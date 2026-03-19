@@ -1,0 +1,120 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "host-release",
+      "displayName": "Host Release (Ninja)",
+      "description": "Host build using Conan toolchain",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/host",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/host-conan/build/Release/generators/conan_toolchain.cmake"
+      }
+    },
+    {
+      "name": "windows-x64-release",
+      "displayName": "Desktop Windows x64 Release",
+      "description": "Desktop native build with Conan toolchain",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/desktop/windows-x64",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "JCE_ENABLE_CPPCHECK": "ON",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/windows-x64-conan/build/Release/generators/conan_toolchain.cmake"
+      }
+    },
+    {
+      "name": "jni-release",
+      "displayName": "JNI Desktop Release",
+      "description": "JNI shared library build for host platform",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/jni/desktop",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "JCE_BUILD_JNI": "ON",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/jni/desktop-conan/build/Release/generators/conan_toolchain.cmake"
+      }
+    },
+    {
+      "name": "windows-arm64-release",
+      "displayName": "Desktop Windows ARM64 Release",
+      "description": "Desktop cross-compile build (Windows ARM64)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/desktop/windows-arm64",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/windows-arm64-conan/build/Release/generators/conan_toolchain.cmake"
+      }
+    },
+    {
+      "name": "android-arm64-release",
+      "displayName": "Mobile Android arm64 Release",
+      "description": "Android arm64 build with Conan toolchain",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/mobile/android-arm64",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/mobile/android-arm64-conan/build/Release/generators/conan_toolchain.cmake"
+      }
+    },
+    {
+      "name": "wasm-release",
+      "displayName": "Web WASM Release",
+      "description": "WebAssembly build with Conan toolchain",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/web/wasm",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/web/wasm-conan/build/Release/generators/conan_toolchain.cmake"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "build-host-release",
+      "displayName": "Build Host Release",
+      "configurePreset": "host-release",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-windows-x64-release",
+      "displayName": "Build Desktop Windows x64",
+      "configurePreset": "windows-x64-release",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-jni-release",
+      "displayName": "Build JNI Desktop",
+      "configurePreset": "jni-release",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-windows-arm64-release",
+      "displayName": "Build Desktop Windows ARM64",
+      "configurePreset": "windows-arm64-release",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-android-arm64-release",
+      "displayName": "Build Mobile Android arm64",
+      "configurePreset": "android-arm64-release",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-wasm-release",
+      "displayName": "Build Web WASM",
+      "configurePreset": "wasm-release",
+      "configuration": "Release"
+    }
+  ]
+}

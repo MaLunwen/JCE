@@ -1,0 +1,49 @@
+# assets_embed.S.in
+#
+# CMake configure_file() template for GCC/Clang platforms.
+# Embeds the .pak binary into the executable via .incbin.
+#
+# After configure_file(), the resulting .S file is compiled by
+# the target assembler, producing a .o with two exported symbols:
+#   assets_pak_data       — start of the PAK blob
+#   assets_pak_data_size  — uint64 holding the blob size
+
+#if defined(__APPLE__)
+# Mach-O requires an underscore prefix for C symbols.
+# Section: __DATA,__const (read-only constant data).
+    .section __DATA,__const
+    .globl _assets_pak_data
+    .globl _assets_pak_data_size
+    .p2align 4
+_assets_pak_data:
+    .incbin "@PAK_FILE_PATH@"
+_assets_pak_data_end:
+    .p2align 3
+_assets_pak_data_size:
+# size_t width matches the target pointer size.
+#if __SIZEOF_POINTER__ == 4
+    .long _assets_pak_data_end - _assets_pak_data
+#else
+    .quad _assets_pak_data_end - _assets_pak_data
+#endif
+#else
+# ELF (Linux, Android, BSDs, etc.)
+    .section .rodata,"a",@progbits
+    .globl assets_pak_data
+    .globl assets_pak_data_size
+    .balign 16
+assets_pak_data:
+    .incbin "@PAK_FILE_PATH@"
+assets_pak_data_end:
+    .balign 8
+assets_pak_data_size:
+# size_t width matches the target pointer size.
+#if __SIZEOF_POINTER__ == 4
+    .long assets_pak_data_end - assets_pak_data
+#else
+    .quad assets_pak_data_end - assets_pak_data
+#endif
+
+# Mark the stack as non-executable (hardening).
+    .section .note.GNU-stack,"",@progbits
+#endif

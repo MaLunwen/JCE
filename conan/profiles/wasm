@@ -1,0 +1,32 @@
+[settings]
+os=Emscripten
+arch=wasm
+compiler=clang
+compiler.version=19
+compiler.libcxx=libc++
+compiler.cppstd=17
+build_type=Release
+
+[options]
+# freetype: bzip2 is for compressed BDF/PCF font files — not needed in a game engine.
+# bzip2's Conan recipe also fails to cross-compile for Emscripten (source-path bug).
+freetype/*:with_bzip2=False
+# harfbuzz: glib integration provides GObject bindings — not needed for text shaping.
+# Disabling removes the glib → libgettext → bzip2 chain from the Emscripten build.
+harfbuzz/*:with_glib=False
+# sdl_image: TIFF support pulls in libtiff → xz_utils (autotools-only, can't cross-compile
+# from Windows to Emscripten). TIFF is not a useful game asset format for web.
+sdl_image/*:with_libtiff=False
+# sdl_image: libwebp/1.6.0 has a C99 implicit-declaration bug in enc_sse41.c that triggers
+# an error under Emscripten/Clang 19. WebP decoding in a game engine is non-critical.
+sdl_image/*:with_libwebp=False
+# sdl_image: AVIF pulls in libaom-av1 + dav1d (AV1 codecs) — heavy and rarely useful as
+# static game textures. Disable to keep the WASM binary lean.
+sdl_image/*:with_avif=False
+
+[conf]
+tools.cmake.cmaketoolchain:generator=Ninja
+# NOTE: user_toolchain and compiler_executables are injected by build-web.bat
+# at conan install time, derived from the emsdk path argument.
+# Using user_toolchain (not toolchain_file) so Conan still generates conan_toolchain.cmake
+# and wraps Emscripten.cmake inside it — preserving per-package cmake variable injection.

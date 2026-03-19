@@ -1,0 +1,14 @@
+{
+    "version": 4,
+    "vendor": {
+        "conan": {}
+    },
+    "include": [
+        "build/host-conan/build/Release/generators/CMakePresets.json",
+        "build/web/wasm-conan/build/Release/generators/CMakePresets.json",
+        "build/mobile/android-arm64-conan/build/Release/generators/CMakePresets.json",
+        "build/desktop/windows-x64-conan/build/Release/generators/CMakePresets.json",
+        "build/desktop/windows-arm64-conan/build/Release/generators/CMakePresets.json",
+        "build/jni/desktop-conan/build/Release/generators/CMakePresets.json"
+    ]
+}
