@@ -1,11 +1,16 @@
 [settings]
 os=Macos
+os.version=10.15
 arch=x86_64
 compiler=apple-clang
-compiler.version=15
+compiler.version=14
 compiler.libcxx=libc++
 compiler.cppstd=17
 build_type=Release
 
 [conf]
 tools.cmake.cmaketoolchain:generator=Ninja
+tools.build:cflags=["-mmacosx-version-min=10.15"]
+tools.build:cxxflags=["-mmacosx-version-min=10.15"]
+tools.build:sharedlinkflags=["-mmacosx-version-min=10.15"]
+tools.build:exelinkflags=["-mmacosx-version-min=10.15"]

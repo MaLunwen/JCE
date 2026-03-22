@@ -116,6 +116,12 @@ function(jce_compile_shaders)
             list(GET _platforms ${_idx} _platform)
             list(GET _profiles  ${_idx} _profile)
 
+            # dx11/HLSL requires the DirectX shader compiler (DXC) which is
+            # only available on Windows hosts.  Skip on macOS/Linux hosts.
+            if(_suffix STREQUAL "dx11" AND NOT CMAKE_HOST_WIN32)
+                continue()
+            endif()
+
             set(_out "${ARG_OUTPUT_DIR}/${_name}_${_suffix}.bin")
 
             add_custom_command(

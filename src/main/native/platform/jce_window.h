@@ -38,13 +38,13 @@ typedef struct JceNativeWindow {
 
 /* Retrieve native window handles.
    Supports Win32, macOS/Cocoa, iOS/UIKit, Android, X11, Wayland. */
-void        jce_window_get_native(JceWindow *win, JceNativeWindow *out);
+void        jce_window_get_native(const JceWindow *win, JceNativeWindow *out);
 
 /* Call from SDL_EVENT_WINDOW_RESIZED handler. */
 void        jce_window_handle_resize(JceWindow *win, uint32_t w, uint32_t h);
 
 /* Compute a letterbox viewport that preserves the logical aspect ratio. */
-void        jce_window_calc_viewport(JceWindow *win,
+void        jce_window_calc_viewport(const JceWindow *win,
                                      uint16_t *vp_x, uint16_t *vp_y,
                                      uint16_t *vp_w, uint16_t *vp_h);
 

@@ -63,4 +63,9 @@ bool         jce_touch_hud_button_down(const JceTouchHud *hud, JceTouchButton bt
    instead of the normal HUD.  Pass false to return to normal HUD. */
 void         jce_touch_hud_set_menu_mode(JceTouchHud *hud, bool menu_mode);
 
+/* Show or hide the HUD overlay.  Input processing continues even when hidden,
+   so mobile controls stay responsive.  Default: visible = true. */
+void         jce_touch_hud_set_visible(JceTouchHud *hud, bool visible);
+bool         jce_touch_hud_is_visible(const JceTouchHud *hud);
+
 #endif /* JCE_TOUCH_HUD_H */

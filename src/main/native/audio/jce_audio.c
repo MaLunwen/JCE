@@ -8,7 +8,7 @@
 
 #include "jce_audio.h"
 #include "resource/pak_loader.h"
-#include "core/jce_log.h"
+#include "foundation/jce_log.h"
 
 #ifndef JCE_NO_AUDIO
 
@@ -103,7 +103,7 @@ void jce_audio_destroy(JceAudio *audio)
 
 /* -- Sound loading -------------------------------------------------- */
 
-static int alloc_buffer_slot(JceAudio *audio)
+static int alloc_buffer_slot(const JceAudio *audio)
 {
     for (int i = 0; i < JCE_MAX_SOUNDS; i++) {
         if (!audio->sound_used[i])
@@ -244,7 +244,7 @@ JceSound jce_audio_load_pcm(JceAudio *audio,
     return (JceSound)(slot + 1);
 }
 
-JceSound jce_audio_load(JceAudio *audio, PakArchive *pak, const char *path)
+JceSound jce_audio_load(JceAudio *audio, const PakArchive *pak, const char *path)
 {
     if (!audio || !pak || !path) return JCE_SOUND_INVALID;
 

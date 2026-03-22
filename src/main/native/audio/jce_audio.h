@@ -27,7 +27,7 @@ void      jce_audio_destroy(JceAudio *audio);
 
 /* Load a sound from the PAK archive.  Supports .wav files.
    Returns JCE_SOUND_INVALID on failure. */
-JceSound  jce_audio_load(JceAudio *audio, PakArchive *pak, const char *path);
+JceSound  jce_audio_load(JceAudio *audio, const PakArchive *pak, const char *path);
 
 /* Upload pre-decoded PCM data as a sound.
    channels: 1 or 2, bits: 8 or 16.

@@ -4,7 +4,7 @@
 #include <jni.h>
 #include <SDL3/SDL.h>
 
-#include "core/jce_engine.h"
+#include "app/jce_engine.h"
 
 /* Opaque Java-side handle payload. */
 typedef struct JceBridgeEngine {

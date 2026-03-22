@@ -77,6 +77,69 @@
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/web/wasm-conan/build/Release/generators/conan_toolchain.cmake"
       }
+    },
+    {
+      "name": "linux-x64-release",
+      "displayName": "Desktop Linux x64 Release (zig)",
+      "description": "Linux x86_64 cross-compile via zig cc",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/desktop/linux-x64",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/linux-x64-conan/build/Release/generators/conan_toolchain.cmake"
+      }
+    },
+    {
+      "name": "linux-arm64-release",
+      "displayName": "Desktop Linux ARM64 Release (zig)",
+      "description": "Linux aarch64 cross-compile via zig cc",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/desktop/linux-arm64",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/linux-arm64-conan/build/Release/generators/conan_toolchain.cmake"
+      }
+    },
+    {
+      "name": "macos-x64-release",
+      "displayName": "Desktop macOS x64 Release",
+      "description": "macOS Intel x86_64 native build",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/desktop/macos-x64",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_OSX_ARCHITECTURES": "x86_64",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "10.15",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/macos-x64-conan/build/Release/generators/conan_toolchain.cmake"
+      }
+    },
+    {
+      "name": "macos-arm64-release",
+      "displayName": "Desktop macOS ARM64 Release",
+      "description": "macOS Apple Silicon native build",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/desktop/macos-arm64",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_OSX_ARCHITECTURES": "arm64",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "11.0",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/macos-arm64-conan/build/Release/generators/conan_toolchain.cmake"
+      }
+    },
+    {
+      "name": "ios-arm64-release",
+      "displayName": "Mobile iOS ARM64 Release",
+      "description": "iOS arm64 cross-compile build",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/mobile/ios-arm64",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/mobile/ios-arm64-conan/build/Release/generators/conan_toolchain.cmake"
+      }
     }
   ],
   "buildPresets": [
@@ -114,6 +177,36 @@
       "name": "build-wasm-release",
       "displayName": "Build Web WASM",
       "configurePreset": "wasm-release",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-linux-x64-release",
+      "displayName": "Build Desktop Linux x64",
+      "configurePreset": "linux-x64-release",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-linux-arm64-release",
+      "displayName": "Build Desktop Linux ARM64",
+      "configurePreset": "linux-arm64-release",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-macos-x64-release",
+      "displayName": "Build Desktop macOS x64",
+      "configurePreset": "macos-x64-release",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-macos-arm64-release",
+      "displayName": "Build Desktop macOS ARM64",
+      "configurePreset": "macos-arm64-release",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-ios-arm64-release",
+      "displayName": "Build Mobile iOS ARM64",
+      "configurePreset": "ios-arm64-release",
       "configuration": "Release"
     }
   ]

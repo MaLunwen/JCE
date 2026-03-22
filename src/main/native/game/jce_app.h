@@ -10,7 +10,7 @@
 #define JCE_APP_H
 
 #include <SDL3/SDL.h>
-#include "renderer/jce_texture.h"
+#include "graphics/jce_texture.h"
 #include "audio/jce_audio.h"
 
 /* Forward declarations  avoids pulling heavy headers into main.c. */

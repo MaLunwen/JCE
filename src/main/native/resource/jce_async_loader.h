@@ -12,7 +12,7 @@
 #include <stdint.h>
 
 /* Lightweight type includes  avoids pulling in full renderer/audio APIs. */
-#include "renderer/jce_texture_types.h"
+#include "graphics/jce_texture_types.h"
 #include "audio/jce_audio_types.h"
 
 typedef struct PakArchive PakArchive;

@@ -3,8 +3,9 @@
  */
 
 #include "jce_window.h"
-#include "core/jce_log.h"
+#include "foundation/jce_log.h"
 #include <SDL3_image/SDL_image.h>
+#include <SDL3/SDL_metal.h>
 #include <string.h>
 
 #define LOG_TAG "jce_window"
@@ -15,6 +16,9 @@
 
 struct JceWindow {
     SDL_Window *sdl_win;
+#if defined(__APPLE__)
+    SDL_MetalView metal_view;
+#endif
     int         logical_w;
     int         logical_h;
     uint32_t    pixel_w;
@@ -29,9 +33,15 @@ JceWindow *jce_window_create(const JceWindowConfig *cfg)
     win->logical_w = cfg->logical_w;
     win->logical_h = cfg->logical_h;
 
+    uint64_t flags = cfg->flags;
+#if defined(__APPLE__)
+    /* Ensure Apple windows are Metal-capable for bgfx initialization. */
+    flags |= SDL_WINDOW_METAL;
+#endif
+
     win->sdl_win = SDL_CreateWindow(cfg->title,
                                     cfg->logical_w, cfg->logical_h,
-                                    cfg->flags);
+                                    flags);
     if (!win->sdl_win) {
         LOG_ERROR(LOG_TAG, "SDL_CreateWindow failed: %s", SDL_GetError());
         SDL_free(win);
@@ -44,12 +54,40 @@ JceWindow *jce_window_create(const JceWindowConfig *cfg)
     win->pixel_w = (uint32_t)pw;
     win->pixel_h = (uint32_t)ph;
 
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    /* On iOS use a 1:1 logical size to match device drawable pixels. */
+    win->logical_w = pw;
+    win->logical_h = ph;
+#endif
+
+#if defined(__APPLE__)
+    win->metal_view = SDL_Metal_CreateView(win->sdl_win);
+    if (!win->metal_view) {
+        LOG_ERROR(LOG_TAG, "SDL_Metal_CreateView failed: %s", SDL_GetError());
+        SDL_DestroyWindow(win->sdl_win);
+        SDL_free(win);
+        return NULL;
+    }
+
+    /* bgfx Metal backend expects CAMetalLayer* as native handle. */
+    if (!SDL_Metal_GetLayer(win->metal_view)) {
+        LOG_ERROR(LOG_TAG, "SDL_Metal_GetLayer failed: %s", SDL_GetError());
+        SDL_Metal_DestroyView(win->metal_view);
+        SDL_DestroyWindow(win->sdl_win);
+        SDL_free(win);
+        return NULL;
+    }
+#endif
+
     return win;
 }
 
 void jce_window_destroy(JceWindow *win)
 {
     if (!win) return;
+#if defined(__APPLE__)
+    if (win->metal_view) SDL_Metal_DestroyView(win->metal_view);
+#endif
     if (win->sdl_win) SDL_DestroyWindow(win->sdl_win);
     SDL_free(win);
 }
@@ -71,11 +109,12 @@ void jce_window_get_logical(JceWindow *win, int *w, int *h)
     if (h) *h = win ? win->logical_h : 0;
 }
 
-void jce_window_get_native(JceWindow *win, JceNativeWindow *out)
+void jce_window_get_native(const JceWindow *win, JceNativeWindow *out)
 {
     if (!win || !out) return;
     memset(out, 0, sizeof(*out));
 
+    // cppcheck-suppress unreadVariable   ; props used in all #if platform branches below
     SDL_PropertiesID props = SDL_GetWindowProperties(win->sdl_win);
 
 #if defined(__ANDROID__)
@@ -83,13 +122,17 @@ void jce_window_get_native(JceWindow *win, JceNativeWindow *out)
         SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
 
 #elif defined(__APPLE__)
+    if (win->metal_view) {
+        out->nwh = SDL_Metal_GetLayer(win->metal_view);
+    } else {
   #if TARGET_OS_IPHONE
-    out->nwh = SDL_GetPointerProperty(props,
-        SDL_PROP_WINDOW_UIKIT_WINDOW_POINTER, NULL);
+        out->nwh = SDL_GetPointerProperty(props,
+            SDL_PROP_WINDOW_UIKIT_WINDOW_POINTER, NULL);
   #else
-    out->nwh = SDL_GetPointerProperty(props,
-        SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, NULL);
+        out->nwh = SDL_GetPointerProperty(props,
+            SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, NULL);
   #endif
+    }
 
 #elif defined(__EMSCRIPTEN__)
     /* bgfx's HTML5 GL context uses nwh as a CSS selector string.
@@ -122,12 +165,18 @@ void jce_window_handle_resize(JceWindow *win, uint32_t w, uint32_t h)
     if (!win) return;
     win->pixel_w = w;
     win->pixel_h = h;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    /* Keep logical size in sync with iOS drawable size. */
+    win->logical_w = (int)w;
+    win->logical_h = (int)h;
+#else
     /* Keep logical height fixed, adapt width to new aspect ratio. */
     if (h > 0)
         win->logical_w = (int)((float)win->logical_h * (float)w / (float)h);
+#endif
 }
 
-void jce_window_calc_viewport(JceWindow *win,
+void jce_window_calc_viewport(const JceWindow *win,
                               uint16_t *vp_x, uint16_t *vp_y,
                               uint16_t *vp_w, uint16_t *vp_h)
 {
@@ -176,6 +225,11 @@ void jce_window_toggle_fullscreen(JceWindow *win)
     SDL_GetWindowSizeInPixels(win->sdl_win, &pw, &ph);
     win->pixel_w = (uint32_t)pw;
     win->pixel_h = (uint32_t)ph;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    win->logical_w = pw;
+    win->logical_h = ph;
+#else
     if (ph > 0)
         win->logical_w = (int)((float)win->logical_h * (float)pw / (float)ph);
+#endif
 }

@@ -36,6 +36,19 @@ class JCEConan(ConanFile):
             # -DJCE_SHADERC_EXECUTABLE in the cross-compile build scripts.
             self.options["bgfx/*"].tools = False
 
+        if self.settings.os == "Macos":
+            # SDL HIDAPI/haptics on recent SDKs can introduce IOKit symbols that
+            # are unavailable on older macOS runtimes (for example, macOS 11).
+            # Disable these optional subsystems for desktop runtime compatibility.
+            self.options["sdl/*"].hidapi = False
+            self.options["sdl/*"].haptic = False
+
+        if self.settings.os in ("iOS", "tvOS", "visionOS", "watchOS"):
+            # Desktop OpenGL is not available on Apple mobile platforms;
+            # the SDL recipe's package_info() incorrectly references opengl::
+            # when the option is True, even though it isn't added as a requirement.
+            self.options["sdl/*"].opengl = False
+
     def requirements(self):
         # ── Core (all platforms) ─────────────────────────────────────
         self.requires("sdl/3.4.0")
@@ -56,10 +69,27 @@ class JCEConan(ConanFile):
         if self.options.get_safe("with_assimp"):
             self.requires("assimp/6.0.2")
 
+        # ── Transitive overrides (resolve version conflicts) ─────────
+        if self.settings.os == "Linux":
+            # bgfx pins wayland/1.23.92 while SDL & others pull 1.24.0
+            self.requires("wayland/1.24.0", override=True)
+
     def layout(self):
         cmake_layout(self)
 
     def generate(self):
+        # Transitive dependency fix for Apple profiles: bgfx aggressively adds
+        # macOS-only frameworks on iOS/tvOS. Strip them out before generating.
+        if self.settings.os in ("iOS", "tvOS", "visionOS", "watchOS"):
+            for dep in self.dependencies.values():
+                if dep.ref.name == "bgfx":
+                    for fw in ("Cocoa", "IOKit"):
+                        if fw in dep.cpp_info.frameworks:
+                            dep.cpp_info.frameworks.remove(fw)
+                        for comp in dep.cpp_info.components.values():
+                            if fw in comp.frameworks:
+                                comp.frameworks.remove(fw)
+
         deps = CMakeDeps(self)
         deps.generate()
         tc = CMakeToolchain(self)

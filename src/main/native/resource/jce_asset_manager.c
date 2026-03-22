@@ -11,9 +11,9 @@
 
 #include "jce_asset_manager.h"
 #include "pak_loader.h"
-#include "renderer/jce_texture.h"
-#include "renderer/jce_mesh.h"
-#include "core/jce_log.h"
+#include "graphics/jce_texture.h"
+#include "graphics/jce_mesh.h"
+#include "foundation/jce_log.h"
 
 #include <SDL3/SDL.h>
 #include <xxhash.h>
@@ -52,7 +52,7 @@ static int find_slot(const JceAssetManager *mgr, uint64_t h)
 }
 
 /* Find a free slot, or return -1. */
-static int alloc_slot(JceAssetManager *mgr)
+static int alloc_slot(const JceAssetManager *mgr)
 {
     for (uint32_t i = 0; i < MAX_ASSETS; i++) {
         if (!mgr->slots[i].occupied)
@@ -204,4 +204,27 @@ uint32_t jce_asset_ref_count(const JceAssetManager *mgr, JceAssetHandle handle)
 uint32_t jce_asset_manager_count(const JceAssetManager *mgr)
 {
     return mgr ? mgr->count : 0;
+}
+
+/* -- Type-safe getters -------------------------------------------- */
+
+JceTexture jce_asset_get_texture(const JceAssetManager *mgr,
+                                  JceAssetHandle handle)
+{
+    JceTexture invalid = { UINT16_MAX };
+    if (!mgr || handle.idx >= MAX_ASSETS) return invalid;
+    const AssetSlot *slot = &mgr->slots[handle.idx];
+    if (!slot->occupied || slot->type != JCE_ASSET_TEXTURE || !slot->data)
+        return invalid;
+    return *(JceTexture *)slot->data;
+}
+
+JceMesh *jce_asset_get_mesh(const JceAssetManager *mgr,
+                              JceAssetHandle handle)
+{
+    if (!mgr || handle.idx >= MAX_ASSETS) return NULL;
+    const AssetSlot *slot = &mgr->slots[handle.idx];
+    if (!slot->occupied || slot->type != JCE_ASSET_MESH)
+        return NULL;
+    return (JceMesh *)slot->data;
 }

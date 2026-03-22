@@ -1,12 +1,12 @@
 # src/CMakeLists.txt
 #
-# Native build rules for JCE (C++17).
+# Native build rules for JCE (pure C).
 # Root CMakeLists.txt calls add_subdirectory("src"), so this file is
 # the single CMake entry point for the native code.
 #
 # Asset embedding pipeline:
 #
-#   tools/jce_pak.cpp         -- Host tool (built first) that:
+#   tools/jce_pak.c           -- Host tool (built first) that:
 #                                1. ZSTD-compresses each asset
 #                                2. Indexes paths via XXH3_64bits
 #                                3. Writes a binary .pak (see pak_format.h)
@@ -44,7 +44,19 @@
 set(CMAKE_SUPPRESS_REGENERATION TRUE)
 
 cmake_minimum_required(VERSION 3.20)
-project(JCE C CXX)
+project(JCE C)
+
+# CXX is needed only for linking C++ dependencies (bgfx, assimp, imgui).
+# No C++ source files exist in this project.
+enable_language(CXX)
+
+# Conan generators in this workspace are produced as Release for iOS/Xcode.
+# Map other Xcode configs to Release so include/link properties still resolve.
+if(CMAKE_GENERATOR STREQUAL "Xcode")
+	set(CMAKE_MAP_IMPORTED_CONFIG_DEBUG Release)
+	set(CMAKE_MAP_IMPORTED_CONFIG_RELWITHDEBINFO Release)
+	set(CMAKE_MAP_IMPORTED_CONFIG_MINSIZEREL Release)
+endif()
 
 option(JCE_BUILD_JNI "Build JCE as a JNI shared library" OFF)
 
@@ -66,6 +78,18 @@ elseif(UNIX)
 	set(JCE_PLATFORM_LINUX TRUE)
 endif()
 
+if(JCE_PLATFORM_MACOS)
+	# Keep runtime compatibility when building on newer macOS hosts.
+	set(JCE_MACOS_DEFAULT_DEPLOYMENT_TARGET "11.0")
+	if((DEFINED CMAKE_OSX_ARCHITECTURES AND CMAKE_OSX_ARCHITECTURES MATCHES "x86_64") OR CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
+		set(JCE_MACOS_DEFAULT_DEPLOYMENT_TARGET "10.15")
+	endif()
+
+	if(NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET OR "${CMAKE_OSX_DEPLOYMENT_TARGET}" STREQUAL "")
+		set(CMAKE_OSX_DEPLOYMENT_TARGET "${JCE_MACOS_DEFAULT_DEPLOYMENT_TARGET}" CACHE STRING "Minimum macOS deployment target" FORCE)
+	endif()
+endif()
+
 # ------------------------------------------------------------------ #
 # Platform-driven option overrides                                     #
 # ------------------------------------------------------------------ #
@@ -74,12 +98,17 @@ endif()
 
 
 # ------------------------------------------------------------------ #
-# C++ standard                                                        #
+# C standard                                                          #
 # ------------------------------------------------------------------ #
 
-set(CMAKE_CXX_STANDARD          17)
-set(CMAKE_CXX_STANDARD_REQUIRED YES)
-set(CMAKE_CXX_EXTENSIONS        OFF)
+set(CMAKE_C_STANDARD          99)
+set(CMAKE_C_STANDARD_REQUIRED YES)
+if(EMSCRIPTEN)
+	# Emscripten EM_ASM macros (used by miniaudio) require GNU extensions.
+	set(CMAKE_C_EXTENSIONS ON)
+else()
+	set(CMAKE_C_EXTENSIONS OFF)
+endif()
 
 # ------------------------------------------------------------------ #
 # Source files                                                        #
@@ -89,16 +118,23 @@ set(CMAKE_CXX_EXTENSIONS        OFF)
 # New / removed source files are picked up automatically — no manual
 # re-configure required (supported by Ninja and Makefiles generators).
 file(GLOB_RECURSE ENGINE_SOURCES CONFIGURE_DEPENDS
-	"${CMAKE_CURRENT_SOURCE_DIR}/main/native/*.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/main/native/*.c")
 
 if(JCE_BUILD_JNI)
 	file(GLOB_RECURSE JNI_BRIDGE_SOURCES CONFIGURE_DEPENDS
-		"${CMAKE_CURRENT_SOURCE_DIR}/main/bridge/*.cpp"
 		"${CMAKE_CURRENT_SOURCE_DIR}/main/bridge/*.c")
 	list(APPEND ENGINE_SOURCES ${JNI_BRIDGE_SOURCES})
 	list(REMOVE_ITEM ENGINE_SOURCES
 		"${CMAKE_CURRENT_SOURCE_DIR}/main/native/main.c")
+endif()
+
+# On Apple platforms, miniaudio's implementation includes AVFoundation
+# (Objective-C framework) — must be compiled as ObjC, not plain C.
+if(APPLE)
+	set_source_files_properties(
+		"${CMAKE_CURRENT_SOURCE_DIR}/main/native/audio/miniaudio_impl.c"
+		PROPERTIES LANGUAGE OBJC)
+	enable_language(OBJC)
 endif()
 
 # Android/JNI: shared library loaded by Java side.
@@ -112,11 +148,30 @@ if(JCE_PLATFORM_ANDROID OR JCE_BUILD_JNI)
 else()
 	add_executable(JCE ${ENGINE_SOURCES})
 	if(JCE_PLATFORM_IOS)
+		set(IOS_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/ios/Info.plist")
+		set(IOS_APP_ICON   "${CMAKE_CURRENT_SOURCE_DIR}/ios/jce_i1024.png")
+		if(NOT EXISTS "${IOS_INFO_PLIST}")
+			message(FATAL_ERROR "Missing iOS Info.plist: ${IOS_INFO_PLIST}")
+		endif()
+		if(NOT EXISTS "${IOS_APP_ICON}")
+			message(FATAL_ERROR "Missing iOS app icon: ${IOS_APP_ICON}")
+		endif()
+
 		set_target_properties(JCE PROPERTIES
 			MACOSX_BUNDLE TRUE
+			MACOSX_BUNDLE_INFO_PLIST "${IOS_INFO_PLIST}"
+			MACOSX_BUNDLE_BUNDLE_NAME "JCE"
 			MACOSX_BUNDLE_GUI_IDENTIFIER "com.jce"
 			MACOSX_BUNDLE_BUNDLE_VERSION "1.0"
-			MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0")
+			MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0"
+			XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "com.jce"
+			XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Automatic"
+			XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "4C98CBUY4F"
+			XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2")
+
+		target_sources(JCE PRIVATE "${IOS_APP_ICON}")
+		set_source_files_properties("${IOS_APP_ICON}" PROPERTIES
+			MACOSX_PACKAGE_LOCATION "Resources")
 	endif()
 endif()
 
@@ -124,7 +179,7 @@ endif()
 # Compiler warnings (P10 rule 10)                                     #
 # ------------------------------------------------------------------ #
 
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
 	target_compile_options(JCE PRIVATE
 		-Wall -Wextra -Wpedantic
 		-Wconversion -Wshadow -Wdouble-promotion
@@ -228,9 +283,104 @@ elseif(JCE_PLATFORM_ANDROID)
 		GLESv3
 		android
 		log)
+elseif(JCE_PLATFORM_IOS)
+	# iOS system frameworks required by bgfx (Metal) and SDL3.
+	target_link_libraries(JCE PRIVATE
+		"-framework Metal"
+		"-framework QuartzCore"
+		"-framework UIKit"
+		"-framework Foundation"
+		"-framework CoreGraphics"
+		"-framework CoreText"
+		"-framework AVFoundation"
+		"-framework AudioToolbox"
+		"-framework CoreAudio"
+		"-framework GameController"
+		"-framework CoreHaptics"
+		"-framework CoreMotion"
+		"-framework CoreServices")
+elseif(JCE_PLATFORM_MACOS)
+	# macOS system frameworks required by bgfx (Metal) and SDL3.
+	target_link_libraries(JCE PRIVATE
+		"-framework Metal"
+		"-framework QuartzCore"
+		"-framework Cocoa"
+		"-framework IOKit"
+		"-framework CoreVideo"
+		"-framework CoreAudio"
+		"-framework AudioToolbox"
+		"-framework Carbon"
+		"-framework ForceFeedback"
+		"-framework GameController"
+		"-framework CoreHaptics")
 elseif(WIN32)
 	# Windows system libraries required by bgfx (process enumeration).
 	target_link_libraries(JCE PRIVATE psapi)
+endif()
+
+# Statically link the C++ runtime on Linux so the binary runs on systems
+# without a matching libstdc++ version.  LINKER_LANGUAGE CXX ensures g++
+# is used as the linker driver (the project is pure C but links C++ deps).
+#
+# Problem: -static-libstdc++ is a g++ DRIVER flag that only replaces the
+# *implicit* -lstdc++ added by g++ itself.  Conan transitive dependencies
+# (e.g. assimp) inject an *explicit* -lstdc++ on the link line, which
+# still resolves to the shared libstdc++.so — defeating the flag.
+#
+# Solution: create a linker script that redirects every -lstdc++ on the
+# entire link line (implicit AND explicit) to libstdc++.a.  We place
+# this script in a directory that comes first on the library search path
+# via -L, so the linker finds our script before the real libstdc++.so.
+# The same trick is applied to libgcc_s → libgcc.a + libgcc_eh.a.
+if(JCE_PLATFORM_LINUX)
+	set_target_properties(JCE PROPERTIES LINKER_LANGUAGE CXX)
+
+	# ── Locate the static archives ──
+	execute_process(
+		COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libstdc++.a
+		OUTPUT_VARIABLE _STATIC_STDCXX OUTPUT_STRIP_TRAILING_WHITESPACE)
+	if(NOT EXISTS "${_STATIC_STDCXX}")
+		message(FATAL_ERROR
+			"libstdc++.a not found (looked for: ${_STATIC_STDCXX}).\n"
+			"Install it:  sudo apt install libstdc++-11-dev")
+	endif()
+	message(STATUS "Static libstdc++: ${_STATIC_STDCXX}")
+
+	execute_process(
+		COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libgcc.a
+		OUTPUT_VARIABLE _STATIC_LIBGCC OUTPUT_STRIP_TRAILING_WHITESPACE)
+	execute_process(
+		COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libgcc_eh.a
+		OUTPUT_VARIABLE _STATIC_LIBGCC_EH OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+	# ── Create linker scripts that redirect .so → .a ──
+	# A linker script named "libstdc++.so" containing GROUP( libstdc++.a )
+	# makes the linker pull in the static archive whenever it would have
+	# loaded the shared library.  We place these scripts in a private
+	# directory and prepend -L<dir> so they shadow the real .so files.
+	set(_STATIC_SHIM_DIR "${CMAKE_CURRENT_BINARY_DIR}/_static_shims")
+	file(MAKE_DIRECTORY "${_STATIC_SHIM_DIR}")
+
+	file(WRITE "${_STATIC_SHIM_DIR}/libstdc++.so"
+		"/* Linker script — redirect to static archive */\n"
+		"GROUP ( ${_STATIC_STDCXX} )\n")
+
+	if(EXISTS "${_STATIC_LIBGCC}" AND EXISTS "${_STATIC_LIBGCC_EH}")
+		file(WRITE "${_STATIC_SHIM_DIR}/libgcc_s.so"
+			"/* Linker script — redirect to static archive */\n"
+			"GROUP ( ${_STATIC_LIBGCC} ${_STATIC_LIBGCC_EH} )\n")
+		file(WRITE "${_STATIC_SHIM_DIR}/libgcc_s.so.1"
+			"/* Linker script — redirect to static archive */\n"
+			"GROUP ( ${_STATIC_LIBGCC} ${_STATIC_LIBGCC_EH} )\n")
+		message(STATUS "Static libgcc:    ${_STATIC_LIBGCC}")
+	endif()
+
+	# Prepend our shim directory so the linker finds our scripts first.
+	target_link_options(JCE PRIVATE
+		"-L${_STATIC_SHIM_DIR}"
+		-static-libstdc++ -static-libgcc)
+
+	# Also link with -Wl,--as-needed to avoid pulling unnecessary DT_NEEDED.
 endif()
 
 # ------------------------------------------------------------------ #
@@ -266,7 +416,7 @@ jce_compile_shaders(
 # Host packer tool: jce_pak                                           #
 # ------------------------------------------------------------------ #
 #
-# jce_pak is a C++17 host tool that compresses assets with ZSTD,
+# jce_pak is a C99 host tool that compresses assets with ZSTD,
 # indexes them with XXH3, writes a binary .pak, and (on MSVC)
 # generates a COFF .obj that embeds the pak blob directly.
 #
@@ -284,10 +434,14 @@ if(CMAKE_CROSSCOMPILING)
 	# $<TARGET_FILE:jce_pak> uniformly.
 	add_executable(jce_pak IMPORTED)
 	set_target_properties(jce_pak PROPERTIES
-		IMPORTED_LOCATION "${JCE_PAK_EXECUTABLE}")
+		IMPORTED_LOCATION "${JCE_PAK_EXECUTABLE}"
+		IMPORTED_LOCATION_DEBUG "${JCE_PAK_EXECUTABLE}"
+		IMPORTED_LOCATION_RELEASE "${JCE_PAK_EXECUTABLE}"
+		IMPORTED_LOCATION_RELWITHDEBINFO "${JCE_PAK_EXECUTABLE}"
+		IMPORTED_LOCATION_MINSIZEREL "${JCE_PAK_EXECUTABLE}")
 else()
 	add_executable(jce_pak
-		"${CMAKE_CURRENT_SOURCE_DIR}/tools/jce_pak.cpp")
+		"${CMAKE_CURRENT_SOURCE_DIR}/tools/jce_pak.c")
 
 	# jce_pak is a build-time-only tool — exclude from the default ALL
 	# target so it doesn't appear as a "product" in the IDE.  The
@@ -296,9 +450,9 @@ else()
 	set_target_properties(jce_pak PROPERTIES
 		EXCLUDE_FROM_ALL      ON
 		RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tools"
-		CXX_STANDARD          17
-		CXX_STANDARD_REQUIRED YES
-		CXX_EXTENSIONS        OFF)
+		C_STANDARD            99
+		C_STANDARD_REQUIRED   YES
+		C_EXTENSIONS          OFF)
 
 	target_include_directories(jce_pak PRIVATE
 		"${CMAKE_CURRENT_SOURCE_DIR}/main/native")

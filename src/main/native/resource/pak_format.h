@@ -16,10 +16,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 /* -- Magic & Version ------------------------------------------------ */
 
 #define JPAK_MAGIC_0 'J'
@@ -87,7 +83,3 @@ static inline uint64_t jpak_read_le64(const void *p) {
          | (uint64_t)b[6] << 48
          | (uint64_t)b[7] << 56;
 }
-
-#ifdef __cplusplus
-}
-#endif

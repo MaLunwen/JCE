@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(JCE CXX)
+project(JCE C)
 
 # Export compile database for tooling (cppcheck/clangd/etc.).
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -20,11 +20,12 @@ if(JCE_ENABLE_CPPCHECK)
 				--relative-paths=${CMAKE_SOURCE_DIR}
 				--enable=warning,style,performance,portability
 				--inconclusive
+				--inline-suppr
 				--suppress=missingIncludeSystem
 
 				--suppress=*:*/.conan2/*
 				--file-filter=${CMAKE_SOURCE_DIR}/src/*
-				--std=c++17
+				--std=c99
 				--template={file}:{line}:{severity}:{id}:{message}
 				--output-file=${JCE_CPPCHECK_TEXT_REPORT}
 			COMMAND "${CPPCHECK_EXECUTABLE}"
@@ -32,11 +33,12 @@ if(JCE_ENABLE_CPPCHECK)
 				--relative-paths=${CMAKE_SOURCE_DIR}
 				--enable=warning,style,performance,portability
 				--inconclusive
+				--inline-suppr
 				--suppress=missingIncludeSystem
 
 				--suppress=*:*/.conan2/*
 				--file-filter=${CMAKE_SOURCE_DIR}/src/*
-				--std=c++17
+				--std=c99
 				--xml
 				--xml-version=2
 				--output-file=${JCE_CPPCHECK_XML_REPORT}
@@ -45,11 +47,12 @@ if(JCE_ENABLE_CPPCHECK)
 				--relative-paths=${CMAKE_SOURCE_DIR}
 				--enable=warning,style,performance,portability
 				--inconclusive
+				--inline-suppr
 				--suppress=missingIncludeSystem
 
 				--suppress=*:*/.conan2/*
 				--file-filter=${CMAKE_SOURCE_DIR}/src/*
-				--std=c++17
+				--std=c99
 				--quiet
 			WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
 			COMMENT "Running cppcheck and generating filtered reports"

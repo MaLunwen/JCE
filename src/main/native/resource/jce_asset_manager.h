@@ -25,7 +25,9 @@ typedef enum {
     JCE_ASSET_TEXTURE,
     JCE_ASSET_MESH,
     JCE_ASSET_SOUND,
-    JCE_ASSET_FONT
+    JCE_ASSET_FONT,
+    JCE_ASSET_SHADER,
+    JCE_ASSET_MATERIAL
 } JceAssetType;
 
 /* Opaque asset handle (index into internal table). */
@@ -63,6 +65,22 @@ uint32_t jce_asset_ref_count(const JceAssetManager *mgr, JceAssetHandle handle);
 
 /* Get the number of loaded assets. */
 uint32_t jce_asset_manager_count(const JceAssetManager *mgr);
+
+/* -- Type-safe asset retrieval ------------------------------------ */
+
+/* Forward-declare types used by getters. */
+#include "graphics/jce_texture_types.h"
+typedef struct JceMesh JceMesh;
+
+/* Get a texture handle from a loaded TEXTURE asset.
+   Returns { UINT16_MAX } if handle is invalid or not a texture. */
+JceTexture jce_asset_get_texture(const JceAssetManager *mgr,
+                                  JceAssetHandle handle);
+
+/* Get a mesh pointer from a loaded MESH asset.
+   Returns NULL if handle is invalid or not a mesh. */
+JceMesh *jce_asset_get_mesh(const JceAssetManager *mgr,
+                              JceAssetHandle handle);
 
 #ifdef __cplusplus
 }

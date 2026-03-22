@@ -11,22 +11,28 @@
 #include "platform/jce_input.h"
 #include "platform/jce_touch_hud.h"
 #include "audio/jce_audio.h"
-#include "renderer/jce_renderer.h"
-#include "renderer/jce_primitives.h"
-#include "renderer/jce_texture.h"
-#include "renderer/jce_text.h"
-#include "renderer/jce_camera.h"
-#include "renderer/jce_mesh.h"
-#include "renderer/jce_material.h"
-#include "renderer/jce_lighting.h"
-#include "renderer/jce_views.h"
+#include "graphics/jce_renderer.h"
+#include "graphics/jce_primitives.h"
+#include "graphics/jce_texture.h"
+#include "graphics/jce_text.h"
+#include "graphics/jce_camera.h"
+#include "graphics/jce_mesh.h"
+#include "graphics/jce_material.h"
+#include "graphics/jce_lighting.h"
+#include "graphics/jce_views.h"
+#include "graphics/jce_gfx_types.h"
 #include "resource/pak_loader.h"
-#include "core/jce_config.h"
-#include "core/jce_sysinfo.h"
-#include "core/jce_timer.h"
-#include "core/jce_math.h"
+#include "app/jce_config.h"
+#include "app/jce_camera_controller.h"
+#include "foundation/jce_sysinfo.h"
+#include "foundation/jce_timer.h"
+#include "foundation/jce_math.h"
 
 #include <bgfx/c99/bgfx.h>
+
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#endif
 
 #define FT_HISTORY    120
 #define FT_GRAPH_COLS  60
@@ -45,6 +51,7 @@ struct JceApp {
 
     /* Phase 2: 3D scene. */
     JceCamera    *camera;
+    JceCameraController *cam_ctrl;
     JceMesh      *cube;
     JceMesh      *chalet;
     JceMesh      *ground;
@@ -59,13 +66,7 @@ struct JceApp {
     int           pause_selection; /* 0 = Continue, 1 = Quit */
     bool          debug_hud;
     bool          mouse_captured;  /* SDL relative mouse mode active   */
-    bool          sprinting;       /* CTRL toggle: 2x move speed      */
     bool          touch_native;    /* true if touch HUD was auto-created (mobile) */
-    float         fov_current;     /* smoothed FOV (degrees)           */
-    float         fov_target;      /* target FOV (60 normal, 70 sprint)*/
-
-    uint64_t      last_ticks;
-    float         fps_smoothed;
 
     /* Frametime graph ring buffer. */
     float         ft_history[FT_HISTORY];
@@ -73,7 +74,6 @@ struct JceApp {
 
     /* System info (updated once per second). */
     JceSysInfo    sysinfo;
-    double        sysinfo_last_update;
 
     /* Touch HUD: auto-created on mobile, F9-toggled on desktop. */
     JceTouchHud  *touch_hud;
@@ -122,6 +122,7 @@ JceApp *jce_app_create(const JceAppContext *ctx)
         cam_desc.far_plane  = 100.0f;
         app->camera = jce_camera_create(&cam_desc);
     }
+    app->cam_ctrl = jce_camctrl_create(app->camera, NULL); /* default settings */
     app->cube   = jce_mesh_load(app->ctx.pak, "models/chalet.obj");
     if (!app->cube)
         app->cube = jce_mesh_create_cube(1.0f);  /* fallback */
@@ -155,31 +156,25 @@ JceApp *jce_app_create(const JceAppContext *ctx)
     app->timer     = jce_timer_create(0.0); /* variable timestep for now */
 
     jce_sysinfo_init(&app->sysinfo);
-    app->sysinfo_last_update = 0.0;
 
     /* Touch HUD: auto-create on native touch platforms only.
-       On desktop, F9 toggles it for debugging. */
+       On desktop, F9 toggles it for debugging.
+       NOTE: macOS trackpad registers as an SDL touch device but is a desktop
+       platform — use TARGET_OS_IOS to exclude macOS from auto-detection. */
     {
         bool is_touch_platform = false;
 #if defined(__ANDROID__) || defined(__EMSCRIPTEN__)
         is_touch_platform = true;
-#elif defined(__APPLE__)
-        {
-            int touch_count = 0;
-            SDL_TouchID *devs = SDL_GetTouchDevices(&touch_count);
-            SDL_free(devs);
-            is_touch_platform = (touch_count > 0);
-        }
+#elif defined(__APPLE__) && (TARGET_OS_IOS || TARGET_OS_TV)
+        is_touch_platform = true;
 #endif
+        // cppcheck-suppress knownConditionTrueFalse   ; true on Android/Emscripten/iOS
         if (is_touch_platform) {
             app->touch_hud    = jce_touch_hud_create(ctx->renderer,
                                     ctx->window, app->font_main);
             app->touch_native = true;
         }
     }
-
-    app->fov_current = 60.0f;
-    app->fov_target  = 60.0f;
 
     /* Desktop (no touch HUD): capture mouse for FPS-style look. */
     if (!app->touch_hud) {
@@ -197,6 +192,7 @@ void jce_app_destroy(JceApp *app)
         SDL_SetWindowRelativeMouseMode(jce_window_sdl(app->ctx.window), false);
     jce_touch_hud_destroy(app->touch_hud);
     jce_timer_destroy(app->timer);
+    jce_camctrl_destroy(app->cam_ctrl);
     jce_camera_destroy(app->camera);
     jce_mesh_destroy(app->cube);
     jce_mesh_destroy(app->chalet);
@@ -237,11 +233,7 @@ static void draw_frametime_graph(JceApp *app, uint16_t tx, uint16_t ty)
 
 static void draw_debug_hud(JceApp *app, float dt_ms)
 {
-    /* Smooth FPS with exponential moving average. */
-    if (dt_ms > 0.0f) {
-        float instant_fps = 1000.0f / dt_ms;
-        app->fps_smoothed = app->fps_smoothed * 0.95f + instant_fps * 0.05f;
-    }
+    float fps_smoothed = jce_timer_fps(app->timer);
 
     uint32_t win_w, win_h;
     jce_window_get_size(app->ctx.window, &win_w, &win_h);
@@ -252,8 +244,8 @@ static void draw_debug_hud(JceApp *app, float dt_ms)
 
     /* FPS color: green >=55, yellow 30-55, red <30. */
     uint8_t fps_attr;
-    if (app->fps_smoothed >= 55.0f)      fps_attr = 0x0a; /* green */
-    else if (app->fps_smoothed >= 30.0f) fps_attr = 0x0e; /* yellow */
+    if (fps_smoothed >= 55.0f)      fps_attr = 0x0a; /* green */
+    else if (fps_smoothed >= 30.0f) fps_attr = 0x0e; /* yellow */
     else                                 fps_attr = 0x0c; /* red */
 
     /* MangoHud-style layout with colored labels. */
@@ -279,7 +271,7 @@ static void draw_debug_hud(JceApp *app, float dt_ms)
 
     /* FPS line: colored value */
     jce_renderer_dbg_text(1, y,   0x07, " FPS ");
-    jce_renderer_dbg_text(6, y++, fps_attr, " %.1f", app->fps_smoothed);
+    jce_renderer_dbg_text(6, y++, fps_attr, " %.1f", fps_smoothed);
 
     /* Frame time line */
     jce_renderer_dbg_text(1, y,   0x07, " Frame");
@@ -288,7 +280,6 @@ static void draw_debug_hud(JceApp *app, float dt_ms)
     /* Frametime graph label + text-based bar chart. */
     jce_renderer_dbg_text(1, y++, 0x07, " Frametime");
     draw_frametime_graph(app, 1, y);
-    y += FT_GRAPH_ROWS;
 }
 
 static void draw_pause_menu(JceApp *app)
@@ -297,7 +288,7 @@ static void draw_pause_menu(JceApp *app)
 
     int lw, lh;
     jce_window_get_logical(app->ctx.window, &lw, &lh);
-    JceRenderer *r = app->ctx.renderer;
+    const JceRenderer *r = app->ctx.renderer;
     JceFont *font  = app->font_main;
     int sel = app->pause_selection;
     const float shrink = 0.4f;
@@ -348,19 +339,22 @@ void jce_app_update(JceApp *app)
 {
     if (!app) return;
 
-    /* Frame timing. */
-    uint64_t now = SDL_GetTicks();
-    float dt_ms = (float)(now - app->last_ticks);
-    app->last_ticks = now;
+    /* Frame timing (high-precision via SDL_GetPerformanceCounter). */
+    jce_timer_tick(app->timer);
+    float dt_ms = jce_timer_dt_ms(app->timer);
 
     /* Record frametime in ring buffer. */
     app->ft_history[app->ft_index] = dt_ms;
     app->ft_index = (app->ft_index + 1) % FT_HISTORY;
 
     /* Update system info once per second. */
-    if (now - (uint64_t)app->sysinfo_last_update >= 1000) {
-        jce_sysinfo_update(&app->sysinfo);
-        app->sysinfo_last_update = (double)now;
+    {
+        double elapsed = jce_timer_elapsed(app->timer);
+        static double last_sysinfo = 0.0;
+        if (elapsed - last_sysinfo >= 1.0) {
+            jce_sysinfo_update(&app->sysinfo);
+            last_sysinfo = elapsed;
+        }
     }
 
     /* -- Input handling -------------------------------------------- */
@@ -400,24 +394,32 @@ void jce_app_update(JceApp *app)
     if (jce_input_key_pressed(input, SDL_SCANCODE_F3))
         app->debug_hud = !app->debug_hud;
 
-    /* F9  toggle touch HUD on desktop (for debugging mobile controls).
-       On native touch platforms this is a no-op (always shown). */
-    if (jce_input_key_pressed(input, SDL_SCANCODE_F9) && !app->touch_native) {
-        if (app->touch_hud) {
-            /* Disable touch HUD, re-enable mouse look. */
-            jce_touch_hud_destroy(app->touch_hud);
-            app->touch_hud = NULL;
-            SDL_SetWindowRelativeMouseMode(
-                jce_window_sdl(app->ctx.window), true);
-            app->mouse_captured = true;
+    /* F9  toggle touch HUD.
+       Desktop: create/destroy HUD + toggle mouse-capture mode.
+       Mobile:  toggle HUD visibility only (input processing always active). */
+    if (jce_input_key_pressed(input, SDL_SCANCODE_F9)) {
+        if (app->touch_native) {
+            /* Mobile: hide/show overlay; controls remain functional either way. */
+            if (app->touch_hud)
+                jce_touch_hud_set_visible(app->touch_hud,
+                    !jce_touch_hud_is_visible(app->touch_hud));
         } else {
-            /* Enable touch HUD, disable mouse look. */
-            app->touch_hud = jce_touch_hud_create(
-                app->ctx.renderer, app->ctx.window, app->font_main);
-            if (app->mouse_captured) {
+            if (app->touch_hud) {
+                /* Disable touch HUD, re-enable mouse look. */
+                jce_touch_hud_destroy(app->touch_hud);
+                app->touch_hud = NULL;
                 SDL_SetWindowRelativeMouseMode(
-                    jce_window_sdl(app->ctx.window), false);
-                app->mouse_captured = false;
+                    jce_window_sdl(app->ctx.window), true);
+                app->mouse_captured = true;
+            } else {
+                /* Enable touch HUD, disable mouse look. */
+                app->touch_hud = jce_touch_hud_create(
+                    app->ctx.renderer, app->ctx.window, app->font_main);
+                if (app->mouse_captured) {
+                    SDL_SetWindowRelativeMouseMode(
+                        jce_window_sdl(app->ctx.window), false);
+                    app->mouse_captured = false;
+                }
             }
         }
     }
@@ -467,78 +469,59 @@ void jce_app_update(JceApp *app)
         /* Auto-rotate cube. */
         app->cube_angle += dt_sec * 1.0f;
 
-        /* CTRL toggle: sprint (2x speed). */
-        if (jce_input_key_pressed(app->ctx.input, SDL_SCANCODE_LCTRL) ||
-            jce_input_key_pressed(app->ctx.input, SDL_SCANCODE_RCTRL))
-            app->sprinting = !app->sprinting;
+        /* Gather raw input for camera controller. */
+        JceCameraInput cam_in = {0};
 
-        /* WASD + touch joystick: camera movement. */
-        float base_speed = 3.0f * dt_sec;
-        float move_speed = app->sprinting ? base_speed * 2.0f : base_speed;
-        float kb_fwd = 0, kb_right = 0;
-        if (jce_input_key_down(app->ctx.input, SDL_SCANCODE_W)) kb_fwd  -= 1;
-        if (jce_input_key_down(app->ctx.input, SDL_SCANCODE_S)) kb_fwd  += 1;
-        if (jce_input_key_down(app->ctx.input, SDL_SCANCODE_A)) kb_right -= 1;
-        if (jce_input_key_down(app->ctx.input, SDL_SCANCODE_D)) kb_right += 1;
+        /* WASD. */
+        if (jce_input_key_down(app->ctx.input, SDL_SCANCODE_W)) cam_in.move_forward -= 1;
+        if (jce_input_key_down(app->ctx.input, SDL_SCANCODE_S)) cam_in.move_forward += 1;
+        if (jce_input_key_down(app->ctx.input, SDL_SCANCODE_A)) cam_in.move_right   -= 1;
+        if (jce_input_key_down(app->ctx.input, SDL_SCANCODE_D)) cam_in.move_right   += 1;
 
-        float touch_dx = 0, touch_dz = 0;
-        jce_touch_hud_get_move(app->touch_hud, &touch_dx, &touch_dz);
+        /* Touch joystick. */
+        {
+            float tdx = 0, tdz = 0;
+            jce_touch_hud_get_move(app->touch_hud, &tdx, &tdz);
+            cam_in.move_forward += tdz;
+            cam_in.move_right   += tdx;
+        }
 
-        float move_fwd   = kb_fwd   + touch_dz;  /* touch Y = forward/back */
-        float move_right = kb_right + touch_dx;   /* touch X = strafe       */
-
-        /* Minecraft: sprint cancels when not moving forward.
-           move_fwd < 0 = forward (W subtracts 1), so >= 0 = stopped/backward. */
-        if (app->sprinting && move_fwd >= 0)
-            app->sprinting = false;
-
-        if (move_fwd   != 0) jce_camera_move_forward(app->camera, -move_fwd * move_speed);
-        if (move_right != 0) jce_camera_move_right(app->camera, move_right * move_speed);
-
-        /* Space = ascend, Shift = descend. */
-        if (jce_input_key_down(app->ctx.input, SDL_SCANCODE_SPACE))
-            jce_camera_move_up(app->camera, move_speed);
+        /* Vertical: Space/Shift + touch buttons. */
+        if (jce_input_key_down(app->ctx.input, SDL_SCANCODE_SPACE))  cam_in.move_up += 1;
         if (jce_input_key_down(app->ctx.input, SDL_SCANCODE_LSHIFT) ||
-            jce_input_key_down(app->ctx.input, SDL_SCANCODE_RSHIFT))
-            jce_camera_move_up(app->camera, -move_speed);
+            jce_input_key_down(app->ctx.input, SDL_SCANCODE_RSHIFT)) cam_in.move_up -= 1;
+        if (jce_touch_hud_button_down(app->touch_hud, JCE_TOUCH_BTN_JUMP))   cam_in.move_up += 1;
+        if (jce_touch_hud_button_down(app->touch_hud, JCE_TOUCH_BTN_CROUCH)) cam_in.move_up -= 1;
 
-        /* Touch buttons: vertical movement (mobile). */
-        if (jce_touch_hud_button_down(app->touch_hud, JCE_TOUCH_BTN_JUMP))
-            jce_camera_move_up(app->camera, move_speed);
-        if (jce_touch_hud_button_down(app->touch_hud, JCE_TOUCH_BTN_CROUCH))
-            jce_camera_move_up(app->camera, -move_speed);
+        /* Sprint toggle. */
+        cam_in.sprint_toggle = jce_input_key_pressed(app->ctx.input, SDL_SCANCODE_LCTRL)
+                            || jce_input_key_pressed(app->ctx.input, SDL_SCANCODE_RCTRL);
 
         /* Mouse look (desktop, when captured) + touch look. */
-        float kb_yaw = 0, kb_pitch = 0;
         if (app->mouse_captured) {
             float mdx = 0, mdy = 0;
             jce_input_mouse_delta(app->ctx.input, &mdx, &mdy);
-            float sensitivity = 0.002f;  /* rad/pixel */
-            kb_yaw   += mdx * sensitivity;
-            kb_pitch -= mdy * sensitivity;
+            cam_in.look_yaw   += mdx * 0.002f;
+            cam_in.look_pitch -= mdy * 0.002f;
+        }
+        {
+            float touch_yaw = 0, touch_pitch = 0;
+            jce_touch_hud_get_look(app->touch_hud, &touch_yaw, &touch_pitch);
+            float deg2rad = 3.14159265f / 180.0f;
+            cam_in.look_yaw   += touch_yaw   * deg2rad;
+            cam_in.look_pitch += touch_pitch  * deg2rad;
         }
 
-        float touch_yaw = 0, touch_pitch = 0;
-        jce_touch_hud_get_look(app->touch_hud, &touch_yaw, &touch_pitch);
-        /* Touch look returns degrees; camera_rotate takes radians. */
-        float deg2rad = 3.14159265f / 180.0f;
-        float total_yaw   = kb_yaw   + touch_yaw   * deg2rad;
-        float total_pitch = kb_pitch + touch_pitch * deg2rad;
-        if (total_yaw != 0 || total_pitch != 0)
-            jce_camera_rotate(app->camera, total_yaw, total_pitch);
-
-        /* FOV sprint effect: smooth 60° ↔ 70° transition. */
-        app->fov_target = app->sprinting ? 70.0f : 60.0f;
-        app->fov_current += (app->fov_target - app->fov_current)
-                          * fminf(dt_sec * 8.0f, 1.0f);
-        jce_camera_set_fov(app->camera, app->fov_current);
+        /* Update camera controller (handles velocity, friction, FOV). */
+        jce_camctrl_update(app->cam_ctrl, &cam_in, dt_sec);
 
         /* Set 3D camera on view 0. */
         jce_renderer_begin_frame_3d(app->ctx.renderer, app->ctx.window,
                                      app->camera, JCE_VIEW_MAIN_3D);
 
-        bgfx_program_handle_t mesh_prog =
+        JceShaderHandle mesh_sh =
             jce_renderer_get_program_mesh(app->ctx.renderer);
+        bgfx_program_handle_t mesh_prog = { mesh_sh.idx };
 
         if (mesh_prog.idx != UINT16_MAX) {
             /* Apply lighting. */
@@ -547,8 +530,9 @@ void jce_app_update(JceApp *app)
             /* Bind cube texture. */
             if (jce_texture_valid(app->tex_cube)) {
                 bgfx_texture_handle_t th = { app->tex_cube.idx };
+                JceUniformHandle uh1 = jce_renderer_get_tex_uniform(app->ctx.renderer);
                 bgfx_set_texture(0,
-                    jce_renderer_get_tex_uniform(app->ctx.renderer),
+                    (bgfx_uniform_handle_t){ uh1.idx },
                     th, UINT32_MAX);
             }
 
@@ -569,8 +553,9 @@ void jce_app_update(JceApp *app)
 
                 if (jce_texture_valid(app->tex_cube)) {
                     bgfx_texture_handle_t th = { app->tex_cube.idx };
+                    JceUniformHandle uh2 = jce_renderer_get_tex_uniform(app->ctx.renderer);
                     bgfx_set_texture(0,
-                        jce_renderer_get_tex_uniform(app->ctx.renderer),
+                        (bgfx_uniform_handle_t){ uh2.idx },
                         th, UINT32_MAX);
                 }
 
@@ -589,8 +574,9 @@ void jce_app_update(JceApp *app)
                               ? app->tex_ground : app->tex_cube;
                 if (jce_texture_valid(gt)) {
                     bgfx_texture_handle_t th = { gt.idx };
+                    JceUniformHandle uh3 = jce_renderer_get_tex_uniform(app->ctx.renderer);
                     bgfx_set_texture(0,
-                        jce_renderer_get_tex_uniform(app->ctx.renderer),
+                        (bgfx_uniform_handle_t){ uh3.idx },
                         th, UINT32_MAX);
                 }
             }
@@ -610,8 +596,9 @@ void jce_app_update(JceApp *app)
     int logical_w, logical_h;
     jce_window_get_logical(app->ctx.window, &logical_w, &logical_h);
 
-    const float direction = ((now % 2000) >= 1000) ? 1.0f : -1.0f;
-    const float scale = ((float)((int)(now % 1000) - 500) / 500.0f)
+    uint64_t anim_ms = (uint64_t)(jce_timer_elapsed(app->timer) * 1000.0);
+    const float direction = ((anim_ms % 2000) >= 1000) ? 1.0f : -1.0f;
+    const float scale = ((float)((int)(anim_ms % 1000) - 500) / 500.0f)
                         * direction;
 
     const uint32_t red   = jce_rgba(255,   0,   0, 255);

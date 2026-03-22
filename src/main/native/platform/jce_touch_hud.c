@@ -27,9 +27,9 @@
 
 #include "jce_window.h"
 #include "jce_input.h"
-#include "renderer/jce_renderer.h"
-#include "renderer/jce_primitives.h"
-#include "renderer/jce_text.h"
+#include "graphics/jce_renderer.h"
+#include "graphics/jce_primitives.h"
+#include "graphics/jce_text.h"
 
 /* ── Configuration ──────────────────────────────────────────────── */
 
@@ -99,6 +99,9 @@ struct JceTouchHud {
 
     /* Menu mode: when paused, draw Continue/Quit instead of normal HUD. */
     bool         menu_mode;
+
+    /* Visibility: false hides the overlay but keeps input processing active. */
+    bool         visible;
 };
 
 /* ── Button rectangles (normalized coords [0,1]) ────────────────── */
@@ -227,6 +230,7 @@ JceTouchHud *jce_touch_hud_create(JceRenderer *renderer, JceWindow *window,
     hud->renderer   = renderer;
     hud->window     = window;
     hud->label_font = label_font;
+    hud->visible    = true;
     return hud;
 }
 
@@ -365,7 +369,7 @@ void jce_touch_hud_update(JceTouchHud *hud, const JceInput *input, float dt_ms)
 
     /* Process active fingers by zone. */
     for (int i = 0; i < MAX_FINGERS; i++) {
-        FingerSlot *f = &hud->fingers[i];
+        const FingerSlot *f = &hud->fingers[i];
         if (!f->active) continue;
 
         switch (f->zone) {
@@ -456,7 +460,7 @@ void jce_touch_hud_set_menu_mode(JceTouchHud *hud, bool menu_mode)
 /* ── Drawing helpers ────────────────────────────────────────────── */
 
 /* Draw a filled circle approximated by N triangles (fan). */
-static void draw_filled_circle(JceRenderer *r,
+static void draw_filled_circle(const JceRenderer *r,
                                 float cx, float cy, float radius,
                                 uint32_t color, int segments)
 {
@@ -474,7 +478,6 @@ static void draw_filled_circle(JceRenderer *r,
     /* Practical approach: draw a filled diamond (4 overlapping rects)
        to approximate a circle, which looks much better than one square. */
     float s  = radius;
-    float s7 = radius * 0.707f;  /* sin(45°) */
 
     /* Core: largest inscribed square (45° rotated = same size). */
     float inner = radius * 0.82f;
@@ -490,7 +493,7 @@ static void draw_filled_circle(JceRenderer *r,
 }
 
 /* Draw a circle outline as a ring of small rects. */
-static void draw_circle_outline(JceRenderer *r,
+static void draw_circle_outline(const JceRenderer *r,
                                  float cx, float cy, float radius,
                                  float thickness, uint32_t color)
 {
@@ -509,9 +512,19 @@ static void draw_circle_outline(JceRenderer *r,
 
 /* ── Drawing ────────────────────────────────────────────────────── */
 
+void jce_touch_hud_set_visible(JceTouchHud *hud, bool visible)
+{
+    if (hud) hud->visible = visible;
+}
+
+bool jce_touch_hud_is_visible(const JceTouchHud *hud)
+{
+    return hud ? hud->visible : false;
+}
+
 void jce_touch_hud_draw(JceTouchHud *hud)
 {
-    if (!hud) return;
+    if (!hud || !hud->visible) return;
 
     int lw, lh;
     jce_window_get_logical(hud->window, &lw, &lh);

@@ -8,9 +8,9 @@
 
 #include "jce_async_loader.h"
 #include "pak_loader.h"
-#include "renderer/jce_texture.h"
+#include "graphics/jce_texture.h"
 #include "audio/jce_audio.h"
-#include "core/jce_log.h"
+#include "foundation/jce_log.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3_image/SDL_image.h>
@@ -238,7 +238,7 @@ JceAsyncTask *jce_async_load_texture(PakArchive *pak, const char *path,
     task->result.tex.sampler_mode = sampler_mode;
     snprintf(task->path, sizeof(task->path), "%s", path);
 
-    task->thread = SDL_CreateThread(texture_worker, "tex_load", task);
+    task->thread = SDL_CreateThread(texture_worker, task->path, task);
     if (!task->thread) {
         SDL_free(task);
         return NULL;
@@ -258,7 +258,7 @@ JceAsyncTask *jce_async_load_audio(PakArchive *pak, const char *path)
     task->pak  = pak;
     snprintf(task->path, sizeof(task->path), "%s", path);
 
-    task->thread = SDL_CreateThread(audio_worker, "aud_load", task);
+    task->thread = SDL_CreateThread(audio_worker, task->path, task);
     if (!task->thread) {
         SDL_free(task);
         return NULL;

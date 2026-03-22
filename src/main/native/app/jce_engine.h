@@ -1,0 +1,32 @@
+/*
+ * jce_engine.h  Engine bootstrap and lifecycle.
+ *
+ * Owns all subsystems (window, renderer, audio, input, PAK, app).
+ * main.c delegates every SDL callback to this module.
+ */
+
+#ifndef JCE_ENGINE_H
+#define JCE_ENGINE_H
+
+#include <SDL3/SDL.h>
+
+typedef struct JceEngine JceEngine;
+
+/* Set optional config file path override used by jce_engine_create.
+   Pass NULL or empty string to clear override. */
+void           jce_engine_set_config_path(const char *path);
+
+/* Create the engine: init logger, load config, open PAK, create
+   window/renderer/audio/input, async-load assets, create app. */
+JceEngine     *jce_engine_create(int argc, char *argv[]);
+
+/* Route an SDL event to input + app. Returns SDL_APP_SUCCESS on quit. */
+SDL_AppResult  jce_engine_event(JceEngine *e, const SDL_Event *event);
+
+/* Run one frame: begin_frame, app_update, end_frame, input_update. */
+SDL_AppResult  jce_engine_iterate(JceEngine *e);
+
+/* Shut down everything in reverse order. */
+void           jce_engine_destroy(JceEngine *e);
+
+#endif /* JCE_ENGINE_H */
