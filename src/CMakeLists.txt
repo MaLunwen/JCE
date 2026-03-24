@@ -189,6 +189,7 @@ elseif(MSVC)
 		/W4
 		/wd4100    # unreferenced formal parameter
 		/wd4127    # conditional expression is constant (P10 assert)
+		/utf-8     # source and execution charset = UTF-8 (i18n strings)
 		/Zc:preprocessor)  # standards-conforming preprocessor (required by bgfx/bx)
 	target_compile_definitions(JCE PRIVATE
 		_CRT_SECURE_NO_WARNINGS

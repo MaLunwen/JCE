@@ -11,7 +11,8 @@
  *   [names section]           concatenated UTF-8 path strings
  *   [data section]            concatenated ZSTD-compressed frames
  */
-#pragma once
+#ifndef JCE_PAK_FORMAT_H
+#define JCE_PAK_FORMAT_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -83,3 +84,5 @@ static inline uint64_t jpak_read_le64(const void *p) {
          | (uint64_t)b[6] << 48
          | (uint64_t)b[7] << 56;
 }
+
+#endif /* JCE_PAK_FORMAT_H */

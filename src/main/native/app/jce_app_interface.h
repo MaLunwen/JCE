@@ -66,6 +66,9 @@ typedef struct JceAppDesc {
     /* Optional: called on window resize. NULL = ignored. */
     void (*on_resize)(uint32_t w, uint32_t h, void *user_data);
 
+    /* Optional: return true when app wants to quit. */
+    bool (*should_quit)(void *user_data);
+
     /* Opaque pointer passed to all callbacks.
        Typically points to game state struct. */
     void *user_data;

@@ -5,11 +5,10 @@
 #include "jce_renderer.h"
 #include "jce_camera.h"
 #include "jce_views.h"
+#include "jce_shaders.h"
 #include "platform/jce_window.h"
-#include "resource/pak_loader.h"
 #include "foundation/jce_log.h"
 #include "foundation/jce_math.h"
-#include "jce_shaders.h"
 
 #include <bgfx/c99/bgfx.h>
 #include <SDL3/SDL.h>
@@ -35,6 +34,7 @@ struct JceRenderer {
     bgfx_uniform_handle_t  u_light_dir;      /* vec4: xyz = light direction */
     bgfx_uniform_handle_t  u_light_color;    /* vec4: xyz = color, w = ambient */
     uint32_t               reset_flags;
+    uint32_t               debug_flags;
     char                   gpu_name[128];
 };
 
@@ -102,10 +102,10 @@ static const bgfx_renderer_type_t *get_platform_fallback_chain(void)
 
 /* -- Lifecycle ------------------------------------------------------ */
 
-JceRenderer *jce_renderer_create(JceWindow *win, const PakArchive *pak,
+JceRenderer *jce_renderer_create(JceWindow *win,
                                   const JceRendererConfig *cfg)
 {
-    if (!win || !pak || !cfg) return NULL;
+    if (!win || !cfg) return NULL;
 
     /* Retrieve native window handle.
      * On iOS the native handle may become available slightly after window
@@ -139,9 +139,13 @@ JceRenderer *jce_renderer_create(JceWindow *win, const PakArchive *pak,
     uint32_t reset_flags = cfg->vsync ? BGFX_RESET_VSYNC : BGFX_RESET_NONE;
 
     bgfx_renderer_type_t requested_type = map_backend(cfg->backend);
-    LOG_INFO(LOG_TAG, "init request: backend=%s nwh=%p ndt=%p size=%ux%u",
-             requested_type == BGFX_RENDERER_TYPE_COUNT ? "auto" : bgfx_get_renderer_name(requested_type),
-             pd.nwh, pd.ndt, w, h);
+    const char *backend_name =
+        requested_type == BGFX_RENDERER_TYPE_COUNT
+            ? "auto"
+            : bgfx_get_renderer_name(requested_type);
+    LOG_INFO(LOG_TAG,
+        "init request: backend=%s nwh=%p ndt=%p size=%ux%u",
+        backend_name, pd.nwh, pd.ndt, w, h);
 
     /* On macOS (not iOS), bgfx's default multi-threaded mode causes a deadlock:
      * the render thread needs to call back to the main thread (via GCD)
@@ -228,51 +232,46 @@ JceRenderer *jce_renderer_create(JceWindow *win, const PakArchive *pak,
         return NULL;
     }
     r->reset_flags = reset_flags;
+    r->debug_flags = cfg->debug_text ? BGFX_DEBUG_TEXT : 0;
 
-    bgfx_vertex_layout_begin(&r->layout, bgfx_get_renderer_type());
-    bgfx_vertex_layout_add(&r->layout, BGFX_ATTRIB_POSITION, 3,
-                           BGFX_ATTRIB_TYPE_FLOAT, false, false);
-    bgfx_vertex_layout_add(&r->layout, BGFX_ATTRIB_COLOR0, 4,
-                           BGFX_ATTRIB_TYPE_UINT8, true, false);
+    /* Color vertex layout: pos(float3) + color(uint8x4). */
+    bgfx_vertex_layout_begin(&r->layout,
+        bgfx_get_renderer_type());
+    bgfx_vertex_layout_add(&r->layout,
+        BGFX_ATTRIB_POSITION, 3,
+        BGFX_ATTRIB_TYPE_FLOAT, false, false);
+    bgfx_vertex_layout_add(&r->layout,
+        BGFX_ATTRIB_COLOR0, 4,
+        BGFX_ATTRIB_TYPE_UINT8, true, false);
     bgfx_vertex_layout_end(&r->layout);
 
-    /* Load color shader program. */
-    r->program = (bgfx_program_handle_t){ shader_load_program(pak, "color").idx };
-    if (r->program.idx == UINT16_MAX) {
-        LOG_ERROR(LOG_TAG, "shader_load_program('color') failed");
-        bgfx_shutdown();
-        SDL_free(r);
-        return NULL;
-    }
-
-    /* Textured vertex layout: Position (float3) + Color0 (UINT8x4) + TexCoord0 (float2). */
-    bgfx_vertex_layout_begin(&r->layout_textured, bgfx_get_renderer_type());
-    bgfx_vertex_layout_add(&r->layout_textured, BGFX_ATTRIB_POSITION, 3,
-                           BGFX_ATTRIB_TYPE_FLOAT, false, false);
-    bgfx_vertex_layout_add(&r->layout_textured, BGFX_ATTRIB_COLOR0, 4,
-                           BGFX_ATTRIB_TYPE_UINT8, true, false);
-    bgfx_vertex_layout_add(&r->layout_textured, BGFX_ATTRIB_TEXCOORD0, 2,
-                           BGFX_ATTRIB_TYPE_FLOAT, false, false);
+    /* Textured vertex layout: pos + color + uv. */
+    bgfx_vertex_layout_begin(&r->layout_textured,
+        bgfx_get_renderer_type());
+    bgfx_vertex_layout_add(&r->layout_textured,
+        BGFX_ATTRIB_POSITION, 3,
+        BGFX_ATTRIB_TYPE_FLOAT, false, false);
+    bgfx_vertex_layout_add(&r->layout_textured,
+        BGFX_ATTRIB_COLOR0, 4,
+        BGFX_ATTRIB_TYPE_UINT8, true, false);
+    bgfx_vertex_layout_add(&r->layout_textured,
+        BGFX_ATTRIB_TEXCOORD0, 2,
+        BGFX_ATTRIB_TYPE_FLOAT, false, false);
     bgfx_vertex_layout_end(&r->layout_textured);
 
-    /* Load textured shader program. */
-    r->program_textured = (bgfx_program_handle_t){ shader_load_program(pak, "textured").idx };
-    if (r->program_textured.idx == UINT16_MAX) {
-        LOG_WARN(LOG_TAG, "shader_load_program('textured') failed  textures unavailable");
-        r->program_textured.idx = UINT16_MAX;
-    }
+    /* Uniforms (created here; shaders attached later). */
+    r->u_tex_color = bgfx_create_uniform(
+        "s_texColor", BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    r->u_light_dir = bgfx_create_uniform(
+        "u_lightDir", BGFX_UNIFORM_TYPE_VEC4, 1);
+    r->u_light_color = bgfx_create_uniform(
+        "u_lightColor", BGFX_UNIFORM_TYPE_VEC4, 1);
 
-    /* Texture sampler uniform. */
-    r->u_tex_color = bgfx_create_uniform("s_texColor", BGFX_UNIFORM_TYPE_SAMPLER, 1);
-
-    /* Load mesh shader program (pos+normal+uv + lighting). */
-    r->program_mesh = (bgfx_program_handle_t){ shader_load_program(pak, "mesh").idx };
-    if (r->program_mesh.idx == UINT16_MAX)
-        LOG_WARN(LOG_TAG, "shader_load_program('mesh') failed  3D meshes unavailable");
-
-    /* Lighting uniforms. */
-    r->u_light_dir   = bgfx_create_uniform("u_lightDir",   BGFX_UNIFORM_TYPE_VEC4, 1);
-    r->u_light_color = bgfx_create_uniform("u_lightColor", BGFX_UNIFORM_TYPE_VEC4, 1);
+    /* Shader programs default to invalid; call
+       jce_renderer_set_shaders() after creation. */
+    r->program.idx          = UINT16_MAX;
+    r->program_textured.idx = UINT16_MAX;
+    r->program_mesh.idx     = UINT16_MAX;
 
     /* Build GPU name from vendor ID + renderer name. */
     {
@@ -295,6 +294,22 @@ JceRenderer *jce_renderer_create(JceWindow *win, const PakArchive *pak,
     return r;
 }
 
+void jce_renderer_set_shaders(JceRenderer *r,
+                              const JceShaderSet *shaders)
+{
+    if (!r || !shaders || r->is_fallback) return;
+
+    r->program = (bgfx_program_handle_t){
+        shaders->color.idx };
+    r->program_textured = (bgfx_program_handle_t){
+        shaders->textured.idx };
+    r->program_mesh = (bgfx_program_handle_t){
+        shaders->mesh.idx };
+
+    if (r->program.idx == UINT16_MAX)
+        LOG_ERROR(LOG_TAG, "color shader not provided");
+}
+
 JceRenderer *jce_renderer_create_fallback(JceWindow *win)
 {
     if (!win) return NULL;
@@ -302,18 +317,30 @@ JceRenderer *jce_renderer_create_fallback(JceWindow *win)
     if (!r) return NULL;
 
     r->is_fallback = true;
-    
-    SDL_Window *sdl_win = jce_window_sdl(win);
-    r->sdl_renderer = SDL_CreateRenderer(sdl_win, NULL);
-    if (!r->sdl_renderer) {
-        LOG_ERROR(LOG_TAG, "SDL_CreateRenderer failed: %s", SDL_GetError());
-        SDL_free(r);
-        return NULL;
-    }
 
-    snprintf(r->gpu_name, sizeof(r->gpu_name), "%s", SDL_GetRendererName(r->sdl_renderer));
-    LOG_SUCCESS(LOG_TAG, "fallback initialized (%s)", r->gpu_name);
-    return r;
+    SDL_Window *sdl_win = jce_window_sdl(win);
+
+    /* 1) Let SDL pick the best available GPU-backed renderer. */
+    r->sdl_renderer = SDL_CreateRenderer(sdl_win, NULL);
+    if (r->sdl_renderer) {
+        snprintf(r->gpu_name, sizeof(r->gpu_name), "Fallback: %s",
+                 SDL_GetRendererName(r->sdl_renderer));
+        LOG_SUCCESS(LOG_TAG, "fallback initialized (%s)", r->gpu_name);
+        return r;
+    }
+    LOG_WARN(LOG_TAG, "SDL auto renderer failed: %s — trying software", SDL_GetError());
+
+    /* 2) Force pure CPU software renderer (no GPU needed at all). */
+    r->sdl_renderer = SDL_CreateRenderer(sdl_win, SDL_SOFTWARE_RENDERER);
+    if (r->sdl_renderer) {
+        snprintf(r->gpu_name, sizeof(r->gpu_name), "Fallback: software (CPU)");
+        LOG_SUCCESS(LOG_TAG, "fallback initialized (software CPU renderer)");
+        return r;
+    }
+    LOG_ERROR(LOG_TAG, "SDL software renderer failed: %s", SDL_GetError());
+
+    SDL_free(r);
+    return NULL;
 }
 
 bool jce_renderer_is_fallback(const JceRenderer *r)
@@ -321,25 +348,137 @@ bool jce_renderer_is_fallback(const JceRenderer *r)
     return r ? r->is_fallback : false;
 }
 
+/* -- Fallback frame: real 2D rendering via SDL_Renderer ------------- */
+
+/* Draw a filled rounded-corner rectangle (approximated with rects). */
+static void fb_draw_panel(SDL_Renderer *rd, float x, float y, float w, float h,
+                          uint8_t r, uint8_t g, uint8_t b, uint8_t a)
+{
+    SDL_SetRenderDrawColor(rd, r, g, b, a);
+    SDL_FRect rect = { x, y, w, h };
+    SDL_RenderFillRect(rd, &rect);
+}
+
+/* Draw a 1px border rectangle. */
+static void fb_draw_border(SDL_Renderer *rd, float x, float y, float w, float h,
+                           uint8_t r, uint8_t g, uint8_t b, uint8_t a)
+{
+    SDL_SetRenderDrawColor(rd, r, g, b, a);
+    SDL_FRect rect = { x, y, w, h };
+    SDL_RenderRect(rd, &rect);
+}
+
 void jce_renderer_render_fallback_frame(const JceRenderer *r)
 {
     if (!r || !r->is_fallback || !r->sdl_renderer) return;
 
-    uint64_t ticks = SDL_GetTicks();
-    if ((ticks / 500) % 2 == 0) {
-        SDL_SetRenderDrawColor(r->sdl_renderer, 20, 180, 255, 255); /* Orange */
-    } else {
-        SDL_SetRenderDrawColor(r->sdl_renderer, 255, 140, 40, 255);   /* Blue */
-    }
-    
-    SDL_RenderClear(r->sdl_renderer);
-    
-    // We could draw text here if we had an SDL backend font, but for now
-    // a blue screen of safe fallback is better than crashing out.
-    // At least the user sees a blue screen instead of a crash and the
-    // window event loop still runs.
+    SDL_Renderer *rd = r->sdl_renderer;
+    int ww = 0, wh = 0;
+    SDL_GetRenderOutputSize(rd, &ww, &wh);
+    if (ww <= 0 || wh <= 0) return;
 
-    SDL_RenderPresent(r->sdl_renderer);
+    float fw = (float)ww, fh = (float)wh;
+    float scale = fw / 800.0f; /* base design at 800px wide */
+    if (scale < 0.5f) scale = 0.5f;
+    if (scale > 2.5f) scale = 2.5f;
+
+    /* -- Background gradient (approximated with horizontal bands) -- */
+    for (int i = 0; i < wh; i++) {
+        float t = (float)i / fh;
+        uint8_t cr = (uint8_t)(20  + t * 15);
+        uint8_t cg = (uint8_t)(22  + t * 18);
+        uint8_t cb = (uint8_t)(35  + t * 25);
+        SDL_SetRenderDrawColor(rd, cr, cg, cb, 255);
+        SDL_FRect line = { 0, (float)i, fw, 1.0f };
+        SDL_RenderFillRect(rd, &line);
+    }
+
+    /* -- Center panel ------------------------------------------------ */
+    float panel_w = 460 * scale;
+    float panel_h = 280 * scale;
+    float px = (fw - panel_w) / 2.0f;
+    float py = (fh - panel_h) / 2.0f;
+
+    fb_draw_panel(rd, px, py, panel_w, panel_h, 30, 32, 45, 230);
+    fb_draw_border(rd, px, py, panel_w, panel_h, 80, 180, 255, 200);
+
+    /* -- Title bar --------------------------------------------------- */
+    float bar_h = 36 * scale;
+    fb_draw_panel(rd, px, py, panel_w, bar_h, 50, 130, 220, 255);
+
+    /* -- Text via SDL_RenderDebugText (8x8 monospace, built-in) ------ */
+    float text_scale = scale * 1.5f;
+    SDL_SetRenderScale(rd, text_scale, text_scale);
+
+    float tx = (px + 12 * scale) / text_scale;
+    float ty = (py + 10 * scale) / text_scale;
+
+    /* Title. */
+    SDL_SetRenderDrawColor(rd, 255, 255, 255, 255);
+    SDL_RenderDebugText(rd, tx, ty, "JCE - Software Renderer");
+
+    /* Info lines below title bar. */
+    float line_y = (py + bar_h + 16 * scale) / text_scale;
+    float line_x = (px + 20 * scale) / text_scale;
+    float line_h = 14.0f;
+
+    SDL_SetRenderDrawColor(rd, 200, 200, 210, 255);
+    SDL_RenderDebugText(rd, line_x, line_y, "GPU acceleration unavailable.");
+    line_y += line_h;
+    SDL_RenderDebugText(rd, line_x, line_y, "Running in CPU software mode.");
+    line_y += line_h * 1.8f;
+
+    SDL_SetRenderDrawColor(rd, 140, 180, 220, 255);
+    SDL_RenderDebugText(rd, line_x, line_y, "Renderer:");
+    SDL_SetRenderDrawColor(rd, 255, 220, 100, 255);
+    SDL_RenderDebugText(rd, line_x + 80, line_y, r->gpu_name);
+    line_y += line_h;
+
+    SDL_SetRenderDrawColor(rd, 140, 180, 220, 255);
+    SDL_RenderDebugText(rd, line_x, line_y, "Platform:");
+    SDL_SetRenderDrawColor(rd, 255, 220, 100, 255);
+    SDL_RenderDebugText(rd, line_x + 80, line_y, SDL_GetPlatform());
+    line_y += line_h * 1.8f;
+
+    /* Uptime. */
+    uint64_t ticks = SDL_GetTicks();
+    unsigned secs = (unsigned)(ticks / 1000);
+    unsigned mins = secs / 60;
+    secs %= 60;
+    char time_buf[32];
+    snprintf(time_buf, sizeof(time_buf), "%u:%02u", mins, secs);
+
+    SDL_SetRenderDrawColor(rd, 140, 180, 220, 255);
+    SDL_RenderDebugText(rd, line_x, line_y, "Uptime:");
+    SDL_SetRenderDrawColor(rd, 180, 255, 180, 255);
+    SDL_RenderDebugText(rd, line_x + 80, line_y, time_buf);
+    line_y += line_h * 1.8f;
+
+    /* Hint message. */
+    SDL_SetRenderDrawColor(rd, 120, 120, 140, 255);
+    SDL_RenderDebugText(rd, line_x, line_y, "For full rendering, use a system");
+    line_y += line_h;
+    SDL_RenderDebugText(rd, line_x, line_y, "with GPU hardware acceleration.");
+
+    /* Restore scale. */
+    SDL_SetRenderScale(rd, 1.0f, 1.0f);
+
+    /* -- Animated activity indicator (bottom of panel) --------------- */
+    {
+        float bar_x = px + 20 * scale;
+        float bar_y = py + panel_h - 28 * scale;
+        float bar_w = panel_w - 40 * scale;
+        float bar_ht = 6 * scale;
+        /* Ping-pong animation. */
+        float t = (float)(ticks % 3000) / 3000.0f;
+        float pos = t < 0.5f ? t * 2.0f : 2.0f - t * 2.0f;
+        fb_draw_panel(rd, bar_x, bar_y, bar_w, bar_ht, 40, 40, 50, 255);
+        float dot_w = bar_w * 0.25f;
+        fb_draw_panel(rd, bar_x + pos * (bar_w - dot_w), bar_y,
+                      dot_w, bar_ht, 80, 180, 255, 255);
+    }
+
+    SDL_RenderPresent(rd);
 }
 
 void jce_renderer_destroy(JceRenderer *r)
@@ -565,4 +704,46 @@ const char *jce_renderer_get_gpu_name(const JceRenderer *r)
 bool jce_renderer_get_vsync(const JceRenderer *r)
 {
     return r ? (r->reset_flags & BGFX_RESET_VSYNC) != 0 : false;
+}
+
+/* -- Transform / texture binding (game-layer wrappers) ------------- */
+
+void jce_renderer_set_transform(const float *mtx)
+{
+    bgfx_set_transform(mtx, 1);
+}
+
+void jce_renderer_bind_texture(const JceRenderer *r,
+                               uint8_t stage,
+                               JceTexture tex)
+{
+    if (!r || tex.idx == UINT16_MAX) return;
+    bgfx_texture_handle_t th = { tex.idx };
+    bgfx_set_texture(stage,
+        (bgfx_uniform_handle_t){ r->u_tex_color.idx },
+        th, UINT32_MAX);
+}
+
+void jce_renderer_dbg_text_attr(uint16_t x, uint16_t y,
+                                uint8_t attr,
+                                const char *str)
+{
+    bgfx_dbg_text_printf(x, y, attr, "%s", str);
+}
+
+/* -- Wireframe debug mode ------------------------------------------ */
+
+void jce_renderer_set_wireframe(JceRenderer *r, bool enabled)
+{
+    if (!r || r->is_fallback) return;
+    if (enabled)
+        r->debug_flags |= BGFX_DEBUG_WIREFRAME;
+    else
+        r->debug_flags &= ~(uint32_t)BGFX_DEBUG_WIREFRAME;
+    bgfx_set_debug(r->debug_flags);
+}
+
+bool jce_renderer_get_wireframe(const JceRenderer *r)
+{
+    return r ? (r->debug_flags & BGFX_DEBUG_WIREFRAME) != 0 : false;
 }

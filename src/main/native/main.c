@@ -11,12 +11,16 @@
 #include <SDL3/SDL_main.h>
 
 #include "app/jce_engine.h"
+#include "game/jce_app.h"
 
 static JceEngine *g_engine;
 
-SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
+SDL_AppResult SDL_AppInit(void **appstate, int argc,
+                          char *argv[])
 {
     (void)appstate;
+    JceAppDesc desc = jce_app_get_desc();
+    jce_engine_set_app_desc(&desc);
     g_engine = jce_engine_create(argc, argv);
     return g_engine ? SDL_APP_CONTINUE : SDL_APP_FAILURE;
 }

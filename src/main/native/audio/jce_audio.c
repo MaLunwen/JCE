@@ -137,7 +137,9 @@ static JceSound load_from_memory(JceAudio *audio, int slot,
 
     ma_result res = ma_decoder_init_memory(data, size, &cfg, &decoder);
     if (res != MA_SUCCESS) {
-        LOG_ERROR("jce_audio", "decode failed for '%s' (ma_result=%d, size=%zu)", path, (int)res, size);
+        LOG_ERROR("jce_audio",
+            "decode failed for '%s' (ma_result=%d, size=%zu)",
+            path, (int)res, size);
         return JCE_SOUND_INVALID;
     }
 
@@ -163,7 +165,11 @@ static JceSound load_from_memory(JceAudio *audio, int slot,
                 alloc_frames *= 2;
                 int16_t *tmp = (int16_t *)SDL_realloc(pcm,
                     alloc_frames * channels * sizeof(int16_t));
-                if (!tmp) { SDL_free(pcm); ma_decoder_uninit(&decoder); return JCE_SOUND_INVALID; }
+                if (!tmp) {
+                    SDL_free(pcm);
+                    ma_decoder_uninit(&decoder);
+                    return JCE_SOUND_INVALID;
+                }
                 pcm = tmp;
             }
             ma_uint64 read = 0;
@@ -467,10 +473,27 @@ JceVoice jce_audio_play(JceAudio *audio, JceSound snd, bool loop, float volume, 
 void jce_audio_stop(JceAudio *audio, JceVoice voice) { (void)audio; (void)voice; }
 void jce_audio_pause(JceAudio *audio, JceVoice voice) { (void)audio; (void)voice; }
 void jce_audio_resume(JceAudio *audio, JceVoice voice) { (void)audio; (void)voice; }
-void jce_audio_set_volume(JceAudio *audio, JceVoice voice, float volume) { (void)audio; (void)voice; (void)volume; }
-void jce_audio_set_pitch(JceAudio *audio, JceVoice voice, float pitch) { (void)audio; (void)voice; (void)pitch; }
-void jce_audio_set_looping(JceAudio *audio, JceVoice voice, bool loop) { (void)audio; (void)voice; (void)loop; }
-bool jce_audio_is_playing(const JceAudio *audio, JceVoice voice) { (void)audio; (void)voice; return false; }
+void jce_audio_set_volume(JceAudio *audio, JceVoice voice,
+                          float volume)
+{
+    (void)audio; (void)voice; (void)volume;
+}
+void jce_audio_set_pitch(JceAudio *audio, JceVoice voice,
+                         float pitch)
+{
+    (void)audio; (void)voice; (void)pitch;
+}
+void jce_audio_set_looping(JceAudio *audio, JceVoice voice,
+                           bool loop)
+{
+    (void)audio; (void)voice; (void)loop;
+}
+bool jce_audio_is_playing(const JceAudio *audio,
+                          JceVoice voice)
+{
+    (void)audio; (void)voice;
+    return false;
+}
 void jce_audio_set_master_volume(JceAudio *audio, float volume) { (void)audio; (void)volume; }
 void jce_audio_stop_all(JceAudio *audio) { (void)audio; }
 

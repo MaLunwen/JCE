@@ -1,10 +1,12 @@
 /*
- * jce_text.c  Glyph-atlas text rendering implementation.
+ * jce_text.c  Glyph-atlas text rendering with Unicode support.
  *
- * Pipeline: PAK  decompress  SDL_IOStream  TTF_OpenFontIO 
- *           render ASCII glyphs  pack into atlas  bgfx texture.
+ * Pipeline: PAK -> decompress -> SDL_IOStream -> TTF_OpenFontIO
+ *           -> render glyphs -> pack into atlas -> bgfx texture.
  *
- * Each character is drawn as a textured quad via jce_draw_textured_rect.
+ * ASCII glyphs (32-126) are stored in a fixed array for fast lookup.
+ * Extra codepoints (e.g. CJK) are stored in an open-addressing hash table.
+ * Text strings are decoded as UTF-8.
  */
 
 #include "jce_text.h"
@@ -46,138 +48,242 @@ typedef struct {
     int   advance;           /* horizontal advance       */
 } GlyphInfo;
 
+/* Hash table entry for non-ASCII glyphs. */
+typedef struct {
+    uint32_t  codepoint;     /* 0 = empty slot */
+    GlyphInfo glyph;
+} GlyphEntry;
+
 struct JceFont {
     JceTexture  atlas;
     uint32_t    atlas_w, atlas_h;
     int         line_height;
-    GlyphInfo   glyphs[GLYPH_COUNT];
+    GlyphInfo   ascii[GLYPH_COUNT];   /* fast path: ASCII 32-126 */
+    GlyphEntry *extra;                /* hash table for non-ASCII */
+    uint32_t    extra_cap;            /* capacity (power of 2)    */
 };
+
+/* -- UTF-8 helpers ------------------------------------------------- */
+
+static uint32_t utf8_decode(const char **pp)
+{
+    const unsigned char *s = (const unsigned char *)*pp;
+    uint32_t cp;
+    if (s[0] < 0x80) {
+        cp = s[0]; *pp += 1;
+    } else if ((s[0] & 0xE0) == 0xC0 && (s[1] & 0xC0) == 0x80) {
+        cp = ((uint32_t)(s[0] & 0x1F) << 6) | (s[1] & 0x3F);
+        *pp += 2;
+    } else if ((s[0] & 0xF0) == 0xE0 && (s[1] & 0xC0) == 0x80
+                                       && (s[2] & 0xC0) == 0x80) {
+        cp = ((uint32_t)(s[0] & 0x0F) << 12)
+           | ((uint32_t)(s[1] & 0x3F) << 6)
+           | (s[2] & 0x3F);
+        *pp += 3;
+    } else if ((s[0] & 0xF8) == 0xF0 && (s[1] & 0xC0) == 0x80
+                                       && (s[2] & 0xC0) == 0x80
+                                       && (s[3] & 0xC0) == 0x80) {
+        cp = ((uint32_t)(s[0] & 0x07) << 18)
+           | ((uint32_t)(s[1] & 0x3F) << 12)
+           | ((uint32_t)(s[2] & 0x3F) << 6)
+           | (s[3] & 0x3F);
+        *pp += 4;
+    } else {
+        cp = '?'; *pp += 1; /* malformed */
+    }
+    return cp;
+}
+
+static int utf8_encode(uint32_t cp, char *buf)
+{
+    if (cp < 0x80) {
+        buf[0] = (char)cp; buf[1] = 0;
+        return 1;
+    }
+    if (cp < 0x800) {
+        buf[0] = (char)(0xC0 | (cp >> 6));
+        buf[1] = (char)(0x80 | (cp & 0x3F));
+        buf[2] = 0;
+        return 2;
+    }
+    if (cp < 0x10000) {
+        buf[0] = (char)(0xE0 | (cp >> 12));
+        buf[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[2] = (char)(0x80 | (cp & 0x3F));
+        buf[3] = 0;
+        return 3;
+    }
+    buf[0] = (char)(0xF0 | (cp >> 18));
+    buf[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+    buf[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+    buf[3] = (char)(0x80 | (cp & 0x3F));
+    buf[4] = 0;
+    return 4;
+}
+
+/* -- Hash table helpers -------------------------------------------- */
+
+static uint32_t next_pow2(uint32_t v)
+{
+    v--;
+    v |= v >> 1;  v |= v >> 2;
+    v |= v >> 4;  v |= v >> 8;
+    v |= v >> 16;
+    return v + 1;
+}
+
+static void glyph_map_insert(GlyphEntry *map, uint32_t cap,
+                              uint32_t cp, const GlyphInfo *g)
+{
+    uint32_t mask = cap - 1;
+    uint32_t idx = cp & mask;
+    while (map[idx].codepoint != 0)
+        idx = (idx + 1) & mask;
+    map[idx].codepoint = cp;
+    map[idx].glyph     = *g;
+}
+
+static const GlyphInfo *glyph_map_find(const GlyphEntry *map, uint32_t cap,
+                                        uint32_t cp)
+{
+    if (!map || cap == 0) return NULL;
+    uint32_t mask = cap - 1;
+    uint32_t idx = cp & mask;
+    for (uint32_t i = 0; i < cap; i++) {
+        uint32_t slot = (idx + i) & mask;
+        if (map[slot].codepoint == 0)  return NULL;
+        if (map[slot].codepoint == cp) return &map[slot].glyph;
+    }
+    return NULL;
+}
+
+/* Unified glyph lookup: ASCII fast path + hash table fallback. */
+static const GlyphInfo *font_get_glyph(const JceFont *font, uint32_t cp)
+{
+    if (cp >= GLYPH_FIRST && cp <= GLYPH_LAST)
+        return &font->ascii[cp - GLYPH_FIRST];
+    return glyph_map_find(font->extra, font->extra_cap, cp);
+}
 
 /* -- Atlas construction -------------------------------------------- */
 
-/* Compute atlas dimensions: single row of glyphs, power-of-two width. */
-static void compute_atlas_size(const GlyphInfo *glyphs, int line_h,
-                               uint32_t *out_w, uint32_t *out_h)
+static JceTexture build_atlas(TTF_Font *ttf, JceFont *font,
+                               const uint32_t *extra_cps, int extra_count)
 {
-    int total_w = 0;
-    for (int i = 0; i < GLYPH_COUNT; i++)
-        total_w += glyphs[i].w + 1; /* +1 pixel padding */
+    int total = GLYPH_COUNT + extra_count;
 
-    /* Round up to next power of two for GPU friendliness. */
-    uint32_t w = 64;
-    while ((int)w < total_w) w <<= 1;
-    if (w > 4096) w = 4096;
-
-    /* Use multiple rows if single row doesn't fit. */
-    int rows = 1;
-    {
-        int x = 0;
-        for (int i = 0; i < GLYPH_COUNT; i++) {
-            if (x + glyphs[i].w + 1 > (int)w) {
-                rows++;
-                x = 0;
-            }
-            x += glyphs[i].w + 1;
-        }
-    }
-
-    uint32_t h = 1;
-    while (h < (uint32_t)(rows * (line_h + 1)))
-        h <<= 1;
-
-    *out_w = w;
-    *out_h = h;
-}
-
-static JceTexture build_atlas(TTF_Font *ttf, GlyphInfo *glyphs,
-                              int line_h, uint32_t *aw, uint32_t *ah)
-{
-    /* First pass: render each glyph, store surfaces and metrics. */
-    SDL_Surface *glyph_surfs[GLYPH_COUNT];
-    memset(glyph_surfs, 0, sizeof(glyph_surfs));
-
-    SDL_Color white = { 255, 255, 255, 255 };
-
-    for (int i = 0; i < GLYPH_COUNT; i++) {
-        char ch[2] = { (char)(GLYPH_FIRST + i), '\0' };
-        SDL_Surface *s = TTF_RenderText_Blended(ttf, ch, 0, white);
-        if (s) {
-            glyph_surfs[i] = s;
-            glyphs[i].w = s->w;
-            glyphs[i].h = s->h;
-        } else {
-            glyphs[i].w = 0;
-            glyphs[i].h = 0;
-        }
-
-        /* Get advance width. */
-        int adv = 0;
-        TTF_GetGlyphMetrics(ttf, (uint32_t)(GLYPH_FIRST + i),
-                            NULL, NULL, NULL, NULL, &adv);
-        glyphs[i].advance = adv;
-    }
-
-    /* Compute atlas size. */
-    compute_atlas_size(glyphs, line_h, aw, ah);
-
-    /* Create RGBA8 atlas surface. */
-    SDL_Surface *atlas = SDL_CreateSurface((int)*aw, (int)*ah,
-                                           SDL_PIXELFORMAT_RGBA32);
-    if (!atlas) {
-        LOG_ERROR(LOG_TAG, "SDL_CreateSurface failed: %s", SDL_GetError());
-        for (int i = 0; i < GLYPH_COUNT; i++)
-            if (glyph_surfs[i]) SDL_DestroySurface(glyph_surfs[i]);
+    /* Temp arrays for surfaces and metrics. */
+    SDL_Surface **surfs = (SDL_Surface **)SDL_calloc((size_t)total,
+                                                      sizeof(SDL_Surface *));
+    GlyphInfo *infos = (GlyphInfo *)SDL_calloc((size_t)total, sizeof(GlyphInfo));
+    if (!surfs || !infos) {
+        SDL_free(surfs); SDL_free(infos);
         return JCE_TEXTURE_INVALID;
     }
 
-    /* Clear atlas to transparent. */
-    SDL_FillSurfaceRect(atlas, NULL, 0);
+    SDL_Color white = { 255, 255, 255, 255 };
 
-    /* Blit glyphs into atlas, computing UVs. */
-    int cx = 0, cy = 0;
-    for (int i = 0; i < GLYPH_COUNT; i++) {
-        if (!glyph_surfs[i] || glyphs[i].w == 0) {
-            glyphs[i].u0 = glyphs[i].v0 = 0;
-            glyphs[i].u1 = glyphs[i].v1 = 0;
-            continue;
+    /* Pass 1: render every glyph and collect metrics. */
+    for (int i = 0; i < total; i++) {
+        uint32_t cp = (i < GLYPH_COUNT) ? (uint32_t)(GLYPH_FIRST + i)
+                                         : extra_cps[i - GLYPH_COUNT];
+
+        char utf8[5];
+        utf8_encode(cp, utf8);
+        SDL_Surface *s = TTF_RenderText_Blended(ttf, utf8, 0, white);
+        if (s) {
+            surfs[i]    = s;
+            infos[i].w  = s->w;
+            infos[i].h  = s->h;
         }
 
-        /* Wrap to next row if needed. */
-        if (cx + glyphs[i].w + 1 > (int)*aw) {
-            cx = 0;
-            cy += line_h + 1;
-        }
-
-        SDL_Rect dst = { cx, cy, glyphs[i].w, glyphs[i].h };
-        SDL_BlitSurface(glyph_surfs[i], NULL, atlas, &dst);
-
-        glyphs[i].u0 = (float)cx / (float)*aw;
-        glyphs[i].v0 = (float)cy / (float)*ah;
-        glyphs[i].u1 = (float)(cx + glyphs[i].w) / (float)*aw;
-        glyphs[i].v1 = (float)(cy + glyphs[i].h) / (float)*ah;
-
-        cx += glyphs[i].w + 1;
-        SDL_DestroySurface(glyph_surfs[i]);
-        glyph_surfs[i] = NULL;
+        int adv = 0;
+        TTF_GetGlyphMetrics(ttf, cp, NULL, NULL, NULL, NULL, &adv);
+        infos[i].advance = adv;
     }
 
-    /* Upload to bgfx. Handle possible pitch != w*4. */
+    /* Pass 2: compute atlas dimensions. */
+    int total_w = 0;
+    for (int i = 0; i < total; i++)
+        total_w += infos[i].w + 1;
+
+    uint32_t aw = 64;
+    while ((int)aw < total_w) aw <<= 1;
+    if (aw > 4096) aw = 4096;
+
+    int line_h = font->line_height;
+    int rows = 1, cx = 0;
+    for (int i = 0; i < total; i++) {
+        if (cx + infos[i].w + 1 > (int)aw) { rows++; cx = 0; }
+        cx += infos[i].w + 1;
+    }
+
+    uint32_t ah = 1;
+    while (ah < (uint32_t)(rows * (line_h + 1)))
+        ah <<= 1;
+
+    /* Pass 3: create atlas surface. */
+    SDL_Surface *atlas = SDL_CreateSurface((int)aw, (int)ah,
+                                           SDL_PIXELFORMAT_RGBA32);
+    if (!atlas) {
+        LOG_ERROR(LOG_TAG, "atlas surface failed: %s", SDL_GetError());
+        goto cleanup;
+    }
+    SDL_FillSurfaceRect(atlas, NULL, 0);
+
+    /* Allocate extra-glyph hash table. */
+    if (extra_count > 0) {
+        font->extra_cap = next_pow2((uint32_t)(extra_count * 2));
+        if (font->extra_cap < 16) font->extra_cap = 16;
+        font->extra = (GlyphEntry *)SDL_calloc(font->extra_cap,
+                                                sizeof(GlyphEntry));
+    }
+
+    /* Pass 4: blit glyphs into atlas, compute UVs, distribute to storage. */
+    cx = 0;
+    {
+        int cy = 0;
+        for (int i = 0; i < total; i++) {
+            GlyphInfo *g = &infos[i];
+
+            if (surfs[i] && g->w > 0 && g->h > 0) {
+                if (cx + g->w + 1 > (int)aw) { cx = 0; cy += line_h + 1; }
+
+                SDL_Rect dst = { cx, cy, g->w, g->h };
+                SDL_BlitSurface(surfs[i], NULL, atlas, &dst);
+
+                g->u0 = (float)cx            / (float)aw;
+                g->v0 = (float)cy            / (float)ah;
+                g->u1 = (float)(cx + g->w)   / (float)aw;
+                g->v1 = (float)(cy + g->h)   / (float)ah;
+
+                cx += g->w + 1;
+            }
+
+            if (i < GLYPH_COUNT) {
+                font->ascii[i] = *g;
+            } else if (font->extra) {
+                uint32_t cp = extra_cps[i - GLYPH_COUNT];
+                glyph_map_insert(font->extra, font->extra_cap, cp, g);
+            }
+        }
+    }
+
+    /* Pass 5: upload atlas to bgfx. */
     JceTexture tex;
     {
-        uint32_t expected_pitch = *aw * 4;
+        uint32_t expected_pitch = aw * 4;
         if ((uint32_t)atlas->pitch == expected_pitch) {
-            tex = jce_texture_from_rgba(atlas->pixels, *aw, *ah);
+            tex = jce_texture_from_rgba(atlas->pixels, aw, ah);
         } else {
-            /* Copy row-by-row to tightly packed buffer. */
-            uint32_t sz = *aw * *ah * 4;
+            uint32_t sz = aw * ah * 4;
             uint8_t *packed = (uint8_t *)SDL_malloc(sz);
             if (packed) {
                 const uint8_t *src = (const uint8_t *)atlas->pixels;
-                for (uint32_t row = 0; row < *ah; row++) {
+                for (uint32_t row = 0; row < ah; row++)
                     memcpy(packed + row * expected_pitch,
                            src + row * atlas->pitch, expected_pitch);
-                }
-                tex = jce_texture_from_rgba(packed, *aw, *ah);
+                tex = jce_texture_from_rgba(packed, aw, ah);
                 SDL_free(packed);
             } else {
                 tex = JCE_TEXTURE_INVALID;
@@ -186,16 +292,28 @@ static JceTexture build_atlas(TTF_Font *ttf, GlyphInfo *glyphs,
     }
     SDL_DestroySurface(atlas);
 
-    /* Clean up any remaining surfaces. */
-    for (int i = 0; i < GLYPH_COUNT; i++)
-        if (glyph_surfs[i]) SDL_DestroySurface(glyph_surfs[i]);
+    font->atlas_w = aw;
+    font->atlas_h = ah;
 
+    for (int i = 0; i < total; i++)
+        if (surfs[i]) SDL_DestroySurface(surfs[i]);
+    SDL_free(surfs);
+    SDL_free(infos);
     return tex;
+
+cleanup:
+    for (int i = 0; i < total; i++)
+        if (surfs[i]) SDL_DestroySurface(surfs[i]);
+    SDL_free(surfs);
+    SDL_free(infos);
+    return JCE_TEXTURE_INVALID;
 }
 
 /* -- Public API ----------------------------------------------------- */
 
-JceFont *jce_font_open(const PakArchive *pak, const char *asset_path, float pt_size)
+JceFont *jce_font_open_ex(const PakArchive *pak, const char *asset_path,
+                           float pt_size,
+                           const uint32_t *extra_cps, int extra_count)
 {
     if (!pak || !asset_path) return NULL;
     if (!ensure_ttf_init()) return NULL;
@@ -217,16 +335,11 @@ JceFont *jce_font_open(const PakArchive *pak, const char *asset_path, float pt_s
         return NULL;
     }
 
-    /* Open font from memory.
-       closeio=false because we manage the buffer ourselves. */
+    /* Open font from memory. */
     SDL_IOStream *io = SDL_IOFromConstMem(buf, (size_t)asset->original_size);
-    if (!io) {
-        SDL_free(buf);
-        return NULL;
-    }
+    if (!io) { SDL_free(buf); return NULL; }
 
-    TTF_Font *ttf = TTF_OpenFontIO(io, true, pt_size); /* true = auto-close io */
-
+    TTF_Font *ttf = TTF_OpenFontIO(io, true, pt_size);
     if (!ttf) {
         LOG_ERROR(LOG_TAG, "TTF_OpenFontIO failed for %s: %s",
                   asset_path, SDL_GetError());
@@ -243,27 +356,36 @@ JceFont *jce_font_open(const PakArchive *pak, const char *asset_path, float pt_s
 
     font->line_height = TTF_GetFontHeight(ttf);
 
-    font->atlas = build_atlas(ttf, font->glyphs, font->line_height,
-                              &font->atlas_w, &font->atlas_h);
+    font->atlas = build_atlas(ttf, font,
+                               extra_cps, extra_count < 0 ? 0 : extra_count);
 
     TTF_CloseFont(ttf);
-    SDL_free(buf);  /* safe now: TTF no longer references the buffer */
+    SDL_free(buf);
 
     if (!jce_texture_valid(font->atlas)) {
         LOG_ERROR(LOG_TAG, "atlas build failed for %s", asset_path);
+        SDL_free(font->extra);
         SDL_free(font);
         return NULL;
     }
 
-    LOG_DEBUG(LOG_TAG, "loaded %s (%.0fpt, atlas %ux%u)",
-              asset_path, pt_size, font->atlas_w, font->atlas_h);
+    LOG_DEBUG(LOG_TAG, "loaded %s (%.0fpt, atlas %ux%u, +%d extra glyphs)",
+              asset_path, pt_size, font->atlas_w, font->atlas_h,
+              extra_count > 0 ? extra_count : 0);
     return font;
+}
+
+JceFont *jce_font_open(const PakArchive *pak, const char *asset_path,
+                        float pt_size)
+{
+    return jce_font_open_ex(pak, asset_path, pt_size, NULL, 0);
 }
 
 void jce_font_close(JceFont *font)
 {
     if (!font) return;
     jce_texture_destroy(font->atlas);
+    SDL_free(font->extra);
     SDL_free(font);
 }
 
@@ -282,17 +404,19 @@ void jce_text_draw_scaled(const JceRenderer *r, JceFont *font,
     if (!jce_texture_valid(font->atlas)) return;
 
     float cx = x;
-    for (const char *p = text; *p; p++) {
-        int ch = (unsigned char)*p;
-        if (ch == '\n') {
+    const char *p = text;
+    while (*p) {
+        uint32_t cp = utf8_decode(&p);
+        if (cp == '\n') {
             cx = x;
             y += (float)font->line_height * scale;
             continue;
         }
-        if (ch < GLYPH_FIRST || ch > GLYPH_LAST)
-            ch = '?'; /* fallback for non-ASCII */
 
-        const GlyphInfo *g = &font->glyphs[ch - GLYPH_FIRST];
+        const GlyphInfo *g = font_get_glyph(font, cp);
+        if (!g) g = font_get_glyph(font, '?');
+        if (!g) { cx += (float)font->line_height * 0.5f * scale; continue; }
+
         if (g->w > 0 && g->h > 0) {
             const float uv[4] = { g->u0, g->v0, g->u1, g->v1 };
             jce_draw_textured_rect(r, cx, y,
@@ -321,16 +445,18 @@ void jce_text_measure(const JceFont *font, const char *text,
     float max_w = 0, cx = 0;
     int lines = 1;
 
-    for (const char *p = text; *p; p++) {
-        int ch = (unsigned char)*p;
-        if (ch == '\n') {
+    const char *p = text;
+    while (*p) {
+        uint32_t cp = utf8_decode(&p);
+        if (cp == '\n') {
             if (cx > max_w) max_w = cx;
             cx = 0;
             lines++;
             continue;
         }
-        if (ch < GLYPH_FIRST || ch > GLYPH_LAST) ch = '?';
-        cx += (float)font->glyphs[ch - GLYPH_FIRST].advance;
+        const GlyphInfo *g = font_get_glyph(font, cp);
+        if (!g) g = font_get_glyph(font, '?');
+        if (g) cx += (float)g->advance;
     }
     if (cx > max_w) max_w = cx;
 

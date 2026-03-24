@@ -209,7 +209,8 @@ static int audio_worker(void *data)
     ma_decoder_uninit(&decoder);
 
     task->result.audio.pcm_data        = pcm;
-    task->result.audio.pcm_size        = (uint32_t)(total_frames * channels * sizeof(int16_t));
+    task->result.audio.pcm_size =
+        (uint32_t)(total_frames * channels * sizeof(int16_t));
     task->result.audio.channels        = (uint16_t)channels;
     task->result.audio.sample_rate     = sample_rate;
     task->result.audio.bits_per_sample = 16;

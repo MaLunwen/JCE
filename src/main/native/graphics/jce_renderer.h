@@ -10,10 +10,10 @@
 #include <stdarg.h>
 
 /* Forward declarations. */
-typedef struct JceWindow   JceWindow;
-typedef struct PakArchive  PakArchive;
-typedef struct JceRenderer JceRenderer;
-typedef struct JceCamera   JceCamera;
+typedef struct JceWindow    JceWindow;
+typedef struct JceRenderer  JceRenderer;
+typedef struct JceCamera    JceCamera;
+typedef struct JceShaderSet JceShaderSet;
 
 /* -- Renderer configuration ---------------------------------------- */
 
@@ -26,11 +26,14 @@ typedef struct JceRendererConfig {
 
 /* -- Lifecycle ------------------------------------------------------ */
 
-/* Create the renderer: initializes bgfx, loads the color shader,
-   sets up the vertex layout and view 0 clear state.
+/* Create the renderer: initializes bgfx, sets up vertex
+   layouts and view 0 clear state.
    Returns NULL on failure. */
-JceRenderer *jce_renderer_create(JceWindow *win, const PakArchive *pak,
-                                  const JceRendererConfig *cfg);
+JceRenderer *jce_renderer_create(JceWindow *win,  const JceRendererConfig *cfg);
+
+/* Attach pre-loaded shaders. Must be called after create
+   and before the first frame. */
+void jce_renderer_set_shaders(JceRenderer *r, const JceShaderSet *shaders);
 
 /* Create a safe fallback renderer using SDL_Renderer. */
 JceRenderer *jce_renderer_create_fallback(JceWindow *win);
@@ -80,11 +83,29 @@ bool         jce_renderer_get_vsync(const JceRenderer *r);
 /* -- Shader/uniform accessors (for 3D scene rendering) ------------- */
 
 #include "jce_gfx_types.h"
+#include "jce_texture_types.h"
 
 /* Mesh (pos+normal+uv) shader program. */
 JceShaderHandle  jce_renderer_get_program_mesh(const JceRenderer *r);
 
 /* Texture sampler uniform (s_texColor). */
 JceUniformHandle jce_renderer_get_tex_uniform(const JceRenderer *r);
+
+/* -- Transform / texture binding (abstracts bgfx) ------------------ */
+
+/* Set the model-to-world transform for the next draw call. */
+void jce_renderer_set_transform(const float *mtx);
+
+/* Bind a texture to a sampler stage for the next draw. */
+void jce_renderer_bind_texture(const JceRenderer *r, uint8_t stage, JceTexture tex);
+
+/* Debug text: single cell with attribute byte. */
+void jce_renderer_dbg_text_attr(uint16_t x, uint16_t y, uint8_t attr, const char *str);
+
+/* -- Wireframe debug mode ------------------------------------------ */
+
+/* Toggle wireframe rendering (F3+V debug feature). */
+void jce_renderer_set_wireframe(JceRenderer *r, bool enabled);
+bool jce_renderer_get_wireframe(const JceRenderer *r);
 
 #endif /* JCE_RENDERER_H */

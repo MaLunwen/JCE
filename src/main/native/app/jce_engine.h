@@ -10,7 +10,13 @@
 
 #include <SDL3/SDL.h>
 
-typedef struct JceEngine JceEngine;
+typedef struct JceEngine  JceEngine;
+typedef struct JceAppDesc JceAppDesc;
+
+/* Register the application descriptor (IApp callbacks).
+   Must be called before jce_engine_create().
+   If not called, engine falls back to direct jce_app_* calls. */
+void           jce_engine_set_app_desc(const JceAppDesc *desc);
 
 /* Set optional config file path override used by jce_engine_create.
    Pass NULL or empty string to clear override. */

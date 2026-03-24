@@ -1,9 +1,9 @@
 /*
  * jce_engine.c  Engine bootstrap and lifecycle implementation.
  *
- * Centralises all subsystem creation, async asset preloading,
- * event routing, and per-frame orchestration that previously
- * lived in main.c.
+ * Centralises all subsystem creation, event routing, and
+ * per-frame orchestration.  Asset loading is delegated to
+ * the application via JceAppDesc callbacks.
  */
 
 #include "jce_engine.h"
@@ -21,15 +21,26 @@
 #include "platform/jce_input.h"
 #include "audio/jce_audio.h"
 #include "graphics/jce_renderer.h"
-#include "graphics/jce_texture.h"
+#include "graphics/jce_shaders.h"
 #include "resource/pak_loader.h"
-#include "resource/jce_async_loader.h"
 #include "game/jce_app.h"
 #include "embedded_assets.h"
 
 #define LOG_TAG "engine"
 
-static char g_config_path_override[512];
+static JceAppDesc  g_app_desc;
+static bool        g_app_desc_set;
+static char        g_config_path_override[512];
+
+void jce_engine_set_app_desc(const JceAppDesc *desc)
+{
+    if (desc) {
+        g_app_desc = *desc;
+        g_app_desc_set = true;
+    } else {
+        g_app_desc_set = false;
+    }
+}
 
 void jce_engine_set_config_path(const char *path)
 {
@@ -168,20 +179,7 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         return NULL;
     }
 
-    /* -- Start async asset loading immediately -------------------- */
-
-    JceAsyncTask *task_tex_demo   = jce_async_load_texture(e->pak,
-        "textures/texture.jpg", JCE_TEX_CLAMP);
-    JceAsyncTask *task_tex_cube   = jce_async_load_texture(e->pak,
-        "textures/chalet.jpg", JCE_TEX_CLAMP);
-    JceAsyncTask *task_tex_ground = jce_async_load_texture(e->pak,
-        "textures/texture.jpg", JCE_TEX_WRAP);
-    JceAsyncTask *task_snd_bounce = jce_async_load_audio(e->pak,
-        "sounds/bounce.wav");
-    JceAsyncTask *task_snd_music  = jce_async_load_audio(e->pak,
-        "sounds/Aria Math - C418.ogg");
-
-    /* -- Window + renderer (main thread, overlaps with workers) --- */
+    /* -- Window ------------------------------------------------------- */
 
     JceWindowConfig win_cfg = {
         .title     = e->config.window_title,
@@ -196,86 +194,64 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         goto fail;
     }
 
+    /* -- Renderer ------------------------------------------------- */
+
     JceRendererConfig ren_cfg = {
-        .backend    = (int)e->config.renderer_backend,
-        .vsync      = e->config.vsync,
-        .debug_text = e->config.debug_text,
+        .backend     = (int)e->config.renderer_backend,
+        .vsync       = e->config.vsync,
+        .debug_text  = e->config.debug_text,
         .clear_color = e->config.clear_color
     };
-    e->renderer = jce_renderer_create(e->window, e->pak, &ren_cfg);
+    e->renderer = jce_renderer_create(e->window, &ren_cfg);
     if (!e->renderer) {
-        LOG_WARN(LOG_TAG, "Renderer initialization failed (bgfx), falling back to safe mode");
-        e->renderer = jce_renderer_create_fallback(e->window);
+        LOG_WARN(LOG_TAG,
+            "Renderer init failed, falling back");
+        e->renderer =
+            jce_renderer_create_fallback(e->window);
         if (!e->renderer) {
-            fatal_msg("Fallback renderer initialization failed");
+            fatal_msg("Fallback renderer init failed");
             goto fail;
         }
     }
 
-    if (jce_renderer_is_fallback(e->renderer)) {
-        // Skip game app and asset loading, as bgfx is not available.
-        // Clean up async tasks since we won't be finishing them.
-        jce_async_task_free(task_tex_demo);
-        jce_async_task_free(task_tex_cube);
-        jce_async_task_free(task_tex_ground);
-        jce_async_task_free(task_snd_bounce);
-        jce_async_task_free(task_snd_music);
+    if (!jce_renderer_is_fallback(e->renderer)) {
+        /* Load and attach shaders (graphics layer no
+           longer depends on resource/pak_loader). */
+        JceShaderSet shaders =
+            jce_shaders_load_all(e->pak);
+        jce_renderer_set_shaders(e->renderer, &shaders);
+    }
 
-        // We will just run the event loop to show the fallback error screen.
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "JCE - GPU Unsupported",
-            "Hardware acceleration could not be initialized.\nThe application will now run in safe fallback mode.", jce_window_sdl(e->window));
+    if (jce_renderer_is_fallback(e->renderer)) {
+        SDL_ShowSimpleMessageBox(
+            SDL_MESSAGEBOX_WARNING,
+            "JCE - GPU Unsupported",
+            "Hardware acceleration could not be "
+            "initialized.\nThe application will now "
+            "run in safe fallback mode.",
+            jce_window_sdl(e->window));
         return e;
     }
 
-    /* Show loading screen while workers finish. */
-    render_loading_frame(e->renderer, e->window, "Loading...");
+    /* -- Remaining subsystems ------------------------------------- */
 
+    render_loading_frame(e->renderer, e->window, "Loading...");
     jce_gpu_caps_init(&e->gpu_caps);
 
     e->input = jce_input_create();
     if (!e->input) {
-        fatal_msg("Input system initialization failed");
+        fatal_msg("Input system init failed");
         goto fail;
     }
 
     e->audio = jce_audio_create();
     if (!e->audio)
-        LOG_WARN(LOG_TAG, "audio init failed  continuing without sound");
+        LOG_WARN(LOG_TAG, "audio init failed, continuing without sound");
 
     if (e->audio && e->config.master_volume < 1.0f)
         jce_audio_set_master_volume(e->audio, e->config.master_volume);
 
-    /* -- Finalize async tasks (wait + create GPU/AL resources) ---- */
-
-    JcePreloadedAssets preloaded = {0};
-    preloaded.has_preloaded = true;
-
-    while (!(jce_async_task_done(task_tex_demo) &&
-             jce_async_task_done(task_tex_cube) &&
-             jce_async_task_done(task_tex_ground) &&
-             jce_async_task_done(task_snd_bounce) &&
-             jce_async_task_done(task_snd_music))) {
-        render_loading_frame(e->renderer, e->window, "Loading assets...");
-    }
-
-    preloaded.tex_demo   = jce_async_finalize_texture(task_tex_demo);
-    preloaded.tex_cube   = jce_async_finalize_texture(task_tex_cube);
-    preloaded.tex_ground = jce_async_finalize_texture(task_tex_ground);
-
-    if (e->audio) {
-        preloaded.snd_bounce = jce_async_finalize_audio(task_snd_bounce,
-                                                         e->audio);
-        preloaded.snd_music  = jce_async_finalize_audio(task_snd_music,
-                                                         e->audio);
-    }
-
-    jce_async_task_free(task_tex_demo);
-    jce_async_task_free(task_tex_cube);
-    jce_async_task_free(task_tex_ground);
-    jce_async_task_free(task_snd_bounce);
-    jce_async_task_free(task_snd_music);
-
-    /* -- Create app with pre-loaded assets ----------------------- */
+    /* -- Build services struct ------------------------------------ */
 
     e->svc = (JceServices){
         .window   = e->window,
@@ -286,17 +262,18 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         .config   = &e->config
     };
 
-    JceAppContext ctx = {
-        .window    = e->window,
-        .input     = e->input,
-        .audio     = e->audio,
-        .renderer  = e->renderer,
-        .pak       = e->pak,
-        .config    = &e->config,
-        .preloaded = preloaded
-    };
-    e->app = jce_app_create(&ctx);
-    if (!e->app) goto fail;
+    /* -- Initialize application ----------------------------------- */
+
+    if (g_app_desc_set && g_app_desc.init) {
+        render_loading_frame(e->renderer, e->window, "Loading assets...");
+        if (!g_app_desc.init(&e->svc, g_app_desc.user_data))
+            goto fail;
+    } else {
+        /* Legacy path: direct jce_app_* calls. */
+        render_loading_frame(e->renderer, e->window, "Loading assets...");
+        e->app = jce_app_create(&e->svc);
+        if (!e->app) goto fail;
+    }
 
     return e;
 
@@ -322,7 +299,10 @@ SDL_AppResult jce_engine_event(JceEngine *e, const SDL_Event *event)
         jce_renderer_resize(e->renderer, (uint32_t)pw, (uint32_t)ph);
     }
 
-    if (e->app) jce_app_event(e->app, event);
+    if (g_app_desc_set && g_app_desc.on_event)
+        g_app_desc.on_event(event, g_app_desc.user_data);
+    else if (e->app)
+        jce_app_event(e->app, event);
 
     return SDL_APP_CONTINUE;
 }
@@ -331,18 +311,29 @@ SDL_AppResult jce_engine_event(JceEngine *e, const SDL_Event *event)
 
 SDL_AppResult jce_engine_iterate(JceEngine *e)
 {
-    if (e->app && jce_app_should_quit(e->app))
+    if (g_app_desc_set && g_app_desc.should_quit) {
+        if (g_app_desc.should_quit(g_app_desc.user_data))
+            return SDL_APP_SUCCESS;
+    } else if (e->app && jce_app_should_quit(e->app)) {
         return SDL_APP_SUCCESS;
+    }
 
     if (jce_renderer_is_fallback(e->renderer)) {
         jce_renderer_render_fallback_frame(e->renderer);
-        /* Pump minimal input so OS doesn't think we are hung. */
         if (e->input) jce_input_update(e->input);
         return SDL_APP_CONTINUE;
     }
 
     jce_renderer_begin_frame(e->renderer, e->window);
-    jce_app_update(e->app);
+
+    if (g_app_desc_set && g_app_desc.update) {
+        g_app_desc.update(0.0f, g_app_desc.user_data);
+        if (g_app_desc.draw)
+            g_app_desc.draw(&e->svc, g_app_desc.user_data);
+    } else if (e->app) {
+        jce_app_update(e->app);
+    }
+
     jce_renderer_end_frame(e->renderer);
     jce_input_update(e->input);
 
@@ -354,11 +345,16 @@ SDL_AppResult jce_engine_iterate(JceEngine *e)
 void jce_engine_destroy(JceEngine *e)
 {
     if (!e) return;
-    if (e->app)      jce_app_destroy(e->app);
-    if (e->renderer)  jce_renderer_destroy(e->renderer);
-    if (e->audio)     jce_audio_destroy(e->audio);
-    if (e->pak)       pak_close(e->pak);
-    if (e->input)     jce_input_destroy(e->input);
-    if (e->window)    jce_window_destroy(e->window);
+
+    if (g_app_desc_set && g_app_desc.exit)
+        g_app_desc.exit(g_app_desc.user_data);
+    else if (e->app)
+        jce_app_destroy(e->app);
+
+    if (e->renderer) jce_renderer_destroy(e->renderer);
+    if (e->audio)    jce_audio_destroy(e->audio);
+    if (e->pak)      pak_close(e->pak);
+    if (e->input)    jce_input_destroy(e->input);
+    if (e->window)   jce_window_destroy(e->window);
     SDL_free(e);
 }

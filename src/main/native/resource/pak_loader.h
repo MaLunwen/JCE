@@ -14,7 +14,8 @@
  *   free(buf);
  *   pak_close(pak);
  */
-#pragma once
+#ifndef JCE_PAK_LOADER_H
+#define JCE_PAK_LOADER_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -65,3 +66,5 @@ const PakAsset *pak_get(const PakArchive *pak, uint32_t index);
 #ifdef __cplusplus
 }
 #endif
+
+#endif /* JCE_PAK_LOADER_H */

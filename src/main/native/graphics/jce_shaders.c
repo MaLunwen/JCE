@@ -90,3 +90,20 @@ JceShaderHandle shader_load_program(const PakArchive *pak, const char *name)
     bgfx_program_handle_t prog = bgfx_create_program(vsh, fsh, true);
     return (JceShaderHandle){ prog.idx };
 }
+
+JceShaderSet jce_shaders_load_all(const PakArchive *pak)
+{
+    JceShaderSet set;
+    set.color    = shader_load_program(pak, "color");
+    set.textured = shader_load_program(pak, "textured");
+    set.mesh     = shader_load_program(pak, "mesh");
+
+    if (!jce_shader_valid(set.color))
+        LOG_ERROR(LOG_TAG, "failed to load 'color' shader");
+    if (!jce_shader_valid(set.textured))
+        LOG_WARN(LOG_TAG, "'textured' shader unavailable");
+    if (!jce_shader_valid(set.mesh))
+        LOG_WARN(LOG_TAG, "'mesh' shader unavailable");
+
+    return set;
+}

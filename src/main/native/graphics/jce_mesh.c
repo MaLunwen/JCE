@@ -17,9 +17,11 @@
 struct JceMesh {
     bgfx_vertex_buffer_handle_t vbh;
     bgfx_index_buffer_handle_t  ibh;
+    bgfx_index_buffer_handle_t  wf_ibh;     /* wireframe line indices */
     bgfx_vertex_layout_t        layout;
     uint32_t                    num_verts;
     uint32_t                    num_indices;
+    uint32_t                    num_wf_indices;
 };
 
 /* Shared mesh vertex layout (position float3 + normal float3 + texcoord float2). */
@@ -57,8 +59,31 @@ JceMesh *jce_mesh_create(const JceMeshVertex *vertices, uint32_t num_verts,
         const bgfx_memory_t *imem = bgfx_copy(indices,
                                                num_indices * (uint32_t)sizeof(uint32_t));
         m->ibh = bgfx_create_index_buffer(imem, BGFX_BUFFER_INDEX32);
+
+        /* Build wireframe index buffer: each triangle -> 3 line segments. */
+        uint32_t num_tris = num_indices / 3;
+        uint32_t wf_count = num_tris * 6;
+        uint32_t *wf = (uint32_t *)SDL_malloc(wf_count * sizeof(uint32_t));
+        if (wf) {
+            for (uint32_t t = 0; t < num_tris; t++) {
+                uint32_t a = indices[t*3+0];
+                uint32_t b = indices[t*3+1];
+                uint32_t c = indices[t*3+2];
+                wf[t*6+0] = a; wf[t*6+1] = b;
+                wf[t*6+2] = b; wf[t*6+3] = c;
+                wf[t*6+4] = c; wf[t*6+5] = a;
+            }
+            const bgfx_memory_t *wmem = bgfx_copy(wf,
+                                                    wf_count * (uint32_t)sizeof(uint32_t));
+            m->wf_ibh = bgfx_create_index_buffer(wmem, BGFX_BUFFER_INDEX32);
+            m->num_wf_indices = wf_count;
+            SDL_free(wf);
+        } else {
+            m->wf_ibh.idx = UINT16_MAX;
+        }
     } else {
         m->ibh.idx = UINT16_MAX;
+        m->wf_ibh.idx = UINT16_MAX;
     }
 
     return m;
@@ -76,6 +101,8 @@ void jce_mesh_destroy(JceMesh *mesh)
         bgfx_destroy_vertex_buffer(mesh->vbh);
     if (mesh->ibh.idx != UINT16_MAX)
         bgfx_destroy_index_buffer(mesh->ibh);
+    if (mesh->wf_ibh.idx != UINT16_MAX)
+        bgfx_destroy_index_buffer(mesh->wf_ibh);
     SDL_free(mesh);
 }
 
@@ -84,10 +111,18 @@ void jce_mesh_submit(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id
     if (!mesh || !r) return;
 
     bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
-    if (mesh->ibh.idx != UINT16_MAX)
-        bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
 
-    bgfx_set_state(BGFX_STATE_DEFAULT, 0);
+    if (jce_renderer_get_wireframe(r) && mesh->wf_ibh.idx != UINT16_MAX) {
+        /* Wireframe: use line index buffer, no face culling. */
+        bgfx_set_index_buffer(mesh->wf_ibh, 0, mesh->num_wf_indices);
+        bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                     | BGFX_STATE_WRITE_Z   | BGFX_STATE_DEPTH_TEST_LESS
+                     | BGFX_STATE_MSAA      | BGFX_STATE_PT_LINES, 0);
+    } else {
+        if (mesh->ibh.idx != UINT16_MAX)
+            bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
+        bgfx_set_state(BGFX_STATE_DEFAULT, 0);
+    }
 
     JceShaderHandle sh = jce_renderer_get_program_mesh(r);
     bgfx_program_handle_t prog = { sh.idx };
