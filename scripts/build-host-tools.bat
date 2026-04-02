@@ -2,7 +2,7 @@
 :: ================================================================
 :: build-host-tools.bat -- Build host jce_pak.exe (prerequisite for cross-compilation)
 :: Usage: build-host-tools.bat [--clean]
-:: Output: build\host\src\tools\jce_pak.exe
+:: Output: build\host\tools\jce_pak.exe
 :: ================================================================
 setlocal enabledelayedexpansion
 
@@ -45,13 +45,13 @@ echo === Step 3: Build jce_pak ===
 cmake --build %BUILD_DIR% --target jce_pak
 if errorlevel 1 goto :error
 
-if not exist "%BUILD_DIR%\src\tools\jce_pak.exe" (
+if not exist "%BUILD_DIR%\tools\jce_pak.exe" (
     echo ERROR: jce_pak.exe not found after build
     goto :error
 )
 
 echo.
-echo [SUCCESS] Host jce_pak ready: %BUILD_DIR%\src\tools\jce_pak.exe
+echo [SUCCESS] Host jce_pak ready: %BUILD_DIR%\tools\jce_pak.exe
 popd
 timeout /t 5 /nobreak >nul
 exit /b 0

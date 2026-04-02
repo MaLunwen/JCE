@@ -1,0 +1,73 @@
+/*
+ * jce_skeleton.h  Bone/joint hierarchy for skeletal animation.
+ *
+ * Stores the bind-pose skeleton: joint names, parent indices,
+ * inverse bind matrices, and rest-pose local transforms.
+ * Evaluates a set of local transforms into skinning matrices.
+ *
+ * Layer: Graphics (Layer 3).
+ */
+
+#ifndef JCE_SKELETON_H
+#define JCE_SKELETON_H
+
+#include <jce/core/jce_math.h>
+#include "jce_skinned_mesh.h"
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct JceSkeleton JceSkeleton;
+
+/* ================================================================== */
+/* Joint descriptor                                                    */
+/* ================================================================== */
+
+typedef struct {
+    char     name[64];
+    int16_t  parent;              /* -1 = root joint */
+    jce_mat4 inverse_bind_matrix; /* transforms from mesh space to bone-local space */
+    jce_mat4 local_transform;     /* default rest pose (T * R * S) */
+} JceJoint;
+
+/* ================================================================== */
+/* Skeleton API                                                        */
+/* ================================================================== */
+
+/* Create a skeleton from an array of joint descriptors.
+ * Joints must be ordered so that a parent always precedes its children.
+ * Copies the data; caller retains ownership. */
+JceSkeleton *jce_skeleton_create(const JceJoint *joints, uint32_t num_joints);
+
+/* Destroy a skeleton. */
+void jce_skeleton_destroy(JceSkeleton *skel);
+
+/* Get the number of joints. */
+uint32_t jce_skeleton_joint_count(const JceSkeleton *skel);
+
+/* Find a joint index by name. Returns -1 if not found. */
+int jce_skeleton_find_joint(const JceSkeleton *skel, const char *name);
+
+/* Get the rest-pose local transforms (array of [joint_count] mat4). */
+const jce_mat4 *jce_skeleton_rest_pose(const JceSkeleton *skel);
+
+/* Evaluate skinning matrices from local transforms.
+ *
+ * local_transforms: per-joint local transforms (e.g. from animation sampling).
+ *                   If NULL, uses the skeleton's rest pose.
+ * out_matrices:     output array of [max_joints] mat4.
+ *                   Each = globalTransform[i] * inverseBindMatrix[i].
+ *                   Ready for upload to GPU via jce_skinned_mesh_set_bones().
+ * max_joints:       capacity of out_matrices (clamped to skeleton joint count). */
+void jce_skeleton_evaluate(const JceSkeleton *skel,
+                            const jce_mat4 *local_transforms,
+                            jce_mat4 *out_matrices,
+                            uint32_t max_joints);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* JCE_SKELETON_H */

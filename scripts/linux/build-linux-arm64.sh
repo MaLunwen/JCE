@@ -2,7 +2,7 @@
 # ================================================================
 # build-linux-arm64.sh -- Build JCE for Linux aarch64
 # Usage: build-linux-arm64.sh [--clean]
-# Output: build/desktop/linux-arm64/src/JCE
+# Output: build/desktop/linux-arm64/CagedKingdom
 #
 # System dependencies (Ubuntu/Debian):
 #   sudo apt install libx11-dev libxrandr-dev libxcursor-dev libxi-dev \
@@ -21,7 +21,7 @@ BUILD_PROFILE="conan/profiles/linux-x64"
 CONAN_DIR="build/desktop/linux-arm64-conan"
 BUILD_DIR="build/desktop/linux-arm64"
 TOOLCHAIN="$CONAN_DIR/build/Release/generators/conan_toolchain.cmake"
-HOST_PAK="build/host/src/tools/jce_pak"
+HOST_PAK="build/host/jce_pak"
 
 # -- Handle --clean flag --
 if [[ "${1:-}" == "--clean" ]]; then
@@ -96,10 +96,10 @@ cmake $CMAKE_ARGS
 echo "=== Step 5: Build (linux-arm64) ==="
 cmake --build "$BUILD_DIR"
 
-if [[ ! -f "$BUILD_DIR/src/JCE" ]]; then
-    echo "ERROR: JCE not found after build"
+if [[ ! -f "$BUILD_DIR/CagedKingdom" ]]; then
+    echo "ERROR: CagedKingdom not found after build"
     exit 1
 fi
 
 echo ""
-echo "[SUCCESS] Linux ARM64 build complete: $BUILD_DIR/src/JCE"
+echo "[SUCCESS] Linux ARM64 build complete: $BUILD_DIR/CagedKingdom"

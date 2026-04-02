@@ -11,8 +11,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT"
 
 OUTPUT_DIR="build/desktop/macos-universal"
-X64_BIN="build/desktop/macos-x64/src/JCE"
-ARM64_BIN="build/desktop/macos-arm64/src/JCE"
+X64_BIN="build/desktop/macos-x64/CagedKingdom"
+ARM64_BIN="build/desktop/macos-arm64/CagedKingdom"
 
 # -- Handle --clean flag --
 CLEAN_FLAG=""

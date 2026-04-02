@@ -20,11 +20,9 @@ class JCEConan(ConanFile):
 
     # ── Options ──────────────────────────────────────────────────────
     options = {
-        "with_assimp": [True, False],
         "jce_jni": [True, False],
     }
     default_options = {
-        "with_assimp": True,
         "jce_jni": False,
         "bgfx/*:tools": True,
     }
@@ -53,21 +51,39 @@ class JCEConan(ConanFile):
         # ── Core (all platforms) ─────────────────────────────────────
         self.requires("sdl/3.4.0")
         self.requires("sdl_image/3.4.0")
-        self.requires("sdl_ttf/3.2.2")
+        self.requires("harfbuzz/12.3.0")
 
         self.requires("bgfx/1.129.8930-495")
-        self.requires("flecs/4.1.1")
-
         self.requires("glm/1.0.1")
-        self.requires("imgui/1.92.5")
-
-        self.requires("zstd/1.5.7")
-        self.requires("xxhash/0.8.3")
 
         self.requires("miniaudio/0.11.22")
 
-        if self.options.get_safe("with_assimp"):
-            self.requires("assimp/6.0.2")
+        self.requires("imgui/1.92.5")
+        self.requires("flecs/4.1.1")
+        self.requires("cjson/1.7.19")
+        self.requires("assimp/6.0.2")
+        self.requires("cgltf/1.15")
+        self.requires("ozz-animation/0.14.1")
+
+        self.requires("physfs/3.2.0")
+        self.requires("zstd/1.5.7")
+        self.requires("xxhash/0.8.3")
+
+        self.requires("mimalloc/2.2.4")
+        self.requires("enkits/1.11")
+
+        self.requires("box2d/3.1.1")
+        self.requires("bullet3/3.25")
+        self.requires("behaviortree.cpp/4.9.0")
+
+        self.requires("rmlui/4.4")
+        self.requires("freetype/2.13.2", force=True)
+
+        self.requires("enet/1.3.18")
+        self.requires("protobuf/6.33.5")
+
+        self.requires("tracy/0.13.1")
+        self.requires("spdlog/1.17.0")
 
         # ── Transitive overrides (resolve version conflicts) ─────────
         if self.settings.os == "Linux":
@@ -95,6 +111,5 @@ class JCEConan(ConanFile):
         tc = CMakeToolchain(self)
         # Forward Conan options to CMake so the build system can react.
         # Always set both True/False to override any stale CMake cache values.
-        tc.variables["JCE_USE_ASSIMP"] = bool(self.options.get_safe("with_assimp"))
         tc.variables["JCE_BUILD_JNI"] = bool(self.options.jce_jni)
         tc.generate()
