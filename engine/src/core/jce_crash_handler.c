@@ -133,8 +133,9 @@ static void crash_signal_handler(int sig)
              "Please report this crash with the above information.",
              sig, signal_name(sig), bt_buf);
 
-    /* Log. */
+    /* Log + flush the async ring buffer so the message is visible. */
     LOG_ERROR(LOG_TAG, "%s", msg);
+    jce_log_flush();
 
 #ifdef __ANDROID__
     /* Also log to Android logcat directly in case jce_log is broken. */
@@ -193,6 +194,7 @@ static void crash_sigaction_handler(int sig, siginfo_t *info, void *ucontext)
              bt_buf);
 
     LOG_ERROR(LOG_TAG, "%s", msg);
+    jce_log_flush();
 
 #ifdef __ANDROID__
     __android_log_print(ANDROID_LOG_FATAL, "JCE",
@@ -243,6 +245,7 @@ static LONG WINAPI windows_exception_handler(EXCEPTION_POINTERS *ep)
              ep->ExceptionRecord->ExceptionAddress);
 
     LOG_ERROR(LOG_TAG, "%s", msg);
+    jce_log_flush();
     SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
                              "JCE Native Crash", msg, NULL);
 

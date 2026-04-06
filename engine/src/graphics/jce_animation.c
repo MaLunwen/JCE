@@ -5,7 +5,7 @@
 #include "jce_animation.h"
 #include <jce/core/jce_log.h>
 
-#include <SDL3/SDL.h>
+#include "core/jce_memory.h"
 #include <string.h>
 
 #define LOG_TAG "jce_animation"
@@ -60,15 +60,15 @@ static jce_mat4 compose_trs(jce_vec3 t, jce_quat r, jce_vec3 s)
 /* Extract translation from a column-major mat4. */
 static jce_vec3 extract_translation(const jce_mat4 *m)
 {
-    return jce_v3(m->m[12], m->m[13], m->m[14]);
+    return jce_v3(m->raw[3][0], m->raw[3][1], m->raw[3][2]);
 }
 
 /* Extract scale from a column-major mat4. */
 static jce_vec3 extract_scale(const jce_mat4 *m)
 {
-    float sx = sqrtf(m->m[0]*m->m[0] + m->m[1]*m->m[1] + m->m[2]*m->m[2]);
-    float sy = sqrtf(m->m[4]*m->m[4] + m->m[5]*m->m[5] + m->m[6]*m->m[6]);
-    float sz = sqrtf(m->m[8]*m->m[8] + m->m[9]*m->m[9] + m->m[10]*m->m[10]);
+    float sx = sqrtf(m->raw[0][0]*m->raw[0][0] + m->raw[0][1]*m->raw[0][1] + m->raw[0][2]*m->raw[0][2]);
+    float sy = sqrtf(m->raw[1][0]*m->raw[1][0] + m->raw[1][1]*m->raw[1][1] + m->raw[1][2]*m->raw[1][2]);
+    float sz = sqrtf(m->raw[2][0]*m->raw[2][0] + m->raw[2][1]*m->raw[2][1] + m->raw[2][2]*m->raw[2][2]);
     return jce_v3(sx, sy, sz);
 }
 
@@ -80,9 +80,9 @@ static jce_quat extract_rotation(const jce_mat4 *m)
     float inv_sy = s.y > 1e-8f ? 1.0f / s.y : 0.0f;
     float inv_sz = s.z > 1e-8f ? 1.0f / s.z : 0.0f;
 
-    float r00 = m->m[0] * inv_sx, r01 = m->m[4] * inv_sy, r02 = m->m[8]  * inv_sz;
-    float r10 = m->m[1] * inv_sx, r11 = m->m[5] * inv_sy, r12 = m->m[9]  * inv_sz;
-    float r20 = m->m[2] * inv_sx, r21 = m->m[6] * inv_sy, r22 = m->m[10] * inv_sz;
+    float r00 = m->raw[0][0] * inv_sx, r01 = m->raw[1][0] * inv_sy, r02 = m->raw[2][0] * inv_sz;
+    float r10 = m->raw[0][1] * inv_sx, r11 = m->raw[1][1] * inv_sy, r12 = m->raw[2][1] * inv_sz;
+    float r20 = m->raw[0][2] * inv_sx, r21 = m->raw[1][2] * inv_sy, r22 = m->raw[2][2] * inv_sz;
 
     float trace = r00 + r11 + r22;
     jce_quat q;
@@ -125,7 +125,7 @@ JceAnimClip *jce_anim_clip_create(const char *name,
 {
     if (!channels || num_channels == 0) return NULL;
 
-    JceAnimClip *clip = (JceAnimClip *)SDL_calloc(1, sizeof(*clip));
+    JceAnimClip *clip = (JceAnimClip *)JCE_CALLOC(1, sizeof(*clip));
     if (!clip) return NULL;
 
     if (name) {
@@ -135,9 +135,9 @@ JceAnimClip *jce_anim_clip_create(const char *name,
     clip->num_channels = num_channels;
     clip->duration     = duration;
 
-    clip->channels = (JceAnimChannel *)SDL_calloc(num_channels, sizeof(JceAnimChannel));
+    clip->channels = (JceAnimChannel *)JCE_CALLOC(num_channels, sizeof(JceAnimChannel));
     if (!clip->channels) {
-        SDL_free(clip);
+        JCE_FREE(clip);
         return NULL;
     }
 
@@ -155,22 +155,22 @@ JceAnimClip *jce_anim_clip_create(const char *name,
 
         /* Deep-copy timestamps. */
         if (src->timestamps && src->count > 0) {
-            dst->timestamps = (float *)SDL_malloc(src->count * sizeof(float));
+            dst->timestamps = (float *)JCE_MALLOC(src->count * sizeof(float));
             if (dst->timestamps)
                 memcpy(dst->timestamps, src->timestamps, src->count * sizeof(float));
         }
 
         /* Deep-copy value arrays based on target type. */
         if (src->target == JCE_ANIM_TARGET_TRANSLATION && src->translations) {
-            dst->translations = (jce_vec3 *)SDL_malloc(src->count * sizeof(jce_vec3));
+            dst->translations = (jce_vec3 *)JCE_MALLOC(src->count * sizeof(jce_vec3));
             if (dst->translations)
                 memcpy(dst->translations, src->translations, src->count * sizeof(jce_vec3));
         } else if (src->target == JCE_ANIM_TARGET_ROTATION && src->rotations) {
-            dst->rotations = (jce_quat *)SDL_malloc(src->count * sizeof(jce_quat));
+            dst->rotations = (jce_quat *)JCE_MALLOC(src->count * sizeof(jce_quat));
             if (dst->rotations)
                 memcpy(dst->rotations, src->rotations, src->count * sizeof(jce_quat));
         } else if (src->target == JCE_ANIM_TARGET_SCALE && src->scales) {
-            dst->scales = (jce_vec3 *)SDL_malloc(src->count * sizeof(jce_vec3));
+            dst->scales = (jce_vec3 *)JCE_MALLOC(src->count * sizeof(jce_vec3));
             if (dst->scales)
                 memcpy(dst->scales, src->scales, src->count * sizeof(jce_vec3));
         }
@@ -185,13 +185,13 @@ void jce_anim_clip_destroy(JceAnimClip *clip)
 {
     if (!clip) return;
     for (uint32_t i = 0; i < clip->num_channels; i++) {
-        SDL_free(clip->channels[i].timestamps);
-        SDL_free(clip->channels[i].translations);
-        SDL_free(clip->channels[i].rotations);
-        SDL_free(clip->channels[i].scales);
+        JCE_FREE(clip->channels[i].timestamps);
+        JCE_FREE(clip->channels[i].translations);
+        JCE_FREE(clip->channels[i].rotations);
+        JCE_FREE(clip->channels[i].scales);
     }
-    SDL_free(clip->channels);
-    SDL_free(clip);
+    JCE_FREE(clip->channels);
+    JCE_FREE(clip);
 }
 
 const char *jce_anim_clip_name(const JceAnimClip *clip)
@@ -205,49 +205,83 @@ float jce_anim_clip_duration(const JceAnimClip *clip)
 }
 
 void jce_anim_clip_sample(const JceAnimClip *clip, float time,
-                            jce_mat4 *out_locals, uint32_t num_joints)
+                            jce_mat4 *out_locals, uint32_t num_joints,
+                            const jce_vec3 *rest_t,
+                            const jce_quat *rest_r,
+                            const jce_vec3 *rest_s)
 {
     if (!clip || !out_locals) return;
 
+    /* Use rest-pose TRS when available to avoid decomposition roundtrip. */
+    bool have_rest_trs = rest_t && rest_r && rest_s;
+
+    /* Build per-joint TRS accumulators, initialized from rest pose.
+       All channels update the appropriate component in these arrays;
+       after all channels are processed we compose the matrices once. */
+    #define MAX_SKEL_JOINTS 256
+    uint32_t nj = num_joints < MAX_SKEL_JOINTS ? num_joints : MAX_SKEL_JOINTS;
+
+    jce_vec3 t_arr[MAX_SKEL_JOINTS];
+    jce_quat r_arr[MAX_SKEL_JOINTS];
+    jce_vec3 s_arr[MAX_SKEL_JOINTS];
+    bool     touched[MAX_SKEL_JOINTS];
+
+    if (have_rest_trs) {
+        memcpy(t_arr, rest_t, nj * sizeof(jce_vec3));
+        memcpy(r_arr, rest_r, nj * sizeof(jce_quat));
+        memcpy(s_arr, rest_s, nj * sizeof(jce_vec3));
+    } else {
+        for (uint32_t i = 0; i < nj; i++) {
+            t_arr[i] = extract_translation(&out_locals[i]);
+            r_arr[i] = extract_rotation(&out_locals[i]);
+            s_arr[i] = extract_scale(&out_locals[i]);
+        }
+    }
+    memset(touched, 0, nj * sizeof(bool));
+
+    /* Process all channels — each modifies one TRS component per joint. */
     for (uint32_t c = 0; c < clip->num_channels; c++) {
         const JceAnimChannel *ch = &clip->channels[c];
-        if (ch->joint_index >= num_joints || ch->count == 0) continue;
+        uint32_t ji = ch->joint_index;
+        if (ji >= nj || ch->count == 0) continue;
 
         uint32_t k = find_keyframe(ch->timestamps, ch->count, time);
-
-        /* Decompose current local transform for partial updates. */
-        jce_vec3 t_val = extract_translation(&out_locals[ch->joint_index]);
-        jce_quat r_val = extract_rotation(&out_locals[ch->joint_index]);
-        jce_vec3 s_val = extract_scale(&out_locals[ch->joint_index]);
+        touched[ji] = true;
 
         if (ch->target == JCE_ANIM_TARGET_TRANSLATION && ch->translations) {
             if (ch->interpolation == JCE_INTERP_STEP || k + 1 >= ch->count) {
-                t_val = ch->translations[k];
+                t_arr[ji] = ch->translations[k];
             } else {
                 float dt = ch->timestamps[k + 1] - ch->timestamps[k];
                 float frac = (dt > 1e-8f) ? (time - ch->timestamps[k]) / dt : 0.0f;
-                t_val = jce_v3_lerp(ch->translations[k], ch->translations[k + 1], frac);
+                t_arr[ji] = jce_v3_lerp(ch->translations[k], ch->translations[k + 1], frac);
             }
         } else if (ch->target == JCE_ANIM_TARGET_ROTATION && ch->rotations) {
             if (ch->interpolation == JCE_INTERP_STEP || k + 1 >= ch->count) {
-                r_val = ch->rotations[k];
+                r_arr[ji] = ch->rotations[k];
             } else {
                 float dt = ch->timestamps[k + 1] - ch->timestamps[k];
                 float frac = (dt > 1e-8f) ? (time - ch->timestamps[k]) / dt : 0.0f;
-                r_val = jce_q_slerp(ch->rotations[k], ch->rotations[k + 1], frac);
+                r_arr[ji] = jce_q_slerp(ch->rotations[k], ch->rotations[k + 1], frac);
             }
         } else if (ch->target == JCE_ANIM_TARGET_SCALE && ch->scales) {
             if (ch->interpolation == JCE_INTERP_STEP || k + 1 >= ch->count) {
-                s_val = ch->scales[k];
+                s_arr[ji] = ch->scales[k];
             } else {
                 float dt = ch->timestamps[k + 1] - ch->timestamps[k];
                 float frac = (dt > 1e-8f) ? (time - ch->timestamps[k]) / dt : 0.0f;
-                s_val = jce_v3_lerp(ch->scales[k], ch->scales[k + 1], frac);
+                s_arr[ji] = jce_v3_lerp(ch->scales[k], ch->scales[k + 1], frac);
             }
         }
-
-        out_locals[ch->joint_index] = compose_trs(t_val, r_val, s_val);
     }
+
+    /* Compose matrices only for joints that had animation channels. */
+    for (uint32_t i = 0; i < nj; i++) {
+        if (touched[i])
+            out_locals[i] = compose_trs(t_arr[i], r_arr[i], s_arr[i]);
+    }
+
+    #undef MAX_SKEL_JOINTS
 }
 
 /* ================================================================== */
@@ -259,16 +293,16 @@ JceAnimPlayer *jce_anim_player_create(const JceSkeleton *skel)
     if (!skel) return NULL;
 
     uint32_t nj = jce_skeleton_joint_count(skel);
-    JceAnimPlayer *p = (JceAnimPlayer *)SDL_calloc(1, sizeof(*p));
+    JceAnimPlayer *p = (JceAnimPlayer *)JCE_CALLOC(1, sizeof(*p));
     if (!p) return NULL;
 
     p->skeleton   = skel;
     p->num_joints = nj;
     p->speed      = 1.0f;
 
-    p->local_transforms = (jce_mat4 *)SDL_malloc(nj * sizeof(jce_mat4));
+    p->local_transforms = (jce_mat4 *)JCE_MALLOC(nj * sizeof(jce_mat4));
     if (!p->local_transforms) {
-        SDL_free(p);
+        JCE_FREE(p);
         return NULL;
     }
 
@@ -283,8 +317,8 @@ JceAnimPlayer *jce_anim_player_create(const JceSkeleton *skel)
 void jce_anim_player_destroy(JceAnimPlayer *player)
 {
     if (!player) return;
-    SDL_free(player->local_transforms);
-    SDL_free(player);
+    JCE_FREE(player->local_transforms);
+    JCE_FREE(player);
 }
 
 void jce_anim_player_play(JceAnimPlayer *p, const JceAnimClip *clip,
@@ -338,18 +372,20 @@ uint32_t jce_anim_player_update(JceAnimPlayer *p, float dt,
     p->time += dt * p->speed;
 
     float dur = jce_anim_clip_duration(p->clip);
-    if (dur > 0.0f) {
-        if (p->loop) {
-            while (p->time >= dur) p->time -= dur;
-            while (p->time < 0.0f) p->time += dur;
-        } else {
-            if (p->time >= dur) {
-                p->time    = dur;
-                p->playing = false;
-            } else if (p->time < 0.0f) {
-                p->time    = 0.0f;
-                p->playing = false;
-            }
+    if (dur <= 0.0f) {
+        /* Zero-duration clip (e.g. a rest-pose action): treat as instantly
+           finished so the caller can advance to the next clip. */
+        p->playing = false;
+    } else if (p->loop) {
+        while (p->time >= dur) p->time -= dur;
+        while (p->time < 0.0f) p->time += dur;
+    } else {
+        if (p->time >= dur) {
+            p->time    = dur;
+            p->playing = false;
+        } else if (p->time < 0.0f) {
+            p->time    = 0.0f;
+            p->playing = false;
         }
     }
 
@@ -358,8 +394,14 @@ uint32_t jce_anim_player_update(JceAnimPlayer *p, float dt,
     if (rest)
         memcpy(p->local_transforms, rest, p->num_joints * sizeof(jce_mat4));
 
-    /* Sample the clip into local transforms. */
-    jce_anim_clip_sample(p->clip, p->time, p->local_transforms, p->num_joints);
+    /* Sample the clip into local transforms (use rest-pose TRS to avoid
+       decomposing the rest-pose matrix every channel). */
+    const jce_vec3 *rt = NULL;
+    const jce_quat *rr = NULL;
+    const jce_vec3 *rs = NULL;
+    jce_skeleton_rest_trs(p->skeleton, &rt, &rr, &rs);
+    jce_anim_clip_sample(p->clip, p->time, p->local_transforms,
+                          p->num_joints, rt, rr, rs);
 
     /* Evaluate skeleton to produce skinning matrices. */
     uint32_t count = p->num_joints < max_joints ? p->num_joints : max_joints;

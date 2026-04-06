@@ -3,6 +3,7 @@
  */
 
 #include <jce/platform/jce_input.h>
+#include "core/jce_memory.h"
 #include <string.h>
 
 struct JceInput {
@@ -37,7 +38,7 @@ struct JceInput {
 
 JceInput *jce_input_create(void)
 {
-    JceInput *input = (JceInput *)SDL_calloc(1, sizeof(*input));
+    JceInput *input = (JceInput *)JCE_CALLOC(1, sizeof(*input));
     return input;
 }
 
@@ -48,7 +49,7 @@ void jce_input_destroy(JceInput *input)
         if (input->gamepads[i].sdl_pad)
             SDL_CloseGamepad(input->gamepads[i].sdl_pad);
     }
-    SDL_free(input);
+    JCE_FREE(input);
 }
 
 void jce_input_update(JceInput *input)

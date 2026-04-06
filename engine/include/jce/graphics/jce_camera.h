@@ -11,6 +11,10 @@
 #include <jce/core/jce_math.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct JceCamera JceCamera;
 
 /* Projection mode. */
@@ -75,5 +79,9 @@ void jce_camera_rotate(JceCamera *cam, float yaw_rad, float pitch_rad);
 
 /* Look at a specific target from the current position. */
 void jce_camera_look_at(JceCamera *cam, jce_vec3 target);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* JCE_CAMERA_H */

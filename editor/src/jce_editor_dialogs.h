@@ -23,6 +23,12 @@ void jce_editor_dialog_open_project(bool *p_open);
 /* Save As dialog. */
 void jce_editor_dialog_save_as(bool *p_open);
 
+/* New Scene dialog. */
+void jce_editor_dialog_new_scene(bool *p_open);
+
+/* Open Scene dialog. */
+void jce_editor_dialog_open_scene(bool *p_open);
+
 /* Unsaved Changes dialog.
    result: 0 = pending, 1 = save, 2 = don't save, 3 = cancel. */
 void jce_editor_dialog_unsaved_changes(bool *p_open, int *result);

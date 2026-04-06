@@ -74,14 +74,31 @@ target_link_libraries(JCE PUBLIC
 	sdl::sdl
 	bgfx::bgfx
 	flecs::flecs_static
-	glm::glm
 	miniaudio::miniaudio
-	imgui::imgui
 	Freetype::Freetype
 	harfbuzz::harfbuzz
 	cgltf::cgltf
 	zstd::libzstd_static
-	xxHash::xxhash)
+	xxHash::xxhash
+	mimalloc-static
+	cglm::cglm
+	enkits::enkits
+	physfs-static
+	cjson::cjson)
+
+# Tracy: true compile-time gate.
+# When OFF, we do not link Tracy at all, and headers compile to no-ops.
+if(JCE_TRACY_ENABLED)
+	target_link_libraries(JCE PUBLIC Tracy::TracyClient)
+	target_compile_definitions(JCE PUBLIC JCE_TRACY_ENABLED=1)
+else()
+	target_compile_definitions(JCE PUBLIC JCE_TRACY_ENABLED=0)
+endif()
+
+# C++-only deps: kept out of the PUBLIC surface so the engine
+# static library stays callable from pure C / FFI / JNI consumers.
+target_link_libraries(JCE PRIVATE
+	imgui::imgui)
 
 # ── Platform-specific link options ──
 if(JCE_PLATFORM_WEB)

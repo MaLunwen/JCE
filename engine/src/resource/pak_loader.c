@@ -7,6 +7,7 @@
 
 #include <jce/resource/pak_loader.h>
 #include "resource/pak_format.h"
+#include <jce/core/jce_profiler.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,6 +28,7 @@ struct PakArchive {
     uint64_t      *hashes;      /* parallel array of path hashes       */
     char         **paths;       /* heap-allocated NUL-terminated copies*/
     int            owns_blob;   /* 1 => blob was malloc'd; free on close*/
+    ZSTD_DCtx     *dctx;        /* reusable decompression context      */
 };
 
 /* ================================================================== */
@@ -65,6 +67,8 @@ PakArchive *pak_open(const void *data, size_t size) {
     pak->blob      = blob;
     pak->blob_size = size;
     pak->count     = count;
+
+    pak->dctx = ZSTD_createDCtx();
 
     if (count == 0) return pak;
 
@@ -130,6 +134,7 @@ void pak_close(PakArchive *pak) {
     }
     free(pak->hashes);
     free(pak->assets);
+    ZSTD_freeDCtx(pak->dctx);
     if (pak->owns_blob) free((void *)pak->blob);
     free(pak);
 }
@@ -209,11 +214,33 @@ const PakAsset *pak_find(const PakArchive *pak, const char *path) {
 /* ================================================================== */
 
 size_t pak_decompress(const PakAsset *asset, void *buf, size_t buf_size) {
-    if (!asset || !buf || buf_size < asset->original_size) return 0;
+    if (!asset || !buf || buf_size < asset->original_size)
+        return 0;
 
     size_t result = ZSTD_decompress(
         buf, buf_size,
         asset->compressed_data, (size_t)asset->compressed_size);
+
+    if (ZSTD_isError(result)) return 0;
+    return result;
+}
+
+size_t pak_decompress_ex(const PakArchive *pak, const PakAsset *asset,
+                         void *buf, size_t buf_size) {
+    if (!asset || !buf || buf_size < asset->original_size)
+        return 0;
+
+    /* Use the archive's reusable DCtx when available. */
+    size_t result;
+    if (pak && pak->dctx) {
+        result = ZSTD_decompressDCtx(
+            pak->dctx, buf, buf_size,
+            asset->compressed_data, (size_t)asset->compressed_size);
+    } else {
+        result = ZSTD_decompress(
+            buf, buf_size,
+            asset->compressed_data, (size_t)asset->compressed_size);
+    }
 
     if (ZSTD_isError(result)) return 0;
     return result;

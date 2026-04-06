@@ -12,6 +12,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Opaque texture handle wrapping bgfx_texture_handle_t. */
 typedef struct { uint16_t idx; } JceTexture;
 
@@ -25,5 +29,9 @@ typedef struct { uint16_t idx; } JceTexture;
 static inline bool jce_texture_valid(JceTexture tex) {
     return tex.idx != UINT16_MAX;
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* JCE_TEXTURE_TYPES_H */

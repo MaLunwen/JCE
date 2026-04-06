@@ -11,6 +11,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct JceTimer JceTimer;
 
 /* Create a timer with the given fixed timestep (seconds).
@@ -50,5 +54,9 @@ double jce_timer_elapsed(const JceTimer *t);
 
 /* Get the current smoothed FPS (exponential moving average). */
 float jce_timer_fps(const JceTimer *t);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* JCE_TIMER_H */

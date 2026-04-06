@@ -1,14 +1,22 @@
 /*
- * jce_log.h  Structured logging with ANSI colors.
+ * jce_log.h  High-performance async structured logging.
  *
  * Format: {timestamp} [{thread}] {level} - {tag}: {message} at {file}:{line}
  * Matches the Java JceLogger output format.
+ *
+ * On platforms with threading (desktop, mobile), log messages are enqueued
+ * into an MPSC ring buffer and written to stderr / file by a dedicated
+ * backend IO thread.  On WASM, falls back to synchronous fprintf.
  */
 
 #ifndef JCE_LOG_H
 #define JCE_LOG_H
 
 #include <stdbool.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 typedef enum JceLogLevel {
     JCE_LOG_LEVEL_TRACE = 0,
@@ -20,21 +28,38 @@ typedef enum JceLogLevel {
     JCE_LOG_LEVEL_OFF
 } JceLogLevel;
 
-/* Call once at startup (enables ANSI escape codes on Windows console). */
+/* Call once at startup.  Enables ANSI escape codes on Windows console
+   and spawns the backend IO thread (on threaded platforms). */
 void jce_log_init(void);
+
+/* Flush remaining messages, join the backend thread, close log file.
+   Call once at engine shutdown.  Safe to call if init was never called. */
+void jce_log_shutdown(void);
+
+/* Synchronously drain the ring buffer to stderr / log file.
+   Use in crash handlers before re-raising the signal. */
+void jce_log_flush(void);
 
 /* Runtime configuration. */
 void jce_log_set_level(JceLogLevel level);
 void jce_log_set_colors(bool enabled);
 
+/* Enable persistent file output (plain text, no ANSI).
+   Pass NULL to close the current log file. */
+void jce_log_set_file(const char *path);
+
 /* Set the display name for the calling thread (e.g. "MAIN", "RENDER").
  * Must be called per-thread; defaults to the numeric thread ID. */
 void jce_log_set_thread_name(const char *name);
 
-/* Core logging function  use the macros below instead. */
+/* Core logging function — use the macros below instead. */
 void jce_log_write(JceLogLevel level, const char *tag,
                    const char *file, int line,
                    const char *fmt, ...);
+
+#ifdef __cplusplus
+}
+#endif
 
 /* -- Convenience macros (capture __FILE__ and __LINE__) ------------ */
 

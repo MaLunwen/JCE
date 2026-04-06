@@ -9,7 +9,7 @@
 #include <jce/core/jce_math.h>
 
 #include <bgfx/c99/bgfx.h>
-#include <SDL3/SDL.h>
+#include "core/jce_memory.h"
 #include <string.h>
 
 #define LOG_TAG "jce_mesh"
@@ -42,7 +42,7 @@ JceMesh *jce_mesh_create(const JceMeshVertex *vertices, uint32_t num_verts,
 {
     if (!vertices || num_verts == 0) return NULL;
 
-    JceMesh *m = (JceMesh *)SDL_calloc(1, sizeof(*m));
+    JceMesh *m = (JceMesh *)JCE_CALLOC(1, sizeof(*m));
     if (!m) return NULL;
 
     init_mesh_layout(&m->layout);
@@ -63,7 +63,7 @@ JceMesh *jce_mesh_create(const JceMeshVertex *vertices, uint32_t num_verts,
         /* Build wireframe index buffer: each triangle -> 3 line segments. */
         uint32_t num_tris = num_indices / 3;
         uint32_t wf_count = num_tris * 6;
-        uint32_t *wf = (uint32_t *)SDL_malloc(wf_count * sizeof(uint32_t));
+        uint32_t *wf = (uint32_t *)JCE_MALLOC(wf_count * sizeof(uint32_t));
         if (wf) {
             for (uint32_t t = 0; t < num_tris; t++) {
                 uint32_t a = indices[t*3+0];
@@ -77,7 +77,7 @@ JceMesh *jce_mesh_create(const JceMeshVertex *vertices, uint32_t num_verts,
                                                     wf_count * (uint32_t)sizeof(uint32_t));
             m->wf_ibh = bgfx_create_index_buffer(wmem, BGFX_BUFFER_INDEX32);
             m->num_wf_indices = wf_count;
-            SDL_free(wf);
+            JCE_FREE(wf);
         } else {
             m->wf_ibh.idx = UINT16_MAX;
         }
@@ -103,7 +103,7 @@ void jce_mesh_destroy(JceMesh *mesh)
         bgfx_destroy_index_buffer(mesh->ibh);
     if (mesh->wf_ibh.idx != UINT16_MAX)
         bgfx_destroy_index_buffer(mesh->wf_ibh);
-    SDL_free(mesh);
+    JCE_FREE(mesh);
 }
 
 void jce_mesh_submit(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id)
@@ -211,11 +211,11 @@ JceMesh *jce_mesh_create_plane_ex(float width, float depth,
     uint32_t num_quads = subdivs * subdivs;
     uint32_t num_indices = num_quads * 6;
 
-    JceMeshVertex *verts = (JceMeshVertex *)SDL_malloc(num_verts * sizeof(JceMeshVertex));
-    uint32_t *indices = (uint32_t *)SDL_malloc(num_indices * sizeof(uint32_t));
+    JceMeshVertex *verts = (JceMeshVertex *)JCE_MALLOC(num_verts * sizeof(JceMeshVertex));
+    uint32_t *indices = (uint32_t *)JCE_MALLOC(num_indices * sizeof(uint32_t));
     if (!verts || !indices) {
-        SDL_free(verts);
-        SDL_free(indices);
+        JCE_FREE(verts);
+        JCE_FREE(indices);
         return NULL;
     }
 
@@ -255,7 +255,7 @@ JceMesh *jce_mesh_create_plane_ex(float width, float depth,
     }
 
     JceMesh *mesh = jce_mesh_create(verts, num_verts, indices, num_indices);
-    SDL_free(verts);
-    SDL_free(indices);
+    JCE_FREE(verts);
+    JCE_FREE(indices);
     return mesh;
 }

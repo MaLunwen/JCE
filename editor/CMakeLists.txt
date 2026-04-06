@@ -16,7 +16,7 @@ file(GLOB_RECURSE EDITOR_SOURCES CONFIGURE_DEPENDS
 add_executable(JCE_Editor ${EDITOR_SOURCES})
 
 find_package(assimp REQUIRED)
-target_link_libraries(JCE_Editor PRIVATE JCE assimp::assimp)
+target_link_libraries(JCE_Editor PRIVATE JCE assimp::assimp imgui::imgui)
 
 target_include_directories(JCE_Editor PRIVATE
 	"${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -59,6 +59,11 @@ set_target_properties(JCE_Editor PROPERTIES
 	OUTPUT_NAME jce_editor
 	RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/${JCE_BUILD_VARIANT}"
 	ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/${JCE_BUILD_VARIANT}")
+
+# Dist builds on Windows: GUI subsystem (no console window).
+if(WIN32 AND JCE_BUILD_VARIANT STREQUAL "dist")
+	set_target_properties(JCE_Editor PROPERTIES WIN32_EXECUTABLE TRUE)
+endif()
 
 # ── Remove MSVC-generated .exp/.lib ──
 if(MSVC)

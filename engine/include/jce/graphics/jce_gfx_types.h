@@ -15,6 +15,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* ================================================================== */
 /* Opaque handle types                                                 */
 /* ================================================================== */
@@ -75,5 +79,9 @@ typedef enum {
     JCE_BLEND_ADD,         /* Additive */
     JCE_BLEND_MULTIPLY     /* Multiply */
 } JceBlendMode;
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* JCE_GFX_TYPES_H */

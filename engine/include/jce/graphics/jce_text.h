@@ -10,6 +10,10 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct JceFont     JceFont;
 typedef struct JceRenderer JceRenderer;
 typedef struct PakArchive  PakArchive;
@@ -46,5 +50,9 @@ int jce_font_line_height(const JceFont *font);
 /* Measure a string's bounding box in pixels (at native pt_size). */
 void jce_text_measure(const JceFont *font, const char *text,
                       float *out_w, float *out_h);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* JCE_TEXT_H */

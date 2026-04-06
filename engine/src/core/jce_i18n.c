@@ -1,8 +1,9 @@
 /*
  * jce_i18n.c  Internationalisation implementation.
  *
- * Loads flat {"key":"value"} JSON files from the PAK archive.
- * A minimal JSON parser handles string extraction (no full parser needed).
+ * Loads flat {"key":"value"} JSON files from the PAK archive
+ * using the cJSON library for correct parsing (Unicode escapes,
+ * nested structures, proper error handling).
  */
 
 #include <jce/core/jce_i18n.h>
@@ -10,6 +11,8 @@
 #include <jce/resource/pak_loader.h>
 
 #include <SDL3/SDL.h>
+#include <cjson/cJSON.h>
+#include "jce_memory.h"
 #include <string.h>
 
 #define LOG_TAG    "jce_i18n"
@@ -40,66 +43,28 @@ static const struct { const char *key; JceStringId id; } s_key_map[] = {
 #define KEY_MAP_COUNT ((int)(sizeof(s_key_map) / sizeof(s_key_map[0])))
 
 /* ------------------------------------------------------------------ */
-/* Minimal JSON string parser                                           */
+/* JSON parsing via cJSON                                               */
 /* ------------------------------------------------------------------ */
 
-static const char *skip_ws(const char *p)
+static void parse_json(const char *json_text, JceLang lang)
 {
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-    return p;
-}
-
-/* Parse a JSON string starting at the opening '"'.
-   Writes content (UTF-8, un-escaped) into buf.
-   Returns pointer past the closing '"'. */
-static const char *json_str(const char *p, char *buf, int cap)
-{
-    if (*p != '"') { buf[0] = '\0'; return p; }
-    p++;
-    int i = 0;
-    while (*p && *p != '"') {
-        if (*p == '\\' && p[1]) {
-            p++;
-            char c = *p;
-            if (c == 'n')       c = '\n';
-            else if (c == 't')  c = '\t';
-            /* \" and \\ pass through as-is */
-            if (i < cap - 1) buf[i++] = c;
-        } else {
-            if (i < cap - 1) buf[i++] = *p;
-        }
-        p++;
+    cJSON *root = cJSON_Parse(json_text);
+    if (!root) {
+        LOG_WARN(LOG_TAG, "JSON parse error near: %.32s",
+                 cJSON_GetErrorPtr() ? cJSON_GetErrorPtr() : "(null)");
+        return;
     }
-    buf[i] = '\0';
-    if (*p == '"') p++;
-    return p;
-}
 
-static void parse_json(const char *json, JceLang lang)
-{
-    const char *p = skip_ws(json);
-    if (*p != '{') return;
-    p++;
-
-    char key[64], val[MAX_STR];
-    while (*p) {
-        p = skip_ws(p);
-        if (*p == '}' || *p == '\0') break;
-        if (*p == ',') { p++; continue; }
-
-        p = json_str(p, key, (int)sizeof(key));
-        p = skip_ws(p);
-        if (*p == ':') p++;
-        p = skip_ws(p);
-        p = json_str(p, val, (int)sizeof(val));
-
-        for (int i = 0; i < KEY_MAP_COUNT; i++) {
-            if (strcmp(key, s_key_map[i].key) == 0) {
-                SDL_strlcpy(s_strings[lang][s_key_map[i].id], val, MAX_STR);
-                break;
-            }
+    for (int i = 0; i < KEY_MAP_COUNT; i++) {
+        const cJSON *item = cJSON_GetObjectItemCaseSensitive(
+            root, s_key_map[i].key);
+        if (cJSON_IsString(item) && item->valuestring) {
+            SDL_strlcpy(s_strings[lang][s_key_map[i].id],
+                        item->valuestring, MAX_STR);
         }
     }
+
+    cJSON_Delete(root);
 }
 
 static void load_lang(const PakArchive *pak, JceLang lang)
@@ -110,15 +75,15 @@ static void load_lang(const PakArchive *pak, JceLang lang)
         return;
     }
 
-    char *json = (char *)SDL_malloc((size_t)asset->original_size + 1);
+    char *json = (char *)JCE_MALLOC((size_t)asset->original_size + 1);
     if (!json) return;
 
     size_t n = pak_decompress(asset, json, (size_t)asset->original_size);
-    if (n == 0) { SDL_free(json); return; }
+    if (n == 0) { JCE_FREE(json); return; }
     json[n] = '\0';
 
     parse_json(json, lang);
-    SDL_free(json);
+    JCE_FREE(json);
 
     LOG_DEBUG(LOG_TAG, "loaded %s", s_lang_assets[lang]);
 }

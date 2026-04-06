@@ -11,6 +11,7 @@
 #include <jce/app/jce_config.h>
 #include <jce/core/jce_log.h>
 
+#include <SDL3/SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,7 +28,7 @@ JceConfig jce_config_defaults(void)
 
     cfg.window_width      = 640;
     cfg.window_height     = 480;
-    strncpy(cfg.window_title, "JCE", sizeof(cfg.window_title) - 1);
+    SDL_strlcpy(cfg.window_title, "JCE", sizeof(cfg.window_title));
     cfg.fullscreen        = false;
     cfg.resizable         = true;
 
@@ -105,8 +106,7 @@ static void apply(JceConfig *cfg, const char *section,
     if      (strcmp(full, "window.width")  == 0) cfg->window_width  = atoi(value);
     else if (strcmp(full, "window.height") == 0) cfg->window_height = atoi(value);
     else if (strcmp(full, "window.title")  == 0) {
-        strncpy(cfg->window_title, value, sizeof(cfg->window_title) - 1);
-        cfg->window_title[sizeof(cfg->window_title) - 1] = '\0';
+        SDL_strlcpy(cfg->window_title, value, sizeof(cfg->window_title));
     }
     else if (strcmp(full, "window.fullscreen") == 0) cfg->fullscreen = parse_bool(value);
     else if (strcmp(full, "window.resizable")  == 0) cfg->resizable  = parse_bool(value);
@@ -156,8 +156,7 @@ bool jce_config_load(JceConfig *cfg, const char *path)
             char *end = strchr(s, ']');
             if (end) {
                 *end = '\0';
-                strncpy(section, s + 1, sizeof(section) - 1);
-                section[sizeof(section) - 1] = '\0';
+                SDL_strlcpy(section, s + 1, sizeof(section));
             }
             continue;
         }

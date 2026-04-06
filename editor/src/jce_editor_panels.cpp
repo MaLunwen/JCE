@@ -12,19 +12,31 @@
 #include "jce_editor_defaults.h"
 #include "jce_editor_i18n.h"
 #include "jce_editor_style.h"
+#include "jce_editor_config.h"
+#include "jce_editor.h"
+#include "jce_file_viewer.h"
 
 #include <imgui.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
+#include <ctype.h>
+#ifdef _WIN32
+#include <direct.h>   /* _mkdir */
+#endif
 
 extern "C" {
 #include <jce/core/jce_log.h>
+#include <jce/app/jce_config.h>
+#include <jce/graphics/jce_renderer.h>
 }
+#include <time.h>
 
 #define LOG_TAG "editor_panels"
+
+/* Forward declaration for settings persistence. */
+static void settings_ensure_init(void);
 
 /* ══════════════════════════════════════════════════════════════════════
  *  PANEL VISIBILITY
@@ -134,300 +146,280 @@ void jce_editor_panels_init(void)
     s_visible[JCE_PANEL_INSPECTOR]   = true;
     s_visible[JCE_PANEL_CONSOLE]     = true;
     s_visible[JCE_PANEL_SCENE_VIEW]  = true;
-    s_visible[JCE_PANEL_GAME_VIEW]   = false;
-    s_visible[JCE_PANEL_TIMELINE]    = false;
+    s_visible[JCE_PANEL_GAME_VIEW]   = true;
+    s_visible[JCE_PANEL_TIMELINE]    = true;
     s_visible[JCE_PANEL_ASSETS]      = true;
-    s_visible[JCE_PANEL_FILE_VIEWER] = false;
+    s_visible[JCE_PANEL_FILE_VIEWER] = true;
     s_visible[JCE_PANEL_PREFERENCES] = false;
 
     /* Console ring buffer. */
     memset(&s_console, 0, sizeof(s_console));
+
+    /* Load persisted editor settings (language, theme, font, renderer). */
+    settings_ensure_init();
 
     jce_editor_console_log_level(JCE_CONSOLE_INFO, "editor panels initialized");
 }
 
 void jce_editor_panels_shutdown(void)
 {
-    /* nothing to free — file viewer tabs cleaned up separately */
+    jce_file_viewer_shutdown();
 }
 
 /* ══════════════════════════════════════════════════════════════════════
- *  FILE VIEWER (multi-tab with line numbers)
+ *  FILE VIEWER — delegated to jce_panel_file_viewer.cpp
  * ══════════════════════════════════════════════════════════════════════ */
-
-#define FILE_VIEWER_MAX_TABS    16
-#define FILE_VIEWER_MAX_CONTENT (1024 * 256)  /* 256KB max per file */
-
-typedef struct {
-    char  path[512];
-    char  display_name[64];
-    char *content;       /* heap-allocated */
-    int   content_len;
-    bool  is_image;      /* for future use */
-    bool  open;          /* tab open state */
-} FileViewerTab;
-
-static struct {
-    FileViewerTab tabs[FILE_VIEWER_MAX_TABS];
-    int tab_count;
-    int active_tab;
-} s_fv;
-
-/* Called from shutdown to free viewer memory. */
-static void file_viewer_shutdown(void)
-{
-    for (int i = 0; i < s_fv.tab_count; i++) {
-        if (s_fv.tabs[i].content) {
-            free(s_fv.tabs[i].content);
-            s_fv.tabs[i].content = NULL;
-        }
-    }
-    s_fv.tab_count  = 0;
-    s_fv.active_tab = -1;
-}
-
-/* Close a tab by index: free content and compact the array. */
-static void file_viewer_close_tab(int idx)
-{
-    if (idx < 0 || idx >= s_fv.tab_count) return;
-
-    if (s_fv.tabs[idx].content) {
-        free(s_fv.tabs[idx].content);
-        s_fv.tabs[idx].content = NULL;
-    }
-
-    /* Shift remaining tabs down. */
-    for (int i = idx; i < s_fv.tab_count - 1; i++)
-        s_fv.tabs[i] = s_fv.tabs[i + 1];
-
-    s_fv.tab_count--;
-
-    /* Clear the vacated last slot. */
-    memset(&s_fv.tabs[s_fv.tab_count], 0, sizeof(FileViewerTab));
-
-    /* Adjust active tab. */
-    if (s_fv.active_tab >= s_fv.tab_count)
-        s_fv.active_tab = s_fv.tab_count - 1;
-}
-
-void jce_file_viewer_open(const char *path)
-{
-    if (!path || !path[0]) return;
-
-    /* Check if already open -> switch to it. */
-    for (int i = 0; i < s_fv.tab_count; i++) {
-        if (strcmp(s_fv.tabs[i].path, path) == 0) {
-            s_fv.active_tab = i;
-            s_visible[JCE_PANEL_FILE_VIEWER] = true;
-            return;
-        }
-    }
-
-    /* If at max capacity, close the oldest (first) tab. */
-    if (s_fv.tab_count >= FILE_VIEWER_MAX_TABS)
-        file_viewer_close_tab(0);
-
-    /* Extract display name (last component after / or \). */
-    const char *name = path;
-    for (const char *p = path; *p; p++) {
-        if (*p == '/' || *p == '\\')
-            name = p + 1;
-    }
-
-    /* Read file content (binary mode, capped). */
-    FILE *fp = fopen(path, "rb");
-    if (!fp) {
-        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-            "file viewer: cannot open '%s'", path);
-        return;
-    }
-
-    fseek(fp, 0, SEEK_END);
-    long file_size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-
-    int read_size = (file_size > FILE_VIEWER_MAX_CONTENT)
-                    ? FILE_VIEWER_MAX_CONTENT : (int)file_size;
-
-    char *buf = (char *)malloc((size_t)read_size + 1);
-    if (!buf) {
-        fclose(fp);
-        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-            "file viewer: malloc failed for '%s'", path);
-        return;
-    }
-
-    int actually_read = (int)fread(buf, 1, (size_t)read_size, fp);
-    fclose(fp);
-
-    buf[actually_read] = '\0';
-
-    /* Fill the new tab. */
-    FileViewerTab *tab = &s_fv.tabs[s_fv.tab_count];
-    memset(tab, 0, sizeof(*tab));
-    snprintf(tab->path, sizeof(tab->path), "%s", path);
-    snprintf(tab->display_name, sizeof(tab->display_name), "%s", name);
-    tab->content     = buf;
-    tab->content_len = actually_read;
-    tab->is_image    = false;
-    tab->open        = true;
-
-    s_fv.active_tab = s_fv.tab_count;
-    s_fv.tab_count++;
-
-    s_visible[JCE_PANEL_FILE_VIEWER] = true;
-}
 
 void jce_editor_panel_file_viewer_content(void)
 {
-    /* If no tabs open, show placeholder. */
-    if (s_fv.tab_count <= 0) {
-        ImGui::TextDisabled("%s", jce_editor_i18n("viewer.noFile"));
-        return;
-    }
-
-    /* Tab bar. */
-    ImGuiTabBarFlags tab_flags = ImGuiTabBarFlags_Reorderable
-                               | ImGuiTabBarFlags_AutoSelectNewTabs
-                               | ImGuiTabBarFlags_FittingPolicyScroll;
-
-    if (ImGui::BeginTabBar("##FileViewerTabs", tab_flags)) {
-        for (int i = 0; i < s_fv.tab_count; /* incremented below */) {
-            FileViewerTab *tab = &s_fv.tabs[i];
-
-            /* Push a unique ID so duplicate display names don't collide. */
-            ImGui::PushID(i);
-            bool tab_open = tab->open;
-            if (ImGui::BeginTabItem(tab->display_name, &tab_open)) {
-                s_fv.active_tab = i;
-
-                /* Toolbar: Open External button + file info. */
-                if (ImGui::Button(jce_editor_i18n("viewer.openExternal"))) {
-                    jce_editor_console_log_level(JCE_CONSOLE_INFO,
-                        "open external: %s (not yet implemented)", tab->path);
-                }
-                ImGui::SameLine();
-                if (tab->content_len >= 1024)
-                    ImGui::Text("%s  (%d KB)", jce_editor_i18n("viewer.fileInfo"),
-                                tab->content_len / 1024);
-                else
-                    ImGui::Text("%s  (%d bytes)", jce_editor_i18n("viewer.fileInfo"),
-                                tab->content_len);
-
-                /* File path in secondary color. */
-                ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s", tab->path);
-                ImGui::Separator();
-
-                /* Code view with line numbers. */
-                ImGui::BeginChild("CodeView", ImVec2(0, 0), false,
-                                  ImGuiWindowFlags_HorizontalScrollbar);
-
-                /* Count total lines. */
-                int line_count = 1;
-                for (int c = 0; c < tab->content_len; c++) {
-                    if (tab->content[c] == '\n') line_count++;
-                }
-
-                /* Determine width for line number column. */
-                int digits = 1;
-                {
-                    int tmp = line_count;
-                    while (tmp >= 10) { digits++; tmp /= 10; }
-                }
-                char num_fmt[16];
-                snprintf(num_fmt, sizeof(num_fmt), "%%%dd", digits);
-
-                /* Render lines. */
-                const char *line_start = tab->content;
-                int line_num = 1;
-                for (;;) {
-                    const char *line_end = line_start;
-                    while (*line_end && *line_end != '\n') line_end++;
-
-                    /* Line number (right-aligned, secondary color). */
-                    char num_buf[16];
-                    snprintf(num_buf, sizeof(num_buf), num_fmt, line_num);
-                    ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s", num_buf);
-                    ImGui::SameLine();
-
-                    /* Line text. */
-                    if (line_end > line_start) {
-                        ImGui::TextUnformatted(line_start, line_end);
-                    } else {
-                        ImGui::TextUnformatted("");
-                    }
-
-                    if (*line_end == '\0') break;
-                    line_start = line_end + 1;
-                    line_num++;
-                }
-
-                ImGui::EndChild();
-                ImGui::EndTabItem();
-            }
-            ImGui::PopID();
-
-            /* Handle tab close. */
-            if (!tab_open) {
-                file_viewer_close_tab(i);
-                /* Don't increment i — array shifted down. */
-            } else {
-                i++;
-            }
-        }
-        ImGui::EndTabBar();
-    }
+    jce_file_viewer_draw_content();
 }
 
 void jce_editor_panel_file_viewer(void)
 {
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_FILE_VIEWER);
     if (!*vis) return;
-
-    if (ImGui::Begin("File Viewer###FileViewer", vis))
-        jce_editor_panel_file_viewer_content();
-    ImGui::End();
+    jce_file_viewer_draw_window(vis);
 }
 
 /* ══════════════════════════════════════════════════════════════════════
  *  SETTINGS DIALOG (full implementation)
  * ══════════════════════════════════════════════════════════════════════ */
 
+/* Platform-specific renderer backend list. */
+#if defined(_WIN32)
+static const char *s_renderer_names[] = { "Auto", "D3D12", "D3D11", "Vulkan", "OpenGL" };
+static const JceRendererBackend s_renderer_values[] = {
+    JCE_BACKEND_AUTO, JCE_BACKEND_D3D12, JCE_BACKEND_D3D11,
+    JCE_BACKEND_VULKAN, JCE_BACKEND_OPENGL
+};
+static const int s_renderer_count = 5;
+#elif defined(__APPLE__)
+static const char *s_renderer_names[] = { "Auto", "Metal", "OpenGL" };
+static const JceRendererBackend s_renderer_values[] = {
+    JCE_BACKEND_AUTO, JCE_BACKEND_METAL, JCE_BACKEND_OPENGL
+};
+static const int s_renderer_count = 3;
+#elif defined(__EMSCRIPTEN__)
+static const char *s_renderer_names[] = { "Auto", "OpenGL ES" };
+static const JceRendererBackend s_renderer_values[] = {
+    JCE_BACKEND_AUTO, JCE_BACKEND_OPENGLES
+};
+static const int s_renderer_count = 2;
+#else
+static const char *s_renderer_names[] = { "Auto", "Vulkan", "OpenGL" };
+static const JceRendererBackend s_renderer_values[] = {
+    JCE_BACKEND_AUTO, JCE_BACKEND_VULKAN, JCE_BACKEND_OPENGL
+};
+static const int s_renderer_count = 3;
+#endif
+
 static struct {
-    int  language_idx;
-    int  font_size_idx;
-    int  theme_idx;
-    int  renderer_idx;
-    bool needs_restart;
-    bool initialized;
+    int   language_idx;
+    int   theme_idx;
+    int   renderer_idx;
+    float font_size;
+    /* Saved originals for Cancel. */
+    int   orig_language_idx;
+    int   orig_theme_idx;
+    int   orig_renderer_idx;
+    float orig_font_size;
+    bool  needs_restart;
+    bool  initialized;
 } s_settings;
+
+static int renderer_backend_to_idx(JceRendererBackend b)
+{
+    for (int i = 0; i < s_renderer_count; i++)
+        if (s_renderer_values[i] == b) return i;
+    return 0;
+}
 
 static void settings_ensure_init(void)
 {
     if (s_settings.initialized) return;
     memset(&s_settings, 0, sizeof(s_settings));
-    s_settings.language_idx  = (jce_editor_i18n_get_locale() == JCE_LOCALE_ZH_CN) ? 1 : 0;
-    s_settings.theme_idx     = jce_editor_get_theme();
-    s_settings.font_size_idx = 1; /* 14px default */
-    s_settings.renderer_idx  = 0; /* OpenGL */
+
+    /* Load persisted editor config. */
+    JceEditorConfig ecfg;
+    if (jce_editor_config_load(&ecfg)) {
+        /* Language */
+        if (strcmp(ecfg.language, "zh_cn") == 0) {
+            s_settings.language_idx = 1;
+            jce_editor_i18n_set_locale(JCE_LOCALE_ZH_CN);
+        } else {
+            s_settings.language_idx = 0;
+            jce_editor_i18n_set_locale(JCE_LOCALE_EN);
+        }
+
+        /* Theme */
+        if (strcmp(ecfg.theme, "Light") == 0) s_settings.theme_idx = JCE_THEME_LIGHT;
+        else if (strcmp(ecfg.theme, "SSMS") == 0) s_settings.theme_idx = JCE_THEME_SSMS;
+        else s_settings.theme_idx = JCE_THEME_DARK;
+        jce_editor_apply_theme(s_settings.theme_idx);
+
+        /* Font size */
+        if (ecfg.font_size >= 12 && ecfg.font_size <= 48) {
+            s_settings.font_size = (float)ecfg.font_size;
+            if (s_settings.font_size != jce_editor_get_font_size())
+                jce_editor_set_font_size(s_settings.font_size);
+        } else {
+            s_settings.font_size = jce_editor_get_font_size();
+        }
+
+        /* Renderer */
+        s_settings.renderer_idx = 0;
+        for (int i = 0; i < s_renderer_count; i++) {
+            if (strcmp(s_renderer_names[i], ecfg.renderer) == 0) {
+                s_settings.renderer_idx = i;
+                break;
+            }
+        }
+    } else {
+        s_settings.language_idx  = (jce_editor_i18n_get_locale() == JCE_LOCALE_ZH_CN) ? 1 : 0;
+        s_settings.theme_idx     = jce_editor_get_theme();
+        s_settings.renderer_idx  = 0;
+        s_settings.font_size     = jce_editor_get_font_size();
+    }
+
     s_settings.initialized   = true;
+}
+
+static void settings_snapshot(void)
+{
+    s_settings.orig_language_idx = s_settings.language_idx;
+    s_settings.orig_theme_idx    = s_settings.theme_idx;
+    s_settings.orig_renderer_idx = s_settings.renderer_idx;
+    s_settings.orig_font_size    = s_settings.font_size;
+}
+
+static void settings_apply(void)
+{
+    /* Language — already applied immediately via Combo callback. */
+
+    /* Theme — already applied immediately via Combo callback. */
+
+    /* Font size — apply if changed. */
+    float cur = jce_editor_get_font_size();
+    if (s_settings.font_size != cur)
+        jce_editor_set_font_size(s_settings.font_size);
+
+    /* Renderer — requires restart; also sync to engine .config/jce.ini. */
+    if (s_settings.renderer_idx != s_settings.orig_renderer_idx)
+        s_settings.needs_restart = true;
+
+    /* Persist to editor config file. */
+    {
+        JceEditorConfig ecfg;
+        jce_editor_config_load(&ecfg);
+
+        snprintf(ecfg.language, sizeof(ecfg.language), "%s",
+                 s_settings.language_idx == 0 ? "en" : "zh_cn");
+        ecfg.font_size = (int)s_settings.font_size;
+
+        const char *theme_names[] = { "Dark", "Light", "SSMS" };
+        snprintf(ecfg.theme, sizeof(ecfg.theme), "%s",
+                 theme_names[s_settings.theme_idx]);
+
+        if (s_settings.renderer_idx >= 0 && s_settings.renderer_idx < s_renderer_count)
+            snprintf(ecfg.renderer, sizeof(ecfg.renderer), "%s",
+                     s_renderer_names[s_settings.renderer_idx]);
+
+        jce_editor_config_save(&ecfg);
+    }
+
+    /* Write renderer backend to .config/jce.ini so the engine picks it up. */
+    {
+        static const char *backend_ini_names[] = {
+#if defined(_WIN32)
+            "auto", "d3d12", "d3d11", "vulkan", "opengl"
+#elif defined(__APPLE__)
+            "auto", "metal", "opengl"
+#elif defined(__EMSCRIPTEN__)
+            "auto", "opengles"
+#else
+            "auto", "vulkan", "opengl"
+#endif
+        };
+        const char *be = "auto";
+        if (s_settings.renderer_idx >= 0 && s_settings.renderer_idx < s_renderer_count)
+            be = backend_ini_names[s_settings.renderer_idx];
+#ifdef _WIN32
+        _mkdir(".config");
+#else
+        mkdir(".config", 0755);
+#endif
+        FILE *ini = fopen(".config/jce.ini", "w");
+        if (ini) {
+            fprintf(ini, "[renderer]\n");
+            fprintf(ini, "backend = %s\n", be);
+            fclose(ini);
+        }
+    }
+
+    /* Update snapshot so Cancel won't revert applied changes. */
+    settings_snapshot();
+
+    jce_editor_console_log("Settings applied and saved");
+}
+
+static void settings_cancel(void)
+{
+    /* Revert language. */
+    if (s_settings.language_idx != s_settings.orig_language_idx) {
+        s_settings.language_idx = s_settings.orig_language_idx;
+        jce_editor_i18n_set_locale(
+            s_settings.language_idx == 0 ? JCE_LOCALE_EN : JCE_LOCALE_ZH_CN);
+    }
+    /* Revert theme. */
+    if (s_settings.theme_idx != s_settings.orig_theme_idx) {
+        s_settings.theme_idx = s_settings.orig_theme_idx;
+        jce_editor_apply_theme(s_settings.theme_idx);
+    }
+    /* Revert font size. */
+    if (s_settings.font_size != s_settings.orig_font_size) {
+        s_settings.font_size = s_settings.orig_font_size;
+        jce_editor_set_font_size(s_settings.orig_font_size);
+    }
+    /* Revert renderer. */
+    s_settings.renderer_idx = s_settings.orig_renderer_idx;
+    s_settings.needs_restart = false;
 }
 
 void jce_editor_settings_dialog(bool *p_open)
 {
-    if (!p_open || !*p_open) return;
-
+    if (!p_open) return;
     settings_ensure_init();
 
-    char _title[256];
-    snprintf(_title, sizeof(_title), "%s###Settings", jce_editor_i18n("settings.title"));
+    static bool was_open = false;
+    if (*p_open && !was_open) {
+        settings_snapshot();
+        was_open = true;
+    }
+    if (!*p_open && was_open) {
+        settings_cancel();
+        was_open = false;
+    }
+    if (!*p_open) return;
 
-    ImGui::SetNextWindowSize(ImVec2(550, 460), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin(_title, p_open, ImGuiWindowFlags_NoCollapse)) {
+    char _title[256];
+    snprintf(_title, sizeof(_title), "%s###SettingsDialog",
+             jce_editor_i18n("settings.title"));
+
+    const ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(550, 500), ImGuiCond_Appearing);
+    ImGui::SetNextWindowViewport(vp->ID);
+
+    if (!ImGui::Begin(_title, p_open,
+                      ImGuiWindowFlags_NoCollapse
+                    | ImGuiWindowFlags_NoDocking)) {
         ImGui::End();
         return;
     }
 
+    ImGui::TextColored(JCE_COLOR_ACCENT, "%s", jce_editor_i18n("settings.title"));
+    ImGui::Spacing();
     ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "%s",
                        jce_editor_i18n("settings.description"));
     ImGui::Spacing();
@@ -448,15 +440,6 @@ void jce_editor_settings_dialog(bool *p_open)
     ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%s",
                        jce_editor_i18n("settings.appliesImmediately"));
 
-    /* Font Size */
-    snprintf(_lbl, sizeof(_lbl), "%s###settings_font", jce_editor_i18n("settings.fontSize"));
-    const char *font_sizes[] = { "12", "14", "16", "18", "20", "24", "28", "32" };
-    if (ImGui::Combo(_lbl, &s_settings.font_size_idx, font_sizes, 8))
-        s_settings.needs_restart = true;
-    ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%s",
-                       jce_editor_i18n("settings.requiresRestart"));
-
     /* Theme */
     snprintf(_lbl, sizeof(_lbl), "%s###settings_theme", jce_editor_i18n("settings.theme"));
     const char *themes[] = { "Dark", "Light", "Blue" };
@@ -466,20 +449,30 @@ void jce_editor_settings_dialog(bool *p_open)
     ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%s",
                        jce_editor_i18n("settings.appliesImmediately"));
 
-    /* Renderer */
-    snprintf(_lbl, sizeof(_lbl), "%s###settings_renderer", jce_editor_i18n("settings.renderBackend"));
-    const char *renderers[] = { "OpenGL 3.3", "Vulkan 1.2" };
-    int prev_renderer = s_settings.renderer_idx;
-    ImGui::Combo(_lbl, &s_settings.renderer_idx, renderers, 2);
-    if (s_settings.renderer_idx != prev_renderer)
-        s_settings.needs_restart = true;
-    ImGui::PopItemWidth();
-
-    /* Vulkan note */
-    if (s_settings.renderer_idx == 1) {
-        ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.2f, 1.0f), "%s",
-                           jce_editor_i18n("settings.requiresRestart"));
+    /* Font Size — apply on release to avoid per-frame atlas rebuild. */
+    snprintf(_lbl, sizeof(_lbl), "%s###settings_fontsize", jce_editor_i18n("settings.fontSize"));
+    ImGui::SliderFloat(_lbl, &s_settings.font_size, 12.0f, 48.0f, "%.0f px");
+    if (ImGui::IsItemDeactivatedAfterEdit()) {
+        jce_editor_set_font_size(s_settings.font_size);
     }
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%s",
+                       jce_editor_i18n("settings.appliesImmediately"));
+
+    /* Renderer Backend (selector) */
+    snprintf(_lbl, sizeof(_lbl), "%s###settings_renderer", jce_editor_i18n("settings.renderBackend"));
+    if (ImGui::Combo(_lbl, &s_settings.renderer_idx, s_renderer_names, s_renderer_count)) {
+        s_settings.needs_restart = true;
+    }
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%s",
+                       jce_editor_i18n("settings.requiresRestart"));
+
+    /* Current active backend display. */
+    ImGui::TextColored(ImVec4(0.7f, 0.9f, 0.7f, 1.0f), "Active: %s",
+                       jce_renderer_get_backend_name(NULL));
+
+    ImGui::PopItemWidth();
 
     /* Restart warning */
     if (s_settings.needs_restart) {
@@ -499,16 +492,25 @@ void jce_editor_settings_dialog(bool *p_open)
     ImGui::SetCursorPosX(ImGui::GetContentRegionAvail().x - total_btn_w + ImGui::GetCursorPosX());
 
     if (ImGui::Button(jce_editor_i18n("dialog.apply"), ImVec2(btn_w, 0))) {
-        jce_editor_console_log("Settings applied");
+        settings_apply();
     }
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("dialog.ok"), ImVec2(btn_w, 0))) {
-        jce_editor_console_log("Settings saved");
+        settings_apply();
         *p_open = false;
+        was_open = false;
     }
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("dialog.cancel"), ImVec2(btn_w, 0))) {
+        settings_cancel();
         *p_open = false;
+        was_open = false;
+    }
+
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        settings_cancel();
+        *p_open = false;
+        was_open = false;
     }
 
     ImGui::End();
@@ -525,7 +527,6 @@ static struct {
     bool  fullscreen;
     bool  vsync;
     int   target_fps;
-    int   renderer_idx;
     int   msaa_idx;
     int   shadow_idx;
     bool  hdr;
@@ -574,6 +575,18 @@ static void prefs_ensure_init(void)
     s_prefs.initialized        = true;
 }
 
+bool jce_editor_prefs_show_gizmos(void)
+{
+    prefs_ensure_init();
+    return s_prefs.show_gizmos;
+}
+
+float jce_editor_prefs_gizmo_scale(void)
+{
+    prefs_ensure_init();
+    return s_prefs.gizmo_scale;
+}
+
 void jce_editor_panel_preferences(void)
 {
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_PREFERENCES);
@@ -605,8 +618,7 @@ void jce_editor_panel_preferences(void)
 
             snprintf(_lbl, sizeof(_lbl), "%s###pref_rendering", jce_editor_i18n("preferences.rendering.title"));
             if (ImGui::BeginTabItem(_lbl)) {
-                const char *renderers[] = { "OpenGL", "Vulkan", "Auto" };
-                ImGui::Combo("Backend###backend", &s_prefs.renderer_idx, renderers, 3);
+                ImGui::Text("Backend: %s", jce_renderer_get_backend_name(NULL));
                 const char *msaa[] = { "Off", "2x", "4x", "8x", "16x" };
                 ImGui::Combo("MSAA###msaa", &s_prefs.msaa_idx, msaa, 5);
                 const char *shadows[] = { "512", "1024", "2048", "4096", "8192" };
@@ -706,23 +718,43 @@ void jce_editor_about_dialog(bool *p_open)
 {
     if (!p_open || !*p_open) return;
 
-    ImGui::SetNextWindowSize(ImVec2(420, 260), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("About JCE Editor###About", p_open,
-                     ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse)) {
+    char _title[256];
+    snprintf(_title, sizeof(_title), "%s###AboutDialog",
+             jce_editor_i18n("about.title"));
 
-        ImGui::TextColored(JCE_COLOR_ACCENT, "%s", jce_editor_i18n("about.title"));
-        ImGui::Spacing();
-        ImGui::Text("Version: 0.3.0 (Editor Preview)");
-        ImGui::Text("Build: %s %s", __DATE__, __TIME__);
-        ImGui::Spacing();
-        ImGui::Separator();
-        ImGui::Spacing();
-        ImGui::TextWrapped("%s", jce_editor_i18n("about.description"));
-        ImGui::Spacing();
-        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
-            "Platforms: Windows, macOS, Linux, iOS, Android, Web");
-        ImGui::Spacing();
-        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s", jce_editor_i18n("about.copyright"));
+    const ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(420, 360), ImGuiCond_Appearing);
+    ImGui::SetNextWindowViewport(vp->ID);
+
+    if (!ImGui::Begin(_title, p_open,
+                      ImGuiWindowFlags_NoCollapse
+                    | ImGuiWindowFlags_NoDocking)) {
+        ImGui::End();
+        return;
     }
+
+    ImGui::TextColored(JCE_COLOR_ACCENT, "%s", jce_editor_i18n("about.title"));
+    ImGui::Spacing();
+    ImGui::Text("Version: 0.3.0 (Editor Preview)");
+    ImGui::Text("Build: %s %s", __DATE__, __TIME__);
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::TextWrapped("%s", jce_editor_i18n("about.description"));
+    ImGui::Spacing();
+    ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
+        "Platforms: Windows, macOS, Linux, iOS, Android, Web");
+    ImGui::Spacing();
+    ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s", jce_editor_i18n("about.copyright"));
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    if (ImGui::Button(jce_editor_i18n("dialog.close"), ImVec2(100, 0))
+        || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        *p_open = false;
+    }
+
     ImGui::End();
 }

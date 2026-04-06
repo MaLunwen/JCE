@@ -12,6 +12,8 @@
 
 #include <bgfx/c99/bgfx.h>
 #include <SDL3/SDL.h>
+#include "core/jce_memory.h"
+#include "core/jce_profiler.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -231,7 +233,7 @@ JceRenderer *jce_renderer_create(JceWindow *win,
     bgfx_set_view_rect(JCE_VIEW_DEBUG, 0, 0, (uint16_t)w, (uint16_t)h);
 
     /* Vertex layout: Position (float3) + Color0 (UINT8x4, normalized). */
-    JceRenderer *r = (JceRenderer *)SDL_calloc(1, sizeof(*r));
+    JceRenderer *r = (JceRenderer *)JCE_CALLOC(1, sizeof(*r));
     if (!r) {
         bgfx_shutdown();
         return NULL;
@@ -326,7 +328,7 @@ void jce_renderer_set_shaders(JceRenderer *r,
 JceRenderer *jce_renderer_create_fallback(JceWindow *win)
 {
     if (!win) return NULL;
-    JceRenderer *r = (JceRenderer *)SDL_calloc(1, sizeof(*r));
+    JceRenderer *r = (JceRenderer *)JCE_CALLOC(1, sizeof(*r));
     if (!r) return NULL;
 
     r->is_fallback = true;
@@ -352,7 +354,7 @@ JceRenderer *jce_renderer_create_fallback(JceWindow *win)
     }
     LOG_ERROR(LOG_TAG, "SDL software renderer failed: %s", SDL_GetError());
 
-    SDL_free(r);
+    JCE_FREE(r);
     return NULL;
 }
 
@@ -501,7 +503,7 @@ void jce_renderer_destroy(JceRenderer *r)
         if (r->sdl_renderer) {
             SDL_DestroyRenderer(r->sdl_renderer);
         }
-        SDL_free(r);
+        JCE_FREE(r);
         return;
     }
     bgfx_destroy_program(r->program);
@@ -524,15 +526,16 @@ void jce_renderer_destroy(JceRenderer *r)
     if (r->u_light_color.idx != UINT16_MAX)
         bgfx_destroy_uniform(r->u_light_color);
     bgfx_shutdown();
-    SDL_free(r);
+    JCE_FREE(r);
 }
 
 /* -- Per-frame ------------------------------------------------------ */
 
 void jce_renderer_begin_frame(const JceRenderer *r, JceWindow *win)
 {
-    if (!r || !win) return;
-    if (r->is_fallback) return;
+    JCE_PROFILE_ZONE_N("Renderer::BeginFrame");
+    if (!r || !win) { JCE_PROFILE_ZONE_END; return; }
+    if (r->is_fallback) { JCE_PROFILE_ZONE_END; return; }
 
     /* Full-backbuffer viewport for all views. */
     uint16_t vp_x, vp_y, vp_w, vp_h;
@@ -547,7 +550,7 @@ void jce_renderer_begin_frame(const JceRenderer *r, JceWindow *win)
         jce_window_get_logical(win, &lw, &lh);
         jce_mat4 proj = jce_m4_ortho(0, (float)lw, (float)lh, 0,
                                       0, 100.0f, caps->homogeneousDepth);
-        bgfx_set_view_transform(JCE_VIEW_MAIN_3D, view.m, proj.m);
+        bgfx_set_view_transform(JCE_VIEW_MAIN_3D, view.raw[0], proj.raw[0]);
         bgfx_set_view_rect(JCE_VIEW_MAIN_3D, vp_x, vp_y, vp_w, vp_h);
     }
 
@@ -558,7 +561,7 @@ void jce_renderer_begin_frame(const JceRenderer *r, JceWindow *win)
         jce_window_get_logical(win, &lw, &lh);
         jce_mat4 proj = jce_m4_ortho(0, (float)lw, (float)lh, 0,
                                       0, 100.0f, caps->homogeneousDepth);
-        bgfx_set_view_transform(JCE_VIEW_UI, view.m, proj.m);
+        bgfx_set_view_transform(JCE_VIEW_UI, view.raw[0], proj.raw[0]);
         bgfx_set_view_rect(JCE_VIEW_UI, vp_x, vp_y, vp_w, vp_h);
     }
 
@@ -569,6 +572,7 @@ void jce_renderer_begin_frame(const JceRenderer *r, JceWindow *win)
     bgfx_touch(JCE_VIEW_MAIN_3D);
     bgfx_touch(JCE_VIEW_UI);
     bgfx_touch(JCE_VIEW_DEBUG);
+    JCE_PROFILE_ZONE_END;
 }
 
 void jce_renderer_begin_frame_3d(const JceRenderer *r, JceWindow *win,
@@ -587,7 +591,7 @@ void jce_renderer_begin_frame_3d(const JceRenderer *r, JceWindow *win,
         jce_mat4 view = jce_camera_view(cam);
         jce_mat4 proj = jce_camera_proj(cam, aspect, caps->homogeneousDepth);
 
-        bgfx_set_view_transform(view_id, view.m, proj.m);
+        bgfx_set_view_transform(view_id, view.raw[0], proj.raw[0]);
     } else {
         /* Fallback: 2D ortho. */
         jce_mat4 view = jce_m4_identity();
@@ -596,7 +600,7 @@ void jce_renderer_begin_frame_3d(const JceRenderer *r, JceWindow *win,
         const bgfx_caps_t *caps = bgfx_get_caps();
         jce_mat4 proj = jce_m4_ortho(0, (float)lw, (float)lh, 0,
                                       0, 100.0f, caps->homogeneousDepth);
-        bgfx_set_view_transform(view_id, view.m, proj.m);
+        bgfx_set_view_transform(view_id, view.raw[0], proj.raw[0]);
     }
 
     bgfx_set_view_rect(view_id, vp_x, vp_y, vp_w, vp_h);
@@ -605,9 +609,10 @@ void jce_renderer_begin_frame_3d(const JceRenderer *r, JceWindow *win,
 
 void jce_renderer_end_frame(const JceRenderer *r)
 {
-    if (!r) return;
-    if (r->is_fallback) return;
+    JCE_PROFILE_ZONE_N("Renderer::EndFrame");
+    if (!r || r->is_fallback) { JCE_PROFILE_ZONE_END; return; }
     bgfx_frame(false);
+    JCE_PROFILE_ZONE_END;
 }
 
 /* -- Events --------------------------------------------------------- */
@@ -688,6 +693,13 @@ JceUniformHandle jce_renderer_get_tex_uniform(const JceRenderer *r)
     JceUniformHandle invalid = JCE_INVALID_UNIFORM;
     if (!r) return invalid;
     return (JceUniformHandle){ r->u_tex_color.idx };
+}
+
+JceShaderHandle jce_renderer_get_program_color(const JceRenderer *r)
+{
+    JceShaderHandle invalid = JCE_INVALID_SHADER;
+    if (!r) return invalid;
+    return (JceShaderHandle){ r->program.idx };
 }
 
 JceShaderHandle jce_renderer_get_program_mesh(const JceRenderer *r)

@@ -2,8 +2,8 @@
  * jce_memory.h  Unified memory allocation macros.
  *
  * All engine allocations go through these macros, which delegate
- * to SDL_malloc / SDL_calloc / SDL_realloc / SDL_free for
- * consistent behaviour across platforms.
+ * to mimalloc (mi_malloc / mi_calloc / mi_realloc / mi_free) for
+ * high-performance, thread-safe allocation across platforms.
  *
  * Layer: Foundation (Layer 1 — no engine dependencies).
  */
@@ -11,15 +11,37 @@
 #ifndef JCE_MEMORY_H
 #define JCE_MEMORY_H
 
-#include <SDL3/SDL.h>   /* SDL_malloc, SDL_calloc, SDL_realloc, SDL_free */
+#include <mimalloc.h>
 #include <stddef.h>
+#include "jce_profiler.h"
 
 /* -- Core allocation macros ---------------------------------------- */
 
-#define JCE_MALLOC(size)         SDL_malloc(size)
-#define JCE_CALLOC(count, size)  SDL_calloc((count), (size))
-#define JCE_REALLOC(ptr, size)   SDL_realloc((ptr), (size))
-#define JCE_FREE(ptr)            SDL_free(ptr)
+static inline void *jce__malloc_tracked(size_t size) {
+    void *p = mi_malloc(size);
+    if (p) JCE_PROFILE_ALLOC(p, size);
+    return p;
+}
+static inline void *jce__calloc_tracked(size_t count, size_t size) {
+    void *p = mi_calloc(count, size);
+    if (p) JCE_PROFILE_ALLOC(p, count * size);
+    return p;
+}
+static inline void *jce__realloc_tracked(void *ptr, size_t size) {
+    if (ptr) JCE_PROFILE_FREE(ptr);
+    void *p = mi_realloc(ptr, size);
+    if (p) JCE_PROFILE_ALLOC(p, size);
+    return p;
+}
+static inline void jce__free_tracked(void *ptr) {
+    if (ptr) JCE_PROFILE_FREE(ptr);
+    mi_free(ptr);
+}
+
+#define JCE_MALLOC(size)         jce__malloc_tracked(size)
+#define JCE_CALLOC(count, size)  jce__calloc_tracked((count), (size))
+#define JCE_REALLOC(ptr, size)   jce__realloc_tracked((ptr), (size))
+#define JCE_FREE(ptr)            jce__free_tracked(ptr)
 
 /* Allocate and zero-initialize a single struct of type T. */
 #define JCE_NEW(T)  ((T *)JCE_CALLOC(1, sizeof(T)))

@@ -62,6 +62,11 @@ const PakAsset *pak_find(const PakArchive *pak, const char *path);
  * Returns the number of decompressed bytes, or 0 on error. */
 size_t pak_decompress(const PakAsset *asset, void *buf, size_t buf_size);
 
+/* Like pak_decompress but reuses the archive's ZSTD decompression context
+ * for better performance when decompressing many assets sequentially. */
+size_t pak_decompress_ex(const PakArchive *pak, const PakAsset *asset,
+                         void *buf, size_t buf_size);
+
 /* Return the number of assets in the archive. */
 uint32_t pak_count(const PakArchive *pak);
 

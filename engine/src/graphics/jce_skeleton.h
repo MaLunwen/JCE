@@ -30,6 +30,9 @@ typedef struct {
     int16_t  parent;              /* -1 = root joint */
     jce_mat4 inverse_bind_matrix; /* transforms from mesh space to bone-local space */
     jce_mat4 local_transform;     /* default rest pose (T * R * S) */
+    jce_vec3 rest_translation;    /* rest-pose T from glTF node */
+    jce_quat rest_rotation;       /* rest-pose R from glTF node */
+    jce_vec3 rest_scale;          /* rest-pose S from glTF node */
 } JceJoint;
 
 /* ================================================================== */
@@ -53,6 +56,13 @@ int jce_skeleton_find_joint(const JceSkeleton *skel, const char *name);
 /* Get the rest-pose local transforms (array of [joint_count] mat4). */
 const jce_mat4 *jce_skeleton_rest_pose(const JceSkeleton *skel);
 
+/* Get rest-pose TRS arrays (each has [joint_count] elements).
+ * These are the original glTF node TRS values, avoiding decomposition. */
+void jce_skeleton_rest_trs(const JceSkeleton *skel,
+                            const jce_vec3 **out_translations,
+                            const jce_quat **out_rotations,
+                            const jce_vec3 **out_scales);
+
 /* Evaluate skinning matrices from local transforms.
  *
  * local_transforms: per-joint local transforms (e.g. from animation sampling).
@@ -65,6 +75,12 @@ void jce_skeleton_evaluate(const JceSkeleton *skel,
                             const jce_mat4 *local_transforms,
                             jce_mat4 *out_matrices,
                             uint32_t max_joints);
+
+/* Return the inverse bind matrix for joint joint_idx.
+ * Returns identity if index is out of range.
+ * Useful for recovering the animated joint world transform from a skin matrix:
+ *   joint_global = skin_matrix[i] * inverse(jce_skeleton_get_inverse_bind(skel, i)) */
+jce_mat4 jce_skeleton_get_inverse_bind(const JceSkeleton *skel, uint32_t joint_idx);
 
 #ifdef __cplusplus
 }

@@ -12,10 +12,12 @@
 #include "jce_editor_style.h"
 #include "jce_editor_i18n.h"
 #include "jce_editor_state.h"
+#include "gizmo/jce_gizmo.h"
 
 #include <imgui.h>
 #include <SDL3/SDL.h>
 #include <string.h>
+#include <stdio.h>
 
 extern "C" {
 #include <jce/graphics/jce_views.h>
@@ -33,6 +35,11 @@ static struct {
     bool        active;         /* editor overlay visible? */
     uint64_t    last_time;      /* for delta-time computation */
     SDL_Cursor *cursors[ImGuiMouseCursor_COUNT];
+    SDL_Window *sdl_window;     /* SDL3 window for text input API */
+    bool        text_input_active;
+    const PakArchive *pak;      /* stored for font rebuild */
+    float       font_size;      /* current font size in pixels */
+    float       pending_font_size; /* >0 means rebuild next frame */
 } s_editor;
 
 /* ── SDL3 key mapping ──────────────────────────────────────────────── */
@@ -190,6 +197,10 @@ bool jce_editor_init(const PakArchive *pak, JceWindow *window)
 
     ImGuiIO &io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+
+    /* Let ImGui persist layout/docking state to imgui.ini. */
+    io.IniFilename = "imgui.ini";
 
     /* Clipboard. */
     io.SetClipboardTextFn = clipboard_set;
@@ -214,7 +225,9 @@ bool jce_editor_init(const PakArchive *pak, JceWindow *window)
     }
 
     /* Load custom font (after bgfx backend is ready). */
-    jce_editor_load_fonts(pak, 16.0f);
+    jce_editor_load_fonts(pak, 24.0f);
+    s_editor.pak       = pak;
+    s_editor.font_size = 24.0f;
 
     /* i18n. */
     jce_editor_i18n_init(pak);
@@ -222,8 +235,28 @@ bool jce_editor_init(const PakArchive *pak, JceWindow *window)
     /* Initialize editor state and panels. */
     jce_editor_state_init();
     jce_editor_panels_init();
+    jce_gizmo_init();
+
+    /* Set window icon from embedded PAK. */
+    {
+        const PakAsset *icon = pak_find(pak, "JCE_icon.png");
+        if (icon) {
+            void *buf = malloc((size_t)icon->original_size);
+            if (buf) {
+                size_t sz = pak_decompress(icon, buf,
+                                           (size_t)icon->original_size);
+                if (sz > 0)
+                    jce_window_set_icon(window, buf, sz);
+                free(buf);
+            }
+        } else {
+            LOG_WARN(LOG_TAG, "JCE_icon.png not found in PAK");
+        }
+    }
 
     s_editor.last_time   = SDL_GetPerformanceCounter();
+    s_editor.sdl_window  = jce_window_sdl(window);
+    s_editor.text_input_active = false;
     s_editor.active      = true;
     s_editor.initialized = true;
 
@@ -235,6 +268,12 @@ void jce_editor_shutdown(void)
 {
     if (!s_editor.initialized) return;
 
+    if (s_editor.text_input_active && s_editor.sdl_window) {
+        SDL_StopTextInput(s_editor.sdl_window);
+        s_editor.text_input_active = false;
+    }
+
+    jce_gizmo_shutdown();
     jce_editor_panels_shutdown();
     jce_editor_state_shutdown();
     jce_editor_i18n_shutdown();
@@ -342,6 +381,23 @@ void jce_editor_update(JceWindow *window)
     /* Setup bgfx view. */
     jce_imgui_bgfx_setup_view((uint16_t)w, (uint16_t)h);
 
+    /* Deferred font rebuild — must happen before NewFrame(). */
+    if (s_editor.pending_font_size > 0.0f) {
+        float new_size = s_editor.pending_font_size;
+        s_editor.pending_font_size = 0.0f;
+
+        ImGui::GetIO().Fonts->Clear();
+        if (jce_editor_load_fonts(s_editor.pak, new_size)) {
+            s_editor.font_size = new_size;
+            LOG_INFO(LOG_TAG, "font size changed to %.0f px", new_size);
+        } else {
+            /* Fallback: reload previous size. */
+            jce_editor_load_fonts(s_editor.pak, s_editor.font_size);
+            LOG_WARN(LOG_TAG, "font size change failed, reverted to %.0f px",
+                     s_editor.font_size);
+        }
+    }
+
     /* Begin ImGui frame. */
     ImGui::NewFrame();
 
@@ -351,6 +407,24 @@ void jce_editor_update(JceWindow *window)
     /* Render and submit to bgfx. */
     ImGui::Render();
     jce_imgui_bgfx_render_draw_data();
+
+    /* SDL3 does not emit SDL_EVENT_TEXT_INPUT unless text input is started.
+       Mirror Java behavior: toggle it based on ImGui's WantTextInput. */
+    if (s_editor.sdl_window) {
+        if (io.WantTextInput && !s_editor.text_input_active) {
+            if (SDL_StartTextInput(s_editor.sdl_window)) {
+                s_editor.text_input_active = true;
+            } else {
+                LOG_WARN(LOG_TAG, "SDL_StartTextInput failed: %s", SDL_GetError());
+            }
+        } else if (!io.WantTextInput && s_editor.text_input_active) {
+            if (SDL_StopTextInput(s_editor.sdl_window)) {
+                s_editor.text_input_active = false;
+            } else {
+                LOG_WARN(LOG_TAG, "SDL_StopTextInput failed: %s", SDL_GetError());
+            }
+        }
+    }
 
     /* Update mouse cursor. */
     update_cursor();
@@ -364,5 +438,32 @@ bool jce_editor_is_active(void)
 void jce_editor_toggle(void)
 {
     s_editor.active = !s_editor.active;
+    if (!s_editor.active && s_editor.text_input_active && s_editor.sdl_window) {
+        SDL_StopTextInput(s_editor.sdl_window);
+        s_editor.text_input_active = false;
+    }
     LOG_INFO(LOG_TAG, "editor %s", s_editor.active ? "shown" : "hidden");
+}
+
+float jce_editor_get_font_size(void)
+{
+    return s_editor.font_size;
+}
+
+bool jce_editor_set_font_size(float size)
+{
+    if (size < 12.0f) size = 12.0f;
+    if (size > 48.0f) size = 48.0f;
+    if (!s_editor.pak) return false;
+
+    /* Skip if already at this size and no pending change. */
+    if (size == s_editor.font_size && s_editor.pending_font_size <= 0.0f)
+        return true;
+
+    /* Defer the actual rebuild to the start of the next frame,
+       before ImGui::NewFrame(). Rebuilding mid-frame causes
+       ACCESS_VIOLATION since the font atlas is in use. */
+    s_editor.pending_font_size = size;
+    LOG_INFO(LOG_TAG, "font size change to %.0f px scheduled", size);
+    return true;
 }

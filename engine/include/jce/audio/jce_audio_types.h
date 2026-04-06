@@ -10,11 +10,19 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Opaque handles (0 = invalid). */
 typedef uint32_t JceSound;
 typedef uint32_t JceVoice;
 
 #define JCE_SOUND_INVALID 0
 #define JCE_VOICE_INVALID 0
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* JCE_AUDIO_TYPES_H */

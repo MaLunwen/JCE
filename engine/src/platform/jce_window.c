@@ -6,6 +6,7 @@
 #include <jce/core/jce_log.h>
 #include <SDL3_image/SDL_image.h>
 #include <SDL3/SDL_metal.h>
+#include "core/jce_memory.h"
 #include <string.h>
 
 #define LOG_TAG "jce_window"
@@ -27,7 +28,7 @@ struct JceWindow {
 
 JceWindow *jce_window_create(const JceWindowConfig *cfg)
 {
-    JceWindow *win = (JceWindow *)SDL_calloc(1, sizeof(*win));
+    JceWindow *win = (JceWindow *)JCE_CALLOC(1, sizeof(*win));
     if (!win) return NULL;
 
     win->logical_w = cfg->logical_w;
@@ -44,7 +45,7 @@ JceWindow *jce_window_create(const JceWindowConfig *cfg)
                                     flags);
     if (!win->sdl_win) {
         LOG_ERROR(LOG_TAG, "SDL_CreateWindow failed: %s", SDL_GetError());
-        SDL_free(win);
+        JCE_FREE(win);
         return NULL;
     }
 
@@ -65,7 +66,7 @@ JceWindow *jce_window_create(const JceWindowConfig *cfg)
     if (!win->metal_view) {
         LOG_ERROR(LOG_TAG, "SDL_Metal_CreateView failed: %s", SDL_GetError());
         SDL_DestroyWindow(win->sdl_win);
-        SDL_free(win);
+        JCE_FREE(win);
         return NULL;
     }
 
@@ -74,7 +75,7 @@ JceWindow *jce_window_create(const JceWindowConfig *cfg)
         LOG_ERROR(LOG_TAG, "SDL_Metal_GetLayer failed: %s", SDL_GetError());
         SDL_Metal_DestroyView(win->metal_view);
         SDL_DestroyWindow(win->sdl_win);
-        SDL_free(win);
+        JCE_FREE(win);
         return NULL;
     }
 #endif
@@ -89,7 +90,7 @@ void jce_window_destroy(JceWindow *win)
     if (win->metal_view) SDL_Metal_DestroyView(win->metal_view);
 #endif
     if (win->sdl_win) SDL_DestroyWindow(win->sdl_win);
-    SDL_free(win);
+    JCE_FREE(win);
 }
 
 SDL_Window *jce_window_sdl(JceWindow *win)

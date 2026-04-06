@@ -7,11 +7,15 @@
 
 #include <jce/graphics/jce_texture.h>
 #include <jce/resource/pak_loader.h>
+#include <jce/resource/jce_asset_format.h>
 #include <jce/core/jce_log.h>
+#include <jce/core/jce_profiler.h>
 
 #include <bgfx/c99/bgfx.h>
 #include <SDL3/SDL.h>
 #include <SDL3_image/SDL_image.h>
+#include "core/jce_memory.h"
+#include "resource/jce_asset_reader.h"
 #include <string.h>
 
 #define LOG_TAG "jce_texture"
@@ -140,8 +144,9 @@ JceTexture jce_texture_load(const PakArchive *pak, const char *asset_path)
     return jce_texture_load_ex(pak, asset_path, JCE_TEX_CLAMP);
 }
 
-JceTexture jce_texture_load_ex(const PakArchive *pak, const char *asset_path,
-                                int sampler_mode)
+static JceTexture jce_texture_load_ex_inner(const PakArchive *pak,
+                                             const char *asset_path,
+                                             int sampler_mode)
 {
     if (!pak || !asset_path) return JCE_TEXTURE_INVALID;
 
@@ -152,25 +157,87 @@ JceTexture jce_texture_load_ex(const PakArchive *pak, const char *asset_path,
     }
 
     /* Decompress from PAK. */
-    void *buf = SDL_malloc((size_t)asset->original_size);
+    void *buf = JCE_MALLOC((size_t)asset->original_size);
     if (!buf) return JCE_TEXTURE_INVALID;
 
     size_t n = pak_decompress(asset, buf, (size_t)asset->original_size);
     if (n == 0) {
         LOG_ERROR(LOG_TAG, "decompression failed: %s", asset_path);
-        SDL_free(buf);
+        JCE_FREE(buf);
         return JCE_TEXTURE_INVALID;
     }
 
-    /* Load image from memory via SDL3_image. */
+    /* ── Cooked path: .jceasset → read RGBA8 directly ── */
+    if (jce_asset_is_cooked(buf, n)) {
+        JceAssetView view;
+        if (!jce_asset_open(&view, buf, n)) {
+            LOG_ERROR(LOG_TAG, "bad .jceasset: %s", asset_path);
+            JCE_FREE(buf);
+            return JCE_TEXTURE_INVALID;
+        }
+
+        const JceAssetChunkEntry *info_chunk =
+            jce_asset_find_chunk(&view, JCEASSET_CHUNK_TEX_INFO);
+        const JceAssetChunkEntry *pixel_chunk =
+            jce_asset_find_chunk(&view, JCEASSET_CHUNK_TEX_PIXELS);
+
+        if (!info_chunk || !pixel_chunk) {
+            LOG_ERROR(LOG_TAG, "missing TEX chunks: %s", asset_path);
+            JCE_FREE(buf);
+            return JCE_TEXTURE_INVALID;
+        }
+
+        JceAssetTexInfo tex_info;
+        if (jce_asset_chunk_data(&view, info_chunk,
+                                  &tex_info, sizeof(tex_info)) == 0) {
+            JCE_FREE(buf);
+            return JCE_TEXTURE_INVALID;
+        }
+
+        void *pixels = JCE_MALLOC((size_t)pixel_chunk->original_size);
+        if (!pixels) { JCE_FREE(buf); return JCE_TEXTURE_INVALID; }
+
+        if (jce_asset_chunk_data(&view, pixel_chunk,
+                                  pixels,
+                                  (size_t)pixel_chunk->original_size) == 0) {
+            JCE_FREE(pixels);
+            JCE_FREE(buf);
+            return JCE_TEXTURE_INVALID;
+        }
+
+        JCE_FREE(buf); /* PAK buffer no longer needed */
+
+        /* Upload RGBA8 directly to bgfx with proper sampler mode. */
+        const bgfx_memory_t *mem = bgfx_alloc(tex_info.width * tex_info.height * 4);
+        memcpy(mem->data, pixels, tex_info.width * tex_info.height * 4);
+        JCE_FREE(pixels);
+
+        bgfx_texture_handle_t handle = bgfx_create_texture_2d(
+            (uint16_t)tex_info.width, (uint16_t)tex_info.height,
+            false, 1, BGFX_TEXTURE_FORMAT_RGBA8,
+            BGFX_TEXTURE_NONE | sampler_flags(sampler_mode), mem);
+
+        if (handle.idx == UINT16_MAX)
+            return JCE_TEXTURE_INVALID;
+
+        registry_add(handle.idx, tex_info.width, tex_info.height);
+        JceTexture tex;
+        tex.idx = handle.idx;
+
+        if (jce_texture_valid(tex))
+            LOG_DEBUG(LOG_TAG, "loaded (cooked) %s", asset_path);
+        return tex;
+    }
+
+    /* ── Raw path: PNG/JPG → SDL3_image → RGBA8 ── */
     SDL_IOStream *io = SDL_IOFromConstMem(buf, (size_t)asset->original_size);
     if (!io) {
-        SDL_free(buf);
+        JCE_FREE(buf);
         return JCE_TEXTURE_INVALID;
     }
 
     SDL_Surface *surf = IMG_Load_IO(io, true);  /* true = auto-close io */
-    SDL_free(buf);
+    JCE_FREE(buf);
 
     if (!surf) {
         LOG_ERROR(LOG_TAG, "IMG_Load_IO failed for %s: %s",
@@ -187,6 +254,15 @@ JceTexture jce_texture_load_ex(const PakArchive *pak, const char *asset_path,
         LOG_DEBUG(LOG_TAG, "loaded %s", asset_path);
 
     return tex;
+}
+
+JceTexture jce_texture_load_ex(const PakArchive *pak, const char *asset_path,
+                                int sampler_mode)
+{
+    JCE_PROFILE_ZONE_N("Texture::Load");
+    JceTexture result = jce_texture_load_ex_inner(pak, asset_path, sampler_mode);
+    JCE_PROFILE_ZONE_END;
+    return result;
 }
 
 JceTexture jce_texture_from_rgba(const void *data,

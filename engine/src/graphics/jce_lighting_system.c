@@ -6,9 +6,8 @@
 #include <jce/core/jce_log.h>
 
 #include <bgfx/c99/bgfx.h>
-#include <SDL3/SDL.h>
+#include "core/jce_memory.h"
 #include <string.h>
-#include <math.h>
 
 #define LOG_TAG "jce_lighting_system"
 
@@ -24,6 +23,8 @@ struct JceLightEnv {
 
     JceSpotLightDesc  spot_lights[JCE_MAX_SPOT_LIGHTS];
     uint32_t          num_spot;
+
+    jce_vec3 camera_pos;
 };
 
 /* ================================================================== */
@@ -35,6 +36,7 @@ static bgfx_uniform_handle_t s_u_dir_lights;
 static bgfx_uniform_handle_t s_u_point_lights;
 static bgfx_uniform_handle_t s_u_spot_lights;
 static bgfx_uniform_handle_t s_u_light_counts;
+static bgfx_uniform_handle_t s_u_camera_pos;
 static bool s_light_uniforms_init = false;
 
 static void ensure_light_uniforms(void)
@@ -52,6 +54,7 @@ static void ensure_light_uniforms(void)
     s_u_spot_lights   = bgfx_create_uniform("u_spotLights",   BGFX_UNIFORM_TYPE_VEC4,
                                              JCE_MAX_SPOT_LIGHTS * 3);
     s_u_light_counts  = bgfx_create_uniform("u_lightCounts",  BGFX_UNIFORM_TYPE_VEC4, 1);
+    s_u_camera_pos    = bgfx_create_uniform("u_cameraPos",    BGFX_UNIFORM_TYPE_VEC4, 1);
 
     s_light_uniforms_init = true;
     LOG_DEBUG(LOG_TAG, "light uniforms initialized");
@@ -63,7 +66,7 @@ static void ensure_light_uniforms(void)
 
 JceLightEnv *jce_light_env_create(void)
 {
-    JceLightEnv *env = (JceLightEnv *)SDL_calloc(1, sizeof(*env));
+    JceLightEnv *env = (JceLightEnv *)JCE_CALLOC(1, sizeof(*env));
     if (!env) return NULL;
 
     env->ambient_color     = jce_v3(1.0f, 1.0f, 1.0f);
@@ -73,7 +76,7 @@ JceLightEnv *jce_light_env_create(void)
 
 void jce_light_env_destroy(JceLightEnv *env)
 {
-    SDL_free(env);
+    JCE_FREE(env);
 }
 
 /* ================================================================== */
@@ -146,11 +149,12 @@ void jce_light_env_apply(const JceLightEnv *env, const JceRenderer *r)
 
     ensure_light_uniforms();
 
-    /* Ambient: xyz = color * intensity, w = intensity. */
+    /* Ambient: xyz = raw color, w = intensity.
+       Shader computes: u_ambientColor.xyz * u_ambientColor.w * albedo * ao */
     float ambient[4] = {
-        env->ambient_color.x * env->ambient_intensity,
-        env->ambient_color.y * env->ambient_intensity,
-        env->ambient_color.z * env->ambient_intensity,
+        env->ambient_color.x,
+        env->ambient_color.y,
+        env->ambient_color.z,
         env->ambient_intensity
     };
     bgfx_set_uniform(s_u_ambient_color, ambient, 1);
@@ -235,4 +239,13 @@ void jce_light_env_apply(const JceLightEnv *env, const JceRenderer *r)
         0.0f
     };
     bgfx_set_uniform(s_u_light_counts, counts, 1);
+
+    /* Camera position for PBR specular. */
+    float cam[4] = { env->camera_pos.x, env->camera_pos.y, env->camera_pos.z, 0.0f };
+    bgfx_set_uniform(s_u_camera_pos, cam, 1);
+}
+
+void jce_light_env_set_camera_pos(JceLightEnv *env, jce_vec3 pos)
+{
+    if (env) env->camera_pos = pos;
 }

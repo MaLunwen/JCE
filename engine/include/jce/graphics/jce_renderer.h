@@ -9,6 +9,10 @@
 #include <stdint.h>
 #include <stdarg.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Forward declarations. */
 typedef struct JceWindow    JceWindow;
 typedef struct JceRenderer  JceRenderer;
@@ -85,6 +89,9 @@ bool         jce_renderer_get_vsync(const JceRenderer *r);
 #include <jce/graphics/jce_gfx_types.h>
 #include <jce/graphics/jce_texture_types.h>
 
+/* Color (pos+color) shader program — flat-colored geometry (grid, debug). */
+JceShaderHandle  jce_renderer_get_program_color(const JceRenderer *r);
+
 /* Mesh (pos+normal+uv) shader program. */
 JceShaderHandle  jce_renderer_get_program_mesh(const JceRenderer *r);
 
@@ -113,5 +120,9 @@ void jce_renderer_dbg_text_attr(uint16_t x, uint16_t y, uint8_t attr, const char
 /* Toggle wireframe rendering (F3+V debug feature). */
 void jce_renderer_set_wireframe(JceRenderer *r, bool enabled);
 bool jce_renderer_get_wireframe(const JceRenderer *r);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* JCE_RENDERER_H */

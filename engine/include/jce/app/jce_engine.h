@@ -10,6 +10,10 @@
 
 #include <SDL3/SDL.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct JceEngine  JceEngine;
 typedef struct JceAppDesc JceAppDesc;
 
@@ -34,5 +38,9 @@ SDL_AppResult  jce_engine_iterate(JceEngine *e);
 
 /* Shut down everything in reverse order. */
 void           jce_engine_destroy(JceEngine *e);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* JCE_ENGINE_H */

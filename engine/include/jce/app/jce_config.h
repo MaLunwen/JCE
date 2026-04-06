@@ -11,6 +11,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* -- Renderer backend ---------------------------------------------- */
 
 typedef enum JceRendererBackend {
@@ -31,6 +35,7 @@ typedef struct JceConfig {
     int         window_height;          /* default: 480 */
     char        window_title[128];      /* default: "JCE" */
     bool        fullscreen;             /* default: false */
+    bool        maximized;              /* default: false */
     bool        resizable;              /* default: true */
 
     /* Renderer */
@@ -56,5 +61,9 @@ JceConfig jce_config_defaults(void);
    Returns true if the file was opened successfully.
    If the file doesn't exist, cfg keeps its current values. */
 bool jce_config_load(JceConfig *cfg, const char *path);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* JCE_CONFIG_H */

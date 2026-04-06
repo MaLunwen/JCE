@@ -2,10 +2,10 @@
  * jce_filesystem.c  Virtual file system implementation.
  *
  * Two backends:
- *   1. Loose-file (directory mount): wraps fopen/fread, for dev overlay.
+ *   1. PhysFS: handles directories, zips, and other archives.
  *   2. PAK archive: wraps pak_find + pak_decompress.
  *
- * Loose-file mounts are checked first so developers can override
+ * PhysFS mounts are checked first so developers can override
  * PAK-embedded assets without rebuilding.
  */
 
@@ -14,8 +14,8 @@
 #include <jce/core/jce_log.h>
 
 #include <jce/resource/pak_loader.h>
+#include <physfs.h>
 
-#include <stdio.h>
 #include <string.h>
 
 #define LOG_TAG "jce_fs"
@@ -24,24 +24,16 @@
 /* Internal types                                                      */
 /* ================================================================== */
 
-#define JCE_FS_MAX_DIR_MOUNTS 8
-
-typedef struct {
-    char prefix[128];
-    char directory[512];
-} DirMount;
-
 struct JceFileSystem {
     PakArchive *pak;
-    DirMount    dirs[JCE_FS_MAX_DIR_MOUNTS];
-    int         dir_count;
+    bool        physfs_owned;   /* true if we called PHYSFS_init */
 };
 
-/* File opened from loose filesystem. */
+/* File opened from PhysFS. */
 typedef struct {
-    FILE  *fp;
-    size_t total_size;
-} LooseFile;
+    PHYSFS_File *handle;
+    PHYSFS_sint64 total_size;
+} PhysFSFile;
 
 /* File opened from PAK (fully decompressed into memory). */
 typedef struct {
@@ -51,15 +43,15 @@ typedef struct {
 } PakFile;
 
 typedef enum {
-    JCE_FILE_LOOSE,
+    JCE_FILE_PHYSFS,
     JCE_FILE_PAK
 } JceFileKind;
 
 struct JceFile {
     JceFileKind kind;
     union {
-        LooseFile loose;
-        PakFile   pak;
+        PhysFSFile physfs;
+        PakFile    pak;
     } u;
 };
 
@@ -69,11 +61,27 @@ struct JceFile {
 
 JceFileSystem *jce_fs_create(void)
 {
-    return JCE_NEW(JceFileSystem);
+    JceFileSystem *fs = JCE_NEW(JceFileSystem);
+    if (!fs) return NULL;
+
+    if (!PHYSFS_isInit()) {
+        if (!PHYSFS_init(NULL)) {
+            LOG_ERROR(LOG_TAG, "PHYSFS_init failed: %s",
+                      PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode()));
+            JCE_FREE(fs);
+            return NULL;
+        }
+        fs->physfs_owned = true;
+    }
+
+    return fs;
 }
 
 void jce_fs_destroy(JceFileSystem *fs)
 {
+    if (!fs) return;
+    if (fs->physfs_owned && PHYSFS_isInit())
+        PHYSFS_deinit();
     JCE_FREE(fs);
 }
 
@@ -89,57 +97,36 @@ void jce_fs_mount_pak(JceFileSystem *fs, PakArchive *pak)
 void jce_fs_mount_dir(JceFileSystem *fs, const char *prefix,
                       const char *directory)
 {
-    if (!fs || !prefix || !directory) return;
-    if (fs->dir_count >= JCE_FS_MAX_DIR_MOUNTS) {
-        LOG_WARN(LOG_TAG, "max directory mounts reached (%d)",
-                 JCE_FS_MAX_DIR_MOUNTS);
+    if (!fs || !directory) return;
+
+    /* PhysFS mount: mountPoint is the virtual prefix. */
+    if (!PHYSFS_mount(directory, prefix, 1)) {
+        LOG_WARN(LOG_TAG, "PHYSFS_mount('%s' -> '%s') failed: %s",
+                 directory, prefix ? prefix : "/",
+                 PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode()));
         return;
     }
 
-    DirMount *dm = &fs->dirs[fs->dir_count++];
-    snprintf(dm->prefix, sizeof(dm->prefix), "%s", prefix);
-    snprintf(dm->directory, sizeof(dm->directory), "%s", directory);
-
-    LOG_DEBUG(LOG_TAG, "mounted dir '%s' -> '%s'", prefix, directory);
+    LOG_DEBUG(LOG_TAG, "mounted dir '%s' -> '%s'",
+              prefix ? prefix : "/", directory);
 }
 
 /* ================================================================== */
-/* Loose-file helpers                                                  */
+/* PhysFS file helpers                                                 */
 /* ================================================================== */
 
-/* Try to open a virtual path via loose-file mounts.
-   Returns a JceFile on success, or NULL. */
-static JceFile *try_open_loose(const JceFileSystem *fs, const char *vpath)
+static JceFile *try_open_physfs(const char *vpath)
 {
-    for (int i = 0; i < fs->dir_count; i++) {
-        const DirMount *dm = &fs->dirs[i];
-        size_t plen = strlen(dm->prefix);
+    PHYSFS_File *h = PHYSFS_openRead(vpath);
+    if (!h) return NULL;
 
-        if (strncmp(vpath, dm->prefix, plen) != 0)
-            continue;
+    JceFile *f = JCE_NEW(JceFile);
+    if (!f) { PHYSFS_close(h); return NULL; }
 
-        /* Build real path: directory + remainder after prefix. */
-        char real_path[1024];
-        snprintf(real_path, sizeof(real_path), "%s%s",
-                 dm->directory, vpath + plen);
-
-        FILE *fp = fopen(real_path, "rb");
-        if (!fp) continue;
-
-        /* Determine size. */
-        fseek(fp, 0, SEEK_END);
-        long sz = ftell(fp);
-        fseek(fp, 0, SEEK_SET);
-
-        JceFile *f = JCE_NEW(JceFile);
-        if (!f) { fclose(fp); return NULL; }
-
-        f->kind = JCE_FILE_LOOSE;
-        f->u.loose.fp = fp;
-        f->u.loose.total_size = (sz > 0) ? (size_t)sz : 0;
-        return f;
-    }
-    return NULL;
+    f->kind = JCE_FILE_PHYSFS;
+    f->u.physfs.handle     = h;
+    f->u.physfs.total_size = PHYSFS_fileLength(h);
+    return f;
 }
 
 /* Try to open a virtual path from the PAK archive.
@@ -151,7 +138,13 @@ static JceFile *try_open_pak(const JceFileSystem *fs, const char *vpath)
     const PakAsset *asset = pak_find(fs->pak, vpath);
     if (!asset) return NULL;
 
-    void *buf = JCE_MALLOC(asset->original_size);
+    /* Guard against uint64 → size_t truncation on 32-bit platforms. */
+    if (asset->original_size > (uint64_t)SIZE_MAX) {
+        LOG_ERROR(LOG_TAG, "asset too large for address space: %s", vpath);
+        return NULL;
+    }
+
+    void *buf = JCE_MALLOC((size_t)asset->original_size);
     if (!buf) return NULL;
 
     size_t decompressed = pak_decompress(asset, buf, asset->original_size);
@@ -178,8 +171,8 @@ JceFile *jce_fs_open(const JceFileSystem *fs, const char *virtual_path)
 {
     if (!fs || !virtual_path) return NULL;
 
-    /* Loose files first (developer override). */
-    JceFile *f = try_open_loose(fs, virtual_path);
+    /* PhysFS first (developer override via mounted dirs/archives). */
+    JceFile *f = try_open_physfs(virtual_path);
     if (f) return f;
 
     return try_open_pak(fs, virtual_path);
@@ -188,8 +181,8 @@ JceFile *jce_fs_open(const JceFileSystem *fs, const char *virtual_path)
 void jce_fs_close(JceFile *file)
 {
     if (!file) return;
-    if (file->kind == JCE_FILE_LOOSE) {
-        fclose(file->u.loose.fp);
+    if (file->kind == JCE_FILE_PHYSFS) {
+        PHYSFS_close(file->u.physfs.handle);
     } else {
         JCE_FREE(file->u.pak.data);
     }
@@ -200,8 +193,10 @@ size_t jce_fs_read(JceFile *file, void *buf, size_t buf_size)
 {
     if (!file || !buf || buf_size == 0) return 0;
 
-    if (file->kind == JCE_FILE_LOOSE) {
-        return fread(buf, 1, buf_size, file->u.loose.fp);
+    if (file->kind == JCE_FILE_PHYSFS) {
+        PHYSFS_sint64 n = PHYSFS_readBytes(file->u.physfs.handle,
+                                           buf, (PHYSFS_uint64)buf_size);
+        return (n > 0) ? (size_t)n : 0;
     }
 
     /* PAK: copy from the memory buffer. */
@@ -215,8 +210,9 @@ size_t jce_fs_read(JceFile *file, void *buf, size_t buf_size)
 size_t jce_fs_size(const JceFile *file)
 {
     if (!file) return 0;
-    if (file->kind == JCE_FILE_LOOSE)
-        return file->u.loose.total_size;
+    if (file->kind == JCE_FILE_PHYSFS)
+        return (file->u.physfs.total_size >= 0)
+             ? (size_t)file->u.physfs.total_size : 0;
     return file->u.pak.size;
 }
 
@@ -252,20 +248,9 @@ bool jce_fs_exists(const JceFileSystem *fs, const char *virtual_path)
 {
     if (!fs || !virtual_path) return false;
 
-    /* Check loose mounts. */
-    for (int i = 0; i < fs->dir_count; i++) {
-        const DirMount *dm = &fs->dirs[i];
-        size_t plen = strlen(dm->prefix);
-        if (strncmp(virtual_path, dm->prefix, plen) != 0)
-            continue;
-
-        char real_path[1024];
-        snprintf(real_path, sizeof(real_path), "%s%s",
-                 dm->directory, virtual_path + plen);
-
-        FILE *fp = fopen(real_path, "rb");
-        if (fp) { fclose(fp); return true; }
-    }
+    /* Check PhysFS search path. */
+    if (PHYSFS_exists(virtual_path))
+        return true;
 
     /* Check PAK. */
     if (fs->pak)

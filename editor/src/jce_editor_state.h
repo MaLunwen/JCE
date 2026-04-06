@@ -79,6 +79,14 @@ typedef enum {
 #define JCE_MAX_ENTITIES       4096
 #define JCE_MAX_COMPONENTS     32
 
+/* ── Max Children ──────────────────────────────────────────────────── */
+
+#define JCE_MAX_CHILDREN       64
+
+/* ── Forward-declare component type ────────────────────────────────── */
+
+typedef struct JceComponentInfo JceComponentInfo;
+
 /* ── Entity Data (lightweight, for editor display) ─────────────────── */
 
 typedef struct {
@@ -88,8 +96,11 @@ typedef struct {
     JceTagColor tag_color;
     bool        enabled;
     uint32_t    parent_id;                    /* 0 = root */
-    uint32_t    children[JCE_MAX_COMPONENTS]; /* child entity ids */
+    uint32_t    children[JCE_MAX_CHILDREN];   /* child entity ids */
     int         child_count;
+
+    /* Per-entity component storage (parsed from scene JSON). */
+    int         component_count;
 } JceEntityInfo;
 
 /* ── Component Data (for inspector display) ────────────────────────── */
@@ -111,7 +122,7 @@ typedef enum {
     JCE_COMP_TYPE_COUNT,
 } JceComponentType;
 
-typedef struct {
+struct JceComponentInfo {
     JceComponentType type;
     bool             expanded;   /* fold state in inspector */
     /* Component-specific data (union for common types). */
@@ -121,7 +132,7 @@ typedef struct {
         struct { float color[4]; float intensity; int type; } light;
         struct { float fov; float near_clip; float far_clip; bool ortho; } camera;
     } data;
-} JceComponentInfo;
+};
 
 /* ── Editor State API ──────────────────────────────────────────────── */
 
@@ -149,11 +160,14 @@ void              jce_state_set_entity_tag_color(uint32_t id, JceTagColor color)
 void              jce_state_reparent_entity(uint32_t id, uint32_t new_parent);
 uint32_t          jce_state_duplicate_entity(uint32_t id);
 
-/* Component management (stub). */
+/* Component management. */
 int                  jce_state_get_components(uint32_t entity_id, JceComponentInfo *out, int max);
+JceComponentInfo    *jce_state_get_entity_components(uint32_t entity_id, int *out_count);
 void                 jce_state_add_component(uint32_t entity_id, JceComponentType type);
 void                 jce_state_remove_component(uint32_t entity_id, JceComponentType type);
+void                 jce_state_set_component(uint32_t entity_id, const JceComponentInfo *comp);
 const char          *jce_component_type_name(JceComponentType type);
+JceComponentType     jce_component_type_from_name(const char *name);
 
 /* Edit mode */
 void          jce_state_set_edit_mode(JceEditMode mode);
@@ -170,6 +184,13 @@ void              jce_state_set_view_mode(JceSceneViewMode mode);
 JceSceneViewMode  jce_state_get_view_mode(void);
 bool              jce_state_get_show_grid(void);
 void              jce_state_set_show_grid(bool show);
+bool              jce_state_get_2d_mode(void);
+void              jce_state_set_2d_mode(bool is_2d);
+bool              jce_state_get_live_preview(void);
+void              jce_state_set_live_preview(bool on);
+
+/* Scene loading */
+bool              jce_state_load_scene_file(const char *scene_path);
 
 /* Play mode */
 void          jce_state_play(void);

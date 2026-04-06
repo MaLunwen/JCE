@@ -13,6 +13,10 @@
 
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct JceCamera          JceCamera;
 typedef struct JceCameraController JceCameraController;
 
@@ -70,5 +74,9 @@ void jce_camctrl_update(JceCameraController *ctrl,
 
 bool  jce_camctrl_is_sprinting(const JceCameraController *ctrl);
 float jce_camctrl_get_current_fov(const JceCameraController *ctrl);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* JCE_CAMERA_CONTROLLER_H */

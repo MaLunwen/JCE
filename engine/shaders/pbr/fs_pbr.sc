@@ -35,9 +35,12 @@ SAMPLER2D(s_emissive,   4);
 void main()
 {
     // --- Base color ---
-    vec4 baseColor = texture2D(s_albedo, v_texcoord0) * u_baseColorFactor;
-    vec3 albedo = baseColor.rgb;
-    float alpha = baseColor.a;
+    // Base color texture is sRGB-encoded (glTF spec §5.19). Convert texture
+    // to linear space FIRST, then multiply by the linear baseColorFactor.
+    vec4 texColor = texture2D(s_albedo, v_texcoord0);
+    vec3 albedo = pow(clamp(texColor.rgb, vec3_splat(0.0), vec3_splat(1.0)), vec3_splat(2.2))
+               * u_baseColorFactor.rgb;
+    float alpha = texColor.a * u_baseColorFactor.a;
 
     // --- Alpha mode ---
     float alphaMode = u_emissiveFactor.w;
@@ -129,15 +132,16 @@ void main()
     vec3 ambient = u_ambientColor.xyz * u_ambientColor.w * albedo * ao;
 
     // --- Emissive ---
-    vec3 emissive = texture2D(s_emissive, v_texcoord0).rgb * u_emissiveFactor.xyz;
+    // Emissive texture is also sRGB-encoded; convert to linear first,
+    // then multiply by the linear emissive factor.
+    vec3 emissiveTex = pow(clamp(texture2D(s_emissive, v_texcoord0).rgb, vec3_splat(0.0), vec3_splat(1.0)), vec3_splat(2.2));
+    vec3 emissive = emissiveTex * u_emissiveFactor.xyz;
 
     // --- Final color ---
     vec3 color = ambient + Lo + emissive;
 
-    // --- Reinhard tonemapping ---
-    color = color / (color + vec3_splat(1.0));
-
     // --- Gamma correction (linear -> sRGB) ---
+    // No tonemapping: match standard 3D viewers (Blender, glTF-viewer, etc.)
     color = pow(color, vec3_splat(1.0 / 2.2));
 
     // --- Output ---

@@ -8,6 +8,10 @@
 #include <stdint.h>
 #include <jce/graphics/jce_texture.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct JceRenderer JceRenderer;
 
 /* Pack RGBA (0-255 each) into ABGR uint32 for bgfx vertex color. */
@@ -42,5 +46,9 @@ void jce_draw_textured_rect(const JceRenderer *r,
                             float x, float y, float w, float h,
                             JceTexture tex, uint32_t tint,
                             const float *uv);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* JCE_PRIMITIVES_H */

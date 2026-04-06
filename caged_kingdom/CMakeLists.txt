@@ -31,6 +31,11 @@ else()
 		RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/${JCE_BUILD_VARIANT}"
 		ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/${JCE_BUILD_VARIANT}")
 
+	# Dist builds on Windows: GUI subsystem (no console window).
+	if(WIN32 AND JCE_BUILD_VARIANT STREQUAL "dist")
+		set_target_properties(CagedKingdom PROPERTIES WIN32_EXECUTABLE TRUE)
+	endif()
+
 	# ── iOS bundle properties ──
 	if(JCE_PLATFORM_IOS)
 		set(IOS_INFO_PLIST "${CMAKE_SOURCE_DIR}/scripts/macos/ios/Info.plist")

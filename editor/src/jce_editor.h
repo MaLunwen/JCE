@@ -44,6 +44,10 @@ bool jce_editor_is_active(void);
 /* Toggle editor visibility on/off. */
 void jce_editor_toggle(void);
 
+/* Get/set the current font size in pixels (range 12-48). */
+float jce_editor_get_font_size(void);
+bool  jce_editor_set_font_size(float size);
+
 #ifdef __cplusplus
 }
 #endif

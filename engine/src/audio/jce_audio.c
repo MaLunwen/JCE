@@ -8,12 +8,16 @@
 
 #include <jce/audio/jce_audio.h>
 #include <jce/resource/pak_loader.h>
+#include <jce/resource/jce_asset_format.h>
 #include <jce/core/jce_log.h>
+#include <jce/core/jce_profiler.h>
 
 #ifndef JCE_NO_AUDIO
 
 #include <miniaudio.h>
 #include <SDL3/SDL.h>
+#include "core/jce_memory.h"
+#include "resource/jce_asset_reader.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -22,7 +26,7 @@
 
 /* Each sound owns a block of decoded PCM (s16) data. */
 typedef struct {
-    void      *pcm_data;      /* SDL_malloc'd, s16 PCM */
+    void      *pcm_data;      /* JCE_MALLOC'd, s16 PCM */
     ma_uint64  frame_count;
     ma_uint32  channels;
     ma_uint32  sample_rate;
@@ -50,13 +54,13 @@ struct JceAudio {
 
 JceAudio *jce_audio_create(void)
 {
-    JceAudio *audio = (JceAudio *)SDL_calloc(1, sizeof(*audio));
+    JceAudio *audio = (JceAudio *)JCE_CALLOC(1, sizeof(*audio));
     if (!audio) return NULL;
 
     ma_engine_config cfg = ma_engine_config_init();
     if (ma_engine_init(&cfg, &audio->engine) != MA_SUCCESS) {
         LOG_ERROR("jce_audio", "ma_engine_init failed");
-        SDL_free(audio);
+        JCE_FREE(audio);
         return NULL;
     }
 
@@ -89,7 +93,7 @@ void jce_audio_destroy(JceAudio *audio)
     /* Free all sound PCM data. */
     for (int i = 0; i < JCE_MAX_SOUNDS; i++) {
         if (audio->sound_used[i]) {
-            SDL_free(audio->sounds[i].pcm_data);
+            JCE_FREE(audio->sounds[i].pcm_data);
             audio->sounds[i].pcm_data = NULL;
             audio->sound_used[i] = false;
         }
@@ -98,7 +102,7 @@ void jce_audio_destroy(JceAudio *audio)
     if (audio->engine_inited)
         ma_engine_uninit(&audio->engine);
 
-    SDL_free(audio);
+    JCE_FREE(audio);
 }
 
 /* -- Sound loading -------------------------------------------------- */
@@ -154,7 +158,7 @@ static JceSound load_from_memory(JceAudio *audio, int slot,
         /* Unknown length (streaming format) — decode in chunks. */
         size_t alloc_frames = 1024 * 256;
         size_t used_frames  = 0;
-        int16_t *pcm = (int16_t *)SDL_malloc(alloc_frames * channels * sizeof(int16_t));
+        int16_t *pcm = (int16_t *)JCE_MALLOC(alloc_frames * channels * sizeof(int16_t));
         if (!pcm) {
             ma_decoder_uninit(&decoder);
             return JCE_SOUND_INVALID;
@@ -163,10 +167,10 @@ static JceSound load_from_memory(JceAudio *audio, int slot,
         for (;;) {
             if (used_frames + 4096 > alloc_frames) {
                 alloc_frames *= 2;
-                int16_t *tmp = (int16_t *)SDL_realloc(pcm,
+                int16_t *tmp = (int16_t *)JCE_REALLOC(pcm,
                     alloc_frames * channels * sizeof(int16_t));
                 if (!tmp) {
-                    SDL_free(pcm);
+                    JCE_FREE(pcm);
                     ma_decoder_uninit(&decoder);
                     return JCE_SOUND_INVALID;
                 }
@@ -183,7 +187,7 @@ static JceSound load_from_memory(JceAudio *audio, int slot,
         audio->sounds[slot].pcm_data = pcm;
     } else {
         /* Known length — single allocation. */
-        void *pcm = SDL_malloc((size_t)(total_frames * channels * sizeof(int16_t)));
+        void *pcm = JCE_MALLOC((size_t)(total_frames * channels * sizeof(int16_t)));
         if (!pcm) {
             ma_decoder_uninit(&decoder);
             return JCE_SOUND_INVALID;
@@ -224,7 +228,7 @@ JceSound jce_audio_load_pcm(JceAudio *audio,
     if (bits_per_sample == 8) {
         frame_count = pcm_size / channels;
         size_t out_size = (size_t)(frame_count * channels * sizeof(int16_t));
-        pcm_copy = SDL_malloc(out_size);
+        pcm_copy = JCE_MALLOC(out_size);
         if (!pcm_copy) return JCE_SOUND_INVALID;
 
         /* Convert u8 → s16. */
@@ -234,7 +238,7 @@ JceSound jce_audio_load_pcm(JceAudio *audio,
             dst[i] = (int16_t)((src[i] - 128) * 256);
     } else if (bits_per_sample == 16) {
         frame_count = pcm_size / (channels * 2);
-        pcm_copy = SDL_malloc(pcm_size);
+        pcm_copy = JCE_MALLOC(pcm_size);
         if (!pcm_copy) return JCE_SOUND_INVALID;
         memcpy(pcm_copy, pcm_data, pcm_size);
     } else {
@@ -250,7 +254,8 @@ JceSound jce_audio_load_pcm(JceAudio *audio,
     return (JceSound)(slot + 1);
 }
 
-JceSound jce_audio_load(JceAudio *audio, const PakArchive *pak, const char *path)
+static JceSound jce_audio_load_inner(JceAudio *audio, const PakArchive *pak,
+                                     const char *path)
 {
     if (!audio || !pak || !path) return JCE_SOUND_INVALID;
 
@@ -261,26 +266,79 @@ JceSound jce_audio_load(JceAudio *audio, const PakArchive *pak, const char *path
     }
 
     /* Decompress asset from PAK. */
-    void *raw = SDL_malloc((size_t)asset->original_size);
+    void *raw = JCE_MALLOC((size_t)asset->original_size);
     if (!raw) return JCE_SOUND_INVALID;
 
     size_t decoded = pak_decompress(asset, raw, (size_t)asset->original_size);
     if (decoded == 0) {
         LOG_ERROR("jce_audio", "decompress failed for '%s'", path);
-        SDL_free(raw);
+        JCE_FREE(raw);
         return JCE_SOUND_INVALID;
     }
 
+    /* ── Cooked path: .jceasset AUDIO_INFO + AUDIO_PCM → direct load ── */
+    if (jce_asset_is_cooked(raw, decoded)) {
+        JceAssetView view;
+        if (!jce_asset_open(&view, raw, decoded)) {
+            JCE_FREE(raw);
+            return JCE_SOUND_INVALID;
+        }
+
+        const JceAssetChunkEntry *info_c =
+            jce_asset_find_chunk(&view, JCEASSET_CHUNK_AUDIO_INFO);
+        const JceAssetChunkEntry *pcm_c =
+            jce_asset_find_chunk(&view, JCEASSET_CHUNK_AUDIO_PCM);
+
+        if (!info_c || !pcm_c) {
+            JCE_FREE(raw);
+            return JCE_SOUND_INVALID;
+        }
+
+        JceAssetAudioInfo ainfo;
+        if (jce_asset_chunk_data(&view, info_c,
+                                  &ainfo, sizeof(ainfo)) == 0) {
+            JCE_FREE(raw);
+            return JCE_SOUND_INVALID;
+        }
+
+        uint32_t pcm_size = (uint32_t)pcm_c->original_size;
+        void *pcm_data = JCE_MALLOC(pcm_size);
+        if (!pcm_data) { JCE_FREE(raw); return JCE_SOUND_INVALID; }
+
+        if (jce_asset_chunk_data(&view, pcm_c, pcm_data, pcm_size) == 0) {
+            JCE_FREE(pcm_data);
+            JCE_FREE(raw);
+            return JCE_SOUND_INVALID;
+        }
+
+        JCE_FREE(raw);
+
+        JceSound result = jce_audio_load_pcm(audio, pcm_data, pcm_size,
+                                              ainfo.channels, ainfo.sample_rate,
+                                              ainfo.bits_per_sample);
+        JCE_FREE(pcm_data);
+        return result;
+    }
+
+    /* ── Raw path: OGG/WAV → miniaudio decode ── */
     int slot = alloc_buffer_slot(audio);
     if (slot < 0) {
         LOG_WARN("jce_audio", "no free buffer slots");
-        SDL_free(raw);
+        JCE_FREE(raw);
         return JCE_SOUND_INVALID;
     }
 
     JceSound result = load_from_memory(audio, slot,
                                         (const uint8_t *)raw, decoded, path);
-    SDL_free(raw);
+    JCE_FREE(raw);
+    return result;
+}
+
+JceSound jce_audio_load(JceAudio *audio, const PakArchive *pak, const char *path)
+{
+    JCE_PROFILE_ZONE_N("Audio::Load");
+    JceSound result = jce_audio_load_inner(audio, pak, path);
+    JCE_PROFILE_ZONE_END;
     return result;
 }
 
@@ -296,7 +354,7 @@ void jce_audio_unload(JceAudio *audio, JceSound snd)
             uninit_voice(&audio->voices[i]);
     }
 
-    SDL_free(audio->sounds[slot].pcm_data);
+    JCE_FREE(audio->sounds[slot].pcm_data);
     audio->sounds[slot].pcm_data = NULL;
     audio->sound_used[slot] = false;
 }

@@ -18,6 +18,7 @@
 #include "graphics/jce_animation.h"
 #include <jce/core/jce_log.h>
 #include <jce/core/jce_math.h>
+#include "core/jce_memory.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3_image/SDL_image.h>
@@ -84,6 +85,18 @@ static JceTexture load_gltf_texture(const PakArchive *pak,
                 return JCE_TEXTURE_INVALID;
             }
 
+            /* Ensure RGBA32 so jce_texture_load_from_surface gets tightly
+               packed 4-byte pixels regardless of the source PNG colour mode. */
+            if (surf->format != SDL_PIXELFORMAT_RGBA32) {
+                SDL_Surface *conv = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA32);
+                SDL_DestroySurface(surf);
+                if (!conv) {
+                    LOG_ERROR(LOG_TAG, "surface convert failed: %s", SDL_GetError());
+                    return JCE_TEXTURE_INVALID;
+                }
+                surf = conv;
+            }
+
             JceTexture tex = jce_texture_load_from_surface(surf, JCE_TEX_WRAP);
             SDL_DestroySurface(surf);
             return tex;
@@ -134,7 +147,7 @@ static JcePbrMaterial *extract_materials(const PakArchive *pak,
     *out_count = 0;
     if (data->materials_count == 0) {
         /* Create a single default material. */
-        JcePbrMaterial *mats = (JcePbrMaterial *)SDL_calloc(1, sizeof(JcePbrMaterial));
+        JcePbrMaterial *mats = (JcePbrMaterial *)JCE_CALLOC(1, sizeof(JcePbrMaterial));
         if (!mats) return NULL;
         mats[0] = jce_pbr_material_default();
         *out_count = 1;
@@ -142,7 +155,7 @@ static JcePbrMaterial *extract_materials(const PakArchive *pak,
     }
 
     uint32_t count = (uint32_t)data->materials_count;
-    JcePbrMaterial *mats = (JcePbrMaterial *)SDL_calloc(count, sizeof(JcePbrMaterial));
+    JcePbrMaterial *mats = (JcePbrMaterial *)JCE_CALLOC(count, sizeof(JcePbrMaterial));
     if (!mats) return NULL;
 
     uint32_t i;
@@ -261,7 +274,7 @@ static void build_primitive(const cgltf_primitive *prim,
     uint32_t *indices = NULL;
     if (prim->indices) {
         num_indices = (uint32_t)prim->indices->count;
-        indices = (uint32_t *)SDL_malloc(num_indices * sizeof(uint32_t));
+        indices = (uint32_t *)JCE_MALLOC(num_indices * sizeof(uint32_t));
         if (indices) {
             uint32_t ii;
             for (ii = 0; ii < num_indices; ++ii) {
@@ -275,9 +288,9 @@ static void build_primitive(const cgltf_primitive *prim,
 
     /* ---- Skinned mesh ---- */
     if (a_joints && a_wts) {
-        JceSkinnedVertex *verts = (JceSkinnedVertex *)SDL_calloc(
+        JceSkinnedVertex *verts = (JceSkinnedVertex *)JCE_CALLOC(
             num_verts, sizeof(JceSkinnedVertex));
-        if (!verts) { SDL_free(indices); return; }
+        if (!verts) { JCE_FREE(indices); return; }
 
         uint32_t vi;
         for (vi = 0; vi < num_verts; ++vi) {
@@ -315,13 +328,13 @@ static void build_primitive(const cgltf_primitive *prim,
         out->skinned_mesh = jce_skinned_mesh_create(verts, num_verts,
                                                      indices, num_indices);
         out->static_mesh = NULL;
-        SDL_free(verts);
+        JCE_FREE(verts);
     }
     /* ---- Static PBR mesh (with tangent) ---- */
     else if (a_tan) {
-        JcePbrVertex *verts = (JcePbrVertex *)SDL_calloc(
+        JcePbrVertex *verts = (JcePbrVertex *)JCE_CALLOC(
             num_verts, sizeof(JcePbrVertex));
-        if (!verts) { SDL_free(indices); return; }
+        if (!verts) { JCE_FREE(indices); return; }
 
         uint32_t vi;
         for (vi = 0; vi < num_verts; ++vi) {
@@ -338,13 +351,13 @@ static void build_primitive(const cgltf_primitive *prim,
         out->skinned_mesh = jce_pbr_mesh_create(verts, num_verts,
                                                  indices, num_indices);
         out->static_mesh = NULL;
-        SDL_free(verts);
+        JCE_FREE(verts);
     }
-    /* ---- Basic static mesh (no tangent) ---- */
+    /* ---- Static mesh (no tangent) — promote to PBR with default tangent ---- */
     else {
-        JceMeshVertex *verts = (JceMeshVertex *)SDL_calloc(
-            num_verts, sizeof(JceMeshVertex));
-        if (!verts) { SDL_free(indices); return; }
+        JcePbrVertex *verts = (JcePbrVertex *)JCE_CALLOC(
+            num_verts, sizeof(JcePbrVertex));
+        if (!verts) { JCE_FREE(indices); return; }
 
         uint32_t vi;
         for (vi = 0; vi < num_verts; ++vi) {
@@ -354,15 +367,21 @@ static void build_primitive(const cgltf_primitive *prim,
             else { verts[vi].normal[0] = 0; verts[vi].normal[1] = 1; verts[vi].normal[2] = 0; }
 
             if (a_uv) cgltf_accessor_read_float(a_uv, vi, verts[vi].uv, 2);
+
+            /* Default tangent: +X, handedness +1. */
+            verts[vi].tangent[0] = 1.0f;
+            verts[vi].tangent[1] = 0.0f;
+            verts[vi].tangent[2] = 0.0f;
+            verts[vi].tangent[3] = 1.0f;
         }
 
-        out->static_mesh = jce_mesh_create(verts, num_verts,
-                                            indices, num_indices);
-        out->skinned_mesh = NULL;
-        SDL_free(verts);
+        out->skinned_mesh = jce_pbr_mesh_create(verts, num_verts,
+                                                  indices, num_indices);
+        out->static_mesh = NULL;
+        JCE_FREE(verts);
     }
 
-    SDL_free(indices);
+    JCE_FREE(indices);
 }
 
 /* ================================================================== */
@@ -377,7 +396,7 @@ static JceSkeleton *extract_skeleton(cgltf_data *data)
     uint32_t num_joints = (uint32_t)skin->joints_count;
     if (num_joints == 0) return NULL;
 
-    JceJoint *joints = (JceJoint *)SDL_calloc(num_joints, sizeof(JceJoint));
+    JceJoint *joints = (JceJoint *)JCE_CALLOC(num_joints, sizeof(JceJoint));
     if (!joints) return NULL;
 
     uint32_t ji;
@@ -406,17 +425,41 @@ static JceSkeleton *extract_skeleton(cgltf_data *data)
         if (skin->inverse_bind_matrices &&
             ji < (uint32_t)skin->inverse_bind_matrices->count) {
             cgltf_accessor_read_float(skin->inverse_bind_matrices, ji,
-                                       j->inverse_bind_matrix.m, 16);
+                                       j->inverse_bind_matrix.raw[0], 16);
         } else {
             j->inverse_bind_matrix = jce_m4_identity();
         }
 
         /* Local rest-pose transform. */
-        cgltf_node_transform_local(jnode, j->local_transform.m);
+        cgltf_node_transform_local(jnode, j->local_transform.raw[0]);
+
+        /* Rest-pose TRS from glTF node (avoids decomposition roundtrip). */
+        if (jnode->has_translation) {
+            j->rest_translation = jce_v3(jnode->translation[0],
+                                          jnode->translation[1],
+                                          jnode->translation[2]);
+        } else {
+            j->rest_translation = jce_v3(0.0f, 0.0f, 0.0f);
+        }
+        if (jnode->has_rotation) {
+            j->rest_rotation.x = jnode->rotation[0];
+            j->rest_rotation.y = jnode->rotation[1];
+            j->rest_rotation.z = jnode->rotation[2];
+            j->rest_rotation.w = jnode->rotation[3];
+        } else {
+            j->rest_rotation = jce_q_identity();
+        }
+        if (jnode->has_scale) {
+            j->rest_scale = jce_v3(jnode->scale[0],
+                                    jnode->scale[1],
+                                    jnode->scale[2]);
+        } else {
+            j->rest_scale = jce_v3(1.0f, 1.0f, 1.0f);
+        }
     }
 
     JceSkeleton *skel = jce_skeleton_create(joints, num_joints);
-    SDL_free(joints);
+    JCE_FREE(joints);
     return skel;
 }
 
@@ -433,7 +476,7 @@ static JceAnimClip **extract_animations(cgltf_data *data, uint32_t *out_count)
     const cgltf_skin *skin = &data->skins[0];
     uint32_t num_anims = (uint32_t)data->animations_count;
 
-    JceAnimClip **clips = (JceAnimClip **)SDL_calloc(num_anims, sizeof(JceAnimClip *));
+    JceAnimClip **clips = (JceAnimClip **)JCE_CALLOC(num_anims, sizeof(JceAnimClip *));
     if (!clips) return NULL;
 
     uint32_t ai;
@@ -442,7 +485,7 @@ static JceAnimClip **extract_animations(cgltf_data *data, uint32_t *out_count)
         uint32_t num_channels = (uint32_t)anim->channels_count;
 
         /* Allocate temporary channel descriptors. */
-        JceAnimChannel *channels = (JceAnimChannel *)SDL_calloc(
+        JceAnimChannel *channels = (JceAnimChannel *)JCE_CALLOC(
             num_channels, sizeof(JceAnimChannel));
         if (!channels) continue;
 
@@ -496,7 +539,7 @@ static JceAnimClip **extract_animations(cgltf_data *data, uint32_t *out_count)
             uint32_t kf_count = (uint32_t)samp->input->count;
             dst->count = kf_count;
 
-            dst->timestamps = (float *)SDL_malloc(kf_count * sizeof(float));
+            dst->timestamps = (float *)JCE_MALLOC(kf_count * sizeof(float));
             if (!dst->timestamps) continue;
 
             uint32_t ki;
@@ -510,8 +553,8 @@ static JceAnimClip **extract_animations(cgltf_data *data, uint32_t *out_count)
             /* Values. */
             if (dst->target == JCE_ANIM_TARGET_TRANSLATION ||
                 dst->target == JCE_ANIM_TARGET_SCALE) {
-                jce_vec3 *vals = (jce_vec3 *)SDL_malloc(kf_count * sizeof(jce_vec3));
-                if (!vals) { SDL_free(dst->timestamps); dst->timestamps = NULL; continue; }
+                jce_vec3 *vals = (jce_vec3 *)JCE_MALLOC(kf_count * sizeof(jce_vec3));
+                if (!vals) { JCE_FREE(dst->timestamps); dst->timestamps = NULL; continue; }
                 for (ki = 0; ki < kf_count; ++ki) {
                     float v[3];
                     cgltf_accessor_read_float(samp->output, ki, v, 3);
@@ -525,8 +568,8 @@ static JceAnimClip **extract_animations(cgltf_data *data, uint32_t *out_count)
                     dst->scales = vals;
             } else {
                 /* Rotation (quaternion xyzw). */
-                jce_quat *vals = (jce_quat *)SDL_malloc(kf_count * sizeof(jce_quat));
-                if (!vals) { SDL_free(dst->timestamps); dst->timestamps = NULL; continue; }
+                jce_quat *vals = (jce_quat *)JCE_MALLOC(kf_count * sizeof(jce_quat));
+                if (!vals) { JCE_FREE(dst->timestamps); dst->timestamps = NULL; continue; }
                 for (ki = 0; ki < kf_count; ++ki) {
                     float v[4];
                     cgltf_accessor_read_float(samp->output, ki, v, 4);
@@ -548,12 +591,12 @@ static JceAnimClip **extract_animations(cgltf_data *data, uint32_t *out_count)
 
         /* Free temporary channel data. */
         for (ci = 0; ci < valid_channels; ++ci) {
-            SDL_free(channels[ci].timestamps);
-            SDL_free(channels[ci].translations);
-            SDL_free(channels[ci].rotations);
-            SDL_free(channels[ci].scales);
+            JCE_FREE(channels[ci].timestamps);
+            JCE_FREE(channels[ci].translations);
+            JCE_FREE(channels[ci].rotations);
+            JCE_FREE(channels[ci].scales);
         }
-        SDL_free(channels);
+        JCE_FREE(channels);
     }
 
     *out_count = num_anims;
@@ -580,7 +623,7 @@ static JceModelNode *extract_nodes(cgltf_data *data,
         return NULL;
     }
 
-    JceModelNode *nodes = (JceModelNode *)SDL_calloc(count, sizeof(JceModelNode));
+    JceModelNode *nodes = (JceModelNode *)JCE_CALLOC(count, sizeof(JceModelNode));
     if (!nodes) { *out_count = 0; return NULL; }
 
     uint32_t idx = 0;
@@ -600,8 +643,29 @@ static JceModelNode *extract_nodes(cgltf_data *data,
             SDL_snprintf(node->name, sizeof(node->name), "node_%u", idx);
         }
 
-        /* Local transform. */
-        cgltf_node_transform_local(gnode, node->local_transform.m);
+        /* World transform: accumulate all ancestor local transforms so the
+           draw call just needs to multiply by the model-to-world matrix.
+           cgltf_node_transform_world walks the full parent chain for us. */
+        cgltf_node_transform_world(gnode, node->local_transform.raw[0]);
+
+        /* Detect if this mesh node is directly parented to a skin joint.
+           If so, the static mesh must follow the animated joint instead of
+           using the baked bind-pose world transform. */
+        node->joint_parent_index = -1;
+        node->joint_local_matrix = jce_m4_identity();
+        if (data->skins_count > 0 && gnode->parent) {
+            const cgltf_skin *skin = &data->skins[0];
+            for (cgltf_size ji = 0; ji < skin->joints_count; ji++) {
+                if (skin->joints[ji] == gnode->parent) {
+                    node->joint_parent_index = (int32_t)ji;
+                    /* Store node's local TRS relative to its parent joint.
+                       At draw time: world = root × animated_joint_global × joint_local */
+                    cgltf_node_transform_local(gnode,
+                        node->joint_local_matrix.raw[0]);
+                    break;
+                }
+            }
+        }
 
         /* Parent index: -1 for now (flat list). */
         node->parent = -1;
@@ -609,7 +673,7 @@ static JceModelNode *extract_nodes(cgltf_data *data,
         /* Primitives. */
         uint32_t num_prims = (uint32_t)gnode->mesh->primitives_count;
         node->num_primitives = num_prims;
-        node->primitives = (JceModelPrimitive *)SDL_calloc(
+        node->primitives = (JceModelPrimitive *)JCE_CALLOC(
             num_prims, sizeof(JceModelPrimitive));
         if (node->primitives) {
             uint32_t pi;
@@ -641,13 +705,13 @@ JceModel *jce_gltf_load(const PakArchive *pak, const char *asset_path)
         return NULL;
     }
 
-    void *buf = SDL_malloc((size_t)asset->original_size);
+    void *buf = JCE_MALLOC((size_t)asset->original_size);
     if (!buf) return NULL;
 
     size_t n = pak_decompress(asset, buf, (size_t)asset->original_size);
     if (n == 0) {
         LOG_ERROR(LOG_TAG, "decompression failed: %s", asset_path);
-        SDL_free(buf);
+        JCE_FREE(buf);
         return NULL;
     }
 
@@ -658,7 +722,7 @@ JceModel *jce_gltf_load(const PakArchive *pak, const char *asset_path)
     cgltf_result result = cgltf_parse(&options, buf, (cgltf_size)n, &data);
     if (result != cgltf_result_success) {
         LOG_ERROR(LOG_TAG, "cgltf_parse failed (%d): %s", (int)result, asset_path);
-        SDL_free(buf);
+        JCE_FREE(buf);
         return NULL;
     }
 
@@ -668,15 +732,23 @@ JceModel *jce_gltf_load(const PakArchive *pak, const char *asset_path)
         LOG_ERROR(LOG_TAG, "cgltf_load_buffers failed (%d): %s",
                   (int)result, asset_path);
         cgltf_free(data);
-        SDL_free(buf);
+        JCE_FREE(buf);
         return NULL;
     }
 
+    /* Safety: for GLB parsed from memory cgltf_load_buffers should have linked
+       buffers[0].data to data->bin.  Ensure it is set even if the size check
+       inside cgltf produced a silent mismatch so embedded textures can decode. */
+    if (data->buffers_count > 0 && !data->buffers[0].data && data->bin) {
+        data->buffers[0].data = (void *)data->bin;
+        data->buffers[0].size = data->bin_size;
+    }
+
     /* ---- Build model ---- */
-    JceModel *model = (JceModel *)SDL_calloc(1, sizeof(JceModel));
+    JceModel *model = (JceModel *)JCE_CALLOC(1, sizeof(JceModel));
     if (!model) {
         cgltf_free(data);
-        SDL_free(buf);
+        JCE_FREE(buf);
         return NULL;
     }
 
@@ -698,6 +770,6 @@ JceModel *jce_gltf_load(const PakArchive *pak, const char *asset_path)
               model->num_anims, model->skeleton ? " (skinned)" : "");
 
     cgltf_free(data);
-    SDL_free(buf);
+    JCE_FREE(buf);
     return model;
 }

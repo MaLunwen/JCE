@@ -12,6 +12,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct JceWindowConfig {
     const char *title;
     int         logical_w;
@@ -54,5 +58,9 @@ void        jce_window_set_icon(JceWindow *win,
 
 /* Toggle between fullscreen and windowed mode. */
 void        jce_window_toggle_fullscreen(JceWindow *win);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* JCE_WINDOW_H */

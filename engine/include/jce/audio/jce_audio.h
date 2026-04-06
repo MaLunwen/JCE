@@ -13,6 +13,10 @@
 
 #include <jce/audio/jce_audio_types.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Forward declaration  avoids pulling in pak_loader.h in every TU. */
 typedef struct PakArchive PakArchive;
 
@@ -60,5 +64,9 @@ bool      jce_audio_is_playing(const JceAudio *audio, JceVoice voice);
 
 void      jce_audio_set_master_volume(JceAudio *audio, float volume);
 void      jce_audio_stop_all(JceAudio *audio);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* JCE_AUDIO_H */

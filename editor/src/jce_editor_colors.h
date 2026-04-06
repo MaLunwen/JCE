@@ -50,6 +50,10 @@
 #define JCE_COLOR_SELECTION_FILL   JCE_RGBA(255, 180,  50,  40)
 #define JCE_COLOR_SELECTION_BOX    JCE_RGBA(100, 150, 255, 100)
 
+/* Asset browser item selection (blue, matching Java reference) */
+#define JCE_COLOR_ASSET_SELECTED   ImVec4(0.2f, 0.6f, 1.0f, 1.0f)
+#define JCE_COLOR_ASSET_SEL_TEXT   ImVec4(0.4f, 0.8f, 1.0f, 1.0f)
+
 /* ── Gizmo Colors ──────────────────────────────────────────────────── */
 
 #define JCE_COLOR_GIZMO_X          JCE_RGBA(255,  50,  50, 255)
@@ -81,15 +85,14 @@
 #define JCE_COLOR_CONSOLE_WARN     JCE_RGBA(255, 200, 100, 255)
 #define JCE_COLOR_CONSOLE_ERROR    JCE_RGBA(255, 100, 100, 255)
 
-/* ── Asset Browser ─────────────────────────────────────────────────── */
+/* ── Asset Browser (matches Java reference renderFileItem colors) ──── */
 
-#define JCE_COLOR_ASSET_FOLDER     JCE_RGBA(255, 220, 100, 255)
-#define JCE_COLOR_ASSET_SCENE      JCE_RGBA(100, 200, 255, 255)
-#define JCE_COLOR_ASSET_PREFAB     JCE_RGBA(150, 100, 255, 255)
-#define JCE_COLOR_ASSET_MATERIAL   JCE_RGBA(255, 150, 100, 255)
-#define JCE_COLOR_ASSET_TEXTURE    JCE_RGBA(100, 255, 150, 255)
-#define JCE_COLOR_ASSET_AUDIO      JCE_RGBA(255, 100, 200, 255)
-#define JCE_COLOR_ASSET_SCRIPT     JCE_RGBA(200, 200, 100, 255)
+#define JCE_COLOR_ASSET_FOLDER     ImVec4(0.95f, 0.75f, 0.20f, 1.0f)  /* gold  */
+#define JCE_COLOR_ASSET_CODE       ImVec4(0.90f, 0.40f, 0.20f, 1.0f)  /* orange */
+#define JCE_COLOR_ASSET_SCENE      ImVec4(0.60f, 0.20f, 0.80f, 1.0f)  /* purple */
+#define JCE_COLOR_ASSET_DATA       ImVec4(0.20f, 0.60f, 0.20f, 1.0f)  /* green  */
+#define JCE_COLOR_ASSET_IMAGE      ImVec4(0.20f, 0.50f, 0.90f, 1.0f)  /* blue   */
+#define JCE_COLOR_ASSET_DEFAULT    ImVec4(0.50f, 0.50f, 0.50f, 1.0f)  /* gray   */
 
 /* ── Inspector ─────────────────────────────────────────────────────── */
 

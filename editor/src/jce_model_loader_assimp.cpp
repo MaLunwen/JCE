@@ -149,4 +149,33 @@ JceMesh *jce_editor_model_load(const PakArchive *pak, const char *asset_path)
     return mesh;
 }
 
+JceMesh *jce_editor_model_load_file(const char *file_path)
+{
+    if (!file_path || file_path[0] == '\0') return nullptr;
+
+    Assimp::Importer importer;
+    const aiScene *scene = importer.ReadFile(
+        file_path,
+        aiProcess_Triangulate
+        | aiProcess_GenSmoothNormals
+        | aiProcess_FlipUVs
+        | aiProcess_CalcTangentSpace);
+
+    if (!scene || !scene->mNumMeshes) {
+        LOG_ERROR(LOG_TAG, "assimp file load failed: %s  %s",
+                  file_path, importer.GetErrorString());
+        return nullptr;
+    }
+
+    JceMesh *mesh = convert_all_meshes(scene);
+    if (mesh) {
+        LOG_DEBUG(LOG_TAG, "loaded file %s (%u meshes merged, %u verts, %u tris)",
+                  file_path, scene->mNumMeshes,
+                  jce_mesh_vertex_count(mesh),
+                  jce_mesh_index_count(mesh) / 3);
+    }
+
+    return mesh;
+}
+
 } /* extern "C" */

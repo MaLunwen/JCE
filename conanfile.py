@@ -54,11 +54,11 @@ class JCEConan(ConanFile):
         self.requires("harfbuzz/12.3.0")
 
         self.requires("bgfx/1.129.8930-495")
-        self.requires("glm/1.0.1")
+        self.requires("cglm/0.9.1")
 
         self.requires("miniaudio/0.11.22")
 
-        self.requires("imgui/1.92.5")
+        self.requires("imgui/1.92.6-docking")
         self.requires("flecs/4.1.1")
         self.requires("cjson/1.7.19")
         self.requires("assimp/6.0.2")
@@ -83,7 +83,6 @@ class JCEConan(ConanFile):
         self.requires("protobuf/6.33.5")
 
         self.requires("tracy/0.13.1")
-        self.requires("spdlog/1.17.0")
 
         # ── Transitive overrides (resolve version conflicts) ─────────
         if self.settings.os == "Linux":
