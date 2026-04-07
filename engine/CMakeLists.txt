@@ -33,23 +33,7 @@ set_target_properties(JCE PROPERTIES LINKER_LANGUAGE CXX)
 # Compiler warnings                                                   #
 # ------------------------------------------------------------------ #
 
-if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
-	target_compile_options(JCE PRIVATE
-		-Wall -Wextra -Wpedantic
-		-Wconversion -Wshadow -Wdouble-promotion
-		-Wno-unused-parameter)
-elseif(MSVC)
-	target_compile_options(JCE PRIVATE
-		/W4
-		/wd4100    # unreferenced formal parameter
-		/wd4127    # conditional expression is constant
-		/utf-8
-		/Zc:preprocessor)
-	target_compile_definitions(JCE PRIVATE
-		_CRT_SECURE_NO_WARNINGS
-		NOMINMAX
-		WIN32_LEAN_AND_MEAN)
-endif()
+jce_target_warnings(JCE STRICT)
 
 # ------------------------------------------------------------------ #
 # Include directories                                                 #

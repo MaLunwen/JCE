@@ -12,10 +12,18 @@
 #include <SDL3/SDL.h>
 #include <jce/app/jce_app_interface.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Opaque game state. */
 typedef struct CkApp CkApp;
 
 /* Return the application descriptor (IApp callbacks). */
 JceAppDesc ck_app_get_desc(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* CK_APP_H */

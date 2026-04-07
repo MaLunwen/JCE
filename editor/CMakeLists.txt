@@ -47,13 +47,7 @@ endif()
 add_dependencies(JCE_Editor PackEditorAssets)
 
 # ── Compiler warnings ──
-if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
-	target_compile_options(JCE_Editor PRIVATE -Wall -Wextra)
-elseif(MSVC)
-	target_compile_options(JCE_Editor PRIVATE /W4 /utf-8 /Zc:preprocessor)
-	target_compile_definitions(JCE_Editor PRIVATE
-		_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
-endif()
+jce_target_warnings(JCE_Editor)
 
 set_target_properties(JCE_Editor PROPERTIES
 	OUTPUT_NAME jce_editor

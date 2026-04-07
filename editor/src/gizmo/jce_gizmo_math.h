@@ -3,14 +3,16 @@
  *
  * Inline helpers: world_to_screen, screen_to_ray, ray-axis closest,
  * ray-plane intersect.  All operate on raw float arrays / JceGizmoCamera.
+ *
+ * Low-level vec3 / mat4 helpers delegate to cglm (already an engine
+ * dependency) so we avoid duplicating SIMD-friendly math.
  */
 
 #ifndef JCE_GIZMO_MATH_H
 #define JCE_GIZMO_MATH_H
 
-#include <math.h>
+#include <cglm/cglm.h>          /* raw float-array API (vec3, mat4) */
 #include <stdbool.h>
-#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -26,123 +28,68 @@ typedef struct {
     float viewport_origin[2];    /* scene view top-left screen coords */
 } JceGizmoCamera;
 
-/* ── Tiny vec3 helpers (raw float[3]) ──────────────────────────────── */
+/* ── Thin vec3 / mat4 wrappers over cglm ──────────────────────────── */
 
 static inline void gm_v3_copy(float dst[3], const float src[3])
 {
-    dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2];
+    glm_vec3_copy((float *)src, dst);
 }
 
 static inline void gm_v3_sub(float out[3], const float a[3], const float b[3])
 {
-    out[0] = a[0] - b[0]; out[1] = a[1] - b[1]; out[2] = a[2] - b[2];
+    glm_vec3_sub((float *)a, (float *)b, out);
 }
 
 static inline void gm_v3_add(float out[3], const float a[3], const float b[3])
 {
-    out[0] = a[0] + b[0]; out[1] = a[1] + b[1]; out[2] = a[2] + b[2];
+    glm_vec3_add((float *)a, (float *)b, out);
 }
 
 static inline void gm_v3_scale(float out[3], const float v[3], float s)
 {
-    out[0] = v[0] * s; out[1] = v[1] * s; out[2] = v[2] * s;
+    glm_vec3_scale((float *)v, s, out);
 }
 
 static inline float gm_v3_dot(const float a[3], const float b[3])
 {
-    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+    return glm_vec3_dot((float *)a, (float *)b);
 }
 
 static inline void gm_v3_cross(float out[3], const float a[3], const float b[3])
 {
-    out[0] = a[1]*b[2] - a[2]*b[1];
-    out[1] = a[2]*b[0] - a[0]*b[2];
-    out[2] = a[0]*b[1] - a[1]*b[0];
+    glm_vec3_cross((float *)a, (float *)b, out);
 }
 
 static inline float gm_v3_len(const float v[3])
 {
-    return sqrtf(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+    return glm_vec3_norm((float *)v);
 }
 
 static inline void gm_v3_normalize(float out[3], const float v[3])
 {
-    float l = gm_v3_len(v);
+    float l = glm_vec3_norm((float *)v);
     if (l < 1e-8f) { out[0] = out[1] = out[2] = 0.0f; return; }
-    float inv = 1.0f / l;
-    out[0] = v[0]*inv; out[1] = v[1]*inv; out[2] = v[2]*inv;
+    glm_vec3_scale((float *)v, 1.0f / l, out);
 }
 
-/* ── Matrix multiply helpers (column-major 4×4) ────────────────────── */
+/* ── Matrix helpers (column-major 4×4, backed by cglm) ─────────────── */
 
-/* Transform homogeneous point (x,y,z,w) by column-major 4×4 matrix.
-   m[col*4+row] = m[col][row] stored linearly. */
 static inline void gm_m4_mul_v4(float out[4], const float m[16], const float v[4])
 {
-    out[0] = m[0]*v[0] + m[4]*v[1] + m[ 8]*v[2] + m[12]*v[3];
-    out[1] = m[1]*v[0] + m[5]*v[1] + m[ 9]*v[2] + m[13]*v[3];
-    out[2] = m[2]*v[0] + m[6]*v[1] + m[10]*v[2] + m[14]*v[3];
-    out[3] = m[3]*v[0] + m[7]*v[1] + m[11]*v[2] + m[15]*v[3];
+    glm_mat4_mulv((vec4 *)m, (float *)v, out);
 }
 
-/* Multiply two 4×4 column-major matrices: out = A * B. */
 static inline void gm_m4_mul(float out[16], const float a[16], const float b[16])
 {
-    for (int c = 0; c < 4; c++) {
-        for (int r = 0; r < 4; r++) {
-            out[c*4+r] = a[0*4+r]*b[c*4+0]
-                       + a[1*4+r]*b[c*4+1]
-                       + a[2*4+r]*b[c*4+2]
-                       + a[3*4+r]*b[c*4+3];
-        }
-    }
+    glm_mat4_mul((vec4 *)a, (vec4 *)b, (vec4 *)out);
 }
 
 /* Invert a 4×4 column-major matrix. Returns false if singular. */
 static inline bool gm_m4_invert(float inv[16], const float m[16])
 {
-    float tmp[16];
-    tmp[ 0] =  m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15]
-             + m[9]*m[7]*m[14]  + m[13]*m[6]*m[11]  - m[13]*m[7]*m[10];
-    tmp[ 4] = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14]  + m[8]*m[6]*m[15]
-             - m[8]*m[7]*m[14]  - m[12]*m[6]*m[11]  + m[12]*m[7]*m[10];
-    tmp[ 8] =  m[4]*m[9]*m[15]  - m[4]*m[11]*m[13]  - m[8]*m[5]*m[15]
-             + m[8]*m[7]*m[13]  + m[12]*m[5]*m[11]  - m[12]*m[7]*m[9];
-    tmp[12] = -m[4]*m[9]*m[14]  + m[4]*m[10]*m[13]  + m[8]*m[5]*m[14]
-             - m[8]*m[6]*m[13]  - m[12]*m[5]*m[10]  + m[12]*m[6]*m[9];
-
-    float det = m[0]*tmp[0] + m[1]*tmp[4] + m[2]*tmp[8] + m[3]*tmp[12];
+    float det = glm_mat4_det((vec4 *)m);
     if (fabsf(det) < 1e-12f) return false;
-
-    tmp[ 1] = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14]  + m[9]*m[2]*m[15]
-             - m[9]*m[3]*m[14]  - m[13]*m[2]*m[11]  + m[13]*m[3]*m[10];
-    tmp[ 5] =  m[0]*m[10]*m[15] - m[0]*m[11]*m[14]  - m[8]*m[2]*m[15]
-             + m[8]*m[3]*m[14]  + m[12]*m[2]*m[11]  - m[12]*m[3]*m[10];
-    tmp[ 9] = -m[0]*m[9]*m[15]  + m[0]*m[11]*m[13]  + m[8]*m[1]*m[15]
-             - m[8]*m[3]*m[13]  - m[12]*m[1]*m[11]  + m[12]*m[3]*m[9];
-    tmp[13] =  m[0]*m[9]*m[14]  - m[0]*m[10]*m[13]  - m[8]*m[1]*m[14]
-             + m[8]*m[2]*m[13]  + m[12]*m[1]*m[10]  - m[12]*m[2]*m[9];
-
-    tmp[ 2] =  m[1]*m[6]*m[15]  - m[1]*m[7]*m[14]   - m[5]*m[2]*m[15]
-             + m[5]*m[3]*m[14]  + m[13]*m[2]*m[7]   - m[13]*m[3]*m[6];
-    tmp[ 6] = -m[0]*m[6]*m[15]  + m[0]*m[7]*m[14]   + m[4]*m[2]*m[15]
-             - m[4]*m[3]*m[14]  - m[12]*m[2]*m[7]   + m[12]*m[3]*m[6];
-    tmp[10] =  m[0]*m[5]*m[15]  - m[0]*m[7]*m[13]   - m[4]*m[1]*m[15]
-             + m[4]*m[3]*m[13]  + m[12]*m[1]*m[7]   - m[12]*m[3]*m[5];
-    tmp[14] = -m[0]*m[5]*m[14]  + m[0]*m[6]*m[13]   + m[4]*m[1]*m[14]
-             - m[4]*m[2]*m[13]  - m[12]*m[1]*m[6]   + m[12]*m[2]*m[5];
-
-    tmp[ 3] = -m[1]*m[6]*m[11]  + m[1]*m[7]*m[10]   + m[5]*m[2]*m[11]
-             - m[5]*m[3]*m[10]  - m[9]*m[2]*m[7]    + m[9]*m[3]*m[6];
-    tmp[ 7] =  m[0]*m[6]*m[11]  - m[0]*m[7]*m[10]   - m[4]*m[2]*m[11]
-             + m[4]*m[3]*m[10]  + m[8]*m[2]*m[7]    - m[8]*m[3]*m[6];
-    tmp[11] = -m[0]*m[5]*m[11]  + m[0]*m[7]*m[9]    + m[4]*m[1]*m[11]
-             - m[4]*m[3]*m[9]   - m[8]*m[1]*m[7]    + m[8]*m[3]*m[5];
-    tmp[15] =  m[0]*m[5]*m[10]  - m[0]*m[6]*m[9]    - m[4]*m[1]*m[10]
-             + m[4]*m[2]*m[9]   + m[8]*m[1]*m[6]    - m[8]*m[2]*m[5];
-
-    float inv_det = 1.0f / det;
-    for (int i = 0; i < 16; i++) inv[i] = tmp[i] * inv_det;
+    glm_mat4_inv((vec4 *)m, (vec4 *)inv);
     return true;
 }
 
