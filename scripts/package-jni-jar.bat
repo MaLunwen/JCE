@@ -73,7 +73,7 @@ if "%DO_FAT%"=="1" goto :fat_jar
 set "CONAN_DIR=%JNI_ROOT%\desktop-conan"
 set "BUILD_DIR=%JNI_ROOT%\desktop"
 set "TOOLCHAIN=%CONAN_DIR%\build\Release\generators\conan_toolchain.cmake"
-set "DLL_PATH=%BUILD_DIR%\src\%LIB_NAME%"
+set "DLL_PATH=%BUILD_DIR%\caged_kingdom\%LIB_NAME%"
 set "PROFILE=conan/profiles/windows-x64"
 
 echo.
@@ -106,7 +106,7 @@ if not exist "%TOOLCHAIN%" (
 
 :: -- Step 2: CMake configure --
 echo === Step 2: CMake configure ===
-cmake -S . -B %BUILD_DIR% -G Ninja -DCMAKE_TOOLCHAIN_FILE=%TOOLCHAIN% -DCMAKE_BUILD_TYPE=Release -DJCE_BUILD_JNI=ON -DJCE_ENABLE_CPPCHECK=OFF
+cmake -S . -B %BUILD_DIR% -G Ninja -DCMAKE_TOOLCHAIN_FILE=%TOOLCHAIN% -DCMAKE_BUILD_TYPE=Release -DJCE_BUILD_JNI=ON -DJCE_ENABLE_CPPCHECK=OFF -DJCE_BUILD_VARIANT=release
 if errorlevel 1 goto :error
 
 :: -- Step 3: Build (Ninja handles incremental) --
@@ -172,7 +172,7 @@ if not exist "%DIST_DIR%" mkdir "%DIST_DIR%"
 
 :: Compile Java sources
 echo === Compile Java sources ===
-"%JAVA_DIR%\bin\javac.exe" -d "%CLASSES_DIR%" src/main/java/com/jce/JceRuntime.java src/main/java/com/jce/Main.java
+"%JAVA_DIR%\bin\javac.exe" -d "%CLASSES_DIR%" engine/java/com/jce/JceRuntime.java engine/java/com/jce/Main.java
 if errorlevel 1 goto :error
 
 :: Copy natives (only dirs with files)

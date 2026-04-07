@@ -53,9 +53,9 @@ set "JAVA_HOME=D:\Java21\openjdk-21"
 set "CONAN_DIR=build\mobile\android-%ARCH%-conan"
 set "BUILD_DIR=build\mobile\android-%ARCH%"
 set "TOOLCHAIN=%CONAN_DIR%\build\Release\generators\conan_toolchain.cmake"
-set "HOST_PAK=build\host\src\tools\jce_pak.exe"
+set "HOST_PAK=build\host\tools\jce_pak.exe"
 set "ABI_DIR=android\app\src\main\jniLibs\%ABI%"
-set "APK_COPY_DIR=build\mobile\android-%ARCH%\src"
+set "APK_COPY_DIR=build\mobile\android-%ARCH%\release"
 
 echo ================================================================
 echo   JCE Android Build (%ARCH% / %ABI%)
@@ -73,6 +73,7 @@ if "%DO_CLEAN%"=="1" (
     if exist "%CONAN_DIR%" rmdir /s /q "%CONAN_DIR%"
     if exist "android\app\build" rmdir /s /q "android\app\build"
     if exist "android\app\src\main\jniLibs" rmdir /s /q "android\app\src\main\jniLibs"
+    if exist "android\app\src\main\assets" rmdir /s /q "android\app\src\main\assets"
     echo   Done
     echo.
 )
@@ -168,7 +169,7 @@ if not exist "%TOOLCHAIN%" (
 :: -- Step 6: CMake configure --
 echo === Step 6: CMake configure (android-%ARCH%) ===
 for %%F in ("%TOOLCHAIN%") do set "TOOLCHAIN=%%~fF"
-set "CMAKE_ARGS=-S . -B %BUILD_DIR% -G Ninja -DCMAKE_TOOLCHAIN_FILE=%TOOLCHAIN% -DCMAKE_BUILD_TYPE=Release -DJCE_PAK_EXECUTABLE=%HOST_PAK% -DJCE_ENABLE_CPPCHECK=OFF"
+set "CMAKE_ARGS=-S . -B %BUILD_DIR% -G Ninja -DCMAKE_TOOLCHAIN_FILE=%TOOLCHAIN% -DCMAKE_BUILD_TYPE=Release -DJCE_PAK_EXECUTABLE=%HOST_PAK% -DJCE_ENABLE_CPPCHECK=OFF -DJCE_BUILD_VARIANT=release"
 if defined HOST_SHADERC set "CMAKE_ARGS=%CMAKE_ARGS% -DJCE_SHADERC_EXECUTABLE=%HOST_SHADERC%"
 cmake %CMAKE_ARGS%
 if errorlevel 1 goto :error
@@ -178,10 +179,10 @@ echo === Step 7: Build native library ===
 cmake --build %BUILD_DIR%
 if errorlevel 1 goto :error
 
-set "NATIVE_LIB=%BUILD_DIR%\src\libJCE.so"
+set "NATIVE_LIB=%BUILD_DIR%\caged_kingdom\libJCE.so"
 if not exist "%NATIVE_LIB%" (
     echo ERROR: libJCE.so not found after build
-    dir /b /s "%BUILD_DIR%\src\*.so" 2>nul
+    dir /b /s "%BUILD_DIR%\caged_kingdom\*.so" 2>nul
     goto :error
 )
 echo   Built: %NATIVE_LIB%
@@ -203,6 +204,18 @@ if not exist "%ABI_DIR%" mkdir "%ABI_DIR%"
 copy /y "%NATIVE_LIB%" "%ABI_DIR%\libJCE.so" >nul
 if errorlevel 1 goto :error
 echo   Copied libJCE.so
+
+:: Copy game_assets.pak into APK assets/ (loaded at runtime via SDL)
+set "PAK_SRC=%BUILD_DIR%\game_assets.pak"
+set "ASSETS_DIR=android\app\src\main\assets"
+if not exist "%PAK_SRC%" (
+    echo ERROR: game_assets.pak not found at: %PAK_SRC%
+    goto :error
+)
+if not exist "%ASSETS_DIR%" mkdir "%ASSETS_DIR%"
+copy /y "%PAK_SRC%" "%ASSETS_DIR%\game_assets.pak" >nul
+if errorlevel 1 goto :error
+echo   Copied game_assets.pak to APK assets
 
 :: Copy libc++_shared.so from NDK
 set "LIBCPP=%NDK_PATH%\toolchains\llvm\prebuilt\windows-x86_64\sysroot\usr\lib\%NDK_TRIPLE%\libc++_shared.so"

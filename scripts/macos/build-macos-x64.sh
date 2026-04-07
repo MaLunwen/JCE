@@ -2,7 +2,7 @@
 # ================================================================
 # build-macos-x64.sh -- Build JCE for macOS x86_64 (Intel)
 # Usage: build-macos-x64.sh [--clean]
-# Output: build/desktop/macos-x64/src/JCE
+# Output: build/desktop/macos-x64/CagedKingdom
 # ================================================================
 set -euo pipefail
 
@@ -23,7 +23,7 @@ fi
 CONAN_DIR="build/desktop/macos-x64-conan"
 BUILD_DIR="build/desktop/macos-x64"
 TOOLCHAIN="$CONAN_DIR/build/Release/generators/conan_toolchain.cmake"
-HOST_PAK="build/host/src/tools/jce_pak"
+HOST_PAK="build/host/jce_pak"
 MACOS_DEPLOYMENT_TARGET="10.15"
 # Use separate Conan cache for each architecture to prevent cache pollution
 CONAN_HOME_DIR="${CONAN_HOME:-$HOME/.conan2}"
@@ -115,10 +115,10 @@ cmake $CMAKE_ARGS
 echo "=== Step 5: Build (macos-x64) ==="
 cmake --build "$BUILD_DIR"
 
-if [[ ! -f "$BUILD_DIR/src/JCE" ]]; then
-    echo "ERROR: JCE not found after build"
+if [[ ! -f "$BUILD_DIR/CagedKingdom" ]]; then
+    echo "ERROR: CagedKingdom not found after build"
     exit 1
 fi
 
 echo ""
-echo "[SUCCESS] macOS x64 build complete: $BUILD_DIR/src/JCE"
+echo "[SUCCESS] macOS x64 build complete: $BUILD_DIR/CagedKingdom"

@@ -2,7 +2,7 @@
 # ================================================================
 # build-host-tools.sh -- Build host jce_pak on Linux
 # Usage: build-host-tools.sh [--clean]
-# Output: build/host/src/tools/jce_pak
+# Output: build/host/jce_pak
 # ================================================================
 set -euo pipefail
 
@@ -58,10 +58,10 @@ cmake -S . -B "$BUILD_DIR" -G Ninja \
 echo "=== Step 3: Build jce_pak ==="
 cmake --build "$BUILD_DIR" --target jce_pak
 
-if [[ ! -f "$BUILD_DIR/src/tools/jce_pak" ]]; then
+if [[ ! -f "$BUILD_DIR/jce_pak" ]]; then
     echo "ERROR: jce_pak not found after build"
     exit 1
 fi
 
 echo ""
-echo "[SUCCESS] Host jce_pak ready: $BUILD_DIR/src/tools/jce_pak"
+echo "[SUCCESS] Host jce_pak ready: $BUILD_DIR/jce_pak"

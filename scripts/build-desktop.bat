@@ -1,8 +1,9 @@
 @echo off
 :: ================================================================
-:: build-desktop.bat -- Build standalone JCE.exe for Windows x64
-:: Usage: build-desktop.bat [--clean]
-:: Output: build\desktop\windows-x64\src\JCE.exe
+:: build-desktop.bat -- Build standalone caged_kingdom.exe for Windows x64
+:: Usage: build-desktop.bat [--clean] [--dist]
+:: Output: build\desktop\windows-x64\release\caged_kingdom.exe
+::         build\desktop\windows-x64\dist\caged_kingdom.exe  (with --dist)
 :: ================================================================
 setlocal enabledelayedexpansion
 
@@ -12,13 +13,22 @@ pushd "%REPO_ROOT%" || goto :error
 set "CONAN_DIR=build\desktop\windows-x64-conan"
 set "BUILD_DIR=build\desktop\windows-x64"
 set "TOOLCHAIN=%CONAN_DIR%\build\Release\generators\conan_toolchain.cmake"
+set "VARIANT=release"
 
-:: -- Handle --clean flag --
+:: -- Parse arguments --
+:parse_args
 if /i "%~1"=="--clean" (
     echo === Cleaning build directory ===
     if exist "%BUILD_DIR%" rmdir /s /q "%BUILD_DIR%"
     if exist "%CONAN_DIR%" rmdir /s /q "%CONAN_DIR%"
     echo   Done
+    shift
+    goto :parse_args
+)
+if /i "%~1"=="--dist" (
+    set "VARIANT=dist"
+    shift
+    goto :parse_args
 )
 
 :: -- Step 1: Conan install (skip if toolchain exists) --
@@ -36,8 +46,8 @@ if not exist "%TOOLCHAIN%" (
 )
 
 :: -- Step 2: CMake configure (always, picks up new/removed sources) --
-echo === Step 2: CMake configure ===
-cmake -S . -B %BUILD_DIR% -G Ninja -DCMAKE_TOOLCHAIN_FILE=%TOOLCHAIN% -DCMAKE_BUILD_TYPE=Release -DJCE_ENABLE_CPPCHECK=ON
+echo === Step 2: CMake configure (%VARIANT%) ===
+cmake -S . -B %BUILD_DIR% -G Ninja -DCMAKE_TOOLCHAIN_FILE=%TOOLCHAIN% -DCMAKE_BUILD_TYPE=Release -DJCE_ENABLE_CPPCHECK=ON -DJCE_BUILD_VARIANT=%VARIANT%
 if errorlevel 1 goto :error
 
 :: -- Step 3: Build (Ninja handles incremental) --
@@ -45,8 +55,8 @@ echo === Step 3: Build ===
 cmake --build %BUILD_DIR%
 if errorlevel 1 goto :error
 
-if not exist "%BUILD_DIR%\src\JCE.exe" (
-    echo ERROR: JCE.exe not found after build
+if not exist "%BUILD_DIR%\%VARIANT%\caged_kingdom.exe" (
+    echo ERROR: caged_kingdom.exe not found after build
     goto :error
 )
 
@@ -58,7 +68,7 @@ if exist "%CPPCHECK_XML%" (
 )
 
 echo.
-echo [SUCCESS] Desktop build complete: %BUILD_DIR%\src\JCE.exe
+echo [SUCCESS] Desktop build complete (%VARIANT%): %BUILD_DIR%\%VARIANT%\caged_kingdom.exe
 popd
 timeout /t 5 /nobreak >nul
 exit /b 0

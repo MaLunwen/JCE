@@ -1,8 +1,9 @@
 @echo off
 :: ================================================================
 :: build-windows-arm64.bat -- Cross-compile JCE for Windows ARM64
-:: Usage: build-windows-arm64.bat [--clean]
-:: Output: build\desktop\windows-arm64\src\JCE.exe
+:: Usage: build-windows-arm64.bat [--clean] [--dist]
+:: Output: build\desktop\windows-arm64\release\caged_kingdom.exe
+::         build\desktop\windows-arm64\dist\caged_kingdom.exe  (with --dist)
 ::
 :: Prerequisites:
 ::   Visual Studio with "MSVC v143 - VS 2022 C++ ARM64 build tools"
@@ -16,19 +17,28 @@ pushd "%REPO_ROOT%" || goto :error
 set "CONAN_DIR=build\desktop\windows-arm64-conan"
 set "BUILD_DIR=build\desktop\windows-arm64"
 set "TOOLCHAIN=%CONAN_DIR%\build\Release\generators\conan_toolchain.cmake"
-set "HOST_PAK=build\host\src\tools\jce_pak.exe"
+set "HOST_PAK=build\host\tools\jce_pak.exe"
+set "VARIANT=release"
 
 echo ================================================================
 echo   JCE Windows ARM64 Cross-Build
 echo ================================================================
 echo.
 
-:: -- Handle --clean flag --
+:: -- Handle --clean / --dist flags --
+:parse_args
 if /i "%~1"=="--clean" (
     echo === Cleaning build directory ===
     if exist "%BUILD_DIR%" rmdir /s /q "%BUILD_DIR%"
     if exist "%CONAN_DIR%" rmdir /s /q "%CONAN_DIR%"
     echo   Done
+    shift
+    goto :parse_args
+)
+if /i "%~1"=="--dist" (
+    set "VARIANT=dist"
+    shift
+    goto :parse_args
 )
 
 :: -- Step 1: Find VS installation with ARM64 cross-compiler --
@@ -109,6 +119,13 @@ if defined HOST_SHADERC (
 
 :: -- Step 4: Conan install (skip if toolchain exists) --
 echo === Step 4: Conan install (windows-arm64) ===
+
+:: Sync project Conan hooks into the user's Conan extensions directory.
+set "CONAN_HOOKS_DIR=%USERPROFILE%\.conan2\extensions\hooks"
+if not exist "%CONAN_HOOKS_DIR%" mkdir "%CONAN_HOOKS_DIR%"
+for %%F in (conan\hooks\hook_*.py) do copy /Y "%%F" "%CONAN_HOOKS_DIR%\" >nul
+echo   Synced hooks -> %CONAN_HOOKS_DIR%
+
 if exist "%TOOLCHAIN%" (
     echo   Toolchain exists, skipping. Use --clean to force.
 ) else (
@@ -124,7 +141,7 @@ if not exist "%TOOLCHAIN%" (
 :: -- Step 5: CMake configure --
 echo === Step 5: CMake configure (windows-arm64) ===
 for %%F in ("%TOOLCHAIN%") do set "TOOLCHAIN=%%~fF"
-set "CMAKE_ARGS=-S . -B %BUILD_DIR% -G Ninja -DCMAKE_TOOLCHAIN_FILE=%TOOLCHAIN% -DCMAKE_BUILD_TYPE=Release -DJCE_PAK_EXECUTABLE=%HOST_PAK% -DJCE_ENABLE_CPPCHECK=OFF"
+set "CMAKE_ARGS=-S . -B %BUILD_DIR% -G Ninja -DCMAKE_TOOLCHAIN_FILE=%TOOLCHAIN% -DCMAKE_BUILD_TYPE=Release -DJCE_PAK_EXECUTABLE=%HOST_PAK% -DJCE_ENABLE_CPPCHECK=OFF -DJCE_BUILD_VARIANT=%VARIANT%"
 if defined HOST_SHADERC set "CMAKE_ARGS=%CMAKE_ARGS% -DJCE_SHADERC_EXECUTABLE=%HOST_SHADERC%"
 cmake %CMAKE_ARGS%
 if errorlevel 1 goto :error
@@ -134,15 +151,15 @@ echo === Step 6: Build ===
 cmake --build %BUILD_DIR%
 if errorlevel 1 goto :error
 
-if not exist "%BUILD_DIR%\src\JCE.exe" (
-    echo ERROR: JCE.exe not found after build
+if not exist "%BUILD_DIR%\%VARIANT%\caged_kingdom.exe" (
+    echo ERROR: caged_kingdom.exe not found after build
     goto :error
 )
 
 echo.
 echo ================================================================
-echo   [SUCCESS] Windows ARM64 build complete:
-echo     %BUILD_DIR%\src\JCE.exe
+echo   [SUCCESS] Windows ARM64 build complete (%VARIANT%):
+echo     %BUILD_DIR%\%VARIANT%\caged_kingdom.exe
 echo ================================================================
 echo.
 echo   To verify with QEMU:

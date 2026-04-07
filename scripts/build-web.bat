@@ -1,8 +1,9 @@
 @echo off
 :: ================================================================
 :: build-web.bat -- Cross-compile JCE for WebAssembly (Emscripten)
-:: Usage: build-web.bat [emsdk_path] [--clean]
-:: Output: build\web\wasm\src\JCE.js, JCE.wasm, JCE.html
+:: Usage: build-web.bat [emsdk_path] [--clean] [--dist]
+:: Output: build\web\wasm\release\caged_kingdom.js, caged_kingdom.wasm, caged_kingdom.html
+::         build\web\wasm\dist\caged_kingdom.js  (with --dist)
 :: ================================================================
 setlocal enabledelayedexpansion
 
@@ -12,16 +13,21 @@ pushd "%REPO_ROOT%" || goto :error
 set "CONAN_DIR=build\web\wasm-conan"
 set "BUILD_DIR=build\web\wasm"
 set "TOOLCHAIN=%CONAN_DIR%\build\Release\generators\conan_toolchain.cmake"
-set "HOST_PAK=build\host\src\tools\jce_pak.exe"
+set "HOST_PAK=build\host\tools\jce_pak.exe"
 
 :: -- Parse arguments --
-set "EMSDK_PATH=%~1"
+set "EMSDK_PATH="
 set "DO_CLEAN=0"
-if /i "%~1"=="--clean" (
-    set "DO_CLEAN=1"
-    set "EMSDK_PATH="
+set "VARIANT=release"
+for %%A in (%*) do (
+    if /i "%%~A"=="--clean" (
+        set "DO_CLEAN=1"
+    ) else if /i "%%~A"=="--dist" (
+        set "VARIANT=dist"
+    ) else if not defined EMSDK_PATH (
+        set "EMSDK_PATH=%%~A"
+    )
 )
-if /i "%~2"=="--clean" set "DO_CLEAN=1"
 if "%EMSDK_PATH%"=="" set "EMSDK_PATH=D:\Code\C_CPP\cross_platform\emsdk"
 
 :: -- Handle --clean flag --
@@ -105,7 +111,7 @@ if not exist "%TOOLCHAIN%" (
 :: -- Step 5: CMake configure --
 echo === Step 5: CMake configure (wasm) ===
 for %%F in ("%TOOLCHAIN%") do set "TOOLCHAIN=%%~fF"
-set "CMAKE_ARGS=-S . -B %BUILD_DIR% -G Ninja -DCMAKE_TOOLCHAIN_FILE=%TOOLCHAIN% -DCMAKE_BUILD_TYPE=Release -DJCE_PAK_EXECUTABLE=%HOST_PAK% -DJCE_ENABLE_CPPCHECK=OFF"
+set "CMAKE_ARGS=-S . -B %BUILD_DIR% -G Ninja -DCMAKE_TOOLCHAIN_FILE=%TOOLCHAIN% -DCMAKE_BUILD_TYPE=Release -DJCE_PAK_EXECUTABLE=%HOST_PAK% -DJCE_ENABLE_CPPCHECK=OFF -DJCE_BUILD_VARIANT=%VARIANT%"
 if defined HOST_SHADERC set "CMAKE_ARGS=%CMAKE_ARGS% -DJCE_SHADERC_EXECUTABLE=%HOST_SHADERC%"
 cmake %CMAKE_ARGS%
 if errorlevel 1 goto :error
@@ -116,10 +122,10 @@ cmake --build %BUILD_DIR%
 if errorlevel 1 goto :error
 
 echo.
-echo [SUCCESS] Web build complete:
-echo   %BUILD_DIR%\src\JCE.html
-echo   %BUILD_DIR%\src\JCE.js
-echo   %BUILD_DIR%\src\JCE.wasm
+echo [SUCCESS] Web build complete (%VARIANT%):
+echo   %BUILD_DIR%\%VARIANT%\caged_kingdom.html
+echo   %BUILD_DIR%\%VARIANT%\caged_kingdom.js
+echo   %BUILD_DIR%\%VARIANT%\caged_kingdom.wasm
 echo.
 echo   To run: python scripts\serve-web.py
 echo   Then open http://localhost:8080

@@ -38,7 +38,7 @@ fi
 CONAN_DIR="build/mobile/ios-arm64-conan"
 BUILD_DIR="build/mobile/ios-arm64"
 TOOLCHAIN="$CONAN_DIR/build/Release/generators/conan_toolchain.cmake"
-HOST_PAK="build/host/src/tools/jce_pak"
+HOST_PAK="build/host/jce_pak"
 
 # -- Handle --clean flag --
 if $CLEAN; then

@@ -6,7 +6,7 @@ SharedArrayBuffer (used by SDL3/Emscripten) requires:
   Cross-Origin-Embedder-Policy: require-corp
 
 Usage: python serve-web.py [port] [directory]
-  Defaults: port=8080, directory=build/web/wasm/src
+  Defaults: port=8080, directory=build/web/wasm/dist
 """
 
 import http.server
@@ -16,10 +16,10 @@ import sys
 
 class COOPCOEPHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
-        # Redirect bare "/" to JCE.html (Emscripten output name)
+        # Redirect bare "/" to caged_kingdom.html (Emscripten output name)
         if self.path == "/":
             self.send_response(302)
-            self.send_header("Location", "/JCE.html")
+            self.send_header("Location", "/caged_kingdom.html")
             self.end_headers()
             return
         super().do_GET()
@@ -34,10 +34,10 @@ def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
     directory = sys.argv[2] if len(sys.argv) > 2 else None
 
-    # Default to build/web/wasm/src relative to repo root
+    # Default to build/web/wasm/dist relative to repo root
     if directory is None:
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        directory = os.path.join(repo_root, "build", "web", "wasm", "src")
+        directory = os.path.join(repo_root, "build", "web", "wasm", "dist")
 
     if not os.path.isdir(directory):
         print(f"ERROR: Directory not found: {directory}")
