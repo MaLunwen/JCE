@@ -183,10 +183,7 @@ else()
 	target_link_libraries(jce_pak PRIVATE
 		zstd::libzstd_static
 		xxHash::xxhash)
-	if(MSVC)
-		target_compile_definitions(jce_pak PRIVATE
-			_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
-	endif()
+	jce_target_warnings(jce_pak)
 endif()
 
 # ------------------------------------------------------------------ #
@@ -213,10 +210,7 @@ if(NOT CMAKE_CROSSCOMPILING)
 		miniaudio::miniaudio
 		zstd::libzstd_static
 		xxHash::xxhash)
-	if(MSVC)
-		target_compile_definitions(jce_cook PRIVATE
-			_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
-	endif()
+	jce_target_warnings(jce_cook)
 endif()
 
 # ------------------------------------------------------------------ #
@@ -408,6 +402,35 @@ endif()
 set(REPORT_SCRIPT "${JCE_TOOLS_DIR}/build_report.cmake")
 
 # ------------------------------------------------------------------ #
+# Common compiler warnings helper                                     #
+# ------------------------------------------------------------------ #
+#
+# jce_target_warnings(<target> [STRICT])
+#   Applies project-wide warning flags.
+#   STRICT mode adds extra conversion / shadow checks (used by engine).
+#
+function(jce_target_warnings TARGET)
+	cmake_parse_arguments(ARG "STRICT" "" "" ${ARGN})
+	if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+		target_compile_options(${TARGET} PRIVATE -Wall -Wextra)
+		if(ARG_STRICT)
+			target_compile_options(${TARGET} PRIVATE
+				-Wpedantic -Wconversion -Wshadow
+				-Wdouble-promotion -Wno-unused-parameter)
+		endif()
+	elseif(MSVC)
+		target_compile_options(${TARGET} PRIVATE /W4 /utf-8 /Zc:preprocessor)
+		if(ARG_STRICT)
+			target_compile_options(${TARGET} PRIVATE
+				/wd4100    # unreferenced formal parameter
+				/wd4127)   # conditional expression is constant
+		endif()
+		target_compile_definitions(${TARGET} PRIVATE
+			_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+	endif()
+endfunction()
+
+# ------------------------------------------------------------------ #
 # Sub-modules                                                         #
 # ------------------------------------------------------------------ #
 
@@ -432,44 +455,29 @@ if(JCE_ENABLE_CPPCHECK)
 		set(JCE_CPPCHECK_TEXT_REPORT "${JCE_CPPCHECK_REPORT_DIR}/cppcheck-report.txt")
 		set(JCE_CPPCHECK_XML_REPORT  "${JCE_CPPCHECK_REPORT_DIR}/cppcheck-report.xml")
 
+		# Common flags shared by all three cppcheck invocations.
+		set(_CPPCHECK_COMMON_FLAGS
+			--project=${CMAKE_BINARY_DIR}/compile_commands.json
+			--relative-paths=${CMAKE_SOURCE_DIR}
+			--enable=warning,style,performance,portability
+			--inconclusive --inline-suppr
+			--suppress=missingIncludeSystem
+			--suppress=*:*/.conan2/*
+			--file-filter=${CMAKE_SOURCE_DIR}/engine/*
+			--file-filter=${CMAKE_SOURCE_DIR}/editor/*
+			--file-filter=${CMAKE_SOURCE_DIR}/caged_kingdom/*
+			--std=c99)
+
 		add_custom_target(cppcheck ALL
 			COMMAND "${CMAKE_COMMAND}" -E make_directory "${JCE_CPPCHECK_REPORT_DIR}"
-			COMMAND "${CPPCHECK_EXECUTABLE}"
-				--project=${CMAKE_BINARY_DIR}/compile_commands.json
-				--relative-paths=${CMAKE_SOURCE_DIR}
-				--enable=warning,style,performance,portability
-				--inconclusive --inline-suppr
-				--suppress=missingIncludeSystem
-				--suppress=*:*/.conan2/*
-				--file-filter=${CMAKE_SOURCE_DIR}/engine/*
-				--file-filter=${CMAKE_SOURCE_DIR}/editor/*
-				--file-filter=${CMAKE_SOURCE_DIR}/caged_kingdom/*
-				--std=c99
+			COMMAND "${CPPCHECK_EXECUTABLE}" ${_CPPCHECK_COMMON_FLAGS}
 				--template={file}:{line}:{severity}:{id}:{message}
 				--output-file=${JCE_CPPCHECK_TEXT_REPORT}
-			COMMAND "${CPPCHECK_EXECUTABLE}"
-				--project=${CMAKE_BINARY_DIR}/compile_commands.json
-				--relative-paths=${CMAKE_SOURCE_DIR}
-				--enable=warning,style,performance,portability
-				--inconclusive --inline-suppr
-				--suppress=missingIncludeSystem
-				--suppress=*:*/.conan2/*
-				--file-filter=${CMAKE_SOURCE_DIR}/engine/*
-				--file-filter=${CMAKE_SOURCE_DIR}/editor/*
-				--file-filter=${CMAKE_SOURCE_DIR}/caged_kingdom/*
-				--std=c99 --xml --xml-version=2
+			COMMAND "${CPPCHECK_EXECUTABLE}" ${_CPPCHECK_COMMON_FLAGS}
+				--xml --xml-version=2
 				--output-file=${JCE_CPPCHECK_XML_REPORT}
-			COMMAND "${CPPCHECK_EXECUTABLE}"
-				--project=${CMAKE_BINARY_DIR}/compile_commands.json
-				--relative-paths=${CMAKE_SOURCE_DIR}
-				--enable=warning,style,performance,portability
-				--inconclusive --inline-suppr
-				--suppress=missingIncludeSystem
-				--suppress=*:*/.conan2/*
-				--file-filter=${CMAKE_SOURCE_DIR}/engine/*
-				--file-filter=${CMAKE_SOURCE_DIR}/editor/*
-				--file-filter=${CMAKE_SOURCE_DIR}/caged_kingdom/*
-				--std=c99 --quiet
+			COMMAND "${CPPCHECK_EXECUTABLE}" ${_CPPCHECK_COMMON_FLAGS}
+				--quiet
 			WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
 			COMMENT "Running cppcheck"
 			VERBATIM)

@@ -652,10 +652,8 @@ void jce_renderer_rebind_platform(JceRenderer *r, JceWindow *win)
 void jce_renderer_dbg_text(uint16_t x, uint16_t y,
                            uint8_t attr, const char *fmt, ...)
 {
-    // A bit tricky because we don't have 'r' here, but bgfx handles global state
-    // We shouldn't call bgfx if in fallback. We just check bgfx context.
-    // Wait, bgfx_dbg_text_printf won't crash if not initialized, but it's better to avoid maybe.
-    // To be perfectly safe, let's keep it as is, but our calls in jce_engine skip if fallback.
+    /* bgfx handles global state so we don't need 'r' here.
+     * Our callers in jce_engine already skip this when in fallback mode. */
     char buf[256];
     va_list ap;
     va_start(ap, fmt);

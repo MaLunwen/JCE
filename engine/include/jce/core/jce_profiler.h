@@ -28,6 +28,10 @@
 #ifndef JCE_PROFILER_H
 #define JCE_PROFILER_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #if defined(JCE_TRACY_ENABLED) && (JCE_TRACY_ENABLED + 0 == 1)
 #include <tracy/TracyC.h>
 
@@ -87,6 +91,10 @@
 
 #define JCE_PROFILE_THREAD_NAME(name)   do { (void)(name); } while (0)
 
+#endif
+
+#ifdef __cplusplus
+}
 #endif
 
 #endif /* JCE_PROFILER_H */
