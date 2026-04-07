@@ -45,6 +45,36 @@ typedef struct {
     float    intensity;
 } JceDirectionalLight;
 
+/* ── Physics components ──────────────────────────────────────────── */
+
+typedef struct {
+    uint32_t body_handle_idx;    /* JceBodyHandle.idx */
+    uint8_t  body_type;          /* JceBodyType enum value */
+    uint8_t  shape_type;         /* JceShapeType enum value */
+    float    mass;
+    float    friction;
+    float    restitution;
+} JceRigidBodyComponent;
+
+typedef struct {
+    uint32_t body_handle_idx;    /* JceBodyHandle.idx (2D) */
+    uint8_t  body_type;
+    uint8_t  shape_type;
+    float    mass;
+    float    friction;
+    float    restitution;
+    bool     fixed_rotation;
+} JceRigidBody2DComponent;
+
+/* ── Particle emitter component ─────────────────────────────────── */
+
+typedef struct {
+    uint32_t emitter_handle_idx; /* JceEmitterHandle.idx */
+    float    emit_rate;
+    float    lifetime_min;
+    float    lifetime_max;
+} JceParticleEmitterComponent;
+
 /* Tag components (zero-size). */
 typedef struct { char _unused; } JceTagActive;
 

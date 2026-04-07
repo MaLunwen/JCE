@@ -18,6 +18,9 @@ static ECS_COMPONENT_DECLARE(JceMeshRenderer);
 static ECS_COMPONENT_DECLARE(JceCameraComponent);
 static ECS_COMPONENT_DECLARE(JceDirectionalLight);
 static ECS_COMPONENT_DECLARE(JceTagActive);
+static ECS_COMPONENT_DECLARE(JceRigidBodyComponent);
+static ECS_COMPONENT_DECLARE(JceRigidBody2DComponent);
+static ECS_COMPONENT_DECLARE(JceParticleEmitterComponent);
 
 /* ── Scene struct ──────────────────────────────────────────────────── */
 
@@ -44,6 +47,9 @@ JceScene *jce_scene_create(void)
     ECS_COMPONENT_DEFINE(s->world, JceCameraComponent);
     ECS_COMPONENT_DEFINE(s->world, JceDirectionalLight);
     ECS_COMPONENT_DEFINE(s->world, JceTagActive);
+    ECS_COMPONENT_DEFINE(s->world, JceRigidBodyComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceRigidBody2DComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceParticleEmitterComponent);
 
     LOG_SUCCESS(LOG_TAG, "scene created");
     return s;
