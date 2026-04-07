@@ -84,7 +84,13 @@ target_link_libraries(JCE PUBLIC
 	cglm::cglm
 	enkits::enkits
 	physfs-static
-	cjson::cjson)
+	cjson::cjson
+	box2d::box2d
+	Bullet::Bullet
+	enet::enet
+	protobuf::protobuf
+	BehaviorTree::behaviortree_cpp
+	rmlui::rmlui)
 
 # Tracy: true compile-time gate.
 # When OFF, we do not link Tracy at all, and headers compile to no-ops.

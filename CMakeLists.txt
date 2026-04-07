@@ -90,6 +90,12 @@ find_package(cglm         REQUIRED)
 find_package(enkits       REQUIRED)
 find_package(PhysFS       REQUIRED)
 find_package(cJSON        REQUIRED)
+find_package(box2d        REQUIRED)
+find_package(Bullet       REQUIRED)
+find_package(enet         REQUIRED)
+find_package(protobuf     REQUIRED)
+find_package(BehaviorTree REQUIRED)
+find_package(RmlUi        REQUIRED)
 
 # Tracy profiling switch.
 option(JCE_ENABLE_PROFILING "Enable Tracy profiling instrumentation" ON)
