@@ -12,6 +12,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define JCE_MAX_GAMEPADS 4
 #define JCE_MAX_TOUCHES  10
 
@@ -58,5 +62,9 @@ bool      jce_input_gamepad_button_pressed(const JceInput *input, int pad,
               SDL_GamepadButton btn);
 float     jce_input_gamepad_axis(const JceInput *input, int pad,
               SDL_GamepadAxis axis);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* JCE_INPUT_H */

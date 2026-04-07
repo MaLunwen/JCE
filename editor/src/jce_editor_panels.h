@@ -9,6 +9,7 @@
 #define JCE_EDITOR_PANELS_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -65,8 +66,30 @@ void  jce_editor_settings_dialog(bool *p_open);
 /* File viewer: open a file for preview. */
 void  jce_file_viewer_open(const char *path);
 
+/* Asset browser: set the project root directory. */
+void  jce_editor_assets_set_project(const char *path);
+/* Asset browser: returns true while the delete confirmation dialog is open. */
+bool  jce_editor_assets_delete_dialog_open(void);
+
 /* Inspector sync: hierarchy calls this when selection changes. */
 void  jce_editor_inspector_request_sync(void);
+
+/* Inspector delete request: opens the same confirmation dialog used by Inspector panel. */
+void  jce_editor_inspector_request_delete_confirm(uint32_t entity_id);
+
+/* Inspector delete request (multi-select). */
+void  jce_editor_inspector_request_delete_confirm_many(const uint32_t *entity_ids,
+                                                       int entity_count);
+
+/* Inspector delete dialog: open-state query + top-level draw call. */
+bool  jce_editor_inspector_delete_dialog_open(void);
+
+/* Inspector delete dialog: call each frame from top-level layout. */
+void  jce_editor_inspector_delete_dialog(void);
+
+/* Preference getters (for scene view / gizmo integration). */
+bool  jce_editor_prefs_show_gizmos(void);
+float jce_editor_prefs_gizmo_scale(void);
 
 /* Console log API (with log levels matching reference). */
 typedef enum {

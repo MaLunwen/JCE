@@ -18,7 +18,7 @@
 #include <jce/core/jce_log.h>
 
 #include <bgfx/c99/bgfx.h>
-#include <SDL3/SDL.h>
+#include "core/jce_memory.h"
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
@@ -158,13 +158,13 @@ static JceTexture build_atlas(FT_Face face, JceFont *font,
 {
     int total = GLYPH_COUNT + extra_count;
 
-    GlyphInfo *infos = (GlyphInfo *)SDL_calloc((size_t)total, sizeof(GlyphInfo));
+    GlyphInfo *infos = (GlyphInfo *)JCE_CALLOC((size_t)total, sizeof(GlyphInfo));
     if (!infos) return JCE_TEXTURE_INVALID;
 
     /* Pass 1: render every glyph and collect metrics. */
     /* We need to store each rendered bitmap temporarily. */
-    uint8_t **bitmaps = (uint8_t **)SDL_calloc((size_t)total, sizeof(uint8_t *));
-    if (!bitmaps) { SDL_free(infos); return JCE_TEXTURE_INVALID; }
+    uint8_t **bitmaps = (uint8_t **)JCE_CALLOC((size_t)total, sizeof(uint8_t *));
+    if (!bitmaps) { JCE_FREE(infos); return JCE_TEXTURE_INVALID; }
 
     int max_glyph_h = 0;  /* track tallest glyph for atlas row height */
 
@@ -189,7 +189,7 @@ static JceTexture build_atlas(FT_Face face, JceFont *font,
 
         if (bw > 0 && bh > 0) {
             size_t sz = (size_t)(bw * bh);
-            bitmaps[i] = (uint8_t *)SDL_malloc(sz);
+            bitmaps[i] = (uint8_t *)JCE_MALLOC(sz);
             if (bitmaps[i]) {
                 /* FreeType bitmap may have padding; copy row by row. */
                 for (int r = 0; r < bh; r++) {
@@ -232,7 +232,7 @@ static JceTexture build_atlas(FT_Face face, JceFont *font,
 
     /* Pass 3: create atlas pixel buffer (RGBA). */
     uint32_t atlas_size = aw * ah * 4;
-    uint8_t *atlas_pixels = (uint8_t *)SDL_calloc(1, atlas_size);
+    uint8_t *atlas_pixels = (uint8_t *)JCE_CALLOC(1, atlas_size);
     if (!atlas_pixels) {
         LOG_ERROR(LOG_TAG, "atlas allocation failed (%ux%u)", aw, ah);
         goto cleanup;
@@ -242,7 +242,7 @@ static JceTexture build_atlas(FT_Face face, JceFont *font,
     if (extra_count > 0) {
         font->extra_cap = next_pow2((uint32_t)(extra_count * 2));
         if (font->extra_cap < 16) font->extra_cap = 16;
-        font->extra = (GlyphEntry *)SDL_calloc(font->extra_cap,
+        font->extra = (GlyphEntry *)JCE_CALLOC(font->extra_cap,
                                                 sizeof(GlyphEntry));
     }
 
@@ -287,20 +287,20 @@ static JceTexture build_atlas(FT_Face face, JceFont *font,
 
     /* Pass 5: upload atlas to bgfx. */
     JceTexture tex = jce_texture_from_rgba(atlas_pixels, aw, ah);
-    SDL_free(atlas_pixels);
+    JCE_FREE(atlas_pixels);
 
     font->atlas_w = aw;
     font->atlas_h = ah;
 
-    for (int i = 0; i < total; i++) SDL_free(bitmaps[i]);
-    SDL_free(bitmaps);
-    SDL_free(infos);
+    for (int i = 0; i < total; i++) JCE_FREE(bitmaps[i]);
+    JCE_FREE(bitmaps);
+    JCE_FREE(infos);
     return tex;
 
 cleanup:
-    for (int i = 0; i < total; i++) SDL_free(bitmaps[i]);
-    SDL_free(bitmaps);
-    SDL_free(infos);
+    for (int i = 0; i < total; i++) JCE_FREE(bitmaps[i]);
+    JCE_FREE(bitmaps);
+    JCE_FREE(infos);
     return JCE_TEXTURE_INVALID;
 }
 
@@ -325,13 +325,13 @@ JceFont *jce_font_open_ex(const PakArchive *pak, const char *asset_path,
     /* Decompress from PAK. */
     LOG_DEBUG(LOG_TAG, "decompressing %s (%llu bytes)", asset_path,
               (unsigned long long)asset->original_size);
-    void *buf = SDL_malloc((size_t)asset->original_size);
+    void *buf = JCE_MALLOC((size_t)asset->original_size);
     if (!buf) return NULL;
 
     size_t n = pak_decompress(asset, buf, (size_t)asset->original_size);
     if (n == 0) {
         LOG_ERROR(LOG_TAG, "decompression failed: %s", asset_path);
-        SDL_free(buf);
+        JCE_FREE(buf);
         return NULL;
     }
 
@@ -345,17 +345,17 @@ JceFont *jce_font_open_ex(const PakArchive *pak, const char *asset_path,
     if (err) {
         LOG_ERROR(LOG_TAG, "FT_New_Memory_Face failed for %s: error %d",
                   asset_path, err);
-        SDL_free(buf);
+        JCE_FREE(buf);
         return NULL;
     }
 
     /* Set pixel size from point size (approximate: 1pt ≈ 1px at 72 DPI). */
     FT_Set_Pixel_Sizes(face, 0, (FT_UInt)pt_size);
 
-    JceFont *font = (JceFont *)SDL_calloc(1, sizeof(*font));
+    JceFont *font = (JceFont *)JCE_CALLOC(1, sizeof(*font));
     if (!font) {
         FT_Done_Face(face);
-        SDL_free(buf);
+        JCE_FREE(buf);
         return NULL;
     }
 
@@ -376,9 +376,9 @@ JceFont *jce_font_open_ex(const PakArchive *pak, const char *asset_path,
         LOG_ERROR(LOG_TAG, "atlas build failed for %s", asset_path);
         hb_font_destroy(font->hb_font);
         FT_Done_Face(face);
-        SDL_free(font->extra);
-        SDL_free(buf);
-        SDL_free(font);
+        JCE_FREE(font->extra);
+        JCE_FREE(buf);
+        JCE_FREE(font);
         return NULL;
     }
 
@@ -400,9 +400,9 @@ void jce_font_close(JceFont *font)
     jce_texture_destroy(font->atlas);
     if (font->hb_font)  hb_font_destroy(font->hb_font);
     if (font->ft_face)   FT_Done_Face(font->ft_face);
-    SDL_free(font->extra);
-    SDL_free(font->font_data);
-    SDL_free(font);
+    JCE_FREE(font->extra);
+    JCE_FREE(font->font_data);
+    JCE_FREE(font);
 }
 
 void jce_text_draw(const JceRenderer *r, JceFont *font,

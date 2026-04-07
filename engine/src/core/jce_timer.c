@@ -7,6 +7,7 @@
 
 #include <jce/core/jce_timer.h>
 #include <SDL3/SDL.h>
+#include "jce_memory.h"
 
 /* Clamp frame delta to avoid spiral of death after breakpoints / sleep. */
 #define MAX_FRAME_DT 0.25  /* 250 ms (4 FPS minimum) */
@@ -29,7 +30,7 @@ struct JceTimer {
 
 JceTimer *jce_timer_create(double fixed_dt)
 {
-    JceTimer *t = (JceTimer *)SDL_calloc(1, sizeof(*t));
+    JceTimer *t = (JceTimer *)JCE_CALLOC(1, sizeof(*t));
     if (!t) return NULL;
 
     t->freq          = SDL_GetPerformanceFrequency();
@@ -43,7 +44,7 @@ JceTimer *jce_timer_create(double fixed_dt)
 
 void jce_timer_destroy(JceTimer *t)
 {
-    SDL_free(t);
+    JCE_FREE(t);
 }
 
 void jce_timer_tick(JceTimer *t)

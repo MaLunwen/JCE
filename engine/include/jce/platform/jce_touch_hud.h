@@ -17,6 +17,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct JceRenderer JceRenderer;
 typedef struct JceWindow   JceWindow;
 typedef struct JceInput    JceInput;
@@ -67,5 +71,9 @@ void         jce_touch_hud_set_menu_mode(JceTouchHud *hud, bool menu_mode);
    so mobile controls stay responsive.  Default: visible = true. */
 void         jce_touch_hud_set_visible(JceTouchHud *hud, bool visible);
 bool         jce_touch_hud_is_visible(const JceTouchHud *hud);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* JCE_TOUCH_HUD_H */

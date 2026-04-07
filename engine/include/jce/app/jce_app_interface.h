@@ -16,13 +16,18 @@
 #include <stdint.h>
 #include <SDL3/SDL_events.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Forward-declare subsystems so game headers need not pull them in. */
-typedef struct JceWindow   JceWindow;
-typedef struct JceInput    JceInput;
-typedef struct JceAudio    JceAudio;
-typedef struct JceRenderer JceRenderer;
-typedef struct PakArchive  PakArchive;
-typedef struct JceConfig   JceConfig;
+typedef struct JceWindow       JceWindow;
+typedef struct JceInput        JceInput;
+typedef struct JceAudio        JceAudio;
+typedef struct JceRenderer     JceRenderer;
+typedef struct PakArchive      PakArchive;
+typedef struct JceConfig       JceConfig;
+typedef struct JceAssetManager JceAssetManager;
 
 /* ================================================================== */
 /* Services provided by the engine to the application                  */
@@ -35,6 +40,7 @@ typedef struct JceServices {
     JceRenderer       *renderer;
     PakArchive        *pak;
     const JceConfig   *config;
+    JceAssetManager   *assets;
 } JceServices;
 
 /* ================================================================== */
@@ -72,6 +78,17 @@ typedef struct JceAppDesc {
     /* Opaque pointer passed to all callbacks.
        Typically points to game state struct. */
     void *user_data;
+
+    /* Start the window maximized. Default: false. */
+    bool  maximized;
+
+    /* Default window dimensions. 0 = use config default. */
+    uint32_t window_width;
+    uint32_t window_height;
 } JceAppDesc;
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* JCE_APP_INTERFACE_H */

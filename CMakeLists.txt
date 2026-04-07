@@ -78,7 +78,6 @@ find_package(SDL3_image   REQUIRED)
 find_package(SDL3         REQUIRED)
 find_package(bgfx         REQUIRED)
 find_package(flecs        REQUIRED)
-find_package(glm          REQUIRED)
 find_package(miniaudio    REQUIRED)
 find_package(imgui        REQUIRED)
 find_package(Freetype     REQUIRED)
@@ -86,6 +85,27 @@ find_package(harfbuzz     REQUIRED)
 find_package(cgltf        REQUIRED)
 find_package(zstd         REQUIRED)
 find_package(xxHash       REQUIRED)
+find_package(mimalloc     REQUIRED)
+find_package(cglm         REQUIRED)
+find_package(enkits       REQUIRED)
+find_package(PhysFS       REQUIRED)
+find_package(cJSON        REQUIRED)
+
+# Tracy profiling switch.
+option(JCE_ENABLE_PROFILING "Enable Tracy profiling instrumentation" ON)
+
+# Dist builds must never ship with Tracy.
+set(JCE_TRACY_ENABLED ${JCE_ENABLE_PROFILING})
+if(JCE_BUILD_VARIANT STREQUAL "dist")
+	if(JCE_ENABLE_PROFILING)
+		message(WARNING "JCE_BUILD_VARIANT=dist forces Tracy OFF.")
+	endif()
+	set(JCE_TRACY_ENABLED OFF)
+endif()
+
+if(JCE_TRACY_ENABLED)
+	find_package(Tracy REQUIRED)
+endif()
 
 if(JCE_BUILD_JNI)
 	find_package(JNI REQUIRED)
@@ -164,6 +184,42 @@ else()
 endif()
 
 # ------------------------------------------------------------------ #
+# Host cooker tool: jce_cook                                          #
+# ------------------------------------------------------------------ #
+
+if(NOT CMAKE_CROSSCOMPILING)
+	add_executable(jce_cook
+		"${JCE_TOOLS_DIR}/jce_cook.c"
+		"${JCE_TOOLS_DIR}/miniaudio_impl_cook.c"
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_asset_cooker.c")
+	set_target_properties(jce_cook PROPERTIES
+		EXCLUDE_FROM_ALL      ON
+		RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tools"
+		C_STANDARD            99
+		C_STANDARD_REQUIRED   YES
+		C_EXTENSIONS          OFF)
+	target_include_directories(jce_cook PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/engine/include"
+		"${JCE_ENGINE_SRC_DIR}")
+	target_link_libraries(jce_cook PRIVATE
+		SDL3_image::SDL3_image
+		sdl::sdl
+		miniaudio::miniaudio
+		zstd::libzstd_static
+		xxHash::xxhash)
+	if(MSVC)
+		target_compile_definitions(jce_cook PRIVATE
+			_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+	endif()
+endif()
+
+# ------------------------------------------------------------------ #
+# Asset cooking (optional — pre-decode textures & audio at build time)#
+# ------------------------------------------------------------------ #
+
+option(JCE_ENABLE_ASSET_COOKING "Pre-cook assets at build time (raw→.jceasset)" ON)
+
+# ------------------------------------------------------------------ #
 # Asset embedding (per-module PAK files)                              #
 # ------------------------------------------------------------------ #
 
@@ -174,6 +230,69 @@ set(EDITOR_RESOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/editor/resources/assets")
 file(GLOB_RECURSE ENGINE_ASSET_FILES CONFIGURE_DEPENDS "${ENGINE_RESOURCE_DIR}/*")
 file(GLOB_RECURSE GAME_ASSET_FILES   CONFIGURE_DEPENDS "${GAME_RESOURCE_DIR}/*")
 file(GLOB_RECURSE EDITOR_ASSET_FILES CONFIGURE_DEPENDS "${EDITOR_RESOURCE_DIR}/*")
+
+# ── Cook step: convert raw assets → .jceasset containers ──
+# When enabled, jce_cook pre-decodes textures (PNG→RGBA8) and audio
+# (WAV/OGG→PCM s16).  PAK then packs the cooked containers.
+# Level 0 = no per-chunk ZSTD (PAK already compresses the whole entry).
+if(JCE_ENABLE_ASSET_COOKING AND NOT CMAKE_CROSSCOMPILING)
+	set(GAME_COOKED_DIR    "${CMAKE_CURRENT_BINARY_DIR}/_cooked/game")
+	set(EDITOR_COOKED_DIR  "${CMAKE_CURRENT_BINARY_DIR}/_cooked/editor")
+	set(COOK_GAME_STAMP    "${CMAKE_CURRENT_BINARY_DIR}/_cook_game.stamp")
+	set(COOK_EDITOR_STAMP  "${CMAKE_CURRENT_BINARY_DIR}/_cook_editor.stamp")
+
+	add_custom_command(
+		OUTPUT     "${COOK_GAME_STAMP}"
+		COMMAND    $<TARGET_FILE:jce_cook>
+		           --batch "${ENGINE_RESOURCE_DIR}"  "${GAME_COOKED_DIR}"
+		           --preserve-names --level 0 --max-texture-size 2048
+		COMMAND    $<TARGET_FILE:jce_cook>
+		           --batch "${GAME_RESOURCE_DIR}"    "${GAME_COOKED_DIR}"
+		           --preserve-names --level 0 --max-texture-size 2048
+		COMMAND    "${CMAKE_COMMAND}" -E touch "${COOK_GAME_STAMP}"
+		DEPENDS    jce_cook ${ENGINE_ASSET_FILES} ${GAME_ASSET_FILES}
+		COMMENT    "Cooking game assets (textures/audio → .jceasset)"
+		VERBATIM)
+
+	set(EDITOR_ICON_FILE "${CMAKE_CURRENT_SOURCE_DIR}/editor/resources/JCE_icon.png")
+
+	add_custom_command(
+		OUTPUT     "${COOK_EDITOR_STAMP}"
+		COMMAND    $<TARGET_FILE:jce_cook>
+		           --batch "${ENGINE_RESOURCE_DIR}"  "${EDITOR_COOKED_DIR}"
+		           --preserve-names --level 0 --max-texture-size 2048
+		COMMAND    $<TARGET_FILE:jce_cook>
+		           --batch "${EDITOR_RESOURCE_DIR}"  "${EDITOR_COOKED_DIR}"
+		           --preserve-names --level 0 --max-texture-size 2048
+		COMMAND    "${CMAKE_COMMAND}" -E copy
+		           "${EDITOR_ICON_FILE}" "${EDITOR_COOKED_DIR}/JCE_icon.png"
+		COMMAND    "${CMAKE_COMMAND}" -E touch "${COOK_EDITOR_STAMP}"
+		DEPENDS    jce_cook ${ENGINE_ASSET_FILES} ${EDITOR_ASSET_FILES}
+		           "${EDITOR_ICON_FILE}"
+		COMMENT    "Cooking editor assets (textures/audio → .jceasset)"
+		VERBATIM)
+
+	add_custom_target(CookGameAssets   DEPENDS "${COOK_GAME_STAMP}")
+	add_custom_target(CookEditorAssets DEPENDS "${COOK_EDITOR_STAMP}")
+	add_dependencies(CookGameAssets   CompileShaders CompileShadersPBR CompileShadersImGui)
+	add_dependencies(CookEditorAssets CompileShaders CompileShadersPBR CompileShadersImGui)
+
+	# PAK reads from a single cooked dir (engine + app merged).
+	set(_GAME_PAK_RES_FLAGS    --resource-dir "${GAME_COOKED_DIR}")
+	set(_EDITOR_PAK_RES_FLAGS  --resource-dir "${EDITOR_COOKED_DIR}")
+	set(_COOK_GAME_DEP    CookGameAssets)
+	set(_COOK_EDITOR_DEP  CookEditorAssets)
+else()
+	# No cooking — PAK reads raw resource dirs directly.
+	set(_GAME_PAK_RES_FLAGS
+		--resource-dir "${ENGINE_RESOURCE_DIR}"
+		--resource-dir "${GAME_RESOURCE_DIR}")
+	set(_EDITOR_PAK_RES_FLAGS
+		--resource-dir "${ENGINE_RESOURCE_DIR}"
+		--resource-dir "${EDITOR_RESOURCE_DIR}")
+	set(_COOK_GAME_DEP   "")
+	set(_COOK_EDITOR_DEP "")
+endif()
 
 # ── Object format detection (shared by both pak targets) ──
 if(JCE_PLATFORM_WEB)
@@ -216,8 +335,7 @@ add_custom_command(
 	OUTPUT     "${GAME_STAMP_FILE}"
 	BYPRODUCTS "${GAME_PAK_FILE}" "${GAME_PAK_OBJ_FILE}" "${GAME_PAK_C_ARRAY}" "${GAME_HEADER_FILE}" "${GAME_MANIFEST_FILE}"
 	COMMAND    $<TARGET_FILE:jce_pak>
-	           --resource-dir  "${ENGINE_RESOURCE_DIR}"
-	           --resource-dir  "${GAME_RESOURCE_DIR}"
+	           ${_GAME_PAK_RES_FLAGS}
 	           --pak-file      "${GAME_PAK_FILE}"
 	           --header-file   "${GAME_HEADER_FILE}"
 	           --manifest-file "${GAME_MANIFEST_FILE}"
@@ -235,6 +353,9 @@ set_source_files_properties(
 
 add_custom_target(PackGameAssets DEPENDS "${GAME_STAMP_FILE}")
 add_dependencies(PackGameAssets CompileShaders CompileShadersPBR CompileShadersImGui)
+if(_COOK_GAME_DEP)
+	add_dependencies(PackGameAssets ${_COOK_GAME_DEP})
+endif()
 
 # ── Editor assets PAK (engine base + editor) ──
 set(EDITOR_PAK_FILE       "${CMAKE_CURRENT_BINARY_DIR}/editor_assets.pak")
@@ -256,8 +377,7 @@ add_custom_command(
 	OUTPUT     "${EDITOR_STAMP_FILE}"
 	BYPRODUCTS "${EDITOR_PAK_FILE}" "${EDITOR_PAK_OBJ_FILE}" "${EDITOR_PAK_C_ARRAY}" "${EDITOR_HEADER_FILE}" "${EDITOR_MANIFEST_FILE}"
 	COMMAND    $<TARGET_FILE:jce_pak>
-	           --resource-dir  "${ENGINE_RESOURCE_DIR}"
-	           --resource-dir  "${EDITOR_RESOURCE_DIR}"
+	           ${_EDITOR_PAK_RES_FLAGS}
 	           --pak-file      "${EDITOR_PAK_FILE}"
 	           --header-file   "${EDITOR_HEADER_FILE}"
 	           --manifest-file "${EDITOR_MANIFEST_FILE}"
@@ -275,6 +395,9 @@ set_source_files_properties(
 
 add_custom_target(PackEditorAssets DEPENDS "${EDITOR_STAMP_FILE}")
 add_dependencies(PackEditorAssets CompileShaders CompileShadersPBR CompileShadersImGui)
+if(_COOK_EDITOR_DEP)
+	add_dependencies(PackEditorAssets ${_COOK_EDITOR_DEP})
+endif()
 
 set(REPORT_SCRIPT "${JCE_TOOLS_DIR}/build_report.cmake")
 
@@ -283,8 +406,8 @@ set(REPORT_SCRIPT "${JCE_TOOLS_DIR}/build_report.cmake")
 # ------------------------------------------------------------------ #
 
 add_subdirectory(engine)
-add_subdirectory(caged_kingdom)
 add_subdirectory(editor)
+add_subdirectory(caged_kingdom)
 
 # ── Dist mode: suppress all logging ──
 if(JCE_BUILD_VARIANT STREQUAL "dist")
@@ -313,6 +436,7 @@ if(JCE_ENABLE_CPPCHECK)
 				--suppress=missingIncludeSystem
 				--suppress=*:*/.conan2/*
 				--file-filter=${CMAKE_SOURCE_DIR}/engine/*
+				--file-filter=${CMAKE_SOURCE_DIR}/editor/*
 				--file-filter=${CMAKE_SOURCE_DIR}/caged_kingdom/*
 				--std=c99
 				--template={file}:{line}:{severity}:{id}:{message}
@@ -325,6 +449,7 @@ if(JCE_ENABLE_CPPCHECK)
 				--suppress=missingIncludeSystem
 				--suppress=*:*/.conan2/*
 				--file-filter=${CMAKE_SOURCE_DIR}/engine/*
+				--file-filter=${CMAKE_SOURCE_DIR}/editor/*
 				--file-filter=${CMAKE_SOURCE_DIR}/caged_kingdom/*
 				--std=c99 --xml --xml-version=2
 				--output-file=${JCE_CPPCHECK_XML_REPORT}
@@ -336,6 +461,7 @@ if(JCE_ENABLE_CPPCHECK)
 				--suppress=missingIncludeSystem
 				--suppress=*:*/.conan2/*
 				--file-filter=${CMAKE_SOURCE_DIR}/engine/*
+				--file-filter=${CMAKE_SOURCE_DIR}/editor/*
 				--file-filter=${CMAKE_SOURCE_DIR}/caged_kingdom/*
 				--std=c99 --quiet
 			WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"

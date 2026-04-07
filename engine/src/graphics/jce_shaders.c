@@ -65,7 +65,12 @@ static bgfx_shader_handle_t load_single(const PakArchive *pak, const char *path)
     return bgfx_create_shader(mem);
 }
 
-JceShaderHandle shader_load_program(const PakArchive *pak, const char *name)
+/* Internal: load a program with explicit VS and FS base names.
+   Skinned programs share the fragment shader with their non-skinned
+   counterpart (e.g., vs_pbr_skinned + fs_pbr). */
+static JceShaderHandle load_program_named(const PakArchive *pak,
+                                          const char *vs_base,
+                                          const char *fs_base)
 {
     const char *sfx = shader_suffix(bgfx_get_renderer_type());
     if (!sfx) {
@@ -75,8 +80,8 @@ JceShaderHandle shader_load_program(const PakArchive *pak, const char *name)
     }
 
     char vs_path[256], fs_path[256];
-    snprintf(vs_path, sizeof(vs_path), "shaders/vs_%s_%s.bin", name, sfx);
-    snprintf(fs_path, sizeof(fs_path), "shaders/fs_%s_%s.bin", name, sfx);
+    snprintf(vs_path, sizeof(vs_path), "shaders/vs_%s_%s.bin", vs_base, sfx);
+    snprintf(fs_path, sizeof(fs_path), "shaders/fs_%s_%s.bin", fs_base, sfx);
 
     bgfx_shader_handle_t vsh = load_single(pak, vs_path);
     if (vsh.idx == UINT16_MAX) return JCE_INVALID_SHADER;
@@ -91,6 +96,11 @@ JceShaderHandle shader_load_program(const PakArchive *pak, const char *name)
     return (JceShaderHandle){ prog.idx };
 }
 
+JceShaderHandle shader_load_program(const PakArchive *pak, const char *name)
+{
+    return load_program_named(pak, name, name);
+}
+
 JceShaderSet jce_shaders_load_all(const PakArchive *pak)
 {
     JceShaderSet set;
@@ -98,9 +108,11 @@ JceShaderSet jce_shaders_load_all(const PakArchive *pak)
     set.textured = shader_load_program(pak, "textured");
     set.mesh     = shader_load_program(pak, "mesh");
     set.pbr            = shader_load_program(pak, "pbr");
-    set.pbr_skinned    = shader_load_program(pak, "pbr_skinned");
+    /* Skinned variants share the fragment shader with their non-skinned
+       counterpart: vs_pbr_skinned + fs_pbr, vs_shadow_skinned + fs_shadow. */
+    set.pbr_skinned    = load_program_named(pak, "pbr_skinned",    "pbr");
     set.shadow         = shader_load_program(pak, "shadow");
-    set.shadow_skinned = shader_load_program(pak, "shadow_skinned");
+    set.shadow_skinned = load_program_named(pak, "shadow_skinned", "shadow");
 
     if (!jce_shader_valid(set.color))
         LOG_ERROR(LOG_TAG, "failed to load 'color' shader");

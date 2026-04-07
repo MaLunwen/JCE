@@ -10,6 +10,10 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct JceSysInfo {
     /* Static (collected once at init). */
     int    cpu_cores;       /* Logical CPU core count. */
@@ -30,5 +34,9 @@ void jce_sysinfo_init(JceSysInfo *info);
 
 /* Update dynamic info. Call roughly once per second. */
 void jce_sysinfo_update(JceSysInfo *info);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* JCE_SYSINFO_H */

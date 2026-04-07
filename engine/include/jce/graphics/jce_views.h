@@ -32,4 +32,6 @@
 /* ImGui editor overlay (always last  renders on top). */
 #define JCE_VIEW_IMGUI       255
 
+/* no extern "C" needed — this header contains only #define macros */
+
 #endif /* JCE_VIEWS_H */

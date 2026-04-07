@@ -30,6 +30,7 @@
 #include <jce/graphics/jce_renderer.h>
 #include <jce/graphics/jce_primitives.h>
 #include <jce/graphics/jce_text.h>
+#include "core/jce_memory.h"
 
 /* ── Configuration ──────────────────────────────────────────────── */
 
@@ -225,7 +226,7 @@ static FingerSlot *alloc_finger(JceTouchHud *hud)
 JceTouchHud *jce_touch_hud_create(JceRenderer *renderer, JceWindow *window,
                                    JceFont *label_font)
 {
-    JceTouchHud *hud = (JceTouchHud *)SDL_calloc(1, sizeof(*hud));
+    JceTouchHud *hud = (JceTouchHud *)JCE_CALLOC(1, sizeof(*hud));
     if (!hud) return NULL;
     hud->renderer   = renderer;
     hud->window     = window;
@@ -236,7 +237,7 @@ JceTouchHud *jce_touch_hud_create(JceRenderer *renderer, JceWindow *window,
 
 void jce_touch_hud_destroy(JceTouchHud *hud)
 {
-    SDL_free(hud);
+    JCE_FREE(hud);
 }
 
 /* ── Update (call once per frame) ───────────────────────────────── */

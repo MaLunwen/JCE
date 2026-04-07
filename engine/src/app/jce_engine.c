@@ -10,6 +10,8 @@
 #include <jce/app/jce_app_interface.h>
 
 #include <SDL3/SDL.h>
+#include "core/jce_memory.h"
+#include "core/jce_profiler.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -24,6 +26,10 @@
 #include <jce/graphics/jce_renderer.h>
 #include <jce/graphics/jce_shaders.h>
 #include <jce/resource/pak_loader.h>
+#include <jce/resource/jce_asset.h>
+#include <jce/app/jce_subsystem.h>
+#include <jce/core/jce_allocator.h>
+#include <jce/core/jce_event.h>
 #include "embedded_assets.h"
 
 #define LOG_TAG "engine"
@@ -90,14 +96,19 @@ static void jce_select_config_path(char *out_path, size_t out_size)
 /* -- Engine state -------------------------------------------------- */
 
 struct JceEngine {
-    JceConfig    config;
-    JceGpuCaps   gpu_caps;
-    JceWindow   *window;
-    JceInput    *input;
-    JceAudio    *audio;
-    JceRenderer *renderer;
-    PakArchive  *pak;
-    JceServices  svc;           /* subsystem handles for IApp */
+    JceConfig        config;
+    JceGpuCaps       gpu_caps;
+    JceWindow       *window;
+    JceInput        *input;
+    JceAudio        *audio;
+    JceRenderer     *renderer;
+    PakArchive      *pak;
+    JceAssetManager *assets;
+    JceServices      svc;           /* subsystem handles for IApp */
+
+    /* L1/L2 infrastructure (Phase 0) */
+    jce_event_bus_t            *event_bus;
+    jce_subsystem_registry_t   *subsystems;
 };
 
 /* -- Fatal error dialog (all platforms) ----------------------------- */
@@ -134,7 +145,7 @@ JceEngine *jce_engine_create(int argc, char *argv[])
     jce_log_set_thread_name("MAIN");
     jce_crash_handler_init();
 
-    JceEngine *e = SDL_calloc(1, sizeof(*e));
+    JceEngine *e = JCE_CALLOC(1, sizeof(*e));
     if (!e) return NULL;
 
     e->config = jce_config_defaults();
@@ -150,7 +161,7 @@ JceEngine *jce_engine_create(int argc, char *argv[])
 
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         fatal_msg("SDL_Init failed: %s", SDL_GetError());
-        SDL_free(e);
+        JCE_FREE(e);
         return NULL;
     }
 
@@ -183,12 +194,12 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         if (io) {
             Sint64 pak_sz = SDL_GetIOSize(io);
             if (pak_sz > 0) {
-                void *pak_buf = SDL_malloc((size_t)pak_sz);
+                void *pak_buf = JCE_MALLOC((size_t)pak_sz);
                 if (pak_buf) {
                     if (SDL_ReadIO(io, pak_buf, (size_t)pak_sz) == (size_t)pak_sz) {
                         e->pak = pak_open_owned(pak_buf, (size_t)pak_sz);
                     }
-                    if (!e->pak) SDL_free(pak_buf);
+                    if (!e->pak) JCE_FREE(pak_buf);
                 }
             }
             SDL_CloseIO(io);
@@ -199,9 +210,20 @@ JceEngine *jce_engine_create(int argc, char *argv[])
 #endif
     if (!e->pak) {
         fatal_msg("Failed to open PAK archive");
-        SDL_free(e);
+        JCE_FREE(e);
         return NULL;
     }
+
+    /* Override window title from app descriptor if set. */
+    if (g_app_desc_set && g_app_desc.name && g_app_desc.name[0])
+        SDL_strlcpy(e->config.window_title, g_app_desc.name,
+                     sizeof(e->config.window_title));
+
+    /* Override window dimensions from app descriptor if set. */
+    if (g_app_desc_set && g_app_desc.window_width)
+        e->config.window_width  = (int)g_app_desc.window_width;
+    if (g_app_desc_set && g_app_desc.window_height)
+        e->config.window_height = (int)g_app_desc.window_height;
 
     /* -- Window ------------------------------------------------------- */
 
@@ -211,6 +233,8 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         .logical_h = e->config.window_height,
         .flags     = (e->config.resizable  ? SDL_WINDOW_RESIZABLE  : 0)
                    | (e->config.fullscreen ? SDL_WINDOW_FULLSCREEN : 0)
+                   | (e->config.maximized  ? SDL_WINDOW_MAXIMIZED  : 0)
+                   | (g_app_desc_set && g_app_desc.maximized ? SDL_WINDOW_MAXIMIZED : 0)
     };
     e->window = jce_window_create(&win_cfg);
     if (!e->window) {
@@ -275,6 +299,17 @@ JceEngine *jce_engine_create(int argc, char *argv[])
     if (e->audio && e->config.master_volume < 1.0f)
         jce_audio_set_master_volume(e->audio, e->config.master_volume);
 
+    /* -- Asset manager -------------------------------------------- */
+
+    {
+        JceAssetManagerConfig acfg = {0};
+        acfg.pak   = e->pak;
+        acfg.audio = e->audio;
+        e->assets = jce_asset_manager_create(&acfg);
+        if (!e->assets)
+            LOG_WARN(LOG_TAG, "asset manager init failed — direct loading only");
+    }
+
     /* -- Build services struct ------------------------------------ */
 
     e->svc = (JceServices){
@@ -283,8 +318,26 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         .audio    = e->audio,
         .renderer = e->renderer,
         .pak      = e->pak,
-        .config   = &e->config
+        .config   = &e->config,
+        .assets   = e->assets
     };
+
+    /* -- L1/L2 infrastructure ------------------------------------- */
+
+    {
+        jce_allocator_t def_alloc = jce_allocator_default();
+        e->event_bus = jce_event_bus_create(def_alloc);
+        if (!e->event_bus)
+            LOG_WARN(LOG_TAG, "event bus creation failed");
+
+        e->subsystems = jce_subsystem_registry_create(def_alloc);
+        if (!e->subsystems)
+            LOG_WARN(LOG_TAG, "subsystem registry creation failed");
+    }
+
+    /* Initialize registered subsystems before app init. */
+    if (e->subsystems)
+        jce_subsystem_init_all(e->subsystems, &e->svc);
 
     /* -- Initialize application ----------------------------------- */
 
@@ -331,6 +384,8 @@ SDL_AppResult jce_engine_event(JceEngine *e, const SDL_Event *event)
 
 SDL_AppResult jce_engine_iterate(JceEngine *e)
 {
+    JCE_PROFILE_ZONE_N("Frame");
+
     if (g_app_desc.should_quit) {
         if (g_app_desc.should_quit(g_app_desc.user_data))
             return SDL_APP_SUCCESS;
@@ -344,15 +399,38 @@ SDL_AppResult jce_engine_iterate(JceEngine *e)
 
     jce_renderer_begin_frame(e->renderer, e->window);
 
+    /* Finalize async asset loads (GPU resource creation). */
+    if (e->assets) {
+        JCE_PROFILE_ZONE_N("AssetManager::Update");
+        jce_asset_manager_update(e->assets, 3.0f);
+        JCE_PROFILE_ZONE_END;
+    }
+
+    /* Tick registered subsystems. */
+    if (e->subsystems) {
+        JCE_PROFILE_ZONE_N("Subsystems::Update");
+        jce_subsystem_update_all(e->subsystems, 0.0f);
+        JCE_PROFILE_ZONE_END;
+    }
+
     if (g_app_desc.update) {
+        JCE_PROFILE_ZONE_N("App::UpdateAndDraw");
         g_app_desc.update(0.0f, g_app_desc.user_data);
         if (g_app_desc.draw)
             g_app_desc.draw(&e->svc, g_app_desc.user_data);
+        JCE_PROFILE_ZONE_END;
     }
 
     jce_renderer_end_frame(e->renderer);
-    jce_input_update(e->input);
 
+    {
+        JCE_PROFILE_ZONE_N("Input::Update");
+        jce_input_update(e->input);
+        JCE_PROFILE_ZONE_END;
+    }
+
+    JCE_PROFILE_FRAME_MARK;
+    JCE_PROFILE_ZONE_END;
     return SDL_APP_CONTINUE;
 }
 
@@ -365,10 +443,23 @@ void jce_engine_destroy(JceEngine *e)
     if (g_app_desc.exit)
         g_app_desc.exit(g_app_desc.user_data);
 
+    /* Shut down registered subsystems (reverse priority). */
+    if (e->subsystems) {
+        jce_subsystem_shutdown_all(e->subsystems);
+        jce_subsystem_registry_destroy(e->subsystems);
+    }
+
+    if (e->event_bus) jce_event_bus_destroy(e->event_bus);
+
+    if (e->assets)   jce_asset_manager_destroy(e->assets);
     if (e->renderer) jce_renderer_destroy(e->renderer);
     if (e->audio)    jce_audio_destroy(e->audio);
     if (e->pak)      pak_close(e->pak);
     if (e->input)    jce_input_destroy(e->input);
     if (e->window)   jce_window_destroy(e->window);
-    SDL_free(e);
+    JCE_FREE(e);
+
+    /* Flush and shut down the async log backend (last, so all
+       teardown messages are captured). */
+    jce_log_shutdown();
 }

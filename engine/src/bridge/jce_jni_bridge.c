@@ -4,6 +4,7 @@
 #include <jni.h>
 #include <SDL3/SDL.h>
 
+#include "core/jce_memory.h"
 #include <jce/app/jce_engine.h>
 #include <jce/app/jce_app_interface.h>
 
@@ -62,7 +63,7 @@ JNIEXPORT jlong JNICALL Java_com_jce_JceRuntime_nativeCreate(JNIEnv *env, jclass
     JceAppDesc desc = ck_app_get_desc();
     jce_engine_set_app_desc(&desc);
 
-    JceBridgeEngine *bridge = (JceBridgeEngine *)SDL_calloc(1, sizeof(*bridge));
+    JceBridgeEngine *bridge = (JceBridgeEngine *)JCE_CALLOC(1, sizeof(*bridge));
     if (!bridge) {
         if (configPath && configUtf8) {
             (*env)->ReleaseStringUTFChars(env, configPath, configUtf8);
@@ -72,7 +73,7 @@ JNIEXPORT jlong JNICALL Java_com_jce_JceRuntime_nativeCreate(JNIEnv *env, jclass
 
     bridge->engine = jce_engine_create(0, NULL);
     if (!bridge->engine) {
-        SDL_free(bridge);
+        JCE_FREE(bridge);
         if (configPath && configUtf8) {
             (*env)->ReleaseStringUTFChars(env, configPath, configUtf8);
         }
@@ -137,6 +138,6 @@ JNIEXPORT void JNICALL Java_com_jce_JceRuntime_nativeDestroy(JNIEnv *env, jclass
         bridge->engine = NULL;
     }
 
-    SDL_free(bridge);
+    JCE_FREE(bridge);
 }
 

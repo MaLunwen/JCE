@@ -1,5 +1,8 @@
 /*
- * jce_file_viewer.h  Multi-tab file viewer.
+ * jce_file_viewer.h  Multi-tab file viewer with specialized sub-viewers.
+ *
+ * Matches Java reference: FileViewerWindow, ImageViewerWindow,
+ * CodeViewerWindow, ModelViewerWindow, TexturePreviewWindow.
  */
 
 #ifndef JCE_FILE_VIEWER_H
@@ -11,25 +14,35 @@
 extern "C" {
 #endif
 
-/* File type detection. */
+/* File type categories (determines which sub-viewer is used). */
 typedef enum {
-    JCE_FILE_TYPE_UNKNOWN = 0,
-    JCE_FILE_TYPE_CODE,
-    JCE_FILE_TYPE_IMAGE,
-    JCE_FILE_TYPE_MODEL,
-} JceFileType;
+    JCE_FV_TEXT = 0,    /* code, config, data, markdown */
+    JCE_FV_IMAGE,       /* png, jpg, bmp, tga, hdr, gif */
+    JCE_FV_MODEL,       /* gltf, glb, obj, fbx */
+    JCE_FV_SCENE,       /* .scene, .scene.json */
+    JCE_FV_BINARY,      /* unknown binary */
+} JceFileViewerType;
 
 /* Open a file in a new tab (or focus existing tab). */
-void jce_file_viewer_open(const char *path);
+void  jce_file_viewer_open(const char *path);
 
-/* Draw the file viewer content (for tab embedding). */
-void jce_file_viewer_draw_content(void);
+/* Draw the tabbed file viewer content (for panel embedding). */
+void  jce_file_viewer_draw_content(void);
 
-/* Close all tabs. */
-void jce_file_viewer_close_all(void);
+/* Draw standalone file viewer window (Begin/End). */
+void  jce_file_viewer_draw_window(bool *p_visible);
+
+/* Close all open tabs/free resources. */
+void  jce_file_viewer_close_all(void);
+
+/* Shutdown (called from editor shutdown). */
+void  jce_file_viewer_shutdown(void);
+
+/* Request the file viewer window to be focused on next frame. */
+void  jce_file_viewer_request_focus(void);
 
 /* Detect file type by extension. */
-JceFileType jce_file_viewer_detect_type(const char *path);
+JceFileViewerType jce_file_viewer_detect_type(const char *path);
 
 #ifdef __cplusplus
 }

@@ -59,7 +59,23 @@ static bool json_get_string(const char *json, const char *key, char *out, size_t
     size_t i = 0;
     while (*pos && *pos != '"' && i < out_size - 1) {
         if (*pos == '\\' && *(pos + 1)) {
-            pos++; /* skip backslash, take next char */
+            char esc = *(pos + 1);
+            switch (esc) {
+            case '\\': out[i++] = '\\'; pos += 2; continue;
+            case '"':  out[i++] = '"';  pos += 2; continue;
+            case '/':   out[i++] = '/';   pos += 2; continue;
+            case 'b':   out[i++] = '\b';  pos += 2; continue;
+            case 'f':   out[i++] = '\f';  pos += 2; continue;
+            case 'n':   out[i++] = '\n';  pos += 2; continue;
+            case 'r':   out[i++] = '\r';  pos += 2; continue;
+            case 't':   out[i++] = '\t';  pos += 2; continue;
+            default:
+                /* Tolerate malformed escapes in hand-edited/legacy config,
+                   e.g. "D:\Code" accidentally written as "D:\Code". */
+                out[i++] = '\\';
+                pos++;
+                continue;
+            }
         }
         out[i++] = *pos++;
     }
@@ -137,6 +153,17 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
 
 /* --------------- save --------------- */
 
+/* Write a JSON string value, escaping backslashes and quotes. */
+static void json_write_escaped(FILE *f, const char *str) {
+    fputc('"', f);
+    for (const char *p = str; *p; p++) {
+        if (*p == '\\')      { fputc('\\', f); fputc('\\', f); }
+        else if (*p == '"')  { fputc('\\', f); fputc('"', f); }
+        else                 { fputc(*p, f); }
+    }
+    fputc('"', f);
+}
+
 bool jce_editor_config_save(const JceEditorConfig *cfg) {
     /* Ensure .jce directory exists */
     MKDIR(CONFIG_DIR);
@@ -152,12 +179,16 @@ bool jce_editor_config_save(const JceEditorConfig *cfg) {
     fprintf(f, "    \"font_size\": \"%d\",\n", cfg->font_size);
     fprintf(f, "    \"theme\": \"%s\",\n", cfg->theme);
     fprintf(f, "    \"renderer\": \"%s\",\n", cfg->renderer);
-    fprintf(f, "    \"last_project\": \"%s\",\n", cfg->last_project);
+    fprintf(f, "    \"last_project\": ");
+    json_write_escaped(f, cfg->last_project);
+    fprintf(f, ",\n");
 
     for (int i = 0; i < 10; i++) {
         const char *val = (i < cfg->recent_count) ? cfg->recent_projects[i] : "";
         const char *comma = (i < 9) ? "," : "";
-        fprintf(f, "    \"recent_%d\": \"%s\"%s\n", i, val, comma);
+        fprintf(f, "    \"recent_%d\": ", i);
+        json_write_escaped(f, val);
+        fprintf(f, "%s\n", comma);
     }
 
     fprintf(f, "}\n");

@@ -1,12 +1,14 @@
 /*
- * jce_editor_layout.cpp  Fixed-region layout with tab groups.
+ * jce_editor_layout.cpp  DockSpace layout with menu bar.
  *
- * Simulates docking without ImGui DockBuilder (not available in 1.92.5).
- * Uses SetNextWindowPos/Size with fixed ratios to create 4 regions:
+ * Uses ImGui DockSpace and DockBuilder for a Unity-like editor layout:
  *   Left   (15%) — Hierarchy
- *   Center (60%) — Scene View / Game View (tab group)
- *   Right  (25%) — Inspector / File Viewer (tab group)
- *   Bottom (25%) — Console / Timeline / Asset Browser (tab group)
+ *   Center (60%) — Scene View / Game View (tabbed)
+ *   Right  (25%) — Inspector / File Viewer (tabbed)
+ *   Bottom (25%) — Console / Timeline / Asset Browser (tabbed)
+ *
+ * All panels are visible by default. Reset Default Layout re-enables
+ * all panels and restores the dock arrangement.
  *
  * Menu bar matches reference EditorUI.java:
  *   File | Edit | GameObject | Window | Help | [centered Play controls]
@@ -21,6 +23,8 @@
 #include "jce_editor_defaults.h"
 
 #include <imgui.h>
+#include <imgui_internal.h>
+#include <SDL3/SDL.h>
 #include <stdio.h>
 
 /* ── Dialog state ─────────────────────────────────────────────────── */
@@ -29,18 +33,72 @@ static bool s_show_about       = false;
 static bool s_show_settings    = false;
 static bool s_show_new_project = false;
 static bool s_show_open_project = false;
+static bool s_show_new_scene   = false;
+static bool s_show_open_scene  = false;
 static bool s_show_save_as     = false;
 static bool s_show_unsaved     = false;
 static int  s_unsaved_result   = 0;
 
-/* ── Region flags (shared by all fixed panels) ────────────────────── */
+/* ── Docking state ────────────────────────────────────────────────── */
 
-static const ImGuiWindowFlags kRegionFlags =
-    ImGuiWindowFlags_NoTitleBar |
-    ImGuiWindowFlags_NoCollapse |
-    ImGuiWindowFlags_NoResize |
-    ImGuiWindowFlags_NoMove |
-    ImGuiWindowFlags_NoBringToFrontOnFocus;
+static bool s_layout_initialized = false;
+static int  s_deferred_focus_frames = 0;
+static bool s_reset_layout_requested = false;
+static bool s_focus_scene_view = false;
+static bool s_focus_inspector = false;
+static bool s_focus_file_viewer = false;
+
+static bool should_draw_dialog_dimmer(void)
+{
+    return s_show_about
+        || s_show_settings
+        || s_show_new_project
+        || s_show_open_project
+        || s_show_new_scene
+        || s_show_open_scene
+        || s_show_save_as
+        || s_show_unsaved
+    || jce_editor_assets_delete_dialog_open()
+    || jce_editor_inspector_delete_dialog_open();
+}
+
+static void draw_dialog_dimmer(void)
+{
+    const ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->Pos);
+    ImGui::SetNextWindowSize(vp->Size);
+    ImGui::SetNextWindowViewport(vp->ID);
+
+    ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoDocking |
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoNav |
+        ImGuiWindowFlags_NoInputs;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImGui::GetStyleColorVec4(ImGuiCol_ModalWindowDimBg));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0, 0, 0, 0));
+
+    ImGui::Begin("##DialogDimmer", NULL, flags);
+    ImGui::End();
+
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(3);
+}
+
+static void request_app_quit(void)
+{
+    SDL_Event ev;
+    SDL_zero(ev);
+    ev.type = SDL_EVENT_QUIT;
+    SDL_PushEvent(&ev);
+}
 
 /* ══════════════════════════════════════════════════════════════════════
  *  MENU BAR
@@ -50,10 +108,15 @@ static void draw_menu_bar(void)
 {
     if (!ImGui::BeginMenuBar()) return;
 
+    /* Wider spacing between menu items to match reference editor. */
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(16, 4));
+
     /* ── File ──────────────────────────────────────────────────────── */
     if (ImGui::BeginMenu(jce_editor_i18n("menu.file"))) {
-        if (ImGui::MenuItem(jce_editor_i18n("menu.file.newScene"),    "Ctrl+N"))  { /* TODO */ }
-        if (ImGui::MenuItem(jce_editor_i18n("menu.file.openScene"),   "Ctrl+O"))  { /* TODO */ }
+        if (ImGui::MenuItem(jce_editor_i18n("menu.file.newScene"),    "Ctrl+N"))
+            s_show_new_scene = true;
+        if (ImGui::MenuItem(jce_editor_i18n("menu.file.openScene"),   "Ctrl+O"))
+            s_show_open_scene = true;
         if (ImGui::MenuItem(jce_editor_i18n("menu.file.saveScene"),   "Ctrl+S"))  { /* TODO */ }
         if (ImGui::MenuItem(jce_editor_i18n("menu.file.saveAs"),   "Ctrl+Shift+S"))
             s_show_save_as = true;
@@ -63,8 +126,10 @@ static void draw_menu_bar(void)
         if (ImGui::MenuItem(jce_editor_i18n("menu.file.open")))
             s_show_open_project = true;
         ImGui::Separator();
-        if (ImGui::MenuItem(jce_editor_i18n("menu.file.exit"), "Alt+F4"))
+        if (ImGui::MenuItem(jce_editor_i18n("menu.file.exit"), "Alt+F4")) {
+            s_unsaved_result = 0;
             s_show_unsaved = true;
+        }
         ImGui::EndMenu();
     }
 
@@ -86,7 +151,7 @@ static void draw_menu_bar(void)
         }
         if (ImGui::MenuItem(jce_editor_i18n("menu.edit.delete"), "Del")) {
             uint32_t f = jce_state_get_focused();
-            if (f) jce_state_delete_entity(f);
+            if (f) jce_editor_inspector_request_delete_confirm(f);
         }
         ImGui::Separator();
         if (ImGui::MenuItem(jce_editor_i18n("menu.edit.settings")))
@@ -155,6 +220,9 @@ static void draw_menu_bar(void)
                         jce_editor_panel_visible_ptr(JCE_PANEL_ASSETS));
         ImGui::MenuItem(jce_editor_i18n("File Viewer"), NULL,
                         jce_editor_panel_visible_ptr(JCE_PANEL_FILE_VIEWER));
+        ImGui::Separator();
+        if (ImGui::MenuItem(jce_editor_i18n("menu.window.resetLayout")))
+            s_reset_layout_requested = true;
         ImGui::EndMenu();
     }
 
@@ -167,9 +235,12 @@ static void draw_menu_bar(void)
 
     /* ── Play controls (right-aligned, matches reference) ──────────── */
     {
-        float avail = ImGui::GetContentRegionAvail().x;
-        float btn_w = 80.0f; /* approx width of play + stop buttons */
-        ImGui::SameLine(ImGui::GetCursorPosX() + avail - btn_w);
+        /* Calculate width of play + stop buttons + spacing for right-alignment. */
+        float btn_w = ImGui::CalcTextSize(" > ").x + ImGui::GetStyle().FramePadding.x * 2
+                    + ImGui::GetStyle().ItemSpacing.x
+                    + ImGui::CalcTextSize(" [] ").x + ImGui::GetStyle().FramePadding.x * 2;
+        float right_edge = ImGui::GetWindowContentRegionMax().x;
+        ImGui::SameLine(right_edge - btn_w);
 
         JcePlayState ps = jce_state_get_play_state();
 
@@ -189,171 +260,155 @@ static void draw_menu_bar(void)
         if (!can_stop) ImGui::EndDisabled();
     }
 
+    ImGui::PopStyleVar(); /* ItemSpacing for menu bar */
     ImGui::EndMenuBar();
 }
 
 /* ══════════════════════════════════════════════════════════════════════
- *  FIXED LAYOUT REGIONS
+ *  DEFAULT DOCKING LAYOUT (first frame only)
  * ══════════════════════════════════════════════════════════════════════ */
 
-static void draw_region_borders(float x0, float y0, float total_w, float total_h,
-                                float left_w, float top_h, float center_w, float pad)
+static void setup_default_docking_layout(ImGuiID dockspace_id)
 {
-    ImDrawList *dl = ImGui::GetBackgroundDrawList();
-    ImU32 border_col = IM_COL32(45, 45, 55, 255); /* JCE_COLOR_BG_HEADER */
+    const ImGuiViewport *viewport = ImGui::GetMainViewport();
+    float vw = viewport->WorkSize.x;
+    float vh = viewport->WorkSize.y;
 
-    /* Vertical: left | center */
-    float vx1 = x0 + left_w + pad * 0.5f;
-    dl->AddLine(ImVec2(vx1, y0), ImVec2(vx1, y0 + top_h), border_col, 1.0f);
+    ImGui::DockBuilderRemoveNode(dockspace_id);
+    ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_None);
+    ImGui::DockBuilderSetNodeSize(dockspace_id, ImVec2(vw, vh));
 
-    /* Vertical: center | right */
-    float vx2 = x0 + left_w + pad + center_w + pad * 0.5f;
-    dl->AddLine(ImVec2(vx2, y0), ImVec2(vx2, y0 + top_h), border_col, 1.0f);
+    /* Split ratios (Unity-like proportions). */
+    float bottom_ratio = JCE_LAYOUT_BOTTOM_RATIO;   /* 0.25 */
+    float left_ratio   = JCE_LAYOUT_LEFT_RATIO;     /* 0.15 */
+    float right_ratio  = JCE_LAYOUT_RIGHT_RATIO;    /* 0.25 */
 
-    /* Horizontal: top | bottom */
-    float hy = y0 + top_h + pad * 0.5f;
-    dl->AddLine(ImVec2(x0, hy), ImVec2(x0 + total_w, hy), border_col, 1.0f);
+    /* First split: top and bottom. */
+    ImGuiID bottom_id = 0, top_id = 0;
+    ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Down,
+        bottom_ratio, &bottom_id, &top_id);
+
+    /* Split top into left and center-right. */
+    ImGuiID left_id = 0, center_right_id = 0;
+    ImGui::DockBuilderSplitNode(top_id, ImGuiDir_Left,
+        left_ratio, &left_id, &center_right_id);
+
+    /* Split center-right into center and right. */
+    ImGuiID center_id = 0, right_id = 0;
+    ImGui::DockBuilderSplitNode(center_right_id, ImGuiDir_Right,
+        right_ratio / (1.0f - left_ratio), &right_id, &center_id);
+
+    /* Dock windows to their respective nodes.
+       Dock order is reversed — first docked ends up as back tab. */
+    ImGui::DockBuilderDockWindow("Hierarchy###hierarchy",       left_id);
+
+    ImGui::DockBuilderDockWindow("Game###game_view",            center_id);
+    ImGui::DockBuilderDockWindow("Scene###scene_view",          center_id);
+
+    ImGui::DockBuilderDockWindow("File Viewer###file_viewer",   right_id);
+    ImGui::DockBuilderDockWindow("Inspector###inspector",       right_id);
+
+    ImGui::DockBuilderDockWindow("Console###console",           bottom_id);
+    ImGui::DockBuilderDockWindow("Timeline###timeline",         bottom_id);
+    ImGui::DockBuilderDockWindow("Asset Browser###assets",      bottom_id);
+
+    ImGui::DockBuilderFinish(dockspace_id);
 }
 
-static void draw_layout_regions(float x0, float y0, float total_w, float total_h)
+/* ══════════════════════════════════════════════════════════════════════
+ *  PANEL WINDOWS
+ * ══════════════════════════════════════════════════════════════════════ */
+
+static void draw_panel_windows(void)
 {
-    const float pad = 2.0f; /* gap between regions */
+    char lbl[256];
 
-    /* Compute region sizes */
-    float left_w   = total_w * JCE_LAYOUT_LEFT_RATIO;
-    float right_w  = total_w * JCE_LAYOUT_RIGHT_RATIO;
-    float center_w = total_w - left_w - right_w - pad * 2;
-    float bottom_h = total_h * JCE_LAYOUT_BOTTOM_RATIO;
-    float top_h    = total_h - bottom_h - pad;
-
-    /* Draw 1px separator lines between regions */
-    draw_region_borders(x0, y0, total_w, total_h, left_w, top_h, center_w, pad);
-
-    /* ── LEFT REGION (Hierarchy) ──────────────────────────────────── */
-    {
-        ImGui::SetNextWindowPos(ImVec2(x0, y0));
-        ImGui::SetNextWindowSize(ImVec2(left_w, top_h));
-
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4, 4));
-        if (ImGui::Begin("##RegionLeft", NULL, kRegionFlags)) {
-            if (ImGui::BeginTabBar("LeftTabs")) {
-                if (*jce_editor_panel_visible_ptr(JCE_PANEL_HIERARCHY)) {
-                    char _lbl[256];
-                    snprintf(_lbl, sizeof(_lbl), "%s###tab_hierarchy", jce_editor_i18n("Hierarchy"));
-                    if (ImGui::BeginTabItem(_lbl)) {
-                        jce_editor_panel_hierarchy_content();
-                        ImGui::EndTabItem();
-                    }
-                }
-                ImGui::EndTabBar();
-            }
+    /* ── Hierarchy ────────────────────────────────────────────────── */
+    if (*jce_editor_panel_visible_ptr(JCE_PANEL_HIERARCHY)) {
+        snprintf(lbl, sizeof(lbl), "%s###hierarchy", jce_editor_i18n("Hierarchy"));
+        if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_HIERARCHY))) {
+            jce_editor_panel_hierarchy_content();
         }
         ImGui::End();
-        ImGui::PopStyleVar();
     }
 
-    /* ── CENTER REGION (Scene View / Game View) ───────────────────── */
-    {
-        float cx = x0 + left_w + pad;
-        ImGui::SetNextWindowPos(ImVec2(cx, y0));
-        ImGui::SetNextWindowSize(ImVec2(center_w, top_h));
-
+    /* ── Scene View ───────────────────────────────────────────────── */
+    if (*jce_editor_panel_visible_ptr(JCE_PANEL_SCENE_VIEW)) {
+        snprintf(lbl, sizeof(lbl), "%s###scene_view", jce_editor_i18n("Scene"));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-        if (ImGui::Begin("##RegionCenter", NULL, kRegionFlags)) {
-            if (ImGui::BeginTabBar("CenterTabs")) {
-                if (*jce_editor_panel_visible_ptr(JCE_PANEL_SCENE_VIEW)) {
-                    char _lbl[256];
-                    snprintf(_lbl, sizeof(_lbl), "%s###tab_scene", jce_editor_i18n("Scene"));
-                    if (ImGui::BeginTabItem(_lbl)) {
-                        jce_editor_panel_scene_view_content();
-                        ImGui::EndTabItem();
-                    }
-                }
-                if (*jce_editor_panel_visible_ptr(JCE_PANEL_GAME_VIEW)) {
-                    char _lbl[256];
-                    snprintf(_lbl, sizeof(_lbl), "%s###tab_game", jce_editor_i18n("Game"));
-                    if (ImGui::BeginTabItem(_lbl)) {
-                        jce_editor_panel_game_view_content();
-                        ImGui::EndTabItem();
-                    }
-                }
-                ImGui::EndTabBar();
-            }
+        if (s_focus_scene_view) {
+            ImGui::SetNextWindowFocus();
+            s_focus_scene_view = false;
+        }
+        if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_SCENE_VIEW))) {
+            jce_editor_panel_scene_view_content();
         }
         ImGui::End();
         ImGui::PopStyleVar();
     }
 
-    /* ── RIGHT REGION (Inspector / File Viewer) ───────────────────── */
-    {
-        float rx = x0 + left_w + pad + center_w + pad;
-        ImGui::SetNextWindowPos(ImVec2(rx, y0));
-        ImGui::SetNextWindowSize(ImVec2(right_w, top_h));
-
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4, 4));
-        if (ImGui::Begin("##RegionRight", NULL, kRegionFlags)) {
-            if (ImGui::BeginTabBar("RightTabs")) {
-                if (*jce_editor_panel_visible_ptr(JCE_PANEL_INSPECTOR)) {
-                    char _lbl[256];
-                    snprintf(_lbl, sizeof(_lbl), "%s###tab_inspector", jce_editor_i18n("Inspector"));
-                    if (ImGui::BeginTabItem(_lbl)) {
-                        jce_editor_panel_inspector_content();
-                        ImGui::EndTabItem();
-                    }
-                }
-                if (*jce_editor_panel_visible_ptr(JCE_PANEL_FILE_VIEWER)) {
-                    char _lbl[256];
-                    snprintf(_lbl, sizeof(_lbl), "%s###tab_file_viewer", jce_editor_i18n("File Viewer"));
-                    if (ImGui::BeginTabItem(_lbl)) {
-                        jce_editor_panel_file_viewer_content();
-                        ImGui::EndTabItem();
-                    }
-                }
-                ImGui::EndTabBar();
-            }
+    /* ── Game View ────────────────────────────────────────────────── */
+    if (*jce_editor_panel_visible_ptr(JCE_PANEL_GAME_VIEW)) {
+        snprintf(lbl, sizeof(lbl), "%s###game_view", jce_editor_i18n("Game"));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+        if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_GAME_VIEW))) {
+            jce_editor_panel_game_view_content();
         }
         ImGui::End();
         ImGui::PopStyleVar();
     }
 
-    /* ── BOTTOM REGION (Console / Timeline / Assets) ──────────────── */
-    {
-        float by = y0 + top_h + pad;
-        ImGui::SetNextWindowPos(ImVec2(x0, by));
-        ImGui::SetNextWindowSize(ImVec2(total_w, bottom_h));
-
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4, 4));
-        if (ImGui::Begin("##RegionBottom", NULL, kRegionFlags)) {
-            if (ImGui::BeginTabBar("BottomTabs")) {
-                if (*jce_editor_panel_visible_ptr(JCE_PANEL_CONSOLE)) {
-                    char _lbl[256];
-                    snprintf(_lbl, sizeof(_lbl), "%s###tab_console", jce_editor_i18n("Console"));
-                    if (ImGui::BeginTabItem(_lbl)) {
-                        jce_editor_panel_console_content();
-                        ImGui::EndTabItem();
-                    }
-                }
-                if (*jce_editor_panel_visible_ptr(JCE_PANEL_TIMELINE)) {
-                    char _lbl[256];
-                    snprintf(_lbl, sizeof(_lbl), "%s###tab_timeline", jce_editor_i18n("Timeline"));
-                    if (ImGui::BeginTabItem(_lbl)) {
-                        jce_editor_panel_timeline_content();
-                        ImGui::EndTabItem();
-                    }
-                }
-                if (*jce_editor_panel_visible_ptr(JCE_PANEL_ASSETS)) {
-                    char _lbl[256];
-                    snprintf(_lbl, sizeof(_lbl), "%s###tab_assets", jce_editor_i18n("Asset Browser"));
-                    if (ImGui::BeginTabItem(_lbl)) {
-                        jce_editor_panel_assets_content();
-                        ImGui::EndTabItem();
-                    }
-                }
-                ImGui::EndTabBar();
-            }
+    /* ── Inspector ────────────────────────────────────────────────── */
+    if (*jce_editor_panel_visible_ptr(JCE_PANEL_INSPECTOR)) {
+        snprintf(lbl, sizeof(lbl), "%s###inspector", jce_editor_i18n("Inspector"));
+        if (s_focus_inspector) {
+            ImGui::SetNextWindowFocus();
+            s_focus_inspector = false;
+        }
+        if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_INSPECTOR))) {
+            jce_editor_panel_inspector_content();
         }
         ImGui::End();
-        ImGui::PopStyleVar();
+    }
+
+    /* ── File Viewer ──────────────────────────────────────────────── */
+    if (*jce_editor_panel_visible_ptr(JCE_PANEL_FILE_VIEWER)) {
+        snprintf(lbl, sizeof(lbl), "%s###file_viewer", jce_editor_i18n("File Viewer"));
+        if (s_focus_file_viewer) {
+            ImGui::SetNextWindowFocus();
+            s_focus_file_viewer = false;
+        }
+        if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_FILE_VIEWER))) {
+            jce_editor_panel_file_viewer_content();
+        }
+        ImGui::End();
+    }
+
+    /* ── Console ──────────────────────────────────────────────────── */
+    if (*jce_editor_panel_visible_ptr(JCE_PANEL_CONSOLE)) {
+        snprintf(lbl, sizeof(lbl), "%s###console", jce_editor_i18n("Console"));
+        if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_CONSOLE))) {
+            jce_editor_panel_console_content();
+        }
+        ImGui::End();
+    }
+
+    /* ── Timeline ─────────────────────────────────────────────────── */
+    if (*jce_editor_panel_visible_ptr(JCE_PANEL_TIMELINE)) {
+        snprintf(lbl, sizeof(lbl), "%s###timeline", jce_editor_i18n("Timeline"));
+        if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_TIMELINE))) {
+            jce_editor_panel_timeline_content();
+        }
+        ImGui::End();
+    }
+
+    /* ── Asset Browser ────────────────────────────────────────────── */
+    if (*jce_editor_panel_visible_ptr(JCE_PANEL_ASSETS)) {
+        snprintf(lbl, sizeof(lbl), "%s###assets", jce_editor_i18n("Asset Browser"));
+        if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_ASSETS))) {
+            jce_editor_panel_assets_content();
+        }
+        ImGui::End();
     }
 }
 
@@ -363,51 +418,116 @@ static void draw_layout_regions(float x0, float y0, float total_w, float total_h
 
 void jce_editor_layout_draw(void)
 {
-    /* Full-viewport host window for the menu bar. */
+    /* Full-viewport host window for the menu bar + DockSpace. */
     const ImGuiViewport *viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
     ImGui::SetNextWindowSize(viewport->WorkSize);
+    ImGui::SetNextWindowViewport(viewport->ID);
 
     ImGuiWindowFlags host_flags =
         ImGuiWindowFlags_MenuBar |
+        ImGuiWindowFlags_NoDocking |
         ImGuiWindowFlags_NoTitleBar |
         ImGuiWindowFlags_NoCollapse |
         ImGuiWindowFlags_NoResize |
         ImGuiWindowFlags_NoMove |
         ImGuiWindowFlags_NoBringToFrontOnFocus |
-        ImGuiWindowFlags_NoNavFocus |
-        ImGuiWindowFlags_NoBackground;
+        ImGuiWindowFlags_NoNavFocus;
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
 
-    ImGui::Begin("##EditorHost", nullptr, host_flags);
+    ImGui::Begin("DockSpace", nullptr, host_flags);
     ImGui::PopStyleVar(3);
 
     /* Menu bar */
     draw_menu_bar();
 
-    /* Compute available area below the menu bar */
-    float menu_h = ImGui::GetFrameHeight() + ImGui::GetStyle().FramePadding.y;
-    float x0 = viewport->WorkPos.x;
-    float y0 = viewport->WorkPos.y + menu_h;
-    float total_w = viewport->WorkSize.x;
-    float total_h = viewport->WorkSize.y - menu_h;
+    /* Create DockSpace. */
+    ImGuiID dockspace_id = ImGui::GetID("JCEDockSpace");
+    ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_None);
 
-    ImGui::End(); /* ##EditorHost */
+    /* Setup default layout only on first frame AND only if no saved
+       layout exists (imgui.ini).  When imgui.ini is present, ImGui
+       restores the user's docking arrangement automatically. */
+    if (!s_layout_initialized) {
+        s_layout_initialized = true;
+        ImGuiDockNode *node = ImGui::DockBuilderGetNode(dockspace_id);
+        if (!node || node->ChildNodes[0] == NULL) {
+            setup_default_docking_layout(dockspace_id);
+            s_deferred_focus_frames = 3;
+        }
+    }
 
-    /* Draw the 4 fixed layout regions */
-    draw_layout_regions(x0, y0, total_w, total_h);
+    /* Handle reset layout request from Window menu. */
+    if (s_reset_layout_requested) {
+        s_reset_layout_requested = false;
+        /* Re-enable all panels. */
+        for (int p = 0; p < JCE_PANEL_COUNT; p++) {
+            if (p != JCE_PANEL_PREFERENCES)
+                *jce_editor_panel_visible_ptr((JceEditorPanel)p) = true;
+        }
+        setup_default_docking_layout(dockspace_id);
+        s_deferred_focus_frames = 3;
+    }
 
-    /* Preferences (floating, temporary — will become Settings dialog) */
+    /* Deferred tab focus — ensure layout is applied before focusing. */
+    if (s_deferred_focus_frames > 0) {
+        s_deferred_focus_frames--;
+        if (s_deferred_focus_frames == 0) {
+            ImGui::SetWindowFocus("Inspector###inspector");
+            ImGui::SetWindowFocus("Scene###scene_view");
+        }
+    }
+
+    ImGui::End(); /* DockSpace */
+
+    /* Draw all panel windows (dockable). */
+    draw_panel_windows();
+
+    /* Preferences (floating). */
     jce_editor_panel_preferences();
+
+    if (should_draw_dialog_dimmer())
+        draw_dialog_dimmer();
 
     /* Dialogs */
     jce_editor_about_dialog(&s_show_about);
     jce_editor_settings_dialog(&s_show_settings);
+    jce_editor_inspector_delete_dialog();
     jce_editor_dialog_new_project(&s_show_new_project);
     jce_editor_dialog_open_project(&s_show_open_project);
+    jce_editor_dialog_new_scene(&s_show_new_scene);
+    jce_editor_dialog_open_scene(&s_show_open_scene);
     jce_editor_dialog_save_as(&s_show_save_as);
     jce_editor_dialog_unsaved_changes(&s_show_unsaved, &s_unsaved_result);
+
+    if (!s_show_unsaved && s_unsaved_result != 0) {
+        if (s_unsaved_result == 1) {
+            /* TODO: route to actual save operation when scene persistence is integrated. */
+            request_app_quit();
+        } else if (s_unsaved_result == 2) {
+            request_app_quit();
+        }
+        s_unsaved_result = 0;
+    }
+}
+
+void jce_editor_layout_request_focus_scene_view(void)
+{
+    *jce_editor_panel_visible_ptr(JCE_PANEL_SCENE_VIEW) = true;
+    s_focus_scene_view = true;
+}
+
+void jce_editor_layout_request_focus_inspector(void)
+{
+    *jce_editor_panel_visible_ptr(JCE_PANEL_INSPECTOR) = true;
+    s_focus_inspector = true;
+}
+
+void jce_editor_layout_request_focus_file_viewer(void)
+{
+    *jce_editor_panel_visible_ptr(JCE_PANEL_FILE_VIEWER) = true;
+    s_focus_file_viewer = true;
 }

@@ -69,9 +69,9 @@ JceEntity jce_scene_create_entity(JceScene *s, const char *name)
 
     /* Default transform. */
     JceTransform t;
-    t.position = (jce_vec3){0, 0, 0};
+    t.position = (jce_vec3){{0, 0, 0}};
     t.rotation = jce_q_identity();
-    t.scale    = (jce_vec3){1, 1, 1};
+    t.scale    = (jce_vec3){{1, 1, 1}};
     ecs_set_ptr(s->world, e, JceTransform, &t);
 
     /* Active by default. */

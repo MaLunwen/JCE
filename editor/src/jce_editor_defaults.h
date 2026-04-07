@@ -7,7 +7,7 @@
 #ifndef JCE_EDITOR_DEFAULTS_H
 #define JCE_EDITOR_DEFAULTS_H
 
-/* ── Layout (simulated docking ratios) ─────────────────────────────── */
+/* ── Layout (default DockBuilder ratios) ───────────────────────────── */
 
 #define JCE_LAYOUT_LEFT_RATIO    0.15f
 #define JCE_LAYOUT_RIGHT_RATIO   0.25f

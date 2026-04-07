@@ -46,7 +46,11 @@ typedef struct {
     jce_mat4            local_transform;
     JceModelPrimitive  *primitives;
     uint32_t            num_primitives;
-    int16_t             parent;        /* -1 = root */
+    int16_t             parent;               /* -1 = root */
+    int32_t             joint_parent_index;   /* -1, or index in skin joints[] if this
+                                                 static mesh is a direct child of a joint */
+    jce_mat4            joint_local_matrix;   /* node's local TRS relative to parent joint
+                                                 (only valid when joint_parent_index >= 0) */
 } JceModelNode;
 
 /* ================================================================== */

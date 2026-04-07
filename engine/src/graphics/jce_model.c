@@ -18,7 +18,7 @@
 #include <jce/core/jce_log.h>
 
 #include <bgfx/c99/bgfx.h>
-#include <SDL3/SDL.h>
+#include "core/jce_memory.h"
 
 #define LOG_TAG "jce_model"
 
@@ -49,9 +49,9 @@ void jce_model_destroy(JceModel *model)
             if (prim->skinned_mesh)
                 jce_skinned_mesh_destroy(prim->skinned_mesh);
         }
-        SDL_free(node->primitives);
+        JCE_FREE(node->primitives);
     }
-    SDL_free(model->nodes);
+    JCE_FREE(model->nodes);
 
     /* Free textures in materials. */
     for (uint32_t i = 0; i < model->num_materials; i++) {
@@ -67,7 +67,7 @@ void jce_model_destroy(JceModel *model)
         if (jce_texture_valid(mat->emissive_map))
             jce_texture_destroy(mat->emissive_map);
     }
-    SDL_free(model->materials);
+    JCE_FREE(model->materials);
 
     /* Free skeleton. */
     jce_skeleton_destroy(model->skeleton);
@@ -75,9 +75,9 @@ void jce_model_destroy(JceModel *model)
     /* Free animation clips. */
     for (uint32_t i = 0; i < model->num_anims; i++)
         jce_anim_clip_destroy(model->anim_clips[i]);
-    SDL_free(model->anim_clips);
+    JCE_FREE(model->anim_clips);
 
-    SDL_free(model);
+    JCE_FREE(model);
 }
 
 /* ================================================================== */
@@ -134,56 +134,92 @@ void jce_model_draw(const JceModel *model,
 {
     if (!model || !r) return;
 
+    jce_mat4 identity = jce_m4_identity();
+    const jce_mat4 *root = transform ? transform : &identity;
+
     for (uint32_t n = 0; n < model->num_nodes; n++) {
         const JceModelNode *node = &model->nodes[n];
+
+        /* node->local_transform is the pre-baked model-space world transform
+           (cgltf_node_transform_world baked full hierarchy in the loader).
+           Combine with the caller's model-to-world root transform. */
+        jce_mat4 world = jce_m4_multiply(root, &node->local_transform);
 
         for (uint32_t p = 0; p < node->num_primitives; p++) {
             const JceModelPrimitive *prim = &node->primitives[p];
 
-            /* Bind material. */
+            /* Bind PBR material. */
             const JcePbrMaterial *mat = NULL;
             if (prim->material_index < model->num_materials)
                 mat = &model->materials[prim->material_index];
-
             if (mat)
                 jce_pbr_material_bind(mat, r, view_id);
 
-            /* Determine which program to use. */
-            JceShaderHandle prog_handle;
-
             if (prim->skinned_mesh) {
-                /* Skinned path: upload bone palette and submit. */
-                if (joint_matrices && num_joints > 0)
-                    jce_skinned_mesh_set_bones(joint_matrices, num_joints);
+                JceShaderHandle prog_handle;
+
+                if (jce_skinned_mesh_is_skinned(prim->skinned_mesh)) {
+                    /* Fully skinned: bone matrices provide per-vertex transform.
+                       Pre-multiply by root so the VS outputs world-space positions. */
+                    if (joint_matrices && num_joints > 0) {
+                        uint32_t nb = num_joints < 256 ? num_joints : 256;
+                        jce_mat4 world_bones[256];
+                        for (uint32_t bi = 0; bi < nb; bi++)
+                            world_bones[bi] = jce_m4_multiply(root, &joint_matrices[bi]);
+                        jce_skinned_mesh_set_bones(world_bones, nb);
+                    } else if (model->skeleton) {
+                        /* No live animation: evaluate rest/bind pose from skeleton. */
+                        uint32_t num_j = jce_skeleton_joint_count(model->skeleton);
+                        if (num_j > 256) num_j = 256;
+                        jce_mat4 bind_pose[256];
+                        jce_skeleton_evaluate(model->skeleton, NULL, bind_pose, num_j);
+                        for (uint32_t bi = 0; bi < num_j; bi++)
+                            bind_pose[bi] = jce_m4_multiply(root, &bind_pose[bi]);
+                        jce_skinned_mesh_set_bones(bind_pose, num_j);
+                    } else {
+                        bgfx_set_transform(world.raw[0], 1);
+                    }
+                    prog_handle = jce_renderer_get_program_pbr_skinned(r);
+                } else {
+                    /* PBR static (has tangent, no joints): use node world. */
+                    bgfx_set_transform(world.raw[0], 1);
+                    prog_handle = jce_renderer_get_program_pbr(r);
+                }
 
                 jce_skinned_mesh_submit(prim->skinned_mesh, r, view_id);
-                prog_handle = jce_renderer_get_program_pbr_skinned(r);
+
+                bgfx_program_handle_t bgfx_prog = { prog_handle.idx };
+                bgfx_submit(view_id, bgfx_prog, 0, BGFX_DISCARD_ALL);
+
             } else if (prim->static_mesh) {
-                /* Static path: set world transform. */
-                if (transform)
-                    bgfx_set_transform(transform->m, 1);
-
-                /* Set vertex/index buffers via mesh internals.
-                 * We use jce_mesh_submit which also calls bgfx_submit,
-                 * but we need PBR program. Use direct bgfx calls. */
-                jce_skinned_mesh_submit(NULL, r, view_id);
-
-                /* Actually for static meshes with PBR material,
-                 * submit with PBR program directly. */
-                prog_handle = jce_renderer_get_program_pbr(r);
-
-                /* Re-do: set buffers + state + submit with PBR program. */
-                if (transform)
-                    bgfx_set_transform(transform->m, 1);
+                /* Basic mesh: apply transform, then submit. */
+                jce_mat4 static_world;
+                if (node->joint_parent_index >= 0 && model->skeleton) {
+                    /* Static mesh directly parented to a skin joint (e.g. a held
+                       weapon). Recover the joint's animated world transform:
+                         joint_global = skin_matrix[i] × inverse(inv_bind[i])
+                       Then: world = root × joint_global × node_local_from_joint */
+                    uint32_t jidx = (uint32_t)node->joint_parent_index;
+                    jce_mat4 inv_bind = jce_skeleton_get_inverse_bind(
+                        model->skeleton, jidx);
+                    jce_mat4 bind_mat = jce_m4_inverse(&inv_bind);
+                    jce_mat4 joint_global;
+                    if (joint_matrices && num_joints > jidx) {
+                        joint_global = jce_m4_multiply(
+                            &joint_matrices[jidx], &bind_mat);
+                    } else {
+                        /* No animation: bind pose global = bind_mat. */
+                        joint_global = bind_mat;
+                    }
+                    jce_mat4 joint_world = jce_m4_multiply(root, &joint_global);
+                    static_world = jce_m4_multiply(
+                        &joint_world, &node->joint_local_matrix);
+                } else {
+                    static_world = world;
+                }
+                bgfx_set_transform(static_world.raw[0], 1);
                 jce_mesh_submit(prim->static_mesh, r, view_id);
-                continue; /* mesh_submit already calls bgfx_submit */
-            } else {
-                continue;
             }
-
-            /* Submit the draw call with the PBR program. */
-            bgfx_program_handle_t bgfx_prog = { prog_handle.idx };
-            bgfx_submit(view_id, bgfx_prog, 0, BGFX_DISCARD_ALL);
         }
     }
 }

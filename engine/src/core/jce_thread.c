@@ -1,17 +1,18 @@
 /*
  * jce_thread.c  Thread pool and synchronisation primitives.
  *
- * Implementation uses SDL3 threads, mutexes, and conditions.
- * The pool maintains a work queue; workers sleep until signalled.
+ * Thread pool backed by enkiTS work-stealing task scheduler.
+ * Mutex / condition-variable wrappers remain on SDL3.
  */
 
 #include "jce_thread.h"
 #include "jce_memory.h"
 
 #include <SDL3/SDL.h>
+#include <enkiTS/TaskScheduler_c.h>
 
 /* ================================================================== */
-/* Mutex                                                               */
+/* Mutex  (SDL3 — enkiTS has no mutex primitive)                       */
 /* ================================================================== */
 
 struct JceMutex {
@@ -45,7 +46,7 @@ void jce_mutex_unlock(JceMutex *m)
 }
 
 /* ================================================================== */
-/* Condition variable                                                  */
+/* Condition variable  (SDL3)                                          */
 /* ================================================================== */
 
 struct JceCondVar {
@@ -85,74 +86,70 @@ void jce_cond_broadcast(JceCondVar *c)
 }
 
 /* ================================================================== */
-/* Thread pool internals                                               */
+/* enkiTS task adapter                                                 */
 /* ================================================================== */
 
-/* Linked-list node for the work queue. */
-typedef struct WorkItem {
-    JceTaskFn       fn;
-    void           *arg;
-    JceTask        *tracked;   /* NULL for fire-and-forget tasks */
-    struct WorkItem *next;
-} WorkItem;
+/* Bridge between JceTaskFn(void*) and enkiTS range callback. */
+typedef struct TaskAdapter {
+    JceTaskFn fn;
+    void     *arg;
+} TaskAdapter;
+
+static void task_range_adapter(uint32_t start_, uint32_t end_,
+                               uint32_t threadnum_, void *pArgs_)
+{
+    (void)start_; (void)end_; (void)threadnum_;
+    TaskAdapter *a = (TaskAdapter *)pArgs_;
+    a->fn(a->arg);
+}
+
+/* ================================================================== */
+/* Tracked task                                                        */
+/* ================================================================== */
 
 struct JceTask {
-    SDL_AtomicInt  done;
-    JceMutex      *mutex;
-    JceCondVar    *cond;
+    enkiTaskScheduler *scheduler;   /* back-reference for wait/query */
+    enkiTaskSet       *task_set;
+    TaskAdapter        adapter;     /* embedded — no separate alloc  */
 };
+
+/* ================================================================== */
+/* Fire-and-forget cleanup list                                        */
+/* ================================================================== */
+
+typedef struct PendingTask {
+    enkiTaskSet        *task_set;
+    TaskAdapter        *adapter;    /* heap-allocated per submit      */
+    struct PendingTask *next;
+} PendingTask;
+
+/* ================================================================== */
+/* Thread pool                                                         */
+/* ================================================================== */
 
 struct JceThreadPool {
-    SDL_Thread  **threads;
-    int           num_threads;
-
-    JceMutex    *queue_mutex;
-    JceCondVar  *queue_cond;
-    WorkItem    *queue_head;
-    WorkItem    *queue_tail;
-    bool         shutdown;
+    enkiTaskScheduler *scheduler;
+    PendingTask       *pending_head;
+    SDL_Mutex         *pending_mutex;
 };
 
-/* Worker thread entry point. */
-static int pool_worker(void *data)
+/* Garbage-collect completed fire-and-forget tasks. */
+static void cleanup_pending(JceThreadPool *pool)
 {
-    JceThreadPool *pool = (JceThreadPool *)data;
-
-    for (;;) {
-        jce_mutex_lock(pool->queue_mutex);
-
-        /* Wait for work or shutdown. */
-        while (!pool->queue_head && !pool->shutdown)
-            jce_cond_wait(pool->queue_cond, pool->queue_mutex);
-
-        if (pool->shutdown && !pool->queue_head) {
-            jce_mutex_unlock(pool->queue_mutex);
-            break;
+    SDL_LockMutex(pool->pending_mutex);
+    PendingTask **pp = &pool->pending_head;
+    while (*pp) {
+        PendingTask *p = *pp;
+        if (enkiIsTaskSetComplete(pool->scheduler, p->task_set)) {
+            *pp = p->next;
+            enkiDeleteTaskSet(pool->scheduler, p->task_set);
+            JCE_FREE(p->adapter);
+            JCE_FREE(p);
+        } else {
+            pp = &p->next;
         }
-
-        /* Dequeue. */
-        WorkItem *item = pool->queue_head;
-        pool->queue_head = item->next;
-        if (!pool->queue_head)
-            pool->queue_tail = NULL;
-
-        jce_mutex_unlock(pool->queue_mutex);
-
-        /* Execute. */
-        item->fn(item->arg);
-
-        /* Signal tracked task completion. */
-        if (item->tracked) {
-            SDL_SetAtomicInt(&item->tracked->done, 1);
-            jce_mutex_lock(item->tracked->mutex);
-            jce_cond_broadcast(item->tracked->cond);
-            jce_mutex_unlock(item->tracked->mutex);
-        }
-
-        JCE_FREE(item);
     }
-
-    return 0;
+    SDL_UnlockMutex(pool->pending_mutex);
 }
 
 /* ================================================================== */
@@ -161,32 +158,19 @@ static int pool_worker(void *data)
 
 JceThreadPool *jce_thread_pool_create(int num_threads)
 {
-    if (num_threads <= 0)
-        num_threads = SDL_GetNumLogicalCPUCores();
-    if (num_threads < 1)
-        num_threads = 2;
-
     JceThreadPool *pool = JCE_NEW(JceThreadPool);
     if (!pool) return NULL;
 
-    pool->queue_mutex = jce_mutex_create();
-    pool->queue_cond  = jce_cond_create();
-    if (!pool->queue_mutex || !pool->queue_cond) {
-        jce_mutex_destroy(pool->queue_mutex);
-        jce_cond_destroy(pool->queue_cond);
-        JCE_FREE(pool);
-        return NULL;
-    }
+    pool->scheduler = enkiNewTaskScheduler();
+    if (!pool->scheduler) { JCE_FREE(pool); return NULL; }
 
-    pool->num_threads = num_threads;
-    pool->threads = JCE_NEW_ARRAY(SDL_Thread *, num_threads);
+    if (num_threads <= 0)
+        enkiInitTaskScheduler(pool->scheduler);          /* auto-detect */
+    else
+        enkiInitTaskSchedulerNumThreads(pool->scheduler, (uint32_t)num_threads);
 
-    for (int i = 0; i < num_threads; i++) {
-        char name[32];
-        SDL_snprintf(name, sizeof(name), "JCE-Worker-%d", i);
-        pool->threads[i] = SDL_CreateThread(pool_worker, name, pool);
-    }
-
+    pool->pending_head  = NULL;
+    pool->pending_mutex = SDL_CreateMutex();
     return pool;
 }
 
@@ -194,57 +178,52 @@ void jce_thread_pool_destroy(JceThreadPool *pool)
 {
     if (!pool) return;
 
-    /* Signal shutdown. */
-    jce_mutex_lock(pool->queue_mutex);
-    pool->shutdown = true;
-    jce_cond_broadcast(pool->queue_cond);
-    jce_mutex_unlock(pool->queue_mutex);
+    enkiWaitforAllAndShutdown(pool->scheduler);
 
-    /* Join all workers. */
-    for (int i = 0; i < pool->num_threads; i++) {
-        if (pool->threads[i])
-            SDL_WaitThread(pool->threads[i], NULL);
+    /* Drain the pending list (all tasks are complete after shutdown). */
+    PendingTask *p = pool->pending_head;
+    while (p) {
+        PendingTask *next = p->next;
+        enkiDeleteTaskSet(pool->scheduler, p->task_set);
+        JCE_FREE(p->adapter);
+        JCE_FREE(p);
+        p = next;
     }
 
-    /* Drain remaining items. */
-    WorkItem *item = pool->queue_head;
-    while (item) {
-        WorkItem *next = item->next;
-        JCE_FREE(item);
-        item = next;
-    }
-
-    JCE_FREE(pool->threads);
-    jce_mutex_destroy(pool->queue_mutex);
-    jce_cond_destroy(pool->queue_cond);
+    enkiDeleteTaskScheduler(pool->scheduler);
+    SDL_DestroyMutex(pool->pending_mutex);
     JCE_FREE(pool);
-}
-
-static void enqueue(JceThreadPool *pool, JceTaskFn fn, void *arg,
-                    JceTask *tracked)
-{
-    WorkItem *item = JCE_NEW(WorkItem);
-    if (!item) return;
-
-    item->fn      = fn;
-    item->arg     = arg;
-    item->tracked = tracked;
-    item->next    = NULL;
-
-    jce_mutex_lock(pool->queue_mutex);
-    if (pool->queue_tail)
-        pool->queue_tail->next = item;
-    else
-        pool->queue_head = item;
-    pool->queue_tail = item;
-    jce_cond_signal(pool->queue_cond);
-    jce_mutex_unlock(pool->queue_mutex);
 }
 
 void jce_thread_pool_submit(JceThreadPool *pool, JceTaskFn fn, void *arg)
 {
     if (!pool || !fn) return;
-    enqueue(pool, fn, arg, NULL);
+
+    cleanup_pending(pool);
+
+    TaskAdapter *adapter = JCE_NEW(TaskAdapter);
+    if (!adapter) return;
+    adapter->fn  = fn;
+    adapter->arg = arg;
+
+    /* Pre-allocate tracking node BEFORE submitting so we never lose
+       the adapter pointer if the allocation fails. */
+    PendingTask *pending = JCE_NEW(PendingTask);
+    if (!pending) {
+        JCE_FREE(adapter);
+        return;
+    }
+
+    enkiTaskSet *ts = enkiCreateTaskSet(pool->scheduler, task_range_adapter);
+    enkiAddTaskSetArgs(pool->scheduler, ts, adapter, 1);
+
+    pending->task_set = ts;
+    pending->adapter  = adapter;
+
+    SDL_LockMutex(pool->pending_mutex);
+    pending->next      = pool->pending_head;
+    pool->pending_head = pending;
+    SDL_UnlockMutex(pool->pending_mutex);
 }
 
 JceTask *jce_thread_pool_submit_tracked(JceThreadPool *pool,
@@ -255,33 +234,31 @@ JceTask *jce_thread_pool_submit_tracked(JceThreadPool *pool,
     JceTask *task = JCE_NEW(JceTask);
     if (!task) return NULL;
 
-    SDL_SetAtomicInt(&task->done, 0);
-    task->mutex = jce_mutex_create();
-    task->cond  = jce_cond_create();
+    task->scheduler    = pool->scheduler;
+    task->adapter.fn   = fn;
+    task->adapter.arg  = arg;
 
-    enqueue(pool, fn, arg, task);
+    task->task_set = enkiCreateTaskSet(pool->scheduler, task_range_adapter);
+    enkiAddTaskSetArgs(pool->scheduler, task->task_set, &task->adapter, 1);
+
     return task;
 }
 
 void jce_task_wait(JceTask *task)
 {
     if (!task) return;
-    jce_mutex_lock(task->mutex);
-    while (!SDL_GetAtomicInt(&task->done))
-        jce_cond_wait(task->cond, task->mutex);
-    jce_mutex_unlock(task->mutex);
+    enkiWaitForTaskSet(task->scheduler, task->task_set);
 }
 
 bool jce_task_done(const JceTask *task)
 {
     if (!task) return true;
-    return SDL_GetAtomicInt((SDL_AtomicInt *)&task->done) != 0;
+    return enkiIsTaskSetComplete(task->scheduler, task->task_set) != 0;
 }
 
 void jce_task_free(JceTask *task)
 {
     if (!task) return;
-    jce_mutex_destroy(task->mutex);
-    jce_cond_destroy(task->cond);
+    enkiDeleteTaskSet(task->scheduler, task->task_set);
     JCE_FREE(task);
 }

@@ -660,6 +660,11 @@ int main(int argc, char *argv[]) {
     AssetEntry *entries = (AssetEntry *)calloc(entries_cap, sizeof(AssetEntry));
     if (!entries) { fprintf(stderr, "[jce_pak] out of memory\n"); return 1; }
 
+    /* Reusable ZSTD compression context — avoids repeated internal
+       allocation/deallocation when compressing many files. */
+    ZSTD_CCtx *cctx = ZSTD_createCCtx();
+    if (!cctx) { fprintf(stderr, "[jce_pak] ZSTD_createCCtx failed\n"); return 1; }
+
     for (size_t fi = 0; fi < files.count; fi++) {
         char *rel = make_relative(files.items[fi], file_bases.items[fi]);
         if (is_hidden(rel)) { free(rel); continue; }
@@ -676,7 +681,7 @@ int main(int argc, char *argv[]) {
         e->compressed = (uint8_t *)malloc(bound);
         if (!e->compressed) { fprintf(stderr, "[jce_pak] out of memory\n"); return 1; }
 
-        size_t comp_sz = ZSTD_compress(e->compressed, bound, raw, raw_size, 3);
+        size_t comp_sz = ZSTD_compressCCtx(cctx, e->compressed, bound, raw, raw_size, 3);
         free(raw);
 
         if (ZSTD_isError(comp_sz)) {
@@ -687,6 +692,8 @@ int main(int argc, char *argv[]) {
         e->compressed_size = comp_sz;
         num_entries++;
     }
+
+    ZSTD_freeCCtx(cctx);
 
     sl_free(&files);
     sl_free(&file_bases);

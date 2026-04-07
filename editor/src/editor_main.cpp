@@ -16,6 +16,7 @@ extern "C" {
 }
 #include "jce_editor.h"
 #include "jce_editor_panels.h"
+#include "jce_editor_scene_render.h"
 
 /* ── Editor state ──────────────────────────────────────────────────── */
 
@@ -32,12 +33,14 @@ static bool editor_app_init(const JceServices *svc, void *ud)
 {
     EditorState *st = (EditorState *)ud;
     st->svc = svc;
+    jce_editor_scene_render_init(svc->renderer);
     return jce_editor_init(svc->pak, svc->window);
 }
 
 static void editor_app_exit(void *ud)
 {
     (void)ud;
+    jce_editor_scene_render_shutdown();
     jce_editor_shutdown();
 }
 
@@ -49,6 +52,11 @@ static void editor_app_update(float dt, void *ud)
 static void editor_app_draw(const JceServices *svc, void *ud)
 {
     (void)ud;
+
+    /* Scene rendering is now triggered from inside the ImGui scene panel
+     * (jce_editor_scene_render_frame) so it renders to the FBO with
+     * the correct panel size. The ImGui panel then displays the texture. */
+
     jce_editor_update(svc->window);
 }
 
@@ -65,7 +73,10 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
     (void)appstate;
 
     JceAppDesc desc = {};
-    desc.name      = "JCE Editor";
+    desc.name          = "JCE Editor";
+    desc.maximized     = true;
+    desc.window_width  = 1600;
+    desc.window_height = 900;
     desc.init      = editor_app_init;
     desc.exit      = editor_app_exit;
     desc.update    = editor_app_update;

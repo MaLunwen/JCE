@@ -8,7 +8,6 @@
 #include <jce/core/jce_log.h>
 
 #include <bgfx/c99/bgfx.h>
-#include <SDL3/SDL.h>
 
 #define LOG_TAG "jce_pbr_material"
 
@@ -17,9 +16,9 @@
 /* ================================================================== */
 
 static bgfx_uniform_handle_t s_u_base_color;
-static bgfx_uniform_handle_t s_u_pbr_params;    /* metallic, roughness, normalScale, aoStrength */
-static bgfx_uniform_handle_t s_u_emissive;       /* emissive RGB + alpha cutoff */
-static bgfx_uniform_handle_t s_u_alpha_params;   /* alphaMode, alphaCutoff, doubleSided, 0 */
+static bgfx_uniform_handle_t s_u_pbr_params;    /* metallic, roughness, aoStrength, alphaCutoff */
+static bgfx_uniform_handle_t s_u_emissive;       /* emissive RGB + alphaMode */
+static bgfx_uniform_handle_t s_u_normal_scale;   /* x=normalScale, y=doubleSided */
 
 static bgfx_uniform_handle_t s_albedo;
 static bgfx_uniform_handle_t s_metal_rough;
@@ -36,10 +35,10 @@ static void ensure_uniforms(void)
 {
     if (s_uniforms_init) return;
 
-    s_u_base_color   = bgfx_create_uniform("u_baseColorFactor", BGFX_UNIFORM_TYPE_VEC4, 1);
-    s_u_pbr_params   = bgfx_create_uniform("u_pbrParams",       BGFX_UNIFORM_TYPE_VEC4, 1);
-    s_u_emissive     = bgfx_create_uniform("u_emissiveFactor",  BGFX_UNIFORM_TYPE_VEC4, 1);
-    s_u_alpha_params = bgfx_create_uniform("u_alphaParams",     BGFX_UNIFORM_TYPE_VEC4, 1);
+    s_u_base_color    = bgfx_create_uniform("u_baseColorFactor", BGFX_UNIFORM_TYPE_VEC4, 1);
+    s_u_pbr_params    = bgfx_create_uniform("u_pbrParams",       BGFX_UNIFORM_TYPE_VEC4, 1);
+    s_u_emissive      = bgfx_create_uniform("u_emissiveFactor",  BGFX_UNIFORM_TYPE_VEC4, 1);
+    s_u_normal_scale  = bgfx_create_uniform("u_normalScale",     BGFX_UNIFORM_TYPE_VEC4, 1);
 
     s_albedo      = bgfx_create_uniform("s_albedo",     BGFX_UNIFORM_TYPE_SAMPLER, 1);
     s_metal_rough = bgfx_create_uniform("s_metalRough", BGFX_UNIFORM_TYPE_SAMPLER, 1);
@@ -108,29 +107,33 @@ void jce_pbr_material_bind(const JcePbrMaterial *mat,
     /* Set uniform vec4s. */
     bgfx_set_uniform(s_u_base_color, mat->base_color_factor, 1);
 
+    /* u_pbrParams: x=metallic, y=roughness, z=aoStrength, w=alphaCutoff
+       (matches fs_pbr.sc uniform declaration) */
     float pbr_params[4] = {
         mat->metallic_factor,
         mat->roughness_factor,
-        mat->normal_scale,
-        mat->ao_strength
+        mat->ao_strength,
+        mat->alpha_cutoff
     };
     bgfx_set_uniform(s_u_pbr_params, pbr_params, 1);
 
+    /* u_emissiveFactor: xyz=emissive, w=alphaMode (0=opaque,1=mask,2=blend) */
     float emissive[4] = {
         mat->emissive_factor[0],
         mat->emissive_factor[1],
         mat->emissive_factor[2],
-        0.0f
+        (float)mat->alpha_mode
     };
     bgfx_set_uniform(s_u_emissive, emissive, 1);
 
-    float alpha_params[4] = {
-        (float)mat->alpha_mode,
-        mat->alpha_cutoff,
+    /* u_normalScale: x=normalScale, y=doubleSided flag */
+    float normal_scale[4] = {
+        mat->normal_scale,
         mat->double_sided ? 1.0f : 0.0f,
+        0.0f,
         0.0f
     };
-    bgfx_set_uniform(s_u_alpha_params, alpha_params, 1);
+    bgfx_set_uniform(s_u_normal_scale, normal_scale, 1);
 
     /* Bind textures to sampler stages, using fallbacks for missing maps. */
     bgfx_texture_handle_t albedo_h = jce_texture_valid(mat->albedo_map)

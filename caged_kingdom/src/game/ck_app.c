@@ -6,6 +6,8 @@
  */
 
 #include "ck_app.h"
+#include <jce/core/jce_profiler.h>
+#include <jce/core/jce_log.h>
 
 #include <jce/platform/jce_window.h>
 #include <jce/platform/jce_input.h>
@@ -18,16 +20,21 @@
 #include <jce/graphics/jce_camera.h>
 #include <jce/graphics/jce_mesh.h>
 #include <jce/graphics/jce_material.h>
+#include <jce/graphics/jce_model.h>
+#include <jce/graphics/jce_animation.h>
 #include <jce/graphics/jce_lighting.h>
+#include <jce/graphics/jce_lighting_system.h>
 #include <jce/graphics/jce_views.h>
 #include <jce/graphics/jce_gfx_types.h>
 #include <jce/resource/pak_loader.h>
+#include <jce/resource/jce_asset.h>
 #include <jce/app/jce_config.h>
 #include <jce/app/jce_camera_controller.h>
 #include <jce/core/jce_sysinfo.h>
 #include <jce/core/jce_timer.h>
 #include <jce/core/jce_math.h>
 #include <jce/core/jce_i18n.h>
+#include <string.h>
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -55,11 +62,24 @@ struct CkApp {
     JceMesh      *cube;
     JceMesh      *chalet;
     JceMesh      *ground;
+    JceModel     *model_bagman;
+    JceAnimPlayer *anim_player;
+    jce_mat4      anim_bones[256];
+    uint32_t      anim_num_joints;
+    int           anim_clip_index;  /* index of currently playing clip */
     JceTexture    tex_cube;
     JceTexture    tex_ground;
     JceDirLight   sun;
+    JceLightEnv  *light_env;
     float         cam_yaw;
     float         cube_angle;
+
+    /* Asset handles for manager-loaded resources. */
+    JceAssetHandle h_tex_demo;
+    JceAssetHandle h_tex_cube;
+    JceAssetHandle h_tex_ground;
+    JceAssetHandle h_cube;
+    JceAssetHandle h_chalet;
 
     bool          quit_requested;
     bool          paused;
@@ -101,10 +121,30 @@ CkApp *ck_app_create(const JceServices *svc)
         }
     }
 
-    /* Load textures. */
-    app->tex_demo = jce_texture_load(app->svc.pak, "textures/texture.jpg");
-    app->tex_cube = jce_texture_load(app->svc.pak, "textures/chalet.jpg");
-    app->tex_ground = jce_texture_load_ex(app->svc.pak, "textures/texture.jpg", JCE_TEX_WRAP);
+    /* Load textures via asset manager. */
+    if (app->svc.assets) {
+        app->h_tex_demo = jce_asset_load(app->svc.assets,
+                              "textures/texture.jpg", JCE_ASSET_TEXTURE);
+        app->tex_demo = jce_asset_get_texture(app->svc.assets, app->h_tex_demo);
+
+        app->h_tex_cube = jce_asset_load(app->svc.assets,
+                              "textures/chalet.jpg", JCE_ASSET_TEXTURE);
+        app->tex_cube = jce_asset_get_texture(app->svc.assets, app->h_tex_cube);
+
+        JceAssetLoadParams wrap_params = JCE_ASSET_LOAD_DEFAULT;
+        wrap_params.texture_sampler_mode = JCE_TEX_WRAP;
+        wrap_params.sync = true;
+        app->h_tex_ground = jce_asset_acquire(app->svc.assets,
+                                "textures/texture.jpg", JCE_ASSET_TEXTURE,
+                                &wrap_params);
+        app->tex_ground = jce_asset_get_texture(app->svc.assets, app->h_tex_ground);
+    } else {
+        /* Fallback: direct loading if no asset manager. */
+        app->tex_demo = jce_texture_load(app->svc.pak, "textures/texture.jpg");
+        app->tex_cube = jce_texture_load(app->svc.pak, "textures/chalet.jpg");
+        app->tex_ground = jce_texture_load_ex(app->svc.pak,
+                              "textures/texture.jpg", JCE_TEX_WRAP);
+    }
 
     /* Load demo font (32pt, must run on main thread). */
     app->font_main = jce_font_open(app->svc.pak, "fonts/Caveat.ttf", 32.0f);
@@ -130,12 +170,78 @@ CkApp *ck_app_create(const JceServices *svc)
         app->camera = jce_camera_create(&cam_desc);
     }
     app->cam_ctrl = jce_camctrl_create(app->camera, NULL);
-    app->cube = jce_mesh_load(app->svc.pak, "models/chalet.obj");
-    if (!app->cube)
-        app->cube = jce_mesh_create_cube(1.0f);
-    app->chalet = jce_mesh_load(app->svc.pak, "models/sachiel_fab_v2.obj");
+
+    // /* Load meshes via asset manager, with direct-API fallback. */
+    // if (app->svc.assets) {
+    //     app->h_cube = jce_asset_load(app->svc.assets,
+    //                       "models/chalet.obj", JCE_ASSET_MESH);
+    //     app->cube = jce_asset_get_mesh(app->svc.assets, app->h_cube);
+    //     if (!app->cube)
+    //         app->cube = jce_mesh_create_cube(1.0f);
+
+    //     // app->h_chalet = jce_asset_load(app->svc.assets,
+    //     //                     "models/sachiel_fab_v2.obj", JCE_ASSET_MESH);
+    //     app->chalet = jce_asset_get_mesh(app->svc.assets, app->h_chalet);
+    // } else {
+    //     app->cube = jce_mesh_load(app->svc.pak, "models/chalet.obj");
+    //     if (!app->cube)
+    //         app->cube = jce_mesh_create_cube(1.0f);
+    //     app->chalet = jce_mesh_load(app->svc.pak, "models/sachiel_fab_v2.obj");
+    // }
     app->ground = jce_mesh_create_plane_ex(10.0f, 10.0f, 10, 5.0f);
     app->sun = jce_dir_light_default();
+
+    /* PBR light environment (matches sun direction). */
+    app->light_env = jce_light_env_create();
+    jce_light_env_set_ambient(app->light_env, jce_v3(1.0f, 1.0f, 1.0f), 0.15f);
+    {
+        JceDirLightDesc dl = {0};
+        dl.direction = app->sun.direction;
+        dl.color     = app->sun.color;
+        dl.intensity = 3.14159f;  /* compensate for Lambertian /PI in Cook-Torrance BRDF */
+        jce_light_env_add_dir_light(app->light_env, &dl);
+    }
+
+    /* Load PSX BagMan GLB model + start animation. */
+    app->model_bagman = jce_model_load_gltf(app->svc.pak,
+        "models/PSX_BagMan.glb");
+    if (app->model_bagman) {
+        JceSkeleton *skel = jce_model_get_skeleton(app->model_bagman);
+        if (skel) {
+            app->anim_player = jce_anim_player_create(skel);
+            if (app->anim_player && jce_model_anim_count(app->model_bagman) > 0) {
+                /* Prefer "Walk_loop" or "Idle_loop" for clearly visible
+                   bone deformation; fall back to first non-zero-duration clip. */
+                uint32_t num_clips = jce_model_anim_count(app->model_bagman);
+                app->anim_clip_index = -1;
+                /* Pass 1: look for Walk_loop or Idle_loop by name. */
+                for (uint32_t ci = 0; ci < num_clips; ci++) {
+                    JceAnimClip *c = jce_model_get_anim(app->model_bagman, ci);
+                    const char *name = jce_anim_clip_name(c);
+                    if (name && (strstr(name, "Walk") || strstr(name, "Idle"))) {
+                        if (jce_anim_clip_duration(c) > 0.0f) {
+                            app->anim_clip_index = (int)ci;
+                            break;
+                        }
+                    }
+                }
+                /* Pass 2: fallback to first non-zero-duration. */
+                if (app->anim_clip_index < 0) {
+                    app->anim_clip_index = 0;
+                    for (uint32_t ci = 0; ci < num_clips; ci++) {
+                        JceAnimClip *c = jce_model_get_anim(app->model_bagman, ci);
+                        if (jce_anim_clip_duration(c) > 0.0f) {
+                            app->anim_clip_index = (int)ci;
+                            break;
+                        }
+                    }
+                }
+                JceAnimClip *clip = jce_model_get_anim(
+                    app->model_bagman, (uint32_t)app->anim_clip_index);
+                jce_anim_player_play(app->anim_player, clip, true, 1.0f);
+            }
+        }
+    }
 
     /* Set window icon from PAK. */
     {
@@ -192,14 +298,35 @@ void ck_app_destroy(CkApp *app)
     jce_timer_destroy(app->timer);
     jce_camctrl_destroy(app->cam_ctrl);
     jce_camera_destroy(app->camera);
-    jce_mesh_destroy(app->cube);
-    jce_mesh_destroy(app->chalet);
+
+    /* Release assets through the manager if available. */
+    if (app->svc.assets) {
+        /* Release manager-owned assets by handle. */
+        jce_asset_release(app->svc.assets, app->h_tex_demo);
+        jce_asset_release(app->svc.assets, app->h_tex_cube);
+        jce_asset_release(app->svc.assets, app->h_tex_ground);
+
+        /* Meshes: if asset load failed and we created a fallback, destroy it.
+           Otherwise the asset manager owns the mesh data. */
+        if (jce_asset_get_mesh(app->svc.assets, app->h_cube) == NULL)
+            jce_mesh_destroy(app->cube);
+        jce_asset_release(app->svc.assets, app->h_cube);
+
+        jce_asset_release(app->svc.assets, app->h_chalet);
+    } else {
+        jce_mesh_destroy(app->cube);
+        jce_mesh_destroy(app->chalet);
+        jce_texture_destroy(app->tex_cube);
+        jce_texture_destroy(app->tex_ground);
+        jce_texture_destroy(app->tex_demo);
+    }
+    /* Ground is always procedural, not from asset manager. */
+    jce_anim_player_destroy(app->anim_player);
+    jce_model_destroy(app->model_bagman);
+    jce_light_env_destroy(app->light_env);
     jce_mesh_destroy(app->ground);
-    jce_texture_destroy(app->tex_cube);
-    jce_texture_destroy(app->tex_ground);
     jce_font_close(app->font_i18n);
     jce_font_close(app->font_main);
-    jce_texture_destroy(app->tex_demo);
     SDL_free(app);
 }
 
@@ -505,7 +632,7 @@ static void draw_mesh_lit(CkApp *app, const JceMesh *mesh,
 {
     jce_lighting_apply(app->svc.renderer, &app->sun);
     jce_renderer_bind_texture(app->svc.renderer, 0, tex);
-    jce_renderer_set_transform(model->m);
+    jce_renderer_set_transform(model->raw[0]);
     jce_mesh_submit(mesh, app->svc.renderer,
                     JCE_VIEW_MAIN_3D);
 }
@@ -582,23 +709,6 @@ static void draw_3d_scene(CkApp *app, float dt_ms)
     if (!jce_shader_valid(mesh_sh))
         return;
 
-    /* Rotating cube at Y=0.5. */
-    {
-        jce_mat4 rot = jce_q_to_mat4(jce_q_from_axis_angle(
-            jce_v3(0, 1, 0), app->cube_angle));
-        jce_mat4 trans = jce_m4_translate(
-            jce_v3(0, 0.5f, 0));
-        jce_mat4 model = jce_m4_multiply(&trans, &rot);
-        draw_mesh_lit(app, app->cube, app->tex_cube, &model);
-    }
-
-    /* Chalet offset to the right. */
-    if (app->chalet) {
-        jce_mat4 model = jce_m4_translate(
-            jce_v3(3.0f, 0.5f, 0.0f));
-        draw_mesh_lit(app, app->chalet, app->tex_cube, &model);
-    }
-
     /* Ground plane at Y=0. */
     {
         JceTexture gt = jce_texture_valid(app->tex_ground)
@@ -606,99 +716,48 @@ static void draw_3d_scene(CkApp *app, float dt_ms)
         jce_mat4 model = jce_m4_identity();
         draw_mesh_lit(app, app->ground, gt, &model);
     }
+
+    /* PSX BagMan character (PBR). */
+    if (app->model_bagman) {
+        /* Advance animation; cycle to the next clip when the current one ends. */
+        if (app->anim_player) {
+            uint32_t num_clips = jce_model_anim_count(app->model_bagman);
+            if (num_clips > 0 && !jce_anim_player_is_playing(app->anim_player)) {
+                /* Advance to next clip, skipping zero-duration rest-pose clips. */
+                for (uint32_t tries = 0; tries < num_clips; tries++) {
+                    app->anim_clip_index =
+                        (app->anim_clip_index + 1) % (int)num_clips;
+                    JceAnimClip *next = jce_model_get_anim(
+                        app->model_bagman, (uint32_t)app->anim_clip_index);
+                    if (jce_anim_clip_duration(next) > 0.0f) {
+                        jce_anim_player_play(app->anim_player, next, true, 1.0f);
+                        break;
+                    }
+                }
+            }
+            app->anim_num_joints = jce_anim_player_update(
+                app->anim_player, dt_sec, app->anim_bones, 256);
+        }
+
+        /* Set PBR light uniforms (camera pos for specular). */
+        jce_light_env_set_camera_pos(app->light_env,
+            jce_camera_get_position(app->camera));
+        jce_light_env_apply(app->light_env, app->svc.renderer);
+
+        jce_mat4 model_t = jce_m4_translate(jce_v3(0.0f, 0.0f, -2.0f));
+
+        jce_model_draw(app->model_bagman, app->svc.renderer,
+                       JCE_VIEW_MAIN_3D, &model_t,
+                       app->anim_num_joints > 0 ? app->anim_bones : NULL,
+                       app->anim_num_joints);
+    }
 }
 
 /* -- 2D overlay ---------------------------------------------------- */
 
 static void draw_2d_overlay(CkApp *app)
 {
-    int logical_w, logical_h;
-    jce_window_get_logical(app->svc.window, &logical_w, &logical_h);
-
-    uint64_t anim_ms =
-        (uint64_t)(jce_timer_elapsed(app->timer) * 1000.0);
-    const float direction =
-        ((anim_ms % 2000) >= 1000) ? 1.0f : -1.0f;
-    const float scale =
-        ((float)((int)(anim_ms % 1000) - 500) / 500.0f)
-        * direction;
-
-    const uint32_t red   = jce_rgba(255,   0,   0, 255);
-    const uint32_t green = jce_rgba(  0, 255,   0, 255);
-    const uint32_t blue  = jce_rgba(  0,   0, 255, 255);
-    const uint32_t white = jce_rgba(255, 255, 255, 255);
-
-    /* 1) Red outlined rectangle. */
-    {
-        float s = 100.0f + 100.0f * scale;
-        jce_draw_rect_outline(app->svc.renderer,
-                              100, 100, s, s, red);
-    }
-
-    /* 2) Three green outlined rectangles (centered). */
-    {
-        float rects[3 * 4];
-        for (int i = 0; i < 3; i++) {
-            float s = (float)(i + 1) * 50.0f;
-            float sz = s + s * scale;
-            rects[i*4+0] = ((float)logical_w - sz) / 2.0f;
-            rects[i*4+1] = ((float)logical_h - sz) / 2.0f;
-            rects[i*4+2] = sz;
-            rects[i*4+3] = sz;
-        }
-        jce_draw_rect_outlines(app->svc.renderer,
-                               rects, 3, green);
-    }
-
-    /* 3) Blue filled rectangle. */
-    {
-        float w = 100.0f + 100.0f * scale;
-        float h =  50.0f +  50.0f * scale;
-        jce_draw_filled_rect(app->svc.renderer,
-                             400, 50, w, h, blue);
-    }
-
-    /* 4) 16 white bars along the bottom. */
-    {
-        float rects[16 * 4];
-        const float bar_w = (float)logical_w / 16.0f;
-        for (int i = 0; i < 16; i++) {
-            float h = (float)(i + 1) * 8.0f;
-            rects[i*4+0] = (float)i * bar_w;
-            rects[i*4+1] = (float)logical_h - h;
-            rects[i*4+2] = bar_w;
-            rects[i*4+3] = h;
-        }
-        jce_draw_filled_rects(app->svc.renderer,
-                              rects, 16, white);
-    }
-
-    /* 5) Textured rectangle. */
-    if (jce_texture_valid(app->tex_demo)) {
-        uint32_t tw, th;
-        jce_texture_get_size(app->tex_demo, &tw, &th);
-        float draw_w = (float)tw * 0.5f;
-        float draw_h = (float)th * 0.5f;
-        float tx = (float)logical_w - draw_w - 20.0f;
-        float ty = 20.0f;
-        jce_draw_textured_rect(app->svc.renderer,
-            tx, ty, draw_w, draw_h, app->tex_demo,
-            jce_rgba(255, 255, 255, 255), NULL);
-    }
-
-    /* 6) Text rendering demo (i18n). */
-    {
-        JceFont *f = active_font(app);
-        if (f) {
-            const uint32_t yellow =
-                jce_rgba(255, 220, 50, 255);
-            jce_text_draw(app->svc.renderer, f,
-                20.0f, (float)logical_h - 60.0f,
-                jce_i18n_get(JCE_STR_TEXT_DEMO), yellow);
-        }
-    }
-
-    /* 7) Touch HUD overlay. */
+    /* Touch HUD overlay (on mobile / F9-toggled). */
     jce_touch_hud_draw(app->touch_hud);
 }
 
@@ -706,7 +765,8 @@ static void draw_2d_overlay(CkApp *app)
 
 void ck_app_update(CkApp *app)
 {
-    if (!app) return;
+    JCE_PROFILE_ZONE_N("CkApp::Update");
+    if (!app) { JCE_PROFILE_ZONE_END; return; }
 
     jce_timer_tick(app->timer);
     float dt_ms = jce_timer_dt_ms(app->timer);
@@ -725,6 +785,7 @@ void ck_app_update(CkApp *app)
 
     draw_3d_scene(app, dt_ms);
     draw_2d_overlay(app);
+    JCE_PROFILE_ZONE_END;
 }
 
 void ck_app_event(CkApp *app, const SDL_Event *event)

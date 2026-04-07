@@ -55,18 +55,14 @@ static void apply_dark_theme(void)
     c[ImGuiCol_ChildBg]               = ImVec4(0.13f, 0.14f, 0.15f, 1.00f);
     c[ImGuiCol_PopupBg]               = ImVec4(0.13f, 0.14f, 0.15f, 1.00f);
     c[ImGuiCol_Border]                = ImVec4(0.43f, 0.43f, 0.50f, 0.50f);
-    c[ImGuiCol_BorderShadow]          = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
     c[ImGuiCol_FrameBg]               = ImVec4(0.25f, 0.25f, 0.25f, 1.00f);
     c[ImGuiCol_FrameBgHovered]        = ImVec4(0.38f, 0.38f, 0.38f, 1.00f);
     c[ImGuiCol_FrameBgActive]         = ImVec4(0.67f, 0.67f, 0.67f, 0.39f);
     c[ImGuiCol_TitleBg]               = ImVec4(0.08f, 0.08f, 0.09f, 1.00f);
     c[ImGuiCol_TitleBgActive]         = ImVec4(0.08f, 0.08f, 0.09f, 1.00f);
-    c[ImGuiCol_TitleBgCollapsed]      = ImVec4(0.08f, 0.08f, 0.09f, 1.00f);
     c[ImGuiCol_MenuBarBg]             = ImVec4(0.14f, 0.14f, 0.14f, 1.00f);
     c[ImGuiCol_ScrollbarBg]           = ImVec4(0.02f, 0.02f, 0.02f, 0.53f);
     c[ImGuiCol_ScrollbarGrab]         = ImVec4(0.31f, 0.31f, 0.31f, 1.00f);
-    c[ImGuiCol_ScrollbarGrabHovered]  = ImVec4(0.41f, 0.41f, 0.41f, 1.00f);
-    c[ImGuiCol_ScrollbarGrabActive]   = ImVec4(0.51f, 0.51f, 0.51f, 1.00f);
     c[ImGuiCol_CheckMark]             = ImVec4(0.26f, 0.59f, 0.98f, 1.00f);
     c[ImGuiCol_SliderGrab]            = ImVec4(0.24f, 0.52f, 0.88f, 1.00f);
     c[ImGuiCol_SliderGrabActive]      = ImVec4(0.26f, 0.59f, 0.98f, 1.00f);
@@ -82,20 +78,14 @@ static void apply_dark_theme(void)
     c[ImGuiCol_ResizeGrip]            = ImVec4(0.26f, 0.59f, 0.98f, 0.20f);
     c[ImGuiCol_ResizeGripHovered]     = ImVec4(0.26f, 0.59f, 0.98f, 0.67f);
     c[ImGuiCol_ResizeGripActive]      = ImVec4(0.26f, 0.59f, 0.98f, 0.95f);
-    c[ImGuiCol_Tab]                   = ImVec4(0.12f, 0.12f, 0.14f, 1.00f);
-    c[ImGuiCol_TabHovered]            = ImVec4(0.35f, 0.38f, 0.42f, 1.00f);
-    c[ImGuiCol_TabSelected]           = ImVec4(0.20f, 0.22f, 0.27f, 1.00f);
-    c[ImGuiCol_TabDimmed]             = ImVec4(0.10f, 0.10f, 0.12f, 1.00f);
-    c[ImGuiCol_TabDimmedSelected]     = ImVec4(0.16f, 0.17f, 0.20f, 1.00f);
-    c[ImGuiCol_TableHeaderBg]         = ImVec4(0.19f, 0.19f, 0.20f, 1.00f);
-    c[ImGuiCol_TableBorderStrong]     = ImVec4(0.31f, 0.31f, 0.35f, 1.00f);
-    c[ImGuiCol_TableBorderLight]      = ImVec4(0.23f, 0.23f, 0.25f, 1.00f);
-    c[ImGuiCol_TableRowBg]            = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-    c[ImGuiCol_TableRowBgAlt]         = ImVec4(1.00f, 1.00f, 1.00f, 0.03f);
+    c[ImGuiCol_Tab]                   = ImVec4(0.08f, 0.08f, 0.09f, 1.00f);
+    c[ImGuiCol_TabHovered]            = ImVec4(0.33f, 0.34f, 0.36f, 1.00f);
+    c[ImGuiCol_TabSelected]           = ImVec4(0.23f, 0.23f, 0.24f, 1.00f);
+    c[ImGuiCol_DockingPreview]        = ImVec4(0.26f, 0.59f, 0.98f, 0.70f);
     c[ImGuiCol_TextSelectedBg]        = ImVec4(0.26f, 0.59f, 0.98f, 0.35f);
     c[ImGuiCol_DragDropTarget]        = ImVec4(0.26f, 0.59f, 0.98f, 1.00f);
     c[ImGuiCol_NavHighlight]          = ImVec4(0.26f, 0.59f, 0.98f, 1.00f);
-
+    c[ImGuiCol_ModalWindowDimBg]      = ImVec4(0.00f, 0.00f, 0.00f, 0.55f);
 }
 
 /* ── Light theme ──────────────────────────────────────────────────── */
@@ -104,106 +94,105 @@ static void apply_light_theme(void)
 {
     ImVec4 *c = ImGui::GetStyle().Colors;
 
-    c[ImGuiCol_Text]                  = ImVec4(0.10f, 0.10f, 0.10f, 1.00f);
-    c[ImGuiCol_TextDisabled]          = ImVec4(0.45f, 0.45f, 0.45f, 1.00f);
+    c[ImGuiCol_Text]                  = ImVec4(0.00f, 0.00f, 0.00f, 1.00f);
+    c[ImGuiCol_TextDisabled]          = ImVec4(0.60f, 0.60f, 0.60f, 1.00f);
     c[ImGuiCol_WindowBg]              = ImVec4(0.94f, 0.94f, 0.94f, 1.00f);
     c[ImGuiCol_ChildBg]               = ImVec4(0.94f, 0.94f, 0.94f, 1.00f);
-    c[ImGuiCol_PopupBg]               = ImVec4(0.98f, 0.98f, 0.98f, 1.00f);
-    c[ImGuiCol_Border]                = ImVec4(0.70f, 0.70f, 0.70f, 0.65f);
-    c[ImGuiCol_BorderShadow]          = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-    c[ImGuiCol_FrameBg]               = ImVec4(0.86f, 0.86f, 0.86f, 1.00f);
-    c[ImGuiCol_FrameBgHovered]        = ImVec4(0.78f, 0.78f, 0.78f, 1.00f);
-    c[ImGuiCol_FrameBgActive]         = ImVec4(0.70f, 0.70f, 0.70f, 0.67f);
-    c[ImGuiCol_TitleBg]               = ImVec4(0.82f, 0.82f, 0.82f, 1.00f);
-    c[ImGuiCol_TitleBgActive]         = ImVec4(0.76f, 0.76f, 0.76f, 1.00f);
-    c[ImGuiCol_TitleBgCollapsed]      = ImVec4(0.90f, 0.90f, 0.90f, 1.00f);
-    c[ImGuiCol_MenuBarBg]             = ImVec4(0.88f, 0.88f, 0.88f, 1.00f);
+    c[ImGuiCol_PopupBg]               = ImVec4(1.00f, 1.00f, 1.00f, 1.00f);
+    c[ImGuiCol_Border]                = ImVec4(0.70f, 0.70f, 0.70f, 0.50f);
+    c[ImGuiCol_FrameBg]               = ImVec4(1.00f, 1.00f, 1.00f, 1.00f);
+    c[ImGuiCol_FrameBgHovered]        = ImVec4(0.26f, 0.59f, 0.98f, 0.40f);
+    c[ImGuiCol_FrameBgActive]         = ImVec4(0.26f, 0.59f, 0.98f, 0.67f);
+    c[ImGuiCol_TitleBg]               = ImVec4(0.80f, 0.80f, 0.80f, 1.00f);
+    c[ImGuiCol_TitleBgActive]         = ImVec4(0.85f, 0.85f, 0.85f, 1.00f);
+    c[ImGuiCol_MenuBarBg]             = ImVec4(0.90f, 0.90f, 0.90f, 1.00f);
     c[ImGuiCol_ScrollbarBg]           = ImVec4(0.90f, 0.90f, 0.90f, 0.53f);
     c[ImGuiCol_ScrollbarGrab]         = ImVec4(0.70f, 0.70f, 0.70f, 1.00f);
-    c[ImGuiCol_ScrollbarGrabHovered]  = ImVec4(0.60f, 0.60f, 0.60f, 1.00f);
-    c[ImGuiCol_ScrollbarGrabActive]   = ImVec4(0.50f, 0.50f, 0.50f, 1.00f);
-    c[ImGuiCol_CheckMark]             = ImVec4(0.16f, 0.47f, 0.87f, 1.00f);
-    c[ImGuiCol_SliderGrab]            = ImVec4(0.20f, 0.50f, 0.85f, 1.00f);
-    c[ImGuiCol_SliderGrabActive]      = ImVec4(0.16f, 0.47f, 0.87f, 1.00f);
-    c[ImGuiCol_Button]                = ImVec4(0.82f, 0.82f, 0.82f, 1.00f);
-    c[ImGuiCol_ButtonHovered]         = ImVec4(0.72f, 0.72f, 0.72f, 1.00f);
-    c[ImGuiCol_ButtonActive]          = ImVec4(0.60f, 0.60f, 0.60f, 1.00f);
-    c[ImGuiCol_Header]                = ImVec4(0.78f, 0.78f, 0.78f, 1.00f);
-    c[ImGuiCol_HeaderHovered]         = ImVec4(0.72f, 0.72f, 0.72f, 1.00f);
-    c[ImGuiCol_HeaderActive]          = ImVec4(0.65f, 0.65f, 0.65f, 1.00f);
+    c[ImGuiCol_CheckMark]             = ImVec4(0.26f, 0.59f, 0.98f, 1.00f);
+    c[ImGuiCol_SliderGrab]            = ImVec4(0.26f, 0.59f, 0.98f, 0.78f);
+    c[ImGuiCol_SliderGrabActive]      = ImVec4(0.46f, 0.54f, 0.80f, 0.60f);
+    c[ImGuiCol_Button]                = ImVec4(0.85f, 0.85f, 0.85f, 1.00f);
+    c[ImGuiCol_ButtonHovered]         = ImVec4(0.26f, 0.59f, 0.98f, 1.00f);
+    c[ImGuiCol_ButtonActive]          = ImVec4(0.06f, 0.53f, 0.98f, 1.00f);
+    c[ImGuiCol_Header]                = ImVec4(0.26f, 0.59f, 0.98f, 0.31f);
+    c[ImGuiCol_HeaderHovered]         = ImVec4(0.26f, 0.59f, 0.98f, 0.80f);
+    c[ImGuiCol_HeaderActive]          = ImVec4(0.26f, 0.59f, 0.98f, 1.00f);
     c[ImGuiCol_Separator]             = ImVec4(0.70f, 0.70f, 0.70f, 0.50f);
-    c[ImGuiCol_SeparatorHovered]      = ImVec4(0.16f, 0.47f, 0.87f, 0.78f);
-    c[ImGuiCol_SeparatorActive]       = ImVec4(0.16f, 0.47f, 0.87f, 1.00f);
-    c[ImGuiCol_ResizeGrip]            = ImVec4(0.16f, 0.47f, 0.87f, 0.20f);
-    c[ImGuiCol_ResizeGripHovered]     = ImVec4(0.16f, 0.47f, 0.87f, 0.67f);
-    c[ImGuiCol_ResizeGripActive]      = ImVec4(0.16f, 0.47f, 0.87f, 0.95f);
-    c[ImGuiCol_Tab]                   = ImVec4(0.82f, 0.82f, 0.82f, 1.00f);
-    c[ImGuiCol_TabHovered]            = ImVec4(0.72f, 0.72f, 0.72f, 1.00f);
-    c[ImGuiCol_TabSelected]           = ImVec4(0.88f, 0.88f, 0.88f, 1.00f);
-    c[ImGuiCol_TabDimmed]             = ImVec4(0.85f, 0.85f, 0.85f, 1.00f);
-    c[ImGuiCol_TabDimmedSelected]     = ImVec4(0.90f, 0.90f, 0.90f, 1.00f);
-    c[ImGuiCol_TableHeaderBg]         = ImVec4(0.80f, 0.80f, 0.80f, 1.00f);
-    c[ImGuiCol_TableBorderStrong]     = ImVec4(0.65f, 0.65f, 0.70f, 1.00f);
-    c[ImGuiCol_TableBorderLight]      = ImVec4(0.75f, 0.75f, 0.78f, 1.00f);
-    c[ImGuiCol_TableRowBg]            = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-    c[ImGuiCol_TableRowBgAlt]         = ImVec4(0.00f, 0.00f, 0.00f, 0.03f);
-    c[ImGuiCol_TextSelectedBg]        = ImVec4(0.16f, 0.47f, 0.87f, 0.35f);
-    c[ImGuiCol_DragDropTarget]        = ImVec4(0.16f, 0.47f, 0.87f, 1.00f);
-    c[ImGuiCol_NavHighlight]          = ImVec4(0.16f, 0.47f, 0.87f, 1.00f);
+    c[ImGuiCol_SeparatorHovered]      = ImVec4(0.10f, 0.40f, 0.75f, 0.78f);
+    c[ImGuiCol_SeparatorActive]       = ImVec4(0.10f, 0.40f, 0.75f, 1.00f);
+    c[ImGuiCol_ResizeGrip]            = ImVec4(0.26f, 0.59f, 0.98f, 0.20f);
+    c[ImGuiCol_ResizeGripHovered]     = ImVec4(0.26f, 0.59f, 0.98f, 0.67f);
+    c[ImGuiCol_ResizeGripActive]      = ImVec4(0.26f, 0.59f, 0.98f, 0.95f);
+    c[ImGuiCol_Tab]                   = ImVec4(0.85f, 0.85f, 0.85f, 1.00f);
+    c[ImGuiCol_TabHovered]            = ImVec4(0.26f, 0.59f, 0.98f, 0.80f);
+    c[ImGuiCol_TabSelected]           = ImVec4(0.94f, 0.94f, 0.94f, 1.00f);
+    c[ImGuiCol_DockingPreview]        = ImVec4(0.26f, 0.59f, 0.98f, 0.70f);
+    c[ImGuiCol_TextSelectedBg]        = ImVec4(0.26f, 0.59f, 0.98f, 0.35f);
+    c[ImGuiCol_DragDropTarget]        = ImVec4(0.26f, 0.59f, 0.98f, 1.00f);
+    c[ImGuiCol_NavHighlight]          = ImVec4(0.26f, 0.59f, 0.98f, 1.00f);
+    c[ImGuiCol_ModalWindowDimBg]      = ImVec4(0.00f, 0.00f, 0.00f, 0.45f);
 }
 
-/* ── Blue theme ───────────────────────────────────────────────────── */
+/* ── SSMS theme (SQL Server Management Studio style) ──────────────── */
 
-static void apply_blue_theme(void)
+static void apply_ssms_theme(void)
 {
     ImVec4 *c = ImGui::GetStyle().Colors;
 
-    c[ImGuiCol_Text]                  = ImVec4(0.90f, 0.93f, 1.00f, 1.00f);
-    c[ImGuiCol_TextDisabled]          = ImVec4(0.45f, 0.50f, 0.58f, 1.00f);
-    c[ImGuiCol_WindowBg]              = ImVec4(0.11f, 0.13f, 0.18f, 1.00f);
-    c[ImGuiCol_ChildBg]               = ImVec4(0.11f, 0.13f, 0.18f, 1.00f);
-    c[ImGuiCol_PopupBg]               = ImVec4(0.12f, 0.14f, 0.20f, 1.00f);
-    c[ImGuiCol_Border]                = ImVec4(0.25f, 0.30f, 0.42f, 0.50f);
-    c[ImGuiCol_BorderShadow]          = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-    c[ImGuiCol_FrameBg]               = ImVec4(0.16f, 0.19f, 0.27f, 1.00f);
-    c[ImGuiCol_FrameBgHovered]        = ImVec4(0.22f, 0.26f, 0.36f, 1.00f);
-    c[ImGuiCol_FrameBgActive]         = ImVec4(0.30f, 0.35f, 0.48f, 0.67f);
-    c[ImGuiCol_TitleBg]               = ImVec4(0.08f, 0.10f, 0.14f, 1.00f);
-    c[ImGuiCol_TitleBgActive]         = ImVec4(0.10f, 0.12f, 0.18f, 1.00f);
-    c[ImGuiCol_TitleBgCollapsed]      = ImVec4(0.08f, 0.10f, 0.14f, 1.00f);
-    c[ImGuiCol_MenuBarBg]             = ImVec4(0.10f, 0.12f, 0.17f, 1.00f);
-    c[ImGuiCol_ScrollbarBg]           = ImVec4(0.05f, 0.06f, 0.09f, 0.53f);
-    c[ImGuiCol_ScrollbarGrab]         = ImVec4(0.22f, 0.26f, 0.36f, 1.00f);
-    c[ImGuiCol_ScrollbarGrabHovered]  = ImVec4(0.30f, 0.35f, 0.48f, 1.00f);
-    c[ImGuiCol_ScrollbarGrabActive]   = ImVec4(0.38f, 0.44f, 0.58f, 1.00f);
-    c[ImGuiCol_CheckMark]             = ImVec4(0.30f, 0.55f, 1.00f, 1.00f);
-    c[ImGuiCol_SliderGrab]            = ImVec4(0.28f, 0.50f, 0.92f, 1.00f);
-    c[ImGuiCol_SliderGrabActive]      = ImVec4(0.30f, 0.55f, 1.00f, 1.00f);
-    c[ImGuiCol_Button]                = ImVec4(0.18f, 0.22f, 0.32f, 1.00f);
-    c[ImGuiCol_ButtonHovered]         = ImVec4(0.25f, 0.30f, 0.42f, 1.00f);
-    c[ImGuiCol_ButtonActive]          = ImVec4(0.30f, 0.38f, 0.55f, 1.00f);
-    c[ImGuiCol_Header]                = ImVec4(0.16f, 0.19f, 0.27f, 1.00f);
-    c[ImGuiCol_HeaderHovered]         = ImVec4(0.22f, 0.26f, 0.36f, 1.00f);
-    c[ImGuiCol_HeaderActive]          = ImVec4(0.30f, 0.35f, 0.48f, 0.67f);
-    c[ImGuiCol_Separator]             = ImVec4(0.25f, 0.30f, 0.42f, 0.50f);
-    c[ImGuiCol_SeparatorHovered]      = ImVec4(0.20f, 0.40f, 0.80f, 0.78f);
-    c[ImGuiCol_SeparatorActive]       = ImVec4(0.20f, 0.40f, 0.80f, 1.00f);
-    c[ImGuiCol_ResizeGrip]            = ImVec4(0.30f, 0.55f, 1.00f, 0.20f);
-    c[ImGuiCol_ResizeGripHovered]     = ImVec4(0.30f, 0.55f, 1.00f, 0.67f);
-    c[ImGuiCol_ResizeGripActive]      = ImVec4(0.30f, 0.55f, 1.00f, 0.95f);
-    c[ImGuiCol_Tab]                   = ImVec4(0.10f, 0.12f, 0.17f, 1.00f);
-    c[ImGuiCol_TabHovered]            = ImVec4(0.22f, 0.28f, 0.42f, 1.00f);
-    c[ImGuiCol_TabSelected]           = ImVec4(0.16f, 0.20f, 0.30f, 1.00f);
-    c[ImGuiCol_TabDimmed]             = ImVec4(0.10f, 0.12f, 0.17f, 1.00f);
-    c[ImGuiCol_TabDimmedSelected]     = ImVec4(0.12f, 0.15f, 0.22f, 1.00f);
-    c[ImGuiCol_TableHeaderBg]         = ImVec4(0.14f, 0.17f, 0.24f, 1.00f);
-    c[ImGuiCol_TableBorderStrong]     = ImVec4(0.22f, 0.26f, 0.36f, 1.00f);
-    c[ImGuiCol_TableBorderLight]      = ImVec4(0.18f, 0.22f, 0.30f, 1.00f);
+    c[ImGuiCol_Text]                  = ImVec4(0.12f, 0.12f, 0.12f, 1.00f);
+    c[ImGuiCol_TextDisabled]          = ImVec4(0.55f, 0.55f, 0.55f, 1.00f);
+    c[ImGuiCol_WindowBg]              = ImVec4(0.937f, 0.957f, 0.976f, 1.00f);
+    c[ImGuiCol_ChildBg]               = ImVec4(0.969f, 0.976f, 0.996f, 1.00f);
+    c[ImGuiCol_PopupBg]               = ImVec4(0.969f, 0.976f, 0.996f, 1.00f);
+    c[ImGuiCol_Border]                = ImVec4(0.800f, 0.835f, 0.941f, 1.00f);
+    c[ImGuiCol_FrameBg]               = ImVec4(0.969f, 0.976f, 0.996f, 1.00f);
+    c[ImGuiCol_FrameBgHovered]        = ImVec4(0.800f, 0.835f, 0.941f, 1.00f);
+    c[ImGuiCol_FrameBgActive]         = ImVec4(0.800f, 0.835f, 0.941f, 1.00f);
+    c[ImGuiCol_TitleBg]               = ImVec4(0.251f, 0.314f, 0.553f, 1.00f);
+    c[ImGuiCol_TitleBgActive]         = ImVec4(0.251f, 0.314f, 0.553f, 1.00f);
+    c[ImGuiCol_TitleBgCollapsed]      = ImVec4(0.251f, 0.314f, 0.553f, 0.60f);
+    c[ImGuiCol_MenuBarBg]             = ImVec4(0.937f, 0.957f, 0.976f, 1.00f);
+    c[ImGuiCol_ScrollbarBg]           = ImVec4(0.937f, 0.957f, 0.976f, 1.00f);
+    c[ImGuiCol_ScrollbarGrab]         = ImVec4(0.800f, 0.835f, 0.941f, 1.00f);
+    c[ImGuiCol_ScrollbarGrabHovered]  = ImVec4(0.365f, 0.420f, 0.600f, 1.00f);
+    c[ImGuiCol_ScrollbarGrabActive]   = ImVec4(0.251f, 0.314f, 0.553f, 1.00f);
+    c[ImGuiCol_CheckMark]             = ImVec4(0.251f, 0.314f, 0.553f, 1.00f);
+    c[ImGuiCol_SliderGrab]            = ImVec4(0.365f, 0.420f, 0.600f, 1.00f);
+    c[ImGuiCol_SliderGrabActive]      = ImVec4(0.251f, 0.314f, 0.553f, 1.00f);
+    c[ImGuiCol_Button]                = ImVec4(0.937f, 0.957f, 0.976f, 1.00f);
+    c[ImGuiCol_ButtonHovered]         = ImVec4(0.365f, 0.420f, 0.600f, 1.00f);
+    c[ImGuiCol_ButtonActive]          = ImVec4(0.251f, 0.314f, 0.553f, 1.00f);
+    c[ImGuiCol_Header]                = ImVec4(0.800f, 0.835f, 0.941f, 1.00f);
+    c[ImGuiCol_HeaderHovered]         = ImVec4(0.365f, 0.420f, 0.600f, 0.80f);
+    c[ImGuiCol_HeaderActive]          = ImVec4(0.365f, 0.420f, 0.600f, 1.00f);
+    c[ImGuiCol_Separator]             = ImVec4(0.800f, 0.835f, 0.941f, 1.00f);
+    c[ImGuiCol_SeparatorHovered]      = ImVec4(0.365f, 0.420f, 0.600f, 0.78f);
+    c[ImGuiCol_SeparatorActive]       = ImVec4(0.251f, 0.314f, 0.553f, 1.00f);
+    c[ImGuiCol_ResizeGrip]            = ImVec4(0.800f, 0.835f, 0.941f, 0.20f);
+    c[ImGuiCol_ResizeGripHovered]     = ImVec4(0.365f, 0.420f, 0.600f, 0.67f);
+    c[ImGuiCol_ResizeGripActive]      = ImVec4(0.251f, 0.314f, 0.553f, 0.95f);
+    c[ImGuiCol_Tab]                   = ImVec4(0.800f, 0.835f, 0.941f, 1.00f);
+    c[ImGuiCol_TabHovered]            = ImVec4(0.365f, 0.420f, 0.600f, 0.80f);
+    c[ImGuiCol_TabSelected]           = ImVec4(0.969f, 0.976f, 0.996f, 1.00f);
+    c[ImGuiCol_TabDimmed]             = ImVec4(0.800f, 0.835f, 0.941f, 1.00f);
+    c[ImGuiCol_TabDimmedSelected]     = ImVec4(0.937f, 0.957f, 0.976f, 1.00f);
+    c[ImGuiCol_DockingPreview]        = ImVec4(0.365f, 0.420f, 0.600f, 0.70f);
+    c[ImGuiCol_DockingEmptyBg]        = ImVec4(0.937f, 0.957f, 0.976f, 1.00f);
+    c[ImGuiCol_PlotLines]             = ImVec4(0.39f, 0.39f, 0.39f, 1.00f);
+    c[ImGuiCol_PlotLinesHovered]      = ImVec4(1.00f, 0.43f, 0.35f, 1.00f);
+    c[ImGuiCol_PlotHistogram]         = ImVec4(0.251f, 0.314f, 0.553f, 1.00f);
+    c[ImGuiCol_PlotHistogramHovered]  = ImVec4(0.365f, 0.420f, 0.600f, 1.00f);
+    c[ImGuiCol_TableHeaderBg]         = ImVec4(0.800f, 0.835f, 0.941f, 1.00f);
+    c[ImGuiCol_TableBorderStrong]     = ImVec4(0.800f, 0.835f, 0.941f, 1.00f);
+    c[ImGuiCol_TableBorderLight]      = ImVec4(0.800f, 0.835f, 0.941f, 0.60f);
     c[ImGuiCol_TableRowBg]            = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
-    c[ImGuiCol_TableRowBgAlt]         = ImVec4(0.90f, 0.93f, 1.00f, 0.03f);
-    c[ImGuiCol_TextSelectedBg]        = ImVec4(0.30f, 0.55f, 1.00f, 0.35f);
-    c[ImGuiCol_DragDropTarget]        = ImVec4(0.30f, 0.55f, 1.00f, 1.00f);
-    c[ImGuiCol_NavHighlight]          = ImVec4(0.30f, 0.55f, 1.00f, 1.00f);
+    c[ImGuiCol_TableRowBgAlt]         = ImVec4(0.937f, 0.957f, 0.976f, 1.00f);
+    c[ImGuiCol_TextSelectedBg]        = ImVec4(0.365f, 0.420f, 0.600f, 0.35f);
+    c[ImGuiCol_DragDropTarget]        = ImVec4(0.251f, 0.314f, 0.553f, 0.90f);
+    c[ImGuiCol_NavHighlight]          = ImVec4(0.251f, 0.314f, 0.553f, 1.00f);
+    c[ImGuiCol_NavWindowingHighlight] = ImVec4(1.00f, 1.00f, 1.00f, 0.70f);
+    c[ImGuiCol_NavWindowingDimBg]     = ImVec4(0.80f, 0.80f, 0.80f, 0.20f);
+    c[ImGuiCol_ModalWindowDimBg]      = ImVec4(0.00f, 0.00f, 0.00f, 0.50f);
 }
 
 /* ── Public API ───────────────────────────────────────────────────── */
@@ -221,12 +210,12 @@ void jce_editor_apply_theme(int theme_idx)
     apply_style_params();
     switch (theme_idx) {
     case JCE_THEME_LIGHT: apply_light_theme(); break;
-    case JCE_THEME_BLUE:  apply_blue_theme();  break;
+    case JCE_THEME_SSMS:  apply_ssms_theme();  break;
     default:              apply_dark_theme();   theme_idx = JCE_THEME_DARK; break;
     }
     s_current_theme = theme_idx;
 
-    const char *names[] = { "Dark", "Light", "Blue" };
+    const char *names[] = { "Dark", "Light", "SSMS" };
     LOG_INFO(LOG_TAG, "%s theme applied", names[theme_idx]);
 }
 
@@ -239,19 +228,20 @@ int jce_editor_get_theme(void)
 
 bool jce_editor_load_fonts(const PakArchive *pak, float size_pixels)
 {
-    const PakAsset *asset = pak_find(pak, "fonts/JCE.ttf");
-    if (!asset) {
-        LOG_WARN(LOG_TAG, "JCE.ttf not found in PAK, using default font");
+    /* --- Latin font (en.ttf) ---------------------------------------- */
+    const PakAsset *en_asset = pak_find(pak, "fonts/en.ttf");
+    if (!en_asset) {
+        LOG_WARN(LOG_TAG, "fonts/en.ttf not found in PAK, using default font");
         return false;
     }
 
-    void *buf = malloc((size_t)asset->original_size);
-    if (!buf) return false;
+    void *en_buf = malloc((size_t)en_asset->original_size);
+    if (!en_buf) return false;
 
-    size_t n = pak_decompress(asset, buf, (size_t)asset->original_size);
-    if (n == 0) {
-        LOG_ERROR(LOG_TAG, "failed to decompress JCE.ttf");
-        free(buf);
+    size_t en_n = pak_decompress(en_asset, en_buf, (size_t)en_asset->original_size);
+    if (en_n == 0) {
+        LOG_ERROR(LOG_TAG, "failed to decompress fonts/en.ttf");
+        free(en_buf);
         return false;
     }
 
@@ -262,23 +252,57 @@ bool jce_editor_load_fonts(const PakArchive *pak, float size_pixels)
     cfg.OversampleV = 2;
     cfg.PixelSnapH  = true;
 
-    /* Full glyph ranges for CJK + Latin (matches reference). */
-    static const ImWchar ranges[] = {
+    static const ImWchar latin_ranges[] = {
         0x0020, 0x00FF,   /* Basic Latin + Latin Supplement */
         0x2000, 0x206F,   /* General Punctuation */
-        0x3000, 0x30FF,   /* CJK Symbols + Katakana */
-        0x31F0, 0x31FF,   /* Katakana Phonetic Extensions */
-        0xFF00, 0xFFEF,   /* Halfwidth & Fullwidth Forms */
-        0x4E00, 0x9FFF,   /* CJK Unified Ideographs */
         0,
     };
 
     ImFont *font = io.Fonts->AddFontFromMemoryTTF(
-        buf, (int)n, size_pixels, &cfg, ranges);
+        en_buf, (int)en_n, size_pixels, &cfg, latin_ranges);
 
     if (!font) {
-        LOG_WARN(LOG_TAG, "failed to add JCE.ttf, using default font");
+        LOG_WARN(LOG_TAG, "failed to add fonts/en.ttf, using default font");
         return false;
+    }
+
+    /* --- CJK font (zh-CN.ttf) — merged into the Latin font --------- */
+    const PakAsset *zh_asset = pak_find(pak, "fonts/zh-CN.ttf");
+    if (zh_asset) {
+        void *zh_buf = malloc((size_t)zh_asset->original_size);
+        if (zh_buf) {
+            size_t zh_n = pak_decompress(zh_asset, zh_buf,
+                                         (size_t)zh_asset->original_size);
+            if (zh_n > 0) {
+                ImFontConfig merge_cfg;
+                merge_cfg.FontDataOwnedByAtlas = true;
+                merge_cfg.OversampleH = 2;
+                merge_cfg.OversampleV = 2;
+                merge_cfg.PixelSnapH  = true;
+                merge_cfg.MergeMode   = true;
+
+                static const ImWchar cjk_ranges[] = {
+                    0x3000, 0x30FF,   /* CJK Symbols + Katakana */
+                    0x31F0, 0x31FF,   /* Katakana Phonetic Extensions */
+                    0xFF00, 0xFFEF,   /* Halfwidth & Fullwidth Forms */
+                    0x4E00, 0x9FFF,   /* CJK Unified Ideographs */
+                    0,
+                };
+
+                if (io.Fonts->AddFontFromMemoryTTF(
+                        zh_buf, (int)zh_n, size_pixels,
+                        &merge_cfg, cjk_ranges)) {
+                    LOG_INFO(LOG_TAG, "merged fonts/zh-CN.ttf for CJK glyphs");
+                } else {
+                    LOG_WARN(LOG_TAG, "failed to merge fonts/zh-CN.ttf");
+                }
+            } else {
+                LOG_WARN(LOG_TAG, "failed to decompress fonts/zh-CN.ttf");
+                free(zh_buf);
+            }
+        }
+    } else {
+        LOG_WARN(LOG_TAG, "fonts/zh-CN.ttf not found in PAK, CJK glyphs unavailable");
     }
 
     io.FontDefault = font;
@@ -286,6 +310,6 @@ bool jce_editor_load_fonts(const PakArchive *pak, float size_pixels)
     /* Rebuild font atlas on bgfx side. */
     jce_imgui_bgfx_rebuild_fonts();
 
-    LOG_SUCCESS(LOG_TAG, "loaded JCE.ttf (%.0f px, CJK+Latin)", size_pixels);
+    LOG_SUCCESS(LOG_TAG, "loaded fonts (%.0f px, Latin + CJK)", size_pixels);
     return true;
 }

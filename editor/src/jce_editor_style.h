@@ -16,13 +16,13 @@ typedef struct PakArchive PakArchive;
 /* Theme indices. */
 #define JCE_THEME_DARK   0
 #define JCE_THEME_LIGHT  1
-#define JCE_THEME_BLUE   2
+#define JCE_THEME_SSMS   2
 #define JCE_THEME_COUNT  3
 
 /* Apply the JCE dark editor theme to ImGui. */
 void jce_editor_setup_style(void);
 
-/* Apply a theme by index (0=Dark, 1=Light, 2=Blue). */
+/* Apply a theme by index (0=Dark, 1=Light, 2=SSMS). */
 void jce_editor_apply_theme(int theme_idx);
 
 /* Get current theme index. */

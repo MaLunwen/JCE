@@ -5,7 +5,7 @@
 #include "jce_skeleton.h"
 #include <jce/core/jce_log.h>
 
-#include <SDL3/SDL.h>
+#include "core/jce_memory.h"
 #include <string.h>
 
 #define LOG_TAG "jce_skeleton"
@@ -13,6 +13,9 @@
 struct JceSkeleton {
     JceJoint *joints;
     jce_mat4 *rest_locals;   /* rest-pose local transforms */
+    jce_vec3 *rest_t;        /* rest-pose translations */
+    jce_quat *rest_r;        /* rest-pose rotations */
+    jce_vec3 *rest_s;        /* rest-pose scales */
     uint32_t  num_joints;
 };
 
@@ -24,24 +27,35 @@ JceSkeleton *jce_skeleton_create(const JceJoint *joints, uint32_t num_joints)
 {
     if (!joints || num_joints == 0) return NULL;
 
-    JceSkeleton *skel = (JceSkeleton *)SDL_calloc(1, sizeof(*skel));
+    JceSkeleton *skel = (JceSkeleton *)JCE_CALLOC(1, sizeof(*skel));
     if (!skel) return NULL;
 
     skel->num_joints = num_joints;
 
-    skel->joints = (JceJoint *)SDL_malloc(num_joints * sizeof(JceJoint));
-    skel->rest_locals = (jce_mat4 *)SDL_malloc(num_joints * sizeof(jce_mat4));
-    if (!skel->joints || !skel->rest_locals) {
-        SDL_free(skel->joints);
-        SDL_free(skel->rest_locals);
-        SDL_free(skel);
+    skel->joints = (JceJoint *)JCE_MALLOC(num_joints * sizeof(JceJoint));
+    skel->rest_locals = (jce_mat4 *)JCE_MALLOC(num_joints * sizeof(jce_mat4));
+    skel->rest_t = (jce_vec3 *)JCE_MALLOC(num_joints * sizeof(jce_vec3));
+    skel->rest_r = (jce_quat *)JCE_MALLOC(num_joints * sizeof(jce_quat));
+    skel->rest_s = (jce_vec3 *)JCE_MALLOC(num_joints * sizeof(jce_vec3));
+    if (!skel->joints || !skel->rest_locals || !skel->rest_t ||
+        !skel->rest_r || !skel->rest_s) {
+        JCE_FREE(skel->joints);
+        JCE_FREE(skel->rest_locals);
+        JCE_FREE(skel->rest_t);
+        JCE_FREE(skel->rest_r);
+        JCE_FREE(skel->rest_s);
+        JCE_FREE(skel);
         return NULL;
     }
 
     memcpy(skel->joints, joints, num_joints * sizeof(JceJoint));
 
-    for (uint32_t i = 0; i < num_joints; i++)
+    for (uint32_t i = 0; i < num_joints; i++) {
         skel->rest_locals[i] = joints[i].local_transform;
+        skel->rest_t[i] = joints[i].rest_translation;
+        skel->rest_r[i] = joints[i].rest_rotation;
+        skel->rest_s[i] = joints[i].rest_scale;
+    }
 
     LOG_DEBUG(LOG_TAG, "created skeleton with %u joints", num_joints);
     return skel;
@@ -50,9 +64,12 @@ JceSkeleton *jce_skeleton_create(const JceJoint *joints, uint32_t num_joints)
 void jce_skeleton_destroy(JceSkeleton *skel)
 {
     if (!skel) return;
-    SDL_free(skel->joints);
-    SDL_free(skel->rest_locals);
-    SDL_free(skel);
+    JCE_FREE(skel->joints);
+    JCE_FREE(skel->rest_locals);
+    JCE_FREE(skel->rest_t);
+    JCE_FREE(skel->rest_r);
+    JCE_FREE(skel->rest_s);
+    JCE_FREE(skel);
 }
 
 /* ================================================================== */
@@ -79,6 +96,22 @@ const jce_mat4 *jce_skeleton_rest_pose(const JceSkeleton *skel)
     return skel ? skel->rest_locals : NULL;
 }
 
+void jce_skeleton_rest_trs(const JceSkeleton *skel,
+                            const jce_vec3 **out_translations,
+                            const jce_quat **out_rotations,
+                            const jce_vec3 **out_scales)
+{
+    if (!skel) {
+        if (out_translations) *out_translations = NULL;
+        if (out_rotations)    *out_rotations    = NULL;
+        if (out_scales)       *out_scales       = NULL;
+        return;
+    }
+    if (out_translations) *out_translations = skel->rest_t;
+    if (out_rotations)    *out_rotations    = skel->rest_r;
+    if (out_scales)       *out_scales       = skel->rest_s;
+}
+
 /* ================================================================== */
 /* Evaluate skinning matrices                                          */
 /* ================================================================== */
@@ -94,7 +127,7 @@ void jce_skeleton_evaluate(const JceSkeleton *skel,
     const jce_mat4 *locals = local_transforms ? local_transforms : skel->rest_locals;
 
     /* Compute global transforms. */
-    jce_mat4 *globals = (jce_mat4 *)SDL_malloc(count * sizeof(jce_mat4));
+    jce_mat4 *globals = (jce_mat4 *)JCE_MALLOC(count * sizeof(jce_mat4));
     if (!globals) {
         LOG_ERROR(LOG_TAG, "failed to allocate globals buffer for %u joints", count);
         return;
@@ -111,5 +144,12 @@ void jce_skeleton_evaluate(const JceSkeleton *skel,
     for (uint32_t i = 0; i < count; i++)
         out_matrices[i] = jce_m4_multiply(&globals[i], &skel->joints[i].inverse_bind_matrix);
 
-    SDL_free(globals);
+    JCE_FREE(globals);
+}
+
+jce_mat4 jce_skeleton_get_inverse_bind(const JceSkeleton *skel, uint32_t joint_idx)
+{
+    if (!skel || joint_idx >= skel->num_joints)
+        return jce_m4_identity();
+    return skel->joints[joint_idx].inverse_bind_matrix;
 }

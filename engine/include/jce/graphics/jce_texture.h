@@ -10,6 +10,10 @@
 
 #include <jce/graphics/jce_texture_types.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct PakArchive  PakArchive;
 typedef struct SDL_Surface SDL_Surface;
 
@@ -35,5 +39,9 @@ void       jce_texture_get_size(JceTexture tex, uint32_t *w, uint32_t *h);
 
 /* Destroy a texture. */
 void       jce_texture_destroy(JceTexture tex);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* JCE_TEXTURE_H */

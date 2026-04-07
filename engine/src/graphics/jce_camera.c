@@ -3,7 +3,7 @@
  */
 
 #include <jce/graphics/jce_camera.h>
-#include <SDL3/SDL.h>   /* SDL_calloc / SDL_free */
+#include "core/jce_memory.h"
 #include <math.h>
 
 /* Max pitch to avoid gimbal lock at poles. */
@@ -44,7 +44,7 @@ JceCamera *jce_camera_create(const JceCameraDesc *desc)
 {
     if (!desc) return NULL;
 
-    JceCamera *cam = (JceCamera *)SDL_calloc(1, sizeof(*cam));
+    JceCamera *cam = (JceCamera *)JCE_CALLOC(1, sizeof(*cam));
     if (!cam) return NULL;
 
     cam->mode       = desc->mode;
@@ -72,7 +72,7 @@ JceCamera *jce_camera_create(const JceCameraDesc *desc)
 
 void jce_camera_destroy(JceCamera *cam)
 {
-    SDL_free(cam);
+    JCE_FREE(cam);
 }
 
 /* -- Matrices ------------------------------------------------------- */
