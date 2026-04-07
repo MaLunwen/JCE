@@ -29,6 +29,16 @@ typedef struct {
 } JceGizmoCamera;
 
 /* ── Thin vec3 / mat4 wrappers over cglm ──────────────────────────── */
+/*
+ * cglm's raw API operates on float[4][4] (mat4) and float[4] (vec4).
+ * Our gizmo code uses flat float[16] / float[3] arrays with the same
+ * memory layout, so the reinterpret cast below is safe.  The const
+ * casts are necessary because cglm parameters are not always const-
+ * qualified in its C headers.
+ */
+
+/* Reinterpret a flat float[16] as cglm mat4 (float[4][4]). */
+#define GM_MAT4(p) ((mat4 *)(p))
 
 static inline void gm_v3_copy(float dst[3], const float src[3])
 {
@@ -76,20 +86,20 @@ static inline void gm_v3_normalize(float out[3], const float v[3])
 
 static inline void gm_m4_mul_v4(float out[4], const float m[16], const float v[4])
 {
-    glm_mat4_mulv((vec4 *)m, (float *)v, out);
+    glm_mat4_mulv(*GM_MAT4(m), (float *)v, out);
 }
 
 static inline void gm_m4_mul(float out[16], const float a[16], const float b[16])
 {
-    glm_mat4_mul((vec4 *)a, (vec4 *)b, (vec4 *)out);
+    glm_mat4_mul(*GM_MAT4(a), *GM_MAT4(b), *GM_MAT4(out));
 }
 
 /* Invert a 4×4 column-major matrix. Returns false if singular. */
 static inline bool gm_m4_invert(float inv[16], const float m[16])
 {
-    float det = glm_mat4_det((vec4 *)m);
+    float det = glm_mat4_det(*GM_MAT4(m));
     if (fabsf(det) < 1e-12f) return false;
-    glm_mat4_inv((vec4 *)m, (vec4 *)inv);
+    glm_mat4_inv(*GM_MAT4(m), *GM_MAT4(inv));
     return true;
 }
 
