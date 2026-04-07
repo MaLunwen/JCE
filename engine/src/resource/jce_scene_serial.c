@@ -72,6 +72,13 @@ static jce_quat json_to_quat(const cJSON *arr)
     return q;
 }
 
+static double json_get_number(const cJSON *parent, const char *key, double fallback)
+{
+    const cJSON *item = cJSON_GetObjectItem(parent, key);
+    if (!item || !cJSON_IsNumber(item)) return fallback;
+    return item->valuedouble;
+}
+
 /* ── Serialize callback (per entity) ───────────────────────────────── */
 
 typedef struct {
@@ -233,8 +240,8 @@ bool jce_scene_serial_load(JceScene *scene, const char *json, size_t len)
         cJSON *mc = cJSON_GetObjectItem(ent, "mesh_renderer");
         if (mc) {
             JceMeshRenderer mr;
-            mr.model.idx  = (uint16_t)cJSON_GetObjectItem(mc, "model")->valuedouble;
-            mr.shader.idx = (uint16_t)cJSON_GetObjectItem(mc, "shader")->valuedouble;
+            mr.model.idx  = (uint16_t)json_get_number(mc, "model", UINT16_MAX);
+            mr.shader.idx = (uint16_t)json_get_number(mc, "shader", UINT16_MAX);
             cJSON *vis = cJSON_GetObjectItem(mc, "visible");
             mr.visible = vis ? cJSON_IsTrue(vis) : true;
             jce_scene_set_mesh_renderer(scene, e, &mr);
@@ -244,9 +251,9 @@ bool jce_scene_serial_load(JceScene *scene, const char *json, size_t len)
         cJSON *cc = cJSON_GetObjectItem(ent, "camera");
         if (cc) {
             JceCameraComponent cam;
-            cam.fov_deg    = (float)cJSON_GetObjectItem(cc, "fov_deg")->valuedouble;
-            cam.near_plane = (float)cJSON_GetObjectItem(cc, "near")->valuedouble;
-            cam.far_plane  = (float)cJSON_GetObjectItem(cc, "far")->valuedouble;
+            cam.fov_deg    = (float)json_get_number(cc, "fov_deg", 60.0);
+            cam.near_plane = (float)json_get_number(cc, "near", 0.1);
+            cam.far_plane  = (float)json_get_number(cc, "far", 1000.0);
             cJSON *pri = cJSON_GetObjectItem(cc, "primary");
             cam.is_primary = pri ? cJSON_IsTrue(pri) : false;
             jce_scene_set_camera(scene, e, &cam);
@@ -258,7 +265,7 @@ bool jce_scene_serial_load(JceScene *scene, const char *json, size_t len)
             JceDirectionalLight dl;
             dl.direction = json_to_vec3(cJSON_GetObjectItem(lc, "direction"));
             dl.color     = json_to_vec3(cJSON_GetObjectItem(lc, "color"));
-            dl.intensity = (float)cJSON_GetObjectItem(lc, "intensity")->valuedouble;
+            dl.intensity = (float)json_get_number(lc, "intensity", 1.0);
             jce_scene_set_dir_light(scene, e, &dl);
         }
     }
