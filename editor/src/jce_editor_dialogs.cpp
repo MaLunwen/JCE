@@ -13,6 +13,7 @@
 #include "jce_editor_config.h"
 #include "jce_file_viewer.h"
 #include "jce_editor_layout.h"
+#include "jce_editor_state.h"
 
 #include <imgui.h>
 #include <stdio.h>
@@ -34,6 +35,7 @@
 namespace fs = std::filesystem;
 
 static char s_current_project_root[512] = {0};
+static char s_last_browse_folder[512] = {0};
 
 static void set_current_project_root(const char *path)
 {
@@ -111,10 +113,27 @@ static bool pick_folder_dialog(const char *title, char *out_path, size_t out_pat
 {
     if (!out_path || out_path_size == 0) return false;
 #ifdef _WIN32
+    auto browse_callback = [](HWND hwnd, UINT uMsg, LPARAM, LPARAM lpData) -> int {
+        if (uMsg == BFFM_INITIALIZED) {
+            const char *initial = (const char *)lpData;
+            if (initial && initial[0] != '\0')
+                SendMessageA(hwnd, BFFM_SETSELECTIONA, TRUE, (LPARAM)initial);
+        }
+        return 0;
+    };
+
+    const char *initial_folder = nullptr;
+    if (s_last_browse_folder[0] != '\0')
+        initial_folder = s_last_browse_folder;
+    else if (out_path[0] != '\0')
+        initial_folder = out_path;
+
     BROWSEINFOA bi;
     memset(&bi, 0, sizeof(bi));
     bi.lpszTitle = title;
     bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_USENEWUI;
+    bi.lpfn = browse_callback;
+    bi.lParam = (LPARAM)initial_folder;
 
     LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
     if (!pidl) return false;
@@ -125,6 +144,7 @@ static bool pick_folder_dialog(const char *title, char *out_path, size_t out_pat
     if (!ok) return false;
 
     snprintf(out_path, out_path_size, "%s", path);
+    snprintf(s_last_browse_folder, sizeof(s_last_browse_folder), "%s", path);
     return true;
 #else
     (void)title;
@@ -787,15 +807,52 @@ void jce_editor_dialog_open_scene(bool *p_open)
 static struct {
     char save_name[256];
     char save_location[512];
+    char source_scene_path[512];
     bool initialized;
 } s_save_as;
 
+static std::string strip_scene_extension(const std::string &file_name)
+{
+    if (file_name.size() >= 11 && file_name.substr(file_name.size() - 11) == ".scene.json")
+        return file_name.substr(0, file_name.size() - 11);
+    if (file_name.size() >= 6 && file_name.substr(file_name.size() - 6) == ".scene")
+        return file_name.substr(0, file_name.size() - 6);
+    return fs::path(file_name).stem().string();
+}
+
 static void save_as_ensure_init(void)
 {
+    const char *current_scene = jce_state_get_current_scene_path();
+    if (current_scene && current_scene[0] != '\0'
+        && (!s_save_as.initialized
+         || strcmp(s_save_as.source_scene_path, current_scene) != 0)) {
+        fs::path p(current_scene);
+        std::string parent = p.parent_path().string();
+        std::string base = strip_scene_extension(p.filename().string());
+
+        memset(&s_save_as, 0, sizeof(s_save_as));
+        snprintf(s_save_as.save_name, sizeof(s_save_as.save_name), "%s",
+                 base.empty() ? "Scene" : base.c_str());
+        snprintf(s_save_as.save_location, sizeof(s_save_as.save_location), "%s",
+                 parent.empty() ? fs::current_path().string().c_str() : parent.c_str());
+        snprintf(s_save_as.source_scene_path, sizeof(s_save_as.source_scene_path), "%s",
+                 current_scene);
+        s_save_as.initialized = true;
+        return;
+    }
+
     if (s_save_as.initialized) return;
+
     memset(&s_save_as, 0, sizeof(s_save_as));
-    snprintf(s_save_as.save_location,
-             sizeof(s_save_as.save_location), "C:/Projects");
+    if (s_current_project_root[0] != '\0') {
+        fs::path p = fs::path(s_current_project_root) / "assets" / "scenes";
+        snprintf(s_save_as.save_location,
+                 sizeof(s_save_as.save_location), "%s", p.string().c_str());
+    } else {
+        snprintf(s_save_as.save_location,
+                 sizeof(s_save_as.save_location), "%s", fs::current_path().string().c_str());
+    }
+    snprintf(s_save_as.save_name, sizeof(s_save_as.save_name), "Scene");
     s_save_as.initialized = true;
 }
 
@@ -805,9 +862,7 @@ void jce_editor_dialog_save_as(bool *p_open)
 
     save_as_ensure_init();
 
-    char _title[256];
-    snprintf(_title, sizeof(_title), "%s###SaveAs",
-             jce_editor_i18n("saveAs.title"));
+    const char *_title = "Save Scene As###SaveAsScene";
 
     ImGui::SetNextWindowSize(ImVec2(500, 250), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin(_title, p_open, ImGuiWindowFlags_NoCollapse)) {
@@ -815,10 +870,8 @@ void jce_editor_dialog_save_as(bool *p_open)
         return;
     }
 
-    char _lbl[256];
-
-    /* Project Name */
-    ImGui::Text("%s", jce_editor_i18n("saveAs.name"));
+    /* Scene Name */
+    ImGui::Text("Scene Name");
     ImGui::SetNextItemWidth(-1);
     ImGui::InputText("###sa_name_input", s_save_as.save_name,
                      sizeof(s_save_as.save_name));
@@ -826,10 +879,16 @@ void jce_editor_dialog_save_as(bool *p_open)
     ImGui::Spacing();
 
     /* Location */
-    ImGui::Text("%s", jce_editor_i18n("saveAs.location"));
-    ImGui::SetNextItemWidth(-1);
+    ImGui::Text("Directory");
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 90.0f);
     ImGui::InputText("###sa_loc_input", s_save_as.save_location,
                      sizeof(s_save_as.save_location));
+    ImGui::SameLine();
+    if (ImGui::Button("Browse", ImVec2(80, 0))) {
+        pick_folder_dialog("Choose scene directory",
+                           s_save_as.save_location,
+                           sizeof(s_save_as.save_location));
+    }
 
     /* Buttons: Save | Cancel (right-aligned) */
     ImGui::Spacing();
@@ -843,11 +902,33 @@ void jce_editor_dialog_save_as(bool *p_open)
                          + ImGui::GetCursorPosX());
 
     if (ImGui::Button(jce_editor_i18n("dialog.save"), ImVec2(btn_w, 0))) {
-        if (strlen(s_save_as.save_name) > 0) {
-            jce_editor_console_log("Saved project as: %s at %s",
-                                   s_save_as.save_name,
-                                   s_save_as.save_location);
-            *p_open = false;
+        if (strlen(s_save_as.save_name) == 0 || strlen(s_save_as.save_location) == 0) {
+            jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+                "Scene name and directory are required");
+        } else {
+            try {
+                fs::create_directories(s_save_as.save_location);
+
+                std::string name = s_save_as.save_name;
+                if (!is_scene_filename(name)) name += ".scene";
+                fs::path out_path = fs::path(s_save_as.save_location) / name;
+
+                if (jce_state_save_scene_file(out_path.string().c_str())) {
+                    snprintf(s_save_as.source_scene_path,
+                             sizeof(s_save_as.source_scene_path), "%s",
+                             out_path.string().c_str());
+                    jce_file_viewer_open(out_path.string().c_str());
+                    jce_editor_layout_request_focus_scene_view();
+                    jce_editor_console_log("Saved scene as: %s", out_path.string().c_str());
+                    *p_open = false;
+                } else {
+                    jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                        "Save scene failed: %s", out_path.string().c_str());
+                }
+            } catch (const std::exception &e) {
+                jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                    "Save scene failed: %s", e.what());
+            }
         }
     }
     ImGui::SameLine();

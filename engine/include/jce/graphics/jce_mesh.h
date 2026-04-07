@@ -42,6 +42,12 @@ void jce_mesh_destroy(JceMesh *mesh);
    Caller must set transforms and uniforms before calling this. */
 void jce_mesh_submit(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id);
 
+/* Submit mesh as wireframe overlay with LEQUAL depth test.
+   Used for selection outlines that render on top of solid geometry.
+   Caller must set transforms, uniforms, and textures before calling. */
+void jce_mesh_submit_wireframe_overlay(const JceMesh *mesh, const JceRenderer *r,
+                                       uint16_t view_id);
+
 /* Get vertex/index counts. */
 uint32_t jce_mesh_vertex_count(const JceMesh *mesh);
 uint32_t jce_mesh_index_count(const JceMesh *mesh);

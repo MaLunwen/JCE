@@ -72,7 +72,7 @@
 #define JCE_THUMBNAIL_SIZE_LARGE    128
 #define JCE_THUMBNAIL_CACHE_SIZE    500
 #define JCE_ASSET_TREE_WIDTH_RATIO  0.25f
-#define JCE_ASSET_CELL_PADDING      8.0f
+#define JCE_ASSET_CELL_PADDING      4.0f
 
 /* ── Console ───────────────────────────────────────────────────────── */
 

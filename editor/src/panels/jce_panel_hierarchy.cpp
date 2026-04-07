@@ -51,6 +51,9 @@ static struct {
     uint32_t display_order[JCE_MAX_ENTITIES];
     int      display_count;
     uint32_t shift_anchor;   /* last click without Shift (range start) */
+    uint32_t last_focus_seen;
+    uint32_t reveal_target;
+    bool     reveal_pending;
 } s_hier;
 
 static void ensure_init(void)
@@ -84,6 +87,25 @@ static void select_range(uint32_t anchor, uint32_t target)
     jce_state_clear_selection();
     for (int i = a; i <= b; i++)
         jce_state_select_entity(s_hier.display_order[i], true);
+}
+
+/* True if node_id is on the parent chain of reveal_target (including itself). */
+static bool node_in_reveal_path(uint32_t node_id)
+{
+    if (!s_hier.reveal_pending || s_hier.reveal_target == 0)
+        return false;
+
+    uint32_t cur = s_hier.reveal_target;
+    while (cur != 0) {
+        if (cur == node_id)
+            return true;
+        JceEntityInfo *e = jce_state_get_entity(cur);
+        if (!e)
+            break;
+        cur = e->parent_id;
+    }
+
+    return false;
 }
 
 static int ascii_tolower(int c)
@@ -249,8 +271,16 @@ static void draw_entity_node(JceEntityInfo *e)
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 18);
     }
 
+    if (node_in_reveal_path(e->id))
+        ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+
     bool node_open = ImGui::TreeNodeEx((void *)(intptr_t)e->id, flags,
                                         "%s", is_renaming ? "" : e->name);
+
+    if (s_hier.reveal_pending && e->id == s_hier.reveal_target) {
+        ImGui::SetScrollHereY(0.35f);
+        s_hier.reveal_pending = false;
+    }
 
     if (is_renaming) {
         ImGui::SameLine();
@@ -364,6 +394,13 @@ void jce_editor_panel_hierarchy_content(void)
 {
     ensure_init();
 
+    uint32_t focused_now = jce_state_get_focused();
+    if (focused_now != s_hier.last_focus_seen) {
+        s_hier.last_focus_seen = focused_now;
+        s_hier.reveal_target = focused_now;
+        s_hier.reveal_pending = (focused_now != 0);
+    }
+
     /* Filter Bar */
     ImGui::PushItemWidth(-1);
     ImGui::InputTextWithHint("##search", jce_editor_i18n("hierarchy.search"), s_hier.search_buf,
@@ -401,10 +438,10 @@ void jce_editor_panel_hierarchy_content(void)
         uint32_t root_ids[JCE_MAX_ENTITIES];
         int root_count = 0;
 
-        for (uint32_t id = 1; id <= (uint32_t)(total + 20); id++) {
-            JceEntityInfo *e = jce_state_get_entity(id);
+        for (int i = 0; i < total; i++) {
+            JceEntityInfo *e = jce_state_get_entity_by_index(i);
             if (e && e->parent_id == 0 && root_count < JCE_MAX_ENTITIES)
-                root_ids[root_count++] = id;
+                root_ids[root_count++] = e->id;
         }
 
         sort_entity_ids(root_ids, root_count);
@@ -528,10 +565,10 @@ void jce_editor_panel_hierarchy_content(void)
                 jce_state_clear_selection();
                 bool first = true;
                 int total = jce_state_get_entity_count();
-                for (uint32_t id = 1; id <= (uint32_t)(total + 20); id++) {
-                    JceEntityInfo *se = jce_state_get_entity(id);
+                for (int i = 0; i < total; i++) {
+                    JceEntityInfo *se = jce_state_get_entity_by_index(i);
                     if (!se) continue;
-                    jce_state_select_entity(id, !first);
+                    jce_state_select_entity(se->id, !first);
                     first = false;
                 }
                 if (!first) {

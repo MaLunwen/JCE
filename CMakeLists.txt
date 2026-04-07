@@ -71,6 +71,35 @@ set(CMAKE_CXX_STANDARD_REQUIRED YES)
 set(CMAKE_CXX_EXTENSIONS        OFF)
 
 # ------------------------------------------------------------------ #
+# Common compiler warnings helper                                     #
+# ------------------------------------------------------------------ #
+#
+# jce_target_warnings(<target> [STRICT])
+#   Applies project-wide warning flags.
+#   STRICT mode adds extra conversion / shadow checks (used by engine).
+#
+function(jce_target_warnings TARGET)
+	cmake_parse_arguments(ARG "STRICT" "" "" ${ARGN})
+	if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+		target_compile_options(${TARGET} PRIVATE -Wall -Wextra)
+		if(ARG_STRICT)
+			target_compile_options(${TARGET} PRIVATE
+				-Wpedantic -Wconversion -Wshadow
+				-Wdouble-promotion -Wno-unused-parameter)
+		endif()
+	elseif(MSVC)
+		target_compile_options(${TARGET} PRIVATE /W4 /utf-8 /Zc:preprocessor)
+		if(ARG_STRICT)
+			target_compile_options(${TARGET} PRIVATE
+				/wd4100    # unreferenced formal parameter
+				/wd4127)   # conditional expression is constant
+		endif()
+		target_compile_definitions(${TARGET} PRIVATE
+			_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+	endif()
+endfunction()
+
+# ------------------------------------------------------------------ #
 # Third-party dependencies (provided by Conan via CMakeDeps)         #
 # ------------------------------------------------------------------ #
 
@@ -94,7 +123,7 @@ find_package(box2d        REQUIRED)
 find_package(Bullet       REQUIRED)
 find_package(enet         REQUIRED)
 find_package(protobuf     REQUIRED)
-find_package(BehaviorTree REQUIRED)
+find_package(behaviortree_cpp REQUIRED)
 find_package(RmlUi        REQUIRED)
 
 # Tracy profiling switch.
@@ -400,35 +429,6 @@ if(_COOK_EDITOR_DEP)
 endif()
 
 set(REPORT_SCRIPT "${JCE_TOOLS_DIR}/build_report.cmake")
-
-# ------------------------------------------------------------------ #
-# Common compiler warnings helper                                     #
-# ------------------------------------------------------------------ #
-#
-# jce_target_warnings(<target> [STRICT])
-#   Applies project-wide warning flags.
-#   STRICT mode adds extra conversion / shadow checks (used by engine).
-#
-function(jce_target_warnings TARGET)
-	cmake_parse_arguments(ARG "STRICT" "" "" ${ARGN})
-	if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
-		target_compile_options(${TARGET} PRIVATE -Wall -Wextra)
-		if(ARG_STRICT)
-			target_compile_options(${TARGET} PRIVATE
-				-Wpedantic -Wconversion -Wshadow
-				-Wdouble-promotion -Wno-unused-parameter)
-		endif()
-	elseif(MSVC)
-		target_compile_options(${TARGET} PRIVATE /W4 /utf-8 /Zc:preprocessor)
-		if(ARG_STRICT)
-			target_compile_options(${TARGET} PRIVATE
-				/wd4100    # unreferenced formal parameter
-				/wd4127)   # conditional expression is constant
-		endif()
-		target_compile_definitions(${TARGET} PRIVATE
-			_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
-	endif()
-endfunction()
 
 # ------------------------------------------------------------------ #
 # Sub-modules                                                         #

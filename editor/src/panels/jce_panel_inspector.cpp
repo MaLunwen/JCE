@@ -99,7 +99,10 @@ bool jce_editor_inspector_delete_dialog_open(void)
 
 /* ── Vec3 control (colored XYZ drag floats) ───────────────────────── */
 
-static void draw_vec3_control(const char *label, float *values, float speed = 0.1f)
+static void draw_vec3_control(const char *label,
+                              float *values,
+                              float speed = 0.1f,
+                              float reset_value = 0.0f)
 {
     ImGui::PushID(label);
 
@@ -112,7 +115,7 @@ static void draw_vec3_control(const char *label, float *values, float speed = 0.
     ImGui::PushStyleColor(ImGuiCol_Button,        JCE_COLOR_INSP_VEC_X);
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(0.9f, 0.2f, 0.2f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.8f, 0.1f, 0.1f, 1.0f));
-    if (ImGui::Button("X", btn_size)) values[0] = 0.0f;
+    if (ImGui::Button("X", btn_size)) values[0] = reset_value;
     ImGui::PopStyleColor(3);
     ImGui::SameLine();
     ImGui::PushItemWidth(width);
@@ -124,7 +127,7 @@ static void draw_vec3_control(const char *label, float *values, float speed = 0.
     ImGui::PushStyleColor(ImGuiCol_Button,        JCE_COLOR_INSP_VEC_Y);
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(0.2f, 0.9f, 0.2f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.1f, 0.8f, 0.1f, 1.0f));
-    if (ImGui::Button("Y", btn_size)) values[1] = 0.0f;
+    if (ImGui::Button("Y", btn_size)) values[1] = reset_value;
     ImGui::PopStyleColor(3);
     ImGui::SameLine();
     ImGui::PushItemWidth(width);
@@ -136,7 +139,7 @@ static void draw_vec3_control(const char *label, float *values, float speed = 0.
     ImGui::PushStyleColor(ImGuiCol_Button,        JCE_COLOR_INSP_VEC_Z);
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered,  ImVec4(0.2f, 0.2f, 0.9f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,   ImVec4(0.1f, 0.1f, 0.8f, 1.0f));
-    if (ImGui::Button("Z", btn_size)) values[2] = 0.0f;
+    if (ImGui::Button("Z", btn_size)) values[2] = reset_value;
     ImGui::PopStyleColor(3);
     ImGui::SameLine();
     ImGui::PushItemWidth(width);
@@ -186,7 +189,7 @@ static void draw_component(JceComponentInfo *comp, uint32_t entity_id)
             draw_vec3_control("Rotation", comp->data.transform.rot, 1.0f);
             ImGui::Text("%s", jce_editor_i18n("transform.scale"));
             ImGui::SameLine(80);
-            draw_vec3_control("Scale", comp->data.transform.scale, 0.01f);
+            draw_vec3_control("Scale", comp->data.transform.scale, 0.01f, 1.0f);
             break;
 
         case JCE_COMP_LIGHT:
@@ -334,12 +337,15 @@ void jce_editor_panel_inspector_content(void)
 
     ImGui::BeginDisabled(!e->enabled);
 
-    /* Components */
-    JceComponentInfo comps[JCE_MAX_COMPONENTS];
-    int comp_count = jce_state_get_components(e->id, comps, JCE_MAX_COMPONENTS);
+    /* Components — use pointer-based access so DragFloat edits modify
+     * the actual state directly (not a local copy). */
+    int comp_count = 0;
+    JceComponentInfo *comps = jce_state_get_entity_components(e->id, &comp_count);
 
-    for (int i = 0; i < comp_count; i++)
-        draw_component(&comps[i], e->id);
+    if (comps) {
+        for (int i = 0; i < comp_count; i++)
+            draw_component(&comps[i], e->id);
+    }
 
     /* Add Component button */
     ImGui::Spacing();

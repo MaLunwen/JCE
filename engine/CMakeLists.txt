@@ -73,7 +73,7 @@ target_link_libraries(JCE PUBLIC
 	Bullet::Bullet
 	enet::enet
 	protobuf::protobuf
-	BehaviorTree::behaviortree_cpp
+	BT::behaviortree_cpp
 	rmlui::rmlui)
 
 # Tracy: true compile-time gate.

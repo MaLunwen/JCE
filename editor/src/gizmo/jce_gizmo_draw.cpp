@@ -18,6 +18,7 @@
 extern "C" JceGizmoAxis jce_gizmo_internal_hovered(void);
 extern "C" bool         jce_gizmo_internal_dragging(void);
 extern "C" JceGizmoAxis jce_gizmo_internal_drag_axis(void);
+extern "C" void         jce_gizmo_internal_get_axes(float ax_x[3], float ax_y[3], float ax_z[3]);
 
 /* ── Color helpers ─────────────────────────────────────────────────── */
 
@@ -179,13 +180,16 @@ void jce_gizmo_draw_translate(ImDrawList *dl,
                           ? jce_gizmo_internal_drag_axis()
                           : JCE_GIZMO_AXIS_NONE;
 
+    float ax_x[3], ax_y[3], ax_z[3];
+    jce_gizmo_internal_get_axes(ax_x, ax_y, ax_z);
+
     float px_len = screen_axis_length(cam, position, scale_factor);
 
-    draw_translate_arrow(dl, cam, position, s_axis_x, px_len,
+    draw_translate_arrow(dl, cam, position, ax_x, px_len,
                          JCE_GIZMO_AXIS_X, hovered, dragging);
-    draw_translate_arrow(dl, cam, position, s_axis_y, px_len,
+    draw_translate_arrow(dl, cam, position, ax_y, px_len,
                          JCE_GIZMO_AXIS_Y, hovered, dragging);
-    draw_translate_arrow(dl, cam, position, s_axis_z, px_len,
+    draw_translate_arrow(dl, cam, position, ax_z, px_len,
                          JCE_GIZMO_AXIS_Z, hovered, dragging);
 
     /* Plane handles */
@@ -195,11 +199,11 @@ void jce_gizmo_draw_translate(ImDrawList *dl,
     if (dist < 0.01f) dist = 0.01f;
     float world_len = JCE_GIZMO_AXIS_LENGTH * dist * 0.07f * (px_len / 120.0f);
 
-    draw_translate_plane_handle(dl, cam, position, s_axis_x, s_axis_y,
+    draw_translate_plane_handle(dl, cam, position, ax_x, ax_y,
                                 world_len, JCE_GIZMO_AXIS_XY, hovered, dragging);
-    draw_translate_plane_handle(dl, cam, position, s_axis_x, s_axis_z,
+    draw_translate_plane_handle(dl, cam, position, ax_x, ax_z,
                                 world_len, JCE_GIZMO_AXIS_XZ, hovered, dragging);
-    draw_translate_plane_handle(dl, cam, position, s_axis_y, s_axis_z,
+    draw_translate_plane_handle(dl, cam, position, ax_y, ax_z,
                                 world_len, JCE_GIZMO_AXIS_YZ, hovered, dragging);
 
     /* Center dot */
@@ -283,19 +287,19 @@ void jce_gizmo_draw_rotate(ImDrawList *dl,
     if (dist < 0.01f) dist = 0.01f;
     float world_radius = JCE_GIZMO_AXIS_LENGTH * dist * 0.07f * scale_factor;
 
+    float ax_x[3], ax_y[3], ax_z[3];
+    jce_gizmo_internal_get_axes(ax_x, ax_y, ax_z);
+
     /* X ring: normal=X, tangent=Y, bitangent=Z */
-    static const float tx[3] = {0,1,0}, bx[3] = {0,0,1};
-    draw_rotation_ring(dl, cam, position, s_axis_x, tx, bx, world_radius,
+    draw_rotation_ring(dl, cam, position, ax_x, ax_y, ax_z, world_radius,
                        JCE_GIZMO_AXIS_X, hovered, dragging);
 
     /* Y ring: normal=Y, tangent=Z, bitangent=X */
-    static const float ty[3] = {0,0,1}, by[3] = {1,0,0};
-    draw_rotation_ring(dl, cam, position, s_axis_y, ty, by, world_radius,
+    draw_rotation_ring(dl, cam, position, ax_y, ax_z, ax_x, world_radius,
                        JCE_GIZMO_AXIS_Y, hovered, dragging);
 
     /* Z ring: normal=Z, tangent=X, bitangent=Y */
-    static const float tz[3] = {1,0,0}, bz[3] = {0,1,0};
-    draw_rotation_ring(dl, cam, position, s_axis_z, tz, bz, world_radius,
+    draw_rotation_ring(dl, cam, position, ax_z, ax_x, ax_y, world_radius,
                        JCE_GIZMO_AXIS_Z, hovered, dragging);
 }
 
@@ -351,13 +355,16 @@ void jce_gizmo_draw_scale(ImDrawList *dl,
                           ? jce_gizmo_internal_drag_axis()
                           : JCE_GIZMO_AXIS_NONE;
 
+    float ax_x[3], ax_y[3], ax_z[3];
+    jce_gizmo_internal_get_axes(ax_x, ax_y, ax_z);
+
     float px_len = screen_axis_length(cam, position, scale_factor);
 
-    draw_scale_axis(dl, cam, position, s_axis_x, px_len,
+    draw_scale_axis(dl, cam, position, ax_x, px_len,
                     JCE_GIZMO_AXIS_X, hovered, dragging);
-    draw_scale_axis(dl, cam, position, s_axis_y, px_len,
+    draw_scale_axis(dl, cam, position, ax_y, px_len,
                     JCE_GIZMO_AXIS_Y, hovered, dragging);
-    draw_scale_axis(dl, cam, position, s_axis_z, px_len,
+    draw_scale_axis(dl, cam, position, ax_z, px_len,
                     JCE_GIZMO_AXIS_Z, hovered, dragging);
 
     /* Center cube */

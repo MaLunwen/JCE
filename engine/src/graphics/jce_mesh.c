@@ -129,6 +129,31 @@ void jce_mesh_submit(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id
     bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
 }
 
+void jce_mesh_submit_wireframe_overlay(const JceMesh *mesh, const JceRenderer *r,
+                                       uint16_t view_id)
+{
+    if (!mesh || !r) return;
+
+    bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
+
+    if (mesh->wf_ibh.idx != UINT16_MAX) {
+        bgfx_set_index_buffer(mesh->wf_ibh, 0, mesh->num_wf_indices);
+    } else if (mesh->ibh.idx != UINT16_MAX) {
+        bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
+    }
+
+    /* LEQUAL depth test so wireframe overlay renders on top of solid geometry
+     * at the same depth.  LINEAA for smooth anti-aliased lines. */
+    bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                 | BGFX_STATE_DEPTH_TEST_LEQUAL
+                 | BGFX_STATE_MSAA | BGFX_STATE_PT_LINES
+                 | BGFX_STATE_LINEAA, 0);
+
+    JceShaderHandle sh = jce_renderer_get_program_mesh(r);
+    bgfx_program_handle_t prog = { sh.idx };
+    bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+}
+
 uint32_t jce_mesh_vertex_count(const JceMesh *mesh)
 {
     return mesh ? mesh->num_verts : 0;

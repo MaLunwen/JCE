@@ -16,6 +16,7 @@
 
 #include <imgui.h>
 #include <imgui_internal.h>
+#include <bgfx/c99/bgfx.h>
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
@@ -36,6 +37,27 @@ static bool   s_sel_pending   = false;
 static ImVec2 s_sel_rect_min  = ImVec2(0, 0);
 static ImVec2 s_sel_rect_max  = ImVec2(0, 0);
 
+/* Pending single-click ray pick (applied in camera matrices block). */
+static bool   s_sel_click_pending = false;
+static ImVec2 s_sel_click_pos     = ImVec2(0, 0);
+
+/* Raw gizmo drag values (unsnapped) to keep Ctrl snapping smooth.
+ * We snap only the applied output, but preserve raw drag progression. */
+static bool  s_gizmo_raw_dragging = false;
+static float s_gizmo_raw_pos[3]   = {0.0f, 0.0f, 0.0f};
+static float s_gizmo_raw_rot[3]   = {0.0f, 0.0f, 0.0f};
+static float s_gizmo_raw_scale[3] = {1.0f, 1.0f, 1.0f};
+
+static JceComponentInfo *find_transform_component(JceComponentInfo *comps, int comp_count)
+{
+    if (!comps || comp_count <= 0) return NULL;
+    for (int i = 0; i < comp_count; i++) {
+        if (comps[i].type == JCE_COMP_TRANSFORM)
+            return &comps[i];
+    }
+    return NULL;
+}
+
 /* ── Helper: transform 3D direction by camera view matrix → 2D ───── */
 
 static ImVec2 project_axis(const float *view16, float dx, float dy, float dz,
@@ -46,6 +68,30 @@ static ImVec2 project_axis(const float *view16, float dx, float dy, float dz,
     float sy = view16[1] * dx + view16[5] * dy + view16[9]  * dz;
     /* Screen X → right, Screen Y → down (ImGui convention). */
     return ImVec2(cx + sx * radius, cy - sy * radius);
+}
+
+/* ── Ray-AABB intersection (slab method) ──────────────────────────── */
+
+static bool ray_aabb_intersect(const float ro[3], const float rd[3],
+                                const float bmin[3], const float bmax[3],
+                                float *out_t)
+{
+    float tmin = 0.0f, tmax = 1e30f;
+    for (int i = 0; i < 3; i++) {
+        if (fabsf(rd[i]) < 1e-8f) {
+            if (ro[i] < bmin[i] || ro[i] > bmax[i]) return false;
+        } else {
+            float inv = 1.0f / rd[i];
+            float t1 = (bmin[i] - ro[i]) * inv;
+            float t2 = (bmax[i] - ro[i]) * inv;
+            if (t1 > t2) { float tmp = t1; t1 = t2; t2 = tmp; }
+            if (t1 > tmin) tmin = t1;
+            if (t2 < tmax) tmax = t2;
+            if (tmin > tmax) return false;
+        }
+    }
+    *out_t = tmin;
+    return true;
 }
 
 /* ── Axis Indicator (bottom-left corner) ──────────────────────────── */
@@ -318,12 +364,18 @@ void jce_editor_panel_scene_view_content(void)
     JceGizmoMode gm = jce_state_get_gizmo_mode();
     if (ImGui::RadioButton("T", gm == JCE_GIZMO_TRANSLATE))
         jce_state_set_gizmo_mode(JCE_GIZMO_TRANSLATE);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Translate  [W]\nCtrl: snap every 0.5 units");
     ImGui::SameLine();
     if (ImGui::RadioButton("R", gm == JCE_GIZMO_ROTATE))
         jce_state_set_gizmo_mode(JCE_GIZMO_ROTATE);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Rotate  [E]\nCtrl: snap every 15 deg");
     ImGui::SameLine();
     if (ImGui::RadioButton("S", gm == JCE_GIZMO_SCALE))
         jce_state_set_gizmo_mode(JCE_GIZMO_SCALE);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Scale  [R]\nCtrl: snap every 0.25");
 
     ImGui::SameLine();
     ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
@@ -419,7 +471,15 @@ void jce_editor_panel_scene_view_content(void)
     /* Display the FBO texture. */
     uint16_t tex_idx = jce_editor_scene_render_get_texture();
     if (tex_idx != UINT16_MAX) {
-        ImGui::Image((ImTextureID)(uintptr_t)tex_idx, avail);
+        /* OpenGL framebuffers have bottom-left origin; flip UV Y so the
+           image is not vertically inverted in the ImGui viewport. */
+        const bgfx_caps_t *caps = bgfx_get_caps();
+        if (caps->originBottomLeft) {
+            ImGui::Image((ImTextureID)(uintptr_t)tex_idx, avail,
+                         ImVec2(0.0f, 1.0f), ImVec2(1.0f, 0.0f));
+        } else {
+            ImGui::Image((ImTextureID)(uintptr_t)tex_idx, avail);
+        }
     } else {
         /* Fallback: show status text on the dark background. */
         ImGui::SetCursorScreenPos(ImVec2(screen_pos.x + 8, screen_pos.y + 8));
@@ -432,6 +492,173 @@ void jce_editor_panel_scene_view_content(void)
     ImGui::InvisibleButton("##SceneViewInput", avail);
     bool viewport_hovered = ImGui::IsItemHovered();
     (void)ImGui::IsItemActive(); /* reserved for future drag handling */
+
+    /* ── Right-click context menu (scene viewport) ────────────── */
+    /* Use manual bounds check so repeated right-clicks work even
+       when an ImGui popup is covering the InvisibleButton. */
+    {
+        ImVec2 mpos = ImGui::GetMousePos();
+        bool mouse_in_vp = (mpos.x >= screen_pos.x &&
+                            mpos.x <= screen_pos.x + avail.x &&
+                            mpos.y >= screen_pos.y &&
+                            mpos.y <= screen_pos.y + avail.y);
+
+        if (mouse_in_vp && ImGui::IsMouseClicked(ImGuiMouseButton_Right)
+            && !ImGui::GetIO().KeyAlt)
+        {
+            ImGui::OpenPopup("SceneViewContextMenu");
+        }
+    }
+    if (ImGui::BeginPopup("SceneViewContextMenu")) {
+        uint32_t focused = jce_state_get_focused();
+        int sel_count = 0;
+        const uint32_t *sel_ids = jce_state_get_selection(&sel_count);
+        bool has_selection = sel_count > 0;
+
+        if (ImGui::BeginMenu("Create")) {
+            if (ImGui::MenuItem("Empty Entity")) {
+                uint32_t id = jce_state_create_entity("New Entity", 0);
+                jce_state_select_entity(id, false);
+                jce_editor_inspector_request_sync();
+            }
+
+            ImGui::Separator();
+
+            if (ImGui::BeginMenu("2D Objects")) {
+                if (ImGui::MenuItem("Sprite")) {
+                    uint32_t id = jce_state_create_entity("Sprite", 0);
+                    jce_state_select_entity(id, false);
+                    jce_editor_inspector_request_sync();
+                }
+                if (ImGui::MenuItem("UI Text")) {
+                    uint32_t id = jce_state_create_entity("UI Text", 0);
+                    jce_state_select_entity(id, false);
+                    jce_editor_inspector_request_sync();
+                }
+                ImGui::EndMenu();
+            }
+
+            if (ImGui::BeginMenu("3D Objects")) {
+                if (ImGui::MenuItem("Cube")) {
+                    uint32_t id = jce_state_create_entity("Cube", 0);
+                    jce_state_select_entity(id, false);
+                    jce_editor_inspector_request_sync();
+                }
+                if (ImGui::MenuItem("Sphere")) {
+                    uint32_t id = jce_state_create_entity("Sphere", 0);
+                    jce_state_select_entity(id, false);
+                    jce_editor_inspector_request_sync();
+                }
+                if (ImGui::MenuItem("Plane")) {
+                    uint32_t id = jce_state_create_entity("Plane", 0);
+                    jce_state_select_entity(id, false);
+                    jce_editor_inspector_request_sync();
+                }
+                if (ImGui::MenuItem("Cylinder")) {
+                    uint32_t id = jce_state_create_entity("Cylinder", 0);
+                    jce_state_select_entity(id, false);
+                    jce_editor_inspector_request_sync();
+                }
+                ImGui::EndMenu();
+            }
+
+            ImGui::Separator();
+
+            if (ImGui::MenuItem("Camera")) {
+                uint32_t id = jce_state_create_entity("Camera", 0);
+                jce_state_select_entity(id, false);
+                jce_editor_inspector_request_sync();
+            }
+            if (ImGui::MenuItem("Light")) {
+                uint32_t id = jce_state_create_entity("Light", 0);
+                jce_state_select_entity(id, false);
+                jce_editor_inspector_request_sync();
+            }
+
+            ImGui::EndMenu();
+        }
+
+        if (has_selection) {
+            ImGui::Separator();
+
+            if (ImGui::MenuItem("Duplicate", "Ctrl+D")) {
+                if (sel_count > 1) {
+                    uint32_t dup_ids[JCE_MAX_SELECTED];
+                    int dup_count = 0;
+                    int n = sel_count < JCE_MAX_SELECTED ? sel_count : JCE_MAX_SELECTED;
+                    for (int i = 0; i < n; i++) {
+                        uint32_t dup = jce_state_duplicate_entity(sel_ids[i]);
+                        if (dup != 0 && dup_count < JCE_MAX_SELECTED)
+                            dup_ids[dup_count++] = dup;
+                    }
+                    if (dup_count > 0) {
+                        jce_state_select_entity(dup_ids[0], false);
+                        for (int i = 1; i < dup_count; i++)
+                            jce_state_select_entity(dup_ids[i], true);
+                    }
+                } else if (focused != 0) {
+                    uint32_t dup = jce_state_duplicate_entity(focused);
+                    if (dup != 0)
+                        jce_state_select_entity(dup, false);
+                }
+                jce_editor_inspector_request_sync();
+            }
+
+            if (ImGui::MenuItem("Delete", "Delete")) {
+                uint32_t ids[JCE_MAX_SELECTED];
+                int n = sel_count < JCE_MAX_SELECTED ? sel_count : JCE_MAX_SELECTED;
+                for (int si = 0; si < n; si++)
+                    ids[si] = sel_ids[si];
+                if (n > 0)
+                    jce_editor_inspector_request_delete_confirm_many(ids, n);
+            }
+
+            ImGui::Separator();
+
+            if (ImGui::MenuItem("Focus on Selection", "F")) {
+                if (focused != 0) {
+                    int fc = 0;
+                    JceComponentInfo *fcomps = jce_state_get_entity_components(focused, &fc);
+                    for (int fi = 0; fi < fc; fi++) {
+                        if (fcomps[fi].type == JCE_COMP_TRANSFORM) {
+                            jce_editor_scene_camera_set_target(
+                                fcomps[fi].data.transform.pos[0],
+                                fcomps[fi].data.transform.pos[1],
+                                fcomps[fi].data.transform.pos[2]);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (ImGui::BeginMenu("Gizmo Mode")) {
+                JceGizmoMode menu_gm = jce_state_get_gizmo_mode();
+                if (ImGui::MenuItem("Translate", "W", menu_gm == JCE_GIZMO_TRANSLATE))
+                    jce_state_set_gizmo_mode(JCE_GIZMO_TRANSLATE);
+                if (ImGui::MenuItem("Rotate", "E", menu_gm == JCE_GIZMO_ROTATE))
+                    jce_state_set_gizmo_mode(JCE_GIZMO_ROTATE);
+                if (ImGui::MenuItem("Scale", "R", menu_gm == JCE_GIZMO_SCALE))
+                    jce_state_set_gizmo_mode(JCE_GIZMO_SCALE);
+                ImGui::EndMenu();
+            }
+        }
+
+        ImGui::Separator();
+
+        if (ImGui::BeginMenu("View")) {
+            if (ImGui::MenuItem("Reset Camera"))
+                jce_editor_scene_camera_reset();
+            if (ImGui::MenuItem("Top View"))
+                jce_editor_scene_camera_snap_view(JCE_CAM_VIEW_TOP);
+            if (ImGui::MenuItem("Front View"))
+                jce_editor_scene_camera_snap_view(JCE_CAM_VIEW_FRONT);
+            if (ImGui::MenuItem("Side View"))
+                jce_editor_scene_camera_snap_view(JCE_CAM_VIEW_RIGHT);
+            ImGui::EndMenu();
+        }
+
+        ImGui::EndPopup();
+    }
 
     /* ── Maya-style camera controls ───────────────────────────── */
     {
@@ -464,7 +691,9 @@ void jce_editor_panel_scene_view_content(void)
 
     /* ── Selection box (marquee) ──────────────────────────────── */
     if (viewport_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)
-        && !ImGui::GetIO().KeyAlt)
+        && !ImGui::GetIO().KeyAlt
+        && !jce_gizmo_is_active()
+        && jce_gizmo_hovered_axis() == JCE_GIZMO_AXIS_NONE)
     {
         s_is_selecting = true;
         s_sel_start    = ImGui::GetMousePos();
@@ -503,6 +732,10 @@ void jce_editor_panel_scene_view_content(void)
                                         fminf(s_sel_start.y, s_sel_current.y));
                 s_sel_rect_max = ImVec2(fmaxf(s_sel_start.x, s_sel_current.x),
                                         fmaxf(s_sel_start.y, s_sel_current.y));
+            } else {
+                /* Single click: schedule ray-pick in camera matrices block. */
+                s_sel_click_pending = true;
+                s_sel_click_pos     = s_sel_start;
             }
         }
     }
@@ -527,16 +760,9 @@ void jce_editor_panel_scene_view_content(void)
     if (jce_editor_prefs_show_gizmos()) {
         uint32_t focused = jce_state_get_focused();
         if (focused != 0) {
-            JceComponentInfo comps[JCE_MAX_COMPONENTS];
-            int comp_count = jce_state_get_components(focused, comps, JCE_MAX_COMPONENTS);
-
-            JceComponentInfo *xform = NULL;
-            for (int i = 0; i < comp_count; i++) {
-                if (comps[i].type == JCE_COMP_TRANSFORM) {
-                    xform = &comps[i];
-                    break;
-                }
-            }
+            int comp_count = 0;
+            JceComponentInfo *comps = jce_state_get_entity_components(focused, &comp_count);
+            JceComponentInfo *xform = find_transform_component(comps, comp_count);
 
             if (xform) {
                 JceGizmoCamera gcam;
@@ -583,21 +809,188 @@ void jce_editor_panel_scene_view_content(void)
 
                 float scale_factor = jce_editor_prefs_gizmo_scale();
 
+                int sel_count = 0;
+                const uint32_t *sel_ids = jce_state_get_selection(&sel_count);
+                bool multi_select = sel_count > 1;
+
+                float gizmo_pos[3] = {
+                    xform->data.transform.pos[0],
+                    xform->data.transform.pos[1],
+                    xform->data.transform.pos[2]
+                };
+                float gizmo_rot[3] = {
+                    xform->data.transform.rot[0],
+                    xform->data.transform.rot[1],
+                    xform->data.transform.rot[2]
+                };
+                float gizmo_scale[3] = {
+                    xform->data.transform.scale[0],
+                    xform->data.transform.scale[1],
+                    xform->data.transform.scale[2]
+                };
+
+                if (multi_select) {
+                    float sum_pos[3] = {0.0f, 0.0f, 0.0f};
+                    int valid_xforms = 0;
+                    for (int i = 0; i < sel_count; i++) {
+                        int other_count = 0;
+                        JceComponentInfo *other_comps = jce_state_get_entity_components(sel_ids[i], &other_count);
+                        JceComponentInfo *other_xform = find_transform_component(other_comps, other_count);
+                        if (!other_xform) continue;
+                        sum_pos[0] += other_xform->data.transform.pos[0];
+                        sum_pos[1] += other_xform->data.transform.pos[1];
+                        sum_pos[2] += other_xform->data.transform.pos[2];
+                        valid_xforms++;
+                    }
+                    if (valid_xforms > 0) {
+                        gizmo_pos[0] = sum_pos[0] / (float)valid_xforms;
+                        gizmo_pos[1] = sum_pos[1] / (float)valid_xforms;
+                        gizmo_pos[2] = sum_pos[2] / (float)valid_xforms;
+                    } else {
+                        multi_select = false;
+                    }
+                }
+
+                float pos_before[3] = { gizmo_pos[0], gizmo_pos[1], gizmo_pos[2] };
+                float rot_before[3] = { gizmo_rot[0], gizmo_rot[1], gizmo_rot[2] };
+                float scale_before[3] = { gizmo_scale[0], gizmo_scale[1], gizmo_scale[2] };
+
+                /* Use raw drag values while dragging so snap feedback does not
+                 * reset per-frame deltas and stall movement. */
+                float gizmo_raw_pos[3] = { gizmo_pos[0], gizmo_pos[1], gizmo_pos[2] };
+                float gizmo_raw_rot[3] = { gizmo_rot[0], gizmo_rot[1], gizmo_rot[2] };
+                float gizmo_raw_scale[3] = {
+                    gizmo_scale[0], gizmo_scale[1], gizmo_scale[2]
+                };
+                bool gizmo_dragging_before = jce_gizmo_is_active();
+                if (gizmo_dragging_before && s_gizmo_raw_dragging) {
+                    memcpy(gizmo_raw_pos, s_gizmo_raw_pos, sizeof(gizmo_raw_pos));
+                    memcpy(gizmo_raw_rot, s_gizmo_raw_rot, sizeof(gizmo_raw_rot));
+                    memcpy(gizmo_raw_scale, s_gizmo_raw_scale, sizeof(gizmo_raw_scale));
+                }
+
+                JceGizmoMode active_gm = jce_state_get_gizmo_mode();
                 jce_gizmo_update(&gcam,
-                                  (int)jce_state_get_gizmo_mode(),
-                                  (int)jce_state_get_gizmo_space(),
-                                  scale_factor,
-                                  xform->data.transform.pos,
-                                  xform->data.transform.rot,
-                                  xform->data.transform.scale);
+                                 (int)active_gm,
+                                 (int)jce_state_get_gizmo_space(),
+                                 scale_factor,
+                                 gizmo_raw_pos,
+                                 gizmo_raw_rot,
+                                 gizmo_raw_scale);
+
+                bool gizmo_dragging_after = jce_gizmo_is_active();
+                if (gizmo_dragging_after) {
+                    s_gizmo_raw_dragging = true;
+                    memcpy(s_gizmo_raw_pos, gizmo_raw_pos, sizeof(s_gizmo_raw_pos));
+                    memcpy(s_gizmo_raw_rot, gizmo_raw_rot, sizeof(s_gizmo_raw_rot));
+                    memcpy(s_gizmo_raw_scale, gizmo_raw_scale, sizeof(s_gizmo_raw_scale));
+                } else {
+                    s_gizmo_raw_dragging = false;
+                }
+
+                memcpy(gizmo_pos, gizmo_raw_pos, sizeof(gizmo_pos));
+                memcpy(gizmo_rot, gizmo_raw_rot, sizeof(gizmo_rot));
+                memcpy(gizmo_scale, gizmo_raw_scale, sizeof(gizmo_scale));
+
+                /* Ctrl + TRS snapping (old Java editor behavior). */
+                if (ImGui::GetIO().KeyCtrl && gizmo_dragging_after) {
+                    const float snap_translate = 0.5f;
+                    const float snap_angle     = 15.0f;
+                    const float snap_scale     = 0.25f;
+                    switch (active_gm) {
+                        case JCE_GIZMO_TRANSLATE:
+                            gizmo_pos[0] = roundf(gizmo_pos[0] / snap_translate) * snap_translate;
+                            gizmo_pos[1] = roundf(gizmo_pos[1] / snap_translate) * snap_translate;
+                            gizmo_pos[2] = roundf(gizmo_pos[2] / snap_translate) * snap_translate;
+                            break;
+                        case JCE_GIZMO_ROTATE:
+                            gizmo_rot[0] = roundf(gizmo_rot[0] / snap_angle) * snap_angle;
+                            gizmo_rot[1] = roundf(gizmo_rot[1] / snap_angle) * snap_angle;
+                            gizmo_rot[2] = roundf(gizmo_rot[2] / snap_angle) * snap_angle;
+                            break;
+                        case JCE_GIZMO_SCALE:
+                            gizmo_scale[0] = roundf(gizmo_scale[0] / snap_scale) * snap_scale;
+                            gizmo_scale[1] = roundf(gizmo_scale[1] / snap_scale) * snap_scale;
+                            gizmo_scale[2] = roundf(gizmo_scale[2] / snap_scale) * snap_scale;
+                            break;
+                        default: break;
+                    }
+                }
+
+                float dpos[3] = {
+                    gizmo_pos[0] - pos_before[0],
+                    gizmo_pos[1] - pos_before[1],
+                    gizmo_pos[2] - pos_before[2]
+                };
+                float drot[3] = {
+                    gizmo_rot[0] - rot_before[0],
+                    gizmo_rot[1] - rot_before[1],
+                    gizmo_rot[2] - rot_before[2]
+                };
+                float dscale[3] = {
+                    gizmo_scale[0] - scale_before[0],
+                    gizmo_scale[1] - scale_before[1],
+                    gizmo_scale[2] - scale_before[2]
+                };
+
+                const float eps = 0.0001f;
+                bool gizmo_changed = false;
+                if (active_gm == JCE_GIZMO_TRANSLATE) {
+                    gizmo_changed = (fabsf(dpos[0]) > eps || fabsf(dpos[1]) > eps || fabsf(dpos[2]) > eps);
+                } else if (active_gm == JCE_GIZMO_ROTATE) {
+                    gizmo_changed = (fabsf(drot[0]) > eps || fabsf(drot[1]) > eps || fabsf(drot[2]) > eps);
+                } else if (active_gm == JCE_GIZMO_SCALE) {
+                    gizmo_changed = (fabsf(dscale[0]) > eps || fabsf(dscale[1]) > eps || fabsf(dscale[2]) > eps);
+                }
+
+                if (gizmo_changed) {
+                    if (multi_select) {
+                        for (int i = 0; i < sel_count; i++) {
+                            int other_count = 0;
+                            JceComponentInfo *other_comps = jce_state_get_entity_components(sel_ids[i], &other_count);
+                            JceComponentInfo *other_xform = find_transform_component(other_comps, other_count);
+                            if (!other_xform) continue;
+
+                            if (active_gm == JCE_GIZMO_TRANSLATE) {
+                                other_xform->data.transform.pos[0] += dpos[0];
+                                other_xform->data.transform.pos[1] += dpos[1];
+                                other_xform->data.transform.pos[2] += dpos[2];
+                            } else if (active_gm == JCE_GIZMO_ROTATE) {
+                                other_xform->data.transform.rot[0] += drot[0];
+                                other_xform->data.transform.rot[1] += drot[1];
+                                other_xform->data.transform.rot[2] += drot[2];
+                            } else if (active_gm == JCE_GIZMO_SCALE) {
+                                other_xform->data.transform.scale[0] += dscale[0];
+                                other_xform->data.transform.scale[1] += dscale[1];
+                                other_xform->data.transform.scale[2] += dscale[2];
+
+                                if (other_xform->data.transform.scale[0] < 0.001f) other_xform->data.transform.scale[0] = 0.001f;
+                                if (other_xform->data.transform.scale[1] < 0.001f) other_xform->data.transform.scale[1] = 0.001f;
+                                if (other_xform->data.transform.scale[2] < 0.001f) other_xform->data.transform.scale[2] = 0.001f;
+                            }
+                        }
+                    } else {
+                        xform->data.transform.pos[0] = gizmo_pos[0];
+                        xform->data.transform.pos[1] = gizmo_pos[1];
+                        xform->data.transform.pos[2] = gizmo_pos[2];
+                        xform->data.transform.rot[0] = gizmo_rot[0];
+                        xform->data.transform.rot[1] = gizmo_rot[1];
+                        xform->data.transform.rot[2] = gizmo_rot[2];
+                        xform->data.transform.scale[0] = gizmo_scale[0] < 0.001f ? 0.001f : gizmo_scale[0];
+                        xform->data.transform.scale[1] = gizmo_scale[1] < 0.001f ? 0.001f : gizmo_scale[1];
+                        xform->data.transform.scale[2] = gizmo_scale[2] < 0.001f ? 0.001f : gizmo_scale[2];
+                    }
+
+                    jce_editor_inspector_request_sync();
+                }
 
                 jce_gizmo_draw(dl, &gcam,
-                                (int)jce_state_get_gizmo_mode(),
-                                (int)jce_state_get_gizmo_space(),
-                                scale_factor,
-                                xform->data.transform.pos,
-                                xform->data.transform.rot,
-                                xform->data.transform.scale);
+                               (int)jce_state_get_gizmo_mode(),
+                               (int)jce_state_get_gizmo_space(),
+                               scale_factor,
+                               gizmo_pos,
+                               gizmo_rot,
+                               gizmo_scale);
             }
         }
     }
@@ -607,6 +1000,58 @@ void jce_editor_panel_scene_view_content(void)
         if (ImGui::IsKeyPressed(ImGuiKey_W)) jce_state_set_gizmo_mode(JCE_GIZMO_TRANSLATE);
         if (ImGui::IsKeyPressed(ImGuiKey_E)) jce_state_set_gizmo_mode(JCE_GIZMO_ROTATE);
         if (ImGui::IsKeyPressed(ImGuiKey_R)) jce_state_set_gizmo_mode(JCE_GIZMO_SCALE);
+
+        /* F — Focus camera on selected entity */
+        if (ImGui::IsKeyPressed(ImGuiKey_F)) {
+            uint32_t f_ent = jce_state_get_focused();
+            if (f_ent != 0) {
+                int fc = 0;
+                JceComponentInfo *fcomps = jce_state_get_entity_components(f_ent, &fc);
+                for (int fi = 0; fi < fc; fi++) {
+                    if (fcomps[fi].type == JCE_COMP_TRANSFORM) {
+                        jce_editor_scene_camera_set_target(
+                            fcomps[fi].data.transform.pos[0],
+                            fcomps[fi].data.transform.pos[1],
+                            fcomps[fi].data.transform.pos[2]);
+                        break;
+                    }
+                }
+            }
+        }
+
+        /* Delete — Delete selected entities */
+        if (ImGui::IsKeyPressed(ImGuiKey_Delete)) {
+            int dk = 0;
+            const uint32_t *dids = jce_state_get_selection(&dk);
+            if (dk > 0) {
+                uint32_t ids[JCE_MAX_SELECTED];
+                int n = dk < JCE_MAX_SELECTED ? dk : JCE_MAX_SELECTED;
+                for (int di = 0; di < n; di++)
+                    ids[di] = dids[di];
+                jce_editor_inspector_request_delete_confirm_many(ids, n);
+            }
+        }
+
+        /* Ctrl+D — Duplicate selected entities */
+        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D)) {
+            int dk = 0;
+            const uint32_t *dids = jce_state_get_selection(&dk);
+            if (dk > 0) {
+                uint32_t new_ids[JCE_MAX_SELECTED];
+                int nc = 0;
+                for (int di = 0; di < dk && di < JCE_MAX_SELECTED; di++) {
+                    uint32_t dup = jce_state_duplicate_entity(dids[di]);
+                    if (dup != 0 && nc < JCE_MAX_SELECTED)
+                        new_ids[nc++] = dup;
+                }
+                if (nc > 0) {
+                    jce_state_select_entity(new_ids[0], false);
+                    for (int di = 1; di < nc; di++)
+                        jce_state_select_entity(new_ids[di], true);
+                }
+                jce_editor_inspector_request_sync();
+            }
+        }
     }
 
     /* ── Axis indicator (bottom-left) + View cube (top-right) ───── */
@@ -642,47 +1087,155 @@ void jce_editor_panel_scene_view_content(void)
             /* ── Marquee selection hit-test ──────────────────────── */
             if (s_sel_pending) {
                 s_sel_pending = false;
-                bool add_mode = ImGui::GetIO().KeyShift;
+                bool add_mode = ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift;
                 if (!add_mode) jce_state_clear_selection();
 
                 int total = jce_state_get_entity_count();
-                for (uint32_t meid = 1; meid <= (uint32_t)(total + 20); meid++) {
-                    JceEntityInfo *me = jce_state_get_entity(meid);
+                for (int mi = 0; mi < total; mi++) {
+                    JceEntityInfo *me = jce_state_get_entity_by_index(mi);
                     if (!me || !me->enabled) continue;
+                    uint32_t meid = me->id;
 
                     JceComponentInfo me_comps[JCE_MAX_COMPONENTS];
                     int me_cc = jce_state_get_components(meid, me_comps, JCE_MAX_COMPONENTS);
                     float mwp[3] = {0, 0, 0};
+                    float mws[3] = {1, 1, 1};
                     bool has_xf = false;
                     for (int mci = 0; mci < me_cc; mci++) {
                         if (me_comps[mci].type == JCE_COMP_TRANSFORM) {
                             mwp[0] = me_comps[mci].data.transform.pos[0];
                             mwp[1] = me_comps[mci].data.transform.pos[1];
                             mwp[2] = me_comps[mci].data.transform.pos[2];
+                            mws[0] = me_comps[mci].data.transform.scale[0];
+                            mws[1] = me_comps[mci].data.transform.scale[1];
+                            mws[2] = me_comps[mci].data.transform.scale[2];
                             has_xf = true;
                             break;
                         }
                     }
                     if (!has_xf) continue;
 
-                    /* World → view → clip space (column-major matrices). */
-                    float mvx = view_mat[0]*mwp[0] + view_mat[4]*mwp[1] + view_mat[8] *mwp[2] + view_mat[12];
-                    float mvy = view_mat[1]*mwp[0] + view_mat[5]*mwp[1] + view_mat[9] *mwp[2] + view_mat[13];
-                    float mvz = view_mat[2]*mwp[0] + view_mat[6]*mwp[1] + view_mat[10]*mwp[2] + view_mat[14];
-                    float mvw = view_mat[3]*mwp[0] + view_mat[7]*mwp[1] + view_mat[11]*mwp[2] + view_mat[15];
-                    float mcx = proj_mat[0]*mvx + proj_mat[4]*mvy + proj_mat[8] *mvz + proj_mat[12]*mvw;
-                    float mcy = proj_mat[1]*mvx + proj_mat[5]*mvy + proj_mat[9] *mvz + proj_mat[13]*mvw;
-                    float mcw = proj_mat[3]*mvx + proj_mat[7]*mvy + proj_mat[11]*mvz + proj_mat[15]*mvw;
-                    if (mcw <= 0.0f) continue; /* behind camera */
+                    /* Screen-space AABB overlap test. Using projected bounds is
+                     * much more reliable than testing only the object pivot. */
+                    float hx = fabsf(mws[0]) * 0.5f;
+                    float hy = fabsf(mws[1]) * 0.5f;
+                    float hz = fabsf(mws[2]) * 0.5f;
+                    if (hx < 0.1f) hx = 0.1f;
+                    if (hy < 0.1f) hy = 0.1f;
+                    if (hz < 0.1f) hz = 0.1f;
 
-                    float msx = screen_pos.x + (mcx / mcw + 1.0f) * 0.5f * avail.x;
-                    float msy = screen_pos.y + (1.0f - mcy / mcw) * 0.5f * avail.y;
+                    static const float corners[8][3] = {
+                        {-1,-1,-1}, { 1,-1,-1}, {-1, 1,-1}, { 1, 1,-1},
+                        {-1,-1, 1}, { 1,-1, 1}, {-1, 1, 1}, { 1, 1, 1},
+                    };
 
-                    if (msx >= s_sel_rect_min.x && msx <= s_sel_rect_max.x &&
-                        msy >= s_sel_rect_min.y && msy <= s_sel_rect_max.y)
+                    float bb_min_x =  1e30f, bb_min_y =  1e30f;
+                    float bb_max_x = -1e30f, bb_max_y = -1e30f;
+                    int projected = 0;
+
+                    for (int ci = 0; ci < 8; ci++) {
+                        float wx = mwp[0] + corners[ci][0] * hx;
+                        float wy = mwp[1] + corners[ci][1] * hy;
+                        float wz = mwp[2] + corners[ci][2] * hz;
+
+                        float mvx = view_mat[0]*wx + view_mat[4]*wy + view_mat[8] *wz + view_mat[12];
+                        float mvy = view_mat[1]*wx + view_mat[5]*wy + view_mat[9] *wz + view_mat[13];
+                        float mvz = view_mat[2]*wx + view_mat[6]*wy + view_mat[10]*wz + view_mat[14];
+                        float mvw = view_mat[3]*wx + view_mat[7]*wy + view_mat[11]*wz + view_mat[15];
+
+                        float mcx = proj_mat[0]*mvx + proj_mat[4]*mvy + proj_mat[8] *mvz + proj_mat[12]*mvw;
+                        float mcy = proj_mat[1]*mvx + proj_mat[5]*mvy + proj_mat[9] *mvz + proj_mat[13]*mvw;
+                        float mcw = proj_mat[3]*mvx + proj_mat[7]*mvy + proj_mat[11]*mvz + proj_mat[15]*mvw;
+                        if (mcw <= 0.0f) continue;
+
+                        float msx = screen_pos.x + (mcx / mcw + 1.0f) * 0.5f * avail.x;
+                        float msy = screen_pos.y + (1.0f - mcy / mcw) * 0.5f * avail.y;
+                        if (msx < bb_min_x) bb_min_x = msx;
+                        if (msx > bb_max_x) bb_max_x = msx;
+                        if (msy < bb_min_y) bb_min_y = msy;
+                        if (msy > bb_max_y) bb_max_y = msy;
+                        projected++;
+                    }
+
+                    if (projected <= 0) continue;
+
+                    if (bb_max_x >= s_sel_rect_min.x && bb_min_x <= s_sel_rect_max.x &&
+                        bb_max_y >= s_sel_rect_min.y && bb_min_y <= s_sel_rect_max.y)
                     {
                         jce_state_select_entity(meid, true /* add */);
                     }
+                }
+                jce_editor_inspector_request_sync();
+            }
+
+            /* ── Single-click ray pick ────────────────────────── */
+            if (s_sel_click_pending) {
+                s_sel_click_pending = false;
+                bool add_mode = ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift;
+
+                /* Build camera struct for screen-to-ray conversion. */
+                JceGizmoCamera pick_cam;
+                memcpy(pick_cam.view, view_mat, sizeof(float) * 16);
+                memcpy(pick_cam.proj, proj_mat, sizeof(float) * 16);
+                memcpy(pick_cam.eye,  eye,      sizeof(float) * 3);
+                pick_cam.viewport_size[0]   = avail.x;
+                pick_cam.viewport_size[1]   = avail.y;
+                pick_cam.viewport_origin[0] = screen_pos.x;
+                pick_cam.viewport_origin[1] = screen_pos.y;
+
+                float ray_o[3], ray_d[3];
+                gm_screen_to_ray(&pick_cam, s_sel_click_pos.x,
+                                 s_sel_click_pos.y, ray_o, ray_d);
+
+                uint32_t best_id = 0;
+                float    best_t  = 1e30f;
+
+                int total = jce_state_get_entity_count();
+                for (int pi = 0; pi < total; pi++) {
+                    JceEntityInfo *pe = jce_state_get_entity_by_index(pi);
+                    if (!pe || !pe->enabled) continue;
+
+                    JceComponentInfo pc[JCE_MAX_COMPONENTS];
+                    int pcc = jce_state_get_components(pe->id, pc,
+                                                       JCE_MAX_COMPONENTS);
+                    float pos[3] = {0,0,0}, scl[3] = {1,1,1};
+                    bool has_xf = false;
+                    for (int ci = 0; ci < pcc; ci++) {
+                        if (pc[ci].type == JCE_COMP_TRANSFORM) {
+                            memcpy(pos, pc[ci].data.transform.pos,
+                                   sizeof(float) * 3);
+                            memcpy(scl, pc[ci].data.transform.scale,
+                                   sizeof(float) * 3);
+                            has_xf = true;
+                            break;
+                        }
+                    }
+                    if (!has_xf) continue;
+
+                    /* AABB: half-extents from scale, min 0.1 each. */
+                    float hx = fabsf(scl[0]) * 0.5f;
+                    float hy = fabsf(scl[1]) * 0.5f;
+                    float hz = fabsf(scl[2]) * 0.5f;
+                    if (hx < 0.1f) hx = 0.1f;
+                    if (hy < 0.1f) hy = 0.1f;
+                    if (hz < 0.1f) hz = 0.1f;
+
+                    float bmin[3] = { pos[0]-hx, pos[1]-hy, pos[2]-hz };
+                    float bmax[3] = { pos[0]+hx, pos[1]+hy, pos[2]+hz };
+
+                    float t;
+                    if (ray_aabb_intersect(ray_o, ray_d, bmin, bmax, &t)) {
+                        if (t < best_t) {
+                            best_t  = t;
+                            best_id = pe->id;
+                        }
+                    }
+                }
+
+                if (best_id != 0) {
+                    jce_state_select_entity(best_id, add_mode);
+                } else if (!add_mode) {
+                    jce_state_clear_selection();
                 }
                 jce_editor_inspector_request_sync();
             }
@@ -728,12 +1281,18 @@ void jce_editor_panel_scene_view_content(void)
 
                     /* Draw orange diamond marker around entity position. */
                     float mr = 14.0f;
+                    dl->AddQuadFilled(
+                        ImVec2(ssx,      ssy - mr),
+                        ImVec2(ssx + mr, ssy),
+                        ImVec2(ssx,      ssy + mr),
+                        ImVec2(ssx - mr, ssy),
+                        IM_COL32(255, 120, 0, 60));
                     dl->AddQuad(
                         ImVec2(ssx,      ssy - mr),
                         ImVec2(ssx + mr, ssy),
                         ImVec2(ssx,      ssy + mr),
                         ImVec2(ssx - mr, ssy),
-                        IM_COL32(255, 165, 0, 220), 1.5f);
+                        IM_COL32(255, 120, 0, 230), 2.0f);
                 }
             }
         }

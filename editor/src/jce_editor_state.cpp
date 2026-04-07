@@ -47,6 +47,7 @@ static struct {
     JceComponentInfo components[JCE_MAX_ENTITIES][JCE_MAX_COMPONENTS];
     int              entity_count;
     uint32_t         next_id;
+    char             current_scene_path[512];
 
     bool initialized;
 } s;
@@ -58,6 +59,41 @@ static int find_entity(uint32_t id)
     for (int i = 0; i < s.entity_count; i++)
         if (s.entities[i].id == id) return i;
     return -1;
+}
+
+static void set_current_scene_path_internal(const char *scene_path)
+{
+    if (scene_path && scene_path[0] != '\0')
+        snprintf(s.current_scene_path, sizeof(s.current_scene_path), "%s", scene_path);
+    else
+        s.current_scene_path[0] = '\0';
+}
+
+static void update_scene_dir_from_path(const char *scene_path)
+{
+    if (!scene_path || scene_path[0] == '\0')
+        return;
+
+    char scene_dir[512];
+    snprintf(scene_dir, sizeof(scene_dir), "%s", scene_path);
+
+    /* Find last path separator. */
+    char *sep = strrchr(scene_dir, '/');
+    char *bsep = strrchr(scene_dir, '\\');
+    if (bsep && (!sep || bsep > sep)) sep = bsep;
+    if (sep) {
+        *sep = '\0';
+        /* Go up one more level if we're in a "Scenes" subdirectory. */
+        char *last_comp = strrchr(scene_dir, '/');
+        char *last_bcomp = strrchr(scene_dir, '\\');
+        if (last_bcomp && (!last_comp || last_bcomp > last_comp)) last_comp = last_bcomp;
+        const char *dir_name = last_comp ? last_comp + 1 : scene_dir;
+        if (_stricmp(dir_name, "Scenes") == 0 || _stricmp(dir_name, "scenes") == 0) {
+            if (last_comp) *last_comp = '\0';
+        }
+    }
+
+    jce_editor_scene_set_scene_dir(scene_dir);
 }
 
 static void clear_scene_entities(void)
@@ -727,6 +763,7 @@ void jce_editor_state_init(void)
     s.view_mode   = JCE_VIEW_SHADED;
     s.play_state  = JCE_PLAY_STOPPED;
     s.show_grid   = true;
+    s.current_scene_path[0] = '\0';
     clear_scene_entities();
     build_demo_scene();
 
@@ -799,6 +836,13 @@ JceEntityInfo *jce_state_get_entity(uint32_t id)
 {
     int idx = find_entity(id);
     return idx >= 0 ? &s.entities[idx] : NULL;
+}
+
+JceEntityInfo *jce_state_get_entity_by_index(int index)
+{
+    if (index < 0 || index >= s.entity_count)
+        return NULL;
+    return &s.entities[index];
 }
 
 JceEntityInfo *jce_state_get_root_entities(int *out_count)
@@ -1139,27 +1183,8 @@ bool jce_state_load_scene_file(const char *scene_path)
     if (!scene_path || scene_path[0] == '\0')
         return false;
 
-    /* Set the scene base directory for mesh resolution. */
-    {
-        char scene_dir[512];
-        snprintf(scene_dir, sizeof(scene_dir), "%s", scene_path);
-        /* Find last path separator. */
-        char *sep = strrchr(scene_dir, '/');
-        char *bsep = strrchr(scene_dir, '\\');
-        if (bsep && (!sep || bsep > sep)) sep = bsep;
-        if (sep) {
-            *sep = '\0';
-            /* Go up one more level if we're in a "Scenes" subdirectory. */
-            char *last_comp = strrchr(scene_dir, '/');
-            char *last_bcomp = strrchr(scene_dir, '\\');
-            if (last_bcomp && (!last_comp || last_bcomp > last_comp)) last_comp = last_bcomp;
-            const char *dir_name = last_comp ? last_comp + 1 : scene_dir;
-            if (_stricmp(dir_name, "Scenes") == 0 || _stricmp(dir_name, "scenes") == 0) {
-                if (last_comp) *last_comp = '\0';
-            }
-        }
-        jce_editor_scene_set_scene_dir(scene_dir);
-    }
+    /* Set the scene base directory for mesh/texture resolution. */
+    update_scene_dir_from_path(scene_path);
 
     FILE *fp = fopen(scene_path, "rb");
     if (!fp) {
@@ -1247,10 +1272,143 @@ bool jce_state_load_scene_file(const char *scene_path)
         LOG_WARN(LOG_TAG, "scene load: no supported entity data in %s", scene_path);
 
     jce_state_clear_selection();
+    set_current_scene_path_internal(scene_path);
     LOG_INFO(LOG_TAG, "scene loaded from %s (%d entities)", scene_path, s.entity_count);
 
     cJSON_Delete(root);
     return true;
+}
+
+static const char *component_type_save_name(JceComponentType type)
+{
+    switch (type) {
+    case JCE_COMP_TRANSFORM:          return "Transform";
+    case JCE_COMP_MESH_RENDERER:      return "MeshRenderer";
+    case JCE_COMP_SPRITE_RENDERER:    return "SpriteRenderer";
+    case JCE_COMP_CAMERA:             return "Camera";
+    case JCE_COMP_LIGHT:              return "Light";
+    case JCE_COMP_ANIMATOR:           return "Animator";
+    case JCE_COMP_SKELETAL_ANIMATOR:  return "SkeletalAnimator";
+    case JCE_COMP_RIGIDBODY:          return "Rigidbody";
+    case JCE_COMP_BOX_COLLIDER:       return "BoxCollider";
+    case JCE_COMP_SPHERE_COLLIDER:    return "SphereCollider";
+    case JCE_COMP_CHARACTER_CONTROLLER:return "CharacterController";
+    case JCE_COMP_AUDIO_SOURCE:       return "AudioSource";
+    case JCE_COMP_SCRIPT:             return "Script";
+    default:                          return "Unknown";
+    }
+}
+
+static cJSON *serialize_component_json(const JceComponentInfo *comp)
+{
+    if (!comp) return NULL;
+
+    cJSON *obj = cJSON_CreateObject();
+    cJSON_AddStringToObject(obj, "type", component_type_save_name(comp->type));
+
+    switch (comp->type) {
+    case JCE_COMP_TRANSFORM:
+        cJSON_AddNumberToObject(obj, "posX", comp->data.transform.pos[0]);
+        cJSON_AddNumberToObject(obj, "posY", comp->data.transform.pos[1]);
+        cJSON_AddNumberToObject(obj, "posZ", comp->data.transform.pos[2]);
+        cJSON_AddNumberToObject(obj, "rotX", comp->data.transform.rot[0]);
+        cJSON_AddNumberToObject(obj, "rotY", comp->data.transform.rot[1]);
+        cJSON_AddNumberToObject(obj, "rotZ", comp->data.transform.rot[2]);
+        cJSON_AddNumberToObject(obj, "scaleX", comp->data.transform.scale[0]);
+        cJSON_AddNumberToObject(obj, "scaleY", comp->data.transform.scale[1]);
+        cJSON_AddNumberToObject(obj, "scaleZ", comp->data.transform.scale[2]);
+        break;
+    case JCE_COMP_MESH_RENDERER:
+        cJSON_AddStringToObject(obj, "meshPath", comp->data.mesh_renderer.mesh_path);
+        cJSON_AddStringToObject(obj, "materialPath", comp->data.mesh_renderer.material_path);
+        break;
+    case JCE_COMP_CAMERA:
+        cJSON_AddNumberToObject(obj, "fov", comp->data.camera.fov);
+        cJSON_AddNumberToObject(obj, "nearClip", comp->data.camera.near_clip);
+        cJSON_AddNumberToObject(obj, "farClip", comp->data.camera.far_clip);
+        cJSON_AddBoolToObject(obj, "orthographic", comp->data.camera.ortho);
+        break;
+    case JCE_COMP_LIGHT:
+        cJSON_AddNumberToObject(obj, "colorR", comp->data.light.color[0]);
+        cJSON_AddNumberToObject(obj, "colorG", comp->data.light.color[1]);
+        cJSON_AddNumberToObject(obj, "colorB", comp->data.light.color[2]);
+        cJSON_AddNumberToObject(obj, "colorA", comp->data.light.color[3]);
+        cJSON_AddNumberToObject(obj, "intensity", comp->data.light.intensity);
+        cJSON_AddNumberToObject(obj, "lightType", comp->data.light.type);
+        break;
+    default:
+        break;
+    }
+
+    return obj;
+}
+
+bool jce_state_save_scene_file(const char *scene_path)
+{
+    if (!scene_path || scene_path[0] == '\0')
+        return false;
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *scene = cJSON_CreateObject();
+    cJSON *entities = cJSON_CreateArray();
+    cJSON_AddItemToObject(root, "scene", scene);
+    cJSON_AddItemToObject(scene, "entities", entities);
+
+    for (int i = 0; i < s.entity_count; i++) {
+        JceEntityInfo *e = &s.entities[i];
+        cJSON *eobj = cJSON_CreateObject();
+
+        cJSON_AddNumberToObject(eobj, "id", (double)e->id);
+        cJSON_AddStringToObject(eobj, "name", e->name);
+        cJSON_AddNumberToObject(eobj, "parentId", (double)e->parent_id);
+        cJSON_AddBoolToObject(eobj, "enabled", e->enabled);
+        if (e->tag[0] != '\0')
+            cJSON_AddStringToObject(eobj, "tag", e->tag);
+        cJSON_AddNumberToObject(eobj, "tagColor", (double)e->tag_color);
+
+        cJSON *comps = cJSON_CreateArray();
+        for (int ci = 0; ci < e->component_count; ci++) {
+            cJSON *cobj = serialize_component_json(&s.components[i][ci]);
+            if (cobj)
+                cJSON_AddItemToArray(comps, cobj);
+        }
+        cJSON_AddItemToObject(eobj, "components", comps);
+        cJSON_AddItemToArray(entities, eobj);
+    }
+
+    char *json_text = cJSON_Print(root);
+    cJSON_Delete(root);
+    if (!json_text) {
+        LOG_WARN(LOG_TAG, "scene save failed, JSON serialization error: %s", scene_path);
+        return false;
+    }
+
+    FILE *fp = fopen(scene_path, "wb");
+    if (!fp) {
+        LOG_WARN(LOG_TAG, "scene save failed, cannot open file: %s", scene_path);
+        free(json_text);
+        return false;
+    }
+
+    size_t len = strlen(json_text);
+    size_t wr = fwrite(json_text, 1, len, fp);
+    fclose(fp);
+    free(json_text);
+
+    if (wr != len) {
+        LOG_WARN(LOG_TAG, "scene save failed, short write: %s", scene_path);
+        return false;
+    }
+
+    update_scene_dir_from_path(scene_path);
+    set_current_scene_path_internal(scene_path);
+    LOG_INFO(LOG_TAG, "scene saved to %s (%d entities)", scene_path, s.entity_count);
+    return true;
+}
+
+const char *jce_state_get_current_scene_path(void)
+{
+    return s.current_scene_path;
 }
 
 /* ── Play Mode ─────────────────────────────────────────────────────── */

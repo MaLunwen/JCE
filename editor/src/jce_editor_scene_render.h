@@ -17,12 +17,14 @@
 extern "C" {
 #endif
 
-typedef struct JceRenderer JceRenderer;
-typedef struct JceCamera   JceCamera;
+typedef struct JceRenderer  JceRenderer;
+typedef struct JceCamera    JceCamera;
+typedef struct PakArchive   PakArchive;
 
 /* Initialize the editor scene renderer (creates camera, shaders, etc.).
- * Must be called after the bgfx renderer is fully initialized. */
-bool jce_editor_scene_render_init(JceRenderer *renderer);
+ * Must be called after the bgfx renderer is fully initialized.
+ * pak is used to load the sky shader program at start-up. */
+bool jce_editor_scene_render_init(JceRenderer *renderer, const PakArchive *pak);
 
 /* Shut down and free all resources (camera, FBO, meshes). */
 void jce_editor_scene_render_shutdown(void);

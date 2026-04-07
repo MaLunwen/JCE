@@ -24,7 +24,7 @@
 
 /* ── Text Colors ───────────────────────────────────────────────────── */
 
-#define JCE_COLOR_TEXT_PRIMARY      JCE_RGBA(220, 220, 230, 255)
+#define JCE_COLOR_TEXT_PRIMARY      JCE_RGBA(255, 255, 255, 255)
 #define JCE_COLOR_TEXT_SECONDARY    JCE_RGBA(160, 160, 170, 255)
 #define JCE_COLOR_TEXT_DISABLED     JCE_RGBA(100, 100, 110, 255)
 #define JCE_COLOR_TEXT_ERROR        JCE_RGBA(255, 100, 100, 255)
@@ -46,8 +46,8 @@
 #define JCE_COLOR_AXIS_X           JCE_RGBA(255,  80,  80, 255)
 #define JCE_COLOR_AXIS_Y           JCE_RGBA( 80, 255,  80, 255)
 #define JCE_COLOR_AXIS_Z           JCE_RGBA( 80,  80, 255, 255)
-#define JCE_COLOR_SELECTION_OUTLINE JCE_RGBA(255, 180,  50, 255)
-#define JCE_COLOR_SELECTION_FILL   JCE_RGBA(255, 180,  50,  40)
+#define JCE_COLOR_SELECTION_OUTLINE JCE_RGBA(255, 120,   0, 255)
+#define JCE_COLOR_SELECTION_FILL   JCE_RGBA(255, 120,   0,  40)
 #define JCE_COLOR_SELECTION_BOX    JCE_RGBA(100, 150, 255, 100)
 
 /* Asset browser item selection (blue, matching Java reference) */

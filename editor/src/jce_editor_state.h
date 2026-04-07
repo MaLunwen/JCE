@@ -73,7 +73,7 @@ typedef enum {
 
 /* ── Max Limits ────────────────────────────────────────────────────── */
 
-#define JCE_MAX_SELECTED       64
+#define JCE_MAX_SELECTED       512
 #define JCE_MAX_ENTITY_NAME    128
 #define JCE_MAX_TAG_STRING     64
 #define JCE_MAX_ENTITIES       4096
@@ -150,6 +150,7 @@ const uint32_t *jce_state_get_selection(int *out_count);
 /* Entity management (demo/stub data for now). */
 int               jce_state_get_entity_count(void);
 JceEntityInfo    *jce_state_get_entity(uint32_t id);
+JceEntityInfo    *jce_state_get_entity_by_index(int index);
 JceEntityInfo    *jce_state_get_root_entities(int *out_count);
 uint32_t          jce_state_create_entity(const char *name, uint32_t parent_id);
 void              jce_state_delete_entity(uint32_t id);
@@ -191,6 +192,8 @@ void              jce_state_set_live_preview(bool on);
 
 /* Scene loading */
 bool              jce_state_load_scene_file(const char *scene_path);
+bool              jce_state_save_scene_file(const char *scene_path);
+const char       *jce_state_get_current_scene_path(void);
 
 /* Play mode */
 void          jce_state_play(void);

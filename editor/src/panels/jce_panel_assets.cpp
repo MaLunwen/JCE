@@ -8,6 +8,8 @@
 #include "jce_editor_defaults.h"
 #include "jce_editor_i18n.h"
 #include "jce_file_viewer.h"
+#include "jce_editor_state.h"
+#include "jce_editor_scene_render.h"
 
 #include "jce_editor_layout.h"
 
@@ -606,8 +608,19 @@ void jce_editor_panel_assets_content(void)
                         s_assets.selected_set.clear();
                         s_assets.last_clicked_idx = -1;
                     } else {
-                        jce_file_viewer_open(fe.path.c_str());
-                        jce_editor_layout_request_focus_file_viewer();
+                        /* Load .scene files directly into the viewport. */
+                        const char *ext = strrchr(fe.path.c_str(), '.');
+                        if (ext && (_stricmp(ext, ".scene") == 0)) {
+                            jce_state_load_scene_file(fe.path.c_str());
+                            /* Update scene dir so mesh resolution works. */
+                            std::string dir = fe.path;
+                            size_t sep = dir.find_last_of("/\\");
+                            if (sep != std::string::npos) dir.resize(sep);
+                            jce_editor_scene_set_scene_dir(dir.c_str());
+                        } else {
+                            jce_file_viewer_open(fe.path.c_str());
+                            jce_editor_layout_request_focus_file_viewer();
+                        }
                     }
                 }
 

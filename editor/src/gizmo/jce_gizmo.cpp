@@ -19,6 +19,7 @@ typedef struct {
     JceGizmoAxis drag_axis;      /* axis being dragged */
     float        drag_prev_mouse[2]; /* previous mouse position */
     bool         initialized;
+    float        axes[3][3];     /* current frame axis directions (local or world) */
 } JceGizmoState;
 
 static JceGizmoState s_gizmo;
@@ -38,6 +39,39 @@ extern "C" bool jce_gizmo_internal_dragging(void)
 extern "C" JceGizmoAxis jce_gizmo_internal_drag_axis(void)
 {
     return s_gizmo.drag_axis;
+}
+
+/* ── Axes accessor (used by draw/interact modules) ─────────────────── */
+
+extern "C" void jce_gizmo_internal_get_axes(float ax_x[3], float ax_y[3], float ax_z[3])
+{
+    memcpy(ax_x, s_gizmo.axes[0], 3 * sizeof(float));
+    memcpy(ax_y, s_gizmo.axes[1], 3 * sizeof(float));
+    memcpy(ax_z, s_gizmo.axes[2], 3 * sizeof(float));
+}
+
+/* Compute gizmo axis directions based on space and entity rotation. */
+static void compute_gizmo_axes(int gizmo_space, const float *rotation)
+{
+    if (gizmo_space == 0 /* LOCAL */ && rotation) {
+        float rx = rotation[0] * (3.14159265f / 180.0f);
+        float ry = rotation[1] * (3.14159265f / 180.0f);
+        float rz = rotation[2] * (3.14159265f / 180.0f);
+
+        mat4 m;
+        vec3 euler = {rx, ry, rz};
+        glm_euler_xyz(euler, m);
+
+        /* Extract rotated axes from matrix columns (cglm col-major). */
+        s_gizmo.axes[0][0] = m[0][0]; s_gizmo.axes[0][1] = m[0][1]; s_gizmo.axes[0][2] = m[0][2];
+        s_gizmo.axes[1][0] = m[1][0]; s_gizmo.axes[1][1] = m[1][1]; s_gizmo.axes[1][2] = m[1][2];
+        s_gizmo.axes[2][0] = m[2][0]; s_gizmo.axes[2][1] = m[2][1]; s_gizmo.axes[2][2] = m[2][2];
+    } else {
+        /* World space: identity axes */
+        s_gizmo.axes[0][0] = 1; s_gizmo.axes[0][1] = 0; s_gizmo.axes[0][2] = 0;
+        s_gizmo.axes[1][0] = 0; s_gizmo.axes[1][1] = 1; s_gizmo.axes[1][2] = 0;
+        s_gizmo.axes[2][0] = 0; s_gizmo.axes[2][1] = 0; s_gizmo.axes[2][2] = 1;
+    }
 }
 
 /* ── Hit-test functions (defined in jce_gizmo_interact.cpp) ────────── */
@@ -113,7 +147,9 @@ extern "C" bool jce_gizmo_update(const JceGizmoCamera *cam,
                                   float *inout_scale)
 {
     if (!s_gizmo.initialized) return false;
-    (void)gizmo_space; /* TODO: local-space transforms in Phase 2 */
+
+    /* Compute axis directions based on Local/World space. */
+    compute_gizmo_axes(gizmo_space, inout_rotation);
 
     ImGuiIO &io = ImGui::GetIO();
     float mx = io.MousePos.x;
@@ -214,9 +250,9 @@ extern "C" void jce_gizmo_draw(struct ImDrawList *dl,
                                 const float *scale)
 {
     if (!s_gizmo.initialized) return;
-    (void)gizmo_space; /* TODO: Phase 2 */
-    (void)rotation;
-    (void)scale;
+
+    /* Recompute axes for drawing (in case draw is called without update). */
+    compute_gizmo_axes(gizmo_space, rotation);
 
     switch (gizmo_mode) {
         case 0: jce_gizmo_draw_translate(dl, cam, scale_factor, position); break;

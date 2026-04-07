@@ -16,6 +16,7 @@
 extern "C" JceGizmoAxis jce_gizmo_internal_hovered(void);
 extern "C" bool         jce_gizmo_internal_dragging(void);
 extern "C" JceGizmoAxis jce_gizmo_internal_drag_axis(void);
+extern "C" void         jce_gizmo_internal_get_axes(float ax_x[3], float ax_y[3], float ax_z[3]);
 
 /* ── Constants ─────────────────────────────────────────────────────── */
 
@@ -175,15 +176,19 @@ JceGizmoAxis jce_gizmo_hit_test_translate(const JceGizmoCamera *cam,
     float threshold = JCE_GIZMO_SELECT_THRESHOLD;
     float world_len = compute_world_axis_len(cam, position, scale_factor);
 
-    /* Center dot first (highest priority) */
+    float ax_x[3], ax_y[3], ax_z[3];
+    jce_gizmo_internal_get_axes(ax_x, ax_y, ax_z);
+    const float *axes[3] = { ax_x, ax_y, ax_z };
+
+    /* Center dot first (highest priority, enlarged hit area) */
     float center_d = hit_test_center(cam, position, mouse_x, mouse_y);
-    if (center_d < 8.0f) return JCE_GIZMO_AXIS_XYZ;
+    if (center_d < 12.0f) return JCE_GIZMO_AXIS_XYZ;
 
     /* Plane handles (priority over single axes) */
-    float plane_axes[3][2][3] = {
-        {{1,0,0},{0,1,0}}, /* XY */
-        {{1,0,0},{0,0,1}}, /* XZ */
-        {{0,1,0},{0,0,1}}, /* YZ */
+    const float *plane_axes[3][2] = {
+        { ax_x, ax_y }, /* XY */
+        { ax_x, ax_z }, /* XZ */
+        { ax_y, ax_z }, /* YZ */
     };
     for (int i = 0; i < 3; i++) {
         float d = hit_test_plane(cam, position, plane_axes[i][0], plane_axes[i][1],
@@ -195,7 +200,7 @@ JceGizmoAxis jce_gizmo_hit_test_translate(const JceGizmoCamera *cam,
     JceGizmoAxis best_axis = JCE_GIZMO_AXIS_NONE;
     float best_dist = threshold;
     for (int i = 0; i < 3; i++) {
-        float d = hit_test_axis(cam, position, s_axis_dirs[i], world_len,
+        float d = hit_test_axis(cam, position, axes[i], world_len,
                                  mouse_x, mouse_y);
         if (d < best_dist) {
             best_dist = d;
@@ -215,11 +220,14 @@ JceGizmoAxis jce_gizmo_hit_test_rotate(const JceGizmoCamera *cam,
     float threshold = JCE_GIZMO_SELECT_THRESHOLD;
     float world_radius = compute_world_axis_len(cam, position, scale_factor);
 
-    /* Ring tangent/bitangent pairs */
-    static const float rings[3][2][3] = {
-        {{0,1,0},{0,0,1}}, /* X ring */
-        {{0,0,1},{1,0,0}}, /* Y ring */
-        {{1,0,0},{0,1,0}}, /* Z ring */
+    float ax_x[3], ax_y[3], ax_z[3];
+    jce_gizmo_internal_get_axes(ax_x, ax_y, ax_z);
+
+    /* Ring tangent/bitangent using dynamic axes */
+    const float *rings[3][2] = {
+        { ax_y, ax_z }, /* X ring: tangent=Y, bitangent=Z */
+        { ax_z, ax_x }, /* Y ring: tangent=Z, bitangent=X */
+        { ax_x, ax_y }, /* Z ring: tangent=X, bitangent=Y */
     };
 
     JceGizmoAxis best_axis = JCE_GIZMO_AXIS_NONE;
@@ -246,15 +254,19 @@ JceGizmoAxis jce_gizmo_hit_test_scale(const JceGizmoCamera *cam,
     float threshold = JCE_GIZMO_SELECT_THRESHOLD;
     float world_len = compute_world_axis_len(cam, position, scale_factor);
 
-    /* Center cube first */
+    float ax_x[3], ax_y[3], ax_z[3];
+    jce_gizmo_internal_get_axes(ax_x, ax_y, ax_z);
+    const float *axes[3] = { ax_x, ax_y, ax_z };
+
+    /* Center cube first (enlarged hit area) */
     float center_d = hit_test_center(cam, position, mouse_x, mouse_y);
-    if (center_d < 8.0f) return JCE_GIZMO_AXIS_XYZ;
+    if (center_d < 12.0f) return JCE_GIZMO_AXIS_XYZ;
 
     /* Single axes */
     JceGizmoAxis best_axis = JCE_GIZMO_AXIS_NONE;
     float best_dist = threshold;
     for (int i = 0; i < 3; i++) {
-        float d = hit_test_axis(cam, position, s_axis_dirs[i], world_len,
+        float d = hit_test_axis(cam, position, axes[i], world_len,
                                  mouse_x, mouse_y);
         if (d < best_dist) {
             best_dist = d;
@@ -269,17 +281,19 @@ JceGizmoAxis jce_gizmo_hit_test_scale(const JceGizmoCamera *cam,
 static void get_drag_plane_normal(JceGizmoAxis axis, const float cam_dir[3],
                                    float out_normal[3])
 {
-    /* For single-axis constraints, pick the plane that is most facing
-       the camera. For plane constraints, use the plane normal directly. */
+    float ax_x[3], ax_y[3], ax_z[3];
+    jce_gizmo_internal_get_axes(ax_x, ax_y, ax_z);
+
+    /* For plane constraints, use the rotated third axis as normal. */
     switch (axis) {
         case JCE_GIZMO_AXIS_XY:
-            out_normal[0] = 0; out_normal[1] = 0; out_normal[2] = 1;
+            gm_v3_copy(out_normal, ax_z);
             return;
         case JCE_GIZMO_AXIS_XZ:
-            out_normal[0] = 0; out_normal[1] = 1; out_normal[2] = 0;
+            gm_v3_copy(out_normal, ax_y);
             return;
         case JCE_GIZMO_AXIS_YZ:
-            out_normal[0] = 1; out_normal[1] = 0; out_normal[2] = 0;
+            gm_v3_copy(out_normal, ax_x);
             return;
         case JCE_GIZMO_AXIS_XYZ:
         case JCE_GIZMO_AXIS_VIEW: {
@@ -291,11 +305,11 @@ static void get_drag_plane_normal(JceGizmoAxis axis, const float cam_dir[3],
         default: break;
     }
 
-    /* Single axis: find best plane (most perpendicular to camera) */
+    /* Single axis: use the rotated axis direction to find best plane. */
     float ax[3] = {0,0,0};
-    if (axis & JCE_GIZMO_AXIS_X) ax[0] = 1;
-    if (axis & JCE_GIZMO_AXIS_Y) ax[1] = 1;
-    if (axis & JCE_GIZMO_AXIS_Z) ax[2] = 1;
+    if (axis & JCE_GIZMO_AXIS_X) gm_v3_copy(ax, ax_x);
+    else if (axis & JCE_GIZMO_AXIS_Y) gm_v3_copy(ax, ax_y);
+    else if (axis & JCE_GIZMO_AXIS_Z) gm_v3_copy(ax, ax_z);
 
     /* Cross with camera direction to get a perpendicular, then cross
        again with axis to get the plane normal. */
@@ -303,7 +317,6 @@ static void get_drag_plane_normal(JceGizmoAxis axis, const float cam_dir[3],
     gm_v3_cross(perp, ax, cam_dir);
     float len = gm_v3_len(perp);
     if (len < 1e-6f) {
-        /* Camera looking along the axis — use any perpendicular */
         float up[3] = {0,1,0};
         if (fabsf(gm_v3_dot(ax, up)) > 0.99f) {
             up[0] = 1; up[1] = 0; up[2] = 0;
@@ -343,13 +356,34 @@ void jce_gizmo_drag_translate(const JceGizmoCamera *cam,
     float delta[3];
     gm_v3_sub(delta, hit_cur, hit_prev);
 
-    /* Mask to constrained axes */
-    if (axis == JCE_GIZMO_AXIS_X)  { delta[1] = 0; delta[2] = 0; }
-    if (axis == JCE_GIZMO_AXIS_Y)  { delta[0] = 0; delta[2] = 0; }
-    if (axis == JCE_GIZMO_AXIS_Z)  { delta[0] = 0; delta[1] = 0; }
-    if (axis == JCE_GIZMO_AXIS_XY) { delta[2] = 0; }
-    if (axis == JCE_GIZMO_AXIS_XZ) { delta[1] = 0; }
-    if (axis == JCE_GIZMO_AXIS_YZ) { delta[0] = 0; }
+    /* Project delta onto constrained axis directions (supports both
+       world and local space via the dynamic axes). */
+    float lx[3], ly[3], lz[3];
+    jce_gizmo_internal_get_axes(lx, ly, lz);
+
+    if (axis == JCE_GIZMO_AXIS_X) {
+        float d = gm_v3_dot(delta, lx);
+        gm_v3_scale(delta, lx, d);
+    } else if (axis == JCE_GIZMO_AXIS_Y) {
+        float d = gm_v3_dot(delta, ly);
+        gm_v3_scale(delta, ly, d);
+    } else if (axis == JCE_GIZMO_AXIS_Z) {
+        float d = gm_v3_dot(delta, lz);
+        gm_v3_scale(delta, lz, d);
+    } else if (axis == JCE_GIZMO_AXIS_XY) {
+        /* Remove Z component in local space */
+        float dz = gm_v3_dot(delta, lz);
+        float sub[3]; gm_v3_scale(sub, lz, dz);
+        gm_v3_sub(delta, delta, sub);
+    } else if (axis == JCE_GIZMO_AXIS_XZ) {
+        float dy = gm_v3_dot(delta, ly);
+        float sub[3]; gm_v3_scale(sub, ly, dy);
+        gm_v3_sub(delta, delta, sub);
+    } else if (axis == JCE_GIZMO_AXIS_YZ) {
+        float dx = gm_v3_dot(delta, lx);
+        float sub[3]; gm_v3_scale(sub, lx, dx);
+        gm_v3_sub(delta, delta, sub);
+    }
 
     gm_v3_copy(out_delta, delta);
 }

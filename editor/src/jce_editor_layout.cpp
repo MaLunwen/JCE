@@ -38,6 +38,7 @@ static bool s_show_open_scene  = false;
 static bool s_show_save_as     = false;
 static bool s_show_unsaved     = false;
 static int  s_unsaved_result   = 0;
+static bool s_quit_after_save_as = false;
 
 /* ── Docking state ────────────────────────────────────────────────── */
 
@@ -100,6 +101,32 @@ static void request_app_quit(void)
     SDL_PushEvent(&ev);
 }
 
+typedef enum {
+    SAVE_SCENE_RESULT_FAILED = 0,
+    SAVE_SCENE_RESULT_OK,
+    SAVE_SCENE_RESULT_NEEDS_PATH,
+} SaveSceneResult;
+
+static SaveSceneResult save_scene_or_open_save_as(void)
+{
+    const char *scene_path = jce_state_get_current_scene_path();
+    if (!scene_path || scene_path[0] == '\0') {
+        s_show_save_as = true;
+        jce_editor_console_log_level(JCE_CONSOLE_INFO,
+            "No current scene file path. Use Save As to choose where to save.");
+        return SAVE_SCENE_RESULT_NEEDS_PATH;
+    }
+
+    if (!jce_state_save_scene_file(scene_path)) {
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+            "Failed to save scene: %s", scene_path);
+        return SAVE_SCENE_RESULT_FAILED;
+    }
+
+    jce_editor_console_log("Saved scene: %s", scene_path);
+    return SAVE_SCENE_RESULT_OK;
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  *  MENU BAR
  * ══════════════════════════════════════════════════════════════════════ */
@@ -117,7 +144,8 @@ static void draw_menu_bar(void)
             s_show_new_scene = true;
         if (ImGui::MenuItem(jce_editor_i18n("menu.file.openScene"),   "Ctrl+O"))
             s_show_open_scene = true;
-        if (ImGui::MenuItem(jce_editor_i18n("menu.file.saveScene"),   "Ctrl+S"))  { /* TODO */ }
+        if (ImGui::MenuItem(jce_editor_i18n("menu.file.saveScene"),   "Ctrl+S"))
+            save_scene_or_open_save_as();
         if (ImGui::MenuItem(jce_editor_i18n("menu.file.saveAs"),   "Ctrl+Shift+S"))
             s_show_save_as = true;
         ImGui::Separator();
@@ -505,12 +533,22 @@ void jce_editor_layout_draw(void)
 
     if (!s_show_unsaved && s_unsaved_result != 0) {
         if (s_unsaved_result == 1) {
-            /* TODO: route to actual save operation when scene persistence is integrated. */
-            request_app_quit();
+            SaveSceneResult save_result = save_scene_or_open_save_as();
+            if (save_result == SAVE_SCENE_RESULT_OK)
+                request_app_quit();
+            else if (save_result == SAVE_SCENE_RESULT_NEEDS_PATH)
+                s_quit_after_save_as = true;
         } else if (s_unsaved_result == 2) {
             request_app_quit();
         }
         s_unsaved_result = 0;
+    }
+
+    if (s_quit_after_save_as && !s_show_save_as) {
+        const char *scene_path = jce_state_get_current_scene_path();
+        if (scene_path && scene_path[0] != '\0')
+            request_app_quit();
+        s_quit_after_save_as = false;
     }
 }
 
