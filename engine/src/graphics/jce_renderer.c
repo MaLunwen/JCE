@@ -7,13 +7,14 @@
 #include <jce/graphics/jce_views.h>
 #include <jce/graphics/jce_shaders.h>
 #include <jce/platform/jce_window.h>
+#include "platform/jce_window_internal.h"
 #include <jce/core/jce_log.h>
 #include <jce/core/jce_math.h>
 
 #include <bgfx/c99/bgfx.h>
 #include <SDL3/SDL.h>
 #include "core/jce_memory.h"
-#include "core/jce_profiler.h"
+#include <jce/core/jce_profiler.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -829,4 +830,10 @@ void jce_renderer_set_wireframe(JceRenderer *r, bool enabled)
 bool jce_renderer_get_wireframe(const JceRenderer *r)
 {
     return r ? (r->debug_flags & BGFX_DEBUG_WIREFRAME) != 0 : false;
+}
+
+bool jce_renderer_origin_bottom_left(void)
+{
+    const bgfx_caps_t *caps = bgfx_get_caps();
+    return caps ? caps->originBottomLeft : false;
 }

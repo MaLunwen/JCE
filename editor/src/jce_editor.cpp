@@ -6,6 +6,7 @@
  */
 
 #include "jce_editor.h"
+#include "jce_editor_alloc.h"
 #include "jce_imgui_bgfx.h"
 #include "jce_editor_layout.h"
 #include "jce_editor_panels.h"
@@ -24,7 +25,7 @@ extern "C" {
 #include <jce/graphics/jce_postfx.h>
 #include <jce/platform/jce_window.h>
 #include <jce/core/jce_log.h>
-#include <jce/resource/pak_loader.h>
+#include <jce/core/pak_loader.h>
 }
 
 #define LOG_TAG "editor"
@@ -40,7 +41,7 @@ static struct {
     bool        active;         /* editor overlay visible? */
     uint64_t    last_time;      /* for delta-time computation */
     SDL_Cursor *cursors[ImGuiMouseCursor_COUNT];
-    SDL_Window *sdl_window;     /* SDL3 window for text input API */
+    JceWindow  *window;         /* opaque engine window for text input API */
     bool        text_input_active;
     const PakArchive *pak;      /* stored for font rebuild */
     float       font_size;      /* current font size in pixels */
@@ -249,13 +250,13 @@ bool jce_editor_init(const PakArchive *pak, JceWindow *window)
     {
         const PakAsset *icon = pak_find(pak, "JCE_icon.png");
         if (icon) {
-            void *buf = malloc((size_t)icon->original_size);
+            void *buf = ED_MALLOC((size_t)icon->original_size);
             if (buf) {
                 size_t sz = pak_decompress(icon, buf,
                                            (size_t)icon->original_size);
                 if (sz > 0)
                     jce_window_set_icon(window, buf, sz);
-                free(buf);
+                ED_FREE(buf);
             }
         } else {
             LOG_WARN(LOG_TAG, "JCE_icon.png not found in PAK");
@@ -263,7 +264,7 @@ bool jce_editor_init(const PakArchive *pak, JceWindow *window)
     }
 
     s_editor.last_time   = SDL_GetPerformanceCounter();
-    s_editor.sdl_window  = jce_window_sdl(window);
+    s_editor.window      = window;
     s_editor.text_input_active = false;
     s_editor.frame_kpi_file = NULL;
     s_editor.frame_kpi_index = 0;
@@ -299,8 +300,11 @@ void jce_editor_shutdown(void)
 {
     if (!s_editor.initialized) return;
 
-    if (s_editor.text_input_active && s_editor.sdl_window) {
-        SDL_StopTextInput(s_editor.sdl_window);
+    if (s_editor.text_input_active && s_editor.window) {
+        if (!jce_window_stop_text_input(s_editor.window)) {
+            LOG_WARN(LOG_TAG, "jce_window_stop_text_input failed during shutdown: %s",
+                     SDL_GetError());
+        }
         s_editor.text_input_active = false;
     }
 
@@ -460,18 +464,18 @@ void jce_editor_update(JceWindow *window)
 
     /* SDL3 does not emit SDL_EVENT_TEXT_INPUT unless text input is started.
        Mirror Java behavior: toggle it based on ImGui's WantTextInput. */
-    if (s_editor.sdl_window) {
+    if (s_editor.window) {
         if (io.WantTextInput && !s_editor.text_input_active) {
-            if (SDL_StartTextInput(s_editor.sdl_window)) {
+            if (jce_window_start_text_input(s_editor.window)) {
                 s_editor.text_input_active = true;
             } else {
-                LOG_WARN(LOG_TAG, "SDL_StartTextInput failed: %s", SDL_GetError());
+                LOG_WARN(LOG_TAG, "jce_window_start_text_input failed: %s", SDL_GetError());
             }
         } else if (!io.WantTextInput && s_editor.text_input_active) {
-            if (SDL_StopTextInput(s_editor.sdl_window)) {
+            if (jce_window_stop_text_input(s_editor.window)) {
                 s_editor.text_input_active = false;
             } else {
-                LOG_WARN(LOG_TAG, "SDL_StopTextInput failed: %s", SDL_GetError());
+                LOG_WARN(LOG_TAG, "jce_window_stop_text_input failed: %s", SDL_GetError());
             }
         }
     }
@@ -488,9 +492,13 @@ bool jce_editor_is_active(void)
 void jce_editor_toggle(void)
 {
     s_editor.active = !s_editor.active;
-    if (!s_editor.active && s_editor.text_input_active && s_editor.sdl_window) {
-        SDL_StopTextInput(s_editor.sdl_window);
-        s_editor.text_input_active = false;
+    if (!s_editor.active && s_editor.text_input_active && s_editor.window) {
+        if (jce_window_stop_text_input(s_editor.window)) {
+            s_editor.text_input_active = false;
+        } else {
+            LOG_WARN(LOG_TAG, "jce_window_stop_text_input failed while hiding editor: %s",
+                     SDL_GetError());
+        }
     }
     LOG_INFO(LOG_TAG, "editor %s", s_editor.active ? "shown" : "hidden");
 }

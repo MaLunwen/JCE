@@ -238,7 +238,6 @@ void *jce_asset_data(const JceAssetManager *mgr, JceAssetHandle handle);
 typedef struct JceMesh         JceMesh;
 typedef struct JceModel        JceModel;
 typedef struct JceFont         JceFont;
-typedef struct JcePbrMaterial  JcePbrMaterial;
 
 /* Texture: returns JCE_TEXTURE_INVALID if not a ready texture. */
 JceTexture jce_asset_get_texture(const JceAssetManager *mgr,

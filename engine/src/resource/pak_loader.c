@@ -5,12 +5,12 @@
  * XXH3_64bits hash, and decompresses assets on demand via ZSTD.
  */
 
-#include <jce/resource/pak_loader.h>
+#include <jce/core/pak_loader.h>
 #include "resource/pak_format.h"
 #include <jce/core/jce_profiler.h>
 
 #include <stdio.h>
-#include <stdlib.h>
+#include "core/jce_memory.h"
 #include <string.h>
 
 #include <xxhash.h>
@@ -61,7 +61,7 @@ PakArchive *pak_open(const void *data, size_t size) {
     uint64_t toc_end = toc_off + (uint64_t)count * JPAK_TOC_ENTRY_SIZE;
     if (toc_end > size || data_off > size) return NULL;
 
-    PakArchive *pak = (PakArchive *)calloc(1, sizeof(PakArchive));
+    PakArchive *pak = (PakArchive *)JCE_CALLOC(1, sizeof(PakArchive));
     if (!pak) return NULL;
 
     pak->blob      = blob;
@@ -72,9 +72,9 @@ PakArchive *pak_open(const void *data, size_t size) {
 
     if (count == 0) return pak;
 
-    pak->assets = (PakAsset *)calloc(count, sizeof(PakAsset));
-    pak->hashes = (uint64_t *)calloc(count, sizeof(uint64_t));
-    pak->paths  = (char **)calloc(count, sizeof(char *));
+    pak->assets = (PakAsset *)JCE_CALLOC(count, sizeof(PakAsset));
+    pak->hashes = (uint64_t *)JCE_CALLOC(count, sizeof(uint64_t));
+    pak->paths  = (char **)JCE_CALLOC(count, sizeof(char *));
     if (!pak->assets || !pak->hashes || !pak->paths) {
         pak_close(pak);
         return NULL;
@@ -98,7 +98,7 @@ PakArchive *pak_open(const void *data, size_t size) {
         }
 
         /* Build a NUL-terminated path copy. */
-        char *path_copy = (char *)malloc(name_length + 1);
+        char *path_copy = (char *)JCE_MALLOC(name_length + 1);
         if (!path_copy) { pak_close(pak); return NULL; }
         memcpy(path_copy, blob + name_offset, name_length);
         path_copy[name_length] = '\0';
@@ -129,14 +129,14 @@ void pak_close(PakArchive *pak) {
     if (!pak) return;
     if (pak->paths) {
         for (uint32_t i = 0; i < pak->count; ++i)
-            free(pak->paths[i]);
-        free(pak->paths);
+            JCE_FREE(pak->paths[i]);
+        JCE_FREE(pak->paths);
     }
-    free(pak->hashes);
-    free(pak->assets);
+    JCE_FREE(pak->hashes);
+    JCE_FREE(pak->assets);
     ZSTD_freeDCtx(pak->dctx);
-    if (pak->owns_blob) free((void *)pak->blob);
-    free(pak);
+    if (pak->owns_blob) JCE_FREE((void *)pak->blob);
+    JCE_FREE(pak);
 }
 
 /* ================================================================== */
@@ -164,11 +164,11 @@ PakArchive *pak_open_file(const char *path) {
     if (lsize <= 0) { fclose(f); return NULL; }
     rewind(f);
 
-    uint8_t *buf = (uint8_t *)malloc((size_t)lsize);
+    uint8_t *buf = (uint8_t *)JCE_MALLOC((size_t)lsize);
     if (!buf) { fclose(f); return NULL; }
 
     if (fread(buf, 1, (size_t)lsize, f) != (size_t)lsize) {
-        free(buf); fclose(f); return NULL;
+        JCE_FREE(buf); fclose(f); return NULL;
     }
     fclose(f);
 
@@ -176,7 +176,7 @@ PakArchive *pak_open_file(const char *path) {
     if (pak) {
         pak->owns_blob = 1;
     } else {
-        free(buf);
+        JCE_FREE(buf);
     }
     return pak;
 }

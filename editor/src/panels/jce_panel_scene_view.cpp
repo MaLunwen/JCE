@@ -16,7 +16,6 @@
 
 #include <imgui.h>
 #include <imgui_internal.h>
-#include <bgfx/c99/bgfx.h>
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
@@ -52,6 +51,15 @@ static float s_gizmo_raw_pos[3]   = {0.0f, 0.0f, 0.0f};
 static float s_gizmo_raw_rot[3]   = {0.0f, 0.0f, 0.0f};
 static float s_gizmo_raw_scale[3] = {1.0f, 1.0f, 1.0f};
 static bool  s_gizmo_history_batch_open = false;
+
+/* ── Shared viewport context for scene view helper functions ──────── */
+
+struct SceneViewCtx {
+    ImVec2      avail;
+    ImVec2      screen_pos;
+    ImDrawList *dl;
+    bool        viewport_hovered;
+};
 
 static JceComponentInfo *find_transform_component(JceComponentInfo *comps,
                                                   int comp_count);
@@ -550,30 +558,6 @@ static ImVec2 project_axis(const float *view16, float dx, float dy, float dz,
     return ImVec2(cx + sx * radius, cy - sy * radius);
 }
 
-/* ── Ray-AABB intersection (slab method) ──────────────────────────── */
-
-static bool ray_aabb_intersect(const float ro[3], const float rd[3],
-                                const float bmin[3], const float bmax[3],
-                                float *out_t)
-{
-    float tmin = 0.0f, tmax = 1e30f;
-    for (int i = 0; i < 3; i++) {
-        if (fabsf(rd[i]) < 1e-8f) {
-            if (ro[i] < bmin[i] || ro[i] > bmax[i]) return false;
-        } else {
-            float inv = 1.0f / rd[i];
-            float t1 = (bmin[i] - ro[i]) * inv;
-            float t2 = (bmax[i] - ro[i]) * inv;
-            if (t1 > t2) { float tmp = t1; t1 = t2; t2 = tmp; }
-            if (t1 > tmin) tmin = t1;
-            if (t2 < tmax) tmax = t2;
-            if (tmin > tmax) return false;
-        }
-    }
-    *out_t = tmin;
-    return true;
-}
-
 /* ── Axis Indicator (bottom-left corner) ──────────────────────────── */
 
 static int draw_axis_indicator(ImDrawList *dl, ImVec2 origin, ImVec2 size,
@@ -838,7 +822,8 @@ static int draw_view_cube(ImDrawList *dl, ImVec2 origin, ImVec2 size,
 
 /* ── Content (embeddable in tabs) ─────────────────────────────────── */
 
-void jce_editor_panel_scene_view_content(void)
+
+static void draw_scene_view_toolbar(void)
 {
     /* Toolbar row (gizmo mode / space / 2D-3D / view menu) */
     JceGizmoMode gm = jce_state_get_gizmo_mode();
@@ -930,12 +915,15 @@ void jce_editor_panel_scene_view_content(void)
     }
 
     ImGui::Separator();
+}
 
+static bool setup_scene_viewport(SceneViewCtx *ctx)
+{
     /* ── Viewport area ──────────────────────────────────────────── */
     ImVec2 avail = ImGui::GetContentRegionAvail();
     if (avail.x <= 0 || avail.y <= 0) {
         clear_stale_gizmo_interaction_state();
-        return;
+        return false;
     }
 
     ImVec2 screen_pos = ImGui::GetCursorScreenPos();
@@ -956,8 +944,8 @@ void jce_editor_panel_scene_view_content(void)
     if (tex_idx != UINT16_MAX) {
         /* OpenGL framebuffers have bottom-left origin; flip UV Y so the
            image is not vertically inverted in the ImGui viewport. */
-        const bgfx_caps_t *caps = bgfx_get_caps();
-        if (caps->originBottomLeft) {
+        const bool origin_bl = jce_renderer_origin_bottom_left();
+        if (origin_bl) {
             ImGui::Image((ImTextureID)(uintptr_t)tex_idx, avail,
                          ImVec2(0.0f, 1.0f), ImVec2(1.0f, 0.0f));
         } else {
@@ -976,15 +964,24 @@ void jce_editor_panel_scene_view_content(void)
     bool viewport_hovered = ImGui::IsItemHovered();
     (void)ImGui::IsItemActive(); /* reserved for future drag handling */
 
+    ctx->avail            = avail;
+    ctx->screen_pos       = screen_pos;
+    ctx->dl               = dl;
+    ctx->viewport_hovered = viewport_hovered;
+    return true;
+}
+
+static void draw_scene_context_menu(const SceneViewCtx *ctx)
+{
     /* ── Right-click context menu (scene viewport) ────────────── */
     /* Use manual bounds check so repeated right-clicks work even
        when an ImGui popup is covering the InvisibleButton. */
     {
         ImVec2 mpos = ImGui::GetMousePos();
-        bool mouse_in_vp = (mpos.x >= screen_pos.x &&
-                            mpos.x <= screen_pos.x + avail.x &&
-                            mpos.y >= screen_pos.y &&
-                            mpos.y <= screen_pos.y + avail.y);
+        bool mouse_in_vp = (mpos.x >= ctx->screen_pos.x &&
+                            mpos.x <= ctx->screen_pos.x + ctx->avail.x &&
+                            mpos.y >= ctx->screen_pos.y &&
+                            mpos.y <= ctx->screen_pos.y + ctx->avail.y);
 
         if (mouse_in_vp && ImGui::IsMouseClicked(ImGuiMouseButton_Right)
             && !ImGui::GetIO().KeyAlt)
@@ -1162,7 +1159,10 @@ void jce_editor_panel_scene_view_content(void)
 
         ImGui::EndPopup();
     }
+}
 
+static void handle_scene_camera_controls(bool viewport_hovered)
+{
     /* ── Maya-style camera controls ───────────────────────────── */
     {
         ImGuiIO &io = ImGui::GetIO();
@@ -1191,12 +1191,15 @@ void jce_editor_panel_scene_view_content(void)
             jce_editor_scene_camera_zoom(io.MouseWheel);
         }
     }
+}
 
+static void handle_scene_selection_box(const SceneViewCtx *ctx)
+{
     /* ── Selection box (marquee) ──────────────────────────────── */
     if (!has_valid_gizmo_target())
         clear_stale_gizmo_interaction_state();
 
-    if (viewport_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)
+    if (ctx->viewport_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)
         && !ImGui::GetIO().KeyAlt
         && !jce_gizmo_is_active()
         && jce_gizmo_hovered_axis() == JCE_GIZMO_AXIS_NONE)
@@ -1254,14 +1257,17 @@ void jce_editor_panel_scene_view_content(void)
 
         /* Only draw if the box is larger than a few pixels (not a click). */
         if ((maxX - minX) > 3.0f || (maxY - minY) > 3.0f) {
-            dl->AddRectFilled(ImVec2(minX, minY), ImVec2(maxX, maxY), s_sel_fill);
-            dl->AddRect(ImVec2(minX + 1, minY + 1), ImVec2(maxX - 1, maxY - 1),
+            ctx->dl->AddRectFilled(ImVec2(minX, minY), ImVec2(maxX, maxY), s_sel_fill);
+            ctx->dl->AddRect(ImVec2(minX + 1, minY + 1), ImVec2(maxX - 1, maxY - 1),
                         s_sel_inner, 0.0f, 0, 1.0f);
-            dl->AddRect(ImVec2(minX, minY), ImVec2(maxX, maxY),
+            ctx->dl->AddRect(ImVec2(minX, minY), ImVec2(maxX, maxY),
                         s_sel_border, 0.0f, 0, 1.5f);
         }
     }
+}
 
+static void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
+{
     /* ── Gizmo overlay ────────────────────────────────────────── */
     if (jce_editor_prefs_show_gizmos()) {
         uint32_t focused = jce_state_get_focused();
@@ -1276,7 +1282,7 @@ void jce_editor_panel_scene_view_content(void)
 
                 if (!jce_editor_scene_get_camera_matrices(
                         gcam.view, gcam.proj, gcam.eye,
-                        avail.x, avail.y))
+                        ctx->avail.x, ctx->avail.y))
                 {
                     /* Fallback: simple default perspective camera. */
                     float eye[3] = {5.0f, 5.0f, 5.0f};
@@ -1295,8 +1301,8 @@ void jce_editor_panel_scene_view_content(void)
                     gcam.view[2] = -f[0]; gcam.view[6] = -f[1]; gcam.view[10] = -f[2]; gcam.view[14] =  gm_v3_dot(f, eye);
                     gcam.view[3] = 0;     gcam.view[7] = 0;     gcam.view[11] = 0;     gcam.view[15] = 1;
 
-                    float fov = 45.0f * (3.14159265f / 180.0f);
-                    float aspect = (avail.y > 0) ? (avail.x / avail.y) : 1.0f;
+                    float fov = 45.0f * JCE_DEG2RAD;
+                    float aspect = (ctx->avail.y > 0) ? (ctx->avail.x / ctx->avail.y) : 1.0f;
                     float near_p = 0.1f, far_p = 1000.0f;
                     float t = tanf(fov * 0.5f);
                     memset(gcam.proj, 0, sizeof(gcam.proj));
@@ -1308,10 +1314,10 @@ void jce_editor_panel_scene_view_content(void)
 
                     gm_v3_copy(gcam.eye, eye);
                 }
-                gcam.viewport_size[0]   = avail.x;
-                gcam.viewport_size[1]   = avail.y;
-                gcam.viewport_origin[0] = screen_pos.x;
-                gcam.viewport_origin[1] = screen_pos.y;
+                gcam.viewport_size[0]   = ctx->avail.x;
+                gcam.viewport_size[1]   = ctx->avail.y;
+                gcam.viewport_origin[0] = ctx->screen_pos.x;
+                gcam.viewport_origin[1] = ctx->screen_pos.y;
 
                 float scale_factor = jce_editor_prefs_gizmo_scale();
 
@@ -1498,7 +1504,7 @@ void jce_editor_panel_scene_view_content(void)
                     jce_editor_inspector_request_sync();
                 }
 
-                jce_gizmo_draw(dl, &gcam,
+                jce_gizmo_draw(ctx->dl, &gcam,
                                (int)jce_state_get_gizmo_mode(),
                                (int)jce_state_get_gizmo_space(),
                                scale_factor,
@@ -1508,12 +1514,10 @@ void jce_editor_panel_scene_view_content(void)
             }
         }
     }
+}
 
-    if (s_gizmo_history_batch_open && !jce_gizmo_is_active()) {
-        jce_state_end_batch_edit();
-        s_gizmo_history_batch_open = false;
-    }
-
+static void handle_scene_view_shortcuts(void)
+{
     /* Keyboard shortcuts for gizmo modes */
     if (ImGui::IsWindowFocused()) {
         if (ImGui::IsKeyPressed(ImGuiKey_W)) jce_state_set_gizmo_mode(JCE_GIZMO_TRANSLATE);
@@ -1576,26 +1580,29 @@ void jce_editor_panel_scene_view_content(void)
             }
         }
     }
+}
 
+static void draw_scene_overlays_and_pick(const SceneViewCtx *ctx)
+{
     /* ── Axis indicator (bottom-left) + View cube (top-right) ───── */
     {
         float view_mat[16], proj_mat[16], eye[3];
         if (jce_editor_scene_get_camera_matrices(view_mat, proj_mat, eye,
-                                                  avail.x, avail.y))
+                                                  ctx->avail.x, ctx->avail.y))
         {
             JceGizmoCamera overlay_cam;
             memcpy(overlay_cam.view, view_mat, sizeof(float) * 16);
             memcpy(overlay_cam.proj, proj_mat, sizeof(float) * 16);
             memcpy(overlay_cam.eye,  eye,      sizeof(float) * 3);
-            overlay_cam.viewport_size[0]   = avail.x;
-            overlay_cam.viewport_size[1]   = avail.y;
-            overlay_cam.viewport_origin[0] = screen_pos.x;
-            overlay_cam.viewport_origin[1] = screen_pos.y;
+            overlay_cam.viewport_size[0]   = ctx->avail.x;
+            overlay_cam.viewport_size[1]   = ctx->avail.y;
+            overlay_cam.viewport_origin[0] = ctx->screen_pos.x;
+            overlay_cam.viewport_origin[1] = ctx->screen_pos.y;
 
-            draw_scene_helper_icons(dl, &overlay_cam);
+            draw_scene_helper_icons(ctx->dl, &overlay_cam);
 
-            int axis_click = draw_axis_indicator(dl, screen_pos, avail, view_mat);
-            int cube_click = draw_view_cube(dl, screen_pos, avail, view_mat);
+            int axis_click = draw_axis_indicator(ctx->dl, ctx->screen_pos, ctx->avail, view_mat);
+            int cube_click = draw_view_cube(ctx->dl, ctx->screen_pos, ctx->avail, view_mat);
 
             /* Axis indicator click: +X=Right, +Y=Top, +Z=Front, -X=Left, -Y=Bottom, -Z=Back */
             if (axis_click >= 0) {
@@ -1682,8 +1689,8 @@ void jce_editor_panel_scene_view_content(void)
                         float mcw = proj_mat[3]*mvx + proj_mat[7]*mvy + proj_mat[11]*mvz + proj_mat[15]*mvw;
                         if (mcw <= 0.0f) continue;
 
-                        float msx = screen_pos.x + (mcx / mcw + 1.0f) * 0.5f * avail.x;
-                        float msy = screen_pos.y + (1.0f - mcy / mcw) * 0.5f * avail.y;
+                        float msx = ctx->screen_pos.x + (mcx / mcw + 1.0f) * 0.5f * ctx->avail.x;
+                        float msy = ctx->screen_pos.y + (1.0f - mcy / mcw) * 0.5f * ctx->avail.y;
                         if (msx < bb_min_x) bb_min_x = msx;
                         if (msx > bb_max_x) bb_max_x = msx;
                         if (msy < bb_min_y) bb_min_y = msy;
@@ -1712,10 +1719,10 @@ void jce_editor_panel_scene_view_content(void)
                 memcpy(pick_cam.view, view_mat, sizeof(float) * 16);
                 memcpy(pick_cam.proj, proj_mat, sizeof(float) * 16);
                 memcpy(pick_cam.eye,  eye,      sizeof(float) * 3);
-                pick_cam.viewport_size[0]   = avail.x;
-                pick_cam.viewport_size[1]   = avail.y;
-                pick_cam.viewport_origin[0] = screen_pos.x;
-                pick_cam.viewport_origin[1] = screen_pos.y;
+                pick_cam.viewport_size[0]   = ctx->avail.x;
+                pick_cam.viewport_size[1]   = ctx->avail.y;
+                pick_cam.viewport_origin[0] = ctx->screen_pos.x;
+                pick_cam.viewport_origin[1] = ctx->screen_pos.y;
 
                 float ray_o[3], ray_d[3];
                 gm_screen_to_ray(&pick_cam, s_sel_click_pos.x,
@@ -1758,7 +1765,11 @@ void jce_editor_panel_scene_view_content(void)
                     float bmax[3] = { pos[0]+hx, pos[1]+hy, pos[2]+hz };
 
                     float t;
-                    if (ray_aabb_intersect(ray_o, ray_d, bmin, bmax, &t)) {
+                    jce_vec3 ro = {{ ray_o[0], ray_o[1], ray_o[2] }};
+                    jce_vec3 rd = {{ ray_d[0], ray_d[1], ray_d[2] }};
+                    jce_vec3 bmin_v = {{ bmin[0], bmin[1], bmin[2] }};
+                    jce_vec3 bmax_v = {{ bmax[0], bmax[1], bmax[2] }};
+                    if (jce_ray_aabb_intersect(ro, rd, bmin_v, bmax_v, &t) && t >= 0.0f) {
                         if (t < best_t) {
                             best_t  = t;
                             best_id = pe->id;
@@ -1805,23 +1816,23 @@ void jce_editor_panel_scene_view_content(void)
                     float scw = proj_mat[3]*svx + proj_mat[7]*svy + proj_mat[11]*svz + proj_mat[15]*svw;
                     if (scw <= 0.0f) continue;
 
-                    float ssx = screen_pos.x + (scx / scw + 1.0f) * 0.5f * avail.x;
-                    float ssy = screen_pos.y + (1.0f - scy / scw) * 0.5f * avail.y;
+                    float ssx = ctx->screen_pos.x + (scx / scw + 1.0f) * 0.5f * ctx->avail.x;
+                    float ssy = ctx->screen_pos.y + (1.0f - scy / scw) * 0.5f * ctx->avail.y;
 
                     /* Skip if outside viewport bounds. */
-                    if (ssx < screen_pos.x || ssx > screen_pos.x + avail.x ||
-                        ssy < screen_pos.y || ssy > screen_pos.y + avail.y)
+                    if (ssx < ctx->screen_pos.x || ssx > ctx->screen_pos.x + ctx->avail.x ||
+                        ssy < ctx->screen_pos.y || ssy > ctx->screen_pos.y + ctx->avail.y)
                         continue;
 
                     /* Draw orange diamond marker around entity position. */
                     float mr = 14.0f;
-                    dl->AddQuadFilled(
+                    ctx->dl->AddQuadFilled(
                         ImVec2(ssx,      ssy - mr),
                         ImVec2(ssx + mr, ssy),
                         ImVec2(ssx,      ssy + mr),
                         ImVec2(ssx - mr, ssy),
                         IM_COL32(255, 120, 0, 60));
-                    dl->AddQuad(
+                    ctx->dl->AddQuad(
                         ImVec2(ssx,      ssy - mr),
                         ImVec2(ssx + mr, ssy),
                         ImVec2(ssx,      ssy + mr),
@@ -1831,6 +1842,30 @@ void jce_editor_panel_scene_view_content(void)
             }
         }
     }
+}
+
+/* ── Content (embeddable in tabs) ─────────────────────────────────── */
+
+void jce_editor_panel_scene_view_content(void)
+{
+    draw_scene_view_toolbar();
+
+    SceneViewCtx ctx;
+    if (!setup_scene_viewport(&ctx))
+        return;
+
+    draw_scene_context_menu(&ctx);
+    handle_scene_camera_controls(ctx.viewport_hovered);
+    handle_scene_selection_box(&ctx);
+    update_and_draw_scene_gizmo(&ctx);
+
+    if (s_gizmo_history_batch_open && !jce_gizmo_is_active()) {
+        jce_state_end_batch_edit();
+        s_gizmo_history_batch_open = false;
+    }
+
+    handle_scene_view_shortcuts();
+    draw_scene_overlays_and_pick(&ctx);
 }
 
 /* ── Standalone wrapper ───────────────────────────────────────────── */

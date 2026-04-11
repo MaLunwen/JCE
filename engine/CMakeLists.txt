@@ -10,7 +10,8 @@
 # ------------------------------------------------------------------ #
 
 file(GLOB_RECURSE ENGINE_SOURCES CONFIGURE_DEPENDS
-	"${CMAKE_CURRENT_SOURCE_DIR}/src/*.c")
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/*.c"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
 
 # Exclude JNI bridge from non-JNI/non-Android builds.
 if(NOT JCE_PLATFORM_ANDROID AND NOT JCE_BUILD_JNI)
@@ -74,7 +75,8 @@ target_link_libraries(JCE PUBLIC
 	enet::enet
 	protobuf::protobuf
 	BT::behaviortree_cpp
-	rmlui::rmlui)
+	rmlui::rmlui
+	ozz-animation::ozz-animation)
 
 # Tracy: true compile-time gate.
 # When OFF, we do not link Tracy at all, and headers compile to no-ops.
@@ -85,10 +87,17 @@ else()
 	target_compile_definitions(JCE PUBLIC JCE_TRACY_ENABLED=0)
 endif()
 
-# C++-only deps: kept out of the PUBLIC surface so the engine
-# static library stays callable from pure C / FFI / JNI consumers.
-target_link_libraries(JCE PRIVATE
-	imgui::imgui)
+# ── Protobuf code generation ──
+set(JCE_PROTO_DIR "${CMAKE_SOURCE_DIR}/proto")
+set(JCE_PROTO_OUT "${CMAKE_CURRENT_BINARY_DIR}/proto_gen")
+file(MAKE_DIRECTORY "${JCE_PROTO_OUT}")
+protobuf_generate(
+	TARGET JCE
+	LANGUAGE cpp
+	IMPORT_DIRS "${JCE_PROTO_DIR}"
+	PROTOS "${JCE_PROTO_DIR}/jce_net_messages.proto"
+	PROTOC_OUT_DIR "${JCE_PROTO_OUT}")
+target_include_directories(JCE PRIVATE "${JCE_PROTO_OUT}")
 
 # ── Platform-specific link options ──
 if(JCE_PLATFORM_WEB)

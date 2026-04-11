@@ -37,7 +37,7 @@ def main():
     # Default to build/web/wasm/dist relative to repo root
     if directory is None:
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        directory = os.path.join(repo_root, "build", "web", "wasm", "dist")
+        directory = os.path.join(repo_root, "build", "web", "wasm", "release")
 
     if not os.path.isdir(directory):
         print(f"ERROR: Directory not found: {directory}")

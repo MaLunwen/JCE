@@ -38,7 +38,7 @@ jce_allocator_t jce_allocator_default(void);
 /* ================================================================== */
 
 #define JCE_ALLOC(a, size)         (a).alloc((size), (a).ctx)
-#define JCE_REALLOC(a, ptr, size)  (a).realloc((ptr), (size), (a).ctx)
+#define JCE_AREALLOC(a, ptr, size) (a).realloc((ptr), (size), (a).ctx)
 #define JCE_AFREE(a, ptr)          (a).free((ptr), (a).ctx)
 #define JCE_ANEW(a, T)             (T *)JCE_ALLOC(a, sizeof(T))
 #define JCE_ANEW_ARRAY(a, T, n)    (T *)JCE_ALLOC(a, sizeof(T) * (n))

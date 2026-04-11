@@ -2,7 +2,7 @@
  * jce_input_actions.c  Action-based input implementation.
  */
 
-#include "jce_input_actions.h"
+#include <jce/platform/jce_input_actions.h>
 #include <jce/platform/jce_input.h>
 #include "core/jce_memory.h"
 

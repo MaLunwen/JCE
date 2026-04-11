@@ -9,7 +9,7 @@
 #include <bgfx/c99/bgfx.h>
 #include <stdio.h>
 #include <string.h>
-#include <stdlib.h>
+#include "core/jce_memory.h"
 
 #define LOG_TAG "shader_mgr"
 #define MAX_SHADERS 64
@@ -29,7 +29,7 @@ struct JceShaderManager {
 
 JceShaderManager *jce_shader_manager_create(const PakArchive *pak)
 {
-    JceShaderManager *mgr = (JceShaderManager *)calloc(1, sizeof(*mgr));
+    JceShaderManager *mgr = (JceShaderManager *)JCE_CALLOC(1, sizeof(*mgr));
     if (!mgr) return NULL;
     mgr->pak = pak;
     return mgr;
@@ -44,7 +44,7 @@ void jce_shader_manager_destroy(JceShaderManager *mgr)
             bgfx_destroy_program(p);
         }
     }
-    free(mgr);
+    JCE_FREE(mgr);
 }
 
 JceShaderHandle jce_shader_manager_acquire(JceShaderManager *mgr,

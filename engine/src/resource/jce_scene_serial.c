@@ -24,13 +24,13 @@
 
 #include <jce/resource/jce_scene_serial.h>
 #include <jce/resource/jce_scene_contract.h>
-#include "scene/jce_scene.h"
+#include <jce/scene/jce_scene.h>
 #include <jce/core/jce_log.h>
 
 #include <cjson/cJSON.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
+#include "core/jce_memory.h"
 
 #define LOG_TAG "scene_serial"
 
@@ -244,14 +244,14 @@ bool jce_scene_serial_save_file(const JceScene *scene, const char *path)
 
     FILE *fp = fopen(path, "wb");
     if (!fp) {
-        free(json);
+        cJSON_free(json);
         LOG_ERROR(LOG_TAG, "cannot open '%s' for writing", path);
         return false;
     }
 
     size_t written = fwrite(json, 1, len, fp);
     fclose(fp);
-    free(json);
+    cJSON_free(json);
 
     if (written != len) {
         LOG_ERROR(LOG_TAG, "write error '%s'", path);
@@ -376,7 +376,7 @@ bool jce_scene_serial_load_file(JceScene *scene, const char *path)
         return false;
     }
 
-    char *buf = (char *)malloc((size_t)sz + 1);
+    char *buf = (char *)JCE_MALLOC((size_t)sz + 1);
     if (!buf) { fclose(fp); return false; }
 
     size_t read_bytes = fread(buf, 1, (size_t)sz, fp);
@@ -384,7 +384,7 @@ bool jce_scene_serial_load_file(JceScene *scene, const char *path)
     buf[read_bytes] = '\0';
 
     bool ok = jce_scene_serial_load(scene, buf, read_bytes);
-    free(buf);
+    JCE_FREE(buf);
     return ok;
 }
 
@@ -392,6 +392,6 @@ bool jce_scene_serial_load_file(JceScene *scene, const char *path)
 
 void jce_scene_serial_free(char *json)
 {
-    /* cJSON_PrintUnformatted allocates with malloc / cJSON_malloc. */
-    if (json) free(json);
+    /* cJSON_PrintUnformatted allocates with cJSON_malloc. */
+    if (json) cJSON_free(json);
 }

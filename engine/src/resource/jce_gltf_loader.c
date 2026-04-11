@@ -9,13 +9,13 @@
 #include <cgltf.h>
 
 #include "jce_gltf_loader.h"
-#include <jce/resource/pak_loader.h>
+#include <jce/core/pak_loader.h>
 #include "graphics/jce_model_internal.h"
 #include <jce/graphics/jce_texture.h>
 #include <jce/graphics/jce_mesh.h>
-#include "graphics/jce_skinned_mesh.h"
-#include "graphics/jce_skeleton.h"
-#include "graphics/jce_animation.h"
+#include <jce/animation/jce_skinned_mesh.h>
+#include <jce/animation/jce_skeleton.h>
+#include "animation/jce_animation.h"
 #include <jce/core/jce_log.h>
 #include <jce/core/jce_math.h>
 #include "core/jce_memory.h"

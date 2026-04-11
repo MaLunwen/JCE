@@ -33,7 +33,7 @@ typedef enum {
 /* PBR Material                                                        */
 /* ================================================================== */
 
-typedef struct {
+typedef struct JcePbrMaterial {
     /* Texture maps (JCE_TEXTURE_INVALID = not present, use factor).
      *   stage 0: s_albedo
      *   stage 1: s_metalRough  (G = roughness, B = metallic)

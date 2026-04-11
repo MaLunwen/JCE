@@ -8,7 +8,7 @@
 
 #include <jce/core/jce_i18n.h>
 #include <jce/core/jce_log.h>
-#include <jce/resource/pak_loader.h>
+#include <jce/core/pak_loader.h>
 
 #include <SDL3/SDL.h>
 #include <cjson/cJSON.h>
@@ -130,32 +130,6 @@ const char *jce_i18n_lang_name(void)
 /* Codepoint collector                                                  */
 /* ------------------------------------------------------------------ */
 
-static uint32_t utf8_next(const char **pp)
-{
-    const unsigned char *s = (const unsigned char *)*pp;
-    uint32_t cp;
-    if (s[0] < 0x80) {
-        cp = s[0]; *pp += 1;
-    } else if ((s[0] & 0xE0) == 0xC0) {
-        cp = ((uint32_t)(s[0] & 0x1F) << 6) | (s[1] & 0x3F);
-        *pp += 2;
-    } else if ((s[0] & 0xF0) == 0xE0) {
-        cp = ((uint32_t)(s[0] & 0x0F) << 12)
-           | ((uint32_t)(s[1] & 0x3F) << 6)
-           | (s[2] & 0x3F);
-        *pp += 3;
-    } else if ((s[0] & 0xF8) == 0xF0) {
-        cp = ((uint32_t)(s[0] & 0x07) << 18)
-           | ((uint32_t)(s[1] & 0x3F) << 12)
-           | ((uint32_t)(s[2] & 0x3F) << 6)
-           | (s[3] & 0x3F);
-        *pp += 4;
-    } else {
-        cp = '?'; *pp += 1;
-    }
-    return cp;
-}
-
 int jce_i18n_collect_codepoints(uint32_t *buf, int cap)
 {
     int count = 0;
@@ -165,14 +139,14 @@ int jce_i18n_collect_codepoints(uint32_t *buf, int cap)
             if (!s[0]) continue;
             const char *p = s;
             while (*p) {
-                uint32_t cp = utf8_next(&p);
+                Uint32 cp = SDL_StepUTF8(&p, NULL);
                 if (cp <= 127) continue;
                 int dup = 0;
                 for (int i = 0; i < count; i++) {
                     if (buf[i] == cp) { dup = 1; break; }
                 }
                 if (!dup && count < cap)
-                    buf[count++] = cp;
+                    buf[count++] = (uint32_t)cp;
             }
         }
     }

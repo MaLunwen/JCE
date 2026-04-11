@@ -10,6 +10,16 @@
 #define JCE_MATH_H
 
 #include <cglm/struct.h>
+/* Raw-array clipspace functions needed by the struct wrappers below. */
+#include <cglm/clipspace/ortho_rh_zo.h>
+#include <cglm/clipspace/ortho_rh_no.h>
+#include <cglm/clipspace/persp_rh_zo.h>
+#include <cglm/clipspace/persp_rh_no.h>
+/* Struct wrappers for both _zo and _no projection variants. */
+#include <cglm/struct/clipspace/ortho_rh_zo.h>
+#include <cglm/struct/clipspace/ortho_rh_no.h>
+#include <cglm/struct/clipspace/persp_rh_zo.h>
+#include <cglm/struct/clipspace/persp_rh_no.h>
 #include <math.h>
 #include <stdbool.h>
 
@@ -116,36 +126,18 @@ static inline jce_mat4 jce_m4_ortho(float left, float right,
                                      float near_val, float far_val,
                                      bool homogeneous_ndc)
 {
-    jce_mat4 out = GLMS_MAT4_ZERO_INIT;
-    out.raw[0][0] = 2.0f / (right - left);
-    out.raw[1][1] = 2.0f / (top - bottom);
-    out.raw[2][2] = (homogeneous_ndc ? 2.0f : 1.0f) / (far_val - near_val);
-    out.raw[3][0] = (left + right) / (left - right);
-    out.raw[3][1] = (top + bottom) / (bottom - top);
-    out.raw[3][2] = homogeneous_ndc
-                  ? (near_val + far_val) / (near_val - far_val)
-                  : near_val / (near_val - far_val);
-    out.raw[3][3] = 1.0f;
-    return out;
+    return homogeneous_ndc
+        ? glms_ortho_rh_no(left, right, bottom, top, near_val, far_val)
+        : glms_ortho_rh_zo(left, right, bottom, top, near_val, far_val);
 }
 
 static inline jce_mat4 jce_m4_perspective(float fov_y_rad, float aspect,
                                            float near_val, float far_val,
                                            bool homogeneous_ndc)
 {
-    float t = tanf(fov_y_rad * 0.5f);
-    jce_mat4 out = GLMS_MAT4_ZERO_INIT;
-    out.raw[0][0] = 1.0f / (aspect * t);
-    out.raw[1][1] = 1.0f / t;
-    if (homogeneous_ndc) {
-        out.raw[2][2] = -(far_val + near_val) / (far_val - near_val);
-        out.raw[3][2] = -(2.0f * far_val * near_val) / (far_val - near_val);
-    } else {
-        out.raw[2][2] = -far_val / (far_val - near_val);
-        out.raw[3][2] = -(far_val * near_val) / (far_val - near_val);
-    }
-    out.raw[2][3] = -1.0f;
-    return out;
+    return homogeneous_ndc
+        ? glms_perspective_rh_no(fov_y_rad, aspect, near_val, far_val)
+        : glms_perspective_rh_zo(fov_y_rad, aspect, near_val, far_val);
 }
 
 static inline jce_mat4 jce_m4_look_at(jce_vec3 eye, jce_vec3 target,
@@ -230,6 +222,74 @@ static inline jce_quat jce_q_from_euler(float pitch, float yaw, float roll)
 static inline jce_quat jce_q_slerp(jce_quat a, jce_quat b, float t)
 {
     return glms_quat_slerp(a, b, t);
+}
+
+/* Quaternion → Euler angles (radians).  Returns (pitch, yaw, roll) in YXZ order. */
+static inline jce_vec3 jce_q_to_euler(jce_quat q)
+{
+    jce_vec3 e;
+    float sinr_cosp = 2.0f * (q.w * q.x + q.y * q.z);
+    float cosr_cosp = 1.0f - 2.0f * (q.x * q.x + q.y * q.y);
+    e.x = atan2f(sinr_cosp, cosr_cosp); /* pitch */
+    float sinp = 2.0f * (q.w * q.y - q.z * q.x);
+    e.y = (fabsf(sinp) >= 1.0f)
+        ? copysignf((float)GLM_PI * 0.5f, sinp)
+        : asinf(sinp); /* yaw */
+    float siny_cosp = 2.0f * (q.w * q.z + q.x * q.y);
+    float cosy_cosp = 1.0f - 2.0f * (q.y * q.y + q.z * q.z);
+    e.z = atan2f(siny_cosp, cosy_cosp); /* roll */
+    return e;
+}
+
+/* Convenience: Euler degrees → quaternion (YXZ order). */
+static inline jce_quat jce_euler_to_q(float pitch_deg, float yaw_deg, float roll_deg)
+{
+    return jce_q_from_euler(pitch_deg * JCE_DEG2RAD,
+                            yaw_deg   * JCE_DEG2RAD,
+                            roll_deg  * JCE_DEG2RAD);
+}
+
+/* Ray–AABB intersection test (slab method).
+   Returns true if the ray hits the box; *t_min receives the entry distance (can be < 0). */
+static inline bool jce_ray_aabb_intersect(jce_vec3 origin, jce_vec3 dir,
+                                           jce_vec3 box_min, jce_vec3 box_max,
+                                           float *t_min)
+{
+    float tmin = -1e30f, tmax = 1e30f;
+    const float *o = &origin.x, *d = &dir.x;
+    const float *bmin = &box_min.x, *bmax = &box_max.x;
+    for (int i = 0; i < 3; i++) {
+        if (fabsf(d[i]) < 1e-8f) {
+            if (o[i] < bmin[i] || o[i] > bmax[i]) return false;
+        } else {
+            float inv = 1.0f / d[i];
+            float t1 = (bmin[i] - o[i]) * inv;
+            float t2 = (bmax[i] - o[i]) * inv;
+            if (t1 > t2) { float tmp = t1; t1 = t2; t2 = tmp; }
+            if (t1 > tmin) tmin = t1;
+            if (t2 < tmax) tmax = t2;
+            if (tmin > tmax) return false;
+        }
+    }
+    if (t_min) *t_min = tmin;
+    return true;
+}
+
+/* Project a world-space point to normalised screen coordinates [0,1].
+   Returns false if the point is behind the camera. */
+static inline bool jce_world_to_screen(jce_vec3 world_pos,
+                                        const jce_mat4 *view,
+                                        const jce_mat4 *proj,
+                                        float *out_x, float *out_y)
+{
+    jce_mat4 vp = glms_mat4_mul(*proj, *view);
+    vec4s p; p.x = world_pos.x; p.y = world_pos.y; p.z = world_pos.z; p.w = 1.0f;
+    vec4s clip = glms_mat4_mulv(vp, p);
+    if (clip.w <= 1e-6f) return false;
+    float inv_w = 1.0f / clip.w;
+    if (out_x) *out_x = (clip.x * inv_w + 1.0f) * 0.5f;
+    if (out_y) *out_y = (1.0f - clip.y * inv_w) * 0.5f;
+    return true;
 }
 
 #ifdef __cplusplus

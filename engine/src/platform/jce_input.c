@@ -3,8 +3,30 @@
  */
 
 #include <jce/platform/jce_input.h>
+#include <SDL3/SDL.h>
 #include "core/jce_memory.h"
 #include <string.h>
+
+/* Compile-time verification that JCE key/gamepad constants match SDL (C99-safe). */
+#define JCE_SASSERT(cond, tag)  typedef char jce_sa_##tag[(cond) ? 1 : -1]
+JCE_SASSERT(JCE_KEY_A      == SDL_SCANCODE_A,      key_a);
+JCE_SASSERT(JCE_KEY_Z      == SDL_SCANCODE_Z,      key_z);
+JCE_SASSERT(JCE_KEY_0      == SDL_SCANCODE_0,      key_0);
+JCE_SASSERT(JCE_KEY_RETURN == SDL_SCANCODE_RETURN,  key_ret);
+JCE_SASSERT(JCE_KEY_ESCAPE == SDL_SCANCODE_ESCAPE,  key_esc);
+JCE_SASSERT(JCE_KEY_SPACE  == SDL_SCANCODE_SPACE,   key_spc);
+JCE_SASSERT(JCE_KEY_F1     == SDL_SCANCODE_F1,      key_f1);
+JCE_SASSERT(JCE_KEY_F12    == SDL_SCANCODE_F12,     key_f12);
+JCE_SASSERT(JCE_KEY_UP     == SDL_SCANCODE_UP,      key_up);
+JCE_SASSERT(JCE_KEY_LCTRL  == SDL_SCANCODE_LCTRL,   key_lc);
+JCE_SASSERT(JCE_KEY_RALT   == SDL_SCANCODE_RALT,    key_ra);
+JCE_SASSERT(JCE_KEY_AC_BACK== SDL_SCANCODE_AC_BACK, key_ab);
+JCE_SASSERT(JCE_KEY_COUNT  == SDL_SCANCODE_COUNT,   key_cnt);
+JCE_SASSERT(JCE_GAMEPAD_BUTTON_SOUTH == SDL_GAMEPAD_BUTTON_SOUTH, gp_bs);
+JCE_SASSERT(JCE_GAMEPAD_BUTTON_COUNT == SDL_GAMEPAD_BUTTON_COUNT, gp_bc);
+JCE_SASSERT(JCE_GAMEPAD_AXIS_LEFTX   == SDL_GAMEPAD_AXIS_LEFTX,  gp_al);
+JCE_SASSERT(JCE_GAMEPAD_AXIS_COUNT   == SDL_GAMEPAD_AXIS_COUNT,   gp_ac);
+#undef JCE_SASSERT
 
 struct JceInput {
     /* Keyboard */
@@ -110,8 +132,9 @@ static void remove_gamepad(JceInput *input, SDL_JoystickID jid)
 
 /* -- event dispatch ------------------------------------------------- */
 
-void jce_input_handle_event(JceInput *input, const SDL_Event *event)
+void jce_input_handle_event(JceInput *input, const void *platform_event)
 {
+    const SDL_Event *event = (const SDL_Event *)platform_event;
     if (!input || !event) return;
 
     switch (event->type) {
@@ -215,19 +238,19 @@ void jce_input_handle_event(JceInput *input, const SDL_Event *event)
 
 /* -- Keyboard queries ----------------------------------------------- */
 
-bool jce_input_key_down(const JceInput *input, SDL_Scancode key)
+bool jce_input_key_down(const JceInput *input, JceKey key)
 {
     if (!input || key >= SDL_SCANCODE_COUNT) return false;
     return input->keys_cur[key];
 }
 
-bool jce_input_key_pressed(const JceInput *input, SDL_Scancode key)
+bool jce_input_key_pressed(const JceInput *input, JceKey key)
 {
     if (!input || key >= SDL_SCANCODE_COUNT) return false;
     return input->keys_cur[key] && !input->keys_prev[key];
 }
 
-bool jce_input_key_released(const JceInput *input, SDL_Scancode key)
+bool jce_input_key_released(const JceInput *input, JceKey key)
 {
     if (!input || key >= SDL_SCANCODE_COUNT) return false;
     return !input->keys_cur[key] && input->keys_prev[key];
@@ -280,7 +303,7 @@ int jce_input_touch_count(const JceInput *input)
 }
 
 bool jce_input_touch_get(const JceInput *input, int index,
-                         SDL_FingerID *id, float *x, float *y,
+                         JceFingerID *id, float *x, float *y,
                          float *pressure)
 {
     if (!input || index < 0 || index >= input->touch_count) return false;
@@ -299,14 +322,14 @@ int jce_input_gamepad_count(const JceInput *input)
 }
 
 bool jce_input_gamepad_button(const JceInput *input, int pad,
-                              SDL_GamepadButton btn)
+                              JceGamepadButton btn)
 {
     if (!input || pad < 0 || pad >= input->gamepad_count) return false;
     return (input->gamepads[pad].buttons_cur & (1u << btn)) != 0;
 }
 
 bool jce_input_gamepad_button_pressed(const JceInput *input, int pad,
-                                      SDL_GamepadButton btn)
+                                      JceGamepadButton btn)
 {
     if (!input || pad < 0 || pad >= input->gamepad_count) return false;
     uint32_t mask = 1u << btn;
@@ -315,7 +338,7 @@ bool jce_input_gamepad_button_pressed(const JceInput *input, int pad,
 }
 
 float jce_input_gamepad_axis(const JceInput *input, int pad,
-                             SDL_GamepadAxis axis)
+                             JceGamepadAxis axis)
 {
     if (!input || pad < 0 || pad >= input->gamepad_count) return 0.0f;
     if (axis < 0 || axis >= SDL_GAMEPAD_AXIS_COUNT) return 0.0f;

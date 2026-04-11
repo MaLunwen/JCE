@@ -1,5 +1,7 @@
 /*
  * jce_editor_config.cpp  Editor configuration persistence.
+ *
+ * Uses cJSON (engine dependency) for JSON parsing and generation.
  */
 
 #include <stdio.h>
@@ -16,9 +18,11 @@
 
 extern "C" {
 #include <jce/core/jce_log.h>
+#include <cjson/cJSON.h>
 }
 
 #include "jce_editor_config.h"
+#include "jce_editor_alloc.h"
 
 #define LOG_TAG       "editor_config"
 #define CONFIG_PATH   ".jce/editor-config.json"
@@ -36,51 +40,22 @@ void jce_editor_config_defaults(JceEditorConfig *cfg) {
     cfg->recent_count = 0;
 }
 
-/* --------------- simple JSON helpers --------------- */
+/* --------------- helpers --------------- */
 
-/* Extract the value for a given key from a flat JSON buffer.
-   Writes result into out (up to out_size-1 chars). Returns true on success. */
-static bool json_get_string(const char *json, const char *key, char *out, size_t out_size) {
-    /* Build the search pattern: "key" */
-    char pattern[64];
-    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-
-    const char *pos = strstr(json, pattern);
-    if (!pos) return false;
-
-    pos += strlen(pattern);
-
-    /* skip whitespace and colon */
-    while (*pos == ' ' || *pos == '\t' || *pos == '\n' || *pos == '\r' || *pos == ':') pos++;
-
-    if (*pos != '"') return false;
-    pos++; /* skip opening quote */
-
-    size_t i = 0;
-    while (*pos && *pos != '"' && i < out_size - 1) {
-        if (*pos == '\\' && *(pos + 1)) {
-            char esc = *(pos + 1);
-            switch (esc) {
-            case '\\': out[i++] = '\\'; pos += 2; continue;
-            case '"':  out[i++] = '"';  pos += 2; continue;
-            case '/':   out[i++] = '/';   pos += 2; continue;
-            case 'b':   out[i++] = '\b';  pos += 2; continue;
-            case 'f':   out[i++] = '\f';  pos += 2; continue;
-            case 'n':   out[i++] = '\n';  pos += 2; continue;
-            case 'r':   out[i++] = '\r';  pos += 2; continue;
-            case 't':   out[i++] = '\t';  pos += 2; continue;
-            default:
-                /* Tolerate malformed escapes in hand-edited/legacy config,
-                   e.g. "D:\Code" accidentally written as "D:\Code". */
-                out[i++] = '\\';
-                pos++;
-                continue;
-            }
-        }
-        out[i++] = *pos++;
+static void cjson_read_str(const cJSON *root, const char *key,
+                           char *out, size_t out_size) {
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (cJSON_IsString(item) && item->valuestring) {
+        strncpy(out, item->valuestring, out_size - 1);
+        out[out_size - 1] = '\0';
     }
-    out[i] = '\0';
-    return true;
+}
+
+static int cjson_read_int(const cJSON *root, const char *key, int fallback) {
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (cJSON_IsNumber(item)) return item->valueint;
+    if (cJSON_IsString(item) && item->valuestring) return atoi(item->valuestring);
+    return fallback;
 }
 
 /* --------------- load --------------- */
@@ -104,7 +79,7 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
         return false;
     }
 
-    char *buf = (char *)malloc((size_t)len + 1);
+    char *buf = (char *)ED_MALLOC((size_t)len + 1);
     if (!buf) {
         fclose(f);
         return false;
@@ -114,38 +89,36 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
     fclose(f);
     buf[rd] = '\0';
 
-    /* Parse known keys */
-    char tmp[512];
+    cJSON *root = cJSON_Parse(buf);
+    ED_FREE(buf);
+    if (!root) {
+        LOG_ERROR(LOG_TAG, "Config JSON parse error");
+        return false;
+    }
 
-    if (json_get_string(buf, "language", tmp, sizeof(tmp)))
-        strncpy(cfg->language, tmp, sizeof(cfg->language) - 1);
-
-    if (json_get_string(buf, "font_size", tmp, sizeof(tmp)))
-        cfg->font_size = atoi(tmp);
-
-    if (json_get_string(buf, "theme", tmp, sizeof(tmp)))
-        strncpy(cfg->theme, tmp, sizeof(cfg->theme) - 1);
-
-    if (json_get_string(buf, "renderer", tmp, sizeof(tmp)))
-        strncpy(cfg->renderer, tmp, sizeof(cfg->renderer) - 1);
-
-    if (json_get_string(buf, "last_project", tmp, sizeof(tmp)))
-        strncpy(cfg->last_project, tmp, sizeof(cfg->last_project) - 1);
+    cjson_read_str(root, "language", cfg->language, sizeof(cfg->language));
+    cfg->font_size = cjson_read_int(root, "font_size", cfg->font_size);
+    cjson_read_str(root, "theme",    cfg->theme,    sizeof(cfg->theme));
+    cjson_read_str(root, "renderer", cfg->renderer, sizeof(cfg->renderer));
+    cjson_read_str(root, "last_project", cfg->last_project, sizeof(cfg->last_project));
 
     /* recent_0 .. recent_9 */
     cfg->recent_count = 0;
     for (int i = 0; i < 10; i++) {
         char key[16];
         snprintf(key, sizeof(key), "recent_%d", i);
-        if (json_get_string(buf, key, tmp, sizeof(tmp)) && tmp[0] != '\0') {
-            strncpy(cfg->recent_projects[i], tmp, sizeof(cfg->recent_projects[i]) - 1);
+        const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+        if (cJSON_IsString(item) && item->valuestring && item->valuestring[0]) {
+            strncpy(cfg->recent_projects[i], item->valuestring,
+                    sizeof(cfg->recent_projects[i]) - 1);
+            cfg->recent_projects[i][sizeof(cfg->recent_projects[i]) - 1] = '\0';
             cfg->recent_count = i + 1;
         } else {
             cfg->recent_projects[i][0] = '\0';
         }
     }
 
-    free(buf);
+    cJSON_Delete(root);
     LOG_INFO(LOG_TAG, "Config loaded: lang=%s theme=%s font=%d",
               cfg->language, cfg->theme, cfg->font_size);
     return true;
@@ -153,46 +126,40 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
 
 /* --------------- save --------------- */
 
-/* Write a JSON string value, escaping backslashes and quotes. */
-static void json_write_escaped(FILE *f, const char *str) {
-    fputc('"', f);
-    for (const char *p = str; *p; p++) {
-        if (*p == '\\')      { fputc('\\', f); fputc('\\', f); }
-        else if (*p == '"')  { fputc('\\', f); fputc('"', f); }
-        else                 { fputc(*p, f); }
-    }
-    fputc('"', f);
-}
-
 bool jce_editor_config_save(const JceEditorConfig *cfg) {
     /* Ensure .jce directory exists */
     MKDIR(CONFIG_DIR);
 
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return false;
+
+    cJSON_AddStringToObject(root, "language",     cfg->language);
+    cJSON_AddNumberToObject(root, "font_size",    cfg->font_size);
+    cJSON_AddStringToObject(root, "theme",        cfg->theme);
+    cJSON_AddStringToObject(root, "renderer",     cfg->renderer);
+    cJSON_AddStringToObject(root, "last_project", cfg->last_project);
+
+    for (int i = 0; i < 10; i++) {
+        char key[16];
+        snprintf(key, sizeof(key), "recent_%d", i);
+        const char *val = (i < cfg->recent_count) ? cfg->recent_projects[i] : "";
+        cJSON_AddStringToObject(root, key, val);
+    }
+
+    char *json_str = cJSON_Print(root);
+    cJSON_Delete(root);
+    if (!json_str) return false;
+
     FILE *f = fopen(CONFIG_PATH, "w");
     if (!f) {
         LOG_ERROR(LOG_TAG, "Failed to write config: %s", CONFIG_PATH);
+        cJSON_free(json_str);
         return false;
     }
 
-    fprintf(f, "{\n");
-    fprintf(f, "    \"language\": \"%s\",\n", cfg->language);
-    fprintf(f, "    \"font_size\": \"%d\",\n", cfg->font_size);
-    fprintf(f, "    \"theme\": \"%s\",\n", cfg->theme);
-    fprintf(f, "    \"renderer\": \"%s\",\n", cfg->renderer);
-    fprintf(f, "    \"last_project\": ");
-    json_write_escaped(f, cfg->last_project);
-    fprintf(f, ",\n");
-
-    for (int i = 0; i < 10; i++) {
-        const char *val = (i < cfg->recent_count) ? cfg->recent_projects[i] : "";
-        const char *comma = (i < 9) ? "," : "";
-        fprintf(f, "    \"recent_%d\": ", i);
-        json_write_escaped(f, val);
-        fprintf(f, "%s\n", comma);
-    }
-
-    fprintf(f, "}\n");
+    fputs(json_str, f);
     fclose(f);
+    cJSON_free(json_str);
 
     LOG_INFO(LOG_TAG, "Config saved to %s", CONFIG_PATH);
     return true;

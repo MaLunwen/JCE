@@ -19,8 +19,8 @@
 extern "C" {
 #endif
 
-typedef struct PakArchive PakArchive;
-typedef struct JceWindow  JceWindow;
+#include <jce/core/pak_loader.h>
+#include <jce/platform/jce_window.h>
 
 /* Initialize the editor subsystem.
    Creates ImGui context, loads fonts, sets up bgfx backend.

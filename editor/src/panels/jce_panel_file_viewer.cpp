@@ -82,7 +82,7 @@ static void fv_close_tab(int idx)
     if (jce_texture_valid(tab->gpu_tex))
         jce_texture_destroy(tab->gpu_tex);
 
-    free(tab->content);
+    ED_FREE(tab->content);
     tab->content = NULL;
 
     for (int i = idx; i < s_fv.tab_count - 1; i++)
@@ -227,7 +227,7 @@ void jce_file_viewer_open(const char *path)
     else
         read_size = (file_size > FV_MAX_CONTENT) ? FV_MAX_CONTENT : (int)file_size;
 
-    char *buf = (char *)malloc((size_t)read_size + 1);
+    char *buf = (char *)ED_MALLOC((size_t)read_size + 1);
     if (!buf) { fclose(fp); return; }
 
     int actually_read = (int)fread(buf, 1, (size_t)read_size, fp);
@@ -472,7 +472,7 @@ void jce_file_viewer_close_all(void)
         fv_code_close_tab(tab);
         if (jce_texture_valid(tab->gpu_tex))
             jce_texture_destroy(tab->gpu_tex);
-        free(tab->content);
+        ED_FREE(tab->content);
         tab->content = NULL;
     }
     s_fv.tab_count      = 0;

@@ -3,12 +3,15 @@
  *
  * Tracks keyboard, mouse, touch, and gamepad state with current/previous
  * frame semantics so callers can query pressed/released transitions.
+ *
+ * This header is SDL-free; game/application code does not need SDL.
  */
 
 #ifndef JCE_INPUT_H
 #define JCE_INPUT_H
 
-#include <SDL3/SDL.h>
+#include <jce/platform/jce_keys.h>
+#include <jce/platform/jce_gamepad.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -29,14 +32,15 @@ void      jce_input_destroy(JceInput *input);
    Copies current state  previous, resets per-frame deltas. */
 void      jce_input_update(JceInput *input);
 
-/* Feed an SDL_Event; call from SDL_AppEvent for every event. */
-void      jce_input_handle_event(JceInput *input, const SDL_Event *event);
+/* Feed a platform event; call from the engine event handler.
+   The event pointer is backend-specific (SDL_Event* internally). */
+void      jce_input_handle_event(JceInput *input, const void *event);
 
 /* -- Keyboard ------------------------------------------------------- */
 
-bool      jce_input_key_down(const JceInput *input, SDL_Scancode key);
-bool      jce_input_key_pressed(const JceInput *input, SDL_Scancode key);
-bool      jce_input_key_released(const JceInput *input, SDL_Scancode key);
+bool      jce_input_key_down(const JceInput *input, JceKey key);
+bool      jce_input_key_pressed(const JceInput *input, JceKey key);
+bool      jce_input_key_released(const JceInput *input, JceKey key);
 
 /* -- Mouse ---------------------------------------------------------- */
 
@@ -51,17 +55,17 @@ float     jce_input_mouse_wheel(const JceInput *input);
 
 int       jce_input_touch_count(const JceInput *input);
 bool      jce_input_touch_get(const JceInput *input, int index,
-              SDL_FingerID *id, float *x, float *y, float *pressure);
+              JceFingerID *id, float *x, float *y, float *pressure);
 
 /* -- Gamepad -------------------------------------------------------- */
 
 int       jce_input_gamepad_count(const JceInput *input);
 bool      jce_input_gamepad_button(const JceInput *input, int pad,
-              SDL_GamepadButton btn);
+              JceGamepadButton btn);
 bool      jce_input_gamepad_button_pressed(const JceInput *input, int pad,
-              SDL_GamepadButton btn);
+              JceGamepadButton btn);
 float     jce_input_gamepad_axis(const JceInput *input, int pad,
-              SDL_GamepadAxis axis);
+              JceGamepadAxis axis);
 
 #ifdef __cplusplus
 }

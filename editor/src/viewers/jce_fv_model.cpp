@@ -319,8 +319,8 @@ void fv_render_model(FvTab *tab)
                 ImVec2(view_pos.x + vw, view_pos.y + vh),
                 IM_COL32(30, 30, 35, 255));
 
-            float radX = ms->rotX * 3.14159265f / 180.0f;
-            float radY = ms->rotY * 3.14159265f / 180.0f;
+            float radX = ms->rotX * JCE_DEG2RAD;
+            float radY = ms->rotY * JCE_DEG2RAD;
             float cosX = cosf(radX), sinX = sinf(radX);
             float cosY = cosf(radY), sinY = sinf(radY);
 

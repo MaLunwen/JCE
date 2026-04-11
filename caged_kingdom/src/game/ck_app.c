@@ -1,39 +1,14 @@
 /*
- * jce_app.c  Rectangles demo application logic.
+ * ck_app.c  Caged Kingdom demo application logic.
  *
  * All game/demo state and per-frame logic lives here.
  * main.c only calls create/destroy/update/event.
+ *
+ * This file uses ONLY JCE engine APIs — no direct SDL dependency.
  */
 
 #include "ck_app.h"
-#include <jce/core/jce_profiler.h>
-#include <jce/core/jce_log.h>
-
-#include <jce/platform/jce_window.h>
-#include <jce/platform/jce_input.h>
-#include <jce/platform/jce_touch_hud.h>
-#include <jce/audio/jce_audio.h>
-#include <jce/graphics/jce_renderer.h>
-#include <jce/graphics/jce_primitives.h>
-#include <jce/graphics/jce_texture.h>
-#include <jce/graphics/jce_text.h>
-#include <jce/graphics/jce_camera.h>
-#include <jce/graphics/jce_mesh.h>
-#include <jce/graphics/jce_material.h>
-#include <jce/graphics/jce_model.h>
-#include <jce/graphics/jce_animation.h>
-#include <jce/graphics/jce_lighting.h>
-#include <jce/graphics/jce_lighting_system.h>
-#include <jce/graphics/jce_views.h>
-#include <jce/graphics/jce_gfx_types.h>
-#include <jce/resource/pak_loader.h>
-#include <jce/resource/jce_asset.h>
-#include <jce/app/jce_config.h>
-#include <jce/app/jce_camera_controller.h>
-#include <jce/core/jce_sysinfo.h>
-#include <jce/core/jce_timer.h>
-#include <jce/core/jce_math.h>
-#include <jce/core/jce_i18n.h>
+#include <jce/api.h>
 #include <string.h>
 
 #ifdef __APPLE__
@@ -104,7 +79,7 @@ struct CkApp {
 
 CkApp *ck_app_create(const JceServices *svc)
 {
-    CkApp *app = (CkApp *)SDL_calloc(1, sizeof(*app));
+    CkApp *app = (CkApp *)calloc(1, sizeof(*app));
     if (!app) return NULL;
     app->svc = *svc;
 
@@ -247,13 +222,13 @@ CkApp *ck_app_create(const JceServices *svc)
     {
         const PakAsset *icon = pak_find(app->svc.pak, "JCE_icon.png");
         if (icon) {
-            void *buf = SDL_malloc((size_t)icon->original_size);
+            void *buf = malloc((size_t)icon->original_size);
             if (buf) {
                 size_t sz = pak_decompress(icon, buf,
                                            (size_t)icon->original_size);
                 if (sz > 0)
                     jce_window_set_icon(app->svc.window, buf, sz);
-                SDL_free(buf);
+                free(buf);
             }
         }
     }
@@ -281,8 +256,7 @@ CkApp *ck_app_create(const JceServices *svc)
 
     /* Desktop: capture mouse for FPS-style look. */
     if (!app->touch_hud) {
-        SDL_SetWindowRelativeMouseMode(
-            jce_window_sdl(app->svc.window), true);
+        jce_window_set_relative_mouse_mode(app->svc.window, true);
         app->mouse_captured = true;
     }
 
@@ -293,7 +267,7 @@ void ck_app_destroy(CkApp *app)
 {
     if (!app) return;
     if (app->mouse_captured)
-        SDL_SetWindowRelativeMouseMode(jce_window_sdl(app->svc.window), false);
+        jce_window_set_relative_mouse_mode(app->svc.window, false);
     jce_touch_hud_destroy(app->touch_hud);
     jce_timer_destroy(app->timer);
     jce_camctrl_destroy(app->cam_ctrl);
@@ -327,7 +301,7 @@ void ck_app_destroy(CkApp *app)
     jce_mesh_destroy(app->ground);
     jce_font_close(app->font_i18n);
     jce_font_close(app->font_main);
-    SDL_free(app);
+    free(app);
 }
 
 /* Return the i18n font for non-English, main font otherwise. */
@@ -511,20 +485,20 @@ static void handle_input(CkApp *app, float dt_ms)
        when paused. Touch HUD active = mouse stays free. */
     if (!app->touch_hud && !app->touch_native) {
         bool alt_held =
-            jce_input_key_down(input, SDL_SCANCODE_LALT) ||
-            jce_input_key_down(input, SDL_SCANCODE_RALT);
+            jce_input_key_down(input, JCE_KEY_LALT) ||
+            jce_input_key_down(input, JCE_KEY_RALT);
         bool want_capture = !app->paused && !alt_held;
         if (want_capture != app->mouse_captured) {
-            SDL_SetWindowRelativeMouseMode(
-                jce_window_sdl(app->svc.window),
+            jce_window_set_relative_mouse_mode(
+                app->svc.window,
                 want_capture);
             app->mouse_captured = want_capture;
         }
     }
 
     /* ESC / Android Back / touch Pause => toggle pause. */
-    if (jce_input_key_pressed(input, SDL_SCANCODE_ESCAPE) ||
-        jce_input_key_pressed(input, SDL_SCANCODE_AC_BACK) ||
+    if (jce_input_key_pressed(input, JCE_KEY_ESCAPE) ||
+        jce_input_key_pressed(input, JCE_KEY_AC_BACK) ||
         jce_touch_hud_button(app->touch_hud,
                              JCE_TOUCH_BTN_PAUSE)) {
         app->paused = !app->paused;
@@ -534,20 +508,20 @@ static void handle_input(CkApp *app, float dt_ms)
     }
 
     /* F11 => fullscreen. */
-    if (jce_input_key_pressed(input, SDL_SCANCODE_F11))
+    if (jce_input_key_pressed(input, JCE_KEY_F11))
         jce_window_toggle_fullscreen(app->svc.window);
 
     /* F3 debug combos (Minecraft-style: toggle on release if no combo used).
        F3+V => wireframe. */
     {
-        bool f3_down = jce_input_key_down(input, SDL_SCANCODE_F3);
+        bool f3_down = jce_input_key_down(input, JCE_KEY_F3);
 
-        if (f3_down && jce_input_key_pressed(input, SDL_SCANCODE_V)) {
+        if (f3_down && jce_input_key_pressed(input, JCE_KEY_V)) {
             app->wireframe = !app->wireframe;
             jce_renderer_set_wireframe(app->svc.renderer, app->wireframe);
             app->f3_combo_used = true;
         }
-        if (f3_down && jce_input_key_pressed(input, SDL_SCANCODE_L)) {
+        if (f3_down && jce_input_key_pressed(input, JCE_KEY_L)) {
             JceLang lang = (JceLang)((jce_i18n_get_lang() + 1)
                                      % JCE_LANG_COUNT);
             jce_i18n_set_lang(lang);
@@ -563,7 +537,7 @@ static void handle_input(CkApp *app, float dt_ms)
     }
 
     /* F9 => toggle touch HUD. */
-    if (jce_input_key_pressed(input, SDL_SCANCODE_F9)) {
+    if (jce_input_key_pressed(input, JCE_KEY_F9)) {
         if (app->touch_native) {
             if (app->touch_hud)
                 jce_touch_hud_set_visible(app->touch_hud,
@@ -571,16 +545,16 @@ static void handle_input(CkApp *app, float dt_ms)
         } else if (app->touch_hud) {
             jce_touch_hud_destroy(app->touch_hud);
             app->touch_hud = NULL;
-            SDL_SetWindowRelativeMouseMode(
-                jce_window_sdl(app->svc.window), true);
+            jce_window_set_relative_mouse_mode(
+                app->svc.window, true);
             app->mouse_captured = true;
         } else {
             app->touch_hud = jce_touch_hud_create(
                 app->svc.renderer, app->svc.window,
                 app->font_main);
             if (app->mouse_captured) {
-                SDL_SetWindowRelativeMouseMode(
-                    jce_window_sdl(app->svc.window), false);
+                jce_window_set_relative_mouse_mode(
+                    app->svc.window, false);
                 app->mouse_captured = false;
             }
         }
@@ -593,13 +567,13 @@ static void update_pause(CkApp *app, float dt_ms)
 {
     const JceInput *input = app->svc.input;
 
-    if (jce_input_key_pressed(input, SDL_SCANCODE_UP) ||
-        jce_input_key_pressed(input, SDL_SCANCODE_W))
+    if (jce_input_key_pressed(input, JCE_KEY_UP) ||
+        jce_input_key_pressed(input, JCE_KEY_W))
         app->pause_selection = 0;
-    if (jce_input_key_pressed(input, SDL_SCANCODE_DOWN) ||
-        jce_input_key_pressed(input, SDL_SCANCODE_S))
+    if (jce_input_key_pressed(input, JCE_KEY_DOWN) ||
+        jce_input_key_pressed(input, JCE_KEY_S))
         app->pause_selection = 1;
-    if (jce_input_key_pressed(input, SDL_SCANCODE_RETURN)) {
+    if (jce_input_key_pressed(input, JCE_KEY_RETURN)) {
         if (app->pause_selection == 0) {
             app->paused = false;
             jce_touch_hud_set_menu_mode(app->touch_hud,
@@ -647,13 +621,13 @@ static void draw_3d_scene(CkApp *app, float dt_ms)
 
     /* WASD. */
     const JceInput *in = app->svc.input;
-    if (jce_input_key_down(in, SDL_SCANCODE_W))
+    if (jce_input_key_down(in, JCE_KEY_W))
         cam_in.move_forward -= 1;
-    if (jce_input_key_down(in, SDL_SCANCODE_S))
+    if (jce_input_key_down(in, JCE_KEY_S))
         cam_in.move_forward += 1;
-    if (jce_input_key_down(in, SDL_SCANCODE_A))
+    if (jce_input_key_down(in, JCE_KEY_A))
         cam_in.move_right -= 1;
-    if (jce_input_key_down(in, SDL_SCANCODE_D))
+    if (jce_input_key_down(in, JCE_KEY_D))
         cam_in.move_right += 1;
 
     /* Touch joystick. */
@@ -665,10 +639,10 @@ static void draw_3d_scene(CkApp *app, float dt_ms)
     }
 
     /* Vertical: Space/Shift + touch buttons. */
-    if (jce_input_key_down(in, SDL_SCANCODE_SPACE))
+    if (jce_input_key_down(in, JCE_KEY_SPACE))
         cam_in.move_up += 1;
-    if (jce_input_key_down(in, SDL_SCANCODE_LSHIFT) ||
-        jce_input_key_down(in, SDL_SCANCODE_RSHIFT))
+    if (jce_input_key_down(in, JCE_KEY_LSHIFT) ||
+        jce_input_key_down(in, JCE_KEY_RSHIFT))
         cam_in.move_up -= 1;
     if (jce_touch_hud_button_down(app->touch_hud,
                                   JCE_TOUCH_BTN_JUMP))
@@ -679,8 +653,8 @@ static void draw_3d_scene(CkApp *app, float dt_ms)
 
     /* Sprint toggle. */
     cam_in.sprint_toggle =
-        jce_input_key_pressed(in, SDL_SCANCODE_LCTRL) ||
-        jce_input_key_pressed(in, SDL_SCANCODE_RCTRL);
+        jce_input_key_pressed(in, JCE_KEY_LCTRL) ||
+        jce_input_key_pressed(in, JCE_KEY_RCTRL);
 
     /* Mouse look + touch look. */
     if (app->mouse_captured) {
@@ -788,7 +762,7 @@ void ck_app_update(CkApp *app)
     JCE_PROFILE_ZONE_END;
 }
 
-void ck_app_event(CkApp *app, const SDL_Event *event)
+void ck_app_event(CkApp *app, const void *event)
 {
     (void)app; (void)event;
 }
@@ -830,7 +804,7 @@ static void demo_draw(const JceServices *svc, void *ud)
     /* Drawing is done inside ck_app_update for now. */
 }
 
-static void demo_on_event(const SDL_Event *ev, void *ud)
+static void demo_on_event(const void *ev, void *ud)
 {
     (void)ud;
     ck_app_event(s_app, ev);

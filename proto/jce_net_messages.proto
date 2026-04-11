@@ -1,0 +1,72 @@
+// jce_net_messages.proto  Network message definitions for JCE engine.
+//
+// Used by the protobuf encode/decode shim (jce_net_proto.cpp) to
+// serialise structured messages before handing them to the ENet layer.
+
+syntax = "proto3";
+package jce.net;
+
+option optimize_for = LITE_RUNTIME;
+
+// ── Envelope ──────────────────────────────────────────────────────
+
+message NetEnvelope {
+    uint32 sequence = 1;
+    uint64 timestamp_us = 2;  // microseconds since session start
+
+    oneof payload {
+        PlayerAction  player_action = 10;
+        GameState     game_state    = 11;
+        ChatMessage   chat_message  = 12;
+        Ping          ping          = 13;
+    }
+}
+
+// ── Payload types ─────────────────────────────────────────────────
+
+message PlayerAction {
+    uint64 entity_id = 1;
+    uint32 action_id = 2;
+    Vec3   position  = 3;
+    Vec3   direction = 4;
+    float  value     = 5;
+}
+
+message GameState {
+    uint32 tick = 1;
+    repeated EntitySnapshot entities = 2;
+}
+
+message EntitySnapshot {
+    uint64 entity_id = 1;
+    Vec3   position  = 2;
+    Quat   rotation  = 3;
+    Vec3   velocity  = 4;
+    uint32 state     = 5;
+}
+
+message ChatMessage {
+    uint64 sender_id = 1;
+    string text      = 2;
+    uint32 channel   = 3;
+}
+
+message Ping {
+    uint64 client_time_us = 1;
+    uint64 server_time_us = 2;
+}
+
+// ── Math primitives ───────────────────────────────────────────────
+
+message Vec3 {
+    float x = 1;
+    float y = 2;
+    float z = 3;
+}
+
+message Quat {
+    float x = 1;
+    float y = 2;
+    float z = 3;
+    float w = 4;
+}

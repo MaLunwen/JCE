@@ -14,7 +14,7 @@
 extern "C" {
 #endif
 
-typedef struct PakArchive PakArchive;
+#include <jce/core/pak_loader.h>
 
 /* Supported locales. */
 typedef enum {

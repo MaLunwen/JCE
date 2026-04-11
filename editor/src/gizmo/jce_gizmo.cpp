@@ -54,9 +54,9 @@ extern "C" void jce_gizmo_internal_get_axes(float ax_x[3], float ax_y[3], float 
 static void compute_gizmo_axes(int gizmo_space, const float *rotation)
 {
     if (gizmo_space == 0 /* LOCAL */ && rotation) {
-        float rx = rotation[0] * (3.14159265f / 180.0f);
-        float ry = rotation[1] * (3.14159265f / 180.0f);
-        float rz = rotation[2] * (3.14159265f / 180.0f);
+        float rx = rotation[0] * JCE_DEG2RAD;
+        float ry = rotation[1] * JCE_DEG2RAD;
+        float rz = rotation[2] * JCE_DEG2RAD;
 
         mat4 m;
         vec3 euler = {rx, ry, rz};

@@ -1,9 +1,9 @@
 /*
- * jce_async_pool.c  Worker thread pool for async asset loading.
+ * jce_async_pool.c  Async asset loading via enkiTS (JceThreadPool).
  *
- * Workers wait on a condition variable for incoming requests.
- * Completed requests are moved to a done-list protected by a mutex.
- * Main thread drains the done-list each frame.
+ * Each submitted request is dispatched to the engine's work-stealing
+ * thread pool as a tracked task.  The main thread drains completed
+ * requests each frame via jce_pool_drain().
  *
  * Worker decoding:
  *   TEXTURE → pak_decompress + IMG_Load_IO → SDL_Surface (RGBA8)
@@ -13,12 +13,13 @@
  */
 
 #include "jce_async_pool.h"
-#include "../core/jce_memory.h"
+#include "core/jce_memory.h"
 #include "jce_asset_reader.h"
-#include <jce/resource/pak_loader.h>
+#include <jce/core/pak_loader.h>
 #include <jce/resource/jce_asset_format.h>
 #include <jce/core/jce_log.h>
 #include <jce/core/jce_profiler.h>
+#include <jce/core/jce_thread.h>
 
 #include <SDL3/SDL.h>
 #include <SDL3_image/SDL_image.h>
@@ -31,70 +32,31 @@
 #endif
 
 #define LOG_TAG "jce_pool"
-#define MAX_WORKERS 8
 
 /* ================================================================== */
 /* Pool internals                                                      */
 /* ================================================================== */
 
-struct JceAsyncPool {
-	SDL_Thread *workers[MAX_WORKERS];
-	uint32_t    num_workers;
+/* A tracked in-flight request. */
+typedef struct InFlight {
+	JceAsyncRequest *req;
+	JceTask         *task;
+	struct InFlight *next;
+} InFlight;
 
-	/* Request queue (FIFO, mutex-protected). */
-	SDL_Mutex     *queue_lock;
-	SDL_Condition *queue_cond;
-	JceAsyncRequest *queue_head;
-	JceAsyncRequest *queue_tail;
-	SDL_AtomicInt    queue_count;
+struct JceAsyncPool {
+	JceThreadPool *tp;
+
+	/* In-flight list (mutex-protected). */
+	JceMutex  *lock;
+	InFlight  *inflight_head;
+	uint32_t   inflight_count;
 
 	/* Completed list (mutex-protected, drained by main thread). */
-	SDL_Mutex       *done_lock;
+	JceMutex        *done_lock;
 	JceAsyncRequest *done_head;
 	JceAsyncRequest *done_tail;
-
-	/* Shutdown flag. */
-	SDL_AtomicInt shutdown;
 };
-
-/* ================================================================== */
-/* Queue helpers (must hold queue_lock)                                */
-/* ================================================================== */
-
-static void queue_push(JceAsyncPool *pool, JceAsyncRequest *req)
-{
-	req->next = NULL;
-	if (pool->queue_tail)
-		pool->queue_tail->next = req;
-	else
-		pool->queue_head = req;
-	pool->queue_tail = req;
-	SDL_AddAtomicInt(&pool->queue_count, 1);
-}
-
-static JceAsyncRequest *queue_pop(JceAsyncPool *pool)
-{
-	JceAsyncRequest *req = pool->queue_head;
-	if (!req) return NULL;
-	pool->queue_head = req->next;
-	if (!pool->queue_head)
-		pool->queue_tail = NULL;
-	req->next = NULL;
-	SDL_AddAtomicInt(&pool->queue_count, -1);
-	return req;
-}
-
-static void done_push(JceAsyncPool *pool, JceAsyncRequest *req)
-{
-	SDL_LockMutex(pool->done_lock);
-	req->next = NULL;
-	if (pool->done_tail)
-		pool->done_tail->next = req;
-	else
-		pool->done_head = req;
-	pool->done_tail = req;
-	SDL_UnlockMutex(pool->done_lock);
-}
 
 /* ================================================================== */
 /* Worker: texture decode                                              */
@@ -156,7 +118,6 @@ static void decode_texture_inner(JceAsyncRequest *req)
 		void *pixels = JCE_MALLOC(pixel_size + sizeof(JceAssetTexInfo));
 		if (!pixels) { JCE_FREE(buf); return; }
 
-		/* Store tex_info header before pixel data so finalize can read it. */
 		memcpy(pixels, &tex_info, sizeof(tex_info));
 		if (jce_asset_chunk_data(&view, pix_c,
 		                          (uint8_t *)pixels + sizeof(JceAssetTexInfo),
@@ -229,8 +190,6 @@ static void decode_audio_inner(JceAsyncRequest *req)
 		return;
 	}
 
-	/* Pack result: decoded audio info + PCM data.
-	   Same layout for both cooked and raw paths. */
 	typedef struct {
 		uint32_t sample_rate;
 		uint16_t channels;
@@ -306,7 +265,6 @@ static void decode_audio_inner(JceAsyncRequest *req)
 	void *pcm = NULL;
 
 	if (total_frames == 0) {
-		/* Unknown length — decode in growing chunks. */
 		size_t alloc_frames = 256 * 1024;
 		size_t used_frames  = 0;
 		pcm = JCE_MALLOC(alloc_frames * channels * sizeof(int16_t));
@@ -396,48 +354,23 @@ static void decode_raw(JceAsyncRequest *req)
 }
 
 /* ================================================================== */
-/* Worker thread entry point                                           */
+/* Task callback (dispatches by request type)                          */
 /* ================================================================== */
 
-static int worker_func(void *data)
+static void async_task_fn(void *arg)
 {
-	JceAsyncPool *pool = (JceAsyncPool *)data;
+	JceAsyncRequest *req = (JceAsyncRequest *)arg;
 
-	for (;;) {
-		SDL_LockMutex(pool->queue_lock);
-
-		/* Wait for a request or shutdown. */
-		while (!pool->queue_head &&
-		       SDL_GetAtomicInt(&pool->shutdown) == 0) {
-			SDL_WaitCondition(pool->queue_cond, pool->queue_lock);
-		}
-
-		if (SDL_GetAtomicInt(&pool->shutdown) != 0 &&
-		    !pool->queue_head) {
-			SDL_UnlockMutex(pool->queue_lock);
-			break;
-		}
-
-		JceAsyncRequest *req = queue_pop(pool);
-		SDL_UnlockMutex(pool->queue_lock);
-
-		if (!req) continue;
-
-		/* Dispatch by type. */
-		switch (req->type) {
-		case JCE_ASYNC_TEXTURE: decode_texture(req); break;
-		case JCE_ASYNC_AUDIO:   decode_audio(req);   break;
-		case JCE_ASYNC_MESH:    decode_raw(req);      break;
-		case JCE_ASYNC_MODEL:   decode_raw(req);      break;
-		case JCE_ASYNC_RAW:     decode_raw(req);      break;
-		case JCE_ASYNC_FONT:    decode_raw(req);      break;
-		}
-
-		SDL_SetAtomicInt(&req->done, 1);
-		done_push(pool, req);
+	switch (req->type) {
+	case JCE_ASYNC_TEXTURE: decode_texture(req); break;
+	case JCE_ASYNC_AUDIO:   decode_audio(req);   break;
+	case JCE_ASYNC_MESH:    /* fall through */
+	case JCE_ASYNC_MODEL:   /* fall through */
+	case JCE_ASYNC_RAW:     /* fall through */
+	case JCE_ASYNC_FONT:    decode_raw(req);      break;
 	}
 
-	return 0;
+	SDL_SetAtomicInt(&req->done, 1);
 }
 
 /* ================================================================== */
@@ -456,29 +389,21 @@ JceAsyncPool *jce_pool_create(uint32_t num_workers)
 		num_workers = 3;
 #endif
 	}
-	if (num_workers > MAX_WORKERS)
-		num_workers = MAX_WORKERS;
 
-	pool->queue_lock = SDL_CreateMutex();
-	pool->queue_cond = SDL_CreateCondition();
-	pool->done_lock  = SDL_CreateMutex();
+	pool->tp = jce_thread_pool_create((int)num_workers);
+	if (!pool->tp) {
+		JCE_FREE(pool);
+		return NULL;
+	}
 
-	if (!pool->queue_lock || !pool->queue_cond || !pool->done_lock) {
+	pool->lock = jce_mutex_create();
+	pool->done_lock = jce_mutex_create();
+	if (!pool->lock || !pool->done_lock) {
 		jce_pool_destroy(pool);
 		return NULL;
 	}
 
-	pool->num_workers = num_workers;
-	for (uint32_t i = 0; i < num_workers; i++) {
-		char name[32];
-		snprintf(name, sizeof(name), "jce_worker_%u", i);
-		pool->workers[i] = SDL_CreateThread(worker_func, name, pool);
-		if (!pool->workers[i]) {
-			LOG_ERROR(LOG_TAG, "failed to create worker thread %u", i);
-		}
-	}
-
-	LOG_INFO(LOG_TAG, "async pool: %u workers", num_workers);
+	LOG_INFO(LOG_TAG, "async pool: %u workers (enkiTS)", num_workers);
 	return pool;
 }
 
@@ -486,36 +411,34 @@ void jce_pool_destroy(JceAsyncPool *pool)
 {
 	if (!pool) return;
 
-	/* Signal shutdown. */
-	SDL_SetAtomicInt(&pool->shutdown, 1);
-	if (pool->queue_cond)
-		SDL_BroadcastCondition(pool->queue_cond);
+	/* Destroy the thread pool — waits for all in-flight tasks to finish. */
+	if (pool->tp)
+		jce_thread_pool_destroy(pool->tp);
 
-	/* Join all workers. */
-	for (uint32_t i = 0; i < pool->num_workers; i++) {
-		if (pool->workers[i])
-			SDL_WaitThread(pool->workers[i], NULL);
-	}
-
-	/* Free remaining queued requests. */
-	while (pool->queue_head) {
-		JceAsyncRequest *req = pool->queue_head;
-		pool->queue_head = req->next;
-		if (req->decoded_data) JCE_FREE(req->decoded_data);
-		JCE_FREE(req);
+	/* Free in-flight tracking nodes (tasks are already complete). */
+	InFlight *inf = pool->inflight_head;
+	while (inf) {
+		InFlight *next = inf->next;
+		if (inf->task) jce_task_free(inf->task);
+		if (inf->req) {
+			if (inf->req->decoded_data) JCE_FREE(inf->req->decoded_data);
+			JCE_FREE(inf->req);
+		}
+		JCE_FREE(inf);
+		inf = next;
 	}
 
 	/* Free remaining done requests. */
-	while (pool->done_head) {
-		JceAsyncRequest *req = pool->done_head;
-		pool->done_head = req->next;
+	JceAsyncRequest *req = pool->done_head;
+	while (req) {
+		JceAsyncRequest *next = req->next;
 		if (req->decoded_data) JCE_FREE(req->decoded_data);
 		JCE_FREE(req);
+		req = next;
 	}
 
-	if (pool->queue_cond) SDL_DestroyCondition(pool->queue_cond);
-	if (pool->queue_lock) SDL_DestroyMutex(pool->queue_lock);
-	if (pool->done_lock)  SDL_DestroyMutex(pool->done_lock);
+	if (pool->lock)      jce_mutex_destroy(pool->lock);
+	if (pool->done_lock) jce_mutex_destroy(pool->done_lock);
 	JCE_FREE(pool);
 }
 
@@ -541,10 +464,29 @@ JceAsyncRequest *jce_pool_submit(JceAsyncPool *pool,
 	if (info)
 		req->info = *info;
 
-	SDL_LockMutex(pool->queue_lock);
-	queue_push(pool, req);
-	SDL_SignalCondition(pool->queue_cond);
-	SDL_UnlockMutex(pool->queue_lock);
+	/* Submit to enkiTS thread pool. */
+	JceTask *task = jce_thread_pool_submit_tracked(pool->tp,
+	                                                async_task_fn, req);
+	if (!task) {
+		JCE_FREE(req);
+		return NULL;
+	}
+
+	/* Track in-flight. */
+	InFlight *inf = JCE_NEW(InFlight);
+	if (!inf) {
+		/* Task was already submitted — can't undo.  Best we can do is let
+		   it complete and leak the request. */
+		return NULL;
+	}
+	inf->req  = req;
+	inf->task = task;
+
+	jce_mutex_lock(pool->lock);
+	inf->next = pool->inflight_head;
+	pool->inflight_head = inf;
+	pool->inflight_count++;
+	jce_mutex_unlock(pool->lock);
 
 	return req;
 }
@@ -553,17 +495,49 @@ JceAsyncRequest *jce_pool_drain(JceAsyncPool *pool, uint32_t max_count)
 {
 	if (!pool) return NULL;
 
-	SDL_LockMutex(pool->done_lock);
+	/* Scan in-flight list: move completed tasks to done list. */
+	jce_mutex_lock(pool->lock);
+
+	InFlight **pp = &pool->inflight_head;
+	while (*pp) {
+		InFlight *inf = *pp;
+		if (jce_task_done(inf->task)) {
+			/* Remove from in-flight. */
+			*pp = inf->next;
+			pool->inflight_count--;
+
+			jce_task_free(inf->task);
+
+			/* Push to done list. */
+			JceAsyncRequest *req = inf->req;
+			req->next = NULL;
+
+			jce_mutex_lock(pool->done_lock);
+			if (pool->done_tail)
+				pool->done_tail->next = req;
+			else
+				pool->done_head = req;
+			pool->done_tail = req;
+			jce_mutex_unlock(pool->done_lock);
+
+			JCE_FREE(inf);
+		} else {
+			pp = &inf->next;
+		}
+	}
+
+	jce_mutex_unlock(pool->lock);
+
+	/* Now drain from done list. */
+	jce_mutex_lock(pool->done_lock);
 
 	JceAsyncRequest *result = NULL;
 
 	if (max_count == 0 || max_count >= UINT32_MAX) {
-		/* Drain all. */
 		result = pool->done_head;
 		pool->done_head = NULL;
 		pool->done_tail = NULL;
 	} else {
-		/* Drain up to max_count. */
 		JceAsyncRequest *head = pool->done_head;
 		JceAsyncRequest *tail = NULL;
 		uint32_t count = 0;
@@ -583,15 +557,13 @@ JceAsyncRequest *jce_pool_drain(JceAsyncPool *pool, uint32_t max_count)
 		}
 	}
 
-	SDL_UnlockMutex(pool->done_lock);
+	jce_mutex_unlock(pool->done_lock);
 	return result;
 }
 
 void jce_pool_free_request(JceAsyncRequest *req)
 {
 	if (!req) return;
-	/* Note: decoded_data ownership is transferred to the asset manager
-	   during finalization. Only free here if it wasn't claimed. */
 	if (req->decoded_data)
 		JCE_FREE(req->decoded_data);
 	JCE_FREE(req);
@@ -600,6 +572,5 @@ void jce_pool_free_request(JceAsyncRequest *req)
 uint32_t jce_pool_pending_count(const JceAsyncPool *pool)
 {
 	if (!pool) return 0;
-	return (uint32_t)SDL_GetAtomicInt(
-		(SDL_AtomicInt *)&pool->queue_count);
+	return pool->inflight_count;
 }

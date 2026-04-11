@@ -3,11 +3,20 @@
  */
 
 #include <jce/platform/jce_window.h>
+#include "jce_window_internal.h"
 #include <jce/core/jce_log.h>
 #include <SDL3_image/SDL_image.h>
 #include <SDL3/SDL_metal.h>
 #include "core/jce_memory.h"
 #include <string.h>
+
+/* Verify JCE_WINDOW_* flags match SDL_WINDOW_* at compile time (C99-safe). */
+#define JCE_SASSERT(cond, tag)  typedef char jce_sa_##tag[(cond) ? 1 : -1]
+JCE_SASSERT(JCE_WINDOW_FULLSCREEN == SDL_WINDOW_FULLSCREEN, win_fs);
+JCE_SASSERT(JCE_WINDOW_RESIZABLE  == SDL_WINDOW_RESIZABLE,  win_rs);
+JCE_SASSERT(JCE_WINDOW_MAXIMIZED  == SDL_WINDOW_MAXIMIZED,  win_mx);
+JCE_SASSERT(JCE_WINDOW_BORDERLESS == SDL_WINDOW_BORDERLESS, win_bl);
+#undef JCE_SASSERT
 
 #define LOG_TAG "jce_window"
 
@@ -233,4 +242,22 @@ void jce_window_toggle_fullscreen(JceWindow *win)
     if (ph > 0)
         win->logical_w = (int)((float)win->logical_h * (float)pw / (float)ph);
 #endif
+}
+
+void jce_window_set_relative_mouse_mode(JceWindow *win, bool enabled)
+{
+    if (!win || !win->sdl_win) return;
+    SDL_SetWindowRelativeMouseMode(win->sdl_win, enabled);
+}
+
+bool jce_window_start_text_input(JceWindow *win)
+{
+    if (!win || !win->sdl_win) return false;
+    return SDL_StartTextInput(win->sdl_win);
+}
+
+bool jce_window_stop_text_input(JceWindow *win)
+{
+    if (!win || !win->sdl_win) return false;
+    return SDL_StopTextInput(win->sdl_win);
 }

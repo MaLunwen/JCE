@@ -4,7 +4,6 @@
 
 #include <jce/graphics/jce_mesh.h>
 #include "jce_renderer_internal.h"
-#include "resource/jce_model_loader.h"
 #include <jce/core/jce_log.h>
 #include <jce/core/jce_math.h>
 
@@ -91,7 +90,9 @@ JceMesh *jce_mesh_create(const JceMeshVertex *vertices, uint32_t num_verts,
 
 JceMesh *jce_mesh_load(const PakArchive *pak, const char *asset_path)
 {
-    return jce_model_load(pak, asset_path);
+    (void)pak; (void)asset_path;
+    LOG_WARN(LOG_TAG, "jce_mesh_load: use jce_model_load_gltf() for glTF assets");
+    return NULL;
 }
 
 void jce_mesh_destroy(JceMesh *mesh)

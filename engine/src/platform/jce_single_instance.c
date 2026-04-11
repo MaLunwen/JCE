@@ -56,7 +56,14 @@ static void sanitize_name(const char *name, char *out, size_t out_size)
 
 bool jce_single_instance_lock(const char *app_name)
 {
-#if defined(_WIN32)
+#if defined(__ANDROID__) || defined(__EMSCRIPTEN__)
+    /* Android: the OS Activity Manager already enforces a single instance;
+     * /tmp is unavailable, so a file-lock would always fail.
+     * WASM: no persistent filesystem; single-tab semantics are enforced
+     * by the browser. Skip the lock in both cases. */
+    (void)app_name;
+    return true;
+#elif defined(_WIN32)
     if (s_single_mutex) return true;
 
     char safe_name[128];
@@ -115,7 +122,9 @@ bool jce_single_instance_lock(const char *app_name)
 
 void jce_single_instance_unlock(void)
 {
-#if defined(_WIN32)
+#if defined(__ANDROID__) || defined(__EMSCRIPTEN__)
+    return; /* no-op: lock was not acquired */
+#elif defined(_WIN32)
     if (!s_single_mutex) return;
 
     ReleaseMutex(s_single_mutex);
@@ -133,7 +142,9 @@ void jce_single_instance_unlock(void)
 
 bool jce_single_instance_is_locked(void)
 {
-#if defined(_WIN32)
+#if defined(__ANDROID__) || defined(__EMSCRIPTEN__)
+    return true; /* always considered locked (OS-enforced) */
+#elif defined(_WIN32)
     return s_single_mutex != NULL;
 #else
     return s_lock_fd >= 0;

@@ -9,13 +9,13 @@
  */
 
 #include "jce_asset_cooker.h"
+#include "core/jce_memory.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3_image/SDL_image.h>
 #include <zstd.h>
 #include <xxhash.h>
 
-#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -36,7 +36,7 @@ typedef struct {
 
 static bool buf_init(Buf *b, size_t cap)
 {
-	b->data = (uint8_t *)malloc(cap);
+	b->data = (uint8_t *)JCE_MALLOC(cap);
 	if (!b->data) return false;
 	b->size = 0;
 	b->capacity = cap;
@@ -48,7 +48,7 @@ static bool buf_grow(Buf *b, size_t needed)
 	if (b->size + needed <= b->capacity) return true;
 	size_t new_cap = b->capacity * 2;
 	if (new_cap < b->size + needed) new_cap = b->size + needed;
-	uint8_t *tmp = (uint8_t *)realloc(b->data, new_cap);
+	uint8_t *tmp = (uint8_t *)JCE_REALLOC(b->data, new_cap);
 	if (!tmp) return false;
 	b->data = tmp;
 	b->capacity = new_cap;
@@ -73,7 +73,7 @@ static bool buf_write_zeros(Buf *b, size_t len)
 
 static void buf_free(Buf *b)
 {
-	free(b->data);
+	JCE_FREE(b->data);
 	b->data = NULL;
 	b->size = 0;
 	b->capacity = 0;
@@ -110,7 +110,7 @@ static JceCookResult build_asset(uint32_t asset_type,
 		bool   is_compressed;
 	} CompChunk;
 
-	CompChunk *comp = (CompChunk *)calloc(chunk_count, sizeof(CompChunk));
+	CompChunk *comp = (CompChunk *)JCE_CALLOC(chunk_count, sizeof(CompChunk));
 	if (!comp) {
 		snprintf(result.error, sizeof(result.error), "allocation failed");
 		return result;
@@ -124,7 +124,7 @@ static JceCookResult build_asset(uint32_t asset_type,
 	for (uint32_t i = 0; i < chunk_count; i++) {
 		if (cctx && chunks[i].raw_size > 64) {
 			size_t bound = ZSTD_compressBound(chunks[i].raw_size);
-			comp[i].comp_data = malloc(bound);
+			comp[i].comp_data = JCE_MALLOC(bound);
 			if (comp[i].comp_data) {
 				size_t csize = ZSTD_compressCCtx(cctx,
 				                                  comp[i].comp_data, bound,
@@ -135,7 +135,7 @@ static JceCookResult build_asset(uint32_t asset_type,
 					comp[i].comp_size = csize;
 					comp[i].is_compressed = true;
 				} else {
-					free(comp[i].comp_data);
+					JCE_FREE(comp[i].comp_data);
 					comp[i].comp_data = NULL;
 				}
 			}
@@ -152,8 +152,8 @@ static JceCookResult build_asset(uint32_t asset_type,
 	/* Build final blob. */
 	Buf buf;
 	if (!buf_init(&buf, data_start + total_data + 64)) {
-		for (uint32_t i = 0; i < chunk_count; i++) free(comp[i].comp_data);
-		free(comp);
+		for (uint32_t i = 0; i < chunk_count; i++) JCE_FREE(comp[i].comp_data);
+		JCE_FREE(comp);
 		snprintf(result.error, sizeof(result.error), "allocation failed");
 		return result;
 	}
@@ -208,8 +208,8 @@ static JceCookResult build_asset(uint32_t asset_type,
 	}
 
 	/* Cleanup compressed buffers. */
-	for (uint32_t i = 0; i < chunk_count; i++) free(comp[i].comp_data);
-	free(comp);
+	for (uint32_t i = 0; i < chunk_count; i++) JCE_FREE(comp[i].comp_data);
+	JCE_FREE(comp);
 
 	result.data    = buf.data;
 	result.size    = buf.size;
@@ -327,7 +327,7 @@ JceCookResult jce_cook_audio(const void *input, size_t input_size,
 		/* Unknown length — decode in chunks. */
 		size_t alloc = 256 * 1024;
 		size_t used  = 0;
-		pcm = malloc(alloc * channels * sizeof(int16_t));
+		pcm = JCE_MALLOC(alloc * channels * sizeof(int16_t));
 		if (!pcm) {
 			ma_decoder_uninit(&decoder);
 			snprintf(result.error, sizeof(result.error), "allocation failed");
@@ -336,9 +336,9 @@ JceCookResult jce_cook_audio(const void *input, size_t input_size,
 		for (;;) {
 			if (used + 4096 > alloc) {
 				alloc *= 2;
-				void *tmp = realloc(pcm, alloc * channels * sizeof(int16_t));
+				void *tmp = JCE_REALLOC(pcm, alloc * channels * sizeof(int16_t));
 				if (!tmp) {
-					free(pcm);
+					JCE_FREE(pcm);
 					ma_decoder_uninit(&decoder);
 					snprintf(result.error, sizeof(result.error), "realloc failed");
 					return result;
@@ -353,7 +353,7 @@ JceCookResult jce_cook_audio(const void *input, size_t input_size,
 		}
 		total_frames = (ma_uint64)used;
 	} else {
-		pcm = malloc((size_t)(total_frames * channels * sizeof(int16_t)));
+		pcm = JCE_MALLOC((size_t)(total_frames * channels * sizeof(int16_t)));
 		if (!pcm) {
 			ma_decoder_uninit(&decoder);
 			snprintf(result.error, sizeof(result.error), "allocation failed");
@@ -387,7 +387,7 @@ JceCookResult jce_cook_audio(const void *input, size_t input_size,
 
 	result = build_asset(JCEASSET_TYPE_SOUND, source_hash, chunks, 2, opts);
 
-	free(pcm);
+	JCE_FREE(pcm);
 	return result;
 #endif
 }
@@ -484,7 +484,7 @@ JceCookResult jce_cook_file(const char *input_path,
 		return result;
 	}
 
-	void *data = malloc((size_t)file_size);
+	void *data = JCE_MALLOC((size_t)file_size);
 	if (!data) {
 		fclose(fp);
 		snprintf(result.error, sizeof(result.error), "allocation failed");
@@ -495,7 +495,7 @@ JceCookResult jce_cook_file(const char *input_path,
 	fclose(fp);
 
 	if (nread != (size_t)file_size) {
-		free(data);
+		JCE_FREE(data);
 		snprintf(result.error, sizeof(result.error),
 		         "read error: %s", input_path);
 		return result;
@@ -517,7 +517,7 @@ JceCookResult jce_cook_file(const char *input_path,
 		break;
 	}
 
-	free(data);
+	JCE_FREE(data);
 	return result;
 }
 
@@ -528,7 +528,7 @@ JceCookResult jce_cook_file(const char *input_path,
 void jce_cook_result_free(JceCookResult *result)
 {
 	if (!result) return;
-	free(result->data);
+	JCE_FREE(result->data);
 	result->data = NULL;
 	result->size = 0;
 }

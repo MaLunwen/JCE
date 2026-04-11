@@ -6,6 +6,7 @@
  */
 
 #include "jce_model_loader_assimp.h"
+#include "jce_editor_alloc.h"
 
 extern "C" {
 #include <jce/core/jce_log.h>
@@ -15,7 +16,6 @@ extern "C" {
 #include <assimp/scene.h>
 #include <assimp/postprocess.h>
 
-#include <SDL3/SDL.h>
 #include <cstring>
 
 #define LOG_TAG "editor_model"
@@ -25,8 +25,8 @@ extern "C" {
 void jce_editor_model_free_cpu_data(JceEditorCpuMeshData *data)
 {
     if (!data) return;
-    SDL_free(data->vertices);
-    SDL_free(data->indices);
+    ED_FREE(data->vertices);
+    ED_FREE(data->indices);
     data->vertices = nullptr;
     data->indices = nullptr;
     data->vertex_count = 0;
@@ -56,14 +56,14 @@ static bool build_cpu_mesh_data(const aiScene *scene, JceEditorCpuMeshData *out)
     if (total_verts == 0) return false;
 
     auto *verts = static_cast<JceMeshVertex *>(
-        SDL_calloc(total_verts, sizeof(JceMeshVertex)));
+        ED_CALLOC(total_verts, sizeof(JceMeshVertex)));
     auto *indices = (total_indices > 0)
-        ? static_cast<uint32_t *>(SDL_malloc(
+        ? static_cast<uint32_t *>(ED_MALLOC(
             static_cast<size_t>(total_indices) * sizeof(uint32_t)))
         : nullptr;
     if (!verts || (total_indices > 0 && !indices)) {
-        SDL_free(verts);
-        SDL_free(indices);
+        ED_FREE(verts);
+        ED_FREE(indices);
         return false;
     }
 
@@ -171,13 +171,13 @@ JceMesh *jce_editor_model_load(const PakArchive *pak, const char *asset_path)
         return nullptr;
     }
 
-    void *buf = SDL_malloc(static_cast<size_t>(asset->original_size));
+    void *buf = ED_MALLOC(static_cast<size_t>(asset->original_size));
     if (!buf) return nullptr;
 
     size_t n = pak_decompress(asset, buf, static_cast<size_t>(asset->original_size));
     if (n == 0) {
         LOG_ERROR(LOG_TAG, "decompression failed: %s", asset_path);
-        SDL_free(buf);
+        ED_FREE(buf);
         return nullptr;
     }
 
@@ -195,7 +195,7 @@ JceMesh *jce_editor_model_load(const PakArchive *pak, const char *asset_path)
         | aiProcess_CalcTangentSpace,
         ext);
 
-    SDL_free(buf);
+    ED_FREE(buf);
 
     if (!scene || !scene->mNumMeshes) {
         LOG_ERROR(LOG_TAG, "assimp failed: %s  %s",

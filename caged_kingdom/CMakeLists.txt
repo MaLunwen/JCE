@@ -125,6 +125,7 @@ document.addEventListener('click',function r(){
 		-sMIN_WEBGL_VERSION=2
 		-sFULL_ES3=1
 		-sSTACK_SIZE=1048576
+		-sMALLOC=emmalloc
 		"SHELL:--shell-file ${_SHELL}")
 endif()
 

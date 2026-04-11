@@ -9,11 +9,11 @@
  * PAK-embedded assets without rebuilding.
  */
 
-#include "jce_filesystem.h"
+#include <jce/core/jce_filesystem.h>
 #include "jce_memory.h"
 #include <jce/core/jce_log.h>
 
-#include <jce/resource/pak_loader.h>
+#include <jce/core/pak_loader.h>
 #include <physfs.h>
 
 #include <string.h>

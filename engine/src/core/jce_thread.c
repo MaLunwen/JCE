@@ -5,7 +5,7 @@
  * Mutex / condition-variable wrappers remain on SDL3.
  */
 
-#include "jce_thread.h"
+#include <jce/core/jce_thread.h>
 #include "jce_memory.h"
 
 #include <SDL3/SDL.h>

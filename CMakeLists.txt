@@ -123,8 +123,97 @@ find_package(box2d        REQUIRED)
 find_package(Bullet       REQUIRED)
 find_package(enet         REQUIRED)
 find_package(protobuf     REQUIRED)
+
+# Ensure protoc comes from the Conan package, not a system/conda protoc.
+# Conan sets protobuf_PACKAGE_FOLDER_RELEASE after find_package(protobuf).
+# Override Protobuf_PROTOC_EXECUTABLE so protobuf_generate() uses the
+# version-matching protoc (e.g. 6.33.x, not Anaconda 4.25.x).
+# CROSS-COMPILE NOTE: When building for Android/WASM from a Windows host,
+# Conan compiles the entire protobuf package (including protoc) for the target
+# architecture, producing an ELF binary that cannot run on Windows. In that
+# case we find a Windows-native protoc.exe from the Conan2 package cache.
+foreach(_pb_cfg RELEASE RELWITHDEBINFO DEBUG)
+    if(DEFINED "protobuf_PACKAGE_FOLDER_${_pb_cfg}")
+        set(_pb_bin_dir "${protobuf_PACKAGE_FOLDER_${_pb_cfg}}/bin")
+        # Probe .exe first (native build), then bare binary (cross-compile package)
+        set(_found_protoc "")
+        foreach(_protoc_name "protoc.exe" "protoc")
+            if(EXISTS "${_pb_bin_dir}/${_protoc_name}")
+                set(_found_protoc "${_pb_bin_dir}/${_protoc_name}")
+                break()
+            endif()
+        endforeach()
+        # On Windows host, verify the found binary actually runs on this host.
+        # Cross-compile Conan packages ship executables the host cannot run:
+        #   - Linux ELF protoc (Android cross-compile)
+        #   - ARM64 PE protoc (Windows ARM64 cross-compile, can't run on x64 host)
+        #   - Only .js protoc files (Emscripten/WASM) with no native executable.
+        # Strategy: probe the found binary with execute_process(--version).
+        # If it fails (wrong arch, ELF, missing, .js), fall back to glob search.
+        if(CMAKE_HOST_WIN32)
+            set(_need_native_search FALSE)
+            if(_found_protoc)
+                execute_process(
+                    COMMAND "${_found_protoc}" --version
+                    RESULT_VARIABLE _run_rc
+                    OUTPUT_QUIET ERROR_QUIET
+                    TIMEOUT 10
+                )
+                if(NOT _run_rc EQUAL 0)
+                    message(STATUS "JCE: Conan protoc cannot run on this host (cross-compile pkg). Searching Conan2 cache for native protoc.exe")
+                    set(_need_native_search TRUE)
+                    set(_found_protoc "")
+                endif()
+                unset(_run_rc)
+            else()
+                # No executable protoc found in bin dir (e.g. WASM: only .js files)
+                message(STATUS "JCE: No native protoc in Conan package bin dir. Searching Conan2 cache for native protoc.exe")
+                set(_need_native_search TRUE)
+            endif()
+            if(_need_native_search)
+                file(GLOB _win_protoc_list
+                    "$ENV{USERPROFILE}/.conan2/p/proto*/p/bin/protoc.exe")
+                list(SORT _win_protoc_list ORDER DESCENDING)
+                foreach(_candidate IN LISTS _win_protoc_list)
+                    if(EXISTS "${_candidate}")
+                        execute_process(
+                            COMMAND "${_candidate}" --version
+                            RESULT_VARIABLE _run_rc
+                            OUTPUT_QUIET ERROR_QUIET
+                            TIMEOUT 10
+                        )
+                        if(_run_rc EQUAL 0)
+                            set(_found_protoc "${_candidate}")
+                            break()
+                        endif()
+                    endif()
+                endforeach()
+                unset(_win_protoc_list)
+                unset(_candidate)
+                unset(_run_rc)
+            endif()
+            unset(_need_native_search)
+        endif()
+        if(_found_protoc)
+            set(Protobuf_PROTOC_EXECUTABLE "${_found_protoc}"
+                CACHE FILEPATH "The protoc compiler" FORCE)
+            if(TARGET protobuf::protoc)
+                set_property(TARGET protobuf::protoc
+                    PROPERTY IMPORTED_LOCATION "${_found_protoc}")
+            endif()
+            message(STATUS "JCE: Using Conan protoc: ${_found_protoc}")
+        endif()
+        break()
+    endif()
+endforeach()
+unset(_found_protoc)
+unset(_pb_bin_dir)
+unset(_pb_cfg)
+unset(_protoc_name)
+
 find_package(behaviortree_cpp REQUIRED)
 find_package(RmlUi        REQUIRED)
+find_package(ozz-animation REQUIRED)
 
 # Tracy profiling switch.
 option(JCE_ENABLE_PROFILING "Enable Tracy profiling instrumentation" ON)
@@ -244,6 +333,7 @@ if(NOT CMAKE_CROSSCOMPILING)
 		SDL3_image::SDL3_image
 		sdl::sdl
 		miniaudio::miniaudio
+		mimalloc-static
 		zstd::libzstd_static
 		xxHash::xxhash)
 	jce_target_warnings(jce_cook)
@@ -527,39 +617,3 @@ string(APPEND _dep_locs_content ")\n")
 
 set(DEP_LOCS_FILE "${CMAKE_CURRENT_BINARY_DIR}/_dep_locs_$<CONFIG>.cmake")
 file(GENERATE OUTPUT "${DEP_LOCS_FILE}" CONTENT "${_dep_locs_content}")
-
-# ------------------------------------------------------------------ #
-# Phase 0 KPI helper targets                                          #
-# ------------------------------------------------------------------ #
-
-find_program(JCE_POWERSHELL_EXECUTABLE NAMES pwsh powershell)
-if(JCE_POWERSHELL_EXECUTABLE)
-	add_custom_target(kpi_startup
-		COMMAND "${JCE_POWERSHELL_EXECUTABLE}" -NoProfile -ExecutionPolicy Bypass
-		        -File "${CMAKE_SOURCE_DIR}/scripts/kpi/measure_startup.ps1"
-		        -BuildRoot "${CMAKE_BINARY_DIR}"
-		WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-		COMMENT "Collecting startup KPI baseline"
-		VERBATIM)
-
-	add_custom_target(kpi_frame_time
-		COMMAND "${JCE_POWERSHELL_EXECUTABLE}" -NoProfile -ExecutionPolicy Bypass
-		        -File "${CMAKE_SOURCE_DIR}/scripts/kpi/measure_frame_time.ps1"
-		        -BuildRoot "${CMAKE_BINARY_DIR}"
-		WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-		COMMENT "Collecting frame-time KPI baseline"
-		VERBATIM)
-
-	add_custom_target(kpi_asset_reload
-		COMMAND "${JCE_POWERSHELL_EXECUTABLE}" -NoProfile -ExecutionPolicy Bypass
-		        -File "${CMAKE_SOURCE_DIR}/scripts/kpi/measure_asset_reload.ps1"
-		        -BuildRoot "${CMAKE_BINARY_DIR}"
-		WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-		COMMENT "Collecting asset update KPI baseline"
-		VERBATIM)
-
-	add_custom_target(kpi_baseline
-		DEPENDS kpi_startup kpi_frame_time kpi_asset_reload)
-else()
-	message(STATUS "PowerShell executable not found. KPI helper targets are disabled.")
-endif()

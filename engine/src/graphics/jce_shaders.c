@@ -5,11 +5,12 @@
  */
 
 #include <jce/graphics/jce_shaders.h>
+#include <jce/core/pak_loader.h>
 #include <jce/core/jce_log.h>
 
 #include <SDL3/SDL.h>
 #include <bgfx/c99/bgfx.h>
-#include <stdlib.h>
+#include "core/jce_memory.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -47,20 +48,20 @@ static bgfx_shader_handle_t load_single(const PakArchive *pak, const char *path)
         return invalid;
     }
 
-    void *buf = malloc((size_t)asset->original_size);
+    void *buf = JCE_MALLOC((size_t)asset->original_size);
     if (!buf) return invalid;
 
     size_t n = pak_decompress(asset, buf, (size_t)asset->original_size);
     if (n == 0) {
         LOG_ERROR(LOG_TAG, "decompression failed: %s", path);
-        free(buf);
+        JCE_FREE(buf);
         return invalid;
     }
 
     /* bgfx_copy allocates internal memory and copies; we can free buf. */
     const bgfx_memory_t *mem =
         bgfx_copy(buf, (uint32_t)asset->original_size);
-    free(buf);
+    JCE_FREE(buf);
 
     return bgfx_create_shader(mem);
 }

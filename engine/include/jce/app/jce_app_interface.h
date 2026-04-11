@@ -7,6 +7,8 @@
  *
  * Inspired by The-Forge's IApp interface.
  * Layer: Application (Layer 5).
+ *
+ * This header is SDL-free; game/application code does not need SDL.
  */
 
 #ifndef JCE_APP_INTERFACE_H
@@ -14,7 +16,6 @@
 
 #include <stdbool.h>
 #include <stdint.h>
-#include <SDL3/SDL_events.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -66,8 +67,10 @@ typedef struct JceAppDesc {
        Perform all draw/submit calls here. */
     void (*draw)(const JceServices *svc, void *user_data);
 
-    /* Called for each platform event (after input system processes it). */
-    void (*on_event)(const SDL_Event *ev, void *user_data);
+    /* Called for each platform event (after input system processes it).
+       The event pointer is backend-specific (SDL_Event* internally).
+       Most apps should use JceInput queries instead, leaving this NULL. */
+    void (*on_event)(const void *platform_event, void *user_data);
 
     /* Optional: called on window resize. NULL = ignored. */
     void (*on_resize)(uint32_t w, uint32_t h, void *user_data);

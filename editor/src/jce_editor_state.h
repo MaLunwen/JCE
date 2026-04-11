@@ -17,6 +17,8 @@
 extern "C" {
 #endif
 
+#include <jce/scene/jce_scene.h>
+
 /* ── Edit Mode ─────────────────────────────────────────────────────── */
 
 typedef enum {
@@ -101,6 +103,8 @@ typedef struct {
     int         child_count;
     bool        prefab_instance;
     char        prefab_path[JCE_MAX_PREFAB_PATH];
+
+    uint64_t    ecs_entity;                   /* JceEntity in engine scene */
 
     /* Per-entity component storage (parsed from scene JSON). */
     int         component_count;
@@ -330,6 +334,10 @@ const char *jce_state_get_prefab_path(uint32_t entity_id);
 void     jce_state_copy_entity(uint32_t id);
 uint32_t jce_state_paste_entity(uint32_t parent_id);
 bool     jce_state_has_copied(void);
+
+/* Engine scene backing store. */
+void       jce_state_set_scene(JceScene *scene);
+JceScene  *jce_state_get_scene(void);
 
 #ifdef __cplusplus
 }

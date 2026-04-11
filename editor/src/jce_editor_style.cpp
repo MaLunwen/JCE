@@ -13,7 +13,7 @@
 #include <stdlib.h>
 
 extern "C" {
-#include <jce/resource/pak_loader.h>
+#include <jce/core/pak_loader.h>
 #include <jce/core/jce_log.h>
 }
 

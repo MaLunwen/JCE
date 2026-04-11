@@ -237,7 +237,7 @@ static void draw_rotation_ring(ImDrawList *dl,
     bool prev_ok = false;
 
     for (int i = 0; i <= segments; i++) {
-        float angle = (float)i / (float)segments * 2.0f * 3.14159265f;
+        float angle = (float)i / (float)segments * 2.0f * JCE_PI;
         float cs = cosf(angle), sn = sinf(angle);
 
         float p[3];

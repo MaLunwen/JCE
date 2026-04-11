@@ -2,7 +2,7 @@
  * jce_pbr_material.c  PBR material bind + JSON I/O implementation.
  */
 
-#include "jce_pbr_material.h"
+#include <jce/graphics/jce_pbr_material.h>
 #include "jce_renderer_internal.h"
 #include <jce/graphics/jce_texture_types.h>
 #include <jce/core/jce_log.h>
@@ -12,7 +12,7 @@
 
 #include <stdio.h>
 #include <string.h>
-#include <stdlib.h>
+#include "core/jce_memory.h"
 
 #define LOG_TAG "jce_pbr_material"
 
@@ -228,14 +228,14 @@ bool jce_pbr_material_load_json(const char *path, JcePbrMaterial *out,
     if (sz <= 0 || sz > (1 << 20)) { fclose(f); return false; }
     fseek(f, 0, SEEK_SET);
 
-    char *buf = (char *)malloc((size_t)sz + 1);
+    char *buf = (char *)JCE_MALLOC((size_t)sz + 1);
     if (!buf) { fclose(f); return false; }
     size_t rd = fread(buf, 1, (size_t)sz, f);
     fclose(f);
     buf[rd] = '\0';
 
     cJSON *root = cJSON_Parse(buf);
-    free(buf);
+    JCE_FREE(buf);
     if (!root) {
         LOG_WARN(LOG_TAG, "invalid JSON in material: %s", path);
         return false;
@@ -333,12 +333,12 @@ bool jce_pbr_material_save_json(const char *path,
     FILE *f = fopen(path, "wb");
     if (!f) {
         LOG_WARN(LOG_TAG, "cannot write material file: %s", path);
-        free(json_str);
+        cJSON_free(json_str);
         return false;
     }
     fputs(json_str, f);
     fclose(f);
-    free(json_str);
+    cJSON_free(json_str);
 
     LOG_INFO(LOG_TAG, "saved material: %s", path);
     return true;

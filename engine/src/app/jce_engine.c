@@ -11,7 +11,7 @@
 
 #include <SDL3/SDL.h>
 #include "core/jce_memory.h"
-#include "core/jce_profiler.h"
+#include <jce/core/jce_profiler.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -19,14 +19,15 @@
 #include <jce/core/jce_log.h>
 #include <jce/core/jce_crash_handler.h>
 #include <jce/app/jce_config.h>
-#include "core/jce_gpu_caps.h"
+#include "graphics/jce_gpu_caps.h"
 #include <jce/platform/jce_window.h>
+#include "platform/jce_window_internal.h"
 #include <jce/platform/jce_single_instance.h>
 #include <jce/platform/jce_input.h>
 #include <jce/audio/jce_audio.h>
 #include <jce/graphics/jce_renderer.h>
 #include <jce/graphics/jce_shaders.h>
-#include <jce/resource/pak_loader.h>
+#include <jce/core/pak_loader.h>
 #include <jce/resource/jce_asset.h>
 #include <jce/app/jce_subsystem.h>
 #include <jce/core/jce_allocator.h>
@@ -263,10 +264,10 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         .title     = e->config.window_title,
         .logical_w = e->config.window_width,
         .logical_h = e->config.window_height,
-        .flags     = (e->config.resizable  ? SDL_WINDOW_RESIZABLE  : 0)
-                   | (e->config.fullscreen ? SDL_WINDOW_FULLSCREEN : 0)
-                   | (e->config.maximized  ? SDL_WINDOW_MAXIMIZED  : 0)
-                   | (g_app_desc_set && g_app_desc.maximized ? SDL_WINDOW_MAXIMIZED : 0)
+        .flags     = (e->config.resizable  ? JCE_WINDOW_RESIZABLE  : 0)
+                   | (e->config.fullscreen ? JCE_WINDOW_FULLSCREEN : 0)
+                   | (e->config.maximized  ? JCE_WINDOW_MAXIMIZED  : 0)
+                   | (g_app_desc_set && g_app_desc.maximized ? JCE_WINDOW_MAXIMIZED : 0)
     };
     e->window = jce_window_create(&win_cfg);
     if (!e->window) {
@@ -406,10 +407,11 @@ fail:
 
 /* -- Event routing ------------------------------------------------- */
 
-SDL_AppResult jce_engine_event(JceEngine *e, const SDL_Event *event)
+JceAppResult jce_engine_event(JceEngine *e, const void *platform_event)
 {
+    const SDL_Event *event = (const SDL_Event *)platform_event;
     if (event->type == SDL_EVENT_QUIT || event->type == SDL_EVENT_TERMINATING)
-        return SDL_APP_SUCCESS;
+        return JCE_APP_SUCCESS;
 
     if (e->input) jce_input_handle_event(e->input, event);
 
@@ -419,29 +421,43 @@ SDL_AppResult jce_engine_event(JceEngine *e, const SDL_Event *event)
         SDL_GetWindowSizeInPixels(jce_window_sdl(e->window), &pw, &ph);
         jce_window_handle_resize(e->window, (uint32_t)pw, (uint32_t)ph);
         jce_renderer_resize(e->renderer, (uint32_t)pw, (uint32_t)ph);
+
+        /* On Windows, SDL3 runs a modal loop during window resize (WM_SIZING)
+         * so SDL_AppIterate is never called.  Emit a minimal render frame here
+         * so bgfx processes the reset and the backbuffer stays in sync. */
+        if (!jce_renderer_is_fallback(e->renderer)) {
+            jce_renderer_begin_frame(e->renderer, e->window);
+
+            if (g_app_desc.update)
+                g_app_desc.update(0.0f, g_app_desc.user_data);
+            if (g_app_desc.draw)
+                g_app_desc.draw(&e->svc, g_app_desc.user_data);
+
+            jce_renderer_end_frame(e->renderer);
+        }
     }
 
     if (g_app_desc.on_event)
         g_app_desc.on_event(event, g_app_desc.user_data);
 
-    return SDL_APP_CONTINUE;
+    return JCE_APP_CONTINUE;
 }
 
 /* -- Per-frame ----------------------------------------------------- */
 
-SDL_AppResult jce_engine_iterate(JceEngine *e)
+JceAppResult jce_engine_iterate(JceEngine *e)
 {
     JCE_PROFILE_ZONE_N("Frame");
 
     if (g_app_desc.should_quit) {
         if (g_app_desc.should_quit(g_app_desc.user_data))
-            return SDL_APP_SUCCESS;
+            return JCE_APP_SUCCESS;
     }
 
     if (jce_renderer_is_fallback(e->renderer)) {
         jce_renderer_render_fallback_frame(e->renderer);
         if (e->input) jce_input_update(e->input);
-        return SDL_APP_CONTINUE;
+        return JCE_APP_CONTINUE;
     }
 
     jce_renderer_begin_frame(e->renderer, e->window);
@@ -501,7 +517,7 @@ SDL_AppResult jce_engine_iterate(JceEngine *e)
 
     JCE_PROFILE_FRAME_MARK;
     JCE_PROFILE_ZONE_END;
-    return SDL_APP_CONTINUE;
+    return JCE_APP_CONTINUE;
 }
 
 /* -- Shutdown ------------------------------------------------------ */

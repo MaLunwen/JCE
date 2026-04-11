@@ -138,7 +138,7 @@ static float hit_test_ring(const JceGizmoCamera *cam,
     const int segments = 32;
 
     for (int i = 0; i < segments; i++) {
-        float angle = (float)i / (float)segments * 2.0f * 3.14159265f;
+        float angle = (float)i / (float)segments * 2.0f * JCE_PI;
         float cs = cosf(angle), sn = sinf(angle);
 
         float p[3];
@@ -409,11 +409,11 @@ void jce_gizmo_drag_rotate(const JceGizmoCamera *cam,
     float da = angle_cur - angle_prev;
 
     /* Wrap to [-pi, pi] */
-    if (da >  3.14159265f) da -= 2.0f * 3.14159265f;
-    if (da < -3.14159265f) da += 2.0f * 3.14159265f;
+    if (da >  JCE_PI) da -= 2.0f * JCE_PI;
+    if (da < -JCE_PI) da += 2.0f * JCE_PI;
 
     /* Convert to degrees */
-    float deg = da * (180.0f / 3.14159265f);
+    float deg = da * JCE_RAD2DEG;
 
     if (axis & JCE_GIZMO_AXIS_X) out_delta_euler[0] = deg;
     if (axis & JCE_GIZMO_AXIS_Y) out_delta_euler[1] = deg;

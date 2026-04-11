@@ -18,7 +18,7 @@
 #include <string.h>
 
 extern "C" {
-#include <jce/graphics/jce_animation.h>
+#include <jce/animation/jce_animation.h>
 }
 
 /* ── Timeline state ───────────────────────────────────────────────── */

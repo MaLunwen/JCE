@@ -1,19 +1,21 @@
 /*
  * jce_editor_i18n.cpp  Internationalisation implementation.
  *
- * Parses the simple JSON string tables in i18n/*.json from the PAK.
- * Uses a minimal hand-rolled parser (no dependency on a JSON library).
+ * Parses the JSON string tables in i18n/*.json from the PAK.
+ * Uses cJSON (engine dependency) for parsing.
  */
 
 #include "jce_editor_i18n.h"
+#include "jce_editor_alloc.h"
 
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 
 extern "C" {
-#include <jce/resource/pak_loader.h>
+#include <jce/core/pak_loader.h>
 #include <jce/core/jce_log.h>
+#include <cjson/cJSON.h>
 }
 
 #define LOG_TAG       "i18n"
@@ -47,59 +49,32 @@ static struct {
 static char s_expand_ring[EXPAND_RING_SIZE][MAX_EXPAND_LEN];
 static int  s_expand_ring_index;
 
-/* ── Minimal JSON string-pair parser ───────────────────────────────── */
-
-static void skip_whitespace(const char **p)
-{
-    while (**p == ' ' || **p == '\t' || **p == '\n' || **p == '\r') (*p)++;
-}
-
-static bool parse_string(const char **p, char *out, int max_len)
-{
-    skip_whitespace(p);
-    if (**p != '"') return false;
-    (*p)++;
-
-    int i = 0;
-    while (**p && **p != '"' && i < max_len - 1) {
-        if (**p == '\\') {
-            (*p)++;
-            switch (**p) {
-            case '"':  out[i++] = '"';  break;
-            case '\\': out[i++] = '\\'; break;
-            case 'n':  out[i++] = '\n'; break;
-            case 't':  out[i++] = '\t'; break;
-            default:   out[i++] = **p;  break;
-            }
-        } else {
-            out[i++] = **p;
-        }
-        (*p)++;
-    }
-    out[i] = '\0';
-    if (**p == '"') (*p)++;
-    return true;
-}
+/* ── JSON parser using cJSON ───────────────────────────────────────── */
 
 static bool parse_json_table(const char *json, I18nTable *table)
 {
     table->count = 0;
-    const char *p = json;
-    skip_whitespace(&p);
-    if (*p != '{') return false;
-    p++;
-
-    while (*p && *p != '}' && table->count < MAX_STRINGS) {
-        I18nEntry *e = &table->entries[table->count];
-        if (!parse_string(&p, e->key, MAX_KEY_LEN)) break;
-        skip_whitespace(&p);
-        if (*p != ':') break;
-        p++;
-        if (!parse_string(&p, e->value, MAX_VALUE_LEN)) break;
-        table->count++;
-        skip_whitespace(&p);
-        if (*p == ',') p++;
+    cJSON *root = cJSON_Parse(json);
+    if (!root || !cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return false;
     }
+
+    const cJSON *item = NULL;
+    cJSON_ArrayForEach(item, root) {
+        if (table->count >= MAX_STRINGS) break;
+        if (!cJSON_IsString(item) || !item->string) continue;
+
+        I18nEntry *e = &table->entries[table->count];
+        strncpy(e->key, item->string, MAX_KEY_LEN - 1);
+        e->key[MAX_KEY_LEN - 1] = '\0';
+        strncpy(e->value, item->valuestring ? item->valuestring : "",
+                MAX_VALUE_LEN - 1);
+        e->value[MAX_VALUE_LEN - 1] = '\0';
+        table->count++;
+    }
+
+    cJSON_Delete(root);
     return true;
 }
 
@@ -113,18 +88,18 @@ static bool load_locale(const PakArchive *pak, const char *path, I18nTable *tabl
         return false;
     }
 
-    char *buf = (char *)malloc((size_t)asset->original_size + 1);
+    char *buf = (char *)ED_MALLOC((size_t)asset->original_size + 1);
     if (!buf) return false;
 
     size_t n = pak_decompress(asset, buf, (size_t)asset->original_size);
     if (n == 0) {
-        free(buf);
+        ED_FREE(buf);
         return false;
     }
     buf[n] = '\0';
 
     bool ok = parse_json_table(buf, table);
-    free(buf);
+    ED_FREE(buf);
 
     if (ok)
         LOG_INFO(LOG_TAG, "loaded %s (%d strings)", path, table->count);

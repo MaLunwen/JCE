@@ -12,6 +12,7 @@
 #define JCE_GIZMO_MATH_H
 
 #include <cglm/cglm.h>          /* raw float-array API (vec3, mat4) */
+#include <jce/core/jce_math.h>  /* JCE_PI, JCE_DEG2RAD, JCE_RAD2DEG */
 #include <stdbool.h>
 
 #ifdef __cplusplus

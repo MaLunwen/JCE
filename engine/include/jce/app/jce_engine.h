@@ -2,17 +2,24 @@
  * jce_engine.h  Engine bootstrap and lifecycle.
  *
  * Owns all subsystems (window, renderer, audio, input, PAK, app).
- * main.c delegates every SDL callback to this module.
+ * The application entry point delegates every callback to this module.
+ *
+ * This header is SDL-free; game/application code does not need SDL.
  */
 
 #ifndef JCE_ENGINE_H
 #define JCE_ENGINE_H
 
-#include <SDL3/SDL.h>
-
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Application result codes (match SDL_AppResult values). */
+typedef enum JceAppResult {
+    JCE_APP_CONTINUE = 0,   /* Keep running */
+    JCE_APP_SUCCESS  = 1,   /* Quit successfully */
+    JCE_APP_FAILURE  = 2    /* Quit with error */
+} JceAppResult;
 
 typedef struct JceEngine  JceEngine;
 typedef struct JceAppDesc JceAppDesc;
@@ -30,11 +37,13 @@ void           jce_engine_set_config_path(const char *path);
    window/renderer/audio/input, async-load assets, create app. */
 JceEngine     *jce_engine_create(int argc, char *argv[]);
 
-/* Route an SDL event to input + app. Returns SDL_APP_SUCCESS on quit. */
-SDL_AppResult  jce_engine_event(JceEngine *e, const SDL_Event *event);
+/* Route a platform event to input + app.
+   Returns JCE_APP_SUCCESS on quit event.
+   The event pointer is backend-specific (SDL_Event* internally). */
+JceAppResult   jce_engine_event(JceEngine *e, const void *event);
 
 /* Run one frame: begin_frame, app_update, end_frame, input_update. */
-SDL_AppResult  jce_engine_iterate(JceEngine *e);
+JceAppResult   jce_engine_iterate(JceEngine *e);
 
 /* Shut down everything in reverse order. */
 void           jce_engine_destroy(JceEngine *e);

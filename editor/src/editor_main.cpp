@@ -140,7 +140,7 @@ static bool editor_app_init(const JceServices *svc, void *ud)
 {
     EditorState *st = (EditorState *)ud;
     st->svc = svc;
-    jce_editor_scene_render_init(svc->renderer, svc->pak);
+    jce_editor_scene_render_init(svc->renderer, svc->pak, svc->assets);
     if (!jce_editor_init(svc->pak, svc->window))
         return false;
 
@@ -171,6 +171,7 @@ static uint64_t s_last_update_counter = 0;
 
 static void editor_app_update(float dt, void *ud)
 {
+    (void)dt;
     (void)ud;
 
     /* Compute real delta time since engine passes 0.0f. */
@@ -199,10 +200,10 @@ static void editor_app_draw(const JceServices *svc, void *ud)
     jce_editor_update(svc->window);
 }
 
-static void editor_app_event(const SDL_Event *ev, void *ud)
+static void editor_app_event(const void *ev, void *ud)
 {
     (void)ud;
-    jce_editor_process_event(ev);
+    jce_editor_process_event((const SDL_Event *)ev);
 }
 
 /* ── SDL3 callbacks ────────────────────────────────────────────────── */
@@ -240,13 +241,13 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
 SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event)
 {
     (void)appstate;
-    return jce_engine_event(g_engine, event);
+    return (SDL_AppResult)jce_engine_event(g_engine, event);
 }
 
 SDL_AppResult SDL_AppIterate(void *appstate)
 {
     (void)appstate;
-    return jce_engine_iterate(g_engine);
+    return (SDL_AppResult)jce_engine_iterate(g_engine);
 }
 
 void SDL_AppQuit(void *appstate, SDL_AppResult result)

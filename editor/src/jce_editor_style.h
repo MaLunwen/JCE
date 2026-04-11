@@ -11,7 +11,7 @@
 extern "C" {
 #endif
 
-typedef struct PakArchive PakArchive;
+#include <jce/core/pak_loader.h>
 
 /* Theme indices. */
 #define JCE_THEME_DARK   0

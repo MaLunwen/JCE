@@ -6,12 +6,12 @@
  */
 
 #include "jce_model_internal.h"
-#include "jce_pbr_material.h"
+#include <jce/graphics/jce_pbr_material.h>
 #include <jce/graphics/jce_mesh.h>
 #include <jce/graphics/jce_texture.h>
-#include "jce_skinned_mesh.h"
-#include "jce_skeleton.h"
-#include "jce_animation.h"
+#include <jce/animation/jce_skinned_mesh.h>
+#include <jce/animation/jce_skeleton.h>
+#include "animation/jce_animation.h"
 #include <jce/graphics/jce_renderer.h>
 #include "jce_renderer_internal.h"
 #include "resource/jce_gltf_loader.h"

@@ -2,12 +2,12 @@
  * jce_scene.c  ECS scene implementation (flecs backend).
  */
 
-#include "jce_scene.h"
+#include <jce/scene/jce_scene.h>
 #include <jce/core/jce_log.h>
+#include "core/jce_memory.h"
 
 #include <flecs.h>
 #include <string.h>
-#include <stdlib.h>
 
 #define LOG_TAG "scene"
 
@@ -21,6 +21,7 @@ static ECS_COMPONENT_DECLARE(JceTagActive);
 static ECS_COMPONENT_DECLARE(JceRigidBodyComponent);
 static ECS_COMPONENT_DECLARE(JceRigidBody2DComponent);
 static ECS_COMPONENT_DECLARE(JceParticleEmitterComponent);
+static ECS_COMPONENT_DECLARE(JceBehaviorTree);
 
 /* ── Scene struct ──────────────────────────────────────────────────── */
 
@@ -32,13 +33,12 @@ struct JceScene {
 
 JceScene *jce_scene_create(void)
 {
-    JceScene *s = (JceScene *)calloc(1, sizeof(*s));
+    JceScene *s = (JceScene *)JCE_CALLOC(1, sizeof(*s));
     if (!s) return NULL;
 
     s->world = ecs_init();
     if (!s->world) {
-        free(s);
-        return NULL;
+        JCE_FREE(s);
     }
 
     /* Register components. */
@@ -50,6 +50,7 @@ JceScene *jce_scene_create(void)
     ECS_COMPONENT_DEFINE(s->world, JceRigidBodyComponent);
     ECS_COMPONENT_DEFINE(s->world, JceRigidBody2DComponent);
     ECS_COMPONENT_DEFINE(s->world, JceParticleEmitterComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceBehaviorTree);
 
     LOG_SUCCESS(LOG_TAG, "scene created");
     return s;
@@ -59,7 +60,7 @@ void jce_scene_destroy(JceScene *s)
 {
     if (!s) return;
     if (s->world) ecs_fini(s->world);
-    free(s);
+    JCE_FREE(s);
     LOG_INFO(LOG_TAG, "scene destroyed");
 }
 

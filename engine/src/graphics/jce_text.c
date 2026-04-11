@@ -14,11 +14,12 @@
 #include <jce/graphics/jce_texture.h>
 #include <jce/graphics/jce_primitives.h>
 #include "jce_renderer_internal.h"
-#include <jce/resource/pak_loader.h>
+#include <jce/core/pak_loader.h>
 #include <jce/core/jce_log.h>
 
 #include <bgfx/c99/bgfx.h>
 #include "core/jce_memory.h"
+#include <SDL3/SDL.h>
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
@@ -80,31 +81,7 @@ struct JceFont {
 
 static uint32_t utf8_decode(const char **pp)
 {
-    const unsigned char *s = (const unsigned char *)*pp;
-    uint32_t cp;
-    if (s[0] < 0x80) {
-        cp = s[0]; *pp += 1;
-    } else if ((s[0] & 0xE0) == 0xC0 && (s[1] & 0xC0) == 0x80) {
-        cp = ((uint32_t)(s[0] & 0x1F) << 6) | (s[1] & 0x3F);
-        *pp += 2;
-    } else if ((s[0] & 0xF0) == 0xE0 && (s[1] & 0xC0) == 0x80
-                                       && (s[2] & 0xC0) == 0x80) {
-        cp = ((uint32_t)(s[0] & 0x0F) << 12)
-           | ((uint32_t)(s[1] & 0x3F) << 6)
-           | (s[2] & 0x3F);
-        *pp += 3;
-    } else if ((s[0] & 0xF8) == 0xF0 && (s[1] & 0xC0) == 0x80
-                                       && (s[2] & 0xC0) == 0x80
-                                       && (s[3] & 0xC0) == 0x80) {
-        cp = ((uint32_t)(s[0] & 0x07) << 18)
-           | ((uint32_t)(s[1] & 0x3F) << 12)
-           | ((uint32_t)(s[2] & 0x3F) << 6)
-           | (s[3] & 0x3F);
-        *pp += 4;
-    } else {
-        cp = '?'; *pp += 1; /* malformed */
-    }
-    return cp;
+    return (uint32_t)SDL_StepUTF8(pp, NULL);
 }
 
 /* -- Hash table helpers -------------------------------------------- */
@@ -432,8 +409,6 @@ void jce_text_draw_scaled(const JceRenderer *r, JceFont *font,
     float cx = x;
     float cy = y;
     for (unsigned int i = 0; i < glyph_count; i++) {
-        uint32_t cp = glyph_info[i].codepoint;
-
         /* HarfBuzz gives us glyph IDs — we need to map back to codepoints.
            For our atlas, we index by Unicode codepoint. Use the cluster value
            which maps back to the original UTF-8 byte offset. */

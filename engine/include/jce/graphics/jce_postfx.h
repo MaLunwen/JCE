@@ -19,7 +19,8 @@
 #include <stdint.h>
 #include <jce/core/jce_allocator.h>
 #include <jce/graphics/jce_gfx_types.h>
-#include <jce/resource/pak_loader.h>
+
+typedef struct PakArchive PakArchive;
 
 #ifdef __cplusplus
 extern "C" {

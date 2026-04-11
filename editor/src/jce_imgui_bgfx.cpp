@@ -15,6 +15,7 @@ extern "C" {
 #include <jce/graphics/jce_shaders.h>
 #include <jce/graphics/jce_views.h>
 #include <jce/core/jce_log.h>
+#include <jce/core/jce_math.h>
 }
 
 #define LOG_TAG "imgui_bgfx"
@@ -30,29 +31,7 @@ static struct {
     bool                   initialized;
 } s_ctx;
 
-/* ── Ortho projection (ImGui coordinate system) ────────────────────── */
-
-static void make_ortho(float *out,
-                       float left, float right,
-                       float bottom, float top,
-                       float z_near, float z_far,
-                       bool homogeneous_depth)
-{
-    memset(out, 0, 16 * sizeof(float));
-    out[0]  = 2.0f / (right - left);
-    out[5]  = 2.0f / (top - bottom);
-    out[12] = (left + right) / (left - right);
-    out[13] = (top + bottom) / (bottom - top);
-
-    if (homogeneous_depth) {
-        out[10] = 2.0f / (z_near - z_far);
-        out[14] = (z_near + z_far) / (z_near - z_far);
-    } else {
-        out[10] = 1.0f / (z_near - z_far);
-        out[14] = z_near / (z_near - z_far);
-    }
-    out[15] = 1.0f;
-}
+/* Ortho projection now delegates to engine API (jce_m4_ortho). */
 
 /* ── Font atlas ────────────────────────────────────────────────────── */
 
@@ -148,14 +127,13 @@ void jce_imgui_bgfx_setup_view(uint16_t width, uint16_t height)
 
     /* Orthographic projection: top-left origin, pixel coordinates. */
     const bgfx_caps_t *caps = bgfx_get_caps();
-    float ortho[16];
-    make_ortho(ortho,
+    jce_mat4 ortho = jce_m4_ortho(
         0.0f, (float)width,
         (float)height, 0.0f,
         0.0f, 1000.0f,
         caps->homogeneousDepth);
 
-    bgfx_set_view_transform(s_ctx.view_id, NULL, ortho);
+    bgfx_set_view_transform(s_ctx.view_id, NULL, &ortho);
 }
 
 void jce_imgui_bgfx_render_draw_data(void)

@@ -121,6 +121,12 @@ void jce_renderer_dbg_text_attr(uint16_t x, uint16_t y, uint8_t attr, const char
 void jce_renderer_set_wireframe(JceRenderer *r, bool enabled);
 bool jce_renderer_get_wireframe(const JceRenderer *r);
 
+/* -- GPU capability queries --------------------------------------- */
+
+/* Returns true if the GPU uses bottom-left framebuffer origin (OpenGL).
+   Useful for UV flipping when displaying FBO textures in UI. */
+bool jce_renderer_origin_bottom_left(void);
+
 #ifdef __cplusplus
 }
 #endif

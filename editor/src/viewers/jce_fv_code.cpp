@@ -250,7 +250,7 @@ static int fv_find_nth(const char *text, const char *needle, int n)
 void fv_code_close_tab(FvTab *tab)
 {
     if (tab->edit_buf) {
-        free(tab->edit_buf);
+        ED_FREE(tab->edit_buf);
         tab->edit_buf = NULL;
     }
     tab->edit_mode = false;
@@ -283,7 +283,7 @@ void fv_render_code(FvTab *tab)
                 if (!tab->edit_buf) {
                     int cap = (tab->content_len + 1 > FV_EDIT_BUF_CAP)
                             ? tab->content_len + 1 : FV_EDIT_BUF_CAP;
-                    tab->edit_buf = (char *)malloc((size_t)cap);
+                    tab->edit_buf = (char *)ED_MALLOC((size_t)cap);
                     tab->edit_buf_cap = cap;
                     if (tab->edit_buf) {
                         memcpy(tab->edit_buf, tab->content, (size_t)tab->content_len);
@@ -316,8 +316,8 @@ void fv_render_code(FvTab *tab)
                     /* Refresh content from edit buffer */
                     if (tab->edit_buf) {
                         int new_len = (int)strlen(tab->edit_buf);
-                        free(tab->content);
-                        tab->content = (char *)malloc((size_t)new_len + 1);
+                        ED_FREE(tab->content);
+                        tab->content = (char *)ED_MALLOC((size_t)new_len + 1);
                         if (tab->content) {
                             memcpy(tab->content, tab->edit_buf, (size_t)new_len);
                             tab->content[new_len] = '\0';
@@ -339,19 +339,19 @@ void fv_render_code(FvTab *tab)
                 long sz = ftell(fp);
                 fseek(fp, 0, SEEK_SET);
                 int read_size = (sz > FV_MAX_CONTENT) ? FV_MAX_CONTENT : (int)sz;
-                char *buf = (char *)malloc((size_t)read_size + 1);
+                char *buf = (char *)ED_MALLOC((size_t)read_size + 1);
                 if (buf) {
                     int n = (int)fread(buf, 1, (size_t)read_size, fp);
                     buf[n] = '\0';
-                    free(tab->content);
+                    ED_FREE(tab->content);
                     tab->content = buf;
                     tab->content_len = n;
                     tab->file_size = sz;
                     /* Refresh edit buffer too */
                     if (tab->edit_buf) {
                         int cap = (n + 1 > FV_EDIT_BUF_CAP) ? n + 1 : FV_EDIT_BUF_CAP;
-                        free(tab->edit_buf);
-                        tab->edit_buf = (char *)malloc((size_t)cap);
+                        ED_FREE(tab->edit_buf);
+                        tab->edit_buf = (char *)ED_MALLOC((size_t)cap);
                         tab->edit_buf_cap = cap;
                         if (tab->edit_buf) {
                             memcpy(tab->edit_buf, tab->content, (size_t)n);

@@ -1,26 +1,38 @@
 /*
- * jce_window.h  Cross-platform SDL3 window management for JCE.
+ * jce_window.h  Cross-platform window management for JCE.
  *
- * Wraps SDL_Window creation, native handle retrieval (Win32, macOS,
+ * Wraps window creation, native handle retrieval (Win32, macOS,
  * iOS, Android, X11, Wayland), and letterbox viewport calculation.
+ *
+ * This header is SDL-free; game/application code does not need SDL.
  */
 
 #ifndef JCE_WINDOW_H
 #define JCE_WINDOW_H
 
-#include <SDL3/SDL.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+/* ----- Window creation flags ----------------------------------------- */
+/* Values match SDL_WINDOW_* so no conversion is needed internally.      */
+
+#define JCE_WINDOW_FULLSCREEN          0x00000001u
+#define JCE_WINDOW_BORDERLESS          0x00000010u
+#define JCE_WINDOW_RESIZABLE           0x00000020u
+#define JCE_WINDOW_MINIMIZED           0x00000040u
+#define JCE_WINDOW_MAXIMIZED           0x00000080u
+#define JCE_WINDOW_HIGH_PIXEL_DENSITY  0x00002000u
+
 typedef struct JceWindowConfig {
     const char *title;
     int         logical_w;
     int         logical_h;
-    uint32_t    flags;          /* SDL_WINDOW_* */
+    uint32_t    flags;          /* JCE_WINDOW_* */
 } JceWindowConfig;
 
 typedef struct JceWindow JceWindow;
@@ -30,7 +42,6 @@ JceWindow  *jce_window_create(const JceWindowConfig *cfg);
 void        jce_window_destroy(JceWindow *win);
 
 /* Accessors. */
-SDL_Window *jce_window_sdl(JceWindow *win);
 void        jce_window_get_size(JceWindow *win, uint32_t *w, uint32_t *h);
 void        jce_window_get_logical(JceWindow *win, int *w, int *h);
 
@@ -44,7 +55,7 @@ typedef struct JceNativeWindow {
    Supports Win32, macOS/Cocoa, iOS/UIKit, Android, X11, Wayland. */
 void        jce_window_get_native(const JceWindow *win, JceNativeWindow *out);
 
-/* Call from SDL_EVENT_WINDOW_RESIZED handler. */
+/* Call from window-resize handler. */
 void        jce_window_handle_resize(JceWindow *win, uint32_t w, uint32_t h);
 
 /* Compute a letterbox viewport that preserves the logical aspect ratio. */
@@ -58,6 +69,13 @@ void        jce_window_set_icon(JceWindow *win,
 
 /* Toggle between fullscreen and windowed mode. */
 void        jce_window_toggle_fullscreen(JceWindow *win);
+
+/* Enable/disable relative (captured) mouse mode for FPS-style controls. */
+void        jce_window_set_relative_mouse_mode(JceWindow *win, bool enabled);
+
+/* Start/stop SDL text input without exposing SDL_Window to consumers. */
+bool        jce_window_start_text_input(JceWindow *win);
+bool        jce_window_stop_text_input(JceWindow *win);
 
 #ifdef __cplusplus
 }

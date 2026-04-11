@@ -7,7 +7,7 @@
  */
 
 #include <jce/audio/jce_audio.h>
-#include <jce/resource/pak_loader.h>
+#include <jce/core/pak_loader.h>
 #include <jce/resource/jce_asset_format.h>
 #include <jce/core/jce_log.h>
 #include <jce/core/jce_profiler.h>

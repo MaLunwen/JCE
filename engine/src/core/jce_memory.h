@@ -13,7 +13,7 @@
 
 #include <mimalloc.h>
 #include <stddef.h>
-#include "jce_profiler.h"
+#include <jce/core/jce_profiler.h>
 
 /* -- Core allocation macros ---------------------------------------- */
 

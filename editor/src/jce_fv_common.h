@@ -10,6 +10,7 @@
 #define JCE_FV_COMMON_H
 
 #include "jce_file_viewer.h"
+#include "jce_editor_alloc.h"
 #include "jce_editor_colors.h"
 #include "jce_editor_defaults.h"
 #include "jce_editor_i18n.h"
@@ -25,6 +26,7 @@
 
 extern "C" {
 #include <jce/core/jce_log.h>
+#include <jce/core/jce_math.h>
 #include <jce/graphics/jce_texture.h>
 }
 
