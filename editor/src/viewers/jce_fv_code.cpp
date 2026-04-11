@@ -272,13 +272,13 @@ void fv_render_code(FvTab *tab)
         if (tab->edit_mode) {
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.55f, 0.2f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.25f, 0.65f, 0.25f, 1.0f));
-            if (ImGui::Button("Editing")) {
+            if (ImGui::Button(jce_editor_i18n("codeViewer.editing"))) {
                 /* Switch back to view mode */
                 tab->edit_mode = false;
             }
             ImGui::PopStyleColor(2);
         } else {
-            if (ImGui::Button("Edit")) {
+            if (ImGui::Button(jce_editor_i18n("codeViewer.edit"))) {
                 /* Activate edit mode — allocate buffer */
                 if (!tab->edit_buf) {
                     int cap = (tab->content_len + 1 > FV_EDIT_BUF_CAP)
@@ -297,7 +297,7 @@ void fv_render_code(FvTab *tab)
 
         /* Find button (Ctrl+F) */
         ImGui::SameLine();
-        if (ImGui::Button("Find")) {
+        if (ImGui::Button(jce_editor_i18n("codeViewer.find"))) {
             tab->show_find_replace = !tab->show_find_replace;
         }
 
@@ -306,7 +306,7 @@ void fv_render_code(FvTab *tab)
             ImGui::SameLine();
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.45f, 0.7f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.25f, 0.55f, 0.8f, 1.0f));
-            if (ImGui::Button("Save")) {
+            if (ImGui::Button(jce_editor_i18n("codeViewer.save"))) {
                 FILE *fp = fopen(tab->path, "wb");
                 if (fp) {
                     const char *save_src = tab->edit_buf ? tab->edit_buf : tab->content;
@@ -332,7 +332,7 @@ void fv_render_code(FvTab *tab)
 
         /* Reload */
         ImGui::SameLine();
-        if (ImGui::Button("Reload")) {
+        if (ImGui::Button(jce_editor_i18n("codeViewer.reload"))) {
             FILE *fp = fopen(tab->path, "rb");
             if (fp) {
                 fseek(fp, 0, SEEK_END);
@@ -366,7 +366,7 @@ void fv_render_code(FvTab *tab)
 
         /* Open in VS Code */
         ImGui::SameLine();
-        if (ImGui::Button("VS Code")) {
+        if (ImGui::Button(jce_editor_i18n("viewer.code.openInEditor"))) {
 #ifdef _WIN32
             char cmd[600];
             snprintf(cmd, sizeof(cmd), "code \"%s\"", tab->path);
@@ -387,7 +387,7 @@ void fv_render_code(FvTab *tab)
                 "  %ld bytes", tab->file_size);
         if (tab->modified) {
             ImGui::SameLine();
-            ImGui::TextColored(JCE_COLOR_TEXT_WARNING, " [Modified]");
+            ImGui::TextColored(JCE_COLOR_TEXT_WARNING, "%s", jce_editor_i18n("codeViewer.modified"));
         }
     }
 
@@ -413,11 +413,11 @@ void fv_render_code(FvTab *tab)
             }
             ImGui::SameLine();
             int match_count = (tab->find_buf[0]) ? fv_count_matches(src, tab->find_buf) : 0;
-            if (ImGui::Button("Find Next") && match_count > 0) {
+            if (ImGui::Button(jce_editor_i18n("codeViewer.findNext")) && match_count > 0) {
                 tab->find_index = (tab->find_index + 1) % match_count;
             }
             ImGui::SameLine();
-            if (ImGui::Button("Find Prev") && match_count > 0) {
+            if (ImGui::Button(jce_editor_i18n("codeViewer.findPrev")) && match_count > 0) {
                 tab->find_index = (tab->find_index - 1 + match_count) % match_count;
             }
             ImGui::SameLine();
@@ -425,7 +425,7 @@ void fv_render_code(FvTab *tab)
                 ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%d/%d",
                     tab->find_index + 1, match_count);
             else if (tab->find_buf[0])
-                ImGui::TextColored(JCE_COLOR_TEXT_ERROR, "No matches");
+                ImGui::TextColored(JCE_COLOR_TEXT_ERROR, "%s", jce_editor_i18n("codeViewer.noMatches"));
             ImGui::SameLine();
             if (ImGui::SmallButton("X")) {
                 tab->show_find_replace = false;
@@ -436,7 +436,7 @@ void fv_render_code(FvTab *tab)
                 ImGui::SetNextItemWidth(200);
                 ImGui::InputText("##replace", tab->replace_buf, sizeof(tab->replace_buf));
                 ImGui::SameLine();
-                if (ImGui::Button("Replace") && tab->edit_buf && tab->find_buf[0]) {
+                if (ImGui::Button(jce_editor_i18n("codeViewer.replaceOne")) && tab->edit_buf && tab->find_buf[0]) {
                     int offset = fv_find_nth(tab->edit_buf, tab->find_buf, tab->find_index);
                     if (offset >= 0) {
                         size_t flen = strlen(tab->find_buf);
@@ -453,7 +453,7 @@ void fv_render_code(FvTab *tab)
                     }
                 }
                 ImGui::SameLine();
-                if (ImGui::Button("Replace All") && tab->edit_buf && tab->find_buf[0]) {
+                if (ImGui::Button(jce_editor_i18n("codeViewer.replaceAll")) && tab->edit_buf && tab->find_buf[0]) {
                     size_t flen = strlen(tab->find_buf);
                     size_t rlen = strlen(tab->replace_buf);
                     /* Build a new string with all replacements */

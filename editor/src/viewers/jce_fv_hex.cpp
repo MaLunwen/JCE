@@ -21,11 +21,11 @@ void fv_render_scene(FvTab *tab)
     }
     ImGui::SameLine();
     ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
-        "Scene  |  %.1f KB", (double)tab->file_size / 1024.0);
+        "%s  |  %.1f KB", jce_editor_i18n("viewer.scene"), (double)tab->file_size / 1024.0);
     ImGui::Separator();
 
     ImGui::Spacing();
-    ImGui::TextColored(JCE_COLOR_ACCENT, "Scene File");
+    ImGui::TextColored(JCE_COLOR_ACCENT, "%s", jce_editor_i18n("viewer.sceneFile"));
     ImGui::Separator();
     ImGui::Spacing();
     fv_render_code(tab);
@@ -46,7 +46,7 @@ void fv_render_hex(FvTab *tab)
     }
     ImGui::SameLine();
     ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
-        "Binary  |  %.1f KB", (double)tab->file_size / 1024.0);
+        "%s  |  %.1f KB", jce_editor_i18n("viewer.binary"), (double)tab->file_size / 1024.0);
     ImGui::Separator();
 
     ImGui::BeginChild("##hex", ImVec2(0, 0), false,
@@ -91,7 +91,7 @@ void fv_render_hex(FvTab *tab)
     if (tab->content_len > 4096) {
         ImGui::Spacing();
         ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
-            "... (%d more bytes)", tab->content_len - 4096);
+            "... (%d %s)", tab->content_len - 4096, jce_editor_i18n("viewer.moreBytes"));
     }
 
     ImGui::EndChild();

@@ -31,9 +31,43 @@ SAMPLER2D(s_metalRough, 1);
 SAMPLER2D(s_normalMap,  2);
 SAMPLER2D(s_aoMap,      3);
 SAMPLER2D(s_emissive,   4);
+SAMPLER2D(s_shadowMap,  5);
+
+// Shadow uniforms
+uniform mat4 u_shadowVP;
 
 void main()
 {
+    // --- Shadow calculation helper (PCF 2x2) ---
+    // Transform world position to shadow clip space, then to UV.
+    vec4 shadowClip = mul(u_shadowVP, vec4(v_worldpos, 1.0));
+    vec3 shadowNDC  = shadowClip.xyz / shadowClip.w;
+    vec2 shadowUV   = shadowNDC.xy * 0.5 + 0.5;
+    // bgfx flips Y for some backends
+#if BGFX_SHADER_LANGUAGE_GLSL
+    float shadowZ   = shadowNDC.z * 0.5 + 0.5;
+#else
+    float shadowZ   = shadowNDC.z;
+#endif
+    float shadowBias = 0.002;
+    float shadow = 1.0;
+    if (shadowUV.x >= 0.0 && shadowUV.x <= 1.0 &&
+        shadowUV.y >= 0.0 && shadowUV.y <= 1.0 &&
+        shadowZ >= 0.0 && shadowZ <= 1.0)
+    {
+        vec2 texelSize = vec2_splat(1.0 / 2048.0);
+        float sum = 0.0;
+        for (int sy = -1; sy <= 1; sy++)
+        {
+            for (int sx = -1; sx <= 1; sx++)
+            {
+                float depth = texture2D(s_shadowMap, shadowUV + vec2(float(sx), float(sy)) * texelSize).r;
+                sum += (shadowZ - shadowBias > depth) ? 0.0 : 1.0;
+            }
+        }
+        shadow = sum / 9.0;
+    }
+
     // --- Base color ---
     // Base color texture is sRGB-encoded (glTF spec §5.19). Convert texture
     // to linear space FIRST, then multiply by the linear baseColorFactor.
@@ -102,7 +136,7 @@ void main()
         vec3 lightColor = u_dirLights[i * 2 + 1].xyz;
 
         vec3 radiance = lightColor * intensity;
-        Lo += cookTorranceBRDF(N, V, lightDir, F0, albedo, metallic, roughness) * radiance;
+        Lo += cookTorranceBRDF(N, V, lightDir, F0, albedo, metallic, roughness) * radiance * shadow;
     }
 
     // --- Point lights ---

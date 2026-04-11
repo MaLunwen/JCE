@@ -75,6 +75,7 @@ void jce_gizmo_draw(struct ImDrawList *dl,
 
 bool         jce_gizmo_is_active(void);
 JceGizmoAxis jce_gizmo_hovered_axis(void);
+void         jce_gizmo_cancel_interaction(void);
 
 #ifdef __cplusplus
 }

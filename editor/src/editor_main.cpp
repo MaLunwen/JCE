@@ -13,26 +13,64 @@
 #include <fstream>
 #include <algorithm>
 #include <string>
+#include <cstdio>
 
 extern "C" {
 #include <jce/app/jce_engine.h>
 #include <jce/app/jce_app_interface.h>
+#include <jce/graphics/jce_postfx.h>
+#include <jce/core/jce_allocator.h>
+#include <jce/platform/jce_window.h>
 }
 #include "jce_editor.h"
 #include "jce_editor_panels.h"
 #include "jce_editor_scene_render.h"
 #include "jce_editor_config.h"
+#include "jce_editor_state.h"
 
 namespace fs = std::filesystem;
 
 /* ── Editor state ──────────────────────────────────────────────────── */
 
 static JceEngine *g_engine;
+static uint64_t g_startup_t0;
+static bool g_startup_reported;
 
 struct EditorState {
     const JceServices *svc;
 };
 static EditorState g_state;
+
+static void maybe_log_startup_kpi(void)
+{
+    if (g_startup_reported || g_startup_t0 == 0) {
+        return;
+    }
+
+    const uint64_t now = SDL_GetPerformanceCounter();
+    const uint64_t freq = SDL_GetPerformanceFrequency();
+    if (freq == 0) {
+        return;
+    }
+
+    const double startup_ms = (double)(now - g_startup_t0) * 1000.0 / (double)freq;
+    SDL_Log("kpi:startup_ms=%.3f", startup_ms);
+
+    const char *startup_log_path = SDL_getenv("JCE_KPI_STARTUP_LOG");
+    if (startup_log_path && startup_log_path[0]) {
+        FILE *fp = fopen(startup_log_path, "a");
+        if (fp) {
+            fprintf(fp, "startup_ms,%.3f\n", startup_ms);
+            fclose(fp);
+        } else {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
+                        "editor: failed to write startup KPI log to %s",
+                        startup_log_path);
+        }
+    }
+
+    g_startup_reported = true;
+}
 
 /* ── Startup renderer backend override from editor config ─────────── */
 
@@ -93,6 +131,9 @@ static void configure_engine_renderer_from_editor_config(void)
             ecfg.renderer, backend, override_path);
 }
 
+/* ── PostFX global (defined in jce_editor.cpp, used by panels) ───── */
+extern JcePostFXPipeline *g_editor_postfx;
+
 /* ── JceAppDesc callbacks ──────────────────────────────────────────── */
 
 static bool editor_app_init(const JceServices *svc, void *ud)
@@ -100,19 +141,50 @@ static bool editor_app_init(const JceServices *svc, void *ud)
     EditorState *st = (EditorState *)ud;
     st->svc = svc;
     jce_editor_scene_render_init(svc->renderer, svc->pak);
-    return jce_editor_init(svc->pak, svc->window);
+    if (!jce_editor_init(svc->pak, svc->window))
+        return false;
+
+    /* Create and load the PostFX pipeline. */
+    if (!g_editor_postfx) {
+        uint32_t w, h;
+        jce_window_get_size(svc->window, &w, &h);
+        g_editor_postfx = jce_postfx_create(jce_allocator_default(), w, h);
+        if (g_editor_postfx)
+            jce_postfx_load_shaders(g_editor_postfx, svc->pak);
+    }
+
+    return true;
 }
 
 static void editor_app_exit(void *ud)
 {
     (void)ud;
+    if (g_editor_postfx) {
+        jce_postfx_destroy(g_editor_postfx);
+        g_editor_postfx = NULL;
+    }
     jce_editor_scene_render_shutdown();
     jce_editor_shutdown();
 }
 
+static uint64_t s_last_update_counter = 0;
+
 static void editor_app_update(float dt, void *ud)
 {
-    (void)dt; (void)ud;
+    (void)ud;
+
+    /* Compute real delta time since engine passes 0.0f. */
+    uint64_t now = SDL_GetPerformanceCounter();
+    float real_dt = 0.0f;
+    if (s_last_update_counter != 0) {
+        real_dt = (float)(now - s_last_update_counter)
+                / (float)SDL_GetPerformanceFrequency();
+        if (real_dt > 0.1f) real_dt = 0.1f;  /* clamp to avoid spiral */
+    }
+    s_last_update_counter = now;
+
+    /* Tick play-mode physics when playing. */
+    jce_state_play_mode_tick(real_dt);
 }
 
 static void editor_app_draw(const JceServices *svc, void *ud)
@@ -123,6 +195,7 @@ static void editor_app_draw(const JceServices *svc, void *ud)
      * (jce_editor_scene_render_frame) so it renders to the FBO with
      * the correct panel size. The ImGui panel then displays the texture. */
 
+    maybe_log_startup_kpi();
     jce_editor_update(svc->window);
 }
 
@@ -137,6 +210,9 @@ static void editor_app_event(const SDL_Event *ev, void *ud)
 SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
 {
     (void)appstate;
+
+    g_startup_t0 = SDL_GetPerformanceCounter();
+    g_startup_reported = false;
 
     /* Let editor-config.json renderer drive backend selection at startup.
      * This avoids requiring users to manually edit executable-adjacent .config/jce.ini. */
@@ -156,7 +232,9 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
 
     jce_engine_set_app_desc(&desc);
     g_engine = jce_engine_create(argc, argv);
-    return g_engine ? SDL_APP_CONTINUE : SDL_APP_FAILURE;
+    if (!g_engine)
+        return SDL_APP_FAILURE;
+    return SDL_APP_CONTINUE;
 }
 
 SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event)

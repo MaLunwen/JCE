@@ -2,22 +2,28 @@
  * jce_scene_serial.c  Scene serialization implementation (cJSON).
  *
  * Converts the ECS scene graph to/from a JSON representation.
- * Format:
+ * Format (contract envelope):
  * {
- *   "version": 1,
- *   "entities": [
- *     {
- *       "name": "Player",
- *       "transform": { "position": [0,0,0], "rotation": [0,0,0,1], "scale": [1,1,1] },
- *       "mesh_renderer": { "model": 0, "shader": 0, "visible": true },
- *       "camera": { "fov_deg": 60, "near": 0.1, "far": 1000, "primary": true },
- *       "dir_light": { "direction": [0,-1,0], "color": [1,1,1], "intensity": 1 }
- *     }
- *   ]
+ *   "contract": { "name": "jce.scene", "major": 1, "minor": 0 },
+ *   "scene": {
+ *     "version": 1,
+ *     "entities": [
+ *       {
+ *         "name": "Player",
+ *         "transform": { "position": [0,0,0], "rotation": [0,0,0,1], "scale": [1,1,1] },
+ *         "mesh_renderer": { "model": 0, "shader": 0, "visible": true },
+ *         "camera": { "fov_deg": 60, "near": 0.1, "far": 1000, "primary": true },
+ *         "dir_light": { "direction": [0,-1,0], "color": [1,1,1], "intensity": 1 }
+ *       }
+ *     ]
+ *   }
  * }
+ *
+ * Legacy root-level {"version":..., "entities":...} is still accepted on load.
  */
 
 #include <jce/resource/jce_scene_serial.h>
+#include <jce/resource/jce_scene_contract.h>
 #include "scene/jce_scene.h"
 #include <jce/core/jce_log.h>
 
@@ -77,6 +83,50 @@ static double json_get_number(const cJSON *parent, const char *key, double fallb
     const cJSON *item = cJSON_GetObjectItem(parent, key);
     if (!item || !cJSON_IsNumber(item)) return fallback;
     return item->valuedouble;
+}
+
+static bool read_contract_version(const cJSON *root,
+                                  uint32_t *out_major,
+                                  uint32_t *out_minor)
+{
+    if (out_major) *out_major = JCE_SCENE_CONTRACT_MAJOR;
+    if (out_minor) *out_minor = JCE_SCENE_CONTRACT_MINOR;
+    if (!root || !cJSON_IsObject(root)) return false;
+
+    const cJSON *contract = cJSON_GetObjectItemCaseSensitive(root,
+        JCE_SCENE_CONTRACT_KEY);
+    if (cJSON_IsObject(contract)) {
+        const cJSON *major = cJSON_GetObjectItemCaseSensitive(contract,
+            JCE_SCENE_CONTRACT_MAJOR_KEY);
+        const cJSON *minor = cJSON_GetObjectItemCaseSensitive(contract,
+            JCE_SCENE_CONTRACT_MINOR_KEY);
+        if (cJSON_IsNumber(major) && out_major)
+            *out_major = (uint32_t)major->valueint;
+        if (cJSON_IsNumber(minor) && out_minor)
+            *out_minor = (uint32_t)minor->valueint;
+        return true;
+    }
+
+    const cJSON *legacy_version = cJSON_GetObjectItemCaseSensitive(root,
+        JCE_SCENE_VERSION_KEY);
+    if (cJSON_IsNumber(legacy_version)) {
+        if (out_major)
+            *out_major = (uint32_t)legacy_version->valueint;
+        if (out_minor)
+            *out_minor = 0;
+        return true;
+    }
+
+    return false;
+}
+
+static cJSON *resolve_scene_container(cJSON *root)
+{
+    if (!root || !cJSON_IsObject(root))
+        return root;
+
+    cJSON *scene = cJSON_GetObjectItemCaseSensitive(root, JCE_SCENE_ROOT_KEY);
+    return cJSON_IsObject(scene) ? scene : root;
 }
 
 /* ── Serialize callback (per entity) ───────────────────────────────── */
@@ -148,12 +198,29 @@ char *jce_scene_serial_save(const JceScene *scene, size_t *out_len)
     if (!scene) return NULL;
 
     cJSON *root = cJSON_CreateObject();
-    if (!root) return NULL;
-
-    cJSON_AddNumberToObject(root, "version", 1);
-
+    cJSON *contract = cJSON_CreateObject();
+    cJSON *scene_obj = cJSON_CreateObject();
     cJSON *entities = cJSON_CreateArray();
-    cJSON_AddItemToObject(root, "entities", entities);
+    if (!root || !contract || !scene_obj || !entities) {
+        cJSON_Delete(root);
+        cJSON_Delete(contract);
+        cJSON_Delete(scene_obj);
+        cJSON_Delete(entities);
+        return NULL;
+    }
+
+    cJSON_AddItemToObject(root, JCE_SCENE_CONTRACT_KEY, contract);
+    cJSON_AddStringToObject(contract, JCE_SCENE_CONTRACT_NAME_KEY,
+                            JCE_SCENE_CONTRACT_NAME);
+    cJSON_AddNumberToObject(contract, JCE_SCENE_CONTRACT_MAJOR_KEY,
+                            JCE_SCENE_CONTRACT_MAJOR);
+    cJSON_AddNumberToObject(contract, JCE_SCENE_CONTRACT_MINOR_KEY,
+                            JCE_SCENE_CONTRACT_MINOR);
+
+    cJSON_AddItemToObject(root, JCE_SCENE_ROOT_KEY, scene_obj);
+    cJSON_AddNumberToObject(scene_obj, JCE_SCENE_VERSION_KEY,
+                            JCE_SCENE_CONTRACT_MAJOR);
+    cJSON_AddItemToObject(scene_obj, JCE_SCENE_ENTITIES_KEY, entities);
 
     SaveCtx ctx = { (JceScene *)scene, entities };
     jce_scene_each_entity((JceScene *)scene, save_entity_cb, &ctx);
@@ -207,7 +274,22 @@ bool jce_scene_serial_load(JceScene *scene, const char *json, size_t len)
         return false;
     }
 
-    cJSON *entities = cJSON_GetObjectItem(root, "entities");
+    uint32_t contract_major = JCE_SCENE_CONTRACT_MAJOR;
+    uint32_t contract_minor = JCE_SCENE_CONTRACT_MINOR;
+    read_contract_version(root, &contract_major, &contract_minor);
+    if (!jce_scene_contract_major_compatible(contract_major)) {
+        LOG_ERROR(LOG_TAG,
+                  "unsupported scene contract major version: %u (expected %u)",
+                  (unsigned)contract_major,
+                  (unsigned)JCE_SCENE_CONTRACT_MAJOR);
+        cJSON_Delete(root);
+        return false;
+    }
+    (void)contract_minor;
+
+    cJSON *container = resolve_scene_container(root);
+    cJSON *entities = cJSON_GetObjectItemCaseSensitive(container,
+        JCE_SCENE_ENTITIES_KEY);
     if (!entities || !cJSON_IsArray(entities)) {
         LOG_ERROR(LOG_TAG, "missing 'entities' array");
         cJSON_Delete(root);

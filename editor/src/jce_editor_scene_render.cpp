@@ -9,6 +9,7 @@
 
 #include "jce_editor_scene_render.h"
 #include "jce_editor_state.h"
+#include "jce_model_loader_assimp.h"
 
 #include <bgfx/c99/bgfx.h>
 #include <string.h>
@@ -20,6 +21,10 @@
 #include <fstream>
 #include <algorithm>
 #include <cctype>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <limits>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -30,6 +35,7 @@
 
 extern "C" {
 #include <cjson/cJSON.h>
+#include <jce/graphics/jce_editor_render_bridge.h>
 #include <jce/graphics/jce_renderer.h>
 #include <jce/graphics/jce_shaders.h>
 #include <jce/graphics/jce_camera.h>
@@ -38,6 +44,8 @@ extern "C" {
 #include <jce/graphics/jce_material.h>
 #include <jce/graphics/jce_texture.h>
 #include <jce/graphics/jce_lighting.h>
+#include <jce/graphics/jce_lighting_system.h>
+#include <jce/graphics/jce_pbr_material.h>
 #include <jce/resource/pak_loader.h>
 #include <jce/core/jce_math.h>
 #include <jce/core/jce_log.h>
@@ -49,10 +57,6 @@ extern "C" {
 #define LOG_TAG "scene_render"
 
 namespace fs = std::filesystem;
-
-/* ── Scene view ID (dedicated editor view, after engine views) ─────── */
-
-#define SCENE_VIEW_ID  3
 
 /* ── Background color: rgba(30, 30, 40, 255) ──────────────────────── */
 
@@ -70,23 +74,25 @@ struct PosColorVertex {
 static struct {
     bool                    initialized;
     JceRenderer            *renderer;
+    JceEditorRenderBridge  *bridge;
     JceCamera              *camera;
     bgfx_vertex_layout_t    layout;
     bgfx_program_handle_t   prog_color;
+    bgfx_program_handle_t   prog_grid;
 
     /* Sky shader resources. */
     bgfx_program_handle_t   prog_sky;
     bgfx_vertex_layout_t    sky_layout;
     bgfx_uniform_handle_t   u_sky_colors;
-
-    /* Framebuffer (render-to-texture). */
-    bgfx_frame_buffer_handle_t fbo;
-    bgfx_texture_handle_t      fbo_color;
-    uint32_t                   fbo_w, fbo_h;
+    bgfx_uniform_handle_t   u_grid_camera;
+    bgfx_uniform_handle_t   u_grid_fade;
 
     /* Procedural meshes for entity placeholders. */
     JceMesh                *cube_mesh;
     JceMesh                *plane_mesh;
+    JceMesh                *sphere_mesh;
+    JceMesh                *capsule_mesh;
+    JceMesh                *cylinder_mesh;
 
     /* Orbit camera state (Maya-style). */
     jce_vec3                orbit_target;
@@ -98,6 +104,9 @@ static struct {
     struct {
         char     path[128];
         JceMesh *mesh;
+        bool     requested;
+        bool     failed;
+        uint64_t request_generation;
     } mesh_cache[512];
     int mesh_cache_count;
 
@@ -112,6 +121,9 @@ static struct {
         char       path[128];
         JceTexture tex;
         bool       tried;   /* true if load was attempted (even if it failed) */
+        bool       requested;
+        bool       failed;
+        uint64_t   request_generation;
     } tex_cache[256];
     int tex_cache_count;
 
@@ -121,68 +133,255 @@ static struct {
     /* Cached lighting uniform handles for flat-color selection outlines. */
     bgfx_uniform_handle_t  u_light_dir;
     bgfx_uniform_handle_t  u_light_color;
+
+    /* ── Shadow mapping ─────────────────────────────────────────── */
+    bgfx_texture_handle_t        shadow_tex;
+    bgfx_frame_buffer_handle_t   shadow_fbo;
+    bgfx_uniform_handle_t        u_shadowMap;
+    bgfx_uniform_handle_t        u_shadowVP;
+    bool                         shadow_valid;
+
+    /* ── Multi-light environment ────────────────────────────────── */
+    JceLightEnv                 *light_env;
 } s_sr;
+
+struct MeshLoadRequest {
+    std::string mesh_path;
+    std::string file_path;
+    float       priority_dist2;
+    uint32_t    order;
+    uint64_t    generation;
+};
+
+struct MeshLoadResult {
+    std::string        mesh_path;
+    uint64_t           generation;
+    bool               success;
+    JceEditorCpuMeshData cpu;
+};
+
+struct MeshAsyncState {
+    std::thread               worker;
+    std::mutex                mutex;
+    std::condition_variable   cv;
+    std::vector<MeshLoadRequest> pending;
+    std::vector<MeshLoadResult>  completed;
+    uint32_t                  discovery;
+    uint64_t                  generation;
+    bool                      running;
+    bool                      stop;
+};
+
+static MeshAsyncState s_mesh_async = {};
+
+struct TextureLoadRequest {
+    std::string key;
+    std::string file_path;
+    uint64_t    generation;
+};
+
+struct TextureLoadResult {
+    std::string            key;
+    uint64_t               generation;
+    bool                   success;
+    std::vector<uint8_t>   rgba;
+    uint32_t               width;
+    uint32_t               height;
+};
+
+struct TextureAsyncState {
+    std::thread                    worker;
+    std::mutex                     mutex;
+    std::condition_variable        cv;
+    std::vector<TextureLoadRequest> pending;
+    std::vector<TextureLoadResult>  completed;
+    uint64_t                       generation;
+    bool                           running;
+    bool                           stop;
+};
+
+static TextureAsyncState s_tex_async = {};
 
 /* ── Helpers ────────────────────────────────────────────────────────── */
 
-static uint32_t pack_abgr(uint8_t r, uint8_t g, uint8_t b, uint8_t a)
+static uint16_t scene_view_id(void)
 {
-    return ((uint32_t)a << 24) | ((uint32_t)b << 16)
-         | ((uint32_t)g << 8)  |  (uint32_t)r;
+    if (s_sr.bridge)
+        return jce_editor_render_bridge_get_view_id(s_sr.bridge);
+    return (uint16_t)JCE_VIEW_EDITOR_SCENE;
 }
 
-/* ── FBO management ────────────────────────────────────────────────── */
+#define MESH_FINALIZE_BUDGET_PER_FRAME    2
+#define TEX_FINALIZE_BUDGET_PER_FRAME     4
 
-static void destroy_fbo(void)
+static float mesh_request_priority(const float *world_pos)
 {
-    if (s_sr.fbo_w == 0 && s_sr.fbo_h == 0) return;
-    if (BGFX_HANDLE_IS_VALID(s_sr.fbo))
-        bgfx_destroy_frame_buffer(s_sr.fbo);
-    s_sr.fbo.idx = UINT16_MAX;
-    s_sr.fbo_color.idx = UINT16_MAX;
-    s_sr.fbo_w = s_sr.fbo_h = 0;
+    if (!world_pos)
+        return std::numeric_limits<float>::max();
+    return world_pos[0] * world_pos[0]
+         + world_pos[1] * world_pos[1]
+         + world_pos[2] * world_pos[2];
 }
 
-static bool ensure_fbo(uint32_t w, uint32_t h)
+static bool mesh_request_is_higher_priority(const MeshLoadRequest &a,
+                                            const MeshLoadRequest &b)
 {
-    if (w == 0 || h == 0) return false;
-    if (s_sr.fbo_w == w && s_sr.fbo_h == h && BGFX_HANDLE_IS_VALID(s_sr.fbo))
-        return true;
+    if (a.priority_dist2 < b.priority_dist2) return true;
+    if (a.priority_dist2 > b.priority_dist2) return false;
+    return a.order < b.order;
+}
 
-    destroy_fbo();
-
-    /* Create two textures: color (RGBA8) + depth (D24S8). */
-    bgfx_texture_handle_t textures[2];
-    textures[0] = bgfx_create_texture_2d(
-        (uint16_t)w, (uint16_t)h, false, 1,
-        BGFX_TEXTURE_FORMAT_RGBA8,
-        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
-            | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT,
-        NULL);
-
-    textures[1] = bgfx_create_texture_2d(
-        (uint16_t)w, (uint16_t)h, false, 1,
-        BGFX_TEXTURE_FORMAT_D24S8,
-        BGFX_TEXTURE_RT,
-        NULL);
-
-    bgfx_attachment_t attachments[2];
-    memset(attachments, 0, sizeof(attachments));
-    bgfx_attachment_init(&attachments[0], textures[0], BGFX_ACCESS_WRITE, 0, 1, 0, BGFX_RESOLVE_AUTO_GEN_MIPS);
-    bgfx_attachment_init(&attachments[1], textures[1], BGFX_ACCESS_WRITE, 0, 1, 0, BGFX_RESOLVE_AUTO_GEN_MIPS);
-
-    s_sr.fbo = bgfx_create_frame_buffer_from_attachment(2, attachments, true);
-    if (!BGFX_HANDLE_IS_VALID(s_sr.fbo)) {
-        LOG_WARN(LOG_TAG, "failed to create FBO %ux%u", w, h);
+static bool mesh_pop_best_request_locked(MeshLoadRequest *out)
+{
+    if (!out || s_mesh_async.pending.empty())
         return false;
+
+    size_t best = 0;
+    for (size_t i = 1; i < s_mesh_async.pending.size(); i++) {
+        if (mesh_request_is_higher_priority(s_mesh_async.pending[i],
+                                            s_mesh_async.pending[best])) {
+            best = i;
+        }
     }
 
-    /* Get the color texture handle from the FBO (attachment 0). */
-    s_sr.fbo_color = bgfx_get_texture(s_sr.fbo, 0);
-    s_sr.fbo_w = w;
-    s_sr.fbo_h = h;
-    LOG_INFO(LOG_TAG, "created FBO %ux%u", w, h);
+    *out = std::move(s_mesh_async.pending[best]);
+    s_mesh_async.pending.erase(
+        s_mesh_async.pending.begin()
+        + static_cast<std::vector<MeshLoadRequest>::difference_type>(best));
     return true;
+}
+
+static void mesh_async_worker_main(void)
+{
+    for (;;) {
+        MeshLoadRequest req;
+        {
+            std::unique_lock<std::mutex> lock(s_mesh_async.mutex);
+            s_mesh_async.cv.wait(lock, [] {
+                return s_mesh_async.stop || !s_mesh_async.pending.empty();
+            });
+
+            if (s_mesh_async.stop && s_mesh_async.pending.empty())
+                break;
+
+            if (!mesh_pop_best_request_locked(&req))
+                continue;
+        }
+
+        MeshLoadResult result = {};
+        result.mesh_path = req.mesh_path;
+        result.generation = req.generation;
+        result.success = jce_editor_model_load_cpu_file(req.file_path.c_str(),
+                                                        &result.cpu);
+
+        std::lock_guard<std::mutex> lock(s_mesh_async.mutex);
+        s_mesh_async.completed.push_back(std::move(result));
+    }
+}
+
+static void mesh_async_start(void)
+{
+    if (s_mesh_async.running)
+        return;
+
+    s_mesh_async.discovery = 0;
+    s_mesh_async.generation = 1;
+    s_mesh_async.stop = false;
+    s_mesh_async.pending.clear();
+    s_mesh_async.completed.clear();
+
+    s_mesh_async.worker = std::thread(mesh_async_worker_main);
+    s_mesh_async.running = true;
+}
+
+static void mesh_async_stop(void)
+{
+    if (!s_mesh_async.running)
+        return;
+
+    {
+        std::lock_guard<std::mutex> lock(s_mesh_async.mutex);
+        s_mesh_async.stop = true;
+    }
+    s_mesh_async.cv.notify_all();
+
+    if (s_mesh_async.worker.joinable())
+        s_mesh_async.worker.join();
+
+    for (auto &res : s_mesh_async.completed)
+        jce_editor_model_free_cpu_data(&res.cpu);
+
+    s_mesh_async.pending.clear();
+    s_mesh_async.completed.clear();
+    s_mesh_async.running = false;
+}
+
+static void mesh_async_begin_new_generation(void)
+{
+    std::lock_guard<std::mutex> lock(s_mesh_async.mutex);
+    s_mesh_async.generation++;
+    s_mesh_async.discovery = 0;
+    s_mesh_async.pending.clear();
+}
+
+static uint64_t mesh_async_current_generation(void)
+{
+    std::lock_guard<std::mutex> lock(s_mesh_async.mutex);
+    return s_mesh_async.generation;
+}
+
+static void mesh_async_queue_request(const char *mesh_path,
+                                     const char *file_path,
+                                     float priority_dist2)
+{
+    if (!s_mesh_async.running || !mesh_path || !file_path)
+        return;
+
+    bool inserted = false;
+    {
+        std::lock_guard<std::mutex> lock(s_mesh_async.mutex);
+        for (MeshLoadRequest &req : s_mesh_async.pending) {
+            if (req.generation == s_mesh_async.generation
+                && req.mesh_path == mesh_path) {
+                if (priority_dist2 < req.priority_dist2)
+                    req.priority_dist2 = priority_dist2;
+                inserted = true;
+                break;
+            }
+        }
+
+        if (!inserted) {
+            MeshLoadRequest req;
+            req.mesh_path = mesh_path;
+            req.file_path = file_path;
+            req.priority_dist2 = priority_dist2;
+            req.order = s_mesh_async.discovery++;
+            req.generation = s_mesh_async.generation;
+            s_mesh_async.pending.push_back(std::move(req));
+            inserted = true;
+        }
+    }
+
+    if (inserted)
+        s_mesh_async.cv.notify_one();
+}
+
+static void mesh_async_take_completed(std::vector<MeshLoadResult> *out)
+{
+    if (!out) return;
+
+    std::lock_guard<std::mutex> lock(s_mesh_async.mutex);
+    out->swap(s_mesh_async.completed);
+}
+
+static void mesh_async_push_back_completed(std::vector<MeshLoadResult> *results)
+{
+    if (!results || results->empty()) return;
+
+    std::lock_guard<std::mutex> lock(s_mesh_async.mutex);
+    for (MeshLoadResult &res : *results)
+        s_mesh_async.completed.push_back(std::move(res));
+    results->clear();
 }
 
 /* ── Sky gradient (smooth sky dome — no visible edges) ───────────────── */
@@ -245,164 +444,54 @@ static void draw_sky_gradient(void)
 
     jce_mat4 identity = jce_m4_identity();
     bgfx_set_transform(identity.raw[0], 1);
-    bgfx_submit(SCENE_VIEW_ID, s_sr.prog_sky, 0, BGFX_DISCARD_ALL);
+    bgfx_submit(scene_view_id(), s_sr.prog_sky, 0, BGFX_DISCARD_ALL);
 }
 
-/* ── Grid Rendering (with distance fog fade like Blender) ──────────── */
-
-/* Fade grid line alpha based on distance from camera (XZ plane).
- * Lines close to the camera are fully opaque; distant lines fade out. */
-static uint32_t fade_grid_color(uint8_t r, uint8_t g, uint8_t b, uint8_t base_a,
-                                 float line_coord, float cam_xz, float fade_start,
-                                 float fade_end)
-{
-    float dist = fabsf(line_coord - cam_xz);
-    float t = 1.0f;
-    if (dist > fade_start) {
-        t = 1.0f - (dist - fade_start) / (fade_end - fade_start);
-        if (t < 0.0f) t = 0.0f;
-    }
-    uint8_t a = (uint8_t)(base_a * t);
-    return pack_abgr(r, g, b, a);
-}
+/* ── Infinite Grid Rendering (Blender-like fullscreen shader) ─────── */
 
 static void draw_grid(void)
 {
-    const int half_extent = 100;
-    const int step_minor  = 1;
-    const int step_major  = 5;
+    if (!BGFX_HANDLE_IS_VALID(s_sr.prog_grid)) return;
 
-    /* Fog/fade parameters: lines start fading at fade_start distance from camera,
-     * fully transparent at fade_end. Wider range prevents grid from disappearing
-     * at oblique camera angles. */
-    const float fade_start = 35.0f;
-    const float fade_end   = 95.0f;
-
-    jce_vec3 cam_pos = jce_camera_get_position(s_sr.camera);
-
-    /* +2 for the center axis lines (x=0 and z=0), guaranteed even if step
-     * doesn't land exactly on 0.  (With step_minor=1 they already do, but
-     * this makes the logic explicit.) */
-    int lines_per_axis = (2 * half_extent / step_minor) + 1;
-    int total_lines    = lines_per_axis * 2;
-    int total_verts    = total_lines * 2;
-    int total_indices  = total_lines * 2;
-
-    if (total_verts > 65535) return;
-
+    struct GridVertex { float x, y, z; };
     bgfx_transient_vertex_buffer_t tvb;
-    bgfx_transient_index_buffer_t  tib;
-
-    if (!bgfx_alloc_transient_buffers(&tvb, &s_sr.layout, (uint32_t)total_verts,
-                                      &tib, (uint32_t)total_indices, false))
+    bgfx_transient_index_buffer_t tib;
+    if (!bgfx_alloc_transient_buffers(&tvb, &s_sr.sky_layout, 4, &tib, 6, false))
         return;
 
-    PosColorVertex *verts = (PosColorVertex *)tvb.data;
-    uint16_t       *idx   = (uint16_t *)tib.data;
-    int vi = 0, ii = 0;
+    GridVertex *v = (GridVertex *)tvb.data;
+    uint16_t *ix = (uint16_t *)tib.data;
+    v[0] = { -1.0f, -1.0f, 0.0f };
+    v[1] = {  1.0f, -1.0f, 0.0f };
+    v[2] = {  1.0f,  1.0f, 0.0f };
+    v[3] = { -1.0f,  1.0f, 0.0f };
+    ix[0] = 0; ix[1] = 1; ix[2] = 2;
+    ix[3] = 0; ix[4] = 2; ix[5] = 3;
 
-    float extent = (float)half_extent;
+    jce_vec3 cam_pos = jce_camera_get_position(s_sr.camera);
+    float fade_near = fmaxf(16.0f, s_sr.orbit_distance * 3.0f);
+    float fade_far  = fmaxf(fade_near + 40.0f, s_sr.orbit_distance * 24.0f);
+    float grid_camera[4] = { cam_pos.x, cam_pos.y, cam_pos.z, 0.0f };
+    float grid_fade[4] = { fade_near, fade_far, 10.0f, 1.0f };
 
-    /* X-parallel lines (varying xi, line runs along Z). */
-    for (int xi = -half_extent; xi <= half_extent; xi += step_minor) {
-        uint8_t r, g, b, base_a;
-        if (xi == 0) {
-            /* Center X axis — red, higher alpha. */
-            r = 200; g = 60; b = 60; base_a = 255;
-        } else if (xi % step_major == 0) {
-            r = 120; g = 120; b = 120; base_a = 255;
-        } else {
-            r = 80; g = 80; b = 80; base_a = 200;
-        }
-
-        /* Fade both endpoints by their Z-distance from camera. */
-        uint32_t c0 = fade_grid_color(r, g, b, base_a, -extent, cam_pos.z,
-                                      fade_start, fade_end);
-        uint32_t c1 = fade_grid_color(r, g, b, base_a,  extent, cam_pos.z,
-                                      fade_start, fade_end);
-
-        /* Also fade by X-distance from camera (line's lateral distance). */
-        float x_dist = fabsf((float)xi - cam_pos.x);
-        float x_fade = 1.0f;
-        if (x_dist > fade_start) {
-            x_fade = 1.0f - (x_dist - fade_start) / (fade_end - fade_start);
-            if (x_fade < 0.0f) x_fade = 0.0f;
-        }
-
-        /* Apply lateral fade to both endpoints. */
-        {
-            uint8_t a0 = (uint8_t)((c0 >> 24) * x_fade);
-            c0 = (c0 & 0x00FFFFFF) | ((uint32_t)a0 << 24);
-            uint8_t a1 = (uint8_t)((c1 >> 24) * x_fade);
-            c1 = (c1 & 0x00FFFFFF) | ((uint32_t)a1 << 24);
-        }
-
-        verts[vi] = { (float)xi, 0.0f, -extent, c0 };
-        idx[ii++] = (uint16_t)vi++;
-        verts[vi] = { (float)xi, 0.0f,  extent, c1 };
-        idx[ii++] = (uint16_t)vi++;
-    }
-
-    /* Z-parallel lines (varying zi, line runs along X). */
-    for (int zi = -half_extent; zi <= half_extent; zi += step_minor) {
-        uint8_t r, g, b, base_a;
-        if (zi == 0) {
-            /* Center Z axis — blue, higher alpha. */
-            r = 60; g = 60; b = 200; base_a = 255;
-        } else if (zi % step_major == 0) {
-            r = 120; g = 120; b = 120; base_a = 255;
-        } else {
-            r = 80; g = 80; b = 80; base_a = 200;
-        }
-
-        /* Fade both endpoints by their X-distance from camera. */
-        uint32_t c0 = fade_grid_color(r, g, b, base_a, -extent, cam_pos.x,
-                                      fade_start, fade_end);
-        uint32_t c1 = fade_grid_color(r, g, b, base_a,  extent, cam_pos.x,
-                                      fade_start, fade_end);
-
-        /* Also fade by Z-distance from camera (line's lateral distance). */
-        float z_dist = fabsf((float)zi - cam_pos.z);
-        float z_fade = 1.0f;
-        if (z_dist > fade_start) {
-            z_fade = 1.0f - (z_dist - fade_start) / (fade_end - fade_start);
-            if (z_fade < 0.0f) z_fade = 0.0f;
-        }
-
-        {
-            uint8_t a0 = (uint8_t)((c0 >> 24) * z_fade);
-            c0 = (c0 & 0x00FFFFFF) | ((uint32_t)a0 << 24);
-            uint8_t a1 = (uint8_t)((c1 >> 24) * z_fade);
-            c1 = (c1 & 0x00FFFFFF) | ((uint32_t)a1 << 24);
-        }
-
-        verts[vi] = { -extent, 0.0f, (float)zi, c0 };
-        idx[ii++] = (uint16_t)vi++;
-        verts[vi] = {  extent, 0.0f, (float)zi, c1 };
-        idx[ii++] = (uint16_t)vi++;
-    }
-
-    bgfx_set_transient_vertex_buffer(0, &tvb, 0, (uint32_t)vi);
-    bgfx_set_transient_index_buffer(&tib, 0, (uint32_t)ii);
+    bgfx_set_uniform(s_sr.u_grid_camera, grid_camera, 1);
+    bgfx_set_uniform(s_sr.u_grid_fade, grid_fade, 1);
+    bgfx_set_transient_vertex_buffer(0, &tvb, 0, 4);
+    bgfx_set_transient_index_buffer(&tib, 0, 6);
 
     uint64_t state = BGFX_STATE_WRITE_RGB
                    | BGFX_STATE_WRITE_A
-                   | BGFX_STATE_WRITE_Z
-                   | BGFX_STATE_DEPTH_TEST_LESS
                    | BGFX_STATE_MSAA
-                   | BGFX_STATE_PT_LINES
                    | BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_SRC_ALPHA,
                                             BGFX_STATE_BLEND_INV_SRC_ALPHA);
     bgfx_set_state(state, 0);
 
     jce_mat4 identity = jce_m4_identity();
     bgfx_set_transform(identity.raw[0], 1);
-    bgfx_submit(SCENE_VIEW_ID, s_sr.prog_color, 0, BGFX_DISCARD_ALL);
+    bgfx_submit(scene_view_id(), s_sr.prog_grid, 0, BGFX_DISCARD_ALL);
 }
 
 /* ── Mesh cache + resolution ────────────────────────────────────────── */
-
-extern "C" JceMesh *jce_editor_model_load_file(const char *file_path);
 
 /* Convert "SM_PascalCase_Name" or "SKM_PascalCase_Name" to "pascalcase-name". */
 static void sm_to_kebab(const char *sm_name, char *out, int out_size)
@@ -680,43 +769,117 @@ static bool resolve_mesh_file_path(const char *mesh_path, char *out_path,
     return false;
 }
 
-/* Search for a mesh file matching mesh_path and load it.
- * mesh_path is like "Meshes/tree-scary-dead.obj".
- * Returns the loaded mesh, or NULL on failure. */
-static JceMesh *resolve_and_load_mesh(const char *mesh_path)
+static int find_mesh_cache_entry(const char *mesh_path)
 {
-    char found_path[512];
-    if (!resolve_mesh_file_path(mesh_path, found_path, sizeof(found_path))) {
-        LOG_WARN(LOG_TAG, "mesh not found: %s (under %s)",
-                 mesh_path ? mesh_path : "<null>", s_sr.scene_dir);
-        return NULL;
-    }
-    return jce_editor_model_load_file(found_path);
-}
+    if (!mesh_path || mesh_path[0] == '\0') return -1;
 
-/* Find or load a mesh by its scene-relative path. */
-static JceMesh *get_cached_mesh(const char *mesh_path)
-{
-    if (!mesh_path || mesh_path[0] == '\0') return NULL;
-
-    /* Check cache. */
     for (int i = 0; i < s_sr.mesh_cache_count; i++) {
         if (strcmp(s_sr.mesh_cache[i].path, mesh_path) == 0)
-            return s_sr.mesh_cache[i].mesh; /* may be NULL if load failed */
+            return i;
+    }
+    return -1;
+}
+
+static JceMesh *get_cached_mesh(const char *mesh_path, const float *world_pos)
+{
+    if (!mesh_path || mesh_path[0] == '\0')
+        return NULL;
+
+    int idx = find_mesh_cache_entry(mesh_path);
+    if (idx < 0) {
+        if (s_sr.mesh_cache_count >= 512)
+            return NULL;
+
+        idx = s_sr.mesh_cache_count++;
+        snprintf(s_sr.mesh_cache[idx].path,
+                 sizeof(s_sr.mesh_cache[idx].path), "%s", mesh_path);
+        s_sr.mesh_cache[idx].mesh = NULL;
+        s_sr.mesh_cache[idx].requested = false;
+        s_sr.mesh_cache[idx].failed = false;
+        s_sr.mesh_cache[idx].request_generation = 0;
     }
 
-    /* Not in cache — try to load. */
-    JceMesh *mesh = resolve_and_load_mesh(mesh_path);
+    if (s_sr.mesh_cache[idx].mesh)
+        return s_sr.mesh_cache[idx].mesh;
+    if (s_sr.mesh_cache[idx].failed)
+        return NULL;
 
-    /* Store in cache (even NULL to avoid re-trying). */
-    if (s_sr.mesh_cache_count < 512) {
-        snprintf(s_sr.mesh_cache[s_sr.mesh_cache_count].path,
-                 sizeof(s_sr.mesh_cache[0].path), "%s", mesh_path);
-        s_sr.mesh_cache[s_sr.mesh_cache_count].mesh = mesh;
-        s_sr.mesh_cache_count++;
+    uint64_t generation = mesh_async_current_generation();
+    if (s_sr.mesh_cache[idx].requested
+        && s_sr.mesh_cache[idx].request_generation == generation) {
+        return NULL;
     }
 
-    return mesh;
+    char found_path[512];
+    if (!resolve_mesh_file_path(mesh_path, found_path, sizeof(found_path))) {
+        s_sr.mesh_cache[idx].failed = true;
+        LOG_WARN(LOG_TAG, "mesh not found: %s (under %s)",
+                 mesh_path, s_sr.scene_dir);
+        return NULL;
+    }
+
+    s_sr.mesh_cache[idx].requested = true;
+    s_sr.mesh_cache[idx].request_generation = generation;
+    mesh_async_queue_request(mesh_path, found_path,
+                             mesh_request_priority(world_pos));
+    return NULL;
+}
+
+static void mesh_finalize_completed_loads(void)
+{
+    std::vector<MeshLoadResult> completed;
+    mesh_async_take_completed(&completed);
+    if (completed.empty())
+        return;
+
+    const uint64_t generation = mesh_async_current_generation();
+    uint32_t finalized = 0;
+    std::vector<MeshLoadResult> deferred;
+    deferred.reserve(completed.size());
+
+    for (MeshLoadResult &res : completed) {
+        if (res.generation != generation) {
+            jce_editor_model_free_cpu_data(&res.cpu);
+            continue;
+        }
+
+        int idx = find_mesh_cache_entry(res.mesh_path.c_str());
+        if (idx < 0) {
+            jce_editor_model_free_cpu_data(&res.cpu);
+            continue;
+        }
+
+        if (finalized >= MESH_FINALIZE_BUDGET_PER_FRAME) {
+            deferred.push_back(std::move(res));
+            continue;
+        }
+
+        s_sr.mesh_cache[idx].requested = false;
+
+        if (!res.success) {
+            s_sr.mesh_cache[idx].failed = true;
+            jce_editor_model_free_cpu_data(&res.cpu);
+            continue;
+        }
+
+        JceMesh *mesh = jce_mesh_create(res.cpu.vertices,
+                                        res.cpu.vertex_count,
+                                        res.cpu.indices,
+                                        res.cpu.index_count);
+        jce_editor_model_free_cpu_data(&res.cpu);
+
+        if (!mesh) {
+            s_sr.mesh_cache[idx].failed = true;
+            LOG_WARN(LOG_TAG, "mesh finalize failed: %s", res.mesh_path.c_str());
+            continue;
+        }
+
+        s_sr.mesh_cache[idx].mesh = mesh;
+        finalized++;
+    }
+
+    if (!deferred.empty())
+        mesh_async_push_back_completed(&deferred);
 }
 
 /* ── Texture cache for material diffuse textures ────────────────────── */
@@ -808,9 +971,25 @@ static bool find_file_by_name_recursive(const std::vector<fs::path> &roots,
     return false;
 }
 
-static bool try_load_texture_path(const fs::path &path, JceTexture *out_tex)
+static bool try_resolve_texture_path(const fs::path &path, fs::path *out_path)
 {
-    if (!out_tex || !path_is_file(path)) return false;
+    if (!out_path || !path_is_file(path)) return false;
+
+    *out_path = path;
+    return true;
+}
+
+static bool decode_texture_rgba_path(const fs::path &path,
+                                     std::vector<uint8_t> *out_rgba,
+                                     uint32_t *out_w,
+                                     uint32_t *out_h)
+{
+    if (!out_rgba || !out_w || !out_h || !path_is_file(path))
+        return false;
+
+    out_rgba->clear();
+    *out_w = 0;
+    *out_h = 0;
 
     SDL_IOStream *io = SDL_IOFromFile(path.string().c_str(), "rb");
     if (!io) return false;
@@ -823,14 +1002,29 @@ static bool try_load_texture_path(const fs::path &path, JceTexture *out_tex)
         SDL_DestroySurface(surf);
         surf = conv;
     }
-    if (!surf) return false;
+    if (!surf || surf->w <= 0 || surf->h <= 0 || !surf->pixels) {
+        if (surf) SDL_DestroySurface(surf);
+        return false;
+    }
 
-    JceTexture tex = jce_texture_load_from_surface(surf, JCE_TEX_WRAP);
+    *out_w = (uint32_t)surf->w;
+    *out_h = (uint32_t)surf->h;
+
+    const size_t row_bytes = (size_t)(*out_w) * 4;
+    const size_t total_bytes = row_bytes * (size_t)(*out_h);
+    out_rgba->resize(total_bytes);
+
+    const uint8_t *src = (const uint8_t *)surf->pixels;
+    uint8_t *dst = out_rgba->data();
+    for (uint32_t y = 0; y < *out_h; y++) {
+        memcpy(dst + (size_t)y * row_bytes,
+               src + (size_t)y * (size_t)surf->pitch,
+               row_bytes);
+    }
+
     SDL_DestroySurface(surf);
-    if (tex.idx == UINT16_MAX) return false;
-
-    *out_tex = tex;
-    LOG_DEBUG(LOG_TAG, "loaded texture: %s", path.string().c_str());
+    LOG_DEBUG(LOG_TAG, "decoded texture: %s (%ux%u)",
+              path.string().c_str(), *out_w, *out_h);
     return true;
 }
 
@@ -892,10 +1086,10 @@ static bool resolve_material_file_path(const char *material_path, fs::path *out_
     return false;
 }
 
-static bool try_load_texture_from_material_json(const char *material_path,
-                                                JceTexture *out_tex)
+static bool try_resolve_texture_from_material_json(const char *material_path,
+                                                   fs::path *out_path)
 {
-    if (!out_tex) return false;
+    if (!out_path) return false;
 
     fs::path mat_file;
     if (!resolve_material_file_path(material_path, &mat_file))
@@ -922,19 +1116,19 @@ static bool try_load_texture_from_material_json(const char *material_path,
     if (!tex_ref.empty()) {
         fs::path tex_path(tex_ref);
         if (tex_path.is_absolute()) {
-            loaded = try_load_texture_path(tex_path, out_tex);
+            loaded = try_resolve_texture_path(tex_path, out_path);
         } else {
             /* Priority: material dir -> parent of material dir -> scene roots -> filename search. */
-            loaded = try_load_texture_path(mat_file.parent_path() / tex_path, out_tex);
+            loaded = try_resolve_texture_path(mat_file.parent_path() / tex_path, out_path);
             if (!loaded) {
                 fs::path mat_parent = mat_file.parent_path().parent_path();
                 if (!mat_parent.empty())
-                    loaded = try_load_texture_path(mat_parent / tex_path, out_tex);
+                    loaded = try_resolve_texture_path(mat_parent / tex_path, out_path);
             }
             if (!loaded) {
                 std::vector<fs::path> roots = collect_scene_roots();
                 for (const fs::path &root_dir : roots) {
-                    if (try_load_texture_path(root_dir / tex_path, out_tex)) {
+                    if (try_resolve_texture_path(root_dir / tex_path, out_path)) {
                         loaded = true;
                         break;
                     }
@@ -944,7 +1138,7 @@ static bool try_load_texture_from_material_json(const char *material_path,
                 fs::path by_name;
                 std::vector<fs::path> roots = collect_scene_roots();
                 if (find_file_by_name_recursive(roots, tex_path.filename().string(), 8, &by_name))
-                    loaded = try_load_texture_path(by_name, out_tex);
+                    loaded = try_resolve_texture_path(by_name, out_path);
             }
         }
     }
@@ -953,9 +1147,9 @@ static bool try_load_texture_from_material_json(const char *material_path,
     return loaded;
 }
 
-static bool try_load_texture_from_obj_mtl(const char *mesh_path, JceTexture *out_tex)
+static bool try_resolve_texture_from_obj_mtl(const char *mesh_path, fs::path *out_path)
 {
-    if (!mesh_path || !out_tex) return false;
+    if (!mesh_path || !out_path) return false;
 
     char mesh_file[512];
     if (!resolve_mesh_file_path(mesh_path, mesh_file, sizeof(mesh_file)))
@@ -1009,13 +1203,13 @@ static bool try_load_texture_from_obj_mtl(const char *mesh_path, JceTexture *out
             if (tex_ref.empty()) continue;
 
             fs::path tex_path = mtl_path.parent_path() / fs::path(tex_ref);
-            if (try_load_texture_path(tex_path, out_tex))
+            if (try_resolve_texture_path(tex_path, out_path))
                 return true;
 
             fs::path by_name;
             std::vector<fs::path> roots = collect_scene_roots();
             if (find_file_by_name_recursive(roots, fs::path(tex_ref).filename().string(), 8, &by_name)) {
-                if (try_load_texture_path(by_name, out_tex))
+                if (try_resolve_texture_path(by_name, out_path))
                     return true;
             }
         }
@@ -1024,36 +1218,36 @@ static bool try_load_texture_from_obj_mtl(const char *mesh_path, JceTexture *out
     return false;
 }
 
-/* Try to load a texture from disk (not from PAK).
+/* Resolve a texture file path from material/mesh references.
  * Resolution chain (matching Java reference intent):
  *  1) material_path -> .mat/.mat.json -> properties.albedoMap
  *  2) mesh_path OBJ -> mtllib -> map_Kd
  *  3) scan Materials/ dir for .mat.json files with albedoMap
  *  4) recursive filename fallback by mesh/material basename */
-static JceTexture resolve_texture_for_material(const char *material_path,
-                                                const char *mesh_path)
+static bool resolve_texture_path_for_material(const char *material_path,
+                                              const char *mesh_path,
+                                              fs::path *out_path)
 {
-    if (s_sr.scene_dir[0] == '\0') return tex_invalid();
+    if (!out_path) return false;
+    if (s_sr.scene_dir[0] == '\0') return false;
 
     LOG_INFO(LOG_TAG, "resolve_texture: mat='%s' mesh='%s' scene_dir='%s'",
              material_path ? material_path : "<null>",
              mesh_path ? mesh_path : "<null>",
              s_sr.scene_dir);
 
-    JceTexture tex = tex_invalid();
-
     if (material_path && material_path[0] != '\0') {
-        if (try_load_texture_from_material_json(material_path, &tex)) {
-            LOG_INFO(LOG_TAG, "texture loaded via material JSON: %s", material_path);
-            return tex;
+        if (try_resolve_texture_from_material_json(material_path, out_path)) {
+            LOG_INFO(LOG_TAG, "texture resolved via material JSON: %s", material_path);
+            return true;
         }
         LOG_DEBUG(LOG_TAG, "  material JSON path failed for '%s'", material_path);
     }
 
     if (mesh_path && mesh_path[0] != '\0') {
-        if (try_load_texture_from_obj_mtl(mesh_path, &tex)) {
-            LOG_INFO(LOG_TAG, "texture loaded via OBJ/MTL: %s", mesh_path);
-            return tex;
+        if (try_resolve_texture_from_obj_mtl(mesh_path, out_path)) {
+            LOG_INFO(LOG_TAG, "texture resolved via OBJ/MTL: %s", mesh_path);
+            return true;
         }
         LOG_DEBUG(LOG_TAG, "  OBJ/MTL path failed for '%s'", mesh_path);
     }
@@ -1102,10 +1296,10 @@ static JceTexture resolve_texture_for_material(const char *material_path,
             });
 
         for (const std::string &mc : mat_candidates) {
-            if (try_load_texture_from_material_json(mc.c_str(), &tex)) {
-                LOG_INFO(LOG_TAG, "texture loaded via Materials/ scan: %s",
+            if (try_resolve_texture_from_material_json(mc.c_str(), out_path)) {
+                LOG_INFO(LOG_TAG, "texture resolved via Materials/ scan: %s",
                          mc.c_str());
-                return tex;
+                return true;
             }
         }
     }
@@ -1156,51 +1350,280 @@ static JceTexture resolve_texture_for_material(const char *material_path,
                 std::string stem = lower_copy(it->path().stem().string());
                 for (const std::string &base : base_names) {
                     if (stem == base || stem == base + "_diffuse" || stem.find(base) != std::string::npos) {
-                        if (try_load_texture_path(it->path(), &tex))
-                            return tex;
+                        if (try_resolve_texture_path(it->path(), out_path))
+                            return true;
                     }
                 }
             }
         }
     }
 
-    return tex_invalid();
+    return false;
 }
 
-/* Get or load a cached texture for a material/mesh pair. */
+static int find_texture_cache_entry(const char *key)
+{
+    if (!key || key[0] == '\0') return -1;
+
+    for (int i = 0; i < s_sr.tex_cache_count; i++) {
+        if (strcmp(s_sr.tex_cache[i].path, key) == 0)
+            return i;
+    }
+    return -1;
+}
+
+static void texture_async_worker_main(void)
+{
+    for (;;) {
+        TextureLoadRequest req;
+        {
+            std::unique_lock<std::mutex> lock(s_tex_async.mutex);
+            s_tex_async.cv.wait(lock, [] {
+                return s_tex_async.stop || !s_tex_async.pending.empty();
+            });
+
+            if (s_tex_async.stop && s_tex_async.pending.empty())
+                break;
+
+            if (s_tex_async.pending.empty())
+                continue;
+
+            req = std::move(s_tex_async.pending.back());
+            s_tex_async.pending.pop_back();
+        }
+
+        TextureLoadResult result = {};
+        result.key = req.key;
+        result.generation = req.generation;
+        result.success = decode_texture_rgba_path(req.file_path,
+                                                  &result.rgba,
+                                                  &result.width,
+                                                  &result.height);
+
+        std::lock_guard<std::mutex> lock(s_tex_async.mutex);
+        s_tex_async.completed.push_back(std::move(result));
+    }
+}
+
+static void texture_async_start(void)
+{
+    if (s_tex_async.running)
+        return;
+
+    s_tex_async.generation = 1;
+    s_tex_async.stop = false;
+    s_tex_async.pending.clear();
+    s_tex_async.completed.clear();
+
+    s_tex_async.worker = std::thread(texture_async_worker_main);
+    s_tex_async.running = true;
+}
+
+static void texture_async_stop(void)
+{
+    if (!s_tex_async.running)
+        return;
+
+    {
+        std::lock_guard<std::mutex> lock(s_tex_async.mutex);
+        s_tex_async.stop = true;
+    }
+    s_tex_async.cv.notify_all();
+
+    if (s_tex_async.worker.joinable())
+        s_tex_async.worker.join();
+
+    s_tex_async.pending.clear();
+    s_tex_async.completed.clear();
+    s_tex_async.running = false;
+}
+
+static void texture_async_begin_new_generation(void)
+{
+    std::lock_guard<std::mutex> lock(s_tex_async.mutex);
+    s_tex_async.generation++;
+    s_tex_async.pending.clear();
+    s_tex_async.completed.clear();
+}
+
+static uint64_t texture_async_current_generation(void)
+{
+    std::lock_guard<std::mutex> lock(s_tex_async.mutex);
+    return s_tex_async.generation;
+}
+
+static void texture_async_queue_request(const char *key, const fs::path &file_path)
+{
+    if (!s_tex_async.running || !key || key[0] == '\0' || file_path.empty())
+        return;
+
+    bool inserted = false;
+    {
+        std::lock_guard<std::mutex> lock(s_tex_async.mutex);
+        for (TextureLoadRequest &req : s_tex_async.pending) {
+            if (req.generation == s_tex_async.generation && req.key == key) {
+                inserted = true;
+                break;
+            }
+        }
+
+        if (!inserted) {
+            TextureLoadRequest req;
+            req.key = key;
+            req.file_path = file_path.string();
+            req.generation = s_tex_async.generation;
+            s_tex_async.pending.push_back(std::move(req));
+            inserted = true;
+        }
+    }
+
+    if (inserted)
+        s_tex_async.cv.notify_one();
+}
+
+static void texture_async_take_completed(std::vector<TextureLoadResult> *out)
+{
+    if (!out) return;
+
+    std::lock_guard<std::mutex> lock(s_tex_async.mutex);
+    out->swap(s_tex_async.completed);
+}
+
+static void texture_async_push_back_completed(std::vector<TextureLoadResult> *results)
+{
+    if (!results || results->empty()) return;
+
+    std::lock_guard<std::mutex> lock(s_tex_async.mutex);
+    for (TextureLoadResult &res : *results)
+        s_tex_async.completed.push_back(std::move(res));
+    results->clear();
+}
+
+static void texture_finalize_completed_loads(void)
+{
+    std::vector<TextureLoadResult> completed;
+    texture_async_take_completed(&completed);
+    if (completed.empty())
+        return;
+
+    const uint64_t generation = texture_async_current_generation();
+    uint32_t finalized = 0;
+    std::vector<TextureLoadResult> deferred;
+    deferred.reserve(completed.size());
+
+    for (TextureLoadResult &res : completed) {
+        if (res.generation != generation)
+            continue;
+
+        const int idx = find_texture_cache_entry(res.key.c_str());
+        if (idx < 0)
+            continue;
+
+        if (finalized >= TEX_FINALIZE_BUDGET_PER_FRAME) {
+            deferred.push_back(std::move(res));
+            continue;
+        }
+
+        s_sr.tex_cache[idx].requested = false;
+
+        if (!res.success || res.rgba.empty() || res.width == 0 || res.height == 0) {
+            s_sr.tex_cache[idx].failed = true;
+            continue;
+        }
+
+        SDL_Surface *surf = SDL_CreateSurface((int)res.width,
+                                              (int)res.height,
+                                              SDL_PIXELFORMAT_RGBA32);
+        if (!surf || !surf->pixels) {
+            if (surf) SDL_DestroySurface(surf);
+            s_sr.tex_cache[idx].failed = true;
+            LOG_WARN(LOG_TAG, "texture finalize failed (surface): %s",
+                     res.key.c_str());
+            continue;
+        }
+
+        const size_t row_bytes = (size_t)res.width * 4;
+        const uint8_t *src = res.rgba.data();
+        uint8_t *dst = (uint8_t *)surf->pixels;
+        for (uint32_t y = 0; y < res.height; y++) {
+            memcpy(dst + (size_t)y * (size_t)surf->pitch,
+                   src + (size_t)y * row_bytes,
+                   row_bytes);
+        }
+
+        JceTexture tex = jce_texture_load_from_surface(surf, JCE_TEX_WRAP);
+        SDL_DestroySurface(surf);
+
+        if (!jce_texture_valid(tex)) {
+            s_sr.tex_cache[idx].failed = true;
+            LOG_WARN(LOG_TAG, "texture finalize failed (upload): %s",
+                     res.key.c_str());
+            continue;
+        }
+
+        if (jce_texture_valid(s_sr.tex_cache[idx].tex))
+            jce_texture_destroy(s_sr.tex_cache[idx].tex);
+
+        s_sr.tex_cache[idx].tex = tex;
+        s_sr.tex_cache[idx].failed = false;
+        finalized++;
+    }
+
+    if (!deferred.empty())
+        texture_async_push_back_completed(&deferred);
+}
+
+/* Get or queue a cached texture for a material/mesh pair. */
 static JceTexture get_cached_texture(const char *material_path,
-                                      const char *mesh_path)
+                                     const char *mesh_path)
 {
     /* Build a cache key from material_path (or mesh_path if no material). */
     const char *key = (material_path && material_path[0] != '\0')
                     ? material_path : mesh_path;
     if (!key || key[0] == '\0') return tex_invalid();
 
-    for (int i = 0; i < s_sr.tex_cache_count; i++) {
-        if (strcmp(s_sr.tex_cache[i].path, key) == 0)
-            return s_sr.tex_cache[i].tex;
+    int idx = find_texture_cache_entry(key);
+    if (idx < 0) {
+        if (s_sr.tex_cache_count >= 256)
+            return tex_invalid();
+
+        idx = s_sr.tex_cache_count++;
+        snprintf(s_sr.tex_cache[idx].path,
+                 sizeof(s_sr.tex_cache[0].path), "%s", key);
+        s_sr.tex_cache[idx].tex = tex_invalid();
+        s_sr.tex_cache[idx].tried = false;
+        s_sr.tex_cache[idx].requested = false;
+        s_sr.tex_cache[idx].failed = false;
+        s_sr.tex_cache[idx].request_generation = 0;
     }
 
-    JceTexture tex = resolve_texture_for_material(material_path, mesh_path);
+    if (jce_texture_valid(s_sr.tex_cache[idx].tex))
+        return s_sr.tex_cache[idx].tex;
+    if (s_sr.tex_cache[idx].failed)
+        return tex_invalid();
 
-    if (tex.idx == UINT16_MAX) {
+    const uint64_t generation = texture_async_current_generation();
+    if (s_sr.tex_cache[idx].requested
+        && s_sr.tex_cache[idx].request_generation == generation) {
+        return tex_invalid();
+    }
+
+    fs::path resolved_path;
+    if (!resolve_texture_path_for_material(material_path, mesh_path, &resolved_path)) {
+        s_sr.tex_cache[idx].failed = true;
+        s_sr.tex_cache[idx].tried = true;
         LOG_WARN(LOG_TAG, "tex cache: MISS (no texture found) key='%s' mat='%s' mesh='%s'",
                  key, material_path ? material_path : "<null>",
                  mesh_path ? mesh_path : "<null>");
-    } else {
-        LOG_INFO(LOG_TAG, "tex cache: loaded texture key='%s' idx=%u",
-                key, (unsigned)tex.idx);
+        return tex_invalid();
     }
 
-    if (s_sr.tex_cache_count < 256) {
-        snprintf(s_sr.tex_cache[s_sr.tex_cache_count].path,
-                 sizeof(s_sr.tex_cache[0].path), "%s", key);
-        s_sr.tex_cache[s_sr.tex_cache_count].tex = tex;
-        s_sr.tex_cache[s_sr.tex_cache_count].tried = true;
-        s_sr.tex_cache_count++;
-    }
+    s_sr.tex_cache[idx].requested = true;
+    s_sr.tex_cache[idx].request_generation = generation;
+    s_sr.tex_cache[idx].tried = true;
 
-    return tex;
+    texture_async_queue_request(key, resolved_path);
+    return tex_invalid();
 }
 
 /* ── Entity Rendering (auto-detect components) ─────────────────────── */
@@ -1221,6 +1644,7 @@ static bool build_entity_model(JceEntityInfo *ent, jce_mat4 *out_model,
     bool has_mesh  = false;
     const char *mesh_path = NULL;
     const char *mat_path  = NULL;
+    int  mesh_shape = 0; /* JCE_MESH_SHAPE_CUBE */
 
     for (int c = 0; c < comp_count; c++) {
         switch (comps[c].type) {
@@ -1233,6 +1657,7 @@ static bool build_entity_model(JceEntityInfo *ent, jce_mat4 *out_model,
             has_mesh  = true;
             mesh_path = comps[c].data.mesh_renderer.mesh_path;
             mat_path  = comps[c].data.mesh_renderer.material_path;
+            mesh_shape = comps[c].data.mesh_renderer.mesh_shape;
             break;
         default: break;
         }
@@ -1261,12 +1686,24 @@ static bool build_entity_model(JceEntityInfo *ent, jce_mat4 *out_model,
 
     if (out_mesh) {
         *out_mesh = NULL;
-        if (has_mesh && mesh_path && mesh_path[0] != '\0') {
-            *out_mesh = get_cached_mesh(mesh_path);
-            if (!*out_mesh) *out_mesh = s_sr.cube_mesh;
-        } else {
-            *out_mesh = s_sr.cube_mesh;
+        if (has_mesh) {
+            if (mesh_path && mesh_path[0] != '\0') {
+                /* Queue background decode and return placeholder until ready. */
+                *out_mesh = get_cached_mesh(mesh_path, pos);
+            }
+            /* If no file mesh loaded, fall back to procedural shape. */
+            if (!*out_mesh) {
+                switch (mesh_shape) {
+                default: /* fall through */
+                case JCE_MESH_SHAPE_CUBE:     *out_mesh = s_sr.cube_mesh;     break;
+                case JCE_MESH_SHAPE_SPHERE:   *out_mesh = s_sr.sphere_mesh;   break;
+                case JCE_MESH_SHAPE_PLANE:    *out_mesh = s_sr.plane_mesh;    break;
+                case JCE_MESH_SHAPE_CAPSULE:  *out_mesh = s_sr.capsule_mesh;  break;
+                case JCE_MESH_SHAPE_CYLINDER: *out_mesh = s_sr.cylinder_mesh; break;
+                }
+            }
         }
+        /* has_mesh == false: entity has no MeshRenderer — no visual geometry. */
     }
 
     if (out_material_path)
@@ -1312,7 +1749,7 @@ static void draw_selection_outlines(void)
         bgfx_set_uniform(s_sr.u_light_color, flat_color,  1);
         bgfx_set_texture(0, su, s_sr.white_tex, UINT32_MAX);
 
-        jce_mesh_submit_wireframe_overlay(mesh, s_sr.renderer, SCENE_VIEW_ID);
+        jce_mesh_submit_wireframe_overlay(mesh, s_sr.renderer, scene_view_id());
     }
 
     /* Restore normal lighting. */
@@ -1320,13 +1757,176 @@ static void draw_selection_outlines(void)
     jce_lighting_apply(s_sr.renderer, &sun);
 }
 
+/* ── Shadow map pass ────────────────────────────────────────────────── */
+
+#define SHADOW_MAP_SIZE  2048
+#define SHADOW_ORTHO_SIZE 20.0f
+
+static void compute_shadow_vp(const jce_vec3 *light_dir, float shadow_vp[16])
+{
+    /* Build an orthographic "camera" looking along the light direction. */
+    jce_vec3 center = jce_v3(0.0f, 0.0f, 0.0f);
+    jce_vec3 ld = jce_v3_normalize(*light_dir);
+    jce_vec3 light_pos = jce_v3_scale(ld, 30.0f); /* push back from origin */
+
+    jce_vec3 up = (fabsf(ld.y) > 0.99f) ? jce_v3(0,0,1) : jce_v3(0,1,0);
+
+    /* Look-at view matrix: light position → center. */
+    jce_mat4 view = jce_m4_look_at(light_pos, center, up);
+
+    /* Orthographic projection enclosing the scene. */
+    const bgfx_caps_t *caps = bgfx_get_caps();
+    float S = SHADOW_ORTHO_SIZE;
+    jce_mat4 proj = jce_m4_ortho(-S, S, -S, S, 0.1f, 80.0f,
+                                  caps->homogeneousDepth);
+
+    jce_mat4 vp = jce_m4_multiply(&proj, &view);
+    memcpy(shadow_vp, vp.raw, 16 * sizeof(float));
+}
+
+static void draw_shadow_pass(void)
+{
+    if (!s_sr.shadow_valid) return;
+
+    JceShaderHandle shadow_sh = jce_renderer_get_program_shadow(s_sr.renderer);
+    if (shadow_sh.idx == UINT16_MAX) return;
+
+    JceDirLight sun = jce_dir_light_default();
+
+    /* Compute light-space view-projection. */
+    float shadow_vp[16];
+    compute_shadow_vp(&sun.direction, shadow_vp);
+
+    /* Configure shadow view. */
+    const uint16_t shadow_view = (uint16_t)JCE_VIEW_SHADOW_0;
+    bgfx_set_view_rect(shadow_view, 0, 0, SHADOW_MAP_SIZE, SHADOW_MAP_SIZE);
+    bgfx_set_view_frame_buffer(shadow_view, s_sr.shadow_fbo);
+    bgfx_set_view_clear(shadow_view,
+                        BGFX_CLEAR_DEPTH, 0, 1.0f, 0);
+
+    /* Set the VP matrix for the shadow view. */
+    float identity[16];
+    memset(identity, 0, sizeof(identity));
+    identity[0] = identity[5] = identity[10] = identity[15] = 1.0f;
+    bgfx_set_view_transform(shadow_view, identity, shadow_vp);
+
+    /* Store shadow VP for the PBR shader. */
+    bgfx_set_uniform(s_sr.u_shadowVP, shadow_vp, 1);
+
+    /* Submit all mesh entities to the shadow depth view. */
+    int count = jce_state_get_entity_count();
+    for (int i = 0; i < count; i++) {
+        JceEntityInfo *ent = jce_state_get_entity_by_index(i);
+        if (!ent || !ent->enabled) continue;
+
+        jce_mat4 model;
+        JceMesh *mesh = NULL;
+        const char *mat_path = NULL;
+        if (!build_entity_model(ent, &model, &mesh, &mat_path)) continue;
+        if (!mesh) continue;
+
+        bgfx_set_transform(model.raw[0], 1);
+        jce_mesh_submit_shadow(mesh, s_sr.renderer, shadow_view);
+    }
+}
+
 static void draw_entities(void)
 {
     int count = jce_state_get_entity_count();
     if (count == 0) return;
 
-    JceDirLight sun = jce_dir_light_default();
-    jce_lighting_apply(s_sr.renderer, &sun);
+    /* Render shadow depth pass before main scene. */
+    draw_shadow_pass();
+
+    /* ── Gather lights from entity components ─────────────────── */
+    if (s_sr.light_env) {
+        jce_light_env_clear(s_sr.light_env);
+        jce_light_env_set_ambient(s_sr.light_env,
+                                  jce_v3(1.0f, 1.0f, 1.0f), 0.15f);
+
+        bool has_any_light = false;
+        for (int i = 0; i < count; i++) {
+            JceEntityInfo *ent = jce_state_get_entity_by_index(i);
+            if (!ent || !ent->enabled) continue;
+
+            int comp_count = 0;
+            JceComponentInfo *comps = jce_state_get_entity_components(ent->id,
+                                                                      &comp_count);
+            for (int c = 0; c < comp_count; c++) {
+                if (comps[c].type != JCE_COMP_LIGHT) continue;
+
+                const auto &ld = comps[c].data.light;
+                jce_vec3 color = jce_v3(ld.color[0], ld.color[1], ld.color[2]);
+                float intensity = ld.intensity;
+
+                /* Get transform for light position/direction. */
+                JceComponentInfo *xf = NULL;
+                for (int t = 0; t < comp_count; t++) {
+                    if (comps[t].type == JCE_COMP_TRANSFORM) { xf = &comps[t]; break; }
+                }
+
+                if (ld.type == 0) {
+                    /* Directional light. */
+                    JceDirLightDesc dl;
+                    memset(&dl, 0, sizeof(dl));
+                    dl.color = color;
+                    dl.intensity = intensity > 0.0f ? intensity : 1.0f;
+                    if (xf) {
+                        /* Use negative Z as direction (forward). */
+                        float yaw_rad = xf->data.transform.rot[1] * JCE_DEG2RAD;
+                        float pitch_rad = xf->data.transform.rot[0] * JCE_DEG2RAD;
+                        dl.direction = jce_v3(
+                            -sinf(yaw_rad),
+                             sinf(pitch_rad),
+                            -cosf(yaw_rad));
+                    } else {
+                        dl.direction = jce_v3(0.5f, 1.0f, 0.3f);
+                    }
+                    jce_light_env_add_dir_light(s_sr.light_env, &dl);
+                    has_any_light = true;
+                } else if (ld.type == 1) {
+                    /* Point light. */
+                    JcePointLightDesc pl;
+                    memset(&pl, 0, sizeof(pl));
+                    pl.color = color;
+                    pl.intensity = intensity > 0.0f ? intensity : 1.0f;
+                    pl.radius = 10.0f;
+                    if (xf) {
+                        pl.position = jce_v3(xf->data.transform.pos[0],
+                                             xf->data.transform.pos[1],
+                                             xf->data.transform.pos[2]);
+                    }
+                    jce_light_env_add_point_light(s_sr.light_env, &pl);
+                    has_any_light = true;
+                }
+            }
+        }
+
+        /* Fallback: always ensure at least one directional light. */
+        if (!has_any_light) {
+            JceDirLightDesc dl;
+            memset(&dl, 0, sizeof(dl));
+            dl.direction = jce_v3(0.5f, 1.0f, 0.3f);
+            dl.color = jce_v3(1.0f, 1.0f, 1.0f);
+            dl.intensity = 1.0f;
+            jce_light_env_add_dir_light(s_sr.light_env, &dl);
+        }
+
+        /* Set camera position for PBR specular. */
+        jce_vec3 cam_pos = jce_camera_get_position(s_sr.camera);
+        jce_light_env_set_camera_pos(s_sr.light_env, cam_pos);
+
+        /* Upload all light uniforms. */
+        jce_light_env_apply(s_sr.light_env, s_sr.renderer);
+
+        /* Also set legacy u_lightDir / u_lightColor for the basic mesh shader. */
+        JceDirLight sun = jce_dir_light_default();
+        jce_lighting_apply(s_sr.renderer, &sun);
+    } else {
+        /* Fallback to legacy single-light. */
+        JceDirLight sun = jce_dir_light_default();
+        jce_lighting_apply(s_sr.renderer, &sun);
+    }
 
     /* Apply render mode. */
     JceSceneViewMode view_mode = jce_state_get_view_mode();
@@ -1346,19 +1946,94 @@ static void draw_entities(void)
         bgfx_set_transform(model.raw[0], 1);
 
         if (view_mode != JCE_VIEW_WIREFRAME) {
-            /* Both SHADED and TEXTURED use program_mesh which samples s_texColor.
-             * SHADED → always bind 1×1 white fallback (lit shading only).
-             * TEXTURED → bind actual texture if found, white fallback otherwise. */
+            /* Find the mesh renderer component for PBR data. */
+            int cc = 0;
+            JceComponentInfo *cs = jce_state_get_entity_components(ent->id, &cc);
+            JceComponentInfo *mr_comp = NULL;
+            for (int c = 0; c < cc; c++) {
+                if (cs[c].type == JCE_COMP_MESH_RENDERER) {
+                    mr_comp = &cs[c];
+                    break;
+                }
+            }
+
+            /* Check if entity has explicit PBR texture data configured. */
+            bool has_pbr_textures = mr_comp
+                && (mr_comp->data.mesh_renderer.albedo_tex[0]
+                    || mr_comp->data.mesh_renderer.mr_tex[0]
+                    || mr_comp->data.mesh_renderer.normal_tex[0]
+                    || mr_comp->data.mesh_renderer.ao_tex[0]
+                    || mr_comp->data.mesh_renderer.emissive_tex[0]);
+
+            if (view_mode == JCE_VIEW_TEXTURED && has_pbr_textures) {
+                /* Build a JcePbrMaterial from the component's inline PBR data. */
+                JcePbrMaterial pbr = jce_pbr_material_default();
+                /* Only override base_color if it looks explicitly set (alpha > 0). */
+                if (mr_comp->data.mesh_renderer.base_color[3] > 0.0f) {
+                    pbr.base_color_factor[0] = mr_comp->data.mesh_renderer.base_color[0];
+                    pbr.base_color_factor[1] = mr_comp->data.mesh_renderer.base_color[1];
+                    pbr.base_color_factor[2] = mr_comp->data.mesh_renderer.base_color[2];
+                    pbr.base_color_factor[3] = mr_comp->data.mesh_renderer.base_color[3];
+                }
+                pbr.metallic_factor      = mr_comp->data.mesh_renderer.metallic;
+                pbr.roughness_factor     = mr_comp->data.mesh_renderer.roughness;
+                pbr.emissive_factor[0]   = mr_comp->data.mesh_renderer.emissive[0];
+                pbr.emissive_factor[1]   = mr_comp->data.mesh_renderer.emissive[1];
+                pbr.emissive_factor[2]   = mr_comp->data.mesh_renderer.emissive[2];
+                pbr.normal_scale         = mr_comp->data.mesh_renderer.normal_scale;
+                pbr.ao_strength          = mr_comp->data.mesh_renderer.ao_strength;
+                pbr.alpha_mode           = (JceAlphaMode)mr_comp->data.mesh_renderer.alpha_mode;
+                pbr.alpha_cutoff         = mr_comp->data.mesh_renderer.alpha_cutoff;
+                pbr.double_sided         = mr_comp->data.mesh_renderer.double_sided;
+
+                /* Try to load cached textures for each PBR slot. */
+                if (mr_comp->data.mesh_renderer.albedo_tex[0]) {
+                    JceTexture t = get_cached_texture(mr_comp->data.mesh_renderer.albedo_tex, NULL);
+                    if (jce_texture_valid(t)) pbr.albedo_map = t;
+                }
+                /* Fallback: use legacy mat_path/mesh_path texture search for albedo. */
+                if (!jce_texture_valid(pbr.albedo_map)) {
+                    const char *mp = mr_comp->data.mesh_renderer.mesh_path;
+                    JceTexture t = get_cached_texture(mat_path, mp);
+                    if (jce_texture_valid(t)) pbr.albedo_map = t;
+                }
+                if (mr_comp->data.mesh_renderer.mr_tex[0]) {
+                    JceTexture t = get_cached_texture(mr_comp->data.mesh_renderer.mr_tex, NULL);
+                    if (jce_texture_valid(t)) pbr.metallic_roughness_map = t;
+                }
+                if (mr_comp->data.mesh_renderer.normal_tex[0]) {
+                    JceTexture t = get_cached_texture(mr_comp->data.mesh_renderer.normal_tex, NULL);
+                    if (jce_texture_valid(t)) pbr.normal_map = t;
+                }
+                if (mr_comp->data.mesh_renderer.ao_tex[0]) {
+                    JceTexture t = get_cached_texture(mr_comp->data.mesh_renderer.ao_tex, NULL);
+                    if (jce_texture_valid(t)) pbr.ao_map = t;
+                }
+                if (mr_comp->data.mesh_renderer.emissive_tex[0]) {
+                    JceTexture t = get_cached_texture(mr_comp->data.mesh_renderer.emissive_tex, NULL);
+                    if (jce_texture_valid(t)) pbr.emissive_map = t;
+                }
+
+                jce_pbr_material_bind(&pbr, s_sr.renderer, scene_view_id());
+
+                /* Bind shadow map to texture stage 5 for PBR shader. */
+                if (s_sr.shadow_valid) {
+                    bgfx_set_texture(5, s_sr.u_shadowMap, s_sr.shadow_tex, UINT32_MAX);
+                    float shadow_vp[16];
+                    jce_vec3 shadow_dir = jce_v3(0.5f, 1.0f, 0.3f); /* default */
+                    compute_shadow_vp(&shadow_dir, shadow_vp);
+                    bgfx_set_uniform(s_sr.u_shadowVP, shadow_vp, 1);
+                }
+
+                jce_mesh_submit_pbr(mesh, s_sr.renderer, scene_view_id());
+                continue; /* skip the default submit below */
+            }
+
+            /* SHADED or TEXTURED fallback: use basic mesh program with single texture. */
             bgfx_texture_handle_t bind_tex = s_sr.white_tex;
 
             if (view_mode == JCE_VIEW_TEXTURED) {
-                /* Try to find an actual diffuse texture for this entity. */
-                const char *mp = NULL;
-                int cc = 0;
-                JceComponentInfo *cs = jce_state_get_entity_components(ent->id, &cc);
-                for (int c = 0; c < cc; c++)
-                    if (cs[c].type == JCE_COMP_MESH_RENDERER)
-                        { mp = cs[c].data.mesh_renderer.mesh_path; break; }
+                const char *mp = mr_comp ? mr_comp->data.mesh_renderer.mesh_path : NULL;
 
                 JceTexture tex = get_cached_texture(mat_path, mp);
                 if (tex.idx != UINT16_MAX) {
@@ -1396,7 +2071,7 @@ static void draw_entities(void)
             bgfx_set_texture(0, su, bind_tex, UINT32_MAX);
         }
 
-        jce_mesh_submit(mesh, s_sr.renderer, SCENE_VIEW_ID);
+        jce_mesh_submit(mesh, s_sr.renderer, scene_view_id());
     }
 
     if (view_mode == JCE_VIEW_WIREFRAME)
@@ -1413,11 +2088,19 @@ bool jce_editor_scene_render_init(JceRenderer *renderer, const PakArchive *pak)
     if (s_sr.initialized) return true;
 
     memset(&s_sr, 0, sizeof(s_sr));
-    s_sr.fbo.idx = UINT16_MAX;
-    s_sr.fbo_color.idx = UINT16_MAX;
+    mesh_async_start();
+    texture_async_start();
     s_sr.white_tex.idx = UINT16_MAX;
     s_sr.checker_tex.idx = UINT16_MAX;
     s_sr.renderer = renderer;
+    s_sr.bridge = jce_editor_render_bridge_create(renderer,
+                                                  (uint16_t)JCE_VIEW_EDITOR_SCENE);
+    if (!s_sr.bridge) {
+        LOG_WARN(LOG_TAG, "failed to create editor render bridge");
+        mesh_async_stop();
+        texture_async_stop();
+        return false;
+    }
 
     /* Create the editor orbit camera. */
     JceCameraDesc cam_desc;
@@ -1433,6 +2116,12 @@ bool jce_editor_scene_render_init(JceRenderer *renderer, const PakArchive *pak)
     s_sr.camera = jce_camera_create(&cam_desc);
     if (!s_sr.camera) {
         LOG_WARN(LOG_TAG, "failed to create editor camera");
+        if (s_sr.bridge) {
+            jce_editor_render_bridge_destroy(s_sr.bridge);
+            s_sr.bridge = NULL;
+        }
+        mesh_async_stop();
+        texture_async_stop();
         return false;
     }
 
@@ -1456,11 +2145,15 @@ bool jce_editor_scene_render_init(JceRenderer *renderer, const PakArchive *pak)
     JceShaderHandle sh = jce_renderer_get_program_color(renderer);
     s_sr.prog_color.idx = sh.idx;
 
-    /* Load sky shader program from the PAK archive. */
+    /* Load sky/grid shader programs from the PAK archive. */
     JceShaderHandle sky_sh = shader_load_program(pak, "sky");
     s_sr.prog_sky.idx = sky_sh.idx;
     if (sky_sh.idx == UINT16_MAX)
         LOG_WARN(LOG_TAG, "sky shader not found in PAK — sky will be skipped");
+    JceShaderHandle grid_sh = shader_load_program(pak, "grid");
+    s_sr.prog_grid.idx = grid_sh.idx;
+    if (grid_sh.idx == UINT16_MAX)
+        LOG_WARN(LOG_TAG, "grid shader not found in PAK — grid will be skipped");
 
     /* Position-only vertex layout for the fullscreen sky quad. */
     bgfx_vertex_layout_begin(&s_sr.sky_layout, bgfx_get_renderer_type());
@@ -1468,9 +2161,13 @@ bool jce_editor_scene_render_init(JceRenderer *renderer, const PakArchive *pak)
                            BGFX_ATTRIB_TYPE_FLOAT, false, false);
     bgfx_vertex_layout_end(&s_sr.sky_layout);
 
-    /* Uniform for sky gradient colors (top / horizon / ground). */
+    /* Uniforms for sky gradient and fullscreen grid. */
     s_sr.u_sky_colors = bgfx_create_uniform("u_sky_colors",
                                              BGFX_UNIFORM_TYPE_VEC4, 3);
+    s_sr.u_grid_camera = bgfx_create_uniform("u_grid_camera",
+                                             BGFX_UNIFORM_TYPE_VEC4, 1);
+    s_sr.u_grid_fade = bgfx_create_uniform("u_grid_fade",
+                                           BGFX_UNIFORM_TYPE_VEC4, 1);
 
     /* Cache lighting uniform handles for flat-color selection outlines.
      * bgfx_create_uniform with the same name returns a reference to the
@@ -1481,8 +2178,11 @@ bool jce_editor_scene_render_init(JceRenderer *renderer, const PakArchive *pak)
                                               BGFX_UNIFORM_TYPE_VEC4, 1);
 
     /* Procedural meshes. */
-    s_sr.cube_mesh  = jce_mesh_create_cube(1.0f);
-    s_sr.plane_mesh = jce_mesh_create_plane(10.0f, 10.0f, 0);
+    s_sr.cube_mesh     = jce_mesh_create_cube(1.0f);
+    s_sr.plane_mesh    = jce_mesh_create_plane(1.0f, 1.0f, 0);
+    s_sr.sphere_mesh   = jce_mesh_create_sphere(0.5f);
+    s_sr.capsule_mesh  = jce_mesh_create_capsule(0.25f, 1.0f);
+    s_sr.cylinder_mesh = jce_mesh_create_cylinder(0.5f, 1.0f);
 
     /* 1×1 white fallback texture for SHADED mode. */
     {
@@ -1507,6 +2207,32 @@ bool jce_editor_scene_render_init(JceRenderer *renderer, const PakArchive *pak)
                                                     cmem);
     }
 
+    /* ── Shadow map resources ──────────────────────────────────────── */
+    {
+        const uint16_t SHADOW_SIZE = 2048;
+        s_sr.shadow_tex = bgfx_create_texture_2d(
+            SHADOW_SIZE, SHADOW_SIZE, false, 1,
+            BGFX_TEXTURE_FORMAT_D16,
+            BGFX_TEXTURE_RT | BGFX_SAMPLER_COMPARE_LEQUAL
+            | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
+            NULL);
+        bgfx_attachment_t at;
+        memset(&at, 0, sizeof(at));
+        bgfx_attachment_init(&at, s_sr.shadow_tex, BGFX_ACCESS_WRITE,
+                             0, 1, 0, BGFX_RESOLVE_AUTO_GEN_MIPS);
+        s_sr.shadow_fbo = bgfx_create_frame_buffer_from_attachment(1, &at, false);
+        s_sr.u_shadowMap = bgfx_create_uniform("s_shadowMap",
+                                                BGFX_UNIFORM_TYPE_SAMPLER, 1);
+        s_sr.u_shadowVP  = bgfx_create_uniform("u_shadowVP",
+                                                BGFX_UNIFORM_TYPE_MAT4, 1);
+        s_sr.shadow_valid = BGFX_HANDLE_IS_VALID(s_sr.shadow_fbo);
+        if (s_sr.shadow_valid)
+            LOG_INFO(LOG_TAG, "shadow map created (%dx%d)", SHADOW_SIZE, SHADOW_SIZE);
+    }
+
+    /* ── Multi-light environment ──────────────────────────────────── */
+    s_sr.light_env = jce_light_env_create();
+
     s_sr.initialized = true;
     LOG_INFO(LOG_TAG, "editor scene renderer initialized (FBO pipeline)");
     return true;
@@ -1516,7 +2242,13 @@ void jce_editor_scene_render_shutdown(void)
 {
     if (!s_sr.initialized) return;
 
-    destroy_fbo();
+    mesh_async_stop();
+    texture_async_stop();
+
+    if (s_sr.bridge) {
+        jce_editor_render_bridge_destroy(s_sr.bridge);
+        s_sr.bridge = NULL;
+    }
 
     /* Free cached meshes. */
     for (int i = 0; i < s_sr.mesh_cache_count; i++) {
@@ -1533,8 +2265,11 @@ void jce_editor_scene_render_shutdown(void)
     s_sr.tex_cache_count = 0;
 
     if (s_sr.camera)     { jce_camera_destroy(s_sr.camera);   s_sr.camera = NULL; }
-    if (s_sr.cube_mesh)  { jce_mesh_destroy(s_sr.cube_mesh);  s_sr.cube_mesh = NULL; }
-    if (s_sr.plane_mesh) { jce_mesh_destroy(s_sr.plane_mesh); s_sr.plane_mesh = NULL; }
+    if (s_sr.cube_mesh)     { jce_mesh_destroy(s_sr.cube_mesh);     s_sr.cube_mesh = NULL; }
+    if (s_sr.plane_mesh)    { jce_mesh_destroy(s_sr.plane_mesh);    s_sr.plane_mesh = NULL; }
+    if (s_sr.sphere_mesh)   { jce_mesh_destroy(s_sr.sphere_mesh);   s_sr.sphere_mesh = NULL; }
+    if (s_sr.capsule_mesh)  { jce_mesh_destroy(s_sr.capsule_mesh);  s_sr.capsule_mesh = NULL; }
+    if (s_sr.cylinder_mesh) { jce_mesh_destroy(s_sr.cylinder_mesh); s_sr.cylinder_mesh = NULL; }
 
     /* Destroy white fallback texture. */
     if (BGFX_HANDLE_IS_VALID(s_sr.white_tex))
@@ -1542,11 +2277,31 @@ void jce_editor_scene_render_shutdown(void)
     if (BGFX_HANDLE_IS_VALID(s_sr.checker_tex))
         bgfx_destroy_texture(s_sr.checker_tex);
 
-    /* Destroy sky shader resources owned by the scene renderer. */
+    /* Destroy sky/grid shader resources owned by the scene renderer. */
     if (BGFX_HANDLE_IS_VALID(s_sr.prog_sky))
         bgfx_destroy_program(s_sr.prog_sky);
+    if (BGFX_HANDLE_IS_VALID(s_sr.prog_grid))
+        bgfx_destroy_program(s_sr.prog_grid);
     if (BGFX_HANDLE_IS_VALID(s_sr.u_sky_colors))
         bgfx_destroy_uniform(s_sr.u_sky_colors);
+    if (BGFX_HANDLE_IS_VALID(s_sr.u_grid_camera))
+        bgfx_destroy_uniform(s_sr.u_grid_camera);
+    if (BGFX_HANDLE_IS_VALID(s_sr.u_grid_fade))
+        bgfx_destroy_uniform(s_sr.u_grid_fade);
+
+    /* Destroy shadow map resources. */
+    if (BGFX_HANDLE_IS_VALID(s_sr.shadow_fbo))
+        bgfx_destroy_frame_buffer(s_sr.shadow_fbo);
+    if (BGFX_HANDLE_IS_VALID(s_sr.u_shadowMap))
+        bgfx_destroy_uniform(s_sr.u_shadowMap);
+    if (BGFX_HANDLE_IS_VALID(s_sr.u_shadowVP))
+        bgfx_destroy_uniform(s_sr.u_shadowVP);
+
+    /* Destroy multi-light environment. */
+    if (s_sr.light_env) {
+        jce_light_env_destroy(s_sr.light_env);
+        s_sr.light_env = NULL;
+    }
 
     s_sr.initialized = false;
     LOG_INFO(LOG_TAG, "editor scene renderer shutdown");
@@ -1557,9 +2312,6 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     if (!s_sr.initialized || !s_sr.renderer) return;
     if (width == 0 || height == 0) return;
 
-    /* Ensure FBO matches the requested size. */
-    if (!ensure_fbo(width, height)) return;
-
     /* Configure the scene view to render into the FBO. */
     const bgfx_caps_t *caps = bgfx_get_caps();
     float aspect = (float)width / (float)height;
@@ -1569,26 +2321,24 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
 
     JceSceneViewMode view_mode = jce_state_get_view_mode();
 
-    bgfx_set_view_name(SCENE_VIEW_ID, "EditorScene", INT32_MAX);
-    bgfx_set_view_rect(SCENE_VIEW_ID, 0, 0, (uint16_t)width, (uint16_t)height);
+    uint32_t clear_color = (view_mode == JCE_VIEW_WIREFRAME)
+        ? 0x373737FF
+        : BG_COLOR_RGBA;
 
-    /* In wireframe mode, use a gray clear color (matching Java reference:
-     * groundColor rgb(55, 55, 55) ≈ #373737) and skip the sky gradient.
-     * In shaded/textured modes, use the sky-blue clear color + gradient. */
-    if (view_mode == JCE_VIEW_WIREFRAME) {
-        bgfx_set_view_clear(SCENE_VIEW_ID,
-                            BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH,
-                            0x373737FF, 1.0f, 0);
-    } else {
-        bgfx_set_view_clear(SCENE_VIEW_ID,
-                            BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH,
-                            BG_COLOR_RGBA, 1.0f, 0);
+    if (!jce_editor_render_bridge_prepare(
+            s_sr.bridge,
+            width,
+            height,
+            view.raw[0],
+            proj.raw[0],
+            clear_color,
+            "EditorScene")) {
+        return;
     }
 
-    bgfx_set_view_transform(SCENE_VIEW_ID, view.raw[0], proj.raw[0]);
-    bgfx_set_view_frame_buffer(SCENE_VIEW_ID, s_sr.fbo);
-    bgfx_set_view_mode(SCENE_VIEW_ID, BGFX_VIEW_MODE_SEQUENTIAL);
-    bgfx_touch(SCENE_VIEW_ID);
+    /* Main-thread GPU finalize for background-decoded meshes. */
+    mesh_finalize_completed_loads();
+    texture_finalize_completed_loads();
 
     /* Draw sky gradient (behind everything) — skip in wireframe mode. */
     if (view_mode != JCE_VIEW_WIREFRAME)
@@ -1605,9 +2355,9 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
 
 uint16_t jce_editor_scene_render_get_texture(void)
 {
-    if (!s_sr.initialized || !BGFX_HANDLE_IS_VALID(s_sr.fbo))
+    if (!s_sr.initialized || !s_sr.bridge)
         return UINT16_MAX;
-    return s_sr.fbo_color.idx;
+    return jce_editor_render_bridge_get_color_texture(s_sr.bridge);
 }
 
 JceCamera *jce_editor_scene_get_camera(void)
@@ -1738,6 +2488,9 @@ void jce_editor_scene_camera_reset(void)
 
 void jce_editor_scene_set_scene_dir(const char *dir)
 {
+    mesh_async_begin_new_generation();
+    texture_async_begin_new_generation();
+
     if (dir)
         snprintf(s_sr.scene_dir, sizeof(s_sr.scene_dir), "%s", dir);
     else

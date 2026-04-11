@@ -5,8 +5,9 @@
  * Each entity is stored with its name and all known components
  * (transform, mesh renderer, camera, light, etc.).
  *
- * The format is human-readable and diff-friendly, making it
- * suitable for version control integration.
+ * The format uses a contract envelope (`contract` + `scene`) and remains
+ * human-readable/diff-friendly for version control integration.
+ * Legacy root-level scene payloads are accepted on load for compatibility.
  *
  * Layer: Resource (Layer 3).
  */

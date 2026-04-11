@@ -21,6 +21,7 @@
 #include <jce/app/jce_config.h>
 #include "core/jce_gpu_caps.h"
 #include <jce/platform/jce_window.h>
+#include <jce/platform/jce_single_instance.h>
 #include <jce/platform/jce_input.h>
 #include <jce/audio/jce_audio.h>
 #include <jce/graphics/jce_renderer.h>
@@ -109,7 +110,27 @@ struct JceEngine {
     /* L1/L2 infrastructure (Phase 0) */
     jce_event_bus_t            *event_bus;
     jce_subsystem_registry_t   *subsystems;
+
+    /* Optional KPI logging for Phase 0 baselines. */
+    FILE                       *kpi_asset_log;
+    uint64_t                    kpi_asset_frame_index;
+    uint32_t                    kpi_asset_frame_limit;
 };
+
+static uint32_t read_positive_u32_env(const char *env_name, uint32_t fallback)
+{
+    const char *value = SDL_getenv(env_name);
+    if (!value || !value[0]) {
+        return fallback;
+    }
+
+    const int parsed = SDL_atoi(value);
+    if (parsed <= 0) {
+        return fallback;
+    }
+
+    return (uint32_t)parsed;
+}
 
 /* -- Fatal error dialog (all platforms) ----------------------------- */
 
@@ -157,10 +178,26 @@ JceEngine *jce_engine_create(int argc, char *argv[])
     jce_log_set_level((JceLogLevel)e->config.log_level);
     jce_log_set_colors(e->config.log_colors);
 
+    if (g_app_desc_set && g_app_desc.name && g_app_desc.name[0])
+        SDL_strlcpy(e->config.window_title, g_app_desc.name,
+                     sizeof(e->config.window_title));
+
     SDL_SetAppMetadata("JCE", "0.1.0", "com.jce");
 
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         fatal_msg("SDL_Init failed: %s", SDL_GetError());
+        JCE_FREE(e);
+        return NULL;
+    }
+
+    if (!jce_single_instance_lock(e->config.window_title)) {
+        char msg[256];
+        const char *title = (e->config.window_title[0] != '\0')
+            ? e->config.window_title
+            : "JCE";
+        snprintf(msg, sizeof(msg), "%s is already running.", title);
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, title, msg, NULL);
+        SDL_Quit();
         JCE_FREE(e);
         return NULL;
     }
@@ -213,11 +250,6 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         JCE_FREE(e);
         return NULL;
     }
-
-    /* Override window title from app descriptor if set. */
-    if (g_app_desc_set && g_app_desc.name && g_app_desc.name[0])
-        SDL_strlcpy(e->config.window_title, g_app_desc.name,
-                     sizeof(e->config.window_title));
 
     /* Override window dimensions from app descriptor if set. */
     if (g_app_desc_set && g_app_desc.window_width)
@@ -308,6 +340,21 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         e->assets = jce_asset_manager_create(&acfg);
         if (!e->assets)
             LOG_WARN(LOG_TAG, "asset manager init failed — direct loading only");
+    }
+
+    {
+        const char *asset_kpi_path = SDL_getenv("JCE_KPI_ASSET_LOG");
+        if (asset_kpi_path && asset_kpi_path[0]) {
+            e->kpi_asset_log = fopen(asset_kpi_path, "w");
+            if (e->kpi_asset_log) {
+                e->kpi_asset_frame_limit = read_positive_u32_env("JCE_KPI_ASSET_FRAME_COUNT", 0u);
+                fprintf(e->kpi_asset_log, "frame_index,asset_update_ms\n");
+                fflush(e->kpi_asset_log);
+                LOG_INFO(LOG_TAG, "asset KPI capture enabled -> %s", asset_kpi_path);
+            } else {
+                LOG_WARN(LOG_TAG, "failed to open asset KPI log: %s", asset_kpi_path);
+            }
+        }
     }
 
     /* -- Build services struct ------------------------------------ */
@@ -401,9 +448,32 @@ SDL_AppResult jce_engine_iterate(JceEngine *e)
 
     /* Finalize async asset loads (GPU resource creation). */
     if (e->assets) {
+        uint64_t asset_t0 = 0;
+        if (e->kpi_asset_log &&
+            (e->kpi_asset_frame_limit == 0u ||
+             e->kpi_asset_frame_index < e->kpi_asset_frame_limit)) {
+            asset_t0 = SDL_GetPerformanceCounter();
+        }
+
         JCE_PROFILE_ZONE_N("AssetManager::Update");
         jce_asset_manager_update(e->assets, 3.0f);
         JCE_PROFILE_ZONE_END;
+
+        if (asset_t0 != 0) {
+            const uint64_t asset_t1 = SDL_GetPerformanceCounter();
+            const uint64_t freq = SDL_GetPerformanceFrequency();
+            if (freq > 0) {
+                const double asset_ms =
+                    (double)(asset_t1 - asset_t0) * 1000.0 / (double)freq;
+                fprintf(e->kpi_asset_log, "%llu,%.3f\n",
+                        (unsigned long long)e->kpi_asset_frame_index,
+                        asset_ms);
+                e->kpi_asset_frame_index++;
+                if ((e->kpi_asset_frame_index % 60u) == 0u) {
+                    fflush(e->kpi_asset_log);
+                }
+            }
+        }
     }
 
     /* Tick registered subsystems. */
@@ -451,12 +521,19 @@ void jce_engine_destroy(JceEngine *e)
 
     if (e->event_bus) jce_event_bus_destroy(e->event_bus);
 
+    if (e->kpi_asset_log) {
+        fflush(e->kpi_asset_log);
+        fclose(e->kpi_asset_log);
+        e->kpi_asset_log = NULL;
+    }
+
     if (e->assets)   jce_asset_manager_destroy(e->assets);
     if (e->renderer) jce_renderer_destroy(e->renderer);
     if (e->audio)    jce_audio_destroy(e->audio);
     if (e->pak)      pak_close(e->pak);
     if (e->input)    jce_input_destroy(e->input);
     if (e->window)   jce_window_destroy(e->window);
+    jce_single_instance_unlock();
     JCE_FREE(e);
 
     /* Flush and shut down the async log backend (last, so all

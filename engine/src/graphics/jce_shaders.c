@@ -101,6 +101,13 @@ JceShaderHandle shader_load_program(const PakArchive *pak, const char *name)
     return load_program_named(pak, name, name);
 }
 
+JceShaderHandle shader_load_program_named(const PakArchive *pak,
+                                          const char *vs_base,
+                                          const char *fs_base)
+{
+    return load_program_named(pak, vs_base, fs_base);
+}
+
 JceShaderSet jce_shaders_load_all(const PakArchive *pak)
 {
     JceShaderSet set;

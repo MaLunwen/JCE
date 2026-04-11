@@ -76,6 +76,7 @@ typedef enum {
 #define JCE_MAX_SELECTED       512
 #define JCE_MAX_ENTITY_NAME    128
 #define JCE_MAX_TAG_STRING     64
+#define JCE_MAX_PREFAB_PATH    260
 #define JCE_MAX_ENTITIES       4096
 #define JCE_MAX_COMPONENTS     32
 
@@ -98,12 +99,24 @@ typedef struct {
     uint32_t    parent_id;                    /* 0 = root */
     uint32_t    children[JCE_MAX_CHILDREN];   /* child entity ids */
     int         child_count;
+    bool        prefab_instance;
+    char        prefab_path[JCE_MAX_PREFAB_PATH];
 
     /* Per-entity component storage (parsed from scene JSON). */
     int         component_count;
 } JceEntityInfo;
 
 /* ── Component Data (for inspector display) ────────────────────────── */
+
+/* Procedural mesh shape for MeshRenderer when no mesh_path is set. */
+enum {
+    JCE_MESH_SHAPE_CUBE     = 0,
+    JCE_MESH_SHAPE_SPHERE   = 1,
+    JCE_MESH_SHAPE_PLANE    = 2,
+    JCE_MESH_SHAPE_CAPSULE  = 3,
+    JCE_MESH_SHAPE_CYLINDER = 4,
+    JCE_MESH_SHAPE_COUNT
+};
 
 typedef enum {
     JCE_COMP_TRANSFORM = 0,
@@ -128,9 +141,95 @@ struct JceComponentInfo {
     /* Component-specific data (union for common types). */
     union {
         struct { float pos[3]; float rot[3]; float scale[3]; } transform;
-        struct { char mesh_path[128]; char material_path[128]; } mesh_renderer;
+
+        struct {
+            char  mesh_path[128];
+            char  material_path[128];
+            int   mesh_shape;         /* JCE_MESH_SHAPE_* (default 0=cube) */
+            /* PBR material parameters (inline editing). */
+            float base_color[4];      /* RGBA linear */
+            float metallic;           /* 0..1 */
+            float roughness;          /* 0..1 */
+            float emissive[3];        /* RGB */
+            float normal_scale;       /* default 1.0 */
+            float ao_strength;        /* 0..1 */
+            int   alpha_mode;         /* 0=OPAQUE, 1=MASK, 2=BLEND */
+            float alpha_cutoff;       /* default 0.5 */
+            bool  double_sided;
+            char  albedo_tex[128];
+            char  mr_tex[128];        /* metallic-roughness map */
+            char  normal_tex[128];
+            char  ao_tex[128];
+            char  emissive_tex[128];
+        } mesh_renderer;
+
         struct { float color[4]; float intensity; int type; } light;
         struct { float fov; float near_clip; float far_clip; bool ortho; } camera;
+
+        struct {
+            char  sprite_path[128];
+            float color[4];
+            bool  flip_x;
+            bool  flip_y;
+            int   sorting_order;
+        } sprite_renderer;
+
+        struct {
+            char  clip_name[64];
+            float speed;
+            bool  loop;
+            bool  playing;
+        } animator;
+
+        struct {
+            char  skeleton_path[128];
+            char  clip_names[8][64];
+            int   clip_count;
+            int   active_clip;
+            float speed;
+            bool  loop;
+            bool  playing;
+        } skeletal_animator;
+
+        struct {
+            float mass;
+            float drag;
+            float angular_drag;
+            bool  use_gravity;
+            bool  is_kinematic;
+        } rigidbody;
+
+        struct {
+            float center[3];
+            float size[3];
+            bool  is_trigger;
+        } box_collider;
+
+        struct {
+            float center[3];
+            float radius;
+            bool  is_trigger;
+        } sphere_collider;
+
+        struct {
+            float height;
+            float radius;
+            float step_offset;
+            float slope_limit;
+        } character_controller;
+
+        struct {
+            char  clip_path[128];
+            float volume;
+            float pitch;
+            float spatial_blend;
+            bool  loop;
+            bool  play_on_awake;
+        } audio_source;
+
+        struct {
+            char  script_path[128];
+        } script;
     } data;
 };
 
@@ -159,6 +258,8 @@ void              jce_state_set_entity_enabled(uint32_t id, bool enabled);
 void              jce_state_set_entity_tag(uint32_t id, const char *tag);
 void              jce_state_set_entity_tag_color(uint32_t id, JceTagColor color);
 void              jce_state_reparent_entity(uint32_t id, uint32_t new_parent);
+void              jce_state_reorder_sibling(uint32_t entity_id, uint32_t ref_id,
+                                            bool insert_after);
 uint32_t          jce_state_duplicate_entity(uint32_t id);
 
 /* Component management. */
@@ -200,12 +301,30 @@ void          jce_state_play(void);
 void          jce_state_pause(void);
 void          jce_state_stop(void);
 JcePlayState  jce_state_get_play_state(void);
+void          jce_state_play_mode_tick(float dt);
 
-/* Undo/Redo (stub for future). */
+/* Undo/Redo history. */
 void  jce_state_undo(void);
 void  jce_state_redo(void);
 bool  jce_state_can_undo(void);
 bool  jce_state_can_redo(void);
+
+/* Batch edit scope for grouping multi-step operations into one undo entry. */
+void  jce_state_begin_batch_edit(void);
+void  jce_state_end_batch_edit(void);
+
+/* Explicit transaction scope for multi-step editor workflows. */
+bool  jce_state_begin_transaction(const char *label);
+void  jce_state_commit_transaction(void);
+void  jce_state_cancel_transaction(void);
+bool  jce_state_transaction_active(void);
+
+/* Prefab lifecycle (minimum viable Phase 4 core). */
+bool     jce_state_save_prefab(uint32_t entity_id, const char *prefab_path);
+uint32_t jce_state_instantiate_prefab(const char *prefab_path, uint32_t parent_id);
+bool     jce_state_revert_prefab(uint32_t entity_id);
+bool     jce_state_is_prefab_instance(uint32_t entity_id);
+const char *jce_state_get_prefab_path(uint32_t entity_id);
 
 /* Entity clipboard */
 void     jce_state_copy_entity(uint32_t id);

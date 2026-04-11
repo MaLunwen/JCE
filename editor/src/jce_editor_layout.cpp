@@ -127,6 +127,30 @@ static SaveSceneResult save_scene_or_open_save_as(void)
     return SAVE_SCENE_RESULT_OK;
 }
 
+static void handle_global_edit_shortcuts(void)
+{
+    ImGuiIO &io = ImGui::GetIO();
+    if (!io.KeyCtrl)
+        return;
+
+    /* Avoid stealing shortcuts while typing in text fields. */
+    if (io.WantTextInput)
+        return;
+
+    if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
+        if (jce_state_can_undo())
+            jce_state_undo();
+        return;
+    }
+
+    if (ImGui::IsKeyPressed(ImGuiKey_Y, false)
+        || (io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z, false)))
+    {
+        if (jce_state_can_redo())
+            jce_state_redo();
+    }
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  *  MENU BAR
  * ══════════════════════════════════════════════════════════════════════ */
@@ -248,6 +272,8 @@ static void draw_menu_bar(void)
                         jce_editor_panel_visible_ptr(JCE_PANEL_ASSETS));
         ImGui::MenuItem(jce_editor_i18n("File Viewer"), NULL,
                         jce_editor_panel_visible_ptr(JCE_PANEL_FILE_VIEWER));
+        ImGui::MenuItem(jce_editor_i18n("postfx.title"), NULL,
+                        jce_editor_panel_visible_ptr(JCE_PANEL_POSTFX));
         ImGui::Separator();
         if (ImGui::MenuItem(jce_editor_i18n("menu.window.resetLayout")))
             s_reset_layout_requested = true;
@@ -438,6 +464,15 @@ static void draw_panel_windows(void)
         }
         ImGui::End();
     }
+
+    /* ── Post Processing ──────────────────────────────────────────── */
+    if (*jce_editor_panel_visible_ptr(JCE_PANEL_POSTFX)) {
+        snprintf(lbl, sizeof(lbl), "%s###postfx", jce_editor_i18n("postfx.title"));
+        if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_POSTFX))) {
+            jce_editor_panel_postfx_content();
+        }
+        ImGui::End();
+    }
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -468,6 +503,8 @@ void jce_editor_layout_draw(void)
 
     ImGui::Begin("DockSpace", nullptr, host_flags);
     ImGui::PopStyleVar(3);
+
+    handle_global_edit_shortcuts();
 
     /* Menu bar */
     draw_menu_bar();

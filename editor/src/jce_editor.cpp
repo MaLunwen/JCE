@@ -21,12 +21,17 @@
 
 extern "C" {
 #include <jce/graphics/jce_views.h>
+#include <jce/graphics/jce_postfx.h>
 #include <jce/platform/jce_window.h>
 #include <jce/core/jce_log.h>
 #include <jce/resource/pak_loader.h>
 }
 
 #define LOG_TAG "editor"
+
+/* ── PostFX pipeline global (used by jce_panel_postfx) ─────────────── */
+
+JcePostFXPipeline *g_editor_postfx = NULL;
 
 /* ── Static state ──────────────────────────────────────────────────── */
 
@@ -40,6 +45,9 @@ static struct {
     const PakArchive *pak;      /* stored for font rebuild */
     float       font_size;      /* current font size in pixels */
     float       pending_font_size; /* >0 means rebuild next frame */
+    FILE       *frame_kpi_file;
+    uint32_t    frame_kpi_index;
+    uint32_t    frame_kpi_limit;
 } s_editor;
 
 /* ── SDL3 key mapping ──────────────────────────────────────────────── */
@@ -257,6 +265,29 @@ bool jce_editor_init(const PakArchive *pak, JceWindow *window)
     s_editor.last_time   = SDL_GetPerformanceCounter();
     s_editor.sdl_window  = jce_window_sdl(window);
     s_editor.text_input_active = false;
+    s_editor.frame_kpi_file = NULL;
+    s_editor.frame_kpi_index = 0;
+    s_editor.frame_kpi_limit = 0;
+
+    const char *frame_kpi_path = SDL_getenv("JCE_KPI_FRAME_LOG");
+    if (frame_kpi_path && frame_kpi_path[0]) {
+        s_editor.frame_kpi_file = fopen(frame_kpi_path, "w");
+        if (s_editor.frame_kpi_file) {
+            const char *frame_count = SDL_getenv("JCE_KPI_FRAME_COUNT");
+            if (frame_count && frame_count[0]) {
+                const int parsed = SDL_atoi(frame_count);
+                if (parsed > 0) {
+                    s_editor.frame_kpi_limit = (uint32_t)parsed;
+                }
+            }
+            fprintf(s_editor.frame_kpi_file, "frame_index,frame_ms\n");
+            fflush(s_editor.frame_kpi_file);
+            LOG_INFO(LOG_TAG, "frame KPI capture enabled -> %s", frame_kpi_path);
+        } else {
+            LOG_WARN(LOG_TAG, "failed to open frame KPI log: %s", frame_kpi_path);
+        }
+    }
+
     s_editor.active      = true;
     s_editor.initialized = true;
 
@@ -278,6 +309,12 @@ void jce_editor_shutdown(void)
     jce_editor_state_shutdown();
     jce_editor_i18n_shutdown();
     jce_imgui_bgfx_shutdown();
+
+    if (s_editor.frame_kpi_file) {
+        fflush(s_editor.frame_kpi_file);
+        fclose(s_editor.frame_kpi_file);
+        s_editor.frame_kpi_file = NULL;
+    }
 
     for (int i = 0; i < ImGuiMouseCursor_COUNT; i++) {
         if (s_editor.cursors[i]) {
@@ -377,6 +414,19 @@ void jce_editor_update(JceWindow *window)
     if (dt <= 0.0f) dt = 1.0f / 60.0f;
     io.DeltaTime = dt;
     s_editor.last_time = now;
+
+    if (s_editor.frame_kpi_file) {
+        if (s_editor.frame_kpi_limit == 0 ||
+            s_editor.frame_kpi_index < s_editor.frame_kpi_limit) {
+            const double frame_ms = (double)dt * 1000.0;
+            fprintf(s_editor.frame_kpi_file, "%u,%.3f\n",
+                    s_editor.frame_kpi_index, frame_ms);
+            s_editor.frame_kpi_index++;
+            if ((s_editor.frame_kpi_index % 60u) == 0u) {
+                fflush(s_editor.frame_kpi_file);
+            }
+        }
+    }
 
     /* Setup bgfx view. */
     jce_imgui_bgfx_setup_view((uint16_t)w, (uint16_t)h);

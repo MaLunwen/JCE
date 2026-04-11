@@ -7,11 +7,17 @@
  */
 
 #include <jce/graphics/jce_postfx.h>
+#include <jce/graphics/jce_shaders.h>
+#include <jce/graphics/jce_views.h>
 #include <jce/core/jce_log.h>
 
+#include <bgfx/c99/bgfx.h>
 #include <string.h>
 
 #define LOG_TAG "postfx"
+
+/* Max intermediate FBOs for ping-pong rendering. */
+#define POSTFX_MAX_FBOS  4
 
 /* ── Pipeline struct ───────────────────────────────────────────────── */
 
@@ -22,6 +28,40 @@ struct JcePostFXPipeline {
     bool            enabled[JCE_POSTFX_COUNT];
     JcePostFXParams params;
     bool            shaders_loaded;
+
+    /* Intermediate framebuffers for ping-pong rendering. */
+    bgfx_texture_handle_t    fbo_tex[POSTFX_MAX_FBOS];
+    bgfx_frame_buffer_handle_t fbo[POSTFX_MAX_FBOS];
+    bool                     fbos_valid;
+
+    /* Shader programs. */
+    bgfx_program_handle_t prog_tonemap;
+    bgfx_program_handle_t prog_bloom_extract;
+    bgfx_program_handle_t prog_bloom_blur;
+    bgfx_program_handle_t prog_bloom_combine;
+    bgfx_program_handle_t prog_fxaa;
+    bgfx_program_handle_t prog_vignette;
+    bgfx_program_handle_t prog_chromatic;
+    bgfx_program_handle_t prog_grayscale;
+
+    /* Uniforms. */
+    bgfx_uniform_handle_t u_texColor;
+    bgfx_uniform_handle_t u_texBloom;
+    bgfx_uniform_handle_t u_tonemapParams;
+    bgfx_uniform_handle_t u_bloomParams;
+    bgfx_uniform_handle_t u_blurDir;
+    bgfx_uniform_handle_t u_fxaaParams;
+    bgfx_uniform_handle_t u_texelSize;
+    bgfx_uniform_handle_t u_vignetteParams;
+    bgfx_uniform_handle_t u_chromaticParams;
+
+    /* Full-screen quad vertex buffer. */
+    bgfx_vertex_buffer_handle_t quad_vb;
+    bgfx_index_buffer_handle_t  quad_ib;
+    bgfx_vertex_layout_t        quad_layout;
+
+    /* Output texture from the last apply. */
+    bgfx_texture_handle_t output_tex;
 };
 
 /* ── Default parameters ────────────────────────────────────────────── */
@@ -43,6 +83,65 @@ JcePostFXParams jce_postfx_default_params(void)
     return p;
 }
 
+/* ── Full-screen quad vertex data ───────────────────────────────────── */
+
+typedef struct {
+    float x, y, z;
+    float u, v;
+} PostfxVertex;
+
+static const PostfxVertex s_quad_verts[4] = {
+    { -1.0f,  1.0f, 0.0f,   0.0f, 0.0f },
+    {  1.0f,  1.0f, 0.0f,   1.0f, 0.0f },
+    { -1.0f, -1.0f, 0.0f,   0.0f, 1.0f },
+    {  1.0f, -1.0f, 0.0f,   1.0f, 1.0f },
+};
+
+static const uint16_t s_quad_indices[6] = { 0, 2, 1, 1, 2, 3 };
+
+/* ── FBO helpers ───────────────────────────────────────────────────── */
+
+static void create_fbos(JcePostFXPipeline *p)
+{
+    if (p->fbos_valid) return;
+    for (int i = 0; i < POSTFX_MAX_FBOS; i++) {
+        p->fbo_tex[i] = bgfx_create_texture_2d(
+            (uint16_t)p->width, (uint16_t)p->height, false, 1,
+            BGFX_TEXTURE_FORMAT_RGBA16F,
+            BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
+            NULL);
+        bgfx_attachment_t at;
+        memset(&at, 0, sizeof(at));
+        bgfx_attachment_init(&at, p->fbo_tex[i], BGFX_ACCESS_WRITE, 0, 1, 0, BGFX_RESOLVE_AUTO_GEN_MIPS);
+        p->fbo[i] = bgfx_create_frame_buffer_from_attachment(1, &at, false);
+    }
+    p->fbos_valid = true;
+}
+
+static void destroy_fbos(JcePostFXPipeline *p)
+{
+    if (!p->fbos_valid) return;
+    for (int i = 0; i < POSTFX_MAX_FBOS; i++) {
+        if (p->fbo[i].idx != UINT16_MAX)
+            bgfx_destroy_frame_buffer(p->fbo[i]);
+        p->fbo[i].idx = UINT16_MAX;
+        /* Textures are owned by the FBs when created via attachment. */
+        p->fbo_tex[i].idx = UINT16_MAX;
+    }
+    p->fbos_valid = false;
+}
+
+/* ── Full-screen quad draw ─────────────────────────────────────────── */
+
+static void draw_fullscreen(JcePostFXPipeline *p, uint16_t view_id,
+                            bgfx_program_handle_t prog)
+{
+    bgfx_set_vertex_buffer(0, p->quad_vb, 0, 4);
+    bgfx_set_index_buffer(p->quad_ib, 0, 6);
+    bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A, 0);
+    bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+}
+
 /* ── Create / Destroy ──────────────────────────────────────────────── */
 
 JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
@@ -58,6 +157,48 @@ JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
     p->height = height;
     p->params = jce_postfx_default_params();
     p->shaders_loaded = false;
+    p->fbos_valid = false;
+
+    /* Initialize handles to invalid. */
+    p->quad_vb.idx = UINT16_MAX;
+    p->quad_ib.idx = UINT16_MAX;
+    for (int i = 0; i < POSTFX_MAX_FBOS; i++) {
+        p->fbo[i].idx     = UINT16_MAX;
+        p->fbo_tex[i].idx = UINT16_MAX;
+    }
+    p->prog_tonemap.idx       = UINT16_MAX;
+    p->prog_bloom_extract.idx = UINT16_MAX;
+    p->prog_bloom_blur.idx    = UINT16_MAX;
+    p->prog_bloom_combine.idx = UINT16_MAX;
+    p->prog_fxaa.idx          = UINT16_MAX;
+    p->prog_vignette.idx      = UINT16_MAX;
+    p->prog_chromatic.idx     = UINT16_MAX;
+    p->prog_grayscale.idx     = UINT16_MAX;
+
+    /* Create full-screen quad geometry. */
+    bgfx_vertex_layout_begin(&p->quad_layout, bgfx_get_renderer_type());
+    bgfx_vertex_layout_add(&p->quad_layout, BGFX_ATTRIB_POSITION, 3,
+                           BGFX_ATTRIB_TYPE_FLOAT, false, false);
+    bgfx_vertex_layout_add(&p->quad_layout, BGFX_ATTRIB_TEXCOORD0, 2,
+                           BGFX_ATTRIB_TYPE_FLOAT, false, false);
+    bgfx_vertex_layout_end(&p->quad_layout);
+
+    const bgfx_memory_t *vb_mem = bgfx_copy(s_quad_verts, sizeof(s_quad_verts));
+    p->quad_vb = bgfx_create_vertex_buffer(vb_mem, &p->quad_layout, BGFX_BUFFER_NONE);
+
+    const bgfx_memory_t *ib_mem = bgfx_copy(s_quad_indices, sizeof(s_quad_indices));
+    p->quad_ib = bgfx_create_index_buffer(ib_mem, BGFX_BUFFER_NONE);
+
+    /* Create uniforms. */
+    p->u_texColor       = bgfx_create_uniform("s_texColor",       BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    p->u_texBloom       = bgfx_create_uniform("s_texBloom",       BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    p->u_tonemapParams  = bgfx_create_uniform("u_tonemapParams",  BGFX_UNIFORM_TYPE_VEC4, 1);
+    p->u_bloomParams    = bgfx_create_uniform("u_bloomParams",    BGFX_UNIFORM_TYPE_VEC4, 1);
+    p->u_blurDir        = bgfx_create_uniform("u_blurDir",        BGFX_UNIFORM_TYPE_VEC4, 1);
+    p->u_fxaaParams     = bgfx_create_uniform("u_fxaaParams",     BGFX_UNIFORM_TYPE_VEC4, 1);
+    p->u_texelSize      = bgfx_create_uniform("u_texelSize",      BGFX_UNIFORM_TYPE_VEC4, 1);
+    p->u_vignetteParams = bgfx_create_uniform("u_vignetteParams", BGFX_UNIFORM_TYPE_VEC4, 1);
+    p->u_chromaticParams= bgfx_create_uniform("u_chromaticParams",BGFX_UNIFORM_TYPE_VEC4, 1);
 
     LOG_SUCCESS(LOG_TAG, "post-fx pipeline created (%ux%u)", width, height);
     return p;
@@ -66,6 +207,35 @@ JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
 void jce_postfx_destroy(JcePostFXPipeline *pipeline)
 {
     if (!pipeline) return;
+
+    destroy_fbos(pipeline);
+
+    if (pipeline->quad_vb.idx != UINT16_MAX)
+        bgfx_destroy_vertex_buffer(pipeline->quad_vb);
+    if (pipeline->quad_ib.idx != UINT16_MAX)
+        bgfx_destroy_index_buffer(pipeline->quad_ib);
+
+    /* Destroy uniforms. */
+    bgfx_destroy_uniform(pipeline->u_texColor);
+    bgfx_destroy_uniform(pipeline->u_texBloom);
+    bgfx_destroy_uniform(pipeline->u_tonemapParams);
+    bgfx_destroy_uniform(pipeline->u_bloomParams);
+    bgfx_destroy_uniform(pipeline->u_blurDir);
+    bgfx_destroy_uniform(pipeline->u_fxaaParams);
+    bgfx_destroy_uniform(pipeline->u_texelSize);
+    bgfx_destroy_uniform(pipeline->u_vignetteParams);
+    bgfx_destroy_uniform(pipeline->u_chromaticParams);
+
+    /* Destroy shader programs. */
+    if (pipeline->prog_tonemap.idx       != UINT16_MAX) bgfx_destroy_program(pipeline->prog_tonemap);
+    if (pipeline->prog_bloom_extract.idx != UINT16_MAX) bgfx_destroy_program(pipeline->prog_bloom_extract);
+    if (pipeline->prog_bloom_blur.idx    != UINT16_MAX) bgfx_destroy_program(pipeline->prog_bloom_blur);
+    if (pipeline->prog_bloom_combine.idx != UINT16_MAX) bgfx_destroy_program(pipeline->prog_bloom_combine);
+    if (pipeline->prog_fxaa.idx          != UINT16_MAX) bgfx_destroy_program(pipeline->prog_fxaa);
+    if (pipeline->prog_vignette.idx      != UINT16_MAX) bgfx_destroy_program(pipeline->prog_vignette);
+    if (pipeline->prog_chromatic.idx     != UINT16_MAX) bgfx_destroy_program(pipeline->prog_chromatic);
+    if (pipeline->prog_grayscale.idx     != UINT16_MAX) bgfx_destroy_program(pipeline->prog_grayscale);
+
     jce_allocator_t a = pipeline->alloc;
     a.free(pipeline, a.ctx);
 }
@@ -80,6 +250,9 @@ void jce_postfx_resize(JcePostFXPipeline *pipeline,
 
     pipeline->width  = width;
     pipeline->height = height;
+
+    /* Recreate FBOs at new resolution. */
+    destroy_fbos(pipeline);
 
     LOG_DEBUG(LOG_TAG, "post-fx resized to %ux%u", width, height);
 }
@@ -115,15 +288,54 @@ void jce_postfx_get_params(const JcePostFXPipeline *pipeline,
 
 /* ── Load shaders ──────────────────────────────────────────────────── */
 
-bool jce_postfx_load_shaders(JcePostFXPipeline *pipeline)
+/* Helper: load a postfx program (vs_postfx + fs_<effect>) and log on failure. */
+static bgfx_program_handle_t load_postfx_prog(const PakArchive *pak,
+                                              const char *fs_name)
+{
+    bgfx_program_handle_t invalid;
+    invalid.idx = UINT16_MAX;
+    JceShaderHandle h = shader_load_program_named(pak, "postfx", fs_name);
+    if (h.idx == UINT16_MAX) {
+        LOG_WARN(LOG_TAG, "post-fx shader '%s' not found in PAK", fs_name);
+        return invalid;
+    }
+    bgfx_program_handle_t prog;
+    prog.idx = h.idx;
+    return prog;
+}
+
+bool jce_postfx_load_shaders(JcePostFXPipeline *pipeline,
+                             const PakArchive *pak)
 {
     if (!pipeline) return false;
+    if (!pak) {
+        LOG_ERROR(LOG_TAG, "cannot load post-fx shaders: NULL PAK");
+        return false;
+    }
 
-    /* Shader loading is deferred until actual bgfx integration.
-       For now, mark as ready so the pipeline can be tested. */
-    pipeline->shaders_loaded = true;
-    LOG_INFO(LOG_TAG, "post-fx shaders loaded");
-    return true;
+    pipeline->prog_tonemap       = load_postfx_prog(pak, "tonemap");
+    pipeline->prog_bloom_extract = load_postfx_prog(pak, "bloom_extract");
+    pipeline->prog_bloom_blur    = load_postfx_prog(pak, "bloom_blur");
+    pipeline->prog_bloom_combine = load_postfx_prog(pak, "bloom_combine");
+    pipeline->prog_fxaa          = load_postfx_prog(pak, "fxaa");
+    pipeline->prog_vignette      = load_postfx_prog(pak, "vignette");
+    pipeline->prog_chromatic     = load_postfx_prog(pak, "chromatic");
+    pipeline->prog_grayscale     = load_postfx_prog(pak, "grayscale");
+
+    /* Count how many loaded successfully. */
+    int loaded = 0;
+    if (pipeline->prog_tonemap.idx       != UINT16_MAX) loaded++;
+    if (pipeline->prog_bloom_extract.idx != UINT16_MAX) loaded++;
+    if (pipeline->prog_bloom_blur.idx    != UINT16_MAX) loaded++;
+    if (pipeline->prog_bloom_combine.idx != UINT16_MAX) loaded++;
+    if (pipeline->prog_fxaa.idx          != UINT16_MAX) loaded++;
+    if (pipeline->prog_vignette.idx      != UINT16_MAX) loaded++;
+    if (pipeline->prog_chromatic.idx     != UINT16_MAX) loaded++;
+    if (pipeline->prog_grayscale.idx     != UINT16_MAX) loaded++;
+
+    pipeline->shaders_loaded = (loaded > 0);
+    LOG_INFO(LOG_TAG, "post-fx shaders loaded: %d/8", loaded);
+    return pipeline->shaders_loaded;
 }
 
 /* ── Apply ─────────────────────────────────────────────────────────── */
@@ -133,33 +345,187 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
                       JceTextureHandle scene_depth)
 {
     if (!pipeline || !pipeline->shaders_loaded) return;
-    (void)scene_color;
     (void)scene_depth;
 
-    /* Count active effects for debug. */
+    /* Count active effects. */
     int active = 0;
     for (int i = 0; i < JCE_POSTFX_COUNT; i++) {
         if (pipeline->enabled[i]) active++;
     }
-
     if (active == 0) return;
 
-    /*
-     * Pipeline execution order (when enabled):
-     *   1. Bloom — extract bright pixels, blur, blend
-     *   2. Tonemap — HDR → LDR
-     *   3. FXAA — anti-aliasing
-     *   4. Chromatic aberration
-     *   5. Vignette
-     *   6. Grayscale
-     *
-     * Each pass reads from the previous output and writes to the next
-     * intermediate framebuffer.  The final pass writes to view 0
-     * (back buffer).
-     *
-     * Full implementation requires bgfx framebuffer creation and
-     * shader uniform binding — deferred to renderer integration.
-     */
+    /* Ensure FBOs are created. */
+    if (!pipeline->fbos_valid)
+        create_fbos(pipeline);
+    if (!pipeline->fbos_valid) return;
 
-    LOG_TRACE(LOG_TAG, "post-fx apply: %d effects active", active);
+    /* Texel size uniform (shared by several effects). */
+    float texel_size[4] = {
+        1.0f / (float)pipeline->width,
+        1.0f / (float)pipeline->height,
+        (float)pipeline->width,
+        (float)pipeline->height
+    };
+    bgfx_set_uniform(pipeline->u_texelSize, texel_size, 1);
+
+    /* Track current input texture. Start with the scene color. */
+    bgfx_texture_handle_t current_tex = { scene_color.idx };
+    uint16_t view_id = JCE_VIEW_POST_BASE;
+    int ping = 0; /* ping-pong FBO index (0 or 1) */
+
+    /* Helper macro: set up view for a post-processing pass. */
+    #define POSTFX_SETUP_VIEW(vid, fb) do { \
+        bgfx_set_view_rect((vid), 0, 0, (uint16_t)pipeline->width, \
+                           (uint16_t)pipeline->height); \
+        bgfx_set_view_frame_buffer((vid), (fb)); \
+        bgfx_set_view_clear((vid), BGFX_CLEAR_NONE, 0, 1.0f, 0); \
+    } while(0)
+
+    /* ── 1. Bloom ─────────────────────────────────────────────────── */
+    if (pipeline->enabled[JCE_POSTFX_BLOOM] &&
+        pipeline->prog_bloom_extract.idx != UINT16_MAX)
+    {
+        /* Bloom extract pass → FBO 2. */
+        float bloom_params[4] = {
+            pipeline->params.bloom_threshold,
+            pipeline->params.bloom_intensity,
+            0.0f, 0.0f
+        };
+        bgfx_set_uniform(pipeline->u_bloomParams, bloom_params, 1);
+
+        POSTFX_SETUP_VIEW(view_id, pipeline->fbo[2]);
+        bgfx_set_texture(0, pipeline->u_texColor, current_tex, UINT32_MAX);
+        draw_fullscreen(pipeline, view_id, pipeline->prog_bloom_extract);
+        view_id++;
+
+        /* Horizontal blur → FBO 3. */
+        if (pipeline->prog_bloom_blur.idx != UINT16_MAX) {
+            float blur_h[4] = { texel_size[0], 0.0f, 0.0f, 0.0f };
+            bgfx_set_uniform(pipeline->u_blurDir, blur_h, 1);
+            POSTFX_SETUP_VIEW(view_id, pipeline->fbo[3]);
+            bgfx_set_texture(0, pipeline->u_texColor, pipeline->fbo_tex[2], UINT32_MAX);
+            draw_fullscreen(pipeline, view_id, pipeline->prog_bloom_blur);
+            view_id++;
+
+            /* Vertical blur → FBO 2. */
+            float blur_v[4] = { 0.0f, texel_size[1], 0.0f, 0.0f };
+            bgfx_set_uniform(pipeline->u_blurDir, blur_v, 1);
+            POSTFX_SETUP_VIEW(view_id, pipeline->fbo[2]);
+            bgfx_set_texture(0, pipeline->u_texColor, pipeline->fbo_tex[3], UINT32_MAX);
+            draw_fullscreen(pipeline, view_id, pipeline->prog_bloom_blur);
+            view_id++;
+        }
+
+        /* Combine: scene + bloom → FBO ping. */
+        if (pipeline->prog_bloom_combine.idx != UINT16_MAX) {
+            POSTFX_SETUP_VIEW(view_id, pipeline->fbo[ping]);
+            bgfx_set_texture(0, pipeline->u_texColor, current_tex, UINT32_MAX);
+            bgfx_set_texture(1, pipeline->u_texBloom, pipeline->fbo_tex[2], UINT32_MAX);
+            draw_fullscreen(pipeline, view_id, pipeline->prog_bloom_combine);
+            current_tex = pipeline->fbo_tex[ping];
+            ping = 1 - ping;
+            view_id++;
+        }
+    }
+
+    /* ── 2. Tonemap ───────────────────────────────────────────────── */
+    if (pipeline->enabled[JCE_POSTFX_TONEMAP] &&
+        pipeline->prog_tonemap.idx != UINT16_MAX)
+    {
+        float tonemap_p[4] = {
+            pipeline->params.exposure,
+            pipeline->params.gamma,
+            0.0f, 0.0f
+        };
+        bgfx_set_uniform(pipeline->u_tonemapParams, tonemap_p, 1);
+
+        POSTFX_SETUP_VIEW(view_id, pipeline->fbo[ping]);
+        bgfx_set_texture(0, pipeline->u_texColor, current_tex, UINT32_MAX);
+        draw_fullscreen(pipeline, view_id, pipeline->prog_tonemap);
+        current_tex = pipeline->fbo_tex[ping];
+        ping = 1 - ping;
+        view_id++;
+    }
+
+    /* ── 3. FXAA ──────────────────────────────────────────────────── */
+    if (pipeline->enabled[JCE_POSTFX_FXAA] &&
+        pipeline->prog_fxaa.idx != UINT16_MAX)
+    {
+        float fxaa_p[4] = {
+            pipeline->params.fxaa_span_max,
+            pipeline->params.fxaa_reduce_min,
+            pipeline->params.fxaa_reduce_mul,
+            0.0f
+        };
+        bgfx_set_uniform(pipeline->u_fxaaParams, fxaa_p, 1);
+
+        POSTFX_SETUP_VIEW(view_id, pipeline->fbo[ping]);
+        bgfx_set_texture(0, pipeline->u_texColor, current_tex, UINT32_MAX);
+        draw_fullscreen(pipeline, view_id, pipeline->prog_fxaa);
+        current_tex = pipeline->fbo_tex[ping];
+        ping = 1 - ping;
+        view_id++;
+    }
+
+    /* ── 4. Chromatic aberration ──────────────────────────────────── */
+    if (pipeline->enabled[JCE_POSTFX_CHROMATIC] &&
+        pipeline->prog_chromatic.idx != UINT16_MAX)
+    {
+        float chrom_p[4] = { pipeline->params.chromatic_strength, 0.0f, 0.0f, 0.0f };
+        bgfx_set_uniform(pipeline->u_chromaticParams, chrom_p, 1);
+
+        POSTFX_SETUP_VIEW(view_id, pipeline->fbo[ping]);
+        bgfx_set_texture(0, pipeline->u_texColor, current_tex, UINT32_MAX);
+        draw_fullscreen(pipeline, view_id, pipeline->prog_chromatic);
+        current_tex = pipeline->fbo_tex[ping];
+        ping = 1 - ping;
+        view_id++;
+    }
+
+    /* ── 5. Vignette ──────────────────────────────────────────────── */
+    if (pipeline->enabled[JCE_POSTFX_VIGNETTE] &&
+        pipeline->prog_vignette.idx != UINT16_MAX)
+    {
+        float vig_p[4] = {
+            pipeline->params.vignette_intensity,
+            pipeline->params.vignette_smoothness,
+            0.0f, 0.0f
+        };
+        bgfx_set_uniform(pipeline->u_vignetteParams, vig_p, 1);
+
+        POSTFX_SETUP_VIEW(view_id, pipeline->fbo[ping]);
+        bgfx_set_texture(0, pipeline->u_texColor, current_tex, UINT32_MAX);
+        draw_fullscreen(pipeline, view_id, pipeline->prog_vignette);
+        current_tex = pipeline->fbo_tex[ping];
+        ping = 1 - ping;
+        view_id++;
+    }
+
+    /* ── 6. Grayscale ─────────────────────────────────────────────── */
+    if (pipeline->enabled[JCE_POSTFX_GRAYSCALE] &&
+        pipeline->prog_grayscale.idx != UINT16_MAX)
+    {
+        POSTFX_SETUP_VIEW(view_id, pipeline->fbo[ping]);
+        bgfx_set_texture(0, pipeline->u_texColor, current_tex, UINT32_MAX);
+        draw_fullscreen(pipeline, view_id, pipeline->prog_grayscale);
+        current_tex = pipeline->fbo_tex[ping];
+        ping = 1 - ping;
+        view_id++;
+    }
+
+    #undef POSTFX_SETUP_VIEW
+
+    /* Store the final output texture for the caller. */
+    pipeline->output_tex = current_tex;
+
+    LOG_TRACE(LOG_TAG, "post-fx apply: %d effects active, %d views used",
+              active, view_id - JCE_VIEW_POST_BASE);
+}
+
+JceTextureHandle jce_postfx_get_output(const JcePostFXPipeline *pipeline)
+{
+    JceTextureHandle h = { UINT16_MAX };
+    if (pipeline)
+        h.idx = pipeline->output_tex.idx;
+    return h;
 }

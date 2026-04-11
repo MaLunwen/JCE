@@ -154,6 +154,40 @@ void jce_mesh_submit_wireframe_overlay(const JceMesh *mesh, const JceRenderer *r
     bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
 }
 
+void jce_mesh_submit_pbr(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id)
+{
+    if (!mesh || !r) return;
+
+    bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
+
+    if (mesh->ibh.idx != UINT16_MAX)
+        bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
+
+    bgfx_set_state(BGFX_STATE_DEFAULT, 0);
+
+    JceShaderHandle sh = jce_renderer_get_program_pbr(r);
+    bgfx_program_handle_t prog = { sh.idx };
+    bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+}
+
+void jce_mesh_submit_shadow(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id)
+{
+    if (!mesh || !r) return;
+
+    bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
+
+    if (mesh->ibh.idx != UINT16_MAX)
+        bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
+
+    /* Depth-only: write Z, cull front faces to reduce peter-panning. */
+    bgfx_set_state(BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
+                 | BGFX_STATE_CULL_CW | BGFX_STATE_MSAA, 0);
+
+    JceShaderHandle sh = jce_renderer_get_program_shadow(r);
+    bgfx_program_handle_t prog = { sh.idx };
+    bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+}
+
 uint32_t jce_mesh_vertex_count(const JceMesh *mesh)
 {
     return mesh ? mesh->num_verts : 0;
@@ -280,6 +314,239 @@ JceMesh *jce_mesh_create_plane_ex(float width, float depth,
     }
 
     JceMesh *mesh = jce_mesh_create(verts, num_verts, indices, num_indices);
+    JCE_FREE(verts);
+    JCE_FREE(indices);
+    return mesh;
+}
+
+/* -- UV sphere ---------------------------------------------------- */
+
+JceMesh *jce_mesh_create_sphere(float radius)
+{
+    const uint32_t rings  = 16;
+    const uint32_t slices = 32;
+    uint32_t num_verts   = (rings + 1) * (slices + 1);
+    uint32_t num_indices = rings * slices * 6;
+
+    JceMeshVertex *verts = (JceMeshVertex *)JCE_MALLOC(num_verts * sizeof(JceMeshVertex));
+    uint32_t *indices    = (uint32_t *)JCE_MALLOC(num_indices * sizeof(uint32_t));
+    if (!verts || !indices) { JCE_FREE(verts); JCE_FREE(indices); return NULL; }
+
+    uint32_t vi = 0;
+    for (uint32_t r = 0; r <= rings; r++) {
+        float theta = JCE_PI * (float)r / (float)rings;
+        float st    = sinf(theta);
+        float ct    = cosf(theta);
+        for (uint32_t s = 0; s <= slices; s++) {
+            float phi = 2.0f * JCE_PI * (float)s / (float)slices;
+            float sp  = sinf(phi);
+            float cp  = cosf(phi);
+            float nx  = st * cp;
+            float ny  = ct;
+            float nz  = st * sp;
+            verts[vi].pos[0]    = radius * nx;
+            verts[vi].pos[1]    = radius * ny;
+            verts[vi].pos[2]    = radius * nz;
+            verts[vi].normal[0] = nx;
+            verts[vi].normal[1] = ny;
+            verts[vi].normal[2] = nz;
+            verts[vi].uv[0]     = (float)s / (float)slices;
+            verts[vi].uv[1]     = (float)r / (float)rings;
+            vi++;
+        }
+    }
+
+    uint32_t ii = 0;
+    for (uint32_t r = 0; r < rings; r++) {
+        for (uint32_t s = 0; s < slices; s++) {
+            uint32_t a = r * (slices + 1) + s;
+            uint32_t b = a + slices + 1;
+            indices[ii++] = a;
+            indices[ii++] = b;
+            indices[ii++] = a + 1;
+            indices[ii++] = a + 1;
+            indices[ii++] = b;
+            indices[ii++] = b + 1;
+        }
+    }
+
+    JceMesh *mesh = jce_mesh_create(verts, num_verts, indices, num_indices);
+    JCE_FREE(verts);
+    JCE_FREE(indices);
+    return mesh;
+}
+
+/* -- Capsule (hemisphere + cylinder + hemisphere) ----------------- */
+
+JceMesh *jce_mesh_create_capsule(float radius, float height)
+{
+    const uint32_t hemi_rings = 8;
+    const uint32_t slices     = 32;
+    float half_h = (height - 2.0f * radius) * 0.5f;
+    if (half_h < 0.0f) half_h = 0.0f;
+
+    /* Top hemi (hemi_rings+1 rows) + bottom hemi (hemi_rings+1 rows)
+       + 2 cylinder rows = total rows: 2*(hemi_rings+1) + 2.
+       Simplified: top hemi rows 0..hemi_rings, bottom rows 0..hemi_rings,
+       but they share the equator.  Total unique rows = 2*hemi_rings + 1. */
+    uint32_t rows      = 2 * hemi_rings + 1;
+    uint32_t num_verts = (rows + 1) * (slices + 1);
+    uint32_t num_idx   = rows * slices * 6;
+
+    JceMeshVertex *verts = (JceMeshVertex *)JCE_MALLOC(num_verts * sizeof(JceMeshVertex));
+    uint32_t *indices    = (uint32_t *)JCE_MALLOC(num_idx * sizeof(uint32_t));
+    if (!verts || !indices) { JCE_FREE(verts); JCE_FREE(indices); return NULL; }
+
+    uint32_t vi = 0;
+    for (uint32_t r = 0; r <= rows; r++) {
+        float theta, y_off;
+        if (r <= hemi_rings) {
+            /* Top hemisphere: theta from 0 (top) to PI/2 (equator). */
+            theta = (JCE_PI * 0.5f) * (float)r / (float)hemi_rings;
+            y_off = half_h;
+        } else {
+            /* Bottom hemisphere: theta from PI/2 to PI (bottom). */
+            uint32_t br = r - hemi_rings;
+            theta = (JCE_PI * 0.5f) + (JCE_PI * 0.5f) * (float)br / (float)hemi_rings;
+            y_off = -half_h;
+        }
+        float st = sinf(theta);
+        float ct = cosf(theta);
+        for (uint32_t s = 0; s <= slices; s++) {
+            float phi = 2.0f * JCE_PI * (float)s / (float)slices;
+            float nx  = st * cosf(phi);
+            float ny  = ct;
+            float nz  = st * sinf(phi);
+            verts[vi].pos[0]    = radius * nx;
+            verts[vi].pos[1]    = radius * ny + y_off;
+            verts[vi].pos[2]    = radius * nz;
+            verts[vi].normal[0] = nx;
+            verts[vi].normal[1] = ny;
+            verts[vi].normal[2] = nz;
+            verts[vi].uv[0]     = (float)s / (float)slices;
+            verts[vi].uv[1]     = (float)r / (float)rows;
+            vi++;
+        }
+    }
+
+    uint32_t ii = 0;
+    for (uint32_t r = 0; r < rows; r++) {
+        for (uint32_t s = 0; s < slices; s++) {
+            uint32_t a = r * (slices + 1) + s;
+            uint32_t b = a + slices + 1;
+            indices[ii++] = a;
+            indices[ii++] = b;
+            indices[ii++] = a + 1;
+            indices[ii++] = a + 1;
+            indices[ii++] = b;
+            indices[ii++] = b + 1;
+        }
+    }
+
+    JceMesh *mesh = jce_mesh_create(verts, num_verts, indices, num_idx);
+    JCE_FREE(verts);
+    JCE_FREE(indices);
+    return mesh;
+}
+
+/* -- Cylinder ----------------------------------------------------- */
+
+JceMesh *jce_mesh_create_cylinder(float radius, float height)
+{
+    const uint32_t slices = 32;
+    const uint32_t rows   = 1;
+    /* Body: 2 rows.  Top cap: center + rim.  Bottom cap: center + rim.
+       Total verts: 2*(slices+1) + 2*(slices+1) + 2 = 4*(slices+1) + 2. */
+    uint32_t body_verts = 2 * (slices + 1);
+    uint32_t cap_verts  = slices + 1 + 1;  /* rim + center */
+    uint32_t num_verts  = body_verts + 2 * cap_verts;
+    uint32_t body_idx   = slices * 6;
+    uint32_t cap_idx    = slices * 3;
+    uint32_t num_idx    = body_idx + 2 * cap_idx;
+    float hh = height * 0.5f;
+
+    JceMeshVertex *verts = (JceMeshVertex *)JCE_MALLOC(num_verts * sizeof(JceMeshVertex));
+    uint32_t *indices    = (uint32_t *)JCE_MALLOC(num_idx * sizeof(uint32_t));
+    if (!verts || !indices) { JCE_FREE(verts); JCE_FREE(indices); return NULL; }
+
+    uint32_t vi = 0, ii = 0;
+
+    /* Body (tube). */
+    for (uint32_t row = 0; row <= rows; row++) {
+        float y = hh - height * (float)row / (float)rows;
+        for (uint32_t s = 0; s <= slices; s++) {
+            float phi = 2.0f * JCE_PI * (float)s / (float)slices;
+            float nx  = cosf(phi);
+            float nz  = sinf(phi);
+            verts[vi].pos[0] = radius * nx;
+            verts[vi].pos[1] = y;
+            verts[vi].pos[2] = radius * nz;
+            verts[vi].normal[0] = nx;
+            verts[vi].normal[1] = 0.0f;
+            verts[vi].normal[2] = nz;
+            verts[vi].uv[0] = (float)s / (float)slices;
+            verts[vi].uv[1] = (float)row / (float)rows;
+            vi++;
+        }
+    }
+    for (uint32_t s = 0; s < slices; s++) {
+        uint32_t a = s;
+        uint32_t b = a + slices + 1;
+        indices[ii++] = a;
+        indices[ii++] = b;
+        indices[ii++] = a + 1;
+        indices[ii++] = a + 1;
+        indices[ii++] = b;
+        indices[ii++] = b + 1;
+    }
+
+    /* Top cap. */
+    uint32_t top_center = vi;
+    verts[vi].pos[0] = 0; verts[vi].pos[1] = hh; verts[vi].pos[2] = 0;
+    verts[vi].normal[0] = 0; verts[vi].normal[1] = 1; verts[vi].normal[2] = 0;
+    verts[vi].uv[0] = 0.5f; verts[vi].uv[1] = 0.5f;
+    vi++;
+    uint32_t top_rim = vi;
+    for (uint32_t s = 0; s <= slices; s++) {
+        float phi = 2.0f * JCE_PI * (float)s / (float)slices;
+        verts[vi].pos[0] = radius * cosf(phi);
+        verts[vi].pos[1] = hh;
+        verts[vi].pos[2] = radius * sinf(phi);
+        verts[vi].normal[0] = 0; verts[vi].normal[1] = 1; verts[vi].normal[2] = 0;
+        verts[vi].uv[0] = 0.5f + 0.5f * cosf(phi);
+        verts[vi].uv[1] = 0.5f + 0.5f * sinf(phi);
+        vi++;
+    }
+    for (uint32_t s = 0; s < slices; s++) {
+        indices[ii++] = top_center;
+        indices[ii++] = top_rim + s;
+        indices[ii++] = top_rim + s + 1;
+    }
+
+    /* Bottom cap. */
+    uint32_t bot_center = vi;
+    verts[vi].pos[0] = 0; verts[vi].pos[1] = -hh; verts[vi].pos[2] = 0;
+    verts[vi].normal[0] = 0; verts[vi].normal[1] = -1; verts[vi].normal[2] = 0;
+    verts[vi].uv[0] = 0.5f; verts[vi].uv[1] = 0.5f;
+    vi++;
+    uint32_t bot_rim = vi;
+    for (uint32_t s = 0; s <= slices; s++) {
+        float phi = 2.0f * JCE_PI * (float)s / (float)slices;
+        verts[vi].pos[0] = radius * cosf(phi);
+        verts[vi].pos[1] = -hh;
+        verts[vi].pos[2] = radius * sinf(phi);
+        verts[vi].normal[0] = 0; verts[vi].normal[1] = -1; verts[vi].normal[2] = 0;
+        verts[vi].uv[0] = 0.5f + 0.5f * cosf(phi);
+        verts[vi].uv[1] = 0.5f + 0.5f * sinf(phi);
+        vi++;
+    }
+    for (uint32_t s = 0; s < slices; s++) {
+        indices[ii++] = bot_center;
+        indices[ii++] = bot_rim + s + 1;
+        indices[ii++] = bot_rim + s;
+    }
+
+    JceMesh *mesh = jce_mesh_create(verts, vi, indices, ii);
     JCE_FREE(verts);
     JCE_FREE(indices);
     return mesh;

@@ -1,5 +1,5 @@
 /*
- * jce_pbr_material.c  PBR material bind implementation.
+ * jce_pbr_material.c  PBR material bind + JSON I/O implementation.
  */
 
 #include "jce_pbr_material.h"
@@ -8,6 +8,11 @@
 #include <jce/core/jce_log.h>
 
 #include <bgfx/c99/bgfx.h>
+#include <cjson/cJSON.h>
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
 
 #define LOG_TAG "jce_pbr_material"
 
@@ -155,4 +160,186 @@ void jce_pbr_material_bind(const JcePbrMaterial *mat,
     bgfx_texture_handle_t em_h = jce_texture_valid(mat->emissive_map)
         ? (bgfx_texture_handle_t){ mat->emissive_map.idx } : s_white_tex;
     bgfx_set_texture(4, s_emissive_map, em_h, UINT32_MAX);
+}
+
+/* ================================================================== */
+/* JSON I/O helpers                                                    */
+/* ================================================================== */
+
+static double json_number(const cJSON *obj, const char *key, double def)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (cJSON_IsNumber(item)) return item->valuedouble;
+    return def;
+}
+
+static const char *json_string(const cJSON *obj, const char *key)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (cJSON_IsString(item) && item->valuestring) return item->valuestring;
+    return NULL;
+}
+
+static void json_float_array(const cJSON *obj, const char *key,
+                             float *out, int n, const float *def)
+{
+    const cJSON *arr = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (cJSON_IsArray(arr)) {
+        int count = cJSON_GetArraySize(arr);
+        for (int i = 0; i < n; i++) {
+            if (i < count) {
+                const cJSON *e = cJSON_GetArrayItem(arr, i);
+                out[i] = cJSON_IsNumber(e) ? (float)e->valuedouble : def[i];
+            } else {
+                out[i] = def[i];
+            }
+        }
+    } else {
+        for (int i = 0; i < n; i++) out[i] = def[i];
+    }
+}
+
+static void safe_copy(char *dst, size_t dst_sz, const char *src)
+{
+    if (!src) { dst[0] = '\0'; return; }
+    size_t len = strlen(src);
+    if (len >= dst_sz) len = dst_sz - 1;
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+}
+
+/* ================================================================== */
+/* Load .mat.json                                                      */
+/* ================================================================== */
+
+bool jce_pbr_material_load_json(const char *path, JcePbrMaterial *out,
+                                 char out_tex_paths[5][256])
+{
+    if (!path || !out || !out_tex_paths) return false;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        LOG_WARN(LOG_TAG, "cannot open material file: %s", path);
+        return false;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    if (sz <= 0 || sz > (1 << 20)) { fclose(f); return false; }
+    fseek(f, 0, SEEK_SET);
+
+    char *buf = (char *)malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return false; }
+    size_t rd = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    buf[rd] = '\0';
+
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (!root) {
+        LOG_WARN(LOG_TAG, "invalid JSON in material: %s", path);
+        return false;
+    }
+
+    /* Start from defaults. */
+    *out = jce_pbr_material_default();
+    memset(out_tex_paths, 0, 5 * 256);
+
+    /* Texture paths. */
+    const char *tex_keys[5] = {
+        "albedoMap", "metallicRoughnessMap", "normalMap", "aoMap", "emissiveMap"
+    };
+    for (int i = 0; i < 5; i++) {
+        const char *v = json_string(root, tex_keys[i]);
+        if (v) safe_copy(out_tex_paths[i], 256, v);
+    }
+
+    /* Scalar/vector parameters. */
+    static const float def_bc[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+    static const float def_em[3] = { 0.0f, 0.0f, 0.0f };
+    json_float_array(root, "baseColorFactor", out->base_color_factor, 4, def_bc);
+    json_float_array(root, "emissiveFactor", out->emissive_factor, 3, def_em);
+
+    out->metallic_factor  = (float)json_number(root, "metallicFactor",  0.0);
+    out->roughness_factor = (float)json_number(root, "roughnessFactor", 1.0);
+    out->normal_scale     = (float)json_number(root, "normalScale",     1.0);
+    out->ao_strength      = (float)json_number(root, "aoStrength",      1.0);
+    out->alpha_cutoff     = (float)json_number(root, "alphaCutoff",     0.5);
+    out->double_sided     = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "doubleSided"));
+
+    /* Alpha mode. */
+    const char *am = json_string(root, "alphaMode");
+    if (am) {
+        if (strcmp(am, "MASK") == 0)       out->alpha_mode = JCE_ALPHA_MASK;
+        else if (strcmp(am, "BLEND") == 0)  out->alpha_mode = JCE_ALPHA_BLEND;
+        else                                out->alpha_mode = JCE_ALPHA_OPAQUE;
+    }
+
+    cJSON_Delete(root);
+    LOG_DEBUG(LOG_TAG, "loaded material: %s", path);
+    return true;
+}
+
+/* ================================================================== */
+/* Save .mat.json                                                      */
+/* ================================================================== */
+
+bool jce_pbr_material_save_json(const char *path,
+                                 const JcePbrMaterial *mat,
+                                 const char tex_paths[5][256])
+{
+    if (!path || !mat || !tex_paths) return false;
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return false;
+
+    cJSON_AddStringToObject(root, "type", "pbr");
+
+    /* Texture paths. */
+    const char *tex_keys[5] = {
+        "albedoMap", "metallicRoughnessMap", "normalMap", "aoMap", "emissiveMap"
+    };
+    for (int i = 0; i < 5; i++) {
+        if (tex_paths[i][0])
+            cJSON_AddStringToObject(root, tex_keys[i], tex_paths[i]);
+    }
+
+    /* Base color factor. */
+    cJSON *bc = cJSON_CreateFloatArray(mat->base_color_factor, 4);
+    cJSON_AddItemToObject(root, "baseColorFactor", bc);
+
+    cJSON_AddNumberToObject(root, "metallicFactor",  mat->metallic_factor);
+    cJSON_AddNumberToObject(root, "roughnessFactor", mat->roughness_factor);
+
+    /* Emissive factor. */
+    cJSON *em = cJSON_CreateFloatArray(mat->emissive_factor, 3);
+    cJSON_AddItemToObject(root, "emissiveFactor", em);
+
+    cJSON_AddNumberToObject(root, "normalScale",  mat->normal_scale);
+    cJSON_AddNumberToObject(root, "aoStrength",   mat->ao_strength);
+    cJSON_AddNumberToObject(root, "alphaCutoff",  mat->alpha_cutoff);
+    cJSON_AddBoolToObject(root, "doubleSided", mat->double_sided);
+
+    /* Alpha mode. */
+    const char *am_str = "OPAQUE";
+    if (mat->alpha_mode == JCE_ALPHA_MASK)  am_str = "MASK";
+    if (mat->alpha_mode == JCE_ALPHA_BLEND) am_str = "BLEND";
+    cJSON_AddStringToObject(root, "alphaMode", am_str);
+
+    char *json_str = cJSON_Print(root);
+    cJSON_Delete(root);
+    if (!json_str) return false;
+
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        LOG_WARN(LOG_TAG, "cannot write material file: %s", path);
+        free(json_str);
+        return false;
+    }
+    fputs(json_str, f);
+    fclose(f);
+    free(json_str);
+
+    LOG_INFO(LOG_TAG, "saved material: %s", path);
+    return true;
 }

@@ -25,6 +25,7 @@ typedef enum {
     JCE_PANEL_TIMELINE,
     JCE_PANEL_ASSETS,
     JCE_PANEL_FILE_VIEWER,
+    JCE_PANEL_POSTFX,
     JCE_PANEL_PREFERENCES,
     JCE_PANEL_COUNT
 } JceEditorPanel;
@@ -45,6 +46,7 @@ void  jce_editor_panel_game_view(void);
 void  jce_editor_panel_timeline(void);
 void  jce_editor_panel_assets(void);
 void  jce_editor_panel_file_viewer(void);
+void  jce_editor_panel_postfx(void);
 void  jce_editor_panel_preferences(void);
 
 /* Draw panel content only (no Begin/End — for embedding in layout tabs). */
@@ -56,6 +58,7 @@ void  jce_editor_panel_game_view_content(void);
 void  jce_editor_panel_timeline_content(void);
 void  jce_editor_panel_assets_content(void);
 void  jce_editor_panel_file_viewer_content(void);
+void  jce_editor_panel_postfx_content(void);
 
 /* About dialog (modal). */
 void  jce_editor_about_dialog(bool *p_open);

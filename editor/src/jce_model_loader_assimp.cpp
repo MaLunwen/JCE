@@ -5,9 +5,9 @@
  * Supports all assimp-supported formats: OBJ, FBX, 3DS, glTF, etc.
  */
 
+#include "jce_model_loader_assimp.h"
+
 extern "C" {
-#include <jce/graphics/jce_mesh.h>
-#include <jce/resource/pak_loader.h>
 #include <jce/core/jce_log.h>
 }
 
@@ -22,32 +22,49 @@ extern "C" {
 
 extern "C" {
 
-/* Merge all meshes in the scene into a single JceMesh. */
-static JceMesh *convert_all_meshes(const aiScene *scene)
+void jce_editor_model_free_cpu_data(JceEditorCpuMeshData *data)
 {
-    if (!scene || scene->mNumMeshes == 0) return nullptr;
+    if (!data) return;
+    SDL_free(data->vertices);
+    SDL_free(data->indices);
+    data->vertices = nullptr;
+    data->indices = nullptr;
+    data->vertex_count = 0;
+    data->index_count = 0;
+}
 
-    /* First pass: count totals. */
+static bool build_cpu_mesh_data(const aiScene *scene, JceEditorCpuMeshData *out)
+{
+    if (!scene || scene->mNumMeshes == 0 || !out) return false;
+
+    out->vertices = nullptr;
+    out->indices = nullptr;
+    out->vertex_count = 0;
+    out->index_count = 0;
+
     uint32_t total_verts = 0;
     uint32_t total_indices = 0;
     for (unsigned m = 0; m < scene->mNumMeshes; m++) {
         const aiMesh *ai = scene->mMeshes[m];
         total_verts += ai->mNumVertices;
-        for (unsigned f = 0; f < ai->mNumFaces; f++)
+        for (unsigned f = 0; f < ai->mNumFaces; f++) {
             if (ai->mFaces[f].mNumIndices == 3)
                 total_indices += 3;
+        }
     }
 
-    if (total_verts == 0) return nullptr;
+    if (total_verts == 0) return false;
 
     auto *verts = static_cast<JceMeshVertex *>(
         SDL_calloc(total_verts, sizeof(JceMeshVertex)));
-    auto *indices = static_cast<uint32_t *>(
-        SDL_malloc(static_cast<size_t>(total_indices) * sizeof(uint32_t)));
-    if (!verts || !indices) {
+    auto *indices = (total_indices > 0)
+        ? static_cast<uint32_t *>(SDL_malloc(
+            static_cast<size_t>(total_indices) * sizeof(uint32_t)))
+        : nullptr;
+    if (!verts || (total_indices > 0 && !indices)) {
         SDL_free(verts);
         SDL_free(indices);
-        return nullptr;
+        return false;
     }
 
     uint32_t idx_count = 0;
@@ -90,10 +107,58 @@ static JceMesh *convert_all_meshes(const aiScene *scene)
         vertex_offset += ai->mNumVertices;
     }
 
-    JceMesh *mesh = jce_mesh_create(verts, total_verts, indices, idx_count);
-    SDL_free(verts);
-    SDL_free(indices);
+    out->vertices = verts;
+    out->indices = indices;
+    out->vertex_count = total_verts;
+    out->index_count = idx_count;
+    return true;
+}
+
+/* Merge all meshes in the scene into a single JceMesh. */
+static JceMesh *convert_all_meshes(const aiScene *scene)
+{
+    JceEditorCpuMeshData cpu = {};
+    if (!build_cpu_mesh_data(scene, &cpu))
+        return nullptr;
+
+    JceMesh *mesh = jce_mesh_create(cpu.vertices, cpu.vertex_count,
+                                    cpu.indices, cpu.index_count);
+    jce_editor_model_free_cpu_data(&cpu);
     return mesh;
+}
+
+bool jce_editor_model_load_cpu_file(const char *file_path,
+                                    JceEditorCpuMeshData *out)
+{
+    if (!file_path || file_path[0] == '\0' || !out) return false;
+
+    out->vertices = nullptr;
+    out->indices = nullptr;
+    out->vertex_count = 0;
+    out->index_count = 0;
+
+    Assimp::Importer importer;
+    const aiScene *scene = importer.ReadFile(
+        file_path,
+        aiProcess_Triangulate
+        | aiProcess_GenSmoothNormals
+        | aiProcess_FlipUVs
+        | aiProcess_CalcTangentSpace);
+
+    if (!scene || !scene->mNumMeshes) {
+        LOG_ERROR(LOG_TAG, "assimp cpu file load failed: %s  %s",
+                  file_path, importer.GetErrorString());
+        return false;
+    }
+
+    if (!build_cpu_mesh_data(scene, out)) {
+        LOG_ERROR(LOG_TAG, "cpu mesh conversion failed: %s", file_path);
+        return false;
+    }
+
+    LOG_DEBUG(LOG_TAG, "decoded cpu mesh %s (%u verts, %u tris)",
+              file_path, out->vertex_count, out->index_count / 3);
+    return true;
 }
 
 JceMesh *jce_editor_model_load(const PakArchive *pak, const char *asset_path)

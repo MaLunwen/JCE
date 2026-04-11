@@ -41,6 +41,8 @@ static struct {
     int      tag_filter;
     uint32_t renaming_id;
     char     rename_buf[JCE_MAX_ENTITY_NAME];
+    bool     rename_focus_pending;
+    bool     rename_had_focus;
     uint32_t context_menu_id;
     bool     context_on_empty;
     bool     want_ctx_popup;     /* deferred OpenPopup flag */
@@ -61,6 +63,14 @@ static void ensure_init(void)
     if (s_hier.initialized) return;
     memset(&s_hier, 0, sizeof(s_hier));
     s_hier.initialized = true;
+}
+
+static void begin_rename_entity(uint32_t id, const char *name)
+{
+    s_hier.renaming_id = id;
+    s_hier.rename_focus_pending = true;
+    s_hier.rename_had_focus = false;
+    snprintf(s_hier.rename_buf, sizeof(s_hier.rename_buf), "%s", name ? name : "");
 }
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
@@ -149,6 +159,40 @@ static bool entity_matches_search_fields(const JceEntityInfo *e, const char *fil
     }
 
     return false;
+}
+
+static void build_default_prefab_path(const char *entity_name,
+                                      char *out_path,
+                                      size_t out_path_size)
+{
+    if (!out_path || out_path_size == 0)
+        return;
+
+    char slug[128];
+    int w = 0;
+    if (entity_name) {
+        for (int i = 0; entity_name[i] != '\0' && w < (int)sizeof(slug) - 1; i++) {
+            char c = entity_name[i];
+            bool is_alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+            bool is_digit = (c >= '0' && c <= '9');
+            if (is_alpha || is_digit) {
+                if (c >= 'A' && c <= 'Z')
+                    c = (char)(c + ('a' - 'A'));
+                slug[w++] = c;
+            } else if (w > 0 && slug[w - 1] != '_') {
+                slug[w++] = '_';
+            }
+        }
+    }
+
+    while (w > 0 && slug[w - 1] == '_')
+        --w;
+    slug[w] = '\0';
+
+    if (slug[0] == '\0')
+        snprintf(slug, sizeof(slug), "entity");
+
+    snprintf(out_path, out_path_size, "assets/prefabs/%s.jprefab", slug);
 }
 
 static int name_compare_ci(const char *a, const char *b)
@@ -274,8 +318,12 @@ static void draw_entity_node(JceEntityInfo *e)
     if (node_in_reveal_path(e->id))
         ImGui::SetNextItemOpen(true, ImGuiCond_Always);
 
+    if (e->prefab_instance)
+        ImGui::PushStyleColor(ImGuiCol_Text, JCE_COLOR_HIER_PREFAB);
     bool node_open = ImGui::TreeNodeEx((void *)(intptr_t)e->id, flags,
                                         "%s", is_renaming ? "" : e->name);
+    if (e->prefab_instance)
+        ImGui::PopStyleColor();
 
     if (s_hier.reveal_pending && e->id == s_hier.reveal_target) {
         ImGui::SetScrollHereY(0.35f);
@@ -284,17 +332,25 @@ static void draw_entity_node(JceEntityInfo *e)
 
     if (is_renaming) {
         ImGui::SameLine();
-        ImGui::SetKeyboardFocusHere();
+        if (s_hier.rename_focus_pending)
+            ImGui::SetKeyboardFocusHere();
         if (ImGui::InputText("##rename", s_hier.rename_buf, sizeof(s_hier.rename_buf),
                              ImGuiInputTextFlags_EnterReturnsTrue |
                              ImGuiInputTextFlags_AutoSelectAll)) {
             jce_state_rename_entity(e->id, s_hier.rename_buf);
             s_hier.renaming_id = 0;
+            s_hier.rename_focus_pending = false;
+            s_hier.rename_had_focus = false;
         }
-        if (ImGui::IsItemDeactivatedAfterEdit() || (!ImGui::IsItemActive() && s_hier.renaming_id)) {
+        if (ImGui::IsItemActive()) {
+            s_hier.rename_focus_pending = false;
+            s_hier.rename_had_focus = true;
+        }
+        if (!s_hier.rename_focus_pending && s_hier.rename_had_focus && ImGui::IsItemDeactivated()) {
             if (s_hier.rename_buf[0])
                 jce_state_rename_entity(e->id, s_hier.rename_buf);
             s_hier.renaming_id = 0;
+            s_hier.rename_had_focus = false;
         }
     }
 
@@ -361,12 +417,38 @@ static void draw_entity_node(JceEntityInfo *e)
     }
 
     if (ImGui::BeginDragDropTarget()) {
+        /* Drop ON an entity → reparent (make child). */
         const ImGuiPayload *payload = ImGui::AcceptDragDropPayload("JCE_ENTITY");
         if (payload) {
             uint32_t dragged_id = *(uint32_t *)payload->Data;
             jce_state_reparent_entity(dragged_id, e->id);
         }
         ImGui::EndDragDropTarget();
+    }
+
+    /* ── Drop-between zone: thin strip below the node for sibling reorder ── */
+    {
+        ImGui::PushID((int)e->id + 0x100000);
+        float avail = ImGui::GetContentRegionAvail().x;
+        ImGui::InvisibleButton("##drop_after", ImVec2(avail, 3.0f));
+
+        if (ImGui::BeginDragDropTarget()) {
+            /* Highlight with a line while hovering. */
+            ImVec2 p0 = ImGui::GetItemRectMin();
+            ImVec2 p1 = ImGui::GetItemRectMax();
+            ImGui::GetWindowDrawList()->AddLine(
+                ImVec2(p0.x, p0.y + 1), ImVec2(p1.x, p0.y + 1),
+                IM_COL32(100, 160, 255, 200), 2.0f);
+
+            const ImGuiPayload *payload = ImGui::AcceptDragDropPayload("JCE_ENTITY");
+            if (payload) {
+                uint32_t dragged_id = *(uint32_t *)payload->Data;
+                if (dragged_id != e->id)
+                    jce_state_reorder_sibling(dragged_id, e->id, true);
+            }
+            ImGui::EndDragDropTarget();
+        }
+        ImGui::PopID();
     }
 
     if (!e->enabled)
@@ -487,6 +569,7 @@ void jce_editor_panel_hierarchy_content(void)
             /* ── Empty-area context menu (matches reference) ──────── */
             if (ImGui::MenuItem(jce_editor_i18n("hierarchy.createEmpty"))) {
                 uint32_t id = jce_state_create_entity("New Entity", 0);
+                jce_state_add_component(id, JCE_COMP_TRANSFORM);
                 jce_state_select_entity(id, false);
                 jce_editor_inspector_request_sync();
                 jce_editor_layout_request_focus_inspector();
@@ -495,24 +578,54 @@ void jce_editor_panel_hierarchy_content(void)
             if (ImGui::BeginMenu(jce_editor_i18n("hierarchy.create3D"))) {
                 if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.createCube"))) {
                     uint32_t id = jce_state_create_entity("Cube", 0);
+                    jce_state_add_component(id, JCE_COMP_TRANSFORM);
+                    jce_state_add_component(id, JCE_COMP_MESH_RENDERER);
+                    /* mesh_shape defaults to JCE_MESH_SHAPE_CUBE (0) */
                     jce_state_select_entity(id, false);
                     jce_editor_inspector_request_sync();
                     jce_editor_layout_request_focus_inspector();
                 }
                 if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.createSphere"))) {
                     uint32_t id = jce_state_create_entity("Sphere", 0);
+                    jce_state_add_component(id, JCE_COMP_TRANSFORM);
+                    jce_state_add_component(id, JCE_COMP_MESH_RENDERER);
+                    {
+                        int cc = 0;
+                        JceComponentInfo *cs = jce_state_get_entity_components(id, &cc);
+                        for (int ci = 0; ci < cc; ci++)
+                            if (cs[ci].type == JCE_COMP_MESH_RENDERER)
+                                cs[ci].data.mesh_renderer.mesh_shape = JCE_MESH_SHAPE_SPHERE;
+                    }
                     jce_state_select_entity(id, false);
                     jce_editor_inspector_request_sync();
                     jce_editor_layout_request_focus_inspector();
                 }
                 if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.createPlane"))) {
                     uint32_t id = jce_state_create_entity("Plane", 0);
+                    jce_state_add_component(id, JCE_COMP_TRANSFORM);
+                    jce_state_add_component(id, JCE_COMP_MESH_RENDERER);
+                    {
+                        int cc = 0;
+                        JceComponentInfo *cs = jce_state_get_entity_components(id, &cc);
+                        for (int ci = 0; ci < cc; ci++)
+                            if (cs[ci].type == JCE_COMP_MESH_RENDERER)
+                                cs[ci].data.mesh_renderer.mesh_shape = JCE_MESH_SHAPE_PLANE;
+                    }
                     jce_state_select_entity(id, false);
                     jce_editor_inspector_request_sync();
                     jce_editor_layout_request_focus_inspector();
                 }
-                if (ImGui::MenuItem("Cylinder")) {
+                if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.createCylinder"))) {
                     uint32_t id = jce_state_create_entity("Cylinder", 0);
+                    jce_state_add_component(id, JCE_COMP_TRANSFORM);
+                    jce_state_add_component(id, JCE_COMP_MESH_RENDERER);
+                    {
+                        int cc = 0;
+                        JceComponentInfo *cs = jce_state_get_entity_components(id, &cc);
+                        for (int ci = 0; ci < cc; ci++)
+                            if (cs[ci].type == JCE_COMP_MESH_RENDERER)
+                                cs[ci].data.mesh_renderer.mesh_shape = JCE_MESH_SHAPE_CYLINDER;
+                    }
                     jce_state_select_entity(id, false);
                     jce_editor_inspector_request_sync();
                     jce_editor_layout_request_focus_inspector();
@@ -521,14 +634,17 @@ void jce_editor_panel_hierarchy_content(void)
             }
 
             if (ImGui::BeginMenu(jce_editor_i18n("hierarchy.create2D"))) {
-                if (ImGui::MenuItem("Sprite")) {
+                if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.createSprite"))) {
                     uint32_t id = jce_state_create_entity("Sprite", 0);
+                    jce_state_add_component(id, JCE_COMP_TRANSFORM);
+                    jce_state_add_component(id, JCE_COMP_SPRITE_RENDERER);
                     jce_state_select_entity(id, false);
                     jce_editor_inspector_request_sync();
                     jce_editor_layout_request_focus_inspector();
                 }
-                if (ImGui::MenuItem("Text")) {
+                if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.createText"))) {
                     uint32_t id = jce_state_create_entity("Text", 0);
+                    jce_state_add_component(id, JCE_COMP_TRANSFORM);
                     jce_state_select_entity(id, false);
                     jce_editor_inspector_request_sync();
                     jce_editor_layout_request_focus_inspector();
@@ -538,12 +654,16 @@ void jce_editor_panel_hierarchy_content(void)
 
             if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.createCamera"))) {
                 uint32_t id = jce_state_create_entity("Camera", 0);
+                jce_state_add_component(id, JCE_COMP_TRANSFORM);
+                jce_state_add_component(id, JCE_COMP_CAMERA);
                 jce_state_select_entity(id, false);
                 jce_editor_inspector_request_sync();
                 jce_editor_layout_request_focus_inspector();
             }
-            if (ImGui::MenuItem("Light")) {
+            if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.createLight"))) {
                 uint32_t id = jce_state_create_entity("Light", 0);
+                jce_state_add_component(id, JCE_COMP_TRANSFORM);
+                jce_state_add_component(id, JCE_COMP_LIGHT);
                 jce_state_select_entity(id, false);
                 jce_editor_inspector_request_sync();
                 jce_editor_layout_request_focus_inspector();
@@ -561,7 +681,7 @@ void jce_editor_panel_hierarchy_content(void)
             }
 
             ImGui::Separator();
-            if (ImGui::MenuItem("Select All", "Ctrl+A")) {
+            if (ImGui::MenuItem(jce_editor_i18n("menu.edit.selectAll"), "Ctrl+A")) {
                 jce_state_clear_selection();
                 bool first = true;
                 int total = jce_state_get_entity_count();
@@ -576,7 +696,7 @@ void jce_editor_panel_hierarchy_content(void)
                     jce_editor_inspector_request_sync();
                 }
             }
-            if (ImGui::MenuItem("Deselect All", "Esc")) {
+            if (ImGui::MenuItem(jce_editor_i18n("hierarchy.deselectAll"), "Esc")) {
                 jce_state_clear_selection();
                 s_hier.shift_anchor = 0;
                 jce_editor_inspector_request_sync();
@@ -598,7 +718,7 @@ void jce_editor_panel_hierarchy_content(void)
             ImGui::TextDisabled("%s", ctx_e->name);
             ImGui::Separator();
 
-            if (ImGui::MenuItem("Focus", "F")) {
+            if (ImGui::MenuItem(jce_editor_i18n("hierarchy.focus"), "F")) {
                 jce_state_select_entity(ctx_e->id, false);
                 s_hier.shift_anchor = ctx_e->id;
                 jce_editor_inspector_request_sync();
@@ -606,8 +726,7 @@ void jce_editor_panel_hierarchy_content(void)
             }
 
             if (ImGui::MenuItem(jce_editor_i18n("hierarchy.rename"), "F2")) {
-                s_hier.renaming_id = ctx_e->id;
-                snprintf(s_hier.rename_buf, sizeof(s_hier.rename_buf), "%s", ctx_e->name);
+                begin_rename_entity(ctx_e->id, ctx_e->name);
             }
 
             if (ImGui::MenuItem(jce_editor_i18n("hierarchy.duplicate"), "Ctrl+D")) {
@@ -620,11 +739,13 @@ void jce_editor_panel_hierarchy_content(void)
                     for (int si = 0; si < n; si++)
                         src_ids[si] = sel[si];
 
+                    jce_state_begin_batch_edit();
                     for (int si = 0; si < n; si++) {
                         uint32_t dup = jce_state_duplicate_entity(src_ids[si]);
                         if (dup != 0 && dup_count < JCE_MAX_SELECTED)
                             dup_ids[dup_count++] = dup;
                     }
+                    jce_state_end_batch_edit();
                 } else {
                     uint32_t dup = jce_state_duplicate_entity(ctx_e->id);
                     if (dup != 0)
@@ -667,7 +788,7 @@ void jce_editor_panel_hierarchy_content(void)
                         jce_editor_inspector_request_sync();
                         jce_editor_layout_request_focus_inspector();
                     }
-                    if (ImGui::MenuItem("Cylinder")) {
+                    if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.createCylinder"))) {
                         uint32_t id = jce_state_create_entity("Cylinder", ctx_e->id);
                         jce_state_select_entity(id, false);
                         jce_editor_inspector_request_sync();
@@ -681,11 +802,38 @@ void jce_editor_panel_hierarchy_content(void)
                     jce_editor_inspector_request_sync();
                     jce_editor_layout_request_focus_inspector();
                 }
-                if (ImGui::MenuItem("Light")) {
+                if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.createLight"))) {
                     uint32_t id = jce_state_create_entity("Light", ctx_e->id);
                     jce_state_select_entity(id, false);
                     jce_editor_inspector_request_sync();
                     jce_editor_layout_request_focus_inspector();
+                }
+                ImGui::EndMenu();
+            }
+
+            ImGui::Separator();
+            if (ImGui::BeginMenu(jce_editor_i18n("hierarchy.prefab"))) {
+                if (ImGui::MenuItem(jce_editor_i18n("hierarchy.prefab.saveAs"))) {
+                    char prefab_path[512];
+                    build_default_prefab_path(ctx_e->name, prefab_path, sizeof(prefab_path));
+                    if (jce_state_save_prefab(ctx_e->id, prefab_path)) {
+                        jce_editor_console_log("Saved prefab: %s", prefab_path);
+                        jce_editor_inspector_request_sync();
+                    } else {
+                        jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+                            "Failed to save prefab: %s", prefab_path);
+                    }
+                }
+
+                bool can_revert = jce_state_is_prefab_instance(ctx_e->id)
+                    && jce_state_get_prefab_path(ctx_e->id) != NULL;
+                if (ImGui::MenuItem(jce_editor_i18n("hierarchy.prefab.revert"), NULL, false, can_revert)) {
+                    if (jce_state_revert_prefab(ctx_e->id)) {
+                        jce_editor_inspector_request_sync();
+                    } else {
+                        jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+                            "Failed to revert prefab instance");
+                    }
                 }
                 ImGui::EndMenu();
             }
@@ -752,7 +900,9 @@ void jce_editor_panel_hierarchy_content(void)
             ImGui::Separator();
 
             ImGui::PushStyleColor(ImGuiCol_Text, JCE_COLOR_TEXT_ERROR);
-            const char *delete_label = multi_on_ctx ? "Delete Selected" : jce_editor_i18n("hierarchy.delete");
+            const char *delete_label = multi_on_ctx
+                ? jce_editor_i18n("hierarchy.deleteSelected")
+                : jce_editor_i18n("hierarchy.delete");
             if (ImGui::MenuItem(delete_label, "Del")) {
                 int selected_count = 0;
                 const uint32_t *selected_ids = jce_state_get_selection(&selected_count);
@@ -777,9 +927,8 @@ void jce_editor_panel_hierarchy_content(void)
         uint32_t focused = jce_state_get_focused();
         if (focused) {
             if (ImGui::IsKeyPressed(ImGuiKey_F2)) {
-                s_hier.renaming_id = focused;
                 JceEntityInfo *e = jce_state_get_entity(focused);
-                if (e) snprintf(s_hier.rename_buf, sizeof(s_hier.rename_buf), "%s", e->name);
+                if (e) begin_rename_entity(focused, e->name);
             }
             if (ImGui::IsKeyPressed(ImGuiKey_Delete)) {
                 int sel_count = 0;
@@ -794,8 +943,34 @@ void jce_editor_panel_hierarchy_content(void)
                 }
             }
             if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D)) {
-                uint32_t dup = jce_state_duplicate_entity(focused);
-                jce_state_select_entity(dup, false);
+                int sel_count = 0;
+                const uint32_t *sel = jce_state_get_selection(&sel_count);
+                if (sel_count > 1) {
+                    uint32_t src_ids[JCE_MAX_SELECTED];
+                    uint32_t dup_ids[JCE_MAX_SELECTED];
+                    int n = sel_count < JCE_MAX_SELECTED ? sel_count : JCE_MAX_SELECTED;
+                    int dup_count = 0;
+
+                    for (int i = 0; i < n; i++)
+                        src_ids[i] = sel[i];
+
+                    jce_state_begin_batch_edit();
+                    for (int i = 0; i < n; i++) {
+                        uint32_t dup = jce_state_duplicate_entity(src_ids[i]);
+                        if (dup != 0)
+                            dup_ids[dup_count++] = dup;
+                    }
+                    jce_state_end_batch_edit();
+
+                    if (dup_count > 0) {
+                        jce_state_select_entity(dup_ids[0], false);
+                        for (int i = 1; i < dup_count; i++)
+                            jce_state_select_entity(dup_ids[i], true);
+                    }
+                } else {
+                    uint32_t dup = jce_state_duplicate_entity(focused);
+                    jce_state_select_entity(dup, false);
+                }
             }
             if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C))
                 jce_state_copy_entity(focused);
@@ -814,7 +989,9 @@ void jce_editor_panel_hierarchy(void)
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_HIERARCHY);
     if (!*vis) return;
 
-    if (ImGui::Begin("Hierarchy###Hierarchy", vis))
+    char title[256];
+    snprintf(title, sizeof(title), "%s###Hierarchy", jce_editor_i18n("Hierarchy"));
+    if (ImGui::Begin(title, vis))
         jce_editor_panel_hierarchy_content();
     ImGui::End();
 }

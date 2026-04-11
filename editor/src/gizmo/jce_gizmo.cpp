@@ -272,3 +272,12 @@ extern "C" JceGizmoAxis jce_gizmo_hovered_axis(void)
 {
     return s_gizmo.hovered_axis;
 }
+
+extern "C" void jce_gizmo_cancel_interaction(void)
+{
+    s_gizmo.active = false;
+    s_gizmo.hovered_axis = JCE_GIZMO_AXIS_NONE;
+    s_gizmo.drag_axis = JCE_GIZMO_AXIS_NONE;
+    s_gizmo.drag_prev_mouse[0] = 0.0f;
+    s_gizmo.drag_prev_mouse[1] = 0.0f;
+}

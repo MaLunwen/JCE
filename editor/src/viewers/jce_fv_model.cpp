@@ -251,15 +251,15 @@ void fv_render_model(FvTab *tab)
                           ImGuiChildFlags_Borders);
         {
             /* Controls bar */
-            ImGui::Checkbox("Wireframe", &ms->show_wireframe);
+            ImGui::Checkbox(jce_editor_i18n("viewer.wireframe"), &ms->show_wireframe);
             ImGui::SameLine();
-            ImGui::Checkbox("Grid", &ms->show_grid);
+            ImGui::Checkbox(jce_editor_i18n("viewer.showGrid"), &ms->show_grid);
             ImGui::SameLine();
-            ImGui::Checkbox("Auto-Rotate", &ms->auto_rotate);
+            ImGui::Checkbox(jce_editor_i18n("viewer.autoRotate"), &ms->auto_rotate);
             ImGui::SameLine();
-            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "Zoom: %.1fx", ms->zoom);
+            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s: %.1fx", jce_editor_i18n("viewer.zoom"), ms->zoom);
             ImGui::SameLine();
-            if (ImGui::SmallButton("Reset View")) {
+            if (ImGui::SmallButton(jce_editor_i18n("viewer.resetView"))) {
                 ms->rotX = 30.0f; ms->rotY = -45.0f; ms->zoom = 1.0f;
                 ms->panX = 0.0f; ms->panY = 0.0f;
             }
@@ -410,29 +410,29 @@ void fv_render_model(FvTab *tab)
         /* Info panel (35%) */
         ImGui::BeginChild("##mdlinfo_panel", ImVec2(0, avail.y), false);
         {
-            ImGui::TextColored(JCE_COLOR_ACCENT, "3D Model Info");
+            ImGui::TextColored(JCE_COLOR_ACCENT, "%s", jce_editor_i18n("viewer.modelInfo"));
             ImGui::Separator();
             ImGui::Spacing();
 
             ImGui::Columns(2, "##mdlinfo2", false);
             ImGui::SetColumnWidth(0, 100);
 
-            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "Format:");
+            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s:", jce_editor_i18n("viewer.format"));
             ImGui::NextColumn(); ImGui::Text("%s", fmt_name); ImGui::NextColumn();
 
-            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "Loader:");
-            ImGui::NextColumn(); ImGui::Text("Assimp"); ImGui::NextColumn();
+            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s:", jce_editor_i18n("viewer.loader"));
+            ImGui::NextColumn(); ImGui::Text("%s", jce_editor_i18n("viewer.loaderAssimp")); ImGui::NextColumn();
 
-            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "Meshes:");
+            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s:", jce_editor_i18n("viewer.meshes"));
             ImGui::NextColumn(); ImGui::Text("%d", ms->mesh_count); ImGui::NextColumn();
 
-            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "Vertices:");
+            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s:", jce_editor_i18n("viewer.vertices"));
             ImGui::NextColumn(); ImGui::Text("%d", ms->vert_count); ImGui::NextColumn();
 
-            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "Faces:");
+            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s:", jce_editor_i18n("viewer.faces"));
             ImGui::NextColumn(); ImGui::Text("%d", ms->face_count); ImGui::NextColumn();
 
-            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "File Size:");
+            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s:", jce_editor_i18n("viewer.fileSize"));
             ImGui::NextColumn();
             if (tab->file_size >= 1024 * 1024)
                 ImGui::Text("%.2f MB", (double)tab->file_size / (1024.0 * 1024.0));
@@ -441,7 +441,7 @@ void fv_render_model(FvTab *tab)
             ImGui::NextColumn();
 
             if (ms->vert_count > 0) {
-                ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "Bounds:");
+                ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s:", jce_editor_i18n("viewer.boundingBox"));
                 ImGui::NextColumn();
                 ImGui::Text("%.2f x %.2f x %.2f",
                     ms->maxX - ms->minX, ms->maxY - ms->minY, ms->maxZ - ms->minZ);
@@ -451,7 +451,8 @@ void fv_render_model(FvTab *tab)
 
             if (!ms->materials.empty()) {
                 ImGui::Spacing();
-                ImGui::TextColored(JCE_COLOR_ACCENT, "Materials (%d)",
+                ImGui::TextColored(JCE_COLOR_ACCENT, "%s (%d)",
+                    jce_editor_i18n("viewer.materials"),
                     (int)ms->materials.size());
                 ImGui::Separator();
                 for (auto &m : ms->materials)
@@ -459,15 +460,15 @@ void fv_render_model(FvTab *tab)
             }
 
             ImGui::Spacing();
-            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "Path:");
+            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s:", jce_editor_i18n("viewer.path"));
             ImGui::TextWrapped("%s", tab->path);
 
             ImGui::Spacing();
             ImGui::Separator();
-            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "Controls:");
-            ImGui::BulletText("Left-drag to rotate");
-            ImGui::BulletText("Right-drag to pan");
-            ImGui::BulletText("Scroll to zoom");
+            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s:", jce_editor_i18n("viewer.controls"));
+            ImGui::BulletText("%s", jce_editor_i18n("viewer.controlRotate"));
+            ImGui::BulletText("%s", jce_editor_i18n("viewer.controlPan"));
+            ImGui::BulletText("%s", jce_editor_i18n("viewer.controlZoom"));
         }
         ImGui::EndChild();
 
@@ -476,11 +477,11 @@ void fv_render_model(FvTab *tab)
 
     /* ── Assimp load failed: show diagnostics + optional source ──── */
     ImGui::Spacing();
-    ImGui::TextColored(JCE_COLOR_ACCENT, "3D Model Info");
+    ImGui::TextColored(JCE_COLOR_ACCENT, "%s", jce_editor_i18n("viewer.modelInfo"));
     ImGui::Separator();
     ImGui::Spacing();
 
-    ImGui::TextColored(JCE_COLOR_TEXT_ERROR, "Assimp load failed.");
+    ImGui::TextColored(JCE_COLOR_TEXT_ERROR, "%s", jce_editor_i18n("viewer.assimpLoadFailed"));
     if (ms->load_error[0])
         ImGui::TextWrapped("%s", ms->load_error);
     ImGui::Spacing();
@@ -488,10 +489,10 @@ void fv_render_model(FvTab *tab)
     ImGui::Columns(2, "##mdlinfo", false);
     ImGui::SetColumnWidth(0, 120);
 
-    ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "Format:");
+    ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s:", jce_editor_i18n("viewer.format"));
     ImGui::NextColumn(); ImGui::Text("%s", fmt_name); ImGui::NextColumn();
 
-    ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "File Size:");
+    ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s:", jce_editor_i18n("viewer.fileSize"));
     ImGui::NextColumn();
     if (tab->file_size >= 1024 * 1024)
         ImGui::Text("%.2f MB", (double)tab->file_size / (1024.0 * 1024.0));
@@ -503,13 +504,13 @@ void fv_render_model(FvTab *tab)
         const unsigned char *d = (const unsigned char *)tab->content;
         uint32_t version = d[4] | (d[5] << 8) | (d[6] << 16) | (d[7] << 24);
         uint32_t length  = d[8] | (d[9] << 8) | (d[10] << 16) | (d[11] << 24);
-        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "GLB Version:");
+        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s:", jce_editor_i18n("viewer.glbVersion"));
         ImGui::NextColumn(); ImGui::Text("%u", version); ImGui::NextColumn();
-        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "Total Size:");
+        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s:", jce_editor_i18n("viewer.totalSize"));
         ImGui::NextColumn(); ImGui::Text("%u bytes", length); ImGui::NextColumn();
     }
 
-    ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "Path:");
+    ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s:", jce_editor_i18n("viewer.path"));
     ImGui::NextColumn(); ImGui::TextWrapped("%s", tab->path); ImGui::NextColumn();
     ImGui::Columns(1);
 
@@ -517,7 +518,7 @@ void fv_render_model(FvTab *tab)
         || strcmp(tab->ext, ".dae") == 0) {
         ImGui::Spacing();
         ImGui::Separator();
-        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "Source:");
+        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s:", jce_editor_i18n("viewer.source"));
         fv_render_code(tab);
     }
 }

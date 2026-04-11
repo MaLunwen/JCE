@@ -42,7 +42,7 @@ void fv_render_image(FvTab *tab)
             if (tab->zoom > 10.0f) tab->zoom = 10.0f;
         }
         ImGui::SameLine();
-        if (ImGui::SmallButton("Fit")) {
+        if (ImGui::SmallButton(jce_editor_i18n("viewer.fitToWindow"))) {
             ImVec2 a = ImGui::GetContentRegionAvail();
             if (tab->img_w > 0 && tab->img_h > 0) {
                 float sx = a.x / (float)tab->img_w;
@@ -124,22 +124,22 @@ void fv_render_image(FvTab *tab)
     } else {
         /* Fallback: texture not loaded */
         ImGui::Spacing();
-        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
-            "Image could not be loaded for preview.");
+        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s",
+            jce_editor_i18n("viewer.imageLoadFailed"));
 
         ImGui::Spacing();
-        ImGui::TextColored(JCE_COLOR_ACCENT, "Image Info");
+        ImGui::TextColored(JCE_COLOR_ACCENT, "%s", jce_editor_i18n("viewer.textureInfo"));
         ImGui::Separator();
         ImGui::Columns(2, "##imginfo", false);
         ImGui::SetColumnWidth(0, 120);
-        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "File Size:");
+        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s:", jce_editor_i18n("viewer.fileSize"));
         ImGui::NextColumn();
         if (tab->file_size >= 1024 * 1024)
             ImGui::Text("%.2f MB", (double)tab->file_size / (1024.0 * 1024.0));
         else
             ImGui::Text("%.1f KB", (double)tab->file_size / 1024.0);
         ImGui::NextColumn();
-        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "Path:");
+        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s:", jce_editor_i18n("viewer.path"));
         ImGui::NextColumn(); ImGui::TextWrapped("%s", tab->path); ImGui::NextColumn();
         ImGui::Columns(1);
     }

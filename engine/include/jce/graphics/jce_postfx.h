@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include <jce/core/jce_allocator.h>
 #include <jce/graphics/jce_gfx_types.h>
+#include <jce/resource/pak_loader.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -98,8 +99,10 @@ JcePostFXParams jce_postfx_default_params(void);
 /* ================================================================== */
 
 /* Load the shaders required by the enabled effects.
-   Must be called after renderer and shader system are ready. */
-bool jce_postfx_load_shaders(JcePostFXPipeline *pipeline);
+   Must be called after renderer and shader system are ready.
+   pak: the PAK archive containing compiled shader binaries. */
+bool jce_postfx_load_shaders(JcePostFXPipeline *pipeline,
+                             const PakArchive *pak);
 
 /* Execute the enabled post-processing chain.
    scene_fb: the framebuffer containing the rendered scene.
@@ -107,6 +110,10 @@ bool jce_postfx_load_shaders(JcePostFXPipeline *pipeline);
 void jce_postfx_apply(JcePostFXPipeline *pipeline,
                       JceTextureHandle scene_color,
                       JceTextureHandle scene_depth);
+
+/* Get the output texture after jce_postfx_apply.
+   Returns JCE_TEXTURE_INVALID if no effects were active. */
+JceTextureHandle jce_postfx_get_output(const JcePostFXPipeline *pipeline);
 
 #ifdef __cplusplus
 }

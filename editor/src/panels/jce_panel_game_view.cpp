@@ -40,7 +40,7 @@ void jce_editor_panel_game_view_content(void)
     }
 
     ImGui::SameLine();
-    ImGui::Text("|");
+    ImGui::TextUnformatted("|");
     ImGui::SameLine();
 
     JcePlayState ps = jce_state_get_play_state();
@@ -67,7 +67,8 @@ void jce_editor_panel_game_view_content(void)
             "%s: %s", jce_editor_i18n("game.renderer"), renderer_names[s_renderer_idx]);
         ImGui::SetCursorPos(ImVec2(8, ImGui::GetCursorPosY()));
         ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 0.8f),
-            "FPS: %.1f | %s: -- | %s: --",
+            "%s: %.1f | %s: -- | %s: --",
+            jce_editor_i18n("preferences.display.targetFps"),
             ImGui::GetIO().Framerate,
             jce_editor_i18n("game.drawCalls"),
             jce_editor_i18n("game.triangles"));
@@ -82,7 +83,9 @@ void jce_editor_panel_game_view(void)
     if (!*vis) return;
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    if (ImGui::Begin("Game###GameView", vis))
+    char title[256];
+    snprintf(title, sizeof(title), "%s###GameView", jce_editor_i18n("Game"));
+    if (ImGui::Begin(title, vis))
         jce_editor_panel_game_view_content();
     ImGui::End();
     ImGui::PopStyleVar();

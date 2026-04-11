@@ -35,6 +35,9 @@ void           jce_anim_player_destroy(JceAnimPlayer *player);
 void  jce_anim_player_play(JceAnimPlayer *p, const JceAnimClip *clip,
                            bool loop, float speed);
 void  jce_anim_player_stop(JceAnimPlayer *p);
+void  jce_anim_player_pause(JceAnimPlayer *p, bool paused);
+void  jce_anim_player_set_speed(JceAnimPlayer *p, float speed);
+float jce_anim_player_get_time(const JceAnimPlayer *p);
 bool  jce_anim_player_is_playing(const JceAnimPlayer *p);
 
 /* Advance by dt seconds and produce joint matrices for GPU upload.
@@ -42,6 +45,14 @@ bool  jce_anim_player_is_playing(const JceAnimPlayer *p);
 uint32_t jce_anim_player_update(JceAnimPlayer *p, float dt,
                                 jce_mat4 *out_joint_matrices,
                                 uint32_t max_joints);
+
+/* -- Skeleton queries ---------------------------------------------- */
+
+/* Return the number of joints in a skeleton. */
+uint32_t jce_skeleton_joint_count(const JceSkeleton *skel);
+
+/* Return the name of a skeleton joint by index (or NULL). */
+const char *jce_skeleton_joint_name(const JceSkeleton *skel, uint32_t index);
 
 #ifdef __cplusplus
 }

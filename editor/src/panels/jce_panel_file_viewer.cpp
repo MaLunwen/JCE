@@ -339,7 +339,7 @@ void jce_file_viewer_draw_content(void)
         ImVec2 tsz = ImGui::CalcTextSize(msg);
         ImGui::SetCursorPos(ImVec2((w - tsz.x) * 0.5f, h * 0.4f));
         ImGui::TextDisabled("%s", msg);
-        const char *hint = "Double-click a file in Asset Browser to preview";
+        const char *hint = jce_editor_i18n("viewer.hint");
         ImVec2 hsz = ImGui::CalcTextSize(hint);
         ImGui::SetCursorPosX((w - hsz.x) * 0.5f);
         ImGui::TextDisabled("%s", hint);
@@ -391,16 +391,16 @@ void jce_file_viewer_draw_content(void)
 
             /* Right-click context menu on tab (must be right after BeginTabItem) */
             if (ImGui::BeginPopupContextItem("##tabctx")) {
-                if (ImGui::MenuItem("Close Tab"))
+                if (ImGui::MenuItem(jce_editor_i18n("fileViewer.closeTab")))
                     tab_open = false;
-                if (ImGui::MenuItem("Close Other Tabs")) {
+                if (ImGui::MenuItem(jce_editor_i18n("fileViewer.closeOtherTabs"))) {
                     for (int j = s_fv.tab_count - 1; j >= 0; j--)
                         if (j != i) fv_close_tab(j);
                     ImGui::EndPopup();
                     ImGui::PopID();
                     break;
                 }
-                if (ImGui::MenuItem("Close All Tabs")) {
+                if (ImGui::MenuItem(jce_editor_i18n("fileViewer.closeAllTabs"))) {
                     jce_file_viewer_close_all();
                     ImGui::EndPopup();
                     ImGui::PopID();
@@ -408,11 +408,11 @@ void jce_file_viewer_draw_content(void)
                 }
                 ImGui::Separator();
                 /* Copy file path */
-                if (ImGui::MenuItem("Copy Path")) {
+                if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.copyPath"))) {
                     ImGui::SetClipboardText(tab->path);
                 }
 #ifdef _WIN32
-                if (ImGui::MenuItem("Open in Explorer")) {
+                if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInExplorer"))) {
                     char cmd[600];
                     snprintf(cmd, sizeof(cmd), "explorer /select,\"%s\"", tab->path);
                     system(cmd);
@@ -456,7 +456,9 @@ void jce_file_viewer_draw_window(bool *p_visible)
         s_fv.want_focus = false;
     }
 
-    if (ImGui::Begin("File Viewer###FileViewer", p_visible))
+    char title[256];
+    snprintf(title, sizeof(title), "%s###FileViewer", jce_editor_i18n("File Viewer"));
+    if (ImGui::Begin(title, p_visible))
         jce_file_viewer_draw_content();
     ImGui::End();
 }

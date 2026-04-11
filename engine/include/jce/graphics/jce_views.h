@@ -19,6 +19,9 @@
 /* Debug overlay (bgfx debug text, profiler). */
 #define JCE_VIEW_DEBUG       2
 
+/* Editor scene viewport render target (off-screen scene panel). */
+#define JCE_VIEW_EDITOR_SCENE 3
+
 /* Shadow map depth passes (one per shadow-casting light). */
 #define JCE_VIEW_SHADOW_BASE 10
 #define JCE_VIEW_SHADOW_0    10

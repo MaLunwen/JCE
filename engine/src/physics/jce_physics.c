@@ -11,8 +11,12 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 
 #define LOG_TAG "physics"
+
+/* max simultaneous contacts tracked for begin/end callbacks */
+#define MAX_CONTACT_PAIRS 512
 
 /* ── Internal body record ──────────────────────────────────────────── */
 
@@ -35,6 +39,12 @@ typedef struct {
     jce_vec3     torque;
 } PhysBody;
 
+/* ── Contact pair for begin/end tracking ────────────────────────────── */
+
+typedef struct {
+    uint32_t a, b; /* body indices, a < b */
+} ContactPair;
+
 /* ── World struct ──────────────────────────────────────────────────── */
 
 struct JcePhysicsWorld {
@@ -52,6 +62,12 @@ struct JcePhysicsWorld {
     void          *contact_begin_ud;
     jce_contact_fn contact_end_fn;
     void          *contact_end_ud;
+
+    /* Contact pair tracking for begin/end events. */
+    ContactPair   prev_pairs[MAX_CONTACT_PAIRS];
+    uint32_t      prev_pair_count;
+    ContactPair   curr_pairs[MAX_CONTACT_PAIRS];
+    uint32_t      curr_pair_count;
 };
 
 /* ── Helpers ───────────────────────────────────────────────────────── */
@@ -141,6 +157,318 @@ static void integrate_body(PhysBody *b, float dt, jce_vec3 gravity)
     b->torque = jce_v3(0, 0, 0);
 }
 
+/* ── Narrow-phase collision tests ──────────────────────────────────── */
+
+/* Result of a narrow-phase test: contact normal points from A → B. */
+typedef struct {
+    bool     colliding;
+    jce_vec3 normal;   /* A → B */
+    jce_vec3 point;    /* world-space contact point */
+    float    depth;    /* penetration depth (>0 = overlapping) */
+} CollisionResult;
+
+static float fclampf(float v, float lo, float hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+/* Sphere vs Sphere */
+static CollisionResult test_sphere_sphere(const PhysBody *a, const PhysBody *b)
+{
+    CollisionResult r = {0};
+    float ra = a->half_extents.x;
+    float rb = b->half_extents.x;
+    jce_vec3 diff = jce_v3_sub(b->position, a->position);
+    float dist = jce_v3_len(diff);
+    float sum = ra + rb;
+
+    if (dist >= sum) return r;
+
+    r.colliding = true;
+    r.depth = sum - dist;
+    if (dist > 1e-6f) {
+        r.normal = jce_v3_scale(diff, 1.0f / dist);
+    } else {
+        r.normal = jce_v3(0, 1, 0);
+    }
+    r.point = jce_v3_add(a->position, jce_v3_scale(r.normal, ra - r.depth * 0.5f));
+    return r;
+}
+
+/* AABB vs AABB (box vs box, axis-aligned only) */
+static CollisionResult test_box_box(const PhysBody *a, const PhysBody *b)
+{
+    CollisionResult r = {0};
+    jce_vec3 d = jce_v3_sub(b->position, a->position);
+    float ox = (a->half_extents.x + b->half_extents.x) - fabsf(d.x);
+    if (ox <= 0) return r;
+    float oy = (a->half_extents.y + b->half_extents.y) - fabsf(d.y);
+    if (oy <= 0) return r;
+    float oz = (a->half_extents.z + b->half_extents.z) - fabsf(d.z);
+    if (oz <= 0) return r;
+
+    r.colliding = true;
+    /* Choose axis of minimum penetration. */
+    if (ox <= oy && ox <= oz) {
+        r.depth = ox;
+        r.normal = jce_v3(d.x > 0 ? 1.0f : -1.0f, 0, 0);
+    } else if (oy <= oz) {
+        r.depth = oy;
+        r.normal = jce_v3(0, d.y > 0 ? 1.0f : -1.0f, 0);
+    } else {
+        r.depth = oz;
+        r.normal = jce_v3(0, 0, d.z > 0 ? 1.0f : -1.0f);
+    }
+    r.point = jce_v3_add(a->position, jce_v3_scale(d, 0.5f));
+    return r;
+}
+
+/* Sphere vs Box (axis-aligned) */
+static CollisionResult test_sphere_box(const PhysBody *sphere, const PhysBody *box)
+{
+    CollisionResult r = {0};
+    /* Clamp sphere center to box extent to find closest point. */
+    jce_vec3 local = jce_v3_sub(sphere->position, box->position);
+    jce_vec3 closest;
+    closest.x = fclampf(local.x, -box->half_extents.x, box->half_extents.x);
+    closest.y = fclampf(local.y, -box->half_extents.y, box->half_extents.y);
+    closest.z = fclampf(local.z, -box->half_extents.z, box->half_extents.z);
+
+    jce_vec3 delta = jce_v3_sub(local, closest);
+    float dist2 = jce_v3_dot(delta, delta);
+    float radius = sphere->half_extents.x;
+
+    if (dist2 >= radius * radius) return r;
+
+    float dist = sqrtf(dist2);
+    r.colliding = true;
+    r.depth = radius - dist;
+    if (dist > 1e-6f) {
+        r.normal = jce_v3_scale(delta, 1.0f / dist);
+    } else {
+        r.normal = jce_v3(0, 1, 0);
+    }
+    r.point = jce_v3_add(box->position, closest);
+    return r;
+}
+
+/* Any shape vs infinite ground plane (Y=0, normal up).
+   Plane bodies use half_extents = (0,0,0). */
+static CollisionResult test_body_plane(const PhysBody *body, const PhysBody *plane)
+{
+    (void)plane;
+    CollisionResult r = {0};
+    float radius = 0.0f;
+
+    if (body->shape == JCE_SHAPE_SPHERE) {
+        radius = body->half_extents.x;
+    } else if (body->shape == JCE_SHAPE_CAPSULE) {
+        /* Approximate as sphere of combined extent. */
+        radius = body->half_extents.x + body->half_extents.y;
+    } else {
+        /* Box: use Y half-extent. */
+        radius = body->half_extents.y;
+    }
+
+    float penetration = radius - (body->position.y - plane->position.y);
+    if (penetration <= 0) return r;
+
+    r.colliding = true;
+    r.depth = penetration;
+    r.normal = jce_v3(0, 1, 0);
+    r.point = jce_v3(body->position.x, plane->position.y, body->position.z);
+    return r;
+}
+
+/* Dispatch collision test between two bodies. Normal points A→B. */
+static CollisionResult test_collision(const PhysBody *a, const PhysBody *b)
+{
+    /* Plane vs anything. */
+    if (b->shape == JCE_SHAPE_PLANE) {
+        return test_body_plane(a, b);
+    }
+    if (a->shape == JCE_SHAPE_PLANE) {
+        CollisionResult r = test_body_plane(b, a);
+        if (r.colliding) r.normal = jce_v3_scale(r.normal, -1.0f);
+        return r;
+    }
+
+    /* Sphere vs Sphere. */
+    if (a->shape == JCE_SHAPE_SPHERE && b->shape == JCE_SHAPE_SPHERE)
+        return test_sphere_sphere(a, b);
+
+    /* Box vs Box. */
+    if (a->shape == JCE_SHAPE_BOX && b->shape == JCE_SHAPE_BOX)
+        return test_box_box(a, b);
+
+    /* Sphere vs Box (or Box vs Sphere). */
+    if (a->shape == JCE_SHAPE_SPHERE && b->shape == JCE_SHAPE_BOX)
+        return test_sphere_box(a, b);
+    if (a->shape == JCE_SHAPE_BOX && b->shape == JCE_SHAPE_SPHERE) {
+        CollisionResult r = test_sphere_box(b, a);
+        if (r.colliding) r.normal = jce_v3_scale(r.normal, -1.0f);
+        return r;
+    }
+
+    /* Capsule or unsupported — use conservative sphere approximation. */
+    PhysBody sa = *a, sb = *b;
+    sa.shape = JCE_SHAPE_SPHERE;
+    sa.half_extents.x = jce_v3_len(a->half_extents);
+    sb.shape = JCE_SHAPE_SPHERE;
+    sb.half_extents.x = jce_v3_len(b->half_extents);
+    return test_sphere_sphere(&sa, &sb);
+}
+
+/* ── Collision resolution ──────────────────────────────────────────── */
+
+static void resolve_collision(PhysBody *a, PhysBody *b,
+                              const CollisionResult *c)
+{
+    bool a_dynamic = (a->type == JCE_BODY_DYNAMIC && a->mass > 0.0f);
+    bool b_dynamic = (b->type == JCE_BODY_DYNAMIC && b->mass > 0.0f);
+
+    float inv_ma = a_dynamic ? (1.0f / a->mass) : 0.0f;
+    float inv_mb = b_dynamic ? (1.0f / b->mass) : 0.0f;
+    float inv_sum = inv_ma + inv_mb;
+
+    if (inv_sum < 1e-10f) return; /* both immovable */
+
+    /* 1. Positional correction — separate bodies. */
+    float correction = c->depth / inv_sum;
+    if (a_dynamic)
+        a->position = jce_v3_sub(a->position,
+                                 jce_v3_scale(c->normal, correction * inv_ma));
+    if (b_dynamic)
+        b->position = jce_v3_add(b->position,
+                                 jce_v3_scale(c->normal, correction * inv_mb));
+
+    /* 2. Impulse-based velocity resolution. */
+    jce_vec3 rel_vel = jce_v3_sub(b->velocity, a->velocity);
+    float vel_along_normal = jce_v3_dot(rel_vel, c->normal);
+
+    if (vel_along_normal > 0) return; /* separating */
+
+    float restitution = fminf(a->restitution, b->restitution);
+    float j = -(1.0f + restitution) * vel_along_normal / inv_sum;
+
+    jce_vec3 impulse = jce_v3_scale(c->normal, j);
+
+    if (a_dynamic)
+        a->velocity = jce_v3_sub(a->velocity, jce_v3_scale(impulse, inv_ma));
+    if (b_dynamic)
+        b->velocity = jce_v3_add(b->velocity, jce_v3_scale(impulse, inv_mb));
+
+    /* 3. Friction impulse (simplified Coulomb). */
+    rel_vel = jce_v3_sub(b->velocity, a->velocity);
+    jce_vec3 tangent = jce_v3_sub(rel_vel,
+                                  jce_v3_scale(c->normal,
+                                               jce_v3_dot(rel_vel, c->normal)));
+    float tangent_len = jce_v3_len(tangent);
+    if (tangent_len < 1e-6f) return;
+    tangent = jce_v3_scale(tangent, 1.0f / tangent_len);
+
+    float jt = -jce_v3_dot(rel_vel, tangent) / inv_sum;
+    float friction = sqrtf(a->friction * b->friction);
+
+    /* Clamp to Coulomb cone. */
+    if (fabsf(jt) > j * friction) jt = (jt > 0 ? 1.0f : -1.0f) * j * friction;
+
+    jce_vec3 friction_impulse = jce_v3_scale(tangent, jt);
+    if (a_dynamic)
+        a->velocity = jce_v3_sub(a->velocity,
+                                 jce_v3_scale(friction_impulse, inv_ma));
+    if (b_dynamic)
+        b->velocity = jce_v3_add(b->velocity,
+                                 jce_v3_scale(friction_impulse, inv_mb));
+}
+
+/* ── Contact pair helpers ──────────────────────────────────────────── */
+
+static bool pair_contains(const ContactPair *arr, uint32_t count,
+                          uint32_t a, uint32_t b)
+{
+    for (uint32_t i = 0; i < count; i++) {
+        if (arr[i].a == a && arr[i].b == b) return true;
+    }
+    return false;
+}
+
+static void record_pair(JcePhysicsWorld *w, uint32_t i, uint32_t j)
+{
+    uint32_t a = i < j ? i : j;
+    uint32_t b = i < j ? j : i;
+    if (w->curr_pair_count < MAX_CONTACT_PAIRS) {
+        w->curr_pairs[w->curr_pair_count].a = a;
+        w->curr_pairs[w->curr_pair_count].b = b;
+        w->curr_pair_count++;
+    }
+}
+
+/* Fire begin/end callbacks by comparing prev vs curr. */
+static void fire_contact_events(JcePhysicsWorld *w)
+{
+    /* New contacts (in curr but not prev) → begin. */
+    if (w->contact_begin_fn) {
+        for (uint32_t k = 0; k < w->curr_pair_count; k++) {
+            if (!pair_contains(w->prev_pairs, w->prev_pair_count,
+                               w->curr_pairs[k].a, w->curr_pairs[k].b)) {
+                JceContactEvent ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.body_a = (JceBodyHandle){ w->curr_pairs[k].a };
+                ev.body_b = (JceBodyHandle){ w->curr_pairs[k].b };
+                w->contact_begin_fn(&ev, w->contact_begin_ud);
+            }
+        }
+    }
+
+    /* Ended contacts (in prev but not curr) → end. */
+    if (w->contact_end_fn) {
+        for (uint32_t k = 0; k < w->prev_pair_count; k++) {
+            if (!pair_contains(w->curr_pairs, w->curr_pair_count,
+                               w->prev_pairs[k].a, w->prev_pairs[k].b)) {
+                JceContactEvent ev;
+                memset(&ev, 0, sizeof(ev));
+                ev.body_a = (JceBodyHandle){ w->prev_pairs[k].a };
+                ev.body_b = (JceBodyHandle){ w->prev_pairs[k].b };
+                w->contact_end_fn(&ev, w->contact_end_ud);
+            }
+        }
+    }
+
+    /* Swap: curr becomes prev for next frame. */
+    memcpy(w->prev_pairs, w->curr_pairs,
+           w->curr_pair_count * sizeof(ContactPair));
+    w->prev_pair_count = w->curr_pair_count;
+}
+
+/* ── Detect and resolve all collisions ─────────────────────────────── */
+
+static void detect_and_resolve(JcePhysicsWorld *w)
+{
+    w->curr_pair_count = 0;
+
+    for (uint32_t i = 0; i < w->capacity; i++) {
+        PhysBody *a = &w->bodies[i];
+        if (!a->alive) continue;
+
+        for (uint32_t j = i + 1; j < w->capacity; j++) {
+            PhysBody *b = &w->bodies[j];
+            if (!b->alive) continue;
+
+            /* Skip static-static and static-kinematic pairs. */
+            if (a->type != JCE_BODY_DYNAMIC && b->type != JCE_BODY_DYNAMIC)
+                continue;
+
+            CollisionResult cr = test_collision(a, b);
+            if (!cr.colliding) continue;
+
+            record_pair(w, i, j);
+            resolve_collision(a, b, &cr);
+        }
+    }
+
+    fire_contact_events(w);
+}
+
 /* ── Step ──────────────────────────────────────────────────────────── */
 
 void jce_physics_step(JcePhysicsWorld *world, float dt)
@@ -156,6 +484,7 @@ void jce_physics_step(JcePhysicsWorld *world, float dt)
             integrate_body(&world->bodies[i], world->fixed_timestep,
                            world->gravity);
         }
+        detect_and_resolve(world);
         world->accumulator -= world->fixed_timestep;
         steps++;
     }

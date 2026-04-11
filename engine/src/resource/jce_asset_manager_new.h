@@ -22,12 +22,14 @@ extern "C" {
 
 typedef struct JceAssetSlot {
 	uint64_t      path_hash;      /* XXH3_64 of asset path */
+	char         *path;           /* owned copy of source asset path */
 	JceAssetType  type;
 	JceAssetState state;
 	uint16_t      generation;     /* generation counter for this slot */
 	uint32_t      ref_count;
 	void         *data;           /* type-specific payload */
 	size_t        memory_bytes;   /* approximate memory usage */
+	JceAssetLoadParams load_params; /* reload parameters (sanitized copy) */
 } JceAssetSlot;
 
 /* ================================================================== */

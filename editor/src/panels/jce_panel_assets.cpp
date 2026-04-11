@@ -68,6 +68,13 @@ static struct {
     std::vector<std::string> pending_delete_paths;
     std::vector<std::string> pending_delete_names;
     int pending_delete_dir_count;
+    /* Search filter */
+    char search_buf[128];
+    bool search_active;
+    /* Recursive search results cache */
+    std::vector<FileEntry> search_results;
+    std::string last_search_query;
+    std::string last_search_root;
 } s_assets;
 
 static std::string normalized_path_string(const fs::path &p)
@@ -160,6 +167,60 @@ static void refresh_entries(void)
     s_assets.needs_refresh = false;
 }
 
+/* ── Recursive search: collect matching entries from current_path and all subdirs ── */
+
+static void collect_search_results(const std::string &query)
+{
+    s_assets.search_results.clear();
+    if (query.empty()) return;
+
+    std::string query_lower = query;
+    for (auto &c : query_lower) c = (char)std::tolower((unsigned char)c);
+
+    try {
+        for (auto &de : fs::recursive_directory_iterator(
+                 s_assets.current_path,
+                 fs::directory_options::skip_permission_denied)) {
+            FileEntry fe;
+            fe.name   = de.path().filename().string();
+            fe.is_dir = de.is_directory();
+
+            /* Match against filename (case-insensitive substring). */
+            std::string name_lower = fe.name;
+            for (auto &c : name_lower) c = (char)std::tolower((unsigned char)c);
+            if (name_lower.find(query_lower) == std::string::npos)
+                continue;
+
+            fe.path = normalized_path_string(de.path());
+            if (!fe.is_dir) {
+                std::string ext = de.path().extension().string();
+                std::transform(ext.begin(), ext.end(), ext.begin(),
+                               [](unsigned char c_) { return (char)std::tolower(c_); });
+                fe.ext  = ext;
+                try { fe.size = de.file_size(); }
+                catch (...) { fe.size = 0; }
+            } else {
+                fe.ext  = "";
+                fe.size = 0;
+            }
+            s_assets.search_results.push_back(std::move(fe));
+
+            /* Limit results to avoid UI stalls on huge trees. */
+            if (s_assets.search_results.size() >= 500) break;
+        }
+    } catch (...) { /* ignore filesystem errors */ }
+
+    /* Sort: directories first, then alphabetical. */
+    std::sort(s_assets.search_results.begin(), s_assets.search_results.end(),
+              [](const FileEntry &a, const FileEntry &b) {
+                  if (a.is_dir != b.is_dir) return a.is_dir > b.is_dir;
+                  return a.name < b.name;
+              });
+
+    s_assets.last_search_query = query;
+    s_assets.last_search_root  = s_assets.current_path;
+}
+
 static ImVec4 asset_color_for_ext(const std::string &ext, bool is_dir)
 {
     if (is_dir) return JCE_COLOR_ASSET_FOLDER;
@@ -248,16 +309,16 @@ static void draw_dir_tree(const fs::path &dir, int depth)
             /* Right-click context menu on tree directory */
             if (ImGui::BeginPopupContextItem()) {
 #ifdef _WIN32
-                if (ImGui::MenuItem("Open in Explorer")) {
+                if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInExplorer"))) {
                     std::string p = sd.string();
                     for (auto &ch : p) { if (ch == '/') ch = '\\'; }
                     ShellExecuteA(NULL, "explore", p.c_str(), NULL, NULL, SW_SHOWNORMAL);
                 }
-                if (ImGui::MenuItem("Open in VS Code")) {
+                if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInVSCode"))) {
                     std::string cmd = "code \"" + sd.string() + "\"";
                     system(cmd.c_str());
                 }
-                if (ImGui::MenuItem("Open in Terminal")) {
+                if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInTerminal"))) {
                     std::string cmd = "start cmd /K cd /d \"" + sd.string() + "\"";
                     system(cmd.c_str());
                 }
@@ -314,16 +375,16 @@ void jce_editor_panel_assets_content(void)
             /* Right-click context menu on root node */
             if (ImGui::BeginPopupContextItem()) {
 #ifdef _WIN32
-                if (ImGui::MenuItem("Open in Explorer")) {
+                if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInExplorer"))) {
                     std::string p = s_assets.project_root;
                     for (auto &ch : p) { if (ch == '/') ch = '\\'; }
                     ShellExecuteA(NULL, "explore", p.c_str(), NULL, NULL, SW_SHOWNORMAL);
                 }
-                if (ImGui::MenuItem("Open in VS Code")) {
+                if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInVSCode"))) {
                     std::string cmd = "code \"" + s_assets.project_root + "\"";
                     system(cmd.c_str());
                 }
-                if (ImGui::MenuItem("Open in Terminal")) {
+                if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInTerminal"))) {
                     std::string cmd = "start cmd /K cd /d \"" + s_assets.project_root + "\"";
                     system(cmd.c_str());
                 }
@@ -351,7 +412,7 @@ void jce_editor_panel_assets_content(void)
 
             /* Up button (always visible; grayed out at root) */
             ImGui::BeginDisabled(at_root);
-            if (ImGui::SmallButton("Up")) {
+            if (ImGui::SmallButton(jce_editor_i18n("assetBrowser.up"))) {
                 try {
                     fs::path parent = fs::path(s_assets.current_path).parent_path();
                     /* Don't navigate above project root. */
@@ -441,7 +502,39 @@ void jce_editor_panel_assets_content(void)
             /* (Tooltip moved to per-item hover below) */
         }
         ImGui::Separator();
+
+        /* ── Search / filter bar ─────────────────────────────── */
         {
+            float search_w = ImGui::GetContentRegionAvail().x;
+            ImGui::PushItemWidth(search_w);
+            ImGui::InputTextWithHint("##asset_search",
+                                     jce_editor_i18n("assetBrowser.searchAllSubdirs"),
+                                     s_assets.search_buf,
+                                     sizeof(s_assets.search_buf));
+            ImGui::PopItemWidth();
+            s_assets.search_active = (s_assets.search_buf[0] != '\0');
+
+            /* Rebuild recursive search results when query or directory changes. */
+            if (s_assets.search_active) {
+                std::string q(s_assets.search_buf);
+                if (q != s_assets.last_search_query
+                    || s_assets.current_path != s_assets.last_search_root) {
+                    collect_search_results(q);
+                }
+            } else {
+                if (!s_assets.search_results.empty()) {
+                    s_assets.search_results.clear();
+                    s_assets.last_search_query.clear();
+                }
+            }
+        }
+        ImGui::Separator();
+
+        {
+            /* When searching, iterate the recursive results; otherwise the flat listing. */
+            const std::vector<FileEntry> &display_entries =
+                s_assets.search_active ? s_assets.search_results : s_assets.entries;
+
             float cell_size = JCE_THUMBNAIL_SIZE + JCE_ASSET_CELL_PADDING * 2;
             float panel_w   = ImGui::GetContentRegionAvail().x;
             int cols = (int)(panel_w / cell_size);
@@ -449,8 +542,8 @@ void jce_editor_panel_assets_content(void)
 
             int col = 0;
             bool want_ctx_popup = false;
-            for (int i = 0; i < (int)s_assets.entries.size(); i++) {
-                const FileEntry &fe = s_assets.entries[i];
+            for (int i = 0; i < (int)display_entries.size(); i++) {
+                const FileEntry &fe = display_entries[i];
 
                 ImGui::PushID(i);
                 ImGui::BeginGroup();
@@ -560,39 +653,118 @@ void jce_editor_panel_assets_content(void)
                         2.0f, 0, 2.0f);
                 }
 
-                /* File name label (clamp to 2 lines max) */
+                /* File name label — selected items show full name,
+                 * unselected items clamp to 2 lines with ellipsis.
+                 * Extension is shown in a dimmer color for readability. */
                 {
+                    bool is_selected = s_assets.selected_set.count(i) != 0;
                     float name_w = (float)JCE_THUMBNAIL_SIZE;
                     float line_h = ImGui::GetTextLineHeightWithSpacing();
                     float max_h  = line_h * 2.0f;
                     ImVec2 name_start = ImGui::GetCursorScreenPos();
-                    ImVec4 name_col = s_assets.selected_set.count(i)
-                        ? JCE_COLOR_ASSET_SEL_TEXT : JCE_COLOR_TEXT_PRIMARY;
-                    ImGui::PushStyleColor(ImGuiCol_Text, name_col);
-                    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + name_w);
-                    ImVec2 text_size = ImGui::CalcTextSize(fe.name.c_str(), NULL, false, name_w);
-                    if (text_size.y <= max_h) {
-                        ImGui::TextWrapped("%s", fe.name.c_str());
-                    } else {
-                        /* Truncate: show chars that fit in ~2 lines, add ellipsis */
-                        const char *src = fe.name.c_str();
-                        int len = (int)strlen(src);
-                        char trunc[128];
-                        int cut = len;
-                        for (cut = len - 1; cut > 0; cut--) {
-                            snprintf(trunc, sizeof(trunc), "%.*s...", cut, src);
-                            ImVec2 ts = ImGui::CalcTextSize(trunc, NULL, false, name_w);
-                            if (ts.y <= max_h) break;
+
+                    /* Split name into stem + extension. */
+                    std::string stem = fe.name;
+                    std::string ext_part;
+                    if (!fe.is_dir) {
+                        size_t dot = fe.name.rfind('.');
+                        if (dot != std::string::npos && dot > 0) {
+                            stem     = fe.name.substr(0, dot);
+                            ext_part = fe.name.substr(dot);
                         }
-                        if (cut <= 0) snprintf(trunc, sizeof(trunc), "...");
-                        ImGui::TextWrapped("%s", trunc);
                     }
+
+                    ImVec4 name_col = is_selected
+                        ? JCE_COLOR_ASSET_SEL_TEXT : JCE_COLOR_TEXT_PRIMARY;
+                    ImVec4 ext_col  = is_selected
+                        ? ImVec4(name_col.x * 0.75f, name_col.y * 0.75f,
+                                 name_col.z * 0.85f, name_col.w)
+                        : JCE_COLOR_TEXT_SECONDARY;
+
+                    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + name_w);
+
+                    if (is_selected) {
+                        /* Selected: show full name (stem + dim extension),
+                         * no height clamp so the user can read it all. */
+                        ImGui::PushStyleColor(ImGuiCol_Text, name_col);
+                        ImGui::TextWrapped("%s", stem.c_str());
+                        ImGui::PopStyleColor();
+                        if (!ext_part.empty()) {
+                            ImGui::SameLine(0, 0);
+                            ImGui::PushStyleColor(ImGuiCol_Text, ext_col);
+                            ImGui::TextWrapped("%s", ext_part.c_str());
+                            ImGui::PopStyleColor();
+                        }
+                    } else {
+                        /* Unselected: clamp to 2 lines. */
+                        ImVec2 full_sz = ImGui::CalcTextSize(
+                            fe.name.c_str(), NULL, false, name_w);
+                        if (full_sz.y <= max_h) {
+                            /* Fits: show stem + dim extension. */
+                            ImGui::PushStyleColor(ImGuiCol_Text, name_col);
+                            ImGui::TextWrapped("%s", stem.c_str());
+                            ImGui::PopStyleColor();
+                            if (!ext_part.empty()) {
+                                ImGui::SameLine(0, 0);
+                                ImGui::PushStyleColor(ImGuiCol_Text, ext_col);
+                                ImGui::TextWrapped("%s", ext_part.c_str());
+                                ImGui::PopStyleColor();
+                            }
+                        } else {
+                            /* Truncate stem, keep extension visible. */
+                            ImGui::PushStyleColor(ImGuiCol_Text, name_col);
+                            if (!ext_part.empty()) {
+                                /* Try to show as much of the stem as fits with "..." + ext */
+                                char trunc[256];
+                                int slen = (int)stem.size();
+                                int cut = slen;
+                                for (cut = slen - 1; cut > 0; cut--) {
+                                    snprintf(trunc, sizeof(trunc), "%.*s...%s",
+                                             cut, stem.c_str(), ext_part.c_str());
+                                    ImVec2 ts = ImGui::CalcTextSize(
+                                        trunc, NULL, false, name_w);
+                                    if (ts.y <= max_h) break;
+                                }
+                                if (cut <= 0)
+                                    snprintf(trunc, sizeof(trunc), "...%s",
+                                             ext_part.c_str());
+                                /* Render stem part + dim extension part. */
+                                char stem_trunc[256];
+                                snprintf(stem_trunc, sizeof(stem_trunc),
+                                         "%.*s...", (cut > 0 ? cut : 0),
+                                         stem.c_str());
+                                ImGui::TextWrapped("%s", stem_trunc);
+                                ImGui::SameLine(0, 0);
+                                ImGui::PopStyleColor();
+                                ImGui::PushStyleColor(ImGuiCol_Text, ext_col);
+                                ImGui::TextWrapped("%s", ext_part.c_str());
+                            } else {
+                                /* No extension (directory or extensionless). */
+                                const char *src = fe.name.c_str();
+                                int len = (int)strlen(src);
+                                char trunc[256];
+                                int cut = len;
+                                for (cut = len - 1; cut > 0; cut--) {
+                                    snprintf(trunc, sizeof(trunc),
+                                             "%.*s...", cut, src);
+                                    ImVec2 ts = ImGui::CalcTextSize(
+                                        trunc, NULL, false, name_w);
+                                    if (ts.y <= max_h) break;
+                                }
+                                if (cut <= 0)
+                                    snprintf(trunc, sizeof(trunc), "...");
+                                ImGui::TextWrapped("%s", trunc);
+                            }
+                            ImGui::PopStyleColor();
+                        }
+                        /* Pad to constant 2-line height for grid alignment. */
+                        float used_h = ImGui::GetCursorScreenPos().y
+                                     - name_start.y;
+                        if (used_h < max_h)
+                            ImGui::Dummy(ImVec2(0, max_h - used_h));
+                    }
+
                     ImGui::PopTextWrapPos();
-                    ImGui::PopStyleColor();
-                    /* Advance cursor to constant height for consistent grid rows */
-                    float used_h = ImGui::GetCursorScreenPos().y - name_start.y;
-                    if (used_h < max_h)
-                        ImGui::Dummy(ImVec2(0, max_h - used_h));
                 }
 
                 ImGui::EndGroup();
@@ -607,6 +779,11 @@ void jce_editor_panel_assets_content(void)
                         s_assets.needs_refresh = true;
                         s_assets.selected_set.clear();
                         s_assets.last_clicked_idx = -1;
+                        /* Clear search when navigating into a directory. */
+                        s_assets.search_buf[0] = '\0';
+                        s_assets.search_active = false;
+                        s_assets.search_results.clear();
+                        s_assets.last_search_query.clear();
                     } else {
                         /* Load .scene files directly into the viewport. */
                         const char *ext = strrchr(fe.path.c_str(), '.');
@@ -645,6 +822,14 @@ void jce_editor_panel_assets_content(void)
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
                     ImGui::SetTooltip("%s", fe.path.c_str());
 
+                /* Drag-drop source: allow dragging asset paths to inspector fields. */
+                if (!fe.is_dir && ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
+                    const char *p = fe.path.c_str();
+                    ImGui::SetDragDropPayload("JCE_ASSET_PATH", p, strlen(p) + 1);
+                    ImGui::Text("%s", fe.name.c_str());
+                    ImGui::EndDragDropSource();
+                }
+
                 ImGui::PopID();
 
                 col++;
@@ -660,11 +845,11 @@ void jce_editor_panel_assets_content(void)
             /* ── Context menu popup ──────────────────────────────────── */
             if (ImGui::BeginPopup("AssetContextMenu")) {
                 int ci = s_assets.context_idx;
-                bool valid = (ci >= 0 && ci < (int)s_assets.entries.size());
-                const FileEntry *cfe = valid ? &s_assets.entries[ci] : nullptr;
+                bool valid = (ci >= 0 && ci < (int)display_entries.size());
+                const FileEntry *cfe = valid ? &display_entries[ci] : nullptr;
 
                 /* Open */
-                if (ImGui::MenuItem("Open")) {
+                if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.open"))) {
                     if (cfe) {
                         if (cfe->is_dir) {
                             s_assets.current_path  = cfe->path;
@@ -679,7 +864,7 @@ void jce_editor_panel_assets_content(void)
                 }
 
                 /* Open in VS Code */
-                if (ImGui::MenuItem("Open in VS Code")) {
+                if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInVSCode"))) {
                     if (cfe) {
 #ifdef _WIN32
                         std::string cmd = "code \"" + cfe->path + "\"";
@@ -689,7 +874,7 @@ void jce_editor_panel_assets_content(void)
                 }
 
                 /* Open in Explorer */
-                if (ImGui::MenuItem("Open in Explorer")) {
+                if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInExplorer"))) {
                     if (cfe) {
 #ifdef _WIN32
                         std::string p = cfe->path;
@@ -707,7 +892,7 @@ void jce_editor_panel_assets_content(void)
                 ImGui::Separator();
 
                 /* Rename (F2) */
-                if (ImGui::MenuItem(jce_editor_i18n("hierarchy.rename"), "F2")) {
+                if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.rename"), "F2")) {
                     if (cfe) {
                         s_assets.renaming_idx = ci;
                         s_assets.rename_focus_needed = true;
@@ -717,7 +902,7 @@ void jce_editor_panel_assets_content(void)
                 }
 
                 /* Duplicate (Ctrl+D) */
-                if (ImGui::MenuItem(jce_editor_i18n("hierarchy.duplicate"), "Ctrl+D")) {
+                if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.duplicate"), "Ctrl+D")) {
                     if (cfe) {
                         try {
                             fs::path src(cfe->path);
@@ -742,14 +927,14 @@ void jce_editor_panel_assets_content(void)
                 ImGui::Separator();
 
                 /* Copy Path */
-                if (ImGui::MenuItem("Copy Path")) {
+                if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.copyPath"))) {
                     if (cfe) {
                         ImGui::SetClipboardText(cfe->path.c_str());
                     }
                 }
 
                 /* Copy (Ctrl+C) */
-                if (ImGui::MenuItem(jce_editor_i18n("menu.edit.copy"), "Ctrl+C")) {
+                if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.copy"), "Ctrl+C")) {
                     if (cfe) {
                         s_assets.clipboard_paths.clear();
                         for (int si : s_assets.selected_set)
@@ -760,7 +945,7 @@ void jce_editor_panel_assets_content(void)
                 }
 
                 /* Cut (Ctrl+X) */
-                if (ImGui::MenuItem("Cut", "Ctrl+X")) {
+                if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.cut"), "Ctrl+X")) {
                     if (cfe) {
                         s_assets.clipboard_paths.clear();
                         for (int si : s_assets.selected_set)
@@ -774,7 +959,7 @@ void jce_editor_panel_assets_content(void)
 
                 /* Delete (Del) — red text, triggers confirmation */
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
-                if (ImGui::MenuItem(jce_editor_i18n("hierarchy.delete"), "Del")) {
+                if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.delete"), "Del")) {
                     if (cfe) {
                         s_assets.pending_delete_paths.clear();
                         s_assets.pending_delete_names.clear();
@@ -967,7 +1152,7 @@ void jce_editor_panel_assets_content(void)
                     ImGui::EndMenu();
                 }
                 ImGui::Separator();
-                if (ImGui::MenuItem(jce_editor_i18n("menu.edit.paste"), "Ctrl+V",
+                if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.paste"), "Ctrl+V",
                                     false, !s_assets.clipboard_paths.empty()))
                 {
                     try {
@@ -989,7 +1174,7 @@ void jce_editor_panel_assets_content(void)
                     }
                 }
                 ImGui::Separator();
-                if (ImGui::MenuItem("Select All", "Ctrl+A")) {
+                if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.selectAll"), "Ctrl+A")) {
                     s_assets.selected_set.clear();
                     for (int si = 0; si < (int)s_assets.entries.size(); si++)
                         s_assets.selected_set.insert(si);
@@ -1003,7 +1188,7 @@ void jce_editor_panel_assets_content(void)
                     std::string cmd = "explorer \"" + s_assets.current_path + "\"";
                     system(cmd.c_str());
                 }
-                if (ImGui::MenuItem("Open in Terminal")) {
+                if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInTerminal"))) {
                     std::string cmd = "start cmd /K cd /d \"" + s_assets.current_path + "\"";
                     system(cmd.c_str());
                 }
@@ -1024,15 +1209,18 @@ void jce_editor_panel_assets_content(void)
             ImGui::SetNextWindowViewport(vp->ID);
             ImGui::SetNextWindowFocus();
 
-            if (ImGui::Begin("Delete?###AssetDeleteConfirm",
+                        char title[256];
+                        snprintf(title, sizeof(title), "%s###AssetDeleteConfirm", jce_editor_i18n("dialog.confirmDelete"));
+                        if (ImGui::Begin(title,
                     &s_assets.show_delete_dialog_open,
                     ImGuiWindowFlags_NoCollapse
                   | ImGuiWindowFlags_NoDocking
                   | ImGuiWindowFlags_AlwaysAutoResize))
             {
-                ImGui::Text("Are you sure you want to delete:");
+                ImGui::Text("%s", jce_editor_i18n("assetBrowser.deleteDialogPrompt"));
                 if (s_assets.pending_delete_names.size() > 1)
-                    ImGui::Text("(%d items)", (int)s_assets.pending_delete_names.size());
+                    ImGui::Text("(%d %s)", (int)s_assets.pending_delete_names.size(),
+                                jce_editor_i18n("assetBrowser.items"));
                 ImGui::Spacing();
                 for (auto &name : s_assets.pending_delete_names)
                     ImGui::TextWrapped("  %s", name.c_str());
@@ -1040,9 +1228,10 @@ void jce_editor_panel_assets_content(void)
                     ImGui::Spacing();
                     ImGui::PushStyleColor(ImGuiCol_Text, JCE_COLOR_TEXT_WARNING);
                     if (s_assets.pending_delete_dir_count == 1)
-                        ImGui::TextWrapped("Includes a folder. All its contents will be deleted.");
+                        ImGui::TextWrapped("%s", jce_editor_i18n("assetBrowser.deleteFolderWarningSingle"));
                     else
-                        ImGui::TextWrapped("Includes %d folders. All their contents will be deleted.",
+                        ImGui::TextWrapped("%s: %d",
+                                           jce_editor_i18n("assetBrowser.deleteFolderWarningMulti"),
                                            s_assets.pending_delete_dir_count);
                     ImGui::PopStyleColor();
                 }
@@ -1058,7 +1247,7 @@ void jce_editor_panel_assets_content(void)
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
                 ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.3f, 0.3f, 1.0f));
                 ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.7f, 0.15f, 0.15f, 1.0f));
-                if (ImGui::Button("Delete", ImVec2(btn_w, 0))) {
+                if (ImGui::Button(jce_editor_i18n("assetBrowser.deleteConfirm"), ImVec2(btn_w, 0))) {
                     try {
                         for (size_t di = 0; di < s_assets.pending_delete_paths.size(); di++) {
                             fs::remove_all(s_assets.pending_delete_paths[di]);
@@ -1077,7 +1266,7 @@ void jce_editor_panel_assets_content(void)
                 ImGui::PopStyleColor(3);
                 ImGui::SameLine();
 
-                if (ImGui::Button("Cancel", ImVec2(btn_w, 0))) {
+                if (ImGui::Button(jce_editor_i18n("dialog.cancel"), ImVec2(btn_w, 0))) {
                     s_assets.show_delete_dialog_open = false;
                 }
             }
@@ -1095,7 +1284,9 @@ void jce_editor_panel_assets(void)
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_ASSETS);
     if (!*vis) return;
 
-    if (ImGui::Begin("Assets###AssetBrowser", vis))
+    char title[256];
+    snprintf(title, sizeof(title), "%s###AssetBrowser", jce_editor_i18n("assetBrowser.title"));
+    if (ImGui::Begin(title, vis))
         jce_editor_panel_assets_content();
     ImGui::End();
 }

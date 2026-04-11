@@ -183,6 +183,13 @@ jce_compile_shaders(
 	OUTPUT_DIR    "${JCE_SHADER_OUTPUT_DIR}"
 	OUT_FILES_VAR COMPILED_IMGUI_SHADER_FILES)
 
+jce_compile_shaders(
+	TARGET        CompileShadersPostFX
+	SHADER_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/postfx"
+	VARYING_DEF   "varying_postfx.def.sc"
+	OUTPUT_DIR    "${JCE_SHADER_OUTPUT_DIR}"
+	OUT_FILES_VAR COMPILED_POSTFX_SHADER_FILES)
+
 # ------------------------------------------------------------------ #
 # Host packer tool: jce_pak                                           #
 # ------------------------------------------------------------------ #
@@ -280,6 +287,8 @@ if(JCE_ENABLE_ASSET_COOKING AND NOT CMAKE_CROSSCOMPILING)
 		           --preserve-names --level 0 --max-texture-size 2048
 		COMMAND    "${CMAKE_COMMAND}" -E touch "${COOK_GAME_STAMP}"
 		DEPENDS    jce_cook ${ENGINE_ASSET_FILES} ${GAME_ASSET_FILES}
+		           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES}
+		           ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES}
 		COMMENT    "Cooking game assets (textures/audio → .jceasset)"
 		VERBATIM)
 
@@ -297,14 +306,16 @@ if(JCE_ENABLE_ASSET_COOKING AND NOT CMAKE_CROSSCOMPILING)
 		           "${EDITOR_ICON_FILE}" "${EDITOR_COOKED_DIR}/JCE_icon.png"
 		COMMAND    "${CMAKE_COMMAND}" -E touch "${COOK_EDITOR_STAMP}"
 		DEPENDS    jce_cook ${ENGINE_ASSET_FILES} ${EDITOR_ASSET_FILES}
+		           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES}
+		           ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES}
 		           "${EDITOR_ICON_FILE}"
 		COMMENT    "Cooking editor assets (textures/audio → .jceasset)"
 		VERBATIM)
 
 	add_custom_target(CookGameAssets   DEPENDS "${COOK_GAME_STAMP}")
 	add_custom_target(CookEditorAssets DEPENDS "${COOK_EDITOR_STAMP}")
-	add_dependencies(CookGameAssets   CompileShaders CompileShadersPBR CompileShadersImGui)
-	add_dependencies(CookEditorAssets CompileShaders CompileShadersPBR CompileShadersImGui)
+	add_dependencies(CookGameAssets   CompileShaders CompileShadersPBR CompileShadersImGui CompileShadersPostFX)
+	add_dependencies(CookEditorAssets CompileShaders CompileShadersPBR CompileShadersImGui CompileShadersPostFX)
 
 	# PAK reads from a single cooked dir (engine + app merged).
 	set(_GAME_PAK_RES_FLAGS    --resource-dir "${GAME_COOKED_DIR}")
@@ -371,7 +382,7 @@ add_custom_command(
 	           ${_GAME_OBJ_FLAGS}
 	COMMAND    "${CMAKE_COMMAND}" -E touch "${GAME_STAMP_FILE}"
 	DEPENDS    jce_pak ${ENGINE_ASSET_FILES} ${GAME_ASSET_FILES}
-	           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES} ${COMPILED_IMGUI_SHADER_FILES}
+	           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES} ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES}
 	COMMENT    "Packing game assets -> ${GAME_PAK_FILE}"
 	VERBATIM)
 
@@ -381,7 +392,7 @@ set_source_files_properties(
 	PROPERTIES GENERATED TRUE)
 
 add_custom_target(PackGameAssets DEPENDS "${GAME_STAMP_FILE}")
-add_dependencies(PackGameAssets CompileShaders CompileShadersPBR CompileShadersImGui)
+add_dependencies(PackGameAssets CompileShaders CompileShadersPBR CompileShadersImGui CompileShadersPostFX)
 if(_COOK_GAME_DEP)
 	add_dependencies(PackGameAssets ${_COOK_GAME_DEP})
 endif()
@@ -413,7 +424,7 @@ add_custom_command(
 	           ${_EDITOR_OBJ_FLAGS}
 	COMMAND    "${CMAKE_COMMAND}" -E touch "${EDITOR_STAMP_FILE}"
 	DEPENDS    jce_pak ${ENGINE_ASSET_FILES} ${EDITOR_ASSET_FILES}
-	           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES} ${COMPILED_IMGUI_SHADER_FILES}
+	           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES} ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES}
 	COMMENT    "Packing editor assets -> ${EDITOR_PAK_FILE}"
 	VERBATIM)
 
@@ -423,7 +434,7 @@ set_source_files_properties(
 	PROPERTIES GENERATED TRUE)
 
 add_custom_target(PackEditorAssets DEPENDS "${EDITOR_STAMP_FILE}")
-add_dependencies(PackEditorAssets CompileShaders CompileShadersPBR CompileShadersImGui)
+add_dependencies(PackEditorAssets CompileShaders CompileShadersPBR CompileShadersImGui CompileShadersPostFX)
 if(_COOK_EDITOR_DEP)
 	add_dependencies(PackEditorAssets ${_COOK_EDITOR_DEP})
 endif()
@@ -516,3 +527,39 @@ string(APPEND _dep_locs_content ")\n")
 
 set(DEP_LOCS_FILE "${CMAKE_CURRENT_BINARY_DIR}/_dep_locs_$<CONFIG>.cmake")
 file(GENERATE OUTPUT "${DEP_LOCS_FILE}" CONTENT "${_dep_locs_content}")
+
+# ------------------------------------------------------------------ #
+# Phase 0 KPI helper targets                                          #
+# ------------------------------------------------------------------ #
+
+find_program(JCE_POWERSHELL_EXECUTABLE NAMES pwsh powershell)
+if(JCE_POWERSHELL_EXECUTABLE)
+	add_custom_target(kpi_startup
+		COMMAND "${JCE_POWERSHELL_EXECUTABLE}" -NoProfile -ExecutionPolicy Bypass
+		        -File "${CMAKE_SOURCE_DIR}/scripts/kpi/measure_startup.ps1"
+		        -BuildRoot "${CMAKE_BINARY_DIR}"
+		WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+		COMMENT "Collecting startup KPI baseline"
+		VERBATIM)
+
+	add_custom_target(kpi_frame_time
+		COMMAND "${JCE_POWERSHELL_EXECUTABLE}" -NoProfile -ExecutionPolicy Bypass
+		        -File "${CMAKE_SOURCE_DIR}/scripts/kpi/measure_frame_time.ps1"
+		        -BuildRoot "${CMAKE_BINARY_DIR}"
+		WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+		COMMENT "Collecting frame-time KPI baseline"
+		VERBATIM)
+
+	add_custom_target(kpi_asset_reload
+		COMMAND "${JCE_POWERSHELL_EXECUTABLE}" -NoProfile -ExecutionPolicy Bypass
+		        -File "${CMAKE_SOURCE_DIR}/scripts/kpi/measure_asset_reload.ps1"
+		        -BuildRoot "${CMAKE_BINARY_DIR}"
+		WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+		COMMENT "Collecting asset update KPI baseline"
+		VERBATIM)
+
+	add_custom_target(kpi_baseline
+		DEPENDS kpi_startup kpi_frame_time kpi_asset_reload)
+else()
+	message(STATUS "PowerShell executable not found. KPI helper targets are disabled.")
+endif()

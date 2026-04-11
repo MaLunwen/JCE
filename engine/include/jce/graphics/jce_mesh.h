@@ -57,6 +57,17 @@ JceMesh *jce_mesh_create_cube(float size);
 JceMesh *jce_mesh_create_plane(float width, float depth, uint32_t subdivs);
 JceMesh *jce_mesh_create_plane_ex(float width, float depth,
                                    uint32_t subdivs, float uv_scale);
+JceMesh *jce_mesh_create_sphere(float radius);
+JceMesh *jce_mesh_create_capsule(float radius, float height);
+JceMesh *jce_mesh_create_cylinder(float radius, float height);
+
+/* Submit mesh for PBR rendering using the PBR shader program.
+   Caller must call jce_pbr_material_bind() and set transforms before this. */
+void jce_mesh_submit_pbr(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id);
+
+/* Submit mesh for shadow depth pass using the shadow shader program.
+   Caller must set transforms and shadow view/proj before calling. */
+void jce_mesh_submit_shadow(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id);
 
 #ifdef __cplusplus
 }

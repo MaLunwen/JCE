@@ -469,7 +469,8 @@ void jce_editor_settings_dialog(bool *p_open)
                        jce_editor_i18n("settings.requiresRestart"));
 
     /* Current active backend display. */
-    ImGui::TextColored(ImVec4(0.7f, 0.9f, 0.7f, 1.0f), "Active: %s",
+    ImGui::TextColored(ImVec4(0.7f, 0.9f, 0.7f, 1.0f), "%s: %s",
+                       jce_editor_i18n("settings.activeBackend"),
                        jce_renderer_get_backend_name(NULL));
 
     ImGui::PopItemWidth();
@@ -594,7 +595,10 @@ void jce_editor_panel_preferences(void)
 
     prefs_ensure_init();
 
-    if (ImGui::Begin("Preferences###Preferences", vis)) {
+    char panel_title[256];
+    snprintf(panel_title, sizeof(panel_title), "%s###Preferences",
+             jce_editor_i18n("preferences.title"));
+    if (ImGui::Begin(panel_title, vis)) {
 
         char _lbl[256];
 
@@ -604,8 +608,10 @@ void jce_editor_panel_preferences(void)
             if (ImGui::BeginTabItem(_lbl)) {
                 snprintf(_lbl, sizeof(_lbl), "%s###winTitle", jce_editor_i18n("preferences.display.windowTitle"));
                 ImGui::InputText(_lbl, s_prefs.window_title, sizeof(s_prefs.window_title));
-                ImGui::InputInt("Window Width",  &s_prefs.window_width);
-                ImGui::InputInt("Window Height", &s_prefs.window_height);
+                snprintf(_lbl, sizeof(_lbl), "%s###windowWidth", jce_editor_i18n("preferences.display.windowWidth"));
+                ImGui::InputInt(_lbl,  &s_prefs.window_width);
+                snprintf(_lbl, sizeof(_lbl), "%s###windowHeight", jce_editor_i18n("preferences.display.windowHeight"));
+                ImGui::InputInt(_lbl, &s_prefs.window_height);
                 snprintf(_lbl, sizeof(_lbl), "%s###fullscreen", jce_editor_i18n("preferences.display.fullscreen"));
                 ImGui::Checkbox(_lbl, &s_prefs.fullscreen);
                 snprintf(_lbl, sizeof(_lbl), "%s###vsync", jce_editor_i18n("preferences.display.vsync"));
@@ -618,28 +624,37 @@ void jce_editor_panel_preferences(void)
 
             snprintf(_lbl, sizeof(_lbl), "%s###pref_rendering", jce_editor_i18n("preferences.rendering.title"));
             if (ImGui::BeginTabItem(_lbl)) {
-                ImGui::Text("Backend: %s", jce_renderer_get_backend_name(NULL));
+                ImGui::Text("%s: %s", jce_editor_i18n("preferences.rendering.backend"),
+                            jce_renderer_get_backend_name(NULL));
                 const char *msaa[] = { "Off", "2x", "4x", "8x", "16x" };
-                ImGui::Combo("MSAA###msaa", &s_prefs.msaa_idx, msaa, 5);
+                snprintf(_lbl, sizeof(_lbl), "%s###msaa", jce_editor_i18n("preferences.rendering.msaa"));
+                ImGui::Combo(_lbl, &s_prefs.msaa_idx, msaa, 5);
                 const char *shadows[] = { "512", "1024", "2048", "4096", "8192" };
-                ImGui::Combo("Shadow Map###shadowMap", &s_prefs.shadow_idx, shadows, 5);
-                ImGui::Checkbox("HDR###hdr", &s_prefs.hdr);
+                snprintf(_lbl, sizeof(_lbl), "%s###shadowMap", jce_editor_i18n("preferences.rendering.shadowMapSize"));
+                ImGui::Combo(_lbl, &s_prefs.shadow_idx, shadows, 5);
+                snprintf(_lbl, sizeof(_lbl), "%s###hdr", jce_editor_i18n("preferences.rendering.hdr"));
+                ImGui::Checkbox(_lbl, &s_prefs.hdr);
                 ImGui::EndTabItem();
             }
 
             snprintf(_lbl, sizeof(_lbl), "%s###pref_audio", jce_editor_i18n("preferences.audio.title"));
             if (ImGui::BeginTabItem(_lbl)) {
-                ImGui::SliderFloat("Master###master", &s_prefs.master_vol, 0.0f, 1.0f);
-                ImGui::SliderFloat("Music###music",  &s_prefs.music_vol,  0.0f, 1.0f);
-                ImGui::SliderFloat("SFX###sfx",    &s_prefs.sfx_vol,    0.0f, 1.0f);
+                snprintf(_lbl, sizeof(_lbl), "%s###master", jce_editor_i18n("preferences.audio.masterVolume"));
+                ImGui::SliderFloat(_lbl, &s_prefs.master_vol, 0.0f, 1.0f);
+                snprintf(_lbl, sizeof(_lbl), "%s###music", jce_editor_i18n("preferences.audio.musicVolume"));
+                ImGui::SliderFloat(_lbl,  &s_prefs.music_vol,  0.0f, 1.0f);
+                snprintf(_lbl, sizeof(_lbl), "%s###sfx", jce_editor_i18n("preferences.audio.sfxVolume"));
+                ImGui::SliderFloat(_lbl,    &s_prefs.sfx_vol,    0.0f, 1.0f);
                 ImGui::EndTabItem();
             }
 
             snprintf(_lbl, sizeof(_lbl), "%s###pref_physics", jce_editor_i18n("preferences.physics.title"));
             if (ImGui::BeginTabItem(_lbl)) {
-                ImGui::SliderInt("Substeps###substeps", &s_prefs.physics_substeps,
+                snprintf(_lbl, sizeof(_lbl), "%s###substeps", jce_editor_i18n("preferences.physics.substeps"));
+                ImGui::SliderInt(_lbl, &s_prefs.physics_substeps,
                                  JCE_PREF_PHYSICS_SUBSTEP_MIN, JCE_PREF_PHYSICS_SUBSTEP_MAX);
-                ImGui::Checkbox("Debug Geometry###debugGeom", &s_prefs.debug_physics);
+                snprintf(_lbl, sizeof(_lbl), "%s###debugGeom", jce_editor_i18n("preferences.physics.debugGeometry"));
+                ImGui::Checkbox(_lbl, &s_prefs.debug_physics);
                 ImGui::EndTabItem();
             }
 
@@ -736,15 +751,15 @@ void jce_editor_about_dialog(bool *p_open)
 
     ImGui::TextColored(JCE_COLOR_ACCENT, "%s", jce_editor_i18n("about.title"));
     ImGui::Spacing();
-    ImGui::Text("Version: 0.3.0 (Editor Preview)");
-    ImGui::Text("Build: %s %s", __DATE__, __TIME__);
+    ImGui::Text("%s: 0.3.0 (Editor Preview)", jce_editor_i18n("about.versionLabel"));
+    ImGui::Text("%s: %s %s", jce_editor_i18n("about.buildLabel"), __DATE__, __TIME__);
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
     ImGui::TextWrapped("%s", jce_editor_i18n("about.description"));
     ImGui::Spacing();
-    ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
-        "Platforms: Windows, macOS, Linux, iOS, Android, Web");
+    ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s",
+        jce_editor_i18n("about.platforms"));
     ImGui::Spacing();
     ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s", jce_editor_i18n("about.copyright"));
 

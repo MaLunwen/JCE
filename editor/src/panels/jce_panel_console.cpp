@@ -137,7 +137,9 @@ void jce_editor_panel_console(void)
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_CONSOLE);
     if (!*vis) return;
 
-    if (ImGui::Begin("Console###Console", vis))
+    char title[256];
+    snprintf(title, sizeof(title), "%s###Console", jce_editor_i18n("console.title"));
+    if (ImGui::Begin(title, vis))
         jce_editor_panel_console_content();
     ImGui::End();
 }
