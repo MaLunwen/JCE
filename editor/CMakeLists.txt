@@ -16,7 +16,9 @@ file(GLOB_RECURSE EDITOR_SOURCES CONFIGURE_DEPENDS
 add_executable(JCE_Editor ${EDITOR_SOURCES})
 
 find_package(assimp REQUIRED)
-target_link_libraries(JCE_Editor PRIVATE JCE assimp::assimp imgui::imgui)
+target_link_libraries(JCE_Editor PRIVATE
+	JCE assimp::assimp imgui::imgui
+	cjson::cjson SDL3_image::SDL3_image bgfx::bgfx)
 
 target_include_directories(JCE_Editor PRIVATE
 	"${CMAKE_CURRENT_SOURCE_DIR}/src")

@@ -47,6 +47,27 @@ typedef mat4s    jce_mat4;
 #define JCE_M4_PTR(m)           ((const float *)(m).raw)
 #define JCE_M4_MUT_PTR(m)       ((float *)(m).raw)
 
+/* -- Vec2 ----------------------------------------------------------- */
+
+static inline jce_vec2 jce_v2(float x, float y)
+{
+    jce_vec2 v;
+    v.x = x; v.y = y;
+    return v;
+}
+
+static inline float jce_v2_len(jce_vec2 v)
+{
+    return glms_vec2_norm(v);
+}
+
+static inline jce_vec2 jce_v2_normalize(jce_vec2 v)
+{
+    float len = glms_vec2_norm(v);
+    if (len < 1e-8f) { jce_vec2 z; z.x = z.y = 0; return z; }
+    return glms_vec2_scale(v, 1.0f / len);
+}
+
 /* -- Vec3 ----------------------------------------------------------- */
 
 static inline jce_vec3 jce_v3(float x, float y, float z)
@@ -286,9 +307,11 @@ static inline bool jce_world_to_screen(jce_vec3 world_pos,
     vec4s p; p.x = world_pos.x; p.y = world_pos.y; p.z = world_pos.z; p.w = 1.0f;
     vec4s clip = glms_mat4_mulv(vp, p);
     if (clip.w <= 1e-6f) return false;
-    float inv_w = 1.0f / clip.w;
-    if (out_x) *out_x = (clip.x * inv_w + 1.0f) * 0.5f;
-    if (out_y) *out_y = (1.0f - clip.y * inv_w) * 0.5f;
+    /* Use unit viewport [0,0,1,1] so glms_project returns normalised coords. */
+    vec4s unit_vp; unit_vp.x = 0; unit_vp.y = 0; unit_vp.z = 1; unit_vp.w = 1;
+    vec3s r = glms_project(world_pos, vp, unit_vp);
+    if (out_x) *out_x = r.x;
+    if (out_y) *out_y = 1.0f - r.y; /* flip Y: screen top = 0 */
     return true;
 }
 

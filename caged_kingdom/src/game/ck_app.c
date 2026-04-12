@@ -145,24 +145,6 @@ CkApp *ck_app_create(const JceServices *svc)
         app->camera = jce_camera_create(&cam_desc);
     }
     app->cam_ctrl = jce_camctrl_create(app->camera, NULL);
-
-    // /* Load meshes via asset manager, with direct-API fallback. */
-    // if (app->svc.assets) {
-    //     app->h_cube = jce_asset_load(app->svc.assets,
-    //                       "models/chalet.obj", JCE_ASSET_MESH);
-    //     app->cube = jce_asset_get_mesh(app->svc.assets, app->h_cube);
-    //     if (!app->cube)
-    //         app->cube = jce_mesh_create_cube(1.0f);
-
-    //     // app->h_chalet = jce_asset_load(app->svc.assets,
-    //     //                     "models/sachiel_fab_v2.obj", JCE_ASSET_MESH);
-    //     app->chalet = jce_asset_get_mesh(app->svc.assets, app->h_chalet);
-    // } else {
-    //     app->cube = jce_mesh_load(app->svc.pak, "models/chalet.obj");
-    //     if (!app->cube)
-    //         app->cube = jce_mesh_create_cube(1.0f);
-    //     app->chalet = jce_mesh_load(app->svc.pak, "models/sachiel_fab_v2.obj");
-    // }
     app->ground = jce_mesh_create_plane_ex(10.0f, 10.0f, 10, 5.0f);
     app->sun = jce_dir_light_default();
 
@@ -173,7 +155,7 @@ CkApp *ck_app_create(const JceServices *svc)
         JceDirLightDesc dl = {0};
         dl.direction = app->sun.direction;
         dl.color     = app->sun.color;
-        dl.intensity = 3.14159f;  /* compensate for Lambertian /PI in Cook-Torrance BRDF */
+        dl.intensity = JCE_PI;  /* compensate for Lambertian /PI in Cook-Torrance BRDF */
         jce_light_env_add_dir_light(app->light_env, &dl);
     }
 
@@ -667,9 +649,8 @@ static void draw_3d_scene(CkApp *app, float dt_ms)
         float tyaw = 0, tpitch = 0;
         jce_touch_hud_get_look(app->touch_hud,
                                &tyaw, &tpitch);
-        float deg2rad = 3.14159265f / 180.0f;
-        cam_in.look_yaw   += tyaw   * deg2rad;
-        cam_in.look_pitch += tpitch * deg2rad;
+        cam_in.look_yaw   += tyaw   * JCE_DEG2RAD;
+        cam_in.look_pitch += tpitch * JCE_DEG2RAD;
     }
 
     jce_camctrl_update(app->cam_ctrl, &cam_in, dt_sec);

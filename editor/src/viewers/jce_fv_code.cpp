@@ -6,6 +6,7 @@
  */
 
 #include "jce_fv_common.h"
+#include "jce_editor_file_util.h"
 
 #include <string>
 #include <vector>
@@ -307,15 +308,13 @@ void fv_render_code(FvTab *tab)
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.45f, 0.7f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.25f, 0.55f, 0.8f, 1.0f));
             if (ImGui::Button(jce_editor_i18n("codeViewer.save"))) {
-                FILE *fp = fopen(tab->path, "wb");
-                if (fp) {
-                    const char *save_src = tab->edit_buf ? tab->edit_buf : tab->content;
-                    fwrite(save_src, 1, strlen(save_src), fp);
-                    fclose(fp);
+                const char *save_src = tab->edit_buf ? tab->edit_buf : tab->content;
+                size_t save_len = strlen(save_src);
+                if (ed_write_file(tab->path, save_src, save_len)) {
                     tab->modified = false;
                     /* Refresh content from edit buffer */
                     if (tab->edit_buf) {
-                        int new_len = (int)strlen(tab->edit_buf);
+                        int new_len = (int)save_len;
                         ED_FREE(tab->content);
                         tab->content = (char *)ED_MALLOC((size_t)new_len + 1);
                         if (tab->content) {

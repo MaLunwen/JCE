@@ -24,7 +24,7 @@ extern "C" {
 }
 #include "jce_editor.h"
 #include "jce_editor_panels.h"
-#include "jce_editor_scene_render.h"
+#include "scene/jce_editor_scene_render.h"
 #include "jce_editor_config.h"
 #include "jce_editor_state.h"
 

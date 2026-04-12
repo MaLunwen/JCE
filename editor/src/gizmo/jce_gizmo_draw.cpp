@@ -13,12 +13,7 @@
 #include <imgui.h>
 #include <math.h>
 
-/* ── Internal state query (defined in jce_gizmo.cpp) ───────────────── */
-
-extern "C" JceGizmoAxis jce_gizmo_internal_hovered(void);
-extern "C" bool         jce_gizmo_internal_dragging(void);
-extern "C" JceGizmoAxis jce_gizmo_internal_drag_axis(void);
-extern "C" void         jce_gizmo_internal_get_axes(float ax_x[3], float ax_y[3], float ax_z[3]);
+#include "jce_gizmo_internal.h"
 
 /* ── Color helpers ─────────────────────────────────────────────────── */
 

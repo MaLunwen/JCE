@@ -62,17 +62,9 @@ void jce_engine_set_config_path(const char *path)
 
 static bool jce_path_exists(const char *path)
 {
-    if (!path || !path[0]) {
-        return false;
-    }
-
-    FILE *fp = fopen(path, "rb");
-    if (!fp) {
-        return false;
-    }
-
-    fclose(fp);
-    return true;
+    if (!path || !path[0]) return false;
+    SDL_PathInfo info;
+    return SDL_GetPathInfo(path, &info);
 }
 
 static void jce_select_config_path(char *out_path, size_t out_size)

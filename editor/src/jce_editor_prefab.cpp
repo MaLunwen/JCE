@@ -20,24 +20,8 @@ bool jce_state_save_prefab(uint32_t entity_id, const char *prefab_path)
 	if (!root)
 		return false;
 
-	char *json_text = cJSON_Print(root);
-	cJSON_Delete(root);
-	if (!json_text)
-		return false;
-
-	FILE *fp = fopen(prefab_path, "wb");
-	if (!fp) {
-		cJSON_free(json_text);
-		LOG_WARN(LOG_TAG, "prefab save failed, cannot open file: %s", prefab_path);
-		return false;
-	}
-
-	size_t len = strlen(json_text);
-	size_t wr = fwrite(json_text, 1, len, fp);
-	fclose(fp);
-	cJSON_free(json_text);
-	if (wr != len) {
-		LOG_WARN(LOG_TAG, "prefab save failed, short write: %s", prefab_path);
+	if (!ed_write_json_to_file(prefab_path, root)) {
+		LOG_WARN(LOG_TAG, "prefab save failed: %s", prefab_path);
 		return false;
 	}
 

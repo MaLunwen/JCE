@@ -23,6 +23,7 @@ extern "C" {
 
 #include "jce_editor_config.h"
 #include "jce_editor_alloc.h"
+#include "jce_editor_file_util.h"
 
 #define LOG_TAG       "editor_config"
 #define CONFIG_PATH   ".jce/editor-config.json"
@@ -63,31 +64,12 @@ static int cjson_read_int(const cJSON *root, const char *key, int fallback) {
 bool jce_editor_config_load(JceEditorConfig *cfg) {
     jce_editor_config_defaults(cfg);
 
-    FILE *f = fopen(CONFIG_PATH, "rb");
-    if (!f) {
+    size_t len = 0;
+    char *buf = (char *)ed_read_file(CONFIG_PATH, &len);
+    if (!buf) {
         LOG_WARN(LOG_TAG, "Config file not found: %s", CONFIG_PATH);
         return false;
     }
-
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    if (len <= 0 || len > 64 * 1024) {
-        fclose(f);
-        LOG_ERROR(LOG_TAG, "Config file invalid size: %ld", len);
-        return false;
-    }
-
-    char *buf = (char *)ED_MALLOC((size_t)len + 1);
-    if (!buf) {
-        fclose(f);
-        return false;
-    }
-
-    size_t rd = fread(buf, 1, (size_t)len, f);
-    fclose(f);
-    buf[rd] = '\0';
 
     cJSON *root = cJSON_Parse(buf);
     ED_FREE(buf);
@@ -146,20 +128,10 @@ bool jce_editor_config_save(const JceEditorConfig *cfg) {
         cJSON_AddStringToObject(root, key, val);
     }
 
-    char *json_str = cJSON_Print(root);
-    cJSON_Delete(root);
-    if (!json_str) return false;
-
-    FILE *f = fopen(CONFIG_PATH, "w");
-    if (!f) {
+    if (!ed_write_json_to_file(CONFIG_PATH, root)) {
         LOG_ERROR(LOG_TAG, "Failed to write config: %s", CONFIG_PATH);
-        cJSON_free(json_str);
         return false;
     }
-
-    fputs(json_str, f);
-    fclose(f);
-    cJSON_free(json_str);
 
     LOG_INFO(LOG_TAG, "Config saved to %s", CONFIG_PATH);
     return true;

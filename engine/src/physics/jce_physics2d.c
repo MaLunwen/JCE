@@ -11,16 +11,14 @@
 
 #include <box2d/box2d.h>
 
+#include <jce/core/jce_math.h>
+
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
 
 #define LOG_TAG        "physics2d"
 #define SUB_STEP_COUNT 4
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
 
 /* ── Helpers: jce_vec2 <-> b2Vec2 ─────────────────────────────────── */
 
@@ -71,14 +69,14 @@ static float shape_area(JceShape2DType shape, jce_vec2 half_extents)
 
         case JCE_SHAPE2D_CIRCLE:
             /* radius stored in half_extents.x */
-            return (float)M_PI * hx * hx;
+            return JCE_PI * hx * hx;
 
         case JCE_SHAPE2D_CAPSULE: {
             /* half_extents: (radius, half_length) */
             float r  = hx;
             float hl = hy;
             /* rectangle + two semicircles = full circle */
-            return 2.0f * r * 2.0f * hl + (float)M_PI * r * r;
+            return 2.0f * r * 2.0f * hl + JCE_PI * r * r;
         }
 
         case JCE_SHAPE2D_SEGMENT:
@@ -365,12 +363,12 @@ JceRaycast2DResult jce_physics2d_raycast(const JcePhysics2D *world,
     if (!world) return result;
 
     /* Normalize direction, then scale to produce the translation vector. */
-    float dlen = sqrtf(direction.x * direction.x + direction.y * direction.y);
-    if (dlen < 1e-8f) return result;
+    jce_vec2 dir_n = jce_v2_normalize(direction);
+    if (dir_n.x == 0 && dir_n.y == 0) return result;
 
     b2Vec2 translation;
-    translation.x = (direction.x / dlen) * max_distance;
-    translation.y = (direction.y / dlen) * max_distance;
+    translation.x = dir_n.x * max_distance;
+    translation.y = dir_n.y * max_distance;
 
     b2QueryFilter filter = b2DefaultQueryFilter();
     b2RayResult ray = b2World_CastRayClosest(world->world_id,

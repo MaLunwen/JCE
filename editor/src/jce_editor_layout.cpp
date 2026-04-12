@@ -16,7 +16,7 @@
 
 #include "jce_editor_layout.h"
 #include "jce_editor_panels.h"
-#include "jce_editor_dialogs.h"
+#include "dialogs/jce_editor_dialogs.h"
 #include "jce_editor_state.h"
 #include "jce_editor_i18n.h"
 #include "jce_editor_colors.h"

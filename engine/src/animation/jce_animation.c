@@ -68,52 +68,13 @@ static jce_vec3 extract_translation(const jce_mat4 *m)
 /* Extract scale from a column-major mat4. */
 static jce_vec3 extract_scale(const jce_mat4 *m)
 {
-    float sx = sqrtf(m->raw[0][0]*m->raw[0][0] + m->raw[0][1]*m->raw[0][1] + m->raw[0][2]*m->raw[0][2]);
-    float sy = sqrtf(m->raw[1][0]*m->raw[1][0] + m->raw[1][1]*m->raw[1][1] + m->raw[1][2]*m->raw[1][2]);
-    float sz = sqrtf(m->raw[2][0]*m->raw[2][0] + m->raw[2][1]*m->raw[2][1] + m->raw[2][2]*m->raw[2][2]);
-    return jce_v3(sx, sy, sz);
+    return glms_decompose_scalev(*m);
 }
 
 /* Extract rotation quaternion from a column-major mat4 (assumes orthogonal). */
 static jce_quat extract_rotation(const jce_mat4 *m)
 {
-    jce_vec3 s = extract_scale(m);
-    float inv_sx = s.x > 1e-8f ? 1.0f / s.x : 0.0f;
-    float inv_sy = s.y > 1e-8f ? 1.0f / s.y : 0.0f;
-    float inv_sz = s.z > 1e-8f ? 1.0f / s.z : 0.0f;
-
-    float r00 = m->raw[0][0] * inv_sx, r01 = m->raw[1][0] * inv_sy, r02 = m->raw[2][0] * inv_sz;
-    float r10 = m->raw[0][1] * inv_sx, r11 = m->raw[1][1] * inv_sy, r12 = m->raw[2][1] * inv_sz;
-    float r20 = m->raw[0][2] * inv_sx, r21 = m->raw[1][2] * inv_sy, r22 = m->raw[2][2] * inv_sz;
-
-    float trace = r00 + r11 + r22;
-    jce_quat q;
-    if (trace > 0.0f) {
-        float s2 = sqrtf(trace + 1.0f) * 2.0f;
-        q.w = 0.25f * s2;
-        q.x = (r21 - r12) / s2;
-        q.y = (r02 - r20) / s2;
-        q.z = (r10 - r01) / s2;
-    } else if (r00 > r11 && r00 > r22) {
-        float s2 = sqrtf(1.0f + r00 - r11 - r22) * 2.0f;
-        q.w = (r21 - r12) / s2;
-        q.x = 0.25f * s2;
-        q.y = (r01 + r10) / s2;
-        q.z = (r02 + r20) / s2;
-    } else if (r11 > r22) {
-        float s2 = sqrtf(1.0f + r11 - r00 - r22) * 2.0f;
-        q.w = (r02 - r20) / s2;
-        q.x = (r01 + r10) / s2;
-        q.y = 0.25f * s2;
-        q.z = (r12 + r21) / s2;
-    } else {
-        float s2 = sqrtf(1.0f + r22 - r00 - r11) * 2.0f;
-        q.w = (r10 - r01) / s2;
-        q.x = (r02 + r20) / s2;
-        q.y = (r12 + r21) / s2;
-        q.z = 0.25f * s2;
-    }
-    return jce_q_normalize(q);
+    return glms_mat4_quat(*m);
 }
 
 /* ================================================================== */

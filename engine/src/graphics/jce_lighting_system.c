@@ -2,7 +2,7 @@
  * jce_lighting_system.c  Multi-light environment implementation.
  */
 
-#include "jce_lighting_system.h"
+#include <jce/graphics/jce_lighting_system.h>
 #include <jce/core/jce_log.h>
 
 #include <bgfx/c99/bgfx.h>

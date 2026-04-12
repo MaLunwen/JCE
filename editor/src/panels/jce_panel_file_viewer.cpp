@@ -8,7 +8,7 @@
  *   jce_fv_hex.cpp    — Hex dump + Scene viewer
  */
 
-#include "jce_fv_common.h"
+#include "viewers/jce_fv_common.h"
 #include "jce_editor_state.h"
 #include <imgui_internal.h>
 

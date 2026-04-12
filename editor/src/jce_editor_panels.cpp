@@ -14,7 +14,7 @@
 #include "jce_editor_style.h"
 #include "jce_editor_config.h"
 #include "jce_editor.h"
-#include "jce_file_viewer.h"
+#include "viewers/jce_file_viewer.h"
 
 #include <imgui.h>
 #include <stdarg.h>

@@ -58,10 +58,8 @@ typedef struct JpakTocEntry {
 #define JPAK_HEADER_SIZE    32u
 #define JPAK_TOC_ENTRY_SIZE 40u
 
-typedef char jpak_assert_header_size
-    [(sizeof(JpakHeader)   == JPAK_HEADER_SIZE)    ? 1 : -1];
-typedef char jpak_assert_toc_entry_size
-    [(sizeof(JpakTocEntry) == JPAK_TOC_ENTRY_SIZE) ? 1 : -1];
+static_assert(sizeof(JpakHeader)   == JPAK_HEADER_SIZE,    "JpakHeader size mismatch");
+static_assert(sizeof(JpakTocEntry) == JPAK_TOC_ENTRY_SIZE, "JpakTocEntry size mismatch");
 
 /* -- Little-endian read helpers (endian-safe) ----------------------- */
 

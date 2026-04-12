@@ -163,12 +163,263 @@ static void accept_asset_drop(char *buf, size_t buf_size)
     }
 }
 
+/* ── Per-component draw helpers ───────────────────────────────────── */
+
+static void draw_comp_transform(JceComponentInfo *comp)
+{
+    ImGui::Text("%s", jce_editor_i18n("transform.position"));
+    ImGui::SameLine(80);
+    draw_vec3_control("Position", comp->data.transform.pos);
+    ImGui::Text("%s", jce_editor_i18n("transform.rotation"));
+    ImGui::SameLine(80);
+    draw_vec3_control("Rotation", comp->data.transform.rot, 1.0f);
+    ImGui::Text("%s", jce_editor_i18n("transform.scale"));
+    ImGui::SameLine(80);
+    draw_vec3_control("Scale", comp->data.transform.scale, 0.01f, 1.0f);
+}
+
+static void draw_comp_light(JceComponentInfo *comp)
+{
+    char lbl[256];
+    snprintf(lbl, sizeof(lbl), "%s###Color", jce_editor_i18n("light.color"));
+    ImGui::ColorEdit4(lbl, comp->data.light.color);
+
+    snprintf(lbl, sizeof(lbl), "%s###Intensity", jce_editor_i18n("light.intensity"));
+    ImGui::DragFloat(lbl, &comp->data.light.intensity, 0.1f, 0.0f, 100.0f);
+
+    const char *light_types[] = {
+        jce_editor_i18n("light.directional"),
+        jce_editor_i18n("light.point"),
+        jce_editor_i18n("light.spot")
+    };
+    snprintf(lbl, sizeof(lbl), "%s###Type", jce_editor_i18n("light.type"));
+    ImGui::Combo(lbl, &comp->data.light.type, light_types, 3);
+}
+
+static void draw_comp_camera(JceComponentInfo *comp)
+{
+    char lbl[256];
+    snprintf(lbl, sizeof(lbl), "%s###FOV", jce_editor_i18n("camera.fov"));
+    ImGui::DragFloat(lbl, &comp->data.camera.fov, 1.0f, 1.0f, 179.0f);
+
+    snprintf(lbl, sizeof(lbl), "%s###Near", jce_editor_i18n("camera.nearClip"));
+    ImGui::DragFloat(lbl, &comp->data.camera.near_clip, 0.01f, 0.001f, 100.0f);
+
+    snprintf(lbl, sizeof(lbl), "%s###Far", jce_editor_i18n("camera.farClip"));
+    ImGui::DragFloat(lbl, &comp->data.camera.far_clip, 1.0f, 1.0f, 100000.0f);
+
+    snprintf(lbl, sizeof(lbl), "%s###Orthographic", jce_editor_i18n("camera.orthographic"));
+    ImGui::Checkbox(lbl, &comp->data.camera.ortho);
+}
+
+static void draw_comp_mesh_renderer(JceComponentInfo *comp)
+{
+    char lbl[256];
+
+    /* Shape selector (procedural mesh fallback). */
+    const char *shape_names[] = {
+        jce_editor_i18n("menu.gameObject.createCube"),
+        jce_editor_i18n("menu.gameObject.createSphere"),
+        jce_editor_i18n("menu.gameObject.createPlane"),
+        jce_editor_i18n("inspector.shape.capsule"),
+        jce_editor_i18n("menu.gameObject.createCylinder")
+    };
+    ImGui::TextColored(JCE_COLOR_INSP_LABEL, "%s",
+                       jce_editor_i18n("inspector.shape"));
+    ImGui::SameLine();
+    ImGui::Combo("##mesh_shape", &comp->data.mesh_renderer.mesh_shape,
+                 shape_names, 5);
+
+    /* Mesh / material file paths. */
+    ImGui::TextColored(JCE_COLOR_INSP_LABEL, "%s", jce_editor_i18n("meshRenderer.mesh"));
+    ImGui::SameLine();
+    ImGui::InputText("##mesh_path", comp->data.mesh_renderer.mesh_path,
+                     sizeof(comp->data.mesh_renderer.mesh_path));
+    accept_asset_drop(comp->data.mesh_renderer.mesh_path,
+                      sizeof(comp->data.mesh_renderer.mesh_path));
+    ImGui::TextColored(JCE_COLOR_INSP_LABEL, "%s", jce_editor_i18n("meshRenderer.materials"));
+    ImGui::SameLine();
+    ImGui::InputText("##mat_path", comp->data.mesh_renderer.material_path,
+                     sizeof(comp->data.mesh_renderer.material_path));
+    accept_asset_drop(comp->data.mesh_renderer.material_path,
+                      sizeof(comp->data.mesh_renderer.material_path));
+
+    /* PBR Parameters */
+    if (ImGui::TreeNodeEx(jce_editor_i18n("inspector.pbrMaterial"), ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::ColorEdit4(jce_editor_i18n("inspector.baseColor"), comp->data.mesh_renderer.base_color);
+        ImGui::DragFloat(jce_editor_i18n("viewer.metallic"), &comp->data.mesh_renderer.metallic,
+                         0.01f, 0.0f, 1.0f);
+        ImGui::DragFloat(jce_editor_i18n("viewer.roughness"), &comp->data.mesh_renderer.roughness,
+                         0.01f, 0.0f, 1.0f);
+        ImGui::ColorEdit3(jce_editor_i18n("inspector.emissive"), comp->data.mesh_renderer.emissive);
+        ImGui::DragFloat(jce_editor_i18n("inspector.normalScale"), &comp->data.mesh_renderer.normal_scale,
+                         0.01f, 0.0f, 4.0f);
+        ImGui::DragFloat(jce_editor_i18n("inspector.aoStrength"), &comp->data.mesh_renderer.ao_strength,
+                         0.01f, 0.0f, 2.0f);
+        const char *alpha_modes[] = {
+            jce_editor_i18n("inspector.alphaMode.opaque"),
+            jce_editor_i18n("inspector.alphaMode.mask"),
+            jce_editor_i18n("inspector.alphaMode.blend")
+        };
+        ImGui::Combo(jce_editor_i18n("inspector.alphaMode"), &comp->data.mesh_renderer.alpha_mode,
+                     alpha_modes, 3);
+        if (comp->data.mesh_renderer.alpha_mode == 1)
+            ImGui::DragFloat(jce_editor_i18n("inspector.alphaCutoff"),
+                             &comp->data.mesh_renderer.alpha_cutoff,
+                             0.01f, 0.0f, 1.0f);
+        ImGui::Checkbox(jce_editor_i18n("inspector.doubleSided"), &comp->data.mesh_renderer.double_sided);
+        ImGui::TreePop();
+    }
+
+    /* Texture Slots */
+    if (ImGui::TreeNodeEx(jce_editor_i18n("inspector.textures"), ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::InputText(jce_editor_i18n("inspector.texture.albedo"), comp->data.mesh_renderer.albedo_tex, 128);
+        accept_asset_drop(comp->data.mesh_renderer.albedo_tex, 128);
+        ImGui::InputText(jce_editor_i18n("inspector.texture.metalRough"), comp->data.mesh_renderer.mr_tex, 128);
+        accept_asset_drop(comp->data.mesh_renderer.mr_tex, 128);
+        ImGui::InputText(jce_editor_i18n("inspector.texture.normal"), comp->data.mesh_renderer.normal_tex, 128);
+        accept_asset_drop(comp->data.mesh_renderer.normal_tex, 128);
+        ImGui::InputText(jce_editor_i18n("inspector.texture.ao"), comp->data.mesh_renderer.ao_tex, 128);
+        accept_asset_drop(comp->data.mesh_renderer.ao_tex, 128);
+        snprintf(lbl, sizeof(lbl), "%s##tex", jce_editor_i18n("inspector.texture.emissive"));
+        ImGui::InputText(lbl, comp->data.mesh_renderer.emissive_tex, 128);
+        accept_asset_drop(comp->data.mesh_renderer.emissive_tex, 128);
+        ImGui::TreePop();
+    }
+}
+
+static void draw_comp_sprite_renderer(JceComponentInfo *comp)
+{
+    ImGui::InputText(jce_editor_i18n("spriteRenderer.sprite"), comp->data.sprite_renderer.sprite_path, 128);
+    accept_asset_drop(comp->data.sprite_renderer.sprite_path, 128);
+    ImGui::ColorEdit4(jce_editor_i18n("spriteRenderer.color"), comp->data.sprite_renderer.color);
+    ImGui::Checkbox(jce_editor_i18n("spriteRenderer.flipX"), &comp->data.sprite_renderer.flip_x);
+    ImGui::SameLine();
+    ImGui::Checkbox(jce_editor_i18n("spriteRenderer.flipY"), &comp->data.sprite_renderer.flip_y);
+    ImGui::DragInt(jce_editor_i18n("spriteRenderer.orderInLayer"), &comp->data.sprite_renderer.sorting_order);
+}
+
+static void draw_comp_animator(JceComponentInfo *comp)
+{
+    ImGui::InputText(jce_editor_i18n("timeline.clip"), comp->data.animator.clip_name, 64);
+    accept_asset_drop(comp->data.animator.clip_name, 64);
+    ImGui::DragFloat(jce_editor_i18n("timeline.speed"), &comp->data.animator.speed,
+                     0.01f, 0.0f, 10.0f);
+    ImGui::Checkbox(jce_editor_i18n("timeline.loop"), &comp->data.animator.loop);
+    if (ImGui::Button(comp->data.animator.playing
+                      ? jce_editor_i18n("toolbar.stop")
+                      : jce_editor_i18n("toolbar.play")))
+        comp->data.animator.playing = !comp->data.animator.playing;
+}
+
+static void draw_comp_skeletal_animator(JceComponentInfo *comp)
+{
+    char lbl[256];
+    ImGui::InputText(jce_editor_i18n("inspector.skeleton"), comp->data.skeletal_animator.skeleton_path, 128);
+    accept_asset_drop(comp->data.skeletal_animator.skeleton_path, 128);
+    snprintf(lbl, sizeof(lbl), "%s##skel", jce_editor_i18n("timeline.speed"));
+    ImGui::DragFloat(lbl, &comp->data.skeletal_animator.speed,
+                     0.01f, 0.0f, 10.0f);
+    snprintf(lbl, sizeof(lbl), "%s##skel", jce_editor_i18n("timeline.loop"));
+    ImGui::Checkbox(lbl, &comp->data.skeletal_animator.loop);
+    if (comp->data.skeletal_animator.clip_count > 0) {
+        ImGui::Combo(jce_editor_i18n("inspector.activeClip"), &comp->data.skeletal_animator.active_clip,
+            [](void *data, int idx) -> const char* {
+                auto *sa = (decltype(comp->data.skeletal_animator)*)data;
+                return sa->clip_names[idx]; },
+            &comp->data.skeletal_animator,
+            comp->data.skeletal_animator.clip_count);
+    }
+    snprintf(lbl, sizeof(lbl), "%s##skel",
+             comp->data.skeletal_animator.playing
+                ? jce_editor_i18n("toolbar.stop")
+                : jce_editor_i18n("toolbar.play"));
+    if (ImGui::Button(lbl))
+        comp->data.skeletal_animator.playing = !comp->data.skeletal_animator.playing;
+}
+
+static void draw_comp_rigidbody(JceComponentInfo *comp)
+{
+    char lbl[256];
+    snprintf(lbl, sizeof(lbl), "%s##rbMass", jce_editor_i18n("rigidbody.mass"));
+    ImGui::DragFloat(lbl, &comp->data.rigidbody.mass, 0.1f, 0.0f, 10000.0f);
+    snprintf(lbl, sizeof(lbl), "%s##rbDrag", jce_editor_i18n("rigidbody.drag"));
+    ImGui::DragFloat(lbl, &comp->data.rigidbody.drag, 0.01f, 0.0f, 100.0f);
+    snprintf(lbl, sizeof(lbl), "%s##rbAngularDrag", jce_editor_i18n("rigidbody.angularDrag"));
+    ImGui::DragFloat(lbl, &comp->data.rigidbody.angular_drag,
+                     0.01f, 0.0f, 100.0f);
+    snprintf(lbl, sizeof(lbl), "%s##rbUseGravity", jce_editor_i18n("rigidbody.useGravity"));
+    ImGui::Checkbox(lbl, &comp->data.rigidbody.use_gravity);
+    snprintf(lbl, sizeof(lbl), "%s##rbIsKinematic", jce_editor_i18n("rigidbody.isKinematic"));
+    ImGui::Checkbox(lbl, &comp->data.rigidbody.is_kinematic);
+}
+
+static void draw_comp_box_collider(JceComponentInfo *comp)
+{
+    char lbl[256];
+    ImGui::Text("%s", jce_editor_i18n("collider.center"));
+    ImGui::SameLine(80);
+    draw_vec3_control("BoxCenter", comp->data.box_collider.center);
+    ImGui::Text("%s", jce_editor_i18n("collider.size"));
+    ImGui::SameLine(80);
+    draw_vec3_control("BoxSize", comp->data.box_collider.size, 0.01f, 1.0f);
+    snprintf(lbl, sizeof(lbl), "%s##box", jce_editor_i18n("collider.isTrigger"));
+    ImGui::Checkbox(lbl, &comp->data.box_collider.is_trigger);
+}
+
+static void draw_comp_sphere_collider(JceComponentInfo *comp)
+{
+    char lbl[256];
+    ImGui::Text("%s", jce_editor_i18n("collider.center"));
+    ImGui::SameLine(80);
+    draw_vec3_control("SphereCenter", comp->data.sphere_collider.center);
+    ImGui::DragFloat(jce_editor_i18n("collider.radius"), &comp->data.sphere_collider.radius,
+                     0.01f, 0.001f, 1000.0f);
+    snprintf(lbl, sizeof(lbl), "%s##sphere", jce_editor_i18n("collider.isTrigger"));
+    ImGui::Checkbox(lbl, &comp->data.sphere_collider.is_trigger);
+}
+
+static void draw_comp_character_controller(JceComponentInfo *comp)
+{
+    char lbl[256];
+    ImGui::DragFloat(jce_editor_i18n("collider.height"), &comp->data.character_controller.height,
+                     0.1f, 0.1f, 100.0f);
+    snprintf(lbl, sizeof(lbl), "%s##cc", jce_editor_i18n("collider.radius"));
+    ImGui::DragFloat(lbl, &comp->data.character_controller.radius,
+                     0.01f, 0.01f, 50.0f);
+    ImGui::DragFloat(jce_editor_i18n("inspector.stepOffset"), &comp->data.character_controller.step_offset,
+                     0.01f, 0.0f, 10.0f);
+    ImGui::DragFloat(jce_editor_i18n("inspector.slopeLimit"), &comp->data.character_controller.slope_limit,
+                     1.0f, 0.0f, 90.0f);
+}
+
+static void draw_comp_audio_source(JceComponentInfo *comp)
+{
+    char lbl[256];
+    ImGui::InputText(jce_editor_i18n("audioSource.clip"), comp->data.audio_source.clip_path, 128);
+    accept_asset_drop(comp->data.audio_source.clip_path, 128);
+    ImGui::DragFloat(jce_editor_i18n("audioSource.volume"), &comp->data.audio_source.volume,
+                     0.01f, 0.0f, 1.0f);
+    ImGui::DragFloat(jce_editor_i18n("audioSource.pitch"), &comp->data.audio_source.pitch,
+                     0.01f, 0.01f, 3.0f);
+    ImGui::DragFloat(jce_editor_i18n("inspector.spatialBlend"), &comp->data.audio_source.spatial_blend,
+                     0.01f, 0.0f, 1.0f);
+    snprintf(lbl, sizeof(lbl), "%s##audio", jce_editor_i18n("audioSource.loop"));
+    ImGui::Checkbox(lbl, &comp->data.audio_source.loop);
+    ImGui::Checkbox(jce_editor_i18n("audioSource.playOnAwake"), &comp->data.audio_source.play_on_awake);
+}
+
+static void draw_comp_script(JceComponentInfo *comp)
+{
+    ImGui::InputText(jce_editor_i18n("inspector.script"), comp->data.script.script_path, 128);
+    accept_asset_drop(comp->data.script.script_path, 128);
+}
+
 /* ── Component editor ─────────────────────────────────────────────── */
 
 static void draw_component(JceComponentInfo *comp, uint32_t entity_id)
 {
     const char *name = jce_component_type_name(comp->type);
-    char lbl[256];
     ImGui::PushID((int)comp->type);
 
     ImGui::PushStyleColor(ImGuiCol_Header, JCE_COLOR_INSP_HEADER);
@@ -195,252 +446,19 @@ static void draw_component(JceComponentInfo *comp, uint32_t entity_id)
 
     if (open) {
         switch (comp->type) {
-        case JCE_COMP_TRANSFORM:
-            ImGui::Text("%s", jce_editor_i18n("transform.position"));
-            ImGui::SameLine(80);
-            draw_vec3_control("Position", comp->data.transform.pos);
-            ImGui::Text("%s", jce_editor_i18n("transform.rotation"));
-            ImGui::SameLine(80);
-            draw_vec3_control("Rotation", comp->data.transform.rot, 1.0f);
-            ImGui::Text("%s", jce_editor_i18n("transform.scale"));
-            ImGui::SameLine(80);
-            draw_vec3_control("Scale", comp->data.transform.scale, 0.01f, 1.0f);
-            break;
-
-        case JCE_COMP_LIGHT:
-            {
-                char _lbl[256];
-                snprintf(_lbl, sizeof(_lbl), "%s###Color", jce_editor_i18n("light.color"));
-                ImGui::ColorEdit4(_lbl, comp->data.light.color);
-            }
-            {
-                char _lbl[256];
-                snprintf(_lbl, sizeof(_lbl), "%s###Intensity", jce_editor_i18n("light.intensity"));
-                ImGui::DragFloat(_lbl, &comp->data.light.intensity, 0.1f, 0.0f, 100.0f);
-            }
-            {
-                const char *light_types[] = {
-                    jce_editor_i18n("light.directional"),
-                    jce_editor_i18n("light.point"),
-                    jce_editor_i18n("light.spot")
-                };
-                char _lbl[256];
-                snprintf(_lbl, sizeof(_lbl), "%s###Type", jce_editor_i18n("light.type"));
-                ImGui::Combo(_lbl, &comp->data.light.type, light_types, 3);
-            }
-            break;
-
-        case JCE_COMP_CAMERA:
-            {
-                char _lbl[256];
-                snprintf(_lbl, sizeof(_lbl), "%s###FOV", jce_editor_i18n("camera.fov"));
-                ImGui::DragFloat(_lbl, &comp->data.camera.fov, 1.0f, 1.0f, 179.0f);
-            }
-            {
-                char _lbl[256];
-                snprintf(_lbl, sizeof(_lbl), "%s###Near", jce_editor_i18n("camera.nearClip"));
-                ImGui::DragFloat(_lbl, &comp->data.camera.near_clip, 0.01f, 0.001f, 100.0f);
-            }
-            {
-                char _lbl[256];
-                snprintf(_lbl, sizeof(_lbl), "%s###Far", jce_editor_i18n("camera.farClip"));
-                ImGui::DragFloat(_lbl, &comp->data.camera.far_clip, 1.0f, 1.0f, 100000.0f);
-            }
-            {
-                char _lbl[256];
-                snprintf(_lbl, sizeof(_lbl), "%s###Orthographic", jce_editor_i18n("camera.orthographic"));
-                ImGui::Checkbox(_lbl, &comp->data.camera.ortho);
-            }
-            break;
-
-        case JCE_COMP_MESH_RENDERER:
-            /* Shape selector (procedural mesh fallback). */
-            {
-                const char *shape_names[] = {
-                    jce_editor_i18n("menu.gameObject.createCube"),
-                    jce_editor_i18n("menu.gameObject.createSphere"),
-                    jce_editor_i18n("menu.gameObject.createPlane"),
-                    jce_editor_i18n("inspector.shape.capsule"),
-                    jce_editor_i18n("menu.gameObject.createCylinder")
-                };
-                ImGui::TextColored(JCE_COLOR_INSP_LABEL, "%s",
-                                   jce_editor_i18n("inspector.shape"));
-                ImGui::SameLine();
-                ImGui::Combo("##mesh_shape", &comp->data.mesh_renderer.mesh_shape,
-                             shape_names, 5);
-            }
-            /* Mesh / material file paths. */
-            ImGui::TextColored(JCE_COLOR_INSP_LABEL, "%s", jce_editor_i18n("meshRenderer.mesh"));
-            ImGui::SameLine();
-            ImGui::InputText("##mesh_path", comp->data.mesh_renderer.mesh_path,
-                             sizeof(comp->data.mesh_renderer.mesh_path));
-            accept_asset_drop(comp->data.mesh_renderer.mesh_path,
-                              sizeof(comp->data.mesh_renderer.mesh_path));
-            ImGui::TextColored(JCE_COLOR_INSP_LABEL, "%s", jce_editor_i18n("meshRenderer.materials"));
-            ImGui::SameLine();
-            ImGui::InputText("##mat_path", comp->data.mesh_renderer.material_path,
-                             sizeof(comp->data.mesh_renderer.material_path));
-            accept_asset_drop(comp->data.mesh_renderer.material_path,
-                              sizeof(comp->data.mesh_renderer.material_path));
-
-            /* --- PBR Parameters --- */
-            if (ImGui::TreeNodeEx(jce_editor_i18n("inspector.pbrMaterial"), ImGuiTreeNodeFlags_DefaultOpen)) {
-                ImGui::ColorEdit4(jce_editor_i18n("inspector.baseColor"), comp->data.mesh_renderer.base_color);
-                ImGui::DragFloat(jce_editor_i18n("viewer.metallic"), &comp->data.mesh_renderer.metallic,
-                                 0.01f, 0.0f, 1.0f);
-                ImGui::DragFloat(jce_editor_i18n("viewer.roughness"), &comp->data.mesh_renderer.roughness,
-                                 0.01f, 0.0f, 1.0f);
-                ImGui::ColorEdit3(jce_editor_i18n("inspector.emissive"), comp->data.mesh_renderer.emissive);
-                ImGui::DragFloat(jce_editor_i18n("inspector.normalScale"), &comp->data.mesh_renderer.normal_scale,
-                                 0.01f, 0.0f, 4.0f);
-                ImGui::DragFloat(jce_editor_i18n("inspector.aoStrength"), &comp->data.mesh_renderer.ao_strength,
-                                 0.01f, 0.0f, 2.0f);
-                {
-                    const char *alpha_modes[] = {
-                        jce_editor_i18n("inspector.alphaMode.opaque"),
-                        jce_editor_i18n("inspector.alphaMode.mask"),
-                        jce_editor_i18n("inspector.alphaMode.blend")
-                    };
-                    ImGui::Combo(jce_editor_i18n("inspector.alphaMode"), &comp->data.mesh_renderer.alpha_mode,
-                                 alpha_modes, 3);
-                }
-                if (comp->data.mesh_renderer.alpha_mode == 1)
-                    ImGui::DragFloat(jce_editor_i18n("inspector.alphaCutoff"),
-                                     &comp->data.mesh_renderer.alpha_cutoff,
-                                     0.01f, 0.0f, 1.0f);
-                ImGui::Checkbox(jce_editor_i18n("inspector.doubleSided"), &comp->data.mesh_renderer.double_sided);
-                ImGui::TreePop();
-            }
-
-            /* --- Texture Slots --- */
-            if (ImGui::TreeNodeEx(jce_editor_i18n("inspector.textures"), ImGuiTreeNodeFlags_DefaultOpen)) {
-                ImGui::InputText(jce_editor_i18n("inspector.texture.albedo"), comp->data.mesh_renderer.albedo_tex, 128);
-                accept_asset_drop(comp->data.mesh_renderer.albedo_tex, 128);
-                ImGui::InputText(jce_editor_i18n("inspector.texture.metalRough"), comp->data.mesh_renderer.mr_tex, 128);
-                accept_asset_drop(comp->data.mesh_renderer.mr_tex, 128);
-                ImGui::InputText(jce_editor_i18n("inspector.texture.normal"), comp->data.mesh_renderer.normal_tex, 128);
-                accept_asset_drop(comp->data.mesh_renderer.normal_tex, 128);
-                ImGui::InputText(jce_editor_i18n("inspector.texture.ao"), comp->data.mesh_renderer.ao_tex, 128);
-                accept_asset_drop(comp->data.mesh_renderer.ao_tex, 128);
-                snprintf(lbl, sizeof(lbl), "%s##tex", jce_editor_i18n("inspector.texture.emissive"));
-                ImGui::InputText(lbl, comp->data.mesh_renderer.emissive_tex, 128);
-                accept_asset_drop(comp->data.mesh_renderer.emissive_tex, 128);
-                ImGui::TreePop();
-            }
-            break;
-
-        case JCE_COMP_SPRITE_RENDERER:
-            ImGui::InputText(jce_editor_i18n("spriteRenderer.sprite"), comp->data.sprite_renderer.sprite_path, 128);
-            accept_asset_drop(comp->data.sprite_renderer.sprite_path, 128);
-            ImGui::ColorEdit4(jce_editor_i18n("spriteRenderer.color"), comp->data.sprite_renderer.color);
-            ImGui::Checkbox(jce_editor_i18n("spriteRenderer.flipX"), &comp->data.sprite_renderer.flip_x);
-            ImGui::SameLine();
-            ImGui::Checkbox(jce_editor_i18n("spriteRenderer.flipY"), &comp->data.sprite_renderer.flip_y);
-            ImGui::DragInt(jce_editor_i18n("spriteRenderer.orderInLayer"), &comp->data.sprite_renderer.sorting_order);
-            break;
-
-        case JCE_COMP_ANIMATOR:
-            ImGui::InputText(jce_editor_i18n("timeline.clip"), comp->data.animator.clip_name, 64);
-            accept_asset_drop(comp->data.animator.clip_name, 64);
-            ImGui::DragFloat(jce_editor_i18n("timeline.speed"), &comp->data.animator.speed,
-                             0.01f, 0.0f, 10.0f);
-            ImGui::Checkbox(jce_editor_i18n("timeline.loop"), &comp->data.animator.loop);
-            if (ImGui::Button(comp->data.animator.playing
-                              ? jce_editor_i18n("toolbar.stop")
-                              : jce_editor_i18n("toolbar.play")))
-                comp->data.animator.playing = !comp->data.animator.playing;
-            break;
-
-        case JCE_COMP_SKELETAL_ANIMATOR:
-            ImGui::InputText(jce_editor_i18n("inspector.skeleton"), comp->data.skeletal_animator.skeleton_path, 128);
-            accept_asset_drop(comp->data.skeletal_animator.skeleton_path, 128);
-            snprintf(lbl, sizeof(lbl), "%s##skel", jce_editor_i18n("timeline.speed"));
-            ImGui::DragFloat(lbl, &comp->data.skeletal_animator.speed,
-                             0.01f, 0.0f, 10.0f);
-            snprintf(lbl, sizeof(lbl), "%s##skel", jce_editor_i18n("timeline.loop"));
-            ImGui::Checkbox(lbl, &comp->data.skeletal_animator.loop);
-            if (comp->data.skeletal_animator.clip_count > 0) {
-                ImGui::Combo(jce_editor_i18n("inspector.activeClip"), &comp->data.skeletal_animator.active_clip,
-                    [](void *data, int idx) -> const char* {
-                        auto *sa = (decltype(comp->data.skeletal_animator)*)data;
-                        return sa->clip_names[idx]; },
-                    &comp->data.skeletal_animator,
-                    comp->data.skeletal_animator.clip_count);
-            }
-            snprintf(lbl, sizeof(lbl), "%s##skel",
-                     comp->data.skeletal_animator.playing
-                        ? jce_editor_i18n("toolbar.stop")
-                        : jce_editor_i18n("toolbar.play"));
-            if (ImGui::Button(lbl))
-                comp->data.skeletal_animator.playing = !comp->data.skeletal_animator.playing;
-            break;
-
-        case JCE_COMP_RIGIDBODY:
-            snprintf(lbl, sizeof(lbl), "%s##rbMass", jce_editor_i18n("rigidbody.mass"));
-            ImGui::DragFloat(lbl, &comp->data.rigidbody.mass, 0.1f, 0.0f, 10000.0f);
-            snprintf(lbl, sizeof(lbl), "%s##rbDrag", jce_editor_i18n("rigidbody.drag"));
-            ImGui::DragFloat(lbl, &comp->data.rigidbody.drag, 0.01f, 0.0f, 100.0f);
-            snprintf(lbl, sizeof(lbl), "%s##rbAngularDrag", jce_editor_i18n("rigidbody.angularDrag"));
-            ImGui::DragFloat(lbl, &comp->data.rigidbody.angular_drag,
-                             0.01f, 0.0f, 100.0f);
-            snprintf(lbl, sizeof(lbl), "%s##rbUseGravity", jce_editor_i18n("rigidbody.useGravity"));
-            ImGui::Checkbox(lbl, &comp->data.rigidbody.use_gravity);
-            snprintf(lbl, sizeof(lbl), "%s##rbIsKinematic", jce_editor_i18n("rigidbody.isKinematic"));
-            ImGui::Checkbox(lbl, &comp->data.rigidbody.is_kinematic);
-            break;
-
-        case JCE_COMP_BOX_COLLIDER:
-            ImGui::Text("%s", jce_editor_i18n("collider.center"));
-            ImGui::SameLine(80);
-            draw_vec3_control("BoxCenter", comp->data.box_collider.center);
-            ImGui::Text("%s", jce_editor_i18n("collider.size"));
-            ImGui::SameLine(80);
-            draw_vec3_control("BoxSize", comp->data.box_collider.size, 0.01f, 1.0f);
-            snprintf(lbl, sizeof(lbl), "%s##box", jce_editor_i18n("collider.isTrigger"));
-            ImGui::Checkbox(lbl, &comp->data.box_collider.is_trigger);
-            break;
-
-        case JCE_COMP_SPHERE_COLLIDER:
-            ImGui::Text("%s", jce_editor_i18n("collider.center"));
-            ImGui::SameLine(80);
-            draw_vec3_control("SphereCenter", comp->data.sphere_collider.center);
-            ImGui::DragFloat(jce_editor_i18n("collider.radius"), &comp->data.sphere_collider.radius,
-                             0.01f, 0.001f, 1000.0f);
-            snprintf(lbl, sizeof(lbl), "%s##sphere", jce_editor_i18n("collider.isTrigger"));
-            ImGui::Checkbox(lbl, &comp->data.sphere_collider.is_trigger);
-            break;
-
-        case JCE_COMP_CHARACTER_CONTROLLER:
-            ImGui::DragFloat(jce_editor_i18n("collider.height"), &comp->data.character_controller.height,
-                             0.1f, 0.1f, 100.0f);
-            snprintf(lbl, sizeof(lbl), "%s##cc", jce_editor_i18n("collider.radius"));
-            ImGui::DragFloat(lbl, &comp->data.character_controller.radius,
-                             0.01f, 0.01f, 50.0f);
-            ImGui::DragFloat(jce_editor_i18n("inspector.stepOffset"), &comp->data.character_controller.step_offset,
-                             0.01f, 0.0f, 10.0f);
-            ImGui::DragFloat(jce_editor_i18n("inspector.slopeLimit"), &comp->data.character_controller.slope_limit,
-                             1.0f, 0.0f, 90.0f);
-            break;
-
-        case JCE_COMP_AUDIO_SOURCE:
-            ImGui::InputText(jce_editor_i18n("audioSource.clip"), comp->data.audio_source.clip_path, 128);
-            accept_asset_drop(comp->data.audio_source.clip_path, 128);
-            ImGui::DragFloat(jce_editor_i18n("audioSource.volume"), &comp->data.audio_source.volume,
-                             0.01f, 0.0f, 1.0f);
-            ImGui::DragFloat(jce_editor_i18n("audioSource.pitch"), &comp->data.audio_source.pitch,
-                             0.01f, 0.01f, 3.0f);
-            ImGui::DragFloat(jce_editor_i18n("inspector.spatialBlend"), &comp->data.audio_source.spatial_blend,
-                             0.01f, 0.0f, 1.0f);
-            snprintf(lbl, sizeof(lbl), "%s##audio", jce_editor_i18n("audioSource.loop"));
-            ImGui::Checkbox(lbl, &comp->data.audio_source.loop);
-            ImGui::Checkbox(jce_editor_i18n("audioSource.playOnAwake"), &comp->data.audio_source.play_on_awake);
-            break;
-
-        case JCE_COMP_SCRIPT:
-            ImGui::InputText(jce_editor_i18n("inspector.script"), comp->data.script.script_path, 128);
-            accept_asset_drop(comp->data.script.script_path, 128);
-            break;
-
+        case JCE_COMP_TRANSFORM:            draw_comp_transform(comp);            break;
+        case JCE_COMP_LIGHT:                draw_comp_light(comp);                break;
+        case JCE_COMP_CAMERA:               draw_comp_camera(comp);               break;
+        case JCE_COMP_MESH_RENDERER:        draw_comp_mesh_renderer(comp);        break;
+        case JCE_COMP_SPRITE_RENDERER:      draw_comp_sprite_renderer(comp);      break;
+        case JCE_COMP_ANIMATOR:             draw_comp_animator(comp);             break;
+        case JCE_COMP_SKELETAL_ANIMATOR:    draw_comp_skeletal_animator(comp);    break;
+        case JCE_COMP_RIGIDBODY:            draw_comp_rigidbody(comp);            break;
+        case JCE_COMP_BOX_COLLIDER:         draw_comp_box_collider(comp);         break;
+        case JCE_COMP_SPHERE_COLLIDER:      draw_comp_sphere_collider(comp);      break;
+        case JCE_COMP_CHARACTER_CONTROLLER: draw_comp_character_controller(comp); break;
+        case JCE_COMP_AUDIO_SOURCE:         draw_comp_audio_source(comp);         break;
+        case JCE_COMP_SCRIPT:               draw_comp_script(comp);               break;
         default:
             ImGui::TextDisabled("%s", jce_editor_i18n("inspector.propertiesNotImplemented"));
             break;

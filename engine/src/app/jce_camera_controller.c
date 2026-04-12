@@ -108,9 +108,9 @@ void jce_camctrl_update(JceCameraController *ctrl,
     {
         float len_sq = mf * mf + mr * mr;
         if (len_sq > 1.0f) {
-            float inv = 1.0f / sqrtf(len_sq);
-            mf *= inv;
-            mr *= inv;
+            jce_vec2 move = jce_v2_normalize(jce_v2(mf, mr));
+            mf = move.x;
+            mr = move.y;
         }
     }
 

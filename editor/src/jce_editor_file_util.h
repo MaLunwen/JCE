@@ -12,6 +12,7 @@
 #define JCE_EDITOR_FILE_UTIL_H
 
 #include "jce_editor_alloc.h"
+#include <cjson/cJSON.h>
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -60,6 +61,22 @@ static inline bool ed_write_file(const char *path,
     size_t written = fwrite(data, 1, size, fp);
     fclose(fp);
     return written == size;
+}
+
+/* Serialize a cJSON tree to a file and free the tree.
+ * Returns true on success.  The cJSON root is always deleted. */
+static inline bool ed_write_json_to_file(const char *path, cJSON *root)
+{
+    if (!path || !root) { cJSON_Delete(root); return false; }
+
+    char *json_str = cJSON_Print(root);
+    cJSON_Delete(root);
+    if (!json_str) return false;
+
+    size_t len = strlen(json_str);
+    bool ok = ed_write_file(path, json_str, len);
+    cJSON_free(json_str);
+    return ok;
 }
 
 #endif /* JCE_EDITOR_FILE_UTIL_H */

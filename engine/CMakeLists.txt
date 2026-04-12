@@ -55,8 +55,11 @@ endif()
 # ------------------------------------------------------------------ #
 
 target_link_libraries(JCE PUBLIC
-	SDL3_image::SDL3_image
 	sdl::sdl
+	cglm::cglm)
+
+target_link_libraries(JCE PRIVATE
+	SDL3_image::SDL3_image
 	bgfx::bgfx
 	flecs::flecs_static
 	miniaudio::miniaudio
@@ -66,7 +69,6 @@ target_link_libraries(JCE PUBLIC
 	zstd::libzstd_static
 	xxHash::xxhash
 	mimalloc-static
-	cglm::cglm
 	enkits::enkits
 	physfs-static
 	cjson::cjson

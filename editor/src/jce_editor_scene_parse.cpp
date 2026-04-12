@@ -220,6 +220,213 @@ static const char *json_get_string(const cJSON *obj, const char *key)
 	return (cJSON_IsString(item) && item->valuestring) ? item->valuestring : NULL;
 }
 
+/* ── Per-component JSON parsers ─────────────────────────────────── */
+
+static void parse_json_transform(const cJSON *props, JceComponentInfo *out)
+{
+	out->data.transform.pos[0]   = json_get_float_any2(props, "posX", "pos_x", 0.0f);
+	out->data.transform.pos[1]   = json_get_float_any2(props, "posY", "pos_y", 0.0f);
+	out->data.transform.pos[2]   = json_get_float_any2(props, "posZ", "pos_z", 0.0f);
+	/* Rotation: check for quaternion (rotW present) and convert to Euler degrees. */
+	{
+		float rx = json_get_float_any2(props, "rotX", "rot_x", 0.0f);
+		float ry = json_get_float_any2(props, "rotY", "rot_y", 0.0f);
+		float rz = json_get_float_any2(props, "rotZ", "rot_z", 0.0f);
+		const cJSON *rw_item = cJSON_GetObjectItemCaseSensitive(props, "rotW");
+		if (!rw_item) rw_item = cJSON_GetObjectItemCaseSensitive(props, "rot_w");
+		if (cJSON_IsNumber(rw_item)) {
+			float qw = (float)rw_item->valuedouble;
+			jce_quat q = {{ rx, ry, rz, qw }};
+			q = jce_q_normalize(q);
+			jce_vec3 e = jce_q_to_euler(q);
+			rx = e.x * JCE_RAD2DEG;
+			ry = e.y * JCE_RAD2DEG;
+			rz = e.z * JCE_RAD2DEG;
+		}
+		out->data.transform.rot[0] = rx;
+		out->data.transform.rot[1] = ry;
+		out->data.transform.rot[2] = rz;
+	}
+	out->data.transform.scale[0] = json_get_float_any2(props, "scaleX", "scale_x", 1.0f);
+	out->data.transform.scale[1] = json_get_float_any2(props, "scaleY", "scale_y", 1.0f);
+	out->data.transform.scale[2] = json_get_float_any2(props, "scaleZ", "scale_z", 1.0f);
+}
+
+static void parse_json_camera(const cJSON *props, JceComponentInfo *out)
+{
+	out->data.camera.fov       = json_get_float(props, "fov", 60.0f);
+	out->data.camera.near_clip = json_get_float_any2(props, "nearClip", "near_clip", 0.1f);
+	out->data.camera.far_clip  = json_get_float_any2(props, "farClip", "far_clip", 1000.0f);
+	bool ortho = false;
+	static const char *const ortho_keys[] = { "orthographic", "ortho", "isOrtho" };
+	json_get_bool_any(props, ortho_keys,
+		(int)(sizeof(ortho_keys) / sizeof(ortho_keys[0])), &ortho);
+	out->data.camera.ortho = ortho;
+}
+
+static void parse_json_light(const cJSON *props, JceComponentInfo *out)
+{
+	out->data.light.color[0]   = json_get_float_any2(props, "colorR", "color_r", 1.0f);
+	out->data.light.color[1]   = json_get_float_any2(props, "colorG", "color_g", 1.0f);
+	out->data.light.color[2]   = json_get_float_any2(props, "colorB", "color_b", 1.0f);
+	out->data.light.color[3]   = json_get_float_any2(props, "colorA", "color_a", 1.0f);
+	out->data.light.intensity  = json_get_float(props, "intensity", 1.0f);
+	const cJSON *lt = cJSON_GetObjectItemCaseSensitive(props, "lightType");
+	if (!lt) lt = cJSON_GetObjectItemCaseSensitive(props, "type");
+	if (cJSON_IsNumber(lt))
+		out->data.light.type = lt->valueint;
+	else if (cJSON_IsString(lt) && lt->valuestring) {
+		if (equals_ignore_case(lt->valuestring, "point")) out->data.light.type = 1;
+		else if (equals_ignore_case(lt->valuestring, "spot")) out->data.light.type = 2;
+	}
+}
+
+static void parse_json_mesh_renderer(const cJSON *props, JceComponentInfo *out)
+{
+	static const char *const mesh_keys[] = { "meshPath", "mesh_path", "mesh" };
+	static const char *const mat_keys[] = { "materialPath", "material_path", "material" };
+	const char *mesh = json_get_string_any(props, mesh_keys,
+		(int)(sizeof(mesh_keys) / sizeof(mesh_keys[0])));
+	const char *mat = json_get_string_any(props, mat_keys,
+		(int)(sizeof(mat_keys) / sizeof(mat_keys[0])));
+	if (mesh)
+		snprintf(out->data.mesh_renderer.mesh_path,
+		         sizeof(out->data.mesh_renderer.mesh_path), "%s", mesh);
+	if (mat)
+		snprintf(out->data.mesh_renderer.material_path,
+		         sizeof(out->data.mesh_renderer.material_path), "%s", mat);
+	out->data.mesh_renderer.mesh_shape = (int)json_get_float(props, "meshShape", 0.0f);
+	/* PBR parameters. */
+	out->data.mesh_renderer.base_color[0] = json_get_float(props, "baseColorR", 1.0f);
+	out->data.mesh_renderer.base_color[1] = json_get_float(props, "baseColorG", 1.0f);
+	out->data.mesh_renderer.base_color[2] = json_get_float(props, "baseColorB", 1.0f);
+	out->data.mesh_renderer.base_color[3] = json_get_float(props, "baseColorA", 1.0f);
+	out->data.mesh_renderer.metallic      = json_get_float(props, "metallic", 0.0f);
+	out->data.mesh_renderer.roughness     = json_get_float(props, "roughness", 1.0f);
+	out->data.mesh_renderer.emissive[0]   = json_get_float(props, "emissiveR", 0.0f);
+	out->data.mesh_renderer.emissive[1]   = json_get_float(props, "emissiveG", 0.0f);
+	out->data.mesh_renderer.emissive[2]   = json_get_float(props, "emissiveB", 0.0f);
+	out->data.mesh_renderer.normal_scale  = json_get_float(props, "normalScale", 1.0f);
+	out->data.mesh_renderer.ao_strength   = json_get_float(props, "aoStrength", 1.0f);
+	out->data.mesh_renderer.alpha_mode    = (int)json_get_float(props, "alphaMode", 0.0f);
+	out->data.mesh_renderer.alpha_cutoff  = json_get_float(props, "alphaCutoff", 0.5f);
+	const cJSON *ds = cJSON_GetObjectItemCaseSensitive(props, "doubleSided");
+	out->data.mesh_renderer.double_sided = cJSON_IsTrue(ds);
+	/* Texture paths. */
+	{ const char *v = json_get_string(props, "albedoTex");
+	  if (v) snprintf(out->data.mesh_renderer.albedo_tex, 128, "%s", v); }
+	{ const char *v = json_get_string(props, "mrTex");
+	  if (v) snprintf(out->data.mesh_renderer.mr_tex, 128, "%s", v); }
+	{ const char *v = json_get_string(props, "normalTex");
+	  if (v) snprintf(out->data.mesh_renderer.normal_tex, 128, "%s", v); }
+	{ const char *v = json_get_string(props, "aoTex");
+	  if (v) snprintf(out->data.mesh_renderer.ao_tex, 128, "%s", v); }
+	{ const char *v = json_get_string(props, "emissiveTex");
+	  if (v) snprintf(out->data.mesh_renderer.emissive_tex, 128, "%s", v); }
+}
+
+static void parse_json_sprite_renderer(const cJSON *props, JceComponentInfo *out)
+{
+	{ const char *v = json_get_string(props, "spritePath");
+	  if (v) snprintf(out->data.sprite_renderer.sprite_path, 128, "%s", v); }
+	out->data.sprite_renderer.color[0] = json_get_float(props, "colorR", 1.0f);
+	out->data.sprite_renderer.color[1] = json_get_float(props, "colorG", 1.0f);
+	out->data.sprite_renderer.color[2] = json_get_float(props, "colorB", 1.0f);
+	out->data.sprite_renderer.color[3] = json_get_float(props, "colorA", 1.0f);
+	out->data.sprite_renderer.flip_x = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "flipX"));
+	out->data.sprite_renderer.flip_y = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "flipY"));
+	out->data.sprite_renderer.sorting_order = (int)json_get_float(props, "sortingOrder", 0.0f);
+}
+
+static void parse_json_animator(const cJSON *props, JceComponentInfo *out)
+{
+	{ const char *v = json_get_string(props, "clipName");
+	  if (v) snprintf(out->data.animator.clip_name, 64, "%s", v); }
+	out->data.animator.speed   = json_get_float(props, "speed", 1.0f);
+	out->data.animator.loop    = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "loop"));
+	out->data.animator.playing = false;
+}
+
+static void parse_json_skeletal_animator(const cJSON *props, JceComponentInfo *out)
+{
+	{ const char *v = json_get_string(props, "skeletonPath");
+	  if (v) snprintf(out->data.skeletal_animator.skeleton_path, 128, "%s", v); }
+	out->data.skeletal_animator.speed       = json_get_float(props, "speed", 1.0f);
+	out->data.skeletal_animator.loop        = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "loop"));
+	out->data.skeletal_animator.playing     = false;
+	out->data.skeletal_animator.active_clip = (int)json_get_float(props, "activeClip", 0.0f);
+	const cJSON *clips = cJSON_GetObjectItemCaseSensitive(props, "clipNames");
+	out->data.skeletal_animator.clip_count = 0;
+	if (cJSON_IsArray(clips)) {
+		int n = cJSON_GetArraySize(clips);
+		if (n > 8) n = 8;
+		for (int ci = 0; ci < n; ci++) {
+			const cJSON *ce = cJSON_GetArrayItem(clips, ci);
+			if (cJSON_IsString(ce) && ce->valuestring)
+				snprintf(out->data.skeletal_animator.clip_names[ci], 64, "%s", ce->valuestring);
+		}
+		out->data.skeletal_animator.clip_count = n;
+	}
+}
+
+static void parse_json_rigidbody(const cJSON *props, JceComponentInfo *out)
+{
+	out->data.rigidbody.mass         = json_get_float(props, "mass", 1.0f);
+	out->data.rigidbody.drag         = json_get_float(props, "drag", 0.0f);
+	out->data.rigidbody.angular_drag = json_get_float(props, "angularDrag", 0.05f);
+	out->data.rigidbody.use_gravity  = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "useGravity"));
+	out->data.rigidbody.is_kinematic = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "isKinematic"));
+	if (!cJSON_GetObjectItemCaseSensitive(props, "useGravity"))
+		out->data.rigidbody.use_gravity = true;
+}
+
+static void parse_json_box_collider(const cJSON *props, JceComponentInfo *out)
+{
+	out->data.box_collider.center[0] = json_get_float(props, "centerX", 0.0f);
+	out->data.box_collider.center[1] = json_get_float(props, "centerY", 0.0f);
+	out->data.box_collider.center[2] = json_get_float(props, "centerZ", 0.0f);
+	out->data.box_collider.size[0]   = json_get_float(props, "sizeX", 1.0f);
+	out->data.box_collider.size[1]   = json_get_float(props, "sizeY", 1.0f);
+	out->data.box_collider.size[2]   = json_get_float(props, "sizeZ", 1.0f);
+	out->data.box_collider.is_trigger = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "isTrigger"));
+}
+
+static void parse_json_sphere_collider(const cJSON *props, JceComponentInfo *out)
+{
+	out->data.sphere_collider.center[0] = json_get_float(props, "centerX", 0.0f);
+	out->data.sphere_collider.center[1] = json_get_float(props, "centerY", 0.0f);
+	out->data.sphere_collider.center[2] = json_get_float(props, "centerZ", 0.0f);
+	out->data.sphere_collider.radius     = json_get_float(props, "radius", 0.5f);
+	out->data.sphere_collider.is_trigger = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "isTrigger"));
+}
+
+static void parse_json_character_controller(const cJSON *props, JceComponentInfo *out)
+{
+	out->data.character_controller.height      = json_get_float(props, "height", 2.0f);
+	out->data.character_controller.radius      = json_get_float(props, "radius", 0.5f);
+	out->data.character_controller.step_offset  = json_get_float(props, "stepOffset", 0.3f);
+	out->data.character_controller.slope_limit  = json_get_float(props, "slopeLimit", 45.0f);
+}
+
+static void parse_json_audio_source(const cJSON *props, JceComponentInfo *out)
+{
+	{ const char *v = json_get_string(props, "clipPath");
+	  if (v) snprintf(out->data.audio_source.clip_path, 128, "%s", v); }
+	out->data.audio_source.volume        = json_get_float(props, "volume", 1.0f);
+	out->data.audio_source.pitch         = json_get_float(props, "pitch", 1.0f);
+	out->data.audio_source.spatial_blend  = json_get_float(props, "spatialBlend", 0.0f);
+	out->data.audio_source.loop          = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "loop"));
+	out->data.audio_source.play_on_awake = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "playOnAwake"));
+	if (!cJSON_GetObjectItemCaseSensitive(props, "playOnAwake"))
+		out->data.audio_source.play_on_awake = true;
+}
+
+static void parse_json_script(const cJSON *props, JceComponentInfo *out)
+{
+	{ const char *v = json_get_string(props, "scriptPath");
+	  if (v) snprintf(out->data.script.script_path, 128, "%s", v); }
+}
+
 /* ── Parse Component from JSON ───────────────────────────────────── */
 
 static bool parse_component_json(const cJSON *comp_json, JceComponentInfo *out)
@@ -239,224 +446,25 @@ static bool parse_component_json(const cJSON *comp_json, JceComponentInfo *out)
 	out->type = type;
 	out->expanded = true;
 
-	/*
-	 * Properties can be either:
-	 *   - Directly on the component object (SceneSpec / flat format)
-	 *   - Wrapped in a "properties" sub-object (SceneData / editor format)
-	 */
 	const cJSON *props = cJSON_GetObjectItemCaseSensitive(comp_json, "properties");
 	if (!cJSON_IsObject(props))
-		props = comp_json; /* flat format — properties are siblings of "type" */
+		props = comp_json;
 
 	switch (type) {
-	case JCE_COMP_TRANSFORM:
-		out->data.transform.pos[0]   = json_get_float_any2(props, "posX", "pos_x", 0.0f);
-		out->data.transform.pos[1]   = json_get_float_any2(props, "posY", "pos_y", 0.0f);
-		out->data.transform.pos[2]   = json_get_float_any2(props, "posZ", "pos_z", 0.0f);
-		/* Rotation: check for quaternion (rotW present) and convert to Euler degrees. */
-		{
-			float rx = json_get_float_any2(props, "rotX", "rot_x", 0.0f);
-			float ry = json_get_float_any2(props, "rotY", "rot_y", 0.0f);
-			float rz = json_get_float_any2(props, "rotZ", "rot_z", 0.0f);
-			const cJSON *rw_item = cJSON_GetObjectItemCaseSensitive(props, "rotW");
-			if (!rw_item) rw_item = cJSON_GetObjectItemCaseSensitive(props, "rot_w");
-			if (cJSON_IsNumber(rw_item)) {
-				/* quaternion -> Euler degrees via engine math. */
-				float qw = (float)rw_item->valuedouble;
-				jce_quat q = {{ rx, ry, rz, qw }};
-				q = jce_q_normalize(q);
-				jce_vec3 e = jce_q_to_euler(q);
-				rx = e.x * JCE_RAD2DEG;
-				ry = e.y * JCE_RAD2DEG;
-				rz = e.z * JCE_RAD2DEG;
-			}
-			out->data.transform.rot[0] = rx;
-			out->data.transform.rot[1] = ry;
-			out->data.transform.rot[2] = rz;
-		}
-		out->data.transform.scale[0] = json_get_float_any2(props, "scaleX", "scale_x", 1.0f);
-		out->data.transform.scale[1] = json_get_float_any2(props, "scaleY", "scale_y", 1.0f);
-		out->data.transform.scale[2] = json_get_float_any2(props, "scaleZ", "scale_z", 1.0f);
-		break;
-
-	case JCE_COMP_CAMERA:
-		out->data.camera.fov       = json_get_float(props, "fov", 60.0f);
-		out->data.camera.near_clip = json_get_float_any2(props, "nearClip", "near_clip", 0.1f);
-		out->data.camera.far_clip  = json_get_float_any2(props, "farClip", "far_clip", 1000.0f);
-		{
-			bool ortho = false;
-			static const char *const ortho_keys[] = { "orthographic", "ortho", "isOrtho" };
-			json_get_bool_any(props, ortho_keys,
-				(int)(sizeof(ortho_keys) / sizeof(ortho_keys[0])), &ortho);
-			out->data.camera.ortho = ortho;
-		}
-		break;
-
-	case JCE_COMP_LIGHT:
-		out->data.light.color[0]   = json_get_float_any2(props, "colorR", "color_r", 1.0f);
-		out->data.light.color[1]   = json_get_float_any2(props, "colorG", "color_g", 1.0f);
-		out->data.light.color[2]   = json_get_float_any2(props, "colorB", "color_b", 1.0f);
-		out->data.light.color[3]   = json_get_float_any2(props, "colorA", "color_a", 1.0f);
-		out->data.light.intensity  = json_get_float(props, "intensity", 1.0f);
-		{
-			/* Light type: 0 = directional, 1 = point, 2 = spot */
-			const cJSON *lt = cJSON_GetObjectItemCaseSensitive(props, "lightType");
-			if (!lt) lt = cJSON_GetObjectItemCaseSensitive(props, "type");
-			if (cJSON_IsNumber(lt))
-				out->data.light.type = lt->valueint;
-			else if (cJSON_IsString(lt) && lt->valuestring) {
-				if (equals_ignore_case(lt->valuestring, "point")) out->data.light.type = 1;
-				else if (equals_ignore_case(lt->valuestring, "spot")) out->data.light.type = 2;
-				/* else directional = 0 (default) */
-			}
-		}
-		break;
-
-	case JCE_COMP_MESH_RENDERER: {
-		static const char *const mesh_keys[] = { "meshPath", "mesh_path", "mesh" };
-		static const char *const mat_keys[] = { "materialPath", "material_path", "material" };
-		const char *mesh = json_get_string_any(props, mesh_keys,
-			(int)(sizeof(mesh_keys) / sizeof(mesh_keys[0])));
-		const char *mat = json_get_string_any(props, mat_keys,
-			(int)(sizeof(mat_keys) / sizeof(mat_keys[0])));
-		if (mesh)
-			snprintf(out->data.mesh_renderer.mesh_path,
-			         sizeof(out->data.mesh_renderer.mesh_path), "%s", mesh);
-		if (mat)
-			snprintf(out->data.mesh_renderer.material_path,
-			         sizeof(out->data.mesh_renderer.material_path), "%s", mat);
-		/* Mesh shape enum. */
-		out->data.mesh_renderer.mesh_shape = (int)json_get_float(props, "meshShape", 0.0f);
-		/* PBR parameters (inline). */
-		out->data.mesh_renderer.base_color[0] = json_get_float(props, "baseColorR", 1.0f);
-		out->data.mesh_renderer.base_color[1] = json_get_float(props, "baseColorG", 1.0f);
-		out->data.mesh_renderer.base_color[2] = json_get_float(props, "baseColorB", 1.0f);
-		out->data.mesh_renderer.base_color[3] = json_get_float(props, "baseColorA", 1.0f);
-		out->data.mesh_renderer.metallic      = json_get_float(props, "metallic", 0.0f);
-		out->data.mesh_renderer.roughness     = json_get_float(props, "roughness", 1.0f);
-		out->data.mesh_renderer.emissive[0]   = json_get_float(props, "emissiveR", 0.0f);
-		out->data.mesh_renderer.emissive[1]   = json_get_float(props, "emissiveG", 0.0f);
-		out->data.mesh_renderer.emissive[2]   = json_get_float(props, "emissiveB", 0.0f);
-		out->data.mesh_renderer.normal_scale  = json_get_float(props, "normalScale", 1.0f);
-		out->data.mesh_renderer.ao_strength   = json_get_float(props, "aoStrength", 1.0f);
-		out->data.mesh_renderer.alpha_mode    = (int)json_get_float(props, "alphaMode", 0.0f);
-		out->data.mesh_renderer.alpha_cutoff  = json_get_float(props, "alphaCutoff", 0.5f);
-		{
-			const cJSON *ds = cJSON_GetObjectItemCaseSensitive(props, "doubleSided");
-			out->data.mesh_renderer.double_sided = cJSON_IsTrue(ds);
-		}
-		/* Texture paths. */
-		{ const char *v = json_get_string(props, "albedoTex");
-		  if (v) snprintf(out->data.mesh_renderer.albedo_tex, 128, "%s", v); }
-		{ const char *v = json_get_string(props, "mrTex");
-		  if (v) snprintf(out->data.mesh_renderer.mr_tex, 128, "%s", v); }
-		{ const char *v = json_get_string(props, "normalTex");
-		  if (v) snprintf(out->data.mesh_renderer.normal_tex, 128, "%s", v); }
-		{ const char *v = json_get_string(props, "aoTex");
-		  if (v) snprintf(out->data.mesh_renderer.ao_tex, 128, "%s", v); }
-		{ const char *v = json_get_string(props, "emissiveTex");
-		  if (v) snprintf(out->data.mesh_renderer.emissive_tex, 128, "%s", v); }
-		break;
-	}
-
-	case JCE_COMP_SPRITE_RENDERER:
-		{ const char *v = json_get_string(props, "spritePath");
-		  if (v) snprintf(out->data.sprite_renderer.sprite_path, 128, "%s", v); }
-		out->data.sprite_renderer.color[0] = json_get_float(props, "colorR", 1.0f);
-		out->data.sprite_renderer.color[1] = json_get_float(props, "colorG", 1.0f);
-		out->data.sprite_renderer.color[2] = json_get_float(props, "colorB", 1.0f);
-		out->data.sprite_renderer.color[3] = json_get_float(props, "colorA", 1.0f);
-		out->data.sprite_renderer.flip_x = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "flipX"));
-		out->data.sprite_renderer.flip_y = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "flipY"));
-		out->data.sprite_renderer.sorting_order = (int)json_get_float(props, "sortingOrder", 0.0f);
-		break;
-
-	case JCE_COMP_ANIMATOR:
-		{ const char *v = json_get_string(props, "clipName");
-		  if (v) snprintf(out->data.animator.clip_name, 64, "%s", v); }
-		out->data.animator.speed   = json_get_float(props, "speed", 1.0f);
-		out->data.animator.loop    = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "loop"));
-		out->data.animator.playing = false;
-		break;
-
-	case JCE_COMP_SKELETAL_ANIMATOR:
-		{ const char *v = json_get_string(props, "skeletonPath");
-		  if (v) snprintf(out->data.skeletal_animator.skeleton_path, 128, "%s", v); }
-		out->data.skeletal_animator.speed       = json_get_float(props, "speed", 1.0f);
-		out->data.skeletal_animator.loop        = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "loop"));
-		out->data.skeletal_animator.playing     = false;
-		out->data.skeletal_animator.active_clip = (int)json_get_float(props, "activeClip", 0.0f);
-		{
-			const cJSON *clips = cJSON_GetObjectItemCaseSensitive(props, "clipNames");
-			out->data.skeletal_animator.clip_count = 0;
-			if (cJSON_IsArray(clips)) {
-				int n = cJSON_GetArraySize(clips);
-				if (n > 8) n = 8;
-				for (int ci = 0; ci < n; ci++) {
-					const cJSON *ce = cJSON_GetArrayItem(clips, ci);
-					if (cJSON_IsString(ce) && ce->valuestring)
-						snprintf(out->data.skeletal_animator.clip_names[ci], 64, "%s", ce->valuestring);
-				}
-				out->data.skeletal_animator.clip_count = n;
-			}
-		}
-		break;
-
-	case JCE_COMP_RIGIDBODY:
-		out->data.rigidbody.mass         = json_get_float(props, "mass", 1.0f);
-		out->data.rigidbody.drag         = json_get_float(props, "drag", 0.0f);
-		out->data.rigidbody.angular_drag = json_get_float(props, "angularDrag", 0.05f);
-		out->data.rigidbody.use_gravity  = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "useGravity"));
-		out->data.rigidbody.is_kinematic = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "isKinematic"));
-		/* Default: gravity on if field absent. */
-		if (!cJSON_GetObjectItemCaseSensitive(props, "useGravity"))
-			out->data.rigidbody.use_gravity = true;
-		break;
-
-	case JCE_COMP_BOX_COLLIDER:
-		out->data.box_collider.center[0] = json_get_float(props, "centerX", 0.0f);
-		out->data.box_collider.center[1] = json_get_float(props, "centerY", 0.0f);
-		out->data.box_collider.center[2] = json_get_float(props, "centerZ", 0.0f);
-		out->data.box_collider.size[0]   = json_get_float(props, "sizeX", 1.0f);
-		out->data.box_collider.size[1]   = json_get_float(props, "sizeY", 1.0f);
-		out->data.box_collider.size[2]   = json_get_float(props, "sizeZ", 1.0f);
-		out->data.box_collider.is_trigger = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "isTrigger"));
-		break;
-
-	case JCE_COMP_SPHERE_COLLIDER:
-		out->data.sphere_collider.center[0] = json_get_float(props, "centerX", 0.0f);
-		out->data.sphere_collider.center[1] = json_get_float(props, "centerY", 0.0f);
-		out->data.sphere_collider.center[2] = json_get_float(props, "centerZ", 0.0f);
-		out->data.sphere_collider.radius     = json_get_float(props, "radius", 0.5f);
-		out->data.sphere_collider.is_trigger = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "isTrigger"));
-		break;
-
-	case JCE_COMP_CHARACTER_CONTROLLER:
-		out->data.character_controller.height      = json_get_float(props, "height", 2.0f);
-		out->data.character_controller.radius      = json_get_float(props, "radius", 0.5f);
-		out->data.character_controller.step_offset  = json_get_float(props, "stepOffset", 0.3f);
-		out->data.character_controller.slope_limit  = json_get_float(props, "slopeLimit", 45.0f);
-		break;
-
-	case JCE_COMP_AUDIO_SOURCE:
-		{ const char *v = json_get_string(props, "clipPath");
-		  if (v) snprintf(out->data.audio_source.clip_path, 128, "%s", v); }
-		out->data.audio_source.volume        = json_get_float(props, "volume", 1.0f);
-		out->data.audio_source.pitch         = json_get_float(props, "pitch", 1.0f);
-		out->data.audio_source.spatial_blend  = json_get_float(props, "spatialBlend", 0.0f);
-		out->data.audio_source.loop          = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "loop"));
-		out->data.audio_source.play_on_awake = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "playOnAwake"));
-		if (!cJSON_GetObjectItemCaseSensitive(props, "playOnAwake"))
-			out->data.audio_source.play_on_awake = true;
-		break;
-
-	case JCE_COMP_SCRIPT:
-		{ const char *v = json_get_string(props, "scriptPath");
-		  if (v) snprintf(out->data.script.script_path, 128, "%s", v); }
-		break;
-
-	default:
-		break;
+	case JCE_COMP_TRANSFORM:            parse_json_transform(props, out);            break;
+	case JCE_COMP_CAMERA:               parse_json_camera(props, out);               break;
+	case JCE_COMP_LIGHT:                parse_json_light(props, out);                break;
+	case JCE_COMP_MESH_RENDERER:        parse_json_mesh_renderer(props, out);        break;
+	case JCE_COMP_SPRITE_RENDERER:      parse_json_sprite_renderer(props, out);      break;
+	case JCE_COMP_ANIMATOR:             parse_json_animator(props, out);             break;
+	case JCE_COMP_SKELETAL_ANIMATOR:    parse_json_skeletal_animator(props, out);    break;
+	case JCE_COMP_RIGIDBODY:            parse_json_rigidbody(props, out);            break;
+	case JCE_COMP_BOX_COLLIDER:         parse_json_box_collider(props, out);         break;
+	case JCE_COMP_SPHERE_COLLIDER:      parse_json_sphere_collider(props, out);      break;
+	case JCE_COMP_CHARACTER_CONTROLLER: parse_json_character_controller(props, out); break;
+	case JCE_COMP_AUDIO_SOURCE:         parse_json_audio_source(props, out);         break;
+	case JCE_COMP_SCRIPT:               parse_json_script(props, out);               break;
+	default: break;
 	}
 
 	return true;
