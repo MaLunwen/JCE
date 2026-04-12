@@ -18,11 +18,15 @@
 extern "C" {
 #endif
 
-typedef struct JceRmlBackend JceRmlBackend;
+typedef struct JceRmlBackend  JceRmlBackend;
+typedef struct JceRenderer    JceRenderer;
+typedef struct PakArchive     PakArchive;
+typedef struct JceInput       JceInput;
 
 /* ── Lifecycle ────────────────────────────────────────────────────────── */
 
-JceRmlBackend *jce_rml_create(uint32_t width, uint32_t height);
+JceRmlBackend *jce_rml_create(uint32_t width, uint32_t height,
+                              JceRenderer *renderer, PakArchive *pak);
 void           jce_rml_destroy(JceRmlBackend *b);
 
 /* ── Documents ────────────────────────────────────────────────────────── */
@@ -52,9 +56,13 @@ typedef void (*jce_rml_event_fn)(uint32_t elem_idx, const char *event_type,
 void           jce_rml_elem_on(JceRmlBackend *b, uint32_t elem_idx,
                                const char *evt, jce_rml_event_fn fn, void *ud);
 
+/* ── Font loading ─────────────────────────────────────────────────────── */
+
+bool           jce_rml_load_font(JceRmlBackend *b, const char *pak_path);
+
 /* ── Per-frame ────────────────────────────────────────────────────────── */
 
-void           jce_rml_process_input(JceRmlBackend *b, const void *input);
+void           jce_rml_process_input(JceRmlBackend *b, const JceInput *input);
 void           jce_rml_update(JceRmlBackend *b, float dt);
 void           jce_rml_render(JceRmlBackend *b);
 void           jce_rml_resize(JceRmlBackend *b, uint32_t w, uint32_t h);

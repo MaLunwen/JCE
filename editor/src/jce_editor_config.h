@@ -19,6 +19,10 @@ typedef struct {
     char last_project[512];
     char recent_projects[10][512];
     int  recent_count;
+
+    /* Scene view render settings (persisted across sessions). */
+    int  view_mode;            /* JceSceneViewMode enum (0=Shaded,1=Wireframe,2=Textured) */
+    bool show_grid;
 } JceEditorConfig;
 
 /* Load config from .jce/editor-config.json. Returns false if not found. */

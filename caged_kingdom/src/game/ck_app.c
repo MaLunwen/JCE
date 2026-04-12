@@ -9,7 +9,9 @@
 
 #include "ck_app.h"
 #include <jce/api.h>
+#include <jce/ui/jce_ui.h>
 #include <string.h>
+#include <stdio.h>
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -75,7 +77,78 @@ struct CkApp {
 
     /* Touch HUD: auto-created on mobile, F9-toggled on desktop. */
     JceTouchHud  *touch_hud;
+
+    /* RmlUI system. */
+    JceUIContext  *ui;
+
+    /* RML document handles. */
+    JceUIDocHandle doc_pause;
+    JceUIDocHandle doc_debug;
+
+    /* Pause menu element handles. */
+    JceUIElementHandle el_pause_title;
+    JceUIElementHandle el_pause_continue;
+    JceUIElementHandle el_pause_quit;
+    JceUIElementHandle el_pause_hint;
+
+    /* Debug HUD element handles. */
+    JceUIElementHandle el_gpu_name;
+    JceUIElementHandle el_cpu_info;
+    JceUIElementHandle el_ram_info;
+    JceUIElementHandle el_resolution;
+    JceUIElementHandle el_fps;
+    JceUIElementHandle el_frametime;
+    JceUIElementHandle el_wireframe;
+    JceUIElementHandle el_lang;
 };
+
+/* ================================================================== */
+/* RmlUI setup helpers                                                 */
+/* ================================================================== */
+
+static void ck_ui_init(CkApp *app)
+{
+    uint32_t w, h;
+    jce_window_get_size(app->svc.window, &w, &h);
+
+    JceUIContextDesc desc = {0};
+    desc.width    = w;
+    desc.height   = h;
+    desc.renderer = app->svc.renderer;
+    desc.pak      = app->svc.pak;
+    app->ui = jce_ui_create(&desc, jce_allocator_default());
+    if (!app->ui) return;
+
+    /* Register fonts available to RML documents. */
+    if (!jce_ui_load_font(app->ui, "fonts/Caveat.ttf"))
+        LOG_WARN("ui", "Failed to load font: Caveat.ttf");
+    if (!jce_ui_load_font(app->ui, "fonts/JCE.ttf"))
+        LOG_WARN("ui", "Failed to load font: JCE.ttf");
+
+    /* -- Pause menu document ---------------------------------------- */
+    app->doc_pause = jce_ui_doc_load_file(app->ui, "ui/pause_menu.rml");
+    if (jce_ui_doc_valid(app->doc_pause)) {
+        app->el_pause_title    = jce_ui_find_element(app->ui, app->doc_pause, "pause-title");
+        app->el_pause_continue = jce_ui_find_element(app->ui, app->doc_pause, "btn-continue");
+        app->el_pause_quit     = jce_ui_find_element(app->ui, app->doc_pause, "btn-quit");
+        app->el_pause_hint     = jce_ui_find_element(app->ui, app->doc_pause, "hint");
+    }
+
+    /* -- Debug HUD document ----------------------------------------- */
+    app->doc_debug = jce_ui_doc_load_file(app->ui, "ui/debug_hud.rml");
+    if (jce_ui_doc_valid(app->doc_debug)) {
+        app->el_gpu_name   = jce_ui_find_element(app->ui, app->doc_debug, "gpu-name");
+        app->el_cpu_info   = jce_ui_find_element(app->ui, app->doc_debug, "cpu-info");
+        app->el_ram_info   = jce_ui_find_element(app->ui, app->doc_debug, "ram-info");
+        app->el_resolution = jce_ui_find_element(app->ui, app->doc_debug, "resolution");
+        app->el_fps        = jce_ui_find_element(app->ui, app->doc_debug, "fps");
+        app->el_frametime  = jce_ui_find_element(app->ui, app->doc_debug, "frametime");
+        app->el_wireframe  = jce_ui_find_element(app->ui, app->doc_debug, "wireframe-status");
+        app->el_lang       = jce_ui_find_element(app->ui, app->doc_debug, "lang-status");
+    }
+}
+
+/* ================================================================== */
 
 CkApp *ck_app_create(const JceServices *svc)
 {
@@ -242,6 +315,13 @@ CkApp *ck_app_create(const JceServices *svc)
         app->mouse_captured = true;
     }
 
+    /* Initialize RmlUI and load UI documents. */
+    ck_ui_init(app);
+
+    /* Show debug HUD if enabled by config. */
+    if (app->ui && app->debug_hud && jce_ui_doc_valid(app->doc_debug))
+        jce_ui_doc_show(app->ui, app->doc_debug);
+
     return app;
 }
 
@@ -250,6 +330,7 @@ void ck_app_destroy(CkApp *app)
     if (!app) return;
     if (app->mouse_captured)
         jce_window_set_relative_mouse_mode(app->svc.window, false);
+    jce_ui_destroy(app->ui);
     jce_touch_hud_destroy(app->touch_hud);
     jce_timer_destroy(app->timer);
     jce_camctrl_destroy(app->cam_ctrl);
@@ -286,160 +367,110 @@ void ck_app_destroy(CkApp *app)
     free(app);
 }
 
-/* Return the i18n font for non-English, main font otherwise. */
-static JceFont *active_font(CkApp *app)
+/* ================================================================== */
+/* RmlUI debug HUD update                                              */
+/* ================================================================== */
+
+static void update_debug_hud_rml(CkApp *app, float dt_ms)
 {
-    if (jce_i18n_get_lang() != JCE_LANG_EN && app->font_i18n)
-        return app->font_i18n;
-    return app->font_main;
-}
+    if (!app->ui) return;
 
-/* -- Debug HUD (MangoHud style) ------------------------------------- */
+    float fps = jce_timer_fps(app->timer);
+    const JceSysInfo *si = &app->sysinfo;
+    char buf[128];
 
-static void draw_frametime_graph(CkApp *app, uint16_t tx, uint16_t ty)
-{
-    const float max_ms = 50.0f;
+    /* GPU name. */
+    if (jce_ui_elem_valid(app->el_gpu_name))
+        jce_ui_elem_set_text(app->ui, app->el_gpu_name,
+                             jce_renderer_get_gpu_name(app->svc.renderer));
 
-    for (int row = 0; row < FT_GRAPH_ROWS; row++) {
-        float threshold = max_ms * (float)(FT_GRAPH_ROWS - row)
-                        / (float)FT_GRAPH_ROWS;
+    /* CPU info. */
+    if (jce_ui_elem_valid(app->el_cpu_info)) {
+        snprintf(buf, sizeof(buf), "%d cores  %.0f%%",
+                 si->cpu_cores, si->cpu_usage);
+        jce_ui_elem_set_text(app->ui, app->el_cpu_info, buf);
+    }
 
-        for (int col = 0; col < FT_GRAPH_COLS; col++) {
-            int idx = (app->ft_index - FT_GRAPH_COLS + col + FT_HISTORY)
-                    % FT_HISTORY;
-            float dt = app->ft_history[idx];
+    /* RAM info. */
+    if (jce_ui_elem_valid(app->el_ram_info)) {
+        snprintf(buf, sizeof(buf), "%d / %d MB",
+                 si->ram_used_mb, si->ram_total_mb);
+        jce_ui_elem_set_text(app->ui, app->el_ram_info, buf);
+    }
 
-            uint8_t attr = 0x00; /* black = empty */
-            if (dt > 0.0f && dt >= threshold) {
-                if (dt <= 16.7f)       attr = 0x20; /* green bg */
-                else if (dt <= 33.3f)  attr = 0xE0; /* yellow bg */
-                else                   attr = 0xC0; /* red bg */
-            }
-            jce_renderer_dbg_text_attr(
-                tx + (uint16_t)col,
-                ty + (uint16_t)row, attr, " ");
-        }
+    /* Resolution. */
+    if (jce_ui_elem_valid(app->el_resolution)) {
+        uint32_t w, h;
+        jce_window_get_size(app->svc.window, &w, &h);
+        bool vsync = jce_renderer_get_vsync(app->svc.renderer);
+        snprintf(buf, sizeof(buf), "%ux%u  VSYNC: %s",
+                 w, h, vsync ? "ON" : "OFF");
+        jce_ui_elem_set_text(app->ui, app->el_resolution, buf);
+    }
+
+    /* FPS with color. */
+    if (jce_ui_elem_valid(app->el_fps)) {
+        snprintf(buf, sizeof(buf), "%.1f", fps);
+        jce_ui_elem_set_text(app->ui, app->el_fps, buf);
+        const char *color;
+        if (fps >= 55.0f)      color = "#00cc00";
+        else if (fps >= 30.0f) color = "#cccc00";
+        else                   color = "#cc0000";
+        jce_ui_elem_set_property(app->ui, app->el_fps, "color", color);
+    }
+
+    /* Frametime. */
+    if (jce_ui_elem_valid(app->el_frametime)) {
+        snprintf(buf, sizeof(buf), "%.1f ms", dt_ms);
+        jce_ui_elem_set_text(app->ui, app->el_frametime, buf);
+    }
+
+    /* Wireframe status. */
+    if (jce_ui_elem_valid(app->el_wireframe))
+        jce_ui_elem_set_text(app->ui, app->el_wireframe,
+                             app->wireframe ? "WIREFRAME (F3+V)" : "");
+
+    /* Language. */
+    if (jce_ui_elem_valid(app->el_lang)) {
+        snprintf(buf, sizeof(buf), "Lang: %s (F3+L)", jce_i18n_lang_name());
+        jce_ui_elem_set_text(app->ui, app->el_lang, buf);
     }
 }
 
-static void draw_debug_hud(CkApp *app, float dt_ms)
+/* ================================================================== */
+/* RmlUI pause menu update                                             */
+/* ================================================================== */
+
+static void update_pause_menu_rml(CkApp *app)
 {
-    float fps_smoothed = jce_timer_fps(app->timer);
+    if (!app->ui) return;
 
-    uint32_t win_w, win_h;
-    jce_window_get_size(app->svc.window, &win_w, &win_h);
+    /* Update i18n text. */
+    if (jce_ui_elem_valid(app->el_pause_title))
+        jce_ui_elem_set_text(app->ui, app->el_pause_title,
+                             jce_i18n_get(JCE_STR_PAUSED));
+    if (jce_ui_elem_valid(app->el_pause_continue))
+        jce_ui_elem_set_text(app->ui, app->el_pause_continue,
+                             jce_i18n_get(JCE_STR_CONTINUE));
+    if (jce_ui_elem_valid(app->el_pause_quit))
+        jce_ui_elem_set_text(app->ui, app->el_pause_quit,
+                             jce_i18n_get(JCE_STR_QUIT));
+    if (jce_ui_elem_valid(app->el_pause_hint))
+        jce_ui_elem_set_text(app->ui, app->el_pause_hint,
+                             jce_i18n_get(JCE_STR_CONTROLS_HINT));
 
-    const char *gpu_name = jce_renderer_get_gpu_name(app->svc.renderer);
-    bool vsync = jce_renderer_get_vsync(app->svc.renderer);
-    const JceSysInfo *si = &app->sysinfo;
-
-    /* FPS color: green >=55, yellow 30-55, red <30. */
-    uint8_t fps_attr;
-    if (fps_smoothed >= 55.0f)      fps_attr = 0x0a; /* green */
-    else if (fps_smoothed >= 30.0f) fps_attr = 0x0e; /* yellow */
-    else                                 fps_attr = 0x0c; /* red */
-
-    /* MangoHud-style layout with colored labels. */
-    uint16_t y = 1;
-
-    /* GPU line: purple label + white value */
-    jce_renderer_dbg_text(1, y,   0x05, " GPU ");
-    jce_renderer_dbg_text(6, y++, 0x0f, " %s", gpu_name);
-
-    /* CPU line: blue label + white value */
-    jce_renderer_dbg_text(1, y,   0x09, " CPU ");
-    jce_renderer_dbg_text(6, y++, 0x0f, " %d cores  %.0f%%",
-                          si->cpu_cores, si->cpu_usage);
-
-    /* RAM line: yellow label + white value */
-    jce_renderer_dbg_text(1, y,   0x0e, " RAM ");
-    jce_renderer_dbg_text(6, y++, 0x0f, " %d / %d MB",
-                          si->ram_used_mb, si->ram_total_mb);
-
-    /* Resolution + VSYNC */
-    jce_renderer_dbg_text(1, y++, 0x07, " %ux%u  VSYNC: %s",
-                          win_w, win_h, vsync ? "ON" : "OFF");
-
-    /* FPS line: colored value */
-    jce_renderer_dbg_text(1, y,   0x07, " FPS ");
-    jce_renderer_dbg_text(6, y++, fps_attr, " %.1f", fps_smoothed);
-
-    /* Frame time line */
-    jce_renderer_dbg_text(1, y,   0x07, " Frame");
-    jce_renderer_dbg_text(7, y++, 0x0f, " %.1f ms", dt_ms);
-
-    /* Wireframe status. */
-    if (app->wireframe)
-        jce_renderer_dbg_text(1, y++, 0x0c, " WIREFRAME  (F3+V)");
-
-    /* Language. */
-    jce_renderer_dbg_text(1, y++, 0x07, " Lang: %s  (F3+L)",
-                          jce_i18n_lang_name());
-
-    /* Frametime graph label + text-based bar chart. */
-    jce_renderer_dbg_text(1, y++, 0x07, " Frametime");
-    draw_frametime_graph(app, 1, y);
+    /* Highlight selected item. */
+    if (jce_ui_elem_valid(app->el_pause_continue))
+        jce_ui_elem_set_property(app->ui, app->el_pause_continue,
+            "color", app->pause_selection == 0 ? "#64ff64" : "#808080");
+    if (jce_ui_elem_valid(app->el_pause_quit))
+        jce_ui_elem_set_property(app->ui, app->el_pause_quit,
+            "color", app->pause_selection == 1 ? "#ff6464" : "#808080");
 }
 
-static void draw_pause_menu(CkApp *app)
-{
-    if (!app->font_main) return;
-
-    int lw, lh;
-    jce_window_get_logical(app->svc.window, &lw, &lh);
-    const JceRenderer *r = app->svc.renderer;
-    JceFont *font  = active_font(app);
-    int sel = app->pause_selection;
-    const float shrink = 0.4f;
-    float scale = 1.5f * shrink;
-    float hint_scale = 1.0f * shrink;
-
-    const uint32_t white = jce_rgba(255, 255, 255, 255);
-    const uint32_t green = jce_rgba(100, 255, 100, 255);
-    const uint32_t red   = jce_rgba(255, 100, 100, 255);
-    const uint32_t gray  = jce_rgba(128, 128, 128, 255);
-
-    float line_h = (float)jce_font_line_height(font) * scale;
-    float tw, th;
-
-    const char *s_paused  = jce_i18n_get(JCE_STR_PAUSED);
-    const char *s_cont    = jce_i18n_get(JCE_STR_CONTINUE);
-    const char *s_quit    = jce_i18n_get(JCE_STR_QUIT);
-    const char *s_hint    = jce_i18n_get(JCE_STR_CONTROLS_HINT);
-
-    /* "=== PAUSED ===" centred. */
-    jce_text_measure(font, s_paused, &tw, &th);
-    float cy = (float)lh * 0.35f;
-    jce_text_draw_scaled(r, font,
-        ((float)lw - tw * scale) * 0.5f, cy, scale,
-        s_paused, white);
-
-    cy += line_h * 2.0f;
-
-    /* "> Continue" */
-    jce_text_measure(font, s_cont, &tw, &th);
-    jce_text_draw_scaled(r, font,
-        ((float)lw - tw * scale) * 0.5f, cy, scale,
-        s_cont, sel == 0 ? green : gray);
-
-    cy += line_h * 1.2f;
-
-    /* "> Quit" */
-    jce_text_measure(font, s_quit, &tw, &th);
-    jce_text_draw_scaled(r, font,
-        ((float)lw - tw * scale) * 0.5f, cy, scale,
-        s_quit, sel == 1 ? red : gray);
-
-    cy += line_h * 1.5f;
-
-    /* Hint text. */
-    jce_text_measure(font, s_hint, &tw, &th);
-    jce_text_draw_scaled(r, font,
-        ((float)lw - tw * hint_scale) * 0.5f, cy, hint_scale,
-        s_hint, gray);
-}
-
-/* -- Input handling ------------------------------------------------ */
+/* ================================================================== */
+/* Input handling                                                      */
+/* ================================================================== */
 
 static void record_frametime(CkApp *app, float dt_ms)
 {
@@ -487,6 +518,13 @@ static void handle_input(CkApp *app, float dt_ms)
         app->pause_selection = 0;
         jce_touch_hud_set_menu_mode(app->touch_hud,
                                     app->paused);
+        /* Show/hide pause menu document. */
+        if (app->ui && jce_ui_doc_valid(app->doc_pause)) {
+            if (app->paused)
+                jce_ui_doc_show(app->ui, app->doc_pause);
+            else
+                jce_ui_doc_hide(app->ui, app->doc_pause);
+        }
     }
 
     /* F11 => fullscreen. */
@@ -511,8 +549,16 @@ static void handle_input(CkApp *app, float dt_ms)
         }
 
         if (app->f3_was_down && !f3_down) {
-            if (!app->f3_combo_used)
+            if (!app->f3_combo_used) {
                 app->debug_hud = !app->debug_hud;
+                /* Show/hide debug HUD document. */
+                if (app->ui && jce_ui_doc_valid(app->doc_debug)) {
+                    if (app->debug_hud)
+                        jce_ui_doc_show(app->ui, app->doc_debug);
+                    else
+                        jce_ui_doc_hide(app->ui, app->doc_debug);
+                }
+            }
             app->f3_combo_used = false;
         }
         app->f3_was_down = f3_down;
@@ -560,6 +606,8 @@ static void update_pause(CkApp *app, float dt_ms)
             app->paused = false;
             jce_touch_hud_set_menu_mode(app->touch_hud,
                                         false);
+            if (app->ui && jce_ui_doc_valid(app->doc_pause))
+                jce_ui_doc_hide(app->ui, app->doc_pause);
         } else {
             app->quit_requested = true;
         }
@@ -570,14 +618,12 @@ static void update_pause(CkApp *app, float dt_ms)
                              JCE_TOUCH_BTN_MENU_0)) {
         app->paused = false;
         jce_touch_hud_set_menu_mode(app->touch_hud, false);
+        if (app->ui && jce_ui_doc_valid(app->doc_pause))
+            jce_ui_doc_hide(app->ui, app->doc_pause);
     }
     if (jce_touch_hud_button(app->touch_hud,
                              JCE_TOUCH_BTN_MENU_1))
         app->quit_requested = true;
-
-    draw_pause_menu(app);
-    if (app->debug_hud)
-        draw_debug_hud(app, dt_ms);
 }
 
 /* -- 3D scene ------------------------------------------------------ */
@@ -725,21 +771,44 @@ void ck_app_update(CkApp *app)
 
     jce_timer_tick(app->timer);
     float dt_ms = jce_timer_dt_ms(app->timer);
+    float dt_sec = dt_ms / 1000.0f;
     record_frametime(app, dt_ms);
     update_sysinfo(app);
 
     handle_input(app, dt_ms);
 
+    /* Update RmlUI element data BEFORE Update() so layout is correct. */
     if (app->paused) {
         update_pause(app, dt_ms);
+        update_pause_menu_rml(app);
+        if (app->debug_hud)
+            update_debug_hud_rml(app, dt_ms);
+    } else {
+        if (app->debug_hud)
+            update_debug_hud_rml(app, dt_ms);
+    }
+
+    /* Feed input to RmlUI, compute layout, then render. */
+    if (app->ui) {
+        jce_ui_process_input(app->ui, app->svc.input);
+        jce_ui_update(app->ui, dt_sec);
+    }
+
+    if (app->paused) {
+        /* Render RmlUI overlay. */
+        if (app->ui)
+            jce_ui_render(app->ui);
+        JCE_PROFILE_ZONE_END;
         return;
     }
 
-    if (app->debug_hud)
-        draw_debug_hud(app, dt_ms);
-
     draw_3d_scene(app, dt_ms);
     draw_2d_overlay(app);
+
+    /* Render RmlUI overlay (debug HUD, etc). */
+    if (app->ui)
+        jce_ui_render(app->ui);
+
     JCE_PROFILE_ZONE_END;
 }
 
@@ -785,6 +854,13 @@ static void demo_draw(const JceServices *svc, void *ud)
     /* Drawing is done inside ck_app_update for now. */
 }
 
+static void demo_on_resize(uint32_t w, uint32_t h, void *ud)
+{
+    (void)ud;
+    if (s_app && s_app->ui)
+        jce_ui_resize(s_app->ui, w, h);
+}
+
 static void demo_on_event(const void *ev, void *ud)
 {
     (void)ud;
@@ -806,6 +882,7 @@ JceAppDesc ck_app_get_desc(void)
         .update      = demo_update,
         .draw        = demo_draw,
         .on_event    = demo_on_event,
+        .on_resize   = demo_on_resize,
         .should_quit = demo_should_quit,
     };
 }

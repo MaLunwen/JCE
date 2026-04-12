@@ -380,92 +380,98 @@ void draw_entities(void)
 
         bgfx_set_transform(model.raw[0], 1);
 
-        if (view_mode != JCE_VIEW_WIREFRAME) {
-            int cc = 0;
-            JceComponentInfo *cs = jce_state_get_entity_components(ent->id, &cc);
-            JceComponentInfo *mr_comp = NULL;
-            for (int c = 0; c < cc; c++) {
-                if (cs[c].type == JCE_COMP_MESH_RENDERER) {
-                    mr_comp = &cs[c];
-                    break;
-                }
+        /* Resolve the MeshRenderer component for texture binding. */
+        int cc = 0;
+        JceComponentInfo *cs = jce_state_get_entity_components(ent->id, &cc);
+        JceComponentInfo *mr_comp = NULL;
+        for (int c = 0; c < cc; c++) {
+            if (cs[c].type == JCE_COMP_MESH_RENDERER) {
+                mr_comp = &cs[c];
+                break;
+            }
+        }
+
+        bool has_pbr_textures = mr_comp
+            && (mr_comp->data.mesh_renderer.albedo_tex[0]
+                || mr_comp->data.mesh_renderer.mr_tex[0]
+                || mr_comp->data.mesh_renderer.normal_tex[0]
+                || mr_comp->data.mesh_renderer.ao_tex[0]
+                || mr_comp->data.mesh_renderer.emissive_tex[0]);
+
+        /* ── TEXTURED (non-wireframe) with PBR textures → full PBR path ── */
+        if (view_mode == JCE_VIEW_TEXTURED && has_pbr_textures) {
+            JcePbrMaterial pbr = jce_pbr_material_default();
+            if (mr_comp->data.mesh_renderer.base_color[3] > 0.0f) {
+                pbr.base_color_factor[0] = mr_comp->data.mesh_renderer.base_color[0];
+                pbr.base_color_factor[1] = mr_comp->data.mesh_renderer.base_color[1];
+                pbr.base_color_factor[2] = mr_comp->data.mesh_renderer.base_color[2];
+                pbr.base_color_factor[3] = mr_comp->data.mesh_renderer.base_color[3];
+            }
+            pbr.metallic_factor      = mr_comp->data.mesh_renderer.metallic;
+            pbr.roughness_factor     = mr_comp->data.mesh_renderer.roughness;
+            pbr.emissive_factor[0]   = mr_comp->data.mesh_renderer.emissive[0];
+            pbr.emissive_factor[1]   = mr_comp->data.mesh_renderer.emissive[1];
+            pbr.emissive_factor[2]   = mr_comp->data.mesh_renderer.emissive[2];
+            pbr.normal_scale         = mr_comp->data.mesh_renderer.normal_scale;
+            pbr.ao_strength          = mr_comp->data.mesh_renderer.ao_strength;
+            pbr.alpha_mode           = (JceAlphaMode)mr_comp->data.mesh_renderer.alpha_mode;
+            pbr.alpha_cutoff         = mr_comp->data.mesh_renderer.alpha_cutoff;
+            pbr.double_sided         = mr_comp->data.mesh_renderer.double_sided;
+
+            if (mr_comp->data.mesh_renderer.albedo_tex[0]) {
+                JceTexture t = get_cached_texture(mr_comp->data.mesh_renderer.albedo_tex, NULL);
+                if (jce_texture_valid(t)) pbr.albedo_map = t;
+            }
+            if (!jce_texture_valid(pbr.albedo_map)) {
+                const char *mp = mr_comp->data.mesh_renderer.mesh_path;
+                JceTexture t = get_cached_texture(mat_path, mp);
+                if (jce_texture_valid(t)) pbr.albedo_map = t;
+            }
+            if (mr_comp->data.mesh_renderer.mr_tex[0]) {
+                JceTexture t = get_cached_texture(mr_comp->data.mesh_renderer.mr_tex, NULL);
+                if (jce_texture_valid(t)) pbr.metallic_roughness_map = t;
+            }
+            if (mr_comp->data.mesh_renderer.normal_tex[0]) {
+                JceTexture t = get_cached_texture(mr_comp->data.mesh_renderer.normal_tex, NULL);
+                if (jce_texture_valid(t)) pbr.normal_map = t;
+            }
+            if (mr_comp->data.mesh_renderer.ao_tex[0]) {
+                JceTexture t = get_cached_texture(mr_comp->data.mesh_renderer.ao_tex, NULL);
+                if (jce_texture_valid(t)) pbr.ao_map = t;
+            }
+            if (mr_comp->data.mesh_renderer.emissive_tex[0]) {
+                JceTexture t = get_cached_texture(mr_comp->data.mesh_renderer.emissive_tex, NULL);
+                if (jce_texture_valid(t)) pbr.emissive_map = t;
             }
 
-            bool has_pbr_textures = mr_comp
-                && (mr_comp->data.mesh_renderer.albedo_tex[0]
-                    || mr_comp->data.mesh_renderer.mr_tex[0]
-                    || mr_comp->data.mesh_renderer.normal_tex[0]
-                    || mr_comp->data.mesh_renderer.ao_tex[0]
-                    || mr_comp->data.mesh_renderer.emissive_tex[0]);
+            jce_pbr_material_bind(&pbr, s_sr.renderer, scene_view_id());
 
-            if (view_mode == JCE_VIEW_TEXTURED && has_pbr_textures) {
-                JcePbrMaterial pbr = jce_pbr_material_default();
-                if (mr_comp->data.mesh_renderer.base_color[3] > 0.0f) {
-                    pbr.base_color_factor[0] = mr_comp->data.mesh_renderer.base_color[0];
-                    pbr.base_color_factor[1] = mr_comp->data.mesh_renderer.base_color[1];
-                    pbr.base_color_factor[2] = mr_comp->data.mesh_renderer.base_color[2];
-                    pbr.base_color_factor[3] = mr_comp->data.mesh_renderer.base_color[3];
-                }
-                pbr.metallic_factor      = mr_comp->data.mesh_renderer.metallic;
-                pbr.roughness_factor     = mr_comp->data.mesh_renderer.roughness;
-                pbr.emissive_factor[0]   = mr_comp->data.mesh_renderer.emissive[0];
-                pbr.emissive_factor[1]   = mr_comp->data.mesh_renderer.emissive[1];
-                pbr.emissive_factor[2]   = mr_comp->data.mesh_renderer.emissive[2];
-                pbr.normal_scale         = mr_comp->data.mesh_renderer.normal_scale;
-                pbr.ao_strength          = mr_comp->data.mesh_renderer.ao_strength;
-                pbr.alpha_mode           = (JceAlphaMode)mr_comp->data.mesh_renderer.alpha_mode;
-                pbr.alpha_cutoff         = mr_comp->data.mesh_renderer.alpha_cutoff;
-                pbr.double_sided         = mr_comp->data.mesh_renderer.double_sided;
-
-                if (mr_comp->data.mesh_renderer.albedo_tex[0]) {
-                    JceTexture t = get_cached_texture(mr_comp->data.mesh_renderer.albedo_tex, NULL);
-                    if (jce_texture_valid(t)) pbr.albedo_map = t;
-                }
-                if (!jce_texture_valid(pbr.albedo_map)) {
-                    const char *mp = mr_comp->data.mesh_renderer.mesh_path;
-                    JceTexture t = get_cached_texture(mat_path, mp);
-                    if (jce_texture_valid(t)) pbr.albedo_map = t;
-                }
-                if (mr_comp->data.mesh_renderer.mr_tex[0]) {
-                    JceTexture t = get_cached_texture(mr_comp->data.mesh_renderer.mr_tex, NULL);
-                    if (jce_texture_valid(t)) pbr.metallic_roughness_map = t;
-                }
-                if (mr_comp->data.mesh_renderer.normal_tex[0]) {
-                    JceTexture t = get_cached_texture(mr_comp->data.mesh_renderer.normal_tex, NULL);
-                    if (jce_texture_valid(t)) pbr.normal_map = t;
-                }
-                if (mr_comp->data.mesh_renderer.ao_tex[0]) {
-                    JceTexture t = get_cached_texture(mr_comp->data.mesh_renderer.ao_tex, NULL);
-                    if (jce_texture_valid(t)) pbr.ao_map = t;
-                }
-                if (mr_comp->data.mesh_renderer.emissive_tex[0]) {
-                    JceTexture t = get_cached_texture(mr_comp->data.mesh_renderer.emissive_tex, NULL);
-                    if (jce_texture_valid(t)) pbr.emissive_map = t;
-                }
-
-                jce_pbr_material_bind(&pbr, s_sr.renderer, scene_view_id());
-
-                if (s_sr.shadow_valid) {
-                    bgfx_set_texture(5, s_sr.u_shadowMap, s_sr.shadow_tex, UINT32_MAX);
-                    float shadow_vp[16];
-                    jce_vec3 shadow_dir = jce_v3(0.5f, 1.0f, 0.3f);
-                    compute_shadow_vp(&shadow_dir, shadow_vp);
-                    bgfx_set_uniform(s_sr.u_shadowVP, shadow_vp, 1);
-                }
-
-                jce_mesh_submit_pbr(mesh, s_sr.renderer, scene_view_id());
-                continue;
+            if (s_sr.shadow_valid) {
+                bgfx_set_texture(5, s_sr.u_shadowMap, s_sr.shadow_tex, UINT32_MAX);
+                float shadow_vp[16];
+                jce_vec3 shadow_dir = jce_v3(0.5f, 1.0f, 0.3f);
+                compute_shadow_vp(&shadow_dir, shadow_vp);
+                bgfx_set_uniform(s_sr.u_shadowVP, shadow_vp, 1);
             }
 
+            jce_mesh_submit_pbr(mesh, s_sr.renderer, scene_view_id());
+            continue;
+        }
+
+        /* ── Bind texture for non-wireframe modes, and also for wireframe
+         *    when the entity has a texture (texture-colored wireframe,
+         *    like CK's F3+V).  Untextured entities get white/checker so
+         *    their wireframe is a solid color. ────────────────────────── */
+        {
             bgfx_texture_handle_t bind_tex = s_sr.white_tex;
 
-            if (view_mode == JCE_VIEW_TEXTURED) {
+            if (view_mode == JCE_VIEW_TEXTURED || view_mode == JCE_VIEW_WIREFRAME) {
                 const char *mp = mr_comp ? mr_comp->data.mesh_renderer.mesh_path : NULL;
 
                 JceTexture tex = get_cached_texture(mat_path, mp);
                 if (tex.idx != UINT16_MAX) {
                     bind_tex.idx = tex.idx;
-                } else {
+                } else if (view_mode == JCE_VIEW_TEXTURED) {
                     bind_tex = s_sr.checker_tex;
                     bool has_mat  = mat_path && mat_path[0] != '\0';
                     bool has_mesh_path = mp && mp[0] != '\0';
@@ -479,6 +485,7 @@ void draw_entities(void)
                         }
                     }
                 }
+                /* wireframe + no texture → keep white_tex for solid-color lines */
             }
 
             JceUniformHandle uh = jce_renderer_get_tex_uniform(s_sr.renderer);

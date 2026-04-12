@@ -27,6 +27,7 @@ extern "C" {
 /* Forward declarations. */
 typedef struct JceRenderer JceRenderer;
 typedef struct JceInput    JceInput;
+typedef struct PakArchive  PakArchive;
 
 /* ================================================================== */
 /* Context lifecycle                                                   */
@@ -35,12 +36,23 @@ typedef struct JceInput    JceInput;
 typedef struct JceUIContext JceUIContext;
 
 typedef struct {
-    uint32_t width;             /* viewport width */
-    uint32_t height;            /* viewport height */
+    uint32_t     width;             /* viewport width */
+    uint32_t     height;            /* viewport height */
+    JceRenderer *renderer;          /* engine renderer (for bgfx draws) */
+    PakArchive  *pak;               /* asset archive (for RML/RCSS/fonts) */
 } JceUIContextDesc;
 
 JceUIContext *jce_ui_create(const JceUIContextDesc *desc, jce_allocator_t alloc);
 void          jce_ui_destroy(JceUIContext *ctx);
+
+/* ================================================================== */
+/* Font loading                                                        */
+/* ================================================================== */
+
+/* Load a TTF/OTF font face from the PAK archive.
+   The family name is derived from the filename (e.g. "fonts/Caveat.ttf" → "Caveat").
+   Must be called after jce_ui_create and before loading documents that use the font. */
+bool jce_ui_load_font(JceUIContext *ctx, const char *pak_path);
 
 /* ================================================================== */
 /* Documents                                                           */
@@ -56,7 +68,7 @@ static inline bool jce_ui_doc_valid(JceUIDocHandle h) { return h.idx != UINT32_M
 JceUIDocHandle jce_ui_doc_load(JceUIContext *ctx, const char *name,
                                const char *markup, uint32_t markup_len);
 
-/* Load a UI document from a file path. */
+/* Load a UI document from a file path (resolved via PAK archive). */
 JceUIDocHandle jce_ui_doc_load_file(JceUIContext *ctx, const char *path);
 
 /* Show / hide / close a document. */

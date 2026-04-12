@@ -8,6 +8,7 @@
  */
 
 #include "jce_editor_state_internal.h"
+#include "jce_editor_config.h"
 
 /* Forward-declare only the one function we need from scene_render,
    avoiding a full include that creates a cpp-level circular dependency. */
@@ -172,6 +173,51 @@ static void build_demo_scene(void)
 		}
 	}
 
+	/* Capsule at (-2.5, 1, 2) — untextured wireframe test (solid color). */
+	uint32_t capsule = jce_state_create_entity("Capsule (no texture)", objs);
+	jce_state_add_component(capsule, JCE_COMP_TRANSFORM);
+	jce_state_add_component(capsule, JCE_COMP_MESH_RENDERER);
+	{
+		int idx = find_entity(capsule);
+		if (idx >= 0) {
+			for (int i = 0; i < s.entities[idx].component_count; i++) {
+				if (s.components[idx][i].type == JCE_COMP_TRANSFORM) {
+					s.components[idx][i].data.transform.pos[0] = -2.5f;
+					s.components[idx][i].data.transform.pos[1] = 1.0f;
+					s.components[idx][i].data.transform.pos[2] = 2.0f;
+				}
+				if (s.components[idx][i].type == JCE_COMP_MESH_RENDERER)
+					s.components[idx][i].data.mesh_renderer.mesh_shape = JCE_MESH_SHAPE_CAPSULE;
+			}
+		}
+	}
+
+	/* Cylinder at (2.5, 0.5, 2) — textured wireframe test (colored lines). */
+	uint32_t cylinder = jce_state_create_entity("Cylinder (textured)", objs);
+	jce_state_add_component(cylinder, JCE_COMP_TRANSFORM);
+	jce_state_add_component(cylinder, JCE_COMP_MESH_RENDERER);
+	{
+		int idx = find_entity(cylinder);
+		if (idx >= 0) {
+			for (int i = 0; i < s.entities[idx].component_count; i++) {
+				if (s.components[idx][i].type == JCE_COMP_TRANSFORM) {
+					s.components[idx][i].data.transform.pos[0] = 2.5f;
+					s.components[idx][i].data.transform.pos[1] = 0.5f;
+					s.components[idx][i].data.transform.pos[2] = 2.0f;
+				}
+				if (s.components[idx][i].type == JCE_COMP_MESH_RENDERER) {
+					s.components[idx][i].data.mesh_renderer.mesh_shape = JCE_MESH_SHAPE_CYLINDER;
+					s.components[idx][i].data.mesh_renderer.base_color[0] = 0.2f;
+					s.components[idx][i].data.mesh_renderer.base_color[1] = 0.6f;
+					s.components[idx][i].data.mesh_renderer.base_color[2] = 0.9f;
+					s.components[idx][i].data.mesh_renderer.base_color[3] = 1.0f;
+					s.components[idx][i].data.mesh_renderer.metallic  = 0.3f;
+					s.components[idx][i].data.mesh_renderer.roughness = 0.5f;
+				}
+			}
+		}
+	}
+
 	uint32_t ui = jce_state_create_entity("UI", root);
 	jce_state_create_entity("Canvas", ui);
 }
@@ -195,10 +241,24 @@ void jce_editor_state_init(void)
 	s.edit_mode   = JCE_EDIT_MODE_SELECT;
 	s.gizmo_mode  = JCE_GIZMO_TRANSLATE;
 	s.gizmo_space = JCE_GIZMO_LOCAL;
-	s.view_mode   = JCE_VIEW_SHADED;
 	s.play_state  = JCE_PLAY_STOPPED;
-	s.show_grid   = true;
 	s.current_scene_path[0] = '\0';
+
+	/* Load persisted render settings from .jce/editor-config.json. */
+	{
+		JceEditorConfig ecfg;
+		if (jce_editor_config_load(&ecfg)) {
+			int vm = ecfg.view_mode;
+			if (vm >= JCE_VIEW_SHADED && vm <= JCE_VIEW_TEXTURED)
+				s.view_mode = (JceSceneViewMode)vm;
+			else
+				s.view_mode = JCE_VIEW_SHADED;
+			s.show_grid = ecfg.show_grid;
+		} else {
+			s.view_mode = JCE_VIEW_SHADED;
+			s.show_grid = true;
+		}
+	}
 
 	s.scene = jce_scene_create();
 	if (!s.scene) {
@@ -742,11 +802,21 @@ JceGizmoMode  jce_state_get_gizmo_mode(void)               { return s.gizmo_mode
 void          jce_state_set_gizmo_space(JceGizmoSpace sp)  { s.gizmo_space = sp; }
 JceGizmoSpace jce_state_get_gizmo_space(void)              { return s.gizmo_space; }
 
-void              jce_state_set_view_mode(JceSceneViewMode m)  { s.view_mode = m; }
+/* Persist view_mode and show_grid to editor-config.json. */
+static void persist_render_settings(void)
+{
+    JceEditorConfig ecfg;
+    jce_editor_config_load(&ecfg);
+    ecfg.view_mode = (int)s.view_mode;
+    ecfg.show_grid = s.show_grid;
+    jce_editor_config_save(&ecfg);
+}
+
+void              jce_state_set_view_mode(JceSceneViewMode m)  { s.view_mode = m; persist_render_settings(); }
 JceSceneViewMode  jce_state_get_view_mode(void)                { return s.view_mode; }
 
 bool  jce_state_get_show_grid(void)          { return s.show_grid; }
-void  jce_state_set_show_grid(bool show)     { s.show_grid = show; }
+void  jce_state_set_show_grid(bool show)     { s.show_grid = show; persist_render_settings(); }
 
 bool  jce_state_get_2d_mode(void)            { return s.is_2d_mode; }
 void  jce_state_set_2d_mode(bool is_2d)      { s.is_2d_mode = is_2d; }

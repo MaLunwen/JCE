@@ -9,8 +9,6 @@
 #define SDL_MAIN_USE_CALLBACKS 1
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
-#include <filesystem>
-#include <fstream>
 #include <algorithm>
 #include <string>
 #include <cstdio>
@@ -27,8 +25,6 @@ extern "C" {
 #include "scene/jce_editor_scene_render.h"
 #include "jce_editor_config.h"
 #include "jce_editor_state.h"
-
-namespace fs = std::filesystem;
 
 /* ── Editor state ──────────────────────────────────────────────────── */
 
@@ -83,21 +79,18 @@ static std::string to_lower_copy(const char *s)
     return out;
 }
 
-static const char *renderer_name_to_backend_ini(const char *renderer_name)
+static int renderer_name_to_backend_enum(const char *renderer_name)
 {
     std::string r = to_lower_copy(renderer_name);
-    if (r.empty()) return NULL;
-
-    if (r == "auto")                         return "auto";
-    if (r == "d3d12" || r == "direct3d12") return "d3d12";
-    if (r == "d3d11" || r == "direct3d11") return "d3d11";
-    if (r == "vulkan")                       return "vulkan";
-    if (r == "metal")                        return "metal";
-    if (r == "opengl" || r == "gl")        return "opengl";
+    if (r.empty() || r == "auto")  return 0;  /* JCE_BACKEND_AUTO */
+    if (r == "d3d11" || r == "direct3d11")  return 1;  /* JCE_BACKEND_D3D11 */
+    if (r == "d3d12" || r == "direct3d12")  return 2;  /* JCE_BACKEND_D3D12 */
+    if (r == "vulkan")                      return 3;  /* JCE_BACKEND_VULKAN */
+    if (r == "opengl" || r == "gl")         return 4;  /* JCE_BACKEND_OPENGL */
     if (r == "opengl es" || r == "opengles" || r == "gles")
-        return "opengles";
-
-    return NULL;
+        return 5;  /* JCE_BACKEND_OPENGLES */
+    if (r == "metal")                       return 6;  /* JCE_BACKEND_METAL */
+    return -1;  /* unknown */
 }
 
 static void configure_engine_renderer_from_editor_config(void)
@@ -106,29 +99,13 @@ static void configure_engine_renderer_from_editor_config(void)
     if (!jce_editor_config_load(&ecfg))
         return;
 
-    const char *backend = renderer_name_to_backend_ini(ecfg.renderer);
-    if (!backend)
+    int backend = renderer_name_to_backend_enum(ecfg.renderer);
+    if (backend < 0)
         return;
 
-    std::error_code ec;
-    fs::create_directories(".jce", ec);
-
-    const char *override_path = ".jce/editor-engine.ini";
-    std::ofstream out(override_path, std::ios::out | std::ios::trunc);
-    if (!out.good()) {
-        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
-                    "editor: failed to write %s, keeping default engine config resolution",
-                    override_path);
-        return;
-    }
-
-    out << "[renderer]\n";
-    out << "backend = " << backend << "\n";
-    out.close();
-
-    jce_engine_set_config_path(override_path);
-    SDL_Log("editor: renderer '%s' -> backend '%s' (config override: %s)",
-            ecfg.renderer, backend, override_path);
+    jce_engine_set_renderer_override(backend);
+    SDL_Log("editor: renderer '%s' -> backend %d (direct override, no temp file)",
+            ecfg.renderer, backend);
 }
 
 /* ── PostFX global (defined in jce_editor.cpp, used by panels) ───── */

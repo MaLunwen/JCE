@@ -4,14 +4,24 @@
  * Implements the extern "C" bridge declared in jce_ui_backend.h by
  * delegating to RmlUi's Core API.
  *
- * Render interface methods are stubs for now — the actual bgfx geometry
- * pipeline will be wired in a follow-up.
+ * Provides:
+ *   - bgfx RenderInterface (transient buffer geometry on JCE_VIEW_UI)
+ *   - PAK FileInterface (load RML/RCSS from archive)
+ *   - Font loading via Rml::LoadFontFace
+ *   - Input forwarding from JceInput → Rml::Context
  */
 
 #include "jce_ui_backend.h"
 
 #include <RmlUi/Core.h>
+#include <bgfx/c99/bgfx.h>
+
 #include <jce/core/jce_log.h>
+#include <jce/core/pak_loader.h>
+#include <jce/graphics/jce_views.h>
+#include <jce/graphics/jce_texture.h>
+#include <jce/platform/jce_input.h>
+#include "graphics/jce_renderer_internal.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +30,22 @@
 #include <unordered_map>
 
 #define LOG_TAG "ui.rml"
+
+/* ================================================================== */
+/* Vertex layout matching engine's PosColorTexVertex                   */
+/* ================================================================== */
+
+struct RmlBgfxVertex {
+    float    x, y, z;
+    uint32_t abgr;
+    float    u, v;
+};
+
+static inline uint32_t rml_colour_to_abgr(const Rml::Colourb &c)
+{
+    return ((uint32_t)c.alpha << 24) | ((uint32_t)c.blue << 16)
+         | ((uint32_t)c.green << 8)  |  (uint32_t)c.red;
+}
 
 /* ================================================================== */
 /* System interface                                                    */
@@ -56,81 +82,278 @@ private:
 };
 
 /* ================================================================== */
-/* Render interface  (stubs — bgfx integration is a follow-up)        */
+/* File interface (PAK archive)                                        */
+/* ================================================================== */
+
+class JceRmlFileInterface : public Rml::FileInterface {
+public:
+    explicit JceRmlFileInterface(PakArchive *pak) : pak_(pak) {}
+
+    Rml::FileHandle Open(const Rml::String &path) override
+    {
+        if (!pak_) return 0;
+
+        const PakAsset *asset = pak_find(pak_, path.c_str());
+        if (!asset) {
+            LOG_WARN(LOG_TAG, "file not found in PAK: %s", path.c_str());
+            return 0;
+        }
+
+        auto *f = new (std::nothrow) FileState();
+        if (!f) return 0;
+
+        f->size = (size_t)asset->original_size;
+        f->data = (uint8_t *)malloc(f->size);
+        if (!f->data) {
+            delete f;
+            return 0;
+        }
+
+        size_t decompressed = pak_decompress(asset, f->data, f->size);
+        if (decompressed == 0) {
+            LOG_ERROR(LOG_TAG, "pak_decompress failed: %s", path.c_str());
+            free(f->data);
+            delete f;
+            return 0;
+        }
+
+        f->pos = 0;
+        return reinterpret_cast<Rml::FileHandle>(f);
+    }
+
+    void Close(Rml::FileHandle file) override
+    {
+        auto *f = reinterpret_cast<FileState *>(file);
+        if (f) {
+            free(f->data);
+            delete f;
+        }
+    }
+
+    size_t Read(void *buffer, size_t size, Rml::FileHandle file) override
+    {
+        auto *f = reinterpret_cast<FileState *>(file);
+        if (!f) return 0;
+
+        size_t remaining = f->size - f->pos;
+        size_t to_read = size < remaining ? size : remaining;
+        memcpy(buffer, f->data + f->pos, to_read);
+        f->pos += to_read;
+        return to_read;
+    }
+
+    bool Seek(Rml::FileHandle file, long offset, int origin) override
+    {
+        auto *f = reinterpret_cast<FileState *>(file);
+        if (!f) return false;
+
+        long new_pos = 0;
+        switch (origin) {
+        case SEEK_SET: new_pos = offset; break;
+        case SEEK_CUR: new_pos = (long)f->pos + offset; break;
+        case SEEK_END: new_pos = (long)f->size + offset; break;
+        default:       return false;
+        }
+
+        if (new_pos < 0 || (size_t)new_pos > f->size) return false;
+        f->pos = (size_t)new_pos;
+        return true;
+    }
+
+    size_t Tell(Rml::FileHandle file) override
+    {
+        auto *f = reinterpret_cast<FileState *>(file);
+        return f ? f->pos : 0;
+    }
+
+    size_t Length(Rml::FileHandle file) override
+    {
+        auto *f = reinterpret_cast<FileState *>(file);
+        return f ? f->size : 0;
+    }
+
+private:
+    PakArchive *pak_;
+
+    struct FileState {
+        uint8_t *data = nullptr;
+        size_t   size = 0;
+        size_t   pos  = 0;
+    };
+};
+
+/* ================================================================== */
+/* Render interface (bgfx)                                             */
 /* ================================================================== */
 
 class JceRmlRenderInterface : public Rml::RenderInterface {
 public:
-    /* Pure-virtual in RmlUi 5.x — must be overridden. */
+    explicit JceRmlRenderInterface(JceRenderer *renderer)
+        : renderer_(renderer) {}
+
+    ~JceRmlRenderInterface() override
+    {
+        for (auto tex : generated_textures_)
+            jce_texture_destroy(tex);
+    }
+
+    /* ── Immediate geometry (transient buffers) ────────────────────── */
+
     void RenderGeometry(Rml::Vertex *vertices, int num_vertices,
                         int *indices, int num_indices,
                         Rml::TextureHandle texture,
                         const Rml::Vector2f &translation) override
     {
-        /* TODO: Submit immediate geometry through bgfx. */
-        LOG_TRACE(LOG_TAG, "RenderGeometry: %d verts, %d indices (stub)",
-                  num_vertices, num_indices);
-        (void)vertices;
-        (void)num_vertices;
-        (void)indices;
-        (void)num_indices;
-        (void)texture;
-        (void)translation;
+        if (!renderer_ || num_vertices <= 0 || num_indices <= 0) return;
+
+        bool textured = (texture != 0);
+        const bgfx_vertex_layout_t *layout = textured
+            ? jce_renderer_get_layout_textured(renderer_)
+            : jce_renderer_get_layout(renderer_);
+        bgfx_program_handle_t prog = textured
+            ? jce_renderer_get_program_textured(renderer_)
+            : jce_renderer_get_program(renderer_);
+
+        if (!layout || prog.idx == UINT16_MAX) return;
+
+        bgfx_transient_vertex_buffer_t tvb;
+        bgfx_transient_index_buffer_t  tib;
+
+        if (!bgfx_alloc_transient_buffers(&tvb, layout,
+                (uint32_t)num_vertices, &tib,
+                (uint32_t)num_indices, false))
+            return;
+
+        /* Copy vertices, converting Rml layout → engine layout. */
+        if (textured) {
+            auto *dst = reinterpret_cast<RmlBgfxVertex *>(tvb.data);
+            for (int i = 0; i < num_vertices; i++) {
+                dst[i].x    = vertices[i].position.x + translation.x;
+                dst[i].y    = vertices[i].position.y + translation.y;
+                dst[i].z    = 0.0f;
+                dst[i].abgr = rml_colour_to_abgr(vertices[i].colour);
+                dst[i].u    = vertices[i].tex_coord.x;
+                dst[i].v    = vertices[i].tex_coord.y;
+            }
+        } else {
+            /* Color-only vertex: {float x,y,z; uint32_t abgr} */
+            struct PosColor { float x, y, z; uint32_t abgr; };
+            auto *dst = reinterpret_cast<PosColor *>(tvb.data);
+            for (int i = 0; i < num_vertices; i++) {
+                dst[i].x    = vertices[i].position.x + translation.x;
+                dst[i].y    = vertices[i].position.y + translation.y;
+                dst[i].z    = 0.0f;
+                dst[i].abgr = rml_colour_to_abgr(vertices[i].colour);
+            }
+        }
+
+        /* Copy indices (RmlUi uses int, bgfx uses uint16_t). */
+        auto *idx = reinterpret_cast<uint16_t *>(tib.data);
+        for (int i = 0; i < num_indices; i++)
+            idx[i] = (uint16_t)indices[i];
+
+        bgfx_set_transient_vertex_buffer(0, &tvb, 0, (uint32_t)num_vertices);
+        bgfx_set_transient_index_buffer(&tib, 0, (uint32_t)num_indices);
+
+        if (textured) {
+            JceTexture tex_handle;
+            tex_handle.idx = (uint16_t)(texture & 0xFFFF);
+            bgfx_texture_handle_t bgfx_tex = { tex_handle.idx };
+            JceUniformHandle uh = jce_renderer_get_tex_uniform(renderer_);
+            bgfx_uniform_handle_t sampler = { uh.idx };
+            bgfx_set_texture(0, sampler, bgfx_tex, UINT32_MAX);
+        }
+
+        uint64_t state = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                       | BGFX_STATE_BLEND_ALPHA;
+
+        if (scissor_enabled_)
+            bgfx_set_scissor(scissor_x_, scissor_y_,
+                             scissor_w_, scissor_h_);
+
+        bgfx_set_state(state, 0);
+        bgfx_submit(JCE_VIEW_UI, prog, 0, BGFX_DISCARD_ALL);
     }
 
-    /* Optional — compile static geometry for faster repeat rendering. */
-    Rml::CompiledGeometryHandle CompileGeometry(Rml::Vertex *vertices,
-                                                int num_vertices,
-                                                int *indices,
-                                                int num_indices,
-                                                Rml::TextureHandle texture) override
-    {
-        LOG_TRACE(LOG_TAG, "CompileGeometry: %d verts, %d indices (stub)",
-                  num_vertices, num_indices);
-        (void)vertices;
-        (void)num_vertices;
-        (void)indices;
-        (void)num_indices;
-        (void)texture;
-        return Rml::CompiledGeometryHandle(0);
-    }
-
-    /* Optional — render previously compiled geometry. */
-    void RenderCompiledGeometry(Rml::CompiledGeometryHandle geometry,
-                                const Rml::Vector2f &translation) override
-    {
-        LOG_TRACE(LOG_TAG, "RenderCompiledGeometry handle=%llu (stub)",
-                  (unsigned long long)geometry);
-        (void)geometry;
-        (void)translation;
-    }
-
-    /* Optional — free compiled geometry resources. */
-    void ReleaseCompiledGeometry(Rml::CompiledGeometryHandle geometry) override
-    {
-        LOG_TRACE(LOG_TAG, "ReleaseCompiledGeometry handle=%llu (stub)",
-                  (unsigned long long)geometry);
-        (void)geometry;
-    }
+    /* ── Scissor ──────────────────────────────────────────────────── */
 
     void EnableScissorRegion(bool enable) override
     {
-        /* TODO: Set bgfx scissor state. */
-        LOG_TRACE(LOG_TAG, "EnableScissorRegion(%s) (stub)",
-                  enable ? "true" : "false");
-        (void)enable;
+        scissor_enabled_ = enable;
     }
 
     void SetScissorRegion(int x, int y, int width, int height) override
     {
-        /* TODO: Apply scissor rectangle via bgfx. */
-        LOG_TRACE(LOG_TAG, "SetScissorRegion(%d,%d,%d,%d) (stub)",
-                  x, y, width, height);
-        (void)x;
-        (void)y;
-        (void)width;
-        (void)height;
+        scissor_x_ = (uint16_t)(x > 0 ? x : 0);
+        scissor_y_ = (uint16_t)(y > 0 ? y : 0);
+        scissor_w_ = (uint16_t)(width  > 0 ? width  : 0);
+        scissor_h_ = (uint16_t)(height > 0 ? height : 0);
     }
+
+    /* ── Textures ─────────────────────────────────────────────────── */
+
+    bool LoadTexture(Rml::TextureHandle &texture_handle,
+                     Rml::Vector2i &texture_dimensions,
+                     const Rml::String &source) override
+    {
+        /* RmlUI calls this for <img src="..."> in documents.
+           We load from PAK via the engine's texture loader. */
+        if (!pak_) return false;
+
+        JceTexture tex = jce_texture_load(pak_, source.c_str());
+        if (!jce_texture_valid(tex)) {
+            LOG_WARN(LOG_TAG, "LoadTexture failed: %s", source.c_str());
+            return false;
+        }
+
+        uint32_t w = 0, h = 0;
+        jce_texture_get_size(tex, &w, &h);
+        texture_handle = (Rml::TextureHandle)tex.idx;
+        texture_dimensions = Rml::Vector2i((int)w, (int)h);
+
+        generated_textures_.push_back(tex);
+        return true;
+    }
+
+    bool GenerateTexture(Rml::TextureHandle &texture_handle,
+                         const Rml::byte *source,
+                         const Rml::Vector2i &source_dimensions) override
+    {
+        /* RmlUI uses this for font atlas textures (RGBA8). */
+        JceTexture tex = jce_texture_from_rgba(source,
+            (uint32_t)source_dimensions.x, (uint32_t)source_dimensions.y);
+        if (!jce_texture_valid(tex)) return false;
+
+        texture_handle = (Rml::TextureHandle)tex.idx;
+        generated_textures_.push_back(tex);
+        return true;
+    }
+
+    void ReleaseTexture(Rml::TextureHandle texture) override
+    {
+        JceTexture tex;
+        tex.idx = (uint16_t)(texture & 0xFFFF);
+        for (auto it = generated_textures_.begin();
+             it != generated_textures_.end(); ++it) {
+            if (it->idx == tex.idx) {
+                jce_texture_destroy(*it);
+                generated_textures_.erase(it);
+                return;
+            }
+        }
+    }
+
+    void SetPak(PakArchive *pak) { pak_ = pak; }
+
+private:
+    JceRenderer *renderer_ = nullptr;
+    PakArchive  *pak_      = nullptr;
+
+    bool     scissor_enabled_ = false;
+    uint16_t scissor_x_ = 0, scissor_y_ = 0;
+    uint16_t scissor_w_ = 0, scissor_h_ = 0;
+
+    std::vector<JceTexture> generated_textures_;
 };
 
 /* ================================================================== */
@@ -162,13 +385,21 @@ private:
 struct JceRmlBackend {
     JceRmlSystemInterface  *sys_interface    = nullptr;
     JceRmlRenderInterface  *render_interface = nullptr;
+    JceRmlFileInterface    *file_interface   = nullptr;
     Rml::Context           *context          = nullptr;
+
+    JceRenderer            *renderer         = nullptr;
+    PakArchive             *pak              = nullptr;
 
     std::vector<Rml::ElementDocument *> documents;
     std::vector<Rml::Element *>         elements;
 
     /* Keeps event adapters alive for the lifetime of the backend. */
     std::vector<JceRmlEventAdapter *>   event_adapters;
+
+    /* Font data buffers — must remain alive while RmlUI uses the fonts.
+       RmlUI::LoadFontFace(data,...) does NOT copy the data. */
+    std::vector<void *>                 font_data_buffers;
 
     /* Temporary storage so elem_get_text can return a stable c_str(). */
     std::string                         temp_text;
@@ -181,7 +412,8 @@ struct JceRmlBackend {
 /* Lifecycle                                                           */
 /* ================================================================== */
 
-JceRmlBackend *jce_rml_create(uint32_t width, uint32_t height)
+JceRmlBackend *jce_rml_create(uint32_t width, uint32_t height,
+                              JceRenderer *renderer, PakArchive *pak)
 {
     auto *b = new (std::nothrow) JceRmlBackend();
     if (!b) {
@@ -189,24 +421,31 @@ JceRmlBackend *jce_rml_create(uint32_t width, uint32_t height)
         return nullptr;
     }
 
-    b->width  = width;
-    b->height = height;
+    b->width    = width;
+    b->height   = height;
+    b->renderer = renderer;
+    b->pak      = pak;
 
     b->sys_interface    = new (std::nothrow) JceRmlSystemInterface();
-    b->render_interface = new (std::nothrow) JceRmlRenderInterface();
-    if (!b->sys_interface || !b->render_interface) {
+    b->render_interface = new (std::nothrow) JceRmlRenderInterface(renderer);
+    b->file_interface   = new (std::nothrow) JceRmlFileInterface(pak);
+    if (!b->sys_interface || !b->render_interface || !b->file_interface) {
         LOG_ERROR(LOG_TAG, "failed to allocate RmlUi interfaces");
+        delete b->file_interface;
         delete b->render_interface;
         delete b->sys_interface;
         delete b;
         return nullptr;
     }
+    b->render_interface->SetPak(pak);
 
     Rml::SetSystemInterface(b->sys_interface);
     Rml::SetRenderInterface(b->render_interface);
+    Rml::SetFileInterface(b->file_interface);
 
     if (!Rml::Initialise()) {
         LOG_ERROR(LOG_TAG, "Rml::Initialise() failed");
+        delete b->file_interface;
         delete b->render_interface;
         delete b->sys_interface;
         delete b;
@@ -218,6 +457,7 @@ JceRmlBackend *jce_rml_create(uint32_t width, uint32_t height)
     if (!b->context) {
         LOG_ERROR(LOG_TAG, "Rml::CreateContext() failed");
         Rml::Shutdown();
+        delete b->file_interface;
         delete b->render_interface;
         delete b->sys_interface;
         delete b;
@@ -232,13 +472,18 @@ void jce_rml_destroy(JceRmlBackend *b)
 {
     if (!b) return;
 
-    for (auto *adapter : b->event_adapters) {
+    for (auto *adapter : b->event_adapters)
         delete adapter;
-    }
     b->event_adapters.clear();
 
     Rml::Shutdown();
 
+    /* Free font data buffers AFTER Rml::Shutdown (FreeType is done). */
+    for (void *buf : b->font_data_buffers)
+        free(buf);
+    b->font_data_buffers.clear();
+
+    delete b->file_interface;
     delete b->render_interface;
     delete b->sys_interface;
     delete b;
@@ -254,7 +499,7 @@ uint32_t jce_rml_doc_load(JceRmlBackend *b, const char *name,
                           const char *markup, uint32_t len)
 {
     if (!b || !b->context || !markup) return UINT32_MAX;
-    (void)name; /* RmlUi does not use a separate name for memory docs. */
+    (void)name;
 
     Rml::ElementDocument *doc =
         b->context->LoadDocumentFromMemory(std::string(markup, len));
@@ -380,18 +625,111 @@ void jce_rml_elem_on(JceRmlBackend *b, uint32_t elem_idx,
 }
 
 /* ================================================================== */
-/* Per-frame                                                           */
+/* Font loading                                                        */
 /* ================================================================== */
 
-void jce_rml_process_input(JceRmlBackend *b, const void *input)
+bool jce_rml_load_font(JceRmlBackend *b, const char *pak_path)
 {
-    /* TODO: Wire SDL/platform input events to RmlUi key/mouse events.
-     * This requires mapping JceInput fields to Rml::Context::Process*
-     * methods (ProcessKeyDown, ProcessMouseMove, ProcessMouseButtonDown,
-     * ProcessTextInput, etc.).  Deferred to the input-integration pass. */
-    (void)b;
-    (void)input;
+    if (!b || !pak_path || !b->pak) return false;
+
+    const PakAsset *asset = pak_find(b->pak, pak_path);
+    if (!asset) {
+        LOG_ERROR(LOG_TAG, "font not found in PAK: %s", pak_path);
+        return false;
+    }
+
+    void *data = malloc((size_t)asset->original_size);
+    if (!data) return false;
+
+    size_t sz = pak_decompress(asset, data, (size_t)asset->original_size);
+    if (sz == 0) {
+        free(data);
+        return false;
+    }
+
+    /* Extract family name from filename (e.g. "fonts/Caveat.ttf" → "Caveat"). */
+    std::string family;
+    {
+        std::string path_str(pak_path);
+        size_t slash = path_str.find_last_of("/\\");
+        size_t dot   = path_str.find_last_of('.');
+        if (slash != std::string::npos)
+            family = path_str.substr(slash + 1,
+                dot != std::string::npos ? dot - slash - 1 : std::string::npos);
+        else
+            family = path_str.substr(0,
+                dot != std::string::npos ? dot : std::string::npos);
+    }
+
+    bool ok = Rml::LoadFontFace(
+        reinterpret_cast<const Rml::byte *>(data), (int)sz,
+        family, Rml::Style::FontStyle::Normal,
+        Rml::Style::FontWeight::Normal, false);
+
+    if (ok) {
+        /* RmlUI keeps a pointer to the font data — must stay alive. */
+        b->font_data_buffers.push_back(data);
+        LOG_SUCCESS(LOG_TAG, "font loaded: %s (family: %s)", pak_path, family.c_str());
+    } else {
+        free(data);
+        LOG_ERROR(LOG_TAG, "Rml::LoadFontFace failed: %s", pak_path);
+    }
+
+    return ok;
 }
+
+/* ================================================================== */
+/* Per-frame: input                                                    */
+/* ================================================================== */
+
+void jce_rml_process_input(JceRmlBackend *b, const JceInput *input)
+{
+    if (!b || !b->context || !input) return;
+
+    /* Mouse position. */
+    float mx = 0, my = 0;
+    jce_input_mouse_pos(input, &mx, &my);
+    b->context->ProcessMouseMove((int)mx, (int)my, 0);
+
+    /* Mouse buttons (left=0, right=1, middle=2). */
+    for (int btn = 0; btn < 3; btn++) {
+        if (jce_input_mouse_button_pressed(input, btn + 1))
+            b->context->ProcessMouseButtonDown(btn, 0);
+        if (jce_input_mouse_button_released(input, btn + 1))
+            b->context->ProcessMouseButtonUp(btn, 0);
+    }
+
+    /* Mouse wheel. */
+    float wheel = jce_input_mouse_wheel(input);
+    if (wheel != 0.0f)
+        b->context->ProcessMouseWheel(-wheel, 0);
+
+    /* Key presses for UI navigation. */
+    struct KeyMap { JceKey jce; Rml::Input::KeyIdentifier rml; };
+    static const KeyMap kmap[] = {
+        { JCE_KEY_TAB,       Rml::Input::KI_TAB    },
+        { JCE_KEY_RETURN,    Rml::Input::KI_RETURN  },
+        { JCE_KEY_ESCAPE,    Rml::Input::KI_ESCAPE  },
+        { JCE_KEY_BACKSPACE, Rml::Input::KI_BACK    },
+        { JCE_KEY_DELETE,    Rml::Input::KI_DELETE   },
+        { JCE_KEY_LEFT,      Rml::Input::KI_LEFT    },
+        { JCE_KEY_RIGHT,     Rml::Input::KI_RIGHT   },
+        { JCE_KEY_UP,        Rml::Input::KI_UP      },
+        { JCE_KEY_DOWN,      Rml::Input::KI_DOWN    },
+        { JCE_KEY_HOME,      Rml::Input::KI_HOME    },
+        { JCE_KEY_END,       Rml::Input::KI_END     },
+    };
+    for (const auto &km : kmap) {
+        if (jce_input_key_pressed(input, km.jce))
+            b->context->ProcessKeyDown(km.rml, 0);
+        if (jce_input_key_released(input, km.jce))
+            b->context->ProcessKeyUp(km.rml, 0);
+    }
+}
+
+/* ================================================================== */
+/* Per-frame: update, render, resize                                   */
+/* ================================================================== */
 
 void jce_rml_update(JceRmlBackend *b, float dt)
 {

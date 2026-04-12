@@ -39,6 +39,7 @@
 static JceAppDesc  g_app_desc;
 static bool        g_app_desc_set;
 static char        g_config_path_override[512];
+static int         g_renderer_backend_override = -1;  /* -1 = no override */
 
 void jce_engine_set_app_desc(const JceAppDesc *desc)
 {
@@ -58,6 +59,11 @@ void jce_engine_set_config_path(const char *path)
     }
 
     snprintf(g_config_path_override, sizeof(g_config_path_override), "%s", path);
+}
+
+void jce_engine_set_renderer_override(int backend)
+{
+    g_renderer_backend_override = backend;
 }
 
 static bool jce_path_exists(const char *path)
@@ -168,6 +174,11 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         jce_select_config_path(cfg_path, sizeof(cfg_path));
         jce_config_load(&e->config, cfg_path);
     }
+
+    /* Apply renderer backend override from editor (or other host). */
+    if (g_renderer_backend_override >= 0)
+        e->config.renderer_backend = (JceRendererBackend)g_renderer_backend_override;
+
     jce_log_set_level((JceLogLevel)e->config.log_level);
     jce_log_set_colors(e->config.log_colors);
 

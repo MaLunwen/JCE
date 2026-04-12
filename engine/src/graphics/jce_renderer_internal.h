@@ -11,6 +11,10 @@
 #include <jce/graphics/jce_renderer.h>
 #include <bgfx/c99/bgfx.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* -- Renderer-internal accessors (not for use outside renderer/) --- */
 
 /* Color (pos+color) vertex layout and shader program. */
@@ -30,5 +34,9 @@ bgfx_program_handle_t jce_renderer_get_bgfx_program_pbr(const JceRenderer *r);
 bgfx_program_handle_t jce_renderer_get_bgfx_program_pbr_skinned(const JceRenderer *r);
 bgfx_program_handle_t jce_renderer_get_bgfx_program_shadow(const JceRenderer *r);
 bgfx_program_handle_t jce_renderer_get_bgfx_program_shadow_skinned(const JceRenderer *r);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* JCE_RENDERER_INTERNAL_H */

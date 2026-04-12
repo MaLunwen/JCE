@@ -39,6 +39,8 @@ void jce_editor_config_defaults(JceEditorConfig *cfg) {
     strncpy(cfg->renderer, "OpenGL", sizeof(cfg->renderer) - 1);
     cfg->last_project[0] = '\0';
     cfg->recent_count = 0;
+    cfg->view_mode = 0;    /* JCE_VIEW_SHADED */
+    cfg->show_grid = true;
 }
 
 /* --------------- helpers --------------- */
@@ -84,6 +86,14 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
     cjson_read_str(root, "renderer", cfg->renderer, sizeof(cfg->renderer));
     cjson_read_str(root, "last_project", cfg->last_project, sizeof(cfg->last_project));
 
+    /* Scene view render settings. */
+    cfg->view_mode = cjson_read_int(root, "view_mode", cfg->view_mode);
+    {
+        const cJSON *g = cJSON_GetObjectItemCaseSensitive(root, "show_grid");
+        if (cJSON_IsBool(g))
+            cfg->show_grid = cJSON_IsTrue(g);
+    }
+
     /* recent_0 .. recent_9 */
     cfg->recent_count = 0;
     for (int i = 0; i < 10; i++) {
@@ -120,6 +130,10 @@ bool jce_editor_config_save(const JceEditorConfig *cfg) {
     cJSON_AddStringToObject(root, "theme",        cfg->theme);
     cJSON_AddStringToObject(root, "renderer",     cfg->renderer);
     cJSON_AddStringToObject(root, "last_project", cfg->last_project);
+
+    /* Scene view render settings. */
+    cJSON_AddNumberToObject(root, "view_mode",  cfg->view_mode);
+    cJSON_AddBoolToObject(root, "show_grid",    cfg->show_grid);
 
     for (int i = 0; i < 10; i++) {
         char key[16];

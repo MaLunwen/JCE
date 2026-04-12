@@ -33,6 +33,12 @@ void           jce_engine_set_app_desc(const JceAppDesc *desc);
    Pass NULL or empty string to clear override. */
 void           jce_engine_set_config_path(const char *path);
 
+/* Override the renderer backend selection.
+   Must be called before jce_engine_create().
+   Pass JCE_BACKEND_AUTO (0) to clear override and use config file value.
+   Requires jce_config.h for JceRendererBackend enum. */
+void           jce_engine_set_renderer_override(int backend);
+
 /* Create the engine: init logger, load config, open PAK, create
    window/renderer/audio/input, async-load assets, create app. */
 JceEngine     *jce_engine_create(int argc, char *argv[]);

@@ -328,34 +328,10 @@ static void settings_apply(void)
         jce_editor_config_save(&ecfg);
     }
 
-    /* Write renderer backend to .config/jce.ini so the engine picks it up. */
-    {
-        static const char *backend_ini_names[] = {
-#if defined(_WIN32)
-            "auto", "d3d12", "d3d11", "vulkan", "opengl"
-#elif defined(__APPLE__)
-            "auto", "metal", "opengl"
-#elif defined(__EMSCRIPTEN__)
-            "auto", "opengles"
-#else
-            "auto", "vulkan", "opengl"
-#endif
-        };
-        const char *be = "auto";
-        if (s_settings.renderer_idx >= 0 && s_settings.renderer_idx < s_renderer_count)
-            be = backend_ini_names[s_settings.renderer_idx];
-#ifdef _WIN32
-        _mkdir(".config");
-#else
-        mkdir(".config", 0755);
-#endif
-        FILE *ini = fopen(".config/jce.ini", "w");
-        if (ini) {
-            fprintf(ini, "[renderer]\n");
-            fprintf(ini, "backend = %s\n", be);
-            fclose(ini);
-        }
-    }
+    /* Renderer backend change is picked up on next editor startup via
+       configure_engine_renderer_from_editor_config() in editor_main.cpp,
+       which writes a temporary .jce/editor-engine.ini for the engine.
+       No need to touch .config/jce.ini. */
 
     /* Update snapshot so Cancel won't revert applied changes. */
     settings_snapshot();

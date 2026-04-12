@@ -38,7 +38,8 @@ JceUIContext *jce_ui_create(const JceUIContextDesc *desc, jce_allocator_t alloc)
     ctx->width  = desc->width;
     ctx->height = desc->height;
 
-    ctx->backend = jce_rml_create(desc->width, desc->height);
+    ctx->backend = jce_rml_create(desc->width, desc->height,
+                                  desc->renderer, desc->pak);
     if (!ctx->backend) {
         LOG_ERROR(LOG_TAG, "failed to create RmlUi backend");
         alloc.free(ctx, alloc.ctx);
@@ -58,6 +59,14 @@ void jce_ui_destroy(JceUIContext *ctx)
 
     jce_allocator_t a = ctx->alloc;
     a.free(ctx, a.ctx);
+}
+
+/* ── Font loading ──────────────────────────────────────────────────── */
+
+bool jce_ui_load_font(JceUIContext *ctx, const char *pak_path)
+{
+    if (!ctx || !pak_path) return false;
+    return jce_rml_load_font(ctx->backend, pak_path);
 }
 
 /* ── Documents ─────────────────────────────────────────────────────── */
@@ -137,12 +146,6 @@ void jce_ui_elem_set_property(JceUIContext *ctx, JceUIElementHandle elem,
 
 /* ── Event callbacks ───────────────────────────────────────────────── */
 
-/*
- * Adapter: the public jce_ui_event_fn receives a JceUIElementHandle,
- * while the backend bridge uses a raw uint32_t index.  We store the
- * original callback+userdata and translate.
- */
-
 typedef struct {
     jce_ui_event_fn fn;
     void           *userdata;
@@ -163,11 +166,6 @@ void jce_ui_elem_on(JceUIContext *ctx, JceUIElementHandle elem,
 {
     if (!ctx || !jce_ui_elem_valid(elem) || !fn) return;
 
-    /*
-     * Allocate a small wrapper that lives for the lifetime of the
-     * listener.  In practice these are few and long-lived, so the
-     * leak-on-close is acceptable until a proper destroy path exists.
-     */
     UIEventCBWrapper *w =
         (UIEventCBWrapper *)ctx->alloc.alloc(sizeof(UIEventCBWrapper),
                                              ctx->alloc.ctx);
