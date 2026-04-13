@@ -1,0 +1,17 @@
+<rml>
+<head>
+    <link type="text/rcss" href="ck_base.rcss"/>
+    <style>
+        #loading-box {
+            margin-top: 45%;
+        }
+    </style>
+</head>
+<body>
+    <div class="overlay-bg">
+        <div id="loading-box" class="center">
+            <p id="loading-text" class="subtitle white">Loading...</p>
+        </div>
+    </div>
+</body>
+</rml>

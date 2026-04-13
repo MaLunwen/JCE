@@ -244,6 +244,12 @@ void jce_window_toggle_fullscreen(JceWindow *win)
 #endif
 }
 
+bool jce_window_is_fullscreen(const JceWindow *win)
+{
+    if (!win || !win->sdl_win) return false;
+    return (SDL_GetWindowFlags(win->sdl_win) & SDL_WINDOW_FULLSCREEN) != 0;
+}
+
 void jce_window_set_relative_mouse_mode(JceWindow *win, bool enabled)
 {
     if (!win || !win->sdl_win) return;

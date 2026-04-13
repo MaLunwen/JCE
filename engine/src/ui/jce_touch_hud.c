@@ -527,10 +527,10 @@ void jce_touch_hud_draw(JceTouchHud *hud)
 {
     if (!hud || !hud->visible) return;
 
-    int lw, lh;
-    jce_window_get_logical(hud->window, &lw, &lh);
-    float sw = (float)lw;
-    float sh = (float)lh;
+    uint32_t pw, ph;
+    jce_window_get_size(hud->window, &pw, &ph);
+    float sw = (float)pw;
+    float sh = (float)ph;
 
     /* ── MCBE-style color palette ─────────────────────────── */
 
@@ -554,20 +554,20 @@ void jce_touch_hud_draw(JceTouchHud *hud)
 
             float px = bx0 * sw;
             float py = by0 * sh;
-            float pw = (bx1 - bx0) * sw;
-            float ph = (by1 - by0) * sh;
+            float btn_w = (bx1 - bx0) * sw;
+            float btn_h = (by1 - by0) * sh;
 
             /* Rounded-rect style menu button. */
-            jce_draw_filled_rect(hud->renderer, px, py, pw, ph,
+            jce_draw_filled_rect(hud->renderer, px, py, btn_w, btn_h,
                                  held ? col_btn_pressed : col_btn);
-            jce_draw_rect_outline(hud->renderer, px, py, pw, ph,
+            jce_draw_rect_outline(hud->renderer, px, py, btn_w, btn_h,
                                   col_btn_outline);
 
             if (hud->label_font) {
                 float tw, th;
                 jce_text_measure(hud->label_font, menu_labels[i], &tw, &th);
-                float lx = px + (pw - tw) * 0.5f;
-                float ly = py + (ph - th) * 0.5f;
+                float lx = px + (btn_w - tw) * 0.5f;
+                float ly = py + (btn_h - th) * 0.5f;
                 jce_text_draw(hud->renderer, hud->label_font,
                               lx, ly, menu_labels[i],
                               jce_rgba(255, 255, 255, held ? 255 : 200));
@@ -631,13 +631,13 @@ void jce_touch_hud_draw(JceTouchHud *hud)
 
         float px = bx0 * sw;
         float py = by0 * sh;
-        float pw = (bx1 - bx0) * sw;
-        float ph = (by1 - by0) * sh;
+        float btn_w = (bx1 - bx0) * sw;
+        float btn_h = (by1 - by0) * sh;
 
         /* Button: circular if roughly square, else rounded rect. */
-        float btn_cx = px + pw * 0.5f;
-        float btn_cy = py + ph * 0.5f;
-        float btn_r  = (pw < ph ? pw : ph) * 0.5f;
+        float btn_cx = px + btn_w * 0.5f;
+        float btn_cy = py + btn_h * 0.5f;
+        float btn_r  = (btn_w < btn_h ? btn_w : btn_h) * 0.5f;
 
         /* Filled circle background. */
         draw_filled_circle(hud->renderer, btn_cx, btn_cy, btn_r,

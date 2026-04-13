@@ -6,7 +6,7 @@
 ::   sdk_path  - Android SDK root (default: ANDROID_HOME or D:\Code\C_CPP\cross_platform\android-sdk)
 ::   arch      - arm64 or arm (default: arm64)
 ::   --clean   - Force full rebuild (remove CMake + Conan caches)
-:: Output: android\app\build\outputs\apk\debug\app-debug.apk
+:: Output: scripts\android\app\build\outputs\apk\debug\app-debug.apk
 :: ================================================================
 setlocal enabledelayedexpansion
 
@@ -54,7 +54,7 @@ set "CONAN_DIR=build\mobile\android-%ARCH%-conan"
 set "BUILD_DIR=build\mobile\android-%ARCH%"
 set "TOOLCHAIN=%CONAN_DIR%\build\Release\generators\conan_toolchain.cmake"
 set "HOST_PAK=build\host\tools\jce_pak.exe"
-set "ABI_DIR=android\app\src\main\jniLibs\%ABI%"
+set "ABI_DIR=scripts\android\app\src\main\jniLibs\%ABI%"
 set "APK_COPY_DIR=build\mobile\android-%ARCH%\release"
 
 echo ================================================================
@@ -71,9 +71,9 @@ if "%DO_CLEAN%"=="1" (
     echo === Full clean ===
     if exist "%BUILD_DIR%" rmdir /s /q "%BUILD_DIR%"
     if exist "%CONAN_DIR%" rmdir /s /q "%CONAN_DIR%"
-    if exist "android\app\build" rmdir /s /q "android\app\build"
-    if exist "android\app\src\main\jniLibs" rmdir /s /q "android\app\src\main\jniLibs"
-    if exist "android\app\src\main\assets" rmdir /s /q "android\app\src\main\assets"
+    if exist "scripts\android\app\build" rmdir /s /q "scripts\android\app\build"
+    if exist "scripts\android\app\src\main\jniLibs" rmdir /s /q "scripts\android\app\src\main\jniLibs"
+    if exist "scripts\android\app\src\main\assets" rmdir /s /q "scripts\android\app\src\main\assets"
     echo   Done
     echo.
 )
@@ -86,9 +86,9 @@ if exist "%ABI_DIR%" (
     rmdir /s /q "%ABI_DIR%"
 )
 :: Remove Gradle build cache (Gradle cannot detect .so content changes)
-if exist "android\app\build" (
+if exist "scripts\android\app\build" (
     echo   Removing Gradle build cache
-    rmdir /s /q "android\app\build"
+    rmdir /s /q "scripts\android\app\build"
 )
 echo   OK
 echo.
@@ -207,7 +207,7 @@ echo   Copied libJCE.so
 
 :: Copy game_assets.pak into APK assets/ (loaded at runtime via SDL)
 set "PAK_SRC=%BUILD_DIR%\game_assets.pak"
-set "ASSETS_DIR=android\app\src\main\assets"
+set "ASSETS_DIR=scripts\android\app\src\main\assets"
 if not exist "%PAK_SRC%" (
     echo ERROR: game_assets.pak not found at: %PAK_SRC%
     goto :error
@@ -228,15 +228,15 @@ if errorlevel 1 goto :error
 echo   Copied libc++_shared.so
 
 :: -- Step 9: Write local.properties --
-echo === Step 9: Write android/local.properties ===
+echo === Step 9: Write scripts/android/local.properties ===
 set "SDK_UNIX=%SDK_PATH:\=/%"
-echo sdk.dir=%SDK_UNIX%> android\local.properties
+echo sdk.dir=%SDK_UNIX%> scripts\android\local.properties
 echo   sdk.dir=%SDK_UNIX%
 
 :: -- Step 10: Gradle assembleDebug --
 echo === Step 10: Gradle assembleDebug ===
 set "ANDROID_HOME=%SDK_PATH%"
-pushd android
+pushd scripts\android
 call .\gradlew.bat assembleDebug
 if errorlevel 1 (
     popd
@@ -244,7 +244,7 @@ if errorlevel 1 (
 )
 popd
 
-set "APK=android\app\build\outputs\apk\debug\app-debug.apk"
+set "APK=scripts\android\app\build\outputs\apk\debug\app-debug.apk"
 if not exist "%APK%" (
     echo ERROR: APK not found at: %APK%
     goto :error
@@ -262,11 +262,35 @@ echo ================================================================
 echo   [SUCCESS] APK built: %APK%
 echo   [SUCCESS] APK copied: %APK_COPY_DIR%\JCE.apk
 echo ================================================================
+
+:: -- Step 12: Auto-install on WSA if connected --
+set "ADB=%SDK_PATH%\platform-tools\adb.exe"
+if not exist "%ADB%" (
+    echo   [SKIP] adb not found at %ADB%, skipping auto-install.
+    goto :done
+)
+
 echo.
-echo   Install and run:
-echo     adb connect 127.0.0.1:58526
-echo     adb install -r %APK%
-echo     adb shell am start -n com.jce/com.jce.JCEActivity
+echo === Step 12: Check for WSA / connected device ===
+:: Try WSA first (localhost:58526)
+"%ADB%" connect 127.0.0.1:58526 >nul 2>&1
+"%ADB%" devices | findstr /r "device$" >nul 2>&1
+if errorlevel 1 (
+    echo   [SKIP] No Android device or WSA detected, skipping install.
+    goto :done
+)
+
+echo   Device detected, installing APK...
+"%ADB%" install -r "%APK_COPY_DIR%\JCE.apk"
+if errorlevel 1 (
+    echo   [WARN] Install failed.
+    goto :done
+)
+echo   Launching com.jce/.JCEActivity ...
+"%ADB%" shell am start -n com.jce/com.jce.JCEActivity
+echo   [OK] App installed and launched.
+
+:done
 echo.
 popd
 timeout /t 5 /nobreak >nul

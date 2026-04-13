@@ -1,0 +1,22 @@
+<rml>
+<head>
+    <link type="text/rcss" href="ck_base.rcss"/>
+    <style>
+        #menu-box {
+            margin-top: 30%;
+        }
+        #title {
+            margin-bottom: 40dp;
+        }
+    </style>
+</head>
+<body>
+    <div class="overlay-bg">
+        <div id="menu-box" class="center">
+            <p id="title" class="title">Caged Kingdom</p>
+            <p id="btn-play" class="menu-item selected">Play</p>
+            <p id="btn-quit" class="menu-item gray">Quit</p>
+        </div>
+    </div>
+</body>
+</rml>

@@ -39,6 +39,12 @@ void jce_draw_rect_outlines(const JceRenderer *r,
                             const float *rects, int count,
                             uint32_t color);
 
+/* Draw a connected polyline in UI pixel space.
+   points_xy: packed float[point_count*2] = { x0, y0, x1, y1, ... }. */
+void jce_draw_polyline(const JceRenderer *r,
+                       const float *points_xy, int point_count,
+                       uint32_t color);
+
 /* Draw a textured rectangle.
    tint: color multiplied with texture (use 0xFFFFFFFF for no tint).
    uv: texture coordinate region {u0, v0, u1, v1} or NULL for {0,0,1,1}. */

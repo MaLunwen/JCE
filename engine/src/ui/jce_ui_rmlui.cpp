@@ -264,8 +264,11 @@ public:
             bgfx_set_texture(0, sampler, bgfx_tex, UINT32_MAX);
         }
 
-        uint64_t state = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
-                       | BGFX_STATE_BLEND_ALPHA;
+          /* RmlUi font atlases are generated as transparent white with glyph
+              coverage in alpha. Use standard alpha blending so fully transparent
+              atlas texels do not render as solid white rectangles. */
+          uint64_t state = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                              | BGFX_STATE_BLEND_ALPHA;
 
         if (scissor_enabled_)
             bgfx_set_scissor(scissor_x_, scissor_y_,
@@ -319,9 +322,31 @@ public:
                          const Rml::byte *source,
                          const Rml::Vector2i &source_dimensions) override
     {
-        /* RmlUI uses this for font atlas textures (RGBA8). */
-        JceTexture tex = jce_texture_from_rgba(source,
-            (uint32_t)source_dimensions.x, (uint32_t)source_dimensions.y);
+          /* RmlUi generated textures are premultiplied RGBA. bgfx uses linear
+              filtering by default when the point-sampler flags are omitted,
+              which keeps UI text from looking blocky at non-integer scale. */
+        if (!source || source_dimensions.x <= 0 || source_dimensions.y <= 0)
+            return false;
+
+        const uint32_t width = (uint32_t)source_dimensions.x;
+        const uint32_t height = (uint32_t)source_dimensions.y;
+        const bgfx_memory_t *mem = bgfx_alloc(width * height * 4);
+        memcpy(mem->data, source, width * height * 4);
+
+        bgfx_texture_handle_t handle = bgfx_create_texture_2d(
+            (uint16_t)width, (uint16_t)height,
+            false, 1,
+            BGFX_TEXTURE_FORMAT_RGBA8,
+            BGFX_TEXTURE_NONE
+                | BGFX_SAMPLER_U_CLAMP
+                | BGFX_SAMPLER_V_CLAMP,
+            mem);
+
+        if (handle.idx == UINT16_MAX)
+            return false;
+
+        JceTexture tex;
+        tex.idx = handle.idx;
         if (!jce_texture_valid(tex)) return false;
 
         texture_handle = (Rml::TextureHandle)tex.idx;
@@ -412,6 +437,16 @@ struct JceRmlBackend {
 /* Lifecycle                                                           */
 /* ================================================================== */
 
+/* Reference height for dp scaling.  At 1080px the dp ratio is 1.0;
+   smaller windows shrink, larger windows grow.  Clamped to [0.6, 4.0]. */
+static float compute_dp_ratio(uint32_t h)
+{
+    float r = (float)h / 1080.0f;
+    if (r < 0.6f)  r = 0.6f;
+    if (r > 4.0f)  r = 4.0f;
+    return r;
+}
+
 JceRmlBackend *jce_rml_create(uint32_t width, uint32_t height,
                               JceRenderer *renderer, PakArchive *pak)
 {
@@ -464,7 +499,11 @@ JceRmlBackend *jce_rml_create(uint32_t width, uint32_t height,
         return nullptr;
     }
 
-    LOG_SUCCESS(LOG_TAG, "RmlUi backend created (%ux%u)", width, height);
+    float dp = compute_dp_ratio(height);
+    b->context->SetDensityIndependentPixelRatio(dp);
+
+    LOG_SUCCESS(LOG_TAG, "RmlUi backend created (%ux%u, dp=%.2f)",
+                width, height, dp);
     return b;
 }
 
@@ -603,6 +642,101 @@ void jce_rml_elem_set_property(JceRmlBackend *b, uint32_t elem_idx,
     if (elem) elem->SetProperty(prop, val);
 }
 
+const char *jce_rml_elem_get_value(JceRmlBackend *b, uint32_t elem_idx)
+{
+    if (!b || elem_idx >= (uint32_t)b->elements.size()) return "";
+    Rml::Element *elem = b->elements[elem_idx];
+    Rml::ElementFormControl *control = dynamic_cast<Rml::ElementFormControl *>(elem);
+    if (!control) return "";
+
+    b->temp_text = control->GetValue();
+    return b->temp_text.c_str();
+}
+
+void jce_rml_elem_set_value(JceRmlBackend *b, uint32_t elem_idx,
+                            const char *value)
+{
+    if (!b || !value || elem_idx >= (uint32_t)b->elements.size()) return;
+    Rml::Element *elem = b->elements[elem_idx];
+    Rml::ElementFormControl *control = dynamic_cast<Rml::ElementFormControl *>(elem);
+    if (control) control->SetValue(value);
+}
+
+const char *jce_rml_elem_get_attribute(JceRmlBackend *b, uint32_t elem_idx,
+                                       const char *attr)
+{
+    if (!b || !attr || elem_idx >= (uint32_t)b->elements.size()) return "";
+    Rml::Element *elem = b->elements[elem_idx];
+    if (!elem) return "";
+
+    Rml::Variant *var = elem->GetAttribute(attr);
+    if (!var) return "";
+
+    b->temp_text = var->Get<Rml::String>();
+    return b->temp_text.c_str();
+}
+
+void jce_rml_elem_set_attribute(JceRmlBackend *b, uint32_t elem_idx,
+                                const char *attr, const char *val)
+{
+    if (!b || !attr || !val || elem_idx >= (uint32_t)b->elements.size()) return;
+    Rml::Element *elem = b->elements[elem_idx];
+    if (elem) elem->SetAttribute(attr, Rml::String(val));
+}
+
+void jce_rml_elem_remove_attribute(JceRmlBackend *b, uint32_t elem_idx,
+                                   const char *attr)
+{
+    if (!b || !attr || elem_idx >= (uint32_t)b->elements.size()) return;
+    Rml::Element *elem = b->elements[elem_idx];
+    if (elem) elem->RemoveAttribute(attr);
+}
+
+void jce_rml_elem_set_inner_rml(JceRmlBackend *b, uint32_t elem_idx,
+                                const char *rml)
+{
+    if (!b || !rml || elem_idx >= (uint32_t)b->elements.size()) return;
+    Rml::Element *elem = b->elements[elem_idx];
+    if (elem) elem->SetInnerRML(rml);
+}
+
+bool jce_rml_elem_get_bounds(JceRmlBackend *b, uint32_t elem_idx,
+                             float *x, float *y, float *w, float *h)
+{
+    if (!b || elem_idx >= (uint32_t)b->elements.size()) return false;
+    Rml::Element *elem = b->elements[elem_idx];
+    if (!elem || !x || !y || !w || !h) return false;
+
+    *x = elem->GetAbsoluteLeft();
+    *y = elem->GetAbsoluteTop();
+    *w = elem->GetOffsetWidth();
+    *h = elem->GetOffsetHeight();
+    return true;
+}
+
+uint32_t jce_rml_doc_get_body(JceRmlBackend *b, uint32_t doc_idx)
+{
+    if (!b || doc_idx >= (uint32_t)b->documents.size()) return UINT32_MAX;
+    Rml::ElementDocument *doc = b->documents[doc_idx];
+    if (!doc) return UINT32_MAX;
+
+    Rml::Element *body = nullptr;
+    const int child_count = doc->GetNumChildren(true);
+    for (int i = 0; i < child_count; ++i) {
+        Rml::Element *child = doc->GetChild(i);
+        if (child && child->GetTagName() == "body") {
+            body = child;
+            break;
+        }
+    }
+    if (!body)
+        body = doc;
+
+    uint32_t idx = (uint32_t)b->elements.size();
+    b->elements.push_back(body);
+    return idx;
+}
+
 /* ================================================================== */
 /* Events                                                              */
 /* ================================================================== */
@@ -682,7 +816,7 @@ bool jce_rml_load_font(JceRmlBackend *b, const char *pak_path)
 /* Per-frame: input                                                    */
 /* ================================================================== */
 
-void jce_rml_process_input(JceRmlBackend *b, const JceInput *input)
+void jce_rml_process_pointer_input(JceRmlBackend *b, const JceInput *input)
 {
     if (!b || !b->context || !input) return;
 
@@ -703,6 +837,13 @@ void jce_rml_process_input(JceRmlBackend *b, const JceInput *input)
     float wheel = jce_input_mouse_wheel(input);
     if (wheel != 0.0f)
         b->context->ProcessMouseWheel(-wheel, 0);
+}
+
+void jce_rml_process_input(JceRmlBackend *b, const JceInput *input)
+{
+    if (!b || !b->context || !input) return;
+
+    jce_rml_process_pointer_input(b, input);
 
     /* Key presses for UI navigation. */
     struct KeyMap { JceKey jce; Rml::Input::KeyIdentifier rml; };
@@ -750,4 +891,5 @@ void jce_rml_resize(JceRmlBackend *b, uint32_t w, uint32_t h)
     b->width  = w;
     b->height = h;
     b->context->SetDimensions(Rml::Vector2i((int)w, (int)h));
+    b->context->SetDensityIndependentPixelRatio(compute_dp_ratio(h));
 }

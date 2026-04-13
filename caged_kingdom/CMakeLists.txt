@@ -81,12 +81,24 @@ target_include_directories(CagedKingdom PRIVATE
 	"${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 # When building a shared library for host JNI, we must force the linker to
-# include ALL symbols from the JCE static archive — otherwise unreferenced JNI
+# include ALL symbols from the JCE static archives — otherwise unreferenced JNI
 # entry points (Java_com_jce_JceRuntime_*) are silently discarded and Java gets
 # UnsatisfiedLinkError at runtime.
 # Android does NOT need WHOLE_ARCHIVE: SDL callbacks are referenced via main.c.
 if(JCE_BUILD_JNI)
-	target_link_libraries(CagedKingdom PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,JCE>)
+	target_link_libraries(CagedKingdom PRIVATE
+		$<LINK_LIBRARY:WHOLE_ARCHIVE,jce_app>
+		$<LINK_LIBRARY:WHOLE_ARCHIVE,jce_core>
+		$<LINK_LIBRARY:WHOLE_ARCHIVE,jce_platform>
+		$<LINK_LIBRARY:WHOLE_ARCHIVE,jce_graphics>
+		$<LINK_LIBRARY:WHOLE_ARCHIVE,jce_audio>
+		$<LINK_LIBRARY:WHOLE_ARCHIVE,jce_physics>
+		$<LINK_LIBRARY:WHOLE_ARCHIVE,jce_animation>
+		$<LINK_LIBRARY:WHOLE_ARCHIVE,jce_ai>
+		$<LINK_LIBRARY:WHOLE_ARCHIVE,jce_net>
+		$<LINK_LIBRARY:WHOLE_ARCHIVE,jce_scene>
+		$<LINK_LIBRARY:WHOLE_ARCHIVE,jce_ui>
+		$<LINK_LIBRARY:WHOLE_ARCHIVE,jce_resource>)
 else()
 	target_link_libraries(CagedKingdom PRIVATE JCE)
 endif()
@@ -126,6 +138,7 @@ document.addEventListener('click',function r(){
 		-sFULL_ES3=1
 		-sSTACK_SIZE=1048576
 		-sMALLOC=emmalloc
+		-sASSERTIONS=1
 		"SHELL:--shell-file ${_SHELL}")
 endif()
 

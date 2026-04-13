@@ -39,6 +39,20 @@ static const struct { const char *key; JceStringId id; } s_key_map[] = {
     { "quit",          JCE_STR_QUIT },
     { "controls_hint", JCE_STR_CONTROLS_HINT },
     { "text_demo",     JCE_STR_TEXT_DEMO },
+    { "settings",      JCE_STR_SETTINGS },
+    { "video",         JCE_STR_VIDEO },
+    { "audio",         JCE_STR_AUDIO },
+    { "fullscreen",    JCE_STR_FULLSCREEN },
+    { "resolution",    JCE_STR_RESOLUTION },
+    { "vsync",         JCE_STR_VSYNC },
+    { "master_volume", JCE_STR_MASTER_VOLUME },
+    { "music_volume",  JCE_STR_MUSIC_VOLUME },
+    { "sfx_volume",    JCE_STR_SFX_VOLUME },
+    { "ok",            JCE_STR_OK },
+    { "cancel",        JCE_STR_CANCEL },
+    { "apply",         JCE_STR_APPLY },
+    { "on",            JCE_STR_ON },
+    { "off",           JCE_STR_OFF },
 };
 #define KEY_MAP_COUNT ((int)(sizeof(s_key_map) / sizeof(s_key_map[0])))
 

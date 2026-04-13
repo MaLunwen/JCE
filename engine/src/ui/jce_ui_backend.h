@@ -47,6 +47,21 @@ void           jce_rml_elem_set_text(JceRmlBackend *b, uint32_t elem_idx,
 const char    *jce_rml_elem_get_text(JceRmlBackend *b, uint32_t elem_idx);
 void           jce_rml_elem_set_property(JceRmlBackend *b, uint32_t elem_idx,
                                          const char *prop, const char *val);
+const char    *jce_rml_elem_get_value(JceRmlBackend *b, uint32_t elem_idx);
+void           jce_rml_elem_set_value(JceRmlBackend *b, uint32_t elem_idx,
+                                      const char *value);
+const char    *jce_rml_elem_get_attribute(JceRmlBackend *b, uint32_t elem_idx,
+                                          const char *attr);
+void           jce_rml_elem_set_attribute(JceRmlBackend *b, uint32_t elem_idx,
+                                          const char *attr, const char *val);
+void           jce_rml_elem_remove_attribute(JceRmlBackend *b, uint32_t elem_idx,
+                                             const char *attr);
+void           jce_rml_elem_set_inner_rml(JceRmlBackend *b, uint32_t elem_idx,
+                                          const char *rml);
+bool           jce_rml_elem_get_bounds(JceRmlBackend *b, uint32_t elem_idx,
+                                       float *x, float *y,
+                                       float *w, float *h);
+uint32_t       jce_rml_doc_get_body(JceRmlBackend *b, uint32_t doc_idx);
 
 /* ── Events ───────────────────────────────────────────────────────────── */
 
@@ -62,6 +77,8 @@ bool           jce_rml_load_font(JceRmlBackend *b, const char *pak_path);
 
 /* ── Per-frame ────────────────────────────────────────────────────────── */
 
+void           jce_rml_process_pointer_input(JceRmlBackend *b,
+                                             const JceInput *input);
 void           jce_rml_process_input(JceRmlBackend *b, const JceInput *input);
 void           jce_rml_update(JceRmlBackend *b, float dt);
 void           jce_rml_render(JceRmlBackend *b);

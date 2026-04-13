@@ -41,7 +41,8 @@ void jce_draw_filled_rect(const JceRenderer *r,
 
     bgfx_set_transient_vertex_buffer(0, &tvb, 0, 4);
     bgfx_set_transient_index_buffer(&tib, 0, 6);
-    bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A, 0);
+    bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                 | BGFX_STATE_BLEND_ALPHA, 0);
     bgfx_submit(JCE_VIEW_UI, prog, 0, BGFX_DISCARD_ALL);
 }
 
@@ -74,6 +75,7 @@ void jce_draw_rect_outline(const JceRenderer *r,
     bgfx_set_transient_vertex_buffer(0, &tvb, 0, 4);
     bgfx_set_transient_index_buffer(&tib, 0, 8);
     bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                 | BGFX_STATE_BLEND_ALPHA
                  | BGFX_STATE_PT_LINES, 0);
     bgfx_submit(JCE_VIEW_UI, prog, 0, BGFX_DISCARD_ALL);
 }
@@ -96,6 +98,49 @@ void jce_draw_rect_outlines(const JceRenderer *r,
         jce_draw_rect_outline(r,
             rects[i*4+0], rects[i*4+1],
             rects[i*4+2], rects[i*4+3], color);
+}
+
+void jce_draw_polyline(const JceRenderer *r,
+                       const float *points_xy, int point_count,
+                       uint32_t color)
+{
+    const bgfx_vertex_layout_t *layout = jce_renderer_get_layout(r);
+    bgfx_program_handle_t prog = jce_renderer_get_program(r);
+    if (!layout || !points_xy || point_count < 2)
+        return;
+
+    const uint32_t vertex_count = (uint32_t)(point_count - 1) * 2u;
+    bgfx_transient_vertex_buffer_t tvb;
+    bgfx_transient_index_buffer_t tib;
+
+    if (!bgfx_alloc_transient_buffers(&tvb, layout, vertex_count,
+                                      &tib, vertex_count, false))
+        return;
+
+    PosColorVertex *v = (PosColorVertex *)tvb.data;
+    for (int i = 0; i < point_count - 1; ++i) {
+        const int src = i * 2;
+        const int dst = i * 2;
+        v[dst + 0] = (PosColorVertex){
+            points_xy[src + 0], points_xy[src + 1], 0.0f, color
+        };
+        v[dst + 1] = (PosColorVertex){
+            points_xy[src + 2], points_xy[src + 3], 0.0f, color
+        };
+    }
+
+    {
+        uint16_t *idx = (uint16_t *)tib.data;
+        for (uint32_t i = 0; i < vertex_count; ++i)
+            idx[i] = (uint16_t)i;
+    }
+
+    bgfx_set_transient_vertex_buffer(0, &tvb, 0, vertex_count);
+    bgfx_set_transient_index_buffer(&tib, 0, vertex_count);
+    bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                 | BGFX_STATE_BLEND_ALPHA
+                 | BGFX_STATE_PT_LINES, 0);
+    bgfx_submit(JCE_VIEW_UI, prog, 0, BGFX_DISCARD_ALL);
 }
 
 void jce_draw_textured_rect(const JceRenderer *r,

@@ -70,6 +70,9 @@ void        jce_window_set_icon(JceWindow *win,
 /* Toggle between fullscreen and windowed mode. */
 void        jce_window_toggle_fullscreen(JceWindow *win);
 
+/* Query whether the window is currently fullscreen. */
+bool        jce_window_is_fullscreen(const JceWindow *win);
+
 /* Enable/disable relative (captured) mouse mode for FPS-style controls. */
 void        jce_window_set_relative_mouse_mode(JceWindow *win, bool enabled);
 

@@ -424,6 +424,9 @@ JceAppResult jce_engine_event(JceEngine *e, const void *platform_event)
         SDL_GetWindowSizeInPixels(jce_window_sdl(e->window), &pw, &ph);
         jce_window_handle_resize(e->window, (uint32_t)pw, (uint32_t)ph);
         jce_renderer_resize(e->renderer, (uint32_t)pw, (uint32_t)ph);
+        if (g_app_desc.on_resize)
+            g_app_desc.on_resize((uint32_t)pw, (uint32_t)ph,
+                                 g_app_desc.user_data);
 
         /* On Windows, SDL3 runs a modal loop during window resize (WM_SIZING)
          * so SDL_AppIterate is never called.  Emit a minimal render frame here

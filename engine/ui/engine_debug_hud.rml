@@ -1,0 +1,138 @@
+<rml>
+<head><title>Debug HUD</title><style>
+body {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    font-family: "FOT-MatisseElegantoPro-EB";
+    font-size: 16dp;
+    color: #f4f1eb;
+}
+
+#hud-panel {
+    position: absolute;
+    left: 12dp;
+    top: 12dp;
+    width: 444dp;
+    padding: 12dp 16dp 12dp 16dp;
+    background-color: #050505b8;
+    border-radius: 12dp;
+}
+
+.stat-row {
+    width: 100%;
+    padding: 1dp 0 2dp 0;
+}
+
+.label {
+    display: inline-block;
+    width: 80dp;
+    font-size: 24dp;
+    letter-spacing: 0.4dp;
+}
+
+.value {
+    display: inline-block;
+    width: 332dp;
+    font-size: 24dp;
+    color: #f6f5f1;
+}
+
+.detail {
+    width: 100%;
+    padding: 0 0 8dp 80dp;
+    font-size: 14dp;
+    color: #e06e60;
+}
+
+.gpu  { color: #47c76a; }
+.cpu  { color: #4da8f0; }
+.vram { color: #9f74ff; }
+.ram  { color: #d46ab8; }
+.api  { color: #ff7565; }
+
+#perf-row {
+    width: 100%;
+    margin-top: 8dp;
+}
+
+#fps {
+    display: inline-block;
+    width: 182dp;
+    font-size: 24dp;
+    color: #f6f5f1;
+}
+
+#frametime {
+    display: inline-block;
+    width: 210dp;
+    font-size: 24dp;
+    text-align: right;
+    color: #f6f5f1;
+}
+
+#frametime-row {
+    width: 100%;
+    margin-top: 10dp;
+}
+
+#frametime-label {
+    display: inline-block;
+    width: 182dp;
+    font-size: 18dp;
+    color: #ff7565;
+}
+
+#frametime-ms {
+    display: inline-block;
+    width: 210dp;
+    font-size: 18dp;
+    text-align: right;
+    color: #f6f5f1;
+}
+
+#frametime-graph {
+    display: block;
+    width: 412dp;
+    height: 80dp;
+    margin-top: 4dp;
+    background-color: #0a0c0fdd;
+    border-width: 1dp;
+    border-color: #ffffff18;
+    border-radius: 4dp;
+}
+
+#extra-status {
+    width: 100%;
+    margin-top: 8dp;
+    font-size: 14dp;
+    color: #f0c542;
+}
+
+#shortcut-hints {
+    position: absolute;
+    left: 12dp;
+    bottom: 12dp;
+    font-size: 14dp;
+    color: #cfc8ba;
+    background-color: #05050588;
+    padding: 6dp 10dp;
+    border-radius: 8dp;
+}
+</style></head>
+<body>
+<div id="hud-panel">
+  <div class="stat-row"><span class="label gpu">GPU</span><span id="gpu-value" class="value">&mdash;</span></div>
+  <div class="stat-row"><span class="label cpu">CPU</span><span id="cpu-value" class="value">&mdash;</span></div>
+  <div class="stat-row"><span class="label vram">VRAM</span><span id="vram-value" class="value">&mdash;</span></div>
+  <div class="stat-row"><span class="label ram">RAM</span><span id="ram-value" class="value">&mdash;</span></div>
+  <div class="stat-row"><span class="label api">API</span><span id="api-value" class="value">&mdash;</span></div>
+  <div id="api-detail" class="detail">&mdash;</div>
+  <div id="perf-row"><span id="fps">&mdash;</span><span id="frametime">&mdash;</span></div>
+  <div id="frametime-row"><span id="frametime-label">Frametime</span><span id="frametime-ms">&mdash;</span></div>
+  <div id="frametime-graph"></div>
+  <div id="extra-status"></div>
+</div>
+<div id="shortcut-hints"></div>
+</body>
+</rml>

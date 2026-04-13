@@ -53,13 +53,13 @@ typedef struct JpakTocEntry {
 
 #pragma pack(pop)
 
-/* -- Compile-time assertions ---------------------------------------- */
+/* -- Compile-time assertions (C99-portable, works on MSVC/Clang/GCC) ------- */
 
 #define JPAK_HEADER_SIZE    32u
 #define JPAK_TOC_ENTRY_SIZE 40u
 
-static_assert(sizeof(JpakHeader)   == JPAK_HEADER_SIZE,    "JpakHeader size mismatch");
-static_assert(sizeof(JpakTocEntry) == JPAK_TOC_ENTRY_SIZE, "JpakTocEntry size mismatch");
+typedef char jpak_sa_header_size    [(sizeof(JpakHeader)   == JPAK_HEADER_SIZE)    ? 1 : -1];
+typedef char jpak_sa_toc_entry_size [(sizeof(JpakTocEntry) == JPAK_TOC_ENTRY_SIZE) ? 1 : -1];
 
 /* -- Little-endian read helpers (endian-safe) ----------------------- */
 

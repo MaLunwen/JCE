@@ -83,6 +83,9 @@ void         jce_renderer_dbg_text(uint16_t x, uint16_t y,
 const char  *jce_renderer_get_backend_name(const JceRenderer *r);
 const char  *jce_renderer_get_gpu_name(const JceRenderer *r);
 bool         jce_renderer_get_vsync(const JceRenderer *r);
+void         jce_renderer_set_vsync(JceRenderer *r, bool enabled);
+void         jce_renderer_set_vsync_for_size(JceRenderer *r, bool enabled,
+                                             uint32_t width, uint32_t height);
 
 /* -- Shader/uniform accessors (for 3D scene rendering) ------------- */
 

@@ -1,0 +1,15 @@
+<rml>
+<head>
+    <link type="text/rcss" href="ck_base.rcss"/>
+</head>
+<body>
+    <div class="overlay-bg">
+        <div id="pause-panel">
+            <p id="pause-title" class="title">PAUSED</p>
+            <p id="btn-continue" class="menu-item selected">Continue</p>
+            <p id="btn-quit" class="menu-item gray">Quit</p>
+            <p id="hint" class="subtitle gray">Arrow keys to navigate, Enter to select</p>
+        </div>
+    </div>
+</body>
+</rml>

@@ -144,6 +144,64 @@ void jce_ui_elem_set_property(JceUIContext *ctx, JceUIElementHandle elem,
     jce_rml_elem_set_property(ctx->backend, elem.idx, property, value);
 }
 
+const char *jce_ui_elem_get_value(JceUIContext *ctx, JceUIElementHandle elem)
+{
+    if (!ctx || !jce_ui_elem_valid(elem)) return "";
+    return jce_rml_elem_get_value(ctx->backend, elem.idx);
+}
+
+void jce_ui_elem_set_value(JceUIContext *ctx, JceUIElementHandle elem,
+                           const char *value)
+{
+    if (!ctx || !jce_ui_elem_valid(elem) || !value) return;
+    jce_rml_elem_set_value(ctx->backend, elem.idx, value);
+}
+
+const char *jce_ui_elem_get_attribute(JceUIContext *ctx, JceUIElementHandle elem,
+                                      const char *attribute)
+{
+    if (!ctx || !jce_ui_elem_valid(elem) || !attribute) return "";
+    return jce_rml_elem_get_attribute(ctx->backend, elem.idx, attribute);
+}
+
+void jce_ui_elem_set_attribute(JceUIContext *ctx, JceUIElementHandle elem,
+                               const char *attribute, const char *value)
+{
+    if (!ctx || !jce_ui_elem_valid(elem) || !attribute) return;
+    jce_rml_elem_set_attribute(ctx->backend, elem.idx, attribute, value);
+}
+
+void jce_ui_elem_remove_attribute(JceUIContext *ctx, JceUIElementHandle elem,
+                                  const char *attribute)
+{
+    if (!ctx || !jce_ui_elem_valid(elem) || !attribute) return;
+    jce_rml_elem_remove_attribute(ctx->backend, elem.idx, attribute);
+}
+
+void jce_ui_elem_set_inner_rml(JceUIContext *ctx, JceUIElementHandle elem,
+                               const char *rml)
+{
+    if (!ctx || !jce_ui_elem_valid(elem) || !rml) return;
+    jce_rml_elem_set_inner_rml(ctx->backend, elem.idx, rml);
+}
+
+bool jce_ui_elem_get_bounds(JceUIContext *ctx, JceUIElementHandle elem,
+                            JceUIRect *out_rect)
+{
+    if (!ctx || !jce_ui_elem_valid(elem) || !out_rect) return false;
+    return jce_rml_elem_get_bounds(ctx->backend, elem.idx,
+                                   &out_rect->x, &out_rect->y,
+                                   &out_rect->w, &out_rect->h);
+}
+
+JceUIElementHandle jce_ui_doc_get_body(JceUIContext *ctx, JceUIDocHandle doc)
+{
+    if (!ctx || !jce_ui_doc_valid(doc)) return JCE_UI_ELEM_INVALID;
+    uint32_t idx = jce_rml_doc_get_body(ctx->backend, doc.idx);
+    if (idx == UINT32_MAX) return JCE_UI_ELEM_INVALID;
+    return (JceUIElementHandle){ idx };
+}
+
 /* ── Event callbacks ───────────────────────────────────────────────── */
 
 typedef struct {
@@ -186,6 +244,12 @@ void jce_ui_process_input(JceUIContext *ctx, const JceInput *input)
 {
     if (!ctx) return;
     jce_rml_process_input(ctx->backend, input);
+}
+
+void jce_ui_process_pointer_input(JceUIContext *ctx, const JceInput *input)
+{
+    if (!ctx) return;
+    jce_rml_process_pointer_input(ctx->backend, input);
 }
 
 void jce_ui_update(JceUIContext *ctx, float dt)

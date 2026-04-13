@@ -8,6 +8,8 @@
 #define JCE_API_UI_H
 
 #include <jce/ui/jce_ui.h>
+#include <jce/ui/jce_ui_debug_hud.h>
+#include <jce/ui/jce_ui_settings.h>
 #include <jce/ui/jce_touch_hud.h>
 
 #endif /* JCE_API_UI_H */

@@ -225,9 +225,13 @@ JceRenderer *jce_renderer_create(JceWindow *win,
         cfg->clear_color, 1.0f, 0);
     bgfx_set_view_rect(JCE_VIEW_MAIN_3D, 0, 0, (uint16_t)w, (uint16_t)h);
 
-    /* View 1 (UI): no clear  draws on top of 3D. */
+    /* View 1 (UI): no clear  draws on top of 3D.
+       Sequential mode = painter's algorithm (submission order).
+       RmlUi already submits back-to-front; post-render primitives
+       (polyline graph, etc.) appear on top of the UI panels. */
     bgfx_set_view_clear(JCE_VIEW_UI, BGFX_CLEAR_NONE, 0, 1.0f, 0);
     bgfx_set_view_rect(JCE_VIEW_UI, 0, 0, (uint16_t)w, (uint16_t)h);
+    bgfx_set_view_mode(JCE_VIEW_UI, BGFX_VIEW_MODE_SEQUENTIAL);
 
     /* View 2 (debug): no clear  debug text overlay. */
     bgfx_set_view_clear(JCE_VIEW_DEBUG, BGFX_CLEAR_NONE, 0, 1.0f, 0);
@@ -558,9 +562,9 @@ void jce_renderer_begin_frame(const JceRenderer *r, JceWindow *win)
     /* View 1 (UI): 2D orthographic in logical coordinates. */
     {
         jce_mat4 view = jce_m4_identity();
-        int lw, lh;
-        jce_window_get_logical(win, &lw, &lh);
-        jce_mat4 proj = jce_m4_ortho(0, (float)lw, (float)lh, 0,
+        uint32_t pw, ph;
+        jce_window_get_size(win, &pw, &ph);
+        jce_mat4 proj = jce_m4_ortho(0, (float)pw, (float)ph, 0,
                                       0, 100.0f, caps->homogeneousDepth);
         bgfx_set_view_transform(JCE_VIEW_UI, view.raw[0], proj.raw[0]);
         bgfx_set_view_rect(JCE_VIEW_UI, vp_x, vp_y, vp_w, vp_h);
@@ -788,6 +792,33 @@ const char *jce_renderer_get_gpu_name(const JceRenderer *r)
 bool jce_renderer_get_vsync(const JceRenderer *r)
 {
     return r ? (r->reset_flags & BGFX_RESET_VSYNC) != 0 : false;
+}
+
+void jce_renderer_set_vsync_for_size(JceRenderer *r, bool enabled,
+                                     uint32_t width, uint32_t height)
+{
+    if (!r || r->is_fallback) return;
+    bool current = (r->reset_flags & BGFX_RESET_VSYNC) != 0;
+    if (current == enabled) return;
+
+    if (enabled)
+        r->reset_flags |= BGFX_RESET_VSYNC;
+    else
+        r->reset_flags &= ~BGFX_RESET_VSYNC;
+
+    if (width == 0 || height == 0) {
+        const bgfx_stats_t *stats = bgfx_get_stats();
+        width = stats->width;
+        height = stats->height;
+    }
+
+    bgfx_reset(width, height, r->reset_flags, BGFX_TEXTURE_FORMAT_COUNT);
+}
+
+void jce_renderer_set_vsync(JceRenderer *r, bool enabled)
+{
+    const bgfx_stats_t *stats = bgfx_get_stats();
+    jce_renderer_set_vsync_for_size(r, enabled, stats->width, stats->height);
 }
 
 /* -- Transform / texture binding (game-layer wrappers) ------------- */

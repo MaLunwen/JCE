@@ -352,10 +352,16 @@ option(JCE_ENABLE_ASSET_COOKING "Pre-cook assets at build time (raw→.jceasset)
 set(ENGINE_RESOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/engine/resources/assets")
 set(GAME_RESOURCE_DIR   "${CMAKE_CURRENT_SOURCE_DIR}/caged_kingdom/resources/assets")
 set(EDITOR_RESOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/editor/resources/assets")
+set(GAME_ICON_FILE      "${CMAKE_CURRENT_SOURCE_DIR}/caged_kingdom/resources/CK_icon.png")
+set(GAME_ICON_STAGE_DIR "${CMAKE_CURRENT_BINARY_DIR}/_raw_game_icon")
+set(ENGINE_UI_DIR       "${CMAKE_CURRENT_SOURCE_DIR}/engine/ui")
+set(GAME_UI_DIR         "${CMAKE_CURRENT_SOURCE_DIR}/caged_kingdom/ui")
 
 file(GLOB_RECURSE ENGINE_ASSET_FILES CONFIGURE_DEPENDS "${ENGINE_RESOURCE_DIR}/*")
 file(GLOB_RECURSE GAME_ASSET_FILES   CONFIGURE_DEPENDS "${GAME_RESOURCE_DIR}/*")
 file(GLOB_RECURSE EDITOR_ASSET_FILES CONFIGURE_DEPENDS "${EDITOR_RESOURCE_DIR}/*")
+file(GLOB_RECURSE ENGINE_UI_FILES    CONFIGURE_DEPENDS "${ENGINE_UI_DIR}/*")
+file(GLOB_RECURSE GAME_UI_FILES      CONFIGURE_DEPENDS "${GAME_UI_DIR}/*")
 
 # ── Cook step: convert raw assets → .jceasset containers ──
 # When enabled, jce_cook pre-decodes textures (PNG→RGBA8) and audio
@@ -369,16 +375,28 @@ if(JCE_ENABLE_ASSET_COOKING AND NOT CMAKE_CROSSCOMPILING)
 
 	add_custom_command(
 		OUTPUT     "${COOK_GAME_STAMP}"
+		COMMAND    "${CMAKE_COMMAND}" -E rm -rf "${GAME_COOKED_DIR}"
+		COMMAND    "${CMAKE_COMMAND}" -E make_directory "${GAME_COOKED_DIR}"
 		COMMAND    $<TARGET_FILE:jce_cook>
 		           --batch "${ENGINE_RESOURCE_DIR}"  "${GAME_COOKED_DIR}"
 		           --preserve-names --level 0 --max-texture-size 2048
 		COMMAND    $<TARGET_FILE:jce_cook>
+		           --batch "${ENGINE_UI_DIR}"        "${GAME_COOKED_DIR}"
+		           --preserve-names --level 0 --max-texture-size 2048
+		COMMAND    $<TARGET_FILE:jce_cook>
 		           --batch "${GAME_RESOURCE_DIR}"    "${GAME_COOKED_DIR}"
 		           --preserve-names --level 0 --max-texture-size 2048
+		COMMAND    $<TARGET_FILE:jce_cook>
+		           --batch "${GAME_UI_DIR}"          "${GAME_COOKED_DIR}"
+		           --preserve-names --level 0 --max-texture-size 2048
+		COMMAND    "${CMAKE_COMMAND}" -E copy
+		           "${GAME_ICON_FILE}" "${GAME_COOKED_DIR}/CK_icon.png"
 		COMMAND    "${CMAKE_COMMAND}" -E touch "${COOK_GAME_STAMP}"
 		DEPENDS    jce_cook ${ENGINE_ASSET_FILES} ${GAME_ASSET_FILES}
+		           ${ENGINE_UI_FILES} ${GAME_UI_FILES}
 		           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES}
 		           ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES}
+		           "${GAME_ICON_FILE}"
 		COMMENT    "Cooking game assets (textures/audio → .jceasset)"
 		VERBATIM)
 
@@ -386,8 +404,13 @@ if(JCE_ENABLE_ASSET_COOKING AND NOT CMAKE_CROSSCOMPILING)
 
 	add_custom_command(
 		OUTPUT     "${COOK_EDITOR_STAMP}"
+		COMMAND    "${CMAKE_COMMAND}" -E rm -rf "${EDITOR_COOKED_DIR}"
+		COMMAND    "${CMAKE_COMMAND}" -E make_directory "${EDITOR_COOKED_DIR}"
 		COMMAND    $<TARGET_FILE:jce_cook>
 		           --batch "${ENGINE_RESOURCE_DIR}"  "${EDITOR_COOKED_DIR}"
+		           --preserve-names --level 0 --max-texture-size 2048
+		COMMAND    $<TARGET_FILE:jce_cook>
+		           --batch "${ENGINE_UI_DIR}"        "${EDITOR_COOKED_DIR}"
 		           --preserve-names --level 0 --max-texture-size 2048
 		COMMAND    $<TARGET_FILE:jce_cook>
 		           --batch "${EDITOR_RESOURCE_DIR}"  "${EDITOR_COOKED_DIR}"
@@ -396,6 +419,7 @@ if(JCE_ENABLE_ASSET_COOKING AND NOT CMAKE_CROSSCOMPILING)
 		           "${EDITOR_ICON_FILE}" "${EDITOR_COOKED_DIR}/JCE_icon.png"
 		COMMAND    "${CMAKE_COMMAND}" -E touch "${COOK_EDITOR_STAMP}"
 		DEPENDS    jce_cook ${ENGINE_ASSET_FILES} ${EDITOR_ASSET_FILES}
+		           ${ENGINE_UI_FILES}
 		           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES}
 		           ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES}
 		           "${EDITOR_ICON_FILE}"
@@ -416,10 +440,19 @@ else()
 	# No cooking — PAK reads raw resource dirs directly.
 	set(_GAME_PAK_RES_FLAGS
 		--resource-dir "${ENGINE_RESOURCE_DIR}"
-		--resource-dir "${GAME_RESOURCE_DIR}")
+		--resource-dir "${ENGINE_UI_DIR}"
+		--resource-dir "${GAME_RESOURCE_DIR}"
+		--resource-dir "${GAME_UI_DIR}"
+		--resource-dir "${GAME_ICON_STAGE_DIR}")
 	set(_EDITOR_PAK_RES_FLAGS
 		--resource-dir "${ENGINE_RESOURCE_DIR}"
+		--resource-dir "${ENGINE_UI_DIR}"
 		--resource-dir "${EDITOR_RESOURCE_DIR}")
+	set(_GAME_PAK_PREP_COMMANDS
+		COMMAND    "${CMAKE_COMMAND}" -E rm -rf "${GAME_ICON_STAGE_DIR}"
+		COMMAND    "${CMAKE_COMMAND}" -E make_directory "${GAME_ICON_STAGE_DIR}"
+		COMMAND    "${CMAKE_COMMAND}" -E copy
+		           "${GAME_ICON_FILE}" "${GAME_ICON_STAGE_DIR}/CK_icon.png")
 	set(_COOK_GAME_DEP   "")
 	set(_COOK_EDITOR_DEP "")
 endif()
@@ -464,6 +497,7 @@ endif()
 add_custom_command(
 	OUTPUT     "${GAME_STAMP_FILE}"
 	BYPRODUCTS "${GAME_PAK_FILE}" "${GAME_PAK_OBJ_FILE}" "${GAME_PAK_C_ARRAY}" "${GAME_HEADER_FILE}" "${GAME_MANIFEST_FILE}"
+	${_GAME_PAK_PREP_COMMANDS}
 	COMMAND    $<TARGET_FILE:jce_pak>
 	           ${_GAME_PAK_RES_FLAGS}
 	           --pak-file      "${GAME_PAK_FILE}"
@@ -472,6 +506,8 @@ add_custom_command(
 	           ${_GAME_OBJ_FLAGS}
 	COMMAND    "${CMAKE_COMMAND}" -E touch "${GAME_STAMP_FILE}"
 	DEPENDS    jce_pak ${ENGINE_ASSET_FILES} ${GAME_ASSET_FILES}
+	           ${ENGINE_UI_FILES} ${GAME_UI_FILES}
+	           "${GAME_ICON_FILE}"
 	           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES} ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES}
 	COMMENT    "Packing game assets -> ${GAME_PAK_FILE}"
 	VERBATIM)
@@ -514,6 +550,7 @@ add_custom_command(
 	           ${_EDITOR_OBJ_FLAGS}
 	COMMAND    "${CMAKE_COMMAND}" -E touch "${EDITOR_STAMP_FILE}"
 	DEPENDS    jce_pak ${ENGINE_ASSET_FILES} ${EDITOR_ASSET_FILES}
+	           ${ENGINE_UI_FILES}
 	           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES} ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES}
 	COMMENT    "Packing editor assets -> ${EDITOR_PAK_FILE}"
 	VERBATIM)
@@ -541,7 +578,7 @@ add_subdirectory(caged_kingdom)
 
 # ── Dist mode: suppress all logging ──
 if(JCE_BUILD_VARIANT STREQUAL "dist")
-	target_compile_definitions(JCE PUBLIC JCE_DIST=1)
+	target_compile_definitions(jce_core PUBLIC JCE_DIST=1)
 endif()
 
 # ------------------------------------------------------------------ #

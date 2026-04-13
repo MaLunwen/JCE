@@ -85,6 +85,13 @@ typedef struct { uint32_t idx; } JceUIElementHandle;
 
 static inline bool jce_ui_elem_valid(JceUIElementHandle h) { return h.idx != UINT32_MAX; }
 
+typedef struct JceUIRect {
+   float x;
+   float y;
+   float w;
+   float h;
+} JceUIRect;
+
 /* Find an element by ID within a document. */
 JceUIElementHandle jce_ui_find_element(JceUIContext *ctx, JceUIDocHandle doc,
                                       const char *element_id);
@@ -97,6 +104,37 @@ const char *jce_ui_elem_get_text(JceUIContext *ctx, JceUIElementHandle elem);
 /* Set a CSS property on an element. */
 void jce_ui_elem_set_property(JceUIContext *ctx, JceUIElementHandle elem,
                               const char *property, const char *value);
+
+/* Get / set the current value of a form control (select, range, text, etc.).
+   Returns "" when the element is not a form control or has no value. */
+const char *jce_ui_elem_get_value(JceUIContext *ctx, JceUIElementHandle elem);
+void jce_ui_elem_set_value(JceUIContext *ctx, JceUIElementHandle elem,
+                           const char *value);
+
+/* Get an HTML attribute from an element (e.g. "value", "checked").
+   Returns "" if the attribute doesn't exist. The returned pointer
+   is valid until the next call to jce_ui_elem_get_attribute. */
+const char *jce_ui_elem_get_attribute(JceUIContext *ctx, JceUIElementHandle elem,
+                                      const char *attribute);
+
+/* Set an HTML attribute on an element. */
+void jce_ui_elem_set_attribute(JceUIContext *ctx, JceUIElementHandle elem,
+                               const char *attribute, const char *value);
+
+/* Remove an HTML attribute from an element. */
+void jce_ui_elem_remove_attribute(JceUIContext *ctx, JceUIElementHandle elem,
+                                  const char *attribute);
+
+/* Replace the inner content of an element with the given RML markup. */
+void jce_ui_elem_set_inner_rml(JceUIContext *ctx, JceUIElementHandle elem,
+                               const char *rml);
+
+/* Query the final laid-out bounds of an element in UI pixel space. */
+bool jce_ui_elem_get_bounds(JceUIContext *ctx, JceUIElementHandle elem,
+                            JceUIRect *out_rect);
+
+/* Get a handle to the document's body (root) element. */
+JceUIElementHandle jce_ui_doc_get_body(JceUIContext *ctx, JceUIDocHandle doc);
 
 /* ================================================================== */
 /* Event callbacks                                                     */
@@ -114,6 +152,10 @@ void jce_ui_elem_on(JceUIContext *ctx, JceUIElementHandle elem,
 
 /* Route input events to the UI.  Call before jce_ui_update(). */
 void jce_ui_process_input(JceUIContext *ctx, const JceInput *input);
+
+/* Route mouse/pointer input only. Use when keyboard navigation is handled
+   explicitly by the game or panel logic. */
+void jce_ui_process_pointer_input(JceUIContext *ctx, const JceInput *input);
 
 /* Update document layout and animations. */
 void jce_ui_update(JceUIContext *ctx, float dt);

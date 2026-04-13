@@ -1,0 +1,404 @@
+<rml>
+<head><title>Settings</title><style>
+body {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    font-family: "JCE";
+    font-size: 18dp;
+    color: #eef3f7;
+}
+
+/* ── Overlay + Box ─────────────────────────────────────────────── */
+
+#settings-overlay {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    width: 100%;
+    height: 100%;
+    background-color: #081019c8;
+}
+
+#settings-box {
+    display: flex;
+    flex-direction: column;
+    width: 56%;
+    min-width: 380dp;
+    max-width: 720dp;
+    max-height: 86%;
+    background-color: #1b2a39f2;
+    border-width: 2dp;
+    border-color: #6c7f90;
+    border-radius: 8dp;
+}
+
+/* ── Header ────────────────────────────────────────────────────── */
+
+#settings-header {
+    flex-shrink: 0;
+    padding: 18dp 24dp 0 24dp;
+}
+
+#settings-title {
+    margin: 0 0 12dp 0;
+    font-size: 28dp;
+    color: #f2f5f7;
+}
+
+.tab-bar {
+    display: flex;
+    flex-direction: row;
+    padding-bottom: 8dp;
+    border-bottom-width: 2dp;
+    border-color: #dfe6eb;
+}
+
+.tab-btn {
+    padding: 10dp 24dp 12dp 24dp;
+    margin-right: 8dp;
+    text-align: center;
+    font-size: 20dp;
+    color: #ffffff;
+    background-color: #3a4959;
+    border-width: 2dp 2dp 0 2dp;
+    border-color: #607385;
+    border-top-left-radius: 4dp;
+    border-top-right-radius: 4dp;
+    cursor: pointer;
+}
+
+/* ── Content area (scrollable) ─────────────────────────────────── */
+
+#settings-content {
+    flex-grow: 1;
+    flex-shrink: 1;
+    overflow: auto;
+    padding: 16dp 24dp 10dp 24dp;
+}
+
+/* Scrollbar styling */
+#settings-content scrollbarvertical {
+    width: 10dp;
+    margin-left: 4dp;
+}
+
+#settings-content scrollbarvertical slidertrack {
+    background-color: #14202e;
+    border-radius: 4dp;
+}
+
+#settings-content scrollbarvertical sliderbar {
+    width: 10dp;
+    min-height: 28dp;
+    background-color: #3e5872;
+    border-radius: 4dp;
+}
+
+#settings-content scrollbarvertical sliderbar:hover {
+    background-color: #5a7e9e;
+}
+
+#settings-content scrollbarvertical sliderarrowdec,
+#settings-content scrollbarvertical sliderarrowinc {
+    width: 0;
+    height: 0;
+}
+
+.tab-content {
+    display: none;
+    width: 100%;
+}
+
+.tab-content-visible {
+    display: block;
+}
+
+/* ── Sections ──────────────────────────────────────────────────── */
+
+.section {
+    width: 100%;
+    margin-bottom: 20dp;
+}
+
+.section-title {
+    text-align: center;
+    font-size: 22dp;
+    color: #f0c84c;
+    margin-bottom: 6dp;
+}
+
+.section-rule {
+    width: 70%;
+    height: 1dp;
+    margin: 0 auto 12dp auto;
+    background-color: #8995a155;
+}
+
+/* ── Setting rows (flex) ───────────────────────────────────────── */
+
+.setting-row {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    width: 100%;
+    padding: 10dp 0;
+    border-bottom-width: 1dp;
+    border-color: #ffffff10;
+}
+
+.setting-label {
+    flex-shrink: 0;
+    width: 40%;
+    padding-right: 12dp;
+    text-align: right;
+    font-size: 18dp;
+    color: #d9e0e6;
+}
+
+.setting-control {
+    flex-grow: 1;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+}
+
+/* ── Select dropdown ───────────────────────────────────────────── */
+
+select {
+    width: 52%;
+    min-width: 140dp;
+    height: 34dp;
+    background-color: #516171;
+    color: #f2f5f7;
+    border-width: 2dp;
+    border-color: #2d557f;
+    border-radius: 3dp;
+}
+
+select selectvalue {
+    width: auto;
+    margin-right: 26dp;
+    padding: 5dp 12dp;
+    font-size: 18dp;
+    color: #f2f5f7;
+}
+
+select selectarrow {
+    width: 34dp;
+    background-color: #1f4f82;
+}
+
+select selectbox {
+    background-color: #2b3644;
+    border-width: 2dp;
+    border-color: #2d557f;
+    padding: 2dp;
+}
+
+select selectbox option {
+    width: auto;
+    padding: 6dp 10dp;
+    font-size: 18dp;
+    color: #e6edf3;
+}
+
+select selectbox option:hover {
+    background-color: #3e5872;
+}
+
+/* ── Range slider ──────────────────────────────────────────────── */
+
+input.range {
+    width: 52%;
+    min-width: 140dp;
+    height: 26dp;
+}
+
+input.range slidertrack {
+    height: 8dp;
+    margin-top: 9dp;
+    background-color: #173252;
+    border-radius: 3dp;
+}
+
+input.range sliderprogress {
+    background-color: #4c83b9;
+    border-radius: 3dp;
+}
+
+input.range sliderbar {
+    width: 14dp;
+    height: 22dp;
+    margin-top: -7dp;
+    background-color: #4c83b9;
+    border-radius: 2dp;
+}
+
+input.range sliderbar:hover {
+    background-color: #6fa6dd;
+}
+
+input.range sliderarrowdec,
+input.range sliderarrowinc {
+    width: 0;
+    height: 0;
+}
+
+/* ── Checkbox ──────────────────────────────────────────────────── */
+
+input.checkbox {
+    width: 22dp;
+    height: 22dp;
+    background-color: #3d5674;
+    border-width: 2dp;
+    border-color: #173252;
+    border-radius: 2dp;
+}
+
+input.checkbox:checked {
+    background-color: #4c83b9;
+    border-color: #173252;
+}
+
+/* ── Value text ────────────────────────────────────────────────── */
+
+.setting-value-text {
+    font-size: 18dp;
+    color: #f1f4f7;
+}
+
+/* ── Footer ────────────────────────────────────────────────────── */
+
+#settings-footer {
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    padding: 12dp 24dp 16dp 24dp;
+    border-top-width: 1dp;
+    border-color: #ffffff10;
+}
+
+#settings-hint {
+    flex-grow: 1;
+    margin: 0;
+    font-size: 14dp;
+    color: #b9c5cf;
+}
+
+.button-row {
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+}
+
+.btn {
+    padding: 10dp 22dp;
+    margin-left: 10dp;
+    text-align: center;
+    font-size: 18dp;
+    color: #edf3f8;
+    background-color: #49627f;
+    border-width: 2dp;
+    border-color: #203851;
+    border-radius: 3dp;
+    cursor: pointer;
+}
+
+.btn:hover {
+    background-color: #5d7a99;
+}
+
+.btn-primary {
+    background-color: #5f89b2;
+    border-color: #203851;
+}
+
+.btn-danger {
+    background-color: #8b473f;
+    border-color: #4d201b;
+}
+</style></head>
+<body>
+<div id="settings-overlay">
+  <div id="settings-box">
+
+    <div id="settings-header">
+      <p id="settings-title">Settings</p>
+      <div class="tab-bar" id="engine-tab-bar">
+        <span class="tab-btn" id="tab-video">Video</span>
+        <span class="tab-btn" id="tab-audio">Audio</span>
+      </div>
+    </div>
+
+    <div id="settings-content">
+      <div class="tab-content tab-content-visible" id="panel-video">
+        <div class="section">
+          <p class="section-title">Display</p>
+          <div class="section-rule"></div>
+
+          <div class="setting-row">
+            <div class="setting-label" id="lbl-fullscreen">Fullscreen</div>
+            <div class="setting-control">
+              <select id="sel-fullscreen">
+                <option value="off">OFF</option>
+                <option value="on">ON</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-label" id="lbl-resolution">Resolution</div>
+            <div class="setting-control">
+              <span class="setting-value-text" id="txt-resolution">1920x1080</span>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-label" id="lbl-vsync">VSync</div>
+            <div class="setting-control">
+              <input type="checkbox" id="chk-vsync"/>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="tab-content" id="panel-audio">
+        <div class="section">
+          <p class="section-title">Mix</p>
+          <div class="section-rule"></div>
+
+          <div class="setting-row">
+            <div class="setting-label" id="lbl-master-vol">Master Volume</div>
+            <div class="setting-control">
+              <input type="range" id="rng-master" min="0" max="100" step="1" value="80"/>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-label" id="lbl-music-vol">Music Volume</div>
+            <div class="setting-control">
+              <input type="range" id="rng-music" min="0" max="100" step="1" value="80"/>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="settings-footer">
+      <p id="settings-hint">Arrow keys move, Left/Right adjust, Enter confirms.</p>
+      <div class="button-row">
+        <span class="btn btn-primary" id="btn-ok">OK</span>
+        <span class="btn" id="btn-cancel">Cancel</span>
+        <span class="btn" id="btn-apply">Apply</span>
+        <span class="btn btn-danger" id="btn-quit">Quit</span>
+      </div>
+    </div>
+
+  </div>
+</div>
+</body>
+</rml>
