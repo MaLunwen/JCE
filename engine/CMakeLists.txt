@@ -74,11 +74,16 @@ target_link_libraries(JCE PRIVATE
 	cjson::cjson
 	box2d::box2d
 	Bullet::Bullet
-	enet::enet
 	protobuf::protobuf
 	BT::behaviortree_cpp
 	rmlui::rmlui
 	ozz-animation::ozz-animation)
+
+# ENet: only linked on non-WASM platforms; on Emscripten the WebSocket
+# backend (jce_net_web.c) replaces ENet and needs no additional library.
+if(NOT JCE_PLATFORM_WEB)
+	target_link_libraries(JCE PRIVATE enet::enet)
+endif()
 
 # Tracy: true compile-time gate.
 # When OFF, we do not link Tracy at all, and headers compile to no-ops.
