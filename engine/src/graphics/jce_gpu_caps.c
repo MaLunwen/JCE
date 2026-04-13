@@ -45,14 +45,6 @@ void jce_gpu_caps_init(JceGpuCaps *caps)
     caps->supports_texture_2d_array = (bc->supported & BGFX_CAPS_TEXTURE_2D_ARRAY)   != 0;
     caps->supports_texture_cube_array = (bc->supported & BGFX_CAPS_TEXTURE_CUBE_ARRAY) != 0;
 
-    /* Texture compression formats. */
-    caps->supports_texture_bc   = (bc->formats[BGFX_TEXTURE_FORMAT_BC1]
-                                    & BGFX_CAPS_FORMAT_TEXTURE_2D) != 0;
-    caps->supports_texture_etc  = (bc->formats[BGFX_TEXTURE_FORMAT_ETC2]
-                                    & BGFX_CAPS_FORMAT_TEXTURE_2D) != 0;
-    caps->supports_texture_astc = (bc->formats[BGFX_TEXTURE_FORMAT_ASTC4X4]
-                                    & BGFX_CAPS_FORMAT_TEXTURE_2D) != 0;
-
     /* MSAA: check if at least 4x is supported for RGBA8. */
     caps->supports_msaa = (bc->formats[BGFX_TEXTURE_FORMAT_RGBA8]
                             & BGFX_CAPS_FORMAT_TEXTURE_MSAA) != 0;
@@ -70,16 +62,12 @@ void jce_gpu_caps_init(JceGpuCaps *caps)
 
     /* Log summary. */
     LOG_INFO(LOG_TAG, "%s / %s", caps->vendor_name, caps->renderer_name);
-    LOG_INFO(LOG_TAG, "compute=%s  instancing=%s  indirect=%s  msaa=%s",
+    LOG_INFO(LOG_TAG, "compute=%s  instancing=%s  indirect=%s  msaa=%s  ndc=%s",
              caps->supports_compute   ? "yes" : "no",
              caps->supports_instancing ? "yes" : "no",
              caps->supports_indirect   ? "yes" : "no",
-             caps->supports_msaa       ? "yes" : "no");
-    LOG_INFO(LOG_TAG, "tex_bc=%s  tex_etc=%s  tex_astc=%s  ndc=%s",
-             caps->supports_texture_bc   ? "yes" : "no",
-             caps->supports_texture_etc  ? "yes" : "no",
-             caps->supports_texture_astc ? "yes" : "no",
-             caps->homogeneous_ndc       ? "[-1,1]" : "[0,1]");
+             caps->supports_msaa       ? "yes" : "no",
+             caps->homogeneous_ndc     ? "[-1,1]" : "[0,1]");
     LOG_INFO(LOG_TAG, "max_tex=%u  max_draws=%u  max_views=%u  max_fb_attach=%u",
              caps->max_texture_size, caps->max_draw_calls,
              caps->max_views, caps->max_fb_attachments);

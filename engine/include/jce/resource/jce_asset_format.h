@@ -68,7 +68,7 @@ extern "C" {
 
 /* Texture chunks */
 #define JCEASSET_CHUNK_TEX_PIXELS 0x0100  /* raw RGBA8 pixel data */
-#define JCEASSET_CHUNK_TEX_GPU    0x0101  /* GPU-compressed (BC/ASTC/KTX2) */
+#define JCEASSET_CHUNK_TEX_GPU    0x0101  /* reserved for future GPU formats */
 #define JCEASSET_CHUNK_TEX_INFO   0x0102  /* JceAssetTexInfo struct */
 
 /* Mesh chunks */
@@ -129,11 +129,21 @@ typedef struct JceAssetChunkEntry {
 typedef struct JceAssetTexInfo {
 	uint32_t width;
 	uint32_t height;
-	uint32_t format;           /* 0=RGBA8, future: BC7, ASTC, etc. */
+	uint32_t format;           /* JCEASSET_TEXFMT_* */
 	uint32_t mip_count;        /* 1 = no mipmaps */
 	uint32_t flags;            /* bit 0: sRGB, bit 1: premultiplied alpha */
 	uint32_t _pad;
 } JceAssetTexInfo;
+
+/* GPU texture formats for JceAssetTexInfo::format. */
+#define JCEASSET_TEXFMT_RGBA8       0   /* Uncompressed RGBA 8-bit          */
+#define JCEASSET_TEXFMT_RGB8        1   /* Uncompressed RGB 8-bit           */
+
+/* Platform target IDs for the jce_pak --platform flag. */
+#define JCEASSET_PLATFORM_DESKTOP   0
+#define JCEASSET_PLATFORM_MOBILE    1
+#define JCEASSET_PLATFORM_WEB       2
+#define JCEASSET_PLATFORM_CONSOLE   3
 
 /*
  * Mesh info — stored in JCEASSET_CHUNK_MESH_INFO.

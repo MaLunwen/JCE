@@ -1,7 +1,7 @@
 /*
  * jce_texture.c  Cross-platform texture loading implementation.
  *
- * Pipeline: PAK  decompress  SDL3_image  SDL_Surface  bgfx texture.
+ * Pipeline: PAK → decompress → SDL3_image → SDL_Surface → bgfx texture.
  * Handles pixel format conversion to RGBA8 for bgfx compatibility.
  */
 
@@ -87,6 +87,7 @@ static uint64_t sampler_flags(int mode)
     }
 }
 
+
 /* Create a bgfx texture from an RGBA8 surface. */
 static JceTexture texture_from_surface_ex(const SDL_Surface *surf, int mode)
 {
@@ -167,7 +168,7 @@ static JceTexture jce_texture_load_ex_inner(const PakArchive *pak,
         return JCE_TEXTURE_INVALID;
     }
 
-    /* ── Cooked path: .jceasset → read RGBA8 directly ── */
+    /* ── Cooked path: .jceasset → RGBA8 ── */
     if (jce_asset_is_cooked(buf, n)) {
         JceAssetView view;
         if (!jce_asset_open(&view, buf, n)) {
@@ -182,11 +183,12 @@ static JceTexture jce_texture_load_ex_inner(const PakArchive *pak,
             jce_asset_find_chunk(&view, JCEASSET_CHUNK_TEX_PIXELS);
 
         if (!info_chunk || !pixel_chunk) {
-            LOG_ERROR(LOG_TAG, "missing TEX chunks: %s", asset_path);
+            LOG_ERROR(LOG_TAG, "missing TEX_INFO or TEX_PIXELS: %s", asset_path);
             JCE_FREE(buf);
             return JCE_TEXTURE_INVALID;
         }
 
+        /* Read texture info. */
         JceAssetTexInfo tex_info;
         if (jce_asset_chunk_data(&view, info_chunk,
                                   &tex_info, sizeof(tex_info)) == 0) {
@@ -194,27 +196,30 @@ static JceTexture jce_texture_load_ex_inner(const PakArchive *pak,
             return JCE_TEXTURE_INVALID;
         }
 
-        void *pixels = JCE_MALLOC((size_t)pixel_chunk->original_size);
-        if (!pixels) { JCE_FREE(buf); return JCE_TEXTURE_INVALID; }
+        /* Read RGBA8 pixel data. */
+        void *tex_data = JCE_MALLOC((size_t)pixel_chunk->original_size);
+        if (!tex_data) { JCE_FREE(buf); return JCE_TEXTURE_INVALID; }
 
         if (jce_asset_chunk_data(&view, pixel_chunk,
-                                  pixels,
+                                  tex_data,
                                   (size_t)pixel_chunk->original_size) == 0) {
-            JCE_FREE(pixels);
+            JCE_FREE(tex_data);
             JCE_FREE(buf);
             return JCE_TEXTURE_INVALID;
         }
 
         JCE_FREE(buf); /* PAK buffer no longer needed */
 
-        /* Upload RGBA8 directly to bgfx with proper sampler mode. */
-        const bgfx_memory_t *mem = bgfx_alloc(tex_info.width * tex_info.height * 4);
-        memcpy(mem->data, pixels, tex_info.width * tex_info.height * 4);
-        JCE_FREE(pixels);
+        /* Upload to bgfx as RGBA8. */
+        const bgfx_memory_t *mem = bgfx_alloc((uint32_t)pixel_chunk->original_size);
+        memcpy(mem->data, tex_data, pixel_chunk->original_size);
+        JCE_FREE(tex_data);
+
+        bool has_mips = tex_info.mip_count > 1;
 
         bgfx_texture_handle_t handle = bgfx_create_texture_2d(
             (uint16_t)tex_info.width, (uint16_t)tex_info.height,
-            false, 1, BGFX_TEXTURE_FORMAT_RGBA8,
+            has_mips, 1, BGFX_TEXTURE_FORMAT_RGBA8,
             BGFX_TEXTURE_NONE | sampler_flags(sampler_mode), mem);
 
         if (handle.idx == UINT16_MAX)
@@ -224,8 +229,11 @@ static JceTexture jce_texture_load_ex_inner(const PakArchive *pak,
         JceTexture tex;
         tex.idx = handle.idx;
 
-        if (jce_texture_valid(tex))
-            LOG_DEBUG(LOG_TAG, "loaded (cooked) %s", asset_path);
+        if (jce_texture_valid(tex)) {
+            LOG_DEBUG(LOG_TAG, "loaded (cooked) %s [%ux%u, %u mips]",
+                      asset_path, tex_info.width, tex_info.height,
+                      tex_info.mip_count);
+        }
         return tex;
     }
 

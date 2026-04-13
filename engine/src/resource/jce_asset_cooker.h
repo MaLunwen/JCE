@@ -31,6 +31,21 @@ extern "C" {
 #endif
 
 /* ================================================================== */
+/* Target platform enumeration                                         */
+/* ================================================================== */
+
+typedef enum JceCookPlatform {
+	JCE_COOK_PLATFORM_WINDOWS = 0,
+	JCE_COOK_PLATFORM_LINUX   = 1,
+	JCE_COOK_PLATFORM_MACOS   = 2,
+	JCE_COOK_PLATFORM_ANDROID = 3,
+	JCE_COOK_PLATFORM_IOS     = 4,
+	JCE_COOK_PLATFORM_WEB     = 5,
+	JCE_COOK_PLATFORM_AUTO    = 6,
+	JCE_COOK_PLATFORM_COUNT
+} JceCookPlatform;
+
+/* ================================================================== */
 /* Cook options                                                        */
 /* ================================================================== */
 
@@ -39,8 +54,8 @@ typedef struct JceCookOptions {
 	   Default: 3. */
 	int compression_level;
 
-	/* For textures: force specific GPU format.
-	   0 = RGBA8 (default, always available). */
+	/* For textures: force specific GPU format (JCEASSET_TEXFMT_*).
+	   0 = auto-select based on platform. */
 	int texture_format;
 
 	/* For textures: generate mipmaps. Default: false. */
@@ -53,9 +68,18 @@ typedef struct JceCookOptions {
 
 	/* Verbose logging. */
 	bool verbose;
+
+	/* Target platform for auto-format selection. Default: AUTO. */
+	JceCookPlatform platform;
+
+	/* Force power-of-two dimensions (pad if needed). Default: false. */
+	bool force_power_of_two;
 } JceCookOptions;
 
-#define JCE_COOK_DEFAULT ((JceCookOptions){ .compression_level = 3 })
+#define JCE_COOK_DEFAULT ((JceCookOptions){ \
+	.compression_level = 3, \
+	.platform = JCE_COOK_PLATFORM_AUTO \
+})
 
 /* ================================================================== */
 /* Cook result                                                         */

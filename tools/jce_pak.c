@@ -565,6 +565,7 @@ typedef struct {
     char c_file[1024];
     char obj_format[32];
     char obj_arch[32];
+    char platform[32];    /* desktop, mobile, web, console (default: desktop) */
 } Args;
 
 static void usage(void) {
@@ -576,7 +577,14 @@ static void usage(void) {
         "              [--obj-file      <out.obj>]\n"
         "              [--c-file        <out.c>]     (for c-array format)\n"
         "              [--obj-format    coff|c-array|none]   (default: none)\n"
-        "              [--obj-arch      x64|arm64|x86|arm]  (default: x64)\n");
+        "              [--obj-arch      x64|arm64|x86|arm]  (default: x64)\n"
+        "              [--platform      desktop|mobile|web|console] (default: desktop)\n"
+        "\n"
+        "  --platform selects the target platform (reserved for future use):\n"
+        "    desktop  → Windows / macOS / Linux\n"
+        "    mobile   → Android / iOS\n"
+        "    web      → Emscripten\n"
+        "    console  → Console platforms\n");
 }
 
 // cppcheck-suppress constParameter   ; argv comes from main() with non-const char**
@@ -585,6 +593,7 @@ static Args parse_args(int argc, char *const argv[]) {
     memset(&a, 0, sizeof(a));
     strcpy(a.obj_format, "none");
     strcpy(a.obj_arch,   "x64");
+    strcpy(a.platform,   "desktop");
 
     for (int i = 1; i < argc; ++i) {
         const char *arg = argv[i];
@@ -605,6 +614,7 @@ static Args parse_args(int argc, char *const argv[]) {
         else if (strcmp(arg, "--c-file") == 0 && val)        { snprintf(a.c_file,        sizeof(a.c_file),        "%s", val); ++i; }
         else if (strcmp(arg, "--obj-format") == 0 && val)    { snprintf(a.obj_format,    sizeof(a.obj_format),    "%s", val); ++i; }
         else if (strcmp(arg, "--obj-arch") == 0 && val)      { snprintf(a.obj_arch,      sizeof(a.obj_arch),      "%s", val); ++i; }
+        else if (strcmp(arg, "--platform") == 0 && val)      { snprintf(a.platform,      sizeof(a.platform),      "%s", val); ++i; }
         else {
             fprintf(stderr, "[jce_pak] unknown argument: %s\n", arg);
             usage();
@@ -617,6 +627,17 @@ static Args parse_args(int argc, char *const argv[]) {
         usage();
         exit(1);
     }
+
+    /* Validate --platform value. */
+    if (strcmp(a.platform, "desktop") != 0 &&
+        strcmp(a.platform, "mobile")  != 0 &&
+        strcmp(a.platform, "web")     != 0 &&
+        strcmp(a.platform, "console") != 0) {
+        fprintf(stderr, "[jce_pak] unknown --platform: %s\n", a.platform);
+        fprintf(stderr, "  Valid values: desktop, mobile, web, console\n");
+        exit(1);
+    }
+
     return a;
 }
 
@@ -626,6 +647,8 @@ static Args parse_args(int argc, char *const argv[]) {
 
 int main(int argc, char *argv[]) {
     Args args = parse_args(argc, argv);
+
+    printf("[jce_pak] target platform: %s\n", args.platform);
 
     /* Normalise resource_dir separators and strip trailing slash. */
     for (int rd = 0; rd < args.resource_dir_count; rd++) {

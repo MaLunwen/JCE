@@ -288,10 +288,17 @@ static void batch_recurse(BatchContext *ctx,
 static void print_usage(void)
 {
 	printf("Usage:\n");
-	printf("  jce_cook <input> <output> [--level N] [--verbose]\n");
-	printf("  jce_cook --batch <input_dir> <output_dir> [--level N] [--verbose] [--dry-run] [--preserve-names]\n");
+	printf("  jce_cook <input> <output> [options]\n");
+	printf("  jce_cook --batch <input_dir> <output_dir> [options]\n");
 	printf("\n");
-	printf("Converts raw assets into .jceasset binary containers.\n");
+	printf("Options:\n");
+	printf("  --level <0-22>           ZSTD compression level (default: 3)\n");
+	printf("  --mipmaps                Generate full mipmap chain\n");
+	printf("  --max-texture-size <N>   Cap texture dimensions\n");
+	printf("  --verbose                Detailed progress output\n");
+	printf("  --batch                  Process directory recursively\n");
+	printf("  --dry-run                Preview without writing\n");
+	printf("  --preserve-names         Keep original extension (don't add .jceasset)\n");
 }
 
 int main(int argc, char **argv)
@@ -305,6 +312,7 @@ int main(int argc, char **argv)
 	bool verbose        = false;
 	bool dry_run        = false;
 	bool preserve_names = false;
+	bool mipmaps        = false;
 	int  level          = 3;
 	int  max_tex_size   = 0;
 	const char *input   = NULL;
@@ -320,6 +328,8 @@ int main(int argc, char **argv)
 			dry_run = true;
 		} else if (strcmp(argv[i], "--preserve-names") == 0) {
 			preserve_names = true;
+		} else if (strcmp(argv[i], "--mipmaps") == 0) {
+			mipmaps = true;
 		} else if (strcmp(argv[i], "--level") == 0 && i + 1 < argc) {
 			level = atoi(argv[++i]);
 			if (level < 0) level = 0;
@@ -341,7 +351,8 @@ int main(int argc, char **argv)
 	JceCookOptions opts = JCE_COOK_DEFAULT;
 	opts.compression_level = level;
 	opts.max_texture_size  = max_tex_size;
-	opts.verbose = verbose;
+	opts.verbose           = verbose;
+	opts.generate_mipmaps  = mipmaps;
 
 	if (batch) {
 		BatchContext ctx = {0};

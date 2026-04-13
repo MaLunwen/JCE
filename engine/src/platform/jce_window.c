@@ -256,6 +256,28 @@ void jce_window_set_relative_mouse_mode(JceWindow *win, bool enabled)
     SDL_SetWindowRelativeMouseMode(win->sdl_win, enabled);
 }
 
+float jce_window_get_dpi_scale(const JceWindow *win)
+{
+    if (!win || !win->sdl_win) return 1.0f;
+
+    /* SDL3: display content scale factor is the ratio between
+       physical pixels and device-independent points.  This is
+       the most reliable DPI indicator across platforms. */
+    SDL_DisplayID display = SDL_GetDisplayForWindow(win->sdl_win);
+    if (display) {
+        float scale = SDL_GetDisplayContentScale(display);
+        if (scale > 0.0f) return scale;
+    }
+
+    /* Fallback: derive from pixel/logical size ratio. */
+    if (win->logical_w > 0 && win->pixel_w > 0) {
+        float ratio = (float)win->pixel_w / (float)win->logical_w;
+        if (ratio > 0.5f) return ratio;
+    }
+
+    return 1.0f;
+}
+
 bool jce_window_start_text_input(JceWindow *win)
 {
     if (!win || !win->sdl_win) return false;

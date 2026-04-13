@@ -84,6 +84,13 @@ void           jce_rml_update(JceRmlBackend *b, float dt);
 void           jce_rml_render(JceRmlBackend *b);
 void           jce_rml_resize(JceRmlBackend *b, uint32_t w, uint32_t h);
 
+/* ── DPI scaling ─────────────────────────────────────────────────────── */
+
+/* Set the device-pixel ratio for RmlUi rendering.
+   This affects how CSS px units map to physical pixels.
+   1.0 = standard, 2.0 = Retina / HiDPI. */
+void           jce_rml_set_dp_ratio(JceRmlBackend *b, float dp_ratio);
+
 #ifdef __cplusplus
 }
 #endif

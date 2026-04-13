@@ -3,7 +3,14 @@
  *
  * Wraps ENet host/peer management in a C99 engine API.
  * Peers are tracked by index into ENet's internal peer array.
+ *
+ * On Emscripten, native UDP sockets are unavailable; the WebSocket
+ * backend (jce_net_web.c) is used instead and this file is skipped.
  */
+
+#ifdef __EMSCRIPTEN__
+/* WebSocket backend (jce_net_web.c) provides the implementation. */
+#else
 
 #include <jce/net/jce_net.h>
 #include <jce/core/jce_log.h>
@@ -314,3 +321,10 @@ uint32_t jce_net_peer_count(const JceNetHost *host)
     }
     return count;
 }
+
+JceNetTransport jce_net_get_transport(void)
+{
+    return JCE_NET_TRANSPORT_ENET;
+}
+
+#endif /* !__EMSCRIPTEN__ */

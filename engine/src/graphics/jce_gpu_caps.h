@@ -25,9 +25,6 @@ typedef struct JceGpuCaps {
     bool  supports_texture_2d_array;
     bool  supports_texture_cube_array;
     bool  supports_msaa;
-    bool  supports_texture_bc;       /* BC1-BC7 (desktop) */
-    bool  supports_texture_etc;      /* ETC1/ETC2 (mobile) */
-    bool  supports_texture_astc;     /* ASTC (mobile) */
     bool  homogeneous_ndc;           /* true = [-1,1] (GL/Vulkan), false = [0,1] (D3D) */
 
     /* Limits (bgfx reports these as uint32_t). */

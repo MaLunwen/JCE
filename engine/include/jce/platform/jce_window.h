@@ -76,6 +76,11 @@ bool        jce_window_is_fullscreen(const JceWindow *win);
 /* Enable/disable relative (captured) mouse mode for FPS-style controls. */
 void        jce_window_set_relative_mouse_mode(JceWindow *win, bool enabled);
 
+/* DPI scale factor: ratio of physical pixels to logical points.
+   Returns 1.0 on standard displays, 2.0 on Retina/HiDPI, etc.
+   Useful for scaling UI elements and touch targets. */
+float       jce_window_get_dpi_scale(const JceWindow *win);
+
 /* Start/stop SDL text input without exposing SDL_Window to consumers. */
 bool        jce_window_start_text_input(JceWindow *win);
 bool        jce_window_stop_text_input(JceWindow *win);

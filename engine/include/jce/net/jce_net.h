@@ -90,6 +90,18 @@ bool jce_net_poll(JceNetHost *host, JceNetEvent *out_event,
 void jce_net_service(JceNetHost *host);
 
 /* ================================================================== */
+/* Transport info                                                      */
+/* ================================================================== */
+
+typedef enum {
+    JCE_NET_TRANSPORT_ENET      = 0,   /* UDP via ENet (desktop/mobile) */
+    JCE_NET_TRANSPORT_WEBSOCKET = 1    /* WebSocket (Emscripten/WASM)   */
+} JceNetTransport;
+
+/* Return the active network transport for this build. */
+JceNetTransport jce_net_get_transport(void);
+
+/* ================================================================== */
 /* Peer info                                                           */
 /* ================================================================== */
 

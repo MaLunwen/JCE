@@ -318,6 +318,7 @@ endif()
 if(NOT CMAKE_CROSSCOMPILING)
 	add_executable(jce_cook
 		"${JCE_TOOLS_DIR}/jce_cook.c"
+		"${JCE_TOOLS_DIR}/jce_tex_compress.c"
 		"${JCE_TOOLS_DIR}/miniaudio_impl_cook.c"
 		"${JCE_ENGINE_SRC_DIR}/resource/jce_asset_cooker.c")
 	set_target_properties(jce_cook PROPERTIES

@@ -9,6 +9,7 @@
  */
 
 #include "jce_asset_cooker.h"
+#include "jce_tex_compress.h"
 #include "core/jce_memory.h"
 
 #include <SDL3/SDL.h>
@@ -218,7 +219,7 @@ static JceCookResult build_asset(uint32_t asset_type,
 }
 
 /* ================================================================== */
-/* Cook: Texture                                                       */
+/* Cook: Texture (with optional mipmaps)                               */
 /* ================================================================== */
 
 JceCookResult jce_cook_texture(const void *input, size_t input_size,
@@ -267,29 +268,124 @@ JceCookResult jce_cook_texture(const void *input, size_t input_size,
 		}
 	}
 
-	/* Build info chunk. */
-	JceAssetTexInfo info = {0};
-	info.width     = (uint32_t)surf->w;
-	info.height    = (uint32_t)surf->h;
-	info.format    = 0; /* RGBA8 */
-	info.mip_count = 1;
-	info.flags     = 1; /* sRGB */
+	uint32_t base_w = (uint32_t)surf->w;
+	uint32_t base_h = (uint32_t)surf->h;
 
-	/* Pixel data. */
-	size_t pixel_size = (size_t)surf->w * (size_t)surf->h * 4;
+	/* Always use RGBA8 format. */
+	int target_format = JCEASSET_TEXFMT_RGBA8;
+
+	/* Determine mip count. */
+	uint32_t mip_count = 1;
+	if (opts && opts->generate_mipmaps) {
+		mip_count = jce_tex_mip_count(base_w, base_h);
+	}
+
+	/* Calculate total output size for all mip levels (RGBA8 = 4 bpp). */
+	size_t total_mip_size = 0;
+	for (uint32_t m = 0; m < mip_count; m++) {
+		uint32_t mw, mh;
+		jce_tex_mip_dimensions(base_w, base_h, m, &mw, &mh);
+		total_mip_size += (size_t)mw * mh * 4;
+	}
+
+	/* Allocate output buffer for all mips. */
+	uint8_t *mip_data = (uint8_t *)JCE_MALLOC(total_mip_size);
+	if (!mip_data) {
+		SDL_DestroySurface(surf);
+		snprintf(result.error, sizeof(result.error), "allocation failed");
+		return result;
+	}
+
+	/* Allocate mip offset array (stored after TEX_INFO struct). */
+	uint32_t *mip_offsets = (uint32_t *)JCE_MALLOC(mip_count * sizeof(uint32_t));
+	if (!mip_offsets) {
+		JCE_FREE(mip_data);
+		SDL_DestroySurface(surf);
+		snprintf(result.error, sizeof(result.error), "allocation failed");
+		return result;
+	}
+
+	/* Generate each mip level. */
+	uint8_t *current_mip = (uint8_t *)surf->pixels;
+	uint8_t *temp_mip = NULL;
+	uint32_t current_w = base_w, current_h = base_h;
+	size_t mip_offset = 0;
+
+	for (uint32_t m = 0; m < mip_count; m++) {
+		mip_offsets[m] = (uint32_t)mip_offset;
+
+		/* Copy RGBA8 pixel data for this mip level. */
+		size_t mip_size = (size_t)current_w * current_h * 4;
+		memcpy(mip_data + mip_offset, current_mip, mip_size);
+		mip_offset += mip_size;
+
+		/* Generate next mip level if needed. */
+		if (m + 1 < mip_count) {
+			uint32_t next_w, next_h;
+			jce_tex_mip_dimensions(base_w, base_h, m + 1, &next_w, &next_h);
+
+			size_t next_size = (size_t)next_w * next_h * 4;
+			if (!temp_mip) {
+				temp_mip = (uint8_t *)JCE_MALLOC(next_size);
+			} else {
+				temp_mip = (uint8_t *)JCE_REALLOC(temp_mip, next_size);
+			}
+
+			if (!temp_mip) {
+				JCE_FREE(mip_offsets);
+				JCE_FREE(mip_data);
+				SDL_DestroySurface(surf);
+				snprintf(result.error, sizeof(result.error), "mip allocation failed");
+				return result;
+			}
+
+			jce_tex_generate_mip(current_mip, current_w, current_h,
+			                     temp_mip, &next_w, &next_h);
+			current_mip = temp_mip;
+			current_w = next_w;
+			current_h = next_h;
+		}
+	}
+
+	JCE_FREE(temp_mip);
+
+	/* Build info chunk (extended with mip offsets). */
+	size_t info_size = sizeof(JceAssetTexInfo) + mip_count * sizeof(uint32_t);
+	uint8_t *info_buf = (uint8_t *)JCE_MALLOC(info_size);
+	if (!info_buf) {
+		JCE_FREE(mip_offsets);
+		JCE_FREE(mip_data);
+		SDL_DestroySurface(surf);
+		snprintf(result.error, sizeof(result.error), "allocation failed");
+		return result;
+	}
+
+	JceAssetTexInfo *info = (JceAssetTexInfo *)info_buf;
+	info->width     = base_w;
+	info->height    = base_h;
+	info->format    = (uint32_t)target_format;
+	info->mip_count = mip_count;
+	info->flags     = 1; /* sRGB */
+	info->_pad      = 0;
+
+	/* Copy mip offsets after the info struct. */
+	memcpy(info_buf + sizeof(JceAssetTexInfo), mip_offsets, mip_count * sizeof(uint32_t));
 
 	uint64_t source_hash = XXH3_64bits(input, input_size);
 
 	ChunkInput chunks[2];
 	chunks[0].chunk_type = JCEASSET_CHUNK_TEX_INFO;
-	chunks[0].raw_data   = &info;
-	chunks[0].raw_size   = sizeof(info);
+	chunks[0].raw_data   = info_buf;
+	chunks[0].raw_size   = info_size;
 	chunks[1].chunk_type = JCEASSET_CHUNK_TEX_PIXELS;
-	chunks[1].raw_data   = surf->pixels;
-	chunks[1].raw_size   = pixel_size;
+	chunks[1].raw_data   = mip_data;
+	chunks[1].raw_size   = mip_offset;  /* Actual data size */
 
 	result = build_asset(JCEASSET_TYPE_TEXTURE, source_hash, chunks, 2, opts);
 
+	JCE_FREE(info_buf);
+	JCE_FREE(mip_offsets);
+	JCE_FREE(mip_data);
 	SDL_DestroySurface(surf);
 	return result;
 }

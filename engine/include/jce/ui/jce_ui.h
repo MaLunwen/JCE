@@ -166,6 +166,15 @@ void jce_ui_render(JceUIContext *ctx);
 /* Handle viewport resize. */
 void jce_ui_resize(JceUIContext *ctx, uint32_t width, uint32_t height);
 
+/* Set the DPI scale factor for the UI system.
+   All document sizes and coordinates will be multiplied by this value.
+   Typically obtained from jce_window_get_dpi_scale().
+   Default: 1.0.  Call before jce_ui_update() when the scale changes. */
+void jce_ui_set_dpi_scale(JceUIContext *ctx, float dpi_scale);
+
+/* Get the current DPI scale factor. */
+float jce_ui_get_dpi_scale(const JceUIContext *ctx);
+
 #ifdef __cplusplus
 }
 #endif
