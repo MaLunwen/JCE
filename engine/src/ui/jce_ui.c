@@ -22,6 +22,7 @@ struct JceUIContext {
     JceRmlBackend   *backend;
     uint32_t         width;
     uint32_t         height;
+    float            dpi_scale;
 };
 
 /* ── Create / Destroy ──────────────────────────────────────────────── */
@@ -34,9 +35,10 @@ JceUIContext *jce_ui_create(const JceUIContextDesc *desc, jce_allocator_t alloc)
     if (!ctx) return NULL;
 
     memset(ctx, 0, sizeof(*ctx));
-    ctx->alloc  = alloc;
-    ctx->width  = desc->width;
-    ctx->height = desc->height;
+    ctx->alloc     = alloc;
+    ctx->width     = desc->width;
+    ctx->height    = desc->height;
+    ctx->dpi_scale = 1.0f;
 
     ctx->backend = jce_rml_create(desc->width, desc->height);
     if (!ctx->backend) {
@@ -208,4 +210,20 @@ void jce_ui_resize(JceUIContext *ctx, uint32_t width, uint32_t height)
     ctx->width  = width;
     ctx->height = height;
     jce_rml_resize(ctx->backend, width, height);
+}
+
+void jce_ui_set_dpi_scale(JceUIContext *ctx, float dpi_scale)
+{
+    if (!ctx || dpi_scale <= 0.0f) return;
+    ctx->dpi_scale = dpi_scale;
+
+    /* Forward the DPI scale to the RmlUi backend which applies it
+       as dp-ratio on the rendering context. */
+    jce_rml_set_dp_ratio(ctx->backend, dpi_scale);
+    LOG_DEBUG(LOG_TAG, "DPI scale set to %.2f", (double)dpi_scale);
+}
+
+float jce_ui_get_dpi_scale(const JceUIContext *ctx)
+{
+    return ctx ? ctx->dpi_scale : 1.0f;
 }

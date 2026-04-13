@@ -135,6 +135,25 @@ typedef struct JceAssetTexInfo {
 	uint32_t _pad;
 } JceAssetTexInfo;
 
+/* GPU texture compression formats for JceAssetTexInfo::format. */
+#define JCEASSET_TEXFMT_RGBA8       0   /* Uncompressed RGBA 8-bit          */
+#define JCEASSET_TEXFMT_RGB8        1   /* Uncompressed RGB 8-bit           */
+#define JCEASSET_TEXFMT_BC1         10  /* DXT1 (desktop, no alpha)         */
+#define JCEASSET_TEXFMT_BC3         11  /* DXT5 (desktop, full alpha)       */
+#define JCEASSET_TEXFMT_BC5         12  /* 2-channel normal maps (desktop)  */
+#define JCEASSET_TEXFMT_BC7         13  /* High-quality desktop (D3D11+)    */
+#define JCEASSET_TEXFMT_ETC2_RGB    20  /* ETC2 RGB (mobile GLES 3.0+)     */
+#define JCEASSET_TEXFMT_ETC2_RGBA   21  /* ETC2 RGBA (mobile GLES 3.0+)    */
+#define JCEASSET_TEXFMT_ASTC_4x4    30  /* ASTC 4×4 (mobile/Apple)         */
+#define JCEASSET_TEXFMT_ASTC_6x6    31  /* ASTC 6×6 (mobile, higher ratio) */
+#define JCEASSET_TEXFMT_ASTC_8x8    32  /* ASTC 8×8 (mobile, max ratio)    */
+
+/* Platform target IDs for the jce_pak --platform flag. */
+#define JCEASSET_PLATFORM_DESKTOP   0   /* Windows / macOS / Linux (BC)     */
+#define JCEASSET_PLATFORM_MOBILE    1   /* Android / iOS (ETC2 or ASTC)     */
+#define JCEASSET_PLATFORM_WEB       2   /* Emscripten (ETC2 or uncompressed)*/
+#define JCEASSET_PLATFORM_CONSOLE   3   /* Future: console-specific formats */
+
 /*
  * Mesh info — stored in JCEASSET_CHUNK_MESH_INFO.
  */

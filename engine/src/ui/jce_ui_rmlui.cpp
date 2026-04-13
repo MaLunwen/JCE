@@ -413,3 +413,10 @@ void jce_rml_resize(JceRmlBackend *b, uint32_t w, uint32_t h)
     b->height = h;
     b->context->SetDimensions(Rml::Vector2i((int)w, (int)h));
 }
+
+void jce_rml_set_dp_ratio(JceRmlBackend *b, float dp_ratio)
+{
+    if (!b || !b->context || dp_ratio <= 0.0f) return;
+    b->context->SetDensityIndependentPixelRatio(dp_ratio);
+    LOG_DEBUG(LOG_TAG, "RmlUi dp-ratio set to %.2f", (double)dp_ratio);
+}
