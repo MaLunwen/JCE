@@ -16,6 +16,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifdef SDL_PLATFORM_WINDOWS
+#include <windows.h>
+#endif
+
 #include <jce/core/jce_log.h>
 #include <jce/core/jce_crash_handler.h>
 #include <jce/app/jce_config.h>
@@ -39,6 +43,7 @@
 static JceAppDesc  g_app_desc;
 static bool        g_app_desc_set;
 static char        g_config_path_override[512];
+static char        g_pak_path_override[512];
 static int         g_renderer_backend_override = -1;  /* -1 = no override */
 
 void jce_engine_set_app_desc(const JceAppDesc *desc)
@@ -59,6 +64,16 @@ void jce_engine_set_config_path(const char *path)
     }
 
     snprintf(g_config_path_override, sizeof(g_config_path_override), "%s", path);
+}
+
+void jce_engine_set_pak_path(const char *path)
+{
+    if (!path || !path[0]) {
+        g_pak_path_override[0] = '\0';
+        return;
+    }
+
+    snprintf(g_pak_path_override, sizeof(g_pak_path_override), "%s", path);
 }
 
 void jce_engine_set_renderer_override(int backend)
@@ -156,6 +171,11 @@ static void render_loading_frame(const JceRenderer *r, JceWindow *win,
 
 /* -- Create -------------------------------------------------------- */
 
+static bool jce_resize_event_watch(void *userdata, SDL_Event *event);
+#ifdef SDL_PLATFORM_WINDOWS
+static bool SDLCALL jce_win32_msg_hook(void *userdata, MSG *msg);
+#endif
+
 JceEngine *jce_engine_create(int argc, char *argv[])
 {
     (void)argc; (void)argv;
@@ -244,6 +264,38 @@ JceEngine *jce_engine_create(int argc, char *argv[])
                 }
             }
             SDL_CloseIO(io);
+        }
+    }
+#elif defined(JCE_BUILD_JNI)
+    /* JNI desktop: PAK shipped as a separate file alongside the native lib.
+     * Java side sets pak path via jce_engine_set_pak_path() before create,
+     * or we fall back to searching next to the shared library / CWD. */
+    {
+        const char *base = SDL_GetBasePath();
+        char pak_path[512];
+        bool found = false;
+
+        /* Try explicit PAK path (set by JceRuntime.java). */
+        if (g_pak_path_override[0]) {
+            snprintf(pak_path, sizeof(pak_path), "%s", g_pak_path_override);
+            found = jce_path_exists(pak_path);
+        }
+
+        /* Try next to the shared library. */
+        if (!found && base) {
+            snprintf(pak_path, sizeof(pak_path), "%sgame_assets.pak", base);
+            found = jce_path_exists(pak_path);
+        }
+
+        /* Try CWD. */
+        if (!found) {
+            snprintf(pak_path, sizeof(pak_path), "game_assets.pak");
+            found = jce_path_exists(pak_path);
+        }
+
+        if (found) {
+            LOG_INFO(LOG_TAG, "JNI: loading PAK from %s", pak_path);
+            e->pak = pak_open_file(pak_path);
         }
     }
 #else
@@ -401,11 +453,112 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         goto fail;
     }
 
+    /* Register live-resize watcher so resize events are handled even
+       during Windows modal message loops (needed for JNI bridge). */
+    SDL_AddEventWatch(jce_resize_event_watch, e);
+
+#ifdef SDL_PLATFORM_WINDOWS
+    /* Keep rendering while the user holds the title bar / window border
+       even without moving the mouse (modal loop with no resize events). */
+    SDL_SetWindowsMessageHook(jce_win32_msg_hook, e);
+#endif
+
     return e;
 
 fail:
     jce_engine_destroy(e);
     return NULL;
+}
+
+/* -- Windows modal-loop rendering --------------------------------- */
+
+/*
+ * On Windows, clicking and holding the title bar or window border enters
+ * a modal message loop inside DefWindowProc (WM_ENTERSIZEMOVE).  During
+ * this loop, SDL_PollEvent never returns, so the JNI bridge's iterate
+ * loop is completely stalled — even if the user doesn't move the mouse.
+ *
+ * Solution: use SDL_SetWindowsMessageHook to detect WM_ENTERSIZEMOVE /
+ * WM_EXITSIZEMOVE, and pump frames via a Win32 timer (~60 fps) that
+ * fires inside the modal loop.  The event watch below handles resize
+ * events specifically (bgfx reset + viewport update).
+ */
+
+#ifdef SDL_PLATFORM_WINDOWS
+
+#define JCE_MODAL_TIMER_ID   1
+#define JCE_MODAL_TIMER_MS  16   /* ~60 fps */
+
+static JceEngine *g_modal_engine;
+
+static void CALLBACK jce_modal_timer_proc(HWND hwnd, UINT msg,
+                                          UINT_PTR id, DWORD time)
+{
+    (void)hwnd; (void)msg; (void)id; (void)time;
+    JceEngine *e = g_modal_engine;
+    if (!e || !e->renderer) return;
+
+    jce_engine_iterate(e);
+}
+
+static bool SDLCALL jce_win32_msg_hook(void *userdata, MSG *msg)
+{
+    JceEngine *e = (JceEngine *)userdata;
+
+    if (msg->message == WM_ENTERSIZEMOVE) {
+        g_modal_engine = e;
+        SetTimer(msg->hwnd, JCE_MODAL_TIMER_ID,
+                 JCE_MODAL_TIMER_MS, jce_modal_timer_proc);
+    } else if (msg->message == WM_EXITSIZEMOVE) {
+        KillTimer(msg->hwnd, JCE_MODAL_TIMER_ID);
+        g_modal_engine = NULL;
+    }
+
+    return true;   /* let SDL process the message */
+}
+
+#endif /* SDL_PLATFORM_WINDOWS */
+
+/* -- Live-resize event watcher ------------------------------------ */
+
+/*
+ * SDL_AddEventWatch callbacks fire from within the OS message pump,
+ * including during modal operations.  This handles resize-specific
+ * work: update window state, reset bgfx backbuffer, render one frame.
+ */
+static bool jce_resize_event_watch(void *userdata, SDL_Event *event)
+{
+    JceEngine *e = (JceEngine *)userdata;
+
+    if (event->type != SDL_EVENT_WINDOW_RESIZED &&
+        event->type != SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED)
+        return true;   /* pass event through, not ours */
+
+    int pw, ph;
+    SDL_GetWindowSizeInPixels(jce_window_sdl(e->window), &pw, &ph);
+    if (pw <= 0 || ph <= 0)
+        return true;
+
+    jce_window_handle_resize(e->window, (uint32_t)pw, (uint32_t)ph);
+    jce_renderer_resize(e->renderer, (uint32_t)pw, (uint32_t)ph);
+
+    if (g_app_desc.on_resize)
+        g_app_desc.on_resize((uint32_t)pw, (uint32_t)ph,
+                             g_app_desc.user_data);
+
+    /* Emit a minimal render frame so bgfx processes the reset. */
+    if (!jce_renderer_is_fallback(e->renderer)) {
+        jce_renderer_begin_frame(e->renderer, e->window);
+
+        if (g_app_desc.update)
+            g_app_desc.update(0.0f, g_app_desc.user_data);
+        if (g_app_desc.draw)
+            g_app_desc.draw(&e->svc, g_app_desc.user_data);
+
+        jce_renderer_end_frame(e->renderer);
+    }
+
+    return true;   /* let other watchers see the event too */
 }
 
 /* -- Event routing ------------------------------------------------- */
@@ -418,30 +571,8 @@ JceAppResult jce_engine_event(JceEngine *e, const void *platform_event)
 
     if (e->input) jce_input_handle_event(e->input, event);
 
-    if (event->type == SDL_EVENT_WINDOW_RESIZED ||
-        event->type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED) {
-        int pw, ph;
-        SDL_GetWindowSizeInPixels(jce_window_sdl(e->window), &pw, &ph);
-        jce_window_handle_resize(e->window, (uint32_t)pw, (uint32_t)ph);
-        jce_renderer_resize(e->renderer, (uint32_t)pw, (uint32_t)ph);
-        if (g_app_desc.on_resize)
-            g_app_desc.on_resize((uint32_t)pw, (uint32_t)ph,
-                                 g_app_desc.user_data);
-
-        /* On Windows, SDL3 runs a modal loop during window resize (WM_SIZING)
-         * so SDL_AppIterate is never called.  Emit a minimal render frame here
-         * so bgfx processes the reset and the backbuffer stays in sync. */
-        if (!jce_renderer_is_fallback(e->renderer)) {
-            jce_renderer_begin_frame(e->renderer, e->window);
-
-            if (g_app_desc.update)
-                g_app_desc.update(0.0f, g_app_desc.user_data);
-            if (g_app_desc.draw)
-                g_app_desc.draw(&e->svc, g_app_desc.user_data);
-
-            jce_renderer_end_frame(e->renderer);
-        }
-    }
+    /* Resize handling is done in jce_resize_event_watch() which fires
+       from both SDL_PollEvent and Windows modal message loops. */
 
     if (g_app_desc.on_event)
         g_app_desc.on_event(event, g_app_desc.user_data);
@@ -531,6 +662,13 @@ JceAppResult jce_engine_iterate(JceEngine *e)
 void jce_engine_destroy(JceEngine *e)
 {
     if (!e) return;
+
+    SDL_RemoveEventWatch(jce_resize_event_watch, e);
+
+#ifdef SDL_PLATFORM_WINDOWS
+    SDL_SetWindowsMessageHook(NULL, NULL);
+    g_modal_engine = NULL;
+#endif
 
     if (g_app_desc.exit)
         g_app_desc.exit(g_app_desc.user_data);

@@ -82,6 +82,14 @@ public final class JceRuntime implements AutoCloseable {
         }
 
         System.setProperty("jce.config.path", resolveConfigPathForNative());
+
+        /* Extract and set the shared PAK path. Native side reads this via
+         * jce_engine_set_pak_path() — one copy shared across all platforms. */
+        String pakPath = extractPakIfNeeded();
+        if (pakPath != null) {
+            System.setProperty("jce.pak.path", pakPath);
+        }
+
         nativeHandle = nativeCreate();
         if (nativeHandle == 0L) {
             throw new IllegalStateException("Failed to create native JCE engine");
@@ -168,6 +176,32 @@ public final class JceRuntime implements AutoCloseable {
             Files.setPosixFilePermissions(path, perms);
         } catch (IOException ignored) {
             // Best-effort hardening on POSIX systems.
+        }
+    }
+
+    /**
+     * Extracts game_assets.pak from the JAR to the application directory
+     * if it doesn't already exist there.  Returns the absolute path.
+     */
+    private static String extractPakIfNeeded() {
+        Path appDir = resolveApplicationDirectory();
+        Path pakDest = appDir.resolve("game_assets.pak");
+
+        /* If PAK is already on disk (dev override or previous extract), use it. */
+        if (Files.exists(pakDest)) {
+            return pakDest.toAbsolutePath().toString();
+        }
+
+        /* Try to extract from JAR resource. */
+        try (InputStream in = JceRuntime.class.getResourceAsStream("/game_assets.pak")) {
+            if (in == null) {
+                return null;  /* No PAK bundled — will fall back to native search. */
+            }
+            Files.copy(in, pakDest, StandardCopyOption.REPLACE_EXISTING);
+            return pakDest.toAbsolutePath().toString();
+        } catch (IOException e) {
+            System.err.println("JCE: failed to extract game_assets.pak: " + e.getMessage());
+            return null;
         }
     }
 

@@ -51,6 +51,28 @@ static const char *jce_get_config_property(JNIEnv *env, jstring *out_config_jstr
     return (*env)->GetStringUTFChars(env, value, NULL);
 }
 
+static const char *jce_get_system_property(JNIEnv *env, const char *prop_name,
+                                            jstring *out_jstr)
+{
+    jclass systemClass = (*env)->FindClass(env, "java/lang/System");
+    if (!systemClass) return NULL;
+
+    jmethodID getProp = (*env)->GetStaticMethodID(env, systemClass,
+        "getProperty", "(Ljava/lang/String;)Ljava/lang/String;");
+    if (!getProp) return NULL;
+
+    jstring key = (*env)->NewStringUTF(env, prop_name);
+    if (!key) return NULL;
+
+    jstring value = (jstring)(*env)->CallStaticObjectMethod(env, systemClass, getProp, key);
+    (*env)->DeleteLocalRef(env, key);
+
+    if (!value) return NULL;
+
+    *out_jstr = value;
+    return (*env)->GetStringUTFChars(env, value, NULL);
+}
+
 JNIEXPORT jlong JNICALL Java_com_jce_JceRuntime_nativeCreate(JNIEnv *env, jclass clazz)
 {
     (void)clazz;
@@ -60,29 +82,37 @@ JNIEXPORT jlong JNICALL Java_com_jce_JceRuntime_nativeCreate(JNIEnv *env, jclass
 
     jce_engine_set_config_path(configUtf8);
 
+    /* Read PAK path from Java system property (set by JceRuntime). */
+    jstring pakPath = NULL;
+    const char *pakUtf8 = jce_get_system_property(env, "jce.pak.path", &pakPath);
+    jce_engine_set_pak_path(pakUtf8);
+
     JceAppDesc desc = ck_app_get_desc();
     jce_engine_set_app_desc(&desc);
 
     JceBridgeEngine *bridge = (JceBridgeEngine *)JCE_CALLOC(1, sizeof(*bridge));
     if (!bridge) {
-        if (configPath && configUtf8) {
+        if (configPath && configUtf8)
             (*env)->ReleaseStringUTFChars(env, configPath, configUtf8);
-        }
+        if (pakPath && pakUtf8)
+            (*env)->ReleaseStringUTFChars(env, pakPath, pakUtf8);
         return 0;
     }
 
     bridge->engine = jce_engine_create(0, NULL);
     if (!bridge->engine) {
         JCE_FREE(bridge);
-        if (configPath && configUtf8) {
+        if (configPath && configUtf8)
             (*env)->ReleaseStringUTFChars(env, configPath, configUtf8);
-        }
+        if (pakPath && pakUtf8)
+            (*env)->ReleaseStringUTFChars(env, pakPath, pakUtf8);
         return 0;
     }
 
-    if (configPath && configUtf8) {
+    if (configPath && configUtf8)
         (*env)->ReleaseStringUTFChars(env, configPath, configUtf8);
-    }
+    if (pakPath && pakUtf8)
+        (*env)->ReleaseStringUTFChars(env, pakPath, pakUtf8);
 
     bridge->last_result = SDL_APP_CONTINUE;
     return (jlong)(intptr_t)bridge;

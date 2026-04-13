@@ -233,6 +233,7 @@ _jce_add_layer(jce_app
 
 if(JCE_BUILD_JNI)
 	target_include_directories(jce_app PRIVATE ${JNI_INCLUDE_DIRS})
+	target_compile_definitions(jce_app PRIVATE JCE_BUILD_JNI=1)
 endif()
 
 # jce_ui needs jce_app for config access (circular at layer level,

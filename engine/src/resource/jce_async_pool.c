@@ -107,12 +107,20 @@ static void decode_texture_inner(JceAsyncRequest *req)
 			return;
 		}
 
-		JceAssetTexInfo tex_info;
+		/* Read texture info (info chunk may include mip offsets). */
+		void *info_buf = JCE_MALLOC((size_t)info_c->original_size);
+		if (!info_buf) { JCE_FREE(buf); return; }
+
 		if (jce_asset_chunk_data(&view, info_c,
-		                          &tex_info, sizeof(tex_info)) == 0) {
+		                          info_buf, (size_t)info_c->original_size) == 0) {
+			JCE_FREE(info_buf);
 			JCE_FREE(buf);
 			return;
 		}
+
+		JceAssetTexInfo tex_info;
+		memcpy(&tex_info, info_buf, sizeof(tex_info));
+		JCE_FREE(info_buf);
 
 		size_t pixel_size = (size_t)pix_c->original_size;
 		void *pixels = JCE_MALLOC(pixel_size + sizeof(JceAssetTexInfo));

@@ -188,13 +188,20 @@ static JceTexture jce_texture_load_ex_inner(const PakArchive *pak,
             return JCE_TEXTURE_INVALID;
         }
 
-        /* Read texture info. */
-        JceAssetTexInfo tex_info;
+        /* Read texture info (info chunk may include mip offsets after the struct). */
+        void *info_buf = JCE_MALLOC((size_t)info_chunk->original_size);
+        if (!info_buf) { JCE_FREE(buf); return JCE_TEXTURE_INVALID; }
+
         if (jce_asset_chunk_data(&view, info_chunk,
-                                  &tex_info, sizeof(tex_info)) == 0) {
+                                  info_buf, (size_t)info_chunk->original_size) == 0) {
+            JCE_FREE(info_buf);
             JCE_FREE(buf);
             return JCE_TEXTURE_INVALID;
         }
+
+        JceAssetTexInfo tex_info;
+        memcpy(&tex_info, info_buf, sizeof(tex_info));
+        JCE_FREE(info_buf);
 
         /* Read RGBA8 pixel data. */
         void *tex_data = JCE_MALLOC((size_t)pixel_chunk->original_size);

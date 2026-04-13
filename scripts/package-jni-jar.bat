@@ -1,10 +1,11 @@
 @echo off
 :: ================================================================
 :: package-jni-jar.bat -- Build JCE JNI native and package fat JAR
-:: Usage: package-jni-jar.bat [java_home] [--clean] [--fat]
+:: Usage: package-jni-jar.bat [java_home] [--clean] [--fat] [--dist]
 ::   java_home - Path to JDK (default: JAVA_HOME env or D:\Java21\openjdk-8)
 ::   --clean   - Force full rebuild (remove CMake + Conan caches)
 ::   --fat     - Skip native build, only re-package fat JAR from natives
+::   --dist    - Distribution build (Tracy OFF, optimised)
 ::
 :: Default: build host native + package ALL available natives into fat JAR.
 :: To add other platforms, copy their .dll/.so/.dylib into:
@@ -12,7 +13,7 @@
 :: Classifiers: win32-x86_64, win32-aarch64,
 ::   linux-x86_64, linux-aarch64, darwin-x86_64, darwin-aarch64
 ::
-:: Output: build\jni\dist\jce-jni.jar  (fat JAR with all available natives)
+:: Output: build\jni\<variant>\jce-jni.jar  (fat JAR with all available natives)
 :: ================================================================
 setlocal enabledelayedexpansion
 
@@ -23,11 +24,14 @@ pushd "%REPO_ROOT%" || goto :error
 set "JAVA_DIR="
 set "DO_CLEAN=0"
 set "DO_FAT=0"
+set "VARIANT=release"
 for %%A in (%*) do (
     if /i "%%~A"=="--clean" (
         set "DO_CLEAN=1"
     ) else if /i "%%~A"=="--fat" (
         set "DO_FAT=1"
+    ) else if /i "%%~A"=="--dist" (
+        set "VARIANT=dist"
     ) else if not defined JAVA_DIR (
         set "JAVA_DIR=%%~A"
     )
@@ -60,7 +64,7 @@ echo Using Java: %JAVA_DIR%
 :: Shared directories under build\jni
 set "JNI_ROOT=build\jni"
 set "NATIVES_DIR=%JNI_ROOT%\natives"
-set "DIST_DIR=%JNI_ROOT%\dist"
+set "DIST_DIR=%JNI_ROOT%\%VARIANT%"
 
 :: ================================================================
 :: Fat JAR mode: assemble from pre-built natives
@@ -73,12 +77,12 @@ if "%DO_FAT%"=="1" goto :fat_jar
 set "CONAN_DIR=%JNI_ROOT%\desktop-conan"
 set "BUILD_DIR=%JNI_ROOT%\desktop"
 set "TOOLCHAIN=%CONAN_DIR%\build\Release\generators\conan_toolchain.cmake"
-set "DLL_PATH=%BUILD_DIR%\caged_kingdom\%LIB_NAME%"
+set "DLL_PATH=%BUILD_DIR%\%VARIANT%\%LIB_NAME%"
 set "PROFILE=conan/profiles/windows-x64"
 
 echo.
 echo ================================================================
-echo   JCE JNI Build (host: %CLASSIFIER%)
+echo   JCE JNI Build (host: %CLASSIFIER%, variant: %VARIANT%)
 echo ================================================================
 
 :: -- Handle --clean flag --
@@ -106,7 +110,7 @@ if not exist "%TOOLCHAIN%" (
 
 :: -- Step 2: CMake configure --
 echo === Step 2: CMake configure ===
-cmake -S . -B %BUILD_DIR% -G Ninja -DCMAKE_TOOLCHAIN_FILE=%TOOLCHAIN% -DCMAKE_BUILD_TYPE=Release -DJCE_BUILD_JNI=ON -DJCE_ENABLE_CPPCHECK=OFF -DJCE_BUILD_VARIANT=release
+cmake -S . -B %BUILD_DIR% -G Ninja -DCMAKE_TOOLCHAIN_FILE=%TOOLCHAIN% -DCMAKE_BUILD_TYPE=Release -DJCE_BUILD_JNI=ON -DJCE_ENABLE_CPPCHECK=OFF -DJCE_BUILD_VARIANT=%VARIANT%
 if errorlevel 1 goto :error
 
 :: -- Step 3: Build (Ninja handles incremental) --
@@ -188,6 +192,18 @@ for /d %%D in ("%NATIVES_DIR%\*") do (
     )
 )
 
+:: Copy shared game_assets.pak (one copy for all platforms)
+echo === Copy shared PAK ===
+set "GAME_PAK=%REPO_ROOT%\build\desktop\windows-x64\game_assets.pak"
+if not exist "%GAME_PAK%" set "GAME_PAK=%REPO_ROOT%\build\jni\desktop\game_assets.pak"
+if exist "%GAME_PAK%" (
+    copy /y "%GAME_PAK%" "%CLASSES_DIR%\game_assets.pak" >nul
+    echo   Packed: game_assets.pak [shared]
+) else (
+    echo   WARNING: game_assets.pak not found, JAR will not include assets.
+    echo   Build the game first to generate game_assets.pak.
+)
+
 :: Package fat JAR
 echo === Package fat JAR ===
 set "FAT_JAR=%DIST_DIR%\jce-jni.jar"
@@ -197,7 +213,7 @@ if exist "%FAT_JAR%" del /q "%FAT_JAR%"
 if errorlevel 1 goto :error
 
 echo.
-echo [SUCCESS] %FAT_JAR%
+echo [SUCCESS] %FAT_JAR% (%VARIANT%)
 echo   Platforms: %NATIVE_COUNT%
 echo   Run: %JAVA_DIR%\bin\java.exe -jar %FAT_JAR% 5
 popd

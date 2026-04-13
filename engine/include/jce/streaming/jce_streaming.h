@@ -27,6 +27,8 @@ extern "C" {
 #endif
 
 typedef struct JceStreamingSystem JceStreamingSystem;
+typedef struct JceFileSystem      JceFileSystem;
+typedef struct JceThreadPool      JceThreadPool;
 
 /* ================================================================== */
 /* Streaming strategy                                                  */
@@ -77,11 +79,41 @@ typedef struct {
 } JceStreamChunk;
 
 /* ================================================================== */
+/* Chunk load callback                                                 */
+/* ================================================================== */
+
+/* Called when a chunk finishes loading (success or failure).
+ * data: loaded chunk data (NULL on failure)
+ * size: data size in bytes
+ * user_data: user-provided context
+ */
+typedef void (*JceChunkLoadedFn)(uint32_t chunk_id, void *data, size_t size,
+                                  void *user_data);
+
+/* Called when a chunk is about to be unloaded.
+ * user_data: user-provided context
+ */
+typedef void (*JceChunkUnloadedFn)(uint32_t chunk_id, void *user_data);
+
+/* ================================================================== */
 /* Lifecycle                                                           */
 /* ================================================================== */
 
 JceStreamingSystem *jce_streaming_create(const JceStreamingConfig *config);
 void                jce_streaming_destroy(JceStreamingSystem *sys);
+
+/* Bind file system for loading. Must be called before streaming starts. */
+void jce_streaming_set_filesystem(JceStreamingSystem *sys, JceFileSystem *fs);
+
+/* Bind thread pool for multi-threaded loading (optional).
+ * If not set, single_thread mode is forced. */
+void jce_streaming_set_thread_pool(JceStreamingSystem *sys, JceThreadPool *pool);
+
+/* Set callbacks for chunk load/unload events (optional). */
+void jce_streaming_set_callbacks(JceStreamingSystem *sys,
+                                  JceChunkLoadedFn on_loaded,
+                                  JceChunkUnloadedFn on_unloaded,
+                                  void *user_data);
 
 /* ================================================================== */
 /* Chunk registration                                                  */
@@ -126,6 +158,10 @@ bool jce_streaming_chunk_loaded(const JceStreamingSystem *sys,
 /* Query the state of a specific chunk. */
 JceChunkState jce_streaming_chunk_state(const JceStreamingSystem *sys,
                                         uint32_t chunk_id);
+
+/* Get the loaded data for a chunk (NULL if not loaded). */
+void *jce_streaming_chunk_data(const JceStreamingSystem *sys,
+                                uint32_t chunk_id, size_t *out_size);
 
 /* Return true if the streaming system is operating in single-thread mode. */
 bool jce_streaming_is_single_thread(const JceStreamingSystem *sys);

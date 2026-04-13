@@ -33,6 +33,12 @@ void           jce_engine_set_app_desc(const JceAppDesc *desc);
    Pass NULL or empty string to clear override. */
 void           jce_engine_set_config_path(const char *path);
 
+/* Set optional PAK file path for JNI desktop mode.
+   Pass NULL or empty string to clear override.
+   When set, jce_engine_create() loads the PAK from this file
+   instead of embedding it in the binary. */
+void           jce_engine_set_pak_path(const char *path);
+
 /* Override the renderer backend selection.
    Must be called before jce_engine_create().
    Pass JCE_BACKEND_AUTO (0) to clear override and use config file value.

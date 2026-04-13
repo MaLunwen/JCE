@@ -81,8 +81,7 @@ size_t jce_asset_chunk_data(const JceAssetView *view,
                             const JceAssetChunkEntry *chunk,
                             void *out_buf, size_t out_size)
 {
-	if (!view || !chunk || !out_buf) return 0;
-	if (out_size < chunk->original_size) return 0;
+	if (!view || !chunk || !out_buf || out_size == 0) return 0;
 
 	/* Bounds-check the chunk data region. */
 	if (chunk->data_offset + chunk->compressed_size > view->blob_size)
@@ -91,13 +90,17 @@ size_t jce_asset_chunk_data(const JceAssetView *view,
 	const uint8_t *src = view->blob + chunk->data_offset;
 
 	if (chunk->compression == JCEASSET_COMPRESS_ZSTD) {
+		/* Decompress requires a buffer at least as large as original_size. */
+		if (out_size < chunk->original_size) return 0;
 		size_t result = ZSTD_decompress(out_buf, out_size,
 		                                src, (size_t)chunk->compressed_size);
 		if (ZSTD_isError(result)) return 0;
 		return result;
 	}
 
-	/* Uncompressed — just copy. */
-	memcpy(out_buf, src, (size_t)chunk->original_size);
-	return (size_t)chunk->original_size;
+	/* Uncompressed — copy up to out_size bytes. */
+	size_t to_copy = chunk->original_size;
+	if (to_copy > out_size) to_copy = out_size;
+	memcpy(out_buf, src, to_copy);
+	return to_copy;
 }

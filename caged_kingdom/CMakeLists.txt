@@ -21,7 +21,11 @@ if(JCE_PLATFORM_ANDROID OR JCE_BUILD_JNI)
 		set_target_properties(CagedKingdom PROPERTIES OUTPUT_NAME JCE)
 	elseif(JCE_BUILD_JNI)
 		# Host JNI: JceRuntime loads "jce" → jce.dll / libjce.so
-		set_target_properties(CagedKingdom PROPERTIES OUTPUT_NAME jce)
+		set_target_properties(CagedKingdom PROPERTIES
+			OUTPUT_NAME jce
+			RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/${JCE_BUILD_VARIANT}"
+			LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/${JCE_BUILD_VARIANT}"
+			ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/${JCE_BUILD_VARIANT}")
 	endif()
 else()
 	add_executable(CagedKingdom ${CK_SOURCES})
@@ -85,20 +89,25 @@ target_include_directories(CagedKingdom PRIVATE
 # entry points (Java_com_jce_JceRuntime_*) are silently discarded and Java gets
 # UnsatisfiedLinkError at runtime.
 # Android does NOT need WHOLE_ARCHIVE: SDL callbacks are referenced via main.c.
+#
+# We use platform-specific linker flags instead of CMake's LINK_LIBRARY feature
+# because transitive PUBLIC dependencies cause WHOLE_ARCHIVE/DEFAULT conflicts.
 if(JCE_BUILD_JNI)
-	target_link_libraries(CagedKingdom PRIVATE
-		$<LINK_LIBRARY:WHOLE_ARCHIVE,jce_app>
-		$<LINK_LIBRARY:WHOLE_ARCHIVE,jce_core>
-		$<LINK_LIBRARY:WHOLE_ARCHIVE,jce_platform>
-		$<LINK_LIBRARY:WHOLE_ARCHIVE,jce_graphics>
-		$<LINK_LIBRARY:WHOLE_ARCHIVE,jce_audio>
-		$<LINK_LIBRARY:WHOLE_ARCHIVE,jce_physics>
-		$<LINK_LIBRARY:WHOLE_ARCHIVE,jce_animation>
-		$<LINK_LIBRARY:WHOLE_ARCHIVE,jce_ai>
-		$<LINK_LIBRARY:WHOLE_ARCHIVE,jce_net>
-		$<LINK_LIBRARY:WHOLE_ARCHIVE,jce_scene>
-		$<LINK_LIBRARY:WHOLE_ARCHIVE,jce_ui>
-		$<LINK_LIBRARY:WHOLE_ARCHIVE,jce_resource>)
+	target_link_libraries(CagedKingdom PRIVATE JCE)
+	if(MSVC)
+		# MSVC: /WHOLEARCHIVE forces all .obj from each .lib to be included.
+		foreach(_lib jce_app jce_core)
+			target_link_options(CagedKingdom PRIVATE
+				"/WHOLEARCHIVE:$<TARGET_FILE:${_lib}>")
+		endforeach()
+	else()
+		# GCC / Clang: --whole-archive / --no-whole-archive bracket.
+		target_link_options(CagedKingdom PRIVATE
+			"LINKER:--whole-archive"
+			"$<TARGET_FILE:jce_app>"
+			"$<TARGET_FILE:jce_core>"
+			"LINKER:--no-whole-archive")
+	endif()
 else()
 	target_link_libraries(CagedKingdom PRIVATE JCE)
 endif()
@@ -164,9 +173,12 @@ if(JCE_PLATFORM_WEB)
 	# The runtime opens it with pak_open_file("/game_assets.pak").
 	target_link_options(CagedKingdom PRIVATE
 		"SHELL:--preload-file ${GAME_PAK_FILE}@/game_assets.pak")
-elseif(JCE_PLATFORM_ANDROID)
+elseif(JCE_PLATFORM_ANDROID OR JCE_BUILD_JNI)
 	# Android: PAK shipped as APK asset, loaded at runtime via SDL_IOFromFile.
-	# Embedding 290 MB in .rodata causes SEGV_ACCERR on Houdini translator.
+	# JNI:     PAK shipped alongside the native lib in the fat JAR, extracted
+	#          and loaded at runtime via pak_open_file().  This avoids embedding
+	#          a ~290 MB blob inside every per-platform shared library, keeping
+	#          a single shared copy of game_assets.pak across all architectures.
 elseif(MSVC)
 	# MSVC: link the COFF .obj produced by jce_pak.
 	target_link_libraries(CagedKingdom PRIVATE "${GAME_PAK_OBJ_FILE}")

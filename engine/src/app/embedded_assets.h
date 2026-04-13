@@ -5,10 +5,13 @@
  *
  * On Emscripten the PAK is not linked in; the runtime opens it via
  * pak_open_file("/game_assets.pak") from the Emscripten virtual FS.
+ *
+ * On Android and JNI desktop mode the PAK is loaded from external file
+ * at runtime to avoid duplicating ~290 MB per platform/architecture.
  */
 #pragma once
 
-#if !defined(__EMSCRIPTEN__) && !defined(__ANDROID__)
+#if !defined(__EMSCRIPTEN__) && !defined(__ANDROID__) && !defined(JCE_BUILD_JNI)
 
 #ifdef __cplusplus
 extern "C" {
@@ -21,4 +24,4 @@ extern const size_t        assets_pak_data_size;
 }
 #endif
 
-#endif /* !__EMSCRIPTEN__ && !__ANDROID__ */
+#endif /* !__EMSCRIPTEN__ && !__ANDROID__ && !JCE_BUILD_JNI */
