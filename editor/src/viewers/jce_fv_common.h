@@ -35,6 +35,7 @@ extern "C" {
  * ══════════════════════════════════════════════════════════════════════ */
 
 #define FV_MAX_TABS       16
+#define FV_MAX_ASSET_BYTES (200 * 1024 * 1024) /* 200 MB per asset */
 #define FV_MAX_CONTENT    (1024 * 256)   /* 256 KB per file */
 #define FV_EDIT_BUF_CAP   (1024 * 64)   /* 64 KB edit buffer */
 
@@ -82,11 +83,14 @@ void fv_render_image(FvTab *tab);
 void fv_render_model(FvTab *tab);
 void fv_render_scene(FvTab *tab);
 void fv_render_material(FvTab *tab);
+void fv_render_audio(FvTab *tab);
 void fv_render_hex(FvTab *tab);
 
 /* ── Per-viewer cleanup (called when closing a tab) ──────────────── */
 
 void fv_code_close_tab(FvTab *tab);
+void fv_audio_close_tab(FvTab *tab);
+void fv_audio_update_focus(const char *active_tab_path, bool allow_playback);
 void fv_model_close_tab(const char *path);
 void fv_model_shutdown(void);
 

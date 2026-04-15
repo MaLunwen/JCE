@@ -773,3 +773,59 @@ JceModel *jce_gltf_load(const PakArchive *pak, const char *asset_path)
     JCE_FREE(buf);
     return model;
 }
+
+/* ================================================================== */
+/* Load from raw memory (no PAK required)                              */
+/* ================================================================== */
+
+JceModel *jce_gltf_load_memory(const void *file_data, uint32_t size,
+                               const char *name)
+{
+    if (!file_data || size == 0) return NULL;
+    const char *tag = name ? name : "<memory>";
+
+    /* ---- Parse with cgltf ---- */
+    cgltf_options options;
+    memset(&options, 0, sizeof(options));
+    cgltf_data *data = NULL;
+    cgltf_result result = cgltf_parse(&options, file_data, (cgltf_size)size,
+                                      &data);
+    if (result != cgltf_result_success) {
+        LOG_ERROR(LOG_TAG, "cgltf_parse failed (%d): %s", (int)result, tag);
+        return NULL;
+    }
+
+    result = cgltf_load_buffers(&options, data, NULL);
+    if (result != cgltf_result_success) {
+        LOG_ERROR(LOG_TAG, "cgltf_load_buffers failed (%d): %s",
+                  (int)result, tag);
+        cgltf_free(data);
+        return NULL;
+    }
+
+    if (data->buffers_count > 0 && !data->buffers[0].data && data->bin) {
+        data->buffers[0].data = (void *)data->bin;
+        data->buffers[0].size = data->bin_size;
+    }
+
+    /* ---- Build model ---- */
+    JceModel *model = (JceModel *)JCE_CALLOC(1, sizeof(JceModel));
+    if (!model) {
+        cgltf_free(data);
+        return NULL;
+    }
+
+    /* Materials – no PAK so pass NULL; embedded textures still decoded. */
+    model->materials = extract_materials(NULL, tag, data,
+                                          &model->num_materials);
+    model->nodes     = extract_nodes(data, &model->num_nodes);
+    model->skeleton  = extract_skeleton(data);
+    model->anim_clips = extract_animations(data, &model->num_anims);
+
+    LOG_DEBUG(LOG_TAG, "loaded %s (memory): %u nodes, %u materials, %u anims%s",
+              tag, model->num_nodes, model->num_materials,
+              model->num_anims, model->skeleton ? " (skinned)" : "");
+
+    cgltf_free(data);
+    return model;
+}

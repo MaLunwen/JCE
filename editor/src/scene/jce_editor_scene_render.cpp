@@ -7,6 +7,7 @@
  */
 
 #include "jce_scene_render_internal.h"
+#include "jce_editor_file_util.h"
 
 /* ── State instance (shared via extern in internal header) ────────── */
 
@@ -30,6 +31,58 @@ JceTexture get_cached_texture(const char *material_path,
                                      const char *mesh_path)
 {
     return jce_editor_scene_asset_cache_get_texture(material_path, mesh_path);
+}
+
+/* ── Model / animation cache ─────────────────────────────────────── */
+
+ModelCacheEntry *get_cached_model(const char *skeleton_path, uint32_t entity_id)
+{
+    if (!skeleton_path || skeleton_path[0] == '\0') return nullptr;
+
+    /* Look up existing entry by path. */
+    int free_slot = -1;
+    for (int i = 0; i < MODEL_CACHE_MAX; ++i) {
+        ModelCacheEntry &e = s_sr.model_cache[i];
+        if (e.used && strcmp(e.path, skeleton_path) == 0) {
+            e.bound_entity = entity_id;
+            return &e;
+        }
+        if (!e.used && free_slot < 0) free_slot = i;
+    }
+
+    if (free_slot < 0) return nullptr; /* cache full */
+
+    /* Load from disk. */
+    size_t fsize = 0;
+    void *buf = ed_read_file(skeleton_path, &fsize);
+    if (!buf) {
+        LOG_WARN(LOG_TAG, "model cache: cannot read %s", skeleton_path);
+        return nullptr;
+    }
+
+    JceModel *model = jce_model_load_gltf_memory(buf, (uint32_t)fsize,
+                                                   skeleton_path);
+    ED_FREE(buf);
+    if (!model) return nullptr;
+
+    ModelCacheEntry &e = s_sr.model_cache[free_slot];
+    snprintf(e.path, sizeof(e.path), "%s", skeleton_path);
+    e.model        = model;
+    e.player       = nullptr;
+    e.bound_entity = entity_id;
+    e.active_clip  = -1;
+    e.loop         = false;
+    e.speed        = 1.0f;
+    e.paused       = true;
+    e.used         = true;
+
+    /* Create anim player if skeleton + clips are available. */
+    JceSkeleton *skel = jce_model_get_skeleton(model);
+    if (skel && jce_model_anim_count(model) > 0) {
+        e.player = jce_anim_player_create(skel);
+    }
+
+    return &e;
 }
 
 /* ── Init ─────────────────────────────────────────────────────────── */
@@ -192,6 +245,15 @@ void jce_editor_scene_render_shutdown(void)
 {
     if (!s_sr.initialized) return;
 
+    /* Flush model / animation cache. */
+    for (int i = 0; i < MODEL_CACHE_MAX; ++i) {
+        ModelCacheEntry &e = s_sr.model_cache[i];
+        if (!e.used) continue;
+        if (e.player) { jce_anim_player_destroy(e.player); e.player = nullptr; }
+        if (e.model)  { jce_model_destroy(e.model);        e.model  = nullptr; }
+        e.used = false;
+    }
+
     jce_editor_scene_asset_cache_shutdown();
 
     if (s_sr.bridge) {
@@ -325,4 +387,20 @@ void jce_editor_scene_set_hover_entity(uint32_t entity_id)
 void jce_editor_scene_clear_hover_entity(void)
 {
     s_sr.hover_entity_id = 0;
+}
+
+/* ── Animation query helpers ──────────────────────────────────────── */
+
+JceAnimPlayer *jce_editor_scene_get_anim_player(const char *skeleton_path,
+                                                 uint32_t entity_id)
+{
+    ModelCacheEntry *mc = get_cached_model(skeleton_path, entity_id);
+    return mc ? mc->player : nullptr;
+}
+
+JceModel *jce_editor_scene_get_model(const char *skeleton_path,
+                                     uint32_t entity_id)
+{
+    ModelCacheEntry *mc = get_cached_model(skeleton_path, entity_id);
+    return mc ? mc->model : nullptr;
 }

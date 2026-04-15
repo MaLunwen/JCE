@@ -150,10 +150,14 @@ static void handle_global_edit_shortcuts(void)
 
 static void draw_menu_bar(void)
 {
-    if (!ImGui::BeginMenuBar()) return;
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f, 8.0f));
+    if (!ImGui::BeginMenuBar()) {
+        ImGui::PopStyleVar();
+        return;
+    }
 
-    /* Wider spacing between menu items to match reference editor. */
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(16, 4));
+    /* Match requested larger row spacing and overall bar height. */
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(18, 8));
 
     /* ── File ──────────────────────────────────────────────────────── */
     if (ImGui::BeginMenu(jce_editor_i18n("menu.file"))) {
@@ -305,7 +309,7 @@ static void draw_menu_bar(void)
         if (!can_stop) ImGui::EndDisabled();
     }
 
-    ImGui::PopStyleVar(); /* ItemSpacing for menu bar */
+    ImGui::PopStyleVar(2); /* ItemSpacing + FramePadding */
     ImGui::EndMenuBar();
 }
 
@@ -602,6 +606,12 @@ void jce_editor_layout_request_quit(void)
 {
     if (s_quit_confirmed) return;
     if (s_show_unsaved)   return; /* already showing */
+
+    if (!jce_state_is_scene_modified()) {
+        s_quit_confirmed = true;
+        return;
+    }
+
     s_unsaved_result = 0;
     s_show_unsaved   = true;
 }

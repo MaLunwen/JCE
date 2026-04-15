@@ -97,6 +97,7 @@ void  jce_anim_player_play(JceAnimPlayer *p, const JceAnimClip *clip,
 void  jce_anim_player_stop(JceAnimPlayer *p);
 void  jce_anim_player_pause(JceAnimPlayer *p, bool paused);
 void  jce_anim_player_set_speed(JceAnimPlayer *p, float speed);
+void  jce_anim_player_set_time(JceAnimPlayer *p, float time);
 float jce_anim_player_get_time(const JceAnimPlayer *p);
 bool  jce_anim_player_is_playing(const JceAnimPlayer *p);
 

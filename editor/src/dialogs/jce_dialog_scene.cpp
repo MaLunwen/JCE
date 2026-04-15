@@ -318,9 +318,14 @@ void jce_editor_dialog_open_scene(bool *p_open)
     ImGui::Spacing();
     ImGui::BeginChild("##scene_file_list", ImVec2(0, ImGui::GetContentRegionAvail().y - 44.0f),
                       ImGuiChildFlags_Borders, ImGuiWindowFlags_None);
+    bool open_from_double_click = false;
     for (int i = 0; i < (int)s_open_scene.scene_files.size(); i++) {
-        if (ImGui::Selectable(s_open_scene.scene_files[i].c_str(), s_open_scene.selected_idx == i)) {
+        if (ImGui::Selectable(s_open_scene.scene_files[i].c_str(),
+                              s_open_scene.selected_idx == i,
+                              ImGuiSelectableFlags_AllowDoubleClick)) {
             s_open_scene.selected_idx = i;
+            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                open_from_double_click = true;
         }
     }
     ImGui::EndChild();
@@ -338,7 +343,8 @@ void jce_editor_dialog_open_scene(bool *p_open)
     ImGui::BeginDisabled(!can_open);
     if (ImGui::Button(jce_editor_i18n("dialog.open"), ImVec2(90, 0))
         || (can_open
-            && (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)))) {
+            && (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)))
+        || (can_open && open_from_double_click)) {
         s_open_scene.error_msg[0] = '\0';
 
         fs::path full;
@@ -527,7 +533,7 @@ void jce_editor_dialog_unsaved_changes(bool *p_open, int *result)
 
     const ImGuiViewport *vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(480, 180), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(ImVec2(500, 180), ImGuiCond_Appearing);
     ImGui::SetNextWindowViewport(vp->ID);
 
     if (!ImGui::Begin(_title, p_open,
@@ -540,7 +546,7 @@ void jce_editor_dialog_unsaved_changes(bool *p_open, int *result)
 
     /* Warning icon + message */
     ImGui::Spacing();
-    ImGui::TextColored(JCE_COLOR_CONSOLE_WARN, "  !!  ");
+    ImGui::TextColored(JCE_COLOR_CONSOLE_WARN, " ? ");
     ImGui::SameLine();
     ImGui::TextWrapped("%s", jce_editor_i18n("unsaved.message"));
 
@@ -555,17 +561,26 @@ void jce_editor_dialog_unsaved_changes(bool *p_open, int *result)
     ImGui::SetCursorPosX(ImGui::GetContentRegionAvail().x - total_btn_w
                          + ImGui::GetCursorPosX());
 
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.24f, 0.62f, 0.24f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.30f, 0.70f, 0.30f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.20f, 0.52f, 0.20f, 1.0f));
     if (ImGui::Button(jce_editor_i18n("dialog.save"), ImVec2(btn_w, 0))
         || ImGui::IsKeyPressed(ImGuiKey_Enter)
         || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) {
         if (result) *result = 1;
         *p_open = false;
     }
+    ImGui::PopStyleColor(3);
     ImGui::SameLine();
+
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.65f, 0.24f, 0.24f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.75f, 0.30f, 0.30f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.55f, 0.20f, 0.20f, 1.0f));
     if (ImGui::Button(jce_editor_i18n("unsaved.dontSave"), ImVec2(btn_w, 0))) {
         if (result) *result = 2;
         *p_open = false;
     }
+    ImGui::PopStyleColor(3);
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("dialog.cancel"), ImVec2(btn_w, 0))) {
         if (result) *result = 3;

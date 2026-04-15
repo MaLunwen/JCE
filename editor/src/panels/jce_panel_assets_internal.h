@@ -71,6 +71,9 @@ struct AssetBrowserState {
     std::vector<FileEntry> search_results;
     std::string last_search_query;
     std::string last_search_root;
+    std::string pending_navigation_path;
+    bool pending_navigation_clear_search;
+    double next_auto_refresh_time;
 };
 
 extern AssetBrowserState s_assets;
@@ -80,6 +83,7 @@ extern AssetBrowserState s_assets;
 std::string normalized_path_string(const fs::path &p);
 void        ensure_assets_init(void);
 void        refresh_entries(void);
+void        navigate_asset_directory(const std::string &path, bool clear_search);
 void        collect_search_results(const std::string &query);
 
 ImVec4      asset_color_for_ext(const std::string &ext, bool is_dir);

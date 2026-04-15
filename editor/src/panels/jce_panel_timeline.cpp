@@ -2,9 +2,8 @@
  * jce_panel_timeline.cpp  Timeline panel (animation keyframes).
  * Extracted from jce_editor_panels.cpp.
  *
- * Now integrates with the engine animation system to display
- * real animation data from entities with Animator or SkeletalAnimator
- * components.
+ * Time-based timeline that syncs with the SkeletalAnimator component
+ * and the scene render model cache for real-time animation preview.
  */
 
 #include "jce_editor_panels.h"
@@ -12,22 +11,25 @@
 #include "jce_editor_colors.h"
 #include "jce_editor_defaults.h"
 #include "jce_editor_i18n.h"
+#include "scene/jce_editor_scene_render.h"
 
 #include <imgui.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 extern "C" {
 #include <jce/animation/jce_animation.h>
+#include <jce/graphics/jce_model.h>
 }
 
 /* ── Timeline state ───────────────────────────────────────────────── */
 
 static struct {
-    int   current_frame;
-    int   total_frames;
+    float current_time;     /* seconds */
+    float duration;         /* clip duration in seconds */
     bool  playing;
-    float px_per_frame;
+    float px_per_sec;       /* pixels per second for ruler */
     float playback_speed;
     bool  loop;
     bool  initialized;
@@ -35,37 +37,36 @@ static struct {
     /* Cached from selected entity. */
     uint32_t bound_entity_id;
     char     clip_name[64];
-    float    clip_duration;
+    char     clip_names[8][64];
     int      clip_count;
     int      active_clip;
     bool     has_animator;
     bool     has_skeletal;
+    char     skeleton_path[128];
 } s_tl;
 
 static void ensure_init(void)
 {
     if (s_tl.initialized) return;
     memset(&s_tl, 0, sizeof(s_tl));
-    s_tl.total_frames   = JCE_TIMELINE_TOTAL_FRAMES;
-    s_tl.px_per_frame   = JCE_TIMELINE_PX_PER_FRAME;
-    s_tl.playback_speed = 1.0f;
-    s_tl.loop           = true;
-    s_tl.initialized    = true;
+    s_tl.px_per_sec      = 120.0f;
+    s_tl.playback_speed  = 1.0f;
+    s_tl.loop            = true;
+    s_tl.initialized     = true;
 }
 
 static void sync_from_entity(void)
 {
     uint32_t focused = jce_state_get_focused();
-    if (focused == s_tl.bound_entity_id && focused != 0)
-        return;
-
     s_tl.bound_entity_id = focused;
     s_tl.has_animator    = false;
     s_tl.has_skeletal    = false;
     s_tl.clip_name[0]   = '\0';
-    s_tl.clip_duration   = 0.0f;
+    memset(s_tl.clip_names, 0, sizeof(s_tl.clip_names));
+    s_tl.duration        = 0.0f;
     s_tl.clip_count      = 0;
     s_tl.active_clip     = 0;
+    s_tl.skeleton_path[0] = '\0';
 
     if (!focused) return;
 
@@ -78,6 +79,8 @@ static void sync_from_entity(void)
             s_tl.has_animator = true;
             snprintf(s_tl.clip_name, sizeof(s_tl.clip_name), "%s",
                      comps[i].data.animator.clip_name);
+            if (comps[i].data.animator.speed <= 0.0f)
+                comps[i].data.animator.speed = 1.0f;
             s_tl.playback_speed = comps[i].data.animator.speed;
             s_tl.loop           = comps[i].data.animator.loop;
             s_tl.playing        = comps[i].data.animator.playing;
@@ -85,13 +88,36 @@ static void sync_from_entity(void)
         if (comps[i].type == JCE_COMP_SKELETAL_ANIMATOR) {
             s_tl.has_skeletal = true;
             s_tl.clip_count   = comps[i].data.skeletal_animator.clip_count;
+            if (s_tl.clip_count < 0) s_tl.clip_count = 0;
+            if (s_tl.clip_count > 8) s_tl.clip_count = 8;
             s_tl.active_clip  = comps[i].data.skeletal_animator.active_clip;
+            if (s_tl.active_clip < 0) s_tl.active_clip = 0;
+            if (s_tl.clip_count > 0 && s_tl.active_clip >= s_tl.clip_count)
+                s_tl.active_clip = s_tl.clip_count - 1;
+            if (comps[i].data.skeletal_animator.speed <= 0.0f)
+                comps[i].data.skeletal_animator.speed = 1.0f;
             s_tl.playback_speed = comps[i].data.skeletal_animator.speed;
             s_tl.loop           = comps[i].data.skeletal_animator.loop;
             s_tl.playing        = comps[i].data.skeletal_animator.playing;
+            snprintf(s_tl.skeleton_path, sizeof(s_tl.skeleton_path), "%s",
+                     comps[i].data.skeletal_animator.skeleton_path);
+            for (int ci = 0; ci < s_tl.clip_count && ci < 8; ci++) {
+                snprintf(s_tl.clip_names[ci], sizeof(s_tl.clip_names[ci]), "%s",
+                         comps[i].data.skeletal_animator.clip_names[ci]);
+            }
             if (s_tl.active_clip < s_tl.clip_count)
                 snprintf(s_tl.clip_name, sizeof(s_tl.clip_name), "%s",
                          comps[i].data.skeletal_animator.clip_names[s_tl.active_clip]);
+
+            /* Query real clip duration from model cache. */
+            JceModel *mdl = jce_editor_scene_get_model(
+                s_tl.skeleton_path, s_tl.bound_entity_id);
+            if (mdl && s_tl.clip_count > 0) {
+                JceAnimClip *clip = jce_model_get_anim(mdl,
+                    (uint32_t)s_tl.active_clip);
+                if (clip)
+                    s_tl.duration = jce_anim_clip_duration(clip);
+            }
         }
     }
 }
@@ -100,6 +126,9 @@ static void sync_from_entity(void)
 static void sync_to_entity(void)
 {
     if (!s_tl.bound_entity_id) return;
+
+    if (s_tl.playback_speed <= 0.0f)
+        s_tl.playback_speed = 1.0f;
 
     int comp_count = 0;
     JceComponentInfo *comps = jce_state_get_entity_components(s_tl.bound_entity_id, &comp_count);
@@ -118,6 +147,14 @@ static void sync_to_entity(void)
             comps[i].data.skeletal_animator.active_clip = s_tl.active_clip;
         }
     }
+
+    /* Sync scrubbed time to animation player in model cache. */
+    if (s_tl.has_skeletal && s_tl.skeleton_path[0]) {
+        JceAnimPlayer *pl = jce_editor_scene_get_anim_player(
+            s_tl.skeleton_path, s_tl.bound_entity_id);
+        if (pl)
+            jce_anim_player_set_time(pl, s_tl.current_time);
+    }
 }
 
 /* ── Content (embeddable in tabs) ─────────────────────────────────── */
@@ -126,7 +163,16 @@ void jce_editor_panel_timeline_content(void)
 {
     ensure_init();
     sync_from_entity();
-    char lbl[128];
+
+    float dur = s_tl.duration > 0.0f ? s_tl.duration : 1.0f;
+
+    /* Read current time from animation player if available. */
+    if (s_tl.has_skeletal && s_tl.skeleton_path[0] && s_tl.playing) {
+        JceAnimPlayer *pl = jce_editor_scene_get_anim_player(
+            s_tl.skeleton_path, s_tl.bound_entity_id);
+        if (pl)
+            s_tl.current_time = jce_anim_player_get_time(pl);
+    }
 
     /* Info bar: show bound entity name. */
     if (s_tl.bound_entity_id) {
@@ -145,11 +191,12 @@ void jce_editor_panel_timeline_content(void)
     }
 
     /* Playback transport */
-    if (ImGui::SmallButton("|<")) s_tl.current_frame = 0;
+    if (ImGui::SmallButton("|<")) { s_tl.current_time = 0.0f; sync_to_entity(); }
     ImGui::SameLine();
     if (ImGui::SmallButton("<<")) {
-        s_tl.current_frame -= 60;
-        if (s_tl.current_frame < 0) s_tl.current_frame = 0;
+        s_tl.current_time -= 1.0f;
+        if (s_tl.current_time < 0.0f) s_tl.current_time = 0.0f;
+        sync_to_entity();
     }
     ImGui::SameLine();
     if (ImGui::SmallButton(s_tl.playing ? "||" : ">")) {
@@ -158,23 +205,21 @@ void jce_editor_panel_timeline_content(void)
     }
     ImGui::SameLine();
     if (ImGui::SmallButton(">>")) {
-        s_tl.current_frame += 60;
-        if (s_tl.current_frame >= s_tl.total_frames)
-            s_tl.current_frame = s_tl.total_frames - 1;
+        s_tl.current_time += 1.0f;
+        if (s_tl.current_time > dur) s_tl.current_time = dur;
+        sync_to_entity();
     }
     ImGui::SameLine();
-    if (ImGui::SmallButton(">|"))
-        s_tl.current_frame = s_tl.total_frames - 1;
+    if (ImGui::SmallButton(">|")) { s_tl.current_time = dur; sync_to_entity(); }
 
     ImGui::SameLine();
-    ImGui::Text("%s: %d / %d", jce_editor_i18n("timeline.frame"),
-               s_tl.current_frame, s_tl.total_frames);
+    ImGui::Text("%.2fs / %.2fs", s_tl.current_time, dur);
 
     /* Speed and loop controls. */
     ImGui::SameLine(0, 20);
     ImGui::PushItemWidth(80);
     if (ImGui::DragFloat(jce_editor_i18n("timeline.speed"), &s_tl.playback_speed,
-                         0.01f, 0.0f, 10.0f))
+                         0.01f, 0.01f, 10.0f))
         sync_to_entity();
     ImGui::PopItemWidth();
     ImGui::SameLine();
@@ -185,13 +230,21 @@ void jce_editor_panel_timeline_content(void)
     if (s_tl.has_skeletal && s_tl.clip_count > 1) {
         ImGui::SameLine(0, 20);
         ImGui::PushItemWidth(120);
-        snprintf(lbl, sizeof(lbl), "%s#", jce_editor_i18n("timeline.clip"));
-        if (ImGui::InputInt(lbl, &s_tl.active_clip)) {
-            if (s_tl.active_clip < 0) s_tl.active_clip = 0;
-            if (s_tl.active_clip >= s_tl.clip_count)
-                s_tl.active_clip = s_tl.clip_count - 1;
+        int prev_clip = s_tl.active_clip;
+        if (ImGui::Combo(jce_editor_i18n("timeline.clip"), &s_tl.active_clip,
+            [](void *data, int idx) -> const char* {
+                auto *names = (char (*)[64])data;
+                return names[idx][0] ? names[idx] : "clip";
+            },
+            s_tl.clip_names, s_tl.clip_count)) {
+            s_tl.current_time = 0.0f;
             sync_to_entity();
+            /* Force resync of clip name / duration on next frame. */
+            s_tl.bound_entity_id = 0;
         }
+        if (s_tl.active_clip != prev_clip && s_tl.active_clip < s_tl.clip_count)
+            snprintf(s_tl.clip_name, sizeof(s_tl.clip_name), "%s",
+                     s_tl.clip_names[s_tl.active_clip]);
         ImGui::PopItemWidth();
     }
 
@@ -206,7 +259,6 @@ void jce_editor_panel_timeline_content(void)
     ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s", jce_editor_i18n("timeline.tracks"));
     ImGui::Separator();
 
-    /* Dynamic tracks based on what's available. */
     ImGui::Selectable(jce_editor_i18n("transform.title"));
     if (s_tl.has_animator || s_tl.has_skeletal)
         ImGui::Selectable(jce_editor_i18n("timeline.animation"));
@@ -222,19 +274,25 @@ void jce_editor_panel_timeline_content(void)
 
     ImDrawList *dl = ImGui::GetWindowDrawList();
     ImVec2 origin = ImGui::GetCursorScreenPos();
-    float total_w = s_tl.total_frames * s_tl.px_per_frame;
+    float total_w = dur * s_tl.px_per_sec;
+    if (total_w < 120.0f) total_w = 120.0f;
 
-    /* Ruler marks */
-    for (int f = 0; f <= s_tl.total_frames; f += 10) {
-        float x = origin.x + f * s_tl.px_per_frame;
-        bool major = (f % 60 == 0);
-        float h = major ? 16.0f : 8.0f;
-        dl->AddLine(ImVec2(x, origin.y), ImVec2(x, origin.y + h),
-                    major ? IM_COL32(200, 200, 200, 255) : IM_COL32(100, 100, 100, 255));
-        if (major) {
-            char label[16];
-            snprintf(label, sizeof(label), "%d", f);
-            dl->AddText(ImVec2(x + 2, origin.y), IM_COL32(200, 200, 200, 255), label);
+    /* Ruler marks (every 0.1s minor, every 1.0s major) */
+    {
+        float step_minor = 0.1f;
+        float step_major = 1.0f;
+        for (float t = 0.0f; t <= dur + 0.001f; t += step_minor) {
+            float x = origin.x + t * s_tl.px_per_sec;
+            bool major = (fmodf(t + 0.001f, step_major) < step_minor * 0.5f);
+            float h = major ? 16.0f : 8.0f;
+            dl->AddLine(ImVec2(x, origin.y), ImVec2(x, origin.y + h),
+                        major ? IM_COL32(200, 200, 200, 255)
+                              : IM_COL32(100, 100, 100, 255));
+            if (major) {
+                char label[16];
+                snprintf(label, sizeof(label), "%.0fs", t);
+                dl->AddText(ImVec2(x + 2, origin.y), IM_COL32(200, 200, 200, 255), label);
+            }
         }
     }
 
@@ -250,35 +308,33 @@ void jce_editor_panel_timeline_content(void)
     }
 
     /* Playhead */
-    float ph_x = origin.x + s_tl.current_frame * s_tl.px_per_frame;
+    float ph_x = origin.x + s_tl.current_time * s_tl.px_per_sec;
     dl->AddLine(ImVec2(ph_x, origin.y),
                 ImVec2(ph_x, origin.y + avail.y),
                 ImGui::ColorConvertFloat4ToU32(JCE_COLOR_TL_PLAYHEAD), 2.0f);
 
     ImGui::Dummy(ImVec2(total_w, 80));
 
-    /* Click to set playhead */
-    if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+    /* Click / drag to scrub playhead */
+    if (ImGui::IsWindowHovered() &&
+        (ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
+         (ImGui::IsMouseDown(ImGuiMouseButton_Left) && ImGui::IsMouseDragging(ImGuiMouseButton_Left)))) {
         float mx = ImGui::GetMousePos().x - origin.x;
-        int f = (int)(mx / s_tl.px_per_frame);
-        if (f >= 0 && f < s_tl.total_frames)
-            s_tl.current_frame = f;
+        float t = mx / s_tl.px_per_sec;
+        if (t < 0.0f) t = 0.0f;
+        if (t > dur)  t = dur;
+        s_tl.current_time = t;
+        sync_to_entity();
     }
 
     ImGui::EndChild();
 
-    /* Advance frame if playing */
-    if (s_tl.playing) {
-        s_tl.current_frame++;
-        if (s_tl.current_frame >= s_tl.total_frames) {
-            if (s_tl.loop)
-                s_tl.current_frame = 0;
-            else {
-                s_tl.current_frame = s_tl.total_frames - 1;
-                s_tl.playing = false;
-                sync_to_entity();
-            }
-        }
+    /* Read-back time from player when playing (player is advanced by draw). */
+    if (s_tl.playing && s_tl.has_skeletal && s_tl.skeleton_path[0]) {
+        JceAnimPlayer *pl = jce_editor_scene_get_anim_player(
+            s_tl.skeleton_path, s_tl.bound_entity_id);
+        if (pl)
+            s_tl.current_time = jce_anim_player_get_time(pl);
     }
 }
 

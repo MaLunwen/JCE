@@ -8,6 +8,7 @@
 #include "jce_editor_colors.h"
 #include "jce_editor_i18n.h"
 #include "scene/jce_model_loader_assimp.h"
+#include "scene/jce_editor_scene_render.h"
 
 #include <imgui.h>
 #include <stdio.h>
@@ -15,6 +16,8 @@
 
 extern "C" {
 #include <jce/graphics/jce_pbr_material.h>
+#include <jce/graphics/jce_model.h>
+#include <jce/animation/jce_animation.h>
 }
 
 /* ── Tag colors (display data) ────────────────────────────────────── */
@@ -531,11 +534,14 @@ static void draw_comp_sprite_renderer(JceComponentInfo *comp)
 
 static void draw_comp_animator(JceComponentInfo *comp)
 {
+    if (comp->data.animator.speed <= 0.0f)
+        comp->data.animator.speed = 1.0f;
+
     ImGui::InputText(jce_editor_i18n("timeline.clip"), comp->data.animator.clip_name, 64);
     insp_track_edit();
     accept_asset_drop(comp->data.animator.clip_name, 64);
     ImGui::DragFloat(jce_editor_i18n("timeline.speed"), &comp->data.animator.speed,
-                     0.01f, 0.0f, 10.0f);
+                     0.01f, 0.01f, 10.0f);
     insp_track_edit();
     if (ImGui::Checkbox(jce_editor_i18n("timeline.loop"), &comp->data.animator.loop))
         insp_undo_bool(&comp->data.animator.loop);
@@ -548,27 +554,82 @@ static void draw_comp_animator(JceComponentInfo *comp)
 static void draw_comp_skeletal_animator(JceComponentInfo *comp)
 {
     char lbl[256];
+
+    if (comp->data.skeletal_animator.speed <= 0.0f)
+        comp->data.skeletal_animator.speed = 1.0f;
+
     ImGui::InputText(jce_editor_i18n("inspector.skeleton"), comp->data.skeletal_animator.skeleton_path, 128);
     insp_track_edit();
     accept_asset_drop(comp->data.skeletal_animator.skeleton_path, 128);
+
+    /* Auto-populate clip list from model if path is set but clips empty. */
+    if (comp->data.skeletal_animator.skeleton_path[0] &&
+        comp->data.skeletal_animator.clip_count == 0) {
+        JceModel *mdl = jce_editor_scene_get_model(
+            comp->data.skeletal_animator.skeleton_path, 0);
+        if (mdl) {
+            uint32_t n = jce_model_anim_count(mdl);
+            if (n > 8) n = 8;
+            comp->data.skeletal_animator.clip_count = (int)n;
+            for (uint32_t ci = 0; ci < n; ++ci) {
+                JceAnimClip *clip = jce_model_get_anim(mdl, ci);
+                const char *name = clip ? jce_anim_clip_name(clip) : "clip";
+                snprintf(comp->data.skeletal_animator.clip_names[ci],
+                         sizeof(comp->data.skeletal_animator.clip_names[ci]),
+                         "%s", name ? name : "clip");
+            }
+        }
+    }
+
     snprintf(lbl, sizeof(lbl), "%s##skel", jce_editor_i18n("timeline.speed"));
     ImGui::DragFloat(lbl, &comp->data.skeletal_animator.speed,
-                     0.01f, 0.0f, 10.0f);
+                     0.01f, 0.01f, 10.0f);
     insp_track_edit();
     snprintf(lbl, sizeof(lbl), "%s##skel", jce_editor_i18n("timeline.loop"));
     if (ImGui::Checkbox(lbl, &comp->data.skeletal_animator.loop))
         insp_undo_bool(&comp->data.skeletal_animator.loop);
-    if (comp->data.skeletal_animator.clip_count > 0) {
+
+    int clip_count = comp->data.skeletal_animator.clip_count;
+    if (clip_count < 0) clip_count = 0;
+    if (clip_count > 8) clip_count = 8;
+    if (comp->data.skeletal_animator.active_clip < 0)
+        comp->data.skeletal_animator.active_clip = 0;
+    if (clip_count > 0 && comp->data.skeletal_animator.active_clip >= clip_count)
+        comp->data.skeletal_animator.active_clip = clip_count - 1;
+
+    if (clip_count > 0) {
         int prev_clip = comp->data.skeletal_animator.active_clip;
         ImGui::Combo(jce_editor_i18n("inspector.activeClip"), &comp->data.skeletal_animator.active_clip,
             [](void *data, int idx) -> const char* {
                 auto *sa = (decltype(comp->data.skeletal_animator)*)data;
                 return sa->clip_names[idx]; },
             &comp->data.skeletal_animator,
-            comp->data.skeletal_animator.clip_count);
+            clip_count);
         if (comp->data.skeletal_animator.active_clip != prev_clip)
             insp_undo_int(&comp->data.skeletal_animator.active_clip, prev_clip);
     }
+
+    /* Progress bar showing animation time. */
+    if (comp->data.skeletal_animator.skeleton_path[0]) {
+        JceAnimPlayer *pl = jce_editor_scene_get_anim_player(
+            comp->data.skeletal_animator.skeleton_path, 0);
+        if (pl) {
+            float t = jce_anim_player_get_time(pl);
+            JceModel *mdl = jce_editor_scene_get_model(
+                comp->data.skeletal_animator.skeleton_path, 0);
+            float dur = 1.0f;
+            if (mdl) {
+                JceAnimClip *clip = jce_model_get_anim(mdl,
+                    (uint32_t)comp->data.skeletal_animator.active_clip);
+                if (clip) dur = jce_anim_clip_duration(clip);
+            }
+            float frac = (dur > 0.0f) ? (t / dur) : 0.0f;
+            if (frac > 1.0f) frac = 1.0f;
+            snprintf(lbl, sizeof(lbl), "%.2fs / %.2fs", t, dur);
+            ImGui::ProgressBar(frac, ImVec2(-1, 0), lbl);
+        }
+    }
+
     snprintf(lbl, sizeof(lbl), "%s##skel",
              comp->data.skeletal_animator.playing
                 ? jce_editor_i18n("toolbar.stop")
@@ -692,7 +753,14 @@ static void draw_component(JceComponentInfo *comp, uint32_t entity_id)
     if (ImGui::BeginPopup("ComponentSettings")) {
         if (ImGui::MenuItem(jce_editor_i18n("transform.reset")))
             jce_editor_console_log("Reset %s (stub)", name);
-        if (comp->type != JCE_COMP_TRANSFORM) {
+        if (comp->type == JCE_COMP_TRANSFORM) {
+            ImGui::BeginDisabled();
+            ImGui::PushStyleColor(ImGuiCol_Text, JCE_COLOR_TEXT_ERROR);
+            ImGui::MenuItem(jce_editor_i18n("inspector.removeComponent"),
+                            NULL, false, false);
+            ImGui::PopStyleColor();
+            ImGui::EndDisabled();
+        } else {
             ImGui::PushStyleColor(ImGuiCol_Text, JCE_COLOR_TEXT_ERROR);
             if (ImGui::MenuItem(jce_editor_i18n("inspector.removeComponent")))
                 jce_state_remove_component(entity_id, comp->type);
@@ -942,7 +1010,20 @@ void jce_editor_panel_inspector_content(void)
         ImGui::OpenPopup("AddComponentPopup");
 
     if (ImGui::BeginPopup("AddComponentPopup")) {
+        int popup_comp_count = 0;
+        JceComponentInfo *popup_comps = jce_state_get_entity_components(e->id,
+                                                                         &popup_comp_count);
         for (int t = 0; t < JCE_COMP_TYPE_COUNT; t++) {
+            /* Skip components already present on this entity. */
+            bool already_has = false;
+            for (int ci = 0; ci < popup_comp_count; ci++) {
+                if (popup_comps[ci].type == (JceComponentType)t) {
+                    already_has = true;
+                    break;
+                }
+            }
+            if (already_has) continue;
+
             if (ImGui::MenuItem(jce_component_type_name((JceComponentType)t)))
                 jce_state_add_component(e->id, (JceComponentType)t);
         }

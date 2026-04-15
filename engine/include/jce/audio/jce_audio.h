@@ -44,6 +44,28 @@ JceSound  jce_audio_load_pcm(JceAudio *audio,
 /* Unload a previously loaded sound. */
 void      jce_audio_unload(JceAudio *audio, JceSound snd);
 
+/* Load a sound from raw file bytes in memory (WAV/OGG/MP3).
+   hint_path is used for format detection only; may be NULL. */
+JceSound  jce_audio_load_memory(JceAudio *audio, const void *data,
+                                 uint32_t size, const char *hint_path);
+
+/* -- Queries -------------------------------------------------------- */
+
+/* Duration of a loaded sound in seconds.  Returns 0 on error. */
+float     jce_audio_get_duration(const JceAudio *audio, JceSound snd);
+
+/* Current playback position of a voice in seconds. */
+float     jce_audio_get_time(const JceAudio *audio, JceVoice voice);
+
+/* Seek a playing/paused voice to a specific time (seconds). */
+void      jce_audio_seek(JceAudio *audio, JceVoice voice, float time_sec);
+
+/* Access decoded PCM data of a loaded sound (16-bit signed).
+   Returns NULL on error.  Caller must NOT free the returned pointer. */
+const int16_t *jce_audio_get_pcm_data(const JceAudio *audio, JceSound snd,
+                                       uint32_t *out_frame_count,
+                                       uint32_t *out_channels);
+
 /* -- Playback ------------------------------------------------------- */
 
 /* Play a sound.  Returns a voice handle for further control.

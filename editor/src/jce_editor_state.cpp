@@ -763,6 +763,12 @@ void jce_state_add_component(uint32_t entity_id, JceComponentType type)
 		c->data.light.color[3] = 1.0f;
 		c->data.light.intensity = 1.0f;
 		break;
+	case JCE_COMP_ANIMATOR:
+		c->data.animator.speed = 1.0f;
+		break;
+	case JCE_COMP_SKELETAL_ANIMATOR:
+		c->data.skeletal_animator.speed = 1.0f;
+		break;
 	default:
 		break;
 	}

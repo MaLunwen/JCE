@@ -212,7 +212,8 @@ JceGizmoAxis jce_gizmo_hit_test_rotate(const JceGizmoCamera *cam,
                                         float scale_factor,
                                         float mouse_x, float mouse_y)
 {
-    float threshold = JCE_GIZMO_SELECT_THRESHOLD;
+    /* Rotation rings need a larger hover envelope for stable picking. */
+    float threshold = JCE_GIZMO_SELECT_THRESHOLD * 1.4f;
     float world_radius = compute_world_axis_len(cam, position, scale_factor);
 
     float ax_x[3], ax_y[3], ax_z[3];
@@ -394,21 +395,72 @@ void jce_gizmo_drag_rotate(const JceGizmoCamera *cam,
 {
     out_delta_euler[0] = out_delta_euler[1] = out_delta_euler[2] = 0.0f;
 
-    /* Project origin to screen */
-    float scr_o[2];
-    if (!gm_world_to_screen(cam, origin, scr_o)) return;
+    float ax_x[3], ax_y[3], ax_z[3];
+    jce_gizmo_internal_get_axes(ax_x, ax_y, ax_z);
 
-    /* Compute angle delta from center */
-    float angle_cur  = atan2f(mouse_y - scr_o[1], mouse_x - scr_o[0]);
-    float angle_prev = atan2f(prev_mouse_y - scr_o[1], prev_mouse_x - scr_o[0]);
-    float da = angle_cur - angle_prev;
+    float plane_n[3] = {0.0f, 0.0f, 1.0f};
+    if (axis & JCE_GIZMO_AXIS_X) {
+        gm_v3_copy(plane_n, ax_x);
+    } else if (axis & JCE_GIZMO_AXIS_Y) {
+        gm_v3_copy(plane_n, ax_y);
+    } else if (axis & JCE_GIZMO_AXIS_Z) {
+        gm_v3_copy(plane_n, ax_z);
+    }
+    gm_v3_normalize(plane_n, plane_n);
 
-    /* Wrap to [-pi, pi] */
-    if (da >  JCE_PI) da -= 2.0f * JCE_PI;
-    if (da < -JCE_PI) da += 2.0f * JCE_PI;
+    float deg = 0.0f;
 
-    /* Convert to degrees */
-    float deg = da * JCE_RAD2DEG;
+    /* Blender-like ring drag: signed angle on the selected ring plane. */
+    {
+        float ro_cur[3], rd_cur[3], ro_prev[3], rd_prev[3];
+        gm_screen_to_ray(cam, mouse_x, mouse_y, ro_cur, rd_cur);
+        gm_screen_to_ray(cam, prev_mouse_x, prev_mouse_y, ro_prev, rd_prev);
+
+        float hit_cur[3], hit_prev[3];
+        bool ok_cur = gm_ray_plane_intersect(ro_cur, rd_cur, plane_n, origin, hit_cur);
+        bool ok_prev = gm_ray_plane_intersect(ro_prev, rd_prev, plane_n, origin, hit_prev);
+
+        if (ok_cur && ok_prev) {
+            float v_cur[3], v_prev[3];
+            gm_v3_sub(v_cur, hit_cur, origin);
+            gm_v3_sub(v_prev, hit_prev, origin);
+
+            float len_cur = gm_v3_len(v_cur);
+            float len_prev = gm_v3_len(v_prev);
+            if (len_cur > 1e-6f && len_prev > 1e-6f) {
+                gm_v3_scale(v_cur, v_cur, 1.0f / len_cur);
+                gm_v3_scale(v_prev, v_prev, 1.0f / len_prev);
+
+                float c[3];
+                gm_v3_cross(c, v_prev, v_cur);
+                float sin_term = gm_v3_dot(plane_n, c);
+                float cos_term = gm_v3_dot(v_prev, v_cur);
+                if (cos_term > 1.0f) cos_term = 1.0f;
+                if (cos_term < -1.0f) cos_term = -1.0f;
+                deg = atan2f(sin_term, cos_term) * JCE_RAD2DEG;
+            }
+        }
+    }
+
+    if (fabsf(deg) < 1e-6f) {
+        /* Fallback when ring plane intersection is degenerate. */
+        float scr_o[2];
+        if (!gm_world_to_screen(cam, origin, scr_o)) return;
+        float angle_cur  = atan2f(mouse_y - scr_o[1], mouse_x - scr_o[0]);
+        float angle_prev = atan2f(prev_mouse_y - scr_o[1], prev_mouse_x - scr_o[0]);
+        float da = angle_cur - angle_prev;
+        if (da >  JCE_PI) da -= 2.0f * JCE_PI;
+        if (da < -JCE_PI) da += 2.0f * JCE_PI;
+        deg = da * JCE_RAD2DEG;
+    }
+
+    /* Shift = precision rotate, similar to Blender fine control. */
+    if (ImGui::GetIO().KeyShift)
+        deg *= 0.2f;
+
+    /* Reject occasional spikes when camera/plane is near-singular. */
+    if (deg > 45.0f) deg = 45.0f;
+    if (deg < -45.0f) deg = -45.0f;
 
     if (axis & JCE_GIZMO_AXIS_X) out_delta_euler[0] = deg;
     if (axis & JCE_GIZMO_AXIS_Y) out_delta_euler[1] = deg;

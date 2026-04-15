@@ -47,6 +47,9 @@ void ensure_assets_init(void)
     s_assets.show_delete_confirm = false;
     s_assets.show_delete_dialog_open = false;
     s_assets.pending_delete_dir_count = 0;
+    s_assets.pending_navigation_path.clear();
+    s_assets.pending_navigation_clear_search = false;
+    s_assets.next_auto_refresh_time = 0.0;
     s_assets.initialized       = true;
 }
 
@@ -84,7 +87,54 @@ void refresh_entries(void)
                   return a.name < b.name;
               });
 
+    /* Rebuild search results after any folder refresh. */
+    s_assets.last_search_query.clear();
     s_assets.needs_refresh = false;
+}
+
+static bool directory_entries_changed(void)
+{
+    std::vector<std::pair<std::string, bool>> disk_entries;
+    try {
+        for (auto &de : fs::directory_iterator(
+                 s_assets.current_path,
+                 fs::directory_options::skip_permission_denied)) {
+            disk_entries.emplace_back(
+                de.path().filename().string(),
+                de.is_directory());
+        }
+    } catch (...) {
+        return false;
+    }
+
+    std::sort(disk_entries.begin(), disk_entries.end(),
+              [](const std::pair<std::string, bool> &a,
+                 const std::pair<std::string, bool> &b) {
+                  if (a.second != b.second) return a.second > b.second;
+                  return a.first < b.first;
+              });
+
+    if (disk_entries.size() != s_assets.entries.size())
+        return true;
+
+    for (size_t i = 0; i < disk_entries.size(); i++) {
+        if (disk_entries[i].first != s_assets.entries[i].name
+            || disk_entries[i].second != s_assets.entries[i].is_dir)
+            return true;
+    }
+
+    return false;
+}
+
+void navigate_asset_directory(const std::string &path, bool clear_search)
+{
+    if (path.empty()) return;
+
+    /* Defer navigation application to panel frame boundary so we never
+       rebuild entry vectors while the grid is still iterating them. */
+    s_assets.pending_navigation_path = normalized_path_string(fs::path(path));
+    s_assets.pending_navigation_clear_search = clear_search;
+    s_assets.next_auto_refresh_time = ImGui::GetTime() + 0.35;
 }
 
 void collect_search_results(const std::string &query)
@@ -230,10 +280,7 @@ void jce_editor_assets_set_project(const char *path)
     std::string normalized = normalized_path_string(fs::path(path));
     if (s_assets.project_root == normalized) return;
     s_assets.project_root  = normalized;
-    s_assets.current_path  = normalized;
-    s_assets.selected_set.clear();
-    s_assets.last_clicked_idx = -1;
-    s_assets.needs_refresh = true;
+    navigate_asset_directory(normalized, true);
 }
 
 bool jce_editor_assets_delete_dialog_open(void)
@@ -399,6 +446,33 @@ static void draw_asset_delete_dialog(void)
 void jce_editor_panel_assets_content(void)
 {
     ensure_assets_init();
+
+    if (!s_assets.pending_navigation_path.empty()) {
+        s_assets.current_path = s_assets.pending_navigation_path;
+        s_assets.pending_navigation_path.clear();
+
+        s_assets.selected_set.clear();
+        s_assets.last_clicked_idx = -1;
+        s_assets.context_idx = -1;
+
+        if (s_assets.pending_navigation_clear_search) {
+            s_assets.search_buf[0] = '\0';
+            s_assets.search_active = false;
+            s_assets.search_results.clear();
+            s_assets.last_search_query.clear();
+            s_assets.last_search_root.clear();
+        }
+        s_assets.pending_navigation_clear_search = false;
+
+        s_assets.needs_refresh = true;
+    }
+
+    double now = ImGui::GetTime();
+    if (now >= s_assets.next_auto_refresh_time) {
+        s_assets.next_auto_refresh_time = now + 0.35;
+        if (!s_assets.needs_refresh && directory_entries_changed())
+            s_assets.needs_refresh = true;
+    }
 
     if (s_assets.needs_refresh)
         refresh_entries();

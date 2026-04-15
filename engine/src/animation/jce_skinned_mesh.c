@@ -53,9 +53,9 @@ static void init_skinned_layout(bgfx_vertex_layout_t *layout)
     bgfx_vertex_layout_add(layout, BGFX_ATTRIB_TANGENT,   4,
                            BGFX_ATTRIB_TYPE_FLOAT, false, false);
     bgfx_vertex_layout_add(layout, BGFX_ATTRIB_INDICES,   4,
-                           BGFX_ATTRIB_TYPE_UINT8, false, false);
+                           BGFX_ATTRIB_TYPE_UINT8, true, false);
     bgfx_vertex_layout_add(layout, BGFX_ATTRIB_WEIGHT,    4,
-                           BGFX_ATTRIB_TYPE_FLOAT, true, false);
+                           BGFX_ATTRIB_TYPE_FLOAT, false, false);
     bgfx_vertex_layout_end(layout);
 }
 

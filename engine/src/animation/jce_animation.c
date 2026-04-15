@@ -318,6 +318,15 @@ void jce_anim_player_set_speed(JceAnimPlayer *p, float speed)
     if (p) p->speed = speed;
 }
 
+void jce_anim_player_set_time(JceAnimPlayer *p, float time)
+{
+    if (!p) return;
+    float dur = p->clip ? jce_anim_clip_duration(p->clip) : 0.0f;
+    if (time < 0.0f) time = 0.0f;
+    if (dur > 0.0f && time > dur) time = dur;
+    p->time = time;
+}
+
 float jce_anim_player_get_time(const JceAnimPlayer *p)
 {
     return p ? p->time : 0.0f;
@@ -332,27 +341,29 @@ uint32_t jce_anim_player_update(JceAnimPlayer *p, float dt,
                                   jce_mat4 *out_joint_matrices,
                                   uint32_t max_joints)
 {
-    if (!p || !p->playing || !p->clip || p->paused)
+    if (!p || !p->playing || !p->clip)
         return 0;
 
-    /* Advance time. */
-    p->time += dt * p->speed;
+    if (!p->paused) {
+        /* Advance time. */
+        p->time += dt * p->speed;
 
-    float dur = jce_anim_clip_duration(p->clip);
-    if (dur <= 0.0f) {
-        /* Zero-duration clip (e.g. a rest-pose action): treat as instantly
-           finished so the caller can advance to the next clip. */
-        p->playing = false;
-    } else if (p->loop) {
-        while (p->time >= dur) p->time -= dur;
-        while (p->time < 0.0f) p->time += dur;
-    } else {
-        if (p->time >= dur) {
-            p->time    = dur;
+        float dur = jce_anim_clip_duration(p->clip);
+        if (dur <= 0.0f) {
+            /* Zero-duration clip (e.g. a rest-pose action): treat as instantly
+               finished so the caller can advance to the next clip. */
             p->playing = false;
-        } else if (p->time < 0.0f) {
-            p->time    = 0.0f;
-            p->playing = false;
+        } else if (p->loop) {
+            while (p->time >= dur) p->time -= dur;
+            while (p->time < 0.0f) p->time += dur;
+        } else {
+            if (p->time >= dur) {
+                p->time    = dur;
+                p->playing = false;
+            } else if (p->time < 0.0f) {
+                p->time    = 0.0f;
+                p->playing = false;
+            }
         }
     }
 

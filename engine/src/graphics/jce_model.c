@@ -22,6 +22,36 @@
 
 #define LOG_TAG "jce_model"
 
+static jce_mat4 compute_static_node_world(const JceModel *model,
+                                           const JceModelNode *node,
+                                           const jce_mat4 *root,
+                                           const jce_mat4 *fallback_world,
+                                           const jce_mat4 *joint_matrices,
+                                           uint32_t num_joints)
+{
+    if (!fallback_world)
+        return jce_m4_identity();
+    if (!model || !node || !root)
+        return *fallback_world;
+
+    if (node->joint_parent_index >= 0 && model->skeleton) {
+        uint32_t jidx = (uint32_t)node->joint_parent_index;
+        jce_mat4 inv_bind = jce_skeleton_get_inverse_bind(model->skeleton, jidx);
+        jce_mat4 bind_mat = jce_m4_inverse(&inv_bind);
+        jce_mat4 joint_global;
+
+        if (joint_matrices && num_joints > jidx)
+            joint_global = jce_m4_multiply(&joint_matrices[jidx], &bind_mat);
+        else
+            joint_global = bind_mat;
+
+        jce_mat4 joint_world = jce_m4_multiply(root, &joint_global);
+        return jce_m4_multiply(&joint_world, &node->joint_local_matrix);
+    }
+
+    return *fallback_world;
+}
+
 /* ================================================================== */
 /* Loading (delegates to glTF loader)                                  */
 /* ================================================================== */
@@ -29,6 +59,12 @@
 JceModel *jce_model_load_gltf(const PakArchive *pak, const char *asset_path)
 {
     return jce_gltf_load(pak, asset_path);
+}
+
+JceModel *jce_model_load_gltf_memory(const void *data, uint32_t size,
+                                      const char *name)
+{
+    return jce_gltf_load_memory(data, size, name);
 }
 
 /* ================================================================== */
@@ -181,8 +217,11 @@ void jce_model_draw(const JceModel *model,
                     }
                     prog_handle = jce_renderer_get_program_pbr_skinned(r);
                 } else {
-                    /* PBR static (has tangent, no joints): use node world. */
-                    bgfx_set_transform(world.raw[0], 1);
+                    /* PBR static (has tangent, no joints): still respect
+                       joint-parent attachment for props under bones. */
+                    jce_mat4 static_world = compute_static_node_world(
+                        model, node, root, &world, joint_matrices, num_joints);
+                    bgfx_set_transform(static_world.raw[0], 1);
                     prog_handle = jce_renderer_get_program_pbr(r);
                 }
 
@@ -193,30 +232,8 @@ void jce_model_draw(const JceModel *model,
 
             } else if (prim->static_mesh) {
                 /* Basic mesh: apply transform, then submit. */
-                jce_mat4 static_world;
-                if (node->joint_parent_index >= 0 && model->skeleton) {
-                    /* Static mesh directly parented to a skin joint (e.g. a held
-                       weapon). Recover the joint's animated world transform:
-                         joint_global = skin_matrix[i] × inverse(inv_bind[i])
-                       Then: world = root × joint_global × node_local_from_joint */
-                    uint32_t jidx = (uint32_t)node->joint_parent_index;
-                    jce_mat4 inv_bind = jce_skeleton_get_inverse_bind(
-                        model->skeleton, jidx);
-                    jce_mat4 bind_mat = jce_m4_inverse(&inv_bind);
-                    jce_mat4 joint_global;
-                    if (joint_matrices && num_joints > jidx) {
-                        joint_global = jce_m4_multiply(
-                            &joint_matrices[jidx], &bind_mat);
-                    } else {
-                        /* No animation: bind pose global = bind_mat. */
-                        joint_global = bind_mat;
-                    }
-                    jce_mat4 joint_world = jce_m4_multiply(root, &joint_global);
-                    static_world = jce_m4_multiply(
-                        &joint_world, &node->joint_local_matrix);
-                } else {
-                    static_world = world;
-                }
+                jce_mat4 static_world = compute_static_node_world(
+                    model, node, root, &world, joint_matrices, num_joints);
                 bgfx_set_transform(static_world.raw[0], 1);
                 jce_mesh_submit(prim->static_mesh, r, view_id);
             }

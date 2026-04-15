@@ -3,6 +3,7 @@
  */
 
 #include "jce_scene_render_internal.h"
+#include <SDL3/SDL_timer.h>
 
 /* ── Shadow map constants ─────────────────────────────────────────── */
 
@@ -368,6 +369,17 @@ void draw_entities(void)
     if (view_mode == JCE_VIEW_WIREFRAME)
         jce_renderer_set_wireframe(s_sr.renderer, true);
 
+    /* Timing for animation updates. */
+    static uint64_t s_last_ticks = 0;
+    uint64_t now_ticks = SDL_GetPerformanceCounter();
+    float anim_dt = 0.0f;
+    if (s_last_ticks > 0) {
+        anim_dt = (float)(now_ticks - s_last_ticks) /
+                  (float)SDL_GetPerformanceFrequency();
+        if (anim_dt > 0.1f) anim_dt = 0.1f; /* clamp large spikes */
+    }
+    s_last_ticks = now_ticks;
+
     for (int i = 0; i < count; i++) {
         JceEntityInfo *ent = jce_state_get_entity_by_index(i);
         if (!ent || !ent->enabled) continue;
@@ -376,6 +388,86 @@ void draw_entities(void)
         JceMesh *mesh = NULL;
         const char *mat_path = NULL;
         if (!build_entity_model(ent, &model, &mesh, &mat_path)) continue;
+
+        /* ── Skinned / animated entity path ──────────────────────── */
+        {
+            int anim_cc = 0;
+            JceComponentInfo *anim_cs = jce_state_get_entity_components(
+                ent->id, &anim_cc);
+            JceComponentInfo *sa_comp = nullptr;
+            for (int c = 0; c < anim_cc; ++c) {
+                if (anim_cs[c].type == JCE_COMP_SKELETAL_ANIMATOR) {
+                    sa_comp = &anim_cs[c];
+                    break;
+                }
+            }
+            if (sa_comp && sa_comp->data.skeletal_animator.skeleton_path[0]) {
+                ModelCacheEntry *mc = get_cached_model(
+                    sa_comp->data.skeletal_animator.skeleton_path, ent->id);
+                if (mc && mc->model) {
+                    if (mc->player) {
+                        int ac = sa_comp->data.skeletal_animator.active_clip;
+                        float anim_speed = sa_comp->data.skeletal_animator.speed;
+                        if (anim_speed <= 0.0f) anim_speed = 1.0f;
+
+                        JceAnimClip *clip = nullptr;
+                        if (ac >= 0 && ac < (int)jce_model_anim_count(mc->model))
+                            clip = jce_model_get_anim(mc->model, (uint32_t)ac);
+
+                        bool comp_playing = sa_comp->data.skeletal_animator.playing;
+                        bool clip_changed = (mc->active_clip != ac);
+                        bool loop_changed = (mc->loop != sa_comp->data.skeletal_animator.loop);
+                        bool speed_changed = fabsf(mc->speed -
+                            anim_speed) > 0.0001f;
+                        bool paused_changed = (mc->paused == comp_playing);
+
+                        if (comp_playing && clip) {
+                            if (!jce_anim_player_is_playing(mc->player)
+                                || clip_changed || loop_changed) {
+                                /* Start or restart the selected clip. */
+                                jce_anim_player_play(mc->player, clip,
+                                    sa_comp->data.skeletal_animator.loop,
+                                    anim_speed);
+                            } else if (speed_changed || paused_changed) {
+                                jce_anim_player_set_speed(mc->player,
+                                    anim_speed);
+                            }
+                            /* Ensure unpaused and speed synced. */
+                            jce_anim_player_pause(mc->player, false);
+                            jce_anim_player_set_speed(mc->player,
+                                anim_speed);
+                        } else {
+                            if (clip && (clip_changed || loop_changed)) {
+                                jce_anim_player_play(mc->player, clip,
+                                    sa_comp->data.skeletal_animator.loop,
+                                    anim_speed);
+                                jce_anim_player_set_time(mc->player, 0.0f);
+                            }
+                            /* Paused — freeze at current pose or selected clip. */
+                            if (jce_anim_player_is_playing(mc->player))
+                                jce_anim_player_pause(mc->player, true);
+                        }
+
+                        mc->active_clip = ac;
+                        mc->loop = sa_comp->data.skeletal_animator.loop;
+                        mc->speed = anim_speed;
+                        mc->paused = !comp_playing;
+
+                        jce_mat4 joints[64];
+                        uint32_t nj = jce_anim_player_update(mc->player,
+                                                              anim_dt, joints, 64);
+                        jce_model_draw(mc->model, s_sr.renderer,
+                                       scene_view_id(), &model,
+                                       nj > 0 ? joints : NULL, nj);
+                    } else {
+                        jce_model_draw(mc->model, s_sr.renderer,
+                                       scene_view_id(), &model, NULL, 0);
+                    }
+                    continue; /* skip regular mesh path */
+                }
+            }
+        }
+
         if (!mesh) continue;
 
         bgfx_set_transform(model.raw[0], 1);

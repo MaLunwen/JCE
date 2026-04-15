@@ -378,6 +378,7 @@ bool jce_state_save_scene_file(const char *scene_path)
 
 	update_scene_dir_from_path(scene_path);
 	set_current_scene_path_internal(scene_path);
+	s.scene_modified = false;
 	LOG_INFO(LOG_TAG, "scene saved to %s (%d entities)", scene_path, s.entity_count);
 	return true;
 }
@@ -419,6 +420,7 @@ bool jce_state_load_scene_file(const char *scene_path)
 	if (ok) {
 		s_undo_history.clear();
 		s_redo_history.clear();
+		s.scene_modified = false;
 		s_history_edit_nesting = 0;
 		s_history_outer_edit_pushed_snapshot = false;
 		s_history_manual_batch_depth = 0;

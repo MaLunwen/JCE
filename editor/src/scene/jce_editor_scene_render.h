@@ -105,6 +105,21 @@ void jce_editor_scene_set_hover_entity(uint32_t entity_id);
 /* Clear the hover highlight. */
 void jce_editor_scene_clear_hover_entity(void);
 
+/* ── Animation query helpers (for timeline panel) ──────────────────── */
+
+typedef struct JceAnimPlayer JceAnimPlayer;
+typedef struct JceModel      JceModel;
+
+/* Look up (or load) the model cache entry for the skeleton path.
+ * Returns the animation player, or NULL if not available. */
+JceAnimPlayer *jce_editor_scene_get_anim_player(const char *skeleton_path,
+                                                 uint32_t entity_id);
+
+/* Look up (or load) the cached model for the skeleton path.
+ * Returns the model, or NULL if not available. */
+JceModel *jce_editor_scene_get_model(const char *skeleton_path,
+                                     uint32_t entity_id);
+
 #ifdef __cplusplus
 }
 #endif

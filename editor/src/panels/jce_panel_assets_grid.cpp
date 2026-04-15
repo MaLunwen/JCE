@@ -83,9 +83,12 @@ void draw_asset_grid_item(const FileEntry &fe, int index,
     ImGui::PopStyleColor(3);
 
     /* Single click: select (Ctrl/Shift multi-select) */
+    bool was_selected_before_click =
+        (s_assets.selected_set.count(index) != 0);
+    bool ctrl  = ImGui::GetIO().KeyCtrl;
+    bool shift = ImGui::GetIO().KeyShift;
+
     if (clicked) {
-        bool ctrl  = ImGui::GetIO().KeyCtrl;
-        bool shift = ImGui::GetIO().KeyShift;
         if (shift && s_assets.last_clicked_idx >= 0) {
             int mn = (s_assets.last_clicked_idx < index) ? s_assets.last_clicked_idx : index;
             int mx = (s_assets.last_clicked_idx > index) ? s_assets.last_clicked_idx : index;
@@ -210,19 +213,17 @@ void draw_asset_grid_item(const FileEntry &fe, int index,
 
     ImGui::EndGroup();
 
-    bool cell_hovered = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByPopup);
+    bool cell_hovered = ImGui::IsItemHovered(
+        ImGuiHoveredFlags_AllowWhenBlockedByPopup
+      | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+
+    bool repeated_click_open_dir =
+        clicked && fe.is_dir && !ctrl && !shift && was_selected_before_click;
 
     /* Double click: navigate or open. */
-    if (cell_hovered && ImGui::IsMouseDoubleClicked(0)) {
+    if (repeated_click_open_dir || (cell_hovered && ImGui::IsMouseDoubleClicked(0))) {
         if (fe.is_dir) {
-            s_assets.current_path  = fe.path;
-            s_assets.needs_refresh = true;
-            s_assets.selected_set.clear();
-            s_assets.last_clicked_idx = -1;
-            s_assets.search_buf[0] = '\0';
-            s_assets.search_active = false;
-            s_assets.search_results.clear();
-            s_assets.last_search_query.clear();
+            navigate_asset_directory(fe.path, true);
         } else {
             const char *ext = strrchr(fe.path.c_str(), '.');
             if (ext && (_stricmp(ext, ".scene") == 0)) {
@@ -279,10 +280,7 @@ void draw_asset_item_context_menu(const std::vector<FileEntry> &display_entries)
         if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.open"))) {
             if (cfe) {
                 if (cfe->is_dir) {
-                    s_assets.current_path  = cfe->path;
-                    s_assets.needs_refresh = true;
-                    s_assets.selected_set.clear();
-                    s_assets.last_clicked_idx = -1;
+                    navigate_asset_directory(cfe->path, false);
                 } else {
                     jce_file_viewer_open(cfe->path.c_str());
                     jce_editor_layout_request_focus_file_viewer();

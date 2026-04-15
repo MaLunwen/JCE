@@ -559,8 +559,12 @@ void jce_editor_dialog_open_project(bool *p_open)
             s_open_project.browse_open = false;
         }
         ImGui::SameLine();
-        if (ImGui::Button(jce_editor_i18n("dialog.cancel"), ImVec2(80, 0))) {
+        if (ImGui::Button("Close Browser###op_browse_close", ImVec2(120, 0))) {
             s_open_project.browse_open = false;
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            s_open_project.browse_open = false;
+            *p_open = false;
         }
     }
 
@@ -569,74 +573,76 @@ void jce_editor_dialog_open_project(bool *p_open)
         ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "%s", s_open_project.error_msg);
     }
 
-    /* Buttons: Open | Cancel (right-aligned) */
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
+    if (!s_open_project.browse_open) {
+        /* Buttons: Open | Cancel (right-aligned) */
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
 
-    float btn_w   = 80.0f;
-    float spacing  = ImGui::GetStyle().ItemSpacing.x;
-    float total_btn_w = btn_w * 2 + spacing;
-    ImGui::SetCursorPosX(ImGui::GetContentRegionAvail().x - total_btn_w
-                         + ImGui::GetCursorPosX());
+        float btn_w   = 80.0f;
+        float spacing  = ImGui::GetStyle().ItemSpacing.x;
+        float total_btn_w = btn_w * 2 + spacing;
+        ImGui::SetCursorPosX(ImGui::GetContentRegionAvail().x - total_btn_w
+                             + ImGui::GetCursorPosX());
 
-    bool has_path = (strlen(s_open_project.manual_path) > 0);
-    bool enter_pressed = ImGui::IsKeyPressed(ImGuiKey_Enter)
-                      || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter);
+        bool has_path = (strlen(s_open_project.manual_path) > 0);
+        bool enter_pressed = ImGui::IsKeyPressed(ImGuiKey_Enter)
+                          || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter);
 
-    snprintf(_lbl, sizeof(_lbl), "%s###op_open",
-             jce_editor_i18n("openProject.open"));
-    ImGui::BeginDisabled(!has_path);
-    if (ImGui::Button(_lbl, ImVec2(btn_w, 0))
-        || (enter_pressed && has_path)) {
-        const char *path = s_open_project.manual_path;
-        s_open_project.error_msg[0] = '\0';
-        if (strlen(path) > 0) {
-            fs::path project_root;
-            if (resolve_project_root_path(path, &project_root)) {
-                std::string resolved_root = project_root.string();
-                if (!s_open_project.cfg_loaded)
-                    jce_editor_config_load(&s_open_project.cfg);
-                jce_editor_config_add_recent(&s_open_project.cfg, resolved_root.c_str());
-                s_open_project.cfg.last_project[0] = '\0';
-                jce_editor_config_save(&s_open_project.cfg);
+        snprintf(_lbl, sizeof(_lbl), "%s###op_open",
+                 jce_editor_i18n("openProject.open"));
+        ImGui::BeginDisabled(!has_path);
+        if (ImGui::Button(_lbl, ImVec2(btn_w, 0))
+            || (enter_pressed && has_path)) {
+            const char *path = s_open_project.manual_path;
+            s_open_project.error_msg[0] = '\0';
+            if (strlen(path) > 0) {
+                fs::path project_root;
+                if (resolve_project_root_path(path, &project_root)) {
+                    std::string resolved_root = project_root.string();
+                    if (!s_open_project.cfg_loaded)
+                        jce_editor_config_load(&s_open_project.cfg);
+                    jce_editor_config_add_recent(&s_open_project.cfg, resolved_root.c_str());
+                    s_open_project.cfg.last_project[0] = '\0';
+                    jce_editor_config_save(&s_open_project.cfg);
 
-                /* Set the asset browser root to the project directory. */
-                jce_editor_assets_set_project(resolved_root.c_str());
-                set_current_project_root(resolved_root.c_str());
-                snprintf(s_open_project.manual_path,
-                         sizeof(s_open_project.manual_path), "%s",
-                         resolved_root.c_str());
-                jce_editor_layout_request_focus_scene_view();
+                    /* Set the asset browser root to the project directory. */
+                    jce_editor_assets_set_project(resolved_root.c_str());
+                    set_current_project_root(resolved_root.c_str());
+                    snprintf(s_open_project.manual_path,
+                             sizeof(s_open_project.manual_path), "%s",
+                             resolved_root.c_str());
+                    jce_editor_layout_request_focus_scene_view();
 
-                jce_editor_console_log("Opened project: %s", resolved_root.c_str());
-                *p_open = false;
-            } else {
-                try {
-                    if (!fs::exists(fs::path(path))) {
+                    jce_editor_console_log("Opened project: %s", resolved_root.c_str());
+                    *p_open = false;
+                } else {
+                    try {
+                        if (!fs::exists(fs::path(path))) {
+                            snprintf(s_open_project.error_msg,
+                                     sizeof(s_open_project.error_msg), "%s",
+                                     jce_editor_i18n("openProject.errorNotExist"));
+                        } else {
+                            snprintf(s_open_project.error_msg,
+                                     sizeof(s_open_project.error_msg), "%s",
+                                     jce_editor_i18n("openProject.errorInvalid"));
+                        }
+                    } catch (...) {
                         snprintf(s_open_project.error_msg,
                                  sizeof(s_open_project.error_msg), "%s",
-                                 jce_editor_i18n("openProject.errorNotExist"));
-                    } else {
-                        snprintf(s_open_project.error_msg,
-                                 sizeof(s_open_project.error_msg), "%s",
-                                 jce_editor_i18n("openProject.errorInvalid"));
+                                 jce_editor_i18n("openProject.errorOpen"));
                     }
-                } catch (...) {
-                    snprintf(s_open_project.error_msg,
-                             sizeof(s_open_project.error_msg), "%s",
-                             jce_editor_i18n("openProject.errorOpen"));
+                    jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+                        "Project open failed for path: %s", path);
                 }
-                jce_editor_console_log_level(JCE_CONSOLE_WARNING,
-                    "Project open failed for path: %s", path);
             }
         }
-    }
-    ImGui::EndDisabled();
-    ImGui::SameLine();
-    if (ImGui::Button(jce_editor_i18n("dialog.cancel"), ImVec2(btn_w, 0))
-        || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-        *p_open = false;
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button(jce_editor_i18n("dialog.cancel"), ImVec2(btn_w, 0))
+            || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            *p_open = false;
+        }
     }
 
     ImGui::End();

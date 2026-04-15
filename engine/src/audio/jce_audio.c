@@ -506,6 +506,66 @@ void jce_audio_stop_all(JceAudio *audio)
         uninit_voice(&audio->voices[i]);
 }
 
+JceSound jce_audio_load_memory(JceAudio *audio, const void *data,
+                                uint32_t size, const char *hint_path)
+{
+    if (!audio || !data || size == 0) return JCE_SOUND_INVALID;
+    int slot = alloc_buffer_slot(audio);
+    if (slot < 0) return JCE_SOUND_INVALID;
+    return load_from_memory(audio, slot,
+                            (const uint8_t *)data, (size_t)size,
+                            hint_path ? hint_path : "<memory>");
+}
+
+float jce_audio_get_duration(const JceAudio *audio, JceSound snd)
+{
+    if (!audio || snd == JCE_SOUND_INVALID) return 0.0f;
+    int slot = (int)snd - 1;
+    if (slot < 0 || slot >= JCE_MAX_SOUNDS || !audio->sound_used[slot]) return 0.0f;
+    const SoundSlot *s = &audio->sounds[slot];
+    if (s->sample_rate == 0) return 0.0f;
+    return (float)s->frame_count / (float)s->sample_rate;
+}
+
+float jce_audio_get_time(const JceAudio *audio, JceVoice voice)
+{
+    if (!audio || voice == JCE_VOICE_INVALID) return 0.0f;
+    int idx = (int)voice - 1;
+    if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return 0.0f;
+    float cursor = 0.0f;
+    ma_sound_get_cursor_in_seconds((ma_sound *)&audio->voices[idx].sound, &cursor);
+    return cursor;
+}
+
+void jce_audio_seek(JceAudio *audio, JceVoice voice, float time_sec)
+{
+    if (!audio || voice == JCE_VOICE_INVALID) return;
+    int idx = (int)voice - 1;
+    if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return;
+    int slot = audio->voices[idx].sound_slot;
+    if (slot < 0 || slot >= JCE_MAX_SOUNDS) return;
+    ma_uint32 sr = audio->sounds[slot].sample_rate;
+    if (sr == 0) return;
+    ma_uint64 frame = (ma_uint64)(time_sec * (float)sr);
+    if (frame > audio->sounds[slot].frame_count)
+        frame = audio->sounds[slot].frame_count;
+    ma_sound_seek_to_pcm_frame(&audio->voices[idx].sound, frame);
+}
+
+const int16_t *jce_audio_get_pcm_data(const JceAudio *audio, JceSound snd,
+                                       uint32_t *out_frame_count,
+                                       uint32_t *out_channels)
+{
+    if (!audio || snd == JCE_SOUND_INVALID) return NULL;
+    int slot = (int)snd - 1;
+    if (slot < 0 || slot >= JCE_MAX_SOUNDS || !audio->sound_used[slot]) return NULL;
+    const SoundSlot *s = &audio->sounds[slot];
+    if (!s->pcm_data) return NULL;
+    if (out_frame_count) *out_frame_count = (uint32_t)s->frame_count;
+    if (out_channels)    *out_channels    = s->channels;
+    return (const int16_t *)s->pcm_data;
+}
+
 #else /* JCE_NO_AUDIO */
 
 JceAudio *jce_audio_create(void) {
@@ -554,5 +614,26 @@ bool jce_audio_is_playing(const JceAudio *audio,
 }
 void jce_audio_set_master_volume(JceAudio *audio, float volume) { (void)audio; (void)volume; }
 void jce_audio_stop_all(JceAudio *audio) { (void)audio; }
+JceSound jce_audio_load_memory(JceAudio *audio, const void *data,
+    uint32_t size, const char *hint_path) {
+    (void)audio; (void)data; (void)size; (void)hint_path;
+    return JCE_SOUND_INVALID;
+}
+float jce_audio_get_duration(const JceAudio *audio, JceSound snd) {
+    (void)audio; (void)snd; return 0.0f;
+}
+float jce_audio_get_time(const JceAudio *audio, JceVoice voice) {
+    (void)audio; (void)voice; return 0.0f;
+}
+void jce_audio_seek(JceAudio *audio, JceVoice voice, float time_sec) {
+    (void)audio; (void)voice; (void)time_sec;
+}
+const int16_t *jce_audio_get_pcm_data(const JceAudio *audio, JceSound snd,
+    uint32_t *out_frame_count, uint32_t *out_channels) {
+    (void)audio; (void)snd;
+    if (out_frame_count) *out_frame_count = 0;
+    if (out_channels) *out_channels = 0;
+    return NULL;
+}
 
 #endif /* JCE_NO_AUDIO */

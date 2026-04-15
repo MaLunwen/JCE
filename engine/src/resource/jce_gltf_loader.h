@@ -12,5 +12,7 @@ typedef struct PakArchive PakArchive;
  * Extracts meshes, PBR materials, textures, skeleton, and animations.
  * Returns NULL on failure. */
 JceModel *jce_gltf_load(const PakArchive *pak, const char *asset_path);
+JceModel *jce_gltf_load_memory(const void *data, uint32_t size,
+                               const char *name);
 
 #endif /* JCE_GLTF_LOADER_H */

@@ -27,6 +27,11 @@ typedef struct JceAnimClip JceAnimClip;
    Returns NULL on failure (asset not found, parse error, OOM). */
 JceModel *jce_model_load_gltf(const PakArchive *pak, const char *asset_path);
 
+/* Load a glTF/GLB model from raw file bytes in memory.
+   name is used for logging only; may be NULL. */
+JceModel *jce_model_load_gltf_memory(const void *data, uint32_t size,
+                                      const char *name);
+
 /* Destroy a model and all owned GPU resources (meshes, textures, skeleton). */
 void jce_model_destroy(JceModel *model);
 

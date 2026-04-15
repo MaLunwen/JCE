@@ -80,6 +80,8 @@ static void fv_close_tab(int idx)
     /* Cleanup viewer-specific state */
     if (tab->type == JCE_FV_MODEL)
         fv_model_close_tab(tab->path);
+    if (tab->type == JCE_FV_AUDIO)
+        fv_audio_close_tab(tab);
     fv_code_close_tab(tab);
 
     if (jce_texture_valid(tab->gpu_tex))
@@ -144,6 +146,10 @@ static JceFileViewerType fv_detect_ext(const char *ext)
         || strcmp(ext, ".gradle") == 0 || strcmp(ext, ".kts") == 0
         || strcmp(ext, ".properties") == 0)
         return JCE_FV_TEXT;
+
+    if (strcmp(ext, ".wav") == 0 || strcmp(ext, ".ogg") == 0
+        || strcmp(ext, ".mp3") == 0 || strcmp(ext, ".flac") == 0)
+        return JCE_FV_AUDIO;
 
     return JCE_FV_BINARY;
 }
@@ -228,16 +234,32 @@ void jce_file_viewer_open(const char *path)
     long file_size = ftell(fp);
     fseek(fp, 0, SEEK_SET);
 
+    if (file_size < 0) {
+        fclose(fp);
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+            "file viewer: failed to read size for '%s'", open_path);
+        return;
+    }
+
+    if (file_size > FV_MAX_ASSET_BYTES) {
+        fclose(fp);
+        jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+            "file viewer: '%s' is too large (%ld bytes). Max single asset is %d MB.",
+            open_path, file_size, FV_MAX_ASSET_BYTES / (1024 * 1024));
+        return;
+    }
+
     JceFileViewerType ftype = fv_detect_ext(ext);
 
     int read_size;
     if (ftype == JCE_FV_IMAGE)
         read_size = (int)file_size;
+    else if (ftype == JCE_FV_AUDIO)
+        read_size = (int)file_size;
     else if (ftype == JCE_FV_MODEL) {
-        /* Cap model content read — assimp uses file-based loading via
-         * tab->path, so we only need the first chunk for GLB header
-         * display and memory-based fallback for small files. */
-        const long model_cap = 2L * 1024 * 1024;  /* 2 MB */
+        /* Keep model bytes up to the global per-asset cap so GLB files
+         * can be inspected consistently in the model viewer. */
+        const long model_cap = FV_MAX_ASSET_BYTES;
         read_size = (file_size > model_cap) ? (int)model_cap : (int)file_size;
     }
     else
@@ -380,6 +402,10 @@ void jce_file_viewer_request_focus(void)
 
 void jce_file_viewer_draw_content(void)
 {
+    const bool file_viewer_focused =
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+    const char *active_audio_path = NULL;
+
     if (s_fv.want_focus) {
         ImGui::SetWindowFocus();
         s_fv.want_focus = false;
@@ -396,6 +422,7 @@ void jce_file_viewer_draw_content(void)
         ImVec2 hsz = ImGui::CalcTextSize(hint);
         ImGui::SetCursorPosX((w - hsz.x) * 0.5f);
         ImGui::TextDisabled("%s", hint);
+        fv_audio_update_focus(NULL, false);
         return;
     }
 
@@ -483,6 +510,10 @@ void jce_file_viewer_draw_content(void)
                 case JCE_FV_MODEL:    fv_render_model(tab);    break;
                 case JCE_FV_SCENE:    fv_render_scene(tab);    break;
                 case JCE_FV_MATERIAL: fv_render_material(tab); break;
+                case JCE_FV_AUDIO:
+                    active_audio_path = tab->path;
+                    fv_render_audio(tab);
+                    break;
                 case JCE_FV_BINARY:   fv_render_hex(tab);      break;
                 default:              fv_render_code(tab);      break;
                 }
@@ -499,11 +530,16 @@ void jce_file_viewer_draw_content(void)
         }
         ImGui::EndTabBar();
     }
+
+    fv_audio_update_focus(active_audio_path, file_viewer_focused);
 }
 
 void jce_file_viewer_draw_window(bool *p_visible)
 {
-    if (!p_visible || !*p_visible) return;
+    if (!p_visible || !*p_visible) {
+        fv_audio_update_focus(NULL, false);
+        return;
+    }
 
     if (s_fv.want_focus) {
         ImGui::SetNextWindowFocus();
@@ -523,6 +559,8 @@ void jce_file_viewer_close_all(void)
         FvTab *tab = &s_fv.tabs[i];
         if (tab->type == JCE_FV_MODEL)
             fv_model_close_tab(tab->path);
+        if (tab->type == JCE_FV_AUDIO)
+            fv_audio_close_tab(tab);
         fv_code_close_tab(tab);
         if (jce_texture_valid(tab->gpu_tex))
             jce_texture_destroy(tab->gpu_tex);

@@ -15,6 +15,11 @@ extern "C" {
 }
 
 #include <ctype.h>
+#include <filesystem>
+
+namespace fs = std::filesystem;
+
+#define SCENE_DROP_SYNC_MATERIAL_LIMIT_BYTES (12ull * 1024ull * 1024ull)
 
 /* ── Forward declarations ─────────────────────────────────────────── */
 static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail);
@@ -261,6 +266,19 @@ static int detect_texture_drop_slot(const char *path)
         return 1;
 
     return 0;
+}
+
+static bool should_extract_drop_material_sync(const char *asset_path)
+{
+    if (!asset_path || !asset_path[0]) return false;
+
+    std::error_code ec;
+    uintmax_t size = fs::file_size(fs::path(asset_path), ec);
+    if (ec) {
+        /* If stat fails (virtual path, permissions), keep previous behavior. */
+        return true;
+    }
+    return size <= SCENE_DROP_SYNC_MATERIAL_LIMIT_BYTES;
 }
 
 static void assign_texture_drop_to_mesh_renderer(JceComponentInfo *mesh_renderer_comp,
@@ -553,32 +571,38 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail)
                     mr.ao_tex[0] = '\0';
                     mr.emissive_tex[0] = '\0';
 
-                    JceEditorMaterialInfo mat = {};
-                    if (jce_editor_model_extract_material(asset_path, &mat)) {
-                        if (mat.albedo_tex[0])
-                            snprintf(mr.albedo_tex, sizeof(mr.albedo_tex), "%s", mat.albedo_tex);
-                        if (mat.mr_tex[0])
-                            snprintf(mr.mr_tex, sizeof(mr.mr_tex), "%s", mat.mr_tex);
-                        if (mat.normal_tex[0])
-                            snprintf(mr.normal_tex, sizeof(mr.normal_tex), "%s", mat.normal_tex);
-                        if (mat.ao_tex[0])
-                            snprintf(mr.ao_tex, sizeof(mr.ao_tex), "%s", mat.ao_tex);
-                        if (mat.emissive_tex[0])
-                            snprintf(mr.emissive_tex, sizeof(mr.emissive_tex), "%s", mat.emissive_tex);
-                        mr.base_color[0] = mat.base_color[0];
-                        mr.base_color[1] = mat.base_color[1];
-                        mr.base_color[2] = mat.base_color[2];
-                        mr.base_color[3] = mat.base_color[3];
-                        mr.metallic       = mat.metallic;
-                        mr.roughness      = mat.roughness;
-                        mr.emissive[0]    = mat.emissive[0];
-                        mr.emissive[1]    = mat.emissive[1];
-                        mr.emissive[2]    = mat.emissive[2];
-                        mr.normal_scale   = mat.normal_scale;
-                        mr.ao_strength    = mat.ao_strength;
-                        mr.alpha_mode     = mat.alpha_mode;
-                        mr.alpha_cutoff   = mat.alpha_cutoff;
-                        mr.double_sided   = mat.double_sided;
+                    if (should_extract_drop_material_sync(asset_path)) {
+                        JceEditorMaterialInfo mat = {};
+                        if (jce_editor_model_extract_material(asset_path, &mat)) {
+                            if (mat.albedo_tex[0])
+                                snprintf(mr.albedo_tex, sizeof(mr.albedo_tex), "%s", mat.albedo_tex);
+                            if (mat.mr_tex[0])
+                                snprintf(mr.mr_tex, sizeof(mr.mr_tex), "%s", mat.mr_tex);
+                            if (mat.normal_tex[0])
+                                snprintf(mr.normal_tex, sizeof(mr.normal_tex), "%s", mat.normal_tex);
+                            if (mat.ao_tex[0])
+                                snprintf(mr.ao_tex, sizeof(mr.ao_tex), "%s", mat.ao_tex);
+                            if (mat.emissive_tex[0])
+                                snprintf(mr.emissive_tex, sizeof(mr.emissive_tex), "%s", mat.emissive_tex);
+                            mr.base_color[0] = mat.base_color[0];
+                            mr.base_color[1] = mat.base_color[1];
+                            mr.base_color[2] = mat.base_color[2];
+                            mr.base_color[3] = mat.base_color[3];
+                            mr.metallic       = mat.metallic;
+                            mr.roughness      = mat.roughness;
+                            mr.emissive[0]    = mat.emissive[0];
+                            mr.emissive[1]    = mat.emissive[1];
+                            mr.emissive[2]    = mat.emissive[2];
+                            mr.normal_scale   = mat.normal_scale;
+                            mr.ao_strength    = mat.ao_strength;
+                            mr.alpha_mode     = mat.alpha_mode;
+                            mr.alpha_cutoff   = mat.alpha_cutoff;
+                            mr.double_sided   = mat.double_sided;
+                        }
+                    } else {
+                        jce_editor_console_log(
+                            "Large mesh drop detected, deferring material extraction: %s",
+                            asset_path);
                     }
                 }
                 jce_state_end_batch_edit();
@@ -654,33 +678,39 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail)
                         mr.ao_tex[0] = '\0';
                         mr.emissive_tex[0] = '\0';
 
-                        JceEditorMaterialInfo mat = {};
-                        if (jce_editor_model_extract_material(asset_path, &mat)) {
-                            if (mat.albedo_tex[0])
-                                snprintf(mr.albedo_tex, sizeof(mr.albedo_tex), "%s", mat.albedo_tex);
-                            if (mat.mr_tex[0])
-                                snprintf(mr.mr_tex, sizeof(mr.mr_tex), "%s", mat.mr_tex);
-                            if (mat.normal_tex[0])
-                                snprintf(mr.normal_tex, sizeof(mr.normal_tex), "%s", mat.normal_tex);
-                            if (mat.ao_tex[0])
-                                snprintf(mr.ao_tex, sizeof(mr.ao_tex), "%s", mat.ao_tex);
-                            if (mat.emissive_tex[0])
-                                snprintf(mr.emissive_tex, sizeof(mr.emissive_tex), "%s", mat.emissive_tex);
+                        if (should_extract_drop_material_sync(asset_path)) {
+                            JceEditorMaterialInfo mat = {};
+                            if (jce_editor_model_extract_material(asset_path, &mat)) {
+                                if (mat.albedo_tex[0])
+                                    snprintf(mr.albedo_tex, sizeof(mr.albedo_tex), "%s", mat.albedo_tex);
+                                if (mat.mr_tex[0])
+                                    snprintf(mr.mr_tex, sizeof(mr.mr_tex), "%s", mat.mr_tex);
+                                if (mat.normal_tex[0])
+                                    snprintf(mr.normal_tex, sizeof(mr.normal_tex), "%s", mat.normal_tex);
+                                if (mat.ao_tex[0])
+                                    snprintf(mr.ao_tex, sizeof(mr.ao_tex), "%s", mat.ao_tex);
+                                if (mat.emissive_tex[0])
+                                    snprintf(mr.emissive_tex, sizeof(mr.emissive_tex), "%s", mat.emissive_tex);
 
-                            mr.base_color[0] = mat.base_color[0];
-                            mr.base_color[1] = mat.base_color[1];
-                            mr.base_color[2] = mat.base_color[2];
-                            mr.base_color[3] = mat.base_color[3];
-                            mr.metallic       = mat.metallic;
-                            mr.roughness      = mat.roughness;
-                            mr.emissive[0]    = mat.emissive[0];
-                            mr.emissive[1]    = mat.emissive[1];
-                            mr.emissive[2]    = mat.emissive[2];
-                            mr.normal_scale   = mat.normal_scale;
-                            mr.ao_strength    = mat.ao_strength;
-                            mr.alpha_mode     = mat.alpha_mode;
-                            mr.alpha_cutoff   = mat.alpha_cutoff;
-                            mr.double_sided   = mat.double_sided;
+                                mr.base_color[0] = mat.base_color[0];
+                                mr.base_color[1] = mat.base_color[1];
+                                mr.base_color[2] = mat.base_color[2];
+                                mr.base_color[3] = mat.base_color[3];
+                                mr.metallic       = mat.metallic;
+                                mr.roughness      = mat.roughness;
+                                mr.emissive[0]    = mat.emissive[0];
+                                mr.emissive[1]    = mat.emissive[1];
+                                mr.emissive[2]    = mat.emissive[2];
+                                mr.normal_scale   = mat.normal_scale;
+                                mr.ao_strength    = mat.ao_strength;
+                                mr.alpha_mode     = mat.alpha_mode;
+                                mr.alpha_cutoff   = mat.alpha_cutoff;
+                                mr.double_sided   = mat.double_sided;
+                            }
+                        } else {
+                            jce_editor_console_log(
+                                "Large mesh drop detected, deferring material extraction: %s",
+                                asset_path);
                         }
                         break;
                     }

@@ -43,8 +43,7 @@ static void draw_dir_tree(const fs::path &dir, int depth)
             bool open = ImGui::TreeNodeEx(dirname.c_str(), flags);
 
             if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
-                s_assets.current_path  = sd.string();
-                s_assets.needs_refresh = true;
+                navigate_asset_directory(sd.string(), false);
             }
 
             if (ImGui::BeginPopupContextItem()) {
@@ -98,8 +97,7 @@ void draw_asset_directory_tree(float tree_w, float panel_h)
 
         if (ImGui::TreeNodeEx(root_name.c_str(), root_flags)) {
             if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
-                s_assets.current_path  = s_assets.project_root;
-                s_assets.needs_refresh = true;
+                navigate_asset_directory(s_assets.project_root, false);
             }
             if (ImGui::BeginPopupContextItem()) {
 #ifdef _WIN32
@@ -146,10 +144,7 @@ void draw_asset_breadcrumb_bar(void)
                                 && parent.string().length() < root.string().length(); }
                 catch (...) {}
                 if (!above_root) {
-                    s_assets.current_path  = parent.string();
-                    s_assets.needs_refresh = true;
-                    s_assets.selected_set.clear();
-                    s_assets.last_clicked_idx = -1;
+                    navigate_asset_directory(parent.string(), false);
                 }
             } catch (const std::exception &e) {
                 jce_editor_console_log_level(JCE_CONSOLE_ERROR,
@@ -198,10 +193,7 @@ void draw_asset_breadcrumb_bar(void)
                     snprintf(bid, sizeof(bid), "%s###bc_%d",
                              crumbs[i].first.c_str(), (int)i);
                     if (ImGui::SmallButton(bid)) {
-                        s_assets.current_path  = crumbs[i].second;
-                        s_assets.needs_refresh = true;
-                        s_assets.selected_set.clear();
-                        s_assets.last_clicked_idx = -1;
+                        navigate_asset_directory(crumbs[i].second, false);
                     }
                     ImGui::PopStyleColor(2);
                 }

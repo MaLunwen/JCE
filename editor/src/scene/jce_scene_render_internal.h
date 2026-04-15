@@ -22,11 +22,13 @@ extern "C" {
 #include <jce/graphics/jce_lighting_system.h>
 #include <jce/graphics/jce_material.h>
 #include <jce/graphics/jce_mesh.h>
+#include <jce/graphics/jce_model.h>
 #include <jce/graphics/jce_pbr_material.h>
 #include <jce/graphics/jce_renderer.h>
 #include <jce/graphics/jce_shaders.h>
 #include <jce/graphics/jce_texture.h>
 #include <jce/graphics/jce_views.h>
+#include <jce/animation/jce_animation.h>
 #include <jce/core/pak_loader.h>
 }
 
@@ -35,6 +37,22 @@ extern "C" {
 /* ── Background color ─────────────────────────────────────────────── */
 
 #define BG_COLOR_RGBA  0x365FA0FF
+
+/* ── Model / animation cache for viewport playback ───────────────── */
+
+#define MODEL_CACHE_MAX 32
+
+struct ModelCacheEntry {
+    char            path[256];
+    JceModel       *model;
+    JceAnimPlayer  *player;
+    uint32_t        bound_entity;   /* entity that owns this entry */
+    int             active_clip;
+    bool            loop;
+    float           speed;
+    bool            paused;
+    bool            used;
+};
 
 /* ── Vertex type for transient buffers ────────────────────────────── */
 
@@ -92,6 +110,9 @@ struct SceneRenderState {
 
     /* Hover highlight for drag-drop onto entity. */
     uint32_t     hover_entity_id;
+
+    /* Model / animation cache for skinned entities. */
+    ModelCacheEntry  model_cache[MODEL_CACHE_MAX];
 };
 
 extern SceneRenderState s_sr;
@@ -101,6 +122,9 @@ extern SceneRenderState s_sr;
 uint16_t scene_view_id(void);
 JceMesh *get_cached_mesh(const char *mesh_path, const float *world_pos);
 JceTexture get_cached_texture(const char *material_path, const char *mesh_path);
+
+/* Model cache helpers (jce_editor_scene_render.cpp). */
+ModelCacheEntry *get_cached_model(const char *skeleton_path, uint32_t entity_id);
 
 /* ── Functions from jce_scene_render_draw.cpp ─────────────────────── */
 
