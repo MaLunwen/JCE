@@ -395,7 +395,21 @@ JceTexture asset_cache_get_texture(const char *material_path,
     if (entry->failed)
         return tex_invalid();
 
-    if (s_cache.assets && material_path && looks_like_texture_asset_path(material_path)) {
+    /* If the path points directly to an existing file on disk, bypass the
+     * PAK asset manager entirely and go straight to the async file-based
+     * texture loader.  The editor always works with real filesystem paths
+     * (never packed assets), so this avoids noisy "not found in PAK"
+     * errors for every drag-dropped model texture. */
+    bool is_filesystem_texture = false;
+    if (material_path && material_path[0] != '\0'
+        && looks_like_texture_asset_path(material_path)) {
+        fs::path direct(material_path);
+        if (path_is_file(direct))
+            is_filesystem_texture = true;
+    }
+
+    if (s_cache.assets && material_path && looks_like_texture_asset_path(material_path)
+        && !is_filesystem_texture) {
         if (!asset_handle_valid(entry->asset_handle)) {
             JceAssetLoadParams params = asset_load_params_default();
             params.texture_sampler_mode = JCE_TEX_WRAP;

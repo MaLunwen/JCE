@@ -566,8 +566,24 @@ static bool jce_resize_event_watch(void *userdata, SDL_Event *event)
 JceAppResult jce_engine_event(JceEngine *e, const void *platform_event)
 {
     const SDL_Event *event = (const SDL_Event *)platform_event;
-    if (event->type == SDL_EVENT_QUIT || event->type == SDL_EVENT_TERMINATING)
+
+    if (event->type == SDL_EVENT_TERMINATING)
         return JCE_APP_SUCCESS;
+
+    if (event->type == SDL_EVENT_QUIT) {
+        if (g_app_desc.on_event)
+            g_app_desc.on_event(event, g_app_desc.user_data);
+
+        /* If the application registered a should_quit callback, give it
+           a chance to intercept the quit (e.g. to show an unsaved-changes
+           dialog).  If the callback returns false, swallow the event. */
+        if (g_app_desc.should_quit) {
+            if (g_app_desc.should_quit(g_app_desc.user_data))
+                return JCE_APP_SUCCESS;
+            return JCE_APP_CONTINUE;
+        }
+        return JCE_APP_SUCCESS;
+    }
 
     if (e->input) jce_input_handle_event(e->input, event);
 

@@ -7,8 +7,8 @@
 /* ── Orbit constants ──────────────────────────────────────────────── */
 
 #define ORBIT_PITCH_MAX  (89.0f * JCE_DEG2RAD)
-#define ORBIT_DIST_MIN   0.5f
-#define ORBIT_DIST_MAX   500.0f
+#define ORBIT_DIST_MIN   0.001f
+#define ORBIT_DIST_MAX   100000.0f
 
 /* ── Internal: recompute camera position from orbit state ─────────── */
 
@@ -27,6 +27,17 @@ void orbit_apply(void)
 
     jce_camera_set_position(s_sr.camera, pos);
     jce_camera_look_at(s_sr.camera, s_sr.orbit_target);
+
+    /* Dynamic near/far clip planes based on orbit distance.
+     * Prevents Z-fighting when very close, and extends far plane when zoom
+     * is very far out. */
+    float near_clip = d * 0.001f;
+    if (near_clip < 0.001f) near_clip = 0.001f;
+    if (near_clip > 1.0f)   near_clip = 1.0f;
+    float far_clip = d * 100.0f;
+    if (far_clip < 100.0f)    far_clip = 100.0f;
+    if (far_clip > 100000.0f) far_clip = 100000.0f;
+    jce_camera_set_near_far(s_sr.camera, near_clip, far_clip);
 }
 
 /* ── Public camera API ────────────────────────────────────────────── */
@@ -82,10 +93,79 @@ void jce_editor_scene_camera_pan(float dx, float dy)
     orbit_apply();
 }
 
+/* ── Maya-style adaptive zoom: nearest object along view ray ──────── */
+
+static float nearest_hit_along_view_ray(void)
+{
+    if (!s_sr.camera) return 1e30f;
+
+    jce_vec3 eye = jce_camera_get_position(s_sr.camera);
+
+    /* Ray direction: from camera eye toward the orbit target. */
+    jce_vec3 dir = jce_v3_sub(s_sr.orbit_target, eye);
+    float dir_len = jce_v3_len(dir);
+    if (dir_len < 1e-8f) return 1e30f;
+    dir = jce_v3_scale(dir, 1.0f / dir_len);
+
+    float best_t = 1e30f;
+    int total = jce_state_get_entity_count();
+
+    for (int i = 0; i < total; i++) {
+        JceEntityInfo *ent = jce_state_get_entity_by_index(i);
+        if (!ent || !ent->enabled) continue;
+
+        JceComponentInfo pc[JCE_MAX_COMPONENTS];
+        int pcc = jce_state_get_components(ent->id, pc, JCE_MAX_COMPONENTS);
+        float pos[3] = {0,0,0}, scl[3] = {1,1,1};
+        bool has_xf = false;
+        for (int ci = 0; ci < pcc; ci++) {
+            if (pc[ci].type == JCE_COMP_TRANSFORM) {
+                memcpy(pos, pc[ci].data.transform.pos, sizeof(float) * 3);
+                memcpy(scl, pc[ci].data.transform.scale, sizeof(float) * 3);
+                has_xf = true;
+                break;
+            }
+        }
+        if (!has_xf) continue;
+
+        float hx = fabsf(scl[0]) * 0.5f;
+        float hy = fabsf(scl[1]) * 0.5f;
+        float hz = fabsf(scl[2]) * 0.5f;
+        if (hx < 0.1f) hx = 0.1f;
+        if (hy < 0.1f) hy = 0.1f;
+        if (hz < 0.1f) hz = 0.1f;
+
+        jce_vec3 bmin = {{ pos[0]-hx, pos[1]-hy, pos[2]-hz }};
+        jce_vec3 bmax = {{ pos[0]+hx, pos[1]+hy, pos[2]+hz }};
+
+        float t;
+        if (jce_ray_aabb_intersect(eye, dir, bmin, bmax, &t) && t >= 0.0f) {
+            if (t < best_t) best_t = t;
+        }
+    }
+    return best_t;
+}
+
 void jce_editor_scene_camera_zoom(float delta)
 {
     if (!s_sr.initialized) return;
-    s_sr.orbit_distance -= delta * s_sr.orbit_distance * 0.1f;
+
+    float base_step = delta * s_sr.orbit_distance * 0.1f;
+
+    /* When zooming IN (distance decreasing, base_step > 0), apply Maya-style
+     * deceleration: reduce zoom speed proportionally to the nearest object
+     * distance along the view ray.  This prevents camera tunneling through
+     * objects without ever fully stopping the zoom. */
+    if (base_step > 0.0f) {
+        float t_hit = nearest_hit_along_view_ray();
+        if (t_hit < s_sr.orbit_distance) {
+            float ratio = t_hit / s_sr.orbit_distance;
+            if (ratio < 0.01f) ratio = 0.01f;
+            base_step *= ratio;
+        }
+    }
+
+    s_sr.orbit_distance -= base_step;
     if (s_sr.orbit_distance < ORBIT_DIST_MIN) s_sr.orbit_distance = ORBIT_DIST_MIN;
     if (s_sr.orbit_distance > ORBIT_DIST_MAX) s_sr.orbit_distance = ORBIT_DIST_MAX;
     orbit_apply();

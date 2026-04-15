@@ -84,6 +84,14 @@ struct SceneRenderState {
     bool                       shadow_valid;
 
     JceLightEnv              *light_env;
+
+    /* Ghost (drag-preview) model state. */
+    bool         ghost_active;
+    char         ghost_mesh_path[512];
+    float        ghost_pos[3];
+
+    /* Hover highlight for drag-drop onto entity. */
+    uint32_t     hover_entity_id;
 };
 
 extern SceneRenderState s_sr;
@@ -99,6 +107,8 @@ JceTexture get_cached_texture(const char *material_path, const char *mesh_path);
 void draw_sky_gradient(void);
 void draw_grid(void);
 void draw_entities(void);
+void draw_ghost_entity(void);
+void draw_hover_highlight(void);
 
 /* ── Functions from jce_scene_render_camera.cpp ───────────────────── */
 

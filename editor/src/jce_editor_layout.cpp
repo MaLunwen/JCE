@@ -39,6 +39,7 @@ static bool s_show_save_as     = false;
 static bool s_show_unsaved     = false;
 static int  s_unsaved_result   = 0;
 static bool s_quit_after_save_as = false;
+static bool s_quit_confirmed = false;
 
 /* ── Docking state ────────────────────────────────────────────────── */
 
@@ -91,14 +92,6 @@ static void draw_dialog_dimmer(void)
 
     ImGui::PopStyleColor(2);
     ImGui::PopStyleVar(3);
-}
-
-static void request_app_quit(void)
-{
-    SDL_Event ev;
-    SDL_zero(ev);
-    ev.type = SDL_EVENT_QUIT;
-    SDL_PushEvent(&ev);
 }
 
 typedef enum {
@@ -178,10 +171,8 @@ static void draw_menu_bar(void)
         if (ImGui::MenuItem(jce_editor_i18n("menu.file.open")))
             s_show_open_project = true;
         ImGui::Separator();
-        if (ImGui::MenuItem(jce_editor_i18n("menu.file.exit"), "Alt+F4")) {
-            s_unsaved_result = 0;
-            s_show_unsaved = true;
-        }
+        if (ImGui::MenuItem(jce_editor_i18n("menu.file.exit"), "Alt+F4"))
+            jce_editor_layout_request_quit();
         ImGui::EndMenu();
     }
 
@@ -572,11 +563,11 @@ void jce_editor_layout_draw(void)
         if (s_unsaved_result == 1) {
             SaveSceneResult save_result = save_scene_or_open_save_as();
             if (save_result == SAVE_SCENE_RESULT_OK)
-                request_app_quit();
+                s_quit_confirmed = true;
             else if (save_result == SAVE_SCENE_RESULT_NEEDS_PATH)
                 s_quit_after_save_as = true;
         } else if (s_unsaved_result == 2) {
-            request_app_quit();
+            s_quit_confirmed = true;
         }
         s_unsaved_result = 0;
     }
@@ -584,7 +575,7 @@ void jce_editor_layout_draw(void)
     if (s_quit_after_save_as && !s_show_save_as) {
         const char *scene_path = jce_state_get_current_scene_path();
         if (scene_path && scene_path[0] != '\0')
-            request_app_quit();
+            s_quit_confirmed = true;
         s_quit_after_save_as = false;
     }
 }
@@ -605,4 +596,17 @@ void jce_editor_layout_request_focus_file_viewer(void)
 {
     *jce_editor_panel_visible_ptr(JCE_PANEL_FILE_VIEWER) = true;
     s_focus_file_viewer = true;
+}
+
+void jce_editor_layout_request_quit(void)
+{
+    if (s_quit_confirmed) return;
+    if (s_show_unsaved)   return; /* already showing */
+    s_unsaved_result = 0;
+    s_show_unsaved   = true;
+}
+
+bool jce_editor_layout_is_quit_confirmed(void)
+{
+    return s_quit_confirmed;
 }

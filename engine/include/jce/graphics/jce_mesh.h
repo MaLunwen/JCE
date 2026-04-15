@@ -69,6 +69,10 @@ void jce_mesh_submit_pbr(const JceMesh *mesh, const JceRenderer *r, uint16_t vie
    Caller must set transforms and shadow view/proj before calling. */
 void jce_mesh_submit_shadow(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id);
 
+/* Submit mesh using the mesh program WITHOUT overriding bgfx_set_state.
+   Caller must set state, transforms, uniforms, and textures before this. */
+void jce_mesh_submit_overlay(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id);
+
 #ifdef __cplusplus
 }
 #endif

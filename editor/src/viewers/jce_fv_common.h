@@ -81,6 +81,7 @@ void fv_render_code(FvTab *tab);
 void fv_render_image(FvTab *tab);
 void fv_render_model(FvTab *tab);
 void fv_render_scene(FvTab *tab);
+void fv_render_material(FvTab *tab);
 void fv_render_hex(FvTab *tab);
 
 /* ── Per-viewer cleanup (called when closing a tab) ──────────────── */

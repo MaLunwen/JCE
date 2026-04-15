@@ -77,6 +77,9 @@ bool  jce_editor_assets_delete_dialog_open(void);
 /* Inspector sync: hierarchy calls this when selection changes. */
 void  jce_editor_inspector_request_sync(void);
 
+/* Reload PBR properties for all entities referencing this material file. */
+void  jce_editor_inspector_reload_material(const char *material_path);
+
 /* Inspector delete request: opens the same confirmation dialog used by Inspector panel. */
 void  jce_editor_inspector_request_delete_confirm(uint32_t entity_id);
 

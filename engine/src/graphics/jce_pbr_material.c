@@ -245,12 +245,17 @@ bool jce_pbr_material_load_json(const char *path, JcePbrMaterial *out,
     *out = jce_pbr_material_default();
     memset(out_tex_paths, 0, 5 * 256);
 
-    /* Texture paths. */
+    /* Texture paths (primary keys + fallback aliases). */
     const char *tex_keys[5] = {
         "albedoMap", "metallicRoughnessMap", "normalMap", "aoMap", "emissiveMap"
     };
+    const char *tex_keys_alt[5] = {
+        NULL, "metallicMap", NULL, "occlusionMap", "emissionMap"
+    };
     for (int i = 0; i < 5; i++) {
         const char *v = json_string(root, tex_keys[i]);
+        if (!v && tex_keys_alt[i])
+            v = json_string(root, tex_keys_alt[i]);
         if (v) safe_copy(out_tex_paths[i], 256, v);
     }
 
@@ -260,8 +265,23 @@ bool jce_pbr_material_load_json(const char *path, JcePbrMaterial *out,
     json_float_array(root, "baseColorFactor", out->base_color_factor, 4, def_bc);
     json_float_array(root, "emissiveFactor", out->emissive_factor, 3, def_em);
 
-    out->metallic_factor  = (float)json_number(root, "metallicFactor",  0.0);
-    out->roughness_factor = (float)json_number(root, "roughnessFactor", 1.0);
+    /* Metallic: "metallicFactor" or legacy "metallic". */
+    cJSON *jm = cJSON_GetObjectItemCaseSensitive(root, "metallicFactor");
+    if (!jm) jm = cJSON_GetObjectItemCaseSensitive(root, "metallic");
+    out->metallic_factor = (jm && cJSON_IsNumber(jm)) ? (float)jm->valuedouble : 0.0f;
+
+    /* Roughness: "roughnessFactor" or legacy "smoothness" (inverted). */
+    cJSON *jr = cJSON_GetObjectItemCaseSensitive(root, "roughnessFactor");
+    if (jr && cJSON_IsNumber(jr)) {
+        out->roughness_factor = (float)jr->valuedouble;
+    } else {
+        cJSON *js = cJSON_GetObjectItemCaseSensitive(root, "smoothness");
+        if (js && cJSON_IsNumber(js))
+            out->roughness_factor = 1.0f - (float)js->valuedouble;
+        else
+            out->roughness_factor = 1.0f;
+    }
+
     out->normal_scale     = (float)json_number(root, "normalScale",     1.0);
     out->ao_strength      = (float)json_number(root, "aoStrength",      1.0);
     out->alpha_cutoff     = (float)json_number(root, "alphaCutoff",     0.5);

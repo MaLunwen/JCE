@@ -42,6 +42,7 @@ void history_end_edit(bool active)
 
 	if (changed) {
 		s_redo_history.clear();
+		s.scene_modified = true;
 	} else if (s_history_outer_edit_pushed_snapshot && !s_undo_history.empty()) {
 		s_undo_history.pop_back();
 	}
@@ -261,3 +262,4 @@ bool jce_state_transaction_active(void)
 {
 	return s_transaction.active;
 }
+

@@ -207,6 +207,7 @@ bool jce_editor_init(const PakArchive *pak, JceWindow *window)
     ImGuiIO &io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+    io.ConfigDragClickToInputText = true;  /* single-click on DragFloat enters text-input mode */
 
     /* Let ImGui persist layout/docking state to imgui.ini. */
     io.IniFilename = "imgui.ini";

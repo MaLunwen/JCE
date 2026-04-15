@@ -25,6 +25,7 @@ extern "C" {
 #include "scene/jce_editor_scene_render.h"
 #include "jce_editor_config.h"
 #include "jce_editor_state.h"
+#include "jce_editor_layout.h"
 
 /* ── Editor state ──────────────────────────────────────────────────── */
 
@@ -180,10 +181,24 @@ static void editor_app_draw(const JceServices *svc, void *ud)
 static void editor_app_event(const void *ev, void *ud)
 {
     (void)ud;
-    jce_editor_process_event((const SDL_Event *)ev);
+    const SDL_Event *event = (const SDL_Event *)ev;
+
+    if (event->type == SDL_EVENT_QUIT
+        && !jce_editor_layout_is_quit_confirmed())
+    {
+        jce_editor_layout_request_quit();
+    }
+
+    jce_editor_process_event(event);
 }
 
 /* ── SDL3 callbacks ────────────────────────────────────────────────── */
+
+static bool editor_should_quit(void *user_data)
+{
+    (void)user_data;
+    return jce_editor_layout_is_quit_confirmed();
+}
 
 SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
 {
@@ -206,6 +221,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
     desc.update    = editor_app_update;
     desc.draw      = editor_app_draw;
     desc.on_event  = editor_app_event;
+    desc.should_quit = editor_should_quit;
     desc.user_data = &g_state;
 
     jce_engine_set_app_desc(&desc);

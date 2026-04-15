@@ -501,3 +501,86 @@ void draw_entities(void)
 
     draw_selection_outlines();
 }
+
+/* ── Ghost (drag-preview) model rendering ─────────────────────────── */
+
+void draw_ghost_entity(void)
+{
+    if (!s_sr.ghost_active || s_sr.ghost_mesh_path[0] == '\0')
+        return;
+
+    JceMesh *mesh = get_cached_mesh(s_sr.ghost_mesh_path, s_sr.ghost_pos);
+    if (!mesh) return;
+
+    /* Build identity-scale model matrix at the ghost position. */
+    jce_mat4 model = jce_m4_identity();
+    model.raw[3][0] = s_sr.ghost_pos[0];
+    model.raw[3][1] = s_sr.ghost_pos[1];
+    model.raw[3][2] = s_sr.ghost_pos[2];
+    bgfx_set_transform(model.raw[0], 1);
+
+    /* Bind a green-tinted white texture. */
+    JceUniformHandle uh = jce_renderer_get_tex_uniform(s_sr.renderer);
+    bgfx_uniform_handle_t su = { uh.idx };
+    bgfx_set_texture(0, su, s_sr.white_tex, UINT32_MAX);
+
+    /* Semi-transparent green: alpha blend + write RGB/A + depth test. */
+    uint64_t state = BGFX_STATE_WRITE_RGB
+                   | BGFX_STATE_WRITE_A
+                   | BGFX_STATE_DEPTH_TEST_LESS
+                   | BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_SRC_ALPHA,
+                                           BGFX_STATE_BLEND_INV_SRC_ALPHA)
+                   | BGFX_STATE_MSAA;
+    bgfx_set_state(state, 0);
+
+    /* Use the flat color shader with green tint via the light uniforms.
+     * Use overlay submit to preserve the custom blend state. */
+    float green_dir[4]   = { 0.0f, -1.0f, 0.0f, 0.0f };
+    float green_color[4] = { 0.2f, 0.9f, 0.3f, 0.45f };
+    bgfx_set_uniform(s_sr.u_light_dir,   green_dir,   1);
+    bgfx_set_uniform(s_sr.u_light_color, green_color, 1);
+
+    jce_mesh_submit_overlay(mesh, s_sr.renderer, scene_view_id());
+}
+
+/* ── Hover highlight for drag-drop onto entity ────────────────────── */
+
+void draw_hover_highlight(void)
+{
+    if (s_sr.hover_entity_id == 0) return;
+
+    JceEntityInfo *ent = jce_state_get_entity(s_sr.hover_entity_id);
+    if (!ent || !ent->enabled) return;
+
+    jce_mat4 model;
+    JceMesh *mesh = NULL;
+    const char *mat_path = NULL;
+    if (!build_entity_model(ent, &model, &mesh, &mat_path)) return;
+    if (!mesh) return;
+
+    bgfx_set_transform(model.raw[0], 1);
+
+    JceUniformHandle uh = jce_renderer_get_tex_uniform(s_sr.renderer);
+    bgfx_uniform_handle_t su = { uh.idx };
+    bgfx_set_texture(0, su, s_sr.white_tex, UINT32_MAX);
+
+    /* Additive brightness overlay — model lights up when hovered.
+     * Use overlay submit to preserve the custom additive blend state. */
+    uint64_t state = BGFX_STATE_WRITE_RGB
+                   | BGFX_STATE_DEPTH_TEST_LEQUAL
+                   | BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_ONE,
+                                           BGFX_STATE_BLEND_ONE)
+                   | BGFX_STATE_MSAA;
+    bgfx_set_state(state, 0);
+
+    float hover_dir[4]   = { 0.0f, -1.0f, 0.0f, 0.0f };
+    float hover_color[4] = { 0.28f, 0.28f, 0.34f, 1.0f };
+    bgfx_set_uniform(s_sr.u_light_dir,   hover_dir,   1);
+    bgfx_set_uniform(s_sr.u_light_color, hover_color, 1);
+
+    jce_mesh_submit_overlay(mesh, s_sr.renderer, scene_view_id());
+
+    /* Restore normal lighting so subsequent draws are unaffected. */
+    JceDirLight sun = jce_dir_light_default();
+    jce_lighting_apply(s_sr.renderer, &sun);
+}

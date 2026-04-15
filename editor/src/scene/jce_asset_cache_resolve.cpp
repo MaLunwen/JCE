@@ -316,6 +316,16 @@ bool resolve_texture_path_for_material(const char *material_path,
                                        fs::path *out_path)
 {
     if (!out_path) return false;
+
+    /* If the material path points directly to an existing file, use it. */
+    if (material_path && material_path[0] != '\0') {
+        fs::path direct(material_path);
+        if (path_is_file(direct)) {
+            *out_path = direct;
+            return true;
+        }
+    }
+
     if (s_cache.scene_dir[0] == '\0') return false;
 
     LOG_INFO(LOG_TAG, "resolve_texture: mat='%s' mesh='%s' scene_dir='%s'",

@@ -875,7 +875,12 @@ bool load_scene_from_parsed_root(const cJSON *root,
 
 	jce_state_clear_selection();
 	if (scene_path && scene_path[0] != '\0') {
-		update_scene_dir_from_path(scene_path);
+		/* Only update scene_dir (which clears the mesh/texture cache) when
+		 * the scene path actually changed.  During undo/redo the path is
+		 * identical, so we must avoid a cache wipe that forces every model
+		 * to reload from disk. */
+		if (strcmp(s.current_scene_path, scene_path) != 0)
+			update_scene_dir_from_path(scene_path);
 		set_current_scene_path_internal(scene_path);
 	} else {
 		set_current_scene_path_internal(NULL);

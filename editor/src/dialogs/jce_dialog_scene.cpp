@@ -17,6 +17,41 @@ static bool is_scene_filename(const std::string &name)
     return false;
 }
 
+static bool resolve_scene_input_path(const char *input_path,
+                                    fs::path *out_scene_file,
+                                    fs::path *out_scene_dir)
+{
+    if (out_scene_file)
+        *out_scene_file = fs::path();
+    if (out_scene_dir)
+        *out_scene_dir = fs::path();
+    if (!input_path || input_path[0] == '\0')
+        return false;
+
+    try {
+        fs::path path(input_path);
+        if (!fs::exists(path))
+            return false;
+
+        if (fs::is_directory(path)) {
+            if (out_scene_dir)
+                *out_scene_dir = path;
+            return true;
+        }
+
+        if (fs::is_regular_file(path) && is_scene_filename(path.filename().string())) {
+            if (out_scene_file)
+                *out_scene_file = path;
+            if (out_scene_dir)
+                *out_scene_dir = path.parent_path();
+            return true;
+        }
+    } catch (...) {
+    }
+
+    return false;
+}
+
 /* ======================================================================
  *  NEW SCENE DIALOG
  * ====================================================================== */
@@ -26,6 +61,7 @@ static struct {
     char scene_dir[512];
     char last_project_root[512];
     bool initialized;
+    char error_msg[256];
 } s_new_scene;
 
 static void new_scene_ensure_init(void)
@@ -66,10 +102,15 @@ void jce_editor_dialog_new_scene(bool *p_open)
         return;
     }
 
+    if (ImGui::IsWindowAppearing())
+        s_new_scene.error_msg[0] = '\0';
+
     ImGui::Text("%s", jce_editor_i18n("sceneDialog.name"));
     ImGui::SetNextItemWidth(-1);
     ImGui::InputText("###ns_name", s_new_scene.scene_name,
                      sizeof(s_new_scene.scene_name));
+
+    bool name_valid = (s_new_scene.scene_name[0] != '\0');
 
     ImGui::Spacing();
     ImGui::Text("%s", jce_editor_i18n("sceneDialog.directory"));
@@ -83,6 +124,15 @@ void jce_editor_dialog_new_scene(bool *p_open)
                            sizeof(s_new_scene.scene_dir));
     }
 
+    bool dir_valid = (s_new_scene.scene_dir[0] != '\0');
+    bool can_create = name_valid && dir_valid;
+
+    /* Inline error */
+    if (s_new_scene.error_msg[0] != '\0') {
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "%s", s_new_scene.error_msg);
+    }
+
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
@@ -93,9 +143,15 @@ void jce_editor_dialog_new_scene(bool *p_open)
     ImGui::SetCursorPosX(ImGui::GetContentRegionAvail().x - total_btn_w
                          + ImGui::GetCursorPosX());
 
-    if (ImGui::Button(jce_editor_i18n("dialog.create"), ImVec2(btn_w, 0))) {
+    bool enter_pressed = ImGui::IsKeyPressed(ImGuiKey_Enter)
+                      || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter);
+
+    ImGui::BeginDisabled(!can_create);
+    if (ImGui::Button(jce_editor_i18n("dialog.create"), ImVec2(btn_w, 0))
+        || (enter_pressed && can_create)) {
+        s_new_scene.error_msg[0] = '\0';
         if (s_new_scene.scene_name[0] == '\0' || s_new_scene.scene_dir[0] == '\0') {
-            jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+            snprintf(s_new_scene.error_msg, sizeof(s_new_scene.error_msg),
                 "%s", jce_editor_i18n("sceneDialog.errorRequired"));
         } else {
             try {
@@ -112,19 +168,27 @@ void jce_editor_dialog_new_scene(bool *p_open)
                 } else {
                     fputs("{}", fp);
                     fclose(fp);
-                    jce_editor_console_log("Created scene: %s", scene_path.string().c_str());
-                    jce_file_viewer_open(scene_path.string().c_str());
-                    jce_editor_layout_request_focus_scene_view();
-                    *p_open = false;
+                    if (jce_state_load_scene_file(scene_path.string().c_str())) {
+                        jce_editor_console_log("Created scene: %s", scene_path.string().c_str());
+                        jce_editor_layout_request_focus_scene_view();
+                        *p_open = false;
+                    } else {
+                        snprintf(s_new_scene.error_msg, sizeof(s_new_scene.error_msg), "%s",
+                                 jce_editor_i18n("sceneDialog.errorOpen"));
+                    }
                 }
             } catch (const std::exception &e) {
+                snprintf(s_new_scene.error_msg, sizeof(s_new_scene.error_msg),
+                    "Create scene failed: %s", e.what());
                 jce_editor_console_log_level(JCE_CONSOLE_ERROR,
                     "Create scene failed: %s", e.what());
             }
         }
     }
+    ImGui::EndDisabled();
     ImGui::SameLine();
-    if (ImGui::Button(jce_editor_i18n("dialog.cancel"), ImVec2(btn_w, 0))) {
+    if (ImGui::Button(jce_editor_i18n("dialog.cancel"), ImVec2(btn_w, 0))
+        || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
         *p_open = false;
     }
 
@@ -142,6 +206,7 @@ static struct {
     int selected_idx;
     bool refresh;
     bool initialized;
+    char error_msg[256];
 } s_open_scene;
 
 static void open_scene_ensure_init(void)
@@ -156,6 +221,7 @@ static void open_scene_ensure_init(void)
     s_open_scene.scene_files.clear();
     s_open_scene.selected_idx = -1;
     s_open_scene.refresh = true;
+    s_open_scene.error_msg[0] = '\0';
 
     if (s_current_project_root[0] != '\0') {
         fs::path p = fs::path(s_current_project_root) / "assets" / "scenes";
@@ -177,13 +243,33 @@ static void open_scene_refresh_entries(void)
     s_open_scene.scene_files.clear();
     s_open_scene.selected_idx = -1;
     try {
-        for (auto &de : fs::directory_iterator(s_open_scene.scene_dir)) {
+        fs::path direct_scene;
+        fs::path browse_dir;
+        if (!resolve_scene_input_path(s_open_scene.scene_dir,
+                                      &direct_scene,
+                                      &browse_dir)
+            || browse_dir.empty()) {
+            s_open_scene.refresh = false;
+            return;
+        }
+
+        for (auto &de : fs::directory_iterator(browse_dir)) {
             if (!de.is_regular_file()) continue;
             std::string name = de.path().filename().string();
             if (is_scene_filename(name))
                 s_open_scene.scene_files.push_back(name);
         }
         std::sort(s_open_scene.scene_files.begin(), s_open_scene.scene_files.end());
+
+        if (!direct_scene.empty()) {
+            std::string selected_name = direct_scene.filename().string();
+            for (int index = 0; index < (int)s_open_scene.scene_files.size(); index++) {
+                if (s_open_scene.scene_files[index] == selected_name) {
+                    s_open_scene.selected_idx = index;
+                    break;
+                }
+            }
+        }
     } catch (...) {
     }
     s_open_scene.refresh = false;
@@ -205,6 +291,9 @@ void jce_editor_dialog_open_scene(bool *p_open)
         ImGui::End();
         return;
     }
+
+    if (ImGui::IsWindowAppearing())
+        s_open_scene.error_msg[0] = '\0';
 
     ImGui::Text("%s", jce_editor_i18n("sceneDialog.sceneDirectory"));
     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 180.0f);
@@ -236,20 +325,46 @@ void jce_editor_dialog_open_scene(bool *p_open)
     }
     ImGui::EndChild();
 
-    ImGui::BeginDisabled(s_open_scene.selected_idx < 0);
-    if (ImGui::Button(jce_editor_i18n("dialog.open"), ImVec2(90, 0))) {
-        fs::path full = fs::path(s_open_scene.scene_dir)
-                      / s_open_scene.scene_files[s_open_scene.selected_idx];
-        if (fs::exists(full)) {
-            jce_file_viewer_open(full.string().c_str());
+    fs::path direct_scene_path;
+    fs::path resolved_scene_dir;
+    bool resolved_scene_input = resolve_scene_input_path(s_open_scene.scene_dir,
+                                                         &direct_scene_path,
+                                                         &resolved_scene_dir);
+    bool can_open = (!direct_scene_path.empty()) || s_open_scene.selected_idx >= 0;
+
+    if (s_open_scene.error_msg[0] != '\0')
+        ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "%s", s_open_scene.error_msg);
+
+    ImGui::BeginDisabled(!can_open);
+    if (ImGui::Button(jce_editor_i18n("dialog.open"), ImVec2(90, 0))
+        || (can_open
+            && (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)))) {
+        s_open_scene.error_msg[0] = '\0';
+
+        fs::path full;
+        if (!direct_scene_path.empty())
+            full = direct_scene_path;
+        else if (resolved_scene_input && s_open_scene.selected_idx >= 0)
+            full = resolved_scene_dir / s_open_scene.scene_files[s_open_scene.selected_idx];
+
+        if (!full.empty() && fs::exists(full) && jce_state_load_scene_file(full.string().c_str())) {
             jce_editor_layout_request_focus_scene_view();
             jce_editor_console_log("Opened scene: %s", full.string().c_str());
             *p_open = false;
+        } else if (!full.empty()) {
+            snprintf(s_open_scene.error_msg, sizeof(s_open_scene.error_msg), "%s",
+                     jce_editor_i18n("sceneDialog.errorOpen"));
+            jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                "Failed to open scene: %s", full.string().c_str());
+        } else {
+            snprintf(s_open_scene.error_msg, sizeof(s_open_scene.error_msg), "%s",
+                     jce_editor_i18n("sceneDialog.errorInvalid"));
         }
     }
     ImGui::EndDisabled();
     ImGui::SameLine();
-    if (ImGui::Button(jce_editor_i18n("dialog.cancel"), ImVec2(90, 0))) {
+    if (ImGui::Button(jce_editor_i18n("dialog.cancel"), ImVec2(90, 0))
+        || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
         *p_open = false;
     }
 
@@ -358,7 +473,9 @@ void jce_editor_dialog_save_as(bool *p_open)
     ImGui::SetCursorPosX(ImGui::GetContentRegionAvail().x - total_btn_w
                          + ImGui::GetCursorPosX());
 
-    if (ImGui::Button(jce_editor_i18n("dialog.save"), ImVec2(btn_w, 0))) {
+    if (ImGui::Button(jce_editor_i18n("dialog.save"), ImVec2(btn_w, 0))
+        || ImGui::IsKeyPressed(ImGuiKey_Enter)
+        || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) {
         if (strlen(s_save_as.save_name) == 0 || strlen(s_save_as.save_location) == 0) {
             jce_editor_console_log_level(JCE_CONSOLE_WARNING,
                 "%s", jce_editor_i18n("sceneDialog.errorRequired"));
@@ -374,7 +491,6 @@ void jce_editor_dialog_save_as(bool *p_open)
                     snprintf(s_save_as.source_scene_path,
                              sizeof(s_save_as.source_scene_path), "%s",
                              out_path.string().c_str());
-                    jce_file_viewer_open(out_path.string().c_str());
                     jce_editor_layout_request_focus_scene_view();
                     jce_editor_console_log("Saved scene as: %s", out_path.string().c_str());
                     *p_open = false;
@@ -389,7 +505,8 @@ void jce_editor_dialog_save_as(bool *p_open)
         }
     }
     ImGui::SameLine();
-    if (ImGui::Button(jce_editor_i18n("dialog.cancel"), ImVec2(btn_w, 0))) {
+    if (ImGui::Button(jce_editor_i18n("dialog.cancel"), ImVec2(btn_w, 0))
+        || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
         *p_open = false;
     }
 
@@ -438,7 +555,9 @@ void jce_editor_dialog_unsaved_changes(bool *p_open, int *result)
     ImGui::SetCursorPosX(ImGui::GetContentRegionAvail().x - total_btn_w
                          + ImGui::GetCursorPosX());
 
-    if (ImGui::Button(jce_editor_i18n("dialog.save"), ImVec2(btn_w, 0))) {
+    if (ImGui::Button(jce_editor_i18n("dialog.save"), ImVec2(btn_w, 0))
+        || ImGui::IsKeyPressed(ImGuiKey_Enter)
+        || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) {
         if (result) *result = 1;
         *p_open = false;
     }

@@ -16,7 +16,13 @@ AssetBrowserState s_assets;
 std::string normalized_path_string(const fs::path &p)
 {
     try {
-        return fs::weakly_canonical(p).string();
+        fs::path canonical = fs::weakly_canonical(p);
+        fs::path cwd       = fs::current_path();
+        fs::path rel        = fs::relative(canonical, cwd);
+        /* fs::relative returns "" on failure; fall back to canonical. */
+        if (!rel.empty() && rel != ".")
+            return rel.string();
+        return canonical.string();
     } catch (...) {
         try {
             return fs::absolute(p).lexically_normal().string();

@@ -277,6 +277,8 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         draw_grid();
 
     draw_entities();
+    draw_hover_highlight();
+    draw_ghost_entity();
 }
 
 /* ── Accessors ────────────────────────────────────────────────────── */
@@ -291,4 +293,36 @@ uint16_t jce_editor_scene_render_get_texture(void)
 void jce_editor_scene_set_scene_dir(const char *dir)
 {
     jce_editor_scene_asset_cache_set_scene_dir(dir);
+}
+
+/* ── Ghost (drag-preview) model ────────────────────────────────────── */
+
+void jce_editor_scene_set_ghost(const char *mesh_path,
+                                float world_x, float world_y, float world_z)
+{
+    if (!mesh_path || mesh_path[0] == '\0') {
+        s_sr.ghost_active = false;
+        return;
+    }
+    s_sr.ghost_active = true;
+    snprintf(s_sr.ghost_mesh_path, sizeof(s_sr.ghost_mesh_path), "%s", mesh_path);
+    s_sr.ghost_pos[0] = world_x;
+    s_sr.ghost_pos[1] = world_y;
+    s_sr.ghost_pos[2] = world_z;
+}
+
+void jce_editor_scene_clear_ghost(void)
+{
+    s_sr.ghost_active = false;
+    s_sr.ghost_mesh_path[0] = '\0';
+}
+
+void jce_editor_scene_set_hover_entity(uint32_t entity_id)
+{
+    s_sr.hover_entity_id = entity_id;
+}
+
+void jce_editor_scene_clear_hover_entity(void)
+{
+    s_sr.hover_entity_id = 0;
 }

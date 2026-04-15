@@ -51,7 +51,7 @@ struct EditorInternalState {
 	bool             show_grid;
 	bool             is_2d_mode;
 	bool             live_preview;
-
+    bool             scene_modified;
 	/* Entity storage (demo data, replaced by ECS later). */
 	JceEntityInfo    entities[JCE_MAX_ENTITIES];
 	JceComponentInfo components[JCE_MAX_ENTITIES][JCE_MAX_COMPONENTS];

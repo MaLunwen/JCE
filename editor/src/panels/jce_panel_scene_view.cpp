@@ -8,6 +8,16 @@
  */
 
 #include "jce_scene_view_internal.h"
+#include "scene/jce_model_loader_assimp.h"
+
+extern "C" {
+#include <jce/graphics/jce_pbr_material.h>
+}
+
+#include <ctype.h>
+
+/* ── Forward declarations ─────────────────────────────────────────── */
+static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail);
 
 /* ── Toolbar ─────────────────────────────────────────────────────── */
 
@@ -140,6 +150,7 @@ static bool setup_scene_viewport(SceneViewCtx *ctx)
 
     ImGui::SetCursorScreenPos(screen_pos);
     ImGui::InvisibleButton("##SceneViewInput", avail);
+    handle_scene_view_asset_drop(screen_pos, avail);  /* drop target must follow the button immediately */
     bool viewport_hovered = ImGui::IsItemHovered();
     (void)ImGui::IsItemActive();
 
@@ -148,6 +159,544 @@ static bool setup_scene_viewport(SceneViewCtx *ctx)
     ctx->dl               = dl;
     ctx->viewport_hovered = viewport_hovered;
     return true;
+}
+
+/* ── Asset drag-and-drop into the viewport ───────────────────────── */
+
+/* Returns true if the extension matches a supported 3-D mesh format. */
+static bool is_mesh_asset(const char *path)
+{
+    const char *ext = strrchr(path, '.');
+    if (!ext) return false;
+    static const char *const mesh_exts[] = {
+        ".fbx", ".FBX",
+        ".glb", ".GLB",
+        ".gltf", ".GLTF",
+        ".obj", ".OBJ",
+        ".mesh", ".MESH",
+        ".dae", ".DAE",
+        NULL
+    };
+    for (int i = 0; mesh_exts[i]; i++) {
+        if (strcmp(ext, mesh_exts[i]) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Returns true if the extension matches a supported texture/material format. */
+static bool is_texture_or_material_asset(const char *path)
+{
+    const char *ext = strrchr(path, '.');
+    if (!ext) return false;
+    /* Check for .mat.json (compound extension). */
+    const char *dot2 = ext - 1;
+    while (dot2 > path && *dot2 != '.' && *dot2 != '/' && *dot2 != '\\')
+        dot2--;
+    if (*dot2 == '.') {
+        size_t len = strlen(dot2);
+        if (len == 9 && strncmp(dot2, ".mat.json", 9) == 0)
+            return true;
+    }
+    static const char *const tex_exts[] = {
+        ".png", ".PNG", ".jpg", ".JPG", ".jpeg", ".JPEG",
+        ".tga", ".TGA", ".bmp", ".BMP", ".hdr", ".HDR",
+        ".dds", ".DDS", ".ktx", ".KTX",
+        NULL
+    };
+    for (int i = 0; tex_exts[i]; i++) {
+        if (strcmp(ext, tex_exts[i]) == 0)
+            return true;
+    }
+    return false;
+}
+
+static JceComponentInfo *find_mesh_renderer_component(uint32_t entity_id)
+{
+    int component_count = 0;
+    JceComponentInfo *components =
+        jce_state_get_entity_components(entity_id, &component_count);
+    for (int index = 0; index < component_count; index++) {
+        if (components[index].type == JCE_COMP_MESH_RENDERER)
+            return &components[index];
+    }
+    return NULL;
+}
+
+static bool entity_accepts_mesh_material_drop(uint32_t entity_id)
+{
+    return entity_id != 0 && find_mesh_renderer_component(entity_id) != NULL;
+}
+
+static int detect_texture_drop_slot(const char *path)
+{
+    const char *name = path ? path : "";
+    const char *sep = strrchr(name, '/');
+    const char *sep2 = strrchr(name, '\\');
+    if (sep2 > sep) sep = sep2;
+    if (sep) name = sep + 1;
+
+    char lowered[256];
+    snprintf(lowered, sizeof(lowered), "%s", name);
+    for (int index = 0; lowered[index] != '\0'; index++)
+        lowered[index] = (char)tolower((unsigned char)lowered[index]);
+
+    if (strstr(lowered, "normal") || strstr(lowered, "_nor")
+        || strstr(lowered, "_nrm") || strstr(lowered, "nrm"))
+        return 2;
+
+    if (strstr(lowered, "occlusion") || strstr(lowered, "ambientocclusion")
+        || strstr(lowered, "ambient_occlusion") || strstr(lowered, "_ao")
+        || strstr(lowered, "ao."))
+        return 3;
+
+    if (strstr(lowered, "emissive") || strstr(lowered, "emission")
+        || strstr(lowered, "emit"))
+        return 4;
+
+    if (strstr(lowered, "metallicroughness") || strstr(lowered, "metalrough")
+        || strstr(lowered, "metal_rough") || strstr(lowered, "roughness")
+        || strstr(lowered, "metallic") || strstr(lowered, "_mr")
+        || strstr(lowered, "orm") || strstr(lowered, "rma"))
+        return 1;
+
+    return 0;
+}
+
+static void assign_texture_drop_to_mesh_renderer(JceComponentInfo *mesh_renderer_comp,
+                                                 int slot,
+                                                 const char *asset_path)
+{
+    if (!mesh_renderer_comp || mesh_renderer_comp->type != JCE_COMP_MESH_RENDERER)
+        return;
+
+    auto &mr = mesh_renderer_comp->data.mesh_renderer;
+    switch (slot) {
+    case 1:
+        snprintf(mr.mr_tex, sizeof(mr.mr_tex), "%s", asset_path);
+        break;
+    case 2:
+        snprintf(mr.normal_tex, sizeof(mr.normal_tex), "%s", asset_path);
+        break;
+    case 3:
+        snprintf(mr.ao_tex, sizeof(mr.ao_tex), "%s", asset_path);
+        break;
+    case 4:
+        snprintf(mr.emissive_tex, sizeof(mr.emissive_tex), "%s", asset_path);
+        break;
+    case 0:
+    default:
+        snprintf(mr.albedo_tex, sizeof(mr.albedo_tex), "%s", asset_path);
+        break;
+    }
+}
+
+static bool apply_material_asset_to_mesh_renderer(JceComponentInfo *mesh_renderer_comp,
+                                                  const char *asset_path)
+{
+    if (!mesh_renderer_comp || mesh_renderer_comp->type != JCE_COMP_MESH_RENDERER)
+        return false;
+
+    JcePbrMaterial material = {};
+    char tex_paths[5][256] = {};
+    if (!jce_pbr_material_load_json(asset_path, &material, tex_paths))
+        return false;
+
+    auto &mr = mesh_renderer_comp->data.mesh_renderer;
+    snprintf(mr.material_path, sizeof(mr.material_path), "%s", asset_path);
+    mr.albedo_tex[0] = '\0';
+    mr.mr_tex[0] = '\0';
+    mr.normal_tex[0] = '\0';
+    mr.ao_tex[0] = '\0';
+    mr.emissive_tex[0] = '\0';
+
+    if (tex_paths[0][0])
+        snprintf(mr.albedo_tex, sizeof(mr.albedo_tex), "%s", tex_paths[0]);
+    if (tex_paths[1][0])
+        snprintf(mr.mr_tex, sizeof(mr.mr_tex), "%s", tex_paths[1]);
+    if (tex_paths[2][0])
+        snprintf(mr.normal_tex, sizeof(mr.normal_tex), "%s", tex_paths[2]);
+    if (tex_paths[3][0])
+        snprintf(mr.ao_tex, sizeof(mr.ao_tex), "%s", tex_paths[3]);
+    if (tex_paths[4][0])
+        snprintf(mr.emissive_tex, sizeof(mr.emissive_tex), "%s", tex_paths[4]);
+
+    mr.base_color[0] = material.base_color_factor[0];
+    mr.base_color[1] = material.base_color_factor[1];
+    mr.base_color[2] = material.base_color_factor[2];
+    mr.base_color[3] = material.base_color_factor[3];
+    mr.metallic = material.metallic_factor;
+    mr.roughness = material.roughness_factor;
+    mr.emissive[0] = material.emissive_factor[0];
+    mr.emissive[1] = material.emissive_factor[1];
+    mr.emissive[2] = material.emissive_factor[2];
+    mr.normal_scale = material.normal_scale;
+    mr.ao_strength = material.ao_strength;
+    mr.alpha_mode = (int)material.alpha_mode;
+    mr.alpha_cutoff = material.alpha_cutoff;
+    mr.double_sided = material.double_sided;
+    return true;
+}
+
+/* Ray-cast pick: find the nearest entity under the current mouse position.
+ * Returns entity ID (0 = none). */
+static uint32_t pick_entity_at_mouse(ImVec2 screen_pos, ImVec2 avail)
+{
+    float view_mat[16], proj_mat[16], eye[3];
+    if (!jce_editor_scene_get_camera_matrices(view_mat, proj_mat, eye,
+                                              avail.x, avail.y))
+        return 0;
+
+    JceGizmoCamera cam;
+    memcpy(cam.view, view_mat, sizeof(float) * 16);
+    memcpy(cam.proj, proj_mat, sizeof(float) * 16);
+    memcpy(cam.eye,  eye,      sizeof(float) * 3);
+    cam.viewport_size[0]   = avail.x;
+    cam.viewport_size[1]   = avail.y;
+    cam.viewport_origin[0] = screen_pos.x;
+    cam.viewport_origin[1] = screen_pos.y;
+
+    ImVec2 mouse = ImGui::GetMousePos();
+    float ray_o[3], ray_d[3];
+    gm_screen_to_ray(&cam, mouse.x, mouse.y, ray_o, ray_d);
+
+    uint32_t best_id = 0;
+    float    best_t  = 1e30f;
+
+    int total = jce_state_get_entity_count();
+    for (int pi = 0; pi < total; pi++) {
+        JceEntityInfo *pe = jce_state_get_entity_by_index(pi);
+        if (!pe || !pe->enabled) continue;
+
+        JceComponentInfo pc[JCE_MAX_COMPONENTS];
+        int pcc = jce_state_get_components(pe->id, pc, JCE_MAX_COMPONENTS);
+        float pos[3] = {0,0,0}, scl[3] = {1,1,1};
+        bool has_xf = false;
+        for (int ci = 0; ci < pcc; ci++) {
+            if (pc[ci].type == JCE_COMP_TRANSFORM) {
+                memcpy(pos, pc[ci].data.transform.pos, sizeof(float) * 3);
+                memcpy(scl, pc[ci].data.transform.scale, sizeof(float) * 3);
+                has_xf = true;
+                break;
+            }
+        }
+        if (!has_xf) continue;
+
+        float hx = fabsf(scl[0]) * 0.5f;
+        float hy = fabsf(scl[1]) * 0.5f;
+        float hz = fabsf(scl[2]) * 0.5f;
+        if (hx < 0.1f) hx = 0.1f;
+        if (hy < 0.1f) hy = 0.1f;
+        if (hz < 0.1f) hz = 0.1f;
+
+        float bmin[3] = { pos[0]-hx, pos[1]-hy, pos[2]-hz };
+        float bmax[3] = { pos[0]+hx, pos[1]+hy, pos[2]+hz };
+
+        float t;
+        jce_vec3 ro    = {{ ray_o[0], ray_o[1], ray_o[2] }};
+        jce_vec3 rd    = {{ ray_d[0], ray_d[1], ray_d[2] }};
+        jce_vec3 bminv = {{ bmin[0],  bmin[1],  bmin[2]  }};
+        jce_vec3 bmaxv = {{ bmax[0],  bmax[1],  bmax[2]  }};
+        if (jce_ray_aabb_intersect(ro, rd, bminv, bmaxv, &t) && t >= 0.0f) {
+            if (t < best_t) {
+                best_t  = t;
+                best_id = pe->id;
+            }
+        }
+    }
+    return best_id;
+}
+
+/* Compute the world-space hit position on the Y=0 ground plane from
+ * the current mouse position, using camera unprojection. */
+static bool compute_ground_hit(ImVec2 screen_pos, ImVec2 avail, float out_pos[3])
+{
+    float view_mat[16], proj_mat[16], eye[3];
+    if (!jce_editor_scene_get_camera_matrices(view_mat, proj_mat, eye,
+                                              avail.x, avail.y))
+        return false;
+
+    JceGizmoCamera cam;
+    memcpy(cam.view, view_mat, sizeof(float) * 16);
+    memcpy(cam.proj, proj_mat, sizeof(float) * 16);
+    memcpy(cam.eye,  eye,      sizeof(float) * 3);
+    cam.viewport_size[0]   = avail.x;
+    cam.viewport_size[1]   = avail.y;
+    cam.viewport_origin[0] = screen_pos.x;
+    cam.viewport_origin[1] = screen_pos.y;
+
+    ImVec2 mouse = ImGui::GetMousePos();
+    float ray_o[3], ray_d[3];
+    gm_screen_to_ray(&cam, mouse.x, mouse.y, ray_o, ray_d);
+
+    /* Intersect with Y=0 ground plane. */
+    if (fabsf(ray_d[1]) < 1e-6f) return false;
+    float t = -ray_o[1] / ray_d[1];
+    if (t < 0.0f) return false;  /* behind camera */
+    out_pos[0] = ray_o[0] + ray_d[0] * t;
+    out_pos[1] = 0.0f;
+    out_pos[2] = ray_o[2] + ray_d[2] * t;
+    return true;
+}
+
+/* Called immediately after InvisibleButton so the drag-drop target
+ * applies to the full viewport area. */
+static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail)
+{
+    if (!ImGui::BeginDragDropTarget()) {
+        jce_editor_scene_clear_ghost();
+        jce_editor_scene_clear_hover_entity();
+        return;
+    }
+
+    /* ── Ghost / hover preview while hovering ───────────────────── */
+    if (const ImGuiPayload *peek =
+            ImGui::AcceptDragDropPayload("JCE_ASSET_PATH",
+                                         ImGuiDragDropFlags_AcceptPeekOnly)) {
+        const char *asset_path = (const char *)peek->Data;
+        if (is_mesh_asset(asset_path)) {
+            /* Mesh drag: ghost preview on ground plane, or highlight
+             * entity if the cursor is over one (mesh-on-entity = replace). */
+            uint32_t hit_id = pick_entity_at_mouse(screen_pos, avail);
+            if (entity_accepts_mesh_material_drop(hit_id)) {
+                jce_editor_scene_clear_ghost();
+                jce_editor_scene_set_hover_entity(hit_id);
+            } else {
+                jce_editor_scene_clear_hover_entity();
+                float hit[3];
+                if (compute_ground_hit(screen_pos, avail, hit))
+                    jce_editor_scene_set_ghost(asset_path, hit[0], hit[1], hit[2]);
+            }
+        } else if (is_texture_or_material_asset(asset_path)) {
+            /* Texture / material drag: highlight entity under cursor. */
+            jce_editor_scene_clear_ghost();
+            uint32_t hit_id = pick_entity_at_mouse(screen_pos, avail);
+            if (!entity_accepts_mesh_material_drop(hit_id))
+                hit_id = 0;
+            jce_editor_scene_set_hover_entity(hit_id);
+        } else {
+            jce_editor_scene_clear_ghost();
+            jce_editor_scene_clear_hover_entity();
+        }
+    }
+
+    /* ── Actual drop ────────────────────────────────────────────── */
+    if (const ImGuiPayload *payload =
+            ImGui::AcceptDragDropPayload("JCE_ASSET_PATH")) {
+        const char *asset_path = (const char *)payload->Data;
+
+        jce_editor_scene_clear_ghost();
+        jce_editor_scene_clear_hover_entity();
+
+        /* ── Texture / material dropped onto an entity ──────────── */
+        if (is_texture_or_material_asset(asset_path)) {
+            uint32_t hit_id = pick_entity_at_mouse(screen_pos, avail);
+            JceComponentInfo *mesh_renderer_comp = find_mesh_renderer_component(hit_id);
+            if (mesh_renderer_comp) {
+                bool is_mat_json = false;
+                size_t path_len = strlen(asset_path);
+                if (path_len >= 9 && strcmp(asset_path + path_len - 9, ".mat.json") == 0)
+                    is_mat_json = true;
+
+                bool applied = false;
+                jce_state_begin_batch_edit();
+                if (is_mat_json) {
+                    applied = apply_material_asset_to_mesh_renderer(mesh_renderer_comp,
+                                                                    asset_path);
+                } else {
+                    assign_texture_drop_to_mesh_renderer(mesh_renderer_comp,
+                                                         detect_texture_drop_slot(asset_path),
+                                                         asset_path);
+                    applied = true;
+                }
+                jce_state_end_batch_edit();
+
+                if (!applied) {
+                    jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+                        "Failed to apply material asset: %s", asset_path);
+                    ImGui::EndDragDropTarget();
+                    return;
+                }
+
+                jce_state_select_entity(hit_id, false);
+                jce_editor_inspector_request_sync();
+                jce_editor_layout_request_focus_inspector();
+
+                JceEntityInfo *ent = jce_state_get_entity(hit_id);
+                if (is_mat_json) {
+                    jce_editor_console_log(
+                        "Applied material '%s' to entity '%s'",
+                        asset_path, ent ? ent->name : "?");
+                } else {
+                    jce_editor_console_log(
+                        "Applied texture '%s' to entity '%s'",
+                        asset_path, ent ? ent->name : "?");
+                }
+            }
+        }
+        /* ── Mesh dropped onto an existing entity ───────────────── */
+        else if (is_mesh_asset(asset_path)) {
+            uint32_t hit_id = pick_entity_at_mouse(screen_pos, avail);
+            JceComponentInfo *mesh_renderer_comp = find_mesh_renderer_component(hit_id);
+            if (mesh_renderer_comp) {
+                /* Replace the existing entity's mesh + extract material. */
+                jce_state_begin_batch_edit();
+                {
+                    auto &mr = mesh_renderer_comp->data.mesh_renderer;
+                    snprintf(mr.mesh_path, sizeof(mr.mesh_path),
+                             "%s", asset_path);
+                    mr.mesh_shape = 0;
+                    mr.material_path[0] = '\0';
+                    mr.albedo_tex[0] = '\0';
+                    mr.mr_tex[0] = '\0';
+                    mr.normal_tex[0] = '\0';
+                    mr.ao_tex[0] = '\0';
+                    mr.emissive_tex[0] = '\0';
+
+                    JceEditorMaterialInfo mat = {};
+                    if (jce_editor_model_extract_material(asset_path, &mat)) {
+                        if (mat.albedo_tex[0])
+                            snprintf(mr.albedo_tex, sizeof(mr.albedo_tex), "%s", mat.albedo_tex);
+                        if (mat.mr_tex[0])
+                            snprintf(mr.mr_tex, sizeof(mr.mr_tex), "%s", mat.mr_tex);
+                        if (mat.normal_tex[0])
+                            snprintf(mr.normal_tex, sizeof(mr.normal_tex), "%s", mat.normal_tex);
+                        if (mat.ao_tex[0])
+                            snprintf(mr.ao_tex, sizeof(mr.ao_tex), "%s", mat.ao_tex);
+                        if (mat.emissive_tex[0])
+                            snprintf(mr.emissive_tex, sizeof(mr.emissive_tex), "%s", mat.emissive_tex);
+                        mr.base_color[0] = mat.base_color[0];
+                        mr.base_color[1] = mat.base_color[1];
+                        mr.base_color[2] = mat.base_color[2];
+                        mr.base_color[3] = mat.base_color[3];
+                        mr.metallic       = mat.metallic;
+                        mr.roughness      = mat.roughness;
+                        mr.emissive[0]    = mat.emissive[0];
+                        mr.emissive[1]    = mat.emissive[1];
+                        mr.emissive[2]    = mat.emissive[2];
+                        mr.normal_scale   = mat.normal_scale;
+                        mr.ao_strength    = mat.ao_strength;
+                        mr.alpha_mode     = mat.alpha_mode;
+                        mr.alpha_cutoff   = mat.alpha_cutoff;
+                        mr.double_sided   = mat.double_sided;
+                    }
+                }
+                jce_state_end_batch_edit();
+
+                jce_state_select_entity(hit_id, false);
+                jce_editor_inspector_request_sync();
+                jce_editor_layout_request_focus_inspector();
+
+                JceEntityInfo *ent = jce_state_get_entity(hit_id);
+                jce_editor_console_log(
+                    "Replaced mesh on '%s' with '%s'",
+                    ent ? ent->name : "?", asset_path);
+            } else {
+                /* ── Mesh dropped on empty space: create new entity ─ */
+                float drop_pos[3] = { 0.0f, 0.0f, 0.0f };
+                compute_ground_hit(screen_pos, avail, drop_pos);
+
+                char name_buf[128];
+                const char *fname  = asset_path;
+                const char *sep    = strrchr(asset_path, '/');
+                const char *sep2   = strrchr(asset_path, '\\');
+                if (sep2 > sep) sep = sep2;
+                if (sep) fname = sep + 1;
+                snprintf(name_buf, sizeof(name_buf), "%s", fname);
+                char *dot = strrchr(name_buf, '.');
+                if (dot) *dot = '\0';
+
+                {
+                    char base[128];
+                    snprintf(base, sizeof(base), "%s", name_buf);
+                    int suffix = 1;
+                    int total = jce_state_get_entity_count();
+                    bool unique = false;
+                    while (!unique) {
+                        unique = true;
+                        for (int ei = 0; ei < total; ei++) {
+                            JceEntityInfo *ent = jce_state_get_entity_by_index(ei);
+                            if (ent && strcmp(ent->name, name_buf) == 0) {
+                                unique = false;
+                                snprintf(name_buf, sizeof(name_buf),
+                                         "%s_%d", base, suffix++);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                jce_state_begin_batch_edit();
+                uint32_t id = create_default_scene_entity(name_buf, 0,
+                                                          JCE_COMP_MESH_RENDERER,
+                                                          JCE_MESH_SHAPE_CUBE);
+                if (id != 0) {
+                    int cc = 0;
+                    JceComponentInfo *comps =
+                        jce_state_get_entity_components(id, &cc);
+                    for (int i = 0; i < cc; i++) {
+                        if (comps[i].type == JCE_COMP_TRANSFORM) {
+                            comps[i].data.transform.pos[0] = drop_pos[0];
+                            comps[i].data.transform.pos[1] = drop_pos[1];
+                            comps[i].data.transform.pos[2] = drop_pos[2];
+                        }
+                        if (comps[i].type != JCE_COMP_MESH_RENDERER)
+                            continue;
+
+                        auto &mr = comps[i].data.mesh_renderer;
+                        snprintf(mr.mesh_path, sizeof(mr.mesh_path),
+                                 "%s", asset_path);
+                        mr.mesh_shape = 0;
+                        mr.material_path[0] = '\0';
+                        mr.albedo_tex[0] = '\0';
+                        mr.mr_tex[0] = '\0';
+                        mr.normal_tex[0] = '\0';
+                        mr.ao_tex[0] = '\0';
+                        mr.emissive_tex[0] = '\0';
+
+                        JceEditorMaterialInfo mat = {};
+                        if (jce_editor_model_extract_material(asset_path, &mat)) {
+                            if (mat.albedo_tex[0])
+                                snprintf(mr.albedo_tex, sizeof(mr.albedo_tex), "%s", mat.albedo_tex);
+                            if (mat.mr_tex[0])
+                                snprintf(mr.mr_tex, sizeof(mr.mr_tex), "%s", mat.mr_tex);
+                            if (mat.normal_tex[0])
+                                snprintf(mr.normal_tex, sizeof(mr.normal_tex), "%s", mat.normal_tex);
+                            if (mat.ao_tex[0])
+                                snprintf(mr.ao_tex, sizeof(mr.ao_tex), "%s", mat.ao_tex);
+                            if (mat.emissive_tex[0])
+                                snprintf(mr.emissive_tex, sizeof(mr.emissive_tex), "%s", mat.emissive_tex);
+
+                            mr.base_color[0] = mat.base_color[0];
+                            mr.base_color[1] = mat.base_color[1];
+                            mr.base_color[2] = mat.base_color[2];
+                            mr.base_color[3] = mat.base_color[3];
+                            mr.metallic       = mat.metallic;
+                            mr.roughness      = mat.roughness;
+                            mr.emissive[0]    = mat.emissive[0];
+                            mr.emissive[1]    = mat.emissive[1];
+                            mr.emissive[2]    = mat.emissive[2];
+                            mr.normal_scale   = mat.normal_scale;
+                            mr.ao_strength    = mat.ao_strength;
+                            mr.alpha_mode     = mat.alpha_mode;
+                            mr.alpha_cutoff   = mat.alpha_cutoff;
+                            mr.double_sided   = mat.double_sided;
+                        }
+                        break;
+                    }
+
+                    jce_state_select_entity(id, false);
+                    jce_editor_inspector_request_sync();
+                    jce_editor_layout_request_focus_inspector();
+                    jce_editor_console_log(
+                        "Dropped mesh '%s' into scene", name_buf);
+                }
+                jce_state_end_batch_edit();
+            }
+        }
+    }
+
+    ImGui::EndDragDropTarget();
 }
 
 /* ── Right-click context menu ────────────────────────────────────── */
@@ -379,7 +928,15 @@ static void handle_scene_camera_controls(bool viewport_hovered)
 
 static void handle_scene_view_shortcuts(void)
 {
-    if (ImGui::IsWindowFocused()) {
+    /* Shortcuts fire when the viewport is hovered (mouse is over it) OR
+     * when it holds keyboard focus — matches Unity/UE editor behaviour.
+     * WantTextInput guard prevents accidental triggers while typing in
+     * any Inspector / Console field. */
+    const bool want_text = ImGui::GetIO().WantTextInput;
+    const bool active = !want_text &&
+                        (ImGui::IsWindowFocused() ||
+                         ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows));
+    if (active) {
         if (ImGui::IsKeyPressed(ImGuiKey_W)) jce_state_set_gizmo_mode(JCE_GIZMO_TRANSLATE);
         if (ImGui::IsKeyPressed(ImGuiKey_E)) jce_state_set_gizmo_mode(JCE_GIZMO_ROTATE);
         if (ImGui::IsKeyPressed(ImGuiKey_R)) jce_state_set_gizmo_mode(JCE_GIZMO_SCALE);
@@ -602,7 +1159,10 @@ static void handle_ray_pick(const SceneViewCtx *ctx,
     }
 
     if (best_id != 0) {
-        jce_state_select_entity(best_id, add_mode);
+        if (add_mode && jce_state_is_selected(best_id))
+            jce_state_deselect_entity(best_id);
+        else
+            jce_state_select_entity(best_id, add_mode);
         jce_editor_inspector_request_sync();
         jce_editor_layout_request_focus_inspector();
     } else if (!add_mode) {

@@ -405,9 +405,13 @@ uint32_t jce_state_create_entity(const char *name, uint32_t parent_id)
 			parent->children[parent->child_count++] = e->id;
 	}
 
-	/* Create in engine ECS. */
+	/* Create in engine ECS.  Pass NULL for the name so flecs does not
+	 * register it in its name_index — the editor manages entity names
+	 * in JceEntityInfo.name and duplicate names are allowed.  Passing
+	 * names to flecs caused fatal "conflicting entity" aborts during
+	 * undo/redo when two entities shared the same name. */
 	if (s.scene) {
-		e->ecs_entity = (uint64_t)jce_scene_create_entity(s.scene, name);
+		e->ecs_entity = (uint64_t)jce_scene_create_entity(s.scene, NULL);
 	}
 
 	return e->id;
@@ -826,3 +830,7 @@ void  jce_state_set_live_preview(bool on)    { s.live_preview = on; }
 
 void jce_state_set_scene(JceScene *scene) { s.scene = scene; }
 JceScene *jce_state_get_scene(void) { return s.scene; }
+
+
+bool jce_state_is_scene_modified(void) { return s.scene_modified; }
+void jce_state_clear_scene_modified(void) { s.scene_modified = false; }

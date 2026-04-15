@@ -86,6 +86,25 @@ void jce_editor_scene_camera_reset(void);
 /* Set the scene base directory for resolving mesh paths. */
 void jce_editor_scene_set_scene_dir(const char *dir);
 
+/* ── Ghost (drag-preview) model ────────────────────────────────────── */
+
+/* Show a semi-transparent green preview mesh at the given world position.
+ * mesh_path points to the model file (.fbx/.glb/.gltf/.obj).
+ * Call every frame while the drag is active. */
+void jce_editor_scene_set_ghost(const char *mesh_path,
+                                float world_x, float world_y, float world_z);
+
+/* Clear the ghost preview (call when drag ends or leaves viewport). */
+void jce_editor_scene_clear_ghost(void);
+
+/* ── Hover highlight for drag-drop onto entity ─────────────────────── */
+
+/* Highlight the given entity during a drag-over (bright overlay). */
+void jce_editor_scene_set_hover_entity(uint32_t entity_id);
+
+/* Clear the hover highlight. */
+void jce_editor_scene_clear_hover_entity(void);
+
 #ifdef __cplusplus
 }
 #endif

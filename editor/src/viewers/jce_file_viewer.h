@@ -17,9 +17,10 @@ extern "C" {
 /* File type categories (determines which sub-viewer is used). */
 typedef enum {
     JCE_FV_TEXT = 0,    /* code, config, data, markdown */
-    JCE_FV_IMAGE,       /* png, jpg, bmp, tga, hdr, gif */
+    JCE_FV_IMAGE,       /* png, jpg, bmp, tga, hdr, gif, dds, ktx */
     JCE_FV_MODEL,       /* gltf, glb, obj, fbx */
     JCE_FV_SCENE,       /* .scene, .scene.json */
+    JCE_FV_MATERIAL,    /* .mat.json PBR material */
     JCE_FV_BINARY,      /* unknown binary */
 } JceFileViewerType;
 

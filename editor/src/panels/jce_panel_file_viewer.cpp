@@ -20,7 +20,10 @@ extern "C" {
 #include <SDL3_image/SDL_image.h>
 #include <SDL3/SDL_iostream.h>
 #include <SDL3/SDL_surface.h>
+#include <jce/graphics/jce_pbr_material.h>
 }
+
+#include <bgfx/c99/bgfx.h>
 
 #define LOG_TAG "file_viewer"
 
@@ -104,13 +107,19 @@ static JceFileViewerType fv_detect_ext(const char *ext)
         || strcmp(ext, ".jpeg") == 0 || strcmp(ext, ".bmp") == 0
         || strcmp(ext, ".tga") == 0 || strcmp(ext, ".hdr") == 0
         || strcmp(ext, ".gif") == 0 || strcmp(ext, ".webp") == 0
-        || strcmp(ext, ".ico") == 0 || strcmp(ext, ".psd") == 0)
+        || strcmp(ext, ".ico") == 0 || strcmp(ext, ".psd") == 0
+        || strcmp(ext, ".dds") == 0 || strcmp(ext, ".ktx") == 0
+        || strcmp(ext, ".ktx2") == 0)
         return JCE_FV_IMAGE;
 
     if (strcmp(ext, ".gltf") == 0 || strcmp(ext, ".glb") == 0
         || strcmp(ext, ".obj") == 0 || strcmp(ext, ".fbx") == 0
         || strcmp(ext, ".dae") == 0 || strcmp(ext, ".3ds") == 0)
         return JCE_FV_MODEL;
+
+    /* .mat.json is detected via the full path in jce_file_viewer_open(),
+     * since the ext here will be just ".json".  See compound-extension
+     * check below. */
 
     if (strcmp(ext, ".scene") == 0)
         return JCE_FV_SCENE;
@@ -222,8 +231,15 @@ void jce_file_viewer_open(const char *path)
     JceFileViewerType ftype = fv_detect_ext(ext);
 
     int read_size;
-    if (ftype == JCE_FV_IMAGE || ftype == JCE_FV_MODEL)
+    if (ftype == JCE_FV_IMAGE)
         read_size = (int)file_size;
+    else if (ftype == JCE_FV_MODEL) {
+        /* Cap model content read — assimp uses file-based loading via
+         * tab->path, so we only need the first chunk for GLB header
+         * display and memory-based fallback for small files. */
+        const long model_cap = 2L * 1024 * 1024;  /* 2 MB */
+        read_size = (file_size > model_cap) ? (int)model_cap : (int)file_size;
+    }
     else
         read_size = (file_size > FV_MAX_CONTENT) ? FV_MAX_CONTENT : (int)file_size;
 
@@ -239,6 +255,12 @@ void jce_file_viewer_open(const char *path)
         std::string lower_path(open_path);
         for (char &ch : lower_path)
             ch = (char)tolower((unsigned char)ch);
+
+        /* .mat.json compound extension → MATERIAL viewer. */
+        size_t pl = lower_path.size();
+        if (pl >= 9 && lower_path.substr(pl - 9) == ".mat.json")
+            ftype = JCE_FV_MATERIAL;
+
         const char *sp = strstr(lower_path.c_str(), ".scene");
         if (sp && (strcmp(sp, ".scene") == 0 || strcmp(sp, ".scene.json") == 0))
             ftype = JCE_FV_SCENE;
@@ -304,6 +326,37 @@ void jce_file_viewer_open(const char *path)
             } else {
                 LOG_WARN(LOG_TAG, "IMG_Load_IO failed for '%s': %s",
                          name, SDL_GetError());
+            }
+        }
+
+        /* Fallback for DDS/KTX/KTX2: bgfx natively decodes these
+         * container formats via bgfx_create_texture(). */
+        if (!jce_texture_valid(tab->gpu_tex) && actually_read > 0) {
+            const bgfx_memory_t *mem =
+                bgfx_copy(buf, (uint32_t)actually_read);
+            if (mem) {
+                bgfx_texture_info_t info;
+                memset(&info, 0, sizeof(info));
+                bgfx_texture_handle_t h =
+                    bgfx_create_texture(mem, BGFX_TEXTURE_NONE
+                                        | BGFX_SAMPLER_U_CLAMP
+                                        | BGFX_SAMPLER_V_CLAMP,
+                                        0, &info);
+                if (h.idx != UINT16_MAX) {
+                    tab->gpu_tex.idx = h.idx;
+                    tab->img_w = (int)info.width;
+                    tab->img_h = (int)info.height;
+
+                    if (tab->img_w > 0 && tab->img_h > 0) {
+                        float max_dim = (float)((tab->img_w > tab->img_h)
+                                                ? tab->img_w : tab->img_h);
+                        if (max_dim > 512.0f)
+                            tab->zoom = 512.0f / max_dim;
+                    }
+                    LOG_INFO(LOG_TAG,
+                        "loaded image (bgfx container) %dx%d tex=%u",
+                        tab->img_w, tab->img_h, tab->gpu_tex.idx);
+                }
             }
         }
     }
@@ -426,11 +479,12 @@ void jce_file_viewer_draw_content(void)
 
                 /* Dispatch to sub-viewer */
                 switch (tab->type) {
-                case JCE_FV_IMAGE:  fv_render_image(tab);  break;
-                case JCE_FV_MODEL:  fv_render_model(tab);  break;
-                case JCE_FV_SCENE:  fv_render_scene(tab);  break;
-                case JCE_FV_BINARY: fv_render_hex(tab);    break;
-                default:            fv_render_code(tab);   break;
+                case JCE_FV_IMAGE:    fv_render_image(tab);    break;
+                case JCE_FV_MODEL:    fv_render_model(tab);    break;
+                case JCE_FV_SCENE:    fv_render_scene(tab);    break;
+                case JCE_FV_MATERIAL: fv_render_material(tab); break;
+                case JCE_FV_BINARY:   fv_render_hex(tab);      break;
+                default:              fv_render_code(tab);      break;
                 }
                 ImGui::EndTabItem();
             }

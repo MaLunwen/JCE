@@ -22,6 +22,12 @@
 
 #define LOG_TAG "fv_model"
 
+/* Complexity thresholds for graceful degradation.
+ * Files above FV_MODEL_SKIP_PARSE_BYTES skip assimp entirely.
+ * Models above FV_MODEL_MAX_WIREFRAME_VERTS show info-only. */
+#define FV_MODEL_SKIP_PARSE_BYTES    (10 * 1024 * 1024)  /* 10 MB */
+#define FV_MODEL_MAX_WIREFRAME_VERTS 100000               /* 100 K */
+
 /* ══════════════════════════════════════════════════════════════════════
  *  MODEL VIEWER STATE (per tab, keyed by path)
  * ══════════════════════════════════════════════════════════════════════ */
@@ -37,6 +43,8 @@ struct ModelViewState {
     bool  show_wireframe;
     bool  show_grid;
     bool  parsed;
+    bool  too_complex;       /* model too large for wireframe preview */
+    bool  skipped_parse;     /* file too large, assimp skipped entirely */
     float minX, minY, minZ, maxX, maxY, maxZ;
     float cx, cy, cz, scale;
     int   mesh_count;
@@ -93,9 +101,19 @@ static void fv_parse_model_assimp(FvTab *tab, ModelViewState *ms)
     ms->mesh_count = 0;
     ms->vert_count = 0; ms->face_count = 0; ms->mat_count = 0;
     ms->load_ok = false;
+    ms->too_complex = false;
+    ms->skipped_parse = false;
     ms->load_error[0] = '\0';
     ms->minX = ms->minY = ms->minZ =  1e30f;
     ms->maxX = ms->maxY = ms->maxZ = -1e30f;
+
+    /* Skip assimp entirely for very large files to avoid main-thread stall. */
+    if (tab->file_size > FV_MODEL_SKIP_PARSE_BYTES) {
+        ms->skipped_parse = true;
+        ms->too_complex   = true;
+        ms->load_ok       = true;  /* not an error, just degraded */
+        return;
+    }
 
     if (!tab->content || tab->content_len <= 0) {
         snprintf(ms->load_error, sizeof(ms->load_error),
@@ -103,22 +121,37 @@ static void fv_parse_model_assimp(FvTab *tab, ModelViewState *ms)
         return;
     }
 
-    const char *hint = tab->ext;
-    if (hint && hint[0] == '.') hint++;
-
-    Assimp::Importer importer;
-    const aiScene *scene = importer.ReadFileFromMemory(
-        tab->content,
-        (size_t)tab->content_len,
+    const unsigned assimp_flags =
         aiProcess_Triangulate
         | aiProcess_JoinIdenticalVertices
         | aiProcess_GenSmoothNormals
-        | aiProcess_ImproveCacheLocality,
-        hint);
+        | aiProcess_ImproveCacheLocality;
+
+    /* Prefer file-based loading so assimp can resolve external references
+     * (e.g. .bin files referenced by .gltf).  Fall back to memory-based
+     * loading when the file path doesn't work (embedded buffers, etc.).
+     * Both importers live at the same scope so the scene pointer stays
+     * valid throughout parsing. */
+    Assimp::Importer file_importer;
+    Assimp::Importer mem_importer;
+    const aiScene *scene = nullptr;
+
+    if (tab->path[0] != '\0')
+        scene = file_importer.ReadFile(tab->path, assimp_flags);
 
     if (!scene || scene->mNumMeshes == 0) {
+        const char *hint = tab->ext;
+        if (hint && hint[0] == '.') hint++;
+        scene = mem_importer.ReadFileFromMemory(
+            tab->content, (size_t)tab->content_len, assimp_flags, hint);
+    }
+
+    if (!scene || scene->mNumMeshes == 0) {
+        const char *err = file_importer.GetErrorString();
+        if (!err || err[0] == '\0')
+            err = mem_importer.GetErrorString();
         snprintf(ms->load_error, sizeof(ms->load_error),
-                 "assimp: %s", importer.GetErrorString());
+                 "assimp: %s", err ? err : "unknown error");
         return;
     }
 
@@ -137,6 +170,28 @@ static void fv_parse_model_assimp(FvTab *tab, ModelViewState *ms)
     }
     ms->mat_count = (int)ms->materials.size();
 
+    /* Count total vertices/faces without building arrays first. */
+    {
+        int total_verts = 0, total_faces = 0;
+        for (unsigned m = 0; m < scene->mNumMeshes; m++) {
+            const aiMesh *mesh = scene->mMeshes[m];
+            if (!mesh) continue;
+            total_verts += (int)mesh->mNumVertices;
+            total_faces += (int)mesh->mNumFaces;
+        }
+        ms->vert_count = total_verts;
+        ms->face_count = total_faces;
+
+        if (total_verts > FV_MODEL_MAX_WIREFRAME_VERTS) {
+            ms->too_complex = true;
+            ms->load_ok = true;
+            return;
+        }
+    }
+
+    /* Collect vertex/face data for wireframe rendering (small models). */
+    ms->vert_count = 0;
+    ms->face_count = 0;
     int vert_base = 0;
     for (unsigned m = 0; m < scene->mNumMeshes; m++) {
         const aiMesh *mesh = scene->mMeshes[m];
@@ -239,6 +294,75 @@ void fv_render_model(FvTab *tab)
 
     ModelViewState *ms = fv_get_model_state(tab);
     fv_parse_model_assimp(tab, ms);
+
+    /* ── Too-complex / skipped: info-only panel (no wireframe) ───── */
+    if (ms->too_complex) {
+        ImGui::Spacing();
+        if (ms->skipped_parse)
+            ImGui::TextColored(JCE_COLOR_TEXT_ERROR, "%s",
+                               jce_editor_i18n("viewer.modelTooLarge"));
+        else
+            ImGui::TextColored(JCE_COLOR_TEXT_ERROR, "%s",
+                               jce_editor_i18n("viewer.modelTooComplex"));
+
+        ImGui::TextWrapped("%s", jce_editor_i18n("viewer.useExternalViewer"));
+        ImGui::Spacing();
+
+        ImGui::TextColored(JCE_COLOR_ACCENT, "%s", jce_editor_i18n("viewer.modelInfo"));
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        ImGui::Columns(2, "##mdlinfo_complex", false);
+        ImGui::SetColumnWidth(0, 120);
+
+        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s:", jce_editor_i18n("viewer.format"));
+        ImGui::NextColumn(); ImGui::Text("%s", fmt_name); ImGui::NextColumn();
+
+        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s:", jce_editor_i18n("viewer.fileSize"));
+        ImGui::NextColumn();
+        if (tab->file_size >= 1024 * 1024)
+            ImGui::Text("%.2f MB", (double)tab->file_size / (1024.0 * 1024.0));
+        else
+            ImGui::Text("%.1f KB", (double)tab->file_size / 1024.0);
+        ImGui::NextColumn();
+
+        if (!ms->skipped_parse) {
+            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s:", jce_editor_i18n("viewer.meshes"));
+            ImGui::NextColumn(); ImGui::Text("%d", ms->mesh_count); ImGui::NextColumn();
+
+            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s:", jce_editor_i18n("viewer.vertices"));
+            ImGui::NextColumn(); ImGui::Text("%d", ms->vert_count); ImGui::NextColumn();
+
+            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s:", jce_editor_i18n("viewer.faces"));
+            ImGui::NextColumn(); ImGui::Text("%d", ms->face_count); ImGui::NextColumn();
+        }
+
+        if (strcmp(tab->ext, ".glb") == 0 && tab->content && tab->content_len >= 12) {
+            const unsigned char *d = (const unsigned char *)tab->content;
+            uint32_t version = d[4] | (d[5] << 8) | (d[6] << 16) | (d[7] << 24);
+            uint32_t length  = d[8] | (d[9] << 8) | (d[10] << 16) | (d[11] << 24);
+            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s:", jce_editor_i18n("viewer.glbVersion"));
+            ImGui::NextColumn(); ImGui::Text("%u", version); ImGui::NextColumn();
+            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s:", jce_editor_i18n("viewer.totalSize"));
+            ImGui::NextColumn(); ImGui::Text("%u bytes", length); ImGui::NextColumn();
+        }
+
+        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s:", jce_editor_i18n("viewer.path"));
+        ImGui::NextColumn(); ImGui::TextWrapped("%s", tab->path); ImGui::NextColumn();
+        ImGui::Columns(1);
+
+        if (!ms->skipped_parse && !ms->materials.empty()) {
+            ImGui::Spacing();
+            ImGui::TextColored(JCE_COLOR_ACCENT, "%s (%d)",
+                jce_editor_i18n("viewer.materials"),
+                (int)ms->materials.size());
+            ImGui::Separator();
+            for (auto &m : ms->materials)
+                ImGui::BulletText("%s", m.c_str());
+        }
+
+        return;
+    }
 
     /* ── Assimp: unified 3D wireframe view for all model formats ─── */
     if (ms->load_ok) {

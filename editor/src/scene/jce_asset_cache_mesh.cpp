@@ -251,11 +251,13 @@ bool resolve_mesh_file_path(const char *mesh_path, char *out_path,
 {
     if (!mesh_path || mesh_path[0] == '\0' || !out_path || out_size == 0)
         return false;
-    if (s_cache.scene_dir[0] == '\0')
-        return false;
 
+    /* If the path already points to an existing file (e.g. absolute), use it. */
     if (fs::exists(mesh_path))
         return copy_found_path(mesh_path, out_path, out_size);
+
+    if (s_cache.scene_dir[0] == '\0')
+        return false;
 
     const char *slash = strrchr(mesh_path, '/');
     if (!slash) slash = strrchr(mesh_path, '\\');
