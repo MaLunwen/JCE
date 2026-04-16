@@ -1,23 +1,21 @@
 /*
- * jce_fv_video.cpp  Video file viewer.
+ * jce_fv_video.cpp  Video file viewer — MPEG-1 playback via jce_video.
  *
- * Decoding full video streams requires a heavyweight codec library
- * (ffmpeg / libvpx / dav1d) which is not currently a dependency of
- * JCE_Editor.  Until that is added, this sub-viewer provides:
+ * Mirrors jce_fv_audio.cpp: each tab owns a VideoState with an engine
+ * JceVideo handle, a bgfx texture holding the most recent decoded
+ * frame, and transport state.  Playback drives plm_decode() through
+ * jce_video_advance() based on the ImGui frame delta time.
  *
- *   • Container detection from the header bytes read into tab->content
- *     (MP4 / MOV / M4V, Matroska / WebM, AVI, FLV, MPEG-PS, Ogg).
- *   • File metadata (size, path, extension).
- *   • "Open in external player" button that hands the file off to the
- *     platform's default video application.
- *   • "Copy path" helper for pipelines that want to inspect the file
- *     with an external tool.
- *
- * When a real decoder is wired up later, the render function can grow
- * a proper frame view and transport controls similar to jce_fv_audio.cpp.
+ * Supported container: MPEG Program Stream (.mpg / .mpeg / .m1v).
+ * Other extensions are still detected as JCE_FV_VIDEO so they open in
+ * a tab, but the engine rejects them and we show a clear diagnostic.
  */
 
 #include "jce_fv_common.h"
+
+extern "C" {
+#include <jce/video/jce_video.h>
+}
 
 #define LOG_TAG "fv_video"
 
@@ -25,15 +23,31 @@
 
 struct VideoState {
     char        path[512];
-    bool        loaded;
+    bool        loaded;       /* slot in use */
 
-    /* Sniffed container / codec info. */
-    const char *container;   /* human-readable container name */
-    char        brand[8];    /* mp4 major brand / ftyp ("isom", "mp42"…) */
-    bool        has_brand;
+    /* Engine handle.  JCE_VIDEO_INVALID when load failed but the slot
+     * is still reserved so we don't retry every frame. */
+    JceVideo    video;
+    bool        load_failed;
+    char        fail_reason[160];
+
+    /* Metadata snapshot (valid only when video != JCE_VIDEO_INVALID). */
+    JceVideoInfo info;
+
+    /* GPU texture for the most-recently uploaded frame. */
+    JceTexture  gpu_tex;
+    int         tex_w;
+    int         tex_h;
+    uint64_t    uploaded_counter;
+
+    /* Transport state. */
+    bool        playing;
+    bool        scrubbing;
+    bool        resume_after_scrub;
+    float       pending_seek;   /* seconds, used during scrub */
 };
 
-#define VIDEO_STATE_MAX 16
+#define VIDEO_STATE_MAX 8
 static VideoState s_video[VIDEO_STATE_MAX];
 
 static VideoState *find_state(const char *path)
@@ -51,122 +65,29 @@ static VideoState *alloc_state(void)
     return nullptr;
 }
 
-/* ── Container sniffing ──────────────────────────────────────────── */
-
-static bool mem_equal(const unsigned char *d, int len, int off,
-                      const char *sig, int sig_len)
+static void release_texture(VideoState *st)
 {
-    if (off < 0 || off + sig_len > len) return false;
-    return memcmp(d + off, sig, (size_t)sig_len) == 0;
+    if (!st) return;
+    if (jce_texture_valid(st->gpu_tex))
+        jce_texture_destroy(st->gpu_tex);
+    st->gpu_tex.idx         = UINT16_MAX;
+    st->tex_w               = 0;
+    st->tex_h               = 0;
+    st->uploaded_counter    = 0;
 }
 
-static void sniff_container(VideoState *st,
-                            const unsigned char *d, int len,
-                            const char *ext)
+static void free_state(VideoState *st)
 {
-    st->container = nullptr;
-    st->has_brand = false;
-    st->brand[0]  = '\0';
-
-    if (!d || len < 12) {
-        /* Fall back to extension-only detection. */
-        if (ext && ext[0]) {
-            if (strcmp(ext, ".mp4") == 0 || strcmp(ext, ".m4v") == 0)
-                st->container = "MP4";
-            else if (strcmp(ext, ".mov") == 0)
-                st->container = "QuickTime MOV";
-            else if (strcmp(ext, ".mkv") == 0)
-                st->container = "Matroska";
-            else if (strcmp(ext, ".webm") == 0)
-                st->container = "WebM";
-            else if (strcmp(ext, ".avi") == 0)
-                st->container = "AVI";
-            else if (strcmp(ext, ".flv") == 0)
-                st->container = "FLV";
-            else if (strcmp(ext, ".mpg") == 0 || strcmp(ext, ".mpeg") == 0)
-                st->container = "MPEG-PS";
-            else if (strcmp(ext, ".ogv") == 0)
-                st->container = "Ogg";
-            else if (strcmp(ext, ".wmv") == 0)
-                st->container = "ASF/WMV";
-            else if (strcmp(ext, ".3gp") == 0)
-                st->container = "3GP";
-        }
-        return;
+    if (!st) return;
+    release_texture(st);
+    if (st->video != JCE_VIDEO_INVALID) {
+        jce_video_unload(st->video);
+        st->video = JCE_VIDEO_INVALID;
     }
-
-    /* ISO BMFF family (MP4, MOV, M4V, 3GP): bytes 4..7 == "ftyp". */
-    if (mem_equal(d, len, 4, "ftyp", 4)) {
-        memcpy(st->brand, d + 8, 4);
-        st->brand[4]   = '\0';
-        st->has_brand  = true;
-
-        if (mem_equal(d, len, 8, "qt  ", 4))
-            st->container = "QuickTime MOV";
-        else if (mem_equal(d, len, 8, "3gp", 3)
-              || mem_equal(d, len, 8, "3g2", 3))
-            st->container = "3GP";
-        else
-            st->container = "MP4 (ISO BMFF)";
-        return;
-    }
-
-    /* EBML — Matroska / WebM: starts with 0x1A 0x45 0xDF 0xA3. */
-    if (len >= 4 && d[0] == 0x1A && d[1] == 0x45
-        && d[2] == 0xDF && d[3] == 0xA3)
-    {
-        /* Look for "webm" DocType within the first header block. */
-        int scan_end = len < 256 ? len : 256;
-        for (int i = 0; i + 4 < scan_end; ++i) {
-            if (d[i] == 'w' && d[i + 1] == 'e'
-                && d[i + 2] == 'b' && d[i + 3] == 'm') {
-                st->container = "WebM";
-                return;
-            }
-        }
-        st->container = "Matroska";
-        return;
-    }
-
-    /* RIFF container family. */
-    if (mem_equal(d, len, 0, "RIFF", 4)) {
-        if (mem_equal(d, len, 8, "AVI ", 4))
-            st->container = "AVI";
-        else
-            st->container = "RIFF";
-        return;
-    }
-
-    /* FLV: "FLV" + version byte. */
-    if (mem_equal(d, len, 0, "FLV", 3)) {
-        st->container = "FLV";
-        return;
-    }
-
-    /* Ogg: "OggS". */
-    if (mem_equal(d, len, 0, "OggS", 4)) {
-        st->container = "Ogg";
-        return;
-    }
-
-    /* MPEG program stream pack header: 00 00 01 BA. */
-    if (len >= 4 && d[0] == 0x00 && d[1] == 0x00
-        && d[2] == 0x01 && d[3] == 0xBA) {
-        st->container = "MPEG-PS";
-        return;
-    }
-
-    /* ASF / WMV GUID (30 26 B2 75 ...). */
-    if (len >= 4 && d[0] == 0x30 && d[1] == 0x26
-        && d[2] == 0xB2 && d[3] == 0x75) {
-        st->container = "ASF/WMV";
-        return;
-    }
-
-    /* Extension fallback. */
-    st->container = "Unknown video";
-    (void)ext;
+    memset(st, 0, sizeof(*st));
 }
+
+/* ── Load ─────────────────────────────────────────────────────────── */
 
 static VideoState *ensure_loaded(FvTab *tab)
 {
@@ -178,42 +99,126 @@ static VideoState *ensure_loaded(FvTab *tab)
 
     memset(st, 0, sizeof(*st));
     snprintf(st->path, sizeof(st->path), "%s", tab->path);
+    st->gpu_tex.idx = UINT16_MAX;
+    st->loaded      = true;     /* reserve the slot up-front */
 
-    sniff_container(st,
-                    (const unsigned char *)tab->content,
-                    tab->content_len,
-                    tab->ext);
+    if (!tab->content || tab->content_len <= 0) {
+        st->load_failed = true;
+        snprintf(st->fail_reason, sizeof(st->fail_reason),
+                 "empty file (%d bytes)", tab->content_len);
+        return st;
+    }
 
-    st->loaded = true;
+    st->video = jce_video_load_memory(tab->content,
+                                       (uint32_t)tab->content_len,
+                                       tab->path);
+    if (st->video == JCE_VIDEO_INVALID) {
+        st->load_failed = true;
+        snprintf(st->fail_reason, sizeof(st->fail_reason),
+            "decoder rejected stream — this viewer supports MPEG-1 "
+            "(.mpg/.mpeg/.m1v); other containers need a codec.");
+        LOG_WARN(LOG_TAG, "load failed: %s", tab->path);
+        return st;
+    }
 
-    LOG_INFO(LOG_TAG, "loaded '%s' container=%s%s%s",
-             tab->display_name,
-             st->container ? st->container : "unknown",
-             st->has_brand ? " brand=" : "",
-             st->has_brand ? st->brand : "");
+    jce_video_get_info(st->video, &st->info);
+    LOG_INFO(LOG_TAG, "loaded %s %dx%d %.2ffps dur=%.2fs",
+             tab->display_name, st->info.width, st->info.height,
+             st->info.framerate, st->info.duration);
     return st;
 }
 
-/* ── Launch external player ──────────────────────────────────────── */
+/* ── Frame upload ─────────────────────────────────────────────────── */
 
-static void launch_external_player(const char *path)
+static void upload_latest_frame(VideoState *st)
 {
-    if (!path || !path[0]) return;
+    if (!st || st->video == JCE_VIDEO_INVALID) return;
 
-    char cmd[768];
-#if defined(_WIN32)
-    snprintf(cmd, sizeof(cmd), "start \"\" \"%s\"", path);
-#elif defined(__APPLE__)
-    snprintf(cmd, sizeof(cmd), "open \"%s\"", path);
-#else
-    /* Linux / BSD: xdg-open hands off to the user's default handler. */
-    snprintf(cmd, sizeof(cmd), "xdg-open \"%s\" >/dev/null 2>&1 &", path);
-#endif
+    uint64_t counter = jce_video_get_frame_counter(st->video);
+    if (counter == 0 || counter == st->uploaded_counter) return;
 
-    int rc = system(cmd);
-    if (rc != 0)
-        LOG_WARN(LOG_TAG, "external player launch returned %d for '%s'",
-                 rc, path);
+    int w = 0, h = 0;
+    double frame_time = 0.0;
+    const uint8_t *rgba = jce_video_get_frame_rgba(st->video,
+                                                    &w, &h, &frame_time);
+    if (!rgba || w <= 0 || h <= 0) return;
+
+    /* bgfx has no cheap in-place 2D update wrapper in this codebase, so
+     * we recreate the texture each frame.  For MPEG-1 preview rates
+     * (~24-30 fps at a few hundred Kpx) this is well within budget. */
+    if (jce_texture_valid(st->gpu_tex))
+        jce_texture_destroy(st->gpu_tex);
+
+    st->gpu_tex = jce_texture_from_rgba(rgba, (uint32_t)w, (uint32_t)h);
+    st->tex_w   = w;
+    st->tex_h   = h;
+    st->uploaded_counter = counter;
+}
+
+/* ── Per-frame playback tick ─────────────────────────────────────── */
+
+static void tick_playback(VideoState *st, bool ui_focused)
+{
+    if (!st || st->video == JCE_VIDEO_INVALID) return;
+
+    /* Pause when the tab isn't focused, same contract as the audio
+     * viewer — avoids runaway decode on background tabs. */
+    if (!ui_focused) return;
+
+    if (st->scrubbing) {
+        /* While the user is dragging the seek widget we only update the
+         * preview frame, not the playback clock. */
+        return;
+    }
+
+    if (!st->playing) return;
+
+    if (jce_video_has_ended(st->video)) {
+        st->playing = false;
+        return;
+    }
+
+    float dt = ImGui::GetIO().DeltaTime;
+    if (dt > 0.25f) dt = 0.25f;   /* clamp long frames */
+    jce_video_advance(st->video, (double)dt);
+
+    if (jce_video_has_ended(st->video))
+        st->playing = false;
+}
+
+/* ── Scrub helpers ────────────────────────────────────────────────── */
+
+static void begin_scrub(VideoState *st, float seek_time)
+{
+    if (!st) return;
+    if (!st->scrubbing) {
+        st->resume_after_scrub = st->playing;
+        st->playing            = false;
+    }
+    st->scrubbing    = true;
+    st->pending_seek = seek_time;
+    /* Fast preview seek (snap to nearest intra-frame) while dragging. */
+    jce_video_seek(st->video, (double)seek_time, false);
+}
+
+static void update_scrub(VideoState *st, float seek_time)
+{
+    if (!st || !st->scrubbing) return;
+    if (fabsf(seek_time - st->pending_seek) < 0.01f) return;
+    st->pending_seek = seek_time;
+    jce_video_seek(st->video, (double)seek_time, false);
+}
+
+static void finish_scrub(VideoState *st)
+{
+    if (!st || !st->scrubbing) return;
+    /* Exact seek at release for pixel-accurate landing. */
+    jce_video_seek(st->video, (double)st->pending_seek, true);
+    st->scrubbing = false;
+    if (st->resume_after_scrub)
+        st->playing = true;
+    st->resume_after_scrub = false;
+    st->pending_seek       = 0.0f;
 }
 
 /* ── Render ───────────────────────────────────────────────────────── */
@@ -221,123 +226,148 @@ static void launch_external_player(const char *path)
 void fv_render_video(FvTab *tab)
 {
     VideoState *st = ensure_loaded(tab);
+    if (!st) {
+        ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1),
+            "Failed to allocate video state for %s", tab->display_name);
+        return;
+    }
 
-    /* Toolbar row: open externally + file summary. */
-    if (ImGui::Button(jce_editor_i18n("viewer.openExternal")))
-        launch_external_player(tab->path);
+    const bool ui_focused =
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
 
+    tick_playback(st, ui_focused);
+    upload_latest_frame(st);
+
+    /* ── Toolbar ─────────────────────────────────────────────────── */
+
+    const bool has_video = (st->video != JCE_VIDEO_INVALID);
+    const float dur  = has_video ? (float)st->info.duration : 0.0f;
+    float cur_time   = has_video ? (float)jce_video_get_time(st->video) : 0.0f;
+    if (st->scrubbing) cur_time = st->pending_seek;
+
+    ImGui::BeginDisabled(!has_video || !ui_focused);
+    if (ImGui::Button(st->playing ? "  ||  " : "  >  ")) {
+        if (!st->playing) {
+            if (jce_video_has_ended(st->video))
+                jce_video_rewind(st->video);
+            st->playing = true;
+        } else {
+            st->playing = false;
+        }
+    }
     ImGui::SameLine();
-    if (ImGui::Button(jce_editor_i18n("assetBrowser.copyPath")))
-        ImGui::SetClipboardText(tab->path);
+    if (ImGui::Button(" |< ")) {
+        jce_video_rewind(st->video);
+        cur_time = 0.0f;
+    }
+    ImGui::EndDisabled();
 
     ImGui::SameLine();
     double kb = (double)tab->file_size / 1024.0;
-    if (kb >= 1024.0)
-        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
-                           "%s  |  %.2f MB",
-                           st && st->container ? st->container : "Video",
-                           kb / 1024.0);
-    else
-        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
-                           "%s  |  %.1f KB",
-                           st && st->container ? st->container : "Video",
-                           kb);
-
-    ImGui::Separator();
-    ImGui::Spacing();
-
-    /* Big centred placeholder — no inline decoder yet. */
-    ImVec2 avail = ImGui::GetContentRegionAvail();
-    float  preview_h = avail.y - 140.0f;
-    if (preview_h < 120.0f) preview_h = 120.0f;
-
-    ImVec2 preview_pos  = ImGui::GetCursorScreenPos();
-    ImVec2 preview_size = ImVec2(avail.x, preview_h);
-
-    ImDrawList *dl = ImGui::GetWindowDrawList();
-    dl->AddRectFilled(preview_pos,
-                      ImVec2(preview_pos.x + preview_size.x,
-                             preview_pos.y + preview_size.y),
-                      IM_COL32(18, 18, 24, 255));
-    dl->AddRect(preview_pos,
-                ImVec2(preview_pos.x + preview_size.x,
-                       preview_pos.y + preview_size.y),
-                IM_COL32(60, 60, 80, 255));
-
-    /* Play-triangle glyph, centred. */
-    float cx = preview_pos.x + preview_size.x * 0.5f;
-    float cy = preview_pos.y + preview_size.y * 0.5f;
-    float r  = preview_size.y * 0.12f;
-    if (r > 48.0f) r = 48.0f;
-    if (r < 16.0f) r = 16.0f;
-
-    ImVec2 p0(cx - r * 0.6f, cy - r);
-    ImVec2 p1(cx - r * 0.6f, cy + r);
-    ImVec2 p2(cx + r,        cy);
-    dl->AddTriangleFilled(p0, p1, p2, IM_COL32(120, 180, 255, 220));
-
-    /* Hint text under the glyph. */
-    const char *hint = jce_editor_i18n("viewer.videoNoInlinePlayback");
-    ImVec2 tsz = ImGui::CalcTextSize(hint);
-    dl->AddText(ImVec2(cx - tsz.x * 0.5f, cy + r + 12.0f),
-                IM_COL32(160, 160, 170, 255), hint);
-
-    ImGui::Dummy(preview_size);
-    ImGui::Spacing();
-
-    /* Metadata block. */
-    ImGui::TextColored(JCE_COLOR_ACCENT, "%s",
-                       jce_editor_i18n("viewer.videoMetadata"));
-    ImGui::Separator();
-
-    if (ImGui::BeginTable("##vid_meta", 2,
-                          ImGuiTableFlags_SizingStretchProp
-                          | ImGuiTableFlags_NoBordersInBody))
-    {
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn();
-        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s",
-                           jce_editor_i18n("viewer.videoContainer"));
-        ImGui::TableNextColumn();
-        ImGui::TextUnformatted(
-            (st && st->container) ? st->container : "—");
-
-        if (st && st->has_brand) {
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s",
-                               jce_editor_i18n("viewer.videoBrand"));
-            ImGui::TableNextColumn();
-            ImGui::TextUnformatted(st->brand);
-        }
-
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn();
-        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s",
-                           jce_editor_i18n("viewer.videoExtension"));
-        ImGui::TableNextColumn();
-        ImGui::TextUnformatted(tab->ext[0] ? tab->ext : "—");
-
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn();
-        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s",
-                           jce_editor_i18n("viewer.videoSize"));
-        ImGui::TableNextColumn();
+    if (has_video) {
         if (kb >= 1024.0)
-            ImGui::Text("%.2f MB (%ld bytes)",
-                        kb / 1024.0, tab->file_size);
+            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
+                "%s  |  %dx%d  |  %.2f fps  |  %.2f MB",
+                tab->display_name, st->info.width, st->info.height,
+                st->info.framerate, kb / 1024.0);
         else
-            ImGui::Text("%.1f KB (%ld bytes)",
-                        kb, tab->file_size);
+            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
+                "%s  |  %dx%d  |  %.2f fps  |  %.1f KB",
+                tab->display_name, st->info.width, st->info.height,
+                st->info.framerate, kb);
+    } else {
+        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
+            "%s  |  %.1f KB", tab->display_name, kb);
+    }
 
-        ImGui::TableNextRow();
-        ImGui::TableNextColumn();
-        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s",
-                           jce_editor_i18n("viewer.videoPath"));
-        ImGui::TableNextColumn();
-        ImGui::TextWrapped("%s", tab->path);
+    if (has_video && !ui_focused)
+        ImGui::TextDisabled("Focus this panel to play");
 
-        ImGui::EndTable();
+    /* ── Seek slider ─────────────────────────────────────────────── */
+
+    ImGui::PushItemWidth(-1);
+    ImGui::BeginDisabled(!has_video);
+    float slider = cur_time;
+    bool slider_changed = ImGui::SliderFloat("##vidseek",
+        &slider, 0.0f, dur > 0.0f ? dur : 1.0f, "%.2fs");
+    bool slider_active = ImGui::IsItemActive();
+    if (has_video) {
+        if (slider_active) {
+            if (!st->scrubbing)
+                begin_scrub(st, slider);
+            else if (slider_changed)
+                update_scrub(st, slider);
+        } else if (st->scrubbing) {
+            finish_scrub(st);
+        }
+    }
+    ImGui::EndDisabled();
+    ImGui::PopItemWidth();
+
+    ImGui::Text("%.2fs / %.2fs", cur_time, dur);
+
+    ImGui::Separator();
+
+    /* ── Frame display ───────────────────────────────────────────── */
+
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    if (avail.y < 80.0f) avail.y = 80.0f;
+
+    if (has_video && jce_texture_valid(st->gpu_tex)
+        && st->tex_w > 0 && st->tex_h > 0)
+    {
+        /* Letterbox-fit the frame inside the remaining area. */
+        float sx = avail.x / (float)st->tex_w;
+        float sy = avail.y / (float)st->tex_h;
+        float scale = (sx < sy) ? sx : sy;
+        if (scale < 0.01f) scale = 0.01f;
+
+        float disp_w = (float)st->tex_w * scale;
+        float disp_h = (float)st->tex_h * scale;
+
+        float ox = (avail.x - disp_w) * 0.5f;
+        float oy = (avail.y - disp_h) * 0.5f;
+        if (ox < 0.0f) ox = 0.0f;
+        if (oy < 0.0f) oy = 0.0f;
+
+        ImVec2 origin = ImGui::GetCursorScreenPos();
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+
+        /* Matte behind the frame so the letterbox bars are clearly framed. */
+        dl->AddRectFilled(origin,
+                          ImVec2(origin.x + avail.x, origin.y + avail.y),
+                          IM_COL32(12, 12, 16, 255));
+
+        ImGui::SetCursorScreenPos(ImVec2(origin.x + ox, origin.y + oy));
+        ImGui::Image((ImTextureID)(uintptr_t)st->gpu_tex.idx,
+                      ImVec2(disp_w, disp_h));
+
+        ImGui::SetCursorScreenPos(
+            ImVec2(origin.x, origin.y + avail.y));
+    } else {
+        /* Placeholder when no frame has been decoded yet, or on load failure. */
+        ImVec2 origin = ImGui::GetCursorScreenPos();
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(origin,
+                          ImVec2(origin.x + avail.x, origin.y + avail.y),
+                          IM_COL32(18, 18, 24, 255));
+        dl->AddRect(origin,
+                    ImVec2(origin.x + avail.x, origin.y + avail.y),
+                    IM_COL32(60, 60, 80, 255));
+
+        const char *msg = has_video
+            ? "Decoding..."
+            : (st->load_failed
+                ? st->fail_reason
+                : "No frame available");
+        ImVec2 tsz = ImGui::CalcTextSize(msg);
+        dl->AddText(ImVec2(origin.x + (avail.x - tsz.x) * 0.5f,
+                           origin.y + (avail.y - tsz.y) * 0.5f),
+                    has_video ? IM_COL32(160, 160, 170, 255)
+                              : IM_COL32(255, 120, 120, 255),
+                    msg);
+
+        ImGui::Dummy(avail);
     }
 }
 
@@ -347,6 +377,5 @@ void fv_video_close_tab(FvTab *tab)
 {
     if (!tab) return;
     VideoState *st = find_state(tab->path);
-    if (!st) return;
-    memset(st, 0, sizeof(*st));
+    free_state(st);
 }

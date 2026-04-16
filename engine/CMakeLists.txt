@@ -118,6 +118,32 @@ if(APPLE)
 	enable_language(OBJC)
 endif()
 
+# ------------------------------------------------------------------ #
+# jce_video — MPEG-1 video via vendored pl_mpeg (single-header,      #
+# MIT).  No external codec dependency.                               #
+# ------------------------------------------------------------------ #
+_jce_add_layer(jce_video
+	DIRS      video
+	LINK_PUBLIC  jce_core)
+
+# pl_mpeg triggers a wide range of conversion/shadow warnings that
+# the engine's STRICT profile would otherwise flag.  Relax them for
+# the vendored translation units only — the wrapper jce_video.c still
+# builds under the strict profile.
+if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+	set_source_files_properties(
+		"${_ENGINE_SRC}/video/pl_mpeg_impl.c"
+		"${_ENGINE_SRC}/video/jce_video.c"
+		PROPERTIES COMPILE_OPTIONS
+			"-Wno-conversion;-Wno-sign-conversion;-Wno-shadow;-Wno-double-promotion;-Wno-pedantic;-Wno-unused-function")
+elseif(MSVC)
+	set_source_files_properties(
+		"${_ENGINE_SRC}/video/pl_mpeg_impl.c"
+		"${_ENGINE_SRC}/video/jce_video.c"
+		PROPERTIES COMPILE_OPTIONS
+			"/wd4244;/wd4245;/wd4267;/wd4456;/wd4457;/wd4701;/wd4189;/wd4242")
+endif()
+
 _jce_add_layer(jce_physics
 	DIRS      physics
 	LINK_PUBLIC  jce_core
@@ -250,6 +276,7 @@ target_link_libraries(JCE INTERFACE
 	jce_core
 	jce_platform
 	jce_audio
+	jce_video
 	jce_physics
 	jce_animation
 	jce_ai

@@ -267,12 +267,12 @@ void jce_file_viewer_open(const char *path)
     else if (ftype == JCE_FV_AUDIO)
         read_size = (int)file_size;
     else if (ftype == JCE_FV_VIDEO) {
-        /* For video we only need the first few KB to sniff the container
-         * header; the file itself is played out-of-process by an external
-         * player launched via its path. */
-        const long video_head_cap = 64 * 1024;
-        read_size = (file_size > video_head_cap) ? (int)video_head_cap
-                                                 : (int)file_size;
+        /* Video is decoded in-engine (jce_video) from the full byte
+         * buffer.  Respect the shared FV_MAX_ASSET_BYTES (200 MB) cap
+         * that also governs audio/model loads. */
+        const long video_cap = FV_MAX_ASSET_BYTES;
+        read_size = (file_size > video_cap) ? (int)video_cap
+                                            : (int)file_size;
     }
     else if (ftype == JCE_FV_MODEL) {
         /* Keep model bytes up to the global per-asset cap so GLB files
