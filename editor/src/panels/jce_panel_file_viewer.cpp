@@ -82,6 +82,8 @@ static void fv_close_tab(int idx)
         fv_model_close_tab(tab->path);
     if (tab->type == JCE_FV_AUDIO)
         fv_audio_close_tab(tab);
+    if (tab->type == JCE_FV_VIDEO)
+        fv_video_close_tab(tab);
     fv_code_close_tab(tab);
 
     if (jce_texture_valid(tab->gpu_tex))
@@ -150,6 +152,14 @@ static JceFileViewerType fv_detect_ext(const char *ext)
     if (strcmp(ext, ".wav") == 0 || strcmp(ext, ".ogg") == 0
         || strcmp(ext, ".mp3") == 0 || strcmp(ext, ".flac") == 0)
         return JCE_FV_AUDIO;
+
+    if (strcmp(ext, ".mp4") == 0 || strcmp(ext, ".m4v") == 0
+        || strcmp(ext, ".webm") == 0 || strcmp(ext, ".mov") == 0
+        || strcmp(ext, ".mkv") == 0 || strcmp(ext, ".avi") == 0
+        || strcmp(ext, ".flv") == 0 || strcmp(ext, ".wmv") == 0
+        || strcmp(ext, ".mpg") == 0 || strcmp(ext, ".mpeg") == 0
+        || strcmp(ext, ".3gp") == 0 || strcmp(ext, ".ogv") == 0)
+        return JCE_FV_VIDEO;
 
     return JCE_FV_BINARY;
 }
@@ -256,6 +266,14 @@ void jce_file_viewer_open(const char *path)
         read_size = (int)file_size;
     else if (ftype == JCE_FV_AUDIO)
         read_size = (int)file_size;
+    else if (ftype == JCE_FV_VIDEO) {
+        /* For video we only need the first few KB to sniff the container
+         * header; the file itself is played out-of-process by an external
+         * player launched via its path. */
+        const long video_head_cap = 64 * 1024;
+        read_size = (file_size > video_head_cap) ? (int)video_head_cap
+                                                 : (int)file_size;
+    }
     else if (ftype == JCE_FV_MODEL) {
         /* Keep model bytes up to the global per-asset cap so GLB files
          * can be inspected consistently in the model viewer. */
@@ -514,6 +532,7 @@ void jce_file_viewer_draw_content(void)
                     active_audio_path = tab->path;
                     fv_render_audio(tab);
                     break;
+                case JCE_FV_VIDEO:    fv_render_video(tab);    break;
                 case JCE_FV_BINARY:   fv_render_hex(tab);      break;
                 default:              fv_render_code(tab);      break;
                 }
@@ -561,6 +580,8 @@ void jce_file_viewer_close_all(void)
             fv_model_close_tab(tab->path);
         if (tab->type == JCE_FV_AUDIO)
             fv_audio_close_tab(tab);
+        if (tab->type == JCE_FV_VIDEO)
+            fv_video_close_tab(tab);
         fv_code_close_tab(tab);
         if (jce_texture_valid(tab->gpu_tex))
             jce_texture_destroy(tab->gpu_tex);

@@ -84,6 +84,7 @@ void fv_render_model(FvTab *tab);
 void fv_render_scene(FvTab *tab);
 void fv_render_material(FvTab *tab);
 void fv_render_audio(FvTab *tab);
+void fv_render_video(FvTab *tab);
 void fv_render_hex(FvTab *tab);
 
 /* ── Per-viewer cleanup (called when closing a tab) ──────────────── */
@@ -91,6 +92,7 @@ void fv_render_hex(FvTab *tab);
 void fv_code_close_tab(FvTab *tab);
 void fv_audio_close_tab(FvTab *tab);
 void fv_audio_update_focus(const char *active_tab_path, bool allow_playback);
+void fv_video_close_tab(FvTab *tab);
 void fv_model_close_tab(const char *path);
 void fv_model_shutdown(void);
 
