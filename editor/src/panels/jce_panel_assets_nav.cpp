@@ -42,7 +42,7 @@ static void draw_dir_tree(const fs::path &dir, int depth)
 
             bool open = ImGui::TreeNodeEx(dirname.c_str(), flags);
 
-            if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
+            if (ImGui::IsMouseDoubleClicked(0) && ImGui::IsItemHovered() && !ImGui::IsItemToggledOpen()) {
                 navigate_asset_directory(sd.string(), false);
             }
 
@@ -96,7 +96,7 @@ void draw_asset_directory_tree(float tree_w, float panel_h)
             root_flags |= ImGuiTreeNodeFlags_Selected;
 
         if (ImGui::TreeNodeEx(root_name.c_str(), root_flags)) {
-            if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
+            if (ImGui::IsMouseDoubleClicked(0) && ImGui::IsItemHovered() && !ImGui::IsItemToggledOpen()) {
                 navigate_asset_directory(s_assets.project_root, false);
             }
             if (ImGui::BeginPopupContextItem()) {

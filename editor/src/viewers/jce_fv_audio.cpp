@@ -150,6 +150,20 @@ void fv_audio_update_focus(const char *active_tab_path, bool allow_playback)
     }
 }
 
+void fv_audio_request_play(const char *path)
+{
+    if (!path) return;
+    AudioState *st = find_state(path);
+    if (!st || !st->loaded || st->playing) return;
+
+    stop_other_playback(path);
+    if (st->voice == JCE_VOICE_INVALID)
+        st->voice = jce_audio_play(st->audio, st->sound, false, 1.0f, 1.0f);
+    else
+        jce_audio_resume(st->audio, st->voice);
+    st->playing = (st->voice != JCE_VOICE_INVALID);
+}
+
 static AudioState *ensure_loaded(FvTab *tab)
 {
     AudioState *st = find_state(tab->path);
@@ -270,7 +284,6 @@ void fv_render_audio(FvTab *tab)
     ImGui::Separator();
 
     /* Transport controls. */
-    ImGui::BeginDisabled(!ui_focused);
     if (ImGui::Button(st->playing ? "  ||  " : "  >  ")) {
         if (!st->playing) {
             stop_other_playback(tab->path);
@@ -289,12 +302,8 @@ void fv_render_audio(FvTab *tab)
         if (st->voice != JCE_VOICE_INVALID)
             jce_audio_seek(st->audio, st->voice, 0.0f);
     }
-    ImGui::EndDisabled();
     ImGui::SameLine();
     ImGui::Text("%.2fs / %.2fs", cur, dur);
-
-    if (!ui_focused)
-        ImGui::TextDisabled("Focus this panel to play audio");
 
     /* Time seek slider. */
     ImGui::PushItemWidth(-1);
@@ -341,6 +350,21 @@ void fv_render_audio(FvTab *tab)
     if (st->playing && st->voice != JCE_VOICE_INVALID &&
         !jce_audio_is_playing(st->audio, st->voice)) {
         st->playing = false;
+    }
+
+    /* Space key toggles play/pause when the file viewer is focused. */
+    if (ui_focused && ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
+        if (!st->playing) {
+            stop_other_playback(tab->path);
+            if (st->voice == JCE_VOICE_INVALID)
+                st->voice = jce_audio_play(st->audio, st->sound,
+                                            false, 1.0f, 1.0f);
+            else
+                jce_audio_resume(st->audio, st->voice);
+            st->playing = (st->voice != JCE_VOICE_INVALID);
+        } else {
+            pause_state_playback(st);
+        }
     }
 }
 

@@ -13,45 +13,10 @@
 
 #include <wels/codec_api.h>
 #include <wels/codec_def.h>
+#include "jce_yuv_convert.h"
 #include <string.h>
 
 #define LOG_TAG "jce_h264"
-
-/* ── YUV420P → RGBA8 ─────────────────────────────────────────────── */
-
-static void yuv420_to_rgba(const uint8_t *y_plane, int y_stride,
-                           const uint8_t *u_plane, int u_stride,
-                           const uint8_t *v_plane, int v_stride,
-                           uint8_t *rgba, uint32_t width, uint32_t height)
-{
-    for (uint32_t row = 0; row < height; ++row) {
-        const uint8_t *yp = y_plane + row * y_stride;
-        const uint8_t *up = u_plane + (row / 2) * u_stride;
-        const uint8_t *vp = v_plane + (row / 2) * v_stride;
-        uint8_t *dst = rgba + row * width * 4;
-
-        for (uint32_t col = 0; col < width; ++col) {
-            int y = (int)yp[col] - 16;
-            int u = (int)up[col / 2] - 128;
-            int v = (int)vp[col / 2] - 128;
-
-            /* BT.601 fixed-point: Y'=Y*298, Cb/Cr scaled accordingly. */
-            int c = y * 298;
-            int r = (c + 409 * v + 128) >> 8;
-            int g = (c - 100 * u - 208 * v + 128) >> 8;
-            int b = (c + 516 * u + 128) >> 8;
-
-            if (r < 0) r = 0; if (r > 255) r = 255;
-            if (g < 0) g = 0; if (g > 255) g = 255;
-            if (b < 0) b = 0; if (b > 255) b = 255;
-
-            dst[col * 4 + 0] = (uint8_t)r;
-            dst[col * 4 + 1] = (uint8_t)g;
-            dst[col * 4 + 2] = (uint8_t)b;
-            dst[col * 4 + 3] = 255;
-        }
-    }
-}
 
 /* ── avcC → Annex B helper ────────────────────────────────────────── */
 
@@ -346,10 +311,10 @@ bool jce_h264_decode_frame(JceH264Decoder *dec,
                 dec->rgba_buf = (uint8_t *)JCE_MALLOC(need);
                 if (!dec->rgba_buf) { dec->rgba_cap = 0; return false; }
             }
-            yuv420_to_rgba(yuv[0], buf_info.UsrData.sSystemBuffer.iStride[0],
-                           yuv[1], buf_info.UsrData.sSystemBuffer.iStride[1],
-                           yuv[2], buf_info.UsrData.sSystemBuffer.iStride[1],
-                           dec->rgba_buf, fw, fh);
+            jce_yuv420_to_rgba(yuv[0], buf_info.UsrData.sSystemBuffer.iStride[0],
+                               yuv[1], buf_info.UsrData.sSystemBuffer.iStride[1],
+                               yuv[2], buf_info.UsrData.sSystemBuffer.iStride[1],
+                               dec->rgba_buf, fw, fh);
             dec->last_w = fw;
             dec->last_h = fh;
             have_frame = true;
@@ -377,7 +342,7 @@ bool jce_h264_decode_frame(JceH264Decoder *dec,
                         dec->pending_rgba = (uint8_t *)JCE_MALLOC(pn);
                     }
                     if (dec->pending_rgba) {
-                        yuv420_to_rgba(
+                        jce_yuv420_to_rgba(
                             drain_yuv[0], drain_info.UsrData.sSystemBuffer.iStride[0],
                             drain_yuv[1], drain_info.UsrData.sSystemBuffer.iStride[1],
                             drain_yuv[2], drain_info.UsrData.sSystemBuffer.iStride[1],
@@ -395,7 +360,7 @@ bool jce_h264_decode_frame(JceH264Decoder *dec,
                         dec->rgba_buf = (uint8_t *)JCE_MALLOC(need);
                         if (!dec->rgba_buf) { dec->rgba_cap = 0; return false; }
                     }
-                    yuv420_to_rgba(
+                    jce_yuv420_to_rgba(
                         drain_yuv[0], drain_info.UsrData.sSystemBuffer.iStride[0],
                         drain_yuv[1], drain_info.UsrData.sSystemBuffer.iStride[1],
                         drain_yuv[2], drain_info.UsrData.sSystemBuffer.iStride[1],

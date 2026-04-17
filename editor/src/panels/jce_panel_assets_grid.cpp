@@ -94,8 +94,6 @@ void draw_asset_grid_item(const FileEntry &fe, int index,
     ImGui::PopStyleColor(3);
 
     /* Single click: select (Ctrl/Shift multi-select) */
-    bool was_selected_before_click =
-        (s_assets.selected_set.count(index) != 0);
     bool ctrl  = ImGui::GetIO().KeyCtrl;
     bool shift = ImGui::GetIO().KeyShift;
 
@@ -228,14 +226,37 @@ void draw_asset_grid_item(const FileEntry &fe, int index,
         ImGuiHoveredFlags_AllowWhenBlockedByPopup
       | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
 
-    bool repeated_click_open_dir =
-        clicked && fe.is_dir && !ctrl && !shift && was_selected_before_click;
-    bool repeated_click_open_file =
-        clicked && !fe.is_dir && !ctrl && !shift && was_selected_before_click;
+    /* Double click: navigate or open.
+     * Primary: ImGui native double-click (fires on 2nd mouse-down).
+     * Fallback: timer-based detection from Button() release events to
+     * handle rapid sequential double-clicks across directory rebuilds.
+     * Path tracking prevents cross-directory false positives. */
+    static char   s_dblclick_path[512] = {0};
+    static double s_dblclick_time = 0.0;
+    bool open_triggered = false;
 
-    /* Double click: navigate or open. */
-    if (repeated_click_open_dir || repeated_click_open_file
-        || (cell_hovered && ImGui::IsMouseDoubleClicked(0))) {
+    if (cell_hovered && ImGui::IsMouseDoubleClicked(0)) {
+        open_triggered = true;
+        s_dblclick_path[0] = '\0';
+        s_dblclick_time = 0.0;
+    }
+
+    if (!open_triggered && clicked && !ctrl && !shift) {
+        double now = ImGui::GetTime();
+        if (s_dblclick_path[0] != '\0'
+            && strcmp(s_dblclick_path, fe.path.c_str()) == 0
+            && (now - s_dblclick_time) < (double)ImGui::GetIO().MouseDoubleClickTime) {
+            open_triggered = true;
+            s_dblclick_path[0] = '\0';
+            s_dblclick_time = 0.0;
+        } else {
+            snprintf(s_dblclick_path, sizeof(s_dblclick_path),
+                     "%s", fe.path.c_str());
+            s_dblclick_time = now;
+        }
+    }
+
+    if (open_triggered) {
         if (fe.is_dir) {
             navigate_asset_directory(fe.path, true);
         } else {

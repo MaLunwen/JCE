@@ -92,8 +92,10 @@ void fv_render_hex(FvTab *tab);
 void fv_code_close_tab(FvTab *tab);
 void fv_audio_close_tab(FvTab *tab);
 void fv_audio_update_focus(const char *active_tab_path, bool allow_playback);
+void fv_audio_request_play(const char *path);
 void fv_video_close_tab(FvTab *tab);
 void fv_video_update_focus(const char *active_tab_path, bool allow_playback);
+void fv_video_request_play(const char *path);
 void fv_model_close_tab(const char *path);
 void fv_model_shutdown(void);
 

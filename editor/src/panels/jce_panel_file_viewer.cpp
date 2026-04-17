@@ -65,6 +65,7 @@ static struct {
     int   active_tab;
     bool  want_focus;
     int   select_tab_req;  /* >= 0: switch to this tab index next draw */
+    bool  request_autoplay; /* one-shot: auto-play when re-selecting A/V tab */
 } s_fv;
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -249,6 +250,7 @@ void jce_file_viewer_open(const char *path)
         if (strcmp(tab_path, open_path) == 0) {
             s_fv.select_tab_req = i;
             s_fv.want_focus = true;
+            s_fv.request_autoplay = true;
             *jce_editor_panel_visible_ptr(JCE_PANEL_FILE_VIEWER) = true;
             if (is_scene_file_path(open_path))
                 jce_state_load_scene_file(open_path);
@@ -477,8 +479,6 @@ void jce_file_viewer_request_focus(void)
 
 void jce_file_viewer_draw_content(void)
 {
-    const bool file_viewer_focused =
-        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
     const char *active_audio_path = NULL;
     const char *active_video_path = NULL;
 
@@ -612,8 +612,22 @@ void jce_file_viewer_draw_content(void)
         ImGui::EndTabBar();
     }
 
-    fv_audio_update_focus(active_audio_path, file_viewer_focused);
-    fv_video_update_focus(active_video_path, file_viewer_focused);
+    /* A/V keeps playing as long as its tab is the active (visible) tab,
+     * regardless of whether the File Viewer window itself is focused. */
+    fv_audio_update_focus(active_audio_path, true);
+    fv_video_update_focus(active_video_path, true);
+
+    /* One-shot auto-play when the user re-opens an existing A/V tab. */
+    if (s_fv.request_autoplay) {
+        s_fv.request_autoplay = false;
+        if (s_fv.active_tab >= 0 && s_fv.active_tab < s_fv.tab_count) {
+            FvTab *at = &s_fv.tabs[s_fv.active_tab];
+            if (at->type == JCE_FV_AUDIO)
+                fv_audio_request_play(at->path);
+            else if (at->type == JCE_FV_VIDEO)
+                fv_video_request_play(at->path);
+        }
+    }
 }
 
 void jce_file_viewer_draw_window(bool *p_visible)

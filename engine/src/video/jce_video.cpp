@@ -8,6 +8,7 @@
 #include <jce/video/jce_video.h>
 #include <jce/video/jce_mp4_parser.h>
 #include <jce/core/jce_log.h>
+#include <jce/core/jce_thread.h>
 #include "core/jce_memory.h"
 #include "jce_aac_decode.h"
 #include "jce_h264_decode.h"
@@ -37,6 +38,11 @@ typedef struct {
     uint32_t             height;
     uint8_t             *mp4_copy;      /* owned copy of raw MP4 data */
     size_t               mp4_copy_size;
+
+    /* Pre-built keyframe index for O(log n) seek. */
+    uint32_t            *keyframe_indices;  /* sorted array of keyframe sample indices */
+    uint32_t             keyframe_count;
+    uint32_t             last_seek_kf_idx;  /* last keyframe used for inexact seek (skip dup) */
 } JceVideoDecoder;
 
 typedef struct {
@@ -78,9 +84,158 @@ typedef struct {
     uint32_t audio_pcm_samplerate;
 
     JceVideoDecoder decoder;
+
+    /* Async audio decode (background thread). */
+    JceTask *audio_task;
 } VideoSlot;
 
 static VideoSlot s_slots[JCE_MAX_VIDEOS];
+
+/* Lazy-init 1-worker pool for async audio decode. */
+static JceThreadPool *s_audio_pool = NULL;
+
+static JceThreadPool *get_audio_pool(void)
+{
+    if (!s_audio_pool)
+        s_audio_pool = jce_thread_pool_create(2); /* 2 = 1 background worker + main */
+    return s_audio_pool;
+}
+
+/* Context passed to the background audio decode thread. */
+typedef struct {
+    VideoSlot   *slot;
+    uint8_t     *mp4_copy;          /* owned copy of MP4 data */
+    size_t       mp4_copy_size;
+    uint8_t     *decoder_config;    /* owned copy of ASC blob */
+    uint32_t     decoder_config_bytes;
+    uint32_t     sample_count;
+    uint32_t     channels_est;
+    uint32_t     samplerate_hz;
+} AudioDecodeCtx;
+
+/* Forward declaration (defined below s_slots). */
+static void set_audio_status(VideoSlot *slot,
+                             JceVideoAudioStatus status,
+                             const char *text);
+
+static void audio_decode_worker(void *arg)
+{
+    AudioDecodeCtx *ctx = (AudioDecodeCtx *)arg;
+    VideoSlot *slot = ctx->slot;
+
+    JceMp4Info dummy;
+    JceMp4Parser *parser = jce_mp4_parser_open_memory(
+        ctx->mp4_copy, ctx->mp4_copy_size, &dummy);
+    if (!parser) {
+        set_audio_status(slot, JCE_VIDEO_AUDIO_STATUS_DEMUX_ERROR,
+                         "async: failed to re-open MP4 for audio");
+        goto cleanup;
+    }
+
+    {
+        JceAacDecoder *aac = jce_aac_decoder_open(
+            ctx->decoder_config, ctx->decoder_config_bytes);
+        if (!aac) {
+            set_audio_status(slot,
+                JCE_VIDEO_AUDIO_STATUS_DECODER_UNAVAILABLE,
+                "async: failed to initialize AAC decoder");
+            jce_mp4_parser_close(parser);
+            goto cleanup;
+        }
+
+        uint32_t ch_est      = ctx->channels_est > 0 ? ctx->channels_est : 2u;
+        uint32_t max_frame   = 2048u;
+        uint64_t est_samples = (uint64_t)ctx->sample_count * max_frame * ch_est;
+        uint64_t est_bytes   = est_samples * sizeof(int16_t);
+
+        if (est_bytes > JCE_VIDEO_AUDIO_PCM_MAX_BYTES) {
+            set_audio_status(slot,
+                JCE_VIDEO_AUDIO_STATUS_DECODER_UNAVAILABLE,
+                "async: audio track exceeds memory limit");
+            jce_aac_decoder_close(aac);
+            jce_mp4_parser_close(parser);
+            goto cleanup;
+        }
+
+        int16_t *pcm_buf = (int16_t *)JCE_MALLOC((size_t)est_bytes);
+        if (!pcm_buf) {
+            set_audio_status(slot,
+                JCE_VIDEO_AUDIO_STATUS_DECODER_UNAVAILABLE,
+                "async: out of memory for audio decode");
+            jce_aac_decoder_close(aac);
+            jce_mp4_parser_close(parser);
+            goto cleanup;
+        }
+
+        uint32_t pcm_pos = 0;
+        uint32_t pcm_cap = (uint32_t)est_samples;
+        bool     ok      = true;
+        uint8_t *sbuf    = NULL;
+        uint32_t sbuf_cap = 0;
+
+        for (uint32_t si = 0; si < ctx->sample_count; ++si) {
+            JceMp4SampleInfo sinfo;
+            if (!jce_mp4_parser_get_audio_sample(parser, si, &sinfo)) {
+                ok = false;
+                break;
+            }
+            if (sinfo.size_bytes > sbuf_cap) {
+                JCE_FREE(sbuf);
+                sbuf_cap = sinfo.size_bytes + 256u;
+                sbuf = (uint8_t *)JCE_MALLOC(sbuf_cap);
+                if (!sbuf) { ok = false; break; }
+            }
+            uint32_t copied = 0;
+            if (!jce_mp4_parser_copy_audio_sample(
+                    parser, si, sbuf, sbuf_cap, &copied)) {
+                ok = false;
+                break;
+            }
+            uint32_t samp_out = 0;
+            uint32_t remain   = pcm_cap - pcm_pos;
+            if (!jce_aac_decode_frame(
+                    aac, sbuf, copied,
+                    pcm_buf + pcm_pos, remain, &samp_out)) {
+                continue;
+            }
+            pcm_pos += samp_out;
+        }
+        JCE_FREE(sbuf);
+
+        if (ok && pcm_pos > 0) {
+            uint32_t ach = jce_aac_decoder_get_channels(aac);
+            uint32_t asr = jce_aac_decoder_get_samplerate(aac);
+            if (ach == 0) ach = ch_est;
+            if (asr == 0) asr = ctx->samplerate_hz;
+            uint32_t aframes = pcm_pos / ach;
+
+            size_t actual = (size_t)pcm_pos * sizeof(int16_t);
+            int16_t *trimmed = (int16_t *)JCE_REALLOC(pcm_buf, actual);
+            if (trimmed) pcm_buf = trimmed;
+
+            slot->audio_pcm            = pcm_buf;
+            slot->audio_pcm_frames     = aframes;
+            slot->audio_pcm_channels   = ach;
+            slot->audio_pcm_samplerate = asr;
+            set_audio_status(slot,
+                JCE_VIDEO_AUDIO_STATUS_READY,
+                "AAC audio decoded to PCM (async)");
+            pcm_buf = NULL;
+        } else {
+            set_audio_status(slot,
+                JCE_VIDEO_AUDIO_STATUS_DEMUX_ERROR,
+                "async: failed to decode AAC audio samples");
+        }
+        JCE_FREE(pcm_buf);
+        jce_aac_decoder_close(aac);
+        jce_mp4_parser_close(parser);
+    }
+
+cleanup:
+    JCE_FREE(ctx->mp4_copy);
+    JCE_FREE(ctx->decoder_config);
+    JCE_FREE(ctx);
+}
 
 static void set_audio_status(VideoSlot *slot,
                              JceVideoAudioStatus status,
@@ -326,6 +481,61 @@ static bool decoder_open(VideoSlot *slot, const void *data, uint32_t size,
     }
     slot->decoder.sample_idx = 1;
     slot->frame_time = normalize_frame_time(slot, 0.0, true);
+
+    /* Build keyframe index by scanning NAL headers of every sample.
+     * Done once at open time so seek can binary-search O(log n). */
+    {
+        uint32_t sc = slot->decoder.vtrack.sample_count;
+        uint32_t nls = slot->decoder.vtrack.nal_length_size;
+        uint32_t cap = (sc / 30) + 16; /* typical GOP ~30 frames */
+        uint32_t *kf = (uint32_t *)JCE_MALLOC(cap * sizeof(uint32_t));
+        uint32_t kf_count = 0;
+
+        if (kf) {
+            for (uint32_t i = 0; i < sc; i++) {
+                JceMp4SampleInfo ksi;
+                if (!jce_mp4_parser_get_video_sample(slot->decoder.parser, i, &ksi))
+                    continue;
+                if (ksi.size_bytes <= nls)
+                    continue;
+                const uint8_t *nd = slot->decoder.mp4_copy + ksi.offset;
+                /* Read the first NAL unit type only (keyframe NAL is always first). */
+                uint32_t nal_len = 0;
+                for (uint32_t b = 0; b < nls; b++)
+                    nal_len = (nal_len << 8) | nd[b];
+                if (nal_len == 0 || nal_len > ksi.size_bytes - nls)
+                    continue;
+                bool is_kf = false;
+                if (slot->decoder.h265) {
+                    uint8_t nt = (nd[nls] >> 1) & 0x3F;
+                    is_kf = (nt >= 16 && nt <= 21);
+                } else {
+                    uint8_t nt = nd[nls] & 0x1F;
+                    is_kf = (nt == 5);
+                }
+                if (is_kf) {
+                    if (kf_count >= cap) {
+                        cap = cap * 2;
+                        uint32_t *tmp = (uint32_t *)JCE_MALLOC(cap * sizeof(uint32_t));
+                        if (!tmp) break;
+                        memcpy(tmp, kf, kf_count * sizeof(uint32_t));
+                        JCE_FREE(kf);
+                        kf = tmp;
+                    }
+                    kf[kf_count++] = i;
+                }
+            }
+            slot->decoder.keyframe_indices = kf;
+            slot->decoder.keyframe_count = kf_count;
+        } else {
+            slot->decoder.keyframe_indices = NULL;
+            slot->decoder.keyframe_count = 0;
+        }
+        slot->decoder.last_seek_kf_idx = 0;
+        LOG_INFO(LOG_TAG, "keyframe index built: %u keyframes / %u samples",
+                 kf_count, sc);
+    }
+
     return true;
 }
 
@@ -419,26 +629,123 @@ static bool decoder_read_next(VideoSlot *slot)
     return true;
 }
 
+/* Check whether a video sample is a keyframe (IDR / random-access point)
+ * by inspecting NAL unit types in the bitstream data. */
+static bool is_sample_keyframe(const VideoSlot *slot, uint32_t sample_index)
+{
+    JceMp4SampleInfo si;
+    if (!jce_mp4_parser_get_video_sample(slot->decoder.parser, sample_index, &si))
+        return false;
+
+    uint32_t nls = slot->decoder.vtrack.nal_length_size;
+    if (si.size_bytes <= nls)
+        return false;
+
+    const uint8_t *data = slot->decoder.mp4_copy + si.offset;
+    uint32_t remaining = si.size_bytes;
+
+    /* Walk through all NAL units in the sample (length-prefixed). */
+    while (remaining > nls) {
+        uint32_t nal_len = 0;
+        for (uint32_t i = 0; i < nls; i++)
+            nal_len = (nal_len << 8) | data[i];
+
+        data += nls;
+        remaining -= nls;
+
+        if (nal_len == 0 || nal_len > remaining)
+            break;
+
+        if (slot->decoder.h265) {
+            /* HEVC: nal_unit_type = (byte >> 1) & 0x3F
+             * BLA_W_LP=16, BLA_W_RADL=17, BLA_N_LP=18,
+             * IDR_W_RADL=19, IDR_N_LP=20, CRA_NUT=21 */
+            uint8_t nal_type = (data[0] >> 1) & 0x3F;
+            if (nal_type >= 16 && nal_type <= 21)
+                return true;
+        } else {
+            /* H.264: nal_unit_type = byte & 0x1F
+             * IDR slice = 5 */
+            uint8_t nal_type = data[0] & 0x1F;
+            if (nal_type == 5)
+                return true;
+        }
+
+        data += nal_len;
+        remaining -= nal_len;
+    }
+    return false;
+}
+
 static bool decoder_seek(VideoSlot *slot, double time_sec, bool exact)
 {
     if (!slot || (!slot->decoder.h264 && !slot->decoder.h265)
         || !slot->decoder.parser) return false;
     if (time_sec < 0.0) time_sec = 0.0;
 
-    /* Find sample index closest to |time_sec|. */
+    /* Find sample index closest to |time_sec| via binary search. */
     uint32_t target_idx = 0;
     uint32_t sc = slot->decoder.vtrack.sample_count;
     uint32_t ts_scale = slot->decoder.vtrack.timescale;
     if (ts_scale == 0) ts_scale = 1;
 
-    for (uint32_t i = 0; i < sc; ++i) {
-        JceMp4SampleInfo si;
-        if (!jce_mp4_parser_get_video_sample(slot->decoder.parser, i, &si))
-            break;
-        double st = (double)si.timestamp / (double)ts_scale;
-        if (st > time_sec) break;
-        target_idx = i;
+    if (sc > 0) {
+        uint32_t lo = 0, hi = sc - 1;
+        while (lo < hi) {
+            uint32_t mid = lo + (hi - lo + 1) / 2;
+            JceMp4SampleInfo si;
+            if (!jce_mp4_parser_get_video_sample(slot->decoder.parser, mid, &si)) {
+                hi = mid - 1;
+                continue;
+            }
+            double st = (double)si.timestamp / (double)ts_scale;
+            if (st <= time_sec) {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        target_idx = lo;
     }
+
+    /* Find the nearest preceding keyframe via binary search on the
+     * pre-built keyframe index.  O(log k) where k = keyframe count. */
+    uint32_t keyframe_idx = 0;
+    if (slot->decoder.keyframe_indices && slot->decoder.keyframe_count > 0) {
+        const uint32_t *kf = slot->decoder.keyframe_indices;
+        uint32_t kn = slot->decoder.keyframe_count;
+        uint32_t klo = 0, khi = kn - 1;
+        while (klo < khi) {
+            uint32_t km = klo + (khi - klo + 1) / 2;
+            if (kf[km] <= target_idx)
+                klo = km;
+            else
+                khi = km - 1;
+        }
+        keyframe_idx = kf[klo];
+    } else {
+        /* Fallback: linear scan (only when index build failed). */
+        keyframe_idx = target_idx;
+        while (keyframe_idx > 0 && !is_sample_keyframe(slot, keyframe_idx))
+            keyframe_idx--;
+    }
+
+    /* For inexact seek (scrub drag), skip the expensive flush+decode
+     * cycle if we would land on the same keyframe as last time. */
+    if (!exact && keyframe_idx == slot->decoder.last_seek_kf_idx
+        && slot->frame_counter > 0) {
+        slot->time = time_sec;
+        /* Recalibrate base so post-scrub advance produces correct times. */
+        JceMp4SampleInfo tsi;
+        if (jce_mp4_parser_get_video_sample(slot->decoder.parser, target_idx, &tsi)) {
+            double target_raw = (double)tsi.timestamp / (double)ts_scale;
+            slot->decode_ts_base_sec = target_raw - time_sec;
+            slot->decode_ts_base_set = true;
+        }
+        slot->frame_time = time_sec;
+        return true;
+    }
+    slot->decoder.last_seek_kf_idx = keyframe_idx;
 
     /* Flush decoder state (discard stale reference frames). */
     if (slot->decoder.h265)
@@ -449,35 +756,52 @@ static bool decoder_seek(VideoSlot *slot, double time_sec, bool exact)
     /* Reset frame counter so normalize_frame_time re-calibrates. */
     slot->frame_counter = 0;
     slot->decode_ts_base_set = false;
-    slot->decoder.sample_idx = target_idx;
+    slot->decoder.sample_idx = keyframe_idx;
     slot->decoder.ended = false;
     slot->ended = false;
     slot->time = time_sec;
 
-    /* Decode one frame at the seek position. */
-    if (!decoder_read_next(slot)) {
-        /* May not produce a frame (non-keyframe after flush).
-         * Advance a few more samples to find a decodable frame. */
+    if (exact) {
+        /* Exact seek (on scrub release): decode from keyframe up to the
+         * target sample.  Stop once we've fed the target to keep
+         * sample_idx aligned with the displayed content. */
+        auto seek_start = std::chrono::steady_clock::now();
+        while (slot->decoder.sample_idx <= target_idx
+               && slot->decoder.sample_idx < sc) {
+            if (!decoder_read_next(slot)) {
+                if (slot->decoder.ended) break;
+            }
+            /* Cap wall-clock time to 100 ms so the UI stays responsive.
+             * advance() will finish catching up over subsequent ticks. */
+            if (std::chrono::steady_clock::now() - seek_start
+                > std::chrono::milliseconds(100))
+                break;
+        }
+    } else {
+        /* Inexact seek (during scrub drag): decode the keyframe to get
+         * one clean frame quickly. Fast feedback > frame accuracy. */
         int safety = 0;
-        while (safety < 30 && slot->decoder.sample_idx < sc) {
+        while (safety < 8 && slot->decoder.sample_idx < sc) {
             if (decoder_read_next(slot)) break;
             safety++;
         }
     }
 
-    /* If exact, keep decoding until we reach the target time. */
-    if (exact) {
-        int safety = 0;
-        while (slot->frame_time + 0.000001 < time_sec
-               && safety < 240
-               && slot->decoder.sample_idx < sc) {
-            if (!decoder_read_next(slot)) {
-                if (slot->decoder.ended) break;
-                continue;
-            }
-            ++safety;
+    /* Recalibrate decode_ts_base so that subsequent normalize_frame_time
+     * calls produce correct absolute playback timestamps.
+     * base = raw_ts[target] - time_sec, so:
+     *   normalize(raw_ts[next]) = raw_ts[next] - base
+     *                            = (raw_ts[next] - raw_ts[target]) + time_sec
+     *                            ≈ time_sec + frame_interval              */
+    {
+        JceMp4SampleInfo tsi;
+        if (jce_mp4_parser_get_video_sample(slot->decoder.parser, target_idx, &tsi)) {
+            double target_raw = (double)tsi.timestamp / (double)ts_scale;
+            slot->decode_ts_base_sec = target_raw - time_sec;
+            slot->decode_ts_base_set = true;
         }
     }
+    slot->frame_time = time_sec;
     return true;
 }
 
@@ -496,6 +820,9 @@ static void decoder_close(VideoSlot *slot)
         jce_mp4_parser_close(slot->decoder.parser);
         slot->decoder.parser = NULL;
     }
+    JCE_FREE(slot->decoder.keyframe_indices);
+    slot->decoder.keyframe_indices = NULL;
+    slot->decoder.keyframe_count = 0;
     JCE_FREE(slot->decoder.mp4_copy);
     slot->decoder.mp4_copy = NULL;
     slot->decoder.mp4_copy_size = 0;
@@ -553,100 +880,50 @@ JceVideo jce_video_load_memory(const void *data, uint32_t size,
 
             if (strcmp(atr.codec, "mp4a") == 0
                 && atr.decoder_config && atr.decoder_config_bytes > 0) {
-                /* ── AAC decode to PCM ─────────────────────────── */
-                JceAacDecoder *aac = jce_aac_decoder_open(
-                    atr.decoder_config, atr.decoder_config_bytes);
-                if (!aac) {
+                /* ── Async AAC decode to PCM ───────────────────── */
+                JceThreadPool *apool = get_audio_pool();
+                if (!apool) {
                     set_audio_status(slot,
                         JCE_VIDEO_AUDIO_STATUS_DECODER_UNAVAILABLE,
-                        "failed to initialize AAC decoder");
+                        "failed to create audio thread pool");
                 } else {
-                    uint32_t ch_est = atr.channels > 0 ? atr.channels : 2u;
-                    uint32_t max_frame = 2048u; /* covers SBR */
-                    uint64_t est_samples = (uint64_t)atr.sample_count
-                                         * max_frame * ch_est;
-                    uint64_t est_bytes = est_samples * sizeof(int16_t);
-
-                    if (est_bytes > JCE_VIDEO_AUDIO_PCM_MAX_BYTES) {
+                    AudioDecodeCtx *actx = (AudioDecodeCtx *)JCE_MALLOC(
+                        sizeof(AudioDecodeCtx));
+                    if (!actx) {
                         set_audio_status(slot,
                             JCE_VIDEO_AUDIO_STATUS_DECODER_UNAVAILABLE,
-                            "audio track exceeds memory limit; video-only");
+                            "out of memory for audio decode context");
                     } else {
-                        int16_t *pcm_buf = (int16_t *)JCE_MALLOC(
-                            (size_t)est_bytes);
-                        if (!pcm_buf) {
+                        /* Copy MP4 data for the background thread's parser. */
+                        actx->mp4_copy = (uint8_t *)JCE_MALLOC(size);
+                        actx->decoder_config = (uint8_t *)JCE_MALLOC(
+                            atr.decoder_config_bytes);
+                        if (!actx->mp4_copy || !actx->decoder_config) {
+                            JCE_FREE(actx->mp4_copy);
+                            JCE_FREE(actx->decoder_config);
+                            JCE_FREE(actx);
                             set_audio_status(slot,
                                 JCE_VIDEO_AUDIO_STATUS_DECODER_UNAVAILABLE,
-                                "out of memory for audio decode");
+                                "out of memory for async audio data copy");
                         } else {
-                            uint32_t pcm_pos = 0;
-                            uint32_t pcm_cap = (uint32_t)est_samples;
-                            bool     ok      = true;
-                            uint8_t *sbuf    = NULL;
-                            uint32_t sbuf_cap = 0;
+                            memcpy(actx->mp4_copy, data, size);
+                            actx->mp4_copy_size = (size_t)size;
+                            memcpy(actx->decoder_config, atr.decoder_config,
+                                   atr.decoder_config_bytes);
+                            actx->decoder_config_bytes = atr.decoder_config_bytes;
+                            actx->sample_count   = atr.sample_count;
+                            actx->channels_est   = atr.channels;
+                            actx->samplerate_hz  = atr.samplerate_hz;
+                            actx->slot           = slot;
 
-                            for (uint32_t si = 0; si < atr.sample_count; ++si) {
-                                JceMp4SampleInfo sinfo;
-                                if (!jce_mp4_parser_get_audio_sample(
-                                        parser, si, &sinfo)) {
-                                    ok = false;
-                                    break;
-                                }
-                                if (sinfo.size_bytes > sbuf_cap) {
-                                    JCE_FREE(sbuf);
-                                    sbuf_cap = sinfo.size_bytes + 256u;
-                                    sbuf = (uint8_t *)JCE_MALLOC(sbuf_cap);
-                                    if (!sbuf) { ok = false; break; }
-                                }
-                                uint32_t copied = 0;
-                                if (!jce_mp4_parser_copy_audio_sample(
-                                        parser, si, sbuf,
-                                        sbuf_cap, &copied)) {
-                                    ok = false;
-                                    break;
-                                }
-                                uint32_t samp_out = 0;
-                                uint32_t remain   = pcm_cap - pcm_pos;
-                                if (!jce_aac_decode_frame(
-                                        aac, sbuf, copied,
-                                        pcm_buf + pcm_pos,
-                                        remain, &samp_out)) {
-                                    continue; /* skip bad frames */
-                                }
-                                pcm_pos += samp_out;
-                            }
-                            JCE_FREE(sbuf);
-
-                            if (ok && pcm_pos > 0) {
-                                uint32_t ach = jce_aac_decoder_get_channels(aac);
-                                uint32_t asr = jce_aac_decoder_get_samplerate(aac);
-                                if (ach == 0) ach = ch_est;
-                                if (asr == 0) asr = atr.samplerate_hz;
-                                uint32_t aframes = pcm_pos / ach;
-
-                                /* Trim buffer to actual size. */
-                                size_t actual = (size_t)pcm_pos * sizeof(int16_t);
-                                int16_t *trimmed = (int16_t *)JCE_REALLOC(
-                                    pcm_buf, actual);
-                                if (trimmed) pcm_buf = trimmed;
-
-                                slot->audio_pcm            = pcm_buf;
-                                slot->audio_pcm_frames     = aframes;
-                                slot->audio_pcm_channels   = ach;
-                                slot->audio_pcm_samplerate = asr;
-                                set_audio_status(slot,
-                                    JCE_VIDEO_AUDIO_STATUS_READY,
-                                    "AAC audio decoded to PCM");
-                                pcm_buf = NULL; /* ownership transferred */
-                            } else {
-                                set_audio_status(slot,
-                                    JCE_VIDEO_AUDIO_STATUS_DEMUX_ERROR,
-                                    "failed to decode AAC audio samples");
-                            }
-                            JCE_FREE(pcm_buf);
+                            set_audio_status(slot,
+                                JCE_VIDEO_AUDIO_STATUS_DECODING,
+                                "decoding AAC audio in background...");
+                            slot->audio_task =
+                                jce_thread_pool_submit_tracked(
+                                    apool, audio_decode_worker, actx);
                         }
                     }
-                    jce_aac_decoder_close(aac);
                 }
             } else if (strcmp(atr.codec, "mp4a") == 0) {
                 set_audio_status(slot,
@@ -715,6 +992,13 @@ void jce_video_unload(JceVideo v)
 {
     VideoSlot *slot = slot_from_handle(v);
     if (!slot) return;
+
+    /* Wait for background audio decode to finish before freeing. */
+    if (slot->audio_task) {
+        jce_task_wait(slot->audio_task);
+        jce_task_free(slot->audio_task);
+        slot->audio_task = NULL;
+    }
 
     decoder_close(slot);
 
@@ -896,9 +1180,8 @@ void jce_video_seek(JceVideo v, double time_sec, bool exact)
         slot->ended = false;
     }
     slot->post_seek = false;
-    /* Force frame_time to match the seek target so advance() does not
-     * stall trying to catch up from a stale pre-seek timestamp. */
-    slot->frame_time = time_sec;
+    /* decoder_seek already sets frame_time and recalibrates
+     * decode_ts_base_sec using the target sample's timestamp. */
 }
 
 void jce_video_rewind(JceVideo v)

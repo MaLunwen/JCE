@@ -10,6 +10,7 @@
  */
 
 #include "jce_h265_decode.h"
+#include "jce_yuv_convert.h"
 #include "core/jce_memory.h"
 #include <jce/core/jce_log.h>
 
@@ -47,41 +48,6 @@ static void jce_hevc_aligned_free(void *pv_mem_ctxt, void *pv_buf)
 #else
     free(pv_buf);
 #endif
-}
-
-/* ── YUV420P → RGBA8 ─────────────────────────────────────────────── */
-
-static void yuv420_to_rgba(const uint8_t *y_plane, int y_stride,
-                           const uint8_t *u_plane, int u_stride,
-                           const uint8_t *v_plane, int v_stride,
-                           uint8_t *rgba, uint32_t width, uint32_t height)
-{
-    for (uint32_t row = 0; row < height; ++row) {
-        const uint8_t *yp = y_plane + row * y_stride;
-        const uint8_t *up = u_plane + (row / 2) * u_stride;
-        const uint8_t *vp = v_plane + (row / 2) * v_stride;
-        uint8_t *dst = rgba + row * width * 4;
-
-        for (uint32_t col = 0; col < width; ++col) {
-            int y = (int)yp[col] - 16;
-            int u = (int)up[col / 2] - 128;
-            int v = (int)vp[col / 2] - 128;
-
-            int c = y * 298;
-            int r = (c + 409 * v + 128) >> 8;
-            int g = (c - 100 * u - 208 * v + 128) >> 8;
-            int b = (c + 516 * u + 128) >> 8;
-
-            if (r < 0) r = 0; if (r > 255) r = 255;
-            if (g < 0) g = 0; if (g > 255) g = 255;
-            if (b < 0) b = 0; if (b > 255) b = 255;
-
-            dst[col * 4 + 0] = (uint8_t)r;
-            dst[col * 4 + 1] = (uint8_t)g;
-            dst[col * 4 + 2] = (uint8_t)b;
-            dst[col * 4 + 3] = 255;
-        }
-    }
 }
 
 /* ── hvcC / HVCC → Annex B helpers ────────────────────────────────── */
@@ -542,7 +508,7 @@ bool jce_h265_decode_frame(JceH265Decoder *dec,
         dec->rgba_cap = rgba_size;
     }
 
-    yuv420_to_rgba(
+    jce_yuv420_to_rgba(
         (const uint8_t *)yuv.pv_y_buf, (int)yuv.u4_y_strd,
         (const uint8_t *)yuv.pv_u_buf, (int)yuv.u4_u_strd,
         (const uint8_t *)yuv.pv_v_buf, (int)yuv.u4_v_strd,

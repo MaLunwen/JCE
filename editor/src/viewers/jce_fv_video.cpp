@@ -181,27 +181,8 @@ static VideoState *ensure_loaded(FvTab *tab)
              st->info.duration);
 
     /* ── Embedded audio ──────────────────────────────────────────── */
-    uint32_t pcm_frames = 0, pcm_ch = 0, pcm_rate = 0;
-    const int16_t *pcm = jce_video_get_audio_pcm(st->video,
-                                                  &pcm_frames, &pcm_ch, &pcm_rate);
-    if (pcm && pcm_frames > 0 && pcm_ch > 0 && pcm_rate > 0) {
-        st->audio = jce_audio_create();
-        if (st->audio) {
-            uint32_t pcm_size = pcm_frames * pcm_ch * (uint32_t)sizeof(int16_t);
-            st->sound = jce_audio_load_pcm(st->audio, pcm, pcm_size,
-                                            (uint16_t)pcm_ch, pcm_rate, 16);
-            if (st->sound != JCE_SOUND_INVALID) {
-                st->audio_available = true;
-                /* Auto-play audio in sync with auto-playing video. */
-                if (st->playing)
-                    st->voice = jce_audio_play(st->audio, st->sound,
-                                                false, 1.0f, 1.0f);
-            } else {
-                jce_audio_destroy(st->audio);
-                st->audio = nullptr;
-            }
-        }
-    }
+    /* Audio is now decoded asynchronously in the background.
+     * We check for readiness each frame in tick_playback(). */
 
     return st;
 }
@@ -255,6 +236,33 @@ static void tick_playback(VideoState *st, bool ui_focused)
     }
 
     if (!st->playing) return;
+
+    /* ── Deferred audio setup (async decode may have finished) ──── */
+    if (!st->audio_available && st->video != JCE_VIDEO_INVALID) {
+        JceVideoAudioStatus astatus = jce_video_get_audio_status(st->video);
+        if (astatus == JCE_VIDEO_AUDIO_STATUS_READY) {
+            uint32_t pcm_frames = 0, pcm_ch = 0, pcm_rate = 0;
+            const int16_t *pcm = jce_video_get_audio_pcm(st->video,
+                                                          &pcm_frames, &pcm_ch, &pcm_rate);
+            if (pcm && pcm_frames > 0 && pcm_ch > 0 && pcm_rate > 0) {
+                st->audio = jce_audio_create();
+                if (st->audio) {
+                    uint32_t pcm_size = pcm_frames * pcm_ch * (uint32_t)sizeof(int16_t);
+                    st->sound = jce_audio_load_pcm(st->audio, pcm, pcm_size,
+                                                    (uint16_t)pcm_ch, pcm_rate, 16);
+                    if (st->sound != JCE_SOUND_INVALID) {
+                        st->audio_available = true;
+                        if (st->playing)
+                            st->voice = jce_audio_play(st->audio, st->sound,
+                                                        false, 1.0f, 1.0f);
+                    } else {
+                        jce_audio_destroy(st->audio);
+                        st->audio = nullptr;
+                    }
+                }
+            }
+        }
+    }
 
     if (jce_video_has_ended(st->video)) {
         st->playing = false;
@@ -369,6 +377,28 @@ void fv_video_update_focus(const char *active_tab_path, bool allow_playback)
     }
 }
 
+void fv_video_request_play(const char *path)
+{
+    if (!path) return;
+    VideoState *st = find_state(path);
+    if (!st || !st->loaded || st->playing) return;
+    if (st->video == JCE_VIDEO_INVALID || st->info.metadata_only) return;
+
+    stop_other_playback(st->path);
+    if (jce_video_has_ended(st->video)) {
+        jce_video_rewind(st->video);
+        if (st->audio_available && st->voice != JCE_VOICE_INVALID)
+            jce_audio_seek(st->audio, st->voice, 0.0f);
+    }
+    if (st->audio_available) {
+        if (st->voice == JCE_VOICE_INVALID)
+            st->voice = jce_audio_play(st->audio, st->sound, false, 1.0f, 1.0f);
+        else
+            jce_audio_resume(st->audio, st->voice);
+    }
+    st->playing = true;
+}
+
 /* ── Render ───────────────────────────────────────────────────────── */
 
 void fv_render_video(FvTab *tab)
@@ -447,9 +477,6 @@ void fv_render_video(FvTab *tab)
             "%s  |  %.1f KB", tab->display_name, kb);
     }
 
-    if (has_video && !ui_focused)
-        ImGui::TextDisabled("Playback pauses when viewer is not focused");
-
     /* ── Seek slider ─────────────────────────────────────────────── */
 
     ImGui::PushItemWidth(-1);
@@ -472,6 +499,28 @@ void fv_render_video(FvTab *tab)
     ImGui::PopItemWidth();
 
     ImGui::Text("%.2fs / %.2fs", cur_time, dur);
+
+    /* Space key toggles play/pause when the file viewer is focused. */
+    if (can_decode && ui_focused && ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
+        if (!st->playing) {
+            stop_other_playback(st->path);
+            if (jce_video_has_ended(st->video)) {
+                jce_video_rewind(st->video);
+                if (st->audio_available && st->voice != JCE_VOICE_INVALID)
+                    jce_audio_seek(st->audio, st->voice, 0.0f);
+            }
+            if (st->audio_available) {
+                if (st->voice == JCE_VOICE_INVALID)
+                    st->voice = jce_audio_play(st->audio, st->sound,
+                                                false, 1.0f, 1.0f);
+                else
+                    jce_audio_resume(st->audio, st->voice);
+            }
+            st->playing = true;
+        } else {
+            pause_state_playback(st);
+        }
+    }
 
     ImGui::Separator();
 
@@ -511,6 +560,7 @@ void fv_render_video(FvTab *tab)
 
         ImGui::SetCursorScreenPos(
             ImVec2(origin.x, origin.y + avail.y));
+        ImGui::Dummy(ImVec2(0, 0));
     } else {
         /* Placeholder when no frame has been decoded yet, or on load failure. */
         ImVec2 origin = ImGui::GetCursorScreenPos();
