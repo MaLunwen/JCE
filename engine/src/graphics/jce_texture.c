@@ -286,24 +286,62 @@ JceTexture jce_texture_from_rgba(const void *data,
     if (!data || width == 0 || height == 0)
         return JCE_TEXTURE_INVALID;
 
-    const bgfx_memory_t *mem = bgfx_alloc(width * height * 4);
-    memcpy(mem->data, data, width * height * 4);
-
     bgfx_texture_handle_t handle = bgfx_create_texture_2d(
         (uint16_t)width, (uint16_t)height,
         false, 1,
         BGFX_TEXTURE_FORMAT_RGBA8,
         BGFX_TEXTURE_NONE | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
-        mem);
+        NULL);
 
     if (handle.idx == UINT16_MAX)
         return JCE_TEXTURE_INVALID;
 
     registry_add(handle.idx, width, height);
 
+    const uint32_t bytes = width * height * 4u;
+    const bgfx_memory_t *mem = bgfx_alloc(bytes);
+    memcpy(mem->data, data, bytes);
+    bgfx_update_texture_2d(handle,
+                           0, /* layer */
+                           0, /* mip */
+                           0, /* x */
+                           0, /* y */
+                           (uint16_t)width,
+                           (uint16_t)height,
+                           mem,
+                           (uint16_t)(width * 4u));
+
     JceTexture tex;
     tex.idx = handle.idx;
     return tex;
+}
+
+bool jce_texture_update_rgba(JceTexture tex, const void *data,
+                             uint32_t width, uint32_t height)
+{
+    if (!jce_texture_valid(tex) || !data || width == 0 || height == 0)
+        return false;
+
+    TexEntry *e = registry_find(tex.idx);
+    if (!e || e->width != width || e->height != height)
+        return false;
+
+    const uint32_t bytes = width * height * 4u;
+    const bgfx_memory_t *mem = bgfx_alloc(bytes);
+    memcpy(mem->data, data, bytes);
+
+    bgfx_texture_handle_t handle;
+    handle.idx = tex.idx;
+    bgfx_update_texture_2d(handle,
+                           0, /* layer */
+                           0, /* mip */
+                           0, /* x */
+                           0, /* y */
+                           (uint16_t)width,
+                           (uint16_t)height,
+                           mem,
+                           (uint16_t)(width * 4u));
+    return true;
 }
 
 void jce_texture_get_size(JceTexture tex, uint32_t *w, uint32_t *h)

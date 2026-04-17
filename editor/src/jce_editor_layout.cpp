@@ -525,9 +525,10 @@ void jce_editor_layout_draw(void)
         s_reset_layout_requested = false;
         /* Re-enable all panels. */
         for (int p = 0; p < JCE_PANEL_COUNT; p++) {
-            if (p != JCE_PANEL_PREFERENCES)
+            if (p != JCE_PANEL_PREFERENCES && p != JCE_PANEL_POSTFX)
                 *jce_editor_panel_visible_ptr((JceEditorPanel)p) = true;
         }
+        *jce_editor_panel_visible_ptr(JCE_PANEL_POSTFX) = false;
         setup_default_docking_layout(dockspace_id);
         s_deferred_focus_frames = 3;
     }

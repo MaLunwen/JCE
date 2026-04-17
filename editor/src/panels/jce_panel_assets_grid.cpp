@@ -5,6 +5,17 @@
 #include "jce_panel_assets_internal.h"
 #include "jce_editor_file_util.h"
 
+static void open_asset_in_file_viewer(const char *path)
+{
+    if (!path || !path[0]) {
+        return;
+    }
+
+    jce_file_viewer_open(path);
+    jce_file_viewer_request_focus();
+    jce_editor_layout_request_focus_file_viewer();
+}
+
 /* ── Single grid item ────────────────────────────────────────────── */
 
 void draw_asset_grid_item(const FileEntry &fe, int index,
@@ -219,9 +230,12 @@ void draw_asset_grid_item(const FileEntry &fe, int index,
 
     bool repeated_click_open_dir =
         clicked && fe.is_dir && !ctrl && !shift && was_selected_before_click;
+    bool repeated_click_open_file =
+        clicked && !fe.is_dir && !ctrl && !shift && was_selected_before_click;
 
     /* Double click: navigate or open. */
-    if (repeated_click_open_dir || (cell_hovered && ImGui::IsMouseDoubleClicked(0))) {
+    if (repeated_click_open_dir || repeated_click_open_file
+        || (cell_hovered && ImGui::IsMouseDoubleClicked(0))) {
         if (fe.is_dir) {
             navigate_asset_directory(fe.path, true);
         } else {
@@ -233,8 +247,7 @@ void draw_asset_grid_item(const FileEntry &fe, int index,
                 if (sep != std::string::npos) dir.resize(sep);
                 jce_editor_scene_set_scene_dir(dir.c_str());
             } else {
-                jce_file_viewer_open(fe.path.c_str());
-                jce_editor_layout_request_focus_file_viewer();
+                open_asset_in_file_viewer(fe.path.c_str());
             }
         }
     }
@@ -282,8 +295,7 @@ void draw_asset_item_context_menu(const std::vector<FileEntry> &display_entries)
                 if (cfe->is_dir) {
                     navigate_asset_directory(cfe->path, false);
                 } else {
-                    jce_file_viewer_open(cfe->path.c_str());
-                    jce_editor_layout_request_focus_file_viewer();
+                    open_asset_in_file_viewer(cfe->path.c_str());
                 }
             }
         }

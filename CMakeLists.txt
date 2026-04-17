@@ -123,6 +123,8 @@ find_package(box2d        REQUIRED)
 find_package(Bullet       REQUIRED)
 find_package(enet         REQUIRED)
 find_package(protobuf     REQUIRED)
+find_package(fdk-aac      REQUIRED)
+find_package(openh264     REQUIRED)
 
 # Ensure protoc comes from the Conan package, not a system/conda protoc.
 # Conan sets protobuf_PACKAGE_FOLDER_RELEASE after find_package(protobuf).

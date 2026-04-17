@@ -1036,6 +1036,7 @@ static void handle_marquee_selection(const SceneViewCtx *ctx,
     if (!s_sel_pending) return;
     s_sel_pending = false;
 
+    bool hit_any = false;
     bool add_mode = ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift;
     if (!add_mode) jce_state_clear_selection();
 
@@ -1109,11 +1110,13 @@ static void handle_marquee_selection(const SceneViewCtx *ctx,
         if (bb_max_x >= s_sel_rect_min.x && bb_min_x <= s_sel_rect_max.x &&
             bb_max_y >= s_sel_rect_min.y && bb_min_y <= s_sel_rect_max.y)
         {
+            hit_any = true;
             jce_state_select_entity(meid, true);
         }
     }
     jce_editor_inspector_request_sync();
-    jce_editor_layout_request_focus_inspector();
+    if (hit_any)
+        jce_editor_layout_request_focus_inspector();
 }
 
 /* Single-click ray pick. */

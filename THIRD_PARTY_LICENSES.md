@@ -65,14 +65,13 @@ freely, subject to the following restrictions:
 ## FreeType
 
 - **Version**: 2.13.2
-- **License**: FreeType License (FTL) or GPLv2
+- **License**: FreeType License (FTL) [selected]
 - **URL**: https://freetype.org/
 
 ```
 Copyright (C) 1996-2023 David Turner, Robert Wilhelm, and Werner Lemberg.
 
-Licensed under the FreeType License (FTL), a BSD-style license,
-or the GNU General Public License version 2 (GPLv2).
+This project uses the FreeType License (FTL) option.
 
 See https://freetype.org/license.html for the full license text.
 ```
@@ -287,6 +286,90 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+```
+
+---
+
+## minimp4
+
+- **Version**: master (commit 4575afb)
+- **License**: CC0-1.0 (Public Domain Dedication)
+- **URL**: https://github.com/lieff/minimp4
+
+```
+To the extent possible under law, the author(s) have dedicated all
+copyright and related and neighboring rights to this software to the
+public domain worldwide.
+
+This software is distributed without any warranty.
+
+CC0 1.0 Universal full text:
+https://creativecommons.org/publicdomain/zero/1.0/
+
+Project license file:
+https://github.com/lieff/minimp4/blob/master/LICENSE
+```
+
+---
+
+## Fraunhofer FDK AAC (libfdk_aac)
+
+- **Version**: 2.0.3
+- **License**: Apache-2.0 (with patent notice)
+- **URL**: https://github.com/mstorsjo/fdk-aac
+
+```
+Copyright (C) 2012-2023 Fraunhofer-Gesellschaft zur Foerderung der
+angewandten Forschung e.V. and Contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+Full license and patent notices:
+https://github.com/mstorsjo/fdk-aac/blob/master/NOTICE
+```
+
+---
+
+## OpenH264
+
+- **Version**: 2.6.0
+- **License**: BSD-2-Clause
+- **URL**: https://github.com/cisco/openh264
+
+```
+Copyright (c) 2013, Cisco Systems
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice, this
+  list of conditions and the following disclaimer in the documentation and/or
+  other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
 ---
@@ -798,4 +881,28 @@ LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
 ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+---
+
+## AOSP libhevc (Android Open Source Project)
+
+- **Version**: android-platform-15.0.0_r1 (vendored source)
+- **License**: Apache-2.0
+- **URL**: https://android.googlesource.com/platform/external/libhevc/
+
+```
+Copyright (c) 2012-2025 The Android Open Source Project
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
 ```

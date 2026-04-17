@@ -57,6 +57,8 @@ class JCEConan(ConanFile):
         self.requires("cglm/0.9.1")
 
         self.requires("miniaudio/0.11.22")
+        self.requires("libfdk_aac/2.0.3")
+        self.requires("openh264/2.6.0")
 
         self.requires("imgui/1.92.6-docking")
         self.requires("flecs/4.1.1")

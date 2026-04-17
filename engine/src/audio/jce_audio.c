@@ -7,6 +7,7 @@
  */
 
 #include <jce/audio/jce_audio.h>
+#include <jce/audio/jce_m4a_decode.h>
 #include <jce/core/pak_loader.h>
 #include <jce/resource/jce_asset_format.h>
 #include <jce/core/jce_log.h>
@@ -131,19 +132,66 @@ static JceSound load_from_memory(JceAudio *audio, int slot,
                                   const uint8_t *data, size_t size,
                                   const char *path)
 {
+    /* ── M4A / AAC-in-MP4 detection ─────────────────────────────── */
+    if (jce_m4a_is_mp4_container(data, size)) {
+        int16_t *pcm = NULL;
+        uint32_t frames = 0, ch = 0, sr = 0;
+        if (jce_m4a_decode_to_pcm(data, size, &pcm, &frames, &ch, &sr)) {
+            audio->sounds[slot].pcm_data    = pcm;
+            audio->sounds[slot].frame_count = (ma_uint64)frames;
+            audio->sounds[slot].channels    = ch;
+            audio->sounds[slot].sample_rate = sr;
+            audio->sound_used[slot]         = true;
+            LOG_DEBUG("jce_audio", "loaded M4A '%s' (%u Hz, %uch, %u frames)",
+                      path, sr, ch, frames);
+            return (JceSound)(slot + 1);
+        }
+        LOG_WARN("jce_audio", "M4A decode failed for '%s', trying miniaudio", path);
+        /* Fall through to miniaudio as last resort. */
+    }
+
     ma_decoder_config cfg = ma_decoder_config_init(
         ma_format_s16, 0 /* auto channels */, 0 /* auto sample rate */);
     ma_decoder decoder;
 
-    /* Hint the encoding format if we can detect it from the extension. */
-    if (size >= 4 && data[0] == 'O' && data[1] == 'g' && data[2] == 'g' && data[3] == 'S')
+    /* Hint the encoding format from magic bytes so miniaudio picks
+       the correct built-in decoder (dr_mp3, dr_wav, dr_flac, stb_vorbis). */
+    if (size >= 4 && data[0] == 'O' && data[1] == 'g'
+                  && data[2] == 'g' && data[3] == 'S') {
         cfg.encodingFormat = ma_encoding_format_vorbis;
+    } else if (size >= 4 && data[0] == 'f' && data[1] == 'L'
+                         && data[2] == 'a' && data[3] == 'C') {
+        cfg.encodingFormat = ma_encoding_format_flac;
+    } else if (size >= 4 && data[0] == 'R' && data[1] == 'I'
+                         && data[2] == 'F' && data[3] == 'F') {
+        cfg.encodingFormat = ma_encoding_format_wav;
+    } else if (size >= 3 && data[0] == 'I' && data[1] == 'D'
+                         && data[2] == '3') {
+        /* ID3v2 tag header — almost always an MP3 file. */
+        cfg.encodingFormat = ma_encoding_format_mp3;
+    } else if (size >= 2 && data[0] == 0xFF
+               && (data[1] & 0xE0) == 0xE0) {
+        /* MPEG audio sync word (0xFFE0+): MP3 / MP2 / MP1. */
+        cfg.encodingFormat = ma_encoding_format_mp3;
+    }
 
     ma_result res = ma_decoder_init_memory(data, size, &cfg, &decoder);
+
+    /* If the hinted format failed, retry with auto-detection. */
+    if (res != MA_SUCCESS && cfg.encodingFormat != ma_encoding_format_unknown) {
+        cfg.encodingFormat = ma_encoding_format_unknown;
+        res = ma_decoder_init_memory(data, size, &cfg, &decoder);
+    }
     if (res != MA_SUCCESS) {
+        /* Log the first bytes to help diagnose unsupported files. */
+        char hdr[48] = {0};
+        size_t hlen = size < 16 ? size : 16;
+        for (size_t i = 0; i < hlen; ++i) {
+            snprintf(hdr + i * 3, sizeof(hdr) - i * 3, "%02X ", data[i]);
+        }
         LOG_ERROR("jce_audio",
-            "decode failed for '%s' (ma_result=%d, size=%zu)",
-            path, (int)res, size);
+            "decode failed for '%s' (ma_result=%d, size=%zu, header=[%s])",
+            path, (int)res, size, hdr);
         return JCE_SOUND_INVALID;
     }
 

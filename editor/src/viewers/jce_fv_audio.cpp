@@ -187,6 +187,12 @@ static AudioState *ensure_loaded(FvTab *tab)
                                               &st->pcm_frame_count,
                                               &st->pcm_channels);
     st->loaded   = true;
+
+    /* Auto-play on load (same behaviour as the video viewer). */
+    stop_other_playback(tab->path);
+    st->voice = jce_audio_play(st->audio, st->sound, false, 1.0f, 1.0f);
+    st->playing = (st->voice != JCE_VOICE_INVALID);
+
     return st;
 }
 

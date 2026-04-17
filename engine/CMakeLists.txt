@@ -105,10 +105,20 @@ _jce_add_layer(jce_platform
 # L3 — Independent subsystems (depend only on L0)                     #
 # ================================================================== #
 
+# AOSP libhevc decoder (Apache-2.0, static library)
+add_subdirectory(
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/video/third_party/libhevc/jce_build"
+	"${CMAKE_CURRENT_BINARY_DIR}/libhevcdec")
+
+_jce_add_layer(jce_video
+	DIRS      video
+	LINK_PUBLIC jce_core
+	LINK_PRIVATE FDK-AAC::fdk-aac openh264::openh264 libhevcdec)
+
 _jce_add_layer(jce_audio
 	DIRS      audio
 	LINK_PUBLIC  jce_core
-	LINK_PRIVATE miniaudio::miniaudio)
+	LINK_PRIVATE miniaudio::miniaudio FDK-AAC::fdk-aac jce_video)
 
 # On Apple platforms, miniaudio includes AVFoundation (Objective-C).
 if(APPLE)
@@ -250,6 +260,7 @@ target_link_libraries(JCE INTERFACE
 	jce_core
 	jce_platform
 	jce_audio
+	jce_video
 	jce_physics
 	jce_animation
 	jce_ai

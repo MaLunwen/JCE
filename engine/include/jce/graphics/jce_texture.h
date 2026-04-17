@@ -34,6 +34,11 @@ JceTexture jce_texture_load_from_surface(const SDL_Surface *surf, int sampler_mo
 JceTexture jce_texture_from_rgba(const void *data,
                                   uint32_t width, uint32_t height);
 
+/* Update an existing RGBA8 texture in-place.
+   Returns false when the handle is invalid, dimensions mismatch, or upload fails. */
+bool       jce_texture_update_rgba(JceTexture tex, const void *data,
+                                   uint32_t width, uint32_t height);
+
 /* Get texture dimensions (0 on invalid handle). */
 void       jce_texture_get_size(JceTexture tex, uint32_t *w, uint32_t *h);
 

@@ -82,6 +82,8 @@ static void fv_close_tab(int idx)
         fv_model_close_tab(tab->path);
     if (tab->type == JCE_FV_AUDIO)
         fv_audio_close_tab(tab);
+    if (tab->type == JCE_FV_VIDEO)
+        fv_video_close_tab(tab);
     fv_code_close_tab(tab);
 
     if (jce_texture_valid(tab->gpu_tex))
@@ -151,6 +153,14 @@ static JceFileViewerType fv_detect_ext(const char *ext)
         || strcmp(ext, ".mp3") == 0 || strcmp(ext, ".flac") == 0)
         return JCE_FV_AUDIO;
 
+    if (strcmp(ext, ".mp4") == 0 || strcmp(ext, ".m4v") == 0
+        || strcmp(ext, ".webm") == 0 || strcmp(ext, ".mov") == 0
+        || strcmp(ext, ".mkv") == 0 || strcmp(ext, ".avi") == 0
+        || strcmp(ext, ".flv") == 0 || strcmp(ext, ".wmv") == 0
+        || strcmp(ext, ".mpg") == 0 || strcmp(ext, ".mpeg") == 0
+        || strcmp(ext, ".3gp") == 0 || strcmp(ext, ".ogv") == 0)
+        return JCE_FV_VIDEO;
+
     return JCE_FV_BINARY;
 }
 
@@ -160,6 +170,51 @@ static bool fv_looks_like_text(const char *data, int len)
     for (int i = 0; i < check; i++)
         if (data[i] == '\0') return false;
     return true;
+}
+
+static void fv_open_info_tab(const char *open_path,
+                             const char *name,
+                             const char *ext,
+                             long file_size,
+                             const char *message)
+{
+    size_t msg_len;
+    char *buf;
+    FvTab *tab;
+
+    if (!open_path || !name || !message) {
+        return;
+    }
+
+    if (s_fv.tab_count >= FV_MAX_TABS)
+        fv_close_tab(0);
+    if (s_fv.tab_count >= FV_MAX_TABS)
+        return;
+
+    msg_len = strlen(message);
+    buf = (char *)ED_MALLOC(msg_len + 1u);
+    if (!buf) {
+        return;
+    }
+    memcpy(buf, message, msg_len + 1u);
+
+    tab = &s_fv.tabs[s_fv.tab_count];
+    memset(tab, 0, sizeof(*tab));
+    snprintf(tab->path, sizeof(tab->path), "%s", open_path);
+    snprintf(tab->display_name, sizeof(tab->display_name), "%s", name);
+    snprintf(tab->ext, sizeof(tab->ext), "%s", ext ? ext : "");
+    tab->content = buf;
+    tab->content_len = (int)msg_len;
+    tab->file_size = file_size;
+    tab->type = JCE_FV_TEXT;
+    tab->open = true;
+    tab->gpu_tex.idx = UINT16_MAX;
+    tab->zoom = 1.0f;
+
+    s_fv.active_tab = s_fv.tab_count;
+    s_fv.tab_count++;
+    s_fv.want_focus = true;
+    *jce_editor_panel_visible_ptr(JCE_PANEL_FILE_VIEWER) = true;
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -242,10 +297,22 @@ void jce_file_viewer_open(const char *path)
     }
 
     if (file_size > FV_MAX_ASSET_BYTES) {
+        char info_msg[384];
         fclose(fp);
         jce_editor_console_log_level(JCE_CONSOLE_WARNING,
             "file viewer: '%s' is too large (%ld bytes). Max single asset is %d MB.",
             open_path, file_size, FV_MAX_ASSET_BYTES / (1024 * 1024));
+
+        snprintf(info_msg, sizeof(info_msg),
+            "Preview unavailable for this file.\n\n"
+            "Path: %s\n"
+            "Size: %.2f MB\n"
+            "Limit: %d MB\n\n"
+            "The file exceeds the File Viewer preview size limit.",
+            open_path,
+            (double)file_size / (1024.0 * 1024.0),
+            FV_MAX_ASSET_BYTES / (1024 * 1024));
+        fv_open_info_tab(open_path, name, ext, file_size, info_msg);
         return;
     }
 
@@ -256,6 +323,14 @@ void jce_file_viewer_open(const char *path)
         read_size = (int)file_size;
     else if (ftype == JCE_FV_AUDIO)
         read_size = (int)file_size;
+    else if (ftype == JCE_FV_VIDEO) {
+        /* Video is decoded in-engine (jce_video) from the full byte
+         * buffer.  Respect the shared FV_MAX_ASSET_BYTES (200 MB) cap
+         * that also governs audio/model loads. */
+        const long video_cap = FV_MAX_ASSET_BYTES;
+        read_size = (file_size > video_cap) ? (int)video_cap
+                                            : (int)file_size;
+    }
     else if (ftype == JCE_FV_MODEL) {
         /* Keep model bytes up to the global per-asset cap so GLB files
          * can be inspected consistently in the model viewer. */
@@ -405,6 +480,7 @@ void jce_file_viewer_draw_content(void)
     const bool file_viewer_focused =
         ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
     const char *active_audio_path = NULL;
+    const char *active_video_path = NULL;
 
     if (s_fv.want_focus) {
         ImGui::SetWindowFocus();
@@ -423,6 +499,7 @@ void jce_file_viewer_draw_content(void)
         ImGui::SetCursorPosX((w - hsz.x) * 0.5f);
         ImGui::TextDisabled("%s", hint);
         fv_audio_update_focus(NULL, false);
+        fv_video_update_focus(NULL, false);
         return;
     }
 
@@ -514,6 +591,10 @@ void jce_file_viewer_draw_content(void)
                     active_audio_path = tab->path;
                     fv_render_audio(tab);
                     break;
+                case JCE_FV_VIDEO:
+                    active_video_path = tab->path;
+                    fv_render_video(tab);
+                    break;
                 case JCE_FV_BINARY:   fv_render_hex(tab);      break;
                 default:              fv_render_code(tab);      break;
                 }
@@ -532,12 +613,14 @@ void jce_file_viewer_draw_content(void)
     }
 
     fv_audio_update_focus(active_audio_path, file_viewer_focused);
+    fv_video_update_focus(active_video_path, file_viewer_focused);
 }
 
 void jce_file_viewer_draw_window(bool *p_visible)
 {
     if (!p_visible || !*p_visible) {
         fv_audio_update_focus(NULL, false);
+        fv_video_update_focus(NULL, false);
         return;
     }
 
@@ -561,6 +644,8 @@ void jce_file_viewer_close_all(void)
             fv_model_close_tab(tab->path);
         if (tab->type == JCE_FV_AUDIO)
             fv_audio_close_tab(tab);
+        if (tab->type == JCE_FV_VIDEO)
+            fv_video_close_tab(tab);
         fv_code_close_tab(tab);
         if (jce_texture_valid(tab->gpu_tex))
             jce_texture_destroy(tab->gpu_tex);

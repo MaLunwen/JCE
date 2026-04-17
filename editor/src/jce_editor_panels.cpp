@@ -150,6 +150,7 @@ void jce_editor_panels_init(void)
     s_visible[JCE_PANEL_TIMELINE]    = true;
     s_visible[JCE_PANEL_ASSETS]      = true;
     s_visible[JCE_PANEL_FILE_VIEWER] = true;
+    s_visible[JCE_PANEL_POSTFX]      = false;
     s_visible[JCE_PANEL_PREFERENCES] = false;
 
     /* Console ring buffer. */
