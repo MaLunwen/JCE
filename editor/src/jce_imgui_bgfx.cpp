@@ -92,6 +92,10 @@ bool jce_imgui_bgfx_init(const PakArchive *pak, uint8_t view_id)
     /* Create default font atlas texture. */
     create_font_texture();
 
+    /* Tell ImGui we can handle per-draw VtxOffset (needed for
+       reordered draw commands such as modal dim overlays). */
+    ImGui::GetIO().BackendFlags |= ImGuiBackendFlags_RendererHasVtxOffset;
+
     s_ctx.initialized = true;
     LOG_SUCCESS(LOG_TAG, "initialized (view %u)", view_id);
     return true;
@@ -173,7 +177,6 @@ void jce_imgui_bgfx_render_draw_data(void)
         memcpy(tib.data, cmd_list->IdxBuffer.Data,
                num_indices * sizeof(ImDrawIdx));
 
-        uint32_t offset = 0;
         for (int cmd_i = 0; cmd_i < cmd_list->CmdBuffer.Size; cmd_i++) {
             const ImDrawCmd *pcmd = &cmd_list->CmdBuffer[cmd_i];
 
@@ -182,21 +185,22 @@ void jce_imgui_bgfx_render_draw_data(void)
                 continue;
             }
 
-            /* Scissor rect (clip to viewport). */
+            /* Scissor rect — clamp to [0, 65535] like the official bgfx
+               ImGui example.  Negative clip-rect coords happen when
+               ImGui extends a clip rect beyond the viewport (e.g. the
+               modal dim overlay uses viewport ± 1 px). */
             ImVec2 clip_off = draw_data->DisplayPos;
-            float cx = pcmd->ClipRect.x - clip_off.x;
-            float cy = pcmd->ClipRect.y - clip_off.y;
-            float cw = pcmd->ClipRect.z - clip_off.x - cx;
-            float ch = pcmd->ClipRect.w - clip_off.y - cy;
-
-            if (cw <= 0.0f || ch <= 0.0f) {
-                offset += pcmd->ElemCount;
+            float clip_min_x = pcmd->ClipRect.x - clip_off.x;
+            float clip_min_y = pcmd->ClipRect.y - clip_off.y;
+            float clip_max_x = pcmd->ClipRect.z - clip_off.x;
+            float clip_max_y = pcmd->ClipRect.w - clip_off.y;
+            if (clip_max_x <= clip_min_x || clip_max_y <= clip_min_y)
                 continue;
-            }
-
-            bgfx_set_scissor(
-                (uint16_t)cx, (uint16_t)cy,
-                (uint16_t)cw, (uint16_t)ch);
+            uint16_t sx = (uint16_t)(clip_min_x > 0.0f ? clip_min_x : 0.0f);
+            uint16_t sy = (uint16_t)(clip_min_y > 0.0f ? clip_min_y : 0.0f);
+            uint16_t sw = (uint16_t)((clip_max_x < 65535.0f ? clip_max_x : 65535.0f) - (float)sx);
+            uint16_t sh = (uint16_t)((clip_max_y < 65535.0f ? clip_max_y : 65535.0f) - (float)sy);
+            bgfx_set_scissor(sx, sy, sw, sh);
 
             /* Bind texture. */
             bgfx_texture_handle_t tex;
@@ -214,16 +218,18 @@ void jce_imgui_bgfx_render_draw_data(void)
                 BGFX_STATE_BLEND_INV_SRC_ALPHA);
             bgfx_set_state(state, 0);
 
-            /* Set vertex/index buffers and submit. */
+            /* Set vertex/index buffers and submit.
+               Use pcmd->VtxOffset / IdxOffset so that reordered draw
+               commands (e.g. modal dim overlay via push_front) render
+               with the correct geometry. */
             bgfx_set_transient_vertex_buffer(
-                0, &tvb, 0, num_vertices);
+                0, &tvb, pcmd->VtxOffset,
+                num_vertices - pcmd->VtxOffset);
             bgfx_set_transient_index_buffer(
-                &tib, offset, pcmd->ElemCount);
+                &tib, pcmd->IdxOffset, pcmd->ElemCount);
             bgfx_submit(
                 s_ctx.view_id, s_ctx.program,
                 0, BGFX_DISCARD_ALL);
-
-            offset += pcmd->ElemCount;
         }
     }
 }

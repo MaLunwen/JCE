@@ -52,8 +52,7 @@ static bool s_focus_file_viewer = false;
 
 static bool should_draw_dialog_dimmer(void)
 {
-    return s_show_about
-        || s_show_settings
+    return s_show_settings
         || s_show_new_project
         || s_show_open_project
         || s_show_new_scene
@@ -62,6 +61,11 @@ static bool should_draw_dialog_dimmer(void)
         || s_show_unsaved
     || jce_editor_assets_delete_dialog_open()
     || jce_editor_inspector_delete_dialog_open();
+}
+
+static bool should_block_editor_interaction(void)
+{
+    return s_show_about || should_draw_dialog_dimmer();
 }
 
 static void draw_dialog_dimmer(void)
@@ -79,7 +83,8 @@ static void draw_dialog_dimmer(void)
         ImGuiWindowFlags_NoDocking |
         ImGuiWindowFlags_NoSavedSettings |
         ImGuiWindowFlags_NoNav |
-        ImGuiWindowFlags_NoInputs;
+        ImGuiWindowFlags_NoFocusOnAppearing |
+        ImGuiWindowFlags_NoBringToFrontOnFocus;
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
@@ -88,6 +93,8 @@ static void draw_dialog_dimmer(void)
     ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0, 0, 0, 0));
 
     ImGui::Begin("##DialogDimmer", NULL, flags);
+    /* Invisible button fills the dimmer to absorb all mouse clicks. */
+    ImGui::InvisibleButton("##dimmer_block", vp->Size);
     ImGui::End();
 
     ImGui::PopStyleColor(2);
@@ -130,6 +137,10 @@ static void handle_global_edit_shortcuts(void)
     if (io.WantTextInput)
         return;
 
+    /* Modal dialogs must block background state changes. */
+    if (should_block_editor_interaction())
+        return;
+
     if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
         if (jce_state_can_undo())
             jce_state_undo();
@@ -158,6 +169,10 @@ static void draw_menu_bar(void)
 
     /* Match requested larger row spacing and overall bar height. */
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(18, 8));
+
+    /* Disable entire menu bar when a modal dialog is open. */
+    bool dialog_active = should_block_editor_interaction();
+    if (dialog_active) ImGui::BeginDisabled(true);
 
     /* ── File ──────────────────────────────────────────────────────── */
     if (ImGui::BeginMenu(jce_editor_i18n("menu.file"))) {
@@ -308,6 +323,8 @@ static void draw_menu_bar(void)
         if (ImGui::SmallButton(" [] ")) jce_state_stop();
         if (!can_stop) ImGui::EndDisabled();
     }
+
+    if (dialog_active) ImGui::EndDisabled();
 
     ImGui::PopStyleVar(2); /* ItemSpacing + FramePadding */
     ImGui::EndMenuBar();

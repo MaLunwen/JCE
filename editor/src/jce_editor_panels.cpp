@@ -708,21 +708,26 @@ void jce_editor_panel_preferences(void)
 
 void jce_editor_about_dialog(bool *p_open)
 {
-    if (!p_open || !*p_open) return;
+    if (!p_open) return;
+
+    const char *popup_id = "###AboutDialog";
+    if (*p_open && !ImGui::IsPopupOpen(popup_id)) {
+        ImGui::OpenPopup(popup_id);
+    }
 
     char _title[256];
-    snprintf(_title, sizeof(_title), "%s###AboutDialog",
-             jce_editor_i18n("about.title"));
+    snprintf(_title, sizeof(_title), "%s%s",
+             jce_editor_i18n("about.title"), popup_id);
 
     const ImGuiViewport *vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(420, 360), ImGuiCond_Appearing);
     ImGui::SetNextWindowViewport(vp->ID);
 
-    if (!ImGui::Begin(_title, p_open,
+    if (!ImGui::BeginPopupModal(_title, p_open,
                       ImGuiWindowFlags_NoCollapse
-                    | ImGuiWindowFlags_NoDocking)) {
-        ImGui::End();
+                    | ImGuiWindowFlags_NoDocking
+                    | ImGuiWindowFlags_NoResize)) {
         return;
     }
 
@@ -746,7 +751,8 @@ void jce_editor_about_dialog(bool *p_open)
     if (ImGui::Button(jce_editor_i18n("dialog.close"), ImVec2(100, 0))
         || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
         *p_open = false;
+        ImGui::CloseCurrentPopup();
     }
 
-    ImGui::End();
+    ImGui::EndPopup();
 }

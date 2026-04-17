@@ -196,8 +196,12 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
                 memcpy(gizmo_rot, gizmo_raw_rot, sizeof(gizmo_rot));
                 memcpy(gizmo_scale, gizmo_raw_scale, sizeof(gizmo_scale));
 
-                /* Ctrl + TRS snapping. */
-                if (ImGui::GetIO().KeyCtrl && gizmo_dragging_after) {
+                /* Ctrl + TRS snapping.
+                 * Use gizmo_dragging_before || gizmo_dragging_after so that
+                 * snapping also applies on the release frame (before=true,
+                 * after=false), preventing the final value from drifting to
+                 * the un-snapped raw position. */
+                if (ImGui::GetIO().KeyCtrl && (gizmo_dragging_before || gizmo_dragging_after)) {
                     const float snap_translate = 0.5f;
                     const float snap_angle     = 15.0f;
                     const float snap_scale     = 0.25f;

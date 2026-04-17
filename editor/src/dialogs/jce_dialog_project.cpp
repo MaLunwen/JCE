@@ -136,6 +136,7 @@ bool pick_folder_dialog(const char *title, char *out_path, size_t out_path_size)
 
     BROWSEINFOA bi;
     memset(&bi, 0, sizeof(bi));
+    bi.hwndOwner = GetActiveWindow();
     bi.lpszTitle = title;
     bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_USENEWUI;
     bi.lpfn = browse_callback;
