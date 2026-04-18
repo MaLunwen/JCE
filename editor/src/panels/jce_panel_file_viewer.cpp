@@ -21,9 +21,11 @@ extern "C" {
 #include <SDL3/SDL_iostream.h>
 #include <SDL3/SDL_surface.h>
 #include <jce/graphics/jce_pbr_material.h>
+#include <jce/third_party/stb_image.h>
 }
 
 #include <bgfx/c99/bgfx.h>
+#include <math.h>
 
 #define LOG_TAG "file_viewer"
 
@@ -395,37 +397,99 @@ void jce_file_viewer_open(const char *path)
     /* Load GPU texture for images. */
     if (ftype == JCE_FV_IMAGE && actually_read > 0) {
         SDL_IOStream *io = SDL_IOFromConstMem(buf, (size_t)actually_read);
+        SDL_Surface *surf = NULL;
         if (io) {
-            SDL_Surface *surf = IMG_Load_IO(io, true);
-            /* Ensure RGBA32 — IMG_Load_IO may return RGB24 for images
-               without alpha (e.g. normal maps).  texture_from_surface_ex()
-               in jce_texture.c assumes 4 bytes/pixel, so feeding it an
-               RGB24 surface causes a stride mismatch → colored stripes. */
-            if (surf && surf->format != SDL_PIXELFORMAT_RGBA32) {
-                SDL_Surface *conv = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA32);
-                SDL_DestroySurface(surf);
-                surf = conv;
-            }
-            if (surf) {
-                tab->img_w   = surf->w;
-                tab->img_h   = surf->h;
-                tab->gpu_tex = jce_texture_load_from_surface(surf, JCE_TEX_CLAMP);
-                SDL_DestroySurface(surf);
+            surf = IMG_Load_IO(io, true);
+        }
 
-                /* Default zoom: fit in ~512px. */
-                if (tab->img_w > 0 && tab->img_h > 0) {
-                    float max_dim = (float)((tab->img_w > tab->img_h)
-                                            ? tab->img_w : tab->img_h);
-                    if (max_dim > 512.0f)
-                        tab->zoom = 512.0f / max_dim;
+        /* stb_image fallback for HDR files — SDL3_image has no HDR codec. */
+        if (!surf && ext && strcmp(ext, ".hdr") == 0) {
+            int hdr_w = 0, hdr_h = 0, hdr_ch = 0;
+            float *hdr_pixels = stbi_loadf_from_memory(
+                (const stbi_uc *)buf, (int)actually_read,
+                &hdr_w, &hdr_h, &hdr_ch, 4);
+            if (hdr_pixels && hdr_w > 0 && hdr_h > 0) {
+                /* Tone-map float HDR → RGBA32 for preview. */
+                surf = SDL_CreateSurface(hdr_w, hdr_h, SDL_PIXELFORMAT_RGBA32);
+                if (surf) {
+                    const float *src = hdr_pixels;
+                    uint8_t *dst = (uint8_t *)surf->pixels;
+                    int npx = hdr_w * hdr_h;
+                    for (int px = 0; px < npx; px++) {
+                        for (int ch = 0; ch < 3; ch++) {
+                            float v = src[px * 4 + ch];
+                            v = v / (v + 1.0f); /* Reinhard tone-map */
+                            v = powf(v, 1.0f / 2.2f); /* gamma */
+                            int iv = (int)(v * 255.0f + 0.5f);
+                            if (iv > 255) iv = 255;
+                            if (iv < 0) iv = 0;
+                            dst[px * 4 + ch] = (uint8_t)iv;
+                        }
+                        dst[px * 4 + 3] = 255;
+                    }
                 }
-
-                LOG_INFO(LOG_TAG, "loaded image %dx%d tex=%u",
-                         tab->img_w, tab->img_h, tab->gpu_tex.idx);
-            } else {
-                LOG_WARN(LOG_TAG, "IMG_Load_IO failed for '%s': %s",
-                         name, SDL_GetError());
+                stbi_image_free(hdr_pixels);
+            } else if (hdr_pixels) {
+                stbi_image_free(hdr_pixels);
             }
+        }
+        /* HDR files produce float surfaces — tone-map to RGBA32 for preview. */
+        else if (surf && (surf->format == SDL_PIXELFORMAT_RGBA128_FLOAT ||
+                          surf->format == SDL_PIXELFORMAT_RGB96_FLOAT)) {
+            SDL_Surface *fsurf = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA128_FLOAT);
+            SDL_DestroySurface(surf);
+            surf = NULL;
+            if (fsurf) {
+                SDL_Surface *sdr = SDL_CreateSurface(fsurf->w, fsurf->h, SDL_PIXELFORMAT_RGBA32);
+                if (sdr) {
+                    const float *src = (const float *)fsurf->pixels;
+                    uint8_t *dst = (uint8_t *)sdr->pixels;
+                    int npx = fsurf->w * fsurf->h;
+                    for (int px = 0; px < npx; px++) {
+                        for (int ch = 0; ch < 3; ch++) {
+                            float v = src[px * 4 + ch];
+                            v = v / (v + 1.0f); /* Reinhard tone-map */
+                            v = powf(v, 1.0f / 2.2f); /* gamma */
+                            int iv = (int)(v * 255.0f + 0.5f);
+                            if (iv > 255) iv = 255;
+                            if (iv < 0) iv = 0;
+                            dst[px * 4 + ch] = (uint8_t)iv;
+                        }
+                        dst[px * 4 + 3] = 255;
+                    }
+                    surf = sdr;
+                }
+                SDL_DestroySurface(fsurf);
+            }
+        }
+        /* Ensure RGBA32 — IMG_Load_IO may return RGB24 for images
+           without alpha (e.g. normal maps).  texture_from_surface_ex()
+           in jce_texture.c assumes 4 bytes/pixel, so feeding it an
+           RGB24 surface causes a stride mismatch → colored stripes. */
+        else if (surf && surf->format != SDL_PIXELFORMAT_RGBA32) {
+            SDL_Surface *conv = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA32);
+            SDL_DestroySurface(surf);
+            surf = conv;
+        }
+        if (surf) {
+            tab->img_w   = surf->w;
+            tab->img_h   = surf->h;
+            tab->gpu_tex = jce_texture_load_from_surface(surf, JCE_TEX_CLAMP);
+            SDL_DestroySurface(surf);
+
+            /* Default zoom: fit in ~512px. */
+            if (tab->img_w > 0 && tab->img_h > 0) {
+                float max_dim = (float)((tab->img_w > tab->img_h)
+                                        ? tab->img_w : tab->img_h);
+                if (max_dim > 512.0f)
+                    tab->zoom = 512.0f / max_dim;
+            }
+
+            LOG_INFO(LOG_TAG, "loaded image %dx%d tex=%u",
+                     tab->img_w, tab->img_h, tab->gpu_tex.idx);
+        } else {
+            LOG_WARN(LOG_TAG, "image load failed for '%s': %s",
+                     name, SDL_GetError());
         }
 
         /* Fallback for DDS/KTX/KTX2: bgfx natively decodes these

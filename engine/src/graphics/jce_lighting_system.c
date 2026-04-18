@@ -50,9 +50,9 @@ static void ensure_light_uniforms(void)
     /* point: 2 vec4s per light * max 8 = 16 vec4s */
     s_u_point_lights  = bgfx_create_uniform("u_pointLights",  BGFX_UNIFORM_TYPE_VEC4,
                                              JCE_MAX_POINT_LIGHTS * 2);
-    /* spot: 3 vec4s per light * max 4 = 12 vec4s */
+    /* spot: 4 vec4s per light * max 4 = 16 vec4s */
     s_u_spot_lights   = bgfx_create_uniform("u_spotLights",   BGFX_UNIFORM_TYPE_VEC4,
-                                             JCE_MAX_SPOT_LIGHTS * 3);
+                                             JCE_MAX_SPOT_LIGHTS * 4);
     s_u_light_counts  = bgfx_create_uniform("u_lightCounts",  BGFX_UNIFORM_TYPE_VEC4, 1);
     s_u_camera_pos    = bgfx_create_uniform("u_cameraPos",    BGFX_UNIFORM_TYPE_VEC4, 1);
 
@@ -202,19 +202,18 @@ void jce_light_env_apply(const JceLightEnv *env, const JceRenderer *r)
         bgfx_set_uniform(s_u_point_lights, data, JCE_MAX_POINT_LIGHTS * 2);
     }
 
-    /* Spot lights: 3 vec4s per light.
-     * [i*3+0] = pos.xyz, radius
-     * [i*3+1] = dir.xyz, intensity
-     * [i*3+2] = color.xyz, innerConeCos
-     * Note: outerConeCos is not packed here; the shader should derive it
-     * or a 4th vec4 can be added later. */
+    /* Spot lights: 4 vec4s per light.
+     * [i*4+0] = pos.xyz, radius
+     * [i*4+1] = dir.xyz, intensity
+     * [i*4+2] = color.xyz, innerConeCos
+     * [i*4+3] = outerConeCos, 0, 0, 0 */
     {
-        float data[JCE_MAX_SPOT_LIGHTS * 3 * 4];
+        float data[JCE_MAX_SPOT_LIGHTS * 4 * 4];
         memset(data, 0, sizeof(data));
         for (uint32_t i = 0; i < env->num_spot; i++) {
             const JceSpotLightDesc *sl = &env->spot_lights[i];
             jce_vec3 d = jce_v3_normalize(sl->direction);
-            uint32_t base = i * 12;
+            uint32_t base = i * 16;
             data[base + 0]  = sl->position.x;
             data[base + 1]  = sl->position.y;
             data[base + 2]  = sl->position.z;
@@ -227,8 +226,12 @@ void jce_light_env_apply(const JceLightEnv *env, const JceRenderer *r)
             data[base + 9]  = sl->color.y;
             data[base + 10] = sl->color.z;
             data[base + 11] = sl->inner_cone_cos;
+            data[base + 12] = sl->outer_cone_cos;
+            data[base + 13] = 0.0f;
+            data[base + 14] = 0.0f;
+            data[base + 15] = 0.0f;
         }
-        bgfx_set_uniform(s_u_spot_lights, data, JCE_MAX_SPOT_LIGHTS * 3);
+        bgfx_set_uniform(s_u_spot_lights, data, JCE_MAX_SPOT_LIGHTS * 4);
     }
 
     /* Light counts: x=numDir, y=numPoint, z=numSpot, w=0. */

@@ -12,12 +12,24 @@ float decode_bone_index(float raw_index)
     return floor(idx + 0.5);
 }
 
+int decode_bone_index_clamped(float raw_index)
+{
+    float idx = decode_bone_index(raw_index);
+    if (idx < 0.0) {
+        idx = 0.0;
+    }
+    if (idx > 63.0) {
+        idx = 63.0;
+    }
+    return int(idx);
+}
+
 void main()
 {
-    int i0 = clamp(int(decode_bone_index(a_indices.x)), 0, 63);
-    int i1 = clamp(int(decode_bone_index(a_indices.y)), 0, 63);
-    int i2 = clamp(int(decode_bone_index(a_indices.z)), 0, 63);
-    int i3 = clamp(int(decode_bone_index(a_indices.w)), 0, 63);
+    int i0 = decode_bone_index_clamped(a_indices.x);
+    int i1 = decode_bone_index_clamped(a_indices.y);
+    int i2 = decode_bone_index_clamped(a_indices.z);
+    int i3 = decode_bone_index_clamped(a_indices.w);
 
     // Bone blending via model palette
     mat4 skinMtx = a_weight.x * u_model[i0]

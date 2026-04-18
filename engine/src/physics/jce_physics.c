@@ -161,6 +161,11 @@ JceBodyHandle jce_physics_body_create(JcePhysicsWorld *world,
 
     float friction = desc->friction > 0.0f ? desc->friction : 0.5f;
 
+    uint16_t group = desc->collision_group;
+    uint16_t mask  = desc->collision_mask;
+    if (group == 0) group = JCE_COLLISION_DEFAULT_GROUP;
+    if (mask  == 0) mask  = JCE_COLLISION_ALL_MASK;
+
     uint32_t idx = jce_bullet_body_create(
         world->bullet,
         (uint8_t)desc->type,
@@ -168,7 +173,8 @@ JceBodyHandle jce_physics_body_create(JcePhysicsWorld *world,
         desc->position, desc->rotation,
         desc->half_extents, desc->mass,
         friction, desc->restitution,
-        desc->linear_damping, desc->angular_damping);
+        desc->linear_damping, desc->angular_damping,
+        group, mask, desc->is_trigger);
 
     if (idx == UINT32_MAX) {
         LOG_ERROR(LOG_TAG, "body pool exhausted");
@@ -310,4 +316,121 @@ uint32_t jce_physics_body_count(const JcePhysicsWorld *world)
 {
     if (!world) return 0;
     return jce_bullet_body_count((JceBulletWorld *)world->bullet);
+}
+
+/* ── Collision filter ─────────────────────────────────────────────── */
+
+void jce_physics_body_set_collision_filter(JcePhysicsWorld *world,
+                                           JceBodyHandle body,
+                                           uint16_t group, uint16_t mask)
+{
+    if (!world || !jce_body_valid(body)) return;
+    jce_bullet_body_set_collision_filter(world->bullet, body.idx,
+                                          group, mask);
+}
+
+/* ── Constraints ──────────────────────────────────────────────────── */
+
+JceConstraintHandle jce_physics_constraint_create(JcePhysicsWorld *world,
+                                                   const JceConstraintDesc *desc)
+{
+    if (!world || !desc) return JCE_CONSTRAINT_INVALID;
+
+    uint32_t idx = jce_bullet_constraint_create(
+        world->bullet,
+        (uint8_t)desc->type,
+        desc->body_a.idx,
+        desc->body_b.idx,
+        desc->pivot_a, desc->pivot_b,
+        desc->axis,
+        desc->lower_limit, desc->upper_limit,
+        desc->disable_collision);
+
+    if (idx == UINT32_MAX) {
+        LOG_ERROR(LOG_TAG, "constraint pool exhausted");
+        return JCE_CONSTRAINT_INVALID;
+    }
+
+    return (JceConstraintHandle){ idx };
+}
+
+void jce_physics_constraint_destroy(JcePhysicsWorld *world,
+                                     JceConstraintHandle con)
+{
+    if (!world || !jce_constraint_valid(con)) return;
+    jce_bullet_constraint_destroy(world->bullet, con.idx);
+}
+
+void jce_physics_constraint_set_limits(JcePhysicsWorld *world,
+                                        JceConstraintHandle con,
+                                        float lower, float upper)
+{
+    if (!world || !jce_constraint_valid(con)) return;
+    jce_bullet_constraint_set_limits(world->bullet, con.idx, lower, upper);
+}
+
+/* ── Character controller ─────────────────────────────────────────── */
+
+JceCharacterHandle jce_physics_character_create(JcePhysicsWorld *world,
+                                                 const JceCharacterDesc *desc)
+{
+    if (!world || !desc) return JCE_CHARACTER_INVALID;
+
+    float max_slope_rad = desc->max_slope_deg * 3.14159265f / 180.0f;
+    float gravity = desc->gravity > 0.0f ? desc->gravity : 9.81f;
+    float jump_speed = desc->jump_speed > 0.0f ? desc->jump_speed : 6.0f;
+    float step_height = desc->step_height > 0.0f ? desc->step_height : 0.35f;
+    float radius = desc->radius > 0.0f ? desc->radius : 0.3f;
+    float height = desc->height > 0.0f ? desc->height : 1.8f;
+
+    uint32_t idx = jce_bullet_character_create(
+        world->bullet,
+        desc->position, radius, height, step_height,
+        max_slope_rad, gravity, jump_speed);
+
+    if (idx == UINT32_MAX) {
+        LOG_ERROR(LOG_TAG, "character pool exhausted");
+        return JCE_CHARACTER_INVALID;
+    }
+
+    return (JceCharacterHandle){ idx };
+}
+
+void jce_physics_character_destroy(JcePhysicsWorld *world,
+                                    JceCharacterHandle ch)
+{
+    if (!world || !jce_character_valid(ch)) return;
+    jce_bullet_character_destroy(world->bullet, ch.idx);
+}
+
+void jce_physics_character_move(JcePhysicsWorld *world,
+                                 JceCharacterHandle ch,
+                                 jce_vec3 walk_dir, float dt)
+{
+    if (!world || !jce_character_valid(ch)) return;
+    jce_bullet_character_move(world->bullet, ch.idx, walk_dir, dt);
+}
+
+void jce_physics_character_jump(JcePhysicsWorld *world,
+                                 JceCharacterHandle ch)
+{
+    if (!world || !jce_character_valid(ch)) return;
+    jce_bullet_character_jump(world->bullet, ch.idx);
+}
+
+void jce_physics_character_get_position(const JcePhysicsWorld *world,
+                                         JceCharacterHandle ch,
+                                         jce_vec3 *out_pos)
+{
+    if (!world || !jce_character_valid(ch)) return;
+    jce_bullet_character_get_position(
+        (JceBulletWorld *)world->bullet, ch.idx, out_pos);
+}
+
+bool jce_physics_character_is_grounded(const JcePhysicsWorld *world,
+                                        JceCharacterHandle ch)
+{
+    if (!world || !jce_character_valid(ch)) return false;
+    return jce_bullet_character_is_grounded(
+        (JceBulletWorld *)world->bullet, ch.idx);
 }

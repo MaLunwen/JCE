@@ -60,6 +60,9 @@ typedef struct {
     float        restitution;  /* default: 0.0 */
     float        linear_damping;
     float        angular_damping;
+    uint16_t     collision_group; /* default: JCE_COLLISION_DEFAULT_GROUP */
+    uint16_t     collision_mask;  /* default: JCE_COLLISION_ALL_MASK */
+    bool         is_trigger;      /* trigger bodies: no contact response */
 } JceBodyDesc;
 
 JceBodyHandle jce_physics_body_create(JcePhysicsWorld *world, const JceBodyDesc *desc);
@@ -117,6 +120,68 @@ void jce_physics_set_contact_end(JcePhysicsWorld *world, jce_contact_fn fn, void
 
 /* Return current body count (active + sleeping). */
 uint32_t jce_physics_body_count(const JcePhysicsWorld *world);
+
+/* ================================================================== */
+/* Collision filters                                                   */
+/* ================================================================== */
+
+/* Change collision group/mask on an existing body. */
+void jce_physics_body_set_collision_filter(JcePhysicsWorld *world,
+                                           JceBodyHandle body,
+                                           uint16_t group, uint16_t mask);
+
+/* ================================================================== */
+/* Constraints                                                         */
+/* ================================================================== */
+
+typedef struct {
+    JceConstraintType type;
+    JceBodyHandle     body_a;
+    JceBodyHandle     body_b;       /* JCE_BODY_INVALID = world anchor */
+    jce_vec3          pivot_a;      /* local pivot on body A */
+    jce_vec3          pivot_b;      /* local pivot on body B */
+    jce_vec3          axis;         /* hinge/slider axis (local to A) */
+    float             lower_limit;
+    float             upper_limit;
+    bool              disable_collision; /* disable collision between A and B */
+} JceConstraintDesc;
+
+JceConstraintHandle jce_physics_constraint_create(JcePhysicsWorld *world,
+                                                   const JceConstraintDesc *desc);
+void jce_physics_constraint_destroy(JcePhysicsWorld *world,
+                                     JceConstraintHandle con);
+void jce_physics_constraint_set_limits(JcePhysicsWorld *world,
+                                        JceConstraintHandle con,
+                                        float lower, float upper);
+
+/* ================================================================== */
+/* Character controller                                                */
+/* ================================================================== */
+
+typedef struct {
+    jce_vec3 position;
+    float    radius;           /* capsule radius */
+    float    height;           /* capsule total height */
+    float    step_height;      /* max step height */
+    float    max_slope_deg;    /* max walkable slope (degrees) */
+    float    gravity;          /* character gravity (positive = downward) */
+    float    jump_speed;       /* initial jump velocity */
+} JceCharacterDesc;
+
+JceCharacterHandle jce_physics_character_create(JcePhysicsWorld *world,
+                                                 const JceCharacterDesc *desc);
+void jce_physics_character_destroy(JcePhysicsWorld *world,
+                                    JceCharacterHandle ch);
+void jce_physics_character_move(JcePhysicsWorld *world,
+                                 JceCharacterHandle ch,
+                                 jce_vec3 walk_dir, float dt);
+void jce_physics_character_jump(JcePhysicsWorld *world,
+                                 JceCharacterHandle ch);
+void jce_physics_character_get_position(const JcePhysicsWorld *world,
+                                         JceCharacterHandle ch,
+                                         jce_vec3 *out_pos);
+bool jce_physics_character_is_grounded(const JcePhysicsWorld *world,
+                                        JceCharacterHandle ch);
 
 #ifdef __cplusplus
 }

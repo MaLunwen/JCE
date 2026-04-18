@@ -17,11 +17,16 @@ static ECS_COMPONENT_DECLARE(JceTransform);
 static ECS_COMPONENT_DECLARE(JceMeshRenderer);
 static ECS_COMPONENT_DECLARE(JceCameraComponent);
 static ECS_COMPONENT_DECLARE(JceDirectionalLight);
+static ECS_COMPONENT_DECLARE(JcePointLight);
+static ECS_COMPONENT_DECLARE(JceSpotLight);
 static ECS_COMPONENT_DECLARE(JceTagActive);
 static ECS_COMPONENT_DECLARE(JceRigidBodyComponent);
 static ECS_COMPONENT_DECLARE(JceRigidBody2DComponent);
 static ECS_COMPONENT_DECLARE(JceParticleEmitterComponent);
 static ECS_COMPONENT_DECLARE(JceBehaviorTree);
+static ECS_COMPONENT_DECLARE(JceSkyboxComponent);
+static ECS_COMPONENT_DECLARE(JceSpriteAnimatorComponent);
+static ECS_COMPONENT_DECLARE(JceConstraintComponent);
 
 /* ── Scene struct ──────────────────────────────────────────────────── */
 
@@ -46,11 +51,16 @@ JceScene *jce_scene_create(void)
     ECS_COMPONENT_DEFINE(s->world, JceMeshRenderer);
     ECS_COMPONENT_DEFINE(s->world, JceCameraComponent);
     ECS_COMPONENT_DEFINE(s->world, JceDirectionalLight);
+    ECS_COMPONENT_DEFINE(s->world, JcePointLight);
+    ECS_COMPONENT_DEFINE(s->world, JceSpotLight);
     ECS_COMPONENT_DEFINE(s->world, JceTagActive);
     ECS_COMPONENT_DEFINE(s->world, JceRigidBodyComponent);
     ECS_COMPONENT_DEFINE(s->world, JceRigidBody2DComponent);
     ECS_COMPONENT_DEFINE(s->world, JceParticleEmitterComponent);
     ECS_COMPONENT_DEFINE(s->world, JceBehaviorTree);
+    ECS_COMPONENT_DEFINE(s->world, JceSkyboxComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceSpriteAnimatorComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceConstraintComponent);
 
     LOG_SUCCESS(LOG_TAG, "scene created");
     return s;
@@ -148,6 +158,66 @@ JceDirectionalLight *jce_scene_get_dir_light(JceScene *s, JceEntity e)
 {
     if (!s) return NULL;
     return (JceDirectionalLight *)ecs_get_mut(s->world, (ecs_entity_t)e, JceDirectionalLight);
+}
+
+void jce_scene_set_point_light(JceScene *s, JceEntity e, const JcePointLight *l)
+{
+    if (!s || !l) return;
+    ecs_set_ptr(s->world, (ecs_entity_t)e, JcePointLight, l);
+}
+
+JcePointLight *jce_scene_get_point_light(JceScene *s, JceEntity e)
+{
+    if (!s) return NULL;
+    return (JcePointLight *)ecs_get_mut(s->world, (ecs_entity_t)e, JcePointLight);
+}
+
+void jce_scene_set_spot_light(JceScene *s, JceEntity e, const JceSpotLight *l)
+{
+    if (!s || !l) return;
+    ecs_set_ptr(s->world, (ecs_entity_t)e, JceSpotLight, l);
+}
+
+JceSpotLight *jce_scene_get_spot_light(JceScene *s, JceEntity e)
+{
+    if (!s) return NULL;
+    return (JceSpotLight *)ecs_get_mut(s->world, (ecs_entity_t)e, JceSpotLight);
+}
+
+void jce_scene_set_skybox(JceScene *s, JceEntity e, const JceSkyboxComponent *c)
+{
+    if (!s || !c) return;
+    ecs_set_ptr(s->world, (ecs_entity_t)e, JceSkyboxComponent, c);
+}
+
+JceSkyboxComponent *jce_scene_get_skybox(JceScene *s, JceEntity e)
+{
+    if (!s) return NULL;
+    return (JceSkyboxComponent *)ecs_get_mut(s->world, (ecs_entity_t)e, JceSkyboxComponent);
+}
+
+void jce_scene_set_sprite_animator(JceScene *s, JceEntity e, const JceSpriteAnimatorComponent *c)
+{
+    if (!s || !c) return;
+    ecs_set_ptr(s->world, (ecs_entity_t)e, JceSpriteAnimatorComponent, c);
+}
+
+JceSpriteAnimatorComponent *jce_scene_get_sprite_animator(JceScene *s, JceEntity e)
+{
+    if (!s) return NULL;
+    return (JceSpriteAnimatorComponent *)ecs_get_mut(s->world, (ecs_entity_t)e, JceSpriteAnimatorComponent);
+}
+
+void jce_scene_set_constraint(JceScene *s, JceEntity e, const JceConstraintComponent *c)
+{
+    if (!s || !c) return;
+    ecs_set_ptr(s->world, (ecs_entity_t)e, JceConstraintComponent, c);
+}
+
+JceConstraintComponent *jce_scene_get_constraint(JceScene *s, JceEntity e)
+{
+    if (!s) return NULL;
+    return (JceConstraintComponent *)ecs_get_mut(s->world, (ecs_entity_t)e, JceConstraintComponent);
 }
 
 /* ── Iteration ─────────────────────────────────────────────────────── */

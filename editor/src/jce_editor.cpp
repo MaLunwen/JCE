@@ -7,6 +7,7 @@
 
 #include "jce_editor.h"
 #include "jce_editor_alloc.h"
+#include "jce_editor_config.h"
 #include "jce_imgui_bgfx.h"
 #include "jce_editor_layout.h"
 #include "jce_editor_panels.h"
@@ -45,7 +46,7 @@ static struct {
     bool        text_input_active;
     const PakArchive *pak;      /* stored for font rebuild */
     float       font_size;      /* current font size in pixels */
-    float       pending_font_size; /* >0 means rebuild next frame */
+
     FILE       *frame_kpi_file;
     uint32_t    frame_kpi_index;
     uint32_t    frame_kpi_limit;
@@ -234,10 +235,17 @@ bool jce_editor_init(const PakArchive *pak, JceWindow *window)
         return false;
     }
 
-    /* Load custom font (after bgfx backend is ready). */
-    jce_editor_load_fonts(pak, 24.0f);
-    s_editor.pak       = pak;
-    s_editor.font_size = 24.0f;
+    /* Load custom font (after bgfx backend is ready).
+       Read saved font size from config; fall back to 14 (default). */
+    {
+        JceEditorConfig ecfg;
+        jce_editor_config_load(&ecfg);
+        float fs = (ecfg.font_size >= 12 && ecfg.font_size <= 48)
+                       ? (float)ecfg.font_size : 14.0f;
+        jce_editor_load_fonts(pak, fs);
+        s_editor.pak       = pak;
+        s_editor.font_size = fs;
+    }
 
     /* i18n. */
     jce_editor_i18n_init(pak);
@@ -436,23 +444,6 @@ void jce_editor_update(JceWindow *window)
     /* Setup bgfx view. */
     jce_imgui_bgfx_setup_view((uint16_t)w, (uint16_t)h);
 
-    /* Deferred font rebuild — must happen before NewFrame(). */
-    if (s_editor.pending_font_size > 0.0f) {
-        float new_size = s_editor.pending_font_size;
-        s_editor.pending_font_size = 0.0f;
-
-        ImGui::GetIO().Fonts->Clear();
-        if (jce_editor_load_fonts(s_editor.pak, new_size)) {
-            s_editor.font_size = new_size;
-            LOG_INFO(LOG_TAG, "font size changed to %.0f px", new_size);
-        } else {
-            /* Fallback: reload previous size. */
-            jce_editor_load_fonts(s_editor.pak, s_editor.font_size);
-            LOG_WARN(LOG_TAG, "font size change failed, reverted to %.0f px",
-                     s_editor.font_size);
-        }
-    }
-
     /* Begin ImGui frame. */
     ImGui::NewFrame();
 
@@ -513,16 +504,6 @@ bool jce_editor_set_font_size(float size)
 {
     if (size < 12.0f) size = 12.0f;
     if (size > 48.0f) size = 48.0f;
-    if (!s_editor.pak) return false;
-
-    /* Skip if already at this size and no pending change. */
-    if (size == s_editor.font_size && s_editor.pending_font_size <= 0.0f)
-        return true;
-
-    /* Defer the actual rebuild to the start of the next frame,
-       before ImGui::NewFrame(). Rebuilding mid-frame causes
-       ACCESS_VIOLATION since the font atlas is in use. */
-    s_editor.pending_font_size = size;
-    LOG_INFO(LOG_TAG, "font size change to %.0f px scheduled", size);
+    s_editor.font_size = size;
     return true;
 }

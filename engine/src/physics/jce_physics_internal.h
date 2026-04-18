@@ -48,7 +48,9 @@ uint32_t jce_bullet_body_create(JceBulletWorld *bw,
                                 jce_vec3 pos, jce_quat rot,
                                 jce_vec3 half_ext, float mass,
                                 float friction, float restitution,
-                                float lin_damp, float ang_damp);
+                                float lin_damp, float ang_damp,
+                                uint16_t col_group, uint16_t col_mask,
+                                bool is_trigger);
 
 void jce_bullet_body_destroy(JceBulletWorld *bw, uint32_t idx);
 
@@ -119,6 +121,45 @@ void jce_bullet_set_contact_end(JceBulletWorld *bw,
 /* ================================================================== */
 
 uint32_t jce_bullet_body_count(JceBulletWorld *bw);
+
+/* ================================================================== */
+/* Collision filter                                                    */
+/* ================================================================== */
+
+void jce_bullet_body_set_collision_filter(JceBulletWorld *bw, uint32_t idx,
+                                          uint16_t group, uint16_t mask);
+
+/* ================================================================== */
+/* Constraints                                                         */
+/* ================================================================== */
+
+uint32_t jce_bullet_constraint_create(JceBulletWorld *bw,
+                                       uint8_t type,
+                                       uint32_t body_a, uint32_t body_b,
+                                       jce_vec3 pivot_a, jce_vec3 pivot_b,
+                                       jce_vec3 axis,
+                                       float lower, float upper,
+                                       bool disable_collision);
+void jce_bullet_constraint_destroy(JceBulletWorld *bw, uint32_t idx);
+void jce_bullet_constraint_set_limits(JceBulletWorld *bw, uint32_t idx,
+                                       float lower, float upper);
+
+/* ================================================================== */
+/* Character controller                                                */
+/* ================================================================== */
+
+uint32_t jce_bullet_character_create(JceBulletWorld *bw,
+                                      jce_vec3 pos, float radius,
+                                      float height, float step_height,
+                                      float max_slope_rad,
+                                      float gravity, float jump_speed);
+void jce_bullet_character_destroy(JceBulletWorld *bw, uint32_t idx);
+void jce_bullet_character_move(JceBulletWorld *bw, uint32_t idx,
+                                jce_vec3 walk_dir, float dt);
+void jce_bullet_character_jump(JceBulletWorld *bw, uint32_t idx);
+void jce_bullet_character_get_position(JceBulletWorld *bw, uint32_t idx,
+                                        jce_vec3 *pos);
+bool jce_bullet_character_is_grounded(JceBulletWorld *bw, uint32_t idx);
 
 #ifdef __cplusplus
 }

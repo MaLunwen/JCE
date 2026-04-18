@@ -26,6 +26,9 @@ static const char *component_type_save_name(JceComponentType type)
 	case JCE_COMP_CHARACTER_CONTROLLER: return "CharacterController";
 	case JCE_COMP_AUDIO_SOURCE:         return "AudioSource";
 	case JCE_COMP_SCRIPT:               return "Script";
+	case JCE_COMP_SKYBOX:               return "Skybox";
+	case JCE_COMP_SPRITE_ANIMATOR:      return "SpriteAnimator";
+	case JCE_COMP_CONSTRAINT:           return "Constraint";
 	default:                            return "Unknown";
 	}
 }
@@ -148,6 +151,38 @@ cJSON *serialize_component_json(const JceComponentInfo *comp)
 	case JCE_COMP_SCRIPT:
 		cJSON_AddStringToObject(obj, "scriptPath", comp->data.script.script_path);
 		break;
+	case JCE_COMP_SKYBOX:
+		cJSON_AddStringToObject(obj, "hdrPath", comp->data.skybox.hdr_path);
+		cJSON_AddNumberToObject(obj, "rotation", comp->data.skybox.rotation);
+		cJSON_AddNumberToObject(obj, "exposure", comp->data.skybox.exposure);
+		cJSON_AddBoolToObject(obj, "useAsIbl", comp->data.skybox.use_as_ibl);
+		break;
+	case JCE_COMP_SPRITE_ANIMATOR:
+		cJSON_AddStringToObject(obj, "sheetPath", comp->data.sprite_animator.sheet_path);
+		cJSON_AddStringToObject(obj, "atlasPath", comp->data.sprite_animator.atlas_path);
+		cJSON_AddNumberToObject(obj, "frameWidth", comp->data.sprite_animator.frame_width);
+		cJSON_AddNumberToObject(obj, "frameHeight", comp->data.sprite_animator.frame_height);
+		cJSON_AddStringToObject(obj, "currentAnim", comp->data.sprite_animator.current_anim);
+		cJSON_AddNumberToObject(obj, "speed", comp->data.sprite_animator.speed);
+		cJSON_AddBoolToObject(obj, "loop", comp->data.sprite_animator.loop);
+		cJSON_AddBoolToObject(obj, "playing", comp->data.sprite_animator.playing);
+		break;
+	case JCE_COMP_CONSTRAINT:
+		cJSON_AddNumberToObject(obj, "constraintType", comp->data.constraint.constraint_type);
+		cJSON_AddNumberToObject(obj, "targetEntity", (double)comp->data.constraint.target_entity);
+		cJSON_AddNumberToObject(obj, "pivotAx", comp->data.constraint.pivot_a[0]);
+		cJSON_AddNumberToObject(obj, "pivotAy", comp->data.constraint.pivot_a[1]);
+		cJSON_AddNumberToObject(obj, "pivotAz", comp->data.constraint.pivot_a[2]);
+		cJSON_AddNumberToObject(obj, "pivotBx", comp->data.constraint.pivot_b[0]);
+		cJSON_AddNumberToObject(obj, "pivotBy", comp->data.constraint.pivot_b[1]);
+		cJSON_AddNumberToObject(obj, "pivotBz", comp->data.constraint.pivot_b[2]);
+		cJSON_AddNumberToObject(obj, "axisX", comp->data.constraint.axis[0]);
+		cJSON_AddNumberToObject(obj, "axisY", comp->data.constraint.axis[1]);
+		cJSON_AddNumberToObject(obj, "axisZ", comp->data.constraint.axis[2]);
+		cJSON_AddNumberToObject(obj, "lowerLimit", comp->data.constraint.lower_limit);
+		cJSON_AddNumberToObject(obj, "upperLimit", comp->data.constraint.upper_limit);
+		cJSON_AddBoolToObject(obj, "disableCollision", comp->data.constraint.disable_collision);
+		break;
 	case JCE_COMP_CAMERA:
 		cJSON_AddNumberToObject(obj, "fov", comp->data.camera.fov);
 		cJSON_AddNumberToObject(obj, "nearClip", comp->data.camera.near_clip);
@@ -161,6 +196,13 @@ cJSON *serialize_component_json(const JceComponentInfo *comp)
 		cJSON_AddNumberToObject(obj, "colorA", comp->data.light.color[3]);
 		cJSON_AddNumberToObject(obj, "intensity", comp->data.light.intensity);
 		cJSON_AddNumberToObject(obj, "lightType", comp->data.light.type);
+		if (comp->data.light.type == 1 || comp->data.light.type == 2)
+			cJSON_AddNumberToObject(obj, "radius", comp->data.light.radius);
+		if (comp->data.light.type == 2) {
+			cJSON_AddNumberToObject(obj, "innerConeDeg", comp->data.light.inner_cone_deg);
+			cJSON_AddNumberToObject(obj, "outerConeDeg", comp->data.light.outer_cone_deg);
+		}
+		cJSON_AddBoolToObject(obj, "castsShadow", comp->data.light.casts_shadow);
 		break;
 	default:
 		break;

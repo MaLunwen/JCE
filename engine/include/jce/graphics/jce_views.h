@@ -28,6 +28,7 @@
 #define JCE_VIEW_SHADOW_1    11
 #define JCE_VIEW_SHADOW_2    12
 #define JCE_VIEW_SHADOW_3    13
+#define JCE_VIEW_SHADOW_4    14
 
 /* Reserved range for post-processing (Phase 4). */
 #define JCE_VIEW_POST_BASE   20

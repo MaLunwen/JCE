@@ -527,20 +527,23 @@ void jce_editor_dialog_unsaved_changes(bool *p_open, int *result)
 {
     if (!p_open || !*p_open) return;
 
+    const char *popup_id = "###UnsavedDialog";
+    if (*p_open && !ImGui::IsPopupOpen(popup_id))
+        ImGui::OpenPopup(popup_id);
+
     char _title[256];
-    snprintf(_title, sizeof(_title), "%s###UnsavedDialog",
-             jce_editor_i18n("unsaved.title"));
+    snprintf(_title, sizeof(_title), "%s%s",
+             jce_editor_i18n("unsaved.title"), popup_id);
 
     const ImGuiViewport *vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(500, 180), ImGuiCond_Appearing);
     ImGui::SetNextWindowViewport(vp->ID);
 
-    if (!ImGui::Begin(_title, p_open,
+    if (!ImGui::BeginPopupModal(_title, p_open,
                       ImGuiWindowFlags_NoCollapse
                     | ImGuiWindowFlags_NoDocking
                     | ImGuiWindowFlags_NoResize)) {
-        ImGui::End();
         return;
     }
 
@@ -568,6 +571,7 @@ void jce_editor_dialog_unsaved_changes(bool *p_open, int *result)
         || ImGui::IsKeyPressed(ImGuiKey_Enter)
         || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) {
         if (result) *result = 1;
+        ImGui::CloseCurrentPopup();
         *p_open = false;
     }
     ImGui::PopStyleColor(3);
@@ -578,19 +582,22 @@ void jce_editor_dialog_unsaved_changes(bool *p_open, int *result)
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.55f, 0.20f, 0.20f, 1.0f));
     if (ImGui::Button(jce_editor_i18n("unsaved.dontSave"), ImVec2(btn_w, 0))) {
         if (result) *result = 2;
+        ImGui::CloseCurrentPopup();
         *p_open = false;
     }
     ImGui::PopStyleColor(3);
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("dialog.cancel"), ImVec2(btn_w, 0))) {
         if (result) *result = 3;
+        ImGui::CloseCurrentPopup();
         *p_open = false;
     }
 
     if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
         if (result) *result = 3;
+        ImGui::CloseCurrentPopup();
         *p_open = false;
     }
 
-    ImGui::End();
+    ImGui::EndPopup();
 }

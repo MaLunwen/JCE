@@ -158,6 +158,9 @@ void jce_editor_panel_hierarchy_content(void)
                 uint32_t pasted = jce_state_paste_entity(0);
                 jce_state_select_entity(pasted, false);
             }
+            if (ImGui::IsKeyPressed(ImGuiKey_F) && !ImGui::GetIO().KeyCtrl
+                && !ImGui::GetIO().KeyAlt && !ImGui::GetIO().KeyShift)
+                focus_entity_in_scene(focused);
         }
     }
 }

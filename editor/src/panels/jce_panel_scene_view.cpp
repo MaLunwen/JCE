@@ -85,8 +85,13 @@ static void draw_scene_view_toolbar(void)
         JceSceneViewMode vm = jce_state_get_view_mode();
 
         if (ImGui::BeginMenu(jce_editor_i18n("sceneView.renderMode"))) {
-            if (ImGui::MenuItem(jce_editor_i18n("scene.wireframe"), NULL, vm == JCE_VIEW_WIREFRAME))
-                jce_state_set_view_mode(JCE_VIEW_WIREFRAME);
+            if (ImGui::BeginMenu(jce_editor_i18n("scene.wireframe"))) {
+                if (ImGui::MenuItem(jce_editor_i18n("scene.wireframe"), NULL, vm == JCE_VIEW_WIREFRAME))
+                    jce_state_set_view_mode(JCE_VIEW_WIREFRAME);
+                if (ImGui::MenuItem(jce_editor_i18n("scene.wireframeTextured"), NULL, vm == JCE_VIEW_WIREFRAME_TEXTURED))
+                    jce_state_set_view_mode(JCE_VIEW_WIREFRAME_TEXTURED);
+                ImGui::EndMenu();
+            }
             if (ImGui::MenuItem(jce_editor_i18n("sceneView.shaded"), NULL, vm == JCE_VIEW_SHADED))
                 jce_state_set_view_mode(JCE_VIEW_SHADED);
             if (ImGui::MenuItem(jce_editor_i18n("sceneView.textured"), NULL, vm == JCE_VIEW_TEXTURED))
@@ -205,7 +210,7 @@ static bool is_texture_or_material_asset(const char *path)
     }
     static const char *const tex_exts[] = {
         ".png", ".PNG", ".jpg", ".JPG", ".jpeg", ".JPEG",
-        ".tga", ".TGA", ".bmp", ".BMP", ".hdr", ".HDR",
+        ".tga", ".TGA", ".bmp", ".BMP",
         ".dds", ".DDS", ".ktx", ".KTX",
         NULL
     };
@@ -214,6 +219,15 @@ static bool is_texture_or_material_asset(const char *path)
             return true;
     }
     return false;
+}
+
+/* Returns true if the file is an HDR environment map. */
+static bool is_hdr_asset(const char *path)
+{
+    const char *ext = strrchr(path, '.');
+    if (!ext) return false;
+    return (strcmp(ext, ".hdr") == 0 || strcmp(ext, ".HDR") == 0 ||
+            strcmp(ext, ".exr") == 0 || strcmp(ext, ".EXR") == 0);
 }
 
 static JceComponentInfo *find_mesh_renderer_component(uint32_t entity_id)
@@ -492,6 +506,10 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail)
             if (!entity_accepts_mesh_material_drop(hit_id))
                 hit_id = 0;
             jce_editor_scene_set_hover_entity(hit_id);
+        } else if (is_hdr_asset(asset_path)) {
+            /* HDR environment map: no ghost, just clear state. */
+            jce_editor_scene_clear_ghost();
+            jce_editor_scene_clear_hover_entity();
         } else {
             jce_editor_scene_clear_ghost();
             jce_editor_scene_clear_hover_entity();
@@ -723,6 +741,54 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail)
                 }
                 jce_state_end_batch_edit();
             }
+        }
+        /* ── HDR dropped: set as skybox ────────────────────────────── */
+        else if (is_hdr_asset(asset_path)) {
+            /* Find existing entity with Skybox component, or create one. */
+            uint32_t sky_id = 0;
+            int ent_count = jce_state_get_entity_count();
+            for (int ei = 0; ei < ent_count; ei++) {
+                JceEntityInfo *ent = jce_state_get_entity_by_index(ei);
+                if (!ent) continue;
+                int cc = 0;
+                JceComponentInfo *comps =
+                    jce_state_get_entity_components(ent->id, &cc);
+                for (int ci = 0; ci < cc; ci++) {
+                    if (comps[ci].type == JCE_COMP_SKYBOX) {
+                        sky_id = ent->id;
+                        break;
+                    }
+                }
+                if (sky_id) break;
+            }
+
+            jce_state_begin_batch_edit();
+            if (!sky_id) {
+                sky_id = jce_state_create_entity("Skybox", 0);
+                if (sky_id)
+                    jce_state_add_component(sky_id, JCE_COMP_SKYBOX);
+            }
+            if (sky_id) {
+                int cc = 0;
+                JceComponentInfo *comps =
+                    jce_state_get_entity_components(sky_id, &cc);
+                for (int ci = 0; ci < cc; ci++) {
+                    if (comps[ci].type == JCE_COMP_SKYBOX) {
+                        snprintf(comps[ci].data.skybox.hdr_path,
+                                 sizeof(comps[ci].data.skybox.hdr_path),
+                                 "%s", asset_path);
+                        if (comps[ci].data.skybox.exposure <= 0.0f)
+                            comps[ci].data.skybox.exposure = 1.0f;
+                        break;
+                    }
+                }
+                jce_state_select_entity(sky_id, false);
+                jce_editor_inspector_request_sync();
+                jce_editor_layout_request_focus_inspector();
+                jce_editor_console_log(
+                    "Applied HDR skybox: %s", asset_path);
+            }
+            jce_state_end_batch_edit();
         }
     }
 

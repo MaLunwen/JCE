@@ -8,6 +8,8 @@
 #include "jce_physics_internal.h"
 
 #include <btBulletDynamicsCommon.h>
+#include <BulletDynamics/Character/btKinematicCharacterController.h>
+#include <BulletCollision/CollisionDispatch/btGhostObject.h>
 
 #include "core/jce_memory.h"
 
@@ -61,6 +63,20 @@ struct JceBulletWorld {
     bool               *alive;
     uint32_t            capacity;
     uint32_t            count;
+
+    /* Constraint pool. */
+    btTypedConstraint **constraints;
+    bool               *con_alive;
+    uint32_t            con_capacity;
+    uint32_t            con_count;
+
+    /* Character controller pool. */
+    btKinematicCharacterController **characters;
+    btPairCachingGhostObject       **ghosts;
+    btConvexShape                  **char_shapes;
+    bool                            *char_alive;
+    uint32_t                         char_capacity;
+    uint32_t                         char_count;
 
     /* Contact callbacks forwarded to the C layer. */
     jce_bullet_contact_fn contact_begin_fn;
@@ -139,6 +155,10 @@ JceBulletWorld *jce_bullet_create(jce_vec3 gravity, uint32_t max_bodies)
     bw->world->setInternalTickCallback(post_tick_callback,
                                        bw, /*isPreTick=*/false);
 
+    /* Register ghost pair callback for character controllers. */
+    bw->broadphase->getOverlappingPairCache()->setInternalGhostPairCallback(
+        new btGhostPairCallback());
+
     /* Allocate body pool. */
     bw->capacity = max_bodies;
     bw->count    = 0;
@@ -154,12 +174,62 @@ JceBulletWorld *jce_bullet_create(jce_vec3 gravity, uint32_t max_bodies)
         return nullptr;
     }
 
+    /* Allocate constraint pool. */
+    bw->con_capacity = max_bodies / 2;
+    if (bw->con_capacity < 64) bw->con_capacity = 64;
+    bw->con_count = 0;
+    bw->constraints = static_cast<btTypedConstraint **>(
+        JCE_CALLOC(bw->con_capacity, sizeof(btTypedConstraint *)));
+    bw->con_alive = static_cast<bool *>(
+        JCE_CALLOC(bw->con_capacity, sizeof(bool)));
+
+    /* Allocate character controller pool. */
+    bw->char_capacity = 32;
+    bw->char_count = 0;
+    bw->characters = static_cast<btKinematicCharacterController **>(
+        JCE_CALLOC(bw->char_capacity, sizeof(btKinematicCharacterController *)));
+    bw->ghosts = static_cast<btPairCachingGhostObject **>(
+        JCE_CALLOC(bw->char_capacity, sizeof(btPairCachingGhostObject *)));
+    bw->char_shapes = static_cast<btConvexShape **>(
+        JCE_CALLOC(bw->char_capacity, sizeof(btConvexShape *)));
+    bw->char_alive = static_cast<bool *>(
+        JCE_CALLOC(bw->char_capacity, sizeof(bool)));
+
     return bw;
 }
 
 void jce_bullet_destroy(JceBulletWorld *bw)
 {
     if (!bw) return;
+
+    /* Remove and delete all live character controllers. */
+    if (bw->characters && bw->ghosts && bw->char_shapes && bw->char_alive) {
+        for (uint32_t i = 0; i < bw->char_capacity; ++i) {
+            if (!bw->char_alive[i]) continue;
+            if (bw->characters[i]) {
+                bw->world->removeAction(bw->characters[i]);
+                delete bw->characters[i];
+            }
+            if (bw->ghosts[i]) {
+                bw->world->removeCollisionObject(bw->ghosts[i]);
+                delete bw->ghosts[i];
+            }
+            delete bw->char_shapes[i];
+            bw->char_alive[i] = false;
+        }
+    }
+
+    /* Remove and delete all live constraints. */
+    if (bw->constraints && bw->con_alive) {
+        for (uint32_t i = 0; i < bw->con_capacity; ++i) {
+            if (!bw->con_alive[i]) continue;
+            if (bw->constraints[i]) {
+                bw->world->removeConstraint(bw->constraints[i]);
+                delete bw->constraints[i];
+            }
+            bw->con_alive[i] = false;
+        }
+    }
 
     /* Remove and delete all live bodies. */
     if (bw->bodies && bw->shapes && bw->alive) {
@@ -183,6 +253,12 @@ void jce_bullet_destroy(JceBulletWorld *bw)
     delete bw->dispatcher;
     delete bw->config;
 
+    JCE_FREE(bw->char_alive);
+    JCE_FREE(bw->char_shapes);
+    JCE_FREE(bw->ghosts);
+    JCE_FREE(bw->characters);
+    JCE_FREE(bw->con_alive);
+    JCE_FREE(bw->constraints);
     JCE_FREE(bw->alive);
     JCE_FREE(bw->shapes);
     JCE_FREE(bw->bodies);
@@ -211,7 +287,9 @@ uint32_t jce_bullet_body_create(JceBulletWorld *bw,
                                 jce_vec3 pos, jce_quat rot,
                                 jce_vec3 half_ext, float mass,
                                 float friction, float restitution,
-                                float lin_damp, float ang_damp)
+                                float lin_damp, float ang_damp,
+                                uint16_t col_group, uint16_t col_mask,
+                                bool is_trigger)
 {
     if (!bw) return UINT32_MAX;
 
@@ -281,12 +359,21 @@ uint32_t jce_bullet_body_create(JceBulletWorld *bw,
         body->setActivationState(DISABLE_DEACTIVATION);
     }
 
+    /* Trigger bodies: no contact response (overlap only). */
+    if (is_trigger) {
+        body->setCollisionFlags(
+            body->getCollisionFlags() |
+            btCollisionObject::CF_NO_CONTACT_RESPONSE);
+    }
+
     /* Store pool index in the user-pointer for contact-callback lookup. */
     body->setUserPointer(reinterpret_cast<void *>(
         static_cast<uintptr_t>(idx)));
 
-    /* Add to world and store in pool. */
-    bw->world->addRigidBody(body);
+    /* Add to world with collision group/mask. */
+    bw->world->addRigidBody(body,
+                             static_cast<int>(col_group),
+                             static_cast<int>(col_mask));
     bw->bodies[idx] = body;
     bw->shapes[idx] = col_shape;
     bw->alive[idx]  = true;
@@ -482,4 +569,286 @@ void jce_bullet_set_contact_end(JceBulletWorld *bw,
 uint32_t jce_bullet_body_count(JceBulletWorld *bw)
 {
     return bw ? bw->count : 0;
+}
+
+/* ================================================================== */
+/* Collision filter                                                    */
+/* ================================================================== */
+
+void jce_bullet_body_set_collision_filter(JceBulletWorld *bw, uint32_t idx,
+                                          uint16_t group, uint16_t mask)
+{
+    if (!bw || idx >= bw->capacity || !bw->alive[idx]) return;
+
+    btRigidBody *body = bw->bodies[idx];
+    if (!body) return;
+
+    /* Must remove and re-add to change filter group/mask. */
+    bw->world->removeRigidBody(body);
+    bw->world->addRigidBody(body,
+                             static_cast<int>(group),
+                             static_cast<int>(mask));
+}
+
+/* ================================================================== */
+/* Constraints                                                         */
+/* ================================================================== */
+
+uint32_t jce_bullet_constraint_create(JceBulletWorld *bw,
+                                       uint8_t type,
+                                       uint32_t body_a, uint32_t body_b,
+                                       jce_vec3 pivot_a, jce_vec3 pivot_b,
+                                       jce_vec3 axis,
+                                       float lower, float upper,
+                                       bool disable_collision)
+{
+    if (!bw) return UINT32_MAX;
+    if (body_a >= bw->capacity || !bw->alive[body_a]) return UINT32_MAX;
+
+    /* Find a free constraint slot. */
+    uint32_t idx = UINT32_MAX;
+    for (uint32_t i = 0; i < bw->con_capacity; ++i) {
+        if (!bw->con_alive[i]) { idx = i; break; }
+    }
+    if (idx == UINT32_MAX) return UINT32_MAX;
+
+    btRigidBody *rb_a = bw->bodies[body_a];
+    btRigidBody *rb_b = nullptr;
+    bool has_b = (body_b < bw->capacity && bw->alive[body_b]);
+    if (has_b) rb_b = bw->bodies[body_b];
+
+    btTypedConstraint *con = nullptr;
+
+    switch (static_cast<JceConstraintType>(type)) {
+    case JCE_CONSTRAINT_POINT2POINT: {
+        if (has_b && rb_b) {
+            con = new btPoint2PointConstraint(
+                *rb_a, *rb_b, to_bt(pivot_a), to_bt(pivot_b));
+        } else {
+            con = new btPoint2PointConstraint(*rb_a, to_bt(pivot_a));
+        }
+        break;
+    }
+    case JCE_CONSTRAINT_HINGE: {
+        btVector3 bt_axis = to_bt(axis);
+        if (bt_axis.length2() < 0.001f) bt_axis = btVector3(0, 1, 0);
+        bt_axis.normalize();
+        if (has_b && rb_b) {
+            con = new btHingeConstraint(
+                *rb_a, *rb_b, to_bt(pivot_a), to_bt(pivot_b),
+                bt_axis, bt_axis);
+        } else {
+            con = new btHingeConstraint(*rb_a, to_bt(pivot_a), bt_axis);
+        }
+        auto *hinge = static_cast<btHingeConstraint *>(con);
+        if (lower < upper)
+            hinge->setLimit(static_cast<btScalar>(lower),
+                            static_cast<btScalar>(upper));
+        break;
+    }
+    case JCE_CONSTRAINT_SLIDER: {
+        btTransform frame_a, frame_b;
+        frame_a.setIdentity();
+        frame_a.setOrigin(to_bt(pivot_a));
+        frame_b.setIdentity();
+        frame_b.setOrigin(to_bt(pivot_b));
+        if (has_b && rb_b) {
+            auto *slider = new btSliderConstraint(
+                *rb_a, *rb_b, frame_a, frame_b, true);
+            slider->setLowerLinLimit(static_cast<btScalar>(lower));
+            slider->setUpperLinLimit(static_cast<btScalar>(upper));
+            con = slider;
+        } else {
+            auto *slider = new btSliderConstraint(
+                *rb_a, frame_a, true);
+            slider->setLowerLinLimit(static_cast<btScalar>(lower));
+            slider->setUpperLinLimit(static_cast<btScalar>(upper));
+            con = slider;
+        }
+        break;
+    }
+    case JCE_CONSTRAINT_GENERIC6DOF: {
+        btTransform frame_a, frame_b;
+        frame_a.setIdentity();
+        frame_a.setOrigin(to_bt(pivot_a));
+        frame_b.setIdentity();
+        frame_b.setOrigin(to_bt(pivot_b));
+        if (has_b && rb_b) {
+            auto *dof = new btGeneric6DofConstraint(
+                *rb_a, *rb_b, frame_a, frame_b, true);
+            dof->setLinearLowerLimit(btVector3(lower, lower, lower));
+            dof->setLinearUpperLimit(btVector3(upper, upper, upper));
+            con = dof;
+        } else {
+            auto *dof = new btGeneric6DofConstraint(
+                *rb_a, frame_a, true);
+            dof->setLinearLowerLimit(btVector3(lower, lower, lower));
+            dof->setLinearUpperLimit(btVector3(upper, upper, upper));
+            con = dof;
+        }
+        break;
+    }
+    default:
+        return UINT32_MAX;
+    }
+
+    if (!con) return UINT32_MAX;
+
+    bw->world->addConstraint(con, disable_collision);
+    bw->constraints[idx] = con;
+    bw->con_alive[idx] = true;
+    bw->con_count++;
+
+    return idx;
+}
+
+void jce_bullet_constraint_destroy(JceBulletWorld *bw, uint32_t idx)
+{
+    if (!bw || idx >= bw->con_capacity || !bw->con_alive[idx]) return;
+
+    btTypedConstraint *con = bw->constraints[idx];
+    if (con) {
+        bw->world->removeConstraint(con);
+        delete con;
+    }
+    bw->constraints[idx] = nullptr;
+    bw->con_alive[idx] = false;
+    bw->con_count--;
+}
+
+void jce_bullet_constraint_set_limits(JceBulletWorld *bw, uint32_t idx,
+                                       float lower, float upper)
+{
+    if (!bw || idx >= bw->con_capacity || !bw->con_alive[idx]) return;
+
+    btTypedConstraint *con = bw->constraints[idx];
+    if (!con) return;
+
+    switch (con->getConstraintType()) {
+    case HINGE_CONSTRAINT_TYPE: {
+        auto *hinge = static_cast<btHingeConstraint *>(con);
+        hinge->setLimit(static_cast<btScalar>(lower),
+                        static_cast<btScalar>(upper));
+        break;
+    }
+    case SLIDER_CONSTRAINT_TYPE: {
+        auto *slider = static_cast<btSliderConstraint *>(con);
+        slider->setLowerLinLimit(static_cast<btScalar>(lower));
+        slider->setUpperLinLimit(static_cast<btScalar>(upper));
+        break;
+    }
+    case D6_CONSTRAINT_TYPE: {
+        auto *dof = static_cast<btGeneric6DofConstraint *>(con);
+        dof->setLinearLowerLimit(btVector3(lower, lower, lower));
+        dof->setLinearUpperLimit(btVector3(upper, upper, upper));
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+/* ================================================================== */
+/* Character controller                                                */
+/* ================================================================== */
+
+uint32_t jce_bullet_character_create(JceBulletWorld *bw,
+                                      jce_vec3 pos, float radius,
+                                      float height, float step_height,
+                                      float max_slope_rad,
+                                      float gravity, float jump_speed)
+{
+    if (!bw) return UINT32_MAX;
+
+    /* Find a free slot. */
+    uint32_t idx = UINT32_MAX;
+    for (uint32_t i = 0; i < bw->char_capacity; ++i) {
+        if (!bw->char_alive[i]) { idx = i; break; }
+    }
+    if (idx == UINT32_MAX) return UINT32_MAX;
+
+    /* Capsule shape: total height = capsule_height + 2*radius. */
+    float capsule_height = height - 2.0f * radius;
+    if (capsule_height < 0.01f) capsule_height = 0.01f;
+
+    auto *cap_shape = new btCapsuleShape(
+        static_cast<btScalar>(radius),
+        static_cast<btScalar>(capsule_height));
+
+    auto *ghost = new btPairCachingGhostObject();
+    btTransform start_xf;
+    start_xf.setIdentity();
+    start_xf.setOrigin(to_bt(pos));
+    ghost->setWorldTransform(start_xf);
+    ghost->setCollisionShape(cap_shape);
+    ghost->setCollisionFlags(btCollisionObject::CF_CHARACTER_OBJECT);
+
+    auto *controller = new btKinematicCharacterController(
+        ghost, cap_shape, static_cast<btScalar>(step_height));
+
+    controller->setGravity(btVector3(0, -static_cast<btScalar>(gravity), 0));
+    controller->setJumpSpeed(static_cast<btScalar>(jump_speed));
+    controller->setMaxSlope(static_cast<btScalar>(max_slope_rad));
+
+    bw->world->addCollisionObject(ghost,
+                                   btBroadphaseProxy::CharacterFilter,
+                                   btBroadphaseProxy::StaticFilter |
+                                   btBroadphaseProxy::DefaultFilter);
+    bw->world->addAction(controller);
+
+    bw->characters[idx] = controller;
+    bw->ghosts[idx] = ghost;
+    bw->char_shapes[idx] = cap_shape;
+    bw->char_alive[idx] = true;
+    bw->char_count++;
+
+    return idx;
+}
+
+void jce_bullet_character_destroy(JceBulletWorld *bw, uint32_t idx)
+{
+    if (!bw || idx >= bw->char_capacity || !bw->char_alive[idx]) return;
+
+    if (bw->characters[idx]) {
+        bw->world->removeAction(bw->characters[idx]);
+        delete bw->characters[idx];
+        bw->characters[idx] = nullptr;
+    }
+    if (bw->ghosts[idx]) {
+        bw->world->removeCollisionObject(bw->ghosts[idx]);
+        delete bw->ghosts[idx];
+        bw->ghosts[idx] = nullptr;
+    }
+    delete bw->char_shapes[idx];
+    bw->char_shapes[idx] = nullptr;
+    bw->char_alive[idx] = false;
+    bw->char_count--;
+}
+
+void jce_bullet_character_move(JceBulletWorld *bw, uint32_t idx,
+                                jce_vec3 walk_dir, float dt)
+{
+    if (!bw || idx >= bw->char_capacity || !bw->char_alive[idx]) return;
+    bw->characters[idx]->setWalkDirection(
+        to_bt(walk_dir) * static_cast<btScalar>(dt));
+}
+
+void jce_bullet_character_jump(JceBulletWorld *bw, uint32_t idx)
+{
+    if (!bw || idx >= bw->char_capacity || !bw->char_alive[idx]) return;
+    bw->characters[idx]->jump();
+}
+
+void jce_bullet_character_get_position(JceBulletWorld *bw, uint32_t idx,
+                                        jce_vec3 *pos)
+{
+    if (!bw || idx >= bw->char_capacity || !bw->char_alive[idx] || !pos) return;
+    btTransform xf = bw->ghosts[idx]->getWorldTransform();
+    *pos = from_bt_v3(xf.getOrigin());
+}
+
+bool jce_bullet_character_is_grounded(JceBulletWorld *bw, uint32_t idx)
+{
+    if (!bw || idx >= bw->char_capacity || !bw->char_alive[idx]) return false;
+    return bw->characters[idx]->onGround();
 }

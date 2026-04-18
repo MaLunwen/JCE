@@ -167,6 +167,10 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     /* Uniforms for sky gradient and fullscreen grid. */
     s_sr.u_sky_colors = bgfx_create_uniform("u_sky_colors",
                                              BGFX_UNIFORM_TYPE_VEC4, 3);
+    s_sr.u_sky_params = bgfx_create_uniform("u_sky_params",
+                                             BGFX_UNIFORM_TYPE_VEC4, 1);
+    s_sr.u_sky_equirect = bgfx_create_uniform("s_equirect",
+                                               BGFX_UNIFORM_TYPE_SAMPLER, 1);
     s_sr.u_grid_camera = bgfx_create_uniform("u_grid_camera",
                                              BGFX_UNIFORM_TYPE_VEC4, 1);
     s_sr.u_grid_fade = bgfx_create_uniform("u_grid_fade",
@@ -214,7 +218,7 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
         s_sr.shadow_tex = bgfx_create_texture_2d(
             shadow_size, shadow_size, false, 1,
             BGFX_TEXTURE_FORMAT_D16,
-            BGFX_TEXTURE_RT | BGFX_SAMPLER_COMPARE_LEQUAL
+            BGFX_TEXTURE_RT
             | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
             NULL);
         bgfx_attachment_t at;
@@ -231,8 +235,62 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
             LOG_INFO(LOG_TAG, "shadow map created (%dx%d)", shadow_size, shadow_size);
     }
 
+    /* Cascaded shadow maps (4 cascades at 2048x2048). */
+    {
+        const uint32_t csm_count = JCE_CSM_MAX_CASCADES;
+        const uint16_t csm_size = 2048;
+        const char *sampler_names[JCE_CSM_MAX_CASCADES] = {
+            "s_csmShadow0", "s_csmShadow1", "s_csmShadow2", "s_csmShadow3"
+        };
+        s_sr.csm_cascade_count = csm_count;
+        s_sr.csm_valid = true;
+        for (uint32_t i = 0; i < csm_count; i++) {
+            s_sr.csm_tex[i] = bgfx_create_texture_2d(
+                csm_size, csm_size, false, 1,
+                BGFX_TEXTURE_FORMAT_D16,
+                BGFX_TEXTURE_RT
+                | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
+                NULL);
+            bgfx_attachment_t at;
+            memset(&at, 0, sizeof(at));
+            bgfx_attachment_init(&at, s_sr.csm_tex[i], BGFX_ACCESS_WRITE,
+                                 0, 1, 0, BGFX_RESOLVE_AUTO_GEN_MIPS);
+            s_sr.csm_fbo[i] = bgfx_create_frame_buffer_from_attachment(1, &at, false);
+            s_sr.u_csm_samplers[i] = bgfx_create_uniform(
+                sampler_names[i], BGFX_UNIFORM_TYPE_SAMPLER, 1);
+            if (!BGFX_HANDLE_IS_VALID(s_sr.csm_fbo[i]))
+                s_sr.csm_valid = false;
+        }
+        s_sr.u_csm_vp     = bgfx_create_uniform("u_csmVP",
+                                                  BGFX_UNIFORM_TYPE_MAT4,
+                                                  JCE_CSM_MAX_CASCADES);
+        s_sr.u_csm_splits  = bgfx_create_uniform("u_csmSplits",
+                                                   BGFX_UNIFORM_TYPE_VEC4, 1);
+        if (s_sr.csm_valid)
+            LOG_INFO(LOG_TAG, "CSM created (%u cascades, %dx%d)",
+                     csm_count, csm_size, csm_size);
+    }
+
     /* Multi-light environment. */
     s_sr.light_env = jce_light_env_create();
+
+    /* IBL / skybox uniforms. */
+    s_sr.u_ibl_irradiance = bgfx_create_uniform("s_irradiance",
+                                                  BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    s_sr.u_ibl_prefilter  = bgfx_create_uniform("s_prefilter",
+                                                  BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    s_sr.u_ibl_brdf_lut   = bgfx_create_uniform("s_brdfLUT",
+                                                  BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    s_sr.u_ibl_params     = bgfx_create_uniform("u_iblParams",
+                                                  BGFX_UNIFORM_TYPE_VEC4, 1);
+    s_sr.brdf_lut         = jce_ibl_create_brdf_lut(256);
+    s_sr.skybox           = NULL;
+    s_sr.ibl_data         = NULL;
+    s_sr.skybox_active    = false;
+    s_sr.skybox_hdr_path[0] = '\0';
+
+    /* Sprite batch for 2D sprite entities. */
+    s_sr.sprite_batch = jce_sprite_batch_create(256);
 
     s_sr.initialized = true;
     LOG_INFO(LOG_TAG, "editor scene renderer initialized (FBO pipeline)");
@@ -279,6 +337,10 @@ void jce_editor_scene_render_shutdown(void)
         bgfx_destroy_program(s_sr.prog_grid);
     if (BGFX_HANDLE_IS_VALID(s_sr.u_sky_colors))
         bgfx_destroy_uniform(s_sr.u_sky_colors);
+    if (BGFX_HANDLE_IS_VALID(s_sr.u_sky_params))
+        bgfx_destroy_uniform(s_sr.u_sky_params);
+    if (BGFX_HANDLE_IS_VALID(s_sr.u_sky_equirect))
+        bgfx_destroy_uniform(s_sr.u_sky_equirect);
     if (BGFX_HANDLE_IS_VALID(s_sr.u_grid_camera))
         bgfx_destroy_uniform(s_sr.u_grid_camera);
     if (BGFX_HANDLE_IS_VALID(s_sr.u_grid_fade))
@@ -291,9 +353,47 @@ void jce_editor_scene_render_shutdown(void)
     if (BGFX_HANDLE_IS_VALID(s_sr.u_shadowVP))
         bgfx_destroy_uniform(s_sr.u_shadowVP);
 
+    /* CSM resources. */
+    for (uint32_t i = 0; i < JCE_CSM_MAX_CASCADES; i++) {
+        if (BGFX_HANDLE_IS_VALID(s_sr.csm_fbo[i]))
+            bgfx_destroy_frame_buffer(s_sr.csm_fbo[i]);
+        if (BGFX_HANDLE_IS_VALID(s_sr.u_csm_samplers[i]))
+            bgfx_destroy_uniform(s_sr.u_csm_samplers[i]);
+    }
+    if (BGFX_HANDLE_IS_VALID(s_sr.u_csm_vp))
+        bgfx_destroy_uniform(s_sr.u_csm_vp);
+    if (BGFX_HANDLE_IS_VALID(s_sr.u_csm_splits))
+        bgfx_destroy_uniform(s_sr.u_csm_splits);
+
     if (s_sr.light_env) {
         jce_light_env_destroy(s_sr.light_env);
         s_sr.light_env = NULL;
+    }
+
+    /* IBL / skybox resources. */
+    if (s_sr.ibl_data) {
+        jce_ibl_destroy(s_sr.ibl_data);
+        s_sr.ibl_data = NULL;
+    }
+    if (s_sr.skybox) {
+        jce_skybox_destroy(s_sr.skybox);
+        s_sr.skybox = NULL;
+    }
+    if (BGFX_HANDLE_IS_VALID(s_sr.brdf_lut))
+        bgfx_destroy_texture(s_sr.brdf_lut);
+    if (BGFX_HANDLE_IS_VALID(s_sr.u_ibl_irradiance))
+        bgfx_destroy_uniform(s_sr.u_ibl_irradiance);
+    if (BGFX_HANDLE_IS_VALID(s_sr.u_ibl_prefilter))
+        bgfx_destroy_uniform(s_sr.u_ibl_prefilter);
+    if (BGFX_HANDLE_IS_VALID(s_sr.u_ibl_brdf_lut))
+        bgfx_destroy_uniform(s_sr.u_ibl_brdf_lut);
+    if (BGFX_HANDLE_IS_VALID(s_sr.u_ibl_params))
+        bgfx_destroy_uniform(s_sr.u_ibl_params);
+
+    /* Sprite batch. */
+    if (s_sr.sprite_batch) {
+        jce_sprite_batch_destroy(s_sr.sprite_batch);
+        s_sr.sprite_batch = NULL;
     }
 
     s_sr.initialized = false;
@@ -307,6 +407,10 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     if (!s_sr.initialized || !s_sr.renderer) return;
     if (width == 0 || height == 0) return;
 
+    s_sr.viewport_width = width;
+    s_sr.viewport_height = height;
+
+
     const bgfx_caps_t *caps = bgfx_get_caps();
     float aspect = (float)width / (float)height;
 
@@ -314,8 +418,10 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     jce_mat4 proj = jce_camera_proj(s_sr.camera, aspect, caps->homogeneousDepth);
 
     JceSceneViewMode view_mode = jce_state_get_view_mode();
+    bool is_plain_wireframe = (view_mode == JCE_VIEW_WIREFRAME);
+    bool is_textured_wireframe = (view_mode == JCE_VIEW_WIREFRAME_TEXTURED);
 
-    uint32_t clear_color = (view_mode == JCE_VIEW_WIREFRAME)
+    uint32_t clear_color = is_plain_wireframe
         ? 0x373737FF
         : BG_COLOR_RGBA;
 
@@ -330,13 +436,73 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         return;
     }
 
+
     jce_editor_scene_asset_cache_finalize();
 
-    if (view_mode != JCE_VIEW_WIREFRAME)
-        draw_sky_gradient();
+    /* Scan for Skybox component and load HDR if path changed. */
+    {
+        const char *hdr_path = NULL;
+        float sky_rotation = 0.0f;
+        float sky_exposure = 1.0f;
+        int ent_count = jce_state_get_entity_count();
+        for (int ei = 0; ei < ent_count && !hdr_path; ei++) {
+            JceEntityInfo *ent = jce_state_get_entity_by_index(ei);
+            if (!ent) continue;
+            int cc = 0;
+            JceComponentInfo *comps = jce_state_get_entity_components(ent->id, &cc);
+            for (int ci = 0; ci < cc; ci++) {
+                if (comps[ci].type == JCE_COMP_SKYBOX && comps[ci].data.skybox.hdr_path[0]) {
+                    hdr_path = comps[ci].data.skybox.hdr_path;
+                    sky_rotation = comps[ci].data.skybox.rotation;
+                    sky_exposure = comps[ci].data.skybox.exposure > 0.0f
+                                 ? comps[ci].data.skybox.exposure : 1.0f;
+                    break;
+                }
+            }
+        }
 
-    if (jce_state_get_show_grid())
+        if (hdr_path && strcmp(hdr_path, s_sr.skybox_hdr_path) != 0) {
+            /* Path changed — reload skybox. */
+            if (s_sr.skybox) {
+                jce_skybox_destroy(s_sr.skybox);
+                s_sr.skybox = NULL;
+            }
+            s_sr.skybox = jce_skybox_create_from_hdr_file(hdr_path, 512);
+            if (s_sr.skybox) {
+                snprintf(s_sr.skybox_hdr_path, sizeof(s_sr.skybox_hdr_path),
+                         "%s", hdr_path);
+                s_sr.skybox_active = true;
+                LOG_INFO(LOG_TAG, "skybox loaded: %s", hdr_path);
+            } else {
+                s_sr.skybox_hdr_path[0] = '\0';
+                s_sr.skybox_active = false;
+            }
+        } else if (!hdr_path && s_sr.skybox_active) {
+            /* Skybox component removed. */
+            if (s_sr.skybox) {
+                jce_skybox_destroy(s_sr.skybox);
+                s_sr.skybox = NULL;
+            }
+            s_sr.skybox_hdr_path[0] = '\0';
+            s_sr.skybox_active = false;
+        }
+
+        /* Store current exposure/rotation for draw_sky_gradient(). */
+        s_sr.skybox_exposure = sky_exposure;
+        s_sr.skybox_rotation = sky_rotation;
+    }
+
+    /* Keep the legacy gray background only for plain wireframe.
+     * Wireframe-textured keeps the normal blue clear color, and only draws
+     * the sky when an actual HDR skybox is active. This avoids falling back
+     * to the shader's default gradient in that mode. */
+    if (!is_plain_wireframe && (!is_textured_wireframe || s_sr.skybox_active)) {
+        draw_sky_gradient();
+    }
+
+    if (jce_state_get_show_grid()) {
         draw_grid();
+    }
 
     draw_entities();
     draw_hover_highlight();

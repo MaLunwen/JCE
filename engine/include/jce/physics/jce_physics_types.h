@@ -33,6 +33,18 @@ typedef struct { uint32_t idx; } JceColliderHandle;
 
 static inline bool jce_collider_valid(JceColliderHandle h) { return h.idx != UINT32_MAX; }
 
+/* Constraint handle. */
+typedef struct { uint32_t idx; } JceConstraintHandle;
+#define JCE_CONSTRAINT_INVALID ((JceConstraintHandle){ UINT32_MAX })
+
+static inline bool jce_constraint_valid(JceConstraintHandle h) { return h.idx != UINT32_MAX; }
+
+/* Character controller handle. */
+typedef struct { uint32_t idx; } JceCharacterHandle;
+#define JCE_CHARACTER_INVALID ((JceCharacterHandle){ UINT32_MAX })
+
+static inline bool jce_character_valid(JceCharacterHandle h) { return h.idx != UINT32_MAX; }
+
 /* ================================================================== */
 /* Shape descriptors                                                   */
 /* ================================================================== */
@@ -50,6 +62,20 @@ typedef enum {
     JCE_BODY_KINEMATIC = 2
 } JceBodyType;
 
+typedef enum {
+    JCE_CONSTRAINT_POINT2POINT = 0,
+    JCE_CONSTRAINT_HINGE       = 1,
+    JCE_CONSTRAINT_SLIDER      = 2,
+    JCE_CONSTRAINT_GENERIC6DOF = 3
+} JceConstraintType;
+
+/* ================================================================== */
+/* Collision layer defaults                                            */
+/* ================================================================== */
+
+#define JCE_COLLISION_DEFAULT_GROUP  0x0001
+#define JCE_COLLISION_ALL_MASK      0xFFFF
+
 /* ================================================================== */
 /* Contact / collision event                                           */
 /* ================================================================== */
@@ -60,6 +86,7 @@ typedef struct {
     float         normal[3];     /* contact normal (A→B) */
     float         point[3];      /* world-space contact point */
     float         depth;         /* penetration depth */
+    bool          is_trigger;    /* true if one of the bodies is a trigger */
 } JceContactEvent;
 
 /* Callback invoked on collision begin / end. */

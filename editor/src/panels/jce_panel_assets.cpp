@@ -370,15 +370,18 @@ static void draw_asset_delete_dialog(void)
         s_assets.show_delete_confirm = false;
     }
     if (s_assets.show_delete_dialog_open) {
+        const char *popup_id = "###AssetDeleteConfirm";
+        if (s_assets.show_delete_dialog_open && !ImGui::IsPopupOpen(popup_id))
+            ImGui::OpenPopup(popup_id);
+
         const ImGuiViewport *vp = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
         ImGui::SetNextWindowSize(ImVec2(400, 0), ImGuiCond_Appearing);
         ImGui::SetNextWindowViewport(vp->ID);
-        ImGui::SetNextWindowFocus();
 
         char title[256];
-        snprintf(title, sizeof(title), "%s###AssetDeleteConfirm", jce_editor_i18n("dialog.confirmDelete"));
-        if (ImGui::Begin(title,
+        snprintf(title, sizeof(title), "%s%s", jce_editor_i18n("dialog.confirmDelete"), popup_id);
+        if (ImGui::BeginPopupModal(title,
                     &s_assets.show_delete_dialog_open,
                     ImGuiWindowFlags_NoCollapse
                   | ImGuiWindowFlags_NoDocking
@@ -428,16 +431,18 @@ static void draw_asset_delete_dialog(void)
                     jce_editor_console_log_level(JCE_CONSOLE_ERROR,
                         "Delete failed: %s", e.what());
                 }
+                ImGui::CloseCurrentPopup();
                 s_assets.show_delete_dialog_open = false;
             }
             ImGui::PopStyleColor(3);
             ImGui::SameLine();
 
             if (ImGui::Button(jce_editor_i18n("dialog.cancel"), ImVec2(btn_w, 0))) {
+                ImGui::CloseCurrentPopup();
                 s_assets.show_delete_dialog_open = false;
             }
+            ImGui::EndPopup();
         }
-        ImGui::End();
     }
 }
 

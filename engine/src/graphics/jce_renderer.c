@@ -17,6 +17,7 @@
 #include <jce/core/jce_profiler.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -44,6 +45,139 @@ struct JceRenderer {
     uint32_t               reset_flags;
     uint32_t               debug_flags;
     char                   gpu_name[128];
+};
+
+static bool s_dbg_text_enabled = false;
+
+static void jce_bgfx_fatal(bgfx_callback_interface_t* _this,
+                           const char* _filePath,
+                           uint16_t _line,
+                           bgfx_fatal_t _code,
+                           const char* _str)
+{
+    (void)_this;
+    fprintf(stderr,
+            "bgfx fatal: code=%d file=%s line=%u msg=%s\n",
+            (int)_code,
+            _filePath ? _filePath : "<null>",
+            (unsigned)_line,
+            _str ? _str : "<null>");
+    fflush(stderr);
+}
+
+static void jce_bgfx_trace_vargs(bgfx_callback_interface_t* _this,
+                                 const char* _filePath,
+                                 uint16_t _line,
+                                 const char* _format,
+                                 va_list _argList)
+{
+    (void)_this;
+    (void)_filePath;
+    (void)_line;
+    (void)_format;
+    (void)_argList;
+}
+
+static void jce_bgfx_profiler_begin(bgfx_callback_interface_t* _this,
+                                    const char* _name,
+                                    uint32_t _abgr,
+                                    const char* _filePath,
+                                    uint16_t _line)
+{
+    (void)_this; (void)_name; (void)_abgr; (void)_filePath; (void)_line;
+}
+
+static void jce_bgfx_profiler_begin_literal(bgfx_callback_interface_t* _this,
+                                            const char* _name,
+                                            uint32_t _abgr,
+                                            const char* _filePath,
+                                            uint16_t _line)
+{
+    (void)_this; (void)_name; (void)_abgr; (void)_filePath; (void)_line;
+}
+
+static void jce_bgfx_profiler_end(bgfx_callback_interface_t* _this)
+{
+    (void)_this;
+}
+
+static uint32_t jce_bgfx_cache_read_size(bgfx_callback_interface_t* _this,
+                                         uint64_t _id)
+{
+    (void)_this; (void)_id;
+    return 0;
+}
+
+static bool jce_bgfx_cache_read(bgfx_callback_interface_t* _this,
+                                uint64_t _id,
+                                void* _data,
+                                uint32_t _size)
+{
+    (void)_this; (void)_id; (void)_data; (void)_size;
+    return false;
+}
+
+static void jce_bgfx_cache_write(bgfx_callback_interface_t* _this,
+                                 uint64_t _id,
+                                 const void* _data,
+                                 uint32_t _size)
+{
+    (void)_this; (void)_id; (void)_data; (void)_size;
+}
+
+static void jce_bgfx_screen_shot(bgfx_callback_interface_t* _this,
+                                 const char* _filePath,
+                                 uint32_t _width,
+                                 uint32_t _height,
+                                 uint32_t _pitch,
+                                 const void* _data,
+                                 uint32_t _size,
+                                 bool _yflip)
+{
+    (void)_this; (void)_filePath; (void)_width; (void)_height;
+    (void)_pitch; (void)_data; (void)_size; (void)_yflip;
+}
+
+static void jce_bgfx_capture_begin(bgfx_callback_interface_t* _this,
+                                   uint32_t _width,
+                                   uint32_t _height,
+                                   uint32_t _pitch,
+                                   bgfx_texture_format_t _format,
+                                   bool _yflip)
+{
+    (void)_this; (void)_width; (void)_height; (void)_pitch;
+    (void)_format; (void)_yflip;
+}
+
+static void jce_bgfx_capture_end(bgfx_callback_interface_t* _this)
+{
+    (void)_this;
+}
+
+static void jce_bgfx_capture_frame(bgfx_callback_interface_t* _this,
+                                   const void* _data,
+                                   uint32_t _size)
+{
+    (void)_this; (void)_data; (void)_size;
+}
+
+static const bgfx_callback_vtbl_t s_bgfx_callback_vtbl = {
+    jce_bgfx_fatal,
+    jce_bgfx_trace_vargs,
+    jce_bgfx_profiler_begin,
+    jce_bgfx_profiler_begin_literal,
+    jce_bgfx_profiler_end,
+    jce_bgfx_cache_read_size,
+    jce_bgfx_cache_read,
+    jce_bgfx_cache_write,
+    jce_bgfx_screen_shot,
+    jce_bgfx_capture_begin,
+    jce_bgfx_capture_end,
+    jce_bgfx_capture_frame,
+};
+
+static bgfx_callback_interface_t s_bgfx_callback = {
+    &s_bgfx_callback_vtbl,
 };
 
 /* Map backend enum to bgfx renderer type. */
@@ -181,6 +315,7 @@ JceRenderer *jce_renderer_create(JceWindow *win,
         init.resolution.height = h;
         init.resolution.reset  = reset_flags;
         init.platformData      = pd;
+        init.callback          = &s_bgfx_callback;
         ok = bgfx_init(&init);
         if (!ok)
             LOG_WARN(LOG_TAG, "requested backend %s failed",
@@ -199,6 +334,7 @@ JceRenderer *jce_renderer_create(JceWindow *win,
             init.resolution.height = h;
             init.resolution.reset  = reset_flags;
             init.platformData      = pd;
+            init.callback          = &s_bgfx_callback;
             if (bgfx_init(&init)) { ok = true; break; }
         }
     }
@@ -216,7 +352,15 @@ JceRenderer *jce_renderer_create(JceWindow *win,
     LOG_INFO(LOG_TAG, "renderer: %s",
              bgfx_get_renderer_name(bgfx_get_renderer_type()));
 
-    if (cfg->debug_text)
+    bool enable_debug_text = cfg->debug_text;
+    if (bgfx_get_renderer_type() == BGFX_RENDERER_TYPE_OPENGL) {
+        if (enable_debug_text) {
+            LOG_INFO(LOG_TAG, "disabling bgfx debug text on OpenGL backend");
+        }
+        enable_debug_text = false;
+    }
+
+    if (enable_debug_text)
         bgfx_set_debug(BGFX_DEBUG_TEXT);
 
     /* View 0 (3D): clear color + depth. */
@@ -244,7 +388,8 @@ JceRenderer *jce_renderer_create(JceWindow *win,
         return NULL;
     }
     r->reset_flags = reset_flags;
-    r->debug_flags = cfg->debug_text ? BGFX_DEBUG_TEXT : 0;
+    r->debug_flags = enable_debug_text ? BGFX_DEBUG_TEXT : 0;
+    s_dbg_text_enabled = enable_debug_text;
 
     /* Color vertex layout: pos(float3) + color(uint8x4). */
     bgfx_vertex_layout_begin(&r->layout,
@@ -511,6 +656,7 @@ void jce_renderer_destroy(JceRenderer *r)
         JCE_FREE(r);
         return;
     }
+    s_dbg_text_enabled = false;
     bgfx_destroy_program(r->program);
     if (r->program_textured.idx != UINT16_MAX)
         bgfx_destroy_program(r->program_textured);
@@ -573,7 +719,8 @@ void jce_renderer_begin_frame(const JceRenderer *r, JceWindow *win)
     /* View 2 (debug): same as UI for debug text. */
     bgfx_set_view_rect(JCE_VIEW_DEBUG, vp_x, vp_y, vp_w, vp_h);
 
-    bgfx_dbg_text_clear(0, false);
+    if (s_dbg_text_enabled)
+        bgfx_dbg_text_clear(0, false);
     bgfx_touch(JCE_VIEW_MAIN_3D);
     bgfx_touch(JCE_VIEW_UI);
     bgfx_touch(JCE_VIEW_DEBUG);
@@ -659,6 +806,9 @@ void jce_renderer_dbg_text(uint16_t x, uint16_t y,
 {
     /* bgfx handles global state so we don't need 'r' here.
      * Our callers in jce_engine already skip this when in fallback mode. */
+    if (!s_dbg_text_enabled)
+        return;
+
     char buf[256];
     va_list ap;
     va_start(ap, fmt);
@@ -843,6 +993,8 @@ void jce_renderer_dbg_text_attr(uint16_t x, uint16_t y,
                                 uint8_t attr,
                                 const char *str)
 {
+    if (!s_dbg_text_enabled)
+        return;
     bgfx_dbg_text_printf(x, y, attr, "%s", str);
 }
 

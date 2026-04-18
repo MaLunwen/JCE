@@ -17,7 +17,10 @@ extern "C" {
 #include <jce/core/jce_log.h>
 #include <jce/core/jce_math.h>
 #include <jce/graphics/jce_camera.h>
+#include <jce/graphics/jce_csm.h>
+#include <jce/graphics/jce_debug_draw.h>
 #include <jce/graphics/jce_editor_render_bridge.h>
+#include <jce/graphics/jce_ibl.h>
 #include <jce/graphics/jce_lighting.h>
 #include <jce/graphics/jce_lighting_system.h>
 #include <jce/graphics/jce_material.h>
@@ -26,6 +29,8 @@ extern "C" {
 #include <jce/graphics/jce_pbr_material.h>
 #include <jce/graphics/jce_renderer.h>
 #include <jce/graphics/jce_shaders.h>
+#include <jce/graphics/jce_skybox.h>
+#include <jce/graphics/jce_sprite_batch.h>
 #include <jce/graphics/jce_texture.h>
 #include <jce/graphics/jce_views.h>
 #include <jce/animation/jce_animation.h>
@@ -75,6 +80,8 @@ struct SceneRenderState {
     bgfx_program_handle_t   prog_sky;
     bgfx_vertex_layout_t    sky_layout;
     bgfx_uniform_handle_t   u_sky_colors;
+    bgfx_uniform_handle_t   u_sky_params;
+    bgfx_uniform_handle_t   u_sky_equirect;
     bgfx_uniform_handle_t   u_grid_camera;
     bgfx_uniform_handle_t   u_grid_fade;
 
@@ -101,7 +108,34 @@ struct SceneRenderState {
     bgfx_uniform_handle_t      u_shadowVP;
     bool                       shadow_valid;
 
+    /* Cascaded shadow maps. */
+    uint32_t                   csm_cascade_count;   /* 0=single shadow, 2-4=CSM */
+    bgfx_texture_handle_t      csm_tex[JCE_CSM_MAX_CASCADES];
+    bgfx_frame_buffer_handle_t csm_fbo[JCE_CSM_MAX_CASCADES];
+    bgfx_uniform_handle_t      u_csm_samplers[JCE_CSM_MAX_CASCADES];
+    bgfx_uniform_handle_t      u_csm_vp;     /* mat4[4] */
+    bgfx_uniform_handle_t      u_csm_splits;
+    bool                       csm_valid;
+
     JceLightEnv              *light_env;
+
+    /* Skybox / IBL state. */
+    JceSkybox               *skybox;
+    JceIblData              *ibl_data;
+    bgfx_texture_handle_t    brdf_lut;       /* shared, created once */
+    bgfx_uniform_handle_t    u_ibl_irradiance;
+    bgfx_uniform_handle_t    u_ibl_prefilter;
+    bgfx_uniform_handle_t    u_ibl_brdf_lut;
+    bgfx_uniform_handle_t    u_ibl_params;
+    char                     skybox_hdr_path[256];
+    bool                     skybox_active;
+    float                    skybox_exposure;
+    float                    skybox_rotation;
+    uint32_t                 viewport_width;
+    uint32_t                 viewport_height;
+
+    /* Sprite batch for 2D sprite rendering. */
+    JceSpriteBatch          *sprite_batch;
 
     /* Ghost (drag-preview) model state. */
     bool         ghost_active;
@@ -133,6 +167,7 @@ void draw_grid(void);
 void draw_entities(void);
 void draw_ghost_entity(void);
 void draw_hover_highlight(void);
+void draw_physics_debug(void);
 
 /* ── Functions from jce_scene_render_camera.cpp ───────────────────── */
 

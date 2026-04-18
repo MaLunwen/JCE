@@ -49,6 +49,7 @@ typedef enum {
     JCE_VIEW_SHADED = 0,
     JCE_VIEW_WIREFRAME,
     JCE_VIEW_TEXTURED,
+    JCE_VIEW_WIREFRAME_TEXTURED,
 } JceSceneViewMode;
 
 /* ── Play State ────────────────────────────────────────────────────── */
@@ -136,6 +137,9 @@ typedef enum {
     JCE_COMP_CHARACTER_CONTROLLER,
     JCE_COMP_AUDIO_SOURCE,
     JCE_COMP_SCRIPT,
+    JCE_COMP_SKYBOX,
+    JCE_COMP_SPRITE_ANIMATOR,
+    JCE_COMP_CONSTRAINT,
     JCE_COMP_TYPE_COUNT,
 } JceComponentType;
 
@@ -167,7 +171,15 @@ struct JceComponentInfo {
             char  emissive_tex[128];
         } mesh_renderer;
 
-        struct { float color[4]; float intensity; int type; } light;
+        struct {
+            float color[4];
+            float intensity;
+            int   type;          /* 0=directional, 1=point, 2=spot */
+            float radius;        /* point & spot: attenuation range */
+            float inner_cone_deg;/* spot: inner cone angle (degrees) */
+            float outer_cone_deg;/* spot: outer cone angle (degrees) */
+            bool  casts_shadow;
+        } light;
         struct { float fov; float near_clip; float far_clip; bool ortho; } camera;
 
         struct {
@@ -234,6 +246,35 @@ struct JceComponentInfo {
         struct {
             char  script_path[128];
         } script;
+
+        struct {
+            char  hdr_path[256];
+            float rotation;       /* Y-axis rotation (degrees) */
+            float exposure;       /* exposure multiplier, default 1.0 */
+            bool  use_as_ibl;     /* also generate IBL textures */
+        } skybox;
+
+        struct {
+            char  sheet_path[128];  /* sprite sheet image */
+            char  atlas_path[128]; /* optional JSON atlas (Aseprite) */
+            int   frame_width;
+            int   frame_height;
+            char  current_anim[64];
+            float speed;
+            bool  loop;
+            bool  playing;
+        } sprite_animator;
+
+        struct {
+            int   constraint_type;   /* 0=point2point, 1=hinge, 2=slider, 3=6dof */
+            uint32_t target_entity;  /* other entity id */
+            float pivot_a[3];
+            float pivot_b[3];
+            float axis[3];
+            float lower_limit;
+            float upper_limit;
+            bool  disable_collision;
+        } constraint;
     } data;
 };
 
@@ -290,6 +331,8 @@ void              jce_state_set_view_mode(JceSceneViewMode mode);
 JceSceneViewMode  jce_state_get_view_mode(void);
 bool              jce_state_get_show_grid(void);
 void              jce_state_set_show_grid(bool show);
+bool              jce_state_get_show_physics_debug(void);
+void              jce_state_set_show_physics_debug(bool show);
 bool              jce_state_get_2d_mode(void);
 void              jce_state_set_2d_mode(bool is_2d);
 bool              jce_state_get_live_preview(void);

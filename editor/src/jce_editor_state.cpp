@@ -8,6 +8,7 @@
  */
 
 #include "jce_editor_state_internal.h"
+#include "jce_editor_i18n.h"
 #include "jce_editor_config.h"
 
 /* Forward-declare only the one function we need from scene_render,
@@ -639,12 +640,38 @@ static const char *s_comp_names[] = {
 	"Character Controller",
 	"Audio Source",
 	"Script",
+	"Skybox",
+	"Sprite Animator",
+	"Constraint",
+};
+
+static const char *s_comp_i18n_keys[] = {
+	"transform.title",
+	"meshRenderer.title",
+	"spriteRenderer.title",
+	"camera.title",
+	"light.title",
+	"animator.title",
+	"skeletalAnimator.title",
+	"rigidbody.title",
+	"boxCollider.title",
+	"sphereCollider.title",
+	"characterController.title",
+	"audioSource.title",
+	"inspector.script",
+	"comp.skybox",
+	"comp.spriteAnimator",
+	"comp.constraint",
 };
 
 const char *jce_component_type_name(JceComponentType type)
 {
-	if (type >= 0 && type < JCE_COMP_TYPE_COUNT)
+	if (type >= 0 && type < JCE_COMP_TYPE_COUNT) {
+		const char *translated = jce_editor_i18n(s_comp_i18n_keys[type]);
+		if (translated != s_comp_i18n_keys[type])
+			return translated;
 		return s_comp_names[type];
+	}
 	return "Unknown";
 }
 
@@ -769,6 +796,42 @@ void jce_state_add_component(uint32_t entity_id, JceComponentType type)
 	case JCE_COMP_SKELETAL_ANIMATOR:
 		c->data.skeletal_animator.speed = 1.0f;
 		break;
+	case JCE_COMP_SPRITE_RENDERER:
+		c->data.sprite_renderer.color[0] = 1.0f;
+		c->data.sprite_renderer.color[1] = 1.0f;
+		c->data.sprite_renderer.color[2] = 1.0f;
+		c->data.sprite_renderer.color[3] = 1.0f;
+		break;
+	case JCE_COMP_SKYBOX:
+		c->data.skybox.exposure = 1.0f;
+		break;
+	case JCE_COMP_SPRITE_ANIMATOR:
+		c->data.sprite_animator.speed = 1.0f;
+		c->data.sprite_animator.frame_width = 64;
+		c->data.sprite_animator.frame_height = 64;
+		break;
+	case JCE_COMP_RIGIDBODY:
+		c->data.rigidbody.mass = 1.0f;
+		c->data.rigidbody.use_gravity = true;
+		break;
+	case JCE_COMP_BOX_COLLIDER:
+		c->data.box_collider.size[0] = 1.0f;
+		c->data.box_collider.size[1] = 1.0f;
+		c->data.box_collider.size[2] = 1.0f;
+		break;
+	case JCE_COMP_SPHERE_COLLIDER:
+		c->data.sphere_collider.radius = 0.5f;
+		break;
+	case JCE_COMP_CHARACTER_CONTROLLER:
+		c->data.character_controller.height = 2.0f;
+		c->data.character_controller.radius = 0.3f;
+		c->data.character_controller.step_offset = 0.35f;
+		c->data.character_controller.slope_limit = 45.0f;
+		break;
+	case JCE_COMP_AUDIO_SOURCE:
+		c->data.audio_source.volume = 1.0f;
+		c->data.audio_source.pitch = 1.0f;
+		break;
 	default:
 		break;
 	}
@@ -827,6 +890,10 @@ JceSceneViewMode  jce_state_get_view_mode(void)                { return s.view_m
 
 bool  jce_state_get_show_grid(void)          { return s.show_grid; }
 void  jce_state_set_show_grid(bool show)     { s.show_grid = show; persist_render_settings(); }
+
+static bool s_show_physics_debug = false;
+bool  jce_state_get_show_physics_debug(void)  { return s_show_physics_debug; }
+void  jce_state_set_show_physics_debug(bool v){ s_show_physics_debug = v; }
 
 bool  jce_state_get_2d_mode(void)            { return s.is_2d_mode; }
 void  jce_state_set_2d_mode(bool is_2d)      { s.is_2d_mode = is_2d; }

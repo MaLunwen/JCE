@@ -10,6 +10,10 @@
 #include <imgui.h>
 #include <stdio.h>
 
+/* Renderer backend list defined in jce_editor_panels.cpp (platform-specific). */
+extern const char *s_renderer_names[];
+extern const int   s_renderer_count;
+
 /* ── Game View state ──────────────────────────────────────────────── */
 
 static int  s_aspect_idx  = 0;
@@ -27,9 +31,8 @@ void jce_editor_panel_game_view_content(void)
 
     ImGui::SameLine();
     static int s_renderer_idx = 0;
-    const char *renderers[] = { "OpenGL", "Vulkan", "Auto" };
     ImGui::PushItemWidth(80);
-    ImGui::Combo("##renderer", &s_renderer_idx, renderers, 3);
+    ImGui::Combo("##renderer", &s_renderer_idx, s_renderer_names, s_renderer_count);
     ImGui::PopItemWidth();
 
     ImGui::SameLine();
@@ -62,9 +65,8 @@ void jce_editor_panel_game_view_content(void)
 
     if (s_show_stats) {
         ImGui::SetCursorPos(ImVec2(8, ImGui::GetCursorPosY()));
-        const char *renderer_names[] = { "OpenGL 3.3", "Vulkan 1.2", "Auto" };
         ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 0.8f),
-            "%s: %s", jce_editor_i18n("game.renderer"), renderer_names[s_renderer_idx]);
+            "%s: %s", jce_editor_i18n("game.renderer"), s_renderer_names[s_renderer_idx]);
         ImGui::SetCursorPos(ImVec2(8, ImGui::GetCursorPosY()));
         ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 0.8f),
             "%s: %.1f | %s: -- | %s: --",

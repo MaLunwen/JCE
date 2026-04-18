@@ -123,6 +123,8 @@ function(jce_compile_shaders)
             endif()
 
             set(_out "${ARG_OUTPUT_DIR}/${_name}_${_suffix}.bin")
+            set(_shader_defines
+                --define "BGFX_CONFIG_MAX_BONES=64")
 
             add_custom_command(
                 OUTPUT  "${_out}"
@@ -134,7 +136,7 @@ function(jce_compile_shaders)
                         -p "${_profile}"
                         --varyingdef "${_varying}"
                         -i "${BGFX_SHADER_INCLUDE_PATH}"
-                        --define "BGFX_CONFIG_MAX_BONES=64"
+                        ${_shader_defines}
                 DEPENDS "${_src}" "${_varying}"
                 COMMENT "Shader: ${_name} (${_suffix})"
                 VERBATIM)

@@ -188,14 +188,17 @@ void jce_editor_dialog_new_project(bool *p_open)
 
     new_project_ensure_init();
 
+    const char *popup_id = "###NewProject";
+    if (*p_open && !ImGui::IsPopupOpen(popup_id))
+        ImGui::OpenPopup(popup_id);
+
     char _title[256];
-    snprintf(_title, sizeof(_title), "%s###NewProject",
-             jce_editor_i18n("newProject.title"));
+    snprintf(_title, sizeof(_title), "%s%s",
+             jce_editor_i18n("newProject.title"), popup_id);
 
     ImGui::SetNextWindowSize(ImVec2(550, 350), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin(_title, p_open,
+    if (!ImGui::BeginPopupModal(_title, p_open,
                       ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking)) {
-        ImGui::End();
         return;
     }
 
@@ -203,13 +206,6 @@ void jce_editor_dialog_new_project(bool *p_open)
         s_new_project.error_msg[0] = '\0';
 
     char _lbl[256];
-
-    /* Heading */
-    ImGui::TextColored(JCE_COLOR_ACCENT, "%s",
-                       jce_editor_i18n("newProject.title"));
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
 
     /* Project Name */
     ImGui::Text("%s", jce_editor_i18n("newProject.name"));
@@ -328,6 +324,7 @@ void jce_editor_dialog_new_project(bool *p_open)
                     jce_editor_console_log("Created project: %s at %s",
                                            s_new_project.project_name,
                                            project_dir.string().c_str());
+                    ImGui::CloseCurrentPopup();
                     *p_open = false;
                 }
             } catch (const std::exception &e) {
@@ -342,10 +339,11 @@ void jce_editor_dialog_new_project(bool *p_open)
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("dialog.cancel"), ImVec2(btn_w, 0))
         || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        ImGui::CloseCurrentPopup();
         *p_open = false;
     }
 
-    ImGui::End();
+    ImGui::EndPopup();
 }
 
 /* ======================================================================

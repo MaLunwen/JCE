@@ -73,4 +73,13 @@ vec3 cookTorranceBRDF(vec3 N, vec3 V, vec3 L, vec3 F0, vec3 albedo, float metall
     return (diffuse + specular) * NdotL;
 }
 
+// Fresnel-Schlick with roughness for IBL ambient specular
+vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness)
+{
+    vec3 oneMinusRough = vec3_splat(1.0 - roughness);
+    // max(oneMinusRough, F0) per-component
+    vec3 maxVal = max(oneMinusRough, F0);
+    return F0 + (maxVal - F0) * pow(max(1.0 - cosTheta, 0.0), 5.0);
+}
+
 #endif // PBR_COMMON_SH

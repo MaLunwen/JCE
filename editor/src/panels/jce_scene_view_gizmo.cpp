@@ -267,6 +267,10 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
                                 other_xform->data.transform.rot[0] += drot[0];
                                 other_xform->data.transform.rot[1] += drot[1];
                                 other_xform->data.transform.rot[2] += drot[2];
+                                for (int a = 0; a < 3; a++) {
+                                    other_xform->data.transform.rot[a] = fmodf(other_xform->data.transform.rot[a], 360.0f);
+                                    if (other_xform->data.transform.rot[a] < 0.0f) other_xform->data.transform.rot[a] += 360.0f;
+                                }
                             } else if (active_gm == JCE_GIZMO_SCALE) {
                                 other_xform->data.transform.scale[0] += dscale[0];
                                 other_xform->data.transform.scale[1] += dscale[1];
@@ -284,6 +288,10 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
                         xform->data.transform.rot[0] = gizmo_rot[0];
                         xform->data.transform.rot[1] = gizmo_rot[1];
                         xform->data.transform.rot[2] = gizmo_rot[2];
+                        for (int a = 0; a < 3; a++) {
+                            xform->data.transform.rot[a] = fmodf(xform->data.transform.rot[a], 360.0f);
+                            if (xform->data.transform.rot[a] < 0.0f) xform->data.transform.rot[a] += 360.0f;
+                        }
                         xform->data.transform.scale[0] = gizmo_scale[0] < 0.001f ? 0.001f : gizmo_scale[0];
                         xform->data.transform.scale[1] = gizmo_scale[1] < 0.001f ? 0.001f : gizmo_scale[1];
                         xform->data.transform.scale[2] = gizmo_scale[2] < 0.001f ? 0.001f : gizmo_scale[2];

@@ -1,5 +1,5 @@
 $input a_position, a_normal, a_tangent, a_texcoord0, a_indices, a_weight
-$output v_texcoord0, v_worldpos, v_normal, v_tangent, v_bitangent
+$output v_texcoord0, v_worldpos, v_normal, v_tangent, v_bitangent, v_viewdepth
 
 #include <bgfx_shader.sh>
 
@@ -12,12 +12,24 @@ float decode_bone_index(float raw_index)
     return floor(idx + 0.5);
 }
 
+int decode_bone_index_clamped(float raw_index)
+{
+    float idx = decode_bone_index(raw_index);
+    if (idx < 0.0) {
+        idx = 0.0;
+    }
+    if (idx > 63.0) {
+        idx = 63.0;
+    }
+    return int(idx);
+}
+
 void main()
 {
-    int i0 = clamp(int(decode_bone_index(a_indices.x)), 0, 63);
-    int i1 = clamp(int(decode_bone_index(a_indices.y)), 0, 63);
-    int i2 = clamp(int(decode_bone_index(a_indices.z)), 0, 63);
-    int i3 = clamp(int(decode_bone_index(a_indices.w)), 0, 63);
+    int i0 = decode_bone_index_clamped(a_indices.x);
+    int i1 = decode_bone_index_clamped(a_indices.y);
+    int i2 = decode_bone_index_clamped(a_indices.z);
+    int i3 = decode_bone_index_clamped(a_indices.w);
 
     // Bone blending via model palette
     mat4 skinMtx = a_weight.x * u_model[i0]
@@ -26,11 +38,13 @@ void main()
                  + a_weight.w * u_model[i3];
 
     vec3 wpos = mul(skinMtx, vec4(a_position, 1.0)).xyz;
-    gl_Position = mul(u_viewProj, vec4(wpos, 1.0));
+    vec4 viewPos = mul(u_view, vec4(wpos, 1.0));
+    gl_Position = mul(u_proj, viewPos);
 
     v_normal    = normalize(mul(skinMtx, vec4(a_normal, 0.0)).xyz);
     v_tangent   = normalize(mul(skinMtx, vec4(a_tangent.xyz, 0.0)).xyz);
     v_bitangent = cross(v_normal, v_tangent) * a_tangent.w;
     v_texcoord0 = a_texcoord0;
     v_worldpos  = wpos;
+    v_viewdepth = -viewPos.z;
 }

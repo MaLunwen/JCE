@@ -36,6 +36,7 @@
 #include <jce/app/jce_subsystem.h>
 #include <jce/core/jce_allocator.h>
 #include <jce/core/jce_event.h>
+#include <bgfx/c99/bgfx.h>
 #include "embedded_assets.h"
 
 #define LOG_TAG "engine"
@@ -167,6 +168,11 @@ static void render_loading_frame(const JceRenderer *r, JceWindow *win,
     jce_renderer_begin_frame(r, win);
     jce_renderer_dbg_text(2, 2, 0x0f, "%s", msg);
     jce_renderer_end_frame(r);
+}
+
+static bool should_render_loading_frame(void)
+{
+    return bgfx_get_renderer_type() != BGFX_RENDERER_TYPE_OPENGL;
 }
 
 /* -- Create -------------------------------------------------------- */
@@ -371,7 +377,9 @@ JceEngine *jce_engine_create(int argc, char *argv[])
 
     /* -- Remaining subsystems ------------------------------------- */
 
-    render_loading_frame(e->renderer, e->window, "Loading...");
+    if (should_render_loading_frame()) {
+        render_loading_frame(e->renderer, e->window, "Loading...");
+    }
     jce_gpu_caps_init(&e->gpu_caps);
 
     e->input = jce_input_create();
@@ -445,7 +453,8 @@ JceEngine *jce_engine_create(int argc, char *argv[])
     /* -- Initialize application ----------------------------------- */
 
     if (g_app_desc_set && g_app_desc.init) {
-        render_loading_frame(e->renderer, e->window, "Loading assets...");
+        if (should_render_loading_frame())
+            render_loading_frame(e->renderer, e->window, "Loading assets...");
         if (!g_app_desc.init(&e->svc, g_app_desc.user_data))
             goto fail;
     } else {

@@ -13,6 +13,7 @@
 #include <imgui.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 extern "C" {
 #include <jce/graphics/jce_pbr_material.h>
@@ -298,6 +299,11 @@ static void draw_comp_transform(JceComponentInfo *comp)
     ImGui::Text("%s", jce_editor_i18n("transform.rotation"));
     ImGui::SameLine(80);
     draw_vec3_control("Rotation", comp->data.transform.rot, 1.0f);
+    /* Normalize rotation angles to [0, 360). */
+    for (int a = 0; a < 3; a++) {
+        comp->data.transform.rot[a] = fmodf(comp->data.transform.rot[a], 360.0f);
+        if (comp->data.transform.rot[a] < 0.0f) comp->data.transform.rot[a] += 360.0f;
+    }
     ImGui::Text("%s", jce_editor_i18n("transform.scale"));
     ImGui::SameLine(80);
     draw_vec3_control("Scale", comp->data.transform.scale, 0.01f, 1.0f);
@@ -322,8 +328,45 @@ static void draw_comp_light(JceComponentInfo *comp)
     int prev_type = comp->data.light.type;
     snprintf(lbl, sizeof(lbl), "%s###Type", jce_editor_i18n("light.type"));
     ImGui::Combo(lbl, &comp->data.light.type, light_types, 3);
-    if (comp->data.light.type != prev_type)
+    if (comp->data.light.type != prev_type) {
         insp_undo_int(&comp->data.light.type, prev_type);
+        /* Apply sensible defaults when switching to point/spot. */
+        if (comp->data.light.type == 1 || comp->data.light.type == 2) {
+            if (comp->data.light.radius <= 0.0f)
+                comp->data.light.radius = 10.0f;
+        }
+        if (comp->data.light.type == 2) {
+            if (comp->data.light.inner_cone_deg <= 0.0f)
+                comp->data.light.inner_cone_deg = 25.0f;
+            if (comp->data.light.outer_cone_deg <= 0.0f)
+                comp->data.light.outer_cone_deg = 35.0f;
+        }
+    }
+
+    /* Radius for point and spot lights. */
+    if (comp->data.light.type == 1 || comp->data.light.type == 2) {
+        snprintf(lbl, sizeof(lbl), "%s###Radius", jce_editor_i18n("collider.radius"));
+        ImGui::DragFloat(lbl, &comp->data.light.radius, 0.1f, 0.01f, 1000.0f);
+        insp_track_edit();
+    }
+
+    /* Cone angles for spot lights. */
+    if (comp->data.light.type == 2) {
+        ImGui::DragFloat("Inner Cone###InnerCone", &comp->data.light.inner_cone_deg,
+                         0.5f, 0.0f, 89.0f);
+        insp_track_edit();
+        ImGui::DragFloat("Outer Cone###OuterCone", &comp->data.light.outer_cone_deg,
+                         0.5f, 0.0f, 90.0f);
+        insp_track_edit();
+        /* Clamp: outer must be >= inner. */
+        if (comp->data.light.outer_cone_deg < comp->data.light.inner_cone_deg)
+            comp->data.light.outer_cone_deg = comp->data.light.inner_cone_deg;
+    }
+
+    /* Casts shadow toggle. */
+    snprintf(lbl, sizeof(lbl), "Casts Shadow###CastsShadow");
+    if (ImGui::Checkbox(lbl, &comp->data.light.casts_shadow))
+        insp_undo_bool(&comp->data.light.casts_shadow);
 }
 
 static void draw_comp_camera(JceComponentInfo *comp)
@@ -729,9 +772,69 @@ static void draw_comp_audio_source(JceComponentInfo *comp)
 
 static void draw_comp_script(JceComponentInfo *comp)
 {
-    ImGui::InputText(jce_editor_i18n("inspector.script"), comp->data.script.script_path, 128);
+    ImGui::InputText("##script_path", comp->data.script.script_path, 128);
     insp_track_edit();
     accept_asset_drop(comp->data.script.script_path, 128);
+}
+
+static void draw_comp_skybox(JceComponentInfo *comp)
+{
+    ImGui::InputText(jce_editor_i18n("skybox.hdrPath"), comp->data.skybox.hdr_path, 256);
+    insp_track_edit();
+    accept_asset_drop(comp->data.skybox.hdr_path, 256);
+    ImGui::DragFloat(jce_editor_i18n("skybox.rotation"), &comp->data.skybox.rotation, 1.0f, 0.0f, 360.0f, "%.1f deg");
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n("skybox.exposure"), &comp->data.skybox.exposure, 0.01f, 0.01f, 10.0f, "%.2f");
+    insp_track_edit();
+    if (comp->data.skybox.exposure <= 0.0f) comp->data.skybox.exposure = 1.0f;
+    if (ImGui::Checkbox(jce_editor_i18n("skybox.useAsIbl"), &comp->data.skybox.use_as_ibl))
+        insp_undo_bool(&comp->data.skybox.use_as_ibl);
+}
+
+static void draw_comp_sprite_animator(JceComponentInfo *comp)
+{
+    ImGui::InputText(jce_editor_i18n("spriteAnimator.sheetPath"), comp->data.sprite_animator.sheet_path, 128);
+    insp_track_edit();
+    accept_asset_drop(comp->data.sprite_animator.sheet_path, 128);
+    ImGui::InputText(jce_editor_i18n("spriteAnimator.atlasPath"), comp->data.sprite_animator.atlas_path, 128);
+    insp_track_edit();
+    accept_asset_drop(comp->data.sprite_animator.atlas_path, 128);
+    ImGui::DragInt(jce_editor_i18n("spriteAnimator.frameWidth"), &comp->data.sprite_animator.frame_width, 1, 1, 4096);
+    insp_track_edit();
+    ImGui::DragInt(jce_editor_i18n("spriteAnimator.frameHeight"), &comp->data.sprite_animator.frame_height, 1, 1, 4096);
+    insp_track_edit();
+    ImGui::InputText(jce_editor_i18n("spriteAnimator.animation"), comp->data.sprite_animator.current_anim, 64);
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n("spriteAnimator.speed"), &comp->data.sprite_animator.speed, 0.01f, 0.0f, 10.0f, "%.2f");
+    insp_track_edit();
+    if (ImGui::Checkbox(jce_editor_i18n("spriteAnimator.loop"), &comp->data.sprite_animator.loop))
+        insp_undo_bool(&comp->data.sprite_animator.loop);
+    if (ImGui::Checkbox(jce_editor_i18n("spriteAnimator.playing"), &comp->data.sprite_animator.playing))
+        insp_undo_bool(&comp->data.sprite_animator.playing);
+}
+
+static void draw_comp_constraint(JceComponentInfo *comp)
+{
+    const char *constraint_types[] = { "Point2Point", "Hinge", "Slider", "6DOF" };
+    int prev_type = comp->data.constraint.constraint_type;
+    if (ImGui::Combo(jce_editor_i18n("constraint.type"), &comp->data.constraint.constraint_type,
+                      constraint_types, 4))
+        insp_undo_int(&comp->data.constraint.constraint_type, prev_type);
+    ImGui::DragFloat3(jce_editor_i18n("constraint.pivotA"), comp->data.constraint.pivot_a, 0.1f);
+    insp_track_edit();
+    ImGui::DragFloat3(jce_editor_i18n("constraint.pivotB"), comp->data.constraint.pivot_b, 0.1f);
+    insp_track_edit();
+    if (comp->data.constraint.constraint_type == 1 ||
+        comp->data.constraint.constraint_type == 2) {
+        ImGui::DragFloat3(jce_editor_i18n("constraint.axis"), comp->data.constraint.axis, 0.1f);
+        insp_track_edit();
+        ImGui::DragFloat(jce_editor_i18n("constraint.lowerLimit"), &comp->data.constraint.lower_limit, 0.1f);
+        insp_track_edit();
+        ImGui::DragFloat(jce_editor_i18n("constraint.upperLimit"), &comp->data.constraint.upper_limit, 0.1f);
+        insp_track_edit();
+    }
+    if (ImGui::Checkbox(jce_editor_i18n("constraint.disableCollision"), &comp->data.constraint.disable_collision))
+        insp_undo_bool(&comp->data.constraint.disable_collision);
 }
 
 /* ── Component editor ─────────────────────────────────────────────── */
@@ -785,6 +888,9 @@ static void draw_component(JceComponentInfo *comp, uint32_t entity_id)
         case JCE_COMP_CHARACTER_CONTROLLER: draw_comp_character_controller(comp); break;
         case JCE_COMP_AUDIO_SOURCE:         draw_comp_audio_source(comp);         break;
         case JCE_COMP_SCRIPT:               draw_comp_script(comp);               break;
+        case JCE_COMP_SKYBOX:               draw_comp_skybox(comp);               break;
+        case JCE_COMP_SPRITE_ANIMATOR:      draw_comp_sprite_animator(comp);      break;
+        case JCE_COMP_CONSTRAINT:           draw_comp_constraint(comp);           break;
         default:
             ImGui::TextDisabled("%s", jce_editor_i18n("inspector.propertiesNotImplemented"));
             break;
@@ -1059,23 +1165,24 @@ void jce_editor_inspector_delete_dialog(void)
 
     const ImGuiViewport *vp = ImGui::GetMainViewport();
 
-        /* Dialog window (dimmer is handled globally by jce_editor_layout). */
+    const char *popup_id = "###ConfirmDeleteEntityDlg";
+    if (s_insp.delete_requested && !ImGui::IsPopupOpen(popup_id))
+        ImGui::OpenPopup(popup_id);
+
     ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(330, 0), ImGuiCond_Appearing);
     ImGui::SetNextWindowViewport(vp->ID);
-    ImGui::SetNextWindowFocus();
 
-        bool keep_open = s_insp.delete_requested;
+    bool keep_open = s_insp.delete_requested;
 
-        char title[256];
-        snprintf(title, sizeof(title), "%s###ConfirmDeleteEntityDlg", jce_editor_i18n("dialog.confirmDelete"));
-        if (!ImGui::Begin(title,
-                                            &keep_open,
+    char title[256];
+    snprintf(title, sizeof(title), "%s%s", jce_editor_i18n("dialog.confirmDelete"), popup_id);
+    if (!ImGui::BeginPopupModal(title,
+                                        &keep_open,
                       ImGuiWindowFlags_NoCollapse
                     | ImGuiWindowFlags_NoDocking
                     | ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::End();
-                s_insp.delete_requested = keep_open;
+        s_insp.delete_requested = keep_open;
         return;
     }
 
@@ -1110,7 +1217,8 @@ void jce_editor_inspector_delete_dialog(void)
 
         keep_open = false;
         ImGui::PopStyleColor(3);
-        ImGui::End();
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
         s_insp.delete_requested = keep_open;
         if (!keep_open)
             s_insp.delete_entity_count = 0;
@@ -1122,10 +1230,11 @@ void jce_editor_inspector_delete_dialog(void)
     if (ImGui::Button(jce_editor_i18n("inspector.no"), ImVec2(btn_w, 0))
         || ImGui::IsKeyPressed(ImGuiKey_Escape))
     {
+        ImGui::CloseCurrentPopup();
         keep_open = false;
     }
 
-    ImGui::End();
+    ImGui::EndPopup();
     s_insp.delete_requested = keep_open;
     if (!keep_open)
         s_insp.delete_entity_count = 0;

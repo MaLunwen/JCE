@@ -45,6 +45,58 @@ typedef struct {
     float    intensity;
 } JceDirectionalLight;
 
+typedef struct {
+    jce_vec3 position;
+    jce_vec3 color;
+    float    intensity;
+    float    radius;
+} JcePointLight;
+
+typedef struct {
+    jce_vec3 position;
+    jce_vec3 direction;
+    jce_vec3 color;
+    float    intensity;
+    float    radius;
+    float    inner_cone_cos;
+    float    outer_cone_cos;
+} JceSpotLight;
+
+/* ── Skybox component ───────────────────────────────────────────── */
+
+typedef struct {
+    char  hdr_path[256];
+    float rotation;
+    float exposure;
+    bool  use_as_ibl;
+} JceSkyboxComponent;
+
+/* ── Sprite animator component ──────────────────────────────────── */
+
+typedef struct {
+    char  sheet_path[128];
+    char  atlas_path[128];
+    int   frame_width;
+    int   frame_height;
+    char  current_anim[64];
+    float speed;
+    bool  loop;
+    bool  playing;
+} JceSpriteAnimatorComponent;
+
+/* ── Constraint component ───────────────────────────────────────── */
+
+typedef struct {
+    int      constraint_type;   /* 0=point2point, 1=hinge, 2=slider, 3=6dof */
+    uint32_t target_entity;
+    float    pivot_a[3];
+    float    pivot_b[3];
+    float    axis[3];
+    float    lower_limit;
+    float    upper_limit;
+    bool     disable_collision;
+} JceConstraintComponent;
+
 /* ── Physics components ──────────────────────────────────────────── */
 
 typedef struct {
@@ -116,6 +168,21 @@ JceCameraComponent    *jce_scene_get_camera(JceScene *s, JceEntity e);
 
 void                   jce_scene_set_dir_light(JceScene *s, JceEntity e, const JceDirectionalLight *l);
 JceDirectionalLight   *jce_scene_get_dir_light(JceScene *s, JceEntity e);
+
+void                   jce_scene_set_point_light(JceScene *s, JceEntity e, const JcePointLight *l);
+JcePointLight         *jce_scene_get_point_light(JceScene *s, JceEntity e);
+
+void                   jce_scene_set_spot_light(JceScene *s, JceEntity e, const JceSpotLight *l);
+JceSpotLight          *jce_scene_get_spot_light(JceScene *s, JceEntity e);
+
+void                          jce_scene_set_skybox(JceScene *s, JceEntity e, const JceSkyboxComponent *c);
+JceSkyboxComponent           *jce_scene_get_skybox(JceScene *s, JceEntity e);
+
+void                          jce_scene_set_sprite_animator(JceScene *s, JceEntity e, const JceSpriteAnimatorComponent *c);
+JceSpriteAnimatorComponent   *jce_scene_get_sprite_animator(JceScene *s, JceEntity e);
+
+void                          jce_scene_set_constraint(JceScene *s, JceEntity e, const JceConstraintComponent *c);
+JceConstraintComponent       *jce_scene_get_constraint(JceScene *s, JceEntity e);
 
 /* Iteration helpers for the editor. */
 typedef void (*JceEntityCallback)(JceScene *s, JceEntity e, void *user_data);

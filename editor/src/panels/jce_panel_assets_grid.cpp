@@ -85,10 +85,14 @@ void draw_asset_grid_item(const FileEntry &fe, int index,
         float cx = mn.x + (mx.x - mn.x - tsz.x) * 0.5f;
         float cy = mn.y + (mx.y - mn.y - tsz.y) * 0.5f;
         ImDrawList *dl = ImGui::GetWindowDrawList();
-        dl->AddText(ImVec2(cx + 1, cy + 1),
-            IM_COL32(0, 0, 0, 200), label);
-        dl->AddText(ImVec2(cx, cy),
-            IM_COL32(255, 255, 255, 255), label);
+        ImU32 text_col = ImGui::GetColorU32(ImGuiCol_Text);
+        ImVec4 bg = ImGui::GetStyleColorVec4(ImGuiCol_WindowBg);
+        float lum = bg.x * 0.299f + bg.y * 0.587f + bg.z * 0.114f;
+        ImU32 shadow_col = (lum > 0.5f)
+            ? IM_COL32(255, 255, 255, 200)
+            : IM_COL32(0, 0, 0, 200);
+        dl->AddText(ImVec2(cx + 1, cy + 1), shadow_col, label);
+        dl->AddText(ImVec2(cx, cy), text_col, label);
     }
 
     ImGui::PopStyleColor(3);
@@ -138,11 +142,12 @@ void draw_asset_grid_item(const FileEntry &fe, int index,
         std::string ext_part;
 
         ImVec4 name_col = is_selected
-            ? JCE_COLOR_ASSET_SEL_TEXT : JCE_COLOR_TEXT_PRIMARY;
+            ? JCE_COLOR_ASSET_SEL_TEXT
+            : ImGui::GetStyleColorVec4(ImGuiCol_Text);
         ImVec4 ext_col  = is_selected
             ? ImVec4(name_col.x * 0.75f, name_col.y * 0.75f,
                      name_col.z * 0.85f, name_col.w)
-            : JCE_COLOR_TEXT_SECONDARY;
+            : ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
 
         ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + name_w);
 

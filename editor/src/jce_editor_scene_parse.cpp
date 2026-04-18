@@ -187,6 +187,13 @@ JceComponentType component_type_from_name(const char *name)
 		{ "Audio Source",         JCE_COMP_AUDIO_SOURCE },
 		{ "Script",               JCE_COMP_SCRIPT },
 		{ "script",               JCE_COMP_SCRIPT },
+		{ "Skybox",               JCE_COMP_SKYBOX },
+		{ "skybox",               JCE_COMP_SKYBOX },
+		{ "SpriteAnimator",       JCE_COMP_SPRITE_ANIMATOR },
+		{ "Sprite Animator",      JCE_COMP_SPRITE_ANIMATOR },
+		{ "spriteAnimator",       JCE_COMP_SPRITE_ANIMATOR },
+		{ "Constraint",           JCE_COMP_CONSTRAINT },
+		{ "constraint",           JCE_COMP_CONSTRAINT },
 	};
 
 	for (int i = 0; i < (int)(sizeof(map) / sizeof(map[0])); i++) {
@@ -279,6 +286,10 @@ static void parse_json_light(const cJSON *props, JceComponentInfo *out)
 		if (equals_ignore_case(lt->valuestring, "point")) out->data.light.type = 1;
 		else if (equals_ignore_case(lt->valuestring, "spot")) out->data.light.type = 2;
 	}
+	out->data.light.radius         = json_get_float(props, "radius", 10.0f);
+	out->data.light.inner_cone_deg = json_get_float_any2(props, "innerConeDeg", "inner_cone_deg", 25.0f);
+	out->data.light.outer_cone_deg = json_get_float_any2(props, "outerConeDeg", "outer_cone_deg", 35.0f);
+	out->data.light.casts_shadow   = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "castsShadow"));
 }
 
 static void parse_json_mesh_renderer(const cJSON *props, JceComponentInfo *out)
@@ -427,6 +438,48 @@ static void parse_json_script(const cJSON *props, JceComponentInfo *out)
 	  if (v) snprintf(out->data.script.script_path, 128, "%s", v); }
 }
 
+static void parse_json_skybox(const cJSON *props, JceComponentInfo *out)
+{
+	{ const char *v = json_get_string(props, "hdrPath");
+	  if (v) snprintf(out->data.skybox.hdr_path, 256, "%s", v); }
+	out->data.skybox.rotation = json_get_float(props, "rotation", 0.0f);
+	out->data.skybox.exposure = json_get_float(props, "exposure", 1.0f);
+	out->data.skybox.use_as_ibl = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "useAsIbl"));
+}
+
+static void parse_json_sprite_animator(const cJSON *props, JceComponentInfo *out)
+{
+	{ const char *v = json_get_string(props, "sheetPath");
+	  if (v) snprintf(out->data.sprite_animator.sheet_path, 128, "%s", v); }
+	{ const char *v = json_get_string(props, "atlasPath");
+	  if (v) snprintf(out->data.sprite_animator.atlas_path, 128, "%s", v); }
+	out->data.sprite_animator.frame_width  = (int)json_get_float(props, "frameWidth", 64.0f);
+	out->data.sprite_animator.frame_height = (int)json_get_float(props, "frameHeight", 64.0f);
+	{ const char *v = json_get_string(props, "currentAnim");
+	  if (v) snprintf(out->data.sprite_animator.current_anim, 64, "%s", v); }
+	out->data.sprite_animator.speed   = json_get_float(props, "speed", 1.0f);
+	out->data.sprite_animator.loop    = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "loop"));
+	out->data.sprite_animator.playing = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "playing"));
+}
+
+static void parse_json_constraint(const cJSON *props, JceComponentInfo *out)
+{
+	out->data.constraint.constraint_type = (int)json_get_float(props, "constraintType", 0.0f);
+	out->data.constraint.target_entity   = (uint32_t)json_get_float(props, "targetEntity", 0.0f);
+	out->data.constraint.pivot_a[0] = json_get_float(props, "pivotAx", 0.0f);
+	out->data.constraint.pivot_a[1] = json_get_float(props, "pivotAy", 0.0f);
+	out->data.constraint.pivot_a[2] = json_get_float(props, "pivotAz", 0.0f);
+	out->data.constraint.pivot_b[0] = json_get_float(props, "pivotBx", 0.0f);
+	out->data.constraint.pivot_b[1] = json_get_float(props, "pivotBy", 0.0f);
+	out->data.constraint.pivot_b[2] = json_get_float(props, "pivotBz", 0.0f);
+	out->data.constraint.axis[0] = json_get_float(props, "axisX", 0.0f);
+	out->data.constraint.axis[1] = json_get_float(props, "axisY", 1.0f);
+	out->data.constraint.axis[2] = json_get_float(props, "axisZ", 0.0f);
+	out->data.constraint.lower_limit = json_get_float(props, "lowerLimit", 0.0f);
+	out->data.constraint.upper_limit = json_get_float(props, "upperLimit", 0.0f);
+	out->data.constraint.disable_collision = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "disableCollision"));
+}
+
 /* ── Parse Component from JSON ───────────────────────────────────── */
 
 static bool parse_component_json(const cJSON *comp_json, JceComponentInfo *out)
@@ -464,6 +517,9 @@ static bool parse_component_json(const cJSON *comp_json, JceComponentInfo *out)
 	case JCE_COMP_CHARACTER_CONTROLLER: parse_json_character_controller(props, out); break;
 	case JCE_COMP_AUDIO_SOURCE:         parse_json_audio_source(props, out);         break;
 	case JCE_COMP_SCRIPT:               parse_json_script(props, out);               break;
+	case JCE_COMP_SKYBOX:               parse_json_skybox(props, out);               break;
+	case JCE_COMP_SPRITE_ANIMATOR:      parse_json_sprite_animator(props, out);      break;
+	case JCE_COMP_CONSTRAINT:           parse_json_constraint(props, out);           break;
 	default: break;
 	}
 
