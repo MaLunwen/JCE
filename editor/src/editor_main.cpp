@@ -127,8 +127,13 @@ static bool editor_app_init(const JceServices *svc, void *ud)
         uint32_t w, h;
         jce_window_get_size(svc->window, &w, &h);
         g_editor_postfx = jce_postfx_create(jce_allocator_default(), w, h);
-        if (g_editor_postfx)
+        if (g_editor_postfx) {
             jce_postfx_load_shaders(g_editor_postfx, svc->pak);
+            JcePostFXParams p = jce_postfx_default_params();
+            jce_postfx_set_params(g_editor_postfx, &p);
+            jce_postfx_enable(g_editor_postfx, JCE_POSTFX_TONEMAP, false);
+            jce_postfx_enable(g_editor_postfx, JCE_POSTFX_FXAA, true);
+        }
     }
 
     return true;

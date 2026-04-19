@@ -16,6 +16,88 @@ static void open_asset_in_file_viewer(const char *path)
     jce_editor_layout_request_focus_file_viewer();
 }
 
+static void open_asset_entry(const FileEntry &fe)
+{
+    if (fe.is_dir) {
+        navigate_asset_directory(fe.path, true);
+        return;
+    }
+
+    const char *ext = strrchr(fe.path.c_str(), '.');
+    if (ext && (_stricmp(ext, ".scene") == 0)) {
+        jce_state_load_scene_file(fe.path.c_str());
+        std::string dir = fe.path;
+        size_t sep = dir.find_last_of("/\\");
+        if (sep != std::string::npos) dir.resize(sep);
+        jce_editor_scene_set_scene_dir(dir.c_str());
+    } else {
+        open_asset_in_file_viewer(fe.path.c_str());
+    }
+}
+
+static bool detect_open_trigger(const FileEntry &fe,
+                                bool clicked,
+                                bool hovered,
+                                bool ctrl,
+                                bool shift)
+{
+    static char s_dblclick_path[512] = {0};
+    static double s_dblclick_time = 0.0;
+
+    if (hovered && ImGui::IsMouseDoubleClicked(0)) {
+        s_dblclick_path[0] = '\0';
+        s_dblclick_time = 0.0;
+        return true;
+    }
+
+    if (clicked && !ctrl && !shift) {
+        double now = ImGui::GetTime();
+        if (s_dblclick_path[0] != '\0'
+            && strcmp(s_dblclick_path, fe.path.c_str()) == 0
+            && (now - s_dblclick_time) < (double)ImGui::GetIO().MouseDoubleClickTime) {
+            s_dblclick_path[0] = '\0';
+            s_dblclick_time = 0.0;
+            return true;
+        }
+        snprintf(s_dblclick_path, sizeof(s_dblclick_path),
+                 "%s", fe.path.c_str());
+        s_dblclick_time = now;
+    }
+
+    return false;
+}
+
+static std::string format_size_label(uintmax_t size)
+{
+    const char *units[] = {"B", "KB", "MB", "GB", "TB"};
+    double value = (double)size;
+    int unit_idx = 0;
+    while (value >= 1024.0 && unit_idx < 4) {
+        value /= 1024.0;
+        unit_idx++;
+    }
+
+    char buf[64];
+    if (unit_idx == 0) {
+        snprintf(buf, sizeof(buf), "%llu %s",
+                 (unsigned long long)size, units[unit_idx]);
+    } else {
+        snprintf(buf, sizeof(buf), "%.1f %s", value, units[unit_idx]);
+    }
+    return std::string(buf);
+}
+
+static std::string details_type_label_for_entry(const FileEntry &fe)
+{
+    if (fe.is_dir)
+        return jce_editor_i18n("assetBrowser.typeFolder");
+
+    const char *short_label = type_label_for_entry(fe);
+    if (strcmp(short_label, "FILE") == 0)
+        return jce_editor_i18n("assetBrowser.typeFile");
+    return short_label;
+}
+
 /* ── Single grid item ────────────────────────────────────────────── */
 
 void draw_asset_grid_item(const FileEntry &fe, int index,
@@ -236,46 +318,9 @@ void draw_asset_grid_item(const FileEntry &fe, int index,
      * Fallback: timer-based detection from Button() release events to
      * handle rapid sequential double-clicks across directory rebuilds.
      * Path tracking prevents cross-directory false positives. */
-    static char   s_dblclick_path[512] = {0};
-    static double s_dblclick_time = 0.0;
-    bool open_triggered = false;
-
-    if (cell_hovered && ImGui::IsMouseDoubleClicked(0)) {
-        open_triggered = true;
-        s_dblclick_path[0] = '\0';
-        s_dblclick_time = 0.0;
-    }
-
-    if (!open_triggered && clicked && !ctrl && !shift) {
-        double now = ImGui::GetTime();
-        if (s_dblclick_path[0] != '\0'
-            && strcmp(s_dblclick_path, fe.path.c_str()) == 0
-            && (now - s_dblclick_time) < (double)ImGui::GetIO().MouseDoubleClickTime) {
-            open_triggered = true;
-            s_dblclick_path[0] = '\0';
-            s_dblclick_time = 0.0;
-        } else {
-            snprintf(s_dblclick_path, sizeof(s_dblclick_path),
-                     "%s", fe.path.c_str());
-            s_dblclick_time = now;
-        }
-    }
-
+    bool open_triggered = detect_open_trigger(fe, clicked, cell_hovered, ctrl, shift);
     if (open_triggered) {
-        if (fe.is_dir) {
-            navigate_asset_directory(fe.path, true);
-        } else {
-            const char *ext = strrchr(fe.path.c_str(), '.');
-            if (ext && (_stricmp(ext, ".scene") == 0)) {
-                jce_state_load_scene_file(fe.path.c_str());
-                std::string dir = fe.path;
-                size_t sep = dir.find_last_of("/\\");
-                if (sep != std::string::npos) dir.resize(sep);
-                jce_editor_scene_set_scene_dir(dir.c_str());
-            } else {
-                open_asset_in_file_viewer(fe.path.c_str());
-            }
-        }
+        open_asset_entry(fe);
     }
 
     /* Right click */
@@ -305,6 +350,153 @@ void draw_asset_grid_item(const FileEntry &fe, int index,
     col++;
     if (col < cols) ImGui::SameLine();
     else col = 0;
+}
+
+void draw_asset_details_list(const std::vector<FileEntry> &display_entries,
+                             bool &want_ctx_popup)
+{
+    const ImGuiTableFlags table_flags = ImGuiTableFlags_RowBg
+                                      | ImGuiTableFlags_BordersInnerV
+                                      | ImGuiTableFlags_BordersOuter
+                                      | ImGuiTableFlags_Resizable
+                                      | ImGuiTableFlags_SizingStretchProp
+                                      | ImGuiTableFlags_ScrollY;
+
+    if (!ImGui::BeginTable("AssetDetailsTable", 4, table_flags, ImVec2(0, 0)))
+        return;
+
+    ImGui::TableSetupScrollFreeze(0, 1);
+    ImGui::TableSetupColumn(jce_editor_i18n("assetBrowser.colName"), ImGuiTableColumnFlags_WidthStretch, 0.55f);
+    ImGui::TableSetupColumn(jce_editor_i18n("assetBrowser.colDateModified"), ImGuiTableColumnFlags_WidthFixed, 150.0f);
+    ImGui::TableSetupColumn(jce_editor_i18n("assetBrowser.colType"), ImGuiTableColumnFlags_WidthFixed, 110.0f);
+    ImGui::TableSetupColumn(jce_editor_i18n("assetBrowser.colSize"), ImGuiTableColumnFlags_WidthFixed, 90.0f);
+    ImGui::TableHeadersRow();
+
+    for (int i = 0; i < (int)display_entries.size(); i++) {
+        const FileEntry &fe = display_entries[i];
+        ImGui::PushID(i);
+        ImGui::TableNextRow();
+
+        const bool ctrl = ImGui::GetIO().KeyCtrl;
+        const bool shift = ImGui::GetIO().KeyShift;
+        bool clicked = false;
+
+        ImGui::TableSetColumnIndex(0);
+        bool row_hovered = false;
+
+        if (s_assets.renaming_idx == i) {
+            if (s_assets.rename_focus_needed) {
+                ImGui::SetKeyboardFocusHere();
+                s_assets.rename_focus_needed = false;
+            }
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::InputText("##rename", s_assets.rename_buf,
+                                 sizeof(s_assets.rename_buf),
+                                 ImGuiInputTextFlags_EnterReturnsTrue
+                                 | ImGuiInputTextFlags_AutoSelectAll))
+            {
+                try {
+                    fs::path old_p(fe.path);
+                    fs::path new_p = old_p.parent_path() / s_assets.rename_buf;
+                    fs::rename(old_p, new_p);
+                    jce_editor_console_log("Renamed '%s' -> '%s'",
+                                           fe.name.c_str(), s_assets.rename_buf);
+                    s_assets.needs_refresh = true;
+                } catch (const std::exception &e) {
+                    jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                                                 "Rename failed: %s", e.what());
+                }
+                s_assets.renaming_idx = -1;
+                s_assets.rename_focus_needed = false;
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape)
+                || (!ImGui::IsItemActive() && ImGui::IsMouseClicked(0)
+                    && !ImGui::IsItemHovered()))
+            {
+                s_assets.renaming_idx = -1;
+                s_assets.rename_focus_needed = false;
+            }
+            row_hovered = ImGui::IsItemHovered(
+                ImGuiHoveredFlags_AllowWhenBlockedByPopup
+              | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+        } else {
+            std::string row_label = "[";
+            row_label += fe.is_dir ? "DIR" : type_label_for_entry(fe);
+            row_label += "] ";
+            row_label += fe.name;
+
+            const bool is_selected = s_assets.selected_set.count(i) != 0;
+            clicked = ImGui::Selectable(row_label.c_str(), is_selected,
+                                        ImGuiSelectableFlags_SpanAllColumns
+                                      | ImGuiSelectableFlags_AllowDoubleClick);
+            row_hovered = ImGui::IsItemHovered(
+                ImGuiHoveredFlags_AllowWhenBlockedByPopup
+              | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+        }
+
+        if (clicked) {
+            if (shift && s_assets.last_clicked_idx >= 0) {
+                int mn = (s_assets.last_clicked_idx < i) ? s_assets.last_clicked_idx : i;
+                int mx = (s_assets.last_clicked_idx > i) ? s_assets.last_clicked_idx : i;
+                if (!ctrl) s_assets.selected_set.clear();
+                for (int k = mn; k <= mx; k++)
+                    s_assets.selected_set.insert(k);
+            } else if (ctrl) {
+                if (s_assets.selected_set.count(i))
+                    s_assets.selected_set.erase(i);
+                else
+                    s_assets.selected_set.insert(i);
+                s_assets.last_clicked_idx = i;
+            } else {
+                s_assets.selected_set.clear();
+                s_assets.selected_set.insert(i);
+                s_assets.last_clicked_idx = i;
+            }
+        }
+
+        if (detect_open_trigger(fe, clicked, row_hovered, ctrl, shift))
+            open_asset_entry(fe);
+
+        if (row_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+            s_assets.context_idx = i;
+            if (s_assets.selected_set.find(i) == s_assets.selected_set.end()) {
+                s_assets.selected_set.clear();
+                s_assets.selected_set.insert(i);
+                s_assets.last_clicked_idx = i;
+            }
+            s_assets.suppress_empty_ctx_frames = 2;
+            want_ctx_popup = true;
+        }
+
+        if (row_hovered && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
+            ImGui::SetTooltip("%s", fe.path.c_str());
+
+        if (row_hovered && !fe.is_dir
+            && ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
+            const char *p = fe.path.c_str();
+            ImGui::SetDragDropPayload("JCE_ASSET_PATH", p, strlen(p) + 1);
+            ImGui::Text("%s", fe.name.c_str());
+            ImGui::EndDragDropSource();
+        }
+
+        ImGui::TableSetColumnIndex(1);
+        if (!fe.modified_at.empty())
+            ImGui::TextUnformatted(fe.modified_at.c_str());
+
+        ImGui::TableSetColumnIndex(2);
+        const std::string type_label = details_type_label_for_entry(fe);
+        ImGui::TextUnformatted(type_label.c_str());
+
+        ImGui::TableSetColumnIndex(3);
+        if (!fe.is_dir) {
+            const std::string size_label = format_size_label(fe.size);
+            ImGui::TextUnformatted(size_label.c_str());
+        }
+
+        ImGui::PopID();
+    }
+
+    ImGui::EndTable();
 }
 
 /* ── Item context menu popup ─────────────────────────────────────── */

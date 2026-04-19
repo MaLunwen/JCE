@@ -47,6 +47,10 @@ static void apply_style_params(void)
 
 static void apply_dark_theme(void)
 {
+    /* Reset all color slots first to avoid stale values when switching from
+       other themes that override additional ImGuiCol entries. */
+    ImGui::StyleColorsDark();
+
     ImVec4 *c = ImGui::GetStyle().Colors;
 
     c[ImGuiCol_Text]                  = ImVec4(1.00f, 1.00f, 1.00f, 1.00f);
@@ -92,6 +96,9 @@ static void apply_dark_theme(void)
 
 static void apply_light_theme(void)
 {
+    /* Start from full light defaults, then apply JCE-tuned overrides. */
+    ImGui::StyleColorsLight();
+
     ImVec4 *c = ImGui::GetStyle().Colors;
 
     c[ImGuiCol_Text]                  = ImVec4(0.00f, 0.00f, 0.00f, 1.00f);
@@ -137,6 +144,9 @@ static void apply_light_theme(void)
 
 static void apply_ssms_theme(void)
 {
+    /* SSMS theme is derived from light defaults. */
+    ImGui::StyleColorsLight();
+
     ImVec4 *c = ImGui::GetStyle().Colors;
 
     c[ImGuiCol_Text]                  = ImVec4(0.12f, 0.12f, 0.12f, 1.00f);

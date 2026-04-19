@@ -9,6 +9,12 @@
 #include "jce_scene_render_internal.h"
 #include "jce_editor_file_util.h"
 
+extern "C" {
+#include <jce/graphics/jce_postfx.h>
+}
+
+extern JcePostFXPipeline *g_editor_postfx;
+
 /* ── State instance (shared via extern in internal header) ────────── */
 
 SceneRenderState s_sr;
@@ -97,6 +103,9 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     jce_editor_scene_asset_cache_init(assets);
     s_sr.white_tex.idx = UINT16_MAX;
     s_sr.checker_tex.idx = UINT16_MAX;
+    s_sr.postfx_output_tex = UINT16_MAX;
+    s_sr.shadow_use_csm = false;
+    s_sr.shadow_far_valid = false;
     s_sr.renderer = renderer;
     s_sr.bridge = jce_editor_render_bridge_create(renderer,
                                                   (uint16_t)JCE_VIEW_EDITOR_SCENE);
@@ -104,6 +113,37 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
         LOG_WARN(LOG_TAG, "failed to create editor render bridge");
         jce_editor_scene_asset_cache_shutdown();
         return false;
+    }
+
+    const bgfx_caps_t *caps = bgfx_get_caps();
+    s_sr.homogeneous_depth = caps ? caps->homogeneousDepth : false;
+
+    /* Dynamic shadow quality defaults from GPU tier recommendation. */
+    {
+        JceRenderRecommendation rec = jce_renderer_get_recommendation();
+        uint32_t shadow_size = rec.shadow_map_size;
+        if (shadow_size < 1024) shadow_size = 1024;
+        if (shadow_size > 4096) shadow_size = 4096;
+        s_sr.shadow_map_size = (uint16_t)shadow_size;
+
+        switch (rec.tier) {
+        case JCE_GPU_TIER_HIGH:
+            s_sr.csm_blend_ratio = 0.16f;
+            s_sr.csm_normal_bias = 0.0011f;
+            s_sr.csm_filter_radius = 1.15f;
+            break;
+        case JCE_GPU_TIER_MEDIUM:
+            s_sr.csm_blend_ratio = 0.14f;
+            s_sr.csm_normal_bias = 0.00095f;
+            s_sr.csm_filter_radius = 1.0f;
+            break;
+        case JCE_GPU_TIER_LOW:
+        default:
+            s_sr.csm_blend_ratio = 0.12f;
+            s_sr.csm_normal_bias = 0.0008f;
+            s_sr.csm_filter_radius = 0.85f;
+            break;
+        }
     }
 
     /* Create the editor orbit camera. */
@@ -135,6 +175,8 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     s_sr.orbit_distance = jce_v3_len(diff);
     s_sr.orbit_yaw   = atan2f(diff.x, -diff.z);
     s_sr.orbit_pitch = asinf(diff.y / s_sr.orbit_distance);
+    s_sr.orbit_clip_valid = false;
+    s_sr.camera_cache_valid = false;
 
     /* Pos + color vertex layout for transient buffers (grid, sky). */
     bgfx_vertex_layout_begin(&s_sr.layout, bgfx_get_renderer_type());
@@ -214,12 +256,13 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
 
     /* Shadow map resources. */
     {
-        const uint16_t shadow_size = 2048;
+        const uint16_t shadow_size = s_sr.shadow_map_size;
         s_sr.shadow_tex = bgfx_create_texture_2d(
             shadow_size, shadow_size, false, 1,
             BGFX_TEXTURE_FORMAT_D16,
             BGFX_TEXTURE_RT
-            | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
+            | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
+            | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT,
             NULL);
         bgfx_attachment_t at;
         memset(&at, 0, sizeof(at));
@@ -238,7 +281,7 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     /* Cascaded shadow maps (4 cascades at 2048x2048). */
     {
         const uint32_t csm_count = JCE_CSM_MAX_CASCADES;
-        const uint16_t csm_size = 2048;
+        const uint16_t csm_size = s_sr.shadow_map_size;
         const char *sampler_names[JCE_CSM_MAX_CASCADES] = {
             "s_csmShadow0", "s_csmShadow1", "s_csmShadow2", "s_csmShadow3"
         };
@@ -249,7 +292,8 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
                 csm_size, csm_size, false, 1,
                 BGFX_TEXTURE_FORMAT_D16,
                 BGFX_TEXTURE_RT
-                | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
+                | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
+                | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT,
                 NULL);
             bgfx_attachment_t at;
             memset(&at, 0, sizeof(at));
@@ -266,6 +310,10 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
                                                   JCE_CSM_MAX_CASCADES);
         s_sr.u_csm_splits  = bgfx_create_uniform("u_csmSplits",
                                                    BGFX_UNIFORM_TYPE_VEC4, 1);
+        s_sr.u_csm_params = bgfx_create_uniform("u_csmParams",
+                                                 BGFX_UNIFORM_TYPE_VEC4, 1);
+        s_sr.u_csm_bias_scales = bgfx_create_uniform("u_csmBiasScales",
+                                                      BGFX_UNIFORM_TYPE_VEC4, 1);
         if (s_sr.csm_valid)
             LOG_INFO(LOG_TAG, "CSM created (%u cascades, %dx%d)",
                      csm_count, csm_size, csm_size);
@@ -364,6 +412,10 @@ void jce_editor_scene_render_shutdown(void)
         bgfx_destroy_uniform(s_sr.u_csm_vp);
     if (BGFX_HANDLE_IS_VALID(s_sr.u_csm_splits))
         bgfx_destroy_uniform(s_sr.u_csm_splits);
+    if (BGFX_HANDLE_IS_VALID(s_sr.u_csm_params))
+        bgfx_destroy_uniform(s_sr.u_csm_params);
+    if (BGFX_HANDLE_IS_VALID(s_sr.u_csm_bias_scales))
+        bgfx_destroy_uniform(s_sr.u_csm_bias_scales);
 
     if (s_sr.light_env) {
         jce_light_env_destroy(s_sr.light_env);
@@ -409,13 +461,30 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
 
     s_sr.viewport_width = width;
     s_sr.viewport_height = height;
+    s_sr.camera_cache_valid = false;
+    s_sr.postfx_output_tex = UINT16_MAX;
+    s_sr.postfx_tonemap_active = false;
+    s_sr.shadow_use_csm = false;
+
+    if (g_editor_postfx) {
+        s_sr.postfx_tonemap_active =
+            jce_postfx_is_enabled(g_editor_postfx, JCE_POSTFX_TONEMAP);
+    }
 
 
-    const bgfx_caps_t *caps = bgfx_get_caps();
     float aspect = (float)width / (float)height;
 
     jce_mat4 view = jce_camera_view(s_sr.camera);
-    jce_mat4 proj = jce_camera_proj(s_sr.camera, aspect, caps->homogeneousDepth);
+    jce_mat4 proj = jce_camera_proj(s_sr.camera, aspect, s_sr.homogeneous_depth);
+    memcpy(s_sr.cached_view, view.raw[0], sizeof(s_sr.cached_view));
+    memcpy(s_sr.cached_proj, proj.raw[0], sizeof(s_sr.cached_proj));
+    {
+        jce_vec3 eye = jce_camera_get_position(s_sr.camera);
+        s_sr.cached_eye[0] = eye.x;
+        s_sr.cached_eye[1] = eye.y;
+        s_sr.cached_eye[2] = eye.z;
+    }
+    s_sr.camera_cache_valid = true;
 
     JceSceneViewMode view_mode = jce_state_get_view_mode();
     bool is_plain_wireframe = (view_mode == JCE_VIEW_WIREFRAME);
@@ -507,6 +576,32 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     draw_entities();
     draw_hover_highlight();
     draw_ghost_entity();
+
+    if (g_editor_postfx) {
+        bool any_effect = false;
+        for (int i = 0; i < JCE_POSTFX_COUNT; i++) {
+            if (jce_postfx_is_enabled(g_editor_postfx, (JcePostFXType)i)) {
+                any_effect = true;
+                break;
+            }
+        }
+
+        jce_postfx_resize(g_editor_postfx, width, height);
+
+        if (any_effect) {
+            JceTextureHandle scene_color = { UINT16_MAX };
+            JceTextureHandle prev_pass = { UINT16_MAX };
+            scene_color.idx = jce_editor_render_bridge_get_color_texture(s_sr.bridge);
+
+            jce_postfx_apply(g_editor_postfx,
+                             scene_color,
+                             prev_pass);
+
+            JceTextureHandle out = jce_postfx_get_output(g_editor_postfx);
+            if (jce_gfx_texture_valid(out))
+                s_sr.postfx_output_tex = out.idx;
+        }
+    }
 }
 
 /* ── Accessors ────────────────────────────────────────────────────── */
@@ -515,6 +610,10 @@ uint16_t jce_editor_scene_render_get_texture(void)
 {
     if (!s_sr.initialized || !s_sr.bridge)
         return UINT16_MAX;
+
+    if (s_sr.postfx_output_tex != UINT16_MAX)
+        return s_sr.postfx_output_tex;
+
     return jce_editor_render_bridge_get_color_texture(s_sr.bridge);
 }
 

@@ -19,6 +19,7 @@
  *           --obj-file     <out.obj>        (optional, COFF output)
  *           --header-file  <out.h>
  *           --manifest-file <out.cmake>
+ *           --exclude-segment <name>        (optional, repeatable)
  *           --obj-format   coff|none        (default: none)
  *           --obj-arch     x64|arm64|x86|arm (default: x64)
  */
@@ -252,6 +253,24 @@ static char *make_relative(const char *full, const char *base) {
 static int is_hidden(const char *rel) {
     if (rel[0] == '.') return 1;
     if (strstr(rel, "/.")) return 1;
+    return 0;
+}
+
+/* Check if rel path contains a segment exactly matching segment_name.
+ * Example: "raw_assets/foo.png" contains segment "raw_assets". */
+static int path_has_segment(const char *rel, const char *segment_name) {
+    size_t seg_len = strlen(segment_name);
+    const char *p = rel;
+
+    while (*p) {
+        const char *q = p;
+        while (*q && *q != '/') q++;
+        if ((size_t)(q - p) == seg_len && strncmp(p, segment_name, seg_len) == 0)
+            return 1;
+
+        if (*q == '\0') break;
+        p = q + 1;
+    }
     return 0;
 }
 
@@ -558,6 +577,8 @@ static void generate_manifest(const AssetEntry *entries, size_t count,
 typedef struct {
     char resource_dirs[16][1024];
     int  resource_dir_count;
+    char exclude_segments[16][128];
+    int  exclude_segment_count;
     char pak_file[1024];
     char obj_file[1024];
     char header_file[1024];
@@ -571,6 +592,7 @@ typedef struct {
 static void usage(void) {
     fprintf(stderr,
         "Usage: jce_pak --resource-dir <dir> [--resource-dir <dir2> ...]\n"
+        "              [--exclude-segment <name> ...]\n"
         "               --pak-file      <out.pak>\n"
         "               --header-file   <out.h>\n"
         "               --manifest-file <out.cmake>\n"
@@ -587,6 +609,17 @@ static void usage(void) {
         "    console  → Console platforms\n");
 }
 
+static int is_excluded_rel_path(const char *rel, const Args *args)
+{
+    for (int i = 0; i < args->exclude_segment_count; i++) {
+        if (args->exclude_segments[i][0] == '\0')
+            continue;
+        if (path_has_segment(rel, args->exclude_segments[i]))
+            return 1;
+    }
+    return 0;
+}
+
 // cppcheck-suppress constParameter   ; argv comes from main() with non-const char**
 static Args parse_args(int argc, char *const argv[]) {
     Args a;
@@ -594,6 +627,11 @@ static Args parse_args(int argc, char *const argv[]) {
     strcpy(a.obj_format, "none");
     strcpy(a.obj_arch,   "x64");
     strcpy(a.platform,   "desktop");
+
+    /* Safety default: raw_assets is source-only and must never be packed. */
+    snprintf(a.exclude_segments[a.exclude_segment_count],
+             sizeof(a.exclude_segments[0]), "%s", "raw_assets");
+    a.exclude_segment_count++;
 
     for (int i = 1; i < argc; ++i) {
         const char *arg = argv[i];
@@ -604,6 +642,14 @@ static Args parse_args(int argc, char *const argv[]) {
             if (a.resource_dir_count < 16) {
                 snprintf(a.resource_dirs[a.resource_dir_count], sizeof(a.resource_dirs[0]), "%s", val);
                 a.resource_dir_count++;
+            }
+            ++i;
+        }
+        else if (strcmp(arg, "--exclude-segment") == 0 && val) {
+            if (a.exclude_segment_count < 16) {
+                snprintf(a.exclude_segments[a.exclude_segment_count],
+                         sizeof(a.exclude_segments[0]), "%s", val);
+                a.exclude_segment_count++;
             }
             ++i;
         }
@@ -688,9 +734,13 @@ int main(int argc, char *argv[]) {
     ZSTD_CCtx *cctx = ZSTD_createCCtx();
     if (!cctx) { fprintf(stderr, "[jce_pak] ZSTD_createCCtx failed\n"); return 1; }
 
+    size_t skipped_hidden = 0;
+    size_t skipped_excluded = 0;
+
     for (size_t fi = 0; fi < files.count; fi++) {
         char *rel = make_relative(files.items[fi], file_bases.items[fi]);
-        if (is_hidden(rel)) { free(rel); continue; }
+        if (is_hidden(rel)) { free(rel); skipped_hidden++; continue; }
+        if (is_excluded_rel_path(rel, &args)) { free(rel); skipped_excluded++; continue; }
 
         AssetEntry *e = &entries[num_entries];
         e->rel_path = rel;
@@ -840,6 +890,11 @@ int main(int argc, char *argv[]) {
            (unsigned long long)raw_total,
            (unsigned long long)comp_total,
            (unsigned long long)pak_total);
+
+    if (skipped_hidden > 0 || skipped_excluded > 0) {
+        printf("[jce_pak] skipped: hidden=%zu excluded=%zu\n",
+               skipped_hidden, skipped_excluded);
+    }
 
     /* Cleanup. */
     bb_free(&pak);

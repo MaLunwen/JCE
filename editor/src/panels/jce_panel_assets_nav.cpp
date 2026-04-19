@@ -201,15 +201,60 @@ void draw_asset_breadcrumb_bar(void)
         }
 
         {
-            float btn_w = ImGui::CalcTextSize(jce_editor_i18n("assetBrowser.refresh")).x
-                        + ImGui::GetStyle().FramePadding.x * 2;
+            const char *details_label = jce_editor_i18n("assetBrowser.viewDetails");
+            const char *grid_label = jce_editor_i18n("assetBrowser.viewGrid");
+            const char *refresh_label = jce_editor_i18n("assetBrowser.refresh");
+            const ImGuiStyle &style = ImGui::GetStyle();
+            const float refresh_gap = 10.0f;
+            const float divider_w = ImGui::CalcTextSize("|").x;
+
+            float details_w = ImGui::CalcTextSize(details_label).x
+                            + style.FramePadding.x * 2.0f + 12.0f;
+            float grid_w = ImGui::CalcTextSize(grid_label).x
+                         + style.FramePadding.x * 2.0f + 12.0f;
+            float refresh_w = ImGui::CalcTextSize(refresh_label).x
+                            + style.FramePadding.x * 2.0f;
+            float spacing = style.ItemSpacing.x;
+            float group_w = details_w + spacing + grid_w
+                          + refresh_gap + divider_w + refresh_gap
+                          + refresh_w;
+
             float avail_w = ImGui::GetContentRegionAvail().x;
-            if (avail_w > btn_w + 8) {
-                ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - btn_w);
+            if (avail_w > group_w + 8.0f) {
+                ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - group_w);
             } else {
                 ImGui::SameLine();
             }
-            if (ImGui::SmallButton(jce_editor_i18n("assetBrowser.refresh"))) {
+
+            bool details_active = (s_assets.view_mode == ASSET_BROWSER_VIEW_DETAILS);
+            if (details_active) {
+                ImGui::PushStyleColor(ImGuiCol_Button, JCE_COLOR_ACCENT);
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, JCE_COLOR_ACCENT_HOVER);
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, JCE_COLOR_ACCENT_ACTIVE);
+            }
+            if (ImGui::SmallButton(details_label))
+                s_assets.view_mode = ASSET_BROWSER_VIEW_DETAILS;
+            if (details_active)
+                ImGui::PopStyleColor(3);
+
+            ImGui::SameLine();
+
+            bool grid_active = (s_assets.view_mode == ASSET_BROWSER_VIEW_GRID);
+            if (grid_active) {
+                ImGui::PushStyleColor(ImGuiCol_Button, JCE_COLOR_ACCENT);
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, JCE_COLOR_ACCENT_HOVER);
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, JCE_COLOR_ACCENT_ACTIVE);
+            }
+            if (ImGui::SmallButton(grid_label))
+                s_assets.view_mode = ASSET_BROWSER_VIEW_GRID;
+            if (grid_active)
+                ImGui::PopStyleColor(3);
+
+            ImGui::SameLine(0.0f, refresh_gap);
+            ImGui::TextDisabled("|");
+
+            ImGui::SameLine(0.0f, refresh_gap);
+            if (ImGui::SmallButton(refresh_label)) {
                 s_assets.needs_refresh = true;
             }
         }

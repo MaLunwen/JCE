@@ -31,9 +31,16 @@ static struct {
 static void ensure_init(void)
 {
     if (s_pfx.initialized) return;
-    s_pfx.params = jce_postfx_default_params();
-    for (int i = 0; i < JCE_POSTFX_COUNT; i++)
-        s_pfx.enabled[i] = false;
+    if (g_editor_postfx) {
+        jce_postfx_get_params(g_editor_postfx, &s_pfx.params);
+        for (int i = 0; i < JCE_POSTFX_COUNT; i++)
+            s_pfx.enabled[i] = jce_postfx_is_enabled(g_editor_postfx,
+                                                     (JcePostFXType)i);
+    } else {
+        s_pfx.params = jce_postfx_default_params();
+        for (int i = 0; i < JCE_POSTFX_COUNT; i++)
+            s_pfx.enabled[i] = false;
+    }
     s_pfx.initialized = true;
 }
 

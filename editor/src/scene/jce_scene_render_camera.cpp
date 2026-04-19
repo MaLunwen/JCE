@@ -9,6 +9,9 @@
 #define ORBIT_PITCH_MAX  (89.0f * JCE_DEG2RAD)
 #define ORBIT_DIST_MIN   0.001f
 #define ORBIT_DIST_MAX   100000.0f
+#define ORBIT_CLIP_HYSTERESIS     0.02f
+#define ORBIT_CLIP_MIN_NEAR_DELTA 0.00025f
+#define ORBIT_CLIP_MIN_FAR_DELTA  1.0f
 
 /* ── Internal: recompute camera position from orbit state ─────────── */
 
@@ -31,13 +34,38 @@ void orbit_apply(void)
     /* Dynamic near/far clip planes based on orbit distance.
      * Prevents Z-fighting when very close, and extends far plane when zoom
      * is very far out. */
-    float near_clip = d * 0.001f;
-    if (near_clip < 0.001f) near_clip = 0.001f;
-    if (near_clip > 1.0f)   near_clip = 1.0f;
-    float far_clip = d * 100.0f;
-    if (far_clip < 100.0f)    far_clip = 100.0f;
-    if (far_clip > 100000.0f) far_clip = 100000.0f;
-    jce_camera_set_near_far(s_sr.camera, near_clip, far_clip);
+    float near_clip_target = d * 0.001f;
+    if (near_clip_target < 0.001f) near_clip_target = 0.001f;
+    if (near_clip_target > 1.0f)   near_clip_target = 1.0f;
+    float far_clip_target = d * 100.0f;
+    if (far_clip_target < 100.0f)    far_clip_target = 100.0f;
+    if (far_clip_target > 100000.0f) far_clip_target = 100000.0f;
+
+    if (!s_sr.orbit_clip_valid) {
+        s_sr.orbit_near_cached = near_clip_target;
+        s_sr.orbit_far_cached = far_clip_target;
+        s_sr.orbit_clip_valid = true;
+    } else {
+        float near_delta = fabsf(near_clip_target - s_sr.orbit_near_cached);
+        float near_rel = near_delta / fmaxf(s_sr.orbit_near_cached, 0.001f);
+        if (near_delta > ORBIT_CLIP_MIN_NEAR_DELTA
+            && (near_rel > ORBIT_CLIP_HYSTERESIS || near_delta > 0.001f))
+        {
+            s_sr.orbit_near_cached = near_clip_target;
+        }
+
+        float far_delta = fabsf(far_clip_target - s_sr.orbit_far_cached);
+        float far_rel = far_delta / fmaxf(s_sr.orbit_far_cached, 100.0f);
+        if (far_delta > ORBIT_CLIP_MIN_FAR_DELTA
+            && far_rel > ORBIT_CLIP_HYSTERESIS)
+        {
+            s_sr.orbit_far_cached = far_clip_target;
+        }
+    }
+
+    jce_camera_set_near_far(s_sr.camera,
+                            s_sr.orbit_near_cached,
+                            s_sr.orbit_far_cached);
 }
 
 /* ── Public camera API ────────────────────────────────────────────── */
@@ -54,10 +82,26 @@ bool jce_editor_scene_get_camera_matrices(float *out_view16,
                                            float viewport_h)
 {
     if (!s_sr.initialized || !s_sr.camera) return false;
+    if (!out_view16 || !out_proj16 || !out_eye3) return false;
 
-    float aspect = (viewport_h > 0.0f) ? viewport_w / viewport_h : 1.0f;
+    uint32_t req_w = (uint32_t)fmaxf(1.0f, floorf(viewport_w));
+    uint32_t req_h = (uint32_t)fmaxf(1.0f, floorf(viewport_h));
+
+    if (s_sr.camera_cache_valid
+        && req_w == s_sr.viewport_width
+        && req_h == s_sr.viewport_height)
+    {
+        memcpy(out_view16, s_sr.cached_view, sizeof(s_sr.cached_view));
+        memcpy(out_proj16, s_sr.cached_proj, sizeof(s_sr.cached_proj));
+        out_eye3[0] = s_sr.cached_eye[0];
+        out_eye3[1] = s_sr.cached_eye[1];
+        out_eye3[2] = s_sr.cached_eye[2];
+        return true;
+    }
+
+    float aspect = (req_h > 0) ? ((float)req_w / (float)req_h) : 1.0f;
     jce_mat4 view = jce_camera_view(s_sr.camera);
-    jce_mat4 proj = jce_camera_proj(s_sr.camera, aspect, false);
+    jce_mat4 proj = jce_camera_proj(s_sr.camera, aspect, s_sr.homogeneous_depth);
     memcpy(out_view16, JCE_M4_PTR(view), 16 * sizeof(float));
     memcpy(out_proj16, JCE_M4_PTR(proj), 16 * sizeof(float));
 
@@ -65,6 +109,13 @@ bool jce_editor_scene_get_camera_matrices(float *out_view16,
     out_eye3[0] = pos.x;
     out_eye3[1] = pos.y;
     out_eye3[2] = pos.z;
+
+    memcpy(s_sr.cached_view, out_view16, sizeof(s_sr.cached_view));
+    memcpy(s_sr.cached_proj, out_proj16, sizeof(s_sr.cached_proj));
+    s_sr.cached_eye[0] = out_eye3[0];
+    s_sr.cached_eye[1] = out_eye3[1];
+    s_sr.cached_eye[2] = out_eye3[2];
+    s_sr.camera_cache_valid = true;
     return true;
 }
 

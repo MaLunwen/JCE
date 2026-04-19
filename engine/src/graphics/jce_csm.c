@@ -11,7 +11,6 @@
 
 /* Lambda for practical split scheme (0=linear, 1=logarithmic). */
 #define CSM_LAMBDA 0.5f
-#define CSM_SHADOW_MAP_SIZE 2048.0f
 
 static void compute_splits(float *splits, uint32_t count,
                            float near, float far)
@@ -67,7 +66,8 @@ void jce_csm_compute(JceCsmData *out,
                      float aspect,
                      const jce_mat4 *camera_view,
                      const jce_vec3 *light_dir,
-                     bool homogeneous_depth)
+                     bool homogeneous_depth,
+                     uint16_t shadow_map_size)
 {
     if (!out || !camera_view || !light_dir) return;
     if (cascade_count < 1) cascade_count = 1;
@@ -114,7 +114,8 @@ void jce_csm_compute(JceCsmData *out,
         /* Snap the cascade center in light space to shadow texels to keep the
          * projection stable during camera panning and small zoom changes. */
         jce_vec4 center_ls4 = glms_mat4_mulv(light_view, (jce_vec4){{ center.x, center.y, center.z, 1.0f }});
-        float texel_size = (radius * 2.0f) / CSM_SHADOW_MAP_SIZE;
+        float map_size = shadow_map_size > 0 ? (float)shadow_map_size : 2048.0f;
+        float texel_size = (radius * 2.0f) / map_size;
         if (texel_size > 0.0f) {
             center_ls4.x = floorf(center_ls4.x / texel_size + 0.5f) * texel_size;
             center_ls4.y = floorf(center_ls4.y / texel_size + 0.5f) * texel_size;

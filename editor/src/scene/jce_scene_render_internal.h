@@ -28,6 +28,7 @@ extern "C" {
 #include <jce/graphics/jce_model.h>
 #include <jce/graphics/jce_pbr_material.h>
 #include <jce/graphics/jce_renderer.h>
+#include <jce/graphics/jce_renderer_caps.h>
 #include <jce/graphics/jce_shaders.h>
 #include <jce/graphics/jce_skybox.h>
 #include <jce/graphics/jce_sprite_batch.h>
@@ -70,6 +71,7 @@ struct PosColorVertex {
 
 struct SceneRenderState {
     bool                    initialized;
+    bool                    homogeneous_depth;
     JceRenderer            *renderer;
     JceEditorRenderBridge  *bridge;
     JceCamera              *camera;
@@ -95,6 +97,14 @@ struct SceneRenderState {
     float                   orbit_distance;
     float                   orbit_yaw;
     float                   orbit_pitch;
+    bool                    orbit_clip_valid;
+    float                   orbit_near_cached;
+    float                   orbit_far_cached;
+
+    bool                    camera_cache_valid;
+    float                   cached_view[16];
+    float                   cached_proj[16];
+    float                   cached_eye[3];
 
     bgfx_texture_handle_t   white_tex;
     bgfx_texture_handle_t   checker_tex;
@@ -107,6 +117,10 @@ struct SceneRenderState {
     bgfx_uniform_handle_t      u_shadowMap;
     bgfx_uniform_handle_t      u_shadowVP;
     bool                       shadow_valid;
+    bool                       shadow_use_csm;
+    uint16_t                   shadow_map_size;
+    bool                       shadow_far_valid;
+    float                      shadow_far_cached;
 
     /* Cascaded shadow maps. */
     uint32_t                   csm_cascade_count;   /* 0=single shadow, 2-4=CSM */
@@ -115,7 +129,12 @@ struct SceneRenderState {
     bgfx_uniform_handle_t      u_csm_samplers[JCE_CSM_MAX_CASCADES];
     bgfx_uniform_handle_t      u_csm_vp;     /* mat4[4] */
     bgfx_uniform_handle_t      u_csm_splits;
+    bgfx_uniform_handle_t      u_csm_params;       /* vec4: invMapSize, blendRange, normalBias, filterRadius */
+    bgfx_uniform_handle_t      u_csm_bias_scales;  /* vec4: per-cascade bias multipliers */
     bool                       csm_valid;
+    float                      csm_blend_ratio;
+    float                      csm_normal_bias;
+    float                      csm_filter_radius;
 
     JceLightEnv              *light_env;
 
@@ -133,6 +152,8 @@ struct SceneRenderState {
     float                    skybox_rotation;
     uint32_t                 viewport_width;
     uint32_t                 viewport_height;
+    bool                     postfx_tonemap_active;
+    uint16_t                 postfx_output_tex;
 
     /* Sprite batch for 2D sprite rendering. */
     JceSpriteBatch          *sprite_batch;

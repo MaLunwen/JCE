@@ -126,11 +126,15 @@ static void draw_scene_view_toolbar(void)
 
 static bool setup_scene_viewport(SceneViewCtx *ctx)
 {
-    ImVec2 avail = ImGui::GetContentRegionAvail();
-    if (avail.x <= 0 || avail.y <= 0) {
+    ImVec2 avail_raw = ImGui::GetContentRegionAvail();
+    if (avail_raw.x <= 0 || avail_raw.y <= 0) {
         clear_stale_gizmo_interaction_state();
         return false;
     }
+
+    uint32_t vp_w = (uint32_t)fmaxf(1.0f, floorf(avail_raw.x));
+    uint32_t vp_h = (uint32_t)fmaxf(1.0f, floorf(avail_raw.y));
+    ImVec2 avail((float)vp_w, (float)vp_h);
 
     ImVec2 screen_pos = ImGui::GetCursorScreenPos();
     ImDrawList *dl = ImGui::GetWindowDrawList();
@@ -139,8 +143,6 @@ static bool setup_scene_viewport(SceneViewCtx *ctx)
                       ImVec2(screen_pos.x + avail.x, screen_pos.y + avail.y),
                       IM_COL32(30, 30, 40, 255));
 
-    uint32_t vp_w = (uint32_t)avail.x;
-    uint32_t vp_h = (uint32_t)avail.y;
     jce_editor_scene_render_frame(vp_w, vp_h);
 
     uint16_t tex_idx = jce_editor_scene_render_get_texture();

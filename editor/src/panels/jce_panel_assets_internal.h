@@ -42,6 +42,12 @@ struct FileEntry {
     std::string ext;
     bool is_dir;
     uintmax_t size;
+    std::string modified_at;
+};
+
+enum AssetBrowserViewMode {
+    ASSET_BROWSER_VIEW_GRID,
+    ASSET_BROWSER_VIEW_DETAILS
 };
 
 /* ── Asset Browser state ─────────────────────────────────────────── */
@@ -74,6 +80,7 @@ struct AssetBrowserState {
     std::string pending_navigation_path;
     bool pending_navigation_clear_search;
     double next_auto_refresh_time;
+    AssetBrowserViewMode view_mode;
 };
 
 extern AssetBrowserState s_assets;
@@ -103,6 +110,8 @@ void draw_asset_search_bar(void);
 
 void draw_asset_grid_item(const FileEntry &fe, int index,
                           int cols, int &col, bool &want_ctx_popup);
+void draw_asset_details_list(const std::vector<FileEntry> &display_entries,
+                             bool &want_ctx_popup);
 void draw_asset_item_context_menu(const std::vector<FileEntry> &display_entries);
 void draw_asset_empty_area_menu(void);
 

@@ -366,6 +366,11 @@ file(GLOB_RECURSE EDITOR_ASSET_FILES CONFIGURE_DEPENDS "${EDITOR_RESOURCE_DIR}/*
 file(GLOB_RECURSE ENGINE_UI_FILES    CONFIGURE_DEPENDS "${ENGINE_UI_DIR}/*")
 file(GLOB_RECURSE GAME_UI_FILES      CONFIGURE_DEPENDS "${GAME_UI_DIR}/*")
 
+# Safety: source-only raw_assets must never participate in cook/pack pipelines.
+list(FILTER ENGINE_ASSET_FILES EXCLUDE REGEX "(/|\\\\)raw_assets(/|\\\\)")
+list(FILTER GAME_ASSET_FILES   EXCLUDE REGEX "(/|\\\\)raw_assets(/|\\\\)")
+list(FILTER EDITOR_ASSET_FILES EXCLUDE REGEX "(/|\\\\)raw_assets(/|\\\\)")
+
 # ── Cook step: convert raw assets → .jceasset containers ──
 # When enabled, jce_cook pre-decodes textures (PNG→RGBA8) and audio
 # (WAV/OGG→PCM s16).  PAK then packs the cooked containers.
@@ -503,6 +508,7 @@ add_custom_command(
 	${_GAME_PAK_PREP_COMMANDS}
 	COMMAND    $<TARGET_FILE:jce_pak>
 	           ${_GAME_PAK_RES_FLAGS}
+	           --exclude-segment raw_assets
 	           --pak-file      "${GAME_PAK_FILE}"
 	           --header-file   "${GAME_HEADER_FILE}"
 	           --manifest-file "${GAME_MANIFEST_FILE}"
@@ -547,6 +553,7 @@ add_custom_command(
 	BYPRODUCTS "${EDITOR_PAK_FILE}" "${EDITOR_PAK_OBJ_FILE}" "${EDITOR_PAK_C_ARRAY}" "${EDITOR_HEADER_FILE}" "${EDITOR_MANIFEST_FILE}"
 	COMMAND    $<TARGET_FILE:jce_pak>
 	           ${_EDITOR_PAK_RES_FLAGS}
+	           --exclude-segment raw_assets
 	           --pak-file      "${EDITOR_PAK_FILE}"
 	           --header-file   "${EDITOR_HEADER_FILE}"
 	           --manifest-file "${EDITOR_MANIFEST_FILE}"
@@ -592,6 +599,12 @@ option(JCE_ENABLE_CPPCHECK "Enable cppcheck target" ON)
 if(JCE_ENABLE_CPPCHECK)
 	find_program(CPPCHECK_EXECUTABLE NAMES cppcheck HINTS "D:/CMake/Cppcheck")
 	if(CPPCHECK_EXECUTABLE)
+		include(ProcessorCount)
+		ProcessorCount(_JCE_CPPCHECK_JOBS)
+		if(NOT _JCE_CPPCHECK_JOBS OR _JCE_CPPCHECK_JOBS LESS 1)
+			set(_JCE_CPPCHECK_JOBS 4)
+		endif()
+
 		set(JCE_CPPCHECK_REPORT_DIR "${CMAKE_BINARY_DIR}/reports")
 		set(JCE_CPPCHECK_TEXT_REPORT "${JCE_CPPCHECK_REPORT_DIR}/cppcheck-report.txt")
 		set(JCE_CPPCHECK_XML_REPORT  "${JCE_CPPCHECK_REPORT_DIR}/cppcheck-report.xml")
@@ -604,9 +617,11 @@ if(JCE_ENABLE_CPPCHECK)
 			--inconclusive --inline-suppr
 			--suppress=missingIncludeSystem
 			--suppress=*:*/.conan2/*
+			--suppress=*:*/third_party/*
 			--file-filter=${CMAKE_SOURCE_DIR}/engine/*
 			--file-filter=${CMAKE_SOURCE_DIR}/editor/*
 			--file-filter=${CMAKE_SOURCE_DIR}/caged_kingdom/*
+			-j${_JCE_CPPCHECK_JOBS}
 			--std=c99)
 
 		add_custom_target(cppcheck ALL

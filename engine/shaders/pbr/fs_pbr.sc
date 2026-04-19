@@ -48,6 +48,13 @@ uniform mat4 u_shadowVP;
 // u_csmSplits.xyzw = view-space split distances for cascades 0-3
 uniform mat4 u_csmVP[4];
 uniform vec4 u_csmSplits;
+// u_csmParams.x = 1 / shadowMapSize
+// u_csmParams.y = cascade blend ratio (fraction of cascade depth range)
+// u_csmParams.z = normal bias strength
+// u_csmParams.w = filter radius multiplier
+uniform vec4 u_csmParams;
+// Per-cascade bias scale (x..w for cascades 0..3)
+uniform vec4 u_csmBiasScales;
 
 // IBL samplers (stages 6-8)
 SAMPLERCUBE(s_irradiance, 6);
@@ -55,6 +62,7 @@ SAMPLERCUBE(s_prefilter,  7);
 SAMPLER2D(s_brdfLUT,      8);
 
 // u_iblParams.x = IBL enabled (0 or 1), y = max prefilter mip level
+// u_iblParams.w = linear output flag (1=skip gamma, for tonemap pass)
 uniform vec4 u_iblParams;
 
 // CSM cascade samplers (stages 9-12)
@@ -75,10 +83,99 @@ float toShadowDepth(float ndc_z)
 #endif
 }
 
+float csm_sample_depth(int cascade, vec2 uv)
+{
+    if      (cascade == 0) return texture2D(s_csmShadow0, uv).r;
+    else if (cascade == 1) return texture2D(s_csmShadow1, uv).r;
+    else if (cascade == 2) return texture2D(s_csmShadow2, uv).r;
+    return texture2D(s_csmShadow3, uv).r;
+}
+
+vec4 csm_clip_for_cascade(int cascade, vec3 world_pos)
+{
+    if      (cascade == 0) return mul(u_csmVP[0], vec4(world_pos, 1.0));
+    else if (cascade == 1) return mul(u_csmVP[1], vec4(world_pos, 1.0));
+    else if (cascade == 2) return mul(u_csmVP[2], vec4(world_pos, 1.0));
+    return mul(u_csmVP[3], vec4(world_pos, 1.0));
+}
+
+float csm_bias_scale_for_cascade(int cascade)
+{
+    if      (cascade == 0) return u_csmBiasScales.x;
+    else if (cascade == 1) return u_csmBiasScales.y;
+    else if (cascade == 2) return u_csmBiasScales.z;
+    return u_csmBiasScales.w;
+}
+
+float sample_csm_shadow(int cascade,
+                        vec3 world_pos,
+                        vec3 shading_normal,
+                        vec3 to_light_dir)
+{
+    vec4 csm_clip = csm_clip_for_cascade(cascade, world_pos);
+    vec3 csm_ndc = csm_clip.xyz / csm_clip.w;
+    vec2 csm_uv = csm_ndc.xy * 0.5 + 0.5;
+#if !BGFX_SHADER_LANGUAGE_GLSL
+    csm_uv.y = 1.0 - csm_uv.y;
+#endif
+    float csm_z = toShadowDepth(csm_ndc.z);
+
+    if (csm_uv.x < 0.0 || csm_uv.x > 1.0 ||
+        csm_uv.y < 0.0 || csm_uv.y > 1.0 ||
+        csm_z < 0.0 || csm_z > 1.0)
+    {
+        return 1.0;
+    }
+
+    float inv_map_size = max(u_csmParams.x, 1.0 / 2048.0);
+    vec2 texel = vec2_splat(inv_map_size);
+    float cascade_lerp = clamp(float(cascade) * (1.0 / 3.0), 0.0, 1.0);
+
+    vec3 n = normalize(shading_normal);
+    float ndotl = max(dot(n, to_light_dir), 0.0);
+    float ndotl_term = 1.0 - ndotl;
+    float slope_bias = max(0.0014 * ndotl_term, 0.00028);
+    float normal_bias = u_csmParams.z * max(ndotl_term, 0.08);
+    float bias_scale = csm_bias_scale_for_cascade(cascade);
+    float bias = (slope_bias + normal_bias) * bias_scale;
+    float max_bias = inv_map_size * mix(2.0, 5.5, cascade_lerp);
+    bias = min(bias, max_bias);
+
+    float filter_radius = max(u_csmParams.w, 0.5) * mix(1.0, 1.8, cascade_lerp);
+
+    float sum = 0.0;
+    for (int y = -2; y <= 2; y++)
+    {
+        for (int x = -2; x <= 2; x++)
+        {
+            vec2 offset = vec2(float(x), float(y)) * texel * filter_radius;
+            float depth = csm_sample_depth(cascade, csm_uv + offset);
+            sum += (csm_z - bias > depth) ? 0.0 : 1.0;
+        }
+    }
+    return sum / 25.0;
+}
+
+vec3 safe_normalize_vec3(vec3 value, vec3 fallback)
+{
+    float len2 = dot(value, value);
+    if (len2 > 1e-8)
+        return value * inversesqrt(len2);
+    return fallback;
+}
+
 void main()
 {
     // --- Shadow calculation ---
     float shadow = 1.0;
+    vec3 toLightDir = safe_normalize_vec3(-u_dirLights[0].xyz,
+                                          vec3(0.0, 1.0, 0.0));
+    vec3 baseNormal = normalize(v_normal);
+
+    if (u_normalScale.y > 0.0 && !gl_FrontFacing)
+    {
+        baseNormal = -baseNormal;
+    }
 
     if (u_csmSplits.x > 0.0)
     {
@@ -89,45 +186,41 @@ void main()
         else if (fragDepth < u_csmSplits.y)  cascade = 1;
         else if (fragDepth < u_csmSplits.z)  cascade = 2;
 
-        vec4 csmClip;
-        if      (cascade == 0) csmClip = mul(u_csmVP[0], vec4(v_worldpos, 1.0));
-        else if (cascade == 1) csmClip = mul(u_csmVP[1], vec4(v_worldpos, 1.0));
-        else if (cascade == 2) csmClip = mul(u_csmVP[2], vec4(v_worldpos, 1.0));
-        else                   csmClip = mul(u_csmVP[3], vec4(v_worldpos, 1.0));
+        shadow = sample_csm_shadow(cascade, v_worldpos, baseNormal, toLightDir);
 
-        vec3 csmNDC = csmClip.xyz / csmClip.w;
-        vec2 csmUV  = csmNDC.xy * 0.5 + 0.5;
-        /* D3D/Metal/Vulkan render-target origin is top-left (UV Y=0 = top),
-           OpenGL is bottom-left (UV Y=0 = bottom). Flip Y for non-GL. */
-#if !BGFX_SHADER_LANGUAGE_GLSL
-        csmUV.y = 1.0 - csmUV.y;
-#endif
-        float csmZ  = toShadowDepth(csmNDC.z);
-
-        // Slope-based bias: direction from surface toward light.
-        vec3 toLightDir = normalize(-u_dirLights[0].xyz);
-        float csmBias = max(0.005 * (1.0 - dot(normalize(v_normal), toLightDir)), 0.002);
-
-        if (csmUV.x >= 0.0 && csmUV.x <= 1.0 &&
-            csmUV.y >= 0.0 && csmUV.y <= 1.0 &&
-            csmZ >= 0.0 && csmZ <= 1.0)
+        if (cascade < 3)
         {
-            vec2 csmTexel = vec2_splat(1.0 / 2048.0);
-            float csmSum = 0.0;
-            for (int cy = -1; cy <= 1; cy++)
+            float split_start = 0.0;
+            float split_end = u_csmSplits.x;
+            if (cascade == 1) {
+                split_start = u_csmSplits.x;
+                split_end = u_csmSplits.y;
+            } else if (cascade == 2) {
+                split_start = u_csmSplits.y;
+                split_end = u_csmSplits.z;
+            } else if (cascade == 3) {
+                split_start = u_csmSplits.z;
+                split_end = u_csmSplits.w;
+            }
+
+            float split_span = split_end - split_start;
+            if (split_span > 0.001)
             {
-                for (int cx = -1; cx <= 1; cx++)
+                float blend_fraction = clamp(u_csmParams.y, 0.0, 0.35);
+                float blend_range = max(split_span * blend_fraction, 0.001);
+                float blend = smoothstep(split_end - blend_range,
+                                         split_end + blend_range,
+                                         fragDepth);
+
+                if (blend > 0.0001)
                 {
-                    vec2 offset = vec2(float(cx), float(cy)) * csmTexel;
-                    float d;
-                    if      (cascade == 0) d = texture2D(s_csmShadow0, csmUV + offset).r;
-                    else if (cascade == 1) d = texture2D(s_csmShadow1, csmUV + offset).r;
-                    else if (cascade == 2) d = texture2D(s_csmShadow2, csmUV + offset).r;
-                    else                   d = texture2D(s_csmShadow3, csmUV + offset).r;
-                    csmSum += (csmZ - csmBias > d) ? 0.0 : 1.0;
+                    float next_shadow = sample_csm_shadow(cascade + 1,
+                                                          v_worldpos,
+                                                          baseNormal,
+                                                          toLightDir);
+                    shadow = mix(shadow, next_shadow, blend);
                 }
             }
-            shadow = csmSum / 9.0;
         }
     }
     else
@@ -140,13 +233,17 @@ void main()
         shadowUV.y = 1.0 - shadowUV.y;
 #endif
         float shadowZ   = toShadowDepth(shadowNDC.z);
-        float shadowBias = 0.005;
+        float ndotl = max(dot(baseNormal, toLightDir), 0.0);
+        float shadowBias = max(0.0014 * (1.0 - ndotl), 0.00035);
+        shadowBias += (u_csmParams.z * 0.5) * (1.0 - ndotl);
+        shadowBias = min(shadowBias,
+                 max(u_csmParams.x, 1.0 / 2048.0) * 3.0);
 
         if (shadowUV.x >= 0.0 && shadowUV.x <= 1.0 &&
             shadowUV.y >= 0.0 && shadowUV.y <= 1.0 &&
             shadowZ >= 0.0 && shadowZ <= 1.0)
         {
-            vec2 texelSize = vec2_splat(1.0 / 2048.0);
+            vec2 texelSize = vec2_splat(max(u_csmParams.x, 1.0 / 2048.0));
             float sum = 0.0;
             for (int sy = -1; sy <= 1; sy++)
             {
@@ -179,13 +276,7 @@ void main()
     }
 
     // --- Normal ---
-    vec3 N = normalize(v_normal);
-
-    // Double-sided: flip normal if back-facing
-    if (u_normalScale.y > 0.0 && !gl_FrontFacing)
-    {
-        N = -N;
-    }
+    vec3 N = baseNormal;
 
     // Perturb normal from normal map
     if (u_normalScale.x > 0.0)
@@ -202,6 +293,13 @@ void main()
     float metallic  = mrSample.b * u_pbrParams.x;
     float roughness = mrSample.g * u_pbrParams.y;
     roughness = clamp(roughness, 0.04, 1.0);
+
+    // Low-cost specular AA from normal derivatives (Toksvig-like).
+    vec3 dndx = dFdx(N);
+    vec3 dndy = dFdy(N);
+    float normal_variance = clamp(max(dot(dndx, dndx), dot(dndy, dndy)), 0.0, 1.0);
+    float aa_roughness = sqrt(normal_variance * 0.5);
+    roughness = clamp(max(roughness, aa_roughness), 0.04, 1.0);
 
     // --- AO ---
     float ao = texture2D(s_aoMap, v_texcoord0).r;
@@ -302,7 +400,9 @@ void main()
         // Specular: sample prefiltered env + BRDF LUT
         vec3 R = reflect(-V, N);
         float maxMipLevel = u_iblParams.y;
-        vec3 prefilteredColor = textureCubeLod(s_prefilter, R, roughness * maxMipLevel).rgb;
+        float perceptual_roughness = sqrt(roughness);
+        vec3 prefilteredColor = textureCubeLod(s_prefilter, R,
+                               perceptual_roughness * maxMipLevel).rgb;
         vec2 brdfSample = texture2D(s_brdfLUT, vec2(NdotV_a, roughness)).rg;
         vec3 specularIBL = prefilteredColor * (F_ibl * brdfSample.x + vec3_splat(brdfSample.y));
 
@@ -323,8 +423,9 @@ void main()
     vec3 color = ambient + Lo + emissive;
 
     // --- Gamma correction (linear -> sRGB) ---
-    // No tonemapping: match standard 3D viewers (Blender, glTF-viewer, etc.)
-    color = pow(color, vec3_splat(1.0 / 2.2));
+    // When postfx tonemap is enabled, keep linear output for post-processing.
+    if (u_iblParams.w < 0.5)
+        color = pow(max(color, vec3_splat(0.0)), vec3_splat(1.0 / 2.2));
 
     // --- Output ---
     if (alphaMode == 2.0)

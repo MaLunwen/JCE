@@ -1,2 +1,2 @@
 # Vendored third-party sources — excluded from GitHub language statistics
-engine/src/video/third_party/**  linguist-vendored=true
+**/third_party/** linguist-vendored=true

@@ -38,6 +38,7 @@ typedef struct {
  * @param camera_view    Camera view matrix.
  * @param light_dir      Normalized light direction (world space).
  * @param homogeneous_depth  bgfx homogeneous depth flag.
+ * @param shadow_map_size Shadow map resolution used by cascades.
  */
 void jce_csm_compute(JceCsmData *out,
                      uint32_t cascade_count,
@@ -47,7 +48,8 @@ void jce_csm_compute(JceCsmData *out,
                      float aspect,
                      const jce_mat4 *camera_view,
                      const jce_vec3 *light_dir,
-                     bool homogeneous_depth);
+                     bool homogeneous_depth,
+                     uint16_t shadow_map_size);
 
 #ifdef __cplusplus
 }

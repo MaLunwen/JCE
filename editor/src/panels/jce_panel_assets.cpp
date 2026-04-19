@@ -7,6 +7,9 @@
 
 #include "jce_panel_assets_internal.h"
 
+#include <chrono>
+#include <ctime>
+
 /* ── State instance (shared via extern in internal header) ───────── */
 
 AssetBrowserState s_assets;
@@ -32,6 +35,32 @@ std::string normalized_path_string(const fs::path &p)
     }
 }
 
+static std::string format_modified_time(const fs::directory_entry &de)
+{
+    try {
+        const auto file_tp = de.last_write_time();
+        const auto sys_tp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+            file_tp - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
+        const std::time_t raw_time = std::chrono::system_clock::to_time_t(sys_tp);
+
+        std::tm local_tm = {};
+#ifdef _WIN32
+        if (localtime_s(&local_tm, &raw_time) != 0)
+            return "";
+#else
+        if (!localtime_r(&raw_time, &local_tm))
+            return "";
+#endif
+
+        char buf[32] = {0};
+        if (std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &local_tm) == 0)
+            return "";
+        return std::string(buf);
+    } catch (...) {
+        return "";
+    }
+}
+
 void ensure_assets_init(void)
 {
     if (s_assets.initialized) return;
@@ -50,6 +79,9 @@ void ensure_assets_init(void)
     s_assets.pending_navigation_path.clear();
     s_assets.pending_navigation_clear_search = false;
     s_assets.next_auto_refresh_time = 0.0;
+    s_assets.search_buf[0] = '\0';
+    s_assets.search_active = false;
+    s_assets.view_mode = ASSET_BROWSER_VIEW_DETAILS;
     s_assets.initialized       = true;
 }
 
@@ -62,6 +94,7 @@ void refresh_entries(void)
             fe.name   = de.path().filename().string();
             fe.path   = normalized_path_string(de.path());
             fe.is_dir = de.is_directory();
+            fe.modified_at = format_modified_time(de);
             if (!fe.is_dir) {
                 std::string ext = de.path().extension().string();
                 std::transform(ext.begin(), ext.end(), ext.begin(),
@@ -152,6 +185,7 @@ void collect_search_results(const std::string &query)
             FileEntry fe;
             fe.name   = de.path().filename().string();
             fe.is_dir = de.is_directory();
+            fe.modified_at = format_modified_time(de);
 
             std::string name_lower = fe.name;
             for (auto &c : name_lower) c = (char)std::tolower((unsigned char)c);
@@ -497,16 +531,20 @@ void jce_editor_panel_assets_content(void)
         {
             const std::vector<FileEntry> &display_entries =
                 s_assets.search_active ? s_assets.search_results : s_assets.entries;
-
-            float cell_size = JCE_THUMBNAIL_SIZE + JCE_ASSET_CELL_PADDING * 2;
-            float panel_w   = ImGui::GetContentRegionAvail().x;
-            int cols = (int)(panel_w / cell_size);
-            if (cols < 1) cols = 1;
-
-            int col = 0;
             bool want_ctx_popup = false;
-            for (int i = 0; i < (int)display_entries.size(); i++)
-                draw_asset_grid_item(display_entries[i], i, cols, col, want_ctx_popup);
+
+            if (s_assets.view_mode == ASSET_BROWSER_VIEW_GRID) {
+                float cell_size = JCE_THUMBNAIL_SIZE + JCE_ASSET_CELL_PADDING * 2;
+                float panel_w   = ImGui::GetContentRegionAvail().x;
+                int cols = (int)(panel_w / cell_size);
+                if (cols < 1) cols = 1;
+
+                int col = 0;
+                for (int i = 0; i < (int)display_entries.size(); i++)
+                    draw_asset_grid_item(display_entries[i], i, cols, col, want_ctx_popup);
+            } else {
+                draw_asset_details_list(display_entries, want_ctx_popup);
+            }
 
             if (want_ctx_popup)
                 ImGui::OpenPopup("AssetContextMenu");

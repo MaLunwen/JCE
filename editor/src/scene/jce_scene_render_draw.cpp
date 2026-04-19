@@ -11,11 +11,12 @@ extern "C" {
 
 /* ── Shadow map constants ─────────────────────────────────────────── */
 
-#define SHADOW_MAP_SIZE  2048
 #define SHADOW_ORTHO_SIZE 50.0f
 #define CSM_SHADOW_DISTANCE_SCALE 512.0f
 #define CSM_SHADOW_DISTANCE_MAX   1200.0f
 #define CSM_SHADOW_DISTANCE_MIN   50.0f
+#define CSM_SHADOW_FAR_HYSTERESIS_REL 0.03f
+#define CSM_SHADOW_FAR_HYSTERESIS_ABS 8.0f
 
 /* ── Sky gradient (smooth sky dome — no visible edges) ────────────── */
 
@@ -305,128 +306,207 @@ static void compute_shadow_vp(const jce_vec3 *light_dir, float shadow_vp[16])
 
     jce_mat4 view = jce_m4_look_at(light_pos, center, up);
 
-    const bgfx_caps_t *caps = bgfx_get_caps();
     float S = SHADOW_ORTHO_SIZE;
     jce_mat4 proj = jce_m4_ortho(-S, S, -S, S, 0.1f, 200.0f,
-                                  caps->homogeneousDepth);
+                                  s_sr.homogeneous_depth);
 
     jce_mat4 vp = jce_m4_multiply(&proj, &view);
     memcpy(shadow_vp, vp.raw, 16 * sizeof(float));
 }
 
+static void fill_csm_bias_scales(const JceCsmData *csm, float out_scales[4])
+{
+    float base_range = 0.1f;
+    if (csm->cascade_count > 0) {
+        base_range = csm->splits[1] - csm->splits[0];
+        if (base_range < 0.0001f)
+            base_range = 0.1f;
+    }
+
+    float last_scale = 1.0f;
+    for (uint32_t i = 0; i < JCE_CSM_MAX_CASCADES; i++) {
+        float scale = last_scale;
+        if (i < csm->cascade_count) {
+            float range = csm->splits[i + 1] - csm->splits[i];
+            if (range < 0.0001f)
+                range = base_range;
+            scale = range / base_range;
+            if (scale < 1.0f) scale = 1.0f;
+            if (scale > 3.2f) scale = 3.2f;
+            last_scale = scale;
+        }
+        out_scales[i] = scale;
+    }
+}
+
 static void draw_shadow_pass(void)
 {
+    s_sr.shadow_use_csm = false;
+
+    /* Keep CSM uniforms deterministic even if shadow rendering is unavailable. */
+    {
+        float disabled_splits[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        float csm_params[4] = {
+            1.0f / (float)s_sr.shadow_map_size,
+            s_sr.csm_blend_ratio,
+            s_sr.csm_normal_bias,
+            s_sr.csm_filter_radius,
+        };
+        float bias_scales[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+        bgfx_set_uniform(s_sr.u_csm_splits, disabled_splits, 1);
+        bgfx_set_uniform(s_sr.u_csm_params, csm_params, 1);
+        bgfx_set_uniform(s_sr.u_csm_bias_scales, bias_scales, 1);
+    }
+
     if (!s_sr.shadow_valid) return;
 
     JceShaderHandle shadow_sh = jce_renderer_get_program_shadow(s_sr.renderer);
     if (shadow_sh.idx == UINT16_MAX) return;
 
+    const bool use_csm = s_sr.csm_valid && s_sr.csm_cascade_count > 0;
+    const int count = jce_state_get_entity_count();
     jce_vec3 shadow_dir = resolve_shadow_light_direction();
 
-    /* Legacy single shadow map (view SHADOW_0). */
-    float shadow_vp[16];
-    compute_shadow_vp(&shadow_dir, shadow_vp);
+    if (!use_csm) {
+        /* Legacy single shadow map fallback (view SHADOW_0). */
+        float shadow_vp[16];
+        compute_shadow_vp(&shadow_dir, shadow_vp);
 
-    const uint16_t shadow_view = (uint16_t)JCE_VIEW_SHADOW_0;
-    bgfx_set_view_rect(shadow_view, 0, 0, SHADOW_MAP_SIZE, SHADOW_MAP_SIZE);
-    bgfx_set_view_frame_buffer(shadow_view, s_sr.shadow_fbo);
-    bgfx_set_view_clear(shadow_view,
-                        BGFX_CLEAR_DEPTH, 0, 1.0f, 0);
+        const uint16_t shadow_view = (uint16_t)JCE_VIEW_SHADOW_0;
+        bgfx_set_view_rect(shadow_view, 0, 0,
+                           s_sr.shadow_map_size,
+                           s_sr.shadow_map_size);
+        bgfx_set_view_frame_buffer(shadow_view, s_sr.shadow_fbo);
+        bgfx_set_view_clear(shadow_view,
+                            BGFX_CLEAR_DEPTH, 0, 1.0f, 0);
 
-    float identity[16];
-    memset(identity, 0, sizeof(identity));
-    identity[0] = identity[5] = identity[10] = identity[15] = 1.0f;
-    bgfx_set_view_transform(shadow_view, identity, shadow_vp);
+        float identity[16];
+        memset(identity, 0, sizeof(identity));
+        identity[0] = identity[5] = identity[10] = identity[15] = 1.0f;
+        bgfx_set_view_transform(shadow_view, identity, shadow_vp);
 
-    bgfx_set_uniform(s_sr.u_shadowVP, shadow_vp, 1);
+        bgfx_set_uniform(s_sr.u_shadowVP, shadow_vp, 1);
 
-    int count = jce_state_get_entity_count();
-    for (int i = 0; i < count; i++) {
-        JceEntityInfo *ent = jce_state_get_entity_by_index(i);
-        if (!ent || !ent->enabled) continue;
+        for (int i = 0; i < count; i++) {
+            JceEntityInfo *ent = jce_state_get_entity_by_index(i);
+            if (!ent || !ent->enabled) continue;
 
-        jce_mat4 model;
-        JceMesh *mesh = NULL;
-        const char *mat_path = NULL;
-        if (!build_entity_model(ent, &model, &mesh, &mat_path)) continue;
-        if (!mesh) continue;
+            jce_mat4 model;
+            JceMesh *mesh = NULL;
+            const char *mat_path = NULL;
+            if (!build_entity_model(ent, &model, &mesh, &mat_path)) continue;
+            if (!mesh) continue;
 
-        bgfx_set_transform(model.raw[0], 1);
-        jce_mesh_submit_shadow(mesh, s_sr.renderer, shadow_view);
+            bgfx_set_transform(model.raw[0], 1);
+            jce_mesh_submit_shadow(mesh, s_sr.renderer, shadow_view);
+        }
+        return;
     }
+
+    s_sr.shadow_use_csm = true;
 
     /* CSM passes (views SHADOW_1..SHADOW_4). */
-    if (s_sr.csm_valid && s_sr.csm_cascade_count > 0) {
-        const bgfx_caps_t *caps = bgfx_get_caps();
-        float cam_near = s_sr.camera ? jce_camera_get_near(s_sr.camera) : 0.1f;
-        float cam_far  = s_sr.camera ? jce_camera_get_far(s_sr.camera) : 200.0f;
-        float cam_fov  = s_sr.camera ? jce_camera_get_fov(s_sr.camera) : 45.0f;
-        float cam_aspect = (s_sr.viewport_width > 0 && s_sr.viewport_height > 0)
-            ? ((float)s_sr.viewport_width / (float)s_sr.viewport_height)
-            : (16.0f / 9.0f);
-        float shadow_far;
+    float cam_near = s_sr.camera ? jce_camera_get_near(s_sr.camera) : 0.1f;
+    float cam_far  = s_sr.camera ? jce_camera_get_far(s_sr.camera) : 200.0f;
+    float cam_fov  = s_sr.camera ? jce_camera_get_fov(s_sr.camera) : 45.0f;
+    float cam_aspect = (s_sr.viewport_width > 0 && s_sr.viewport_height > 0)
+        ? ((float)s_sr.viewport_width / (float)s_sr.viewport_height)
+        : (16.0f / 9.0f);
+    float shadow_far_target;
+    float shadow_far;
 
-        if (cam_near <= 0.0f)
-            cam_near = 0.1f;
-        if (cam_far <= cam_near)
-            cam_far = cam_near + 200.0f;
-          shadow_far = cam_far;
-          shadow_far = fminf(shadow_far,
-                       fmaxf(cam_near * CSM_SHADOW_DISTANCE_SCALE,
-                           CSM_SHADOW_DISTANCE_MAX));
-          shadow_far = fmaxf(shadow_far, cam_near + CSM_SHADOW_DISTANCE_MIN);
+    if (cam_near <= 0.0f)
+        cam_near = 0.1f;
+    if (cam_far <= cam_near)
+        cam_far = cam_near + 200.0f;
+    shadow_far_target = cam_far;
+    shadow_far_target = fminf(shadow_far_target,
+                 fmaxf(cam_near * CSM_SHADOW_DISTANCE_SCALE,
+                       CSM_SHADOW_DISTANCE_MAX));
+    shadow_far_target = fmaxf(shadow_far_target,
+                              cam_near + CSM_SHADOW_DISTANCE_MIN);
 
-        jce_mat4 cam_view = jce_camera_view(s_sr.camera);
-        jce_vec3 light_dir = shadow_dir;
-
-        JceCsmData csm;
-        jce_csm_compute(&csm, s_sr.csm_cascade_count,
-                         cam_near, shadow_far,
-                         cam_fov, cam_aspect,
-                         &cam_view, &light_dir,
-                         caps->homogeneousDepth);
-
-        /* Render each cascade into its own FBO using SHADOW_1..SHADOW_4. */
-        for (uint32_t c = 0; c < csm.cascade_count; c++) {
-            uint16_t csm_view = (uint16_t)(JCE_VIEW_SHADOW_1 + c);
-            if (c >= JCE_CSM_MAX_CASCADES) break;
-
-            bgfx_set_view_rect(csm_view, 0, 0, SHADOW_MAP_SIZE, SHADOW_MAP_SIZE);
-            bgfx_set_view_frame_buffer(csm_view, s_sr.csm_fbo[c]);
-            bgfx_set_view_clear(csm_view, BGFX_CLEAR_DEPTH, 0, 1.0f, 0);
-
-            float csm_identity[16];
-            memset(csm_identity, 0, sizeof(csm_identity));
-            csm_identity[0] = csm_identity[5] = csm_identity[10] = csm_identity[15] = 1.0f;
-            bgfx_set_view_transform(csm_view, csm_identity, csm.vp[c].raw[0]);
-
-            for (int i = 0; i < count; i++) {
-                JceEntityInfo *ent = jce_state_get_entity_by_index(i);
-                if (!ent || !ent->enabled) continue;
-
-                jce_mat4 model;
-                JceMesh *mesh = NULL;
-                const char *mat_path = NULL;
-                if (!build_entity_model(ent, &model, &mesh, &mat_path)) continue;
-                if (!mesh) continue;
-
-                bgfx_set_transform(model.raw[0], 1);
-                jce_mesh_submit_shadow(mesh, s_sr.renderer, csm_view);
-            }
+    if (!s_sr.shadow_far_valid) {
+        s_sr.shadow_far_cached = shadow_far_target;
+        s_sr.shadow_far_valid = true;
+    } else {
+        float far_delta = fabsf(shadow_far_target - s_sr.shadow_far_cached);
+        float far_rel = far_delta / fmaxf(s_sr.shadow_far_cached,
+                                          CSM_SHADOW_DISTANCE_MIN);
+        if (far_delta > CSM_SHADOW_FAR_HYSTERESIS_ABS
+            && far_rel > CSM_SHADOW_FAR_HYSTERESIS_REL)
+        {
+            s_sr.shadow_far_cached = shadow_far_target;
         }
-
-        /* Upload CSM uniforms for the PBR shader. */
-        bgfx_set_uniform(s_sr.u_csm_vp, csm.vp[0].raw[0],
-                 (uint16_t)csm.cascade_count);
-
-        float splits_vec4[4] = {
-            csm.cascade_count > 0 ? csm.splits[1] : shadow_far,
-            csm.cascade_count > 1 ? csm.splits[2] : shadow_far,
-            csm.cascade_count > 2 ? csm.splits[3] : shadow_far,
-            csm.cascade_count > 3 ? csm.splits[4] : shadow_far,
-        };
-        bgfx_set_uniform(s_sr.u_csm_splits, splits_vec4, 1);
     }
+
+    shadow_far = s_sr.shadow_far_cached;
+
+    jce_mat4 cam_view = jce_camera_view(s_sr.camera);
+    jce_vec3 light_dir = shadow_dir;
+
+    JceCsmData csm;
+    jce_csm_compute(&csm, s_sr.csm_cascade_count,
+                     cam_near, shadow_far,
+                     cam_fov, cam_aspect,
+                     &cam_view, &light_dir,
+                     s_sr.homogeneous_depth,
+                     s_sr.shadow_map_size);
+
+    /* Render each cascade into its own FBO using SHADOW_1..SHADOW_4. */
+    for (uint32_t c = 0; c < csm.cascade_count; c++) {
+        uint16_t csm_view = (uint16_t)(JCE_VIEW_SHADOW_1 + c);
+        if (c >= JCE_CSM_MAX_CASCADES) break;
+
+        bgfx_set_view_rect(csm_view, 0, 0,
+                           s_sr.shadow_map_size,
+                           s_sr.shadow_map_size);
+        bgfx_set_view_frame_buffer(csm_view, s_sr.csm_fbo[c]);
+        bgfx_set_view_clear(csm_view, BGFX_CLEAR_DEPTH, 0, 1.0f, 0);
+
+        float csm_identity[16];
+        memset(csm_identity, 0, sizeof(csm_identity));
+        csm_identity[0] = csm_identity[5] = csm_identity[10] = csm_identity[15] = 1.0f;
+        bgfx_set_view_transform(csm_view, csm_identity, csm.vp[c].raw[0]);
+
+        for (int i = 0; i < count; i++) {
+            JceEntityInfo *ent = jce_state_get_entity_by_index(i);
+            if (!ent || !ent->enabled) continue;
+
+            jce_mat4 model;
+            JceMesh *mesh = NULL;
+            const char *mat_path = NULL;
+            if (!build_entity_model(ent, &model, &mesh, &mat_path)) continue;
+            if (!mesh) continue;
+
+            bgfx_set_transform(model.raw[0], 1);
+            jce_mesh_submit_shadow(mesh, s_sr.renderer, csm_view);
+        }
+    }
+
+    /* Upload CSM uniforms for the PBR shader. */
+    bgfx_set_uniform(s_sr.u_csm_vp, csm.vp[0].raw[0],
+                     (uint16_t)csm.cascade_count);
+
+    float splits_vec4[4] = {
+        csm.cascade_count > 0 ? csm.splits[1] : shadow_far,
+        csm.cascade_count > 1 ? csm.splits[2] : shadow_far,
+        csm.cascade_count > 2 ? csm.splits[3] : shadow_far,
+        csm.cascade_count > 3 ? csm.splits[4] : shadow_far,
+    };
+    bgfx_set_uniform(s_sr.u_csm_splits, splits_vec4, 1);
+
+    float csm_params[4] = {
+        1.0f / (float)s_sr.shadow_map_size,
+        s_sr.csm_blend_ratio,
+        s_sr.csm_normal_bias,
+        s_sr.csm_filter_radius,
+    };
+    bgfx_set_uniform(s_sr.u_csm_params, csm_params, 1);
+
+    float bias_scales[4];
+    fill_csm_bias_scales(&csm, bias_scales);
+    bgfx_set_uniform(s_sr.u_csm_bias_scales, bias_scales, 1);
 }
 
 /* ── Main entity rendering ────────────────────────────────────────── */
@@ -787,7 +867,7 @@ void draw_entities(void)
 
             jce_pbr_material_bind(&pbr, s_sr.renderer, scene_view_id());
 
-            if (s_sr.shadow_valid) {
+            if (s_sr.shadow_valid && !s_sr.shadow_use_csm) {
                 bgfx_set_texture(5, s_sr.u_shadowMap, s_sr.shadow_tex, UINT32_MAX);
                 float shadow_vp[16];
                 jce_vec3 shadow_dir = resolve_shadow_light_direction();
@@ -796,7 +876,7 @@ void draw_entities(void)
             }
 
             /* Bind CSM cascade textures (stages 9-12). */
-            if (s_sr.csm_valid) {
+            if (s_sr.csm_valid && s_sr.shadow_use_csm) {
                 for (uint32_t ci = 0; ci < s_sr.csm_cascade_count && ci < JCE_CSM_MAX_CASCADES; ci++)
                     bgfx_set_texture((uint8_t)(9 + ci), s_sr.u_csm_samplers[ci],
                                      s_sr.csm_tex[ci], UINT32_MAX);
@@ -804,7 +884,12 @@ void draw_entities(void)
 
             /* Bind IBL textures (stages 6-8) if active. */
             {
-                float ibl_params[4] = { 0.0f, 5.0f, 0.0f, 0.0f };
+                float ibl_params[4] = {
+                    0.0f,
+                    5.0f,
+                    0.0f,
+                    s_sr.postfx_tonemap_active ? 1.0f : 0.0f
+                };
                 if (s_sr.skybox_active && s_sr.ibl_data) {
                     bgfx_texture_handle_t irr = jce_ibl_get_irradiance(s_sr.ibl_data);
                     bgfx_texture_handle_t pf  = jce_ibl_get_prefilter(s_sr.ibl_data);

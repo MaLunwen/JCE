@@ -57,8 +57,7 @@ static bool bridge_ensure_target(JceEditorRenderBridge *bridge,
     textures[0] = bgfx_create_texture_2d(
         (uint16_t)width, (uint16_t)height, false, 1,
         BGFX_TEXTURE_FORMAT_RGBA8,
-        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
-            | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT,
+        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
         NULL);
 
     textures[1] = bgfx_create_texture_2d(
