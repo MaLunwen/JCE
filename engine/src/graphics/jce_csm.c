@@ -103,8 +103,13 @@ void jce_csm_compute(JceCsmData *out,
             float d = jce_v3_len(jce_v3_sub(corners[i], center));
             if (d > radius) radius = d;
         }
-        /* Round up to reduce shadow shimmer on camera movement. */
-        radius = ceilf(radius * 16.0f) / 16.0f;
+        /* Quantize radius to shadow-map-aligned steps to reduce shimmer
+         * during camera rotation and small frustum changes. */
+        {
+            float texel_approx = (radius * 2.0f) / (float)shadow_map_size;
+            float quant = fmaxf(texel_approx * 4.0f, 0.25f);
+            radius = ceilf(radius / quant) * quant;
+        }
 
         /* Light view matrix: look from center along light direction. */
         jce_vec3 light_pos = jce_v3_add(center, jce_v3_scale(ld, radius));
@@ -127,10 +132,12 @@ void jce_csm_compute(JceCsmData *out,
         light_pos = jce_v3_add(snapped_center, jce_v3_scale(ld, radius));
         light_view = jce_m4_look_at(light_pos, snapped_center, up);
 
-        /* Tight ortho projection around the bounding sphere. */
+        /* Ortho projection around bounding sphere with Z padding for
+         * world-space normal-offset bias applied in the fragment shader. */
+        float z_pad = radius * 0.05f;
         jce_mat4 light_proj = jce_m4_ortho(-radius, radius,
                                             -radius, radius,
-                                            0.0f, radius * 2.0f,
+                                            -z_pad, radius * 2.0f + z_pad,
                                             homogeneous_depth);
 
         out->vp[c] = jce_m4_multiply(&light_proj, &light_view);

@@ -65,6 +65,21 @@ static void mesh_async_worker_main(void)
         MeshLoadResult result = {};
         result.mesh_path = req.mesh_path;
         result.generation = req.generation;
+
+        if (req.file_path.empty()) {
+            char found_path[512];
+            if (!resolve_mesh_file_path(req.mesh_path.c_str(),
+                                        found_path,
+                                        sizeof(found_path))) {
+                result.success = false;
+
+                std::lock_guard<std::mutex> lock(s_mesh_async.mutex);
+                s_mesh_async.completed.push_back(std::move(result));
+                continue;
+            }
+            req.file_path = found_path;
+        }
+
         result.success = jce_editor_model_load_cpu_file(req.file_path.c_str(),
                                                         &result.cpu);
 
@@ -130,7 +145,7 @@ void mesh_async_queue_request(const char *mesh_path,
                               const char *file_path,
                               float priority_dist2)
 {
-    if (!s_mesh_async.running || !mesh_path || !file_path)
+    if (!s_mesh_async.running || !mesh_path)
         return;
 
     bool inserted = false;
@@ -149,7 +164,7 @@ void mesh_async_queue_request(const char *mesh_path,
         if (!inserted) {
             MeshLoadRequest req;
             req.mesh_path = mesh_path;
-            req.file_path = file_path;
+            req.file_path = file_path ? file_path : "";
             req.priority_dist2 = priority_dist2;
             req.order = s_mesh_async.discovery++;
             req.generation = s_mesh_async.generation;
@@ -502,6 +517,8 @@ void mesh_finalize_completed_loads(void)
 
         if (!res.success) {
             s_cache.mesh_cache[idx].failed = true;
+            LOG_WARN(LOG_TAG, "mesh async load failed: %s",
+                     res.mesh_path.c_str());
             jce_editor_model_free_cpu_data(&res.cpu);
             continue;
         }
@@ -553,17 +570,9 @@ JceMesh *asset_cache_get_mesh(const char *mesh_path, const float *world_pos)
         return NULL;
     }
 
-    char found_path[512];
-    if (!resolve_mesh_file_path(mesh_path, found_path, sizeof(found_path))) {
-        s_cache.mesh_cache[idx].failed = true;
-        LOG_WARN(LOG_TAG, "mesh not found: %s (under %s)",
-                 mesh_path, s_cache.scene_dir);
-        return NULL;
-    }
-
     s_cache.mesh_cache[idx].requested = true;
     s_cache.mesh_cache[idx].request_generation = generation;
-    mesh_async_queue_request(mesh_path, found_path,
+    mesh_async_queue_request(mesh_path, NULL,
                              mesh_request_priority(world_pos));
     return NULL;
 }

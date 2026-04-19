@@ -1,5 +1,5 @@
 $input a_position, a_normal, a_tangent, a_texcoord0, a_indices, a_weight
-$output v_texcoord0, v_worldpos, v_normal, v_tangent, v_bitangent, v_viewdepth
+$output v_texcoord0, v_worldpos, v_normal, v_tangent, v_bitangent, v_viewdepth, v_localpos
 
 #include <bgfx_shader.sh>
 
@@ -46,5 +46,6 @@ void main()
     v_bitangent = cross(v_normal, v_tangent) * a_tangent.w;
     v_texcoord0 = a_texcoord0;
     v_worldpos  = wpos;
+    v_localpos  = a_position;
     v_viewdepth = -viewPos.z;
 }

@@ -362,6 +362,10 @@ bool  jce_state_can_redo(void);
 void  jce_state_begin_batch_edit(void);
 void  jce_state_end_batch_edit(void);
 
+/* Transient edit scope: no undo snapshot, but marks scene dirty. */
+void  jce_state_begin_transient_edit(void);
+void  jce_state_end_transient_edit(void);
+
 /* Explicit transaction scope for multi-step editor workflows. */
 bool  jce_state_begin_transaction(const char *label);
 void  jce_state_commit_transaction(void);

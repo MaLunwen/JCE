@@ -657,7 +657,8 @@ void jce_renderer_destroy(JceRenderer *r)
         return;
     }
     s_dbg_text_enabled = false;
-    bgfx_destroy_program(r->program);
+    if (r->program.idx != UINT16_MAX)
+        bgfx_destroy_program(r->program);
     if (r->program_textured.idx != UINT16_MAX)
         bgfx_destroy_program(r->program_textured);
     if (r->u_tex_color.idx != UINT16_MAX)

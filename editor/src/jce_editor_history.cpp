@@ -203,6 +203,27 @@ void jce_state_end_batch_edit(void)
 	history_end_edit(true);
 }
 
+void jce_state_begin_transient_edit(void)
+{
+	++s_history_suspend_depth;
+	++s_history_transient_batch_depth;
+}
+
+void jce_state_end_transient_edit(void)
+{
+	if (s_history_transient_batch_depth <= 0)
+		return;
+
+	--s_history_transient_batch_depth;
+	if (s_history_suspend_depth > 0)
+		--s_history_suspend_depth;
+
+	if (s_history_transient_batch_depth == 0) {
+		s_redo_history.clear();
+		s.scene_modified = true;
+	}
+}
+
 /* ── Explicit transaction scope ──────────────────────────────────── */
 
 bool jce_state_begin_transaction(const char *label)

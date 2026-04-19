@@ -140,10 +140,29 @@ static void texture_async_worker_main(void)
         TextureLoadResult result = {};
         result.key = req.key;
         result.generation = req.generation;
-        result.success = decode_texture_rgba_path(req.file_path,
-                                                  &result.rgba,
-                                                  &result.width,
-                                                  &result.height);
+        if (req.resolve_path) {
+            fs::path resolved_path;
+            const char *material_path = req.material_path.empty()
+                                      ? NULL : req.material_path.c_str();
+            const char *mesh_path = req.mesh_path.empty()
+                                  ? NULL : req.mesh_path.c_str();
+
+            if (resolve_texture_path_for_material(material_path,
+                                                  mesh_path,
+                                                  &resolved_path)) {
+                result.success = decode_texture_rgba_path(resolved_path,
+                                                          &result.rgba,
+                                                          &result.width,
+                                                          &result.height);
+            } else {
+                result.success = false;
+            }
+        } else {
+            result.success = decode_texture_rgba_path(req.file_path,
+                                                      &result.rgba,
+                                                      &result.width,
+                                                      &result.height);
+        }
 
         std::lock_guard<std::mutex> lock(s_tex_async.mutex);
         s_tex_async.completed.push_back(std::move(result));
@@ -218,6 +237,43 @@ void texture_async_queue_request(const char *key, const fs::path &file_path)
             TextureLoadRequest req;
             req.key = key;
             req.file_path = file_path.string();
+            req.material_path.clear();
+            req.mesh_path.clear();
+            req.resolve_path = false;
+            req.generation = s_tex_async.generation;
+            s_tex_async.pending.push_back(std::move(req));
+            inserted = true;
+        }
+    }
+
+    if (inserted)
+        s_tex_async.cv.notify_one();
+}
+
+void texture_async_queue_resolve_request(const char *key,
+                                         const char *material_path,
+                                         const char *mesh_path)
+{
+    if (!s_tex_async.running || !key || key[0] == '\0')
+        return;
+
+    bool inserted = false;
+    {
+        std::lock_guard<std::mutex> lock(s_tex_async.mutex);
+        for (TextureLoadRequest &req : s_tex_async.pending) {
+            if (req.generation == s_tex_async.generation && req.key == key) {
+                inserted = true;
+                break;
+            }
+        }
+
+        if (!inserted) {
+            TextureLoadRequest req;
+            req.key = key;
+            req.file_path.clear();
+            req.material_path = material_path ? material_path : "";
+            req.mesh_path = mesh_path ? mesh_path : "";
+            req.resolve_path = true;
             req.generation = s_tex_async.generation;
             s_tex_async.pending.push_back(std::move(req));
             inserted = true;
@@ -450,19 +506,13 @@ JceTexture asset_cache_get_texture(const char *material_path,
         return tex_invalid();
     }
 
-    fs::path resolved_path;
-    if (!resolve_texture_path_for_material(material_path, mesh_path, &resolved_path)) {
-        entry->failed = true;
-        LOG_WARN(LOG_TAG,
-                 "tex cache: MISS (no texture found) key='%s' mat='%s' mesh='%s'",
-                 key, material_path ? material_path : "<null>",
-                 mesh_path ? mesh_path : "<null>");
-        return tex_invalid();
-    }
-
     entry->requested = true;
     entry->request_generation = generation;
 
-    texture_async_queue_request(key, resolved_path);
+    if (is_filesystem_texture) {
+        texture_async_queue_request(key, fs::path(material_path));
+    } else {
+        texture_async_queue_resolve_request(key, material_path, mesh_path);
+    }
     return tex_invalid();
 }

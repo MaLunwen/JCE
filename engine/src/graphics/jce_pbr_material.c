@@ -23,7 +23,7 @@
 static bgfx_uniform_handle_t s_u_base_color;
 static bgfx_uniform_handle_t s_u_pbr_params;    /* metallic, roughness, aoStrength, alphaCutoff */
 static bgfx_uniform_handle_t s_u_emissive;       /* emissive RGB + alphaMode */
-static bgfx_uniform_handle_t s_u_normal_scale;   /* x=normalScale, y=doubleSided */
+static bgfx_uniform_handle_t s_u_normal_scale;   /* x=normalScale (x<0 => checker fallback), y=doubleSided */
 
 static bgfx_uniform_handle_t s_albedo;
 static bgfx_uniform_handle_t s_metal_rough;
@@ -131,7 +131,7 @@ void jce_pbr_material_bind(const JcePbrMaterial *mat,
     };
     bgfx_set_uniform(s_u_emissive, emissive, 1);
 
-    /* u_normalScale: x=normalScale, y=doubleSided flag */
+    /* u_normalScale: x=normalScale (x<0 => checker fallback), y=doubleSided flag */
     float normal_scale[4] = {
         mat->normal_scale,
         mat->double_sided ? 1.0f : 0.0f,

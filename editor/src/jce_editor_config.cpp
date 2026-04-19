@@ -41,6 +41,7 @@ void jce_editor_config_defaults(JceEditorConfig *cfg) {
     cfg->recent_count = 0;
     cfg->view_mode = 0;    /* JCE_VIEW_SHADED */
     cfg->show_grid = true;
+    cfg->asset_browser_view_mode = 0; /* ASSET_BROWSER_VIEW_GRID */
 }
 
 /* --------------- helpers --------------- */
@@ -93,6 +94,9 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
         if (cJSON_IsBool(g))
             cfg->show_grid = cJSON_IsTrue(g);
     }
+    cfg->asset_browser_view_mode = cjson_read_int(root,
+                                                  "asset_browser_view_mode",
+                                                  cfg->asset_browser_view_mode);
 
     /* recent_0 .. recent_9 */
     cfg->recent_count = 0;
@@ -134,6 +138,9 @@ bool jce_editor_config_save(const JceEditorConfig *cfg) {
     /* Scene view render settings. */
     cJSON_AddNumberToObject(root, "view_mode",  cfg->view_mode);
     cJSON_AddBoolToObject(root, "show_grid",    cfg->show_grid);
+    cJSON_AddNumberToObject(root,
+                            "asset_browser_view_mode",
+                            cfg->asset_browser_view_mode);
 
     for (int i = 0; i < 10; i++) {
         char key[16];

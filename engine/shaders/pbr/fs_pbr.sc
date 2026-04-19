@@ -1,4 +1,4 @@
-$input v_texcoord0, v_worldpos, v_normal, v_tangent, v_bitangent, v_viewdepth
+$input v_texcoord0, v_worldpos, v_normal, v_tangent, v_bitangent, v_viewdepth, v_localpos
 
 #include <bgfx_shader.sh>
 #include "pbr_common.sh"
@@ -8,7 +8,7 @@ uniform vec4 u_baseColorFactor;
 uniform vec4 u_pbrParams;       // x=metallic, y=roughness, z=aoStrength, w=alphaCutoff
 uniform vec4 u_emissiveFactor;  // xyz=emissive, w=alphaMode (0=opaque, 1=mask, 2=blend)
 uniform vec4 u_cameraPos;       // xyz=world-space camera position
-uniform vec4 u_normalScale;     // x=normal map scale, y=doubleSided flag
+uniform vec4 u_normalScale;     // x=normal map scale (x<0 => checker fallback), y=doubleSided flag
 uniform vec4 u_ambientColor;    // xyz=ambient color, w=ambient intensity
 
 // Light uniforms
@@ -107,12 +107,31 @@ float csm_bias_scale_for_cascade(int cascade)
     return u_csmBiasScales.w;
 }
 
+// Stable per-fragment hash for PCF kernel rotation (breaks grid patterns).
+float shadow_hash(vec3 p)
+{
+    p = fract(p * vec3(443.897, 441.423, 437.195));
+    p += dot(p, p.yzx + 19.19);
+    return fract((p.x + p.y) * p.z);
+}
+
 float sample_csm_shadow(int cascade,
                         vec3 world_pos,
                         vec3 shading_normal,
                         vec3 to_light_dir)
 {
-    vec4 csm_clip = csm_clip_for_cascade(cascade, world_pos);
+    // World-space normal-offset bias: push the shadow sample point along
+    // the surface normal to prevent light bleeding through thin geometry
+    // and self-shadowing on angled surfaces.
+    vec3 n = normalize(shading_normal);
+    float ndotl = max(dot(n, to_light_dir), 0.0);
+    float sin_theta = sqrt(max(1.0 - ndotl * ndotl, 0.0));
+
+    float bias_scale = csm_bias_scale_for_cascade(cascade);
+    float normal_offset = u_csmParams.z * bias_scale * max(sin_theta, 0.05);
+    vec3 biased_pos = world_pos + n * normal_offset;
+
+    vec4 csm_clip = csm_clip_for_cascade(cascade, biased_pos);
     vec3 csm_ndc = csm_clip.xyz / csm_clip.w;
     vec2 csm_uv = csm_ndc.xy * 0.5 + 0.5;
 #if !BGFX_SHADER_LANGUAGE_GLSL
@@ -131,26 +150,27 @@ float sample_csm_shadow(int cascade,
     vec2 texel = vec2_splat(inv_map_size);
     float cascade_lerp = clamp(float(cascade) * (1.0 / 3.0), 0.0, 1.0);
 
-    vec3 n = normalize(shading_normal);
-    float ndotl = max(dot(n, to_light_dir), 0.0);
-    float ndotl_term = 1.0 - ndotl;
-    float slope_bias = max(0.0014 * ndotl_term, 0.00028);
-    float normal_bias = u_csmParams.z * max(ndotl_term, 0.08);
-    float bias_scale = csm_bias_scale_for_cascade(cascade);
-    float bias = (slope_bias + normal_bias) * bias_scale;
-    float max_bias = inv_map_size * mix(2.0, 5.5, cascade_lerp);
-    bias = min(bias, max_bias);
+    // Small constant depth bias for residual precision artifacts.
+    float depth_bias = inv_map_size * mix(1.0, 2.0, cascade_lerp);
 
-    float filter_radius = max(u_csmParams.w, 0.5) * mix(1.0, 1.8, cascade_lerp);
+    float filter_radius = max(u_csmParams.w, 0.5) * mix(1.0, 2.0, cascade_lerp);
+
+    // Rotate PCF kernel per-fragment using world-position hash to
+    // eliminate visible grid patterns while keeping temporally stable shadows.
+    float angle = shadow_hash(world_pos) * 6.283185;
+    float rot_c = cos(angle);
+    float rot_s = sin(angle);
 
     float sum = 0.0;
     for (int y = -2; y <= 2; y++)
     {
         for (int x = -2; x <= 2; x++)
         {
-            vec2 offset = vec2(float(x), float(y)) * texel * filter_radius;
+            vec2 raw = vec2(float(x), float(y)) * texel * filter_radius;
+            vec2 offset = vec2(raw.x * rot_c - raw.y * rot_s,
+                               raw.x * rot_s + raw.y * rot_c);
             float depth = csm_sample_depth(cascade, csm_uv + offset);
-            sum += (csm_z - bias > depth) ? 0.0 : 1.0;
+            sum += (csm_z - depth_bias > depth) ? 0.0 : 1.0;
         }
     }
     return sum / 25.0;
@@ -162,6 +182,41 @@ vec3 safe_normalize_vec3(vec3 value, vec3 fallback)
     if (len2 > 1e-8)
         return value * inversesqrt(len2);
     return fallback;
+}
+
+float checker_cell(vec2 uv, float scale)
+{
+    vec2 cell = floor(uv * scale);
+    float parity = fract((cell.x + cell.y) * 0.5) * 2.0;
+    return parity;
+}
+
+vec3 triplanar_checker(vec3 local_pos)
+{
+    const vec3 magenta = vec3(1.0, 0.0, 1.0);
+    const vec3 black = vec3(0.0, 0.0, 0.0);
+    const float checker_scale = 3.0;
+
+    // Flat face normal in LOCAL space from screen-space derivatives of the
+    // local position. Invariant under the object's model transform, so the
+    // checker stays glued to the mesh when the entity moves or rotates.
+    vec3 local_n = cross(dFdx(local_pos), dFdy(local_pos));
+    float len2 = dot(local_n, local_n);
+    local_n = (len2 > 1e-12) ? local_n * inversesqrt(len2) : vec3(0.0, 1.0, 0.0);
+
+    vec3 weights = abs(local_n);
+    weights = max(weights, vec3_splat(1e-4));
+    weights = pow(weights, vec3_splat(4.0));
+    weights /= (weights.x + weights.y + weights.z);
+
+    vec3 sample_x = mix(magenta, black,
+                        checker_cell(local_pos.yz, checker_scale));
+    vec3 sample_y = mix(magenta, black,
+                        checker_cell(local_pos.xz, checker_scale));
+    vec3 sample_z = mix(magenta, black,
+                        checker_cell(local_pos.xy, checker_scale));
+
+    return sample_x * weights.x + sample_y * weights.y + sample_z * weights.z;
 }
 
 void main()
@@ -198,9 +253,6 @@ void main()
             } else if (cascade == 2) {
                 split_start = u_csmSplits.y;
                 split_end = u_csmSplits.z;
-            } else if (cascade == 3) {
-                split_start = u_csmSplits.z;
-                split_end = u_csmSplits.w;
             }
 
             float split_span = split_end - split_start;
@@ -208,8 +260,10 @@ void main()
             {
                 float blend_fraction = clamp(u_csmParams.y, 0.0, 0.35);
                 float blend_range = max(split_span * blend_fraction, 0.001);
+                // Blend entirely within current cascade to prevent
+                // 50%->100% discontinuity at cascade boundaries.
                 float blend = smoothstep(split_end - blend_range,
-                                         split_end + blend_range,
+                                         split_end,
                                          fragDepth);
 
                 if (blend > 0.0001)
@@ -226,18 +280,19 @@ void main()
     else
     {
         // Legacy single shadow map fallback (PCF 3x3).
-        vec4 shadowClip = mul(u_shadowVP, vec4(v_worldpos, 1.0));
+        // Normal-offset bias in world space before light-space projection.
+        float leg_ndotl = max(dot(baseNormal, toLightDir), 0.0);
+        float leg_sin = sqrt(max(1.0 - leg_ndotl * leg_ndotl, 0.0));
+        vec3 biased_worldpos = v_worldpos + baseNormal * u_csmParams.z * max(leg_sin, 0.05);
+
+        vec4 shadowClip = mul(u_shadowVP, vec4(biased_worldpos, 1.0));
         vec3 shadowNDC  = shadowClip.xyz / shadowClip.w;
         vec2 shadowUV   = shadowNDC.xy * 0.5 + 0.5;
 #if !BGFX_SHADER_LANGUAGE_GLSL
         shadowUV.y = 1.0 - shadowUV.y;
 #endif
         float shadowZ   = toShadowDepth(shadowNDC.z);
-        float ndotl = max(dot(baseNormal, toLightDir), 0.0);
-        float shadowBias = max(0.0014 * (1.0 - ndotl), 0.00035);
-        shadowBias += (u_csmParams.z * 0.5) * (1.0 - ndotl);
-        shadowBias = min(shadowBias,
-                 max(u_csmParams.x, 1.0 / 2048.0) * 3.0);
+        float shadowBias = max(u_csmParams.x, 1.0 / 2048.0) * 1.5;
 
         if (shadowUV.x >= 0.0 && shadowUV.x <= 1.0 &&
             shadowUV.y >= 0.0 && shadowUV.y <= 1.0 &&
@@ -261,6 +316,12 @@ void main()
     // Base color texture is sRGB-encoded (glTF spec §5.19). Convert texture
     // to linear space FIRST, then multiply by the linear baseColorFactor.
     vec4 texColor = texture2D(s_albedo, v_texcoord0);
+    bool useCheckerFallback = (u_normalScale.x < 0.0);
+    if (useCheckerFallback)
+    {
+        texColor = vec4(triplanar_checker(v_localpos), 1.0);
+    }
+
     vec3 albedo = pow(clamp(texColor.rgb, vec3_splat(0.0), vec3_splat(1.0)), vec3_splat(2.2))
                * u_baseColorFactor.rgb;
     float alpha = texColor.a * u_baseColorFactor.a;
@@ -277,12 +338,13 @@ void main()
 
     // --- Normal ---
     vec3 N = baseNormal;
+    float normalScale = abs(u_normalScale.x);
 
     // Perturb normal from normal map
-    if (u_normalScale.x > 0.0)
+    if (normalScale > 0.0)
     {
         vec3 tangentNormal = texture2D(s_normalMap, v_texcoord0).xyz * 2.0 - vec3_splat(1.0);
-        tangentNormal.xy *= u_normalScale.x;
+        tangentNormal.xy *= normalScale;
         tangentNormal = normalize(tangentNormal);
         mat3 TBN = mat3(normalize(v_tangent), normalize(v_bitangent), N);
         N = normalize(mul(tangentNormal, TBN));

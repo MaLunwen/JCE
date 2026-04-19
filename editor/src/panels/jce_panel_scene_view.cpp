@@ -8,18 +8,13 @@
  */
 
 #include "jce_scene_view_internal.h"
-#include "scene/jce_model_loader_assimp.h"
+#include "scene/jce_editor_scene_asset_cache.h"
 
 extern "C" {
 #include <jce/graphics/jce_pbr_material.h>
 }
 
 #include <ctype.h>
-#include <filesystem>
-
-namespace fs = std::filesystem;
-
-#define SCENE_DROP_SYNC_MATERIAL_LIMIT_BYTES (12ull * 1024ull * 1024ull)
 
 /* ── Forward declarations ─────────────────────────────────────────── */
 static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail);
@@ -284,19 +279,6 @@ static int detect_texture_drop_slot(const char *path)
     return 0;
 }
 
-static bool should_extract_drop_material_sync(const char *asset_path)
-{
-    if (!asset_path || !asset_path[0]) return false;
-
-    std::error_code ec;
-    uintmax_t size = fs::file_size(fs::path(asset_path), ec);
-    if (ec) {
-        /* If stat fails (virtual path, permissions), keep previous behavior. */
-        return true;
-    }
-    return size <= SCENE_DROP_SYNC_MATERIAL_LIMIT_BYTES;
-}
-
 static void assign_texture_drop_to_mesh_renderer(JceComponentInfo *mesh_renderer_comp,
                                                  int slot,
                                                  const char *asset_path)
@@ -370,6 +352,82 @@ static bool apply_material_asset_to_mesh_renderer(JceComponentInfo *mesh_rendere
     mr.alpha_cutoff = material.alpha_cutoff;
     mr.double_sided = material.double_sided;
     return true;
+}
+
+static void apply_extracted_material_to_mesh_renderer(
+    JceComponentInfo *mesh_renderer_comp,
+    const JceEditorMaterialInfo *material)
+{
+    if (!mesh_renderer_comp || mesh_renderer_comp->type != JCE_COMP_MESH_RENDERER
+        || !material)
+        return;
+
+    auto &mr = mesh_renderer_comp->data.mesh_renderer;
+    if (material->albedo_tex[0])
+        snprintf(mr.albedo_tex, sizeof(mr.albedo_tex), "%s", material->albedo_tex);
+    if (material->mr_tex[0])
+        snprintf(mr.mr_tex, sizeof(mr.mr_tex), "%s", material->mr_tex);
+    if (material->normal_tex[0])
+        snprintf(mr.normal_tex, sizeof(mr.normal_tex), "%s", material->normal_tex);
+    if (material->ao_tex[0])
+        snprintf(mr.ao_tex, sizeof(mr.ao_tex), "%s", material->ao_tex);
+    if (material->emissive_tex[0])
+        snprintf(mr.emissive_tex, sizeof(mr.emissive_tex), "%s", material->emissive_tex);
+
+    mr.base_color[0] = material->base_color[0];
+    mr.base_color[1] = material->base_color[1];
+    mr.base_color[2] = material->base_color[2];
+    mr.base_color[3] = material->base_color[3];
+    mr.metallic       = material->metallic;
+    mr.roughness      = material->roughness;
+    mr.emissive[0]    = material->emissive[0];
+    mr.emissive[1]    = material->emissive[1];
+    mr.emissive[2]    = material->emissive[2];
+    mr.normal_scale   = material->normal_scale;
+    mr.ao_strength    = material->ao_strength;
+    mr.alpha_mode     = material->alpha_mode;
+    mr.alpha_cutoff   = material->alpha_cutoff;
+    mr.double_sided   = material->double_sided;
+}
+
+static void flush_async_drop_material_extracts(void)
+{
+    JceEditorMaterialExtractResult result = {};
+    bool has_updates = false;
+    bool transient_edit_open = false;
+
+    while (jce_editor_scene_asset_cache_take_material_result(&result)) {
+        if (!result.success) {
+            jce_editor_console_log_level(
+                JCE_CONSOLE_WARNING,
+                "Dropped mesh material extraction failed: %s",
+                result.mesh_path);
+            continue;
+        }
+
+        JceComponentInfo *mesh_renderer_comp =
+            find_mesh_renderer_component(result.entity_id);
+        if (!mesh_renderer_comp || mesh_renderer_comp->type != JCE_COMP_MESH_RENDERER)
+            continue;
+
+        auto &mr = mesh_renderer_comp->data.mesh_renderer;
+        if (strcmp(mr.mesh_path, result.mesh_path) != 0)
+            continue;
+
+        if (!transient_edit_open) {
+            jce_state_begin_transient_edit();
+            transient_edit_open = true;
+        }
+        apply_extracted_material_to_mesh_renderer(mesh_renderer_comp,
+                                                  &result.material);
+        has_updates = true;
+    }
+
+    if (transient_edit_open)
+        jce_state_end_transient_edit();
+
+    if (has_updates)
+        jce_editor_inspector_request_sync();
 }
 
 /* Ray-cast pick: find the nearest entity under the current mouse position.
@@ -578,7 +636,7 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail)
             JceComponentInfo *mesh_renderer_comp = find_mesh_renderer_component(hit_id);
             if (mesh_renderer_comp) {
                 /* Replace the existing entity's mesh + extract material. */
-                jce_state_begin_batch_edit();
+                jce_state_begin_transient_edit();
                 {
                     auto &mr = mesh_renderer_comp->data.mesh_renderer;
                     snprintf(mr.mesh_path, sizeof(mr.mesh_path),
@@ -590,42 +648,11 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail)
                     mr.normal_tex[0] = '\0';
                     mr.ao_tex[0] = '\0';
                     mr.emissive_tex[0] = '\0';
-
-                    if (should_extract_drop_material_sync(asset_path)) {
-                        JceEditorMaterialInfo mat = {};
-                        if (jce_editor_model_extract_material(asset_path, &mat)) {
-                            if (mat.albedo_tex[0])
-                                snprintf(mr.albedo_tex, sizeof(mr.albedo_tex), "%s", mat.albedo_tex);
-                            if (mat.mr_tex[0])
-                                snprintf(mr.mr_tex, sizeof(mr.mr_tex), "%s", mat.mr_tex);
-                            if (mat.normal_tex[0])
-                                snprintf(mr.normal_tex, sizeof(mr.normal_tex), "%s", mat.normal_tex);
-                            if (mat.ao_tex[0])
-                                snprintf(mr.ao_tex, sizeof(mr.ao_tex), "%s", mat.ao_tex);
-                            if (mat.emissive_tex[0])
-                                snprintf(mr.emissive_tex, sizeof(mr.emissive_tex), "%s", mat.emissive_tex);
-                            mr.base_color[0] = mat.base_color[0];
-                            mr.base_color[1] = mat.base_color[1];
-                            mr.base_color[2] = mat.base_color[2];
-                            mr.base_color[3] = mat.base_color[3];
-                            mr.metallic       = mat.metallic;
-                            mr.roughness      = mat.roughness;
-                            mr.emissive[0]    = mat.emissive[0];
-                            mr.emissive[1]    = mat.emissive[1];
-                            mr.emissive[2]    = mat.emissive[2];
-                            mr.normal_scale   = mat.normal_scale;
-                            mr.ao_strength    = mat.ao_strength;
-                            mr.alpha_mode     = mat.alpha_mode;
-                            mr.alpha_cutoff   = mat.alpha_cutoff;
-                            mr.double_sided   = mat.double_sided;
-                        }
-                    } else {
-                        jce_editor_console_log(
-                            "Large mesh drop detected, deferring material extraction: %s",
-                            asset_path);
-                    }
                 }
-                jce_state_end_batch_edit();
+                jce_state_end_transient_edit();
+
+                jce_editor_scene_asset_cache_queue_material_extract(
+                    hit_id, asset_path, asset_path);
 
                 jce_state_select_entity(hit_id, false);
                 jce_editor_inspector_request_sync();
@@ -670,7 +697,7 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail)
                     }
                 }
 
-                jce_state_begin_batch_edit();
+                jce_state_begin_transient_edit();
                 uint32_t id = create_default_scene_entity(name_buf, 0,
                                                           JCE_COMP_MESH_RENDERER,
                                                           JCE_MESH_SHAPE_CUBE);
@@ -697,43 +724,11 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail)
                         mr.normal_tex[0] = '\0';
                         mr.ao_tex[0] = '\0';
                         mr.emissive_tex[0] = '\0';
-
-                        if (should_extract_drop_material_sync(asset_path)) {
-                            JceEditorMaterialInfo mat = {};
-                            if (jce_editor_model_extract_material(asset_path, &mat)) {
-                                if (mat.albedo_tex[0])
-                                    snprintf(mr.albedo_tex, sizeof(mr.albedo_tex), "%s", mat.albedo_tex);
-                                if (mat.mr_tex[0])
-                                    snprintf(mr.mr_tex, sizeof(mr.mr_tex), "%s", mat.mr_tex);
-                                if (mat.normal_tex[0])
-                                    snprintf(mr.normal_tex, sizeof(mr.normal_tex), "%s", mat.normal_tex);
-                                if (mat.ao_tex[0])
-                                    snprintf(mr.ao_tex, sizeof(mr.ao_tex), "%s", mat.ao_tex);
-                                if (mat.emissive_tex[0])
-                                    snprintf(mr.emissive_tex, sizeof(mr.emissive_tex), "%s", mat.emissive_tex);
-
-                                mr.base_color[0] = mat.base_color[0];
-                                mr.base_color[1] = mat.base_color[1];
-                                mr.base_color[2] = mat.base_color[2];
-                                mr.base_color[3] = mat.base_color[3];
-                                mr.metallic       = mat.metallic;
-                                mr.roughness      = mat.roughness;
-                                mr.emissive[0]    = mat.emissive[0];
-                                mr.emissive[1]    = mat.emissive[1];
-                                mr.emissive[2]    = mat.emissive[2];
-                                mr.normal_scale   = mat.normal_scale;
-                                mr.ao_strength    = mat.ao_strength;
-                                mr.alpha_mode     = mat.alpha_mode;
-                                mr.alpha_cutoff   = mat.alpha_cutoff;
-                                mr.double_sided   = mat.double_sided;
-                            }
-                        } else {
-                            jce_editor_console_log(
-                                "Large mesh drop detected, deferring material extraction: %s",
-                                asset_path);
-                        }
                         break;
                     }
+
+                    jce_editor_scene_asset_cache_queue_material_extract(
+                        id, asset_path, asset_path);
 
                     jce_state_select_entity(id, false);
                     jce_editor_inspector_request_sync();
@@ -741,7 +736,7 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail)
                     jce_editor_console_log(
                         "Dropped mesh '%s' into scene", name_buf);
                 }
-                jce_state_end_batch_edit();
+                jce_state_end_transient_edit();
             }
         }
         /* ── HDR dropped: set as skybox ────────────────────────────── */
@@ -1380,6 +1375,7 @@ static void draw_scene_overlays_and_pick(const SceneViewCtx *ctx)
 
 void jce_editor_panel_scene_view_content(void)
 {
+    flush_async_drop_material_extracts();
     draw_scene_view_toolbar();
 
     SceneViewCtx ctx;

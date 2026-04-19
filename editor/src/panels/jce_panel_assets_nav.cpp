@@ -3,6 +3,19 @@
  */
 
 #include "jce_panel_assets_internal.h"
+#include "jce_editor_config.h"
+
+static void persist_asset_browser_view_mode(void)
+{
+    JceEditorConfig ecfg;
+    jce_editor_config_load(&ecfg);
+    ecfg.asset_browser_view_mode = (int)s_assets.view_mode;
+    if (!jce_editor_config_save(&ecfg)) {
+        jce_editor_console_log_level(
+            JCE_CONSOLE_WARNING,
+            "Asset browser: failed to persist view mode");
+    }
+}
 
 /* ── Directory tree (recursive) ──────────────────────────────────── */
 
@@ -232,8 +245,11 @@ void draw_asset_breadcrumb_bar(void)
                 ImGui::PushStyleColor(ImGuiCol_ButtonHovered, JCE_COLOR_ACCENT_HOVER);
                 ImGui::PushStyleColor(ImGuiCol_ButtonActive, JCE_COLOR_ACCENT_ACTIVE);
             }
-            if (ImGui::SmallButton(details_label))
+            if (ImGui::SmallButton(details_label)
+                && s_assets.view_mode != ASSET_BROWSER_VIEW_DETAILS) {
                 s_assets.view_mode = ASSET_BROWSER_VIEW_DETAILS;
+                persist_asset_browser_view_mode();
+            }
             if (details_active)
                 ImGui::PopStyleColor(3);
 
@@ -245,8 +261,11 @@ void draw_asset_breadcrumb_bar(void)
                 ImGui::PushStyleColor(ImGuiCol_ButtonHovered, JCE_COLOR_ACCENT_HOVER);
                 ImGui::PushStyleColor(ImGuiCol_ButtonActive, JCE_COLOR_ACCENT_ACTIVE);
             }
-            if (ImGui::SmallButton(grid_label))
+            if (ImGui::SmallButton(grid_label)
+                && s_assets.view_mode != ASSET_BROWSER_VIEW_GRID) {
                 s_assets.view_mode = ASSET_BROWSER_VIEW_GRID;
+                persist_asset_browser_view_mode();
+            }
             if (grid_active)
                 ImGui::PopStyleColor(3);
 

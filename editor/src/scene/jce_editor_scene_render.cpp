@@ -118,6 +118,20 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     const bgfx_caps_t *caps = bgfx_get_caps();
     s_sr.homogeneous_depth = caps ? caps->homogeneousDepth : false;
 
+    /* Select best available depth format for shadow maps.
+     * D32F > D24S8 > D16 — higher precision reduces shadow banding. */
+    bgfx_texture_format_t shadow_depth_fmt = BGFX_TEXTURE_FORMAT_D16;
+    if (caps) {
+        uint16_t d32f = caps->formats[BGFX_TEXTURE_FORMAT_D32F];
+        uint16_t d24  = caps->formats[BGFX_TEXTURE_FORMAT_D24S8];
+        if ((d32f & BGFX_CAPS_FORMAT_TEXTURE_2D)
+            && (d32f & BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER))
+            shadow_depth_fmt = BGFX_TEXTURE_FORMAT_D32F;
+        else if ((d24 & BGFX_CAPS_FORMAT_TEXTURE_2D)
+                 && (d24 & BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER))
+            shadow_depth_fmt = BGFX_TEXTURE_FORMAT_D24S8;
+    }
+
     /* Dynamic shadow quality defaults from GPU tier recommendation. */
     {
         JceRenderRecommendation rec = jce_renderer_get_recommendation();
@@ -128,20 +142,20 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
 
         switch (rec.tier) {
         case JCE_GPU_TIER_HIGH:
-            s_sr.csm_blend_ratio = 0.16f;
-            s_sr.csm_normal_bias = 0.0011f;
-            s_sr.csm_filter_radius = 1.15f;
+            s_sr.csm_blend_ratio  = 0.22f;
+            s_sr.csm_normal_bias  = 0.015f;
+            s_sr.csm_filter_radius = 1.6f;
             break;
         case JCE_GPU_TIER_MEDIUM:
-            s_sr.csm_blend_ratio = 0.14f;
-            s_sr.csm_normal_bias = 0.00095f;
-            s_sr.csm_filter_radius = 1.0f;
+            s_sr.csm_blend_ratio  = 0.20f;
+            s_sr.csm_normal_bias  = 0.012f;
+            s_sr.csm_filter_radius = 1.4f;
             break;
         case JCE_GPU_TIER_LOW:
         default:
-            s_sr.csm_blend_ratio = 0.12f;
-            s_sr.csm_normal_bias = 0.0008f;
-            s_sr.csm_filter_radius = 0.85f;
+            s_sr.csm_blend_ratio  = 0.18f;
+            s_sr.csm_normal_bias  = 0.010f;
+            s_sr.csm_filter_radius = 1.2f;
             break;
         }
     }
@@ -259,7 +273,7 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
         const uint16_t shadow_size = s_sr.shadow_map_size;
         s_sr.shadow_tex = bgfx_create_texture_2d(
             shadow_size, shadow_size, false, 1,
-            BGFX_TEXTURE_FORMAT_D16,
+            shadow_depth_fmt,
             BGFX_TEXTURE_RT
             | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
             | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT,
@@ -290,7 +304,7 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
         for (uint32_t i = 0; i < csm_count; i++) {
             s_sr.csm_tex[i] = bgfx_create_texture_2d(
                 csm_size, csm_size, false, 1,
-                BGFX_TEXTURE_FORMAT_D16,
+                shadow_depth_fmt,
                 BGFX_TEXTURE_RT
                 | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
                 | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT,

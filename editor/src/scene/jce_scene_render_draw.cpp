@@ -332,7 +332,7 @@ static void fill_csm_bias_scales(const JceCsmData *csm, float out_scales[4])
                 range = base_range;
             scale = range / base_range;
             if (scale < 1.0f) scale = 1.0f;
-            if (scale > 3.2f) scale = 3.2f;
+            if (scale > 20.0f) scale = 20.0f;
             last_scale = scale;
         }
         out_scales[i] = scale;
@@ -813,6 +813,7 @@ void draw_entities(void)
         /* ── Non-wireframe rendering with PBR lighting ────────────────── */
         if (view_mode != JCE_VIEW_WIREFRAME && view_mode != JCE_VIEW_WIREFRAME_TEXTURED && mr_comp) {
             JcePbrMaterial pbr = jce_pbr_material_default();
+            bool use_checker_fallback = false;
             if (mr_comp->data.mesh_renderer.base_color[3] > 0.0f) {
                 pbr.base_color_factor[0] = mr_comp->data.mesh_renderer.base_color[0];
                 pbr.base_color_factor[1] = mr_comp->data.mesh_renderer.base_color[1];
@@ -842,11 +843,9 @@ void draw_entities(void)
                     JceTexture t = get_cached_texture(mat_path, mp);
                     if (jce_texture_valid(t)) pbr.albedo_map = t;
                 }
-                /* If albedo is still missing, use magenta/black checker. */
-                if (!jce_texture_valid(pbr.albedo_map)
-                    && BGFX_HANDLE_IS_VALID(s_sr.checker_tex)) {
-                    pbr.albedo_map.idx = s_sr.checker_tex.idx;
-                }
+                /* If albedo is still missing, flag shader-side tri-planar checker. */
+                if (!jce_texture_valid(pbr.albedo_map))
+                    use_checker_fallback = true;
                 if (mr_comp->data.mesh_renderer.mr_tex[0]) {
                     JceTexture t = get_cached_texture(mr_comp->data.mesh_renderer.mr_tex, NULL);
                     if (jce_texture_valid(t)) pbr.metallic_roughness_map = t;
@@ -863,6 +862,13 @@ void draw_entities(void)
                     JceTexture t = get_cached_texture(mr_comp->data.mesh_renderer.emissive_tex, NULL);
                     if (jce_texture_valid(t)) pbr.emissive_map = t;
                 }
+            }
+
+            if (use_checker_fallback) {
+                /* Negative normal scale is reserved as checker-fallback flag in shader. */
+                pbr.normal_scale = -fmaxf(fabsf(pbr.normal_scale), 0.0001f);
+            } else {
+                pbr.normal_scale = fabsf(pbr.normal_scale);
             }
 
             jce_pbr_material_bind(&pbr, s_sr.renderer, scene_view_id());

@@ -9,6 +9,7 @@
 AssetCacheState  s_cache      = {};
 MeshAsyncState   s_mesh_async = {};
 TextureAsyncState s_tex_async = {};
+MaterialAsyncState s_mat_async = {};
 
 /* ── Public API ─────────────────────────────────────────────────── */
 
@@ -23,6 +24,7 @@ void jce_editor_scene_asset_cache_init(JceAssetManager *assets)
     s_cache.assets = assets;
     mesh_async_start();
     texture_async_start();
+    material_async_start();
     s_cache.initialized = true;
 }
 
@@ -30,6 +32,7 @@ void jce_editor_scene_asset_cache_shutdown(void)
 {
     mesh_async_stop();
     texture_async_stop();
+    material_async_stop();
     clear_mesh_cache();
     clear_texture_cache();
     memset(&s_cache, 0, sizeof(s_cache));
@@ -42,6 +45,7 @@ void jce_editor_scene_asset_cache_finalize(void)
 
     mesh_finalize_completed_loads();
     texture_finalize_completed_loads();
+    material_finalize_completed_loads();
 }
 
 void jce_editor_scene_asset_cache_set_scene_dir(const char *dir)
@@ -51,6 +55,7 @@ void jce_editor_scene_asset_cache_set_scene_dir(const char *dir)
 
     mesh_async_begin_new_generation();
     texture_async_begin_new_generation();
+    material_async_begin_new_generation();
 
     if (dir) {
         snprintf(s_cache.scene_dir, sizeof(s_cache.scene_dir), "%s", dir);
@@ -96,4 +101,21 @@ bool jce_editor_scene_asset_cache_take_texture_warning(const char *material_path
 
     entry.warned_missing = true;
     return true;
+}
+
+void jce_editor_scene_asset_cache_queue_material_extract(uint32_t entity_id,
+                                                         const char *mesh_path,
+                                                         const char *file_path)
+{
+    if (!s_cache.initialized)
+        return;
+    material_async_queue_request(entity_id, mesh_path, file_path);
+}
+
+bool jce_editor_scene_asset_cache_take_material_result(
+    JceEditorMaterialExtractResult *out_result)
+{
+    if (!s_cache.initialized)
+        return false;
+    return material_take_completed_result(out_result);
 }

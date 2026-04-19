@@ -78,6 +78,7 @@ extern int  s_history_suspend_depth;
 extern int  s_history_edit_nesting;
 extern bool s_history_outer_edit_pushed_snapshot;
 extern int  s_history_manual_batch_depth;
+extern int  s_history_transient_batch_depth;
 
 /* ── Transaction ──────────────────────────────────────────────────── */
 

@@ -6,6 +6,7 @@
  */
 
 #include "jce_panel_assets_internal.h"
+#include "jce_editor_config.h"
 
 #include <chrono>
 #include <ctime>
@@ -81,7 +82,15 @@ void ensure_assets_init(void)
     s_assets.next_auto_refresh_time = 0.0;
     s_assets.search_buf[0] = '\0';
     s_assets.search_active = false;
-    s_assets.view_mode = ASSET_BROWSER_VIEW_DETAILS;
+    s_assets.view_mode = ASSET_BROWSER_VIEW_GRID;
+    {
+        JceEditorConfig ecfg;
+        if (jce_editor_config_load(&ecfg)) {
+            int vm = ecfg.asset_browser_view_mode;
+            if (vm == ASSET_BROWSER_VIEW_GRID || vm == ASSET_BROWSER_VIEW_DETAILS)
+                s_assets.view_mode = (AssetBrowserViewMode)vm;
+        }
+    }
     s_assets.initialized       = true;
 }
 

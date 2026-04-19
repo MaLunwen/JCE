@@ -40,6 +40,8 @@
 #include "embedded_assets.h"
 
 #define LOG_TAG "engine"
+#define JCE_DEFAULT_FRAME_DT (1.0f / 60.0f)
+#define JCE_MAX_FRAME_DT 0.1f
 
 static JceAppDesc  g_app_desc;
 static bool        g_app_desc_set;
@@ -130,7 +132,18 @@ struct JceEngine {
     FILE                       *kpi_asset_log;
     uint64_t                    kpi_asset_frame_index;
     uint32_t                    kpi_asset_frame_limit;
+
+    /* Frame clock state for dt propagation. */
+    uint64_t                    perf_freq;
+    uint64_t                    frame_counter_prev;
 };
+
+static void jce_engine_reset_frame_clock(JceEngine *e)
+{
+    if (!e) return;
+    e->perf_freq = SDL_GetPerformanceFrequency();
+    e->frame_counter_prev = SDL_GetPerformanceCounter();
+}
 
 static uint32_t read_positive_u32_env(const char *env_name, uint32_t fallback)
 {
@@ -372,6 +385,7 @@ JceEngine *jce_engine_create(int argc, char *argv[])
             "initialized.\nThe application will now "
             "run in safe fallback mode.",
             jce_window_sdl(e->window));
+        jce_engine_reset_frame_clock(e);
         return e;
     }
 
@@ -471,6 +485,8 @@ JceEngine *jce_engine_create(int argc, char *argv[])
        even without moving the mouse (modal loop with no resize events). */
     SDL_SetWindowsMessageHook(jce_win32_msg_hook, e);
 #endif
+
+    jce_engine_reset_frame_clock(e);
 
     return e;
 
@@ -611,6 +627,24 @@ JceAppResult jce_engine_iterate(JceEngine *e)
 {
     JCE_PROFILE_ZONE_N("Frame");
 
+    float dt = JCE_DEFAULT_FRAME_DT;
+    const uint64_t now = SDL_GetPerformanceCounter();
+
+    if (e->perf_freq == 0)
+        e->perf_freq = SDL_GetPerformanceFrequency();
+
+    if (e->perf_freq > 0 &&
+        e->frame_counter_prev > 0 &&
+        now >= e->frame_counter_prev) {
+        const double elapsed = (double)(now - e->frame_counter_prev);
+        dt = (float)(elapsed / (double)e->perf_freq);
+    }
+
+    e->frame_counter_prev = now;
+
+    if (dt < 0.0f) dt = 0.0f;
+    if (dt > JCE_MAX_FRAME_DT) dt = JCE_MAX_FRAME_DT;
+
     if (g_app_desc.should_quit) {
         if (g_app_desc.should_quit(g_app_desc.user_data))
             return JCE_APP_SUCCESS;
@@ -657,13 +691,13 @@ JceAppResult jce_engine_iterate(JceEngine *e)
     /* Tick registered subsystems. */
     if (e->subsystems) {
         JCE_PROFILE_ZONE_N("Subsystems::Update");
-        jce_subsystem_update_all(e->subsystems, 0.0f);
+        jce_subsystem_update_all(e->subsystems, dt);
         JCE_PROFILE_ZONE_END;
     }
 
     if (g_app_desc.update) {
         JCE_PROFILE_ZONE_N("App::UpdateAndDraw");
-        g_app_desc.update(0.0f, g_app_desc.user_data);
+        g_app_desc.update(dt, g_app_desc.user_data);
         if (g_app_desc.draw)
             g_app_desc.draw(&e->svc, g_app_desc.user_data);
         JCE_PROFILE_ZONE_END;

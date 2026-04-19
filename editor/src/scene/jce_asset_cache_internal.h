@@ -37,6 +37,7 @@
 extern "C" {
 #include <cjson/cJSON.h>
 #include <jce/core/jce_log.h>
+#include <jce/core/jce_thread.h>
 #include <jce/graphics/jce_mesh.h>
 #include <jce/graphics/jce_texture.h>
 #include <jce/resource/jce_asset.h>
@@ -120,6 +121,9 @@ extern MeshAsyncState s_mesh_async;
 struct TextureLoadRequest {
     std::string key;
     std::string file_path;
+    std::string material_path;
+    std::string mesh_path;
+    bool        resolve_path;
     uint64_t    generation;
 };
 
@@ -144,6 +148,33 @@ struct TextureAsyncState {
 };
 
 extern TextureAsyncState s_tex_async;
+
+/* ── Material async types + state (thread-pool based) ───────────── */
+
+struct MaterialAsyncContext {
+    uint32_t              entity_id;
+    char                  mesh_path[128];
+    char                  file_path[512];
+    uint64_t              generation;
+    bool                  success;
+    JceEditorMaterialInfo material;
+};
+
+struct MaterialInFlightTask {
+    JceTask              *task;
+    MaterialAsyncContext *context;
+};
+
+struct MaterialAsyncState {
+    JceThreadPool                              *pool;
+    std::mutex                                  mutex;
+    std::vector<MaterialInFlightTask>           inflight;
+    std::vector<JceEditorMaterialExtractResult> completed;
+    uint64_t                                    generation;
+    bool                                        running;
+};
+
+extern MaterialAsyncState s_mat_async;
 
 /* ── Budget constants ───────────────────────────────────────────── */
 
@@ -210,6 +241,9 @@ void texture_async_stop(void);
 void texture_async_begin_new_generation(void);
 uint64_t texture_async_current_generation(void);
 void texture_async_queue_request(const char *key, const fs::path &file_path);
+void texture_async_queue_resolve_request(const char *key,
+                                         const char *material_path,
+                                         const char *mesh_path);
 
 bool decode_texture_rgba_path(const fs::path &path,
                               std::vector<uint8_t> *out_rgba,
@@ -219,6 +253,19 @@ bool decode_texture_rgba_path(const fs::path &path,
 void       texture_finalize_completed_loads(void);
 JceTexture asset_cache_get_texture(const char *material_path,
                                    const char *mesh_path);
+
+/* ── Functions from jce_asset_cache_material.cpp ─────────────────── */
+
+void     material_async_start(void);
+void     material_async_stop(void);
+void     material_async_begin_new_generation(void);
+uint64_t material_async_current_generation(void);
+void     material_async_queue_request(uint32_t entity_id,
+                                      const char *mesh_path,
+                                      const char *file_path);
+
+void material_finalize_completed_loads(void);
+bool material_take_completed_result(JceEditorMaterialExtractResult *out_result);
 
 /* ── Functions from jce_asset_cache_resolve.cpp ──────────────────── */
 

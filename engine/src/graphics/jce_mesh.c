@@ -10,6 +10,7 @@
 #include <bgfx/c99/bgfx.h>
 #include "core/jce_memory.h"
 #include <string.h>
+#include <stdlib.h>
 
 #define LOG_TAG "jce_mesh"
 
@@ -22,6 +23,99 @@ struct JceMesh {
     uint32_t                    num_indices;
     uint32_t                    num_wf_indices;
 };
+
+typedef struct JceEdgeKey {
+    uint32_t a;
+    uint32_t b;
+} JceEdgeKey;
+
+static int edge_key_compare(const void *lhs, const void *rhs)
+{
+    const JceEdgeKey *l = (const JceEdgeKey *)lhs;
+    const JceEdgeKey *r = (const JceEdgeKey *)rhs;
+    if (l->a < r->a) return -1;
+    if (l->a > r->a) return 1;
+    if (l->b < r->b) return -1;
+    if (l->b > r->b) return 1;
+    return 0;
+}
+
+static bool build_unique_wireframe_indices(const uint32_t *indices,
+                                           uint32_t num_indices,
+                                           uint32_t **out_wf,
+                                           uint32_t *out_wf_count)
+{
+    if (!indices || num_indices < 3 || !out_wf || !out_wf_count)
+        return false;
+
+    const uint32_t num_tris = num_indices / 3;
+    const uint32_t edge_capacity = num_tris * 3;
+    if (edge_capacity == 0)
+        return false;
+
+    JceEdgeKey *edges = (JceEdgeKey *)JCE_MALLOC((size_t)edge_capacity * sizeof(JceEdgeKey));
+    if (!edges)
+        return false;
+
+    uint32_t edge_count = 0;
+    for (uint32_t t = 0; t < num_tris; t++) {
+        const uint32_t tri[3] = {
+            indices[t * 3 + 0],
+            indices[t * 3 + 1],
+            indices[t * 3 + 2]
+        };
+
+        for (int e = 0; e < 3; e++) {
+            uint32_t a = tri[e];
+            uint32_t b = tri[(e + 1) % 3];
+            if (a == b)
+                continue;
+            if (a > b) {
+                uint32_t tmp = a;
+                a = b;
+                b = tmp;
+            }
+            edges[edge_count].a = a;
+            edges[edge_count].b = b;
+            edge_count++;
+        }
+    }
+
+    if (edge_count == 0) {
+        JCE_FREE(edges);
+        return false;
+    }
+
+    qsort(edges, edge_count, sizeof(JceEdgeKey), edge_key_compare);
+
+    uint32_t unique_count = 1;
+    for (uint32_t i = 1; i < edge_count; i++) {
+        if (edges[i].a != edges[i - 1].a || edges[i].b != edges[i - 1].b)
+            unique_count++;
+    }
+
+    uint32_t *wf = (uint32_t *)JCE_MALLOC((size_t)unique_count * 2u * sizeof(uint32_t));
+    if (!wf) {
+        JCE_FREE(edges);
+        return false;
+    }
+
+    uint32_t write = 0;
+    wf[write++] = edges[0].a;
+    wf[write++] = edges[0].b;
+    for (uint32_t i = 1; i < edge_count; i++) {
+        if (edges[i].a == edges[i - 1].a && edges[i].b == edges[i - 1].b)
+            continue;
+        wf[write++] = edges[i].a;
+        wf[write++] = edges[i].b;
+    }
+
+    JCE_FREE(edges);
+
+    *out_wf = wf;
+    *out_wf_count = write;
+    return true;
+}
 
 /* Shared mesh vertex layout (position float3 + normal float3 + texcoord float2). */
 static void init_mesh_layout(bgfx_vertex_layout_t *layout)
@@ -59,19 +153,14 @@ JceMesh *jce_mesh_create(const JceMeshVertex *vertices, uint32_t num_verts,
                                                num_indices * (uint32_t)sizeof(uint32_t));
         m->ibh = bgfx_create_index_buffer(imem, BGFX_BUFFER_INDEX32);
 
-        /* Build wireframe index buffer: each triangle -> 3 line segments. */
-        uint32_t num_tris = num_indices / 3;
-        uint32_t wf_count = num_tris * 6;
-        uint32_t *wf = (uint32_t *)JCE_MALLOC(wf_count * sizeof(uint32_t));
-        if (wf) {
-            for (uint32_t t = 0; t < num_tris; t++) {
-                uint32_t a = indices[t*3+0];
-                uint32_t b = indices[t*3+1];
-                uint32_t c = indices[t*3+2];
-                wf[t*6+0] = a; wf[t*6+1] = b;
-                wf[t*6+2] = b; wf[t*6+3] = c;
-                wf[t*6+4] = c; wf[t*6+5] = a;
-            }
+        /* Build wireframe index buffer using UNIQUE undirected edges.
+         * This preserves full wireframe topology while avoiding duplicate
+         * interior edges from adjacent triangles. */
+        uint32_t *wf = NULL;
+        uint32_t wf_count = 0;
+        if (build_unique_wireframe_indices(indices, num_indices,
+                                           &wf, &wf_count)
+            && wf && wf_count > 0) {
             const bgfx_memory_t *wmem = bgfx_copy(wf,
                                                     wf_count * (uint32_t)sizeof(uint32_t));
             m->wf_ibh = bgfx_create_index_buffer(wmem, BGFX_BUFFER_INDEX32);
@@ -143,12 +232,17 @@ void jce_mesh_submit_wireframe_overlay(const JceMesh *mesh, const JceRenderer *r
         bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
     }
 
+    uint64_t state = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                   | BGFX_STATE_DEPTH_TEST_LEQUAL
+                   | BGFX_STATE_MSAA | BGFX_STATE_PT_LINES;
+
+    /* LINEAA is visually nice but very expensive on dense meshes. */
+    if (mesh->num_wf_indices < 1500000u)
+        state |= BGFX_STATE_LINEAA;
+
     /* LEQUAL depth test so wireframe overlay renders on top of solid geometry
      * at the same depth.  LINEAA for smooth anti-aliased lines. */
-    bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
-                 | BGFX_STATE_DEPTH_TEST_LEQUAL
-                 | BGFX_STATE_MSAA | BGFX_STATE_PT_LINES
-                 | BGFX_STATE_LINEAA, 0);
+    bgfx_set_state(state, 0);
 
     JceShaderHandle sh = jce_renderer_get_program_mesh(r);
     bgfx_program_handle_t prog = { sh.idx };

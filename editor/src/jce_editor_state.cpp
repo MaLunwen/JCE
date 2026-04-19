@@ -25,6 +25,7 @@ int  s_history_suspend_depth = 0;
 int  s_history_edit_nesting = 0;
 bool s_history_outer_edit_pushed_snapshot = false;
 int  s_history_manual_batch_depth = 0;
+int  s_history_transient_batch_depth = 0;
 
 EditorTransaction s_transaction;
 
@@ -234,6 +235,7 @@ void jce_editor_state_init(void)
 	s_history_edit_nesting = 0;
 	s_history_outer_edit_pushed_snapshot = false;
 	s_history_manual_batch_depth = 0;
+	s_history_transient_batch_depth = 0;
 	s_transaction.active = false;
 	s_transaction.label[0] = '\0';
 	s_transaction.before.scene_json.clear();

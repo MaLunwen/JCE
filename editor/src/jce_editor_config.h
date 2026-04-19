@@ -23,6 +23,9 @@ typedef struct {
     /* Scene view render settings (persisted across sessions). */
     int  view_mode;            /* JceSceneViewMode enum (0=Shaded,1=Wireframe,2=Textured) */
     bool show_grid;
+
+    /* Asset Browser settings (persisted across sessions). */
+    int  asset_browser_view_mode; /* AssetBrowserViewMode enum (0=Grid,1=Details) */
 } JceEditorConfig;
 
 /* Load config from .jce/editor-config.json. Returns false if not found. */
