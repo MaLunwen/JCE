@@ -77,206 +77,13 @@ typedef enum {
 /* ── Max Limits ────────────────────────────────────────────────────── */
 
 #define JCE_MAX_SELECTED       512
-#define JCE_MAX_ENTITY_NAME    128
+#define JCE_MAX_ENTITY_NAME    64
 #define JCE_MAX_TAG_STRING     64
 #define JCE_MAX_PREFAB_PATH    260
-#define JCE_MAX_ENTITIES       4096
-#define JCE_MAX_COMPONENTS     32
 
 /* ── Max Children ──────────────────────────────────────────────────── */
 
 #define JCE_MAX_CHILDREN       64
-
-/* ── Forward-declare component type ────────────────────────────────── */
-
-typedef struct JceComponentInfo JceComponentInfo;
-
-/* ── Entity Data (lightweight, for editor display) ─────────────────── */
-
-typedef struct {
-    uint32_t    id;                           /* engine entity id */
-    char        name[JCE_MAX_ENTITY_NAME];
-    char        tag[JCE_MAX_TAG_STRING];
-    JceTagColor tag_color;
-    bool        enabled;
-    uint32_t    parent_id;                    /* 0 = root */
-    uint32_t    children[JCE_MAX_CHILDREN];   /* child entity ids */
-    int         child_count;
-    bool        prefab_instance;
-    char        prefab_path[JCE_MAX_PREFAB_PATH];
-
-    uint64_t    ecs_entity;                   /* JceEntity in engine scene */
-
-    /* Per-entity component storage (parsed from scene JSON). */
-    int         component_count;
-} JceEntityInfo;
-
-/* ── Component Data (for inspector display) ────────────────────────── */
-
-/* Procedural mesh shape for MeshRenderer when no mesh_path is set. */
-enum {
-    JCE_MESH_SHAPE_CUBE     = 0,
-    JCE_MESH_SHAPE_SPHERE   = 1,
-    JCE_MESH_SHAPE_PLANE    = 2,
-    JCE_MESH_SHAPE_CAPSULE  = 3,
-    JCE_MESH_SHAPE_CYLINDER = 4,
-    JCE_MESH_SHAPE_COUNT
-};
-
-typedef enum {
-    JCE_COMP_TRANSFORM = 0,
-    JCE_COMP_MESH_RENDERER,
-    JCE_COMP_SPRITE_RENDERER,
-    JCE_COMP_CAMERA,
-    JCE_COMP_LIGHT,
-    JCE_COMP_ANIMATOR,
-    JCE_COMP_SKELETAL_ANIMATOR,
-    JCE_COMP_RIGIDBODY,
-    JCE_COMP_BOX_COLLIDER,
-    JCE_COMP_SPHERE_COLLIDER,
-    JCE_COMP_CHARACTER_CONTROLLER,
-    JCE_COMP_AUDIO_SOURCE,
-    JCE_COMP_SCRIPT,
-    JCE_COMP_SKYBOX,
-    JCE_COMP_SPRITE_ANIMATOR,
-    JCE_COMP_CONSTRAINT,
-    JCE_COMP_TYPE_COUNT,
-} JceComponentType;
-
-struct JceComponentInfo {
-    JceComponentType type;
-    bool             expanded;   /* fold state in inspector */
-    /* Component-specific data (union for common types). */
-    union {
-        struct { float pos[3]; float rot[3]; float scale[3]; } transform;
-
-        struct {
-            char  mesh_path[128];
-            char  material_path[128];
-            int   mesh_shape;         /* JCE_MESH_SHAPE_* (default 0=cube) */
-            /* PBR material parameters (inline editing). */
-            float base_color[4];      /* RGBA linear */
-            float metallic;           /* 0..1 */
-            float roughness;          /* 0..1 */
-            float emissive[3];        /* RGB */
-            float normal_scale;       /* default 1.0 */
-            float ao_strength;        /* 0..1 */
-            int   alpha_mode;         /* 0=OPAQUE, 1=MASK, 2=BLEND */
-            float alpha_cutoff;       /* default 0.5 */
-            bool  double_sided;
-            char  albedo_tex[128];
-            char  mr_tex[128];        /* metallic-roughness map */
-            char  normal_tex[128];
-            char  ao_tex[128];
-            char  emissive_tex[128];
-        } mesh_renderer;
-
-        struct {
-            float color[4];
-            float intensity;
-            int   type;          /* 0=directional, 1=point, 2=spot */
-            float radius;        /* point & spot: attenuation range */
-            float inner_cone_deg;/* spot: inner cone angle (degrees) */
-            float outer_cone_deg;/* spot: outer cone angle (degrees) */
-            bool  casts_shadow;
-        } light;
-        struct { float fov; float near_clip; float far_clip; bool ortho; } camera;
-
-        struct {
-            char  sprite_path[128];
-            float color[4];
-            bool  flip_x;
-            bool  flip_y;
-            int   sorting_order;
-        } sprite_renderer;
-
-        struct {
-            char  clip_name[64];
-            float speed;
-            bool  loop;
-            bool  playing;
-        } animator;
-
-        struct {
-            char  skeleton_path[128];
-            char  clip_names[8][64];
-            int   clip_count;
-            int   active_clip;
-            float speed;
-            bool  loop;
-            bool  playing;
-        } skeletal_animator;
-
-        struct {
-            float mass;
-            float drag;
-            float angular_drag;
-            bool  use_gravity;
-            bool  is_kinematic;
-        } rigidbody;
-
-        struct {
-            float center[3];
-            float size[3];
-            bool  is_trigger;
-        } box_collider;
-
-        struct {
-            float center[3];
-            float radius;
-            bool  is_trigger;
-        } sphere_collider;
-
-        struct {
-            float height;
-            float radius;
-            float step_offset;
-            float slope_limit;
-        } character_controller;
-
-        struct {
-            char  clip_path[128];
-            float volume;
-            float pitch;
-            float spatial_blend;
-            bool  loop;
-            bool  play_on_awake;
-        } audio_source;
-
-        struct {
-            char  script_path[128];
-        } script;
-
-        struct {
-            char  hdr_path[256];
-            float rotation;       /* Y-axis rotation (degrees) */
-            float exposure;       /* exposure multiplier, default 1.0 */
-            bool  use_as_ibl;     /* also generate IBL textures */
-        } skybox;
-
-        struct {
-            char  sheet_path[128];  /* sprite sheet image */
-            char  atlas_path[128]; /* optional JSON atlas (Aseprite) */
-            int   frame_width;
-            int   frame_height;
-            char  current_anim[64];
-            float speed;
-            bool  loop;
-            bool  playing;
-        } sprite_animator;
-
-        struct {
-            int   constraint_type;   /* 0=point2point, 1=hinge, 2=slider, 3=6dof */
-            uint32_t target_entity;  /* other entity id */
-            float pivot_a[3];
-            float pivot_b[3];
-            float axis[3];
-            float lower_limit;
-            float upper_limit;
-            bool  disable_collision;
-        } constraint;
-    } data;
-};
 
 /* ── Editor State API ──────────────────────────────────────────────── */
 
@@ -291,11 +98,10 @@ bool        jce_state_is_selected(uint32_t id);
 uint32_t    jce_state_get_focused(void);
 const uint32_t *jce_state_get_selection(int *out_count);
 
-/* Entity management (demo/stub data for now). */
+/* Entity management — ECS is the single source of truth. */
 int               jce_state_get_entity_count(void);
-JceEntityInfo    *jce_state_get_entity(uint32_t id);
-JceEntityInfo    *jce_state_get_entity_by_index(int index);
-JceEntityInfo    *jce_state_get_root_entities(int *out_count);
+uint32_t          jce_state_get_entity_id_by_index(int index);
+bool              jce_state_entity_exists(uint32_t id);
 uint32_t          jce_state_create_entity(const char *name, uint32_t parent_id);
 void              jce_state_delete_entity(uint32_t id);
 void              jce_state_rename_entity(uint32_t id, const char *name);
@@ -307,14 +113,27 @@ void              jce_state_reorder_sibling(uint32_t entity_id, uint32_t ref_id,
                                             bool insert_after);
 uint32_t          jce_state_duplicate_entity(uint32_t id);
 
-/* Component management. */
-int                  jce_state_get_components(uint32_t entity_id, JceComponentInfo *out, int max);
-JceComponentInfo    *jce_state_get_entity_components(uint32_t entity_id, int *out_count);
-void                 jce_state_add_component(uint32_t entity_id, JceComponentType type);
-void                 jce_state_remove_component(uint32_t entity_id, JceComponentType type);
-void                 jce_state_set_component(uint32_t entity_id, const JceComponentInfo *comp);
-const char          *jce_component_type_name(JceComponentType type);
-JceComponentType     jce_component_type_from_name(const char *name);
+/* Entity property queries — read from ECS EditorMeta + scene hierarchy. */
+const char       *jce_state_entity_name(uint32_t id);
+bool              jce_state_entity_enabled(uint32_t id);
+uint32_t          jce_state_entity_parent(uint32_t id);
+int               jce_state_entity_child_count(uint32_t id);
+int               jce_state_entity_children(uint32_t id, uint32_t *out, int max);
+JceTagColor       jce_state_entity_tag_color(uint32_t id);
+const char       *jce_state_entity_tag(uint32_t id);
+bool              jce_state_entity_is_prefab(uint32_t id);
+const char       *jce_state_entity_prefab_path(uint32_t id);
+JceEntity         jce_state_to_ecs_entity(uint32_t id);
+uint32_t          jce_state_from_ecs_entity(JceEntity e);
+
+/* Component management (thin wrappers — uses JceComponentFlag from jce_scene.h). */
+void              jce_state_add_component(uint32_t entity_id, uint32_t comp_flag);
+void              jce_state_remove_component(uint32_t entity_id, uint32_t comp_flag);
+const char       *jce_comp_flag_display_name(uint32_t comp_flag);
+
+/* Root entity enumeration. */
+int               jce_state_get_root_count(void);
+uint32_t          jce_state_get_root_id(int index);
 
 /* Edit mode */
 void          jce_state_set_edit_mode(JceEditMode mode);

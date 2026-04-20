@@ -21,6 +21,7 @@
 extern "C" {
 #include <jce/animation/jce_animation.h>
 #include <jce/graphics/jce_model.h>
+#include <jce/scene/jce_scene.h>
 }
 
 /* ── Timeline state ───────────────────────────────────────────────── */
@@ -70,54 +71,55 @@ static void sync_from_entity(void)
 
     if (!focused) return;
 
-    int comp_count = 0;
-    JceComponentInfo *comps = jce_state_get_entity_components(focused, &comp_count);
-    if (!comps) return;
+    JceScene *scene = jce_state_get_scene();
+    if (!scene || !jce_state_entity_exists(focused)) return;
 
-    for (int i = 0; i < comp_count; i++) {
-        if (comps[i].type == JCE_COMP_ANIMATOR) {
-            s_tl.has_animator = true;
-            snprintf(s_tl.clip_name, sizeof(s_tl.clip_name), "%s",
-                     comps[i].data.animator.clip_name);
-            if (comps[i].data.animator.speed <= 0.0f)
-                comps[i].data.animator.speed = 1.0f;
-            s_tl.playback_speed = comps[i].data.animator.speed;
-            s_tl.loop           = comps[i].data.animator.loop;
-            s_tl.playing        = comps[i].data.animator.playing;
+    JceEntity e = jce_state_to_ecs_entity(focused);
+
+    JceAnimatorComponent *anim = jce_scene_get_animator(scene, e);
+    if (anim) {
+        s_tl.has_animator = true;
+        snprintf(s_tl.clip_name, sizeof(s_tl.clip_name), "%s", anim->clip_name);
+        if (anim->speed <= 0.0f)
+            anim->speed = 1.0f;
+        s_tl.playback_speed = anim->speed;
+        s_tl.loop           = anim->loop;
+        s_tl.playing        = anim->playing;
+    }
+
+    JceSkeletalAnimatorComponent *skel = jce_scene_get_skeletal_animator(scene, e);
+    if (skel) {
+        s_tl.has_skeletal = true;
+        s_tl.clip_count   = skel->clip_count;
+        if (s_tl.clip_count < 0) s_tl.clip_count = 0;
+        if (s_tl.clip_count > 8) s_tl.clip_count = 8;
+        s_tl.active_clip  = skel->active_clip;
+        if (s_tl.active_clip < 0) s_tl.active_clip = 0;
+        if (s_tl.clip_count > 0 && s_tl.active_clip >= s_tl.clip_count)
+            s_tl.active_clip = s_tl.clip_count - 1;
+        if (skel->speed <= 0.0f)
+            skel->speed = 1.0f;
+        s_tl.playback_speed = skel->speed;
+        s_tl.loop           = skel->loop;
+        s_tl.playing        = skel->playing;
+        snprintf(s_tl.skeleton_path, sizeof(s_tl.skeleton_path), "%s",
+                 skel->skeleton_path);
+        for (int ci = 0; ci < s_tl.clip_count && ci < 8; ci++) {
+            snprintf(s_tl.clip_names[ci], sizeof(s_tl.clip_names[ci]), "%s",
+                     skel->clip_names[ci]);
         }
-        if (comps[i].type == JCE_COMP_SKELETAL_ANIMATOR) {
-            s_tl.has_skeletal = true;
-            s_tl.clip_count   = comps[i].data.skeletal_animator.clip_count;
-            if (s_tl.clip_count < 0) s_tl.clip_count = 0;
-            if (s_tl.clip_count > 8) s_tl.clip_count = 8;
-            s_tl.active_clip  = comps[i].data.skeletal_animator.active_clip;
-            if (s_tl.active_clip < 0) s_tl.active_clip = 0;
-            if (s_tl.clip_count > 0 && s_tl.active_clip >= s_tl.clip_count)
-                s_tl.active_clip = s_tl.clip_count - 1;
-            if (comps[i].data.skeletal_animator.speed <= 0.0f)
-                comps[i].data.skeletal_animator.speed = 1.0f;
-            s_tl.playback_speed = comps[i].data.skeletal_animator.speed;
-            s_tl.loop           = comps[i].data.skeletal_animator.loop;
-            s_tl.playing        = comps[i].data.skeletal_animator.playing;
-            snprintf(s_tl.skeleton_path, sizeof(s_tl.skeleton_path), "%s",
-                     comps[i].data.skeletal_animator.skeleton_path);
-            for (int ci = 0; ci < s_tl.clip_count && ci < 8; ci++) {
-                snprintf(s_tl.clip_names[ci], sizeof(s_tl.clip_names[ci]), "%s",
-                         comps[i].data.skeletal_animator.clip_names[ci]);
-            }
-            if (s_tl.active_clip < s_tl.clip_count)
-                snprintf(s_tl.clip_name, sizeof(s_tl.clip_name), "%s",
-                         comps[i].data.skeletal_animator.clip_names[s_tl.active_clip]);
+        if (s_tl.active_clip < s_tl.clip_count)
+            snprintf(s_tl.clip_name, sizeof(s_tl.clip_name), "%s",
+                     skel->clip_names[s_tl.active_clip]);
 
-            /* Query real clip duration from model cache. */
-            JceModel *mdl = jce_editor_scene_get_model(
-                s_tl.skeleton_path, s_tl.bound_entity_id);
-            if (mdl && s_tl.clip_count > 0) {
-                JceAnimClip *clip = jce_model_get_anim(mdl,
-                    (uint32_t)s_tl.active_clip);
-                if (clip)
-                    s_tl.duration = jce_anim_clip_duration(clip);
-            }
+        /* Query real clip duration from model cache. */
+        JceModel *mdl = jce_editor_scene_get_model(
+            s_tl.skeleton_path, s_tl.bound_entity_id);
+        if (mdl && s_tl.clip_count > 0) {
+            JceAnimClip *clip = jce_model_get_anim(mdl,
+                (uint32_t)s_tl.active_clip);
+            if (clip)
+                s_tl.duration = jce_anim_clip_duration(clip);
         }
     }
 }
@@ -130,22 +132,24 @@ static void sync_to_entity(void)
     if (s_tl.playback_speed <= 0.0f)
         s_tl.playback_speed = 1.0f;
 
-    int comp_count = 0;
-    JceComponentInfo *comps = jce_state_get_entity_components(s_tl.bound_entity_id, &comp_count);
-    if (!comps) return;
+    JceScene *scene = jce_state_get_scene();
+    if (!scene || !jce_state_entity_exists(s_tl.bound_entity_id)) return;
 
-    for (int i = 0; i < comp_count; i++) {
-        if (comps[i].type == JCE_COMP_ANIMATOR) {
-            comps[i].data.animator.speed   = s_tl.playback_speed;
-            comps[i].data.animator.loop    = s_tl.loop;
-            comps[i].data.animator.playing = s_tl.playing;
-        }
-        if (comps[i].type == JCE_COMP_SKELETAL_ANIMATOR) {
-            comps[i].data.skeletal_animator.speed       = s_tl.playback_speed;
-            comps[i].data.skeletal_animator.loop        = s_tl.loop;
-            comps[i].data.skeletal_animator.playing     = s_tl.playing;
-            comps[i].data.skeletal_animator.active_clip = s_tl.active_clip;
-        }
+    JceEntity e = jce_state_to_ecs_entity(s_tl.bound_entity_id);
+
+    JceAnimatorComponent *anim = jce_scene_get_animator(scene, e);
+    if (anim) {
+        anim->speed   = s_tl.playback_speed;
+        anim->loop    = s_tl.loop;
+        anim->playing = s_tl.playing;
+    }
+
+    JceSkeletalAnimatorComponent *skel = jce_scene_get_skeletal_animator(scene, e);
+    if (skel) {
+        skel->speed       = s_tl.playback_speed;
+        skel->loop        = s_tl.loop;
+        skel->playing     = s_tl.playing;
+        skel->active_clip = s_tl.active_clip;
     }
 
     /* Sync scrubbed time to animation player in model cache. */
@@ -176,10 +180,11 @@ void jce_editor_panel_timeline_content(void)
 
     /* Info bar: show bound entity name. */
     if (s_tl.bound_entity_id) {
-        JceEntityInfo *ent = jce_state_get_entity(s_tl.bound_entity_id);
-        if (ent) {
+        if (jce_state_entity_exists(s_tl.bound_entity_id)) {
+            const char *ent_name = jce_state_entity_name(s_tl.bound_entity_id);
+            if (!ent_name) ent_name = "";
             ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s: %s",
-                               jce_editor_i18n("timeline.entity"), ent->name);
+                               jce_editor_i18n("timeline.entity"), ent_name);
             ImGui::SameLine();
             if (s_tl.clip_name[0])
                 ImGui::Text("| %s: %s", jce_editor_i18n("timeline.clip"), s_tl.clip_name);

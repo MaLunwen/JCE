@@ -22,6 +22,34 @@
 
 extern "C" {
 #include <jce/core/jce_math.h>
+#include <jce/scene/jce_scene.h>
+}
+
+/* ── Local mesh shape constants (procedural primitives) ───────────── */
+
+#ifndef JCE_MESH_SHAPE_CUBE
+#define JCE_MESH_SHAPE_CUBE     0
+#define JCE_MESH_SHAPE_SPHERE   1
+#define JCE_MESH_SHAPE_PLANE    2
+#define JCE_MESH_SHAPE_CAPSULE  3
+#define JCE_MESH_SHAPE_CYLINDER 4
+#endif
+
+/* ── Quat ↔ Euler degrees (local helpers) ─────────────────────────── */
+
+static inline void scene_view_q_to_euler_deg(jce_quat q, float out[3])
+{
+    jce_vec3 e = jce_q_to_euler(q);
+    out[0] = e.x * JCE_RAD2DEG;
+    out[1] = e.y * JCE_RAD2DEG;
+    out[2] = e.z * JCE_RAD2DEG;
+}
+
+static inline jce_quat scene_view_q_from_euler_deg(const float in[3])
+{
+    return jce_q_from_euler(in[0] * JCE_DEG2RAD,
+                            in[1] * JCE_DEG2RAD,
+                            in[2] * JCE_DEG2RAD);
 }
 
 /* ── Shared viewport context ─────────────────────────────────────── */
@@ -63,18 +91,16 @@ extern bool  s_gizmo_history_batch_open;
 void clear_stale_gizmo_interaction_state(void);
 bool has_valid_gizmo_target(void);
 
-JceComponentInfo *find_transform_component(JceComponentInfo *comps,
-                                           int comp_count);
-JceComponentInfo *find_component_by_type(JceComponentInfo *comps,
-                                         int comp_count,
-                                         JceComponentType type);
-
 void draw_scene_helper_icons(ImDrawList *dl, const JceGizmoCamera *cam);
 
 void set_entity_mesh_shape(uint32_t entity_id, int mesh_shape);
+
+/* extra_comp_flag = 0 means "no additional component beyond the default
+ * Transform + EditorMeta added by jce_state_create_entity". Otherwise
+ * pass a single JCE_COMP_FLAG_* value. */
 uint32_t create_default_scene_entity(const char *name,
                                      uint32_t parent_id,
-                                     JceComponentType extra_type,
+                                     uint32_t extra_comp_flag,
                                      int mesh_shape);
 
 /* ── Functions from jce_scene_view_cube.cpp ───────────────────────── */

@@ -1,12 +1,18 @@
 /*
  * jce_editor_scene_parse.cpp  Scene JSON parsing and entity loading.
  *
- * Handles all JSON deserialization of scene files: component parsing,
+ * Handles all JSON deserialization of scene files: per-component parsing,
  * entity tree loading, flat-array loading with parent references,
  * object-map loading, and contract version checking.
+ *
+ * Components are written straight to the engine ECS — no editor mirror
+ * store.  The accepted JSON format is unchanged from the previous
+ * mirror-based implementation so existing scenes stay loadable.
  */
 
 #include "jce_editor_state_internal.h"
+
+#include <cstring>
 
 /* ── Case-insensitive string comparison ──────────────────────────── */
 
@@ -146,64 +152,68 @@ struct FlatEntityRef {
 	std::string source_key;
 	std::string source_alt_key;
 	std::string parent_key;
-	bool has_parent;
-	uint32_t new_id;
+	bool        has_parent;
+	uint32_t    new_id;
 };
 
-/* ── Component Type from Name ────────────────────────────────────── */
+/* ── Component name → flag (or special "Light" sentinel) ─────────── */
 
-JceComponentType component_type_from_name(const char *name)
+/* Sentinel used while parsing; the actual ECS component (DirLight /
+   PointLight / SpotLight) is selected from the JSON "lightType" field. */
+#define COMP_PARSE_LIGHT 0xFFFFFFFEu
+
+static uint32_t component_flag_from_name(const char *name)
 {
-	if (!name) return JCE_COMP_TYPE_COUNT;
+	if (!name) return 0;
 
-	static const struct { const char *name; JceComponentType type; } map[] = {
-		{ "Transform",            JCE_COMP_TRANSFORM },
-		{ "transform",            JCE_COMP_TRANSFORM },
-		{ "MeshRenderer",         JCE_COMP_MESH_RENDERER },
-		{ "Mesh Renderer",        JCE_COMP_MESH_RENDERER },
-		{ "meshRenderer",         JCE_COMP_MESH_RENDERER },
-		{ "mesh_renderer",        JCE_COMP_MESH_RENDERER },
-		{ "SpriteRenderer",       JCE_COMP_SPRITE_RENDERER },
-		{ "Sprite Renderer",      JCE_COMP_SPRITE_RENDERER },
-		{ "spriteRenderer",       JCE_COMP_SPRITE_RENDERER },
-		{ "sprite_renderer",      JCE_COMP_SPRITE_RENDERER },
-		{ "Camera",               JCE_COMP_CAMERA },
-		{ "camera",               JCE_COMP_CAMERA },
-		{ "Light",                JCE_COMP_LIGHT },
-		{ "light",                JCE_COMP_LIGHT },
-		{ "Animator",             JCE_COMP_ANIMATOR },
-		{ "animator",             JCE_COMP_ANIMATOR },
-		{ "SkeletalAnimator",     JCE_COMP_SKELETAL_ANIMATOR },
-		{ "Skeletal Animator",    JCE_COMP_SKELETAL_ANIMATOR },
-		{ "Rigidbody",            JCE_COMP_RIGIDBODY },
-		{ "rigidbody",            JCE_COMP_RIGIDBODY },
-		{ "BoxCollider",          JCE_COMP_BOX_COLLIDER },
-		{ "Box Collider",         JCE_COMP_BOX_COLLIDER },
-		{ "SphereCollider",       JCE_COMP_SPHERE_COLLIDER },
-		{ "Sphere Collider",      JCE_COMP_SPHERE_COLLIDER },
-		{ "CharacterController",  JCE_COMP_CHARACTER_CONTROLLER },
-		{ "Character Controller", JCE_COMP_CHARACTER_CONTROLLER },
-		{ "AudioSource",          JCE_COMP_AUDIO_SOURCE },
-		{ "Audio Source",         JCE_COMP_AUDIO_SOURCE },
-		{ "Script",               JCE_COMP_SCRIPT },
-		{ "script",               JCE_COMP_SCRIPT },
-		{ "Skybox",               JCE_COMP_SKYBOX },
-		{ "skybox",               JCE_COMP_SKYBOX },
-		{ "SpriteAnimator",       JCE_COMP_SPRITE_ANIMATOR },
-		{ "Sprite Animator",      JCE_COMP_SPRITE_ANIMATOR },
-		{ "spriteAnimator",       JCE_COMP_SPRITE_ANIMATOR },
-		{ "Constraint",           JCE_COMP_CONSTRAINT },
-		{ "constraint",           JCE_COMP_CONSTRAINT },
+	static const struct { const char *name; uint32_t flag; } map[] = {
+		{ "Transform",            JCE_COMP_FLAG_TRANSFORM },
+		{ "transform",            JCE_COMP_FLAG_TRANSFORM },
+		{ "MeshRenderer",         JCE_COMP_FLAG_MESH_RENDERER },
+		{ "Mesh Renderer",        JCE_COMP_FLAG_MESH_RENDERER },
+		{ "meshRenderer",         JCE_COMP_FLAG_MESH_RENDERER },
+		{ "mesh_renderer",        JCE_COMP_FLAG_MESH_RENDERER },
+		{ "SpriteRenderer",       JCE_COMP_FLAG_SPRITE_RENDERER },
+		{ "Sprite Renderer",      JCE_COMP_FLAG_SPRITE_RENDERER },
+		{ "spriteRenderer",       JCE_COMP_FLAG_SPRITE_RENDERER },
+		{ "sprite_renderer",      JCE_COMP_FLAG_SPRITE_RENDERER },
+		{ "Camera",               JCE_COMP_FLAG_CAMERA },
+		{ "camera",               JCE_COMP_FLAG_CAMERA },
+		{ "Light",                COMP_PARSE_LIGHT },
+		{ "light",                COMP_PARSE_LIGHT },
+		{ "Animator",             JCE_COMP_FLAG_ANIMATOR },
+		{ "animator",             JCE_COMP_FLAG_ANIMATOR },
+		{ "SkeletalAnimator",     JCE_COMP_FLAG_SKELETAL_ANIMATOR },
+		{ "Skeletal Animator",    JCE_COMP_FLAG_SKELETAL_ANIMATOR },
+		{ "Rigidbody",            JCE_COMP_FLAG_RIGIDBODY },
+		{ "rigidbody",            JCE_COMP_FLAG_RIGIDBODY },
+		{ "BoxCollider",          JCE_COMP_FLAG_BOX_COLLIDER },
+		{ "Box Collider",         JCE_COMP_FLAG_BOX_COLLIDER },
+		{ "SphereCollider",       JCE_COMP_FLAG_SPHERE_COLLIDER },
+		{ "Sphere Collider",      JCE_COMP_FLAG_SPHERE_COLLIDER },
+		{ "CharacterController",  JCE_COMP_FLAG_CHARACTER_CONTROLLER },
+		{ "Character Controller", JCE_COMP_FLAG_CHARACTER_CONTROLLER },
+		{ "AudioSource",          JCE_COMP_FLAG_AUDIO_SOURCE },
+		{ "Audio Source",         JCE_COMP_FLAG_AUDIO_SOURCE },
+		{ "Script",               JCE_COMP_FLAG_SCRIPT },
+		{ "script",               JCE_COMP_FLAG_SCRIPT },
+		{ "Skybox",               JCE_COMP_FLAG_SKYBOX },
+		{ "skybox",               JCE_COMP_FLAG_SKYBOX },
+		{ "SpriteAnimator",       JCE_COMP_FLAG_SPRITE_ANIMATOR },
+		{ "Sprite Animator",      JCE_COMP_FLAG_SPRITE_ANIMATOR },
+		{ "spriteAnimator",       JCE_COMP_FLAG_SPRITE_ANIMATOR },
+		{ "Constraint",           JCE_COMP_FLAG_CONSTRAINT },
+		{ "constraint",           JCE_COMP_FLAG_CONSTRAINT },
 	};
 
 	for (int i = 0; i < (int)(sizeof(map) / sizeof(map[0])); i++) {
 		if (strcmp(name, map[i].name) == 0)
-			return map[i].type;
+			return map[i].flag;
 	}
-	return JCE_COMP_TYPE_COUNT;
+	return 0;
 }
 
-/* ── JSON Number Helper ──────────────────────────────────────────── */
+/* ── JSON Number / String Helpers ────────────────────────────────── */
 
 static float json_get_float(const cJSON *obj, const char *key, float def)
 {
@@ -219,81 +229,116 @@ static float json_get_float_any2(const cJSON *obj, const char *k1, const char *k
 	return cJSON_IsNumber(item) ? (float)item->valuedouble : def;
 }
 
-/* ── JSON String Helper ──────────────────────────────────────────── */
-
 static const char *json_get_string(const cJSON *obj, const char *key)
 {
 	const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
 	return (cJSON_IsString(item) && item->valuestring) ? item->valuestring : NULL;
 }
 
-/* ── Per-component JSON parsers ─────────────────────────────────── */
+/* ── Per-component JSON parsers (write directly to ECS) ──────────── */
 
-static void parse_json_transform(const cJSON *props, JceComponentInfo *out)
+static void parse_json_transform(const cJSON *props, JceScene *scene, JceEntity e)
 {
-	out->data.transform.pos[0]   = json_get_float_any2(props, "posX", "pos_x", 0.0f);
-	out->data.transform.pos[1]   = json_get_float_any2(props, "posY", "pos_y", 0.0f);
-	out->data.transform.pos[2]   = json_get_float_any2(props, "posZ", "pos_z", 0.0f);
-	/* Rotation: check for quaternion (rotW present) and convert to Euler degrees. */
-	{
-		float rx = json_get_float_any2(props, "rotX", "rot_x", 0.0f);
-		float ry = json_get_float_any2(props, "rotY", "rot_y", 0.0f);
-		float rz = json_get_float_any2(props, "rotZ", "rot_z", 0.0f);
-		const cJSON *rw_item = cJSON_GetObjectItemCaseSensitive(props, "rotW");
-		if (!rw_item) rw_item = cJSON_GetObjectItemCaseSensitive(props, "rot_w");
-		if (cJSON_IsNumber(rw_item)) {
-			float qw = (float)rw_item->valuedouble;
-			jce_quat q = {{ rx, ry, rz, qw }};
-			q = jce_q_normalize(q);
-			jce_vec3 e = jce_q_to_euler(q);
-			rx = e.x * JCE_RAD2DEG;
-			ry = e.y * JCE_RAD2DEG;
-			rz = e.z * JCE_RAD2DEG;
-		}
-		out->data.transform.rot[0] = rx;
-		out->data.transform.rot[1] = ry;
-		out->data.transform.rot[2] = rz;
+	JceTransform t;
+	memset(&t, 0, sizeof(t));
+
+	t.position.x = json_get_float_any2(props, "posX", "pos_x", 0.0f);
+	t.position.y = json_get_float_any2(props, "posY", "pos_y", 0.0f);
+	t.position.z = json_get_float_any2(props, "posZ", "pos_z", 0.0f);
+
+	float rx = json_get_float_any2(props, "rotX", "rot_x", 0.0f);
+	float ry = json_get_float_any2(props, "rotY", "rot_y", 0.0f);
+	float rz = json_get_float_any2(props, "rotZ", "rot_z", 0.0f);
+	const cJSON *rw = cJSON_GetObjectItemCaseSensitive(props, "rotW");
+	if (!rw) rw = cJSON_GetObjectItemCaseSensitive(props, "rot_w");
+	if (cJSON_IsNumber(rw)) {
+		jce_quat q = {{ rx, ry, rz, (float)rw->valuedouble }};
+		t.rotation = jce_q_normalize(q);
+	} else {
+		float euler[3] = { rx, ry, rz };
+		t.rotation = jce_q_from_euler_deg(euler);
 	}
-	out->data.transform.scale[0] = json_get_float_any2(props, "scaleX", "scale_x", 1.0f);
-	out->data.transform.scale[1] = json_get_float_any2(props, "scaleY", "scale_y", 1.0f);
-	out->data.transform.scale[2] = json_get_float_any2(props, "scaleZ", "scale_z", 1.0f);
+
+	t.scale.x = json_get_float_any2(props, "scaleX", "scale_x", 1.0f);
+	t.scale.y = json_get_float_any2(props, "scaleY", "scale_y", 1.0f);
+	t.scale.z = json_get_float_any2(props, "scaleZ", "scale_z", 1.0f);
+
+	jce_scene_set_transform(scene, e, &t);
 }
 
-static void parse_json_camera(const cJSON *props, JceComponentInfo *out)
+static void parse_json_camera(const cJSON *props, JceScene *scene, JceEntity e)
 {
-	out->data.camera.fov       = json_get_float(props, "fov", 60.0f);
-	out->data.camera.near_clip = json_get_float_any2(props, "nearClip", "near_clip", 0.1f);
-	out->data.camera.far_clip  = json_get_float_any2(props, "farClip", "far_clip", 1000.0f);
+	JceCameraComponent c;
+	memset(&c, 0, sizeof(c));
+	c.fov_deg    = json_get_float(props, "fov", 60.0f);
+	c.near_plane = json_get_float_any2(props, "nearClip", "near_clip", 0.1f);
+	c.far_plane  = json_get_float_any2(props, "farClip", "far_clip", 1000.0f);
 	bool ortho = false;
 	static const char *const ortho_keys[] = { "orthographic", "ortho", "isOrtho" };
 	json_get_bool_any(props, ortho_keys,
 		(int)(sizeof(ortho_keys) / sizeof(ortho_keys[0])), &ortho);
-	out->data.camera.ortho = ortho;
+	c.ortho = ortho;
+	c.is_primary = true;
+	jce_scene_set_camera(scene, e, &c);
 }
 
-static void parse_json_light(const cJSON *props, JceComponentInfo *out)
+static void parse_json_light(const cJSON *props, JceScene *scene, JceEntity e)
 {
-	out->data.light.color[0]   = json_get_float_any2(props, "colorR", "color_r", 1.0f);
-	out->data.light.color[1]   = json_get_float_any2(props, "colorG", "color_g", 1.0f);
-	out->data.light.color[2]   = json_get_float_any2(props, "colorB", "color_b", 1.0f);
-	out->data.light.color[3]   = json_get_float_any2(props, "colorA", "color_a", 1.0f);
-	out->data.light.intensity  = json_get_float(props, "intensity", 1.0f);
+	float colorR = json_get_float_any2(props, "colorR", "color_r", 1.0f);
+	float colorG = json_get_float_any2(props, "colorG", "color_g", 1.0f);
+	float colorB = json_get_float_any2(props, "colorB", "color_b", 1.0f);
+	float intensity = json_get_float(props, "intensity", 1.0f);
+	bool casts_shadow = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "castsShadow"));
+
+	int type = 0;
 	const cJSON *lt = cJSON_GetObjectItemCaseSensitive(props, "lightType");
 	if (!lt) lt = cJSON_GetObjectItemCaseSensitive(props, "type");
 	if (cJSON_IsNumber(lt))
-		out->data.light.type = lt->valueint;
+		type = lt->valueint;
 	else if (cJSON_IsString(lt) && lt->valuestring) {
-		if (equals_ignore_case(lt->valuestring, "point")) out->data.light.type = 1;
-		else if (equals_ignore_case(lt->valuestring, "spot")) out->data.light.type = 2;
+		if (equals_ignore_case(lt->valuestring, "point")) type = 1;
+		else if (equals_ignore_case(lt->valuestring, "spot")) type = 2;
 	}
-	out->data.light.radius         = json_get_float(props, "radius", 10.0f);
-	out->data.light.inner_cone_deg = json_get_float_any2(props, "innerConeDeg", "inner_cone_deg", 25.0f);
-	out->data.light.outer_cone_deg = json_get_float_any2(props, "outerConeDeg", "outer_cone_deg", 35.0f);
-	out->data.light.casts_shadow   = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "castsShadow"));
+
+	if (type == 1) {
+		JcePointLight pl;
+		memset(&pl, 0, sizeof(pl));
+		pl.color.x = colorR;
+		pl.color.y = colorG;
+		pl.color.z = colorB;
+		pl.intensity = intensity;
+		pl.radius    = json_get_float(props, "radius", 10.0f);
+		jce_scene_set_point_light(scene, e, &pl);
+	} else if (type == 2) {
+		JceSpotLight sl;
+		memset(&sl, 0, sizeof(sl));
+		sl.color.x = colorR;
+		sl.color.y = colorG;
+		sl.color.z = colorB;
+		sl.intensity = intensity;
+		sl.radius    = json_get_float(props, "radius", 10.0f);
+		float inner_deg = json_get_float_any2(props, "innerConeDeg", "inner_cone_deg", 25.0f);
+		float outer_deg = json_get_float_any2(props, "outerConeDeg", "outer_cone_deg", 35.0f);
+		sl.inner_cone_cos = cosf(inner_deg * JCE_DEG2RAD);
+		sl.outer_cone_cos = cosf(outer_deg * JCE_DEG2RAD);
+		jce_scene_set_spot_light(scene, e, &sl);
+	} else {
+		JceDirectionalLight dl;
+		memset(&dl, 0, sizeof(dl));
+		dl.color.x = colorR;
+		dl.color.y = colorG;
+		dl.color.z = colorB;
+		dl.intensity    = intensity;
+		dl.casts_shadow = casts_shadow;
+		jce_scene_set_dir_light(scene, e, &dl);
+	}
 }
 
-static void parse_json_mesh_renderer(const cJSON *props, JceComponentInfo *out)
+static void parse_json_mesh_renderer(const cJSON *props, JceScene *scene, JceEntity e)
 {
+	JceMeshRenderer mr;
+	memset(&mr, 0, sizeof(mr));
+
 	static const char *const mesh_keys[] = { "meshPath", "mesh_path", "mesh" };
 	static const char *const mat_keys[] = { "materialPath", "material_path", "material" };
 	const char *mesh = json_get_string_any(props, mesh_keys,
@@ -301,226 +346,259 @@ static void parse_json_mesh_renderer(const cJSON *props, JceComponentInfo *out)
 	const char *mat = json_get_string_any(props, mat_keys,
 		(int)(sizeof(mat_keys) / sizeof(mat_keys[0])));
 	if (mesh)
-		snprintf(out->data.mesh_renderer.mesh_path,
-		         sizeof(out->data.mesh_renderer.mesh_path), "%s", mesh);
+		snprintf(mr.mesh_path, sizeof(mr.mesh_path), "%s", mesh);
 	if (mat)
-		snprintf(out->data.mesh_renderer.material_path,
-		         sizeof(out->data.mesh_renderer.material_path), "%s", mat);
-	out->data.mesh_renderer.mesh_shape = (int)json_get_float(props, "meshShape", 0.0f);
-	/* PBR parameters. */
-	out->data.mesh_renderer.base_color[0] = json_get_float(props, "baseColorR", 1.0f);
-	out->data.mesh_renderer.base_color[1] = json_get_float(props, "baseColorG", 1.0f);
-	out->data.mesh_renderer.base_color[2] = json_get_float(props, "baseColorB", 1.0f);
-	out->data.mesh_renderer.base_color[3] = json_get_float(props, "baseColorA", 1.0f);
-	out->data.mesh_renderer.metallic      = json_get_float(props, "metallic", 0.0f);
-	out->data.mesh_renderer.roughness     = json_get_float(props, "roughness", 1.0f);
-	out->data.mesh_renderer.emissive[0]   = json_get_float(props, "emissiveR", 0.0f);
-	out->data.mesh_renderer.emissive[1]   = json_get_float(props, "emissiveG", 0.0f);
-	out->data.mesh_renderer.emissive[2]   = json_get_float(props, "emissiveB", 0.0f);
-	out->data.mesh_renderer.normal_scale  = json_get_float(props, "normalScale", 1.0f);
-	out->data.mesh_renderer.ao_strength   = json_get_float(props, "aoStrength", 1.0f);
-	out->data.mesh_renderer.alpha_mode    = (int)json_get_float(props, "alphaMode", 0.0f);
-	out->data.mesh_renderer.alpha_cutoff  = json_get_float(props, "alphaCutoff", 0.5f);
-	const cJSON *ds = cJSON_GetObjectItemCaseSensitive(props, "doubleSided");
-	out->data.mesh_renderer.double_sided = cJSON_IsTrue(ds);
-	/* Texture paths. */
+		snprintf(mr.material_path, sizeof(mr.material_path), "%s", mat);
+	mr.mesh_shape = (int)json_get_float(props, "meshShape", 0.0f);
+
+	mr.base_color[0] = json_get_float(props, "baseColorR", 1.0f);
+	mr.base_color[1] = json_get_float(props, "baseColorG", 1.0f);
+	mr.base_color[2] = json_get_float(props, "baseColorB", 1.0f);
+	mr.base_color[3] = json_get_float(props, "baseColorA", 1.0f);
+	mr.metallic      = json_get_float(props, "metallic", 0.0f);
+	mr.roughness     = json_get_float(props, "roughness", 1.0f);
+	mr.emissive[0]   = json_get_float(props, "emissiveR", 0.0f);
+	mr.emissive[1]   = json_get_float(props, "emissiveG", 0.0f);
+	mr.emissive[2]   = json_get_float(props, "emissiveB", 0.0f);
+	mr.normal_scale  = json_get_float(props, "normalScale", 1.0f);
+	mr.ao_strength   = json_get_float(props, "aoStrength", 1.0f);
+	mr.alpha_mode    = (int)json_get_float(props, "alphaMode", 0.0f);
+	mr.alpha_cutoff  = json_get_float(props, "alphaCutoff", 0.5f);
+	mr.double_sided  = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "doubleSided"));
+	mr.visible       = true;
+
 	{ const char *v = json_get_string(props, "albedoTex");
-	  if (v) snprintf(out->data.mesh_renderer.albedo_tex, 128, "%s", v); }
+	  if (v) snprintf(mr.albedo_tex, sizeof(mr.albedo_tex), "%s", v); }
 	{ const char *v = json_get_string(props, "mrTex");
-	  if (v) snprintf(out->data.mesh_renderer.mr_tex, 128, "%s", v); }
+	  if (v) snprintf(mr.mr_tex, sizeof(mr.mr_tex), "%s", v); }
 	{ const char *v = json_get_string(props, "normalTex");
-	  if (v) snprintf(out->data.mesh_renderer.normal_tex, 128, "%s", v); }
+	  if (v) snprintf(mr.normal_tex, sizeof(mr.normal_tex), "%s", v); }
 	{ const char *v = json_get_string(props, "aoTex");
-	  if (v) snprintf(out->data.mesh_renderer.ao_tex, 128, "%s", v); }
+	  if (v) snprintf(mr.ao_tex, sizeof(mr.ao_tex), "%s", v); }
 	{ const char *v = json_get_string(props, "emissiveTex");
-	  if (v) snprintf(out->data.mesh_renderer.emissive_tex, 128, "%s", v); }
+	  if (v) snprintf(mr.emissive_tex, sizeof(mr.emissive_tex), "%s", v); }
+
+	jce_scene_set_mesh_renderer(scene, e, &mr);
 }
 
-static void parse_json_sprite_renderer(const cJSON *props, JceComponentInfo *out)
+static void parse_json_sprite_renderer(const cJSON *props, JceScene *scene, JceEntity e)
 {
+	JceSpriteRendererComponent c;
+	memset(&c, 0, sizeof(c));
 	{ const char *v = json_get_string(props, "spritePath");
-	  if (v) snprintf(out->data.sprite_renderer.sprite_path, 128, "%s", v); }
-	out->data.sprite_renderer.color[0] = json_get_float(props, "colorR", 1.0f);
-	out->data.sprite_renderer.color[1] = json_get_float(props, "colorG", 1.0f);
-	out->data.sprite_renderer.color[2] = json_get_float(props, "colorB", 1.0f);
-	out->data.sprite_renderer.color[3] = json_get_float(props, "colorA", 1.0f);
-	out->data.sprite_renderer.flip_x = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "flipX"));
-	out->data.sprite_renderer.flip_y = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "flipY"));
-	out->data.sprite_renderer.sorting_order = (int)json_get_float(props, "sortingOrder", 0.0f);
+	  if (v) snprintf(c.sprite_path, sizeof(c.sprite_path), "%s", v); }
+	c.color[0] = json_get_float(props, "colorR", 1.0f);
+	c.color[1] = json_get_float(props, "colorG", 1.0f);
+	c.color[2] = json_get_float(props, "colorB", 1.0f);
+	c.color[3] = json_get_float(props, "colorA", 1.0f);
+	c.flip_x = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "flipX"));
+	c.flip_y = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "flipY"));
+	c.sorting_order = (int)json_get_float(props, "sortingOrder", 0.0f);
+	jce_scene_set_sprite_renderer(scene, e, &c);
 }
 
-static void parse_json_animator(const cJSON *props, JceComponentInfo *out)
+static void parse_json_animator(const cJSON *props, JceScene *scene, JceEntity e)
 {
+	JceAnimatorComponent c;
+	memset(&c, 0, sizeof(c));
 	{ const char *v = json_get_string(props, "clipName");
-	  if (v) snprintf(out->data.animator.clip_name, 64, "%s", v); }
-	out->data.animator.speed   = json_get_float(props, "speed", 1.0f);
-	out->data.animator.loop    = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "loop"));
-	out->data.animator.playing = false;
+	  if (v) snprintf(c.clip_name, sizeof(c.clip_name), "%s", v); }
+	c.speed   = json_get_float(props, "speed", 1.0f);
+	c.loop    = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "loop"));
+	c.playing = false;
+	jce_scene_set_animator(scene, e, &c);
 }
 
-static void parse_json_skeletal_animator(const cJSON *props, JceComponentInfo *out)
+static void parse_json_skeletal_animator(const cJSON *props, JceScene *scene, JceEntity e)
 {
+	JceSkeletalAnimatorComponent c;
+	memset(&c, 0, sizeof(c));
 	{ const char *v = json_get_string(props, "skeletonPath");
-	  if (v) snprintf(out->data.skeletal_animator.skeleton_path, 128, "%s", v); }
-	out->data.skeletal_animator.speed       = json_get_float(props, "speed", 1.0f);
-	out->data.skeletal_animator.loop        = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "loop"));
-	out->data.skeletal_animator.playing     = false;
-	out->data.skeletal_animator.active_clip = (int)json_get_float(props, "activeClip", 0.0f);
+	  if (v) snprintf(c.skeleton_path, sizeof(c.skeleton_path), "%s", v); }
+	c.speed       = json_get_float(props, "speed", 1.0f);
+	c.loop        = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "loop"));
+	c.playing     = false;
+	c.active_clip = (int)json_get_float(props, "activeClip", 0.0f);
+
 	const cJSON *clips = cJSON_GetObjectItemCaseSensitive(props, "clipNames");
-	out->data.skeletal_animator.clip_count = 0;
+	c.clip_count = 0;
 	if (cJSON_IsArray(clips)) {
 		int n = cJSON_GetArraySize(clips);
 		if (n > 8) n = 8;
 		for (int ci = 0; ci < n; ci++) {
 			const cJSON *ce = cJSON_GetArrayItem(clips, ci);
 			if (cJSON_IsString(ce) && ce->valuestring)
-				snprintf(out->data.skeletal_animator.clip_names[ci], 64, "%s", ce->valuestring);
+				snprintf(c.clip_names[ci], 64, "%s", ce->valuestring);
 		}
-		out->data.skeletal_animator.clip_count = n;
+		c.clip_count = n;
 	}
+	jce_scene_set_skeletal_animator(scene, e, &c);
 }
 
-static void parse_json_rigidbody(const cJSON *props, JceComponentInfo *out)
+static void parse_json_rigidbody(const cJSON *props, JceScene *scene, JceEntity e)
 {
-	out->data.rigidbody.mass         = json_get_float(props, "mass", 1.0f);
-	out->data.rigidbody.drag         = json_get_float(props, "drag", 0.0f);
-	out->data.rigidbody.angular_drag = json_get_float(props, "angularDrag", 0.05f);
-	out->data.rigidbody.use_gravity  = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "useGravity"));
-	out->data.rigidbody.is_kinematic = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "isKinematic"));
+	JceRigidBodyComponent c;
+	memset(&c, 0, sizeof(c));
+	c.mass         = json_get_float(props, "mass", 1.0f);
+	c.drag         = json_get_float(props, "drag", 0.0f);
+	c.angular_drag = json_get_float(props, "angularDrag", 0.05f);
+	c.use_gravity  = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "useGravity"));
+	c.is_kinematic = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "isKinematic"));
 	if (!cJSON_GetObjectItemCaseSensitive(props, "useGravity"))
-		out->data.rigidbody.use_gravity = true;
+		c.use_gravity = true;
+	jce_scene_set_rigidbody(scene, e, &c);
 }
 
-static void parse_json_box_collider(const cJSON *props, JceComponentInfo *out)
+static void parse_json_box_collider(const cJSON *props, JceScene *scene, JceEntity e)
 {
-	out->data.box_collider.center[0] = json_get_float(props, "centerX", 0.0f);
-	out->data.box_collider.center[1] = json_get_float(props, "centerY", 0.0f);
-	out->data.box_collider.center[2] = json_get_float(props, "centerZ", 0.0f);
-	out->data.box_collider.size[0]   = json_get_float(props, "sizeX", 1.0f);
-	out->data.box_collider.size[1]   = json_get_float(props, "sizeY", 1.0f);
-	out->data.box_collider.size[2]   = json_get_float(props, "sizeZ", 1.0f);
-	out->data.box_collider.is_trigger = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "isTrigger"));
+	JceBoxColliderComponent c;
+	memset(&c, 0, sizeof(c));
+	c.center[0] = json_get_float(props, "centerX", 0.0f);
+	c.center[1] = json_get_float(props, "centerY", 0.0f);
+	c.center[2] = json_get_float(props, "centerZ", 0.0f);
+	c.size[0]   = json_get_float(props, "sizeX", 1.0f);
+	c.size[1]   = json_get_float(props, "sizeY", 1.0f);
+	c.size[2]   = json_get_float(props, "sizeZ", 1.0f);
+	c.is_trigger = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "isTrigger"));
+	jce_scene_set_box_collider(scene, e, &c);
 }
 
-static void parse_json_sphere_collider(const cJSON *props, JceComponentInfo *out)
+static void parse_json_sphere_collider(const cJSON *props, JceScene *scene, JceEntity e)
 {
-	out->data.sphere_collider.center[0] = json_get_float(props, "centerX", 0.0f);
-	out->data.sphere_collider.center[1] = json_get_float(props, "centerY", 0.0f);
-	out->data.sphere_collider.center[2] = json_get_float(props, "centerZ", 0.0f);
-	out->data.sphere_collider.radius     = json_get_float(props, "radius", 0.5f);
-	out->data.sphere_collider.is_trigger = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "isTrigger"));
+	JceSphereColliderComponent c;
+	memset(&c, 0, sizeof(c));
+	c.center[0] = json_get_float(props, "centerX", 0.0f);
+	c.center[1] = json_get_float(props, "centerY", 0.0f);
+	c.center[2] = json_get_float(props, "centerZ", 0.0f);
+	c.radius     = json_get_float(props, "radius", 0.5f);
+	c.is_trigger = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "isTrigger"));
+	jce_scene_set_sphere_collider(scene, e, &c);
 }
 
-static void parse_json_character_controller(const cJSON *props, JceComponentInfo *out)
+static void parse_json_character_controller(const cJSON *props, JceScene *scene, JceEntity e)
 {
-	out->data.character_controller.height      = json_get_float(props, "height", 2.0f);
-	out->data.character_controller.radius      = json_get_float(props, "radius", 0.5f);
-	out->data.character_controller.step_offset  = json_get_float(props, "stepOffset", 0.3f);
-	out->data.character_controller.slope_limit  = json_get_float(props, "slopeLimit", 45.0f);
+	JceCharacterControllerComponent c;
+	memset(&c, 0, sizeof(c));
+	c.height      = json_get_float(props, "height", 2.0f);
+	c.radius      = json_get_float(props, "radius", 0.5f);
+	c.step_offset = json_get_float(props, "stepOffset", 0.3f);
+	c.slope_limit = json_get_float(props, "slopeLimit", 45.0f);
+	jce_scene_set_character_controller(scene, e, &c);
 }
 
-static void parse_json_audio_source(const cJSON *props, JceComponentInfo *out)
+static void parse_json_audio_source(const cJSON *props, JceScene *scene, JceEntity e)
 {
+	JceAudioSourceComponent c;
+	memset(&c, 0, sizeof(c));
 	{ const char *v = json_get_string(props, "clipPath");
-	  if (v) snprintf(out->data.audio_source.clip_path, 128, "%s", v); }
-	out->data.audio_source.volume        = json_get_float(props, "volume", 1.0f);
-	out->data.audio_source.pitch         = json_get_float(props, "pitch", 1.0f);
-	out->data.audio_source.spatial_blend  = json_get_float(props, "spatialBlend", 0.0f);
-	out->data.audio_source.loop          = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "loop"));
-	out->data.audio_source.play_on_awake = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "playOnAwake"));
+	  if (v) snprintf(c.clip_path, sizeof(c.clip_path), "%s", v); }
+	c.volume        = json_get_float(props, "volume", 1.0f);
+	c.pitch         = json_get_float(props, "pitch", 1.0f);
+	c.spatial_blend = json_get_float(props, "spatialBlend", 0.0f);
+	c.loop          = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "loop"));
+	c.play_on_awake = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "playOnAwake"));
 	if (!cJSON_GetObjectItemCaseSensitive(props, "playOnAwake"))
-		out->data.audio_source.play_on_awake = true;
+		c.play_on_awake = true;
+	jce_scene_set_audio_source(scene, e, &c);
 }
 
-static void parse_json_script(const cJSON *props, JceComponentInfo *out)
+static void parse_json_script(const cJSON *props, JceScene *scene, JceEntity e)
 {
+	JceScriptComponent c;
+	memset(&c, 0, sizeof(c));
 	{ const char *v = json_get_string(props, "scriptPath");
-	  if (v) snprintf(out->data.script.script_path, 128, "%s", v); }
+	  if (v) snprintf(c.script_path, sizeof(c.script_path), "%s", v); }
+	jce_scene_set_script(scene, e, &c);
 }
 
-static void parse_json_skybox(const cJSON *props, JceComponentInfo *out)
+static void parse_json_skybox(const cJSON *props, JceScene *scene, JceEntity e)
 {
+	JceSkyboxComponent c;
+	memset(&c, 0, sizeof(c));
 	{ const char *v = json_get_string(props, "hdrPath");
-	  if (v) snprintf(out->data.skybox.hdr_path, 256, "%s", v); }
-	out->data.skybox.rotation = json_get_float(props, "rotation", 0.0f);
-	out->data.skybox.exposure = json_get_float(props, "exposure", 1.0f);
-	out->data.skybox.use_as_ibl = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "useAsIbl"));
+	  if (v) snprintf(c.hdr_path, sizeof(c.hdr_path), "%s", v); }
+	c.rotation   = json_get_float(props, "rotation", 0.0f);
+	c.exposure   = json_get_float(props, "exposure", 1.0f);
+	c.use_as_ibl = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "useAsIbl"));
+	jce_scene_set_skybox(scene, e, &c);
 }
 
-static void parse_json_sprite_animator(const cJSON *props, JceComponentInfo *out)
+static void parse_json_sprite_animator(const cJSON *props, JceScene *scene, JceEntity e)
 {
+	JceSpriteAnimatorComponent c;
+	memset(&c, 0, sizeof(c));
 	{ const char *v = json_get_string(props, "sheetPath");
-	  if (v) snprintf(out->data.sprite_animator.sheet_path, 128, "%s", v); }
+	  if (v) snprintf(c.sheet_path, sizeof(c.sheet_path), "%s", v); }
 	{ const char *v = json_get_string(props, "atlasPath");
-	  if (v) snprintf(out->data.sprite_animator.atlas_path, 128, "%s", v); }
-	out->data.sprite_animator.frame_width  = (int)json_get_float(props, "frameWidth", 64.0f);
-	out->data.sprite_animator.frame_height = (int)json_get_float(props, "frameHeight", 64.0f);
+	  if (v) snprintf(c.atlas_path, sizeof(c.atlas_path), "%s", v); }
+	c.frame_width  = (int)json_get_float(props, "frameWidth", 64.0f);
+	c.frame_height = (int)json_get_float(props, "frameHeight", 64.0f);
 	{ const char *v = json_get_string(props, "currentAnim");
-	  if (v) snprintf(out->data.sprite_animator.current_anim, 64, "%s", v); }
-	out->data.sprite_animator.speed   = json_get_float(props, "speed", 1.0f);
-	out->data.sprite_animator.loop    = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "loop"));
-	out->data.sprite_animator.playing = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "playing"));
+	  if (v) snprintf(c.current_anim, sizeof(c.current_anim), "%s", v); }
+	c.speed   = json_get_float(props, "speed", 1.0f);
+	c.loop    = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "loop"));
+	c.playing = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "playing"));
+	jce_scene_set_sprite_animator(scene, e, &c);
 }
 
-static void parse_json_constraint(const cJSON *props, JceComponentInfo *out)
+static void parse_json_constraint(const cJSON *props, JceScene *scene, JceEntity e)
 {
-	out->data.constraint.constraint_type = (int)json_get_float(props, "constraintType", 0.0f);
-	out->data.constraint.target_entity   = (uint32_t)json_get_float(props, "targetEntity", 0.0f);
-	out->data.constraint.pivot_a[0] = json_get_float(props, "pivotAx", 0.0f);
-	out->data.constraint.pivot_a[1] = json_get_float(props, "pivotAy", 0.0f);
-	out->data.constraint.pivot_a[2] = json_get_float(props, "pivotAz", 0.0f);
-	out->data.constraint.pivot_b[0] = json_get_float(props, "pivotBx", 0.0f);
-	out->data.constraint.pivot_b[1] = json_get_float(props, "pivotBy", 0.0f);
-	out->data.constraint.pivot_b[2] = json_get_float(props, "pivotBz", 0.0f);
-	out->data.constraint.axis[0] = json_get_float(props, "axisX", 0.0f);
-	out->data.constraint.axis[1] = json_get_float(props, "axisY", 1.0f);
-	out->data.constraint.axis[2] = json_get_float(props, "axisZ", 0.0f);
-	out->data.constraint.lower_limit = json_get_float(props, "lowerLimit", 0.0f);
-	out->data.constraint.upper_limit = json_get_float(props, "upperLimit", 0.0f);
-	out->data.constraint.disable_collision = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "disableCollision"));
+	JceConstraintComponent c;
+	memset(&c, 0, sizeof(c));
+	c.constraint_type = (int)json_get_float(props, "constraintType", 0.0f);
+	c.target_entity   = (uint32_t)json_get_float(props, "targetEntity", 0.0f);
+	c.pivot_a[0] = json_get_float(props, "pivotAx", 0.0f);
+	c.pivot_a[1] = json_get_float(props, "pivotAy", 0.0f);
+	c.pivot_a[2] = json_get_float(props, "pivotAz", 0.0f);
+	c.pivot_b[0] = json_get_float(props, "pivotBx", 0.0f);
+	c.pivot_b[1] = json_get_float(props, "pivotBy", 0.0f);
+	c.pivot_b[2] = json_get_float(props, "pivotBz", 0.0f);
+	c.axis[0] = json_get_float(props, "axisX", 0.0f);
+	c.axis[1] = json_get_float(props, "axisY", 1.0f);
+	c.axis[2] = json_get_float(props, "axisZ", 0.0f);
+	c.lower_limit = json_get_float(props, "lowerLimit", 0.0f);
+	c.upper_limit = json_get_float(props, "upperLimit", 0.0f);
+	c.disable_collision = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "disableCollision"));
+	jce_scene_set_constraint(scene, e, &c);
 }
 
-/* ── Parse Component from JSON ───────────────────────────────────── */
+/* ── Parse a single component JSON object → ECS write ────────────── */
 
-static bool parse_component_json(const cJSON *comp_json, JceComponentInfo *out)
+static bool parse_component_json(const cJSON *comp_json, JceScene *scene, JceEntity e)
 {
-	if (!cJSON_IsObject(comp_json) || !out) return false;
+	if (!cJSON_IsObject(comp_json) || !scene || e == JCE_ENTITY_INVALID)
+		return false;
 
-	/* Determine component type. */
 	static const char *const type_keys[] = { "type", "componentType", "class" };
 	const char *type_str = json_get_string_any(comp_json, type_keys,
 		(int)(sizeof(type_keys) / sizeof(type_keys[0])));
 	if (!type_str) return false;
 
-	JceComponentType type = component_type_from_name(type_str);
-	if (type >= JCE_COMP_TYPE_COUNT) return false;
-
-	memset(out, 0, sizeof(*out));
-	out->type = type;
-	out->expanded = true;
+	uint32_t flag = component_flag_from_name(type_str);
+	if (flag == 0) return false;
 
 	const cJSON *props = cJSON_GetObjectItemCaseSensitive(comp_json, "properties");
 	if (!cJSON_IsObject(props))
 		props = comp_json;
 
-	switch (type) {
-	case JCE_COMP_TRANSFORM:            parse_json_transform(props, out);            break;
-	case JCE_COMP_CAMERA:               parse_json_camera(props, out);               break;
-	case JCE_COMP_LIGHT:                parse_json_light(props, out);                break;
-	case JCE_COMP_MESH_RENDERER:        parse_json_mesh_renderer(props, out);        break;
-	case JCE_COMP_SPRITE_RENDERER:      parse_json_sprite_renderer(props, out);      break;
-	case JCE_COMP_ANIMATOR:             parse_json_animator(props, out);             break;
-	case JCE_COMP_SKELETAL_ANIMATOR:    parse_json_skeletal_animator(props, out);    break;
-	case JCE_COMP_RIGIDBODY:            parse_json_rigidbody(props, out);            break;
-	case JCE_COMP_BOX_COLLIDER:         parse_json_box_collider(props, out);         break;
-	case JCE_COMP_SPHERE_COLLIDER:      parse_json_sphere_collider(props, out);      break;
-	case JCE_COMP_CHARACTER_CONTROLLER: parse_json_character_controller(props, out); break;
-	case JCE_COMP_AUDIO_SOURCE:         parse_json_audio_source(props, out);         break;
-	case JCE_COMP_SCRIPT:               parse_json_script(props, out);               break;
-	case JCE_COMP_SKYBOX:               parse_json_skybox(props, out);               break;
-	case JCE_COMP_SPRITE_ANIMATOR:      parse_json_sprite_animator(props, out);      break;
-	case JCE_COMP_CONSTRAINT:           parse_json_constraint(props, out);           break;
-	default: break;
+	switch (flag) {
+	case JCE_COMP_FLAG_TRANSFORM:            parse_json_transform(props, scene, e);            break;
+	case JCE_COMP_FLAG_CAMERA:               parse_json_camera(props, scene, e);               break;
+	case COMP_PARSE_LIGHT:                   parse_json_light(props, scene, e);                break;
+	case JCE_COMP_FLAG_MESH_RENDERER:        parse_json_mesh_renderer(props, scene, e);        break;
+	case JCE_COMP_FLAG_SPRITE_RENDERER:      parse_json_sprite_renderer(props, scene, e);      break;
+	case JCE_COMP_FLAG_ANIMATOR:             parse_json_animator(props, scene, e);             break;
+	case JCE_COMP_FLAG_SKELETAL_ANIMATOR:    parse_json_skeletal_animator(props, scene, e);    break;
+	case JCE_COMP_FLAG_RIGIDBODY:            parse_json_rigidbody(props, scene, e);            break;
+	case JCE_COMP_FLAG_BOX_COLLIDER:         parse_json_box_collider(props, scene, e);         break;
+	case JCE_COMP_FLAG_SPHERE_COLLIDER:      parse_json_sphere_collider(props, scene, e);      break;
+	case JCE_COMP_FLAG_CHARACTER_CONTROLLER: parse_json_character_controller(props, scene, e); break;
+	case JCE_COMP_FLAG_AUDIO_SOURCE:         parse_json_audio_source(props, scene, e);         break;
+	case JCE_COMP_FLAG_SCRIPT:               parse_json_script(props, scene, e);               break;
+	case JCE_COMP_FLAG_SKYBOX:               parse_json_skybox(props, scene, e);               break;
+	case JCE_COMP_FLAG_SPRITE_ANIMATOR:      parse_json_sprite_animator(props, scene, e);      break;
+	case JCE_COMP_FLAG_CONSTRAINT:           parse_json_constraint(props, scene, e);           break;
+	default: return false;
 	}
 
 	return true;
@@ -528,54 +606,31 @@ static bool parse_component_json(const cJSON *comp_json, JceComponentInfo *out)
 
 /* ── Parse Components Array for an Entity ────────────────────────── */
 
-static void parse_entity_components(int entity_idx, const cJSON *obj)
+static void parse_entity_components(const cJSON *obj, JceScene *scene, JceEntity e)
 {
-	if (entity_idx < 0 || entity_idx >= s.entity_count) return;
-	if (!cJSON_IsObject(obj)) return;
+	if (!cJSON_IsObject(obj) || !scene || e == JCE_ENTITY_INVALID) return;
 
 	static const char *const comp_keys[] = { "components", "component" };
 	const cJSON *comps = json_get_any(obj, comp_keys,
 		(int)(sizeof(comp_keys) / sizeof(comp_keys[0])));
 	if (!cJSON_IsArray(comps)) return;
 
-	int count = 0;
-	for (cJSON *c = comps->child; c && count < JCE_MAX_COMPONENTS; c = c->next) {
-		JceComponentInfo info;
-		if (parse_component_json(c, &info))
-			s.components[entity_idx][count++] = info;
-	}
-	s.entities[entity_idx].component_count = count;
+	for (cJSON *c = comps->child; c; c = c->next)
+		parse_component_json(c, scene, e);
 }
 
 /* ── Ensure Entity has a Transform Component ─────────────────────── */
 
-static void ensure_transform_component(int entity_idx)
+static void ensure_transform_component(JceScene *scene, JceEntity e)
 {
-	if (entity_idx < 0 || entity_idx >= s.entity_count) return;
+	if (!scene || e == JCE_ENTITY_INVALID) return;
+	if (jce_scene_has_transform(scene, e)) return;
 
-	JceEntityInfo *e = &s.entities[entity_idx];
-	JceComponentInfo *comps = s.components[entity_idx];
-
-	/* Check if already has Transform. */
-	for (int i = 0; i < e->component_count; i++) {
-		if (comps[i].type == JCE_COMP_TRANSFORM)
-			return;
-	}
-
-	/* Add default Transform at the front. */
-	if (e->component_count >= JCE_MAX_COMPONENTS) return;
-
-	/* Shift existing components right. */
-	for (int i = e->component_count; i > 0; i--)
-		comps[i] = comps[i - 1];
-
-	memset(&comps[0], 0, sizeof(comps[0]));
-	comps[0].type = JCE_COMP_TRANSFORM;
-	comps[0].expanded = true;
-	comps[0].data.transform.scale[0] = 1.0f;
-	comps[0].data.transform.scale[1] = 1.0f;
-	comps[0].data.transform.scale[2] = 1.0f;
-	e->component_count++;
+	JceTransform t;
+	t.position = jce_v3(0.0f, 0.0f, 0.0f);
+	t.rotation = jce_q_identity();
+	t.scale    = jce_v3(1.0f, 1.0f, 1.0f);
+	jce_scene_set_transform(scene, e, &t);
 }
 
 /* ── Flat entity ref helpers ─────────────────────────────────────── */
@@ -592,9 +647,15 @@ static uint32_t find_new_id_for_key(const std::vector<FlatEntityRef> &refs,
 	return 0;
 }
 
-static void apply_entity_fields(JceEntityInfo *e, const cJSON *obj)
+/* ── Apply per-entity fields to ECS EditorMeta + parse components ── */
+
+static void apply_entity_fields(uint32_t entity_id, const cJSON *obj)
 {
-	if (!e || !cJSON_IsObject(obj)) return;
+	if (!cJSON_IsObject(obj) || entity_id == 0 || !s.scene) return;
+
+	JceEntity e = (JceEntity)entity_id;
+	JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, e);
+	if (!m) return;
 
 	static const char *const name_keys[] = { "name", "entityName", "label" };
 	static const char *const tag_keys[] = { "tag", "entityTag" };
@@ -607,43 +668,39 @@ static void apply_entity_fields(JceEntityInfo *e, const cJSON *obj)
 	const char *name = json_get_string_any(obj, name_keys,
 		(int)(sizeof(name_keys) / sizeof(name_keys[0])));
 	if (name && name[0] != '\0')
-		snprintf(e->name, sizeof(e->name), "%s", name);
+		snprintf(m->name, sizeof(m->name), "%s", name);
 
 	const char *tag = json_get_string_any(obj, tag_keys,
 		(int)(sizeof(tag_keys) / sizeof(tag_keys[0])));
 	if (tag)
-		snprintf(e->tag, sizeof(e->tag), "%s", tag);
+		snprintf(m->tag, sizeof(m->tag), "%s", tag);
 
 	bool enabled = true;
 	if (json_get_bool_any(obj, enabled_keys,
 		(int)(sizeof(enabled_keys) / sizeof(enabled_keys[0])),
 		&enabled))
-		e->enabled = enabled;
+		m->enabled = enabled;
 
-	bool prefab_instance = e->prefab_instance;
+	bool prefab_instance = m->prefab_instance;
 	if (json_get_bool_any(obj, prefab_instance_keys,
 		(int)(sizeof(prefab_instance_keys) / sizeof(prefab_instance_keys[0])),
 		&prefab_instance)) {
-		e->prefab_instance = prefab_instance;
+		m->prefab_instance = prefab_instance;
 		if (!prefab_instance)
-			e->prefab_path[0] = '\0';
+			m->prefab_path[0] = '\0';
 	}
 
 	const char *prefab_path = json_get_string_any(obj, prefab_path_keys,
 		(int)(sizeof(prefab_path_keys) / sizeof(prefab_path_keys[0])));
 	if (prefab_path && prefab_path[0] != '\0') {
-		snprintf(e->prefab_path, sizeof(e->prefab_path), "%s", prefab_path);
-		e->prefab_instance = true;
+		snprintf(m->prefab_path, sizeof(m->prefab_path), "%s", prefab_path);
+		m->prefab_instance = true;
 	}
 
-	e->tag_color = parse_tag_color(obj);
+	m->tag_color = (uint8_t)parse_tag_color(obj);
 
-	/* Parse components from JSON. */
-	int idx = find_entity(e->id);
-	if (idx >= 0) {
-		parse_entity_components(idx, obj);
-		ensure_transform_component(idx);
-	}
+	parse_entity_components(obj, s.scene, e);
+	ensure_transform_component(s.scene, e);
 }
 
 /* ── Entity tree loading ─────────────────────────────────────────── */
@@ -663,8 +720,7 @@ uint32_t load_entity_tree_node(const cJSON *node, uint32_t parent_id)
 		name = "Entity";
 
 	uint32_t id = jce_state_create_entity(name, parent_id);
-	JceEntityInfo *e = jce_state_get_entity(id);
-	apply_entity_fields(e, node);
+	apply_entity_fields(id, node);
 
 	const cJSON *children = json_get_any(node, children_keys,
 		(int)(sizeof(children_keys) / sizeof(children_keys[0])));
@@ -718,8 +774,7 @@ static void load_entities_from_array(const cJSON *arr)
 			name = "Entity";
 
 		uint32_t id = jce_state_create_entity(name, 0);
-		JceEntityInfo *e = jce_state_get_entity(id);
-		apply_entity_fields(e, item);
+		apply_entity_fields(id, item);
 
 		FlatEntityRef ref;
 		ref.source_key = resolve_source_key(item, fallback_id++);
@@ -777,8 +832,7 @@ static void load_entities_from_object_map(const cJSON *obj)
 			name = "Entity";
 
 		uint32_t id = jce_state_create_entity(name, 0);
-		JceEntityInfo *e = jce_state_get_entity(id);
-		apply_entity_fields(e, item);
+		apply_entity_fields(id, item);
 
 		FlatEntityRef ref;
 		std::string resolved = resolve_source_key(item, fallback_id++);
@@ -886,9 +940,9 @@ bool load_scene_from_parsed_root(const cJSON *root,
 	bool loaded_any = false;
 
 	if (cJSON_IsArray(container)) {
-		int before = s.entity_count;
+		int before = (int)g_entity_order.size();
 		load_entities_from_array(container);
-		loaded_any = (s.entity_count > before);
+		loaded_any = ((int)g_entity_order.size() > before);
 	} else if (cJSON_IsObject(container)) {
 		static const char *const array_keys[] = {
 			JCE_SCENE_ENTITIES_KEY, "objects", "nodes", "children"
@@ -896,13 +950,13 @@ bool load_scene_from_parsed_root(const cJSON *root,
 		const cJSON *entities_data = json_get_any(container, array_keys,
 			(int)(sizeof(array_keys) / sizeof(array_keys[0])));
 		if (cJSON_IsArray(entities_data)) {
-			int before = s.entity_count;
+			int before = (int)g_entity_order.size();
 			load_entities_from_array(entities_data);
-			loaded_any = loaded_any || (s.entity_count > before);
+			loaded_any = loaded_any || ((int)g_entity_order.size() > before);
 		} else if (cJSON_IsObject(entities_data)) {
-			int before = s.entity_count;
+			int before = (int)g_entity_order.size();
 			load_entities_from_object_map(entities_data);
-			loaded_any = loaded_any || (s.entity_count > before);
+			loaded_any = loaded_any || ((int)g_entity_order.size() > before);
 		}
 
 		static const char *const root_node_keys[] = {
@@ -911,15 +965,15 @@ bool load_scene_from_parsed_root(const cJSON *root,
 		const cJSON *root_node = json_get_any(container, root_node_keys,
 			(int)(sizeof(root_node_keys) / sizeof(root_node_keys[0])));
 		if (cJSON_IsObject(root_node)) {
-			int before = s.entity_count;
+			int before = (int)g_entity_order.size();
 			load_entity_tree_node(root_node, 0);
-			loaded_any = loaded_any || (s.entity_count > before);
+			loaded_any = loaded_any || ((int)g_entity_order.size() > before);
 		}
 
 		if (!loaded_any && looks_like_entity_object(container)) {
-			int before = s.entity_count;
+			int before = (int)g_entity_order.size();
 			load_entity_tree_node(container, 0);
-			loaded_any = loaded_any || (s.entity_count > before);
+			loaded_any = loaded_any || ((int)g_entity_order.size() > before);
 		}
 	}
 
@@ -942,6 +996,7 @@ bool load_scene_from_parsed_root(const cJSON *root,
 		set_current_scene_path_internal(NULL);
 	}
 
-	LOG_INFO(LOG_TAG, "scene loaded from %s (%d entities)", label, s.entity_count);
+	LOG_INFO(LOG_TAG, "scene loaded from %s (%d entities)",
+	         label, (int)g_entity_order.size());
 	return true;
 }

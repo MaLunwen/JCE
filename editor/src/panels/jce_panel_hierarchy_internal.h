@@ -25,6 +25,8 @@ extern const char  *s_tag_names[];
 
 /* ── Hierarchy state ──────────────────────────────────────────────── */
 
+#define HIERARCHY_MAX_DISPLAY 4096
+
 struct HierarchyState {
     char     search_buf[128];
     int      sort_mode;
@@ -39,7 +41,7 @@ struct HierarchyState {
     bool     ctx_clicked_entity;
     bool     initialized;
 
-    uint32_t display_order[JCE_MAX_ENTITIES];
+    uint32_t display_order[HIERARCHY_MAX_DISPLAY];
     int      display_count;
     uint32_t shift_anchor;
     uint32_t last_focus_seen;
@@ -59,7 +61,7 @@ bool node_in_reveal_path(uint32_t node_id);
 
 int  ascii_tolower(int c);
 bool text_matches_filter_ci(const char *text, const char *filter);
-bool entity_matches_search_fields(const JceEntityInfo *e, const char *filter);
+bool entity_matches_search_fields(uint32_t entity_id, const char *filter);
 bool entity_matches_search_recursive(uint32_t entity_id, const char *filter);
 void build_default_prefab_path(const char *entity_name, char *out_path, size_t out_path_size);
 int  name_compare_ci(const char *a, const char *b);
@@ -69,7 +71,7 @@ void focus_entity_in_scene(uint32_t id);
 
 /* ── Functions from jce_panel_hierarchy_node.cpp ──────────────────── */
 
-void draw_entity_node(JceEntityInfo *e);
+void draw_entity_node(uint32_t entity_id);
 
 /* ── Functions from jce_panel_hierarchy_menu.cpp ──────────────────── */
 

@@ -53,22 +53,20 @@ void jce_editor_panel_hierarchy_content(void)
         s_hier.display_count = 0;
         s_hier.ctx_clicked_entity = false;
 
-        int total = jce_state_get_entity_count();
-        uint32_t root_ids[JCE_MAX_ENTITIES];
+        uint32_t root_ids[HIERARCHY_MAX_DISPLAY];
+        int root_total = jce_state_get_root_count();
         int root_count = 0;
 
-        for (int i = 0; i < total; i++) {
-            JceEntityInfo *e = jce_state_get_entity_by_index(i);
-            if (e && e->parent_id == 0 && root_count < JCE_MAX_ENTITIES)
-                root_ids[root_count++] = e->id;
+        for (int i = 0; i < root_total && root_count < HIERARCHY_MAX_DISPLAY; i++) {
+            uint32_t rid = jce_state_get_root_id(i);
+            if (rid != 0 && jce_state_entity_exists(rid))
+                root_ids[root_count++] = rid;
         }
 
         sort_entity_ids(root_ids, root_count);
 
-        for (int i = 0; i < root_count; i++) {
-            JceEntityInfo *e = jce_state_get_entity(root_ids[i]);
-            draw_entity_node(e);
-        }
+        for (int i = 0; i < root_count; i++)
+            draw_entity_node(root_ids[i]);
 
         /* Left-click on empty space: clear selection. */
         if (ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByPopup)
@@ -107,8 +105,8 @@ void jce_editor_panel_hierarchy_content(void)
         uint32_t focused = jce_state_get_focused();
         if (focused) {
             if (ImGui::IsKeyPressed(ImGuiKey_F2)) {
-                JceEntityInfo *e = jce_state_get_entity(focused);
-                if (e) begin_rename_entity(focused, e->name);
+                if (jce_state_entity_exists(focused))
+                    begin_rename_entity(focused, jce_state_entity_name(focused));
             }
             if (ImGui::IsKeyPressed(ImGuiKey_Delete)) {
                 int sel_count = 0;

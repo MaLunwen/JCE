@@ -1,5 +1,8 @@
 /*
  * jce_scene_view_helpers.cpp  Icons, projections, helper line drawing, entity creation.
+ *
+ * Reads/writes scene data via the engine ECS API
+ * (jce_state_get_scene + jce_scene_get_*).
  */
 
 #include "jce_scene_view_internal.h"
@@ -48,36 +51,12 @@ bool has_valid_gizmo_target(void)
         return false;
 
     uint32_t focused = jce_state_get_focused();
-    if (focused == 0)
+    if (focused == 0 || !jce_state_entity_exists(focused))
         return false;
 
-    int comp_count = 0;
-    JceComponentInfo *comps = jce_state_get_entity_components(focused, &comp_count);
-    return find_transform_component(comps, comp_count) != NULL;
-}
-
-/* ── Component lookup ────────────────────────────────────────────── */
-
-JceComponentInfo *find_transform_component(JceComponentInfo *comps, int comp_count)
-{
-    if (!comps || comp_count <= 0) return NULL;
-    for (int i = 0; i < comp_count; i++) {
-        if (comps[i].type == JCE_COMP_TRANSFORM)
-            return &comps[i];
-    }
-    return NULL;
-}
-
-JceComponentInfo *find_component_by_type(JceComponentInfo *comps,
-                                         int comp_count,
-                                         JceComponentType type)
-{
-    if (!comps || comp_count <= 0) return NULL;
-    for (int i = 0; i < comp_count; i++) {
-        if (comps[i].type == type)
-            return &comps[i];
-    }
-    return NULL;
+    JceScene *scene = jce_state_get_scene();
+    if (!scene) return false;
+    return jce_scene_has_transform(scene, (JceEntity)focused);
 }
 
 /* ── Camera scene icon ───────────────────────────────────────────── */
@@ -151,20 +130,23 @@ static void draw_light_scene_icon(ImDrawList *dl, ImVec2 center,
     }
 }
 
-/* ── Orientation helper basis from euler angles ──────────────────── */
+/* ── Orientation helper basis from a transform's quaternion ──────── */
 
-static void build_helper_basis(const JceComponentInfo *xform,
+static void build_helper_basis(const JceTransform *xform,
                                float forward[3],
                                float right[3],
                                float up[3])
 {
-    float pitch = 0.0f;
-    float yaw = 0.0f;
-    float roll = 0.0f;
+    /* Convert the stored quaternion back to euler degrees and rebuild
+     * the basis with the same YXZ convention used historically by the
+     * scene-view helper icons. This keeps icon orientation consistent
+     * with what the user sees in the inspector. */
+    float pitch = 0.0f, yaw = 0.0f, roll = 0.0f;
     if (xform) {
-        pitch = xform->data.transform.rot[0] * JCE_DEG2RAD;
-        yaw   = xform->data.transform.rot[1] * JCE_DEG2RAD;
-        roll  = xform->data.transform.rot[2] * JCE_DEG2RAD;
+        jce_vec3 e_rad = jce_q_to_euler(xform->rotation);
+        pitch = e_rad.x;
+        yaw   = e_rad.y;
+        roll  = e_rad.z;
     }
 
     float cp = cosf(pitch), sp = sinf(pitch);
@@ -217,23 +199,19 @@ static bool project_helper_point(const JceGizmoCamera *cam,
 
 static void draw_camera_helper_lines(ImDrawList *dl,
                                      const JceGizmoCamera *cam,
-                                     const JceComponentInfo *xform,
-                                     const JceComponentInfo *camera,
+                                     const JceTransform *xform,
+                                     const JceCameraComponent *camera,
                                      bool selected)
 {
     if (!dl || !cam || !xform || !camera) return;
 
-    float pos[3] = {
-        xform->data.transform.pos[0],
-        xform->data.transform.pos[1],
-        xform->data.transform.pos[2]
-    };
+    float pos[3] = { xform->position.x, xform->position.y, xform->position.z };
     float forward[3], right[3], up[3];
     build_helper_basis(xform, forward, right, up);
 
     float near_d = 0.9f;
     float far_d = 2.6f;
-    float fov = camera->data.camera.fov > 1.0f ? camera->data.camera.fov : 60.0f;
+    float fov = camera->fov_deg > 1.0f ? camera->fov_deg : 60.0f;
     float half_h = tanf(fov * JCE_DEG2RAD * 0.5f) * far_d * 0.45f;
     float half_w = half_h * 1.25f;
 
@@ -283,17 +261,13 @@ static void draw_camera_helper_lines(ImDrawList *dl,
 
 static void draw_light_helper_lines(ImDrawList *dl,
                                     const JceGizmoCamera *cam,
-                                    const JceComponentInfo *xform,
-                                    const JceComponentInfo *light,
+                                    const JceTransform *xform,
+                                    int light_type,
                                     bool selected)
 {
-    if (!dl || !cam || !xform || !light) return;
+    if (!dl || !cam || !xform) return;
 
-    float pos[3] = {
-        xform->data.transform.pos[0],
-        xform->data.transform.pos[1],
-        xform->data.transform.pos[2]
-    };
+    float pos[3] = { xform->position.x, xform->position.y, xform->position.z };
     float forward[3], right[3], up[3];
     build_helper_basis(xform, forward, right, up);
 
@@ -303,7 +277,8 @@ static void draw_light_helper_lines(ImDrawList *dl,
     if (!project_helper_point(cam, pos, &pos_s))
         return;
 
-    if (light->data.light.type == 0) {
+    if (light_type == 0) {
+        /* Directional: 3 parallel arrows along the entity forward axis. */
         for (int i = -1; i <= 1; i++) {
             float offset = (float)i * 0.45f;
             float start[3] = {
@@ -333,7 +308,8 @@ static void draw_light_helper_lines(ImDrawList *dl,
                 }
             }
         }
-    } else if (light->data.light.type == 1) {
+    } else if (light_type == 1) {
+        /* Point: 6-axis spider ("sphere" outline). */
         float axes[6][3] = {
             { 1, 0, 0 }, { -1, 0, 0 },
             { 0, 1, 0 }, { 0, -1, 0 },
@@ -350,6 +326,7 @@ static void draw_light_helper_lines(ImDrawList *dl,
                 dl->AddLine(pos_s, e, line_col, 1.4f);
         }
     } else {
+        /* Spot: cone projecting along forward. */
         float base_center[3] = {
             pos[0] + forward[0] * 2.4f,
             pos[1] + forward[1] * 2.4f,
@@ -382,26 +359,28 @@ void draw_scene_helper_icons(ImDrawList *dl, const JceGizmoCamera *cam)
 {
     if (!dl || !cam) return;
 
+    JceScene *scene = jce_state_get_scene();
+    if (!scene) return;
+
     int total = jce_state_get_entity_count();
     for (int i = 0; i < total; i++) {
-        JceEntityInfo *ent = jce_state_get_entity_by_index(i);
-        if (!ent || !ent->enabled) continue;
+        uint32_t id = jce_state_get_entity_id_by_index(i);
+        if (id == 0 || !jce_state_entity_exists(id)) continue;
+        if (!jce_state_entity_enabled(id)) continue;
 
-        int comp_count = 0;
-        JceComponentInfo *comps = jce_state_get_entity_components(ent->id, &comp_count);
-        JceComponentInfo *xform = find_transform_component(comps, comp_count);
+        JceEntity e = (JceEntity)id;
+        JceTransform *xform = jce_scene_get_transform(scene, e);
         if (!xform) continue;
 
-        JceComponentInfo *camera = find_component_by_type(comps, comp_count,
-                                                          JCE_COMP_CAMERA);
-        JceComponentInfo *light  = find_component_by_type(comps, comp_count,
-                                                          JCE_COMP_LIGHT);
-        if (!camera && !light) continue;
+        bool has_camera = jce_scene_has_camera(scene, e);
+        bool has_dir    = jce_scene_has_dir_light(scene, e);
+        bool has_point  = jce_scene_has_point_light(scene, e);
+        bool has_spot   = jce_scene_has_spot_light(scene, e);
+        bool has_light  = has_dir || has_point || has_spot;
+        if (!has_camera && !has_light) continue;
 
         float world[3] = {
-            xform->data.transform.pos[0],
-            xform->data.transform.pos[1],
-            xform->data.transform.pos[2]
+            xform->position.x, xform->position.y, xform->position.z
         };
         float screen[2];
         if (!gm_world_to_screen(cam, world, screen))
@@ -414,30 +393,37 @@ void draw_scene_helper_icons(ImDrawList *dl, const JceGizmoCamera *cam)
             || screen[1] > cam->viewport_origin[1] + cam->viewport_size[1] + pad)
             continue;
 
-        bool selected = jce_state_is_selected(ent->id);
-        bool skip_icon = selected && ent->id == jce_state_get_focused()
+        bool selected = jce_state_is_selected(id);
+        bool skip_icon = selected && id == jce_state_get_focused()
                       && jce_editor_prefs_show_gizmos()
                       && jce_state_get_play_state() == JCE_PLAY_STOPPED;
         ImVec2 center(screen[0], screen[1]);
-        if (camera)
+
+        int light_type = -1;
+        if (has_dir)        light_type = 0;
+        else if (has_point) light_type = 1;
+        else if (has_spot)  light_type = 2;
+
+        if (has_camera) {
+            JceCameraComponent *camera = jce_scene_get_camera(scene, e);
             draw_camera_helper_lines(dl, cam, xform, camera, selected);
-        if (light)
-            draw_light_helper_lines(dl, cam, xform, light, selected);
+        }
+        if (light_type >= 0)
+            draw_light_helper_lines(dl, cam, xform, light_type, selected);
 
         if (skip_icon) {
             continue;
         }
 
-        if (camera && light) {
+        if (has_camera && light_type >= 0) {
             draw_camera_scene_icon(dl, ImVec2(center.x - 14.0f, center.y),
                                    16.0f, selected);
             draw_light_scene_icon(dl, ImVec2(center.x + 14.0f, center.y),
-                                  16.0f, light->data.light.type, selected);
-        } else if (camera) {
+                                  16.0f, light_type, selected);
+        } else if (has_camera) {
             draw_camera_scene_icon(dl, center, 18.0f, selected);
-        } else if (light) {
-            draw_light_scene_icon(dl, center, 18.0f,
-                                  light->data.light.type, selected);
+        } else if (light_type >= 0) {
+            draw_light_scene_icon(dl, center, 18.0f, light_type, selected);
         }
     }
 }
@@ -446,33 +432,29 @@ void draw_scene_helper_icons(ImDrawList *dl, const JceGizmoCamera *cam)
 
 void set_entity_mesh_shape(uint32_t entity_id, int mesh_shape)
 {
-    int comp_count = 0;
-    JceComponentInfo *comps = jce_state_get_entity_components(entity_id, &comp_count);
-    if (!comps) return;
+    if (entity_id == 0) return;
+    JceScene *scene = jce_state_get_scene();
+    if (!scene) return;
 
-    for (int i = 0; i < comp_count; i++) {
-        if (comps[i].type == JCE_COMP_MESH_RENDERER) {
-            comps[i].data.mesh_renderer.mesh_shape = mesh_shape;
-            break;
-        }
-    }
+    JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, (JceEntity)entity_id);
+    if (!mr) return;
+
+    mr->mesh_shape = mesh_shape;
 }
 
 uint32_t create_default_scene_entity(const char *name,
                                      uint32_t parent_id,
-                                     JceComponentType extra_type,
+                                     uint32_t extra_comp_flag,
                                      int mesh_shape)
 {
     jce_state_begin_batch_edit();
 
+    /* jce_state_create_entity already seeds Transform + EditorMeta. */
     uint32_t id = jce_state_create_entity(name, parent_id);
-    if (id != 0) {
-        jce_state_add_component(id, JCE_COMP_TRANSFORM);
-        if (extra_type != JCE_COMP_TYPE_COUNT) {
-            jce_state_add_component(id, extra_type);
-            if (extra_type == JCE_COMP_MESH_RENDERER)
-                set_entity_mesh_shape(id, mesh_shape);
-        }
+    if (id != 0 && extra_comp_flag != 0) {
+        jce_state_add_component(id, extra_comp_flag);
+        if (extra_comp_flag == JCE_COMP_FLAG_MESH_RENDERER)
+            set_entity_mesh_shape(id, mesh_shape);
     }
 
     jce_state_end_batch_edit();

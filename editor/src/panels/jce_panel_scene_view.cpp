@@ -227,21 +227,17 @@ static bool is_hdr_asset(const char *path)
             strcmp(ext, ".exr") == 0 || strcmp(ext, ".EXR") == 0);
 }
 
-static JceComponentInfo *find_mesh_renderer_component(uint32_t entity_id)
+static JceMeshRenderer *find_mesh_renderer_component(uint32_t entity_id)
 {
-    int component_count = 0;
-    JceComponentInfo *components =
-        jce_state_get_entity_components(entity_id, &component_count);
-    for (int index = 0; index < component_count; index++) {
-        if (components[index].type == JCE_COMP_MESH_RENDERER)
-            return &components[index];
-    }
-    return NULL;
+    if (entity_id == 0 || !jce_state_entity_exists(entity_id)) return NULL;
+    JceScene *scene = jce_state_get_scene();
+    if (!scene) return NULL;
+    return jce_scene_get_mesh_renderer(scene, (JceEntity)entity_id);
 }
 
 static bool entity_accepts_mesh_material_drop(uint32_t entity_id)
 {
-    return entity_id != 0 && find_mesh_renderer_component(entity_id) != NULL;
+    return find_mesh_renderer_component(entity_id) != NULL;
 }
 
 static int detect_texture_drop_slot(const char *path)
@@ -279,14 +275,13 @@ static int detect_texture_drop_slot(const char *path)
     return 0;
 }
 
-static void assign_texture_drop_to_mesh_renderer(JceComponentInfo *mesh_renderer_comp,
+static void assign_texture_drop_to_mesh_renderer(JceMeshRenderer *mesh_renderer_comp,
                                                  int slot,
                                                  const char *asset_path)
 {
-    if (!mesh_renderer_comp || mesh_renderer_comp->type != JCE_COMP_MESH_RENDERER)
-        return;
+    if (!mesh_renderer_comp) return;
 
-    auto &mr = mesh_renderer_comp->data.mesh_renderer;
+    auto &mr = *mesh_renderer_comp;
     switch (slot) {
     case 1:
         snprintf(mr.mr_tex, sizeof(mr.mr_tex), "%s", asset_path);
@@ -307,18 +302,17 @@ static void assign_texture_drop_to_mesh_renderer(JceComponentInfo *mesh_renderer
     }
 }
 
-static bool apply_material_asset_to_mesh_renderer(JceComponentInfo *mesh_renderer_comp,
+static bool apply_material_asset_to_mesh_renderer(JceMeshRenderer *mesh_renderer_comp,
                                                   const char *asset_path)
 {
-    if (!mesh_renderer_comp || mesh_renderer_comp->type != JCE_COMP_MESH_RENDERER)
-        return false;
+    if (!mesh_renderer_comp) return false;
 
     JcePbrMaterial material = {};
     char tex_paths[5][256] = {};
     if (!jce_pbr_material_load_json(asset_path, &material, tex_paths))
         return false;
 
-    auto &mr = mesh_renderer_comp->data.mesh_renderer;
+    auto &mr = *mesh_renderer_comp;
     snprintf(mr.material_path, sizeof(mr.material_path), "%s", asset_path);
     mr.albedo_tex[0] = '\0';
     mr.mr_tex[0] = '\0';
@@ -355,14 +349,12 @@ static bool apply_material_asset_to_mesh_renderer(JceComponentInfo *mesh_rendere
 }
 
 static void apply_extracted_material_to_mesh_renderer(
-    JceComponentInfo *mesh_renderer_comp,
+    JceMeshRenderer *mesh_renderer_comp,
     const JceEditorMaterialInfo *material)
 {
-    if (!mesh_renderer_comp || mesh_renderer_comp->type != JCE_COMP_MESH_RENDERER
-        || !material)
-        return;
+    if (!mesh_renderer_comp || !material) return;
 
-    auto &mr = mesh_renderer_comp->data.mesh_renderer;
+    auto &mr = *mesh_renderer_comp;
     if (material->albedo_tex[0])
         snprintf(mr.albedo_tex, sizeof(mr.albedo_tex), "%s", material->albedo_tex);
     if (material->mr_tex[0])
@@ -405,13 +397,12 @@ static void flush_async_drop_material_extracts(void)
             continue;
         }
 
-        JceComponentInfo *mesh_renderer_comp =
+        JceMeshRenderer *mesh_renderer_comp =
             find_mesh_renderer_component(result.entity_id);
-        if (!mesh_renderer_comp || mesh_renderer_comp->type != JCE_COMP_MESH_RENDERER)
+        if (!mesh_renderer_comp)
             continue;
 
-        auto &mr = mesh_renderer_comp->data.mesh_renderer;
-        if (strcmp(mr.mesh_path, result.mesh_path) != 0)
+        if (strcmp(mesh_renderer_comp->mesh_path, result.mesh_path) != 0)
             continue;
 
         if (!transient_edit_open) {
@@ -455,24 +446,17 @@ static uint32_t pick_entity_at_mouse(ImVec2 screen_pos, ImVec2 avail)
     uint32_t best_id = 0;
     float    best_t  = 1e30f;
 
+    JceScene *scene = jce_state_get_scene();
     int total = jce_state_get_entity_count();
     for (int pi = 0; pi < total; pi++) {
-        JceEntityInfo *pe = jce_state_get_entity_by_index(pi);
-        if (!pe || !pe->enabled) continue;
+        uint32_t pid = jce_state_get_entity_id_by_index(pi);
+        if (pid == 0 || !jce_state_entity_exists(pid)) continue;
+        if (!jce_state_entity_enabled(pid)) continue;
 
-        JceComponentInfo pc[JCE_MAX_COMPONENTS];
-        int pcc = jce_state_get_components(pe->id, pc, JCE_MAX_COMPONENTS);
-        float pos[3] = {0,0,0}, scl[3] = {1,1,1};
-        bool has_xf = false;
-        for (int ci = 0; ci < pcc; ci++) {
-            if (pc[ci].type == JCE_COMP_TRANSFORM) {
-                memcpy(pos, pc[ci].data.transform.pos, sizeof(float) * 3);
-                memcpy(scl, pc[ci].data.transform.scale, sizeof(float) * 3);
-                has_xf = true;
-                break;
-            }
-        }
-        if (!has_xf) continue;
+        JceTransform *t = scene ? jce_scene_get_transform(scene, (JceEntity)pid) : NULL;
+        if (!t) continue;
+        float pos[3] = { t->position.x, t->position.y, t->position.z };
+        float scl[3] = { t->scale.x,    t->scale.y,    t->scale.z    };
 
         float hx = fabsf(scl[0]) * 0.5f;
         float hy = fabsf(scl[1]) * 0.5f;
@@ -484,15 +468,15 @@ static uint32_t pick_entity_at_mouse(ImVec2 screen_pos, ImVec2 avail)
         float bmin[3] = { pos[0]-hx, pos[1]-hy, pos[2]-hz };
         float bmax[3] = { pos[0]+hx, pos[1]+hy, pos[2]+hz };
 
-        float t;
+        float t_hit;
         jce_vec3 ro    = {{ ray_o[0], ray_o[1], ray_o[2] }};
         jce_vec3 rd    = {{ ray_d[0], ray_d[1], ray_d[2] }};
         jce_vec3 bminv = {{ bmin[0],  bmin[1],  bmin[2]  }};
         jce_vec3 bmaxv = {{ bmax[0],  bmax[1],  bmax[2]  }};
-        if (jce_ray_aabb_intersect(ro, rd, bminv, bmaxv, &t) && t >= 0.0f) {
-            if (t < best_t) {
-                best_t  = t;
-                best_id = pe->id;
+        if (jce_ray_aabb_intersect(ro, rd, bminv, bmaxv, &t_hit) && t_hit >= 0.0f) {
+            if (t_hit < best_t) {
+                best_t  = t_hit;
+                best_id = pid;
             }
         }
     }
@@ -587,7 +571,7 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail)
         /* ── Texture / material dropped onto an entity ──────────── */
         if (is_texture_or_material_asset(asset_path)) {
             uint32_t hit_id = pick_entity_at_mouse(screen_pos, avail);
-            JceComponentInfo *mesh_renderer_comp = find_mesh_renderer_component(hit_id);
+            JceMeshRenderer *mesh_renderer_comp = find_mesh_renderer_component(hit_id);
             if (mesh_renderer_comp) {
                 bool is_mat_json = false;
                 size_t path_len = strlen(asset_path);
@@ -618,27 +602,27 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail)
                 jce_editor_inspector_request_sync();
                 jce_editor_layout_request_focus_inspector();
 
-                JceEntityInfo *ent = jce_state_get_entity(hit_id);
+                const char *ent_name = jce_state_entity_name(hit_id);
                 if (is_mat_json) {
                     jce_editor_console_log(
                         "Applied material '%s' to entity '%s'",
-                        asset_path, ent ? ent->name : "?");
+                        asset_path, ent_name ? ent_name : "?");
                 } else {
                     jce_editor_console_log(
                         "Applied texture '%s' to entity '%s'",
-                        asset_path, ent ? ent->name : "?");
+                        asset_path, ent_name ? ent_name : "?");
                 }
             }
         }
         /* ── Mesh dropped onto an existing entity ───────────────── */
         else if (is_mesh_asset(asset_path)) {
             uint32_t hit_id = pick_entity_at_mouse(screen_pos, avail);
-            JceComponentInfo *mesh_renderer_comp = find_mesh_renderer_component(hit_id);
+            JceMeshRenderer *mesh_renderer_comp = find_mesh_renderer_component(hit_id);
             if (mesh_renderer_comp) {
                 /* Replace the existing entity's mesh + extract material. */
                 jce_state_begin_transient_edit();
                 {
-                    auto &mr = mesh_renderer_comp->data.mesh_renderer;
+                    auto &mr = *mesh_renderer_comp;
                     snprintf(mr.mesh_path, sizeof(mr.mesh_path),
                              "%s", asset_path);
                     mr.mesh_shape = 0;
@@ -658,10 +642,10 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail)
                 jce_editor_inspector_request_sync();
                 jce_editor_layout_request_focus_inspector();
 
-                JceEntityInfo *ent = jce_state_get_entity(hit_id);
+                const char *ent_name = jce_state_entity_name(hit_id);
                 jce_editor_console_log(
                     "Replaced mesh on '%s' with '%s'",
-                    ent ? ent->name : "?", asset_path);
+                    ent_name ? ent_name : "?", asset_path);
             } else {
                 /* ── Mesh dropped on empty space: create new entity ─ */
                 float drop_pos[3] = { 0.0f, 0.0f, 0.0f };
@@ -686,8 +670,10 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail)
                     while (!unique) {
                         unique = true;
                         for (int ei = 0; ei < total; ei++) {
-                            JceEntityInfo *ent = jce_state_get_entity_by_index(ei);
-                            if (ent && strcmp(ent->name, name_buf) == 0) {
+                            uint32_t eid = jce_state_get_entity_id_by_index(ei);
+                            if (eid == 0 || !jce_state_entity_exists(eid)) continue;
+                            const char *en = jce_state_entity_name(eid);
+                            if (en && strcmp(en, name_buf) == 0) {
                                 unique = false;
                                 snprintf(name_buf, sizeof(name_buf),
                                          "%s_%d", base, suffix++);
@@ -699,32 +685,29 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail)
 
                 jce_state_begin_transient_edit();
                 uint32_t id = create_default_scene_entity(name_buf, 0,
-                                                          JCE_COMP_MESH_RENDERER,
+                                                          JCE_COMP_FLAG_MESH_RENDERER,
                                                           JCE_MESH_SHAPE_CUBE);
                 if (id != 0) {
-                    int cc = 0;
-                    JceComponentInfo *comps =
-                        jce_state_get_entity_components(id, &cc);
-                    for (int i = 0; i < cc; i++) {
-                        if (comps[i].type == JCE_COMP_TRANSFORM) {
-                            comps[i].data.transform.pos[0] = drop_pos[0];
-                            comps[i].data.transform.pos[1] = drop_pos[1];
-                            comps[i].data.transform.pos[2] = drop_pos[2];
+                    JceScene *scene = jce_state_get_scene();
+                    if (scene) {
+                        JceTransform *t = jce_scene_get_transform(scene, (JceEntity)id);
+                        if (t) {
+                            t->position.x = drop_pos[0];
+                            t->position.y = drop_pos[1];
+                            t->position.z = drop_pos[2];
                         }
-                        if (comps[i].type != JCE_COMP_MESH_RENDERER)
-                            continue;
-
-                        auto &mr = comps[i].data.mesh_renderer;
-                        snprintf(mr.mesh_path, sizeof(mr.mesh_path),
-                                 "%s", asset_path);
-                        mr.mesh_shape = 0;
-                        mr.material_path[0] = '\0';
-                        mr.albedo_tex[0] = '\0';
-                        mr.mr_tex[0] = '\0';
-                        mr.normal_tex[0] = '\0';
-                        mr.ao_tex[0] = '\0';
-                        mr.emissive_tex[0] = '\0';
-                        break;
+                        JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, (JceEntity)id);
+                        if (mr) {
+                            snprintf(mr->mesh_path, sizeof(mr->mesh_path),
+                                     "%s", asset_path);
+                            mr->mesh_shape = 0;
+                            mr->material_path[0] = '\0';
+                            mr->albedo_tex[0] = '\0';
+                            mr->mr_tex[0] = '\0';
+                            mr->normal_tex[0] = '\0';
+                            mr->ao_tex[0] = '\0';
+                            mr->emissive_tex[0] = '\0';
+                        }
                     }
 
                     jce_editor_scene_asset_cache_queue_material_extract(
@@ -742,42 +725,34 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail)
         /* ── HDR dropped: set as skybox ────────────────────────────── */
         else if (is_hdr_asset(asset_path)) {
             /* Find existing entity with Skybox component, or create one. */
+            JceScene *scene = jce_state_get_scene();
             uint32_t sky_id = 0;
             int ent_count = jce_state_get_entity_count();
             for (int ei = 0; ei < ent_count; ei++) {
-                JceEntityInfo *ent = jce_state_get_entity_by_index(ei);
-                if (!ent) continue;
-                int cc = 0;
-                JceComponentInfo *comps =
-                    jce_state_get_entity_components(ent->id, &cc);
-                for (int ci = 0; ci < cc; ci++) {
-                    if (comps[ci].type == JCE_COMP_SKYBOX) {
-                        sky_id = ent->id;
-                        break;
-                    }
+                uint32_t eid = jce_state_get_entity_id_by_index(ei);
+                if (eid == 0 || !jce_state_entity_exists(eid)) continue;
+                if (scene && jce_scene_has_skybox(scene, (JceEntity)eid)) {
+                    sky_id = eid;
+                    break;
                 }
-                if (sky_id) break;
             }
 
             jce_state_begin_batch_edit();
             if (!sky_id) {
                 sky_id = jce_state_create_entity("Skybox", 0);
                 if (sky_id)
-                    jce_state_add_component(sky_id, JCE_COMP_SKYBOX);
+                    jce_state_add_component(sky_id, JCE_COMP_FLAG_SKYBOX);
             }
             if (sky_id) {
-                int cc = 0;
-                JceComponentInfo *comps =
-                    jce_state_get_entity_components(sky_id, &cc);
-                for (int ci = 0; ci < cc; ci++) {
-                    if (comps[ci].type == JCE_COMP_SKYBOX) {
-                        snprintf(comps[ci].data.skybox.hdr_path,
-                                 sizeof(comps[ci].data.skybox.hdr_path),
-                                 "%s", asset_path);
-                        if (comps[ci].data.skybox.exposure <= 0.0f)
-                            comps[ci].data.skybox.exposure = 1.0f;
-                        break;
-                    }
+                scene = jce_state_get_scene();
+                JceSkyboxComponent *sky = scene
+                    ? jce_scene_get_skybox(scene, (JceEntity)sky_id)
+                    : NULL;
+                if (sky) {
+                    snprintf(sky->hdr_path, sizeof(sky->hdr_path),
+                             "%s", asset_path);
+                    if (sky->exposure <= 0.0f)
+                        sky->exposure = 1.0f;
                 }
                 jce_state_select_entity(sky_id, false);
                 jce_editor_inspector_request_sync();
@@ -818,7 +793,7 @@ static void draw_scene_context_menu(const SceneViewCtx *ctx)
         if (ImGui::BeginMenu(jce_editor_i18n("dialog.create"))) {
             if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.createEmpty"))) {
                 uint32_t id = create_default_scene_entity("New Entity", 0,
-                                                          JCE_COMP_TYPE_COUNT,
+                                                          0,
                                                           JCE_MESH_SHAPE_CUBE);
                 jce_state_select_entity(id, false);
                 jce_editor_inspector_request_sync();
@@ -830,7 +805,7 @@ static void draw_scene_context_menu(const SceneViewCtx *ctx)
             if (ImGui::BeginMenu(jce_editor_i18n("hierarchy.create2D"))) {
                 if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.createSprite"))) {
                     uint32_t id = create_default_scene_entity("Sprite", 0,
-                                                              JCE_COMP_SPRITE_RENDERER,
+                                                              JCE_COMP_FLAG_SPRITE_RENDERER,
                                                               JCE_MESH_SHAPE_CUBE);
                     jce_state_select_entity(id, false);
                     jce_editor_inspector_request_sync();
@@ -838,7 +813,7 @@ static void draw_scene_context_menu(const SceneViewCtx *ctx)
                 }
                 if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.createText"))) {
                     uint32_t id = create_default_scene_entity("UI Text", 0,
-                                                              JCE_COMP_TYPE_COUNT,
+                                                              0,
                                                               JCE_MESH_SHAPE_CUBE);
                     jce_state_select_entity(id, false);
                     jce_editor_inspector_request_sync();
@@ -850,7 +825,7 @@ static void draw_scene_context_menu(const SceneViewCtx *ctx)
             if (ImGui::BeginMenu(jce_editor_i18n("hierarchy.create3D"))) {
                 if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.createCube"))) {
                     uint32_t id = create_default_scene_entity("Cube", 0,
-                                                              JCE_COMP_MESH_RENDERER,
+                                                              JCE_COMP_FLAG_MESH_RENDERER,
                                                               JCE_MESH_SHAPE_CUBE);
                     jce_state_select_entity(id, false);
                     jce_editor_inspector_request_sync();
@@ -858,7 +833,7 @@ static void draw_scene_context_menu(const SceneViewCtx *ctx)
                 }
                 if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.createSphere"))) {
                     uint32_t id = create_default_scene_entity("Sphere", 0,
-                                                              JCE_COMP_MESH_RENDERER,
+                                                              JCE_COMP_FLAG_MESH_RENDERER,
                                                               JCE_MESH_SHAPE_SPHERE);
                     jce_state_select_entity(id, false);
                     jce_editor_inspector_request_sync();
@@ -866,7 +841,7 @@ static void draw_scene_context_menu(const SceneViewCtx *ctx)
                 }
                 if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.createPlane"))) {
                     uint32_t id = create_default_scene_entity("Plane", 0,
-                                                              JCE_COMP_MESH_RENDERER,
+                                                              JCE_COMP_FLAG_MESH_RENDERER,
                                                               JCE_MESH_SHAPE_PLANE);
                     jce_state_select_entity(id, false);
                     jce_editor_inspector_request_sync();
@@ -874,7 +849,7 @@ static void draw_scene_context_menu(const SceneViewCtx *ctx)
                 }
                 if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.createCylinder"))) {
                     uint32_t id = create_default_scene_entity("Cylinder", 0,
-                                                              JCE_COMP_MESH_RENDERER,
+                                                              JCE_COMP_FLAG_MESH_RENDERER,
                                                               JCE_MESH_SHAPE_CYLINDER);
                     jce_state_select_entity(id, false);
                     jce_editor_inspector_request_sync();
@@ -887,7 +862,7 @@ static void draw_scene_context_menu(const SceneViewCtx *ctx)
 
             if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.createCamera"))) {
                 uint32_t id = create_default_scene_entity("Camera", 0,
-                                                          JCE_COMP_CAMERA,
+                                                          JCE_COMP_FLAG_CAMERA,
                                                           JCE_MESH_SHAPE_CUBE);
                 jce_state_select_entity(id, false);
                 jce_editor_inspector_request_sync();
@@ -895,7 +870,7 @@ static void draw_scene_context_menu(const SceneViewCtx *ctx)
             }
             if (ImGui::MenuItem(jce_editor_i18n("menu.gameObject.createLight"))) {
                 uint32_t id = create_default_scene_entity("Light", 0,
-                                                          JCE_COMP_LIGHT,
+                                                          JCE_COMP_FLAG_DIR_LIGHT,
                                                           JCE_MESH_SHAPE_CUBE);
                 jce_state_select_entity(id, false);
                 jce_editor_inspector_request_sync();
@@ -946,16 +921,13 @@ static void draw_scene_context_menu(const SceneViewCtx *ctx)
 
             if (ImGui::MenuItem(jce_editor_i18n("scene.focusSelected"), "F")) {
                 if (focused != 0) {
-                    int fc = 0;
-                    JceComponentInfo *fcomps = jce_state_get_entity_components(focused, &fc);
-                    for (int fi = 0; fi < fc; fi++) {
-                        if (fcomps[fi].type == JCE_COMP_TRANSFORM) {
-                            jce_editor_scene_camera_set_target(
-                                fcomps[fi].data.transform.pos[0],
-                                fcomps[fi].data.transform.pos[1],
-                                fcomps[fi].data.transform.pos[2]);
-                            break;
-                        }
+                    JceScene *scene = jce_state_get_scene();
+                    JceTransform *t = scene
+                        ? jce_scene_get_transform(scene, (JceEntity)focused)
+                        : NULL;
+                    if (t) {
+                        jce_editor_scene_camera_set_target(
+                            t->position.x, t->position.y, t->position.z);
                     }
                 }
             }
@@ -1037,16 +1009,13 @@ static void handle_scene_view_shortcuts(void)
         if (ImGui::IsKeyPressed(ImGuiKey_F)) {
             uint32_t f_ent = jce_state_get_focused();
             if (f_ent != 0) {
-                int fc = 0;
-                JceComponentInfo *fcomps = jce_state_get_entity_components(f_ent, &fc);
-                for (int fi = 0; fi < fc; fi++) {
-                    if (fcomps[fi].type == JCE_COMP_TRANSFORM) {
-                        jce_editor_scene_camera_set_target(
-                            fcomps[fi].data.transform.pos[0],
-                            fcomps[fi].data.transform.pos[1],
-                            fcomps[fi].data.transform.pos[2]);
-                        break;
-                    }
+                JceScene *scene = jce_state_get_scene();
+                JceTransform *t = scene
+                    ? jce_scene_get_transform(scene, (JceEntity)f_ent)
+                    : NULL;
+                if (t) {
+                    jce_editor_scene_camera_set_target(
+                        t->position.x, t->position.y, t->position.z);
                 }
             }
         }
@@ -1103,30 +1072,17 @@ static void handle_marquee_selection(const SceneViewCtx *ctx,
     bool add_mode = ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift;
     if (!add_mode) jce_state_clear_selection();
 
+    JceScene *scene = jce_state_get_scene();
     int total = jce_state_get_entity_count();
     for (int mi = 0; mi < total; mi++) {
-        JceEntityInfo *me = jce_state_get_entity_by_index(mi);
-        if (!me || !me->enabled) continue;
-        uint32_t meid = me->id;
+        uint32_t meid = jce_state_get_entity_id_by_index(mi);
+        if (meid == 0 || !jce_state_entity_exists(meid)) continue;
+        if (!jce_state_entity_enabled(meid)) continue;
 
-        JceComponentInfo me_comps[JCE_MAX_COMPONENTS];
-        int me_cc = jce_state_get_components(meid, me_comps, JCE_MAX_COMPONENTS);
-        float mwp[3] = {0, 0, 0};
-        float mws[3] = {1, 1, 1};
-        bool has_xf = false;
-        for (int mci = 0; mci < me_cc; mci++) {
-            if (me_comps[mci].type == JCE_COMP_TRANSFORM) {
-                mwp[0] = me_comps[mci].data.transform.pos[0];
-                mwp[1] = me_comps[mci].data.transform.pos[1];
-                mwp[2] = me_comps[mci].data.transform.pos[2];
-                mws[0] = me_comps[mci].data.transform.scale[0];
-                mws[1] = me_comps[mci].data.transform.scale[1];
-                mws[2] = me_comps[mci].data.transform.scale[2];
-                has_xf = true;
-                break;
-            }
-        }
-        if (!has_xf) continue;
+        JceTransform *t = scene ? jce_scene_get_transform(scene, (JceEntity)meid) : NULL;
+        if (!t) continue;
+        float mwp[3] = { t->position.x, t->position.y, t->position.z };
+        float mws[3] = { t->scale.x,    t->scale.y,    t->scale.z    };
 
         float hx = fabsf(mws[0]) * 0.5f;
         float hy = fabsf(mws[1]) * 0.5f;
@@ -1209,27 +1165,17 @@ static void handle_ray_pick(const SceneViewCtx *ctx,
     uint32_t best_id = 0;
     float    best_t  = 1e30f;
 
+    JceScene *scene = jce_state_get_scene();
     int total = jce_state_get_entity_count();
     for (int pi = 0; pi < total; pi++) {
-        JceEntityInfo *pe = jce_state_get_entity_by_index(pi);
-        if (!pe || !pe->enabled) continue;
+        uint32_t pid = jce_state_get_entity_id_by_index(pi);
+        if (pid == 0 || !jce_state_entity_exists(pid)) continue;
+        if (!jce_state_entity_enabled(pid)) continue;
 
-        JceComponentInfo pc[JCE_MAX_COMPONENTS];
-        int pcc = jce_state_get_components(pe->id, pc,
-                                           JCE_MAX_COMPONENTS);
-        float pos[3] = {0,0,0}, scl[3] = {1,1,1};
-        bool has_xf = false;
-        for (int ci = 0; ci < pcc; ci++) {
-            if (pc[ci].type == JCE_COMP_TRANSFORM) {
-                memcpy(pos, pc[ci].data.transform.pos,
-                       sizeof(float) * 3);
-                memcpy(scl, pc[ci].data.transform.scale,
-                       sizeof(float) * 3);
-                has_xf = true;
-                break;
-            }
-        }
-        if (!has_xf) continue;
+        JceTransform *xf = scene ? jce_scene_get_transform(scene, (JceEntity)pid) : NULL;
+        if (!xf) continue;
+        float pos[3] = { xf->position.x, xf->position.y, xf->position.z };
+        float scl[3] = { xf->scale.x,    xf->scale.y,    xf->scale.z    };
 
         float hx = fabsf(scl[0]) * 0.5f;
         float hy = fabsf(scl[1]) * 0.5f;
@@ -1249,7 +1195,7 @@ static void handle_ray_pick(const SceneViewCtx *ctx,
         if (jce_ray_aabb_intersect(ro, rd, bmin_v, bmax_v, &t) && t >= 0.0f) {
             if (t < best_t) {
                 best_t  = t;
-                best_id = pe->id;
+                best_id = pid;
             }
         }
     }
@@ -1274,23 +1220,14 @@ static void draw_selection_outlines(const SceneViewCtx *ctx,
 {
     int sel_count = 0;
     const uint32_t *sel_ids = jce_state_get_selection(&sel_count);
+    JceScene *scene = jce_state_get_scene();
     for (int si = 0; si < sel_count; si++) {
-        JceEntityInfo *se = jce_state_get_entity(sel_ids[si]);
-        if (!se || !se->enabled) continue;
-        JceComponentInfo se_comps[JCE_MAX_COMPONENTS];
-        int se_cc = jce_state_get_components(sel_ids[si], se_comps, JCE_MAX_COMPONENTS);
-        float swp[3] = {0, 0, 0};
-        bool has_sxf = false;
-        for (int sci = 0; sci < se_cc; sci++) {
-            if (se_comps[sci].type == JCE_COMP_TRANSFORM) {
-                swp[0] = se_comps[sci].data.transform.pos[0];
-                swp[1] = se_comps[sci].data.transform.pos[1];
-                swp[2] = se_comps[sci].data.transform.pos[2];
-                has_sxf = true;
-                break;
-            }
-        }
-        if (!has_sxf) continue;
+        uint32_t sid = sel_ids[si];
+        if (sid == 0 || !jce_state_entity_exists(sid)) continue;
+        if (!jce_state_entity_enabled(sid)) continue;
+        JceTransform *t = scene ? jce_scene_get_transform(scene, (JceEntity)sid) : NULL;
+        if (!t) continue;
+        float swp[3] = { t->position.x, t->position.y, t->position.z };
 
         float svx = view_mat[0]*swp[0] + view_mat[4]*swp[1] + view_mat[8] *swp[2] + view_mat[12];
         float svy = view_mat[1]*swp[0] + view_mat[5]*swp[1] + view_mat[9] *swp[2] + view_mat[13];

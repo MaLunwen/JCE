@@ -160,38 +160,31 @@ static float nearest_hit_along_view_ray(void)
 
     float best_t = 1e30f;
     int total = jce_state_get_entity_count();
+    JceScene *scene = jce_state_get_scene();
+    if (!scene) return best_t;
 
     for (int i = 0; i < total; i++) {
-        JceEntityInfo *ent = jce_state_get_entity_by_index(i);
-        if (!ent || !ent->enabled) continue;
+        uint32_t id = jce_state_get_entity_id_by_index(i);
+        if (id == 0 || !jce_state_entity_exists(id)) continue;
+        if (!jce_state_entity_enabled(id)) continue;
 
-        JceComponentInfo pc[JCE_MAX_COMPONENTS];
-        int pcc = jce_state_get_components(ent->id, pc, JCE_MAX_COMPONENTS);
-        float pos[3] = {0,0,0}, scl[3] = {1,1,1};
-        bool has_xf = false;
-        for (int ci = 0; ci < pcc; ci++) {
-            if (pc[ci].type == JCE_COMP_TRANSFORM) {
-                memcpy(pos, pc[ci].data.transform.pos, sizeof(float) * 3);
-                memcpy(scl, pc[ci].data.transform.scale, sizeof(float) * 3);
-                has_xf = true;
-                break;
-            }
-        }
-        if (!has_xf) continue;
+        JceEntity e = (JceEntity)id;
+        JceTransform *t = jce_scene_get_transform(scene, e);
+        if (!t) continue;
 
-        float hx = fabsf(scl[0]) * 0.5f;
-        float hy = fabsf(scl[1]) * 0.5f;
-        float hz = fabsf(scl[2]) * 0.5f;
+        float hx = fabsf(t->scale.x) * 0.5f;
+        float hy = fabsf(t->scale.y) * 0.5f;
+        float hz = fabsf(t->scale.z) * 0.5f;
         if (hx < 0.1f) hx = 0.1f;
         if (hy < 0.1f) hy = 0.1f;
         if (hz < 0.1f) hz = 0.1f;
 
-        jce_vec3 bmin = {{ pos[0]-hx, pos[1]-hy, pos[2]-hz }};
-        jce_vec3 bmax = {{ pos[0]+hx, pos[1]+hy, pos[2]+hz }};
+        jce_vec3 bmin = {{ t->position.x - hx, t->position.y - hy, t->position.z - hz }};
+        jce_vec3 bmax = {{ t->position.x + hx, t->position.y + hy, t->position.z + hz }};
 
-        float t;
-        if (jce_ray_aabb_intersect(eye, dir, bmin, bmax, &t) && t >= 0.0f) {
-            if (t < best_t) best_t = t;
+        float th;
+        if (jce_ray_aabb_intersect(eye, dir, bmin, bmax, &th) && th >= 0.0f) {
+            if (th < best_t) best_t = th;
         }
     }
     return best_t;

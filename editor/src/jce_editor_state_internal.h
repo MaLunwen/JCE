@@ -4,6 +4,10 @@
  * Included by all jce_editor_state_*.cpp files.  Not part of the public API.
  * Contains the editor internal state struct, history types, and forward
  * declarations for cross-file functions.
+ *
+ * After the ECS-direct refactor, the engine's JceScene (flecs) is the single
+ * source of truth for all entity / component data.  The editor keeps only
+ * UI-specific state (selection, modes, undo history, sidecar fold flags).
  */
 
 #ifndef JCE_EDITOR_STATE_INTERNAL_H
@@ -23,6 +27,7 @@
 #include <vector>
 #include <string>
 #include <utility>
+#include <unordered_map>
 
 extern "C" {
 #include <jce/core/jce_log.h>
@@ -51,19 +56,27 @@ struct EditorInternalState {
 	bool             show_grid;
 	bool             is_2d_mode;
 	bool             live_preview;
-    bool             scene_modified;
-	/* Entity storage (demo data, replaced by ECS later). */
-	JceEntityInfo    entities[JCE_MAX_ENTITIES];
-	JceComponentInfo components[JCE_MAX_ENTITIES][JCE_MAX_COMPONENTS];
-	int              entity_count;
-	uint32_t         next_id;
-	JceScene        *scene;                    /* engine ECS backing store */
+	bool             scene_modified;
+
+	/* ECS backing store – the single source of truth. */
+	JceScene        *scene;
 	char             current_scene_path[512];
 
 	bool initialized;
 };
 
 extern EditorInternalState s;
+
+/* ── Entity order list (kept in sync with ECS) ────────────────────── */
+/* Maintains creation / load order for index-based iteration.
+   Rebuilt from ECS on scene load / undo; updated on create/delete. */
+extern std::vector<uint32_t> g_entity_order;
+
+/* ── Editor per-entity sidecar (UI-only state) ────────────────────── */
+struct EditorEntitySidecar {
+	uint32_t expanded_flags = 0xFFFFFFFFu; /* Inspector fold state bitmask */
+};
+extern std::unordered_map<uint32_t, EditorEntitySidecar> g_entity_sidecar;
 
 /* ── History Snapshot ──────────────────────────────────────────────── */
 
@@ -92,11 +105,10 @@ extern EditorTransaction s_transaction;
 
 /* ── Core helpers (defined in jce_editor_state.cpp) ───────────────── */
 
-int  find_entity(uint32_t id);
-void jce_state_rebuild_id_map(void);
 void set_current_scene_path_internal(const char *scene_path);
 void update_scene_dir_from_path(const char *scene_path);
 void clear_scene_entities(void);
+void rebuild_entity_order_from_ecs(void);
 
 /* ── History functions (defined in jce_editor_history.cpp) ─────────── */
 
@@ -109,7 +121,6 @@ bool history_restore_snapshot(const EditorHistorySnapshot &snapshot,
 
 /* ── Scene parse functions (defined in jce_editor_scene_parse.cpp) ── */
 
-JceComponentType component_type_from_name(const char *name);
 uint32_t load_entity_tree_node(const cJSON *node, uint32_t parent_id);
 bool     looks_like_entity_object(const cJSON *obj);
 bool     parse_scene_contract_version(const cJSON *root,
@@ -120,13 +131,28 @@ bool     load_scene_from_parsed_root(const cJSON *root,
 
 /* ── Scene serial functions (defined in jce_editor_scene_serial.cpp) ─ */
 
-cJSON       *serialize_component_json(const JceComponentInfo *comp);
 cJSON       *serialize_entity_tree_json(uint32_t entity_id);
 cJSON       *build_scene_json_root(void);
 cJSON       *build_prefab_json_root(uint32_t entity_id);
 const cJSON *find_prefab_root_node(const cJSON *root);
 void         mark_prefab_instance_recursive(uint32_t entity_id,
                                             const char *prefab_path);
+
+/* ── Euler ↔ Quaternion helpers (degrees) ─────────────────────────── */
+
+static inline void jce_q_to_euler_deg(jce_quat q, float out[3])
+{
+	jce_vec3 e = jce_q_to_euler(q);
+	out[0] = e.x * JCE_RAD2DEG;
+	out[1] = e.y * JCE_RAD2DEG;
+	out[2] = e.z * JCE_RAD2DEG;
+}
+static inline jce_quat jce_q_from_euler_deg(const float in[3])
+{
+	return jce_q_from_euler(in[0] * JCE_DEG2RAD,
+	                        in[1] * JCE_DEG2RAD,
+	                        in[2] * JCE_DEG2RAD);
+}
 
 /* ── RAII Scopes ──────────────────────────────────────────────────── */
 

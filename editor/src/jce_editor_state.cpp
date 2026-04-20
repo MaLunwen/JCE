@@ -3,16 +3,21 @@
  *
  * Defines the global editor state struct, selection, entity CRUD,
  * component management, mode accessors, and demo scene builder.
- * Parsing, serialization, history, play mode, and prefabs live in
- * their own jce_editor_*.cpp files.
+ *
+ * After the ECS-direct refactor, the engine's JceScene (flecs) is the
+ * single source of truth for all entity / component data.  The editor
+ * keeps only UI-specific state (selection, modes, undo history, sidecar
+ * fold flags) and an order vector for stable iteration / sibling ordering.
+ *
+ * Parsing, serialization, history, play mode, and prefabs live in their
+ * own jce_editor_*.cpp files.
  */
 
 #include "jce_editor_state_internal.h"
-#include "jce_editor_ecs_adapter.h"
 #include "jce_editor_i18n.h"
 #include "jce_editor_config.h"
 
-#include <unordered_map>
+#include <algorithm>
 
 /* Forward-declare only the one function we need from scene_render,
    avoiding a full include that creates a cpp-level circular dependency. */
@@ -21,6 +26,9 @@ extern "C" void jce_editor_scene_set_scene_dir(const char *dir);
 /* ── Global State Definitions ─────────────────────────────────────── */
 
 EditorInternalState s;
+
+std::vector<uint32_t>                              g_entity_order;
+std::unordered_map<uint32_t, EditorEntitySidecar>  g_entity_sidecar;
 
 std::vector<EditorHistorySnapshot> s_undo_history;
 std::vector<EditorHistorySnapshot> s_redo_history;
@@ -32,28 +40,26 @@ int  s_history_transient_batch_depth = 0;
 
 EditorTransaction s_transaction;
 
-/* ── O(1) entity lookup map ───────────────────────────────────────── */
-/*
- * ECS is the authoritative store for all entity/component data.
- * The editor arrays (s.entities[], s.components[][]) are a synchronised
- * cache populated from ECS on load/undo and kept in sync by CRUD ops.
- * This map accelerates the cache lookup from O(n) to O(1).
- */
+/* ── Internal helpers ─────────────────────────────────────────────── */
 
-static std::unordered_map<uint32_t, int> s_id_to_idx;
-
-int find_entity(uint32_t id)
+static void erase_from_order(uint32_t id)
 {
-	auto it = s_id_to_idx.find(id);
-	return it != s_id_to_idx.end() ? it->second : -1;
+	auto it = std::find(g_entity_order.begin(), g_entity_order.end(), id);
+	if (it != g_entity_order.end())
+		g_entity_order.erase(it);
 }
 
-void jce_state_rebuild_id_map(void)
+static void rebuild_order_cb(JceScene * /*scene*/, JceEntity e, void *user_data)
 {
-	s_id_to_idx.clear();
-	s_id_to_idx.reserve(s.entity_count);
-	for (int i = 0; i < s.entity_count; i++)
-		s_id_to_idx[s.entities[i].id] = i;
+	auto *out = static_cast<std::vector<uint32_t> *>(user_data);
+	out->push_back((uint32_t)e);
+}
+
+void rebuild_entity_order_from_ecs(void)
+{
+	g_entity_order.clear();
+	if (!s.scene) return;
+	jce_scene_each_entity(s.scene, rebuild_order_cb, &g_entity_order);
 }
 
 void set_current_scene_path_internal(const char *scene_path)
@@ -93,27 +99,38 @@ void update_scene_dir_from_path(const char *scene_path)
 
 void clear_scene_entities(void)
 {
+	g_entity_order.clear();
+	g_entity_sidecar.clear();
+
 	/* Destroy and recreate engine scene to clear all ECS entities. */
 	if (s.scene) {
 		jce_scene_destroy(s.scene);
 		s.scene = jce_scene_create();
 	}
-	s.entity_count = 0;
-	s.next_id = 1;
-	s_id_to_idx.clear();
 	jce_state_clear_selection();
 }
 
 /* ── Demo scene builder ──────────────────────────────────────────── */
 
-/* Helper: return mutable pointer to a component the entity already has. */
-static JceComponentInfo *find_comp(uint32_t eid, JceComponentType type)
+static void demo_set_position(uint32_t id, float x, float y, float z)
 {
-	int count = 0;
-	JceComponentInfo *comps = jce_state_get_entity_components(eid, &count);
-	for (int i = 0; i < count; i++)
-		if (comps[i].type == type) return &comps[i];
-	return NULL;
+	JceTransform *t = jce_scene_get_transform(s.scene, (JceEntity)id);
+	if (!t) return;
+	t->position = jce_v3(x, y, z);
+}
+
+static void demo_set_scale(uint32_t id, float x, float y, float z)
+{
+	JceTransform *t = jce_scene_get_transform(s.scene, (JceEntity)id);
+	if (!t) return;
+	t->scale = jce_v3(x, y, z);
+}
+
+static void demo_set_mesh_shape(uint32_t id, int shape)
+{
+	JceMeshRenderer *m = jce_scene_get_mesh_renderer(s.scene, (JceEntity)id);
+	if (!m) return;
+	m->mesh_shape = shape;
 }
 
 static void build_demo_scene(void)
@@ -123,96 +140,49 @@ static void build_demo_scene(void)
 	uint32_t root = jce_state_create_entity("Scene Root", 0);
 
 	uint32_t cam = jce_state_create_entity("Main Camera", root);
-	jce_state_add_component(cam, JCE_COMP_TRANSFORM);
-	if (JceComponentInfo *t = find_comp(cam, JCE_COMP_TRANSFORM)) {
-		t->data.transform.pos[1] = 5.0f;
-		t->data.transform.pos[2] = 10.0f;
-		jce_state_set_component(cam, t);
-	}
-	jce_state_add_component(cam, JCE_COMP_CAMERA);
+	demo_set_position(cam, 0.0f, 5.0f, 10.0f);
+	jce_state_add_component(cam, JCE_COMP_FLAG_CAMERA);
 
 	uint32_t lights = jce_state_create_entity("Lights", root);
 	uint32_t dir_light = jce_state_create_entity("Directional Light", lights);
-	jce_state_add_component(dir_light, JCE_COMP_TRANSFORM);
-	jce_state_add_component(dir_light, JCE_COMP_LIGHT);
+	jce_state_add_component(dir_light, JCE_COMP_FLAG_DIR_LIGHT);
 
 	uint32_t pt_light = jce_state_create_entity("Point Light", lights);
-	jce_state_add_component(pt_light, JCE_COMP_TRANSFORM);
-	jce_state_add_component(pt_light, JCE_COMP_LIGHT);
-	if (JceComponentInfo *l = find_comp(pt_light, JCE_COMP_LIGHT)) {
-		l->data.light.type = 1;
-		jce_state_set_component(pt_light, l);
-	}
+	jce_state_add_component(pt_light, JCE_COMP_FLAG_POINT_LIGHT);
 
 	uint32_t objs = jce_state_create_entity("Objects", root);
+
 	uint32_t cube = jce_state_create_entity("Cube", objs);
-	jce_state_add_component(cube, JCE_COMP_TRANSFORM);
-	jce_state_add_component(cube, JCE_COMP_MESH_RENDERER);
-	if (JceComponentInfo *t = find_comp(cube, JCE_COMP_TRANSFORM)) {
-		t->data.transform.pos[1] = 0.5f;
-		jce_state_set_component(cube, t);
-	}
+	jce_state_add_component(cube, JCE_COMP_FLAG_MESH_RENDERER);
+	demo_set_position(cube, 0.0f, 0.5f, 0.0f);
 
 	uint32_t sphere = jce_state_create_entity("Sphere", objs);
-	jce_state_add_component(sphere, JCE_COMP_TRANSFORM);
-	jce_state_add_component(sphere, JCE_COMP_MESH_RENDERER);
-	if (JceComponentInfo *t = find_comp(sphere, JCE_COMP_TRANSFORM)) {
-		t->data.transform.pos[0] = 2.5f;
-		t->data.transform.pos[1] = 0.5f;
-		jce_state_set_component(sphere, t);
-	}
-	if (JceComponentInfo *m = find_comp(sphere, JCE_COMP_MESH_RENDERER)) {
-		m->data.mesh_renderer.mesh_shape = JCE_MESH_SHAPE_SPHERE;
-		jce_state_set_component(sphere, m);
-	}
+	jce_state_add_component(sphere, JCE_COMP_FLAG_MESH_RENDERER);
+	demo_set_position(sphere, 2.5f, 0.5f, 0.0f);
+	demo_set_mesh_shape(sphere, 1 /* sphere */);
 
 	uint32_t plane = jce_state_create_entity("Plane", objs);
-	jce_state_add_component(plane, JCE_COMP_TRANSFORM);
-	jce_state_add_component(plane, JCE_COMP_MESH_RENDERER);
-	if (JceComponentInfo *t = find_comp(plane, JCE_COMP_TRANSFORM)) {
-		t->data.transform.pos[0] = -2.5f;
-		t->data.transform.scale[0] = 3.0f;
-		t->data.transform.scale[1] = 3.0f;
-		t->data.transform.scale[2] = 3.0f;
-		jce_state_set_component(plane, t);
-	}
-	if (JceComponentInfo *m = find_comp(plane, JCE_COMP_MESH_RENDERER)) {
-		m->data.mesh_renderer.mesh_shape = JCE_MESH_SHAPE_PLANE;
-		jce_state_set_component(plane, m);
-	}
+	jce_state_add_component(plane, JCE_COMP_FLAG_MESH_RENDERER);
+	demo_set_position(plane, -2.5f, 0.0f, 0.0f);
+	demo_set_scale(plane, 3.0f, 3.0f, 3.0f);
+	demo_set_mesh_shape(plane, 2 /* plane */);
 
 	uint32_t capsule = jce_state_create_entity("Capsule (no texture)", objs);
-	jce_state_add_component(capsule, JCE_COMP_TRANSFORM);
-	jce_state_add_component(capsule, JCE_COMP_MESH_RENDERER);
-	if (JceComponentInfo *t = find_comp(capsule, JCE_COMP_TRANSFORM)) {
-		t->data.transform.pos[0] = -2.5f;
-		t->data.transform.pos[1] = 1.0f;
-		t->data.transform.pos[2] = 2.0f;
-		jce_state_set_component(capsule, t);
-	}
-	if (JceComponentInfo *m = find_comp(capsule, JCE_COMP_MESH_RENDERER)) {
-		m->data.mesh_renderer.mesh_shape = JCE_MESH_SHAPE_CAPSULE;
-		jce_state_set_component(capsule, m);
-	}
+	jce_state_add_component(capsule, JCE_COMP_FLAG_MESH_RENDERER);
+	demo_set_position(capsule, -2.5f, 1.0f, 2.0f);
+	demo_set_mesh_shape(capsule, 3 /* capsule */);
 
 	uint32_t cylinder = jce_state_create_entity("Cylinder (textured)", objs);
-	jce_state_add_component(cylinder, JCE_COMP_TRANSFORM);
-	jce_state_add_component(cylinder, JCE_COMP_MESH_RENDERER);
-	if (JceComponentInfo *t = find_comp(cylinder, JCE_COMP_TRANSFORM)) {
-		t->data.transform.pos[0] = 2.5f;
-		t->data.transform.pos[1] = 0.5f;
-		t->data.transform.pos[2] = 2.0f;
-		jce_state_set_component(cylinder, t);
-	}
-	if (JceComponentInfo *m = find_comp(cylinder, JCE_COMP_MESH_RENDERER)) {
-		m->data.mesh_renderer.mesh_shape = JCE_MESH_SHAPE_CYLINDER;
-		m->data.mesh_renderer.base_color[0] = 0.2f;
-		m->data.mesh_renderer.base_color[1] = 0.6f;
-		m->data.mesh_renderer.base_color[2] = 0.9f;
-		m->data.mesh_renderer.base_color[3] = 1.0f;
-		m->data.mesh_renderer.metallic  = 0.3f;
-		m->data.mesh_renderer.roughness = 0.5f;
-		jce_state_set_component(cylinder, m);
+	jce_state_add_component(cylinder, JCE_COMP_FLAG_MESH_RENDERER);
+	demo_set_position(cylinder, 2.5f, 0.5f, 2.0f);
+	demo_set_mesh_shape(cylinder, 4 /* cylinder */);
+	if (JceMeshRenderer *m = jce_scene_get_mesh_renderer(s.scene, (JceEntity)cylinder)) {
+		m->base_color[0] = 0.2f;
+		m->base_color[1] = 0.6f;
+		m->base_color[2] = 0.9f;
+		m->base_color[3] = 1.0f;
+		m->metallic  = 0.3f;
+		m->roughness = 0.5f;
 	}
 
 	uint32_t ui = jce_state_create_entity("UI", root);
@@ -224,6 +194,8 @@ static void build_demo_scene(void)
 void jce_editor_state_init(void)
 {
 	memset(&s, 0, sizeof(s));
+	g_entity_order.clear();
+	g_entity_sidecar.clear();
 	s_undo_history.clear();
 	s_redo_history.clear();
 	s_history_suspend_depth = 0;
@@ -270,11 +242,14 @@ void jce_editor_state_init(void)
 	}
 
 	s.initialized = true;
-	LOG_INFO(LOG_TAG, "editor state initialized (%d demo entities)", s.entity_count);
+	LOG_INFO(LOG_TAG, "editor state initialized (%d demo entities)",
+	         (int)g_entity_order.size());
 }
 
 void jce_editor_state_shutdown(void)
 {
+	g_entity_order.clear();
+	g_entity_sidecar.clear();
 	s_undo_history.clear();
 	s_redo_history.clear();
 	s_history_suspend_depth = 0;
@@ -344,242 +319,241 @@ const uint32_t *jce_state_get_selection(int *out_count)
 	return s.selected;
 }
 
-/* ── Entity Management ───────────────────────────────────────────── */
+/* ── Entity Order / Existence ────────────────────────────────────── */
 
-int jce_state_get_entity_count(void) { return s.entity_count; }
-
-JceEntityInfo *jce_state_get_entity(uint32_t id)
+int jce_state_get_entity_count(void)
 {
-	int idx = find_entity(id);
-	return idx >= 0 ? &s.entities[idx] : NULL;
+	return (int)g_entity_order.size();
 }
 
-JceEntityInfo *jce_state_get_entity_by_index(int index)
+uint32_t jce_state_get_entity_id_by_index(int index)
 {
-	if (index < 0 || index >= s.entity_count)
-		return NULL;
-	return &s.entities[index];
+	if (index < 0 || index >= (int)g_entity_order.size())
+		return 0;
+	return g_entity_order[(size_t)index];
 }
 
-JceEntityInfo *jce_state_get_root_entities(int *out_count)
+bool jce_state_entity_exists(uint32_t id)
 {
-	/* Build flat list of root entities (parent_id == 0).
-	 * For simplicity, return pointer into entities array;
-	 * caller should iterate with jce_state_get_entity_count(). */
-	static uint32_t roots[JCE_MAX_ENTITIES];
-	static JceEntityInfo *root_ptrs[JCE_MAX_ENTITIES];
+	if (id == 0 || !s.scene) return false;
+	return jce_scene_has_editor_meta(s.scene, (JceEntity)id);
+}
+
+/* ── Entity property queries (read-through to ECS) ───────────────── */
+
+const char *jce_state_entity_name(uint32_t id)
+{
+	if (!s.scene || id == 0) return "";
+	JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, (JceEntity)id);
+	return m ? m->name : "";
+}
+
+bool jce_state_entity_enabled(uint32_t id)
+{
+	if (!s.scene || id == 0) return false;
+	JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, (JceEntity)id);
+	return m ? m->enabled : false;
+}
+
+uint32_t jce_state_entity_parent(uint32_t id)
+{
+	if (!s.scene || id == 0) return 0;
+	return (uint32_t)jce_scene_get_parent(s.scene, (JceEntity)id);
+}
+
+int jce_state_entity_child_count(uint32_t id)
+{
+	if (!s.scene || id == 0) return 0;
+	return jce_scene_get_child_count(s.scene, (JceEntity)id);
+}
+
+int jce_state_entity_children(uint32_t id, uint32_t *out, int max)
+{
+	if (!s.scene || id == 0 || !out || max <= 0) return 0;
+	JceEntity buf[JCE_MAX_CHILDREN];
+	int cap = (max < JCE_MAX_CHILDREN) ? max : JCE_MAX_CHILDREN;
+	int n = jce_scene_get_children(s.scene, (JceEntity)id, buf, cap);
+	for (int i = 0; i < n; i++)
+		out[i] = (uint32_t)buf[i];
+	return n;
+}
+
+JceTagColor jce_state_entity_tag_color(uint32_t id)
+{
+	if (!s.scene || id == 0) return JCE_TAG_NONE;
+	JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, (JceEntity)id);
+	return m ? (JceTagColor)m->tag_color : JCE_TAG_NONE;
+}
+
+const char *jce_state_entity_tag(uint32_t id)
+{
+	if (!s.scene || id == 0) return "";
+	JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, (JceEntity)id);
+	return m ? m->tag : "";
+}
+
+bool jce_state_entity_is_prefab(uint32_t id)
+{
+	if (!s.scene || id == 0) return false;
+	JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, (JceEntity)id);
+	return m ? m->prefab_instance : false;
+}
+
+const char *jce_state_entity_prefab_path(uint32_t id)
+{
+	if (!s.scene || id == 0) return "";
+	JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, (JceEntity)id);
+	return m ? m->prefab_path : "";
+}
+
+JceEntity jce_state_to_ecs_entity(uint32_t id)   { return (JceEntity)id; }
+uint32_t  jce_state_from_ecs_entity(JceEntity e) { return (uint32_t)e; }
+
+/* ── Root entity enumeration ─────────────────────────────────────── */
+
+int jce_state_get_root_count(void)
+{
+	if (!s.scene) return 0;
 	int n = 0;
-	for (int i = 0; i < s.entity_count; i++) {
-		if (s.entities[i].parent_id == 0) {
-			root_ptrs[n] = &s.entities[i];
-			roots[n++] = s.entities[i].id;
+	for (uint32_t id : g_entity_order) {
+		if (jce_scene_get_parent(s.scene, (JceEntity)id) == JCE_ENTITY_INVALID)
+			++n;
+	}
+	return n;
+}
+
+uint32_t jce_state_get_root_id(int index)
+{
+	if (!s.scene || index < 0) return 0;
+	int n = 0;
+	for (uint32_t id : g_entity_order) {
+		if (jce_scene_get_parent(s.scene, (JceEntity)id) == JCE_ENTITY_INVALID) {
+			if (n == index) return id;
+			++n;
 		}
 	}
-	if (out_count) *out_count = n;
-	/* Return first root — caller iterates via get_entity on children. */
-	return n > 0 ? &s.entities[find_entity(roots[0])] : NULL;
+	return 0;
 }
+
+/* ── Entity CRUD ─────────────────────────────────────────────────── */
 
 uint32_t jce_state_create_entity(const char *name, uint32_t parent_id)
 {
 	HistoryEditScope edit_scope;
 
-	if (s.entity_count >= JCE_MAX_ENTITIES) return 0;
+	if (!s.scene) return 0;
 
-	JceEntityInfo *e = &s.entities[s.entity_count++];
-	memset(e, 0, sizeof(*e));
-	e->id = s.next_id++;
-	snprintf(e->name, sizeof(e->name), "%s", name ? name : "Entity");
-	e->enabled   = true;
-	e->parent_id = parent_id;
-	e->tag_color = JCE_TAG_NONE;
-	e->prefab_instance = false;
-	e->prefab_path[0] = '\0';
+	/* Pass NULL to flecs so duplicate display names don't conflict. */
+	JceEntity e = jce_scene_create_entity(s.scene, NULL);
+	if (e == JCE_ENTITY_INVALID) return 0;
 
-	/* Update O(1) index map. */
-	s_id_to_idx[e->id] = s.entity_count - 1;
+	JceEditorMeta meta;
+	memset(&meta, 0, sizeof(meta));
+	snprintf(meta.name, sizeof(meta.name), "%s", name ? name : "Entity");
+	meta.tag[0]          = '\0';
+	meta.tag_color       = (uint8_t)JCE_TAG_NONE;
+	meta.enabled         = true;
+	meta.prefab_instance = false;
+	meta.prefab_path[0]  = '\0';
+	jce_scene_set_editor_meta(s.scene, e, &meta);
 
-	/* Add to parent's children list. */
-	if (parent_id != 0) {
-		JceEntityInfo *parent = jce_state_get_entity(parent_id);
-		if (parent && parent->child_count < JCE_MAX_CHILDREN)
-			parent->children[parent->child_count++] = e->id;
-	}
+	if (parent_id != 0)
+		jce_scene_set_parent(s.scene, e, (JceEntity)parent_id);
 
-	/* Create in engine ECS.  Pass NULL for the name so flecs does not
-	 * register it in its name_index — the editor manages entity names
-	 * in EditorMeta.name and duplicate names are allowed.  Passing
-	 * names to flecs caused fatal "conflicting entity" aborts during
-	 * undo/redo when two entities shared the same name. */
-	if (s.scene) {
-		e->ecs_entity = (uint64_t)jce_scene_create_entity(s.scene, NULL);
+	JceTransform t;
+	t.position = jce_v3(0.0f, 0.0f, 0.0f);
+	t.rotation = jce_q_identity();
+	t.scale    = jce_v3(1.0f, 1.0f, 1.0f);
+	jce_scene_set_transform(s.scene, e, &t);
 
-		/* Store display name and metadata in EditorMeta. */
-		jce_adapter_push_entity_meta(s.scene, (JceEntity)e->ecs_entity, e);
-
-		/* Set parent in ECS if applicable. */
-		if (parent_id != 0) {
-			JceEntityInfo *parent = jce_state_get_entity(parent_id);
-			if (parent && parent->ecs_entity != 0)
-				jce_scene_set_parent(s.scene, (JceEntity)e->ecs_entity,
-				                     (JceEntity)parent->ecs_entity);
-		}
-	}
-
-	return e->id;
+	uint32_t id = (uint32_t)e;
+	g_entity_order.push_back(id);
+	g_entity_sidecar[id] = EditorEntitySidecar{};
+	return id;
 }
 
 void jce_state_delete_entity(uint32_t id)
 {
 	HistoryEditScope edit_scope;
 
-	int idx = find_entity(id);
-	if (idx < 0) return;
+	if (!s.scene || id == 0) return;
+	if (!jce_state_entity_exists(id)) return;
 
-	/* Remove from parent's children list. */
-	JceEntityInfo *e = &s.entities[idx];
+	/* Recursively delete children first (snapshot list since it mutates). */
+	JceEntity children[JCE_MAX_CHILDREN];
+	int cn = jce_scene_get_children(s.scene, (JceEntity)id, children, JCE_MAX_CHILDREN);
+	for (int i = cn - 1; i >= 0; --i)
+		jce_state_delete_entity((uint32_t)children[i]);
 
-	/* Remove from engine ECS. */
-	if (s.scene && e->ecs_entity != 0) {
-		jce_scene_destroy_entity(s.scene, (JceEntity)e->ecs_entity);
-	}
-
-	if (e->parent_id != 0) {
-		JceEntityInfo *parent = jce_state_get_entity(e->parent_id);
-		if (parent) {
-			for (int i = 0; i < parent->child_count; i++) {
-				if (parent->children[i] == id) {
-					parent->children[i] = parent->children[--parent->child_count];
-					break;
-				}
-			}
-		}
-	}
-
-	/* Recursively delete children. */
-	for (int i = e->child_count - 1; i >= 0; i--)
-		jce_state_delete_entity(e->children[i]);
-
-	/* Remove from selection. */
 	jce_state_deselect_entity(id);
+	erase_from_order(id);
+	g_entity_sidecar.erase(id);
 
-	/* Swap-remove from array + update index map. */
-	idx = find_entity(id);  /* re-find after recursive deletes */
-	if (idx >= 0) {
-		s_id_to_idx.erase(id);
-		int last = s.entity_count - 1;
-		if (idx != last) {
-			s.entities[idx] = s.entities[last];
-			memcpy(s.components[idx], s.components[last],
-			       sizeof(JceComponentInfo) * JCE_MAX_COMPONENTS);
-			s_id_to_idx[s.entities[idx].id] = idx;
-		}
-		s.entity_count--;
-	}
+	jce_scene_destroy_entity(s.scene, (JceEntity)id);
 }
 
 void jce_state_rename_entity(uint32_t id, const char *name)
 {
 	HistoryEditScope edit_scope;
 
-	JceEntityInfo *e = jce_state_get_entity(id);
-	if (!e) return;
-	snprintf(e->name, sizeof(e->name), "%s", name);
-
-	/* Update EditorMeta.name in ECS. */
-	if (s.scene && e->ecs_entity != 0)
-		jce_adapter_push_entity_meta(s.scene, (JceEntity)e->ecs_entity, e);
+	if (!s.scene || id == 0) return;
+	JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, (JceEntity)id);
+	if (!m) return;
+	snprintf(m->name, sizeof(m->name), "%s", name ? name : "");
 }
 
 void jce_state_set_entity_enabled(uint32_t id, bool enabled)
 {
 	HistoryEditScope edit_scope;
 
-	JceEntityInfo *e = jce_state_get_entity(id);
-	if (!e) return;
+	if (!s.scene || id == 0) return;
+	JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, (JceEntity)id);
+	if (!m) return;
+	m->enabled = enabled;
 
-	e->enabled = enabled;
-
-	/* Update EditorMeta in ECS. */
-	if (s.scene && e->ecs_entity != 0)
-		jce_adapter_push_entity_meta(s.scene, (JceEntity)e->ecs_entity, e);
-
-	for (int i = 0; i < e->child_count; i++)
-		jce_state_set_entity_enabled(e->children[i], enabled);
+	/* Cascade to children. */
+	JceEntity children[JCE_MAX_CHILDREN];
+	int cn = jce_scene_get_children(s.scene, (JceEntity)id, children, JCE_MAX_CHILDREN);
+	for (int i = 0; i < cn; ++i)
+		jce_state_set_entity_enabled((uint32_t)children[i], enabled);
 }
 
 void jce_state_set_entity_tag(uint32_t id, const char *tag)
 {
 	HistoryEditScope edit_scope;
 
-	JceEntityInfo *e = jce_state_get_entity(id);
-	if (!e) return;
-	snprintf(e->tag, sizeof(e->tag), "%s", tag ? tag : "");
-
-	if (s.scene && e->ecs_entity != 0)
-		jce_adapter_push_entity_meta(s.scene, (JceEntity)e->ecs_entity, e);
+	if (!s.scene || id == 0) return;
+	JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, (JceEntity)id);
+	if (!m) return;
+	snprintf(m->tag, sizeof(m->tag), "%s", tag ? tag : "");
 }
 
 void jce_state_set_entity_tag_color(uint32_t id, JceTagColor color)
 {
 	HistoryEditScope edit_scope;
 
-	JceEntityInfo *e = jce_state_get_entity(id);
-	if (!e) return;
-	e->tag_color = color;
-
-	if (s.scene && e->ecs_entity != 0)
-		jce_adapter_push_entity_meta(s.scene, (JceEntity)e->ecs_entity, e);
+	if (!s.scene || id == 0) return;
+	JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, (JceEntity)id);
+	if (!m) return;
+	m->tag_color = (uint8_t)color;
 }
 
 void jce_state_reparent_entity(uint32_t id, uint32_t new_parent)
 {
 	HistoryEditScope edit_scope;
 
-	JceEntityInfo *e = jce_state_get_entity(id);
-	if (!e || e->id == new_parent) return;
+	if (!s.scene || id == 0 || id == new_parent) return;
+	if (!jce_state_entity_exists(id)) return;
 
 	/* Cycle detection: ensure new_parent is not a descendant of id. */
 	uint32_t check = new_parent;
 	while (check != 0) {
-		if (check == id) return;  /* would create cycle */
-		JceEntityInfo *p = jce_state_get_entity(check);
-		check = p ? p->parent_id : 0;
+		if (check == id) return;
+		check = (uint32_t)jce_scene_get_parent(s.scene, (JceEntity)check);
 	}
 
-	/* Remove from old parent. */
-	if (e->parent_id != 0) {
-		JceEntityInfo *old_p = jce_state_get_entity(e->parent_id);
-		if (old_p) {
-			for (int i = 0; i < old_p->child_count; i++) {
-				if (old_p->children[i] == id) {
-					old_p->children[i] = old_p->children[--old_p->child_count];
-					break;
-				}
-			}
-		}
-	}
-
-	/* Add to new parent. */
-	e->parent_id = new_parent;
-	if (new_parent != 0) {
-		JceEntityInfo *new_p = jce_state_get_entity(new_parent);
-		if (new_p && new_p->child_count < JCE_MAX_CHILDREN)
-			new_p->children[new_p->child_count++] = id;
-	}
-
-	/* Sync parent relationship in ECS. */
-	if (s.scene && e->ecs_entity != 0) {
-		if (new_parent != 0) {
-			JceEntityInfo *new_p = jce_state_get_entity(new_parent);
-			if (new_p && new_p->ecs_entity != 0)
-				jce_scene_set_parent(s.scene, (JceEntity)e->ecs_entity,
-				                     (JceEntity)new_p->ecs_entity);
-		} else {
-			jce_scene_set_parent(s.scene, (JceEntity)e->ecs_entity,
-			                     JCE_ENTITY_INVALID);
-		}
-	}
+	jce_scene_set_parent(s.scene, (JceEntity)id,
+	                     new_parent != 0 ? (JceEntity)new_parent : JCE_ENTITY_INVALID);
 }
 
 void jce_state_reorder_sibling(uint32_t entity_id, uint32_t ref_id,
@@ -587,334 +561,366 @@ void jce_state_reorder_sibling(uint32_t entity_id, uint32_t ref_id,
 {
 	HistoryEditScope edit_scope;
 
-	JceEntityInfo *e   = jce_state_get_entity(entity_id);
-	JceEntityInfo *ref = jce_state_get_entity(ref_id);
-	if (!e || !ref) return;
-	if (entity_id == ref_id) return;
+	if (!s.scene || entity_id == 0 || ref_id == 0 || entity_id == ref_id) return;
+	if (jce_scene_get_parent(s.scene, (JceEntity)entity_id) !=
+	    jce_scene_get_parent(s.scene, (JceEntity)ref_id))
+		return;
 
-	/* Both must share the same parent. */
-	if (e->parent_id != ref->parent_id) return;
+	auto it_e = std::find(g_entity_order.begin(), g_entity_order.end(), entity_id);
+	if (it_e == g_entity_order.end()) return;
+	g_entity_order.erase(it_e);
 
-	JceEntityInfo *parent = (e->parent_id != 0)
-		? jce_state_get_entity(e->parent_id) : NULL;
-
-	/* For root-level entities, we don't have a parent children array.
-	   Rearranging root display order is handled by the flat entity list. */
-	if (!parent) return;
-
-	/* Remove entity_id from parent's children array. */
-	int from = -1;
-	for (int i = 0; i < parent->child_count; i++) {
-		if (parent->children[i] == entity_id) { from = i; break; }
-	}
-	if (from < 0) return;
-
-	/* Shift remaining children down to fill gap. */
-	for (int i = from; i < parent->child_count - 1; i++)
-		parent->children[i] = parent->children[i + 1];
-	parent->child_count--;
-
-	/* Find the ref_id position in the (now shorter) array. */
-	int ref_pos = -1;
-	for (int i = 0; i < parent->child_count; i++) {
-		if (parent->children[i] == ref_id) { ref_pos = i; break; }
-	}
-	if (ref_pos < 0) {
-		/* ref disappeared; just append back */
-		parent->children[parent->child_count++] = entity_id;
+	auto it_r = std::find(g_entity_order.begin(), g_entity_order.end(), ref_id);
+	if (it_r == g_entity_order.end()) {
+		g_entity_order.push_back(entity_id);
 		return;
 	}
+	if (insert_after) ++it_r;
+	g_entity_order.insert(it_r, entity_id);
+}
 
-	int insert_pos = insert_after ? ref_pos + 1 : ref_pos;
+/* ── Component duplication helper (deep-copies all components) ───── */
 
-	/* Shift children up to make room. */
-	for (int i = parent->child_count; i > insert_pos; i--)
-		parent->children[i] = parent->children[i - 1];
-	parent->children[insert_pos] = entity_id;
-	parent->child_count++;
+static void duplicate_components(JceEntity src, JceEntity dst)
+{
+	if (jce_scene_has_transform(s.scene, src))
+		jce_scene_set_transform(s.scene, dst, jce_scene_get_transform(s.scene, src));
+	if (jce_scene_has_mesh_renderer(s.scene, src))
+		jce_scene_set_mesh_renderer(s.scene, dst, jce_scene_get_mesh_renderer(s.scene, src));
+	if (jce_scene_has_camera(s.scene, src))
+		jce_scene_set_camera(s.scene, dst, jce_scene_get_camera(s.scene, src));
+	if (jce_scene_has_dir_light(s.scene, src))
+		jce_scene_set_dir_light(s.scene, dst, jce_scene_get_dir_light(s.scene, src));
+	if (jce_scene_has_point_light(s.scene, src))
+		jce_scene_set_point_light(s.scene, dst, jce_scene_get_point_light(s.scene, src));
+	if (jce_scene_has_spot_light(s.scene, src))
+		jce_scene_set_spot_light(s.scene, dst, jce_scene_get_spot_light(s.scene, src));
+	if (jce_scene_has_skybox(s.scene, src))
+		jce_scene_set_skybox(s.scene, dst, jce_scene_get_skybox(s.scene, src));
+	if (jce_scene_has_sprite_renderer(s.scene, src))
+		jce_scene_set_sprite_renderer(s.scene, dst, jce_scene_get_sprite_renderer(s.scene, src));
+	if (jce_scene_has_sprite_animator(s.scene, src))
+		jce_scene_set_sprite_animator(s.scene, dst, jce_scene_get_sprite_animator(s.scene, src));
+	if (jce_scene_has_animator(s.scene, src))
+		jce_scene_set_animator(s.scene, dst, jce_scene_get_animator(s.scene, src));
+	if (jce_scene_has_skeletal_animator(s.scene, src))
+		jce_scene_set_skeletal_animator(s.scene, dst, jce_scene_get_skeletal_animator(s.scene, src));
+	if (jce_scene_has_constraint(s.scene, src))
+		jce_scene_set_constraint(s.scene, dst, jce_scene_get_constraint(s.scene, src));
+	if (jce_scene_has_rigidbody(s.scene, src))
+		jce_scene_set_rigidbody(s.scene, dst, jce_scene_get_rigidbody(s.scene, src));
+	if (jce_scene_has_box_collider(s.scene, src))
+		jce_scene_set_box_collider(s.scene, dst, jce_scene_get_box_collider(s.scene, src));
+	if (jce_scene_has_sphere_collider(s.scene, src))
+		jce_scene_set_sphere_collider(s.scene, dst, jce_scene_get_sphere_collider(s.scene, src));
+	if (jce_scene_has_character_controller(s.scene, src))
+		jce_scene_set_character_controller(s.scene, dst, jce_scene_get_character_controller(s.scene, src));
+	if (jce_scene_has_audio_source(s.scene, src))
+		jce_scene_set_audio_source(s.scene, dst, jce_scene_get_audio_source(s.scene, src));
+	if (jce_scene_has_script(s.scene, src))
+		jce_scene_set_script(s.scene, dst, jce_scene_get_script(s.scene, src));
 }
 
 uint32_t jce_state_duplicate_entity(uint32_t id)
 {
 	HistoryEditScope edit_scope;
 
-	JceEntityInfo *src = jce_state_get_entity(id);
-	if (!src) return 0;
+	if (!s.scene || id == 0 || !jce_state_entity_exists(id)) return 0;
 
-	char dup_name[JCE_MAX_ENTITY_NAME];
-	snprintf(dup_name, sizeof(dup_name), "%s (Copy)", src->name);
-	uint32_t dup = jce_state_create_entity(dup_name, src->parent_id);
+	JceEditorMeta *src_meta = jce_scene_get_editor_meta(s.scene, (JceEntity)id);
+	if (!src_meta) return 0;
 
-	/* Refresh src — create_entity appended so index is stable,
-	 * but be defensive. */
-	src = jce_state_get_entity(id);
-	JceEntityInfo *d = jce_state_get_entity(dup);
-	if (d && src) {
-		d->tag_color = src->tag_color;
-		d->enabled   = src->enabled;
-		snprintf(d->tag, sizeof(d->tag), "%s", src->tag);
-		d->prefab_instance = src->prefab_instance;
-		snprintf(d->prefab_path, sizeof(d->prefab_path), "%s", src->prefab_path);
+	char dup_name[64];
+	snprintf(dup_name, sizeof(dup_name), "%s (Copy)", src_meta->name);
 
-		/* Sync updated metadata to ECS. */
-		if (s.scene && d->ecs_entity != 0)
-			jce_adapter_push_entity_meta(s.scene, (JceEntity)d->ecs_entity, d);
+	uint32_t parent_id = (uint32_t)jce_scene_get_parent(s.scene, (JceEntity)id);
+	uint32_t dup = jce_state_create_entity(dup_name, parent_id);
+	if (dup == 0) return 0;
+
+	/* Copy editor-meta extras (name already set). */
+	JceEditorMeta *dup_meta = jce_scene_get_editor_meta(s.scene, (JceEntity)dup);
+	src_meta = jce_scene_get_editor_meta(s.scene, (JceEntity)id);  /* refresh */
+	if (dup_meta && src_meta) {
+		dup_meta->tag_color       = src_meta->tag_color;
+		dup_meta->enabled         = src_meta->enabled;
+		snprintf(dup_meta->tag, sizeof(dup_meta->tag), "%s", src_meta->tag);
+		dup_meta->prefab_instance = src_meta->prefab_instance;
+		snprintf(dup_meta->prefab_path, sizeof(dup_meta->prefab_path),
+		         "%s", src_meta->prefab_path);
 	}
 
-	/* Copy components. */
-	int src_idx = find_entity(id);
-	int dup_idx = find_entity(dup);
-	if (src_idx >= 0 && dup_idx >= 0) {
-		int count = s.entities[src_idx].component_count;
-		if (count > JCE_MAX_COMPONENTS) count = JCE_MAX_COMPONENTS;
-		memcpy(s.components[dup_idx], s.components[src_idx],
-		       sizeof(JceComponentInfo) * count);
-		s.entities[dup_idx].component_count = count;
+	/* Deep-copy all components from src → dup (overwrites the identity
+	 * Transform that create_entity installed). */
+	duplicate_components((JceEntity)id, (JceEntity)dup);
 
-		/* Sync all copied components to ECS. */
-		if (s.scene && d && d->ecs_entity != 0) {
-			for (int i = 0; i < count; i++)
-				jce_adapter_comp_info_to_ecs(s.scene,
-					(JceEntity)d->ecs_entity, &s.components[dup_idx][i]);
-		}
+	/* Recursively duplicate children, reparenting under dup. */
+	JceEntity src_children[JCE_MAX_CHILDREN];
+	int cn = jce_scene_get_children(s.scene, (JceEntity)id, src_children, JCE_MAX_CHILDREN);
+	for (int i = 0; i < cn; ++i) {
+		uint32_t child_dup = jce_state_duplicate_entity((uint32_t)src_children[i]);
+		if (child_dup != 0)
+			jce_scene_set_parent(s.scene, (JceEntity)child_dup, (JceEntity)dup);
 	}
 
 	return dup;
 }
 
-/* ── Components ──────────────────────────────────────────────────── */
+/* ── Component management ────────────────────────────────────────── */
 
-static const char *s_comp_names[] = {
-	"Transform",
-	"Mesh Renderer",
-	"Sprite Renderer",
-	"Camera",
-	"Light",
-	"Animator",
-	"Skeletal Animator",
-	"Rigidbody",
-	"Box Collider",
-	"Sphere Collider",
-	"Character Controller",
-	"Audio Source",
-	"Script",
-	"Skybox",
-	"Sprite Animator",
-	"Constraint",
-};
-
-static const char *s_comp_i18n_keys[] = {
-	"transform.title",
-	"meshRenderer.title",
-	"spriteRenderer.title",
-	"camera.title",
-	"light.title",
-	"animator.title",
-	"skeletalAnimator.title",
-	"rigidbody.title",
-	"boxCollider.title",
-	"sphereCollider.title",
-	"characterController.title",
-	"audioSource.title",
-	"inspector.script",
-	"comp.skybox",
-	"comp.spriteAnimator",
-	"comp.constraint",
-};
-
-const char *jce_component_type_name(JceComponentType type)
-{
-	if (type >= 0 && type < JCE_COMP_TYPE_COUNT) {
-		const char *translated = jce_editor_i18n(s_comp_i18n_keys[type]);
-		if (translated != s_comp_i18n_keys[type])
-			return translated;
-		return s_comp_names[type];
-	}
-	return "Unknown";
-}
-
-int jce_state_get_components(uint32_t entity_id, JceComponentInfo *out, int max)
-{
-	if (max < 1 || !out) return 0;
-
-	int idx = find_entity(entity_id);
-	if (idx < 0) return 0;
-
-	JceEntityInfo *e = &s.entities[idx];
-	int n = (e->component_count < max) ? e->component_count : max;
-	for (int i = 0; i < n; i++)
-		out[i] = s.components[idx][i];
-	return n;
-}
-
-JceComponentInfo *jce_state_get_entity_components(uint32_t entity_id, int *out_count)
-{
-	int idx = find_entity(entity_id);
-	if (idx < 0) {
-		if (out_count) *out_count = 0;
-		return NULL;
-	}
-	if (out_count) *out_count = s.entities[idx].component_count;
-	return s.components[idx];
-}
-
-void jce_state_set_component(uint32_t entity_id, const JceComponentInfo *comp)
+void jce_state_add_component(uint32_t entity_id, uint32_t comp_flag)
 {
 	HistoryEditScope edit_scope;
 
-	if (!comp) return;
-	int idx = find_entity(entity_id);
-	if (idx < 0) return;
+	if (!s.scene || entity_id == 0) return;
+	JceEntity e = (JceEntity)entity_id;
 
-	JceEntityInfo *e = &s.entities[idx];
-	/* Update existing component of same type. */
-	bool found = false;
-	for (int i = 0; i < e->component_count; i++) {
-		if (s.components[idx][i].type == comp->type) {
-			s.components[idx][i] = *comp;
-			found = true;
-			break;
-		}
+	switch (comp_flag) {
+	case JCE_COMP_FLAG_TRANSFORM: {
+		if (jce_scene_has_transform(s.scene, e)) return;
+		JceTransform t;
+		t.position = jce_v3(0.0f, 0.0f, 0.0f);
+		t.rotation = jce_q_identity();
+		t.scale    = jce_v3(1.0f, 1.0f, 1.0f);
+		jce_scene_set_transform(s.scene, e, &t);
+		break;
 	}
-	/* Not found — add it. */
-	if (!found && e->component_count < JCE_MAX_COMPONENTS) {
-		s.components[idx][e->component_count++] = *comp;
+	case JCE_COMP_FLAG_MESH_RENDERER: {
+		if (jce_scene_has_mesh_renderer(s.scene, e)) return;
+		JceMeshRenderer mr;
+		memset(&mr, 0, sizeof(mr));
+		mr.visible        = true;
+		mr.base_color[0]  = 1.0f;
+		mr.base_color[1]  = 1.0f;
+		mr.base_color[2]  = 1.0f;
+		mr.base_color[3]  = 1.0f;
+		mr.metallic       = 0.0f;
+		mr.roughness      = 0.5f;
+		mr.normal_scale   = 1.0f;
+		mr.ao_strength    = 1.0f;
+		mr.alpha_cutoff   = 0.5f;
+		jce_scene_set_mesh_renderer(s.scene, e, &mr);
+		break;
 	}
-
-	/* Sync component to engine ECS via adapter. */
-	if (s.scene && e->ecs_entity != 0) {
-		jce_adapter_comp_info_to_ecs(s.scene, (JceEntity)e->ecs_entity, comp);
+	case JCE_COMP_FLAG_CAMERA: {
+		if (jce_scene_has_camera(s.scene, e)) return;
+		JceCameraComponent c;
+		memset(&c, 0, sizeof(c));
+		c.fov_deg    = 60.0f;
+		c.near_plane = 0.1f;
+		c.far_plane  = 1000.0f;
+		c.is_primary = false;
+		c.ortho      = false;
+		jce_scene_set_camera(s.scene, e, &c);
+		break;
 	}
-}
-
-void jce_state_add_component(uint32_t entity_id, JceComponentType type)
-{
-	HistoryEditScope edit_scope;
-
-	int idx = find_entity(entity_id);
-	if (idx < 0) return;
-
-	JceEntityInfo *e = &s.entities[idx];
-	/* Check for duplicate. */
-	for (int i = 0; i < e->component_count; i++) {
-		if (s.components[idx][i].type == type)
-			return;
+	case JCE_COMP_FLAG_DIR_LIGHT: {
+		if (jce_scene_has_dir_light(s.scene, e)) return;
+		JceDirectionalLight l;
+		l.direction    = jce_v3(0.0f, -1.0f, 0.0f);
+		l.color        = jce_v3(1.0f, 1.0f, 1.0f);
+		l.intensity    = 1.0f;
+		l.casts_shadow = true;
+		jce_scene_set_dir_light(s.scene, e, &l);
+		break;
 	}
-	if (e->component_count >= JCE_MAX_COMPONENTS) return;
-
-	JceComponentInfo *c = &s.components[idx][e->component_count++];
-	memset(c, 0, sizeof(*c));
-	c->type = type;
-	c->expanded = true;
-
-	/* Set sensible defaults. */
-	switch (type) {
-	case JCE_COMP_TRANSFORM:
-		c->data.transform.scale[0] = 1.0f;
-		c->data.transform.scale[1] = 1.0f;
-		c->data.transform.scale[2] = 1.0f;
+	case JCE_COMP_FLAG_POINT_LIGHT: {
+		if (jce_scene_has_point_light(s.scene, e)) return;
+		JcePointLight l;
+		l.position  = jce_v3(0.0f, 0.0f, 0.0f);
+		l.color     = jce_v3(1.0f, 1.0f, 1.0f);
+		l.intensity = 1.0f;
+		l.radius    = 10.0f;
+		jce_scene_set_point_light(s.scene, e, &l);
 		break;
-	case JCE_COMP_MESH_RENDERER:
-		c->data.mesh_renderer.base_color[0] = 1.0f;
-		c->data.mesh_renderer.base_color[1] = 1.0f;
-		c->data.mesh_renderer.base_color[2] = 1.0f;
-		c->data.mesh_renderer.base_color[3] = 1.0f;
-		c->data.mesh_renderer.roughness     = 0.5f;
+	}
+	case JCE_COMP_FLAG_SPOT_LIGHT: {
+		if (jce_scene_has_spot_light(s.scene, e)) return;
+		JceSpotLight l;
+		l.position       = jce_v3(0.0f, 0.0f, 0.0f);
+		l.direction      = jce_v3(0.0f, -1.0f, 0.0f);
+		l.color          = jce_v3(1.0f, 1.0f, 1.0f);
+		l.intensity      = 1.0f;
+		l.radius         = 10.0f;
+		l.inner_cone_cos = 0.95f;
+		l.outer_cone_cos = 0.85f;
+		jce_scene_set_spot_light(s.scene, e, &l);
 		break;
-	case JCE_COMP_CAMERA:
-		c->data.camera.fov = 60.0f;
-		c->data.camera.near_clip = 0.1f;
-		c->data.camera.far_clip = 1000.0f;
+	}
+	case JCE_COMP_FLAG_SKYBOX: {
+		if (jce_scene_has_skybox(s.scene, e)) return;
+		JceSkyboxComponent c;
+		memset(&c, 0, sizeof(c));
+		c.exposure   = 1.0f;
+		c.use_as_ibl = true;
+		jce_scene_set_skybox(s.scene, e, &c);
 		break;
-	case JCE_COMP_LIGHT:
-		c->data.light.color[0] = 1.0f;
-		c->data.light.color[1] = 1.0f;
-		c->data.light.color[2] = 1.0f;
-		c->data.light.color[3] = 1.0f;
-		c->data.light.intensity = 1.0f;
+	}
+	case JCE_COMP_FLAG_SPRITE_RENDERER: {
+		if (jce_scene_has_sprite_renderer(s.scene, e)) return;
+		JceSpriteRendererComponent c;
+		memset(&c, 0, sizeof(c));
+		c.color[0] = 1.0f; c.color[1] = 1.0f;
+		c.color[2] = 1.0f; c.color[3] = 1.0f;
+		jce_scene_set_sprite_renderer(s.scene, e, &c);
 		break;
-	case JCE_COMP_ANIMATOR:
-		c->data.animator.speed = 1.0f;
+	}
+	case JCE_COMP_FLAG_SPRITE_ANIMATOR: {
+		if (jce_scene_has_sprite_animator(s.scene, e)) return;
+		JceSpriteAnimatorComponent c;
+		memset(&c, 0, sizeof(c));
+		c.frame_width  = 64;
+		c.frame_height = 64;
+		c.speed        = 1.0f;
+		c.loop         = true;
+		jce_scene_set_sprite_animator(s.scene, e, &c);
 		break;
-	case JCE_COMP_SKELETAL_ANIMATOR:
-		c->data.skeletal_animator.speed = 1.0f;
+	}
+	case JCE_COMP_FLAG_ANIMATOR: {
+		if (jce_scene_has_animator(s.scene, e)) return;
+		JceAnimatorComponent c;
+		memset(&c, 0, sizeof(c));
+		c.speed = 1.0f;
+		c.loop  = true;
+		jce_scene_set_animator(s.scene, e, &c);
 		break;
-	case JCE_COMP_SPRITE_RENDERER:
-		c->data.sprite_renderer.color[0] = 1.0f;
-		c->data.sprite_renderer.color[1] = 1.0f;
-		c->data.sprite_renderer.color[2] = 1.0f;
-		c->data.sprite_renderer.color[3] = 1.0f;
+	}
+	case JCE_COMP_FLAG_SKELETAL_ANIMATOR: {
+		if (jce_scene_has_skeletal_animator(s.scene, e)) return;
+		JceSkeletalAnimatorComponent c;
+		memset(&c, 0, sizeof(c));
+		c.speed = 1.0f;
+		c.loop  = true;
+		jce_scene_set_skeletal_animator(s.scene, e, &c);
 		break;
-	case JCE_COMP_SKYBOX:
-		c->data.skybox.exposure = 1.0f;
+	}
+	case JCE_COMP_FLAG_CONSTRAINT: {
+		if (jce_scene_has_constraint(s.scene, e)) return;
+		JceConstraintComponent c;
+		memset(&c, 0, sizeof(c));
+		jce_scene_set_constraint(s.scene, e, &c);
 		break;
-	case JCE_COMP_SPRITE_ANIMATOR:
-		c->data.sprite_animator.speed = 1.0f;
-		c->data.sprite_animator.frame_width = 64;
-		c->data.sprite_animator.frame_height = 64;
+	}
+	case JCE_COMP_FLAG_RIGIDBODY: {
+		if (jce_scene_has_rigidbody(s.scene, e)) return;
+		JceRigidBodyComponent c;
+		memset(&c, 0, sizeof(c));
+		c.mass        = 1.0f;
+		c.friction    = 0.5f;
+		c.restitution = 0.0f;
+		c.use_gravity = true;
+		jce_scene_set_rigidbody(s.scene, e, &c);
 		break;
-	case JCE_COMP_RIGIDBODY:
-		c->data.rigidbody.mass = 1.0f;
-		c->data.rigidbody.use_gravity = true;
+	}
+	case JCE_COMP_FLAG_BOX_COLLIDER: {
+		if (jce_scene_has_box_collider(s.scene, e)) return;
+		JceBoxColliderComponent c;
+		memset(&c, 0, sizeof(c));
+		c.size[0] = 1.0f; c.size[1] = 1.0f; c.size[2] = 1.0f;
+		jce_scene_set_box_collider(s.scene, e, &c);
 		break;
-	case JCE_COMP_BOX_COLLIDER:
-		c->data.box_collider.size[0] = 1.0f;
-		c->data.box_collider.size[1] = 1.0f;
-		c->data.box_collider.size[2] = 1.0f;
+	}
+	case JCE_COMP_FLAG_SPHERE_COLLIDER: {
+		if (jce_scene_has_sphere_collider(s.scene, e)) return;
+		JceSphereColliderComponent c;
+		memset(&c, 0, sizeof(c));
+		c.radius = 0.5f;
+		jce_scene_set_sphere_collider(s.scene, e, &c);
 		break;
-	case JCE_COMP_SPHERE_COLLIDER:
-		c->data.sphere_collider.radius = 0.5f;
+	}
+	case JCE_COMP_FLAG_CHARACTER_CONTROLLER: {
+		if (jce_scene_has_character_controller(s.scene, e)) return;
+		JceCharacterControllerComponent c;
+		c.height      = 2.0f;
+		c.radius      = 0.3f;
+		c.step_offset = 0.35f;
+		c.slope_limit = 45.0f;
+		jce_scene_set_character_controller(s.scene, e, &c);
 		break;
-	case JCE_COMP_CHARACTER_CONTROLLER:
-		c->data.character_controller.height = 2.0f;
-		c->data.character_controller.radius = 0.3f;
-		c->data.character_controller.step_offset = 0.35f;
-		c->data.character_controller.slope_limit = 45.0f;
+	}
+	case JCE_COMP_FLAG_AUDIO_SOURCE: {
+		if (jce_scene_has_audio_source(s.scene, e)) return;
+		JceAudioSourceComponent c;
+		memset(&c, 0, sizeof(c));
+		c.volume = 1.0f;
+		c.pitch  = 1.0f;
+		jce_scene_set_audio_source(s.scene, e, &c);
 		break;
-	case JCE_COMP_AUDIO_SOURCE:
-		c->data.audio_source.volume = 1.0f;
-		c->data.audio_source.pitch = 1.0f;
+	}
+	case JCE_COMP_FLAG_SCRIPT: {
+		if (jce_scene_has_script(s.scene, e)) return;
+		JceScriptComponent c;
+		memset(&c, 0, sizeof(c));
+		jce_scene_set_script(s.scene, e, &c);
 		break;
+	}
 	default:
-		break;
+		return;
 	}
 
 	LOG_INFO(LOG_TAG, "add component %s to entity %u",
-	         jce_component_type_name(type), entity_id);
-
-	/* Sync new component to engine ECS via adapter. */
-	if (s.scene && e->ecs_entity != 0) {
-		jce_adapter_comp_info_to_ecs(s.scene, (JceEntity)e->ecs_entity, c);
-	}
+	         jce_comp_flag_display_name(comp_flag), entity_id);
 }
 
-void jce_state_remove_component(uint32_t entity_id, JceComponentType type)
+void jce_state_remove_component(uint32_t entity_id, uint32_t comp_flag)
 {
 	HistoryEditScope edit_scope;
 
-	int idx = find_entity(entity_id);
-	if (idx < 0) return;
+	if (!s.scene || entity_id == 0) return;
+	JceEntity e = (JceEntity)entity_id;
 
-	JceEntityInfo *e = &s.entities[idx];
-	for (int i = 0; i < e->component_count; i++) {
-		if (s.components[idx][i].type == type) {
-			/* Swap-remove. */
-			s.components[idx][i] = s.components[idx][--e->component_count];
-
-			/* Remove from engine ECS via adapter. */
-			if (s.scene && e->ecs_entity != 0)
-				jce_adapter_remove_from_ecs(s.scene, (JceEntity)e->ecs_entity, type);
-
-			LOG_INFO(LOG_TAG, "remove component %s from entity %u",
-			         jce_component_type_name(type), entity_id);
-			return;
-		}
+	switch (comp_flag) {
+	case JCE_COMP_FLAG_TRANSFORM:            jce_scene_remove_transform(s.scene, e); break;
+	case JCE_COMP_FLAG_MESH_RENDERER:        jce_scene_remove_mesh_renderer(s.scene, e); break;
+	case JCE_COMP_FLAG_CAMERA:               jce_scene_remove_camera(s.scene, e); break;
+	case JCE_COMP_FLAG_DIR_LIGHT:            jce_scene_remove_dir_light(s.scene, e); break;
+	case JCE_COMP_FLAG_POINT_LIGHT:          jce_scene_remove_point_light(s.scene, e); break;
+	case JCE_COMP_FLAG_SPOT_LIGHT:           jce_scene_remove_spot_light(s.scene, e); break;
+	case JCE_COMP_FLAG_SKYBOX:               jce_scene_remove_skybox(s.scene, e); break;
+	case JCE_COMP_FLAG_SPRITE_RENDERER:      jce_scene_remove_sprite_renderer(s.scene, e); break;
+	case JCE_COMP_FLAG_SPRITE_ANIMATOR:      jce_scene_remove_sprite_animator(s.scene, e); break;
+	case JCE_COMP_FLAG_ANIMATOR:             jce_scene_remove_animator(s.scene, e); break;
+	case JCE_COMP_FLAG_SKELETAL_ANIMATOR:    jce_scene_remove_skeletal_animator(s.scene, e); break;
+	case JCE_COMP_FLAG_CONSTRAINT:           jce_scene_remove_constraint(s.scene, e); break;
+	case JCE_COMP_FLAG_RIGIDBODY:            jce_scene_remove_rigidbody(s.scene, e); break;
+	case JCE_COMP_FLAG_BOX_COLLIDER:         jce_scene_remove_box_collider(s.scene, e); break;
+	case JCE_COMP_FLAG_SPHERE_COLLIDER:      jce_scene_remove_sphere_collider(s.scene, e); break;
+	case JCE_COMP_FLAG_CHARACTER_CONTROLLER: jce_scene_remove_character_controller(s.scene, e); break;
+	case JCE_COMP_FLAG_AUDIO_SOURCE:         jce_scene_remove_audio_source(s.scene, e); break;
+	case JCE_COMP_FLAG_SCRIPT:               jce_scene_remove_script(s.scene, e); break;
+	default: return;
 	}
+
+	LOG_INFO(LOG_TAG, "remove component %s from entity %u",
+	         jce_comp_flag_display_name(comp_flag), entity_id);
 }
 
-JceComponentType jce_component_type_from_name(const char *name)
+const char *jce_comp_flag_display_name(uint32_t comp_flag)
 {
-	return component_type_from_name(name);
+	switch (comp_flag) {
+	case JCE_COMP_FLAG_TRANSFORM:            return "Transform";
+	case JCE_COMP_FLAG_MESH_RENDERER:        return "Mesh Renderer";
+	case JCE_COMP_FLAG_CAMERA:               return "Camera";
+	case JCE_COMP_FLAG_DIR_LIGHT:            return "Directional Light";
+	case JCE_COMP_FLAG_POINT_LIGHT:          return "Point Light";
+	case JCE_COMP_FLAG_SPOT_LIGHT:           return "Spot Light";
+	case JCE_COMP_FLAG_SKYBOX:               return "Skybox";
+	case JCE_COMP_FLAG_SPRITE_RENDERER:      return "Sprite Renderer";
+	case JCE_COMP_FLAG_SPRITE_ANIMATOR:      return "Sprite Animator";
+	case JCE_COMP_FLAG_ANIMATOR:             return "Animator";
+	case JCE_COMP_FLAG_SKELETAL_ANIMATOR:    return "Skeletal Animator";
+	case JCE_COMP_FLAG_CONSTRAINT:           return "Constraint";
+	case JCE_COMP_FLAG_RIGIDBODY:            return "Rigidbody";
+	case JCE_COMP_FLAG_RIGIDBODY_2D:         return "Rigidbody 2D";
+	case JCE_COMP_FLAG_BOX_COLLIDER:         return "Box Collider";
+	case JCE_COMP_FLAG_SPHERE_COLLIDER:      return "Sphere Collider";
+	case JCE_COMP_FLAG_CHARACTER_CONTROLLER: return "Character Controller";
+	case JCE_COMP_FLAG_AUDIO_SOURCE:         return "Audio Source";
+	case JCE_COMP_FLAG_SCRIPT:               return "Script";
+	case JCE_COMP_FLAG_PARTICLE_EMITTER:     return "Particle Emitter";
+	case JCE_COMP_FLAG_BEHAVIOR_TREE:        return "Behavior Tree";
+	case JCE_COMP_FLAG_EDITOR_META:          return "Editor Meta";
+	default:                                 return "Unknown";
+	}
 }
 
 /* ── Mode Accessors ──────────────────────────────────────────────── */

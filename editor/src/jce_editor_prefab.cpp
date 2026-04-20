@@ -2,6 +2,8 @@
  * jce_editor_prefab.cpp  Prefab lifecycle operations.
  *
  * Implements save, instantiate, revert, and query for prefab instances.
+ * Reads/writes prefab metadata directly through the engine ECS EditorMeta
+ * component — no editor mirror store.
  */
 
 #include "jce_editor_state_internal.h"
@@ -13,7 +15,7 @@ bool jce_state_save_prefab(uint32_t entity_id, const char *prefab_path)
 {
 	if (!prefab_path || prefab_path[0] == '\0')
 		return false;
-	if (find_entity(entity_id) < 0)
+	if (!jce_state_entity_exists(entity_id))
 		return false;
 
 	cJSON *root = build_prefab_json_root(entity_id);
@@ -86,14 +88,19 @@ uint32_t jce_state_instantiate_prefab(const char *prefab_path, uint32_t parent_i
 
 bool jce_state_revert_prefab(uint32_t entity_id)
 {
-	JceEntityInfo *e = jce_state_get_entity(entity_id);
-	if (!e || !e->prefab_instance || e->prefab_path[0] == '\0')
+	if (!jce_state_entity_exists(entity_id))
+		return false;
+	if (!jce_state_entity_is_prefab(entity_id))
 		return false;
 
-	uint32_t parent_id = e->parent_id;
+	const char *path = jce_state_entity_prefab_path(entity_id);
+	if (!path || path[0] == '\0')
+		return false;
+
+	uint32_t parent_id = jce_state_entity_parent(entity_id);
 	bool was_selected = jce_state_is_selected(entity_id);
 	char prefab_path[JCE_MAX_PREFAB_PATH];
-	snprintf(prefab_path, sizeof(prefab_path), "%s", e->prefab_path);
+	snprintf(prefab_path, sizeof(prefab_path), "%s", path);
 
 	HistoryEditScope edit_scope;
 	uint32_t new_id = jce_state_instantiate_prefab(prefab_path, parent_id);
@@ -111,14 +118,13 @@ bool jce_state_revert_prefab(uint32_t entity_id)
 
 bool jce_state_is_prefab_instance(uint32_t entity_id)
 {
-	JceEntityInfo *e = jce_state_get_entity(entity_id);
-	return e ? e->prefab_instance : false;
+	return jce_state_entity_is_prefab(entity_id);
 }
 
 const char *jce_state_get_prefab_path(uint32_t entity_id)
 {
-	JceEntityInfo *e = jce_state_get_entity(entity_id);
-	if (!e || !e->prefab_instance || e->prefab_path[0] == '\0')
+	if (!jce_state_entity_is_prefab(entity_id))
 		return NULL;
-	return e->prefab_path;
+	const char *p = jce_state_entity_prefab_path(entity_id);
+	return (p && p[0] != '\0') ? p : NULL;
 }

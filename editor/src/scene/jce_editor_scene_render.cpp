@@ -528,21 +528,19 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         const char *hdr_path = NULL;
         float sky_rotation = 0.0f;
         float sky_exposure = 1.0f;
+        JceScene *scene = jce_state_get_scene();
         int ent_count = jce_state_get_entity_count();
         for (int ei = 0; ei < ent_count && !hdr_path; ei++) {
-            JceEntityInfo *ent = jce_state_get_entity_by_index(ei);
-            if (!ent) continue;
-            int cc = 0;
-            JceComponentInfo *comps = jce_state_get_entity_components(ent->id, &cc);
-            for (int ci = 0; ci < cc; ci++) {
-                if (comps[ci].type == JCE_COMP_SKYBOX && comps[ci].data.skybox.hdr_path[0]) {
-                    hdr_path = comps[ci].data.skybox.hdr_path;
-                    sky_rotation = comps[ci].data.skybox.rotation;
-                    sky_exposure = comps[ci].data.skybox.exposure > 0.0f
-                                 ? comps[ci].data.skybox.exposure : 1.0f;
-                    break;
-                }
-            }
+            uint32_t id = jce_state_get_entity_id_by_index(ei);
+            if (id == 0 || !jce_state_entity_exists(id)) continue;
+            if (!scene) continue;
+            JceEntity e = (JceEntity)id;
+            if (!jce_scene_has_skybox(scene, e)) continue;
+            JceSkyboxComponent *sky = jce_scene_get_skybox(scene, e);
+            if (!sky || sky->hdr_path[0] == '\0') continue;
+            hdr_path = sky->hdr_path;
+            sky_rotation = sky->rotation;
+            sky_exposure = sky->exposure > 0.0f ? sky->exposure : 1.0f;
         }
 
         if (hdr_path && strcmp(hdr_path, s_sr.skybox_hdr_path) != 0) {

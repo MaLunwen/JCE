@@ -130,96 +130,70 @@ void draw_grid(void)
 
 /* ── Entity model builder ─────────────────────────────────────────── */
 
-static bool build_entity_model(JceEntityInfo *ent, jce_mat4 *out_model,
+/* Builds a TRS model matrix from the entity's Transform component (using its
+ * quaternion rotation, not euler).  Optionally returns the cached/procedural
+ * mesh and the material path for renderer binding. */
+static bool build_entity_model(uint32_t entity_id, jce_mat4 *out_model,
                                 JceMesh **out_mesh,
                                 const char **out_material_path)
 {
-    int comp_count = 0;
-    JceComponentInfo *comps = jce_state_get_entity_components(ent->id, &comp_count);
-    if (!comps) return false;
+    JceScene *scene = jce_state_get_scene();
+    if (!scene || entity_id == 0) return false;
+    JceEntity e = (JceEntity)entity_id;
 
-    const float *pos   = NULL;
-    const float *rot   = NULL;
-    const float *scale = NULL;
-    bool has_mesh  = false;
-    const char *mesh_path = NULL;
-    const char *mat_path  = NULL;
-    int  mesh_shape = 0;
+    JceTransform *t = jce_scene_get_transform(scene, e);
+    if (!t) return false;
 
-    for (int c = 0; c < comp_count; c++) {
-        switch (comps[c].type) {
-        case JCE_COMP_TRANSFORM:
-            pos   = comps[c].data.transform.pos;
-            rot   = comps[c].data.transform.rot;
-            scale = comps[c].data.transform.scale;
-            break;
-        case JCE_COMP_MESH_RENDERER:
-            has_mesh  = true;
-            mesh_path = comps[c].data.mesh_renderer.mesh_path;
-            mat_path  = comps[c].data.mesh_renderer.material_path;
-            mesh_shape = comps[c].data.mesh_renderer.mesh_shape;
-            break;
-        default: break;
-        }
-    }
+    float sx = (t->scale.x != 0.0f) ? t->scale.x : 1.0f;
+    float sy = (t->scale.y != 0.0f) ? t->scale.y : 1.0f;
+    float sz = (t->scale.z != 0.0f) ? t->scale.z : 1.0f;
 
-    if (!pos) return false;
-
-    float sx = (scale && scale[0] != 0.0f) ? scale[0] : 1.0f;
-    float sy = (scale && scale[1] != 0.0f) ? scale[1] : 1.0f;
-    float sz = (scale && scale[2] != 0.0f) ? scale[2] : 1.0f;
-
-    if (rot && (rot[0] != 0.0f || rot[1] != 0.0f || rot[2] != 0.0f)) {
-        *out_model = jce_m4_from_trs(
-            jce_v3(pos[0], pos[1], pos[2]),
-            jce_q_from_euler(rot[0] * JCE_DEG2RAD, rot[1] * JCE_DEG2RAD, rot[2] * JCE_DEG2RAD),
-            jce_v3(sx, sy, sz));
-    } else {
-        *out_model = jce_m4_identity();
-        out_model->raw[0][0] = sx;
-        out_model->raw[1][1] = sy;
-        out_model->raw[2][2] = sz;
-        out_model->raw[3][0] = pos[0];
-        out_model->raw[3][1] = pos[1];
-        out_model->raw[3][2] = pos[2];
-    }
+    *out_model = jce_m4_from_trs(t->position, t->rotation, jce_v3(sx, sy, sz));
 
     if (out_mesh) {
         *out_mesh = NULL;
-        if (has_mesh) {
-            if (mesh_path && mesh_path[0] != '\0') {
-                *out_mesh = get_cached_mesh(mesh_path, pos);
-            }
-            if (!*out_mesh) {
-                switch (mesh_shape) {
-                default:
-                case JCE_MESH_SHAPE_CUBE:     *out_mesh = s_sr.cube_mesh;     break;
-                case JCE_MESH_SHAPE_SPHERE:   *out_mesh = s_sr.sphere_mesh;   break;
-                case JCE_MESH_SHAPE_PLANE:    *out_mesh = s_sr.plane_mesh;    break;
-                case JCE_MESH_SHAPE_CAPSULE:  *out_mesh = s_sr.capsule_mesh;  break;
-                case JCE_MESH_SHAPE_CYLINDER: *out_mesh = s_sr.cylinder_mesh; break;
+        if (jce_scene_has_mesh_renderer(scene, e)) {
+            JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, e);
+            if (mr) {
+                if (mr->mesh_path[0] != '\0') {
+                    float wp[3] = { t->position.x, t->position.y, t->position.z };
+                    *out_mesh = get_cached_mesh(mr->mesh_path, wp);
+                }
+                if (!*out_mesh) {
+                    /* mesh_shape: 0=cube, 1=sphere, 2=plane, 3=capsule, 4=cylinder */
+                    switch (mr->mesh_shape) {
+                    default:
+                    case 0: *out_mesh = s_sr.cube_mesh;     break;
+                    case 1: *out_mesh = s_sr.sphere_mesh;   break;
+                    case 2: *out_mesh = s_sr.plane_mesh;    break;
+                    case 3: *out_mesh = s_sr.capsule_mesh;  break;
+                    case 4: *out_mesh = s_sr.cylinder_mesh; break;
+                    }
                 }
             }
         }
     }
 
-    if (out_material_path)
-        *out_material_path = mat_path;
+    if (out_material_path) {
+        *out_material_path = NULL;
+        if (jce_scene_has_mesh_renderer(scene, e)) {
+            JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, e);
+            if (mr) *out_material_path = mr->material_path;
+        }
+    }
 
     return true;
 }
 
-static jce_vec3 light_direction_from_transform(const JceComponentInfo *xf)
+/* Returns the direction a directional/spot light shines, taken straight from
+ * its component.  Falls back to the engine default if the component is missing
+ * or its direction is degenerate. */
+static jce_vec3 light_shine_direction(const jce_vec3 *comp_dir)
 {
-    if (!xf || xf->type != JCE_COMP_TRANSFORM)
-        return jce_dir_light_default().direction;
-
-    float yaw_rad = xf->data.transform.rot[1] * JCE_DEG2RAD;
-    float pitch_rad = xf->data.transform.rot[0] * JCE_DEG2RAD;
-    return jce_v3(
-         sinf(yaw_rad) * cosf(pitch_rad),
-        -sinf(pitch_rad),
-        -cosf(yaw_rad) * cosf(pitch_rad));
+    if (!comp_dir) return jce_dir_light_default().direction;
+    float len2 = comp_dir->x*comp_dir->x + comp_dir->y*comp_dir->y + comp_dir->z*comp_dir->z;
+    if (len2 < 1e-8f) return jce_dir_light_default().direction;
+    return *comp_dir;
 }
 
 static jce_vec3 resolve_shadow_light_direction(void)
@@ -228,39 +202,31 @@ static jce_vec3 resolve_shadow_light_direction(void)
     jce_vec3 first_dir = fallback;
     bool have_any_dir = false;
 
+    JceScene *scene = jce_state_get_scene();
+    if (!scene) return fallback;
+
     int count = jce_state_get_entity_count();
     for (int i = 0; i < count; i++) {
-        JceEntityInfo *ent = jce_state_get_entity_by_index(i);
-        if (!ent || !ent->enabled) continue;
+        uint32_t id = jce_state_get_entity_id_by_index(i);
+        if (id == 0 || !jce_state_entity_exists(id)) continue;
+        if (!jce_state_entity_enabled(id)) continue;
 
-        int comp_count = 0;
-        JceComponentInfo *comps = jce_state_get_entity_components(ent->id,
-                                                                  &comp_count);
-        JceComponentInfo *xf = NULL;
-        for (int c = 0; c < comp_count; c++) {
-            if (comps[c].type == JCE_COMP_TRANSFORM) {
-                xf = &comps[c];
-                break;
-            }
+        JceEntity e = (JceEntity)id;
+        if (!jce_scene_has_dir_light(scene, e)) continue;
+        JceDirectionalLight *dl = jce_scene_get_dir_light(scene, e);
+        if (!dl) continue;
+
+        /* light_shine_direction returns "direction the light shines"; all
+           shadow/legacy callers expect "toward the light", so negate. */
+        jce_vec3 dir = light_shine_direction(&dl->direction);
+        dir = jce_v3_scale(dir, -1.0f);
+        if (!have_any_dir) {
+            first_dir = dir;
+            have_any_dir = true;
         }
 
-        for (int c = 0; c < comp_count; c++) {
-            if (comps[c].type != JCE_COMP_LIGHT) continue;
-            if (comps[c].data.light.type != 0) continue;
-
-            /* light_direction_from_transform returns the direction the
-               light shines (from light toward scene).  All shadow/legacy
-               callers expect "toward the light" convention, so negate. */
-            jce_vec3 dir = light_direction_from_transform(xf);
-            dir = jce_v3_scale(dir, -1.0f);
-            if (!have_any_dir) {
-                first_dir = dir;
-                have_any_dir = true;
-            }
-
-            if (comps[c].data.light.casts_shadow)
-                return dir;
-        }
+        if (dl->casts_shadow)
+            return dir;
     }
 
     return have_any_dir ? first_dir : fallback;
@@ -281,13 +247,14 @@ static void draw_selection_outlines(void)
     bgfx_uniform_handle_t su = { uh.idx };
 
     for (int i = 0; i < sel_count; i++) {
-        JceEntityInfo *ent = jce_state_get_entity(sel[i]);
-        if (!ent || !ent->enabled) continue;
+        uint32_t id = sel[i];
+        if (id == 0 || !jce_state_entity_exists(id)) continue;
+        if (!jce_state_entity_enabled(id)) continue;
 
         jce_mat4 model;
         JceMesh *mesh = NULL;
         const char *mat_path = NULL;
-        if (!build_entity_model(ent, &model, &mesh, &mat_path)) continue;
+        if (!build_entity_model(id, &model, &mesh, &mat_path)) continue;
         if (!mesh) continue;
 
         bgfx_set_transform(model.raw[0], 1);
@@ -398,13 +365,14 @@ static void draw_shadow_pass(void)
         bgfx_set_uniform(s_sr.u_shadowVP, shadow_vp, 1);
 
         for (int i = 0; i < count; i++) {
-            JceEntityInfo *ent = jce_state_get_entity_by_index(i);
-            if (!ent || !ent->enabled) continue;
+            uint32_t id = jce_state_get_entity_id_by_index(i);
+            if (id == 0 || !jce_state_entity_exists(id)) continue;
+            if (!jce_state_entity_enabled(id)) continue;
 
             jce_mat4 model;
             JceMesh *mesh = NULL;
             const char *mat_path = NULL;
-            if (!build_entity_model(ent, &model, &mesh, &mat_path)) continue;
+            if (!build_entity_model(id, &model, &mesh, &mat_path)) continue;
             if (!mesh) continue;
 
             bgfx_set_transform(model.raw[0], 1);
@@ -480,13 +448,14 @@ static void draw_shadow_pass(void)
         bgfx_set_view_transform(csm_view, csm_identity, csm.vp[c].raw[0]);
 
         for (int i = 0; i < count; i++) {
-            JceEntityInfo *ent = jce_state_get_entity_by_index(i);
-            if (!ent || !ent->enabled) continue;
+            uint32_t id = jce_state_get_entity_id_by_index(i);
+            if (id == 0 || !jce_state_entity_exists(id)) continue;
+            if (!jce_state_entity_enabled(id)) continue;
 
             jce_mat4 model;
             JceMesh *mesh = NULL;
             const char *mat_path = NULL;
-            if (!build_entity_model(ent, &model, &mesh, &mat_path)) continue;
+            if (!build_entity_model(id, &model, &mesh, &mat_path)) continue;
             if (!mesh) continue;
 
             bgfx_set_transform(model.raw[0], 1);
@@ -535,69 +504,55 @@ void draw_entities(void)
                                   jce_v3(1.0f, 1.0f, 1.0f), 0.15f);
 
         bool has_any_light = false;
-        for (int i = 0; i < count; i++) {
-            JceEntityInfo *ent = jce_state_get_entity_by_index(i);
-            if (!ent || !ent->enabled) continue;
+        JceScene *scene = jce_state_get_scene();
+        for (int i = 0; scene && i < count; i++) {
+            uint32_t id = jce_state_get_entity_id_by_index(i);
+            if (id == 0 || !jce_state_entity_exists(id)) continue;
+            if (!jce_state_entity_enabled(id)) continue;
 
-            int comp_count = 0;
-            JceComponentInfo *comps = jce_state_get_entity_components(ent->id,
-                                                                      &comp_count);
-            for (int c = 0; c < comp_count; c++) {
-                if (comps[c].type != JCE_COMP_LIGHT) continue;
+            JceEntity e = (JceEntity)id;
+            JceTransform *xf = jce_scene_get_transform(scene, e);
 
-                const auto &ld = comps[c].data.light;
-                jce_vec3 color = jce_v3(ld.color[0], ld.color[1], ld.color[2]);
-                float intensity = ld.intensity;
-
-                JceComponentInfo *xf = NULL;
-                for (int t = 0; t < comp_count; t++) {
-                    if (comps[t].type == JCE_COMP_TRANSFORM) { xf = &comps[t]; break; }
-                }
-
-                if (ld.type == 0) {
+            if (jce_scene_has_dir_light(scene, e)) {
+                JceDirectionalLight *dlc = jce_scene_get_dir_light(scene, e);
+                if (dlc) {
                     JceDirLightDesc dl;
                     memset(&dl, 0, sizeof(dl));
-                    dl.color = color;
-                    dl.intensity = intensity > 0.0f ? intensity : 1.0f;
-                    dl.direction = light_direction_from_transform(xf);
+                    dl.color = dlc->color;
+                    dl.intensity = dlc->intensity > 0.0f ? dlc->intensity : 1.0f;
+                    dl.direction = light_shine_direction(&dlc->direction);
                     jce_light_env_add_dir_light(s_sr.light_env, &dl);
                     has_any_light = true;
-                } else if (ld.type == 1) {
+                }
+            }
+
+            if (jce_scene_has_point_light(scene, e)) {
+                JcePointLight *plc = jce_scene_get_point_light(scene, e);
+                if (plc) {
                     JcePointLightDesc pl;
                     memset(&pl, 0, sizeof(pl));
-                    pl.color = color;
-                    pl.intensity = intensity > 0.0f ? intensity : 1.0f;
-                    pl.radius = ld.radius > 0.0f ? ld.radius : 10.0f;
-                    if (xf) {
-                        pl.position = jce_v3(xf->data.transform.pos[0],
-                                             xf->data.transform.pos[1],
-                                             xf->data.transform.pos[2]);
-                    }
+                    pl.color = plc->color;
+                    pl.intensity = plc->intensity > 0.0f ? plc->intensity : 1.0f;
+                    pl.radius = plc->radius > 0.0f ? plc->radius : 10.0f;
+                    /* Transform position is authoritative for world-space placement. */
+                    pl.position = xf ? xf->position : plc->position;
                     jce_light_env_add_point_light(s_sr.light_env, &pl);
                     has_any_light = true;
-                } else if (ld.type == 2) {
+                }
+            }
+
+            if (jce_scene_has_spot_light(scene, e)) {
+                JceSpotLight *slc = jce_scene_get_spot_light(scene, e);
+                if (slc) {
                     JceSpotLightDesc sl;
                     memset(&sl, 0, sizeof(sl));
-                    sl.color = color;
-                    sl.intensity = intensity > 0.0f ? intensity : 1.0f;
-                    sl.radius = ld.radius > 0.0f ? ld.radius : 10.0f;
-                    float inner_deg = ld.inner_cone_deg > 0.0f ? ld.inner_cone_deg : 25.0f;
-                    float outer_deg = ld.outer_cone_deg > 0.0f ? ld.outer_cone_deg : 35.0f;
-                    sl.inner_cone_cos = cosf(inner_deg * JCE_DEG2RAD);
-                    sl.outer_cone_cos = cosf(outer_deg * JCE_DEG2RAD);
-                    if (xf) {
-                        sl.position = jce_v3(xf->data.transform.pos[0],
-                                             xf->data.transform.pos[1],
-                                             xf->data.transform.pos[2]);
-                        float yaw_rad = xf->data.transform.rot[1] * JCE_DEG2RAD;
-                        float pitch_rad = xf->data.transform.rot[0] * JCE_DEG2RAD;
-                        sl.direction = jce_v3(
-                             sinf(yaw_rad) * cosf(pitch_rad),
-                            -sinf(pitch_rad),
-                            -cosf(yaw_rad) * cosf(pitch_rad));
-                    } else {
-                        sl.direction = jce_v3(0.0f, -1.0f, 0.0f);
-                    }
+                    sl.color = slc->color;
+                    sl.intensity = slc->intensity > 0.0f ? slc->intensity : 1.0f;
+                    sl.radius = slc->radius > 0.0f ? slc->radius : 10.0f;
+                    sl.inner_cone_cos = slc->inner_cone_cos;
+                    sl.outer_cone_cos = slc->outer_cone_cos;
+                    sl.position = xf ? xf->position : slc->position;
+                    sl.direction = light_shine_direction(&slc->direction);
                     jce_light_env_add_spot_light(s_sr.light_env, &sl);
                     has_any_light = true;
                 }
@@ -656,45 +611,38 @@ void draw_entities(void)
     if (s_sr.sprite_batch)
         jce_sprite_batch_begin(s_sr.sprite_batch);
 
+    JceScene *scene_ents = jce_state_get_scene();
     for (int i = 0; i < count; i++) {
-        JceEntityInfo *ent = jce_state_get_entity_by_index(i);
-        if (!ent || !ent->enabled) continue;
+        uint32_t id = jce_state_get_entity_id_by_index(i);
+        if (id == 0 || !jce_state_entity_exists(id)) continue;
+        if (!jce_state_entity_enabled(id)) continue;
 
         jce_mat4 model;
         JceMesh *mesh = NULL;
         const char *mat_path = NULL;
-        if (!build_entity_model(ent, &model, &mesh, &mat_path)) continue;
+        if (!build_entity_model(id, &model, &mesh, &mat_path)) continue;
+
+        JceEntity e = (JceEntity)id;
 
         /* ── Skinned / animated entity path ──────────────────────── */
-        {
-            int anim_cc = 0;
-            JceComponentInfo *anim_cs = jce_state_get_entity_components(
-                ent->id, &anim_cc);
-            JceComponentInfo *sa_comp = nullptr;
-            for (int c = 0; c < anim_cc; ++c) {
-                if (anim_cs[c].type == JCE_COMP_SKELETAL_ANIMATOR) {
-                    sa_comp = &anim_cs[c];
-                    break;
-                }
-            }
-            if (sa_comp && sa_comp->data.skeletal_animator.skeleton_path[0]) {
-                ModelCacheEntry *mc = get_cached_model(
-                    sa_comp->data.skeletal_animator.skeleton_path, ent->id);
+        if (scene_ents && jce_scene_has_skeletal_animator(scene_ents, e)) {
+            JceSkeletalAnimatorComponent *sa = jce_scene_get_skeletal_animator(scene_ents, e);
+            if (sa && sa->skeleton_path[0]) {
+                ModelCacheEntry *mc = get_cached_model(sa->skeleton_path, id);
                 if (mc && mc->model) {
                     if (mc->player) {
-                        int ac = sa_comp->data.skeletal_animator.active_clip;
-                        float anim_speed = sa_comp->data.skeletal_animator.speed;
+                        int ac = sa->active_clip;
+                        float anim_speed = sa->speed;
                         if (anim_speed <= 0.0f) anim_speed = 1.0f;
 
                         JceAnimClip *clip = nullptr;
                         if (ac >= 0 && ac < (int)jce_model_anim_count(mc->model))
                             clip = jce_model_get_anim(mc->model, (uint32_t)ac);
 
-                        bool comp_playing = sa_comp->data.skeletal_animator.playing;
+                        bool comp_playing = sa->playing;
                         bool clip_changed = (mc->active_clip != ac);
-                        bool loop_changed = (mc->loop != sa_comp->data.skeletal_animator.loop);
-                        bool speed_changed = fabsf(mc->speed -
-                            anim_speed) > 0.0001f;
+                        bool loop_changed = (mc->loop != sa->loop);
+                        bool speed_changed = fabsf(mc->speed - anim_speed) > 0.0001f;
                         bool paused_changed = (mc->paused == comp_playing);
 
                         if (comp_playing && clip) {
@@ -702,21 +650,17 @@ void draw_entities(void)
                                 || clip_changed || loop_changed) {
                                 /* Start or restart the selected clip. */
                                 jce_anim_player_play(mc->player, clip,
-                                    sa_comp->data.skeletal_animator.loop,
-                                    anim_speed);
+                                    sa->loop, anim_speed);
                             } else if (speed_changed || paused_changed) {
-                                jce_anim_player_set_speed(mc->player,
-                                    anim_speed);
+                                jce_anim_player_set_speed(mc->player, anim_speed);
                             }
                             /* Ensure unpaused and speed synced. */
                             jce_anim_player_pause(mc->player, false);
-                            jce_anim_player_set_speed(mc->player,
-                                anim_speed);
+                            jce_anim_player_set_speed(mc->player, anim_speed);
                         } else {
                             if (clip && (clip_changed || loop_changed)) {
                                 jce_anim_player_play(mc->player, clip,
-                                    sa_comp->data.skeletal_animator.loop,
-                                    anim_speed);
+                                    sa->loop, anim_speed);
                                 jce_anim_player_set_time(mc->player, 0.0f);
                             }
                             /* Paused — freeze at current pose or selected clip. */
@@ -725,7 +669,7 @@ void draw_entities(void)
                         }
 
                         mc->active_clip = ac;
-                        mc->loop = sa_comp->data.skeletal_animator.loop;
+                        mc->loop = sa->loop;
                         mc->speed = anim_speed;
                         mc->paused = !comp_playing;
 
@@ -744,22 +688,16 @@ void draw_entities(void)
             }
         }
 
-        /* ── Sprite entity path (JCE_COMP_SPRITE_RENDERER or SPRITE_ANIMATOR) ── */
-        if (s_sr.sprite_batch) {
-            int sp_cc = 0;
-            JceComponentInfo *sp_cs = jce_state_get_entity_components(ent->id, &sp_cc);
-            JceComponentInfo *spr_comp = nullptr;
-            JceComponentInfo *spa_comp = nullptr;
-            for (int c = 0; c < sp_cc; ++c) {
-                if (sp_cs[c].type == JCE_COMP_SPRITE_RENDERER) spr_comp = &sp_cs[c];
-                if (sp_cs[c].type == JCE_COMP_SPRITE_ANIMATOR)  spa_comp = &sp_cs[c];
-            }
-            if (spr_comp) {
+        /* ── Sprite entity path (sprite renderer / animator) ── */
+        if (s_sr.sprite_batch && scene_ents && jce_scene_has_sprite_renderer(scene_ents, e)) {
+            JceSpriteRendererComponent *spr = jce_scene_get_sprite_renderer(scene_ents, e);
+            JceSpriteAnimatorComponent *spa = jce_scene_has_sprite_animator(scene_ents, e)
+                ? jce_scene_get_sprite_animator(scene_ents, e) : NULL;
+            if (spr) {
                 /* Load sprite texture from the sprite_path. */
                 bgfx_texture_handle_t spr_tex = { UINT16_MAX };
-                if (spr_comp->data.sprite_renderer.sprite_path[0]) {
-                    JceTexture t = get_cached_texture(
-                        spr_comp->data.sprite_renderer.sprite_path, NULL);
+                if (spr->sprite_path[0]) {
+                    JceTexture t = get_cached_texture(spr->sprite_path, NULL);
                     if (jce_texture_valid(t)) spr_tex.idx = t.idx;
                 }
                 if (!BGFX_HANDLE_IS_VALID(spr_tex))
@@ -767,9 +705,9 @@ void draw_entities(void)
 
                 /* Compute UV region from sprite animator frame data. */
                 float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
-                if (spa_comp) {
-                    int fw = spa_comp->data.sprite_animator.frame_width;
-                    int fh = spa_comp->data.sprite_animator.frame_height;
+                if (spa) {
+                    int fw = spa->frame_width;
+                    int fh = spa->frame_height;
                     if (fw > 0 && fh > 0) {
                         /* Simple grid-based UV: no atlas loaded yet, just use
                            frame dimensions relative to a 1x1 mapping. Full
@@ -780,15 +718,11 @@ void draw_entities(void)
                 }
 
                 /* Flip UV if requested. */
-                if (spr_comp->data.sprite_renderer.flip_x) {
-                    float tmp = u0; u0 = u1; u1 = tmp;
-                }
-                if (spr_comp->data.sprite_renderer.flip_y) {
-                    float tmp = v0; v0 = v1; v1 = tmp;
-                }
+                if (spr->flip_x) { float tmp = u0; u0 = u1; u1 = tmp; }
+                if (spr->flip_y) { float tmp = v0; v0 = v1; v1 = tmp; }
 
                 /* Tint color (ABGR). */
-                const float *sc = spr_comp->data.sprite_renderer.color;
+                const float *sc = spr->color;
                 uint8_t r8 = (uint8_t)(sc[0] * 255.0f);
                 uint8_t g8 = (uint8_t)(sc[1] * 255.0f);
                 uint8_t b8 = (uint8_t)(sc[2] * 255.0f);
@@ -802,7 +736,7 @@ void draw_entities(void)
                                      spr_jce_tex,
                                      model.raw[0],
                                      u0, v0, u1, v1,
-                                     abgr, spr_comp->data.sprite_renderer.sorting_order);
+                                     abgr, spr->sorting_order);
                 continue; /* skip regular mesh path */
             }
         }
@@ -812,66 +746,59 @@ void draw_entities(void)
         bgfx_set_transform(model.raw[0], 1);
 
         /* Resolve the MeshRenderer component for texture binding. */
-        int cc = 0;
-        JceComponentInfo *cs = jce_state_get_entity_components(ent->id, &cc);
-        JceComponentInfo *mr_comp = NULL;
-        for (int c = 0; c < cc; c++) {
-            if (cs[c].type == JCE_COMP_MESH_RENDERER) {
-                mr_comp = &cs[c];
-                break;
-            }
-        }
+        JceMeshRenderer *mr_comp = (scene_ents && jce_scene_has_mesh_renderer(scene_ents, e))
+            ? jce_scene_get_mesh_renderer(scene_ents, e) : NULL;
 
         /* ── Non-wireframe rendering with PBR lighting ────────────────── */
         if (view_mode != JCE_VIEW_WIREFRAME && view_mode != JCE_VIEW_WIREFRAME_TEXTURED && mr_comp) {
             JcePbrMaterial pbr = jce_pbr_material_default();
             bool use_checker_fallback = false;
-            if (mr_comp->data.mesh_renderer.base_color[3] > 0.0f) {
-                pbr.base_color_factor[0] = mr_comp->data.mesh_renderer.base_color[0];
-                pbr.base_color_factor[1] = mr_comp->data.mesh_renderer.base_color[1];
-                pbr.base_color_factor[2] = mr_comp->data.mesh_renderer.base_color[2];
-                pbr.base_color_factor[3] = mr_comp->data.mesh_renderer.base_color[3];
+            if (mr_comp->base_color[3] > 0.0f) {
+                pbr.base_color_factor[0] = mr_comp->base_color[0];
+                pbr.base_color_factor[1] = mr_comp->base_color[1];
+                pbr.base_color_factor[2] = mr_comp->base_color[2];
+                pbr.base_color_factor[3] = mr_comp->base_color[3];
             }
-            pbr.metallic_factor      = mr_comp->data.mesh_renderer.metallic;
-            pbr.roughness_factor     = mr_comp->data.mesh_renderer.roughness;
-            pbr.emissive_factor[0]   = mr_comp->data.mesh_renderer.emissive[0];
-            pbr.emissive_factor[1]   = mr_comp->data.mesh_renderer.emissive[1];
-            pbr.emissive_factor[2]   = mr_comp->data.mesh_renderer.emissive[2];
-            pbr.normal_scale         = mr_comp->data.mesh_renderer.normal_scale;
-            pbr.ao_strength          = mr_comp->data.mesh_renderer.ao_strength;
-            pbr.alpha_mode           = (JceAlphaMode)mr_comp->data.mesh_renderer.alpha_mode;
-            pbr.alpha_cutoff         = mr_comp->data.mesh_renderer.alpha_cutoff;
-            pbr.double_sided         = mr_comp->data.mesh_renderer.double_sided;
+            pbr.metallic_factor      = mr_comp->metallic;
+            pbr.roughness_factor     = mr_comp->roughness;
+            pbr.emissive_factor[0]   = mr_comp->emissive[0];
+            pbr.emissive_factor[1]   = mr_comp->emissive[1];
+            pbr.emissive_factor[2]   = mr_comp->emissive[2];
+            pbr.normal_scale         = mr_comp->normal_scale;
+            pbr.ao_strength          = mr_comp->ao_strength;
+            pbr.alpha_mode           = (JceAlphaMode)mr_comp->alpha_mode;
+            pbr.alpha_cutoff         = mr_comp->alpha_cutoff;
+            pbr.double_sided         = mr_comp->double_sided;
 
             /* Load textures only for Textured mode; Shaded uses PBR
                factors with fallback white/flat-normal textures. */
             if (view_mode == JCE_VIEW_TEXTURED) {
-                if (mr_comp->data.mesh_renderer.albedo_tex[0]) {
-                    JceTexture t = get_cached_texture(mr_comp->data.mesh_renderer.albedo_tex, NULL);
+                if (mr_comp->albedo_tex[0]) {
+                    JceTexture t = get_cached_texture(mr_comp->albedo_tex, NULL);
                     if (jce_texture_valid(t)) pbr.albedo_map = t;
                 }
                 if (!jce_texture_valid(pbr.albedo_map)) {
-                    const char *mp = mr_comp->data.mesh_renderer.mesh_path;
+                    const char *mp = mr_comp->mesh_path;
                     JceTexture t = get_cached_texture(mat_path, mp);
                     if (jce_texture_valid(t)) pbr.albedo_map = t;
                 }
                 /* If albedo is still missing, flag shader-side tri-planar checker. */
                 if (!jce_texture_valid(pbr.albedo_map))
                     use_checker_fallback = true;
-                if (mr_comp->data.mesh_renderer.mr_tex[0]) {
-                    JceTexture t = get_cached_texture(mr_comp->data.mesh_renderer.mr_tex, NULL);
+                if (mr_comp->mr_tex[0]) {
+                    JceTexture t = get_cached_texture(mr_comp->mr_tex, NULL);
                     if (jce_texture_valid(t)) pbr.metallic_roughness_map = t;
                 }
-                if (mr_comp->data.mesh_renderer.normal_tex[0]) {
-                    JceTexture t = get_cached_texture(mr_comp->data.mesh_renderer.normal_tex, NULL);
+                if (mr_comp->normal_tex[0]) {
+                    JceTexture t = get_cached_texture(mr_comp->normal_tex, NULL);
                     if (jce_texture_valid(t)) pbr.normal_map = t;
                 }
-                if (mr_comp->data.mesh_renderer.ao_tex[0]) {
-                    JceTexture t = get_cached_texture(mr_comp->data.mesh_renderer.ao_tex, NULL);
+                if (mr_comp->ao_tex[0]) {
+                    JceTexture t = get_cached_texture(mr_comp->ao_tex, NULL);
                     if (jce_texture_valid(t)) pbr.ao_map = t;
                 }
-                if (mr_comp->data.mesh_renderer.emissive_tex[0]) {
-                    JceTexture t = get_cached_texture(mr_comp->data.mesh_renderer.emissive_tex, NULL);
+                if (mr_comp->emissive_tex[0]) {
+                    JceTexture t = get_cached_texture(mr_comp->emissive_tex, NULL);
                     if (jce_texture_valid(t)) pbr.emissive_map = t;
                 }
             }
@@ -934,12 +861,11 @@ void draw_entities(void)
             bgfx_texture_handle_t bind_tex = s_sr.white_tex;
 
             if (view_mode == JCE_VIEW_TEXTURED || view_mode == JCE_VIEW_WIREFRAME_TEXTURED) {
-                const char *mp = mr_comp ? mr_comp->data.mesh_renderer.mesh_path : NULL;
+                const char *mp = mr_comp ? mr_comp->mesh_path : NULL;
                 bool bound_tex = false;
 
-                if (mr_comp && mr_comp->data.mesh_renderer.albedo_tex[0]) {
-                    JceTexture tex = get_cached_texture(
-                        mr_comp->data.mesh_renderer.albedo_tex, NULL);
+                if (mr_comp && mr_comp->albedo_tex[0]) {
+                    JceTexture tex = get_cached_texture(mr_comp->albedo_tex, NULL);
                     if (jce_texture_valid(tex)) {
                         bind_tex.idx = tex.idx;
                         bound_tex = true;
@@ -960,9 +886,10 @@ void draw_entities(void)
                     bool has_mesh_path = mp && mp[0] != '\0';
                     if (has_mat || has_mesh_path) {
                         if (jce_editor_scene_asset_cache_take_texture_warning(mat_path, mp)) {
+                            const char *ent_name = jce_state_entity_name(id);
                             LOG_WARN(LOG_TAG,
                                      "TEXTURED entity '%s': NO texture (mat='%s' mesh='%s')",
-                                     ent->name,
+                                     ent_name ? ent_name : "",
                                      has_mat  ? mat_path : "",
                                      has_mesh_path ? mp  : "");
                         }
@@ -1001,56 +928,42 @@ void draw_physics_debug(void)
     int count = jce_state_get_entity_count();
     if (count == 0) return;
 
+    JceScene *scene = jce_state_get_scene();
+    if (!scene) return;
+
     const uint32_t col_box     = 0xFF00FF00; /* green */
     const uint32_t col_sphere  = 0xFF00FFFF; /* cyan */
     const uint32_t col_capsule = 0xFFFFFF00; /* yellow */
 
     for (int i = 0; i < count; i++) {
-        JceEntityInfo *ent = jce_state_get_entity_by_index(i);
-        if (!ent || !ent->enabled) continue;
+        uint32_t id = jce_state_get_entity_id_by_index(i);
+        if (id == 0 || !jce_state_entity_exists(id)) continue;
+        if (!jce_state_entity_enabled(id)) continue;
 
-        int comp_count = 0;
-        JceComponentInfo *comps = jce_state_get_entity_components(ent->id,
-                                                                   &comp_count);
+        JceEntity e = (JceEntity)id;
+        JceTransform *t = jce_scene_get_transform(scene, e);
+        if (!t) continue;
 
-        /* Find transform. */
-        const float *pos   = NULL;
-        const float *rot_e = NULL;
-        const float *scale = NULL;
-        for (int c = 0; c < comp_count; c++) {
-            if (comps[c].type == JCE_COMP_TRANSFORM) {
-                pos   = comps[c].data.transform.pos;
-                rot_e = comps[c].data.transform.rot;
-                scale = comps[c].data.transform.scale;
-                break;
-            }
-        }
-        if (!pos) continue;
-
-        jce_vec3 center = jce_v3(pos[0], pos[1], pos[2]);
-        jce_quat q = jce_q_identity();
-        if (rot_e && (rot_e[0] != 0 || rot_e[1] != 0 || rot_e[2] != 0))
-            q = jce_q_from_euler(rot_e[0]*JCE_DEG2RAD,
-                                  rot_e[1]*JCE_DEG2RAD,
-                                  rot_e[2]*JCE_DEG2RAD);
+        jce_vec3 center = t->position;
+        jce_quat q = t->rotation;
 
         /* Draw collider shapes. */
-        for (int c = 0; c < comp_count; c++) {
-            if (comps[c].type == JCE_COMP_BOX_COLLIDER) {
-                float sx = (scale && scale[0] > 0) ? scale[0] : 1.0f;
-                float sy = (scale && scale[1] > 0) ? scale[1] : 1.0f;
-                float sz = (scale && scale[2] > 0) ? scale[2] : 1.0f;
-                jce_vec3 half = jce_v3(0.5f * sx, 0.5f * sy, 0.5f * sz);
-                jce_debug_draw_box(center, half, q, col_box);
-            } else if (comps[c].type == JCE_COMP_SPHERE_COLLIDER) {
-                float r = (scale && scale[0] > 0) ? scale[0] * 0.5f : 0.5f;
-                jce_debug_draw_sphere(center, r, col_sphere);
-            } else if (comps[c].type == JCE_COMP_CHARACTER_CONTROLLER) {
-                /* Use the character controller's capsule shape. */
-                float radius = 0.3f;
-                float half_h = 0.6f;
-                jce_debug_draw_capsule(center, radius, half_h, q, col_capsule);
-            }
+        if (jce_scene_has_box_collider(scene, e)) {
+            float sx = (t->scale.x > 0) ? t->scale.x : 1.0f;
+            float sy = (t->scale.y > 0) ? t->scale.y : 1.0f;
+            float sz = (t->scale.z > 0) ? t->scale.z : 1.0f;
+            jce_vec3 half = jce_v3(0.5f * sx, 0.5f * sy, 0.5f * sz);
+            jce_debug_draw_box(center, half, q, col_box);
+        }
+        if (jce_scene_has_sphere_collider(scene, e)) {
+            float r = (t->scale.x > 0) ? t->scale.x * 0.5f : 0.5f;
+            jce_debug_draw_sphere(center, r, col_sphere);
+        }
+        if (jce_scene_has_character_controller(scene, e)) {
+            /* Use the character controller's capsule shape. */
+            float radius = 0.3f;
+            float half_h = 0.6f;
+            jce_debug_draw_capsule(center, radius, half_h, q, col_capsule);
         }
     }
 
@@ -1104,13 +1017,13 @@ void draw_hover_highlight(void)
 {
     if (s_sr.hover_entity_id == 0) return;
 
-    JceEntityInfo *ent = jce_state_get_entity(s_sr.hover_entity_id);
-    if (!ent || !ent->enabled) return;
+    uint32_t id = s_sr.hover_entity_id;
+    if (!jce_state_entity_exists(id) || !jce_state_entity_enabled(id)) return;
 
     jce_mat4 model;
     JceMesh *mesh = NULL;
     const char *mat_path = NULL;
-    if (!build_entity_model(ent, &model, &mesh, &mat_path)) return;
+    if (!build_entity_model(id, &model, &mesh, &mat_path)) return;
     if (!mesh) return;
 
     bgfx_set_transform(model.raw[0], 1);

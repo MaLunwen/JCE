@@ -4,12 +4,11 @@
  * Implements snapshot capture, history push/restore, and the public
  * undo/redo/batch-edit/transaction API.
  *
- * Snapshots now use the engine serializer (jce_scene_serial_save/load)
- * via the ECS adapter for full engine-editor format consistency.
+ * Snapshots use the engine serializer (jce_scene_serial_save/load)
+ * directly against the ECS — no editor mirror store.
  */
 
 #include "jce_editor_state_internal.h"
-#include "jce_editor_ecs_adapter.h"
 
 /* ── History begin/end edit ───────────────────────────────────────── */
 
@@ -61,7 +60,6 @@ bool history_capture_snapshot(EditorHistorySnapshot *out)
 	if (!out)
 		return false;
 
-	/* ECS is kept in sync by CRUD operations, serialize directly. */
 	size_t json_len = 0;
 	char *json_text = jce_scene_serial_save(s.scene, &json_len);
 	if (!json_text)
@@ -103,7 +101,7 @@ bool history_restore_snapshot(const EditorHistorySnapshot &snapshot,
 
 	HistorySuspendScope suspend;
 
-	/* Clear existing scene (destroys/recreates ECS world + editor arrays). */
+	/* Clear existing scene (destroys/recreates ECS world). */
 	clear_scene_entities();
 
 	/* Load via engine serializer → ECS. */
@@ -116,8 +114,8 @@ bool history_restore_snapshot(const EditorHistorySnapshot &snapshot,
 		return false;
 	}
 
-	/* Pull ECS → editor arrays. */
-	jce_adapter_sync_ecs_to_editor();
+	/* Rebuild the editor's iteration order from the freshly-loaded ECS. */
+	rebuild_entity_order_from_ecs();
 
 	if (!snapshot.scene_path.empty())
 		set_current_scene_path_internal(snapshot.scene_path.c_str());
@@ -292,4 +290,3 @@ bool jce_state_transaction_active(void)
 {
 	return s_transaction.active;
 }
-
