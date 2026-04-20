@@ -12,5 +12,6 @@
 
 #include <jce/render/jce_render_graph.h>
 #include <jce/render/jce_render_queue.h>
+#include <jce/render/jce_scene_renderer.h>
 
 #endif /* JCE_API_RENDER_H */

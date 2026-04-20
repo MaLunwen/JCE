@@ -326,6 +326,18 @@ void main()
                * u_baseColorFactor.rgb;
     float alpha = texColor.a * u_baseColorFactor.a;
 
+    // --- View-mode override: TEXTURED / WIREFRAME_TEXTURED → unlit albedo ---
+    // u_normalScale.z carries view mode (0=shaded, 1=wireframe(no override),
+    // 2=textured/unlit, 3=wireframe+textured).
+    float viewMode = u_normalScale.z;
+    if (viewMode > 1.5)
+    {
+        // Output albedo without lighting (gamma-correct for display).
+        vec3 outRgb = pow(max(albedo, vec3_splat(0.0)), vec3_splat(1.0 / 2.2));
+        gl_FragColor = vec4(outRgb, alpha);
+        return;
+    }
+
     // --- Alpha mode ---
     float alphaMode = u_emissiveFactor.w;
     float alphaCutoff = u_pbrParams.w;

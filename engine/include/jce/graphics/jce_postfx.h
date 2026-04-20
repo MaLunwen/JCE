@@ -116,6 +116,12 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
    Returns JCE_TEXTURE_INVALID if no effects were active. */
 JceTextureHandle jce_postfx_get_output(const JcePostFXPipeline *pipeline);
 
+/* Returns the bgfx framebuffer handle (as raw uint16) currently holding the
+ * postfx output texture, or UINT16_MAX if no apply has run.
+ * Editors can submit overlay passes to this FBO so gizmos render *after*
+ * tone-mapping / bloom instead of being filtered through PostFX. */
+uint16_t jce_postfx_get_output_framebuffer(const JcePostFXPipeline *pipeline);
+
 #ifdef __cplusplus
 }
 #endif

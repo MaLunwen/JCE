@@ -2,23 +2,30 @@
  * jce_panel_postfx.cpp  Post-processing effect editor panel.
  *
  * Provides toggle switches and parameter sliders for each PostFX effect
- * in the pipeline.
+ * in the pipeline.  Reads/writes the engine-owned PostFX pipeline via
+ * `jce_scene_renderer_get_postfx`.
  */
 
 #include "jce_editor_panels.h"
 #include "jce_editor_colors.h"
 #include "jce_editor_i18n.h"
+#include "scene/jce_editor_scene_render.h"
 
 #include <imgui.h>
 #include <cstdio>
 
 extern "C" {
 #include <jce/graphics/jce_postfx.h>
+#include <jce/render/jce_scene_renderer.h>
 }
 
-/* ── External: the editor's postfx pipeline instance ──────────────── */
+/* ── Helper: retrieve the engine-owned PostFX pipeline ────────────── */
 
-extern JcePostFXPipeline *g_editor_postfx;
+static JcePostFXPipeline *get_postfx(void)
+{
+    JceSceneRenderer *sr = jce_editor_get_scene_renderer();
+    return sr ? jce_scene_renderer_get_postfx(sr) : NULL;
+}
 
 /* ── Panel state ──────────────────────────────────────────────────── */
 
@@ -31,10 +38,11 @@ static struct {
 static void ensure_init(void)
 {
     if (s_pfx.initialized) return;
-    if (g_editor_postfx) {
-        jce_postfx_get_params(g_editor_postfx, &s_pfx.params);
+    JcePostFXPipeline *pfx = get_postfx();
+    if (pfx) {
+        jce_postfx_get_params(pfx, &s_pfx.params);
         for (int i = 0; i < JCE_POSTFX_COUNT; i++)
-            s_pfx.enabled[i] = jce_postfx_is_enabled(g_editor_postfx,
+            s_pfx.enabled[i] = jce_postfx_is_enabled(pfx,
                                                      (JcePostFXType)i);
     } else {
         s_pfx.params = jce_postfx_default_params();
@@ -46,10 +54,11 @@ static void ensure_init(void)
 
 static void sync_to_pipeline(void)
 {
-    if (!g_editor_postfx) return;
-    jce_postfx_set_params(g_editor_postfx, &s_pfx.params);
+    JcePostFXPipeline *pfx = get_postfx();
+    if (!pfx) return;
+    jce_postfx_set_params(pfx, &s_pfx.params);
     for (int i = 0; i < JCE_POSTFX_COUNT; i++)
-        jce_postfx_enable(g_editor_postfx, (JcePostFXType)i, s_pfx.enabled[i]);
+        jce_postfx_enable(pfx, (JcePostFXType)i, s_pfx.enabled[i]);
 }
 
 /* ── Content ──────────────────────────────────────────────────────── */

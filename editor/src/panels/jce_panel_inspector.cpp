@@ -18,6 +18,16 @@
 #include <math.h>
 #include <cmath>
 
+/* Per-entity euler cache shared with the scene-view gizmo. Implemented in
+ * jce_scene_view_helpers.cpp; declared inline here to avoid pulling in the
+ * full scene-view internal header. */
+extern "C++" {
+    bool jce_editor_get_cached_euler_deg(uint32_t entity_id, jce_quat current_q,
+                                          float out_deg[3]);
+    void jce_editor_set_cached_euler_deg(uint32_t entity_id, jce_quat q,
+                                          const float deg[3]);
+}
+
 extern "C" {
 #include <jce/graphics/jce_pbr_material.h>
 #include <jce/graphics/jce_model.h>
@@ -280,12 +290,13 @@ static void accept_mesh_drop_with_material(JceMeshRenderer *mr)
 
 /* ── Per-component draw helpers ───────────────────────────────────── */
 
-static void draw_comp_transform(JceTransform *t)
+static void draw_comp_transform(uint32_t entity_id, JceTransform *t)
 {
     float pos[3] = {t->position.x, t->position.y, t->position.z};
     float scl[3] = {t->scale.x,    t->scale.y,    t->scale.z};
     float rot[3];
-    jce_q_to_euler_deg(t->rotation, rot);
+    if (!jce_editor_get_cached_euler_deg(entity_id, t->rotation, rot))
+        jce_q_to_euler_deg(t->rotation, rot);
 
     ImGui::Text("%s", jce_editor_i18n("transform.position"));
     ImGui::SameLine(80);
@@ -302,8 +313,10 @@ static void draw_comp_transform(JceTransform *t)
         rot[a] = fmodf(rot[a], 360.0f);
         if (rot[a] < 0.0f) rot[a] += 360.0f;
     }
-    if (rot[0] != rot_in[0] || rot[1] != rot_in[1] || rot[2] != rot_in[2])
+    if (rot[0] != rot_in[0] || rot[1] != rot_in[1] || rot[2] != rot_in[2]) {
         t->rotation = jce_q_from_euler_deg(rot);
+        jce_editor_set_cached_euler_deg(entity_id, t->rotation, rot);
+    }
 
     ImGui::Text("%s", jce_editor_i18n("transform.scale"));
     ImGui::SameLine(80);
@@ -1146,7 +1159,7 @@ void jce_editor_panel_inspector_content(void)
     if (flags & JCE_COMP_FLAG_TRANSFORM) {
         if (comp_section_begin(focused, sidecar, JCE_COMP_FLAG_TRANSFORM,
                                 jce_comp_flag_display_name(JCE_COMP_FLAG_TRANSFORM), false))
-            draw_comp_transform(jce_scene_get_transform(scene, ecs_e));
+            draw_comp_transform(focused, jce_scene_get_transform(scene, ecs_e));
         comp_section_end();
     }
 

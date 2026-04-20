@@ -86,6 +86,15 @@ static void normalize_euler_deg(float rot[3])
     }
 }
 
+/* Per-entity persistent euler cache. JceTransform stores rotation as a
+ * quaternion, but the gizmo operates in euler degrees. Round-tripping
+ * quat→euler→quat every frame collapses rotations whenever pitch crosses
+ * the YXZ gimbal-lock branch at ±90° — X drag past 90° would suddenly
+ * push 180° into Y/Z values. To avoid this we keep the editor's own
+ * authoritative euler for the focused entity, only re-decomposing from
+ * the quaternion when the transform was modified externally (inspector,
+ * undo, scene reload, focus change). */
+
 /* ── Gizmo overlay (translate/rotate/scale) ──────────────────────── */
 
 void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
@@ -136,7 +145,8 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
         xform->position.x, xform->position.y, xform->position.z
     };
     float gizmo_rot[3];
-    scene_view_q_to_euler_deg(xform->rotation, gizmo_rot);
+    if (!jce_editor_get_cached_euler_deg(focused, xform->rotation, gizmo_rot))
+        scene_view_q_to_euler_deg(xform->rotation, gizmo_rot);
     float gizmo_scale[3] = {
         xform->scale.x, xform->scale.y, xform->scale.z
     };
@@ -293,6 +303,7 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
 
             normalize_euler_deg(gizmo_rot);
             xform->rotation = scene_view_q_from_euler_deg(gizmo_rot);
+            jce_editor_set_cached_euler_deg(focused, xform->rotation, gizmo_rot);
 
             xform->scale.x = gizmo_scale[0] < 0.001f ? 0.001f : gizmo_scale[0];
             xform->scale.y = gizmo_scale[1] < 0.001f ? 0.001f : gizmo_scale[1];

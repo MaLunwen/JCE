@@ -77,6 +77,11 @@ JcePbrMaterial jce_pbr_material_default(void);
 void jce_pbr_material_bind(const JcePbrMaterial *mat,
                             const JceRenderer *r, uint16_t view_id);
 
+/* Set the global PBR view mode (0=shaded, 1=wireframe, 2=textured/unlit,
+ * 3=wireframe+textured). Affects all subsequent jce_pbr_material_bind
+ * calls. The scene renderer pushes this once per frame from its config. */
+void jce_pbr_material_set_view_mode(int mode);
+
 /* ================================================================== */
 /* Material file I/O (.mat.json)                                       */
 /* ================================================================== */

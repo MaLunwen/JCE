@@ -80,6 +80,17 @@ extern ImVec2 s_sel_click_pos;
 
 /* ── Gizmo raw drag state ────────────────────────────────────────── */
 
+/* Per-entity persistent euler cache. JceTransform stores rotation as a
+ * quaternion, but the gizmo + inspector both operate in euler degrees.
+ * Round-tripping quat→euler→quat every frame collapses rotations whenever
+ * pitch crosses the YXZ gimbal-lock branch at ±90° — X drag past 90°
+ * would suddenly push 180° into Y/Z values. To avoid this we keep the
+ * editor's own authoritative euler for the focused entity, only
+ * re-decomposing from the quaternion when the transform was modified
+ * externally (undo, scene reload, focus change). */
+bool jce_editor_get_cached_euler_deg(uint32_t entity_id, jce_quat current_q, float out_deg[3]);
+void jce_editor_set_cached_euler_deg(uint32_t entity_id, jce_quat q, const float deg[3]);
+
 extern bool  s_gizmo_raw_dragging;
 extern float s_gizmo_raw_pos[3];
 extern float s_gizmo_raw_rot[3];

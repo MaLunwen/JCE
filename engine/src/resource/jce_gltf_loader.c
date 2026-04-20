@@ -103,11 +103,49 @@ static JceTexture load_gltf_texture(const JcePakArchive *pak,
         }
     }
 
-    /* Case 2: external URI -- resolve relative to model path in PAK. */
+    /* Case 2: external URI -- resolve relative to model path. Try PAK first
+     * (runtime), then fall back to disk (editor / dev workflow). */
     if (image->uri) {
         char resolved[512];
         resolve_path(model_path, image->uri, resolved, sizeof(resolved));
-        return jce_texture_load_ex(pak, resolved, JCE_TEX_WRAP);
+        JceTexture t = jce_texture_load_ex(pak, resolved, JCE_TEX_WRAP);
+        if (jce_texture_valid(t)) return t;
+
+        /* Disk fallback: build absolute path from model_path's directory. */
+        char disk_path[1024];
+        const char *slash = strrchr(model_path, '/');
+        const char *bslash = strrchr(model_path, '\\');
+        const char *sep = (slash > bslash) ? slash : bslash;
+        if (sep) {
+            size_t dir_len = (size_t)(sep - model_path + 1);
+            if (dir_len < sizeof(disk_path)) {
+                memcpy(disk_path, model_path, dir_len);
+                SDL_strlcpy(disk_path + dir_len, image->uri,
+                            sizeof(disk_path) - dir_len);
+            } else {
+                SDL_strlcpy(disk_path, image->uri, sizeof(disk_path));
+            }
+        } else {
+            SDL_strlcpy(disk_path, image->uri, sizeof(disk_path));
+        }
+
+        SDL_IOStream *io = SDL_IOFromFile(disk_path, "rb");
+        if (io) {
+            SDL_Surface *surf = IMG_Load_IO(io, true);
+            if (surf) {
+                if (surf->format != SDL_PIXELFORMAT_RGBA32) {
+                    SDL_Surface *conv = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA32);
+                    SDL_DestroySurface(surf);
+                    surf = conv;
+                }
+                if (surf) {
+                    JceTexture tex = jce_texture_load_from_surface(surf, JCE_TEX_WRAP);
+                    SDL_DestroySurface(surf);
+                    return tex;
+                }
+            }
+        }
+        return JCE_TEXTURE_INVALID;
     }
 
     (void)data;

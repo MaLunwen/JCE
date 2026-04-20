@@ -60,8 +60,10 @@ struct JcePostFXPipeline {
     bgfx_index_buffer_handle_t  quad_ib;
     bgfx_vertex_layout_t        quad_layout;
 
-    /* Output texture from the last apply. */
-    bgfx_texture_handle_t output_tex;
+    /* Output texture and framebuffer from the last apply. */
+    bgfx_texture_handle_t      output_tex;
+    bgfx_frame_buffer_handle_t output_fb;
+    int                        output_ping;   /* index into fbo[] */
 };
 
 /* ── Default parameters ────────────────────────────────────────────── */
@@ -517,6 +519,8 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
 
     /* Store the final output texture for the caller. */
     pipeline->output_tex = current_tex;
+    pipeline->output_fb  = pipeline->fbo[ping];
+    pipeline->output_ping = ping;
 
     LOG_TRACE(LOG_TAG, "post-fx apply: %d effects active, %d views used",
               active, view_id - JCE_VIEW_POST_BASE);
@@ -528,4 +532,10 @@ JceTextureHandle jce_postfx_get_output(const JcePostFXPipeline *pipeline)
     if (pipeline)
         h.idx = pipeline->output_tex.idx;
     return h;
+}
+
+uint16_t jce_postfx_get_output_framebuffer(const JcePostFXPipeline *pipeline)
+{
+    if (!pipeline) return UINT16_MAX;
+    return pipeline->output_fb.idx;
 }

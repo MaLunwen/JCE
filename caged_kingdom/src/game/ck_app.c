@@ -9,6 +9,8 @@
 
 #include "ck_app.h"
 #include <jce/api.h>
+#include <jce/scene/jce_scene_serial.h>
+#include <cJSON/cJSON.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,30 +35,14 @@ struct CkApp {
 
     JceTimer     *timer;
 
-    /* 3D scene. */
-    JceCamera    *camera;
+    /* 3D scene (ECS + engine renderer). */
+    JceCamera          *camera;
     JceCameraController *cam_ctrl;
-    JceMesh      *cube;
-    JceMesh      *chalet;
-    JceMesh      *ground;
-    JceModel     *model_bagman;
-    JceAnimPlayer *anim_player;
-    jce_mat4      anim_bones[256];
-    uint32_t      anim_num_joints;
-    int           anim_clip_index;  /* index of currently playing clip */
-    JceTexture    tex_cube;
-    JceTexture    tex_ground;
-    JceDirLight   sun;
-    JceLightEnv  *light_env;
-    float         cam_yaw;
-    float         cube_angle;
+    JceScene           *scene;
+    JceSceneRenderer   *scene_renderer;
 
     /* Asset handles for manager-loaded resources. */
     JceAssetHandle h_tex_demo;
-    JceAssetHandle h_tex_cube;
-    JceAssetHandle h_tex_ground;
-    JceAssetHandle h_cube;
-    JceAssetHandle h_chalet;
 
     bool          quit_requested;
     bool          paused;
@@ -229,24 +215,9 @@ CkApp *ck_app_create(const JceServices *svc)
         app->h_tex_demo = jce_asset_load(app->svc.assets,
                               "textures/texture.jpg", JCE_ASSET_TEXTURE);
         app->tex_demo = jce_asset_get_texture(app->svc.assets, app->h_tex_demo);
-
-        app->h_tex_cube = jce_asset_load(app->svc.assets,
-                              "textures/chalet.jpg", JCE_ASSET_TEXTURE);
-        app->tex_cube = jce_asset_get_texture(app->svc.assets, app->h_tex_cube);
-
-        JceAssetLoadParams wrap_params = JCE_ASSET_LOAD_DEFAULT;
-        wrap_params.texture_sampler_mode = JCE_TEX_WRAP;
-        wrap_params.sync = true;
-        app->h_tex_ground = jce_asset_acquire(app->svc.assets,
-                                "textures/texture.jpg", JCE_ASSET_TEXTURE,
-                                &wrap_params);
-        app->tex_ground = jce_asset_get_texture(app->svc.assets, app->h_tex_ground);
     } else {
         /* Fallback: direct loading if no asset manager. */
         app->tex_demo = jce_texture_load(app->svc.pak, "textures/texture.jpg");
-        app->tex_cube = jce_texture_load(app->svc.pak, "textures/chalet.jpg");
-        app->tex_ground = jce_texture_load_ex(app->svc.pak,
-                              "textures/texture.jpg", JCE_TEX_WRAP);
     }
 
     /* Load demo font (32pt, must run on main thread). */
@@ -273,60 +244,43 @@ CkApp *ck_app_create(const JceServices *svc)
         app->camera = jce_camera_create(&cam_desc);
     }
     app->cam_ctrl = jce_camctrl_create(app->camera, NULL);
-    app->ground = jce_mesh_create_plane_ex(10.0f, 10.0f, 10, 5.0f);
-    app->sun = jce_dir_light_default();
 
-    /* PBR light environment (matches sun direction). */
-    app->light_env = jce_light_env_create();
-    jce_light_env_set_ambient(app->light_env, jce_v3(1.0f, 1.0f, 1.0f), 0.15f);
+    /* Create ECS scene and load entities from PAK-packed JSON.
+       No programmatic fallback — ck must consume scene data, not build it. */
+    app->scene = jce_scene_create();
     {
-        JceDirLightDesc dl = {0};
-        dl.direction = app->sun.direction;
-        dl.color     = app->sun.color;
-        dl.intensity = JCE_PI;  /* compensate for Lambertian /PI in Cook-Torrance BRDF */
-        jce_light_env_add_dir_light(app->light_env, &dl);
-    }
-
-    /* Load PSX BagMan GLB model + start animation. */
-    app->model_bagman = jce_model_load_gltf(app->svc.pak,
-        "models/PSX_BagMan.glb");
-    if (app->model_bagman) {
-        JceSkeleton *skel = jce_model_get_skeleton(app->model_bagman);
-        if (skel) {
-            app->anim_player = jce_anim_player_create(skel);
-            if (app->anim_player && jce_model_anim_count(app->model_bagman) > 0) {
-                /* Prefer "Walk_loop" or "Idle_loop" for clearly visible
-                   bone deformation; fall back to first non-zero-duration clip. */
-                uint32_t num_clips = jce_model_anim_count(app->model_bagman);
-                app->anim_clip_index = -1;
-                /* Pass 1: look for Walk_loop or Idle_loop by name. */
-                for (uint32_t ci = 0; ci < num_clips; ci++) {
-                    JceAnimClip *c = jce_model_get_anim(app->model_bagman, ci);
-                    const char *name = jce_anim_clip_name(c);
-                    if (name && (strstr(name, "Walk") || strstr(name, "Idle"))) {
-                        if (jce_anim_clip_duration(c) > 0.0f) {
-                            app->anim_clip_index = (int)ci;
-                            break;
-                        }
+        const JcePakAsset *sa = jce_pak_find(app->svc.pak,
+                                             "scenes/main.scene.json");
+        if (!sa) {
+            LOG_ERROR("ck_app",
+                      "scenes/main.scene.json not found in PAK — cannot start");
+        } else {
+            void *buf = malloc((size_t)sa->original_size + 1);
+            if (buf) {
+                size_t sz = jce_pak_decompress(sa, buf,
+                                               (size_t)sa->original_size);
+                if (sz > 0) {
+                    ((char *)buf)[sz] = '\0';
+                    cJSON *root = cJSON_Parse((const char *)buf);
+                    if (root) {
+                        int n = jce_scene_load_json(app->scene, root);
+                        cJSON_Delete(root);
+                        if (n <= 0)
+                            LOG_ERROR("ck_app",
+                                      "scenes/main.scene.json: parsed 0 entities");
+                    } else {
+                        LOG_ERROR("ck_app",
+                                  "scenes/main.scene.json: JSON parse error");
                     }
                 }
-                /* Pass 2: fallback to first non-zero-duration. */
-                if (app->anim_clip_index < 0) {
-                    app->anim_clip_index = 0;
-                    for (uint32_t ci = 0; ci < num_clips; ci++) {
-                        JceAnimClip *c = jce_model_get_anim(app->model_bagman, ci);
-                        if (jce_anim_clip_duration(c) > 0.0f) {
-                            app->anim_clip_index = (int)ci;
-                            break;
-                        }
-                    }
-                }
-                JceAnimClip *clip = jce_model_get_anim(
-                    app->model_bagman, (uint32_t)app->anim_clip_index);
-                jce_anim_player_play(app->anim_player, clip, true, 1.0f);
+                free(buf);
             }
         }
     }
+
+    /* Engine scene renderer (resolves textures/models from PAK). */
+    app->scene_renderer = jce_scene_renderer_create(
+        app->svc.renderer, app->svc.pak, NULL);
 
     /* Set window icon from PAK. */
     {
@@ -402,35 +356,19 @@ void ck_app_destroy(CkApp *app)
     app->ui = NULL;
     jce_touch_hud_destroy(app->touch_hud);
     jce_timer_destroy(app->timer);
+
+    /* Scene renderer + ECS scene + camera. */
+    jce_scene_renderer_destroy(app->scene_renderer);
+    jce_scene_destroy(app->scene);
     jce_camctrl_destroy(app->cam_ctrl);
     jce_camera_destroy(app->camera);
 
-    /* Release assets through the manager if available. */
+    /* Release demo texture (used by 2D overlay path historically). */
     if (app->svc.assets) {
-        /* Release manager-owned assets by handle. */
         jce_asset_release(app->svc.assets, app->h_tex_demo);
-        jce_asset_release(app->svc.assets, app->h_tex_cube);
-        jce_asset_release(app->svc.assets, app->h_tex_ground);
-
-        /* Meshes: if asset load failed and we created a fallback, destroy it.
-           Otherwise the asset manager owns the mesh data. */
-        if (jce_asset_get_mesh(app->svc.assets, app->h_cube) == NULL)
-            jce_mesh_destroy(app->cube);
-        jce_asset_release(app->svc.assets, app->h_cube);
-
-        jce_asset_release(app->svc.assets, app->h_chalet);
     } else {
-        jce_mesh_destroy(app->cube);
-        jce_mesh_destroy(app->chalet);
-        jce_texture_destroy(app->tex_cube);
-        jce_texture_destroy(app->tex_ground);
         jce_texture_destroy(app->tex_demo);
     }
-    /* Ground is always procedural, not from asset manager. */
-    jce_anim_player_destroy(app->anim_player);
-    jce_model_destroy(app->model_bagman);
-    jce_light_env_destroy(app->light_env);
-    jce_mesh_destroy(app->ground);
     jce_font_close(app->font_i18n);
     jce_font_close(app->font_main);
     free(app);
@@ -710,21 +648,9 @@ static void update_pause(CkApp *app, float dt_ms)
 
 /* -- 3D scene ------------------------------------------------------ */
 
-static void draw_mesh_lit(CkApp *app, const JceMesh *mesh,
-                          JceTexture tex,
-                          const jce_mat4 *model)
-{
-    jce_lighting_apply(app->svc.renderer, &app->sun);
-    jce_renderer_bind_texture(app->svc.renderer, 0, tex);
-    jce_renderer_set_transform(model->raw[0]);
-    jce_mesh_submit(mesh, app->svc.renderer,
-                    JCE_VIEW_MAIN_3D);
-}
-
 static void draw_3d_scene(CkApp *app, float dt_ms)
 {
     float dt_sec = dt_ms / 1000.0f;
-    app->cube_angle += dt_sec * 1.0f;
 
     /* Gather camera input. */
     JceCameraInput cam_in = {0};
@@ -787,53 +713,11 @@ static void draw_3d_scene(CkApp *app, float dt_ms)
     jce_renderer_begin_frame_3d(app->svc.renderer,
         app->svc.window, app->camera, JCE_VIEW_MAIN_3D);
 
-    JceShaderHandle mesh_sh =
-        jce_renderer_get_program_mesh(app->svc.renderer);
-    if (!jce_shader_valid(mesh_sh))
-        return;
-
-    /* Ground plane at Y=0. */
-    {
-        JceTexture gt = jce_texture_valid(app->tex_ground)
-                      ? app->tex_ground : app->tex_cube;
-        jce_mat4 model = jce_m4_identity();
-        draw_mesh_lit(app, app->ground, gt, &model);
-    }
-
-    /* PSX BagMan character (PBR). */
-    if (app->model_bagman) {
-        /* Advance animation; cycle to the next clip when the current one ends. */
-        if (app->anim_player) {
-            uint32_t num_clips = jce_model_anim_count(app->model_bagman);
-            if (num_clips > 0 && !jce_anim_player_is_playing(app->anim_player)) {
-                /* Advance to next clip, skipping zero-duration rest-pose clips. */
-                for (uint32_t tries = 0; tries < num_clips; tries++) {
-                    app->anim_clip_index =
-                        (app->anim_clip_index + 1) % (int)num_clips;
-                    JceAnimClip *next = jce_model_get_anim(
-                        app->model_bagman, (uint32_t)app->anim_clip_index);
-                    if (jce_anim_clip_duration(next) > 0.0f) {
-                        jce_anim_player_play(app->anim_player, next, true, 1.0f);
-                        break;
-                    }
-                }
-            }
-            app->anim_num_joints = jce_anim_player_update(
-                app->anim_player, dt_sec, app->anim_bones, 256);
-        }
-
-        /* Set PBR light uniforms (camera pos for specular). */
-        jce_light_env_set_camera_pos(app->light_env,
-            jce_camera_get_position(app->camera));
-        jce_light_env_apply(app->light_env, app->svc.renderer);
-
-        jce_mat4 model_t = jce_m4_translate(jce_v3(0.0f, 0.0f, -2.0f));
-
-        jce_model_draw(app->model_bagman, app->svc.renderer,
-                       JCE_VIEW_MAIN_3D, &model_t,
-                       app->anim_num_joints > 0 ? app->anim_bones : NULL,
-                       app->anim_num_joints);
-    }
+    /* Render the ECS scene via the engine scene renderer. */
+    JceSceneRenderConfig cfg = jce_scene_render_config_default();
+    jce_scene_renderer_render(
+        app->scene_renderer, app->scene, app->camera,
+        JCE_VIEW_MAIN_3D, dt_sec, &cfg);
 }
 
 /* -- 2D overlay ---------------------------------------------------- */

@@ -30,6 +30,43 @@ float s_gizmo_raw_rot[3]   = {0.0f, 0.0f, 0.0f};
 float s_gizmo_raw_scale[3] = {1.0f, 1.0f, 1.0f};
 bool  s_gizmo_history_batch_open = false;
 
+/* ── Per-entity persistent euler cache (see internal header) ─────── */
+
+static uint32_t  s_euler_cache_entity = 0;
+static jce_quat  s_euler_cache_quat   = {0.0f, 0.0f, 0.0f, 1.0f};
+static float     s_euler_cache_deg[3] = {0.0f, 0.0f, 0.0f};
+static bool      s_euler_cache_valid  = false;
+
+static bool euler_cache_quat_almost_equal(jce_quat a, jce_quat b)
+{
+    /* Quaternion double-cover: q and -q are the same rotation. */
+    float d = a.w*b.w + a.x*b.x + a.y*b.y + a.z*b.z;
+    return fabsf(d) > 0.99999f;
+}
+
+bool jce_editor_get_cached_euler_deg(uint32_t entity_id, jce_quat current_q,
+                                      float out_deg[3])
+{
+    if (!s_euler_cache_valid) return false;
+    if (s_euler_cache_entity != entity_id) return false;
+    if (!euler_cache_quat_almost_equal(s_euler_cache_quat, current_q)) return false;
+    out_deg[0] = s_euler_cache_deg[0];
+    out_deg[1] = s_euler_cache_deg[1];
+    out_deg[2] = s_euler_cache_deg[2];
+    return true;
+}
+
+void jce_editor_set_cached_euler_deg(uint32_t entity_id, jce_quat q,
+                                      const float deg[3])
+{
+    s_euler_cache_entity = entity_id;
+    s_euler_cache_quat   = q;
+    s_euler_cache_deg[0] = deg[0];
+    s_euler_cache_deg[1] = deg[1];
+    s_euler_cache_deg[2] = deg[2];
+    s_euler_cache_valid  = true;
+}
+
 /* ── Gizmo state helpers ─────────────────────────────────────────── */
 
 void clear_stale_gizmo_interaction_state(void)

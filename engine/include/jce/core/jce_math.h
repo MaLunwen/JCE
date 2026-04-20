@@ -251,22 +251,37 @@ static inline jce_quat jce_q_slerp(jce_quat a, jce_quat b, float t)
     return glms_quat_slerp(a, b, t);
 }
 
-/* Quaternion → Euler angles (radians).  Returns (pitch, yaw, roll) in YXZ order.
- * Hand-rolled: cglm has no direct quat→euler; its glm_euler_angles() works on mat4.
- * This avoids an intermediate mat4 conversion and handles gimbal lock correctly. */
+/* Quaternion → Euler angles (radians) in YXZ order — the inverse of
+ * jce_q_from_euler above. Returns (pitch=X, yaw=Y, roll=Z) such that
+ * jce_q_from_euler(q_to_euler(q)) reconstructs q (modulo gimbal-lock
+ * branch). Earlier this used the standard ZYX (roll-pitch-yaw)
+ * decomposition formulas, which do NOT round-trip through the YXZ
+ * jce_q_from_euler — the resulting drift caused gizmo R-rotation to
+ * self-spin each frame. */
 static inline jce_vec3 jce_q_to_euler(jce_quat q)
 {
     jce_vec3 e;
-    float sinr_cosp = 2.0f * (q.w * q.x + q.y * q.z);
-    float cosr_cosp = 1.0f - 2.0f * (q.x * q.x + q.y * q.y);
-    e.x = atan2f(sinr_cosp, cosr_cosp); /* pitch */
-    float sinp = 2.0f * (q.w * q.y - q.z * q.x);
-    e.y = (fabsf(sinp) >= 1.0f)
-        ? copysignf((float)GLM_PI * 0.5f, sinp)
-        : asinf(sinp); /* yaw */
-    float siny_cosp = 2.0f * (q.w * q.z + q.x * q.y);
-    float cosy_cosp = 1.0f - 2.0f * (q.y * q.y + q.z * q.z);
-    e.z = atan2f(siny_cosp, cosy_cosp); /* roll */
+    /* Pitch (X) = asin(-M[1][2]) where M is the rotation matrix of
+     * q = qy * qx * qz. M[1][2] = 2(yz - wx). */
+    float sinx = 2.0f * (q.w * q.x - q.y * q.z);
+    if (sinx >  1.0f) sinx =  1.0f;
+    if (sinx < -1.0f) sinx = -1.0f;
+    e.x = asinf(sinx);
+    if (fabsf(sinx) >= 0.99999f) {
+        /* Gimbal lock at ±90° pitch: X axis aligned with Y. Solve for
+         * combined Y+Z by setting Z=0 (convention) and reading Y from
+         * the residual matrix entries. */
+        e.y = atan2f(-2.0f * (q.x * q.z - q.w * q.y),
+                      1.0f - 2.0f * (q.y * q.y + q.z * q.z));
+        e.z = 0.0f;
+    } else {
+        /* Yaw   (Y) = atan2(M[0][2], M[2][2]) = atan2(2(xz+wy), 1-2(x²+y²)) */
+        e.y = atan2f(2.0f * (q.x * q.z + q.w * q.y),
+                     1.0f - 2.0f * (q.x * q.x + q.y * q.y));
+        /* Roll  (Z) = atan2(M[1][0], M[1][1]) = atan2(2(xy+wz), 1-2(x²+z²)) */
+        e.z = atan2f(2.0f * (q.x * q.y + q.w * q.z),
+                     1.0f - 2.0f * (q.x * q.x + q.z * q.z));
+    }
     return e;
 }
 

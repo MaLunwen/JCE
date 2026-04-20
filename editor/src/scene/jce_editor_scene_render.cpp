@@ -1,19 +1,23 @@
 /*
  * jce_editor_scene_render.cpp  Editor 3D scene rendering (FBO pipeline).
  *
- * Owns the SceneRenderState instance and implements init/shutdown/frame.
- * Camera logic is in jce_scene_render_camera.cpp.
- * Draw logic (sky, grid, entities) is in jce_scene_render_draw.cpp.
+ * Phase B refactor: scene rendering is delegated to the engine
+ * `JceSceneRenderer` (sky, shadows, entities, sprites, IBL, post-fx
+ * params). This file owns the overlay pipeline (grid, selection, ghost,
+ * hover, physics debug) and the editor's PostFX bloom/tonemap chain.
  */
 
 #include "jce_scene_render_internal.h"
 #include "jce_editor_file_util.h"
 
+#include <SDL3/SDL_timer.h>
+
 extern "C" {
 #include <jce/graphics/jce_postfx.h>
+#include <jce/graphics/jce_model.h>
+#include <jce/animation/jce_animation.h>
+#include <jce/scene/jce_scene.h>
 }
-
-extern JcePostFXPipeline *g_editor_postfx;
 
 /* ── State instance (shared via extern in internal header) ────────── */
 
@@ -21,8 +25,15 @@ SceneRenderState s_sr;
 
 /* ── Helpers (shared via internal header) ─────────────────────────── */
 
+/* When non-UINT16_MAX, scene_view_id() returns this instead of the bridge view.
+ * Used to redirect editor overlays into the post-PostFX FBO so gizmos render
+ * crisply on top of the tone-mapped scene. */
+static uint16_t s_view_id_override = UINT16_MAX;
+
 uint16_t scene_view_id(void)
 {
+    if (s_view_id_override != UINT16_MAX)
+        return s_view_id_override;
     if (s_sr.bridge)
         return jce_editor_render_bridge_get_view_id(s_sr.bridge);
     return (uint16_t)JCE_VIEW_EDITOR_SCENE;
@@ -39,57 +50,48 @@ JceTexture get_cached_texture(const char *material_path,
     return jce_editor_scene_asset_cache_get_texture(material_path, mesh_path);
 }
 
-/* ── Model / animation cache ─────────────────────────────────────── */
+/* ── Asset cache callbacks for the engine scene renderer ──────────── */
 
-ModelCacheEntry *get_cached_model(const char *skeleton_path, uint32_t entity_id)
+static JceMesh *ed_load_mesh_cb(const char *path, void *ud)
 {
-    if (!skeleton_path || skeleton_path[0] == '\0') return nullptr;
-
-    /* Look up existing entry by path. */
-    int free_slot = -1;
-    for (int i = 0; i < MODEL_CACHE_MAX; ++i) {
-        ModelCacheEntry &e = s_sr.model_cache[i];
-        if (e.used && strcmp(e.path, skeleton_path) == 0) {
-            e.bound_entity = entity_id;
-            return &e;
-        }
-        if (!e.used && free_slot < 0) free_slot = i;
-    }
-
-    if (free_slot < 0) return nullptr; /* cache full */
-
-    /* Load from disk. */
-    size_t fsize = 0;
-    void *buf = ed_read_file(skeleton_path, &fsize);
-    if (!buf) {
-        LOG_WARN(LOG_TAG, "model cache: cannot read %s", skeleton_path);
-        return nullptr;
-    }
-
-    JceModel *model = jce_model_load_gltf_memory(buf, (uint32_t)fsize,
-                                                   skeleton_path);
-    ED_FREE(buf);
-    if (!model) return nullptr;
-
-    ModelCacheEntry &e = s_sr.model_cache[free_slot];
-    snprintf(e.path, sizeof(e.path), "%s", skeleton_path);
-    e.model        = model;
-    e.player       = nullptr;
-    e.bound_entity = entity_id;
-    e.active_clip  = -1;
-    e.loop         = false;
-    e.speed        = 1.0f;
-    e.paused       = true;
-    e.used         = true;
-
-    /* Create anim player if skeleton + clips are available. */
-    JceSkeleton *skel = jce_model_get_skeleton(model);
-    if (skel && jce_model_anim_count(model) > 0) {
-        e.player = jce_anim_player_create(skel);
-    }
-
-    return &e;
+    (void)ud;
+    return jce_editor_scene_asset_cache_get_mesh(path, NULL);
 }
+
+static JceModel *ed_load_model_cb(const char *path, void *ud)
+{
+    (void)ud;
+    if (!path || path[0] == '\0') return NULL;
+    size_t fsize = 0;
+    void *buf = ed_read_file(path, &fsize);
+    if (!buf) return NULL;
+    JceModel *m = jce_model_load_gltf_memory(buf, (uint32_t)fsize, path);
+    ED_FREE(buf);
+    return m;
+}
+
+static JceTexture ed_load_texture_cb(const char *material_path,
+                                     const char *mesh_path,
+                                     void       *ud)
+{
+    (void)ud;
+    /* Editor uses its async asset cache, which understands material JSON,
+     * OBJ MTL, basename fallback, and filesystem paths (not just PAK).
+     * Passing both paths into a single asset_cache call collapses them
+     * into ONE cache entry — matches 0.5.5 single-resolve behavior. */
+    return jce_editor_scene_asset_cache_get_texture(material_path, mesh_path);
+}
+
+/* ── Animation query cache (forward state for shutdown) ───────────── */
+
+#define ED_QUERY_CACHE_MAX 16
+struct EdQueryCacheEntry {
+    char           path[256];
+    JceModel      *model;
+    JceAnimPlayer *player;
+    bool           used;
+};
+static EdQueryCacheEntry s_query_cache[ED_QUERY_CACHE_MAX];
 
 /* ── Init ─────────────────────────────────────────────────────────── */
 
@@ -102,10 +104,7 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     memset(&s_sr, 0, sizeof(s_sr));
     jce_editor_scene_asset_cache_init(assets);
     s_sr.white_tex.idx = UINT16_MAX;
-    s_sr.checker_tex.idx = UINT16_MAX;
     s_sr.postfx_output_tex = UINT16_MAX;
-    s_sr.shadow_use_csm = false;
-    s_sr.shadow_far_valid = false;
     s_sr.renderer = renderer;
     s_sr.bridge = jce_editor_render_bridge_create(renderer,
                                                   (uint16_t)JCE_VIEW_EDITOR_SCENE);
@@ -117,48 +116,6 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
 
     const bgfx_caps_t *caps = bgfx_get_caps();
     s_sr.homogeneous_depth = caps ? caps->homogeneousDepth : false;
-
-    /* Select best available depth format for shadow maps.
-     * D32F > D24S8 > D16 — higher precision reduces shadow banding. */
-    bgfx_texture_format_t shadow_depth_fmt = BGFX_TEXTURE_FORMAT_D16;
-    if (caps) {
-        uint16_t d32f = caps->formats[BGFX_TEXTURE_FORMAT_D32F];
-        uint16_t d24  = caps->formats[BGFX_TEXTURE_FORMAT_D24S8];
-        if ((d32f & BGFX_CAPS_FORMAT_TEXTURE_2D)
-            && (d32f & BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER))
-            shadow_depth_fmt = BGFX_TEXTURE_FORMAT_D32F;
-        else if ((d24 & BGFX_CAPS_FORMAT_TEXTURE_2D)
-                 && (d24 & BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER))
-            shadow_depth_fmt = BGFX_TEXTURE_FORMAT_D24S8;
-    }
-
-    /* Dynamic shadow quality defaults from GPU tier recommendation. */
-    {
-        JceRenderRecommendation rec = jce_renderer_get_recommendation();
-        uint32_t shadow_size = rec.shadow_map_size;
-        if (shadow_size < 1024) shadow_size = 1024;
-        if (shadow_size > 4096) shadow_size = 4096;
-        s_sr.shadow_map_size = (uint16_t)shadow_size;
-
-        switch (rec.tier) {
-        case JCE_GPU_TIER_HIGH:
-            s_sr.csm_blend_ratio  = 0.22f;
-            s_sr.csm_normal_bias  = 0.015f;
-            s_sr.csm_filter_radius = 1.6f;
-            break;
-        case JCE_GPU_TIER_MEDIUM:
-            s_sr.csm_blend_ratio  = 0.20f;
-            s_sr.csm_normal_bias  = 0.012f;
-            s_sr.csm_filter_radius = 1.4f;
-            break;
-        case JCE_GPU_TIER_LOW:
-        default:
-            s_sr.csm_blend_ratio  = 0.18f;
-            s_sr.csm_normal_bias  = 0.010f;
-            s_sr.csm_filter_radius = 1.2f;
-            break;
-        }
-    }
 
     /* Create the editor orbit camera. */
     JceCameraDesc cam_desc;
@@ -192,7 +149,7 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     s_sr.orbit_clip_valid = false;
     s_sr.camera_cache_valid = false;
 
-    /* Pos + color vertex layout for transient buffers (grid, sky). */
+    /* Pos + color vertex layout for transient buffers (grid / overlays). */
     bgfx_vertex_layout_begin(&s_sr.layout, bgfx_get_renderer_type());
     bgfx_vertex_layout_add(&s_sr.layout, BGFX_ATTRIB_POSITION, 3,
                            BGFX_ATTRIB_TYPE_FLOAT, false, false);
@@ -204,48 +161,24 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     JceShaderHandle sh = jce_renderer_get_program_color(renderer);
     s_sr.prog_color.idx = sh.idx;
 
-    /* Load sky/grid shader programs from the PAK archive. */
-    JceShaderHandle sky_sh = shader_load_program(pak, "sky");
-    s_sr.prog_sky.idx = sky_sh.idx;
-    if (sky_sh.idx == UINT16_MAX)
-        LOG_WARN(LOG_TAG, "sky shader not found in PAK — sky will be skipped");
+    /* Load editor-only grid shader from the PAK archive. */
     JceShaderHandle grid_sh = shader_load_program(pak, "grid");
     s_sr.prog_grid.idx = grid_sh.idx;
     if (grid_sh.idx == UINT16_MAX)
         LOG_WARN(LOG_TAG, "grid shader not found in PAK — grid will be skipped");
 
-    /* Position-only vertex layout for the fullscreen sky quad. */
-    bgfx_vertex_layout_begin(&s_sr.sky_layout, bgfx_get_renderer_type());
-    bgfx_vertex_layout_add(&s_sr.sky_layout, BGFX_ATTRIB_POSITION, 3,
-                           BGFX_ATTRIB_TYPE_FLOAT, false, false);
-    bgfx_vertex_layout_end(&s_sr.sky_layout);
-
-    /* Uniforms for sky gradient and fullscreen grid. */
-    s_sr.u_sky_colors = bgfx_create_uniform("u_sky_colors",
-                                             BGFX_UNIFORM_TYPE_VEC4, 3);
-    s_sr.u_sky_params = bgfx_create_uniform("u_sky_params",
-                                             BGFX_UNIFORM_TYPE_VEC4, 1);
-    s_sr.u_sky_equirect = bgfx_create_uniform("s_equirect",
-                                               BGFX_UNIFORM_TYPE_SAMPLER, 1);
     s_sr.u_grid_camera = bgfx_create_uniform("u_grid_camera",
                                              BGFX_UNIFORM_TYPE_VEC4, 1);
     s_sr.u_grid_fade = bgfx_create_uniform("u_grid_fade",
                                            BGFX_UNIFORM_TYPE_VEC4, 1);
 
-    /* Cache lighting uniform handles for flat-color selection outlines. */
+    /* Lighting uniforms for flat-color overlay (selection / ghost / hover). */
     s_sr.u_light_dir   = bgfx_create_uniform("u_lightDir",
                                               BGFX_UNIFORM_TYPE_VEC4, 1);
     s_sr.u_light_color = bgfx_create_uniform("u_lightColor",
                                               BGFX_UNIFORM_TYPE_VEC4, 1);
 
-    /* Procedural meshes. */
-    s_sr.cube_mesh     = jce_mesh_create_cube(1.0f);
-    s_sr.plane_mesh    = jce_mesh_create_plane(1.0f, 1.0f, 0);
-    s_sr.sphere_mesh   = jce_mesh_create_sphere(0.5f);
-    s_sr.capsule_mesh  = jce_mesh_create_capsule(0.25f, 1.0f);
-    s_sr.cylinder_mesh = jce_mesh_create_cylinder(0.5f, 1.0f);
-
-    /* 1x1 white fallback texture for SHADED mode. */
+    /* 1x1 white fallback texture for overlay binding. */
     {
         uint32_t white = 0xFFFFFFFF;
         const bgfx_memory_t *mem = bgfx_copy(&white, 4);
@@ -253,110 +186,25 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
                                                   BGFX_TEXTURE_FORMAT_RGBA8, 0, mem);
     }
 
-    /* 8x8 magenta/black checkerboard for missing textures (TEXTURED mode). */
-    {
-        const uint32_t M = 0xFFFF00FF;
-        const uint32_t K = 0xFF000000;
-        uint32_t checker[8 * 8];
-        for (int y = 0; y < 8; y++)
-            for (int x = 0; x < 8; x++)
-                checker[y * 8 + x] = ((x ^ y) & 1) ? K : M;
-        const bgfx_memory_t *cmem = bgfx_copy(checker, sizeof(checker));
-        s_sr.checker_tex = bgfx_create_texture_2d(8, 8, false, 1,
-                                                    BGFX_TEXTURE_FORMAT_RGBA8,
-                                                    BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT,
-                                                    cmem);
+    /* Create the engine scene renderer with editor asset callbacks. */
+    JceSceneRendererCallbacks cbs;
+    memset(&cbs, 0, sizeof(cbs));
+    cbs.load_mesh    = ed_load_mesh_cb;
+    cbs.load_model   = ed_load_model_cb;
+    cbs.load_texture = ed_load_texture_cb;
+    cbs.userdata     = NULL;
+    s_sr.scene_renderer = jce_scene_renderer_create(renderer, pak, &cbs);
+    if (!s_sr.scene_renderer) {
+        LOG_WARN(LOG_TAG, "failed to create engine scene renderer");
+        if (s_sr.camera) { jce_camera_destroy(s_sr.camera); s_sr.camera = NULL; }
+        if (s_sr.bridge) { jce_editor_render_bridge_destroy(s_sr.bridge); s_sr.bridge = NULL; }
+        jce_editor_scene_asset_cache_shutdown();
+        return false;
     }
 
-    /* Shadow map resources. */
-    {
-        const uint16_t shadow_size = s_sr.shadow_map_size;
-        s_sr.shadow_tex = bgfx_create_texture_2d(
-            shadow_size, shadow_size, false, 1,
-            shadow_depth_fmt,
-            BGFX_TEXTURE_RT
-            | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
-            | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT,
-            NULL);
-        bgfx_attachment_t at;
-        memset(&at, 0, sizeof(at));
-        bgfx_attachment_init(&at, s_sr.shadow_tex, BGFX_ACCESS_WRITE,
-                             0, 1, 0, BGFX_RESOLVE_AUTO_GEN_MIPS);
-        s_sr.shadow_fbo = bgfx_create_frame_buffer_from_attachment(1, &at, false);
-        s_sr.u_shadowMap = bgfx_create_uniform("s_shadowMap",
-                                                BGFX_UNIFORM_TYPE_SAMPLER, 1);
-        s_sr.u_shadowVP  = bgfx_create_uniform("u_shadowVP",
-                                                BGFX_UNIFORM_TYPE_MAT4, 1);
-        s_sr.shadow_valid = BGFX_HANDLE_IS_VALID(s_sr.shadow_fbo);
-        if (s_sr.shadow_valid)
-            LOG_INFO(LOG_TAG, "shadow map created (%dx%d)", shadow_size, shadow_size);
-    }
-
-    /* Cascaded shadow maps (4 cascades at 2048x2048). */
-    {
-        const uint32_t csm_count = JCE_CSM_MAX_CASCADES;
-        const uint16_t csm_size = s_sr.shadow_map_size;
-        const char *sampler_names[JCE_CSM_MAX_CASCADES] = {
-            "s_csmShadow0", "s_csmShadow1", "s_csmShadow2", "s_csmShadow3"
-        };
-        s_sr.csm_cascade_count = csm_count;
-        s_sr.csm_valid = true;
-        for (uint32_t i = 0; i < csm_count; i++) {
-            s_sr.csm_tex[i] = bgfx_create_texture_2d(
-                csm_size, csm_size, false, 1,
-                shadow_depth_fmt,
-                BGFX_TEXTURE_RT
-                | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
-                | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT,
-                NULL);
-            bgfx_attachment_t at;
-            memset(&at, 0, sizeof(at));
-            bgfx_attachment_init(&at, s_sr.csm_tex[i], BGFX_ACCESS_WRITE,
-                                 0, 1, 0, BGFX_RESOLVE_AUTO_GEN_MIPS);
-            s_sr.csm_fbo[i] = bgfx_create_frame_buffer_from_attachment(1, &at, false);
-            s_sr.u_csm_samplers[i] = bgfx_create_uniform(
-                sampler_names[i], BGFX_UNIFORM_TYPE_SAMPLER, 1);
-            if (!BGFX_HANDLE_IS_VALID(s_sr.csm_fbo[i]))
-                s_sr.csm_valid = false;
-        }
-        s_sr.u_csm_vp     = bgfx_create_uniform("u_csmVP",
-                                                  BGFX_UNIFORM_TYPE_MAT4,
-                                                  JCE_CSM_MAX_CASCADES);
-        s_sr.u_csm_splits  = bgfx_create_uniform("u_csmSplits",
-                                                   BGFX_UNIFORM_TYPE_VEC4, 1);
-        s_sr.u_csm_params = bgfx_create_uniform("u_csmParams",
-                                                 BGFX_UNIFORM_TYPE_VEC4, 1);
-        s_sr.u_csm_bias_scales = bgfx_create_uniform("u_csmBiasScales",
-                                                      BGFX_UNIFORM_TYPE_VEC4, 1);
-        if (s_sr.csm_valid)
-            LOG_INFO(LOG_TAG, "CSM created (%u cascades, %dx%d)",
-                     csm_count, csm_size, csm_size);
-    }
-
-    /* Multi-light environment. */
-    s_sr.light_env = jce_light_env_create();
-
-    /* IBL / skybox uniforms. */
-    s_sr.u_ibl_irradiance = bgfx_create_uniform("s_irradiance",
-                                                  BGFX_UNIFORM_TYPE_SAMPLER, 1);
-    s_sr.u_ibl_prefilter  = bgfx_create_uniform("s_prefilter",
-                                                  BGFX_UNIFORM_TYPE_SAMPLER, 1);
-    s_sr.u_ibl_brdf_lut   = bgfx_create_uniform("s_brdfLUT",
-                                                  BGFX_UNIFORM_TYPE_SAMPLER, 1);
-    s_sr.u_ibl_params     = bgfx_create_uniform("u_iblParams",
-                                                  BGFX_UNIFORM_TYPE_VEC4, 1);
-    JceTexture brdf = jce_ibl_create_brdf_lut(256);
-    s_sr.brdf_lut         = { brdf.idx };
-    s_sr.skybox           = NULL;
-    s_sr.ibl_data         = NULL;
-    s_sr.skybox_active    = false;
-    s_sr.skybox_hdr_path[0] = '\0';
-
-    /* Sprite batch for 2D sprite entities. */
-    s_sr.sprite_batch = jce_sprite_batch_create(256);
-
+    s_sr.anim_last_ticks = 0;
     s_sr.initialized = true;
-    LOG_INFO(LOG_TAG, "editor scene renderer initialized (FBO pipeline)");
+    LOG_INFO(LOG_TAG, "editor scene renderer initialized (engine-backed)");
     return true;
 }
 
@@ -366,9 +214,14 @@ void jce_editor_scene_render_shutdown(void)
 {
     if (!s_sr.initialized) return;
 
-    /* Flush model / animation cache. */
-    for (int i = 0; i < MODEL_CACHE_MAX; ++i) {
-        ModelCacheEntry &e = s_sr.model_cache[i];
+    if (s_sr.scene_renderer) {
+        jce_scene_renderer_destroy(s_sr.scene_renderer);
+        s_sr.scene_renderer = NULL;
+    }
+
+    /* Free the editor-side animation query cache. */
+    for (int i = 0; i < ED_QUERY_CACHE_MAX; ++i) {
+        EdQueryCacheEntry &e = s_query_cache[i];
         if (!e.used) continue;
         if (e.player) { jce_anim_player_destroy(e.player); e.player = nullptr; }
         if (e.model)  { jce_model_destroy(e.model);        e.model  = nullptr; }
@@ -383,88 +236,28 @@ void jce_editor_scene_render_shutdown(void)
     }
 
     if (s_sr.camera)     { jce_camera_destroy(s_sr.camera);   s_sr.camera = NULL; }
-    if (s_sr.cube_mesh)     { jce_mesh_destroy(s_sr.cube_mesh);     s_sr.cube_mesh = NULL; }
-    if (s_sr.plane_mesh)    { jce_mesh_destroy(s_sr.plane_mesh);    s_sr.plane_mesh = NULL; }
-    if (s_sr.sphere_mesh)   { jce_mesh_destroy(s_sr.sphere_mesh);   s_sr.sphere_mesh = NULL; }
-    if (s_sr.capsule_mesh)  { jce_mesh_destroy(s_sr.capsule_mesh);  s_sr.capsule_mesh = NULL; }
-    if (s_sr.cylinder_mesh) { jce_mesh_destroy(s_sr.cylinder_mesh); s_sr.cylinder_mesh = NULL; }
 
     if (BGFX_HANDLE_IS_VALID(s_sr.white_tex))
         bgfx_destroy_texture(s_sr.white_tex);
-    if (BGFX_HANDLE_IS_VALID(s_sr.checker_tex))
-        bgfx_destroy_texture(s_sr.checker_tex);
 
-    if (BGFX_HANDLE_IS_VALID(s_sr.prog_sky))
-        bgfx_destroy_program(s_sr.prog_sky);
     if (BGFX_HANDLE_IS_VALID(s_sr.prog_grid))
         bgfx_destroy_program(s_sr.prog_grid);
-    if (BGFX_HANDLE_IS_VALID(s_sr.u_sky_colors))
-        bgfx_destroy_uniform(s_sr.u_sky_colors);
-    if (BGFX_HANDLE_IS_VALID(s_sr.u_sky_params))
-        bgfx_destroy_uniform(s_sr.u_sky_params);
-    if (BGFX_HANDLE_IS_VALID(s_sr.u_sky_equirect))
-        bgfx_destroy_uniform(s_sr.u_sky_equirect);
     if (BGFX_HANDLE_IS_VALID(s_sr.u_grid_camera))
         bgfx_destroy_uniform(s_sr.u_grid_camera);
     if (BGFX_HANDLE_IS_VALID(s_sr.u_grid_fade))
         bgfx_destroy_uniform(s_sr.u_grid_fade);
-
-    if (BGFX_HANDLE_IS_VALID(s_sr.shadow_fbo))
-        bgfx_destroy_frame_buffer(s_sr.shadow_fbo);
-    if (BGFX_HANDLE_IS_VALID(s_sr.u_shadowMap))
-        bgfx_destroy_uniform(s_sr.u_shadowMap);
-    if (BGFX_HANDLE_IS_VALID(s_sr.u_shadowVP))
-        bgfx_destroy_uniform(s_sr.u_shadowVP);
-
-    /* CSM resources. */
-    for (uint32_t i = 0; i < JCE_CSM_MAX_CASCADES; i++) {
-        if (BGFX_HANDLE_IS_VALID(s_sr.csm_fbo[i]))
-            bgfx_destroy_frame_buffer(s_sr.csm_fbo[i]);
-        if (BGFX_HANDLE_IS_VALID(s_sr.u_csm_samplers[i]))
-            bgfx_destroy_uniform(s_sr.u_csm_samplers[i]);
-    }
-    if (BGFX_HANDLE_IS_VALID(s_sr.u_csm_vp))
-        bgfx_destroy_uniform(s_sr.u_csm_vp);
-    if (BGFX_HANDLE_IS_VALID(s_sr.u_csm_splits))
-        bgfx_destroy_uniform(s_sr.u_csm_splits);
-    if (BGFX_HANDLE_IS_VALID(s_sr.u_csm_params))
-        bgfx_destroy_uniform(s_sr.u_csm_params);
-    if (BGFX_HANDLE_IS_VALID(s_sr.u_csm_bias_scales))
-        bgfx_destroy_uniform(s_sr.u_csm_bias_scales);
-
-    if (s_sr.light_env) {
-        jce_light_env_destroy(s_sr.light_env);
-        s_sr.light_env = NULL;
-    }
-
-    /* IBL / skybox resources. */
-    if (s_sr.ibl_data) {
-        jce_ibl_destroy(s_sr.ibl_data);
-        s_sr.ibl_data = NULL;
-    }
-    if (s_sr.skybox) {
-        jce_skybox_destroy(s_sr.skybox);
-        s_sr.skybox = NULL;
-    }
-    if (BGFX_HANDLE_IS_VALID(s_sr.brdf_lut))
-        bgfx_destroy_texture(s_sr.brdf_lut);
-    if (BGFX_HANDLE_IS_VALID(s_sr.u_ibl_irradiance))
-        bgfx_destroy_uniform(s_sr.u_ibl_irradiance);
-    if (BGFX_HANDLE_IS_VALID(s_sr.u_ibl_prefilter))
-        bgfx_destroy_uniform(s_sr.u_ibl_prefilter);
-    if (BGFX_HANDLE_IS_VALID(s_sr.u_ibl_brdf_lut))
-        bgfx_destroy_uniform(s_sr.u_ibl_brdf_lut);
-    if (BGFX_HANDLE_IS_VALID(s_sr.u_ibl_params))
-        bgfx_destroy_uniform(s_sr.u_ibl_params);
-
-    /* Sprite batch. */
-    if (s_sr.sprite_batch) {
-        jce_sprite_batch_destroy(s_sr.sprite_batch);
-        s_sr.sprite_batch = NULL;
-    }
+    if (BGFX_HANDLE_IS_VALID(s_sr.u_light_dir))
+        bgfx_destroy_uniform(s_sr.u_light_dir);
+    if (BGFX_HANDLE_IS_VALID(s_sr.u_light_color))
+        bgfx_destroy_uniform(s_sr.u_light_color);
 
     s_sr.initialized = false;
     LOG_INFO(LOG_TAG, "editor scene renderer shutdown");
+}
+
+JceSceneRenderer *jce_editor_get_scene_renderer(void)
+{
+    return s_sr.scene_renderer;
 }
 
 /* ── Per-frame ────────────────────────────────────────────────────── */
@@ -478,14 +271,6 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     s_sr.viewport_height = height;
     s_sr.camera_cache_valid = false;
     s_sr.postfx_output_tex = UINT16_MAX;
-    s_sr.postfx_tonemap_active = false;
-    s_sr.shadow_use_csm = false;
-
-    if (g_editor_postfx) {
-        s_sr.postfx_tonemap_active =
-            jce_postfx_is_enabled(g_editor_postfx, JCE_POSTFX_TONEMAP);
-    }
-
 
     float aspect = (float)width / (float)height;
 
@@ -503,7 +288,6 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
 
     JceSceneViewMode view_mode = jce_state_get_view_mode();
     bool is_plain_wireframe = (view_mode == JCE_VIEW_WIREFRAME);
-    bool is_textured_wireframe = (view_mode == JCE_VIEW_WIREFRAME_TEXTURED);
 
     uint32_t clear_color = is_plain_wireframe
         ? 0x373737FF
@@ -520,97 +304,92 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         return;
     }
 
-
     jce_editor_scene_asset_cache_finalize();
 
-    /* Scan for Skybox component and load HDR if path changed. */
-    {
-        const char *hdr_path = NULL;
-        float sky_rotation = 0.0f;
-        float sky_exposure = 1.0f;
-        JceScene *scene = jce_state_get_scene();
-        int ent_count = jce_state_get_entity_count();
-        for (int ei = 0; ei < ent_count && !hdr_path; ei++) {
-            uint32_t id = jce_state_get_entity_id_by_index(ei);
-            if (id == 0 || !jce_state_entity_exists(id)) continue;
-            if (!scene) continue;
-            JceEntity e = (JceEntity)id;
-            if (!jce_scene_has_skybox(scene, e)) continue;
-            JceSkyboxComponent *sky = jce_scene_get_skybox(scene, e);
-            if (!sky || sky->hdr_path[0] == '\0') continue;
-            hdr_path = sky->hdr_path;
-            sky_rotation = sky->rotation;
-            sky_exposure = sky->exposure > 0.0f ? sky->exposure : 1.0f;
-        }
+    /* Compute frame delta time for skeletal animation. */
+    uint64_t now_ticks = SDL_GetPerformanceCounter();
+    float dt_sec = 0.0f;
+    if (s_sr.anim_last_ticks > 0) {
+        dt_sec = (float)(now_ticks - s_sr.anim_last_ticks)
+               / (float)SDL_GetPerformanceFrequency();
+        if (dt_sec > 0.1f) dt_sec = 0.1f;
+    }
+    s_sr.anim_last_ticks = now_ticks;
 
-        if (hdr_path && strcmp(hdr_path, s_sr.skybox_hdr_path) != 0) {
-            /* Path changed — reload skybox. */
-            if (s_sr.skybox) {
-                jce_skybox_destroy(s_sr.skybox);
-                s_sr.skybox = NULL;
-            }
-            s_sr.skybox = jce_skybox_create_from_hdr_file(hdr_path, 512);
-            if (s_sr.skybox) {
-                snprintf(s_sr.skybox_hdr_path, sizeof(s_sr.skybox_hdr_path),
-                         "%s", hdr_path);
-                s_sr.skybox_active = true;
-                LOG_INFO(LOG_TAG, "skybox loaded: %s", hdr_path);
-            } else {
-                s_sr.skybox_hdr_path[0] = '\0';
-                s_sr.skybox_active = false;
-            }
-        } else if (!hdr_path && s_sr.skybox_active) {
-            /* Skybox component removed. */
-            if (s_sr.skybox) {
-                jce_skybox_destroy(s_sr.skybox);
-                s_sr.skybox = NULL;
-            }
-            s_sr.skybox_hdr_path[0] = '\0';
-            s_sr.skybox_active = false;
-        }
+    /* Engine renders sky, shadows, entities, and PostFX into the bridge view.
+     * PostFX is driven via the engine's pipeline (same one the panel controls). */
+    JceSceneRenderConfig cfg = jce_scene_render_config_default();
 
-        /* Store current exposure/rotation for draw_sky_gradient(). */
-        s_sr.skybox_exposure = sky_exposure;
-        s_sr.skybox_rotation = sky_rotation;
+    /* Map editor view mode to engine config. */
+    switch (view_mode) {
+    case JCE_VIEW_WIREFRAME:
+        cfg.view_mode = JCE_SCENE_VIEW_WIREFRAME; break;
+    case JCE_VIEW_TEXTURED:
+        cfg.view_mode = JCE_SCENE_VIEW_TEXTURED; break;
+    case JCE_VIEW_WIREFRAME_TEXTURED:
+        cfg.view_mode = JCE_SCENE_VIEW_WIREFRAME_TEXTURED; break;
+    case JCE_VIEW_SHADED:
+    default:
+        cfg.view_mode = JCE_SCENE_VIEW_SHADED; break;
     }
 
-    /* Keep the legacy gray background only for plain wireframe.
-     * Wireframe-textured keeps the normal blue clear color, and only draws
-     * the sky when an actual HDR skybox is active. This avoids falling back
-     * to the shader's default gradient in that mode. */
-    if (!is_plain_wireframe && (!is_textured_wireframe || s_sr.skybox_active)) {
-        draw_sky_gradient();
-    }
-
-    if (jce_state_get_show_grid() && jce_state_get_play_state() == JCE_PLAY_STOPPED) {
+    /* 0.5.7 ordering: sky → grid → entities. Engine renders sky first,
+     * then invokes this callback to draw grid INTO THE SAME view, then
+     * proceeds with entity submission. Grid is NOT gated by view mode
+     * in 0.5.7 — it draws in wireframe modes too. */
+    cfg.on_after_sky = [](uint16_t /*view_id*/, bool /*sky_drawn*/, void * /*ud*/) {
+        if (!jce_state_get_show_grid()) return;
+        if (jce_state_get_play_state() != JCE_PLAY_STOPPED) return;
         draw_grid();
+    };
+    cfg.on_after_sky_ud = nullptr;
+
+    JceScene *scene = jce_state_get_scene();
+    if (scene && s_sr.scene_renderer) {
+        jce_scene_renderer_render(s_sr.scene_renderer, scene, s_sr.camera,
+                                  scene_view_id(), dt_sec, &cfg);
     }
 
-    draw_entities();
+    /* ── 0.5.7 ordering: scene → overlays → PostFX ─────────────────────
+     * Overlays MUST render BEFORE PostFX into the bridge FBO (which has
+     * a depth buffer). PostFX FBOs are color-only — routing overlays
+     * into the postfx output silently fails depth tests for ghost &
+     * selection. PostFX then tonemaps the entire composited bridge image.
+     * This matches 0.5.7 exactly. */
+
+    /* Editor overlay passes — submit into the bridge FBO (scene_view_id()
+     * resolves to bridge view since s_view_id_override is unset). Grid is
+     * NOT drawn here — it runs via on_after_sky callback BEFORE entities,
+     * mirroring 0.5.7 ordering exactly. */
+    draw_selection_outlines();
+    if (jce_state_get_show_physics_debug()) {
+        draw_physics_debug();
+    }
     draw_hover_highlight();
     draw_ghost_entity();
 
-    if (g_editor_postfx) {
+    /* Apply the engine PostFX pipeline AFTER overlays so they receive
+     * tonemapping along with the scene (matches 0.5.7 behavior). */
+    JcePostFXPipeline *postfx = jce_scene_renderer_get_postfx(s_sr.scene_renderer);
+    if (postfx) {
         bool any_effect = false;
         for (int i = 0; i < JCE_POSTFX_COUNT; i++) {
-            if (jce_postfx_is_enabled(g_editor_postfx, (JcePostFXType)i)) {
+            if (jce_postfx_is_enabled(postfx, (JcePostFXType)i)) {
                 any_effect = true;
                 break;
             }
         }
 
-        jce_postfx_resize(g_editor_postfx, width, height);
+        jce_postfx_resize(postfx, width, height);
 
         if (any_effect) {
             JceTextureHandle scene_color = { UINT16_MAX };
             JceTextureHandle prev_pass = { UINT16_MAX };
             scene_color.idx = jce_editor_render_bridge_get_color_texture(s_sr.bridge);
 
-            jce_postfx_apply(g_editor_postfx,
-                             scene_color,
-                             prev_pass);
+            jce_postfx_apply(postfx, scene_color, prev_pass);
 
-            JceTextureHandle out = jce_postfx_get_output(g_editor_postfx);
+            JceTextureHandle out = jce_postfx_get_output(postfx);
             if (jce_gfx_texture_valid(out))
                 s_sr.postfx_output_tex = out.idx;
         }
@@ -668,17 +447,57 @@ void jce_editor_scene_clear_hover_entity(void)
 }
 
 /* ── Animation query helpers ──────────────────────────────────────── */
+/*
+ * Phase B: skeletal animation *playback* is owned by the engine scene
+ * renderer's internal model cache. To keep the editor's timeline /
+ * inspector panels functional, we maintain a tiny editor-side cache
+ * (declared near the top of this file) that lazy-loads the model +
+ * (optional) player for query purposes. This player is independent of
+ * the engine's playback player; timeline scrubbing writes its time via
+ * jce_anim_player_set_time(), and the engine renderer queries the
+ * scene's JceSkeletalAnimatorComponent for its own playback state.
+ */
+
+static EdQueryCacheEntry *ed_query_cache_get(const char *skeleton_path)
+{
+    if (!skeleton_path || skeleton_path[0] == '\0') return nullptr;
+
+    int free_slot = -1;
+    for (int i = 0; i < ED_QUERY_CACHE_MAX; ++i) {
+        EdQueryCacheEntry &e = s_query_cache[i];
+        if (e.used && strcmp(e.path, skeleton_path) == 0) return &e;
+        if (!e.used && free_slot < 0) free_slot = i;
+    }
+    if (free_slot < 0) return nullptr;
+
+    JceModel *m = ed_load_model_cb(skeleton_path, NULL);
+    if (!m) return nullptr;
+
+    EdQueryCacheEntry &e = s_query_cache[free_slot];
+    snprintf(e.path, sizeof(e.path), "%s", skeleton_path);
+    e.model  = m;
+    e.player = nullptr;
+    e.used   = true;
+
+    JceSkeleton *skel = jce_model_get_skeleton(m);
+    if (skel && jce_model_anim_count(m) > 0)
+        e.player = jce_anim_player_create(skel);
+
+    return &e;
+}
 
 JceAnimPlayer *jce_editor_scene_get_anim_player(const char *skeleton_path,
                                                  uint32_t entity_id)
 {
-    ModelCacheEntry *mc = get_cached_model(skeleton_path, entity_id);
-    return mc ? mc->player : nullptr;
+    (void)entity_id;
+    EdQueryCacheEntry *e = ed_query_cache_get(skeleton_path);
+    return e ? e->player : nullptr;
 }
 
 JceModel *jce_editor_scene_get_model(const char *skeleton_path,
                                      uint32_t entity_id)
 {
-    ModelCacheEntry *mc = get_cached_model(skeleton_path, entity_id);
-    return mc ? mc->model : nullptr;
+    (void)entity_id;
+    EdQueryCacheEntry *e = ed_query_cache_get(skeleton_path);
+    return e ? e->model : nullptr;
 }

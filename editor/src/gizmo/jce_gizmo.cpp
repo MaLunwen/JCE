@@ -58,16 +58,13 @@ static void compute_gizmo_axes(int gizmo_space, const float *rotation)
         float ry = rotation[1] * JCE_DEG2RAD;
         float rz = rotation[2] * JCE_DEG2RAD;
 
-        /* Build rotation via engine math API (XYZ intrinsic euler order). */
-        jce_vec3 ax_x; ax_x.x = 1; ax_x.y = 0; ax_x.z = 0;
-        jce_vec3 ax_y; ax_y.x = 0; ax_y.y = 1; ax_y.z = 0;
-        jce_vec3 ax_z; ax_z.x = 0; ax_z.y = 0; ax_z.z = 1;
-
-        jce_quat qx = jce_q_from_axis_angle(ax_x, rx);
-        jce_quat qy = jce_q_from_axis_angle(ax_y, ry);
-        jce_quat qz = jce_q_from_axis_angle(ax_z, rz);
-        jce_quat q   = jce_q_multiply(jce_q_multiply(qx, qy), qz);
-        jce_mat4 m   = jce_q_to_mat4(q);
+        /* Build rotation via engine euler convention (YXZ — same order as
+         * jce_q_from_euler / jce_q_to_euler). The gizmo display MUST use the
+         * same convention as ECS storage, otherwise the visible ring axes
+         * diverge from the object's actual rotation axes each frame and
+         * dragging produces visible jitter. */
+        jce_quat q = jce_q_from_euler(rx, ry, rz);
+        jce_mat4 m = jce_q_to_mat4(q);
 
         /* Extract rotated axes from matrix columns. */
         s_gizmo.axes[0][0] = m.col[0].x; s_gizmo.axes[0][1] = m.col[0].y; s_gizmo.axes[0][2] = m.col[0].z;

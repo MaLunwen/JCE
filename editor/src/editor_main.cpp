@@ -17,6 +17,7 @@ extern "C" {
 #include <jce/app/jce_engine.h>
 #include <jce/app/jce_app_interface.h>
 #include <jce/graphics/jce_postfx.h>
+#include <jce/render/jce_scene_renderer.h>
 #include <jce/core/jce_allocator.h>
 #include <jce/platform/jce_window.h>
 }
@@ -109,9 +110,6 @@ static void configure_engine_renderer_from_editor_config(void)
             ecfg.renderer, backend);
 }
 
-/* ── PostFX global (defined in jce_editor.cpp, used by panels) ───── */
-extern JcePostFXPipeline *g_editor_postfx;
-
 /* ── JceAppDesc callbacks ──────────────────────────────────────────── */
 
 static bool editor_app_init(const JceServices *svc, void *ud)
@@ -122,17 +120,17 @@ static bool editor_app_init(const JceServices *svc, void *ud)
     if (!jce_editor_init(svc->pak, svc->window))
         return false;
 
-    /* Create and load the PostFX pipeline. */
-    if (!g_editor_postfx) {
-        uint32_t w, h;
-        jce_window_get_size(svc->window, &w, &h);
-        g_editor_postfx = jce_postfx_create(jce_allocator_default(), w, h);
-        if (g_editor_postfx) {
-            jce_postfx_load_shaders(g_editor_postfx, svc->pak);
+    /* Configure engine-owned PostFX pipeline defaults.
+     * The pipeline is created/destroyed by the engine scene renderer;
+     * we only set initial enable states here. */
+    {
+        JceSceneRenderer *sr = jce_editor_get_scene_renderer();
+        JcePostFXPipeline *pfx = sr ? jce_scene_renderer_get_postfx(sr) : NULL;
+        if (pfx) {
             JcePostFXParams p = jce_postfx_default_params();
-            jce_postfx_set_params(g_editor_postfx, &p);
-            jce_postfx_enable(g_editor_postfx, JCE_POSTFX_TONEMAP, false);
-            jce_postfx_enable(g_editor_postfx, JCE_POSTFX_FXAA, true);
+            jce_postfx_set_params(pfx, &p);
+            jce_postfx_enable(pfx, JCE_POSTFX_TONEMAP, false);
+            jce_postfx_enable(pfx, JCE_POSTFX_FXAA, true);
         }
     }
 
@@ -142,10 +140,8 @@ static bool editor_app_init(const JceServices *svc, void *ud)
 static void editor_app_exit(void *ud)
 {
     (void)ud;
-    if (g_editor_postfx) {
-        jce_postfx_destroy(g_editor_postfx);
-        g_editor_postfx = NULL;
-    }
+    /* PostFX pipeline is destroyed by jce_scene_renderer_destroy(),
+     * which is called inside jce_editor_scene_render_shutdown(). */
     jce_editor_scene_render_shutdown();
     jce_editor_shutdown();
 }

@@ -33,6 +33,10 @@
 /* Reserved range for post-processing (Phase 4). */
 #define JCE_VIEW_POST_BASE   20
 
+/* Editor gizmo / grid / selection overlay — drawn AFTER PostFX so it
+ * doesn't get tone-mapped or bloomed. Targets the postfx output FBO. */
+#define JCE_VIEW_EDITOR_OVERLAY 50
+
 /* ImGui editor overlay (always last  renders on top). */
 #define JCE_VIEW_IMGUI       255
 

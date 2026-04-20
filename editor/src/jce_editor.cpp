@@ -23,17 +23,12 @@
 
 extern "C" {
 #include <jce/graphics/jce_views.h>
-#include <jce/graphics/jce_postfx.h>
 #include <jce/platform/jce_window.h>
 #include <jce/core/jce_log.h>
 #include <jce/core/pak_loader.h>
 }
 
 #define LOG_TAG "editor"
-
-/* ── PostFX pipeline global (used by jce_panel_postfx) ─────────────── */
-
-JcePostFXPipeline *g_editor_postfx = NULL;
 
 /* ── Static state ──────────────────────────────────────────────────── */
 

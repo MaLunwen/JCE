@@ -557,13 +557,25 @@ static bool jce_resize_event_watch(void *userdata, SDL_Event *event)
     JceEngine *e = (JceEngine *)userdata;
 
     if (event->type != SDL_EVENT_WINDOW_RESIZED &&
-        event->type != SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED)
+        event->type != SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED &&
+        event->type != SDL_EVENT_WINDOW_ENTER_FULLSCREEN &&
+        event->type != SDL_EVENT_WINDOW_LEAVE_FULLSCREEN)
         return true;   /* pass event through, not ours */
+
+    /* Reentrancy guard: SDL can pump events from inside our own render
+     * (e.g. via SDL_SyncWindow or modal Win32 sizing). Without this guard
+     * we'd nest begin_frame/end_frame and crash bgfx. */
+    static SDL_AtomicInt s_in_resize_watch;
+    if (SDL_GetAtomicInt(&s_in_resize_watch) != 0)
+        return true;
+    SDL_SetAtomicInt(&s_in_resize_watch, 1);
 
     int pw, ph;
     SDL_GetWindowSizeInPixels(jce_window_sdl(e->window), &pw, &ph);
-    if (pw <= 0 || ph <= 0)
+    if (pw <= 0 || ph <= 0) {
+        SDL_SetAtomicInt(&s_in_resize_watch, 0);
         return true;
+    }
 
     jce_window_handle_resize(e->window, (uint32_t)pw, (uint32_t)ph);
     jce_renderer_resize(e->renderer, (uint32_t)pw, (uint32_t)ph);
@@ -572,18 +584,21 @@ static bool jce_resize_event_watch(void *userdata, SDL_Event *event)
         g_app_desc.on_resize((uint32_t)pw, (uint32_t)ph,
                              g_app_desc.user_data);
 
-    /* Emit a minimal render frame so bgfx processes the reset. */
+    /* Emit a minimal render frame so bgfx processes the reset. We deliberately
+     * do NOT call g_app_desc.update here: that would re-sample input (e.g. an
+     * F11 still being held during the OS resize) and could re-toggle
+     * fullscreen, causing an infinite resize storm ("seizure"). The next
+     * normal main-loop tick will run update with fresh input state. */
     if (!jce_renderer_is_fallback(e->renderer)) {
         jce_renderer_begin_frame(e->renderer, e->window);
 
-        if (g_app_desc.update)
-            g_app_desc.update(0.0f, g_app_desc.user_data);
         if (g_app_desc.draw)
             g_app_desc.draw(&e->svc, g_app_desc.user_data);
 
         jce_renderer_end_frame(e->renderer);
     }
 
+    SDL_SetAtomicInt(&s_in_resize_watch, 0);
     return true;   /* let other watchers see the event too */
 }
 

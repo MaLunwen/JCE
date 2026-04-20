@@ -111,6 +111,11 @@ void jce_editor_scene_clear_hover_entity(void);
  * Call when entering/exiting play mode to avoid a large first-frame spike. */
 void jce_editor_scene_reset_anim_timer(void);
 
+/* Access the engine scene renderer owned by the editor viewport.
+ * Used by panels (e.g., PostFX) to access engine-owned subsystems. */
+typedef struct JceSceneRenderer JceSceneRenderer;
+JceSceneRenderer *jce_editor_get_scene_renderer(void);
+
 typedef struct JceAnimPlayer JceAnimPlayer;
 typedef struct JceModel      JceModel;
 

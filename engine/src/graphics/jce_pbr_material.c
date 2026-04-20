@@ -36,6 +36,15 @@ static bgfx_texture_handle_t s_flat_normal_tex;   /* 1x1 (128,128,255,255) fallb
 
 static bool s_uniforms_init = false;
 
+/* Global view mode for unlit/textured editor view; set by scene renderer
+ * before each frame. 0 = SHADED (PBR default). */
+static float s_view_mode = 0.0f;
+
+void jce_pbr_material_set_view_mode(int mode)
+{
+    s_view_mode = (float)mode;
+}
+
 static void ensure_uniforms(void)
 {
     if (s_uniforms_init) return;
@@ -131,11 +140,14 @@ void jce_pbr_material_bind(const JcePbrMaterial *mat,
     };
     bgfx_set_uniform(s_u_emissive, emissive, 1);
 
-    /* u_normalScale: x=normalScale (x<0 => checker fallback), y=doubleSided flag */
+    /* u_normalScale: x=normalScale (x<0 => checker fallback),
+     *                y=doubleSided flag,
+     *                z=view_mode (0=shaded, 1=wireframe, 2=textured/unlit, 3=wf+tex)
+     */
     float normal_scale[4] = {
         mat->normal_scale,
         mat->double_sided ? 1.0f : 0.0f,
-        0.0f,
+        s_view_mode,
         0.0f
     };
     bgfx_set_uniform(s_u_normal_scale, normal_scale, 1);
@@ -243,6 +255,11 @@ bool jce_pbr_material_load_json(const char *path, JcePbrMaterial *out,
     *out = jce_pbr_material_default();
     memset(out_tex_paths, 0, 5 * 256);
 
+    /* Unity-style exporters wrap params under "properties": { ... }.
+     * Engine-native files put params at root. Accept both transparently. */
+    cJSON *props_obj = cJSON_GetObjectItemCaseSensitive(root, "properties");
+    cJSON *props = (props_obj && cJSON_IsObject(props_obj)) ? props_obj : root;
+
     /* Texture paths (primary keys + fallback aliases). */
     const char *tex_keys[5] = {
         "albedoMap", "metallicRoughnessMap", "normalMap", "aoMap", "emissiveMap"
@@ -251,42 +268,61 @@ bool jce_pbr_material_load_json(const char *path, JcePbrMaterial *out,
         NULL, "metallicMap", NULL, "occlusionMap", "emissionMap"
     };
     for (int i = 0; i < 5; i++) {
-        const char *v = json_string(root, tex_keys[i]);
+        const char *v = json_string(props, tex_keys[i]);
         if (!v && tex_keys_alt[i])
-            v = json_string(root, tex_keys_alt[i]);
+            v = json_string(props, tex_keys_alt[i]);
+        if (!v && props != root) {
+            v = json_string(root, tex_keys[i]);
+            if (!v && tex_keys_alt[i])
+                v = json_string(root, tex_keys_alt[i]);
+        }
         if (v) safe_copy(out_tex_paths[i], 256, v);
     }
 
     /* Scalar/vector parameters. */
     static const float def_bc[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
     static const float def_em[3] = { 0.0f, 0.0f, 0.0f };
-    json_float_array(root, "baseColorFactor", out->base_color_factor, 4, def_bc);
-    json_float_array(root, "emissiveFactor", out->emissive_factor, 3, def_em);
+    /* Accept "baseColorFactor" or Unity-style "baseColor". */
+    if (cJSON_GetObjectItemCaseSensitive(props, "baseColorFactor"))
+        json_float_array(props, "baseColorFactor", out->base_color_factor, 4, def_bc);
+    else
+        json_float_array(props, "baseColor",       out->base_color_factor, 4, def_bc);
+    /* Accept "emissiveFactor" or Unity-style "emissionColor" (4-comp, drop alpha). */
+    if (cJSON_GetObjectItemCaseSensitive(props, "emissiveFactor")) {
+        json_float_array(props, "emissiveFactor", out->emissive_factor, 3, def_em);
+    } else {
+        float em4[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        const float def_em4[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        json_float_array(props, "emissionColor", em4, 4, def_em4);
+        out->emissive_factor[0] = em4[0];
+        out->emissive_factor[1] = em4[1];
+        out->emissive_factor[2] = em4[2];
+    }
 
-    /* Metallic: "metallicFactor" or legacy "metallic". */
-    cJSON *jm = cJSON_GetObjectItemCaseSensitive(root, "metallicFactor");
-    if (!jm) jm = cJSON_GetObjectItemCaseSensitive(root, "metallic");
+    /* Metallic: "metallicFactor" or legacy/unity "metallic". */
+    cJSON *jm = cJSON_GetObjectItemCaseSensitive(props, "metallicFactor");
+    if (!jm) jm = cJSON_GetObjectItemCaseSensitive(props, "metallic");
     out->metallic_factor = (jm && cJSON_IsNumber(jm)) ? (float)jm->valuedouble : 0.0f;
 
-    /* Roughness: "roughnessFactor" or legacy "smoothness" (inverted). */
-    cJSON *jr = cJSON_GetObjectItemCaseSensitive(root, "roughnessFactor");
+    /* Roughness: "roughnessFactor" or legacy/unity "smoothness" (inverted). */
+    cJSON *jr = cJSON_GetObjectItemCaseSensitive(props, "roughnessFactor");
     if (jr && cJSON_IsNumber(jr)) {
         out->roughness_factor = (float)jr->valuedouble;
     } else {
-        cJSON *js = cJSON_GetObjectItemCaseSensitive(root, "smoothness");
+        cJSON *js = cJSON_GetObjectItemCaseSensitive(props, "smoothness");
         if (js && cJSON_IsNumber(js))
             out->roughness_factor = 1.0f - (float)js->valuedouble;
         else
             out->roughness_factor = 1.0f;
     }
 
-    out->normal_scale     = (float)json_number(root, "normalScale",     1.0);
-    out->ao_strength      = (float)json_number(root, "aoStrength",      1.0);
-    out->alpha_cutoff     = (float)json_number(root, "alphaCutoff",     0.5);
-    out->double_sided     = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "doubleSided"));
+    out->normal_scale     = (float)json_number(props, "normalScale",     1.0);
+    out->ao_strength      = (float)json_number(props, "aoStrength",      1.0);
+    out->alpha_cutoff     = (float)json_number(props, "alphaCutoff",     0.5);
+    out->double_sided     = cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(props, "doubleSided"));
 
     /* Alpha mode. */
-    const char *am = json_string(root, "alphaMode");
+    const char *am = json_string(props, "alphaMode");
     if (am) {
         if (strcmp(am, "MASK") == 0)       out->alpha_mode = JCE_ALPHA_MASK;
         else if (strcmp(am, "BLEND") == 0)  out->alpha_mode = JCE_ALPHA_BLEND;
