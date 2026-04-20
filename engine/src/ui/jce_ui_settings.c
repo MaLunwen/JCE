@@ -12,8 +12,8 @@
 #include <jce/app/jce_config.h>
 #include <jce/core/jce_i18n.h>
 #include <jce/core/jce_log.h>
+#include "core/jce_memory.h"
 
-#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -496,7 +496,7 @@ JceSettingsPanel *jce_settings_create(const JceSettingsPanelDesc *desc)
     if (!desc || !desc->ui || !desc->renderer || !desc->window)
         return NULL;
 
-    JceSettingsPanel *p = (JceSettingsPanel *)calloc(1, sizeof(*p));
+    JceSettingsPanel *p = (JceSettingsPanel *)JCE_CALLOC(1, sizeof(*p));
     if (!p) return NULL;
 
     p->ui           = desc->ui;
@@ -521,7 +521,7 @@ JceSettingsPanel *jce_settings_create(const JceSettingsPanelDesc *desc)
     p->doc = jce_ui_doc_load_file(p->ui, "engine_settings.rml");
     if (!jce_ui_doc_valid(p->doc)) {
         LOG_ERROR(LOG_TAG, "failed to load settings document: engine_settings.rml");
-        free(p);
+        JCE_FREE(p);
         return NULL;
     }
 
@@ -574,7 +574,7 @@ void jce_settings_destroy(JceSettingsPanel *panel)
     if (!panel) return;
     if (panel->ui && jce_ui_doc_valid(panel->doc))
         jce_ui_doc_close(panel->ui, panel->doc);
-    free(panel);
+    JCE_FREE(panel);
 }
 
 void jce_settings_open(JceSettingsPanel *panel)

@@ -25,7 +25,7 @@ extern "C" {
 /* Initialize the editor subsystem.
    Creates ImGui context, loads fonts, sets up bgfx backend.
    Must be called after bgfx is initialized. */
-bool jce_editor_init(const PakArchive *pak, JceWindow *window);
+bool jce_editor_init(const JcePakArchive *pak, JceWindow *window);
 
 /* Shut down the editor and release all resources. */
 void jce_editor_shutdown(void);

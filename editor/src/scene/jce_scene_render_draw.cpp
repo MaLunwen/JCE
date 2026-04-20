@@ -9,6 +9,15 @@ extern "C" {
 #include <jce/graphics/jce_sprite.h>
 }
 
+/* ── Animation delta-time accumulator ─────────────────────────────── */
+
+static uint64_t s_anim_last_ticks = 0;
+
+void jce_editor_scene_reset_anim_timer(void)
+{
+    s_anim_last_ticks = 0;
+}
+
 /* ── Shadow map constants ─────────────────────────────────────────── */
 
 #define SHADOW_ORTHO_SIZE 50.0f
@@ -54,7 +63,8 @@ void draw_sky_gradient(void)
     float sky_params[4] = { 0.0f, 1.0f, 0.0f, 0.0f };
 
     if (s_sr.skybox_active && s_sr.skybox) {
-        equirect_tex = jce_skybox_get_equirect_texture(s_sr.skybox);
+        JceTexture jce_equirect = jce_skybox_get_equirect_texture(s_sr.skybox);
+        equirect_tex = { jce_equirect.idx };
         if (BGFX_HANDLE_IS_VALID(equirect_tex)) {
             sky_params[0] = 1.0f;  /* mode = equirect */
             sky_params[1] = s_sr.skybox_exposure;
@@ -633,15 +643,14 @@ void draw_entities(void)
     }
 
     /* Timing for animation updates. */
-    static uint64_t s_last_ticks = 0;
     uint64_t now_ticks = SDL_GetPerformanceCounter();
     float anim_dt = 0.0f;
-    if (s_last_ticks > 0) {
-        anim_dt = (float)(now_ticks - s_last_ticks) /
+    if (s_anim_last_ticks > 0) {
+        anim_dt = (float)(now_ticks - s_anim_last_ticks) /
                   (float)SDL_GetPerformanceFrequency();
         if (anim_dt > 0.1f) anim_dt = 0.1f; /* clamp large spikes */
     }
-    s_last_ticks = now_ticks;
+    s_anim_last_ticks = now_ticks;
 
     /* Begin sprite batch for 2D sprite entities. */
     if (s_sr.sprite_batch)
@@ -787,7 +796,10 @@ void draw_entities(void)
                 uint32_t abgr = ((uint32_t)a8 << 24) | ((uint32_t)b8 << 16)
                               | ((uint32_t)g8 << 8) | (uint32_t)r8;
 
-                jce_sprite_batch_add(s_sr.sprite_batch, spr_tex,
+                JceTexture spr_jce_tex;
+                spr_jce_tex.idx = spr_tex.idx;
+                jce_sprite_batch_add(s_sr.sprite_batch,
+                                     spr_jce_tex,
                                      model.raw[0],
                                      u0, v0, u1, v1,
                                      abgr, spr_comp->data.sprite_renderer.sorting_order);
@@ -897,8 +909,10 @@ void draw_entities(void)
                     s_sr.postfx_tonemap_active ? 1.0f : 0.0f
                 };
                 if (s_sr.skybox_active && s_sr.ibl_data) {
-                    bgfx_texture_handle_t irr = jce_ibl_get_irradiance(s_sr.ibl_data);
-                    bgfx_texture_handle_t pf  = jce_ibl_get_prefilter(s_sr.ibl_data);
+                    JceTexture irr_jce = jce_ibl_get_irradiance(s_sr.ibl_data);
+                    JceTexture pf_jce  = jce_ibl_get_prefilter(s_sr.ibl_data);
+                    bgfx_texture_handle_t irr = { irr_jce.idx };
+                    bgfx_texture_handle_t pf  = { pf_jce.idx };
                     if (BGFX_HANDLE_IS_VALID(irr) && BGFX_HANDLE_IS_VALID(pf) &&
                         BGFX_HANDLE_IS_VALID(s_sr.brdf_lut)) {
                         bgfx_set_texture(6, s_sr.u_ibl_irradiance, irr, UINT32_MAX);

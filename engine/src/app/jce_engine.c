@@ -120,7 +120,7 @@ struct JceEngine {
     JceInput        *input;
     JceAudio        *audio;
     JceRenderer     *renderer;
-    PakArchive      *pak;
+    JcePakArchive      *pak;
     JceAssetManager *assets;
     JceServices      svc;           /* subsystem handles for IApp */
 
@@ -129,7 +129,7 @@ struct JceEngine {
     jce_subsystem_registry_t   *subsystems;
 
     /* Optional KPI logging for Phase 0 baselines. */
-    FILE                       *kpi_asset_log;
+    SDL_IOStream                *kpi_asset_log;
     uint64_t                    kpi_asset_frame_index;
     uint32_t                    kpi_asset_frame_limit;
 
@@ -264,7 +264,7 @@ JceEngine *jce_engine_create(int argc, char *argv[])
 
     /* Open PAK archive. */
 #if defined(__EMSCRIPTEN__)
-    e->pak = pak_open_file("/game_assets.pak");
+    e->pak = jce_pak_open_file("/game_assets.pak");
 #elif defined(__ANDROID__)
     /* Android: load PAK from APK assets/ dir at runtime.
      * Embedding 290 MB in .rodata causes SEGV_ACCERR on Houdini
@@ -277,7 +277,7 @@ JceEngine *jce_engine_create(int argc, char *argv[])
                 void *pak_buf = JCE_MALLOC((size_t)pak_sz);
                 if (pak_buf) {
                     if (SDL_ReadIO(io, pak_buf, (size_t)pak_sz) == (size_t)pak_sz) {
-                        e->pak = pak_open_owned(pak_buf, (size_t)pak_sz);
+                        e->pak = jce_pak_open_owned(pak_buf, (size_t)pak_sz);
                     }
                     if (!e->pak) JCE_FREE(pak_buf);
                 }
@@ -314,11 +314,11 @@ JceEngine *jce_engine_create(int argc, char *argv[])
 
         if (found) {
             LOG_INFO(LOG_TAG, "JNI: loading PAK from %s", pak_path);
-            e->pak = pak_open_file(pak_path);
+            e->pak = jce_pak_open_file(pak_path);
         }
     }
 #else
-    e->pak = pak_open(assets_pak_data, assets_pak_data_size);
+    e->pak = jce_pak_open(assets_pak_data, assets_pak_data_size);
 #endif
     if (!e->pak) {
         fatal_msg("Failed to open PAK archive");
@@ -423,11 +423,12 @@ JceEngine *jce_engine_create(int argc, char *argv[])
     {
         const char *asset_kpi_path = SDL_getenv("JCE_KPI_ASSET_LOG");
         if (asset_kpi_path && asset_kpi_path[0]) {
-            e->kpi_asset_log = fopen(asset_kpi_path, "w");
+            e->kpi_asset_log = SDL_IOFromFile(asset_kpi_path, "w");
             if (e->kpi_asset_log) {
                 e->kpi_asset_frame_limit = read_positive_u32_env("JCE_KPI_ASSET_FRAME_COUNT", 0u);
-                fprintf(e->kpi_asset_log, "frame_index,asset_update_ms\n");
-                fflush(e->kpi_asset_log);
+                static const char hdr[] = "frame_index,asset_update_ms\n";
+                SDL_WriteIO(e->kpi_asset_log, hdr, sizeof(hdr) - 1);
+                SDL_FlushIO(e->kpi_asset_log);
                 LOG_INFO(LOG_TAG, "asset KPI capture enabled -> %s", asset_kpi_path);
             } else {
                 LOG_WARN(LOG_TAG, "failed to open asset KPI log: %s", asset_kpi_path);
@@ -677,12 +678,16 @@ JceAppResult jce_engine_iterate(JceEngine *e)
             if (freq > 0) {
                 const double asset_ms =
                     (double)(asset_t1 - asset_t0) * 1000.0 / (double)freq;
-                fprintf(e->kpi_asset_log, "%llu,%.3f\n",
-                        (unsigned long long)e->kpi_asset_frame_index,
-                        asset_ms);
+                char kpi_line[64];
+                int kpi_len = snprintf(kpi_line, sizeof(kpi_line),
+                    "%llu,%.3f\n",
+                    (unsigned long long)e->kpi_asset_frame_index,
+                    asset_ms);
+                if (kpi_len > 0)
+                    SDL_WriteIO(e->kpi_asset_log, kpi_line, (size_t)kpi_len);
                 e->kpi_asset_frame_index++;
                 if ((e->kpi_asset_frame_index % 60u) == 0u) {
-                    fflush(e->kpi_asset_log);
+                    SDL_FlushIO(e->kpi_asset_log);
                 }
             }
         }
@@ -741,15 +746,15 @@ void jce_engine_destroy(JceEngine *e)
     if (e->event_bus) jce_event_bus_destroy(e->event_bus);
 
     if (e->kpi_asset_log) {
-        fflush(e->kpi_asset_log);
-        fclose(e->kpi_asset_log);
+        SDL_FlushIO(e->kpi_asset_log);
+        SDL_CloseIO(e->kpi_asset_log);
         e->kpi_asset_log = NULL;
     }
 
     if (e->assets)   jce_asset_manager_destroy(e->assets);
     if (e->renderer) jce_renderer_destroy(e->renderer);
     if (e->audio)    jce_audio_destroy(e->audio);
-    if (e->pak)      pak_close(e->pak);
+    if (e->pak)      jce_pak_close(e->pak);
     if (e->input)    jce_input_destroy(e->input);
     if (e->window)   jce_window_destroy(e->window);
     jce_single_instance_unlock();

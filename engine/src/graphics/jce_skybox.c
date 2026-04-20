@@ -13,6 +13,7 @@
 
 #include <jce/graphics/jce_skybox.h>
 #include <jce/core/jce_log.h>
+#include <SDL3/SDL.h>
 #include "core/jce_memory.h"
 
 #include <bgfx/c99/bgfx.h>
@@ -85,20 +86,18 @@ static bgfx_texture_handle_t load_hdr_texture(const char *path,
     if (path) {
         /* Read the file into memory first (stbi_loadf needs stdio which
          * we've disabled; use stbi_loadf_from_memory instead). */
-        FILE *fp = fopen(path, "rb");
-        if (!fp) {
+        SDL_IOStream *io = SDL_IOFromFile(path, "rb");
+        if (!io) {
             LOG_WARN(LOG_TAG, "failed to open HDR file: %s", path);
             return invalid;
         }
-        fseek(fp, 0, SEEK_END);
-        long fsize = ftell(fp);
-        fseek(fp, 0, SEEK_SET);
-        if (fsize <= 0) { fclose(fp); return invalid; }
+        Sint64 fsize = SDL_GetIOSize(io);
+        if (fsize <= 0) { SDL_CloseIO(io); return invalid; }
 
         unsigned char *fbuf = (unsigned char *)JCE_MALLOC((size_t)fsize);
-        if (!fbuf) { fclose(fp); return invalid; }
-        size_t nread = fread(fbuf, 1, (size_t)fsize, fp);
-        fclose(fp);
+        if (!fbuf) { SDL_CloseIO(io); return invalid; }
+        size_t nread = SDL_ReadIO(io, fbuf, (size_t)fsize);
+        SDL_CloseIO(io);
 
         pixels = stbi_loadf_from_memory(fbuf, (int)nread, &w, &h, &channels, 4);
         JCE_FREE(fbuf);
@@ -231,14 +230,14 @@ void jce_skybox_render(const JceSkybox *sky, uint16_t view_id,
 /* Accessors                                                           */
 /* ================================================================== */
 
-bgfx_texture_handle_t jce_skybox_get_equirect_texture(const JceSkybox *sky)
+JceTexture jce_skybox_get_equirect_texture(const JceSkybox *sky)
 {
-    if (!sky) return sky_invalid_tex_handle();
-    return sky->equirect_tex;
+    if (!sky) return JCE_TEXTURE_INVALID;
+    return (JceTexture){ sky->equirect_tex.idx };
 }
 
-bgfx_texture_handle_t jce_skybox_get_cubemap(const JceSkybox *sky)
+JceTexture jce_skybox_get_cubemap(const JceSkybox *sky)
 {
-    if (!sky) return sky_invalid_tex_handle();
-    return sky->cubemap_tex;
+    if (!sky) return JCE_TEXTURE_INVALID;
+    return (JceTexture){ sky->cubemap_tex.idx };
 }

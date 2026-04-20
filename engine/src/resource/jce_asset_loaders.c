@@ -147,7 +147,7 @@ static void load_sound_sync(JceAssetManager *mgr, JceAssetSlot *slot,
 static void load_raw_sync(JceAssetManager *mgr, JceAssetSlot *slot,
                           const char *path)
 {
-	const PakAsset *asset = pak_find(mgr->pak, path);
+	const JcePakAsset *asset = jce_pak_find(mgr->pak, path);
 	if (!asset) {
 		slot->state = JCE_ASSET_STATE_FAILED;
 		LOG_ERROR(LOG_TAG, "raw asset not found: %s", path);
@@ -157,7 +157,7 @@ static void load_raw_sync(JceAssetManager *mgr, JceAssetSlot *slot,
 	void *buf = JCE_MALLOC(asset->original_size);
 	if (!buf) { slot->state = JCE_ASSET_STATE_FAILED; return; }
 
-	size_t n = pak_decompress(asset, buf, (size_t)asset->original_size);
+	size_t n = jce_pak_decompress(asset, buf, (size_t)asset->original_size);
 	if (n == 0) {
 		JCE_FREE(buf);
 		slot->state = JCE_ASSET_STATE_FAILED;
@@ -216,11 +216,11 @@ void load_slot_sync(JceAssetManager *mgr,
 	/* Try registered external loader first. */
 	if ((uint32_t)type < JCE_ASSET_TYPE_COUNT &&
 	    mgr->ext_loaders[type]) {
-		const PakAsset *pa = pak_find(mgr->pak, asset_path);
+		const JcePakAsset *pa = jce_pak_find(mgr->pak, asset_path);
 		if (pa) {
 			void *decompressed = JCE_MALLOC((size_t)pa->original_size);
 			size_t dec_size = decompressed
-				? pak_decompress(pa, decompressed, (size_t)pa->original_size) : 0;
+				? jce_pak_decompress(pa, decompressed, (size_t)pa->original_size) : 0;
 			if (dec_size > 0 && mgr->ext_loaders[type](
 			        decompressed, dec_size, params,
 			        &slot->data, &slot->memory_bytes)) {

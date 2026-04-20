@@ -1,14 +1,15 @@
 /*
  * jce_render_graph.h  Declarative frame graph for render passes.
  *
- * Abstracts bgfx views into a directed acyclic graph of render passes
+ * Abstracts render views into a directed acyclic graph of render passes
  * with automatic resource (transient texture) management.  Each pass
  * declares its inputs, outputs, and attachments; the graph compiles
  * them into an optimal execution order with barrier placement.
  *
  * Layer: Render Abstraction (Layer 4).
  *
- * STATUS: Architecture stub — API surface defined, implementation pending.
+ * STATUS: Implemented — topological sort (Kahn's), transient resource
+ *         allocation, cycle detection, automatic view assignment.
  */
 
 #ifndef JCE_RENDER_GRAPH_H
@@ -59,9 +60,9 @@ typedef struct {
 /*
  * Called once per frame for each pass.  The callback should:
  *   1. Declare resource reads/writes via jce_rg_pass_read / _write.
- *   2. Record draw commands into the provided bgfx view.
+ *   2. Record draw commands into the provided view.
  */
-typedef void (*JceRGPassExecuteFn)(JceRGPass pass, uint16_t bgfx_view,
+typedef void (*JceRGPassExecuteFn)(JceRGPass pass, uint16_t view_id,
                                    void *userdata);
 
 /* ================================================================== */
@@ -81,7 +82,7 @@ JceRGResource jce_rg_create_resource(JceRenderGraph *rg,
 
 /* Import an external resource (e.g. backbuffer, persistent texture). */
 JceRGResource jce_rg_import_resource(JceRenderGraph *rg,
-                                      uint16_t bgfx_texture_handle,
+                                      uint16_t texture_handle,
                                       const char *debug_name);
 
 /* ================================================================== */
@@ -108,8 +109,8 @@ void jce_rg_pass_write(JceRenderGraph *rg, JceRGPass pass,
  * transient resources.  Returns false on cycle or error. */
 bool jce_rg_compile(JceRenderGraph *rg);
 
-/* Execute all passes in compiled order.  Call between
- * bgfx_begin / bgfx_end (frame boundary). */
+/* Execute all passes in compiled order.  Call within a
+ * frame boundary (after begin_frame / before end_frame). */
 void jce_rg_execute(JceRenderGraph *rg);
 
 /* Reset the graph for the next frame.  Clears all passes and transient

@@ -21,7 +21,7 @@ extern "C" {
    Loads the imgui shader from PAK, creates font atlas texture,
    and sets up vertex layout.
    Must be called after bgfx_init() and ImGui::CreateContext(). */
-bool jce_imgui_bgfx_init(const PakArchive *pak, uint8_t view_id);
+bool jce_imgui_bgfx_init(const JcePakArchive *pak, uint8_t view_id);
 
 /* Destroy all bgfx resources (shader, texture, uniform). */
 void jce_imgui_bgfx_shutdown(void);

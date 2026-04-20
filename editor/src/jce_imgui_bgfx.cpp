@@ -58,7 +58,7 @@ static void create_font_texture(void)
 
 /* ── Public API ────────────────────────────────────────────────────── */
 
-bool jce_imgui_bgfx_init(const PakArchive *pak, uint8_t view_id)
+bool jce_imgui_bgfx_init(const JcePakArchive *pak, uint8_t view_id)
 {
     s_ctx.view_id = view_id;
 

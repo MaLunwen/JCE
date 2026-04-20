@@ -17,7 +17,7 @@ extern "C" {
 
 typedef struct JceMesh    JceMesh;
 typedef struct JceRenderer JceRenderer;
-typedef struct PakArchive  PakArchive;
+typedef struct JcePakArchive  JcePakArchive;
 
 /* Mesh vertex: position + normal + texcoord. */
 typedef struct {
@@ -33,7 +33,7 @@ JceMesh *jce_mesh_create(const JceMeshVertex *vertices, uint32_t num_verts,
 
 /* Load a mesh from a model file in PAK (e.g. "models/chalet.obj").
    Uses assimp. Returns first mesh in the file. */
-JceMesh *jce_mesh_load(const PakArchive *pak, const char *asset_path);
+JceMesh *jce_mesh_load(const JcePakArchive *pak, const char *asset_path);
 
 /* Destroy a mesh and free GPU buffers. */
 void jce_mesh_destroy(JceMesh *mesh);

@@ -26,7 +26,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
-#include <time.h>
 
 /* ================================================================== */
 /* Log message (fixed-size, POD, lives in the ring buffer)             */
@@ -36,7 +35,7 @@ typedef struct JceLogMessage {
     JceLogLevel level;
     int         line;
     uint64_t    timestamp_ms;   /* SDL_GetTicks() */
-    time_t      wall_time;      /* time(NULL)     */
+    SDL_Time    wall_time;      /* SDL_GetCurrentTime() */
     char        tag[32];
     char        file[64];
     char        thread_name[32];

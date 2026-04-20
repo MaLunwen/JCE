@@ -94,7 +94,7 @@ ModelCacheEntry *get_cached_model(const char *skeleton_path, uint32_t entity_id)
 /* ── Init ─────────────────────────────────────────────────────────── */
 
 bool jce_editor_scene_render_init(JceRenderer *renderer,
-                                  const PakArchive *pak,
+                                  const JcePakArchive *pak,
                                   JceAssetManager *assets)
 {
     if (s_sr.initialized) return true;
@@ -345,7 +345,8 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
                                                   BGFX_UNIFORM_TYPE_SAMPLER, 1);
     s_sr.u_ibl_params     = bgfx_create_uniform("u_iblParams",
                                                   BGFX_UNIFORM_TYPE_VEC4, 1);
-    s_sr.brdf_lut         = jce_ibl_create_brdf_lut(256);
+    JceTexture brdf = jce_ibl_create_brdf_lut(256);
+    s_sr.brdf_lut         = { brdf.idx };
     s_sr.skybox           = NULL;
     s_sr.ibl_data         = NULL;
     s_sr.skybox_active    = false;
@@ -583,7 +584,7 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         draw_sky_gradient();
     }
 
-    if (jce_state_get_show_grid()) {
+    if (jce_state_get_show_grid() && jce_state_get_play_state() == JCE_PLAY_STOPPED) {
         draw_grid();
     }
 

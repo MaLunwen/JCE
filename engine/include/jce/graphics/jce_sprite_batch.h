@@ -8,8 +8,8 @@
 #ifndef JCE_SPRITE_BATCH_H
 #define JCE_SPRITE_BATCH_H
 
+#include <jce/graphics/jce_texture_types.h>
 #include <jce/core/jce_math.h>
-#include <bgfx/c99/bgfx.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -30,7 +30,7 @@ void jce_sprite_batch_begin(JceSpriteBatch *batch);
  * Add a sprite quad to the batch.
  *
  * @param batch     The sprite batch.
- * @param texture   bgfx texture handle for the sprite atlas.
+ * @param texture   Texture handle for the sprite atlas.
  * @param world     4x4 world transform matrix (billboard or 3D placement).
  * @param uv_min    UV min corner {u0, v0}.
  * @param uv_max    UV max corner {u1, v1}.
@@ -38,7 +38,7 @@ void jce_sprite_batch_begin(JceSpriteBatch *batch);
  * @param sort_key  Sorting key (lower = drawn first).
  */
 void jce_sprite_batch_add(JceSpriteBatch *batch,
-                           bgfx_texture_handle_t texture,
+                           JceTexture texture,
                            const float *world,
                            float u0, float v0, float u1, float v1,
                            uint32_t color, int32_t sort_key);

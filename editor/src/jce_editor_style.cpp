@@ -236,10 +236,10 @@ int jce_editor_get_theme(void)
 
 /* ── Font loading ──────────────────────────────────────────────────── */
 
-bool jce_editor_load_fonts(const PakArchive *pak, float size_pixels)
+bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels)
 {
     /* --- Latin font (en.ttf) ---------------------------------------- */
-    const PakAsset *en_asset = pak_find(pak, "fonts/en.ttf");
+    const JcePakAsset *en_asset = jce_pak_find(pak, "fonts/en.ttf");
     if (!en_asset) {
         LOG_WARN(LOG_TAG, "fonts/en.ttf not found in PAK, using default font");
         return false;
@@ -248,7 +248,7 @@ bool jce_editor_load_fonts(const PakArchive *pak, float size_pixels)
     void *en_buf = malloc((size_t)en_asset->original_size);
     if (!en_buf) return false;
 
-    size_t en_n = pak_decompress(en_asset, en_buf, (size_t)en_asset->original_size);
+    size_t en_n = jce_pak_decompress(en_asset, en_buf, (size_t)en_asset->original_size);
     if (en_n == 0) {
         LOG_ERROR(LOG_TAG, "failed to decompress fonts/en.ttf");
         free(en_buf);
@@ -277,11 +277,11 @@ bool jce_editor_load_fonts(const PakArchive *pak, float size_pixels)
     }
 
     /* --- CJK font (zh-CN.ttf) — merged into the Latin font --------- */
-    const PakAsset *zh_asset = pak_find(pak, "fonts/zh-CN.ttf");
+    const JcePakAsset *zh_asset = jce_pak_find(pak, "fonts/zh-CN.ttf");
     if (zh_asset) {
         void *zh_buf = malloc((size_t)zh_asset->original_size);
         if (zh_buf) {
-            size_t zh_n = pak_decompress(zh_asset, zh_buf,
+            size_t zh_n = jce_pak_decompress(zh_asset, zh_buf,
                                          (size_t)zh_asset->original_size);
             if (zh_n > 0) {
                 ImFontConfig merge_cfg;

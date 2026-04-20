@@ -10,10 +10,9 @@
 
 #include <jce/app/jce_config.h>
 #include <jce/core/jce_log.h>
+#include "core/jce_memory.h"
 
 #include <SDL3/SDL.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 
@@ -91,7 +90,7 @@ static int parse_log_level(const char *value)
 
 static uint32_t parse_hex(const char *value)
 {
-    return (uint32_t)strtoul(value, NULL, 16);
+    return (uint32_t)SDL_strtoul(value, NULL, 16);
 }
 
 /* -- Apply a section.key = value to config ------------------------- */
@@ -103,8 +102,8 @@ static void apply(JceConfig *cfg, const char *section,
     snprintf(full, sizeof(full), "%s.%s", section, key);
 
     /* Window */
-    if      (strcmp(full, "window.width")  == 0) cfg->window_width  = atoi(value);
-    else if (strcmp(full, "window.height") == 0) cfg->window_height = atoi(value);
+    if      (strcmp(full, "window.width")  == 0) cfg->window_width  = SDL_atoi(value);
+    else if (strcmp(full, "window.height") == 0) cfg->window_height = SDL_atoi(value);
     else if (strcmp(full, "window.title")  == 0) {
         SDL_strlcpy(cfg->window_title, value, sizeof(cfg->window_title));
     }
@@ -118,9 +117,9 @@ static void apply(JceConfig *cfg, const char *section,
     else if (strcmp(full, "renderer.clear_color")== 0) cfg->clear_color = parse_hex(value);
 
     /* Audio */
-    else if (strcmp(full, "audio.master_volume") == 0) cfg->master_volume = (float)atof(value);
-    else if (strcmp(full, "audio.music_volume")  == 0) cfg->music_volume  = (float)atof(value);
-    else if (strcmp(full, "audio.sfx_volume")    == 0) cfg->sfx_volume    = (float)atof(value);
+    else if (strcmp(full, "audio.master_volume") == 0) cfg->master_volume = (float)SDL_atof(value);
+    else if (strcmp(full, "audio.music_volume")  == 0) cfg->music_volume  = (float)SDL_atof(value);
+    else if (strcmp(full, "audio.sfx_volume")    == 0) cfg->sfx_volume    = (float)SDL_atof(value);
 
     /* Logging */
     else if (strcmp(full, "logging.level")  == 0) cfg->log_level  = parse_log_level(value);
@@ -137,43 +136,68 @@ bool jce_config_load(JceConfig *cfg, const char *path)
 {
     if (!cfg || !path) return false;
 
-    FILE *fp = fopen(path, "r");
-    if (!fp) return false;
+    /* Use SDL_IOStream for cross-platform file access (works before PhysFS). */
+    SDL_IOStream *io = SDL_IOFromFile(path, "r");
+    if (!io) return false;
 
     LOG_INFO(LOG_TAG, "loading %s", path);
 
-    char line[512];
-    char section[64] = "";
-
-    while (fgets(line, sizeof(line), fp)) {
-        char *s = trim(line);
-
-        /* Skip empty lines and comments. */
-        if (*s == '\0' || *s == '#' || *s == ';') continue;
-
-        /* Section header: [name] */
-        if (*s == '[') {
-            char *end = strchr(s, ']');
-            if (end) {
-                *end = '\0';
-                SDL_strlcpy(section, s + 1, sizeof(section));
-            }
-            continue;
-        }
-
-        /* Key = value */
-        char *eq = strchr(s, '=');
-        if (!eq) continue;
-
-        *eq = '\0';
-        const char *key   = trim(s);
-        const char *value = trim(eq + 1);
-
-        if (*key != '\0' && section[0] != '\0') {
-            apply(cfg, section, key, value);
-        }
+    /* Read entire file into memory, then parse line-by-line. */
+    Sint64 file_size = SDL_GetIOSize(io);
+    if (file_size <= 0) {
+        /* Size unknown or empty — read incrementally up to 32 KB. */
+        file_size = 32 * 1024;
     }
 
-    fclose(fp);
+    char *buf = (char *)JCE_MALLOC((size_t)file_size + 1);
+    if (!buf) { SDL_CloseIO(io); return false; }
+
+    size_t total = SDL_ReadIO(io, buf, (size_t)file_size);
+    SDL_CloseIO(io);
+
+    if (total == 0) { JCE_FREE(buf); return false; }
+    buf[total] = '\0';
+
+    /* Parse lines from the in-memory buffer. */
+    char section[64] = "";
+    char *cursor = buf;
+
+    while (*cursor) {
+        /* Extract one line. */
+        char *eol = cursor;
+        while (*eol && *eol != '\n' && *eol != '\r') eol++;
+
+        char saved = *eol;
+        *eol = '\0';
+
+        char *s = trim(cursor);
+
+        if (*s != '\0' && *s != '#' && *s != ';') {
+            if (*s == '[') {
+                char *end = strchr(s, ']');
+                if (end) {
+                    *end = '\0';
+                    SDL_strlcpy(section, s + 1, sizeof(section));
+                }
+            } else {
+                char *eq = strchr(s, '=');
+                if (eq) {
+                    *eq = '\0';
+                    const char *key   = trim(s);
+                    const char *value = trim(eq + 1);
+                    if (*key != '\0' && section[0] != '\0')
+                        apply(cfg, section, key, value);
+                }
+            }
+        }
+
+        /* Advance past the line ending. */
+        *eol = saved;
+        if (*eol == '\r') eol++;
+        if (*eol == '\n') eol++;
+        cursor = eol;
+    }
+
+    JCE_FREE(buf);
     return true;
 }

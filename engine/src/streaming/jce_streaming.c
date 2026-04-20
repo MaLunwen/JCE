@@ -19,6 +19,7 @@
 #include <jce/core/jce_filesystem.h>
 #include <jce/core/jce_thread.h>
 #include <jce/core/jce_log.h>
+#include <jce/core/jce_profiler.h>
 #include "core/jce_memory.h"
 
 #include <SDL3/SDL_timer.h>
@@ -392,7 +393,8 @@ void jce_streaming_unregister_chunk(JceStreamingSystem *sys,
 
 void jce_streaming_update(JceStreamingSystem *sys, jce_vec3 camera_pos)
 {
-    if (!sys) return;
+    JCE_PROFILE_ZONE_N("Streaming::Update");
+    if (!sys) { JCE_PROFILE_ZONE_END; return; }
 
     double start = now_ms();
     float load_r2   = sys->config.load_radius   * sys->config.load_radius;
@@ -467,6 +469,7 @@ void jce_streaming_update(JceStreamingSystem *sys, jce_vec3 camera_pos)
                 break;  /* resume next frame */
         }
     }
+    JCE_PROFILE_ZONE_END;
 }
 
 /* ── Queries ──────────────────────────────────────────────────────── */

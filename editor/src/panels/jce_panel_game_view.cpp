@@ -53,6 +53,11 @@ void jce_editor_panel_game_view_content(void)
         if (ImGui::SmallButton("||")) jce_state_pause();
         ImGui::SameLine();
         if (ImGui::SmallButton("[]")) jce_state_stop();
+        ImGui::SameLine();
+        if (ps == JCE_PLAY_PLAYING)
+            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), ">> Playing");
+        else
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "|| Paused");
     }
 
     ImGui::Separator();

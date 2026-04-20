@@ -72,7 +72,7 @@ void handle_scene_selection_box(const SceneViewCtx *ctx)
 
 void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
 {
-    if (jce_editor_prefs_show_gizmos()) {
+    if (jce_editor_prefs_show_gizmos() && jce_state_get_play_state() == JCE_PLAY_STOPPED) {
         uint32_t focused = jce_state_get_focused();
         if (focused != 0) {
             int comp_count = 0;

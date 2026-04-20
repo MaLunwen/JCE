@@ -289,7 +289,7 @@ void jce_postfx_get_params(const JcePostFXPipeline *pipeline,
 /* ── Load shaders ──────────────────────────────────────────────────── */
 
 /* Helper: load a postfx program (vs_postfx + fs_<effect>) and log on failure. */
-static bgfx_program_handle_t load_postfx_prog(const PakArchive *pak,
+static bgfx_program_handle_t load_postfx_prog(const JcePakArchive *pak,
                                               const char *fs_name)
 {
     bgfx_program_handle_t invalid;
@@ -305,7 +305,7 @@ static bgfx_program_handle_t load_postfx_prog(const PakArchive *pak,
 }
 
 bool jce_postfx_load_shaders(JcePostFXPipeline *pipeline,
-                             const PakArchive *pak)
+                             const JcePakArchive *pak)
 {
     if (!pipeline) return false;
     if (!pak) {

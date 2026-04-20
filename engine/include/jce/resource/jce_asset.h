@@ -131,7 +131,7 @@ typedef struct JceAssetLoadParams {
 typedef struct JceAssetManager JceAssetManager;
 
 /* Forward declarations for subsystems. */
-typedef struct PakArchive   PakArchive;
+typedef struct JcePakArchive   JcePakArchive;
 typedef struct JceFileSystem JceFileSystem;
 typedef struct JceAudio     JceAudio;
 
@@ -149,7 +149,7 @@ typedef struct JceAssetManagerConfig {
 	uint32_t worker_threads;
 
 	/* PAK archive for reading cooked assets (required). */
-	PakArchive *pak;
+	JcePakArchive *pak;
 
 	/* Optional VFS for loose-file override (developer mode). */
 	JceFileSystem *fs;

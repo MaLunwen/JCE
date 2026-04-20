@@ -80,9 +80,9 @@ static bool parse_json_table(const char *json, I18nTable *table)
 
 /* ── Load a single locale file from PAK ────────────────────────────── */
 
-static bool load_locale(const PakArchive *pak, const char *path, I18nTable *table)
+static bool load_locale(const JcePakArchive *pak, const char *path, I18nTable *table)
 {
-    const PakAsset *asset = pak_find(pak, path);
+    const JcePakAsset *asset = jce_pak_find(pak, path);
     if (!asset) {
         LOG_WARN(LOG_TAG, "locale file not found: %s", path);
         return false;
@@ -91,7 +91,7 @@ static bool load_locale(const PakArchive *pak, const char *path, I18nTable *tabl
     char *buf = (char *)ED_MALLOC((size_t)asset->original_size + 1);
     if (!buf) return false;
 
-    size_t n = pak_decompress(asset, buf, (size_t)asset->original_size);
+    size_t n = jce_pak_decompress(asset, buf, (size_t)asset->original_size);
     if (n == 0) {
         ED_FREE(buf);
         return false;
@@ -205,7 +205,7 @@ static void expand_placeholders(const char *src, char *dst, size_t cap, int dept
 
 /* ── Public API ────────────────────────────────────────────────────── */
 
-bool jce_editor_i18n_init(const PakArchive *pak)
+bool jce_editor_i18n_init(const JcePakArchive *pak)
 {
     memset(&s_i18n, 0, sizeof(s_i18n));
     s_i18n.active = JCE_LOCALE_EN;

@@ -56,13 +56,12 @@ static void jce_bgfx_fatal(bgfx_callback_interface_t* _this,
                            const char* _str)
 {
     (void)_this;
-    fprintf(stderr,
-            "bgfx fatal: code=%d file=%s line=%u msg=%s\n",
-            (int)_code,
-            _filePath ? _filePath : "<null>",
-            (unsigned)_line,
-            _str ? _str : "<null>");
-    fflush(stderr);
+    LOG_ERROR(LOG_TAG,
+              "bgfx fatal: code=%d file=%s line=%u msg=%s",
+              (int)_code,
+              _filePath ? _filePath : "<null>",
+              (unsigned)_line,
+              _str ? _str : "<null>");
 }
 
 static void jce_bgfx_trace_vargs(bgfx_callback_interface_t* _this,

@@ -7,7 +7,8 @@
  *
  * Layer: Render Abstraction (Layer 4).
  *
- * STATUS: Architecture stub — API surface defined, implementation pending.
+ * STATUS: Implemented — sorted queue with front-to-back, back-to-front,
+ *         by-material, and sequential sort modes.
  */
 
 #ifndef JCE_RENDER_QUEUE_H

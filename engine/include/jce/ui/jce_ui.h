@@ -27,7 +27,7 @@ extern "C" {
 /* Forward declarations. */
 typedef struct JceRenderer JceRenderer;
 typedef struct JceInput    JceInput;
-typedef struct PakArchive  PakArchive;
+typedef struct JcePakArchive  JcePakArchive;
 
 /* ================================================================== */
 /* Context lifecycle                                                   */
@@ -39,7 +39,7 @@ typedef struct {
     uint32_t     width;             /* viewport width */
     uint32_t     height;            /* viewport height */
     JceRenderer *renderer;          /* engine renderer (for bgfx draws) */
-    PakArchive  *pak;               /* asset archive (for RML/RCSS/fonts) */
+    JcePakArchive  *pak;               /* asset archive (for RML/RCSS/fonts) */
 } JceUIContextDesc;
 
 JceUIContext *jce_ui_create(const JceUIContextDesc *desc, jce_allocator_t alloc);

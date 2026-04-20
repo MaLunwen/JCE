@@ -1,5 +1,5 @@
 /*
- * jce_scene_serial.h  Scene serialization (JSON via cJSON).
+ * jce_scene_serial.h  Scene serialization (JSON format).
  *
  * Saves and loads the full ECS scene graph to/from a JSON file.
  * Each entity is stored with its name and all known components
@@ -23,7 +23,8 @@ extern "C" {
 #endif
 
 /* Forward declarations. */
-typedef struct JceScene JceScene;
+typedef struct JceScene      JceScene;
+typedef struct JceFileSystem JceFileSystem;
 
 /* ================================================================== */
 /* Save                                                                */
@@ -34,7 +35,9 @@ typedef struct JceScene JceScene;
    Caller must free the string with jce_scene_serial_free(). */
 char *jce_scene_serial_save(const JceScene *scene, size_t *out_len);
 
-/* Write the scene to a file path (UTF-8 JSON). */
+/* Write the scene to a file path (UTF-8 JSON).
+   Uses the engine VFS for cross-platform I/O.
+   path is relative to the write directory set on fs. */
 bool  jce_scene_serial_save_file(const JceScene *scene, const char *path);
 
 /* ================================================================== */
@@ -46,8 +49,16 @@ bool  jce_scene_serial_save_file(const JceScene *scene, const char *path);
    Returns true on success. */
 bool jce_scene_serial_load(JceScene *scene, const char *json, size_t len);
 
-/* Load the scene from a file path. */
+/* Load the scene from a file path.
+   Uses the engine VFS for cross-platform I/O.
+   Falls back to the native filesystem if fs is NULL. */
 bool jce_scene_serial_load_file(JceScene *scene, const char *path);
+
+/* Load the scene from a virtual path through the VFS.
+   Supports reading from PAK archives and mounted directories. */
+bool jce_scene_serial_load_vfs(JceScene *scene,
+                               const JceFileSystem *fs,
+                               const char *virtual_path);
 
 /* ================================================================== */
 /* Memory                                                              */

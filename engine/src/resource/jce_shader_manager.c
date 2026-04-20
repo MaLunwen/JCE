@@ -22,12 +22,12 @@ typedef struct {
 } ShaderEntry;
 
 struct JceShaderManager {
-    const PakArchive *pak;
+    const JcePakArchive *pak;
     ShaderEntry       entries[MAX_SHADERS];
     int               count;
 };
 
-JceShaderManager *jce_shader_manager_create(const PakArchive *pak)
+JceShaderManager *jce_shader_manager_create(const JcePakArchive *pak)
 {
     JceShaderManager *mgr = (JceShaderManager *)JCE_CALLOC(1, sizeof(*mgr));
     if (!mgr) return NULL;

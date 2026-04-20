@@ -24,7 +24,7 @@ typedef enum {
 } JceLocale;
 
 /* Initialize the i18n system and load all locale files from PAK. */
-bool jce_editor_i18n_init(const PakArchive *pak);
+bool jce_editor_i18n_init(const JcePakArchive *pak);
 
 /* Shut down and free all string tables. */
 void jce_editor_i18n_shutdown(void);

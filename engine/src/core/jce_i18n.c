@@ -81,9 +81,9 @@ static void parse_json(const char *json_text, JceLang lang)
     cJSON_Delete(root);
 }
 
-static void load_lang(const PakArchive *pak, JceLang lang)
+static void load_lang(const JcePakArchive *pak, JceLang lang)
 {
-    const PakAsset *asset = pak_find(pak, s_lang_assets[lang]);
+    const JcePakAsset *asset = jce_pak_find(pak, s_lang_assets[lang]);
     if (!asset) {
         LOG_WARN(LOG_TAG, "missing translation: %s", s_lang_assets[lang]);
         return;
@@ -92,7 +92,7 @@ static void load_lang(const PakArchive *pak, JceLang lang)
     char *json = (char *)JCE_MALLOC((size_t)asset->original_size + 1);
     if (!json) return;
 
-    size_t n = pak_decompress(asset, json, (size_t)asset->original_size);
+    size_t n = jce_pak_decompress(asset, json, (size_t)asset->original_size);
     if (n == 0) { JCE_FREE(json); return; }
     json[n] = '\0';
 
@@ -106,7 +106,7 @@ static void load_lang(const PakArchive *pak, JceLang lang)
 /* Public API                                                           */
 /* ------------------------------------------------------------------ */
 
-void jce_i18n_init(const PakArchive *pak)
+void jce_i18n_init(const JcePakArchive *pak)
 {
     if (!pak) return;
     memset(s_strings, 0, sizeof(s_strings));

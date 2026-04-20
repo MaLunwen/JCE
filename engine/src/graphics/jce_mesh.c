@@ -177,7 +177,7 @@ JceMesh *jce_mesh_create(const JceMeshVertex *vertices, uint32_t num_verts,
     return m;
 }
 
-JceMesh *jce_mesh_load(const PakArchive *pak, const char *asset_path)
+JceMesh *jce_mesh_load(const JcePakArchive *pak, const char *asset_path)
 {
     (void)pak; (void)asset_path;
     LOG_WARN(LOG_TAG, "jce_mesh_load: use jce_model_load_gltf() for glTF assets");

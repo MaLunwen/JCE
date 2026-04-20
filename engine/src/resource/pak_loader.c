@@ -9,7 +9,7 @@
 #include "resource/pak_format.h"
 #include <jce/core/jce_profiler.h>
 
-#include <stdio.h>
+#include <SDL3/SDL.h>
 #include "core/jce_memory.h"
 #include <string.h>
 
@@ -20,11 +20,11 @@
 /* Internal types                                                      */
 /* ================================================================== */
 
-struct PakArchive {
+struct JcePakArchive {
     const uint8_t *blob;        /* start of the in-memory PAK         */
     size_t         blob_size;
     uint32_t       count;       /* number of entries                   */
-    PakAsset      *assets;      /* heap-allocated array, sorted by hash*/
+    JcePakAsset      *assets;      /* heap-allocated array, sorted by hash*/
     uint64_t      *hashes;      /* parallel array of path hashes       */
     char         **paths;       /* heap-allocated NUL-terminated copies*/
     int            owns_blob;   /* 1 => blob was malloc'd; free on close*/
@@ -32,10 +32,10 @@ struct PakArchive {
 };
 
 /* ================================================================== */
-/* pak_open                                                            */
+/* jce_pak_open                                                            */
 /* ================================================================== */
 
-PakArchive *pak_open(const void *data, size_t size) {
+JcePakArchive *jce_pak_open(const void *data, size_t size) {
     if (!data || size < JPAK_HEADER_SIZE) return NULL;
 
     const uint8_t *blob = (const uint8_t *)data;
@@ -61,7 +61,7 @@ PakArchive *pak_open(const void *data, size_t size) {
     uint64_t toc_end = toc_off + (uint64_t)count * JPAK_TOC_ENTRY_SIZE;
     if (toc_end > size || data_off > size) return NULL;
 
-    PakArchive *pak = (PakArchive *)JCE_CALLOC(1, sizeof(PakArchive));
+    JcePakArchive *pak = (JcePakArchive *)JCE_CALLOC(1, sizeof(JcePakArchive));
     if (!pak) return NULL;
 
     pak->blob      = blob;
@@ -72,11 +72,11 @@ PakArchive *pak_open(const void *data, size_t size) {
 
     if (count == 0) return pak;
 
-    pak->assets = (PakAsset *)JCE_CALLOC(count, sizeof(PakAsset));
+    pak->assets = (JcePakAsset *)JCE_CALLOC(count, sizeof(JcePakAsset));
     pak->hashes = (uint64_t *)JCE_CALLOC(count, sizeof(uint64_t));
     pak->paths  = (char **)JCE_CALLOC(count, sizeof(char *));
     if (!pak->assets || !pak->hashes || !pak->paths) {
-        pak_close(pak);
+        jce_pak_close(pak);
         return NULL;
     }
 
@@ -93,13 +93,13 @@ PakArchive *pak_open(const void *data, size_t size) {
 
         /* Bounds-check name region. */
         if ((uint64_t)name_offset + name_length > size) {
-            pak_close(pak);
+            jce_pak_close(pak);
             return NULL;
         }
 
         /* Build a NUL-terminated path copy. */
         char *path_copy = (char *)JCE_MALLOC(name_length + 1);
-        if (!path_copy) { pak_close(pak); return NULL; }
+        if (!path_copy) { jce_pak_close(pak); return NULL; }
         memcpy(path_copy, blob + name_offset, name_length);
         path_copy[name_length] = '\0';
 
@@ -113,7 +113,7 @@ PakArchive *pak_open(const void *data, size_t size) {
 
         /* Bounds-check data region. */
         if (data_off + entry_data_off + compressed_size > size) {
-            pak_close(pak);
+            jce_pak_close(pak);
             return NULL;
         }
     }
@@ -122,10 +122,10 @@ PakArchive *pak_open(const void *data, size_t size) {
 }
 
 /* ================================================================== */
-/* pak_close                                                           */
+/* jce_pak_close                                                           */
 /* ================================================================== */
 
-void pak_close(PakArchive *pak) {
+void jce_pak_close(JcePakArchive *pak) {
     if (!pak) return;
     if (pak->paths) {
         for (uint32_t i = 0; i < pak->count; ++i)
@@ -140,39 +140,37 @@ void pak_close(PakArchive *pak) {
 }
 
 /* ================================================================== */
-/* pak_open_owned                                                      */
+/* jce_pak_open_owned                                                      */
 /* ================================================================== */
 
-PakArchive *pak_open_owned(void *data, size_t size) {
-    PakArchive *pak = pak_open(data, size);
+JcePakArchive *jce_pak_open_owned(void *data, size_t size) {
+    JcePakArchive *pak = jce_pak_open(data, size);
     if (pak) pak->owns_blob = 1;
     return pak;
 }
 
 /* ================================================================== */
-/* pak_open_file                                                       */
+/* jce_pak_open_file                                                       */
 /* ================================================================== */
 
-PakArchive *pak_open_file(const char *path) {
+JcePakArchive *jce_pak_open_file(const char *path) {
     if (!path) return NULL;
 
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
+    SDL_IOStream *io = SDL_IOFromFile(path, "rb");
+    if (!io) return NULL;
 
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
-    long lsize = ftell(f);
-    if (lsize <= 0) { fclose(f); return NULL; }
-    rewind(f);
+    Sint64 lsize = SDL_GetIOSize(io);
+    if (lsize <= 0) { SDL_CloseIO(io); return NULL; }
 
     uint8_t *buf = (uint8_t *)JCE_MALLOC((size_t)lsize);
-    if (!buf) { fclose(f); return NULL; }
+    if (!buf) { SDL_CloseIO(io); return NULL; }
 
-    if (fread(buf, 1, (size_t)lsize, f) != (size_t)lsize) {
-        JCE_FREE(buf); fclose(f); return NULL;
+    if (SDL_ReadIO(io, buf, (size_t)lsize) != (size_t)lsize) {
+        JCE_FREE(buf); SDL_CloseIO(io); return NULL;
     }
-    fclose(f);
+    SDL_CloseIO(io);
 
-    PakArchive *pak = pak_open(buf, (size_t)lsize);
+    JcePakArchive *pak = jce_pak_open(buf, (size_t)lsize);
     if (pak) {
         pak->owns_blob = 1;
     } else {
@@ -182,10 +180,10 @@ PakArchive *pak_open_file(const char *path) {
 }
 
 /* ================================================================== */
-/* pak_find    XXH3 hash + binary search                              */
+/* jce_pak_find    XXH3 hash + binary search                              */
 /* ================================================================== */
 
-const PakAsset *pak_find(const PakArchive *pak, const char *path) {
+const JcePakAsset *jce_pak_find(const JcePakArchive *pak, const char *path) {
     if (!pak || !path || pak->count == 0) return NULL;
 
     uint64_t hash = XXH3_64bits(path, strlen(path));
@@ -210,10 +208,10 @@ const PakAsset *pak_find(const PakArchive *pak, const char *path) {
 }
 
 /* ================================================================== */
-/* pak_decompress                                                      */
+/* jce_pak_decompress                                                      */
 /* ================================================================== */
 
-size_t pak_decompress(const PakAsset *asset, void *buf, size_t buf_size) {
+size_t jce_pak_decompress(const JcePakAsset *asset, void *buf, size_t buf_size) {
     if (!asset || !buf || buf_size < asset->original_size)
         return 0;
 
@@ -225,7 +223,7 @@ size_t pak_decompress(const PakAsset *asset, void *buf, size_t buf_size) {
     return result;
 }
 
-size_t pak_decompress_ex(const PakArchive *pak, const PakAsset *asset,
+size_t jce_pak_decompress_ex(const JcePakArchive *pak, const JcePakAsset *asset,
                          void *buf, size_t buf_size) {
     if (!asset || !buf || buf_size < asset->original_size)
         return 0;
@@ -247,14 +245,14 @@ size_t pak_decompress_ex(const PakArchive *pak, const PakAsset *asset,
 }
 
 /* ================================================================== */
-/* pak_count / pak_get                                                 */
+/* jce_pak_count / jce_pak_get                                                 */
 /* ================================================================== */
 
-uint32_t pak_count(const PakArchive *pak) {
+uint32_t jce_pak_count(const JcePakArchive *pak) {
     return pak ? pak->count : 0;
 }
 
-const PakAsset *pak_get(const PakArchive *pak, uint32_t index) {
+const JcePakAsset *jce_pak_get(const JcePakArchive *pak, uint32_t index) {
     if (!pak || index >= pak->count) return NULL;
     return &pak->assets[index];
 }

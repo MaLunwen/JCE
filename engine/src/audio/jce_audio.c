@@ -302,12 +302,12 @@ JceSound jce_audio_load_pcm(JceAudio *audio,
     return (JceSound)(slot + 1);
 }
 
-static JceSound jce_audio_load_inner(JceAudio *audio, const PakArchive *pak,
+static JceSound jce_audio_load_inner(JceAudio *audio, const JcePakArchive *pak,
                                      const char *path)
 {
     if (!audio || !pak || !path) return JCE_SOUND_INVALID;
 
-    const PakAsset *asset = pak_find(pak, path);
+    const JcePakAsset *asset = jce_pak_find(pak, path);
     if (!asset) {
         LOG_ERROR("jce_audio", "asset '%s' not found in PAK", path);
         return JCE_SOUND_INVALID;
@@ -317,7 +317,7 @@ static JceSound jce_audio_load_inner(JceAudio *audio, const PakArchive *pak,
     void *raw = JCE_MALLOC((size_t)asset->original_size);
     if (!raw) return JCE_SOUND_INVALID;
 
-    size_t decoded = pak_decompress(asset, raw, (size_t)asset->original_size);
+    size_t decoded = jce_pak_decompress(asset, raw, (size_t)asset->original_size);
     if (decoded == 0) {
         LOG_ERROR("jce_audio", "decompress failed for '%s'", path);
         JCE_FREE(raw);
@@ -382,7 +382,7 @@ static JceSound jce_audio_load_inner(JceAudio *audio, const PakArchive *pak,
     return result;
 }
 
-JceSound jce_audio_load(JceAudio *audio, const PakArchive *pak, const char *path)
+JceSound jce_audio_load(JceAudio *audio, const JcePakArchive *pak, const char *path)
 {
     JCE_PROFILE_ZONE_N("Audio::Load");
     JceSound result = jce_audio_load_inner(audio, pak, path);
@@ -431,16 +431,20 @@ static int alloc_voice(JceAudio *audio)
 JceVoice jce_audio_play(JceAudio *audio, JceSound snd,
                          bool loop, float volume, float pitch)
 {
-    if (!audio || snd == JCE_SOUND_INVALID) return JCE_VOICE_INVALID;
+    JCE_PROFILE_ZONE_N("Audio::Play");
+    if (!audio || snd == JCE_SOUND_INVALID) { JCE_PROFILE_ZONE_END; return JCE_VOICE_INVALID; }
 
     int buf_slot = (int)snd - 1;
     if (buf_slot < 0 || buf_slot >= JCE_MAX_SOUNDS
-        || !audio->sound_used[buf_slot])
+        || !audio->sound_used[buf_slot]) {
+        JCE_PROFILE_ZONE_END;
         return JCE_VOICE_INVALID;
+    }
 
     int vi = alloc_voice(audio);
     if (vi < 0) {
         LOG_WARN("jce_audio", "no free voices");
+        JCE_PROFILE_ZONE_END;
         return JCE_VOICE_INVALID;
     }
 
@@ -455,6 +459,7 @@ JceVoice jce_audio_play(JceAudio *audio, JceSound snd,
 
     if (ma_audio_buffer_init(&buf_cfg, &v->buffer) != MA_SUCCESS) {
         LOG_ERROR("jce_audio", "ma_audio_buffer_init failed");
+        JCE_PROFILE_ZONE_END;
         return JCE_VOICE_INVALID;
     }
 
@@ -462,6 +467,7 @@ JceVoice jce_audio_play(JceAudio *audio, JceSound snd,
             &v->buffer, 0, NULL, &v->sound) != MA_SUCCESS) {
         LOG_ERROR("jce_audio", "ma_sound_init_from_data_source failed");
         ma_audio_buffer_uninit(&v->buffer);
+        JCE_PROFILE_ZONE_END;
         return JCE_VOICE_INVALID;
     }
 
@@ -472,6 +478,7 @@ JceVoice jce_audio_play(JceAudio *audio, JceSound snd,
 
     v->inited = true;
     v->sound_slot = buf_slot;
+    JCE_PROFILE_ZONE_END;
     return (JceVoice)(vi + 1);
 }
 
@@ -621,7 +628,7 @@ JceAudio *jce_audio_create(void) {
     return NULL;
 }
 void jce_audio_destroy(JceAudio *audio) { (void)audio; }
-JceSound jce_audio_load(JceAudio *audio, PakArchive *pak, const char *path) {
+JceSound jce_audio_load(JceAudio *audio, JcePakArchive *pak, const char *path) {
     (void)audio; (void)pak; (void)path; return JCE_SOUND_INVALID;
 }
 JceSound jce_audio_load_pcm(JceAudio *audio, const void *pcm_data,

@@ -26,7 +26,7 @@ typedef struct JceWindow       JceWindow;
 typedef struct JceInput        JceInput;
 typedef struct JceAudio        JceAudio;
 typedef struct JceRenderer     JceRenderer;
-typedef struct PakArchive      PakArchive;
+typedef struct JcePakArchive      JcePakArchive;
 typedef struct JceConfig       JceConfig;
 typedef struct JceAssetManager JceAssetManager;
 
@@ -39,7 +39,7 @@ typedef struct JceServices {
     JceInput          *input;
     JceAudio          *audio;
     JceRenderer       *renderer;
-    PakArchive        *pak;
+    JcePakArchive        *pak;
     const JceConfig   *config;
     JceAssetManager   *assets;
 } JceServices;

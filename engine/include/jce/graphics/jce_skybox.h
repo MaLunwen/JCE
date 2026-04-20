@@ -13,7 +13,6 @@
 #include <jce/graphics/jce_texture_types.h>
 #include <jce/graphics/jce_renderer.h>
 #include <jce/core/jce_math.h>
-#include <bgfx/c99/bgfx.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -56,13 +55,13 @@ void jce_skybox_render(const JceSkybox *sky, uint16_t view_id,
  * Get the equirectangular texture handle (RGBA16F or RGBA32F).
  * Useful for IBL processing.
  */
-bgfx_texture_handle_t jce_skybox_get_equirect_texture(const JceSkybox *sky);
+JceTexture jce_skybox_get_equirect_texture(const JceSkybox *sky);
 
 /*
  * Get the cubemap texture handle (6-face cubemap).
- * Returns BGFX_INVALID_HANDLE if not yet converted.
+ * Returns JCE_TEXTURE_INVALID if not yet converted.
  */
-bgfx_texture_handle_t jce_skybox_get_cubemap(const JceSkybox *sky);
+JceTexture jce_skybox_get_cubemap(const JceSkybox *sky);
 
 /* Check if the current GPU supports HDR skybox (float textures). */
 bool jce_skybox_supported(void);

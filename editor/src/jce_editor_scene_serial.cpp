@@ -6,7 +6,16 @@
  */
 
 #include "jce_editor_state_internal.h"
+#include "jce_editor_ecs_adapter.h"
 #include "jce_editor_file_util.h"
+
+extern "C" {
+#include <jce/graphics/jce_model.h>
+}
+
+#include <SDL3/SDL.h>
+#include <cstring>
+#include <filesystem>
 
 /* ── Component type save name ────────────────────────────────────── */
 
@@ -400,6 +409,115 @@ void mark_prefab_instance_recursive(uint32_t entity_id, const char *prefab_path)
 		mark_prefab_instance_recursive(child_ids[i], prefab_path);
 }
 
+/* ── Mesh asset validation (glTF/GLB via engine cgltf) ────────────── */
+
+static bool is_gltf_extension(const char *path)
+{
+	const char *dot = strrchr(path, '.');
+	if (!dot) return false;
+	return (strcmp(dot, ".gltf") == 0 || strcmp(dot, ".glb") == 0 ||
+	        strcmp(dot, ".GLTF") == 0 || strcmp(dot, ".GLB") == 0);
+}
+
+struct MeshValidCtx { int checked; int failed; const char *scene_dir; };
+
+static void validate_mesh_cb(JceScene *sc, JceEntity e, void *ud)
+{
+	auto *ctx = static_cast<MeshValidCtx *>(ud);
+
+	JceMeshRenderer *mr = jce_scene_get_mesh_renderer(sc, e);
+	if (!mr || mr->mesh_path[0] == '\0') return;
+	if (!is_gltf_extension(mr->mesh_path)) return;
+
+	/* Resolve relative path against scene directory. */
+	namespace fs = std::filesystem;
+	fs::path mesh_p(mr->mesh_path);
+	if (!mesh_p.is_absolute() && ctx->scene_dir && ctx->scene_dir[0]) {
+		mesh_p = fs::path(ctx->scene_dir) / mesh_p;
+	}
+	std::string abs_path = mesh_p.string();
+
+	size_t file_size = 0;
+	void *data = SDL_LoadFile(abs_path.c_str(), &file_size);
+	if (!data) return; /* file not found — separate concern */
+
+	ctx->checked++;
+	JceModel *model = jce_model_load_gltf_memory(data, (uint32_t)file_size,
+	                                              mr->mesh_path);
+	SDL_free(data);
+
+	if (!model) {
+		ctx->failed++;
+		LOG_WARN(LOG_TAG, "engine cgltf cannot load mesh '%s' — "
+		         "runtime may fail to display this model",
+		         mr->mesh_path);
+	} else {
+		jce_model_destroy(model);
+	}
+}
+
+static void validate_mesh_assets(const char *scene_path)
+{
+	namespace fs = std::filesystem;
+	std::string scene_dir;
+	if (scene_path) {
+		fs::path sp(scene_path);
+		if (sp.has_parent_path())
+			scene_dir = sp.parent_path().string();
+	}
+
+	MeshValidCtx ctx = { 0, 0, scene_dir.c_str() };
+	jce_scene_each_entity(s.scene, validate_mesh_cb, &ctx);
+
+	if (ctx.checked > 0 && ctx.failed == 0) {
+		LOG_SUCCESS(LOG_TAG, "mesh asset validation passed: %d glTF "
+		            "files verified with engine cgltf", ctx.checked);
+	} else if (ctx.failed > 0) {
+		LOG_WARN(LOG_TAG, "mesh asset validation: %d/%d glTF files "
+		         "failed engine cgltf load", ctx.failed, ctx.checked);
+	}
+}
+
+/* ── Round-trip validation ────────────────────────────────────────── */
+
+static void count_entity_cb(JceScene * /*s*/, JceEntity /*e*/, void *ud)
+{
+	(*(int *)ud)++;
+}
+
+static bool validate_scene_round_trip(const char *path)
+{
+	JceScene *verify = jce_scene_create();
+	if (!verify) {
+		LOG_ERROR(LOG_TAG, "round-trip validation: cannot create temp scene");
+		return false;
+	}
+
+	bool ok = jce_scene_serial_load_file(verify, path);
+	if (!ok) {
+		LOG_ERROR(LOG_TAG, "round-trip validation FAILED: saved file cannot "
+		          "be loaded back (%s)", path);
+		jce_scene_destroy(verify);
+		return false;
+	}
+
+	/* Compare entity counts as a basic consistency check. */
+	int loaded_count = 0;
+	jce_scene_each_entity(verify, count_entity_cb, &loaded_count);
+
+	if (loaded_count != s.entity_count) {
+		LOG_WARN(LOG_TAG, "round-trip validation: entity count mismatch "
+		         "(saved %d, loaded %d) in %s",
+		         s.entity_count, loaded_count, path);
+	} else {
+		LOG_SUCCESS(LOG_TAG, "round-trip validation passed: %d entities (%s)",
+		            loaded_count, path);
+	}
+
+	jce_scene_destroy(verify);
+	return true;
+}
+
 /* ── Scene file save ─────────────────────────────────────────────── */
 
 bool jce_state_save_scene_file(const char *scene_path)
@@ -407,16 +525,19 @@ bool jce_state_save_scene_file(const char *scene_path)
 	if (!scene_path || scene_path[0] == '\0')
 		return false;
 
-	cJSON *root = build_scene_json_root();
-	if (!root) {
-		LOG_WARN(LOG_TAG, "scene save failed, JSON root creation error: %s", scene_path);
-		return false;
-	}
-
-	if (!ed_write_json_to_file(scene_path, root)) {
+	/* ECS is kept in sync by CRUD operations, so we can serialize directly. */
+	if (!jce_scene_serial_save_file(s.scene, scene_path)) {
 		LOG_WARN(LOG_TAG, "scene save failed: %s", scene_path);
 		return false;
 	}
+
+	/* Validate: reload the saved file into a temp scene to verify the
+	   serialization round-trips correctly.  Logs a warning on mismatch. */
+	validate_scene_round_trip(scene_path);
+
+	/* Validate: check that any glTF/GLB mesh assets can be loaded by the
+	   engine's cgltf loader (the same path the runtime uses). */
+	validate_mesh_assets(scene_path);
 
 	update_scene_dir_from_path(scene_path);
 	set_current_scene_path_internal(scene_path);
@@ -439,25 +560,25 @@ bool jce_state_load_scene_file(const char *scene_path)
 	if (!scene_path || scene_path[0] == '\0')
 		return false;
 
-	size_t file_size = 0;
-	char *buf = (char *)ed_read_file(scene_path, &file_size);
-	if (!buf) {
-		LOG_WARN(LOG_TAG, "scene load failed, cannot read file: %s", scene_path);
-		return false;
-	}
-
-	cJSON *root = cJSON_Parse(buf);
-	ED_FREE(buf);
-
-	if (!root) {
-		LOG_WARN(LOG_TAG, "scene JSON parse failed: %s", scene_path);
-		return false;
-	}
-
 	bool ok = false;
 	{
 		HistorySuspendScope suspend;
-		ok = load_scene_from_parsed_root(root, scene_path, scene_path);
+
+		/* Clear existing scene (destroys/recreates ECS world + editor arrays). */
+		clear_scene_entities();
+
+		/* Load via engine serializer → ECS. */
+		ok = jce_scene_serial_load_file(s.scene, scene_path);
+		if (ok) {
+			/* Pull ECS → editor arrays. */
+			jce_adapter_sync_ecs_to_editor();
+			update_scene_dir_from_path(scene_path);
+			set_current_scene_path_internal(scene_path);
+			LOG_INFO(LOG_TAG, "scene loaded from %s (%d entities)",
+			         scene_path, s.entity_count);
+		} else {
+			LOG_WARN(LOG_TAG, "scene load failed: %s", scene_path);
+		}
 	}
 	if (ok) {
 		s_undo_history.clear();
@@ -471,6 +592,5 @@ bool jce_state_load_scene_file(const char *scene_path)
 		s_transaction.before.scene_json.clear();
 		s_transaction.before.scene_path.clear();
 	}
-	cJSON_Delete(root);
 	return ok;
 }

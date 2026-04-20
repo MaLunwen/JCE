@@ -1,8 +1,8 @@
 /*
- * jce_texture.h  Cross-platform texture loading via SDL3_image + bgfx.
+ * jce_texture.h  Cross-platform texture loading and management.
  *
- * Loads images from PAK archive memory buffers into bgfx textures.
- * Supports all formats SDL3_image supports (PNG, JPG, BMP, etc.).
+ * Loads images from PAK archive memory buffers into GPU textures.
+ * Supports PNG, JPG, BMP, and other common image formats.
  */
 
 #ifndef JCE_TEXTURE_H
@@ -14,20 +14,20 @@
 extern "C" {
 #endif
 
-typedef struct PakArchive  PakArchive;
-typedef struct SDL_Surface SDL_Surface;
+typedef struct JcePakArchive  JcePakArchive;
 
 /* Load a texture from a PAK asset path (e.g. "textures/chalet.jpg").
    Returns JCE_TEXTURE_INVALID on failure. Uses clamp sampling. */
-JceTexture jce_texture_load(const PakArchive *pak, const char *asset_path);
+JceTexture jce_texture_load(const JcePakArchive *pak, const char *asset_path);
 
 /* Load a texture with explicit sampler flags (JCE_TEX_CLAMP/WRAP/MIRROR). */
-JceTexture jce_texture_load_ex(const PakArchive *pak, const char *asset_path,
+JceTexture jce_texture_load_ex(const JcePakArchive *pak, const char *asset_path,
                                 int sampler_mode);
 
-/* Create a bgfx texture from a pre-decoded RGBA8 SDL_Surface.
+/* Create a GPU texture from a pre-decoded RGBA8 surface (SDL_Surface*).
+   The opaque pointer must be a valid SDL_Surface*.
    Caller retains ownership of the surface. */
-JceTexture jce_texture_load_from_surface(const SDL_Surface *surf, int sampler_mode);
+JceTexture jce_texture_load_from_surface(const void *surface, int sampler_mode);
 
 /* Load a texture from raw pixel data (RGBA8, top-left origin).
    Caller retains ownership of data. */

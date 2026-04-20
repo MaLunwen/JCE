@@ -3,8 +3,7 @@
  */
 
 #include "jce_asset_cache_internal.h"
-
-#include <new>
+#include "jce_editor_alloc.h"
 
 static void material_extract_worker(void *arg)
 {
@@ -51,7 +50,7 @@ void material_async_stop(void)
             jce_task_wait(task.task);
             jce_task_free(task.task);
         }
-        delete task.context;
+        ED_FREE(task.context);
     }
 
     if (s_mat_async.pool) {
@@ -91,9 +90,12 @@ void material_async_queue_request(uint32_t entity_id,
         return;
     }
 
-    MaterialAsyncContext *ctx = new (std::nothrow) MaterialAsyncContext();
-    if (!ctx)
+    MaterialAsyncContext *ctx =
+        (MaterialAsyncContext *)ED_CALLOC(1, sizeof(MaterialAsyncContext));
+    if (!ctx) {
+        LOG_WARN(LOG_TAG, "material async alloc failed for entity %u", entity_id);
         return;
+    }
 
     memset(ctx, 0, sizeof(*ctx));
     ctx->entity_id = entity_id;
@@ -111,7 +113,7 @@ void material_async_queue_request(uint32_t entity_id,
             if (pending->generation == ctx->generation
                 && pending->entity_id == entity_id
                 && strcmp(pending->mesh_path, mesh_path) == 0) {
-                delete ctx;
+                ED_FREE(ctx);
                 return;
             }
         }
@@ -121,7 +123,7 @@ void material_async_queue_request(uint32_t entity_id,
                                                    material_extract_worker,
                                                    ctx);
     if (!task) {
-        delete ctx;
+        ED_FREE(ctx);
         LOG_WARN(LOG_TAG, "material async submit failed: %s", file_path);
         return;
     }
@@ -180,10 +182,10 @@ static void material_collect_completed_tasks(void)
             completed.push_back(result);
         }
 
-        delete ctx;
+        ED_FREE(ctx);
     }
 
-    if (!completed.empty()) {
+    if (!completed.empty()){
         std::lock_guard<std::mutex> lock(s_mat_async.mutex);
         for (JceEditorMaterialExtractResult &result : completed)
             s_mat_async.completed.push_back(result);

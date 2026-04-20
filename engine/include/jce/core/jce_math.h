@@ -223,16 +223,10 @@ static inline jce_quat jce_q_normalize(jce_quat q)
     return glms_quat_normalize(q);
 }
 
-/* Rotate a vec3 by a unit quaternion: v' = q * v * q^{-1}.
- * Uses the efficient cross-product form:
- *   t = 2 * cross(q.xyz, v)
- *   result = v + q.w * t + cross(q.xyz, t)                              */
+/* Rotate a vec3 by a unit quaternion: v' = q * v * q^{-1}. */
 static inline jce_vec3 jce_q_rotate(jce_quat q, jce_vec3 v)
 {
-    jce_vec3 u; u.x = q.x; u.y = q.y; u.z = q.z;
-    float    w = q.w;
-    jce_vec3 t = jce_v3_scale(jce_v3_cross(u, v), 2.0f);
-    return jce_v3_add(jce_v3_add(v, jce_v3_scale(t, w)), jce_v3_cross(u, t));
+    return glms_quat_rotatev(q, v);
 }
 
 static inline jce_mat4 jce_q_to_mat4(jce_quat q)
@@ -257,7 +251,9 @@ static inline jce_quat jce_q_slerp(jce_quat a, jce_quat b, float t)
     return glms_quat_slerp(a, b, t);
 }
 
-/* Quaternion → Euler angles (radians).  Returns (pitch, yaw, roll) in YXZ order. */
+/* Quaternion → Euler angles (radians).  Returns (pitch, yaw, roll) in YXZ order.
+ * Hand-rolled: cglm has no direct quat→euler; its glm_euler_angles() works on mat4.
+ * This avoids an intermediate mat4 conversion and handles gimbal lock correctly. */
 static inline jce_vec3 jce_q_to_euler(jce_quat q)
 {
     jce_vec3 e;

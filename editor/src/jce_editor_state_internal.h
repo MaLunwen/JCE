@@ -93,6 +93,7 @@ extern EditorTransaction s_transaction;
 /* ── Core helpers (defined in jce_editor_state.cpp) ───────────────── */
 
 int  find_entity(uint32_t id);
+void jce_state_rebuild_id_map(void);
 void set_current_scene_path_internal(const char *scene_path);
 void update_scene_dir_from_path(const char *scene_path);
 void clear_scene_entities(void);

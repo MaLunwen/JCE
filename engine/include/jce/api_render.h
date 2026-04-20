@@ -4,7 +4,7 @@
  * Declarative frame graph and sorted draw-call queue.
  * Wraps bgfx views into a higher-level render pipeline.
  *
- * STATUS: Architecture stubs — implementation pending.
+ * STATUS: Implemented — declarative frame graph and sorted draw-call queue.
  */
 
 #ifndef JCE_API_RENDER_H

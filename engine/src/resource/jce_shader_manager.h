@@ -16,11 +16,11 @@
 extern "C" {
 #endif
 
-typedef struct PakArchive       PakArchive;
+typedef struct JcePakArchive       JcePakArchive;
 typedef struct JceShaderManager JceShaderManager;
 
 /* Create / destroy. */
-JceShaderManager *jce_shader_manager_create(const PakArchive *pak);
+JceShaderManager *jce_shader_manager_create(const JcePakArchive *pak);
 void              jce_shader_manager_destroy(JceShaderManager *mgr);
 
 /* Acquire a shader program by base name (e.g. "pbr").

@@ -16,17 +16,17 @@ extern "C" {
 
 typedef struct JceFont     JceFont;
 typedef struct JceRenderer JceRenderer;
-typedef struct PakArchive  PakArchive;
+typedef struct JcePakArchive  JcePakArchive;
 
 /* Open a font from a PAK asset (e.g. "fonts/JCE.ttf").
    pt_size: point size for glyph rasterization.
    Returns NULL on failure.  Only ASCII glyphs are pre-rendered. */
-JceFont *jce_font_open(const PakArchive *pak, const char *asset_path, float pt_size);
+JceFont *jce_font_open(const JcePakArchive *pak, const char *asset_path, float pt_size);
 
 /* Open a font with additional Unicode codepoints beyond ASCII.
    extra_cps / extra_count: non-ASCII codepoints to pre-render
    (e.g. CJK characters for i18n). */
-JceFont *jce_font_open_ex(const PakArchive *pak, const char *asset_path,
+JceFont *jce_font_open_ex(const JcePakArchive *pak, const char *asset_path,
                            float pt_size,
                            const uint32_t *extra_cps, int extra_count);
 

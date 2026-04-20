@@ -134,24 +134,24 @@ static JceTexture texture_from_surface_ex(const SDL_Surface *surf, int mode)
 
 /* -- Public API ----------------------------------------------------- */
 
-JceTexture jce_texture_load_from_surface(const SDL_Surface *surf, int sampler_mode)
+JceTexture jce_texture_load_from_surface(const void *surface, int sampler_mode)
 {
-    if (!surf) return JCE_TEXTURE_INVALID;
-    return texture_from_surface_ex(surf, sampler_mode);
+    if (!surface) return JCE_TEXTURE_INVALID;
+    return texture_from_surface_ex((const SDL_Surface *)surface, sampler_mode);
 }
 
-JceTexture jce_texture_load(const PakArchive *pak, const char *asset_path)
+JceTexture jce_texture_load(const JcePakArchive *pak, const char *asset_path)
 {
     return jce_texture_load_ex(pak, asset_path, JCE_TEX_CLAMP);
 }
 
-static JceTexture jce_texture_load_ex_inner(const PakArchive *pak,
+static JceTexture jce_texture_load_ex_inner(const JcePakArchive *pak,
                                              const char *asset_path,
                                              int sampler_mode)
 {
     if (!pak || !asset_path) return JCE_TEXTURE_INVALID;
 
-    const PakAsset *asset = pak_find(pak, asset_path);
+    const JcePakAsset *asset = jce_pak_find(pak, asset_path);
     if (!asset) {
         LOG_ERROR(LOG_TAG, "not found in PAK: %s", asset_path);
         return JCE_TEXTURE_INVALID;
@@ -161,7 +161,7 @@ static JceTexture jce_texture_load_ex_inner(const PakArchive *pak,
     void *buf = JCE_MALLOC((size_t)asset->original_size);
     if (!buf) return JCE_TEXTURE_INVALID;
 
-    size_t n = pak_decompress(asset, buf, (size_t)asset->original_size);
+    size_t n = jce_pak_decompress(asset, buf, (size_t)asset->original_size);
     if (n == 0) {
         LOG_ERROR(LOG_TAG, "decompression failed: %s", asset_path);
         JCE_FREE(buf);
@@ -271,7 +271,7 @@ static JceTexture jce_texture_load_ex_inner(const PakArchive *pak,
     return tex;
 }
 
-JceTexture jce_texture_load_ex(const PakArchive *pak, const char *asset_path,
+JceTexture jce_texture_load_ex(const JcePakArchive *pak, const char *asset_path,
                                 int sampler_mode)
 {
     JCE_PROFILE_ZONE_N("Texture::Load");

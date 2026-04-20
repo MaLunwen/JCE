@@ -1,5 +1,5 @@
 /*
- * jce_renderer.h  bgfx renderer initialization and per-frame management.
+ * jce_renderer.h  Renderer initialization and per-frame management.
  */
 
 #ifndef JCE_RENDERER_H
@@ -30,7 +30,7 @@ typedef struct JceRendererConfig {
 
 /* -- Lifecycle ------------------------------------------------------ */
 
-/* Create the renderer: initializes bgfx, sets up vertex
+/* Create the renderer: initializes the GPU backend, sets up vertex
    layouts and view 0 clear state.
    Returns NULL on failure. */
 JceRenderer *jce_renderer_create(JceWindow *win,  const JceRendererConfig *cfg);
@@ -48,7 +48,7 @@ bool         jce_renderer_is_fallback(const JceRenderer *r);
 /* Render the fallback error screen. */
 void         jce_renderer_render_fallback_frame(const JceRenderer *r);
 
-/* Destroy the renderer: destroys the shader program and shuts down bgfx. */
+/* Destroy the renderer: destroys shaders and shuts down the GPU backend. */
 void         jce_renderer_destroy(JceRenderer *r);
 
 /* -- Per-frame ------------------------------------------------------ */
@@ -61,15 +61,15 @@ void         jce_renderer_begin_frame(const JceRenderer *r, JceWindow *win);
 void         jce_renderer_begin_frame_3d(const JceRenderer *r, JceWindow *win,
                                           const JceCamera *cam, uint16_t view_id);
 
-/* End a frame: calls bgfx_frame. */
+/* End a frame: submits all queued draw calls to the GPU. */
 void         jce_renderer_end_frame(const JceRenderer *r);
 
 /* -- Events --------------------------------------------------------- */
 
-/* Handle window resize: calls bgfx_reset. */
+/* Handle window resize: resets the GPU swap chain. */
 void         jce_renderer_resize(const JceRenderer *r, uint32_t w, uint32_t h);
 
-/* Re-bind the native window handle and reset bgfx.
+/* Re-bind the native window handle and reset the GPU backend.
    Required after Android background/foreground cycle (ANativeWindow is recreated). */
 void         jce_renderer_rebind_platform(JceRenderer *r, JceWindow *win);
 
@@ -107,7 +107,7 @@ JceShaderHandle  jce_renderer_get_program_shadow_skinned(const JceRenderer *r);
 /* Texture sampler uniform (s_texColor). */
 JceUniformHandle jce_renderer_get_tex_uniform(const JceRenderer *r);
 
-/* -- Transform / texture binding (abstracts bgfx) ------------------ */
+/* -- Transform / texture binding ------------------------------------- */
 
 /* Set the model-to-world transform for the next draw call. */
 void jce_renderer_set_transform(const float *mtx);

@@ -20,13 +20,13 @@ extern "C" {
 
 typedef struct JceRmlBackend  JceRmlBackend;
 typedef struct JceRenderer    JceRenderer;
-typedef struct PakArchive     PakArchive;
+typedef struct JcePakArchive     JcePakArchive;
 typedef struct JceInput       JceInput;
 
 /* ── Lifecycle ────────────────────────────────────────────────────────── */
 
 JceRmlBackend *jce_rml_create(uint32_t width, uint32_t height,
-                              JceRenderer *renderer, PakArchive *pak);
+                              JceRenderer *renderer, JcePakArchive *pak);
 void           jce_rml_destroy(JceRmlBackend *b);
 
 /* ── Documents ────────────────────────────────────────────────────────── */

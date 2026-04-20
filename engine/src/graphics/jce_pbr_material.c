@@ -9,8 +9,8 @@
 
 #include <bgfx/c99/bgfx.h>
 #include <cjson/cJSON.h>
+#include <SDL3/SDL.h>
 
-#include <stdio.h>
 #include <string.h>
 #include "core/jce_memory.h"
 
@@ -217,21 +217,19 @@ bool jce_pbr_material_load_json(const char *path, JcePbrMaterial *out,
 {
     if (!path || !out || !out_tex_paths) return false;
 
-    FILE *f = fopen(path, "rb");
-    if (!f) {
+    SDL_IOStream *io = SDL_IOFromFile(path, "rb");
+    if (!io) {
         LOG_WARN(LOG_TAG, "cannot open material file: %s", path);
         return false;
     }
 
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    if (sz <= 0 || sz > (1 << 20)) { fclose(f); return false; }
-    fseek(f, 0, SEEK_SET);
+    Sint64 sz = SDL_GetIOSize(io);
+    if (sz <= 0 || sz > (1 << 20)) { SDL_CloseIO(io); return false; }
 
     char *buf = (char *)JCE_MALLOC((size_t)sz + 1);
-    if (!buf) { fclose(f); return false; }
-    size_t rd = fread(buf, 1, (size_t)sz, f);
-    fclose(f);
+    if (!buf) { SDL_CloseIO(io); return false; }
+    size_t rd = SDL_ReadIO(io, buf, (size_t)sz);
+    SDL_CloseIO(io);
     buf[rd] = '\0';
 
     cJSON *root = cJSON_Parse(buf);
@@ -350,14 +348,15 @@ bool jce_pbr_material_save_json(const char *path,
     cJSON_Delete(root);
     if (!json_str) return false;
 
-    FILE *f = fopen(path, "wb");
-    if (!f) {
+    SDL_IOStream *io = SDL_IOFromFile(path, "wb");
+    if (!io) {
         LOG_WARN(LOG_TAG, "cannot write material file: %s", path);
         cJSON_free(json_str);
         return false;
     }
-    fputs(json_str, f);
-    fclose(f);
+    size_t len = strlen(json_str);
+    SDL_WriteIO(io, json_str, len);
+    SDL_CloseIO(io);
     cJSON_free(json_str);
 
     LOG_INFO(LOG_TAG, "saved material: %s", path);

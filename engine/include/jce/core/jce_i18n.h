@@ -14,7 +14,7 @@
 extern "C" {
 #endif
 
-typedef struct PakArchive PakArchive;
+typedef struct JcePakArchive JcePakArchive;
 
 typedef enum {
     JCE_LANG_EN,
@@ -47,7 +47,7 @@ typedef enum {
 } JceStringId;
 
 /* Load all translation JSON files from PAK.  Call once at startup. */
-void        jce_i18n_init(const PakArchive *pak);
+void        jce_i18n_init(const JcePakArchive *pak);
 
 /* Set / get the active language. */
 void        jce_i18n_set_lang(JceLang lang);

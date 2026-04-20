@@ -3,9 +3,13 @@
  *
  * Implements snapshot capture, history push/restore, and the public
  * undo/redo/batch-edit/transaction API.
+ *
+ * Snapshots now use the engine serializer (jce_scene_serial_save/load)
+ * via the ECS adapter for full engine-editor format consistency.
  */
 
 #include "jce_editor_state_internal.h"
+#include "jce_editor_ecs_adapter.h"
 
 /* ── History begin/end edit ───────────────────────────────────────── */
 
@@ -57,12 +61,9 @@ bool history_capture_snapshot(EditorHistorySnapshot *out)
 	if (!out)
 		return false;
 
-	cJSON *root = build_scene_json_root();
-	if (!root)
-		return false;
-
-	char *json_text = cJSON_PrintUnformatted(root);
-	cJSON_Delete(root);
+	/* ECS is kept in sync by CRUD operations, serialize directly. */
+	size_t json_len = 0;
+	char *json_text = jce_scene_serial_save(s.scene, &json_len);
 	if (!json_text)
 		return false;
 
@@ -100,20 +101,28 @@ bool history_restore_snapshot(const EditorHistorySnapshot &snapshot,
 	if (snapshot.scene_json.empty())
 		return false;
 
-	cJSON *root = cJSON_Parse(snapshot.scene_json.c_str());
-	if (!root) {
-		LOG_WARN(LOG_TAG, "history restore parse failed (%s)",
+	HistorySuspendScope suspend;
+
+	/* Clear existing scene (destroys/recreates ECS world + editor arrays). */
+	clear_scene_entities();
+
+	/* Load via engine serializer → ECS. */
+	bool ok = jce_scene_serial_load(s.scene,
+	                                snapshot.scene_json.c_str(),
+	                                snapshot.scene_json.size());
+	if (!ok) {
+		LOG_WARN(LOG_TAG, "history restore failed (%s)",
 		         reason ? reason : "unknown");
 		return false;
 	}
 
-	HistorySuspendScope suspend;
-	const char *label = snapshot.scene_path.empty()
-		? (reason ? reason : "history")
-		: snapshot.scene_path.c_str();
-	bool ok = load_scene_from_parsed_root(root, label, snapshot.scene_path.c_str());
-	cJSON_Delete(root);
-	return ok;
+	/* Pull ECS → editor arrays. */
+	jce_adapter_sync_ecs_to_editor();
+
+	if (!snapshot.scene_path.empty())
+		set_current_scene_path_internal(snapshot.scene_path.c_str());
+
+	return true;
 }
 
 /* ── Undo / Redo ─────────────────────────────────────────────────── */

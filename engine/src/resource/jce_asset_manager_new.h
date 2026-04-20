@@ -38,7 +38,7 @@ typedef struct JceAssetSlot {
 
 struct JceAssetManager {
 	/* Configuration (immutable after creation). */
-	PakArchive     *pak;
+	JcePakArchive     *pak;
 	JceFileSystem  *fs;
 	JceAudio       *audio;
 	uint32_t        max_assets;

@@ -7,6 +7,7 @@
 #include <jce/graphics/jce_shaders.h>
 #include <jce/core/pak_loader.h>
 #include <jce/core/jce_log.h>
+#include <jce/core/jce_profiler.h>
 
 #include <SDL3/SDL.h>
 #include <bgfx/c99/bgfx.h>
@@ -37,12 +38,12 @@ static const char *shader_suffix(bgfx_renderer_type_t type)
 }
 
 /* Load one shader (.bin) from the PAK, return a bgfx handle. */
-static bgfx_shader_handle_t load_single(const PakArchive *pak, const char *path)
+static bgfx_shader_handle_t load_single(const JcePakArchive *pak, const char *path)
 {
     bgfx_shader_handle_t invalid;
     invalid.idx = UINT16_MAX;
 
-    const PakAsset *asset = pak_find(pak, path);
+    const JcePakAsset *asset = jce_pak_find(pak, path);
     if (!asset) {
         LOG_ERROR(LOG_TAG, "not found in PAK: %s", path);
         return invalid;
@@ -51,7 +52,7 @@ static bgfx_shader_handle_t load_single(const PakArchive *pak, const char *path)
     void *buf = JCE_MALLOC((size_t)asset->original_size);
     if (!buf) return invalid;
 
-    size_t n = pak_decompress(asset, buf, (size_t)asset->original_size);
+    size_t n = jce_pak_decompress(asset, buf, (size_t)asset->original_size);
     if (n == 0) {
         LOG_ERROR(LOG_TAG, "decompression failed: %s", path);
         JCE_FREE(buf);
@@ -69,7 +70,7 @@ static bgfx_shader_handle_t load_single(const PakArchive *pak, const char *path)
 /* Internal: load a program with explicit VS and FS base names.
    Skinned programs share the fragment shader with their non-skinned
    counterpart (e.g., vs_pbr_skinned + fs_pbr). */
-static JceShaderHandle load_program_named(const PakArchive *pak,
+static JceShaderHandle load_program_named(const JcePakArchive *pak,
                                           const char *vs_base,
                                           const char *fs_base)
 {
@@ -97,20 +98,21 @@ static JceShaderHandle load_program_named(const PakArchive *pak,
     return (JceShaderHandle){ prog.idx };
 }
 
-JceShaderHandle shader_load_program(const PakArchive *pak, const char *name)
+JceShaderHandle shader_load_program(const JcePakArchive *pak, const char *name)
 {
     return load_program_named(pak, name, name);
 }
 
-JceShaderHandle shader_load_program_named(const PakArchive *pak,
+JceShaderHandle shader_load_program_named(const JcePakArchive *pak,
                                           const char *vs_base,
                                           const char *fs_base)
 {
     return load_program_named(pak, vs_base, fs_base);
 }
 
-JceShaderSet jce_shaders_load_all(const PakArchive *pak)
+JceShaderSet jce_shaders_load_all(const JcePakArchive *pak)
 {
+    JCE_PROFILE_ZONE_N("Shaders::LoadAll");
     JceShaderSet set;
     set.color    = shader_load_program(pak, "color");
     set.textured = shader_load_program(pak, "textured");
@@ -137,5 +139,6 @@ JceShaderSet jce_shaders_load_all(const PakArchive *pak)
     if (!jce_shader_valid(set.shadow_skinned))
         LOG_WARN(LOG_TAG, "'shadow_skinned' shader unavailable");
 
+    JCE_PROFILE_ZONE_END;
     return set;
 }

@@ -12,6 +12,7 @@
 
 #include <jce/graphics/jce_ibl.h>
 #include <jce/core/jce_log.h>
+#include <jce/core/jce_math.h>
 #include "core/jce_memory.h"
 
 #include <bgfx/c99/bgfx.h>
@@ -26,10 +27,6 @@ static bgfx_texture_handle_t ibl_invalid_tex_handle(void)
     bgfx_texture_handle_t h = BGFX_INVALID_HANDLE;
     return h;
 }
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
 
 /* ================================================================== */
 /* IBL data structure                                                  */
@@ -81,7 +78,7 @@ static void importance_sample_ggx(float xi1, float xi2, float roughness,
                                   float *hx, float *hy, float *hz)
 {
     float a = roughness * roughness;
-    float phi = 2.0f * (float)M_PI * xi1;
+    float phi = 2.0f * JCE_PI * xi1;
     float cos_theta = sqrtf((1.0f - xi2) / (1.0f + (a * a - 1.0f) * xi2));
     float sin_theta = sqrtf(1.0f - cos_theta * cos_theta);
 
@@ -155,13 +152,13 @@ static void integrate_brdf(float n_dot_v, float roughness,
     *out_bias  = bias  / (float)SAMPLE_COUNT;
 }
 
-bgfx_texture_handle_t jce_ibl_create_brdf_lut(uint32_t size)
+JceTexture jce_ibl_create_brdf_lut(uint32_t size)
 {
     if (size == 0) size = 256;
 
     uint32_t pixel_count = size * size;
     uint16_t *data = (uint16_t *)JCE_MALLOC(pixel_count * 4 * sizeof(uint16_t));
-    if (!data) return ibl_invalid_tex_handle();
+    if (!data) return JCE_TEXTURE_INVALID;
 
     for (uint32_t y = 0; y < size; y++) {
         float roughness = ((float)y + 0.5f) / (float)size;
@@ -190,7 +187,7 @@ bgfx_texture_handle_t jce_ibl_create_brdf_lut(uint32_t size)
     if (BGFX_HANDLE_IS_VALID(tex))
         LOG_INFO(LOG_TAG, "BRDF LUT created: %ux%u", size, size);
 
-    return tex;
+    return (JceTexture){ tex.idx };
 }
 
 /* ================================================================== */
@@ -228,8 +225,8 @@ static void sample_equirect(const float *src, uint32_t w, uint32_t h,
 {
     float theta = atan2f(dz, dx);
     float phi   = asinf(dy);
-    float u = theta / (2.0f * (float)M_PI) + 0.5f;
-    float v = phi / (float)M_PI + 0.5f;
+    float u = theta / (2.0f * JCE_PI) + 0.5f;
+    float v = phi / JCE_PI + 0.5f;
 
     /* Bilinear sample. */
     float fx = u * (float)(w - 1);
@@ -302,9 +299,9 @@ static bgfx_texture_handle_t generate_irradiance(const float *equirect,
                 float total_weight = 0.0f;
 
                 for (uint32_t p = 0; p < SAMPLE_DELTA_STEPS; p++) {
-                    float phi = 2.0f * (float)M_PI * ((float)p + 0.5f) / (float)SAMPLE_DELTA_STEPS;
+                    float phi = 2.0f * JCE_PI * ((float)p + 0.5f) / (float)SAMPLE_DELTA_STEPS;
                     for (uint32_t t = 0; t < SAMPLE_DELTA_STEPS / 4; t++) {
-                        float theta = 0.5f * (float)M_PI * ((float)t + 0.5f) / (float)(SAMPLE_DELTA_STEPS / 4);
+                        float theta = 0.5f * JCE_PI * ((float)t + 0.5f) / (float)(SAMPLE_DELTA_STEPS / 4);
 
                         float sin_t = sinf(theta);
                         float cos_t = cosf(theta);
@@ -334,9 +331,9 @@ static bgfx_texture_handle_t generate_irradiance(const float *equirect,
                 }
 
                 if (total_weight > 0.0f) {
-                    irr_r = irr_r * (float)M_PI / total_weight;
-                    irr_g = irr_g * (float)M_PI / total_weight;
-                    irr_b = irr_b * (float)M_PI / total_weight;
+                    irr_r = irr_r * JCE_PI / total_weight;
+                    irr_g = irr_g * JCE_PI / total_weight;
+                    irr_b = irr_b * JCE_PI / total_weight;
                 }
 
                 uint32_t idx = ((uint32_t)face * face_pixels + y * face_size + x) * 4;
@@ -493,7 +490,7 @@ static bgfx_texture_handle_t generate_prefilter(const float *equirect,
 /* Public API                                                          */
 /* ================================================================== */
 
-JceIblData *jce_ibl_generate(bgfx_texture_handle_t equirect_tex,
+JceIblData *jce_ibl_generate(JceTexture equirect_tex,
                               uint32_t irradiance_size,
                               uint32_t prefilter_size,
                               uint32_t brdf_lut_size)
@@ -529,20 +526,20 @@ void jce_ibl_destroy(JceIblData *ibl)
     JCE_FREE(ibl);
 }
 
-bgfx_texture_handle_t jce_ibl_get_irradiance(const JceIblData *ibl)
+JceTexture jce_ibl_get_irradiance(const JceIblData *ibl)
 {
-    if (!ibl) return ibl_invalid_tex_handle();
-    return ibl->irradiance;
+    if (!ibl) return JCE_TEXTURE_INVALID;
+    return (JceTexture){ ibl->irradiance.idx };
 }
 
-bgfx_texture_handle_t jce_ibl_get_prefilter(const JceIblData *ibl)
+JceTexture jce_ibl_get_prefilter(const JceIblData *ibl)
 {
-    if (!ibl) return ibl_invalid_tex_handle();
-    return ibl->prefilter;
+    if (!ibl) return JCE_TEXTURE_INVALID;
+    return (JceTexture){ ibl->prefilter.idx };
 }
 
-bgfx_texture_handle_t jce_ibl_get_brdf_lut(const JceIblData *ibl)
+JceTexture jce_ibl_get_brdf_lut(const JceIblData *ibl)
 {
-    if (!ibl) return ibl_invalid_tex_handle();
-    return ibl->brdf_lut;
+    if (!ibl) return JCE_TEXTURE_INVALID;
+    return (JceTexture){ ibl->brdf_lut.idx };
 }

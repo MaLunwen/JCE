@@ -58,14 +58,21 @@ static void compute_gizmo_axes(int gizmo_space, const float *rotation)
         float ry = rotation[1] * JCE_DEG2RAD;
         float rz = rotation[2] * JCE_DEG2RAD;
 
-        mat4 m;
-        vec3 euler = {rx, ry, rz};
-        glm_euler_xyz(euler, m);
+        /* Build rotation via engine math API (XYZ intrinsic euler order). */
+        jce_vec3 ax_x; ax_x.x = 1; ax_x.y = 0; ax_x.z = 0;
+        jce_vec3 ax_y; ax_y.x = 0; ax_y.y = 1; ax_y.z = 0;
+        jce_vec3 ax_z; ax_z.x = 0; ax_z.y = 0; ax_z.z = 1;
 
-        /* Extract rotated axes from matrix columns (cglm col-major). */
-        s_gizmo.axes[0][0] = m[0][0]; s_gizmo.axes[0][1] = m[0][1]; s_gizmo.axes[0][2] = m[0][2];
-        s_gizmo.axes[1][0] = m[1][0]; s_gizmo.axes[1][1] = m[1][1]; s_gizmo.axes[1][2] = m[1][2];
-        s_gizmo.axes[2][0] = m[2][0]; s_gizmo.axes[2][1] = m[2][1]; s_gizmo.axes[2][2] = m[2][2];
+        jce_quat qx = jce_q_from_axis_angle(ax_x, rx);
+        jce_quat qy = jce_q_from_axis_angle(ax_y, ry);
+        jce_quat qz = jce_q_from_axis_angle(ax_z, rz);
+        jce_quat q   = jce_q_multiply(jce_q_multiply(qx, qy), qz);
+        jce_mat4 m   = jce_q_to_mat4(q);
+
+        /* Extract rotated axes from matrix columns. */
+        s_gizmo.axes[0][0] = m.col[0].x; s_gizmo.axes[0][1] = m.col[0].y; s_gizmo.axes[0][2] = m.col[0].z;
+        s_gizmo.axes[1][0] = m.col[1].x; s_gizmo.axes[1][1] = m.col[1].y; s_gizmo.axes[1][2] = m.col[1].z;
+        s_gizmo.axes[2][0] = m.col[2].x; s_gizmo.axes[2][1] = m.col[2].y; s_gizmo.axes[2][2] = m.col[2].z;
     } else {
         /* World space: identity axes */
         s_gizmo.axes[0][0] = 1; s_gizmo.axes[0][1] = 0; s_gizmo.axes[0][2] = 0;

@@ -19,7 +19,7 @@ extern "C" {
 #endif
 
 typedef struct JceFileSystem JceFileSystem;
-typedef struct PakArchive    PakArchive;
+typedef struct JcePakArchive    JcePakArchive;
 
 /* Opaque file handle for streaming reads. */
 typedef struct JceFile JceFile;
@@ -33,7 +33,7 @@ void           jce_fs_destroy(JceFileSystem *fs);
 
 /* Register a PAK archive as a read source.
    Assets stored in PAK are resolved by their embedded path. */
-void jce_fs_mount_pak(JceFileSystem *fs, PakArchive *pak);
+void jce_fs_mount_pak(JceFileSystem *fs, JcePakArchive *pak);
 
 /* Register a loose-file directory as a read source.
    prefix: virtual path prefix (e.g. "assets/").
@@ -68,6 +68,28 @@ void *jce_fs_read_all(const JceFileSystem *fs, const char *virtual_path,
 
 /* Returns true if the virtual path exists in any mounted source. */
 bool jce_fs_exists(const JceFileSystem *fs, const char *virtual_path);
+
+/* -- Write support -------------------------------------------------- */
+
+/* Set the directory where VFS write operations go.
+   Subsequent jce_fs_open_write / jce_fs_write_all are relative to this dir.
+   Returns false if the directory does not exist or cannot be set.
+   Pass NULL or "" to clear the write directory. */
+bool jce_fs_set_write_dir(JceFileSystem *fs, const char *directory);
+
+/* Open a virtual file for writing.  Returns NULL on failure.
+   The path is relative to the write directory set by jce_fs_set_write_dir.
+   Creates the file if it does not exist; truncates if it does. */
+JceFile *jce_fs_open_write(JceFileSystem *fs, const char *virtual_path);
+
+/* Write bytes to an opened-for-write file.  Returns bytes written. */
+size_t jce_fs_write(JceFile *file, const void *buf, size_t size);
+
+/* Convenience: write an entire buffer to a file in one call.
+   Equivalent to open_write + write + close.
+   Returns false on any error. */
+bool jce_fs_write_all(JceFileSystem *fs, const char *virtual_path,
+                      const void *data, size_t size);
 
 #ifdef __cplusplus
 }

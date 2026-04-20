@@ -30,7 +30,7 @@ int  jce_editor_get_theme(void);
 
 /* Load JCE.ttf from PAK and set it as the default font.
    Must be called before jce_imgui_bgfx_rebuild_fonts(). */
-bool jce_editor_load_fonts(const PakArchive *pak, float size_pixels);
+bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels);
 
 #ifdef __cplusplus
 }

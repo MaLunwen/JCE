@@ -3,7 +3,7 @@
  * Runtime shader loading from a PAK archive.
  *
  * Usage:
- *   PakArchive *pak = pak_open(assets_pak_data, assets_pak_data_size);
+ *   JcePakArchive *pak = jce_pak_open(assets_pak_data, assets_pak_data_size);
  *   JceShaderHandle prog = shader_load_program(pak, "color");
  *   // loads shaders/vs_color_<backend>.bin + shaders/fs_color_<backend>.bin
  */
@@ -12,7 +12,7 @@
 
 #include <jce/graphics/jce_gfx_types.h>
 
-typedef struct PakArchive PakArchive;
+typedef struct JcePakArchive JcePakArchive;
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,13 +27,13 @@ extern "C" {
  *
  * Returns valid handle or JCE_INVALID_SHADER on failure. */
 JceShaderHandle shader_load_program(
-    const PakArchive *pak, const char *name);
+    const JcePakArchive *pak, const char *name);
 
 /* Load a program with separate VS and FS base names.
  * E.g. shader_load_program_named(pak, "postfx", "tonemap")
  * loads vs_postfx_<backend>.bin + fs_tonemap_<backend>.bin. */
 JceShaderHandle shader_load_program_named(
-    const PakArchive *pak, const char *vs_base, const char *fs_base);
+    const JcePakArchive *pak, const char *vs_base, const char *fs_base);
 
 /* Pre-loaded shader set (color + textured + mesh + PBR). */
 typedef struct JceShaderSet {
@@ -48,7 +48,7 @@ typedef struct JceShaderSet {
 
 /* Load all standard shader programs from PAK.
  * Must be called after bgfx is initialized. */
-JceShaderSet jce_shaders_load_all(const PakArchive *pak);
+JceShaderSet jce_shaders_load_all(const JcePakArchive *pak);
 
 #ifdef __cplusplus
 }

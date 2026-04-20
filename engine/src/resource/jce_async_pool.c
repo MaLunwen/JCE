@@ -6,10 +6,10 @@
  * requests each frame via jce_pool_drain().
  *
  * Worker decoding:
- *   TEXTURE → pak_decompress + IMG_Load_IO → SDL_Surface (RGBA8)
- *   AUDIO   → pak_decompress + miniaudio decode → PCM s16
- *   MESH    → pak_decompress (raw bytes for main-thread GPU upload)
- *   RAW     → pak_decompress (pass-through)
+ *   TEXTURE → jce_pak_decompress + IMG_Load_IO → SDL_Surface (RGBA8)
+ *   AUDIO   → jce_pak_decompress + miniaudio decode → PCM s16
+ *   MESH    → jce_pak_decompress (raw bytes for main-thread GPU upload)
+ *   RAW     → jce_pak_decompress (pass-through)
  */
 
 #include "jce_async_pool.h"
@@ -73,7 +73,7 @@ static SDL_Surface *ensure_rgba8(SDL_Surface *src)
 
 static void decode_texture_inner(JceAsyncRequest *req)
 {
-	const PakAsset *asset = pak_find(req->pak, req->path);
+	const JcePakAsset *asset = jce_pak_find(req->pak, req->path);
 	if (!asset) {
 		LOG_ERROR(LOG_TAG, "not found: %s", req->path);
 		return;
@@ -82,7 +82,7 @@ static void decode_texture_inner(JceAsyncRequest *req)
 	void *buf = JCE_MALLOC(asset->original_size);
 	if (!buf) return;
 
-	size_t n = pak_decompress(asset, buf, (size_t)asset->original_size);
+	size_t n = jce_pak_decompress(asset, buf, (size_t)asset->original_size);
 	if (n == 0) {
 		JCE_FREE(buf);
 		LOG_ERROR(LOG_TAG, "decompress failed: %s", req->path);
@@ -183,7 +183,7 @@ static void decode_audio_inner(JceAsyncRequest *req)
 	LOG_WARN(LOG_TAG, "audio disabled: %s", req->path);
 	return;
 #else
-	const PakAsset *asset = pak_find(req->pak, req->path);
+	const JcePakAsset *asset = jce_pak_find(req->pak, req->path);
 	if (!asset) {
 		LOG_ERROR(LOG_TAG, "not found: %s", req->path);
 		return;
@@ -192,7 +192,7 @@ static void decode_audio_inner(JceAsyncRequest *req)
 	void *buf = JCE_MALLOC(asset->original_size);
 	if (!buf) return;
 
-	size_t n = pak_decompress(asset, buf, (size_t)asset->original_size);
+	size_t n = jce_pak_decompress(asset, buf, (size_t)asset->original_size);
 	if (n == 0) {
 		JCE_FREE(buf);
 		return;
@@ -341,7 +341,7 @@ static void decode_audio(JceAsyncRequest *req)
 
 static void decode_raw(JceAsyncRequest *req)
 {
-	const PakAsset *asset = pak_find(req->pak, req->path);
+	const JcePakAsset *asset = jce_pak_find(req->pak, req->path);
 	if (!asset) {
 		LOG_ERROR(LOG_TAG, "not found: %s", req->path);
 		return;
@@ -350,7 +350,7 @@ static void decode_raw(JceAsyncRequest *req)
 	void *buf = JCE_MALLOC(asset->original_size);
 	if (!buf) return;
 
-	size_t n = pak_decompress(asset, buf, (size_t)asset->original_size);
+	size_t n = jce_pak_decompress(asset, buf, (size_t)asset->original_size);
 	if (n == 0) {
 		JCE_FREE(buf);
 		return;
@@ -456,7 +456,7 @@ JceAsyncRequest *jce_pool_submit(JceAsyncPool *pool,
                                  JceAsyncRequestType type,
                                  uint16_t slot_index,
                                  const char *path,
-                                 PakArchive *pak,
+                                 JcePakArchive *pak,
                                  JceFileSystem *fs,
                                  const JceAsyncLoadInfo *info)
 {

@@ -44,10 +44,10 @@ static struct {
     SDL_Cursor *cursors[ImGuiMouseCursor_COUNT];
     JceWindow  *window;         /* opaque engine window for text input API */
     bool        text_input_active;
-    const PakArchive *pak;      /* stored for font rebuild */
+    const JcePakArchive *pak;      /* stored for font rebuild */
     float       font_size;      /* current font size in pixels */
 
-    FILE       *frame_kpi_file;
+    SDL_IOStream *frame_kpi_file;
     uint32_t    frame_kpi_index;
     uint32_t    frame_kpi_limit;
 } s_editor;
@@ -197,7 +197,7 @@ static void update_cursor(void)
 
 /* ── Public API ────────────────────────────────────────────────────── */
 
-bool jce_editor_init(const PakArchive *pak, JceWindow *window)
+bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
 {
     if (s_editor.initialized) return true;
 
@@ -257,11 +257,11 @@ bool jce_editor_init(const PakArchive *pak, JceWindow *window)
 
     /* Set window icon from embedded PAK. */
     {
-        const PakAsset *icon = pak_find(pak, "JCE_icon.png");
+        const JcePakAsset *icon = jce_pak_find(pak, "JCE_icon.png");
         if (icon) {
             void *buf = ED_MALLOC((size_t)icon->original_size);
             if (buf) {
-                size_t sz = pak_decompress(icon, buf,
+                size_t sz = jce_pak_decompress(icon, buf,
                                            (size_t)icon->original_size);
                 if (sz > 0)
                     jce_window_set_icon(window, buf, sz);
@@ -281,7 +281,7 @@ bool jce_editor_init(const PakArchive *pak, JceWindow *window)
 
     const char *frame_kpi_path = SDL_getenv("JCE_KPI_FRAME_LOG");
     if (frame_kpi_path && frame_kpi_path[0]) {
-        s_editor.frame_kpi_file = fopen(frame_kpi_path, "w");
+        s_editor.frame_kpi_file = SDL_IOFromFile(frame_kpi_path, "w");
         if (s_editor.frame_kpi_file) {
             const char *frame_count = SDL_getenv("JCE_KPI_FRAME_COUNT");
             if (frame_count && frame_count[0]) {
@@ -290,8 +290,9 @@ bool jce_editor_init(const PakArchive *pak, JceWindow *window)
                     s_editor.frame_kpi_limit = (uint32_t)parsed;
                 }
             }
-            fprintf(s_editor.frame_kpi_file, "frame_index,frame_ms\n");
-            fflush(s_editor.frame_kpi_file);
+            static const char hdr[] = "frame_index,frame_ms\n";
+            SDL_WriteIO(s_editor.frame_kpi_file, hdr, sizeof(hdr) - 1);
+            SDL_FlushIO(s_editor.frame_kpi_file);
             LOG_INFO(LOG_TAG, "frame KPI capture enabled -> %s", frame_kpi_path);
         } else {
             LOG_WARN(LOG_TAG, "failed to open frame KPI log: %s", frame_kpi_path);
@@ -324,8 +325,8 @@ void jce_editor_shutdown(void)
     jce_imgui_bgfx_shutdown();
 
     if (s_editor.frame_kpi_file) {
-        fflush(s_editor.frame_kpi_file);
-        fclose(s_editor.frame_kpi_file);
+        SDL_FlushIO(s_editor.frame_kpi_file);
+        SDL_CloseIO(s_editor.frame_kpi_file);
         s_editor.frame_kpi_file = NULL;
     }
 
@@ -432,11 +433,14 @@ void jce_editor_update(JceWindow *window)
         if (s_editor.frame_kpi_limit == 0 ||
             s_editor.frame_kpi_index < s_editor.frame_kpi_limit) {
             const double frame_ms = (double)dt * 1000.0;
-            fprintf(s_editor.frame_kpi_file, "%u,%.3f\n",
-                    s_editor.frame_kpi_index, frame_ms);
+            char kpi_line[64];
+            int kpi_len = snprintf(kpi_line, sizeof(kpi_line), "%u,%.3f\n",
+                                   s_editor.frame_kpi_index, frame_ms);
+            if (kpi_len > 0)
+                SDL_WriteIO(s_editor.frame_kpi_file, kpi_line, (size_t)kpi_len);
             s_editor.frame_kpi_index++;
             if ((s_editor.frame_kpi_index % 60u) == 0u) {
-                fflush(s_editor.frame_kpi_file);
+                SDL_FlushIO(s_editor.frame_kpi_file);
             }
         }
     }

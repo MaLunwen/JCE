@@ -26,7 +26,7 @@ extern "C" {
  * Must be called after the bgfx renderer is fully initialized.
  * pak is used to load the sky shader program at start-up. */
 bool jce_editor_scene_render_init(JceRenderer *renderer,
-                                  const PakArchive *pak,
+                                  const JcePakArchive *pak,
                                   JceAssetManager *assets);
 
 /* Shut down and free all resources (camera, FBO, meshes). */
@@ -106,6 +106,10 @@ void jce_editor_scene_set_hover_entity(uint32_t entity_id);
 void jce_editor_scene_clear_hover_entity(void);
 
 /* ── Animation query helpers (for timeline panel) ──────────────────── */
+
+/* Reset the animation delta-time accumulator.
+ * Call when entering/exiting play mode to avoid a large first-frame spike. */
+void jce_editor_scene_reset_anim_timer(void);
 
 typedef struct JceAnimPlayer JceAnimPlayer;
 typedef struct JceModel      JceModel;

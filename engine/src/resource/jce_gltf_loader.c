@@ -60,7 +60,7 @@ static void resolve_path(const char *model_path, const char *uri,
 }
 
 /* Load a texture from a glTF image (either URI or embedded buffer_view). */
-static JceTexture load_gltf_texture(const PakArchive *pak,
+static JceTexture load_gltf_texture(const JcePakArchive *pak,
                                      const char *model_path,
                                      const cgltf_image *image,
                                      cgltf_data *data)
@@ -139,7 +139,7 @@ static uint32_t find_material_index(const cgltf_data *data,
 /* Extract PBR materials                                               */
 /* ================================================================== */
 
-static JcePbrMaterial *extract_materials(const PakArchive *pak,
+static JcePbrMaterial *extract_materials(const JcePakArchive *pak,
                                           const char *model_path,
                                           cgltf_data *data,
                                           uint32_t *out_count)
@@ -694,12 +694,12 @@ static JceModelNode *extract_nodes(cgltf_data *data,
 /* Main entry point                                                    */
 /* ================================================================== */
 
-JceModel *jce_gltf_load(const PakArchive *pak, const char *asset_path)
+JceModel *jce_gltf_load(const JcePakArchive *pak, const char *asset_path)
 {
     if (!pak || !asset_path) return NULL;
 
     /* ---- Decompress from PAK ---- */
-    const PakAsset *asset = pak_find(pak, asset_path);
+    const JcePakAsset *asset = jce_pak_find(pak, asset_path);
     if (!asset) {
         LOG_ERROR(LOG_TAG, "model not found in PAK: %s", asset_path);
         return NULL;
@@ -708,7 +708,7 @@ JceModel *jce_gltf_load(const PakArchive *pak, const char *asset_path)
     void *buf = JCE_MALLOC((size_t)asset->original_size);
     if (!buf) return NULL;
 
-    size_t n = pak_decompress(asset, buf, (size_t)asset->original_size);
+    size_t n = jce_pak_decompress(asset, buf, (size_t)asset->original_size);
     if (n == 0) {
         LOG_ERROR(LOG_TAG, "decompression failed: %s", asset_path);
         JCE_FREE(buf);

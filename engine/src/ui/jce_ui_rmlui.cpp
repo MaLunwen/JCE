@@ -23,7 +23,8 @@
 #include <jce/platform/jce_input.h>
 #include "graphics/jce_renderer_internal.h"
 
-#include <cstdlib>
+#include "core/jce_memory.h"
+
 #include <cstring>
 #include <string>
 #include <vector>
@@ -87,13 +88,13 @@ private:
 
 class JceRmlFileInterface : public Rml::FileInterface {
 public:
-    explicit JceRmlFileInterface(PakArchive *pak) : pak_(pak) {}
+    explicit JceRmlFileInterface(JcePakArchive *pak) : pak_(pak) {}
 
     Rml::FileHandle Open(const Rml::String &path) override
     {
         if (!pak_) return 0;
 
-        const PakAsset *asset = pak_find(pak_, path.c_str());
+        const JcePakAsset *asset = jce_pak_find(pak_, path.c_str());
         if (!asset) {
             LOG_WARN(LOG_TAG, "file not found in PAK: %s", path.c_str());
             return 0;
@@ -103,16 +104,16 @@ public:
         if (!f) return 0;
 
         f->size = (size_t)asset->original_size;
-        f->data = (uint8_t *)malloc(f->size);
+        f->data = (uint8_t *)JCE_MALLOC(f->size);
         if (!f->data) {
             delete f;
             return 0;
         }
 
-        size_t decompressed = pak_decompress(asset, f->data, f->size);
+        size_t decompressed = jce_pak_decompress(asset, f->data, f->size);
         if (decompressed == 0) {
-            LOG_ERROR(LOG_TAG, "pak_decompress failed: %s", path.c_str());
-            free(f->data);
+            LOG_ERROR(LOG_TAG, "jce_pak_decompress failed: %s", path.c_str());
+            JCE_FREE(f->data);
             delete f;
             return 0;
         }
@@ -125,7 +126,7 @@ public:
     {
         auto *f = reinterpret_cast<FileState *>(file);
         if (f) {
-            free(f->data);
+            JCE_FREE(f->data);
             delete f;
         }
     }
@@ -173,7 +174,7 @@ public:
     }
 
 private:
-    PakArchive *pak_;
+    JcePakArchive *pak_;
 
     struct FileState {
         uint8_t *data = nullptr;
@@ -368,11 +369,11 @@ public:
         }
     }
 
-    void SetPak(PakArchive *pak) { pak_ = pak; }
+    void SetPak(JcePakArchive *pak) { pak_ = pak; }
 
 private:
     JceRenderer *renderer_ = nullptr;
-    PakArchive  *pak_      = nullptr;
+    JcePakArchive  *pak_      = nullptr;
 
     bool     scissor_enabled_ = false;
     uint16_t scissor_x_ = 0, scissor_y_ = 0;
@@ -414,7 +415,7 @@ struct JceRmlBackend {
     Rml::Context           *context          = nullptr;
 
     JceRenderer            *renderer         = nullptr;
-    PakArchive             *pak              = nullptr;
+    JcePakArchive             *pak              = nullptr;
 
     std::vector<Rml::ElementDocument *> documents;
     std::vector<Rml::Element *>         elements;
@@ -448,7 +449,7 @@ static float compute_dp_ratio(uint32_t h)
 }
 
 JceRmlBackend *jce_rml_create(uint32_t width, uint32_t height,
-                              JceRenderer *renderer, PakArchive *pak)
+                              JceRenderer *renderer, JcePakArchive *pak)
 {
     auto *b = new (std::nothrow) JceRmlBackend();
     if (!b) {
@@ -519,7 +520,7 @@ void jce_rml_destroy(JceRmlBackend *b)
 
     /* Free font data buffers AFTER Rml::Shutdown (FreeType is done). */
     for (void *buf : b->font_data_buffers)
-        free(buf);
+        JCE_FREE(buf);
     b->font_data_buffers.clear();
 
     delete b->file_interface;
@@ -766,18 +767,18 @@ bool jce_rml_load_font(JceRmlBackend *b, const char *pak_path)
 {
     if (!b || !pak_path || !b->pak) return false;
 
-    const PakAsset *asset = pak_find(b->pak, pak_path);
+    const JcePakAsset *asset = jce_pak_find(b->pak, pak_path);
     if (!asset) {
         LOG_ERROR(LOG_TAG, "font not found in PAK: %s", pak_path);
         return false;
     }
 
-    void *data = malloc((size_t)asset->original_size);
+    void *data = JCE_MALLOC((size_t)asset->original_size);
     if (!data) return false;
 
-    size_t sz = pak_decompress(asset, data, (size_t)asset->original_size);
+    size_t sz = jce_pak_decompress(asset, data, (size_t)asset->original_size);
     if (sz == 0) {
-        free(data);
+        JCE_FREE(data);
         return false;
     }
 
@@ -805,7 +806,7 @@ bool jce_rml_load_font(JceRmlBackend *b, const char *pak_path)
         b->font_data_buffers.push_back(data);
         LOG_SUCCESS(LOG_TAG, "font loaded: %s (family: %s)", pak_path, family.c_str());
     } else {
-        free(data);
+        JCE_FREE(data);
         LOG_ERROR(LOG_TAG, "Rml::LoadFontFace failed: %s", pak_path);
     }
 

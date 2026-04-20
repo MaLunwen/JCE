@@ -8,8 +8,8 @@
 #include <jce/core/jce_log.h>
 #include "core/jce_memory.h"
 
+#include <SDL3/SDL.h>
 #include <cjson/cJSON.h>
-#include <stdio.h>
 #include <string.h>
 
 #define LOG_TAG "jce_sprite"
@@ -86,18 +86,16 @@ JceSpriteSheet *jce_sprite_sheet_create_grid(const char *image_path,
 
 static char *read_file_text(const char *path, size_t *out_size)
 {
-    FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (sz <= 0) { fclose(f); return NULL; }
+    SDL_IOStream *io = SDL_IOFromFile(path, "rb");
+    if (!io) return NULL;
+    Sint64 sz = SDL_GetIOSize(io);
+    if (sz <= 0) { SDL_CloseIO(io); return NULL; }
 
     char *buf = (char *)JCE_MALLOC((size_t)sz + 1);
-    if (!buf) { fclose(f); return NULL; }
-    fread(buf, 1, (size_t)sz, f);
+    if (!buf) { SDL_CloseIO(io); return NULL; }
+    SDL_ReadIO(io, buf, (size_t)sz);
     buf[sz] = '\0';
-    fclose(f);
+    SDL_CloseIO(io);
     if (out_size) *out_size = (size_t)sz;
     return buf;
 }

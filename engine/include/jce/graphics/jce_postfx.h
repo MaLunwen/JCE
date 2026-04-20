@@ -20,7 +20,7 @@
 #include <jce/core/jce_allocator.h>
 #include <jce/graphics/jce_gfx_types.h>
 
-typedef struct PakArchive PakArchive;
+typedef struct JcePakArchive JcePakArchive;
 
 #ifdef __cplusplus
 extern "C" {
@@ -103,7 +103,7 @@ JcePostFXParams jce_postfx_default_params(void);
    Must be called after renderer and shader system are ready.
    pak: the PAK archive containing compiled shader binaries. */
 bool jce_postfx_load_shaders(JcePostFXPipeline *pipeline,
-                             const PakArchive *pak);
+                             const JcePakArchive *pak);
 
 /* Execute the enabled post-processing chain.
    scene_fb: the framebuffer containing the rendered scene.

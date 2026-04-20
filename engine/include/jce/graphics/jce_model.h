@@ -19,13 +19,13 @@ extern "C" {
 
 typedef struct JceModel    JceModel;
 typedef struct JceRenderer JceRenderer;
-typedef struct PakArchive  PakArchive;
+typedef struct JcePakArchive  JcePakArchive;
 typedef struct JceSkeleton JceSkeleton;
 typedef struct JceAnimClip JceAnimClip;
 
 /* Load a glTF/GLB model from the PAK archive.
    Returns NULL on failure (asset not found, parse error, OOM). */
-JceModel *jce_model_load_gltf(const PakArchive *pak, const char *asset_path);
+JceModel *jce_model_load_gltf(const JcePakArchive *pak, const char *asset_path);
 
 /* Load a glTF/GLB model from raw file bytes in memory.
    name is used for logging only; may be NULL. */

@@ -562,19 +562,17 @@ JceCookResult jce_cook_file(const char *input_path,
 	}
 
 	/* Read file. */
-	FILE *fp = fopen(input_path, "rb");
-	if (!fp) {
+	SDL_IOStream *io = SDL_IOFromFile(input_path, "rb");
+	if (!io) {
 		snprintf(result.error, sizeof(result.error),
 		         "cannot open: %s", input_path);
 		return result;
 	}
 
-	fseek(fp, 0, SEEK_END);
-	long file_size = ftell(fp);
-	fseek(fp, 0, SEEK_SET);
+	Sint64 file_size = SDL_GetIOSize(io);
 
 	if (file_size <= 0) {
-		fclose(fp);
+		SDL_CloseIO(io);
 		snprintf(result.error, sizeof(result.error),
 		         "empty file: %s", input_path);
 		return result;
@@ -582,13 +580,13 @@ JceCookResult jce_cook_file(const char *input_path,
 
 	void *data = JCE_MALLOC((size_t)file_size);
 	if (!data) {
-		fclose(fp);
+		SDL_CloseIO(io);
 		snprintf(result.error, sizeof(result.error), "allocation failed");
 		return result;
 	}
 
-	size_t nread = fread(data, 1, (size_t)file_size, fp);
-	fclose(fp);
+	size_t nread = SDL_ReadIO(io, data, (size_t)file_size);
+	SDL_CloseIO(io);
 
 	if (nread != (size_t)file_size) {
 		JCE_FREE(data);
@@ -634,10 +632,10 @@ bool jce_cook_write(const JceCookResult *result, const char *output_path)
 	if (!result || !result->success || !result->data || !output_path)
 		return false;
 
-	FILE *fp = fopen(output_path, "wb");
-	if (!fp) return false;
+	SDL_IOStream *io = SDL_IOFromFile(output_path, "wb");
+	if (!io) return false;
 
-	size_t written = fwrite(result->data, 1, result->size, fp);
-	fclose(fp);
+	size_t written = SDL_WriteIO(io, result->data, result->size);
+	SDL_CloseIO(io);
 	return written == result->size;
 }

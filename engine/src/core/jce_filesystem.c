@@ -3,7 +3,7 @@
  *
  * Two backends:
  *   1. PhysFS: handles directories, zips, and other archives.
- *   2. PAK archive: wraps pak_find + pak_decompress.
+ *   2. PAK archive: wraps jce_pak_find + jce_pak_decompress.
  *
  * PhysFS mounts are checked first so developers can override
  * PAK-embedded assets without rebuilding.
@@ -25,7 +25,7 @@
 /* ================================================================== */
 
 struct JceFileSystem {
-    PakArchive *pak;
+    JcePakArchive *pak;
     bool        physfs_owned;   /* true if we called PHYSFS_init */
 };
 
@@ -89,7 +89,7 @@ void jce_fs_destroy(JceFileSystem *fs)
 /* Mount points                                                        */
 /* ================================================================== */
 
-void jce_fs_mount_pak(JceFileSystem *fs, PakArchive *pak)
+void jce_fs_mount_pak(JceFileSystem *fs, JcePakArchive *pak)
 {
     if (fs) fs->pak = pak;
 }
@@ -135,7 +135,7 @@ static JceFile *try_open_pak(const JceFileSystem *fs, const char *vpath)
 {
     if (!fs->pak) return NULL;
 
-    const PakAsset *asset = pak_find(fs->pak, vpath);
+    const JcePakAsset *asset = jce_pak_find(fs->pak, vpath);
     if (!asset) return NULL;
 
     /* Guard against uint64 → size_t truncation on 32-bit platforms. */
@@ -147,7 +147,7 @@ static JceFile *try_open_pak(const JceFileSystem *fs, const char *vpath)
     void *buf = JCE_MALLOC((size_t)asset->original_size);
     if (!buf) return NULL;
 
-    size_t decompressed = pak_decompress(asset, buf, asset->original_size);
+    size_t decompressed = jce_pak_decompress(asset, buf, asset->original_size);
     if (decompressed == 0) {
         JCE_FREE(buf);
         return NULL;
@@ -254,7 +254,87 @@ bool jce_fs_exists(const JceFileSystem *fs, const char *virtual_path)
 
     /* Check PAK. */
     if (fs->pak)
-        return pak_find(fs->pak, virtual_path) != NULL;
+        return jce_pak_find(fs->pak, virtual_path) != NULL;
 
     return false;
+}
+
+/* ================================================================== */
+/* Write support                                                       */
+/* ================================================================== */
+
+bool jce_fs_set_write_dir(JceFileSystem *fs, const char *directory)
+{
+    if (!fs) return false;
+
+    if (!directory || directory[0] == '\0') {
+        /* Clear the write directory. */
+        PHYSFS_setWriteDir(NULL);
+        return true;
+    }
+
+    if (!PHYSFS_setWriteDir(directory)) {
+        LOG_ERROR(LOG_TAG, "PHYSFS_setWriteDir('%s') failed: %s",
+                  directory,
+                  PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode()));
+        return false;
+    }
+
+    LOG_DEBUG(LOG_TAG, "write dir set to '%s'", directory);
+    return true;
+}
+
+JceFile *jce_fs_open_write(JceFileSystem *fs, const char *virtual_path)
+{
+    if (!fs || !virtual_path) return NULL;
+
+    PHYSFS_File *h = PHYSFS_openWrite(virtual_path);
+    if (!h) {
+        LOG_ERROR(LOG_TAG, "PHYSFS_openWrite('%s') failed: %s",
+                  virtual_path,
+                  PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode()));
+        return NULL;
+    }
+
+    JceFile *f = JCE_NEW(JceFile);
+    if (!f) { PHYSFS_close(h); return NULL; }
+
+    f->kind = JCE_FILE_PHYSFS;
+    f->u.physfs.handle     = h;
+    f->u.physfs.total_size = 0;
+    return f;
+}
+
+size_t jce_fs_write(JceFile *file, const void *buf, size_t size)
+{
+    if (!file || !buf || size == 0) return 0;
+
+    if (file->kind != JCE_FILE_PHYSFS) {
+        LOG_ERROR(LOG_TAG, "cannot write to a PAK-backed file");
+        return 0;
+    }
+
+    PHYSFS_sint64 n = PHYSFS_writeBytes(file->u.physfs.handle,
+                                         buf, (PHYSFS_uint64)size);
+    return (n > 0) ? (size_t)n : 0;
+}
+
+bool jce_fs_write_all(JceFileSystem *fs, const char *virtual_path,
+                      const void *data, size_t size)
+{
+    if (!fs || !virtual_path || !data) return false;
+
+    JceFile *f = jce_fs_open_write(fs, virtual_path);
+    if (!f) return false;
+
+    size_t written = jce_fs_write(f, data, size);
+    jce_fs_close(f);
+
+    if (written != size) {
+        LOG_ERROR(LOG_TAG, "write error: wrote %zu / %zu bytes to '%s'",
+                  written, size, virtual_path);
+        return false;
+    }
+
+    return true;
 }

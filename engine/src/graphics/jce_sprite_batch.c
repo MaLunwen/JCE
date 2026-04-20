@@ -92,7 +92,7 @@ void jce_sprite_batch_begin(JceSpriteBatch *batch)
 }
 
 void jce_sprite_batch_add(JceSpriteBatch *batch,
-                           bgfx_texture_handle_t texture,
+                           JceTexture texture,
                            const float *world,
                            float u0, float v0, float u1, float v1,
                            uint32_t color, int32_t sort_key)
@@ -100,7 +100,7 @@ void jce_sprite_batch_add(JceSpriteBatch *batch,
     if (!batch || !world || batch->count >= batch->capacity) return;
 
     SpriteEntry *e = &batch->entries[batch->count++];
-    e->texture  = texture;
+    e->texture  = (bgfx_texture_handle_t){ texture.idx };
     e->sort_key = sort_key;
 
     /* Local quad corners (centered, unit size). */

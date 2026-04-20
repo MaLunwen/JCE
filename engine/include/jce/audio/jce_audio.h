@@ -1,8 +1,7 @@
 /*
- * jce_audio.h  Cross-platform audio via miniaudio.
+ * jce_audio.h  Cross-platform audio system.
  *
- * Loads WAV/OGG from the PAK archive via miniaudio, manages
- * voices for playback.
+ * Loads WAV/OGG from the PAK archive, manages voices for playback.
  */
 
 #ifndef JCE_AUDIO_H
@@ -18,7 +17,7 @@ extern "C" {
 #endif
 
 /* Forward declaration  avoids pulling in pak_loader.h in every TU. */
-typedef struct PakArchive PakArchive;
+typedef struct JcePakArchive JcePakArchive;
 
 typedef struct JceAudio JceAudio;
 
@@ -31,7 +30,7 @@ void      jce_audio_destroy(JceAudio *audio);
 
 /* Load a sound from the PAK archive.  Supports .wav files.
    Returns JCE_SOUND_INVALID on failure. */
-JceSound  jce_audio_load(JceAudio *audio, const PakArchive *pak, const char *path);
+JceSound  jce_audio_load(JceAudio *audio, const JcePakArchive *pak, const char *path);
 
 /* Upload pre-decoded PCM data as a sound.
    channels: 1 or 2, bits: 8 or 16.

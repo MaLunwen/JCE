@@ -28,7 +28,7 @@ extern "C" {
 /* ================================================================== */
 
 /* Forward declarations. */
-typedef struct PakArchive    PakArchive;
+typedef struct JcePakArchive    JcePakArchive;
 typedef struct JceFileSystem JceFileSystem;
 typedef struct JceAudio      JceAudio;
 
@@ -65,7 +65,7 @@ typedef struct JceAsyncRequest {
 	JceAsyncRequestType type;
 	uint16_t            slot_index;    /* target slot in asset manager */
 	char                path[256];     /* virtual asset path */
-	PakArchive         *pak;
+	JcePakArchive         *pak;
 	JceFileSystem      *fs;
 	JceAsyncLoadInfo    info;
 
@@ -104,7 +104,7 @@ JceAsyncRequest *jce_pool_submit(JceAsyncPool *pool,
                                  JceAsyncRequestType type,
                                  uint16_t slot_index,
                                  const char *path,
-                                 PakArchive *pak,
+                                 JcePakArchive *pak,
                                  JceFileSystem *fs,
                                  const JceAsyncLoadInfo *info);
 

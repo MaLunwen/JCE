@@ -1,8 +1,7 @@
 /*
  * jce_editor_file_util.h  Common file I/O helpers for editor code.
  *
- * Replaces repetitive fopen/fseek/fread/fclose boilerplate with
- * two simple functions:
+ * Two simple functions backed by SDL3 for cross-platform I/O:
  *
  *   void *ed_read_file(path, &out_size)   -- read whole file, caller frees
  *   bool  ed_write_file(path, data, size) -- write buffer to file
@@ -13,9 +12,10 @@
 
 #include "jce_editor_alloc.h"
 #include <cjson/cJSON.h>
+#include <SDL3/SDL.h>
 #include <stddef.h>
 #include <stdbool.h>
-#include <stdio.h>
+#include <string.h>
 
 /* Read an entire file into an ED_MALLOC'd buffer.
  * Returns NULL on failure.  Appends a '\0' sentinel beyond out_size
@@ -26,22 +26,19 @@ static inline void *ed_read_file(const char *path, size_t *out_size)
     if (out_size) *out_size = 0;
     if (!path) return NULL;
 
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return NULL;
+    SDL_IOStream *io = SDL_IOFromFile(path, "rb");
+    if (!io) return NULL;
 
-    fseek(fp, 0, SEEK_END);
-    long len = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
+    Sint64 file_size = SDL_GetIOSize(io);
+    if (file_size <= 0) { SDL_CloseIO(io); return NULL; }
 
-    if (len <= 0) { fclose(fp); return NULL; }
+    void *buf = ED_MALLOC((size_t)file_size + 1);
+    if (!buf) { SDL_CloseIO(io); return NULL; }
 
-    void *buf = ED_MALLOC((size_t)len + 1);
-    if (!buf) { fclose(fp); return NULL; }
+    size_t nread = SDL_ReadIO(io, buf, (size_t)file_size);
+    SDL_CloseIO(io);
 
-    size_t nread = fread(buf, 1, (size_t)len, fp);
-    fclose(fp);
-
-    if (nread != (size_t)len) {
+    if (nread != (size_t)file_size) {
         ED_FREE(buf);
         return NULL;
     }
@@ -56,10 +53,10 @@ static inline bool ed_write_file(const char *path,
                                  const void *data, size_t size)
 {
     if (!path || !data) return false;
-    FILE *fp = fopen(path, "wb");
-    if (!fp) return false;
-    size_t written = fwrite(data, 1, size, fp);
-    fclose(fp);
+    SDL_IOStream *io = SDL_IOFromFile(path, "wb");
+    if (!io) return false;
+    size_t written = SDL_WriteIO(io, data, size);
+    SDL_CloseIO(io);
     return written == size;
 }
 

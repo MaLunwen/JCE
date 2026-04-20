@@ -4,12 +4,6 @@
  * Uses SDL3 for static info, platform APIs for dynamic info.
  */
 
-/* Ensure POSIX / GNU extensions (clock_gettime, struct timespec,
-   CLOCK_MONOTONIC, sysconf, etc.) are visible under -std=c99. */
-#if defined(__linux__) && !defined(_GNU_SOURCE)
-#  define _GNU_SOURCE
-#endif
-
 #include <jce/core/jce_sysinfo.h>
 
 #include <SDL3/SDL.h>
@@ -18,17 +12,16 @@
 #ifdef __EMSCRIPTEN__
 /* Emscripten: no meaningful CPU/RAM measurement available from the
    browser sandbox.  All dynamic values remain at their init defaults (0). */
-#elif defined(_WIN32)
+#elif defined(SDL_PLATFORM_WINDOWS)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
 #include <psapi.h>
-#elif defined(__linux__)
+#elif defined(SDL_PLATFORM_LINUX)
 #include <stdio.h>
-#include <time.h>
 #include <unistd.h>
-#elif defined(__APPLE__)
+#elif defined(SDL_PLATFORM_MACOS)
 #include <mach/mach.h>
 #include <mach/thread_act.h>
 #include <mach/thread_info.h>
@@ -45,7 +38,7 @@ void jce_sysinfo_init(JceSysInfo *info)
     /* Initialize CPU usage baseline. */
 #ifdef __EMSCRIPTEN__
     /* No-op: browser sandbox provides no process-level metrics. */
-#elif defined(_WIN32)
+#elif defined(SDL_PLATFORM_WINDOWS)
     {
         FILETIME creation, exit, kernel, user;
         GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user);
@@ -62,15 +55,16 @@ void jce_sysinfo_init(JceSysInfo *info)
         now_ul.HighPart = now_ft.dwHighDateTime;
         info->_prev_time = now_ul.QuadPart;
     }
-#elif defined(__linux__)
+#elif defined(SDL_PLATFORM_LINUX)
     {
-        FILE *fp = fopen("/proc/self/stat", "r");
-        if (fp) {
+        SDL_IOStream *io = SDL_IOFromFile("/proc/self/stat", "r");
+        if (io) {
             unsigned long utime = 0, stime = 0;
-            /* Skip first 13 fields, read utime (14) and stime (15). */
             char buf[1024];
-            if (fgets(buf, sizeof(buf), fp)) {
-                /* Find the closing ')' of the comm field. */
+            size_t nread = SDL_ReadIO(io, buf, sizeof(buf) - 1);
+            SDL_CloseIO(io);
+            if (nread > 0) {
+                buf[nread] = '\0';
                 char *p = strrchr(buf, ')');
                 if (p) {
                     p += 2; /* skip ") " */
@@ -84,13 +78,13 @@ void jce_sysinfo_init(JceSysInfo *info)
                     (void)n;
                 }
             }
-            fclose(fp);
             info->_prev_kernel = stime;
             info->_prev_user   = utime;
         }
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        info->_prev_time = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+        /* Use SDL high-resolution counter instead of clock_gettime. */
+        uint64_t freq = SDL_GetPerformanceFrequency();
+        uint64_t ctr  = SDL_GetPerformanceCounter();
+        info->_prev_time = (freq > 0) ? ctr * 1000000000ULL / freq : 0;
     }
 #endif
 }
@@ -105,29 +99,31 @@ void jce_sysinfo_update(JceSysInfo *info)
 #ifdef __EMSCRIPTEN__
     /* No-op: browser sandbox provides no process-level metrics. */
     (void)info;
-#elif defined(_WIN32)
+#elif defined(SDL_PLATFORM_WINDOWS)
     {
         PROCESS_MEMORY_COUNTERS pmc;
         if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
             info->ram_used_mb = (int)(pmc.WorkingSetSize / (1024 * 1024));
     }
-#elif defined(__linux__)
+#elif defined(SDL_PLATFORM_LINUX)
     {
-        FILE *fp = fopen("/proc/self/status", "r");
-        if (fp) {
-            char line[256];
-            while (fgets(line, sizeof(line), fp)) {
-                if (strncmp(line, "VmRSS:", 6) == 0) {
+        SDL_IOStream *io = SDL_IOFromFile("/proc/self/status", "r");
+        if (io) {
+            char status_buf[4096];
+            size_t nread = SDL_ReadIO(io, status_buf, sizeof(status_buf) - 1);
+            SDL_CloseIO(io);
+            if (nread > 0) {
+                status_buf[nread] = '\0';
+                const char *vmrss = strstr(status_buf, "VmRSS:");
+                if (vmrss) {
                     long kb = 0;
-                    sscanf(line + 6, " %ld", &kb);
+                    sscanf(vmrss + 6, " %ld", &kb);
                     info->ram_used_mb = (int)(kb / 1024);
-                    break;
                 }
             }
-            fclose(fp);
         }
     }
-#elif defined(__APPLE__)
+#elif defined(SDL_PLATFORM_MACOS)
     {
         mach_task_basic_info_data_t task_info_data;
         mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
@@ -141,8 +137,8 @@ void jce_sysinfo_update(JceSysInfo *info)
     /* -- CPU usage ------------------------------------------------ */
 
 #if defined(__EMSCRIPTEN__)
-    /* No CPU usage on Emscripten  handled above. */
-#elif defined(_WIN32)
+    /* No CPU usage on Emscripten — handled above. */
+#elif defined(SDL_PLATFORM_WINDOWS)
     {
         FILETIME creation, exit, kernel, user;
         GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user);
@@ -168,13 +164,16 @@ void jce_sysinfo_update(JceSysInfo *info)
         info->_prev_kernel = k.QuadPart;
         info->_prev_user   = u.QuadPart;
     }
-#elif defined(__linux__)
+#elif defined(SDL_PLATFORM_LINUX)
     {
         unsigned long utime = 0, stime = 0;
-        FILE *fp = fopen("/proc/self/stat", "r");
-        if (fp) {
+        SDL_IOStream *io = SDL_IOFromFile("/proc/self/stat", "r");
+        if (io) {
             char buf[1024];
-            if (fgets(buf, sizeof(buf), fp)) {
+            size_t nread = SDL_ReadIO(io, buf, sizeof(buf) - 1);
+            SDL_CloseIO(io);
+            if (nread > 0) {
+                buf[nread] = '\0';
                 char *p = strrchr(buf, ')');
                 if (p) {
                     p += 2;
@@ -187,12 +186,12 @@ void jce_sysinfo_update(JceSysInfo *info)
                            &utime, &stime);
                 }
             }
-            fclose(fp);
         }
 
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        uint64_t now_ns = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+        /* Use SDL high-resolution counter instead of clock_gettime. */
+        uint64_t freq = SDL_GetPerformanceFrequency();
+        uint64_t ctr  = SDL_GetPerformanceCounter();
+        uint64_t now_ns = (freq > 0) ? ctr * 1000000000ULL / freq : 0;
         uint64_t dt_ns = now_ns - info->_prev_time;
 
         long ticks_per_sec = sysconf(_SC_CLK_TCK);
@@ -208,7 +207,7 @@ void jce_sysinfo_update(JceSysInfo *info)
         info->_prev_kernel = stime;
         info->_prev_user   = utime;
     }
-#elif defined(__APPLE__)
+#elif defined(SDL_PLATFORM_MACOS)
     {
         /* Sum CPU time across all threads in the process. */
         thread_act_array_t threads;

@@ -10,7 +10,7 @@
 #ifndef JCE_IBL_H
 #define JCE_IBL_H
 
-#include <bgfx/c99/bgfx.h>
+#include <jce/graphics/jce_texture_types.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -32,7 +32,7 @@ typedef struct JceIblData JceIblData;
  * @param prefilter_size    Size of the prefilter cubemap face at mip 0 (e.g., 128).
  * @param brdf_lut_size     Size of the BRDF LUT (e.g., 256).
  */
-JceIblData *jce_ibl_generate(bgfx_texture_handle_t equirect_tex,
+JceIblData *jce_ibl_generate(JceTexture equirect_tex,
                               uint32_t irradiance_size,
                               uint32_t prefilter_size,
                               uint32_t brdf_lut_size);
@@ -40,13 +40,13 @@ JceIblData *jce_ibl_generate(bgfx_texture_handle_t equirect_tex,
 void jce_ibl_destroy(JceIblData *ibl);
 
 /* Get the irradiance cubemap texture. */
-bgfx_texture_handle_t jce_ibl_get_irradiance(const JceIblData *ibl);
+JceTexture jce_ibl_get_irradiance(const JceIblData *ibl);
 
 /* Get the prefiltered specular cubemap texture. */
-bgfx_texture_handle_t jce_ibl_get_prefilter(const JceIblData *ibl);
+JceTexture jce_ibl_get_prefilter(const JceIblData *ibl);
 
 /* Get the BRDF integration LUT texture. */
-bgfx_texture_handle_t jce_ibl_get_brdf_lut(const JceIblData *ibl);
+JceTexture jce_ibl_get_brdf_lut(const JceIblData *ibl);
 
 /*
  * Create a pre-baked BRDF LUT (does not require an HDR source).
@@ -54,7 +54,7 @@ bgfx_texture_handle_t jce_ibl_get_brdf_lut(const JceIblData *ibl);
  *
  * @param size  LUT resolution (e.g., 256).
  */
-bgfx_texture_handle_t jce_ibl_create_brdf_lut(uint32_t size);
+JceTexture jce_ibl_create_brdf_lut(uint32_t size);
 
 #ifdef __cplusplus
 }

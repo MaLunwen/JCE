@@ -19,8 +19,8 @@
 #include "ivd.h"
 #include "ihevcd_cxa.h"
 
+#include <mimalloc.h>
 #include <string.h>
-#include <stdlib.h>
 
 #define LOG_TAG "jce_h265"
 
@@ -30,24 +30,13 @@ static void *jce_hevc_aligned_alloc(void *pv_mem_ctxt,
                                     WORD32 alignment, WORD32 size)
 {
     (void)pv_mem_ctxt;
-#ifdef _MSC_VER
-    return _aligned_malloc((size_t)size, (size_t)alignment);
-#else
-    void *ptr = NULL;
-    if (posix_memalign(&ptr, (size_t)alignment, (size_t)size) != 0)
-        return NULL;
-    return ptr;
-#endif
+    return mi_malloc_aligned((size_t)size, (size_t)alignment);
 }
 
 static void jce_hevc_aligned_free(void *pv_mem_ctxt, void *pv_buf)
 {
     (void)pv_mem_ctxt;
-#ifdef _MSC_VER
-    _aligned_free(pv_buf);
-#else
-    free(pv_buf);
-#endif
+    mi_free(pv_buf);
 }
 
 /* ── hvcC / HVCC → Annex B helpers ────────────────────────────────── */

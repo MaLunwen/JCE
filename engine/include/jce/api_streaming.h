@@ -4,7 +4,7 @@
  * Background loading / unloading of scene chunks, texture mips,
  * and mesh LODs based on camera proximity.
  *
- * STATUS: Architecture stub — implementation pending.
+ * STATUS: Implemented — background chunk loading with radial/rectangular modes.
  */
 
 #ifndef JCE_API_STREAMING_H

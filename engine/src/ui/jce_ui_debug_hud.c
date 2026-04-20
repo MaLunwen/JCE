@@ -10,6 +10,7 @@
 #include <jce/graphics/jce_renderer.h>
 #include <jce/platform/jce_window.h>
 #include <jce/core/jce_log.h>
+#include "core/jce_memory.h"
 
 #include <bgfx/c99/bgfx.h>
 
@@ -118,7 +119,7 @@ JceDebugHud *jce_debug_hud_create(const JceDebugHudDesc *desc)
     if (!desc || !desc->ui || !desc->renderer || !desc->window)
         return NULL;
 
-    JceDebugHud *hud = (JceDebugHud *)calloc(1, sizeof(*hud));
+    JceDebugHud *hud = (JceDebugHud *)JCE_CALLOC(1, sizeof(*hud));
     if (!hud) return NULL;
 
     hud->ui       = desc->ui;
@@ -129,7 +130,7 @@ JceDebugHud *jce_debug_hud_create(const JceDebugHudDesc *desc)
     hud->doc = jce_ui_doc_load_file(hud->ui, "engine_debug_hud.rml");
     if (!jce_ui_doc_valid(hud->doc)) {
         LOG_ERROR(LOG_TAG, "failed to load debug HUD document: engine_debug_hud.rml");
-        free(hud);
+        JCE_FREE(hud);
         return NULL;
     }
 
@@ -160,7 +161,7 @@ void jce_debug_hud_destroy(JceDebugHud *hud)
     if (!hud) return;
     if (hud->ui && jce_ui_doc_valid(hud->doc))
         jce_ui_doc_close(hud->ui, hud->doc);
-    free(hud);
+    JCE_FREE(hud);
 }
 
 void jce_debug_hud_show(JceDebugHud *hud)

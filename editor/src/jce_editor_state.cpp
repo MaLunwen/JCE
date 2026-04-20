@@ -8,8 +8,11 @@
  */
 
 #include "jce_editor_state_internal.h"
+#include "jce_editor_ecs_adapter.h"
 #include "jce_editor_i18n.h"
 #include "jce_editor_config.h"
+
+#include <unordered_map>
 
 /* Forward-declare only the one function we need from scene_render,
    avoiding a full include that creates a cpp-level circular dependency. */
@@ -29,13 +32,28 @@ int  s_history_transient_batch_depth = 0;
 
 EditorTransaction s_transaction;
 
-/* ── Helper: find entity index by id ─────────────────────────────── */
+/* ── O(1) entity lookup map ───────────────────────────────────────── */
+/*
+ * ECS is the authoritative store for all entity/component data.
+ * The editor arrays (s.entities[], s.components[][]) are a synchronised
+ * cache populated from ECS on load/undo and kept in sync by CRUD ops.
+ * This map accelerates the cache lookup from O(n) to O(1).
+ */
+
+static std::unordered_map<uint32_t, int> s_id_to_idx;
 
 int find_entity(uint32_t id)
 {
+	auto it = s_id_to_idx.find(id);
+	return it != s_id_to_idx.end() ? it->second : -1;
+}
+
+void jce_state_rebuild_id_map(void)
+{
+	s_id_to_idx.clear();
+	s_id_to_idx.reserve(s.entity_count);
 	for (int i = 0; i < s.entity_count; i++)
-		if (s.entities[i].id == id) return i;
-	return -1;
+		s_id_to_idx[s.entities[i].id] = i;
 }
 
 void set_current_scene_path_internal(const char *scene_path)
@@ -82,24 +100,34 @@ void clear_scene_entities(void)
 	}
 	s.entity_count = 0;
 	s.next_id = 1;
+	s_id_to_idx.clear();
 	jce_state_clear_selection();
 }
 
 /* ── Demo scene builder ──────────────────────────────────────────── */
 
+/* Helper: return mutable pointer to a component the entity already has. */
+static JceComponentInfo *find_comp(uint32_t eid, JceComponentType type)
+{
+	int count = 0;
+	JceComponentInfo *comps = jce_state_get_entity_components(eid, &count);
+	for (int i = 0; i < count; i++)
+		if (comps[i].type == type) return &comps[i];
+	return NULL;
+}
+
 static void build_demo_scene(void)
 {
+	HistorySuspendScope no_undo;
+
 	uint32_t root = jce_state_create_entity("Scene Root", 0);
 
 	uint32_t cam = jce_state_create_entity("Main Camera", root);
 	jce_state_add_component(cam, JCE_COMP_TRANSFORM);
-	/* Set camera position. */
-	{
-		int idx = find_entity(cam);
-		if (idx >= 0) {
-			s.components[idx][0].data.transform.pos[1] = 5.0f;
-			s.components[idx][0].data.transform.pos[2] = 10.0f;
-		}
+	if (JceComponentInfo *t = find_comp(cam, JCE_COMP_TRANSFORM)) {
+		t->data.transform.pos[1] = 5.0f;
+		t->data.transform.pos[2] = 10.0f;
+		jce_state_set_component(cam, t);
 	}
 	jce_state_add_component(cam, JCE_COMP_CAMERA);
 
@@ -111,113 +139,80 @@ static void build_demo_scene(void)
 	uint32_t pt_light = jce_state_create_entity("Point Light", lights);
 	jce_state_add_component(pt_light, JCE_COMP_TRANSFORM);
 	jce_state_add_component(pt_light, JCE_COMP_LIGHT);
-	{
-		int idx = find_entity(pt_light);
-		if (idx >= 0) {
-			/* Point light type = 1. */
-			for (int i = 0; i < s.entities[idx].component_count; i++) {
-				if (s.components[idx][i].type == JCE_COMP_LIGHT)
-					s.components[idx][i].data.light.type = 1;
-			}
-		}
+	if (JceComponentInfo *l = find_comp(pt_light, JCE_COMP_LIGHT)) {
+		l->data.light.type = 1;
+		jce_state_set_component(pt_light, l);
 	}
 
 	uint32_t objs = jce_state_create_entity("Objects", root);
 	uint32_t cube = jce_state_create_entity("Cube", objs);
 	jce_state_add_component(cube, JCE_COMP_TRANSFORM);
 	jce_state_add_component(cube, JCE_COMP_MESH_RENDERER);
-	/* Position cube at (0, 0.5, 0) so it sits on the Y=0 ground. */
-	{
-		int idx = find_entity(cube);
-		if (idx >= 0) {
-			for (int i = 0; i < s.entities[idx].component_count; i++) {
-				if (s.components[idx][i].type == JCE_COMP_TRANSFORM)
-					s.components[idx][i].data.transform.pos[1] = 0.5f;
-			}
-		}
+	if (JceComponentInfo *t = find_comp(cube, JCE_COMP_TRANSFORM)) {
+		t->data.transform.pos[1] = 0.5f;
+		jce_state_set_component(cube, t);
 	}
 
 	uint32_t sphere = jce_state_create_entity("Sphere", objs);
 	jce_state_add_component(sphere, JCE_COMP_TRANSFORM);
 	jce_state_add_component(sphere, JCE_COMP_MESH_RENDERER);
-	/* Sphere at (2.5, 0.5, 0) — to the right of the cube. */
-	{
-		int idx = find_entity(sphere);
-		if (idx >= 0) {
-			for (int i = 0; i < s.entities[idx].component_count; i++) {
-				if (s.components[idx][i].type == JCE_COMP_TRANSFORM) {
-					s.components[idx][i].data.transform.pos[0] = 2.5f;
-					s.components[idx][i].data.transform.pos[1] = 0.5f;
-				}
-				if (s.components[idx][i].type == JCE_COMP_MESH_RENDERER)
-					s.components[idx][i].data.mesh_renderer.mesh_shape = JCE_MESH_SHAPE_SPHERE;
-			}
-		}
+	if (JceComponentInfo *t = find_comp(sphere, JCE_COMP_TRANSFORM)) {
+		t->data.transform.pos[0] = 2.5f;
+		t->data.transform.pos[1] = 0.5f;
+		jce_state_set_component(sphere, t);
+	}
+	if (JceComponentInfo *m = find_comp(sphere, JCE_COMP_MESH_RENDERER)) {
+		m->data.mesh_renderer.mesh_shape = JCE_MESH_SHAPE_SPHERE;
+		jce_state_set_component(sphere, m);
 	}
 
 	uint32_t plane = jce_state_create_entity("Plane", objs);
 	jce_state_add_component(plane, JCE_COMP_TRANSFORM);
 	jce_state_add_component(plane, JCE_COMP_MESH_RENDERER);
-	/* Plane at (-2.5, 0, 0) — to the left, acts as a flat ground patch. */
-	{
-		int idx = find_entity(plane);
-		if (idx >= 0) {
-			for (int i = 0; i < s.entities[idx].component_count; i++) {
-				if (s.components[idx][i].type == JCE_COMP_TRANSFORM) {
-					s.components[idx][i].data.transform.pos[0] = -2.5f;
-					s.components[idx][i].data.transform.scale[0] = 3.0f;
-					s.components[idx][i].data.transform.scale[1] = 3.0f;
-					s.components[idx][i].data.transform.scale[2] = 3.0f;
-				}
-				if (s.components[idx][i].type == JCE_COMP_MESH_RENDERER)
-					s.components[idx][i].data.mesh_renderer.mesh_shape = JCE_MESH_SHAPE_PLANE;
-			}
-		}
+	if (JceComponentInfo *t = find_comp(plane, JCE_COMP_TRANSFORM)) {
+		t->data.transform.pos[0] = -2.5f;
+		t->data.transform.scale[0] = 3.0f;
+		t->data.transform.scale[1] = 3.0f;
+		t->data.transform.scale[2] = 3.0f;
+		jce_state_set_component(plane, t);
+	}
+	if (JceComponentInfo *m = find_comp(plane, JCE_COMP_MESH_RENDERER)) {
+		m->data.mesh_renderer.mesh_shape = JCE_MESH_SHAPE_PLANE;
+		jce_state_set_component(plane, m);
 	}
 
-	/* Capsule at (-2.5, 1, 2) — untextured wireframe test (solid color). */
 	uint32_t capsule = jce_state_create_entity("Capsule (no texture)", objs);
 	jce_state_add_component(capsule, JCE_COMP_TRANSFORM);
 	jce_state_add_component(capsule, JCE_COMP_MESH_RENDERER);
-	{
-		int idx = find_entity(capsule);
-		if (idx >= 0) {
-			for (int i = 0; i < s.entities[idx].component_count; i++) {
-				if (s.components[idx][i].type == JCE_COMP_TRANSFORM) {
-					s.components[idx][i].data.transform.pos[0] = -2.5f;
-					s.components[idx][i].data.transform.pos[1] = 1.0f;
-					s.components[idx][i].data.transform.pos[2] = 2.0f;
-				}
-				if (s.components[idx][i].type == JCE_COMP_MESH_RENDERER)
-					s.components[idx][i].data.mesh_renderer.mesh_shape = JCE_MESH_SHAPE_CAPSULE;
-			}
-		}
+	if (JceComponentInfo *t = find_comp(capsule, JCE_COMP_TRANSFORM)) {
+		t->data.transform.pos[0] = -2.5f;
+		t->data.transform.pos[1] = 1.0f;
+		t->data.transform.pos[2] = 2.0f;
+		jce_state_set_component(capsule, t);
+	}
+	if (JceComponentInfo *m = find_comp(capsule, JCE_COMP_MESH_RENDERER)) {
+		m->data.mesh_renderer.mesh_shape = JCE_MESH_SHAPE_CAPSULE;
+		jce_state_set_component(capsule, m);
 	}
 
-	/* Cylinder at (2.5, 0.5, 2) — textured wireframe test (colored lines). */
 	uint32_t cylinder = jce_state_create_entity("Cylinder (textured)", objs);
 	jce_state_add_component(cylinder, JCE_COMP_TRANSFORM);
 	jce_state_add_component(cylinder, JCE_COMP_MESH_RENDERER);
-	{
-		int idx = find_entity(cylinder);
-		if (idx >= 0) {
-			for (int i = 0; i < s.entities[idx].component_count; i++) {
-				if (s.components[idx][i].type == JCE_COMP_TRANSFORM) {
-					s.components[idx][i].data.transform.pos[0] = 2.5f;
-					s.components[idx][i].data.transform.pos[1] = 0.5f;
-					s.components[idx][i].data.transform.pos[2] = 2.0f;
-				}
-				if (s.components[idx][i].type == JCE_COMP_MESH_RENDERER) {
-					s.components[idx][i].data.mesh_renderer.mesh_shape = JCE_MESH_SHAPE_CYLINDER;
-					s.components[idx][i].data.mesh_renderer.base_color[0] = 0.2f;
-					s.components[idx][i].data.mesh_renderer.base_color[1] = 0.6f;
-					s.components[idx][i].data.mesh_renderer.base_color[2] = 0.9f;
-					s.components[idx][i].data.mesh_renderer.base_color[3] = 1.0f;
-					s.components[idx][i].data.mesh_renderer.metallic  = 0.3f;
-					s.components[idx][i].data.mesh_renderer.roughness = 0.5f;
-				}
-			}
-		}
+	if (JceComponentInfo *t = find_comp(cylinder, JCE_COMP_TRANSFORM)) {
+		t->data.transform.pos[0] = 2.5f;
+		t->data.transform.pos[1] = 0.5f;
+		t->data.transform.pos[2] = 2.0f;
+		jce_state_set_component(cylinder, t);
+	}
+	if (JceComponentInfo *m = find_comp(cylinder, JCE_COMP_MESH_RENDERER)) {
+		m->data.mesh_renderer.mesh_shape = JCE_MESH_SHAPE_CYLINDER;
+		m->data.mesh_renderer.base_color[0] = 0.2f;
+		m->data.mesh_renderer.base_color[1] = 0.6f;
+		m->data.mesh_renderer.base_color[2] = 0.9f;
+		m->data.mesh_renderer.base_color[3] = 1.0f;
+		m->data.mesh_renderer.metallic  = 0.3f;
+		m->data.mesh_renderer.roughness = 0.5f;
+		jce_state_set_component(cylinder, m);
 	}
 
 	uint32_t ui = jce_state_create_entity("UI", root);
@@ -401,6 +396,9 @@ uint32_t jce_state_create_entity(const char *name, uint32_t parent_id)
 	e->prefab_instance = false;
 	e->prefab_path[0] = '\0';
 
+	/* Update O(1) index map. */
+	s_id_to_idx[e->id] = s.entity_count - 1;
+
 	/* Add to parent's children list. */
 	if (parent_id != 0) {
 		JceEntityInfo *parent = jce_state_get_entity(parent_id);
@@ -410,11 +408,22 @@ uint32_t jce_state_create_entity(const char *name, uint32_t parent_id)
 
 	/* Create in engine ECS.  Pass NULL for the name so flecs does not
 	 * register it in its name_index — the editor manages entity names
-	 * in JceEntityInfo.name and duplicate names are allowed.  Passing
+	 * in EditorMeta.name and duplicate names are allowed.  Passing
 	 * names to flecs caused fatal "conflicting entity" aborts during
 	 * undo/redo when two entities shared the same name. */
 	if (s.scene) {
 		e->ecs_entity = (uint64_t)jce_scene_create_entity(s.scene, NULL);
+
+		/* Store display name and metadata in EditorMeta. */
+		jce_adapter_push_entity_meta(s.scene, (JceEntity)e->ecs_entity, e);
+
+		/* Set parent in ECS if applicable. */
+		if (parent_id != 0) {
+			JceEntityInfo *parent = jce_state_get_entity(parent_id);
+			if (parent && parent->ecs_entity != 0)
+				jce_scene_set_parent(s.scene, (JceEntity)e->ecs_entity,
+				                     (JceEntity)parent->ecs_entity);
+		}
 	}
 
 	return e->id;
@@ -454,14 +463,16 @@ void jce_state_delete_entity(uint32_t id)
 	/* Remove from selection. */
 	jce_state_deselect_entity(id);
 
-	/* Swap-remove from array. */
+	/* Swap-remove from array + update index map. */
 	idx = find_entity(id);  /* re-find after recursive deletes */
 	if (idx >= 0) {
+		s_id_to_idx.erase(id);
 		int last = s.entity_count - 1;
 		if (idx != last) {
 			s.entities[idx] = s.entities[last];
 			memcpy(s.components[idx], s.components[last],
 			       sizeof(JceComponentInfo) * JCE_MAX_COMPONENTS);
+			s_id_to_idx[s.entities[idx].id] = idx;
 		}
 		s.entity_count--;
 	}
@@ -472,7 +483,12 @@ void jce_state_rename_entity(uint32_t id, const char *name)
 	HistoryEditScope edit_scope;
 
 	JceEntityInfo *e = jce_state_get_entity(id);
-	if (e) snprintf(e->name, sizeof(e->name), "%s", name);
+	if (!e) return;
+	snprintf(e->name, sizeof(e->name), "%s", name);
+
+	/* Update EditorMeta.name in ECS. */
+	if (s.scene && e->ecs_entity != 0)
+		jce_adapter_push_entity_meta(s.scene, (JceEntity)e->ecs_entity, e);
 }
 
 void jce_state_set_entity_enabled(uint32_t id, bool enabled)
@@ -483,6 +499,11 @@ void jce_state_set_entity_enabled(uint32_t id, bool enabled)
 	if (!e) return;
 
 	e->enabled = enabled;
+
+	/* Update EditorMeta in ECS. */
+	if (s.scene && e->ecs_entity != 0)
+		jce_adapter_push_entity_meta(s.scene, (JceEntity)e->ecs_entity, e);
+
 	for (int i = 0; i < e->child_count; i++)
 		jce_state_set_entity_enabled(e->children[i], enabled);
 }
@@ -492,7 +513,11 @@ void jce_state_set_entity_tag(uint32_t id, const char *tag)
 	HistoryEditScope edit_scope;
 
 	JceEntityInfo *e = jce_state_get_entity(id);
-	if (e) snprintf(e->tag, sizeof(e->tag), "%s", tag ? tag : "");
+	if (!e) return;
+	snprintf(e->tag, sizeof(e->tag), "%s", tag ? tag : "");
+
+	if (s.scene && e->ecs_entity != 0)
+		jce_adapter_push_entity_meta(s.scene, (JceEntity)e->ecs_entity, e);
 }
 
 void jce_state_set_entity_tag_color(uint32_t id, JceTagColor color)
@@ -500,7 +525,11 @@ void jce_state_set_entity_tag_color(uint32_t id, JceTagColor color)
 	HistoryEditScope edit_scope;
 
 	JceEntityInfo *e = jce_state_get_entity(id);
-	if (e) e->tag_color = color;
+	if (!e) return;
+	e->tag_color = color;
+
+	if (s.scene && e->ecs_entity != 0)
+		jce_adapter_push_entity_meta(s.scene, (JceEntity)e->ecs_entity, e);
 }
 
 void jce_state_reparent_entity(uint32_t id, uint32_t new_parent)
@@ -537,6 +566,19 @@ void jce_state_reparent_entity(uint32_t id, uint32_t new_parent)
 		JceEntityInfo *new_p = jce_state_get_entity(new_parent);
 		if (new_p && new_p->child_count < JCE_MAX_CHILDREN)
 			new_p->children[new_p->child_count++] = id;
+	}
+
+	/* Sync parent relationship in ECS. */
+	if (s.scene && e->ecs_entity != 0) {
+		if (new_parent != 0) {
+			JceEntityInfo *new_p = jce_state_get_entity(new_parent);
+			if (new_p && new_p->ecs_entity != 0)
+				jce_scene_set_parent(s.scene, (JceEntity)e->ecs_entity,
+				                     (JceEntity)new_p->ecs_entity);
+		} else {
+			jce_scene_set_parent(s.scene, (JceEntity)e->ecs_entity,
+			                     JCE_ENTITY_INVALID);
+		}
 	}
 }
 
@@ -599,21 +641,28 @@ uint32_t jce_state_duplicate_entity(uint32_t id)
 	JceEntityInfo *src = jce_state_get_entity(id);
 	if (!src) return 0;
 
-	int src_idx = find_entity(id);
 	char dup_name[JCE_MAX_ENTITY_NAME];
 	snprintf(dup_name, sizeof(dup_name), "%s (Copy)", src->name);
 	uint32_t dup = jce_state_create_entity(dup_name, src->parent_id);
 
+	/* Refresh src — create_entity appended so index is stable,
+	 * but be defensive. */
+	src = jce_state_get_entity(id);
 	JceEntityInfo *d = jce_state_get_entity(dup);
-	if (d) {
+	if (d && src) {
 		d->tag_color = src->tag_color;
 		d->enabled   = src->enabled;
 		snprintf(d->tag, sizeof(d->tag), "%s", src->tag);
 		d->prefab_instance = src->prefab_instance;
 		snprintf(d->prefab_path, sizeof(d->prefab_path), "%s", src->prefab_path);
+
+		/* Sync updated metadata to ECS. */
+		if (s.scene && d->ecs_entity != 0)
+			jce_adapter_push_entity_meta(s.scene, (JceEntity)d->ecs_entity, d);
 	}
 
 	/* Copy components. */
+	int src_idx = find_entity(id);
 	int dup_idx = find_entity(dup);
 	if (src_idx >= 0 && dup_idx >= 0) {
 		int count = s.entities[src_idx].component_count;
@@ -621,6 +670,13 @@ uint32_t jce_state_duplicate_entity(uint32_t id)
 		memcpy(s.components[dup_idx], s.components[src_idx],
 		       sizeof(JceComponentInfo) * count);
 		s.entities[dup_idx].component_count = count;
+
+		/* Sync all copied components to ECS. */
+		if (s.scene && d && d->ecs_entity != 0) {
+			for (int i = 0; i < count; i++)
+				jce_adapter_comp_info_to_ecs(s.scene,
+					(JceEntity)d->ecs_entity, &s.components[dup_idx][i]);
+		}
 	}
 
 	return dup;
@@ -725,24 +781,9 @@ void jce_state_set_component(uint32_t entity_id, const JceComponentInfo *comp)
 		s.components[idx][e->component_count++] = *comp;
 	}
 
-	/* Sync transform to engine ECS. */
-	if (comp->type == JCE_COMP_TRANSFORM && s.scene) {
-		JceEntityInfo *ent = &s.entities[idx];
-		if (ent->ecs_entity != 0) {
-			JceTransform t;
-			t.position = jce_v3(comp->data.transform.pos[0],
-			                    comp->data.transform.pos[1],
-			                    comp->data.transform.pos[2]);
-			/* Convert Euler degrees to quaternion (engine API). */
-			t.rotation = jce_euler_to_q(
-				comp->data.transform.rot[0],
-				comp->data.transform.rot[1],
-				comp->data.transform.rot[2]);
-			t.scale = jce_v3(comp->data.transform.scale[0],
-			                 comp->data.transform.scale[1],
-			                 comp->data.transform.scale[2]);
-			jce_scene_set_transform(s.scene, (JceEntity)ent->ecs_entity, &t);
-		}
+	/* Sync component to engine ECS via adapter. */
+	if (s.scene && e->ecs_entity != 0) {
+		jce_adapter_comp_info_to_ecs(s.scene, (JceEntity)e->ecs_entity, comp);
 	}
 }
 
@@ -840,6 +881,11 @@ void jce_state_add_component(uint32_t entity_id, JceComponentType type)
 
 	LOG_INFO(LOG_TAG, "add component %s to entity %u",
 	         jce_component_type_name(type), entity_id);
+
+	/* Sync new component to engine ECS via adapter. */
+	if (s.scene && e->ecs_entity != 0) {
+		jce_adapter_comp_info_to_ecs(s.scene, (JceEntity)e->ecs_entity, c);
+	}
 }
 
 void jce_state_remove_component(uint32_t entity_id, JceComponentType type)
@@ -854,6 +900,11 @@ void jce_state_remove_component(uint32_t entity_id, JceComponentType type)
 		if (s.components[idx][i].type == type) {
 			/* Swap-remove. */
 			s.components[idx][i] = s.components[idx][--e->component_count];
+
+			/* Remove from engine ECS via adapter. */
+			if (s.scene && e->ecs_entity != 0)
+				jce_adapter_remove_from_ecs(s.scene, (JceEntity)e->ecs_entity, type);
+
 			LOG_INFO(LOG_TAG, "remove component %s from entity %u",
 			         jce_component_type_name(type), entity_id);
 			return;

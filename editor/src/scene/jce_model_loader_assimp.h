@@ -39,7 +39,7 @@ typedef struct JceEditorMaterialInfo {
     bool  double_sided;
 } JceEditorMaterialInfo;
 
-JceMesh *jce_editor_model_load(const PakArchive *pak, const char *asset_path);
+JceMesh *jce_editor_model_load(const JcePakArchive *pak, const char *asset_path);
 JceMesh *jce_editor_model_load_file(const char *file_path);
 
 bool jce_editor_model_load_cpu_file(const char *file_path,

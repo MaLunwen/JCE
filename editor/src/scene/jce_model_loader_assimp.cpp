@@ -184,11 +184,11 @@ bool jce_editor_model_load_cpu_file(const char *file_path,
     return true;
 }
 
-JceMesh *jce_editor_model_load(const PakArchive *pak, const char *asset_path)
+JceMesh *jce_editor_model_load(const JcePakArchive *pak, const char *asset_path)
 {
     if (!pak || !asset_path) return nullptr;
 
-    const PakAsset *asset = pak_find(pak, asset_path);
+    const JcePakAsset *asset = jce_pak_find(pak, asset_path);
     if (!asset) {
         LOG_ERROR(LOG_TAG, "model not found in PAK: %s", asset_path);
         return nullptr;
@@ -197,7 +197,7 @@ JceMesh *jce_editor_model_load(const PakArchive *pak, const char *asset_path)
     void *buf = ED_MALLOC(static_cast<size_t>(asset->original_size));
     if (!buf) return nullptr;
 
-    size_t n = pak_decompress(asset, buf, static_cast<size_t>(asset->original_size));
+    size_t n = jce_pak_decompress(asset, buf, static_cast<size_t>(asset->original_size));
     if (n == 0) {
         LOG_ERROR(LOG_TAG, "decompression failed: %s", asset_path);
         ED_FREE(buf);

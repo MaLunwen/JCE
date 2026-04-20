@@ -330,11 +330,11 @@ CkApp *ck_app_create(const JceServices *svc)
 
     /* Set window icon from PAK. */
     {
-        const PakAsset *icon = pak_find(app->svc.pak, "CK_icon.png");
+        const JcePakAsset *icon = jce_pak_find(app->svc.pak, "CK_icon.png");
         if (icon) {
             void *buf = malloc((size_t)icon->original_size);
             if (buf) {
-                size_t sz = pak_decompress(icon, buf,
+                size_t sz = jce_pak_decompress(icon, buf,
                                            (size_t)icon->original_size);
                 if (sz > 0)
                     jce_window_set_icon(app->svc.window, buf, sz);

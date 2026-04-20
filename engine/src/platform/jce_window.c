@@ -20,13 +20,9 @@ JCE_SASSERT(JCE_WINDOW_BORDERLESS == SDL_WINDOW_BORDERLESS, win_bl);
 
 #define LOG_TAG "jce_window"
 
-#ifdef __APPLE__
-#include <TargetConditionals.h>
-#endif
-
 struct JceWindow {
     SDL_Window *sdl_win;
-#if defined(__APPLE__)
+#if defined(SDL_PLATFORM_APPLE)
     SDL_MetalView metal_view;
 #endif
     int         logical_w;
@@ -44,7 +40,7 @@ JceWindow *jce_window_create(const JceWindowConfig *cfg)
     win->logical_h = cfg->logical_h;
 
     uint64_t flags = cfg->flags;
-#if defined(__APPLE__)
+#if defined(SDL_PLATFORM_APPLE)
     /* Ensure Apple windows are Metal-capable for bgfx initialization. */
     flags |= SDL_WINDOW_METAL;
 #endif
@@ -64,13 +60,13 @@ JceWindow *jce_window_create(const JceWindowConfig *cfg)
     win->pixel_w = (uint32_t)pw;
     win->pixel_h = (uint32_t)ph;
 
-#if defined(__APPLE__) && TARGET_OS_IPHONE
+#if defined(SDL_PLATFORM_IOS)
     /* On iOS use a 1:1 logical size to match device drawable pixels. */
     win->logical_w = pw;
     win->logical_h = ph;
 #endif
 
-#if defined(__APPLE__)
+#if defined(SDL_PLATFORM_APPLE)
     win->metal_view = SDL_Metal_CreateView(win->sdl_win);
     if (!win->metal_view) {
         LOG_ERROR(LOG_TAG, "SDL_Metal_CreateView failed: %s", SDL_GetError());
@@ -95,7 +91,7 @@ JceWindow *jce_window_create(const JceWindowConfig *cfg)
 void jce_window_destroy(JceWindow *win)
 {
     if (!win) return;
-#if defined(__APPLE__)
+#if defined(SDL_PLATFORM_APPLE)
     if (win->metal_view) SDL_Metal_DestroyView(win->metal_view);
 #endif
     if (win->sdl_win) SDL_DestroyWindow(win->sdl_win);
@@ -127,15 +123,15 @@ void jce_window_get_native(const JceWindow *win, JceNativeWindow *out)
     // cppcheck-suppress unreadVariable   ; props used in all #if platform branches below
     SDL_PropertiesID props = SDL_GetWindowProperties(win->sdl_win);
 
-#if defined(__ANDROID__)
+#if defined(SDL_PLATFORM_ANDROID)
     out->nwh = SDL_GetPointerProperty(props,
         SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
 
-#elif defined(__APPLE__)
+#elif defined(SDL_PLATFORM_APPLE)
     if (win->metal_view) {
         out->nwh = SDL_Metal_GetLayer(win->metal_view);
     } else {
-  #if TARGET_OS_IPHONE
+  #if defined(SDL_PLATFORM_IOS)
         out->nwh = SDL_GetPointerProperty(props,
             SDL_PROP_WINDOW_UIKIT_WINDOW_POINTER, NULL);
   #else
@@ -144,16 +140,16 @@ void jce_window_get_native(const JceWindow *win, JceNativeWindow *out)
   #endif
     }
 
-#elif defined(__EMSCRIPTEN__)
+#elif defined(SDL_PLATFORM_EMSCRIPTEN)
     /* bgfx's HTML5 GL context uses nwh as a CSS selector string.
        Must match the <canvas id="canvas"> in web-shell.html. */
     out->nwh = (void *)"#canvas";
 
-#elif defined(_WIN32)
+#elif defined(SDL_PLATFORM_WINDOWS)
     out->nwh = SDL_GetPointerProperty(props,
         SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
 
-#elif defined(__linux__)
+#elif defined(SDL_PLATFORM_LINUX)
     /* Try Wayland first, fall back to X11. */
     void *wl_display = SDL_GetPointerProperty(props,
         SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, NULL);
@@ -175,7 +171,7 @@ void jce_window_handle_resize(JceWindow *win, uint32_t w, uint32_t h)
     if (!win) return;
     win->pixel_w = w;
     win->pixel_h = h;
-#if defined(__APPLE__) && TARGET_OS_IPHONE
+#if defined(SDL_PLATFORM_IOS)
     /* Keep logical size in sync with iOS drawable size. */
     win->logical_w = (int)w;
     win->logical_h = (int)h;
@@ -202,7 +198,7 @@ void jce_window_set_icon(JceWindow *win, const void *data, size_t size)
 {
     if (!win || !data || size == 0) return;
 
-#ifdef __EMSCRIPTEN__
+#ifdef SDL_PLATFORM_EMSCRIPTEN
     /* SDL3's Emscripten SDL_SetWindowIcon uses MAIN_THREAD_EM_ASM with
        an `instanceof SharedArrayBuffer` guard that throws ReferenceError
        when the browser lacks cross-origin isolation.  Browser favicons
@@ -235,7 +231,7 @@ void jce_window_toggle_fullscreen(JceWindow *win)
     SDL_GetWindowSizeInPixels(win->sdl_win, &pw, &ph);
     win->pixel_w = (uint32_t)pw;
     win->pixel_h = (uint32_t)ph;
-#if defined(__APPLE__) && TARGET_OS_IPHONE
+#if defined(SDL_PLATFORM_IOS)
     win->logical_w = pw;
     win->logical_h = ph;
 #else

@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "core/jce_memory.h"
 
 #define MP4D_INFO_SUPPORTED 1
 #define MP4D_PRINT_INFO_SUPPORTED 0
@@ -181,7 +182,7 @@ JceMp4Parser *jce_mp4_parser_open_memory(const void *data, size_t size,
         return NULL;
     }
 
-    parser = (JceMp4Parser *)calloc(1u, sizeof(*parser));
+    parser = (JceMp4Parser *)JCE_CALLOC(1u, sizeof(*parser));
     if (!parser) {
         if (out_info) {
             jce_mp4_set_error(out_info, "out of memory");
@@ -201,7 +202,7 @@ JceMp4Parser *jce_mp4_parser_open_memory(const void *data, size_t size,
         if (out_info) {
             jce_mp4_set_error(out_info, "invalid MP4 structure");
         }
-        free(parser);
+        JCE_FREE(parser);
         return NULL;
     }
 
@@ -212,7 +213,7 @@ JceMp4Parser *jce_mp4_parser_open_memory(const void *data, size_t size,
             *out_info = parser->info;
         }
         MP4D_close(&parser->mp4);
-        free(parser);
+        JCE_FREE(parser);
         return NULL;
     }
 
@@ -228,7 +229,7 @@ void jce_mp4_parser_close(JceMp4Parser *parser)
         return;
     }
     MP4D_close(&parser->mp4);
-    free(parser);
+    JCE_FREE(parser);
 }
 
 bool jce_mp4_parse_memory(const void *data, size_t size, JceMp4Info *out)

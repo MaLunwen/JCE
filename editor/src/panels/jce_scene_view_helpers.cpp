@@ -44,7 +44,7 @@ void clear_stale_gizmo_interaction_state(void)
 
 bool has_valid_gizmo_target(void)
 {
-    if (!jce_editor_prefs_show_gizmos())
+    if (!jce_editor_prefs_show_gizmos() || jce_state_get_play_state() != JCE_PLAY_STOPPED)
         return false;
 
     uint32_t focused = jce_state_get_focused();
@@ -416,7 +416,8 @@ void draw_scene_helper_icons(ImDrawList *dl, const JceGizmoCamera *cam)
 
         bool selected = jce_state_is_selected(ent->id);
         bool skip_icon = selected && ent->id == jce_state_get_focused()
-                      && jce_editor_prefs_show_gizmos();
+                      && jce_editor_prefs_show_gizmos()
+                      && jce_state_get_play_state() == JCE_PLAY_STOPPED;
         ImVec2 center(screen[0], screen[1]);
         if (camera)
             draw_camera_helper_lines(dl, cam, xform, camera, selected);

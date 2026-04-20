@@ -24,9 +24,8 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
-#include <time.h>
 
-#ifdef _WIN32
+#ifdef SDL_PLATFORM_WINDOWS
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -85,7 +84,7 @@ static __thread char tl_thread_name[32] = {0};
 static JceLogRing   *g_ring           = NULL;
 static SDL_Thread   *g_backend_thread = NULL;
 static SDL_AtomicInt g_running;               /* 1 = running, 0 = stop */
-static FILE         *g_log_file       = NULL; /* optional file sink    */
+static SDL_IOStream *g_log_file       = NULL; /* optional file sink    */
 static SDL_Mutex    *g_file_mtx       = NULL; /* protects g_log_file   */
 #endif
 
@@ -133,16 +132,18 @@ static const char *strip_path(const char *path)
 static void emit_message(const JceLogMessage *m)
 {
     /* Timestamp string.  wall_time is resolved here (backend / sync
-       fallback) so the producer path never calls time(). */
+       fallback) so the producer path never calls SDL_GetCurrentTime(). */
     char ts[32];
     {
-        time_t wt = m->wall_time ? m->wall_time : time(NULL);
-        const struct tm *lt = localtime(&wt);
-        int ms = (int)(m->timestamp_ms % 1000);
-        if (lt) {
+        SDL_Time wt = m->wall_time;
+        if (wt == 0) SDL_GetCurrentTime(&wt);
+
+        SDL_DateTime dt;
+        if (SDL_TimeToDateTime(wt, &dt, true)) {
+            int ms = (int)(m->timestamp_ms % 1000);
             snprintf(ts, sizeof(ts), "%04d-%02d-%02d %02d:%02d:%02d.%03d",
-                     lt->tm_year + 1900, lt->tm_mon + 1, lt->tm_mday,
-                     lt->tm_hour, lt->tm_min, lt->tm_sec, ms);
+                     dt.year, dt.month, dt.day,
+                     dt.hour, dt.minute, dt.second, ms);
         } else {
             snprintf(ts, sizeof(ts), "%012" SDL_PRIu64, m->timestamp_ms);
         }
@@ -173,10 +174,14 @@ static void emit_message(const JceLogMessage *m)
 #ifdef JCE_LOG_ASYNC
     /* Write to log file (plain text, no ANSI). */
     if (g_log_file) {
-        SDL_LockMutex(g_file_mtx);
-        fprintf(g_log_file, "%s [%s] %s - %s: %s at %s:%d\n",
+        char file_buf[2048];
+        int file_len = snprintf(file_buf, sizeof(file_buf),
+                "%s [%s] %s - %s: %s at %s:%d\n",
                 ts, m->thread_name, lvl, m->tag, m->message,
                 fname, m->line);
+        SDL_LockMutex(g_file_mtx);
+        if (file_len > 0)
+            SDL_WriteIO(g_log_file, file_buf, (size_t)file_len);
         SDL_UnlockMutex(g_file_mtx);
     }
 #endif
@@ -213,7 +218,7 @@ static int SDLCALL log_backend_func(void *data)
         fflush(stderr);
         if (g_log_file) {
             SDL_LockMutex(g_file_mtx);
-            fflush(g_log_file);
+            SDL_FlushIO(g_log_file);
             SDL_UnlockMutex(g_file_mtx);
         }
 
@@ -236,7 +241,7 @@ static int SDLCALL log_backend_func(void *data)
     fflush(stderr);
     if (g_log_file) {
         SDL_LockMutex(g_file_mtx);
-        fflush(g_log_file);
+        SDL_FlushIO(g_log_file);
         SDL_UnlockMutex(g_file_mtx);
     }
     return 0;
@@ -248,7 +253,7 @@ static int SDLCALL log_backend_func(void *data)
 
 void jce_log_init(void)
 {
-#ifdef _WIN32
+#ifdef SDL_PLATFORM_WINDOWS
     /* Enable ANSI escape codes on Windows 10+ console. */
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
     if (hOut != INVALID_HANDLE_VALUE) {
@@ -271,6 +276,8 @@ void jce_log_init(void)
         g_ring     = jce_log_ring_create();
         g_file_mtx = SDL_CreateMutex();
         SDL_SetAtomicInt(&g_running, 1);
+        /* Intentional: dedicated SDL thread instead of enkiTS — the log backend
+         * must outlive the task system so that shutdown messages are still captured. */
         g_backend_thread = SDL_CreateThread(log_backend_func, "JCE-Log", NULL);
     }
 #endif
@@ -294,7 +301,7 @@ void jce_log_shutdown(void)
     g_ring = NULL;
 
     if (g_log_file) {
-        fclose(g_log_file);
+        SDL_CloseIO(g_log_file);
         g_log_file = NULL;
     }
     if (g_file_mtx) {
@@ -319,7 +326,7 @@ void jce_log_flush(void)
 
     fflush(stderr);
     if (g_log_file)
-        fflush(g_log_file);
+        SDL_FlushIO(g_log_file);
 #else
     fflush(stderr);
 #endif
@@ -330,11 +337,11 @@ void jce_log_set_file(const char *path)
 #ifdef JCE_LOG_ASYNC
     SDL_LockMutex(g_file_mtx);
     if (g_log_file) {
-        fclose(g_log_file);
+        SDL_CloseIO(g_log_file);
         g_log_file = NULL;
     }
     if (path) {
-        g_log_file = fopen(path, "a");
+        g_log_file = SDL_IOFromFile(path, "a");
     }
     SDL_UnlockMutex(g_file_mtx);
 #else
@@ -373,8 +380,8 @@ void jce_log_write(JceLogLevel level, const char *tag,
     m.line         = line;
     m.timestamp_ms = SDL_GetTicks();
     /* wall_time is derived by the backend thread (emit_message) to
-       keep the producer hot path free of time() syscalls.  Set to 0
-       as a sentinel; emit_message fills it from timestamp_ms. */
+       keep the producer hot path free of SDL_GetCurrentTime() syscalls.
+       Set to 0 as a sentinel; emit_message fills it with current time. */
     m.wall_time    = 0;
 
     snprintf(m.tag,  sizeof(m.tag),  "%s", tag  ? tag  : "");

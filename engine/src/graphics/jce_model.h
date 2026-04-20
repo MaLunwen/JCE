@@ -24,7 +24,7 @@ extern "C" {
 typedef struct JceMesh         JceMesh;
 typedef struct JceSkinnedMesh  JceSkinnedMesh;
 typedef struct JceRenderer     JceRenderer;
-typedef struct PakArchive      PakArchive;
+typedef struct JcePakArchive      JcePakArchive;
 typedef struct JceModel        JceModel;
 
 /* ================================================================== */
@@ -58,7 +58,7 @@ typedef struct {
 /* ================================================================== */
 
 /* Load a glTF/GLB model from PAK. Returns NULL on failure. */
-JceModel *jce_model_load_gltf(const PakArchive *pak, const char *asset_path);
+JceModel *jce_model_load_gltf(const JcePakArchive *pak, const char *asset_path);
 
 /* Destroy a model and all owned resources (meshes, textures, skeleton, anims). */
 void jce_model_destroy(JceModel *model);

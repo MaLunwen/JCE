@@ -56,7 +56,7 @@ static jce_mat4 compute_static_node_world(const JceModel *model,
 /* Loading (delegates to glTF loader)                                  */
 /* ================================================================== */
 
-JceModel *jce_model_load_gltf(const PakArchive *pak, const char *asset_path)
+JceModel *jce_model_load_gltf(const JcePakArchive *pak, const char *asset_path)
 {
     return jce_gltf_load(pak, asset_path);
 }
