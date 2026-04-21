@@ -1,5 +1,5 @@
 /*
- * jce_asset_manager_new.h  Internal header for the new unified asset manager.
+ * jce_asset_manager.h  Internal header for the unified asset manager.
  *
  * The public API is in <jce/resource/jce_asset.h>.
  * This header exposes internals needed by the implementation only.

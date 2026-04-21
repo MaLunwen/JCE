@@ -1,5 +1,5 @@
 /*
- * jce_asset_manager_new.c  Unified asset manager implementation.
+ * jce_asset_manager.c  Unified asset manager implementation.
  *
  * Core design:
  *   - Generational handle pool: O(1) alloc/free via free-list stack
@@ -14,7 +14,7 @@
  *   - Only the async pool uses worker threads internally
  */
 
-#include "jce_asset_manager_new.h"
+#include "jce_asset_manager.h"
 #include "jce_asset_loaders.h"
 #include "core/jce_memory.h"
 #include <jce/core/pak_loader.h>

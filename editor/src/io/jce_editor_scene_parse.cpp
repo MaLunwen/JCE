@@ -13,7 +13,7 @@
 #include <cstring>
 
 extern "C" {
-#include <jce/scene/jce_scene_serial.h>
+#include <jce/scene/jce_scene_components_json.h>
 }
 
 /* ── JSON helpers (format detection only — no component parsing) ──── */

@@ -2,7 +2,7 @@
  * jce_asset_loaders.c  Type-dispatch sync loaders, async finalization,
  *                      and per-type payload destruction.
  *
- * Split from jce_asset_manager_new.c to keep the manager file focused on
+ * Split from jce_asset_manager.c to keep the manager file focused on
  * lifecycle, public API, and the frame pump.
  */
 

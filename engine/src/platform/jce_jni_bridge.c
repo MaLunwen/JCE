@@ -1,3 +1,8 @@
+/* Desktop JNI bridge — exposes the engine to JVM-hosted callers
+ * (Java / Kotlin / Scala) on Windows / Linux / macOS.  Android does
+ * NOT use this file; the Android build has its own gradle project
+ * and JNI surface. */
+#if defined(JCE_BUILD_JNI)
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -171,3 +176,5 @@ JNIEXPORT void JNICALL Java_com_jce_JceRuntime_nativeDestroy(JNIEnv *env, jclass
     JCE_FREE(bridge);
 }
 
+
+#endif /* JCE_BUILD_JNI */

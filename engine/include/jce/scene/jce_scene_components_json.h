@@ -39,13 +39,11 @@ cJSON *jce_scene_serialize_entity_components(JceScene *scene, JceEntity e);
  * Caller owns the returned cJSON and must call cJSON_Delete on it. */
 cJSON *jce_scene_save_json(const JceScene *scene);
 
-/* Convenience: load a scene from a JSON file on disk.
- * Returns number of entities loaded, or -1 on error. */
-int jce_scene_load_file(JceScene *scene, const char *path);
-
-/* Convenience: save a scene to a JSON file on disk.
- * Returns true on success. */
-bool jce_scene_save_file(const JceScene *scene, const char *path);
+/* Set the base directory used to resolve sibling material references
+ * during the next jce_scene_load_json() call.
+ * Pass NULL to clear. The resource-layer wrapper sets this around its
+ * VFS loads; runtime PAK loads typically leave it empty. */
+void jce_scene_serial_set_base_dir(const char *dir);
 
 #ifdef __cplusplus
 }

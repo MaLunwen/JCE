@@ -16,7 +16,7 @@
 #include <jce/resource/jce_scene_serial.h>
 #include <jce/resource/jce_scene_contract.h>
 #include <jce/scene/jce_scene.h>
-#include <jce/scene/jce_scene_serial.h>      /* canonical (de)serializer */
+#include <jce/scene/jce_scene_components_json.h>      /* canonical (de)serializer */
 #include <jce/core/jce_filesystem.h>
 #include <jce/core/jce_log.h>
 
@@ -178,6 +178,24 @@ bool jce_scene_serial_load(JceScene *scene, const char *json, size_t len)
 bool jce_scene_serial_load_file(JceScene *scene, const char *path)
 {
     if (!scene || !path) return false;
+
+    /* Derive base directory from the path and inform the parser, so
+       sibling material backfill (Unity-style) can resolve. */
+    {
+        const char *sep = strrchr(path, '/');
+        const char *bs  = strrchr(path, '\\');
+        if (bs > sep) sep = bs;
+        if (sep) {
+            char dir[1024];
+            size_t L = (size_t)(sep - path);
+            if (L >= sizeof(dir)) L = sizeof(dir) - 1;
+            memcpy(dir, path, L);
+            dir[L] = '\0';
+            jce_scene_serial_set_base_dir(dir);
+        } else {
+            jce_scene_serial_set_base_dir(NULL);
+        }
+    }
 
     /* Try PhysFS first for cross-platform consistency. */
     if (PHYSFS_isInit()) {

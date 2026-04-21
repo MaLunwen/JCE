@@ -35,7 +35,7 @@ uint16_t scene_view_id(void)
     if (s_view_id_override != UINT16_MAX)
         return s_view_id_override;
     if (s_sr.bridge)
-        return jce_editor_render_bridge_get_view_id(s_sr.bridge);
+        return jce_offscreen_target_get_view_id(s_sr.bridge);
     return (uint16_t)JCE_VIEW_EDITOR_SCENE;
 }
 
@@ -106,7 +106,7 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     s_sr.white_tex.idx = UINT16_MAX;
     s_sr.postfx_output_tex = UINT16_MAX;
     s_sr.renderer = renderer;
-    s_sr.bridge = jce_editor_render_bridge_create(renderer,
+    s_sr.bridge = jce_offscreen_target_create(renderer,
                                                   (uint16_t)JCE_VIEW_EDITOR_SCENE);
     if (!s_sr.bridge) {
         LOG_WARN(LOG_TAG, "failed to create editor render bridge");
@@ -132,7 +132,7 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     if (!s_sr.camera) {
         LOG_WARN(LOG_TAG, "failed to create editor camera");
         if (s_sr.bridge) {
-            jce_editor_render_bridge_destroy(s_sr.bridge);
+            jce_offscreen_target_destroy(s_sr.bridge);
             s_sr.bridge = NULL;
         }
         jce_editor_scene_asset_cache_shutdown();
@@ -197,7 +197,7 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     if (!s_sr.scene_renderer) {
         LOG_WARN(LOG_TAG, "failed to create engine scene renderer");
         if (s_sr.camera) { jce_camera_destroy(s_sr.camera); s_sr.camera = NULL; }
-        if (s_sr.bridge) { jce_editor_render_bridge_destroy(s_sr.bridge); s_sr.bridge = NULL; }
+        if (s_sr.bridge) { jce_offscreen_target_destroy(s_sr.bridge); s_sr.bridge = NULL; }
         jce_editor_scene_asset_cache_shutdown();
         return false;
     }
@@ -231,7 +231,7 @@ void jce_editor_scene_render_shutdown(void)
     jce_editor_scene_asset_cache_shutdown();
 
     if (s_sr.bridge) {
-        jce_editor_render_bridge_destroy(s_sr.bridge);
+        jce_offscreen_target_destroy(s_sr.bridge);
         s_sr.bridge = NULL;
     }
 
@@ -293,7 +293,7 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         ? 0x373737FF
         : BG_COLOR_RGBA;
 
-    if (!jce_editor_render_bridge_prepare(
+    if (!jce_offscreen_target_prepare(
             s_sr.bridge,
             width,
             height,
@@ -385,7 +385,7 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         if (any_effect) {
             JceTextureHandle scene_color = { UINT16_MAX };
             JceTextureHandle prev_pass = { UINT16_MAX };
-            scene_color.idx = jce_editor_render_bridge_get_color_texture(s_sr.bridge);
+            scene_color.idx = jce_offscreen_target_get_color_texture(s_sr.bridge);
 
             jce_postfx_apply(postfx, scene_color, prev_pass);
 
@@ -406,7 +406,7 @@ uint16_t jce_editor_scene_render_get_texture(void)
     if (s_sr.postfx_output_tex != UINT16_MAX)
         return s_sr.postfx_output_tex;
 
-    return jce_editor_render_bridge_get_color_texture(s_sr.bridge);
+    return jce_offscreen_target_get_color_texture(s_sr.bridge);
 }
 
 void jce_editor_scene_set_scene_dir(const char *dir)

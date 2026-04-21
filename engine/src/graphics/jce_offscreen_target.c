@@ -1,8 +1,8 @@
 /*
- * jce_editor_render_bridge.c  Engine-owned bridge for editor scene viewport.
+ * jce_offscreen_target.c  Engine-owned bridge for editor scene viewport.
  */
 
-#include <jce/graphics/jce_editor_render_bridge.h>
+#include <jce/graphics/jce_offscreen_target.h>
 
 #include <jce/graphics/jce_views.h>
 #include <jce/core/jce_log.h>
@@ -15,7 +15,7 @@
 
 #define LOG_TAG "editor_bridge"
 
-struct JceEditorRenderBridge {
+struct JceOffscreenTarget {
     JceRenderer *renderer;
     uint16_t view_id;
 
@@ -25,7 +25,7 @@ struct JceEditorRenderBridge {
     uint32_t target_h;
 };
 
-static void bridge_destroy_target(JceEditorRenderBridge *bridge)
+static void bridge_destroy_target(JceOffscreenTarget *bridge)
 {
     if (!bridge)
         return;
@@ -39,7 +39,7 @@ static void bridge_destroy_target(JceEditorRenderBridge *bridge)
     bridge->target_h = 0;
 }
 
-static bool bridge_ensure_target(JceEditorRenderBridge *bridge,
+static bool bridge_ensure_target(JceOffscreenTarget *bridge,
                                  uint32_t width,
                                  uint32_t height)
 {
@@ -107,13 +107,13 @@ static bool bridge_ensure_target(JceEditorRenderBridge *bridge,
     return true;
 }
 
-JceEditorRenderBridge *jce_editor_render_bridge_create(JceRenderer *renderer,
+JceOffscreenTarget *jce_offscreen_target_create(JceRenderer *renderer,
                                                        uint16_t view_id)
 {
     if (!renderer)
         return NULL;
 
-    JceEditorRenderBridge *bridge = (JceEditorRenderBridge *)JCE_CALLOC(1, sizeof(*bridge));
+    JceOffscreenTarget *bridge = (JceOffscreenTarget *)JCE_CALLOC(1, sizeof(*bridge));
     if (!bridge)
         return NULL;
 
@@ -124,7 +124,7 @@ JceEditorRenderBridge *jce_editor_render_bridge_create(JceRenderer *renderer,
     return bridge;
 }
 
-void jce_editor_render_bridge_destroy(JceEditorRenderBridge *bridge)
+void jce_offscreen_target_destroy(JceOffscreenTarget *bridge)
 {
     if (!bridge)
         return;
@@ -133,7 +133,7 @@ void jce_editor_render_bridge_destroy(JceEditorRenderBridge *bridge)
     JCE_FREE(bridge);
 }
 
-bool jce_editor_render_bridge_prepare(JceEditorRenderBridge *bridge,
+bool jce_offscreen_target_prepare(JceOffscreenTarget *bridge,
                                       uint32_t width,
                                       uint32_t height,
                                       const float *view16,
@@ -163,15 +163,15 @@ bool jce_editor_render_bridge_prepare(JceEditorRenderBridge *bridge,
     return true;
 }
 
-uint16_t jce_editor_render_bridge_get_color_texture(
-    const JceEditorRenderBridge *bridge)
+uint16_t jce_offscreen_target_get_color_texture(
+    const JceOffscreenTarget *bridge)
 {
     if (!bridge || !BGFX_HANDLE_IS_VALID(bridge->target_fbo))
         return UINT16_MAX;
     return bridge->target_color.idx;
 }
 
-uint16_t jce_editor_render_bridge_get_view_id(const JceEditorRenderBridge *bridge)
+uint16_t jce_offscreen_target_get_view_id(const JceOffscreenTarget *bridge)
 {
     if (!bridge)
         return (uint16_t)JCE_VIEW_EDITOR_SCENE;

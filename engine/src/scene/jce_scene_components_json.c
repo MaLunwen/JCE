@@ -5,7 +5,7 @@
  * supplements with backwards-compat parsing on top of these primitives.
  */
 
-#include <jce/scene/jce_scene_serial.h>
+#include <jce/scene/jce_scene_components_json.h>
 #include <jce/scene/jce_scene.h>
 #include <jce/resource/jce_scene_contract.h>
 #include <jce/graphics/jce_pbr_material.h>
@@ -13,6 +13,7 @@
 #include <jce/core/jce_math.h>
 
 #include <cJSON/cJSON.h>
+#include <SDL3/SDL_filesystem.h>
 
 #include <math.h>
 #include <stdio.h>
@@ -23,8 +24,24 @@
 
 /* Base directory of the currently-loading scene file; used to resolve
  * sibling .mat.json material references (e.g. "Materials/foo.mat.json").
- * Set by jce_scene_load_file before parse, cleared after. */
+ * Set by jce_scene_serial_set_base_dir() before parse, cleared after. */
 static char s_scene_base_dir[1024] = { 0 };
+
+void jce_scene_serial_set_base_dir(const char *dir)
+{
+    if (!dir || !*dir) {
+        s_scene_base_dir[0] = '\0';
+        return;
+    }
+    size_t L = strlen(dir);
+    if (L >= sizeof(s_scene_base_dir)) L = sizeof(s_scene_base_dir) - 1;
+    memcpy(s_scene_base_dir, dir, L);
+    s_scene_base_dir[L] = '\0';
+    /* Strip trailing slash for consistent join with snprintf("%s/%s"). */
+    while (L > 0 && (s_scene_base_dir[L-1] == '/' || s_scene_base_dir[L-1] == '\\')) {
+        s_scene_base_dir[--L] = '\0';
+    }
+}
 
 static bool sse_path_is_absolute(const char *p)
 {
@@ -37,10 +54,8 @@ static bool sse_path_is_absolute(const char *p)
 static bool sse_file_exists(const char *p)
 {
     if (!p || !*p) return false;
-    FILE *f = fopen(p, "rb");
-    if (!f) return false;
-    fclose(f);
-    return true;
+    SDL_PathInfo info;
+    return SDL_GetPathInfo(p, &info) && info.type == SDL_PATHTYPE_FILE;
 }
 
 /* ── Local Euler ↔ Quaternion helpers (degrees) ───────────────────── */
@@ -1307,79 +1322,3 @@ cJSON *jce_scene_serialize_entity_components(JceScene *scene, JceEntity e)
     return arr;
 }
 
-int jce_scene_load_file(JceScene *scene, const char *path)
-{
-    if (!scene || !path) return -1;
-
-    FILE *fp = fopen(path, "rb");
-    if (!fp) {
-        LOG_WARN(LOG_TAG, "cannot open scene file: %s", path);
-        return -1;
-    }
-    fseek(fp, 0, SEEK_END);
-    long sz = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    if (sz <= 0) { fclose(fp); return -1; }
-
-    char *buf = (char *)malloc((size_t)sz + 1);
-    if (!buf) { fclose(fp); return -1; }
-
-    size_t got = fread(buf, 1, (size_t)sz, fp);
-    fclose(fp);
-    buf[got] = '\0';
-
-    cJSON *root = cJSON_Parse(buf);
-    free(buf);
-    if (!root) {
-        LOG_WARN(LOG_TAG, "JSON parse failed: %s", path);
-        return -1;
-    }
-
-    /* Capture scene file's directory so material refs can be resolved. */
-    s_scene_base_dir[0] = '\0';
-    {
-        size_t L = strlen(path);
-        if (L < sizeof(s_scene_base_dir)) {
-            memcpy(s_scene_base_dir, path, L);
-            s_scene_base_dir[L] = '\0';
-            for (long i = (long)L - 1; i >= 0; i--) {
-                if (s_scene_base_dir[i] == '/' || s_scene_base_dir[i] == '\\') {
-                    s_scene_base_dir[i] = '\0';
-                    break;
-                }
-                s_scene_base_dir[i] = '\0';
-            }
-        }
-    }
-
-    int n = jce_scene_load_json(scene, root);
-    cJSON_Delete(root);
-    s_scene_base_dir[0] = '\0';
-    return n;
-}
-
-bool jce_scene_save_file(const JceScene *scene, const char *path)
-{
-    if (!scene || !path) return false;
-
-    cJSON *root = jce_scene_save_json(scene);
-    if (!root) return false;
-
-    char *txt = cJSON_Print(root);
-    cJSON_Delete(root);
-    if (!txt) return false;
-
-    FILE *fp = fopen(path, "wb");
-    if (!fp) {
-        free(txt);
-        LOG_WARN(LOG_TAG, "cannot write scene file: %s", path);
-        return false;
-    }
-
-    size_t len = strlen(txt);
-    size_t wrote = fwrite(txt, 1, len, fp);
-    fclose(fp);
-    free(txt);
-
-    return wrote == len;
-}

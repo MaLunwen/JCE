@@ -21,7 +21,10 @@ target_link_libraries(JCE_Editor PRIVATE
 	cjson::cjson SDL3_image::SDL3_image bgfx::bgfx)
 
 target_include_directories(JCE_Editor PRIVATE
-	"${CMAKE_CURRENT_SOURCE_DIR}/src")
+	"${CMAKE_CURRENT_SOURCE_DIR}/src"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/core"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/ui"
+	"${CMAKE_CURRENT_SOURCE_DIR}/src/io")
 
 target_compile_definitions(JCE_Editor PRIVATE SDL_MAIN_USE_CALLBACKS=1)
 

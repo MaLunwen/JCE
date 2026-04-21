@@ -9,8 +9,8 @@
 
 #include "ck_app.h"
 #include <jce/api.h>
-#include <jce/scene/jce_scene_serial.h>
-#include <cJSON/cJSON.h>
+#include <jce/resource/jce_scene_serial.h>
+#include <jce/core/jce_filesystem.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -245,37 +245,18 @@ CkApp *ck_app_create(const JceServices *svc)
     }
     app->cam_ctrl = jce_camctrl_create(app->camera, NULL);
 
-    /* Create ECS scene and load entities from PAK-packed JSON.
+    /* Create ECS scene and load entities from PAK-packed JSON via VFS.
        No programmatic fallback — ck must consume scene data, not build it. */
     app->scene = jce_scene_create();
     {
-        const JcePakAsset *sa = jce_pak_find(app->svc.pak,
-                                             "scenes/main.scene.json");
-        if (!sa) {
+        JceFileSystem *fs = jce_fs_create();
+        jce_fs_mount_pak(fs, app->svc.pak);
+        if (!jce_scene_serial_load_vfs(app->scene, fs,
+                                       "scenes/main.scene.json")) {
             LOG_ERROR("ck_app",
-                      "scenes/main.scene.json not found in PAK — cannot start");
-        } else {
-            void *buf = malloc((size_t)sa->original_size + 1);
-            if (buf) {
-                size_t sz = jce_pak_decompress(sa, buf,
-                                               (size_t)sa->original_size);
-                if (sz > 0) {
-                    ((char *)buf)[sz] = '\0';
-                    cJSON *root = cJSON_Parse((const char *)buf);
-                    if (root) {
-                        int n = jce_scene_load_json(app->scene, root);
-                        cJSON_Delete(root);
-                        if (n <= 0)
-                            LOG_ERROR("ck_app",
-                                      "scenes/main.scene.json: parsed 0 entities");
-                    } else {
-                        LOG_ERROR("ck_app",
-                                  "scenes/main.scene.json: JSON parse error");
-                    }
-                }
-                free(buf);
-            }
+                      "scenes/main.scene.json failed to load from PAK");
         }
+        jce_fs_destroy(fs);
     }
 
     /* Engine scene renderer (resolves textures/models from PAK). */

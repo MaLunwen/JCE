@@ -13,7 +13,7 @@
 
 extern "C" {
 #include <jce/graphics/jce_model.h>
-#include <jce/scene/jce_scene_serial.h>
+#include <jce/scene/jce_scene_components_json.h>
 }
 
 #include <SDL3/SDL.h>

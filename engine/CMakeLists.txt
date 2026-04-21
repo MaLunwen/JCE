@@ -24,12 +24,15 @@ set(_ENGINE_INC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 function(_jce_add_layer NAME)
 	cmake_parse_arguments(ARG "CXX" "" "DIRS;LINK_PUBLIC;LINK_PRIVATE" ${ARGN})
 
-	# Collect sources from the listed directories.
+	# Collect sources from the listed directories (recursive — picks up
+	# OS-specific subdirectories like platform/macos/, platform/android/).
 	set(_srcs "")
 	foreach(_dir IN LISTS ARG_DIRS)
-		file(GLOB _dir_srcs CONFIGURE_DEPENDS
+		file(GLOB_RECURSE _dir_srcs CONFIGURE_DEPENDS
 			"${_ENGINE_SRC}/${_dir}/*.c"
 			"${_ENGINE_SRC}/${_dir}/*.cpp")
+		# Skip vendored third_party trees (e.g., libhevc has its own build).
+		list(FILTER _dir_srcs EXCLUDE REGEX "/third_party/")
 		list(APPEND _srcs ${_dir_srcs})
 	endforeach()
 
@@ -123,7 +126,7 @@ _jce_add_layer(jce_audio
 # On Apple platforms, miniaudio includes AVFoundation (Objective-C).
 if(APPLE)
 	set_source_files_properties(
-		"${_ENGINE_SRC}/audio/miniaudio_impl.c"
+		"${_ENGINE_SRC}/audio/jce_miniaudio_impl.c"
 		PROPERTIES LANGUAGE OBJC)
 	enable_language(OBJC)
 endif()
@@ -227,10 +230,7 @@ _jce_add_layer(jce_resource
 # L5 — Application orchestrator                                       #
 # ================================================================== #
 
-set(_APP_DIRS app streaming)
-if(JCE_PLATFORM_ANDROID OR JCE_BUILD_JNI)
-	list(APPEND _APP_DIRS bridge)
-endif()
+set(_APP_DIRS app)
 
 _jce_add_layer(jce_app
 	DIRS      ${_APP_DIRS}

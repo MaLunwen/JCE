@@ -1,7 +1,7 @@
 /*
  * jce_asset_loaders.h  Type-dispatch sync loaders and async finalization.
  *
- * Split from jce_asset_manager_new.c so that the manager file focuses on
+ * Split from jce_asset_manager.c so that the manager file focuses on
  * lifecycle, public API, and the frame pump, while this module owns all
  * per-type loading/finalization/destruction logic.
  */
@@ -9,7 +9,7 @@
 #ifndef JCE_ASSET_LOADERS_H
 #define JCE_ASSET_LOADERS_H
 
-#include "jce_asset_manager_new.h"
+#include "jce_asset_manager.h"
 
 #ifdef __cplusplus
 extern "C" {

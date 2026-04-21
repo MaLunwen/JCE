@@ -23,7 +23,7 @@ extern "C" {
 #include <jce/core/jce_math.h>
 #include <jce/graphics/jce_camera.h>
 #include <jce/graphics/jce_debug_draw.h>
-#include <jce/graphics/jce_editor_render_bridge.h>
+#include <jce/graphics/jce_offscreen_target.h>
 #include <jce/graphics/jce_lighting.h>
 #include <jce/graphics/jce_material.h>
 #include <jce/graphics/jce_mesh.h>
@@ -54,7 +54,7 @@ struct SceneRenderState {
     bool                    initialized;
     bool                    homogeneous_depth;
     JceRenderer            *renderer;
-    JceEditorRenderBridge  *bridge;
+    JceOffscreenTarget  *bridge;
     JceCamera              *camera;
 
     /* Engine-owned scene renderer (sky, shadows, entities, sprites, IBL). */
