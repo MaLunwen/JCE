@@ -773,6 +773,20 @@ void jce_renderer_resize(const JceRenderer *r, uint32_t w, uint32_t h)
 {
     if (!r) return;
     if (r->is_fallback) return;
+
+    /* Sanitize dimensions before handing them to bgfx:
+     *  - bgfx_reset(0, 0) leaves the backbuffer in an invalid state which
+     *    typically manifests as a permanent black screen after restoring
+     *    from a minimized window.
+     *  - Some D3D11/D3D12 drivers reject backbuffer widths that are not a
+     *    multiple of 4, falling back silently and leaving the previous
+     *    swap chain — the user sees a frozen / flickering image while the
+     *    window is dragged across DPI boundaries that produce odd pixel
+     *    widths. Round the width up so reset always succeeds. */
+    if (w < 1u) w = 1u;
+    if (h < 1u) h = 1u;
+    w = (w + 3u) & ~3u;
+
     bgfx_reset(w, h, r->reset_flags, BGFX_TEXTURE_FORMAT_COUNT);
 }
 

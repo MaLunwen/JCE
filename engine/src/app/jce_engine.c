@@ -195,6 +195,13 @@ static bool jce_resize_event_watch(void *userdata, SDL_Event *event);
 static bool SDLCALL jce_win32_msg_hook(void *userdata, MSG *msg);
 #endif
 
+/* Shared reentrancy / pause atomics for the resize watcher and the
+ * Win32 modal-loop timer.  Forward-declared here because the modal
+ * timer (defined in the SDL_PLATFORM_WINDOWS block below) references
+ * them before the watcher's definition that owns them. */
+static SDL_AtomicInt s_in_render_frame;
+static SDL_AtomicInt s_render_paused;
+
 JceEngine *jce_engine_create(int argc, char *argv[])
 {
     (void)argc; (void)argv;
@@ -524,6 +531,14 @@ static void CALLBACK jce_modal_timer_proc(HWND hwnd, UINT msg,
     JceEngine *e = g_modal_engine;
     if (!e || !e->renderer) return;
 
+    /* Cooperate with jce_resize_event_watch: only one of the two paths
+     * may be inside begin_frame/end_frame at a time, otherwise bgfx
+     * would see nested frames during a sizing/moving modal loop and
+     * the user would observe a black flash or a freeze.  Skipping a
+     * timer tick is safe — the next 16 ms tick will pick up. */
+    if (SDL_GetAtomicInt(&s_in_render_frame) != 0)
+        return;
+
     jce_engine_iterate(e);
 }
 
@@ -548,6 +563,23 @@ static bool SDLCALL jce_win32_msg_hook(void *userdata, MSG *msg)
 /* -- Live-resize event watcher ------------------------------------ */
 
 /*
+ * The shared reentrancy / pause atomics (s_in_render_frame and
+ * s_render_paused) are declared near the top of this file because the
+ * Win32 modal timer above also needs to consult them.
+ *
+ * Why they exist:
+ *  - Both the SDL event watcher and the Win32 modal timer can fire while
+ *    the OS is inside a sizing/moving modal loop, and bgfx_reset +
+ *    begin_frame/end_frame are NOT reentrant — letting them race
+ *    produces black flashes ("闪屏") or a hard freeze.  s_in_render_frame
+ *    serialises the two paths.
+ *  - s_render_paused is set when the window is minimized so we skip
+ *    rendering entirely; otherwise we'd call bgfx_reset(0, 0) and
+ *    corrupt the swap chain, which shows up as a permanent black
+ *    screen after the window is restored.
+ */
+
+/*
  * SDL_AddEventWatch callbacks fire from within the OS message pump,
  * including during modal operations.  This handles resize-specific
  * work: update window state, reset bgfx backbuffer, render one frame.
@@ -556,39 +588,71 @@ static bool jce_resize_event_watch(void *userdata, SDL_Event *event)
 {
     JceEngine *e = (JceEngine *)userdata;
 
-    if (event->type != SDL_EVENT_WINDOW_RESIZED &&
-        event->type != SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED &&
-        event->type != SDL_EVENT_WINDOW_ENTER_FULLSCREEN &&
-        event->type != SDL_EVENT_WINDOW_LEAVE_FULLSCREEN)
+    const Uint32 t = event->type;
+
+    /* Pause/resume on minimize so we don't keep resetting to a 0-sized
+     * backbuffer (which leaves bgfx in a broken state on restore). */
+    if (t == SDL_EVENT_WINDOW_MINIMIZED) {
+        SDL_SetAtomicInt(&s_render_paused, 1);
+        return true;
+    }
+    if (t == SDL_EVENT_WINDOW_RESTORED ||
+        t == SDL_EVENT_WINDOW_SHOWN) {
+        SDL_SetAtomicInt(&s_render_paused, 0);
+        /* Fall through to the size-refresh path below so we re-reset
+         * bgfx with the post-restore drawable size. */
+    }
+
+    const bool is_size_event =
+        (t == SDL_EVENT_WINDOW_RESIZED ||
+         t == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED ||
+         t == SDL_EVENT_WINDOW_ENTER_FULLSCREEN ||
+         t == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN ||
+         t == SDL_EVENT_WINDOW_DISPLAY_CHANGED ||
+         t == SDL_EVENT_WINDOW_RESTORED ||
+         t == SDL_EVENT_WINDOW_SHOWN);
+
+    /* SDL_EVENT_WINDOW_EXPOSED needs a redraw but no bgfx_reset — handle
+     * it as a "draw one frame if we can" pulse so the window doesn't
+     * stay blank when uncovered during a modal drag. */
+    const bool is_expose_event = (t == SDL_EVENT_WINDOW_EXPOSED);
+
+    if (!is_size_event && !is_expose_event)
         return true;   /* pass event through, not ours */
 
     /* Reentrancy guard: SDL can pump events from inside our own render
-     * (e.g. via SDL_SyncWindow or modal Win32 sizing). Without this guard
-     * we'd nest begin_frame/end_frame and crash bgfx. */
-    static SDL_AtomicInt s_in_resize_watch;
-    if (SDL_GetAtomicInt(&s_in_resize_watch) != 0)
+     * (e.g. via SDL_SyncWindow or modal Win32 sizing).  The same guard
+     * is shared with the Win32 modal timer below to keep them mutually
+     * exclusive. */
+    if (SDL_GetAtomicInt(&s_in_render_frame) != 0)
         return true;
-    SDL_SetAtomicInt(&s_in_resize_watch, 1);
+    if (SDL_GetAtomicInt(&s_render_paused) != 0)
+        return true;
+    SDL_SetAtomicInt(&s_in_render_frame, 1);
 
     int pw, ph;
     SDL_GetWindowSizeInPixels(jce_window_sdl(e->window), &pw, &ph);
     if (pw <= 0 || ph <= 0) {
-        SDL_SetAtomicInt(&s_in_resize_watch, 0);
+        SDL_SetAtomicInt(&s_in_render_frame, 0);
         return true;
     }
 
-    jce_window_handle_resize(e->window, (uint32_t)pw, (uint32_t)ph);
-    jce_renderer_resize(e->renderer, (uint32_t)pw, (uint32_t)ph);
+    if (is_size_event) {
+        jce_window_handle_resize(e->window, (uint32_t)pw, (uint32_t)ph);
+        jce_renderer_resize(e->renderer, (uint32_t)pw, (uint32_t)ph);
 
-    if (g_app_desc.on_resize)
-        g_app_desc.on_resize((uint32_t)pw, (uint32_t)ph,
-                             g_app_desc.user_data);
+        if (g_app_desc.on_resize)
+            g_app_desc.on_resize((uint32_t)pw, (uint32_t)ph,
+                                 g_app_desc.user_data);
+    }
 
-    /* Emit a minimal render frame so bgfx processes the reset. We deliberately
-     * do NOT call g_app_desc.update here: that would re-sample input (e.g. an
-     * F11 still being held during the OS resize) and could re-toggle
-     * fullscreen, causing an infinite resize storm ("seizure"). The next
-     * normal main-loop tick will run update with fresh input state. */
+    /* Emit a minimal render frame so bgfx processes the reset (or, for
+     * an EXPOSED pulse, so the backbuffer is repainted).  We deliberately
+     * do NOT call g_app_desc.update here: that would re-sample input
+     * (e.g. an F11 still being held during the OS resize) and could
+     * re-toggle fullscreen, causing an infinite resize storm
+     * ("seizure"). The next normal main-loop tick will run update with
+     * fresh input state. */
     if (!jce_renderer_is_fallback(e->renderer)) {
         jce_renderer_begin_frame(e->renderer, e->window);
 
@@ -598,7 +662,7 @@ static bool jce_resize_event_watch(void *userdata, SDL_Event *event)
         jce_renderer_end_frame(e->renderer);
     }
 
-    SDL_SetAtomicInt(&s_in_resize_watch, 0);
+    SDL_SetAtomicInt(&s_in_render_frame, 0);
     return true;   /* let other watchers see the event too */
 }
 
@@ -672,6 +736,25 @@ JceAppResult jce_engine_iterate(JceEngine *e)
         return JCE_APP_CONTINUE;
     }
 
+    /* Window is minimized (or its drawable size collapsed to zero).
+     * Skip the entire render pipeline: bgfx_reset(0,0) would corrupt
+     * the swap chain, and begin_frame on a zero-sized backbuffer is
+     * undefined.  Still update input so we notice when the user
+     * restores the window. */
+    if (SDL_GetAtomicInt(&s_render_paused) != 0) {
+        if (e->input) jce_input_update(e->input);
+        return JCE_APP_CONTINUE;
+    }
+
+    /* Cooperate with the resize watcher / Win32 modal timer: never enter
+     * begin_frame while one of them is mid-frame, otherwise bgfx sees
+     * nested frames and produces a black flash. */
+    if (SDL_GetAtomicInt(&s_in_render_frame) != 0) {
+        if (e->input) jce_input_update(e->input);
+        return JCE_APP_CONTINUE;
+    }
+    SDL_SetAtomicInt(&s_in_render_frame, 1);
+
     jce_renderer_begin_frame(e->renderer, e->window);
 
     /* Finalize async asset loads (GPU resource creation). */
@@ -724,6 +807,8 @@ JceAppResult jce_engine_iterate(JceEngine *e)
     }
 
     jce_renderer_end_frame(e->renderer);
+
+    SDL_SetAtomicInt(&s_in_render_frame, 0);
 
     {
         JCE_PROFILE_ZONE_N("Input::Update");
