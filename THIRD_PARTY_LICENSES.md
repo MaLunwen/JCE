@@ -312,68 +312,6 @@ https://github.com/lieff/minimp4/blob/master/LICENSE
 
 ---
 
-## Fraunhofer FDK AAC (libfdk_aac)
-
-- **Version**: 2.0.3
-- **License**: Apache-2.0 (with patent notice)
-- **URL**: https://github.com/mstorsjo/fdk-aac
-
-```
-Copyright (C) 2012-2023 Fraunhofer-Gesellschaft zur Foerderung der
-angewandten Forschung e.V. and Contributors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
-Full license and patent notices:
-https://github.com/mstorsjo/fdk-aac/blob/master/NOTICE
-```
-
----
-
-## OpenH264
-
-- **Version**: 2.6.0
-- **License**: BSD-2-Clause
-- **URL**: https://github.com/cisco/openh264
-
-```
-Copyright (c) 2013, Cisco Systems
-All rights reserved.
-
-Redistribution and use in source and binary forms, with or without modification,
-are permitted provided that the following conditions are met:
-
-* Redistributions of source code must retain the above copyright notice, this
-  list of conditions and the following disclaimer.
-
-* Redistributions in binary form must reproduce the above copyright notice, this
-  list of conditions and the following disclaimer in the documentation and/or
-  other materials provided with the distribution.
-
-THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
-ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
-WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
-ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
-(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
-LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
-ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
-SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-```
-
----
-
 ## Assimp (Open Asset Import Library)
 
 - **Version**: 6.0.2
@@ -885,30 +823,6 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ---
 
-## AOSP libhevc (Android Open Source Project)
-
-- **Version**: android-platform-15.0.0_r1 (vendored source)
-- **License**: Apache-2.0
-- **URL**: https://android.googlesource.com/platform/external/libhevc/
-
-```
-Copyright (c) 2012-2025 The Android Open Source Project
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-     http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-```
-
----
-
 ## stb_image
 
 - **Version**: 2.30 (vendored header)
@@ -961,3 +875,251 @@ AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
 ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
+
+
+------
+
+## Opus (libopus)
+
+- **Version**: 1.5.2
+- **License**: BSD-3-Clause
+- **URL**: https://github.com/xiph/opus
+
+```
+Copyright 2001-2023 Xiph.Org, Skype Limited, Octasic, Jean-Marc Valin,
+Timothy B. Terriberry, CSIRO, Gregory Maxwell, Mark Borgerding, Erik de Castro Lopo
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+- Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+
+- Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+- Neither the name of Internet Society, IETF or IETF Trust, nor the names of
+  specific contributors, may be used to endorse or promote products derived
+  from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED.
+```
+
+---
+
+## libogg
+
+- **Version**: 1.3.5
+- **License**: BSD-3-Clause
+- **URL**: https://github.com/xiph/ogg
+
+```
+Copyright (c) 2002, Xiph.org Foundation
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+- Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+- Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+- Neither the name of the Xiph.org Foundation nor the names of its contributors
+  may be used to endorse or promote products derived from this software without
+  specific prior written permission.
+```
+
+---
+
+## dav1d
+
+- **Version**: 1.5.3
+- **License**: BSD-2-Clause
+- **URL**: https://code.videolan.org/videolan/dav1d
+
+```
+Copyright (c) 2018-2024, VideoLAN and dav1d authors
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS".
+```
+
+---
+
+## libvpx
+
+- **Version**: 1.16.0
+- **License**: BSD-3-Clause (with Additional IP Rights Grant)
+- **URL**: https://github.com/webmproject/libvpx
+
+```
+Copyright (c) 2010, The WebM Project authors. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+  * Redistributions of source code must retain the above copyright notice,
+    this list of conditions and the following disclaimer.
+  * Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in the
+    documentation and/or other materials provided with the distribution.
+  * Neither the name of Google nor the WebM Project, nor the names of its
+    contributors may be used to endorse or promote products derived from
+    this software without specific prior written permission.
+
+The libvpx LICENSE is accompanied by an Additional IP Rights Grant (PATENTS
+file) granting a free patent license for VP8/VP9 use within the codec.
+```
+
+---
+
+## libwebm
+
+- **Version**: 1.0.0.31
+- **License**: BSD-3-Clause
+- **URL**: https://github.com/webmproject/libwebm
+
+```
+Copyright (c) 2010, Google Inc. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+  * Redistributions of source code must retain the above copyright notice,
+    this list of conditions and the following disclaimer.
+  * Redistributions in binary form must reproduce the above copyright notice,
+    this list of conditions and the following disclaimer in the documentation
+    and/or other materials provided with the distribution.
+  * Neither the name of Google nor the names of its contributors may be used
+    to endorse or promote products derived from this software without specific
+    prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED.
+```
+
+---
+
+# ⚠️ PATENT-ENCUMBERED CODECS (OPTIONAL, OFF BY DEFAULT)
+
+The libraries below are **only compiled when** `-DJCE_ENABLE_PATENTED_CODECS=ON`
+is passed at CMake configure time.  Even when their source licenses are permissive,
+the underlying media formats (AAC / H.264 / H.265) are covered by **third-party
+patents** that may require royalty agreements (e.g. Via Licensing, MPEG-LA, Access
+Advance) for commercial redistribution.
+
+JCE's default royalty-free build excludes all of them.  Use AV1 (dav1d), VP8/VP9
+(libvpx), Opus (libopus), and WebM (libwebm) — all listed above — for license-clean
+delivery.
+
+| Library | Format | Patent pool |
+|---|---|---|
+| Fraunhofer FDK AAC | AAC-LC / HE-AAC | Via Licensing |
+| OpenH264           | H.264 / AVC     | MPEG-LA AVC pool (Cisco pays for binary distribution only) |
+| AOSP libhevc       | H.265 / HEVC    | MPEG-LA HEVC + Access Advance + HEVC Advance |
+
+---
+## Fraunhofer FDK AAC (libfdk_aac)
+
+- **Version**: 2.0.3
+- **License**: Apache-2.0 (with patent notice)
+- **URL**: https://github.com/mstorsjo/fdk-aac
+
+```
+Copyright (C) 2012-2023 Fraunhofer-Gesellschaft zur Foerderung der
+angewandten Forschung e.V. and Contributors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+Full license and patent notices:
+https://github.com/mstorsjo/fdk-aac/blob/master/NOTICE
+```
+
+---
+
+---
+
+## OpenH264
+
+- **Version**: 2.6.0
+- **License**: BSD-2-Clause
+- **URL**: https://github.com/cisco/openh264
+
+```
+Copyright (c) 2013, Cisco Systems
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this
+  list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice, this
+  list of conditions and the following disclaimer in the documentation and/or
+  other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+---
+
+---
+
+## AOSP libhevc (Android Open Source Project)
+
+- **Version**: android-platform-15.0.0_r1 (vendored source)
+- **License**: Apache-2.0
+- **URL**: https://android.googlesource.com/platform/external/libhevc/
+
+```
+Copyright (c) 2012-2025 The Android Open Source Project
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+```
+
+---

@@ -108,20 +108,66 @@ _jce_add_layer(jce_platform
 # L3 — Independent subsystems (depend only on L0)                     #
 # ================================================================== #
 
-# AOSP libhevc decoder (Apache-2.0, static library)
-add_subdirectory(
-	"${CMAKE_CURRENT_SOURCE_DIR}/src/video/third_party/libhevc/jce_build"
-	"${CMAKE_CURRENT_BINARY_DIR}/libhevcdec")
+# Patented codec adapters (AAC / H.264 / H.265). Default OFF: ships
+# royalty-free Opus + AV1 path only. Toggle via Conan option
+# `enable_patented_codecs` (forwarded as -DJCE_ENABLE_PATENTED_CODECS)
+# or by passing -DJCE_ENABLE_PATENTED_CODECS=ON to cmake directly.
+option(JCE_ENABLE_PATENTED_CODECS
+	"Compile vendored fdk-aac / OpenH264 / libhevc adapters (AAC, H.264, H.265). \
+Patent-encumbered in many jurisdictions; you are responsible for licensing." OFF)
+
+if(JCE_ENABLE_PATENTED_CODECS)
+	message(STATUS "JCE: patented codecs ENABLED (AAC/H.264/H.265 via fdk-aac/OpenH264/libhevc)")
+
+	# AOSP libhevc decoder (Apache-2.0, static library)
+	add_subdirectory(
+		"${CMAKE_CURRENT_SOURCE_DIR}/src/video/third_party/libhevc/jce_build"
+		"${CMAKE_CURRENT_BINARY_DIR}/libhevcdec")
+
+	# Cisco openh264 decoder (BSD-2, static library — pure-C path)
+	add_subdirectory(
+		"${CMAKE_CURRENT_SOURCE_DIR}/src/video/third_party/openh264/jce_build"
+		"${CMAKE_CURRENT_BINARY_DIR}/openh264dec")
+
+	# Fraunhofer FDK-AAC decoder/encoder (vendored — see header note in
+	# the directory). Built as static lib with default options.
+	set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+	set(BUILD_PROGRAMS    OFF CACHE BOOL "" FORCE)
+	set(FDK_AAC_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+	set(FDK_AAC_INSTALL_PKGCONFIG_MODULE    OFF CACHE BOOL "" FORCE)
+	add_subdirectory(
+		"${CMAKE_CURRENT_SOURCE_DIR}/src/audio/third_party/fdk-aac"
+		"${CMAKE_CURRENT_BINARY_DIR}/fdk-aac")
+	# Suppress strict-warnings for vendored 3rd-party.
+	if(TARGET fdk-aac)
+		target_compile_options(fdk-aac PRIVATE
+			$<$<C_COMPILER_ID:MSVC>:/w>
+			$<$<NOT:$<C_COMPILER_ID:MSVC>>:-w>)
+	endif()
+else()
+	message(STATUS "JCE: patented codecs DISABLED (royalty-free path: Opus + AV1)")
+endif()
 
 _jce_add_layer(jce_video
 	DIRS      video
 	LINK_PUBLIC jce_core
-	LINK_PRIVATE FDK-AAC::fdk-aac openh264::openh264 libhevcdec)
+	LINK_PRIVATE dav1d::dav1d libvpx::libvpx webm::webm Opus::opus)
+
+if(JCE_ENABLE_PATENTED_CODECS)
+	target_link_libraries(jce_video PRIVATE fdk-aac openh264dec libhevcdec)
+	target_compile_definitions(jce_video PUBLIC JCE_ENABLE_PATENTED_CODECS=1)
+endif()
 
 _jce_add_layer(jce_audio
 	DIRS      audio
 	LINK_PUBLIC  jce_core
-	LINK_PRIVATE miniaudio::miniaudio FDK-AAC::fdk-aac jce_video)
+	LINK_PRIVATE miniaudio::miniaudio jce_video
+	            Opus::opus Ogg::ogg)
+
+if(JCE_ENABLE_PATENTED_CODECS)
+	target_link_libraries(jce_audio PRIVATE fdk-aac)
+	target_compile_definitions(jce_audio PUBLIC JCE_ENABLE_PATENTED_CODECS=1)
+endif()
 
 # On Apple platforms, miniaudio includes AVFoundation (Objective-C).
 if(APPLE)

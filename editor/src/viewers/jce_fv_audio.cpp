@@ -24,6 +24,7 @@ struct AudioState {
     float      duration;
     bool       playing;
     bool       loaded;
+    bool       load_failed;  /* sticky: don't re-attempt every frame */
 
     /* Decoded PCM for waveform rendering. */
     const int16_t *pcm_samples;
@@ -48,7 +49,8 @@ static AudioState s_audio[AUDIO_STATE_MAX];
 static AudioState *find_state(const char *path)
 {
     for (int i = 0; i < AUDIO_STATE_MAX; ++i)
-        if (s_audio[i].loaded && strcmp(s_audio[i].path, path) == 0)
+        if ((s_audio[i].loaded || s_audio[i].load_failed)
+            && strcmp(s_audio[i].path, path) == 0)
             return &s_audio[i];
     return nullptr;
 }
@@ -56,7 +58,7 @@ static AudioState *find_state(const char *path)
 static AudioState *alloc_state(void)
 {
     for (int i = 0; i < AUDIO_STATE_MAX; ++i)
-        if (!s_audio[i].loaded) return &s_audio[i];
+        if (!s_audio[i].loaded && !s_audio[i].load_failed) return &s_audio[i];
     return nullptr;
 }
 
@@ -167,7 +169,12 @@ void fv_audio_request_play(const char *path)
 static AudioState *ensure_loaded(FvTab *tab)
 {
     AudioState *st = find_state(tab->path);
-    if (st) return st;
+    if (st) {
+        /* Already attempted: return loaded state, or nullptr if it failed.
+         * Without this guard, a broken file would re-init miniaudio and
+         * spam the decode pipeline every frame, freezing the UI. */
+        return st->loaded ? st : nullptr;
+    }
 
     st = alloc_state();
     if (!st) return nullptr;
@@ -178,6 +185,7 @@ static AudioState *ensure_loaded(FvTab *tab)
     st->audio = jce_audio_create();
     if (!st->audio) {
         LOG_ERROR(LOG_TAG, "failed to create audio engine for %s", tab->path);
+        st->load_failed = true;
         return nullptr;
     }
 
@@ -192,7 +200,8 @@ static AudioState *ensure_loaded(FvTab *tab)
     if (st->sound == JCE_SOUND_INVALID) {
         LOG_ERROR(LOG_TAG, "failed to decode audio: %s", tab->path);
         jce_audio_destroy(st->audio);
-        memset(st, 0, sizeof(*st));
+        st->audio = nullptr;
+        st->load_failed = true;  /* sticky: skip retry next frame */
         return nullptr;
     }
 

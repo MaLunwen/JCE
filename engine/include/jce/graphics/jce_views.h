@@ -13,9 +13,6 @@
 /* Main 3D scene (perspective camera, depth test, lit meshes). */
 #define JCE_VIEW_MAIN_3D    0
 
-/* 2D overlay (orthographic, no depth test  sprites, text, UI). */
-#define JCE_VIEW_UI          1
-
 /* Debug overlay (bgfx debug text, profiler). */
 #define JCE_VIEW_DEBUG       2
 
@@ -37,8 +34,13 @@
  * doesn't get tone-mapped or bloomed. Targets the postfx output FBO. */
 #define JCE_VIEW_EDITOR_OVERLAY 50
 
-/* ImGui editor overlay (always last  renders on top). */
-#define JCE_VIEW_IMGUI       255
+/* ImGui editor overlay (renders before UI overlay so HUD sits on top). */
+#define JCE_VIEW_IMGUI       250
+
+/* 2D UI / RmlUi overlay (orthographic, no depth test — sprites, text,
+ * debug HUD). Placed AFTER ImGui so the engine HUD is visible on top
+ * of editor panels. */
+#define JCE_VIEW_UI          254
 
 /* no extern "C" needed — this header contains only #define macros */
 

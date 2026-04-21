@@ -125,6 +125,12 @@ static void jce_mp4_codec_from_object_type(unsigned oti, char out_codec[5])
         case MP4_OBJECT_TYPE_HEVC:
             snprintf(out_codec, 5u, "hvc1");
             break;
+        case MP4_OBJECT_TYPE_AV1:
+            snprintf(out_codec, 5u, "av01");
+            break;
+        case MP4_OBJECT_TYPE_OPUS:
+            snprintf(out_codec, 5u, "opus");
+            break;
         case 0x20:
             snprintf(out_codec, 5u, "mp4v");
             break;
@@ -423,6 +429,7 @@ static bool jce_mp4_is_audio_object_type(unsigned oti)
         case MP4_OBJECT_TYPE_AUDIO_ISO_IEC_13818_7_SSR_PROFILE:
         case 0x69: /* MPEG-2 Layer III */
         case 0x6B: /* MPEG-1 Layer III */
+        case MP4_OBJECT_TYPE_OPUS: /* Opus in MP4 */
             return true;
         default:
             break;

@@ -2,8 +2,7 @@
  * jce_editor.h  Editor overlay module (ImGui-based).
  *
  * Provides a dockable editor UI on top of the game viewport.
- * The editor is independent of game logic and can be toggled
- * with the F1 key at runtime.
+ * The editor overlay is always active in the editor build.
  *
  * All functions are C-linkage so the C99 engine can call them.
  */
@@ -47,6 +46,9 @@ void jce_editor_toggle(void);
 /* Get/set the current font size in pixels (range 12-48). */
 float jce_editor_get_font_size(void);
 bool  jce_editor_set_font_size(float size);
+
+/* Access the editor PAK archive (for panels needing baked-in resources). */
+const JcePakArchive *jce_editor_get_pak(void);
 
 #ifdef __cplusplus
 }

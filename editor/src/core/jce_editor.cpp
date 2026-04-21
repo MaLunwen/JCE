@@ -297,7 +297,6 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
     s_editor.active      = true;
     s_editor.initialized = true;
 
-    LOG_SUCCESS(LOG_TAG, "editor initialized (F1 to toggle)");
     return true;
 }
 
@@ -343,14 +342,6 @@ bool jce_editor_process_event(const SDL_Event *event)
     if (!s_editor.initialized) return false;
 
     ImGuiIO &io = ImGui::GetIO();
-
-    /* F1 toggles editor regardless of ImGui focus. */
-    if (event->type == SDL_EVENT_KEY_DOWN &&
-        event->key.scancode == SDL_SCANCODE_F1 &&
-        !event->key.repeat) {
-        jce_editor_toggle();
-        return true;
-    }
 
     if (!s_editor.active) return false;
 
@@ -505,4 +496,9 @@ bool jce_editor_set_font_size(float size)
     if (size > 48.0f) size = 48.0f;
     s_editor.font_size = size;
     return true;
+}
+
+const JcePakArchive *jce_editor_get_pak(void)
+{
+    return s_editor.pak;
 }

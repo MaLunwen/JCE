@@ -123,8 +123,28 @@ find_package(box2d        REQUIRED)
 find_package(Bullet       REQUIRED)
 find_package(enet         REQUIRED)
 find_package(protobuf     REQUIRED)
-find_package(fdk-aac      REQUIRED)
-find_package(openh264     REQUIRED)
+
+# ── Patent-free codecs (preferred path) ──────────────────────────────
+# Audio:
+#   - Opus    : RFC 6716 codec, plugged into miniaudio as a custom backend
+#   - Ogg     : container only (RFC 3533)
+#   - Vorbis  : handled internally by miniaudio (stb_vorbis), no Conan dep
+#   - FLAC    : handled internally by miniaudio (dr_flac), no Conan dep
+#   - WAV/MP3 : handled internally by miniaudio (dr_wav / dr_mp3)
+# Video:
+#   - dav1d   : AV1 decoder
+#   - libvpx  : VP8/VP9 decoder
+find_package(Opus         REQUIRED)
+find_package(Ogg          REQUIRED)
+find_package(dav1d        REQUIRED)
+find_package(libvpx       REQUIRED)
+find_package(webm         REQUIRED)
+
+# fdk-aac and openh264 are now vendored at engine/src/<layer>/third_party/
+# (added as subdirectories by engine/CMakeLists.txt). Reasons:
+#   * libfdk_aac: upstream Conan recipe blocks Android cross-builds.
+#   * openh264:   upstream meson doesn't recognise emscripten.
+# Single source of truth that works across all platforms.
 
 # Ensure protoc comes from the Conan package, not a system/conda protoc.
 # Conan sets protobuf_PACKAGE_FOLDER_RELEASE after find_package(protobuf).
@@ -360,6 +380,11 @@ set(GAME_ICON_STAGE_DIR "${CMAKE_CURRENT_BINARY_DIR}/_raw_game_icon")
 set(ENGINE_UI_DIR       "${CMAKE_CURRENT_SOURCE_DIR}/engine/ui")
 set(GAME_UI_DIR         "${CMAKE_CURRENT_SOURCE_DIR}/caged_kingdom/ui")
 
+# THIRD_PARTY_LICENSES.md is sourced from the repo root and copied
+# directly into each PAK at build time. We do NOT mirror it into the
+# source tree (no engine/resources/THIRD_PARTY_LICENSES.md).
+set(TPL_SRC_FILE "${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_LICENSES.md")
+
 file(GLOB_RECURSE ENGINE_ASSET_FILES CONFIGURE_DEPENDS "${ENGINE_RESOURCE_DIR}/*")
 file(GLOB_RECURSE GAME_ASSET_FILES   CONFIGURE_DEPENDS "${GAME_RESOURCE_DIR}/*")
 file(GLOB_RECURSE EDITOR_ASSET_FILES CONFIGURE_DEPENDS "${EDITOR_RESOURCE_DIR}/*")
@@ -400,12 +425,14 @@ if(JCE_ENABLE_ASSET_COOKING AND NOT CMAKE_CROSSCOMPILING)
 		           --preserve-names --level 0 --max-texture-size 2048
 		COMMAND    "${CMAKE_COMMAND}" -E copy
 		           "${GAME_ICON_FILE}" "${GAME_COOKED_DIR}/CK_icon.png"
+		COMMAND    "${CMAKE_COMMAND}" -E copy
+		           "${TPL_SRC_FILE}" "${GAME_COOKED_DIR}/THIRD_PARTY_LICENSES.md"
 		COMMAND    "${CMAKE_COMMAND}" -E touch "${COOK_GAME_STAMP}"
 		DEPENDS    jce_cook ${ENGINE_ASSET_FILES} ${GAME_ASSET_FILES}
 		           ${ENGINE_UI_FILES} ${GAME_UI_FILES}
 		           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES}
 		           ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES}
-		           "${GAME_ICON_FILE}"
+		           "${GAME_ICON_FILE}" "${TPL_SRC_FILE}"
 		COMMENT    "Cooking game assets (textures/audio → .jceasset)"
 		VERBATIM)
 
@@ -427,12 +454,14 @@ if(JCE_ENABLE_ASSET_COOKING AND NOT CMAKE_CROSSCOMPILING)
 		           --preserve-names --level 0 --max-texture-size 2048
 		COMMAND    "${CMAKE_COMMAND}" -E copy
 		           "${EDITOR_ICON_FILE}" "${EDITOR_COOKED_DIR}/JCE_icon.png"
+		COMMAND    "${CMAKE_COMMAND}" -E copy
+		           "${TPL_SRC_FILE}" "${EDITOR_COOKED_DIR}/THIRD_PARTY_LICENSES.md"
 		COMMAND    "${CMAKE_COMMAND}" -E touch "${COOK_EDITOR_STAMP}"
 		DEPENDS    jce_cook ${ENGINE_ASSET_FILES} ${EDITOR_ASSET_FILES}
 		           ${ENGINE_UI_FILES}
 		           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES}
 		           ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES}
-		           "${EDITOR_ICON_FILE}"
+		           "${EDITOR_ICON_FILE}" "${TPL_SRC_FILE}"
 		COMMENT    "Cooking editor assets (textures/audio → .jceasset)"
 		VERBATIM)
 
@@ -620,6 +649,8 @@ if(JCE_ENABLE_CPPCHECK)
 			--suppress=missingIncludeSystem
 			--suppress=*:*/.conan2/*
 			--suppress=*:*/third_party/*
+			-i${CMAKE_SOURCE_DIR}/engine/src/audio/third_party
+			-i${CMAKE_SOURCE_DIR}/engine/src/video/third_party
 			--file-filter=${CMAKE_SOURCE_DIR}/engine/*
 			--file-filter=${CMAKE_SOURCE_DIR}/editor/*
 			--file-filter=${CMAKE_SOURCE_DIR}/caged_kingdom/*

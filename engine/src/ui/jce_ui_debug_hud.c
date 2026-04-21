@@ -303,12 +303,11 @@ void jce_debug_hud_update(JceDebugHud *hud, const JceDebugHudData *data)
 
 void jce_debug_hud_draw(JceDebugHud *hud)
 {
-    static const float graph_max_ms = 40.0f;
+    static const float graph_max_ms = 50.0f;
     static const float ref_60fps_ms = 16.67f;
     static const float ref_30fps_ms = 33.3f;
 
     JceUIRect graph_bounds;
-    float points[JCE_HUD_MAX_GRAPH_POINTS * 2];
     int visible_count;
     float x;
     float y;
@@ -323,7 +322,7 @@ void jce_debug_hud_draw(JceDebugHud *hud)
         return;
 
     visible_count = debug_hud_visible_sample_count(hud);
-    if (visible_count < 2)
+    if (visible_count < 1)
         return;
 
     x = graph_bounds.x + 4.0f;
@@ -333,6 +332,7 @@ void jce_debug_hud_draw(JceDebugHud *hud)
     if (w < 8.0f || h < 8.0f)
         return;
 
+    /* Reference lines (60 fps yellow, 30 fps red). */
     {
         const float line_60fps = debug_hud_graph_y(y, h, ref_60fps_ms, graph_max_ms);
         const float line_30fps = debug_hud_graph_y(y, h, ref_30fps_ms, graph_max_ms);
@@ -342,6 +342,7 @@ void jce_debug_hud_draw(JceDebugHud *hud)
                              jce_rgba(255, 106, 94, 140));
     }
 
+    /* MangoHud-style polyline (thin colored line, no markers, no fill). */
     {
         const int first = (hud->frametime_history_head - visible_count
                          + hud->frametime_history_count) % hud->frametime_history_count;
@@ -349,32 +350,31 @@ void jce_debug_hud_draw(JceDebugHud *hud)
                            ? w / (float)(visible_count - 1)
                            : 0.0f;
 
-        for (int i = 0; i < visible_count; ++i) {
-            const int sample_idx = (first + i) % hud->frametime_history_count;
-            const float sample_ms = hud->frametime_history[sample_idx];
-            points[i * 2 + 0] = x + (step_x * (float)i);
-            points[i * 2 + 1] = debug_hud_graph_y(y, h, sample_ms, graph_max_ms);
+        for (int i = 0; i < visible_count - 1; ++i) {
+            const int idx0 = (first + i)     % hud->frametime_history_count;
+            const int idx1 = (first + i + 1) % hud->frametime_history_count;
+            float ms0 = hud->frametime_history[idx0];
+            float ms1 = hud->frametime_history[idx1];
+            if (ms0 < 0.0f) ms0 = 0.0f;
+            if (ms1 < 0.0f) ms1 = 0.0f;
+
+            float seg[4];
+            seg[0] = x + step_x * (float)i;
+            seg[1] = debug_hud_graph_y(y, h, ms0, graph_max_ms);
+            seg[2] = x + step_x * (float)(i + 1);
+            seg[3] = debug_hud_graph_y(y, h, ms1, graph_max_ms);
+
+            const float worst = ms0 > ms1 ? ms0 : ms1;
+            uint32_t color;
+            if (worst >= ref_30fps_ms)
+                color = jce_rgba(255, 106, 94, 240);     /* red    < 30 fps */
+            else if (worst >= ref_60fps_ms)
+                color = jce_rgba(240, 197, 66, 235);     /* yellow < 60 fps */
+            else
+                color = jce_rgba(60, 226, 85, 230);      /* green  >= 60 fps */
+
+            jce_draw_polyline(hud->renderer, seg, 2, color);
         }
-    }
-
-    jce_draw_polyline(hud->renderer, points, visible_count,
-                      jce_rgba(0, 210, 80, 230));
-
-    {
-        const float latest_ms = hud->frametime_history[
-            (hud->frametime_history_head - 1 + hud->frametime_history_count)
-            % hud->frametime_history_count
-        ];
-        uint32_t marker_color = jce_rgba(60, 226, 85, 230);
-        if (latest_ms >= ref_30fps_ms)
-            marker_color = jce_rgba(255, 106, 94, 240);
-        else if (latest_ms >= ref_60fps_ms)
-            marker_color = jce_rgba(240, 197, 66, 240);
-
-        jce_draw_filled_rect(hud->renderer,
-                             points[(visible_count - 1) * 2] - 2.0f,
-                             points[(visible_count - 1) * 2 + 1] - 2.0f,
-                             4.0f, 4.0f, marker_color);
     }
 }
 

@@ -15,6 +15,7 @@
 #include "core/jce_memory.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define LOG_TAG "ui.settings"

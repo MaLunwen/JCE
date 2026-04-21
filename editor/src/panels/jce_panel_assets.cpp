@@ -232,34 +232,57 @@ void collect_search_results(const std::string &query)
 ImVec4 asset_color_for_ext(const std::string &ext, bool is_dir)
 {
     if (is_dir) return JCE_COLOR_ASSET_FOLDER;
-    if (ext == ".c" || ext == ".cpp" || ext == ".h" || ext == ".hpp"
-        || ext == ".java" || ext == ".kt" || ext == ".lua" || ext == ".py")
+    if (ext == ".c" || ext == ".cpp" || ext == ".cc" || ext == ".cxx"
+        || ext == ".h" || ext == ".hpp" || ext == ".hxx" || ext == ".inl"
+        || ext == ".java" || ext == ".kt" || ext == ".lua" || ext == ".py"
+        || ext == ".js" || ext == ".ts" || ext == ".rs" || ext == ".go"
+        || ext == ".cs" || ext == ".swift" || ext == ".m" || ext == ".mm")
         return JCE_COLOR_ASSET_CODE;
     if (ext == ".scene") return JCE_COLOR_ASSET_SCENE;
-    if (ext == ".json" || ext == ".xml" || ext == ".ini" || ext == ".mat")
+    if (ext == ".prefab" || ext == ".asset") return JCE_COLOR_ASSET_PREFAB;
+    if (ext == ".json" || ext == ".xml" || ext == ".ini" || ext == ".yaml"
+        || ext == ".yml" || ext == ".toml" || ext == ".csv")
         return JCE_COLOR_ASSET_DATA;
+    if (ext == ".mat") return JCE_COLOR_ASSET_MATERIAL;
+    if (ext == ".vert" || ext == ".frag" || ext == ".comp" || ext == ".geom"
+        || ext == ".tesc" || ext == ".tese" || ext == ".glsl" || ext == ".hlsl"
+        || ext == ".sc" || ext == ".sh" || ext == ".bin")
+        return JCE_COLOR_ASSET_SHADER;
     if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".bmp"
-        || ext == ".tga" || ext == ".hdr")
+        || ext == ".tga" || ext == ".hdr" || ext == ".gif" || ext == ".webp"
+        || ext == ".tif" || ext == ".tiff" || ext == ".dds" || ext == ".ktx"
+        || ext == ".ktx2" || ext == ".exr" || ext == ".psd" || ext == ".svg"
+        || ext == ".ico")
         return JCE_COLOR_ASSET_IMAGE;
+    if (ext == ".wav" || ext == ".ogg" || ext == ".mp3" || ext == ".flac"
+        || ext == ".opus" || ext == ".aac" || ext == ".m4a" || ext == ".aiff"
+        || ext == ".wma" || ext == ".mid" || ext == ".midi")
+        return JCE_COLOR_ASSET_AUDIO;
+    if (ext == ".mp4" || ext == ".webm" || ext == ".mkv" || ext == ".avi"
+        || ext == ".mov" || ext == ".wmv" || ext == ".flv" || ext == ".m4v"
+        || ext == ".mpg" || ext == ".mpeg" || ext == ".ts")
+        return JCE_COLOR_ASSET_VIDEO;
+    if (ext == ".obj" || ext == ".fbx" || ext == ".gltf" || ext == ".glb"
+        || ext == ".dae" || ext == ".3ds" || ext == ".blend" || ext == ".stl"
+        || ext == ".ply")
+        return JCE_COLOR_ASSET_MODEL;
+    if (ext == ".anim" || ext == ".ozz" || ext == ".bvh")
+        return JCE_COLOR_ASSET_ANIM;
+    if (ext == ".ttf" || ext == ".otf" || ext == ".woff" || ext == ".woff2"
+        || ext == ".fnt")
+        return JCE_COLOR_ASSET_FONT;
+    if (ext == ".zip" || ext == ".7z" || ext == ".tar" || ext == ".gz"
+        || ext == ".bz2" || ext == ".xz" || ext == ".rar" || ext == ".pak")
+        return JCE_COLOR_ASSET_ARCHIVE;
+    if (ext == ".md" || ext == ".txt" || ext == ".rst" || ext == ".pdf"
+        || ext == ".doc" || ext == ".docx" || ext == ".rtf" || ext == ".log")
+        return JCE_COLOR_ASSET_DOC;
     return JCE_COLOR_ASSET_DEFAULT;
 }
 
 const char *type_label_for_entry(const FileEntry &fe)
 {
     if (fe.is_dir) return "/";
-    if (fe.ext == ".c" || fe.ext == ".cpp" || fe.ext == ".h" || fe.ext == ".hpp"
-        || fe.ext == ".java" || fe.ext == ".kt" || fe.ext == ".lua" || fe.ext == ".py")
-        return "CODE";
-    if (fe.ext == ".scene") return "SCENE";
-    if (fe.ext == ".json" || fe.ext == ".xml" || fe.ext == ".ini" || fe.ext == ".mat")
-        return "DATA";
-    if (fe.ext == ".png" || fe.ext == ".jpg" || fe.ext == ".jpeg" || fe.ext == ".bmp"
-        || fe.ext == ".tga" || fe.ext == ".hdr")
-        return "IMG";
-    if (fe.ext == ".wav" || fe.ext == ".ogg" || fe.ext == ".mp3")
-        return "SND";
-    if (fe.ext == ".obj" || fe.ext == ".fbx" || fe.ext == ".gltf" || fe.ext == ".glb")
-        return "3D";
     if (!fe.ext.empty()) return fe.ext.c_str() + 1;
     return "FILE";
 }

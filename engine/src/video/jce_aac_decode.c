@@ -1,15 +1,26 @@
 /*
  * jce_aac_decode.c  AAC-LC decoder adapter using libfdk_aac.
  *
+ * ⚠ PATENT NOTICE — see jce_m4a_decode.c. AAC is patent-encumbered.
+ * Prefer Opus (miniaudio Opus backend) for new assets.
+ *
  * Wraps the Fraunhofer FDK AAC decoder with a minimal C API.
  * Accepts one access unit at a time and outputs interleaved s16 PCM.
+ *
+ * The full implementation is gated on JCE_ENABLE_PATENTED_CODECS.
+ * When the option is OFF (default), this file provides stubs that
+ * always fail-open — the runtime gracefully degrades to "unsupported
+ * codec" instead of pulling in libfdk_aac.
  */
 
 #include "jce_aac_decode.h"
+
+#ifdef JCE_ENABLE_PATENTED_CODECS
+
 #include <jce/core/jce_log.h>
 #include "core/jce_memory.h"
 
-#include <fdk-aac/aacdecoder_lib.h>
+#include <aacdecoder_lib.h>
 #include <string.h>
 
 /* Ensure the fdk-aac build matches our expected s16 output. */
@@ -117,3 +128,29 @@ void jce_aac_decoder_close(JceAacDecoder *dec)
     if (dec->handle) aacDecoder_Close(dec->handle);
     JCE_FREE(dec);
 }
+
+#else /* !JCE_ENABLE_PATENTED_CODECS */
+
+/* Royalty-free build: stubs that fail-open. Callers fall through to
+ * "unsupported codec" status without pulling in libfdk_aac. */
+JceAacDecoder *jce_aac_decoder_open(const void *asc_config, uint32_t asc_bytes)
+{ (void)asc_config; (void)asc_bytes; return (JceAacDecoder *)0; }
+
+bool jce_aac_decode_frame(JceAacDecoder *dec,
+                          const void *aac_frame, uint32_t frame_bytes,
+                          int16_t *out_pcm, uint32_t out_capacity,
+                          uint32_t *out_samples)
+{
+    (void)dec; (void)aac_frame; (void)frame_bytes;
+    (void)out_pcm; (void)out_capacity;
+    if (out_samples) *out_samples = 0u;
+    return false;
+}
+
+uint32_t jce_aac_decoder_get_channels(const JceAacDecoder *dec) { (void)dec; return 0u; }
+uint32_t jce_aac_decoder_get_samplerate(const JceAacDecoder *dec) { (void)dec; return 0u; }
+uint32_t jce_aac_decoder_get_frame_size(const JceAacDecoder *dec) { (void)dec; return 0u; }
+
+void jce_aac_decoder_close(JceAacDecoder *dec) { (void)dec; }
+
+#endif /* JCE_ENABLE_PATENTED_CODECS */

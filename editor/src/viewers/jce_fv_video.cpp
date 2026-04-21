@@ -55,7 +55,7 @@ struct VideoState {
     bool        audio_available;
 };
 
-#define VIDEO_STATE_MAX 8
+#define VIDEO_STATE_MAX 32
 static VideoState s_video[VIDEO_STATE_MAX];
 
 static VideoState *find_state(const char *path)
@@ -572,13 +572,25 @@ void fv_render_video(FvTab *tab)
                     ImVec2(origin.x + avail.x, origin.y + avail.y),
                     IM_COL32(60, 60, 80, 255));
 
-        const char *msg = has_video
-            ? (st->info.metadata_only
-                ? "MP4 parsed, but runtime decoder backend is unavailable."
-                : "Decoding...")
-            : (st->load_failed
-                ? st->fail_reason
-                : "No frame available");
+        const char *msg = "Decoding...";
+        char patent_msg[192];
+        if (has_video) {
+            if (st->info.metadata_only) {
+                const char *vc = st->info.video_codec;
+                bool is_h264  = (strcmp(vc, "avc1") == 0 || strcmp(vc, "avc3") == 0);
+                bool is_h265  = (strcmp(vc, "hvc1") == 0 || strcmp(vc, "hev1") == 0);
+                if (is_h264 || is_h265) {
+                    snprintf(patent_msg, sizeof(patent_msg),
+                        "%s is patent-encumbered and disabled in this build.\n",
+                        is_h264 ? "H.264 / AVC" : "H.265 / HEVC");
+                    msg = patent_msg;
+                } else {
+                    msg = "Container parsed, but runtime decoder backend is unavailable.";
+                }
+            }
+        } else {
+            msg = st->load_failed ? st->fail_reason : "No frame available";
+        }
         ImVec2 tsz = ImGui::CalcTextSize(msg);
         dl->AddText(ImVec2(origin.x + (avail.x - tsz.x) * 0.5f,
                            origin.y + (avail.y - tsz.y) * 0.5f),

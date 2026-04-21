@@ -1,16 +1,30 @@
 /*
  * jce_m4a_decode.c  Decode M4A (AAC-in-MP4) audio files to PCM.
  *
+ * ┌─────────────────────────────────────────────────────────────┐
+ * │ ⚠ PATENT NOTICE — AAC (MPEG-4 Audio)                        │
+ * │ AAC is covered by patents in the Via Licensing AAC pool.    │
+ * │ Distributing binaries that decode/encode AAC may require    │
+ * │ patent licenses in many jurisdictions.                      │
+ * │                                                             │
+ * │ Prefer the royalty-free Opus path (miniaudio Opus backend) │
+ * │ for NEW assets. This loader is retained ONLY to import legacy │
+ * │ M4A/AAC content and SHOULD NOT be the default cooker output. │
+ * └─────────────────────────────────────────────────────────────┘
+ *
  * Detects MP4/M4A containers via the ftyp box, parses with minimp4,
  * extracts AAC audio frames, and decodes to s16 PCM using FDK-AAC.
  */
 
 #include <jce/audio/jce_m4a_decode.h>
+
+#ifdef JCE_ENABLE_PATENTED_CODECS
+
 #include <jce/video/jce_mp4_parser.h>
 #include <jce/core/jce_log.h>
 #include "core/jce_memory.h"
 
-#include <fdk-aac/aacdecoder_lib.h>
+#include <aacdecoder_lib.h>
 #include <string.h>
 
 /* Ensure the fdk-aac build matches our expected s16 output. */
@@ -201,3 +215,32 @@ bool jce_m4a_decode_to_pcm(const void *data, size_t size,
                 actual_frames, actual_sr, actual_ch);
     return true;
 }
+
+#else /* !JCE_ENABLE_PATENTED_CODECS */
+
+#include <string.h>
+
+bool jce_m4a_is_mp4_container(const void *data, size_t size)
+{
+    /* Cheap byte sniff stays available even without fdk-aac, so callers
+     * can keep their detection logic — they just won't decode. */
+    const unsigned char *p = (const unsigned char *)data;
+    if (!p || size < 12u) return false;
+    return p[4] == 'f' && p[5] == 't' && p[6] == 'y' && p[7] == 'p';
+}
+
+bool jce_m4a_decode_to_pcm(const void *data, size_t size,
+                            int16_t **out_pcm,
+                            uint32_t *out_frames,
+                            uint32_t *out_channels,
+                            uint32_t *out_samplerate)
+{
+    (void)data; (void)size;
+    if (out_pcm)        *out_pcm        = (int16_t *)0;
+    if (out_frames)     *out_frames     = 0u;
+    if (out_channels)   *out_channels   = 0u;
+    if (out_samplerate) *out_samplerate = 0u;
+    return false;
+}
+
+#endif /* JCE_ENABLE_PATENTED_CODECS */

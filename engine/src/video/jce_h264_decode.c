@@ -1,6 +1,20 @@
 /*
  * jce_h264_decode.c  OpenH264-backed H.264 decoder.
  *
+ * ┌─────────────────────────────────────────────────────────────┐
+ * │ ⚠ PATENT NOTICE — H.264 / AVC                               │
+ * │ H.264 is covered by patents in the MPEG-LA AVC pool.        │
+ * │ Cisco's OpenH264 includes a binary distribution where Cisco │
+ * │ pays royalties on behalf of the user, but only when shipped │
+ * │ as the official Cisco binary. Re-compiled OpenH264 (which   │
+ * │ is what we link statically here) DOES NOT inherit that      │
+ * │ coverage and may require licenses for distribution.         │
+ * │                                                             │
+ * │ Prefer the royalty-free AV1 path (jce_av1_decode.h) for     │
+ * │ NEW assets. This loader is retained ONLY to import legacy   │
+ * │ H.264 content and SHOULD NOT be the default cooker output.  │
+ * └─────────────────────────────────────────────────────────────┘
+ *
  * - Parses the avcC box to extract SPS/PPS NAL units.
  * - Converts AVCC-formatted samples to Annex B on the fly.
  * - Feeds Annex B NALs to OpenH264 ISVCDecoder.
@@ -8,6 +22,9 @@
  */
 
 #include "jce_h264_decode.h"
+
+#ifdef JCE_ENABLE_PATENTED_CODECS
+
 #include "core/jce_memory.h"
 #include <jce/core/jce_log.h>
 
@@ -447,3 +464,36 @@ void jce_h264_decoder_close(JceH264Decoder *dec)
     JCE_FREE(dec->pending_rgba);
     JCE_FREE(dec);
 }
+
+#else /* !JCE_ENABLE_PATENTED_CODECS */
+
+JceH264Decoder *jce_h264_decoder_open(const void *avcc, uint32_t avcc_bytes)
+{ (void)avcc; (void)avcc_bytes; return (JceH264Decoder *)0; }
+
+bool jce_h264_decode_frame(JceH264Decoder *dec, const void *avcc_sample,
+                           uint32_t sample_bytes, uint8_t nal_length_size,
+                           const uint8_t **out_rgba,
+                           uint32_t *out_width, uint32_t *out_height)
+{
+    (void)dec; (void)avcc_sample; (void)sample_bytes; (void)nal_length_size;
+    if (out_rgba)   *out_rgba   = (const uint8_t *)0;
+    if (out_width)  *out_width  = 0u;
+    if (out_height) *out_height = 0u;
+    return false;
+}
+
+bool jce_h264_decoder_drain_pending(JceH264Decoder *dec,
+                                     const uint8_t **out_rgba,
+                                     uint32_t *out_width, uint32_t *out_height)
+{
+    (void)dec;
+    if (out_rgba)   *out_rgba   = (const uint8_t *)0;
+    if (out_width)  *out_width  = 0u;
+    if (out_height) *out_height = 0u;
+    return false;
+}
+
+void jce_h264_decoder_flush(JceH264Decoder *dec) { (void)dec; }
+void jce_h264_decoder_close(JceH264Decoder *dec) { (void)dec; }
+
+#endif /* JCE_ENABLE_PATENTED_CODECS */

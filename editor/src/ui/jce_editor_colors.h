@@ -87,12 +87,22 @@
 
 /* ── Asset Browser (matches Java reference renderFileItem colors) ──── */
 
-#define JCE_COLOR_ASSET_FOLDER     ImVec4(0.95f, 0.75f, 0.20f, 1.0f)  /* gold  */
+#define JCE_COLOR_ASSET_FOLDER     ImVec4(0.95f, 0.75f, 0.20f, 1.0f)  /* gold   */
 #define JCE_COLOR_ASSET_CODE       ImVec4(0.90f, 0.40f, 0.20f, 1.0f)  /* orange */
 #define JCE_COLOR_ASSET_SCENE      ImVec4(0.60f, 0.20f, 0.80f, 1.0f)  /* purple */
 #define JCE_COLOR_ASSET_DATA       ImVec4(0.20f, 0.60f, 0.20f, 1.0f)  /* green  */
 #define JCE_COLOR_ASSET_IMAGE      ImVec4(0.20f, 0.50f, 0.90f, 1.0f)  /* blue   */
-#define JCE_COLOR_ASSET_DEFAULT    ImVec4(0.50f, 0.50f, 0.50f, 1.0f)  /* gray   */
+#define JCE_COLOR_ASSET_AUDIO      ImVec4(0.85f, 0.30f, 0.65f, 1.0f)  /* magenta */
+#define JCE_COLOR_ASSET_VIDEO      ImVec4(0.70f, 0.15f, 0.30f, 1.0f)  /* crimson */
+#define JCE_COLOR_ASSET_MODEL      ImVec4(0.20f, 0.65f, 0.60f, 1.0f)  /* teal   */
+#define JCE_COLOR_ASSET_SHADER     ImVec4(0.80f, 0.70f, 0.20f, 1.0f)  /* mustard */
+#define JCE_COLOR_ASSET_MATERIAL   ImVec4(0.40f, 0.70f, 0.25f, 1.0f)  /* olive  */
+#define JCE_COLOR_ASSET_FONT       ImVec4(0.55f, 0.50f, 0.80f, 1.0f)  /* indigo */
+#define JCE_COLOR_ASSET_ARCHIVE    ImVec4(0.55f, 0.40f, 0.20f, 1.0f)  /* brown  */
+#define JCE_COLOR_ASSET_DOC        ImVec4(0.40f, 0.65f, 0.85f, 1.0f)  /* steel  */
+#define JCE_COLOR_ASSET_ANIM       ImVec4(0.85f, 0.50f, 0.20f, 1.0f)  /* rust   */
+#define JCE_COLOR_ASSET_PREFAB     ImVec4(0.20f, 0.70f, 0.50f, 1.0f)  /* jade   */
+#define JCE_COLOR_ASSET_DEFAULT    ImVec4(0.55f, 0.55f, 0.55f, 1.0f)  /* gray   */
 
 /* ── Inspector ─────────────────────────────────────────────────────── */
 

@@ -14,6 +14,7 @@
 #include "jce_editor_style.h"
 #include "jce_editor_config.h"
 #include "jce_editor.h"
+#include "jce_editor_alloc.h"
 #include "viewers/jce_file_viewer.h"
 
 #include <imgui.h>
@@ -700,9 +701,85 @@ void jce_editor_panel_preferences(void)
  *  ABOUT DIALOG (modal)
  * ══════════════════════════════════════════════════════════════════════ */
 
+/* Lazy-loaded license text, sourced from the editor PAK
+ * (engine/resources/THIRD_PARTY_LICENSES.md, baked at build time). */
+static char  *s_tpl_text = NULL;
+static size_t s_tpl_len  = 0;
+
+static void load_tpl_once(void)
+{
+    if (s_tpl_text) return;
+
+    const JcePakArchive *pak = jce_editor_get_pak();
+    if (pak) {
+        const JcePakAsset *asset = jce_pak_find(pak, "THIRD_PARTY_LICENSES.md");
+        if (asset && asset->original_size > 0) {
+            size_t sz = (size_t)asset->original_size;
+            s_tpl_text = (char *)ED_MALLOC(sz + 1);
+            if (s_tpl_text) {
+                size_t got = jce_pak_decompress(asset, s_tpl_text, sz);
+                if (got == 0) got = sz;
+                s_tpl_text[got] = '\0';
+                s_tpl_len = got;
+                return;
+            }
+        }
+    }
+
+    static const char fallback[] =
+        "THIRD_PARTY_LICENSES.md not packaged into editor PAK.";
+    s_tpl_text = (char *)ED_MALLOC(sizeof(fallback));
+    if (s_tpl_text) {
+        memcpy(s_tpl_text, fallback, sizeof(fallback));
+        s_tpl_len = sizeof(fallback) - 1;
+    }
+}
+
+static void render_third_party_popup(bool *p_open)
+{
+    const char *popup_id = "###ThirdPartyDialog";
+    if (*p_open && !ImGui::IsPopupOpen(popup_id))
+        ImGui::OpenPopup(popup_id);
+
+    char title[256];
+    snprintf(title, sizeof(title), "%s%s",
+             jce_editor_i18n("about.thirdPartyTitle"), popup_id);
+
+    const ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(820, 640), ImGuiCond_Appearing);
+    ImGui::SetNextWindowViewport(vp->ID);
+
+    if (!ImGui::BeginPopupModal(title, p_open,
+                  ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoDocking)) {
+        return;
+    }
+
+    load_tpl_once();
+    ImGui::BeginChild("##tpl_scroll",
+                      ImVec2(0, -ImGui::GetFrameHeightWithSpacing()),
+                      true, ImGuiWindowFlags_HorizontalScrollbar);
+    if (s_tpl_text)
+        ImGui::TextUnformatted(s_tpl_text, s_tpl_text + s_tpl_len);
+    ImGui::EndChild();
+
+    if (ImGui::Button(jce_editor_i18n("dialog.close"), ImVec2(100, 0))
+        || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        *p_open = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
 void jce_editor_about_dialog(bool *p_open)
 {
-    if (!p_open) return;
+    static bool s_show_tpl = false;
+
+    if (!p_open) {
+        /* Allow standalone tpl popup to keep working even if about closed. */
+        if (s_show_tpl) render_third_party_popup(&s_show_tpl);
+        return;
+    }
 
     const char *popup_id = "###AboutDialog";
     if (*p_open && !ImGui::IsPopupOpen(popup_id)) {
@@ -715,31 +792,38 @@ void jce_editor_about_dialog(bool *p_open)
 
     const ImGuiViewport *vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(420, 360), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(ImVec2(640, 480), ImGuiCond_Appearing);
     ImGui::SetNextWindowViewport(vp->ID);
 
     if (!ImGui::BeginPopupModal(_title, p_open,
                       ImGuiWindowFlags_NoCollapse
-                    | ImGuiWindowFlags_NoDocking
-                    | ImGuiWindowFlags_NoResize)) {
+                    | ImGuiWindowFlags_NoDocking)) {
+        if (s_show_tpl) render_third_party_popup(&s_show_tpl);
         return;
     }
 
-    ImGui::Text("%s: 0.3.0 (Editor Preview)", jce_editor_i18n("about.versionLabel"));
+    ImGui::Text("%s: 0.6.0 (Editor Preview)", jce_editor_i18n("about.versionLabel"));
     ImGui::Text("%s: %s %s", jce_editor_i18n("about.buildLabel"), __DATE__, __TIME__);
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
     ImGui::TextWrapped("%s", jce_editor_i18n("about.description"));
     ImGui::Spacing();
-    ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s",
-        jce_editor_i18n("about.platforms"));
+    ImGui::TextWrapped("%s", jce_editor_i18n("about.platforms"));
+    ImGui::PushStyleColor(ImGuiCol_Text, JCE_COLOR_TEXT_SECONDARY);
     ImGui::Spacing();
-    ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s", jce_editor_i18n("about.copyright"));
+    ImGui::TextWrapped("%s", jce_editor_i18n("about.copyright"));
+    ImGui::PopStyleColor();
 
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
+    if (ImGui::Button(jce_editor_i18n("about.thirdParty"), ImVec2(180, 0))) {
+        s_show_tpl = true;
+        *p_open = false;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("dialog.close"), ImVec2(100, 0))
         || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
         *p_open = false;
@@ -747,4 +831,6 @@ void jce_editor_about_dialog(bool *p_open)
     }
 
     ImGui::EndPopup();
+
+    if (s_show_tpl) render_third_party_popup(&s_show_tpl);
 }

@@ -21,9 +21,20 @@ class JCEConan(ConanFile):
     # ── Options ──────────────────────────────────────────────────────
     options = {
         "jce_jni": [True, False],
+        # Patent-encumbered codecs (AAC / H.264 / H.265).
+        # The vendored sources at engine/src/{audio,video}/third_party/
+        # are always compiled (the editor needs them to import legacy
+        # assets), so this option is currently informational — see
+        # plan E5 follow-up to fully gate them out of the runtime.
+        # When you ship binaries, consider:
+        #   - jurisdictions where these patents are enforced
+        #   - whether you have the required licenses
+        # Default OFF for safety; the royalty-free path is Opus + AV1.
+        "enable_patented_codecs": [True, False],
     }
     default_options = {
         "jce_jni": False,
+        "enable_patented_codecs": False,
         "bgfx/*:tools": True,
     }
 
@@ -57,9 +68,13 @@ class JCEConan(ConanFile):
         self.requires("cglm/0.9.1")
 
         self.requires("miniaudio/0.11.22")
-        self.requires("libfdk_aac/2.0.3")
-        self.requires("openh264/2.6.0")
+        self.requires("opus/1.5.2")
+        self.requires("ogg/1.3.5")
 
+        self.requires("dav1d/1.5.3")
+        self.requires("libvpx/1.16.0")
+        self.requires("libwebm/1.0.0.31")
+        
         self.requires("imgui/1.92.6-docking")
         self.requires("flecs/4.1.1")
         self.requires("cjson/1.7.19")
@@ -113,4 +128,5 @@ class JCEConan(ConanFile):
         # Forward Conan options to CMake so the build system can react.
         # Always set both True/False to override any stale CMake cache values.
         tc.variables["JCE_BUILD_JNI"] = bool(self.options.jce_jni)
+        tc.variables["JCE_ENABLE_PATENTED_CODECS"] = bool(self.options.enable_patented_codecs)
         tc.generate()

@@ -5,119 +5,135 @@ body {
     height: 100%;
     margin: 0;
     font-family: "FOT-MatisseElegantoPro-EB";
-    font-size: 16dp;
-    color: #f4f1eb;
+    font-size: 14dp;
+    color: #f0f0f0;
 }
 
 #hud-panel {
     position: absolute;
-    left: 12dp;
-    top: 12dp;
-    width: 444dp;
-    padding: 12dp 16dp 12dp 16dp;
-    background-color: #050505b8;
-    border-radius: 12dp;
+    left: 8dp;
+    top: 8dp;
+    width: 360dp;
+    max-width: 96%;
+    padding: 6dp 8dp 6dp 8dp;
+    background-color: #00000099;
+    border-radius: 4dp;
 }
 
 .stat-row {
     width: 100%;
-    padding: 1dp 0 2dp 0;
+    padding: 0;
+    white-space: nowrap;
+    overflow: hidden;
 }
 
 .label {
     display: inline-block;
-    width: 80dp;
-    font-size: 24dp;
-    letter-spacing: 0.4dp;
+    width: 110dp;
+    font-size: 14dp;
+    white-space: nowrap;
 }
 
 .value {
     display: inline-block;
-    width: 332dp;
-    font-size: 24dp;
-    color: #f6f5f1;
+    width: 234dp;
+    font-size: 14dp;
+    color: #f0f0f0;
+    text-align: right;
+    white-space: nowrap;
+    overflow: hidden;
 }
 
 .detail {
     width: 100%;
-    padding: 0 0 8dp 80dp;
-    font-size: 14dp;
-    color: #e06e60;
+    padding: 0 0 4dp 0;
+    font-size: 12dp;
+    color: #aaaaaa;
+    text-align: right;
+    white-space: nowrap;
+    overflow: hidden;
 }
 
-.gpu  { color: #47c76a; }
-.cpu  { color: #4da8f0; }
-.vram { color: #9f74ff; }
-.ram  { color: #d46ab8; }
-.api  { color: #ff7565; }
+.gpu  { color: #2ecc71; }
+.cpu  { color: #3498db; }
+.vram { color: #9b59b6; }
+.ram  { color: #e91e63; }
+.api  { color: #e74c3c; }
 
 #perf-row {
     width: 100%;
-    margin-top: 8dp;
+    margin-top: 4dp;
+    white-space: nowrap;
 }
 
 #fps {
     display: inline-block;
-    width: 182dp;
-    font-size: 24dp;
-    color: #f6f5f1;
+    width: 110dp;
+    font-size: 18dp;
+    color: #f39c12;
+    white-space: nowrap;
 }
 
 #frametime {
     display: inline-block;
-    width: 210dp;
-    font-size: 24dp;
+    width: 234dp;
+    font-size: 18dp;
     text-align: right;
-    color: #f6f5f1;
+    color: #f0f0f0;
+    white-space: nowrap;
 }
 
 #frametime-row {
     width: 100%;
-    margin-top: 10dp;
+    margin-top: 2dp;
+    white-space: nowrap;
 }
 
 #frametime-label {
     display: inline-block;
-    width: 182dp;
-    font-size: 18dp;
-    color: #ff7565;
+    width: 110dp;
+    font-size: 12dp;
+    color: #f39c12;
+    white-space: nowrap;
 }
 
 #frametime-ms {
     display: inline-block;
-    width: 210dp;
-    font-size: 18dp;
+    width: 234dp;
+    font-size: 12dp;
     text-align: right;
-    color: #f6f5f1;
+    color: #f0f0f0;
+    white-space: nowrap;
 }
 
 #frametime-graph {
     display: block;
-    width: 412dp;
-    height: 80dp;
-    margin-top: 4dp;
-    background-color: #0a0c0fdd;
+    width: 344dp;
+    height: 50dp;
+    margin-top: 3dp;
+    background-color: #00000088;
     border-width: 1dp;
     border-color: #ffffff18;
-    border-radius: 4dp;
 }
 
 #extra-status {
     width: 100%;
-    margin-top: 8dp;
-    font-size: 14dp;
-    color: #f0c542;
+    margin-top: 4dp;
+    font-size: 12dp;
+    color: #f1c40f;
+    white-space: nowrap;
+    overflow: hidden;
 }
 
 #shortcut-hints {
     position: absolute;
-    left: 12dp;
-    bottom: 12dp;
-    font-size: 14dp;
+    left: 8dp;
+    bottom: 8dp;
+    font-size: 12dp;
     color: #cfc8ba;
-    background-color: #05050588;
-    padding: 6dp 10dp;
-    border-radius: 8dp;
+    background-color: #00000088;
+    padding: 4dp 8dp;
+    border-radius: 4dp;
 }
 </style></head>
 <body>

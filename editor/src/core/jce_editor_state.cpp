@@ -472,6 +472,28 @@ uint32_t jce_state_create_entity(const char *name, uint32_t parent_id)
 	return id;
 }
 
+/* Recursively scrub editor-side bookkeeping (sidecar / order / selection)
+ * for `id` and all its descendants. The actual ECS deletion is performed
+ * once at the end by the public `jce_state_delete_entity` — flecs cascades
+ * the ChildOf relationship automatically. Doing per-node ecs_delete during
+ * recursion would race with that cascade and corrupt flecs's tables (the
+ * symptom is an AV inside ecs_has the next time we touch a freed id). */
+static void scrub_editor_state_recursive(uint32_t id)
+{
+	if (id == 0 || !s.scene) return;
+	if (!jce_state_entity_exists(id)) return;
+
+	JceEntity children[JCE_MAX_CHILDREN];
+	int cn = jce_scene_get_children(s.scene, (JceEntity)id,
+	                                children, JCE_MAX_CHILDREN);
+	for (int i = cn - 1; i >= 0; --i)
+		scrub_editor_state_recursive((uint32_t)children[i]);
+
+	jce_state_deselect_entity(id);
+	erase_from_order(id);
+	g_entity_sidecar.erase(id);
+}
+
 void jce_state_delete_entity(uint32_t id)
 {
 	HistoryEditScope edit_scope;
@@ -479,16 +501,9 @@ void jce_state_delete_entity(uint32_t id)
 	if (!s.scene || id == 0) return;
 	if (!jce_state_entity_exists(id)) return;
 
-	/* Recursively delete children first (snapshot list since it mutates). */
-	JceEntity children[JCE_MAX_CHILDREN];
-	int cn = jce_scene_get_children(s.scene, (JceEntity)id, children, JCE_MAX_CHILDREN);
-	for (int i = cn - 1; i >= 0; --i)
-		jce_state_delete_entity((uint32_t)children[i]);
+	scrub_editor_state_recursive(id);
 
-	jce_state_deselect_entity(id);
-	erase_from_order(id);
-	g_entity_sidecar.erase(id);
-
+	/* Single ecs_delete at the root — flecs cascades to ChildOf descendants. */
 	jce_scene_destroy_entity(s.scene, (JceEntity)id);
 }
 

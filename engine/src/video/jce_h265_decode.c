@@ -1,15 +1,35 @@
 /*
  * jce_h265_decode.c  AOSP libhevc-backed H.265/HEVC decoder.
  *
+ * ┌─────────────────────────────────────────────────────────────┐
+ * │ ⚠ PATENT NOTICE — H.265 / HEVC                              │
+ * │ HEVC is covered by patents in three separate pools:         │
+ * │   - MPEG-LA HEVC                                            │
+ * │   - HEVC Advance / Access Advance                           │
+ * │   - Velos Media                                             │
+ * │ Distributing binaries that decode HEVC may require licenses │
+ * │ from any/all of these pools depending on jurisdiction.      │
+ * │                                                             │
+ * │ The libhevc source is Apache-2.0 (no source-code royalty),  │
+ * │ but the patent claims attach to the *resulting binary*,     │
+ * │ not the source. Apache-2.0 explicitly does NOT grant patent │
+ * │ licenses for third-party patents.                           │
+ * │                                                             │
+ * │ Prefer the royalty-free AV1 path (jce_av1_decode.h) for     │
+ * │ NEW assets. This loader is retained ONLY to import legacy   │
+ * │ HEVC content and SHOULD NOT be the default cooker output.   │
+ * └─────────────────────────────────────────────────────────────┘
+ *
  * - Parses the hvcC box to extract VPS/SPS/PPS NAL units.
  * - Converts HVCC-formatted samples to Annex B on the fly.
  * - Feeds Annex B NALs to the AOSP HEVC decoder (IVD API).
  * - Converts YUV420P output to packed RGBA8.
- *
- * AOSP libhevc is Apache-2.0 licensed — safe for static linking.
  */
 
 #include "jce_h265_decode.h"
+
+#ifdef JCE_ENABLE_PATENTED_CODECS
+
 #include "jce_yuv_convert.h"
 #include "core/jce_memory.h"
 #include <jce/core/jce_log.h>
@@ -595,3 +615,25 @@ void jce_h265_decoder_close(JceH265Decoder *dec)
     JCE_FREE(dec->out_y);  /* out_u and out_v are offsets into this block */
     JCE_FREE(dec);
 }
+
+#else /* !JCE_ENABLE_PATENTED_CODECS */
+
+JceH265Decoder *jce_h265_decoder_open(const void *hvcc, uint32_t hvcc_bytes)
+{ (void)hvcc; (void)hvcc_bytes; return (JceH265Decoder *)0; }
+
+bool jce_h265_decode_frame(JceH265Decoder *dec, const void *hvcc_sample,
+                           uint32_t sample_bytes, uint8_t nal_length_size,
+                           const uint8_t **out_rgba,
+                           uint32_t *out_width, uint32_t *out_height)
+{
+    (void)dec; (void)hvcc_sample; (void)sample_bytes; (void)nal_length_size;
+    if (out_rgba)   *out_rgba   = (const uint8_t *)0;
+    if (out_width)  *out_width  = 0u;
+    if (out_height) *out_height = 0u;
+    return false;
+}
+
+void jce_h265_decoder_flush(JceH265Decoder *dec) { (void)dec; }
+void jce_h265_decoder_close(JceH265Decoder *dec) { (void)dec; }
+
+#endif /* JCE_ENABLE_PATENTED_CODECS */

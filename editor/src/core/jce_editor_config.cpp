@@ -34,7 +34,7 @@ extern "C" {
 void jce_editor_config_defaults(JceEditorConfig *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     strncpy(cfg->language, "en", sizeof(cfg->language) - 1);
-    cfg->font_size = 14;
+    cfg->font_size = 24;
     strncpy(cfg->theme, "Dark", sizeof(cfg->theme) - 1);
     strncpy(cfg->renderer, "OpenGL", sizeof(cfg->renderer) - 1);
     cfg->last_project[0] = '\0';

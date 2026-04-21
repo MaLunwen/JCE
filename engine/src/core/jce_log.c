@@ -23,6 +23,7 @@
 #include <SDL3/SDL.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifdef SDL_PLATFORM_WINDOWS

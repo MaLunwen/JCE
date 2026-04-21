@@ -1367,8 +1367,13 @@ void jce_editor_inspector_delete_dialog(void)
             ids[i] = s_insp.delete_entity_ids[i];
 
         if (n > 1) jce_state_begin_batch_edit();
-        for (int i = 0; i < n; i++)
+        for (int i = 0; i < n; i++) {
+            /* Skip ids that were already cascade-deleted by a prior
+             * iteration (when a parent in the selection took its
+             * descendants with it via flecs ChildOf cascade). */
+            if (!jce_state_entity_exists(ids[i])) continue;
             jce_state_delete_entity(ids[i]);
+        }
         if (n > 1) jce_state_end_batch_edit();
 
         keep_open = false;

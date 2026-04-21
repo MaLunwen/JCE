@@ -18,6 +18,7 @@
 #include <xxhash.h>
 
 #include <string.h>
+#include <stdlib.h>
 #include <stdio.h>
 
 #ifndef JCE_NO_AUDIO
@@ -528,8 +529,11 @@ int jce_cook_detect_type(const char *path)
 	/* Audio extensions. */
 	if (SDL_strcasecmp(dot, "wav") == 0 ||
 	    SDL_strcasecmp(dot, "ogg") == 0 ||
+	    SDL_strcasecmp(dot, "opus") == 0 ||   /* royalty-free (preferred) */
 	    SDL_strcasecmp(dot, "flac") == 0 ||
-	    SDL_strcasecmp(dot, "mp3") == 0)
+	    SDL_strcasecmp(dot, "mp3") == 0 ||
+	    SDL_strcasecmp(dot, "m4a") == 0 ||    /* legacy AAC-in-MP4 */
+	    SDL_strcasecmp(dot, "aac") == 0)      /* legacy raw AAC */
 		return JCEASSET_TYPE_SOUND;
 
 	/* Mesh/model extensions. */

@@ -26,6 +26,7 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #ifndef JCE_NO_AUDIO
 #include <miniaudio.h>

@@ -1,6 +1,7 @@
 
 .*
 !.gitattributes
+third_party/
 _*
 
 build/

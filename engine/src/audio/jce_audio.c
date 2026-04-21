@@ -8,6 +8,7 @@
 
 #include <jce/audio/jce_audio.h>
 #include <jce/audio/jce_m4a_decode.h>
+#include <jce/audio/jce_miniaudio_opus_backend.h>
 #include <jce/core/pak_loader.h>
 #include <jce/resource/jce_asset_format.h>
 #include <jce/core/jce_log.h>
@@ -20,6 +21,7 @@
 #include "core/jce_memory.h"
 #include "resource/jce_asset_reader.h"
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 #define JCE_MAX_SOUNDS  64
@@ -154,11 +156,32 @@ static JceSound load_from_memory(JceAudio *audio, int slot,
         ma_format_s16, 0 /* auto channels */, 0 /* auto sample rate */);
     ma_decoder decoder;
 
+    /* Wire our Opus custom backend so .opus / Ogg-Opus is handled
+       transparently (miniaudio probes custom backends before
+       built-ins, so an Ogg page carrying OpusHead routes here). */
+    static const ma_decoding_backend_vtable *jce_custom_backends[] = {
+        &g_jce_ma_opus_backend_vtable,
+    };
+    cfg.ppCustomBackendVTables = (ma_decoding_backend_vtable **)jce_custom_backends;
+    cfg.customBackendCount     = (ma_uint32)(sizeof(jce_custom_backends)
+                                            / sizeof(jce_custom_backends[0]));
+
     /* Hint the encoding format from magic bytes so miniaudio picks
-       the correct built-in decoder (dr_mp3, dr_wav, dr_flac, stb_vorbis). */
+       the correct built-in decoder (dr_mp3, dr_wav, dr_flac, stb_vorbis).
+       Note: we do NOT hint Ogg-Opus as vorbis — miniaudio's custom-backend
+       probe phase (which runs first) already routes OpusHead pages to
+       g_jce_ma_opus_backend_vtable. Plain Ogg-Vorbis still falls through. */
     if (size >= 4 && data[0] == 'O' && data[1] == 'g'
                   && data[2] == 'g' && data[3] == 'S') {
-        cfg.encodingFormat = ma_encoding_format_vorbis;
+        /* Sniff for OpusHead — if present, leave format unknown so the
+           custom backend wins; otherwise hint vorbis. */
+        bool is_opus = false;
+        for (size_t i = 28; i + 8 <= size && i < 80; ++i) {
+            if (data[i] == 'O' && memcmp(data + i, "OpusHead", 8) == 0) {
+                is_opus = true; break;
+            }
+        }
+        if (!is_opus) cfg.encodingFormat = ma_encoding_format_vorbis;
     } else if (size >= 4 && data[0] == 'f' && data[1] == 'L'
                          && data[2] == 'a' && data[3] == 'C') {
         cfg.encodingFormat = ma_encoding_format_flac;

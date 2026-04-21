@@ -10,6 +10,7 @@
 
 #include <SDL3/SDL.h>
 #include <cjson/cJSON.h>
+#include <stdio.h>
 #include <string.h>
 
 #define LOG_TAG "jce_sprite"

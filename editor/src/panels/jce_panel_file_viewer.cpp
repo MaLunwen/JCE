@@ -153,7 +153,8 @@ static JceFileViewerType fv_detect_ext(const char *ext)
         return JCE_FV_TEXT;
 
     if (strcmp(ext, ".wav") == 0 || strcmp(ext, ".ogg") == 0
-        || strcmp(ext, ".mp3") == 0 || strcmp(ext, ".flac") == 0)
+        || strcmp(ext, ".mp3") == 0 || strcmp(ext, ".flac") == 0
+        || strcmp(ext, ".opus") == 0 || strcmp(ext, ".oga") == 0)
         return JCE_FV_AUDIO;
 
     if (strcmp(ext, ".mp4") == 0 || strcmp(ext, ".m4v") == 0
@@ -573,6 +574,21 @@ void jce_file_viewer_draw_content(void)
                                | ImGuiTabBarFlags_TabListPopupButton;
 
     if (ImGui::BeginTabBar("##FvTabs", bar_flags)) {
+        /* Mouse-wheel horizontal scroll over the tab strip. ImGui's tab bar
+         * doesn't ship this by default; nudge ScrollingTarget directly. */
+        if (ImGuiTabBar *wbar = ImGui::GetCurrentTabBar()) {
+            float wheel = ImGui::GetIO().MouseWheel;
+            if (wheel != 0.0f
+                && ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem)
+                && ImGui::IsMouseHoveringRect(wbar->BarRect.Min, wbar->BarRect.Max, false)) {
+                const float step = ImGui::GetFontSize() * 4.0f;
+                wbar->ScrollingTarget = ImClamp(
+                    wbar->ScrollingTarget - wheel * step,
+                    0.0f, ImMax(0.0f, wbar->WidthAllTabs - wbar->BarRect.GetWidth()));
+                wbar->ScrollingTargetDistToVisibility = 0.0f;
+            }
+        }
+
         /* Programmatic tab selection: directly set the tab bar's selected ID
          * so the switch happens this frame rather than after 2-frame scheduling. */
         if (s_fv.select_tab_req >= 0 && s_fv.select_tab_req < s_fv.tab_count) {
