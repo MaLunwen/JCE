@@ -199,8 +199,8 @@ static bool SDLCALL jce_win32_msg_hook(void *userdata, MSG *msg);
  * Win32 modal-loop timer.  Forward-declared here because the modal
  * timer (defined in the SDL_PLATFORM_WINDOWS block below) references
  * them before the watcher's definition that owns them. */
-static SDL_AtomicInt s_in_render_frame;
-static SDL_AtomicInt s_render_paused;
+static SDL_AtomicInt s_in_render_frame = {0};
+static SDL_AtomicInt s_render_paused = {0};
 
 JceEngine *jce_engine_create(int argc, char *argv[])
 {
