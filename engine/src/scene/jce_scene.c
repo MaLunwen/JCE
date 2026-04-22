@@ -212,6 +212,7 @@ TYPE *jce_scene_get_##NAME(JceScene *s, JceEntity e)                    \
 bool jce_scene_has_##NAME(const JceScene *s, JceEntity e)               \
 {                                                                       \
     if (!s) return false;                                               \
+    if (!ecs_is_alive(s->world, (ecs_entity_t)e)) return false;         \
     return ecs_has(s->world, (ecs_entity_t)e, TYPE);                    \
 }                                                                       \
                                                                         \
@@ -251,8 +252,9 @@ JCE_COMP_IMPL(JceEditorMeta,                  editor_meta)
 uint32_t jce_scene_get_component_flags(const JceScene *s, JceEntity e)
 {
     if (!s || e == JCE_ENTITY_INVALID) return 0;
-    uint32_t flags = 0;
     ecs_entity_t ent = (ecs_entity_t)e;
+    if (!ecs_is_alive(s->world, ent)) return 0;
+    uint32_t flags = 0;
 
     if (ecs_has(s->world, ent, JceTransform))                   flags |= JCE_COMP_FLAG_TRANSFORM;
     if (ecs_has(s->world, ent, JceMeshRenderer))                flags |= JCE_COMP_FLAG_MESH_RENDERER;
