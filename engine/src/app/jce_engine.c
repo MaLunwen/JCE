@@ -837,6 +837,48 @@ JceAppResult jce_engine_iterate(JceEngine *e)
         return JCE_APP_CONTINUE;
     }
 
+    /* Reconcile any size change the resize watcher may have missed.
+     *
+     * SDL_AddEventWatch callbacks fire exactly once, when the event is
+     * pushed onto the queue.  If a size change is pushed while we are
+     * already inside this function (s_in_render_frame == 1) — which
+     * happens, for example, when the app calls SDL_SetWindowFullscreen
+     * from inside its own update callback (CK's F11 handler) and SDL3
+     * pumps the resulting WM_SIZE synchronously — the watcher
+     * early-returns and the resize is then dropped, because by the time
+     * the next iterate runs, no further watcher invocation occurs for
+     * the queued event.  Result: bgfx keeps the old backbuffer size
+     * while the OS-presented window is at the new size, producing the
+     * "old image in a corner of an otherwise black window" symptom that
+     * F11→fullscreen exhibits.
+     *
+     * Catch this here by comparing SDL's authoritative pixel size
+     * against our tracked JceWindow size, and applying the resize once
+     * before begin_frame.  This is cheap (an SDL accessor + an integer
+     * compare) and a no-op in the common case. */
+    if (e->window) {
+        int sdl_pw = 0, sdl_ph = 0;
+        SDL_GetWindowSizeInPixels(jce_window_sdl(e->window),
+                                  &sdl_pw, &sdl_ph);
+        if (sdl_pw > 0 && sdl_ph > 0) {
+            uint32_t cur_w = 0, cur_h = 0;
+            jce_window_get_size(e->window, &cur_w, &cur_h);
+            if ((uint32_t)sdl_pw != cur_w || (uint32_t)sdl_ph != cur_h) {
+                jce_window_handle_resize(e->window,
+                                         (uint32_t)sdl_pw,
+                                         (uint32_t)sdl_ph);
+                if (e->renderer)
+                    jce_renderer_resize(e->renderer,
+                                        (uint32_t)sdl_pw,
+                                        (uint32_t)sdl_ph);
+                if (g_app_desc.on_resize)
+                    g_app_desc.on_resize((uint32_t)sdl_pw,
+                                         (uint32_t)sdl_ph,
+                                         g_app_desc.user_data);
+            }
+        }
+    }
+
     /* Cooperate with the resize watcher / Win32 modal timer: never enter
      * begin_frame while one of them is mid-frame, otherwise bgfx sees
      * nested frames and produces a black flash. */
