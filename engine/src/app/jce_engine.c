@@ -202,6 +202,32 @@ static bool SDLCALL jce_win32_msg_hook(void *userdata, MSG *msg);
 static SDL_AtomicInt s_in_render_frame = {0};
 static SDL_AtomicInt s_render_paused = {0};
 
+/* Set inside a Win32 WM_ENTERSIZEMOVE / WM_EXITSIZEMOVE bracket so other
+ * code paths can choose backend-specific behaviour during the modal
+ * loop (notably: don't present on OpenGL, where wglSwapBuffers is not
+ * DWM-composited and would produce visible black flashes). */
+static SDL_AtomicInt s_in_modal_loop = {0};
+/* Set when a resize event arrived during the modal loop but we deferred
+ * the bgfx reset (only happens on OpenGL).  On WM_EXITSIZEMOVE we do a
+ * single reset + iterate to catch up. */
+static SDL_AtomicInt s_pending_modal_resize = {0};
+
+/* True when rendering through bgfx is currently unsafe (would flicker /
+ * black-flash) because we're inside a Win32 modal sizing/moving loop on
+ * a backend that doesn't tolerate it.
+ *
+ * Today only the OpenGL backend has this problem on Windows: wglSwap-
+ * Buffers isn't routed through DWM during the modal loop, so each
+ * Present produces a visible flash on top of the OS-managed drag/move
+ * preview.  D3D11/D3D12/Vulkan all use DWM-composited swap chains and
+ * are safe to keep presenting. */
+static bool jce_render_blocked_by_modal_loop(void)
+{
+    if (SDL_GetAtomicInt(&s_in_modal_loop) == 0)
+        return false;
+    return bgfx_get_renderer_type() == BGFX_RENDERER_TYPE_OPENGL;
+}
+
 JceEngine *jce_engine_create(int argc, char *argv[])
 {
     (void)argc; (void)argv;
@@ -539,6 +565,13 @@ static void CALLBACK jce_modal_timer_proc(HWND hwnd, UINT msg,
     if (SDL_GetAtomicInt(&s_in_render_frame) != 0)
         return;
 
+    /* OpenGL on Windows can't be presented during the modal loop
+     * without flicker (see jce_render_blocked_by_modal_loop).  Skip the
+     * timer-driven frame entirely; the OS will keep the last presented
+     * pixels visible until WM_EXITSIZEMOVE. */
+    if (jce_render_blocked_by_modal_loop())
+        return;
+
     jce_engine_iterate(e);
 }
 
@@ -548,10 +581,36 @@ static bool SDLCALL jce_win32_msg_hook(void *userdata, MSG *msg)
 
     if (msg->message == WM_ENTERSIZEMOVE) {
         g_modal_engine = e;
+        SDL_SetAtomicInt(&s_in_modal_loop, 1);
+        SDL_SetAtomicInt(&s_pending_modal_resize, 0);
         SetTimer(msg->hwnd, JCE_MODAL_TIMER_ID,
                  JCE_MODAL_TIMER_MS, jce_modal_timer_proc);
     } else if (msg->message == WM_EXITSIZEMOVE) {
         KillTimer(msg->hwnd, JCE_MODAL_TIMER_ID);
+        SDL_SetAtomicInt(&s_in_modal_loop, 0);
+
+        /* If we deferred a bgfx reset (OpenGL backend), apply it now
+         * with the final post-modal size and run a single iterate so
+         * the new backbuffer gets composed before the next main-loop
+         * tick. */
+        if (e && e->renderer && e->window &&
+            SDL_GetAtomicInt(&s_pending_modal_resize) != 0 &&
+            SDL_GetAtomicInt(&s_in_render_frame) == 0) {
+            SDL_SetAtomicInt(&s_pending_modal_resize, 0);
+
+            int pw = 0, ph = 0;
+            SDL_GetWindowSizeInPixels(jce_window_sdl(e->window), &pw, &ph);
+            if (pw > 0 && ph > 0) {
+                jce_window_handle_resize(e->window,
+                                         (uint32_t)pw, (uint32_t)ph);
+                jce_renderer_resize(e->renderer,
+                                    (uint32_t)pw, (uint32_t)ph);
+                if (g_app_desc.on_resize)
+                    g_app_desc.on_resize((uint32_t)pw, (uint32_t)ph,
+                                         g_app_desc.user_data);
+                jce_engine_iterate(e);
+            }
+        }
         g_modal_engine = NULL;
     }
 
@@ -638,31 +697,55 @@ static bool jce_resize_event_watch(void *userdata, SDL_Event *event)
     }
 
     if (is_size_event) {
+        /* On OpenGL, calling bgfx_reset (and thus a GL framebuffer
+         * recreation + wglSwapBuffers) inside the Win32 modal loop
+         * produces a visible black flash on every event.  Defer the
+         * reset until WM_EXITSIZEMOVE — Windows already paints the
+         * window contents from a captured bitmap during the drag, so
+         * the user simply sees the pre-drag image until the resize
+         * commits.  Other backends are DWM-composited and are safe to
+         * reset in-line. */
+        if (jce_render_blocked_by_modal_loop()) {
+            SDL_SetAtomicInt(&s_pending_modal_resize, 1);
+            SDL_SetAtomicInt(&s_in_render_frame, 0);
+            return true;
+        }
+
         jce_window_handle_resize(e->window, (uint32_t)pw, (uint32_t)ph);
         jce_renderer_resize(e->renderer, (uint32_t)pw, (uint32_t)ph);
 
         if (g_app_desc.on_resize)
             g_app_desc.on_resize((uint32_t)pw, (uint32_t)ph,
                                  g_app_desc.user_data);
+    } else if (is_expose_event) {
+        /* Same backend constraint applies to a bare repaint pulse. */
+        if (jce_render_blocked_by_modal_loop()) {
+            SDL_SetAtomicInt(&s_in_render_frame, 0);
+            return true;
+        }
     }
 
-    /* Emit a minimal render frame so bgfx processes the reset (or, for
-     * an EXPOSED pulse, so the backbuffer is repainted).  We deliberately
-     * do NOT call g_app_desc.update here: that would re-sample input
-     * (e.g. an F11 still being held during the OS resize) and could
-     * re-toggle fullscreen, causing an infinite resize storm
-     * ("seizure"). The next normal main-loop tick will run update with
-     * fresh input state. */
-    if (!jce_renderer_is_fallback(e->renderer)) {
-        jce_renderer_begin_frame(e->renderer, e->window);
-
-        if (g_app_desc.draw)
-            g_app_desc.draw(&e->svc, g_app_desc.user_data);
-
-        jce_renderer_end_frame(e->renderer);
-    }
-
+    /* Release the guard before re-entering jce_engine_iterate — it
+     * acquires the same guard internally.  The s_in_modal_loop /
+     * s_in_render_frame combination still serialises us against the
+     * Win32 modal timer.
+     *
+     * Going through the full iterate path (instead of a bespoke
+     * begin_frame + g_app_desc.draw + end_frame as before) is required
+     * because applications may put their actual scene submission inside
+     * `update` rather than `draw` (e.g. caged_kingdom does its drawing
+     * inside ck_app_update).  Skipping update produced "stale frame"
+     * symptoms during drag on DX11/DX12/Vulkan ("画面没有更新").
+     *
+     * The historical concern that re-entering update would re-toggle a
+     * still-held F11 (and cause a fullscreen "seizure") doesn't apply:
+     * jce_input_key_pressed is edge-triggered (cur && !prev), and
+     * jce_input_update at the end of the iterate clears the edge. */
     SDL_SetAtomicInt(&s_in_render_frame, 0);
+
+    if (!jce_renderer_is_fallback(e->renderer))
+        jce_engine_iterate(e);
+
     return true;   /* let other watchers see the event too */
 }
 
@@ -742,6 +825,14 @@ JceAppResult jce_engine_iterate(JceEngine *e)
      * undefined.  Still update input so we notice when the user
      * restores the window. */
     if (SDL_GetAtomicInt(&s_render_paused) != 0) {
+        if (e->input) jce_input_update(e->input);
+        return JCE_APP_CONTINUE;
+    }
+
+    /* OpenGL backend during a Win32 modal sizing/moving loop: presenting
+     * via wglSwapBuffers in that window state produces visible black
+     * flashes.  Skip rendering until WM_EXITSIZEMOVE clears the flag. */
+    if (jce_render_blocked_by_modal_loop()) {
         if (e->input) jce_input_update(e->input);
         return JCE_APP_CONTINUE;
     }
