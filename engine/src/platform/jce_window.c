@@ -235,19 +235,19 @@ void jce_window_toggle_fullscreen(JceWindow *win)
      * PIXEL_SIZE_CHANGED on the next normal event pump and the watcher
      * picks it up safely. */
     SDL_SetWindowFullscreen(win->sdl_win, !is_fs);
-
-    /* Update pixel size + logical width immediately. */
-    int pw, ph;
-    SDL_GetWindowSizeInPixels(win->sdl_win, &pw, &ph);
-    win->pixel_w = (uint32_t)pw;
-    win->pixel_h = (uint32_t)ph;
-#if defined(__APPLE__) && TARGET_OS_IPHONE
-    win->logical_w = pw;
-    win->logical_h = ph;
-#else
-    if (ph > 0)
-        win->logical_w = (int)((float)win->logical_h * (float)pw / (float)ph);
-#endif
+    /* Do NOT proactively query SDL_GetWindowSizeInPixels here.
+     * On Windows, SetWindowPos (called by SDL_SetWindowFullscreen) sends
+     * WM_SIZE synchronously, which means GetClientRect already returns the
+     * new fullscreen size before SDL_SetWindowFullscreen returns.  Updating
+     * win->pixel_w/h to the new size while bgfx still has the old backbuffer
+     * fools the reconcile check in jce_engine_iterate into seeing no mismatch
+     * (both JceWindow and SDL report the new size), so bgfx_reset is never
+     * called.  The result is view rects set for 1920x1080 in a 1280x720
+     * backbuffer: old content in the top-left corner, rest black.
+     *
+     * Leave win->pixel_w/h at the old size.  The resize watcher (fired between
+     * frames when s_in_render_frame==0) or the iterate reconcile check will
+     * detect the SDL vs JceWindow mismatch and call jce_renderer_resize. */
 }
 
 bool jce_window_is_fullscreen(const JceWindow *win)

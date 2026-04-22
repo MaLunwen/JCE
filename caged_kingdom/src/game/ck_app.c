@@ -35,6 +35,11 @@ struct CkApp {
 
     JceTimer     *timer;
 
+    /* 3D scene advances exactly once per update; resize-only redraws reuse
+       the latest state without stepping simulation/animation again. */
+    float         scene_render_dt_sec;
+    bool          scene_render_dt_fresh;
+
     /* 3D scene (ECS + engine renderer). */
     JceCamera          *camera;
     JceCameraController *cam_ctrl;
@@ -629,7 +634,7 @@ static void update_pause(CkApp *app, float dt_ms)
 
 /* -- 3D scene ------------------------------------------------------ */
 
-static void draw_3d_scene(CkApp *app, float dt_ms)
+static void update_3d_scene(CkApp *app, float dt_ms)
 {
     float dt_sec = dt_ms / 1000.0f;
 
@@ -689,7 +694,10 @@ static void draw_3d_scene(CkApp *app, float dt_ms)
     }
 
     jce_camctrl_update(app->cam_ctrl, &cam_in, dt_sec);
+}
 
+static void draw_3d_scene(CkApp *app, float dt_sec)
+{
     /* Begin 3D frame. */
     jce_renderer_begin_frame_3d(app->svc.renderer,
         app->svc.window, app->camera, JCE_VIEW_MAIN_3D);
@@ -709,6 +717,32 @@ static void draw_2d_overlay(CkApp *app)
     jce_touch_hud_draw(app->touch_hud);
 }
 
+static void ck_app_draw(CkApp *app)
+{
+    if (!app) return;
+
+    if (jce_settings_is_open(app->engine_settings) || app->paused) {
+        if (app->ui)
+            jce_ui_render(app->ui);
+        jce_debug_hud_draw(app->engine_hud);
+        return;
+    }
+
+    float scene_dt_sec = 0.0f;
+    if (app->scene_render_dt_fresh) {
+        scene_dt_sec = app->scene_render_dt_sec;
+        app->scene_render_dt_fresh = false;
+    }
+
+    draw_3d_scene(app, scene_dt_sec);
+    draw_2d_overlay(app);
+
+    /* Render RmlUI overlay (debug HUD, etc). */
+    if (app->ui)
+        jce_ui_render(app->ui);
+    jce_debug_hud_draw(app->engine_hud);
+}
+
 /* ================================================================== */
 
 void ck_app_update(CkApp *app)
@@ -720,6 +754,8 @@ void ck_app_update(CkApp *app)
     jce_timer_tick(app->timer);
     float dt_ms = jce_timer_dt_ms(app->timer);
     float dt_sec = dt_ms / 1000.0f;
+    app->scene_render_dt_sec = 0.0f;
+    app->scene_render_dt_fresh = false;
     record_frametime(app, dt_ms);
     update_sysinfo(app);
 
@@ -754,22 +790,11 @@ void ck_app_update(CkApp *app)
         jce_debug_hud_show(app->engine_hud);
     }
 
-    if (jce_settings_is_open(app->engine_settings) || app->paused) {
-        /* Render RmlUI overlay only (no 3D scene update). */
-        if (app->ui)
-            jce_ui_render(app->ui);
-        jce_debug_hud_draw(app->engine_hud);
-        JCE_PROFILE_ZONE_END;
-        return;
+    if (!jce_settings_is_open(app->engine_settings) && !app->paused) {
+        update_3d_scene(app, dt_ms);
+        app->scene_render_dt_sec = dt_sec;
+        app->scene_render_dt_fresh = true;
     }
-
-    draw_3d_scene(app, dt_ms);
-    draw_2d_overlay(app);
-
-    /* Render RmlUI overlay (debug HUD, etc). */
-    if (app->ui)
-        jce_ui_render(app->ui);
-    jce_debug_hud_draw(app->engine_hud);
 
     JCE_PROFILE_ZONE_END;
 }
@@ -813,7 +838,7 @@ static void demo_update(float dt, void *ud)
 static void demo_draw(const JceServices *svc, void *ud)
 {
     (void)svc; (void)ud;
-    /* Drawing is done inside ck_app_update for now. */
+    ck_app_draw(s_app);
 }
 
 static void demo_on_resize(uint32_t w, uint32_t h, void *ud)
