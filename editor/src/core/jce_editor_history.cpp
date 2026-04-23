@@ -71,6 +71,39 @@ bool history_capture_snapshot(EditorHistorySnapshot *out)
 	return true;
 }
 
+static size_t history_snapshot_bytes(const EditorHistorySnapshot &snap)
+{
+	return snap.scene_json.capacity() + snap.scene_path.capacity()
+	       + sizeof(EditorHistorySnapshot);
+}
+
+static size_t history_total_bytes(void)
+{
+	size_t total = 0;
+	for (const auto &it : s_undo_history) total += history_snapshot_bytes(it);
+	for (const auto &it : s_redo_history) total += history_snapshot_bytes(it);
+	return total;
+}
+
+static void history_enforce_budget(void)
+{
+	while (history_total_bytes() > JCE_UNDO_HISTORY_BYTES_BUDGET) {
+		/* Drop oldest from whichever side is bigger; prefer redo first
+		 * since redo is rarely consulted compared to undo. */
+		if (!s_redo_history.empty()
+		    && history_snapshot_bytes(s_redo_history.front())
+		           >= history_snapshot_bytes(s_undo_history.empty()
+		                                         ? s_redo_history.front()
+		                                         : s_undo_history.front())) {
+			s_redo_history.erase(s_redo_history.begin());
+		} else if (!s_undo_history.empty()) {
+			s_undo_history.erase(s_undo_history.begin());
+		} else {
+			break;
+		}
+	}
+}
+
 bool history_push_undo_snapshot(void)
 {
 	if (s_history_suspend_depth > 0)
@@ -90,6 +123,7 @@ bool history_push_undo_snapshot(void)
 		s_undo_history.erase(s_undo_history.begin());
 
 	s_undo_history.push_back(std::move(snap));
+	history_enforce_budget();
 	return true;
 }
 
@@ -150,6 +184,7 @@ void jce_state_undo(void)
 	if ((int)s_redo_history.size() >= JCE_UNDO_HISTORY_LIMIT)
 		s_redo_history.erase(s_redo_history.begin());
 	s_redo_history.push_back(std::move(current));
+	history_enforce_budget();
 
 	LOG_INFO(LOG_TAG, "undo: applied");
 }
@@ -179,6 +214,7 @@ void jce_state_redo(void)
 	if ((int)s_undo_history.size() >= JCE_UNDO_HISTORY_LIMIT)
 		s_undo_history.erase(s_undo_history.begin());
 	s_undo_history.push_back(std::move(current));
+	history_enforce_budget();
 
 	LOG_INFO(LOG_TAG, "redo: applied");
 }

@@ -964,7 +964,7 @@ static void ser_entity_cb(JceScene *s, JceEntity e, void *ud)
     cJSON *eobj = cJSON_CreateObject();
     if (!eobj) return;
 
-    const char *name = jce_scene_entity_name(s, e);
+    const char *name = jce_scene_entity_registered_name(s, e);
     cJSON_AddNumberToObject(eobj, "id", (double)e);
     cJSON_AddStringToObject(eobj, "name", name ? name : "");
     cJSON_AddNumberToObject(eobj, "parentId", (double)jce_scene_get_parent(s, e));
@@ -1101,6 +1101,11 @@ static const cJSON *resolve_entities(const cJSON *root)
     return NULL;
 }
 
+static bool is_legacy_unnamed_entity_name(const char *name)
+{
+    return !name || name[0] == '\0' || strcmp(name, "(unnamed)") == 0;
+}
+
 int jce_scene_load_json(JceScene *scene, const cJSON *root)
 {
     if (!scene || !root) return -1;
@@ -1125,8 +1130,13 @@ int jce_scene_load_json(JceScene *scene, const cJSON *root)
         const cJSON *eobj = cJSON_GetArrayItem(entities, i);
         if (!cJSON_IsObject(eobj)) continue;
 
-        const char *name = j_str(eobj, "name", "Entity");
-        JceEntity new_e = jce_scene_create_entity(scene, name);
+        const cJSON *name_item = cJSON_GetObjectItemCaseSensitive(eobj, "name");
+        const char *name = (cJSON_IsString(name_item) && name_item->valuestring)
+                         ? name_item->valuestring
+                         : "";
+        JceEntity new_e = jce_scene_create_entity(
+            scene,
+            is_legacy_unnamed_entity_name(name) ? NULL : name);
         if (new_e == JCE_ENTITY_INVALID) continue;
 
         map[loaded].src_id = (JceEntity)j_num(eobj, "id", 0.0);
@@ -1148,7 +1158,8 @@ int jce_scene_load_json(JceScene *scene, const cJSON *root)
                 if (!m) {
                     JceEditorMeta fresh;
                     memset(&fresh, 0, sizeof(fresh));
-                    copy_str(fresh.name, sizeof(fresh.name), name);
+                    copy_str(fresh.name, sizeof(fresh.name),
+                             is_legacy_unnamed_entity_name(name) ? "Entity" : name);
                     fresh.enabled = true;
                     jce_scene_set_editor_meta(scene, new_e, &fresh);
                     m = jce_scene_get_editor_meta(scene, new_e);
@@ -1210,7 +1221,8 @@ void jce_scene_parse_entity_json(JceScene *scene, JceEntity e,
                 JceEditorMeta fresh;
                 memset(&fresh, 0, sizeof(fresh));
                 const char *n = j_str(entity_obj, "name", "");
-                copy_str(fresh.name, sizeof(fresh.name), n);
+                copy_str(fresh.name, sizeof(fresh.name),
+                         is_legacy_unnamed_entity_name(n) ? "Entity" : n);
                 fresh.enabled = true;
                 jce_scene_set_editor_meta(scene, e, &fresh);
                 m = jce_scene_get_editor_meta(scene, e);

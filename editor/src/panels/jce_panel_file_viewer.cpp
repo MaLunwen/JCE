@@ -213,7 +213,7 @@ static void fv_open_info_tab(const char *open_path,
     tab->type = JCE_FV_TEXT;
     tab->open = true;
     tab->gpu_tex.idx = UINT16_MAX;
-    tab->zoom = 1.0f;
+    tab->zoom = 0.0f;  /* 0 = fit on first render (zoomable helper auto-fits) */
 
     s_fv.active_tab = s_fv.tab_count;
     s_fv.tab_count++;
@@ -384,7 +384,7 @@ void jce_file_viewer_open(const char *path)
     tab->gpu_tex.idx = UINT16_MAX;
     tab->img_w       = 0;
     tab->img_h       = 0;
-    tab->zoom        = 1.0f;
+    tab->zoom        = 0.0f;  /* 0 = fit on first render (zoomable helper auto-fits) */
     tab->pan_x       = 0.0f;
     tab->pan_y       = 0.0f;
     tab->edit_mode   = false;

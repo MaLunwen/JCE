@@ -31,6 +31,7 @@ extern "C" {
 #include <jce/core/jce_log.h>
 #include <jce/app/jce_config.h>
 #include <jce/graphics/jce_renderer.h>
+#include <jce/jce_version.h>
 }
 #include <time.h>
 
@@ -792,7 +793,7 @@ void jce_editor_about_dialog(bool *p_open)
 
     const ImGuiViewport *vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(640, 480), ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize(ImVec2(640, 560), ImGuiCond_Appearing);
     ImGui::SetNextWindowViewport(vp->ID);
 
     if (!ImGui::BeginPopupModal(_title, p_open,
@@ -802,11 +803,53 @@ void jce_editor_about_dialog(bool *p_open)
         return;
     }
 
-    ImGui::Text("%s: 0.6.0 (Editor Preview)", jce_editor_i18n("about.versionLabel"));
+    ImGui::Text("%s: " JCE_VERSION_STR " (Editor Preview)", jce_editor_i18n("about.versionLabel"));
     ImGui::Text("%s: %s %s", jce_editor_i18n("about.buildLabel"), __DATE__, __TIME__);
+
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Text, JCE_COLOR_TEXT_SECONDARY);
+    if (ImGui::BeginTable("##about_build_info", 2, ImGuiTableFlags_None)) {
+        ImGui::TableSetupColumn("##bk", ImGuiTableColumnFlags_WidthFixed, 220.0f);
+        ImGui::TableSetupColumn("##bv", ImGuiTableColumnFlags_WidthStretch);
+
+        auto build_row = [](const char *key, const char *val) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(key);
+            ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(val);
+        };
+
+#if defined(JCE_PLATFORM_STR)
+        build_row("Platform", JCE_PLATFORM_STR);
+#endif
+#if defined(JCE_BUILD_VARIANT_STR)
+        build_row("Variant", JCE_BUILD_VARIANT_STR);
+#endif
+#if defined(JCE_GIT_COMMIT)
+        build_row("Commit", JCE_GIT_COMMIT);
+#endif
+#if JCE_TRACY_ENABLED
+        build_row("Profiling (Tracy)", "Enabled");
+#endif
+#if defined(JCE_ENABLE_PATENTED_CODECS) && JCE_ENABLE_PATENTED_CODECS
+        build_row("Patented Codecs", "AAC \xc2\xb7 H.264 \xc2\xb7 H.265");
+#else
+        build_row("Patented Codecs", "Off (patent-free only)");
+#endif
+
+        ImGui::EndTable();
+    }
+    ImGui::PopStyleColor();
+
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
+
+    /* Scrollable region — pins buttons to the bottom regardless of text length. */
+    const float bottom_reserve = ImGui::GetFrameHeightWithSpacing()
+                               + ImGui::GetStyle().ItemSpacing.y + 6.0f;
+    ImGui::BeginChild("##about_scroll",
+                      ImVec2(0.0f, ImGui::GetContentRegionAvail().y - bottom_reserve),
+                      false, ImGuiWindowFlags_None);
     ImGui::TextWrapped("%s", jce_editor_i18n("about.description"));
     ImGui::Spacing();
     ImGui::TextWrapped("%s", jce_editor_i18n("about.platforms"));
@@ -814,6 +857,7 @@ void jce_editor_about_dialog(bool *p_open)
     ImGui::Spacing();
     ImGui::TextWrapped("%s", jce_editor_i18n("about.copyright"));
     ImGui::PopStyleColor();
+    ImGui::EndChild();
 
     ImGui::Spacing();
     ImGui::Separator();

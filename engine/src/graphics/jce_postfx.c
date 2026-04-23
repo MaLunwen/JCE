@@ -66,6 +66,15 @@ struct JcePostFXPipeline {
     int                        output_ping;   /* index into fbo[] */
 };
 
+static void reset_output_state(JcePostFXPipeline *pipeline)
+{
+    if (!pipeline) return;
+
+    pipeline->output_tex = (bgfx_texture_handle_t){ UINT16_MAX };
+    pipeline->output_fb = (bgfx_frame_buffer_handle_t){ UINT16_MAX };
+    pipeline->output_ping = -1;
+}
+
 /* ── Default parameters ────────────────────────────────────────────── */
 
 JcePostFXParams jce_postfx_default_params(void)
@@ -176,6 +185,7 @@ JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
     p->prog_vignette.idx      = UINT16_MAX;
     p->prog_chromatic.idx     = UINT16_MAX;
     p->prog_grayscale.idx     = UINT16_MAX;
+    reset_output_state(p);
 
     /* Create full-screen quad geometry. */
     bgfx_vertex_layout_begin(&p->quad_layout, bgfx_get_renderer_type());
@@ -255,6 +265,7 @@ void jce_postfx_resize(JcePostFXPipeline *pipeline,
 
     /* Recreate FBOs at new resolution. */
     destroy_fbos(pipeline);
+    reset_output_state(pipeline);
 
     LOG_DEBUG(LOG_TAG, "post-fx resized to %ux%u", width, height);
 }
@@ -346,8 +357,17 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
                       JceTextureHandle scene_color,
                       JceTextureHandle scene_depth)
 {
-    if (!pipeline || !pipeline->shaders_loaded) return;
+    if (!pipeline) return;
+
+    reset_output_state(pipeline);
+
+    if (!pipeline->shaders_loaded) return;
     (void)scene_depth;
+
+    if (!jce_gfx_texture_valid(scene_color)) {
+        LOG_WARN(LOG_TAG, "post-fx skipped: invalid scene color texture");
+        return;
+    }
 
     /* Count active effects. */
     int active = 0;
@@ -374,6 +394,7 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
     bgfx_texture_handle_t current_tex = { scene_color.idx };
     uint16_t view_id = JCE_VIEW_POST_BASE;
     int ping = 0; /* ping-pong FBO index (0 or 1) */
+    int current_fb_index = -1;
 
     /* Helper macro: set up view for a post-processing pass. */
     #define POSTFX_SETUP_VIEW(vid, fb) do { \
@@ -425,6 +446,7 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
             bgfx_set_texture(1, pipeline->u_texBloom, pipeline->fbo_tex[2], UINT32_MAX);
             draw_fullscreen(pipeline, view_id, pipeline->prog_bloom_combine);
             current_tex = pipeline->fbo_tex[ping];
+            current_fb_index = ping;
             ping = 1 - ping;
             view_id++;
         }
@@ -445,6 +467,7 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
         bgfx_set_texture(0, pipeline->u_texColor, current_tex, UINT32_MAX);
         draw_fullscreen(pipeline, view_id, pipeline->prog_tonemap);
         current_tex = pipeline->fbo_tex[ping];
+        current_fb_index = ping;
         ping = 1 - ping;
         view_id++;
     }
@@ -465,6 +488,7 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
         bgfx_set_texture(0, pipeline->u_texColor, current_tex, UINT32_MAX);
         draw_fullscreen(pipeline, view_id, pipeline->prog_fxaa);
         current_tex = pipeline->fbo_tex[ping];
+        current_fb_index = ping;
         ping = 1 - ping;
         view_id++;
     }
@@ -480,6 +504,7 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
         bgfx_set_texture(0, pipeline->u_texColor, current_tex, UINT32_MAX);
         draw_fullscreen(pipeline, view_id, pipeline->prog_chromatic);
         current_tex = pipeline->fbo_tex[ping];
+        current_fb_index = ping;
         ping = 1 - ping;
         view_id++;
     }
@@ -499,6 +524,7 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
         bgfx_set_texture(0, pipeline->u_texColor, current_tex, UINT32_MAX);
         draw_fullscreen(pipeline, view_id, pipeline->prog_vignette);
         current_tex = pipeline->fbo_tex[ping];
+        current_fb_index = ping;
         ping = 1 - ping;
         view_id++;
     }
@@ -511,6 +537,7 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
         bgfx_set_texture(0, pipeline->u_texColor, current_tex, UINT32_MAX);
         draw_fullscreen(pipeline, view_id, pipeline->prog_grayscale);
         current_tex = pipeline->fbo_tex[ping];
+        current_fb_index = ping;
         ping = 1 - ping;
         view_id++;
     }
@@ -519,8 +546,10 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
 
     /* Store the final output texture for the caller. */
     pipeline->output_tex = current_tex;
-    pipeline->output_fb  = pipeline->fbo[ping];
-    pipeline->output_ping = ping;
+    if (current_fb_index >= 0) {
+        pipeline->output_fb = pipeline->fbo[current_fb_index];
+        pipeline->output_ping = current_fb_index;
+    }
 
     LOG_TRACE(LOG_TAG, "post-fx apply: %d effects active, %d views used",
               active, view_id - JCE_VIEW_POST_BASE);

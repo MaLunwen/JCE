@@ -158,6 +158,10 @@ bool jce_editor_config_save(const JceEditorConfig *cfg) {
     return true;
 }
 
+void jce_editor_config_ensure_dir(void) {
+    MKDIR(CONFIG_DIR);
+}
+
 /* --------------- add recent --------------- */
 
 void jce_editor_config_add_recent(JceEditorConfig *cfg, const char *path) {

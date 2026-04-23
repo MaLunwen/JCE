@@ -26,10 +26,37 @@
 #include "core/jce_memory.h"
 
 #include <dav1d/dav1d.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define LOG_TAG "jce_av1"
+
+/* ---- helpers (declared early so jce_av1_open* can reference them) ---- */
+
+/* Silent dav1d logger: suppress "Error parsing OBU data" and similar
+ * stderr spam that dav1d emits via its default printf logger. We re-emit
+ * via our throttled av1_should_log_send_err() path on real send failures. */
+static void av1_silent_logger(void *cookie, const char *fmt, va_list ap)
+{
+    (void)cookie; (void)fmt; (void)ap;
+}
+
+/* Shared throttle counter for dav1d_send_data() warnings. Corrupt streams
+ * can hit this every frame; we log first 4, then 1 per 256, with running
+ * total so the user still knows the error is recurring. */
+static unsigned long s_send_data_err_count = 0;
+static bool av1_should_log_send_err(void)
+{
+    unsigned long n = ++s_send_data_err_count;
+    return (n <= 4u) || ((n & 0xFFu) == 0u);
+}
+
+static void av1_packet_noop_free(const uint8_t *buf, void *cookie)
+{
+    (void)buf;
+    (void)cookie;
+}
 
 struct JceAv1Decoder {
     Dav1dContext  *ctx;
@@ -76,6 +103,8 @@ JceAv1Decoder *jce_av1_open_memory(const void *data, size_t size,
     Dav1dSettings s;
     dav1d_default_settings(&s);
     s.max_frame_delay = 1;
+    s.logger.cookie = NULL;
+    s.logger.callback = av1_silent_logger;
     if (dav1d_open(&dec->ctx, &s) < 0) {
         LOG_ERROR(LOG_TAG, "dav1d_open failed");
         JCE_FREE(dec);
@@ -146,7 +175,10 @@ bool jce_av1_decode_next(JceAv1Decoder *dec,
         int sd = dav1d_send_data(dec->ctx, &d);
         if (sd < 0 && sd != DAV1D_ERR(EAGAIN)) {
             dav1d_data_unref(&d);
-            LOG_WARN(LOG_TAG, "dav1d_send_data: %d", sd);
+            if (av1_should_log_send_err()) {
+                LOG_WARN(LOG_TAG, "dav1d_send_data: %d (err #%lu)",
+                         sd, s_send_data_err_count);
+            }
             return false;
         }
         /* If EAGAIN, dav1d kept a reference; loop and try get_picture. */
@@ -168,6 +200,8 @@ JceAv1Decoder *jce_av1_open_packet(void)
     Dav1dSettings s;
     dav1d_default_settings(&s);
     s.max_frame_delay = 1;
+    s.logger.cookie = NULL;
+    s.logger.callback = av1_silent_logger;
     if (dav1d_open(&dec->ctx, &s) < 0) {
         LOG_ERROR(LOG_TAG, "dav1d_open failed");
         JCE_FREE(dec);
@@ -175,12 +209,6 @@ JceAv1Decoder *jce_av1_open_packet(void)
     }
     /* No IVF buffer — caller drives via jce_av1_decode_packet(). */
     return dec;
-}
-
-static void av1_packet_noop_free(const uint8_t *buf, void *cookie)
-{
-    (void)buf;
-    (void)cookie;
 }
 
 bool jce_av1_decode_packet(JceAv1Decoder *dec,
@@ -203,7 +231,10 @@ bool jce_av1_decode_packet(JceAv1Decoder *dec,
         int sd = dav1d_send_data(dec->ctx, &d);
         if (sd < 0 && sd != DAV1D_ERR(EAGAIN)) {
             dav1d_data_unref(&d);
-            LOG_WARN(LOG_TAG, "dav1d_send_data: %d", sd);
+            if (av1_should_log_send_err()) {
+                LOG_WARN(LOG_TAG, "dav1d_send_data: %d (err #%lu)",
+                         sd, s_send_data_err_count);
+            }
             return false;
         }
     }

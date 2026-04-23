@@ -34,6 +34,9 @@ bool jce_editor_config_load(JceEditorConfig *cfg);
 /* Save config to .jce/editor-config.json. */
 bool jce_editor_config_save(const JceEditorConfig *cfg);
 
+/* Ensure the .jce config directory exists (idempotent). */
+void jce_editor_config_ensure_dir(void);
+
 /* Set defaults. */
 void jce_editor_config_defaults(JceEditorConfig *cfg);
 

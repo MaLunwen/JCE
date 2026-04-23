@@ -46,6 +46,33 @@ enum {
 };
 static AudioState s_audio[AUDIO_STATE_MAX];
 
+/* Shared miniaudio engine across all audio tabs. Each tab still owns its
+ * own JceSound + JceVoice, but creating one ma_engine per tab cost ~MB of
+ * mixer state and dozens of internal allocations. We refcount via the
+ * number of currently-loaded tabs. */
+static JceAudio *s_shared_audio = nullptr;
+static int       s_shared_refcount = 0;
+
+static JceAudio *audio_engine_acquire(void)
+{
+    if (!s_shared_audio) {
+        s_shared_audio = jce_audio_create();
+        if (!s_shared_audio) return nullptr;
+    }
+    ++s_shared_refcount;
+    return s_shared_audio;
+}
+
+static void audio_engine_release(void)
+{
+    if (s_shared_refcount <= 0) return;
+    --s_shared_refcount;
+    if (s_shared_refcount == 0 && s_shared_audio) {
+        jce_audio_destroy(s_shared_audio);
+        s_shared_audio = nullptr;
+    }
+}
+
 static AudioState *find_state(const char *path)
 {
     for (int i = 0; i < AUDIO_STATE_MAX; ++i)
@@ -65,13 +92,14 @@ static AudioState *alloc_state(void)
 static void free_state(AudioState *st)
 {
     if (!st) return;
-    if (st->voice != JCE_VOICE_INVALID)
+    if (st->audio && st->voice != JCE_VOICE_INVALID)
         jce_audio_stop(st->audio, st->voice);
-    if (st->sound != JCE_SOUND_INVALID)
+    if (st->audio && st->sound != JCE_SOUND_INVALID)
         jce_audio_unload(st->audio, st->sound);
-    if (st->audio)
-        jce_audio_destroy(st->audio);
+    bool had_engine = (st->audio != nullptr);
     memset(st, 0, sizeof(*st));
+    if (had_engine)
+        audio_engine_release();
 }
 
 static void pause_state_playback(AudioState *st)
@@ -143,6 +171,13 @@ void fv_audio_update_focus(const char *active_tab_path, bool allow_playback)
         bool is_active_tab = (active_tab_path && strcmp(st->path, active_tab_path) == 0);
         bool can_keep_playing = allow_playback && is_active_tab;
         if (!can_keep_playing) {
+            /* Fully release inactive audio tabs (sound buffer + decoded
+             * PCM). Re-loaded transparently when the tab becomes active
+             * again. */
+            if (!is_active_tab) {
+                free_state(st);
+                continue;
+            }
             pause_state_playback(st);
             st->scrubbing = false;
             st->resume_after_scrub = false;
@@ -182,9 +217,9 @@ static AudioState *ensure_loaded(FvTab *tab)
     memset(st, 0, sizeof(*st));
     snprintf(st->path, sizeof(st->path), "%s", tab->path);
 
-    st->audio = jce_audio_create();
+    st->audio = audio_engine_acquire();
     if (!st->audio) {
-        LOG_ERROR(LOG_TAG, "failed to create audio engine for %s", tab->path);
+        LOG_ERROR(LOG_TAG, "failed to acquire shared audio engine for %s", tab->path);
         st->load_failed = true;
         return nullptr;
     }
@@ -199,7 +234,7 @@ static AudioState *ensure_loaded(FvTab *tab)
 
     if (st->sound == JCE_SOUND_INVALID) {
         LOG_ERROR(LOG_TAG, "failed to decode audio: %s", tab->path);
-        jce_audio_destroy(st->audio);
+        audio_engine_release();
         st->audio = nullptr;
         st->load_failed = true;  /* sticky: skip retry next frame */
         return nullptr;

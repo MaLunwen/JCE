@@ -26,7 +26,38 @@ target_include_directories(JCE_Editor PRIVATE
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/ui"
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/io")
 
-target_compile_definitions(JCE_Editor PRIVATE SDL_MAIN_USE_CALLBACKS=1)
+# Resolve a human-readable OS + arch string for the About dialog.
+if(JCE_PLATFORM_WINDOWS)
+    set(_jce_os_str "Windows")
+elseif(JCE_PLATFORM_MACOS)
+    set(_jce_os_str "macOS")
+elseif(JCE_PLATFORM_LINUX)
+    set(_jce_os_str "Linux")
+else()
+    set(_jce_os_str "${CMAKE_SYSTEM_NAME}")
+endif()
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|arm64|aarch64")
+    set(_jce_arch_str "ARM64")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64|x64")
+    set(_jce_arch_str "x64")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86|i[3-6]86")
+    set(_jce_arch_str "x86")
+else()
+    set(_jce_arch_str "${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+
+set(_jce_platform_str "${_jce_os_str} ${_jce_arch_str}")
+
+set(_jce_config_str "Unknown")
+if(CMAKE_BUILD_TYPE)
+    set(_jce_config_str "${CMAKE_BUILD_TYPE}")
+endif()
+
+target_compile_definitions(JCE_Editor PRIVATE
+    SDL_MAIN_USE_CALLBACKS=1
+    JCE_BUILD_VARIANT_STR="${JCE_BUILD_VARIANT}"
+    JCE_PLATFORM_STR="${_jce_platform_str}")
 
 # ------------------------------------------------------------------ #
 # Embedded PAK blob (editor_assets.pak)                               #

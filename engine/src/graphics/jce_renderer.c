@@ -764,6 +764,51 @@ void jce_renderer_end_frame(const JceRenderer *r)
 {
     JCE_PROFILE_ZONE_N("Renderer::EndFrame");
     if (!r || r->is_fallback) { JCE_PROFILE_ZONE_END; return; }
+
+    /* ── GPU memory diagnostic (every 15 seconds) ─────────────────────
+     * Logs bgfx GPU resource counts and memory usage. Use this to
+     * confirm whether the editor's working-set growth lives on the
+     * GPU side (textures / framebuffers leaking) or the CPU side
+     * (CRT heap, mapped files). Disable by undef'ing the macro.
+     *
+     * Note: bgfx returns INT64_MAX (~9.2e18, displayed as ~-8.8e12 MB
+     * after the >>20 shift on signed types) for memory counters when
+     * the backend doesn't expose them (D3D11 typically doesn't). We
+     * detect the sentinel and print "n/a" instead. */
+#ifndef JCE_DISABLE_BGFX_STATS_LOG
+    {
+        static double s_last_log_s = 0.0;
+        static uint16_t s_max_textures = 0;
+        static uint16_t s_max_framebuffers = 0;
+        const double now_s = (double)SDL_GetTicks() / 1000.0;
+        if (now_s - s_last_log_s >= 15.0) {
+            s_last_log_s = now_s;
+            const bgfx_stats_t *st = bgfx_get_stats();
+            if (st) {
+                if (st->numTextures     > s_max_textures)     s_max_textures     = st->numTextures;
+                if (st->numFrameBuffers > s_max_framebuffers) s_max_framebuffers = st->numFrameBuffers;
+                char gpu_buf[64];
+                if (st->gpuMemoryUsed < 0 || st->gpuMemoryMax < 0) {
+                    snprintf(gpu_buf, sizeof(gpu_buf), "gpu=n/a (backend not reporting)");
+                } else {
+                    snprintf(gpu_buf, sizeof(gpu_buf), "gpu=%lld/%lld MB",
+                             (long long)(st->gpuMemoryUsed >> 20),
+                             (long long)(st->gpuMemoryMax  >> 20));
+                }
+                LOG_INFO(LOG_TAG,
+                    "bgfx stats: %s tex=%u(peak %u) fb=%u(peak %u) "
+                    "vb=%u ib=%u prog=%u shader=%u uniform=%u",
+                    gpu_buf,
+                    (unsigned)st->numTextures,     (unsigned)s_max_textures,
+                    (unsigned)st->numFrameBuffers, (unsigned)s_max_framebuffers,
+                    (unsigned)st->numVertexBuffers, (unsigned)st->numIndexBuffers,
+                    (unsigned)st->numPrograms,      (unsigned)st->numShaders,
+                    (unsigned)st->numUniforms);
+            }
+        }
+    }
+#endif
+
     bgfx_frame(false);
     JCE_PROFILE_ZONE_END;
 }

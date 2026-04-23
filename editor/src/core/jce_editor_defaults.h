@@ -63,7 +63,12 @@
 
 #define JCE_TARGET_FPS              60
 #define JCE_AUTO_SAVE_INTERVAL      300  /* seconds */
-#define JCE_UNDO_HISTORY_LIMIT      100
+#define JCE_UNDO_HISTORY_LIMIT      30
+/* Soft cap on combined memory used by undo+redo snapshots (bytes). When
+ * exceeded, the oldest entries are evicted regardless of count. Prevents
+ * the per-edit full-scene-JSON snapshots from ballooning RAM on scenes
+ * containing HDR skyboxes / IBL paths / lots of components. */
+#define JCE_UNDO_HISTORY_BYTES_BUDGET   (64u * 1024u * 1024u)
 #define JCE_DOUBLE_CLICK_MS         300
 
 /* ── Asset Browser ─────────────────────────────────────────────────── */

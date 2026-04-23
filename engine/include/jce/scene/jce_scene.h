@@ -290,6 +290,7 @@ void      jce_scene_destroy(JceScene *scene);
 JceEntity jce_scene_create_entity(JceScene *s, const char *name);
 void      jce_scene_destroy_entity(JceScene *s, JceEntity e);
 const char *jce_scene_entity_name(const JceScene *s, JceEntity e);
+const char *jce_scene_entity_registered_name(const JceScene *s, JceEntity e);
 void      jce_scene_set_entity_name(JceScene *s, JceEntity e, const char *name);
 
 /* Parent / child hierarchy. */

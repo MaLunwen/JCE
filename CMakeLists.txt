@@ -3,13 +3,36 @@ cmake_minimum_required(VERSION 3.20)
 # ── MUST be set before project() ──
 set(CMAKE_SUPPRESS_REGENERATION TRUE)
 
-project(JCE C)
+project(JCE VERSION 0.7.1 LANGUAGES C)
 
 # CXX is needed for C++ dependencies (bgfx, assimp, imgui) and the editor.
 enable_language(CXX)
 
 # Export compile database for tooling (cppcheck/clangd/etc.).
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# ── Version header ────────────────────────────────────────────────────
+# Resolve git short commit hash (falls back to "unknown" in CI/archives).
+find_package(Git QUIET)
+set(JCE_GIT_COMMIT "unknown")
+if(Git_FOUND)
+	execute_process(
+		COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+		WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+		OUTPUT_VARIABLE JCE_GIT_COMMIT
+		OUTPUT_STRIP_TRAILING_WHITESPACE
+		ERROR_QUIET
+		RESULT_VARIABLE _git_rc)
+	if(NOT _git_rc EQUAL 0)
+		set(JCE_GIT_COMMIT "unknown")
+	endif()
+	unset(_git_rc)
+endif()
+
+configure_file(
+	"${CMAKE_SOURCE_DIR}/engine/include/jce/jce_version.h.in"
+	"${CMAKE_BINARY_DIR}/include/jce/jce_version.h"
+	@ONLY)
 
 # Conan generators in this workspace are produced as Release for iOS/Xcode.
 if(CMAKE_GENERATOR STREQUAL "Xcode")

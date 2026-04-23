@@ -387,11 +387,15 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
             JceTextureHandle prev_pass = { UINT16_MAX };
             scene_color.idx = jce_offscreen_target_get_color_texture(s_sr.bridge);
 
-            jce_postfx_apply(postfx, scene_color, prev_pass);
+            if (!jce_gfx_texture_valid(scene_color)) {
+                LOG_WARN(LOG_TAG, "post-fx skipped: invalid bridge color texture");
+            } else {
+                jce_postfx_apply(postfx, scene_color, prev_pass);
 
-            JceTextureHandle out = jce_postfx_get_output(postfx);
-            if (jce_gfx_texture_valid(out))
-                s_sr.postfx_output_tex = out.idx;
+                JceTextureHandle out = jce_postfx_get_output(postfx);
+                if (jce_gfx_texture_valid(out))
+                    s_sr.postfx_output_tex = out.idx;
+            }
         }
     }
 }

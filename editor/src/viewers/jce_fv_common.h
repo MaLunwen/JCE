@@ -73,10 +73,35 @@ struct FvTab {
 };
 
 /* ══════════════════════════════════════════════════════════════════════
- *  SUB-VIEWER RENDER FUNCTIONS
+ *  ZOOMABLE IMAGE / FRAME HELPER
  *
- *  Each sub-viewer renders inside the current tab area.
+ *  Shared by image and video viewers. Renders a texture inside the
+ *  current ImGui window with:
+ *    - Mouse wheel zoom (centered on cursor)
+ *    - Left or middle drag pan
+ *    - Double-left-click toggles between Fit and 1:1
+ *    - Checker/dark matte background
+ *
+ *  Caller owns zoom/pan_x/pan_y storage. Pass content_w/h = source pixel
+ *  dimensions. If first_view is true, the helper auto-fits on the first
+ *  call (zoom == 0).
  * ══════════════════════════════════════════════════════════════════════ */
+struct FvZoomable {
+    JceTexture tex;
+    int        content_w;
+    int        content_h;
+    float     *zoom;
+    float     *pan_x;
+    float     *pan_y;
+    bool       allow_double_click_toggle;
+    /* Background color (BG behind the image inside the canvas). */
+    uint32_t   matte_color;
+};
+
+void fv_render_zoomable(const FvZoomable *params);
+void fv_zoomable_fit(const FvZoomable *params, ImVec2 avail);
+void fv_zoomable_one_to_one(const FvZoomable *params);
+
 
 void fv_render_code(FvTab *tab);
 void fv_render_image(FvTab *tab);

@@ -724,6 +724,12 @@ JceAppResult jce_engine_iterate(JceEngine *e)
      * restores the window. */
     if (SDL_GetAtomicInt(&s_render_paused) != 0) {
         if (e->input) jce_input_update(e->input);
+        /* Throttle main loop while minimized to avoid burning CPU and
+         * to give worker threads (video decode, async assets) a chance
+         * to drain. Without this the main loop spins at thousands of
+         * fps while the renderer is paused, which keeps producing input
+         * polls / log entries / event queue churn. */
+        SDL_Delay(33);
         return JCE_APP_CONTINUE;
     }
 

@@ -50,12 +50,26 @@ function(jce_compile_shaders)
     if(JCE_SHADERC_EXECUTABLE)
         set(_shaderc "${JCE_SHADERC_EXECUTABLE}")
     else()
-        set(_shaderc
-            "${bgfx_PACKAGE_FOLDER_RELEASE}/bin/shaderc${CMAKE_EXECUTABLE_SUFFIX}")
+        # Try Release package folder first (typical native build),
+        # then Debug package folder (when CMAKE_BUILD_TYPE=Debug),
+        # then the Debug build-tree location (Conan keeps shaderc only there).
+        set(_shaderc_candidates
+            "${bgfx_PACKAGE_FOLDER_RELEASE}/bin/shaderc${CMAKE_EXECUTABLE_SUFFIX}"
+            "${bgfx_PACKAGE_FOLDER_DEBUG}/bin/shaderc${CMAKE_EXECUTABLE_SUFFIX}"
+            "${bgfx_PACKAGE_FOLDER_DEBUG}/../b/build/Debug/cmake/bgfx/shaderc${CMAKE_EXECUTABLE_SUFFIX}"
+            "${bgfx_PACKAGE_FOLDER_RELEASE}/../b/build/Release/cmake/bgfx/shaderc${CMAKE_EXECUTABLE_SUFFIX}")
+        set(_shaderc "")
+        foreach(_c IN LISTS _shaderc_candidates)
+            if(_c AND EXISTS "${_c}")
+                set(_shaderc "${_c}")
+                break()
+            endif()
+        endforeach()
     endif()
-    if(NOT EXISTS "${_shaderc}")
+    if(NOT _shaderc OR NOT EXISTS "${_shaderc}")
         message(FATAL_ERROR
-            "shaderc not found at ${_shaderc}.\n"
+            "shaderc not found.\n"
+            "Tried: ${_shaderc_candidates}\n"
             "Native builds:      ensure bgfx is built with tools=True.\n"
             "Cross-compilation:  pass -DJCE_SHADERC_EXECUTABLE=/path/to/shaderc.exe")
     endif()

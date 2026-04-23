@@ -205,8 +205,9 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.ConfigDragClickToInputText = true;  /* single-click on DragFloat enters text-input mode */
 
-    /* Let ImGui persist layout/docking state to imgui.ini. */
-    io.IniFilename = "imgui.ini";
+    /* Ensure .jce config dir exists, then let ImGui persist layout/docking state there. */
+    jce_editor_config_ensure_dir();
+    io.IniFilename = ".jce/imgui.ini";
 
     /* Clipboard. */
     io.SetClipboardTextFn = clipboard_set;
@@ -483,6 +484,14 @@ void jce_editor_toggle(void)
         }
     }
     LOG_INFO(LOG_TAG, "editor %s", s_editor.active ? "shown" : "hidden");
+}
+
+void jce_editor_toggle_fullscreen(void)
+{
+    if (!s_editor.initialized || !s_editor.window)
+        return;
+
+    jce_window_toggle_fullscreen(s_editor.window);
 }
 
 float jce_editor_get_font_size(void)

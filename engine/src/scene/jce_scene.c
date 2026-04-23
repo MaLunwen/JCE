@@ -129,6 +129,12 @@ const char *jce_scene_entity_name(const JceScene *s, JceEntity e)
     return name ? name : "(unnamed)";
 }
 
+const char *jce_scene_entity_registered_name(const JceScene *s, JceEntity e)
+{
+    if (!s || e == JCE_ENTITY_INVALID) return NULL;
+    return ecs_get_name(s->world, (ecs_entity_t)e);
+}
+
 void jce_scene_set_entity_name(JceScene *s, JceEntity e, const char *name)
 {
     if (!s || e == JCE_ENTITY_INVALID) return;

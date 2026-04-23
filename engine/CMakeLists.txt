@@ -302,6 +302,9 @@ target_link_libraries(jce_ui PUBLIC jce_app)
 
 add_library(JCE INTERFACE)
 
+# Expose the CMake-generated version header to all JCE consumers.
+target_include_directories(JCE INTERFACE "${CMAKE_BINARY_DIR}/include")
+
 target_link_libraries(JCE INTERFACE
 	jce_core
 	jce_platform

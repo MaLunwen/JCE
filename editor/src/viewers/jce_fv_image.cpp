@@ -44,83 +44,40 @@ void fv_render_image(FvTab *tab)
         ImGui::SameLine();
         if (ImGui::SmallButton(jce_editor_i18n("viewer.fitToWindow"))) {
             ImVec2 a = ImGui::GetContentRegionAvail();
-            if (tab->img_w > 0 && tab->img_h > 0) {
-                float sx = a.x / (float)tab->img_w;
-                float sy = (a.y - 40.0f) / (float)tab->img_h;
-                tab->zoom = (sx < sy) ? sx : sy;
-                if (tab->zoom < 0.1f) tab->zoom = 0.1f;
-            }
-            tab->pan_x = 0.0f;
-            tab->pan_y = 0.0f;
+            FvZoomable zp{};
+            zp.content_w = tab->img_w;
+            zp.content_h = tab->img_h;
+            zp.zoom      = &tab->zoom;
+            zp.pan_x     = &tab->pan_x;
+            zp.pan_y     = &tab->pan_y;
+            /* Toolbar consumed ~40px of vertical space; account for it. */
+            if (a.y > 40.0f) a.y -= 40.0f;
+            fv_zoomable_fit(&zp, a);
         }
         ImGui::SameLine();
         if (ImGui::SmallButton("1:1")) {
-            tab->zoom = 1.0f;
-            tab->pan_x = 0.0f;
-            tab->pan_y = 0.0f;
+            FvZoomable zp{};
+            zp.zoom  = &tab->zoom;
+            zp.pan_x = &tab->pan_x;
+            zp.pan_y = &tab->pan_y;
+            fv_zoomable_one_to_one(&zp);
         }
     }
 
     ImGui::Separator();
 
-    /* ── Image Display ───────────────────────────────────────────── */
+    /* ── Image Display (shared zoomable canvas) ──────────────────── */
     if (jce_texture_valid(tab->gpu_tex) && tab->img_w > 0 && tab->img_h > 0) {
-        float disp_w = (float)tab->img_w * tab->zoom;
-        float disp_h = (float)tab->img_h * tab->zoom;
-
-        ImGui::BeginChild("##imgscroll", ImVec2(0, 0), false,
-                          ImGuiWindowFlags_HorizontalScrollbar
-                          | ImGuiWindowFlags_NoScrollWithMouse);
-
-        ImVec2 avail = ImGui::GetContentRegionAvail();
-        float base_ox = (avail.x > disp_w) ? (avail.x - disp_w) * 0.5f : 0.0f;
-        float base_oy = (avail.y > disp_h) ? (avail.y - disp_h) * 0.5f : 0.0f;
-        float ox = base_ox + tab->pan_x;
-        float oy = base_oy + tab->pan_y;
-
-        /* Set cursor with pan offset */
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ox);
-        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + oy);
-
-        ImVec2 p = ImGui::GetCursorScreenPos();
-        ImDrawList *dl = ImGui::GetWindowDrawList();
-
-        /* Solid dark background behind image (Java reference style) */
-        dl->AddRectFilled(p, ImVec2(p.x + disp_w, p.y + disp_h),
-                          IM_COL32(48, 48, 52, 255));
-
-        ImGui::Image((ImTextureID)(uintptr_t)tab->gpu_tex.idx,
-                      ImVec2(disp_w, disp_h));
-
-        /* Mouse interactions */
-        if (ImGui::IsWindowHovered()) {
-            /* Mouse wheel zoom (centered on cursor) */
-            float wheel = ImGui::GetIO().MouseWheel;
-            if (wheel != 0.0f) {
-                float old_zoom = tab->zoom;
-                tab->zoom += wheel * 0.1f;
-                if (tab->zoom < 0.1f) tab->zoom = 0.1f;
-                if (tab->zoom > 10.0f) tab->zoom = 10.0f;
-
-                /* Adjust pan to keep zoom centered on mouse */
-                ImVec2 mouse = ImGui::GetIO().MousePos;
-                ImVec2 win_pos = ImGui::GetWindowPos();
-                float mx = mouse.x - win_pos.x - avail.x * 0.5f;
-                float my = mouse.y - win_pos.y - avail.y * 0.5f;
-                float scale = tab->zoom / old_zoom;
-                tab->pan_x = tab->pan_x * scale + mx * (1.0f - scale);
-                tab->pan_y = tab->pan_y * scale + my * (1.0f - scale);
-            }
-
-            /* Middle-click drag panning */
-            if (ImGui::IsMouseDragging(ImGuiMouseButton_Middle)) {
-                ImVec2 delta = ImGui::GetIO().MouseDelta;
-                tab->pan_x += delta.x;
-                tab->pan_y += delta.y;
-            }
-        }
-
-        ImGui::EndChild();
+        FvZoomable zp{};
+        zp.tex         = tab->gpu_tex;
+        zp.content_w   = tab->img_w;
+        zp.content_h   = tab->img_h;
+        zp.zoom        = &tab->zoom;
+        zp.pan_x       = &tab->pan_x;
+        zp.pan_y       = &tab->pan_y;
+        zp.allow_double_click_toggle = true;
+        zp.matte_color = IM_COL32(48, 48, 52, 255);
+        fv_render_zoomable(&zp);
     } else {
         /* Fallback: texture not loaded */
         ImGui::Spacing();

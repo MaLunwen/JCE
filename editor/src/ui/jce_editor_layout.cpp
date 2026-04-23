@@ -21,6 +21,7 @@
 #include "jce_editor_i18n.h"
 #include "jce_editor_colors.h"
 #include "jce_editor_defaults.h"
+#include "jce_editor.h"
 
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -130,8 +131,10 @@ static SaveSceneResult save_scene_or_open_save_as(void)
 static void handle_global_edit_shortcuts(void)
 {
     ImGuiIO &io = ImGui::GetIO();
-    if (!io.KeyCtrl)
+    if (ImGui::IsKeyPressed(ImGuiKey_F11, false)) {
+        jce_editor_toggle_fullscreen();
         return;
+    }
 
     /* Avoid stealing shortcuts while typing in text fields. */
     if (io.WantTextInput)
@@ -139,6 +142,9 @@ static void handle_global_edit_shortcuts(void)
 
     /* Modal dialogs must block background state changes. */
     if (should_block_editor_interaction())
+        return;
+
+    if (!io.KeyCtrl)
         return;
 
     if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
@@ -526,7 +532,7 @@ void jce_editor_layout_draw(void)
     ImGui::DockSpace(dockspace_id, ImVec2(0.0f, 0.0f), ImGuiDockNodeFlags_None);
 
     /* Setup default layout only on first frame AND only if no saved
-       layout exists (imgui.ini).  When imgui.ini is present, ImGui
+       layout exists (.jce/imgui.ini).  When .jce/imgui.ini is present, ImGui
        restores the user's docking arrangement automatically. */
     if (!s_layout_initialized) {
         s_layout_initialized = true;

@@ -1170,12 +1170,13 @@ static bool webm_decode_opus_to_pcm(const void *data, size_t size,
 
     /* Estimate capacity from duration + 20 % slack, but clamp so a
      * pathological/corrupt duration_ns cannot trigger a huge alloc.
-     * Cap the initial reservation at 16 MB worth of frames (~85 s @ 48k stereo);
-     * the realloc-double strategy will grow it from there as needed. */
+     * Cap the initial reservation at 1 M frames (~4 MB stereo); the
+     * realloc-double strategy will grow it from there as needed. The
+     * smaller initial reservation reduces peak RSS for short clips. */
     uint64_t est_frames = (info.duration_ns / 1000000ull) * 48ull;
     if (est_frames < 48000) est_frames = 48000;
     est_frames = est_frames + est_frames / 5u;
-    const uint64_t MAX_INIT_FRAMES = 4u * 1024u * 1024u; /* 4 M frames */
+    const uint64_t MAX_INIT_FRAMES = 1u * 1024u * 1024u; /* 1 M frames */
     if (est_frames > MAX_INIT_FRAMES) est_frames = MAX_INIT_FRAMES;
     size_t cap = (size_t)est_frames * channels;
     int16_t *pcm = (int16_t *)JCE_MALLOC(cap * sizeof(int16_t));
@@ -1184,10 +1185,11 @@ static bool webm_decode_opus_to_pcm(const void *data, size_t size,
 
     const uint8_t *pkt = NULL; size_t pkt_sz = 0;
     uint64_t pts_ns = 0;
-    /* Hard safety cap: 5 minutes of stereo @ 48kHz s16 ≈ 55 MB.
-     * Any honest video clip stays well under this; if we cross it the
-     * parser is likely stuck in a loop and we want to bail rather than OOM. */
-    const size_t HARD_CAP_FRAMES = 5ull * 60ull * 48000ull;
+    /* Hard safety cap: 2 minutes of stereo @ 48kHz s16 ≈ 22 MB.
+     * Long clips get truncated rather than OOMing the editor. The
+     * file-viewer audio preview is not meant for full-length playback;
+     * runtime in-game audio uses streaming codepaths instead. */
+    const size_t HARD_CAP_FRAMES = 2ull * 60ull * 48000ull;
     size_t pkt_count = 0;
     while (jce_webm_read_audio_packet(p, &pkt, &pkt_sz, &pts_ns)) {
         ++pkt_count;
@@ -1215,8 +1217,9 @@ static bool webm_decode_opus_to_pcm(const void *data, size_t size,
         pos = need;
     }
     LOG_INFO(LOG_TAG,
-        "WebM Opus decoded %zu packets -> %zu frames (%uHz x %uch)",
-        pkt_count, pos / channels, 48000u, channels);
+        "WebM Opus decoded %zu packets -> %zu frames (%uHz x %uch, %.1f MB)",
+        pkt_count, pos / channels, 48000u, channels,
+        (double)(pos * sizeof(int16_t)) / (1024.0 * 1024.0));
 
     opus_decoder_destroy(od);
     jce_webm_close(p);

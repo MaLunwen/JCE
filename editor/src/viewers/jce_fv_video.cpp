@@ -369,6 +369,16 @@ void fv_video_update_focus(const char *active_tab_path, bool allow_playback)
         is_active_tab = (active_tab_path && strcmp(st->path, active_tab_path) == 0);
         can_keep_playing = allow_playback && is_active_tab;
         if (!can_keep_playing) {
+            /* Fully release the webm/MP4 parser, decoded PCM buffer, and
+             * GPU texture for any tab that's not the active video viewer.
+             * Each loaded video can pin 80MB+ of mkvparser cluster index
+             * + decoded PCM; keeping 5 inactive tabs around bloated heap
+             * to several GB. The tab's file content stays cached by the
+             * file viewer, so switching back transparently re-loads. */
+            if (!is_active_tab) {
+                free_state(st);
+                continue;
+            }
             pause_state_playback(st);
             st->scrubbing = false;
             st->resume_after_scrub = false;
@@ -524,7 +534,7 @@ void fv_render_video(FvTab *tab)
 
     ImGui::Separator();
 
-    /* ── Frame display ───────────────────────────────────────────── */
+    /* ── Frame display (shared zoomable canvas) ──────────────────── */
 
     ImVec2 avail = ImGui::GetContentRegionAvail();
     if (avail.y < 80.0f) avail.y = 80.0f;
@@ -532,35 +542,41 @@ void fv_render_video(FvTab *tab)
     if (has_video && jce_texture_valid(st->gpu_tex)
         && st->tex_w > 0 && st->tex_h > 0)
     {
-        /* Letterbox-fit the frame inside the remaining area. */
-        float sx = avail.x / (float)st->tex_w;
-        float sy = avail.y / (float)st->tex_h;
-        float scale = (sx < sy) ? sx : sy;
-        if (scale < 0.01f) scale = 0.01f;
+        /* Inline zoom toolbar above the canvas. Reuses FvTab zoom/pan
+         * storage which is otherwise unused by the video viewer. */
+        ImGui::SetNextItemWidth(120);
+        float zoom_pct = (tab->zoom > 0.0f ? tab->zoom : 1.0f) * 100.0f;
+        if (ImGui::SliderFloat("##vzoom", &zoom_pct, 10.0f, 800.0f, "%.0f%%")) {
+            tab->zoom = zoom_pct / 100.0f;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Fit##vfit")) {
+            FvZoomable zp{};
+            zp.content_w = st->tex_w; zp.content_h = st->tex_h;
+            zp.zoom = &tab->zoom; zp.pan_x = &tab->pan_x; zp.pan_y = &tab->pan_y;
+            ImVec2 a = ImGui::GetContentRegionAvail();
+            fv_zoomable_fit(&zp, a);
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("1:1##v11")) {
+            FvZoomable zp{};
+            zp.zoom = &tab->zoom; zp.pan_x = &tab->pan_x; zp.pan_y = &tab->pan_y;
+            fv_zoomable_one_to_one(&zp);
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
+            "wheel=zoom  drag=pan  dbl-click=Fit/1:1");
 
-        float disp_w = (float)st->tex_w * scale;
-        float disp_h = (float)st->tex_h * scale;
-
-        float ox = (avail.x - disp_w) * 0.5f;
-        float oy = (avail.y - disp_h) * 0.5f;
-        if (ox < 0.0f) ox = 0.0f;
-        if (oy < 0.0f) oy = 0.0f;
-
-        ImVec2 origin = ImGui::GetCursorScreenPos();
-        ImDrawList *dl = ImGui::GetWindowDrawList();
-
-        /* Matte behind the frame so the letterbox bars are clearly framed. */
-        dl->AddRectFilled(origin,
-                          ImVec2(origin.x + avail.x, origin.y + avail.y),
-                          IM_COL32(12, 12, 16, 255));
-
-        ImGui::SetCursorScreenPos(ImVec2(origin.x + ox, origin.y + oy));
-        ImGui::Image((ImTextureID)(uintptr_t)st->gpu_tex.idx,
-                      ImVec2(disp_w, disp_h));
-
-        ImGui::SetCursorScreenPos(
-            ImVec2(origin.x, origin.y + avail.y));
-        ImGui::Dummy(ImVec2(0, 0));
+        FvZoomable zp{};
+        zp.tex         = st->gpu_tex;
+        zp.content_w   = st->tex_w;
+        zp.content_h   = st->tex_h;
+        zp.zoom        = &tab->zoom;
+        zp.pan_x       = &tab->pan_x;
+        zp.pan_y       = &tab->pan_y;
+        zp.allow_double_click_toggle = true;
+        zp.matte_color = IM_COL32(12, 12, 16, 255);
+        fv_render_zoomable(&zp);
     } else {
         /* Placeholder when no frame has been decoded yet, or on load failure. */
         ImVec2 origin = ImGui::GetCursorScreenPos();
