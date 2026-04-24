@@ -65,6 +65,7 @@ struct JceAv1Decoder {
     size_t         pos;            /* read cursor (after IVF header) */
     Dav1dPicture   pic;            /* last decoded picture (must be unref'd) */
     bool           pic_valid;
+    bool           ivf_eof;        /* all IVF packets sent; drain buffered frames */
 };
 
 static uint32_t rd_u32_le(const uint8_t *p) {
@@ -102,7 +103,12 @@ JceAv1Decoder *jce_av1_open_memory(const void *data, size_t size,
 
     Dav1dSettings s;
     dav1d_default_settings(&s);
-    s.max_frame_delay = 1;
+    /* S2: n_threads=0 (auto = logical cores, already the default).
+     * max_frame_delay=0 (auto = ceil(sqrt(n_threads))) enables frame-level
+     * parallelism inside dav1d, critical for 4K throughput.  Low-latency
+     * single-frame mode (=1) is only needed for packet-driven paths where
+     * the caller feeds one packet at a time and expects one frame back. */
+    s.max_frame_delay = 0;
     s.logger.cookie = NULL;
     s.logger.callback = av1_silent_logger;
     if (dav1d_open(&dec->ctx, &s) < 0) {
@@ -110,7 +116,11 @@ JceAv1Decoder *jce_av1_open_memory(const void *data, size_t size,
         JCE_FREE(dec);
         return NULL;
     }
-
+    {
+        int actual_delay = dav1d_get_frame_delay(&s);
+        LOG_INFO(LOG_TAG, "dav1d IVF: n_threads=%d max_frame_delay=%d (actual=%d)",
+                 s.n_threads, s.max_frame_delay, actual_delay);
+    }
     if (out_info) {
         out_info->width   = rd_u16_le(p + 12);
         out_info->height  = rd_u16_le(p + 14);
@@ -156,8 +166,17 @@ bool jce_av1_decode_next(JceAv1Decoder *dec,
             return false;
         }
 
-        /* Need more data — feed next IVF frame. */
-        if (dec->pos + 12 > dec->size) return false; /* clean EOF */
+        /* EAGAIN: dav1d needs more input.  If we've already sent all IVF
+         * packets (ivf_eof), dav1d is done — no more frames will come.
+         * With max_frame_delay > 1 the remaining buffered frames would have
+         * been output before EAGAIN was returned, so this is true EOF. */
+        if (dec->ivf_eof) return false;
+
+        /* Feed next IVF frame. */
+        if (dec->pos + 12 > dec->size) {
+            dec->ivf_eof = true;
+            continue; /* let dav1d drain buffered frames via get_picture */
+        }
         uint32_t fsize = rd_u32_le(dec->data + dec->pos);
         dec->pos += 12;
         if (dec->pos + fsize > dec->size) {
@@ -199,6 +218,10 @@ JceAv1Decoder *jce_av1_open_packet(void)
     if (!dec) return NULL;
     Dav1dSettings s;
     dav1d_default_settings(&s);
+    /* Packet-driven path (WebM/AV1): keep max_frame_delay=1 (low-latency).
+     * Caller sends one packet and expects at most one frame back immediately.
+     * Frame-level threading (S2) is not useful here since the pipeline is
+     * bounded by network/demux, not decode throughput. */
     s.max_frame_delay = 1;
     s.logger.cookie = NULL;
     s.logger.callback = av1_silent_logger;

@@ -35,7 +35,7 @@ extern "C" {
  * ══════════════════════════════════════════════════════════════════════ */
 
 #define FV_MAX_TABS       16
-#define FV_MAX_ASSET_BYTES (200 * 1024 * 1024) /* 200 MB per asset */
+#define FV_MAX_ASSET_BYTES (1024 * 1024 * 1024) /* 1 GB per asset */
 #define FV_MAX_CONTENT    (1024 * 256)   /* 256 KB per file */
 #define FV_EDIT_BUF_CAP   (1024 * 64)   /* 64 KB edit buffer */
 

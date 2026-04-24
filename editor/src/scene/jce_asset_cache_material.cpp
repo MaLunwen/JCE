@@ -21,11 +21,12 @@ void material_async_start(void)
     if (s_mat_async.running)
         return;
 
+    if (!s_mat_async.mutex) s_mat_async.mutex = jce_mutex_create();
     s_mat_async.pool = jce_thread_pool_create(2);
     s_mat_async.generation = 1;
     s_mat_async.inflight.clear();
     s_mat_async.completed.clear();
-    s_mat_async.running = (s_mat_async.pool != NULL);
+    s_mat_async.running = (s_mat_async.pool != NULL && s_mat_async.mutex != NULL);
 
     if (!s_mat_async.running) {
         LOG_WARN(LOG_TAG,
@@ -40,7 +41,7 @@ void material_async_stop(void)
 
     std::vector<MaterialInFlightTask> inflight;
     {
-        std::lock_guard<std::mutex> lock(s_mat_async.mutex);
+        JceMutexGuard lock(s_mat_async.mutex);
         inflight.swap(s_mat_async.inflight);
         s_mat_async.completed.clear();
     }
@@ -60,6 +61,11 @@ void material_async_stop(void)
 
     s_mat_async.running = false;
     s_mat_async.generation = 0;
+
+    if (s_mat_async.mutex) {
+        jce_mutex_destroy(s_mat_async.mutex);
+        s_mat_async.mutex = NULL;
+    }
 }
 
 void material_async_begin_new_generation(void)
@@ -67,7 +73,7 @@ void material_async_begin_new_generation(void)
     if (!s_mat_async.running)
         return;
 
-    std::lock_guard<std::mutex> lock(s_mat_async.mutex);
+    JceMutexGuard lock(s_mat_async.mutex);
     s_mat_async.generation++;
     s_mat_async.completed.clear();
 }
@@ -77,7 +83,7 @@ uint64_t material_async_current_generation(void)
     if (!s_mat_async.running)
         return 0;
 
-    std::lock_guard<std::mutex> lock(s_mat_async.mutex);
+    JceMutexGuard lock(s_mat_async.mutex);
     return s_mat_async.generation;
 }
 
@@ -103,7 +109,7 @@ void material_async_queue_request(uint32_t entity_id,
     snprintf(ctx->file_path, sizeof(ctx->file_path), "%s", file_path);
 
     {
-        std::lock_guard<std::mutex> lock(s_mat_async.mutex);
+        JceMutexGuard lock(s_mat_async.mutex);
         ctx->generation = s_mat_async.generation;
 
         for (const MaterialInFlightTask &inflight : s_mat_async.inflight) {
@@ -128,7 +134,7 @@ void material_async_queue_request(uint32_t entity_id,
         return;
     }
 
-    std::lock_guard<std::mutex> lock(s_mat_async.mutex);
+    JceMutexGuard lock(s_mat_async.mutex);
     MaterialInFlightTask inflight = {};
     inflight.task = task;
     inflight.context = ctx;
@@ -139,7 +145,7 @@ static void material_collect_completed_tasks(void)
 {
     std::vector<MaterialInFlightTask> finished;
     {
-        std::lock_guard<std::mutex> lock(s_mat_async.mutex);
+        JceMutexGuard lock(s_mat_async.mutex);
         for (size_t i = 0; i < s_mat_async.inflight.size();) {
             MaterialInFlightTask &entry = s_mat_async.inflight[i];
             if (entry.task && jce_task_done(entry.task)) {
@@ -186,7 +192,7 @@ static void material_collect_completed_tasks(void)
     }
 
     if (!completed.empty()){
-        std::lock_guard<std::mutex> lock(s_mat_async.mutex);
+        JceMutexGuard lock(s_mat_async.mutex);
         for (JceEditorMaterialExtractResult &result : completed)
             s_mat_async.completed.push_back(result);
     }
@@ -205,7 +211,7 @@ bool material_take_completed_result(JceEditorMaterialExtractResult *out_result)
     if (!out_result || !s_mat_async.running)
         return false;
 
-    std::lock_guard<std::mutex> lock(s_mat_async.mutex);
+    JceMutexGuard lock(s_mat_async.mutex);
     if (s_mat_async.completed.empty())
         return false;
 

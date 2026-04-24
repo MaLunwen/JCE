@@ -117,24 +117,29 @@ bool decode_texture_rgba_path(const fs::path &path,
 
 /* ── Texture async worker ───────────────────────────────────────── */
 
-static void texture_async_worker_main(void)
+static void texture_async_worker_main(void *arg)
 {
+    (void)arg;
     for (;;) {
         TextureLoadRequest req;
         {
-            std::unique_lock<std::mutex> lock(s_tex_async.mutex);
-            s_tex_async.cv.wait(lock, [] {
-                return s_tex_async.stop || !s_tex_async.pending.empty();
-            });
+            jce_mutex_lock(s_tex_async.mutex);
+            while (!(s_tex_async.stop || !s_tex_async.pending.empty()))
+                jce_cond_wait(s_tex_async.cv, s_tex_async.mutex);
 
-            if (s_tex_async.stop && s_tex_async.pending.empty())
+            if (s_tex_async.stop && s_tex_async.pending.empty()) {
+                jce_mutex_unlock(s_tex_async.mutex);
                 break;
+            }
 
-            if (s_tex_async.pending.empty())
+            if (s_tex_async.pending.empty()) {
+                jce_mutex_unlock(s_tex_async.mutex);
                 continue;
+            }
 
             req = std::move(s_tex_async.pending.back());
             s_tex_async.pending.pop_back();
+            jce_mutex_unlock(s_tex_async.mutex);
         }
 
         TextureLoadResult result = {};
@@ -164,7 +169,7 @@ static void texture_async_worker_main(void)
                                                       &result.height);
         }
 
-        std::lock_guard<std::mutex> lock(s_tex_async.mutex);
+        JceMutexGuard lock(s_tex_async.mutex);
         s_tex_async.completed.push_back(std::move(result));
     }
 }
@@ -176,12 +181,16 @@ void texture_async_start(void)
     if (s_tex_async.running)
         return;
 
+    if (!s_tex_async.mutex) s_tex_async.mutex = jce_mutex_create();
+    if (!s_tex_async.cv)    s_tex_async.cv    = jce_cond_create();
+
     s_tex_async.generation = 1;
     s_tex_async.stop = false;
     s_tex_async.pending.clear();
     s_tex_async.completed.clear();
 
-    s_tex_async.worker = std::thread(texture_async_worker_main);
+    s_tex_async.worker = jce_thread_create(texture_async_worker_main, NULL,
+                                           "scene_tex_async");
     s_tex_async.running = true;
 }
 
@@ -191,22 +200,27 @@ void texture_async_stop(void)
         return;
 
     {
-        std::lock_guard<std::mutex> lock(s_tex_async.mutex);
+        JceMutexGuard lock(s_tex_async.mutex);
         s_tex_async.stop = true;
     }
-    s_tex_async.cv.notify_all();
+    jce_cond_broadcast(s_tex_async.cv);
 
-    if (s_tex_async.worker.joinable())
-        s_tex_async.worker.join();
+    if (s_tex_async.worker) {
+        jce_thread_join(s_tex_async.worker);
+        s_tex_async.worker = NULL;
+    }
 
     s_tex_async.pending.clear();
     s_tex_async.completed.clear();
     s_tex_async.running = false;
+
+    if (s_tex_async.cv)    { jce_cond_destroy(s_tex_async.cv);    s_tex_async.cv = NULL; }
+    if (s_tex_async.mutex) { jce_mutex_destroy(s_tex_async.mutex); s_tex_async.mutex = NULL; }
 }
 
 void texture_async_begin_new_generation(void)
 {
-    std::lock_guard<std::mutex> lock(s_tex_async.mutex);
+    JceMutexGuard lock(s_tex_async.mutex);
     s_tex_async.generation++;
     s_tex_async.pending.clear();
     s_tex_async.completed.clear();
@@ -214,7 +228,7 @@ void texture_async_begin_new_generation(void)
 
 uint64_t texture_async_current_generation(void)
 {
-    std::lock_guard<std::mutex> lock(s_tex_async.mutex);
+    JceMutexGuard lock(s_tex_async.mutex);
     return s_tex_async.generation;
 }
 
@@ -225,7 +239,7 @@ void texture_async_queue_request(const char *key, const fs::path &file_path)
 
     bool inserted = false;
     {
-        std::lock_guard<std::mutex> lock(s_tex_async.mutex);
+        JceMutexGuard lock(s_tex_async.mutex);
         for (TextureLoadRequest &req : s_tex_async.pending) {
             if (req.generation == s_tex_async.generation && req.key == key) {
                 inserted = true;
@@ -247,7 +261,7 @@ void texture_async_queue_request(const char *key, const fs::path &file_path)
     }
 
     if (inserted)
-        s_tex_async.cv.notify_one();
+        jce_cond_signal(s_tex_async.cv);
 }
 
 void texture_async_queue_resolve_request(const char *key,
@@ -259,7 +273,7 @@ void texture_async_queue_resolve_request(const char *key,
 
     bool inserted = false;
     {
-        std::lock_guard<std::mutex> lock(s_tex_async.mutex);
+        JceMutexGuard lock(s_tex_async.mutex);
         for (TextureLoadRequest &req : s_tex_async.pending) {
             if (req.generation == s_tex_async.generation && req.key == key) {
                 inserted = true;
@@ -281,14 +295,14 @@ void texture_async_queue_resolve_request(const char *key,
     }
 
     if (inserted)
-        s_tex_async.cv.notify_one();
+        jce_cond_signal(s_tex_async.cv);
 }
 
 static void texture_async_take_completed(std::vector<TextureLoadResult> *out)
 {
     if (!out) return;
 
-    std::lock_guard<std::mutex> lock(s_tex_async.mutex);
+    JceMutexGuard lock(s_tex_async.mutex);
     out->swap(s_tex_async.completed);
 }
 
@@ -296,7 +310,7 @@ static void texture_async_push_back_completed(std::vector<TextureLoadResult> *re
 {
     if (!results || results->empty()) return;
 
-    std::lock_guard<std::mutex> lock(s_tex_async.mutex);
+    JceMutexGuard lock(s_tex_async.mutex);
     for (TextureLoadResult &res : *results)
         s_tex_async.completed.push_back(std::move(res));
     results->clear();

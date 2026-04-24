@@ -123,13 +123,71 @@ const char *jce_video_get_audio_status_text(JceVideo v);
 /* Number of encoded samples in the selected MP4 audio track (0 if none/unknown). */
 uint32_t jce_video_get_audio_sample_count(JceVideo v);
 
-/* Access decoded audio PCM buffer (interleaved s16, full clip).
- * Returns NULL when no embedded audio was decoded.
- * Output parameters are set to 0 on failure. */
+/* DEPRECATED: returns the full-clip PCM blob if one is currently
+ * resident. With the streaming pipeline this returns NULL for codec
+ * paths that have been migrated (e.g. WebM/Opus). New code should use
+ * jce_video_audio_pull(). */
 const int16_t *jce_video_get_audio_pcm(JceVideo v,
                                         uint32_t *out_frame_count,
                                         uint32_t *out_channels,
                                         uint32_t *out_samplerate);
+
+/* -- Streaming audio (pull-based) --------------------------------- */
+
+/* Returns format metadata for the embedded audio track, regardless of
+ * whether playback has started. Returns false if no audio is available
+ * (status != READY). */
+bool jce_video_get_audio_format(JceVideo v,
+                                 uint32_t *out_channels,
+                                 uint32_t *out_samplerate,
+                                 double   *out_duration_sec);
+
+/* Pull up to `frames` interleaved s16 frames from the streaming
+ * decoder. Returns the number written. May return less than requested
+ * (under-run); callers that need continuous output should fill the
+ * remainder with silence. Safe to call from the audio device thread. */
+uint32_t jce_video_audio_pull(JceVideo v,
+                               int16_t *out, uint32_t frames);
+
+/* Seek the audio stream to `time_sec`. */
+void jce_video_audio_seek(JceVideo v, double time_sec);
+
+/* Audio playback time, in seconds, derived from frames pulled. */
+double jce_video_audio_get_time(JceVideo v);
+
+/* True iff the streaming source has reached EOF and the buffer is drained. */
+bool jce_video_audio_eof(JceVideo v);
+
+/* -- Performance probes (debug; S1) ------------------------------- */
+
+/* EMA-smoothed per-frame timings (microseconds) and queue/frame
+ * counters for the playback worker. Returns false if the handle is
+ * invalid or playback has not been started (no worker). */
+typedef struct {
+    /* Worker thread (per decoded frame). */
+    double   decode_us_ema;
+    double   decode_us_last;
+    double   convert_us_ema;     /* YUV→RGBA SIMD on the worker side */
+    double   convert_us_last;
+    double   push_us_ema;        /* enqueue under lock */
+    double   push_us_last;
+    /* UI thread (per advance). */
+    double   pop_us_ema;
+    double   pop_us_last;
+    /* Frame queue snapshot. */
+    int      q_count;
+    int      q_capacity;
+    /* Counters since slot init. */
+    uint64_t frames_decoded;
+    uint64_t frames_displayed;
+    uint64_t frames_dropped;     /* late frames skipped during pop */
+    /* Worker state. */
+    bool     worker_running;
+    bool     worker_eof;
+    bool     queue_yuv_mode;     /* false: RGBA queue (current path) */
+} JceVideoPerfStats;
+
+bool jce_video_get_perf_stats(JceVideo v, JceVideoPerfStats *out);
 
 #ifdef __cplusplus
 }

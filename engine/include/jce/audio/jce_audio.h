@@ -81,6 +81,24 @@ void      jce_audio_set_pitch(JceAudio *audio, JceVoice voice, float pitch);
 void      jce_audio_set_looping(JceAudio *audio, JceVoice voice, bool loop);
 bool      jce_audio_is_playing(const JceAudio *audio, JceVoice voice);
 
+/* -- Streaming playback ---------------------------------------------- */
+
+/* Pull callback for jce_audio_play_stream(). Must write up to
+ * `frames` interleaved s16 frames into `out` and return the number
+ * actually produced. Returning 0 signals end-of-stream. Called from
+ * the audio device thread. Must be thread-safe. */
+typedef uint32_t (*JceAudioStreamPullFn)(void *ud,
+                                          int16_t *out,
+                                          uint32_t frames);
+
+/* Begin streaming playback driven by a pull callback. Returns a voice
+ * handle. The caller retains ownership of `ud` and is responsible for
+ * keeping it valid until the voice is stopped (jce_audio_stop). */
+JceVoice  jce_audio_play_stream(JceAudio *audio,
+                                 JceAudioStreamPullFn on_read, void *ud,
+                                 uint16_t channels, uint32_t sample_rate,
+                                 float volume, float pitch);
+
 /* -- Global --------------------------------------------------------- */
 
 void      jce_audio_set_master_volume(JceAudio *audio, float volume);

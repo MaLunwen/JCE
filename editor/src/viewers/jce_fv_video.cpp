@@ -18,6 +18,8 @@ extern "C" {
 #include <jce/audio/jce_audio.h>
 }
 
+#include <SDL3/SDL.h>  /* SDL_GetPerformanceCounter for upload timing (S1) */
+
 #define LOG_TAG "fv_video"
 
 /* ── Per-tab video state (keyed by tab path) ─────────────────────── */
@@ -47,16 +49,62 @@ struct VideoState {
     bool        resume_after_scrub;
     float       pending_seek;   /* seconds, used during scrub */
     float       last_seek_issued;
+    double      sync_resume_at; /* ImGui time when drift-correction may resume */
+
+    /* Deferred audio resume after seek: pause audio, seek video, then wait
+     * until the worker has actually produced a frame at the seek target
+     * before unpausing audio.  Eliminates "video freeze + audio ahead"
+     * desync after slider release.  When pending_audio_resume_seek >= 0
+     * the audio voice is held silent until either:
+     *   (a) frame_counter advances past audio_resume_seek_counter, or
+     *   (b) audio_resume_deadline elapses (timeout fallback). */
+    double      pending_audio_resume_seek;  /* < 0 = not pending */
+    uint64_t    audio_resume_seek_counter;
+    double      audio_resume_deadline;
 
     /* Embedded audio playback (decoded MP4 audio track). */
     JceAudio   *audio;
     JceSound    sound;
     JceVoice    voice;
     bool        audio_available;
+
+    /* Perf overlay (S1). */
+    bool        show_perf_overlay;
+    double      perf_upload_us_ema;
+    double      perf_upload_us_last;
+    uint64_t    perf_uploads;
 };
 
 #define VIDEO_STATE_MAX 32
 static VideoState s_video[VIDEO_STATE_MAX];
+
+/* Pull-callback trampoline for the streaming audio voice. Routes
+ * miniaudio's onRead back into the video module's pull API. */
+static uint32_t fv_video_audio_pull_trampoline(void *ud,
+                                                int16_t *out,
+                                                uint32_t frames)
+{
+    VideoState *st = (VideoState *)ud;
+    if (!st || st->video == JCE_VIDEO_INVALID) return 0;
+    return jce_video_audio_pull(st->video, out, frames);
+}
+
+/* Start (or restart) the streaming voice for `st`. Returns the new
+ * voice handle or JCE_VOICE_INVALID on failure. */
+static JceVoice fv_video_start_stream_voice(VideoState *st)
+{
+    if (!st || !st->audio || st->video == JCE_VIDEO_INVALID)
+        return JCE_VOICE_INVALID;
+    uint32_t ch = 0, sr = 0;
+    double dur = 0.0;
+    if (!jce_video_get_audio_format(st->video, &ch, &sr, &dur))
+        return JCE_VOICE_INVALID;
+    return jce_audio_play_stream(st->audio,
+                                  &fv_video_audio_pull_trampoline,
+                                  st,
+                                  (uint16_t)ch, sr,
+                                  1.0f, 1.0f);
+}
 
 static VideoState *find_state(const char *path)
 {
@@ -99,6 +147,7 @@ static void free_state(VideoState *st)
         st->video = JCE_VIDEO_INVALID;
     }
     memset(st, 0, sizeof(*st));
+    st->pending_audio_resume_seek = -1.0;
 }
 
 static void pause_state_playback(VideoState *st)
@@ -137,6 +186,7 @@ static VideoState *ensure_loaded(FvTab *tab)
     snprintf(st->path, sizeof(st->path), "%s", tab->path);
     st->gpu_tex.idx = UINT16_MAX;
     st->loaded      = true;     /* reserve the slot up-front */
+    st->pending_audio_resume_seek = -1.0;
 
     if (!tab->content || tab->content_len <= 0) {
         st->load_failed = true;
@@ -206,16 +256,39 @@ static void upload_latest_frame(VideoState *st)
     const uint32_t uh = (uint32_t)h;
 
     if (jce_texture_valid(st->gpu_tex)
-        && st->tex_w == w && st->tex_h == h
-        && jce_texture_update_rgba(st->gpu_tex, rgba, uw, uh)) {
-        st->uploaded_counter = counter;
-        return;
+        && st->tex_w == w && st->tex_h == h) {
+        const uint64_t t0 = SDL_GetPerformanceCounter();
+        /* S5: zero-copy ref upload — bgfx borrows display_rgba until bgfx_frame().
+         * display_rgba is stable for the full render frame (repopulated only on
+         * the next jce_video_advance call, which runs before the next upload). */
+        const bool ok = jce_texture_update_rgba_ref(st->gpu_tex, rgba, uw, uh);
+        const uint64_t t1 = SDL_GetPerformanceCounter();
+        if (ok) {
+            const double us = (double)(t1 - t0) * 1e6
+                            / (double)SDL_GetPerformanceFrequency();
+            st->perf_upload_us_last = us;
+            st->perf_upload_us_ema = (st->perf_upload_us_ema <= 0.0)
+                                     ? us
+                                     : st->perf_upload_us_ema * 0.9 + us * 0.1;
+            st->perf_uploads++;
+            st->uploaded_counter = counter;
+            return;
+        }
     }
 
     if (jce_texture_valid(st->gpu_tex))
         jce_texture_destroy(st->gpu_tex);
 
+    const uint64_t t0 = SDL_GetPerformanceCounter();
     st->gpu_tex = jce_texture_from_rgba(rgba, uw, uh);
+    const uint64_t t1 = SDL_GetPerformanceCounter();
+    const double us = (double)(t1 - t0) * 1e6
+                    / (double)SDL_GetPerformanceFrequency();
+    st->perf_upload_us_last = us;
+    st->perf_upload_us_ema = (st->perf_upload_us_ema <= 0.0)
+                             ? us
+                             : st->perf_upload_us_ema * 0.9 + us * 0.1;
+    st->perf_uploads++;
     st->tex_w   = w;
     st->tex_h   = h;
     st->uploaded_counter = counter;
@@ -229,6 +302,30 @@ static void tick_playback(VideoState *st, bool ui_focused)
 
     (void)ui_focused;
 
+    /* ── Deferred audio resume after seek ───────────────────────
+     * If a seek issued by finish_scrub asked us to wait for the worker
+     * to actually produce a frame at the seek target before unpausing
+     * audio, check progress here.  Resume audio (with audio_seek to
+     * land at the same PTS) when either:
+     *   - the worker has produced a new frame at/after the seek target;
+     *   - the deadline elapsed (timeout fallback so audio doesn't stall
+     *     forever if the decoder can't reach the target). */
+    if (st->pending_audio_resume_seek >= 0.0
+        && st->audio_available && st->voice != JCE_VOICE_INVALID) {
+        const uint64_t cnt = jce_video_get_frame_counter(st->video);
+        const double   vtime = jce_video_get_time(st->video);
+        const double   target = st->pending_audio_resume_seek;
+        const bool video_caught_up =
+            (cnt > st->audio_resume_seek_counter
+             && vtime + 0.05 >= target);
+        const bool deadline_hit = (ImGui::GetTime() >= st->audio_resume_deadline);
+        if (video_caught_up || deadline_hit) {
+            jce_video_audio_seek(st->video, target);
+            jce_audio_resume(st->audio, st->voice);
+            st->pending_audio_resume_seek = -1.0;
+        }
+    }
+
     if (st->scrubbing) {
         /* While the user is dragging the seek widget we only update the
          * preview frame, not the playback clock. */
@@ -241,23 +338,29 @@ static void tick_playback(VideoState *st, bool ui_focused)
     if (!st->audio_available && st->video != JCE_VIDEO_INVALID) {
         JceVideoAudioStatus astatus = jce_video_get_audio_status(st->video);
         if (astatus == JCE_VIDEO_AUDIO_STATUS_READY) {
-            uint32_t pcm_frames = 0, pcm_ch = 0, pcm_rate = 0;
-            const int16_t *pcm = jce_video_get_audio_pcm(st->video,
-                                                          &pcm_frames, &pcm_ch, &pcm_rate);
-            if (pcm && pcm_frames > 0 && pcm_ch > 0 && pcm_rate > 0) {
+            uint32_t fmt_ch = 0, fmt_sr = 0;
+            double   fmt_dur = 0.0;
+            if (jce_video_get_audio_format(st->video,
+                                           &fmt_ch, &fmt_sr, &fmt_dur)
+                && fmt_ch > 0 && fmt_sr > 0) {
                 st->audio = jce_audio_create();
                 if (st->audio) {
-                    uint32_t pcm_size = pcm_frames * pcm_ch * (uint32_t)sizeof(int16_t);
-                    st->sound = jce_audio_load_pcm(st->audio, pcm, pcm_size,
-                                                    (uint16_t)pcm_ch, pcm_rate, 16);
-                    if (st->sound != JCE_SOUND_INVALID) {
-                        st->audio_available = true;
-                        if (st->playing)
-                            st->voice = jce_audio_play(st->audio, st->sound,
-                                                        false, 1.0f, 1.0f);
-                    } else {
-                        jce_audio_destroy(st->audio);
-                        st->audio = nullptr;
+                    /* Streaming voice: the audio engine pulls from the
+                     * video's JceAudioStream on demand. The pull
+                     * trampoline routes ma_data_source onRead() back
+                     * into jce_video_audio_pull(). */
+                    st->audio_available = true;
+                    /* Sound handle is unused for streaming voices, but
+                     * keep it valid-ish so the rest of the viewer's
+                     * "is audio loaded" predicates still work. */
+                    st->sound = (JceSound)1;
+                    if (st->playing) {
+                        st->voice = jce_audio_play_stream(
+                            st->audio,
+                            &fv_video_audio_pull_trampoline,
+                            st,
+                            (uint16_t)fmt_ch, fmt_sr,
+                            1.0f, 1.0f);
                     }
                 }
             }
@@ -275,19 +378,30 @@ static void tick_playback(VideoState *st, bool ui_focused)
     if (dt > 0.25f) dt = 0.25f;   /* clamp long frames */
     jce_video_advance(st->video, (double)dt);
 
-    /* ── A/V sync: audio is the master clock ─────────────────────── */
+    /* ── A/V sync ────────────────────────────────────────────────
+     * We previously auto-corrected drift by re-seeking the video to
+     * audio_t whenever |drift| > 150 ms. That created a death loop
+     * after seeks near the end: the video decoder needs N ticks to
+     * walk from a keyframe to the requested time, during which
+     * slot->time gets capped backward, drift grows, we re-seek
+     * forward, decoder restarts, repeat. Net effect: picture never
+     * catches up.
+     *
+     * The fix: trust the user's seek. Audio drives the clock for
+     * has_ended / UI display; video plays at its own decoded pace.
+     * Brief decoder stalls produce at most a fraction of a second of
+     * drift that resolves itself. */
+#if 0
     if (st->audio_available && st->voice != JCE_VOICE_INVALID) {
-        float audio_t = jce_audio_get_time(st->audio, st->voice);
+        float audio_t = (float)jce_video_audio_get_time(st->video);
         float video_t = (float)jce_video_get_time(st->video);
         float drift   = audio_t - video_t;
-        /* Skip sync during initial ramp-up: audio needs a moment to start
-         * producing valid time, while video may decode several frames in the
-         * first tick.  A seek at this stage flushes reference frames and
-         * causes "B-Slice cannot be continued" errors in OpenH264. */
         bool warmup = (audio_t < 0.5f && video_t < 0.5f);
         if (!warmup && fabsf(drift) > 0.15f)
             jce_video_seek(st->video, (double)audio_t, false);
     }
+#endif
+    (void)st->sync_resume_at;
 
     if (jce_video_has_ended(st->video)) {
         st->playing = false;
@@ -339,19 +453,35 @@ static void finish_scrub(VideoState *st)
     /* Exact seek at release for pixel-accurate landing. */
     jce_video_seek(st->video, (double)st->pending_seek, true);
     st->last_seek_issued = st->pending_seek;
+    /* Give the video decoder ~1.5 s of grace to walk from the
+     * keyframe to the requested position before A/V drift correction
+     * starts second-guessing it. */
+    st->sync_resume_at = ImGui::GetTime() + 1.5;
 
     /* The slider release happens after the normal per-frame upload pass. */
     upload_latest_frame(st);
 
-    /* Seek audio to the same position. */
-    if (st->audio_available && st->voice != JCE_VOICE_INVALID)
-        jce_audio_seek(st->audio, st->voice, st->pending_seek);
-
     st->scrubbing = false;
     if (st->resume_after_scrub) {
         st->playing = true;
-        if (st->audio_available && st->voice != JCE_VOICE_INVALID)
-            jce_audio_resume(st->audio, st->voice);
+        if (st->audio_available && st->voice != JCE_VOICE_INVALID) {
+            /* DON'T unpause audio yet — defer until the video worker has
+             * actually produced a frame at the seek target.  Otherwise
+             * audio races ahead while the decoder walks from the
+             * keyframe (often 100–500 ms for HEVC), giving the classic
+             * "audio plays, picture frozen" desync after release.
+             *
+             * tick_playback monitors frame_counter and resumes audio
+             * (with audio_seek) once a fresh frame arrives, or after a
+             * 750 ms timeout fallback. */
+            st->pending_audio_resume_seek    = (double)st->pending_seek;
+            st->audio_resume_seek_counter    = jce_video_get_frame_counter(st->video);
+            st->audio_resume_deadline        = ImGui::GetTime() + 0.75;
+        }
+    } else if (st->audio_available && st->voice != JCE_VOICE_INVALID) {
+        /* Not resuming playback — just reseat audio at the new position
+         * so the next play press starts in sync. */
+        jce_video_audio_seek(st->video, (double)st->pending_seek);
     }
     st->resume_after_scrub = false;
     st->pending_seek       = 0.0f;
@@ -398,11 +528,11 @@ void fv_video_request_play(const char *path)
     if (jce_video_has_ended(st->video)) {
         jce_video_rewind(st->video);
         if (st->audio_available && st->voice != JCE_VOICE_INVALID)
-            jce_audio_seek(st->audio, st->voice, 0.0f);
+            jce_video_audio_seek(st->video, 0.0);
     }
     if (st->audio_available) {
         if (st->voice == JCE_VOICE_INVALID)
-            st->voice = jce_audio_play(st->audio, st->sound, false, 1.0f, 1.0f);
+            st->voice = fv_video_start_stream_voice(st);
         else
             jce_audio_resume(st->audio, st->voice);
     }
@@ -441,12 +571,11 @@ void fv_render_video(FvTab *tab)
             if (jce_video_has_ended(st->video)) {
                 jce_video_rewind(st->video);
                 if (st->audio_available && st->voice != JCE_VOICE_INVALID)
-                    jce_audio_seek(st->audio, st->voice, 0.0f);
+                    jce_video_audio_seek(st->video, 0.0);
             }
             if (st->audio_available) {
                 if (st->voice == JCE_VOICE_INVALID)
-                    st->voice = jce_audio_play(st->audio, st->sound,
-                                                false, 1.0f, 1.0f);
+                    st->voice = fv_video_start_stream_voice(st);
                 else
                     jce_audio_resume(st->audio, st->voice);
             }
@@ -459,7 +588,7 @@ void fv_render_video(FvTab *tab)
     if (ImGui::Button(" |< ")) {
         jce_video_rewind(st->video);
         if (st->audio_available && st->voice != JCE_VOICE_INVALID)
-            jce_audio_seek(st->audio, st->voice, 0.0f);
+            jce_video_audio_seek(st->video, 0.0);
         st->last_seek_issued = 0.0f;
         cur_time = 0.0f;
     }
@@ -510,6 +639,41 @@ void fv_render_video(FvTab *tab)
 
     ImGui::Text("%.2fs / %.2fs", cur_time, dur);
 
+    /* ── Perf overlay (S1 — debug) ───────────────────────────────── */
+    ImGui::SameLine();
+    ImGui::Checkbox("perf", &st->show_perf_overlay);
+    if (st->show_perf_overlay && has_video) {
+        JceVideoPerfStats ps;
+        if (jce_video_get_perf_stats(st->video, &ps)) {
+            const double dec  = ps.decode_us_ema  / 1000.0;
+            const double cv   = ps.convert_us_ema / 1000.0;
+            const double push = ps.push_us_ema    / 1000.0;
+            const double pop  = ps.pop_us_ema     / 1000.0;
+            const double up   = st->perf_upload_us_ema / 1000.0;
+            const double worker_total = dec + cv + push;
+            const double ui_total     = pop + up;
+            ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
+                "worker: dec %5.2f | yuv→rgba %5.2f | push %5.2f = %5.2f ms"
+                "   ui: pop %5.2f | upload %5.2f = %5.2f ms"
+                "   q %d/%d   dec %llu  disp %llu  drop %llu",
+                dec, cv, push, worker_total,
+                pop, up, ui_total,
+                ps.q_count, ps.q_capacity,
+                (unsigned long long)ps.frames_decoded,
+                (unsigned long long)ps.frames_displayed,
+                (unsigned long long)ps.frames_dropped);
+            const double budget = 1000.0 / (st->info.framerate > 0.0
+                                            ? st->info.framerate : 60.0);
+            const ImVec4 worker_color = (worker_total > budget)
+                                        ? ImVec4(1.0f, 0.4f, 0.4f, 1.0f)
+                                        : ImVec4(0.5f, 1.0f, 0.5f, 1.0f);
+            ImGui::TextColored(worker_color,
+                "  budget %.2f ms (%.1f fps) | worker headroom %+.2f ms | ui headroom %+.2f ms",
+                budget, st->info.framerate,
+                budget - worker_total, budget - ui_total);
+        }
+    }
+
     /* Space key toggles play/pause when the file viewer is focused. */
     if (can_decode && ui_focused && ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
         if (!st->playing) {
@@ -517,12 +681,11 @@ void fv_render_video(FvTab *tab)
             if (jce_video_has_ended(st->video)) {
                 jce_video_rewind(st->video);
                 if (st->audio_available && st->voice != JCE_VOICE_INVALID)
-                    jce_audio_seek(st->audio, st->voice, 0.0f);
+                    jce_video_audio_seek(st->video, 0.0);
             }
             if (st->audio_available) {
                 if (st->voice == JCE_VOICE_INVALID)
-                    st->voice = jce_audio_play(st->audio, st->sound,
-                                                false, 1.0f, 1.0f);
+                    st->voice = fv_video_start_stream_voice(st);
                 else
                     jce_audio_resume(st->audio, st->voice);
             }

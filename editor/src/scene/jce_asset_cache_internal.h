@@ -14,13 +14,10 @@
 
 #include <algorithm>
 #include <cctype>
-#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <limits>
-#include <mutex>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -103,9 +100,9 @@ struct MeshLoadResult {
 };
 
 struct MeshAsyncState {
-    std::thread                 worker;
-    std::mutex                  mutex;
-    std::condition_variable     cv;
+    JceThread                   *worker;
+    JceMutex                    *mutex;
+    JceCondVar                  *cv;
     std::vector<MeshLoadRequest> pending;
     std::vector<MeshLoadResult>  completed;
     uint32_t                    discovery;
@@ -137,9 +134,9 @@ struct TextureLoadResult {
 };
 
 struct TextureAsyncState {
-    std::thread                    worker;
-    std::mutex                     mutex;
-    std::condition_variable        cv;
+    JceThread                      *worker;
+    JceMutex                       *mutex;
+    JceCondVar                     *cv;
     std::vector<TextureLoadRequest> pending;
     std::vector<TextureLoadResult>  completed;
     uint64_t                       generation;
@@ -167,7 +164,7 @@ struct MaterialInFlightTask {
 
 struct MaterialAsyncState {
     JceThreadPool                              *pool;
-    std::mutex                                  mutex;
+    JceMutex                                   *mutex;
     std::vector<MaterialInFlightTask>           inflight;
     std::vector<JceEditorMaterialExtractResult> completed;
     uint64_t                                    generation;
@@ -182,6 +179,15 @@ extern MaterialAsyncState s_mat_async;
 #define TEX_FINALIZE_BUDGET_PER_FRAME  4
 
 /* ── Inline helpers ─────────────────────────────────────────────── */
+
+/* RAII guard around JceMutex — replaces std::lock_guard usage. */
+struct JceMutexGuard {
+    JceMutex *m;
+    explicit JceMutexGuard(JceMutex *mtx) : m(mtx) { jce_mutex_lock(m); }
+    ~JceMutexGuard() { jce_mutex_unlock(m); }
+    JceMutexGuard(const JceMutexGuard &) = delete;
+    JceMutexGuard &operator=(const JceMutexGuard &) = delete;
+};
 
 static inline JceTexture tex_invalid(void)
 {

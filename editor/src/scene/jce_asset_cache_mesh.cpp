@@ -45,21 +45,24 @@ static bool mesh_pop_best_request_locked(MeshLoadRequest *out)
 
 /* ── Mesh async worker ──────────────────────────────────────────── */
 
-static void mesh_async_worker_main(void)
+static void mesh_async_worker_main(void *arg)
 {
+    (void)arg;
     for (;;) {
         MeshLoadRequest req;
         {
-            std::unique_lock<std::mutex> lock(s_mesh_async.mutex);
-            s_mesh_async.cv.wait(lock, [] {
-                return s_mesh_async.stop || !s_mesh_async.pending.empty();
-            });
+            jce_mutex_lock(s_mesh_async.mutex);
+            while (!(s_mesh_async.stop || !s_mesh_async.pending.empty()))
+                jce_cond_wait(s_mesh_async.cv, s_mesh_async.mutex);
 
-            if (s_mesh_async.stop && s_mesh_async.pending.empty())
+            if (s_mesh_async.stop && s_mesh_async.pending.empty()) {
+                jce_mutex_unlock(s_mesh_async.mutex);
                 break;
+            }
 
-            if (!mesh_pop_best_request_locked(&req))
-                continue;
+            bool got = mesh_pop_best_request_locked(&req);
+            jce_mutex_unlock(s_mesh_async.mutex);
+            if (!got) continue;
         }
 
         MeshLoadResult result = {};
@@ -73,7 +76,7 @@ static void mesh_async_worker_main(void)
                                         sizeof(found_path))) {
                 result.success = false;
 
-                std::lock_guard<std::mutex> lock(s_mesh_async.mutex);
+                JceMutexGuard lock(s_mesh_async.mutex);
                 s_mesh_async.completed.push_back(std::move(result));
                 continue;
             }
@@ -83,7 +86,7 @@ static void mesh_async_worker_main(void)
         result.success = jce_editor_model_load_cpu_file(req.file_path.c_str(),
                                                         &result.cpu);
 
-        std::lock_guard<std::mutex> lock(s_mesh_async.mutex);
+        JceMutexGuard lock(s_mesh_async.mutex);
         s_mesh_async.completed.push_back(std::move(result));
     }
 }
@@ -95,13 +98,17 @@ void mesh_async_start(void)
     if (s_mesh_async.running)
         return;
 
+    if (!s_mesh_async.mutex) s_mesh_async.mutex = jce_mutex_create();
+    if (!s_mesh_async.cv)    s_mesh_async.cv    = jce_cond_create();
+
     s_mesh_async.discovery = 0;
     s_mesh_async.generation = 1;
     s_mesh_async.stop = false;
     s_mesh_async.pending.clear();
     s_mesh_async.completed.clear();
 
-    s_mesh_async.worker = std::thread(mesh_async_worker_main);
+    s_mesh_async.worker = jce_thread_create(mesh_async_worker_main, NULL,
+                                            "scene_mesh_async");
     s_mesh_async.running = true;
 }
 
@@ -111,13 +118,15 @@ void mesh_async_stop(void)
         return;
 
     {
-        std::lock_guard<std::mutex> lock(s_mesh_async.mutex);
+        JceMutexGuard lock(s_mesh_async.mutex);
         s_mesh_async.stop = true;
     }
-    s_mesh_async.cv.notify_all();
+    jce_cond_broadcast(s_mesh_async.cv);
 
-    if (s_mesh_async.worker.joinable())
-        s_mesh_async.worker.join();
+    if (s_mesh_async.worker) {
+        jce_thread_join(s_mesh_async.worker);
+        s_mesh_async.worker = NULL;
+    }
 
     for (auto &res : s_mesh_async.completed)
         jce_editor_model_free_cpu_data(&res.cpu);
@@ -125,11 +134,14 @@ void mesh_async_stop(void)
     s_mesh_async.pending.clear();
     s_mesh_async.completed.clear();
     s_mesh_async.running = false;
+
+    if (s_mesh_async.cv)    { jce_cond_destroy(s_mesh_async.cv);    s_mesh_async.cv = NULL; }
+    if (s_mesh_async.mutex) { jce_mutex_destroy(s_mesh_async.mutex); s_mesh_async.mutex = NULL; }
 }
 
 void mesh_async_begin_new_generation(void)
 {
-    std::lock_guard<std::mutex> lock(s_mesh_async.mutex);
+    JceMutexGuard lock(s_mesh_async.mutex);
     s_mesh_async.generation++;
     s_mesh_async.discovery = 0;
     s_mesh_async.pending.clear();
@@ -137,7 +149,7 @@ void mesh_async_begin_new_generation(void)
 
 uint64_t mesh_async_current_generation(void)
 {
-    std::lock_guard<std::mutex> lock(s_mesh_async.mutex);
+    JceMutexGuard lock(s_mesh_async.mutex);
     return s_mesh_async.generation;
 }
 
@@ -150,7 +162,7 @@ void mesh_async_queue_request(const char *mesh_path,
 
     bool inserted = false;
     {
-        std::lock_guard<std::mutex> lock(s_mesh_async.mutex);
+        JceMutexGuard lock(s_mesh_async.mutex);
         for (MeshLoadRequest &req : s_mesh_async.pending) {
             if (req.generation == s_mesh_async.generation
                 && req.mesh_path == mesh_path) {
@@ -174,14 +186,14 @@ void mesh_async_queue_request(const char *mesh_path,
     }
 
     if (inserted)
-        s_mesh_async.cv.notify_one();
+        jce_cond_signal(s_mesh_async.cv);
 }
 
 static void mesh_async_take_completed(std::vector<MeshLoadResult> *out)
 {
     if (!out) return;
 
-    std::lock_guard<std::mutex> lock(s_mesh_async.mutex);
+    JceMutexGuard lock(s_mesh_async.mutex);
     out->swap(s_mesh_async.completed);
 }
 
@@ -189,7 +201,7 @@ static void mesh_async_push_back_completed(std::vector<MeshLoadResult> *results)
 {
     if (!results || results->empty()) return;
 
-    std::lock_guard<std::mutex> lock(s_mesh_async.mutex);
+    JceMutexGuard lock(s_mesh_async.mutex);
     for (MeshLoadResult &res : *results)
         s_mesh_async.completed.push_back(std::move(res));
     results->clear();

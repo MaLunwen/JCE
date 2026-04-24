@@ -86,6 +86,189 @@ void jce_cond_broadcast(JceCondVar *c)
 }
 
 /* ================================================================== */
+/* Long-lived dedicated thread (SDL3 SDL_Thread)                       */
+/* ================================================================== */
+
+struct JceThread {
+    SDL_Thread *handle;
+    JceThreadFn fn;
+    void       *arg;
+};
+
+static int sdl_thread_trampoline(void *user)
+{
+    JceThread *t = (JceThread *)user;
+    if (t && t->fn) t->fn(t->arg);
+    return 0;
+}
+
+JceThread *jce_thread_create(JceThreadFn fn, void *arg, const char *name)
+{
+    if (!fn) return NULL;
+    JceThread *t = JCE_NEW(JceThread);
+    if (!t) return NULL;
+    t->fn = fn;
+    t->arg = arg;
+    t->handle = SDL_CreateThread(sdl_thread_trampoline,
+                                 name ? name : "jce_thread", t);
+    if (!t->handle) { JCE_FREE(t); return NULL; }
+    return t;
+}
+
+void jce_thread_join(JceThread *t)
+{
+    if (!t) return;
+    if (t->handle) SDL_WaitThread(t->handle, NULL);
+    JCE_FREE(t);
+}
+
+void jce_thread_sleep_ms(uint32_t ms)
+{
+    SDL_Delay(ms);
+}
+
+/* ================================================================== */
+/* Atomics                                                             */
+/*                                                                     */
+/* Int32 backed by SDL3 lock-free atomics; U64 backed by mutex (SDL3   */
+/* does not expose 64-bit atomics on all targets). Operations are      */
+/* sequentially consistent.                                            */
+/* ================================================================== */
+
+struct JceAtomicI32 {
+    SDL_AtomicInt v;
+};
+
+JceAtomicI32 *jce_atomic_i32_create(int32_t initial)
+{
+    JceAtomicI32 *a = JCE_NEW(JceAtomicI32);
+    if (!a) return NULL;
+    SDL_SetAtomicInt(&a->v, (int)initial);
+    return a;
+}
+
+void jce_atomic_i32_destroy(JceAtomicI32 *a)
+{
+    if (a) JCE_FREE(a);
+}
+
+int32_t jce_atomic_i32_load(const JceAtomicI32 *a)
+{
+    if (!a) return 0;
+    return (int32_t)SDL_GetAtomicInt((SDL_AtomicInt *)&a->v);
+}
+
+void jce_atomic_i32_store(JceAtomicI32 *a, int32_t v)
+{
+    if (a) SDL_SetAtomicInt(&a->v, (int)v);
+}
+
+int32_t jce_atomic_i32_exchange(JceAtomicI32 *a, int32_t v)
+{
+    if (!a) return 0;
+    int prev;
+    do {
+        prev = SDL_GetAtomicInt(&a->v);
+    } while (!SDL_CompareAndSwapAtomicInt(&a->v, prev, (int)v));
+    return (int32_t)prev;
+}
+
+int32_t jce_atomic_i32_add(JceAtomicI32 *a, int32_t v)
+{
+    if (!a) return 0;
+    return (int32_t)SDL_AddAtomicInt(&a->v, (int)v);
+}
+
+struct JceAtomicU64 {
+    SDL_Mutex *m;
+    uint64_t   v;
+};
+
+JceAtomicU64 *jce_atomic_u64_create(uint64_t initial)
+{
+    JceAtomicU64 *a = JCE_NEW(JceAtomicU64);
+    if (!a) return NULL;
+    a->m = SDL_CreateMutex();
+    if (!a->m) { JCE_FREE(a); return NULL; }
+    a->v = initial;
+    return a;
+}
+
+void jce_atomic_u64_destroy(JceAtomicU64 *a)
+{
+    if (!a) return;
+    SDL_DestroyMutex(a->m);
+    JCE_FREE(a);
+}
+
+uint64_t jce_atomic_u64_load(const JceAtomicU64 *a)
+{
+    if (!a) return 0;
+    SDL_LockMutex(a->m);
+    uint64_t v = a->v;
+    SDL_UnlockMutex(a->m);
+    return v;
+}
+
+void jce_atomic_u64_store(JceAtomicU64 *a, uint64_t v)
+{
+    if (!a) return;
+    SDL_LockMutex(a->m);
+    a->v = v;
+    SDL_UnlockMutex(a->m);
+}
+
+uint64_t jce_atomic_u64_add(JceAtomicU64 *a, uint64_t v)
+{
+    if (!a) return 0;
+    SDL_LockMutex(a->m);
+    uint64_t prev = a->v;
+    a->v += v;
+    SDL_UnlockMutex(a->m);
+    return prev;
+}
+
+/* ================================================================== */
+/* Semaphore (SDL3)                                                    */
+/* ================================================================== */
+
+struct JceSemaphore {
+    SDL_Semaphore *handle;
+};
+
+JceSemaphore *jce_semaphore_create(uint32_t initial)
+{
+    JceSemaphore *s = JCE_NEW(JceSemaphore);
+    if (!s) return NULL;
+    s->handle = SDL_CreateSemaphore(initial);
+    if (!s->handle) { JCE_FREE(s); return NULL; }
+    return s;
+}
+
+void jce_semaphore_destroy(JceSemaphore *s)
+{
+    if (!s) return;
+    if (s->handle) SDL_DestroySemaphore(s->handle);
+    JCE_FREE(s);
+}
+
+void jce_semaphore_signal(JceSemaphore *s)
+{
+    if (s && s->handle) SDL_SignalSemaphore(s->handle);
+}
+
+void jce_semaphore_wait(JceSemaphore *s)
+{
+    if (s && s->handle) SDL_WaitSemaphore(s->handle);
+}
+
+bool jce_semaphore_wait_timeout(JceSemaphore *s, uint32_t timeout_ms)
+{
+    if (!s || !s->handle) return false;
+    return SDL_WaitSemaphoreTimeout(s->handle, (Sint32)timeout_ms);
+}
+
+/* ================================================================== */
 /* enkiTS task adapter                                                 */
 /* ================================================================== */
 

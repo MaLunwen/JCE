@@ -17,12 +17,13 @@
 #include "core/jce_memory.h"
 #include "resource/jce_asset_reader.h"
 #include <string.h>
+#include <stdbool.h>
 
 #define LOG_TAG "jce_texture"
 
 /* -- Internal texture registry (for size queries) ------------------ */
 
-#define MAX_TEXTURES 256
+#define MAX_TEXTURES 4096
 
 typedef struct {
     uint16_t idx;
@@ -32,11 +33,21 @@ typedef struct {
 
 static TexEntry s_registry[MAX_TEXTURES];
 static int      s_count;
+static bool     s_registry_warned_full;
 
 static void registry_add(uint16_t idx, uint32_t w, uint32_t h)
 {
-    if (s_count < MAX_TEXTURES)
+    if (s_count < MAX_TEXTURES) {
         s_registry[s_count++] = (TexEntry){ idx, w, h };
+        return;
+    }
+    if (!s_registry_warned_full) {
+        s_registry_warned_full = true;
+        LOG_WARN(LOG_TAG,
+            "texture registry full (%d entries) — size queries will "
+            "miss for new textures; raise MAX_TEXTURES or audit leaks",
+            MAX_TEXTURES);
+    }
 }
 
 static TexEntry *registry_find(uint16_t idx)
@@ -322,8 +333,13 @@ bool jce_texture_update_rgba(JceTexture tex, const void *data,
     if (!jce_texture_valid(tex) || !data || width == 0 || height == 0)
         return false;
 
+    /* If the registry has an entry, dimensions must match.  If the
+     * registry overflowed (entry missing), trust the bgfx handle and
+     * caller-provided dimensions — falling through to destroy+recreate
+     * here would leak GPU memory each frame for high-throughput uploads
+     * (e.g. video viewer) once MAX_TEXTURES is exceeded. */
     TexEntry *e = registry_find(tex.idx);
-    if (!e || e->width != width || e->height != height)
+    if (e && (e->width != width || e->height != height))
         return false;
 
     const uint32_t bytes = width * height * 4u;
@@ -344,12 +360,44 @@ bool jce_texture_update_rgba(JceTexture tex, const void *data,
     return true;
 }
 
+/* Zero-copy variant: bgfx takes a reference to caller-owned data.
+ * Data must remain valid until bgfx_frame() is called (end of render frame).
+ * Saves a ~33 MB memcpy per frame at 4K resolution vs jce_texture_update_rgba. */
+bool jce_texture_update_rgba_ref(JceTexture tex, const void *data,
+                                 uint32_t width, uint32_t height)
+{
+    if (!jce_texture_valid(tex) || !data || width == 0 || height == 0)
+        return false;
+
+    TexEntry *e = registry_find(tex.idx);
+    if (e && (e->width != width || e->height != height))
+        return false;
+
+    const uint32_t bytes = width * height * 4u;
+    const bgfx_memory_t *mem = bgfx_make_ref(data, bytes);
+
+    bgfx_texture_handle_t handle;
+    handle.idx = tex.idx;
+    bgfx_update_texture_2d(handle,
+                           0, /* layer */
+                           0, /* mip */
+                           0, /* x */
+                           0, /* y */
+                           (uint16_t)width,
+                           (uint16_t)height,
+                           mem,
+                           (uint16_t)(width * 4u));
+    return true;
+}
+
+
 void jce_texture_get_size(JceTexture tex, uint32_t *w, uint32_t *h)
 {
     TexEntry *e = registry_find(tex.idx);
     if (w) *w = e ? e->width  : 0;
     if (h) *h = e ? e->height : 0;
 }
+
 
 void jce_texture_destroy(JceTexture tex)
 {

@@ -39,7 +39,12 @@ JceTexture jce_texture_from_rgba(const void *data,
 bool       jce_texture_update_rgba(JceTexture tex, const void *data,
                                    uint32_t width, uint32_t height);
 
-/* Get texture dimensions (0 on invalid handle). */
+/* Update an existing RGBA8 texture in-place (zero-copy variant).
+   bgfx takes a reference to `data`; caller guarantees data remains valid
+   until bgfx_frame() is called (end of the current render frame).
+   Returns false when the handle is invalid or dimensions mismatch. */
+bool       jce_texture_update_rgba_ref(JceTexture tex, const void *data,
+                                       uint32_t width, uint32_t height);
 void       jce_texture_get_size(JceTexture tex, uint32_t *w, uint32_t *h);
 
 /* Destroy a texture. */

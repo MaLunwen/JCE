@@ -41,6 +41,14 @@ typedef struct {
     ma_sound        sound;    /* attached to the engine */
     bool            inited;
     int             sound_slot;
+    /* Streaming voices: custom data source instead of ma_audio_buffer. */
+    bool                  is_stream;
+    ma_data_source_base   stream_ds;
+    JceAudioStreamPullFn  stream_on_read;
+    void                 *stream_ud;
+    ma_uint32             stream_channels;
+    ma_uint32             stream_samplerate;
+    ma_uint64             stream_cursor; /* frames pulled so far */
 } VoiceSlot;
 
 struct JceAudio {
@@ -80,7 +88,14 @@ static void uninit_voice(VoiceSlot *v)
 {
     if (!v->inited) return;
     ma_sound_uninit(&v->sound);
-    ma_audio_buffer_uninit(&v->buffer);
+    if (v->is_stream) {
+        ma_data_source_uninit(&v->stream_ds);
+        v->is_stream = false;
+        v->stream_on_read = NULL;
+        v->stream_ud = NULL;
+    } else {
+        ma_audio_buffer_uninit(&v->buffer);
+    }
     v->inited = false;
     v->sound_slot = -1;
 }
@@ -505,6 +520,137 @@ JceVoice jce_audio_play(JceAudio *audio, JceSound snd,
     return (JceVoice)(vi + 1);
 }
 
+/* ── Streaming source ──────────────────────────────────────────── */
+
+/* miniaudio passes &v->stream_ds (NOT a VoiceSlot*) to vtable callbacks.
+ * Recover the enclosing VoiceSlot via offsetof container_of. */
+static inline VoiceSlot *voice_from_ds(ma_data_source *ds) {
+    return (VoiceSlot *)((char *)ds - offsetof(VoiceSlot, stream_ds));
+}
+
+static ma_result stream_ds_on_read(ma_data_source *ds,
+                                    void *out, ma_uint64 frame_count,
+                                    ma_uint64 *frames_read)
+{
+    VoiceSlot *v = voice_from_ds(ds);
+    if (!v->stream_on_read) {
+        if (frames_read) *frames_read = 0;
+        return MA_AT_END;
+    }
+    /* Cap to uint32 — miniaudio buffers are small per callback. */
+    uint32_t want = frame_count > 0xffffffffull
+        ? 0xffffffffu : (uint32_t)frame_count;
+    /* The pull callback (jce_audio_stream_pull) always returns the full
+     * requested count, padding silence on under-run/EOF. So we can just
+     * forward its output directly. */
+    uint32_t got = v->stream_on_read(v->stream_ud,
+                                     (int16_t *)out, want);
+    if (got == 0) {
+        /* Defensive: pad silence here too in case a future pull impl
+         * returns short. */
+        memset(out, 0, (size_t)want * v->stream_channels * sizeof(int16_t));
+        got = want;
+    }
+    v->stream_cursor += got;
+    if (frames_read) *frames_read = got;
+    return MA_SUCCESS;
+}
+
+static ma_result stream_ds_on_seek(ma_data_source *ds, ma_uint64 frame_index)
+{
+    (void)ds; (void)frame_index;
+    /* Seeks are driven by the upstream JceAudioStream, not via miniaudio. */
+    return MA_NOT_IMPLEMENTED;
+}
+
+static ma_result stream_ds_on_get_data_format(ma_data_source *ds,
+                                              ma_format *format,
+                                              ma_uint32 *channels,
+                                              ma_uint32 *sample_rate,
+                                              ma_channel *channel_map,
+                                              size_t channel_map_cap)
+{
+    VoiceSlot *v = voice_from_ds(ds);
+    if (format) *format = ma_format_s16;
+    if (channels) *channels = v->stream_channels;
+    if (sample_rate) *sample_rate = v->stream_samplerate;
+    (void)channel_map; (void)channel_map_cap;
+    return MA_SUCCESS;
+}
+
+static ma_result stream_ds_on_get_cursor(ma_data_source *ds,
+                                          ma_uint64 *cursor)
+{
+    VoiceSlot *v = voice_from_ds(ds);
+    if (cursor) *cursor = v->stream_cursor;
+    return MA_SUCCESS;
+}
+
+static ma_data_source_vtable g_stream_vtable = {
+    stream_ds_on_read,
+    stream_ds_on_seek,
+    stream_ds_on_get_data_format,
+    stream_ds_on_get_cursor,
+    NULL, /* onGetLength: unknown for streams */
+    NULL, /* onSetLooping */
+    0
+};
+
+JceVoice jce_audio_play_stream(JceAudio *audio,
+                                JceAudioStreamPullFn on_read, void *ud,
+                                uint16_t channels, uint32_t sample_rate,
+                                float volume, float pitch)
+{
+    JCE_PROFILE_ZONE_N("Audio::PlayStream");
+    if (!audio || !on_read || channels == 0 || sample_rate == 0) {
+        JCE_PROFILE_ZONE_END;
+        return JCE_VOICE_INVALID;
+    }
+
+    int vi = alloc_voice(audio);
+    if (vi < 0) {
+        LOG_WARN("jce_audio", "no free voices for stream");
+        JCE_PROFILE_ZONE_END;
+        return JCE_VOICE_INVALID;
+    }
+
+    VoiceSlot *v = &audio->voices[vi];
+
+    ma_data_source_config ds_cfg = ma_data_source_config_init();
+    ds_cfg.vtable = &g_stream_vtable;
+    if (ma_data_source_init(&ds_cfg, &v->stream_ds) != MA_SUCCESS) {
+        LOG_ERROR("jce_audio", "ma_data_source_init failed");
+        JCE_PROFILE_ZONE_END;
+        return JCE_VOICE_INVALID;
+    }
+
+    v->is_stream         = true;
+    v->stream_on_read    = on_read;
+    v->stream_ud         = ud;
+    v->stream_channels   = channels;
+    v->stream_samplerate = sample_rate;
+    v->stream_cursor     = 0;
+
+    if (ma_sound_init_from_data_source(&audio->engine,
+            &v->stream_ds, 0, NULL, &v->sound) != MA_SUCCESS) {
+        LOG_ERROR("jce_audio", "ma_sound_init_from_data_source (stream) failed");
+        ma_data_source_uninit(&v->stream_ds);
+        v->is_stream = false;
+        JCE_PROFILE_ZONE_END;
+        return JCE_VOICE_INVALID;
+    }
+
+    ma_sound_set_volume(&v->sound, volume);
+    ma_sound_set_pitch(&v->sound, pitch);
+    ma_sound_set_looping(&v->sound, MA_FALSE);
+    ma_sound_start(&v->sound);
+
+    v->inited     = true;
+    v->sound_slot = -1;
+    JCE_PROFILE_ZONE_END;
+    return (JceVoice)(vi + 1);
+}
+
 void jce_audio_stop(JceAudio *audio, JceVoice voice)
 {
     if (!audio || voice == JCE_VOICE_INVALID) return;
@@ -712,6 +858,14 @@ const int16_t *jce_audio_get_pcm_data(const JceAudio *audio, JceSound snd,
     if (out_frame_count) *out_frame_count = 0;
     if (out_channels) *out_channels = 0;
     return NULL;
+}
+JceVoice jce_audio_play_stream(JceAudio *audio,
+                                JceAudioStreamPullFn on_read, void *ud,
+                                uint16_t channels, uint32_t sample_rate,
+                                float volume, float pitch) {
+    (void)audio; (void)on_read; (void)ud; (void)channels;
+    (void)sample_rate; (void)volume; (void)pitch;
+    return JCE_VOICE_INVALID;
 }
 
 #endif /* JCE_NO_AUDIO */

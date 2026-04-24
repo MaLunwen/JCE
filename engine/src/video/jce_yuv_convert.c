@@ -291,6 +291,22 @@ static void yuv420_to_rgba_scalar(const uint8_t *y_plane, int y_stride,
 
 /* ── Public dispatch ─────────────────────────────────────────────── */
 
+/* Runtime flag set by jce_yuv_set_avx2() — checked in the x86 dispatch path. */
+static int s_yuv_use_avx2 = 0;
+
+void jce_yuv_set_avx2(int enabled)
+{
+    s_yuv_use_avx2 = enabled;
+}
+
+#if JCE_YUV_HAS_SSE2
+/* Defined in jce_yuv_convert_avx2.c, compiled with /arch:AVX2 or -mavx2. */
+extern void jce_yuv420_to_rgba_avx2(const uint8_t *y_plane, int y_stride,
+                                    const uint8_t *u_plane, int u_stride,
+                                    const uint8_t *v_plane, int v_stride,
+                                    uint8_t *rgba, uint32_t width, uint32_t height);
+#endif
+
 void jce_yuv420_to_rgba(const uint8_t *y_plane, int y_stride,
                         const uint8_t *u_plane, int u_stride,
                         const uint8_t *v_plane, int v_stride,
@@ -300,6 +316,11 @@ void jce_yuv420_to_rgba(const uint8_t *y_plane, int y_stride,
         return;
 
 #if JCE_YUV_HAS_SSE2
+    if (s_yuv_use_avx2) {
+        jce_yuv420_to_rgba_avx2(y_plane, y_stride, u_plane, u_stride,
+                                v_plane, v_stride, rgba, width, height);
+        return;
+    }
     yuv420_to_rgba_sse2(y_plane, y_stride, u_plane, u_stride,
                         v_plane, v_stride, rgba, width, height);
 #elif JCE_YUV_HAS_NEON

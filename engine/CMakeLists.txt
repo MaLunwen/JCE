@@ -153,6 +153,12 @@ _jce_add_layer(jce_video
 	LINK_PUBLIC jce_core
 	LINK_PRIVATE dav1d::dav1d libvpx::libvpx webm::webm Opus::opus)
 
+# S3: compile the AVX2 YUV conversion TU with SIMD flags only for that file.
+set_source_files_properties(
+    "${_ENGINE_SRC}/video/jce_yuv_convert_avx2.c"
+    PROPERTIES COMPILE_OPTIONS
+        "$<IF:$<C_COMPILER_ID:MSVC>,/arch:AVX2,-mavx2>")
+
 if(JCE_ENABLE_PATENTED_CODECS)
 	target_link_libraries(jce_video PRIVATE fdk-aac openh264dec libhevcdec)
 	target_compile_definitions(jce_video PUBLIC JCE_ENABLE_PATENTED_CODECS=1)

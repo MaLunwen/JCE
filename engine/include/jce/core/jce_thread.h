@@ -41,6 +41,67 @@ void        jce_cond_signal(JceCondVar *c);
 void        jce_cond_broadcast(JceCondVar *c);
 
 /* ================================================================== */
+/* Long-lived dedicated thread (SDL3-backed, cross-platform)            */
+/*                                                                     */
+/* Use this for streams that must own a worker for their full lifetime  */
+/* (e.g. video decode loops). Do NOT submit such loops to the thread    */
+/* pool — they would starve enkiTS workers.                             */
+/* ================================================================== */
+
+typedef struct JceThread JceThread;
+
+typedef void (*JceThreadFn)(void *arg);
+
+/* Spawn a dedicated OS thread. `name` is optional (debug label).
+   Returns NULL on failure. */
+JceThread *jce_thread_create(JceThreadFn fn, void *arg, const char *name);
+
+/* Block until the thread function returns; releases all resources.
+   Must be called exactly once per JceThread. */
+void jce_thread_join(JceThread *t);
+
+/* Cross-platform sleep for the calling thread. Uses SDL3 internally. */
+void jce_thread_sleep_ms(uint32_t ms);
+
+/* ================================================================== */
+/* Atomic primitives                                                   */
+/*                                                                     */
+/* Engine-managed atomics so callers never include <atomic> /          */
+/* <stdatomic.h>. All operations have sequentially consistent          */
+/* semantics — sufficient for control flags, counters, EOF signals.    */
+/* For high-throughput hot paths prefer mutex-protected batching.      */
+/* ================================================================== */
+
+typedef struct JceAtomicI32 JceAtomicI32;
+typedef struct JceAtomicU64 JceAtomicU64;
+
+JceAtomicI32 *jce_atomic_i32_create(int32_t initial);
+void          jce_atomic_i32_destroy(JceAtomicI32 *a);
+int32_t       jce_atomic_i32_load(const JceAtomicI32 *a);
+void          jce_atomic_i32_store(JceAtomicI32 *a, int32_t v);
+int32_t       jce_atomic_i32_exchange(JceAtomicI32 *a, int32_t v);
+int32_t       jce_atomic_i32_add(JceAtomicI32 *a, int32_t v); /* returns previous */
+
+JceAtomicU64 *jce_atomic_u64_create(uint64_t initial);
+void          jce_atomic_u64_destroy(JceAtomicU64 *a);
+uint64_t      jce_atomic_u64_load(const JceAtomicU64 *a);
+void          jce_atomic_u64_store(JceAtomicU64 *a, uint64_t v);
+uint64_t      jce_atomic_u64_add(JceAtomicU64 *a, uint64_t v); /* returns previous */
+
+/* ================================================================== */
+/* Semaphore                                                           */
+/* ================================================================== */
+
+typedef struct JceSemaphore JceSemaphore;
+
+JceSemaphore *jce_semaphore_create(uint32_t initial);
+void          jce_semaphore_destroy(JceSemaphore *s);
+void          jce_semaphore_signal(JceSemaphore *s);
+void          jce_semaphore_wait(JceSemaphore *s);
+/* Wait up to `timeout_ms`. Returns true if acquired, false on timeout. */
+bool          jce_semaphore_wait_timeout(JceSemaphore *s, uint32_t timeout_ms);
+
+/* ================================================================== */
 /* Thread pool                                                         */
 /* ================================================================== */
 
