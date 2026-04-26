@@ -8,8 +8,10 @@
 #include "jce_panel_assets_internal.h"
 #include "jce_editor_config.h"
 
+#include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_timer.h>
+
 #include <chrono>
-#include <ctime>
 
 /* ── State instance (shared via extern in internal header) ───────── */
 
@@ -42,19 +44,12 @@ static std::string format_modified_time(const fs::directory_entry &de)
         const auto file_tp = de.last_write_time();
         const auto sys_tp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
             file_tp - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
-        const std::time_t raw_time = std::chrono::system_clock::to_time_t(sys_tp);
+        const auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
+            sys_tp.time_since_epoch()).count();
 
-        std::tm local_tm = {};
-#ifdef _WIN32
-        if (localtime_s(&local_tm, &raw_time) != 0)
-            return "";
-#else
-        if (!localtime_r(&raw_time, &local_tm))
-            return "";
-#endif
-
-        char buf[32] = {0};
-        if (std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &local_tm) == 0)
+        char buf[32];
+        if (jce_time_format_local((int64_t)epoch, "%Y-%m-%d %H:%M",
+                                  buf, sizeof(buf)) == 0)
             return "";
         return std::string(buf);
     } catch (...) {
@@ -74,6 +69,8 @@ void ensure_assets_init(void)
     s_assets.context_idx       = -1;
     s_assets.needs_refresh     = true;
     s_assets.clipboard_cut     = false;
+    s_assets.clipboard_flash_t = 0.0f;
+    s_assets.paste_flash_t     = 0.0f;
     s_assets.show_delete_confirm = false;
     s_assets.show_delete_dialog_open = false;
     s_assets.pending_delete_dir_count = 0;
@@ -289,48 +286,104 @@ const char *type_label_for_entry(const FileEntry &fe)
 
 void copy_selection_to_clipboard(bool cut)
 {
+    copy_selection_from_view_to_clipboard(s_assets.entries, cut);
+}
+
+void copy_selection_from_view_to_clipboard(
+    const std::vector<FileEntry> &view, bool cut)
+{
     s_assets.clipboard_paths.clear();
     for (int si : s_assets.selected_set)
-        if (si >= 0 && si < (int)s_assets.entries.size())
-            s_assets.clipboard_paths.push_back(s_assets.entries[si].path);
+        if (si >= 0 && si < (int)view.size())
+            s_assets.clipboard_paths.push_back(view[si].path);
     s_assets.clipboard_cut = cut;
+    s_assets.clipboard_flash_t = 0.6f;
+    if (!s_assets.clipboard_paths.empty()) {
+        for (auto &p : s_assets.clipboard_paths)
+            s_assets.entry_flash[p] = 0.6f;
+        jce_editor_console_log("%s %d item(s)",
+            cut ? "Cut" : "Copied", (int)s_assets.clipboard_paths.size());
+    }
+}
+
+void copy_path_to_clipboard(const std::string &path, bool cut)
+{
+    if (path.empty()) return;
+    s_assets.clipboard_paths.clear();
+    s_assets.clipboard_paths.push_back(path);
+    s_assets.clipboard_cut = cut;
+    s_assets.clipboard_flash_t = 0.6f;
+    jce_editor_console_log("%s '%s'",
+        cut ? "Cut" : "Copied",
+        fs::path(path).filename().string().c_str());
 }
 
 void execute_clipboard_paste(void)
 {
-    try {
-        for (auto &cp : s_assets.clipboard_paths) {
-            fs::path src(cp);
-            fs::path dst = fs::path(s_assets.current_path) / src.filename();
-            if (s_assets.clipboard_cut) {
-                fs::rename(src, dst);
-                jce_editor_console_log("Moved '%s'",
-                    src.filename().string().c_str());
-            } else {
-                fs::copy(src, dst, fs::copy_options::recursive);
-                jce_editor_console_log("Pasted '%s'",
-                    src.filename().string().c_str());
-            }
+    int n = 0;
+    for (auto &cp : s_assets.clipboard_paths) {
+        std::string fname;
+        {
+            /* Extract basename from cp without std::filesystem. */
+            size_t s = cp.find_last_of("/\\");
+            fname = (s == std::string::npos) ? cp : cp.substr(s + 1);
         }
-        if (s_assets.clipboard_cut)
-            s_assets.clipboard_paths.clear();
-        s_assets.needs_refresh = true;
-    } catch (const std::exception &e) {
-        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-            "Paste failed: %s", e.what());
+        std::string desired = s_assets.current_path + "/" + fname;
+
+        if (s_assets.clipboard_cut) {
+            if (desired == cp) continue; /* same folder no-op */
+            if (!jce_fs_host_rename(cp.c_str(), desired.c_str())) {
+                jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                    "Move failed: '%s'", fname.c_str());
+                continue;
+            }
+            jce_editor_console_log("Moved '%s'", fname.c_str());
+            s_assets.entry_flash[desired] = 0.6f;
+        } else {
+            char unique[1200];
+            const char *dst_path = desired.c_str();
+            if (jce_fs_host_exists_file(desired.c_str())
+                || jce_fs_host_exists_dir(desired.c_str()))
+            {
+                if (jce_fs_host_make_unique_path(desired.c_str(),
+                                                 unique, sizeof(unique)))
+                {
+                    dst_path = unique;
+                }
+            }
+            if (!jce_fs_host_copy_recursive(cp.c_str(), dst_path)) {
+                jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                    "Copy failed: '%s'", fname.c_str());
+                continue;
+            }
+            jce_editor_console_log("Pasted '%s' -> '%s'",
+                fname.c_str(), dst_path);
+            s_assets.entry_flash[dst_path] = 0.6f;
+        }
+        ++n;
     }
+    if (s_assets.clipboard_cut)
+        s_assets.clipboard_paths.clear();
+    s_assets.needs_refresh = true;
+    if (n > 0) s_assets.paste_flash_t = 0.6f;
 }
 
 void collect_selected_for_deletion(void)
+{
+    collect_selected_from_view_for_deletion(s_assets.entries);
+}
+
+void collect_selected_from_view_for_deletion(
+    const std::vector<FileEntry> &view)
 {
     s_assets.pending_delete_paths.clear();
     s_assets.pending_delete_names.clear();
     s_assets.pending_delete_dir_count = 0;
     for (int si : s_assets.selected_set) {
-        if (si >= 0 && si < (int)s_assets.entries.size()) {
-            s_assets.pending_delete_paths.push_back(s_assets.entries[si].path);
-            s_assets.pending_delete_names.push_back(s_assets.entries[si].name);
-            if (s_assets.entries[si].is_dir)
+        if (si >= 0 && si < (int)view.size()) {
+            s_assets.pending_delete_paths.push_back(view[si].path);
+            s_assets.pending_delete_names.push_back(view[si].name);
+            if (view[si].is_dir)
                 s_assets.pending_delete_dir_count++;
         }
     }
@@ -356,7 +409,8 @@ bool jce_editor_assets_delete_dialog_open(void)
 
 /* ── Keyboard shortcuts ──────────────────────────────────────────── */
 
-static void handle_asset_keyboard_shortcuts(void)
+static void handle_asset_keyboard_shortcuts(
+    const std::vector<FileEntry> &view)
 {
     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)
         && s_assets.renaming_idx < 0
@@ -366,61 +420,65 @@ static void handle_asset_keyboard_shortcuts(void)
         bool ctrl    = ImGui::GetIO().KeyCtrl;
 
         if (has_sel && s_assets.selected_set.size() == 1
-            && ImGui::IsKeyPressed(ImGuiKey_F2))
+            && ImGui::IsKeyPressed(ImGuiKey_F2, false))
         {
             int sel = *s_assets.selected_set.begin();
-            s_assets.renaming_idx = sel;
-            s_assets.rename_focus_needed = true;
-            snprintf(s_assets.rename_buf, sizeof(s_assets.rename_buf),
-                    "%s", s_assets.entries[sel].name.c_str());
+            if (sel >= 0 && sel < (int)view.size()) {
+                s_assets.renaming_idx = sel;
+                s_assets.rename_focus_needed = true;
+                snprintf(s_assets.rename_buf, sizeof(s_assets.rename_buf),
+                        "%s", view[sel].name.c_str());
+            }
         }
 
-        if (has_sel && ImGui::IsKeyPressed(ImGuiKey_Delete))
-            collect_selected_for_deletion();
+        if (has_sel && ImGui::IsKeyPressed(ImGuiKey_Delete, false))
+            collect_selected_from_view_for_deletion(view);
 
-        if (has_sel && ctrl && ImGui::IsKeyPressed(ImGuiKey_C))
-            copy_selection_to_clipboard(false);
+        if (has_sel && ctrl && ImGui::IsKeyPressed(ImGuiKey_C, false))
+            copy_selection_from_view_to_clipboard(view, false);
 
-        if (has_sel && ctrl && ImGui::IsKeyPressed(ImGuiKey_X))
-            copy_selection_to_clipboard(true);
+        if (has_sel && ctrl && ImGui::IsKeyPressed(ImGuiKey_X, false))
+            copy_selection_from_view_to_clipboard(view, true);
 
-        if (ctrl && ImGui::IsKeyPressed(ImGuiKey_V)
+        if (ctrl && ImGui::IsKeyPressed(ImGuiKey_V, false)
             && !s_assets.clipboard_paths.empty())
         {
             execute_clipboard_paste();
         }
 
-        if (has_sel && ctrl && ImGui::IsKeyPressed(ImGuiKey_D)) {
-            try {
-                for (int si : s_assets.selected_set) {
-                    if (si < 0 || si >= (int)s_assets.entries.size()) continue;
-                    const FileEntry &fe = s_assets.entries[si];
-                    fs::path src(fe.path);
-                    fs::path dst;
-                    if (fe.is_dir) {
-                        dst = src.parent_path() / (fe.name + "_copy");
-                    } else {
-                        std::string stem = src.stem().string();
-                        std::string ext  = src.extension().string();
-                        dst = src.parent_path() / (stem + "_copy" + ext);
-                    }
-                    fs::copy(src, dst, fs::copy_options::recursive);
-                    jce_editor_console_log("Duplicated '%s'", fe.name.c_str());
+        if (has_sel && ctrl && ImGui::IsKeyPressed(ImGuiKey_D, false)) {
+            int dup_count = 0;
+            for (int si : s_assets.selected_set) {
+                if (si < 0 || si >= (int)view.size()) continue;
+                const FileEntry &fe = view[si];
+                char unique[1200];
+                if (!jce_fs_host_make_unique_path(fe.path.c_str(),
+                                                   unique, sizeof(unique)))
+                {
+                    jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                        "Duplicate failed: cannot find unique name for '%s'",
+                        fe.name.c_str());
+                    continue;
                 }
-                s_assets.needs_refresh = true;
-            } catch (const std::exception &e) {
-                jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-                    "Duplicate failed: %s", e.what());
+                if (!jce_fs_host_copy_recursive(fe.path.c_str(), unique)) {
+                    jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                        "Duplicate failed: '%s'", fe.name.c_str());
+                    continue;
+                }
+                jce_editor_console_log("Duplicated '%s'", fe.name.c_str());
+                s_assets.entry_flash[unique] = 0.6f;
+                ++dup_count;
             }
+            if (dup_count > 0) s_assets.needs_refresh = true;
         }
 
-        if (ctrl && ImGui::IsKeyPressed(ImGuiKey_A)) {
+        if (ctrl && ImGui::IsKeyPressed(ImGuiKey_A, false)) {
             s_assets.selected_set.clear();
-            for (int si = 0; si < (int)s_assets.entries.size(); si++)
+            for (int si = 0; si < (int)view.size(); si++)
                 s_assets.selected_set.insert(si);
         }
 
-        if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
             s_assets.selected_set.clear();
             s_assets.last_clicked_idx = -1;
         }
@@ -518,6 +576,24 @@ void jce_editor_panel_assets_content(void)
 {
     ensure_assets_init();
 
+    /* Decay clipboard / paste flash effects. */
+    {
+        float dt = ImGui::GetIO().DeltaTime;
+        if (s_assets.clipboard_flash_t > 0.0f)
+            s_assets.clipboard_flash_t -= dt;
+        if (s_assets.paste_flash_t > 0.0f)
+            s_assets.paste_flash_t -= dt;
+        for (auto it = s_assets.entry_flash.begin();
+             it != s_assets.entry_flash.end(); )
+        {
+            it->second -= dt;
+            if (it->second <= 0.0f)
+                it = s_assets.entry_flash.erase(it);
+            else
+                ++it;
+        }
+    }
+
     if (!s_assets.pending_navigation_path.empty()) {
         s_assets.current_path = s_assets.pending_navigation_path;
         s_assets.pending_navigation_path.clear();
@@ -582,7 +658,7 @@ void jce_editor_panel_assets_content(void)
                 ImGui::OpenPopup("AssetContextMenu");
 
             draw_asset_item_context_menu(display_entries);
-            handle_asset_keyboard_shortcuts();
+            handle_asset_keyboard_shortcuts(display_entries);
             draw_asset_empty_area_menu();
         }
 

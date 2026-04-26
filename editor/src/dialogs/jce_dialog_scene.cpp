@@ -119,9 +119,11 @@ void jce_editor_dialog_new_scene(bool *p_open)
                      sizeof(s_new_scene.scene_dir));
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("openProject.browse"), ImVec2(80, 0))) {
-        pick_folder_dialog(jce_editor_i18n("sceneDialog.chooseDirectory"),
-                           s_new_scene.scene_dir,
-                           sizeof(s_new_scene.scene_dir));
+        pick_folder_dialog_async(jce_editor_i18n("sceneDialog.chooseDirectory"),
+                                 NULL,
+                                 s_new_scene.scene_dir,
+                                 sizeof(s_new_scene.scene_dir),
+                                 NULL, 0, NULL, NULL);
     }
 
     bool dir_valid = (s_new_scene.scene_dir[0] != '\0');
@@ -161,13 +163,12 @@ void jce_editor_dialog_new_scene(bool *p_open)
                 if (!is_scene_filename(name)) name += ".scene";
                 fs::path scene_path = fs::path(s_new_scene.scene_dir) / name;
 
-                FILE *fp = fopen(scene_path.string().c_str(), "w");
-                if (!fp) {
+                static const char empty_scene[] = "{}";
+                if (!ed_write_file(scene_path.string().c_str(),
+                                   empty_scene, sizeof(empty_scene) - 1)) {
                     jce_editor_console_log_level(JCE_CONSOLE_ERROR,
                         "Failed to create scene file: %s", scene_path.string().c_str());
                 } else {
-                    fputs("{}", fp);
-                    fclose(fp);
                     if (jce_state_load_scene_file(scene_path.string().c_str())) {
                         jce_editor_console_log("Created scene: %s", scene_path.string().c_str());
                         jce_editor_layout_request_focus_scene_view();
@@ -301,11 +302,14 @@ void jce_editor_dialog_open_scene(bool *p_open)
                      sizeof(s_open_scene.scene_dir));
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("openProject.browse"), ImVec2(80, 0))) {
-        if (pick_folder_dialog(jce_editor_i18n("sceneDialog.chooseDirectory"),
-                               s_open_scene.scene_dir,
-                               sizeof(s_open_scene.scene_dir))) {
-            s_open_scene.refresh = true;
-        }
+        /* Async pick: callback flips s_open_scene.refresh on success. */
+        pick_folder_dialog_async(jce_editor_i18n("sceneDialog.chooseDirectory"),
+                                 NULL,
+                                 s_open_scene.scene_dir,
+                                 sizeof(s_open_scene.scene_dir),
+                                 NULL, 0,
+                                 &s_open_scene.refresh,
+                                 NULL);
     }
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("assetBrowser.refresh"), ImVec2(80, 0))) {
@@ -463,9 +467,11 @@ void jce_editor_dialog_save_as(bool *p_open)
                      sizeof(s_save_as.save_location));
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("openProject.browse"), ImVec2(80, 0))) {
-        pick_folder_dialog(jce_editor_i18n("sceneDialog.chooseDirectory"),
-                           s_save_as.save_location,
-                           sizeof(s_save_as.save_location));
+        pick_folder_dialog_async(jce_editor_i18n("sceneDialog.chooseDirectory"),
+                                 NULL,
+                                 s_save_as.save_location,
+                                 sizeof(s_save_as.save_location),
+                                 NULL, 0, NULL, NULL);
     }
 
     /* Buttons: Save | Cancel (right-aligned) */

@@ -7,6 +7,6 @@
 #ifndef JCE_API_AI_H
 #define JCE_API_AI_H
 
-#include <jce/ai/jce_bt.h>
+#include <jce/middleware/ai/jce_bt.h>
 
 #endif /* JCE_API_AI_H */

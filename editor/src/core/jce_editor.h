@@ -18,8 +18,8 @@
 extern "C" {
 #endif
 
-#include <jce/core/pak_loader.h>
-#include <jce/platform/jce_window.h>
+#include <jce/os/core/pak_loader.h>
+#include <jce/os/platform/jce_window.h>
 
 /* Initialize the editor subsystem.
    Creates ImGui context, loads fonts, sets up bgfx backend.

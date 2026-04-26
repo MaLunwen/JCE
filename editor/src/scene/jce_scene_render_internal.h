@@ -19,20 +19,20 @@
 #include <string.h>
 
 extern "C" {
-#include <jce/core/jce_log.h>
-#include <jce/core/jce_math.h>
-#include <jce/graphics/jce_camera.h>
-#include <jce/graphics/jce_debug_draw.h>
-#include <jce/graphics/jce_offscreen_target.h>
-#include <jce/graphics/jce_lighting.h>
-#include <jce/graphics/jce_material.h>
-#include <jce/graphics/jce_mesh.h>
-#include <jce/graphics/jce_renderer.h>
-#include <jce/graphics/jce_renderer_caps.h>
-#include <jce/graphics/jce_shaders.h>
-#include <jce/graphics/jce_texture.h>
-#include <jce/graphics/jce_views.h>
-#include <jce/render/jce_scene_renderer.h>
+#include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_math.h>
+#include <jce/renderer/jce_camera.h>
+#include <jce/renderer/jce_debug_draw.h>
+#include <jce/renderer/jce_offscreen_target.h>
+#include <jce/renderer/jce_lighting.h>
+#include <jce/renderer/jce_material.h>
+#include <jce/renderer/jce_mesh.h>
+#include <jce/renderer/jce_renderer.h>
+#include <jce/renderer/jce_renderer_caps.h>
+#include <jce/renderer/jce_shaders.h>
+#include <jce/renderer/jce_texture.h>
+#include <jce/renderer/jce_views.h>
+#include <jce/renderer/jce_scene_renderer.h>
 }
 
 #define LOG_TAG "scene_render"

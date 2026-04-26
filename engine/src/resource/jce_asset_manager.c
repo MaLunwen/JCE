@@ -16,18 +16,19 @@
 
 #include "jce_asset_manager.h"
 #include "jce_asset_loaders.h"
-#include "core/jce_memory.h"
-#include <jce/core/pak_loader.h>
+#include "os/core/jce_memory.h"
+#include <jce/os/core/pak_loader.h>
 #include <jce/resource/jce_asset_format.h>
-#include <jce/graphics/jce_texture.h>
-#include <jce/graphics/jce_mesh.h>
-#include <jce/graphics/jce_model.h>
-#include <jce/graphics/jce_text.h>
-#include <jce/audio/jce_audio.h>
-#include <jce/core/jce_log.h>
-#include <jce/core/jce_profiler.h>
+#include <jce/renderer/jce_texture.h>
+#include <jce/renderer/jce_mesh.h>
+#include <jce/renderer/jce_model.h>
+#include <jce/renderer/jce_text.h>
+#include <jce/middleware/audio/jce_audio.h>
+#include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_profiler.h>
 
 #include <SDL3/SDL.h>
+#include <jce/os/core/jce_timer.h>
 #include <xxhash.h>
 #include <string.h>
 
@@ -576,8 +577,8 @@ uint32_t jce_asset_manager_update(JceAssetManager *mgr,
 		return 0;
 	}
 
-	uint64_t start = SDL_GetPerformanceCounter();
-	uint64_t freq  = SDL_GetPerformanceFrequency();
+	uint64_t start = jce_time_perf_counter();
+	uint64_t freq  = jce_time_perf_freq();
 	double budget_sec = (max_finalize_ms > 0)
 		? (double)max_finalize_ms / 1000.0
 		: 1e9; /* unlimited */
@@ -618,7 +619,7 @@ uint32_t jce_asset_manager_update(JceAssetManager *mgr,
 
 		/* Check time budget. */
 		if (max_finalize_ms > 0) {
-			uint64_t now = SDL_GetPerformanceCounter();
+			uint64_t now = jce_time_perf_counter();
 			double elapsed = (double)(now - start) / (double)freq;
 			if (elapsed >= budget_sec) {
 				/* Put remaining back — they'll be drained next frame. */

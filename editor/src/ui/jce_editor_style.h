@@ -11,7 +11,7 @@
 extern "C" {
 #endif
 
-#include <jce/core/pak_loader.h>
+#include <jce/os/core/pak_loader.h>
 
 /* Theme indices. */
 #define JCE_THEME_DARK   0
@@ -28,9 +28,31 @@ void jce_editor_apply_theme(int theme_idx);
 /* Get current theme index. */
 int  jce_editor_get_theme(void);
 
-/* Load JCE.ttf from PAK and set it as the default font.
+/* Load fonts and set the default. Resolution priority for each font:
+     1. user override path (if non-NULL and file exists)
+     2. system font (e.g. Ink Free / KaiTi installed on the host OS)
+   No fonts are bundled — if both lookups fail, the editor falls back to
+   ImGui's built-in proggy font for that role.
+   Override paths may be NULL or empty.
    Must be called before jce_imgui_bgfx_rebuild_fonts(). */
-bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels);
+bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
+                           const char *en_override,
+                           const char *zh_override);
+
+/* Discoverable font entry returned by jce_editor_enumerate_fonts(). */
+typedef struct {
+    char display_name[128]; /* e.g. "Ink Free", "Microsoft YaHei", "msgothic.ttc" */
+    char path[1024];        /* absolute filesystem path                          */
+} JceFontEntry;
+
+/* Enumerate font files available on the host system by scanning a small
+   set of well-known per-platform directories. Picks up *.ttf / *.otf /
+   *.ttc files. Pure runtime detection (SDL_GetPlatform + SDL_getenv);
+   no #ifdef branches.
+
+   Writes up to `max_entries` records into `out` and returns the count
+   actually written. Sorted alphabetically by display_name. */
+int  jce_editor_enumerate_fonts(JceFontEntry *out, int max_entries);
 
 #ifdef __cplusplus
 }

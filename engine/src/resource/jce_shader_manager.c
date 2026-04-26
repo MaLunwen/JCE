@@ -3,13 +3,13 @@
  */
 
 #include "jce_shader_manager.h"
-#include <jce/graphics/jce_shaders.h>
-#include <jce/core/jce_log.h>
+#include <jce/renderer/jce_shaders.h>
+#include <jce/os/core/jce_log.h>
 
 #include <bgfx/c99/bgfx.h>
 #include <stdio.h>
 #include <string.h>
-#include "core/jce_memory.h"
+#include "os/core/jce_memory.h"
 
 #define LOG_TAG "shader_mgr"
 #define MAX_SHADERS 64

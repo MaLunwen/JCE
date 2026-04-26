@@ -96,7 +96,7 @@ if(JCE_BUILD_JNI)
 	target_link_libraries(CagedKingdom PRIVATE JCE)
 	if(MSVC)
 		# MSVC: /WHOLEARCHIVE forces all .obj from each .lib to be included.
-		foreach(_lib jce_app jce_core)
+		foreach(_lib jce_application jce_core)
 			target_link_options(CagedKingdom PRIVATE
 				"/WHOLEARCHIVE:$<TARGET_FILE:${_lib}>")
 		endforeach()
@@ -104,7 +104,7 @@ if(JCE_BUILD_JNI)
 		# GCC / Clang: --whole-archive / --no-whole-archive bracket.
 		target_link_options(CagedKingdom PRIVATE
 			"LINKER:--whole-archive"
-			"$<TARGET_FILE:jce_app>"
+			"$<TARGET_FILE:jce_application>"
 			"$<TARGET_FILE:jce_core>"
 			"LINKER:--no-whole-archive")
 	endif()

@@ -120,12 +120,16 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
         float center[3] = {0.0f, 0.0f, 0.0f};
         float up[3] = {0.0f, 1.0f, 0.0f};
 
-        glm_lookat(eye, center, up, (vec4 *)gcam.view);
+        jce_mat4 view_m = jce_m4_look_at(jce_v3(eye[0], eye[1], eye[2]),
+                                         jce_v3(center[0], center[1], center[2]),
+                                         jce_v3(up[0], up[1], up[2]));
+        memcpy(gcam.view, &view_m, sizeof(gcam.view));
 
         float fov = 45.0f * JCE_DEG2RAD;
         float aspect = (ctx->avail.y > 0) ? (ctx->avail.x / ctx->avail.y) : 1.0f;
         float near_p = 0.1f, far_p = 1000.0f;
-        glm_perspective_rh_no(fov, aspect, near_p, far_p, (vec4 *)gcam.proj);
+        jce_mat4 proj_m = jce_m4_perspective(fov, aspect, near_p, far_p, true);
+        memcpy(gcam.proj, &proj_m, sizeof(gcam.proj));
 
         gm_v3_copy(gcam.eye, eye);
     }

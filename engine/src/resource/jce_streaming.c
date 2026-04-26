@@ -15,13 +15,14 @@
  *       JceThreadPool.  Main thread polls for completion.
  */
 
-#include <jce/streaming/jce_streaming.h>
-#include <jce/core/jce_filesystem.h>
-#include <jce/core/jce_thread.h>
-#include <jce/core/jce_log.h>
-#include <jce/core/jce_profiler.h>
-#include "core/jce_memory.h"
+#include <jce/middleware/streaming/jce_streaming.h>
+#include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_thread.h>
+#include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_profiler.h>
+#include "os/core/jce_memory.h"
 
+#include <jce/os/core/jce_timer.h>
 #include <SDL3/SDL_timer.h>
 #include <SDL3/SDL_atomic.h>
 
@@ -107,8 +108,8 @@ static ChunkRecord *find_chunk(JceStreamingSystem *sys, uint32_t chunk_id)
 
 static double now_ms(void)
 {
-    return (double)SDL_GetPerformanceCounter() /
-           (double)SDL_GetPerformanceFrequency() * 1000.0;
+    return (double)jce_time_perf_counter() /
+           (double)jce_time_perf_freq() * 1000.0;
 }
 
 /* ── Async load worker function ───────────────────────────────────── */

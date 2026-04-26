@@ -25,9 +25,10 @@
 #include <math.h>
 
 extern "C" {
-#include <jce/core/jce_log.h>
-#include <jce/core/jce_math.h>
-#include <jce/graphics/jce_texture.h>
+#include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_math.h>
+#include <jce/renderer/jce_texture.h>
+#include <jce/os/platform/jce_host_shell.h>
 }
 
 /* ══════════════════════════════════════════════════════════════════════

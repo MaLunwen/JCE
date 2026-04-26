@@ -11,11 +11,13 @@
 #include <vector>
 
 extern "C" {
-#include <jce/graphics/jce_pbr_material.h>
+#include <jce/renderer/jce_pbr_material.h>
 #include <SDL3_image/SDL_image.h>
 #include <SDL3/SDL_iostream.h>
 #include <SDL3/SDL_surface.h>
 }
+
+#include "jce_editor_file_util.h"
 
 #define LOG_TAG "fv_material"
 
@@ -59,19 +61,12 @@ static void try_load_thumb(MatTexSlot *slot, const char *path)
 
     if (!path || path[0] == '\0') return;
 
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return;
-    fseek(fp, 0, SEEK_END);
-    long sz = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    if (sz <= 0 || sz > 64 * 1024 * 1024) { fclose(fp); return; }
+    size_t sz = 0;
+    char *buf = (char *)ed_read_file(path, &sz);
+    if (!buf) return;
+    if (sz == 0 || sz > 64 * 1024 * 1024) { ED_FREE(buf); return; }
 
-    char *buf = (char *)ED_MALLOC((size_t)sz);
-    if (!buf) { fclose(fp); return; }
-    size_t rd = fread(buf, 1, (size_t)sz, fp);
-    fclose(fp);
-
-    SDL_IOStream *io = SDL_IOFromConstMem(buf, rd);
+    SDL_IOStream *io = SDL_IOFromConstMem(buf, sz);
     if (!io) { ED_FREE(buf); return; }
 
     SDL_Surface *surf = IMG_Load_IO(io, true);
@@ -151,22 +146,14 @@ void fv_render_material(FvTab *tab)
                 /* Push changes to all entities referencing this material. */
                 jce_editor_inspector_reload_material(tab->path);
                 /* Refresh raw content for the Source section. */
-                FILE *fp = fopen(tab->path, "rb");
-                if (fp) {
-                    fseek(fp, 0, SEEK_END);
-                    long sz = ftell(fp);
-                    fseek(fp, 0, SEEK_SET);
-                    int read_size = (sz > FV_MAX_CONTENT) ? FV_MAX_CONTENT : (int)sz;
-                    char *buf = (char *)ED_MALLOC((size_t)read_size + 1);
-                    if (buf) {
-                        int n = (int)fread(buf, 1, (size_t)read_size, fp);
-                        buf[n] = '\0';
-                        ED_FREE(tab->content);
-                        tab->content = buf;
-                        tab->content_len = n;
-                        tab->file_size = sz;
-                    }
-                    fclose(fp);
+                size_t got = 0, total = 0;
+                char *buf = (char *)ed_read_file_capped(tab->path, FV_MAX_CONTENT,
+                                                        &got, &total);
+                if (buf) {
+                    ED_FREE(tab->content);
+                    tab->content = buf;
+                    tab->content_len = (int)got;
+                    tab->file_size = (long)total;
                 }
             } else {
                 jce_editor_console_log_level(JCE_CONSOLE_ERROR,

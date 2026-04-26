@@ -78,10 +78,15 @@ bool decode_texture_rgba_path(const fs::path &path,
     *out_w = 0;
     *out_h = 0;
 
-    SDL_IOStream *io = SDL_IOFromFile(path.string().c_str(), "rb");
-    if (!io) return false;
+    size_t img_size = 0;
+    void *img_buf = ed_read_file(path.string().c_str(), &img_size);
+    if (!img_buf) return false;
+
+    SDL_IOStream *io = SDL_IOFromConstMem(img_buf, img_size);
+    if (!io) { ED_FREE(img_buf); return false; }
 
     SDL_Surface *surf = IMG_Load_IO(io, true);
+    ED_FREE(img_buf);
     if (!surf) return false;
 
     if (surf->format != SDL_PIXELFORMAT_RGBA32) {

@@ -9,11 +9,11 @@
 #ifndef JCE_API_PLATFORM_H
 #define JCE_API_PLATFORM_H
 
-#include <jce/platform/jce_window.h>
-#include <jce/platform/jce_input.h>
-#include <jce/platform/jce_keys.h>
-#include <jce/platform/jce_gamepad.h>
-#include <jce/platform/jce_single_instance.h>
-#include <jce/platform/jce_input_actions.h>
+#include <jce/os/platform/jce_window.h>
+#include <jce/os/platform/jce_input.h>
+#include <jce/os/platform/jce_keys.h>
+#include <jce/os/platform/jce_gamepad.h>
+#include <jce/os/platform/jce_single_instance.h>
+#include <jce/os/platform/jce_input_actions.h>
 
 #endif /* JCE_API_PLATFORM_H */

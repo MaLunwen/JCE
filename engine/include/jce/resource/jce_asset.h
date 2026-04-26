@@ -17,13 +17,13 @@
 #ifndef JCE_ASSET_H
 #define JCE_ASSET_H
 
+
+#include <jce/os/core/jce_defs.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+JCE_EXTERN_C_BEGIN
 
 /* ================================================================== */
 /* Generational Handle                                                 */
@@ -233,7 +233,7 @@ uint32_t jce_asset_count(const JceAssetManager *mgr);
 void *jce_asset_data(const JceAssetManager *mgr, JceAssetHandle handle);
 
 /* Forward-declare typed accessors' return types. */
-#include <jce/graphics/jce_texture_types.h>
+#include <jce/renderer/jce_texture_types.h>
 
 typedef struct JceMesh         JceMesh;
 typedef struct JceModel        JceModel;
@@ -252,7 +252,7 @@ JceModel *jce_asset_get_model(const JceAssetManager *mgr,
                               JceAssetHandle handle);
 
 /* Sound handle — reuse existing audio type definition. */
-#include <jce/audio/jce_audio_types.h>
+#include <jce/middleware/audio/jce_audio_types.h>
 
 JceSound jce_asset_get_sound(const JceAssetManager *mgr,
                              JceAssetHandle handle);
@@ -333,8 +333,6 @@ bool jce_asset_register_loader(JceAssetManager *mgr,
                                jce_asset_load_fn load_fn,
                                jce_asset_destroy_fn destroy_fn);
 
-#ifdef __cplusplus
-}
-#endif
+JCE_EXTERN_C_END
 
 #endif /* JCE_ASSET_H */

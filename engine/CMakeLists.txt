@@ -45,6 +45,7 @@ function(_jce_add_layer NAME)
 	# Public headers — every layer exposes the same public include root
 	# so that #include <jce/core/jce_log.h> works from any layer.
 	target_include_directories(${NAME} PUBLIC "${_ENGINE_INC}")
+	target_compile_definitions(${NAME} PRIVATE JCE_BUILDING_ENGINE=1)
 
 	# Private: only the layer's own source directories.
 	foreach(_dir IN LISTS ARG_DIRS)
@@ -74,20 +75,20 @@ endfunction()
 # ================================================================== #
 
 _jce_add_layer(jce_core
-	DIRS      core
+	DIRS      os/core
 	LINK_PUBLIC
 		sdl::sdl
-		cglm::cglm
+	LINK_PRIVATE
+		cjson::cjson
 		mimalloc-static
+		enkits::enkits
 		zstd::libzstd_static
 		xxHash::xxhash
-		physfs-static
-		cjson::cjson
-		enkits::enkits)
+		physfs-static)
 
 # Tracy: true compile-time gate.
 if(JCE_TRACY_ENABLED)
-	target_link_libraries(jce_core PUBLIC Tracy::TracyClient)
+	target_link_libraries(jce_core PRIVATE Tracy::TracyClient)
 	target_compile_definitions(jce_core PUBLIC JCE_TRACY_ENABLED=1)
 else()
 	target_compile_definitions(jce_core PUBLIC JCE_TRACY_ENABLED=0)
@@ -98,7 +99,7 @@ endif()
 # ================================================================== #
 
 _jce_add_layer(jce_platform
-	DIRS      platform
+	DIRS      os/platform
 	LINK_PUBLIC
 		jce_core
 	LINK_PRIVATE
@@ -108,25 +109,35 @@ _jce_add_layer(jce_platform
 # L3 — Independent subsystems (depend only on L0)                     #
 # ================================================================== #
 
-# Patented codec adapters (AAC / H.264 / H.265). Default OFF: ships
-# royalty-free Opus + AV1 path only. Toggle via Conan option
-# `enable_patented_codecs` (forwarded as -DJCE_ENABLE_PATENTED_CODECS)
-# or by passing -DJCE_ENABLE_PATENTED_CODECS=ON to cmake directly.
+# Patented codec adapters (AAC / H.264 / H.265) — user preference.
+# Default ON for release (editor needs them to import legacy assets).
+# The dist variant always overrides this OFF via the JCE_PATENTED_CODECS_ENABLED
+# intermediate (see root CMakeLists.txt), without mutating this preference —
+# so flipping back to release naturally restores the user's chosen value.
 option(JCE_ENABLE_PATENTED_CODECS
 	"Compile vendored fdk-aac / OpenH264 / libhevc adapters (AAC, H.264, H.265). \
-Patent-encumbered in many jurisdictions; you are responsible for licensing." OFF)
+Patent-encumbered in many jurisdictions; you are responsible for licensing. \
+Default ON for release; the dist variant always forces OFF for royalty-free \
+redistribution." ON)
 
-if(JCE_ENABLE_PATENTED_CODECS)
+# Effective switch — the rest of this file reads only this. Set by the root
+# CMakeLists.txt before this file runs (default: == JCE_ENABLE_PATENTED_CODECS;
+# dist variant: forced OFF).
+if(NOT DEFINED JCE_PATENTED_CODECS_ENABLED)
+	set(JCE_PATENTED_CODECS_ENABLED ${JCE_ENABLE_PATENTED_CODECS})
+endif()
+
+if(JCE_PATENTED_CODECS_ENABLED)
 	message(STATUS "JCE: patented codecs ENABLED (AAC/H.264/H.265 via fdk-aac/OpenH264/libhevc)")
 
 	# AOSP libhevc decoder (Apache-2.0, static library)
 	add_subdirectory(
-		"${CMAKE_CURRENT_SOURCE_DIR}/src/video/third_party/libhevc/jce_build"
+		"${CMAKE_CURRENT_SOURCE_DIR}/src/middleware/video/third_party/libhevc/jce_build"
 		"${CMAKE_CURRENT_BINARY_DIR}/libhevcdec")
 
 	# Cisco openh264 decoder (BSD-2, static library — pure-C path)
 	add_subdirectory(
-		"${CMAKE_CURRENT_SOURCE_DIR}/src/video/third_party/openh264/jce_build"
+		"${CMAKE_CURRENT_SOURCE_DIR}/src/middleware/video/third_party/openh264/jce_build"
 		"${CMAKE_CURRENT_BINARY_DIR}/openh264dec")
 
 	# Fraunhofer FDK-AAC decoder/encoder (vendored — see header note in
@@ -136,7 +147,7 @@ if(JCE_ENABLE_PATENTED_CODECS)
 	set(FDK_AAC_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
 	set(FDK_AAC_INSTALL_PKGCONFIG_MODULE    OFF CACHE BOOL "" FORCE)
 	add_subdirectory(
-		"${CMAKE_CURRENT_SOURCE_DIR}/src/audio/third_party/fdk-aac"
+		"${CMAKE_CURRENT_SOURCE_DIR}/src/middleware/audio/third_party/fdk-aac"
 		"${CMAKE_CURRENT_BINARY_DIR}/fdk-aac")
 	# Suppress strict-warnings for vendored 3rd-party.
 	if(TARGET fdk-aac)
@@ -149,28 +160,28 @@ else()
 endif()
 
 _jce_add_layer(jce_video
-	DIRS      video
+	DIRS      middleware/video
 	LINK_PUBLIC jce_core
 	LINK_PRIVATE dav1d::dav1d libvpx::libvpx webm::webm Opus::opus)
 
 # S3: compile the AVX2 YUV conversion TU with SIMD flags only for that file.
 set_source_files_properties(
-    "${_ENGINE_SRC}/video/jce_yuv_convert_avx2.c"
+    "${_ENGINE_SRC}/middleware/video/jce_yuv_convert_avx2.c"
     PROPERTIES COMPILE_OPTIONS
         "$<IF:$<C_COMPILER_ID:MSVC>,/arch:AVX2,-mavx2>")
 
-if(JCE_ENABLE_PATENTED_CODECS)
+if(JCE_PATENTED_CODECS_ENABLED)
 	target_link_libraries(jce_video PRIVATE fdk-aac openh264dec libhevcdec)
 	target_compile_definitions(jce_video PUBLIC JCE_ENABLE_PATENTED_CODECS=1)
 endif()
 
 _jce_add_layer(jce_audio
-	DIRS      audio
+	DIRS      middleware/audio
 	LINK_PUBLIC  jce_core
 	LINK_PRIVATE miniaudio::miniaudio jce_video
 	            Opus::opus Ogg::ogg)
 
-if(JCE_ENABLE_PATENTED_CODECS)
+if(JCE_PATENTED_CODECS_ENABLED)
 	target_link_libraries(jce_audio PRIVATE fdk-aac)
 	target_compile_definitions(jce_audio PUBLIC JCE_ENABLE_PATENTED_CODECS=1)
 endif()
@@ -178,31 +189,31 @@ endif()
 # On Apple platforms, miniaudio includes AVFoundation (Objective-C).
 if(APPLE)
 	set_source_files_properties(
-		"${_ENGINE_SRC}/audio/jce_miniaudio_impl.c"
+		"${_ENGINE_SRC}/middleware/audio/jce_miniaudio_impl.c"
 		PROPERTIES LANGUAGE OBJC)
 	enable_language(OBJC)
 endif()
 
 _jce_add_layer(jce_physics
-	DIRS      physics
+	DIRS      middleware/physics
 	LINK_PUBLIC  jce_core
 	LINK_PRIVATE box2d::box2d Bullet::Bullet
 	CXX)
 
 _jce_add_layer(jce_animation
-	DIRS      animation
+	DIRS      middleware/animation
 	LINK_PUBLIC  jce_core
 	LINK_PRIVATE ozz-animation::ozz-animation bgfx::bgfx
 	CXX)
 
 _jce_add_layer(jce_ai
-	DIRS      ai
+	DIRS      middleware/ai
 	LINK_PUBLIC  jce_core
 	LINK_PRIVATE BT::behaviortree_cpp
 	CXX)
 
 _jce_add_layer(jce_net
-	DIRS      net
+	DIRS      middleware/net
 	LINK_PUBLIC  jce_core
 	LINK_PRIVATE enet::enet protobuf::protobuf
 	CXX)
@@ -220,23 +231,22 @@ protobuf_generate(
 target_include_directories(jce_net PRIVATE "${JCE_PROTO_OUT}")
 
 _jce_add_layer(jce_scene
-	DIRS      scene
+	DIRS      middleware/scene
 	LINK_PUBLIC  jce_core
-	LINK_PRIVATE flecs::flecs_static)
+	LINK_PRIVATE flecs::flecs_static cjson::cjson)
 
 # ================================================================== #
 # L3 — Graphics + Render (depends on L0, L1, animation)              #
 # ================================================================== #
 
-_jce_add_layer(jce_graphics
-	DIRS      graphics render
+_jce_add_layer(jce_renderer
+	DIRS      renderer
 	LINK_PUBLIC
 		jce_core
 		jce_platform
 		jce_animation
-	LINK_PUBLIC
-		bgfx::bgfx
 	LINK_PRIVATE
+		bgfx::bgfx
 		SDL3_image::SDL3_image
 		Freetype::Freetype
 		harfbuzz::harfbuzz
@@ -246,18 +256,19 @@ _jce_add_layer(jce_graphics
 # L3 — UI (depends on core, graphics, platform, audio, app)          #
 # ================================================================== #
 
-# NOTE: jce_ui links jce_app (forward-declared below) for config access,
+# NOTE: jce_ui links jce_application (forward-declared below) for config access,
 #       and jce_audio for volume settings.  These are intentional design
 #       choices to keep settings UI self-contained.
 _jce_add_layer(jce_ui
-	DIRS      ui
+	DIRS      middleware/ui
 	LINK_PUBLIC
 		jce_core
-		jce_graphics
+		jce_renderer
 		jce_platform
 		jce_audio
 	LINK_PRIVATE
 		rmlui::rmlui
+		bgfx::bgfx
 	CXX)
 
 # ================================================================== #
@@ -268,7 +279,7 @@ _jce_add_layer(jce_resource
 	DIRS      resource
 	LINK_PUBLIC
 		jce_core
-		jce_graphics
+		jce_renderer
 		jce_audio
 		jce_animation
 		jce_scene
@@ -276,31 +287,36 @@ _jce_add_layer(jce_resource
 		SDL3_image::SDL3_image
 		cgltf::cgltf
 		miniaudio::miniaudio
+		zstd::libzstd_static
+		xxHash::xxhash
+		bgfx::bgfx
 	CXX)
 
 # ================================================================== #
 # L5 — Application orchestrator                                       #
 # ================================================================== #
 
-set(_APP_DIRS app)
+set(_APP_DIRS application)
 
-_jce_add_layer(jce_app
+_jce_add_layer(jce_application
 	DIRS      ${_APP_DIRS}
 	LINK_PUBLIC
 		jce_core
 		jce_platform
-		jce_graphics
+		jce_renderer
 		jce_audio
-		jce_resource)
+		jce_resource
+	LINK_PRIVATE
+		bgfx::bgfx)
 
 if(JCE_BUILD_JNI)
-	target_include_directories(jce_app PRIVATE ${JNI_INCLUDE_DIRS})
-	target_compile_definitions(jce_app PRIVATE JCE_BUILD_JNI=1)
+	target_include_directories(jce_application PRIVATE ${JNI_INCLUDE_DIRS})
+	target_compile_definitions(jce_application PRIVATE JCE_BUILD_JNI=1)
 endif()
 
-# jce_ui needs jce_app for config access (circular at layer level,
+# jce_ui needs jce_application for config access (circular at layer level,
 # but not at symbol level — ui reads config, app orchestrates ui).
-target_link_libraries(jce_ui PUBLIC jce_app)
+target_link_libraries(jce_ui PUBLIC jce_application)
 
 # ================================================================== #
 # JCE — INTERFACE facade (backward-compatible link target)            #
@@ -321,10 +337,10 @@ target_link_libraries(JCE INTERFACE
 	jce_ai
 	jce_net
 	jce_scene
-	jce_graphics
+	jce_renderer
 	jce_ui
 	jce_resource
-	jce_app)
+	jce_application)
 
 # ── Platform-specific link options (on the facade) ──
 if(JCE_PLATFORM_WEB)

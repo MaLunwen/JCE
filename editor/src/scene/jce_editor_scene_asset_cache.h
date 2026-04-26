@@ -15,8 +15,8 @@
 extern "C" {
 #endif
 
-#include <jce/graphics/jce_texture.h>
-#include <jce/graphics/jce_mesh.h>
+#include <jce/renderer/jce_texture.h>
+#include <jce/renderer/jce_mesh.h>
 #include <jce/resource/jce_asset.h>
 #include "jce_model_loader_assimp.h"
 

@@ -4,7 +4,7 @@
 #ifndef JCE_GLTF_LOADER_H
 #define JCE_GLTF_LOADER_H
 
-#include "graphics/jce_model.h"
+#include "renderer/jce_model.h"
 
 typedef struct JcePakArchive JcePakArchive;
 

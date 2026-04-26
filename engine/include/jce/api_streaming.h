@@ -10,6 +10,6 @@
 #ifndef JCE_API_STREAMING_H
 #define JCE_API_STREAMING_H
 
-#include <jce/streaming/jce_streaming.h>
+#include <jce/middleware/streaming/jce_streaming.h>
 
 #endif /* JCE_API_STREAMING_H */

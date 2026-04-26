@@ -308,154 +308,9 @@ bool resolve_mesh_file_path(const char *mesh_path, char *out_path,
     if (fs::exists(full_path))
         return copy_found_path(full_path, out_path, out_size);
 
-    char meshes_dirs[4][512];
-    int meshes_dir_count = 0;
-    snprintf(meshes_dirs[meshes_dir_count++], 512, "%s\\Meshes", s_cache.scene_dir);
-    {
-        char parent[512];
-        snprintf(parent, sizeof(parent), "%s", s_cache.scene_dir);
-        char *sep = strrchr(parent, '\\');
-        if (!sep) sep = strrchr(parent, '/');
-        if (sep) {
-            *sep = '\0';
-            snprintf(meshes_dirs[meshes_dir_count++], 512, "%s\\Meshes", parent);
-        }
-    }
-    snprintf(meshes_dirs[meshes_dir_count++], 512, "%s", s_cache.scene_dir);
-
-    static const char *mesh_exts[] = { "*.obj", "*.fbx", "*.gltf", "*.glb", NULL };
-
-#ifdef _WIN32
-    char subdir_paths[64][512];
-    int subdir_count = 0;
-
-    for (int md = 0; md < meshes_dir_count; md++) {
-        WIN32_FIND_DATAA dir_fd;
-        char dir_pattern[512];
-        snprintf(dir_pattern, sizeof(dir_pattern), "%s\\*", meshes_dirs[md]);
-        HANDLE h_dir = FindFirstFileA(dir_pattern, &dir_fd);
-        if (h_dir == INVALID_HANDLE_VALUE) continue;
-
-        if (subdir_count < 63)
-            snprintf(subdir_paths[subdir_count++], 512, "%s", meshes_dirs[md]);
-
-        do {
-            if (!(dir_fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-            if (dir_fd.cFileName[0] == '.') continue;
-            if (subdir_count >= 63) break;
-            char l1[512];
-            snprintf(l1, 512, "%s\\%s", meshes_dirs[md], dir_fd.cFileName);
-            snprintf(subdir_paths[subdir_count++], 512, "%s", l1);
-
-            WIN32_FIND_DATAA l2_fd;
-            char l2_pat[512];
-            snprintf(l2_pat, sizeof(l2_pat), "%s\\*", l1);
-            HANDLE h2 = FindFirstFileA(l2_pat, &l2_fd);
-            if (h2 != INVALID_HANDLE_VALUE) {
-                do {
-                    if (!(l2_fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-                    if (l2_fd.cFileName[0] == '.') continue;
-                    if (subdir_count >= 63) break;
-                    char l2[512];
-                    snprintf(l2, 512, "%s\\%s", l1, l2_fd.cFileName);
-                    snprintf(subdir_paths[subdir_count++], 512, "%s", l2);
-
-                    WIN32_FIND_DATAA l3_fd;
-                    char l3_pat[512];
-                    snprintf(l3_pat, sizeof(l3_pat), "%s\\*", l2);
-                    HANDLE h3 = FindFirstFileA(l3_pat, &l3_fd);
-                    if (h3 != INVALID_HANDLE_VALUE) {
-                        do {
-                            if (!(l3_fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-                            if (l3_fd.cFileName[0] == '.') continue;
-                            if (subdir_count >= 63) break;
-                            snprintf(subdir_paths[subdir_count++], 512,
-                                     "%s\\%s", l2, l3_fd.cFileName);
-                        } while (FindNextFileA(h3, &l3_fd));
-                        FindClose(h3);
-                    }
-                } while (FindNextFileA(h2, &l2_fd));
-                FindClose(h2);
-            }
-        } while (FindNextFileA(h_dir, &dir_fd));
-        FindClose(h_dir);
-    }
-
-    if (subdir_count == 0) {
-        LOG_WARN(LOG_TAG, "mesh not found: %s (no Meshes dirs found under %s)",
-                 mesh_path, s_cache.scene_dir);
-        return false;
-    }
-
-    int target_len = (int)strlen(target_kebab);
-
-    for (int d = 0; d < subdir_count; d++) {
-        for (int ei = 0; mesh_exts[ei]; ei++) {
-            WIN32_FIND_DATAA fd;
-            char search_pattern[512];
-            snprintf(search_pattern, sizeof(search_pattern), "%s\\%s",
-                     subdir_paths[d], mesh_exts[ei]);
-            HANDLE h_find = FindFirstFileA(search_pattern, &fd);
-            if (h_find == INVALID_HANDLE_VALUE) continue;
-            do {
-                char base_name[256];
-                snprintf(base_name, sizeof(base_name), "%s", fd.cFileName);
-                char *ext = strrchr(base_name, '.');
-                if (ext) *ext = '\0';
-
-                {
-                    char file_lower[256];
-                    snprintf(file_lower, sizeof(file_lower), "%s", base_name);
-                    for (char *p = file_lower; *p; p++) {
-                        if (*p >= 'A' && *p <= 'Z')
-                            *p = (char)(*p + 32);
-                    }
-                    if (strcmp(file_lower, target_kebab) == 0) {
-                        char found_path[512];
-                        snprintf(found_path, sizeof(found_path), "%s\\%s",
-                                 subdir_paths[d], fd.cFileName);
-                        FindClose(h_find);
-                        return copy_found_path(found_path, out_path, out_size);
-                    }
-                }
-
-                char file_kebab[256];
-                sm_to_kebab(base_name, file_kebab, sizeof(file_kebab));
-
-                if (strcmp(file_kebab, target_kebab) == 0) {
-                    char found_path[512];
-                    snprintf(found_path, sizeof(found_path), "%s\\%s",
-                             subdir_paths[d], fd.cFileName);
-                    FindClose(h_find);
-                    return copy_found_path(found_path, out_path, out_size);
-                }
-
-                int fk_len = (int)strlen(file_kebab);
-                if (fk_len > target_len && target_len > 0) {
-                    const char *suffix = file_kebab + (fk_len - target_len);
-                    if (strcmp(suffix, target_kebab) == 0 && suffix[-1] == '-') {
-                        char found_path[512];
-                        snprintf(found_path, sizeof(found_path), "%s\\%s",
-                                 subdir_paths[d], fd.cFileName);
-                        FindClose(h_find);
-                        return copy_found_path(found_path, out_path, out_size);
-                    }
-                }
-
-                if (target_len > 2 && fk_len > target_len) {
-                    if (strstr(file_kebab, target_kebab) != NULL) {
-                        char found_path[512];
-                        snprintf(found_path, sizeof(found_path), "%s\\%s",
-                                 subdir_paths[d], fd.cFileName);
-                        FindClose(h_find);
-                        return copy_found_path(found_path, out_path, out_size);
-                    }
-                }
-            } while (FindNextFileA(h_find, &fd));
-            FindClose(h_find);
-        }
-    }
-
+    /* Recursive search via std::filesystem (cross-platform).  Walks up
+       from the scene directory looking for a regular file whose
+       lower-cased name matches the requested mesh basename. */
     {
         std::error_code ec;
         std::string target_name = base;
@@ -489,7 +344,6 @@ bool resolve_mesh_file_path(const char *mesh_path, char *out_path,
             }
         }
     }
-#endif
 
     return false;
 }

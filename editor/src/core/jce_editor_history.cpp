@@ -67,7 +67,7 @@ bool history_capture_snapshot(EditorHistorySnapshot *out)
 
 	out->scene_json = json_text;
 	out->scene_path = s.current_scene_path;
-	cJSON_free(json_text);
+	jce_json_free_string(json_text);
 	return true;
 }
 

@@ -5,12 +5,12 @@
  * XXH3_64bits hash, and decompresses assets on demand via ZSTD.
  */
 
-#include <jce/core/pak_loader.h>
+#include <jce/os/core/pak_loader.h>
 #include "resource/pak_format.h"
-#include <jce/core/jce_profiler.h>
+#include <jce/os/core/jce_profiler.h>
 
 #include <SDL3/SDL.h>
-#include "core/jce_memory.h"
+#include "os/core/jce_memory.h"
 #include <string.h>
 
 #include <xxhash.h>

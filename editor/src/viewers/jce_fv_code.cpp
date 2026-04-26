@@ -332,45 +332,34 @@ void fv_render_code(FvTab *tab)
         /* Reload */
         ImGui::SameLine();
         if (ImGui::Button(jce_editor_i18n("codeViewer.reload"))) {
-            FILE *fp = fopen(tab->path, "rb");
-            if (fp) {
-                fseek(fp, 0, SEEK_END);
-                long sz = ftell(fp);
-                fseek(fp, 0, SEEK_SET);
-                int read_size = (sz > FV_MAX_CONTENT) ? FV_MAX_CONTENT : (int)sz;
-                char *buf = (char *)ED_MALLOC((size_t)read_size + 1);
-                if (buf) {
-                    int n = (int)fread(buf, 1, (size_t)read_size, fp);
-                    buf[n] = '\0';
-                    ED_FREE(tab->content);
-                    tab->content = buf;
-                    tab->content_len = n;
-                    tab->file_size = sz;
-                    /* Refresh edit buffer too */
+            size_t got = 0, total = 0;
+            char *buf = (char *)ed_read_file_capped(tab->path, FV_MAX_CONTENT,
+                                                    &got, &total);
+            if (buf) {
+                int n = (int)got;
+                ED_FREE(tab->content);
+                tab->content = buf;
+                tab->content_len = n;
+                tab->file_size = (long)total;
+                /* Refresh edit buffer too */
+                if (tab->edit_buf) {
+                    int cap = (n + 1 > FV_EDIT_BUF_CAP) ? n + 1 : FV_EDIT_BUF_CAP;
+                    ED_FREE(tab->edit_buf);
+                    tab->edit_buf = (char *)ED_MALLOC((size_t)cap);
+                    tab->edit_buf_cap = cap;
                     if (tab->edit_buf) {
-                        int cap = (n + 1 > FV_EDIT_BUF_CAP) ? n + 1 : FV_EDIT_BUF_CAP;
-                        ED_FREE(tab->edit_buf);
-                        tab->edit_buf = (char *)ED_MALLOC((size_t)cap);
-                        tab->edit_buf_cap = cap;
-                        if (tab->edit_buf) {
-                            memcpy(tab->edit_buf, tab->content, (size_t)n);
-                            tab->edit_buf[n] = '\0';
-                        }
+                        memcpy(tab->edit_buf, tab->content, (size_t)n);
+                        tab->edit_buf[n] = '\0';
                     }
-                    tab->modified = false;
                 }
-                fclose(fp);
+                tab->modified = false;
             }
         }
 
         /* Open in VS Code */
         ImGui::SameLine();
         if (ImGui::Button(jce_editor_i18n("viewer.code.openInEditor"))) {
-#ifdef _WIN32
-            char cmd[600];
-            snprintf(cmd, sizeof(cmd), "code \"%s\"", tab->path);
-            system(cmd);
-#endif
+            jce_host_open_in_text_editor(tab->path);
         }
 
         /* File info (right side) */

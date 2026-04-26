@@ -7,6 +7,7 @@
 
 #include "jce_editor_scene_asset_cache.h"
 #include "jce_model_loader_assimp.h"
+#include "io/jce_editor_file_util.h"
 
 #include <string.h>
 #include <math.h>
@@ -15,28 +16,18 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
-#include <fstream>
+#include <sstream>
 #include <limits>
 #include <string>
 #include <utility>
 #include <vector>
 
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#endif
-
 extern "C" {
-#include <cjson/cJSON.h>
-#include <jce/core/jce_log.h>
-#include <jce/core/jce_thread.h>
-#include <jce/graphics/jce_mesh.h>
-#include <jce/graphics/jce_texture.h>
+#include <jce/os/core/jce_json.h>
+#include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_thread.h>
+#include <jce/renderer/jce_mesh.h>
+#include <jce/renderer/jce_texture.h>
 #include <jce/resource/jce_asset.h>
 }
 

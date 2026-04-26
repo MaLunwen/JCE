@@ -60,21 +60,15 @@ static void draw_dir_tree(const fs::path &dir, int depth)
             }
 
             if (ImGui::BeginPopupContextItem()) {
-#ifdef _WIN32
                 if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInExplorer"))) {
-                    std::string p = sd.string();
-                    for (auto &ch : p) { if (ch == '/') ch = '\\'; }
-                    ShellExecuteA(NULL, "explore", p.c_str(), NULL, NULL, SW_SHOWNORMAL);
+                    jce_host_reveal_path(sd.string().c_str());
                 }
                 if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInVSCode"))) {
-                    std::string cmd = "code \"" + sd.string() + "\"";
-                    system(cmd.c_str());
+                    jce_host_open_in_text_editor(sd.string().c_str());
                 }
                 if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInTerminal"))) {
-                    std::string cmd = "start cmd /K cd /d \"" + sd.string() + "\"";
-                    system(cmd.c_str());
+                    jce_host_open_terminal(sd.string().c_str());
                 }
-#endif
                 ImGui::EndPopup();
             }
 
@@ -113,21 +107,15 @@ void draw_asset_directory_tree(float tree_w, float panel_h)
                 navigate_asset_directory(s_assets.project_root, false);
             }
             if (ImGui::BeginPopupContextItem()) {
-#ifdef _WIN32
                 if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInExplorer"))) {
-                    std::string p = s_assets.project_root;
-                    for (auto &ch : p) { if (ch == '/') ch = '\\'; }
-                    ShellExecuteA(NULL, "explore", p.c_str(), NULL, NULL, SW_SHOWNORMAL);
+                    jce_host_reveal_path(s_assets.project_root.c_str());
                 }
                 if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInVSCode"))) {
-                    std::string cmd = "code \"" + s_assets.project_root + "\"";
-                    system(cmd.c_str());
+                    jce_host_open_in_text_editor(s_assets.project_root.c_str());
                 }
                 if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInTerminal"))) {
-                    std::string cmd = "start cmd /K cd /d \"" + s_assets.project_root + "\"";
-                    system(cmd.c_str());
+                    jce_host_open_terminal(s_assets.project_root.c_str());
                 }
-#endif
                 ImGui::EndPopup();
             }
             draw_dir_tree(s_assets.project_root, 0);

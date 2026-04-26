@@ -8,7 +8,7 @@
 #ifndef JCE_API_SCENE_H
 #define JCE_API_SCENE_H
 
-#include <jce/scene/jce_scene.h>
-#include <jce/scene/jce_space_partition.h>
+#include <jce/middleware/scene/jce_scene.h>
+#include <jce/middleware/scene/jce_space_partition.h>
 
 #endif /* JCE_API_SCENE_H */

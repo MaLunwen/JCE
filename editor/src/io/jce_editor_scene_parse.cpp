@@ -13,34 +13,34 @@
 #include <cstring>
 
 extern "C" {
-#include <jce/scene/jce_scene_components_json.h>
+#include <jce/middleware/scene/jce_scene_components_json.h>
 }
 
 /* ── JSON helpers (format detection only — no component parsing) ──── */
 
-static const cJSON *json_get_any(const cJSON *obj, const char *const *keys, int key_count)
+static const JceJson *json_get_any(const JceJson *obj, const char *const *keys, int key_count)
 {
-	if (!cJSON_IsObject(obj)) return NULL;
+	if (!jce_json_is_object(obj)) return NULL;
 	for (int i = 0; i < key_count; i++) {
-		const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, keys[i]);
+		const JceJson *item = jce_json_get(obj, keys[i]);
 		if (item) return item;
 	}
 	return NULL;
 }
 
-static const char *json_get_string_any(const cJSON *obj,
-                                       const char *const *keys,
-                                       int key_count)
+static const char *json_get_string_any(const JceJson *obj,
+                                        const char *const *keys,
+                                        int key_count)
 {
-	const cJSON *item = json_get_any(obj, keys, key_count);
-	return cJSON_IsString(item) ? item->valuestring : NULL;
+	const JceJson *item = json_get_any(obj, keys, key_count);
+	return jce_json_string_value(item, NULL);
 }
 
 /* ── Apply entity JSON fields via engine + editor metadata ────────── */
 
-static void apply_entity_fields(uint32_t entity_id, const cJSON *obj)
+static void apply_entity_fields(uint32_t entity_id, const JceJson *obj)
 {
-	if (!cJSON_IsObject(obj) || entity_id == 0 || !s.scene) return;
+	if (!jce_json_is_object(obj) || entity_id == 0 || !s.scene) return;
 	JceEntity e = (JceEntity)entity_id;
 
 	/* Engine parses all components and entity-level EditorMeta fields. */
@@ -58,9 +58,9 @@ static void apply_entity_fields(uint32_t entity_id, const cJSON *obj)
 
 /* ── Entity tree loading (for prefabs and tree-format scenes) ──────── */
 
-uint32_t load_entity_tree_node(const cJSON *node, uint32_t parent_id)
+uint32_t load_entity_tree_node(const JceJson *node, uint32_t parent_id)
 {
-	if (!cJSON_IsObject(node)) return 0;
+	if (!jce_json_is_object(node)) return 0;
 
 	static const char *const name_keys[] = { "name", "entityName", "label" };
 	static const char *const children_keys[] = {
@@ -75,10 +75,11 @@ uint32_t load_entity_tree_node(const cJSON *node, uint32_t parent_id)
 	uint32_t id = jce_state_create_entity(name, parent_id);
 	apply_entity_fields(id, node);
 
-	const cJSON *children = json_get_any(node, children_keys,
+	const JceJson *children = json_get_any(node, children_keys,
 		(int)(sizeof(children_keys) / sizeof(children_keys[0])));
-	if (cJSON_IsArray(children)) {
-		for (cJSON *child = children->child; child; child = child->next)
+	if (jce_json_is_array(children)) {
+		for (JceJson *child = jce_json_first_child(children); child;
+		     child = jce_json_next_sibling(child))
 			load_entity_tree_node(child, id);
 	}
 
@@ -87,9 +88,9 @@ uint32_t load_entity_tree_node(const cJSON *node, uint32_t parent_id)
 
 /* ── Entity object detection ─────────────────────────────────────── */
 
-bool looks_like_entity_object(const cJSON *obj)
+bool looks_like_entity_object(const JceJson *obj)
 {
-	if (!cJSON_IsObject(obj)) return false;
+	if (!jce_json_is_object(obj)) return false;
 
 	static const char *const entity_keys[] = {
 		"name", "entityName", "label", "children",
@@ -103,31 +104,26 @@ bool looks_like_entity_object(const cJSON *obj)
 
 /* ── Contract version parsing ────────────────────────────────────── */
 
-bool parse_scene_contract_version(const cJSON *root, int *out_major, int *out_minor)
+bool parse_scene_contract_version(const JceJson *root, int *out_major, int *out_minor)
 {
 	if (out_major) *out_major = (int)JCE_SCENE_CONTRACT_MAJOR;
 	if (out_minor) *out_minor = (int)JCE_SCENE_CONTRACT_MINOR;
-	if (!cJSON_IsObject(root)) return false;
+	if (!jce_json_is_object(root)) return false;
 
-	const cJSON *contract = cJSON_GetObjectItemCaseSensitive(root,
-		JCE_SCENE_CONTRACT_KEY);
-	if (cJSON_IsObject(contract)) {
-		const cJSON *major_item = cJSON_GetObjectItemCaseSensitive(contract,
-			JCE_SCENE_CONTRACT_MAJOR_KEY);
-		const cJSON *minor_item = cJSON_GetObjectItemCaseSensitive(contract,
-			JCE_SCENE_CONTRACT_MINOR_KEY);
-
-		if (cJSON_IsNumber(major_item) && out_major)
-			*out_major = major_item->valueint;
-		if (cJSON_IsNumber(minor_item) && out_minor)
-			*out_minor = minor_item->valueint;
+	const JceJson *contract = jce_json_get(root, JCE_SCENE_CONTRACT_KEY);
+	if (jce_json_is_object(contract)) {
+		if (out_major)
+			*out_major = jce_json_get_int(contract,
+				JCE_SCENE_CONTRACT_MAJOR_KEY, *out_major);
+		if (out_minor)
+			*out_minor = jce_json_get_int(contract,
+				JCE_SCENE_CONTRACT_MINOR_KEY, *out_minor);
 		return true;
 	}
 
-	const cJSON *legacy_version = cJSON_GetObjectItemCaseSensitive(root,
-		JCE_SCENE_VERSION_KEY);
-	if (cJSON_IsNumber(legacy_version)) {
-		if (out_major) *out_major = legacy_version->valueint;
+	const JceJson *legacy_version = jce_json_get(root, JCE_SCENE_VERSION_KEY);
+	if (jce_json_is_number(legacy_version)) {
+		if (out_major) *out_major = (int)jce_json_number_value(legacy_version, *out_major);
 		if (out_minor) *out_minor = 0;
 		return true;
 	}
@@ -137,7 +133,7 @@ bool parse_scene_contract_version(const cJSON *root, int *out_major, int *out_mi
 
 /* ── Load scene from parsed JSON root ────────────────────────────── */
 
-bool load_scene_from_parsed_root(const cJSON *root,
+bool load_scene_from_parsed_root(const JceJson *root,
                                  const char *scene_label,
                                  const char *scene_path)
 {

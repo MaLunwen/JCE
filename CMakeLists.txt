@@ -29,6 +29,11 @@ if(Git_FOUND)
 	unset(_git_rc)
 endif()
 
+# Build timestamp with timezone — captured at configure time and embedded into
+# version header so the editor About dialog can display a TZ-aware build time
+# instead of the per-TU __DATE__/__TIME__ macros (which lack timezone info).
+string(TIMESTAMP JCE_BUILD_TIMESTAMP_UTC "%Y-%m-%d %H:%M:%S UTC" UTC)
+
 configure_file(
 	"${CMAKE_SOURCE_DIR}/engine/include/jce/jce_version.h.in"
 	"${CMAKE_BINARY_DIR}/include/jce/jce_version.h"
@@ -276,6 +281,23 @@ if(JCE_TRACY_ENABLED)
 	find_package(Tracy REQUIRED)
 endif()
 
+# Dist builds must never ship patent-encumbered codecs (AAC/H.264/H.265).
+# Mirror the Tracy pattern with an intermediate variable: the user-facing
+# JCE_ENABLE_PATENTED_CODECS option (declared in engine/CMakeLists.txt,
+# default ON) records preference and is never mutated. JCE_PATENTED_CODECS_ENABLED
+# is the *effective* switch the build reads — derived from the option, then
+# forced OFF for dist. Switching variants does not lose the user's preference.
+set(JCE_PATENTED_CODECS_ENABLED ON)  # default; flipped below if needed
+if(DEFINED JCE_ENABLE_PATENTED_CODECS AND NOT JCE_ENABLE_PATENTED_CODECS)
+	set(JCE_PATENTED_CODECS_ENABLED OFF)
+endif()
+if(JCE_BUILD_VARIANT STREQUAL "dist")
+	if(JCE_PATENTED_CODECS_ENABLED)
+		message(STATUS "JCE_BUILD_VARIANT=dist forces JCE_ENABLE_PATENTED_CODECS OFF (royalty-free redistribution).")
+	endif()
+	set(JCE_PATENTED_CODECS_ENABLED OFF)
+endif()
+
 if(JCE_BUILD_JNI)
 	find_package(JNI REQUIRED)
 endif()
@@ -365,7 +387,9 @@ if(NOT CMAKE_CROSSCOMPILING)
 		"${JCE_TOOLS_DIR}/jce_cook.c"
 		"${JCE_TOOLS_DIR}/jce_tex_compress.c"
 		"${JCE_TOOLS_DIR}/miniaudio_impl_cook.c"
-		"${JCE_ENGINE_SRC_DIR}/resource/jce_asset_cooker.c")
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_asset_cooker.c"
+		"${JCE_ENGINE_SRC_DIR}/os/core/jce_filesystem_host.c"
+		"${JCE_ENGINE_SRC_DIR}/os/core/jce_memory.c")
 	set_target_properties(jce_cook PROPERTIES
 		EXCLUDE_FROM_ALL      ON
 		RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tools"
@@ -672,8 +696,8 @@ if(JCE_ENABLE_CPPCHECK)
 			--suppress=missingIncludeSystem
 			--suppress=*:*/.conan2/*
 			--suppress=*:*/third_party/*
-			-i${CMAKE_SOURCE_DIR}/engine/src/audio/third_party
-			-i${CMAKE_SOURCE_DIR}/engine/src/video/third_party
+			-i${CMAKE_SOURCE_DIR}/engine/src/middleware/audio/third_party
+			-i${CMAKE_SOURCE_DIR}/engine/src/middleware/video/third_party
 			--file-filter=${CMAKE_SOURCE_DIR}/engine/*
 			--file-filter=${CMAKE_SOURCE_DIR}/editor/*
 			--file-filter=${CMAKE_SOURCE_DIR}/caged_kingdom/*

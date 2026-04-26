@@ -17,7 +17,7 @@
 extern "C" {
 #endif
 
-#include <jce/scene/jce_scene.h>
+#include <jce/middleware/scene/jce_scene.h>
 
 /* ── Edit Mode ─────────────────────────────────────────────────────── */
 
@@ -202,6 +202,21 @@ const char *jce_state_get_prefab_path(uint32_t entity_id);
 void     jce_state_copy_entity(uint32_t id);
 uint32_t jce_state_paste_entity(uint32_t parent_id);
 bool     jce_state_has_copied(void);
+
+/* Multi-entity clipboard. count<=0 clears the clipboard.  Cut mode marks
+ * the entries for deletion on the next paste; callers query
+ * jce_state_clipboard_is_cut() to render ghosting/labels. */
+void     jce_state_copy_entities(const uint32_t *ids, int count, bool cut);
+int      jce_state_clipboard_count(void);
+bool     jce_state_clipboard_is_cut(void);
+const uint32_t *jce_state_clipboard_source_ids(int *out_count);
+/* Pastes ALL clipboard entries under parent_id (0 = root). Returns number
+ * of entities pasted; out_ids (if non-NULL, capacity max_out) receives the
+ * new entity IDs in clipboard order.  If the clipboard is in cut mode the
+ * source entities are deleted after a successful paste and the clipboard
+ * is cleared. */
+int      jce_state_paste_entities(uint32_t parent_id,
+                                  uint32_t *out_ids, int max_out);
 
 /* Engine scene backing store. */
 void       jce_state_set_scene(JceScene *scene);

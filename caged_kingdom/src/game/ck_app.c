@@ -10,7 +10,7 @@
 #include "ck_app.h"
 #include <jce/api.h>
 #include <jce/resource/jce_scene_serial.h>
-#include <jce/core/jce_filesystem.h>
+#include <jce/os/core/jce_filesystem.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>

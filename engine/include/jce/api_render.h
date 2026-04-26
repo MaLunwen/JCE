@@ -10,8 +10,8 @@
 #ifndef JCE_API_RENDER_H
 #define JCE_API_RENDER_H
 
-#include <jce/render/jce_render_graph.h>
-#include <jce/render/jce_render_queue.h>
-#include <jce/render/jce_scene_renderer.h>
+#include <jce/renderer/jce_render_graph.h>
+#include <jce/renderer/jce_render_queue.h>
+#include <jce/renderer/jce_scene_renderer.h>
 
 #endif /* JCE_API_RENDER_H */

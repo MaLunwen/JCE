@@ -9,7 +9,7 @@
 #ifndef CK_APP_H
 #define CK_APP_H
 
-#include <jce/app/jce_app_interface.h>
+#include <jce/application/jce_app_interface.h>
 
 #ifdef __cplusplus
 extern "C" {

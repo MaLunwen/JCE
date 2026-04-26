@@ -13,11 +13,7 @@
 void fv_render_scene(FvTab *tab)
 {
     if (ImGui::Button(jce_editor_i18n("viewer.openExternal"))) {
-#ifdef _WIN32
-        char cmd[600];
-        snprintf(cmd, sizeof(cmd), "explorer /select,\"%s\"", tab->path);
-        system(cmd);
-#endif
+        jce_host_reveal_path(tab->path);
     }
     ImGui::SameLine();
     ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
@@ -38,11 +34,7 @@ void fv_render_scene(FvTab *tab)
 void fv_render_hex(FvTab *tab)
 {
     if (ImGui::Button(jce_editor_i18n("viewer.openExternal"))) {
-#ifdef _WIN32
-        char cmd[600];
-        snprintf(cmd, sizeof(cmd), "explorer /select,\"%s\"", tab->path);
-        system(cmd);
-#endif
+        jce_host_reveal_path(tab->path);
     }
     ImGui::SameLine();
     ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,

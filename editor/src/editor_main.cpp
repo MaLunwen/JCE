@@ -8,18 +8,19 @@
 
 #define SDL_MAIN_USE_CALLBACKS 1
 #include <SDL3/SDL.h>
+#include <jce/os/core/jce_timer.h>
 #include <SDL3/SDL_main.h>
 #include <algorithm>
 #include <string>
 #include <cstdio>
 
 extern "C" {
-#include <jce/app/jce_engine.h>
-#include <jce/app/jce_app_interface.h>
-#include <jce/graphics/jce_postfx.h>
-#include <jce/render/jce_scene_renderer.h>
-#include <jce/core/jce_allocator.h>
-#include <jce/platform/jce_window.h>
+#include <jce/application/jce_engine.h>
+#include <jce/application/jce_app_interface.h>
+#include <jce/renderer/jce_postfx.h>
+#include <jce/renderer/jce_scene_renderer.h>
+#include <jce/os/core/jce_allocator.h>
+#include <jce/os/platform/jce_window.h>
 }
 #include "jce_editor.h"
 #include "jce_editor_panels.h"
@@ -27,6 +28,7 @@ extern "C" {
 #include "jce_editor_config.h"
 #include "jce_editor_state.h"
 #include "jce_editor_layout.h"
+#include "jce_run_manager.h"
 
 /* ── Editor state ──────────────────────────────────────────────────── */
 
@@ -45,8 +47,8 @@ static void maybe_log_startup_kpi(void)
         return;
     }
 
-    const uint64_t now = SDL_GetPerformanceCounter();
-    const uint64_t freq = SDL_GetPerformanceFrequency();
+    const uint64_t now = jce_time_perf_counter();
+    const uint64_t freq = jce_time_perf_freq();
     if (freq == 0) {
         return;
     }
@@ -154,17 +156,18 @@ static void editor_app_update(float dt, void *ud)
     (void)ud;
 
     /* Compute real delta time since engine passes 0.0f. */
-    uint64_t now = SDL_GetPerformanceCounter();
+    uint64_t now = jce_time_perf_counter();
     float real_dt = 0.0f;
     if (s_last_update_counter != 0) {
         real_dt = (float)(now - s_last_update_counter)
-                / (float)SDL_GetPerformanceFrequency();
+                / (float)jce_time_perf_freq();
         if (real_dt > 0.1f) real_dt = 0.1f;  /* clamp to avoid spiral */
     }
     s_last_update_counter = now;
 
     /* Tick play-mode physics when playing. */
     jce_state_play_mode_tick(real_dt);
+    jce_run_manager_poll();
 }
 
 static void editor_app_draw(const JceServices *svc, void *ud)
@@ -205,7 +208,7 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
 {
     (void)appstate;
 
-    g_startup_t0 = SDL_GetPerformanceCounter();
+    g_startup_t0 = jce_time_perf_counter();
     g_startup_reported = false;
 
     /* Let editor-config.json renderer drive backend selection at startup.

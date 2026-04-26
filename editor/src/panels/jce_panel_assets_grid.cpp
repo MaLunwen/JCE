@@ -212,6 +212,40 @@ void draw_asset_grid_item(const FileEntry &fe, int index,
             2.0f, 0, 2.0f);
     }
 
+    /* Clipboard / paste flash effect */
+    {
+        auto it = s_assets.entry_flash.find(fe.path);
+        if (it != s_assets.entry_flash.end() && it->second > 0.0f) {
+            float t = it->second / 0.6f;
+            if (t > 1.0f) t = 1.0f;
+            ImVec2 mn = ImGui::GetItemRectMin();
+            ImVec2 mx = ImGui::GetItemRectMax();
+            /* Yellow ring for copy/cut, green ring for paste-target. */
+            bool cut = s_assets.clipboard_cut;
+            ImVec4 c = cut
+                ? ImVec4(1.0f, 0.5f, 0.2f, t)
+                : ImVec4(1.0f, 0.92f, 0.2f, t);
+            float pad = (1.0f - t) * 6.0f;
+            ImVec2 pmn(mn.x - pad, mn.y - pad);
+            ImVec2 pmx(mx.x + pad, mx.y + pad);
+            ImGui::GetWindowDrawList()->AddRect(pmn, pmx,
+                ImGui::ColorConvertFloat4ToU32(c), 4.0f, 0, 3.0f);
+        }
+    }
+
+    /* "Cut" item: dim it while in clipboard. */
+    if (s_assets.clipboard_cut) {
+        for (auto &cp : s_assets.clipboard_paths) {
+            if (cp == fe.path) {
+                ImVec2 mn = ImGui::GetItemRectMin();
+                ImVec2 mx = ImGui::GetItemRectMax();
+                ImGui::GetWindowDrawList()->AddRectFilled(mn, mx,
+                    IM_COL32(0, 0, 0, 90));
+                break;
+            }
+        }
+    }
+
     /* File name label */
     {
         bool is_selected = s_assets.selected_set.count(index) != 0;
@@ -520,25 +554,22 @@ void draw_asset_item_context_menu(const std::vector<FileEntry> &display_entries)
 
         if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInVSCode"))) {
             if (cfe) {
-#ifdef _WIN32
-                std::string cmd = "code \"" + cfe->path + "\"";
-                system(cmd.c_str());
-#endif
+                jce_host_open_in_text_editor(cfe->path.c_str());
             }
         }
 
         if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInExplorer"))) {
             if (cfe) {
-#ifdef _WIN32
-                std::string p = cfe->path;
-                for (auto &ch : p) { if (ch == '/') ch = '\\'; }
-                if (cfe->is_dir) {
-                    ShellExecuteA(NULL, "explore", p.c_str(), NULL, NULL, SW_SHOWNORMAL);
-                } else {
-                    std::string arg = "/select,\"" + p + "\"";
-                    ShellExecuteA(NULL, NULL, "explorer.exe", arg.c_str(), NULL, SW_SHOWNORMAL);
-                }
-#endif
+                jce_host_reveal_path(cfe->path.c_str());
+            }
+        }
+
+        if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInTerminal"))) {
+            if (cfe) {
+                std::string dir = cfe->is_dir
+                    ? cfe->path
+                    : fs::path(cfe->path).parent_path().string();
+                jce_host_open_terminal(dir.c_str());
             }
         }
 
@@ -555,22 +586,17 @@ void draw_asset_item_context_menu(const std::vector<FileEntry> &display_entries)
 
         if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.duplicate"), "Ctrl+D")) {
             if (cfe) {
-                try {
-                    fs::path src(cfe->path);
-                    fs::path dst;
-                    if (cfe->is_dir) {
-                        dst = src.parent_path() / (cfe->name + "_copy");
-                    } else {
-                        std::string stem = src.stem().string();
-                        std::string ext  = src.extension().string();
-                        dst = src.parent_path() / (stem + "_copy" + ext);
-                    }
-                    fs::copy(src, dst, fs::copy_options::recursive);
+                char unique[1200];
+                if (jce_fs_host_make_unique_path(cfe->path.c_str(),
+                                                  unique, sizeof(unique))
+                    && jce_fs_host_copy_recursive(cfe->path.c_str(), unique))
+                {
                     jce_editor_console_log("Duplicated '%s'", cfe->name.c_str());
+                    s_assets.entry_flash[unique] = 0.6f;
                     s_assets.needs_refresh = true;
-                } catch (const std::exception &e) {
+                } else {
                     jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-                        "Duplicate failed: %s", e.what());
+                        "Duplicate failed: '%s'", cfe->name.c_str());
                 }
             }
         }
@@ -582,18 +608,30 @@ void draw_asset_item_context_menu(const std::vector<FileEntry> &display_entries)
         }
 
         if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.copy"), "Ctrl+C")) {
-            if (cfe) copy_selection_to_clipboard(false);
+            if (cfe) {
+                if (s_assets.selected_set.size() > 1) {
+                    copy_selection_from_view_to_clipboard(display_entries, false);
+                } else {
+                    copy_path_to_clipboard(cfe->path, false);
+                }
+            }
         }
 
         if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.cut"), "Ctrl+X")) {
-            if (cfe) copy_selection_to_clipboard(true);
+            if (cfe) {
+                if (s_assets.selected_set.size() > 1) {
+                    copy_selection_from_view_to_clipboard(display_entries, true);
+                } else {
+                    copy_path_to_clipboard(cfe->path, true);
+                }
+            }
         }
 
         ImGui::Separator();
 
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
         if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.delete"), "Del")) {
-            if (cfe) collect_selected_for_deletion();
+            if (cfe) collect_selected_from_view_for_deletion(display_entries);
         }
         ImGui::PopStyleColor();
 
@@ -611,7 +649,8 @@ void draw_asset_empty_area_menu(void)
     if (ImGui::IsMouseClicked(ImGuiMouseButton_Right)
         && s_assets.suppress_empty_ctx_frames == 0
         && !ImGui::IsPopupOpen("AssetContextMenu")
-        && ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByPopup))
+        && ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByPopup
+                                  | ImGuiHoveredFlags_ChildWindows))
     {
         ImGui::OpenPopup("EmptyAreaCtx");
     }
@@ -669,16 +708,12 @@ void draw_asset_empty_area_menu(void)
         if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.refresh"))) {
             s_assets.needs_refresh = true;
         }
-#ifdef _WIN32
         if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInExplorer"))) {
-            std::string cmd = "explorer \"" + s_assets.current_path + "\"";
-            system(cmd.c_str());
+            jce_host_reveal_path(s_assets.current_path.c_str());
         }
         if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInTerminal"))) {
-            std::string cmd = "start cmd /K cd /d \"" + s_assets.current_path + "\"";
-            system(cmd.c_str());
+            jce_host_open_terminal(s_assets.current_path.c_str());
         }
-#endif
         ImGui::EndPopup();
     }
 }

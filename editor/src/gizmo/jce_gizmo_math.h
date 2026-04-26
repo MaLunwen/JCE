@@ -1,18 +1,20 @@
 /*
  * jce_gizmo_math.h  Projection + ray utilities for gizmo interaction.
  *
- * Inline helpers: world_to_screen, screen_to_ray, ray-axis closest,
- * ray-plane intersect.  All operate on raw float arrays / JceGizmoCamera.
- *
- * Low-level vec3 / mat4 helpers delegate to cglm (already an engine
- * dependency) so we avoid duplicating SIMD-friendly math.
+ * NOTE: This is the gizmo subsystem's *raw float-array* adapter to cglm.
+ * The gizmo pipeline operates on flat float[3]/float[16] buffers because
+ * those interop directly with ImGui draw lists, bgfx vertex layouts, and
+ * the editor scene's column-major matrix exports.  jce_math.h provides
+ * the same algorithms over the struct API (jce_vec3 / jce_mat4) for
+ * everything else in the codebase; this header is the only sanctioned
+ * place to call cglm's raw API.
  */
 
 #ifndef JCE_GIZMO_MATH_H
 #define JCE_GIZMO_MATH_H
 
 #include <cglm/cglm.h>          /* raw float-array API (vec3, mat4) */
-#include <jce/core/jce_math.h>  /* JCE_PI, JCE_DEG2RAD, JCE_RAD2DEG */
+#include <jce/os/core/jce_math.h>  /* JCE_PI, JCE_DEG2RAD, JCE_RAD2DEG */
 #include <stdbool.h>
 
 #ifdef __cplusplus

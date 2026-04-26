@@ -26,6 +26,20 @@ typedef struct {
 
     /* Asset Browser settings (persisted across sessions). */
     int  asset_browser_view_mode; /* AssetBrowserViewMode enum (0=Grid,1=Details) */
+
+    /* External game run/build settings. */
+    int  run_mode;             /* 0=Editor Simulation, 1=External Game */
+    char game_executable_path[512];
+    char game_working_directory[512];
+    char game_target_name[128];
+    char build_configure_preset[128];
+    char build_preset[128];
+    char build_output_path[512];
+
+    /* Font overrides (empty -> default lookup: try system Ink Free /
+       KaiTi by name, fall back to ImGui built-in proggy). */
+    char font_en_path[512];
+    char font_zh_path[512];
 } JceEditorConfig;
 
 /* Load config from .jce/editor-config.json. Returns false if not found. */

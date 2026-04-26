@@ -10,7 +10,7 @@
 #include "jce_scene_render_internal.h"
 
 extern "C" {
-#include <jce/scene/jce_scene.h>
+#include <jce/middleware/scene/jce_scene.h>
 }
 
 /* ── Animation timer reset (kept for play.cpp compatibility) ─────── */

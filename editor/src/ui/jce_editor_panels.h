@@ -119,6 +119,12 @@ typedef struct {
 int   jce_editor_console_entry_count(void);
 bool  jce_editor_console_entry_get(int display_idx, JceConsoleEntry *out);
 
+/* Renderer-backend dropdown contents.  Populated from
+   jce_renderer_caps_list_backends() the first time it is queried.
+   Returns the count of entries; *out_names (if non-NULL) receives a
+   pointer to a const array of UI strings of that length. */
+int   jce_editor_renderer_backends(const char *const **out_names);
+
 #ifdef __cplusplus
 }
 #endif

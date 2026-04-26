@@ -179,8 +179,8 @@ static float nearest_hit_along_view_ray(void)
         if (hy < 0.1f) hy = 0.1f;
         if (hz < 0.1f) hz = 0.1f;
 
-        jce_vec3 bmin = {{ t->position.x - hx, t->position.y - hy, t->position.z - hz }};
-        jce_vec3 bmax = {{ t->position.x + hx, t->position.y + hy, t->position.z + hz }};
+        jce_vec3 bmin = jce_v3(t->position.x - hx, t->position.y - hy, t->position.z - hz);
+        jce_vec3 bmax = jce_v3(t->position.x + hx, t->position.y + hy, t->position.z + hz);
 
         float th;
         if (jce_ray_aabb_intersect(eye, dir, bmin, bmax, &th) && th >= 0.0f) {

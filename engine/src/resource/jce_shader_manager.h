@@ -9,7 +9,7 @@
 #ifndef JCE_SHADER_MANAGER_H
 #define JCE_SHADER_MANAGER_H
 
-#include <jce/graphics/jce_gfx_types.h>
+#include <jce/renderer/jce_gfx_types.h>
 #include <stdbool.h>
 
 #ifdef __cplusplus

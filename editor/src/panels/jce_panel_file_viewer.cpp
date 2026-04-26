@@ -10,6 +10,7 @@
 
 #include "viewers/jce_fv_common.h"
 #include "jce_editor_state.h"
+#include "jce_editor_file_util.h"
 #include <imgui_internal.h>
 
 #include <string>
@@ -20,7 +21,8 @@ extern "C" {
 #include <SDL3_image/SDL_image.h>
 #include <SDL3/SDL_iostream.h>
 #include <SDL3/SDL_surface.h>
-#include <jce/graphics/jce_pbr_material.h>
+#include <jce/renderer/jce_pbr_material.h>
+#include <jce/os/platform/jce_host_shell.h>
 #include <jce/third_party/stb_image.h>
 }
 
@@ -283,19 +285,21 @@ void jce_file_viewer_open(const char *path)
         }
     }
 
-    /* Read file. */
-    FILE *fp = fopen(open_path, "rb");
-    if (!fp) {
-        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-            "file viewer: cannot open '%s'", open_path);
-        return;
+    /* Stat file size first so we can reject oversize previews before
+     * any allocation; std::filesystem keeps this dependency-free. */
+    long file_size = -1;
+    {
+        std::error_code ec;
+        auto sz = std::filesystem::file_size(open_path, ec);
+        if (ec) {
+            jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                "file viewer: cannot open '%s'", open_path);
+            return;
+        }
+        file_size = (long)sz;
     }
-    fseek(fp, 0, SEEK_END);
-    long file_size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
 
     if (file_size < 0) {
-        fclose(fp);
         jce_editor_console_log_level(JCE_CONSOLE_ERROR,
             "file viewer: failed to read size for '%s'", open_path);
         return;
@@ -303,7 +307,6 @@ void jce_file_viewer_open(const char *path)
 
     if (file_size > FV_MAX_ASSET_BYTES) {
         char info_msg[384];
-        fclose(fp);
         jce_editor_console_log_level(JCE_CONSOLE_WARNING,
             "file viewer: '%s' is too large (%ld bytes). Max single asset is %d MB.",
             open_path, file_size, FV_MAX_ASSET_BYTES / (1024 * 1024));
@@ -345,12 +348,18 @@ void jce_file_viewer_open(const char *path)
     else
         read_size = (file_size > FV_MAX_CONTENT) ? FV_MAX_CONTENT : (int)file_size;
 
-    char *buf = (char *)ED_MALLOC((size_t)read_size + 1);
-    if (!buf) { fclose(fp); return; }
-
-    int actually_read = (int)fread(buf, 1, (size_t)read_size, fp);
-    fclose(fp);
-    buf[actually_read] = '\0';
+    /* Read file (capped at FV_MAX_ASSET_BYTES already validated above
+     * via stat helper before opening — see file_size check earlier). */
+    size_t got = 0, total = 0;
+    char *buf = (char *)ed_read_file_capped(open_path,
+                                            (size_t)read_size,
+                                            &got, &total);
+    if (!buf) {
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+            "file viewer: cannot open '%s'", open_path);
+        return;
+    }
+    int actually_read = (int)got;
 
     /* Refine type detection. */
     if (ftype == JCE_FV_TEXT) {
@@ -648,13 +657,23 @@ void jce_file_viewer_draw_content(void)
                 if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.copyPath"))) {
                     ImGui::SetClipboardText(tab->path);
                 }
-#ifdef _WIN32
                 if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInExplorer"))) {
-                    char cmd[600];
-                    snprintf(cmd, sizeof(cmd), "explorer /select,\"%s\"", tab->path);
-                    system(cmd);
+                    jce_host_reveal_path(tab->path);
                 }
-#endif
+                if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInTerminal"))) {
+                    /* Use parent dir for files; tab->path itself if a directory. */
+                    SDL_PathInfo info;
+                    if (SDL_GetPathInfo(tab->path, &info) &&
+                        info.type == SDL_PATHTYPE_DIRECTORY) {
+                        jce_host_open_terminal(tab->path);
+                    } else {
+                        std::string p = tab->path;
+                        size_t s = p.find_last_of("/\\");
+                        jce_host_open_terminal(s == std::string::npos
+                                               ? "."
+                                               : p.substr(0, s).c_str());
+                    }
+                }
                 ImGui::EndPopup();
             }
 

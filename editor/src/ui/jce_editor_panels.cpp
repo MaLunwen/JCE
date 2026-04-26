@@ -23,17 +23,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#ifdef _WIN32
-#include <direct.h>   /* _mkdir */
-#endif
 
 extern "C" {
-#include <jce/core/jce_log.h>
-#include <jce/app/jce_config.h>
-#include <jce/graphics/jce_renderer.h>
+#include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_timer.h>
+#include <jce/application/jce_config.h>
+#include <jce/renderer/jce_renderer.h>
+#include <jce/renderer/jce_renderer_caps.h>
 #include <jce/jce_version.h>
+#include <SDL3/SDL.h>
+#include "io/jce_editor_file_util.h"
 }
-#include <time.h>
 
 #define LOG_TAG "editor_panels"
 
@@ -61,7 +61,7 @@ bool *jce_editor_panel_visible_ptr(JceEditorPanel panel)
 
 typedef struct {
     char            text[CONSOLE_LINE_LEN];
-    char            timestamp[16];
+    char            timestamp[24];
     JceConsoleLevel level;
 } ConsoleLine;
 
@@ -77,12 +77,13 @@ static void console_add(JceConsoleLevel level, const char *text)
     s_console.lines[idx].level = level;
     snprintf(s_console.lines[idx].text, CONSOLE_LINE_LEN, "%s", text);
 
-    time_t now = time(NULL);
-    struct tm *t = localtime(&now);
-    if (t)
-        strftime(s_console.lines[idx].timestamp, 16, "%H:%M:%S", t);
-    else
-        snprintf(s_console.lines[idx].timestamp, 16, "--:--:--");
+    int64_t now_s = jce_time_now_epoch_seconds();
+    if (jce_time_format_local(now_s, "%Y-%m-%d %H:%M:%S",
+                              s_console.lines[idx].timestamp,
+                              sizeof(s_console.lines[idx].timestamp)) == 0)
+        snprintf(s_console.lines[idx].timestamp,
+                 sizeof(s_console.lines[idx].timestamp),
+                 "----------  --:--:--");
 
     s_console.head++;
     if (s_console.count < CONSOLE_MAX_LINES)
@@ -189,44 +190,54 @@ void jce_editor_panel_file_viewer(void)
  *  SETTINGS DIALOG (full implementation)
  * ══════════════════════════════════════════════════════════════════════ */
 
-/* Platform-specific renderer backend list. */
-#if defined(_WIN32)
-const char *s_renderer_names[] = { "Auto", "D3D12", "D3D11", "Vulkan", "OpenGL" };
-static const JceRendererBackend s_renderer_values[] = {
-    JCE_BACKEND_AUTO, JCE_BACKEND_D3D12, JCE_BACKEND_D3D11,
-    JCE_BACKEND_VULKAN, JCE_BACKEND_OPENGL
+/* Renderer backend list — populated at runtime from compiled-in
+   bgfx backends via jce_renderer_caps_list_backends().  Falls back
+   to a single "Auto" entry if the renderer has not been initialized
+   yet (e.g. settings panel opened before first frame). */
+#define JCE_EDITOR_MAX_BACKENDS 8
+static JceRendererBackend s_renderer_values[JCE_EDITOR_MAX_BACKENDS] = {
+    JCE_BACKEND_AUTO
 };
-extern const int s_renderer_count = 5;
-#elif defined(__APPLE__)
-const char *s_renderer_names[] = { "Auto", "Metal", "OpenGL" };
-static const JceRendererBackend s_renderer_values[] = {
-    JCE_BACKEND_AUTO, JCE_BACKEND_METAL, JCE_BACKEND_OPENGL
+static const char        *s_renderer_names[JCE_EDITOR_MAX_BACKENDS]  = {
+    "Auto"
 };
-extern const int s_renderer_count = 3;
-#elif defined(__EMSCRIPTEN__)
-const char *s_renderer_names[] = { "Auto", "OpenGL ES" };
-static const JceRendererBackend s_renderer_values[] = {
-    JCE_BACKEND_AUTO, JCE_BACKEND_OPENGLES
-};
-extern const int s_renderer_count = 2;
-#else
-const char *s_renderer_names[] = { "Auto", "Vulkan", "OpenGL" };
-static const JceRendererBackend s_renderer_values[] = {
-    JCE_BACKEND_AUTO, JCE_BACKEND_VULKAN, JCE_BACKEND_OPENGL
-};
-extern const int s_renderer_count = 3;
-#endif
+static int                s_renderer_count = 1;
+static bool               s_renderer_list_built = false;
+
+static void build_renderer_list_if_needed(void)
+{
+    if (s_renderer_list_built) return;
+    int n = jce_renderer_caps_list_backends(s_renderer_values,
+                                            JCE_EDITOR_MAX_BACKENDS);
+    if (n <= 0) return; /* bgfx not initialized yet — keep defaults. */
+    if (n > JCE_EDITOR_MAX_BACKENDS) n = JCE_EDITOR_MAX_BACKENDS;
+    for (int i = 0; i < n; ++i)
+        s_renderer_names[i] = jce_renderer_backend_name(s_renderer_values[i]);
+    s_renderer_count = n;
+    s_renderer_list_built = true;
+}
+
+extern "C" int jce_editor_renderer_backends(const char *const **out_names)
+{
+    build_renderer_list_if_needed();
+    if (out_names) *out_names = s_renderer_names;
+    return s_renderer_count;
+}
 
 static struct {
     int   language_idx;
     int   theme_idx;
     int   renderer_idx;
     float font_size;
+    char  font_en_path[512];
+    char  font_zh_path[512];
     /* Saved originals for Cancel. */
     int   orig_language_idx;
     int   orig_theme_idx;
     int   orig_renderer_idx;
     float orig_font_size;
+    char  orig_font_en_path[512];
+    char  orig_font_zh_path[512];
     bool  needs_restart;
     bool  initialized;
 } s_settings;
@@ -268,6 +279,7 @@ static void settings_ensure_init(void)
             s_settings.font_size = jce_editor_get_font_size();
 
         /* Renderer */
+        build_renderer_list_if_needed();
         s_settings.renderer_idx = 0;
         for (int i = 0; i < s_renderer_count; i++) {
             if (strcmp(s_renderer_names[i], ecfg.renderer) == 0) {
@@ -275,6 +287,12 @@ static void settings_ensure_init(void)
                 break;
             }
         }
+
+        /* Font path overrides (applied on next restart). */
+        snprintf(s_settings.font_en_path, sizeof(s_settings.font_en_path),
+                 "%s", ecfg.font_en_path);
+        snprintf(s_settings.font_zh_path, sizeof(s_settings.font_zh_path),
+                 "%s", ecfg.font_zh_path);
     } else {
         s_settings.language_idx  = (jce_editor_i18n_get_locale() == JCE_LOCALE_ZH_CN) ? 1 : 0;
         s_settings.theme_idx     = jce_editor_get_theme();
@@ -291,6 +309,10 @@ static void settings_snapshot(void)
     s_settings.orig_theme_idx    = s_settings.theme_idx;
     s_settings.orig_renderer_idx = s_settings.renderer_idx;
     s_settings.orig_font_size    = s_settings.font_size;
+    snprintf(s_settings.orig_font_en_path, sizeof(s_settings.orig_font_en_path),
+             "%s", s_settings.font_en_path);
+    snprintf(s_settings.orig_font_zh_path, sizeof(s_settings.orig_font_zh_path),
+             "%s", s_settings.font_zh_path);
 }
 
 static void settings_apply(void)
@@ -321,6 +343,11 @@ static void settings_apply(void)
         if (s_settings.renderer_idx >= 0 && s_settings.renderer_idx < s_renderer_count)
             snprintf(ecfg.renderer, sizeof(ecfg.renderer), "%s",
                      s_renderer_names[s_settings.renderer_idx]);
+
+        snprintf(ecfg.font_en_path, sizeof(ecfg.font_en_path),
+                 "%s", s_settings.font_en_path);
+        snprintf(ecfg.font_zh_path, sizeof(ecfg.font_zh_path),
+                 "%s", s_settings.font_zh_path);
 
         jce_editor_config_save(&ecfg);
     }
@@ -353,6 +380,11 @@ static void settings_cancel(void)
     s_settings.font_size = s_settings.orig_font_size;
     /* Revert renderer. */
     s_settings.renderer_idx = s_settings.orig_renderer_idx;
+    /* Revert font path overrides. */
+    snprintf(s_settings.font_en_path, sizeof(s_settings.font_en_path),
+             "%s", s_settings.orig_font_en_path);
+    snprintf(s_settings.font_zh_path, sizeof(s_settings.font_zh_path),
+             "%s", s_settings.orig_font_zh_path);
     s_settings.needs_restart = false;
 }
 
@@ -430,6 +462,7 @@ void jce_editor_settings_dialog(bool *p_open)
                        jce_editor_i18n("settings.requiresRestart"));
 
     /* Renderer Backend (selector) */
+    build_renderer_list_if_needed();
     snprintf(_lbl, sizeof(_lbl), "%s###settings_renderer", jce_editor_i18n("settings.renderBackend"));
     if (ImGui::Combo(_lbl, &s_settings.renderer_idx, s_renderer_names, s_renderer_count)) {
         s_settings.needs_restart = true;
@@ -444,6 +477,87 @@ void jce_editor_settings_dialog(bool *p_open)
                        jce_renderer_get_backend_name(NULL));
 
     ImGui::PopItemWidth();
+
+    /* Font picker — pick from fonts discovered on the host system.
+     * "(Auto)" => system font auto-detection at startup; if no system
+     * font matches, ImGui's built-in default is used.
+     * Changes take effect on next editor restart. */
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(0.6f, 0.8f, 1.0f, 1.0f), "%s",
+                       jce_editor_i18n("settings.fonts.title"));
+    ImGui::TextWrapped("%s", jce_editor_i18n("settings.fonts.help"));
+    ImGui::Spacing();
+
+    /* Lazy one-shot scan of available fonts on the host. */
+    enum { JCE_FONT_PICKER_MAX = 512 };
+    static JceFontEntry  s_font_entries[JCE_FONT_PICKER_MAX];
+    static const char   *s_font_labels[JCE_FONT_PICKER_MAX + 1]; /* +1 for Auto */
+    static int           s_font_count   = -1;   /* -1 => not scanned yet */
+    if (s_font_count < 0) {
+        s_font_count = jce_editor_enumerate_fonts(s_font_entries,
+                                                  JCE_FONT_PICKER_MAX);
+        s_font_labels[0] = jce_editor_i18n("settings.fonts.auto");
+        for (int i = 0; i < s_font_count; ++i)
+            s_font_labels[i + 1] = s_font_entries[i].display_name;
+    }
+    /* Refresh "Auto" label every frame so locale changes apply live. */
+    s_font_labels[0] = jce_editor_i18n("settings.fonts.auto");
+
+    /* Helper lambda to find the combo index that matches a stored path. */
+    auto find_idx_for_path = [](const char *path) -> int {
+        if (!path || !*path) return 0;          /* Auto */
+        for (int i = 0; i < s_font_count; ++i)
+            if (SDL_strcasecmp(s_font_entries[i].path, path) == 0)
+                return i + 1;
+        return 0;                               /* unknown -> show Auto */
+    };
+
+    int en_idx = find_idx_for_path(s_settings.font_en_path);
+    int zh_idx = find_idx_for_path(s_settings.font_zh_path);
+
+    ImGui::PushItemWidth(-160);
+
+    snprintf(_lbl, sizeof(_lbl), "%s###settings_font_en",
+             jce_editor_i18n("settings.fonts.latin"));
+    if (ImGui::Combo(_lbl, &en_idx, s_font_labels, s_font_count + 1)) {
+        if (en_idx <= 0)
+            s_settings.font_en_path[0] = '\0';
+        else
+            SDL_strlcpy(s_settings.font_en_path,
+                        s_font_entries[en_idx - 1].path,
+                        sizeof(s_settings.font_en_path));
+        s_settings.needs_restart = true;
+    }
+
+    snprintf(_lbl, sizeof(_lbl), "%s###settings_font_zh",
+             jce_editor_i18n("settings.fonts.cjk"));
+    if (ImGui::Combo(_lbl, &zh_idx, s_font_labels, s_font_count + 1)) {
+        if (zh_idx <= 0)
+            s_settings.font_zh_path[0] = '\0';
+        else
+            SDL_strlcpy(s_settings.font_zh_path,
+                        s_font_entries[zh_idx - 1].path,
+                        sizeof(s_settings.font_zh_path));
+        s_settings.needs_restart = true;
+    }
+    ImGui::PopItemWidth();
+
+    /* Show the resolved absolute path of the current selection (helpful
+       when two installed fonts share a display name). */
+    if (en_idx > 0)
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Latin: %s",
+                           s_font_entries[en_idx - 1].path);
+    if (zh_idx > 0)
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "CJK:   %s",
+                           s_font_entries[zh_idx - 1].path);
+
+    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),
+                       "%s (%d %s)",
+                       jce_editor_i18n("settings.fonts.scanned"),
+                       s_font_count,
+                       jce_editor_i18n("settings.fonts.fontsFound"));
 
     /* Restart warning */
     if (s_settings.needs_restart) {
@@ -518,6 +632,8 @@ static struct {
     char  scenes_path[512];
     char  prefabs_path[512];
     char  build_output_path[512];
+    char  font_en_path[512];
+    char  font_zh_path[512];
     char  status_msg[128];
     float status_timer;
     bool  initialized;
@@ -546,6 +662,15 @@ static void prefs_ensure_init(void)
     snprintf(s_prefs.scenes_path, sizeof(s_prefs.scenes_path), "assets/scenes");
     snprintf(s_prefs.prefabs_path, sizeof(s_prefs.prefabs_path), "assets/prefabs");
     snprintf(s_prefs.build_output_path, sizeof(s_prefs.build_output_path), "build");
+
+    /* Pull persisted font overrides from editor config. */
+    JceEditorConfig _ecfg;
+    if (jce_editor_config_load(&_ecfg)) {
+        snprintf(s_prefs.font_en_path, sizeof(s_prefs.font_en_path),
+                 "%s", _ecfg.font_en_path);
+        snprintf(s_prefs.font_zh_path, sizeof(s_prefs.font_zh_path),
+                 "%s", _ecfg.font_zh_path);
+    }
     s_prefs.initialized        = true;
 }
 
@@ -669,12 +794,45 @@ void jce_editor_panel_preferences(void)
                 ImGui::EndTabItem();
             }
 
+            /* Fonts tab: user-supplied font overrides (e.g. system Ink Free /
+             * KaiTi on Windows). Empty string -> use bundled OFL fallback.
+             * Changes apply on next editor restart. */
+            if (ImGui::BeginTabItem("Fonts###pref_fonts")) {
+                ImGui::TextWrapped("Override the editor UI fonts. Leave empty "
+                                   "to auto-detect a system font, falling back "
+                                   "to bundled OFL fonts. Restart required.");
+                ImGui::Spacing();
+                ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "Latin font (.ttf/.otf)");
+                ImGui::InputText("##fontEn", s_prefs.font_en_path, sizeof(s_prefs.font_en_path));
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Clear##fontEnClr")) s_prefs.font_en_path[0] = '\0';
+                ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "CJK font (.ttf/.otf/.ttc)");
+                ImGui::InputText("##fontZh", s_prefs.font_zh_path, sizeof(s_prefs.font_zh_path));
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Clear##fontZhClr")) s_prefs.font_zh_path[0] = '\0';
+                ImGui::Spacing();
+                ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
+                    "Hint (Windows): C:/Windows/Fonts/inkfree.ttf, simkai.ttf, msyh.ttc");
+                ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
+                    "Hint (macOS):   /System/Library/Fonts/PingFang.ttc");
+                ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
+                    "Hint (Linux):   /usr/share/fonts/...");
+                ImGui::EndTabItem();
+            }
+
             ImGui::EndTabBar();
         }
 
         ImGui::Separator();
 
         if (ImGui::Button(jce_editor_i18n("preferences.buttons.save"))) {
+            JceEditorConfig _ecfg;
+            jce_editor_config_load(&_ecfg);
+            snprintf(_ecfg.font_en_path, sizeof(_ecfg.font_en_path),
+                     "%s", s_prefs.font_en_path);
+            snprintf(_ecfg.font_zh_path, sizeof(_ecfg.font_zh_path),
+                     "%s", s_prefs.font_zh_path);
+            jce_editor_config_save(&_ecfg);
             snprintf(s_prefs.status_msg, sizeof(s_prefs.status_msg),
                      "%s", jce_editor_i18n("preferences.status.saved"));
             s_prefs.status_timer = 3.0f;
@@ -775,6 +933,32 @@ static void render_third_party_popup(bool *p_open)
 void jce_editor_about_dialog(bool *p_open)
 {
     static bool s_show_tpl = false;
+    static bool s_sha_loaded = false;
+    static char s_sha[96];   /* "<64 hex>  jce_editor.exe\n" comfortably fits */
+
+    if (!s_sha_loaded) {
+        s_sha_loaded = true;
+        s_sha[0] = '\0';
+        const char *base = SDL_GetBasePath();
+        if (base) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%sjce_editor_sha256.txt", base);
+            size_t sz = 0;
+            char *buf = (char *)ed_read_file(path, &sz);
+            if (buf) {
+                /* The file is "<hex>  <filename>\n" — keep just the hex prefix. */
+                size_t take = sz < sizeof(s_sha) - 1 ? sz : sizeof(s_sha) - 1;
+                size_t hex_end = 0;
+                while (hex_end < take && ((buf[hex_end] >= '0' && buf[hex_end] <= '9') ||
+                                          (buf[hex_end] >= 'a' && buf[hex_end] <= 'f') ||
+                                          (buf[hex_end] >= 'A' && buf[hex_end] <= 'F')))
+                    hex_end++;
+                memcpy(s_sha, buf, hex_end);
+                s_sha[hex_end] = '\0';
+                ED_FREE(buf);
+            }
+        }
+    }
 
     if (!p_open) {
         /* Allow standalone tpl popup to keep working even if about closed. */
@@ -803,8 +987,17 @@ void jce_editor_about_dialog(bool *p_open)
         return;
     }
 
-    ImGui::Text("%s: " JCE_VERSION_STR " (Editor Preview)", jce_editor_i18n("about.versionLabel"));
-    ImGui::Text("%s: %s %s", jce_editor_i18n("about.buildLabel"), __DATE__, __TIME__);
+    ImGui::Text("%s: " JCE_VERSION_STR " (Editor%s)",
+                jce_editor_i18n("about.versionLabel"),
+#if defined(JCE_BUILD_VARIANT_STR)
+                strcmp(JCE_BUILD_VARIANT_STR, "dist") == 0 ? "" : " Preview"
+#else
+                " Preview"
+#endif
+    );
+    ImGui::Text("%s: %s",
+                jce_editor_i18n("about.buildLabel"),
+                JCE_BUILD_TIMESTAMP_UTC);
 
     ImGui::Spacing();
     ImGui::PushStyleColor(ImGuiCol_Text, JCE_COLOR_TEXT_SECONDARY);
@@ -824,9 +1017,15 @@ void jce_editor_about_dialog(bool *p_open)
 #if defined(JCE_BUILD_VARIANT_STR)
         build_row("Variant", JCE_BUILD_VARIANT_STR);
 #endif
+        if (s_sha[0]) {
+            /* dist build: show binary SHA-256 (tamper-evident). */
+            build_row("SHA-256", s_sha);
+        } else {
+            /* Non-dist: show source git commit so devs can reproduce the build. */
 #if defined(JCE_GIT_COMMIT)
-        build_row("Commit", JCE_GIT_COMMIT);
+            build_row("Commit", JCE_GIT_COMMIT);
 #endif
+        }
 #if JCE_TRACY_ENABLED
         build_row("Profiling (Tracy)", "Enabled");
 #endif

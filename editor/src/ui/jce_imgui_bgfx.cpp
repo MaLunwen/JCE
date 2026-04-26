@@ -12,10 +12,10 @@
 #include <string.h>
 
 extern "C" {
-#include <jce/graphics/jce_shaders.h>
-#include <jce/graphics/jce_views.h>
-#include <jce/core/jce_log.h>
-#include <jce/core/jce_math.h>
+#include <jce/renderer/jce_shaders.h>
+#include <jce/renderer/jce_views.h>
+#include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_math.h>
 }
 
 #define LOG_TAG "imgui_bgfx"

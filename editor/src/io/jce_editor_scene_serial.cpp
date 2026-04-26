@@ -12,8 +12,8 @@
 #include "jce_editor_file_util.h"
 
 extern "C" {
-#include <jce/graphics/jce_model.h>
-#include <jce/scene/jce_scene_components_json.h>
+#include <jce/renderer/jce_model.h>
+#include <jce/middleware/scene/jce_scene_components_json.h>
 }
 
 #include <SDL3/SDL.h>
@@ -23,47 +23,47 @@ extern "C" {
 
 /* ── Serialize entity tree to JSON (recursive, for prefabs) ────────── */
 
-cJSON *serialize_entity_tree_json(uint32_t entity_id)
+JceJson *serialize_entity_tree_json(uint32_t entity_id)
 {
 	if (!s.scene || entity_id == 0) return NULL;
 	JceEntity e = (JceEntity)entity_id;
 	JceEditorMeta *meta = jce_scene_get_editor_meta(s.scene, e);
 	if (!meta) return NULL;
 
-	cJSON *node = cJSON_CreateObject();
+	JceJson *node = jce_json_object();
 	if (!node) return NULL;
 
-	cJSON_AddStringToObject(node, "name", meta->name);
-	cJSON_AddBoolToObject(node, "enabled", meta->enabled);
-	cJSON_AddNumberToObject(node, "tagColor", (double)meta->tag_color);
+	jce_json_set_string(node, "name", meta->name);
+	jce_json_set_bool(node, "enabled", meta->enabled);
+	jce_json_set_number(node, "tagColor", (double)meta->tag_color);
 	if (meta->tag[0] != '\0')
-		cJSON_AddStringToObject(node, "tag", meta->tag);
+		jce_json_set_string(node, "tag", meta->tag);
 	if (meta->prefab_instance) {
-		cJSON_AddBoolToObject(node, "prefabInstance", true);
+		jce_json_set_bool(node, "prefabInstance", true);
 		if (meta->prefab_path[0] != '\0')
-			cJSON_AddStringToObject(node, "prefabPath", meta->prefab_path);
+			jce_json_set_string(node, "prefabPath", meta->prefab_path);
 	}
 
 	/* Delegate component serialization to the engine. */
 	{
-		cJSON *comps = jce_scene_serialize_entity_components(s.scene, e);
+		JceJson *comps = jce_scene_serialize_entity_components(s.scene, e);
 		if (comps)
-			cJSON_AddItemToObject(node, "components", comps);
+			jce_json_set_child(node, "components", comps);
 	}
 
-	cJSON *children = cJSON_CreateArray();
+	JceJson *children = jce_json_array();
 	if (!children) {
-		cJSON_Delete(node);
+		jce_json_free(node);
 		return NULL;
 	}
-	cJSON_AddItemToObject(node, "children", children);
+	jce_json_set_child(node, "children", children);
 
 	JceEntity child_buf[JCE_MAX_CHILDREN];
 	int cn = jce_scene_get_children(s.scene, e, child_buf, JCE_MAX_CHILDREN);
 	for (int i = 0; i < cn; i++) {
-		cJSON *child = serialize_entity_tree_json((uint32_t)child_buf[i]);
+		JceJson *child = serialize_entity_tree_json((uint32_t)child_buf[i]);
 		if (child)
-			cJSON_AddItemToArray(children, child);
+			jce_json_array_push(children, child);
 	}
 
 	return node;
@@ -71,52 +71,52 @@ cJSON *serialize_entity_tree_json(uint32_t entity_id)
 
 /* ── Build full scene JSON root (delegates to engine) ──────────────── */
 
-cJSON *build_scene_json_root(void)
+JceJson *build_scene_json_root(void)
 {
 	/* The engine serializer emits the contract envelope format. */
 	return jce_scene_save_json(s.scene);
 }
 
-cJSON *build_prefab_json_root(uint32_t entity_id)
+JceJson *build_prefab_json_root(uint32_t entity_id)
 {
-	cJSON *root = cJSON_CreateObject();
-	cJSON *contract = cJSON_CreateObject();
-	cJSON *prefab = cJSON_CreateObject();
-	cJSON *root_node = serialize_entity_tree_json(entity_id);
+	JceJson *root = jce_json_object();
+	JceJson *contract = jce_json_object();
+	JceJson *prefab = jce_json_object();
+	JceJson *root_node = serialize_entity_tree_json(entity_id);
 	if (!root || !contract || !prefab || !root_node) {
-		cJSON_Delete(root);
-		cJSON_Delete(contract);
-		cJSON_Delete(prefab);
-		cJSON_Delete(root_node);
+		jce_json_free(root);
+		jce_json_free(contract);
+		jce_json_free(prefab);
+		jce_json_free(root_node);
 		return NULL;
 	}
 
-	cJSON_AddItemToObject(root, JCE_SCENE_CONTRACT_KEY, contract);
-	cJSON_AddStringToObject(contract, JCE_SCENE_CONTRACT_NAME_KEY,
-	                        JCE_SCENE_CONTRACT_NAME);
-	cJSON_AddNumberToObject(contract, JCE_SCENE_CONTRACT_MAJOR_KEY,
-	                        JCE_SCENE_CONTRACT_MAJOR);
-	cJSON_AddNumberToObject(contract, JCE_SCENE_CONTRACT_MINOR_KEY,
-	                        JCE_SCENE_CONTRACT_MINOR);
+	jce_json_set_child(root, JCE_SCENE_CONTRACT_KEY, contract);
+	jce_json_set_string(contract, JCE_SCENE_CONTRACT_NAME_KEY,
+	                    JCE_SCENE_CONTRACT_NAME);
+	jce_json_set_int(contract, JCE_SCENE_CONTRACT_MAJOR_KEY,
+	                 JCE_SCENE_CONTRACT_MAJOR);
+	jce_json_set_int(contract, JCE_SCENE_CONTRACT_MINOR_KEY,
+	                 JCE_SCENE_CONTRACT_MINOR);
 
-	cJSON_AddItemToObject(root, "prefab", prefab);
-	cJSON_AddNumberToObject(prefab, JCE_SCENE_VERSION_KEY,
-	                        JCE_SCENE_CONTRACT_MAJOR);
-	cJSON_AddItemToObject(prefab, "root", root_node);
+	jce_json_set_child(root, "prefab", prefab);
+	jce_json_set_int(prefab, JCE_SCENE_VERSION_KEY,
+	                 JCE_SCENE_CONTRACT_MAJOR);
+	jce_json_set_child(prefab, "root", root_node);
 	return root;
 }
 
 /* ── Find prefab root node in parsed JSON ────────────────────────── */
 
-const cJSON *find_prefab_root_node(const cJSON *root)
+const JceJson *find_prefab_root_node(const JceJson *root)
 {
 	if (!root) return NULL;
 
-	if (cJSON_IsObject(root)) {
-		const cJSON *prefab = cJSON_GetObjectItemCaseSensitive(root, "prefab");
-		if (cJSON_IsObject(prefab)) {
-			const cJSON *node = cJSON_GetObjectItemCaseSensitive(prefab, "root");
-			if (cJSON_IsObject(node))
+	if (jce_json_is_object(root)) {
+		const JceJson *prefab = jce_json_get(root, "prefab");
+		if (jce_json_is_object(prefab)) {
+			const JceJson *node = jce_json_get(prefab, "root");
+			if (jce_json_is_object(node))
 				return node;
 		}
 		if (looks_like_entity_object(root))

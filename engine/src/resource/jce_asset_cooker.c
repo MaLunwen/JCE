@@ -10,7 +10,8 @@
 
 #include "jce_asset_cooker.h"
 #include "jce_tex_compress.h"
-#include "core/jce_memory.h"
+#include "os/core/jce_memory.h"
+#include <jce/os/core/jce_filesystem.h>
 
 #include <SDL3/SDL.h>
 #include <SDL3_image/SDL_image.h>
@@ -566,36 +567,18 @@ JceCookResult jce_cook_file(const char *input_path,
 	}
 
 	/* Read file. */
-	SDL_IOStream *io = SDL_IOFromFile(input_path, "rb");
-	if (!io) {
+	size_t nread = 0;
+	void *data = jce_fs_host_read_all(input_path, &nread);
+	if (!data) {
 		snprintf(result.error, sizeof(result.error),
 		         "cannot open: %s", input_path);
 		return result;
 	}
 
-	Sint64 file_size = SDL_GetIOSize(io);
-
-	if (file_size <= 0) {
-		SDL_CloseIO(io);
-		snprintf(result.error, sizeof(result.error),
-		         "empty file: %s", input_path);
-		return result;
-	}
-
-	void *data = JCE_MALLOC((size_t)file_size);
-	if (!data) {
-		SDL_CloseIO(io);
-		snprintf(result.error, sizeof(result.error), "allocation failed");
-		return result;
-	}
-
-	size_t nread = SDL_ReadIO(io, data, (size_t)file_size);
-	SDL_CloseIO(io);
-
-	if (nread != (size_t)file_size) {
+	if (nread == 0) {
 		JCE_FREE(data);
 		snprintf(result.error, sizeof(result.error),
-		         "read error: %s", input_path);
+		         "empty file: %s", input_path);
 		return result;
 	}
 
@@ -636,10 +619,5 @@ bool jce_cook_write(const JceCookResult *result, const char *output_path)
 	if (!result || !result->success || !result->data || !output_path)
 		return false;
 
-	SDL_IOStream *io = SDL_IOFromFile(output_path, "wb");
-	if (!io) return false;
-
-	size_t written = SDL_WriteIO(io, result->data, result->size);
-	SDL_CloseIO(io);
-	return written == result->size;
+	return jce_fs_host_write_all(output_path, result->data, result->size);
 }

@@ -15,12 +15,12 @@
 #ifndef JCE_SCENE_SERIAL_H
 #define JCE_SCENE_SERIAL_H
 
+
+#include <jce/os/core/jce_defs.h>
 #include <stdbool.h>
 #include <stddef.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+JCE_EXTERN_C_BEGIN
 
 /* Forward declarations. */
 typedef struct JceScene      JceScene;
@@ -67,8 +67,6 @@ bool jce_scene_serial_load_vfs(JceScene *scene,
 /* Free a string returned by jce_scene_serial_save(). */
 void jce_scene_serial_free(char *json);
 
-#ifdef __cplusplus
-}
-#endif
+JCE_EXTERN_C_END
 
 #endif /* JCE_SCENE_SERIAL_H */

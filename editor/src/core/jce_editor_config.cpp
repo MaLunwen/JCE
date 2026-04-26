@@ -1,24 +1,25 @@
 /*
  * jce_editor_config.cpp  Editor configuration persistence.
  *
- * Uses cJSON (engine dependency) for JSON parsing and generation.
+ * Uses the engine JSON facade for JSON parsing and generation.
  */
 
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
-#ifdef _WIN32
-#include <direct.h>
-#define MKDIR(p) _mkdir(p)
-#else
-#include <sys/stat.h>
-#define MKDIR(p) mkdir(p, 0755)
-#endif
+#include <SDL3/SDL_filesystem.h>
 
 extern "C" {
-#include <jce/core/jce_log.h>
-#include <cjson/cJSON.h>
+#include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_json.h>
+}
+
+/* Cross-platform mkdir-equivalent. SDL_CreateDirectory creates the directory
+ * if it does not already exist, returning true if the directory exists after
+ * the call. */
+static void ensure_directory(const char *path) {
+    SDL_CreateDirectory(path);
 }
 
 #include "jce_editor_config.h"
@@ -42,23 +43,45 @@ void jce_editor_config_defaults(JceEditorConfig *cfg) {
     cfg->view_mode = 0;    /* JCE_VIEW_SHADED */
     cfg->show_grid = true;
     cfg->asset_browser_view_mode = 0; /* ASSET_BROWSER_VIEW_GRID */
+    cfg->run_mode = 0; /* Editor Simulation */
+    /* Forward slashes work on all hosts including Windows, so the defaults
+     * stay platform-neutral. The .exe suffix is intentionally omitted; the
+     * executable resolver in jce_run_manager will validate existence and the
+     * Build dialog (Phase 2) will overwrite this value to the freshly produced
+     * binary path including any host-specific suffix. */
+    strncpy(cfg->game_executable_path, "build/host/release/caged_kingdom",
+            sizeof(cfg->game_executable_path) - 1);
+    strncpy(cfg->game_working_directory, "build/host/release",
+            sizeof(cfg->game_working_directory) - 1);
+    strncpy(cfg->game_target_name, "CagedKingdom", sizeof(cfg->game_target_name) - 1);
+    strncpy(cfg->build_configure_preset, "host-release",
+            sizeof(cfg->build_configure_preset) - 1);
+    strncpy(cfg->build_preset, "build-host-release", sizeof(cfg->build_preset) - 1);
+    strncpy(cfg->build_output_path, "build/host/release",
+            sizeof(cfg->build_output_path) - 1);
+    cfg->font_en_path[0] = '\0';
+    cfg->font_zh_path[0] = '\0';
 }
 
 /* --------------- helpers --------------- */
 
-static void cjson_read_str(const cJSON *root, const char *key,
+static void cjson_read_str(const JceJson *root, const char *key,
                            char *out, size_t out_size) {
-    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
-    if (cJSON_IsString(item) && item->valuestring) {
-        strncpy(out, item->valuestring, out_size - 1);
+    const char *s = jce_json_get_string(root, key, NULL);
+    if (s) {
+        strncpy(out, s, out_size - 1);
         out[out_size - 1] = '\0';
     }
 }
 
-static int cjson_read_int(const cJSON *root, const char *key, int fallback) {
-    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
-    if (cJSON_IsNumber(item)) return item->valueint;
-    if (cJSON_IsString(item) && item->valuestring) return atoi(item->valuestring);
+static int cjson_read_int(const JceJson *root, const char *key, int fallback) {
+    const JceJson *item = jce_json_get(root, key);
+    if (jce_json_is_number(item))
+        return jce_json_get_int(root, key, fallback);
+    if (jce_json_is_string(item)) {
+        const char *s = jce_json_get_string(root, key, NULL);
+        if (s) return atoi(s);
+    }
     return fallback;
 }
 
@@ -74,7 +97,7 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
         return false;
     }
 
-    cJSON *root = cJSON_Parse(buf);
+    JceJson *root = jce_json_parse(buf, len);
     ED_FREE(buf);
     if (!root) {
         LOG_ERROR(LOG_TAG, "Config JSON parse error");
@@ -90,22 +113,40 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
     /* Scene view render settings. */
     cfg->view_mode = cjson_read_int(root, "view_mode", cfg->view_mode);
     {
-        const cJSON *g = cJSON_GetObjectItemCaseSensitive(root, "show_grid");
-        if (cJSON_IsBool(g))
-            cfg->show_grid = cJSON_IsTrue(g);
+        const JceJson *g = jce_json_get(root, "show_grid");
+        if (jce_json_is_bool(g))
+            cfg->show_grid = jce_json_get_bool(root, "show_grid", cfg->show_grid);
     }
     cfg->asset_browser_view_mode = cjson_read_int(root,
                                                   "asset_browser_view_mode",
                                                   cfg->asset_browser_view_mode);
+
+    cfg->run_mode = cjson_read_int(root, "run_mode", cfg->run_mode);
+    cjson_read_str(root, "game_executable_path",
+                   cfg->game_executable_path, sizeof(cfg->game_executable_path));
+    cjson_read_str(root, "game_working_directory",
+                   cfg->game_working_directory, sizeof(cfg->game_working_directory));
+    cjson_read_str(root, "game_target_name",
+                   cfg->game_target_name, sizeof(cfg->game_target_name));
+    cjson_read_str(root, "build_configure_preset",
+                   cfg->build_configure_preset, sizeof(cfg->build_configure_preset));
+    cjson_read_str(root, "build_preset",
+                   cfg->build_preset, sizeof(cfg->build_preset));
+    cjson_read_str(root, "build_output_path",
+                   cfg->build_output_path, sizeof(cfg->build_output_path));
+    cjson_read_str(root, "font_en_path",
+                   cfg->font_en_path, sizeof(cfg->font_en_path));
+    cjson_read_str(root, "font_zh_path",
+                   cfg->font_zh_path, sizeof(cfg->font_zh_path));
 
     /* recent_0 .. recent_9 */
     cfg->recent_count = 0;
     for (int i = 0; i < 10; i++) {
         char key[16];
         snprintf(key, sizeof(key), "recent_%d", i);
-        const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
-        if (cJSON_IsString(item) && item->valuestring && item->valuestring[0]) {
-            strncpy(cfg->recent_projects[i], item->valuestring,
+        const char *s = jce_json_get_string(root, key, NULL);
+        if (s && s[0]) {
+            strncpy(cfg->recent_projects[i], s,
                     sizeof(cfg->recent_projects[i]) - 1);
             cfg->recent_projects[i][sizeof(cfg->recent_projects[i]) - 1] = '\0';
             cfg->recent_count = i + 1;
@@ -114,7 +155,7 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
         }
     }
 
-    cJSON_Delete(root);
+    jce_json_free(root);
     LOG_INFO(LOG_TAG, "Config loaded: lang=%s theme=%s font=%d",
               cfg->language, cfg->theme, cfg->font_size);
     return true;
@@ -124,29 +165,40 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
 
 bool jce_editor_config_save(const JceEditorConfig *cfg) {
     /* Ensure .jce directory exists */
-    MKDIR(CONFIG_DIR);
+    ensure_directory(CONFIG_DIR);
 
-    cJSON *root = cJSON_CreateObject();
+    JceJson *root = jce_json_object();
     if (!root) return false;
 
-    cJSON_AddStringToObject(root, "language",     cfg->language);
-    cJSON_AddNumberToObject(root, "font_size",    cfg->font_size);
-    cJSON_AddStringToObject(root, "theme",        cfg->theme);
-    cJSON_AddStringToObject(root, "renderer",     cfg->renderer);
-    cJSON_AddStringToObject(root, "last_project", cfg->last_project);
+    jce_json_set_string(root, "language",     cfg->language);
+    jce_json_set_int   (root, "font_size",    cfg->font_size);
+    jce_json_set_string(root, "theme",        cfg->theme);
+    jce_json_set_string(root, "renderer",     cfg->renderer);
+    jce_json_set_string(root, "last_project", cfg->last_project);
 
     /* Scene view render settings. */
-    cJSON_AddNumberToObject(root, "view_mode",  cfg->view_mode);
-    cJSON_AddBoolToObject(root, "show_grid",    cfg->show_grid);
-    cJSON_AddNumberToObject(root,
-                            "asset_browser_view_mode",
-                            cfg->asset_browser_view_mode);
+    jce_json_set_int (root, "view_mode",  cfg->view_mode);
+    jce_json_set_bool(root, "show_grid",  cfg->show_grid);
+    jce_json_set_int (root, "asset_browser_view_mode",
+                      cfg->asset_browser_view_mode);
+    jce_json_set_int (root, "run_mode", cfg->run_mode);
+    jce_json_set_string(root, "game_executable_path",
+                        cfg->game_executable_path);
+    jce_json_set_string(root, "game_working_directory",
+                        cfg->game_working_directory);
+    jce_json_set_string(root, "game_target_name", cfg->game_target_name);
+    jce_json_set_string(root, "build_configure_preset",
+                        cfg->build_configure_preset);
+    jce_json_set_string(root, "build_preset", cfg->build_preset);
+    jce_json_set_string(root, "build_output_path", cfg->build_output_path);
+    jce_json_set_string(root, "font_en_path", cfg->font_en_path);
+    jce_json_set_string(root, "font_zh_path", cfg->font_zh_path);
 
     for (int i = 0; i < 10; i++) {
         char key[16];
         snprintf(key, sizeof(key), "recent_%d", i);
         const char *val = (i < cfg->recent_count) ? cfg->recent_projects[i] : "";
-        cJSON_AddStringToObject(root, key, val);
+        jce_json_set_string(root, key, val);
     }
 
     if (!ed_write_json_to_file(CONFIG_PATH, root)) {
@@ -159,7 +211,7 @@ bool jce_editor_config_save(const JceEditorConfig *cfg) {
 }
 
 void jce_editor_config_ensure_dir(void) {
-    MKDIR(CONFIG_DIR);
+    ensure_directory(CONFIG_DIR);
 }
 
 /* --------------- add recent --------------- */

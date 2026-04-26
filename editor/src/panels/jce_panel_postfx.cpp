@@ -15,8 +15,8 @@
 #include <cstdio>
 
 extern "C" {
-#include <jce/graphics/jce_postfx.h>
-#include <jce/render/jce_scene_renderer.h>
+#include <jce/renderer/jce_postfx.h>
+#include <jce/renderer/jce_scene_renderer.h>
 }
 
 /* ── Helper: retrieve the engine-owned PostFX pipeline ────────────── */

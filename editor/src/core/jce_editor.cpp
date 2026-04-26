@@ -14,18 +14,20 @@
 #include "jce_editor_style.h"
 #include "jce_editor_i18n.h"
 #include "jce_editor_state.h"
+#include "jce_run_manager.h"
 #include "gizmo/jce_gizmo.h"
 
 #include <imgui.h>
 #include <SDL3/SDL.h>
+#include <jce/os/core/jce_timer.h>
 #include <string.h>
 #include <stdio.h>
 
 extern "C" {
-#include <jce/graphics/jce_views.h>
-#include <jce/platform/jce_window.h>
-#include <jce/core/jce_log.h>
-#include <jce/core/pak_loader.h>
+#include <jce/renderer/jce_views.h>
+#include <jce/os/platform/jce_window.h>
+#include <jce/os/core/jce_log.h>
+#include <jce/os/core/pak_loader.h>
 }
 
 #define LOG_TAG "editor"
@@ -238,7 +240,8 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
         jce_editor_config_load(&ecfg);
         float fs = (ecfg.font_size >= 12 && ecfg.font_size <= 48)
                        ? (float)ecfg.font_size : 14.0f;
-        jce_editor_load_fonts(pak, fs);
+        jce_editor_load_fonts(pak, fs,
+                              ecfg.font_en_path, ecfg.font_zh_path);
         s_editor.pak       = pak;
         s_editor.font_size = fs;
     }
@@ -249,6 +252,7 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
     /* Initialize editor state and panels. */
     jce_editor_state_init();
     jce_editor_panels_init();
+    jce_run_manager_init();
     jce_gizmo_init();
 
     /* Set window icon from embedded PAK. */
@@ -268,7 +272,7 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
         }
     }
 
-    s_editor.last_time   = SDL_GetPerformanceCounter();
+    s_editor.last_time   = jce_time_perf_counter();
     s_editor.window      = window;
     s_editor.text_input_active = false;
     s_editor.frame_kpi_file = NULL;
@@ -314,6 +318,7 @@ void jce_editor_shutdown(void)
     }
 
     jce_gizmo_shutdown();
+    jce_run_manager_shutdown();
     jce_editor_panels_shutdown();
     jce_editor_state_shutdown();
     jce_editor_i18n_shutdown();
@@ -409,8 +414,8 @@ void jce_editor_update(JceWindow *window)
     io.DisplaySize = ImVec2((float)w, (float)h);
 
     /* Delta time. */
-    uint64_t now  = SDL_GetPerformanceCounter();
-    uint64_t freq = SDL_GetPerformanceFrequency();
+    uint64_t now  = jce_time_perf_counter();
+    uint64_t freq = jce_time_perf_freq();
     float dt = (float)((double)(now - s_editor.last_time) / (double)freq);
     if (dt <= 0.0f) dt = 1.0f / 60.0f;
     io.DeltaTime = dt;

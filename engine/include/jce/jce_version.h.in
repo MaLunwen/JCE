@@ -19,4 +19,9 @@
 /* Short git commit hash at configure time, or "unknown". */
 #define JCE_GIT_COMMIT    "@JCE_GIT_COMMIT@"
 
+/* Build timestamp captured at CMake configure time, in UTC.
+ * Explicit "UTC" suffix keeps logs/About dialogs unambiguous across
+ * machines and timezones. */
+#define JCE_BUILD_TIMESTAMP_UTC   "@JCE_BUILD_TIMESTAMP_UTC@"
+
 #endif /* JCE_VERSION_H */

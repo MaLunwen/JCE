@@ -9,16 +9,17 @@
 #include <cgltf.h>
 
 #include "jce_gltf_loader.h"
-#include <jce/core/pak_loader.h>
-#include "graphics/jce_model_internal.h"
-#include <jce/graphics/jce_texture.h>
-#include <jce/graphics/jce_mesh.h>
-#include <jce/animation/jce_skinned_mesh.h>
-#include <jce/animation/jce_skeleton.h>
-#include "animation/jce_animation.h"
-#include <jce/core/jce_log.h>
-#include <jce/core/jce_math.h>
-#include "core/jce_memory.h"
+#include <jce/os/core/pak_loader.h>
+#include "renderer/jce_model_internal.h"
+#include <jce/renderer/jce_texture.h>
+#include <jce/renderer/jce_mesh.h>
+#include <jce/middleware/animation/jce_skinned_mesh.h>
+#include <jce/middleware/animation/jce_skeleton.h>
+#include "middleware/animation/jce_animation.h"
+#include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_math.h>
+#include <jce/os/core/jce_filesystem.h>
+#include "os/core/jce_memory.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3_image/SDL_image.h>
@@ -131,22 +132,28 @@ static JceTexture load_gltf_texture(const JcePakArchive *pak,
             SDL_strlcpy(disk_path, image->uri, sizeof(disk_path));
         }
 
-        SDL_IOStream *io = SDL_IOFromFile(disk_path, "rb");
-        if (io) {
-            SDL_Surface *surf = IMG_Load_IO(io, true);
-            if (surf) {
-                if (surf->format != SDL_PIXELFORMAT_RGBA32) {
-                    SDL_Surface *conv = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA32);
-                    SDL_DestroySurface(surf);
-                    surf = conv;
-                }
+        size_t img_size = 0;
+        void *img_buf = jce_fs_host_read_all(disk_path, &img_size);
+        if (img_buf && img_size > 0) {
+            SDL_IOStream *io = SDL_IOFromConstMem(img_buf, img_size);
+            if (io) {
+                SDL_Surface *surf = IMG_Load_IO(io, true);
                 if (surf) {
-                    JceTexture tex = jce_texture_load_from_surface(surf, JCE_TEX_WRAP);
-                    SDL_DestroySurface(surf);
-                    return tex;
+                    if (surf->format != SDL_PIXELFORMAT_RGBA32) {
+                        SDL_Surface *conv = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA32);
+                        SDL_DestroySurface(surf);
+                        surf = conv;
+                    }
+                    if (surf) {
+                        JceTexture tex = jce_texture_load_from_surface(surf, JCE_TEX_WRAP);
+                        SDL_DestroySurface(surf);
+                        JCE_FREE(img_buf);
+                        return tex;
+                    }
                 }
             }
         }
+        if (img_buf) JCE_FREE(img_buf);
         return JCE_TEXTURE_INVALID;
     }
 

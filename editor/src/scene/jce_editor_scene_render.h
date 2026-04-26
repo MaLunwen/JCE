@@ -17,9 +17,9 @@
 extern "C" {
 #endif
 
-#include <jce/graphics/jce_renderer.h>
-#include <jce/graphics/jce_camera.h>
-#include <jce/core/pak_loader.h>
+#include <jce/renderer/jce_renderer.h>
+#include <jce/renderer/jce_camera.h>
+#include <jce/os/core/pak_loader.h>
 #include <jce/resource/jce_asset.h>
 
 /* Initialize the editor scene renderer (creates camera, shaders, etc.).

@@ -8,8 +8,8 @@
 #ifndef JCE_API_ANIMATION_H
 #define JCE_API_ANIMATION_H
 
-#include <jce/animation/jce_animation.h>
-#include <jce/animation/jce_skeleton.h>
-#include <jce/animation/jce_skinned_mesh.h>
+#include <jce/middleware/animation/jce_animation.h>
+#include <jce/middleware/animation/jce_skeleton.h>
+#include <jce/middleware/animation/jce_skinned_mesh.h>
 
 #endif /* JCE_API_ANIMATION_H */

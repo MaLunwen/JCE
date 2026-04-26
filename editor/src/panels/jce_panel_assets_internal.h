@@ -22,15 +22,10 @@
 #include <vector>
 #include <string>
 #include <set>
+#include <unordered_map>
 
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#include <shellapi.h>
-#pragma comment(lib, "shell32.lib")
-#endif
+#include <jce/os/platform/jce_host_shell.h>
+#include <jce/os/core/jce_filesystem.h>
 
 namespace fs = std::filesystem;
 
@@ -66,6 +61,11 @@ struct AssetBrowserState {
     int context_idx;
     std::vector<std::string> clipboard_paths;
     bool clipboard_cut;
+    /* Visual feedback timers (seconds, decay each frame). */
+    float clipboard_flash_t;
+    float paste_flash_t;
+    /* Per-entry-path "just touched" flash (path -> remaining seconds). */
+    std::unordered_map<std::string, float> entry_flash;
     bool initialized;
     bool show_delete_confirm;
     bool show_delete_dialog_open;
@@ -97,8 +97,13 @@ ImVec4      asset_color_for_ext(const std::string &ext, bool is_dir);
 const char *type_label_for_entry(const FileEntry &fe);
 
 void copy_selection_to_clipboard(bool cut);
+void copy_selection_from_view_to_clipboard(
+    const std::vector<FileEntry> &view, bool cut);
+void copy_path_to_clipboard(const std::string &path, bool cut);
 void execute_clipboard_paste(void);
 void collect_selected_for_deletion(void);
+void collect_selected_from_view_for_deletion(
+    const std::vector<FileEntry> &view);
 
 /* ── Functions from jce_panel_assets_nav.cpp ──────────────────────── */
 

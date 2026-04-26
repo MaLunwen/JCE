@@ -8,8 +8,8 @@
 #include "jce_fv_common.h"
 
 extern "C" {
-#include <jce/audio/jce_audio.h>
-#include <jce/core/jce_log.h>
+#include <jce/middleware/audio/jce_audio.h>
+#include <jce/os/core/jce_log.h>
 }
 
 #define LOG_TAG "fv_audio"

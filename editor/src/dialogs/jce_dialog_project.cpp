@@ -115,50 +115,71 @@ bool sanitize_recent_projects(JceEditorConfig *cfg)
     return changed;
 }
 
-bool pick_folder_dialog(const char *title, char *out_path, size_t out_path_size)
+/* ── Async folder picker ──────────────────────────────────────────── */
+/*
+ * The host folder dialog is asynchronous: the SDL callback fires later
+ * (on the editor UI thread).  We marshal the result into the caller-
+ * supplied output buffers + flags so ImGui code can poll on the next
+ * frame instead of blocking.
+ */
+
+namespace {
+
+struct FolderPickRequest {
+    char  *primary;
+    size_t primary_size;
+    char  *secondary;
+    size_t secondary_size;
+    bool  *ready_flag;
+    bool  *cancelled_flag;
+};
+
+void folder_pick_callback(void *user, JceDialogResult result, const char *path)
 {
-    if (!out_path || out_path_size == 0) return false;
-#ifdef _WIN32
-    auto browse_callback = [](HWND hwnd, UINT uMsg, LPARAM, LPARAM lpData) -> int {
-        if (uMsg == BFFM_INITIALIZED) {
-            const char *initial = (const char *)lpData;
-            if (initial && initial[0] != '\0')
-                SendMessageA(hwnd, BFFM_SETSELECTIONA, TRUE, (LPARAM)initial);
-        }
-        return 0;
-    };
+    FolderPickRequest *req = (FolderPickRequest *)user;
+    if (!req) return;
 
-    const char *initial_folder = nullptr;
-    if (s_last_browse_folder[0] != '\0')
-        initial_folder = s_last_browse_folder;
-    else if (out_path[0] != '\0')
-        initial_folder = out_path;
+    if (result == JCE_DIALOG_OK && path && path[0] != '\0') {
+        if (req->primary && req->primary_size > 0)
+            snprintf(req->primary, req->primary_size, "%s", path);
+        if (req->secondary && req->secondary_size > 0)
+            snprintf(req->secondary, req->secondary_size, "%s", path);
+        snprintf(s_last_browse_folder, sizeof(s_last_browse_folder), "%s", path);
+        if (req->ready_flag)     *req->ready_flag     = true;
+    } else {
+        if (req->cancelled_flag) *req->cancelled_flag = true;
+    }
+    delete req;
+}
 
-    BROWSEINFOA bi;
-    memset(&bi, 0, sizeof(bi));
-    bi.hwndOwner = GetActiveWindow();
-    bi.lpszTitle = title;
-    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_USENEWUI;
-    bi.lpfn = browse_callback;
-    bi.lParam = (LPARAM)initial_folder;
+} // namespace
 
-    LPITEMIDLIST pidl = SHBrowseForFolderA(&bi);
-    if (!pidl) return false;
+void pick_folder_dialog_async(const char *title,
+                              const char *default_path,
+                              char *primary_out, size_t primary_size,
+                              char *secondary_out, size_t secondary_size,
+                              bool *ready_flag,
+                              bool *cancelled_flag)
+{
+    if (!primary_out || primary_size == 0) return;
 
-    char path[MAX_PATH] = {0};
-    bool ok = (SHGetPathFromIDListA(pidl, path) == TRUE);
-    CoTaskMemFree(pidl);
-    if (!ok) return false;
+    FolderPickRequest *req = new FolderPickRequest{};
+    req->primary        = primary_out;
+    req->primary_size   = primary_size;
+    req->secondary      = secondary_out;
+    req->secondary_size = secondary_size;
+    req->ready_flag     = ready_flag;
+    req->cancelled_flag = cancelled_flag;
 
-    snprintf(out_path, out_path_size, "%s", path);
-    snprintf(s_last_browse_folder, sizeof(s_last_browse_folder), "%s", path);
-    return true;
-#else
-    (void)title;
-    (void)out_path;
-    (void)out_path_size;
-    return false;
-#endif
+    const char *initial = NULL;
+    if (default_path && default_path[0] != '\0')
+        initial = default_path;
+    else if (s_last_browse_folder[0] != '\0')
+        initial = s_last_browse_folder;
+    else if (primary_out[0] != '\0')
+        initial = primary_out;
+
+    jce_host_dialog_pick_folder(title, initial, folder_pick_callback, req);
 }
 
 /* ======================================================================
@@ -226,9 +247,11 @@ void jce_editor_dialog_new_project(bool *p_open)
                      sizeof(s_new_project.project_location));
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("openProject.browse"), ImVec2(80, 0))) {
-        pick_folder_dialog(jce_editor_i18n("newProject.selectLocation"),
-                           s_new_project.project_location,
-                           sizeof(s_new_project.project_location));
+        pick_folder_dialog_async(jce_editor_i18n("newProject.selectLocation"),
+                                 NULL,
+                                 s_new_project.project_location,
+                                 sizeof(s_new_project.project_location),
+                                 NULL, 0, NULL, NULL);
     }
 
     bool loc_valid = (strlen(s_new_project.project_location) > 0);
@@ -296,17 +319,20 @@ void jce_editor_dialog_new_project(bool *p_open)
 
                     /* Write a minimal project file with editor/engine version. */
                     fs::path proj_file = project_dir / "project.jce";
-                    FILE *pf = fopen(proj_file.string().c_str(), "w");
-                    if (pf) {
-                        fprintf(pf, "{\n");
-                        fprintf(pf, "    \"name\": \"%s\",\n", s_new_project.project_name);
-                        fprintf(pf, "    \"type\": \"%s\",\n",
-                                s_new_project.project_type == 0 ? "3D" : "2D");
-                        fprintf(pf, "    \"version\": \"1.0\",\n");
-                        fprintf(pf, "    \"engineVersion\": \"0.1.0\",\n");
-                        fprintf(pf, "    \"editorVersion\": \"0.1.0\"\n");
-                        fprintf(pf, "}\n");
-                        fclose(pf);
+                    {
+                        char proj_buf[512];
+                        int proj_len = snprintf(proj_buf, sizeof(proj_buf),
+                            "{\n"
+                            "    \"name\": \"%s\",\n"
+                            "    \"type\": \"%s\",\n"
+                            "    \"version\": \"1.0\",\n"
+                            "    \"engineVersion\": \"0.1.0\",\n"
+                            "    \"editorVersion\": \"0.1.0\"\n"
+                            "}\n",
+                            s_new_project.project_name,
+                            s_new_project.project_type == 0 ? "3D" : "2D");
+                        if (proj_len > 0)
+                            ed_write_file(proj_file.string().c_str(), proj_buf, (size_t)proj_len);
                     }
 
                     /* Add to recent projects. */
@@ -360,7 +386,11 @@ static struct {
     std::vector<std::string> browse_entries;
     bool browse_open;
     bool browse_refresh;
+    /* Async folder-picker outcomes (written from SDL UI thread). */
+    bool pick_ready;
+    bool pick_cancelled;
     bool initialized;
+    bool request_open;  /* Set by double-click on a recent project. */
     char error_msg[256];
 } s_open_project;
 
@@ -375,6 +405,9 @@ static void open_project_ensure_init(void)
     s_open_project.browse_entries.clear();
     s_open_project.browse_open     = false;
     s_open_project.browse_refresh  = true;
+    s_open_project.pick_ready      = false;
+    s_open_project.pick_cancelled  = false;
+    s_open_project.request_open    = false;
     /* Default browse to current directory or user home. */
     snprintf(s_open_project.browse_path, sizeof(s_open_project.browse_path),
              "%s", fs::current_path().string().c_str());
@@ -458,12 +491,14 @@ void jce_editor_dialog_open_project(bool *p_open)
 
         ImGui::PushID(i);
         if (ImGui::Selectable(s_open_project.cfg.recent_projects[i], is_selected,
-                              ImGuiSelectableFlags_None,
+                              ImGuiSelectableFlags_AllowDoubleClick,
                               ImVec2(ImGui::GetContentRegionAvail().x - 30, 0))) {
             s_open_project.selected_recent = i;
             snprintf(s_open_project.manual_path,
                      sizeof(s_open_project.manual_path),
                      "%s", s_open_project.cfg.recent_projects[i]);
+            if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                s_open_project.request_open = true;
         }
         ImGui::SameLine(ImGui::GetContentRegionAvail().x - 20);
         if (ImGui::SmallButton("X")) {
@@ -496,17 +531,28 @@ void jce_editor_dialog_open_project(bool *p_open)
     snprintf(_lbl, sizeof(_lbl), "%s###op_browse",
              jce_editor_i18n("openProject.browse"));
     if (ImGui::Button(_lbl, ImVec2(80, 0))) {
-        if (!pick_folder_dialog(jce_editor_i18n("openProject.selectFolder"),
-                                s_open_project.manual_path,
-                                sizeof(s_open_project.manual_path))) {
-            s_open_project.browse_open = true;
-            s_open_project.browse_refresh = true;
-        } else {
-            snprintf(s_open_project.browse_path,
-                     sizeof(s_open_project.browse_path),
-                     "%s", s_open_project.manual_path);
-            s_open_project.browse_open = false;
-        }
+        /* Async dispatch.  Flags are written from the SDL UI thread when
+           the dialog returns; we observe them in subsequent frames. */
+        s_open_project.pick_ready     = false;
+        s_open_project.pick_cancelled = false;
+        pick_folder_dialog_async(jce_editor_i18n("openProject.selectFolder"),
+                                 NULL,
+                                 s_open_project.manual_path,
+                                 sizeof(s_open_project.manual_path),
+                                 s_open_project.browse_path,
+                                 sizeof(s_open_project.browse_path),
+                                 &s_open_project.pick_ready,
+                                 &s_open_project.pick_cancelled);
+    }
+
+    /* React to async folder-picker outcome from a previous frame. */
+    if (s_open_project.pick_ready) {
+        s_open_project.pick_ready  = false;
+        s_open_project.browse_open = false;
+    } else if (s_open_project.pick_cancelled) {
+        s_open_project.pick_cancelled = false;
+        s_open_project.browse_open    = true;
+        s_open_project.browse_refresh = true;
     }
 
     /* Inline folder browser (shown when Browse was clicked) */
@@ -591,8 +637,11 @@ void jce_editor_dialog_open_project(bool *p_open)
         snprintf(_lbl, sizeof(_lbl), "%s###op_open",
                  jce_editor_i18n("openProject.open"));
         ImGui::BeginDisabled(!has_path);
+        bool dbl_open = s_open_project.request_open && has_path;
+        s_open_project.request_open = false;
         if (ImGui::Button(_lbl, ImVec2(btn_w, 0))
-            || (enter_pressed && has_path)) {
+            || (enter_pressed && has_path)
+            || dbl_open) {
             const char *path = s_open_project.manual_path;
             s_open_project.error_msg[0] = '\0';
             if (strlen(path) > 0) {

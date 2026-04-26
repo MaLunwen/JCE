@@ -279,11 +279,7 @@ void fv_render_model(FvTab *tab)
     /* ── Toolbar ─────────────────────────────────────────────────── */
     {
         if (ImGui::Button(jce_editor_i18n("viewer.openExternal"))) {
-#ifdef _WIN32
-            char cmd[600];
-            snprintf(cmd, sizeof(cmd), "explorer /select,\"%s\"", tab->path);
-            system(cmd);
-#endif
+            jce_host_reveal_path(tab->path);
         }
         ImGui::SameLine();
         ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,

@@ -2,7 +2,7 @@
  * jce_editor_i18n.cpp  Internationalisation implementation.
  *
  * Parses the JSON string tables in i18n/*.json from the PAK.
- * Uses cJSON (engine dependency) for parsing.
+ * Uses the engine JSON facade for parsing.
  */
 
 #include "jce_editor_i18n.h"
@@ -13,9 +13,9 @@
 #include <stdio.h>
 
 extern "C" {
-#include <jce/core/pak_loader.h>
-#include <jce/core/jce_log.h>
-#include <cjson/cJSON.h>
+#include <jce/os/core/pak_loader.h>
+#include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_json.h>
 }
 
 #define LOG_TAG       "i18n"
@@ -49,32 +49,33 @@ static struct {
 static char s_expand_ring[EXPAND_RING_SIZE][MAX_EXPAND_LEN];
 static int  s_expand_ring_index;
 
-/* ── JSON parser using cJSON ───────────────────────────────────────── */
+/* ── JSON parser using jce_json ────────────────────────────────────── */
 
 static bool parse_json_table(const char *json, I18nTable *table)
 {
     table->count = 0;
-    cJSON *root = cJSON_Parse(json);
-    if (!root || !cJSON_IsObject(root)) {
-        cJSON_Delete(root);
+    JceJson *root = jce_json_parse(json, 0);
+    if (!root || !jce_json_is_object(root)) {
+        jce_json_free(root);
         return false;
     }
 
-    const cJSON *item = NULL;
-    cJSON_ArrayForEach(item, root) {
+    for (JceJson *item = jce_json_first_child(root); item;
+         item = jce_json_next_sibling(item)) {
         if (table->count >= MAX_STRINGS) break;
-        if (!cJSON_IsString(item) || !item->string) continue;
+        const char *key = jce_json_member_key(item);
+        if (!jce_json_is_string(item) || !key) continue;
 
         I18nEntry *e = &table->entries[table->count];
-        strncpy(e->key, item->string, MAX_KEY_LEN - 1);
+        strncpy(e->key, key, MAX_KEY_LEN - 1);
         e->key[MAX_KEY_LEN - 1] = '\0';
-        strncpy(e->value, item->valuestring ? item->valuestring : "",
-                MAX_VALUE_LEN - 1);
+        const char *val = jce_json_string_value(item, "");
+        strncpy(e->value, val, MAX_VALUE_LEN - 1);
         e->value[MAX_VALUE_LEN - 1] = '\0';
         table->count++;
     }
 
-    cJSON_Delete(root);
+    jce_json_free(root);
     return true;
 }
 

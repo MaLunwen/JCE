@@ -5,7 +5,7 @@
 #include "jce_panel_hierarchy_internal.h"
 
 extern "C" {
-#include <jce/scene/jce_scene.h>
+#include <jce/middleware/scene/jce_scene.h>
 }
 
 /* ── Tag colors (shared via internal header) ─────────────────────── */
@@ -283,6 +283,19 @@ void draw_entity_node(uint32_t id)
     if (!enabled)
         ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
 
+    /* Ghost rows for entities currently held in the cut clipboard so the
+     * user has visual feedback before pasting (mirrors asset browser). */
+    bool is_cut_pending = false;
+    if (jce_state_clipboard_is_cut()) {
+        int cut_n = 0;
+        const uint32_t *cut_ids = jce_state_clipboard_source_ids(&cut_n);
+        for (int i = 0; i < cut_n; i++) {
+            if (cut_ids[i] == id) { is_cut_pending = true; break; }
+        }
+    }
+    if (is_cut_pending)
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, enabled ? 0.55f : 0.3f);
+
     if (tag_color != JCE_TAG_NONE) {
         ImVec2 pos = ImGui::GetCursorScreenPos();
         ImDrawList *dl = ImGui::GetWindowDrawList();
@@ -419,6 +432,8 @@ void draw_entity_node(uint32_t id)
         ImGui::PopID();
     }
 
+    if (is_cut_pending)
+        ImGui::PopStyleVar();
     if (!enabled)
         ImGui::PopStyleVar();
 

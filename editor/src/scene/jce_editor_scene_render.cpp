@@ -10,13 +10,15 @@
 #include "jce_scene_render_internal.h"
 #include "jce_editor_file_util.h"
 
-#include <SDL3/SDL_timer.h>
+#include <cstdio>
+
+#include <jce/os/core/jce_timer.h>
 
 extern "C" {
-#include <jce/graphics/jce_postfx.h>
-#include <jce/graphics/jce_model.h>
-#include <jce/animation/jce_animation.h>
-#include <jce/scene/jce_scene.h>
+#include <jce/renderer/jce_postfx.h>
+#include <jce/renderer/jce_model.h>
+#include <jce/middleware/animation/jce_animation.h>
+#include <jce/middleware/scene/jce_scene.h>
 }
 
 /* ── State instance (shared via extern in internal header) ────────── */
@@ -307,11 +309,11 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     jce_editor_scene_asset_cache_finalize();
 
     /* Compute frame delta time for skeletal animation. */
-    uint64_t now_ticks = SDL_GetPerformanceCounter();
+    uint64_t now_ticks = jce_time_perf_counter();
     float dt_sec = 0.0f;
     if (s_sr.anim_last_ticks > 0) {
         dt_sec = (float)(now_ticks - s_sr.anim_last_ticks)
-               / (float)SDL_GetPerformanceFrequency();
+               / (float)jce_time_perf_freq();
         if (dt_sec > 0.1f) dt_sec = 0.1f;
     }
     s_sr.anim_last_ticks = now_ticks;

@@ -29,10 +29,10 @@ extern "C++" {
 }
 
 extern "C" {
-#include <jce/graphics/jce_pbr_material.h>
-#include <jce/graphics/jce_model.h>
-#include <jce/animation/jce_animation.h>
-#include <jce/scene/jce_scene.h>
+#include <jce/renderer/jce_pbr_material.h>
+#include <jce/renderer/jce_model.h>
+#include <jce/middleware/animation/jce_animation.h>
+#include <jce/middleware/scene/jce_scene.h>
 }
 
 /* ── Tag colors (display data) ────────────────────────────────────── */

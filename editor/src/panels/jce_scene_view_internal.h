@@ -21,8 +21,8 @@
 #include <stdlib.h>
 
 extern "C" {
-#include <jce/core/jce_math.h>
-#include <jce/scene/jce_scene.h>
+#include <jce/os/core/jce_math.h>
+#include <jce/middleware/scene/jce_scene.h>
 }
 
 /* ── Local mesh shape constants (procedural primitives) ───────────── */

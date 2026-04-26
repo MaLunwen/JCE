@@ -8,12 +8,12 @@
 #ifndef JCE_SCENE_CONTRACT_H
 #define JCE_SCENE_CONTRACT_H
 
+
+#include <jce/os/core/jce_defs.h>
 #include <stdbool.h>
 #include <stdint.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+JCE_EXTERN_C_BEGIN
 
 #define JCE_SCENE_CONTRACT_NAME      "jce.scene"
 #define JCE_SCENE_CONTRACT_MAJOR     1u
@@ -33,8 +33,6 @@ static inline bool jce_scene_contract_major_compatible(uint32_t major)
     return major == JCE_SCENE_CONTRACT_MAJOR;
 }
 
-#ifdef __cplusplus
-}
-#endif
+JCE_EXTERN_C_END
 
 #endif /* JCE_SCENE_CONTRACT_H */

@@ -12,8 +12,8 @@
 extern "C" {
 #endif
 
-#include <jce/graphics/jce_mesh.h>
-#include <jce/core/pak_loader.h>
+#include <jce/renderer/jce_mesh.h>
+#include <jce/os/core/pak_loader.h>
 
 typedef struct JceEditorCpuMeshData {
     JceMeshVertex *vertices;

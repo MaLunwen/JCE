@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#include <jce/core/pak_loader.h>
+#include <jce/os/core/pak_loader.h>
 
 /* Initialize the bgfx renderer backend for ImGui.
    Loads the imgui shader from PAK, creates font atlas texture,

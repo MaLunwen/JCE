@@ -11,7 +11,7 @@
 #include "scene/jce_editor_scene_asset_cache.h"
 
 extern "C" {
-#include <jce/graphics/jce_pbr_material.h>
+#include <jce/renderer/jce_pbr_material.h>
 }
 
 #include <ctype.h>
@@ -469,10 +469,10 @@ static uint32_t pick_entity_at_mouse(ImVec2 screen_pos, ImVec2 avail)
         float bmax[3] = { pos[0]+hx, pos[1]+hy, pos[2]+hz };
 
         float t_hit;
-        jce_vec3 ro    = {{ ray_o[0], ray_o[1], ray_o[2] }};
-        jce_vec3 rd    = {{ ray_d[0], ray_d[1], ray_d[2] }};
-        jce_vec3 bminv = {{ bmin[0],  bmin[1],  bmin[2]  }};
-        jce_vec3 bmaxv = {{ bmax[0],  bmax[1],  bmax[2]  }};
+        jce_vec3 ro    = jce_v3(ray_o[0], ray_o[1], ray_o[2]);
+        jce_vec3 rd    = jce_v3(ray_d[0], ray_d[1], ray_d[2]);
+        jce_vec3 bminv = jce_v3(bmin[0],  bmin[1],  bmin[2]);
+        jce_vec3 bmaxv = jce_v3(bmax[0],  bmax[1],  bmax[2]);
         if (jce_ray_aabb_intersect(ro, rd, bminv, bmaxv, &t_hit) && t_hit >= 0.0f) {
             if (t_hit < best_t) {
                 best_t  = t_hit;
@@ -1188,10 +1188,10 @@ static void handle_ray_pick(const SceneViewCtx *ctx,
         float bmax[3] = { pos[0]+hx, pos[1]+hy, pos[2]+hz };
 
         float t;
-        jce_vec3 ro = {{ ray_o[0], ray_o[1], ray_o[2] }};
-        jce_vec3 rd = {{ ray_d[0], ray_d[1], ray_d[2] }};
-        jce_vec3 bmin_v = {{ bmin[0], bmin[1], bmin[2] }};
-        jce_vec3 bmax_v = {{ bmax[0], bmax[1], bmax[2] }};
+        jce_vec3 ro = jce_v3(ray_o[0], ray_o[1], ray_o[2]);
+        jce_vec3 rd = jce_v3(ray_d[0], ray_d[1], ray_d[2]);
+        jce_vec3 bmin_v = jce_v3(bmin[0], bmin[1], bmin[2]);
+        jce_vec3 bmax_v = jce_v3(bmax[0], bmax[1], bmax[2]);
         if (jce_ray_aabb_intersect(ro, rd, bmin_v, bmax_v, &t) && t >= 0.0f) {
             if (t < best_t) {
                 best_t  = t;

@@ -1015,17 +1015,16 @@ ARE DISCLAIMED.
 
 ---
 
-# ⚠️ PATENT-ENCUMBERED CODECS (OPTIONAL, OFF BY DEFAULT)
+# ⚠️ PATENT-ENCUMBERED CODECS
 
-The libraries below are **only compiled when** `-DJCE_ENABLE_PATENTED_CODECS=ON`
-is passed at CMake configure time.  Even when their source licenses are permissive,
-the underlying media formats (AAC / H.264 / H.265) are covered by **third-party
-patents** that may require royalty agreements (e.g. Via Licensing, MPEG-LA, Access
-Advance) for commercial redistribution.
+The libraries below are compiled into `release` builds and **never** into
+`dist` builds (`JCE_BUILD_VARIANT=dist` forces them OFF). Their source licenses are permissive (Apache-2.0 / BSD-2),
+but the underlying media formats are covered by **third-party patents** that
+may require royalty agreements (e.g. Via Licensing, MPEG-LA, Access Advance)
+for commercial redistribution.
 
-JCE's default royalty-free build excludes all of them.  Use AV1 (dav1d), VP8/VP9
-(libvpx), Opus (libopus), and WebM (libwebm) — all listed above — for license-clean
-delivery.
+`dist` binaries are royalty-free: AV1 (dav1d), VP8/VP9 (libvpx), Opus
+(libopus), and WebM (libwebm) — all listed above.
 
 | Library | Format | Patent pool |
 |---|---|---|

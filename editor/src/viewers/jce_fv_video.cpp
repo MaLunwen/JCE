@@ -14,11 +14,12 @@
 #include "jce_fv_common.h"
 
 extern "C" {
-#include <jce/video/jce_video.h>
-#include <jce/audio/jce_audio.h>
+#include <jce/middleware/video/jce_video.h>
+#include <jce/middleware/audio/jce_audio.h>
 }
 
-#include <SDL3/SDL.h>  /* SDL_GetPerformanceCounter for upload timing (S1) */
+/* perf timing comes from <jce/core/jce_timer.h> */
+#include <jce/os/core/jce_timer.h>
 
 #define LOG_TAG "fv_video"
 
@@ -257,15 +258,15 @@ static void upload_latest_frame(VideoState *st)
 
     if (jce_texture_valid(st->gpu_tex)
         && st->tex_w == w && st->tex_h == h) {
-        const uint64_t t0 = SDL_GetPerformanceCounter();
+        const uint64_t t0 = jce_time_perf_counter();
         /* S5: zero-copy ref upload — bgfx borrows display_rgba until bgfx_frame().
          * display_rgba is stable for the full render frame (repopulated only on
          * the next jce_video_advance call, which runs before the next upload). */
         const bool ok = jce_texture_update_rgba_ref(st->gpu_tex, rgba, uw, uh);
-        const uint64_t t1 = SDL_GetPerformanceCounter();
+        const uint64_t t1 = jce_time_perf_counter();
         if (ok) {
             const double us = (double)(t1 - t0) * 1e6
-                            / (double)SDL_GetPerformanceFrequency();
+                            / (double)jce_time_perf_freq();
             st->perf_upload_us_last = us;
             st->perf_upload_us_ema = (st->perf_upload_us_ema <= 0.0)
                                      ? us
@@ -279,11 +280,11 @@ static void upload_latest_frame(VideoState *st)
     if (jce_texture_valid(st->gpu_tex))
         jce_texture_destroy(st->gpu_tex);
 
-    const uint64_t t0 = SDL_GetPerformanceCounter();
+    const uint64_t t0 = jce_time_perf_counter();
     st->gpu_tex = jce_texture_from_rgba(rgba, uw, uh);
-    const uint64_t t1 = SDL_GetPerformanceCounter();
+    const uint64_t t1 = jce_time_perf_counter();
     const double us = (double)(t1 - t0) * 1e6
-                    / (double)SDL_GetPerformanceFrequency();
+                    / (double)jce_time_perf_freq();
     st->perf_upload_us_last = us;
     st->perf_upload_us_ema = (st->perf_upload_us_ema <= 0.0)
                              ? us

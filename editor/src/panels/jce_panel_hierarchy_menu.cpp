@@ -5,7 +5,7 @@
 #include "jce_panel_hierarchy_internal.h"
 
 extern "C" {
-#include <jce/scene/jce_scene.h>
+#include <jce/middleware/scene/jce_scene.h>
 }
 
 /* Procedural mesh shape values (matches JceMeshRenderer::mesh_shape).
@@ -100,9 +100,13 @@ static void draw_empty_area_menu(void)
     ImGui::Separator();
     if (ImGui::MenuItem(jce_editor_i18n("menu.edit.paste"), "Ctrl+V", false,
                         jce_state_has_copied())) {
-        uint32_t pasted = jce_state_paste_entity(0);
-        if (pasted != 0) {
-            jce_state_select_entity(pasted, false);
+        uint32_t pasted_ids[JCE_MAX_SELECTED];
+        int pasted_n = jce_state_paste_entities(0, pasted_ids,
+                                                JCE_MAX_SELECTED);
+        if (pasted_n > 0) {
+            jce_state_select_entity(pasted_ids[0], false);
+            for (int i = 1; i < pasted_n; i++)
+                jce_state_select_entity(pasted_ids[i], true);
             jce_editor_inspector_request_sync();
             jce_editor_layout_request_focus_inspector();
         }
@@ -285,14 +289,28 @@ static void draw_entity_menu(uint32_t ctx_id)
         ImGui::EndMenu();
     }
 
-    /* Copy / Paste / Delete */
+    /* Copy / Cut / Paste / Delete */
     ImGui::Separator();
-    if (ImGui::MenuItem(jce_editor_i18n("menu.edit.copy"), "Ctrl+C"))
-        jce_state_copy_entity(ctx_id);
+    if (ImGui::MenuItem(jce_editor_i18n("menu.edit.copy"), "Ctrl+C")) {
+        if (multi_on_ctx)
+            jce_state_copy_entities(sel, sel_count, false);
+        else
+            jce_state_copy_entity(ctx_id);
+    }
+    if (ImGui::MenuItem(jce_editor_i18n("menu.edit.cut"), "Ctrl+X")) {
+        if (multi_on_ctx)
+            jce_state_copy_entities(sel, sel_count, true);
+        else
+            jce_state_copy_entities(&ctx_id, 1, true);
+    }
     if (ImGui::MenuItem(jce_editor_i18n("menu.edit.paste"), "Ctrl+V", false, jce_state_has_copied())) {
-        uint32_t pasted = jce_state_paste_entity(ctx_id);
-        if (pasted != 0) {
-            jce_state_select_entity(pasted, false);
+        uint32_t pasted_ids[JCE_MAX_SELECTED];
+        int pasted_n = jce_state_paste_entities(ctx_id, pasted_ids,
+                                                JCE_MAX_SELECTED);
+        if (pasted_n > 0) {
+            jce_state_select_entity(pasted_ids[0], false);
+            for (int i = 1; i < pasted_n; i++)
+                jce_state_select_entity(pasted_ids[i], true);
             jce_editor_inspector_request_sync();
             jce_editor_layout_request_focus_inspector();
         }

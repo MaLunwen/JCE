@@ -8,8 +8,8 @@
 #ifndef JCE_API_PHYSICS_H
 #define JCE_API_PHYSICS_H
 
-#include <jce/physics/jce_physics.h>
-#include <jce/physics/jce_physics2d.h>
-#include <jce/physics/jce_physics_types.h>
+#include <jce/middleware/physics/jce_physics.h>
+#include <jce/middleware/physics/jce_physics2d.h>
+#include <jce/middleware/physics/jce_physics_types.h>
 
 #endif /* JCE_API_PHYSICS_H */

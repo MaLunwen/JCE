@@ -19,22 +19,14 @@ class JCEConan(ConanFile):
     settings = "os", "compiler", "build_type", "arch"
 
     # ── Options ──────────────────────────────────────────────────────
-    options = {
-        "jce_jni": [True, False],
-        # Patent-encumbered codecs (AAC / H.264 / H.265).
-        # The vendored sources at engine/src/{audio,video}/third_party/
-        # are always compiled (the editor needs them to import legacy
-        # assets), so this option is currently informational — see
-        # plan E5 follow-up to fully gate them out of the runtime.
-        # When you ship binaries, consider:
-        #   - jurisdictions where these patents are enforced
-        #   - whether you have the required licenses
-        # Default OFF for safety; the royalty-free path is Opus + AV1.
-        "enable_patented_codecs": [True, False],
-    }
+    # NOTE: legal-/packaging-sensitive switches (JCE_BUILD_JNI,
+    # JCE_ENABLE_PATENTED_CODECS) are intentionally NOT exposed here.
+    # They are CMake-only and must be set with -D at configure time:
+    #   cmake -DJCE_ENABLE_PATENTED_CODECS=ON   (default OFF)
+    #   cmake -DJCE_BUILD_JNI=ON                (default OFF)
+    # Keeping them out of Conan options ensures `conan install .` is
+    # legally neutral: it never silently enables AAC/H.264/H.265.
     default_options = {
-        "jce_jni": False,
-        "enable_patented_codecs": False,
         "bgfx/*:tools": True,
     }
 
@@ -62,15 +54,16 @@ class JCEConan(ConanFile):
         # ── Core (all platforms) ─────────────────────────────────────
         self.requires("sdl/3.4.0")
         self.requires("sdl_image/3.4.0")
-        self.requires("harfbuzz/12.3.0")
 
         self.requires("bgfx/1.129.8930-495")
         self.requires("cglm/0.9.1")
 
+        self.requires("harfbuzz/12.3.0")
+        self.requires("freetype/2.13.2", force=True)
+
         self.requires("miniaudio/0.11.22")
         self.requires("opus/1.5.2")
         self.requires("ogg/1.3.5")
-
         self.requires("dav1d/1.5.3")
         self.requires("libvpx/1.16.0")
         self.requires("libwebm/1.0.0.31")
@@ -80,7 +73,9 @@ class JCEConan(ConanFile):
         self.requires("cjson/1.7.19")
         self.requires("assimp/6.0.2")
         self.requires("cgltf/1.15")
+
         self.requires("ozz-animation/0.14.1")
+        self.requires("behaviortree.cpp/4.9.0")
 
         self.requires("physfs/3.2.0")
         self.requires("zstd/1.5.7")
@@ -91,10 +86,8 @@ class JCEConan(ConanFile):
 
         self.requires("box2d/3.1.1")
         self.requires("bullet3/3.25")
-        self.requires("behaviortree.cpp/4.9.0")
 
         self.requires("rmlui/4.4")
-        self.requires("freetype/2.13.2", force=True)
 
         self.requires("enet/1.3.18")
         self.requires("protobuf/6.33.5")
@@ -125,8 +118,7 @@ class JCEConan(ConanFile):
         deps = CMakeDeps(self)
         deps.generate()
         tc = CMakeToolchain(self)
-        # Forward Conan options to CMake so the build system can react.
-        # Always set both True/False to override any stale CMake cache values.
-        tc.variables["JCE_BUILD_JNI"] = bool(self.options.jce_jni)
-        tc.variables["JCE_ENABLE_PATENTED_CODECS"] = bool(self.options.enable_patented_codecs)
+        # JCE_BUILD_JNI and JCE_ENABLE_PATENTED_CODECS are intentionally
+        # NOT forwarded from Conan options — they are CMake-only switches.
+        # Set them with -D at cmake configure time.
         tc.generate()

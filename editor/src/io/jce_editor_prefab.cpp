@@ -18,7 +18,7 @@ bool jce_state_save_prefab(uint32_t entity_id, const char *prefab_path)
 	if (!jce_state_entity_exists(entity_id))
 		return false;
 
-	cJSON *root = build_prefab_json_root(entity_id);
+	JceJson *root = build_prefab_json_root(entity_id);
 	if (!root)
 		return false;
 
@@ -48,7 +48,7 @@ uint32_t jce_state_instantiate_prefab(const char *prefab_path, uint32_t parent_i
 	}
 	buf[file_size] = '\0';
 
-	cJSON *root = cJSON_Parse(buf);
+	JceJson *root = jce_json_parse(buf, file_size);
 	ED_FREE(buf);
 	if (!root) {
 		LOG_WARN(LOG_TAG, "prefab instantiate failed, JSON parse error: %s", prefab_path);
@@ -63,20 +63,20 @@ uint32_t jce_state_instantiate_prefab(const char *prefab_path, uint32_t parent_i
 		LOG_WARN(LOG_TAG,
 		         "prefab instantiate failed, unsupported contract major %d: %s",
 		         contract_major, prefab_path);
-		cJSON_Delete(root);
+		jce_json_free(root);
 		return 0;
 	}
 
-	const cJSON *node = find_prefab_root_node(root);
+	const JceJson *node = find_prefab_root_node(root);
 	if (!node) {
-		cJSON_Delete(root);
+		jce_json_free(root);
 		LOG_WARN(LOG_TAG, "prefab instantiate failed, missing root node: %s", prefab_path);
 		return 0;
 	}
 
 	HistoryEditScope edit_scope;
 	uint32_t id = load_entity_tree_node(node, parent_id);
-	cJSON_Delete(root);
+	jce_json_free(root);
 
 	if (id != 0)
 		mark_prefab_instance_recursive(id, prefab_path);

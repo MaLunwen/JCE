@@ -7,16 +7,16 @@
  */
 
 #include "jce_asset_loaders.h"
-#include "core/jce_memory.h"
-#include <jce/core/pak_loader.h>
+#include "os/core/jce_memory.h"
+#include <jce/os/core/pak_loader.h>
 #include <jce/resource/jce_asset_format.h>
-#include <jce/graphics/jce_texture.h>
-#include <jce/graphics/jce_mesh.h>
-#include <jce/graphics/jce_model.h>
-#include <jce/graphics/jce_text.h>
-#include <jce/audio/jce_audio.h>
-#include <jce/core/jce_log.h>
-#include <jce/core/jce_profiler.h>
+#include <jce/renderer/jce_texture.h>
+#include <jce/renderer/jce_mesh.h>
+#include <jce/renderer/jce_model.h>
+#include <jce/renderer/jce_text.h>
+#include <jce/middleware/audio/jce_audio.h>
+#include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_profiler.h>
 
 #include <SDL3/SDL.h>
 #include <string.h>

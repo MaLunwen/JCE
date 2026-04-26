@@ -7,9 +7,10 @@
 
 #include "jce_model_loader_assimp.h"
 #include "jce_editor_alloc.h"
+#include "io/jce_editor_file_util.h"
 
 extern "C" {
-#include <jce/core/jce_log.h>
+#include <jce/os/core/jce_log.h>
 }
 
 #include <assimp/Importer.hpp>
@@ -396,10 +397,8 @@ static bool write_embedded_texture(const aiTexture *tex,
 
     if (tex->mHeight == 0) {
         /* Compressed data (e.g. PNG/JPG stored as-is). */
-        FILE *f = fopen(full.c_str(), "wb");
-        if (!f) return false;
-        fwrite(tex->pcData, 1, tex->mWidth, f);
-        fclose(f);
+        if (!ed_write_file(full.c_str(), tex->pcData, tex->mWidth))
+            return false;
     } else {
         /* Uncompressed ARGB8888 — write as raw RGBA TGA for simplicity.
          * The texture cache can load TGA natively via SDL_image. */
@@ -419,17 +418,24 @@ static bool write_embedded_texture(const aiTexture *tex,
         snprintf(fname, sizeof(fname), "%s_tex%d.tga", stem.c_str(), tex_index);
         full = dir + fname;
 
-        FILE *f = fopen(full.c_str(), "wb");
-        if (!f) return false;
-        fwrite(tga_header, 1, sizeof(tga_header), f);
+        size_t total = sizeof(tga_header) + pixel_count * 4;
+        uint8_t *blob = (uint8_t *)ED_MALLOC(total);
+        if (!blob) return false;
+        memcpy(blob, tga_header, sizeof(tga_header));
 
         /* assimp stores ARGB8888; TGA expects BGRA. */
         const aiTexel *src = tex->pcData;
+        uint8_t *dst = blob + sizeof(tga_header);
         for (size_t i = 0; i < pixel_count; i++) {
-            uint8_t bgra[4] = { src[i].b, src[i].g, src[i].r, src[i].a };
-            fwrite(bgra, 1, 4, f);
+            dst[i * 4 + 0] = src[i].b;
+            dst[i * 4 + 1] = src[i].g;
+            dst[i * 4 + 2] = src[i].r;
+            dst[i * 4 + 3] = src[i].a;
         }
-        fclose(f);
+
+        bool ok = ed_write_file(full.c_str(), blob, total);
+        ED_FREE(blob);
+        if (!ok) return false;
     }
 
     std::string rel_full = to_cwd_relative(full);

@@ -14,7 +14,7 @@
 extern "C" {
 #endif
 
-#include <jce/core/pak_loader.h>
+#include <jce/os/core/pak_loader.h>
 
 /* Supported locales. */
 typedef enum {

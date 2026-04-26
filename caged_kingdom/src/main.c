@@ -7,7 +7,7 @@
  * This file uses the JCE_MAIN macro — no direct SDL dependency.
  */
 
-#include <jce/app/jce_main.h>
+#include <jce/application/jce_main.h>
 #include "game/ck_app.h"
 
 JCE_MAIN(ck_app_get_desc)

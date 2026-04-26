@@ -19,11 +19,11 @@
 #ifndef JCE_ASSET_FORMAT_H
 #define JCE_ASSET_FORMAT_H
 
+
+#include <jce/os/core/jce_defs.h>
 #include <stdint.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+JCE_EXTERN_C_BEGIN
 
 /* ================================================================== */
 /* Magic & Version                                                     */
@@ -178,8 +178,6 @@ typedef struct JceAssetAudioInfo {
 #define JCEASSET_HEADER_SIZE      32u
 #define JCEASSET_CHUNK_ENTRY_SIZE 32u
 
-#ifdef __cplusplus
-}
-#endif
+JCE_EXTERN_C_END
 
 #endif /* JCE_ASSET_FORMAT_H */

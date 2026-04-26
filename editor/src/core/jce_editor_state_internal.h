@@ -17,8 +17,6 @@
 #include "jce_editor_defaults.h"
 #include "jce_editor_alloc.h"
 
-#include <cjson/cJSON.h>
-
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,10 +28,11 @@
 #include <unordered_map>
 
 extern "C" {
-#include <jce/core/jce_log.h>
-#include <jce/core/jce_math.h>
+#include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_json.h>
+#include <jce/os/core/jce_math.h>
 #include <jce/resource/jce_scene_contract.h>
-#include <jce/scene/jce_scene.h>
+#include <jce/middleware/scene/jce_scene.h>
 #include <jce/resource/jce_scene_serial.h>
 }
 
@@ -121,20 +120,20 @@ bool history_restore_snapshot(const EditorHistorySnapshot &snapshot,
 
 /* ── Scene parse functions (defined in jce_editor_scene_parse.cpp) ── */
 
-uint32_t load_entity_tree_node(const cJSON *node, uint32_t parent_id);
-bool     looks_like_entity_object(const cJSON *obj);
-bool     parse_scene_contract_version(const cJSON *root,
-                                      int *out_major, int *out_minor);
-bool     load_scene_from_parsed_root(const cJSON *root,
+uint32_t load_entity_tree_node(const JceJson *node, uint32_t parent_id);
+bool     looks_like_entity_object(const JceJson *obj);
+bool     parse_scene_contract_version(const JceJson *root,
+                                       int *out_major, int *out_minor);
+bool     load_scene_from_parsed_root(const JceJson *root,
                                      const char *scene_label,
                                      const char *scene_path);
 
 /* ── Scene serial functions (defined in jce_editor_scene_serial.cpp) ─ */
 
-cJSON       *serialize_entity_tree_json(uint32_t entity_id);
-cJSON       *build_scene_json_root(void);
-cJSON       *build_prefab_json_root(uint32_t entity_id);
-const cJSON *find_prefab_root_node(const cJSON *root);
+JceJson       *serialize_entity_tree_json(uint32_t entity_id);
+JceJson       *build_scene_json_root(void);
+JceJson       *build_prefab_json_root(uint32_t entity_id);
+const JceJson *find_prefab_root_node(const JceJson *root);
 void         mark_prefab_instance_recursive(uint32_t entity_id,
                                             const char *prefab_path);
 

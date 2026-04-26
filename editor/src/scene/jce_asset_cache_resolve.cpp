@@ -112,13 +112,13 @@ static bool try_resolve_texture_path(const fs::path &path, fs::path *out_path)
     return true;
 }
 
-static std::string cjson_string(cJSON *obj, const char *key)
+static std::string json_string(JceJson *obj, const char *key)
 {
     if (!obj || !key) return std::string();
-    cJSON *value = cJSON_GetObjectItemCaseSensitive(obj, key);
-    if (!cJSON_IsString(value) || !value->valuestring || value->valuestring[0] == '\0')
+    const char *value = jce_json_get_string(obj, key, NULL);
+    if (!value || value[0] == '\0')
         return std::string();
-    return std::string(value->valuestring);
+    return std::string(value);
 }
 
 /* ── Material file resolution ───────────────────────────────────── */
@@ -183,22 +183,24 @@ static bool try_resolve_texture_from_material_json(const char *material_path,
     if (!resolve_material_file_path(material_path, &mat_file))
         return false;
 
-    std::ifstream in(mat_file, std::ios::binary);
-    if (!in.good()) return false;
-    std::string json((std::istreambuf_iterator<char>(in)),
-                     std::istreambuf_iterator<char>());
-    if (json.empty()) return false;
+    size_t got = 0;
+    char *raw = (char *)ed_read_file(mat_file.string().c_str(), &got);
+    if (!raw || got == 0) {
+        if (raw) ED_FREE(raw);
+        return false;
+    }
 
-    cJSON *root = cJSON_Parse(json.c_str());
+    JceJson *root = jce_json_parse(raw, got);
+    ED_FREE(raw);
     if (!root) return false;
 
-    cJSON *props = cJSON_GetObjectItemCaseSensitive(root, "properties");
-    if (!cJSON_IsObject(props)) props = root;
+    JceJson *props = jce_json_get(root, "properties");
+    if (!jce_json_is_object(props)) props = root;
 
-    std::string tex_ref = cjson_string(props, "albedoMap");
-    if (tex_ref.empty()) tex_ref = cjson_string(props, "baseColorMap");
-    if (tex_ref.empty()) tex_ref = cjson_string(props, "diffuseMap");
-    if (tex_ref.empty()) tex_ref = cjson_string(props, "mainTexture");
+    std::string tex_ref = json_string(props, "albedoMap");
+    if (tex_ref.empty()) tex_ref = json_string(props, "baseColorMap");
+    if (tex_ref.empty()) tex_ref = json_string(props, "diffuseMap");
+    if (tex_ref.empty()) tex_ref = json_string(props, "mainTexture");
 
     bool loaded = false;
     if (!tex_ref.empty()) {
@@ -230,7 +232,7 @@ static bool try_resolve_texture_from_material_json(const char *material_path,
         }
     }
 
-    cJSON_Delete(root);
+    jce_json_free(root);
     return loaded;
 }
 
@@ -248,8 +250,11 @@ static bool try_resolve_texture_from_obj_mtl(const char *mesh_path, fs::path *ou
     if (lower_copy(mesh_abs.extension().string()) != ".obj")
         return false;
 
-    std::ifstream obj(mesh_abs);
-    if (!obj.good()) return false;
+    size_t obj_size = 0;
+    char *obj_text = (char *)ed_read_file(mesh_abs.string().c_str(), &obj_size);
+    if (!obj_text) return false;
+    std::istringstream obj(std::string(obj_text, obj_size));
+    ED_FREE(obj_text);
 
     std::vector<std::string> mtl_refs;
     std::string line;
@@ -274,8 +279,11 @@ static bool try_resolve_texture_from_obj_mtl(const char *mesh_path, fs::path *ou
             mtl_path = by_name;
         }
 
-        std::ifstream mtl(mtl_path);
-        if (!mtl.good()) continue;
+        size_t mtl_size = 0;
+        char *mtl_text = (char *)ed_read_file(mtl_path.string().c_str(), &mtl_size);
+        if (!mtl_text) continue;
+        std::istringstream mtl(std::string(mtl_text, mtl_size));
+        ED_FREE(mtl_text);
 
         std::string mline;
         while (std::getline(mtl, mline)) {
