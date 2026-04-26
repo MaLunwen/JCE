@@ -14,9 +14,9 @@
 #define JCE_NET_H
 
 
-#include <jce/os/core/jce_defs.h>
 #include <jce/middleware/net/jce_net_types.h>
 #include <jce/os/core/jce_allocator.h>
+#include <jce/os/core/jce_defs.h>
 
 JCE_EXTERN_C_BEGIN
 

@@ -9,18 +9,19 @@
  */
 
 #include "jce_asset_cooker.h"
+
+#include <jce/os/core/jce_filesystem.h>
+
 #include "jce_tex_compress.h"
 #include "os/core/jce_memory.h"
-#include <jce/os/core/jce_filesystem.h>
 
 #include <SDL3/SDL.h>
 #include <SDL3_image/SDL_image.h>
-#include <zstd.h>
-#include <xxhash.h>
-
-#include <string.h>
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <xxhash.h>
+#include <zstd.h>
 
 #ifndef JCE_NO_AUDIO
 #include <miniaudio.h>

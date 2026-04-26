@@ -3,8 +3,10 @@
  */
 
 #include <jce/os/platform/jce_input.h>
-#include <SDL3/SDL.h>
+
 #include "os/core/jce_memory.h"
+
+#include <SDL3/SDL.h>
 #include <string.h>
 
 /* Compile-time verification that JCE key/gamepad constants match SDL (C99-safe). */

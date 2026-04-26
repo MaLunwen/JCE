@@ -23,6 +23,7 @@
 
 #include <jce/middleware/video/jce_av1_decode.h>
 #include <jce/os/core/jce_log.h>
+
 #include "os/core/jce_memory.h"
 
 #include <dav1d/dav1d.h>

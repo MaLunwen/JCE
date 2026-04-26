@@ -4,13 +4,14 @@
  * Supports grid-based sheets and Aseprite JSON atlases (via cJSON).
  */
 
-#include <jce/renderer/jce_sprite.h>
-#include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_json.h>
+#include <jce/os/core/jce_log.h>
+#include <jce/renderer/jce_sprite.h>
+
 #include "os/core/jce_memory.h"
 
 #include <SDL3/SDL.h>
-#include <jce/os/core/jce_json.h>
 #include <stdio.h>
 #include <string.h>
 

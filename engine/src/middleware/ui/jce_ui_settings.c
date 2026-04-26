@@ -5,13 +5,14 @@
  * manages the full populate -> read -> apply cycle.
  */
 
-#include <jce/middleware/ui/jce_ui_settings.h>
-#include <jce/renderer/jce_renderer.h>
-#include <jce/os/platform/jce_window.h>
-#include <jce/middleware/audio/jce_audio.h>
 #include <jce/application/jce_config.h>
+#include <jce/middleware/audio/jce_audio.h>
+#include <jce/middleware/ui/jce_ui_settings.h>
 #include <jce/os/core/jce_i18n.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/platform/jce_window.h>
+#include <jce/renderer/jce_renderer.h>
+
 #include "os/core/jce_memory.h"
 
 #include <stdio.h>

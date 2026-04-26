@@ -13,11 +13,10 @@
 #ifndef JCE_ASYNC_POOL_H
 #define JCE_ASYNC_POOL_H
 
-#include <stdint.h>
+#include <SDL3/SDL_atomic.h>
 #include <stdbool.h>
 #include <stddef.h>
-
-#include <SDL3/SDL_atomic.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {

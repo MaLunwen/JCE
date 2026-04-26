@@ -5,12 +5,12 @@
  * Reference: Java CodeViewerWindow.
  */
 
-#include "jce_fv_common.h"
 #include "jce_editor_file_util.h"
+#include "jce_fv_common.h"
 
+#include <algorithm>
 #include <string>
 #include <vector>
-#include <algorithm>
 
 #define LOG_TAG "fv_code"
 

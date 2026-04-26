@@ -9,6 +9,7 @@
 #define JCE_ASSET_MANAGER_NEW_H
 
 #include <jce/resource/jce_asset.h>
+
 #include "jce_asset_registry.h"
 #include "jce_async_pool.h"
 

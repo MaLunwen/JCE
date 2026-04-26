@@ -17,8 +17,10 @@
  *   page 2+ : audio packets, decoded with opus_decode()
  */
 
-#include <jce/middleware/audio/jce_miniaudio_opus_backend.h>
+#include "jce_miniaudio_opus_backend.h"
+
 #include <jce/os/core/jce_log.h>
+
 #include "os/core/jce_memory.h"
 
 #include <ogg/ogg.h>

@@ -12,6 +12,7 @@
  */
 
 #include "jce_yuv_convert.h"
+
 #include <string.h>
 
 /* ── SSE2 fast path (32-bit intermediates via madd) ──────────────── */

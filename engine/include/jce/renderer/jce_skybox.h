@@ -12,9 +12,10 @@
 
 
 #include <jce/os/core/jce_defs.h>
-#include <jce/renderer/jce_texture_types.h>
-#include <jce/renderer/jce_renderer.h>
 #include <jce/os/core/jce_math.h>
+#include <jce/renderer/jce_renderer.h>
+#include <jce/renderer/jce_texture_types.h>
+
 #include <stdbool.h>
 #include <stdint.h>
 

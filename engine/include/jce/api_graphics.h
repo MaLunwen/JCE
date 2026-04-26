@@ -9,22 +9,22 @@
 #ifndef JCE_API_GRAPHICS_H
 #define JCE_API_GRAPHICS_H
 
-#include <jce/renderer/jce_gfx_types.h>
-#include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_camera.h>
-#include <jce/renderer/jce_texture.h>
-#include <jce/renderer/jce_texture_types.h>
-#include <jce/renderer/jce_mesh.h>
-#include <jce/renderer/jce_model.h>
-#include <jce/renderer/jce_material.h>
-#include <jce/renderer/jce_pbr_material.h>
-#include <jce/renderer/jce_text.h>
-#include <jce/renderer/jce_primitives.h>
+#include <jce/renderer/jce_gfx_types.h>
 #include <jce/renderer/jce_lighting.h>
 #include <jce/renderer/jce_lighting_system.h>
-#include <jce/renderer/jce_views.h>
-#include <jce/renderer/jce_shaders.h>
+#include <jce/renderer/jce_material.h>
+#include <jce/renderer/jce_mesh.h>
+#include <jce/renderer/jce_model.h>
 #include <jce/renderer/jce_particles.h>
+#include <jce/renderer/jce_pbr_material.h>
 #include <jce/renderer/jce_postfx.h>
+#include <jce/renderer/jce_primitives.h>
+#include <jce/renderer/jce_renderer.h>
+#include <jce/renderer/jce_shaders.h>
+#include <jce/renderer/jce_text.h>
+#include <jce/renderer/jce_texture.h>
+#include <jce/renderer/jce_texture_types.h>
+#include <jce/renderer/jce_views.h>
 
 #endif /* JCE_API_GRAPHICS_H */

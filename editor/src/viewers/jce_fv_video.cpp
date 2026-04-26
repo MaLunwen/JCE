@@ -14,8 +14,8 @@
 #include "jce_fv_common.h"
 
 extern "C" {
-#include <jce/middleware/video/jce_video.h>
 #include <jce/middleware/audio/jce_audio.h>
+#include <jce/middleware/video/jce_video.h>
 }
 
 /* perf timing comes from <jce/core/jce_timer.h> */

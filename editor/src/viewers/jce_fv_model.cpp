@@ -12,13 +12,13 @@
 
 #include "jce_fv_common.h"
 
-#include <string>
-#include <vector>
-
 #include <assimp/Importer.hpp>
 #include <assimp/material.h>
 #include <assimp/postprocess.h>
 #include <assimp/scene.h>
+
+#include <string>
+#include <vector>
 
 #define LOG_TAG "fv_model"
 

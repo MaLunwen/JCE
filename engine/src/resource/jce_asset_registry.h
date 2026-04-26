@@ -11,8 +11,8 @@
 #ifndef JCE_ASSET_REGISTRY_H
 #define JCE_ASSET_REGISTRY_H
 
-#include <stdint.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {

@@ -6,6 +6,7 @@
  */
 
 #include "jce_gizmo.h"
+
 #include "jce_editor_defaults.h"
 
 #include <imgui.h>

@@ -5,19 +5,19 @@
 #ifndef JCE_ASSET_CACHE_INTERNAL_H
 #define JCE_ASSET_CACHE_INTERNAL_H
 
+#include "io/jce_editor_file_util.h"
 #include "jce_editor_scene_asset_cache.h"
 #include "jce_model_loader_assimp.h"
-#include "io/jce_editor_file_util.h"
 
-#include <string.h>
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
-#include <sstream>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>

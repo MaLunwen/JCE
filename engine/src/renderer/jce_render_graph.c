@@ -10,14 +10,15 @@
  * callback in the compiled order.
  */
 
-#include <jce/renderer/jce_render_graph.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
+#include <jce/renderer/jce_render_graph.h>
+
 #include "os/core/jce_memory.h"
 
 #include <bgfx/c99/bgfx.h>
-#include <string.h>
 #include <stdio.h>
+#include <string.h>
 
 #define LOG_TAG "render_graph"
 

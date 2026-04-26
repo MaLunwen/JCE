@@ -4,7 +4,9 @@
 
 #include <jce/application/jce_camera_controller.h>
 #include <jce/renderer/jce_camera.h>
+
 #include "os/core/jce_memory.h"
+
 #include <math.h>
 
 /* ================================================================== */

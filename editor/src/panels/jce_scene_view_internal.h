@@ -5,24 +5,24 @@
 #ifndef JCE_SCENE_VIEW_INTERNAL_H
 #define JCE_SCENE_VIEW_INTERNAL_H
 
-#include "jce_editor_panels.h"
-#include "jce_editor_state.h"
+#include "gizmo/jce_gizmo.h"
 #include "jce_editor_colors.h"
 #include "jce_editor_i18n.h"
 #include "jce_editor_layout.h"
+#include "jce_editor_panels.h"
+#include "jce_editor_state.h"
 #include "scene/jce_editor_scene_render.h"
-#include "gizmo/jce_gizmo.h"
 
 #include <imgui.h>
 #include <imgui_internal.h>
-#include <stdio.h>
 #include <math.h>
-#include <string.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 extern "C" {
-#include <jce/os/core/jce_math.h>
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/os/core/jce_math.h>
 }
 
 /* ── Local mesh shape constants (procedural primitives) ───────────── */

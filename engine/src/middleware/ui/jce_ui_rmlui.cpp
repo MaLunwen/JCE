@@ -11,24 +11,23 @@
  *   - Input forwarding from JceInput → Rml::Context
  */
 
-#include "jce_ui_backend.h"
-
-#include <RmlUi/Core.h>
-#include <bgfx/c99/bgfx.h>
-
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/pak_loader.h>
-#include <jce/renderer/jce_views.h>
-#include <jce/renderer/jce_texture.h>
 #include <jce/os/platform/jce_input.h>
+#include <jce/renderer/jce_texture.h>
+#include <jce/renderer/jce_views.h>
+
+#include "jce_ui_backend.h"
+#include "os/core/jce_memory.h"
 #include "renderer/jce_renderer_internal.h"
 
-#include "os/core/jce_memory.h"
+#include <bgfx/c99/bgfx.h>
+#include <RmlUi/Core.h>
 
 #include <cstring>
 #include <string>
-#include <vector>
 #include <unordered_map>
+#include <vector>
 
 #define LOG_TAG "ui.rml"
 

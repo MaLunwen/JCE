@@ -64,7 +64,10 @@ typedef enum {
 #define JCE_CORO_STATE  int _coro_line
 
 /* Initialize a coroutine context before first use. */
-#define JCE_CORO_INIT(ctx)  do { (ctx)->_coro_line = 0; } while(0)
+#define JCE_CORO_INIT(ctx)                                                                         \
+    do {                                                                                           \
+        (ctx)->_coro_line = 0;                                                                     \
+    } while (0)
 
 /* Reset a coroutine to its initial state. */
 #define JCE_CORO_RESET(ctx) JCE_CORO_INIT(ctx)
@@ -77,8 +80,9 @@ typedef enum {
 /* ================================================================== */
 
 /* Begin a coroutine function body. */
-#define JCE_CORO_BEGIN(ctx) \
-    switch ((ctx)->_coro_line) { case 0:;
+#define JCE_CORO_BEGIN(ctx)                                                                        \
+    switch ((ctx)->_coro_line) {                                                                   \
+    case 0:;
 
 /* Yield execution — return and resume here next call. */
 #define JCE_CORO_YIELD() \
@@ -114,14 +118,15 @@ typedef enum {
 /* ================================================================== */
 
 /* Wait until condition is true. */
-#define JCE_CORO_WAIT_UNTIL(cond) \
-    do { \
-        while (!(cond)) { JCE_CORO_YIELD(); } \
-    } while(0)
+#define JCE_CORO_WAIT_UNTIL(cond)                                                                  \
+    do {                                                                                           \
+        while (!(cond)) {                                                                          \
+            JCE_CORO_YIELD();                                                                      \
+        }                                                                                          \
+    } while (0)
 
 /* Wait while condition is true. */
-#define JCE_CORO_WAIT_WHILE(cond) \
-    JCE_CORO_WAIT_UNTIL(!(cond))
+#define JCE_CORO_WAIT_WHILE(cond) JCE_CORO_WAIT_UNTIL(!(cond))
 
 /* Wait for N frames. */
 #define JCE_CORO_WAIT_FRAMES(ctx, n, frame_var) \

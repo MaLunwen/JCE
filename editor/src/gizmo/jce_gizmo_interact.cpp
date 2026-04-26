@@ -5,13 +5,12 @@
  * when dragging.  All logic works in world-space via ray unprojection.
  */
 
-#include "jce_gizmo.h"
 #include "jce_editor_defaults.h"
+#include "jce_gizmo.h"
+#include "jce_gizmo_internal.h"
 
 #include <imgui.h>
 #include <math.h>
-
-#include "jce_gizmo_internal.h"
 
 /* ── Constants ─────────────────────────────────────────────────────── */
 

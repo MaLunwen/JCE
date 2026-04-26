@@ -20,8 +20,9 @@
 
 
 #include <jce/os/core/jce_defs.h>
-#include <stddef.h>
+
 #include <stdbool.h>
+#include <stddef.h>
 
 JCE_EXTERN_C_BEGIN
 

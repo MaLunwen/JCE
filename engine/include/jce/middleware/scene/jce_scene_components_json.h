@@ -9,10 +9,11 @@
 #define JCE_SCENE_SERIAL_FLAT_H
 
 
-#include <jce/os/core/jce_defs.h>
-#include <stdbool.h>
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/os/core/jce_defs.h>
 #include <jce/os/core/jce_json.h>
+
+#include <stdbool.h>
 
 JCE_EXTERN_C_BEGIN
 

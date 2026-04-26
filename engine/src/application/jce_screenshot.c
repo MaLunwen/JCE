@@ -6,6 +6,7 @@
  */
 
 #include <jce/application/jce_screenshot.h>
+
 #include <stddef.h>
 
 bool jce_screenshot_save(const char *path, JceScreenshotFormat format) { (void)path; (void)format; return false; }

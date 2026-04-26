@@ -11,6 +11,7 @@
  */
 
 #include "jce_run_manager.h"
+
 #include "jce_editor_panels.h"
 
 extern "C" {

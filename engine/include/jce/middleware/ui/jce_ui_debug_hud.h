@@ -12,8 +12,9 @@
 #define JCE_UI_DEBUG_HUD_H
 
 
-#include <jce/os/core/jce_defs.h>
 #include <jce/middleware/ui/jce_ui.h>
+#include <jce/os/core/jce_defs.h>
+
 #include <stdbool.h>
 
 JCE_EXTERN_C_BEGIN

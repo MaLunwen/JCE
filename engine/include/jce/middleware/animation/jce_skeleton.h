@@ -12,9 +12,10 @@
 #define JCE_SKELETON_H
 
 
+#include <jce/middleware/animation/jce_skinned_mesh.h>
 #include <jce/os/core/jce_defs.h>
 #include <jce/os/core/jce_math.h>
-#include <jce/middleware/animation/jce_skinned_mesh.h>
+
 #include <stdint.h>
 
 JCE_EXTERN_C_BEGIN

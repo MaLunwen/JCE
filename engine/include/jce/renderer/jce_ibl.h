@@ -13,6 +13,7 @@
 
 #include <jce/os/core/jce_defs.h>
 #include <jce/renderer/jce_texture_types.h>
+
 #include <stdbool.h>
 #include <stdint.h>
 

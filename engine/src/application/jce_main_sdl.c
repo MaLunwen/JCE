@@ -25,8 +25,8 @@
  *     entry points.
  */
 
-#include <jce/application/jce_engine.h>
 #include <jce/application/jce_app_interface.h>
+#include <jce/application/jce_engine.h>
 
 /* SDL3 callback contract.  Must precede SDL_main.h. */
 #define SDL_MAIN_USE_CALLBACKS 1

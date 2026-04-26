@@ -12,9 +12,10 @@
 
 extern "C" {
 #include <jce/renderer/jce_pbr_material.h>
-#include <SDL3_image/SDL_image.h>
+
 #include <SDL3/SDL_iostream.h>
 #include <SDL3/SDL_surface.h>
+#include <SDL3_image/SDL_image.h>
 }
 
 #include "jce_editor_file_util.h"

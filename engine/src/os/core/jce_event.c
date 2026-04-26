@@ -7,8 +7,9 @@
  */
 
 #include <jce/os/core/jce_event.h>
-#include <xxhash.h>
+
 #include <string.h>
+#include <xxhash.h>
 
 /* ================================================================== */
 /* Internal types                                                      */

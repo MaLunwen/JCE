@@ -17,9 +17,10 @@
 
 
 #include <jce/os/core/jce_defs.h>
+
 #include <stdbool.h>
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
 
 JCE_EXTERN_C_BEGIN
 

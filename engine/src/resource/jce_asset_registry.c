@@ -7,6 +7,7 @@
  */
 
 #include "jce_asset_registry.h"
+
 #include "os/core/jce_memory.h"
 
 #include <string.h>

@@ -14,9 +14,10 @@
 
 
 #include <jce/os/core/jce_defs.h>
+#include <jce/os/core/jce_math.h>
+
 #include <stdbool.h>
 #include <stdint.h>
-#include <jce/os/core/jce_math.h>
 
 JCE_EXTERN_C_BEGIN
 

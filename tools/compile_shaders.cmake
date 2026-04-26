@@ -105,6 +105,11 @@ function(jce_compile_shaders)
     list(LENGTH _suffixes _num_profiles)
     math(EXPR _max_idx "${_num_profiles} - 1")
 
+    # JCE_SHADER_PROFILES (parent scope, set by top-level CMakeLists)
+    # may restrict the set of suffixes we compile for.  Empty/unset =
+    # compile every profile (legacy behaviour).
+    set(_profile_filter "${JCE_SHADER_PROFILES}")
+
     # Ensure output directory exists.
     file(MAKE_DIRECTORY "${ARG_OUTPUT_DIR}")
 
@@ -129,6 +134,13 @@ function(jce_compile_shaders)
             list(GET _suffixes  ${_idx} _suffix)
             list(GET _platforms ${_idx} _platform)
             list(GET _profiles  ${_idx} _profile)
+
+            # Skip profiles not requested for this build's target platform.
+            if(_profile_filter)
+                if(NOT _suffix IN_LIST _profile_filter)
+                    continue()
+                endif()
+            endif()
 
             # dx11/HLSL requires the DirectX shader compiler (DXC) which is
             # only available on Windows hosts.  Skip on macOS/Linux hosts.

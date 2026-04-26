@@ -11,16 +11,17 @@
  * the equirect-to-cube shader is compiled.
  */
 
-#include <jce/renderer/jce_skybox.h>
-#include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_filesystem.h>
-#include <SDL3/SDL.h>
+#include <jce/os/core/jce_log.h>
+#include <jce/renderer/jce_skybox.h>
+
+#include "internal/stb_image.h"
 #include "os/core/jce_memory.h"
 
 #include <bgfx/c99/bgfx.h>
-#include <jce/third_party/stb_image.h>
-#include <string.h>
+#include <SDL3/SDL.h>
 #include <stdio.h>
+#include <string.h>
 
 #define LOG_TAG "jce_skybox"
 

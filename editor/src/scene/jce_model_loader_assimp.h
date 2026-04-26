@@ -5,15 +5,15 @@
 #ifndef JCE_MODEL_LOADER_ASSIMP_H
 #define JCE_MODEL_LOADER_ASSIMP_H
 
-#include <stdint.h>
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#include <jce/renderer/jce_mesh.h>
 #include <jce/os/core/pak_loader.h>
+#include <jce/renderer/jce_mesh.h>
 
 typedef struct JceEditorCpuMeshData {
     JceMeshVertex *vertices;

@@ -19,9 +19,10 @@
 
 
 #include <jce/os/core/jce_defs.h>
-#include <stdint.h>
+
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 JCE_EXTERN_C_BEGIN
 
@@ -40,34 +41,34 @@ JCE_EXTERN_C_BEGIN
  *   - O(1) lookup: slots[handle.index]
  */
 typedef struct JceAssetHandle {
-	uint16_t index;
-	uint16_t generation;
+    uint16_t index;
+    uint16_t generation;
 } JceAssetHandle;
 
 #define JCE_ASSET_HANDLE_INVALID ((JceAssetHandle){ 0xFFFF, 0 })
 
 static inline bool jce_asset_handle_valid(JceAssetHandle h)
 {
-	return h.index != 0xFFFF;
+    return h.index != 0xFFFF;
 }
 
 static inline bool jce_asset_handle_eq(JceAssetHandle a, JceAssetHandle b)
 {
-	return a.index == b.index && a.generation == b.generation;
+    return a.index == b.index && a.generation == b.generation;
 }
 
 /* Pack/unpack for FFI: treat handle as opaque uint32_t. */
 static inline uint32_t jce_asset_handle_pack(JceAssetHandle h)
 {
-	return ((uint32_t)h.generation << 16) | (uint32_t)h.index;
+    return ((uint32_t)h.generation << 16) | (uint32_t)h.index;
 }
 
 static inline JceAssetHandle jce_asset_handle_unpack(uint32_t packed)
 {
-	JceAssetHandle h;
-	h.index      = (uint16_t)(packed & 0xFFFF);
-	h.generation = (uint16_t)(packed >> 16);
-	return h;
+    JceAssetHandle h;
+    h.index      = (uint16_t)(packed & 0xFFFF);
+    h.generation = (uint16_t)(packed >> 16);
+    return h;
 }
 
 /* ================================================================== */
@@ -75,18 +76,18 @@ static inline JceAssetHandle jce_asset_handle_unpack(uint32_t packed)
 /* ================================================================== */
 
 typedef enum JceAssetType {
-	JCE_ASSET_TEXTURE    = 0,
-	JCE_ASSET_MESH       = 1,
-	JCE_ASSET_SOUND      = 2,
-	JCE_ASSET_FONT       = 3,
-	JCE_ASSET_SHADER     = 4,
-	JCE_ASSET_MATERIAL   = 5,
-	JCE_ASSET_MODEL      = 6,   /* composite glTF model */
-	JCE_ASSET_ANIMATION  = 7,
-	JCE_ASSET_SCENE      = 8,
-	JCE_ASSET_RAW        = 9,   /* opaque binary blob */
+    JCE_ASSET_TEXTURE    = 0,
+    JCE_ASSET_MESH       = 1,
+    JCE_ASSET_SOUND      = 2,
+    JCE_ASSET_FONT       = 3,
+    JCE_ASSET_SHADER     = 4,
+    JCE_ASSET_MATERIAL   = 5,
+    JCE_ASSET_MODEL      = 6,   /* composite glTF model */
+    JCE_ASSET_ANIMATION  = 7,
+    JCE_ASSET_SCENE      = 8,
+    JCE_ASSET_RAW        = 9,   /* opaque binary blob */
 
-	JCE_ASSET_TYPE_COUNT
+    JCE_ASSET_TYPE_COUNT
 } JceAssetType;
 
 /* ================================================================== */
@@ -94,12 +95,12 @@ typedef enum JceAssetType {
 /* ================================================================== */
 
 typedef enum JceAssetState {
-	JCE_ASSET_STATE_UNLOADED  = 0,
-	JCE_ASSET_STATE_QUEUED    = 1,  /* waiting in async queue */
-	JCE_ASSET_STATE_LOADING   = 2,  /* worker thread active */
-	JCE_ASSET_STATE_LOADED    = 3,  /* CPU-side ready, awaiting finalize */
-	JCE_ASSET_STATE_READY     = 4,  /* GPU-uploaded, fully usable */
-	JCE_ASSET_STATE_FAILED    = 5
+    JCE_ASSET_STATE_UNLOADED  = 0,
+    JCE_ASSET_STATE_QUEUED    = 1,  /* waiting in async queue */
+    JCE_ASSET_STATE_LOADING   = 2,  /* worker thread active */
+    JCE_ASSET_STATE_LOADED    = 3,  /* CPU-side ready, awaiting finalize */
+    JCE_ASSET_STATE_READY     = 4,  /* GPU-uploaded, fully usable */
+    JCE_ASSET_STATE_FAILED    = 5
 } JceAssetState;
 
 /* ================================================================== */
@@ -108,18 +109,18 @@ typedef enum JceAssetState {
 
 /* Optional extra parameters for loading specific asset types. */
 typedef struct JceAssetLoadParams {
-	/* Texture sampler mode: 0=default(clamp), JCE_TEX_WRAP, JCE_TEX_MIRROR */
-	int texture_sampler_mode;
+    /* Texture sampler mode: 0=default(clamp), JCE_TEX_WRAP, JCE_TEX_MIRROR */
+    int texture_sampler_mode;
 
-	/* Font point size (only for JCE_ASSET_FONT). */
-	float font_size;
+    /* Font point size (only for JCE_ASSET_FONT). */
+    float font_size;
 
-	/* Optional codepoints array for font atlas (NULL = ASCII only). */
-	const uint32_t *font_codepoints;
-	int             font_codepoint_count;
+    /* Optional codepoints array for font atlas (NULL = ASCII only). */
+    const uint32_t *font_codepoints;
+    int             font_codepoint_count;
 
-	/* Force synchronous load even when async is available. */
-	bool sync;
+    /* Force synchronous load even when async is available. */
+    bool sync;
 } JceAssetLoadParams;
 
 #define JCE_ASSET_LOAD_DEFAULT ((JceAssetLoadParams){0})
@@ -140,22 +141,22 @@ typedef struct JceAudio     JceAudio;
 /* ================================================================== */
 
 typedef struct JceAssetManagerConfig {
-	/* Maximum number of concurrent assets (determines slot pool size).
+    /* Maximum number of concurrent assets (determines slot pool size).
 	   0 = default (8192). Must be <= 65534 (0xFFFE). */
-	uint32_t max_assets;
+    uint32_t max_assets;
 
-	/* Number of async worker threads. 0 = default (2).
+    /* Number of async worker threads. 0 = default (2).
 	   Workers handle decompression + decoding off main thread. */
-	uint32_t worker_threads;
+    uint32_t worker_threads;
 
-	/* PAK archive for reading cooked assets (required). */
-	JcePakArchive *pak;
+    /* PAK archive for reading cooked assets (required). */
+    JcePakArchive *pak;
 
-	/* Optional VFS for loose-file override (developer mode). */
-	JceFileSystem *fs;
+    /* Optional VFS for loose-file override (developer mode). */
+    JceFileSystem *fs;
 
-	/* Optional audio subsystem for sound asset loading. */
-	JceAudio *audio;
+    /* Optional audio subsystem for sound asset loading. */
+    JceAudio *audio;
 } JceAssetManagerConfig;
 
 /* ================================================================== */

@@ -27,3 +27,7 @@ scripts/android/app/src/main/jniLibs/
 scripts/android/app/src/main/res/*
 !scripts/android/app/src/main/res/drawable-nodpi/
 !scripts/android/app/src/main/res/values/
+
+# Vendored single-header libraries (managed manually, excluded from style/CI scans)
+engine/src/renderer/internal/stb_image.h
+

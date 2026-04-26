@@ -8,12 +8,12 @@
 #ifndef JCE_API_APP_H
 #define JCE_API_APP_H
 
-#include <jce/application/jce_engine.h>
 #include <jce/application/jce_app_interface.h>
-#include <jce/application/jce_config.h>
 #include <jce/application/jce_camera_controller.h>
-#include <jce/application/jce_subsystem.h>
+#include <jce/application/jce_config.h>
+#include <jce/application/jce_engine.h>
 #include <jce/application/jce_screenshot.h>
+#include <jce/application/jce_subsystem.h>
 
 /* NOTE: jce_main.h is intentionally excluded.
  * It defines SDL_MAIN_USE_CALLBACKS and generates entry-point functions

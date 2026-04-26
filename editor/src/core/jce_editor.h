@@ -10,9 +10,9 @@
 #ifndef JCE_EDITOR_H
 #define JCE_EDITOR_H
 
+#include <SDL3/SDL_events.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <SDL3/SDL_events.h>
 
 #ifdef __cplusplus
 extern "C" {

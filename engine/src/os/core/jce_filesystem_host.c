@@ -6,12 +6,12 @@
  */
 
 #include <jce/os/core/jce_filesystem.h>
+
 #include "jce_memory.h"
 
 #include <SDL3/SDL_filesystem.h>
 #include <SDL3/SDL_iostream.h>
 #include <SDL3/SDL_stdinc.h>
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

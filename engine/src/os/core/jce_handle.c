@@ -8,6 +8,7 @@
  */
 
 #include <jce/os/core/jce_handle.h>
+
 #include <string.h>
 
 /* Maximum index value (2^20 - 1, minus 1 for null sentinel). */

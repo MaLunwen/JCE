@@ -9,6 +9,9 @@
 #ifndef JCE_VERSION_H
 #define JCE_VERSION_H
 
+#include <jce/os/core/jce_defs.h>
+#include <stdint.h>
+
 #define JCE_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
 #define JCE_VERSION_MINOR @PROJECT_VERSION_MINOR@
 #define JCE_VERSION_PATCH @PROJECT_VERSION_PATCH@
@@ -23,5 +26,26 @@
  * Explicit "UTC" suffix keeps logs/About dialogs unambiguous across
  * machines and timezones. */
 #define JCE_BUILD_TIMESTAMP_UTC   "@JCE_BUILD_TIMESTAMP_UTC@"
+
+/* Packed ABI / API version — bumped whenever the public C ABI changes
+ * in a source- or binary-incompatible way.  Layout: 0xMMmmpp00, e.g.
+ * 0.7.1 -> 0x00070100.  Language bindings (JNI, C#, Python, ...) MUST
+ * call jce_api_version() at startup and reject mismatching majors. */
+#define JCE_API_VERSION   ((JCE_VERSION_MAJOR << 24) | \
+                           (JCE_VERSION_MINOR << 16) | \
+                           (JCE_VERSION_PATCH << 8))
+
+JCE_EXTERN_C_BEGIN
+
+/* Returns JCE_API_VERSION compiled into the loaded engine library.
+ * Use this to verify ABI compatibility from foreign-language bindings
+ * before invoking any other JCE entry point. */
+JCE_API uint32_t JCE_CALL jce_api_version(void);
+
+/* Returns the dotted version string baked into the engine library
+ * (same value as JCE_VERSION_STR at compile time of the engine). */
+JCE_API const char *JCE_CALL jce_api_version_string(void);
+
+JCE_EXTERN_C_END
 
 #endif /* JCE_VERSION_H */

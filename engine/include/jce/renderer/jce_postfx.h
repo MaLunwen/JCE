@@ -16,11 +16,12 @@
 #define JCE_POSTFX_H
 
 
+#include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_defs.h>
+#include <jce/renderer/jce_gfx_types.h>
+
 #include <stdbool.h>
 #include <stdint.h>
-#include <jce/os/core/jce_allocator.h>
-#include <jce/renderer/jce_gfx_types.h>
 
 typedef struct JcePakArchive JcePakArchive;
 

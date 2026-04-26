@@ -8,6 +8,7 @@
 #include <jce/application/jce_subsystem.h>
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_log.h>
+
 #include <string.h>
 
 #define LOG_TAG "subsystem"

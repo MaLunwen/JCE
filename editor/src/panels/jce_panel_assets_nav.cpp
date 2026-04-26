@@ -2,8 +2,8 @@
  * jce_panel_assets_nav.cpp  Directory tree, breadcrumb, search.
  */
 
-#include "jce_panel_assets_internal.h"
 #include "jce_editor_config.h"
+#include "jce_panel_assets_internal.h"
 
 static void persist_asset_browser_view_mode(void)
 {

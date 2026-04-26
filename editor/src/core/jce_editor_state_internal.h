@@ -13,26 +13,26 @@
 #ifndef JCE_EDITOR_STATE_INTERNAL_H
 #define JCE_EDITOR_STATE_INTERNAL_H
 
-#include "jce_editor_state.h"
-#include "jce_editor_defaults.h"
 #include "jce_editor_alloc.h"
+#include "jce_editor_defaults.h"
+#include "jce_editor_state.h"
 
-#include <string.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <math.h>
+#include <string.h>
 
-#include <vector>
 #include <string>
-#include <utility>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 extern "C" {
-#include <jce/os/core/jce_log.h>
+#include <jce/middleware/scene/jce_scene.h>
 #include <jce/os/core/jce_json.h>
+#include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/resource/jce_scene_contract.h>
-#include <jce/middleware/scene/jce_scene.h>
 #include <jce/resource/jce_scene_serial.h>
 }
 

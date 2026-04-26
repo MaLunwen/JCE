@@ -3,10 +3,12 @@
  */
 
 #include "jce_animation.h"
-#include "jce_anim_ozz.h"
+
 #include <jce/os/core/jce_log.h>
 
+#include "jce_anim_ozz.h"
 #include "os/core/jce_memory.h"
+
 #include <string.h>
 
 #define LOG_TAG "jce_animation"

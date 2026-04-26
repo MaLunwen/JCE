@@ -2,14 +2,15 @@
  * jce_input_actions.c  Action-based input implementation.
  */
 
-#include <jce/os/platform/jce_input_actions.h>
 #include <jce/os/platform/jce_input.h>
+#include <jce/os/platform/jce_input_actions.h>
+
 #include "os/core/jce_memory.h"
 
-#include <SDL3/SDL.h>
-#include <string.h>
-#include <stdio.h>
 #include <math.h>
+#include <SDL3/SDL.h>
+#include <stdio.h>
+#include <string.h>
 
 /* ================================================================== */
 /* Internals                                                           */

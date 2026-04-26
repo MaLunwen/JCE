@@ -2,15 +2,13 @@
  * jce_offscreen_target.c  Engine-owned bridge for editor scene viewport.
  */
 
-#include <jce/renderer/jce_offscreen_target.h>
-
-#include <jce/renderer/jce_views.h>
 #include <jce/os/core/jce_log.h>
-
-#include <bgfx/c99/bgfx.h>
+#include <jce/renderer/jce_offscreen_target.h>
+#include <jce/renderer/jce_views.h>
 
 #include "os/core/jce_memory.h"
 
+#include <bgfx/c99/bgfx.h>
 #include <limits.h>
 
 #define LOG_TAG "editor_bridge"

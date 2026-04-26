@@ -7,12 +7,13 @@
 
 #include <jce/middleware/video/jce_vp8_decode.h>
 #include <jce/os/core/jce_log.h>
+
 #include "os/core/jce_memory.h"
 
-#include <vpx/vpx_decoder.h>
-#include <vpx/vp8dx.h>
-#include <vpx/vpx_image.h>
 #include <string.h>
+#include <vpx/vp8dx.h>
+#include <vpx/vpx_decoder.h>
+#include <vpx/vpx_image.h>
 
 #define LOG_TAG "jce_vp8"
 

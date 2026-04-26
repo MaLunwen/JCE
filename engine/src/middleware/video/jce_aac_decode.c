@@ -18,6 +18,7 @@
 #ifdef JCE_ENABLE_PATENTED_CODECS
 
 #include <jce/os/core/jce_log.h>
+
 #include "os/core/jce_memory.h"
 
 #include <aacdecoder_lib.h>

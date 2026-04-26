@@ -12,12 +12,12 @@
 
 
 #include <jce/os/core/jce_defs.h>
+#include <jce/renderer/jce_csm.h>
+#include <jce/renderer/jce_postfx.h>
+#include <jce/renderer/jce_texture_types.h>
+
 #include <stdbool.h>
 #include <stdint.h>
-#include <jce/renderer/jce_postfx.h>
-#include <jce/renderer/jce_csm.h>
-
-#include <jce/renderer/jce_texture_types.h>
 
 JCE_EXTERN_C_BEGIN
 

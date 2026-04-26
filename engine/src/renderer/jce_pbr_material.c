@@ -2,18 +2,18 @@
  * jce_pbr_material.c  PBR material bind + JSON I/O implementation.
  */
 
-#include <jce/renderer/jce_pbr_material.h>
-#include "jce_renderer_internal.h"
-#include <jce/renderer/jce_texture_types.h>
-#include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_json.h>
+#include <jce/os/core/jce_log.h>
+#include <jce/renderer/jce_pbr_material.h>
+#include <jce/renderer/jce_texture_types.h>
+
+#include "jce_renderer_internal.h"
+#include "os/core/jce_memory.h"
 
 #include <bgfx/c99/bgfx.h>
 #include <SDL3/SDL.h>
-
 #include <string.h>
-#include "os/core/jce_memory.h"
 
 #define LOG_TAG "jce_pbr_material"
 

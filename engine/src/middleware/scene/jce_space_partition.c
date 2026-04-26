@@ -6,6 +6,7 @@
  */
 
 #include <jce/middleware/scene/jce_space_partition.h>
+
 #include <stddef.h>
 
 JceSpaceIndex *jce_space_create(const JceSpaceConfig *config)              { (void)config; return NULL; }

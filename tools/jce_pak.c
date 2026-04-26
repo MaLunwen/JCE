@@ -44,10 +44,10 @@
 #  define _strdup strdup
 #endif
 
+#include "resource/pak_format.h"
+
 #include <xxhash.h>
 #include <zstd.h>
-
-#include "resource/pak_format.h"
 
 /* ================================================================== */
 /* Dynamic byte buffer                                                 */
@@ -338,17 +338,51 @@ static void enumerate_files(const char *dir, StrList *out) {
 /* ================================================================== */
 
 typedef struct {
-    char     *rel_path;
-    uint64_t  path_hash;
-    uint64_t  original_size;
-    uint8_t  *compressed;
-    size_t    compressed_size;
-    uint32_t  name_offset;
-    uint32_t  name_length;
-    uint64_t  data_offset;
+    char *rel_path;
+    uint64_t path_hash;
+    uint64_t original_size;
+    uint8_t *compressed;
+    size_t compressed_size;
+    uint32_t name_offset;
+    uint32_t name_length;
+    uint64_t data_offset;
+    uint32_t flags;        /* JPAK_FLAG_*                            */
+    uint64_t content_hash; /* XXH3_64bits of original bytes          */
 } AssetEntry;
 
-static int entry_cmp_hash(const void *a, const void *b) {
+/* Files whose contents are already entropy-coded; running zstd on them
+ * yields ~1.00× ratio while still costing CPU at decode time.  We mark
+ * those entries with JPAK_FLAG_STORED and copy raw bytes verbatim. */
+static int jce_pak_is_already_compressed(const char *rel)
+{
+    static const char *exts[] = {
+        ".png", ".jpg",      ".jpeg",     ".webp", ".ktx",  ".ktx2", ".basis", ".dds",  ".ogg",
+        ".mp3", ".opus",     ".flac",     ".aac",  ".wav",  ".m4a",  ".mp4",   ".webm", ".mkv",
+        ".mov", ".avi",      ".ivf",      ".zip",  ".7z",   ".gz",   ".zst",   ".xz",   ".bz2",
+        ".pak", ".jceasset", ".jpeg2000", ".jp2",  ".heic", ".heif", ".avif",  NULL};
+    size_t n = strlen(rel);
+    for (size_t i = 0; exts[i]; ++i) {
+        size_t e = strlen(exts[i]);
+        if (n >= e) {
+            int eq = 1;
+            for (size_t k = 0; k < e; ++k) {
+                char c = rel[n - e + k];
+                if (c >= 'A' && c <= 'Z')
+                    c = (char)(c - 'A' + 'a');
+                if (c != exts[i][k]) {
+                    eq = 0;
+                    break;
+                }
+            }
+            if (eq)
+                return 1;
+        }
+    }
+    return 0;
+}
+
+static int entry_cmp_hash(const void *a, const void *b)
+{
     uint64_t ha = ((const AssetEntry *)a)->path_hash;
     uint64_t hb = ((const AssetEntry *)b)->path_hash;
     if (ha < hb) return -1;
@@ -551,22 +585,38 @@ static void generate_manifest(const AssetEntry *entries, size_t count,
     }
     bb_append(out, "\")\n", 3);
 
+    /* ASSET_FLAGS (PAK v2: 1 = STORED, 0 = compressed) */
+    bb_append(out, "set(ASSET_FLAGS \"", 17);
+    for (size_t i = 0; i < count; ++i) {
+        if (i)
+            bb_push(out, ';');
+        n = snprintf(line, sizeof(line), "%u", (unsigned)entries[i].flags);
+        bb_append(out, line, (size_t)n);
+    }
+    bb_append(out, "\")\n", 3);
+
     /* Totals */
-    uint64_t raw_total = 0, comp_total = 0;
+    uint64_t raw_total = 0, comp_total = 0, stored_raw = 0;
+    size_t stored_count = 0;
     for (size_t i = 0; i < count; ++i) {
         raw_total  += entries[i].original_size;
         comp_total += entries[i].compressed_size;
+        if (entries[i].flags & JPAK_FLAG_STORED) {
+            stored_count++;
+            stored_raw += entries[i].original_size;
+        }
     }
 
     n = snprintf(line, sizeof(line),
-        "set(ASSET_RAW_TOTAL %llu)\n"
-        "set(ASSET_COMP_TOTAL %llu)\n"
-        "set(ASSET_PAK_TOTAL %llu)\n"
-        "set(ASSET_FILE_COUNT %llu)\n",
-        (unsigned long long)raw_total,
-        (unsigned long long)comp_total,
-        (unsigned long long)pak_total,
-        (unsigned long long)count);
+                 "set(ASSET_RAW_TOTAL %llu)\n"
+                 "set(ASSET_COMP_TOTAL %llu)\n"
+                 "set(ASSET_PAK_TOTAL %llu)\n"
+                 "set(ASSET_FILE_COUNT %llu)\n"
+                 "set(ASSET_STORED_COUNT %llu)\n"
+                 "set(ASSET_STORED_RAW_TOTAL %llu)\n",
+                 (unsigned long long)raw_total, (unsigned long long)comp_total,
+                 (unsigned long long)pak_total, (unsigned long long)count,
+                 (unsigned long long)stored_count, (unsigned long long)stored_raw);
     bb_append(out, line, (size_t)n);
 }
 
@@ -578,7 +628,9 @@ typedef struct {
     char resource_dirs[16][1024];
     int  resource_dir_count;
     char exclude_segments[16][128];
-    int  exclude_segment_count;
+    int exclude_segment_count;
+    char exclude_suffixes[16][32];
+    int exclude_suffix_count;
     char pak_file[1024];
     char obj_file[1024];
     char header_file[1024];
@@ -586,27 +638,44 @@ typedef struct {
     char c_file[1024];
     char obj_format[32];
     char obj_arch[32];
-    char platform[32];    /* desktop, mobile, web, console (default: desktop) */
+    char platform[32]; /* desktop, mobile, web, console (default: desktop) */
+    int zstd_level;    /* 1..22; default 3                                */
+    int no_store_opt;  /* 1 to disable STORED auto-detection             */
 } Args;
 
 static void usage(void) {
     fprintf(stderr,
-        "Usage: jce_pak --resource-dir <dir> [--resource-dir <dir2> ...]\n"
-        "              [--exclude-segment <name> ...]\n"
-        "               --pak-file      <out.pak>\n"
-        "               --header-file   <out.h>\n"
-        "               --manifest-file <out.cmake>\n"
-        "              [--obj-file      <out.obj>]\n"
-        "              [--c-file        <out.c>]     (for c-array format)\n"
-        "              [--obj-format    coff|c-array|none]   (default: none)\n"
-        "              [--obj-arch      x64|arm64|x86|arm]  (default: x64)\n"
-        "              [--platform      desktop|mobile|web|console] (default: desktop)\n"
-        "\n"
-        "  --platform selects the target platform (reserved for future use):\n"
-        "    desktop  → Windows / macOS / Linux\n"
-        "    mobile   → Android / iOS\n"
-        "    web      → Emscripten\n"
-        "    console  → Console platforms\n");
+            "Usage: jce_pak --resource-dir <dir> [--resource-dir <dir2> ...]\n"
+            "              [--exclude-segment <name> ...]\n"
+            "              [--exclude-suffix  <suffix> ...]\n"
+            "               --pak-file      <out.pak>\n"
+            "               --header-file   <out.h>\n"
+            "               --manifest-file <out.cmake>\n"
+            "              [--obj-file      <out.obj>]\n"
+            "              [--c-file        <out.c>]     (for c-array format)\n"
+            "              [--obj-format    coff|c-array|none]   (default: none)\n"
+            "              [--obj-arch      x64|arm64|x86|arm]  (default: x64)\n"
+            "              [--platform      desktop|mobile|web|console] (default: desktop)\n"
+            "              [--level         <1..22>]    ZSTD level (default: 3)\n"
+            "              [--no-store-opt]             disable already-compressed bypass\n"
+            "\n"
+            "  --exclude-suffix skips any file whose path ends with the suffix\n"
+            "  (case-sensitive).  Used to drop platform-irrelevant shader binaries\n"
+            "  (e.g. _mtl.bin on Windows, _dx11.bin on Linux).\n"
+            "\n"
+            "  --platform selects the target platform (reserved for future use):\n"
+            "    desktop  → Windows / macOS / Linux\n"
+            "    mobile   → Android / iOS\n"
+            "    web      → Emscripten\n"
+            "    console  → Console platforms\n");
+}
+
+static int has_suffix(const char *s, const char *suffix)
+{
+    size_t ls = strlen(s), lf = strlen(suffix);
+    if (lf > ls)
+        return 0;
+    return memcmp(s + ls - lf, suffix, lf) == 0;
 }
 
 static int is_excluded_rel_path(const char *rel, const Args *args)
@@ -617,6 +686,12 @@ static int is_excluded_rel_path(const char *rel, const Args *args)
         if (path_has_segment(rel, args->exclude_segments[i]))
             return 1;
     }
+    for (int i = 0; i < args->exclude_suffix_count; i++) {
+        if (args->exclude_suffixes[i][0] == '\0')
+            continue;
+        if (has_suffix(rel, args->exclude_suffixes[i]))
+            return 1;
+    }
     return 0;
 }
 
@@ -625,8 +700,10 @@ static Args parse_args(int argc, char *const argv[]) {
     Args a;
     memset(&a, 0, sizeof(a));
     strcpy(a.obj_format, "none");
-    strcpy(a.obj_arch,   "x64");
-    strcpy(a.platform,   "desktop");
+    strcpy(a.obj_arch, "x64");
+    strcpy(a.platform, "desktop");
+    a.zstd_level = 3;
+    a.no_store_opt = 0;
 
     /* Safety default: raw_assets is source-only and must never be packed. */
     snprintf(a.exclude_segments[a.exclude_segment_count],
@@ -652,16 +729,43 @@ static Args parse_args(int argc, char *const argv[]) {
                 a.exclude_segment_count++;
             }
             ++i;
-        }
-        else if (strcmp(arg, "--pak-file") == 0 && val)      { snprintf(a.pak_file,      sizeof(a.pak_file),      "%s", val); ++i; }
-        else if (strcmp(arg, "--obj-file") == 0 && val)      { snprintf(a.obj_file,      sizeof(a.obj_file),      "%s", val); ++i; }
-        else if (strcmp(arg, "--header-file") == 0 && val)   { snprintf(a.header_file,   sizeof(a.header_file),   "%s", val); ++i; }
-        else if (strcmp(arg, "--manifest-file") == 0 && val) { snprintf(a.manifest_file, sizeof(a.manifest_file), "%s", val); ++i; }
-        else if (strcmp(arg, "--c-file") == 0 && val)        { snprintf(a.c_file,        sizeof(a.c_file),        "%s", val); ++i; }
-        else if (strcmp(arg, "--obj-format") == 0 && val)    { snprintf(a.obj_format,    sizeof(a.obj_format),    "%s", val); ++i; }
-        else if (strcmp(arg, "--obj-arch") == 0 && val)      { snprintf(a.obj_arch,      sizeof(a.obj_arch),      "%s", val); ++i; }
-        else if (strcmp(arg, "--platform") == 0 && val)      { snprintf(a.platform,      sizeof(a.platform),      "%s", val); ++i; }
-        else {
+        } else if (strcmp(arg, "--exclude-suffix") == 0 && val) {
+            if (a.exclude_suffix_count < 16) {
+                snprintf(a.exclude_suffixes[a.exclude_suffix_count], sizeof(a.exclude_suffixes[0]),
+                         "%s", val);
+                a.exclude_suffix_count++;
+            }
+            ++i;
+        } else if (strcmp(arg, "--pak-file") == 0 && val) {
+            snprintf(a.pak_file, sizeof(a.pak_file), "%s", val);
+            ++i;
+        } else if (strcmp(arg, "--obj-file") == 0 && val) {
+            snprintf(a.obj_file, sizeof(a.obj_file), "%s", val);
+            ++i;
+        } else if (strcmp(arg, "--header-file") == 0 && val) {
+            snprintf(a.header_file, sizeof(a.header_file), "%s", val);
+            ++i;
+        } else if (strcmp(arg, "--manifest-file") == 0 && val) {
+            snprintf(a.manifest_file, sizeof(a.manifest_file), "%s", val);
+            ++i;
+        } else if (strcmp(arg, "--c-file") == 0 && val) {
+            snprintf(a.c_file, sizeof(a.c_file), "%s", val);
+            ++i;
+        } else if (strcmp(arg, "--obj-format") == 0 && val) {
+            snprintf(a.obj_format, sizeof(a.obj_format), "%s", val);
+            ++i;
+        } else if (strcmp(arg, "--obj-arch") == 0 && val) {
+            snprintf(a.obj_arch, sizeof(a.obj_arch), "%s", val);
+            ++i;
+        } else if (strcmp(arg, "--platform") == 0 && val) {
+            snprintf(a.platform, sizeof(a.platform), "%s", val);
+            ++i;
+        } else if (strcmp(arg, "--level") == 0 && val) {
+            a.zstd_level = atoi(val);
+            ++i;
+        } else if (strcmp(arg, "--no-store-opt") == 0) {
+            a.no_store_opt = 1;
+        } else {
             fprintf(stderr, "[jce_pak] unknown argument: %s\n", arg);
             usage();
             exit(1);
@@ -681,6 +785,12 @@ static Args parse_args(int argc, char *const argv[]) {
         strcmp(a.platform, "console") != 0) {
         fprintf(stderr, "[jce_pak] unknown --platform: %s\n", a.platform);
         fprintf(stderr, "  Valid values: desktop, mobile, web, console\n");
+        exit(1);
+    }
+
+    /* Validate --level. */
+    if (a.zstd_level < 1 || a.zstd_level > 22) {
+        fprintf(stderr, "[jce_pak] --level must be in [1, 22] (got %d)\n", a.zstd_level);
         exit(1);
     }
 
@@ -736,6 +846,8 @@ int main(int argc, char *argv[]) {
 
     size_t skipped_hidden = 0;
     size_t skipped_excluded = 0;
+    size_t stored_count = 0;
+    uint64_t stored_bytes = 0;
 
     for (size_t fi = 0; fi < files.count; fi++) {
         char *rel = make_relative(files.items[fi], file_bases.items[fi]);
@@ -749,24 +861,71 @@ int main(int argc, char *argv[]) {
         size_t raw_size = 0;
         uint8_t *raw = read_file_bin(files.items[fi], &raw_size);
         e->original_size = raw_size;
+        e->content_hash = XXH3_64bits(raw, raw_size);
+        e->flags = 0;
 
-        size_t bound = ZSTD_compressBound(raw_size);
-        e->compressed = (uint8_t *)malloc(bound);
-        if (!e->compressed) { fprintf(stderr, "[jce_pak] out of memory\n"); return 1; }
+        /* STORED bypass: already-compressed media or tiny files where the
+         * ZSTD frame header would inflate the payload.  Loader memcpy's
+         * compressed_size == original_size bytes verbatim. */
+        int store_raw =
+            !args.no_store_opt && (jce_pak_is_already_compressed(rel) || raw_size < 256);
 
-        size_t comp_sz = ZSTD_compressCCtx(cctx, e->compressed, bound, raw, raw_size, 3);
-        free(raw);
+        if (store_raw) {
+            e->compressed = (uint8_t *)malloc(raw_size ? raw_size : 1);
+            if (!e->compressed) {
+                fprintf(stderr, "[jce_pak] out of memory\n");
+                return 1;
+            }
+            if (raw_size)
+                memcpy(e->compressed, raw, raw_size);
+            e->compressed_size = raw_size;
+            e->flags |= JPAK_FLAG_STORED;
+            stored_count++;
+            stored_bytes += raw_size;
+            free(raw);
+        } else {
+            size_t bound = ZSTD_compressBound(raw_size);
+            e->compressed = (uint8_t *)malloc(bound);
+            if (!e->compressed) {
+                fprintf(stderr, "[jce_pak] out of memory\n");
+                return 1;
+            }
 
-        if (ZSTD_isError(comp_sz)) {
-            fprintf(stderr, "[jce_pak] ZSTD error compressing %s: %s\n",
-                    rel, ZSTD_getErrorName(comp_sz));
-            return 1;
+            size_t comp_sz =
+                ZSTD_compressCCtx(cctx, e->compressed, bound, raw, raw_size, args.zstd_level);
+            free(raw);
+
+            if (ZSTD_isError(comp_sz)) {
+                fprintf(stderr, "[jce_pak] ZSTD error compressing %s: %s\n", rel,
+                        ZSTD_getErrorName(comp_sz));
+                return 1;
+            }
+
+            /* Fallback: if zstd somehow produced a larger output (very small
+             * inputs or already-entropy-coded), promote to STORED to avoid
+             * negative ratios. */
+            if (comp_sz >= e->original_size && e->original_size > 0) {
+                /* Re-read to store raw — cheaper than a second buffer. */
+                uint8_t *raw2 = read_file_bin(files.items[fi], &raw_size);
+                memcpy(e->compressed, raw2, raw_size);
+                free(raw2);
+                e->compressed_size = raw_size;
+                e->flags |= JPAK_FLAG_STORED;
+                stored_count++;
+                stored_bytes += raw_size;
+            } else {
+                e->compressed_size = comp_sz;
+            }
         }
-        e->compressed_size = comp_sz;
         num_entries++;
     }
 
     ZSTD_freeCCtx(cctx);
+
+    if (stored_count > 0) {
+        printf("[jce_pak] stored (uncompressed): %zu entries, %.2f MB\n", stored_count,
+               (double)stored_bytes / (1024.0 * 1024.0));
+    }
 
     sl_free(&files);
     sl_free(&file_bases);
@@ -824,6 +983,9 @@ int main(int argc, char *argv[]) {
         buf_le64(&pak, e->data_offset);
         buf_le64(&pak, e->compressed_size);
         buf_le64(&pak, e->original_size);
+        buf_le32(&pak, e->flags);
+        buf_le32(&pak, 0); /* _pad */
+        buf_le64(&pak, e->content_hash);
     }
 
     /* Names section. */

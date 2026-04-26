@@ -3,11 +3,12 @@
  */
 
 #include <jce/middleware/animation/jce_skinned_mesh.h>
-#include "renderer/jce_renderer_internal.h"
 #include <jce/os/core/jce_log.h>
 
-#include <bgfx/c99/bgfx.h>
 #include "os/core/jce_memory.h"
+#include "renderer/jce_renderer_internal.h"
+
+#include <bgfx/c99/bgfx.h>
 #include <string.h>
 
 #define LOG_TAG "jce_skinned_mesh"

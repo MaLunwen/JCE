@@ -15,9 +15,10 @@
 extern "C" {
 #endif
 
-#include <jce/renderer/jce_texture.h>
 #include <jce/renderer/jce_mesh.h>
+#include <jce/renderer/jce_texture.h>
 #include <jce/resource/jce_asset.h>
+
 #include "jce_model_loader_assimp.h"
 
 typedef struct JceEditorMaterialExtractResult {

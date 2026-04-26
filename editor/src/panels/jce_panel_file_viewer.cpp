@@ -8,22 +8,24 @@
  *   jce_fv_hex.cpp    — Hex dump + Scene viewer
  */
 
-#include "viewers/jce_fv_common.h"
-#include "jce_editor_state.h"
 #include "jce_editor_file_util.h"
+#include "jce_editor_state.h"
+#include "viewers/jce_fv_common.h"
+
 #include <imgui_internal.h>
 
+#include <filesystem>
 #include <string>
 #include <vector>
-#include <filesystem>
 
 extern "C" {
-#include <SDL3_image/SDL_image.h>
+#include <jce/os/platform/jce_host_shell.h>
+#include <jce/renderer/jce_image.h>
+#include <jce/renderer/jce_pbr_material.h>
+
 #include <SDL3/SDL_iostream.h>
 #include <SDL3/SDL_surface.h>
-#include <jce/renderer/jce_pbr_material.h>
-#include <jce/os/platform/jce_host_shell.h>
-#include <jce/third_party/stb_image.h>
+#include <SDL3_image/SDL_image.h>
 }
 
 #include <bgfx/c99/bgfx.h>
@@ -415,9 +417,9 @@ void jce_file_viewer_open(const char *path)
         /* stb_image fallback for HDR files — SDL3_image has no HDR codec. */
         if (!surf && ext && strcmp(ext, ".hdr") == 0) {
             int hdr_w = 0, hdr_h = 0, hdr_ch = 0;
-            float *hdr_pixels = stbi_loadf_from_memory(
-                (const stbi_uc *)buf, (int)actually_read,
-                &hdr_w, &hdr_h, &hdr_ch, 4);
+            float *hdr_pixels =
+                jce_image_load_hdr_from_memory(buf, (uint64_t)actually_read, &hdr_w, &hdr_h);
+            (void)hdr_ch;
             if (hdr_pixels && hdr_w > 0 && hdr_h > 0) {
                 /* Tone-map float HDR → RGBA32 for preview. */
                 surf = SDL_CreateSurface(hdr_w, hdr_h, SDL_PIXELFORMAT_RGBA32);
@@ -438,9 +440,9 @@ void jce_file_viewer_open(const char *path)
                         dst[px * 4 + 3] = 255;
                     }
                 }
-                stbi_image_free(hdr_pixels);
+                jce_image_free_hdr(hdr_pixels);
             } else if (hdr_pixels) {
-                stbi_image_free(hdr_pixels);
+                jce_image_free_hdr(hdr_pixels);
             }
         }
         /* HDR files produce float surfaces — tone-map to RGBA32 for preview. */

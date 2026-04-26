@@ -7,32 +7,35 @@
  */
 
 #include "jce_editor_panels.h"
-#include "jce_editor_state.h"
-#include "jce_editor_colors.h"
-#include "jce_editor_defaults.h"
-#include "jce_editor_i18n.h"
-#include "jce_editor_style.h"
-#include "jce_editor_config.h"
+
 #include "jce_editor.h"
 #include "jce_editor_alloc.h"
+#include "jce_editor_colors.h"
+#include "jce_editor_config.h"
+#include "jce_editor_defaults.h"
+#include "jce_editor_i18n.h"
+#include "jce_editor_state.h"
+#include "jce_editor_style.h"
 #include "viewers/jce_file_viewer.h"
 
+#include <ctype.h>
 #include <imgui.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
 
 extern "C" {
+#include <jce/application/jce_config.h>
+#include <jce/jce_version.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_timer.h>
-#include <jce/application/jce_config.h>
 #include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_renderer_caps.h>
-#include <jce/jce_version.h>
-#include <SDL3/SDL.h>
+
 #include "io/jce_editor_file_util.h"
+
+#include <SDL3/SDL.h>
 }
 
 #define LOG_TAG "editor_panels"

@@ -17,11 +17,12 @@
 #define JCE_HANDLE_H
 
 
+#include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_defs.h>
-#include <stdint.h>
+
 #include <stdbool.h>
 #include <stddef.h>
-#include <jce/os/core/jce_allocator.h>
+#include <stdint.h>
 
 JCE_EXTERN_C_BEGIN
 

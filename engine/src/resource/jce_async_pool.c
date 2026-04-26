@@ -13,20 +13,21 @@
  */
 
 #include "jce_async_pool.h"
-#include "os/core/jce_memory.h"
-#include "jce_asset_reader.h"
-#include <jce/os/core/pak_loader.h>
-#include <jce/resource/jce_asset_format.h>
+
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/os/core/jce_thread.h>
+#include <jce/os/core/pak_loader.h>
+#include <jce/resource/jce_asset_format.h>
+
+#include "jce_asset_reader.h"
+#include "os/core/jce_memory.h"
 
 #include <SDL3/SDL.h>
 #include <SDL3_image/SDL_image.h>
-
-#include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #ifndef JCE_NO_AUDIO
 #include <miniaudio.h>

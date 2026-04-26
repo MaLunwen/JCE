@@ -2,15 +2,16 @@
  * jce_mesh.c  GPU mesh implementation.
  */
 
-#include <jce/renderer/jce_mesh.h>
-#include "jce_renderer_internal.h"
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
+#include <jce/renderer/jce_mesh.h>
+
+#include "jce_renderer_internal.h"
+#include "os/core/jce_memory.h"
 
 #include <bgfx/c99/bgfx.h>
-#include "os/core/jce_memory.h"
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define LOG_TAG "jce_mesh"
 

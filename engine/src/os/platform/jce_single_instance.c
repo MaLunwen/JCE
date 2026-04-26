@@ -2,9 +2,8 @@
  * jce_single_instance.c  Cross-platform process single-instance lock.
  */
 
-#include <jce/os/platform/jce_single_instance.h>
-
 #include <jce/os/core/jce_log.h>
+#include <jce/os/platform/jce_single_instance.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -19,9 +18,9 @@ static HANDLE s_single_mutex = NULL;
 
 #else
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/file.h>
 #include <sys/stat.h>
-#include <fcntl.h>
 #include <unistd.h>
 
 static int  s_lock_fd = -1;

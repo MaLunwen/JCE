@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 # ── MUST be set before project() ──
 set(CMAKE_SUPPRESS_REGENERATION TRUE)
 
-project(JCE VERSION 0.7.1 LANGUAGES C)
+project(JCE VERSION 0.7.6 LANGUAGES C)
 
 # CXX is needed for C++ dependencies (bgfx, assimp, imgui) and the editor.
 enable_language(CXX)
@@ -319,6 +319,41 @@ include("${JCE_TOOLS_DIR}/compile_shaders.cmake")
 
 set(JCE_SHADER_OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/engine/resources/assets/shaders")
 
+# ── Per-platform shader profile selection ───────────────────────────
+# Compile (and pak) only the bgfx renderer back-ends that the target
+# platform can actually load.  Saves compile time and keeps shipped
+# .pak slim (e.g. no Metal binaries on Windows builds).
+#
+# Override at configure time with -DJCE_SHADER_PROFILES="dx11;spv".
+if(NOT JCE_SHADER_PROFILES)
+	if(JCE_PLATFORM_WINDOWS)
+		set(JCE_SHADER_PROFILES dx11 spv glsl)
+	elseif(JCE_PLATFORM_MACOS OR JCE_PLATFORM_IOS)
+		set(JCE_SHADER_PROFILES mtl spv)
+	elseif(JCE_PLATFORM_ANDROID)
+		set(JCE_SHADER_PROFILES essl spv)
+	elseif(JCE_PLATFORM_WEB)
+		set(JCE_SHADER_PROFILES essl)
+	elseif(JCE_PLATFORM_LINUX)
+		set(JCE_SHADER_PROFILES spv glsl)
+	else()
+		set(JCE_SHADER_PROFILES dx11 spv glsl essl mtl)
+	endif()
+endif()
+message(STATUS "JCE shader profiles: ${JCE_SHADER_PROFILES}")
+
+# Build a list of `--exclude-suffix _<sfx>.bin` flags for jce_pak so
+# that any *stale* shader binaries left in the shared output dir (from
+# a previous build for another platform) are not packed into the .pak.
+set(_all_shader_suffixes dx11 spv glsl essl mtl)
+set(JCE_PAK_SHADER_EXCLUDE_FLAGS "")
+foreach(_sfx IN LISTS _all_shader_suffixes)
+	if(NOT _sfx IN_LIST JCE_SHADER_PROFILES)
+		list(APPEND JCE_PAK_SHADER_EXCLUDE_FLAGS
+			--exclude-suffix "_${_sfx}.bin")
+	endif()
+endforeach()
+
 jce_compile_shaders(
 	TARGET        CompileShaders
 	SHADER_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/standard"
@@ -565,6 +600,27 @@ else()
 endif()
 
 # ── Game assets PAK (engine base + caged_kingdom) ──
+
+# Locate Python early so the HTML report generator can be wired into the
+# pak custom commands.  Optional: if missing, the report step is skipped.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_FOUND)
+	set(_PAK_REPORT_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_pak_report.py")
+endif()
+
+# zstd compression level: high effort for Release/Dist (ship size matters),
+# default 3 for Debug/RelWithDebInfo (iteration speed matters).  Override
+# with -DJCE_PAK_LEVEL=N at configure time.
+if(NOT DEFINED JCE_PAK_LEVEL)
+	if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "Dist")
+		set(JCE_PAK_LEVEL 19)
+	else()
+		set(JCE_PAK_LEVEL 3)
+	endif()
+endif()
+set(_PAK_LEVEL_FLAGS --level ${JCE_PAK_LEVEL})
+message(STATUS "JCE PAK zstd level: ${JCE_PAK_LEVEL}")
+
 set(GAME_PAK_FILE       "${CMAKE_CURRENT_BINARY_DIR}/game_assets.pak")
 set(GAME_PAK_OBJ_FILE   "${CMAKE_CURRENT_BINARY_DIR}/game_assets_pak.obj")
 set(GAME_PAK_C_ARRAY    "${CMAKE_CURRENT_BINARY_DIR}/game_assets_pak_data.c")
@@ -580,6 +636,15 @@ else()
 	set(_GAME_OBJ_FLAGS --obj-format none)
 endif()
 
+if(Python3_FOUND)
+	set(_GAME_REPORT_CMD COMMAND "${Python3_EXECUTABLE}" "${_PAK_REPORT_SCRIPT}"
+		"${GAME_MANIFEST_FILE}"
+		"${CMAKE_CURRENT_BINARY_DIR}/reports/game_assets_report.html"
+		--title "Game Assets Report")
+else()
+	set(_GAME_REPORT_CMD "")
+endif()
+
 add_custom_command(
 	OUTPUT     "${GAME_STAMP_FILE}"
 	BYPRODUCTS "${GAME_PAK_FILE}" "${GAME_PAK_OBJ_FILE}" "${GAME_PAK_C_ARRAY}" "${GAME_HEADER_FILE}" "${GAME_MANIFEST_FILE}"
@@ -587,10 +652,13 @@ add_custom_command(
 	COMMAND    $<TARGET_FILE:jce_pak>
 	           ${_GAME_PAK_RES_FLAGS}
 	           --exclude-segment raw_assets
+	           ${JCE_PAK_SHADER_EXCLUDE_FLAGS}
+	           ${_PAK_LEVEL_FLAGS}
 	           --pak-file      "${GAME_PAK_FILE}"
 	           --header-file   "${GAME_HEADER_FILE}"
 	           --manifest-file "${GAME_MANIFEST_FILE}"
 	           ${_GAME_OBJ_FLAGS}
+	${_GAME_REPORT_CMD}
 	COMMAND    "${CMAKE_COMMAND}" -E touch "${GAME_STAMP_FILE}"
 	DEPENDS    jce_pak ${ENGINE_ASSET_FILES} ${GAME_ASSET_FILES}
 	           ${ENGINE_UI_FILES} ${GAME_UI_FILES}
@@ -626,16 +694,28 @@ else()
 	set(_EDITOR_OBJ_FLAGS --obj-format none)
 endif()
 
+if(Python3_FOUND)
+	set(_EDITOR_REPORT_CMD COMMAND "${Python3_EXECUTABLE}" "${_PAK_REPORT_SCRIPT}"
+		"${EDITOR_MANIFEST_FILE}"
+		"${CMAKE_CURRENT_BINARY_DIR}/reports/editor_assets_report.html"
+		--title "Editor Assets Report")
+else()
+	set(_EDITOR_REPORT_CMD "")
+endif()
+
 add_custom_command(
 	OUTPUT     "${EDITOR_STAMP_FILE}"
 	BYPRODUCTS "${EDITOR_PAK_FILE}" "${EDITOR_PAK_OBJ_FILE}" "${EDITOR_PAK_C_ARRAY}" "${EDITOR_HEADER_FILE}" "${EDITOR_MANIFEST_FILE}"
 	COMMAND    $<TARGET_FILE:jce_pak>
 	           ${_EDITOR_PAK_RES_FLAGS}
 	           --exclude-segment raw_assets
+	           ${JCE_PAK_SHADER_EXCLUDE_FLAGS}
+	           ${_PAK_LEVEL_FLAGS}
 	           --pak-file      "${EDITOR_PAK_FILE}"
 	           --header-file   "${EDITOR_HEADER_FILE}"
 	           --manifest-file "${EDITOR_MANIFEST_FILE}"
 	           ${_EDITOR_OBJ_FLAGS}
+	${_EDITOR_REPORT_CMD}
 	COMMAND    "${CMAKE_COMMAND}" -E touch "${EDITOR_STAMP_FILE}"
 	DEPENDS    jce_pak ${ENGINE_ASSET_FILES} ${EDITOR_ASSET_FILES}
 	           ${ENGINE_UI_FILES}
@@ -667,6 +747,65 @@ add_subdirectory(caged_kingdom)
 # ── Dist mode: suppress all logging ──
 if(JCE_BUILD_VARIANT STREQUAL "dist")
 	target_compile_definitions(jce_core PUBLIC JCE_DIST=1)
+endif()
+
+# ------------------------------------------------------------------ #
+# Public-header dependency guard                                      #
+#                                                                     #
+# Fails the build if any header under engine/include/jce/ pulls in a  #
+# third-party header (SDL, bgfx, cglm, imgui, ...).  Guarantees the   #
+# "users only call our API" invariant.                                #
+# ------------------------------------------------------------------ #
+
+option(JCE_ENABLE_PUBLIC_API_GUARD "Enable public-header leak guard" ON)
+if(JCE_ENABLE_PUBLIC_API_GUARD)
+	find_package(Python3 COMPONENTS Interpreter QUIET)
+	if(Python3_FOUND)
+		add_custom_target(check_public_api
+			COMMAND ${Python3_EXECUTABLE}
+				"${CMAKE_SOURCE_DIR}/tools/check_public_headers.py"
+			WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+			COMMENT "Verifying public headers have no third-party leaks"
+			VERBATIM)
+	endif()
+endif()
+
+# ------------------------------------------------------------------ #
+# Code-style targets: clang-format                                    #
+#                                                                     #
+# `format`       — apply formatting in-place                          #
+# `format-check` — fail if any file would be reformatted (CI gate)    #
+# Excludes vendored third_party trees and Conan caches.               #
+# ------------------------------------------------------------------ #
+
+find_program(CLANG_FORMAT_EXECUTABLE NAMES clang-format
+	HINTS
+		"C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/Llvm/x64/bin"
+		"C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/Llvm/bin")
+if(CLANG_FORMAT_EXECUTABLE)
+	file(GLOB_RECURSE _jce_fmt_files
+		"${CMAKE_SOURCE_DIR}/engine/include/*.h"
+		"${CMAKE_SOURCE_DIR}/engine/src/*.c"
+		"${CMAKE_SOURCE_DIR}/engine/src/*.h"
+		"${CMAKE_SOURCE_DIR}/editor/src/*.cpp"
+		"${CMAKE_SOURCE_DIR}/editor/src/*.h"
+		"${CMAKE_SOURCE_DIR}/caged_kingdom/src/*.c"
+		"${CMAKE_SOURCE_DIR}/caged_kingdom/src/*.h")
+	list(FILTER _jce_fmt_files EXCLUDE REGEX "/third_party/")
+	list(FILTER _jce_fmt_files EXCLUDE REGEX "/internal/stb_image\\.h$")
+
+	add_custom_target(format
+		COMMAND ${CLANG_FORMAT_EXECUTABLE} -i --style=file ${_jce_fmt_files}
+		WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+		COMMENT "Formatting JCE C/C++ sources via clang-format"
+		VERBATIM)
+
+	add_custom_target(format-check
+		COMMAND ${CLANG_FORMAT_EXECUTABLE}
+			--dry-run --Werror --style=file ${_jce_fmt_files}
+		WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+		COMMENT "Checking JCE source formatting"
+		VERBATIM)
 endif()
 
 # ------------------------------------------------------------------ #

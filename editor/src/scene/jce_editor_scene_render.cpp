@@ -7,18 +7,18 @@
  * hover, physics debug) and the editor's PostFX bloom/tonemap chain.
  */
 
-#include "jce_scene_render_internal.h"
+#include <jce/os/core/jce_timer.h>
+
 #include "jce_editor_file_util.h"
+#include "jce_scene_render_internal.h"
 
 #include <cstdio>
 
-#include <jce/os/core/jce_timer.h>
-
 extern "C" {
-#include <jce/renderer/jce_postfx.h>
-#include <jce/renderer/jce_model.h>
 #include <jce/middleware/animation/jce_animation.h>
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/renderer/jce_model.h>
+#include <jce/renderer/jce_postfx.h>
 }
 
 /* ── State instance (shared via extern in internal header) ────────── */

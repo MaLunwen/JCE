@@ -23,16 +23,16 @@ extern "C" {
 #include <jce/os/core/jce_math.h>
 #include <jce/renderer/jce_camera.h>
 #include <jce/renderer/jce_debug_draw.h>
-#include <jce/renderer/jce_offscreen_target.h>
 #include <jce/renderer/jce_lighting.h>
 #include <jce/renderer/jce_material.h>
 #include <jce/renderer/jce_mesh.h>
+#include <jce/renderer/jce_offscreen_target.h>
 #include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_renderer_caps.h>
+#include <jce/renderer/jce_scene_renderer.h>
 #include <jce/renderer/jce_shaders.h>
 #include <jce/renderer/jce_texture.h>
 #include <jce/renderer/jce_views.h>
-#include <jce/renderer/jce_scene_renderer.h>
 }
 
 #define LOG_TAG "scene_render"

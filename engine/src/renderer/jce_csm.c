@@ -103,12 +103,16 @@ void jce_csm_compute(JceCsmData *out,
             float d = jce_v3_len(jce_v3_sub(corners[i], center));
             if (d > radius) radius = d;
         }
-        /* Quantize radius to shadow-map-aligned steps to reduce shimmer
-         * during camera rotation and small frustum changes. */
+        /* Quantize radius to a single texel step so the bounding sphere
+         * grows in atomic shadow-texel increments.  Combined with the
+         * texel-aligned snap below this is sufficient to eliminate
+         * shimmer during camera rotation and small frustum changes.
+         * Earlier code over-quantized (4 texel + 0.25 m bucket) which
+         * fought against the snap and produced visible cascade jumps. */
         {
             float texel_approx = (radius * 2.0f) / (float)shadow_map_size;
-            float quant = fmaxf(texel_approx * 4.0f, 0.25f);
-            radius = ceilf(radius / quant) * quant;
+            if (texel_approx > 0.0f)
+                radius = ceilf(radius / texel_approx) * texel_approx;
         }
 
         /* Light view matrix: look from center along light direction. */

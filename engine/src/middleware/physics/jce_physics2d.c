@@ -7,15 +7,14 @@
 
 #include <jce/middleware/physics/jce_physics2d.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_math.h>
+
 #include "os/core/jce_memory.h"
 
 #include <box2d/box2d.h>
-
-#include <jce/os/core/jce_math.h>
-
-#include <string.h>
 #include <math.h>
 #include <stdint.h>
+#include <string.h>
 
 #define LOG_TAG        "physics2d"
 #define SUB_STEP_COUNT 4

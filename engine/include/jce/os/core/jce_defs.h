@@ -142,4 +142,22 @@
 #endif
 #endif
 
+/* -- ABI-stable scalar typedefs ------------------------------------ */
+/*
+ * Foreign-language bindings (JNI, C#, Python ctypes, Wasm imports, ...)
+ * cannot reliably interoperate with `size_t` (LP64 vs LLP64) or the C99
+ * `_Bool` (sizeof varies between 1 and 4 bytes across ABIs).  New JCE
+ * public APIs SHOULD use these stable aliases so binding generators do
+ * not need per-platform plumbing.  Existing APIs that already use
+ * `size_t`/`bool` remain valid; migrate opportunistically.
+ */
+typedef uint64_t JceSize;  /* sizes / counts in the public ABI */
+typedef int64_t JceOffset; /* signed offsets / cursor positions */
+typedef uint8_t JceBool;   /* boolean values; 0 = false, !=0 = true */
+
+#ifndef JCE_TRUE
+#define JCE_TRUE ((JceBool)1)
+#define JCE_FALSE ((JceBool)0)
+#endif
+
 #endif /* JCE_DEFS_H */

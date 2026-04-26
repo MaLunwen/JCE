@@ -6,28 +6,30 @@
  */
 
 #include "jce_editor.h"
+
+#include <jce/os/core/jce_timer.h>
+
+#include "gizmo/jce_gizmo.h"
 #include "jce_editor_alloc.h"
 #include "jce_editor_config.h"
-#include "jce_imgui_bgfx.h"
+#include "jce_editor_i18n.h"
 #include "jce_editor_layout.h"
 #include "jce_editor_panels.h"
-#include "jce_editor_style.h"
-#include "jce_editor_i18n.h"
 #include "jce_editor_state.h"
+#include "jce_editor_style.h"
+#include "jce_imgui_bgfx.h"
 #include "jce_run_manager.h"
-#include "gizmo/jce_gizmo.h"
 
 #include <imgui.h>
 #include <SDL3/SDL.h>
-#include <jce/os/core/jce_timer.h>
-#include <string.h>
 #include <stdio.h>
+#include <string.h>
 
 extern "C" {
-#include <jce/renderer/jce_views.h>
-#include <jce/os/platform/jce_window.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/pak_loader.h>
+#include <jce/os/platform/jce_window.h>
+#include <jce/renderer/jce_views.h>
 }
 
 #define LOG_TAG "editor"

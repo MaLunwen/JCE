@@ -3,6 +3,7 @@
  */
 
 #include <jce/renderer/jce_lighting.h>
+
 #include "jce_renderer_internal.h"
 
 #include <bgfx/c99/bgfx.h>

@@ -8,8 +8,8 @@
 #ifndef JCE_TEX_COMPRESS_H
 #define JCE_TEX_COMPRESS_H
 
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {

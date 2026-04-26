@@ -17,10 +17,11 @@
 #define JCE_UI_H
 
 
+#include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_defs.h>
+
 #include <stdbool.h>
 #include <stdint.h>
-#include <jce/os/core/jce_allocator.h>
 
 JCE_EXTERN_C_BEGIN
 

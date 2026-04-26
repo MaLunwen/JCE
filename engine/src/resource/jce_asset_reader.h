@@ -19,6 +19,7 @@
 #define JCE_ASSET_READER_H
 
 #include <jce/resource/jce_asset_format.h>
+
 #include <stdbool.h>
 #include <stddef.h>
 

@@ -5,19 +5,20 @@
  * Handles pixel format conversion to RGBA8 for bgfx compatibility.
  */
 
-#include <jce/renderer/jce_texture.h>
-#include <jce/os/core/pak_loader.h>
-#include <jce/resource/jce_asset_format.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
+#include <jce/os/core/pak_loader.h>
+#include <jce/renderer/jce_texture.h>
+#include <jce/resource/jce_asset_format.h>
+
+#include "os/core/jce_memory.h"
+#include "resource/jce_asset_reader.h"
 
 #include <bgfx/c99/bgfx.h>
 #include <SDL3/SDL.h>
 #include <SDL3_image/SDL_image.h>
-#include "os/core/jce_memory.h"
-#include "resource/jce_asset_reader.h"
-#include <string.h>
 #include <stdbool.h>
+#include <string.h>
 
 #define LOG_TAG "jce_texture"
 

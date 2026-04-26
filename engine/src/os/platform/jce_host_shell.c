@@ -15,7 +15,6 @@
 #include <SDL3/SDL_process.h>
 #include <SDL3/SDL_properties.h>
 #include <SDL3/SDL_stdinc.h>
-
 #include <stdio.h>
 #include <string.h>
 

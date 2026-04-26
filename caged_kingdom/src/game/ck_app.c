@@ -8,12 +8,14 @@
  */
 
 #include "ck_app.h"
+
 #include <jce/api.h>
-#include <jce/resource/jce_scene_serial.h>
 #include <jce/os/core/jce_filesystem.h>
-#include <string.h>
+#include <jce/resource/jce_scene_serial.h>
+
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>

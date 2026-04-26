@@ -13,16 +13,17 @@
  * so the on-disk format can never diverge between tools.
  */
 
-#include <jce/resource/jce_scene_serial.h>
-#include <jce/resource/jce_scene_contract.h>
 #include <jce/middleware/scene/jce_scene.h>
-#include <jce/middleware/scene/jce_scene_components_json.h>      /* canonical (de)serializer */
+#include <jce/middleware/scene/jce_scene_components_json.h> /* canonical (de)serializer */
 #include <jce/os/core/jce_filesystem.h>
-#include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_json.h>
+#include <jce/os/core/jce_log.h>
+#include <jce/resource/jce_scene_contract.h>
+#include <jce/resource/jce_scene_serial.h>
+
+#include "os/core/jce_memory.h"
 
 #include <string.h>
-#include "os/core/jce_memory.h"
 
 #define LOG_TAG "scene_serial"
 

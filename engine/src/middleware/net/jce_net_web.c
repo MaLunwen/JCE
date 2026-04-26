@@ -20,10 +20,9 @@
 #include <jce/os/core/jce_log.h>
 
 #include <emscripten/websocket.h>
-
-#include <string.h>
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define LOG_TAG "net_web"
 

@@ -13,10 +13,11 @@
 #endif
 #endif
 
+#include "os/core/jce_memory.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "os/core/jce_memory.h"
 
 #define MP4D_INFO_SUPPORTED 1
 #define MP4D_PRINT_INFO_SUPPORTED 0

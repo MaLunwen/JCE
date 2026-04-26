@@ -5,27 +5,28 @@
 #ifndef JCE_PANEL_ASSETS_INTERNAL_H
 #define JCE_PANEL_ASSETS_INTERNAL_H
 
-#include "jce_editor_panels.h"
+#include <jce/os/core/jce_filesystem.h>
+#include <jce/os/platform/jce_host_shell.h>
+
 #include "jce_editor_colors.h"
 #include "jce_editor_defaults.h"
 #include "jce_editor_i18n.h"
-#include "viewers/jce_file_viewer.h"
+#include "jce_editor_layout.h"
+#include "jce_editor_panels.h"
 #include "jce_editor_state.h"
 #include "scene/jce_editor_scene_render.h"
-#include "jce_editor_layout.h"
+#include "viewers/jce_file_viewer.h"
 
 #include <imgui.h>
 #include <stdio.h>
 #include <string.h>
-#include <filesystem>
-#include <algorithm>
-#include <vector>
-#include <string>
-#include <set>
-#include <unordered_map>
 
-#include <jce/os/platform/jce_host_shell.h>
-#include <jce/os/core/jce_filesystem.h>
+#include <algorithm>
+#include <filesystem>
+#include <set>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace fs = std::filesystem;
 

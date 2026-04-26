@@ -7,15 +7,15 @@
 
 #include "jce_imgui_bgfx.h"
 
-#include <imgui.h>
 #include <bgfx/c99/bgfx.h>
+#include <imgui.h>
 #include <string.h>
 
 extern "C" {
-#include <jce/renderer/jce_shaders.h>
-#include <jce/renderer/jce_views.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
+#include <jce/renderer/jce_shaders.h>
+#include <jce/renderer/jce_views.h>
 }
 
 #define LOG_TAG "imgui_bgfx"

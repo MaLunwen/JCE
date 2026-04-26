@@ -10,9 +10,10 @@
 #ifndef JCE_UI_BACKEND_H
 #define JCE_UI_BACKEND_H
 
-#include <stdint.h>
-#include <stdbool.h>
 #include <jce/os/core/jce_allocator.h>
+
+#include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {

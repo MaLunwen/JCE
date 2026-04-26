@@ -5,18 +5,18 @@
 #ifndef JCE_PANEL_HIERARCHY_INTERNAL_H
 #define JCE_PANEL_HIERARCHY_INTERNAL_H
 
-#include "jce_editor_panels.h"
-#include "jce_editor_state.h"
 #include "jce_editor_colors.h"
 #include "jce_editor_defaults.h"
 #include "jce_editor_i18n.h"
 #include "jce_editor_layout.h"
+#include "jce_editor_panels.h"
+#include "jce_editor_state.h"
 #include "scene/jce_editor_scene_render.h"
 
 #include <imgui.h>
-#include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* ── Tag colors (display data) ────────────────────────────────────── */
 

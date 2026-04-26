@@ -9,10 +9,9 @@
 
 #include <cjson/cJSON.h>
 #include <SDL3/SDL.h>
-
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* ── Lifecycle ─────────────────────────────────────────────────────── */
 

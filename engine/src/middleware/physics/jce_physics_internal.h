@@ -11,8 +11,9 @@
 
 #include <jce/middleware/physics/jce_physics_types.h>
 #include <jce/os/core/jce_math.h>
-#include <stdint.h>
+
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {

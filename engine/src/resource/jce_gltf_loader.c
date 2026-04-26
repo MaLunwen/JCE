@@ -6,21 +6,22 @@
  * GLB binary blob decompressed from the PAK archive.
  */
 
-#include <cgltf.h>
-
 #include "jce_gltf_loader.h"
-#include <jce/os/core/pak_loader.h>
-#include "renderer/jce_model_internal.h"
-#include <jce/renderer/jce_texture.h>
-#include <jce/renderer/jce_mesh.h>
-#include <jce/middleware/animation/jce_skinned_mesh.h>
+
 #include <jce/middleware/animation/jce_skeleton.h>
-#include "middleware/animation/jce_animation.h"
+#include <jce/middleware/animation/jce_skinned_mesh.h>
+#include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
-#include <jce/os/core/jce_filesystem.h>
-#include "os/core/jce_memory.h"
+#include <jce/os/core/pak_loader.h>
+#include <jce/renderer/jce_mesh.h>
+#include <jce/renderer/jce_texture.h>
 
+#include "middleware/animation/jce_animation.h"
+#include "os/core/jce_memory.h"
+#include "renderer/jce_model_internal.h"
+
+#include <cgltf.h>
 #include <SDL3/SDL.h>
 #include <SDL3_image/SDL_image.h>
 #include <stdio.h>

@@ -5,14 +5,14 @@
  * using BGFX_STATE_PT_LINES.
  */
 
-#include <jce/renderer/jce_debug_draw.h>
-#include <jce/renderer/jce_renderer.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
+#include <jce/renderer/jce_debug_draw.h>
+#include <jce/renderer/jce_renderer.h>
 
 #include <bgfx/c99/bgfx.h>
-#include <string.h>
 #include <math.h>
+#include <string.h>
 
 #define LOG_TAG "debug_draw"
 

@@ -6,22 +6,23 @@
  */
 
 #include "jce_model_loader_assimp.h"
-#include "jce_editor_alloc.h"
+
 #include "io/jce_editor_file_util.h"
+#include "jce_editor_alloc.h"
 
 extern "C" {
 #include <jce/os/core/jce_log.h>
 }
 
 #include <assimp/Importer.hpp>
-#include <assimp/scene.h>
-#include <assimp/postprocess.h>
 #include <assimp/material.h>
+#include <assimp/postprocess.h>
+#include <assimp/scene.h>
 
-#include <cstring>
 #include <cstdio>
-#include <string>
+#include <cstring>
 #include <filesystem>
+#include <string>
 
 namespace fs = std::filesystem;
 

@@ -23,8 +23,9 @@
 #define JCE_ASSET_COOKER_H
 
 #include <jce/resource/jce_asset_format.h>
-#include <stddef.h>
+
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -76,10 +77,8 @@ typedef struct JceCookOptions {
 	bool force_power_of_two;
 } JceCookOptions;
 
-#define JCE_COOK_DEFAULT ((JceCookOptions){ \
-	.compression_level = 3, \
-	.platform = JCE_COOK_PLATFORM_AUTO \
-})
+#define JCE_COOK_DEFAULT                                                                           \
+    ((JceCookOptions){.compression_level = 3, .platform = JCE_COOK_PLATFORM_AUTO})
 
 /* ================================================================== */
 /* Cook result                                                         */

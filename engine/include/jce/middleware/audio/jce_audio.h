@@ -8,11 +8,11 @@
 #define JCE_AUDIO_H
 
 
+#include <jce/middleware/audio/jce_audio_types.h>
 #include <jce/os/core/jce_defs.h>
+
 #include <stdbool.h>
 #include <stdint.h>
-
-#include <jce/middleware/audio/jce_audio_types.h>
 
 JCE_EXTERN_C_BEGIN
 

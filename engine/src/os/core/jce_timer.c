@@ -6,8 +6,10 @@
  */
 
 #include <jce/os/core/jce_timer.h>
-#include <SDL3/SDL.h>
+
 #include "jce_memory.h"
+
+#include <SDL3/SDL.h>
 
 /* Clamp frame delta to avoid spiral of death after breakpoints / sleep. */
 #define MAX_FRAME_DT 0.25  /* 250 ms (4 FPS minimum) */

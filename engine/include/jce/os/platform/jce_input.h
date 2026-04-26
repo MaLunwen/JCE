@@ -12,8 +12,9 @@
 
 
 #include <jce/os/core/jce_defs.h>
-#include <jce/os/platform/jce_keys.h>
 #include <jce/os/platform/jce_gamepad.h>
+#include <jce/os/platform/jce_keys.h>
+
 #include <stdbool.h>
 #include <stdint.h>
 

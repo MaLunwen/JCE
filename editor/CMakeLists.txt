@@ -15,6 +15,12 @@ file(GLOB_RECURSE EDITOR_SOURCES CONFIGURE_DEPENDS
 
 add_executable(JCE_Editor ${EDITOR_SOURCES})
 
+# Editor is C++17 (per project policy: engine = C99, editor = C++17).
+set_target_properties(JCE_Editor PROPERTIES
+	CXX_STANDARD 17
+	CXX_STANDARD_REQUIRED YES
+	CXX_EXTENSIONS NO)
+
 find_package(assimp REQUIRED)
 target_link_libraries(JCE_Editor PRIVATE
 	JCE assimp::assimp imgui::imgui
@@ -55,7 +61,6 @@ if(CMAKE_BUILD_TYPE)
 endif()
 
 target_compile_definitions(JCE_Editor PRIVATE
-    SDL_MAIN_USE_CALLBACKS=1
     JCE_BUILD_VARIANT_STR="${JCE_BUILD_VARIANT}"
     JCE_PLATFORM_STR="${_jce_platform_str}")
 

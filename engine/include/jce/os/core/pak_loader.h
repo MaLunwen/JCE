@@ -27,6 +27,9 @@ JCE_EXTERN_C_BEGIN
 /* Opaque handle returned by jce_pak_open(). */
 typedef struct JcePakArchive JcePakArchive;
 
+/* Asset entry flags (PAK v2+).  Test with `(asset->flags & JCE_PAK_ASSET_STORED)`. */
+#define JCE_PAK_ASSET_STORED 0x00000001u /* compressed_data is raw bytes */
+
 /* A resolved asset reference.  Returned by jce_pak_find(); the pointer
  * remains valid until jce_pak_close() is called. */
 typedef struct JcePakAsset {
@@ -34,6 +37,8 @@ typedef struct JcePakAsset {
     const uint8_t  *compressed_data;/* pointer into the PAK blob      */
     uint64_t       compressed_size;
     uint64_t       original_size;
+    uint32_t       flags;        /* JPAK_FLAG_* (PAK v2+); 0 if absent */
+    uint64_t       content_hash; /* XXH3 of original bytes (PAK v2+)   */
 } JcePakAsset;
 
 /* -- API ------------------------------------------------------------ */
@@ -64,8 +69,25 @@ size_t jce_pak_decompress(const JcePakAsset *asset, void *buf, size_t buf_size);
 
 /* Like jce_pak_decompress but reuses the archive's ZSTD decompression context
  * for better performance when decompressing many assets sequentially. */
-size_t jce_pak_decompress_ex(const JcePakArchive *pak, const JcePakAsset *asset,
-                         void *buf, size_t buf_size);
+size_t jce_pak_decompress_ex(const JcePakArchive *pak, const JcePakAsset *asset, void *buf,
+                             size_t buf_size);
+
+/* Verify decompressed bytes match the TOC's content_hash (XXH3-64).
+ * Useful after decompression when integrity is critical, or in CI to catch
+ * silent data corruption.  Returns 1 on match, 0 on mismatch.
+ * If the asset has no recorded hash (legacy PAK or hash==0), returns 1. */
+int jce_pak_verify(const JcePakAsset *asset, const void *buf, size_t size);
+
+/* Walk every asset, decompress into a transient buffer, and verify its
+ * content_hash.  Returns the number of mismatches (0 = archive intact).
+ * Allocates and frees a buffer per entry; intended for diagnostics, not
+ * the hot path. */
+uint32_t jce_pak_verify_all(const JcePakArchive *pak);
+
+/* Toggle automatic content_hash verification inside jce_pak_decompress[_ex]().
+ * When enabled, a mismatch causes the decompress call to return 0 even if
+ * ZSTD itself reported success.  Default: disabled (zero-overhead). */
+void jce_pak_set_verify_on_decompress(int enable);
 
 /* Return the number of assets in the archive. */
 uint32_t jce_pak_count(const JcePakArchive *pak);

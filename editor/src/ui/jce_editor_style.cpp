@@ -5,17 +5,18 @@
  */
 
 #include "jce_editor_style.h"
+
 #include "jce_editor_colors.h"
 #include "jce_imgui_bgfx.h"
 
 #include <imgui.h>
-#include <string.h>
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 extern "C" {
-#include <jce/os/core/pak_loader.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/pak_loader.h>
 }
 
 #include <SDL3/SDL.h>

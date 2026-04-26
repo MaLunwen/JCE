@@ -17,19 +17,19 @@
 
 #include <jce/middleware/streaming/jce_streaming.h>
 #include <jce/os/core/jce_filesystem.h>
-#include <jce/os/core/jce_thread.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
+#include <jce/os/core/jce_thread.h>
+#include <jce/os/core/jce_timer.h>
+
 #include "os/core/jce_memory.h"
 
-#include <jce/os/core/jce_timer.h>
-#include <SDL3/SDL_timer.h>
+#include <math.h>
 #include <SDL3/SDL_atomic.h>
-
-#include <string.h>
+#include <SDL3/SDL_timer.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <math.h>
+#include <string.h>
 
 #define LOG_TAG "streaming"
 

@@ -6,16 +6,16 @@
  */
 
 #include <jce/middleware/ui/jce_ui_debug_hud.h>
+#include <jce/os/core/jce_log.h>
+#include <jce/os/platform/jce_window.h>
 #include <jce/renderer/jce_primitives.h>
 #include <jce/renderer/jce_renderer.h>
-#include <jce/os/platform/jce_window.h>
-#include <jce/os/core/jce_log.h>
+
 #include "os/core/jce_memory.h"
 
 #include <bgfx/c99/bgfx.h>
-
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define LOG_TAG "ui.hud"

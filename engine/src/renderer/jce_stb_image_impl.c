@@ -9,4 +9,4 @@
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_HDR            /* compile only the HDR codec */
 #define STBI_NO_STDIO            /* we load from memory, not FILE* */
-#include <jce/third_party/stb_image.h>
+#include "internal/stb_image.h"

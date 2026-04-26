@@ -9,14 +9,15 @@
  */
 
 #include <jce/application/jce_config.h>
-#include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_log.h>
+
 #include "os/core/jce_memory.h"
 
+#include <ctype.h>
 #include <SDL3/SDL.h>
 #include <stdio.h>
 #include <string.h>
-#include <ctype.h>
 
 #define LOG_TAG "jce_config"
 

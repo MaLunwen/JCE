@@ -30,16 +30,16 @@
 
 #ifdef JCE_ENABLE_PATENTED_CODECS
 
-#include "jce_yuv_convert.h"
-#include "os/core/jce_memory.h"
+#include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_log.h>
 
 #include "ihevc_typedefs.h"
+#include "ihevcd_cxa.h"
 #include "iv.h"
 #include "ivd.h"
-#include "ihevcd_cxa.h"
+#include "jce_yuv_convert.h"
+#include "os/core/jce_memory.h"
 
-#include <jce/os/core/jce_allocator.h>
 #include <string.h>
 
 #define LOG_TAG "jce_h265"

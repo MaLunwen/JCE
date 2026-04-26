@@ -39,11 +39,11 @@
 #include <jce/api_platform.h>
 
 /* ── Layer 3: Graphics, Animation, Resources, Audio ──────────────── */
-#include <jce/api_graphics.h>
 #include <jce/api_animation.h>
+#include <jce/api_audio.h>
+#include <jce/api_graphics.h>
 #include <jce/api_resource.h>
 #include <jce/api_streaming.h>
-#include <jce/api_audio.h>
 
 /* ── Layer 4: Render Abstraction ─────────────────────────────────── */
 #include <jce/api_render.h>
@@ -55,9 +55,9 @@
 #include <jce/api_app.h>
 
 /* ── Cross-cutting systems ───────────────────────────────────────── */
-#include <jce/api_physics.h>
-#include <jce/api_net.h>
-#include <jce/api_ui.h>
 #include <jce/api_ai.h>
+#include <jce/api_net.h>
+#include <jce/api_physics.h>
+#include <jce/api_ui.h>
 
 #endif /* JCE_API_H */

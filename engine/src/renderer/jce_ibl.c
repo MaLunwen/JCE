@@ -10,9 +10,10 @@
  * The output textures are uploaded to bgfx as RGBA16F cubemaps / 2D textures.
  */
 
-#include <jce/renderer/jce_ibl.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
+#include <jce/renderer/jce_ibl.h>
+
 #include "os/core/jce_memory.h"
 
 #include <bgfx/c99/bgfx.h>

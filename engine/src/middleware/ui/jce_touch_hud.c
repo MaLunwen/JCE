@@ -20,17 +20,17 @@
  */
 
 #include <jce/middleware/ui/jce_touch_hud.h>
+#include <jce/os/platform/jce_input.h>
+#include <jce/os/platform/jce_window.h>
+#include <jce/renderer/jce_primitives.h>
+#include <jce/renderer/jce_renderer.h>
+#include <jce/renderer/jce_text.h>
 
+#include "os/core/jce_memory.h"
+
+#include <math.h>
 #include <SDL3/SDL.h>
 #include <string.h>
-#include <math.h>
-
-#include <jce/os/platform/jce_window.h>
-#include <jce/os/platform/jce_input.h>
-#include <jce/renderer/jce_renderer.h>
-#include <jce/renderer/jce_primitives.h>
-#include <jce/renderer/jce_text.h>
-#include "os/core/jce_memory.h"
 
 /* ── Configuration ──────────────────────────────────────────────── */
 

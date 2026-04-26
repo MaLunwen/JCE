@@ -16,9 +16,8 @@
 #include <jce/os/core/jce_log.h>
 
 #include <enet/enet.h>
-
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define LOG_TAG "net"
 

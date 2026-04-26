@@ -6,22 +6,22 @@
  * and the scene render model cache for real-time animation preview.
  */
 
-#include "jce_editor_panels.h"
-#include "jce_editor_state.h"
 #include "jce_editor_colors.h"
 #include "jce_editor_defaults.h"
 #include "jce_editor_i18n.h"
+#include "jce_editor_panels.h"
+#include "jce_editor_state.h"
 #include "scene/jce_editor_scene_render.h"
 
 #include <imgui.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
-#include <math.h>
 
 extern "C" {
 #include <jce/middleware/animation/jce_animation.h>
-#include <jce/renderer/jce_model.h>
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/renderer/jce_model.h>
 }
 
 /* ── Timeline state ───────────────────────────────────────────────── */

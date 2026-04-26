@@ -8,10 +8,11 @@
 
 #include <jce/middleware/ui/jce_ui.h>
 #include <jce/os/core/jce_log.h>
+
 #include "jce_ui_backend.h"
 
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define LOG_TAG "ui"
 

@@ -4,13 +4,12 @@
 
 #include <jce/os/core/jce_process.h>
 
+#include "jce_memory.h"
+
 #include <SDL3/SDL_iostream.h>
 #include <SDL3/SDL_process.h>
 #include <SDL3/SDL_properties.h>
 #include <SDL3/SDL_stdinc.h>
-
-#include "jce_memory.h"
-
 #include <stdlib.h>
 #include <string.h>
 

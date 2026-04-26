@@ -45,6 +45,8 @@ function(_jce_add_layer NAME)
 	# Public headers — every layer exposes the same public include root
 	# so that #include <jce/core/jce_log.h> works from any layer.
 	target_include_directories(${NAME} PUBLIC "${_ENGINE_INC}")
+	# Generated headers (e.g. jce_version.h) live under the build tree.
+	target_include_directories(${NAME} PUBLIC "${CMAKE_BINARY_DIR}/include")
 	target_compile_definitions(${NAME} PRIVATE JCE_BUILDING_ENGINE=1)
 
 	# Private: only the layer's own source directories.

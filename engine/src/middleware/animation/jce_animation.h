@@ -11,10 +11,11 @@
 #ifndef JCE_ANIMATION_H
 #define JCE_ANIMATION_H
 
-#include <jce/os/core/jce_math.h>
 #include <jce/middleware/animation/jce_skeleton.h>
-#include <stdint.h>
+#include <jce/os/core/jce_math.h>
+
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {

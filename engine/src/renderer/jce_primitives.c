@@ -3,8 +3,9 @@
  */
 
 #include <jce/renderer/jce_primitives.h>
-#include "jce_renderer_internal.h"
 #include <jce/renderer/jce_views.h>
+
+#include "jce_renderer_internal.h"
 
 typedef struct { float x, y, z; uint32_t abgr; }             PosColorVertex;
 typedef struct { float x, y, z; uint32_t abgr; float u, v; } PosColorTexVertex;

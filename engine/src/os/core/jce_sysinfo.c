@@ -5,9 +5,9 @@
  */
 
 #include <jce/os/core/jce_sysinfo.h>
+#include <jce/os/core/jce_timer.h>
 
 #include <SDL3/SDL.h>
-#include <jce/os/core/jce_timer.h>
 #include <string.h>
 
 #ifdef __EMSCRIPTEN__
@@ -18,6 +18,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+
 #include <psapi.h>
 #elif defined(SDL_PLATFORM_LINUX)
 #include <stdio.h>

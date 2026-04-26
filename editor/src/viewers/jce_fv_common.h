@@ -9,26 +9,26 @@
 #ifndef JCE_FV_COMMON_H
 #define JCE_FV_COMMON_H
 
-#include "jce_file_viewer.h"
 #include "jce_editor_alloc.h"
 #include "jce_editor_colors.h"
 #include "jce_editor_defaults.h"
 #include "jce_editor_i18n.h"
 #include "jce_editor_panels.h"
+#include "jce_file_viewer.h"
 
+#include <ctype.h>
 #include <imgui.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <ctype.h>
-#include <math.h>
 
 extern "C" {
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
-#include <jce/renderer/jce_texture.h>
 #include <jce/os/platform/jce_host_shell.h>
+#include <jce/renderer/jce_texture.h>
 }
 
 /* ══════════════════════════════════════════════════════════════════════

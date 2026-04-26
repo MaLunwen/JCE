@@ -9,6 +9,7 @@
 #define JCE_RENDERER_INTERNAL_H
 
 #include <jce/renderer/jce_renderer.h>
+
 #include <bgfx/c99/bgfx.h>
 
 #ifdef __cplusplus

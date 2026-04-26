@@ -8,20 +8,22 @@
 
 #include <jce/middleware/audio/jce_audio.h>
 #include <jce/middleware/audio/jce_m4a_decode.h>
-#include <jce/middleware/audio/jce_miniaudio_opus_backend.h>
-#include <jce/os/core/pak_loader.h>
-#include <jce/resource/jce_asset_format.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
+#include <jce/os/core/pak_loader.h>
+#include <jce/resource/jce_asset_format.h>
+
+#include "jce_miniaudio_opus_backend.h"
 
 #ifndef JCE_NO_AUDIO
 
-#include <miniaudio.h>
-#include <SDL3/SDL.h>
 #include "os/core/jce_memory.h"
 #include "resource/jce_asset_reader.h"
-#include <stdlib.h>
+
+#include <miniaudio.h>
+#include <SDL3/SDL.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define JCE_MAX_SOUNDS  64

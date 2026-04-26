@@ -11,10 +11,11 @@
 
 
 #include <jce/os/core/jce_defs.h>
-#include <stdbool.h>
-#include <stdint.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/renderer/jce_gfx_types.h>
+
+#include <stdbool.h>
+#include <stdint.h>
 
 JCE_EXTERN_C_BEGIN
 

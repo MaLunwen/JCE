@@ -21,6 +21,7 @@
 
 
 #include <jce/os/core/jce_defs.h>
+
 #include <stdint.h>
 
 JCE_EXTERN_C_BEGIN

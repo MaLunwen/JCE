@@ -13,9 +13,9 @@
  * own jce_editor_*.cpp files.
  */
 
-#include "jce_editor_state_internal.h"
-#include "jce_editor_i18n.h"
 #include "jce_editor_config.h"
+#include "jce_editor_i18n.h"
+#include "jce_editor_state_internal.h"
 
 #include <algorithm>
 

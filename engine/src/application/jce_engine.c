@@ -6,14 +6,15 @@
  * the application via JceAppDesc callbacks.
  */
 
-#include <jce/application/jce_engine.h>
 #include <jce/application/jce_app_interface.h>
+#include <jce/application/jce_engine.h>
+#include <jce/os/core/jce_profiler.h>
+#include <jce/os/core/jce_thread.h>
+#include <jce/os/core/jce_timer.h>
+
+#include "os/core/jce_memory.h"
 
 #include <SDL3/SDL.h>
-#include <jce/os/core/jce_timer.h>
-#include <jce/os/core/jce_thread.h>
-#include "os/core/jce_memory.h"
-#include <jce/os/core/jce_profiler.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -22,25 +23,27 @@
 #include <windows.h>
 #endif
 
-#include <jce/os/core/jce_log.h>
-#include <jce/os/core/jce_crash_handler.h>
 #include <jce/application/jce_config.h>
-#include "renderer/jce_gpu_caps.h"
-#include <jce/os/platform/jce_window.h>
-#include "os/platform/jce_window_internal.h"
-#include <jce/os/platform/jce_single_instance.h>
-#include <jce/os/platform/jce_input.h>
+#include <jce/application/jce_subsystem.h>
 #include <jce/middleware/audio/jce_audio.h>
+#include <jce/os/core/jce_allocator.h>
+#include <jce/os/core/jce_crash_handler.h>
+#include <jce/os/core/jce_event.h>
+#include <jce/os/core/jce_log.h>
+#include <jce/os/core/pak_loader.h>
+#include <jce/os/platform/jce_input.h>
+#include <jce/os/platform/jce_single_instance.h>
+#include <jce/os/platform/jce_window.h>
 #include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_shaders.h>
 #include <jce/renderer/jce_text.h>
-#include <jce/os/core/pak_loader.h>
 #include <jce/resource/jce_asset.h>
-#include <jce/application/jce_subsystem.h>
-#include <jce/os/core/jce_allocator.h>
-#include <jce/os/core/jce_event.h>
-#include <bgfx/c99/bgfx.h>
+
 #include "embedded_assets.h"
+#include "os/platform/jce_window_internal.h"
+#include "renderer/jce_gpu_caps.h"
+
+#include <bgfx/c99/bgfx.h>
 
 #define LOG_TAG "engine"
 #define JCE_DEFAULT_FRAME_DT (1.0f / 60.0f)

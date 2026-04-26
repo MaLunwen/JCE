@@ -3,15 +3,15 @@
  * NOT use this file; the Android build has its own gradle project
  * and JNI surface. */
 #if defined(JCE_BUILD_JNI)
-#include <stdint.h>
-#include <stdbool.h>
+#include <jce/application/jce_app_interface.h>
+#include <jce/application/jce_engine.h>
+
+#include "os/core/jce_memory.h"
 
 #include <jni.h>
 #include <SDL3/SDL.h>
-
-#include "os/core/jce_memory.h"
-#include <jce/application/jce_engine.h>
-#include <jce/application/jce_app_interface.h>
+#include <stdbool.h>
+#include <stdint.h>
 
 /* The game (linked into the same shared library) must provide this. */
 extern JceAppDesc ck_app_get_desc(void);

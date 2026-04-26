@@ -5,11 +5,11 @@
  * Grid rendering & context menus are in jce_panel_assets_grid.cpp.
  */
 
-#include "jce_panel_assets_internal.h"
-#include "jce_editor_config.h"
-
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_timer.h>
+
+#include "jce_editor_config.h"
+#include "jce_panel_assets_internal.h"
 
 #include <chrono>
 

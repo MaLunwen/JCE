@@ -5,17 +5,16 @@
  * supplements with backwards-compat parsing on top of these primitives.
  */
 
-#include <jce/middleware/scene/jce_scene_components_json.h>
 #include <jce/middleware/scene/jce_scene.h>
-#include <jce/resource/jce_scene_contract.h>
-#include <jce/renderer/jce_pbr_material.h>
+#include <jce/middleware/scene/jce_scene_components_json.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
+#include <jce/renderer/jce_pbr_material.h>
+#include <jce/resource/jce_scene_contract.h>
 
 #include <cJSON/cJSON.h>
-#include <SDL3/SDL_filesystem.h>
-
 #include <math.h>
+#include <SDL3/SDL_filesystem.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

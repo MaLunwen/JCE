@@ -4,35 +4,34 @@
  * Reads from / writes to the ECS scene directly via jce_scene_*.
  */
 
+#include "jce_editor_colors.h"
+#include "jce_editor_i18n.h"
 #include "jce_editor_panels.h"
 #include "jce_editor_state.h"
 #include "jce_editor_state_internal.h"
-#include "jce_editor_colors.h"
-#include "jce_editor_i18n.h"
-#include "scene/jce_model_loader_assimp.h"
 #include "scene/jce_editor_scene_render.h"
+#include "scene/jce_model_loader_assimp.h"
 
 #include <imgui.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
-#include <math.h>
+
 #include <cmath>
 
 /* Per-entity euler cache shared with the scene-view gizmo. Implemented in
  * jce_scene_view_helpers.cpp; declared inline here to avoid pulling in the
  * full scene-view internal header. */
 extern "C++" {
-    bool jce_editor_get_cached_euler_deg(uint32_t entity_id, jce_quat current_q,
-                                          float out_deg[3]);
-    void jce_editor_set_cached_euler_deg(uint32_t entity_id, jce_quat q,
-                                          const float deg[3]);
+bool jce_editor_get_cached_euler_deg(uint32_t entity_id, jce_quat current_q, float out_deg[3]);
+void jce_editor_set_cached_euler_deg(uint32_t entity_id, jce_quat q, const float deg[3]);
 }
 
 extern "C" {
-#include <jce/renderer/jce_pbr_material.h>
-#include <jce/renderer/jce_model.h>
 #include <jce/middleware/animation/jce_animation.h>
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/renderer/jce_model.h>
+#include <jce/renderer/jce_pbr_material.h>
 }
 
 /* ── Tag colors (display data) ────────────────────────────────────── */

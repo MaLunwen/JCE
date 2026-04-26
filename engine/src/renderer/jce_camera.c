@@ -3,7 +3,9 @@
  */
 
 #include <jce/renderer/jce_camera.h>
+
 #include "os/core/jce_memory.h"
+
 #include <math.h>
 
 /* Max pitch to avoid gimbal lock at poles. */

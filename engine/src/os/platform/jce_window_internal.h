@@ -9,6 +9,7 @@
 #define JCE_WINDOW_INTERNAL_H
 
 #include <jce/os/platform/jce_window.h>
+
 #include <SDL3/SDL.h>
 
 #ifdef __cplusplus

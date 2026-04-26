@@ -5,12 +5,13 @@
  */
 
 #include <jce/middleware/ai/jce_bt.h>
-#include "jce_bt_impl.h"
-
 #include <jce/os/core/jce_log.h>
+
+#include "jce_bt_impl.h"
 #include "os/core/jce_memory.h"
-#include <string.h>
+
 #include <stdio.h>
+#include <string.h>
 
 #define LOG_TAG "bt"
 

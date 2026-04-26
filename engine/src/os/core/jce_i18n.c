@@ -7,12 +7,13 @@
  */
 
 #include <jce/os/core/jce_i18n.h>
+#include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/pak_loader.h>
 
-#include <SDL3/SDL.h>
-#include <jce/os/core/jce_json.h>
 #include "jce_memory.h"
+
+#include <SDL3/SDL.h>
 #include <string.h>
 
 #define LOG_TAG    "jce_i18n"

@@ -12,6 +12,7 @@
 
 
 #include <jce/os/core/jce_defs.h>
+
 #include <stdbool.h>
 #include <stdint.h>
 

@@ -25,13 +25,14 @@
 
 #ifdef JCE_ENABLE_PATENTED_CODECS
 
-#include "os/core/jce_memory.h"
 #include <jce/os/core/jce_log.h>
 
+#include "jce_yuv_convert.h"
+#include "os/core/jce_memory.h"
+
+#include <string.h>
 #include <wels/codec_api.h>
 #include <wels/codec_def.h>
-#include "jce_yuv_convert.h"
-#include <string.h>
 
 #define LOG_TAG "jce_h264"
 

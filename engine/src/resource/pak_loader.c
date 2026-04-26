@@ -5,16 +5,21 @@
  * XXH3_64bits hash, and decompresses assets on demand via ZSTD.
  */
 
-#include <jce/os/core/pak_loader.h>
-#include "resource/pak_format.h"
 #include <jce/os/core/jce_profiler.h>
+#include <jce/os/core/pak_loader.h>
+
+#include "os/core/jce_memory.h"
+#include "resource/pak_format.h"
 
 #include <SDL3/SDL.h>
-#include "os/core/jce_memory.h"
 #include <string.h>
 
 #include <xxhash.h>
 #include <zstd.h>
+
+/* Module-global toggle: when non-zero, jce_pak_decompress[_ex] will re-hash
+ * the output buffer with XXH3 and compare against asset->content_hash. */
+static int g_verify_on_decompress = 0;
 
 /* ================================================================== */
 /* Internal types                                                      */
@@ -81,7 +86,7 @@ JcePakArchive *jce_pak_open(const void *data, size_t size) {
     }
 
     for (uint32_t i = 0; i < count; ++i) {
-        /* Pointer to the i-th TOC entry (each 40 bytes). */
+        /* Pointer to the i-th TOC entry (v2: 56 bytes). */
         const uint8_t *e = blob + toc_off + (uint64_t)i * JPAK_TOC_ENTRY_SIZE;
 
         uint64_t path_hash       = jpak_read_le64(e + 0);
@@ -89,7 +94,10 @@ JcePakArchive *jce_pak_open(const void *data, size_t size) {
         uint32_t name_length     = jpak_read_le32(e + 12);
         uint64_t entry_data_off  = jpak_read_le64(e + 16);
         uint64_t compressed_size = jpak_read_le64(e + 24);
-        uint64_t original_size   = jpak_read_le64(e + 32);
+        uint64_t original_size = jpak_read_le64(e + 32);
+        uint32_t entry_flags = jpak_read_le32(e + 40);
+        /* skip _pad at +44 */
+        uint64_t content_hash = jpak_read_le64(e + 48);
 
         /* Bounds-check name region. */
         if ((uint64_t)name_offset + name_length > size) {
@@ -109,7 +117,9 @@ JcePakArchive *jce_pak_open(const void *data, size_t size) {
         pak->assets[i].path            = path_copy;
         pak->assets[i].compressed_data = blob + data_off + entry_data_off;
         pak->assets[i].compressed_size = compressed_size;
-        pak->assets[i].original_size   = original_size;
+        pak->assets[i].original_size = original_size;
+        pak->assets[i].flags = entry_flags;
+        pak->assets[i].content_hash = content_hash;
 
         /* Bounds-check data region. */
         if (data_off + entry_data_off + compressed_size > size) {
@@ -215,11 +225,21 @@ size_t jce_pak_decompress(const JcePakAsset *asset, void *buf, size_t buf_size) 
     if (!asset || !buf || buf_size < asset->original_size)
         return 0;
 
-    size_t result = ZSTD_decompress(
-        buf, buf_size,
-        asset->compressed_data, (size_t)asset->compressed_size);
+    size_t result;
+    if (asset->flags & JCE_PAK_ASSET_STORED) {
+        if (asset->compressed_size != asset->original_size)
+            return 0;
+        memcpy(buf, asset->compressed_data, (size_t)asset->original_size);
+        result = (size_t)asset->original_size;
+    } else {
+        result =
+            ZSTD_decompress(buf, buf_size, asset->compressed_data, (size_t)asset->compressed_size);
+        if (ZSTD_isError(result))
+            return 0;
+    }
 
-    if (ZSTD_isError(result)) return 0;
+    if (g_verify_on_decompress && !jce_pak_verify(asset, buf, result))
+        return 0;
     return result;
 }
 
@@ -228,20 +248,68 @@ size_t jce_pak_decompress_ex(const JcePakArchive *pak, const JcePakAsset *asset,
     if (!asset || !buf || buf_size < asset->original_size)
         return 0;
 
-    /* Use the archive's reusable DCtx when available. */
     size_t result;
-    if (pak && pak->dctx) {
-        result = ZSTD_decompressDCtx(
-            pak->dctx, buf, buf_size,
-            asset->compressed_data, (size_t)asset->compressed_size);
+    if (asset->flags & JCE_PAK_ASSET_STORED) {
+        if (asset->compressed_size != asset->original_size)
+            return 0;
+        memcpy(buf, asset->compressed_data, (size_t)asset->original_size);
+        result = (size_t)asset->original_size;
+    } else if (pak && pak->dctx) {
+        result = ZSTD_decompressDCtx(pak->dctx, buf, buf_size, asset->compressed_data,
+                                     (size_t)asset->compressed_size);
+        if (ZSTD_isError(result))
+            return 0;
     } else {
-        result = ZSTD_decompress(
-            buf, buf_size,
-            asset->compressed_data, (size_t)asset->compressed_size);
+        result =
+            ZSTD_decompress(buf, buf_size, asset->compressed_data, (size_t)asset->compressed_size);
+        if (ZSTD_isError(result))
+            return 0;
     }
 
-    if (ZSTD_isError(result)) return 0;
+    if (g_verify_on_decompress && !jce_pak_verify(asset, buf, result))
+        return 0;
     return result;
+}
+
+/* ================================================================== */
+/* Integrity verification                                              */
+/* ================================================================== */
+
+int jce_pak_verify(const JcePakAsset *asset, const void *buf, size_t size)
+{
+    if (!asset || !buf)
+        return 0;
+    if (asset->content_hash == 0)
+        return 1; /* legacy / not recorded */
+    uint64_t actual = XXH3_64bits(buf, size);
+    return actual == asset->content_hash ? 1 : 0;
+}
+
+uint32_t jce_pak_verify_all(const JcePakArchive *pak)
+{
+    if (!pak)
+        return 0;
+    uint32_t mismatches = 0;
+    for (uint32_t i = 0; i < pak->count; ++i) {
+        const JcePakAsset *a = &pak->assets[i];
+        if (a->original_size == 0 || a->content_hash == 0)
+            continue;
+        void *buf = JCE_MALLOC((size_t)a->original_size);
+        if (!buf) {
+            mismatches++;
+            continue;
+        }
+        size_t got = jce_pak_decompress_ex(pak, a, buf, (size_t)a->original_size);
+        if (got != a->original_size || !jce_pak_verify(a, buf, got))
+            mismatches++;
+        JCE_FREE(buf);
+    }
+    return mismatches;
+}
+
+void jce_pak_set_verify_on_decompress(int enable)
+{
+    g_verify_on_decompress = enable ? 1 : 0;
 }
 
 /* ================================================================== */

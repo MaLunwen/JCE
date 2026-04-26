@@ -6,12 +6,11 @@
  */
 
 #include "jce_physics_internal.h"
+#include "os/core/jce_memory.h"
 
 #include <btBulletDynamicsCommon.h>
-#include <BulletDynamics/Character/btKinematicCharacterController.h>
 #include <BulletCollision/CollisionDispatch/btGhostObject.h>
-
-#include "os/core/jce_memory.h"
+#include <BulletDynamics/Character/btKinematicCharacterController.h>
 
 #include <cstring>
 

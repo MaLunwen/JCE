@@ -6,10 +6,10 @@
  * and the previous pass's output as input texture.
  */
 
+#include <jce/os/core/jce_log.h>
 #include <jce/renderer/jce_postfx.h>
 #include <jce/renderer/jce_shaders.h>
 #include <jce/renderer/jce_views.h>
-#include <jce/os/core/jce_log.h>
 
 #include <bgfx/c99/bgfx.h>
 #include <string.h>
@@ -396,13 +396,13 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
     int ping = 0; /* ping-pong FBO index (0 or 1) */
     int current_fb_index = -1;
 
-    /* Helper macro: set up view for a post-processing pass. */
-    #define POSTFX_SETUP_VIEW(vid, fb) do { \
-        bgfx_set_view_rect((vid), 0, 0, (uint16_t)pipeline->width, \
-                           (uint16_t)pipeline->height); \
-        bgfx_set_view_frame_buffer((vid), (fb)); \
-        bgfx_set_view_clear((vid), BGFX_CLEAR_NONE, 0, 1.0f, 0); \
-    } while(0)
+/* Helper macro: set up view for a post-processing pass. */
+#define POSTFX_SETUP_VIEW(vid, fb)                                                                 \
+    do {                                                                                           \
+        bgfx_set_view_rect((vid), 0, 0, (uint16_t)pipeline->width, (uint16_t)pipeline->height);    \
+        bgfx_set_view_frame_buffer((vid), (fb));                                                   \
+        bgfx_set_view_clear((vid), BGFX_CLEAR_NONE, 0, 1.0f, 0);                                   \
+    } while (0)
 
     /* ── 1. Bloom ─────────────────────────────────────────────────── */
     if (pipeline->enabled[JCE_POSTFX_BLOOM] &&

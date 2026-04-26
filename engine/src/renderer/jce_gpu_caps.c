@@ -3,6 +3,7 @@
  */
 
 #include "jce_gpu_caps.h"
+
 #include <jce/os/core/jce_log.h>
 
 #include <bgfx/c99/bgfx.h>

@@ -8,6 +8,7 @@
  */
 
 #include <jce/application/jce_main.h>
+
 #include "game/ck_app.h"
 
 JCE_MAIN(ck_app_get_desc)

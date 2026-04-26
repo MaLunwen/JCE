@@ -15,22 +15,24 @@
  */
 
 #include "jce_asset_manager.h"
-#include "jce_asset_loaders.h"
-#include "os/core/jce_memory.h"
-#include <jce/os/core/pak_loader.h>
-#include <jce/resource/jce_asset_format.h>
-#include <jce/renderer/jce_texture.h>
-#include <jce/renderer/jce_mesh.h>
-#include <jce/renderer/jce_model.h>
-#include <jce/renderer/jce_text.h>
+
 #include <jce/middleware/audio/jce_audio.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
+#include <jce/os/core/jce_timer.h>
+#include <jce/os/core/pak_loader.h>
+#include <jce/renderer/jce_mesh.h>
+#include <jce/renderer/jce_model.h>
+#include <jce/renderer/jce_text.h>
+#include <jce/renderer/jce_texture.h>
+#include <jce/resource/jce_asset_format.h>
+
+#include "jce_asset_loaders.h"
+#include "os/core/jce_memory.h"
 
 #include <SDL3/SDL.h>
-#include <jce/os/core/jce_timer.h>
-#include <xxhash.h>
 #include <string.h>
+#include <xxhash.h>
 
 #define LOG_TAG "jce_asset"
 #define DEFAULT_MAX_ASSETS 8192

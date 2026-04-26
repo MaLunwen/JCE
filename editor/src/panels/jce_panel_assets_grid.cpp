@@ -2,8 +2,8 @@
  * jce_panel_assets_grid.cpp  Grid item rendering, item context menu, empty area menu.
  */
 
-#include "jce_panel_assets_internal.h"
 #include "jce_editor_file_util.h"
+#include "jce_panel_assets_internal.h"
 
 static void open_asset_in_file_viewer(const char *path)
 {

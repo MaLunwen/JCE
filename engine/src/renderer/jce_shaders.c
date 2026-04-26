@@ -4,14 +4,15 @@
  * Decompresses .bin blobs, feeds them to bgfx_create_shader().
  */
 
-#include <jce/renderer/jce_shaders.h>
-#include <jce/os/core/pak_loader.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
+#include <jce/os/core/pak_loader.h>
+#include <jce/renderer/jce_shaders.h>
 
-#include <SDL3/SDL.h>
-#include <bgfx/c99/bgfx.h>
 #include "os/core/jce_memory.h"
+
+#include <bgfx/c99/bgfx.h>
+#include <SDL3/SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

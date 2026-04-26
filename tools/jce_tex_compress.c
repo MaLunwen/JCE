@@ -5,6 +5,7 @@
  */
 
 #include "resource/jce_tex_compress.h"
+
 #include <stdint.h>
 
 /* ================================================================== */

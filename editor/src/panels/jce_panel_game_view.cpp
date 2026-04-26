@@ -3,10 +3,10 @@
  * Extracted from jce_editor_panels.cpp.
  */
 
+#include "jce_editor_config.h"
+#include "jce_editor_i18n.h"
 #include "jce_editor_panels.h"
 #include "jce_editor_state.h"
-#include "jce_editor_i18n.h"
-#include "jce_editor_config.h"
 #include "jce_run_manager.h"
 
 #include <imgui.h>

@@ -8,17 +8,18 @@
  * round-trip verification.
  */
 
-#include "jce_editor_state_internal.h"
 #include "jce_editor_file_util.h"
+#include "jce_editor_state_internal.h"
 
 extern "C" {
-#include <jce/renderer/jce_model.h>
 #include <jce/middleware/scene/jce_scene_components_json.h>
+#include <jce/renderer/jce_model.h>
 }
 
 #include <SDL3/SDL.h>
-#include <cstring>
+
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 
 /* ── Serialize entity tree to JSON (recursive, for prefabs) ────────── */

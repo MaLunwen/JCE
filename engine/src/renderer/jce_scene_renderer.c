@@ -5,11 +5,12 @@
  * directly with no editor-state coupling.
  */
 
-#include <jce/renderer/jce_scene_renderer.h>
-
-#include <bgfx/c99/bgfx.h>
-
+#include <jce/middleware/animation/jce_animation.h>
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/os/core/jce_allocator.h>
+#include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_math.h>
+#include <jce/os/core/pak_loader.h>
 #include <jce/renderer/jce_camera.h>
 #include <jce/renderer/jce_csm.h>
 #include <jce/renderer/jce_ibl.h>
@@ -22,21 +23,18 @@
 #include <jce/renderer/jce_postfx.h>
 #include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_renderer_caps.h>
+#include <jce/renderer/jce_scene_renderer.h>
 #include <jce/renderer/jce_shaders.h>
 #include <jce/renderer/jce_skybox.h>
 #include <jce/renderer/jce_sprite_batch.h>
 #include <jce/renderer/jce_texture.h>
 #include <jce/renderer/jce_views.h>
-#include <jce/middleware/animation/jce_animation.h>
-#include <jce/os/core/jce_allocator.h>
-#include <jce/os/core/jce_log.h>
-#include <jce/os/core/jce_math.h>
-#include <jce/os/core/pak_loader.h>
 
+#include <bgfx/c99/bgfx.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 
 #define LOG_TAG "scene_renderer"
 
@@ -546,10 +544,17 @@ static void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
         sr->shadow_far_cached = shadow_far_target;
         sr->shadow_far_valid = true;
     } else {
-        float far_delta = fabsf(shadow_far_target - sr->shadow_far_cached);
-        float far_rel = far_delta / fmaxf(sr->shadow_far_cached, CSM_DIST_MIN);
-        if (far_delta > CSM_FAR_HYST_ABS && far_rel > CSM_FAR_HYST_REL)
-            sr->shadow_far_cached = shadow_far_target;
+        /* Smooth-track the shadow far plane every frame.  An earlier
+         * AND-hysteresis (>8 m AND >3%) caused the cached value to
+         * remain stale for many frames and then jump abruptly,
+         * snapping all 4 cascade splits at once and producing a
+         * visible flicker.  The texel-aligned snap inside jce_csm
+         * already provides per-cascade temporal stability, so a soft
+         * exponential smoothing here is enough to avoid hot-path
+         * recompute jitter without introducing a sudden step. */
+        float t = 0.25f;
+        sr->shadow_far_cached =
+            sr->shadow_far_cached + (shadow_far_target - sr->shadow_far_cached) * t;
     }
     float shadow_far = sr->shadow_far_cached;
 
@@ -873,25 +878,49 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
             (cfg->view_mode == JCE_SCENE_VIEW_WIREFRAME ||
              cfg->view_mode == JCE_SCENE_VIEW_WIREFRAME_TEXTURED);
 
-        if (mr_comp && !wireframe_path) {
+        if (!wireframe_path) {
             JcePbrMaterial pbr = jce_pbr_material_default();
             bool use_checker_fallback = false;
-            if (mr_comp->base_color[3] > 0.0f) {
+
+            /* If this entity has no MeshRenderer component, fall back to a
+             * neutral default material (mid-gray, fully rough, dielectric)
+             * so the mesh still goes through the PBR shader and therefore
+             * receives shadows / IBL exactly like fully-described entities.
+             * Earlier this branch went through the legacy fs_mesh.sc which
+             * has no shadow sampler, producing the well-known "object only
+             * gets darker but never receives external shadow" symptom. */
+            if (!mr_comp) {
+                pbr.base_color_factor[0] = 0.7f;
+                pbr.base_color_factor[1] = 0.7f;
+                pbr.base_color_factor[2] = 0.7f;
+                pbr.base_color_factor[3] = 1.0f;
+                pbr.metallic_factor = 0.0f;
+                pbr.roughness_factor = 0.85f;
+                pbr.normal_scale = 1.0f;
+                pbr.ao_strength = 1.0f;
+
+                /* In editor TEXTURED mode the legacy path used a magenta
+                 * checker to highlight missing assets; preserve that hint. */
+                if (editor_mode && cfg->view_mode == JCE_SCENE_VIEW_TEXTURED)
+                    use_checker_fallback = true;
+            } else if (mr_comp->base_color[3] > 0.0f) {
                 pbr.base_color_factor[0] = mr_comp->base_color[0];
                 pbr.base_color_factor[1] = mr_comp->base_color[1];
                 pbr.base_color_factor[2] = mr_comp->base_color[2];
                 pbr.base_color_factor[3] = mr_comp->base_color[3];
             }
-            pbr.metallic_factor      = mr_comp->metallic;
-            pbr.roughness_factor     = mr_comp->roughness;
-            pbr.emissive_factor[0]   = mr_comp->emissive[0];
-            pbr.emissive_factor[1]   = mr_comp->emissive[1];
-            pbr.emissive_factor[2]   = mr_comp->emissive[2];
-            pbr.normal_scale         = mr_comp->normal_scale;
-            pbr.ao_strength          = mr_comp->ao_strength;
-            pbr.alpha_mode           = (JceAlphaMode)mr_comp->alpha_mode;
-            pbr.alpha_cutoff         = mr_comp->alpha_cutoff;
-            pbr.double_sided         = mr_comp->double_sided;
+            if (mr_comp) {
+                pbr.metallic_factor = mr_comp->metallic;
+                pbr.roughness_factor = mr_comp->roughness;
+                pbr.emissive_factor[0] = mr_comp->emissive[0];
+                pbr.emissive_factor[1] = mr_comp->emissive[1];
+                pbr.emissive_factor[2] = mr_comp->emissive[2];
+                pbr.normal_scale = mr_comp->normal_scale;
+                pbr.ao_strength = mr_comp->ao_strength;
+                pbr.alpha_mode = (JceAlphaMode)mr_comp->alpha_mode;
+                pbr.alpha_cutoff = mr_comp->alpha_cutoff;
+                pbr.double_sided = mr_comp->double_sided;
+            }
 
             /* Editor SHADED mode: skip texture loading entirely (factors only).
              * Runtime / TEXTURED: load all maps. */
@@ -899,7 +928,7 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                 !editor_mode ||
                 cfg->view_mode == JCE_SCENE_VIEW_TEXTURED;
 
-            if (load_tex) {
+            if (load_tex && mr_comp) {
                 if (mr_comp->albedo_tex[0]) {
                     JceTexture t = sr_resolve_texture(sr, mr_comp->albedo_tex);
                     if (jce_texture_valid(t)) pbr.albedo_map = t;

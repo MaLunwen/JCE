@@ -7,16 +7,17 @@
 
 
 #include <jce/os/core/jce_defs.h>
+
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdarg.h>
 
 JCE_EXTERN_C_BEGIN
 
 /* Forward declarations. */
-typedef struct JceWindow    JceWindow;
-typedef struct JceRenderer  JceRenderer;
-typedef struct JceCamera    JceCamera;
+typedef struct JceWindow JceWindow;
+typedef struct JceRenderer JceRenderer;
+typedef struct JceCamera JceCamera;
 typedef struct JceShaderSet JceShaderSet;
 
 /* -- Renderer configuration ---------------------------------------- */

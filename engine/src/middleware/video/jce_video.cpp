@@ -5,11 +5,12 @@
  * Decode:      OpenH264 software H.264 decoder (cross-platform).
  */
 
-#include <jce/middleware/video/jce_video.h>
-#include <jce/middleware/video/jce_mp4_parser.h>
 #include <jce/middleware/video/jce_av1_decode.h>
+#include <jce/middleware/video/jce_mp4_parser.h>
+#include <jce/middleware/video/jce_video.h>
 #include <jce/middleware/video/jce_vp8_decode.h>
 #include <jce/middleware/video/jce_webm_parser.h>
+
 #include "jce_audio_stream.h"
 
 extern "C" {
@@ -17,11 +18,12 @@ extern "C" {
 }
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_thread.h>
-#include "os/core/jce_memory.h"
+
 #include "jce_aac_decode.h"
 #include "jce_h264_decode.h"
 #include "jce_h265_decode.h"
 #include "jce_yuv_convert.h"
+#include "os/core/jce_memory.h"
 
 #include <cmath>
 #include <cstdio>
@@ -29,7 +31,8 @@ extern "C" {
 
 /* perf timing comes from <jce/core/jce_timer.h> */
 #include <jce/os/core/jce_timer.h>
-#include <SDL3/SDL.h>  /* SDL_HasAVX2 */
+
+#include <SDL3/SDL.h> /* SDL_HasAVX2 */
 
 /* S3: Enable AVX2 YUV→RGBA path when available (checked once at startup). */
 static const int s_yuv_avx2_init = (jce_yuv_set_avx2(SDL_HasAVX2()), 0);

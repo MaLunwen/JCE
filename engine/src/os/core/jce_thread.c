@@ -6,10 +6,11 @@
  */
 
 #include <jce/os/core/jce_thread.h>
+
 #include "jce_memory.h"
 
-#include <SDL3/SDL.h>
 #include <enkiTS/TaskScheduler_c.h>
+#include <SDL3/SDL.h>
 
 /* ================================================================== */
 /* Mutex  (SDL3 — enkiTS has no mutex primitive)                       */

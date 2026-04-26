@@ -19,9 +19,9 @@
  */
 
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_timer.h>
 
 #include <SDL3/SDL.h>
-#include <jce/os/core/jce_timer.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>

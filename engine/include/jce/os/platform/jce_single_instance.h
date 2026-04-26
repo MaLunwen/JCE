@@ -10,6 +10,7 @@
 
 
 #include <jce/os/core/jce_defs.h>
+
 #include <stdbool.h>
 
 JCE_EXTERN_C_BEGIN

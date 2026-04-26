@@ -4,15 +4,14 @@
  * Uses the engine JSON facade for JSON parsing and generation.
  */
 
-#include <stdio.h>
-#include <string.h>
-#include <stdlib.h>
-
 #include <SDL3/SDL_filesystem.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 extern "C" {
-#include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_json.h>
+#include <jce/os/core/jce_log.h>
 }
 
 /* Cross-platform mkdir-equivalent. SDL_CreateDirectory creates the directory
@@ -22,8 +21,8 @@ static void ensure_directory(const char *path) {
     SDL_CreateDirectory(path);
 }
 
-#include "jce_editor_config.h"
 #include "jce_editor_alloc.h"
+#include "jce_editor_config.h"
 #include "jce_editor_file_util.h"
 
 #define LOG_TAG       "editor_config"

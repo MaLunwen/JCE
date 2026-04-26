@@ -9,8 +9,9 @@
 #include <jce/middleware/physics/jce_physics.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
-#include "os/core/jce_memory.h"
+
 #include "jce_physics_internal.h"
+#include "os/core/jce_memory.h"
 
 #include <string.h>
 

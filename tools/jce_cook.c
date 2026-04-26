@@ -16,13 +16,14 @@
  *   jce_cook --batch resources/assets/ cooked/ --level 6
  */
 
-#include "resource/jce_asset_cooker.h"
 #include <jce/resource/jce_asset_format.h>
 
+#include "resource/jce_asset_cooker.h"
+
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdbool.h>
 
 #ifdef _WIN32
 #include <windows.h>

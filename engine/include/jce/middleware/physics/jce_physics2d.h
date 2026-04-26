@@ -13,8 +13,8 @@
 #define JCE_PHYSICS2D_H
 
 
-#include <jce/os/core/jce_defs.h>
 #include <jce/middleware/physics/jce_physics_types.h>
+#include <jce/os/core/jce_defs.h>
 #include <jce/os/core/jce_math.h>
 
 JCE_EXTERN_C_BEGIN

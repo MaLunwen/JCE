@@ -9,8 +9,9 @@
 #define JCE_NET_PROTO_H
 
 #include <jce/os/core/jce_math.h>
-#include <stdint.h>
+
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {

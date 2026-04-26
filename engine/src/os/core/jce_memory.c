@@ -11,8 +11,9 @@
 
 #include "jce_memory.h"
 
-#include <mimalloc.h>
 #include <jce/os/core/jce_profiler.h>
+
+#include <mimalloc.h>
 
 void *jce__malloc_tracked(size_t size)
 {

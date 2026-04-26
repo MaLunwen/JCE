@@ -2,24 +2,25 @@
  * jce_renderer.c  bgfx renderer implementation.
  */
 
-#include <jce/renderer/jce_renderer.h>
-#include <jce/renderer/jce_camera.h>
-#include <jce/renderer/jce_views.h>
-#include <jce/renderer/jce_shaders.h>
-#include <jce/os/platform/jce_window.h>
-#include "os/platform/jce_window_internal.h"
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
+#include <jce/os/core/jce_profiler.h>
+#include <jce/os/core/jce_thread.h>
+#include <jce/os/core/jce_timer.h>
+#include <jce/os/platform/jce_window.h>
+#include <jce/renderer/jce_camera.h>
+#include <jce/renderer/jce_renderer.h>
+#include <jce/renderer/jce_shaders.h>
+#include <jce/renderer/jce_views.h>
+
+#include "os/core/jce_memory.h"
+#include "os/platform/jce_window_internal.h"
 
 #include <bgfx/c99/bgfx.h>
 #include <SDL3/SDL.h>
-#include <jce/os/core/jce_timer.h>
-#include <jce/os/core/jce_thread.h>
-#include "os/core/jce_memory.h"
-#include <jce/os/core/jce_profiler.h>
-#include <string.h>
-#include <stdio.h>
 #include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
 
 #ifdef __APPLE__
 #include <TargetConditionals.h>
@@ -28,49 +29,39 @@
 #define LOG_TAG "jce_renderer"
 
 struct JceRenderer {
-    bool                   is_fallback;
-    SDL_Renderer          *sdl_renderer;
+    bool is_fallback;
+    SDL_Renderer *sdl_renderer;
 
-    bgfx_program_handle_t  program;          /* color (pos+color) */
-    bgfx_vertex_layout_t   layout;           /* color vertex layout */
-    bgfx_program_handle_t  program_textured; /* textured (pos+color+uv) */
-    bgfx_vertex_layout_t   layout_textured;  /* textured vertex layout */
-    bgfx_uniform_handle_t  u_tex_color;      /* sampler uniform for textures */
-    bgfx_program_handle_t  program_mesh;     /* mesh (pos+normal+uv) */
+    bgfx_program_handle_t program;          /* color (pos+color) */
+    bgfx_vertex_layout_t layout;            /* color vertex layout */
+    bgfx_program_handle_t program_textured; /* textured (pos+color+uv) */
+    bgfx_vertex_layout_t layout_textured;   /* textured vertex layout */
+    bgfx_uniform_handle_t u_tex_color;      /* sampler uniform for textures */
+    bgfx_program_handle_t program_mesh;     /* mesh (pos+normal+uv) */
     /* PBR programs */
-    bgfx_program_handle_t  program_pbr;
-    bgfx_program_handle_t  program_pbr_skinned;
-    bgfx_program_handle_t  program_shadow;
-    bgfx_program_handle_t  program_shadow_skinned;
-    bgfx_uniform_handle_t  u_light_dir;      /* vec4: xyz = light direction */
-    bgfx_uniform_handle_t  u_light_color;    /* vec4: xyz = color, w = ambient */
-    uint32_t               reset_flags;
-    uint32_t               debug_flags;
-    char                   gpu_name[128];
+    bgfx_program_handle_t program_pbr;
+    bgfx_program_handle_t program_pbr_skinned;
+    bgfx_program_handle_t program_shadow;
+    bgfx_program_handle_t program_shadow_skinned;
+    bgfx_uniform_handle_t u_light_dir;   /* vec4: xyz = light direction */
+    bgfx_uniform_handle_t u_light_color; /* vec4: xyz = color, w = ambient */
+    uint32_t reset_flags;
+    uint32_t debug_flags;
+    char gpu_name[128];
 };
 
 static bool s_dbg_text_enabled = false;
 
-static void jce_bgfx_fatal(bgfx_callback_interface_t* _this,
-                           const char* _filePath,
-                           uint16_t _line,
-                           bgfx_fatal_t _code,
-                           const char* _str)
+static void jce_bgfx_fatal(bgfx_callback_interface_t *_this, const char *_filePath, uint16_t _line,
+                           bgfx_fatal_t _code, const char *_str)
 {
     (void)_this;
-    LOG_ERROR(LOG_TAG,
-              "bgfx fatal: code=%d file=%s line=%u msg=%s",
-              (int)_code,
-              _filePath ? _filePath : "<null>",
-              (unsigned)_line,
-              _str ? _str : "<null>");
+    LOG_ERROR(LOG_TAG, "bgfx fatal: code=%d file=%s line=%u msg=%s", (int)_code,
+              _filePath ? _filePath : "<null>", (unsigned)_line, _str ? _str : "<null>");
 }
 
-static void jce_bgfx_trace_vargs(bgfx_callback_interface_t* _this,
-                                 const char* _filePath,
-                                 uint16_t _line,
-                                 const char* _format,
-                                 va_list _argList)
+static void jce_bgfx_trace_vargs(bgfx_callback_interface_t *_this, const char *_filePath,
+                                 uint16_t _line, const char *_format, va_list _argList)
 {
     (void)_this;
     (void)_filePath;
@@ -79,102 +70,103 @@ static void jce_bgfx_trace_vargs(bgfx_callback_interface_t* _this,
     (void)_argList;
 }
 
-static void jce_bgfx_profiler_begin(bgfx_callback_interface_t* _this,
-                                    const char* _name,
-                                    uint32_t _abgr,
-                                    const char* _filePath,
-                                    uint16_t _line)
+static void jce_bgfx_profiler_begin(bgfx_callback_interface_t *_this, const char *_name,
+                                    uint32_t _abgr, const char *_filePath, uint16_t _line)
 {
-    (void)_this; (void)_name; (void)_abgr; (void)_filePath; (void)_line;
+    (void)_this;
+    (void)_name;
+    (void)_abgr;
+    (void)_filePath;
+    (void)_line;
 }
 
-static void jce_bgfx_profiler_begin_literal(bgfx_callback_interface_t* _this,
-                                            const char* _name,
-                                            uint32_t _abgr,
-                                            const char* _filePath,
-                                            uint16_t _line)
+static void jce_bgfx_profiler_begin_literal(bgfx_callback_interface_t *_this, const char *_name,
+                                            uint32_t _abgr, const char *_filePath, uint16_t _line)
 {
-    (void)_this; (void)_name; (void)_abgr; (void)_filePath; (void)_line;
+    (void)_this;
+    (void)_name;
+    (void)_abgr;
+    (void)_filePath;
+    (void)_line;
 }
 
-static void jce_bgfx_profiler_end(bgfx_callback_interface_t* _this)
+static void jce_bgfx_profiler_end(bgfx_callback_interface_t *_this)
 {
     (void)_this;
 }
 
-static uint32_t jce_bgfx_cache_read_size(bgfx_callback_interface_t* _this,
-                                         uint64_t _id)
+static uint32_t jce_bgfx_cache_read_size(bgfx_callback_interface_t *_this, uint64_t _id)
 {
-    (void)_this; (void)_id;
+    (void)_this;
+    (void)_id;
     return 0;
 }
 
-static bool jce_bgfx_cache_read(bgfx_callback_interface_t* _this,
-                                uint64_t _id,
-                                void* _data,
+static bool jce_bgfx_cache_read(bgfx_callback_interface_t *_this, uint64_t _id, void *_data,
                                 uint32_t _size)
 {
-    (void)_this; (void)_id; (void)_data; (void)_size;
+    (void)_this;
+    (void)_id;
+    (void)_data;
+    (void)_size;
     return false;
 }
 
-static void jce_bgfx_cache_write(bgfx_callback_interface_t* _this,
-                                 uint64_t _id,
-                                 const void* _data,
+static void jce_bgfx_cache_write(bgfx_callback_interface_t *_this, uint64_t _id, const void *_data,
                                  uint32_t _size)
 {
-    (void)_this; (void)_id; (void)_data; (void)_size;
+    (void)_this;
+    (void)_id;
+    (void)_data;
+    (void)_size;
 }
 
-static void jce_bgfx_screen_shot(bgfx_callback_interface_t* _this,
-                                 const char* _filePath,
-                                 uint32_t _width,
-                                 uint32_t _height,
-                                 uint32_t _pitch,
-                                 const void* _data,
-                                 uint32_t _size,
-                                 bool _yflip)
+static void jce_bgfx_screen_shot(bgfx_callback_interface_t *_this, const char *_filePath,
+                                 uint32_t _width, uint32_t _height, uint32_t _pitch,
+                                 const void *_data, uint32_t _size, bool _yflip)
 {
-    (void)_this; (void)_filePath; (void)_width; (void)_height;
-    (void)_pitch; (void)_data; (void)_size; (void)_yflip;
+    (void)_this;
+    (void)_filePath;
+    (void)_width;
+    (void)_height;
+    (void)_pitch;
+    (void)_data;
+    (void)_size;
+    (void)_yflip;
 }
 
-static void jce_bgfx_capture_begin(bgfx_callback_interface_t* _this,
-                                   uint32_t _width,
-                                   uint32_t _height,
-                                   uint32_t _pitch,
-                                   bgfx_texture_format_t _format,
+static void jce_bgfx_capture_begin(bgfx_callback_interface_t *_this, uint32_t _width,
+                                   uint32_t _height, uint32_t _pitch, bgfx_texture_format_t _format,
                                    bool _yflip)
 {
-    (void)_this; (void)_width; (void)_height; (void)_pitch;
-    (void)_format; (void)_yflip;
+    (void)_this;
+    (void)_width;
+    (void)_height;
+    (void)_pitch;
+    (void)_format;
+    (void)_yflip;
 }
 
-static void jce_bgfx_capture_end(bgfx_callback_interface_t* _this)
+static void jce_bgfx_capture_end(bgfx_callback_interface_t *_this)
 {
     (void)_this;
 }
 
-static void jce_bgfx_capture_frame(bgfx_callback_interface_t* _this,
-                                   const void* _data,
+static void jce_bgfx_capture_frame(bgfx_callback_interface_t *_this, const void *_data,
                                    uint32_t _size)
 {
-    (void)_this; (void)_data; (void)_size;
+    (void)_this;
+    (void)_data;
+    (void)_size;
 }
 
 static const bgfx_callback_vtbl_t s_bgfx_callback_vtbl = {
-    jce_bgfx_fatal,
-    jce_bgfx_trace_vargs,
-    jce_bgfx_profiler_begin,
-    jce_bgfx_profiler_begin_literal,
-    jce_bgfx_profiler_end,
-    jce_bgfx_cache_read_size,
-    jce_bgfx_cache_read,
-    jce_bgfx_cache_write,
-    jce_bgfx_screen_shot,
-    jce_bgfx_capture_begin,
-    jce_bgfx_capture_end,
-    jce_bgfx_capture_frame,
+    jce_bgfx_fatal,          jce_bgfx_trace_vargs,
+    jce_bgfx_profiler_begin, jce_bgfx_profiler_begin_literal,
+    jce_bgfx_profiler_end,   jce_bgfx_cache_read_size,
+    jce_bgfx_cache_read,     jce_bgfx_cache_write,
+    jce_bgfx_screen_shot,    jce_bgfx_capture_begin,
+    jce_bgfx_capture_end,    jce_bgfx_capture_frame,
 };
 
 static bgfx_callback_interface_t s_bgfx_callback = {
@@ -185,13 +177,20 @@ static bgfx_callback_interface_t s_bgfx_callback = {
 static bgfx_renderer_type_t map_backend(int backend)
 {
     switch (backend) {
-    case 1:  return BGFX_RENDERER_TYPE_DIRECT3D11;
-    case 2:  return BGFX_RENDERER_TYPE_DIRECT3D12;
-    case 3:  return BGFX_RENDERER_TYPE_VULKAN;
-    case 4:  return BGFX_RENDERER_TYPE_OPENGL;
-    case 5:  return BGFX_RENDERER_TYPE_OPENGLES;
-    case 6:  return BGFX_RENDERER_TYPE_METAL;
-    default: return BGFX_RENDERER_TYPE_COUNT; /* auto */
+    case 1:
+        return BGFX_RENDERER_TYPE_DIRECT3D11;
+    case 2:
+        return BGFX_RENDERER_TYPE_DIRECT3D12;
+    case 3:
+        return BGFX_RENDERER_TYPE_VULKAN;
+    case 4:
+        return BGFX_RENDERER_TYPE_OPENGL;
+    case 5:
+        return BGFX_RENDERER_TYPE_OPENGLES;
+    case 6:
+        return BGFX_RENDERER_TYPE_METAL;
+    default:
+        return BGFX_RENDERER_TYPE_COUNT; /* auto */
     }
 }
 
@@ -201,14 +200,10 @@ static const bgfx_renderer_type_t *get_platform_fallback_chain(void)
 {
 #if defined(_WIN32)
     static const bgfx_renderer_type_t chain[] = {
-        BGFX_RENDERER_TYPE_DIRECT3D12,
-        BGFX_RENDERER_TYPE_DIRECT3D11,
-        BGFX_RENDERER_TYPE_VULKAN,
-        BGFX_RENDERER_TYPE_OPENGL,
-        BGFX_RENDERER_TYPE_COUNT
-    };
+        BGFX_RENDERER_TYPE_DIRECT3D12, BGFX_RENDERER_TYPE_DIRECT3D11, BGFX_RENDERER_TYPE_VULKAN,
+        BGFX_RENDERER_TYPE_OPENGL, BGFX_RENDERER_TYPE_COUNT};
 #elif defined(__APPLE__)
-  #include <TargetConditionals.h>
+#include <TargetConditionals.h>
   #if TARGET_OS_IOS || TARGET_OS_TV
     static const bgfx_renderer_type_t chain[] = {
         BGFX_RENDERER_TYPE_METAL,

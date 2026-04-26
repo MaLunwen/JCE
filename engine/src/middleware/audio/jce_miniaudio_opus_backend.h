@@ -1,10 +1,15 @@
 /*
- * jce_miniaudio_opus_backend.h
+ * jce_miniaudio_opus_backend.h  (engine-internal)
  *
  * Plugs Ogg-Opus decoding into miniaudio via the
  * ma_decoding_backend_vtable extension point, so ma_decoder /
  * ma_engine handle .opus files transparently alongside the built-in
  * dr_wav / dr_mp3 / dr_flac / stb_vorbis decoders.
+ *
+ * NOTE: This header intentionally exposes the miniaudio ABI and is
+ * therefore NOT part of JCE's public API.  Application code must
+ * never include this file directly — use the audio facade in
+ * <jce/middleware/audio/jce_audio.h> instead.
  *
  * Royalty-free codec (RFC 6716 + RFC 7845).
  */
@@ -14,6 +19,7 @@
 
 
 #include <jce/os/core/jce_defs.h>
+
 #include <miniaudio.h>
 
 JCE_EXTERN_C_BEGIN

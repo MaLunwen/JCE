@@ -8,11 +8,10 @@
 #include "jce_net_proto.h"
 
 #include "jce_net_messages.pb.h"
+#include "os/core/jce_memory.h"
 
 #include <cstring>
 #include <string>
-
-#include "os/core/jce_memory.h"
 
 extern "C" {
 #include <jce/os/core/jce_log.h>

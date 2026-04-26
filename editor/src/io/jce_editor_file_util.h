@@ -10,11 +10,13 @@
 #ifndef JCE_EDITOR_FILE_UTIL_H
 #define JCE_EDITOR_FILE_UTIL_H
 
-#include "jce_editor_alloc.h"
 #include <jce/os/core/jce_json.h>
+
+#include "jce_editor_alloc.h"
+
 #include <SDL3/SDL.h>
-#include <stddef.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <string.h>
 
 /* Read an entire file into an ED_MALLOC'd buffer.

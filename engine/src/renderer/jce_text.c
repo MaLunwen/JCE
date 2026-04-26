@@ -10,22 +10,21 @@
  * Text strings are decoded as UTF-8.
  */
 
+#include <jce/os/core/jce_log.h>
+#include <jce/os/core/pak_loader.h>
+#include <jce/renderer/jce_primitives.h>
 #include <jce/renderer/jce_text.h>
 #include <jce/renderer/jce_texture.h>
-#include <jce/renderer/jce_primitives.h>
+
 #include "jce_renderer_internal.h"
-#include <jce/os/core/pak_loader.h>
-#include <jce/os/core/jce_log.h>
+#include "os/core/jce_memory.h"
 
 #include <bgfx/c99/bgfx.h>
-#include "os/core/jce_memory.h"
-#include <SDL3/SDL.h>
-
 #include <ft2build.h>
+#include <SDL3/SDL.h>
 #include FT_FREETYPE_H
-#include <hb.h>
 #include <hb-ft.h>
-
+#include <hb.h>
 #include <string.h>
 
 #define LOG_TAG "jce_text"

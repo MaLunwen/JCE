@@ -6,12 +6,12 @@
  * for cache-friendly iteration.
  */
 
-#include <jce/renderer/jce_particles.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/renderer/jce_particles.h>
 
-#include <string.h>
-#include <stdlib.h>
 #include <math.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define LOG_TAG "particles"
 

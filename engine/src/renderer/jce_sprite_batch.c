@@ -5,14 +5,15 @@
  * and flushes using transient vertex/index buffers.
  */
 
-#include <jce/renderer/jce_sprite_batch.h>
-#include <jce/renderer/jce_renderer.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/renderer/jce_renderer.h>
+#include <jce/renderer/jce_sprite_batch.h>
+
 #include "os/core/jce_memory.h"
 
 #include <bgfx/c99/bgfx.h>
-#include <string.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define LOG_TAG "sprite_batch"
 

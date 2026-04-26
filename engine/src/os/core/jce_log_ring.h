@@ -22,6 +22,7 @@
 #include <jce/os/core/jce_log.h>
 
 #include "jce_memory.h"
+
 #include <SDL3/SDL.h>
 #include <stdbool.h>
 #include <stdint.h>

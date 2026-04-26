@@ -22,6 +22,7 @@
 
 #include <jce/middleware/video/jce_mp4_parser.h>
 #include <jce/os/core/jce_log.h>
+
 #include "os/core/jce_memory.h"
 
 #include <aacdecoder_lib.h>
