@@ -9,9 +9,13 @@
 
 /* ── Layout (default DockBuilder ratios) ───────────────────────────── */
 
-#define JCE_LAYOUT_LEFT_RATIO    0.15f
-#define JCE_LAYOUT_RIGHT_RATIO   0.25f
-#define JCE_LAYOUT_BOTTOM_RATIO  0.25f
+/* Default DockSpace proportions. Tuned to approximate Unity / UE
+   defaults on a 16:9 display. Right column is wider than left because
+   the Inspector typically holds dense forms. Bottom row holds tabbed
+   Console / Asset Browser and needs enough vertical room to scan logs. */
+#define JCE_LAYOUT_LEFT_RATIO    0.18f
+#define JCE_LAYOUT_RIGHT_RATIO   0.28f
+#define JCE_LAYOUT_BOTTOM_RATIO  0.28f
 
 /* ── Viewport ──────────────────────────────────────────────────────── */
 

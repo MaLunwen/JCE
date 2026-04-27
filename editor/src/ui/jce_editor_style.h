@@ -11,7 +11,7 @@
 extern "C" {
 #endif
 
-#include <jce/os/core/pak_loader.h>
+#include <jce/os/core/jce_pak_loader.h>
 
 /* Theme indices. */
 #define JCE_THEME_DARK   0
@@ -34,7 +34,7 @@ int  jce_editor_get_theme(void);
    No fonts are bundled — if both lookups fail, the editor falls back to
    ImGui's built-in proggy font for that role.
    Override paths may be NULL or empty.
-   Must be called before jce_imgui_bgfx_rebuild_fonts(). */
+   Must be called before jce_imgui_renderer_rebuild_fonts(). */
 bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
                            const char *en_override,
                            const char *zh_override);
@@ -47,12 +47,22 @@ typedef struct {
 
 /* Enumerate font files available on the host system by scanning a small
    set of well-known per-platform directories. Picks up *.ttf / *.otf /
-   *.ttc files. Pure runtime detection (SDL_GetPlatform + SDL_getenv);
+   *.ttc files. Pure runtime detection (jce_platform_name + getenv);
    no #ifdef branches.
 
    Writes up to `max_entries` records into `out` and returns the count
    actually written. Sorted alphabetically by display_name. */
 int  jce_editor_enumerate_fonts(JceFontEntry *out, int max_entries);
+
+/* Defer a font reload to the next frame (call from inside an ImGui frame
+   to avoid corrupting the active draw list / atlas). Strings are copied. */
+void jce_editor_request_font_reload(float size_pixels,
+                                    const char *en_override,
+                                    const char *zh_override);
+
+/* Editor main loop calls this BEFORE ImGui::NewFrame() — applies any
+   pending reload requested via jce_editor_request_font_reload(). */
+void jce_editor_apply_pending_font_reload(void);
 
 #ifdef __cplusplus
 }

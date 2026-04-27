@@ -12,7 +12,7 @@
 
 #include "jce_run_manager.h"
 
-#include "jce_editor_panels.h"
+#include "ui/jce_editor_panels.h"
 
 extern "C" {
 #include <jce/os/core/jce_process.h>
@@ -22,8 +22,102 @@ extern "C" {
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <sys/stat.h>
+
+#include <jce/os/core/jce_defs.h>
 
 namespace {
+
+#if JCE_PLATFORM_WINDOWS
+static constexpr const char *kExeSuffix = ".exe";
+#else
+static constexpr const char *kExeSuffix = "";
+#endif
+
+static bool path_exists(const std::string &p)
+{
+    if (p.empty()) return false;
+    struct stat st;
+    return stat(p.c_str(), &st) == 0;
+}
+
+/* Try `candidate` as-is and (on platforms with an exe suffix) with the
+ * suffix appended.  Returns the matching path, or empty string. */
+static std::string try_with_suffix(const std::string &candidate)
+{
+    if (path_exists(candidate)) return candidate;
+    if (kExeSuffix[0]) {
+        size_t slen = std::strlen(kExeSuffix);
+        if (candidate.size() < slen ||
+            candidate.compare(candidate.size() - slen, slen, kExeSuffix) != 0) {
+            std::string with = candidate + kExeSuffix;
+            if (path_exists(with)) return with;
+        }
+    }
+    return {};
+}
+
+/* Resolve user-configured executable path.  Tries (in order):
+ *   1. path as-is (then with platform exe suffix on Windows)
+ *   2. for relative paths, prepend a few cwd ancestors ("..", "../..", …)
+ *      so launching the editor from build/desktop/.../release still finds
+ *      siblings declared with repo-relative paths
+ *   3. known CMake preset output dirs for the host platform — keeps the
+ *      out-of-the-box defaults working without the user touching anything
+ * Returns the first match, or the original string for a useful diagnostic. */
+static std::string resolve_executable(const std::string &configured)
+{
+    if (configured.empty()) return configured;
+
+    std::string hit = try_with_suffix(configured);
+    if (!hit.empty()) return hit;
+
+    bool is_absolute = false;
+    if (!configured.empty() && (configured[0] == '/' || configured[0] == '\\'))
+        is_absolute = true;
+    if (configured.size() > 1 && configured[1] == ':')
+        is_absolute = true;
+
+    if (!is_absolute) {
+        const char *parents[] = {
+            ".", "..", "../..", "../../..", "../../../..",
+        };
+        for (const char *par : parents) {
+            std::string p = std::string(par) + "/" + configured;
+            hit = try_with_suffix(p);
+            if (!hit.empty()) return hit;
+        }
+    }
+
+    /* Per-platform "well-known build-preset output" candidates so the
+     * default path (which targets one specific arch/variant) still finds
+     * the binary when the user actually built a different variant. */
+    static const char *kCandidates[] = {
+#if JCE_PLATFORM_WINDOWS
+        "build/desktop/windows-x64/release/caged_kingdom",
+        "build/desktop/windows-x64/dist/caged_kingdom",
+        "build/desktop/windows-x64/debug/caged_kingdom",
+        "build/desktop/windows-arm64/release/caged_kingdom",
+#elif JCE_PLATFORM_MACOS
+        "build/desktop/macos-arm64/CagedKingdom",
+        "build/desktop/macos-x64/CagedKingdom",
+#elif JCE_PLATFORM_LINUX
+        "build/desktop/linux-x64/CagedKingdom",
+        "build/desktop/linux-arm64/CagedKingdom",
+#endif
+        nullptr,
+    };
+    const char *parents[] = { ".", "..", "../..", "../../..", "../../../..",
+                              nullptr };
+    for (int ci = 0; kCandidates[ci]; ++ci) {
+        for (int pi = 0; parents[pi]; ++pi) {
+            std::string p = std::string(parents[pi]) + "/" + kCandidates[ci];
+            hit = try_with_suffix(p);
+            if (!hit.empty()) return hit;
+        }
+    }
+    return configured;
+}
 
 /* 2-second graceful-stop window before forcing termination. */
 constexpr uint64_t STOP_TIMEOUT_MS = 2000;
@@ -213,9 +307,28 @@ bool jce_run_manager_start(const JceRunConfig *cfg)
 
     release_process();
 
+    std::string resolved_exe = resolve_executable(cfg->executable_path);
+    std::string resolved_cwd = cfg->working_directory ? cfg->working_directory : "";
+    if (!path_exists(resolved_exe)) {
+        std::string msg = std::string("game executable not found: ") +
+                          cfg->executable_path;
+        if (resolved_exe != cfg->executable_path)
+            msg += " (also tried: " + resolved_exe + ")";
+        msg += " — set Preferences > Game > Executable Path";
+        set_error(msg);
+        return false;
+    }
+    /* If working dir is empty/missing, default to the directory containing
+     * the resolved executable so the game can find its assets. */
+    if (resolved_cwd.empty() || !path_exists(resolved_cwd)) {
+        size_t slash = resolved_exe.find_last_of("/\\");
+        if (slash != std::string::npos)
+            resolved_cwd = resolved_exe.substr(0, slash);
+    }
+
     JceProcessConfig pcfg{};
-    pcfg.executable_path   = cfg->executable_path;
-    pcfg.working_directory = cfg->working_directory;
+    pcfg.executable_path   = resolved_exe.c_str();
+    pcfg.working_directory = resolved_cwd.empty() ? nullptr : resolved_cwd.c_str();
     pcfg.arguments         = cfg->arguments;
     pcfg.capture_stdout    = cfg->capture_stdout;
     pcfg.capture_stderr    = cfg->capture_stderr;
@@ -223,7 +336,7 @@ bool jce_run_manager_start(const JceRunConfig *cfg)
     JceProcess *proc = jce_process_spawn(&pcfg);
     if (!proc) {
         set_error(std::string("cannot start game: jce_process_spawn failed: ") +
-                  cfg->executable_path);
+                  resolved_exe);
         return false;
     }
 
@@ -236,7 +349,9 @@ bool jce_run_manager_start(const JceRunConfig *cfg)
     g_run.force_stop_logged = false;
 
     log_line(JCE_CONSOLE_INFO,
-             std::string("[run] started external game: ") + cfg->executable_path);
+             std::string("[run] started external game: ") + resolved_exe +
+             (resolved_cwd.empty() ? std::string()
+                                   : (std::string(" (cwd: ") + resolved_cwd + ")")));
     return true;
 }
 

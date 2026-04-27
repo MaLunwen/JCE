@@ -68,15 +68,15 @@ JceSpriteSheet *jce_sprite_sheet_create_grid(const char *image_path,
                                               uint32_t frame_h,
                                               float frame_duration_ms);
 
-void jce_sprite_sheet_destroy(JceSpriteSheet *sheet);
+JCE_API void jce_sprite_sheet_destroy(JceSpriteSheet *sheet);
 
 /* Accessors. */
-const char       *jce_sprite_sheet_image_path(const JceSpriteSheet *sheet);
-uint32_t          jce_sprite_sheet_frame_count(const JceSpriteSheet *sheet);
+JCE_API const char       *jce_sprite_sheet_image_path(const JceSpriteSheet *sheet);
+JCE_API uint32_t          jce_sprite_sheet_frame_count(const JceSpriteSheet *sheet);
 const JceSpriteFrame *jce_sprite_sheet_get_frame(const JceSpriteSheet *sheet,
                                                   uint32_t index);
 
-uint32_t          jce_sprite_sheet_anim_count(const JceSpriteSheet *sheet);
+JCE_API uint32_t          jce_sprite_sheet_anim_count(const JceSpriteSheet *sheet);
 const JceSpriteAnim *jce_sprite_sheet_get_anim(const JceSpriteSheet *sheet,
                                                 uint32_t index);
 const JceSpriteAnim *jce_sprite_sheet_find_anim(const JceSpriteSheet *sheet,
@@ -88,21 +88,21 @@ const JceSpriteAnim *jce_sprite_sheet_find_anim(const JceSpriteSheet *sheet,
 
 typedef struct JceSpritePlayer JceSpritePlayer;
 
-JceSpritePlayer *jce_sprite_player_create(const JceSpriteSheet *sheet);
-void             jce_sprite_player_destroy(JceSpritePlayer *p);
+JCE_API JceSpritePlayer *jce_sprite_player_create(const JceSpriteSheet *sheet);
+JCE_API void             jce_sprite_player_destroy(JceSpritePlayer *p);
 
 /* Set current animation by name. Returns false if not found. */
-bool jce_sprite_player_set_anim(JceSpritePlayer *p, const char *name);
+JCE_API bool jce_sprite_player_set_anim(JceSpritePlayer *p, const char *name);
 
 /* Advance animation by dt seconds. */
-void jce_sprite_player_update(JceSpritePlayer *p, float dt, float speed);
+JCE_API void jce_sprite_player_update(JceSpritePlayer *p, float dt, float speed);
 
 /* Get current frame's UV region (for rendering). */
-const JceSpriteFrame *jce_sprite_player_current_frame(const JceSpritePlayer *p);
-uint32_t              jce_sprite_player_current_index(const JceSpritePlayer *p);
+JCE_API const JceSpriteFrame *jce_sprite_player_current_frame(const JceSpritePlayer *p);
+JCE_API uint32_t              jce_sprite_player_current_index(const JceSpritePlayer *p);
 
-bool jce_sprite_player_is_finished(const JceSpritePlayer *p);
-void jce_sprite_player_reset(JceSpritePlayer *p);
+JCE_API bool jce_sprite_player_is_finished(const JceSpritePlayer *p);
+JCE_API void jce_sprite_player_reset(JceSpritePlayer *p);
 
 JCE_EXTERN_C_END
 

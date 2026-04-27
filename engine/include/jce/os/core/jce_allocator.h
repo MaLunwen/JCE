@@ -24,10 +24,10 @@ JCE_EXTERN_C_BEGIN
 /* ================================================================== */
 
 typedef struct jce_allocator {
-	void *(*alloc)(size_t size, void *ctx);
-	void *(*realloc)(void *ptr, size_t new_size, void *ctx);
-	void  (*free)(void *ptr, void *ctx);
-	void  *ctx;   /* opaque context passed to every call */
+    void *(*alloc)(size_t size, void *ctx);
+    void *(*realloc)(void *ptr, size_t new_size, void *ctx);
+    void  (*free)(void *ptr, void *ctx);
+    void  *ctx;   /* opaque context passed to every call */
 } jce_allocator_t;
 
 /* Default allocator backed by SDL_malloc (which is mimalloc when
@@ -58,13 +58,13 @@ typedef struct jce_arena jce_arena_t;
 
 /* Create an arena with the given byte capacity.
    Uses 'backing' for the single large allocation. */
-jce_arena_t *jce_arena_create(jce_allocator_t backing, size_t capacity);
+JCE_API jce_arena_t *jce_arena_create(jce_allocator_t backing, size_t capacity);
 
 /* Allocate 'size' bytes from the arena.  Returns NULL if exhausted. */
-void *jce_arena_push(jce_arena_t *a, size_t size);
+JCE_API void *jce_arena_push(jce_arena_t *a, size_t size);
 
 /* Allocate and zero-fill 'size' bytes. */
-void *jce_arena_push_zero(jce_arena_t *a, size_t size);
+JCE_API void *jce_arena_push_zero(jce_arena_t *a, size_t size);
 
 /* Reset the arena to empty.  All previous pointers are invalidated. */
 JCE_API void JCE_CALL jce_arena_reset(jce_arena_t *a);
@@ -89,7 +89,7 @@ JCE_API void JCE_CALL jce_arena_destroy(jce_arena_t *a);
 /* Allocate `size` bytes aligned to `alignment` (must be power of two).
    Returned pointer must be released with jce_aligned_free(). Used by
    third-party decoders (e.g. libhevc) that require SIMD-aligned bufs. */
-void *jce_aligned_alloc(size_t size, size_t alignment);
+JCE_API void *jce_aligned_alloc(size_t size, size_t alignment);
 
 /* Release a buffer obtained from jce_aligned_alloc(). NULL is OK. */
 JCE_API void JCE_CALL jce_aligned_free(void *ptr);

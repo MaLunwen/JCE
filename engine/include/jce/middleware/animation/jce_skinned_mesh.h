@@ -70,7 +70,7 @@ JceSkinnedMesh *jce_pbr_mesh_create(
     const uint32_t *indices, uint32_t num_indices);
 
 /* Destroy a skinned mesh and free GPU buffers. */
-void jce_skinned_mesh_destroy(JceSkinnedMesh *mesh);
+JCE_API void jce_skinned_mesh_destroy(JceSkinnedMesh *mesh);
 
 /* Submit the mesh for rendering.
  * For skinned meshes, call jce_skinned_mesh_set_bones() first.
@@ -85,9 +85,9 @@ void jce_skinned_mesh_set_bones(const jce_mat4 *joint_matrices,
                                  uint32_t num_joints);
 
 /* Query whether this mesh has skinning data. */
-bool     jce_skinned_mesh_is_skinned(const JceSkinnedMesh *mesh);
-uint32_t jce_skinned_mesh_vertex_count(const JceSkinnedMesh *mesh);
-uint32_t jce_skinned_mesh_index_count(const JceSkinnedMesh *mesh);
+JCE_API bool     jce_skinned_mesh_is_skinned(const JceSkinnedMesh *mesh);
+JCE_API uint32_t jce_skinned_mesh_vertex_count(const JceSkinnedMesh *mesh);
+JCE_API uint32_t jce_skinned_mesh_index_count(const JceSkinnedMesh *mesh);
 
 JCE_EXTERN_C_END
 

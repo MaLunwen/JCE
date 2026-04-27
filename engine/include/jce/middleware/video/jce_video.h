@@ -66,34 +66,34 @@ JceVideo jce_video_load_memory(const void *data, uint32_t size,
                                 const char *hint_path);
 
 /* Release a clip.  Safe to call with JCE_VIDEO_INVALID. */
-void     jce_video_unload(JceVideo v);
+JCE_API void     jce_video_unload(JceVideo v);
 
 /* -- Queries ------------------------------------------------------- */
 
-bool     jce_video_get_info(JceVideo v, JceVideoInfo *out);
-double   jce_video_get_time(JceVideo v);
-double   jce_video_get_duration(JceVideo v);
-bool     jce_video_has_ended(JceVideo v);
+JCE_API bool     jce_video_get_info(JceVideo v, JceVideoInfo *out);
+JCE_API double   jce_video_get_time(JceVideo v);
+JCE_API double   jce_video_get_duration(JceVideo v);
+JCE_API bool     jce_video_has_ended(JceVideo v);
 
 /* Width / height reported by parsed stream metadata. */
-void     jce_video_get_size(JceVideo v, int *out_w, int *out_h);
+JCE_API void     jce_video_get_size(JceVideo v, int *out_w, int *out_h);
 
 /* -- Transport ----------------------------------------------------- */
 
 /* Advance the internal clock by dt seconds and decode any frames that
  * fall within that window.  When paused, pass dt == 0 or skip the call. */
-void     jce_video_advance(JceVideo v, double dt_seconds);
+JCE_API void     jce_video_advance(JceVideo v, double dt_seconds);
 
 /* Seek to an absolute time.  If exact is false this snaps to the
  * nearest preceding intra-frame (fast).  If true, performs an exact
  * seek (may decode many frames to land on the target). */
-void     jce_video_seek(JceVideo v, double time_sec, bool exact);
+JCE_API void     jce_video_seek(JceVideo v, double time_sec, bool exact);
 
 /* Reset to the beginning of the clip. */
-void     jce_video_rewind(JceVideo v);
+JCE_API void     jce_video_rewind(JceVideo v);
 
 /* Enable / disable looped playback (default: off). */
-void     jce_video_set_loop(JceVideo v, bool loop);
+JCE_API void     jce_video_set_loop(JceVideo v, bool loop);
 
 /* -- Frame access -------------------------------------------------- */
 
@@ -108,20 +108,20 @@ const uint8_t *jce_video_get_frame_rgba(JceVideo v,
 
 /* Monotonic frame counter incremented when a new frame is decoded.
  * Metadata-only mode returns 0. */
-uint64_t jce_video_get_frame_counter(JceVideo v);
+JCE_API uint64_t jce_video_get_frame_counter(JceVideo v);
 
 /* -- Audio status -------------------------------------------------- */
 
 /* Returns high-level embedded-audio availability for the clip. */
-JceVideoAudioStatus jce_video_get_audio_status(JceVideo v);
+JCE_API JceVideoAudioStatus jce_video_get_audio_status(JceVideo v);
 
 /* Human-readable reason for current audio status.
  * Returned pointer is owned by the video handle and remains valid
  * until jce_video_unload(). */
-const char *jce_video_get_audio_status_text(JceVideo v);
+JCE_API const char *jce_video_get_audio_status_text(JceVideo v);
 
 /* Number of encoded samples in the selected MP4 audio track (0 if none/unknown). */
-uint32_t jce_video_get_audio_sample_count(JceVideo v);
+JCE_API uint32_t jce_video_get_audio_sample_count(JceVideo v);
 
 /* DEPRECATED: returns the full-clip PCM blob if one is currently
  * resident. With the streaming pipeline this returns NULL for codec
@@ -150,13 +150,13 @@ uint32_t jce_video_audio_pull(JceVideo v,
                                int16_t *out, uint32_t frames);
 
 /* Seek the audio stream to `time_sec`. */
-void jce_video_audio_seek(JceVideo v, double time_sec);
+JCE_API void jce_video_audio_seek(JceVideo v, double time_sec);
 
 /* Audio playback time, in seconds, derived from frames pulled. */
-double jce_video_audio_get_time(JceVideo v);
+JCE_API double jce_video_audio_get_time(JceVideo v);
 
 /* True iff the streaming source has reached EOF and the buffer is drained. */
-bool jce_video_audio_eof(JceVideo v);
+JCE_API bool jce_video_audio_eof(JceVideo v);
 
 /* -- Performance probes (debug; S1) ------------------------------- */
 
@@ -187,7 +187,7 @@ typedef struct {
     bool     queue_yuv_mode;     /* false: RGBA queue (current path) */
 } JceVideoPerfStats;
 
-bool jce_video_get_perf_stats(JceVideo v, JceVideoPerfStats *out);
+JCE_API bool jce_video_get_perf_stats(JceVideo v, JceVideoPerfStats *out);
 
 JCE_EXTERN_C_END
 

@@ -10,7 +10,7 @@
 #ifndef JCE_EDITOR_H
 #define JCE_EDITOR_H
 
-#include <SDL3/SDL_events.h>
+#include <jce/os/platform/jce_event.h>
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#include <jce/os/core/pak_loader.h>
+#include <jce/os/core/jce_pak_loader.h>
 #include <jce/os/platform/jce_window.h>
 
 /* Initialize the editor subsystem.
@@ -29,9 +29,9 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window);
 /* Shut down the editor and release all resources. */
 void jce_editor_shutdown(void);
 
-/* Process an SDL event for ImGui input.
+/* Process a platform event for ImGui input.
    Returns true if ImGui consumed the event (game should skip it). */
-bool jce_editor_process_event(const SDL_Event *event);
+bool jce_editor_process_event(const JceEvent *event);
 
 /* Run one editor frame: NewFrame -> draw panels -> Render -> bgfx submit.
    Call between jce_renderer_begin_frame and jce_renderer_end_frame. */

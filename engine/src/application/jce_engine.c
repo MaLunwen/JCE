@@ -30,7 +30,7 @@
 #include <jce/os/core/jce_crash_handler.h>
 #include <jce/os/core/jce_event.h>
 #include <jce/os/core/jce_log.h>
-#include <jce/os/core/pak_loader.h>
+#include <jce/os/core/jce_pak_loader.h>
 #include <jce/os/platform/jce_input.h>
 #include <jce/os/platform/jce_single_instance.h>
 #include <jce/os/platform/jce_window.h>
@@ -39,7 +39,7 @@
 #include <jce/renderer/jce_text.h>
 #include <jce/resource/jce_asset.h>
 
-#include "embedded_assets.h"
+#include "jce_embedded_assets.h"
 #include "os/platform/jce_window_internal.h"
 #include "renderer/jce_gpu_caps.h"
 
@@ -655,6 +655,88 @@ static bool jce_resize_event_watch(void *userdata, SDL_Event *event)
 
 /* -- Event routing ------------------------------------------------- */
 
+/* Translate one SDL_Event into our backend-neutral JceEvent.
+ * Unknown SDL event types map to JCE_EVENT_OTHER so applications can
+ * still distinguish "got an event" from "no event". */
+static void translate_sdl_event(const SDL_Event *src, JceEvent *dst)
+{
+    dst->type = JCE_EVENT_OTHER;
+
+    switch (src->type) {
+    case SDL_EVENT_QUIT:
+        dst->type = JCE_EVENT_QUIT;
+        break;
+
+    case SDL_EVENT_KEY_DOWN:
+    case SDL_EVENT_KEY_UP:
+        dst->type = (src->type == SDL_EVENT_KEY_DOWN)
+                  ? JCE_EVENT_KEY_DOWN : JCE_EVENT_KEY_UP;
+        dst->key.scancode = (JceKey)src->key.scancode;
+        dst->key.mod      = (uint16_t)src->key.mod;
+        dst->key.repeat   = src->key.repeat ? true : false;
+        break;
+
+    case SDL_EVENT_TEXT_INPUT:
+        dst->type = JCE_EVENT_TEXT_INPUT;
+        if (src->text.text) {
+            size_t n = strlen(src->text.text);
+            if (n >= sizeof(dst->text.text))
+                n = sizeof(dst->text.text) - 1;
+            memcpy(dst->text.text, src->text.text, n);
+            dst->text.text[n] = '\0';
+        } else {
+            dst->text.text[0] = '\0';
+        }
+        break;
+
+    case SDL_EVENT_MOUSE_MOTION:
+        dst->type = JCE_EVENT_MOUSE_MOTION;
+        dst->motion.x    = src->motion.x;
+        dst->motion.y    = src->motion.y;
+        dst->motion.xrel = src->motion.xrel;
+        dst->motion.yrel = src->motion.yrel;
+        break;
+
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+    case SDL_EVENT_MOUSE_BUTTON_UP:
+        dst->type = (src->type == SDL_EVENT_MOUSE_BUTTON_DOWN)
+                  ? JCE_EVENT_MOUSE_BUTTON_DOWN : JCE_EVENT_MOUSE_BUTTON_UP;
+        dst->button.button = src->button.button;  /* SDL_BUTTON_* == JCE_MOUSE_BUTTON_* */
+        dst->button.clicks = src->button.clicks;
+        dst->button.x      = src->button.x;
+        dst->button.y      = src->button.y;
+        break;
+
+    case SDL_EVENT_MOUSE_WHEEL:
+        dst->type = JCE_EVENT_MOUSE_WHEEL;
+        dst->wheel.x = src->wheel.x;
+        dst->wheel.y = src->wheel.y;
+        break;
+
+    case SDL_EVENT_WINDOW_FOCUS_GAINED:
+        dst->type = JCE_EVENT_WINDOW_FOCUS_GAINED;
+        break;
+    case SDL_EVENT_WINDOW_FOCUS_LOST:
+        dst->type = JCE_EVENT_WINDOW_FOCUS_LOST;
+        break;
+    case SDL_EVENT_WINDOW_RESIZED:
+    case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
+        dst->type = JCE_EVENT_WINDOW_RESIZED;
+        dst->resize.w = (uint32_t)src->window.data1;
+        dst->resize.h = (uint32_t)src->window.data2;
+        break;
+    case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+        dst->type = JCE_EVENT_WINDOW_CLOSE;
+        break;
+    case SDL_EVENT_WINDOW_EXPOSED:
+        dst->type = JCE_EVENT_WINDOW_EXPOSED;
+        break;
+
+    default:
+        break;
+    }
+}
+
 JceAppResult jce_engine_event(JceEngine *e, const void *platform_event)
 {
     const SDL_Event *event = (const SDL_Event *)platform_event;
@@ -662,9 +744,12 @@ JceAppResult jce_engine_event(JceEngine *e, const void *platform_event)
     if (event->type == SDL_EVENT_TERMINATING)
         return JCE_APP_SUCCESS;
 
+    JceEvent ev = (JceEvent){0};
+    translate_sdl_event(event, &ev);
+
     if (event->type == SDL_EVENT_QUIT) {
         if (g_app_desc.on_event)
-            g_app_desc.on_event(event, g_app_desc.user_data);
+            g_app_desc.on_event(&ev, g_app_desc.user_data);
 
         /* If the application registered a should_quit callback, give it
            a chance to intercept the quit (e.g. to show an unsaved-changes
@@ -683,7 +768,7 @@ JceAppResult jce_engine_event(JceEngine *e, const void *platform_event)
        from both SDL_PollEvent and Windows modal message loops. */
 
     if (g_app_desc.on_event)
-        g_app_desc.on_event(event, g_app_desc.user_data);
+        g_app_desc.on_event(&ev, g_app_desc.user_data);
 
     return JCE_APP_CONTINUE;
 }

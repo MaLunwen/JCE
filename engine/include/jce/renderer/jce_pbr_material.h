@@ -70,7 +70,7 @@ typedef struct JcePbrMaterial {
 /* ================================================================== */
 
 /* Create a default PBR material (white, metallic=0, roughness=1, opaque). */
-JcePbrMaterial jce_pbr_material_default(void);
+JCE_API JcePbrMaterial jce_pbr_material_default(void);
 
 /* Bind the PBR material state (textures, uniforms) for the next draw call.
  * Selects the appropriate PBR shader program.
@@ -81,7 +81,7 @@ void jce_pbr_material_bind(const JcePbrMaterial *mat,
 /* Set the global PBR view mode (0=shaded, 1=wireframe, 2=textured/unlit,
  * 3=wireframe+textured). Affects all subsequent jce_pbr_material_bind
  * calls. The scene renderer pushes this once per frame from its config. */
-void jce_pbr_material_set_view_mode(int mode);
+JCE_API void jce_pbr_material_set_view_mode(int mode);
 
 /* ================================================================== */
 /* Material file I/O (.mat.json)                                       */

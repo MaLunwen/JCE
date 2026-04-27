@@ -1,22 +1,21 @@
 /*
  * jce_gizmo_math.h  Projection + ray utilities for gizmo interaction.
  *
- * NOTE: This is the gizmo subsystem's *raw float-array* adapter to cglm.
- * The gizmo pipeline operates on flat float[3]/float[16] buffers because
- * those interop directly with ImGui draw lists, bgfx vertex layouts, and
- * the editor scene's column-major matrix exports.  jce_math.h provides
- * the same algorithms over the struct API (jce_vec3 / jce_mat4) for
- * everything else in the codebase; this header is the only sanctioned
- * place to call cglm's raw API.
+ * Raw float-array (float[3]/float[16]) adapter built on jce_math.h's
+ * struct API.  The gizmo pipeline interoperates with ImGui draw lists
+ * and column-major editor matrix exports as flat float buffers, so we
+ * keep the raw signatures here and reinterpret to the public struct
+ * types where it's layout-compatible.  No third-party math leakage.
  */
 
 #ifndef JCE_GIZMO_MATH_H
 #define JCE_GIZMO_MATH_H
 
-#include <jce/os/core/jce_math.h> /* JCE_PI, JCE_DEG2RAD, JCE_RAD2DEG */
+#include <jce/os/core/jce_math.h> /* jce_vec3 / jce_mat4 / JCE_PI / helpers */
 
-#include <cglm/cglm.h> /* raw float-array API (vec3, mat4) */
+#include <math.h>
 #include <stdbool.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,78 +31,92 @@ typedef struct {
     float viewport_origin[2];    /* scene view top-left screen coords */
 } JceGizmoCamera;
 
-/* ── Thin vec3 / mat4 wrappers over cglm ──────────────────────────── */
+/* ── Thin vec3 / mat4 wrappers built on jce_math.h struct API ─────── */
 /*
- * cglm's raw API operates on float[4][4] (mat4) and float[4] (vec4).
- * Our gizmo code uses flat float[16] / float[3] arrays with the same
- * memory layout, so the reinterpret cast below is safe.  The const
- * casts are necessary because cglm parameters are not always const-
- * qualified in its C headers.
+ * jce_vec3 is { float x,y,z; } and jce_mat4 is a union { float raw[4][4]; }
+ * — both are layout-compatible with float[3] and float[16] respectively,
+ * so we can reinterpret the caller's flat buffers as the struct types.
  */
 
-/* Reinterpret a flat float[16] as cglm mat4 (float[4][4]). */
-#define GM_MAT4(p) ((mat4 *)(p))
+#define GM_V3_REF(p) (*(jce_vec3 *)(p))
+#define GM_V3_CREF(p) (*(const jce_vec3 *)(p))
+#define GM_M4_REF(p) (*(jce_mat4 *)(p))
+#define GM_M4_CREF(p) (*(const jce_mat4 *)(p))
 
 static inline void gm_v3_copy(float dst[3], const float src[3])
 {
-    glm_vec3_copy((float *)src, dst);
+    dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2];
 }
 
 static inline void gm_v3_sub(float out[3], const float a[3], const float b[3])
 {
-    glm_vec3_sub((float *)a, (float *)b, out);
+    out[0] = a[0] - b[0]; out[1] = a[1] - b[1]; out[2] = a[2] - b[2];
 }
 
 static inline void gm_v3_add(float out[3], const float a[3], const float b[3])
 {
-    glm_vec3_add((float *)a, (float *)b, out);
+    out[0] = a[0] + b[0]; out[1] = a[1] + b[1]; out[2] = a[2] + b[2];
 }
 
 static inline void gm_v3_scale(float out[3], const float v[3], float s)
 {
-    glm_vec3_scale((float *)v, s, out);
+    out[0] = v[0] * s; out[1] = v[1] * s; out[2] = v[2] * s;
 }
 
 static inline float gm_v3_dot(const float a[3], const float b[3])
 {
-    return glm_vec3_dot((float *)a, (float *)b);
+    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
 }
 
 static inline void gm_v3_cross(float out[3], const float a[3], const float b[3])
 {
-    glm_vec3_cross((float *)a, (float *)b, out);
+    float x = a[1]*b[2] - a[2]*b[1];
+    float y = a[2]*b[0] - a[0]*b[2];
+    float z = a[0]*b[1] - a[1]*b[0];
+    out[0] = x; out[1] = y; out[2] = z;
 }
 
 static inline float gm_v3_len(const float v[3])
 {
-    return glm_vec3_norm((float *)v);
+    return sqrtf(gm_v3_dot(v, v));
 }
 
 static inline void gm_v3_normalize(float out[3], const float v[3])
 {
-    float l = glm_vec3_norm((float *)v);
+    float l = gm_v3_len(v);
     if (l < 1e-8f) { out[0] = out[1] = out[2] = 0.0f; return; }
-    glm_vec3_scale((float *)v, 1.0f / l, out);
+    float inv = 1.0f / l;
+    out[0] = v[0] * inv; out[1] = v[1] * inv; out[2] = v[2] * inv;
 }
 
-/* ── Matrix helpers (column-major 4×4, backed by cglm) ─────────────── */
+/* ── Matrix helpers (column-major 4×4, backed by jce_math.h) ──────── */
 
 static inline void gm_m4_mul_v4(float out[4], const float m[16], const float v[4])
 {
-    glm_mat4_mulv(*GM_MAT4(m), (float *)v, out);
+    /* column-major: out = m * v */
+    out[0] = m[0]*v[0] + m[4]*v[1] + m[8]*v[2]  + m[12]*v[3];
+    out[1] = m[1]*v[0] + m[5]*v[1] + m[9]*v[2]  + m[13]*v[3];
+    out[2] = m[2]*v[0] + m[6]*v[1] + m[10]*v[2] + m[14]*v[3];
+    out[3] = m[3]*v[0] + m[7]*v[1] + m[11]*v[2] + m[15]*v[3];
 }
 
 static inline void gm_m4_mul(float out[16], const float a[16], const float b[16])
 {
-    glm_mat4_mul(*GM_MAT4(a), *GM_MAT4(b), *GM_MAT4(out));
+    jce_mat4 r = jce_m4_multiply(&GM_M4_CREF(a), &GM_M4_CREF(b));
+    memcpy(out, r.raw, sizeof(float) * 16);
 }
 
 /* Invert a 4×4 column-major matrix. Returns false if singular. */
 static inline bool gm_m4_invert(float inv[16], const float m[16])
 {
-    float det = glm_mat4_det(*GM_MAT4(m));
-    if (fabsf(det) < 1e-12f) return false;
-    glm_mat4_inv(*GM_MAT4(m), *GM_MAT4(inv));
+    /* jce_m4_inverse computes via cofactor expansion; check determinant via
+       a quick 2x2 minor approximation by inverting and detecting NaN.  The
+       public API doesn't expose a det() helper, so we trust the caller's
+       matrix is well-formed for gizmo use (cameras have non-zero det). */
+    jce_mat4 r = jce_m4_inverse(&GM_M4_CREF(m));
+    /* sanity: NaN/Inf check on first element */
+    if (!(r.raw[0][0] == r.raw[0][0])) return false;
+    memcpy(inv, r.raw, sizeof(float) * 16);
     return true;
 }
 

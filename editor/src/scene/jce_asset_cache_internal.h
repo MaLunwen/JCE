@@ -29,10 +29,8 @@ extern "C" {
 #include <jce/renderer/jce_mesh.h>
 #include <jce/renderer/jce_texture.h>
 #include <jce/resource/jce_asset.h>
+#include <jce/resource/jce_image_decode.h>
 }
-
-#include <SDL3/SDL.h>
-#include <SDL3_image/SDL_image.h>
 
 #define LOG_TAG "scene_asset_cache"
 

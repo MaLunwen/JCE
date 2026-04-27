@@ -1,14 +1,14 @@
 /*
- * jce_imgui_bgfx.cpp  ImGui bgfx renderer backend implementation.
+ * jce_imgui_renderer.cpp  ImGui renderer backend implementation (bgfx).
  *
  * Renders ImGui draw lists using bgfx transient vertex/index buffers.
  * Each draw command is submitted on JCE_VIEW_IMGUI (view 255).
  */
 
-#include "jce_imgui_bgfx.h"
+#include <jce/ui/jce_imgui_renderer.h>
 
 #include <bgfx/c99/bgfx.h>
-#include <imgui.h>
+#include <jce/tools/jce_imgui.h>
 #include <string.h>
 
 extern "C" {
@@ -18,7 +18,7 @@ extern "C" {
 #include <jce/renderer/jce_views.h>
 }
 
-#define LOG_TAG "imgui_bgfx"
+#define LOG_TAG "imgui_renderer"
 
 /* ── Static state ──────────────────────────────────────────────────── */
 
@@ -58,7 +58,7 @@ static void create_font_texture(void)
 
 /* ── Public API ────────────────────────────────────────────────────── */
 
-bool jce_imgui_bgfx_init(const JcePakArchive *pak, uint8_t view_id)
+bool jce_imgui_renderer_init(const JcePakArchive *pak, uint8_t view_id)
 {
     s_ctx.view_id = view_id;
 
@@ -101,7 +101,7 @@ bool jce_imgui_bgfx_init(const JcePakArchive *pak, uint8_t view_id)
     return true;
 }
 
-void jce_imgui_bgfx_shutdown(void)
+void jce_imgui_renderer_shutdown(void)
 {
     if (!s_ctx.initialized) return;
 
@@ -121,7 +121,7 @@ void jce_imgui_bgfx_shutdown(void)
     LOG_INFO(LOG_TAG, "shutdown");
 }
 
-void jce_imgui_bgfx_setup_view(uint16_t width, uint16_t height)
+void jce_imgui_renderer_setup_view(uint16_t width, uint16_t height)
 {
     if (!s_ctx.initialized) return;
 
@@ -140,7 +140,7 @@ void jce_imgui_bgfx_setup_view(uint16_t width, uint16_t height)
     bgfx_set_view_transform(s_ctx.view_id, NULL, &ortho);
 }
 
-void jce_imgui_bgfx_render_draw_data(void)
+void jce_imgui_renderer_draw(void)
 {
     if (!s_ctx.initialized) return;
 
@@ -234,7 +234,7 @@ void jce_imgui_bgfx_render_draw_data(void)
     }
 }
 
-void jce_imgui_bgfx_rebuild_fonts(void)
+void jce_imgui_renderer_rebuild_fonts(void)
 {
     if (!s_ctx.initialized) return;
 

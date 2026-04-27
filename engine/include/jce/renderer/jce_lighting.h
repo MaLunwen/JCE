@@ -24,10 +24,10 @@ typedef struct {
 } JceDirLight;
 
 /* Create a default directional light (white, from upper-right-front). */
-JceDirLight jce_dir_light_default(void);
+JCE_API JceDirLight jce_dir_light_default(void);
 
 /* Apply the directional light uniforms for the next mesh draw calls. */
-void jce_lighting_apply(const JceRenderer *r, const JceDirLight *light);
+JCE_API void jce_lighting_apply(const JceRenderer *r, const JceDirLight *light);
 
 JCE_EXTERN_C_END
 

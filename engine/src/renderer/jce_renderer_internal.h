@@ -35,6 +35,7 @@ bgfx_program_handle_t jce_renderer_get_bgfx_program_pbr(const JceRenderer *r);
 bgfx_program_handle_t jce_renderer_get_bgfx_program_pbr_skinned(const JceRenderer *r);
 bgfx_program_handle_t jce_renderer_get_bgfx_program_shadow(const JceRenderer *r);
 bgfx_program_handle_t jce_renderer_get_bgfx_program_shadow_skinned(const JceRenderer *r);
+bgfx_program_handle_t jce_renderer_get_bgfx_program_terrain(const JceRenderer *r);
 
 #ifdef __cplusplus
 }

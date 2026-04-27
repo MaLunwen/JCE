@@ -33,20 +33,20 @@ typedef struct JceAudio      JceAudio;
 
 /* Async request types. */
 typedef enum {
-	JCE_ASYNC_TEXTURE,
-	JCE_ASYNC_AUDIO,
-	JCE_ASYNC_MESH,
-	JCE_ASYNC_MODEL,
-	JCE_ASYNC_RAW,
-	JCE_ASYNC_FONT
+    JCE_ASYNC_TEXTURE,
+    JCE_ASYNC_AUDIO,
+    JCE_ASYNC_MESH,
+    JCE_ASYNC_MODEL,
+    JCE_ASYNC_RAW,
+    JCE_ASYNC_FONT
 } JceAsyncRequestType;
 
 /* Load parameters (copied into request). */
 typedef struct JceAsyncLoadInfo {
-	int      texture_sampler_mode;
-	float    font_size;
-	uint32_t font_codepoints[256];
-	int      font_codepoint_count;
+    int      texture_sampler_mode;
+    float    font_size;
+    uint32_t font_codepoints[256];
+    int      font_codepoint_count;
 } JceAsyncLoadInfo;
 
 /*
@@ -60,23 +60,23 @@ typedef struct JceAsyncLoadInfo {
  *   5. Pool frees the request
  */
 typedef struct JceAsyncRequest {
-	/* --- Input (read-only after submission) --- */
-	JceAsyncRequestType type;
-	uint16_t            slot_index;    /* target slot in asset manager */
-	char                path[256];     /* virtual asset path */
-	JcePakArchive         *pak;
-	JceFileSystem      *fs;
-	JceAsyncLoadInfo    info;
+    /* --- Input (read-only after submission) --- */
+    JceAsyncRequestType type;
+    uint16_t            slot_index;    /* target slot in asset manager */
+    char                path[256];     /* virtual asset path */
+    JcePakArchive         *pak;
+    JceFileSystem      *fs;
+    JceAsyncLoadInfo    info;
 
-	/* --- Output (written by worker) --- */
-	void               *decoded_data;  /* type-specific decoded result */
-	size_t              decoded_size;
-	bool                success;
-	bool                is_cooked;     /* true if data came from .jceasset */
-	SDL_AtomicInt       done;          /* 0=working, 1=complete */
+    /* --- Output (written by worker) --- */
+    void               *decoded_data;  /* type-specific decoded result */
+    size_t              decoded_size;
+    bool                success;
+    bool                is_cooked;     /* true if data came from .jceasset */
+    SDL_AtomicInt       done;          /* 0=working, 1=complete */
 
-	/* --- Internal linked list --- */
-	struct JceAsyncRequest *next;
+    /* --- Internal linked list --- */
+    struct JceAsyncRequest *next;
 } JceAsyncRequest;
 
 /* ================================================================== */

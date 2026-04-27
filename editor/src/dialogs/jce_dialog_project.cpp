@@ -7,6 +7,7 @@
  */
 
 #include "jce_editor_dialogs_internal.h"
+#include "core/jce_assetdb.h"
 
 /* ── Shared state ─────────────────────────────────────────────────── */
 
@@ -17,9 +18,11 @@ void set_current_project_root(const char *path)
 {
     if (!path || path[0] == '\0') {
         s_current_project_root[0] = '\0';
+        jce_assetdb_set_root("");
         return;
     }
     snprintf(s_current_project_root, sizeof(s_current_project_root), "%s", path);
+    jce_assetdb_set_root(s_current_project_root);
 }
 
 bool is_valid_project_dir(const char *path)
@@ -604,7 +607,7 @@ void jce_editor_dialog_open_project(bool *p_open)
             s_open_project.browse_open = false;
         }
         ImGui::SameLine();
-        if (ImGui::Button("Close Browser###op_browse_close", ImVec2(120, 0))) {
+        if (ImGui::Button(jce_editor_i18n_id("newProject.button.closeBrowser", "op_browse_close"), ImVec2(120, 0))) {
             s_open_project.browse_open = false;
         }
         if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {

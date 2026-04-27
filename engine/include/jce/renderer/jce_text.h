@@ -36,12 +36,12 @@ typedef struct JcePakArchive  JcePakArchive;
  * Idempotent. Safe to call after all JceFont have been closed.
  * Calling jce_font_open* again after shutdown is allowed and will
  * re-initialize lazily. */
-void jce_text_shutdown(void);
+JCE_API void jce_text_shutdown(void);
 
 /* Open a font from a PAK asset (e.g. "fonts/JCE.ttf").
    pt_size: point size for glyph rasterization.
    Returns NULL on failure.  Only ASCII glyphs are pre-rendered. */
-JceFont *jce_font_open(const JcePakArchive *pak, const char *asset_path, float pt_size);
+JCE_API JceFont *jce_font_open(const JcePakArchive *pak, const char *asset_path, float pt_size);
 
 /* Open a font with additional Unicode codepoints beyond ASCII.
    extra_cps / extra_count: non-ASCII codepoints to pre-render
@@ -51,7 +51,7 @@ JceFont *jce_font_open_ex(const JcePakArchive *pak, const char *asset_path,
                            const uint32_t *extra_cps, int extra_count);
 
 /* Close a font and free its atlas texture. */
-void jce_font_close(JceFont *font);
+JCE_API void jce_font_close(JceFont *font);
 
 /* Draw a UTF-8 text string at (x, y) in logical coordinates.
    color: ABGR packed via jce_rgba(). */
@@ -65,7 +65,7 @@ void jce_text_draw_scaled(const JceRenderer *r, JceFont *font,
                           const char *text, uint32_t color);
 
 /* Get the line height in pixels (at native pt_size). */
-int jce_font_line_height(const JceFont *font);
+JCE_API int jce_font_line_height(const JceFont *font);
 
 /* Measure a string's bounding box in pixels (at native pt_size). */
 void jce_text_measure(const JceFont *font, const char *text,

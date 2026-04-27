@@ -36,8 +36,8 @@ typedef enum {
 
 typedef struct JceBtContext JceBtContext;
 
-JceBtContext *jce_bt_create(void);
-void          jce_bt_destroy(JceBtContext *ctx);
+JCE_API JceBtContext *jce_bt_create(void);
+JCE_API void          jce_bt_destroy(JceBtContext *ctx);
 
 /* ================================================================== */
 /* Action registration                                                 */
@@ -77,24 +77,24 @@ JceBtTreeHandle jce_bt_load_tree(JceBtContext *ctx,
 /*
  * Load a behavior tree from a file path.
  */
-JceBtTreeHandle jce_bt_load_tree_file(JceBtContext *ctx, const char *path);
+JCE_API JceBtTreeHandle jce_bt_load_tree_file(JceBtContext *ctx, const char *path);
 
 /* ================================================================== */
 /* Execution                                                           */
 /* ================================================================== */
 
 /* Tick the tree once.  Returns the root node status. */
-JceBtStatus jce_bt_tick(JceBtContext *ctx, JceBtTreeHandle tree);
+JCE_API JceBtStatus jce_bt_tick(JceBtContext *ctx, JceBtTreeHandle tree);
 
 /* Halt a running tree (reset all RUNNING nodes). */
-void jce_bt_halt(JceBtContext *ctx, JceBtTreeHandle tree);
+JCE_API void jce_bt_halt(JceBtContext *ctx, JceBtTreeHandle tree);
 
 /* ================================================================== */
 /* Debug                                                               */
 /* ================================================================== */
 
 /* Return the number of loaded trees. */
-uint32_t jce_bt_tree_count(const JceBtContext *ctx);
+JCE_API uint32_t jce_bt_tree_count(const JceBtContext *ctx);
 
 JCE_EXTERN_C_END
 

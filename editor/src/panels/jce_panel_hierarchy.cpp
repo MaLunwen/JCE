@@ -7,6 +7,7 @@
  */
 
 #include "jce_panel_hierarchy_internal.h"
+#include "core/jce_hotkeys.h"
 
 /* ── Content (embeddable in tabs) ─────────────────────────────────── */
 
@@ -106,7 +107,7 @@ void jce_editor_panel_hierarchy_content(void)
 
         /* Paste is allowed regardless of focus (pastes under focused if
          * any, else at scene root). */
-        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V, false) && jce_state_has_copied()) {
+        if (jce_hotkey_pressed(JCE_HK_EDIT_PASTE) && jce_state_has_copied()) {
             uint32_t pasted_ids[JCE_MAX_SELECTED];
             uint32_t parent = jce_state_entity_exists(focused) ? focused : 0;
             int pasted_n = jce_state_paste_entities(parent, pasted_ids,
@@ -119,11 +120,11 @@ void jce_editor_panel_hierarchy_content(void)
         }
 
         if (focused) {
-            if (ImGui::IsKeyPressed(ImGuiKey_F2, false)) {
+            if (jce_hotkey_pressed(JCE_HK_EDIT_RENAME)) {
                 if (jce_state_entity_exists(focused))
                     begin_rename_entity(focused, jce_state_entity_name(focused));
             }
-            if (ImGui::IsKeyPressed(ImGuiKey_Delete, false)) {
+            if (jce_hotkey_pressed(JCE_HK_EDIT_DELETE)) {
                 int sel_count = 0;
                 const uint32_t *sel = jce_state_get_selection(&sel_count);
                 if (sel_count > 1) {
@@ -135,7 +136,7 @@ void jce_editor_panel_hierarchy_content(void)
                     jce_editor_inspector_request_delete_confirm(focused);
                 }
             }
-            if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D, false)) {
+            if (jce_hotkey_pressed(JCE_HK_EDIT_DUPLICATE)) {
                 int sel_count = 0;
                 const uint32_t *sel = jce_state_get_selection(&sel_count);
                 if (sel_count > 1) {
@@ -165,7 +166,7 @@ void jce_editor_panel_hierarchy_content(void)
                     jce_state_select_entity(dup, false);
                 }
             }
-            if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false)) {
+            if (jce_hotkey_pressed(JCE_HK_EDIT_COPY)) {
                 int sel_count = 0;
                 const uint32_t *sel = jce_state_get_selection(&sel_count);
                 if (sel_count > 0)
@@ -173,7 +174,7 @@ void jce_editor_panel_hierarchy_content(void)
                 else
                     jce_state_copy_entity(focused);
             }
-            if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_X, false)) {
+            if (jce_hotkey_pressed(JCE_HK_EDIT_CUT)) {
                 int sel_count = 0;
                 const uint32_t *sel = jce_state_get_selection(&sel_count);
                 if (sel_count > 0)
@@ -181,8 +182,7 @@ void jce_editor_panel_hierarchy_content(void)
                 else
                     jce_state_copy_entities(&focused, 1, true);
             }
-            if (ImGui::IsKeyPressed(ImGuiKey_F, false) && !ImGui::GetIO().KeyCtrl
-                && !ImGui::GetIO().KeyAlt && !ImGui::GetIO().KeyShift)
+            if (jce_hotkey_pressed(JCE_HK_VIEW_FRAME_SELECTED))
                 focus_entity_in_scene(focused);
         }
     }

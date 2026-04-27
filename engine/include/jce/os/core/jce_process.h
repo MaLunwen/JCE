@@ -59,31 +59,31 @@ typedef struct JceProcess JceProcess;
 
 /* Spawn a new process.  Returns NULL on failure (use SDL_GetError
    for details).  Caller owns the returned handle. */
-JceProcess *jce_process_spawn(const JceProcessConfig *cfg);
+JCE_API JceProcess *jce_process_spawn(const JceProcessConfig *cfg);
 
 /* Destroy a process handle.  If the child is still running, it is
    force-killed and reaped first.  Always safe to call with NULL. */
-void jce_process_destroy(JceProcess *p);
+JCE_API void jce_process_destroy(JceProcess *p);
 
 /* Read up to `cap` bytes from the child's stdout into `buf`.
    Returns the number of bytes actually read (0 if no data is
    currently available or stdout was not captured). */
-size_t jce_process_read_stdout(JceProcess *p, char *buf, size_t cap);
+JCE_API size_t jce_process_read_stdout(JceProcess *p, char *buf, size_t cap);
 
 /* Same as jce_process_read_stdout but for stderr. */
-size_t jce_process_read_stderr(JceProcess *p, char *buf, size_t cap);
+JCE_API size_t jce_process_read_stderr(JceProcess *p, char *buf, size_t cap);
 
 /* Request a graceful stop (SDL_KillProcess(force=false)).
    Returns false if the underlying SDL call failed. */
-bool jce_process_request_stop(JceProcess *p);
+JCE_API bool jce_process_request_stop(JceProcess *p);
 
 /* Force-kill the child (SDL_KillProcess(force=true)). */
-bool jce_process_force_kill(JceProcess *p);
+JCE_API bool jce_process_force_kill(JceProcess *p);
 
 /* Non-blocking exit poll.  Returns true if the process has exited;
    in that case *out_exit_code (if non-NULL) receives the exit code.
    Returns false while the process is still running. */
-bool jce_process_poll_exit(JceProcess *p, int *out_exit_code);
+JCE_API bool jce_process_poll_exit(JceProcess *p, int *out_exit_code);
 
 JCE_EXTERN_C_END
 

@@ -9,7 +9,7 @@
 
 #include <jce/os/core/jce_timer.h>
 
-#include "jce_editor_file_util.h"
+#include "io/jce_editor_file_util.h"
 #include "jce_scene_render_internal.h"
 
 #include <cstdio>
@@ -116,8 +116,8 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
         return false;
     }
 
-    const bgfx_caps_t *caps = bgfx_get_caps();
-    s_sr.homogeneous_depth = caps ? caps->homogeneousDepth : false;
+    JceGfxCaps caps = jce_gfx_caps();
+    s_sr.homogeneous_depth = caps.homogeneous_depth;
 
     /* Create the editor orbit camera. */
     JceCameraDesc cam_desc;
@@ -152,12 +152,12 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     s_sr.camera_cache_valid = false;
 
     /* Pos + color vertex layout for transient buffers (grid / overlays). */
-    bgfx_vertex_layout_begin(&s_sr.layout, bgfx_get_renderer_type());
-    bgfx_vertex_layout_add(&s_sr.layout, BGFX_ATTRIB_POSITION, 3,
-                           BGFX_ATTRIB_TYPE_FLOAT, false, false);
-    bgfx_vertex_layout_add(&s_sr.layout, BGFX_ATTRIB_COLOR0, 4,
-                           BGFX_ATTRIB_TYPE_UINT8, true, false);
-    bgfx_vertex_layout_end(&s_sr.layout);
+    jce_vertex_layout_begin(&s_sr.layout);
+    jce_vertex_layout_add(&s_sr.layout, JCE_ATTRIB_POSITION, 3,
+                          JCE_ATTRIB_TYPE_FLOAT, false, false);
+    jce_vertex_layout_add(&s_sr.layout, JCE_ATTRIB_COLOR0, 4,
+                          JCE_ATTRIB_TYPE_UINT8, true, false);
+    jce_vertex_layout_end(&s_sr.layout);
 
     /* Cache the color shader program handle. */
     JceShaderHandle sh = jce_renderer_get_program_color(renderer);
@@ -169,23 +169,24 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     if (grid_sh.idx == UINT16_MAX)
         LOG_WARN(LOG_TAG, "grid shader not found in PAK — grid will be skipped");
 
-    s_sr.u_grid_camera = bgfx_create_uniform("u_grid_camera",
-                                             BGFX_UNIFORM_TYPE_VEC4, 1);
-    s_sr.u_grid_fade = bgfx_create_uniform("u_grid_fade",
-                                           BGFX_UNIFORM_TYPE_VEC4, 1);
+    s_sr.u_grid_camera = jce_uniform_create("u_grid_camera",
+                                            JCE_UNIFORM_TYPE_VEC4, 1);
+    s_sr.u_grid_fade = jce_uniform_create("u_grid_fade",
+                                          JCE_UNIFORM_TYPE_VEC4, 1);
 
     /* Lighting uniforms for flat-color overlay (selection / ghost / hover). */
-    s_sr.u_light_dir   = bgfx_create_uniform("u_lightDir",
-                                              BGFX_UNIFORM_TYPE_VEC4, 1);
-    s_sr.u_light_color = bgfx_create_uniform("u_lightColor",
-                                              BGFX_UNIFORM_TYPE_VEC4, 1);
+    s_sr.u_light_dir   = jce_uniform_create("u_lightDir",
+                                            JCE_UNIFORM_TYPE_VEC4, 1);
+    s_sr.u_light_color = jce_uniform_create("u_lightColor",
+                                            JCE_UNIFORM_TYPE_VEC4, 1);
 
     /* 1x1 white fallback texture for overlay binding. */
     {
         uint32_t white = 0xFFFFFFFF;
-        const bgfx_memory_t *mem = bgfx_copy(&white, 4);
-        s_sr.white_tex = bgfx_create_texture_2d(1, 1, false, 1,
-                                                  BGFX_TEXTURE_FORMAT_RGBA8, 0, mem);
+        const JceGfxMemory *mem = jce_gfx_memory_copy(&white, 4);
+        s_sr.white_tex = jce_texture_create_2d(1, 1, false, 1,
+                                               JCE_TEXTURE_FORMAT_RGBA8,
+                                               JCE_TEXTURE_FLAGS_NONE, mem);
     }
 
     /* Create the engine scene renderer with editor asset callbacks. */
@@ -239,19 +240,19 @@ void jce_editor_scene_render_shutdown(void)
 
     if (s_sr.camera)     { jce_camera_destroy(s_sr.camera);   s_sr.camera = NULL; }
 
-    if (BGFX_HANDLE_IS_VALID(s_sr.white_tex))
-        bgfx_destroy_texture(s_sr.white_tex);
+    if (jce_gfx_texture_valid(s_sr.white_tex))
+        jce_gfx_texture_destroy(s_sr.white_tex);
 
-    if (BGFX_HANDLE_IS_VALID(s_sr.prog_grid))
-        bgfx_destroy_program(s_sr.prog_grid);
-    if (BGFX_HANDLE_IS_VALID(s_sr.u_grid_camera))
-        bgfx_destroy_uniform(s_sr.u_grid_camera);
-    if (BGFX_HANDLE_IS_VALID(s_sr.u_grid_fade))
-        bgfx_destroy_uniform(s_sr.u_grid_fade);
-    if (BGFX_HANDLE_IS_VALID(s_sr.u_light_dir))
-        bgfx_destroy_uniform(s_sr.u_light_dir);
-    if (BGFX_HANDLE_IS_VALID(s_sr.u_light_color))
-        bgfx_destroy_uniform(s_sr.u_light_color);
+    if (jce_program_valid(s_sr.prog_grid))
+        jce_program_destroy(s_sr.prog_grid);
+    if (jce_uniform_valid(s_sr.u_grid_camera))
+        jce_uniform_destroy(s_sr.u_grid_camera);
+    if (jce_uniform_valid(s_sr.u_grid_fade))
+        jce_uniform_destroy(s_sr.u_grid_fade);
+    if (jce_uniform_valid(s_sr.u_light_dir))
+        jce_uniform_destroy(s_sr.u_light_dir);
+    if (jce_uniform_valid(s_sr.u_light_color))
+        jce_uniform_destroy(s_sr.u_light_color);
 
     s_sr.initialized = false;
     LOG_INFO(LOG_TAG, "editor scene renderer shutdown");
@@ -334,6 +335,14 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     default:
         cfg.view_mode = JCE_SCENE_VIEW_SHADED; break;
     }
+
+    /* Wire the editor's Show menu flags into engine config so toggles
+       actually take effect. */
+    if (!jce_state_show_flag(JCE_SHOW_FLAG_SKYBOX))
+        cfg.draw_skybox = false;
+    if (!jce_state_show_flag(JCE_SHOW_FLAG_LIGHT_ICONS) &&
+        !jce_state_show_flag(JCE_SHOW_FLAG_CAMERA_ICONS))
+        cfg.draw_sprites = false;
 
     /* 0.5.7 ordering: sky → grid → entities. Engine renders sky first,
      * then invokes this callback to draw grid INTO THE SAME view, then

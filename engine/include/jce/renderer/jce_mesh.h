@@ -34,14 +34,14 @@ JceMesh *jce_mesh_create(const JceMeshVertex *vertices, uint32_t num_verts,
 
 /* Load a mesh from a model file in PAK (e.g. "models/chalet.obj").
    Uses assimp. Returns first mesh in the file. */
-JceMesh *jce_mesh_load(const JcePakArchive *pak, const char *asset_path);
+JCE_API JceMesh *jce_mesh_load(const JcePakArchive *pak, const char *asset_path);
 
 /* Destroy a mesh and free GPU buffers. */
-void jce_mesh_destroy(JceMesh *mesh);
+JCE_API void jce_mesh_destroy(JceMesh *mesh);
 
 /* Submit the mesh for rendering on the given view with the given program.
    Caller must set transforms and uniforms before calling this. */
-void jce_mesh_submit(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id);
+JCE_API void jce_mesh_submit(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id);
 
 /* Submit mesh as wireframe overlay with LEQUAL depth test.
    Used for selection outlines that render on top of solid geometry.
@@ -50,29 +50,34 @@ void jce_mesh_submit_wireframe_overlay(const JceMesh *mesh, const JceRenderer *r
                                        uint16_t view_id);
 
 /* Get vertex/index counts. */
-uint32_t jce_mesh_vertex_count(const JceMesh *mesh);
-uint32_t jce_mesh_index_count(const JceMesh *mesh);
+JCE_API uint32_t jce_mesh_vertex_count(const JceMesh *mesh);
+JCE_API uint32_t jce_mesh_index_count(const JceMesh *mesh);
 
 /* Built-in procedural meshes. */
-JceMesh *jce_mesh_create_cube(float size);
-JceMesh *jce_mesh_create_plane(float width, float depth, uint32_t subdivs);
+JCE_API JceMesh *jce_mesh_create_cube(float size);
+JCE_API JceMesh *jce_mesh_create_plane(float width, float depth, uint32_t subdivs);
 JceMesh *jce_mesh_create_plane_ex(float width, float depth,
                                    uint32_t subdivs, float uv_scale);
-JceMesh *jce_mesh_create_sphere(float radius);
-JceMesh *jce_mesh_create_capsule(float radius, float height);
-JceMesh *jce_mesh_create_cylinder(float radius, float height);
+JCE_API JceMesh *jce_mesh_create_sphere(float radius);
+JCE_API JceMesh *jce_mesh_create_capsule(float radius, float height);
+JCE_API JceMesh *jce_mesh_create_cylinder(float radius, float height);
 
 /* Submit mesh for PBR rendering using the PBR shader program.
    Caller must call jce_pbr_material_bind() and set transforms before this. */
-void jce_mesh_submit_pbr(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id);
+JCE_API void jce_mesh_submit_pbr(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id);
+
+/* Submit mesh for terrain rendering using the terrain shader program.
+   Caller must bind splat / layer textures and u_terrainParams before this
+   (in addition to the usual PBR uniforms / lighting / shadows). */
+JCE_API void jce_mesh_submit_terrain(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id);
 
 /* Submit mesh for shadow depth pass using the shadow shader program.
    Caller must set transforms and shadow view/proj before calling. */
-void jce_mesh_submit_shadow(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id);
+JCE_API void jce_mesh_submit_shadow(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id);
 
 /* Submit mesh using the mesh program WITHOUT overriding bgfx_set_state.
    Caller must set state, transforms, uniforms, and textures before this. */
-void jce_mesh_submit_overlay(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id);
+JCE_API void jce_mesh_submit_overlay(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id);
 
 JCE_EXTERN_C_END
 

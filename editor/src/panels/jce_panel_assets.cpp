@@ -8,10 +8,9 @@
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_timer.h>
 
-#include "jce_editor_config.h"
+#include "core/jce_editor_config.h"
+#include "core/jce_hotkeys.h"
 #include "jce_panel_assets_internal.h"
-
-#include <chrono>
 
 /* ── State instance (shared via extern in internal header) ───────── */
 
@@ -41,14 +40,12 @@ std::string normalized_path_string(const fs::path &p)
 static std::string format_modified_time(const fs::directory_entry &de)
 {
     try {
-        const auto file_tp = de.last_write_time();
-        const auto sys_tp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-            file_tp - fs::file_time_type::clock::now() + std::chrono::system_clock::now());
-        const auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
-            sys_tp.time_since_epoch()).count();
+        int64_t epoch = 0;
+        if (!jce_fs_host_get_mtime(de.path().string().c_str(), &epoch))
+            return "";
 
         char buf[32];
-        if (jce_time_format_local((int64_t)epoch, "%Y-%m-%d %H:%M",
+        if (jce_time_format_local(epoch, "%Y-%m-%d %H:%M",
                                   buf, sizeof(buf)) == 0)
             return "";
         return std::string(buf);
@@ -80,6 +77,7 @@ void ensure_assets_init(void)
     s_assets.search_buf[0] = '\0';
     s_assets.search_active = false;
     s_assets.view_mode = ASSET_BROWSER_VIEW_GRID;
+    s_assets.kind_filter = 0;
     {
         JceEditorConfig ecfg;
         if (jce_editor_config_load(&ecfg)) {
@@ -417,10 +415,9 @@ static void handle_asset_keyboard_shortcuts(
         && !ImGui::GetIO().WantTextInput)
     {
         bool has_sel = !s_assets.selected_set.empty();
-        bool ctrl    = ImGui::GetIO().KeyCtrl;
 
         if (has_sel && s_assets.selected_set.size() == 1
-            && ImGui::IsKeyPressed(ImGuiKey_F2, false))
+            && jce_hotkey_pressed(JCE_HK_EDIT_RENAME))
         {
             int sel = *s_assets.selected_set.begin();
             if (sel >= 0 && sel < (int)view.size()) {
@@ -431,22 +428,22 @@ static void handle_asset_keyboard_shortcuts(
             }
         }
 
-        if (has_sel && ImGui::IsKeyPressed(ImGuiKey_Delete, false))
+        if (has_sel && jce_hotkey_pressed(JCE_HK_EDIT_DELETE))
             collect_selected_from_view_for_deletion(view);
 
-        if (has_sel && ctrl && ImGui::IsKeyPressed(ImGuiKey_C, false))
+        if (has_sel && jce_hotkey_pressed(JCE_HK_EDIT_COPY))
             copy_selection_from_view_to_clipboard(view, false);
 
-        if (has_sel && ctrl && ImGui::IsKeyPressed(ImGuiKey_X, false))
+        if (has_sel && jce_hotkey_pressed(JCE_HK_EDIT_CUT))
             copy_selection_from_view_to_clipboard(view, true);
 
-        if (ctrl && ImGui::IsKeyPressed(ImGuiKey_V, false)
+        if (jce_hotkey_pressed(JCE_HK_EDIT_PASTE)
             && !s_assets.clipboard_paths.empty())
         {
             execute_clipboard_paste();
         }
 
-        if (has_sel && ctrl && ImGui::IsKeyPressed(ImGuiKey_D, false)) {
+        if (has_sel && jce_hotkey_pressed(JCE_HK_EDIT_DUPLICATE)) {
             int dup_count = 0;
             for (int si : s_assets.selected_set) {
                 if (si < 0 || si >= (int)view.size()) continue;
@@ -472,7 +469,7 @@ static void handle_asset_keyboard_shortcuts(
             if (dup_count > 0) s_assets.needs_refresh = true;
         }
 
-        if (ctrl && ImGui::IsKeyPressed(ImGuiKey_A, false)) {
+        if (jce_hotkey_pressed(JCE_HK_EDIT_SELECT_ALL)) {
             s_assets.selected_set.clear();
             for (int si = 0; si < (int)view.size(); si++)
                 s_assets.selected_set.insert(si);
@@ -636,9 +633,44 @@ void jce_editor_panel_assets_content(void)
         draw_asset_breadcrumb_bar();
         draw_asset_search_bar();
 
+        /* (Type filter is now embedded in the search bar — see draw_asset_search_bar.) */
+
         {
-            const std::vector<FileEntry> &display_entries =
+            const std::vector<FileEntry> &raw_entries =
                 s_assets.search_active ? s_assets.search_results : s_assets.entries;
+
+            /* Apply kind_filter on top */
+            std::vector<FileEntry> filtered;
+            const std::vector<FileEntry> *display_ptr = &raw_entries;
+            if (s_assets.kind_filter != 0) {
+                filtered.reserve(raw_entries.size());
+                for (const auto &fe : raw_entries) {
+                    if (fe.is_dir) { filtered.push_back(fe); continue; }
+                    std::string e = fe.ext;
+                    for (auto &c : e) c = (char)tolower((unsigned char)c);
+                    bool keep = false;
+                    switch (s_assets.kind_filter) {
+                    case 1: /* Images */
+                        keep = (e==".png"||e==".jpg"||e==".jpeg"||e==".bmp"||e==".tga"||e==".dds"||e==".ktx"||e==".gif"||e==".webp"||e==".hdr");
+                        break;
+                    case 2: /* Models */
+                        keep = (e==".gltf"||e==".glb"||e==".obj"||e==".fbx"||e==".dae"||e==".stl"||e==".ply"||e==".usd"||e==".usdc"||e==".usdz");
+                        break;
+                    case 3: /* Audio */
+                        keep = (e==".wav"||e==".mp3"||e==".ogg"||e==".flac"||e==".opus"||e==".aac"||e==".m4a");
+                        break;
+                    case 4: /* Code/text */
+                        keep = (e==".c"||e==".cpp"||e==".h"||e==".hpp"||e==".sc"||e==".sh"||e==".lua"||e==".py"||e==".js"||e==".ts"||e==".json"||e==".yaml"||e==".yml"||e==".toml"||e==".xml"||e==".md"||e==".txt"||e==".ini");
+                        break;
+                    case 5: /* Archive */
+                        keep = (e==".zip"||e==".pak"||e==".7z"||e==".tar"||e==".gz"||e==".rar");
+                        break;
+                    }
+                    if (keep) filtered.push_back(fe);
+                }
+                display_ptr = &filtered;
+            }
+            const std::vector<FileEntry> &display_entries = *display_ptr;
             bool want_ctx_popup = false;
 
             if (s_assets.view_mode == ASSET_BROWSER_VIEW_GRID) {

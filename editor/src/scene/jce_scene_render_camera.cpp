@@ -254,3 +254,37 @@ void jce_editor_scene_camera_reset(void)
     s_sr.orbit_pitch    = asinf(6.0f / s_sr.orbit_distance);
     orbit_apply();
 }
+
+void jce_editor_scene_camera_focus_aabb(const float min3[3], const float max3[3])
+{
+    if (!s_sr.initialized || !s_sr.camera || !min3 || !max3) return;
+
+    float cx = (min3[0] + max3[0]) * 0.5f;
+    float cy = (min3[1] + max3[1]) * 0.5f;
+    float cz = (min3[2] + max3[2]) * 0.5f;
+
+    float ex = (max3[0] - min3[0]) * 0.5f;
+    float ey = (max3[1] - min3[1]) * 0.5f;
+    float ez = (max3[2] - min3[2]) * 0.5f;
+    if (ex < 0.0f) ex = -ex;
+    if (ey < 0.0f) ey = -ey;
+    if (ez < 0.0f) ez = -ez;
+
+    /* Bounding sphere radius from extents (cheap upper bound). */
+    float radius = sqrtf(ex*ex + ey*ey + ez*ez);
+    if (radius < 0.5f) radius = 0.5f;       /* don't zoom in past 0.5m */
+
+    /* Distance to fit sphere into vertical FOV; use the camera's actual
+     * FOV with a small margin so the object isn't flush with the edges. */
+    float fov_deg = jce_camera_get_fov(s_sr.camera);
+    if (fov_deg < 1.0f) fov_deg = 45.0f;
+    float fov_y = fov_deg * JCE_DEG2RAD;
+    float dist = radius / sinf(fov_y * 0.5f);
+    dist *= 1.15f;                          /* breathing room */
+    if (dist < ORBIT_DIST_MIN) dist = ORBIT_DIST_MIN;
+    if (dist > ORBIT_DIST_MAX) dist = ORBIT_DIST_MAX;
+
+    s_sr.orbit_target   = jce_v3(cx, cy, cz);
+    s_sr.orbit_distance = dist;
+    orbit_apply();
+}

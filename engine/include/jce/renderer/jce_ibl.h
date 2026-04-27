@@ -38,16 +38,16 @@ JceIblData *jce_ibl_generate(JceTexture equirect_tex,
                               uint32_t prefilter_size,
                               uint32_t brdf_lut_size);
 
-void jce_ibl_destroy(JceIblData *ibl);
+JCE_API void jce_ibl_destroy(JceIblData *ibl);
 
 /* Get the irradiance cubemap texture. */
-JceTexture jce_ibl_get_irradiance(const JceIblData *ibl);
+JCE_API JceTexture jce_ibl_get_irradiance(const JceIblData *ibl);
 
 /* Get the prefiltered specular cubemap texture. */
-JceTexture jce_ibl_get_prefilter(const JceIblData *ibl);
+JCE_API JceTexture jce_ibl_get_prefilter(const JceIblData *ibl);
 
 /* Get the BRDF integration LUT texture. */
-JceTexture jce_ibl_get_brdf_lut(const JceIblData *ibl);
+JCE_API JceTexture jce_ibl_get_brdf_lut(const JceIblData *ibl);
 
 /*
  * Create a pre-baked BRDF LUT (does not require an HDR source).
@@ -55,7 +55,7 @@ JceTexture jce_ibl_get_brdf_lut(const JceIblData *ibl);
  *
  * @param size  LUT resolution (e.g., 256).
  */
-JceTexture jce_ibl_create_brdf_lut(uint32_t size);
+JCE_API JceTexture jce_ibl_create_brdf_lut(uint32_t size);
 
 JCE_EXTERN_C_END
 

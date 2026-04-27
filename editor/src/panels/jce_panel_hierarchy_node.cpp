@@ -275,7 +275,8 @@ void draw_entity_node(uint32_t id)
     if (!name) name = "";
 
     ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow |
-                                ImGuiTreeNodeFlags_SpanAvailWidth;
+                                ImGuiTreeNodeFlags_SpanAvailWidth |
+                                ImGuiTreeNodeFlags_AllowOverlap;
     if (is_leaf)     flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
     if (is_selected) flags |= ImGuiTreeNodeFlags_Selected;
     if (s_hier.search_buf[0]) flags |= ImGuiTreeNodeFlags_DefaultOpen;
@@ -315,9 +316,106 @@ void draw_entity_node(uint32_t id)
     if (is_prefab)
         ImGui::PopStyleColor();
 
+    /* Capture row click state IMMEDIATELY after the tree node — later
+       SameLine widgets (variant icon, eye toggle, rename input) would
+       otherwise overwrite the "last item" used by IsItemClicked. */
+    bool node_clicked_left   = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+    bool node_clicked_right  = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+    bool node_double_clicked = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)
+                               && ImGui::IsItemHovered();
+
+    /* Variant indicator: cyan diamond drawn as a primitive so it never
+       depends on whether the active font ships Geometric Shapes (KaiTi
+       and many CJK fonts don't, which would render as '?'/tofu). */
+    {
+        const char *vparent = jce_state_get_variant_parent(id);
+        if (vparent) {
+            ImGui::SameLine(0.0f, 4.0f);
+            ImDrawList *dl = ImGui::GetWindowDrawList();
+            float h = ImGui::GetTextLineHeight();
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            float cx = p.x + h * 0.5f;
+            float cy = p.y + h * 0.5f;
+            float r  = h * 0.32f;
+            ImU32 col = IM_COL32(102, 217, 242, 255);
+            ImVec2 pts[4] = {
+                ImVec2(cx,     cy - r),
+                ImVec2(cx + r, cy    ),
+                ImVec2(cx,     cy + r),
+                ImVec2(cx - r, cy    ),
+            };
+            dl->AddConvexPolyFilled(pts, 4, col);
+            ImGui::Dummy(ImVec2(h, h));
+            if (ImGui::IsItemHovered()) {
+                ImGui::BeginTooltip();
+                ImGui::TextUnformatted(jce_editor_i18n("hierarchy.tooltip.prefabVariant"));
+                ImGui::Separator();
+                ImGui::Text(jce_editor_i18n("hierarchy.tooltip.parent"), vparent);
+                ImGui::EndTooltip();
+            }
+        }
+    }
+
     if (s_hier.reveal_pending && id == s_hier.reveal_target) {
         ImGui::SetScrollHereY(0.35f);
         s_hier.reveal_pending = false;
+    }
+
+    /* Right-aligned eye toggle: click to flip per-entity enabled state.
+     * Open eye (◉) = visible/enabled, hollow circle (○) = disabled.
+     * Sits at row's right edge so it doesn't shift the name column. */
+    /* Right-aligned eye toggle: filled circle = visible, hollow = hidden.
+       Drawn as primitives instead of glyphs so the indicator is always
+       visible regardless of font coverage. */
+    if (!is_renaming) {
+        float h = ImGui::GetTextLineHeight();
+        float btn_w = h;
+        float row_right = ImGui::GetWindowContentRegionMax().x;
+        float btn_x = row_right - btn_w - 4.0f;
+        ImGui::SameLine(btn_x);
+        ImGui::PushID((int)id ^ 0x4000);
+        ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0,0,0,0));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1,1,1,0.10f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(1,1,1,0.20f));
+        if (!enabled)
+            ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.55f);
+
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        ImGui::SetNextItemAllowOverlap();
+        bool clicked = ImGui::InvisibleButton("##eye", ImVec2(btn_w, h));
+        bool hovered = ImGui::IsItemHovered();
+
+        /* If the click landed inside this eye button, suppress the row's
+           selection click captured earlier so the toggle is a "pure"
+           interaction. */
+        if (hovered && (clicked || ImGui::IsItemActive())) {
+            node_clicked_left = false;
+        }
+
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        float cx = p.x + btn_w * 0.5f;
+        float cy = p.y + h * 0.5f;
+        float r  = h * 0.32f;
+        ImU32 col = enabled ? IM_COL32(220, 220, 220, 255)
+                            : IM_COL32(140, 140, 140, 200);
+        if (hovered) col = IM_COL32(255, 255, 255, 255);
+        if (enabled) {
+            dl->AddCircleFilled(ImVec2(cx, cy), r, col, 16);
+        } else {
+            dl->AddCircle(ImVec2(cx, cy), r, col, 16, 1.5f);
+        }
+
+        if (clicked) {
+            jce_state_set_entity_enabled(id, !enabled);
+        }
+        if (!enabled)
+            ImGui::PopStyleVar();
+        if (hovered)
+            ImGui::SetTooltip("%s", jce_editor_i18n(enabled
+                ? "hierarchy.tooltip.hide"
+                : "hierarchy.tooltip.show"));
+        ImGui::PopStyleColor(3);
+        ImGui::PopID();
     }
 
     if (is_renaming) {
@@ -345,7 +443,7 @@ void draw_entity_node(uint32_t id)
     }
 
     /* ── Left-click: Windows Explorer selection logic ────────────── */
-    if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && !is_renaming) {
+    if (node_clicked_left && !is_renaming) {
         bool ctrl  = ImGui::GetIO().KeyCtrl;
         bool shift = ImGui::GetIO().KeyShift;
 
@@ -365,9 +463,7 @@ void draw_entity_node(uint32_t id)
     }
 
     /* Double-click: focus camera on entity. */
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByPopup)
-        && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)
-        && !is_renaming)
+    if (node_double_clicked && !is_renaming)
     {
         jce_state_select_entity(id, false);
         s_hier.shift_anchor = id;
@@ -376,9 +472,7 @@ void draw_entity_node(uint32_t id)
     }
 
     /* ── Right-click: defer popup open ───────────────────────────── */
-    bool item_hovered_ctx = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByPopup);
-
-    if (item_hovered_ctx && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
+    if (node_clicked_right) {
         s_hier.context_on_empty = false;
         s_hier.context_menu_id = id;
         s_hier.ctx_clicked_entity = true;

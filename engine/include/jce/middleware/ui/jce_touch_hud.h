@@ -41,14 +41,14 @@ typedef enum {
 /* Create / destroy.  label_font may be NULL (labels will be skipped). */
 JceTouchHud *jce_touch_hud_create(JceRenderer *renderer, JceWindow *window,
                                    JceFont *label_font);
-void         jce_touch_hud_destroy(JceTouchHud *hud);
+JCE_API void         jce_touch_hud_destroy(JceTouchHud *hud);
 
 /* Process touch input and update virtual controls.  Call once per frame. */
 void         jce_touch_hud_update(JceTouchHud *hud,
                                    const JceInput *input, float dt_ms);
 
 /* Draw semi-transparent overlays.  Call after game rendering. */
-void         jce_touch_hud_draw(JceTouchHud *hud);
+JCE_API void         jce_touch_hud_draw(JceTouchHud *hud);
 
 /* Query virtual joystick output (each axis in [-1, 1]). */
 void         jce_touch_hud_get_move(const JceTouchHud *hud,
@@ -59,19 +59,19 @@ void         jce_touch_hud_get_look(const JceTouchHud *hud,
                                      float *yaw, float *pitch);
 
 /* Query whether a virtual button was "pressed" this frame (edge). */
-bool         jce_touch_hud_button(const JceTouchHud *hud, JceTouchButton btn);
+JCE_API bool         jce_touch_hud_button(const JceTouchHud *hud, JceTouchButton btn);
 
 /* Query whether a virtual button is currently held down. */
-bool         jce_touch_hud_button_down(const JceTouchHud *hud, JceTouchButton btn);
+JCE_API bool         jce_touch_hud_button_down(const JceTouchHud *hud, JceTouchButton btn);
 
 /* Switch to menu mode (pause screen): draws Continue/Quit buttons
    instead of the normal HUD.  Pass false to return to normal HUD. */
-void         jce_touch_hud_set_menu_mode(JceTouchHud *hud, bool menu_mode);
+JCE_API void         jce_touch_hud_set_menu_mode(JceTouchHud *hud, bool menu_mode);
 
 /* Show or hide the HUD overlay.  Input processing continues even when hidden,
    so mobile controls stay responsive.  Default: visible = true. */
-void         jce_touch_hud_set_visible(JceTouchHud *hud, bool visible);
-bool         jce_touch_hud_is_visible(const JceTouchHud *hud);
+JCE_API void         jce_touch_hud_set_visible(JceTouchHud *hud, bool visible);
+JCE_API bool         jce_touch_hud_is_visible(const JceTouchHud *hud);
 
 JCE_EXTERN_C_END
 

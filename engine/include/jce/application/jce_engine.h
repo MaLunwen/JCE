@@ -47,7 +47,7 @@ JCE_API void JCE_CALL jce_engine_set_renderer_override(int backend);
 
 /* Create the engine: init logger, load config, open PAK, create
    window/renderer/audio/input, async-load assets, create app. */
-JceEngine     *jce_engine_create(int argc, char *argv[]);
+JCE_API JceEngine     *jce_engine_create(int argc, char *argv[]);
 
 /* Route a platform event to input + app.
    Returns JCE_APP_SUCCESS on quit event.

@@ -8,10 +8,19 @@
 #ifndef JCE_API_RESOURCE_H
 #define JCE_API_RESOURCE_H
 
-#include <jce/os/core/pak_loader.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <jce/os/core/jce_pak_loader.h>
 #include <jce/resource/jce_asset.h>
 #include <jce/resource/jce_asset_format.h>
 #include <jce/resource/jce_scene_contract.h>
 #include <jce/resource/jce_scene_serial.h>
 
+
+
+#ifdef __cplusplus
+}
+#endif
 #endif /* JCE_API_RESOURCE_H */

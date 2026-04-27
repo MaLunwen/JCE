@@ -8,8 +8,17 @@
 #ifndef JCE_API_ANIMATION_H
 #define JCE_API_ANIMATION_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <jce/middleware/animation/jce_animation.h>
 #include <jce/middleware/animation/jce_skeleton.h>
 #include <jce/middleware/animation/jce_skinned_mesh.h>
 
+
+
+#ifdef __cplusplus
+}
+#endif
 #endif /* JCE_API_ANIMATION_H */

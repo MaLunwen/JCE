@@ -21,16 +21,12 @@ set_target_properties(JCE_Editor PROPERTIES
 	CXX_STANDARD_REQUIRED YES
 	CXX_EXTENSIONS NO)
 
-find_package(assimp REQUIRED)
 target_link_libraries(JCE_Editor PRIVATE
-	JCE assimp::assimp imgui::imgui
-	cglm::cglm cjson::cjson SDL3_image::SDL3_image bgfx::bgfx)
+	JCE imgui::imgui
+	cjson::cjson SDL3_image::SDL3_image bgfx::bgfx)
 
 target_include_directories(JCE_Editor PRIVATE
-	"${CMAKE_CURRENT_SOURCE_DIR}/src"
-	"${CMAKE_CURRENT_SOURCE_DIR}/src/core"
-	"${CMAKE_CURRENT_SOURCE_DIR}/src/ui"
-	"${CMAKE_CURRENT_SOURCE_DIR}/src/io")
+	"${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 # Resolve a human-readable OS + arch string for the About dialog.
 if(JCE_PLATFORM_WINDOWS)

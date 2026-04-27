@@ -10,6 +10,15 @@
 #ifndef JCE_API_STREAMING_H
 #define JCE_API_STREAMING_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <jce/middleware/streaming/jce_streaming.h>
 
+
+
+#ifdef __cplusplus
+}
+#endif
 #endif /* JCE_API_STREAMING_H */

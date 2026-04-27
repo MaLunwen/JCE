@@ -37,7 +37,7 @@ typedef enum {
 /* Request a screenshot of the current frame.
  * The capture is deferred: it happens at the end of bgfx_frame(),
  * and is written asynchronously.  Returns false if path is invalid. */
-bool jce_screenshot_save(const char *path, JceScreenshotFormat format);
+JCE_API bool jce_screenshot_save(const char *path, JceScreenshotFormat format);
 
 /* ================================================================== */
 /* Capture to memory                                                   */
@@ -51,14 +51,14 @@ typedef void (*JceScreenshotCallback)(const uint8_t *rgba_pixels,
                                        uint32_t width, uint32_t height,
                                        void *userdata);
 
-void jce_screenshot_capture(JceScreenshotCallback cb, void *userdata);
+JCE_API void jce_screenshot_capture(JceScreenshotCallback cb, void *userdata);
 
 /* ================================================================== */
 /* Query                                                               */
 /* ================================================================== */
 
 /* Returns true if a screenshot is currently pending. */
-bool jce_screenshot_pending(void);
+JCE_API bool jce_screenshot_pending(void);
 
 JCE_EXTERN_C_END
 

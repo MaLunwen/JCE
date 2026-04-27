@@ -12,13 +12,10 @@
 
 extern "C" {
 #include <jce/renderer/jce_pbr_material.h>
-
-#include <SDL3/SDL_iostream.h>
-#include <SDL3/SDL_surface.h>
-#include <SDL3_image/SDL_image.h>
+#include <jce/resource/jce_image_decode.h>
 }
 
-#include "jce_editor_file_util.h"
+#include "io/jce_editor_file_util.h"
 
 #define LOG_TAG "fv_material"
 
@@ -67,20 +64,12 @@ static void try_load_thumb(MatTexSlot *slot, const char *path)
     if (!buf) return;
     if (sz == 0 || sz > 64 * 1024 * 1024) { ED_FREE(buf); return; }
 
-    SDL_IOStream *io = SDL_IOFromConstMem(buf, sz);
-    if (!io) { ED_FREE(buf); return; }
-
-    SDL_Surface *surf = IMG_Load_IO(io, true);
-    if (surf && surf->format != SDL_PIXELFORMAT_RGBA32) {
-        SDL_Surface *conv = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA32);
-        SDL_DestroySurface(surf);
-        surf = conv;
-    }
-    if (surf) {
-        slot->w = surf->w;
-        slot->h = surf->h;
-        slot->handle = jce_texture_load_from_surface(surf, JCE_TEX_CLAMP);
-        SDL_DestroySurface(surf);
+    JceImage img;
+    if (jce_image_decode(buf, sz, &img)) {
+        slot->w = (int)img.width;
+        slot->h = (int)img.height;
+        slot->handle = jce_texture_from_rgba(img.pixels, img.width, img.height);
+        jce_image_free(&img);
     }
     ED_FREE(buf);
 }

@@ -6,15 +6,15 @@
 #define JCE_SCENE_VIEW_INTERNAL_H
 
 #include "gizmo/jce_gizmo.h"
-#include "jce_editor_colors.h"
-#include "jce_editor_i18n.h"
-#include "jce_editor_layout.h"
-#include "jce_editor_panels.h"
-#include "jce_editor_state.h"
+#include "ui/jce_editor_colors.h"
+#include "core/jce_editor_i18n.h"
+#include "ui/jce_editor_layout.h"
+#include "ui/jce_editor_panels.h"
+#include "core/jce_editor_state.h"
 #include "scene/jce_editor_scene_render.h"
 
-#include <imgui.h>
-#include <imgui_internal.h>
+#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui_internal.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>

@@ -4,15 +4,16 @@
  * Reads from / writes to the ECS scene directly via jce_scene_*.
  */
 
-#include "jce_editor_colors.h"
-#include "jce_editor_i18n.h"
-#include "jce_editor_panels.h"
-#include "jce_editor_state.h"
-#include "jce_editor_state_internal.h"
+#include "ui/jce_editor_colors.h"
+#include "core/jce_editor_i18n.h"
+#include "ui/jce_editor_panels.h"
+#include "core/jce_editor_state.h"
+#include "core/jce_editor_state_internal.h"
+#include "core/jce_reflect.h"
 #include "scene/jce_editor_scene_render.h"
 #include "scene/jce_model_loader_assimp.h"
 
-#include <imgui.h>
+#include <jce/tools/jce_imgui.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -427,10 +428,10 @@ static void draw_comp_light(JceScene *scene, JceEntity e, uint32_t flags)
         JceSpotLight *l = jce_scene_get_spot_light(scene, e);
         float inner_deg = acosf(l->inner_cone_cos) * JCE_RAD2DEG;
         float outer_deg = acosf(l->outer_cone_cos) * JCE_RAD2DEG;
-        if (ImGui::DragFloat("Inner Cone###InnerCone", &inner_deg, 0.5f, 0.0f, 89.0f))
+        if (ImGui::DragFloat(jce_editor_i18n_id("inspector.light.innerCone", "InnerCone"), &inner_deg, 0.5f, 0.0f, 89.0f))
             l->inner_cone_cos = cosf(inner_deg * JCE_DEG2RAD);
         insp_track_edit();
-        if (ImGui::DragFloat("Outer Cone###OuterCone", &outer_deg, 0.5f, 0.0f, 90.0f))
+        if (ImGui::DragFloat(jce_editor_i18n_id("inspector.light.outerCone", "OuterCone"), &outer_deg, 0.5f, 0.0f, 90.0f))
             l->outer_cone_cos = cosf(outer_deg * JCE_DEG2RAD);
         insp_track_edit();
         /* Clamp: outer must be >= inner (i.e. outer cos <= inner cos). */
@@ -440,13 +441,19 @@ static void draw_comp_light(JceScene *scene, JceEntity e, uint32_t flags)
 
     if (light_type == 0) {
         JceDirectionalLight *l = jce_scene_get_dir_light(scene, e);
-        if (ImGui::Checkbox("Casts Shadow###CastsShadow", &l->casts_shadow))
+        if (ImGui::Checkbox(jce_editor_i18n_id("inspector.light.castsShadow", "CastsShadow"), &l->casts_shadow))
             insp_undo_bool(&l->casts_shadow);
     }
 }
 
 static void draw_comp_camera(JceCameraComponent *cam)
 {
+    static const JceReflectType *t = jce_reflect_find("Camera");
+    if (t) {
+        jce_reflect_draw(t, cam);
+        return;
+    }
+    /* Fallback: legacy hand-written drawer if reflection registry is empty. */
     char lbl[256];
     snprintf(lbl, sizeof(lbl), "%s###FOV", jce_editor_i18n("camera.fov"));
     ImGui::DragFloat(lbl, &cam->fov_deg, 1.0f, 1.0f, 179.0f);
@@ -464,7 +471,7 @@ static void draw_comp_camera(JceCameraComponent *cam)
     if (ImGui::Checkbox(lbl, &cam->ortho))
         insp_undo_bool(&cam->ortho);
 
-    if (ImGui::Checkbox("Primary###CamPrimary", &cam->is_primary))
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.camera.primary", "CamPrimary"), &cam->is_primary))
         insp_undo_bool(&cam->is_primary);
 }
 
@@ -869,6 +876,54 @@ static void draw_comp_constraint(JceConstraintComponent *con)
         insp_undo_bool(&con->disable_collision);
 }
 
+static void draw_comp_terrain(JceTerrainComponent *tc)
+{
+    if (!tc) return;
+    ImGui::InputText(jce_editor_i18n("inspector.terrain.path"), tc->terrain_path, sizeof tc->terrain_path);
+    insp_track_edit();
+    accept_asset_drop(tc->terrain_path, sizeof tc->terrain_path);
+    ImGui::TextDisabled("%s", jce_editor_i18n("inspector.terrain.dropHint"));
+
+    if (ImGui::Checkbox(jce_editor_i18n("inspector.terrain.visible"), &tc->visible))
+        insp_undo_bool(&tc->visible);
+
+    ImGui::ColorEdit3(jce_editor_i18n("inspector.terrain.tint"), tc->tint);
+    insp_track_edit();
+
+    ImGui::Separator();
+    ImGui::TextUnformatted(jce_editor_i18n("inspector.terrain.splatHeader"));
+    if (ImGui::Checkbox(jce_editor_i18n("inspector.terrain.splatEnable"), &tc->splat_enabled))
+        insp_undo_bool(&tc->splat_enabled);
+    if (tc->tile_scale <= 0.0f) tc->tile_scale = 10.0f;
+    ImGui::DragFloat(jce_editor_i18n("inspector.terrain.layerTile"), &tc->tile_scale, 0.1f, 0.1f, 256.0f, "%.2f");
+    insp_track_edit();
+
+    for (int i = 0; i < 4; i++) {
+        char label[32];
+        snprintf(label, sizeof label, jce_editor_i18n("inspector.terrain.layerFmt"), i);
+        ImGui::PushID(i);
+        ImGui::InputText(label, tc->layer_albedo_path[i],
+                         sizeof tc->layer_albedo_path[i]);
+        insp_track_edit();
+        accept_asset_drop(tc->layer_albedo_path[i],
+                          sizeof tc->layer_albedo_path[i]);
+        ImGui::PopID();
+    }
+    ImGui::TextDisabled("%s", jce_editor_i18n("inspector.terrain.splatChannels"));
+
+    /* Show summary if a terrain file is bound. Using load_file is heavy;
+     * for the inspector we just print the path and let the Terrain panel
+     * handle authoring. */
+    if (tc->terrain_path[0]) {
+        ImGui::Separator();
+        ImGui::TextWrapped("%s", jce_editor_i18n("inspector.terrain.useTerrainPanel"));
+    } else {
+        ImGui::Separator();
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "%s",
+                           jce_editor_i18n("inspector.terrain.notBound"));
+    }
+}
+
 /* ── Component header / settings popup helper ─────────────────────── */
 
 /* Returns true if the component's body should be drawn this frame.
@@ -971,6 +1026,7 @@ static const AddCompOption s_add_options[] = {
     { JCE_COMP_FLAG_AUDIO_SOURCE,         false, false },
     { JCE_COMP_FLAG_SCRIPT,               false, false },
     { JCE_COMP_FLAG_CONSTRAINT,           false, false },
+    { JCE_COMP_FLAG_TERRAIN,              false, false },
 };
 
 /* ── Content (embeddable in tabs) ─────────────────────────────────── */
@@ -1054,6 +1110,86 @@ void jce_editor_panel_inspector_content(void)
         }
 
         ImGui::Separator();
+
+        /* ── Bulk Transform editor (multi-select) ──────────────────── */
+        if (scene) {
+            if (ImGui::CollapsingHeader(jce_editor_i18n("inspector.bulk.section"), ImGuiTreeNodeFlags_DefaultOpen)) {
+                static float pos_delta[3] = {0,0,0};
+                static float rot_set[3]   = {0,0,0};
+                static float scl_set[3]   = {1,1,1};
+                static bool  scl_uniform  = true;
+
+                ImGui::TextDisabled("%s", jce_editor_i18n("inspector.bulk.posOffset"));
+                ImGui::DragFloat3("##bulk_pos_delta", pos_delta, 0.1f);
+                ImGui::SameLine();
+                if (ImGui::Button(jce_editor_i18n_id("inspector.bulk.apply", "bulk_pos"))) {
+                    for (int i = 0; i < sel_count; i++) {
+                        JceEntity e = jce_state_to_ecs_entity(sel_ids[i]);
+                        JceTransform *t = jce_scene_get_transform(scene, e);
+                        if (t) {
+                            t->position.x += pos_delta[0];
+                            t->position.y += pos_delta[1];
+                            t->position.z += pos_delta[2];
+                        }
+                    }
+                    pos_delta[0] = pos_delta[1] = pos_delta[2] = 0.0f;
+                }
+
+                ImGui::TextDisabled("%s", jce_editor_i18n("inspector.bulk.rotAbsolute"));
+                ImGui::DragFloat3("##bulk_rot_set", rot_set, 1.0f);
+                ImGui::SameLine();
+                if (ImGui::Button(jce_editor_i18n_id("inspector.bulk.apply", "bulk_rot"))) {
+                    for (int i = 0; i < sel_count; i++) {
+                        JceEntity e = jce_state_to_ecs_entity(sel_ids[i]);
+                        JceTransform *t = jce_scene_get_transform(scene, e);
+                        if (t) {
+                            t->rotation = jce_q_from_euler_deg(rot_set);
+                            jce_editor_set_cached_euler_deg(sel_ids[i], t->rotation, rot_set);
+                        }
+                    }
+                }
+
+                ImGui::TextDisabled("%s", jce_editor_i18n("inspector.bulk.scaleAbsolute"));
+                ImGui::Checkbox(jce_editor_i18n_id("inspector.bulk.uniform", "bulk_scl_uni"), &scl_uniform);
+                if (scl_uniform) {
+                    ImGui::DragFloat("##bulk_scl_uniform_v", &scl_set[0], 0.01f, 0.001f, 1000.0f);
+                    scl_set[1] = scl_set[2] = scl_set[0];
+                } else {
+                    ImGui::DragFloat3("##bulk_scl_set", scl_set, 0.01f, 0.001f, 1000.0f);
+                }
+                ImGui::SameLine();
+                if (ImGui::Button(jce_editor_i18n_id("inspector.bulk.apply", "bulk_scl"))) {
+                    for (int i = 0; i < sel_count; i++) {
+                        JceEntity e = jce_state_to_ecs_entity(sel_ids[i]);
+                        JceTransform *t = jce_scene_get_transform(scene, e);
+                        if (t) {
+                            t->scale.x = scl_set[0];
+                            t->scale.y = scl_set[1];
+                            t->scale.z = scl_set[2];
+                        }
+                    }
+                }
+
+                ImGui::Separator();
+                if (ImGui::Button(jce_editor_i18n_id("inspector.bulk.resetPos", "bulk"))) {
+                    for (int i = 0; i < sel_count; i++) {
+                        JceEntity e = jce_state_to_ecs_entity(sel_ids[i]);
+                        JceTransform *t = jce_scene_get_transform(scene, e);
+                        if (t) { t->position.x = t->position.y = t->position.z = 0.0f; }
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::Button(jce_editor_i18n_id("inspector.bulk.resetScale", "bulk"))) {
+                    for (int i = 0; i < sel_count; i++) {
+                        JceEntity e = jce_state_to_ecs_entity(sel_ids[i]);
+                        JceTransform *t = jce_scene_get_transform(scene, e);
+                        if (t) { t->scale.x = t->scale.y = t->scale.z = 1.0f; }
+                    }
+                }
+            }
+
+            ImGui::Separator();
+        }
 
         for (int i = 0; i < sel_count && i < 20; i++) {
             const char *nm = jce_state_entity_name(sel_ids[i]);
@@ -1270,6 +1406,13 @@ void jce_editor_panel_inspector_content(void)
         if (comp_section_begin(focused, sidecar, JCE_COMP_FLAG_CONSTRAINT,
                                 jce_comp_flag_display_name(JCE_COMP_FLAG_CONSTRAINT), true))
             draw_comp_constraint(jce_scene_get_constraint(scene, ecs_e));
+        comp_section_end();
+    }
+
+    if (flags & JCE_COMP_FLAG_TERRAIN) {
+        if (comp_section_begin(focused, sidecar, JCE_COMP_FLAG_TERRAIN,
+                                jce_comp_flag_display_name(JCE_COMP_FLAG_TERRAIN), true))
+            draw_comp_terrain(jce_scene_get_terrain(scene, ecs_e));
         comp_section_end();
     }
 

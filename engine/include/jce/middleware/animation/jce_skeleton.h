@@ -43,19 +43,19 @@ typedef struct {
 /* Create a skeleton from an array of joint descriptors.
  * Joints must be ordered so that a parent always precedes its children.
  * Copies the data; caller retains ownership. */
-JceSkeleton *jce_skeleton_create(const JceJoint *joints, uint32_t num_joints);
+JCE_API JceSkeleton *jce_skeleton_create(const JceJoint *joints, uint32_t num_joints);
 
 /* Destroy a skeleton. */
-void jce_skeleton_destroy(JceSkeleton *skel);
+JCE_API void jce_skeleton_destroy(JceSkeleton *skel);
 
 /* Get the number of joints. */
-uint32_t jce_skeleton_joint_count(const JceSkeleton *skel);
+JCE_API uint32_t jce_skeleton_joint_count(const JceSkeleton *skel);
 
 /* Find a joint index by name. Returns -1 if not found. */
-int jce_skeleton_find_joint(const JceSkeleton *skel, const char *name);
+JCE_API int jce_skeleton_find_joint(const JceSkeleton *skel, const char *name);
 
 /* Get the rest-pose local transforms (array of [joint_count] mat4). */
-const jce_mat4 *jce_skeleton_rest_pose(const JceSkeleton *skel);
+JCE_API const jce_mat4 *jce_skeleton_rest_pose(const JceSkeleton *skel);
 
 /* Get rest-pose TRS arrays (each has [joint_count] elements).
  * These are the original glTF node TRS values, avoiding decomposition. */
@@ -81,7 +81,7 @@ void jce_skeleton_evaluate(const JceSkeleton *skel,
  * Returns identity if index is out of range.
  * Useful for recovering the animated joint world transform from a skin matrix:
  *   joint_global = skin_matrix[i] * inverse(jce_skeleton_get_inverse_bind(skel, i)) */
-jce_mat4 jce_skeleton_get_inverse_bind(const JceSkeleton *skel, uint32_t joint_idx);
+JCE_API jce_mat4 jce_skeleton_get_inverse_bind(const JceSkeleton *skel, uint32_t joint_idx);
 
 JCE_EXTERN_C_END
 

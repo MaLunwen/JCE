@@ -6,7 +6,7 @@
 
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
-#include <jce/os/core/pak_loader.h>
+#include <jce/os/core/jce_pak_loader.h>
 #include <jce/renderer/jce_shaders.h>
 
 #include "os/core/jce_memory.h"
@@ -125,6 +125,7 @@ JceShaderSet jce_shaders_load_all(const JcePakArchive *pak)
     set.pbr_skinned    = load_program_named(pak, "pbr_skinned",    "pbr");
     set.shadow         = shader_load_program(pak, "shadow");
     set.shadow_skinned = load_program_named(pak, "shadow_skinned", "shadow");
+    set.terrain        = shader_load_program(pak, "terrain");
 
     if (!jce_shader_valid(set.color))
         LOG_ERROR(LOG_TAG, "failed to load 'color' shader");
@@ -140,6 +141,8 @@ JceShaderSet jce_shaders_load_all(const JcePakArchive *pak)
         LOG_WARN(LOG_TAG, "'shadow' shader unavailable");
     if (!jce_shader_valid(set.shadow_skinned))
         LOG_WARN(LOG_TAG, "'shadow_skinned' shader unavailable");
+    if (!jce_shader_valid(set.terrain))
+        LOG_WARN(LOG_TAG, "'terrain' shader unavailable");
 
     JCE_PROFILE_ZONE_END;
     return set;

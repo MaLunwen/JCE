@@ -59,7 +59,7 @@ typedef struct JceCameraInput {
 JceCameraController *jce_camctrl_create(JceCamera *cam,
                                          const JceCameraControllerDesc *desc);
 
-void jce_camctrl_destroy(JceCameraController *ctrl);
+JCE_API void jce_camctrl_destroy(JceCameraController *ctrl);
 
 /* ================================================================== */
 /* Per-frame                                                           */
@@ -73,8 +73,8 @@ void jce_camctrl_update(JceCameraController *ctrl,
 /* Queries                                                             */
 /* ================================================================== */
 
-bool  jce_camctrl_is_sprinting(const JceCameraController *ctrl);
-float jce_camctrl_get_current_fov(const JceCameraController *ctrl);
+JCE_API bool  jce_camctrl_is_sprinting(const JceCameraController *ctrl);
+JCE_API float jce_camctrl_get_current_fov(const JceCameraController *ctrl);
 
 JCE_EXTERN_C_END
 

@@ -37,6 +37,7 @@ static ECS_COMPONENT_DECLARE(JceCharacterControllerComponent);
 static ECS_COMPONENT_DECLARE(JceAudioSourceComponent);
 static ECS_COMPONENT_DECLARE(JceScriptComponent);
 static ECS_COMPONENT_DECLARE(JceEditorMeta);
+static ECS_COMPONENT_DECLARE(JceTerrainComponent);
 
 /* ── Scene struct ──────────────────────────────────────────────────── */
 
@@ -80,6 +81,7 @@ JceScene *jce_scene_create(void)
     ECS_COMPONENT_DEFINE(s->world, JceAudioSourceComponent);
     ECS_COMPONENT_DEFINE(s->world, JceScriptComponent);
     ECS_COMPONENT_DEFINE(s->world, JceEditorMeta);
+    ECS_COMPONENT_DEFINE(s->world, JceTerrainComponent);
 
     LOG_SUCCESS(LOG_TAG, "scene created");
     return s;
@@ -250,6 +252,7 @@ JCE_COMP_IMPL(JceScriptComponent,             script)
 JCE_COMP_IMPL(JceParticleEmitterComponent,    particle_emitter)
 JCE_COMP_IMPL(JceBehaviorTree,                behavior_tree)
 JCE_COMP_IMPL(JceEditorMeta,                  editor_meta)
+JCE_COMP_IMPL(JceTerrainComponent,            terrain)
 
 #undef JCE_COMP_IMPL
 
@@ -284,6 +287,7 @@ uint32_t jce_scene_get_component_flags(const JceScene *s, JceEntity e)
     if (ecs_has(s->world, ent, JceParticleEmitterComponent))    flags |= JCE_COMP_FLAG_PARTICLE_EMITTER;
     if (ecs_has(s->world, ent, JceBehaviorTree))                flags |= JCE_COMP_FLAG_BEHAVIOR_TREE;
     if (ecs_has(s->world, ent, JceEditorMeta))                  flags |= JCE_COMP_FLAG_EDITOR_META;
+    if (ecs_has(s->world, ent, JceTerrainComponent))            flags |= JCE_COMP_FLAG_TERRAIN;
 
     return flags;
 }

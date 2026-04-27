@@ -43,6 +43,7 @@ struct JceRenderer {
     bgfx_program_handle_t program_pbr_skinned;
     bgfx_program_handle_t program_shadow;
     bgfx_program_handle_t program_shadow_skinned;
+    bgfx_program_handle_t program_terrain;
     bgfx_uniform_handle_t u_light_dir;   /* vec4: xyz = light direction */
     bgfx_uniform_handle_t u_light_color; /* vec4: xyz = color, w = ambient */
     uint32_t reset_flags;
@@ -429,6 +430,7 @@ JceRenderer *jce_renderer_create(JceWindow *win,
     r->program_pbr_skinned.idx  = UINT16_MAX;
     r->program_shadow.idx       = UINT16_MAX;
     r->program_shadow_skinned.idx = UINT16_MAX;
+    r->program_terrain.idx        = UINT16_MAX;
 
     /* Build GPU name from vendor ID + renderer name. */
     {
@@ -466,6 +468,7 @@ void jce_renderer_set_shaders(JceRenderer *r,
     r->program_pbr_skinned = (bgfx_program_handle_t){ shaders->pbr_skinned.idx };
     r->program_shadow = (bgfx_program_handle_t){ shaders->shadow.idx };
     r->program_shadow_skinned = (bgfx_program_handle_t){ shaders->shadow_skinned.idx };
+    r->program_terrain = (bgfx_program_handle_t){ shaders->terrain.idx };
 
     if (r->program.idx == UINT16_MAX)
         LOG_ERROR(LOG_TAG, "color shader not provided");
@@ -669,6 +672,8 @@ void jce_renderer_destroy(JceRenderer *r)
         bgfx_destroy_program(r->program_shadow);
     if (r->program_shadow_skinned.idx != UINT16_MAX)
         bgfx_destroy_program(r->program_shadow_skinned);
+    if (r->program_terrain.idx != UINT16_MAX)
+        bgfx_destroy_program(r->program_terrain);
     if (r->u_light_dir.idx != UINT16_MAX)
         bgfx_destroy_uniform(r->u_light_dir);
     if (r->u_light_color.idx != UINT16_MAX)
@@ -945,6 +950,19 @@ JceShaderHandle jce_renderer_get_program_shadow_skinned(const JceRenderer *r)
     JceShaderHandle invalid = JCE_INVALID_SHADER;
     if (!r) return invalid;
     return (JceShaderHandle){ r->program_shadow_skinned.idx };
+}
+
+JceShaderHandle jce_renderer_get_program_terrain(const JceRenderer *r)
+{
+    JceShaderHandle invalid = JCE_INVALID_SHADER;
+    if (!r) return invalid;
+    return (JceShaderHandle){ r->program_terrain.idx };
+}
+
+bgfx_program_handle_t jce_renderer_get_bgfx_program_terrain(const JceRenderer *r)
+{
+    bgfx_program_handle_t invalid = { UINT16_MAX };
+    return r ? r->program_terrain : invalid;
 }
 
 bgfx_program_handle_t jce_renderer_get_bgfx_program_pbr(const JceRenderer *r)

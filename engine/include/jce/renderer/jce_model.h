@@ -26,7 +26,7 @@ typedef struct JceAnimClip JceAnimClip;
 
 /* Load a glTF/GLB model from the PAK archive.
    Returns NULL on failure (asset not found, parse error, OOM). */
-JceModel *jce_model_load_gltf(const JcePakArchive *pak, const char *asset_path);
+JCE_API JceModel *jce_model_load_gltf(const JcePakArchive *pak, const char *asset_path);
 
 /* Load a glTF/GLB model from raw file bytes in memory.
    name is used for logging only; may be NULL. */
@@ -34,7 +34,7 @@ JceModel *jce_model_load_gltf_memory(const void *data, uint32_t size,
                                       const char *name);
 
 /* Destroy a model and all owned GPU resources (meshes, textures, skeleton). */
-void jce_model_destroy(JceModel *model);
+JCE_API void jce_model_destroy(JceModel *model);
 
 /* Draw all mesh primitives with their PBR materials.
  *
@@ -50,13 +50,13 @@ void jce_model_draw(const JceModel *model,
 /* -- Skeleton & animation accessors -------------------------------- */
 
 /* Returns the skeleton, or NULL if the model has no skinning. */
-JceSkeleton  *jce_model_get_skeleton(const JceModel *model);
+JCE_API JceSkeleton  *jce_model_get_skeleton(const JceModel *model);
 
 /* Number of animation clips embedded in the model. */
-uint32_t      jce_model_anim_count(const JceModel *model);
+JCE_API uint32_t      jce_model_anim_count(const JceModel *model);
 
 /* Get animation clip by index. Returns NULL if out of range. */
-JceAnimClip  *jce_model_get_anim(const JceModel *model, uint32_t index);
+JCE_API JceAnimClip  *jce_model_get_anim(const JceModel *model, uint32_t index);
 
 JCE_EXTERN_C_END
 

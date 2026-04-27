@@ -14,7 +14,7 @@
 extern "C" {
 #endif
 
-#include <jce/os/core/pak_loader.h>
+#include <jce/os/core/jce_pak_loader.h>
 
 /* Supported locales. */
 typedef enum {
@@ -38,6 +38,18 @@ JceLocale jce_editor_i18n_get_locale(void);
 /* Look up a translated string by key.
    Returns the key itself if not found. */
 const char *jce_editor_i18n(const char *key);
+
+/* Look up a translated string by key, returning `fallback` (not the key)
+   when no translation is registered. Useful for opportunistic
+   translation of strings that already have a sensible English literal
+   in code (e.g. reflection field labels). */
+const char *jce_editor_i18n_or(const char *key, const char *fallback);
+
+/* Look up a translated string and append "##id_suffix" for ImGui IDs.
+   Returns a pointer into a thread-local rotating buffer pool
+   (16 slots * 192 bytes), safe across many SameLine() calls per frame.
+   Pass id_suffix as the bare id (no leading "##"). */
+const char *jce_editor_i18n_id(const char *key, const char *id_suffix);
 
 #ifdef __cplusplus
 }

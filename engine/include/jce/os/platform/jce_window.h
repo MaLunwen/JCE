@@ -39,12 +39,12 @@ typedef struct JceWindowConfig {
 typedef struct JceWindow JceWindow;
 
 /* Create / destroy. */
-JceWindow  *jce_window_create(const JceWindowConfig *cfg);
-void        jce_window_destroy(JceWindow *win);
+JCE_API JceWindow  *jce_window_create(const JceWindowConfig *cfg);
+JCE_API void        jce_window_destroy(JceWindow *win);
 
 /* Accessors. */
-void        jce_window_get_size(JceWindow *win, uint32_t *w, uint32_t *h);
-void        jce_window_get_logical(JceWindow *win, int *w, int *h);
+JCE_API void        jce_window_get_size(JceWindow *win, uint32_t *w, uint32_t *h);
+JCE_API void        jce_window_get_logical(JceWindow *win, int *w, int *h);
 
 /* Native window handle info for renderer backends. */
 typedef struct JceNativeWindow {
@@ -54,10 +54,10 @@ typedef struct JceNativeWindow {
 
 /* Retrieve native window handles.
    Supports Win32, macOS/Cocoa, iOS/UIKit, Android, X11, Wayland. */
-void        jce_window_get_native(const JceWindow *win, JceNativeWindow *out);
+JCE_API void        jce_window_get_native(const JceWindow *win, JceNativeWindow *out);
 
 /* Call from window-resize handler. */
-void        jce_window_handle_resize(JceWindow *win, uint32_t w, uint32_t h);
+JCE_API void        jce_window_handle_resize(JceWindow *win, uint32_t w, uint32_t h);
 
 /* Compute a letterbox viewport that preserves the logical aspect ratio. */
 void        jce_window_calc_viewport(const JceWindow *win,
@@ -69,22 +69,22 @@ void        jce_window_set_icon(JceWindow *win,
                                 const void *data, size_t size);
 
 /* Toggle between fullscreen and windowed mode. */
-void        jce_window_toggle_fullscreen(JceWindow *win);
+JCE_API void        jce_window_toggle_fullscreen(JceWindow *win);
 
 /* Query whether the window is currently fullscreen. */
-bool        jce_window_is_fullscreen(const JceWindow *win);
+JCE_API bool        jce_window_is_fullscreen(const JceWindow *win);
 
 /* Enable/disable relative (captured) mouse mode for FPS-style controls. */
-void        jce_window_set_relative_mouse_mode(JceWindow *win, bool enabled);
+JCE_API void        jce_window_set_relative_mouse_mode(JceWindow *win, bool enabled);
 
 /* DPI scale factor: ratio of physical pixels to logical points.
    Returns 1.0 on standard displays, 2.0 on Retina/HiDPI, etc.
    Useful for scaling UI elements and touch targets. */
-float       jce_window_get_dpi_scale(const JceWindow *win);
+JCE_API float       jce_window_get_dpi_scale(const JceWindow *win);
 
 /* Start/stop SDL text input without exposing SDL_Window to consumers. */
-bool        jce_window_start_text_input(JceWindow *win);
-bool        jce_window_stop_text_input(JceWindow *win);
+JCE_API bool        jce_window_start_text_input(JceWindow *win);
+JCE_API bool        jce_window_stop_text_input(JceWindow *win);
 
 JCE_EXTERN_C_END
 

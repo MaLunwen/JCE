@@ -33,54 +33,54 @@
 
 /* Growable buffer for building .jceasset blobs. */
 typedef struct {
-	uint8_t *data;
-	size_t   size;
-	size_t   capacity;
+    uint8_t *data;
+    size_t   size;
+    size_t   capacity;
 } Buf;
 
 static bool buf_init(Buf *b, size_t cap)
 {
-	b->data = (uint8_t *)JCE_MALLOC(cap);
-	if (!b->data) return false;
-	b->size = 0;
-	b->capacity = cap;
-	return true;
+    b->data = (uint8_t *)JCE_MALLOC(cap);
+    if (!b->data) return false;
+    b->size = 0;
+    b->capacity = cap;
+    return true;
 }
 
 static bool buf_grow(Buf *b, size_t needed)
 {
-	if (b->size + needed <= b->capacity) return true;
-	size_t new_cap = b->capacity * 2;
-	if (new_cap < b->size + needed) new_cap = b->size + needed;
-	uint8_t *tmp = (uint8_t *)JCE_REALLOC(b->data, new_cap);
-	if (!tmp) return false;
-	b->data = tmp;
-	b->capacity = new_cap;
-	return true;
+    if (b->size + needed <= b->capacity) return true;
+    size_t new_cap = b->capacity * 2;
+    if (new_cap < b->size + needed) new_cap = b->size + needed;
+    uint8_t *tmp = (uint8_t *)JCE_REALLOC(b->data, new_cap);
+    if (!tmp) return false;
+    b->data = tmp;
+    b->capacity = new_cap;
+    return true;
 }
 
 static bool buf_write(Buf *b, const void *data, size_t len)
 {
-	if (!buf_grow(b, len)) return false;
-	memcpy(b->data + b->size, data, len);
-	b->size += len;
-	return true;
+    if (!buf_grow(b, len)) return false;
+    memcpy(b->data + b->size, data, len);
+    b->size += len;
+    return true;
 }
 
 static bool buf_write_zeros(Buf *b, size_t len)
 {
-	if (!buf_grow(b, len)) return false;
-	memset(b->data + b->size, 0, len);
-	b->size += len;
-	return true;
+    if (!buf_grow(b, len)) return false;
+    memset(b->data + b->size, 0, len);
+    b->size += len;
+    return true;
 }
 
 static void buf_free(Buf *b)
 {
-	JCE_FREE(b->data);
-	b->data = NULL;
-	b->size = 0;
-	b->capacity = 0;
+    JCE_FREE(b->data);
+    b->data = NULL;
+    b->size = 0;
+    b->capacity = 0;
 }
 
 /* Build a .jceasset blob from pre-built chunks.
@@ -88,9 +88,9 @@ static void buf_free(Buf *b)
    Returns malloc'd blob. */
 
 typedef struct {
-	uint16_t    chunk_type;
-	const void *raw_data;
-	size_t      raw_size;
+    uint16_t    chunk_type;
+    const void *raw_data;
+    size_t      raw_size;
 } ChunkInput;
 
 static JceCookResult build_asset(uint32_t asset_type,
@@ -99,126 +99,126 @@ static JceCookResult build_asset(uint32_t asset_type,
                                  uint32_t chunk_count,
                                  const JceCookOptions *opts)
 {
-	JceCookResult result = {0};
-	int clevel = opts ? opts->compression_level : 3;
+    JceCookResult result = {0};
+    int clevel = opts ? opts->compression_level : 3;
 
-	/* Calculate layout sizes. */
-	size_t header_size = JCEASSET_HEADER_SIZE;
-	size_t toc_size    = (size_t)chunk_count * JCEASSET_CHUNK_ENTRY_SIZE;
-	size_t data_start  = header_size + toc_size;
+    /* Calculate layout sizes. */
+    size_t header_size = JCEASSET_HEADER_SIZE;
+    size_t toc_size    = (size_t)chunk_count * JCEASSET_CHUNK_ENTRY_SIZE;
+    size_t data_start  = header_size + toc_size;
 
-	/* Pre-compress all chunks to get sizes. */
-	typedef struct {
-		void  *comp_data;
-		size_t comp_size;
-		bool   is_compressed;
-	} CompChunk;
+    /* Pre-compress all chunks to get sizes. */
+    typedef struct {
+        void  *comp_data;
+        size_t comp_size;
+        bool   is_compressed;
+    } CompChunk;
 
-	CompChunk *comp = (CompChunk *)JCE_CALLOC(chunk_count, sizeof(CompChunk));
-	if (!comp) {
-		snprintf(result.error, sizeof(result.error), "allocation failed");
-		return result;
-	}
+    CompChunk *comp = (CompChunk *)JCE_CALLOC(chunk_count, sizeof(CompChunk));
+    if (!comp) {
+        snprintf(result.error, sizeof(result.error), "allocation failed");
+        return result;
+    }
 
-	/* Reusable ZSTD compression context — avoids repeated internal
-	   allocation/deallocation when compressing multiple chunks. */
-	ZSTD_CCtx *cctx = (clevel > 0) ? ZSTD_createCCtx() : NULL;
+    /* Reusable ZSTD compression context — avoids repeated internal
+       allocation/deallocation when compressing multiple chunks. */
+    ZSTD_CCtx *cctx = (clevel > 0) ? ZSTD_createCCtx() : NULL;
 
-	size_t total_data = 0;
-	for (uint32_t i = 0; i < chunk_count; i++) {
-		if (cctx && chunks[i].raw_size > 64) {
-			size_t bound = ZSTD_compressBound(chunks[i].raw_size);
-			comp[i].comp_data = JCE_MALLOC(bound);
-			if (comp[i].comp_data) {
-				size_t csize = ZSTD_compressCCtx(cctx,
-				                                  comp[i].comp_data, bound,
-				                                  chunks[i].raw_data,
-				                                  chunks[i].raw_size,
-				                                  clevel);
-				if (!ZSTD_isError(csize) && csize < chunks[i].raw_size) {
-					comp[i].comp_size = csize;
-					comp[i].is_compressed = true;
-				} else {
-					JCE_FREE(comp[i].comp_data);
-					comp[i].comp_data = NULL;
-				}
-			}
-		}
+    size_t total_data = 0;
+    for (uint32_t i = 0; i < chunk_count; i++) {
+        if (cctx && chunks[i].raw_size > 64) {
+            size_t bound = ZSTD_compressBound(chunks[i].raw_size);
+            comp[i].comp_data = JCE_MALLOC(bound);
+            if (comp[i].comp_data) {
+                size_t csize = ZSTD_compressCCtx(cctx,
+                                                  comp[i].comp_data, bound,
+                                                  chunks[i].raw_data,
+                                                  chunks[i].raw_size,
+                                                  clevel);
+                if (!ZSTD_isError(csize) && csize < chunks[i].raw_size) {
+                    comp[i].comp_size = csize;
+                    comp[i].is_compressed = true;
+                } else {
+                    JCE_FREE(comp[i].comp_data);
+                    comp[i].comp_data = NULL;
+                }
+            }
+        }
 
-		if (comp[i].is_compressed)
-			total_data += comp[i].comp_size;
-		else
-			total_data += chunks[i].raw_size;
-	}
+        if (comp[i].is_compressed)
+            total_data += comp[i].comp_size;
+        else
+            total_data += chunks[i].raw_size;
+    }
 
-	ZSTD_freeCCtx(cctx);
+    ZSTD_freeCCtx(cctx);
 
-	/* Build final blob. */
-	Buf buf;
-	if (!buf_init(&buf, data_start + total_data + 64)) {
-		for (uint32_t i = 0; i < chunk_count; i++) JCE_FREE(comp[i].comp_data);
-		JCE_FREE(comp);
-		snprintf(result.error, sizeof(result.error), "allocation failed");
-		return result;
-	}
+    /* Build final blob. */
+    Buf buf;
+    if (!buf_init(&buf, data_start + total_data + 64)) {
+        for (uint32_t i = 0; i < chunk_count; i++) JCE_FREE(comp[i].comp_data);
+        JCE_FREE(comp);
+        snprintf(result.error, sizeof(result.error), "allocation failed");
+        return result;
+    }
 
-	/* Write header. */
-	JceAssetFileHeader hdr = {0};
-	hdr.magic[0]    = JCEASSET_MAGIC_0;
-	hdr.magic[1]    = JCEASSET_MAGIC_1;
-	hdr.magic[2]    = JCEASSET_MAGIC_2;
-	hdr.magic[3]    = JCEASSET_MAGIC_3;
-	hdr.version     = JCEASSET_VERSION;
-	hdr.asset_type  = asset_type;
-	hdr.chunk_count = chunk_count;
-	hdr.source_hash = source_hash;
-	buf_write(&buf, &hdr, sizeof(hdr));
+    /* Write header. */
+    JceAssetFileHeader hdr = {0};
+    hdr.magic[0]    = JCEASSET_MAGIC_0;
+    hdr.magic[1]    = JCEASSET_MAGIC_1;
+    hdr.magic[2]    = JCEASSET_MAGIC_2;
+    hdr.magic[3]    = JCEASSET_MAGIC_3;
+    hdr.version     = JCEASSET_VERSION;
+    hdr.asset_type  = asset_type;
+    hdr.chunk_count = chunk_count;
+    hdr.source_hash = source_hash;
+    buf_write(&buf, &hdr, sizeof(hdr));
 
-	/* Pad header to JCEASSET_HEADER_SIZE if struct is smaller. */
-	if (sizeof(hdr) < JCEASSET_HEADER_SIZE)
-		buf_write_zeros(&buf, JCEASSET_HEADER_SIZE - sizeof(hdr));
+    /* Pad header to JCEASSET_HEADER_SIZE if struct is smaller. */
+    if (sizeof(hdr) < JCEASSET_HEADER_SIZE)
+        buf_write_zeros(&buf, JCEASSET_HEADER_SIZE - sizeof(hdr));
 
-	/* Write chunk table (fill data_offset after calculating). */
-	size_t offset = data_start;
+    /* Write chunk table (fill data_offset after calculating). */
+    size_t offset = data_start;
 
-	for (uint32_t i = 0; i < chunk_count; i++) {
-		JceAssetChunkEntry entry = {0};
-		entry.chunk_type    = chunks[i].chunk_type;
-		entry.compression   = comp[i].is_compressed
-			? JCEASSET_COMPRESS_ZSTD : JCEASSET_COMPRESS_NONE;
-		entry.data_offset   = (uint64_t)offset;
-		entry.original_size = (uint64_t)chunks[i].raw_size;
+    for (uint32_t i = 0; i < chunk_count; i++) {
+        JceAssetChunkEntry entry = {0};
+        entry.chunk_type    = chunks[i].chunk_type;
+        entry.compression   = comp[i].is_compressed
+            ? JCEASSET_COMPRESS_ZSTD : JCEASSET_COMPRESS_NONE;
+        entry.data_offset   = (uint64_t)offset;
+        entry.original_size = (uint64_t)chunks[i].raw_size;
 
-		if (comp[i].is_compressed) {
-			entry.compressed_size = (uint64_t)comp[i].comp_size;
-			offset += comp[i].comp_size;
-		} else {
-			entry.compressed_size = (uint64_t)chunks[i].raw_size;
-			offset += chunks[i].raw_size;
-		}
+        if (comp[i].is_compressed) {
+            entry.compressed_size = (uint64_t)comp[i].comp_size;
+            offset += comp[i].comp_size;
+        } else {
+            entry.compressed_size = (uint64_t)chunks[i].raw_size;
+            offset += chunks[i].raw_size;
+        }
 
-		buf_write(&buf, &entry, sizeof(entry));
-		if (sizeof(entry) < JCEASSET_CHUNK_ENTRY_SIZE)
-			buf_write_zeros(&buf, JCEASSET_CHUNK_ENTRY_SIZE - sizeof(entry));
-	}
+        buf_write(&buf, &entry, sizeof(entry));
+        if (sizeof(entry) < JCEASSET_CHUNK_ENTRY_SIZE)
+            buf_write_zeros(&buf, JCEASSET_CHUNK_ENTRY_SIZE - sizeof(entry));
+    }
 
-	/* Write data blocks. */
-	for (uint32_t i = 0; i < chunk_count; i++) {
-		if (comp[i].is_compressed) {
-			buf_write(&buf, comp[i].comp_data, comp[i].comp_size);
-		} else {
-			buf_write(&buf, chunks[i].raw_data, chunks[i].raw_size);
-		}
-	}
+    /* Write data blocks. */
+    for (uint32_t i = 0; i < chunk_count; i++) {
+        if (comp[i].is_compressed) {
+            buf_write(&buf, comp[i].comp_data, comp[i].comp_size);
+        } else {
+            buf_write(&buf, chunks[i].raw_data, chunks[i].raw_size);
+        }
+    }
 
-	/* Cleanup compressed buffers. */
-	for (uint32_t i = 0; i < chunk_count; i++) JCE_FREE(comp[i].comp_data);
-	JCE_FREE(comp);
+    /* Cleanup compressed buffers. */
+    for (uint32_t i = 0; i < chunk_count; i++) JCE_FREE(comp[i].comp_data);
+    JCE_FREE(comp);
 
-	result.data    = buf.data;
-	result.size    = buf.size;
-	result.success = true;
-	return result;
+    result.data    = buf.data;
+    result.size    = buf.size;
+    result.success = true;
+    return result;
 }
 
 /* ================================================================== */
@@ -228,169 +228,169 @@ static JceCookResult build_asset(uint32_t asset_type,
 JceCookResult jce_cook_texture(const void *input, size_t input_size,
                                const JceCookOptions *opts)
 {
-	JceCookResult result = {0};
+    JceCookResult result = {0};
 
-	/* Decode image via SDL3_image. */
-	SDL_IOStream *io = SDL_IOFromConstMem(input, input_size);
-	if (!io) {
-		snprintf(result.error, sizeof(result.error), "SDL_IOFromConstMem failed");
-		return result;
-	}
+    /* Decode image via SDL3_image. */
+    SDL_IOStream *io = SDL_IOFromConstMem(input, input_size);
+    if (!io) {
+        snprintf(result.error, sizeof(result.error), "SDL_IOFromConstMem failed");
+        return result;
+    }
 
-	SDL_Surface *surf = IMG_Load_IO(io, true);
-	if (!surf) {
-		snprintf(result.error, sizeof(result.error), "IMG_Load_IO failed: %s",
-		         SDL_GetError());
-		return result;
-	}
+    SDL_Surface *surf = IMG_Load_IO(io, true);
+    if (!surf) {
+        snprintf(result.error, sizeof(result.error), "IMG_Load_IO failed: %s",
+                 SDL_GetError());
+        return result;
+    }
 
-	/* Ensure RGBA8. */
-	if (surf->format != SDL_PIXELFORMAT_RGBA32) {
-		SDL_Surface *conv = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA32);
-		SDL_DestroySurface(surf);
-		surf = conv;
-		if (!surf) {
-			snprintf(result.error, sizeof(result.error), "RGBA conversion failed");
-			return result;
-		}
-	}
+    /* Ensure RGBA8. */
+    if (surf->format != SDL_PIXELFORMAT_RGBA32) {
+        SDL_Surface *conv = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA32);
+        SDL_DestroySurface(surf);
+        surf = conv;
+        if (!surf) {
+            snprintf(result.error, sizeof(result.error), "RGBA conversion failed");
+            return result;
+        }
+    }
 
-	/* Downscale if exceeding max texture dimension cap. */
-	int max_dim = opts ? opts->max_texture_size : 0;
-	if (max_dim > 0 && (surf->w > max_dim || surf->h > max_dim)) {
-		float scale = (float)max_dim / (float)(surf->w > surf->h ? surf->w : surf->h);
-		int nw = (int)(surf->w * scale);
-		int nh = (int)(surf->h * scale);
-		if (nw < 1) nw = 1;
-		if (nh < 1) nh = 1;
-		SDL_Surface *scaled = SDL_CreateSurface(nw, nh, SDL_PIXELFORMAT_RGBA32);
-		if (scaled) {
-			SDL_BlitSurfaceScaled(surf, NULL, scaled, NULL, SDL_SCALEMODE_LINEAR);
-			SDL_DestroySurface(surf);
-			surf = scaled;
-		}
-	}
+    /* Downscale if exceeding max texture dimension cap. */
+    int max_dim = opts ? opts->max_texture_size : 0;
+    if (max_dim > 0 && (surf->w > max_dim || surf->h > max_dim)) {
+        float scale = (float)max_dim / (float)(surf->w > surf->h ? surf->w : surf->h);
+        int nw = (int)(surf->w * scale);
+        int nh = (int)(surf->h * scale);
+        if (nw < 1) nw = 1;
+        if (nh < 1) nh = 1;
+        SDL_Surface *scaled = SDL_CreateSurface(nw, nh, SDL_PIXELFORMAT_RGBA32);
+        if (scaled) {
+            SDL_BlitSurfaceScaled(surf, NULL, scaled, NULL, SDL_SCALEMODE_LINEAR);
+            SDL_DestroySurface(surf);
+            surf = scaled;
+        }
+    }
 
-	uint32_t base_w = (uint32_t)surf->w;
-	uint32_t base_h = (uint32_t)surf->h;
+    uint32_t base_w = (uint32_t)surf->w;
+    uint32_t base_h = (uint32_t)surf->h;
 
-	/* Always use RGBA8 format. */
-	int target_format = JCEASSET_TEXFMT_RGBA8;
+    /* Always use RGBA8 format. */
+    int target_format = JCEASSET_TEXFMT_RGBA8;
 
-	/* Determine mip count. */
-	uint32_t mip_count = 1;
-	if (opts && opts->generate_mipmaps) {
-		mip_count = jce_tex_mip_count(base_w, base_h);
-	}
+    /* Determine mip count. */
+    uint32_t mip_count = 1;
+    if (opts && opts->generate_mipmaps) {
+        mip_count = jce_tex_mip_count(base_w, base_h);
+    }
 
-	/* Calculate total output size for all mip levels (RGBA8 = 4 bpp). */
-	size_t total_mip_size = 0;
-	for (uint32_t m = 0; m < mip_count; m++) {
-		uint32_t mw, mh;
-		jce_tex_mip_dimensions(base_w, base_h, m, &mw, &mh);
-		total_mip_size += (size_t)mw * mh * 4;
-	}
+    /* Calculate total output size for all mip levels (RGBA8 = 4 bpp). */
+    size_t total_mip_size = 0;
+    for (uint32_t m = 0; m < mip_count; m++) {
+        uint32_t mw, mh;
+        jce_tex_mip_dimensions(base_w, base_h, m, &mw, &mh);
+        total_mip_size += (size_t)mw * mh * 4;
+    }
 
-	/* Allocate output buffer for all mips. */
-	uint8_t *mip_data = (uint8_t *)JCE_MALLOC(total_mip_size);
-	if (!mip_data) {
-		SDL_DestroySurface(surf);
-		snprintf(result.error, sizeof(result.error), "allocation failed");
-		return result;
-	}
+    /* Allocate output buffer for all mips. */
+    uint8_t *mip_data = (uint8_t *)JCE_MALLOC(total_mip_size);
+    if (!mip_data) {
+        SDL_DestroySurface(surf);
+        snprintf(result.error, sizeof(result.error), "allocation failed");
+        return result;
+    }
 
-	/* Allocate mip offset array (stored after TEX_INFO struct). */
-	uint32_t *mip_offsets = (uint32_t *)JCE_MALLOC(mip_count * sizeof(uint32_t));
-	if (!mip_offsets) {
-		JCE_FREE(mip_data);
-		SDL_DestroySurface(surf);
-		snprintf(result.error, sizeof(result.error), "allocation failed");
-		return result;
-	}
+    /* Allocate mip offset array (stored after TEX_INFO struct). */
+    uint32_t *mip_offsets = (uint32_t *)JCE_MALLOC(mip_count * sizeof(uint32_t));
+    if (!mip_offsets) {
+        JCE_FREE(mip_data);
+        SDL_DestroySurface(surf);
+        snprintf(result.error, sizeof(result.error), "allocation failed");
+        return result;
+    }
 
-	/* Generate each mip level. */
-	uint8_t *current_mip = (uint8_t *)surf->pixels;
-	uint8_t *temp_mip = NULL;
-	uint32_t current_w = base_w, current_h = base_h;
-	size_t mip_offset = 0;
+    /* Generate each mip level. */
+    uint8_t *current_mip = (uint8_t *)surf->pixels;
+    uint8_t *temp_mip = NULL;
+    uint32_t current_w = base_w, current_h = base_h;
+    size_t mip_offset = 0;
 
-	for (uint32_t m = 0; m < mip_count; m++) {
-		mip_offsets[m] = (uint32_t)mip_offset;
+    for (uint32_t m = 0; m < mip_count; m++) {
+        mip_offsets[m] = (uint32_t)mip_offset;
 
-		/* Copy RGBA8 pixel data for this mip level. */
-		size_t mip_size = (size_t)current_w * current_h * 4;
-		memcpy(mip_data + mip_offset, current_mip, mip_size);
-		mip_offset += mip_size;
+        /* Copy RGBA8 pixel data for this mip level. */
+        size_t mip_size = (size_t)current_w * current_h * 4;
+        memcpy(mip_data + mip_offset, current_mip, mip_size);
+        mip_offset += mip_size;
 
-		/* Generate next mip level if needed. */
-		if (m + 1 < mip_count) {
-			uint32_t next_w, next_h;
-			jce_tex_mip_dimensions(base_w, base_h, m + 1, &next_w, &next_h);
+        /* Generate next mip level if needed. */
+        if (m + 1 < mip_count) {
+            uint32_t next_w, next_h;
+            jce_tex_mip_dimensions(base_w, base_h, m + 1, &next_w, &next_h);
 
-			size_t next_size = (size_t)next_w * next_h * 4;
-			if (!temp_mip) {
-				temp_mip = (uint8_t *)JCE_MALLOC(next_size);
-			} else {
-				temp_mip = (uint8_t *)JCE_REALLOC(temp_mip, next_size);
-			}
+            size_t next_size = (size_t)next_w * next_h * 4;
+            if (!temp_mip) {
+                temp_mip = (uint8_t *)JCE_MALLOC(next_size);
+            } else {
+                temp_mip = (uint8_t *)JCE_REALLOC(temp_mip, next_size);
+            }
 
-			if (!temp_mip) {
-				JCE_FREE(mip_offsets);
-				JCE_FREE(mip_data);
-				SDL_DestroySurface(surf);
-				snprintf(result.error, sizeof(result.error), "mip allocation failed");
-				return result;
-			}
+            if (!temp_mip) {
+                JCE_FREE(mip_offsets);
+                JCE_FREE(mip_data);
+                SDL_DestroySurface(surf);
+                snprintf(result.error, sizeof(result.error), "mip allocation failed");
+                return result;
+            }
 
-			jce_tex_generate_mip(current_mip, current_w, current_h,
-			                     temp_mip, &next_w, &next_h);
-			current_mip = temp_mip;
-			current_w = next_w;
-			current_h = next_h;
-		}
-	}
+            jce_tex_generate_mip(current_mip, current_w, current_h,
+                                 temp_mip, &next_w, &next_h);
+            current_mip = temp_mip;
+            current_w = next_w;
+            current_h = next_h;
+        }
+    }
 
-	JCE_FREE(temp_mip);
+    JCE_FREE(temp_mip);
 
-	/* Build info chunk (extended with mip offsets). */
-	size_t info_size = sizeof(JceAssetTexInfo) + mip_count * sizeof(uint32_t);
-	uint8_t *info_buf = (uint8_t *)JCE_MALLOC(info_size);
-	if (!info_buf) {
-		JCE_FREE(mip_offsets);
-		JCE_FREE(mip_data);
-		SDL_DestroySurface(surf);
-		snprintf(result.error, sizeof(result.error), "allocation failed");
-		return result;
-	}
+    /* Build info chunk (extended with mip offsets). */
+    size_t info_size = sizeof(JceAssetTexInfo) + mip_count * sizeof(uint32_t);
+    uint8_t *info_buf = (uint8_t *)JCE_MALLOC(info_size);
+    if (!info_buf) {
+        JCE_FREE(mip_offsets);
+        JCE_FREE(mip_data);
+        SDL_DestroySurface(surf);
+        snprintf(result.error, sizeof(result.error), "allocation failed");
+        return result;
+    }
 
-	JceAssetTexInfo *info = (JceAssetTexInfo *)info_buf;
-	info->width     = base_w;
-	info->height    = base_h;
-	info->format    = (uint32_t)target_format;
-	info->mip_count = mip_count;
-	info->flags     = 1; /* sRGB */
-	info->_pad      = 0;
+    JceAssetTexInfo *info = (JceAssetTexInfo *)info_buf;
+    info->width     = base_w;
+    info->height    = base_h;
+    info->format    = (uint32_t)target_format;
+    info->mip_count = mip_count;
+    info->flags     = 1; /* sRGB */
+    info->_pad      = 0;
 
-	/* Copy mip offsets after the info struct. */
-	memcpy(info_buf + sizeof(JceAssetTexInfo), mip_offsets, mip_count * sizeof(uint32_t));
+    /* Copy mip offsets after the info struct. */
+    memcpy(info_buf + sizeof(JceAssetTexInfo), mip_offsets, mip_count * sizeof(uint32_t));
 
-	uint64_t source_hash = XXH3_64bits(input, input_size);
+    uint64_t source_hash = XXH3_64bits(input, input_size);
 
-	ChunkInput chunks[2];
-	chunks[0].chunk_type = JCEASSET_CHUNK_TEX_INFO;
-	chunks[0].raw_data   = info_buf;
-	chunks[0].raw_size   = info_size;
-	chunks[1].chunk_type = JCEASSET_CHUNK_TEX_PIXELS;
-	chunks[1].raw_data   = mip_data;
-	chunks[1].raw_size   = mip_offset;  /* Actual data size */
+    ChunkInput chunks[2];
+    chunks[0].chunk_type = JCEASSET_CHUNK_TEX_INFO;
+    chunks[0].raw_data   = info_buf;
+    chunks[0].raw_size   = info_size;
+    chunks[1].chunk_type = JCEASSET_CHUNK_TEX_PIXELS;
+    chunks[1].raw_data   = mip_data;
+    chunks[1].raw_size   = mip_offset;  /* Actual data size */
 
-	result = build_asset(JCEASSET_TYPE_TEXTURE, source_hash, chunks, 2, opts);
+    result = build_asset(JCEASSET_TYPE_TEXTURE, source_hash, chunks, 2, opts);
 
-	JCE_FREE(info_buf);
-	JCE_FREE(mip_offsets);
-	JCE_FREE(mip_data);
-	SDL_DestroySurface(surf);
-	return result;
+    JCE_FREE(info_buf);
+    JCE_FREE(mip_offsets);
+    JCE_FREE(mip_data);
+    SDL_DestroySurface(surf);
+    return result;
 }
 
 /* ================================================================== */
@@ -400,94 +400,94 @@ JceCookResult jce_cook_texture(const void *input, size_t input_size,
 JceCookResult jce_cook_audio(const void *input, size_t input_size,
                              const JceCookOptions *opts)
 {
-	JceCookResult result = {0};
+    JceCookResult result = {0};
 
 #ifdef JCE_NO_AUDIO
-	snprintf(result.error, sizeof(result.error), "audio disabled");
-	return result;
+    snprintf(result.error, sizeof(result.error), "audio disabled");
+    return result;
 #else
-	/* Decode via miniaudio. */
-	ma_decoder_config cfg = ma_decoder_config_init(ma_format_s16, 0, 0);
-	ma_decoder decoder;
+    /* Decode via miniaudio. */
+    ma_decoder_config cfg = ma_decoder_config_init(ma_format_s16, 0, 0);
+    ma_decoder decoder;
 
-	if (ma_decoder_init_memory(input, input_size, &cfg, &decoder) != MA_SUCCESS) {
-		snprintf(result.error, sizeof(result.error), "miniaudio decode failed");
-		return result;
-	}
+    if (ma_decoder_init_memory(input, input_size, &cfg, &decoder) != MA_SUCCESS) {
+        snprintf(result.error, sizeof(result.error), "miniaudio decode failed");
+        return result;
+    }
 
-	ma_uint64 total_frames = 0;
-	ma_decoder_get_length_in_pcm_frames(&decoder, &total_frames);
+    ma_uint64 total_frames = 0;
+    ma_decoder_get_length_in_pcm_frames(&decoder, &total_frames);
 
-	ma_uint32 channels    = decoder.outputChannels;
-	ma_uint32 sample_rate = decoder.outputSampleRate;
-	void *pcm = NULL;
+    ma_uint32 channels    = decoder.outputChannels;
+    ma_uint32 sample_rate = decoder.outputSampleRate;
+    void *pcm = NULL;
 
-	if (total_frames == 0) {
-		/* Unknown length — decode in chunks. */
-		size_t alloc = 256 * 1024;
-		size_t used  = 0;
-		pcm = JCE_MALLOC(alloc * channels * sizeof(int16_t));
-		if (!pcm) {
-			ma_decoder_uninit(&decoder);
-			snprintf(result.error, sizeof(result.error), "allocation failed");
-			return result;
-		}
-		for (;;) {
-			if (used + 4096 > alloc) {
-				alloc *= 2;
-				void *tmp = JCE_REALLOC(pcm, alloc * channels * sizeof(int16_t));
-				if (!tmp) {
-					JCE_FREE(pcm);
-					ma_decoder_uninit(&decoder);
-					snprintf(result.error, sizeof(result.error), "realloc failed");
-					return result;
-				}
-				pcm = tmp;
-			}
-			ma_uint64 read = 0;
-			ma_decoder_read_pcm_frames(&decoder,
-				(int16_t *)pcm + used * channels, 4096, &read);
-			if (read == 0) break;
-			used += (size_t)read;
-		}
-		total_frames = (ma_uint64)used;
-	} else {
-		pcm = JCE_MALLOC((size_t)(total_frames * channels * sizeof(int16_t)));
-		if (!pcm) {
-			ma_decoder_uninit(&decoder);
-			snprintf(result.error, sizeof(result.error), "allocation failed");
-			return result;
-		}
-		ma_uint64 read = 0;
-		ma_decoder_read_pcm_frames(&decoder, pcm, total_frames, &read);
-		total_frames = read;
-	}
+    if (total_frames == 0) {
+        /* Unknown length — decode in chunks. */
+        size_t alloc = 256 * 1024;
+        size_t used  = 0;
+        pcm = JCE_MALLOC(alloc * channels * sizeof(int16_t));
+        if (!pcm) {
+            ma_decoder_uninit(&decoder);
+            snprintf(result.error, sizeof(result.error), "allocation failed");
+            return result;
+        }
+        for (;;) {
+            if (used + 4096 > alloc) {
+                alloc *= 2;
+                void *tmp = JCE_REALLOC(pcm, alloc * channels * sizeof(int16_t));
+                if (!tmp) {
+                    JCE_FREE(pcm);
+                    ma_decoder_uninit(&decoder);
+                    snprintf(result.error, sizeof(result.error), "realloc failed");
+                    return result;
+                }
+                pcm = tmp;
+            }
+            ma_uint64 read = 0;
+            ma_decoder_read_pcm_frames(&decoder,
+                (int16_t *)pcm + used * channels, 4096, &read);
+            if (read == 0) break;
+            used += (size_t)read;
+        }
+        total_frames = (ma_uint64)used;
+    } else {
+        pcm = JCE_MALLOC((size_t)(total_frames * channels * sizeof(int16_t)));
+        if (!pcm) {
+            ma_decoder_uninit(&decoder);
+            snprintf(result.error, sizeof(result.error), "allocation failed");
+            return result;
+        }
+        ma_uint64 read = 0;
+        ma_decoder_read_pcm_frames(&decoder, pcm, total_frames, &read);
+        total_frames = read;
+    }
 
-	ma_decoder_uninit(&decoder);
+    ma_decoder_uninit(&decoder);
 
-	/* Build info chunk. */
-	JceAssetAudioInfo info = {0};
-	info.sample_rate     = sample_rate;
-	info.channels        = (uint16_t)channels;
-	info.bits_per_sample = 16;
-	info.total_frames    = total_frames;
-	info.format          = 0; /* PCM_S16 */
+    /* Build info chunk. */
+    JceAssetAudioInfo info = {0};
+    info.sample_rate     = sample_rate;
+    info.channels        = (uint16_t)channels;
+    info.bits_per_sample = 16;
+    info.total_frames    = total_frames;
+    info.format          = 0; /* PCM_S16 */
 
-	size_t pcm_size = (size_t)(total_frames * channels * sizeof(int16_t));
-	uint64_t source_hash = XXH3_64bits(input, input_size);
+    size_t pcm_size = (size_t)(total_frames * channels * sizeof(int16_t));
+    uint64_t source_hash = XXH3_64bits(input, input_size);
 
-	ChunkInput chunks[2];
-	chunks[0].chunk_type = JCEASSET_CHUNK_AUDIO_INFO;
-	chunks[0].raw_data   = &info;
-	chunks[0].raw_size   = sizeof(info);
-	chunks[1].chunk_type = JCEASSET_CHUNK_AUDIO_PCM;
-	chunks[1].raw_data   = pcm;
-	chunks[1].raw_size   = pcm_size;
+    ChunkInput chunks[2];
+    chunks[0].chunk_type = JCEASSET_CHUNK_AUDIO_INFO;
+    chunks[0].raw_data   = &info;
+    chunks[0].raw_size   = sizeof(info);
+    chunks[1].chunk_type = JCEASSET_CHUNK_AUDIO_PCM;
+    chunks[1].raw_data   = pcm;
+    chunks[1].raw_size   = pcm_size;
 
-	result = build_asset(JCEASSET_TYPE_SOUND, source_hash, chunks, 2, opts);
+    result = build_asset(JCEASSET_TYPE_SOUND, source_hash, chunks, 2, opts);
 
-	JCE_FREE(pcm);
-	return result;
+    JCE_FREE(pcm);
+    return result;
 #endif
 }
 
@@ -498,14 +498,14 @@ JceCookResult jce_cook_audio(const void *input, size_t input_size,
 JceCookResult jce_cook_raw(const void *input, size_t input_size,
                            const JceCookOptions *opts)
 {
-	uint64_t source_hash = XXH3_64bits(input, input_size);
+    uint64_t source_hash = XXH3_64bits(input, input_size);
 
-	ChunkInput chunks[1];
-	chunks[0].chunk_type = JCEASSET_CHUNK_RAW;
-	chunks[0].raw_data   = input;
-	chunks[0].raw_size   = input_size;
+    ChunkInput chunks[1];
+    chunks[0].chunk_type = JCEASSET_CHUNK_RAW;
+    chunks[0].raw_data   = input;
+    chunks[0].raw_size   = input_size;
 
-	return build_asset(JCEASSET_TYPE_RAW, source_hash, chunks, 1, opts);
+    return build_asset(JCEASSET_TYPE_RAW, source_hash, chunks, 1, opts);
 }
 
 /* ================================================================== */
@@ -514,93 +514,93 @@ JceCookResult jce_cook_raw(const void *input, size_t input_size,
 
 int jce_cook_detect_type(const char *path)
 {
-	if (!path) return -1;
-	const char *dot = strrchr(path, '.');
-	if (!dot) return JCEASSET_TYPE_RAW;
+    if (!path) return -1;
+    const char *dot = strrchr(path, '.');
+    if (!dot) return JCEASSET_TYPE_RAW;
 
-	dot++; /* skip the dot */
+    dot++; /* skip the dot */
 
-	/* Texture extensions. */
-	if (SDL_strcasecmp(dot, "png") == 0 ||
-	    SDL_strcasecmp(dot, "jpg") == 0 ||
-	    SDL_strcasecmp(dot, "jpeg") == 0 ||
-	    SDL_strcasecmp(dot, "bmp") == 0 ||
-	    SDL_strcasecmp(dot, "tga") == 0)
-		return JCEASSET_TYPE_TEXTURE;
+    /* Texture extensions. */
+    if (SDL_strcasecmp(dot, "png") == 0 ||
+        SDL_strcasecmp(dot, "jpg") == 0 ||
+        SDL_strcasecmp(dot, "jpeg") == 0 ||
+        SDL_strcasecmp(dot, "bmp") == 0 ||
+        SDL_strcasecmp(dot, "tga") == 0)
+        return JCEASSET_TYPE_TEXTURE;
 
-	/* Audio extensions. */
-	if (SDL_strcasecmp(dot, "wav") == 0 ||
-	    SDL_strcasecmp(dot, "ogg") == 0 ||
-	    SDL_strcasecmp(dot, "opus") == 0 ||   /* royalty-free (preferred) */
-	    SDL_strcasecmp(dot, "flac") == 0 ||
-	    SDL_strcasecmp(dot, "mp3") == 0 ||
-	    SDL_strcasecmp(dot, "m4a") == 0 ||    /* legacy AAC-in-MP4 */
-	    SDL_strcasecmp(dot, "aac") == 0)      /* legacy raw AAC */
-		return JCEASSET_TYPE_SOUND;
+    /* Audio extensions. */
+    if (SDL_strcasecmp(dot, "wav") == 0 ||
+        SDL_strcasecmp(dot, "ogg") == 0 ||
+        SDL_strcasecmp(dot, "opus") == 0 ||   /* royalty-free (preferred) */
+        SDL_strcasecmp(dot, "flac") == 0 ||
+        SDL_strcasecmp(dot, "mp3") == 0 ||
+        SDL_strcasecmp(dot, "m4a") == 0 ||    /* legacy AAC-in-MP4 */
+        SDL_strcasecmp(dot, "aac") == 0)      /* legacy raw AAC */
+        return JCEASSET_TYPE_SOUND;
 
-	/* Mesh/model extensions. */
-	if (SDL_strcasecmp(dot, "obj") == 0 ||
-	    SDL_strcasecmp(dot, "fbx") == 0 ||
-	    SDL_strcasecmp(dot, "gltf") == 0 ||
-	    SDL_strcasecmp(dot, "glb") == 0)
-		return JCEASSET_TYPE_MODEL;
+    /* Mesh/model extensions. */
+    if (SDL_strcasecmp(dot, "obj") == 0 ||
+        SDL_strcasecmp(dot, "fbx") == 0 ||
+        SDL_strcasecmp(dot, "gltf") == 0 ||
+        SDL_strcasecmp(dot, "glb") == 0)
+        return JCEASSET_TYPE_MODEL;
 
-	/* Font extensions. */
-	if (SDL_strcasecmp(dot, "ttf") == 0 ||
-	    SDL_strcasecmp(dot, "otf") == 0)
-		return JCEASSET_TYPE_FONT;
+    /* Font extensions. */
+    if (SDL_strcasecmp(dot, "ttf") == 0 ||
+        SDL_strcasecmp(dot, "otf") == 0)
+        return JCEASSET_TYPE_FONT;
 
-	/* Shader extensions. */
-	if (SDL_strcasecmp(dot, "sc") == 0 ||
-	    SDL_strcasecmp(dot, "bin") == 0)
-		return JCEASSET_TYPE_SHADER;
+    /* Shader extensions. */
+    if (SDL_strcasecmp(dot, "sc") == 0 ||
+        SDL_strcasecmp(dot, "bin") == 0)
+        return JCEASSET_TYPE_SHADER;
 
-	return JCEASSET_TYPE_RAW;
+    return JCEASSET_TYPE_RAW;
 }
 
 JceCookResult jce_cook_file(const char *input_path,
                             const JceCookOptions *opts)
 {
-	JceCookResult result = {0};
-	if (!input_path) {
-		snprintf(result.error, sizeof(result.error), "null input path");
-		return result;
-	}
+    JceCookResult result = {0};
+    if (!input_path) {
+        snprintf(result.error, sizeof(result.error), "null input path");
+        return result;
+    }
 
-	/* Read file. */
-	size_t nread = 0;
-	void *data = jce_fs_host_read_all(input_path, &nread);
-	if (!data) {
-		snprintf(result.error, sizeof(result.error),
-		         "cannot open: %s", input_path);
-		return result;
-	}
+    /* Read file. */
+    size_t nread = 0;
+    void *data = jce_fs_host_read_all(input_path, &nread);
+    if (!data) {
+        snprintf(result.error, sizeof(result.error),
+                 "cannot open: %s", input_path);
+        return result;
+    }
 
-	if (nread == 0) {
-		JCE_FREE(data);
-		snprintf(result.error, sizeof(result.error),
-		         "empty file: %s", input_path);
-		return result;
-	}
+    if (nread == 0) {
+        JCE_FREE(data);
+        snprintf(result.error, sizeof(result.error),
+                 "empty file: %s", input_path);
+        return result;
+    }
 
-	/* Dispatch by type. */
-	int type = jce_cook_detect_type(input_path);
-	switch (type) {
-	case JCEASSET_TYPE_TEXTURE:
-		result = jce_cook_texture(data, nread, opts);
-		break;
-	case JCEASSET_TYPE_SOUND:
-		result = jce_cook_audio(data, nread, opts);
-		break;
-	default:
-		/* For models, fonts, shaders — pass through as raw for now.
-		   Full mesh cooking (vertex quantization, etc.) is a future phase. */
-		result = jce_cook_raw(data, nread, opts);
-		break;
-	}
+    /* Dispatch by type. */
+    int type = jce_cook_detect_type(input_path);
+    switch (type) {
+    case JCEASSET_TYPE_TEXTURE:
+        result = jce_cook_texture(data, nread, opts);
+        break;
+    case JCEASSET_TYPE_SOUND:
+        result = jce_cook_audio(data, nread, opts);
+        break;
+    default:
+        /* For models, fonts, shaders — pass through as raw for now.
+           Full mesh cooking (vertex quantization, etc.) is a future phase. */
+        result = jce_cook_raw(data, nread, opts);
+        break;
+    }
 
-	JCE_FREE(data);
-	return result;
+    JCE_FREE(data);
+    return result;
 }
 
 /* ================================================================== */
@@ -609,16 +609,16 @@ JceCookResult jce_cook_file(const char *input_path,
 
 void jce_cook_result_free(JceCookResult *result)
 {
-	if (!result) return;
-	JCE_FREE(result->data);
-	result->data = NULL;
-	result->size = 0;
+    if (!result) return;
+    JCE_FREE(result->data);
+    result->data = NULL;
+    result->size = 0;
 }
 
 bool jce_cook_write(const JceCookResult *result, const char *output_path)
 {
-	if (!result || !result->success || !result->data || !output_path)
-		return false;
+    if (!result || !result->success || !result->data || !output_path)
+        return false;
 
-	return jce_fs_host_write_all(output_path, result->data, result->size);
+    return jce_fs_host_write_all(output_path, result->data, result->size);
 }

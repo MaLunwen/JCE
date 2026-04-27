@@ -20,16 +20,16 @@ extern "C" {
 
 /* Registry entry stored in the hash map. */
 typedef struct JceRegistryEntry {
-	uint64_t path_hash;      /* XXH3_64bits of virtual path */
-	uint16_t slot_index;     /* index into asset slot array */
-	bool     occupied;       /* true if this bucket is in use */
+    uint64_t path_hash;      /* XXH3_64bits of virtual path */
+    uint16_t slot_index;     /* index into asset slot array */
+    bool     occupied;       /* true if this bucket is in use */
 } JceRegistryEntry;
 
 /* Open-addressing hash table. */
 typedef struct JceAssetRegistry {
-	JceRegistryEntry *buckets;
-	uint32_t          capacity;     /* always power of 2 */
-	uint32_t          count;        /* number of active entries */
+    JceRegistryEntry *buckets;
+    uint32_t          capacity;     /* always power of 2 */
+    uint32_t          count;        /* number of active entries */
 } JceAssetRegistry;
 
 /* Create registry with initial capacity (rounded up to power of 2).

@@ -34,7 +34,7 @@ typedef struct JceVp8FrameInfo {
 } JceVp8FrameInfo;
 
 /* Quick magic-byte check for an IVF/VP8 stream ('DKIF' + codec='VP80'). */
-bool jce_vp8_is_ivf(const void *data, size_t size);
+JCE_API bool jce_vp8_is_ivf(const void *data, size_t size);
 
 /* Open an in-memory IVF/VP8 stream. The buffer must outlive the decoder. */
 JceVp8Decoder *jce_vp8_open_ivf_memory(const void *data, size_t size,
@@ -42,7 +42,7 @@ JceVp8Decoder *jce_vp8_open_ivf_memory(const void *data, size_t size,
 
 /* Open a raw decoder (no container) — caller feeds VP8 packets via
  * jce_vp8_decode_packet(). Use this when demuxing WebM / MKV. */
-JceVp8Decoder *jce_vp8_decoder_open(void);
+JCE_API JceVp8Decoder *jce_vp8_decoder_open(void);
 
 /* Decode the next IVF frame. Plane pointers point into libvpx-owned memory
  * and are valid until the next call. Returns false at EOF or on error.
@@ -62,7 +62,7 @@ bool jce_vp8_decode_packet(JceVp8Decoder *dec,
                            const uint8_t **out_v,
                            uint32_t *out_width, uint32_t *out_height);
 
-void jce_vp8_close(JceVp8Decoder *dec);
+JCE_API void jce_vp8_close(JceVp8Decoder *dec);
 
 JCE_EXTERN_C_END
 

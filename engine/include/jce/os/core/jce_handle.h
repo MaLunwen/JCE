@@ -51,24 +51,24 @@ jce_handle_pool_t *jce_handle_pool_create(jce_allocator_t alloc,
                                           uint32_t capacity);
 
 /* Destroy the pool and free all storage. */
-void jce_handle_pool_destroy(jce_handle_pool_t *pool);
+JCE_API void jce_handle_pool_destroy(jce_handle_pool_t *pool);
 
 /* Add an item (copies 'item_size' bytes from 'item').
    Returns JCE_HANDLE_NULL if pool is full. */
-jce_handle_t jce_handle_pool_add(jce_handle_pool_t *pool, const void *item);
+JCE_API jce_handle_t jce_handle_pool_add(jce_handle_pool_t *pool, const void *item);
 
 /* Remove an item by handle (increments generation for that slot).
    No-op if handle is stale. */
-void jce_handle_pool_remove(jce_handle_pool_t *pool, jce_handle_t h);
+JCE_API void jce_handle_pool_remove(jce_handle_pool_t *pool, jce_handle_t h);
 
 /* Get a pointer to the item.  Returns NULL if handle is stale or invalid. */
-void *jce_handle_pool_get(const jce_handle_pool_t *pool, jce_handle_t h);
+JCE_API void *jce_handle_pool_get(const jce_handle_pool_t *pool, jce_handle_t h);
 
 /* Check whether a handle still refers to a live item. */
-bool jce_handle_pool_alive(const jce_handle_pool_t *pool, jce_handle_t h);
+JCE_API bool jce_handle_pool_alive(const jce_handle_pool_t *pool, jce_handle_t h);
 
 /* Number of currently live items. */
-uint32_t jce_handle_pool_count(const jce_handle_pool_t *pool);
+JCE_API uint32_t jce_handle_pool_count(const jce_handle_pool_t *pool);
 
 JCE_EXTERN_C_END
 

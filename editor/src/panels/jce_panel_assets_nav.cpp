@@ -2,7 +2,7 @@
  * jce_panel_assets_nav.cpp  Directory tree, breadcrumb, search.
  */
 
-#include "jce_editor_config.h"
+#include "core/jce_editor_config.h"
 #include "jce_panel_assets_internal.h"
 
 static void persist_asset_browser_view_mode(void)
@@ -33,9 +33,7 @@ static void draw_dir_tree(const fs::path &dir, int depth)
         for (auto &sd : subdirs) {
             std::string dirname = sd.filename().string();
 
-            ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow
-                                     | ImGuiTreeNodeFlags_OpenOnDoubleClick
-                                     | ImGuiTreeNodeFlags_SpanAvailWidth;
+            ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_SpanAvailWidth;
 
             bool is_current = false;
             try { is_current = fs::equivalent(sd, s_assets.current_path); }
@@ -55,6 +53,11 @@ static void draw_dir_tree(const fs::path &dir, int depth)
 
             bool open = ImGui::TreeNodeEx(dirname.c_str(), flags);
 
+            /* Single-click anywhere on the row navigates into that folder
+               (TreeNode also toggles open/closed — both happen on the same click). */
+            if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
+                navigate_asset_directory(sd.string(), false);
+            }
             if (ImGui::IsMouseDoubleClicked(0) && ImGui::IsItemHovered() && !ImGui::IsItemToggledOpen()) {
                 navigate_asset_directory(sd.string(), false);
             }
@@ -94,7 +97,6 @@ void draw_asset_directory_tree(float tree_w, float panel_h)
             root_name = "Project";
 
         ImGuiTreeNodeFlags root_flags = ImGuiTreeNodeFlags_DefaultOpen
-                                      | ImGuiTreeNodeFlags_OpenOnArrow
                                       | ImGuiTreeNodeFlags_SpanAvailWidth;
         bool root_is_current = false;
         try { root_is_current = fs::equivalent(s_assets.project_root, s_assets.current_path); }
@@ -103,6 +105,9 @@ void draw_asset_directory_tree(float tree_w, float panel_h)
             root_flags |= ImGuiTreeNodeFlags_Selected;
 
         if (ImGui::TreeNodeEx(root_name.c_str(), root_flags)) {
+            if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
+                navigate_asset_directory(s_assets.project_root, false);
+            }
             if (ImGui::IsMouseDoubleClicked(0) && ImGui::IsItemHovered() && !ImGui::IsItemToggledOpen()) {
                 navigate_asset_directory(s_assets.project_root, false);
             }
@@ -127,26 +132,47 @@ void draw_asset_directory_tree(float tree_w, float panel_h)
 
 /* ── B. Breadcrumb bar ───────────────────────────────────────────── */
 
+/* Strip trailing path separator(s). std::filesystem::path::parent_path()
+   on a path ending in "/" returns the same path (treats it as a
+   directory entry), which makes "Up" appear to do nothing on the second
+   click. Normalize first so parent_path() always pops one segment. */
+static std::string strip_trailing_sep(const std::string &s)
+{
+    if (s.empty()) return s;
+    std::string out = s;
+    while (out.size() > 1) {
+        char c = out.back();
+        if (c == '/' || c == '\\') out.pop_back();
+        else break;
+    }
+    return out;
+}
+
 void draw_asset_breadcrumb_bar(void)
 {
     {
-        fs::path cur(s_assets.current_path);
-        fs::path root(s_assets.project_root);
-        bool at_root = false;
-        try { at_root = fs::equivalent(cur, root); }
-        catch (...) { at_root = (s_assets.current_path == s_assets.project_root); }
+        fs::path cur(strip_trailing_sep(s_assets.current_path));
+        fs::path root(strip_trailing_sep(s_assets.project_root));
 
-        ImGui::BeginDisabled(at_root);
+        /* Up button: disabled at the project root and at any path that
+           cannot ascend further (filesystem root). Computed on the
+           absolute form so trailing-relative paths still resolve. */
+        fs::path cur_abs;
+        try { cur_abs = fs::weakly_canonical(cur); }
+        catch (...) { cur_abs = fs::absolute(cur); }
+        fs::path root_abs;
+        try { root_abs = fs::weakly_canonical(root); }
+        catch (...) { root_abs = fs::absolute(root); }
+        fs::path parent_abs = cur_abs.parent_path();
+        bool at_root = (cur_abs.lexically_normal() == root_abs.lexically_normal());
+        bool can_go_up = !at_root
+                      && !parent_abs.empty()
+                      && parent_abs.lexically_normal() != cur_abs.lexically_normal();
+
+        ImGui::BeginDisabled(!can_go_up);
         if (ImGui::SmallButton(jce_editor_i18n("assetBrowser.up"))) {
             try {
-                fs::path parent = fs::path(s_assets.current_path).parent_path();
-                bool above_root = false;
-                try { above_root = !fs::equivalent(parent, root)
-                                && parent.string().length() < root.string().length(); }
-                catch (...) {}
-                if (!above_root) {
-                    navigate_asset_directory(parent.string(), false);
-                }
+                navigate_asset_directory(parent_abs.string(), false);
             } catch (const std::exception &e) {
                 jce_editor_console_log_level(JCE_CONSOLE_ERROR,
                     "Navigate up: %s", e.what());
@@ -154,6 +180,7 @@ void draw_asset_breadcrumb_bar(void)
         }
         ImGui::EndDisabled();
         ImGui::SameLine();
+        (void)root;
 
         {
             std::string root_name = fs::path(s_assets.project_root).filename().string();
@@ -163,7 +190,7 @@ void draw_asset_breadcrumb_bar(void)
             std::vector<std::pair<std::string, std::string>> crumbs;
             crumbs.push_back({root_name, s_assets.project_root});
 
-            if (!at_root) {
+            if (cur.lexically_normal() != root.lexically_normal()) {
                 fs::path rel;
                 try { rel = fs::relative(cur, root); }
                 catch (...) {}
@@ -274,6 +301,28 @@ void draw_asset_breadcrumb_bar(void)
 void draw_asset_search_bar(void)
 {
     {
+        /* Inline kind filter (compact combo) on the left of the search input. */
+        const char *kind_labels[] = {
+            "All", "Images", "Models", "Audio", "Code", "Archive"
+        };
+        const int kind_count = (int)(sizeof(kind_labels) / sizeof(kind_labels[0]));
+        if (s_assets.kind_filter < 0 || s_assets.kind_filter >= kind_count)
+            s_assets.kind_filter = 0;
+
+        ImGui::SetNextItemWidth(96.0f);
+        if (ImGui::BeginCombo("##asset_kind_filter",
+                              kind_labels[s_assets.kind_filter],
+                              ImGuiComboFlags_HeightSmall)) {
+            for (int i = 0; i < kind_count; i++) {
+                bool sel = (s_assets.kind_filter == i);
+                if (ImGui::Selectable(kind_labels[i], sel))
+                    s_assets.kind_filter = i;
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine();
+
         float search_w = ImGui::GetContentRegionAvail().x;
         ImGui::PushItemWidth(search_w);
         ImGui::InputTextWithHint("##asset_search",

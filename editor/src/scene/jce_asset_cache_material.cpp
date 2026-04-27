@@ -3,7 +3,7 @@
  */
 
 #include "jce_asset_cache_internal.h"
-#include "jce_editor_alloc.h"
+#include "core/jce_editor_alloc.h"
 
 static void material_extract_worker(void *arg)
 {

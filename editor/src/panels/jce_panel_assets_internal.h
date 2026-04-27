@@ -8,16 +8,16 @@
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/platform/jce_host_shell.h>
 
-#include "jce_editor_colors.h"
-#include "jce_editor_defaults.h"
-#include "jce_editor_i18n.h"
-#include "jce_editor_layout.h"
-#include "jce_editor_panels.h"
-#include "jce_editor_state.h"
+#include "ui/jce_editor_colors.h"
+#include "core/jce_editor_defaults.h"
+#include "core/jce_editor_i18n.h"
+#include "ui/jce_editor_layout.h"
+#include "ui/jce_editor_panels.h"
+#include "core/jce_editor_state.h"
 #include "scene/jce_editor_scene_render.h"
 #include "viewers/jce_file_viewer.h"
 
-#include <imgui.h>
+#include <jce/tools/jce_imgui.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -82,6 +82,8 @@ struct AssetBrowserState {
     bool pending_navigation_clear_search;
     double next_auto_refresh_time;
     AssetBrowserViewMode view_mode;
+    /* Type filter (kind mask): 0=all, 1=images, 2=models, 3=audio, 4=text/code, 5=archives */
+    int             kind_filter;
 };
 
 extern AssetBrowserState s_assets;

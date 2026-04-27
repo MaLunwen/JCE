@@ -8,18 +8,20 @@
 
 #include "jce_editor_panels.h"
 
-#include "jce_editor.h"
-#include "jce_editor_alloc.h"
+#include "core/jce_editor.h"
+#include "core/jce_editor_alloc.h"
 #include "jce_editor_colors.h"
-#include "jce_editor_config.h"
-#include "jce_editor_defaults.h"
-#include "jce_editor_i18n.h"
-#include "jce_editor_state.h"
+#include "core/jce_editor_config.h"
+#include "core/jce_editor_defaults.h"
+#include "core/jce_editor_i18n.h"
+#include "core/jce_editor_state.h"
+#include "core/jce_editor_toast.h"
 #include "jce_editor_style.h"
 #include "viewers/jce_file_viewer.h"
 
 #include <ctype.h>
-#include <imgui.h>
+#include <jce/os/core/jce_str.h>
+#include <jce/tools/jce_imgui.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,10 +34,9 @@ extern "C" {
 #include <jce/os/core/jce_timer.h>
 #include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_renderer_caps.h>
+#include <jce/os/core/jce_filesystem.h>
 
 #include "io/jce_editor_file_util.h"
-
-#include <SDL3/SDL.h>
 }
 
 #define LOG_TAG "editor_panels"
@@ -53,6 +54,26 @@ bool *jce_editor_panel_visible_ptr(JceEditorPanel panel)
 {
     if (panel < 0 || panel >= JCE_PANEL_COUNT) return NULL;
     return &s_visible[panel];
+}
+
+void jce_editor_panels_persist_visibility(void)
+{
+    static uint32_t s_last_saved_mask = JCE_EDITOR_PANELS_MASK_UNSET;
+    uint32_t mask = 0;
+    for (int i = 0; i < JCE_PANEL_COUNT && i < 32; i++) {
+        if (s_visible[i]) mask |= (1u << i);
+    }
+    if (mask == s_last_saved_mask) return;
+    JceEditorConfig _cfg = {};
+    jce_editor_config_load(&_cfg);
+    if (_cfg.panels_visible_mask == mask) {
+        s_last_saved_mask = mask;
+        return;
+    }
+    _cfg.panels_visible_mask = mask;
+    if (jce_editor_config_save(&_cfg)) {
+        s_last_saved_mask = mask;
+    }
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -111,6 +132,13 @@ void jce_editor_console_log_level(JceConsoleLevel level, const char *fmt, ...)
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     console_add(level, buf);
+
+    /* Auto-surface warnings & errors as toasts so users notice them
+       without having to open the Console panel. */
+    if (level == JCE_CONSOLE_ERROR)
+        jce_toast_error("%s", buf);
+    else if (level == JCE_CONSOLE_WARNING)
+        jce_toast_warn("%s", buf);
 }
 
 void jce_editor_console_clear(void)
@@ -153,17 +181,44 @@ void jce_editor_panels_init(void)
     s_visible[JCE_PANEL_CONSOLE]     = true;
     s_visible[JCE_PANEL_SCENE_VIEW]  = true;
     s_visible[JCE_PANEL_GAME_VIEW]   = true;
-    s_visible[JCE_PANEL_TIMELINE]    = true;
     s_visible[JCE_PANEL_ASSETS]      = true;
     s_visible[JCE_PANEL_FILE_VIEWER] = true;
-    s_visible[JCE_PANEL_POSTFX]      = false;
-    s_visible[JCE_PANEL_PREFERENCES] = false;
+    /* Specialized panels (Unity-style: shown only on demand). Reduces
+       startup tab clutter and matches what users expect from the
+       Window menu being where you go to enable them. */
+    s_visible[JCE_PANEL_TIMELINE]         = false;
+    s_visible[JCE_PANEL_POSTFX]           = false;
+    s_visible[JCE_PANEL_PROFILER]         = false;
+    s_visible[JCE_PANEL_PARTICLE_EDITOR]  = false;
+    s_visible[JCE_PANEL_MATERIAL_GRAPH]   = false;
+    s_visible[JCE_PANEL_IMPORT_PRESETS]   = false;
+    s_visible[JCE_PANEL_LIGHTMAP_BAKE]    = false;
+    s_visible[JCE_PANEL_CURVE_EDITOR]     = false;
+    s_visible[JCE_PANEL_ANIMATION_EDITOR] = false;
+    s_visible[JCE_PANEL_ANIMATOR_SM]      = false;
+    s_visible[JCE_PANEL_SEQUENCER]        = false;
+    s_visible[JCE_PANEL_NAVMESH]          = false;
+    s_visible[JCE_PANEL_TERRAIN]          = false;
+    s_visible[JCE_PANEL_PREFERENCES]      = false;
 
     /* Console ring buffer. */
     memset(&s_console, 0, sizeof(s_console));
 
     /* Load persisted editor settings (language, theme, font, renderer). */
     settings_ensure_init();
+
+    /* Restore window panel visibility from editor-config (overrides defaults
+       set above). Sentinel JCE_EDITOR_PANELS_MASK_UNSET means "never saved",
+       which keeps the per-panel defaults. */
+    {
+        JceEditorConfig _ecfg;
+        if (jce_editor_config_load(&_ecfg) &&
+            _ecfg.panels_visible_mask != JCE_EDITOR_PANELS_MASK_UNSET) {
+            for (int i = 0; i < JCE_PANEL_COUNT && i < 32; i++) {
+                s_visible[i] = (_ecfg.panels_visible_mask >> i) & 1u;
+            }
+        }
+    }
 
     jce_editor_console_log_level(JCE_CONSOLE_INFO, "editor panels initialized");
 }
@@ -269,8 +324,9 @@ static void settings_ensure_init(void)
             jce_editor_i18n_set_locale(JCE_LOCALE_EN);
         }
 
-        /* Theme */
+        /* Theme — accept Blue (preferred) and SSMS (legacy) for the SSMS engine theme. */
         if (strcmp(ecfg.theme, "Light") == 0) s_settings.theme_idx = JCE_THEME_LIGHT;
+        else if (strcmp(ecfg.theme, "Blue") == 0) s_settings.theme_idx = JCE_THEME_SSMS;
         else if (strcmp(ecfg.theme, "SSMS") == 0) s_settings.theme_idx = JCE_THEME_SSMS;
         else s_settings.theme_idx = JCE_THEME_DARK;
         jce_editor_apply_theme(s_settings.theme_idx);
@@ -339,7 +395,7 @@ static void settings_apply(void)
                  s_settings.language_idx == 0 ? "en" : "zh_cn");
         ecfg.font_size = (int)s_settings.font_size;
 
-        const char *theme_names[] = { "Dark", "Light", "SSMS" };
+        const char *theme_names[] = { "Dark", "Light", "Blue" };
         snprintf(ecfg.theme, sizeof(ecfg.theme), "%s",
                  theme_names[s_settings.theme_idx]);
 
@@ -512,7 +568,7 @@ void jce_editor_settings_dialog(bool *p_open)
     auto find_idx_for_path = [](const char *path) -> int {
         if (!path || !*path) return 0;          /* Auto */
         for (int i = 0; i < s_font_count; ++i)
-            if (SDL_strcasecmp(s_font_entries[i].path, path) == 0)
+            if (jce_strcasecmp(s_font_entries[i].path, path) == 0)
                 return i + 1;
         return 0;                               /* unknown -> show Auto */
     };
@@ -528,7 +584,7 @@ void jce_editor_settings_dialog(bool *p_open)
         if (en_idx <= 0)
             s_settings.font_en_path[0] = '\0';
         else
-            SDL_strlcpy(s_settings.font_en_path,
+            jce_strlcpy(s_settings.font_en_path,
                         s_font_entries[en_idx - 1].path,
                         sizeof(s_settings.font_en_path));
         s_settings.needs_restart = true;
@@ -540,7 +596,7 @@ void jce_editor_settings_dialog(bool *p_open)
         if (zh_idx <= 0)
             s_settings.font_zh_path[0] = '\0';
         else
-            SDL_strlcpy(s_settings.font_zh_path,
+            jce_strlcpy(s_settings.font_zh_path,
                         s_font_entries[zh_idx - 1].path,
                         sizeof(s_settings.font_zh_path));
         s_settings.needs_restart = true;
@@ -772,11 +828,73 @@ void jce_editor_panel_preferences(void)
                 ImGui::SliderFloat(_lbl, &s_prefs.camera_sensitivity,
                                    JCE_PREF_CAM_SENS_MIN, JCE_PREF_CAM_SENS_MAX);
                 ImGui::Separator();
+                /* Input direction preferences — clearly grouped so users
+                   distinguish mouse wheel from touchpad. All three live-bind
+                   to editor-config and persist immediately on toggle. */
+                ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s",
+                                   jce_editor_i18n("preferences.input.mouseGroup"));
+                snprintf(_lbl, sizeof(_lbl), "%s###invScrollZoom",
+                         jce_editor_i18n("preferences.input.invertScrollZoom"));
+                if (ImGui::Checkbox(_lbl, &jce_editor_pref_invert_scroll_zoom)) {
+                    bool _new = jce_editor_pref_invert_scroll_zoom;
+                    JceEditorConfig _cfg = {};
+                    jce_editor_config_load(&_cfg);
+                    _cfg.invert_scroll_zoom = _new;
+                    jce_editor_config_save(&_cfg);
+                    jce_editor_pref_invert_scroll_zoom = _new;
+                }
+                snprintf(_lbl, sizeof(_lbl), "%s###invDragY",
+                         jce_editor_i18n("preferences.input.invertDragY"));
+                if (ImGui::Checkbox(_lbl, &jce_editor_pref_invert_drag_y)) {
+                    bool _new = jce_editor_pref_invert_drag_y;
+                    JceEditorConfig _cfg = {};
+                    jce_editor_config_load(&_cfg);
+                    _cfg.invert_drag_y = _new;
+                    jce_editor_config_save(&_cfg);
+                    jce_editor_pref_invert_drag_y = _new;
+                }
+                ImGui::Spacing();
+                ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s",
+                                   jce_editor_i18n("preferences.input.touchpadGroup"));
+                snprintf(_lbl, sizeof(_lbl), "%s###touchpadHInv",
+                         jce_editor_i18n("preferences.editorTab.touchpadHInvert"));
+                if (ImGui::Checkbox(_lbl, &jce_editor_pref_touchpad_h_invert)) {
+                    bool _new = jce_editor_pref_touchpad_h_invert;
+                    JceEditorConfig _cfg = {};
+                    jce_editor_config_load(&_cfg);
+                    _cfg.touchpad_h_invert = _new;
+                    jce_editor_config_save(&_cfg);
+                    jce_editor_pref_touchpad_h_invert = _new;
+                }
+                ImGui::Separator();
                 const char *languages[] = { "English", "Chinese" };
                 snprintf(_lbl, sizeof(_lbl), "%s###language", jce_editor_i18n("preferences.language"));
                 if (ImGui::Combo(_lbl, &s_prefs.language_idx, languages, 2)) {
                     jce_editor_i18n_set_locale(
                         s_prefs.language_idx == 0 ? JCE_LOCALE_EN : JCE_LOCALE_ZH_CN);
+                    s_settings.language_idx = s_prefs.language_idx;
+                    settings_apply();
+                }
+                /* Theme — live apply + persist via shared s_settings/apply path. */
+                settings_ensure_init();
+                const char *themes[] = { "Dark", "Light", "Blue" };
+                snprintf(_lbl, sizeof(_lbl), "%s###pref_theme",
+                         jce_editor_i18n("settings.theme"));
+                if (ImGui::Combo(_lbl, &s_settings.theme_idx, themes, 3)) {
+                    jce_editor_apply_theme(s_settings.theme_idx);
+                    settings_apply();
+                }
+                /* Font size — requires restart, but persists immediately. */
+                snprintf(_lbl, sizeof(_lbl), "%s###pref_fontsize",
+                         jce_editor_i18n("settings.fontSize"));
+                if (ImGui::SliderFloat(_lbl, &s_settings.font_size,
+                                       12.0f, 48.0f, "%.0f px")) {
+                    s_settings.needs_restart = true;
+                    settings_apply();
+                }
+                if (s_settings.needs_restart) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.2f, 1.0f), "%s",
+                                       jce_editor_i18n("settings.requiresRestart"));
                 }
                 ImGui::EndTabItem();
             }
@@ -800,26 +918,21 @@ void jce_editor_panel_preferences(void)
             /* Fonts tab: user-supplied font overrides (e.g. system Ink Free /
              * KaiTi on Windows). Empty string -> use bundled OFL fallback.
              * Changes apply on next editor restart. */
-            if (ImGui::BeginTabItem("Fonts###pref_fonts")) {
-                ImGui::TextWrapped("Override the editor UI fonts. Leave empty "
-                                   "to auto-detect a system font, falling back "
-                                   "to bundled OFL fonts. Restart required.");
+            if (ImGui::BeginTabItem(jce_editor_i18n_id("preferences.tab.fonts", "pref_fonts"))) {
+                ImGui::TextWrapped("%s", jce_editor_i18n("preferences.fonts.help"));
                 ImGui::Spacing();
-                ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "Latin font (.ttf/.otf)");
+                ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s", jce_editor_i18n("preferences.fonts.latin"));
                 ImGui::InputText("##fontEn", s_prefs.font_en_path, sizeof(s_prefs.font_en_path));
                 ImGui::SameLine();
-                if (ImGui::SmallButton("Clear##fontEnClr")) s_prefs.font_en_path[0] = '\0';
-                ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "CJK font (.ttf/.otf/.ttc)");
+                if (ImGui::SmallButton(jce_editor_i18n_id("preferences.fonts.clear", "fontEnClr"))) s_prefs.font_en_path[0] = '\0';
+                ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s", jce_editor_i18n("preferences.fonts.cjk"));
                 ImGui::InputText("##fontZh", s_prefs.font_zh_path, sizeof(s_prefs.font_zh_path));
                 ImGui::SameLine();
-                if (ImGui::SmallButton("Clear##fontZhClr")) s_prefs.font_zh_path[0] = '\0';
+                if (ImGui::SmallButton(jce_editor_i18n_id("preferences.fonts.clear", "fontZhClr"))) s_prefs.font_zh_path[0] = '\0';
                 ImGui::Spacing();
-                ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
-                    "Hint (Windows): C:/Windows/Fonts/inkfree.ttf, simkai.ttf, msyh.ttc");
-                ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
-                    "Hint (macOS):   /System/Library/Fonts/PingFang.ttc");
-                ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
-                    "Hint (Linux):   /usr/share/fonts/...");
+                ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s", jce_editor_i18n("preferences.fonts.hintWindows"));
+                ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s", jce_editor_i18n("preferences.fonts.hintMac"));
+                ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s", jce_editor_i18n("preferences.fonts.hintLinux"));
                 ImGui::EndTabItem();
             }
 
@@ -942,8 +1055,8 @@ void jce_editor_about_dialog(bool *p_open)
     if (!s_sha_loaded) {
         s_sha_loaded = true;
         s_sha[0] = '\0';
-        const char *base = SDL_GetBasePath();
-        if (base) {
+        char base[1024];
+        if (jce_fs_host_get_base_path(base, sizeof(base))) {
             char path[1024];
             snprintf(path, sizeof(path), "%sjce_editor_sha256.txt", base);
             size_t sz = 0;

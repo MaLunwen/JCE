@@ -5,7 +5,7 @@
  *   1. Recursively enumerates RESOURCE_DIR
  *   2. ZSTD-compresses each file
  *   3. Indexes paths with XXH3_64bits
- *   4. Writes a binary .pak (see pak_format.h)
+ *   4. Writes a binary .pak (see jce_pak_format.h)
  *   5. Generates embedded_assets.h  (extern declarations)
  *   6. Generates _assets_manifest.cmake (per-asset sizes)
  *   7. Optionally generates a COFF .obj wrapping the .pak blob
@@ -44,7 +44,7 @@
 #  define _strdup strdup
 #endif
 
-#include "resource/pak_format.h"
+#include "resource/jce_pak_format.h"
 
 #include <xxhash.h>
 #include <zstd.h>

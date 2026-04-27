@@ -9,15 +9,15 @@
 #ifndef JCE_FV_COMMON_H
 #define JCE_FV_COMMON_H
 
-#include "jce_editor_alloc.h"
-#include "jce_editor_colors.h"
-#include "jce_editor_defaults.h"
-#include "jce_editor_i18n.h"
-#include "jce_editor_panels.h"
+#include "core/jce_editor_alloc.h"
+#include "ui/jce_editor_colors.h"
+#include "core/jce_editor_defaults.h"
+#include "core/jce_editor_i18n.h"
+#include "ui/jce_editor_panels.h"
 #include "jce_file_viewer.h"
 
 #include <ctype.h>
-#include <imgui.h>
+#include <jce/tools/jce_imgui.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>

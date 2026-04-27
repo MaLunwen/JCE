@@ -56,13 +56,20 @@
 #if TARGET_OS_IPHONE
 #define JCE_PLATFORM_IOS 1
 #define JCE_PLATFORM_MACOS 0
+#if TARGET_OS_TV
+#define JCE_PLATFORM_TVOS 1
+#else
+#define JCE_PLATFORM_TVOS 0
+#endif
 #else
 #define JCE_PLATFORM_IOS 0
+#define JCE_PLATFORM_TVOS 0
 #define JCE_PLATFORM_MACOS 1
 #endif
 #else
 #define JCE_PLATFORM_APPLE 0
 #define JCE_PLATFORM_IOS 0
+#define JCE_PLATFORM_TVOS 0
 #define JCE_PLATFORM_MACOS 0
 #endif
 
@@ -82,6 +89,29 @@
 #define JCE_PLATFORM_WEB 1
 #else
 #define JCE_PLATFORM_WEB 0
+#endif
+
+/* -- Platform aggregates (touch / mobile / desktop) ----------------- */
+
+/* Touch-input platforms: phones, tablets, TVs (with remote). */
+#if JCE_PLATFORM_IOS || JCE_PLATFORM_TVOS || JCE_PLATFORM_ANDROID
+#define JCE_PLATFORM_TOUCH 1
+#else
+#define JCE_PLATFORM_TOUCH 0
+#endif
+
+/* Mobile-class: battery-powered, lifecycle suspend/resume. */
+#if JCE_PLATFORM_IOS || JCE_PLATFORM_ANDROID
+#define JCE_PLATFORM_MOBILE 1
+#else
+#define JCE_PLATFORM_MOBILE 0
+#endif
+
+/* Desktop-class: windowed, multi-process, full filesystem. */
+#if JCE_PLATFORM_WINDOWS || JCE_PLATFORM_MACOS || JCE_PLATFORM_LINUX
+#define JCE_PLATFORM_DESKTOP 1
+#else
+#define JCE_PLATFORM_DESKTOP 0
 #endif
 
 /* -- Architecture --------------------------------------------------- */

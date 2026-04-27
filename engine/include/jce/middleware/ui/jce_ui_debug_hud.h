@@ -49,26 +49,26 @@ typedef struct JceDebugHudData {
     const char *shortcut_hints;   /* optional bottom-left hint line */
 } JceDebugHudData;
 
-JceDebugHud   *jce_debug_hud_create(const JceDebugHudDesc *desc);
-void           jce_debug_hud_destroy(JceDebugHud *hud);
+JCE_API JceDebugHud   *jce_debug_hud_create(const JceDebugHudDesc *desc);
+JCE_API void           jce_debug_hud_destroy(JceDebugHud *hud);
 
-void           jce_debug_hud_show(JceDebugHud *hud);
-void           jce_debug_hud_hide(JceDebugHud *hud);
-bool           jce_debug_hud_is_visible(const JceDebugHud *hud);
+JCE_API void           jce_debug_hud_show(JceDebugHud *hud);
+JCE_API void           jce_debug_hud_hide(JceDebugHud *hud);
+JCE_API bool           jce_debug_hud_is_visible(const JceDebugHud *hud);
 
 /* Push current data into HUD elements.  Call before jce_ui_update(). */
 void           jce_debug_hud_update(JceDebugHud *hud,
                                     const JceDebugHudData *data);
 
 /* Draw supplemental HUD graphics after jce_ui_render(). */
-void           jce_debug_hud_draw(JceDebugHud *hud);
+JCE_API void           jce_debug_hud_draw(JceDebugHud *hud);
 
 /* Change the body font-family at runtime (e.g. on language switch). */
 void           jce_debug_hud_set_font_family(JceDebugHud *hud,
                                              const char *family);
 
 /* Get the underlying document handle for advanced use. */
-JceUIDocHandle jce_debug_hud_get_doc(const JceDebugHud *hud);
+JCE_API JceUIDocHandle jce_debug_hud_get_doc(const JceDebugHud *hud);
 
 JCE_EXTERN_C_END
 

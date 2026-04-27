@@ -82,39 +82,23 @@ bool decode_texture_rgba_path(const fs::path &path,
     void *img_buf = ed_read_file(path.string().c_str(), &img_size);
     if (!img_buf) return false;
 
-    SDL_IOStream *io = SDL_IOFromConstMem(img_buf, img_size);
-    if (!io) { ED_FREE(img_buf); return false; }
-
-    SDL_Surface *surf = IMG_Load_IO(io, true);
+    JceImage img;
+    bool ok = jce_image_decode(img_buf, img_size, &img);
     ED_FREE(img_buf);
-    if (!surf) return false;
-
-    if (surf->format != SDL_PIXELFORMAT_RGBA32) {
-        SDL_Surface *conv = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA32);
-        SDL_DestroySurface(surf);
-        surf = conv;
-    }
-    if (!surf || surf->w <= 0 || surf->h <= 0 || !surf->pixels) {
-        if (surf) SDL_DestroySurface(surf);
+    if (!ok) return false;
+    if (img.width == 0 || img.height == 0 || !img.pixels) {
+        jce_image_free(&img);
         return false;
     }
 
-    *out_w = (uint32_t)surf->w;
-    *out_h = (uint32_t)surf->h;
+    *out_w = img.width;
+    *out_h = img.height;
 
-    const size_t row_bytes = (size_t)(*out_w) * 4;
-    const size_t total_bytes = row_bytes * (size_t)(*out_h);
+    const size_t total_bytes = (size_t)img.width * (size_t)img.height * 4u;
     out_rgba->resize(total_bytes);
+    memcpy(out_rgba->data(), img.pixels, total_bytes);
 
-    const uint8_t *src = (const uint8_t *)surf->pixels;
-    uint8_t *dst = out_rgba->data();
-    for (uint32_t y = 0; y < *out_h; y++) {
-        memcpy(dst + (size_t)y * row_bytes,
-               src + (size_t)y * (size_t)surf->pitch,
-               row_bytes);
-    }
-
-    SDL_DestroySurface(surf);
+    jce_image_free(&img);
     LOG_DEBUG(LOG_TAG, "decoded texture: %s (%ux%u)",
               path.string().c_str(), *out_w, *out_h);
     return true;
@@ -355,28 +339,8 @@ void texture_finalize_completed_loads(void)
             continue;
         }
 
-        SDL_Surface *surf = SDL_CreateSurface((int)res.width,
-                                              (int)res.height,
-                                              SDL_PIXELFORMAT_RGBA32);
-        if (!surf || !surf->pixels) {
-            if (surf) SDL_DestroySurface(surf);
-            s_cache.tex_cache[idx].failed = true;
-            LOG_WARN(LOG_TAG, "texture finalize failed (surface): %s",
-                     res.key.c_str());
-            continue;
-        }
-
-        const size_t row_bytes = (size_t)res.width * 4;
-        const uint8_t *src = res.rgba.data();
-        uint8_t *dst = (uint8_t *)surf->pixels;
-        for (uint32_t y = 0; y < res.height; y++) {
-            memcpy(dst + (size_t)y * (size_t)surf->pitch,
-                   src + (size_t)y * row_bytes,
-                   row_bytes);
-        }
-
-        JceTexture tex = jce_texture_load_from_surface(surf, JCE_TEX_WRAP);
-        SDL_DestroySurface(surf);
+        JceTexture tex = jce_texture_from_rgba(res.rgba.data(),
+                                               res.width, res.height);
 
         if (!jce_texture_valid(tex)) {
             s_cache.tex_cache[idx].failed = true;

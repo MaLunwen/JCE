@@ -43,8 +43,8 @@ typedef struct {
 
 /* Create a host.  For a server, set port > 0.
    For a client, set port = 0 (ephemeral). */
-JceNetHost *jce_net_host_create(const JceNetHostDesc *desc, jce_allocator_t alloc);
-void        jce_net_host_destroy(JceNetHost *host);
+JCE_API JceNetHost *jce_net_host_create(const JceNetHostDesc *desc, jce_allocator_t alloc);
+JCE_API void        jce_net_host_destroy(JceNetHost *host);
 
 /* ================================================================== */
 /* Connection                                                          */
@@ -57,10 +57,10 @@ JcePeerHandle jce_net_connect(JceNetHost *host,
                               uint8_t channel_count);
 
 /* Graceful disconnect.  Triggers JCE_NET_EVENT_DISCONNECT. */
-void jce_net_disconnect(JceNetHost *host, JcePeerHandle peer);
+JCE_API void jce_net_disconnect(JceNetHost *host, JcePeerHandle peer);
 
 /* Forceful disconnect (no notification to remote). */
-void jce_net_disconnect_now(JceNetHost *host, JcePeerHandle peer);
+JCE_API void jce_net_disconnect_now(JceNetHost *host, JcePeerHandle peer);
 
 /* ================================================================== */
 /* Send / receive                                                      */
@@ -87,7 +87,7 @@ bool jce_net_poll(JceNetHost *host, JceNetEvent *out_event,
 
 /* Service the host: send queued packets, receive events.
    Call once per frame. */
-void jce_net_service(JceNetHost *host);
+JCE_API void jce_net_service(JceNetHost *host);
 
 /* ================================================================== */
 /* Transport info                                                      */
@@ -99,17 +99,17 @@ typedef enum {
 } JceNetTransport;
 
 /* Return the active network transport for this build. */
-JceNetTransport jce_net_get_transport(void);
+JCE_API JceNetTransport jce_net_get_transport(void);
 
 /* ================================================================== */
 /* Peer info                                                           */
 /* ================================================================== */
 
 /* Round-trip time in milliseconds. */
-uint32_t jce_net_peer_rtt(const JceNetHost *host, JcePeerHandle peer);
+JCE_API uint32_t jce_net_peer_rtt(const JceNetHost *host, JcePeerHandle peer);
 
 /* Number of currently connected peers. */
-uint32_t jce_net_peer_count(const JceNetHost *host);
+JCE_API uint32_t jce_net_peer_count(const JceNetHost *host);
 
 JCE_EXTERN_C_END
 

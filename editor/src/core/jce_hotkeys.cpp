@@ -1,0 +1,253 @@
+/*
+ * jce_hotkeys.cpp  Implementation of the hotkey registry.
+ */
+
+#include "jce_hotkeys.h"
+#include "jce_editor_config.h"
+
+#include <jce/tools/jce_imgui.h>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+
+namespace {
+
+struct HotkeyEntry {
+    const char    *id_string;   /* stable, used in JSON */
+    const char    *display;     /* shown in Settings UI */
+    JceHotkeyChord def;
+    JceHotkeyChord cur;
+};
+
+/* clang-format off */
+HotkeyEntry s_table[JCE_HK_COUNT] = {
+    /* file */
+    { "file.save",                 "File / Save",                 { ImGuiKey_S, JCE_HKM_CTRL }, {} },
+    { "file.save_as",              "File / Save As",              { ImGuiKey_S, (uint8_t)(JCE_HKM_CTRL | JCE_HKM_SHIFT) }, {} },
+    { "file.open",                 "File / Open",                 { ImGuiKey_O, JCE_HKM_CTRL }, {} },
+    { "file.new",                  "File / New",                  { ImGuiKey_N, JCE_HKM_CTRL }, {} },
+
+    /* edit */
+    { "edit.undo",                 "Edit / Undo",                 { ImGuiKey_Z, JCE_HKM_CTRL }, {} },
+    { "edit.redo",                 "Edit / Redo",                 { ImGuiKey_Y, JCE_HKM_CTRL }, {} },
+    { "edit.cut",                  "Edit / Cut",                  { ImGuiKey_X, JCE_HKM_CTRL }, {} },
+    { "edit.copy",                 "Edit / Copy",                 { ImGuiKey_C, JCE_HKM_CTRL }, {} },
+    { "edit.paste",                "Edit / Paste",                { ImGuiKey_V, JCE_HKM_CTRL }, {} },
+    { "edit.duplicate",            "Edit / Duplicate",            { ImGuiKey_D, JCE_HKM_CTRL }, {} },
+    { "edit.delete",               "Edit / Delete",               { ImGuiKey_Delete, JCE_HKM_NONE }, {} },
+    { "edit.rename",               "Edit / Rename",               { ImGuiKey_F2, JCE_HKM_NONE }, {} },
+    { "edit.select_all",           "Edit / Select All",           { ImGuiKey_A, JCE_HKM_CTRL }, {} },
+    { "edit.find",                 "Edit / Find",                 { ImGuiKey_F, JCE_HKM_CTRL }, {} },
+
+    /* gizmos */
+    { "gizmo.translate",           "Gizmo / Translate",           { ImGuiKey_W, JCE_HKM_NONE }, {} },
+    { "gizmo.rotate",              "Gizmo / Rotate",              { ImGuiKey_E, JCE_HKM_NONE }, {} },
+    { "gizmo.scale",               "Gizmo / Scale",               { ImGuiKey_R, JCE_HKM_NONE }, {} },
+    { "gizmo.none",                "Gizmo / None",                { ImGuiKey_Q, JCE_HKM_NONE }, {} },
+    { "gizmo.toggle_space",        "Gizmo / Toggle Local/World",  { ImGuiKey_X, JCE_HKM_NONE }, {} },
+    { "gizmo.toggle_snap",         "Gizmo / Toggle Snap",         { ImGuiKey_S, JCE_HKM_NONE }, {} },
+
+    /* view */
+    { "view.frame_selected",       "View / Frame Selected",       { ImGuiKey_F, JCE_HKM_NONE }, {} },
+    { "view.frame_all",            "View / Frame All",            { ImGuiKey_F, JCE_HKM_SHIFT }, {} },
+    { "view.focus_persp",          "View / Perspective",          { ImGuiKey_Keypad5, JCE_HKM_NONE }, {} },
+    { "view.focus_top",            "View / Top",                  { ImGuiKey_Keypad7, JCE_HKM_NONE }, {} },
+    { "view.focus_front",          "View / Front",                { ImGuiKey_Keypad1, JCE_HKM_NONE }, {} },
+    { "view.focus_right",          "View / Right",                { ImGuiKey_Keypad3, JCE_HKM_NONE }, {} },
+    { "view.toggle_grid",          "View / Toggle Grid",          { ImGuiKey_G, JCE_HKM_NONE }, {} },
+    { "view.toggle_gizmos",        "View / Toggle Gizmos",        { ImGuiKey_G, JCE_HKM_SHIFT }, {} },
+
+    /* play */
+    { "play.toggle",               "Play / Toggle",               { ImGuiKey_F5, JCE_HKM_NONE }, {} },
+    { "play.step",                 "Play / Step",                 { ImGuiKey_F10, JCE_HKM_NONE }, {} },
+    { "play.pause",                "Play / Pause",                { ImGuiKey_Pause, JCE_HKM_NONE }, {} },
+
+    /* ui */
+    { "ui.command_palette",        "UI / Command Palette",        { ImGuiKey_P, JCE_HKM_CTRL }, {} },
+    { "ui.find_in_hierarchy",      "UI / Find in Hierarchy",      { ImGuiKey_F, JCE_HKM_CTRL }, {} },
+    { "ui.find_in_assets",         "UI / Find in Assets",         { ImGuiKey_F, (uint8_t)(JCE_HKM_CTRL | JCE_HKM_ALT) }, {} },
+    { "ui.toggle_fullscreen_view", "UI / Toggle Fullscreen Panel",{ ImGuiKey_F12, JCE_HKM_NONE }, {} },
+};
+/* clang-format on */
+
+void hotkeys_path(char *out, size_t n)
+{
+    /* Sit alongside editor-config.json. */
+    std::snprintf(out, n, ".jce/hotkeys.json");
+}
+
+int chord_imgui(JceHotkeyChord c)
+{
+    int chord = 0;
+    if (c.mods & JCE_HKM_CTRL)  chord |= ImGuiMod_Ctrl;
+    if (c.mods & JCE_HKM_SHIFT) chord |= ImGuiMod_Shift;
+    if (c.mods & JCE_HKM_ALT)   chord |= ImGuiMod_Alt;
+    if (c.mods & JCE_HKM_SUPER) chord |= ImGuiMod_Super;
+    chord |= c.key;
+    return chord;
+}
+
+const char *imgui_key_name(int key)
+{
+    if (key <= 0) return "";
+    return ImGui::GetKeyName((ImGuiKey)key);
+}
+
+bool initialized = false;
+
+} /* namespace */
+
+extern "C" void jce_hotkeys_init(void)
+{
+    if (initialized) return;
+    for (int i = 0; i < JCE_HK_COUNT; ++i) {
+        s_table[i].cur = s_table[i].def;
+    }
+    initialized = true;
+    jce_hotkeys_load();
+}
+
+extern "C" void jce_hotkeys_shutdown(void)
+{
+    initialized = false;
+}
+
+extern "C" void jce_hotkeys_reset_all(void)
+{
+    for (int i = 0; i < JCE_HK_COUNT; ++i) {
+        s_table[i].cur = s_table[i].def;
+    }
+}
+
+extern "C" const char *jce_hotkey_name(JceHotkeyId id)
+{
+    if (id < 0 || id >= JCE_HK_COUNT) return "";
+    return s_table[id].display;
+}
+extern "C" const char *jce_hotkey_id_string(JceHotkeyId id)
+{
+    if (id < 0 || id >= JCE_HK_COUNT) return "";
+    return s_table[id].id_string;
+}
+extern "C" JceHotkeyChord jce_hotkey_get(JceHotkeyId id)
+{
+    if (id < 0 || id >= JCE_HK_COUNT) return JceHotkeyChord{0, 0};
+    return s_table[id].cur;
+}
+extern "C" JceHotkeyChord jce_hotkey_get_default(JceHotkeyId id)
+{
+    if (id < 0 || id >= JCE_HK_COUNT) return JceHotkeyChord{0, 0};
+    return s_table[id].def;
+}
+extern "C" void jce_hotkey_set(JceHotkeyId id, JceHotkeyChord chord)
+{
+    if (id < 0 || id >= JCE_HK_COUNT) return;
+    s_table[id].cur = chord;
+}
+
+extern "C" bool jce_hotkey_pressed(JceHotkeyId id)
+{
+    if (id < 0 || id >= JCE_HK_COUNT) return false;
+    JceHotkeyChord c = s_table[id].cur;
+    if (c.key <= 0) return false;
+    return ImGui::IsKeyChordPressed((ImGuiKeyChord)chord_imgui(c));
+}
+
+extern "C" char *jce_hotkey_chord_label(JceHotkeyChord c, char *out, size_t n)
+{
+    if (!out || n == 0) return out;
+    out[0] = '\0';
+    char tmp[96] = {0};
+    size_t off = 0;
+    auto append = [&](const char *s) {
+        size_t l = std::strlen(s);
+        if (off + l + 1 < sizeof(tmp)) {
+            std::memcpy(tmp + off, s, l);
+            off += l;
+            tmp[off] = '\0';
+        }
+    };
+    if (c.mods & JCE_HKM_CTRL)  append("Ctrl+");
+    if (c.mods & JCE_HKM_SHIFT) append("Shift+");
+    if (c.mods & JCE_HKM_ALT)   append("Alt+");
+    if (c.mods & JCE_HKM_SUPER) append("Super+");
+    if (c.key > 0) append(imgui_key_name(c.key));
+    if (off == 0) std::snprintf(tmp, sizeof(tmp), "(unbound)");
+    std::strncpy(out, tmp, n - 1);
+    out[n - 1] = '\0';
+    return out;
+}
+
+/* ── Persistence (very small JSON; no library) ─────────────────────── */
+
+extern "C" bool jce_hotkeys_save(void)
+{
+    if (!initialized) return false;
+    char path[640];
+    hotkeys_path(path, sizeof(path));
+    FILE *fp = std::fopen(path, "wb");
+    if (!fp) return false;
+    std::fprintf(fp, "{\n  \"hotkeys\": [\n");
+    for (int i = 0; i < JCE_HK_COUNT; ++i) {
+        std::fprintf(fp,
+            "    { \"id\": \"%s\", \"key\": %d, \"mods\": %u }%s\n",
+            s_table[i].id_string,
+            (int)s_table[i].cur.key,
+            (unsigned)s_table[i].cur.mods,
+            (i + 1 < JCE_HK_COUNT) ? "," : "");
+    }
+    std::fprintf(fp, "  ]\n}\n");
+    std::fclose(fp);
+    return true;
+}
+
+extern "C" bool jce_hotkeys_load(void)
+{
+    char path[640];
+    hotkeys_path(path, sizeof(path));
+    FILE *fp = std::fopen(path, "rb");
+    if (!fp) return false;
+    std::fseek(fp, 0, SEEK_END);
+    long len = std::ftell(fp);
+    std::fseek(fp, 0, SEEK_SET);
+    if (len <= 0 || len > (1 << 20)) { std::fclose(fp); return false; }
+    char *buf = (char *)std::malloc((size_t)len + 1);
+    if (!buf) { std::fclose(fp); return false; }
+    std::fread(buf, 1, (size_t)len, fp);
+    buf[len] = '\0';
+    std::fclose(fp);
+
+    /* Tiny scanner: look for "id": "...", "key": N, "mods": N triples. */
+    const char *p = buf;
+    while (p && *p) {
+        const char *id_key = std::strstr(p, "\"id\"");
+        if (!id_key) break;
+        const char *q1 = std::strchr(id_key + 4, '"'); if (!q1) break;
+        const char *q2 = std::strchr(q1 + 1,    '"'); if (!q2) break;
+        char idbuf[64] = {0};
+        size_t idlen = (size_t)(q2 - q1 - 1);
+        if (idlen >= sizeof(idbuf)) idlen = sizeof(idbuf) - 1;
+        std::memcpy(idbuf, q1 + 1, idlen);
+
+        const char *key_key  = std::strstr(q2, "\"key\"");
+        const char *mods_key = std::strstr(q2, "\"mods\"");
+        if (!key_key || !mods_key) break;
+        int keyv = 0; unsigned modsv = 0;
+        std::sscanf(key_key,  "\"key\" : %d", &keyv);
+        if (keyv == 0) std::sscanf(key_key,  "\"key\":%d",  &keyv);
+        std::sscanf(mods_key, "\"mods\" : %u", &modsv);
+        if (modsv == 0 && std::strstr(mods_key, "0") == nullptr)
+            std::sscanf(mods_key, "\"mods\":%u", &modsv);
+
+        for (int i = 0; i < JCE_HK_COUNT; ++i) {
+            if (std::strcmp(s_table[i].id_string, idbuf) == 0) {
+                s_table[i].cur.key  = keyv;
+                s_table[i].cur.mods = (uint8_t)modsv;
+                break;
+            }
+        }
+        p = mods_key + 1;
+    }
+    std::free(buf);
+    return true;
+}

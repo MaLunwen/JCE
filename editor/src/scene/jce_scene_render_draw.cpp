@@ -61,19 +61,19 @@ static bool build_overlay_entity_model(uint32_t entity_id,
 
 void draw_grid(void)
 {
-    if (!BGFX_HANDLE_IS_VALID(s_sr.prog_grid)) return;
+    if (!jce_program_valid(s_sr.prog_grid)) return;
 
     /* Position-only fullscreen quad in NDC. */
-    bgfx_vertex_layout_t layout;
-    bgfx_vertex_layout_begin(&layout, bgfx_get_renderer_type());
-    bgfx_vertex_layout_add(&layout, BGFX_ATTRIB_POSITION, 3,
-                           BGFX_ATTRIB_TYPE_FLOAT, false, false);
-    bgfx_vertex_layout_end(&layout);
+    JceVertexLayout layout;
+    jce_vertex_layout_begin(&layout);
+    jce_vertex_layout_add(&layout, JCE_ATTRIB_POSITION, 3,
+                          JCE_ATTRIB_TYPE_FLOAT, false, false);
+    jce_vertex_layout_end(&layout);
 
     struct GridVertex { float x, y, z; };
-    bgfx_transient_vertex_buffer_t tvb;
-    bgfx_transient_index_buffer_t tib;
-    if (!bgfx_alloc_transient_buffers(&tvb, &layout, 4, &tib, 6, false))
+    JceTransientVertexBuffer tvb;
+    JceTransientIndexBuffer  tib;
+    if (!jce_alloc_transient_buffers(&tvb, &layout, 4, &tib, 6, false))
         return;
 
     GridVertex *v = (GridVertex *)tvb.data;
@@ -91,21 +91,21 @@ void draw_grid(void)
     float grid_camera[4] = { cam_pos.x, cam_pos.y, cam_pos.z, 0.0f };
     float grid_fade[4] = { fade_near, fade_far, 10.0f, 1.0f };
 
-    bgfx_set_uniform(s_sr.u_grid_camera, grid_camera, 1);
-    bgfx_set_uniform(s_sr.u_grid_fade, grid_fade, 1);
-    bgfx_set_transient_vertex_buffer(0, &tvb, 0, 4);
-    bgfx_set_transient_index_buffer(&tib, 0, 6);
+    jce_uniform_set(s_sr.u_grid_camera, grid_camera, 1);
+    jce_uniform_set(s_sr.u_grid_fade, grid_fade, 1);
+    jce_set_transient_vertex_buffer(0, &tvb, 0, 4);
+    jce_set_transient_index_buffer(&tib, 0, 6);
 
-    uint64_t state = BGFX_STATE_WRITE_RGB
-                   | BGFX_STATE_WRITE_A
-                   | BGFX_STATE_MSAA
-                   | BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_SRC_ALPHA,
-                                            BGFX_STATE_BLEND_INV_SRC_ALPHA);
-    bgfx_set_state(state, 0);
+    uint64_t state = JCE_STATE_WRITE_RGB
+                   | JCE_STATE_WRITE_A
+                   | JCE_STATE_MSAA
+                   | JCE_STATE_BLEND_FUNC(JCE_BLEND_SRC_ALPHA,
+                                          JCE_BLEND_INV_SRC_ALPHA);
+    jce_set_state(state, 0);
 
     jce_mat4 identity = jce_m4_identity();
-    bgfx_set_transform(identity.raw[0], 1);
-    bgfx_submit(scene_view_id(), s_sr.prog_grid, 0, BGFX_DISCARD_ALL);
+    jce_set_transform(identity.raw[0], 1);
+    jce_submit(scene_view_id(), s_sr.prog_grid, 0, JCE_DISCARD_ALL);
 }
 
 /* ── Selection outlines ───────────────────────────────────────────── */
@@ -120,7 +120,6 @@ void draw_selection_outlines(void)
     float flat_color[4]  = { 1.0f, 0.75f, 0.0f, 1.0f };
 
     JceUniformHandle uh = jce_renderer_get_tex_uniform(s_sr.renderer);
-    bgfx_uniform_handle_t su = { uh.idx };
 
     for (int i = 0; i < sel_count; i++) {
         uint32_t id = sel[i];
@@ -132,11 +131,11 @@ void draw_selection_outlines(void)
         if (!build_overlay_entity_model(id, &model, &mesh)) continue;
         if (!mesh) continue;
 
-        bgfx_set_transform(model.raw[0], 1);
+        jce_set_transform(model.raw[0], 1);
 
-        bgfx_set_uniform(s_sr.u_light_dir,   flat_dir,   1);
-        bgfx_set_uniform(s_sr.u_light_color, flat_color, 1);
-        bgfx_set_texture(0, su, s_sr.white_tex, UINT32_MAX);
+        jce_uniform_set(s_sr.u_light_dir,   flat_dir,   1);
+        jce_uniform_set(s_sr.u_light_color, flat_color, 1);
+        jce_set_texture(0, uh, s_sr.white_tex, JCE_SAMPLER_INHERIT);
 
         jce_mesh_submit_wireframe_overlay(mesh, s_sr.renderer, scene_view_id());
     }
@@ -207,24 +206,23 @@ void draw_ghost_entity(void)
     model.raw[3][0] = s_sr.ghost_pos[0];
     model.raw[3][1] = s_sr.ghost_pos[1];
     model.raw[3][2] = s_sr.ghost_pos[2];
-    bgfx_set_transform(model.raw[0], 1);
+    jce_set_transform(model.raw[0], 1);
 
     JceUniformHandle uh = jce_renderer_get_tex_uniform(s_sr.renderer);
-    bgfx_uniform_handle_t su = { uh.idx };
-    bgfx_set_texture(0, su, s_sr.white_tex, UINT32_MAX);
+    jce_set_texture(0, uh, s_sr.white_tex, JCE_SAMPLER_INHERIT);
 
-    uint64_t state = BGFX_STATE_WRITE_RGB
-                   | BGFX_STATE_WRITE_A
-                   | BGFX_STATE_DEPTH_TEST_LESS
-                   | BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_SRC_ALPHA,
-                                           BGFX_STATE_BLEND_INV_SRC_ALPHA)
-                   | BGFX_STATE_MSAA;
-    bgfx_set_state(state, 0);
+    uint64_t state = JCE_STATE_WRITE_RGB
+                   | JCE_STATE_WRITE_A
+                   | JCE_STATE_DEPTH_TEST_LESS
+                   | JCE_STATE_BLEND_FUNC(JCE_BLEND_SRC_ALPHA,
+                                          JCE_BLEND_INV_SRC_ALPHA)
+                   | JCE_STATE_MSAA;
+    jce_set_state(state, 0);
 
     float green_dir[4]   = { 0.0f, -1.0f, 0.0f, 0.0f };
     float green_color[4] = { 0.2f, 0.9f, 0.3f, 0.45f };
-    bgfx_set_uniform(s_sr.u_light_dir,   green_dir,   1);
-    bgfx_set_uniform(s_sr.u_light_color, green_color, 1);
+    jce_uniform_set(s_sr.u_light_dir,   green_dir,   1);
+    jce_uniform_set(s_sr.u_light_color, green_color, 1);
 
     jce_mesh_submit_overlay(mesh, s_sr.renderer, scene_view_id());
 }
@@ -243,23 +241,22 @@ void draw_hover_highlight(void)
     if (!build_overlay_entity_model(id, &model, &mesh)) return;
     if (!mesh) return;
 
-    bgfx_set_transform(model.raw[0], 1);
+    jce_set_transform(model.raw[0], 1);
 
     JceUniformHandle uh = jce_renderer_get_tex_uniform(s_sr.renderer);
-    bgfx_uniform_handle_t su = { uh.idx };
-    bgfx_set_texture(0, su, s_sr.white_tex, UINT32_MAX);
+    jce_set_texture(0, uh, s_sr.white_tex, JCE_SAMPLER_INHERIT);
 
-    uint64_t state = BGFX_STATE_WRITE_RGB
-                   | BGFX_STATE_DEPTH_TEST_LEQUAL
-                   | BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_ONE,
-                                           BGFX_STATE_BLEND_ONE)
-                   | BGFX_STATE_MSAA;
-    bgfx_set_state(state, 0);
+    uint64_t state = JCE_STATE_WRITE_RGB
+                   | JCE_STATE_DEPTH_TEST_LEQUAL
+                   | JCE_STATE_BLEND_FUNC(JCE_BLEND_ONE,
+                                          JCE_BLEND_ONE)
+                   | JCE_STATE_MSAA;
+    jce_set_state(state, 0);
 
     float hover_dir[4]   = { 0.0f, -1.0f, 0.0f, 0.0f };
     float hover_color[4] = { 0.28f, 0.28f, 0.34f, 1.0f };
-    bgfx_set_uniform(s_sr.u_light_dir,   hover_dir,   1);
-    bgfx_set_uniform(s_sr.u_light_color, hover_color, 1);
+    jce_uniform_set(s_sr.u_light_dir,   hover_dir,   1);
+    jce_uniform_set(s_sr.u_light_color, hover_color, 1);
 
     jce_mesh_submit_overlay(mesh, s_sr.renderer, scene_view_id());
 

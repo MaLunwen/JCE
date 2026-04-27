@@ -32,30 +32,30 @@ typedef struct jce_allocator jce_allocator_t;
 /* ================================================================== */
 
 typedef struct jce_subsystem_desc {
-	/* Human-readable name for logs. */
-	const char *name;
+    /* Human-readable name for logs. */
+    const char *name;
 
-	/* Initialisation priority — lower values run first.
-	   Convention:
-	     0–99      Core (ECS world, debug)
-	     100–199   Engine services (physics, anim, ai)
-	     200–299   High-level (scene, prefab, net)
-	     300+      Application / editor plug-ins               */
-	int32_t priority;
+    /* Initialisation priority — lower values run first.
+       Convention:
+         0–99      Core (ECS world, debug)
+         100–199   Engine services (physics, anim, ai)
+         200–299   High-level (scene, prefab, net)
+         300+      Application / editor plug-ins               */
+    int32_t priority;
 
-	/* Called during engine startup (after core subsystems).
-	   `svc` provides access to already-initialised subsystems.
-	   Return true on success; false aborts engine startup. */
-	bool (*init)(const JceServices *svc, void *ctx);
+    /* Called during engine startup (after core subsystems).
+       `svc` provides access to already-initialised subsystems.
+       Return true on success; false aborts engine startup. */
+    bool (*init)(const JceServices *svc, void *ctx);
 
-	/* Called during engine shutdown in reverse priority order. */
-	void (*shutdown)(void *ctx);
+    /* Called during engine shutdown in reverse priority order. */
+    void (*shutdown)(void *ctx);
 
-	/* Optional per-frame tick (called from main loop).  NULL = skipped. */
-	void (*update)(float dt, void *ctx);
+    /* Optional per-frame tick (called from main loop).  NULL = skipped. */
+    void (*update)(float dt, void *ctx);
 
-	/* Opaque data forwarded to all callbacks. */
-	void *ctx;
+    /* Opaque data forwarded to all callbacks. */
+    void *ctx;
 } jce_subsystem_desc_t;
 
 /* ================================================================== */
@@ -67,8 +67,8 @@ typedef struct jce_subsystem_registry jce_subsystem_registry_t;
 
 /* Create / destroy the registry.
    Pass jce_allocator_default() if you have no custom allocator. */
-jce_subsystem_registry_t *jce_subsystem_registry_create(jce_allocator_t alloc);
-void                      jce_subsystem_registry_destroy(jce_subsystem_registry_t *reg);
+JCE_API jce_subsystem_registry_t *jce_subsystem_registry_create(jce_allocator_t alloc);
+JCE_API void                      jce_subsystem_registry_destroy(jce_subsystem_registry_t *reg);
 
 /* Register a subsystem.  Can be called any time before init_all().
    The descriptor is copied internally. */
@@ -81,10 +81,10 @@ bool jce_subsystem_init_all(jce_subsystem_registry_t *reg,
                             const JceServices *svc);
 
 /* Call update() on every subsystem that provides one. */
-void jce_subsystem_update_all(jce_subsystem_registry_t *reg, float dt);
+JCE_API void jce_subsystem_update_all(jce_subsystem_registry_t *reg, float dt);
 
 /* Shut down all subsystems in reverse priority order. */
-void jce_subsystem_shutdown_all(jce_subsystem_registry_t *reg);
+JCE_API void jce_subsystem_shutdown_all(jce_subsystem_registry_t *reg);
 
 JCE_EXTERN_C_END
 

@@ -3,13 +3,18 @@
  * Extracted from jce_editor_panels.cpp.
  */
 
-#include "jce_editor_config.h"
-#include "jce_editor_i18n.h"
-#include "jce_editor_panels.h"
-#include "jce_editor_state.h"
-#include "jce_run_manager.h"
+#include "core/jce_editor_config.h"
+#include "core/jce_editor_i18n.h"
+#include "ui/jce_editor_panels.h"
+#include "core/jce_editor_state.h"
+#include "core/jce_run_manager.h"
 
-#include <imgui.h>
+extern "C" {
+#include <jce/os/core/jce_defs.h>
+#include <jce/os/platform/jce_host_dialog.h>
+}
+
+#include <jce/tools/jce_imgui.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -114,6 +119,48 @@ void jce_editor_panel_game_view_content(void)
         jce_run_manager_get_status(&rs);
         if (!rs.running) {
             if (ImGui::SmallButton(">")) start_external_game();
+            ImGui::SameLine();
+            if (ImGui::SmallButton("...##pickExe")) {
+                jce_host_dialog_pick_file(
+                    "Select Game Executable", nullptr,
+#if JCE_PLATFORM_WINDOWS
+                    "Executables (*.exe);;All Files (*.*)",
+#else
+                    "All Files (*)",
+#endif
+                    [](void *, JceDialogResult result, const char *path) {
+                        if (result != JCE_DIALOG_OK || !path) return;
+                        JceEditorConfig c;
+                        jce_editor_config_load(&c);
+                        snprintf(c.game_executable_path,
+                                 sizeof(c.game_executable_path), "%s", path);
+                        const char *slash = strrchr(path, '/');
+                        const char *bslash = strrchr(path, '\\');
+                        const char *sep = (slash && bslash) ? (slash > bslash ? slash : bslash)
+                                                            : (slash ? slash : bslash);
+                        if (sep) {
+                            size_t n = (size_t) (sep - path);
+                            if (n >= sizeof(c.game_working_directory))
+                                n = sizeof(c.game_working_directory) - 1;
+                            memcpy(c.game_working_directory, path, n);
+                            c.game_working_directory[n] = '\0';
+                        }
+                        jce_editor_config_save(&c);
+                    },
+                    nullptr);
+            }
+            if (ImGui::IsItemHovered()) {
+                JceEditorConfig c;
+                jce_editor_config_load(&c);
+                ImGui::SetTooltip("Game executable:\n%s",
+                                  c.game_executable_path[0] ? c.game_executable_path
+                                                            : "(not set)");
+            }
+            if (rs.last_error[0]) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s",
+                                   rs.last_error);
+            }
         } else {
             if (ImGui::SmallButton("[]")) jce_run_manager_request_stop();
             ImGui::SameLine();

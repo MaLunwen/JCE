@@ -271,6 +271,7 @@ _jce_add_layer(jce_ui
 	LINK_PRIVATE
 		rmlui::rmlui
 		bgfx::bgfx
+		imgui::imgui
 	CXX)
 
 # ================================================================== #
@@ -292,6 +293,7 @@ _jce_add_layer(jce_resource
 		zstd::libzstd_static
 		xxHash::xxhash
 		bgfx::bgfx
+		assimp::assimp
 	CXX)
 
 # ================================================================== #

@@ -7,6 +7,15 @@
 #ifndef JCE_API_AI_H
 #define JCE_API_AI_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <jce/middleware/ai/jce_bt.h>
 
+
+
+#ifdef __cplusplus
+}
+#endif
 #endif /* JCE_API_AI_H */

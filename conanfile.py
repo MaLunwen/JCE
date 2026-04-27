@@ -56,7 +56,6 @@ class JCEConan(ConanFile):
         self.requires("sdl_image/3.4.0")
 
         self.requires("bgfx/1.129.8930-495")
-        self.requires("cglm/0.9.1")
 
         self.requires("harfbuzz/12.3.0")
         self.requires("freetype/2.13.2", force=True)
@@ -67,7 +66,7 @@ class JCEConan(ConanFile):
         self.requires("dav1d/1.5.3")
         self.requires("libvpx/1.16.0")
         self.requires("libwebm/1.0.0.31")
-        
+
         self.requires("imgui/1.92.6-docking")
         self.requires("flecs/4.1.1")
         self.requires("cjson/1.7.19")

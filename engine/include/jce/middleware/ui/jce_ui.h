@@ -43,8 +43,8 @@ typedef struct {
     JcePakArchive  *pak;               /* asset archive (for RML/RCSS/fonts) */
 } JceUIContextDesc;
 
-JceUIContext *jce_ui_create(const JceUIContextDesc *desc, jce_allocator_t alloc);
-void          jce_ui_destroy(JceUIContext *ctx);
+JCE_API JceUIContext *jce_ui_create(const JceUIContextDesc *desc, jce_allocator_t alloc);
+JCE_API void          jce_ui_destroy(JceUIContext *ctx);
 
 /* ================================================================== */
 /* Font loading                                                        */
@@ -53,7 +53,7 @@ void          jce_ui_destroy(JceUIContext *ctx);
 /* Load a TTF/OTF font face from the PAK archive.
    The family name is derived from the filename (e.g. "fonts/Caveat.ttf" → "Caveat").
    Must be called after jce_ui_create and before loading documents that use the font. */
-bool jce_ui_load_font(JceUIContext *ctx, const char *pak_path);
+JCE_API bool jce_ui_load_font(JceUIContext *ctx, const char *pak_path);
 
 /* ================================================================== */
 /* Documents                                                           */
@@ -70,12 +70,12 @@ JceUIDocHandle jce_ui_doc_load(JceUIContext *ctx, const char *name,
                                const char *markup, uint32_t markup_len);
 
 /* Load a UI document from a file path (resolved via PAK archive). */
-JceUIDocHandle jce_ui_doc_load_file(JceUIContext *ctx, const char *path);
+JCE_API JceUIDocHandle jce_ui_doc_load_file(JceUIContext *ctx, const char *path);
 
 /* Show / hide / close a document. */
-void jce_ui_doc_show(JceUIContext *ctx, JceUIDocHandle doc);
-void jce_ui_doc_hide(JceUIContext *ctx, JceUIDocHandle doc);
-void jce_ui_doc_close(JceUIContext *ctx, JceUIDocHandle doc);
+JCE_API void jce_ui_doc_show(JceUIContext *ctx, JceUIDocHandle doc);
+JCE_API void jce_ui_doc_hide(JceUIContext *ctx, JceUIDocHandle doc);
+JCE_API void jce_ui_doc_close(JceUIContext *ctx, JceUIDocHandle doc);
 
 /* ================================================================== */
 /* Elements                                                            */
@@ -100,7 +100,7 @@ JceUIElementHandle jce_ui_find_element(JceUIContext *ctx, JceUIDocHandle doc,
 /* Set / get the inner text of an element. */
 void        jce_ui_elem_set_text(JceUIContext *ctx, JceUIElementHandle elem,
                                  const char *text);
-const char *jce_ui_elem_get_text(JceUIContext *ctx, JceUIElementHandle elem);
+JCE_API const char *jce_ui_elem_get_text(JceUIContext *ctx, JceUIElementHandle elem);
 
 /* Set a CSS property on an element. */
 void jce_ui_elem_set_property(JceUIContext *ctx, JceUIElementHandle elem,
@@ -108,7 +108,7 @@ void jce_ui_elem_set_property(JceUIContext *ctx, JceUIElementHandle elem,
 
 /* Get / set the current value of a form control (select, range, text, etc.).
    Returns "" when the element is not a form control or has no value. */
-const char *jce_ui_elem_get_value(JceUIContext *ctx, JceUIElementHandle elem);
+JCE_API const char *jce_ui_elem_get_value(JceUIContext *ctx, JceUIElementHandle elem);
 void jce_ui_elem_set_value(JceUIContext *ctx, JceUIElementHandle elem,
                            const char *value);
 
@@ -135,7 +135,7 @@ bool jce_ui_elem_get_bounds(JceUIContext *ctx, JceUIElementHandle elem,
                             JceUIRect *out_rect);
 
 /* Get a handle to the document's body (root) element. */
-JceUIElementHandle jce_ui_doc_get_body(JceUIContext *ctx, JceUIDocHandle doc);
+JCE_API JceUIElementHandle jce_ui_doc_get_body(JceUIContext *ctx, JceUIDocHandle doc);
 
 /* ================================================================== */
 /* Event callbacks                                                     */
@@ -152,29 +152,29 @@ void jce_ui_elem_on(JceUIContext *ctx, JceUIElementHandle elem,
 /* ================================================================== */
 
 /* Route input events to the UI.  Call before jce_ui_update(). */
-void jce_ui_process_input(JceUIContext *ctx, const JceInput *input);
+JCE_API void jce_ui_process_input(JceUIContext *ctx, const JceInput *input);
 
 /* Route mouse/pointer input only. Use when keyboard navigation is handled
    explicitly by the game or panel logic. */
-void jce_ui_process_pointer_input(JceUIContext *ctx, const JceInput *input);
+JCE_API void jce_ui_process_pointer_input(JceUIContext *ctx, const JceInput *input);
 
 /* Update document layout and animations. */
-void jce_ui_update(JceUIContext *ctx, float dt);
+JCE_API void jce_ui_update(JceUIContext *ctx, float dt);
 
 /* Render all visible documents.  Call during the render phase. */
-void jce_ui_render(JceUIContext *ctx);
+JCE_API void jce_ui_render(JceUIContext *ctx);
 
 /* Handle viewport resize. */
-void jce_ui_resize(JceUIContext *ctx, uint32_t width, uint32_t height);
+JCE_API void jce_ui_resize(JceUIContext *ctx, uint32_t width, uint32_t height);
 
 /* Set the DPI scale factor for the UI system.
    All document sizes and coordinates will be multiplied by this value.
    Typically obtained from jce_window_get_dpi_scale().
    Default: 1.0.  Call before jce_ui_update() when the scale changes. */
-void jce_ui_set_dpi_scale(JceUIContext *ctx, float dpi_scale);
+JCE_API void jce_ui_set_dpi_scale(JceUIContext *ctx, float dpi_scale);
 
 /* Get the current DPI scale factor. */
-float jce_ui_get_dpi_scale(const JceUIContext *ctx);
+JCE_API float jce_ui_get_dpi_scale(const JceUIContext *ctx);
 
 JCE_EXTERN_C_END
 

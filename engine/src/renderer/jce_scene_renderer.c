@@ -7,10 +7,11 @@
 
 #include <jce/middleware/animation/jce_animation.h>
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/middleware/scene/jce_terrain.h>
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
-#include <jce/os/core/pak_loader.h>
+#include <jce/os/core/jce_pak_loader.h>
 #include <jce/renderer/jce_camera.h>
 #include <jce/renderer/jce_csm.h>
 #include <jce/renderer/jce_ibl.h>
@@ -153,6 +154,27 @@ struct JceSceneRenderer {
 
     /* PostFX pipeline (owned). */
     JcePostFXPipeline       *postfx_pipeline;
+
+    /* Terrain mesh cache (path -> JceTerrain* + combined JceMesh*).
+     * Synthesised on first use so terrain entities flow through the
+     * existing PBR mesh path (and therefore receive shadows / lighting). */
+    struct {
+        char                  path[256];
+        JceTerrain           *terrain;
+        JceMesh              *mesh;
+        bgfx_texture_handle_t splat_tex;
+        bool                  used;
+        bool                  failed;
+        bool                  splat_uploaded;
+    } terrain_cache[16];
+
+    /* Terrain shader uniforms (created lazily on first terrain submit). */
+    bgfx_uniform_handle_t u_terrain_params;
+    bgfx_uniform_handle_t s_terrain_splat;
+    bgfx_uniform_handle_t s_terrain_layer0;
+    bgfx_uniform_handle_t s_terrain_layer1;
+    bgfx_uniform_handle_t s_terrain_layer2;
+    bgfx_uniform_handle_t s_terrain_layer3;
 };
 
 /* ── Entity collection ────────────────────────────────────────────── */
@@ -327,6 +349,84 @@ static bool sr_build_entity_model(JceSceneRenderer *sr, JceScene *scene,
         if (jce_scene_has_mesh_renderer(scene, e)) {
             JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, e);
             *out_mesh = sr_resolve_mesh(sr, mr);
+        }
+        /* Terrain fallback: only attempted when no mesh renderer mesh
+         * was resolved.  Synthesises a single combined mesh from all
+         * terrain chunks at LOD 0 the first time the path is seen. */
+        if (!*out_mesh && jce_scene_has_terrain(scene, e)) {
+            JceTerrainComponent *tc = jce_scene_get_terrain(scene, e);
+            if (tc && tc->visible && tc->terrain_path[0]) {
+                int slot = -1, free_slot = -1;
+                for (int i = 0; i < 16; i++) {
+                    if (sr->terrain_cache[i].used &&
+                        strncmp(sr->terrain_cache[i].path, tc->terrain_path,
+                                sizeof sr->terrain_cache[i].path) == 0) {
+                        slot = i; break;
+                    }
+                    if (!sr->terrain_cache[i].used && free_slot < 0) free_slot = i;
+                }
+                if (slot < 0 && free_slot >= 0) {
+                    slot = free_slot;
+                    memset(&sr->terrain_cache[slot], 0,
+                           sizeof sr->terrain_cache[slot]);
+                    strncpy(sr->terrain_cache[slot].path, tc->terrain_path,
+                            sizeof sr->terrain_cache[slot].path - 1);
+                    sr->terrain_cache[slot].used = true;
+                    JceTerrain *terr = jce_terrain_load_file(tc->terrain_path);
+                    if (!terr) { sr->terrain_cache[slot].failed = true; }
+                    else {
+                        sr->terrain_cache[slot].terrain = terr;
+                        /* Combine all chunks into one mesh. */
+                        int ncx = jce_terrain_chunk_count_x(terr);
+                        int ncz = jce_terrain_chunk_count_z(terr);
+                        int total_v = 0, total_i = 0;
+                        for (int cz = 0; cz < ncz; cz++)
+                        for (int cx = 0; cx < ncx; cx++) {
+                            int v=0,ii=0;
+                            jce_terrain_chunk_mesh_size(terr, cx, cz, 0, &v, &ii);
+                            total_v += v; total_i += ii;
+                        }
+                        if (total_v > 0 && total_i > 0) {
+                            JceTerrainVertex *tv = (JceTerrainVertex *)
+                                malloc(sizeof(JceTerrainVertex) * (size_t)total_v);
+                            uint32_t *tiidx = (uint32_t *)
+                                malloc(sizeof(uint32_t) * (size_t)total_i);
+                            int v_off = 0, i_off = 0;
+                            for (int cz = 0; cz < ncz; cz++)
+                            for (int cx = 0; cx < ncx; cx++) {
+                                int v_cap = total_v - v_off;
+                                int i_cap = total_i - i_off;
+                                int wrote_v = 0, wrote_i = 0;
+                                /* Build into a scratch & re-base indices. */
+                                int v_need=0,i_need=0;
+                                jce_terrain_chunk_mesh_size(terr, cx, cz, 0,
+                                                            &v_need, &i_need);
+                                if (v_need <= 0 || i_need <= 0) continue;
+                                JceTerrainVertex *vbuf = tv + v_off;
+                                uint32_t *ibuf = tiidx + i_off;
+                                jce_terrain_chunk_build_mesh(terr, cx, cz, 0,
+                                    vbuf, v_cap, ibuf, i_cap,
+                                    &wrote_v, &wrote_i);
+                                for (int k = 0; k < wrote_i; k++)
+                                    ibuf[k] += (uint32_t)v_off;
+                                v_off += wrote_v;
+                                i_off += wrote_i;
+                            }
+                            /* JceTerrainVertex layout matches JceMeshVertex. */
+                            sr->terrain_cache[slot].mesh = jce_mesh_create(
+                                (const JceMeshVertex *)tv, (uint32_t)v_off,
+                                tiidx, (uint32_t)i_off);
+                            free(tv); free(tiidx);
+                            if (!sr->terrain_cache[slot].mesh)
+                                sr->terrain_cache[slot].failed = true;
+                        } else {
+                            sr->terrain_cache[slot].failed = true;
+                        }
+                    }
+                }
+                if (slot >= 0 && !sr->terrain_cache[slot].failed)
+                    *out_mesh = sr->terrain_cache[slot].mesh;
+            }
         }
     }
     return true;
@@ -1009,7 +1109,79 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
             }
             bgfx_set_uniform(sr->u_ibl_params, ibl_params, 1);
 
-            jce_mesh_submit_pbr(mesh, sr->renderer, view_id);
+            /* ── Terrain submit override ─────────────────────────────
+             * If this entity is a terrain that we already cached, swap
+             * to program_terrain and bind splat + 4 layer textures.
+             * Otherwise fall through to the standard PBR submit. */
+            int terrain_slot = -1;
+            JceTerrainComponent *tc_render = NULL;
+            if (jce_scene_has_terrain(scene, e)) {
+                tc_render = jce_scene_get_terrain(scene, e);
+                if (tc_render && tc_render->terrain_path[0]) {
+                    for (int ti = 0; ti < 16; ti++) {
+                        if (sr->terrain_cache[ti].used &&
+                            !sr->terrain_cache[ti].failed &&
+                            strncmp(sr->terrain_cache[ti].path,
+                                    tc_render->terrain_path,
+                                    sizeof sr->terrain_cache[ti].path) == 0) {
+                            terrain_slot = ti; break;
+                        }
+                    }
+                }
+            }
+
+            if (terrain_slot >= 0 && tc_render) {
+                /* Lazy upload of the splat texture. */
+                if (!sr->terrain_cache[terrain_slot].splat_uploaded &&
+                    sr->terrain_cache[terrain_slot].terrain) {
+                    JceTerrain *terr = sr->terrain_cache[terrain_slot].terrain;
+                    int tw = jce_terrain_width(terr);
+                    int th = jce_terrain_height(terr);
+                    const uint32_t *splat = jce_terrain_splat(terr);
+                    if (splat && tw > 0 && th > 0) {
+                        const bgfx_memory_t *mem = bgfx_copy(splat,
+                            (uint32_t)(tw * th * 4));
+                        sr->terrain_cache[terrain_slot].splat_tex =
+                            bgfx_create_texture_2d((uint16_t)tw, (uint16_t)th,
+                                false, 1, BGFX_TEXTURE_FORMAT_RGBA8,
+                                BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
+                                mem);
+                    }
+                    sr->terrain_cache[terrain_slot].splat_uploaded = true;
+                }
+
+                /* Resolve 4 layer albedo textures (white fallback). */
+                bgfx_texture_handle_t layer_tex[4];
+                for (int li = 0; li < 4; li++) layer_tex[li] = sr->white_tex;
+                for (int li = 0; li < 4; li++) {
+                    if (!tc_render->layer_albedo_path[li][0]) continue;
+                    JceTexture lt = sr_resolve_texture(sr,
+                        tc_render->layer_albedo_path[li]);
+                    if (jce_texture_valid(lt)) layer_tex[li].idx = lt.idx;
+                }
+
+                /* Override stages 0 (s_albedo→layer0), 4 (s_emissive→layer3),
+                 * 14 (s_layer1), 15 (s_layer2), and 13 (s_splatMap). */
+                bgfx_set_texture(0,  sr->s_terrain_layer0, layer_tex[0], UINT32_MAX);
+                bgfx_set_texture(4,  sr->s_terrain_layer3, layer_tex[3], UINT32_MAX);
+
+                bgfx_texture_handle_t splat_h = sr->terrain_cache[terrain_slot].splat_tex;
+                if (!BGFX_HANDLE_IS_VALID(splat_h)) splat_h = sr->white_tex;
+                bgfx_set_texture(13, sr->s_terrain_splat,  splat_h,    UINT32_MAX);
+                bgfx_set_texture(14, sr->s_terrain_layer1, layer_tex[1], UINT32_MAX);
+                bgfx_set_texture(15, sr->s_terrain_layer2, layer_tex[2], UINT32_MAX);
+
+                float tparams[4] = {
+                    tc_render->tile_scale > 0.0f ? tc_render->tile_scale : 10.0f,
+                    tc_render->splat_enabled ? 1.0f : 0.0f,
+                    0.0f, 0.0f
+                };
+                bgfx_set_uniform(sr->u_terrain_params, tparams, 1);
+
+                jce_mesh_submit_terrain(mesh, sr->renderer, view_id);
+            } else {
+                jce_mesh_submit_pbr(mesh, sr->renderer, view_id);
+            }
         } else {
             /* Simple mesh shader path. Used for:
              *   - WIREFRAME / WIREFRAME_TEXTURED (editor debug views)
@@ -1272,6 +1444,23 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
         BGFX_UNIFORM_TYPE_SAMPLER, 1);
     sr->u_ibl_params     = bgfx_create_uniform("u_iblParams",
         BGFX_UNIFORM_TYPE_VEC4, 1);
+
+    /* Terrain shader bindings (lazy: created here so submit-time has
+     * valid handles even when no terrain is bound). */
+    sr->u_terrain_params = bgfx_create_uniform("u_terrainParams",
+        BGFX_UNIFORM_TYPE_VEC4, 1);
+    sr->s_terrain_splat  = bgfx_create_uniform("s_splatMap",
+        BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    sr->s_terrain_layer1 = bgfx_create_uniform("s_layer1",
+        BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    sr->s_terrain_layer2 = bgfx_create_uniform("s_layer2",
+        BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    sr->s_terrain_layer0 = bgfx_create_uniform("s_albedo",
+        BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    sr->s_terrain_layer3 = bgfx_create_uniform("s_emissive",
+        BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    for (int ti = 0; ti < 16; ti++)
+        sr->terrain_cache[ti].splat_tex.idx = UINT16_MAX;
     {
         JceTexture brdf = jce_ibl_create_brdf_lut(256);
         sr->brdf_lut.idx = brdf.idx;
@@ -1313,6 +1502,22 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
     if (sr->sphere_mesh)   jce_mesh_destroy(sr->sphere_mesh);
     if (sr->capsule_mesh)  jce_mesh_destroy(sr->capsule_mesh);
     if (sr->cylinder_mesh) jce_mesh_destroy(sr->cylinder_mesh);
+
+    /* Terrain cache. */
+    for (int i = 0; i < 16; i++) {
+        if (!sr->terrain_cache[i].used) continue;
+        if (sr->terrain_cache[i].mesh)    jce_mesh_destroy(sr->terrain_cache[i].mesh);
+        if (sr->terrain_cache[i].terrain) jce_terrain_free(sr->terrain_cache[i].terrain);
+        if (BGFX_HANDLE_IS_VALID(sr->terrain_cache[i].splat_tex))
+            bgfx_destroy_texture(sr->terrain_cache[i].splat_tex);
+        sr->terrain_cache[i].used = false;
+    }
+    if (BGFX_HANDLE_IS_VALID(sr->u_terrain_params)) bgfx_destroy_uniform(sr->u_terrain_params);
+    if (BGFX_HANDLE_IS_VALID(sr->s_terrain_splat))  bgfx_destroy_uniform(sr->s_terrain_splat);
+    if (BGFX_HANDLE_IS_VALID(sr->s_terrain_layer1)) bgfx_destroy_uniform(sr->s_terrain_layer1);
+    if (BGFX_HANDLE_IS_VALID(sr->s_terrain_layer2)) bgfx_destroy_uniform(sr->s_terrain_layer2);
+    if (BGFX_HANDLE_IS_VALID(sr->s_terrain_layer0)) bgfx_destroy_uniform(sr->s_terrain_layer0);
+    if (BGFX_HANDLE_IS_VALID(sr->s_terrain_layer3)) bgfx_destroy_uniform(sr->s_terrain_layer3);
 
     if (BGFX_HANDLE_IS_VALID(sr->white_tex))      bgfx_destroy_texture(sr->white_tex);
     if (BGFX_HANDLE_IS_VALID(sr->checker_tex))    bgfx_destroy_texture(sr->checker_tex);

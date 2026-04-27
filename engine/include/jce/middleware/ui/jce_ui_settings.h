@@ -60,33 +60,33 @@ typedef struct JceSettingsVolumes {
     float sfx;
 } JceSettingsVolumes;
 
-JceSettingsPanel  *jce_settings_create(const JceSettingsPanelDesc *desc);
-void               jce_settings_destroy(JceSettingsPanel *panel);
+JCE_API JceSettingsPanel  *jce_settings_create(const JceSettingsPanelDesc *desc);
+JCE_API void               jce_settings_destroy(JceSettingsPanel *panel);
 
-void               jce_settings_open(JceSettingsPanel *panel);
-void               jce_settings_close(JceSettingsPanel *panel);
-bool               jce_settings_is_open(const JceSettingsPanel *panel);
+JCE_API void               jce_settings_open(JceSettingsPanel *panel);
+JCE_API void               jce_settings_close(JceSettingsPanel *panel);
+JCE_API bool               jce_settings_is_open(const JceSettingsPanel *panel);
 
 /* Apply pending settings to engine.
    Called internally by OK/Apply buttons. */
-void               jce_settings_apply(JceSettingsPanel *panel);
+JCE_API void               jce_settings_apply(JceSettingsPanel *panel);
 
 /* Keyboard navigation helpers for arrow-key driven menus. */
-void               jce_settings_focus_prev(JceSettingsPanel *panel);
-void               jce_settings_focus_next(JceSettingsPanel *panel);
-void               jce_settings_adjust(JceSettingsPanel *panel, int delta);
-void               jce_settings_activate(JceSettingsPanel *panel);
+JCE_API void               jce_settings_focus_prev(JceSettingsPanel *panel);
+JCE_API void               jce_settings_focus_next(JceSettingsPanel *panel);
+JCE_API void               jce_settings_adjust(JceSettingsPanel *panel, int delta);
+JCE_API void               jce_settings_activate(JceSettingsPanel *panel);
 
 /* Refresh all i18n labels (call after jce_i18n_set_lang()). */
-void               jce_settings_update_i18n(JceSettingsPanel *panel);
+JCE_API void               jce_settings_update_i18n(JceSettingsPanel *panel);
 
 /* Change body font-family (e.g. on language switch). */
 void               jce_settings_set_font_family(JceSettingsPanel *panel,
                                                 const char *family);
 
-JceUIDocHandle     jce_settings_get_doc(const JceSettingsPanel *panel);
+JCE_API JceUIDocHandle     jce_settings_get_doc(const JceSettingsPanel *panel);
 
-JceSettingsVolumes jce_settings_get_volumes(const JceSettingsPanel *panel);
+JCE_API JceSettingsVolumes jce_settings_get_volumes(const JceSettingsPanel *panel);
 void               jce_settings_set_volumes(JceSettingsPanel *panel,
                                             const JceSettingsVolumes *v);
 

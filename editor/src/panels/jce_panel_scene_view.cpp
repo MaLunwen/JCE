@@ -9,9 +9,16 @@
 
 #include "jce_scene_view_internal.h"
 #include "scene/jce_editor_scene_asset_cache.h"
+#include "core/jce_hotkeys.h"
+#include "core/jce_editor_config.h"
 
 extern "C" {
 #include <jce/renderer/jce_pbr_material.h>
+#include <jce/middleware/scene/jce_terrain.h>
+
+bool jce_terrain_panel_brush_armed(void);
+struct JceTerrain *jce_terrain_panel_get_terrain(void);
+void jce_terrain_panel_apply_brush_world(float wx, float wz, float dt);
 }
 
 #include <ctype.h>
@@ -97,6 +104,34 @@ static void draw_scene_view_toolbar(void)
         bool grid = jce_state_get_show_grid();
         if (ImGui::MenuItem(jce_editor_i18n("scene.grid"), NULL, grid))
             jce_state_set_show_grid(!grid);
+
+        if (ImGui::BeginMenu(jce_editor_i18n("sceneView.menu.showFlags"))) {
+            uint32_t f = jce_state_get_show_flags();
+            struct { const char *i18n_key; uint32_t bit; } items[] = {
+                { "sceneView.flag.gizmos",        JCE_SHOW_FLAG_GIZMOS         },
+                { "sceneView.flag.lightIcons",    JCE_SHOW_FLAG_LIGHT_ICONS    },
+                { "sceneView.flag.cameraIcons",   JCE_SHOW_FLAG_CAMERA_ICONS   },
+                { "sceneView.flag.colliders",     JCE_SHOW_FLAG_COLLIDERS      },
+                { "sceneView.flag.skybox",        JCE_SHOW_FLAG_SKYBOX         },
+                { "sceneView.flag.boundingBoxes", JCE_SHOW_FLAG_BOUNDING_BOXES },
+                { "sceneView.flag.worldAxis",     JCE_SHOW_FLAG_WORLD_AXIS     },
+                { "sceneView.flag.statsOverlay",  JCE_SHOW_FLAG_STATS_OVERLAY  },
+                { "sceneView.flag.navMesh",       JCE_SHOW_FLAG_NAVMESH        },
+            };
+            for (auto &it : items) {
+                bool on = (f & it.bit) != 0;
+                if (ImGui::MenuItem(jce_editor_i18n(it.i18n_key), NULL, on))
+                    jce_state_set_show_flag((JceShowFlag)it.bit, !on);
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem(jce_editor_i18n("sceneView.menu.allOn")))   jce_state_set_show_flags(0xFFFFFFFFu);
+            if (ImGui::MenuItem(jce_editor_i18n("sceneView.menu.allOff")))  jce_state_set_show_flags(0);
+            if (ImGui::MenuItem(jce_editor_i18n("sceneView.menu.defaults"))) jce_state_set_show_flags(
+                JCE_SHOW_FLAG_GIZMOS | JCE_SHOW_FLAG_LIGHT_ICONS
+              | JCE_SHOW_FLAG_CAMERA_ICONS | JCE_SHOW_FLAG_SKYBOX
+              | JCE_SHOW_FLAG_WORLD_AXIS);
+            ImGui::EndMenu();
+        }
 
         bool lp = jce_state_get_live_preview();
         if (ImGui::MenuItem(jce_editor_i18n("sceneView.livePreview"), NULL, lp))
@@ -968,24 +1003,52 @@ static void handle_scene_camera_controls(bool viewport_hovered)
 {
     ImGuiIO &io = ImGui::GetIO();
     bool alt_held = io.KeyAlt;
+    /* Default: wheel up -> zoom in. scene_camera_zoom(positive) brings
+       the camera closer, MouseWheel is positive on wheel-up, so the
+       default sign is +1. The pref opts INTO Apple natural-scroll. */
+    float dy_sign     = jce_editor_pref_invert_drag_y      ? -1.0f : 1.0f;
+    float wheel_sign  = jce_editor_pref_invert_scroll_zoom ? -1.0f : 1.0f;
 
     if (viewport_hovered && alt_held && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 1.0f)) {
         float dyaw   = io.MouseDelta.x * 0.005f;
-        float dpitch = io.MouseDelta.y * 0.005f;
+        float dpitch = io.MouseDelta.y * 0.005f * dy_sign;
         jce_editor_scene_camera_orbit(dyaw, dpitch);
     }
 
+    /* Pan: "grab the world" — drag right → world slides right under cursor
+       (camera moves left). MouseDelta.x positive when dragging right;
+       jce_editor_scene_camera_pan already moves the camera by (-dx, -dy)
+       internally, so passing raw MouseDelta yields the grab semantic. */
     if (viewport_hovered && alt_held && ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 1.0f)) {
-        jce_editor_scene_camera_pan(io.MouseDelta.x, io.MouseDelta.y);
+        float pan_x = io.MouseDelta.x;
+        float pan_y = io.MouseDelta.y * dy_sign;
+        jce_editor_scene_camera_pan(pan_x, pan_y);
     }
 
     if (viewport_hovered && alt_held && ImGui::IsMouseDragging(ImGuiMouseButton_Right, 1.0f)) {
-        float zoom_delta = -io.MouseDelta.y * 0.05f;
+        float zoom_delta = -io.MouseDelta.y * 0.05f * dy_sign;
         jce_editor_scene_camera_zoom(zoom_delta);
     }
 
     if (viewport_hovered && fabsf(io.MouseWheel) > 0.0f) {
-        jce_editor_scene_camera_zoom(io.MouseWheel);
+        jce_editor_scene_camera_zoom(io.MouseWheel * wheel_sign);
+    }
+
+    /* Touchpad two-finger horizontal swipe → 3D camera pan. The wheel
+       handler already applied touchpad inversion if enabled, so the value
+       here matches the user's chosen content-scroll convention. We negate
+       once more so the world stays under the finger (camera moves the
+       opposite direction). */
+    if (viewport_hovered && fabsf(io.MouseWheelH) > 0.0f) {
+        /* editor.cpp globally inverts io.MouseWheelH when
+           touchpad_h_invert is enabled (to make ImGui windows scroll
+           naturally). Scene viewport pan should follow the user's
+           physical finger direction regardless of that ImGui-facing
+           toggle, so undo the global flip here. */
+        float wheel_h = io.MouseWheelH;
+        if (jce_editor_pref_touchpad_h_invert) wheel_h = -wheel_h;
+        float h_sign = jce_editor_pref_invert_scroll_zoom ? -1.0f : 1.0f;
+        jce_editor_scene_camera_pan(-wheel_h * 8.0f * h_sign, 0.0f);
     }
 }
 
@@ -1002,25 +1065,64 @@ static void handle_scene_view_shortcuts(void)
                         (ImGui::IsWindowFocused() ||
                          ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows));
     if (active) {
-        if (ImGui::IsKeyPressed(ImGuiKey_W)) jce_state_set_gizmo_mode(JCE_GIZMO_TRANSLATE);
-        if (ImGui::IsKeyPressed(ImGuiKey_E)) jce_state_set_gizmo_mode(JCE_GIZMO_ROTATE);
-        if (ImGui::IsKeyPressed(ImGuiKey_R)) jce_state_set_gizmo_mode(JCE_GIZMO_SCALE);
+        if (jce_hotkey_pressed(JCE_HK_GIZMO_TRANSLATE)) jce_state_set_gizmo_mode(JCE_GIZMO_TRANSLATE);
+        if (jce_hotkey_pressed(JCE_HK_GIZMO_ROTATE))    jce_state_set_gizmo_mode(JCE_GIZMO_ROTATE);
+        if (jce_hotkey_pressed(JCE_HK_GIZMO_SCALE))     jce_state_set_gizmo_mode(JCE_GIZMO_SCALE);
 
-        if (ImGui::IsKeyPressed(ImGuiKey_F)) {
-            uint32_t f_ent = jce_state_get_focused();
-            if (f_ent != 0) {
-                JceScene *scene = jce_state_get_scene();
-                JceTransform *t = scene
-                    ? jce_scene_get_transform(scene, (JceEntity)f_ent)
-                    : NULL;
-                if (t) {
-                    jce_editor_scene_camera_set_target(
-                        t->position.x, t->position.y, t->position.z);
+        const bool frame_sel  = jce_hotkey_pressed(JCE_HK_VIEW_FRAME_SELECTED);
+        const bool frame_all_ = jce_hotkey_pressed(JCE_HK_VIEW_FRAME_ALL);
+        if (frame_sel || frame_all_) {
+            JceScene *scene = jce_state_get_scene();
+            const bool frame_all = frame_all_;
+            if (scene) {
+                float bmin[3] = { 1e30f,  1e30f,  1e30f };
+                float bmax[3] = {-1e30f, -1e30f, -1e30f };
+                int counted = 0;
+
+                auto accumulate = [&](uint32_t id) {
+                    JceTransform *t = jce_scene_get_transform(scene, (JceEntity)id);
+                    if (!t) return;
+                    float hx = fabsf(t->scale.x) * 0.5f;
+                    float hy = fabsf(t->scale.y) * 0.5f;
+                    float hz = fabsf(t->scale.z) * 0.5f;
+                    if (hx < 0.1f) hx = 0.1f;
+                    if (hy < 0.1f) hy = 0.1f;
+                    if (hz < 0.1f) hz = 0.1f;
+                    float lo[3] = { t->position.x - hx, t->position.y - hy, t->position.z - hz };
+                    float hi[3] = { t->position.x + hx, t->position.y + hy, t->position.z + hz };
+                    for (int k = 0; k < 3; k++) {
+                        if (lo[k] < bmin[k]) bmin[k] = lo[k];
+                        if (hi[k] > bmax[k]) bmax[k] = hi[k];
+                    }
+                    counted++;
+                };
+
+                if (frame_all) {
+                    int total = jce_state_get_entity_count();
+                    for (int i = 0; i < total; i++) {
+                        uint32_t id = jce_state_get_entity_id_by_index(i);
+                        if (id != 0 && jce_state_entity_exists(id))
+                            accumulate(id);
+                    }
+                } else {
+                    int sel_n = 0;
+                    const uint32_t *sel = jce_state_get_selection(&sel_n);
+                    if (sel_n == 0) {
+                        uint32_t f_ent = jce_state_get_focused();
+                        if (f_ent != 0) accumulate(f_ent);
+                    } else {
+                        for (int i = 0; i < sel_n; i++)
+                            if (sel[i] != 0 && jce_state_entity_exists(sel[i]))
+                                accumulate(sel[i]);
+                    }
                 }
+
+                if (counted > 0)
+                    jce_editor_scene_camera_focus_aabb(bmin, bmax);
             }
         }
 
-        if (ImGui::IsKeyPressed(ImGuiKey_Delete)) {
+        if (jce_hotkey_pressed(JCE_HK_EDIT_DELETE)) {
             int dk = 0;
             const uint32_t *dids = jce_state_get_selection(&dk);
             if (dk > 0) {
@@ -1032,7 +1134,7 @@ static void handle_scene_view_shortcuts(void)
             }
         }
 
-        if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D)) {
+        if (jce_hotkey_pressed(JCE_HK_EDIT_DUPLICATE)) {
             int dk = 0;
             const uint32_t *dids = jce_state_get_selection(&dk);
             if (dk > 0) {
@@ -1279,9 +1381,13 @@ static void draw_scene_overlays_and_pick(const SceneViewCtx *ctx)
     overlay_cam.viewport_origin[0] = ctx->screen_pos.x;
     overlay_cam.viewport_origin[1] = ctx->screen_pos.y;
 
-    draw_scene_helper_icons(ctx->dl, &overlay_cam);
+    if (jce_state_show_flag(JCE_SHOW_FLAG_LIGHT_ICONS) ||
+        jce_state_show_flag(JCE_SHOW_FLAG_CAMERA_ICONS))
+        draw_scene_helper_icons(ctx->dl, &overlay_cam);
 
-    int axis_click = draw_axis_indicator(ctx->dl, ctx->screen_pos, ctx->avail, view_mat);
+    int axis_click = -1;
+    if (jce_state_show_flag(JCE_SHOW_FLAG_WORLD_AXIS))
+        axis_click = draw_axis_indicator(ctx->dl, ctx->screen_pos, ctx->avail, view_mat);
     int cube_click = draw_view_cube(ctx->dl, ctx->screen_pos, ctx->avail, view_mat);
 
     if (axis_click >= 0) {
@@ -1321,8 +1427,62 @@ void jce_editor_panel_scene_view_content(void)
 
     draw_scene_context_menu(&ctx);
     handle_scene_camera_controls(ctx.viewport_hovered);
-    handle_scene_selection_box(&ctx);
-    update_and_draw_scene_gizmo(&ctx);
+
+    /* ── Terrain brush (Phase 2-B.2) ─────────────────────────────
+     *  Active only when the Terrain panel arms it. Steals LMB from
+     *  selection so a click/drag inside the viewport raycasts onto
+     *  the active terrain and applies the current brush at the
+     *  hit point. Plain LMB only — Alt-LMB still orbits the camera. */
+    bool brush_consumed = false;
+    if (ctx.viewport_hovered && jce_terrain_panel_brush_armed() &&
+        !ImGui::GetIO().KeyAlt &&
+        (ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
+         ImGui::IsMouseDown(ImGuiMouseButton_Left)))
+    {
+        float vmat[16], pmat[16], eye[3];
+        if (jce_editor_scene_get_camera_matrices(vmat, pmat, eye,
+                                                 ctx.avail.x, ctx.avail.y)) {
+            JceGizmoCamera cam;
+            memcpy(cam.view, vmat, sizeof vmat);
+            memcpy(cam.proj, pmat, sizeof pmat);
+            memcpy(cam.eye,  eye,  sizeof eye);
+            cam.viewport_size[0]   = ctx.avail.x;
+            cam.viewport_size[1]   = ctx.avail.y;
+            cam.viewport_origin[0] = ctx.screen_pos.x;
+            cam.viewport_origin[1] = ctx.screen_pos.y;
+            ImVec2 m = ImGui::GetMousePos();
+            float ro[3], rd[3];
+            gm_screen_to_ray(&cam, m.x, m.y, ro, rd);
+
+            float hit[3];
+            JceTerrain *terr = jce_terrain_panel_get_terrain();
+            bool got = false;
+            if (terr && jce_terrain_raycast(terr, ro, rd, 10000.0f, hit))
+                got = true;
+            if (!got && fabsf(rd[1]) > 1e-6f) {
+                /* Fallback: hit Y=0 plane. */
+                float t = -ro[1] / rd[1];
+                if (t > 0.0f) {
+                    hit[0] = ro[0] + rd[0] * t;
+                    hit[1] = 0.0f;
+                    hit[2] = ro[2] + rd[2] * t;
+                    got = true;
+                }
+            }
+            if (got) {
+                jce_terrain_panel_apply_brush_world(hit[0], hit[2],
+                                                     ImGui::GetIO().DeltaTime);
+                brush_consumed = true;
+            }
+        }
+    }
+
+    if (!brush_consumed)
+        handle_scene_selection_box(&ctx);
+    else
+        (void)0;
+    if (jce_state_show_flag(JCE_SHOW_FLAG_GIZMOS))
+        update_and_draw_scene_gizmo(&ctx);
 
     if (s_gizmo_history_batch_open && !jce_gizmo_is_active()) {
         jce_state_end_batch_edit();

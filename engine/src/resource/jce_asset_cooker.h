@@ -36,14 +36,14 @@ extern "C" {
 /* ================================================================== */
 
 typedef enum JceCookPlatform {
-	JCE_COOK_PLATFORM_WINDOWS = 0,
-	JCE_COOK_PLATFORM_LINUX   = 1,
-	JCE_COOK_PLATFORM_MACOS   = 2,
-	JCE_COOK_PLATFORM_ANDROID = 3,
-	JCE_COOK_PLATFORM_IOS     = 4,
-	JCE_COOK_PLATFORM_WEB     = 5,
-	JCE_COOK_PLATFORM_AUTO    = 6,
-	JCE_COOK_PLATFORM_COUNT
+    JCE_COOK_PLATFORM_WINDOWS = 0,
+    JCE_COOK_PLATFORM_LINUX   = 1,
+    JCE_COOK_PLATFORM_MACOS   = 2,
+    JCE_COOK_PLATFORM_ANDROID = 3,
+    JCE_COOK_PLATFORM_IOS     = 4,
+    JCE_COOK_PLATFORM_WEB     = 5,
+    JCE_COOK_PLATFORM_AUTO    = 6,
+    JCE_COOK_PLATFORM_COUNT
 } JceCookPlatform;
 
 /* ================================================================== */
@@ -51,30 +51,30 @@ typedef enum JceCookPlatform {
 /* ================================================================== */
 
 typedef struct JceCookOptions {
-	/* ZSTD compression level (0=none, 1-19=normal, 20-22=ultra).
-	   Default: 3. */
-	int compression_level;
+    /* ZSTD compression level (0=none, 1-19=normal, 20-22=ultra).
+       Default: 3. */
+    int compression_level;
 
-	/* For textures: force specific GPU format (JCEASSET_TEXFMT_*).
-	   0 = auto-select based on platform. */
-	int texture_format;
+    /* For textures: force specific GPU format (JCEASSET_TEXFMT_*).
+       0 = auto-select based on platform. */
+    int texture_format;
 
-	/* For textures: generate mipmaps. Default: false. */
-	bool generate_mipmaps;
+    /* For textures: generate mipmaps. Default: false. */
+    bool generate_mipmaps;
 
-	/* For textures: max dimension (width or height) cap.
-	   0 = no cap. Textures exceeding this are downscaled preserving
-	   aspect ratio. Reduces PAK size and runtime memory. */
-	int max_texture_size;
+    /* For textures: max dimension (width or height) cap.
+       0 = no cap. Textures exceeding this are downscaled preserving
+       aspect ratio. Reduces PAK size and runtime memory. */
+    int max_texture_size;
 
-	/* Verbose logging. */
-	bool verbose;
+    /* Verbose logging. */
+    bool verbose;
 
-	/* Target platform for auto-format selection. Default: AUTO. */
-	JceCookPlatform platform;
+    /* Target platform for auto-format selection. Default: AUTO. */
+    JceCookPlatform platform;
 
-	/* Force power-of-two dimensions (pad if needed). Default: false. */
-	bool force_power_of_two;
+    /* Force power-of-two dimensions (pad if needed). Default: false. */
+    bool force_power_of_two;
 } JceCookOptions;
 
 #define JCE_COOK_DEFAULT                                                                           \
@@ -85,10 +85,10 @@ typedef struct JceCookOptions {
 /* ================================================================== */
 
 typedef struct JceCookResult {
-	void  *data;        /* malloc'd .jceasset blob */
-	size_t size;        /* total size in bytes */
-	bool   success;
-	char   error[256];  /* error message if !success */
+    void  *data;        /* malloc'd .jceasset blob */
+    size_t size;        /* total size in bytes */
+    bool   success;
+    char   error[256];  /* error message if !success */
 } JceCookResult;
 
 /* Free the result data. */

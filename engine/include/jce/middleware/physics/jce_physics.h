@@ -33,8 +33,8 @@ typedef struct {
     int32_t  max_sub_steps;    /* default: 4 */
 } JcePhysicsWorldDesc;
 
-JcePhysicsWorld *jce_physics_create(const JcePhysicsWorldDesc *desc);
-void             jce_physics_destroy(JcePhysicsWorld *world);
+JCE_API JcePhysicsWorld *jce_physics_create(const JcePhysicsWorldDesc *desc);
+JCE_API void             jce_physics_destroy(JcePhysicsWorld *world);
 
 /* ================================================================== */
 /* Simulation                                                          */
@@ -42,7 +42,7 @@ void             jce_physics_destroy(JcePhysicsWorld *world);
 
 /* Step the simulation by dt seconds.  Internally accumulates time
    and runs fixed sub-steps of fixed_timestep length. */
-void jce_physics_step(JcePhysicsWorld *world, float dt);
+JCE_API void jce_physics_step(JcePhysicsWorld *world, float dt);
 
 /* ================================================================== */
 /* Rigid bodies                                                        */
@@ -65,8 +65,8 @@ typedef struct {
     bool         is_trigger;      /* trigger bodies: no contact response */
 } JceBodyDesc;
 
-JceBodyHandle jce_physics_body_create(JcePhysicsWorld *world, const JceBodyDesc *desc);
-void          jce_physics_body_destroy(JcePhysicsWorld *world, JceBodyHandle body);
+JCE_API JceBodyHandle jce_physics_body_create(JcePhysicsWorld *world, const JceBodyDesc *desc);
+JCE_API void          jce_physics_body_destroy(JcePhysicsWorld *world, JceBodyHandle body);
 
 /* ================================================================== */
 /* Body state queries                                                  */
@@ -77,19 +77,19 @@ void     jce_physics_body_get_transform(const JcePhysicsWorld *world, JceBodyHan
 void     jce_physics_body_set_transform(JcePhysicsWorld *world, JceBodyHandle body,
                                         jce_vec3 pos, jce_quat rot);
 
-jce_vec3 jce_physics_body_get_velocity(const JcePhysicsWorld *world, JceBodyHandle body);
-void     jce_physics_body_set_velocity(JcePhysicsWorld *world, JceBodyHandle body, jce_vec3 vel);
+JCE_API jce_vec3 jce_physics_body_get_velocity(const JcePhysicsWorld *world, JceBodyHandle body);
+JCE_API void     jce_physics_body_set_velocity(JcePhysicsWorld *world, JceBodyHandle body, jce_vec3 vel);
 
-jce_vec3 jce_physics_body_get_angular_velocity(const JcePhysicsWorld *world, JceBodyHandle body);
-void     jce_physics_body_set_angular_velocity(JcePhysicsWorld *world, JceBodyHandle body, jce_vec3 vel);
+JCE_API jce_vec3 jce_physics_body_get_angular_velocity(const JcePhysicsWorld *world, JceBodyHandle body);
+JCE_API void     jce_physics_body_set_angular_velocity(JcePhysicsWorld *world, JceBodyHandle body, jce_vec3 vel);
 
 /* ================================================================== */
 /* Forces & impulses                                                   */
 /* ================================================================== */
 
-void jce_physics_body_apply_force(JcePhysicsWorld *world, JceBodyHandle body, jce_vec3 force);
-void jce_physics_body_apply_impulse(JcePhysicsWorld *world, JceBodyHandle body, jce_vec3 impulse);
-void jce_physics_body_apply_torque(JcePhysicsWorld *world, JceBodyHandle body, jce_vec3 torque);
+JCE_API void jce_physics_body_apply_force(JcePhysicsWorld *world, JceBodyHandle body, jce_vec3 force);
+JCE_API void jce_physics_body_apply_impulse(JcePhysicsWorld *world, JceBodyHandle body, jce_vec3 impulse);
+JCE_API void jce_physics_body_apply_torque(JcePhysicsWorld *world, JceBodyHandle body, jce_vec3 torque);
 
 /* ================================================================== */
 /* Ray casting                                                         */
@@ -111,15 +111,15 @@ JceRaycastResult jce_physics_raycast(const JcePhysicsWorld *world,
 /* Collision callbacks                                                 */
 /* ================================================================== */
 
-void jce_physics_set_contact_begin(JcePhysicsWorld *world, jce_contact_fn fn, void *userdata);
-void jce_physics_set_contact_end(JcePhysicsWorld *world, jce_contact_fn fn, void *userdata);
+JCE_API void jce_physics_set_contact_begin(JcePhysicsWorld *world, jce_contact_fn fn, void *userdata);
+JCE_API void jce_physics_set_contact_end(JcePhysicsWorld *world, jce_contact_fn fn, void *userdata);
 
 /* ================================================================== */
 /* Debug                                                               */
 /* ================================================================== */
 
 /* Return current body count (active + sleeping). */
-uint32_t jce_physics_body_count(const JcePhysicsWorld *world);
+JCE_API uint32_t jce_physics_body_count(const JcePhysicsWorld *world);
 
 /* ================================================================== */
 /* Collision filters                                                   */

@@ -18,13 +18,13 @@ JCE_EXTERN_C_BEGIN
 /* Acquire the global process lock for the given app name.
  * Returns true when lock is acquired, false when another instance is running
  * (or when lock acquisition fails). */
-bool jce_single_instance_lock(const char *app_name);
+JCE_API bool jce_single_instance_lock(const char *app_name);
 
 /* Release the global process lock if held by this process. */
-void jce_single_instance_unlock(void);
+JCE_API void jce_single_instance_unlock(void);
 
 /* Query whether this process currently owns the lock. */
-bool jce_single_instance_is_locked(void);
+JCE_API bool jce_single_instance_is_locked(void);
 
 JCE_EXTERN_C_END
 

@@ -31,10 +31,10 @@ typedef struct JceSysInfo {
 } JceSysInfo;
 
 /* Collect static info and initialize internal state. */
-void jce_sysinfo_init(JceSysInfo *info);
+JCE_API void jce_sysinfo_init(JceSysInfo *info);
 
 /* Update dynamic info. Call roughly once per second. */
-void jce_sysinfo_update(JceSysInfo *info);
+JCE_API void jce_sysinfo_update(JceSysInfo *info);
 
 JCE_EXTERN_C_END
 

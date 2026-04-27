@@ -78,8 +78,8 @@ static inline bool jce_emitter_valid(JceEmitterHandle h) { return h.idx != UINT3
 
 typedef struct JceParticleSystem JceParticleSystem;
 
-JceParticleSystem *jce_particles_create(jce_allocator_t alloc);
-void               jce_particles_destroy(JceParticleSystem *sys);
+JCE_API JceParticleSystem *jce_particles_create(jce_allocator_t alloc);
+JCE_API void               jce_particles_destroy(JceParticleSystem *sys);
 
 /* ================================================================== */
 /* Emitter management                                                  */
@@ -92,8 +92,8 @@ void             jce_particles_emitter_remove(JceParticleSystem *sys,
 
 /* Start / stop emission.  Stopping lets existing particles live out
    their lifetime; remove kills them immediately. */
-void jce_particles_emitter_start(JceParticleSystem *sys, JceEmitterHandle emitter);
-void jce_particles_emitter_stop(JceParticleSystem *sys, JceEmitterHandle emitter);
+JCE_API void jce_particles_emitter_start(JceParticleSystem *sys, JceEmitterHandle emitter);
+JCE_API void jce_particles_emitter_stop(JceParticleSystem *sys, JceEmitterHandle emitter);
 
 /* Move the emitter origin (only matters when world_space = false). */
 void jce_particles_emitter_set_position(JceParticleSystem *sys,
@@ -108,10 +108,10 @@ void jce_particles_emitter_burst(JceParticleSystem *sys,
 /* ================================================================== */
 
 /* Simulate all alive particles (spawn, move, age, kill). */
-void jce_particles_update(JceParticleSystem *sys, float dt);
+JCE_API void jce_particles_update(JceParticleSystem *sys, float dt);
 
 /* Return total alive particle count across all emitters. */
-uint32_t jce_particles_alive_count(const JceParticleSystem *sys);
+JCE_API uint32_t jce_particles_alive_count(const JceParticleSystem *sys);
 
 JCE_EXTERN_C_END
 

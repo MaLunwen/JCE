@@ -33,7 +33,7 @@ JCE_EXTERN_C_BEGIN
  * The JCE_MAIN() macro below generates it by forwarding to a
  * user-named factory.  Defining it manually is also legal.
  */
-JceAppDesc jce_app_get_desc(void);
+JCE_API JceAppDesc jce_app_get_desc(void);
 
 JCE_EXTERN_C_END
 

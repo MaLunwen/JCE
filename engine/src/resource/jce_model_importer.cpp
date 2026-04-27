@@ -1,16 +1,16 @@
 /*
- * jce_model_loader_assimp.cpp  Model loading via assimp (editor-only).
+ * jce_model_importer.cpp  Model loading via assimp (engine layer).
  *
- * Uses assimp's C++ interface to load models from PAK assets.
+ * Uses assimp's C++ interface to load models from disk or PAK assets.
  * Supports all assimp-supported formats: OBJ, FBX, 3DS, glTF, etc.
  */
 
-#include "jce_model_loader_assimp.h"
+#include <jce/resource/jce_model_importer.h>
 
-#include "io/jce_editor_file_util.h"
-#include "jce_editor_alloc.h"
+#include <jce/os/core/jce_filesystem.h>
 
 extern "C" {
+#include "os/core/jce_memory.h"
 #include <jce/os/core/jce_log.h>
 }
 
@@ -26,7 +26,7 @@ extern "C" {
 
 namespace fs = std::filesystem;
 
-#define LOG_TAG "editor_model"
+#define LOG_TAG "model_importer"
 
 /*
  * Convert an absolute (or any) path to a CWD-relative path.
@@ -46,18 +46,18 @@ static std::string to_cwd_relative(const std::string &p)
 
 extern "C" {
 
-void jce_editor_model_free_cpu_data(JceEditorCpuMeshData *data)
+void jce_model_importer_free_cpu(JceModelCpuMeshData *data)
 {
     if (!data) return;
-    ED_FREE(data->vertices);
-    ED_FREE(data->indices);
+    JCE_FREE(data->vertices);
+    JCE_FREE(data->indices);
     data->vertices = nullptr;
     data->indices = nullptr;
     data->vertex_count = 0;
     data->index_count = 0;
 }
 
-static bool build_cpu_mesh_data(const aiScene *scene, JceEditorCpuMeshData *out)
+static bool build_cpu_mesh_data(const aiScene *scene, JceModelCpuMeshData *out)
 {
     if (!scene || scene->mNumMeshes == 0 || !out) return false;
 
@@ -80,14 +80,14 @@ static bool build_cpu_mesh_data(const aiScene *scene, JceEditorCpuMeshData *out)
     if (total_verts == 0) return false;
 
     auto *verts = static_cast<JceMeshVertex *>(
-        ED_CALLOC(total_verts, sizeof(JceMeshVertex)));
+        JCE_CALLOC(total_verts, sizeof(JceMeshVertex)));
     auto *indices = (total_indices > 0)
-        ? static_cast<uint32_t *>(ED_MALLOC(
+        ? static_cast<uint32_t *>(JCE_MALLOC(
             static_cast<size_t>(total_indices) * sizeof(uint32_t)))
         : nullptr;
     if (!verts || (total_indices > 0 && !indices)) {
-        ED_FREE(verts);
-        ED_FREE(indices);
+        JCE_FREE(verts);
+        JCE_FREE(indices);
         return false;
     }
 
@@ -141,18 +141,18 @@ static bool build_cpu_mesh_data(const aiScene *scene, JceEditorCpuMeshData *out)
 /* Merge all meshes in the scene into a single JceMesh. */
 static JceMesh *convert_all_meshes(const aiScene *scene)
 {
-    JceEditorCpuMeshData cpu = {};
+    JceModelCpuMeshData cpu = {};
     if (!build_cpu_mesh_data(scene, &cpu))
         return nullptr;
 
     JceMesh *mesh = jce_mesh_create(cpu.vertices, cpu.vertex_count,
                                     cpu.indices, cpu.index_count);
-    jce_editor_model_free_cpu_data(&cpu);
+    jce_model_importer_free_cpu(&cpu);
     return mesh;
 }
 
-bool jce_editor_model_load_cpu_file(const char *file_path,
-                                    JceEditorCpuMeshData *out)
+bool jce_model_importer_load_cpu_file(const char *file_path,
+                                    JceModelCpuMeshData *out)
 {
     if (!file_path || file_path[0] == '\0' || !out) return false;
 
@@ -186,7 +186,7 @@ bool jce_editor_model_load_cpu_file(const char *file_path,
     return true;
 }
 
-JceMesh *jce_editor_model_load(const JcePakArchive *pak, const char *asset_path)
+JceMesh *jce_model_importer_load_pak(const JcePakArchive *pak, const char *asset_path)
 {
     if (!pak || !asset_path) return nullptr;
 
@@ -196,13 +196,13 @@ JceMesh *jce_editor_model_load(const JcePakArchive *pak, const char *asset_path)
         return nullptr;
     }
 
-    void *buf = ED_MALLOC(static_cast<size_t>(asset->original_size));
+    void *buf = JCE_MALLOC(static_cast<size_t>(asset->original_size));
     if (!buf) return nullptr;
 
     size_t n = jce_pak_decompress(asset, buf, static_cast<size_t>(asset->original_size));
     if (n == 0) {
         LOG_ERROR(LOG_TAG, "decompression failed: %s", asset_path);
-        ED_FREE(buf);
+        JCE_FREE(buf);
         return nullptr;
     }
 
@@ -221,7 +221,7 @@ JceMesh *jce_editor_model_load(const JcePakArchive *pak, const char *asset_path)
         | aiProcess_PreTransformVertices,
         ext);
 
-    ED_FREE(buf);
+    JCE_FREE(buf);
 
     if (!scene || !scene->mNumMeshes) {
         LOG_ERROR(LOG_TAG, "assimp failed: %s  %s",
@@ -240,7 +240,7 @@ JceMesh *jce_editor_model_load(const JcePakArchive *pak, const char *asset_path)
     return mesh;
 }
 
-JceMesh *jce_editor_model_load_file(const char *file_path)
+JceMesh *jce_model_importer_load_file(const char *file_path)
 {
     if (!file_path || file_path[0] == '\0') return nullptr;
 
@@ -398,7 +398,7 @@ static bool write_embedded_texture(const aiTexture *tex,
 
     if (tex->mHeight == 0) {
         /* Compressed data (e.g. PNG/JPG stored as-is). */
-        if (!ed_write_file(full.c_str(), tex->pcData, tex->mWidth))
+        if (!jce_fs_host_write_all(full.c_str(), tex->pcData, tex->mWidth))
             return false;
     } else {
         /* Uncompressed ARGB8888 — write as raw RGBA TGA for simplicity.
@@ -420,7 +420,7 @@ static bool write_embedded_texture(const aiTexture *tex,
         full = dir + fname;
 
         size_t total = sizeof(tga_header) + pixel_count * 4;
-        uint8_t *blob = (uint8_t *)ED_MALLOC(total);
+        uint8_t *blob = (uint8_t *)JCE_MALLOC(total);
         if (!blob) return false;
         memcpy(blob, tga_header, sizeof(tga_header));
 
@@ -434,8 +434,8 @@ static bool write_embedded_texture(const aiTexture *tex,
             dst[i * 4 + 3] = src[i].a;
         }
 
-        bool ok = ed_write_file(full.c_str(), blob, total);
-        ED_FREE(blob);
+        bool ok = jce_fs_host_write_all(full.c_str(), blob, total);
+        JCE_FREE(blob);
         if (!ok) return false;
     }
 
@@ -451,7 +451,7 @@ static bool write_embedded_texture(const aiTexture *tex,
  */
 static void resolve_embedded_textures(const aiScene *scene,
                                       const char *model_path,
-                                      JceEditorMaterialInfo *out)
+                                      JceModelMaterialInfo *out)
 {
     auto try_resolve = [&](char *path, size_t sz) {
         if (path[0] != '*') return;
@@ -476,8 +476,8 @@ static void resolve_embedded_textures(const aiScene *scene,
     try_resolve(out->emissive_tex, sizeof(out->emissive_tex));
 }
 
-bool jce_editor_model_extract_material(const char *file_path,
-                                       JceEditorMaterialInfo *out)
+bool jce_model_importer_extract_material(const char *file_path,
+                                       JceModelMaterialInfo *out)
 {
     if (!file_path || file_path[0] == '\0' || !out) return false;
 
@@ -596,6 +596,178 @@ bool jce_editor_model_extract_material(const char *file_path,
               file_path, out->albedo_tex, out->normal_tex, out->mr_tex,
               out->metallic, out->roughness);
     return true;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ *  INSPECTOR API
+ * ══════════════════════════════════════════════════════════════════════ */
+
+static constexpr unsigned INSPECT_FLAGS =
+    aiProcess_Triangulate
+    | aiProcess_JoinIdenticalVertices
+    | aiProcess_GenSmoothNormals
+    | aiProcess_ImproveCacheLocality;
+
+static bool fill_inspect(const aiScene *scene, bool want_wireframe,
+                         JceModelInspectResult *out)
+{
+    out->mesh_count     = (int)scene->mNumMeshes;
+    out->material_count = (int)scene->mNumMaterials;
+
+    /* Material names. */
+    if (scene->mNumMaterials > 0) {
+        out->material_names = (char **)JCE_CALLOC(scene->mNumMaterials, sizeof(char *));
+        if (!out->material_names) {
+            snprintf(out->error, sizeof(out->error), "out of memory");
+            return false;
+        }
+        for (unsigned i = 0; i < scene->mNumMaterials; i++) {
+            const aiMaterial *mat = scene->mMaterials[i];
+            aiString name;
+            char     buf[128];
+            if (mat && mat->Get(AI_MATKEY_NAME, name) == AI_SUCCESS && name.length > 0)
+                snprintf(buf, sizeof(buf), "%s", name.C_Str());
+            else
+                snprintf(buf, sizeof(buf), "Material %u", i);
+            size_t len           = strlen(buf) + 1;
+            char  *copy          = (char *)JCE_MALLOC(len);
+            if (copy) memcpy(copy, buf, len);
+            out->material_names[i] = copy;
+        }
+    }
+
+    /* Vertex/face totals + bounds. */
+    int total_verts = 0, total_faces = 0;
+    float minx =  1e30f, miny =  1e30f, minz =  1e30f;
+    float maxx = -1e30f, maxy = -1e30f, maxz = -1e30f;
+    for (unsigned m = 0; m < scene->mNumMeshes; m++) {
+        const aiMesh *mesh = scene->mMeshes[m];
+        if (!mesh) continue;
+        total_verts += (int)mesh->mNumVertices;
+        total_faces += (int)mesh->mNumFaces;
+        for (unsigned v = 0; v < mesh->mNumVertices; v++) {
+            float x = mesh->mVertices[v].x;
+            float y = mesh->mVertices[v].y;
+            float z = mesh->mVertices[v].z;
+            if (x < minx) minx = x; if (x > maxx) maxx = x;
+            if (y < miny) miny = y; if (y > maxy) maxy = y;
+            if (z < minz) minz = z; if (z > maxz) maxz = z;
+        }
+    }
+    out->vertex_count   = total_verts;
+    out->face_count     = total_faces;
+    out->bounds_min[0]  = minx; out->bounds_min[1] = miny; out->bounds_min[2] = minz;
+    out->bounds_max[0]  = maxx; out->bounds_max[1] = maxy; out->bounds_max[2] = maxz;
+
+    if (!want_wireframe || total_verts <= 0)
+        return true;
+
+    /* Flat vertex/face arrays. */
+    out->vertices_xyz = (float *)JCE_MALLOC((size_t)total_verts * 3 * sizeof(float));
+    out->face_sizes   = (int   *)JCE_MALLOC((size_t)total_faces * sizeof(int));
+    if (!out->vertices_xyz || !out->face_sizes) {
+        snprintf(out->error, sizeof(out->error), "out of memory");
+        return false;
+    }
+
+    int total_face_idx = 0;
+    for (unsigned m = 0; m < scene->mNumMeshes; m++) {
+        const aiMesh *mesh = scene->mMeshes[m];
+        if (!mesh) continue;
+        for (unsigned f = 0; f < mesh->mNumFaces; f++)
+            total_face_idx += (int)mesh->mFaces[f].mNumIndices;
+    }
+    out->face_indices = (int *)JCE_MALLOC((size_t)total_face_idx * sizeof(int));
+    if (!out->face_indices && total_face_idx > 0) {
+        snprintf(out->error, sizeof(out->error), "out of memory");
+        return false;
+    }
+
+    int vi = 0, fi = 0, fii = 0, vert_base = 0, face_idx = 0;
+    for (unsigned m = 0; m < scene->mNumMeshes; m++) {
+        const aiMesh *mesh = scene->mMeshes[m];
+        if (!mesh) continue;
+        for (unsigned v = 0; v < mesh->mNumVertices; v++) {
+            out->vertices_xyz[vi++] = mesh->mVertices[v].x;
+            out->vertices_xyz[vi++] = mesh->mVertices[v].y;
+            out->vertices_xyz[vi++] = mesh->mVertices[v].z;
+        }
+        for (unsigned f = 0; f < mesh->mNumFaces; f++) {
+            const aiFace &face = mesh->mFaces[f];
+            if (face.mNumIndices < 2) {
+                out->face_sizes[face_idx++] = 0;
+                continue;
+            }
+            out->face_sizes[face_idx++] = (int)face.mNumIndices;
+            for (unsigned k = 0; k < face.mNumIndices; k++)
+                out->face_indices[fii++] = (int)face.mIndices[k] + vert_base;
+            fi++;
+        }
+        vert_base += (int)mesh->mNumVertices;
+    }
+    out->face_indices_count = fii;
+    return true;
+}
+
+bool jce_model_importer_inspect_memory(const void *data, size_t size,
+                                       const char *ext_hint,
+                                       bool        want_wireframe,
+                                       JceModelInspectResult *out)
+{
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (!data || size == 0) {
+        snprintf(out->error, sizeof(out->error), "empty model content");
+        return false;
+    }
+    Assimp::Importer imp;
+    const aiScene *scene = imp.ReadFileFromMemory(data, size, INSPECT_FLAGS,
+                                                  ext_hint ? ext_hint : "");
+    if (!scene || scene->mNumMeshes == 0) {
+        const char *err = imp.GetErrorString();
+        snprintf(out->error, sizeof(out->error),
+                 "assimp: %s", err && err[0] ? err : "unknown error");
+        return false;
+    }
+    return fill_inspect(scene, want_wireframe, out);
+}
+
+bool jce_model_importer_inspect_file(const char *file_path,
+                                     bool        want_wireframe,
+                                     JceModelInspectResult *out)
+{
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (!file_path || !file_path[0]) {
+        snprintf(out->error, sizeof(out->error), "empty file path");
+        return false;
+    }
+    Assimp::Importer imp;
+    const aiScene *scene = imp.ReadFile(file_path, INSPECT_FLAGS);
+    if (!scene || scene->mNumMeshes == 0) {
+        const char *err = imp.GetErrorString();
+        snprintf(out->error, sizeof(out->error),
+                 "assimp: %s", err && err[0] ? err : "unknown error");
+        return false;
+    }
+    return fill_inspect(scene, want_wireframe, out);
+}
+
+void jce_model_importer_free_inspect(JceModelInspectResult *r)
+{
+    if (!r) return;
+    if (r->material_names) {
+        for (int i = 0; i < r->material_count; i++)
+            if (r->material_names[i]) JCE_FREE(r->material_names[i]);
+        JCE_FREE(r->material_names);
+    }
+    if (r->vertices_xyz) JCE_FREE(r->vertices_xyz);
+    if (r->face_indices) JCE_FREE(r->face_indices);
+    if (r->face_sizes)   JCE_FREE(r->face_sizes);
+    r->material_names = nullptr;
+    r->vertices_xyz   = nullptr;
+    r->face_indices   = nullptr;
+    r->face_sizes     = nullptr;
 }
 
 } /* extern "C" */

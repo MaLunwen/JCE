@@ -8,6 +8,10 @@
 #ifndef JCE_API_APP_H
 #define JCE_API_APP_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <jce/application/jce_app_interface.h>
 #include <jce/application/jce_camera_controller.h>
 #include <jce/application/jce_config.h>
@@ -20,4 +24,9 @@
  * via the JCE_MAIN() macro — it must be included in exactly ONE .c file
  * (the application entry point), never from an umbrella header. */
 
+
+
+#ifdef __cplusplus
+}
+#endif
 #endif /* JCE_API_APP_H */

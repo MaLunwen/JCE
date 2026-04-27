@@ -24,7 +24,7 @@ JCE_EXTERN_C_BEGIN
 
 typedef struct JceMutex JceMutex;
 
-JceMutex *jce_mutex_create(void);
+JCE_API JceMutex *jce_mutex_create(void);
 JCE_API void JCE_CALL jce_mutex_destroy(JceMutex *m);
 JCE_API void JCE_CALL jce_mutex_lock(JceMutex *m);
 JCE_API void JCE_CALL jce_mutex_unlock(JceMutex *m);
@@ -35,7 +35,7 @@ JCE_API void JCE_CALL jce_mutex_unlock(JceMutex *m);
 
 typedef struct JceCondVar JceCondVar;
 
-JceCondVar *jce_cond_create(void);
+JCE_API JceCondVar *jce_cond_create(void);
 JCE_API void JCE_CALL jce_cond_destroy(JceCondVar *c);
 JCE_API void JCE_CALL jce_cond_wait(JceCondVar *c, JceMutex *m);
 JCE_API void JCE_CALL jce_cond_signal(JceCondVar *c);
@@ -55,7 +55,7 @@ typedef void (*JceThreadFn)(void *arg);
 
 /* Spawn a dedicated OS thread. `name` is optional (debug label).
    Returns NULL on failure. */
-JceThread *jce_thread_create(JceThreadFn fn, void *arg, const char *name);
+JCE_API JceThread *jce_thread_create(JceThreadFn fn, void *arg, const char *name);
 
 /* Block until the thread function returns; releases all resources.
    Must be called exactly once per JceThread. */
@@ -76,14 +76,14 @@ JCE_API void JCE_CALL jce_thread_sleep_ms(uint32_t ms);
 typedef struct JceAtomicI32 JceAtomicI32;
 typedef struct JceAtomicU64 JceAtomicU64;
 
-JceAtomicI32 *jce_atomic_i32_create(int32_t initial);
+JCE_API JceAtomicI32 *jce_atomic_i32_create(int32_t initial);
 JCE_API void JCE_CALL jce_atomic_i32_destroy(JceAtomicI32 *a);
 JCE_API int32_t JCE_CALL jce_atomic_i32_load(const JceAtomicI32 *a);
 JCE_API void JCE_CALL jce_atomic_i32_store(JceAtomicI32 *a, int32_t v);
 JCE_API int32_t JCE_CALL jce_atomic_i32_exchange(JceAtomicI32 *a, int32_t v);
 JCE_API int32_t JCE_CALL jce_atomic_i32_add(JceAtomicI32 *a, int32_t v); /* returns previous */
 
-JceAtomicU64 *jce_atomic_u64_create(uint64_t initial);
+JCE_API JceAtomicU64 *jce_atomic_u64_create(uint64_t initial);
 JCE_API void JCE_CALL jce_atomic_u64_destroy(JceAtomicU64 *a);
 JCE_API uint64_t JCE_CALL jce_atomic_u64_load(const JceAtomicU64 *a);
 JCE_API void JCE_CALL jce_atomic_u64_store(JceAtomicU64 *a, uint64_t v);
@@ -95,7 +95,7 @@ JCE_API uint64_t JCE_CALL jce_atomic_u64_add(JceAtomicU64 *a, uint64_t v); /* re
 
 typedef struct JceSemaphore JceSemaphore;
 
-JceSemaphore *jce_semaphore_create(uint32_t initial);
+JCE_API JceSemaphore *jce_semaphore_create(uint32_t initial);
 JCE_API void JCE_CALL jce_semaphore_destroy(JceSemaphore *s);
 JCE_API void JCE_CALL jce_semaphore_signal(JceSemaphore *s);
 JCE_API void JCE_CALL jce_semaphore_wait(JceSemaphore *s);
@@ -112,7 +112,7 @@ typedef struct JceThreadPool JceThreadPool;
 typedef void (*JceTaskFn)(void *arg);
 
 /* Create a pool with num_threads workers (0 = auto-detect CPU cores). */
-JceThreadPool *jce_thread_pool_create(int num_threads);
+JCE_API JceThreadPool *jce_thread_pool_create(int num_threads);
 
 /* Wait for all pending tasks to finish, then destroy the pool. */
 JCE_API void JCE_CALL jce_thread_pool_destroy(JceThreadPool *pool);

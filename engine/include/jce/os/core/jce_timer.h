@@ -21,7 +21,7 @@ typedef struct JceTimer JceTimer;
 /* Create a timer with the given fixed timestep (seconds).
    Typical values: 1.0/60.0 for 60 Hz, 1.0/120.0 for 120 Hz.
    Pass 0.0 for variable timestep (no fixed-step accumulation). */
-JceTimer *jce_timer_create(double fixed_dt);
+JCE_API JceTimer *jce_timer_create(double fixed_dt);
 
 /* Destroy a timer. */
 JCE_API void JCE_CALL jce_timer_destroy(JceTimer *t);

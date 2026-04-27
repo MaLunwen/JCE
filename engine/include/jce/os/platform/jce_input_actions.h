@@ -54,8 +54,8 @@ typedef struct {
 /* Lifecycle                                                           */
 /* ================================================================== */
 
-JceInputActions *jce_actions_create(void);
-void             jce_actions_destroy(JceInputActions *a);
+JCE_API JceInputActions *jce_actions_create(void);
+JCE_API void             jce_actions_destroy(JceInputActions *a);
 
 /* ================================================================== */
 /* Action registration                                                 */
@@ -64,7 +64,7 @@ void             jce_actions_destroy(JceInputActions *a);
 /* Register a named action. Returns the action ID (0-based index).
    Returns -1 if the name already exists or table is full.
    Names are copied internally. */
-int  jce_action_register(JceInputActions *a, const char *name);
+JCE_API int  jce_action_register(JceInputActions *a, const char *name);
 
 /* Bind a physical input to an action. Up to JCE_ACTION_MAX_BINDS per action.
    Returns true on success. */
@@ -72,10 +72,10 @@ bool jce_action_bind(JceInputActions *a, int action_id,
                       const JceBinding *binding);
 
 /* Unbind all bindings for an action. */
-void jce_action_unbind_all(JceInputActions *a, int action_id);
+JCE_API void jce_action_unbind_all(JceInputActions *a, int action_id);
 
 /* Look up action ID by name. Returns -1 if not found. */
-int  jce_action_find(const JceInputActions *a, const char *name);
+JCE_API int  jce_action_find(const JceInputActions *a, const char *name);
 
 /* ================================================================== */
 /* Per-frame update                                                    */
@@ -83,23 +83,23 @@ int  jce_action_find(const JceInputActions *a, const char *name);
 
 /* Read current input state and update all action values.
    Call once per frame after jce_input_handle_event. */
-void jce_actions_update(JceInputActions *a, const JceInput *input);
+JCE_API void jce_actions_update(JceInputActions *a, const JceInput *input);
 
 /* ================================================================== */
 /* Queries                                                             */
 /* ================================================================== */
 
 /* Action value this frame (-1.0 to 1.0; keys give 0 or scale). */
-float jce_action_value(const JceInputActions *a, int action_id);
+JCE_API float jce_action_value(const JceInputActions *a, int action_id);
 
 /* True if action transitioned from inactive to active this frame. */
-bool  jce_action_pressed(const JceInputActions *a, int action_id);
+JCE_API bool  jce_action_pressed(const JceInputActions *a, int action_id);
 
 /* True if action is currently active (value != 0). */
-bool  jce_action_down(const JceInputActions *a, int action_id);
+JCE_API bool  jce_action_down(const JceInputActions *a, int action_id);
 
 /* True if action transitioned from active to inactive this frame. */
-bool  jce_action_released(const JceInputActions *a, int action_id);
+JCE_API bool  jce_action_released(const JceInputActions *a, int action_id);
 
 /* ================================================================== */
 /* Helper: register default FPS bindings                               */
@@ -109,7 +109,7 @@ bool  jce_action_released(const JceInputActions *a, int action_id);
  *   "move_forward", "move_back", "move_left", "move_right",
  *   "move_up", "move_down", "sprint", "look_x", "look_y"
  * Returns the first action ID (they are contiguous). */
-int jce_actions_bind_fps_defaults(JceInputActions *a);
+JCE_API int jce_actions_bind_fps_defaults(JceInputActions *a);
 
 JCE_EXTERN_C_END
 

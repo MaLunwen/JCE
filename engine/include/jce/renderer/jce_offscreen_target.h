@@ -23,7 +23,7 @@ typedef struct JceOffscreenTarget JceOffscreenTarget;
  * view_id=0 uses JCE_VIEW_EDITOR_SCENE. */
 JceOffscreenTarget *jce_offscreen_target_create(JceRenderer *renderer,
                                                        uint16_t view_id);
-void jce_offscreen_target_destroy(JceOffscreenTarget *bridge);
+JCE_API void jce_offscreen_target_destroy(JceOffscreenTarget *bridge);
 
 /* Ensure render target exists at width/height and configure the view.
  * Returns false if target allocation or setup fails. */
@@ -38,7 +38,7 @@ bool jce_offscreen_target_prepare(JceOffscreenTarget *bridge,
 /* Query bridge-owned texture/view handles for panel integration. */
 uint16_t jce_offscreen_target_get_color_texture(
     const JceOffscreenTarget *bridge);
-uint16_t jce_offscreen_target_get_view_id(const JceOffscreenTarget *bridge);
+JCE_API uint16_t jce_offscreen_target_get_view_id(const JceOffscreenTarget *bridge);
 
 JCE_EXTERN_C_END
 

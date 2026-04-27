@@ -9,6 +9,10 @@
 #ifndef JCE_API_GRAPHICS_H
 #define JCE_API_GRAPHICS_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <jce/renderer/jce_camera.h>
 #include <jce/renderer/jce_gfx_types.h>
 #include <jce/renderer/jce_lighting.h>
@@ -27,4 +31,9 @@
 #include <jce/renderer/jce_texture_types.h>
 #include <jce/renderer/jce_views.h>
 
+
+
+#ifdef __cplusplus
+}
+#endif
 #endif /* JCE_API_GRAPHICS_H */

@@ -8,27 +8,24 @@
  *   jce_fv_hex.cpp    — Hex dump + Scene viewer
  */
 
-#include "jce_editor_file_util.h"
-#include "jce_editor_state.h"
+#include "io/jce_editor_file_util.h"
+#include "core/jce_editor_state.h"
 #include "viewers/jce_fv_common.h"
 
-#include <imgui_internal.h>
-
+#include <jce/tools/jce_imgui_internal.h>
 #include <filesystem>
 #include <string>
 #include <vector>
 
 extern "C" {
+#include <jce/os/core/jce_filesystem.h>
 #include <jce/os/platform/jce_host_shell.h>
 #include <jce/renderer/jce_image.h>
+#include <jce/renderer/jce_lowlevel.h>
 #include <jce/renderer/jce_pbr_material.h>
-
-#include <SDL3/SDL_iostream.h>
-#include <SDL3/SDL_surface.h>
-#include <SDL3_image/SDL_image.h>
+#include <jce/resource/jce_image_decode.h>
 }
 
-#include <bgfx/c99/bgfx.h>
 #include <math.h>
 
 #define LOG_TAG "file_viewer"
@@ -408,86 +405,47 @@ void jce_file_viewer_open(const char *path)
 
     /* Load GPU texture for images. */
     if (ftype == JCE_FV_IMAGE && actually_read > 0) {
-        SDL_IOStream *io = SDL_IOFromConstMem(buf, (size_t)actually_read);
-        SDL_Surface *surf = NULL;
-        if (io) {
-            surf = IMG_Load_IO(io, true);
+        JceImage img;
+        bool decoded = false;
+
+        /* Try generic LDR decode (PNG/JPG/BMP/TGA/GIF/PSD/PIC/PNM/HDR8). */
+        if (jce_image_decode(buf, (size_t)actually_read, &img)) {
+            decoded = true;
         }
 
-        /* stb_image fallback for HDR files — SDL3_image has no HDR codec. */
-        if (!surf && ext && strcmp(ext, ".hdr") == 0) {
-            int hdr_w = 0, hdr_h = 0, hdr_ch = 0;
-            float *hdr_pixels =
-                jce_image_load_hdr_from_memory(buf, (uint64_t)actually_read, &hdr_w, &hdr_h);
-            (void)hdr_ch;
-            if (hdr_pixels && hdr_w > 0 && hdr_h > 0) {
-                /* Tone-map float HDR → RGBA32 for preview. */
-                surf = SDL_CreateSurface(hdr_w, hdr_h, SDL_PIXELFORMAT_RGBA32);
-                if (surf) {
-                    const float *src = hdr_pixels;
-                    uint8_t *dst = (uint8_t *)surf->pixels;
-                    int npx = hdr_w * hdr_h;
-                    for (int px = 0; px < npx; px++) {
-                        for (int ch = 0; ch < 3; ch++) {
-                            float v = src[px * 4 + ch];
-                            v = v / (v + 1.0f); /* Reinhard tone-map */
-                            v = powf(v, 1.0f / 2.2f); /* gamma */
-                            int iv = (int)(v * 255.0f + 0.5f);
-                            if (iv > 255) iv = 255;
-                            if (iv < 0) iv = 0;
-                            dst[px * 4 + ch] = (uint8_t)iv;
-                        }
-                        dst[px * 4 + 3] = 255;
+        /* Float HDR fallback for .hdr (Radiance) — tone-map to RGBA8 for preview. */
+        if (!decoded && ext && strcmp(ext, ".hdr") == 0) {
+            int hdr_w = 0, hdr_h = 0;
+            float *hdr_pixels = jce_image_load_hdr_from_memory(
+                buf, (uint64_t)actually_read, &hdr_w, &hdr_h);
+            if (hdr_pixels && hdr_w > 0 && hdr_h > 0
+                && jce_image_create_blank((uint32_t)hdr_w, (uint32_t)hdr_h, &img)) {
+                const float *src = hdr_pixels;
+                uint8_t *dst = img.pixels;
+                int npx = hdr_w * hdr_h;
+                for (int px = 0; px < npx; px++) {
+                    for (int ch = 0; ch < 3; ch++) {
+                        float v = src[px * 4 + ch];
+                        v = v / (v + 1.0f);              /* Reinhard */
+                        v = powf(v, 1.0f / 2.2f);        /* gamma */
+                        int iv = (int)(v * 255.0f + 0.5f);
+                        if (iv > 255) iv = 255;
+                        if (iv < 0) iv = 0;
+                        dst[px * 4 + ch] = (uint8_t)iv;
                     }
+                    dst[px * 4 + 3] = 255;
                 }
-                jce_image_free_hdr(hdr_pixels);
-            } else if (hdr_pixels) {
-                jce_image_free_hdr(hdr_pixels);
+                decoded = true;
             }
+            if (hdr_pixels) jce_image_free_hdr(hdr_pixels);
         }
-        /* HDR files produce float surfaces — tone-map to RGBA32 for preview. */
-        else if (surf && (surf->format == SDL_PIXELFORMAT_RGBA128_FLOAT ||
-                          surf->format == SDL_PIXELFORMAT_RGB96_FLOAT)) {
-            SDL_Surface *fsurf = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA128_FLOAT);
-            SDL_DestroySurface(surf);
-            surf = NULL;
-            if (fsurf) {
-                SDL_Surface *sdr = SDL_CreateSurface(fsurf->w, fsurf->h, SDL_PIXELFORMAT_RGBA32);
-                if (sdr) {
-                    const float *src = (const float *)fsurf->pixels;
-                    uint8_t *dst = (uint8_t *)sdr->pixels;
-                    int npx = fsurf->w * fsurf->h;
-                    for (int px = 0; px < npx; px++) {
-                        for (int ch = 0; ch < 3; ch++) {
-                            float v = src[px * 4 + ch];
-                            v = v / (v + 1.0f); /* Reinhard tone-map */
-                            v = powf(v, 1.0f / 2.2f); /* gamma */
-                            int iv = (int)(v * 255.0f + 0.5f);
-                            if (iv > 255) iv = 255;
-                            if (iv < 0) iv = 0;
-                            dst[px * 4 + ch] = (uint8_t)iv;
-                        }
-                        dst[px * 4 + 3] = 255;
-                    }
-                    surf = sdr;
-                }
-                SDL_DestroySurface(fsurf);
-            }
-        }
-        /* Ensure RGBA32 — IMG_Load_IO may return RGB24 for images
-           without alpha (e.g. normal maps).  texture_from_surface_ex()
-           in jce_texture.c assumes 4 bytes/pixel, so feeding it an
-           RGB24 surface causes a stride mismatch → colored stripes. */
-        else if (surf && surf->format != SDL_PIXELFORMAT_RGBA32) {
-            SDL_Surface *conv = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA32);
-            SDL_DestroySurface(surf);
-            surf = conv;
-        }
-        if (surf) {
-            tab->img_w   = surf->w;
-            tab->img_h   = surf->h;
-            tab->gpu_tex = jce_texture_load_from_surface(surf, JCE_TEX_CLAMP);
-            SDL_DestroySurface(surf);
+
+        if (decoded) {
+            tab->img_w   = (int)img.width;
+            tab->img_h   = (int)img.height;
+            tab->gpu_tex = jce_texture_from_rgba(img.pixels,
+                                                 img.width, img.height);
+            jce_image_free(&img);
 
             /* Default zoom: fit in ~512px. */
             if (tab->img_w > 0 && tab->img_h > 0) {
@@ -500,23 +458,22 @@ void jce_file_viewer_open(const char *path)
             LOG_INFO(LOG_TAG, "loaded image %dx%d tex=%u",
                      tab->img_w, tab->img_h, tab->gpu_tex.idx);
         } else {
-            LOG_WARN(LOG_TAG, "image load failed for '%s': %s",
-                     name, SDL_GetError());
+            LOG_WARN(LOG_TAG, "image decode failed for '%s'", name);
         }
 
         /* Fallback for DDS/KTX/KTX2: bgfx natively decodes these
-         * container formats via bgfx_create_texture(). */
+         * container formats via jce_texture_create_from_encoded(). */
         if (!jce_texture_valid(tab->gpu_tex) && actually_read > 0) {
-            const bgfx_memory_t *mem =
-                bgfx_copy(buf, (uint32_t)actually_read);
+            const JceGfxMemory *mem =
+                jce_gfx_memory_copy(buf, (uint32_t)actually_read);
             if (mem) {
-                bgfx_texture_info_t info;
+                JceTextureInfo info;
                 memset(&info, 0, sizeof(info));
-                bgfx_texture_handle_t h =
-                    bgfx_create_texture(mem, BGFX_TEXTURE_NONE
-                                        | BGFX_SAMPLER_U_CLAMP
-                                        | BGFX_SAMPLER_V_CLAMP,
-                                        0, &info);
+                JceTextureHandle h =
+                    jce_texture_create_from_encoded(mem,
+                                                    JCE_SAMPLER_U_CLAMP
+                                                    | JCE_SAMPLER_V_CLAMP,
+                                                    &info);
                 if (h.idx != UINT16_MAX) {
                     tab->gpu_tex.idx = h.idx;
                     tab->img_w = (int)info.width;
@@ -529,7 +486,7 @@ void jce_file_viewer_open(const char *path)
                             tab->zoom = 512.0f / max_dim;
                     }
                     LOG_INFO(LOG_TAG,
-                        "loaded image (bgfx container) %dx%d tex=%u",
+                        "loaded image (gfx container) %dx%d tex=%u",
                         tab->img_w, tab->img_h, tab->gpu_tex.idx);
                 }
             }
@@ -664,9 +621,7 @@ void jce_file_viewer_draw_content(void)
                 }
                 if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInTerminal"))) {
                     /* Use parent dir for files; tab->path itself if a directory. */
-                    SDL_PathInfo info;
-                    if (SDL_GetPathInfo(tab->path, &info) &&
-                        info.type == SDL_PATHTYPE_DIRECTORY) {
+                    if (jce_fs_host_exists_dir(tab->path)) {
                         jce_host_open_terminal(tab->path);
                     } else {
                         std::string p = tab->path;

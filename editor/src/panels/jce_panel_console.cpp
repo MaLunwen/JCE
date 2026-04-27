@@ -6,31 +6,94 @@
  * uses the iteration API (jce_editor_console_entry_count/get) to read it.
  */
 
-#include "jce_editor_colors.h"
-#include "jce_editor_i18n.h"
-#include "jce_editor_panels.h"
+#include "ui/jce_editor_colors.h"
+#include "core/jce_editor_i18n.h"
+#include "ui/jce_editor_panels.h"
+#include "core/jce_editor_state.h"
 
-#include <imgui.h>
+#include <jce/tools/jce_imgui.h>
 #include <stdio.h>
 #include <string.h>
+#include <ctype.h>
 
 #include <set>
 #include <string>
+#include <vector>
+#include <unordered_map>
 
 /* ── Console UI state (filter / scroll / selection) ───────────────── */
 
 struct ConsoleUiState {
-    bool          auto_scroll  = true;
-    bool          show_info    = true;
-    bool          show_warning = true;
-    bool          show_error   = true;
-    bool          show_debug   = false;
-    bool          initialized  = false;
+    bool          auto_scroll    = true;
+    bool          show_info      = true;
+    bool          show_warning   = true;
+    bool          show_error     = true;
+    bool          show_debug     = false;
+    bool          clear_on_play  = false;
+    bool          collapse       = false;
+    bool          initialized    = false;
+    JcePlayState  last_play      = JCE_PLAY_STOPPED;
+    char          search_buf[128] = {0};
+    char          cmd_buf[256]    = {0};
     std::set<int> selected;   /* entry indices */
     int           anchor      = -1;
 };
 
 static ConsoleUiState s_ui;
+
+static bool ascii_contains_ci(const char *hay, const char *needle)
+{
+    if (!needle || !*needle) return true;
+    if (!hay) return false;
+    size_t nl = strlen(needle);
+    for (const char *p = hay; *p; ++p) {
+        size_t i = 0;
+        while (i < nl && p[i] && tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i]))
+            ++i;
+        if (i == nl) return true;
+    }
+    return false;
+}
+
+static bool entry_passes_filter(const JceConsoleEntry &e)
+{
+    bool show = false;
+    switch (e.level) {
+    case JCE_CONSOLE_INFO:    show = s_ui.show_info;    break;
+    case JCE_CONSOLE_WARNING: show = s_ui.show_warning; break;
+    case JCE_CONSOLE_ERROR:   show = s_ui.show_error;   break;
+    case JCE_CONSOLE_DEBUG:   show = s_ui.show_debug;   break;
+    }
+    if (!show) return false;
+    if (s_ui.search_buf[0] && !ascii_contains_ci(e.text, s_ui.search_buf))
+        return false;
+    return true;
+}
+
+static void execute_console_command(const char *cmd)
+{
+    if (!cmd || !*cmd) return;
+    jce_editor_console_log("> %s", cmd);
+
+    if (strncmp(cmd, "clear", 5) == 0) {
+        jce_editor_console_clear();
+        s_ui.selected.clear();
+        s_ui.anchor = -1;
+    } else if (strncmp(cmd, "help", 4) == 0) {
+        jce_editor_console_log("Commands: clear, help, echo <msg>, play, stop, pause");
+    } else if (strncmp(cmd, "echo ", 5) == 0) {
+        jce_editor_console_log("%s", cmd + 5);
+    } else if (strcmp(cmd, "play") == 0) {
+        jce_state_play();
+    } else if (strcmp(cmd, "stop") == 0) {
+        jce_state_stop();
+    } else if (strcmp(cmd, "pause") == 0) {
+        jce_state_pause();
+    } else {
+        jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+            "unknown command: %s (try 'help')", cmd);
+    }
+}
 
 static void ensure_init(void)
 {
@@ -101,7 +164,16 @@ void jce_editor_panel_console_content(void)
 {
     ensure_init();
 
-    /* Toolbar: Clear + filter checkboxes + auto-scroll */
+    /* Clear-on-play: detect transition to PLAYING. */
+    JcePlayState ps_now = jce_state_get_play_state();
+    if (s_ui.clear_on_play && ps_now == JCE_PLAY_PLAYING && s_ui.last_play != JCE_PLAY_PLAYING) {
+        jce_editor_console_clear();
+        s_ui.selected.clear();
+        s_ui.anchor = -1;
+    }
+    s_ui.last_play = ps_now;
+
+    /* Toolbar: Clear + filter checkboxes + auto-scroll + clear-on-play + collapse */
     if (ImGui::SmallButton(jce_editor_i18n("console.clear")))
         jce_editor_console_clear();
     ImGui::SameLine();
@@ -133,38 +205,69 @@ void jce_editor_panel_console_content(void)
         ImGui::Checkbox(_lbl, &s_ui.show_debug);
     }
     ImGui::SameLine();
-    float right = ImGui::GetContentRegionAvail().x;
-    ImGui::SameLine(ImGui::GetCursorPosX() + right - 100);
-    {
-        char _lbl[64];
-        snprintf(_lbl, sizeof(_lbl), "%s###auto_scroll", jce_editor_i18n("console.autoScroll"));
-        ImGui::Checkbox(_lbl, &s_ui.auto_scroll);
-    }
+    ImGui::Checkbox(jce_editor_i18n_id("console.toggle.collapse", "collapse"), &s_ui.collapse);
+    ImGui::SameLine();
+    ImGui::Checkbox(jce_editor_i18n_id("console.toggle.clearOnPlay", "cop"), &s_ui.clear_on_play);
+    ImGui::SameLine();
+    ImGui::Checkbox(jce_editor_i18n_id("console.toggle.autoScroll", "auto_scroll"), &s_ui.auto_scroll);
+
+    /* Search row */
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputTextWithHint("##search", "Search (substring, case-insensitive)",
+                              s_ui.search_buf, sizeof(s_ui.search_buf));
+
     ImGui::Separator();
 
+    /* Reserve space for command line at the bottom */
+    const float cmd_h = ImGui::GetFrameHeightWithSpacing();
+
     /* Log output */
-    ImGui::BeginChild("ConsoleScroll", ImVec2(0, 0), ImGuiChildFlags_None,
+    ImGui::BeginChild("ConsoleScroll", ImVec2(0, -cmd_h), ImGuiChildFlags_None,
                        ImGuiWindowFlags_HorizontalScrollbar);
 
     int count = jce_editor_console_entry_count();
-    int last_visible = -1;
-    for (int i = 0; i < count; i++) {
-        JceConsoleEntry entry;
-        if (!jce_editor_console_entry_get(i, &entry))
-            continue;
 
-        /* Filter by level */
-        bool show = false;
-        switch (entry.level) {
-        case JCE_CONSOLE_INFO:    show = s_ui.show_info;    break;
-        case JCE_CONSOLE_WARNING: show = s_ui.show_warning; break;
-        case JCE_CONSOLE_ERROR:   show = s_ui.show_error;   break;
-        case JCE_CONSOLE_DEBUG:   show = s_ui.show_debug;   break;
+    /* Pre-compute per-entry visibility + collapse counts.
+     * collapse merges consecutive entries with identical (level,text). */
+    std::vector<int> visible_idx;
+    std::vector<int> collapse_count;
+    visible_idx.reserve(count);
+    collapse_count.reserve(count);
+
+    int i = 0;
+    while (i < count) {
+        JceConsoleEntry e;
+        if (!jce_editor_console_entry_get(i, &e)) { i++; continue; }
+        if (!entry_passes_filter(e)) { i++; continue; }
+
+        int run = 1;
+        if (s_ui.collapse) {
+            int j = i + 1;
+            while (j < count) {
+                JceConsoleEntry e2;
+                if (!jce_editor_console_entry_get(j, &e2)) break;
+                if (!entry_passes_filter(e2)) { j++; continue; }
+                if (e2.level == e.level && strcmp(e2.text, e.text) == 0) {
+                    run++;
+                    j++;
+                } else break;
+            }
+            visible_idx.push_back(i);
+            collapse_count.push_back(run);
+            i = j;
+        } else {
+            visible_idx.push_back(i);
+            collapse_count.push_back(1);
+            i++;
         }
-        if (!show) continue;
-        last_visible = i;
+    }
 
-        /* Color by level */
+    for (size_t vi = 0; vi < visible_idx.size(); ++vi) {
+        int idx = visible_idx[vi];
+        int dup = collapse_count[vi];
+        JceConsoleEntry entry;
+        if (!jce_editor_console_entry_get(idx, &entry)) continue;
+
         ImVec4 color;
         const char *prefix;
         switch (entry.level) {
@@ -174,8 +277,8 @@ void jce_editor_panel_console_content(void)
         default:                  color = JCE_COLOR_CONSOLE_INFO;  prefix = "[INFO]  "; break;
         }
 
-        ImGui::PushID(i);
-        bool selected = s_ui.selected.count(i) != 0;
+        ImGui::PushID(idx);
+        bool selected = s_ui.selected.count(idx) != 0;
         ImVec2 row_start = ImGui::GetCursorScreenPos();
         if (ImGui::Selectable("##row", selected,
                               ImGuiSelectableFlags_AllowOverlap
@@ -185,28 +288,26 @@ void jce_editor_panel_console_content(void)
             bool ctrl  = ImGui::GetIO().KeyCtrl;
             bool shift = ImGui::GetIO().KeyShift;
             if (shift && s_ui.anchor >= 0) {
-                int mn = s_ui.anchor < i ? s_ui.anchor : i;
-                int mx = s_ui.anchor > i ? s_ui.anchor : i;
+                int mn = s_ui.anchor < idx ? s_ui.anchor : idx;
+                int mx = s_ui.anchor > idx ? s_ui.anchor : idx;
                 if (!ctrl) s_ui.selected.clear();
                 for (int k = mn; k <= mx; k++) s_ui.selected.insert(k);
             } else if (ctrl) {
-                if (selected) s_ui.selected.erase(i);
-                else          s_ui.selected.insert(i);
-                s_ui.anchor = i;
+                if (selected) s_ui.selected.erase(idx);
+                else          s_ui.selected.insert(idx);
+                s_ui.anchor = idx;
             } else {
                 s_ui.selected.clear();
-                s_ui.selected.insert(i);
-                s_ui.anchor = i;
+                s_ui.selected.insert(idx);
+                s_ui.anchor = idx;
             }
         }
 
-        /* Right-click on row also selects it (if not already) so context
-         * menu acts on the right-clicked entry. */
         if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
             if (!selected) {
                 s_ui.selected.clear();
-                s_ui.selected.insert(i);
-                s_ui.anchor = i;
+                s_ui.selected.insert(idx);
+                s_ui.anchor = idx;
             }
         }
 
@@ -216,23 +317,6 @@ void jce_editor_panel_console_content(void)
                 copy_selection_to_clipboard();
             if (ImGui::MenuItem(jce_editor_i18n("console.copyAll")))
                 copy_all_visible_to_clipboard();
-            if (ImGui::MenuItem(jce_editor_i18n("console.selectAll"), "Ctrl+A"))
-            {
-                s_ui.selected.clear();
-                int n = jce_editor_console_entry_count();
-                for (int k = 0; k < n; k++) {
-                    JceConsoleEntry e;
-                    if (!jce_editor_console_entry_get(k, &e)) continue;
-                    bool s = false;
-                    switch (e.level) {
-                    case JCE_CONSOLE_INFO:    s = s_ui.show_info;    break;
-                    case JCE_CONSOLE_WARNING: s = s_ui.show_warning; break;
-                    case JCE_CONSOLE_ERROR:   s = s_ui.show_error;   break;
-                    case JCE_CONSOLE_DEBUG:   s = s_ui.show_debug;   break;
-                    }
-                    if (s) s_ui.selected.insert(k);
-                }
-            }
             ImGui::Separator();
             if (ImGui::MenuItem(jce_editor_i18n("console.clear"))) {
                 jce_editor_console_clear();
@@ -242,7 +326,6 @@ void jce_editor_panel_console_content(void)
             ImGui::EndPopup();
         }
 
-        /* Overlay text on top of the selectable row. */
         ImGui::SameLine(0, 0);
         ImGui::SetCursorScreenPos(row_start);
         ImGui::PushStyleColor(ImGuiCol_Text, JCE_COLOR_TEXT_SECONDARY);
@@ -254,11 +337,16 @@ void jce_editor_panel_console_content(void)
         ImGui::SameLine();
         ImGui::TextUnformatted(entry.text);
         ImGui::PopStyleColor();
+        if (dup > 1) {
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Text, JCE_COLOR_TEXT_SECONDARY);
+            ImGui::Text("(x%d)", dup);
+            ImGui::PopStyleColor();
+        }
 
         ImGui::PopID();
     }
 
-    /* Background context menu (for empty area). */
     if (ImGui::BeginPopupContextWindow("##console_bg_ctx",
             ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems))
     {
@@ -272,40 +360,32 @@ void jce_editor_panel_console_content(void)
         ImGui::EndPopup();
     }
 
-    /* Keyboard shortcuts (when console is focused). */
     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)
         && !ImGui::GetIO().WantTextInput)
     {
         bool ctrl = ImGui::GetIO().KeyCtrl;
         if (ctrl && ImGui::IsKeyPressed(ImGuiKey_C, false))
             copy_selection_to_clipboard();
-        if (ctrl && ImGui::IsKeyPressed(ImGuiKey_A, false)) {
-            s_ui.selected.clear();
-            int n = jce_editor_console_entry_count();
-            for (int k = 0; k < n; k++) {
-                JceConsoleEntry e;
-                if (!jce_editor_console_entry_get(k, &e)) continue;
-                bool s = false;
-                switch (e.level) {
-                case JCE_CONSOLE_INFO:    s = s_ui.show_info;    break;
-                case JCE_CONSOLE_WARNING: s = s_ui.show_warning; break;
-                case JCE_CONSOLE_ERROR:   s = s_ui.show_error;   break;
-                case JCE_CONSOLE_DEBUG:   s = s_ui.show_debug;   break;
-                }
-                if (s) s_ui.selected.insert(k);
-            }
-        }
         if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
             s_ui.selected.clear();
             s_ui.anchor = -1;
         }
     }
 
-    (void)last_visible;
     if (s_ui.auto_scroll && ImGui::GetScrollY() >= ImGui::GetScrollMaxY())
         ImGui::SetScrollHereY(1.0f);
 
     ImGui::EndChild();
+
+    /* Command-line input at the bottom. */
+    ImGui::SetNextItemWidth(-1);
+    bool submit = ImGui::InputText("##cmdline", s_ui.cmd_buf, sizeof(s_ui.cmd_buf),
+                                    ImGuiInputTextFlags_EnterReturnsTrue);
+    if (submit && s_ui.cmd_buf[0]) {
+        execute_console_command(s_ui.cmd_buf);
+        s_ui.cmd_buf[0] = '\0';
+        ImGui::SetKeyboardFocusHere(-1);
+    }
 }
 
 /* ── Standalone wrapper ───────────────────────────────────────────── */

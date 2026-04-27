@@ -99,6 +99,29 @@ set(CMAKE_CXX_STANDARD_REQUIRED YES)
 set(CMAKE_CXX_EXTENSIONS        OFF)
 
 # ------------------------------------------------------------------ #
+# Compatibility baseline (jce_compat.h)                              #
+# ------------------------------------------------------------------ #
+#
+# Enforce minimum OS / SIMD targets so that the engine matches the
+# guarantees declared in engine/include/jce/jce_compat.h:
+#   Windows 7+, iOS 12+, macOS 10.13+, Android API 21+,
+#   SSE2 baseline on x86, NEON on arm64.
+
+if(JCE_PLATFORM_WINDOWS)
+	add_compile_definitions(_WIN32_WINNT=0x0601 WINVER=0x0601)
+endif()
+
+if(NOT MSVC)
+	# x86_64 always has SSE2 architecturally; -msse2 is a no-op on
+	# x86_64 but is still passed to make 32-bit builds explicit.
+	include(CheckCCompilerFlag)
+	check_c_compiler_flag("-msse2" JCE_HAS_MSSE2_FLAG)
+	if(JCE_HAS_MSSE2_FLAG)
+		add_compile_options(-msse2)
+	endif()
+endif()
+
+# ------------------------------------------------------------------ #
 # Common compiler warnings helper                                     #
 # ------------------------------------------------------------------ #
 #
@@ -140,10 +163,10 @@ find_package(imgui        REQUIRED)
 find_package(Freetype     REQUIRED)
 find_package(harfbuzz     REQUIRED)
 find_package(cgltf        REQUIRED)
+find_package(assimp       REQUIRED)
 find_package(zstd         REQUIRED)
 find_package(xxHash       REQUIRED)
 find_package(mimalloc     REQUIRED)
-find_package(cglm         REQUIRED)
 find_package(enkits       REQUIRED)
 find_package(PhysFS       REQUIRED)
 find_package(cJSON        REQUIRED)
@@ -753,7 +776,7 @@ endif()
 # Public-header dependency guard                                      #
 #                                                                     #
 # Fails the build if any header under engine/include/jce/ pulls in a  #
-# third-party header (SDL, bgfx, cglm, imgui, ...).  Guarantees the   #
+# third-party header (SDL, bgfx, imgui, assimp, ...).  Guarantees the #
 # "users only call our API" invariant.                                #
 # ------------------------------------------------------------------ #
 

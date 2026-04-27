@@ -152,6 +152,26 @@ bool              jce_state_get_show_grid(void);
 void              jce_state_set_show_grid(bool show);
 bool              jce_state_get_show_physics_debug(void);
 void              jce_state_set_show_physics_debug(bool show);
+
+/* Show Flags (UE-style overlay toggles).  Bitmask, see JceShowFlag below.
+ * Existing show_grid / show_physics_debug remain authoritative; the bitmask
+ * is the new generic API (consumed by editor overlay code as it's wired up). */
+typedef enum {
+    JCE_SHOW_FLAG_GIZMOS         = 1u <<  0,
+    JCE_SHOW_FLAG_LIGHT_ICONS    = 1u <<  1,
+    JCE_SHOW_FLAG_CAMERA_ICONS   = 1u <<  2,
+    JCE_SHOW_FLAG_COLLIDERS      = 1u <<  3,
+    JCE_SHOW_FLAG_SKYBOX         = 1u <<  4,
+    JCE_SHOW_FLAG_BOUNDING_BOXES = 1u <<  5,
+    JCE_SHOW_FLAG_WORLD_AXIS     = 1u <<  6,
+    JCE_SHOW_FLAG_STATS_OVERLAY  = 1u <<  7,
+    JCE_SHOW_FLAG_NAVMESH        = 1u <<  8,
+} JceShowFlag;
+
+uint32_t          jce_state_get_show_flags(void);
+void              jce_state_set_show_flags(uint32_t flags);
+bool              jce_state_show_flag(JceShowFlag f);
+void              jce_state_set_show_flag(JceShowFlag f, bool on);
 bool              jce_state_get_2d_mode(void);
 void              jce_state_set_2d_mode(bool is_2d);
 bool              jce_state_get_live_preview(void);
@@ -197,6 +217,15 @@ uint32_t jce_state_instantiate_prefab(const char *prefab_path, uint32_t parent_i
 bool     jce_state_revert_prefab(uint32_t entity_id);
 bool     jce_state_is_prefab_instance(uint32_t entity_id);
 const char *jce_state_get_prefab_path(uint32_t entity_id);
+
+/* Prefab Variant (P1 #10).  Saves a snapshot annotated with `$variantOf`
+ * pointing at the parent prefab.  In v0.7.12 the loader treats the
+ * snapshot as authoritative (no deep merge yet) — variant inheritance
+ * gives a stable on-disk format and menu entry to build on. */
+bool        jce_state_save_prefab_variant(uint32_t entity_id,
+                                          const char *variant_path,
+                                          const char *parent_prefab_path);
+const char *jce_state_get_variant_parent(uint32_t entity_id);
 
 /* Entity clipboard */
 void     jce_state_copy_entity(uint32_t id);

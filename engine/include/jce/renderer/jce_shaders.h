@@ -44,11 +44,12 @@ typedef struct JceShaderSet {
     JceShaderHandle pbr_skinned;      /* skinned PBR */
     JceShaderHandle shadow;           /* shadow depth */
     JceShaderHandle shadow_skinned;   /* skinned shadow */
+    JceShaderHandle terrain;          /* PBR-style terrain (4-layer splat) */
 } JceShaderSet;
 
 /* Load all standard shader programs from PAK.
  * Must be called after bgfx is initialized. */
-JceShaderSet jce_shaders_load_all(const JcePakArchive *pak);
+JCE_API JceShaderSet jce_shaders_load_all(const JcePakArchive *pak);
 
 JCE_EXTERN_C_END
 

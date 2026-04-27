@@ -17,7 +17,7 @@
 extern "C" {
 #endif
 
-#include <jce/os/core/pak_loader.h>
+#include <jce/os/core/jce_pak_loader.h>
 #include <jce/renderer/jce_camera.h>
 #include <jce/renderer/jce_renderer.h>
 #include <jce/resource/jce_asset.h>
@@ -82,6 +82,12 @@ void jce_editor_scene_camera_snap_view(JceCamPresetView preset);
 
 /* Reset camera to the default position and target (Persp 45°, pos 8,6,8 → 0,0,0). */
 void jce_editor_scene_camera_reset(void);
+
+/* Frame the camera onto a world-space AABB so the box is fully in view.
+ * Sets target to the centre and orbit_distance to fit at the current FOV.
+ * Pass min_extent_pad to enforce a minimum size when the AABB is very small
+ * (e.g. focusing a single point light). Pitch/yaw are preserved. */
+void jce_editor_scene_camera_focus_aabb(const float min3[3], const float max3[3]);
 
 /* Set the scene base directory for resolving mesh paths. */
 void jce_editor_scene_set_scene_dir(const char *dir);

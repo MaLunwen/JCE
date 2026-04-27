@@ -100,15 +100,15 @@ typedef void (*JceChunkUnloadedFn)(uint32_t chunk_id, void *user_data);
 /* Lifecycle                                                           */
 /* ================================================================== */
 
-JceStreamingSystem *jce_streaming_create(const JceStreamingConfig *config);
-void                jce_streaming_destroy(JceStreamingSystem *sys);
+JCE_API JceStreamingSystem *jce_streaming_create(const JceStreamingConfig *config);
+JCE_API void                jce_streaming_destroy(JceStreamingSystem *sys);
 
 /* Bind file system for loading. Must be called before streaming starts. */
-void jce_streaming_set_filesystem(JceStreamingSystem *sys, JceFileSystem *fs);
+JCE_API void jce_streaming_set_filesystem(JceStreamingSystem *sys, JceFileSystem *fs);
 
 /* Bind thread pool for multi-threaded loading (optional).
  * If not set, single_thread mode is forced. */
-void jce_streaming_set_thread_pool(JceStreamingSystem *sys, JceThreadPool *pool);
+JCE_API void jce_streaming_set_thread_pool(JceStreamingSystem *sys, JceThreadPool *pool);
 
 /* Set callbacks for chunk load/unload events (optional). */
 void jce_streaming_set_callbacks(JceStreamingSystem *sys,
@@ -137,20 +137,20 @@ void jce_streaming_unregister_chunk(JceStreamingSystem *sys,
  *
  * In single-thread mode, this processes pending loads within
  * the configured frame_budget_ms time budget. */
-void jce_streaming_update(JceStreamingSystem *sys, jce_vec3 camera_pos);
+JCE_API void jce_streaming_update(JceStreamingSystem *sys, jce_vec3 camera_pos);
 
 /* ================================================================== */
 /* Queries                                                             */
 /* ================================================================== */
 
 /* Number of chunks currently loaded in memory. */
-uint32_t jce_streaming_loaded_count(const JceStreamingSystem *sys);
+JCE_API uint32_t jce_streaming_loaded_count(const JceStreamingSystem *sys);
 
 /* Number of chunks currently being loaded (in-flight). */
-uint32_t jce_streaming_pending_count(const JceStreamingSystem *sys);
+JCE_API uint32_t jce_streaming_pending_count(const JceStreamingSystem *sys);
 
 /* Current memory usage in bytes. */
-uint64_t jce_streaming_memory_used(const JceStreamingSystem *sys);
+JCE_API uint64_t jce_streaming_memory_used(const JceStreamingSystem *sys);
 
 /* Check if a specific chunk is loaded. */
 bool jce_streaming_chunk_loaded(const JceStreamingSystem *sys,
@@ -165,7 +165,7 @@ void *jce_streaming_chunk_data(const JceStreamingSystem *sys,
                                 uint32_t chunk_id, size_t *out_size);
 
 /* Return true if the streaming system is operating in single-thread mode. */
-bool jce_streaming_is_single_thread(const JceStreamingSystem *sys);
+JCE_API bool jce_streaming_is_single_thread(const JceStreamingSystem *sys);
 
 JCE_EXTERN_C_END
 

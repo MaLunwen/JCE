@@ -36,10 +36,10 @@ extern "C" {
  * All pointers reference the original buffer — caller must keep it alive.
  */
 typedef struct JceAssetView {
-	const JceAssetFileHeader *header;       /* points into blob */
-	const JceAssetChunkEntry *chunks;       /* chunk table array */
-	const uint8_t            *blob;         /* start of blob */
-	size_t                    blob_size;    /* total blob size */
+    const JceAssetFileHeader *header;       /* points into blob */
+    const JceAssetChunkEntry *chunks;       /* chunk table array */
+    const uint8_t            *blob;         /* start of blob */
+    size_t                    blob_size;    /* total blob size */
 } JceAssetView;
 
 /* ================================================================== */

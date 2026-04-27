@@ -64,10 +64,10 @@ typedef struct {
 /* Returns true if a skybox component is currently active in the scene
  * (i.e. an HDR environment is loaded). Updated each render call by
  * the internal scan. Used by editor to mirror 0.5.7 grid-gating logic. */
-bool jce_scene_renderer_is_skybox_active(const JceSceneRenderer *sr);
+JCE_API bool jce_scene_renderer_is_skybox_active(const JceSceneRenderer *sr);
 
 /* Return a sensible default configuration (all features on). */
-JceSceneRenderConfig jce_scene_render_config_default(void);
+JCE_API JceSceneRenderConfig jce_scene_render_config_default(void);
 
 /* ── Asset resolution callbacks (optional) ────────────────────────── */
 
@@ -104,7 +104,7 @@ JceSceneRenderer *jce_scene_renderer_create(
     const JcePakArchive   *pak,
     const JceSceneRendererCallbacks *cbs);
 
-void jce_scene_renderer_destroy(JceSceneRenderer *sr);
+JCE_API void jce_scene_renderer_destroy(JceSceneRenderer *sr);
 
 /* ── Per-frame rendering ──────────────────────────────────────────── */
 
@@ -132,11 +132,11 @@ uint16_t jce_scene_renderer_render(
 
 /* Returns the CSM data from the most recent render (for overlay shadow
    queries).  Returns NULL if shadows were not rendered. */
-const JceCsmData *jce_scene_renderer_get_csm(const JceSceneRenderer *sr);
+JCE_API const JceCsmData *jce_scene_renderer_get_csm(const JceSceneRenderer *sr);
 
 /* Returns the engine-owned PostFX pipeline. Editor and runtime use this
    single instance — no separate global. Returns NULL before create(). */
-JcePostFXPipeline *jce_scene_renderer_get_postfx(JceSceneRenderer *sr);
+JCE_API JcePostFXPipeline *jce_scene_renderer_get_postfx(JceSceneRenderer *sr);
 
 JCE_EXTERN_C_END
 

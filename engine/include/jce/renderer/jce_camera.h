@@ -38,48 +38,48 @@ typedef struct {
 } JceCameraDesc;
 
 /* Create a camera from a descriptor. Returns NULL on failure. */
-JceCamera *jce_camera_create(const JceCameraDesc *desc);
+JCE_API JceCamera *jce_camera_create(const JceCameraDesc *desc);
 
 /* Destroy a camera. */
-void jce_camera_destroy(JceCamera *cam);
+JCE_API void jce_camera_destroy(JceCamera *cam);
 
 /* -- Getters -------------------------------------------------------- */
 
 /* Get the view matrix (world  camera). */
-jce_mat4 jce_camera_view(const JceCamera *cam);
+JCE_API jce_mat4 jce_camera_view(const JceCamera *cam);
 
 /* Get the projection matrix. Requires aspect ratio for perspective mode. */
 jce_mat4 jce_camera_proj(const JceCamera *cam, float aspect,
                           bool homogeneous_ndc);
 
-jce_vec3       jce_camera_get_position(const JceCamera *cam);
-jce_vec3       jce_camera_get_forward(const JceCamera *cam);
-jce_vec3       jce_camera_get_right(const JceCamera *cam);
-jce_vec3       jce_camera_get_up(const JceCamera *cam);
-float          jce_camera_get_fov(const JceCamera *cam);
-float          jce_camera_get_near(const JceCamera *cam);
-float          jce_camera_get_far(const JceCamera *cam);
-JceCameraMode  jce_camera_get_mode(const JceCamera *cam);
+JCE_API jce_vec3       jce_camera_get_position(const JceCamera *cam);
+JCE_API jce_vec3       jce_camera_get_forward(const JceCamera *cam);
+JCE_API jce_vec3       jce_camera_get_right(const JceCamera *cam);
+JCE_API jce_vec3       jce_camera_get_up(const JceCamera *cam);
+JCE_API float          jce_camera_get_fov(const JceCamera *cam);
+JCE_API float          jce_camera_get_near(const JceCamera *cam);
+JCE_API float          jce_camera_get_far(const JceCamera *cam);
+JCE_API JceCameraMode  jce_camera_get_mode(const JceCamera *cam);
 
 /* -- Setters / Manipulation ---------------------------------------- */
 
-void jce_camera_set_position(JceCamera *cam, jce_vec3 pos);
-void jce_camera_set_target(JceCamera *cam, jce_vec3 target);
-void jce_camera_set_fov(JceCamera *cam, float fov_deg);
-void jce_camera_set_near_far(JceCamera *cam, float near_plane, float far_plane);
-void jce_camera_set_ortho_size(JceCamera *cam, float w, float h);
-void jce_camera_set_mode(JceCamera *cam, JceCameraMode mode);
+JCE_API void jce_camera_set_position(JceCamera *cam, jce_vec3 pos);
+JCE_API void jce_camera_set_target(JceCamera *cam, jce_vec3 target);
+JCE_API void jce_camera_set_fov(JceCamera *cam, float fov_deg);
+JCE_API void jce_camera_set_near_far(JceCamera *cam, float near_plane, float far_plane);
+JCE_API void jce_camera_set_ortho_size(JceCamera *cam, float w, float h);
+JCE_API void jce_camera_set_mode(JceCamera *cam, JceCameraMode mode);
 
 /* Move relative to camera orientation (FPS-style). */
-void jce_camera_move_forward(JceCamera *cam, float distance);
-void jce_camera_move_right(JceCamera *cam, float distance);
-void jce_camera_move_up(JceCamera *cam, float distance);
+JCE_API void jce_camera_move_forward(JceCamera *cam, float distance);
+JCE_API void jce_camera_move_right(JceCamera *cam, float distance);
+JCE_API void jce_camera_move_up(JceCamera *cam, float distance);
 
 /* Rotate by yaw/pitch (radians). Clamps pitch to 89. */
-void jce_camera_rotate(JceCamera *cam, float yaw_rad, float pitch_rad);
+JCE_API void jce_camera_rotate(JceCamera *cam, float yaw_rad, float pitch_rad);
 
 /* Look at a specific target from the current position. */
-void jce_camera_look_at(JceCamera *cam, jce_vec3 target);
+JCE_API void jce_camera_look_at(JceCamera *cam, jce_vec3 target);
 
 JCE_EXTERN_C_END
 

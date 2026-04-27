@@ -34,12 +34,12 @@ typedef struct JceFileSystem JceFileSystem;
 /* Serialize the scene to a JSON string.
    Returns a heap-allocated NUL-terminated string.
    Caller must free the string with jce_scene_serial_free(). */
-char *jce_scene_serial_save(const JceScene *scene, size_t *out_len);
+JCE_API char *jce_scene_serial_save(const JceScene *scene, size_t *out_len);
 
 /* Write the scene to a file path (UTF-8 JSON).
    Uses the engine VFS for cross-platform I/O.
    path is relative to the write directory set on fs. */
-bool  jce_scene_serial_save_file(const JceScene *scene, const char *path);
+JCE_API bool  jce_scene_serial_save_file(const JceScene *scene, const char *path);
 
 /* ================================================================== */
 /* Load                                                                */
@@ -48,12 +48,12 @@ bool  jce_scene_serial_save_file(const JceScene *scene, const char *path);
 /* Deserialize a scene from a JSON string.
    Existing entities in 'scene' are cleared before loading.
    Returns true on success. */
-bool jce_scene_serial_load(JceScene *scene, const char *json, size_t len);
+JCE_API bool jce_scene_serial_load(JceScene *scene, const char *json, size_t len);
 
 /* Load the scene from a file path.
    Uses the engine VFS for cross-platform I/O.
    Falls back to the native filesystem if fs is NULL. */
-bool jce_scene_serial_load_file(JceScene *scene, const char *path);
+JCE_API bool jce_scene_serial_load_file(JceScene *scene, const char *path);
 
 /* Load the scene from a virtual path through the VFS.
    Supports reading from PAK archives and mounted directories. */
@@ -66,7 +66,7 @@ bool jce_scene_serial_load_vfs(JceScene *scene,
 /* ================================================================== */
 
 /* Free a string returned by jce_scene_serial_save(). */
-void jce_scene_serial_free(char *json);
+JCE_API void jce_scene_serial_free(char *json);
 
 JCE_EXTERN_C_END
 

@@ -5,8 +5,9 @@
  * Reference: Java CodeViewerWindow.
  */
 
-#include "jce_editor_file_util.h"
+#include "io/jce_editor_file_util.h"
 #include "jce_fv_common.h"
+#include "core/jce_hotkeys.h"
 
 #include <algorithm>
 #include <string>
@@ -472,7 +473,7 @@ void fv_render_code(FvTab *tab)
 
     /* Ctrl+F shortcut */
     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)
-        && ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F))
+        && jce_hotkey_pressed(JCE_HK_EDIT_FIND))
     {
         tab->show_find_replace = true;
     }

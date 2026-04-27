@@ -30,7 +30,7 @@ typedef struct JceAv1FrameInfo {
 } JceAv1FrameInfo;
 
 /* Quick magic-byte check for an IVF/AV1 stream ('DKIF' + codec='AV01'). */
-bool jce_av1_is_ivf(const void *data, size_t size);
+JCE_API bool jce_av1_is_ivf(const void *data, size_t size);
 
 /* Open an in-memory IVF/AV1 stream. The buffer must outlive the decoder. */
 JceAv1Decoder *jce_av1_open_memory(const void *data, size_t size,
@@ -47,7 +47,7 @@ bool jce_av1_decode_next(JceAv1Decoder *dec,
 
 /* Open a packet-driven AV1 decoder (no IVF reader). Use this when the
  * caller demuxes the AV1 bitstream itself, e.g. WebM/Matroska. */
-JceAv1Decoder *jce_av1_open_packet(void);
+JCE_API JceAv1Decoder *jce_av1_open_packet(void);
 
 /* Decode one AV1 OBU/frame packet. Same output semantics as
  * jce_av1_decode_next(). Pass NULL/0 to drain. */
@@ -58,7 +58,7 @@ bool jce_av1_decode_packet(JceAv1Decoder *dec,
                            const uint8_t **out_v,
                            uint32_t *out_width, uint32_t *out_height);
 
-void jce_av1_close(JceAv1Decoder *dec);
+JCE_API void jce_av1_close(JceAv1Decoder *dec);
 
 JCE_EXTERN_C_END
 

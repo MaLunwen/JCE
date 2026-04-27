@@ -8,6 +8,10 @@
 #ifndef JCE_API_CORE_H
 #define JCE_API_CORE_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_crash_handler.h>
 #include <jce/os/core/jce_defs.h>
@@ -22,4 +26,9 @@
 #include <jce/os/core/jce_thread.h>
 #include <jce/os/core/jce_timer.h>
 
+
+
+#ifdef __cplusplus
+}
+#endif
 #endif /* JCE_API_CORE_H */

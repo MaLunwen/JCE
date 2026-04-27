@@ -9,7 +9,7 @@
 #include <jce/os/core/jce_i18n.h>
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
-#include <jce/os/core/pak_loader.h>
+#include <jce/os/core/jce_pak_loader.h>
 
 #include "jce_memory.h"
 

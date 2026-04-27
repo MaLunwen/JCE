@@ -16,11 +16,11 @@
 extern "C" {
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
-#include <jce/os/core/pak_loader.h>
+#include <jce/os/core/jce_pak_loader.h>
 }
 
 #define LOG_TAG       "i18n"
-#define MAX_STRINGS   1024
+#define MAX_STRINGS   16384
 #define MAX_KEY_LEN   128
 #define MAX_VALUE_LEN 512
 #define MAX_EXPAND_LEN 1024
@@ -61,9 +61,10 @@ static bool parse_json_table(const char *json, I18nTable *table)
         return false;
     }
 
+    int overflow = 0;
     for (JceJson *item = jce_json_first_child(root); item;
          item = jce_json_next_sibling(item)) {
-        if (table->count >= MAX_STRINGS) break;
+        if (table->count >= MAX_STRINGS) { overflow++; continue; }
         const char *key = jce_json_member_key(item);
         if (!jce_json_is_string(item) || !key) continue;
 
@@ -74,6 +75,9 @@ static bool parse_json_table(const char *json, I18nTable *table)
         strncpy(e->value, val, MAX_VALUE_LEN - 1);
         e->value[MAX_VALUE_LEN - 1] = '\0';
         table->count++;
+    }
+    if (overflow > 0) {
+        LOG_WARN(LOG_TAG, "i18n table overflow: %d keys dropped (raise MAX_STRINGS)", overflow);
     }
 
     jce_json_free(root);
@@ -250,4 +254,37 @@ const char *jce_editor_i18n(const char *key)
     s_expand_ring_index = (s_expand_ring_index + 1) % EXPAND_RING_SIZE;
     expand_placeholders(raw, expanded, MAX_EXPAND_LEN, 0);
     return expanded;
+}
+
+const char *jce_editor_i18n_or(const char *key, const char *fallback)
+{
+    if (!s_i18n.initialized || !key) return fallback ? fallback : "";
+    bool found = false;
+    const char *raw = lookup_raw_value(key, &found);
+    if (!found) return fallback ? fallback : key;
+    if (!strchr(raw, '{'))
+        return raw;
+    char *expanded = s_expand_ring[s_expand_ring_index % EXPAND_RING_SIZE];
+    s_expand_ring_index = (s_expand_ring_index + 1) % EXPAND_RING_SIZE;
+    expand_placeholders(raw, expanded, MAX_EXPAND_LEN, 0);
+    return expanded;
+}
+
+/* Rotating buffer pool for "label##id" strings. 16 slots avoids clobber
+   even when many widgets share a single ImGui::SameLine() row. */
+#define LABEL_ID_RING 16
+#define LABEL_ID_LEN  192
+static char s_label_id_ring[LABEL_ID_RING][LABEL_ID_LEN];
+static unsigned s_label_id_idx = 0;
+
+const char *jce_editor_i18n_id(const char *key, const char *id_suffix)
+{
+    const char *txt = jce_editor_i18n(key);
+    char *buf = s_label_id_ring[s_label_id_idx % LABEL_ID_RING];
+    s_label_id_idx = (s_label_id_idx + 1) % LABEL_ID_RING;
+    if (id_suffix && id_suffix[0])
+        snprintf(buf, LABEL_ID_LEN, "%s###%s", txt, id_suffix);
+    else
+        snprintf(buf, LABEL_ID_LEN, "%s", txt);
+    return buf;
 }

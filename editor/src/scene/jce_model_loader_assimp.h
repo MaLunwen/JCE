@@ -1,53 +1,50 @@
 /*
- * jce_model_loader_assimp.h  Assimp model loading helpers (editor-only).
+ * jce_model_loader_assimp.h  Editor-side compatibility alias for the
+ * engine's public model importer (jce/resource/jce_model_importer.h).
+ *
+ * Kept so existing editor call sites keep building during the assimp
+ * wrap-up; new code should include the engine header directly.
  */
 
 #ifndef JCE_MODEL_LOADER_ASSIMP_H
 #define JCE_MODEL_LOADER_ASSIMP_H
 
-#include <stdbool.h>
-#include <stdint.h>
+#include <jce/resource/jce_model_importer.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#include <jce/os/core/pak_loader.h>
-#include <jce/renderer/jce_mesh.h>
+typedef JceModelCpuMeshData  JceEditorCpuMeshData;
+typedef JceModelMaterialInfo JceEditorMaterialInfo;
 
-typedef struct JceEditorCpuMeshData {
-    JceMeshVertex *vertices;
-    uint32_t       vertex_count;
-    uint32_t      *indices;
-    uint32_t       index_count;
-} JceEditorCpuMeshData;
+static inline JceMesh *jce_editor_model_load(const JcePakArchive *pak,
+                                             const char          *asset_path)
+{
+    return jce_model_importer_load_pak(pak, asset_path);
+}
 
-typedef struct JceEditorMaterialInfo {
-    char  albedo_tex[128];
-    char  mr_tex[128];
-    char  normal_tex[128];
-    char  ao_tex[128];
-    char  emissive_tex[128];
-    float base_color[4];
-    float metallic;
-    float roughness;
-    float emissive[3];
-    float normal_scale;
-    float ao_strength;
-    int   alpha_mode;       /* 0=OPAQUE, 1=MASK, 2=BLEND */
-    float alpha_cutoff;
-    bool  double_sided;
-} JceEditorMaterialInfo;
+static inline JceMesh *jce_editor_model_load_file(const char *file_path)
+{
+    return jce_model_importer_load_file(file_path);
+}
 
-JceMesh *jce_editor_model_load(const JcePakArchive *pak, const char *asset_path);
-JceMesh *jce_editor_model_load_file(const char *file_path);
+static inline bool jce_editor_model_load_cpu_file(const char           *file_path,
+                                                  JceEditorCpuMeshData *out)
+{
+    return jce_model_importer_load_cpu_file(file_path, out);
+}
 
-bool jce_editor_model_load_cpu_file(const char *file_path,
-                                    JceEditorCpuMeshData *out);
-void jce_editor_model_free_cpu_data(JceEditorCpuMeshData *data);
+static inline void jce_editor_model_free_cpu_data(JceEditorCpuMeshData *data)
+{
+    jce_model_importer_free_cpu(data);
+}
 
-bool jce_editor_model_extract_material(const char *file_path,
-                                       JceEditorMaterialInfo *out);
+static inline bool jce_editor_model_extract_material(const char            *file_path,
+                                                     JceEditorMaterialInfo *out)
+{
+    return jce_model_importer_extract_material(file_path, out);
+}
 
 #ifdef __cplusplus
 }

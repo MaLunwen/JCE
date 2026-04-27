@@ -16,21 +16,21 @@
 
 JCE_EXTERN_C_BEGIN
 
-/* Forward declaration  avoids pulling in pak_loader.h in every TU. */
+/* Forward declaration  avoids pulling in jce_pak_loader.h in every TU. */
 typedef struct JcePakArchive JcePakArchive;
 
 typedef struct JceAudio JceAudio;
 
 /* -- Lifecycle ------------------------------------------------------ */
 
-JceAudio *jce_audio_create(void);
-void      jce_audio_destroy(JceAudio *audio);
+JCE_API JceAudio *jce_audio_create(void);
+JCE_API void      jce_audio_destroy(JceAudio *audio);
 
 /* -- Sound loading (from PAK) --------------------------------------- */
 
 /* Load a sound from the PAK archive.  Supports .wav files.
    Returns JCE_SOUND_INVALID on failure. */
-JceSound  jce_audio_load(JceAudio *audio, const JcePakArchive *pak, const char *path);
+JCE_API JceSound  jce_audio_load(JceAudio *audio, const JcePakArchive *pak, const char *path);
 
 /* Upload pre-decoded PCM data as a sound.
    channels: 1 or 2, bits: 8 or 16.
@@ -41,7 +41,7 @@ JceSound  jce_audio_load_pcm(JceAudio *audio,
                                uint16_t bits_per_sample);
 
 /* Unload a previously loaded sound. */
-void      jce_audio_unload(JceAudio *audio, JceSound snd);
+JCE_API void      jce_audio_unload(JceAudio *audio, JceSound snd);
 
 /* Load a sound from raw file bytes in memory (WAV/OGG/MP3).
    hint_path is used for format detection only; may be NULL. */
@@ -51,13 +51,13 @@ JceSound  jce_audio_load_memory(JceAudio *audio, const void *data,
 /* -- Queries -------------------------------------------------------- */
 
 /* Duration of a loaded sound in seconds.  Returns 0 on error. */
-float     jce_audio_get_duration(const JceAudio *audio, JceSound snd);
+JCE_API float     jce_audio_get_duration(const JceAudio *audio, JceSound snd);
 
 /* Current playback position of a voice in seconds. */
-float     jce_audio_get_time(const JceAudio *audio, JceVoice voice);
+JCE_API float     jce_audio_get_time(const JceAudio *audio, JceVoice voice);
 
 /* Seek a playing/paused voice to a specific time (seconds). */
-void      jce_audio_seek(JceAudio *audio, JceVoice voice, float time_sec);
+JCE_API void      jce_audio_seek(JceAudio *audio, JceVoice voice, float time_sec);
 
 /* Access decoded PCM data of a loaded sound (16-bit signed).
    Returns NULL on error.  Caller must NOT free the returned pointer. */
@@ -72,14 +72,14 @@ const int16_t *jce_audio_get_pcm_data(const JceAudio *audio, JceSound snd,
 JceVoice  jce_audio_play(JceAudio *audio, JceSound snd,
                           bool loop, float volume, float pitch);
 
-void      jce_audio_stop(JceAudio *audio, JceVoice voice);
-void      jce_audio_pause(JceAudio *audio, JceVoice voice);
-void      jce_audio_resume(JceAudio *audio, JceVoice voice);
+JCE_API void      jce_audio_stop(JceAudio *audio, JceVoice voice);
+JCE_API void      jce_audio_pause(JceAudio *audio, JceVoice voice);
+JCE_API void      jce_audio_resume(JceAudio *audio, JceVoice voice);
 
-void      jce_audio_set_volume(JceAudio *audio, JceVoice voice, float volume);
-void      jce_audio_set_pitch(JceAudio *audio, JceVoice voice, float pitch);
-void      jce_audio_set_looping(JceAudio *audio, JceVoice voice, bool loop);
-bool      jce_audio_is_playing(const JceAudio *audio, JceVoice voice);
+JCE_API void      jce_audio_set_volume(JceAudio *audio, JceVoice voice, float volume);
+JCE_API void      jce_audio_set_pitch(JceAudio *audio, JceVoice voice, float pitch);
+JCE_API void      jce_audio_set_looping(JceAudio *audio, JceVoice voice, bool loop);
+JCE_API bool      jce_audio_is_playing(const JceAudio *audio, JceVoice voice);
 
 /* -- Streaming playback ---------------------------------------------- */
 
@@ -101,8 +101,8 @@ JceVoice  jce_audio_play_stream(JceAudio *audio,
 
 /* -- Global --------------------------------------------------------- */
 
-void      jce_audio_set_master_volume(JceAudio *audio, float volume);
-void      jce_audio_stop_all(JceAudio *audio);
+JCE_API void      jce_audio_set_master_volume(JceAudio *audio, float volume);
+JCE_API void      jce_audio_stop_all(JceAudio *audio);
 
 JCE_EXTERN_C_END
 

@@ -6,10 +6,10 @@
  */
 
 #include <jce/os/core/jce_profiler.h>
-#include <jce/os/core/pak_loader.h>
+#include <jce/os/core/jce_pak_loader.h>
 
 #include "os/core/jce_memory.h"
-#include "resource/pak_format.h"
+#include "resource/jce_pak_format.h"
 
 #include <SDL3/SDL.h>
 #include <string.h>

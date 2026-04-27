@@ -17,7 +17,7 @@
 JCE_EXTERN_C_BEGIN
 
 /* Check if a memory buffer looks like an MP4/M4A container (ftyp box). */
-bool jce_m4a_is_mp4_container(const void *data, size_t size);
+JCE_API bool jce_m4a_is_mp4_container(const void *data, size_t size);
 
 /* Decode M4A/MP4 audio to interleaved signed 16-bit PCM.
  * On success, *out_pcm is JCE_MALLOC'd and must be freed by the caller.

@@ -17,7 +17,7 @@
 JCE_EXTERN_C_BEGIN
 
 /* Install crash signal handlers.  Call once, early in main / engine init. */
-void jce_crash_handler_init(void);
+JCE_API void jce_crash_handler_init(void);
 
 JCE_EXTERN_C_END
 

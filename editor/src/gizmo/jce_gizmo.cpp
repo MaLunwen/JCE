@@ -7,9 +7,9 @@
 
 #include "jce_gizmo.h"
 
-#include "jce_editor_defaults.h"
+#include "core/jce_editor_defaults.h"
 
-#include <imgui.h>
+#include <jce/tools/jce_imgui.h>
 #include <string.h>
 
 /* ── Internal state ────────────────────────────────────────────────── */

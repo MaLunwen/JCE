@@ -78,16 +78,16 @@ typedef struct JceRenderRecommendation {
 
 /* Evaluate GPU capabilities and return the tier.
    Must be called AFTER jce_renderer_create() (bgfx must be initialized). */
-JceGpuTier jce_renderer_get_tier(void);
+JCE_API JceGpuTier jce_renderer_get_tier(void);
 
 /* Return a bitmask of JCE_CAP_* flags for the current GPU. */
-uint32_t jce_renderer_get_caps(void);
+JCE_API uint32_t jce_renderer_get_caps(void);
 
 /* Return recommended render settings based on the current tier. */
-JceRenderRecommendation jce_renderer_get_recommendation(void);
+JCE_API JceRenderRecommendation jce_renderer_get_recommendation(void);
 
 /* Return a human-readable name for the tier. */
-const char *jce_gpu_tier_name(JceGpuTier tier);
+JCE_API const char *jce_gpu_tier_name(JceGpuTier tier);
 
 /* ================================================================== */
 /* Backend enumeration                                                 */
@@ -101,14 +101,14 @@ const char *jce_gpu_tier_name(JceGpuTier tier);
 enum JceRendererBackend;
 
 /* Return a stable human-readable name for a backend.  Never NULL. */
-const char *jce_renderer_backend_name(enum JceRendererBackend b);
+JCE_API const char *jce_renderer_backend_name(enum JceRendererBackend b);
 
 /* Fill `out` with the list of renderer backends supported by the
    compiled-in bgfx build (queried via bgfx::getSupportedRenderers).
    The first slot is always JCE_BACKEND_AUTO.  Returns the number of
    entries written (<= max).  Pass max=0 / out=NULL to query the
    needed count. */
-int jce_renderer_caps_list_backends(enum JceRendererBackend *out, int max);
+JCE_API int jce_renderer_caps_list_backends(enum JceRendererBackend *out, int max);
 
 JCE_EXTERN_C_END
 

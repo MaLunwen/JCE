@@ -99,25 +99,25 @@ JCE_EXTERN_C_BEGIN
  * File header — 32 bytes.
  */
 typedef struct JceAssetFileHeader {
-	uint8_t  magic[4];       /* "JCEA"                             */
-	uint32_t version;        /* JCEASSET_VERSION                   */
-	uint32_t asset_type;     /* JCEASSET_TYPE_* enum               */
-	uint32_t chunk_count;    /* number of chunk entries             */
-	uint32_t flags;          /* reserved, must be 0                 */
-	uint64_t source_hash;    /* XXH3_64 of original source file    */
-	uint32_t _pad;           /* padding to 32 bytes                */
+    uint8_t  magic[4];       /* "JCEA"                             */
+    uint32_t version;        /* JCEASSET_VERSION                   */
+    uint32_t asset_type;     /* JCEASSET_TYPE_* enum               */
+    uint32_t chunk_count;    /* number of chunk entries             */
+    uint32_t flags;          /* reserved, must be 0                 */
+    uint64_t source_hash;    /* XXH3_64 of original source file    */
+    uint32_t _pad;           /* padding to 32 bytes                */
 } JceAssetFileHeader;
 
 /*
  * Chunk table entry — 32 bytes.
  */
 typedef struct JceAssetChunkEntry {
-	uint16_t chunk_type;       /* JCEASSET_CHUNK_* tag               */
-	uint16_t compression;      /* JCEASSET_COMPRESS_* tag            */
-	uint32_t _reserved;        /* must be 0                          */
-	uint64_t data_offset;      /* byte offset from start of file     */
-	uint64_t compressed_size;  /* on-disk size (= original if none)  */
-	uint64_t original_size;    /* uncompressed size                  */
+    uint16_t chunk_type;       /* JCEASSET_CHUNK_* tag               */
+    uint16_t compression;      /* JCEASSET_COMPRESS_* tag            */
+    uint32_t _reserved;        /* must be 0                          */
+    uint64_t data_offset;      /* byte offset from start of file     */
+    uint64_t compressed_size;  /* on-disk size (= original if none)  */
+    uint64_t original_size;    /* uncompressed size                  */
 } JceAssetChunkEntry;
 
 /* ================================================================== */
@@ -128,12 +128,12 @@ typedef struct JceAssetChunkEntry {
  * Texture info — stored in JCEASSET_CHUNK_TEX_INFO.
  */
 typedef struct JceAssetTexInfo {
-	uint32_t width;
-	uint32_t height;
-	uint32_t format;           /* JCEASSET_TEXFMT_* */
-	uint32_t mip_count;        /* 1 = no mipmaps */
-	uint32_t flags;            /* bit 0: sRGB, bit 1: premultiplied alpha */
-	uint32_t _pad;
+    uint32_t width;
+    uint32_t height;
+    uint32_t format;           /* JCEASSET_TEXFMT_* */
+    uint32_t mip_count;        /* 1 = no mipmaps */
+    uint32_t flags;            /* bit 0: sRGB, bit 1: premultiplied alpha */
+    uint32_t _pad;
 } JceAssetTexInfo;
 
 /* GPU texture formats for JceAssetTexInfo::format. */
@@ -150,24 +150,24 @@ typedef struct JceAssetTexInfo {
  * Mesh info — stored in JCEASSET_CHUNK_MESH_INFO.
  */
 typedef struct JceAssetMeshInfo {
-	uint32_t vertex_count;
-	uint32_t index_count;
-	uint32_t vertex_stride;    /* bytes per vertex */
-	uint32_t index_stride;     /* 2 (uint16) or 4 (uint32) */
-	uint32_t vertex_format;    /* enum: 0=pos+normal+uv, 1=+tangent, 2=+joints */
-	uint32_t _pad;
+    uint32_t vertex_count;
+    uint32_t index_count;
+    uint32_t vertex_stride;    /* bytes per vertex */
+    uint32_t index_stride;     /* 2 (uint16) or 4 (uint32) */
+    uint32_t vertex_format;    /* enum: 0=pos+normal+uv, 1=+tangent, 2=+joints */
+    uint32_t _pad;
 } JceAssetMeshInfo;
 
 /*
  * Audio info — stored in JCEASSET_CHUNK_AUDIO_INFO.
  */
 typedef struct JceAssetAudioInfo {
-	uint32_t sample_rate;
-	uint16_t channels;
-	uint16_t bits_per_sample;
-	uint64_t total_frames;
-	uint32_t format;           /* 0=PCM_S16, future: float32, etc. */
-	uint32_t _pad;
+    uint32_t sample_rate;
+    uint16_t channels;
+    uint16_t bits_per_sample;
+    uint64_t total_frames;
+    uint32_t format;           /* 0=PCM_S16, future: float32, etc. */
+    uint32_t _pad;
 } JceAssetAudioInfo;
 
 #pragma pack(pop)

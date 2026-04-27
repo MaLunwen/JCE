@@ -75,7 +75,7 @@ typedef struct JcePostFXPipeline JcePostFXPipeline;
 
 JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
                                      uint32_t width, uint32_t height);
-void               jce_postfx_destroy(JcePostFXPipeline *pipeline);
+JCE_API void               jce_postfx_destroy(JcePostFXPipeline *pipeline);
 
 /* Recreate internal framebuffers after window resize. */
 void jce_postfx_resize(JcePostFXPipeline *pipeline,
@@ -86,15 +86,15 @@ void jce_postfx_resize(JcePostFXPipeline *pipeline,
 /* ================================================================== */
 
 /* Enable / disable individual effects.  Order is fixed by enum. */
-void jce_postfx_enable(JcePostFXPipeline *pipeline, JcePostFXType type, bool enabled);
-bool jce_postfx_is_enabled(const JcePostFXPipeline *pipeline, JcePostFXType type);
+JCE_API void jce_postfx_enable(JcePostFXPipeline *pipeline, JcePostFXType type, bool enabled);
+JCE_API bool jce_postfx_is_enabled(const JcePostFXPipeline *pipeline, JcePostFXType type);
 
 /* Set parameters for the entire pipeline. */
-void jce_postfx_set_params(JcePostFXPipeline *pipeline, const JcePostFXParams *params);
-void jce_postfx_get_params(const JcePostFXPipeline *pipeline, JcePostFXParams *out);
+JCE_API void jce_postfx_set_params(JcePostFXPipeline *pipeline, const JcePostFXParams *params);
+JCE_API void jce_postfx_get_params(const JcePostFXPipeline *pipeline, JcePostFXParams *out);
 
 /* Return default parameter values. */
-JcePostFXParams jce_postfx_default_params(void);
+JCE_API JcePostFXParams jce_postfx_default_params(void);
 
 /* ================================================================== */
 /* Rendering                                                           */
@@ -115,13 +115,13 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
 
 /* Get the output texture after jce_postfx_apply.
    Returns JCE_TEXTURE_INVALID if no effects were active. */
-JceTextureHandle jce_postfx_get_output(const JcePostFXPipeline *pipeline);
+JCE_API JceTextureHandle jce_postfx_get_output(const JcePostFXPipeline *pipeline);
 
 /* Returns the bgfx framebuffer handle (as raw uint16) currently holding the
  * postfx output texture, or UINT16_MAX if no apply has run.
  * Editors can submit overlay passes to this FBO so gizmos render *after*
  * tone-mapping / bloom instead of being filtered through PostFX. */
-uint16_t jce_postfx_get_output_framebuffer(const JcePostFXPipeline *pipeline);
+JCE_API uint16_t jce_postfx_get_output_framebuffer(const JcePostFXPipeline *pipeline);
 
 JCE_EXTERN_C_END
 

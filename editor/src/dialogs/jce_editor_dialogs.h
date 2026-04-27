@@ -33,6 +33,15 @@ void jce_editor_dialog_open_scene(bool *p_open);
    result: 0 = pending, 1 = save, 2 = don't save, 3 = cancel. */
 void jce_editor_dialog_unsaved_changes(bool *p_open, int *result);
 
+/* Build Settings dialog (CMake preset launcher). */
+void jce_editor_dialog_build_settings(bool *p_open);
+
+/* Project Settings dialog (centralized: project / build / run / render / hotkeys). */
+void jce_editor_dialog_project_settings(bool *p_open);
+
+/* Preferences dialog (global per-user: general / fonts / editor / input / paths). */
+void jce_editor_dialog_preferences(bool *p_open);
+
 #ifdef __cplusplus
 }
 #endif

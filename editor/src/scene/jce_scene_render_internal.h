@@ -11,10 +11,9 @@
 #define JCE_SCENE_RENDER_INTERNAL_H
 
 #include "jce_editor_scene_render.h"
-#include "jce_editor_state.h"
+#include "core/jce_editor_state.h"
 #include "scene/jce_editor_scene_asset_cache.h"
 
-#include <bgfx/c99/bgfx.h>
 #include <math.h>
 #include <string.h>
 
@@ -24,6 +23,7 @@ extern "C" {
 #include <jce/renderer/jce_camera.h>
 #include <jce/renderer/jce_debug_draw.h>
 #include <jce/renderer/jce_lighting.h>
+#include <jce/renderer/jce_lowlevel.h>
 #include <jce/renderer/jce_material.h>
 #include <jce/renderer/jce_mesh.h>
 #include <jce/renderer/jce_offscreen_target.h>
@@ -61,19 +61,19 @@ struct SceneRenderState {
     JceSceneRenderer       *scene_renderer;
 
     /* Pos+color vertex layout used by grid / overlay transient buffers. */
-    bgfx_vertex_layout_t    layout;
+    JceVertexLayout         layout;
 
     /* Cached color shader handle from the renderer (overlay flat-color path). */
-    bgfx_program_handle_t   prog_color;
+    JceProgramHandle        prog_color;
 
     /* Editor-only infinite grid shader. */
-    bgfx_program_handle_t   prog_grid;
-    bgfx_uniform_handle_t   u_grid_camera;
-    bgfx_uniform_handle_t   u_grid_fade;
+    JceProgramHandle        prog_grid;
+    JceUniformHandle        u_grid_camera;
+    JceUniformHandle        u_grid_fade;
 
     /* Lighting uniforms used by selection / hover / ghost flat-color overlays. */
-    bgfx_uniform_handle_t   u_light_dir;
-    bgfx_uniform_handle_t   u_light_color;
+    JceUniformHandle        u_light_dir;
+    JceUniformHandle        u_light_color;
 
     /* Orbit camera state. */
     jce_vec3                orbit_target;
@@ -91,7 +91,7 @@ struct SceneRenderState {
     float                   cached_eye[3];
 
     /* 1x1 white texture used by overlay flat-color binding. */
-    bgfx_texture_handle_t   white_tex;
+    JceTextureHandle        white_tex;
 
     /* Viewport size from the current frame. */
     uint32_t                viewport_width;

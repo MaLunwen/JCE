@@ -11,6 +11,10 @@
 #ifndef JCE_API_MIDDLEWARE_H
 #define JCE_API_MIDDLEWARE_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <jce/api_ai.h>
 #include <jce/api_animation.h>
 #include <jce/api_audio.h>
@@ -19,4 +23,9 @@
 #include <jce/api_streaming.h>
 #include <jce/api_ui.h>
 
+
+
+#ifdef __cplusplus
+}
+#endif
 #endif /* JCE_API_MIDDLEWARE_H */

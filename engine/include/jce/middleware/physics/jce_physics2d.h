@@ -30,15 +30,15 @@ typedef struct {
     uint32_t max_bodies;       /* default: 4096 */
 } JcePhysics2DDesc;
 
-JcePhysics2D *jce_physics2d_create(const JcePhysics2DDesc *desc);
-void          jce_physics2d_destroy(JcePhysics2D *world);
+JCE_API JcePhysics2D *jce_physics2d_create(const JcePhysics2DDesc *desc);
+JCE_API void          jce_physics2d_destroy(JcePhysics2D *world);
 
 /* ================================================================== */
 /* Simulation                                                          */
 /* ================================================================== */
 
 /* Step the 2D simulation forward by dt seconds. */
-void jce_physics2d_step(JcePhysics2D *world, float dt);
+JCE_API void jce_physics2d_step(JcePhysics2D *world, float dt);
 
 /* ================================================================== */
 /* 2D body shapes                                                      */
@@ -70,8 +70,8 @@ typedef struct {
     bool           fixed_rotation;
 } JceBody2DDesc;
 
-JceBodyHandle jce_physics2d_body_create(JcePhysics2D *world, const JceBody2DDesc *desc);
-void          jce_physics2d_body_destroy(JcePhysics2D *world, JceBodyHandle body);
+JCE_API JceBodyHandle jce_physics2d_body_create(JcePhysics2D *world, const JceBody2DDesc *desc);
+JCE_API void          jce_physics2d_body_destroy(JcePhysics2D *world, JceBodyHandle body);
 
 /* ================================================================== */
 /* 2D body state queries                                               */
@@ -82,16 +82,16 @@ void     jce_physics2d_body_get_transform(const JcePhysics2D *world, JceBodyHand
 void     jce_physics2d_body_set_transform(JcePhysics2D *world, JceBodyHandle body,
                                           jce_vec2 pos, float angle);
 
-jce_vec2 jce_physics2d_body_get_velocity(const JcePhysics2D *world, JceBodyHandle body);
-void     jce_physics2d_body_set_velocity(JcePhysics2D *world, JceBodyHandle body, jce_vec2 vel);
+JCE_API jce_vec2 jce_physics2d_body_get_velocity(const JcePhysics2D *world, JceBodyHandle body);
+JCE_API void     jce_physics2d_body_set_velocity(JcePhysics2D *world, JceBodyHandle body, jce_vec2 vel);
 
 /* ================================================================== */
 /* 2D forces & impulses                                                */
 /* ================================================================== */
 
-void jce_physics2d_body_apply_force(JcePhysics2D *world, JceBodyHandle body, jce_vec2 force);
-void jce_physics2d_body_apply_impulse(JcePhysics2D *world, JceBodyHandle body, jce_vec2 impulse);
-void jce_physics2d_body_apply_torque(JcePhysics2D *world, JceBodyHandle body, float torque);
+JCE_API void jce_physics2d_body_apply_force(JcePhysics2D *world, JceBodyHandle body, jce_vec2 force);
+JCE_API void jce_physics2d_body_apply_impulse(JcePhysics2D *world, JceBodyHandle body, jce_vec2 impulse);
+JCE_API void jce_physics2d_body_apply_torque(JcePhysics2D *world, JceBodyHandle body, float torque);
 
 /* ================================================================== */
 /* 2D ray casting                                                      */
@@ -113,7 +113,7 @@ JceRaycast2DResult jce_physics2d_raycast(const JcePhysics2D *world,
 /* Debug                                                               */
 /* ================================================================== */
 
-uint32_t jce_physics2d_body_count(const JcePhysics2D *world);
+JCE_API uint32_t jce_physics2d_body_count(const JcePhysics2D *world);
 
 JCE_EXTERN_C_END
 

@@ -6,13 +6,12 @@
  * `jce_scene_renderer_get_postfx`.
  */
 
-#include "jce_editor_colors.h"
-#include "jce_editor_i18n.h"
-#include "jce_editor_panels.h"
+#include "ui/jce_editor_colors.h"
+#include "core/jce_editor_i18n.h"
+#include "ui/jce_editor_panels.h"
 #include "scene/jce_editor_scene_render.h"
 
-#include <imgui.h>
-
+#include <jce/tools/jce_imgui.h>
 #include <cstdio>
 
 extern "C" {

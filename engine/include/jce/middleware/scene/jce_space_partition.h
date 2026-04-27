@@ -52,8 +52,8 @@ typedef struct {
 /* Lifecycle                                                           */
 /* ================================================================== */
 
-JceSpaceIndex *jce_space_create(const JceSpaceConfig *config);
-void           jce_space_destroy(JceSpaceIndex *idx);
+JCE_API JceSpaceIndex *jce_space_create(const JceSpaceConfig *config);
+JCE_API void           jce_space_destroy(JceSpaceIndex *idx);
 
 /* ================================================================== */
 /* Object management                                                   */
@@ -69,7 +69,7 @@ void jce_space_update(JceSpaceIndex *idx, uint32_t handle,
                        JceAABB new_bounds);
 
 /* Remove an object. */
-void jce_space_remove(JceSpaceIndex *idx, uint32_t handle);
+JCE_API void jce_space_remove(JceSpaceIndex *idx, uint32_t handle);
 
 /* ================================================================== */
 /* Queries                                                             */
@@ -105,7 +105,7 @@ bool jce_space_raycast(const JceSpaceIndex *idx, jce_vec3 origin,
 /* Statistics                                                          */
 /* ================================================================== */
 
-uint32_t jce_space_object_count(const JceSpaceIndex *idx);
+JCE_API uint32_t jce_space_object_count(const JceSpaceIndex *idx);
 
 JCE_EXTERN_C_END
 

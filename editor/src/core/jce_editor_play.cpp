@@ -16,9 +16,9 @@ extern "C" {
 #include <jce/middleware/audio/jce_audio.h>
 #include <jce/middleware/physics/jce_physics.h>
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_alloc.h>
 }
-
-#include <SDL3/SDL_iostream.h>
 
 /* ── Play mode static data ───────────────────────────────────────── */
 
@@ -155,14 +155,15 @@ static JceSound play_load_audio_clip(const char *clip_path)
     }
 
     size_t fsize = 0;
-    void *data = SDL_LoadFile(full, &fsize);
+    void *data = jce_fs_host_read_all(full, &fsize);
     if (!data || fsize == 0) {
         LOG_WARN(LOG_TAG, "play audio: could not read '%s'", full);
+        if (data) jce_free(data);
         return JCE_SOUND_INVALID;
     }
 
     JceSound snd = jce_audio_load_memory(s_play_audio, data, (uint32_t)fsize, clip_path);
-    SDL_free(data);
+    jce_free(data);
     return snd;
 }
 

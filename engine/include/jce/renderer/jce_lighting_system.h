@@ -66,33 +66,33 @@ typedef struct {
 /* ================================================================== */
 
 /* Create an empty light environment. */
-JceLightEnv *jce_light_env_create(void);
+JCE_API JceLightEnv *jce_light_env_create(void);
 
 /* Destroy the light environment. */
-void jce_light_env_destroy(JceLightEnv *env);
+JCE_API void jce_light_env_destroy(JceLightEnv *env);
 
 /* Set ambient light color and intensity. */
-void jce_light_env_set_ambient(JceLightEnv *env, jce_vec3 color, float intensity);
+JCE_API void jce_light_env_set_ambient(JceLightEnv *env, jce_vec3 color, float intensity);
 
 /* Add lights. Returns the light index, or -1 if at capacity. */
-int jce_light_env_add_dir_light(JceLightEnv *env, const JceDirLightDesc *light);
-int jce_light_env_add_point_light(JceLightEnv *env, const JcePointLightDesc *light);
-int jce_light_env_add_spot_light(JceLightEnv *env, const JceSpotLightDesc *light);
+JCE_API int jce_light_env_add_dir_light(JceLightEnv *env, const JceDirLightDesc *light);
+JCE_API int jce_light_env_add_point_light(JceLightEnv *env, const JcePointLightDesc *light);
+JCE_API int jce_light_env_add_spot_light(JceLightEnv *env, const JceSpotLightDesc *light);
 
 /* Clear all lights (ambient retained). */
-void jce_light_env_clear(JceLightEnv *env);
+JCE_API void jce_light_env_clear(JceLightEnv *env);
 
 /* Get current light counts. */
-uint32_t jce_light_env_dir_count(const JceLightEnv *env);
-uint32_t jce_light_env_point_count(const JceLightEnv *env);
-uint32_t jce_light_env_spot_count(const JceLightEnv *env);
+JCE_API uint32_t jce_light_env_dir_count(const JceLightEnv *env);
+JCE_API uint32_t jce_light_env_point_count(const JceLightEnv *env);
+JCE_API uint32_t jce_light_env_spot_count(const JceLightEnv *env);
 
 /* Set the camera world position (needed for PBR specular). */
-void jce_light_env_set_camera_pos(JceLightEnv *env, jce_vec3 pos);
+JCE_API void jce_light_env_set_camera_pos(JceLightEnv *env, jce_vec3 pos);
 
 /* Upload all light uniforms for the current draw state.
  * Call once per frame before submitting PBR draw calls. */
-void jce_light_env_apply(const JceLightEnv *env, const JceRenderer *r);
+JCE_API void jce_light_env_apply(const JceLightEnv *env, const JceRenderer *r);
 
 JCE_EXTERN_C_END
 

@@ -10,8 +10,17 @@
 #ifndef JCE_API_RENDER_H
 #define JCE_API_RENDER_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <jce/renderer/jce_render_graph.h>
 #include <jce/renderer/jce_render_queue.h>
 #include <jce/renderer/jce_scene_renderer.h>
 
+
+
+#ifdef __cplusplus
+}
+#endif
 #endif /* JCE_API_RENDER_H */

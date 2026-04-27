@@ -8,8 +8,6 @@
  */
 #include <jce/application/jce_main.h>
 
-#include <SDL3/SDL_events.h>
-
 #include <algorithm>
 #include <cstdio>
 #include <string>
@@ -169,12 +167,11 @@ static void editor_app_draw(const JceServices *svc, void *ud)
     jce_editor_update(svc->window);
 }
 
-static void editor_app_event(const void *ev, void *ud)
+static void editor_app_event(const JceEvent *event, void *ud)
 {
     (void)ud;
-    const SDL_Event *event = (const SDL_Event *)ev;
 
-    if (event->type == SDL_EVENT_QUIT
+    if (event->type == JCE_EVENT_QUIT
         && !jce_editor_layout_is_quit_confirmed())
     {
         jce_editor_layout_request_quit();

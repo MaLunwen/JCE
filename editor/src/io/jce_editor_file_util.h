@@ -1,10 +1,14 @@
 /*
  * jce_editor_file_util.h  Common file I/O helpers for editor code.
  *
- * Two simple functions backed by SDL3 for cross-platform I/O:
+ * Two simple functions backed by C stdio for cross-platform I/O:
  *
  *   void *ed_read_file(path, &out_size)   -- read whole file, caller frees
  *   bool  ed_write_file(path, data, size) -- write buffer to file
+ *
+ * The editor relies on ED_MALLOC / ED_FREE so the host engine's own
+ * filesystem helpers (which return JCE_MALLOC'd buffers) are not used
+ * here — that would break the editor's allocator accounting.
  */
 
 #ifndef JCE_EDITOR_FILE_UTIL_H
@@ -12,11 +16,11 @@
 
 #include <jce/os/core/jce_json.h>
 
-#include "jce_editor_alloc.h"
+#include "core/jce_editor_alloc.h"
 
-#include <SDL3/SDL.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 /* Read an entire file into an ED_MALLOC'd buffer.
@@ -28,17 +32,20 @@ static inline void *ed_read_file(const char *path, size_t *out_size)
     if (out_size) *out_size = 0;
     if (!path) return NULL;
 
-    SDL_IOStream *io = SDL_IOFromFile(path, "rb");
-    if (!io) return NULL;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
 
-    Sint64 file_size = SDL_GetIOSize(io);
-    if (file_size <= 0) { SDL_CloseIO(io); return NULL; }
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return NULL; }
+    long file_size = ftell(fp);
+    if (file_size < 0) { fclose(fp); return NULL; }
+    rewind(fp);
 
     void *buf = ED_MALLOC((size_t)file_size + 1);
-    if (!buf) { SDL_CloseIO(io); return NULL; }
+    if (!buf) { fclose(fp); return NULL; }
 
-    size_t nread = SDL_ReadIO(io, buf, (size_t)file_size);
-    SDL_CloseIO(io);
+    size_t nread = (file_size > 0)
+        ? fread(buf, 1, (size_t)file_size, fp) : 0;
+    fclose(fp);
 
     if (nread != (size_t)file_size) {
         ED_FREE(buf);
@@ -54,11 +61,11 @@ static inline void *ed_read_file(const char *path, size_t *out_size)
 static inline bool ed_write_file(const char *path,
                                  const void *data, size_t size)
 {
-    if (!path || !data) return false;
-    SDL_IOStream *io = SDL_IOFromFile(path, "wb");
-    if (!io) return false;
-    size_t written = SDL_WriteIO(io, data, size);
-    SDL_CloseIO(io);
+    if (!path || (!data && size > 0)) return false;
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return false;
+    size_t written = (size > 0) ? fwrite(data, 1, size, fp) : 0;
+    fclose(fp);
     return written == size;
 }
 
@@ -84,21 +91,23 @@ static inline void *ed_read_file_capped(const char *path,
     if (out_total) *out_total = 0;
     if (!path) return NULL;
 
-    SDL_IOStream *io = SDL_IOFromFile(path, "rb");
-    if (!io) return NULL;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return NULL;
 
-    Sint64 file_size = SDL_GetIOSize(io);
-    if (file_size < 0) { SDL_CloseIO(io); return NULL; }
+    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return NULL; }
+    long file_size = ftell(fp);
+    if (file_size < 0) { fclose(fp); return NULL; }
+    rewind(fp);
     if (out_total) *out_total = (size_t)file_size;
 
     size_t read_size = (size_t)file_size;
     if (read_size > max_bytes) read_size = max_bytes;
 
     void *buf = ED_MALLOC(read_size + 1);
-    if (!buf) { SDL_CloseIO(io); return NULL; }
+    if (!buf) { fclose(fp); return NULL; }
 
-    size_t nread = (read_size > 0) ? SDL_ReadIO(io, buf, read_size) : 0;
-    SDL_CloseIO(io);
+    size_t nread = (read_size > 0) ? fread(buf, 1, read_size, fp) : 0;
+    fclose(fp);
 
     ((char *)buf)[nread] = '\0';
     if (out_size) *out_size = nread;

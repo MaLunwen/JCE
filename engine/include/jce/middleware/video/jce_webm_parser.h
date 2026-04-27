@@ -56,7 +56,7 @@ typedef struct JceWebmInfo {
 typedef struct JceWebmParser JceWebmParser;
 
 /* Quick magic-byte check (EBML header at offset 0). */
-bool jce_webm_is_webm(const void *data, size_t size);
+JCE_API bool jce_webm_is_webm(const void *data, size_t size);
 
 /* Open an in-memory WebM/Matroska stream. Buffer must outlive the parser. */
 JceWebmParser *jce_webm_open_memory(const void *data, size_t size,
@@ -84,9 +84,9 @@ bool jce_webm_read_audio_packet(JceWebmParser *p,
 /* Coarse seek: rewind both readers to the first cluster whose timestamp
  * is <= the requested time. The next video/audio read returns frames
  * starting from there (the caller should drop pre-roll frames itself). */
-bool jce_webm_seek(JceWebmParser *p, uint64_t time_ns);
+JCE_API bool jce_webm_seek(JceWebmParser *p, uint64_t time_ns);
 
-void jce_webm_close(JceWebmParser *p);
+JCE_API void jce_webm_close(JceWebmParser *p);
 
 JCE_EXTERN_C_END
 

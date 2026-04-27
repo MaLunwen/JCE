@@ -33,11 +33,11 @@ typedef struct {
 } JceMaterial;
 
 /* Create a default material of the given type. */
-JceMaterial jce_material_default(JceMaterialType type);
+JCE_API JceMaterial jce_material_default(JceMaterialType type);
 
 /* Bind the material state (program, textures, uniforms) for the next draw.
    Returns the program handle to use with bgfx_submit. */
-void jce_material_bind(const JceMaterial *mat, const JceRenderer *r, uint16_t view_id);
+JCE_API void jce_material_bind(const JceMaterial *mat, const JceRenderer *r, uint16_t view_id);
 
 JCE_EXTERN_C_END
 

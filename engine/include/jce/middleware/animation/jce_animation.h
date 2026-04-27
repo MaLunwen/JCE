@@ -23,24 +23,24 @@ typedef struct JceSkeleton   JceSkeleton;
 
 /* -- Clip queries -------------------------------------------------- */
 
-const char *jce_anim_clip_name(const JceAnimClip *clip);
-float       jce_anim_clip_duration(const JceAnimClip *clip);
+JCE_API const char *jce_anim_clip_name(const JceAnimClip *clip);
+JCE_API float       jce_anim_clip_duration(const JceAnimClip *clip);
 
 /* -- Animation player ---------------------------------------------- */
 
 /* Create a player bound to a skeleton. */
-JceAnimPlayer *jce_anim_player_create(const JceSkeleton *skel);
-void           jce_anim_player_destroy(JceAnimPlayer *player);
+JCE_API JceAnimPlayer *jce_anim_player_create(const JceSkeleton *skel);
+JCE_API void           jce_anim_player_destroy(JceAnimPlayer *player);
 
 /* Start playing a clip. loop=true for continuous, speed=1.0 for normal. */
 void  jce_anim_player_play(JceAnimPlayer *p, const JceAnimClip *clip,
                            bool loop, float speed);
-void  jce_anim_player_stop(JceAnimPlayer *p);
-void  jce_anim_player_pause(JceAnimPlayer *p, bool paused);
-void  jce_anim_player_set_speed(JceAnimPlayer *p, float speed);
-void  jce_anim_player_set_time(JceAnimPlayer *p, float time);
-float jce_anim_player_get_time(const JceAnimPlayer *p);
-bool  jce_anim_player_is_playing(const JceAnimPlayer *p);
+JCE_API void  jce_anim_player_stop(JceAnimPlayer *p);
+JCE_API void  jce_anim_player_pause(JceAnimPlayer *p, bool paused);
+JCE_API void  jce_anim_player_set_speed(JceAnimPlayer *p, float speed);
+JCE_API void  jce_anim_player_set_time(JceAnimPlayer *p, float time);
+JCE_API float jce_anim_player_get_time(const JceAnimPlayer *p);
+JCE_API bool  jce_anim_player_is_playing(const JceAnimPlayer *p);
 
 /* Advance by dt seconds and produce joint matrices for GPU upload.
  * Returns number of joints written to out_joint_matrices. */
@@ -51,10 +51,10 @@ uint32_t jce_anim_player_update(JceAnimPlayer *p, float dt,
 /* -- Skeleton queries ---------------------------------------------- */
 
 /* Return the number of joints in a skeleton. */
-uint32_t jce_skeleton_joint_count(const JceSkeleton *skel);
+JCE_API uint32_t jce_skeleton_joint_count(const JceSkeleton *skel);
 
 /* Return the name of a skeleton joint by index (or NULL). */
-const char *jce_skeleton_joint_name(const JceSkeleton *skel, uint32_t index);
+JCE_API const char *jce_skeleton_joint_name(const JceSkeleton *skel, uint32_t index);
 
 JCE_EXTERN_C_END
 

@@ -12,6 +12,7 @@
  */
 
 #include "jce_fv_common.h"
+#include "core/jce_editor_i18n.h"
 
 extern "C" {
 #include <jce/middleware/audio/jce_audio.h>
@@ -714,7 +715,7 @@ void fv_render_video(FvTab *tab)
             tab->zoom = zoom_pct / 100.0f;
         }
         ImGui::SameLine();
-        if (ImGui::SmallButton("Fit##vfit")) {
+        if (ImGui::SmallButton(jce_editor_i18n_id("viewer.video.fit", "vfit"))) {
             FvZoomable zp{};
             zp.content_w = st->tex_w; zp.content_h = st->tex_h;
             zp.zoom = &tab->zoom; zp.pan_x = &tab->pan_x; zp.pan_y = &tab->pan_y;

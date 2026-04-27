@@ -4,30 +4,35 @@
  * Uses the engine JSON facade for JSON parsing and generation.
  */
 
-#include <SDL3/SDL_filesystem.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 extern "C" {
+#include <jce/os/core/jce_defs.h>
+#include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
 }
 
-/* Cross-platform mkdir-equivalent. SDL_CreateDirectory creates the directory
- * if it does not already exist, returning true if the directory exists after
- * the call. */
+/* Cross-platform mkdir-equivalent. Creates the directory if it does not
+ * already exist. */
 static void ensure_directory(const char *path) {
-    SDL_CreateDirectory(path);
+    jce_fs_host_create_directory(path);
 }
 
 #include "jce_editor_alloc.h"
 #include "jce_editor_config.h"
-#include "jce_editor_file_util.h"
+#include "io/jce_editor_file_util.h"
 
 #define LOG_TAG       "editor_config"
 #define CONFIG_PATH   ".jce/editor-config.json"
 #define CONFIG_DIR    ".jce"
+
+/* Cached input preference flags. */
+bool jce_editor_pref_invert_scroll_zoom = false;
+bool jce_editor_pref_invert_drag_y      = false;
+bool jce_editor_pref_touchpad_h_invert  = true;
 
 /* --------------- defaults --------------- */
 
@@ -35,6 +40,7 @@ void jce_editor_config_defaults(JceEditorConfig *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     strncpy(cfg->language, "en", sizeof(cfg->language) - 1);
     cfg->font_size = 24;
+    cfg->ui_scale  = 1.0f;
     strncpy(cfg->theme, "Dark", sizeof(cfg->theme) - 1);
     strncpy(cfg->renderer, "OpenGL", sizeof(cfg->renderer) - 1);
     cfg->last_project[0] = '\0';
@@ -43,15 +49,35 @@ void jce_editor_config_defaults(JceEditorConfig *cfg) {
     cfg->show_grid = true;
     cfg->asset_browser_view_mode = 0; /* ASSET_BROWSER_VIEW_GRID */
     cfg->run_mode = 0; /* Editor Simulation */
-    /* Forward slashes work on all hosts including Windows, so the defaults
-     * stay platform-neutral. The .exe suffix is intentionally omitted; the
-     * executable resolver in jce_run_manager will validate existence and the
-     * Build dialog (Phase 2) will overwrite this value to the freshly produced
-     * binary path including any host-specific suffix. */
+    /* Default points to the canonical CMake-preset output.  Forward slashes
+     * work on every host (Windows accepts them in CreateProcess paths).
+     * jce_run_manager performs smart resolution at spawn-time: tries
+     * configured path → with platform exe suffix → walks parent dirs →
+     * tries other known build/desktop/<arch>/[release/] candidates. */
+#if JCE_PLATFORM_WINDOWS
+    strncpy(cfg->game_executable_path,
+            "build/desktop/windows-x64/release/caged_kingdom.exe",
+            sizeof(cfg->game_executable_path) - 1);
+    strncpy(cfg->game_working_directory, "build/desktop/windows-x64/release",
+            sizeof(cfg->game_working_directory) - 1);
+#elif JCE_PLATFORM_MACOS
+    strncpy(cfg->game_executable_path,
+            "build/desktop/macos-arm64/CagedKingdom",
+            sizeof(cfg->game_executable_path) - 1);
+    strncpy(cfg->game_working_directory, "build/desktop/macos-arm64",
+            sizeof(cfg->game_working_directory) - 1);
+#elif JCE_PLATFORM_LINUX
+    strncpy(cfg->game_executable_path,
+            "build/desktop/linux-x64/CagedKingdom",
+            sizeof(cfg->game_executable_path) - 1);
+    strncpy(cfg->game_working_directory, "build/desktop/linux-x64",
+            sizeof(cfg->game_working_directory) - 1);
+#else
     strncpy(cfg->game_executable_path, "build/host/release/caged_kingdom",
             sizeof(cfg->game_executable_path) - 1);
     strncpy(cfg->game_working_directory, "build/host/release",
             sizeof(cfg->game_working_directory) - 1);
+#endif
     strncpy(cfg->game_target_name, "CagedKingdom", sizeof(cfg->game_target_name) - 1);
     strncpy(cfg->build_configure_preset, "host-release",
             sizeof(cfg->build_configure_preset) - 1);
@@ -60,6 +86,10 @@ void jce_editor_config_defaults(JceEditorConfig *cfg) {
             sizeof(cfg->build_output_path) - 1);
     cfg->font_en_path[0] = '\0';
     cfg->font_zh_path[0] = '\0';
+    cfg->invert_scroll_zoom = false;
+    cfg->invert_drag_y      = false;
+    cfg->touchpad_h_invert  = true;
+    cfg->panels_visible_mask = JCE_EDITOR_PANELS_MASK_UNSET;
 }
 
 /* --------------- helpers --------------- */
@@ -105,6 +135,9 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
 
     cjson_read_str(root, "language", cfg->language, sizeof(cfg->language));
     cfg->font_size = cjson_read_int(root, "font_size", cfg->font_size);
+    cfg->ui_scale  = (float)jce_json_get_number(root, "ui_scale", cfg->ui_scale);
+    if (cfg->ui_scale < 0.5f) cfg->ui_scale = 0.5f;
+    if (cfg->ui_scale > 3.0f) cfg->ui_scale = 3.0f;
     cjson_read_str(root, "theme",    cfg->theme,    sizeof(cfg->theme));
     cjson_read_str(root, "renderer", cfg->renderer, sizeof(cfg->renderer));
     cjson_read_str(root, "last_project", cfg->last_project, sizeof(cfg->last_project));
@@ -137,6 +170,17 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
                    cfg->font_en_path, sizeof(cfg->font_en_path));
     cjson_read_str(root, "font_zh_path",
                    cfg->font_zh_path, sizeof(cfg->font_zh_path));
+    cfg->invert_scroll_zoom = jce_json_get_bool(root, "invert_scroll_zoom",
+                                                cfg->invert_scroll_zoom);
+    cfg->invert_drag_y      = jce_json_get_bool(root, "invert_drag_y",
+                                                cfg->invert_drag_y);
+    cfg->touchpad_h_invert  = jce_json_get_bool(root, "touchpad_h_invert",
+                                                cfg->touchpad_h_invert);
+    cfg->panels_visible_mask = (uint32_t)jce_json_get_int(
+        root, "panels_visible_mask", (int)cfg->panels_visible_mask);
+    jce_editor_pref_invert_scroll_zoom = cfg->invert_scroll_zoom;
+    jce_editor_pref_invert_drag_y      = cfg->invert_drag_y;
+    jce_editor_pref_touchpad_h_invert  = cfg->touchpad_h_invert;
 
     /* recent_0 .. recent_9 */
     cfg->recent_count = 0;
@@ -171,6 +215,7 @@ bool jce_editor_config_save(const JceEditorConfig *cfg) {
 
     jce_json_set_string(root, "language",     cfg->language);
     jce_json_set_int   (root, "font_size",    cfg->font_size);
+    jce_json_set_number(root, "ui_scale",     cfg->ui_scale);
     jce_json_set_string(root, "theme",        cfg->theme);
     jce_json_set_string(root, "renderer",     cfg->renderer);
     jce_json_set_string(root, "last_project", cfg->last_project);
@@ -192,6 +237,13 @@ bool jce_editor_config_save(const JceEditorConfig *cfg) {
     jce_json_set_string(root, "build_output_path", cfg->build_output_path);
     jce_json_set_string(root, "font_en_path", cfg->font_en_path);
     jce_json_set_string(root, "font_zh_path", cfg->font_zh_path);
+    jce_json_set_bool(root, "invert_scroll_zoom", cfg->invert_scroll_zoom);
+    jce_json_set_bool(root, "invert_drag_y",      cfg->invert_drag_y);
+    jce_json_set_bool(root, "touchpad_h_invert",  cfg->touchpad_h_invert);
+    jce_json_set_int (root, "panels_visible_mask", (int)cfg->panels_visible_mask);
+    jce_editor_pref_invert_scroll_zoom = cfg->invert_scroll_zoom;
+    jce_editor_pref_invert_drag_y      = cfg->invert_drag_y;
+    jce_editor_pref_touchpad_h_invert  = cfg->touchpad_h_invert;
 
     for (int i = 0; i < 10; i++) {
         char key[16];

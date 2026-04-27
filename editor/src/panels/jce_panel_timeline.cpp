@@ -6,14 +6,15 @@
  * and the scene render model cache for real-time animation preview.
  */
 
-#include "jce_editor_colors.h"
-#include "jce_editor_defaults.h"
-#include "jce_editor_i18n.h"
-#include "jce_editor_panels.h"
-#include "jce_editor_state.h"
+#include "ui/jce_editor_colors.h"
+#include "core/jce_editor_defaults.h"
+#include "core/jce_editor_i18n.h"
+#include "ui/jce_editor_panels.h"
+#include "core/jce_editor_state.h"
 #include "scene/jce_editor_scene_render.h"
+#include "widgets/jce_widget_timeline.h"
 
-#include <imgui.h>
+#include <jce/tools/jce_imgui.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -277,60 +278,32 @@ void jce_editor_panel_timeline_content(void)
     ImGui::BeginChild("TimelineArea", ImVec2(0, avail.y), ImGuiChildFlags_Borders,
                        ImGuiWindowFlags_HorizontalScrollbar);
 
-    ImDrawList *dl = ImGui::GetWindowDrawList();
     ImVec2 origin = ImGui::GetCursorScreenPos();
     float total_w = dur * s_tl.px_per_sec;
     if (total_w < 120.0f) total_w = 120.0f;
 
-    /* Ruler marks (every 0.1s minor, every 1.0s major) */
-    {
-        float step_minor = 0.1f;
-        float step_major = 1.0f;
-        for (float t = 0.0f; t <= dur + 0.001f; t += step_minor) {
-            float x = origin.x + t * s_tl.px_per_sec;
-            bool major = (fmodf(t + 0.001f, step_major) < step_minor * 0.5f);
-            float h = major ? 16.0f : 8.0f;
-            dl->AddLine(ImVec2(x, origin.y), ImVec2(x, origin.y + h),
-                        major ? IM_COL32(200, 200, 200, 255)
-                              : IM_COL32(100, 100, 100, 255));
-            if (major) {
-                char label[16];
-                snprintf(label, sizeof(label), "%.0fs", t);
-                dl->AddText(ImVec2(x + 2, origin.y), IM_COL32(200, 200, 200, 255), label);
-            }
-        }
-    }
+    /* Ruler (shared widget). */
+    jce_widget_timeline_ruler(origin, total_w, dur, s_tl.px_per_sec, 0.1f, 1.0f);
 
     /* Track rows */
     float row_y = origin.y + 24.0f;
     int track_count = 2 + (s_tl.has_animator || s_tl.has_skeletal ? 1 : 0);
     for (int t = 0; t < track_count; t++) {
-        ImU32 bg = (t % 2 == 0) ? ImGui::ColorConvertFloat4ToU32(JCE_COLOR_TL_TRACK_EVEN)
-                                 : ImGui::ColorConvertFloat4ToU32(JCE_COLOR_TL_TRACK_ODD);
-        dl->AddRectFilled(ImVec2(origin.x, row_y),
-                          ImVec2(origin.x + total_w, row_y + 24.0f), bg);
+        jce_widget_timeline_track_bg(origin, total_w, row_y, 24.0f, t);
         row_y += 24.0f;
     }
 
     /* Playhead */
-    float ph_x = origin.x + s_tl.current_time * s_tl.px_per_sec;
-    dl->AddLine(ImVec2(ph_x, origin.y),
-                ImVec2(ph_x, origin.y + avail.y),
-                ImGui::ColorConvertFloat4ToU32(JCE_COLOR_TL_PLAYHEAD), 2.0f);
+    jce_widget_timeline_playhead(origin, avail.y, s_tl.current_time,
+        s_tl.px_per_sec,
+        ImGui::ColorConvertFloat4ToU32(JCE_COLOR_TL_PLAYHEAD), 2.0f);
 
     ImGui::Dummy(ImVec2(total_w, 80));
 
     /* Click / drag to scrub playhead */
-    if (ImGui::IsWindowHovered() &&
-        (ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
-         (ImGui::IsMouseDown(ImGuiMouseButton_Left) && ImGui::IsMouseDragging(ImGuiMouseButton_Left)))) {
-        float mx = ImGui::GetMousePos().x - origin.x;
-        float t = mx / s_tl.px_per_sec;
-        if (t < 0.0f) t = 0.0f;
-        if (t > dur)  t = dur;
-        s_tl.current_time = t;
+    if (jce_widget_timeline_scrub(origin, total_w, dur, s_tl.px_per_sec,
+                                  &s_tl.current_time))
         sync_to_entity();
-    }
 
     ImGui::EndChild();
 

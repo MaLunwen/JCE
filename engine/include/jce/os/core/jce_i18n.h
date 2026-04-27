@@ -48,23 +48,23 @@ typedef enum {
 } JceStringId;
 
 /* Load all translation JSON files from PAK.  Call once at startup. */
-void        jce_i18n_init(const JcePakArchive *pak);
+JCE_API void        jce_i18n_init(const JcePakArchive *pak);
 
 /* Set / get the active language. */
-void        jce_i18n_set_lang(JceLang lang);
-JceLang     jce_i18n_get_lang(void);
+JCE_API void        jce_i18n_set_lang(JceLang lang);
+JCE_API JceLang     jce_i18n_get_lang(void);
 
 /* Return the translated string for the active language.
    Falls back to English if the key is missing. */
-const char *jce_i18n_get(JceStringId id);
+JCE_API const char *jce_i18n_get(JceStringId id);
 
 /* Short display name for the current language ("EN", "ZH", ...). */
-const char *jce_i18n_lang_name(void);
+JCE_API const char *jce_i18n_lang_name(void);
 
 /* Collect all unique non-ASCII codepoints used across ALL languages.
    Writes up to `cap` codepoints into `buf`.
    Returns the number written. */
-int         jce_i18n_collect_codepoints(uint32_t *buf, int cap);
+JCE_API int         jce_i18n_collect_codepoints(uint32_t *buf, int cap);
 
 JCE_EXTERN_C_END
 

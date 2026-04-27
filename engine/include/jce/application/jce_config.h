@@ -56,12 +56,12 @@ typedef struct JceConfig {
 } JceConfig;
 
 /* Fill cfg with default values. */
-JceConfig jce_config_defaults(void);
+JCE_API JceConfig jce_config_defaults(void);
 
 /* Load config from an INI file, overriding only the keys found.
    Returns true if the file was opened successfully.
    If the file doesn't exist, cfg keeps its current values. */
-bool jce_config_load(JceConfig *cfg, const char *path);
+JCE_API bool jce_config_load(JceConfig *cfg, const char *path);
 
 JCE_EXTERN_C_END
 

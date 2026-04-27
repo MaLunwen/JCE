@@ -17,9 +17,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef __APPLE__
-#include <TargetConditionals.h>
-#endif
+/* Platform detection comes from <jce/...> headers below; no raw
+   __APPLE__ / TargetConditionals.h needed in game code. */
 
 #define FT_HISTORY      120
 #define FT_GRAPH_COLS    60
@@ -295,9 +294,7 @@ CkApp *ck_app_create(const JceServices *svc)
     /* Touch HUD: auto-create on native touch platforms. */
     {
         bool is_touch_platform = false;
-#if defined(__ANDROID__) || defined(__EMSCRIPTEN__)
-        is_touch_platform = true;
-#elif defined(__APPLE__) && (TARGET_OS_IOS || TARGET_OS_TV)
+#if JCE_PLATFORM_TOUCH
         is_touch_platform = true;
 #endif
         // cppcheck-suppress knownConditionTrueFalse
@@ -801,7 +798,7 @@ void ck_app_update(CkApp *app)
     JCE_PROFILE_ZONE_END;
 }
 
-void ck_app_event(CkApp *app, const void *event)
+void ck_app_event(CkApp *app, const JceEvent *event)
 {
     (void)app; (void)event;
 }
@@ -850,7 +847,7 @@ static void demo_on_resize(uint32_t w, uint32_t h, void *ud)
         jce_ui_resize(s_app->ui, w, h);
 }
 
-static void demo_on_event(const void *ev, void *ud)
+static void demo_on_event(const JceEvent *ev, void *ud)
 {
     (void)ud;
     ck_app_event(s_app, ev);

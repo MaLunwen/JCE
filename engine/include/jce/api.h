@@ -32,7 +32,14 @@
 #ifndef JCE_API_H
 #define JCE_API_H
 
+/* ── Layer 0: Compatibility baseline (compile-time assertions) ────── */
+#include <jce/jce_compat.h>
+
 /* ── Layer 1: Core Utilities ─────────────────────────────────────── */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <jce/api_core.h>
 
 /* ── Layer 2: OS / Platform Abstraction ──────────────────────────── */
@@ -60,4 +67,9 @@
 #include <jce/api_physics.h>
 #include <jce/api_ui.h>
 
+
+
+#ifdef __cplusplus
+}
+#endif
 #endif /* JCE_API_H */

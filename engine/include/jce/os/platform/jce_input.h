@@ -26,41 +26,41 @@ JCE_EXTERN_C_BEGIN
 typedef struct JceInput JceInput;
 
 /* Create / destroy. */
-JceInput *jce_input_create(void);
-void      jce_input_destroy(JceInput *input);
+JCE_API JceInput *jce_input_create(void);
+JCE_API void      jce_input_destroy(JceInput *input);
 
 /* Call at the START of each frame (before processing events).
    Copies current state  previous, resets per-frame deltas. */
-void      jce_input_update(JceInput *input);
+JCE_API void      jce_input_update(JceInput *input);
 
 /* Feed a platform event; call from the engine event handler.
    The event pointer is backend-specific (SDL_Event* internally). */
-void      jce_input_handle_event(JceInput *input, const void *event);
+JCE_API void      jce_input_handle_event(JceInput *input, const void *event);
 
 /* -- Keyboard ------------------------------------------------------- */
 
-bool      jce_input_key_down(const JceInput *input, JceKey key);
-bool      jce_input_key_pressed(const JceInput *input, JceKey key);
-bool      jce_input_key_released(const JceInput *input, JceKey key);
+JCE_API bool      jce_input_key_down(const JceInput *input, JceKey key);
+JCE_API bool      jce_input_key_pressed(const JceInput *input, JceKey key);
+JCE_API bool      jce_input_key_released(const JceInput *input, JceKey key);
 
 /* -- Mouse ---------------------------------------------------------- */
 
-void      jce_input_mouse_pos(const JceInput *input, float *x, float *y);
-void      jce_input_mouse_delta(const JceInput *input, float *dx, float *dy);
-bool      jce_input_mouse_button(const JceInput *input, int button);
-bool      jce_input_mouse_button_pressed(const JceInput *input, int button);
-bool      jce_input_mouse_button_released(const JceInput *input, int button);
-float     jce_input_mouse_wheel(const JceInput *input);
+JCE_API void      jce_input_mouse_pos(const JceInput *input, float *x, float *y);
+JCE_API void      jce_input_mouse_delta(const JceInput *input, float *dx, float *dy);
+JCE_API bool      jce_input_mouse_button(const JceInput *input, int button);
+JCE_API bool      jce_input_mouse_button_pressed(const JceInput *input, int button);
+JCE_API bool      jce_input_mouse_button_released(const JceInput *input, int button);
+JCE_API float     jce_input_mouse_wheel(const JceInput *input);
 
 /* -- Touch (mobile) ------------------------------------------------- */
 
-int       jce_input_touch_count(const JceInput *input);
+JCE_API int       jce_input_touch_count(const JceInput *input);
 bool      jce_input_touch_get(const JceInput *input, int index,
               JceFingerID *id, float *x, float *y, float *pressure);
 
 /* -- Gamepad -------------------------------------------------------- */
 
-int       jce_input_gamepad_count(const JceInput *input);
+JCE_API int       jce_input_gamepad_count(const JceInput *input);
 bool      jce_input_gamepad_button(const JceInput *input, int pad,
               JceGamepadButton btn);
 bool      jce_input_gamepad_button_pressed(const JceInput *input, int pad,

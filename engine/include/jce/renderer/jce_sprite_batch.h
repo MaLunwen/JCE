@@ -21,11 +21,11 @@ typedef struct JceSpriteBatch JceSpriteBatch;
 typedef struct JceRenderer JceRenderer;
 
 /* Create a sprite batch (max_sprites = maximum quads per flush). */
-JceSpriteBatch *jce_sprite_batch_create(uint32_t max_sprites);
-void            jce_sprite_batch_destroy(JceSpriteBatch *batch);
+JCE_API JceSpriteBatch *jce_sprite_batch_create(uint32_t max_sprites);
+JCE_API void            jce_sprite_batch_destroy(JceSpriteBatch *batch);
 
 /* Begin a new batch frame. */
-void jce_sprite_batch_begin(JceSpriteBatch *batch);
+JCE_API void jce_sprite_batch_begin(JceSpriteBatch *batch);
 
 /*
  * Add a sprite quad to the batch.
@@ -51,7 +51,7 @@ void jce_sprite_batch_flush(JceSpriteBatch *batch,
                              uint16_t view_id);
 
 /* Get number of sprites queued this frame. */
-uint32_t jce_sprite_batch_count(const JceSpriteBatch *batch);
+JCE_API uint32_t jce_sprite_batch_count(const JceSpriteBatch *batch);
 
 JCE_EXTERN_C_END
 

@@ -26,6 +26,17 @@ typedef enum {
     JCE_PANEL_ASSETS,
     JCE_PANEL_FILE_VIEWER,
     JCE_PANEL_POSTFX,
+    JCE_PANEL_PROFILER,
+    JCE_PANEL_PARTICLE_EDITOR,
+    JCE_PANEL_MATERIAL_GRAPH,
+    JCE_PANEL_IMPORT_PRESETS,
+    JCE_PANEL_LIGHTMAP_BAKE,
+    JCE_PANEL_CURVE_EDITOR,
+    JCE_PANEL_ANIMATION_EDITOR,
+    JCE_PANEL_ANIMATOR_SM,
+    JCE_PANEL_SEQUENCER,
+    JCE_PANEL_NAVMESH,
+    JCE_PANEL_TERRAIN,
     JCE_PANEL_PREFERENCES,
     JCE_PANEL_COUNT
 } JceEditorPanel;
@@ -37,6 +48,11 @@ void  jce_editor_panels_shutdown(void);
 /* Visibility toggle (returns pointer for ImGui::MenuItem binding). */
 bool *jce_editor_panel_visible_ptr(JceEditorPanel panel);
 
+/* Persist current visibility mask to editor-config if changed since last
+   call. Cheap (no-op when stable). Call once per frame from the main UI
+   loop after panel toggles are processed. */
+void  jce_editor_panels_persist_visibility(void);
+
 /* Draw individual panels as standalone windows (only if visible). */
 void  jce_editor_panel_hierarchy(void);
 void  jce_editor_panel_inspector(void);
@@ -47,6 +63,17 @@ void  jce_editor_panel_timeline(void);
 void  jce_editor_panel_assets(void);
 void  jce_editor_panel_file_viewer(void);
 void  jce_editor_panel_postfx(void);
+void  jce_editor_panel_profiler(void);
+void  jce_editor_panel_particle_editor(void);
+void  jce_editor_panel_material_graph(void);
+void  jce_editor_panel_import_presets(void);
+void  jce_editor_panel_lightmap_bake(void);
+void  jce_editor_panel_curve_editor(void);
+void  jce_editor_panel_animation_editor(void);
+void  jce_editor_panel_animator_sm(void);
+void  jce_editor_panel_sequencer(void);
+void  jce_editor_panel_navmesh(void);
+void  jce_editor_panel_terrain(void);
 void  jce_editor_panel_preferences(void);
 
 /* Draw panel content only (no Begin/End — for embedding in layout tabs). */
@@ -59,12 +86,10 @@ void  jce_editor_panel_timeline_content(void);
 void  jce_editor_panel_assets_content(void);
 void  jce_editor_panel_file_viewer_content(void);
 void  jce_editor_panel_postfx_content(void);
+void  jce_editor_panel_profiler_content(void);
 
 /* About dialog (modal). */
 void  jce_editor_about_dialog(bool *p_open);
-
-/* Settings dialog (modal — will replace Preferences). */
-void  jce_editor_settings_dialog(bool *p_open);
 
 /* File viewer: open a file for preview. */
 void  jce_file_viewer_open(const char *path);

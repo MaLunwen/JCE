@@ -8,16 +8,16 @@
 #include <jce/os/platform/jce_host_dialog.h>
 
 #include "io/jce_editor_file_util.h"
-#include "jce_editor_colors.h"
-#include "jce_editor_config.h"
+#include "ui/jce_editor_colors.h"
+#include "core/jce_editor_config.h"
 #include "jce_editor_dialogs.h"
-#include "jce_editor_i18n.h"
-#include "jce_editor_layout.h"
-#include "jce_editor_panels.h"
-#include "jce_editor_state.h"
+#include "core/jce_editor_i18n.h"
+#include "ui/jce_editor_layout.h"
+#include "ui/jce_editor_panels.h"
+#include "core/jce_editor_state.h"
 #include "viewers/jce_file_viewer.h"
 
-#include <imgui.h>
+#include <jce/tools/jce_imgui.h>
 #include <stdio.h>
 #include <string.h>
 

@@ -10,6 +10,7 @@
  */
 
 #include "jce_fv_common.h"
+#include "ui/jce_theme_palette.h"
 
 /* ══════════════════════════════════════════════════════════════════════
  *  RENDER
@@ -72,7 +73,7 @@ void fv_render_image(FvTab *tab)
         zp.pan_x       = &tab->pan_x;
         zp.pan_y       = &tab->pan_y;
         zp.allow_double_click_toggle = true;
-        zp.matte_color = IM_COL32(48, 48, 52, 255);
+        zp.matte_color = jce_theme::canvas_bg();
         fv_render_zoomable(&zp);
     } else {
         /* Fallback: texture not loaded */

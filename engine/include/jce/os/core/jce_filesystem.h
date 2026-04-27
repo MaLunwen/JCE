@@ -27,7 +27,7 @@ typedef struct JceFile JceFile;
 
 /* -- Lifecycle ------------------------------------------------------ */
 
-JceFileSystem *jce_fs_create(void);
+JCE_API JceFileSystem *jce_fs_create(void);
 JCE_API void JCE_CALL jce_fs_destroy(JceFileSystem *fs);
 
 /* -- Mount points --------------------------------------------------- */
@@ -46,7 +46,7 @@ JCE_API void JCE_CALL jce_fs_mount_dir(JceFileSystem *fs, const char *prefix,
 /* -- File operations ------------------------------------------------ */
 
 /* Open a virtual file for reading.  Returns NULL if not found. */
-JceFile *jce_fs_open(const JceFileSystem *fs, const char *virtual_path);
+JCE_API JceFile *jce_fs_open(const JceFileSystem *fs, const char *virtual_path);
 
 /* Close a file. */
 JCE_API void JCE_CALL jce_fs_close(JceFile *file);
@@ -81,7 +81,7 @@ JCE_API bool JCE_CALL jce_fs_set_write_dir(JceFileSystem *fs, const char *direct
 /* Open a virtual file for writing.  Returns NULL on failure.
    The path is relative to the write directory set by jce_fs_set_write_dir.
    Creates the file if it does not exist; truncates if it does. */
-JceFile *jce_fs_open_write(JceFileSystem *fs, const char *virtual_path);
+JCE_API JceFile *jce_fs_open_write(JceFileSystem *fs, const char *virtual_path);
 
 /* Write bytes to an opened-for-write file.  Returns bytes written. */
 JCE_API size_t JCE_CALL jce_fs_write(JceFile *file, const void *buf, size_t size);
@@ -123,6 +123,12 @@ JCE_API bool JCE_CALL jce_fs_host_remove_file(const char *path);
 typedef bool (*JceFsHostWalkFn)(const char *path, bool is_dir, void *user);
 JCE_API bool JCE_CALL jce_fs_host_walk(const char *root, JceFsHostWalkFn cb, void *user);
 
+/* Single-level directory enumeration (non-recursive).  `cb` receives
+   the entry's leaf name (no path prefix) and a bool flag for dirs.
+   Return false from `cb` to stop early.  Returns false on error. */
+typedef bool (*JceFsHostListFn)(const char *name, bool is_dir, void *user);
+JCE_API bool JCE_CALL jce_fs_host_list_dir(const char *dir, JceFsHostListFn cb, void *user);
+
 /* Get last-modified time as Unix epoch seconds.  Returns false if
    the path does not exist. */
 JCE_API bool JCE_CALL jce_fs_host_get_mtime(const char *path, int64_t *out_epoch_sec);
@@ -160,13 +166,31 @@ JCE_API bool JCE_CALL jce_fs_host_make_unique_path(const char *desired,
    On success returns a JCE_MALLOC'd buffer of *out_size bytes (caller
    frees with JCE_FREE) and writes the byte count to *out_size.
    Returns NULL on any error (missing file, read truncation, OOM). */
-void *jce_fs_host_read_all(const char *path, size_t *out_size);
+JCE_API void *jce_fs_host_read_all(const char *path, size_t *out_size);
 
 /* Write an entire buffer to a host-path file (truncate-and-replace).
    Creates parent directories that do not exist.  Returns true on
    success. */
 JCE_API bool JCE_CALL jce_fs_host_write_all(const char *path,
                            const void *data, size_t size);
+
+/* Append a buffer to the end of a host-path file (creating it if missing).
+   Returns true on success.  Suitable for log/KPI streams; not safe for
+   concurrent multi-process appends. */
+JCE_API bool JCE_CALL jce_fs_host_append(const char *path,
+                           const void *data, size_t size);
+
+/* Read up to `max_bytes` of a host-path file into a freshly allocated
+   buffer.  On success returns a JCE_MALLOC'd buffer of *out_read bytes
+   (always NUL-terminated past the end so it's safe to cast to char*),
+   and writes the full file size to *out_total (caller may pass NULL
+   for either).  Returns NULL on failure. */
+JCE_API void *jce_fs_host_read_capped(const char *path, size_t max_bytes,
+                                      size_t *out_read, size_t *out_total);
+
+/* Get the executable's directory (with trailing path separator) into
+   `out`.  Returns true on success.  Equivalent to SDL_GetBasePath. */
+JCE_API bool JCE_CALL jce_fs_host_get_base_path(char *out, size_t out_size);
 
 JCE_EXTERN_C_END
 

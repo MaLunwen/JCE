@@ -7,27 +7,38 @@
 
 #include "jce_editor.h"
 
+#include <cstdlib>
+#include <cmath>
+
+#include <jce/os/core/jce_str.h>
 #include <jce/os/core/jce_timer.h>
 
 #include "gizmo/jce_gizmo.h"
 #include "jce_editor_alloc.h"
 #include "jce_editor_config.h"
 #include "jce_editor_i18n.h"
-#include "jce_editor_layout.h"
-#include "jce_editor_panels.h"
+#include "ui/jce_editor_layout.h"
+#include "ui/jce_editor_panels.h"
 #include "jce_editor_state.h"
-#include "jce_editor_style.h"
-#include "jce_imgui_bgfx.h"
+#include "ui/jce_editor_style.h"
+#include <jce/ui/jce_imgui_renderer.h>
+#include "jce_build_manager.h"
 #include "jce_run_manager.h"
 
-#include <imgui.h>
-#include <SDL3/SDL.h>
+extern "C" void jce_reflect_register_builtin(void);
+extern "C" void jce_hotkeys_init(void);
+
+#include <jce/tools/jce_imgui.h>
 #include <stdio.h>
 #include <string.h>
 
 extern "C" {
+#include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
-#include <jce/os/core/pak_loader.h>
+#include <jce/os/core/jce_pak_loader.h>
+#include <jce/os/core/jce_str.h>
+#include <jce/os/platform/jce_clipboard.h>
+#include <jce/os/platform/jce_cursor.h>
 #include <jce/os/platform/jce_window.h>
 #include <jce/renderer/jce_views.h>
 }
@@ -40,140 +51,140 @@ static struct {
     bool        initialized;
     bool        active;         /* editor overlay visible? */
     uint64_t    last_time;      /* for delta-time computation */
-    SDL_Cursor *cursors[ImGuiMouseCursor_COUNT];
+    JceCursor  *cursors[ImGuiMouseCursor_COUNT];
     JceWindow  *window;         /* opaque engine window for text input API */
     bool        text_input_active;
     const JcePakArchive *pak;      /* stored for font rebuild */
     float       font_size;      /* current font size in pixels */
 
-    SDL_IOStream *frame_kpi_file;
+    char        frame_kpi_path[1024];
     uint32_t    frame_kpi_index;
     uint32_t    frame_kpi_limit;
 } s_editor;
 
-/* ── SDL3 key mapping ──────────────────────────────────────────────── */
+/* ── Key mapping (JCE → ImGui) ─────────────────────────────────────── */
 
-static ImGuiKey sdl_scancode_to_imgui_key(SDL_Scancode sc)
+static ImGuiKey jce_key_to_imgui_key(JceKey sc)
 {
     switch (sc) {
-    case SDL_SCANCODE_TAB:          return ImGuiKey_Tab;
-    case SDL_SCANCODE_LEFT:         return ImGuiKey_LeftArrow;
-    case SDL_SCANCODE_RIGHT:        return ImGuiKey_RightArrow;
-    case SDL_SCANCODE_UP:           return ImGuiKey_UpArrow;
-    case SDL_SCANCODE_DOWN:         return ImGuiKey_DownArrow;
-    case SDL_SCANCODE_PAGEUP:       return ImGuiKey_PageUp;
-    case SDL_SCANCODE_PAGEDOWN:     return ImGuiKey_PageDown;
-    case SDL_SCANCODE_HOME:         return ImGuiKey_Home;
-    case SDL_SCANCODE_END:          return ImGuiKey_End;
-    case SDL_SCANCODE_INSERT:       return ImGuiKey_Insert;
-    case SDL_SCANCODE_DELETE:        return ImGuiKey_Delete;
-    case SDL_SCANCODE_BACKSPACE:    return ImGuiKey_Backspace;
-    case SDL_SCANCODE_SPACE:        return ImGuiKey_Space;
-    case SDL_SCANCODE_RETURN:       return ImGuiKey_Enter;
-    case SDL_SCANCODE_ESCAPE:       return ImGuiKey_Escape;
-    case SDL_SCANCODE_APOSTROPHE:   return ImGuiKey_Apostrophe;
-    case SDL_SCANCODE_COMMA:        return ImGuiKey_Comma;
-    case SDL_SCANCODE_MINUS:        return ImGuiKey_Minus;
-    case SDL_SCANCODE_PERIOD:       return ImGuiKey_Period;
-    case SDL_SCANCODE_SLASH:        return ImGuiKey_Slash;
-    case SDL_SCANCODE_SEMICOLON:    return ImGuiKey_Semicolon;
-    case SDL_SCANCODE_EQUALS:       return ImGuiKey_Equal;
-    case SDL_SCANCODE_LEFTBRACKET:  return ImGuiKey_LeftBracket;
-    case SDL_SCANCODE_BACKSLASH:    return ImGuiKey_Backslash;
-    case SDL_SCANCODE_RIGHTBRACKET: return ImGuiKey_RightBracket;
-    case SDL_SCANCODE_GRAVE:        return ImGuiKey_GraveAccent;
-    case SDL_SCANCODE_CAPSLOCK:     return ImGuiKey_CapsLock;
-    case SDL_SCANCODE_SCROLLLOCK:   return ImGuiKey_ScrollLock;
-    case SDL_SCANCODE_NUMLOCKCLEAR: return ImGuiKey_NumLock;
-    case SDL_SCANCODE_PRINTSCREEN:  return ImGuiKey_PrintScreen;
-    case SDL_SCANCODE_PAUSE:        return ImGuiKey_Pause;
-    case SDL_SCANCODE_LCTRL:        return ImGuiKey_LeftCtrl;
-    case SDL_SCANCODE_LSHIFT:       return ImGuiKey_LeftShift;
-    case SDL_SCANCODE_LALT:         return ImGuiKey_LeftAlt;
-    case SDL_SCANCODE_LGUI:         return ImGuiKey_LeftSuper;
-    case SDL_SCANCODE_RCTRL:        return ImGuiKey_RightCtrl;
-    case SDL_SCANCODE_RSHIFT:       return ImGuiKey_RightShift;
-    case SDL_SCANCODE_RALT:         return ImGuiKey_RightAlt;
-    case SDL_SCANCODE_RGUI:         return ImGuiKey_RightSuper;
-    case SDL_SCANCODE_KP_0:         return ImGuiKey_Keypad0;
-    case SDL_SCANCODE_KP_1:         return ImGuiKey_Keypad1;
-    case SDL_SCANCODE_KP_2:         return ImGuiKey_Keypad2;
-    case SDL_SCANCODE_KP_3:         return ImGuiKey_Keypad3;
-    case SDL_SCANCODE_KP_4:         return ImGuiKey_Keypad4;
-    case SDL_SCANCODE_KP_5:         return ImGuiKey_Keypad5;
-    case SDL_SCANCODE_KP_6:         return ImGuiKey_Keypad6;
-    case SDL_SCANCODE_KP_7:         return ImGuiKey_Keypad7;
-    case SDL_SCANCODE_KP_8:         return ImGuiKey_Keypad8;
-    case SDL_SCANCODE_KP_9:         return ImGuiKey_Keypad9;
-    case SDL_SCANCODE_KP_PERIOD:    return ImGuiKey_KeypadDecimal;
-    case SDL_SCANCODE_KP_DIVIDE:    return ImGuiKey_KeypadDivide;
-    case SDL_SCANCODE_KP_MULTIPLY:  return ImGuiKey_KeypadMultiply;
-    case SDL_SCANCODE_KP_MINUS:     return ImGuiKey_KeypadSubtract;
-    case SDL_SCANCODE_KP_PLUS:      return ImGuiKey_KeypadAdd;
-    case SDL_SCANCODE_KP_ENTER:     return ImGuiKey_KeypadEnter;
-    case SDL_SCANCODE_KP_EQUALS:    return ImGuiKey_KeypadEqual;
-    case SDL_SCANCODE_A: return ImGuiKey_A; case SDL_SCANCODE_B: return ImGuiKey_B;
-    case SDL_SCANCODE_C: return ImGuiKey_C; case SDL_SCANCODE_D: return ImGuiKey_D;
-    case SDL_SCANCODE_E: return ImGuiKey_E; case SDL_SCANCODE_F: return ImGuiKey_F;
-    case SDL_SCANCODE_G: return ImGuiKey_G; case SDL_SCANCODE_H: return ImGuiKey_H;
-    case SDL_SCANCODE_I: return ImGuiKey_I; case SDL_SCANCODE_J: return ImGuiKey_J;
-    case SDL_SCANCODE_K: return ImGuiKey_K; case SDL_SCANCODE_L: return ImGuiKey_L;
-    case SDL_SCANCODE_M: return ImGuiKey_M; case SDL_SCANCODE_N: return ImGuiKey_N;
-    case SDL_SCANCODE_O: return ImGuiKey_O; case SDL_SCANCODE_P: return ImGuiKey_P;
-    case SDL_SCANCODE_Q: return ImGuiKey_Q; case SDL_SCANCODE_R: return ImGuiKey_R;
-    case SDL_SCANCODE_S: return ImGuiKey_S; case SDL_SCANCODE_T: return ImGuiKey_T;
-    case SDL_SCANCODE_U: return ImGuiKey_U; case SDL_SCANCODE_V: return ImGuiKey_V;
-    case SDL_SCANCODE_W: return ImGuiKey_W; case SDL_SCANCODE_X: return ImGuiKey_X;
-    case SDL_SCANCODE_Y: return ImGuiKey_Y; case SDL_SCANCODE_Z: return ImGuiKey_Z;
-    case SDL_SCANCODE_0: return ImGuiKey_0; case SDL_SCANCODE_1: return ImGuiKey_1;
-    case SDL_SCANCODE_2: return ImGuiKey_2; case SDL_SCANCODE_3: return ImGuiKey_3;
-    case SDL_SCANCODE_4: return ImGuiKey_4; case SDL_SCANCODE_5: return ImGuiKey_5;
-    case SDL_SCANCODE_6: return ImGuiKey_6; case SDL_SCANCODE_7: return ImGuiKey_7;
-    case SDL_SCANCODE_8: return ImGuiKey_8; case SDL_SCANCODE_9: return ImGuiKey_9;
-    case SDL_SCANCODE_F1:  return ImGuiKey_F1;  case SDL_SCANCODE_F2:  return ImGuiKey_F2;
-    case SDL_SCANCODE_F3:  return ImGuiKey_F3;  case SDL_SCANCODE_F4:  return ImGuiKey_F4;
-    case SDL_SCANCODE_F5:  return ImGuiKey_F5;  case SDL_SCANCODE_F6:  return ImGuiKey_F6;
-    case SDL_SCANCODE_F7:  return ImGuiKey_F7;  case SDL_SCANCODE_F8:  return ImGuiKey_F8;
-    case SDL_SCANCODE_F9:  return ImGuiKey_F9;  case SDL_SCANCODE_F10: return ImGuiKey_F10;
-    case SDL_SCANCODE_F11: return ImGuiKey_F11; case SDL_SCANCODE_F12: return ImGuiKey_F12;
+    case JCE_KEY_TAB:          return ImGuiKey_Tab;
+    case JCE_KEY_LEFT:         return ImGuiKey_LeftArrow;
+    case JCE_KEY_RIGHT:        return ImGuiKey_RightArrow;
+    case JCE_KEY_UP:           return ImGuiKey_UpArrow;
+    case JCE_KEY_DOWN:         return ImGuiKey_DownArrow;
+    case JCE_KEY_PAGEUP:       return ImGuiKey_PageUp;
+    case JCE_KEY_PAGEDOWN:     return ImGuiKey_PageDown;
+    case JCE_KEY_HOME:         return ImGuiKey_Home;
+    case JCE_KEY_END:          return ImGuiKey_End;
+    case JCE_KEY_INSERT:       return ImGuiKey_Insert;
+    case JCE_KEY_DELETE:       return ImGuiKey_Delete;
+    case JCE_KEY_BACKSPACE:    return ImGuiKey_Backspace;
+    case JCE_KEY_SPACE:        return ImGuiKey_Space;
+    case JCE_KEY_RETURN:       return ImGuiKey_Enter;
+    case JCE_KEY_ESCAPE:       return ImGuiKey_Escape;
+    case JCE_KEY_APOSTROPHE:   return ImGuiKey_Apostrophe;
+    case JCE_KEY_COMMA:        return ImGuiKey_Comma;
+    case JCE_KEY_MINUS:        return ImGuiKey_Minus;
+    case JCE_KEY_PERIOD:       return ImGuiKey_Period;
+    case JCE_KEY_SLASH:        return ImGuiKey_Slash;
+    case JCE_KEY_SEMICOLON:    return ImGuiKey_Semicolon;
+    case JCE_KEY_EQUALS:       return ImGuiKey_Equal;
+    case JCE_KEY_LEFTBRACKET:  return ImGuiKey_LeftBracket;
+    case JCE_KEY_BACKSLASH:    return ImGuiKey_Backslash;
+    case JCE_KEY_RIGHTBRACKET: return ImGuiKey_RightBracket;
+    case JCE_KEY_GRAVE:        return ImGuiKey_GraveAccent;
+    case JCE_KEY_CAPSLOCK:     return ImGuiKey_CapsLock;
+    case JCE_KEY_SCROLLLOCK:   return ImGuiKey_ScrollLock;
+    case JCE_KEY_NUMLOCKCLEAR: return ImGuiKey_NumLock;
+    case JCE_KEY_PRINTSCREEN:  return ImGuiKey_PrintScreen;
+    case JCE_KEY_PAUSE:        return ImGuiKey_Pause;
+    case JCE_KEY_LCTRL:        return ImGuiKey_LeftCtrl;
+    case JCE_KEY_LSHIFT:       return ImGuiKey_LeftShift;
+    case JCE_KEY_LALT:         return ImGuiKey_LeftAlt;
+    case JCE_KEY_LGUI:         return ImGuiKey_LeftSuper;
+    case JCE_KEY_RCTRL:        return ImGuiKey_RightCtrl;
+    case JCE_KEY_RSHIFT:       return ImGuiKey_RightShift;
+    case JCE_KEY_RALT:         return ImGuiKey_RightAlt;
+    case JCE_KEY_RGUI:         return ImGuiKey_RightSuper;
+    case JCE_KEY_KP_0:         return ImGuiKey_Keypad0;
+    case JCE_KEY_KP_1:         return ImGuiKey_Keypad1;
+    case JCE_KEY_KP_2:         return ImGuiKey_Keypad2;
+    case JCE_KEY_KP_3:         return ImGuiKey_Keypad3;
+    case JCE_KEY_KP_4:         return ImGuiKey_Keypad4;
+    case JCE_KEY_KP_5:         return ImGuiKey_Keypad5;
+    case JCE_KEY_KP_6:         return ImGuiKey_Keypad6;
+    case JCE_KEY_KP_7:         return ImGuiKey_Keypad7;
+    case JCE_KEY_KP_8:         return ImGuiKey_Keypad8;
+    case JCE_KEY_KP_9:         return ImGuiKey_Keypad9;
+    case JCE_KEY_KP_PERIOD:    return ImGuiKey_KeypadDecimal;
+    case JCE_KEY_KP_DIVIDE:    return ImGuiKey_KeypadDivide;
+    case JCE_KEY_KP_MULTIPLY:  return ImGuiKey_KeypadMultiply;
+    case JCE_KEY_KP_MINUS:     return ImGuiKey_KeypadSubtract;
+    case JCE_KEY_KP_PLUS:      return ImGuiKey_KeypadAdd;
+    case JCE_KEY_KP_ENTER:     return ImGuiKey_KeypadEnter;
+    case JCE_KEY_KP_EQUALS:    return ImGuiKey_KeypadEqual;
+    case JCE_KEY_A: return ImGuiKey_A; case JCE_KEY_B: return ImGuiKey_B;
+    case JCE_KEY_C: return ImGuiKey_C; case JCE_KEY_D: return ImGuiKey_D;
+    case JCE_KEY_E: return ImGuiKey_E; case JCE_KEY_F: return ImGuiKey_F;
+    case JCE_KEY_G: return ImGuiKey_G; case JCE_KEY_H: return ImGuiKey_H;
+    case JCE_KEY_I: return ImGuiKey_I; case JCE_KEY_J: return ImGuiKey_J;
+    case JCE_KEY_K: return ImGuiKey_K; case JCE_KEY_L: return ImGuiKey_L;
+    case JCE_KEY_M: return ImGuiKey_M; case JCE_KEY_N: return ImGuiKey_N;
+    case JCE_KEY_O: return ImGuiKey_O; case JCE_KEY_P: return ImGuiKey_P;
+    case JCE_KEY_Q: return ImGuiKey_Q; case JCE_KEY_R: return ImGuiKey_R;
+    case JCE_KEY_S: return ImGuiKey_S; case JCE_KEY_T: return ImGuiKey_T;
+    case JCE_KEY_U: return ImGuiKey_U; case JCE_KEY_V: return ImGuiKey_V;
+    case JCE_KEY_W: return ImGuiKey_W; case JCE_KEY_X: return ImGuiKey_X;
+    case JCE_KEY_Y: return ImGuiKey_Y; case JCE_KEY_Z: return ImGuiKey_Z;
+    case JCE_KEY_0: return ImGuiKey_0; case JCE_KEY_1: return ImGuiKey_1;
+    case JCE_KEY_2: return ImGuiKey_2; case JCE_KEY_3: return ImGuiKey_3;
+    case JCE_KEY_4: return ImGuiKey_4; case JCE_KEY_5: return ImGuiKey_5;
+    case JCE_KEY_6: return ImGuiKey_6; case JCE_KEY_7: return ImGuiKey_7;
+    case JCE_KEY_8: return ImGuiKey_8; case JCE_KEY_9: return ImGuiKey_9;
+    case JCE_KEY_F1:  return ImGuiKey_F1;  case JCE_KEY_F2:  return ImGuiKey_F2;
+    case JCE_KEY_F3:  return ImGuiKey_F3;  case JCE_KEY_F4:  return ImGuiKey_F4;
+    case JCE_KEY_F5:  return ImGuiKey_F5;  case JCE_KEY_F6:  return ImGuiKey_F6;
+    case JCE_KEY_F7:  return ImGuiKey_F7;  case JCE_KEY_F8:  return ImGuiKey_F8;
+    case JCE_KEY_F9:  return ImGuiKey_F9;  case JCE_KEY_F10: return ImGuiKey_F10;
+    case JCE_KEY_F11: return ImGuiKey_F11; case JCE_KEY_F12: return ImGuiKey_F12;
     default: return ImGuiKey_None;
     }
 }
 
-static void update_key_modifiers(SDL_Keymod mods)
+static void update_key_modifiers(uint16_t mods)
 {
     ImGuiIO &io = ImGui::GetIO();
-    io.AddKeyEvent(ImGuiMod_Ctrl,  (mods & SDL_KMOD_CTRL)  != 0);
-    io.AddKeyEvent(ImGuiMod_Shift, (mods & SDL_KMOD_SHIFT) != 0);
-    io.AddKeyEvent(ImGuiMod_Alt,   (mods & SDL_KMOD_ALT)   != 0);
-    io.AddKeyEvent(ImGuiMod_Super, (mods & SDL_KMOD_GUI)   != 0);
+    io.AddKeyEvent(ImGuiMod_Ctrl,  (mods & JCE_KMOD_CTRL)  != 0);
+    io.AddKeyEvent(ImGuiMod_Shift, (mods & JCE_KMOD_SHIFT) != 0);
+    io.AddKeyEvent(ImGuiMod_Alt,   (mods & JCE_KMOD_ALT)   != 0);
+    io.AddKeyEvent(ImGuiMod_Super, (mods & JCE_KMOD_GUI)   != 0);
 }
 
-/* ── Clipboard (SDL3 <-> ImGui) ────────────────────────────────────── */
+/* ── Clipboard (JCE <-> ImGui) ────────────────────────────────────── */
 
 static const char *clipboard_get(void *)
 {
-    return SDL_GetClipboardText();
+    return jce_clipboard_get_text();
 }
 
 static void clipboard_set(void *, const char *text)
 {
-    SDL_SetClipboardText(text);
+    jce_clipboard_set_text(text);
 }
 
 /* ── Cursor mapping ────────────────────────────────────────────────── */
 
 static void create_cursors(void)
 {
-    s_editor.cursors[ImGuiMouseCursor_Arrow]      = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_DEFAULT);
-    s_editor.cursors[ImGuiMouseCursor_TextInput]   = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_TEXT);
-    s_editor.cursors[ImGuiMouseCursor_ResizeAll]   = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_MOVE);
-    s_editor.cursors[ImGuiMouseCursor_ResizeNS]    = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_NS_RESIZE);
-    s_editor.cursors[ImGuiMouseCursor_ResizeEW]    = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_EW_RESIZE);
-    s_editor.cursors[ImGuiMouseCursor_ResizeNESW]  = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_NESW_RESIZE);
-    s_editor.cursors[ImGuiMouseCursor_ResizeNWSE]  = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_NWSE_RESIZE);
-    s_editor.cursors[ImGuiMouseCursor_Hand]        = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_POINTER);
-    s_editor.cursors[ImGuiMouseCursor_NotAllowed]  = SDL_CreateSystemCursor(SDL_SYSTEM_CURSOR_NOT_ALLOWED);
+    s_editor.cursors[ImGuiMouseCursor_Arrow]      = jce_cursor_create_system(JCE_CURSOR_ARROW);
+    s_editor.cursors[ImGuiMouseCursor_TextInput]  = jce_cursor_create_system(JCE_CURSOR_TEXT);
+    s_editor.cursors[ImGuiMouseCursor_ResizeAll]  = jce_cursor_create_system(JCE_CURSOR_MOVE);
+    s_editor.cursors[ImGuiMouseCursor_ResizeNS]   = jce_cursor_create_system(JCE_CURSOR_NS_RESIZE);
+    s_editor.cursors[ImGuiMouseCursor_ResizeEW]   = jce_cursor_create_system(JCE_CURSOR_EW_RESIZE);
+    s_editor.cursors[ImGuiMouseCursor_ResizeNESW] = jce_cursor_create_system(JCE_CURSOR_NESW_RESIZE);
+    s_editor.cursors[ImGuiMouseCursor_ResizeNWSE] = jce_cursor_create_system(JCE_CURSOR_NWSE_RESIZE);
+    s_editor.cursors[ImGuiMouseCursor_Hand]       = jce_cursor_create_system(JCE_CURSOR_HAND);
+    s_editor.cursors[ImGuiMouseCursor_NotAllowed] = jce_cursor_create_system(JCE_CURSOR_NOT_ALLOWED);
 }
 
 static void update_cursor(void)
@@ -184,13 +195,13 @@ static void update_cursor(void)
 
     ImGuiMouseCursor cursor = ImGui::GetMouseCursor();
     if (cursor == ImGuiMouseCursor_None || io.MouseDrawCursor) {
-        SDL_HideCursor();
+        jce_cursor_show(false);
     } else {
-        SDL_Cursor *c = s_editor.cursors[cursor]
+        JceCursor *c = s_editor.cursors[cursor]
             ? s_editor.cursors[cursor]
             : s_editor.cursors[ImGuiMouseCursor_Arrow];
-        SDL_SetCursor(c);
-        SDL_ShowCursor();
+        jce_cursor_set(c);
+        jce_cursor_show(true);
     }
 }
 
@@ -226,11 +237,25 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
     /* Apply JCE dark theme and load custom font. */
     jce_editor_setup_style();
 
+    /* Apply persisted theme from editor config. setup_style applies the
+       default dark theme; this overrides if the user previously chose
+       Light/SSMS so the saved preference takes effect at startup. */
+    {
+        JceEditorConfig _ecfg;
+        if (jce_editor_config_load(&_ecfg)) {
+            int t = JCE_THEME_DARK;
+            if      (jce_strcasecmp(_ecfg.theme, "Light") == 0) t = JCE_THEME_LIGHT;
+            else if (jce_strcasecmp(_ecfg.theme, "SSMS")  == 0) t = JCE_THEME_SSMS;
+            else if (jce_strcasecmp(_ecfg.theme, "Blue")  == 0) t = JCE_THEME_SSMS;
+            jce_editor_apply_theme(t);
+        }
+    }
+
     /* Cursors. */
     create_cursors();
 
     /* bgfx renderer backend. */
-    if (!jce_imgui_bgfx_init(pak, JCE_VIEW_IMGUI)) {
+    if (!jce_imgui_renderer_init(pak, JCE_VIEW_IMGUI)) {
         ImGui::DestroyContext();
         return false;
     }
@@ -244,6 +269,7 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
                        ? (float)ecfg.font_size : 14.0f;
         jce_editor_load_fonts(pak, fs,
                               ecfg.font_en_path, ecfg.font_zh_path);
+        ImGui::GetIO().FontGlobalScale = (ecfg.ui_scale > 0.1f) ? ecfg.ui_scale : 1.0f;
         s_editor.pak       = pak;
         s_editor.font_size = fs;
     }
@@ -255,6 +281,9 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
     jce_editor_state_init();
     jce_editor_panels_init();
     jce_run_manager_init();
+    jce_build_manager_init();
+    jce_reflect_register_builtin();
+    jce_hotkeys_init();
     jce_gizmo_init();
 
     /* Set window icon from embedded PAK. */
@@ -277,24 +306,22 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
     s_editor.last_time   = jce_time_perf_counter();
     s_editor.window      = window;
     s_editor.text_input_active = false;
-    s_editor.frame_kpi_file = NULL;
+    s_editor.frame_kpi_path[0] = '\0';
     s_editor.frame_kpi_index = 0;
     s_editor.frame_kpi_limit = 0;
 
-    const char *frame_kpi_path = SDL_getenv("JCE_KPI_FRAME_LOG");
+    const char *frame_kpi_path = getenv("JCE_KPI_FRAME_LOG");
     if (frame_kpi_path && frame_kpi_path[0]) {
-        s_editor.frame_kpi_file = SDL_IOFromFile(frame_kpi_path, "w");
-        if (s_editor.frame_kpi_file) {
-            const char *frame_count = SDL_getenv("JCE_KPI_FRAME_COUNT");
+        /* Truncate then write CSV header. */
+        static const char hdr[] = "frame_index,frame_ms\n";
+        if (jce_fs_host_write_all(frame_kpi_path, hdr, sizeof(hdr) - 1)) {
+            jce_strlcpy(s_editor.frame_kpi_path, frame_kpi_path,
+                        sizeof(s_editor.frame_kpi_path));
+            const char *frame_count = getenv("JCE_KPI_FRAME_COUNT");
             if (frame_count && frame_count[0]) {
-                const int parsed = SDL_atoi(frame_count);
-                if (parsed > 0) {
-                    s_editor.frame_kpi_limit = (uint32_t)parsed;
-                }
+                const int parsed = atoi(frame_count);
+                if (parsed > 0) s_editor.frame_kpi_limit = (uint32_t)parsed;
             }
-            static const char hdr[] = "frame_index,frame_ms\n";
-            SDL_WriteIO(s_editor.frame_kpi_file, hdr, sizeof(hdr) - 1);
-            SDL_FlushIO(s_editor.frame_kpi_file);
             LOG_INFO(LOG_TAG, "frame KPI capture enabled -> %s", frame_kpi_path);
         } else {
             LOG_WARN(LOG_TAG, "failed to open frame KPI log: %s", frame_kpi_path);
@@ -313,28 +340,24 @@ void jce_editor_shutdown(void)
 
     if (s_editor.text_input_active && s_editor.window) {
         if (!jce_window_stop_text_input(s_editor.window)) {
-            LOG_WARN(LOG_TAG, "jce_window_stop_text_input failed during shutdown: %s",
-                     SDL_GetError());
+            LOG_WARN(LOG_TAG, "jce_window_stop_text_input failed during shutdown");
         }
         s_editor.text_input_active = false;
     }
 
     jce_gizmo_shutdown();
+    jce_build_manager_shutdown();
     jce_run_manager_shutdown();
     jce_editor_panels_shutdown();
     jce_editor_state_shutdown();
     jce_editor_i18n_shutdown();
-    jce_imgui_bgfx_shutdown();
+    jce_imgui_renderer_shutdown();
 
-    if (s_editor.frame_kpi_file) {
-        SDL_FlushIO(s_editor.frame_kpi_file);
-        SDL_CloseIO(s_editor.frame_kpi_file);
-        s_editor.frame_kpi_file = NULL;
-    }
+    s_editor.frame_kpi_path[0] = '\0';
 
     for (int i = 0; i < ImGuiMouseCursor_COUNT; i++) {
         if (s_editor.cursors[i]) {
-            SDL_DestroyCursor(s_editor.cursors[i]);
+            jce_cursor_destroy(s_editor.cursors[i]);
             s_editor.cursors[i] = NULL;
         }
     }
@@ -345,7 +368,7 @@ void jce_editor_shutdown(void)
     LOG_INFO(LOG_TAG, "editor shutdown");
 }
 
-bool jce_editor_process_event(const SDL_Event *event)
+bool jce_editor_process_event(const JceEvent *event)
 {
     if (!s_editor.initialized) return false;
 
@@ -354,45 +377,60 @@ bool jce_editor_process_event(const SDL_Event *event)
     if (!s_editor.active) return false;
 
     switch (event->type) {
-    case SDL_EVENT_MOUSE_MOTION:
+    case JCE_EVENT_MOUSE_MOTION:
         io.AddMousePosEvent(event->motion.x, event->motion.y);
         break;
 
-    case SDL_EVENT_MOUSE_WHEEL:
-        io.AddMouseWheelEvent(event->wheel.x, event->wheel.y);
-        break;
-
-    case SDL_EVENT_MOUSE_BUTTON_DOWN:
-    case SDL_EVENT_MOUSE_BUTTON_UP: {
-        int btn = -1;
-        if (event->button.button == SDL_BUTTON_LEFT)   btn = 0;
-        if (event->button.button == SDL_BUTTON_RIGHT)  btn = 1;
-        if (event->button.button == SDL_BUTTON_MIDDLE) btn = 2;
-        if (event->button.button == SDL_BUTTON_X1)     btn = 3;
-        if (event->button.button == SDL_BUTTON_X2)     btn = 4;
-        if (btn >= 0)
-            io.AddMouseButtonEvent(btn,
-                event->type == SDL_EVENT_MOUSE_BUTTON_DOWN);
+    case JCE_EVENT_MOUSE_WHEEL: {
+        /* Distinguish touchpad from mouse-wheel by checking whether wheel.x
+           is fractional. Windows Precision Touchpad reports values in the
+           0.05..0.95 range per event; classic mouse wheels (incl. tilt)
+           report integer ±1.0. Only the touchpad case is flipped — the
+           mouse wheel is handled elsewhere via invert_scroll_zoom. */
+        float wx = event->wheel.x;
+        float frac = fabsf(wx) - floorf(fabsf(wx));
+        bool is_touchpad_h = (wx != 0.0f) && (frac > 0.01f && frac < 0.99f);
+        if (is_touchpad_h && jce_editor_pref_touchpad_h_invert) {
+            wx = -wx;
+        }
+        io.AddMouseWheelEvent(wx, event->wheel.y);
         break;
     }
 
-    case SDL_EVENT_TEXT_INPUT:
+    case JCE_EVENT_MOUSE_BUTTON_DOWN:
+    case JCE_EVENT_MOUSE_BUTTON_UP: {
+        int btn = -1;
+        switch (event->button.button) {
+        case JCE_MOUSE_BUTTON_LEFT:   btn = 0; break;
+        case JCE_MOUSE_BUTTON_RIGHT:  btn = 1; break;
+        case JCE_MOUSE_BUTTON_MIDDLE: btn = 2; break;
+        case JCE_MOUSE_BUTTON_X1:     btn = 3; break;
+        case JCE_MOUSE_BUTTON_X2:     btn = 4; break;
+        default: break;
+        }
+        if (btn >= 0)
+            io.AddMouseButtonEvent(btn,
+                event->type == JCE_EVENT_MOUSE_BUTTON_DOWN);
+        break;
+    }
+
+    case JCE_EVENT_TEXT_INPUT:
         io.AddInputCharactersUTF8(event->text.text);
         break;
 
-    case SDL_EVENT_KEY_DOWN:
-    case SDL_EVENT_KEY_UP: {
+    case JCE_EVENT_KEY_DOWN:
+    case JCE_EVENT_KEY_UP: {
         update_key_modifiers(event->key.mod);
-        ImGuiKey key = sdl_scancode_to_imgui_key(event->key.scancode);
+        ImGuiKey key = jce_key_to_imgui_key(event->key.scancode);
         if (key != ImGuiKey_None)
-            io.AddKeyEvent(key, event->type == SDL_EVENT_KEY_DOWN);
+            io.AddKeyEvent(key, event->type == JCE_EVENT_KEY_DOWN);
         break;
     }
 
-    case SDL_EVENT_WINDOW_FOCUS_GAINED:
+    case JCE_EVENT_WINDOW_FOCUS_GAINED:
         io.AddFocusEvent(true);
         break;
-    case SDL_EVENT_WINDOW_FOCUS_LOST:
+    case JCE_EVENT_WINDOW_FOCUS_LOST:
         io.AddFocusEvent(false);
         break;
 
@@ -423,7 +461,7 @@ void jce_editor_update(JceWindow *window)
     io.DeltaTime = dt;
     s_editor.last_time = now;
 
-    if (s_editor.frame_kpi_file) {
+    if (s_editor.frame_kpi_path[0]) {
         if (s_editor.frame_kpi_limit == 0 ||
             s_editor.frame_kpi_index < s_editor.frame_kpi_limit) {
             const double frame_ms = (double)dt * 1000.0;
@@ -431,41 +469,45 @@ void jce_editor_update(JceWindow *window)
             int kpi_len = snprintf(kpi_line, sizeof(kpi_line), "%u,%.3f\n",
                                    s_editor.frame_kpi_index, frame_ms);
             if (kpi_len > 0)
-                SDL_WriteIO(s_editor.frame_kpi_file, kpi_line, (size_t)kpi_len);
+                jce_fs_host_append(s_editor.frame_kpi_path, kpi_line, (size_t)kpi_len);
             s_editor.frame_kpi_index++;
-            if ((s_editor.frame_kpi_index % 60u) == 0u) {
-                SDL_FlushIO(s_editor.frame_kpi_file);
-            }
         }
     }
 
     /* Setup bgfx view. */
-    jce_imgui_bgfx_setup_view((uint16_t)w, (uint16_t)h);
+    jce_imgui_renderer_setup_view((uint16_t)w, (uint16_t)h);
+
+    /* Apply any pending font reload BEFORE starting the next frame. */
+    jce_editor_apply_pending_font_reload();
 
     /* Begin ImGui frame. */
     ImGui::NewFrame();
+
+    /* Horizontal scroll direction is decided per-event in the wheel
+       handler above based on touchpad vs mouse-wheel detection
+       (jce_editor_pref_touchpad_h_invert). No global flip here. */
 
     /* Draw editor panels. */
     jce_editor_layout_draw();
 
     /* Render and submit to bgfx. */
     ImGui::Render();
-    jce_imgui_bgfx_render_draw_data();
+    jce_imgui_renderer_draw();
 
-    /* SDL3 does not emit SDL_EVENT_TEXT_INPUT unless text input is started.
-       Mirror Java behavior: toggle it based on ImGui's WantTextInput. */
+    /* The platform window does not emit text-input events unless text
+       input is started.  Mirror ImGui's WantTextInput here. */
     if (s_editor.window) {
         if (io.WantTextInput && !s_editor.text_input_active) {
             if (jce_window_start_text_input(s_editor.window)) {
                 s_editor.text_input_active = true;
             } else {
-                LOG_WARN(LOG_TAG, "jce_window_start_text_input failed: %s", SDL_GetError());
+                LOG_WARN(LOG_TAG, "jce_window_start_text_input failed");
             }
         } else if (!io.WantTextInput && s_editor.text_input_active) {
             if (jce_window_stop_text_input(s_editor.window)) {
                 s_editor.text_input_active = false;
             } else {
-                LOG_WARN(LOG_TAG, "jce_window_stop_text_input failed: %s", SDL_GetError());
+                LOG_WARN(LOG_TAG, "jce_window_stop_text_input failed");
             }
         }
     }
@@ -486,8 +528,7 @@ void jce_editor_toggle(void)
         if (jce_window_stop_text_input(s_editor.window)) {
             s_editor.text_input_active = false;
         } else {
-            LOG_WARN(LOG_TAG, "jce_window_stop_text_input failed while hiding editor: %s",
-                     SDL_GetError());
+            LOG_WARN(LOG_TAG, "jce_window_stop_text_input failed while hiding editor");
         }
     }
     LOG_INFO(LOG_TAG, "editor %s", s_editor.active ? "shown" : "hidden");

@@ -5,9 +5,16 @@ third_party/
 _*
 
 build/
+out/
 
 
-assets/
+caged_kingdom/resources/assets/
+engine/resources/assets/
+editor/resources/assets/fonts/
+!editor/resources/assets/i18n/
+!editor/resources/assets/i18n/**
+
+
 raw_assets/
 
 
@@ -23,6 +30,7 @@ docs/
 
 # Android APK build
 scripts/android/app/src/main/jniLibs/
+scripts/android/app/src/main/assets/
 
 scripts/android/app/src/main/res/*
 !scripts/android/app/src/main/res/drawable-nodpi/
@@ -30,4 +38,3 @@ scripts/android/app/src/main/res/*
 
 # Vendored single-header libraries (managed manually, excluded from style/CI scans)
 engine/src/renderer/internal/stb_image.h
-

@@ -70,8 +70,8 @@ typedef void (*JceRGPassExecuteFn)(JceRGPass pass, uint16_t view_id,
 /* Graph lifecycle                                                     */
 /* ================================================================== */
 
-JceRenderGraph *jce_rg_create(void);
-void            jce_rg_destroy(JceRenderGraph *rg);
+JCE_API JceRenderGraph *jce_rg_create(void);
+JCE_API void            jce_rg_destroy(JceRenderGraph *rg);
 
 /* ================================================================== */
 /* Resource management                                                 */
@@ -108,15 +108,15 @@ void jce_rg_pass_write(JceRenderGraph *rg, JceRGPass pass,
 
 /* Compile the graph: topological sort, cull unused passes, allocate
  * transient resources.  Returns false on cycle or error. */
-bool jce_rg_compile(JceRenderGraph *rg);
+JCE_API bool jce_rg_compile(JceRenderGraph *rg);
 
 /* Execute all passes in compiled order.  Call within a
  * frame boundary (after begin_frame / before end_frame). */
-void jce_rg_execute(JceRenderGraph *rg);
+JCE_API void jce_rg_execute(JceRenderGraph *rg);
 
 /* Reset the graph for the next frame.  Clears all passes and transient
  * resource declarations.  Imported resources survive. */
-void jce_rg_reset(JceRenderGraph *rg);
+JCE_API void jce_rg_reset(JceRenderGraph *rg);
 
 JCE_EXTERN_C_END
 

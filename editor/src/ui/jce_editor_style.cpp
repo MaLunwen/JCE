@@ -7,19 +7,20 @@
 #include "jce_editor_style.h"
 
 #include "jce_editor_colors.h"
-#include "jce_imgui_bgfx.h"
+#include <jce/ui/jce_imgui_renderer.h>
 
-#include <imgui.h>
+#include <jce/tools/jce_imgui.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 extern "C" {
+#include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
-#include <jce/os/core/pak_loader.h>
+#include <jce/os/core/jce_alloc.h>
+#include <jce/os/core/jce_pak_loader.h>
+#include <jce/os/core/jce_str.h>
 }
-
-#include <SDL3/SDL.h>
 
 #define LOG_TAG "editor_style"
 
@@ -247,7 +248,7 @@ int jce_editor_get_theme(void)
  *   2. System font installed on the host OS (Ink Free / KaiTi)
  *   3. ImGui built-in default (proggy) — no fonts are bundled by JCE
  *
- * System font lookup uses runtime platform detection via SDL_GetPlatform()
+ * System font lookup uses runtime platform detection via jce_platform_name()
  * — no compile-time #ifdef branches. We probe a fixed list of well-known
  * filesystem locations per platform string. Loading the file off the
  * user's machine is legal because the user holds a license to use it
@@ -257,11 +258,7 @@ int jce_editor_get_theme(void)
 
 static bool file_exists_readable(const char *path)
 {
-    if (!path || !*path) return false;
-    SDL_IOStream *io = SDL_IOFromFile(path, "rb");
-    if (!io) return false;
-    SDL_CloseIO(io);
-    return true;
+    return jce_fs_host_exists_file(path);
 }
 
 /* Read a TTF/OTF font file fully into a heap buffer.
@@ -271,17 +268,17 @@ static void *read_font_file(const char *path, size_t *out_size)
 {
     if (!path || !*path) return NULL;
     size_t n = 0;
-    void *raw = SDL_LoadFile(path, &n);
+    void *raw = jce_fs_host_read_all(path, &n);
     if (!raw || n == 0) {
-        if (raw) SDL_free(raw);
+        if (raw) jce_free(raw);
         return NULL;
     }
-    /* SDL_LoadFile returns SDL-allocated memory; ImGui will call free()
-       on FontDataOwnedByAtlas, so copy into a malloc buffer. */
+    /* ImGui calls free() on FontDataOwnedByAtlas, so copy into a malloc
+       buffer rather than handing out the engine-allocated block. */
     void *buf = malloc(n);
-    if (!buf) { SDL_free(raw); return NULL; }
+    if (!buf) { jce_free(raw); return NULL; }
     memcpy(buf, raw, n);
-    SDL_free(raw);
+    jce_free(raw);
     if (out_size) *out_size = n;
     return buf;
 }
@@ -292,7 +289,7 @@ static void join_path(char *out, size_t out_size,
                       const char *dir, const char *file)
 {
     if (!dir || !*dir || !file || !*file) { out[0] = '\0'; return; }
-    SDL_snprintf(out, out_size, "%s/%s", dir, file);
+    snprintf(out, out_size, "%s/%s", dir, file);
 }
 
 /* Look up a system-installed font by family. Tries platform-specific
@@ -302,7 +299,7 @@ static void join_path(char *out, size_t out_size,
 static bool find_system_font(const char *family, char *out, size_t out_size)
 {
     out[0] = '\0';
-    const char *plat = SDL_GetPlatform();   /* "Windows" / "macOS" / "Linux" / ... */
+    const char *plat = jce_platform_name();   /* "Windows" / "macOS" / "Linux" / ... */
 
     /* Map family name to per-platform candidate filenames.
        Filenames are documented OS install names; if the user has the
@@ -310,11 +307,11 @@ static bool find_system_font(const char *family, char *out, size_t out_size)
     const char *win_file = NULL;
     const char *mac_file = NULL;
     const char *linux_file = NULL;
-    if (SDL_strcasecmp(family, "InkFree") == 0) {
+    if (jce_strcasecmp(family, "InkFree") == 0) {
         win_file   = "inkfree.ttf";
         mac_file   = "Ink Free.ttf";   /* uncommon on macOS, harmless probe */
         linux_file = "InkFree.ttf";    /* uncommon on Linux, harmless probe */
-    } else if (SDL_strcasecmp(family, "KaiTi") == 0) {
+    } else if (jce_strcasecmp(family, "KaiTi") == 0) {
         win_file   = "simkai.ttf";
         mac_file   = "Kaiti.ttc";
         linux_file = "ukai.ttc";       /* AR PL UKai (common Linux Kaiti) */
@@ -324,21 +321,21 @@ static bool find_system_font(const char *family, char *out, size_t out_size)
 
     char candidate[1024];
 
-    if (SDL_strcmp(plat, "Windows") == 0) {
-        const char *windir = SDL_getenv("WINDIR");
-        if (!windir || !*windir) windir = SDL_getenv("SystemRoot");
+    if (strcmp(plat, "Windows") == 0) {
+        const char *windir = getenv("WINDIR");
+        if (!windir || !*windir) windir = getenv("SystemRoot");
         if (windir && *windir) {
             join_path(candidate, sizeof(candidate),
                       windir, "Fonts");
             char fontdir[1024];
-            SDL_snprintf(fontdir, sizeof(fontdir), "%s", candidate);
+            snprintf(fontdir, sizeof(fontdir), "%s", candidate);
             join_path(candidate, sizeof(candidate), fontdir, win_file);
             if (file_exists_readable(candidate)) {
-                SDL_strlcpy(out, candidate, out_size);
+                jce_strlcpy(out, candidate, out_size);
                 return true;
             }
         }
-    } else if (SDL_strcmp(plat, "macOS") == 0) {
+    } else if (strcmp(plat, "macOS") == 0) {
         const char *dirs[] = {
             "/System/Library/Fonts/Supplemental",
             "/System/Library/Fonts",
@@ -348,11 +345,11 @@ static bool find_system_font(const char *family, char *out, size_t out_size)
         for (int i = 0; dirs[i]; ++i) {
             join_path(candidate, sizeof(candidate), dirs[i], mac_file);
             if (file_exists_readable(candidate)) {
-                SDL_strlcpy(out, candidate, out_size);
+                jce_strlcpy(out, candidate, out_size);
                 return true;
             }
         }
-    } else if (SDL_strcmp(plat, "Linux") == 0) {
+    } else if (strcmp(plat, "Linux") == 0) {
         const char *dirs[] = {
             "/usr/share/fonts/truetype/arphic",
             "/usr/share/fonts/truetype",
@@ -363,7 +360,7 @@ static bool find_system_font(const char *family, char *out, size_t out_size)
         for (int i = 0; dirs[i]; ++i) {
             join_path(candidate, sizeof(candidate), dirs[i], linux_file);
             if (file_exists_readable(candidate)) {
-                SDL_strlcpy(out, candidate, out_size);
+                jce_strlcpy(out, candidate, out_size);
                 return true;
             }
         }
@@ -381,7 +378,7 @@ static bool resolve_font_path(const char *override_path,
 {
     out_path[0] = '\0';
     if (override_path && *override_path && file_exists_readable(override_path)) {
-        SDL_strlcpy(out_path, override_path, out_size);
+        jce_strlcpy(out_path, override_path, out_size);
         if (out_source) *out_source = "user override";
         return true;
     }
@@ -440,6 +437,15 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
     (void)pak; /* no longer needed; kept for API stability */
     ImGuiIO &io = ImGui::GetIO();
 
+    /* CRITICAL: clear the atlas before re-adding. Without this, repeat
+       calls (e.g. from Project Settings 'Save') leave the previous Latin
+       and CJK fonts in the atlas and append new ones, then re-point
+       io.FontDefault. If the second pass fails to resolve CJK (e.g. user
+       cleared the override and KaiTi isn't installed), the new default
+       font has only Latin glyphs and every CJK character renders as ?.
+       Clearing forces a clean rebuild that walks the full fallback chain. */
+    io.Fonts->Clear();
+
     /* --- Latin font -------------------------------------------------- */
     ImFontConfig cfg;
     cfg.FontDataOwnedByAtlas = true;
@@ -450,12 +456,28 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
     static const ImWchar latin_ranges[] = {
         0x0020, 0x00FF,   /* Basic Latin + Latin Supplement */
         0x2000, 0x206F,   /* General Punctuation */
+        0x2190, 0x21FF,   /* Arrows */
+        0x2500, 0x25FF,   /* Box Drawing + Block Elements + Geometric Shapes (◆◉○) */
+        0x2600, 0x26FF,   /* Misc Symbols (☼☀ etc.) */
         0,
     };
 
     ImFont *font = load_font_with_fallback(
         "Latin", en_override, "InkFree",
         size_pixels, &cfg, latin_ranges);
+
+    /* Latin fallback chain: try widely-installed sans-serifs if Ink Free
+       is missing, so the editor renders in something readable instead
+       of falling back to the proggy bitmap. */
+    if (!font) {
+        const char *latin_fallbacks[] = {
+            "segoeui", "Arial", "Helvetica", "DejaVuSans", NULL };
+        for (int i = 0; latin_fallbacks[i] && !font; i++) {
+            font = load_font_with_fallback(
+                "Latin", NULL, latin_fallbacks[i],
+                size_pixels, &cfg, latin_ranges);
+        }
+    }
 
     if (!font) {
         /* No override, no system font. Add ImGui's built-in proggy font so
@@ -473,6 +495,14 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
     merge_cfg.MergeMode   = true;
 
     static const ImWchar cjk_ranges[] = {
+        /* Backup ranges for arrows + box drawing + geometric shapes +
+           misc symbols. Most CJK fonts (msyh, simhei, simsun, KaiTi)
+           contain these glyphs, so merging them here ensures icons like
+           ◆ ◉ ○ render even when the Latin font (e.g. Ink Free) lacks
+           them. ImGui's per-glyph fallback walks the merged fonts. */
+        0x2190, 0x21FF,   /* Arrows */
+        0x2500, 0x25FF,   /* Box Drawing + Block + Geometric Shapes */
+        0x2600, 0x26FF,   /* Misc Symbols */
         0x3000, 0x30FF,   /* CJK Symbols + Katakana */
         0x31F0, 0x31FF,   /* Katakana Phonetic Extensions */
         0xFF00, 0xFFEF,   /* Halfwidth & Fullwidth Forms */
@@ -480,14 +510,64 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
         0,
     };
 
-    load_font_with_fallback(
+    /* CJK fallback chain: try a list of commonly-installed CJK fonts so
+       Chinese / Japanese text doesn't show as tofu when the preferred
+       family (KaiTi / simkai.ttf) is absent. */
+    ImFont *cjk = load_font_with_fallback(
         "CJK", zh_override, "KaiTi",
         size_pixels, &merge_cfg, cjk_ranges);
+    if (!cjk) {
+        const char *cjk_fallbacks[] = {
+            "msyh",        /* Microsoft YaHei */
+            "simhei",      /* SimHei */
+            "simsun",      /* SimSun */
+            "msjh",        /* JhengHei */
+            "PingFang",    /* macOS */
+            "STHeiti",     /* macOS */
+            "Hiragino",    /* macOS */
+            "wqy-microhei",/* Linux */
+            "wqy-zenhei",
+            "NotoSansCJK", "NotoSans",
+            NULL };
+        for (int i = 0; cjk_fallbacks[i] && !cjk; i++) {
+            cjk = load_font_with_fallback(
+                "CJK", NULL, cjk_fallbacks[i],
+                size_pixels, &merge_cfg, cjk_ranges);
+        }
+    }
+
+    /* --- Icon font (merged) ----------------------------------------- */
+    /* Dedicated icon-coverage merge pass: KaiTi and many other CJK fonts
+       LACK U+25C6 / U+25C9 / U+25CB even though their character chart
+       claims the range. Force-merge a font that demonstrably ships the
+       Geometric Shapes block (Segoe UI Symbol on Windows, Apple Symbols
+       on macOS, DejaVu Sans on Linux) so the hierarchy panel's diamond
+       and eye icons resolve regardless of which CJK fallback won. */
+    static const ImWchar icon_ranges[] = {
+        0x2190, 0x21FF,   /* Arrows */
+        0x2500, 0x25FF,   /* Box Drawing + Geometric Shapes */
+        0x2600, 0x26FF,   /* Misc Symbols */
+        0x2700, 0x27BF,   /* Dingbats */
+        0,
+    };
+    const char *icon_fallbacks[] = {
+        "seguisym",       /* Segoe UI Symbol (Win) */
+        "segoeui",        /* Segoe UI also covers most icon glyphs */
+        "Apple Symbols",  /* macOS */
+        "DejaVuSans",     /* Linux */
+        "msyh", "simhei", "simsun",
+        NULL };
+    for (int i = 0; icon_fallbacks[i]; i++) {
+        ImFont *ic = load_font_with_fallback(
+            "Icons", NULL, icon_fallbacks[i],
+            size_pixels, &merge_cfg, icon_ranges);
+        if (ic) break;
+    }
 
     io.FontDefault = font;
 
     /* Rebuild font atlas on bgfx side. */
-    jce_imgui_bgfx_rebuild_fonts();
+    jce_imgui_renderer_rebuild_fonts();
 
     LOG_SUCCESS(LOG_TAG, "loaded fonts (%.0f px, Latin + CJK)", size_pixels);
     return true;
@@ -543,7 +623,7 @@ static const char *prettify_font_name(const char *fname)
         { NULL, NULL }
     };
     for (int i = 0; map[i].file; ++i)
-        if (SDL_strcasecmp(fname, map[i].file) == 0) return map[i].pretty;
+        if (jce_strcasecmp(fname, map[i].file) == 0) return map[i].pretty;
     return fname;
 }
 
@@ -554,42 +634,40 @@ struct font_enum_ctx {
     const char   *root_dir;     /* directory currently being scanned */
 };
 
-static SDL_EnumerationResult font_enum_cb(void *userdata,
-                                          const char *dirname,
-                                          const char *fname)
+static bool font_enum_cb(const char *fname, bool is_dir, void *userdata)
 {
-    (void)dirname;
+    (void)is_dir;
     struct font_enum_ctx *ctx = (struct font_enum_ctx *)userdata;
-    if (!fname || !*fname) return SDL_ENUM_CONTINUE;
-    if (ctx->count >= ctx->max) return SDL_ENUM_SUCCESS;
+    if (!fname || !*fname) return true;
+    if (ctx->count >= ctx->max) return false;
 
     /* Filter by extension. */
-    const char *dot = SDL_strrchr(fname, '.');
-    if (!dot) return SDL_ENUM_CONTINUE;
-    if (SDL_strcasecmp(dot, ".ttf") != 0 &&
-        SDL_strcasecmp(dot, ".otf") != 0 &&
-        SDL_strcasecmp(dot, ".ttc") != 0) return SDL_ENUM_CONTINUE;
+    const char *dot = strrchr(fname, '.');
+    if (!dot) return true;
+    if (jce_strcasecmp(dot, ".ttf") != 0 &&
+        jce_strcasecmp(dot, ".otf") != 0 &&
+        jce_strcasecmp(dot, ".ttc") != 0) return true;
 
     JceFontEntry *e = &ctx->out[ctx->count];
-    SDL_snprintf(e->path, sizeof(e->path), "%s/%s", ctx->root_dir, fname);
-    SDL_strlcpy(e->display_name, prettify_font_name(fname), sizeof(e->display_name));
+    snprintf(e->path, sizeof(e->path), "%s/%s", ctx->root_dir, fname);
+    jce_strlcpy(e->display_name, prettify_font_name(fname), sizeof(e->display_name));
     ctx->count++;
-    return SDL_ENUM_CONTINUE;
+    return true;
 }
 
 static void scan_dir(struct font_enum_ctx *ctx, const char *dir)
 {
     if (!dir || !*dir) return;
     ctx->root_dir = dir;
-    /* SDL_EnumerateDirectory returns false if dir doesn't exist — fine. */
-    SDL_EnumerateDirectory(dir, font_enum_cb, ctx);
+    /* Returns false silently if dir doesn't exist — that's expected. */
+    jce_fs_host_list_dir(dir, font_enum_cb, ctx);
 }
 
 static int font_entry_cmp(const void *a, const void *b)
 {
     const JceFontEntry *ea = (const JceFontEntry *)a;
     const JceFontEntry *eb = (const JceFontEntry *)b;
-    return SDL_strcasecmp(ea->display_name, eb->display_name);
+    return jce_strcasecmp(ea->display_name, eb->display_name);
 }
 
 extern "C" int jce_editor_enumerate_fonts(JceFontEntry *out, int max_entries)
@@ -597,31 +675,31 @@ extern "C" int jce_editor_enumerate_fonts(JceFontEntry *out, int max_entries)
     if (!out || max_entries <= 0) return 0;
     struct font_enum_ctx ctx = { out, 0, max_entries, NULL };
 
-    const char *plat = SDL_GetPlatform();
+    const char *plat = jce_platform_name();
 
-    if (SDL_strcmp(plat, "Windows") == 0) {
-        const char *windir = SDL_getenv("WINDIR");
-        if (!windir || !*windir) windir = SDL_getenv("SystemRoot");
+    if (strcmp(plat, "Windows") == 0) {
+        const char *windir = getenv("WINDIR");
+        if (!windir || !*windir) windir = getenv("SystemRoot");
         if (windir && *windir) {
             char fontdir[1024];
-            SDL_snprintf(fontdir, sizeof(fontdir), "%s/Fonts", windir);
+            snprintf(fontdir, sizeof(fontdir), "%s/Fonts", windir);
             scan_dir(&ctx, fontdir);
         }
-        const char *localapp = SDL_getenv("LOCALAPPDATA");
+        const char *localapp = getenv("LOCALAPPDATA");
         if (localapp && *localapp) {
             char ud[1024];
-            SDL_snprintf(ud, sizeof(ud),
+            snprintf(ud, sizeof(ud),
                          "%s/Microsoft/Windows/Fonts", localapp);
             scan_dir(&ctx, ud);
         }
-    } else if (SDL_strcmp(plat, "macOS") == 0) {
+    } else if (strcmp(plat, "macOS") == 0) {
         scan_dir(&ctx, "/System/Library/Fonts");
         scan_dir(&ctx, "/System/Library/Fonts/Supplemental");
         scan_dir(&ctx, "/Library/Fonts");
-        const char *home = SDL_getenv("HOME");
+        const char *home = getenv("HOME");
         if (home && *home) {
             char ud[1024];
-            SDL_snprintf(ud, sizeof(ud), "%s/Library/Fonts", home);
+            snprintf(ud, sizeof(ud), "%s/Library/Fonts", home);
             scan_dir(&ctx, ud);
         }
     } else {
@@ -633,12 +711,12 @@ extern "C" int jce_editor_enumerate_fonts(JceFontEntry *out, int max_entries)
         scan_dir(&ctx, "/usr/share/fonts/truetype/dejavu");
         scan_dir(&ctx, "/usr/share/fonts/truetype/noto");
         scan_dir(&ctx, "/usr/local/share/fonts");
-        const char *home = SDL_getenv("HOME");
+        const char *home = getenv("HOME");
         if (home && *home) {
             char ud[1024];
-            SDL_snprintf(ud, sizeof(ud), "%s/.fonts", home);
+            snprintf(ud, sizeof(ud), "%s/.fonts", home);
             scan_dir(&ctx, ud);
-            SDL_snprintf(ud, sizeof(ud), "%s/.local/share/fonts", home);
+            snprintf(ud, sizeof(ud), "%s/.local/share/fonts", home);
             scan_dir(&ctx, ud);
         }
     }
@@ -648,7 +726,7 @@ extern "C" int jce_editor_enumerate_fonts(JceFontEntry *out, int max_entries)
     if (ctx.count > 1) {
         for (int i = 0; i < ctx.count; ++i) {
             for (int j = i + 1; j < ctx.count; ) {
-                if (SDL_strcasecmp(out[i].path, out[j].path) == 0) {
+                if (jce_strcasecmp(out[i].path, out[j].path) == 0) {
                     out[j] = out[ctx.count - 1];
                     ctx.count--;
                 } else {
@@ -659,7 +737,46 @@ extern "C" int jce_editor_enumerate_fonts(JceFontEntry *out, int max_entries)
     }
 
     if (ctx.count > 1)
-        SDL_qsort(out, (size_t)ctx.count, sizeof(JceFontEntry), font_entry_cmp);
+        qsort(out, (size_t)ctx.count, sizeof(JceFontEntry), font_entry_cmp);
 
     return ctx.count;
+}
+
+/* ── Deferred font reload (called from Settings dialog while in a frame). */
+namespace {
+struct PendingReload {
+    bool  pending = false;
+    float size    = 14.0f;
+    char  en[1024] = {0};
+    char  zh[1024] = {0};
+} g_pending;
+} // namespace
+
+extern "C" void jce_editor_request_font_reload(float size_pixels,
+                                               const char *en_override,
+                                               const char *zh_override)
+{
+    g_pending.pending = true;
+    g_pending.size    = size_pixels;
+    if (en_override) {
+        strncpy(g_pending.en, en_override, sizeof(g_pending.en) - 1);
+        g_pending.en[sizeof(g_pending.en) - 1] = '\0';
+    } else {
+        g_pending.en[0] = '\0';
+    }
+    if (zh_override) {
+        strncpy(g_pending.zh, zh_override, sizeof(g_pending.zh) - 1);
+        g_pending.zh[sizeof(g_pending.zh) - 1] = '\0';
+    } else {
+        g_pending.zh[0] = '\0';
+    }
+}
+
+extern "C" void jce_editor_apply_pending_font_reload(void)
+{
+    if (!g_pending.pending) return;
+    g_pending.pending = false;
+    jce_editor_load_fonts(NULL, g_pending.size,
+                          g_pending.en[0] ? g_pending.en : NULL,
+                          g_pending.zh[0] ? g_pending.zh : NULL);
 }

@@ -5,13 +5,13 @@
  * Uses ImDrawList::Add* primitives — no bgfx resources needed.
  */
 
-#include "jce_editor_colors.h"
-#include "jce_editor_defaults.h"
-#include "jce_editor_state.h"
+#include "ui/jce_editor_colors.h"
+#include "core/jce_editor_defaults.h"
+#include "core/jce_editor_state.h"
 #include "jce_gizmo.h"
 #include "jce_gizmo_internal.h"
 
-#include <imgui.h>
+#include <jce/tools/jce_imgui.h>
 #include <math.h>
 
 /* ── Color helpers ─────────────────────────────────────────────────── */

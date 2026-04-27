@@ -80,7 +80,7 @@ typedef struct {
 /* Parse an MP4/ISO-BMFF file from a full in-memory blob.
  * Returns true when parsing succeeds and at least one video track
  * was identified. On failure, out->error contains a short reason. */
-bool jce_mp4_parse_memory(const void *data, size_t size, JceMp4Info *out);
+JCE_API bool jce_mp4_parse_memory(const void *data, size_t size, JceMp4Info *out);
 
 /* Open a reusable parser context over an in-memory MP4 blob.
  * The input blob must remain valid until jce_mp4_parser_close().
@@ -88,7 +88,7 @@ bool jce_mp4_parse_memory(const void *data, size_t size, JceMp4Info *out);
 JceMp4Parser *jce_mp4_parser_open_memory(const void *data, size_t size,
                                          JceMp4Info *out_info);
 
-void jce_mp4_parser_close(JceMp4Parser *parser);
+JCE_API void jce_mp4_parser_close(JceMp4Parser *parser);
 
 /* Query the selected primary audio track metadata.
  * Returns false when no audio track is present. */

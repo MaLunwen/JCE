@@ -57,27 +57,27 @@ typedef struct {
 /* ================================================================== */
 
 /* Create a render queue with initial capacity. */
-JceRenderQueue *jce_rq_create(uint32_t initial_capacity);
-void            jce_rq_destroy(JceRenderQueue *rq);
+JCE_API JceRenderQueue *jce_rq_create(uint32_t initial_capacity);
+JCE_API void            jce_rq_destroy(JceRenderQueue *rq);
 
 /* ================================================================== */
 /* Submission                                                          */
 /* ================================================================== */
 
 /* Push a draw command into the queue. */
-void jce_rq_push(JceRenderQueue *rq, const JceDrawCmd *cmd);
+JCE_API void jce_rq_push(JceRenderQueue *rq, const JceDrawCmd *cmd);
 
 /* Sort queued commands by the given mode. */
-void jce_rq_sort(JceRenderQueue *rq, JceSortMode mode);
+JCE_API void jce_rq_sort(JceRenderQueue *rq, JceSortMode mode);
 
 /* Submit all queued commands to bgfx and clear the queue. */
-void jce_rq_flush(JceRenderQueue *rq, const JceRenderer *renderer);
+JCE_API void jce_rq_flush(JceRenderQueue *rq, const JceRenderer *renderer);
 
 /* Discard all queued commands without submitting. */
-void jce_rq_clear(JceRenderQueue *rq);
+JCE_API void jce_rq_clear(JceRenderQueue *rq);
 
 /* Current number of queued draw commands. */
-uint32_t jce_rq_count(const JceRenderQueue *rq);
+JCE_API uint32_t jce_rq_count(const JceRenderQueue *rq);
 
 JCE_EXTERN_C_END
 

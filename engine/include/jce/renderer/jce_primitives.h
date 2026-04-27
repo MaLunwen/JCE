@@ -16,7 +16,7 @@ JCE_EXTERN_C_BEGIN
 typedef struct JceRenderer JceRenderer;
 
 /* Pack RGBA (0-255 each) into ABGR uint32 for bgfx vertex color. */
-uint32_t jce_rgba(uint8_t r, uint8_t g, uint8_t b, uint8_t a);
+JCE_API uint32_t jce_rgba(uint8_t r, uint8_t g, uint8_t b, uint8_t a);
 
 /* Draw a single filled rectangle. */
 void jce_draw_filled_rect(const JceRenderer *r,

@@ -268,6 +268,25 @@ static void draw_entity_menu(uint32_t ctx_id)
                     "Failed to revert prefab instance");
             }
         }
+
+        ImGui::Separator();
+        const char *parent_path = jce_state_get_prefab_path(ctx_id);
+        bool can_variant = (parent_path != NULL);
+        if (ImGui::MenuItem(jce_editor_i18n("hierarchy.menu.saveAsVariant"), NULL, false, can_variant)) {
+            char variant_path[512];
+            char variant_name[256];
+            snprintf(variant_name, sizeof(variant_name),
+                     "%s_Variant", ctx_name ? ctx_name : "Entity");
+            build_default_prefab_path(variant_name, variant_path, sizeof(variant_path));
+            if (jce_state_save_prefab_variant(ctx_id, variant_path, parent_path)) {
+                jce_editor_console_log("Saved prefab variant: %s (parent=%s)",
+                                       variant_path, parent_path);
+                jce_editor_inspector_request_sync();
+            } else {
+                jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+                    "Failed to save prefab variant: %s", variant_path);
+            }
+        }
         ImGui::EndMenu();
     }
 

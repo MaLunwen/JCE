@@ -142,11 +142,11 @@ typedef struct JceAudio     JceAudio;
 
 typedef struct JceAssetManagerConfig {
     /* Maximum number of concurrent assets (determines slot pool size).
-	   0 = default (8192). Must be <= 65534 (0xFFFE). */
+       0 = default (8192). Must be <= 65534 (0xFFFE). */
     uint32_t max_assets;
 
     /* Number of async worker threads. 0 = default (2).
-	   Workers handle decompression + decoding off main thread. */
+       Workers handle decompression + decoding off main thread. */
     uint32_t worker_threads;
 
     /* PAK archive for reading cooked assets (required). */
@@ -164,10 +164,10 @@ typedef struct JceAssetManagerConfig {
 /* ================================================================== */
 
 /* Create the asset manager. Returns NULL on failure. */
-JceAssetManager *jce_asset_manager_create(const JceAssetManagerConfig *cfg);
+JCE_API JceAssetManager *jce_asset_manager_create(const JceAssetManagerConfig *cfg);
 
 /* Destroy the manager and release all loaded assets. */
-void jce_asset_manager_destroy(JceAssetManager *mgr);
+JCE_API void jce_asset_manager_destroy(JceAssetManager *mgr);
 
 /* ================================================================== */
 /* Loading & Unloading                                                 */
@@ -195,10 +195,10 @@ JceAssetHandle jce_asset_load(JceAssetManager *mgr,
                               JceAssetType type);
 
 /* Release an asset (decrement ref count; freed at zero). */
-void jce_asset_release(JceAssetManager *mgr, JceAssetHandle handle);
+JCE_API void jce_asset_release(JceAssetManager *mgr, JceAssetHandle handle);
 
 /* Force reload an asset (for hot-reload in editor). */
-void jce_asset_reload(JceAssetManager *mgr, JceAssetHandle handle);
+JCE_API void jce_asset_reload(JceAssetManager *mgr, JceAssetHandle handle);
 
 /* ================================================================== */
 /* Query                                                               */
@@ -212,7 +212,7 @@ JceAssetState jce_asset_state(const JceAssetManager *mgr,
 static inline bool jce_asset_ready(const JceAssetManager *mgr,
                                    JceAssetHandle handle)
 {
-	return jce_asset_state(mgr, handle) == JCE_ASSET_STATE_READY;
+    return jce_asset_state(mgr, handle) == JCE_ASSET_STATE_READY;
 }
 
 /* Get reference count (0 if invalid/freed). */
@@ -224,14 +224,14 @@ JceAssetType jce_asset_type(const JceAssetManager *mgr,
                             JceAssetHandle handle);
 
 /* Get total number of loaded assets. */
-uint32_t jce_asset_count(const JceAssetManager *mgr);
+JCE_API uint32_t jce_asset_count(const JceAssetManager *mgr);
 
 /* ================================================================== */
 /* Type-safe data retrieval                                            */
 /* ================================================================== */
 
 /* Generic: get raw data pointer. Returns NULL if not ready. */
-void *jce_asset_data(const JceAssetManager *mgr, JceAssetHandle handle);
+JCE_API void *jce_asset_data(const JceAssetManager *mgr, JceAssetHandle handle);
 
 /* Forward-declare typed accessors' return types. */
 #include <jce/renderer/jce_texture_types.h>
@@ -290,12 +290,12 @@ uint32_t jce_asset_manager_update(JceAssetManager *mgr,
 /* ================================================================== */
 
 typedef struct JceAssetStats {
-	uint32_t total_loaded;
-	uint32_t total_slots_used;
-	uint32_t total_slots_capacity;
-	uint32_t pending_loads;
-	uint32_t failed_loads;
-	uint64_t total_memory_bytes;  /* approximate */
+    uint32_t total_loaded;
+    uint32_t total_slots_used;
+    uint32_t total_slots_capacity;
+    uint32_t pending_loads;
+    uint32_t failed_loads;
+    uint64_t total_memory_bytes;  /* approximate */
 } JceAssetStats;
 
 void jce_asset_manager_stats(const JceAssetManager *mgr,

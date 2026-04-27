@@ -46,8 +46,8 @@ typedef struct jce_event_bus jce_event_bus_t;
 /* Lifecycle                                                           */
 /* ================================================================== */
 
-jce_event_bus_t *jce_event_bus_create(jce_allocator_t alloc);
-void             jce_event_bus_destroy(jce_event_bus_t *bus);
+JCE_API jce_event_bus_t *jce_event_bus_create(jce_allocator_t alloc);
+JCE_API void             jce_event_bus_destroy(jce_event_bus_t *bus);
 
 /* ================================================================== */
 /* Subscribe / Unsubscribe                                             */
@@ -78,7 +78,7 @@ void jce_event_publish(jce_event_bus_t *bus, jce_event_id id,
 /* Compute event ID from a NUL-terminated name string at runtime.
    Internally uses XXH3_64bits for speed + low collision.
    For compile-time IDs, use JCE_EVENT_ID() macro below. */
-jce_event_id jce_event_hash(const char *name);
+JCE_API jce_event_id jce_event_hash(const char *name);
 
 /* Runtime hash — same as jce_event_hash but explicit. */
 #define JCE_EVENT_ID(str) jce_event_hash(str)

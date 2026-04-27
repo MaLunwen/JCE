@@ -16,6 +16,7 @@
 
 
 #include <jce/os/core/jce_defs.h>
+#include <jce/os/platform/jce_event.h>
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -69,9 +70,11 @@ typedef struct JceAppDesc {
     void (*draw)(const JceServices *svc, void *user_data);
 
     /* Called for each platform event (after input system processes it).
-       The event pointer is backend-specific (SDL_Event* internally).
-       Most apps should use JceInput queries instead, leaving this NULL. */
-    void (*on_event)(const void *platform_event, void *user_data);
+       The event is delivered as a backend-neutral JceEvent so the
+       application never needs to depend on SDL or any other windowing
+       library. Most apps should use JceInput queries instead and leave
+       this NULL. */
+    void (*on_event)(const JceEvent *event, void *user_data);
 
     /* Optional: called on window resize. NULL = ignored. */
     void (*on_resize)(uint32_t w, uint32_t h, void *user_data);

@@ -41,27 +41,27 @@ extern "C" {
 /* ── Internal State ────────────────────────────────────────────────── */
 
 struct EditorInternalState {
-	/* Selection. */
-	uint32_t    selected[JCE_MAX_SELECTED];
-	int         selected_count;
-	uint32_t    focused;       /* primary selection */
+    /* Selection. */
+    uint32_t    selected[JCE_MAX_SELECTED];
+    int         selected_count;
+    uint32_t    focused;       /* primary selection */
 
-	/* Modes. */
-	JceEditMode      edit_mode;
-	JceGizmoMode     gizmo_mode;
-	JceGizmoSpace    gizmo_space;
-	JceSceneViewMode view_mode;
-	JcePlayState     play_state;
-	bool             show_grid;
-	bool             is_2d_mode;
-	bool             live_preview;
-	bool             scene_modified;
+    /* Modes. */
+    JceEditMode      edit_mode;
+    JceGizmoMode     gizmo_mode;
+    JceGizmoSpace    gizmo_space;
+    JceSceneViewMode view_mode;
+    JcePlayState     play_state;
+    bool             show_grid;
+    bool             is_2d_mode;
+    bool             live_preview;
+    bool             scene_modified;
 
-	/* ECS backing store – the single source of truth. */
-	JceScene        *scene;
-	char             current_scene_path[512];
+    /* ECS backing store – the single source of truth. */
+    JceScene        *scene;
+    char             current_scene_path[512];
 
-	bool initialized;
+    bool initialized;
 };
 
 extern EditorInternalState s;
@@ -73,15 +73,15 @@ extern std::vector<uint32_t> g_entity_order;
 
 /* ── Editor per-entity sidecar (UI-only state) ────────────────────── */
 struct EditorEntitySidecar {
-	uint32_t expanded_flags = 0xFFFFFFFFu; /* Inspector fold state bitmask */
+    uint32_t expanded_flags = 0xFFFFFFFFu; /* Inspector fold state bitmask */
 };
 extern std::unordered_map<uint32_t, EditorEntitySidecar> g_entity_sidecar;
 
 /* ── History Snapshot ──────────────────────────────────────────────── */
 
 struct EditorHistorySnapshot {
-	std::string scene_json;
-	std::string scene_path;
+    std::string scene_json;
+    std::string scene_path;
 };
 
 extern std::vector<EditorHistorySnapshot> s_undo_history;
@@ -95,9 +95,9 @@ extern int  s_history_transient_batch_depth;
 /* ── Transaction ──────────────────────────────────────────────────── */
 
 struct EditorTransaction {
-	bool active;
-	char label[64];
-	EditorHistorySnapshot before;
+    bool active;
+    char label[64];
+    EditorHistorySnapshot before;
 };
 
 extern EditorTransaction s_transaction;
@@ -141,32 +141,32 @@ void         mark_prefab_instance_recursive(uint32_t entity_id,
 
 static inline void jce_q_to_euler_deg(jce_quat q, float out[3])
 {
-	jce_vec3 e = jce_q_to_euler(q);
-	out[0] = e.x * JCE_RAD2DEG;
-	out[1] = e.y * JCE_RAD2DEG;
-	out[2] = e.z * JCE_RAD2DEG;
+    jce_vec3 e = jce_q_to_euler(q);
+    out[0] = e.x * JCE_RAD2DEG;
+    out[1] = e.y * JCE_RAD2DEG;
+    out[2] = e.z * JCE_RAD2DEG;
 }
 static inline jce_quat jce_q_from_euler_deg(const float in[3])
 {
-	return jce_q_from_euler(in[0] * JCE_DEG2RAD,
-	                        in[1] * JCE_DEG2RAD,
-	                        in[2] * JCE_DEG2RAD);
+    return jce_q_from_euler(in[0] * JCE_DEG2RAD,
+                            in[1] * JCE_DEG2RAD,
+                            in[2] * JCE_DEG2RAD);
 }
 
 /* ── RAII Scopes ──────────────────────────────────────────────────── */
 
 struct HistorySuspendScope {
-	HistorySuspendScope() { ++s_history_suspend_depth; }
-	~HistorySuspendScope() {
-		if (s_history_suspend_depth > 0)
-			--s_history_suspend_depth;
-	}
+    HistorySuspendScope() { ++s_history_suspend_depth; }
+    ~HistorySuspendScope() {
+        if (s_history_suspend_depth > 0)
+            --s_history_suspend_depth;
+    }
 };
 
 struct HistoryEditScope {
-	bool active;
-	HistoryEditScope() : active(history_begin_edit()) {}
-	~HistoryEditScope() { history_end_edit(active); }
+    bool active;
+    HistoryEditScope() : active(history_begin_edit()) {}
+    ~HistoryEditScope() { history_end_edit(active); }
 };
 
 #endif /* JCE_EDITOR_STATE_INTERNAL_H */

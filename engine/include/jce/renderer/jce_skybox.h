@@ -38,7 +38,7 @@ JceSkybox *jce_skybox_create_from_hdr_file(const char *path,
 JceSkybox *jce_skybox_create_from_hdr_memory(const void *data, uint32_t data_size,
                                               uint32_t cubemap_size);
 
-void jce_skybox_destroy(JceSkybox *sky);
+JCE_API void jce_skybox_destroy(JceSkybox *sky);
 
 /*
  * Render the skybox into the specified view.
@@ -56,16 +56,16 @@ void jce_skybox_render(const JceSkybox *sky, uint16_t view_id,
  * Get the equirectangular texture handle (RGBA16F or RGBA32F).
  * Useful for IBL processing.
  */
-JceTexture jce_skybox_get_equirect_texture(const JceSkybox *sky);
+JCE_API JceTexture jce_skybox_get_equirect_texture(const JceSkybox *sky);
 
 /*
  * Get the cubemap texture handle (6-face cubemap).
  * Returns JCE_TEXTURE_INVALID if not yet converted.
  */
-JceTexture jce_skybox_get_cubemap(const JceSkybox *sky);
+JCE_API JceTexture jce_skybox_get_cubemap(const JceSkybox *sky);
 
 /* Check if the current GPU supports HDR skybox (float textures). */
-bool jce_skybox_supported(void);
+JCE_API bool jce_skybox_supported(void);
 
 JCE_EXTERN_C_END
 

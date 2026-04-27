@@ -11,11 +11,9 @@
  */
 
 #include "jce_fv_common.h"
+#include "ui/jce_theme_palette.h"
 
-#include <assimp/Importer.hpp>
-#include <assimp/material.h>
-#include <assimp/postprocess.h>
-#include <assimp/scene.h>
+#include <jce/resource/jce_model_importer.h>
 
 #include <string>
 #include <vector>
@@ -107,7 +105,7 @@ static void fv_parse_model_assimp(FvTab *tab, ModelViewState *ms)
     ms->minX = ms->minY = ms->minZ =  1e30f;
     ms->maxX = ms->maxY = ms->maxZ = -1e30f;
 
-    /* Skip assimp entirely for very large files to avoid main-thread stall. */
+    /* Skip parsing entirely for very large files to avoid main-thread stall. */
     if (tab->file_size > FV_MODEL_SKIP_PARSE_BYTES) {
         ms->skipped_parse = true;
         ms->too_complex   = true;
@@ -121,113 +119,95 @@ static void fv_parse_model_assimp(FvTab *tab, ModelViewState *ms)
         return;
     }
 
-    const unsigned assimp_flags =
-        aiProcess_Triangulate
-        | aiProcess_JoinIdenticalVertices
-        | aiProcess_GenSmoothNormals
-        | aiProcess_ImproveCacheLocality;
-
-    /* Prefer file-based loading so assimp can resolve external references
-     * (e.g. .bin files referenced by .gltf).  Fall back to memory-based
-     * loading when the file path doesn't work (embedded buffers, etc.).
-     * Both importers live at the same scope so the scene pointer stays
-     * valid throughout parsing. */
-    Assimp::Importer file_importer;
-    Assimp::Importer mem_importer;
-    const aiScene *scene = nullptr;
-
+    /* First pass: counts only — bail out early if too complex. */
+    JceModelInspectResult info = {};
+    bool ok = false;
     if (tab->path[0] != '\0')
-        scene = file_importer.ReadFile(tab->path, assimp_flags);
-
-    if (!scene || scene->mNumMeshes == 0) {
+        ok = jce_model_importer_inspect_file(tab->path, false, &info);
+    if (!ok) {
+        jce_model_importer_free_inspect(&info);
         const char *hint = tab->ext;
         if (hint && hint[0] == '.') hint++;
-        scene = mem_importer.ReadFileFromMemory(
-            tab->content, (size_t)tab->content_len, assimp_flags, hint);
+        ok = jce_model_importer_inspect_memory(tab->content,
+                                               (size_t)tab->content_len,
+                                               hint, false, &info);
     }
-
-    if (!scene || scene->mNumMeshes == 0) {
-        const char *err = file_importer.GetErrorString();
-        if (!err || err[0] == '\0')
-            err = mem_importer.GetErrorString();
+    if (!ok) {
         snprintf(ms->load_error, sizeof(ms->load_error),
-                 "assimp: %s", err ? err : "unknown error");
+                 "%s", info.error[0] ? info.error : "model load failed");
+        jce_model_importer_free_inspect(&info);
         return;
     }
 
-    ms->mesh_count = (int)scene->mNumMeshes;
-
-    for (unsigned i = 0; i < scene->mNumMaterials; i++) {
-        const aiMaterial *mat = scene->mMaterials[i];
-        aiString name;
-        if (mat && mat->Get(AI_MATKEY_NAME, name) == AI_SUCCESS && name.length > 0) {
-            ms->materials.push_back(std::string(name.C_Str()));
-        } else {
-            char tmp[64];
-            snprintf(tmp, sizeof(tmp), "Material %u", i);
-            ms->materials.push_back(std::string(tmp));
-        }
-    }
-    ms->mat_count = (int)ms->materials.size();
-
-    /* Count total vertices/faces without building arrays first. */
-    {
-        int total_verts = 0, total_faces = 0;
-        for (unsigned m = 0; m < scene->mNumMeshes; m++) {
-            const aiMesh *mesh = scene->mMeshes[m];
-            if (!mesh) continue;
-            total_verts += (int)mesh->mNumVertices;
-            total_faces += (int)mesh->mNumFaces;
-        }
-        ms->vert_count = total_verts;
-        ms->face_count = total_faces;
-
-        if (total_verts > FV_MODEL_MAX_WIREFRAME_VERTS) {
-            ms->too_complex = true;
-            ms->load_ok = true;
-            return;
-        }
+    ms->mesh_count = info.mesh_count;
+    ms->vert_count = info.vertex_count;
+    ms->face_count = info.face_count;
+    ms->mat_count  = info.material_count;
+    for (int i = 0; i < info.material_count; i++) {
+        const char *n = info.material_names ? info.material_names[i] : nullptr;
+        ms->materials.push_back(std::string(n ? n : ""));
     }
 
-    /* Collect vertex/face data for wireframe rendering (small models). */
-    ms->vert_count = 0;
+    if (info.vertex_count > FV_MODEL_MAX_WIREFRAME_VERTS) {
+        ms->too_complex = true;
+        ms->load_ok = true;
+        jce_model_importer_free_inspect(&info);
+        return;
+    }
+    jce_model_importer_free_inspect(&info);
+
+    /* Second pass: also fetch flat vertex/face arrays for wireframe. */
+    JceModelInspectResult wire = {};
+    bool wok = false;
+    if (tab->path[0] != '\0')
+        wok = jce_model_importer_inspect_file(tab->path, true, &wire);
+    if (!wok) {
+        jce_model_importer_free_inspect(&wire);
+        const char *hint = tab->ext;
+        if (hint && hint[0] == '.') hint++;
+        wok = jce_model_importer_inspect_memory(tab->content,
+                                                (size_t)tab->content_len,
+                                                hint, true, &wire);
+    }
+    if (!wok) {
+        snprintf(ms->load_error, sizeof(ms->load_error),
+                 "%s", wire.error[0] ? wire.error : "wireframe load failed");
+        jce_model_importer_free_inspect(&wire);
+        return;
+    }
+
+    ms->vert_count = wire.vertex_count;
     ms->face_count = 0;
-    int vert_base = 0;
-    for (unsigned m = 0; m < scene->mNumMeshes; m++) {
-        const aiMesh *mesh = scene->mMeshes[m];
-        if (!mesh) continue;
-
-        for (unsigned v = 0; v < mesh->mNumVertices; v++) {
-            float x = mesh->mVertices[v].x;
-            float y = mesh->mVertices[v].y;
-            float z = mesh->mVertices[v].z;
-
-            ms->vx.push_back(x);
-            ms->vy.push_back(y);
-            ms->vz.push_back(z);
-
-            if (x < ms->minX) ms->minX = x; if (x > ms->maxX) ms->maxX = x;
-            if (y < ms->minY) ms->minY = y; if (y > ms->maxY) ms->maxY = y;
-            if (z < ms->minZ) ms->minZ = z; if (z > ms->maxZ) ms->maxZ = z;
-            ms->vert_count++;
-        }
-
-        for (unsigned f = 0; f < mesh->mNumFaces; f++) {
-            const aiFace &face = mesh->mFaces[f];
-            if (face.mNumIndices < 2) continue;
-
-            ms->face_sizes.push_back((int)face.mNumIndices);
-            for (unsigned fi = 0; fi < face.mNumIndices; fi++)
-                ms->face_idx.push_back((int)face.mIndices[fi] + vert_base);
-            ms->face_count++;
-        }
-
-        vert_base += (int)mesh->mNumVertices;
+    ms->vx.reserve(wire.vertex_count);
+    ms->vy.reserve(wire.vertex_count);
+    ms->vz.reserve(wire.vertex_count);
+    for (int v = 0; v < wire.vertex_count; v++) {
+        float x = wire.vertices_xyz[v * 3 + 0];
+        float y = wire.vertices_xyz[v * 3 + 1];
+        float z = wire.vertices_xyz[v * 3 + 2];
+        ms->vx.push_back(x);
+        ms->vy.push_back(y);
+        ms->vz.push_back(z);
     }
+    ms->minX = wire.bounds_min[0]; ms->maxX = wire.bounds_max[0];
+    ms->minY = wire.bounds_min[1]; ms->maxY = wire.bounds_max[1];
+    ms->minZ = wire.bounds_min[2]; ms->maxZ = wire.bounds_max[2];
+
+    int face_idx_cursor = 0;
+    for (int f = 0; f < wire.face_count; f++) {
+        int n = wire.face_sizes[f];
+        if (n < 2) continue;
+        ms->face_sizes.push_back(n);
+        for (int k = 0; k < n; k++)
+            ms->face_idx.push_back(wire.face_indices[face_idx_cursor + k]);
+        face_idx_cursor += n;
+        ms->face_count++;
+    }
+    jce_model_importer_free_inspect(&wire);
 
     if (ms->vert_count <= 0) {
         snprintf(ms->load_error, sizeof(ms->load_error),
-                 "assimp loaded scene but found no vertices");
+                 "model loaded but found no vertices");
         return;
     }
 
@@ -434,10 +414,10 @@ void fv_render_model(FvTab *tab)
             dl->PushClipRect(view_pos,
                 ImVec2(view_pos.x + vw, view_pos.y + vh), true);
 
-            /* Dark background */
+            /* Theme-aware background */
             dl->AddRectFilled(view_pos,
                 ImVec2(view_pos.x + vw, view_pos.y + vh),
-                IM_COL32(30, 30, 35, 255));
+                jce_theme::canvas_bg());
 
             float radX = ms->rotX * JCE_DEG2RAD;
             float radY = ms->rotY * JCE_DEG2RAD;
@@ -477,7 +457,7 @@ void fv_render_model(FvTab *tab)
             if (ms->vert_count > 0) {
                 if (ms->show_wireframe) {
                     /* Wireframe faces */
-                    ImU32 wire_col = IM_COL32(180, 180, 200, 200);
+                    ImU32 wire_col = jce_theme::text_primary();
                     int fi = 0;
                     for (int f = 0; f < (int)ms->face_sizes.size(); f++) {
                         int nv = ms->face_sizes[f];
@@ -507,7 +487,7 @@ void fv_render_model(FvTab *tab)
                     }
                 } else {
                     /* Point cloud mode: draw each vertex as a small filled circle */
-                    ImU32 point_col = IM_COL32(180, 200, 220, 220);
+                    ImU32 point_col = jce_theme::text_primary();
                     for (int v = 0; v < ms->vert_count; v++) {
                         float px0 = (ms->vx[v] - ms->cx) * ms->scale;
                         float py0 = (ms->vy[v] - ms->cy) * ms->scale;
