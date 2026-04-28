@@ -65,6 +65,16 @@ void         jce_renderer_begin_frame_3d(const JceRenderer *r, JceWindow *win,
 /* End a frame: submits all queued draw calls to the GPU. */
 JCE_API void         jce_renderer_end_frame(const JceRenderer *r);
 
+/* Submit a single "splash" frame that just clears view 0 to the given
+   RGBA8 colour and presents. Intended to be called once at app-init
+   entry, BEFORE heavy synchronous initialisation, so the OS window
+   shows a themed background instead of the white "not responding"
+   surface while subsystems warm up. Safe to call after the renderer
+   has been created and the window is attached. */
+JCE_API void         jce_renderer_present_splash(const JceRenderer *r,
+                                                  JceWindow *win,
+                                                  uint32_t rgba_color);
+
 /* -- Events --------------------------------------------------------- */
 
 /* Handle window resize: resets the GPU swap chain. */

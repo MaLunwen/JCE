@@ -199,8 +199,25 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
     }
 
     jce_json_free(root);
-    LOG_INFO(LOG_TAG, "Config loaded: lang=%s theme=%s font=%d",
-              cfg->language, cfg->theme, cfg->font_size);
+    /* Suppress repetitive logging: jce_editor_config_load() is called from
+       ~30 sites during startup (panels, dialogs, state init, etc.) and each
+       call would otherwise spam an identical line. Log only when the
+       observable summary (lang/theme/font) actually changes vs the previous
+       successful load. The first call always logs. */
+    static char  s_last_lang[8]  = {0};
+    static char  s_last_theme[16] = {0};
+    static int   s_last_font     = -1;
+    if (s_last_font != cfg->font_size ||
+        strncmp(s_last_lang, cfg->language, sizeof(s_last_lang)) != 0 ||
+        strncmp(s_last_theme, cfg->theme, sizeof(s_last_theme)) != 0) {
+        LOG_INFO(LOG_TAG, "Config loaded: lang=%s theme=%s font=%d",
+                  cfg->language, cfg->theme, cfg->font_size);
+        strncpy(s_last_lang, cfg->language, sizeof(s_last_lang) - 1);
+        s_last_lang[sizeof(s_last_lang) - 1] = '\0';
+        strncpy(s_last_theme, cfg->theme, sizeof(s_last_theme) - 1);
+        s_last_theme[sizeof(s_last_theme) - 1] = '\0';
+        s_last_font = cfg->font_size;
+    }
     return true;
 }
 

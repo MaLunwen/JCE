@@ -19,6 +19,7 @@ extern "C" {
 #include <jce/os/core/jce_timer.h>
 #include <jce/os/platform/jce_window.h>
 #include <jce/renderer/jce_postfx.h>
+#include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_scene_renderer.h>
 }
 
@@ -113,6 +114,17 @@ static bool editor_app_init(const JceServices *svc, void *ud)
 {
     EditorState *st = (EditorState *)ud;
     st->svc = svc;
+
+    /* ── Splash frame (G) ─────────────────────────────────────────────
+       Submit a single themed-colour frame BEFORE the heavy init work
+       (BRDF LUT, font atlas, i18n parse, demo scene). On first launch
+       this turns the initial white "not responding" window into a dark
+       window almost instantly, so the user sees something within a few
+       ms instead of waiting for the whole startup pipeline to flush a
+       frame. The actual bgfx clear lives behind jce_renderer's API to
+       keep the editor TU free of backend-specific includes. */
+    jce_renderer_present_splash(svc->renderer, svc->window, 0x1c1c1cff);
+
     jce_editor_scene_render_init(svc->renderer, svc->pak, svc->assets);
     if (!jce_editor_init(svc->pak, svc->window))
         return false;

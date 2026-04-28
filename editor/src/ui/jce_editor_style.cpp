@@ -391,14 +391,17 @@ static bool resolve_font_path(const char *override_path,
 }
 
 /* Helper: try to load a font from override -> system. Returns the loaded
-   ImFont* (or NULL if neither path resolves) and logs the resolution. */
+   ImFont* (or NULL if neither path resolves) and logs the resolution.
+   When `quiet_on_miss` is true, no per-attempt WARN is emitted on miss
+   (used by the Icons fallback walk where misses are expected). */
 static ImFont *load_font_with_fallback(
-    const char *role,                  /* "Latin" / "CJK" */
+    const char *role,                  /* "Latin" / "CJK" / "Icons" */
     const char *override_path,
     const char *system_family,
     float size_pixels,
     const ImFontConfig *cfg,
-    const ImWchar *ranges)
+    const ImWchar *ranges,
+    bool quiet_on_miss = false)
 {
     ImGuiIO &io = ImGui::GetIO();
 
@@ -426,15 +429,23 @@ static ImFont *load_font_with_fallback(
         }
     }
 
-    LOG_WARN(LOG_TAG, "%s font unavailable (no override, no system match); "
-                      "ImGui default will be used", role);
+    if (!quiet_on_miss) {
+        LOG_WARN(LOG_TAG, "%s font unavailable (no override, no system match); "
+                          "ImGui default will be used", role);
+    }
     return NULL;
 }
 
 bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
                            const char *en_override, const char *zh_override)
 {
-    (void)pak; /* no longer needed; kept for API stability */
+    /* Cache pak across reloads so the deferred-reload path (font size
+       change in Preferences passes pak=NULL) still has access to i18n
+       JSON for the codepoint scan. */
+    static const JcePakArchive *s_pak_cached = NULL;
+    if (pak) s_pak_cached = pak;
+    const JcePakArchive *use_pak = pak ? pak : s_pak_cached;
+
     ImGuiIO &io = ImGui::GetIO();
 
     /* CRITICAL: clear the atlas before re-adding. Without this, repeat
@@ -494,7 +505,7 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
     merge_cfg.PixelSnapH  = true;
     merge_cfg.MergeMode   = true;
 
-    static const ImWchar cjk_ranges[] = {
+    static const ImWchar cjk_extra_ranges[] = {
         /* Backup ranges for arrows + box drawing + geometric shapes +
            misc symbols. Most CJK fonts (msyh, simhei, simsun, KaiTi)
            contain these glyphs, so merging them here ensures icons like
@@ -503,12 +514,75 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
         0x2190, 0x21FF,   /* Arrows */
         0x2500, 0x25FF,   /* Box Drawing + Block + Geometric Shapes */
         0x2600, 0x26FF,   /* Misc Symbols */
-        0x3000, 0x30FF,   /* CJK Symbols + Katakana */
-        0x31F0, 0x31FF,   /* Katakana Phonetic Extensions */
-        0xFF00, 0xFFEF,   /* Halfwidth & Fullwidth Forms */
-        0x4E00, 0x9FFF,   /* CJK Unified Ideographs */
         0,
     };
+
+    /* Build the actual CJK glyph set lazily.
+       Previously we baked 0x4E00–0x9FFF (~20 000 CJK Unified Ideographs)
+       which dominated atlas-build time (~1.7 s @ 24 px). Now we scan
+       the i18n JSON files in the PAK and add only the codepoints that
+       actually appear in editor strings. This keeps the atlas tiny
+       while guaranteeing every translatable string renders correctly
+       (no missing glyphs like 轴 or 管). A small built-in fallback set
+       ("ChineseSimplifiedCommon") is also merged so user-typed scene
+       names / asset names with common Chinese characters still render
+       even if the string isn't in the i18n table. */
+    ImFontGlyphRangesBuilder cjk_builder;
+    cjk_builder.AddRanges(io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+    cjk_builder.AddRanges(cjk_extra_ranges);
+
+    /* Scan i18n PAK files: for every UTF-8 codepoint encountered, mark
+       it as required. This is fast (~1 ms per file) and exact. */
+    if (use_pak) {
+        const char *i18n_paths[] = {
+            "i18n/en.json", "i18n/zh_cn.json", NULL
+        };
+        for (int i = 0; i18n_paths[i]; i++) {
+            const JcePakAsset *a = jce_pak_find(use_pak, i18n_paths[i]);
+            if (!a) continue;
+            char *buf = (char *)jce_malloc((size_t)a->original_size + 1);
+            if (!buf) continue;
+            size_t n = jce_pak_decompress(a, buf, (size_t)a->original_size);
+            if (n > 0) {
+                buf[n] = '\0';
+                const unsigned char *p = (const unsigned char *)buf;
+                const unsigned char *end = p + n;
+                while (p < end) {
+                    /* Inline UTF-8 decoder: returns codepoint and
+                       advances `p`. Handles 1/2/3/4-byte sequences. */
+                    unsigned int cp = 0;
+                    unsigned char c = *p;
+                    int adv = 1;
+                    if (c < 0x80) {
+                        cp = c;
+                    } else if ((c & 0xE0) == 0xC0 && p + 1 < end) {
+                        cp = ((c & 0x1F) << 6) | (p[1] & 0x3F);
+                        adv = 2;
+                    } else if ((c & 0xF0) == 0xE0 && p + 2 < end) {
+                        cp = ((c & 0x0F) << 12) |
+                             ((p[1] & 0x3F) << 6) |
+                             (p[2] & 0x3F);
+                        adv = 3;
+                    } else if ((c & 0xF8) == 0xF0 && p + 3 < end) {
+                        cp = ((c & 0x07) << 18) |
+                             ((p[1] & 0x3F) << 12) |
+                             ((p[2] & 0x3F) << 6) |
+                             (p[3] & 0x3F);
+                        adv = 4;
+                    }
+                    if (cp >= 0x80 && cp <= 0xFFFF)
+                        cjk_builder.AddChar((ImWchar)cp);
+                    p += adv;
+                }
+            }
+            jce_free(buf);
+        }
+    }
+
+    static ImVector<ImWchar> cjk_ranges_v;
+    cjk_ranges_v.clear();
+    cjk_builder.BuildRanges(&cjk_ranges_v);
+    const ImWchar *cjk_ranges = cjk_ranges_v.Data;
 
     /* CJK fallback chain: try a list of commonly-installed CJK fonts so
        Chinese / Japanese text doesn't show as tofu when the preferred
@@ -560,7 +634,8 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
     for (int i = 0; icon_fallbacks[i]; i++) {
         ImFont *ic = load_font_with_fallback(
             "Icons", NULL, icon_fallbacks[i],
-            size_pixels, &merge_cfg, icon_ranges);
+            size_pixels, &merge_cfg, icon_ranges,
+            /*quiet_on_miss=*/true);
         if (ic) break;
     }
 

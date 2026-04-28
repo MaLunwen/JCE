@@ -236,8 +236,12 @@ void jce_editor_state_init(void)
     }
 
     {
+        /* Note: clear_scene_entities() is intentionally NOT called here.
+           It would destroy the scene we just created and recreate it,
+           plus clear containers/selection that are already empty after
+           the memset() above — pure churn (~visible as a stray
+           "scene destroyed / scene created" pair in startup logs). */
         HistorySuspendScope suspend;
-        clear_scene_entities();
         build_demo_scene();
     }
 

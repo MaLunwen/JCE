@@ -42,9 +42,11 @@ typedef struct {
 /* ── State ─────────────────────────────────────────────────────────── */
 
 static struct {
-    I18nTable  tables[JCE_LOCALE_COUNT];
-    JceLocale  active;
-    bool       initialized;
+    I18nTable             tables[JCE_LOCALE_COUNT];
+    bool                  loaded[JCE_LOCALE_COUNT];
+    JceLocale             active;
+    bool                  initialized;
+    const JcePakArchive  *pak;   /* kept so we can lazy-load other locales */
 } s_i18n;
 
 static char s_expand_ring[EXPAND_RING_SIZE][MAX_EXPAND_LEN];
@@ -211,14 +213,41 @@ static void expand_placeholders(const char *src, char *dst, size_t cap, int dept
 
 /* ── Public API ────────────────────────────────────────────────────── */
 
+static const char *locale_filename(JceLocale locale)
+{
+    switch (locale) {
+        case JCE_LOCALE_EN:    return "i18n/en.json";
+        case JCE_LOCALE_ZH_CN: return "i18n/zh_cn.json";
+        default:               return NULL;
+    }
+}
+
+static void ensure_locale_loaded(JceLocale locale)
+{
+    if (locale < 0 || locale >= JCE_LOCALE_COUNT) return;
+    if (s_i18n.loaded[locale]) return;
+    if (!s_i18n.pak) return;
+    const char *path = locale_filename(locale);
+    if (!path) return;
+    if (load_locale(s_i18n.pak, path, &s_i18n.tables[locale]))
+        s_i18n.loaded[locale] = true;
+}
+
 bool jce_editor_i18n_init(const JcePakArchive *pak)
 {
     memset(&s_i18n, 0, sizeof(s_i18n));
     s_i18n.active = JCE_LOCALE_EN;
+    s_i18n.pak    = pak;
     s_expand_ring_index = 0;
 
-    load_locale(pak, "i18n/en.json",    &s_i18n.tables[JCE_LOCALE_EN]);
-    load_locale(pak, "i18n/zh_cn.json", &s_i18n.tables[JCE_LOCALE_ZH_CN]);
+    /* Only load the English fallback up-front. The currently-active
+       non-English locale (if any) is loaded lazily on the first
+       jce_editor_i18n_set_locale() call, which during startup typically
+       happens once when the editor reads the saved language preference.
+       This trims one ~1 ms JSON parse from cold start when the user
+       stays in EN — and avoids loading translations the user never
+       switches to. */
+    ensure_locale_loaded(JCE_LOCALE_EN);
 
     s_i18n.initialized = true;
     return true;
@@ -232,8 +261,9 @@ void jce_editor_i18n_shutdown(void)
 
 void jce_editor_i18n_set_locale(JceLocale locale)
 {
-    if (locale >= 0 && locale < JCE_LOCALE_COUNT)
-        s_i18n.active = locale;
+    if (locale < 0 || locale >= JCE_LOCALE_COUNT) return;
+    ensure_locale_loaded(locale);
+    s_i18n.active = locale;
 }
 
 JceLocale jce_editor_i18n_get_locale(void)

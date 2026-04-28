@@ -762,6 +762,25 @@ void jce_renderer_begin_frame_3d(const JceRenderer *r, JceWindow *win,
     bgfx_touch(view_id);
 }
 
+void jce_renderer_present_splash(const JceRenderer *r,
+                                 JceWindow *win,
+                                 uint32_t rgba_color)
+{
+    if (!r || r->is_fallback || !win) return;
+
+    uint32_t w = 0, h = 0;
+    jce_window_get_size(win, &w, &h);
+    if (w == 0) w = 1;
+    if (h == 0) h = 1;
+
+    bgfx_set_view_clear(0,
+                        BGFX_CLEAR_COLOR | BGFX_CLEAR_DEPTH,
+                        rgba_color, 1.0f, 0);
+    bgfx_set_view_rect(0, 0, 0, (uint16_t)w, (uint16_t)h);
+    bgfx_touch(0);
+    bgfx_frame(false);
+}
+
 void jce_renderer_end_frame(const JceRenderer *r)
 {
     JCE_PROFILE_ZONE_N("Renderer::EndFrame");

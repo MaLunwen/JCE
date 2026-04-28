@@ -12,12 +12,16 @@
 
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
+#include <jce/os/core/jce_thread.h>
+#include <jce/os/core/jce_filesystem.h>
 #include <jce/renderer/jce_ibl.h>
 
 #include "os/core/jce_memory.h"
 
 #include <bgfx/c99/bgfx.h>
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define LOG_TAG "jce_ibl"
@@ -153,30 +157,107 @@ static void integrate_brdf(float n_dot_v, float roughness,
     *out_bias  = bias  / (float)SAMPLE_COUNT;
 }
 
+/* BRDF LUT parallel-for job descriptor (file-scope so the worker and
+   the dispatch site share an exact type). */
+typedef struct {
+    uint32_t  y_begin, y_end, size;
+    uint16_t *out;
+} JceIblBrdfJob;
+
+static void jce_ibl_brdf_worker(void *arg)
+{
+    JceIblBrdfJob *j = (JceIblBrdfJob *)arg;
+    for (uint32_t y = j->y_begin; y < j->y_end; y++) {
+        float roughness = ((float)y + 0.5f) / (float)j->size;
+        for (uint32_t x = 0; x < j->size; x++) {
+            float n_dot_v = ((float)x + 0.5f) / (float)j->size;
+            float s, b;
+            integrate_brdf(n_dot_v, roughness, &s, &b);
+
+            uint32_t idx = (y * j->size + x) * 4;
+            j->out[idx + 0] = f32_to_f16(s);
+            j->out[idx + 1] = f32_to_f16(b);
+            j->out[idx + 2] = f32_to_f16(0.0f);
+            j->out[idx + 3] = f32_to_f16(1.0f);
+        }
+    }
+}
+
 JceTexture jce_ibl_create_brdf_lut(uint32_t size)
 {
     if (size == 0) size = 256;
 
     uint32_t pixel_count = size * size;
-    uint16_t *data = (uint16_t *)JCE_MALLOC(pixel_count * 4 * sizeof(uint16_t));
+    size_t   bytes       = (size_t)pixel_count * 4 * sizeof(uint16_t);
+    uint16_t *data = (uint16_t *)JCE_MALLOC(bytes);
     if (!data) return JCE_TEXTURE_INVALID;
 
-    for (uint32_t y = 0; y < size; y++) {
-        float roughness = ((float)y + 0.5f) / (float)size;
-        for (uint32_t x = 0; x < size; x++) {
-            float n_dot_v = ((float)x + 0.5f) / (float)size;
-            float s, b;
-            integrate_brdf(n_dot_v, roughness, &s, &b);
-
-            uint32_t idx = (y * size + x) * 4;
-            data[idx + 0] = f32_to_f16(s);
-            data[idx + 1] = f32_to_f16(b);
-            data[idx + 2] = f32_to_f16(0.0f);
-            data[idx + 3] = f32_to_f16(1.0f);
+    /* ── Try disk cache ──────────────────────────────────────────────
+       The BRDF LUT is a deterministic function of pixel coordinates
+       (importance-sampled split-sum GGX), so we can cache the raw
+       RGBA16F bytes on disk and reload instantly on subsequent runs. */
+    bool from_cache = false;
+    char cache_path[256];
+    snprintf(cache_path, sizeof(cache_path),
+             ".jce/cache/brdf_lut_%u.f16", size);
+    {
+        FILE *fp = fopen(cache_path, "rb");
+        if (fp) {
+            fseek(fp, 0, SEEK_END);
+            long fsz = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+            if (fsz == (long)bytes &&
+                fread(data, 1, bytes, fp) == bytes) {
+                from_cache = true;
+            }
+            fclose(fp);
         }
     }
 
-    const bgfx_memory_t *mem = bgfx_copy(data, pixel_count * 4 * sizeof(uint16_t));
+    if (!from_cache) {
+        /* ── Parallel CPU integration ──────────────────────────────────
+           Split the y-axis into N row chunks; spawn one short-lived SDL
+           thread per chunk. The work is embarrassingly parallel (no
+           shared state between rows). */
+        int worker_count = 4;
+        if ((uint32_t)worker_count > size) worker_count = (int)size;
+
+        JceIblBrdfJob jobs[8];
+        JceThread    *threads[8] = {0};
+
+        uint32_t rows_per = size / (uint32_t)worker_count;
+        uint32_t y = 0;
+        for (int i = 0; i < worker_count; i++) {
+            jobs[i].size    = size;
+            jobs[i].out     = data;
+            jobs[i].y_begin = y;
+            jobs[i].y_end   = (i == worker_count - 1) ? size : y + rows_per;
+            y               = jobs[i].y_end;
+        }
+
+        for (int i = 0; i < worker_count; i++) {
+            threads[i] = jce_thread_create(
+                jce_ibl_brdf_worker, &jobs[i], "brdf_lut");
+            if (!threads[i]) {
+                /* Fallback: run inline on the calling thread. */
+                jce_ibl_brdf_worker(&jobs[i]);
+            }
+        }
+        for (int i = 0; i < worker_count; i++) {
+            if (threads[i]) jce_thread_join(threads[i]);
+        }
+
+        /* ── Write cache for next run (best-effort) ─────────────────── */
+        jce_fs_host_create_directory(".jce");
+        jce_fs_host_create_directory(".jce/cache");
+        FILE *fp = fopen(cache_path, "wb");
+        if (fp) {
+            fwrite(data, 1, bytes, fp);
+            fclose(fp);
+        }
+    }
+
+    const bgfx_memory_t *mem = bgfx_copy(data, (uint32_t)bytes);
     JCE_FREE(data);
 
     bgfx_texture_handle_t tex = bgfx_create_texture_2d(
@@ -186,7 +267,8 @@ JceTexture jce_ibl_create_brdf_lut(uint32_t size)
         mem);
 
     if (BGFX_HANDLE_IS_VALID(tex))
-        LOG_INFO(LOG_TAG, "BRDF LUT created: %ux%u", size, size);
+        LOG_INFO(LOG_TAG, "BRDF LUT %s: %ux%u",
+                 from_cache ? "cached" : "created", size, size);
 
     return (JceTexture){ tex.idx };
 }
