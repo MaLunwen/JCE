@@ -11,7 +11,7 @@
 
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
-#include <jce/os/core/jce_pak_loader.h>
+#include <jce/resource/jce_pak_loader.h>
 
 #include "jce_memory.h"
 
@@ -189,41 +189,41 @@ void jce_fs_close(JceFile *file)
     JCE_FREE(file);
 }
 
-size_t jce_fs_read(JceFile *file, void *buf, size_t buf_size)
+uint64_t jce_fs_read(JceFile *file, void *buf, uint64_t buf_size)
 {
     if (!file || !buf || buf_size == 0) return 0;
 
     if (file->kind == JCE_FILE_PHYSFS) {
         PHYSFS_sint64 n = PHYSFS_readBytes(file->u.physfs.handle,
                                            buf, (PHYSFS_uint64)buf_size);
-        return (n > 0) ? (size_t)n : 0;
+        return (n > 0) ? (uint64_t)n : 0;
     }
 
     /* PAK: copy from the memory buffer. */
-    size_t remaining = file->u.pak.size - file->u.pak.cursor;
-    size_t to_read   = (buf_size < remaining) ? buf_size : remaining;
-    memcpy(buf, (const char *)file->u.pak.data + file->u.pak.cursor, to_read);
+    uint64_t remaining = file->u.pak.size - file->u.pak.cursor;
+    uint64_t to_read   = (buf_size < remaining) ? buf_size : remaining;
+    memcpy(buf, (const char *)file->u.pak.data + file->u.pak.cursor, (size_t)to_read);
     file->u.pak.cursor += to_read;
     return to_read;
 }
 
-size_t jce_fs_size(const JceFile *file)
+uint64_t jce_fs_size(const JceFile *file)
 {
     if (!file) return 0;
     if (file->kind == JCE_FILE_PHYSFS)
         return (file->u.physfs.total_size >= 0)
-             ? (size_t)file->u.physfs.total_size : 0;
+             ? (uint64_t)file->u.physfs.total_size : 0;
     return file->u.pak.size;
 }
 
 void *jce_fs_read_all(const JceFileSystem *fs, const char *virtual_path,
-                      size_t *out_size)
+                      uint64_t *out_size)
 {
     if (out_size) *out_size = 0;
     JceFile *f = jce_fs_open(fs, virtual_path);
     if (!f) return NULL;
 
-    size_t sz = jce_fs_size(f);
+    uint64_t sz = jce_fs_size(f);
     if (sz == 0) {
         jce_fs_close(f);
         return NULL;
@@ -232,7 +232,7 @@ void *jce_fs_read_all(const JceFileSystem *fs, const char *virtual_path,
     void *buf = JCE_MALLOC(sz);
     if (!buf) { jce_fs_close(f); return NULL; }
 
-    size_t nread = jce_fs_read(f, buf, sz);
+    uint64_t nread = jce_fs_read(f, buf, sz);
     jce_fs_close(f);
 
     if (nread != sz) {
@@ -305,7 +305,7 @@ JceFile *jce_fs_open_write(JceFileSystem *fs, const char *virtual_path)
     return f;
 }
 
-size_t jce_fs_write(JceFile *file, const void *buf, size_t size)
+uint64_t jce_fs_write(JceFile *file, const void *buf, uint64_t size)
 {
     if (!file || !buf || size == 0) return 0;
 
@@ -316,23 +316,23 @@ size_t jce_fs_write(JceFile *file, const void *buf, size_t size)
 
     PHYSFS_sint64 n = PHYSFS_writeBytes(file->u.physfs.handle,
                                          buf, (PHYSFS_uint64)size);
-    return (n > 0) ? (size_t)n : 0;
+    return (n > 0) ? (uint64_t)n : 0;
 }
 
 bool jce_fs_write_all(JceFileSystem *fs, const char *virtual_path,
-                      const void *data, size_t size)
+                      const void *data, uint64_t size)
 {
     if (!fs || !virtual_path || !data) return false;
 
     JceFile *f = jce_fs_open_write(fs, virtual_path);
     if (!f) return false;
 
-    size_t written = jce_fs_write(f, data, size);
+    uint64_t written = jce_fs_write(f, data, size);
     jce_fs_close(f);
 
     if (written != size) {
-        LOG_ERROR(LOG_TAG, "write error: wrote %zu / %zu bytes to '%s'",
-                  written, size, virtual_path);
+        LOG_ERROR(LOG_TAG, "write error: wrote %llu / %llu bytes to '%s'",
+                  (unsigned long long)written, (unsigned long long)size, virtual_path);
         return false;
     }
 

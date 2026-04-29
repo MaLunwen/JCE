@@ -15,7 +15,6 @@
 
 #include <algorithm>
 #include <cctype>
-#include <filesystem>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -23,8 +22,10 @@
 #include <vector>
 
 extern "C" {
+#include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_path.h>
 #include <jce/os/core/jce_thread.h>
 #include <jce/renderer/jce_mesh.h>
 #include <jce/renderer/jce_texture.h>
@@ -33,8 +34,6 @@ extern "C" {
 }
 
 #define LOG_TAG "scene_asset_cache"
-
-namespace fs = std::filesystem;
 
 /* ── Cache entry types ──────────────────────────────────────────── */
 
@@ -235,12 +234,12 @@ void texture_async_start(void);
 void texture_async_stop(void);
 void texture_async_begin_new_generation(void);
 uint64_t texture_async_current_generation(void);
-void texture_async_queue_request(const char *key, const fs::path &file_path);
+void texture_async_queue_request(const char *key, const char *file_path);
 void texture_async_queue_resolve_request(const char *key,
                                          const char *material_path,
                                          const char *mesh_path);
 
-bool decode_texture_rgba_path(const fs::path &path,
+bool decode_texture_rgba_path(const char *path,
                               std::vector<uint8_t> *out_rgba,
                               uint32_t *out_w,
                               uint32_t *out_h);
@@ -266,15 +265,15 @@ bool material_take_completed_result(JceEditorMaterialExtractResult *out_result);
 
 std::string lower_copy(const std::string &s);
 std::string trim_copy(const std::string &s);
-bool        path_is_file(const fs::path &path);
-std::vector<fs::path> collect_scene_roots(void);
-bool find_file_by_name_recursive(const std::vector<fs::path> &roots,
-                                 const std::string &file_name,
-                                 int max_depth,
-                                 fs::path *out);
+bool        path_is_file(const char *path);
+void        collect_scene_roots(std::vector<std::string> *out);
+bool        find_file_by_name_recursive(const std::vector<std::string> &roots,
+                                        const std::string &file_name,
+                                        int max_depth,
+                                        char *out, size_t out_size);
 
 bool resolve_texture_path_for_material(const char *material_path,
                                        const char *mesh_path,
-                                       fs::path *out_path);
+                                       char *out_path, size_t out_size);
 
 #endif /* JCE_ASSET_CACHE_INTERNAL_H */

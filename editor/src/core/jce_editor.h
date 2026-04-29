@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#include <jce/os/core/jce_pak_loader.h>
+#include <jce/resource/jce_pak_loader.h>
 #include <jce/os/platform/jce_window.h>
 
 /* Initialize the editor subsystem.

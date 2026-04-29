@@ -20,9 +20,9 @@
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_style.h"
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 #include <jce/os/core/jce_str.h>
-#include <jce/application/jce_config.h>
+#include <jce/os/core/jce_config.h>
 #include <jce/renderer/jce_renderer_caps.h>
 #include <jce/renderer/jce_renderer.h>
 #include <stdio.h>

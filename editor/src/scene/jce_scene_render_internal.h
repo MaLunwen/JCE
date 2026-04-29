@@ -20,12 +20,14 @@
 extern "C" {
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
+#include <jce/os/core/jce_filesystem.h>
 #include <jce/renderer/jce_camera.h>
 #include <jce/renderer/jce_debug_draw.h>
 #include <jce/renderer/jce_lighting.h>
 #include <jce/renderer/jce_lowlevel.h>
 #include <jce/renderer/jce_material.h>
 #include <jce/renderer/jce_mesh.h>
+#include <jce/renderer/jce_occlusion_culler.h>
 #include <jce/renderer/jce_offscreen_target.h>
 #include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_renderer_caps.h>
@@ -33,6 +35,7 @@ extern "C" {
 #include <jce/renderer/jce_shaders.h>
 #include <jce/renderer/jce_texture.h>
 #include <jce/renderer/jce_views.h>
+#include <jce/resource/jce_world_streamer.h>
 }
 
 #define LOG_TAG "scene_render"
@@ -110,6 +113,13 @@ struct SceneRenderState {
 
     /* Animation delta-time accumulator (driven by frame()). */
     uint64_t     anim_last_ticks;
+
+    /* World streamer — optional open-world chunk streaming. */
+    JceWorldStreamer   *world_streamer;
+    JceFileSystem      *stream_fs;
+
+    /* GPU-query occlusion culler — optional two-pass coherence culling. */
+    JceOcclusionCuller *occlusion_culler;
 };
 
 extern SceneRenderState s_sr;

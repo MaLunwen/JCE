@@ -55,8 +55,8 @@ typedef JceBtStatus (*jce_bt_action_fn)(const char *name, void *userdata);
  * Register a named action node.  When the behavior tree encounters
  * a leaf node with this name, `fn` is called.
  */
-void jce_bt_register_action(JceBtContext *ctx, const char *name,
-                            jce_bt_action_fn fn, void *userdata);
+JCE_API void JCE_CALL jce_bt_register_action(JceBtContext *ctx, const char *name,
+                                             jce_bt_action_fn fn, void *userdata);
 
 /* ================================================================== */
 /* Tree management                                                     */

@@ -8,7 +8,7 @@
 #ifndef JCE_EDITOR_COLORS_H
 #define JCE_EDITOR_COLORS_H
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 /* Helper: build ImVec4 from 0-255 RGBA */
 #define JCE_RGBA(r, g, b, a) ImVec4((r)/255.0f, (g)/255.0f, (b)/255.0f, (a)/255.0f)
 

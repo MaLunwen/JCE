@@ -91,12 +91,16 @@ JceWindow *jce_window_create(const JceWindowConfig *cfg)
     }
 #endif
 
+    LOG_INFO(LOG_TAG, "window created (%ux%u logical, %ux%u pixels)",
+             win->logical_w, win->logical_h, win->pixel_w, win->pixel_h);
+
     return win;
 }
 
 void jce_window_destroy(JceWindow *win)
 {
     if (!win) return;
+    LOG_INFO(LOG_TAG, "window destroyed");
 #if defined(__APPLE__)
     if (win->metal_view) SDL_Metal_DestroyView(win->metal_view);
 #endif

@@ -6,6 +6,7 @@
  */
 
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_path.h>
 #include <jce/os/core/jce_timer.h>
 
 #include "core/jce_editor_config.h"
@@ -18,46 +19,56 @@ AssetBrowserState s_assets;
 
 /* ── Shared helpers ──────────────────────────────────────────────── */
 
-std::string normalized_path_string(const fs::path &p)
+std::string normalized_path_string(const std::string &p)
 {
-    try {
-        fs::path canonical = fs::weakly_canonical(p);
-        fs::path cwd       = fs::current_path();
-        fs::path rel        = fs::relative(canonical, cwd);
-        /* fs::relative returns "" on failure; fall back to canonical. */
-        if (!rel.empty() && rel != ".")
-            return rel.string();
-        return canonical.string();
-    } catch (...) {
-        try {
-            return fs::absolute(p).lexically_normal().string();
-        } catch (...) {
-            return p.string();
-        }
+    if (p.empty()) return p;
+
+    /* Identity form is always absolute + canonical so that path
+       comparisons (breadcrumb, parent navigation, dir tree selection)
+       are unambiguous regardless of process CWD changes.  Display
+       layers can compute a relative form on demand. */
+    char abs_buf[1024];
+    if (jce_path_is_absolute(p.c_str())) {
+        if (!jce_path_normalize(abs_buf, sizeof(abs_buf), p.c_str()))
+            return p;
+    } else {
+        char cwd_buf[1024];
+        if (!jce_fs_host_get_current_dir(cwd_buf, sizeof(cwd_buf)))
+            return p;
+        char joined[1024];
+        if (!jce_path_join(joined, sizeof(joined), cwd_buf, p.c_str()))
+            return p;
+        if (!jce_path_normalize(abs_buf, sizeof(abs_buf), joined))
+            return p;
     }
+    jce_path_to_canonical(abs_buf, sizeof(abs_buf), abs_buf);
+    return std::string(abs_buf);
 }
 
-static std::string format_modified_time(const fs::directory_entry &de)
+static std::string format_modified_time(const char *path)
 {
-    try {
-        int64_t epoch = 0;
-        if (!jce_fs_host_get_mtime(de.path().string().c_str(), &epoch))
-            return "";
-
-        char buf[32];
-        if (jce_time_format_local(epoch, "%Y-%m-%d %H:%M",
-                                  buf, sizeof(buf)) == 0)
-            return "";
-        return std::string(buf);
-    } catch (...) {
+    int64_t epoch = 0;
+    if (!jce_fs_host_get_mtime(path, &epoch))
         return "";
-    }
+
+    char buf[32];
+    if (jce_time_format_local(epoch, "%Y-%m-%d %H:%M",
+                              buf, sizeof(buf)) == 0)
+        return "";
+    return std::string(buf);
 }
 
 void ensure_assets_init(void)
 {
     if (s_assets.initialized) return;
-    s_assets.project_root      = ".";
+    /* Use the launch CWD as the initial project root.  Anything else
+       (e.g. ".") becomes ambiguous once the editor changes process cwd
+       or is launched from a build folder. */
+    char cwd_buf[1024];
+    if (jce_fs_host_get_current_dir(cwd_buf, sizeof(cwd_buf)))
+        s_assets.project_root = cwd_buf;
+    else
+        s_assets.project_root = ".";
     s_assets.current_path      = s_assets.project_root;
     s_assets.last_clicked_idx  = -1;
     s_assets.renaming_idx      = -1;
@@ -92,30 +103,50 @@ void ensure_assets_init(void)
 void refresh_entries(void)
 {
     s_assets.entries.clear();
-    try {
-        for (auto &de : fs::directory_iterator(s_assets.current_path)) {
-            FileEntry fe;
-            fe.name   = de.path().filename().string();
-            fe.path   = normalized_path_string(de.path());
-            fe.is_dir = de.is_directory();
-            fe.modified_at = format_modified_time(de);
-            if (!fe.is_dir) {
-                std::string ext = de.path().extension().string();
-                std::transform(ext.begin(), ext.end(), ext.begin(),
-                               [](unsigned char c) { return (char)std::tolower(c); });
-                fe.ext  = ext;
-                try { fe.size = de.file_size(); }
-                catch (...) { fe.size = 0; }
-            } else {
-                fe.ext  = "";
-                fe.size = 0;
-            }
-            s_assets.entries.push_back(std::move(fe));
+    
+    struct ListCtx {
+        std::vector<FileEntry> *entries;
+        std::string current_path;
+    } ctx;
+    ctx.entries = &s_assets.entries;
+    ctx.current_path = s_assets.current_path;
+    
+    auto cb = [](const char *name, bool is_dir, void *ud) -> bool {
+        ListCtx *c = static_cast<ListCtx*>(ud);
+        
+        FileEntry fe;
+        fe.name = name;
+        
+        char full[1024];
+        jce_path_join(full, sizeof(full), c->current_path.c_str(), name);
+        fe.path = normalized_path_string(full);
+        fe.is_dir = is_dir;
+        fe.modified_at = format_modified_time(full);
+        
+        if (!fe.is_dir) {
+            char ext_buf[64];
+            jce_path_extension(ext_buf, sizeof(ext_buf), name);
+            std::string ext = ext_buf;
+            std::transform(ext.begin(), ext.end(), ext.begin(),
+                           [](unsigned char c) { return (char)std::tolower(c); });
+            fe.ext = ext;
+            
+            uint64_t sz = 0;
+            jce_fs_host_get_size(full, &sz);
+            fe.size = sz;
+        } else {
+            fe.ext  = "";
+            fe.size = 0;
         }
-    } catch (const std::exception &e) {
+        
+        c->entries->push_back(std::move(fe));
+        return true;
+    };
+    
+    if (!jce_fs_host_list_dir(s_assets.current_path.c_str(), cb, &ctx)) {
         jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-            "Asset browser: failed to read directory '%s': %s",
-            s_assets.current_path.c_str(), e.what());
+            "Asset browser: failed to read directory '%s'",
+            s_assets.current_path.c_str());
     }
 
     std::sort(s_assets.entries.begin(), s_assets.entries.end(),
@@ -132,17 +163,20 @@ void refresh_entries(void)
 static bool directory_entries_changed(void)
 {
     std::vector<std::pair<std::string, bool>> disk_entries;
-    try {
-        for (auto &de : fs::directory_iterator(
-                 s_assets.current_path,
-                 fs::directory_options::skip_permission_denied)) {
-            disk_entries.emplace_back(
-                de.path().filename().string(),
-                de.is_directory());
-        }
-    } catch (...) {
+    
+    struct ListCtx {
+        std::vector<std::pair<std::string, bool>> *entries;
+    } ctx;
+    ctx.entries = &disk_entries;
+    
+    auto cb = [](const char *name, bool is_dir, void *ud) -> bool {
+        ListCtx *c = static_cast<ListCtx*>(ud);
+        c->entries->emplace_back(name, is_dir);
+        return true;
+    };
+    
+    if (!jce_fs_host_list_dir(s_assets.current_path.c_str(), cb, &ctx))
         return false;
-    }
 
     std::sort(disk_entries.begin(), disk_entries.end(),
               [](const std::pair<std::string, bool> &a,
@@ -169,7 +203,7 @@ void navigate_asset_directory(const std::string &path, bool clear_search)
 
     /* Defer navigation application to panel frame boundary so we never
        rebuild entry vectors while the grid is still iterating them. */
-    s_assets.pending_navigation_path = normalized_path_string(fs::path(path));
+    s_assets.pending_navigation_path = normalized_path_string(path);
     s_assets.pending_navigation_clear_search = clear_search;
     s_assets.next_auto_refresh_time = ImGui::GetTime() + 0.35;
 }
@@ -182,37 +216,56 @@ void collect_search_results(const std::string &query)
     std::string query_lower = query;
     for (auto &c : query_lower) c = (char)std::tolower((unsigned char)c);
 
-    try {
-        for (auto &de : fs::recursive_directory_iterator(
-                 s_assets.current_path,
-                 fs::directory_options::skip_permission_denied)) {
-            FileEntry fe;
-            fe.name   = de.path().filename().string();
-            fe.is_dir = de.is_directory();
-            fe.modified_at = format_modified_time(de);
-
-            std::string name_lower = fe.name;
-            for (auto &c : name_lower) c = (char)std::tolower((unsigned char)c);
-            if (name_lower.find(query_lower) == std::string::npos)
-                continue;
-
-            fe.path = normalized_path_string(de.path());
-            if (!fe.is_dir) {
-                std::string ext = de.path().extension().string();
-                std::transform(ext.begin(), ext.end(), ext.begin(),
-                               [](unsigned char c_) { return (char)std::tolower(c_); });
-                fe.ext  = ext;
-                try { fe.size = de.file_size(); }
-                catch (...) { fe.size = 0; }
-            } else {
-                fe.ext  = "";
-                fe.size = 0;
-            }
-            s_assets.search_results.push_back(std::move(fe));
-
-            if (s_assets.search_results.size() >= 500) break;
+    struct WalkCtx {
+        std::string query_lower;
+        std::vector<FileEntry> *results;
+    } ctx;
+    ctx.query_lower = query_lower;
+    ctx.results = &s_assets.search_results;
+    
+    auto cb = [](const char *path, bool is_dir, void *ud) -> bool {
+        WalkCtx *c = static_cast<WalkCtx*>(ud);
+        
+        if (c->results->size() >= 500)
+            return false;
+        
+        char basename[256];
+        jce_path_basename(basename, sizeof(basename), path);
+        
+        std::string name = basename;
+        std::string name_lower = name;
+        for (auto &ch : name_lower) ch = (char)std::tolower((unsigned char)ch);
+        
+        if (name_lower.find(c->query_lower) == std::string::npos)
+            return true;
+        
+        FileEntry fe;
+        fe.name = name;
+        fe.is_dir = is_dir;
+        fe.modified_at = format_modified_time(path);
+        fe.path = normalized_path_string(path);
+        
+        if (!fe.is_dir) {
+            char ext_buf[64];
+            jce_path_extension(ext_buf, sizeof(ext_buf), path);
+            std::string ext = ext_buf;
+            std::transform(ext.begin(), ext.end(), ext.begin(),
+                           [](unsigned char c_) { return (char)std::tolower(c_); });
+            fe.ext = ext;
+            
+            uint64_t sz = 0;
+            jce_fs_host_get_size(path, &sz);
+            fe.size = sz;
+        } else {
+            fe.ext  = "";
+            fe.size = 0;
         }
-    } catch (...) {}
+        
+        c->results->push_back(std::move(fe));
+        return true;
+    };
+    
+    jce_fs_host_walk(s_assets.current_path.c_str(), cb, &ctx);
 
     std::sort(s_assets.search_results.begin(), s_assets.search_results.end(),
               [](const FileEntry &a, const FileEntry &b) {
@@ -311,9 +364,13 @@ void copy_path_to_clipboard(const std::string &path, bool cut)
     s_assets.clipboard_paths.push_back(path);
     s_assets.clipboard_cut = cut;
     s_assets.clipboard_flash_t = 0.6f;
+    
+    char basename[256];
+    jce_path_basename(basename, sizeof(basename), path.c_str());
+    
     jce_editor_console_log("%s '%s'",
         cut ? "Cut" : "Copied",
-        fs::path(path).filename().string().c_str());
+        basename);
 }
 
 void execute_clipboard_paste(void)
@@ -322,7 +379,7 @@ void execute_clipboard_paste(void)
     for (auto &cp : s_assets.clipboard_paths) {
         std::string fname;
         {
-            /* Extract basename from cp without std::filesystem. */
+            /* Extract basename from cp via plain string ops. */
             size_t s = cp.find_last_of("/\\");
             fname = (s == std::string::npos) ? cp : cp.substr(s + 1);
         }
@@ -394,7 +451,7 @@ void jce_editor_assets_set_project(const char *path)
 {
     ensure_assets_init();
     if (!path || !path[0]) return;
-    std::string normalized = normalized_path_string(fs::path(path));
+    std::string normalized = normalized_path_string(path);
     if (s_assets.project_root == normalized) return;
     s_assets.project_root  = normalized;
     navigate_asset_directory(normalized, true);
@@ -539,19 +596,14 @@ static void draw_asset_delete_dialog(void)
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.3f, 0.3f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.7f, 0.15f, 0.15f, 1.0f));
             if (ImGui::Button(jce_editor_i18n("assetBrowser.deleteConfirm"), ImVec2(btn_w, 0))) {
-                try {
-                    for (size_t di = 0; di < s_assets.pending_delete_paths.size(); di++) {
-                        fs::remove_all(s_assets.pending_delete_paths[di]);
-                        jce_editor_console_log("Deleted '%s'",
-                            s_assets.pending_delete_names[di].c_str());
-                    }
-                    s_assets.needs_refresh = true;
-                    s_assets.selected_set.clear();
-                    s_assets.last_clicked_idx = -1;
-                } catch (const std::exception &e) {
-                    jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-                        "Delete failed: %s", e.what());
+                for (size_t di = 0; di < s_assets.pending_delete_paths.size(); di++) {
+                    jce_fs_host_remove_recursive(s_assets.pending_delete_paths[di].c_str());
+                    jce_editor_console_log("Deleted '%s'",
+                        s_assets.pending_delete_names[di].c_str());
                 }
+                s_assets.needs_refresh = true;
+                s_assets.selected_set.clear();
+                s_assets.last_clicked_idx = -1;
                 ImGui::CloseCurrentPopup();
                 s_assets.show_delete_dialog_open = false;
             }

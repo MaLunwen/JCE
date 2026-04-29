@@ -26,6 +26,7 @@ JCE_EXTERN_C_BEGIN
 /* Forward declarations. */
 typedef struct JceScene      JceScene;
 typedef struct JceFileSystem JceFileSystem;
+typedef uint64_t             JceEntity;
 
 /* ================================================================== */
 /* Save                                                                */
@@ -60,6 +61,24 @@ JCE_API bool jce_scene_serial_load_file(JceScene *scene, const char *path);
 bool jce_scene_serial_load_vfs(JceScene *scene,
                                const JceFileSystem *fs,
                                const char *virtual_path);
+
+/* ================================================================== */
+/* Additive (streaming) load                                           */
+/* ================================================================== */
+
+/* Deserialize a scene chunk from a JSON string, appending entities to an
+   existing live scene WITHOUT clearing it first.  The caller receives
+   ownership of an array of JceEntity handles for all newly created
+   entities, which can be used to remove the chunk later.
+   Free the array with jce_scene_serial_free_entities().
+   Returns true on success. */
+JCE_API bool jce_scene_serial_load_additive(JceScene *scene,
+                                             const char *json, size_t len,
+                                             JceEntity **out_entities,
+                                             uint32_t   *out_count);
+
+/* Free an entity array returned by jce_scene_serial_load_additive(). */
+JCE_API void jce_scene_serial_free_entities(JceEntity *entities);
 
 /* ================================================================== */
 /* Memory                                                              */

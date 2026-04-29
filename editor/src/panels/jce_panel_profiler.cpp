@@ -18,14 +18,21 @@
 
 #include "ui/jce_editor_colors.h"
 #include "core/jce_editor_i18n.h"
+#include "core/jce_editor_toast.h"
+#include "scene/jce_editor_scene_render.h"
 #include "ui/jce_editor_panels.h"
 #include "ui/jce_theme_palette.h"
 
 #include <jce/renderer/jce_lowlevel.h>
-#include <jce/tools/jce_imgui.h>
+#include <jce/renderer/jce_scene_renderer.h>
+#include <jce/resource/jce_world_streamer.h>
+#include <jce/os/core/jce_allocator.h>
+#include <jce/tools/jce_imgui.hpp>
 #include <algorithm>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace {
@@ -284,6 +291,163 @@ void draw_view_table()
     }
 }
 
+/* ── Clipboard snapshot ─────────────────────────────────────────────────── */
+
+void append_fmt(std::string &out, const char *fmt, ...)
+{
+    char buf[256];
+    va_list ap; va_start(ap, fmt);
+    int n = std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n > 0) out.append(buf, std::min<size_t>((size_t)n, sizeof(buf) - 1));
+}
+
+std::string build_clipboard_snapshot(float dt_ms,
+                                     float mn,  float avg, float mx,
+                                     float cpu_avg, float gpu_avg, float w_avg)
+{
+    std::string s;
+    s.reserve(4096);
+
+    ImGuiIO &io = ImGui::GetIO();
+    float fps_avg = (avg > 0.0f) ? (1000.0f / avg) : 0.0f;
+
+    append_fmt(s, "── JCE Profiler snapshot ─────────────────────\n");
+    append_fmt(s, "Uptime           : %.1f s\n", s_prof.uptime_s);
+    append_fmt(s, "Backbuffer       : %u x %u\n",
+               (unsigned)s_prof.bb_w, (unsigned)s_prof.bb_h);
+    append_fmt(s, "Samples          : %d / %d\n", s_prof.filled, kHistoryLen);
+    s += "\n[Frame timing]\n";
+    append_fmt(s, "  Current        : %.2f ms (%.1f FPS)\n", dt_ms,
+               dt_ms > 0.0f ? 1000.0f / dt_ms : 0.0f);
+    append_fmt(s, "  Frame min/avg/max : %.2f / %.2f / %.2f ms (%.1f FPS avg)\n",
+               mn, avg, mx, fps_avg);
+    append_fmt(s, "  CPU avg        : %.2f ms\n", cpu_avg);
+    append_fmt(s, "  GPU avg        : %.2f ms\n", gpu_avg);
+    append_fmt(s, "  Wait avg       : %.2f ms\n", w_avg);
+    append_fmt(s, "  ImGui FPS      : %.1f\n", io.Framerate);
+
+    s += "\n[Renderer (bgfx)]\n";
+    append_fmt(s, "  Draw calls     : %u\n", s_prof.num_draw);
+    append_fmt(s, "  Compute        : %u\n", s_prof.num_compute);
+    append_fmt(s, "  Blits          : %u\n", s_prof.num_blit);
+    append_fmt(s, "  Textures       : %u\n", s_prof.num_textures);
+    append_fmt(s, "  Programs       : %u\n", s_prof.num_programs);
+    append_fmt(s, "  Shaders        : %u\n", s_prof.num_shaders);
+    append_fmt(s, "  Uniforms       : %u\n", s_prof.num_uniforms);
+    append_fmt(s, "  Frame buffers  : %u\n", s_prof.num_fbs);
+    append_fmt(s, "  Vertex bufs    : %u\n", s_prof.num_vbs);
+    append_fmt(s, "  Index bufs     : %u\n", s_prof.num_ibs);
+    char b[32];
+    format_bytes(b, sizeof(b), s_prof.tex_mem);  append_fmt(s, "  Texture mem    : %s\n", b);
+    format_bytes(b, sizeof(b), s_prof.rt_mem);   append_fmt(s, "  RT mem         : %s\n", b);
+    format_bytes(b, sizeof(b), s_prof.vram_used);append_fmt(s, "  VRAM used      : %s\n", b);
+    format_bytes(b, sizeof(b), s_prof.vram_max); append_fmt(s, "  VRAM max       : %s\n", b);
+
+    s += "\n[ImGui]\n";
+    append_fmt(s, "  Vertices       : %d\n", io.MetricsRenderVertices);
+    append_fmt(s, "  Indices        : %d\n", io.MetricsRenderIndices);
+    append_fmt(s, "  Draw lists     : %d\n", io.MetricsRenderWindows);
+    append_fmt(s, "  Active windows : %d\n", io.MetricsActiveWindows);
+
+    JceSceneRenderer *sr = jce_editor_get_scene_renderer();
+    if (sr) {
+        JceSceneCullStats cs = {0,0,0,false};
+        jce_scene_renderer_get_cull_stats(sr, &cs);
+        s += "\n[Scene culling (frustum)]\n";
+        append_fmt(s, "  Mode           : %s\n", cs.enabled ? "On" : "Off");
+        append_fmt(s, "  Total / vis / cull : %u / %u / %u\n",
+                   cs.total, cs.visible, cs.culled);
+        if (cs.total > 0) {
+            float p = 100.0f * (float)cs.culled / (float)cs.total;
+            append_fmt(s, "  Cull ratio     : %.1f%%\n", p);
+        }
+
+        JceSceneLodStats ls = {};
+        jce_scene_renderer_get_lod_stats(sr, &ls);
+        s += "\n[Scene LOD]\n";
+        append_fmt(s, "  Mode           : %s\n", ls.enabled ? "Global LOD group" : "Disabled");
+        if (ls.enabled) {
+            for (int i = 0; i < ls.level_count && i < JCE_SCENE_LOD_MAX_LEVELS; i++)
+                append_fmt(s, "  L%d picks       : %u\n", i, ls.picks[i]);
+            append_fmt(s, "  LOD culled     : %u\n", ls.culled);
+        }
+
+        JceSceneRqStats rqs = {};
+        jce_scene_renderer_get_rq_stats(sr, &rqs);
+        s += "\n[Render queue]\n";
+        append_fmt(s, "  Mode           : %s\n", rqs.enabled ? "On (default; JCE_USE_RQ=0 disables)" : "Off (JCE_USE_RQ=0)");
+        if (rqs.enabled) {
+            append_fmt(s, "  Commands in    : %u\n", rqs.commands_in);
+            append_fmt(s, "  bgfx submits   : %u\n", rqs.submits_out);
+            append_fmt(s, "  Instanced batch: %u\n", rqs.batches_merged);
+            append_fmt(s, "  Instances total: %u\n", rqs.instances_total);
+            if (rqs.commands_in > 0 && rqs.submits_out > 0) {
+                float r = (float)rqs.commands_in / (float)rqs.submits_out;
+                append_fmt(s, "  Merge ratio    : %.1fx\n", r);
+            }
+        }
+
+        JceSceneOcclusionStats ocs = {};
+        jce_scene_renderer_get_occlusion_stats(sr, &ocs);
+        s += "\n[Occlusion culling]\n";
+        append_fmt(s, "  Mode           : %s\n", ocs.enabled ? "On (GPU queries)" : "Off");
+        if (ocs.enabled) {
+            append_fmt(s, "  Tested         : %u\n", ocs.total);
+            append_fmt(s, "  Visible        : %u\n", ocs.visible);
+            append_fmt(s, "  Occluded       : %u\n", ocs.occluded);
+            append_fmt(s, "  Warm-up        : %u\n", ocs.warm_up);
+            if (ocs.total > 0) {
+                float p = 100.0f * (float)ocs.occluded / (float)ocs.total;
+                append_fmt(s, "  Cull rate      : %.1f%%\n", p);
+            }
+        }
+    }
+
+    JceWorldStreamer *ws = jce_editor_get_world_streamer();
+    s += "\n[World streaming]\n";
+    if (!ws) {
+        s += "  Status         : Inactive\n";
+    } else {
+        uint32_t loaded  = jce_world_streamer_loaded_count(ws);
+        uint32_t pending = jce_world_streamer_pending_count(ws);
+        uint32_t total   = jce_world_streamer_chunk_count(ws);
+        uint64_t mem     = jce_world_streamer_memory_used(ws);
+        uint32_t ents    = jce_world_streamer_entity_count(ws);
+        append_fmt(s, "  Chunks loaded  : %u / %u\n", loaded, total);
+        append_fmt(s, "  Pending loads  : %u\n", pending);
+        append_fmt(s, "  Memory         : %.2f MB\n",
+                   (double)mem / (1024.0 * 1024.0));
+        append_fmt(s, "  Entities       : %u\n", ents);
+    }
+
+    JceMemStats ms = {};
+    if (jce_mem_stats(&ms)) {
+        const double MB = 1024.0 * 1024.0;
+        s += "\n[Process memory]\n";
+        append_fmt(s, "  RSS curr/peak  : %.1f / %.1f MB\n",
+                   (double)ms.current_rss / MB, (double)ms.peak_rss / MB);
+        append_fmt(s, "  Commit c/p     : %.1f / %.1f MB\n",
+                   (double)ms.current_commit / MB, (double)ms.peak_commit / MB);
+        append_fmt(s, "  Page faults    : %zu\n", ms.page_faults);
+    }
+
+    s += "\n──────────────────────────────────────────────\n";
+    return s;
+}
+
+/* Reset the rolling history buffers without losing the singleton. */
+void reset_history(void)
+{
+    std::memset(s_prof.frame_ms, 0, sizeof(s_prof.frame_ms));
+    std::memset(s_prof.cpu_ms,   0, sizeof(s_prof.cpu_ms));
+    std::memset(s_prof.gpu_ms,   0, sizeof(s_prof.gpu_ms));
+    std::memset(s_prof.wait_ms,  0, sizeof(s_prof.wait_ms));
+    std::memset(s_prof.vram_mb,  0, sizeof(s_prof.vram_mb));
+    s_prof.head   = 0;
+    s_prof.filled = 0;
+}
+
 void draw_content(void)
 {
     ImGuiIO &io = ImGui::GetIO();
@@ -307,6 +471,51 @@ void draw_content(void)
     compute_stats(s_prof.vram_mb, v_mn,   v_mx,   v_avg);
 
     float plot_max = std::max(33.4f, mx * 1.2f);
+
+    /* ── Top toolbar: status chip + Copy / Reset ───────────────── */
+    {
+        float fps_now = (dt_ms > 0.0f) ? 1000.0f / dt_ms : 0.0f;
+        ImU32 chip_col;
+        if (fps_now >= 55.0f)      chip_col = IM_COL32( 80, 200, 120, 255);
+        else if (fps_now >= 30.0f) chip_col = IM_COL32(240, 180,  60, 255);
+        else                       chip_col = IM_COL32(230,  90,  90, 255);
+
+        ImGui::PushStyleColor(ImGuiCol_Text, chip_col);
+        ImGui::Text("\xe2\x97\x8f %.1f FPS", fps_now);   /* ● */
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::TextDisabled("|");
+        ImGui::SameLine();
+        ImGui::Text("%.2f ms (avg %.2f / max %.2f)", dt_ms, avg, mx);
+
+        ImGui::SameLine();
+        float region = ImGui::GetContentRegionAvail().x;
+        const char *copy_lbl  = jce_editor_i18n("profiler.action.copyAll");
+        const char *reset_lbl = jce_editor_i18n("profiler.action.resetHistory");
+        float copy_w  = ImGui::CalcTextSize(copy_lbl).x  + ImGui::GetStyle().FramePadding.x * 2;
+        float reset_w = ImGui::CalcTextSize(reset_lbl).x + ImGui::GetStyle().FramePadding.x * 2;
+        float gap = ImGui::GetStyle().ItemSpacing.x;
+        ImGui::Dummy(ImVec2(std::max(0.0f, region - copy_w - reset_w - gap * 2), 1));
+        ImGui::SameLine();
+        if (ImGui::Button(reset_lbl)) {
+            reset_history();
+            jce_toast_success("%s", jce_editor_i18n("profiler.toast.historyReset"));
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", jce_editor_i18n("profiler.tooltip.resetHistory"));
+        ImGui::SameLine();
+        if (ImGui::Button(copy_lbl)) {
+            std::string snap = build_clipboard_snapshot(
+                dt_ms, mn, avg, mx, cpu_avg, gpu_avg, w_avg);
+            ImGui::SetClipboardText(snap.c_str());
+            jce_toast_success("%s (%zu B)",
+                              jce_editor_i18n("profiler.toast.copied"),
+                              snap.size());
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", jce_editor_i18n("profiler.tooltip.copyAll"));
+        ImGui::Separator();
+    }
 
     /* ── Frame-time graph ──────────────────────────────────────── */
     char overlay[64];
@@ -446,6 +655,247 @@ void draw_content(void)
         row_i(jce_editor_i18n("profiler.row.drawLists"),      io.MetricsRenderWindows);
         row_i(jce_editor_i18n("profiler.row.activeWindows"),  io.MetricsActiveWindows);
         ImGui::EndTable();
+    }
+
+    /* ── Scene culling ─────────────────────────────────────────── */
+    {
+        JceSceneRenderer *sr = jce_editor_get_scene_renderer();
+        JceSceneCullStats cs = { 0, 0, 0, false };
+        if (sr) jce_scene_renderer_get_cull_stats(sr, &cs);
+
+        ImGui::Spacing();
+        ImGui::SeparatorText(jce_editor_i18n("profiler.section.sceneCulling"));
+        if (ImGui::BeginTable("prof_cull", 2,
+                              ImGuiTableFlags_SizingStretchProp |
+                              ImGuiTableFlags_RowBg)) {
+            auto row = [](const char *k, const char *v) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(k);
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(v);
+            };
+            char buf[64];
+
+            row(jce_editor_i18n("profiler.row.cullMode"),
+                cs.enabled ? jce_editor_i18n("profiler.value.cullModeOn")
+                           : jce_editor_i18n("profiler.value.cullModeOff"));
+            snprintf(buf, sizeof(buf), "%u", cs.total);
+            row(jce_editor_i18n("profiler.row.cullTotal"), buf);
+            snprintf(buf, sizeof(buf), "%u", cs.visible);
+            row(jce_editor_i18n("profiler.row.cullVisible"), buf);
+            snprintf(buf, sizeof(buf), "%u", cs.culled);
+            row(jce_editor_i18n("profiler.row.cullCulled"), buf);
+            const float pct = cs.total > 0
+                                ? 100.0f * (float)cs.culled / (float)cs.total
+                                : 0.0f;
+            snprintf(buf, sizeof(buf), "%.1f %%", pct);
+            row(jce_editor_i18n("profiler.row.cullRatio"), buf);
+            ImGui::EndTable();
+        }
+        if (cs.enabled && cs.total > 0) {
+            float frac = (float)cs.culled / (float)cs.total;
+            ImU32 c = (frac >= 0.5f) ? IM_COL32(80, 200, 120, 255)
+                                     : IM_COL32(160, 200, 240, 255);
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, c);
+            ImGui::ProgressBar(frac, ImVec2(-1, 6.0f), "");
+            ImGui::PopStyleColor();
+        }
+    }
+
+    /* ── Scene LOD ─────────────────────────────────────────────── */
+    {
+        JceSceneRenderer *sr = jce_editor_get_scene_renderer();
+        JceSceneLodStats ls = {};
+        if (sr) jce_scene_renderer_get_lod_stats(sr, &ls);
+
+        ImGui::Spacing();
+        ImGui::SeparatorText(jce_editor_i18n("profiler.section.sceneLod"));
+        if (ImGui::BeginTable("prof_lod", 2,
+                              ImGuiTableFlags_SizingStretchProp |
+                              ImGuiTableFlags_RowBg)) {
+            auto row = [](const char *k, const char *v) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(k);
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(v);
+            };
+            char buf[96];
+            row(jce_editor_i18n("profiler.row.lodMode"),
+                ls.enabled ? jce_editor_i18n("profiler.value.lodModeOn")
+                           : jce_editor_i18n("profiler.value.lodModeOff"));
+            if (ls.enabled) {
+                for (int i = 0; i < ls.level_count && i < JCE_SCENE_LOD_MAX_LEVELS; i++) {
+                    char key[32];
+                    snprintf(key, sizeof(key), "L%d", i);
+                    snprintf(buf, sizeof(buf), "%u", ls.picks[i]);
+                    row(key, buf);
+                }
+                snprintf(buf, sizeof(buf), "%u", ls.culled);
+                row(jce_editor_i18n("profiler.row.lodCulled"), buf);
+            }
+            ImGui::EndTable();
+        }
+    }
+
+    /* ── Render queue (GPU instancing) ─────────────────────────── */
+    {
+        JceSceneRenderer *sr = jce_editor_get_scene_renderer();
+        JceSceneRqStats rqs = {};
+        if (sr) jce_scene_renderer_get_rq_stats(sr, &rqs);
+
+        ImGui::Spacing();
+        ImGui::SeparatorText(jce_editor_i18n("profiler.section.renderQueue"));
+        if (ImGui::BeginTable("prof_rq", 2,
+                              ImGuiTableFlags_SizingStretchProp |
+                              ImGuiTableFlags_RowBg)) {
+            auto row = [](const char *k, const char *v) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(k);
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(v);
+            };
+            char buf[96];
+            row(jce_editor_i18n("profiler.row.rqMode"),
+                rqs.enabled ? jce_editor_i18n("profiler.value.rqOn")
+                            : jce_editor_i18n("profiler.value.rqOff"));
+            if (rqs.enabled) {
+                snprintf(buf, sizeof(buf), "%u", rqs.commands_in);
+                row(jce_editor_i18n("profiler.row.rqCommandsIn"), buf);
+                snprintf(buf, sizeof(buf), "%u", rqs.submits_out);
+                row(jce_editor_i18n("profiler.row.rqSubmits"), buf);
+                snprintf(buf, sizeof(buf), "%u", rqs.batches_merged);
+                row(jce_editor_i18n("profiler.row.rqInstancedBatches"), buf);
+                snprintf(buf, sizeof(buf), "%u", rqs.instances_total);
+                row(jce_editor_i18n("profiler.row.rqInstancesTotal"), buf);
+                if (rqs.commands_in > 0 && rqs.submits_out > 0) {
+                    float ratio = (float)rqs.commands_in / (float)rqs.submits_out;
+                    snprintf(buf, sizeof(buf), "%.1fx", ratio);
+                    row(jce_editor_i18n("profiler.row.rqMergeRatio"), buf);
+                }
+            }
+            ImGui::EndTable();
+        }
+    }
+
+    /* ── World streaming ───────────────────────────────────────── */
+    {
+        JceWorldStreamer *ws = jce_editor_get_world_streamer();
+
+        ImGui::Spacing();
+        ImGui::SeparatorText(jce_editor_i18n("profiler.section.worldStreaming"));
+        if (ImGui::BeginTable("prof_ws", 2,
+                              ImGuiTableFlags_SizingStretchProp |
+                              ImGuiTableFlags_RowBg)) {
+            auto row = [](const char *k, const char *v) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(k);
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(v);
+            };
+            char buf[96];
+            if (!ws) {
+                row(jce_editor_i18n("profiler.row.wsStatus"),
+                    jce_editor_i18n("profiler.value.wsInactive"));
+            } else {
+                uint32_t loaded  = jce_world_streamer_loaded_count(ws);
+                uint32_t pending = jce_world_streamer_pending_count(ws);
+                uint32_t total   = jce_world_streamer_chunk_count(ws);
+                uint64_t mem     = jce_world_streamer_memory_used(ws);
+                uint32_t ents    = jce_world_streamer_entity_count(ws);
+
+                snprintf(buf, sizeof(buf), "%u / %u", loaded, total);
+                row(jce_editor_i18n("profiler.row.wsChunksLoaded"), buf);
+                snprintf(buf, sizeof(buf), "%u", pending);
+                row(jce_editor_i18n("profiler.row.wsPending"), buf);
+                snprintf(buf, sizeof(buf), "%.2f MB",
+                         (double)mem / (1024.0 * 1024.0));
+                row(jce_editor_i18n("profiler.row.wsMemory"), buf);
+                snprintf(buf, sizeof(buf), "%u", ents);
+                row(jce_editor_i18n("profiler.row.wsEntities"), buf);
+            }
+            ImGui::EndTable();
+        }
+    }
+
+    /* ── Occlusion culling ─────────────────────────────────────── */
+    {
+        JceSceneRenderer *sr = jce_editor_get_scene_renderer();
+        JceSceneOcclusionStats ocs = {};
+        if (sr) jce_scene_renderer_get_occlusion_stats(sr, &ocs);
+
+        ImGui::Spacing();
+        ImGui::SeparatorText(jce_editor_i18n("profiler.section.occlusion"));
+        if (ImGui::BeginTable("prof_oc", 2,
+                              ImGuiTableFlags_SizingStretchProp |
+                              ImGuiTableFlags_RowBg)) {
+            auto row = [](const char *k, const char *v) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(k);
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(v);
+            };
+            char buf[96];
+            row(jce_editor_i18n("profiler.row.ocMode"),
+                ocs.enabled ? jce_editor_i18n("profiler.value.ocOn")
+                            : jce_editor_i18n("profiler.value.ocOff"));
+            if (ocs.enabled) {
+                snprintf(buf, sizeof(buf), "%u", ocs.total);
+                row(jce_editor_i18n("profiler.row.ocTested"), buf);
+                snprintf(buf, sizeof(buf), "%u", ocs.visible);
+                row(jce_editor_i18n("profiler.row.ocVisible"), buf);
+                snprintf(buf, sizeof(buf), "%u", ocs.occluded);
+                row(jce_editor_i18n("profiler.row.ocOccluded"), buf);
+                snprintf(buf, sizeof(buf), "%u", ocs.warm_up);
+                row(jce_editor_i18n("profiler.row.ocWarmup"), buf);
+                if (ocs.total > 0) {
+                    float pct = 100.0f * (float)ocs.occluded / (float)ocs.total;
+                    snprintf(buf, sizeof(buf), "%.1f%%", (double)pct);
+                    row(jce_editor_i18n("profiler.row.ocCullRate"), buf);
+                }
+            }
+            ImGui::EndTable();
+        }
+        if (ocs.enabled && ocs.total > 0) {
+            float frac = (float)ocs.occluded / (float)ocs.total;
+            ImU32 c = (frac >= 0.3f) ? IM_COL32(80, 200, 120, 255)
+                                     : IM_COL32(160, 200, 240, 255);
+            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, c);
+            ImGui::ProgressBar(frac, ImVec2(-1, 6.0f), "");
+            ImGui::PopStyleColor();
+        }
+    }
+
+    /* ── Process memory (mimalloc) ─────────────────────────────── */
+    {
+        JceMemStats ms = {};
+        if (jce_mem_stats(&ms)) {
+            ImGui::Spacing();
+            ImGui::SeparatorText(jce_editor_i18n("profiler.section.processMemory"));
+            if (ImGui::BeginTable("prof_mem", 2,
+                                  ImGuiTableFlags_SizingStretchProp |
+                                  ImGuiTableFlags_RowBg)) {
+                auto row = [](const char *k, const char *v) {
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn(); ImGui::TextUnformatted(k);
+                    ImGui::TableNextColumn(); ImGui::TextUnformatted(v);
+                };
+                char buf[96];
+                const double MB = 1024.0 * 1024.0;
+                snprintf(buf, sizeof(buf), "%.1f MB", (double)ms.current_rss / MB);
+                row(jce_editor_i18n("profiler.row.memRssCurrent"), buf);
+                snprintf(buf, sizeof(buf), "%.1f MB", (double)ms.peak_rss / MB);
+                row(jce_editor_i18n("profiler.row.memRssPeak"), buf);
+                snprintf(buf, sizeof(buf), "%.1f MB", (double)ms.current_commit / MB);
+                row(jce_editor_i18n("profiler.row.memCommitCurrent"), buf);
+                snprintf(buf, sizeof(buf), "%.1f MB", (double)ms.peak_commit / MB);
+                row(jce_editor_i18n("profiler.row.memCommitPeak"), buf);
+                snprintf(buf, sizeof(buf), "%zu", ms.page_faults);
+                row(jce_editor_i18n("profiler.row.memPageFaults"), buf);
+                ImGui::EndTable();
+            }
+            if (ms.peak_rss > 0) {
+                float frac = (float)((double)ms.current_rss / (double)ms.peak_rss);
+                ImU32 c = IM_COL32(206, 147, 216, 255);
+                ImGui::PushStyleColor(ImGuiCol_PlotHistogram, c);
+                ImGui::ProgressBar(frac, ImVec2(-1, 6.0f), "");
+                ImGui::PopStyleColor();
+            }
+        }
     }
 
     /* ── View hot-list ─────────────────────────────────────────── */

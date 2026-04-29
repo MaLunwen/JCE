@@ -7,7 +7,7 @@
 
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
-#include <jce/os/core/jce_pak_loader.h>
+#include <jce/resource/jce_pak_loader.h>
 #include <jce/renderer/jce_texture.h>
 #include <jce/resource/jce_asset_format.h>
 
@@ -227,11 +227,14 @@ static JceTexture jce_texture_load_ex_inner(const JcePakArchive *pak,
             return JCE_TEXTURE_INVALID;
         }
 
+        /* IMPORTANT: cache the size before freeing buf — pixel_chunk
+         * points into buf, so reading it after free is UB. */
+        size_t pixel_bytes = (size_t)pixel_chunk->original_size;
         JCE_FREE(buf); /* PAK buffer no longer needed */
 
         /* Upload to bgfx as RGBA8. */
-        const bgfx_memory_t *mem = bgfx_alloc((uint32_t)pixel_chunk->original_size);
-        memcpy(mem->data, tex_data, pixel_chunk->original_size);
+        const bgfx_memory_t *mem = bgfx_alloc((uint32_t)pixel_bytes);
+        memcpy(mem->data, tex_data, pixel_bytes);
         JCE_FREE(tex_data);
 
         bool has_mips = tex_info.mip_count > 1;

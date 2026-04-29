@@ -8,6 +8,7 @@
 
 #include <jce/middleware/ui/jce_ui.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_profiler.h>
 
 #include "jce_ui_backend.h"
 
@@ -246,25 +247,33 @@ void jce_ui_elem_on(JceUIContext *ctx, JceUIElementHandle elem,
 void jce_ui_process_input(JceUIContext *ctx, const JceInput *input)
 {
     if (!ctx) return;
+    JCE_PROFILE_ZONE_N("UI::ProcessInput");
     jce_rml_process_input(ctx->backend, input);
+    JCE_PROFILE_ZONE_END;
 }
 
 void jce_ui_process_pointer_input(JceUIContext *ctx, const JceInput *input)
 {
     if (!ctx) return;
+    JCE_PROFILE_ZONE_N("UI::ProcessPointer");
     jce_rml_process_pointer_input(ctx->backend, input);
+    JCE_PROFILE_ZONE_END;
 }
 
 void jce_ui_update(JceUIContext *ctx, float dt)
 {
     if (!ctx) return;
+    JCE_PROFILE_ZONE_N("UI::Update");
     jce_rml_update(ctx->backend, dt);
+    JCE_PROFILE_ZONE_END;
 }
 
 void jce_ui_render(JceUIContext *ctx)
 {
     if (!ctx) return;
+    JCE_PROFILE_ZONE_N("UI::Render");
     jce_rml_render(ctx->backend);
+    JCE_PROFILE_ZONE_END;
 }
 
 void jce_ui_resize(JceUIContext *ctx, uint32_t width, uint32_t height)

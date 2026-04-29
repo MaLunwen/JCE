@@ -338,5 +338,15 @@ void jce_scene_update(JceScene *s, float dt)
     JCE_PROFILE_ZONE_N("Scene::Update");
     if (!s) { JCE_PROFILE_ZONE_END; return; }
     ecs_progress(s->world, dt);
+
+#if defined(JCE_PROFILER_ENABLED)
+    {
+        const ecs_world_info_t *info = ecs_get_world_info(s->world);
+        if (info) {
+            JCE_PROFILE_PLOT_I("scene.entities", (int64_t)info->entity_count);
+        }
+    }
+#endif
+
     JCE_PROFILE_ZONE_END;
 }

@@ -11,7 +11,7 @@
 #include "ui/jce_editor_panels.h"
 #include "scene/jce_editor_scene_render.h"
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 #include <cstdio>
 
 extern "C" {

@@ -3,11 +3,15 @@
  */
 
 #include <jce/os/platform/jce_input.h>
+#include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_profiler.h>
 
 #include "os/core/jce_memory.h"
 
 #include <SDL3/SDL.h>
 #include <string.h>
+
+#define LOG_TAG "jce_input"
 
 /* Compile-time verification that JCE key/gamepad constants match SDL (C99-safe). */
 #define JCE_SASSERT(cond, tag)  typedef char jce_sa_##tag[(cond) ? 1 : -1]
@@ -63,6 +67,7 @@ struct JceInput {
 JceInput *jce_input_create(void)
 {
     JceInput *input = (JceInput *)JCE_CALLOC(1, sizeof(*input));
+    LOG_INFO(LOG_TAG, "input system initialized");
     return input;
 }
 
@@ -74,11 +79,13 @@ void jce_input_destroy(JceInput *input)
             SDL_CloseGamepad(input->gamepads[i].sdl_pad);
     }
     JCE_FREE(input);
+    LOG_INFO(LOG_TAG, "input system destroyed");
 }
 
 void jce_input_update(JceInput *input)
 {
     if (!input) return;
+    JCE_PROFILE_ZONE_N("Input::Update");
 
     memcpy(input->keys_prev, input->keys_cur, sizeof(input->keys_cur));
     input->mouse_prev = input->mouse_cur;
@@ -88,6 +95,7 @@ void jce_input_update(JceInput *input)
 
     for (int i = 0; i < input->gamepad_count; i++)
         input->gamepads[i].buttons_prev = input->gamepads[i].buttons_cur;
+    JCE_PROFILE_ZONE_END;
 }
 
 /* -- internal: gamepad slot management ------------------------------ */
@@ -345,4 +353,68 @@ float jce_input_gamepad_axis(const JceInput *input, int pad,
     if (!input || pad < 0 || pad >= input->gamepad_count) return 0.0f;
     if (axis < 0 || axis >= SDL_GAMEPAD_AXIS_COUNT) return 0.0f;
     return input->gamepads[pad].axes[axis];
+}
+
+
+/* -- Frame capture / apply (record / replay) ------------------------ */
+
+void jce_input_capture(const JceInput *input, JceInputFrame *out)
+{
+    if (!input || !out) return;
+    memset(out, 0, sizeof(*out));
+    out->version   = JCE_INPUT_FRAME_VERSION;
+    out->key_count = (uint32_t)JCE_KEY_COUNT;
+
+    /* Pack key bits. */
+    for (int i = 0; i < (int)SDL_SCANCODE_COUNT && i < 64 * 64; ++i) {
+        if (input->keys_cur[i])
+            out->keys_bits[i >> 6] |= (uint64_t)1 << (i & 63);
+    }
+
+    out->mouse_x       = input->mouse_x;
+    out->mouse_y       = input->mouse_y;
+    out->mouse_dx      = input->mouse_dx;
+    out->mouse_dy      = input->mouse_dy;
+    out->mouse_wheel   = input->wheel;
+    out->mouse_buttons = input->mouse_cur;
+
+    out->gamepad_count = (uint32_t)input->gamepad_count;
+    for (int i = 0; i < input->gamepad_count && i < JCE_MAX_GAMEPADS; ++i) {
+        out->gamepads[i].buttons = input->gamepads[i].buttons_cur;
+        for (int a = 0; a < SDL_GAMEPAD_AXIS_COUNT && a < 8; ++a)
+            out->gamepads[i].axes[a] = input->gamepads[i].axes[a];
+    }
+}
+
+bool jce_input_apply(JceInput *input, const JceInputFrame *frame)
+{
+    if (!input || !frame) return false;
+    if (frame->version != JCE_INPUT_FRAME_VERSION) return false;
+
+    /* Restore key bits. */
+    memset(input->keys_cur, 0, sizeof(input->keys_cur));
+    for (int i = 0; i < (int)SDL_SCANCODE_COUNT && i < 64 * 64; ++i) {
+        if (frame->keys_bits[i >> 6] & ((uint64_t)1 << (i & 63)))
+            input->keys_cur[i] = true;
+    }
+
+    input->mouse_x    = frame->mouse_x;
+    input->mouse_y    = frame->mouse_y;
+    input->mouse_dx   = frame->mouse_dx;
+    input->mouse_dy   = frame->mouse_dy;
+    input->wheel      = frame->mouse_wheel;
+    input->mouse_cur  = frame->mouse_buttons;
+
+    /* NOTE: we do not re-open SDL_Gamepad handles during replay; we just
+     * inject the cached state.  Replays of gamepad-driven sessions still
+     * see the original button/axis values per frame. */
+    for (uint32_t i = 0; i < frame->gamepad_count && i < JCE_MAX_GAMEPADS; ++i) {
+        input->gamepads[i].buttons_cur = frame->gamepads[i].buttons;
+        for (int a = 0; a < SDL_GAMEPAD_AXIS_COUNT && a < 8; ++a)
+            input->gamepads[i].axes[a] = frame->gamepads[i].axes[a];
+    }
+    if ((int)frame->gamepad_count > input->gamepad_count)
+        input->gamepad_count = (int)frame->gamepad_count;
+
+    return true;
 }

@@ -5,6 +5,7 @@
 #include "jce_animation.h"
 
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_profiler.h>
 
 #include "jce_anim_ozz.h"
 #include "os/core/jce_memory.h"
@@ -28,7 +29,8 @@ struct JceAnimPlayer {
     bool                loop;
     bool                playing;
     bool                paused;
-    jce_mat4           *local_transforms;  /* working buffer */
+    jce_mat4           *local_transforms;  /* working buffer (clip A)         */
+    jce_mat4           *blend_buffer;      /* secondary buffer for clip B     */
     uint32_t            num_joints;
     JceOzzContext      *ozz_ctx;           /* ozz sampling context */
 };
@@ -176,6 +178,7 @@ void jce_anim_clip_sample(const JceAnimClip *clip, float time,
                             const jce_vec3 *rest_s)
 {
     if (!clip || !out_locals) return;
+    JCE_PROFILE_ZONE_N("Anim::ClipSample");
 
     /* Use rest-pose TRS when available to avoid decomposition roundtrip. */
     bool have_rest_trs = rest_t && rest_r && rest_s;
@@ -247,6 +250,7 @@ void jce_anim_clip_sample(const JceAnimClip *clip, float time,
     }
 
     #undef MAX_SKEL_JOINTS
+    JCE_PROFILE_ZONE_END;
 }
 
 /* ================================================================== */
@@ -287,6 +291,7 @@ void jce_anim_player_destroy(JceAnimPlayer *player)
     if (!player) return;
     jce_ozz_context_destroy(player->ozz_ctx);
     JCE_FREE(player->local_transforms);
+    JCE_FREE(player->blend_buffer);
     JCE_FREE(player);
 }
 
@@ -346,6 +351,8 @@ uint32_t jce_anim_player_update(JceAnimPlayer *p, float dt,
     if (!p || !p->playing || !p->clip)
         return 0;
 
+    JCE_PROFILE_ZONE_N("Anim::PlayerUpdate");
+
     if (!p->paused) {
         /* Advance time. */
         p->time += dt * p->speed;
@@ -389,5 +396,101 @@ uint32_t jce_anim_player_update(JceAnimPlayer *p, float dt,
         jce_skeleton_evaluate(p->skeleton, p->local_transforms,
                               out_joint_matrices, count);
 
+    JCE_PROFILE_ZONE_END;
+    return count;
+}
+
+/* ================================================================== */
+/* Multi-clip blend (stateless)                                        */
+/* ================================================================== */
+
+uint32_t jce_anim_player_blend(JceAnimPlayer    *p,
+                                const JceAnimClip *clip_a,
+                                float              time_a,
+                                float              weight_a,
+                                const JceAnimClip *clip_b,
+                                float              time_b,
+                                float              weight_b,
+                                jce_mat4         *out_joint_matrices,
+                                uint32_t           max_joints)
+{
+    if (!p || !p->skeleton) return 0;
+
+    JCE_PROFILE_ZONE_N("Anim::PlayerBlend");
+
+    /* Lazily allocate the second working buffer on first use. */
+    if (!p->blend_buffer) {
+        p->blend_buffer = (jce_mat4 *)JCE_MALLOC(p->num_joints * sizeof(jce_mat4));
+        if (!p->blend_buffer) { JCE_PROFILE_ZONE_END; return 0; }
+    }
+
+    /* Normalise weights: ignore branches whose clip is NULL.  When both
+     * clips are NULL we fall through to a rest-pose evaluation. */
+    if (!clip_a) weight_a = 0.0f;
+    if (!clip_b) weight_b = 0.0f;
+    float sum = weight_a + weight_b;
+    if (sum <= 1e-6f) {
+        clip_a = NULL;
+        clip_b = NULL;
+        weight_a = 0.0f;
+        weight_b = 0.0f;
+    } else {
+        weight_a /= sum;
+        weight_b /= sum;
+    }
+
+    /* Reset both buffers to rest pose. */
+    const jce_mat4 *rest = jce_skeleton_rest_pose(p->skeleton);
+    if (rest) {
+        memcpy(p->local_transforms, rest, p->num_joints * sizeof(jce_mat4));
+        memcpy(p->blend_buffer,     rest, p->num_joints * sizeof(jce_mat4));
+    }
+
+    const jce_vec3 *rt = NULL;
+    const jce_quat *rr = NULL;
+    const jce_vec3 *rs = NULL;
+    jce_skeleton_rest_trs(p->skeleton, &rt, &rr, &rs);
+
+    /* Sample each clip into its own buffer. */
+    if (clip_a)
+        jce_anim_clip_sample(clip_a, time_a, p->local_transforms,
+                              p->num_joints, rt, rr, rs);
+    if (clip_b)
+        jce_anim_clip_sample(clip_b, time_b, p->blend_buffer,
+                              p->num_joints, rt, rr, rs);
+
+    /* Per-joint TRS blend.  Skipped when only one source is active —
+     * local_transforms already holds the active sample. */
+    if (clip_a && clip_b && weight_b > 0.0f) {
+        for (uint32_t j = 0; j < p->num_joints; ++j) {
+            jce_mat4 *ma = &p->local_transforms[j];
+            jce_mat4 *mb = &p->blend_buffer[j];
+
+            jce_vec3 ta = jce_v3(ma->raw[3][0], ma->raw[3][1], ma->raw[3][2]);
+            jce_vec3 tb = jce_v3(mb->raw[3][0], mb->raw[3][1], mb->raw[3][2]);
+            jce_quat ra = jce_m4_to_quat(ma);
+            jce_quat rb = jce_m4_to_quat(mb);
+            jce_vec3 sa = jce_m4_extract_scale(ma);
+            jce_vec3 sb = jce_m4_extract_scale(mb);
+
+            jce_vec3 t = jce_v3_lerp(ta, tb, weight_b);
+            jce_quat r = jce_q_slerp(ra, rb, weight_b);
+            jce_vec3 s = jce_v3_lerp(sa, sb, weight_b);
+
+            *ma = jce_m4_from_trs(t, r, s);
+        }
+    } else if (clip_b && !clip_a) {
+        /* Only B contributed — promote it to the working buffer. */
+        memcpy(p->local_transforms, p->blend_buffer,
+               p->num_joints * sizeof(jce_mat4));
+    }
+
+    /* Evaluate skeleton to produce skinning matrices. */
+    uint32_t count = p->num_joints < max_joints ? p->num_joints : max_joints;
+    if (out_joint_matrices)
+        jce_skeleton_evaluate(p->skeleton, p->local_transforms,
+                              out_joint_matrices, count);
+
+    JCE_PROFILE_ZONE_END;
     return count;
 }

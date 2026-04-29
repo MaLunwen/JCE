@@ -11,6 +11,8 @@ The HTML report is fully self-contained (no external deps) and provides:
   * Sortable table of all assets (path / size / compressed / ratio)
   * Aggregation by file extension and top-level folder
   * Top 20 largest assets bar chart (pure CSS, no JS libs)
+  * SVG donut by extension, log-log scatter (raw vs compressed),
+    and squarified treemap (folder × extension) — pure SVG, no libs.
 """
 from __future__ import annotations
 
@@ -160,6 +162,22 @@ tr:hover td {{ background: #1d232b; }}
 .search {{ background: #1f2530; border: 1px solid #2a3240; color: var(--fg);
            padding: 6px 12px; border-radius: 4px; font-size: 13px; width: 280px;
            margin-bottom: 8px; }}
+.viz-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
+             margin: 16px 0; }}
+@media (max-width: 900px) {{ .viz-grid {{ grid-template-columns: 1fr; }} }}
+.viz {{ background: var(--card); border: 1px solid #232931; border-radius: 8px;
+        padding: 12px; }}
+.viz h3 {{ margin: 0 0 8px; font-size: 13px; color: var(--muted);
+           text-transform: uppercase; letter-spacing: 0.04em; font-weight: 500; }}
+.viz svg {{ display: block; width: 100%; height: auto; }}
+.legend {{ display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 8px;
+           font-size: 11px; color: var(--muted); }}
+.legend .sw {{ display: inline-block; width: 10px; height: 10px;
+               border-radius: 2px; margin-right: 4px; vertical-align: middle; }}
+.tm-cell text {{ font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+                 fill: #0f1216; pointer-events: none; }}
+.tm-cell rect {{ stroke: #0f1216; stroke-width: 1; }}
+.tm-cell:hover rect {{ stroke: #fff; stroke-width: 2; }}
 footer {{ color: var(--muted); margin-top: 32px; font-size: 11px;
           text-align: center; }}
 </style>
@@ -191,6 +209,22 @@ footer {{ color: var(--muted); margin-top: 32px; font-size: 11px;
 <h2>Top 20 largest assets (raw size)</h2>
 <div class="top-list">
 {top_bars}
+</div>
+
+<h2>Visualisations</h2>
+<div class="viz-grid">
+  <div class="viz">
+    <h3>Raw size by extension (top 12)</h3>
+    {pie_svg}
+  </div>
+  <div class="viz">
+    <h3>Compression scatter — raw vs compressed (log/log)</h3>
+    {scatter_svg}
+  </div>
+</div>
+<div class="viz">
+  <h3>Treemap — top-level folders × extensions (raw size)</h3>
+  {treemap_svg}
 </div>
 
 <h2>By extension</h2>
@@ -324,6 +358,323 @@ def render_rows(paths: List[str], sizes: List[int], comp: List[int],
     return "\n".join(rows)
 
 
+# ──────────────────────────────────────────────────────────────────────
+# SVG visualisations (pure SVG, no external libs)
+# ──────────────────────────────────────────────────────────────────────
+
+
+_PALETTE = [
+    "#4fc3f7", "#66bb6a", "#ffa726", "#ce93d8", "#f06292", "#9575cd",
+    "#4dd0e1", "#aed581", "#ff8a65", "#ba68c8", "#7986cb", "#dce775",
+    "#a1887f", "#90a4ae", "#fff176", "#4db6ac",
+]
+
+
+def _color(i: int) -> str:
+    return _PALETTE[i % len(_PALETTE)]
+
+
+def render_pie_svg(rows: List[Tuple[str, int, int, int]],
+                   max_slices: int = 12,
+                   size: int = 320) -> str:
+    """Donut chart by extension. rows = [(key, n, raw, comp), ...]."""
+    if not rows:
+        return "<p>(no data)</p>"
+    sorted_rows = sorted(rows, key=lambda r: r[2], reverse=True)
+    head = sorted_rows[:max_slices]
+    tail = sorted_rows[max_slices:]
+    if tail:
+        head.append(("other", sum(r[1] for r in tail),
+                     sum(r[2] for r in tail), sum(r[3] for r in tail)))
+
+    total = sum(r[2] for r in head) or 1
+    cx = cy = size / 2
+    r_outer = size * 0.45
+    r_inner = size * 0.27
+
+    import math
+    paths = []
+    legend = []
+    angle = -math.pi / 2  # start at 12 o'clock
+    for i, (key, _, raw, _) in enumerate(head):
+        frac = raw / total
+        if frac <= 0:
+            continue
+        a2 = angle + frac * 2 * math.pi
+        large = 1 if frac > 0.5 else 0
+        x1 = cx + r_outer * math.cos(angle)
+        y1 = cy + r_outer * math.sin(angle)
+        x2 = cx + r_outer * math.cos(a2)
+        y2 = cy + r_outer * math.sin(a2)
+        x3 = cx + r_inner * math.cos(a2)
+        y3 = cy + r_inner * math.sin(a2)
+        x4 = cx + r_inner * math.cos(angle)
+        y4 = cy + r_inner * math.sin(angle)
+        d = (f"M {x1:.2f} {y1:.2f} "
+             f"A {r_outer:.2f} {r_outer:.2f} 0 {large} 1 {x2:.2f} {y2:.2f} "
+             f"L {x3:.2f} {y3:.2f} "
+             f"A {r_inner:.2f} {r_inner:.2f} 0 {large} 0 {x4:.2f} {y4:.2f} Z")
+        title = f"{key}: {fmt_bytes(raw)} ({frac * 100:.1f}%)"
+        paths.append(
+            f'<path d="{d}" fill="{_color(i)}" stroke="#0f1216" stroke-width="1">'
+            f'<title>{html.escape(title)}</title></path>'
+        )
+        legend.append(
+            f'<span><span class="sw" style="background:{_color(i)}"></span>'
+            f'{html.escape(key)} &middot; {fmt_bytes(raw)} ({frac * 100:.1f}%)</span>'
+        )
+        angle = a2
+
+    centre_label = fmt_bytes(total)
+    svg = (
+        f'<svg viewBox="0 0 {size} {size}" preserveAspectRatio="xMidYMid meet">'
+        f'{"".join(paths)}'
+        f'<text x="{cx}" y="{cy - 4}" text-anchor="middle" '
+        f'fill="#e6e8eb" font-size="13" font-weight="600">{html.escape(centre_label)}</text>'
+        f'<text x="{cx}" y="{cy + 12}" text-anchor="middle" '
+        f'fill="#8b95a5" font-size="10">total raw</text>'
+        f'</svg>'
+        f'<div class="legend">{"".join(legend)}</div>'
+    )
+    return svg
+
+
+def render_scatter_svg(sizes: List[int], comp: List[int], flags: List[int],
+                       width: int = 480, height: int = 320) -> str:
+    """Log-log scatter of raw vs compressed size."""
+    points = [(s, c, f) for s, c, f in zip(sizes, comp, flags) if s > 0 and c > 0]
+    if not points:
+        return "<p>(no data)</p>"
+
+    import math
+    pad_l, pad_b, pad_t, pad_r = 44, 36, 12, 12
+    plot_w = width - pad_l - pad_r
+    plot_h = height - pad_t - pad_b
+
+    log_xs = [math.log10(s) for s, _, _ in points]
+    log_ys = [math.log10(c) for _, c, _ in points]
+    lo = min(min(log_xs), min(log_ys))
+    hi = max(max(log_xs), max(log_ys))
+    if hi - lo < 0.5:
+        hi = lo + 0.5
+
+    def sx(v: float) -> float:
+        return pad_l + (v - lo) / (hi - lo) * plot_w
+
+    def sy(v: float) -> float:
+        return pad_t + plot_h - (v - lo) / (hi - lo) * plot_h
+
+    # Grid + axis labels at decade boundaries
+    grid = []
+    lo_dec = int(math.floor(lo))
+    hi_dec = int(math.ceil(hi))
+    decade_labels = {0: "1B", 1: "10B", 2: "100B", 3: "1KB", 4: "10KB",
+                     5: "100KB", 6: "1MB", 7: "10MB", 8: "100MB", 9: "1GB"}
+    for d in range(lo_dec, hi_dec + 1):
+        x = sx(d)
+        y = sy(d)
+        grid.append(
+            f'<line x1="{x:.1f}" y1="{pad_t}" x2="{x:.1f}" y2="{pad_t + plot_h}" '
+            f'stroke="#232931" stroke-width="1"/>'
+        )
+        grid.append(
+            f'<line x1="{pad_l}" y1="{y:.1f}" x2="{pad_l + plot_w}" y2="{y:.1f}" '
+            f'stroke="#232931" stroke-width="1"/>'
+        )
+        lbl = decade_labels.get(d, f"1e{d}")
+        grid.append(
+            f'<text x="{x:.1f}" y="{pad_t + plot_h + 14}" text-anchor="middle" '
+            f'fill="#8b95a5" font-size="10">{lbl}</text>'
+        )
+        grid.append(
+            f'<text x="{pad_l - 6}" y="{y + 3:.1f}" text-anchor="end" '
+            f'fill="#8b95a5" font-size="10">{lbl}</text>'
+        )
+
+    # y = x reference line (no compression baseline)
+    diag = (f'<line x1="{sx(lo):.1f}" y1="{sy(lo):.1f}" '
+            f'x2="{sx(hi):.1f}" y2="{sy(hi):.1f}" '
+            f'stroke="#8b95a5" stroke-width="1" stroke-dasharray="3,3"/>')
+
+    dots = []
+    for s, c, fl in points:
+        x = sx(math.log10(s))
+        y = sy(math.log10(c))
+        stored = bool(fl & 1)
+        color = "#ce93d8" if stored else ("#66bb6a" if c < s * 0.5 else "#4fc3f7")
+        dots.append(
+            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="2" fill="{color}" '
+            f'fill-opacity="0.6"/>'
+        )
+
+    axis_labels = (
+        f'<text x="{pad_l + plot_w / 2:.1f}" y="{height - 4}" text-anchor="middle" '
+        f'fill="#8b95a5" font-size="11">raw size</text>'
+        f'<text x="14" y="{pad_t + plot_h / 2:.1f}" text-anchor="middle" '
+        f'fill="#8b95a5" font-size="11" '
+        f'transform="rotate(-90 14 {pad_t + plot_h / 2:.1f})">compressed size</text>'
+    )
+
+    legend = (
+        '<div class="legend">'
+        '<span><span class="sw" style="background:#66bb6a"></span>good (≥2×)</span>'
+        '<span><span class="sw" style="background:#4fc3f7"></span>compressed</span>'
+        '<span><span class="sw" style="background:#ce93d8"></span>STORED</span>'
+        '<span style="color:#8b95a5">— dashed: y = x (no compression)</span>'
+        '</div>'
+    )
+
+    svg = (
+        f'<svg viewBox="0 0 {width} {height}" preserveAspectRatio="xMidYMid meet">'
+        f'{"".join(grid)}{diag}{"".join(dots)}{axis_labels}'
+        f'</svg>{legend}'
+    )
+    return svg
+
+
+def _squarify(items: List[Tuple[str, float]],
+              x: float, y: float, w: float, h: float
+              ) -> List[Tuple[str, float, float, float, float, float]]:
+    """Return [(label, value, x, y, w, h), ...] using squarified treemap.
+
+    items must be sorted descending by value.
+    """
+    if not items or w <= 0 or h <= 0:
+        return []
+    total = sum(v for _, v in items) or 1.0
+    out: List[Tuple[str, float, float, float, float, float]] = []
+
+    def worst(row, length):
+        if not row or length <= 0:
+            return float("inf")
+        s = sum(v for _, v in row)
+        rmax = max(v for _, v in row)
+        rmin = min(v for _, v in row)
+        return max((length * length * rmax) / (s * s),
+                   (s * s) / (length * length * rmin))
+
+    remaining = list(items)
+    cx, cy, cw, ch = x, y, w, h
+    cur_total = total
+
+    while remaining:
+        length = min(cw, ch)
+        row: List[Tuple[str, float]] = []
+        scale = (cw * ch) / cur_total if cur_total else 0.0
+        scaled = [(k, v * scale) for k, v in remaining]
+        i = 0
+        while i < len(scaled):
+            cand = row + [scaled[i]]
+            if worst(cand, length) <= worst(row, length) or not row:
+                row = cand
+                i += 1
+            else:
+                break
+
+        # lay out row along the shorter side
+        row_sum = sum(v for _, v in row) or 1.0
+        if cw <= ch:
+            row_h = row_sum / cw
+            ox = cx
+            for k, v in row:
+                ww = v / row_h if row_h else 0
+                out.append((k, v, ox, cy, ww, row_h))
+                ox += ww
+            cy += row_h
+            ch -= row_h
+        else:
+            row_w = row_sum / ch
+            oy = cy
+            for k, v in row:
+                hh = v / row_w if row_w else 0
+                out.append((k, v, cx, oy, row_w, hh))
+                oy += hh
+            cx += row_w
+            cw -= row_w
+
+        cur_total -= sum(v for _, v in remaining[:i])
+        remaining = remaining[i:]
+
+    return out
+
+
+def render_treemap_svg(paths: List[str], sizes: List[int],
+                       width: int = 960, height: int = 420) -> str:
+    """Two-level squarified treemap: top-level folder → extension."""
+    if not paths or not sizes:
+        return "<p>(no data)</p>"
+
+    folders: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for p, s in zip(paths, sizes):
+        folders[folder_key(p)][ext_key(p)] += s
+
+    folder_totals = sorted(((k, sum(v.values())) for k, v in folders.items()),
+                           key=lambda x: x[1], reverse=True)
+    folder_items: List[Tuple[str, float]] = [(k, float(v)) for k, v in folder_totals]
+    cells = _squarify(folder_items, 0.0, 0.0, float(width), float(height))
+
+    folder_color = {k: _color(i) for i, (k, _) in enumerate(folder_totals)}
+
+    out = [f'<svg viewBox="0 0 {width} {height}" preserveAspectRatio="xMidYMid meet">']
+
+    for k, v, x, y, w, h in cells:
+        if w < 2 or h < 2:
+            continue
+        # Inner squarify by extension
+        ext_items: List[Tuple[str, float]] = sorted(
+            ((ek, float(ev)) for ek, ev in folders[k].items()),
+            key=lambda e: e[1], reverse=True,
+        )
+        sub = _squarify(ext_items, x, y, w, h)
+        base = folder_color[k]
+        # Outer fill (slightly darker to underlay sub-cells)
+        out.append(
+            f'<rect x="{x:.2f}" y="{y:.2f}" width="{w:.2f}" height="{h:.2f}" '
+            f'fill="{base}" fill-opacity="0.15"/>'
+        )
+        for j, (ek, ev, ex, ey, ew, eh) in enumerate(sub):
+            if ew < 1 or eh < 1:
+                continue
+            tip = f"{k}/{ek}: {fmt_bytes(int(ev))}"
+            shade = 0.55 + 0.35 * (j % 3) / 2.0
+            out.append(
+                f'<g class="tm-cell">'
+                f'<rect x="{ex:.2f}" y="{ey:.2f}" width="{ew:.2f}" height="{eh:.2f}" '
+                f'fill="{base}" fill-opacity="{shade:.2f}">'
+                f'<title>{html.escape(tip)}</title></rect>'
+            )
+            if ew > 60 and eh > 18:
+                out.append(
+                    f'<text x="{ex + 4:.2f}" y="{ey + 13:.2f}" '
+                    f'font-size="11" font-weight="600">{html.escape(ek)}</text>'
+                )
+                if eh > 32:
+                    out.append(
+                        f'<text x="{ex + 4:.2f}" y="{ey + 26:.2f}" '
+                        f'font-size="10" fill-opacity="0.75">'
+                        f'{html.escape(fmt_bytes(int(ev)))}</text>'
+                    )
+            out.append('</g>')
+        # Folder label overlay
+        if w > 80 and h > 22:
+            out.append(
+                f'<text x="{x + 6:.2f}" y="{y + 16:.2f}" '
+                f'font-size="13" font-weight="700" fill="#0f1216" '
+                f'stroke="#fff" stroke-width="0.5" stroke-opacity="0.4">'
+                f'{html.escape(k)}</text>'
+            )
+
+    out.append('</svg>')
+
+    legend = '<div class="legend">' + "".join(
+        f'<span><span class="sw" style="background:{folder_color[k]}"></span>'
+        f'{html.escape(k)} &middot; {fmt_bytes(int(v))}</span>'
+        for k, v in folder_totals
+    ) + '</div>'
+
+    return "".join(out) + legend
+
+
 def render_html(data: Dict[str, object], manifest_path: Path, title: str) -> str:
     paths = data["paths"]
     sizes = data["sizes"]
@@ -351,6 +702,9 @@ def render_html(data: Dict[str, object], manifest_path: Path, title: str) -> str
         stored_raw_h=fmt_bytes(stored_raw),
         stored_pct=stored_pct,
         top_bars=render_top_bars(paths, sizes),
+        pie_svg=render_pie_svg(by_ext),
+        scatter_svg=render_scatter_svg(sizes, comp, flags),
+        treemap_svg=render_treemap_svg(paths, sizes),
         ext_table=render_agg_table(by_ext),
         folder_table=render_agg_table(by_folder),
         rows=render_rows(paths, sizes, comp, flags),

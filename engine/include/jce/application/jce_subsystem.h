@@ -54,6 +54,16 @@ typedef struct jce_subsystem_desc {
     /* Optional per-frame tick (called from main loop).  NULL = skipped. */
     void (*update)(float dt, void *ctx);
 
+    /* Optional quiescence hook.  Called BEFORE shutdown() to let the
+       subsystem stop submitting new work, drain its in-flight tasks, and
+       acknowledge that no further callbacks will fire.  Used by
+       init_all() rollback (so a half-initialised pipeline can drain
+       cleanly) and by shutdown_all() in reverse priority order.
+
+       Distinct from shutdown(): quiesce_fn must NOT free resources — the
+       engine may still query state afterwards.  Idempotent. */
+    void (*quiesce)(void *ctx);
+
     /* Opaque data forwarded to all callbacks. */
     void *ctx;
 } jce_subsystem_desc_t;
@@ -72,13 +82,13 @@ JCE_API void                      jce_subsystem_registry_destroy(jce_subsystem_r
 
 /* Register a subsystem.  Can be called any time before init_all().
    The descriptor is copied internally. */
-bool jce_subsystem_register(jce_subsystem_registry_t *reg,
-                            const jce_subsystem_desc_t *desc);
+JCE_API bool JCE_CALL jce_subsystem_register(jce_subsystem_registry_t *reg,
+                                             const jce_subsystem_desc_t *desc);
 
 /* Initialise all registered subsystems in ascending priority order.
    Stops and returns false on the first failure. */
-bool jce_subsystem_init_all(jce_subsystem_registry_t *reg,
-                            const JceServices *svc);
+JCE_API bool JCE_CALL jce_subsystem_init_all(jce_subsystem_registry_t *reg,
+                                             const JceServices *svc);
 
 /* Call update() on every subsystem that provides one. */
 JCE_API void jce_subsystem_update_all(jce_subsystem_registry_t *reg, float dt);

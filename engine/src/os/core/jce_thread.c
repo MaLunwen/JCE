@@ -128,6 +128,28 @@ void jce_thread_sleep_ms(uint32_t ms)
     SDL_Delay(ms);
 }
 
+/* ── Main-thread tracking ─────────────────────────────────────────── */
+
+static SDL_ThreadID g_main_thread_id;
+static int          g_main_thread_marked;
+
+void jce_thread_mark_main(void)
+{
+    g_main_thread_id     = SDL_GetCurrentThreadID();
+    g_main_thread_marked = 1;
+}
+
+bool jce_thread_is_main(void)
+{
+    if (!g_main_thread_marked) return true; /* unmarked → single-threaded */
+    return SDL_GetCurrentThreadID() == g_main_thread_id;
+}
+
+uint64_t jce_thread_current_id(void)
+{
+    return (uint64_t)SDL_GetCurrentThreadID();
+}
+
 /* ================================================================== */
 /* Atomics                                                             */
 /*                                                                     */

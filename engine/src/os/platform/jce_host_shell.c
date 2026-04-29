@@ -113,14 +113,27 @@ bool jce_host_reveal_path(const char *path)
     /* Windows: explorer.exe with /select reveals the file inside its
        parent folder; on a directory we just open it.  The /select
        syntax is `/select,<path>` with the comma directly preceding
-       the path; SDL will quote the joined arg correctly. */
+       the path; SDL will quote the joined arg correctly.
+
+       Critical: explorer.exe expects backslashes. Canonical JCE paths
+       use forward slashes ('/'), and explorer silently falls back to
+       opening "Documents" when given them, so we convert to '\\' for
+       just this argv. */
+    char winpath[1100];
+    {
+        size_t len = strlen(path);
+        if (len >= sizeof(winpath)) return false;
+        for (size_t i = 0; i < len; ++i)
+            winpath[i] = (path[i] == '/') ? '\\' : path[i];
+        winpath[len] = '\0';
+    }
     if (info.type == SDL_PATHTYPE_FILE) {
         char arg[1100];
-        (void)snprintf(arg, sizeof(arg), "/select,%s", path);
+        (void)snprintf(arg, sizeof(arg), "/select,%s", winpath);
         const char *argv[] = { "explorer.exe", arg, NULL };
         if (s_spawn_detached(argv)) return true;
     } else {
-        const char *argv[] = { "explorer.exe", path, NULL };
+        const char *argv[] = { "explorer.exe", winpath, NULL };
         if (s_spawn_detached(argv)) return true;
     }
 #elif defined(__APPLE__)

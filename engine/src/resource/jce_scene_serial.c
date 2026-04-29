@@ -164,3 +164,104 @@ void jce_scene_serial_free(char *json)
 {
     jce_json_free_string(json);
 }
+
+/* ── Additive (streaming) load ────────────────────────────────────── */
+
+/* Callback context used to snapshot pre-existing entity IDs. */
+typedef struct {
+    uint64_t *ids;
+    uint32_t  count;
+    uint32_t  capacity;
+} EntitySnapshot;
+
+static void _snapshot_cb(JceScene *s, JceEntity e, void *ud)
+{
+    (void)s;
+    EntitySnapshot *snap = (EntitySnapshot *)ud;
+    if (snap->count == snap->capacity) {
+        uint32_t  newcap = snap->capacity ? snap->capacity * 2 : 64;
+        uint64_t *buf    = (uint64_t *)JCE_REALLOC(snap->ids,
+                                                    newcap * sizeof(uint64_t));
+        if (!buf) return;
+        snap->ids      = buf;
+        snap->capacity = newcap;
+    }
+    snap->ids[snap->count++] = e;
+}
+
+static bool _entity_in_snapshot(const EntitySnapshot *snap, JceEntity e)
+{
+    for (uint32_t i = 0; i < snap->count; ++i)
+        if (snap->ids[i] == e) return true;
+    return false;
+}
+
+/* Callback context used to collect newly created entity IDs. */
+typedef struct {
+    const EntitySnapshot *snap;
+    uint64_t             *out;
+    uint32_t              out_count;
+    uint32_t              out_cap;
+} NewEntityCollector;
+
+static void _collect_new_cb(JceScene *s, JceEntity e, void *ud)
+{
+    (void)s;
+    NewEntityCollector *c = (NewEntityCollector *)ud;
+    if (_entity_in_snapshot(c->snap, e)) return;
+    if (c->out_count == c->out_cap) {
+        uint32_t  newcap = c->out_cap ? c->out_cap * 2 : 16;
+        uint64_t *buf    = (uint64_t *)JCE_REALLOC(c->out,
+                                                    newcap * sizeof(uint64_t));
+        if (!buf) return;
+        c->out     = buf;
+        c->out_cap = newcap;
+    }
+    c->out[c->out_count++] = e;
+}
+
+bool jce_scene_serial_load_additive(JceScene *scene,
+                                     const char *json, size_t len,
+                                     JceEntity **out_entities,
+                                     uint32_t   *out_count)
+{
+    if (!scene || !json || len == 0) return false;
+
+    /* 1. Snapshot all existing entity IDs. */
+    EntitySnapshot snap = {NULL, 0, 0};
+    jce_scene_each_entity(scene, _snapshot_cb, &snap);
+
+    /* 2. Parse JSON and append entities (jce_scene_load_json is additive). */
+    JceJson *root = jce_json_parse(json, len);
+    if (!root) {
+        LOG_ERROR(LOG_TAG, "additive load: JSON parse error");
+        JCE_FREE(snap.ids);
+        return false;
+    }
+
+    int n = jce_scene_load_json(scene, root);
+    jce_json_free(root);
+
+    if (n < 0) {
+        LOG_ERROR(LOG_TAG, "additive load: scene load failed");
+        JCE_FREE(snap.ids);
+        return false;
+    }
+
+    /* 3. Collect entities created since the snapshot. */
+    if (out_entities && out_count) {
+        NewEntityCollector col = {&snap, NULL, 0, 0};
+        jce_scene_each_entity(scene, _collect_new_cb, &col);
+        *out_entities = (JceEntity *)col.out;
+        *out_count    = col.out_count;
+    }
+
+    JCE_FREE(snap.ids);
+    LOG_INFO(LOG_TAG, "additive chunk loaded: %d entities added", n);
+    return true;
+}
+
+void jce_scene_serial_free_entities(JceEntity *entities)
+{
+    JCE_FREE(entities);
+}

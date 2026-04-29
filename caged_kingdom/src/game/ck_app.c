@@ -8,12 +8,12 @@
  */
 
 #include "ck_app.h"
+#include "ck_engine_smoke.h"
 
 #include <jce/api.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/resource/jce_scene_serial.h>
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -226,11 +226,13 @@ CkApp *ck_app_create(const JceServices *svc)
         app->tex_demo = jce_texture_load(app->svc.pak, "textures/texture.jpg");
     }
 
+    /* Load i18n translations from PAK before opening fonts (defensive ordering). */
+    jce_i18n_init(app->svc.pak);
+
     /* Load demo font (32pt, must run on main thread). */
     app->font_main = jce_font_open(app->svc.pak, "fonts/Caveat.ttf", 32.0f);
 
-    /* Load i18n translations from PAK, then build CJK font atlas. */
-    jce_i18n_init(app->svc.pak);
+    /* Build CJK font atlas using i18n collected codepoints. */
     {
         uint32_t cps[256];
         int cp_count = jce_i18n_collect_codepoints(cps, 256);
@@ -817,6 +819,10 @@ static CkApp *s_app;
 static bool demo_init(const JceServices *svc, void *ud)
 {
     (void)ud;
+    /* ck is the integration-test harness for the JCE engine.  Run the
+     * Stage 17–26 smoke tests once at startup; failures are logged but
+     * do not block the game from launching. */
+    ck_engine_smoke_run();
     s_app = ck_app_create(svc);
     return s_app != NULL;
 }

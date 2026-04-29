@@ -21,14 +21,14 @@
 
 #include <ctype.h>
 #include <jce/os/core/jce_str.h>
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 extern "C" {
-#include <jce/application/jce_config.h>
+#include <jce/os/core/jce_config.h>
 #include <jce/jce_version.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_timer.h>

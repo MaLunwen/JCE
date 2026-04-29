@@ -16,7 +16,7 @@
 extern "C" {
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
-#include <jce/os/core/jce_pak_loader.h>
+#include <jce/resource/jce_pak_loader.h>
 }
 
 #define LOG_TAG       "i18n"

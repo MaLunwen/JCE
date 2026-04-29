@@ -35,21 +35,41 @@ JceShaderHandle shader_load_program(
 JceShaderHandle shader_load_program_named(
     const JcePakArchive *pak, const char *vs_base, const char *fs_base);
 
+/* Filesystem overlay variant — reads .bin from <dev_dir>/shaders/...
+ * via SDL_IO instead of from PAK.  Used by the shader manager when
+ * a dev directory is registered (hot-reload support).  Returns
+ * JCE_INVALID_SHADER on missing file or backend mismatch. */
+JceShaderHandle shader_load_program_fs(
+    const char *dev_dir, const char *name);
+JceShaderHandle shader_load_program_fs_named(
+    const char *dev_dir, const char *vs_base, const char *fs_base);
+
 /* Pre-loaded shader set (color + textured + mesh + PBR). */
 typedef struct JceShaderSet {
     JceShaderHandle color;
     JceShaderHandle textured;
     JceShaderHandle mesh;
     JceShaderHandle pbr;              /* static PBR */
+    JceShaderHandle pbr_inst;         /* static PBR — GPU-instanced variant */
     JceShaderHandle pbr_skinned;      /* skinned PBR */
     JceShaderHandle shadow;           /* shadow depth */
+    JceShaderHandle shadow_inst;      /* shadow depth — GPU-instanced variant */
     JceShaderHandle shadow_skinned;   /* skinned shadow */
+    JceShaderHandle shadow_vsm;       /* variance shadow map (depth, depth^2) */
     JceShaderHandle terrain;          /* PBR-style terrain (4-layer splat) */
 } JceShaderSet;
 
 /* Load all standard shader programs from PAK.
  * Must be called after bgfx is initialized. */
 JCE_API JceShaderSet jce_shaders_load_all(const JcePakArchive *pak);
+
+/* Same as jce_shaders_load_all but tries `<dev_dir>/shaders/*.bin` on
+ * the filesystem first for each shader, falling back to PAK on a
+ * per-shader basis.  When dev_dir is NULL or empty, behaves identically
+ * to jce_shaders_load_all.  Used by the editor's "Reload Shaders"
+ * action to demonstrate end-to-end hot-reload from disk. */
+JCE_API JceShaderSet jce_shaders_load_all_fs(const char *dev_dir,
+                                             const JcePakArchive *pak);
 
 JCE_EXTERN_C_END
 

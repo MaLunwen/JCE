@@ -5,7 +5,7 @@
  * manages the full populate -> read -> apply cycle.
  */
 
-#include <jce/application/jce_config.h>
+#include <jce/os/core/jce_config.h>
 #include <jce/middleware/audio/jce_audio.h>
 #include <jce/middleware/ui/jce_ui_settings.h>
 #include <jce/os/core/jce_i18n.h>
@@ -574,8 +574,8 @@ JceSettingsPanel *jce_settings_create(const JceSettingsPanelDesc *desc)
 void jce_settings_destroy(JceSettingsPanel *panel)
 {
     if (!panel) return;
-    if (panel->ui && jce_ui_doc_valid(panel->doc))
-        jce_ui_doc_close(panel->ui, panel->doc);
+    /* See note in jce_debug_hud_destroy: document close is deferred to
+     * Rml::Shutdown() to avoid shutdown-time access violations. */
     JCE_FREE(panel);
 }
 

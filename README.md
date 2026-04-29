@@ -7,6 +7,30 @@ This document provides working build flows for:
 
 All commands below are tested in PowerShell from the repository root.
 
+## Canonical Dependencies
+
+JCE deliberately keeps its third-party dependency surface small and
+cross-platform. Every entry below is a sanctioned, architecturally-load-
+bearing dependency — *not* an incidental transitive pull. New direct deps
+are only added with explicit project-owner approval and require updating
+this list plus `THIRD_PARTY_LICENSES.md`.
+
+| Dep      | Role                              | Layer       |
+|----------|-----------------------------------|-------------|
+| SDL3     | Window / input / platform abstraction | os/platform |
+| bgfx     | Graphics backend abstraction      | renderer    |
+| cglm     | SIMD math (wrapped by `jce_math`) | os/core     |
+| PhysFS   | Virtual filesystem / archive I/O  | os/core     |
+| enkiTS   | Task scheduler                    | os/core     |
+| mimalloc | Allocator                         | os/core     |
+| Tracy    | Profiling                         | os/core     |
+| flecs    | Data-driven ECS                   | scene / renderer / ui |
+| Recast & Detour | Navigation mesh generation + pathfinding | middleware/navigation |
+
+Platform-specific native APIs (Win32, POSIX, Cocoa, NDK) must always be
+accessed through one of the canonical wrappers above; they are never
+called directly from engine source.
+
 ## Project Structure
 
 ```

@@ -11,6 +11,7 @@
 #include <btBulletDynamicsCommon.h>
 #include <BulletCollision/CollisionDispatch/btGhostObject.h>
 #include <BulletDynamics/Character/btKinematicCharacterController.h>
+#include <BulletDynamics/Vehicle/btRaycastVehicle.h>
 
 #include <cstring>
 
@@ -76,6 +77,22 @@ struct JceBulletWorld {
     bool                            *char_alive;
     uint32_t                         char_capacity;
     uint32_t                         char_count;
+
+    /* Vehicle controller pool (parallel arrays).  Each slot owns a
+     * chassis btRigidBody, the box collision shape, the raycaster,
+     * and the btRaycastVehicle.  Per-vehicle drive state is cached
+     * here so set_input() can apply the same force to every wheel
+     * without the user having to track wheel indices. */
+    btRaycastVehicle              **vehicles;
+    btDefaultVehicleRaycaster     **vehicle_raycasters;
+    btRigidBody                   **vehicle_chassis;
+    btCollisionShape              **vehicle_chassis_shapes;
+    bool                           *vehicle_alive;
+    float                          *vehicle_max_engine;
+    float                          *vehicle_max_brake;
+    float                          *vehicle_max_steer;
+    uint32_t                        vehicle_capacity;
+    uint32_t                        vehicle_count;
 
     /* Contact callbacks forwarded to the C layer. */
     jce_bullet_contact_fn contact_begin_fn;
@@ -194,12 +211,51 @@ JceBulletWorld *jce_bullet_create(jce_vec3 gravity, uint32_t max_bodies)
     bw->char_alive = static_cast<bool *>(
         JCE_CALLOC(bw->char_capacity, sizeof(bool)));
 
+    /* Allocate vehicle controller pool. */
+    bw->vehicle_capacity = 16;
+    bw->vehicle_count = 0;
+    bw->vehicles = static_cast<btRaycastVehicle **>(
+        JCE_CALLOC(bw->vehicle_capacity, sizeof(btRaycastVehicle *)));
+    bw->vehicle_raycasters = static_cast<btDefaultVehicleRaycaster **>(
+        JCE_CALLOC(bw->vehicle_capacity, sizeof(btDefaultVehicleRaycaster *)));
+    bw->vehicle_chassis = static_cast<btRigidBody **>(
+        JCE_CALLOC(bw->vehicle_capacity, sizeof(btRigidBody *)));
+    bw->vehicle_chassis_shapes = static_cast<btCollisionShape **>(
+        JCE_CALLOC(bw->vehicle_capacity, sizeof(btCollisionShape *)));
+    bw->vehicle_alive = static_cast<bool *>(
+        JCE_CALLOC(bw->vehicle_capacity, sizeof(bool)));
+    bw->vehicle_max_engine = static_cast<float *>(
+        JCE_CALLOC(bw->vehicle_capacity, sizeof(float)));
+    bw->vehicle_max_brake = static_cast<float *>(
+        JCE_CALLOC(bw->vehicle_capacity, sizeof(float)));
+    bw->vehicle_max_steer = static_cast<float *>(
+        JCE_CALLOC(bw->vehicle_capacity, sizeof(float)));
+
     return bw;
 }
 
 void jce_bullet_destroy(JceBulletWorld *bw)
 {
     if (!bw) return;
+
+    /* Remove and delete all live vehicles (must come before bodies). */
+    if (bw->vehicles && bw->vehicle_alive) {
+        for (uint32_t i = 0; i < bw->vehicle_capacity; ++i) {
+            if (!bw->vehicle_alive[i]) continue;
+            if (bw->vehicles[i]) {
+                bw->world->removeVehicle(bw->vehicles[i]);
+                delete bw->vehicles[i];
+            }
+            delete bw->vehicle_raycasters[i];
+            if (bw->vehicle_chassis[i]) {
+                bw->world->removeRigidBody(bw->vehicle_chassis[i]);
+                delete bw->vehicle_chassis[i]->getMotionState();
+                delete bw->vehicle_chassis[i];
+            }
+            delete bw->vehicle_chassis_shapes[i];
+            bw->vehicle_alive[i] = false;
+        }
+    }
 
     /* Remove and delete all live character controllers. */
     if (bw->characters && bw->ghosts && bw->char_shapes && bw->char_alive) {
@@ -256,6 +312,14 @@ void jce_bullet_destroy(JceBulletWorld *bw)
     JCE_FREE(bw->char_shapes);
     JCE_FREE(bw->ghosts);
     JCE_FREE(bw->characters);
+    JCE_FREE(bw->vehicle_max_steer);
+    JCE_FREE(bw->vehicle_max_brake);
+    JCE_FREE(bw->vehicle_max_engine);
+    JCE_FREE(bw->vehicle_alive);
+    JCE_FREE(bw->vehicle_chassis_shapes);
+    JCE_FREE(bw->vehicle_chassis);
+    JCE_FREE(bw->vehicle_raycasters);
+    JCE_FREE(bw->vehicles);
     JCE_FREE(bw->con_alive);
     JCE_FREE(bw->constraints);
     JCE_FREE(bw->alive);
@@ -850,4 +914,187 @@ bool jce_bullet_character_is_grounded(JceBulletWorld *bw, uint32_t idx)
 {
     if (!bw || idx >= bw->char_capacity || !bw->char_alive[idx]) return false;
     return bw->characters[idx]->onGround();
+}
+
+/* ================================================================== */
+/* Vehicle controller                                                  */
+/* ================================================================== */
+
+uint32_t jce_bullet_vehicle_create(JceBulletWorld *bw,
+                                    jce_vec3 pos, jce_quat rot,
+                                    jce_vec3 chassis_half_ext,
+                                    float chassis_mass,
+                                    float max_engine_force,
+                                    float max_brake_force,
+                                    float max_steering_rad,
+                                    uint16_t col_group, uint16_t col_mask)
+{
+    if (!bw) return UINT32_MAX;
+
+    uint32_t idx = UINT32_MAX;
+    for (uint32_t i = 0; i < bw->vehicle_capacity; ++i) {
+        if (!bw->vehicle_alive[i]) { idx = i; break; }
+    }
+    if (idx == UINT32_MAX) return UINT32_MAX;
+
+    /* Chassis collision shape (box). */
+    btCollisionShape *chassis_shape = new btBoxShape(to_bt(chassis_half_ext));
+    btVector3 inertia(0, 0, 0);
+    if (chassis_mass > 0.0f) chassis_shape->calculateLocalInertia(chassis_mass, inertia);
+
+    btTransform xf;
+    xf.setIdentity();
+    xf.setOrigin(to_bt(pos));
+    xf.setRotation(to_bt_q(rot));
+    auto *motion = new btDefaultMotionState(xf);
+    btRigidBody::btRigidBodyConstructionInfo ci(chassis_mass, motion, chassis_shape, inertia);
+    auto *chassis = new btRigidBody(ci);
+
+    /* Chassis must never sleep — wheels rely on continuous integration. */
+    chassis->setActivationState(DISABLE_DEACTIVATION);
+    chassis->setUserPointer(reinterpret_cast<void *>(static_cast<uintptr_t>(idx)));
+    bw->world->addRigidBody(chassis,
+        static_cast<int>(col_group), static_cast<int>(col_mask));
+
+    /* Raycaster + vehicle. */
+    auto *raycaster = new btDefaultVehicleRaycaster(bw->world);
+    btRaycastVehicle::btVehicleTuning tuning;
+    auto *vehicle = new btRaycastVehicle(tuning, chassis, raycaster);
+
+    /* Bullet vehicle convention: forward = Z (axis index 2), up = Y (1), right = X (0). */
+    vehicle->setCoordinateSystem(0, 1, 2);
+
+    bw->world->addVehicle(vehicle);
+
+    bw->vehicles[idx]                = vehicle;
+    bw->vehicle_raycasters[idx]      = raycaster;
+    bw->vehicle_chassis[idx]         = chassis;
+    bw->vehicle_chassis_shapes[idx]  = chassis_shape;
+    bw->vehicle_alive[idx]           = true;
+    bw->vehicle_max_engine[idx]      = max_engine_force;
+    bw->vehicle_max_brake[idx]       = max_brake_force;
+    bw->vehicle_max_steer[idx]       = max_steering_rad;
+    bw->vehicle_count++;
+    return idx;
+}
+
+void jce_bullet_vehicle_destroy(JceBulletWorld *bw, uint32_t idx)
+{
+    if (!bw || idx >= bw->vehicle_capacity || !bw->vehicle_alive[idx]) return;
+    if (bw->vehicles[idx]) {
+        bw->world->removeVehicle(bw->vehicles[idx]);
+        delete bw->vehicles[idx];
+        bw->vehicles[idx] = nullptr;
+    }
+    delete bw->vehicle_raycasters[idx];
+    bw->vehicle_raycasters[idx] = nullptr;
+    if (bw->vehicle_chassis[idx]) {
+        bw->world->removeRigidBody(bw->vehicle_chassis[idx]);
+        delete bw->vehicle_chassis[idx]->getMotionState();
+        delete bw->vehicle_chassis[idx];
+        bw->vehicle_chassis[idx] = nullptr;
+    }
+    delete bw->vehicle_chassis_shapes[idx];
+    bw->vehicle_chassis_shapes[idx] = nullptr;
+    bw->vehicle_alive[idx] = false;
+    bw->vehicle_count--;
+}
+
+uint32_t jce_bullet_vehicle_add_wheel(JceBulletWorld *bw, uint32_t idx,
+                                       jce_vec3 connection,
+                                       jce_vec3 wheel_dir,
+                                       jce_vec3 wheel_axle,
+                                       float suspension_rest_len,
+                                       float wheel_radius,
+                                       bool is_front,
+                                       float susp_stiffness,
+                                       float susp_damping,
+                                       float susp_compression,
+                                       float friction_slip,
+                                       float roll_influence)
+{
+    if (!bw || idx >= bw->vehicle_capacity || !bw->vehicle_alive[idx])
+        return UINT32_MAX;
+    btRaycastVehicle *vehicle = bw->vehicles[idx];
+    btRaycastVehicle::btVehicleTuning tuning;
+    btWheelInfo &wi = vehicle->addWheel(to_bt(connection), to_bt(wheel_dir),
+                                          to_bt(wheel_axle),
+                                          static_cast<btScalar>(suspension_rest_len),
+                                          static_cast<btScalar>(wheel_radius),
+                                          tuning, is_front);
+    if (susp_stiffness   > 0) wi.m_suspensionStiffness   = susp_stiffness;
+    if (susp_damping     > 0) wi.m_wheelsDampingRelaxation = susp_damping;
+    if (susp_compression > 0) wi.m_wheelsDampingCompression = susp_compression;
+    if (friction_slip    > 0) wi.m_frictionSlip           = friction_slip;
+    wi.m_rollInfluence   = roll_influence;
+    return static_cast<uint32_t>(vehicle->getNumWheels()) - 1u;
+}
+
+void jce_bullet_vehicle_set_input(JceBulletWorld *bw, uint32_t idx,
+                                   float throttle, float brake, float steer)
+{
+    if (!bw || idx >= bw->vehicle_capacity || !bw->vehicle_alive[idx]) return;
+    btRaycastVehicle *vehicle = bw->vehicles[idx];
+
+    /* Clamp inputs. */
+    if (throttle >  1.0f) throttle =  1.0f;
+    if (throttle < -1.0f) throttle = -1.0f;
+    if (brake    <  0.0f) brake    =  0.0f;
+    if (brake    >  1.0f) brake    =  1.0f;
+    if (steer    >  1.0f) steer    =  1.0f;
+    if (steer    < -1.0f) steer    = -1.0f;
+
+    float engine_force = throttle * bw->vehicle_max_engine[idx];
+    float brake_force  = brake    * bw->vehicle_max_brake[idx];
+    float steer_rad    = steer    * bw->vehicle_max_steer[idx];
+
+    /* Wake the chassis whenever the user is driving. */
+    if (bw->vehicle_chassis[idx])
+        bw->vehicle_chassis[idx]->activate(true);
+
+    int n = vehicle->getNumWheels();
+    for (int i = 0; i < n; ++i) {
+        const btWheelInfo &wi = vehicle->getWheelInfo(i);
+        /* Drive: rear-wheel-drive on non-steering wheels, brake everywhere,
+         * steer only on front wheels.  Sane GTA-style default. */
+        if (wi.m_bIsFrontWheel) {
+            vehicle->applyEngineForce(0.0f, i);
+            vehicle->setSteeringValue(steer_rad, i);
+        } else {
+            vehicle->applyEngineForce(engine_force, i);
+            vehicle->setSteeringValue(0.0f, i);
+        }
+        vehicle->setBrake(brake_force, i);
+    }
+}
+
+void jce_bullet_vehicle_get_chassis_transform(JceBulletWorld *bw, uint32_t idx,
+                                                jce_vec3 *pos, jce_quat *rot)
+{
+    if (!bw || idx >= bw->vehicle_capacity || !bw->vehicle_alive[idx]) return;
+    btTransform xf;
+    bw->vehicle_chassis[idx]->getMotionState()->getWorldTransform(xf);
+    if (pos) *pos = from_bt_v3(xf.getOrigin());
+    if (rot) *rot = from_bt_q(xf.getRotation());
+}
+
+void jce_bullet_vehicle_get_wheel_transform(JceBulletWorld *bw, uint32_t idx,
+                                              uint32_t wheel,
+                                              jce_vec3 *pos, jce_quat *rot)
+{
+    if (!bw || idx >= bw->vehicle_capacity || !bw->vehicle_alive[idx]) return;
+    btRaycastVehicle *vehicle = bw->vehicles[idx];
+    if (static_cast<int>(wheel) >= vehicle->getNumWheels()) return;
+    /* Update interpolated wheel transform from current suspension state. */
+    vehicle->updateWheelTransform(static_cast<int>(wheel), true);
+    const btTransform &xf = vehicle->getWheelInfo(wheel).m_worldTransform;
+    if (pos) *pos = from_bt_v3(xf.getOrigin());
+    if (rot) *rot = from_bt_q(xf.getRotation());
+}
+
+float jce_bullet_vehicle_get_speed(JceBulletWorld *bw, uint32_t idx)
+{
+    if (!bw || idx >= bw->vehicle_capacity || !bw->vehicle_alive[idx]) return 0.0f;
+    /* Bullet returns km/h — convert to m/s for SI consistency. */
+    return static_cast<float>(bw->vehicles[idx]->getCurrentSpeedKmHour()) * (1.0f / 3.6f);
 }

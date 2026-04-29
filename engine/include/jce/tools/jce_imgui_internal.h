@@ -9,7 +9,7 @@
 #ifndef JCE_TOOLS_JCE_IMGUI_INTERNAL_H
 #define JCE_TOOLS_JCE_IMGUI_INTERNAL_H
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 #include <imgui_internal.h>
 
 #endif  /* JCE_TOOLS_JCE_IMGUI_INTERNAL_H */

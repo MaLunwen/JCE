@@ -15,6 +15,7 @@
 
 #include <jce/os/core/jce_defs.h>
 #include <stdbool.h>
+#include <stdarg.h>
 
 JCE_EXTERN_C_BEGIN
 
@@ -56,6 +57,11 @@ JCE_API void JCE_CALL jce_log_set_thread_name(const char *name);
 JCE_API void JCE_CALL jce_log_write(JceLogLevel level, const char *tag,
                    const char *file, int line,
                    const char *fmt, ...);
+
+/* va_list variant for FFI bindings that cannot call variadic functions. */
+JCE_API void JCE_CALL jce_log_write_v(JceLogLevel level, const char *tag,
+                     const char *file, int line,
+                     const char *fmt, va_list ap);
 
 JCE_EXTERN_C_END
 

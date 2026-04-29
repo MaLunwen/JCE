@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#include <jce/os/core/jce_pak_loader.h>
+#include <jce/resource/jce_pak_loader.h>
 #include <jce/resource/jce_asset.h>
 #include <jce/resource/jce_asset_format.h>
 #include <jce/resource/jce_scene_contract.h>

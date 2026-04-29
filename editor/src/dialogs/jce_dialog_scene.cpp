@@ -4,6 +4,9 @@
  * New Scene, Open Scene, Save As, Unsaved Changes.
  */
 
+#include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_path.h>
+
 #include "jce_editor_dialogs_internal.h"
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
@@ -18,35 +21,39 @@ static bool is_scene_filename(const std::string &name)
 }
 
 static bool resolve_scene_input_path(const char *input_path,
-                                    fs::path *out_scene_file,
-                                    fs::path *out_scene_dir)
+                                    std::string *out_scene_file,
+                                    std::string *out_scene_dir)
 {
     if (out_scene_file)
-        *out_scene_file = fs::path();
+        *out_scene_file = "";
     if (out_scene_dir)
-        *out_scene_dir = fs::path();
+        *out_scene_dir = "";
     if (!input_path || input_path[0] == '\0')
         return false;
 
-    try {
-        fs::path path(input_path);
-        if (!fs::exists(path))
-            return false;
+    bool is_dir = jce_fs_host_exists_dir(input_path);
+    bool is_file = jce_fs_host_exists_file(input_path);
+    
+    if (!is_dir && !is_file)
+        return false;
 
-        if (fs::is_directory(path)) {
-            if (out_scene_dir)
-                *out_scene_dir = path;
-            return true;
-        }
+    if (is_dir) {
+        if (out_scene_dir)
+            *out_scene_dir = input_path;
+        return true;
+    }
 
-        if (fs::is_regular_file(path) && is_scene_filename(path.filename().string())) {
-            if (out_scene_file)
-                *out_scene_file = path;
-            if (out_scene_dir)
-                *out_scene_dir = path.parent_path();
-            return true;
+    char basename[256];
+    jce_path_basename(basename, sizeof(basename), input_path);
+    if (is_file && is_scene_filename(basename)) {
+        if (out_scene_file)
+            *out_scene_file = input_path;
+        if (out_scene_dir) {
+            char parent[1024];
+            jce_path_parent(parent, sizeof(parent), input_path);
+            *out_scene_dir = parent;
         }
-    } catch (...) {
+        return true;
     }
 
     return false;
@@ -73,12 +80,17 @@ static void new_scene_ensure_init(void)
     memset(&s_new_scene, 0, sizeof(s_new_scene));
 
     if (s_current_project_root[0] != '\0') {
-        fs::path p = fs::path(s_current_project_root) / "assets" / "scenes";
-        snprintf(s_new_scene.scene_dir, sizeof(s_new_scene.scene_dir), "%s",
-                 p.string().c_str());
+        char p[1024];
+        jce_path_join(p, sizeof(p), s_current_project_root, "assets");
+        jce_path_join(p, sizeof(p), p, "scenes");
+        snprintf(s_new_scene.scene_dir, sizeof(s_new_scene.scene_dir), "%s", p);
     } else {
-        snprintf(s_new_scene.scene_dir, sizeof(s_new_scene.scene_dir), "%s",
-                 fs::current_path().string().c_str());
+        char base[1024];
+        if (jce_fs_host_get_current_dir(base, sizeof(base))) {
+            snprintf(s_new_scene.scene_dir, sizeof(s_new_scene.scene_dir), "%s", base);
+        } else {
+            snprintf(s_new_scene.scene_dir, sizeof(s_new_scene.scene_dir), ".");
+        }
     }
     snprintf(s_new_scene.last_project_root, sizeof(s_new_scene.last_project_root),
              "%s", s_current_project_root);
@@ -157,20 +169,23 @@ void jce_editor_dialog_new_scene(bool *p_open)
                 "%s", jce_editor_i18n("sceneDialog.errorRequired"));
         } else {
             try {
-                fs::create_directories(s_new_scene.scene_dir);
+                jce_fs_host_create_directory(s_new_scene.scene_dir);
 
                 std::string name = s_new_scene.scene_name;
                 if (!is_scene_filename(name)) name += ".scene";
-                fs::path scene_path = fs::path(s_new_scene.scene_dir) / name;
+                char scene_path_buf[1024];
+                jce_path_join(scene_path_buf, sizeof(scene_path_buf),
+                              s_new_scene.scene_dir, name.c_str());
+                std::string scene_path = scene_path_buf;
 
                 static const char empty_scene[] = "{}";
-                if (!ed_write_file(scene_path.string().c_str(),
+                if (!ed_write_file(scene_path.c_str(),
                                    empty_scene, sizeof(empty_scene) - 1)) {
                     jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-                        "Failed to create scene file: %s", scene_path.string().c_str());
+                        "Failed to create scene file: %s", scene_path.c_str());
                 } else {
-                    if (jce_state_load_scene_file(scene_path.string().c_str())) {
-                        jce_editor_console_log("Created scene: %s", scene_path.string().c_str());
+                    if (jce_state_load_scene_file(scene_path.c_str())) {
+                        jce_editor_console_log("Created scene: %s", scene_path.c_str());
                         jce_editor_layout_request_focus_scene_view();
                         *p_open = false;
                     } else {
@@ -225,12 +240,17 @@ static void open_scene_ensure_init(void)
     s_open_scene.error_msg[0] = '\0';
 
     if (s_current_project_root[0] != '\0') {
-        fs::path p = fs::path(s_current_project_root) / "assets" / "scenes";
-        snprintf(s_open_scene.scene_dir, sizeof(s_open_scene.scene_dir), "%s",
-                 p.string().c_str());
+        char p[1024];
+        jce_path_join(p, sizeof(p), s_current_project_root, "assets");
+        jce_path_join(p, sizeof(p), p, "scenes");
+        snprintf(s_open_scene.scene_dir, sizeof(s_open_scene.scene_dir), "%s", p);
     } else {
-        snprintf(s_open_scene.scene_dir, sizeof(s_open_scene.scene_dir), "%s",
-                 fs::current_path().string().c_str());
+        char base[1024];
+        if (jce_fs_host_get_current_dir(base, sizeof(base))) {
+            snprintf(s_open_scene.scene_dir, sizeof(s_open_scene.scene_dir), "%s", base);
+        } else {
+            snprintf(s_open_scene.scene_dir, sizeof(s_open_scene.scene_dir), ".");
+        }
     }
 
     snprintf(s_open_scene.last_project_root, sizeof(s_open_scene.last_project_root),
@@ -244,26 +264,35 @@ static void open_scene_refresh_entries(void)
     s_open_scene.scene_files.clear();
     s_open_scene.selected_idx = -1;
     try {
-        fs::path direct_scene;
-        fs::path browse_dir;
+        std::string direct_scene_path;
+        std::string browse_dir;
         if (!resolve_scene_input_path(s_open_scene.scene_dir,
-                                      &direct_scene,
+                                      &direct_scene_path,
                                       &browse_dir)
             || browse_dir.empty()) {
             s_open_scene.refresh = false;
             return;
         }
 
-        for (auto &de : fs::directory_iterator(browse_dir)) {
-            if (!de.is_regular_file()) continue;
-            std::string name = de.path().filename().string();
-            if (is_scene_filename(name))
-                s_open_scene.scene_files.push_back(name);
-        }
+        struct ListCtx {
+            std::vector<std::string> *files;
+        } ctx;
+        ctx.files = &s_open_scene.scene_files;
+        
+        auto cb = [](const char *name, bool is_dir, void *ud) -> bool {
+            if (!is_dir && is_scene_filename(name)) {
+                static_cast<ListCtx*>(ud)->files->push_back(name);
+            }
+            return true;
+        };
+        
+        jce_fs_host_list_dir(browse_dir.c_str(), cb, &ctx);
         std::sort(s_open_scene.scene_files.begin(), s_open_scene.scene_files.end());
 
-        if (!direct_scene.empty()) {
-            std::string selected_name = direct_scene.filename().string();
+        if (!direct_scene_path.empty()) {
+            char basename[256];
+            jce_path_basename(basename, sizeof(basename), direct_scene_path.c_str());
+            std::string selected_name = basename;
             for (int index = 0; index < (int)s_open_scene.scene_files.size(); index++) {
                 if (s_open_scene.scene_files[index] == selected_name) {
                     s_open_scene.selected_idx = index;
@@ -334,8 +363,8 @@ void jce_editor_dialog_open_scene(bool *p_open)
     }
     ImGui::EndChild();
 
-    fs::path direct_scene_path;
-    fs::path resolved_scene_dir;
+    std::string direct_scene_path;
+    std::string resolved_scene_dir;
     bool resolved_scene_input = resolve_scene_input_path(s_open_scene.scene_dir,
                                                          &direct_scene_path,
                                                          &resolved_scene_dir);
@@ -351,21 +380,26 @@ void jce_editor_dialog_open_scene(bool *p_open)
         || (can_open && open_from_double_click)) {
         s_open_scene.error_msg[0] = '\0';
 
-        fs::path full;
-        if (!direct_scene_path.empty())
-            full = direct_scene_path;
-        else if (resolved_scene_input && s_open_scene.selected_idx >= 0)
-            full = resolved_scene_dir / s_open_scene.scene_files[s_open_scene.selected_idx];
+        char full[1024];
+        full[0] = '\0';
+        
+        if (!direct_scene_path.empty()) {
+            snprintf(full, sizeof(full), "%s", direct_scene_path.c_str());
+        } else if (resolved_scene_input && s_open_scene.selected_idx >= 0) {
+            jce_path_join(full, sizeof(full),
+                         resolved_scene_dir.c_str(),
+                         s_open_scene.scene_files[s_open_scene.selected_idx].c_str());
+        }
 
-        if (!full.empty() && fs::exists(full) && jce_state_load_scene_file(full.string().c_str())) {
+        if (full[0] != '\0' && jce_fs_host_exists_file(full) && jce_state_load_scene_file(full)) {
             jce_editor_layout_request_focus_scene_view();
-            jce_editor_console_log("Opened scene: %s", full.string().c_str());
+            jce_editor_console_log("Opened scene: %s", full);
             *p_open = false;
-        } else if (!full.empty()) {
+        } else if (full[0] != '\0') {
             snprintf(s_open_scene.error_msg, sizeof(s_open_scene.error_msg), "%s",
                      jce_editor_i18n("sceneDialog.errorOpen"));
             jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-                "Failed to open scene: %s", full.string().c_str());
+                "Failed to open scene: %s", full);
         } else {
             snprintf(s_open_scene.error_msg, sizeof(s_open_scene.error_msg), "%s",
                      jce_editor_i18n("sceneDialog.errorInvalid"));
@@ -398,7 +432,10 @@ static std::string strip_scene_extension(const std::string &file_name)
         return file_name.substr(0, file_name.size() - 11);
     if (file_name.size() >= 6 && file_name.substr(file_name.size() - 6) == ".scene")
         return file_name.substr(0, file_name.size() - 6);
-    return fs::path(file_name).stem().string();
+    
+    char stem[256];
+    jce_path_stem(stem, sizeof(stem), file_name.c_str());
+    return std::string(stem);
 }
 
 static void save_as_ensure_init(void)
@@ -407,15 +444,27 @@ static void save_as_ensure_init(void)
     if (current_scene && current_scene[0] != '\0'
         && (!s_save_as.initialized
          || strcmp(s_save_as.source_scene_path, current_scene) != 0)) {
-        fs::path p(current_scene);
-        std::string parent = p.parent_path().string();
-        std::string base = strip_scene_extension(p.filename().string());
+        char parent[1024];
+        jce_path_parent(parent, sizeof(parent), current_scene);
+        char basename[256];
+        jce_path_basename(basename, sizeof(basename), current_scene);
+        std::string base = strip_scene_extension(basename);
 
         memset(&s_save_as, 0, sizeof(s_save_as));
         snprintf(s_save_as.save_name, sizeof(s_save_as.save_name), "%s",
                  base.empty() ? "Scene" : base.c_str());
-        snprintf(s_save_as.save_location, sizeof(s_save_as.save_location), "%s",
-                 parent.empty() ? fs::current_path().string().c_str() : parent.c_str());
+        
+        if (parent[0] != '\0') {
+            snprintf(s_save_as.save_location, sizeof(s_save_as.save_location), "%s", parent);
+        } else {
+            char base_path[1024];
+            if (jce_fs_host_get_current_dir(base_path, sizeof(base_path))) {
+                snprintf(s_save_as.save_location, sizeof(s_save_as.save_location), "%s", base_path);
+            } else {
+                snprintf(s_save_as.save_location, sizeof(s_save_as.save_location), ".");
+            }
+        }
+        
         snprintf(s_save_as.source_scene_path, sizeof(s_save_as.source_scene_path), "%s",
                  current_scene);
         s_save_as.initialized = true;
@@ -426,12 +475,20 @@ static void save_as_ensure_init(void)
 
     memset(&s_save_as, 0, sizeof(s_save_as));
     if (s_current_project_root[0] != '\0') {
-        fs::path p = fs::path(s_current_project_root) / "assets" / "scenes";
+        char path_buf[1024];
+        jce_path_join(path_buf, sizeof(path_buf), s_current_project_root, "assets");
+        jce_path_join(path_buf, sizeof(path_buf), path_buf, "scenes");
         snprintf(s_save_as.save_location,
-                 sizeof(s_save_as.save_location), "%s", p.string().c_str());
+                 sizeof(s_save_as.save_location), "%s", path_buf);
     } else {
-        snprintf(s_save_as.save_location,
-                 sizeof(s_save_as.save_location), "%s", fs::current_path().string().c_str());
+        char base_path[1024];
+        if (jce_fs_host_get_current_dir(base_path, sizeof(base_path))) {
+            snprintf(s_save_as.save_location,
+                     sizeof(s_save_as.save_location), "%s", base_path);
+        } else {
+            snprintf(s_save_as.save_location,
+                     sizeof(s_save_as.save_location), ".");
+        }
     }
     snprintf(s_save_as.save_name, sizeof(s_save_as.save_name), "Scene");
     s_save_as.initialized = true;
@@ -492,27 +549,24 @@ void jce_editor_dialog_save_as(bool *p_open)
             jce_editor_console_log_level(JCE_CONSOLE_WARNING,
                 "%s", jce_editor_i18n("sceneDialog.errorRequired"));
         } else {
-            try {
-                fs::create_directories(s_save_as.save_location);
+            jce_fs_host_create_directory(s_save_as.save_location);
 
-                std::string name = s_save_as.save_name;
-                if (!is_scene_filename(name)) name += ".scene";
-                fs::path out_path = fs::path(s_save_as.save_location) / name;
+            std::string name = s_save_as.save_name;
+            if (!is_scene_filename(name)) name += ".scene";
+            
+            char out_path[1024];
+            jce_path_join(out_path, sizeof(out_path), s_save_as.save_location, name.c_str());
 
-                if (jce_state_save_scene_file(out_path.string().c_str())) {
-                    snprintf(s_save_as.source_scene_path,
-                             sizeof(s_save_as.source_scene_path), "%s",
-                             out_path.string().c_str());
-                    jce_editor_layout_request_focus_scene_view();
-                    jce_editor_console_log("Saved scene as: %s", out_path.string().c_str());
-                    *p_open = false;
-                } else {
-                    jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-                        "Save scene failed: %s", out_path.string().c_str());
-                }
-            } catch (const std::exception &e) {
+            if (jce_state_save_scene_file(out_path)) {
+                snprintf(s_save_as.source_scene_path,
+                         sizeof(s_save_as.source_scene_path), "%s",
+                         out_path);
+                jce_editor_layout_request_focus_scene_view();
+                jce_editor_console_log("Saved scene as: %s", out_path);
+                *p_open = false;
+            } else {
                 jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-                    "Save scene failed: %s", e.what());
+                    "Save scene failed: %s", out_path);
             }
         }
     }

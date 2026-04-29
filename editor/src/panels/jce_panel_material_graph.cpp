@@ -30,7 +30,7 @@
 #include "ui/jce_theme_palette.h"
 #include "core/jce_hotkeys.h"
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 #include <jce/tools/jce_imgui_internal.h>
 extern "C" {
 #include <jce/os/core/jce_json.h>

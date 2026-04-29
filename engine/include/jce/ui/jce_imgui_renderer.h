@@ -14,7 +14,7 @@
 #include <stdint.h>
 
 #include <jce/os/core/jce_defs.h>
-#include <jce/os/core/jce_pak_loader.h>
+#include <jce/resource/jce_pak_loader.h>
 
 #ifdef __cplusplus
 extern "C" {

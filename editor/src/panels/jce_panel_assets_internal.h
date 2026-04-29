@@ -17,18 +17,15 @@
 #include "scene/jce_editor_scene_render.h"
 #include "viewers/jce_file_viewer.h"
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 #include <stdio.h>
 #include <string.h>
 
 #include <algorithm>
-#include <filesystem>
 #include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
-
-namespace fs = std::filesystem;
 
 /* ── Asset Browser types ─────────────────────────────────────────── */
 
@@ -90,7 +87,7 @@ extern AssetBrowserState s_assets;
 
 /* ── Shared helpers ───────────────────────────────────────────────── */
 
-std::string normalized_path_string(const fs::path &p);
+std::string normalized_path_string(const std::string &p);
 void        ensure_assets_init(void);
 void        refresh_entries(void);
 void        navigate_asset_directory(const std::string &path, bool clear_search);

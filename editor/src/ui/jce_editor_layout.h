@@ -29,6 +29,13 @@ void jce_editor_layout_request_quit(void);
    saved or chose "Don't Save" in the unsaved-changes dialog). */
 bool jce_editor_layout_is_quit_confirmed(void);
 
+/* Hot-reload all bgfx shader programs from disk (uses
+   <dev_dir>/shaders, falls back to PAK per-shader).  dev_dir
+   defaults to the JCE_SHADER_DEV_DIR env var; if unset, the
+   editor uses the build output's shaders dir as inferred from
+   the running executable.  Returns true on success. */
+bool jce_editor_reload_shaders(void);
+
 #ifdef __cplusplus
 }
 #endif

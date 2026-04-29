@@ -104,6 +104,65 @@ JceVoice  jce_audio_play_stream(JceAudio *audio,
 JCE_API void      jce_audio_set_master_volume(JceAudio *audio, float volume);
 JCE_API void      jce_audio_stop_all(JceAudio *audio);
 
+/* -- 3D positional audio -------------------------------------------- */
+
+/*
+ * Listener orientation.  Each frame the game updates the listener
+ * with the camera (or player ear) transform; voices marked spatial
+ * are then attenuated, panned, and Doppler-shifted relative to it.
+ *
+ * Coordinate convention matches miniaudio: right-handed, +Y up.
+ * Position/forward/up/velocity are world-space.  Velocity is only
+ * used for Doppler — pass {0,0,0} if you don't want Doppler.
+ */
+typedef struct {
+    float position[3];
+    float forward[3];
+    float up[3];
+    float velocity[3];
+} JceAudioListener;
+
+/* Update the (single) listener.  Safe to call every frame. */
+JCE_API void jce_audio_set_listener(JceAudio *audio,
+                                     const JceAudioListener *l);
+
+/* Global Doppler factor.  1.0 = realistic, 0.0 = disabled. */
+JCE_API void jce_audio_set_doppler_factor(JceAudio *audio, float factor);
+
+/* Distance attenuation models — matches miniaudio. */
+typedef enum {
+    JCE_AUDIO_ATTEN_NONE        = 0,
+    JCE_AUDIO_ATTEN_INVERSE     = 1,  /* 1/d falloff (default) */
+    JCE_AUDIO_ATTEN_LINEAR      = 2,
+    JCE_AUDIO_ATTEN_EXPONENTIAL = 3
+} JceAudioAttenuation;
+
+/* Enable / disable spatialisation on a voice.  Voices default to
+ * non-spatial (UI sounds, music) — call this immediately after
+ * jce_audio_play() to make a voice positional. */
+JCE_API void jce_audio_voice_set_3d(JceAudio *audio, JceVoice voice,
+                                     bool spatial);
+
+/* World-space source position. */
+JCE_API void jce_audio_voice_set_position(JceAudio *audio, JceVoice voice,
+                                            float x, float y, float z);
+
+/* World-space source velocity (m/s) — drives Doppler. */
+JCE_API void jce_audio_voice_set_velocity(JceAudio *audio, JceVoice voice,
+                                            float vx, float vy, float vz);
+
+/* Per-voice attenuation parameters.
+ *   min_distance — full volume up to this distance
+ *   max_distance — silent past this distance (NONE/LINEAR);
+ *                   ignored by INVERSE/EXPONENTIAL
+ *   rolloff      — falloff factor (1.0 default).  Higher = quicker
+ *                   attenuation. */
+JCE_API void jce_audio_voice_set_attenuation(JceAudio *audio, JceVoice voice,
+                                               JceAudioAttenuation model,
+                                               float min_distance,
+                                               float max_distance,
+                                               float rolloff);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_AUDIO_H */

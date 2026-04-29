@@ -8,7 +8,7 @@
 #include <jce/ui/jce_imgui_renderer.h>
 
 #include <bgfx/c99/bgfx.h>
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 #include <string.h>
 
 extern "C" {

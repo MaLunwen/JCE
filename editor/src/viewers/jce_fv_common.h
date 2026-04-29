@@ -17,7 +17,7 @@
 #include "jce_file_viewer.h"
 
 #include <ctype.h>
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>

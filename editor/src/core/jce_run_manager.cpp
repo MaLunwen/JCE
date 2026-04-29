@@ -15,6 +15,7 @@
 #include "ui/jce_editor_panels.h"
 
 extern "C" {
+#include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_process.h>
 #include <jce/os/core/jce_timer.h>
 }
@@ -22,7 +23,6 @@ extern "C" {
 #include <cstdio>
 #include <cstring>
 #include <string>
-#include <sys/stat.h>
 
 #include <jce/os/core/jce_defs.h>
 
@@ -37,8 +37,8 @@ static constexpr const char *kExeSuffix = "";
 static bool path_exists(const std::string &p)
 {
     if (p.empty()) return false;
-    struct stat st;
-    return stat(p.c_str(), &st) == 0;
+    return jce_fs_host_exists_file(p.c_str()) ||
+           jce_fs_host_exists_dir(p.c_str());
 }
 
 /* Try `candidate` as-is and (on platforms with an exe suffix) with the

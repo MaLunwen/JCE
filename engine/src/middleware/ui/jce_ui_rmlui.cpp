@@ -12,7 +12,7 @@
  */
 
 #include <jce/os/core/jce_log.h>
-#include <jce/os/core/jce_pak_loader.h>
+#include <jce/resource/jce_pak_loader.h>
 #include <jce/os/platform/jce_input.h>
 #include <jce/renderer/jce_texture.h>
 #include <jce/renderer/jce_views.h>
@@ -511,11 +511,22 @@ void jce_rml_destroy(JceRmlBackend *b)
 {
     if (!b) return;
 
+    /* CRITICAL: Clear global interface pointers BEFORE shutdown to prevent
+     * dangling references in case engine is restarted. */
+    Rml::SetSystemInterface(nullptr);
+    Rml::SetRenderInterface(nullptr);
+    Rml::SetFileInterface(nullptr);
+
+    /* CRITICAL: Rml::Shutdown() walks every document and dispatches
+     * OnDetach() on each registered listener. We must therefore keep
+     * JceRmlEventAdapter instances alive until AFTER Shutdown returns;
+     * otherwise the dispatcher dereferences freed memory (observed as
+     * ACCESS_VIOLATION inside Rml::EventDispatcher::DetachAllEvents). */
+    Rml::Shutdown();
+
     for (auto *adapter : b->event_adapters)
         delete adapter;
     b->event_adapters.clear();
-
-    Rml::Shutdown();
 
     /* Free font data buffers AFTER Rml::Shutdown (FreeType is done). */
     for (void *buf : b->font_data_buffers)

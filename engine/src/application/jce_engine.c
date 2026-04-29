@@ -19,24 +19,20 @@
 #include <stdio.h>
 #include <string.h>
 
-#ifdef SDL_PLATFORM_WINDOWS
-#include <windows.h>
-#endif
-
-#include <jce/application/jce_config.h>
+#include <jce/os/core/jce_config.h>
 #include <jce/application/jce_subsystem.h>
 #include <jce/middleware/audio/jce_audio.h>
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_crash_handler.h>
 #include <jce/os/core/jce_event.h>
 #include <jce/os/core/jce_log.h>
-#include <jce/os/core/jce_pak_loader.h>
+#include <jce/resource/jce_pak_loader.h>
 #include <jce/os/platform/jce_input.h>
 #include <jce/os/platform/jce_single_instance.h>
 #include <jce/os/platform/jce_window.h>
+#include <jce/os/platform/jce_window_modal_loop.h>
 #include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_shaders.h>
-#include <jce/renderer/jce_text.h>
 #include <jce/resource/jce_asset.h>
 
 #include "jce_embedded_assets.h"
@@ -197,14 +193,10 @@ static bool should_render_loading_frame(void)
 /* -- Create -------------------------------------------------------- */
 
 static bool jce_resize_event_watch(void *userdata, SDL_Event *event);
-#ifdef SDL_PLATFORM_WINDOWS
-static bool SDLCALL jce_win32_msg_hook(void *userdata, MSG *msg);
-#endif
+static void jce_modal_tick_cb(void *user);
 
 /* Shared reentrancy / pause atomics for the resize watcher and the
- * Win32 modal-loop timer.  Forward-declared here because the modal
- * timer (defined in the SDL_PLATFORM_WINDOWS block below) references
- * them before the watcher's definition that owns them. */
+ * modal-loop tick callback. */
 static SDL_AtomicInt s_in_render_frame = {0};
 static SDL_AtomicInt s_render_paused = {0};
 
@@ -227,6 +219,7 @@ JceEngine *jce_engine_create(int argc, char *argv[])
     /* Logger + crash handler + config. */
     jce_log_init();
     jce_log_set_thread_name("MAIN");
+    jce_thread_mark_main();
     jce_crash_handler_init();
 
     JceEngine *e = JCE_CALLOC(1, sizeof(*e));
@@ -347,8 +340,7 @@ JceEngine *jce_engine_create(int argc, char *argv[])
 #endif
     if (!e->pak) {
         fatal_msg("Failed to open PAK archive");
-        JCE_FREE(e);
-        return NULL;
+        goto fail;
     }
 
     /* Override window dimensions from app descriptor if set. */
@@ -503,14 +495,12 @@ JceEngine *jce_engine_create(int argc, char *argv[])
     }
 
     /* Register live-resize watcher so resize events are handled even
-       during Windows modal message loops (needed for JNI bridge). */
+       during platform modal message loops (needed for JNI bridge). */
     SDL_AddEventWatch(jce_resize_event_watch, e);
 
-#ifdef SDL_PLATFORM_WINDOWS
     /* Keep rendering while the user holds the title bar / window border
-       even without moving the mouse (modal loop with no resize events). */
-    SDL_SetWindowsMessageHook(jce_win32_msg_hook, e);
-#endif
+       on platforms with a modal sizing loop (Windows). No-op elsewhere. */
+    jce_window_install_modal_tick(jce_modal_tick_cb, e);
 
     jce_engine_reset_frame_clock(e);
 
@@ -521,7 +511,7 @@ fail:
     return NULL;
 }
 
-/* -- Windows modal-loop rendering --------------------------------- */
+/* -- Modal-loop tick callback ------------------------------------- */
 
 /*
  * On Windows, clicking and holding the title bar or window border enters
@@ -529,52 +519,24 @@ fail:
  * this loop, SDL_PollEvent never returns, so the JNI bridge's iterate
  * loop is completely stalled — even if the user doesn't move the mouse.
  *
- * Solution: use SDL_SetWindowsMessageHook to detect WM_ENTERSIZEMOVE /
- * WM_EXITSIZEMOVE, and pump frames via a Win32 timer (~60 fps) that
- * fires inside the modal loop.  The event watch below handles resize
- * events specifically (bgfx reset + viewport update).
+ * The portable jce_window_install_modal_tick() hook (Windows: SetTimer
+ * driven from a SDL_SetWindowsMessageHook) calls back here at ~60 fps
+ * while the modal loop is active; the resize watcher below handles
+ * resize events specifically (bgfx reset + viewport update).
  */
-
-#ifdef SDL_PLATFORM_WINDOWS
-
-#define JCE_MODAL_TIMER_ID   1
-#define JCE_MODAL_TIMER_MS  16   /* ~60 fps */
-
-static JceEngine *g_modal_engine;
-
-static void CALLBACK jce_modal_timer_proc(HWND hwnd, UINT msg,
-                                          UINT_PTR id, DWORD time)
+static void jce_modal_tick_cb(void *user)
 {
-    (void)hwnd; (void)msg; (void)id; (void)time;
-    JceEngine *e = g_modal_engine;
+    JceEngine *e = (JceEngine *)user;
     if (!e || !e->renderer) return;
 
     /* Cooperate with jce_resize_event_watch: only one of the two paths
-     * may be inside begin_frame/end_frame at a time.  Skipping a timer
-     * tick is safe — the next 16 ms tick will pick up. */
+     * may be inside begin_frame/end_frame at a time.  Skipping a tick
+     * is safe — the next 16 ms tick will pick up. */
     if (SDL_GetAtomicInt(&s_in_render_frame) != 0)
         return;
 
     jce_engine_iterate(e);
 }
-
-static bool SDLCALL jce_win32_msg_hook(void *userdata, MSG *msg)
-{
-    JceEngine *e = (JceEngine *)userdata;
-
-    if (msg->message == WM_ENTERSIZEMOVE) {
-        g_modal_engine = e;
-        SetTimer(msg->hwnd, JCE_MODAL_TIMER_ID,
-                 JCE_MODAL_TIMER_MS, jce_modal_timer_proc);
-    } else if (msg->message == WM_EXITSIZEMOVE) {
-        KillTimer(msg->hwnd, JCE_MODAL_TIMER_ID);
-        g_modal_engine = NULL;
-    }
-
-    return true;   /* let SDL process the message */
-}
-
-#endif /* SDL_PLATFORM_WINDOWS */
 
 /* -- Live-resize event watcher ------------------------------------ */
 
@@ -949,10 +911,7 @@ void jce_engine_destroy(JceEngine *e)
 
     SDL_RemoveEventWatch(jce_resize_event_watch, e);
 
-#ifdef SDL_PLATFORM_WINDOWS
-    SDL_SetWindowsMessageHook(NULL, NULL);
-    g_modal_engine = NULL;
-#endif
+    jce_window_uninstall_modal_tick();
 
     if (g_app_desc.exit)
         g_app_desc.exit(g_app_desc.user_data);
@@ -972,14 +931,23 @@ void jce_engine_destroy(JceEngine *e)
     }
 
     if (e->assets)   jce_asset_manager_destroy(e->assets);
+    /* jce_text_shutdown() now runs inside jce_renderer_destroy() before
+     * bgfx_shutdown(), preserving the LIFO contract for any future
+     * GPU-touching cleanup the text subsystem may grow. */
     if (e->renderer) jce_renderer_destroy(e->renderer);
-    jce_text_shutdown();
     if (e->audio)    jce_audio_destroy(e->audio);
     if (e->pak)      jce_pak_close(e->pak);
     if (e->input)    jce_input_destroy(e->input);
     if (e->window)   jce_window_destroy(e->window);
     jce_single_instance_unlock();
     JCE_FREE(e);
+
+    /* SDL_Init pairs with SDL_Quit; perform it after every other subsystem
+     * is gone so OS resources owned by SDL are released last. */
+    SDL_Quit();
+
+    /* Restore default crash handlers after all subsystems are down. */
+    jce_crash_handler_shutdown();
 
     /* Flush and shut down the async log backend (last, so all
        teardown messages are captured). */

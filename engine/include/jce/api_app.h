@@ -14,7 +14,7 @@ extern "C" {
 
 #include <jce/application/jce_app_interface.h>
 #include <jce/application/jce_camera_controller.h>
-#include <jce/application/jce_config.h>
+#include <jce/os/core/jce_config.h>
 #include <jce/application/jce_engine.h>
 #include <jce/application/jce_screenshot.h>
 #include <jce/application/jce_subsystem.h>

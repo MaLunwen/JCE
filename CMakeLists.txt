@@ -172,6 +172,7 @@ find_package(PhysFS       REQUIRED)
 find_package(cJSON        REQUIRED)
 find_package(box2d        REQUIRED)
 find_package(Bullet       REQUIRED)
+find_package(recastnavigation REQUIRED)
 find_package(enet         REQUIRED)
 find_package(protobuf     REQUIRED)
 
@@ -354,13 +355,15 @@ if(NOT JCE_SHADER_PROFILES)
 	elseif(JCE_PLATFORM_MACOS OR JCE_PLATFORM_IOS)
 		set(JCE_SHADER_PROFILES mtl spv)
 	elseif(JCE_PLATFORM_ANDROID)
-		set(JCE_SHADER_PROFILES essl spv)
+		# essl1 = GLES2 fallback (P3-34) for legacy mobile.
+		set(JCE_SHADER_PROFILES essl essl1 spv)
 	elseif(JCE_PLATFORM_WEB)
-		set(JCE_SHADER_PROFILES essl)
+		# essl1 = WebGL1 fallback (P3-34).
+		set(JCE_SHADER_PROFILES essl essl1)
 	elseif(JCE_PLATFORM_LINUX)
 		set(JCE_SHADER_PROFILES spv glsl)
 	else()
-		set(JCE_SHADER_PROFILES dx11 spv glsl essl mtl)
+		set(JCE_SHADER_PROFILES dx11 spv glsl essl essl1 mtl)
 	endif()
 endif()
 message(STATUS "JCE shader profiles: ${JCE_SHADER_PROFILES}")
@@ -368,7 +371,7 @@ message(STATUS "JCE shader profiles: ${JCE_SHADER_PROFILES}")
 # Build a list of `--exclude-suffix _<sfx>.bin` flags for jce_pak so
 # that any *stale* shader binaries left in the shared output dir (from
 # a previous build for another platform) are not packed into the .pak.
-set(_all_shader_suffixes dx11 spv glsl essl mtl)
+set(_all_shader_suffixes dx11 spv glsl essl essl1 mtl)
 set(JCE_PAK_SHADER_EXCLUDE_FLAGS "")
 foreach(_sfx IN LISTS _all_shader_suffixes)
 	if(NOT _sfx IN_LIST JCE_SHADER_PROFILES)
@@ -403,6 +406,48 @@ jce_compile_shaders(
 	VARYING_DEF   "varying_postfx.def.sc"
 	OUTPUT_DIR    "${JCE_SHADER_OUTPUT_DIR}"
 	OUT_FILES_VAR COMPILED_POSTFX_SHADER_FILES)
+
+jce_compile_shaders(
+	TARGET        CompileShadersParticles
+	SHADER_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/particles"
+	VARYING_DEF   "varying_particles.def.sc"
+	OUTPUT_DIR    "${JCE_SHADER_OUTPUT_DIR}"
+	OUT_FILES_VAR COMPILED_PARTICLES_SHADER_FILES)
+
+jce_compile_shaders(
+	TARGET        CompileShadersDecals
+	SHADER_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/decals"
+	VARYING_DEF   "varying_decals.def.sc"
+	OUTPUT_DIR    "${JCE_SHADER_OUTPUT_DIR}"
+	OUT_FILES_VAR COMPILED_DECALS_SHADER_FILES)
+
+jce_compile_shaders(
+	TARGET        CompileShadersWeather
+	SHADER_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/weather"
+	VARYING_DEF   "varying_weather.def.sc"
+	OUTPUT_DIR    "${JCE_SHADER_OUTPUT_DIR}"
+	OUT_FILES_VAR COMPILED_WEATHER_SHADER_FILES)
+
+jce_compile_shaders(
+	TARGET        CompileShadersSSAO
+	SHADER_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/ssao"
+	VARYING_DEF   "varying_ssao.def.sc"
+	OUTPUT_DIR    "${JCE_SHADER_OUTPUT_DIR}"
+	OUT_FILES_VAR COMPILED_SSAO_SHADER_FILES)
+
+jce_compile_shaders(
+	TARGET        CompileShadersSSR
+	SHADER_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/ssr"
+	VARYING_DEF   "varying_ssr.def.sc"
+	OUTPUT_DIR    "${JCE_SHADER_OUTPUT_DIR}"
+	OUT_FILES_VAR COMPILED_SSR_SHADER_FILES)
+
+jce_compile_shaders(
+	TARGET        CompileShadersVolFog
+	SHADER_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/volfog"
+	VARYING_DEF   "varying_volfog.def.sc"
+	OUTPUT_DIR    "${JCE_SHADER_OUTPUT_DIR}"
+	OUT_FILES_VAR COMPILED_VOLFOG_SHADER_FILES)
 
 # ------------------------------------------------------------------ #
 # Host packer tool: jce_pak                                           #
@@ -536,7 +581,7 @@ if(JCE_ENABLE_ASSET_COOKING AND NOT CMAKE_CROSSCOMPILING)
 		DEPENDS    jce_cook ${ENGINE_ASSET_FILES} ${GAME_ASSET_FILES}
 		           ${ENGINE_UI_FILES} ${GAME_UI_FILES}
 		           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES}
-		           ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES}
+		           ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES} ${COMPILED_PARTICLES_SHADER_FILES} ${COMPILED_DECALS_SHADER_FILES} ${COMPILED_WEATHER_SHADER_FILES} ${COMPILED_SSAO_SHADER_FILES} ${COMPILED_SSR_SHADER_FILES} ${COMPILED_VOLFOG_SHADER_FILES}
 		           "${GAME_ICON_FILE}" "${TPL_SRC_FILE}"
 		COMMENT    "Cooking game assets (textures/audio → .jceasset)"
 		VERBATIM)
@@ -565,15 +610,15 @@ if(JCE_ENABLE_ASSET_COOKING AND NOT CMAKE_CROSSCOMPILING)
 		DEPENDS    jce_cook ${ENGINE_ASSET_FILES} ${EDITOR_ASSET_FILES}
 		           ${ENGINE_UI_FILES}
 		           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES}
-		           ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES}
+		           ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES} ${COMPILED_PARTICLES_SHADER_FILES} ${COMPILED_DECALS_SHADER_FILES} ${COMPILED_WEATHER_SHADER_FILES} ${COMPILED_SSAO_SHADER_FILES} ${COMPILED_SSR_SHADER_FILES} ${COMPILED_VOLFOG_SHADER_FILES}
 		           "${EDITOR_ICON_FILE}" "${TPL_SRC_FILE}"
 		COMMENT    "Cooking editor assets (textures/audio → .jceasset)"
 		VERBATIM)
 
 	add_custom_target(CookGameAssets   DEPENDS "${COOK_GAME_STAMP}")
 	add_custom_target(CookEditorAssets DEPENDS "${COOK_EDITOR_STAMP}")
-	add_dependencies(CookGameAssets   CompileShaders CompileShadersPBR CompileShadersImGui CompileShadersPostFX)
-	add_dependencies(CookEditorAssets CompileShaders CompileShadersPBR CompileShadersImGui CompileShadersPostFX)
+	add_dependencies(CookGameAssets   CompileShaders CompileShadersPBR CompileShadersImGui CompileShadersPostFX CompileShadersParticles CompileShadersDecals CompileShadersWeather CompileShadersSSAO CompileShadersSSR CompileShadersVolFog)
+	add_dependencies(CookEditorAssets CompileShaders CompileShadersPBR CompileShadersImGui CompileShadersPostFX CompileShadersParticles CompileShadersDecals CompileShadersWeather CompileShadersSSAO CompileShadersSSR CompileShadersVolFog)
 
 	# PAK reads from a single cooked dir (engine + app merged).
 	set(_GAME_PAK_RES_FLAGS    --resource-dir "${GAME_COOKED_DIR}")
@@ -686,7 +731,7 @@ add_custom_command(
 	DEPENDS    jce_pak ${ENGINE_ASSET_FILES} ${GAME_ASSET_FILES}
 	           ${ENGINE_UI_FILES} ${GAME_UI_FILES}
 	           "${GAME_ICON_FILE}"
-	           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES} ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES}
+	           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES} ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES} ${COMPILED_PARTICLES_SHADER_FILES} ${COMPILED_DECALS_SHADER_FILES} ${COMPILED_WEATHER_SHADER_FILES} ${COMPILED_SSAO_SHADER_FILES} ${COMPILED_SSR_SHADER_FILES} ${COMPILED_VOLFOG_SHADER_FILES}
 	COMMENT    "Packing game assets -> ${GAME_PAK_FILE}"
 	VERBATIM)
 
@@ -696,7 +741,7 @@ set_source_files_properties(
 	PROPERTIES GENERATED TRUE)
 
 add_custom_target(PackGameAssets DEPENDS "${GAME_STAMP_FILE}")
-add_dependencies(PackGameAssets CompileShaders CompileShadersPBR CompileShadersImGui CompileShadersPostFX)
+add_dependencies(PackGameAssets CompileShaders CompileShadersPBR CompileShadersImGui CompileShadersPostFX CompileShadersParticles CompileShadersDecals CompileShadersWeather CompileShadersSSAO CompileShadersSSR CompileShadersVolFog)
 if(_COOK_GAME_DEP)
 	add_dependencies(PackGameAssets ${_COOK_GAME_DEP})
 endif()
@@ -742,7 +787,7 @@ add_custom_command(
 	COMMAND    "${CMAKE_COMMAND}" -E touch "${EDITOR_STAMP_FILE}"
 	DEPENDS    jce_pak ${ENGINE_ASSET_FILES} ${EDITOR_ASSET_FILES}
 	           ${ENGINE_UI_FILES}
-	           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES} ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES}
+	           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES} ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES} ${COMPILED_PARTICLES_SHADER_FILES} ${COMPILED_DECALS_SHADER_FILES} ${COMPILED_WEATHER_SHADER_FILES} ${COMPILED_SSAO_SHADER_FILES} ${COMPILED_SSR_SHADER_FILES} ${COMPILED_VOLFOG_SHADER_FILES}
 	COMMENT    "Packing editor assets -> ${EDITOR_PAK_FILE}"
 	VERBATIM)
 
@@ -752,7 +797,7 @@ set_source_files_properties(
 	PROPERTIES GENERATED TRUE)
 
 add_custom_target(PackEditorAssets DEPENDS "${EDITOR_STAMP_FILE}")
-add_dependencies(PackEditorAssets CompileShaders CompileShadersPBR CompileShadersImGui CompileShadersPostFX)
+add_dependencies(PackEditorAssets CompileShaders CompileShadersPBR CompileShadersImGui CompileShadersPostFX CompileShadersParticles CompileShadersDecals CompileShadersWeather CompileShadersSSAO CompileShadersSSR CompileShadersVolFog)
 if(_COOK_EDITOR_DEP)
 	add_dependencies(PackEditorAssets ${_COOK_EDITOR_DEP})
 endif()

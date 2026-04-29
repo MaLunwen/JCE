@@ -69,6 +69,11 @@ uint32_t       jce_rml_doc_get_body(JceRmlBackend *b, uint32_t doc_idx);
 typedef void (*jce_rml_event_fn)(uint32_t elem_idx, const char *event_type,
                                  void *ud);
 
+/* Register a listener.  See jce_ui.h::jce_ui_elem_on for the LIFETIME
+ * CONTRACT — `fn` and `ud` MUST outlive the JceRmlBackend.  The backend
+ * stores listener adapters in a vector that is torn down strictly AFTER
+ * Rml::Shutdown() (see jce_rml_destroy), so adapters remain alive while
+ * RmlUi tears down its event dispatchers. */
 void           jce_rml_elem_on(JceRmlBackend *b, uint32_t elem_idx,
                                const char *evt, jce_rml_event_fn fn, void *ud);
 

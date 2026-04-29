@@ -6,7 +6,8 @@
  *
  * Layer: Scene (Layer 5).
  *
- * STATUS: Architecture stub — API surface defined, implementation pending.
+ * STATUS: Implemented — uniform grid backend (used for all index types
+ *         until BVH / octree variants land).
  */
 
 #ifndef JCE_SPACE_PARTITION_H
@@ -55,18 +56,25 @@ typedef struct {
 JCE_API JceSpaceIndex *jce_space_create(const JceSpaceConfig *config);
 JCE_API void           jce_space_destroy(JceSpaceIndex *idx);
 
+/* Clear all objects and (optionally) re-set world bounds without freeing
+ * the index allocation. Cell capacity is preserved across resets, so the
+ * common per-frame "rebuild for culling" pattern avoids a malloc/destroy
+ * cycle. Pass new_bounds = NULL to keep current bounds. */
+JCE_API void           jce_space_reset(JceSpaceIndex *idx,
+                                        const JceAABB *new_bounds);
+
 /* ================================================================== */
 /* Object management                                                   */
 /* ================================================================== */
 
-/* Insert an object with the given AABB.  Returns an opaque handle.
- * user_id is stored and returned in query results. */
-uint32_t jce_space_insert(JceSpaceIndex *idx, JceAABB bounds,
-                           uint32_t user_id);
+/* Insert an object with the given AABB.  Returns an opaque handle
+ * (0 on failure). user_id is stored and returned in query results. */
+JCE_API uint32_t jce_space_insert(JceSpaceIndex *idx, JceAABB bounds,
+                                   uint32_t user_id);
 
 /* Update the AABB of an existing object. */
-void jce_space_update(JceSpaceIndex *idx, uint32_t handle,
-                       JceAABB new_bounds);
+JCE_API void jce_space_update(JceSpaceIndex *idx, uint32_t handle,
+                               JceAABB new_bounds);
 
 /* Remove an object. */
 JCE_API void jce_space_remove(JceSpaceIndex *idx, uint32_t handle);
@@ -97,9 +105,9 @@ typedef struct {
     jce_vec3 point;
 } JceSpaceRayHit;
 
-bool jce_space_raycast(const JceSpaceIndex *idx, jce_vec3 origin,
-                        jce_vec3 direction, float max_dist,
-                        JceSpaceRayHit *out_hit);
+JCE_API bool jce_space_raycast(const JceSpaceIndex *idx, jce_vec3 origin,
+                                jce_vec3 direction, float max_dist,
+                                JceSpaceRayHit *out_hit);
 
 /* ================================================================== */
 /* Statistics                                                          */

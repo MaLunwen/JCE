@@ -1,26 +1,25 @@
 /*
  * jce_editor_file_util.h  Common file I/O helpers for editor code.
  *
- * Two simple functions backed by C stdio for cross-platform I/O:
+ * Two simple functions backed by the engine's host filesystem wrappers
+ * (jce_fs_host_*) so the editor never touches Win32 / POSIX / stdio
+ * directly. Buffers are returned as ED_MALLOC'd memory to keep the
+ * editor's allocator accounting consistent.
  *
  *   void *ed_read_file(path, &out_size)   -- read whole file, caller frees
  *   bool  ed_write_file(path, data, size) -- write buffer to file
- *
- * The editor relies on ED_MALLOC / ED_FREE so the host engine's own
- * filesystem helpers (which return JCE_MALLOC'd buffers) are not used
- * here — that would break the editor's allocator accounting.
  */
 
 #ifndef JCE_EDITOR_FILE_UTIL_H
 #define JCE_EDITOR_FILE_UTIL_H
 
+#include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_json.h>
 
 #include "core/jce_editor_alloc.h"
 
 #include <stdbool.h>
 #include <stddef.h>
-#include <stdio.h>
 #include <string.h>
 
 /* Read an entire file into an ED_MALLOC'd buffer.
@@ -32,28 +31,18 @@ static inline void *ed_read_file(const char *path, size_t *out_size)
     if (out_size) *out_size = 0;
     if (!path) return NULL;
 
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return NULL;
+    size_t n = 0;
+    void *raw = jce_fs_host_read_all(path, &n);
+    if (!raw) return NULL;
 
-    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return NULL; }
-    long file_size = ftell(fp);
-    if (file_size < 0) { fclose(fp); return NULL; }
-    rewind(fp);
+    void *buf = ED_MALLOC(n + 1);
+    if (!buf) { jce_fs_buffer_free(raw); return NULL; }
 
-    void *buf = ED_MALLOC((size_t)file_size + 1);
-    if (!buf) { fclose(fp); return NULL; }
+    if (n > 0) memcpy(buf, raw, n);
+    ((char *)buf)[n] = '\0';
+    jce_fs_buffer_free(raw);
 
-    size_t nread = (file_size > 0)
-        ? fread(buf, 1, (size_t)file_size, fp) : 0;
-    fclose(fp);
-
-    if (nread != (size_t)file_size) {
-        ED_FREE(buf);
-        return NULL;
-    }
-
-    ((char *)buf)[nread] = '\0';  /* sentinel for text use */
-    if (out_size) *out_size = nread;
+    if (out_size) *out_size = n;
     return buf;
 }
 
@@ -62,11 +51,7 @@ static inline bool ed_write_file(const char *path,
                                  const void *data, size_t size)
 {
     if (!path || (!data && size > 0)) return false;
-    FILE *fp = fopen(path, "wb");
-    if (!fp) return false;
-    size_t written = (size > 0) ? fwrite(data, 1, size, fp) : 0;
-    fclose(fp);
-    return written == size;
+    return jce_fs_host_write_all(path, data, size);
 }
 
 /* Serialize a JSON tree to a file and free the tree.
@@ -91,26 +76,20 @@ static inline void *ed_read_file_capped(const char *path,
     if (out_total) *out_total = 0;
     if (!path) return NULL;
 
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return NULL;
+    size_t got = 0, total = 0;
+    void *raw = jce_fs_host_read_capped(path, max_bytes, &got, &total);
+    if (!raw) return NULL;
 
-    if (fseek(fp, 0, SEEK_END) != 0) { fclose(fp); return NULL; }
-    long file_size = ftell(fp);
-    if (file_size < 0) { fclose(fp); return NULL; }
-    rewind(fp);
-    if (out_total) *out_total = (size_t)file_size;
+    if (out_total) *out_total = total;
 
-    size_t read_size = (size_t)file_size;
-    if (read_size > max_bytes) read_size = max_bytes;
+    void *buf = ED_MALLOC(got + 1);
+    if (!buf) { jce_fs_buffer_free(raw); return NULL; }
 
-    void *buf = ED_MALLOC(read_size + 1);
-    if (!buf) { fclose(fp); return NULL; }
+    if (got > 0) memcpy(buf, raw, got);
+    ((char *)buf)[got] = '\0';
+    jce_fs_buffer_free(raw);
 
-    size_t nread = (read_size > 0) ? fread(buf, 1, read_size, fp) : 0;
-    fclose(fp);
-
-    ((char *)buf)[nread] = '\0';
-    if (out_size) *out_size = nread;
+    if (out_size) *out_size = got;
     return buf;
 }
 

@@ -18,6 +18,7 @@
 #include "jce_editor_state_internal.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 /* Forward-declare only the one function we need from scene_render,
    avoiding a full include that creates a cpp-level circular dependency. */
@@ -110,6 +111,11 @@ void clear_scene_entities(void)
     jce_state_clear_selection();
 }
 
+/* When true, jce_state_add_component() omits its per-call INFO log.
+ * Used by the stress-test path to avoid flooding the console with
+ * thousands of identical lines. */
+static bool s_suppress_add_component_log = false;
+
 /* ── Demo scene builder ──────────────────────────────────────────── */
 
 static void demo_set_position(uint32_t id, float x, float y, float z)
@@ -187,6 +193,48 @@ static void build_demo_scene(void)
 
     uint32_t ui = jce_state_create_entity("UI", root);
     jce_state_create_entity("Canvas", ui);
+
+    /* ── Optional stress test (env JCE_STRESS_CUBES=N) ─────────────
+     * Spawns N cubes on a uniform 3D grid centred at origin so we can
+     * benchmark frustum culling, grid persistence, and LOD selection
+     * with a non-trivial entity count. */
+    {
+        const char *env = nullptr;
+        size_t      env_len = 0;
+        if (_dupenv_s((char **)&env, &env_len, "JCE_STRESS_CUBES") == 0 && env) {
+            const long n = strtol(env, nullptr, 10);
+            free((void *)env);
+            if (n > 0 && n <= 200000) {
+                LOG_INFO(LOG_TAG, "stress test: spawning %ld cubes", n);
+                uint32_t stress_root = jce_state_create_entity("Stress Cubes", root);
+
+                /* Cube root of N rounded up so the side length covers all. */
+                int side = 1;
+                while ((long)side * side * side < n) side++;
+                const float spacing = 1.5f;
+                const float origin  = -0.5f * (side - 1) * spacing;
+
+                s_suppress_add_component_log = true;
+                long spawned = 0;
+                for (int x = 0; x < side && spawned < n; x++) {
+                    for (int y = 0; y < side && spawned < n; y++) {
+                        for (int z = 0; z < side && spawned < n; z++) {
+                            uint32_t c = jce_state_create_entity("c", stress_root);
+                            jce_state_add_component(c, JCE_COMP_FLAG_MESH_RENDERER);
+                            demo_set_position(c,
+                                              origin + x * spacing,
+                                              origin + y * spacing,
+                                              origin + z * spacing);
+                            spawned++;
+                        }
+                    }
+                }
+                s_suppress_add_component_log = false;
+                LOG_INFO(LOG_TAG, "stress test: spawned %ld cubes (%dx%dx%d grid)",
+                         spawned, side, side, side);
+            }
+        }
+    }
 }
 
 /* ── Init / Shutdown ─────────────────────────────────────────────── */
@@ -242,7 +290,12 @@ void jce_editor_state_init(void)
            the memset() above — pure churn (~visible as a stray
            "scene destroyed / scene created" pair in startup logs). */
         HistorySuspendScope suspend;
+        /* Suppress per-component "add component …" spam during demo
+         * scene construction.  The single "editor state initialized
+         * (N demo entities)" line below is sufficient. */
+        s_suppress_add_component_log = true;
         build_demo_scene();
+        s_suppress_add_component_log = false;
     }
 
     s.initialized = true;
@@ -887,8 +940,10 @@ void jce_state_add_component(uint32_t entity_id, uint32_t comp_flag)
         return;
     }
 
-    LOG_INFO(LOG_TAG, "add component %s to entity %u",
-             jce_comp_flag_display_name(comp_flag), entity_id);
+    if (!s_suppress_add_component_log) {
+        LOG_INFO(LOG_TAG, "add component %s to entity %u",
+                 jce_comp_flag_display_name(comp_flag), entity_id);
+    }
 }
 
 void jce_state_remove_component(uint32_t entity_id, uint32_t comp_flag)

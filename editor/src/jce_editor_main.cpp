@@ -10,12 +10,14 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 extern "C" {
 #include <jce/application/jce_app_interface.h>
 #include <jce/application/jce_engine.h>
 #include <jce/os/core/jce_allocator.h>
+#include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_timer.h>
 #include <jce/os/platform/jce_window.h>
 #include <jce/renderer/jce_postfx.h>
@@ -59,10 +61,10 @@ static void maybe_log_startup_kpi(void)
 
     const char *startup_log_path = getenv("JCE_KPI_STARTUP_LOG");
     if (startup_log_path && startup_log_path[0]) {
-        FILE *fp = fopen(startup_log_path, "a");
-        if (fp) {
-            fprintf(fp, "startup_ms,%.3f\n", startup_ms);
-            fclose(fp);
+        char line[64];
+        int n = snprintf(line, sizeof(line), "startup_ms,%.3f\n", startup_ms);
+        if (n > 0 && (size_t)n < sizeof(line)) {
+            jce_fs_host_append(startup_log_path, line, (size_t)n);
         }
     }
 
@@ -199,6 +201,38 @@ static bool editor_should_quit(void *ud)
 }
 
 /* ── JCE entry point (engine owns SDL) ─────────────────────────────── */
+
+/* Hot-reload all bgfx shader programs from disk.  Resolves dev_dir from:
+   1. JCE_SHADER_DEV_DIR env var (highest priority)
+   2. <exe_dir>/shaders relative path
+   3. NULL (PAK-only — effectively a no-op reload)
+   Defined here because we have access to the captured JceServices. */
+extern "C" bool jce_editor_reload_shaders(void)
+{
+    if (!g_state.svc || !g_state.svc->renderer || !g_state.svc->pak) {
+        fprintf(stderr, "[editor] reload_shaders: services not ready\n");
+        return false;
+    }
+
+    const char *dev_dir = getenv("JCE_SHADER_DEV_DIR");
+    char inferred[1024];
+    if (!dev_dir || !dev_dir[0]) {
+        if (jce_fs_host_get_base_path(inferred, sizeof(inferred))) {
+            /* base path returns trailing slash; strip it. */
+            size_t n = strlen(inferred);
+            if (n && (inferred[n-1] == '/' || inferred[n-1] == '\\'))
+                inferred[n-1] = '\0';
+            dev_dir = inferred;
+        }
+    }
+
+    bool ok = jce_renderer_reload_shaders_fs(g_state.svc->renderer,
+                                             dev_dir,
+                                             g_state.svc->pak);
+    fprintf(stderr, "[editor] reload_shaders dev_dir=%s -> %s\n",
+            dev_dir ? dev_dir : "(none)", ok ? "ok" : "FAILED");
+    return ok;
+}
 
 extern "C" JceAppDesc editor_app_get_desc(void)
 {

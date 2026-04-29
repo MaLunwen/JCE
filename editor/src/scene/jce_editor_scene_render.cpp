@@ -206,6 +206,49 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     }
 
     s_sr.anim_last_ticks = 0;
+
+    /* Occlusion culler: GPU-query two-pass coherence culling.
+     * Only the 'color' program is needed for the depth-only proxy draw.
+     * The culler silently degrades to always-visible when hardware
+     * occlusion queries are unsupported (ES2 / WebGL1). */
+    {
+        JceShaderSet oc_shaders;
+        memset(&oc_shaders, 0, sizeof(oc_shaders));
+        JceShaderHandle ch = jce_renderer_get_program_color(renderer);
+        oc_shaders.color.idx = ch.idx;
+
+        JceOcclusionConfig oc_cfg = jce_occlusion_config_default();
+        s_sr.occlusion_culler = jce_occlusion_culler_create(&oc_cfg, &oc_shaders);
+        if (!s_sr.occlusion_culler)
+            LOG_WARN(LOG_TAG, "occlusion culler creation failed (culling disabled)");
+    }
+
+    /* World streamer: cooperative mode (no background threads) so bgfx
+       handles are always created on the render/main thread. */
+    {
+        JceScene *scene = jce_state_get_scene();
+        if (scene) {
+            JceFileSystem *fs = jce_fs_create();
+            if (fs) {
+                /* Mount the current working directory so chunks can be
+                   addressed by relative path (e.g. "chunks/c0.jscene"). */
+                jce_fs_mount_dir(fs, "", ".");
+
+                JceWorldStreamConfig wsc = jce_world_stream_config_default();
+                wsc.single_thread = true; /* editor: cooperative, main-thread only */
+
+                JceWorldStreamer *ws = jce_world_streamer_create(&wsc, scene, fs, NULL);
+                if (ws) {
+                    s_sr.world_streamer = ws;
+                    s_sr.stream_fs      = fs;
+                } else {
+                    jce_fs_destroy(fs);
+                    LOG_WARN(LOG_TAG, "world streamer creation failed (streaming disabled)");
+                }
+            }
+        }
+    }
+
     s_sr.initialized = true;
     LOG_INFO(LOG_TAG, "editor scene renderer initialized (engine-backed)");
     return true;
@@ -255,12 +298,31 @@ void jce_editor_scene_render_shutdown(void)
         jce_uniform_destroy(s_sr.u_light_color);
 
     s_sr.initialized = false;
+
+    if (s_sr.world_streamer) {
+        jce_world_streamer_destroy(s_sr.world_streamer);
+        s_sr.world_streamer = NULL;
+    }
+    if (s_sr.stream_fs) {
+        jce_fs_destroy(s_sr.stream_fs);
+        s_sr.stream_fs = NULL;
+    }
+    if (s_sr.occlusion_culler) {
+        jce_occlusion_culler_destroy(s_sr.occlusion_culler);
+        s_sr.occlusion_culler = NULL;
+    }
+
     LOG_INFO(LOG_TAG, "editor scene renderer shutdown");
 }
 
 JceSceneRenderer *jce_editor_get_scene_renderer(void)
 {
     return s_sr.scene_renderer;
+}
+
+JceWorldStreamer *jce_editor_get_world_streamer(void)
+{
+    return s_sr.world_streamer;
 }
 
 /* ── Per-frame ────────────────────────────────────────────────────── */
@@ -355,10 +417,26 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     };
     cfg.on_after_sky_ud = nullptr;
 
+    /* Broadphase frustum culling — uniform-grid backed. Stats appear in
+     * the Profiler panel under "Scene Culling". Approximate AABBs derived
+     * from transform position + scale; precise mesh AABBs are a TODO. */
+    cfg.frustum_culling = true;
+
+    /* Two-pass GPU-query occlusion culling. Falls back to always-visible
+     * when hardware queries are unsupported (ES2/WebGL1). */
+    cfg.occlusion_culler = s_sr.occlusion_culler;
+
     JceScene *scene = jce_state_get_scene();
     if (scene && s_sr.scene_renderer) {
         jce_scene_renderer_render(s_sr.scene_renderer, scene, s_sr.camera,
                                   scene_view_id(), dt_sec, &cfg);
+    }
+
+    /* Tick the world streamer each frame so pending chunk loads are applied
+       to the scene synchronously on the main/render thread. */
+    if (s_sr.world_streamer) {
+        jce_vec3 cam_pos = jce_camera_get_position(s_sr.camera);
+        jce_world_streamer_update(s_sr.world_streamer, cam_pos);
     }
 
     /* ── 0.5.7 ordering: scene → overlays → PostFX ─────────────────────

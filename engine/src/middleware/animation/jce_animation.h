@@ -11,7 +11,7 @@
 #ifndef JCE_ANIMATION_H
 #define JCE_ANIMATION_H
 
-#include <jce/middleware/animation/jce_skeleton.h>
+#include <jce/renderer/jce_skeleton.h>
 #include <jce/os/core/jce_math.h>
 
 #include <stdbool.h>

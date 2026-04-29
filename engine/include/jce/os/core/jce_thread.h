@@ -64,6 +64,25 @@ JCE_API void JCE_CALL jce_thread_join(JceThread *t);
 /* Cross-platform sleep for the calling thread. Uses SDL3 internally. */
 JCE_API void JCE_CALL jce_thread_sleep_ms(uint32_t ms);
 
+/* ── Current thread id / main-thread tracking ──────────────────────
+ *
+ * Helper used by debug-only invariants (e.g., "this slot must only be
+ * mutated from the main thread").  Implementation is cross-platform
+ * via SDL3.  Cost: single TLS load.
+ *
+ *   jce_thread_mark_main()     Records the calling thread as the
+ *                               application main thread.  Should be
+ *                               called once near engine startup.
+ *   jce_thread_is_main()       Returns true if the caller is the same
+ *                               thread that called jce_thread_mark_main().
+ *                               Returns true if mark was never called
+ *                               (treated as single-threaded).
+ *   jce_thread_current_id()    Returns the OS-level thread id of the
+ *                               caller (opaque, comparable). */
+JCE_API void     JCE_CALL jce_thread_mark_main(void);
+JCE_API bool     JCE_CALL jce_thread_is_main(void);
+JCE_API uint64_t JCE_CALL jce_thread_current_id(void);
+
 /* ================================================================== */
 /* Atomic primitives                                                   */
 /*                                                                     */

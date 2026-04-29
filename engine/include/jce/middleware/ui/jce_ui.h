@@ -144,8 +144,28 @@ JCE_API JceUIElementHandle jce_ui_doc_get_body(JceUIContext *ctx, JceUIDocHandle
 typedef void (*jce_ui_event_fn)(JceUIElementHandle elem, const char *event_type,
                                 void *userdata);
 
-void jce_ui_elem_on(JceUIContext *ctx, JceUIElementHandle elem,
-                    const char *event_type, jce_ui_event_fn fn, void *userdata);
+/**
+ * Register an event listener on a UI element.
+ *
+ * LIFETIME CONTRACT (read carefully — violations cause use-after-free at
+ * shutdown, observed historically as ACCESS_VIOLATION inside RmlUi's
+ * Rml::EventDispatcher::DetachAllEvents):
+ *
+ *   - The callback `fn` and pointer `userdata` MUST remain valid until
+ *     the owning UI context is destroyed via jce_ui_destroy(), or until
+ *     the element itself is removed.
+ *   - The UI backend does NOT copy `userdata` and does NOT take ownership
+ *     of the pointed-to object.  Passing the address of a stack object
+ *     or a soon-to-be-freed heap object will dangle.
+ *   - There is currently no public unregister API.  Callers must keep
+ *     listener-owned state alive at least until jce_ui_destroy() returns.
+ *   - The backend keeps internal listener adapters alive across
+ *     Rml::Shutdown(), so it is safe for `userdata` to outlive individual
+ *     documents but it MUST outlive the JceUIContext.
+ */
+JCE_API void jce_ui_elem_on(JceUIContext *ctx, JceUIElementHandle elem,
+                            const char *event_type, jce_ui_event_fn fn,
+                            void *userdata);
 
 /* ================================================================== */
 /* Per-frame update & render                                           */

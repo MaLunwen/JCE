@@ -20,7 +20,7 @@
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/os/core/jce_timer.h>
-#include <jce/os/core/jce_pak_loader.h>
+#include <jce/resource/jce_pak_loader.h>
 #include <jce/renderer/jce_mesh.h>
 #include <jce/renderer/jce_model.h>
 #include <jce/renderer/jce_text.h>
@@ -36,6 +36,12 @@
 
 #define LOG_TAG "jce_asset"
 #define DEFAULT_MAX_ASSETS 8192
+
+static void fire_asset_error(JceAssetManager *mgr,
+                             const JceAssetSlot *slot,
+                             uint16_t slot_index,
+                             JceAssetErrorCode code,
+                             const char *detail);
 
 /* ================================================================== */
 /* Helpers                                                             */
@@ -99,7 +105,7 @@ static bool validate_handle(const JceAssetManager *mgr, JceAssetHandle h)
 {
     if (h.index >= mgr->max_assets) return false;
     const JceAssetSlot *slot = &mgr->slots[h.index];
-    return slot->generation == h.generation && slot->ref_count > 0;
+    return slot->generation == h.generation && JCE_SLOT_REF_GET(slot) > 0;
 }
 
 /* ================================================================== */
@@ -215,7 +221,7 @@ void jce_asset_manager_destroy(JceAssetManager *mgr)
 
     /* Free all occupied slots. */
     for (uint32_t i = 0; i < mgr->max_assets; i++) {
-        if (mgr->slots[i].ref_count > 0)
+        if (JCE_SLOT_REF_GET(&mgr->slots[i]) > 0)
             free_slot(mgr, (uint16_t)i);
     }
 
@@ -254,7 +260,7 @@ JceAssetHandle jce_asset_acquire(JceAssetManager *mgr,
     uint16_t existing = jce_registry_find(&mgr->registry, h);
     if (existing != UINT16_MAX) {
         JceAssetSlot *slot = &mgr->slots[existing];
-        slot->ref_count++;
+        JCE_SLOT_REF_INC(slot);
         return (JceAssetHandle){ existing, slot->generation };
     }
 
@@ -277,8 +283,8 @@ JceAssetHandle jce_asset_acquire(JceAssetManager *mgr,
     slot->path_hash  = h;
     slot->path       = path_copy;
     slot->type       = type;
-    slot->ref_count  = 1;
-    slot->state      = JCE_ASSET_STATE_UNLOADED;
+    JCE_SLOT_REF_SET(slot, 1);
+    JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_UNLOADED);
     slot->data       = NULL;
     slot->memory_bytes = 0;
     slot->load_params = sanitize_load_params(params);
@@ -292,8 +298,8 @@ JceAssetHandle jce_asset_acquire(JceAssetManager *mgr,
         slot->path = NULL;
         slot->path_hash = 0;
         slot->type = JCE_ASSET_RAW;
-        slot->state = JCE_ASSET_STATE_UNLOADED;
-        slot->ref_count = 0;
+        JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_UNLOADED);
+        JCE_SLOT_REF_SET(slot, 0);
         slot->data = NULL;
         slot->memory_bytes = 0;
         slot->load_params = JCE_ASSET_LOAD_DEFAULT;
@@ -304,14 +310,14 @@ JceAssetHandle jce_asset_acquire(JceAssetManager *mgr,
     if (inserted != idx) {
         /* Registry already tracks this key; recycle the speculative slot. */
         JceAssetSlot *existing_slot = &mgr->slots[inserted];
-        existing_slot->ref_count++;
+        JCE_SLOT_REF_INC(existing_slot);
 
         JCE_FREE(slot->path);
         slot->path = NULL;
         slot->path_hash = 0;
         slot->type = JCE_ASSET_RAW;
-        slot->state = JCE_ASSET_STATE_UNLOADED;
-        slot->ref_count = 0;
+        JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_UNLOADED);
+        JCE_SLOT_REF_SET(slot, 0);
         slot->data = NULL;
         slot->memory_bytes = 0;
         slot->load_params = JCE_ASSET_LOAD_DEFAULT;
@@ -334,15 +340,17 @@ JceAssetHandle jce_asset_acquire(JceAssetManager *mgr,
     if (sync) {
         load_slot_sync(mgr, slot, asset_path, type, params);
 
-        if (slot->state == JCE_ASSET_STATE_READY) {
+        if (JCE_SLOT_STATE_GET(slot) == JCE_ASSET_STATE_READY) {
             mgr->total_loaded++;
             mgr->total_memory += slot->memory_bytes;
         } else {
             mgr->failed_loads++;
+            fire_asset_error(mgr, slot, idx, JCE_ASSET_ERR_INTERNAL,
+                             "sync load returned non-READY state");
         }
     } else {
         /* Submit to async pool. */
-        slot->state = JCE_ASSET_STATE_QUEUED;
+        JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_QUEUED);
 
         JceAsyncLoadInfo info = {0};
         if (params) {
@@ -378,12 +386,12 @@ void jce_asset_release(JceAssetManager *mgr, JceAssetHandle handle)
     if (!mgr || !validate_handle(mgr, handle)) return;
 
     JceAssetSlot *slot = &mgr->slots[handle.index];
-    if (slot->ref_count > 1) {
-        slot->ref_count--;
+    if (JCE_SLOT_REF_GET(slot) > 1) {
+        JCE_SLOT_REF_DEC(slot);
         return;
     }
 
-    if (slot->state == JCE_ASSET_STATE_READY && mgr->total_loaded > 0)
+    if (JCE_SLOT_STATE_GET(slot) == JCE_ASSET_STATE_READY && mgr->total_loaded > 0)
         mgr->total_loaded--;
     free_slot(mgr, handle.index);
 }
@@ -402,8 +410,8 @@ void jce_asset_reload(JceAssetManager *mgr, JceAssetHandle handle)
         return;
     }
 
-    if (slot->state == JCE_ASSET_STATE_QUEUED ||
-        slot->state == JCE_ASSET_STATE_LOADING) {
+    if (JCE_SLOT_STATE_GET(slot) == JCE_ASSET_STATE_QUEUED ||
+        JCE_SLOT_STATE_GET(slot) == JCE_ASSET_STATE_LOADING) {
         LOG_WARN(LOG_TAG, "reload deferred: asset still loading (%s)", slot->path);
         return;
     }
@@ -418,9 +426,11 @@ void jce_asset_reload(JceAssetManager *mgr, JceAssetHandle handle)
     staged.type = slot->type;
     load_slot_sync(mgr, &staged, slot->path, slot->type, &params);
 
-    if (staged.state != JCE_ASSET_STATE_READY) {
+    if (JCE_SLOT_STATE_GET(&staged) != JCE_ASSET_STATE_READY) {
         destroy_slot_payload(mgr, &staged);
         mgr->failed_loads++;
+        fire_asset_error(mgr, slot, (uint16_t)handle.index,
+                         JCE_ASSET_ERR_INTERNAL, "reload failed");
         LOG_WARN(LOG_TAG, "reload failed, keeping previous asset data: %s",
                  slot->path);
         return;
@@ -432,7 +442,7 @@ void jce_asset_reload(JceAssetManager *mgr, JceAssetHandle handle)
     old_payload.data = slot->data;
     old_payload.memory_bytes = slot->memory_bytes;
 
-    if (slot->state == JCE_ASSET_STATE_READY) {
+    if (JCE_SLOT_STATE_GET(slot) == JCE_ASSET_STATE_READY) {
         if (mgr->total_memory >= slot->memory_bytes)
             mgr->total_memory -= slot->memory_bytes;
         else
@@ -441,7 +451,7 @@ void jce_asset_reload(JceAssetManager *mgr, JceAssetHandle handle)
 
     slot->data = staged.data;
     slot->memory_bytes = staged.memory_bytes;
-    slot->state = JCE_ASSET_STATE_READY;
+    JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_READY);
 
     staged.data = NULL;
     staged.memory_bytes = 0;
@@ -463,14 +473,14 @@ JceAssetState jce_asset_state(const JceAssetManager *mgr,
     if (!mgr || handle.index >= mgr->max_assets) return JCE_ASSET_STATE_UNLOADED;
     const JceAssetSlot *slot = &mgr->slots[handle.index];
     if (slot->generation != handle.generation) return JCE_ASSET_STATE_UNLOADED;
-    return slot->state;
+    return JCE_SLOT_STATE_GET(slot);
 }
 
 uint32_t jce_asset_ref_count(const JceAssetManager *mgr,
                              JceAssetHandle handle)
 {
     if (!mgr || !validate_handle(mgr, handle)) return 0;
-    return mgr->slots[handle.index].ref_count;
+    return (uint32_t)JCE_SLOT_REF_GET(&mgr->slots[handle.index]);
 }
 
 JceAssetType jce_asset_type(const JceAssetManager *mgr,
@@ -493,7 +503,7 @@ void *jce_asset_data(const JceAssetManager *mgr, JceAssetHandle handle)
 {
     if (!mgr || !validate_handle(mgr, handle)) return NULL;
     const JceAssetSlot *slot = &mgr->slots[handle.index];
-    if (slot->state != JCE_ASSET_STATE_READY) return NULL;
+    if (JCE_SLOT_STATE_GET(slot) != JCE_ASSET_STATE_READY) return NULL;
     return slot->data;
 }
 
@@ -503,7 +513,7 @@ JceTexture jce_asset_get_texture(const JceAssetManager *mgr,
     JceTexture invalid = { UINT16_MAX };
     if (!mgr || !validate_handle(mgr, handle)) return invalid;
     const JceAssetSlot *slot = &mgr->slots[handle.index];
-    if (slot->state != JCE_ASSET_STATE_READY ||
+    if (JCE_SLOT_STATE_GET(slot) != JCE_ASSET_STATE_READY ||
         slot->type != JCE_ASSET_TEXTURE || !slot->data)
         return invalid;
     return *(JceTexture *)slot->data;
@@ -514,7 +524,7 @@ JceMesh *jce_asset_get_mesh(const JceAssetManager *mgr,
 {
     if (!mgr || !validate_handle(mgr, handle)) return NULL;
     const JceAssetSlot *slot = &mgr->slots[handle.index];
-    if (slot->state != JCE_ASSET_STATE_READY ||
+    if (JCE_SLOT_STATE_GET(slot) != JCE_ASSET_STATE_READY ||
         slot->type != JCE_ASSET_MESH)
         return NULL;
     return (JceMesh *)slot->data;
@@ -525,7 +535,7 @@ JceModel *jce_asset_get_model(const JceAssetManager *mgr,
 {
     if (!mgr || !validate_handle(mgr, handle)) return NULL;
     const JceAssetSlot *slot = &mgr->slots[handle.index];
-    if (slot->state != JCE_ASSET_STATE_READY ||
+    if (JCE_SLOT_STATE_GET(slot) != JCE_ASSET_STATE_READY ||
         slot->type != JCE_ASSET_MODEL)
         return NULL;
     return (JceModel *)slot->data;
@@ -536,7 +546,7 @@ JceSound jce_asset_get_sound(const JceAssetManager *mgr,
 {
     if (!mgr || !validate_handle(mgr, handle)) return JCE_SOUND_INVALID;
     const JceAssetSlot *slot = &mgr->slots[handle.index];
-    if (slot->state != JCE_ASSET_STATE_READY ||
+    if (JCE_SLOT_STATE_GET(slot) != JCE_ASSET_STATE_READY ||
         slot->type != JCE_ASSET_SOUND || !slot->data)
         return JCE_SOUND_INVALID;
     return *(JceSound *)slot->data;
@@ -547,7 +557,7 @@ JceFont *jce_asset_get_font(const JceAssetManager *mgr,
 {
     if (!mgr || !validate_handle(mgr, handle)) return NULL;
     const JceAssetSlot *slot = &mgr->slots[handle.index];
-    if (slot->state != JCE_ASSET_STATE_READY ||
+    if (JCE_SLOT_STATE_GET(slot) != JCE_ASSET_STATE_READY ||
         slot->type != JCE_ASSET_FONT)
         return NULL;
     return (JceFont *)slot->data;
@@ -560,7 +570,7 @@ const void *jce_asset_get_raw(const JceAssetManager *mgr,
     if (out_size) *out_size = 0;
     if (!mgr || !validate_handle(mgr, handle)) return NULL;
     const JceAssetSlot *slot = &mgr->slots[handle.index];
-    if (slot->state != JCE_ASSET_STATE_READY || !slot->data)
+    if (JCE_SLOT_STATE_GET(slot) != JCE_ASSET_STATE_READY || !slot->data)
         return NULL;
     if (out_size) *out_size = slot->memory_bytes;
     return slot->data;
@@ -610,9 +620,11 @@ uint32_t jce_asset_manager_update(JceAssetManager *mgr,
                     break;
                 }
             } else {
-                slot->state = JCE_ASSET_STATE_FAILED;
+                JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
                 mgr->failed_loads++;
                 LOG_ERROR(LOG_TAG, "async load failed: %s", req->path);
+                fire_asset_error(mgr, slot, (uint16_t)req->slot_index,
+                                 JCE_ASSET_ERR_IO, "async pipeline failure");
             }
         }
 
@@ -654,14 +666,25 @@ uint32_t jce_asset_manager_update(JceAssetManager *mgr,
                     default:                finalize_raw(mgr, slot, req);     break;
                     }
                 } else {
-                    slot->state = JCE_ASSET_STATE_FAILED;
+                    JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
                     mgr->failed_loads++;
+                    fire_asset_error(mgr, slot, (uint16_t)req->slot_index,
+                                     JCE_ASSET_ERR_IO,
+                                     "async pipeline failure (deferred drain)");
                 }
             }
             jce_pool_free_request(req);
             count++;
         }
     }
+
+#if defined(JCE_PROFILER_ENABLED)
+    {
+        uint32_t loaded = mgr->max_assets - mgr->free_count;
+        JCE_PROFILE_PLOT_I("assets.loaded", (int64_t)loaded);
+        JCE_PROFILE_PLOT_I("assets.memory_mb", (int64_t)(mgr->total_memory / (1024 * 1024)));
+    }
+#endif
 
     JCE_PROFILE_ZONE_END;
     return count;
@@ -690,6 +713,23 @@ void jce_asset_manager_stats(const JceAssetManager *mgr,
 /* Pluggable loader registration                                       */
 /* ================================================================== */
 
+static void fire_asset_error(JceAssetManager *mgr,
+                             const JceAssetSlot *slot,
+                             uint16_t slot_index,
+                             JceAssetErrorCode code,
+                             const char *detail)
+{
+    if (!mgr || !mgr->error_fn) return;
+    JceAssetErrorInfo info;
+    info.handle.index      = slot_index;
+    info.handle.generation = slot ? slot->generation : 0;
+    info.type              = slot ? (JceAssetType)slot->type : JCE_ASSET_RAW;
+    info.code              = code;
+    info.path              = (slot && slot->path) ? slot->path : "<unknown>";
+    info.detail            = detail;
+    mgr->error_fn(&info, mgr->error_user);
+}
+
 bool jce_asset_register_loader(JceAssetManager *mgr,
                                JceAssetType type,
                                jce_asset_load_fn load_fn,
@@ -706,4 +746,13 @@ bool jce_asset_register_loader(JceAssetManager *mgr,
     mgr->ext_destroyers[type] = destroy_fn;
     LOG_INFO(LOG_TAG, "registered external loader for type %d", (int)type);
     return true;
+}
+
+void jce_asset_set_error_handler(JceAssetManager *mgr,
+                                 jce_asset_error_fn fn,
+                                 void *user)
+{
+    if (!mgr) return;
+    mgr->error_fn   = fn;
+    mgr->error_user = user;
 }

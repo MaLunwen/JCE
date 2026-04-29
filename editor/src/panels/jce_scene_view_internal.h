@@ -13,7 +13,7 @@
 #include "core/jce_editor_state.h"
 #include "scene/jce_editor_scene_render.h"
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 #include <jce/tools/jce_imgui_internal.h>
 #include <math.h>
 #include <stdio.h>

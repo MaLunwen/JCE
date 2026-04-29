@@ -9,6 +9,7 @@
 #include <jce/middleware/physics/jce_physics.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
+#include <jce/os/core/jce_profiler.h>
 
 #include "jce_physics_internal.h"
 #include "os/core/jce_memory.h"
@@ -149,9 +150,11 @@ void jce_physics_destroy(JcePhysicsWorld *world)
 void jce_physics_step(JcePhysicsWorld *world, float dt)
 {
     if (!world) return;
+    JCE_PROFILE_ZONE_N("Physics::Step");
     jce_bullet_step(world->bullet, dt,
                     world->fixed_timestep,
                     world->max_sub_steps);
+    JCE_PROFILE_ZONE_END;
 }
 
 /* ── Body create / destroy ─────────────────────────────────────────── */
@@ -435,4 +438,88 @@ bool jce_physics_character_is_grounded(const JcePhysicsWorld *world,
     if (!world || !jce_character_valid(ch)) return false;
     return jce_bullet_character_is_grounded(
         (JceBulletWorld *)world->bullet, ch.idx);
+}
+
+/* ── Vehicle controller ───────────────────────────────────────────── */
+
+JceVehicleHandle jce_physics_vehicle_create(JcePhysicsWorld *world,
+                                              const JceVehicleDesc *desc)
+{
+    if (!world || !desc) return JCE_VEHICLE_INVALID;
+    uint16_t group = desc->collision_group ? desc->collision_group
+                                            : JCE_COLLISION_DEFAULT_GROUP;
+    uint16_t mask  = desc->collision_mask  ? desc->collision_mask
+                                            : JCE_COLLISION_ALL_MASK;
+    uint32_t idx = jce_bullet_vehicle_create(world->bullet,
+                                              desc->position, desc->rotation,
+                                              desc->chassis_half_extents,
+                                              desc->chassis_mass,
+                                              desc->max_engine_force,
+                                              desc->max_brake_force,
+                                              desc->max_steering_rad,
+                                              group, mask);
+    return (idx == UINT32_MAX) ? JCE_VEHICLE_INVALID
+                                : (JceVehicleHandle){ idx };
+}
+
+void jce_physics_vehicle_destroy(JcePhysicsWorld *world, JceVehicleHandle veh)
+{
+    if (!world || !jce_vehicle_valid(veh)) return;
+    jce_bullet_vehicle_destroy(world->bullet, veh.idx);
+}
+
+uint32_t jce_physics_vehicle_add_wheel(JcePhysicsWorld *world,
+                                        JceVehicleHandle veh,
+                                        const JceWheelDesc *w)
+{
+    if (!world || !jce_vehicle_valid(veh) || !w) return UINT32_MAX;
+    return jce_bullet_vehicle_add_wheel(world->bullet, veh.idx,
+                                         w->connection_point,
+                                         w->wheel_direction,
+                                         w->wheel_axle,
+                                         w->suspension_rest_len,
+                                         w->wheel_radius,
+                                         w->is_front_wheel,
+                                         w->suspension_stiffness,
+                                         w->suspension_damping,
+                                         w->suspension_compression,
+                                         w->friction_slip,
+                                         w->roll_influence);
+}
+
+void jce_physics_vehicle_set_input(JcePhysicsWorld *world, JceVehicleHandle veh,
+                                    float throttle, float brake, float steer)
+{
+    if (!world || !jce_vehicle_valid(veh)) return;
+    jce_bullet_vehicle_set_input(world->bullet, veh.idx,
+                                  throttle, brake, steer);
+}
+
+void jce_physics_vehicle_get_chassis_transform(const JcePhysicsWorld *world,
+                                                 JceVehicleHandle veh,
+                                                 jce_vec3 *out_pos,
+                                                 jce_quat *out_rot)
+{
+    if (!world || !jce_vehicle_valid(veh)) return;
+    jce_bullet_vehicle_get_chassis_transform(
+        (JceBulletWorld *)world->bullet, veh.idx, out_pos, out_rot);
+}
+
+void jce_physics_vehicle_get_wheel_transform(const JcePhysicsWorld *world,
+                                               JceVehicleHandle veh,
+                                               uint32_t wheel_idx,
+                                               jce_vec3 *out_pos,
+                                               jce_quat *out_rot)
+{
+    if (!world || !jce_vehicle_valid(veh)) return;
+    jce_bullet_vehicle_get_wheel_transform(
+        (JceBulletWorld *)world->bullet, veh.idx, wheel_idx, out_pos, out_rot);
+}
+
+float jce_physics_vehicle_get_speed(const JcePhysicsWorld *world,
+                                     JceVehicleHandle veh)
+{
+    if (!world || !jce_vehicle_valid(veh)) return 0.0f;
+    return jce_bullet_vehicle_get_speed(
+        (JceBulletWorld *)world->bullet, veh.idx);
 }

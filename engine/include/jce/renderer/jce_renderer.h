@@ -19,6 +19,7 @@ typedef struct JceWindow JceWindow;
 typedef struct JceRenderer JceRenderer;
 typedef struct JceCamera JceCamera;
 typedef struct JceShaderSet JceShaderSet;
+typedef struct JcePakArchive JcePakArchive;
 
 /* -- Renderer configuration ---------------------------------------- */
 
@@ -40,6 +41,15 @@ JCE_API JceRenderer *jce_renderer_create(JceWindow *win,  const JceRendererConfi
    and before the first frame. */
 JCE_API void jce_renderer_set_shaders(JceRenderer *r, const JceShaderSet *shaders);
 
+/* Hot-reload all standard shader programs from <dev_dir>/shaders on
+   disk (with PAK fallback per-shader), destroy the previous bgfx
+   programs, and swap in the new set.  Safe to call mid-application;
+   bgfx defers handle destruction to end-of-frame.  Returns true if
+   at least the color program reloaded successfully. */
+JCE_API bool jce_renderer_reload_shaders_fs(JceRenderer        *r,
+                                            const char         *dev_dir,
+                                            const JcePakArchive *pak);
+
 /* Create a safe fallback renderer using SDL_Renderer. */
 JCE_API JceRenderer *jce_renderer_create_fallback(JceWindow *win);
 
@@ -59,8 +69,8 @@ JCE_API void         jce_renderer_begin_frame(const JceRenderer *r, JceWindow *w
 
 /* Begin a frame with a 3D camera on the given view ID.
    Pass NULL camera for 2D ortho fallback on view 0. */
-void         jce_renderer_begin_frame_3d(const JceRenderer *r, JceWindow *win,
-                                          const JceCamera *cam, uint16_t view_id);
+JCE_API void JCE_CALL jce_renderer_begin_frame_3d(const JceRenderer *r, JceWindow *win,
+                                                  const JceCamera *cam, uint16_t view_id);
 
 /* End a frame: submits all queued draw calls to the GPU. */
 JCE_API void         jce_renderer_end_frame(const JceRenderer *r);
@@ -86,8 +96,12 @@ JCE_API void         jce_renderer_rebind_platform(JceRenderer *r, JceWindow *win
 
 /* -- Debug text ----------------------------------------------------- */
 
-void         jce_renderer_dbg_text(uint16_t x, uint16_t y,
-                                   uint8_t attr, const char *fmt, ...);
+JCE_API void JCE_CALL jce_renderer_dbg_text(uint16_t x, uint16_t y,
+                                            uint8_t attr, const char *fmt, ...);
+
+/* va_list variant for FFI bindings that cannot call variadic functions. */
+JCE_API void JCE_CALL jce_renderer_dbg_text_v(uint16_t x, uint16_t y,
+                                              uint8_t attr, const char *fmt, va_list ap);
 
 /* -- Queries (for debug HUD) --------------------------------------- */
 
@@ -95,8 +109,8 @@ JCE_API const char  *jce_renderer_get_backend_name(const JceRenderer *r);
 JCE_API const char  *jce_renderer_get_gpu_name(const JceRenderer *r);
 JCE_API bool         jce_renderer_get_vsync(const JceRenderer *r);
 JCE_API void         jce_renderer_set_vsync(JceRenderer *r, bool enabled);
-void         jce_renderer_set_vsync_for_size(JceRenderer *r, bool enabled,
-                                             uint32_t width, uint32_t height);
+JCE_API void JCE_CALL jce_renderer_set_vsync_for_size(JceRenderer *r, bool enabled,
+                                                      uint32_t width, uint32_t height);
 
 /* -- Shader/uniform accessors (for 3D scene rendering) ------------- */
 
@@ -111,8 +125,10 @@ JCE_API JceShaderHandle  jce_renderer_get_program_mesh(const JceRenderer *r);
 
 /* PBR shader programs. */
 JCE_API JceShaderHandle  jce_renderer_get_program_pbr(const JceRenderer *r);
+JCE_API JceShaderHandle  jce_renderer_get_program_pbr_inst(const JceRenderer *r);
 JCE_API JceShaderHandle  jce_renderer_get_program_pbr_skinned(const JceRenderer *r);
 JCE_API JceShaderHandle  jce_renderer_get_program_shadow(const JceRenderer *r);
+JCE_API JceShaderHandle  jce_renderer_get_program_shadow_inst(const JceRenderer *r);
 JCE_API JceShaderHandle  jce_renderer_get_program_shadow_skinned(const JceRenderer *r);
 JCE_API JceShaderHandle  jce_renderer_get_program_terrain(const JceRenderer *r);
 

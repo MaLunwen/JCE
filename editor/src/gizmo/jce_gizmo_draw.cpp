@@ -11,7 +11,7 @@
 #include "jce_gizmo.h"
 #include "jce_gizmo_internal.h"
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 #include <math.h>
 
 /* ── Color helpers ─────────────────────────────────────────────────── */

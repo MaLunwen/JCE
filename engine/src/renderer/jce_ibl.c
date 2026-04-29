@@ -19,6 +19,7 @@
 #include "os/core/jce_memory.h"
 
 #include <bgfx/c99/bgfx.h>
+#include <SDL3/SDL_iostream.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -201,16 +202,14 @@ JceTexture jce_ibl_create_brdf_lut(uint32_t size)
     snprintf(cache_path, sizeof(cache_path),
              ".jce/cache/brdf_lut_%u.f16", size);
     {
-        FILE *fp = fopen(cache_path, "rb");
-        if (fp) {
-            fseek(fp, 0, SEEK_END);
-            long fsz = ftell(fp);
-            fseek(fp, 0, SEEK_SET);
-            if (fsz == (long)bytes &&
-                fread(data, 1, bytes, fp) == bytes) {
+        SDL_IOStream *io = SDL_IOFromFile(cache_path, "rb");
+        if (io) {
+            Sint64 fsz = SDL_GetIOSize(io);
+            if (fsz == (Sint64)bytes &&
+                SDL_ReadIO(io, data, bytes) == bytes) {
                 from_cache = true;
             }
-            fclose(fp);
+            SDL_CloseIO(io);
         }
     }
 
@@ -250,10 +249,10 @@ JceTexture jce_ibl_create_brdf_lut(uint32_t size)
         /* ── Write cache for next run (best-effort) ─────────────────── */
         jce_fs_host_create_directory(".jce");
         jce_fs_host_create_directory(".jce/cache");
-        FILE *fp = fopen(cache_path, "wb");
-        if (fp) {
-            fwrite(data, 1, bytes, fp);
-            fclose(fp);
+        SDL_IOStream *io = SDL_IOFromFile(cache_path, "wb");
+        if (io) {
+            SDL_WriteIO(io, data, bytes);
+            SDL_CloseIO(io);
         }
     }
 

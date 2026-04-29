@@ -58,6 +58,10 @@ typedef struct {
     void         *loaded_data;
     size_t        loaded_size;
     bool          load_success;
+
+    /* LRU bookkeeping: incremented on every frame this chunk is in
+       load_radius (i.e. "actively used"). Older = better eviction candidate. */
+    uint64_t      last_touch_tick;
 } ChunkRecord;
 
 /* ── Async load job context ────────────────────────────────────────── */
@@ -76,6 +80,10 @@ struct JceStreamingSystem {
     uint32_t           chunk_count;
     uint64_t           memory_used;
 
+    /* LRU / budget bookkeeping. */
+    uint64_t           tick_counter;   /* monotonically increases each update */
+    uint32_t           evicted_count;  /* total LRU evictions across lifetime */
+
     /* External dependencies. */
     JceFileSystem     *fs;
     JceThreadPool     *thread_pool;
@@ -84,7 +92,39 @@ struct JceStreamingSystem {
     JceChunkLoadedFn   on_loaded;
     JceChunkUnloadedFn on_unloaded;
     void              *callback_data;
+
+    /* Pressure / back-pressure (P3-28). */
+    JceStreamingPressure   pressure;
+    JceStreamingPressure   pressure_high_water;
+    uint32_t               refused_loads;
+    JceStreamingPressureFn pressure_cb;
+    void                  *pressure_cb_user;
 };
+
+/* Soft threshold: we enter SOFT pressure at 85% of budget. */
+#define JCE_STREAMING_SOFT_THRESHOLD 0.85f
+
+static JceStreamingPressure compute_pressure(uint64_t used, uint64_t budget)
+{
+    if (budget == 0) return JCE_STREAM_PRESSURE_OK;
+    if (used >= budget)                                       return JCE_STREAM_PRESSURE_HARD;
+    if ((double)used >= (double)budget * JCE_STREAMING_SOFT_THRESHOLD)
+        return JCE_STREAM_PRESSURE_SOFT;
+    return JCE_STREAM_PRESSURE_OK;
+}
+
+static void update_pressure(JceStreamingSystem *sys, uint64_t budget_bytes)
+{
+    JceStreamingPressure now = compute_pressure(sys->memory_used, budget_bytes);
+    if (now > sys->pressure_high_water) sys->pressure_high_water = now;
+    if (now != sys->pressure) {
+        JceStreamingPressure prev = sys->pressure;
+        sys->pressure = now;
+        if (sys->pressure_cb)
+            sys->pressure_cb(prev, now, sys->memory_used, budget_bytes,
+                             sys->pressure_cb_user);
+    }
+}
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
 
@@ -241,6 +281,52 @@ static void unload_chunk(JceStreamingSystem *sys, ChunkRecord *c)
     c->data_size = 0;
     c->state = JCE_CHUNK_UNLOADED;
     c->estimated_size = 0;
+}
+
+/* ── LRU eviction ─────────────────────────────────────────────────── *
+ *
+ * Evict loaded chunks that are *outside* the load radius until either:
+ *   - memory_used <= budget_bytes, or
+ *   - no eligible candidate remains.
+ *
+ * "Eligible" = LOADED state + distance to camera > load_radius.  Chunks
+ * still inside load_radius are considered "actively in use" and are
+ * never evicted by LRU pressure (avoids visible pop-out under camera).
+ *
+ * Selection: smallest last_touch_tick (least-recently-used).
+ */
+static uint32_t evict_lru_for_budget(JceStreamingSystem *sys,
+                                     jce_vec3            camera_pos,
+                                     uint64_t            budget_bytes,
+                                     float               load_r2)
+{
+    if (budget_bytes == 0) return 0;
+
+    uint32_t evicted = 0;
+    while (sys->memory_used > budget_bytes) {
+        ChunkRecord *victim = NULL;
+        uint64_t     oldest = UINT64_MAX;
+
+        for (uint32_t i = 0; i < sys->chunk_count; i++) {
+            ChunkRecord *c = &sys->chunks[i];
+            if (!c->registered) continue;
+            if (c->state != JCE_CHUNK_LOADED) continue;
+            if (dist_sq(camera_pos, c->center) <= load_r2) continue;
+            if (c->last_touch_tick < oldest) {
+                oldest = c->last_touch_tick;
+                victim = c;
+            }
+        }
+        if (!victim) break;  /* nothing left to evict */
+
+        sys->memory_used -= victim->estimated_size;
+        unload_chunk(sys, victim);
+        sys->evicted_count++;
+        evicted++;
+        LOG_DEBUG(LOG_TAG, "LRU evicted chunk %u (tick=%llu)",
+                  victim->chunk_id, (unsigned long long)oldest);
+    }
+    return evicted;
 }
 
 /* ── Create / Destroy ─────────────────────────────────────────────── */
@@ -403,6 +489,8 @@ void jce_streaming_update(JceStreamingSystem *sys, jce_vec3 camera_pos)
     float unload_r2 = sys->config.unload_radius * sys->config.unload_radius;
     uint64_t budget_bytes = (uint64_t)sys->config.budget_mb * 1024ULL * 1024ULL;
 
+    sys->tick_counter++;
+
     uint32_t loads_this_frame   = 0;
     uint32_t pending_count      = 0;
 
@@ -412,12 +500,24 @@ void jce_streaming_update(JceStreamingSystem *sys, jce_vec3 camera_pos)
 
         float d2 = dist_sq(camera_pos, c->center);
 
+        /* Touch in-radius loaded chunks so LRU keeps them resident. */
+        if (c->state == JCE_CHUNK_LOADED && d2 <= load_r2)
+            c->last_touch_tick = sys->tick_counter;
+
         switch (c->state) {
         case JCE_CHUNK_UNLOADED:
             /* Should we load this chunk? */
             if (d2 <= load_r2 &&
-                pending_count + loads_this_frame < sys->config.max_pending &&
-                (budget_bytes == 0 || sys->memory_used < budget_bytes)) {
+                pending_count + loads_this_frame < sys->config.max_pending) {
+
+                /* Try to make room via LRU before refusing. */
+                if (budget_bytes != 0 && sys->memory_used >= budget_bytes)
+                    evict_lru_for_budget(sys, camera_pos, budget_bytes, load_r2);
+
+                if (budget_bytes != 0 && sys->memory_used >= budget_bytes) {
+                    sys->refused_loads++;
+                    break;  /* still over budget — defer to next frame */
+                }
 
                 c->state = JCE_CHUNK_LOADING;
 
@@ -471,6 +571,11 @@ void jce_streaming_update(JceStreamingSystem *sys, jce_vec3 camera_pos)
                 break;  /* resume next frame */
         }
     }
+
+    /* End-of-tick: reclassify pressure based on final memory_used.
+     * Fires the optional callback only on level transitions. */
+    update_pressure(sys, budget_bytes);
+
     JCE_PROFILE_ZONE_END;
 }
 
@@ -503,6 +608,45 @@ uint32_t jce_streaming_pending_count(const JceStreamingSystem *sys)
 uint64_t jce_streaming_memory_used(const JceStreamingSystem *sys)
 {
     return sys ? sys->memory_used : 0;
+}
+
+uint32_t jce_streaming_evicted_count(const JceStreamingSystem *sys)
+{
+    return sys ? sys->evicted_count : 0;
+}
+
+JceStreamingPressure jce_streaming_get_pressure(const JceStreamingSystem *sys)
+{
+    return sys ? sys->pressure : JCE_STREAM_PRESSURE_OK;
+}
+
+JceStreamingPressure jce_streaming_pressure_high_water(const JceStreamingSystem *sys)
+{
+    return sys ? sys->pressure_high_water : JCE_STREAM_PRESSURE_OK;
+}
+
+const char *jce_streaming_pressure_name(JceStreamingPressure p)
+{
+    switch (p) {
+    case JCE_STREAM_PRESSURE_OK:   return "OK";
+    case JCE_STREAM_PRESSURE_SOFT: return "SOFT";
+    case JCE_STREAM_PRESSURE_HARD: return "HARD";
+    default:                       return "?";
+    }
+}
+
+uint32_t jce_streaming_refused_loads(const JceStreamingSystem *sys)
+{
+    return sys ? sys->refused_loads : 0;
+}
+
+void jce_streaming_set_pressure_callback(JceStreamingSystem    *sys,
+                                          JceStreamingPressureFn fn,
+                                          void                  *user)
+{
+    if (!sys) return;
+    sys->pressure_cb      = fn;
+    sys->pressure_cb_user = user;
 }
 
 bool jce_streaming_chunk_loaded(const JceStreamingSystem *sys,

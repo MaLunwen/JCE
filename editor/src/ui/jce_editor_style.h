@@ -11,7 +11,7 @@
 extern "C" {
 #endif
 
-#include <jce/os/core/jce_pak_loader.h>
+#include <jce/resource/jce_pak_loader.h>
 
 /* Theme indices. */
 #define JCE_THEME_DARK   0

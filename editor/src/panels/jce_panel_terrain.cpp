@@ -17,7 +17,7 @@
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 extern "C" {
 #include <jce/middleware/scene/jce_terrain.h>
 }

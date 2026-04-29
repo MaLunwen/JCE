@@ -7,7 +7,7 @@
 #include "jce_editor_i18n.h"
 #include "jce_editor_state.h"
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 #include <cmath>
 #include <cstdio>
 #include <cstring>

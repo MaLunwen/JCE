@@ -2,6 +2,8 @@
  * jce_panel_assets_grid.cpp  Grid item rendering, item context menu, empty area menu.
  */
 
+#include <jce/os/core/jce_path.h>
+
 #include "io/jce_editor_file_util.h"
 #include "jce_panel_assets_internal.h"
 
@@ -119,12 +121,20 @@ void draw_asset_grid_item(const FileEntry &fe, int index,
                             | ImGuiInputTextFlags_AutoSelectAll))
         {
             try {
-                fs::path old_p(fe.path);
-                fs::path new_p = old_p.parent_path() / s_assets.rename_buf;
-                fs::rename(old_p, new_p);
-                jce_editor_console_log("Renamed '%s' -> '%s'",
-                    fe.name.c_str(), s_assets.rename_buf);
-                s_assets.needs_refresh = true;
+                char parent[1024];
+                jce_path_parent(parent, sizeof(parent), fe.path.c_str());
+                
+                char new_path[1024];
+                jce_path_join(new_path, sizeof(new_path), parent, s_assets.rename_buf);
+                
+                if (jce_fs_host_rename(fe.path.c_str(), new_path)) {
+                    jce_editor_console_log("Renamed '%s' -> '%s'",
+                        fe.name.c_str(), s_assets.rename_buf);
+                    s_assets.needs_refresh = true;
+                } else {
+                    jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                        "Rename failed");
+                }
             } catch (const std::exception &e) {
                 jce_editor_console_log_level(JCE_CONSOLE_ERROR,
                     "Rename failed: %s", e.what());
@@ -430,12 +440,20 @@ void draw_asset_details_list(const std::vector<FileEntry> &display_entries,
                                  | ImGuiInputTextFlags_AutoSelectAll))
             {
                 try {
-                    fs::path old_p(fe.path);
-                    fs::path new_p = old_p.parent_path() / s_assets.rename_buf;
-                    fs::rename(old_p, new_p);
-                    jce_editor_console_log("Renamed '%s' -> '%s'",
-                                           fe.name.c_str(), s_assets.rename_buf);
-                    s_assets.needs_refresh = true;
+                    char parent[1024];
+                    jce_path_parent(parent, sizeof(parent), fe.path.c_str());
+                    
+                    char new_path[1024];
+                    jce_path_join(new_path, sizeof(new_path), parent, s_assets.rename_buf);
+                    
+                    if (jce_fs_host_rename(fe.path.c_str(), new_path)) {
+                        jce_editor_console_log("Renamed '%s' -> '%s'",
+                                               fe.name.c_str(), s_assets.rename_buf);
+                        s_assets.needs_refresh = true;
+                    } else {
+                        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                                                     "Rename failed");
+                    }
                 } catch (const std::exception &e) {
                     jce_editor_console_log_level(JCE_CONSOLE_ERROR,
                                                  "Rename failed: %s", e.what());
@@ -566,10 +584,14 @@ void draw_asset_item_context_menu(const std::vector<FileEntry> &display_entries)
 
         if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInTerminal"))) {
             if (cfe) {
-                std::string dir = cfe->is_dir
-                    ? cfe->path
-                    : fs::path(cfe->path).parent_path().string();
-                jce_host_open_terminal(dir.c_str());
+                std::string dir = cfe->is_dir ? cfe->path : std::string();
+                if (!cfe->is_dir) {
+                    char parent[1024];
+                    if (jce_path_parent(parent, sizeof(parent), cfe->path.c_str()))
+                        dir = parent;
+                }
+                if (!dir.empty())
+                    jce_host_open_terminal(dir.c_str());
             }
         }
 
@@ -659,36 +681,39 @@ void draw_asset_empty_area_menu(void)
     {
         if (ImGui::BeginMenu(jce_editor_i18n("assetBrowser.create"))) {
             if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.newFolder"))) {
-                try {
-                    fs::path nf = fs::path(s_assets.current_path) / "New Folder";
-                    int cnt = 1;
-                    while (fs::exists(nf)) {
-                        char name[64];
-                        snprintf(name, sizeof(name), "New Folder %d", cnt++);
-                        nf = fs::path(s_assets.current_path) / name;
-                    }
-                    fs::create_directory(nf);
-                    jce_editor_console_log("Created '%s'", nf.filename().string().c_str());
+                char base_name[256] = "New Folder";
+                char nf[1024];
+                jce_path_join(nf, sizeof(nf), s_assets.current_path.c_str(), base_name);
+                
+                int cnt = 1;
+                while (jce_fs_host_exists_dir(nf) || jce_fs_host_exists_file(nf)) {
+                    char name[64];
+                    snprintf(name, sizeof(name), "New Folder %d", cnt++);
+                    jce_path_join(nf, sizeof(nf), s_assets.current_path.c_str(), name);
+                }
+                
+                if (jce_fs_host_create_directory(nf)) {
+                    char basename[256];
+                    jce_path_basename(basename, sizeof(basename), nf);
+                    jce_editor_console_log("Created '%s'", basename);
                     s_assets.needs_refresh = true;
-                } catch (const std::exception &e) {
+                } else {
                     jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-                        "New folder: %s", e.what());
+                        "New folder failed");
                 }
             }
             ImGui::Separator();
             if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.newScene"))) {
-                try {
-                    fs::path nf = fs::path(s_assets.current_path) / "New Scene.scene";
-                    ed_write_file(nf.string().c_str(), "{}", 2);
-                    s_assets.needs_refresh = true;
-                } catch (...) {}
+                char nf[1024];
+                jce_path_join(nf, sizeof(nf), s_assets.current_path.c_str(), "New Scene.scene");
+                ed_write_file(nf, "{}", 2);
+                s_assets.needs_refresh = true;
             }
             if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.newScript"))) {
-                try {
-                    fs::path nf = fs::path(s_assets.current_path) / "NewScript.c";
-                    ed_write_file(nf.string().c_str(), "/* New Script */\n", 17);
-                    s_assets.needs_refresh = true;
-                } catch (...) {}
+                char nf[1024];
+                jce_path_join(nf, sizeof(nf), s_assets.current_path.c_str(), "NewScript.c");
+                ed_write_file(nf, "/* New Script */\n", 17);
+                s_assets.needs_refresh = true;
             }
             ImGui::EndMenu();
         }

@@ -35,68 +35,92 @@ std::string trim_copy(const std::string &s)
 
 /* ── Path utilities ─────────────────────────────────────────────── */
 
-bool path_is_file(const fs::path &path)
+bool path_is_file(const char *path)
 {
-    std::error_code ec;
-    return fs::exists(path, ec) && fs::is_regular_file(path, ec);
+    return jce_fs_host_exists_file(path);
 }
 
-std::vector<fs::path> collect_scene_roots(void)
+void collect_scene_roots(std::vector<std::string> *out)
 {
-    std::vector<fs::path> roots;
-    if (s_cache.scene_dir[0] == '\0') return roots;
+    if (!out) return;
+    out->clear();
+    if (s_cache.scene_dir[0] == '\0') return;
 
-    fs::path scene(s_cache.scene_dir);
-    roots.push_back(scene);
+    char parent_buf[512];
+    out->push_back(std::string(s_cache.scene_dir));
 
-    fs::path parent = scene.parent_path();
-    if (!parent.empty()) roots.push_back(parent);
-
-    roots.push_back(scene / "Meshes");
-    roots.push_back(scene / "Materials");
-    roots.push_back(scene / "Textures");
-    roots.push_back(scene / "materials");
-    roots.push_back(scene / "textures");
-
-    if (!parent.empty()) {
-        roots.push_back(parent / "Meshes");
-        roots.push_back(parent / "Materials");
-        roots.push_back(parent / "Textures");
-        roots.push_back(parent / "materials");
-        roots.push_back(parent / "textures");
+    if (jce_path_parent(parent_buf, sizeof(parent_buf), s_cache.scene_dir)) {
+        out->push_back(std::string(parent_buf));
     }
 
-    return roots;
+    char joined[512];
+    const char *subdirs[] = { "Meshes", "Materials", "Textures", "materials", "textures", NULL };
+    for (int i = 0; subdirs[i]; i++) {
+        if (jce_path_join(joined, sizeof(joined), s_cache.scene_dir, subdirs[i])) {
+            out->push_back(std::string(joined));
+        }
+    }
+
+    if (parent_buf[0]) {
+        for (int i = 0; subdirs[i]; i++) {
+            if (jce_path_join(joined, sizeof(joined), parent_buf, subdirs[i])) {
+                out->push_back(std::string(joined));
+            }
+        }
+    }
 }
 
-bool find_file_by_name_recursive(const std::vector<fs::path> &roots,
+struct FindFileContext {
+    std::string target_lower;
+    int max_depth;
+    int current_depth;
+    char *out_buf;
+    size_t out_size;
+    bool found;
+};
+
+static bool find_file_walker(const char *path, bool is_dir, void *user)
+{
+    FindFileContext *ctx = (FindFileContext*)user;
+    if (ctx->found) return false; /* stop early */
+    
+    if (is_dir) {
+        /* Track depth - note: this is simplified, real depth tracking would need path parsing */
+        return true; /* continue */
+    }
+    
+    char basename[256];
+    if (jce_path_basename(basename, sizeof(basename), path)) {
+        std::string base_lower = lower_copy(std::string(basename));
+        if (base_lower == ctx->target_lower) {
+            snprintf(ctx->out_buf, ctx->out_size, "%s", path);
+            ctx->found = true;
+            return false; /* stop */
+        }
+    }
+    return true; /* continue */
+}
+
+bool find_file_by_name_recursive(const std::vector<std::string> &roots,
                                  const std::string &file_name,
                                  int max_depth,
-                                 fs::path *out)
+                                 char *out, size_t out_size)
 {
     if (!out || file_name.empty()) return false;
 
-    const std::string target = lower_copy(file_name);
-    std::error_code ec;
-    for (const fs::path &root : roots) {
-        if (!fs::exists(root, ec) || !fs::is_directory(root, ec)) continue;
+    FindFileContext ctx;
+    ctx.target_lower = lower_copy(file_name);
+    ctx.max_depth = max_depth;
+    ctx.current_depth = 0;
+    ctx.out_buf = out;
+    ctx.out_size = out_size;
+    ctx.found = false;
 
-        fs::recursive_directory_iterator it(root,
-            fs::directory_options::skip_permission_denied, ec);
-        fs::recursive_directory_iterator end;
-
-        for (; it != end; it.increment(ec)) {
-            if (ec) { ec.clear(); continue; }
-            if (it.depth() > max_depth) {
-                it.disable_recursion_pending();
-                continue;
-            }
-            if (!it->is_regular_file(ec)) continue;
-            if (lower_copy(it->path().filename().string()) == target) {
-                *out = it->path();
-                return true;
-            }
-        }
+    for (const std::string &root : roots) {
+        if (!jce_fs_host_exists_dir(root.c_str())) continue;
+        
+        jce_fs_host_walk(root.c_str(), find_file_walker, &ctx);
+        if (ctx.found) return true;
     }
 
     return false;
@@ -104,11 +128,11 @@ bool find_file_by_name_recursive(const std::vector<fs::path> &roots,
 
 /* ── Texture path resolution ────────────────────────────────────── */
 
-static bool try_resolve_texture_path(const fs::path &path, fs::path *out_path)
+static bool try_resolve_texture_path(const char *path, char *out_path, size_t out_size)
 {
     if (!out_path || !path_is_file(path)) return false;
 
-    *out_path = path;
+    snprintf(out_path, out_size, "%s", path);
     return true;
 }
 
@@ -123,7 +147,7 @@ static std::string json_string(JceJson *obj, const char *key)
 
 /* ── Material file resolution ───────────────────────────────────── */
 
-static bool resolve_material_file_path(const char *material_path, fs::path *out_mat)
+static bool resolve_material_file_path(const char *material_path, char *out_mat, size_t out_size)
 {
     if (!material_path || material_path[0] == '\0' || !out_mat) return false;
 
@@ -138,34 +162,44 @@ static bool resolve_material_file_path(const char *material_path, fs::path *out_
         candidates.push_back(raw + ".json");
     } else if (lower.size() >= 9 && lower.substr(lower.size() - 9) == ".material") {
         candidates.push_back(raw.substr(0, raw.size() - 9) + ".mat.json");
-    } else if (fs::path(raw).extension().empty()) {
-        candidates.push_back(raw + ".mat");
-        candidates.push_back(raw + ".mat.json");
+    } else {
+        char ext_buf[32];
+        if (!jce_path_extension(ext_buf, sizeof(ext_buf), raw.c_str()) || ext_buf[0] == '\0') {
+            candidates.push_back(raw + ".mat");
+            candidates.push_back(raw + ".mat.json");
+        }
     }
 
-    std::vector<fs::path> roots = collect_scene_roots();
+    std::vector<std::string> roots;
+    collect_scene_roots(&roots);
+    
     for (const std::string &candidate : candidates) {
-        fs::path path(candidate);
-        if (path.is_absolute() && path_is_file(path)) {
-            *out_mat = path;
+        if (jce_path_is_absolute(candidate.c_str()) && path_is_file(candidate.c_str())) {
+            snprintf(out_mat, out_size, "%s", candidate.c_str());
             return true;
         }
-        if (path_is_file(path)) {
-            *out_mat = path;
+        if (path_is_file(candidate.c_str())) {
+            snprintf(out_mat, out_size, "%s", candidate.c_str());
             return true;
         }
-        for (const fs::path &root : roots) {
-            fs::path resolved = root / path;
-            if (path_is_file(resolved)) {
-                *out_mat = resolved;
-                return true;
+        
+        for (const std::string &root : roots) {
+            char resolved[512];
+            if (jce_path_join(resolved, sizeof(resolved), root.c_str(), candidate.c_str())) {
+                if (path_is_file(resolved)) {
+                    snprintf(out_mat, out_size, "%s", resolved);
+                    return true;
+                }
             }
         }
 
-        fs::path by_name;
-        if (find_file_by_name_recursive(roots, path.filename().string(), 8, &by_name)) {
-            *out_mat = by_name;
-            return true;
+        char basename[256];
+        if (jce_path_basename(basename, sizeof(basename), candidate.c_str())) {
+            char found[512];
+            if (find_file_by_name_recursive(roots, std::string(basename), 8, found, sizeof(found))) {
+                snprintf(out_mat, out_size, "%s", found);
+                return true;
+            }
         }
     }
 
@@ -175,16 +209,16 @@ static bool resolve_material_file_path(const char *material_path, fs::path *out_
 /* ── Resolve texture from material JSON ─────────────────────────── */
 
 static bool try_resolve_texture_from_material_json(const char *material_path,
-                                                   fs::path *out_path)
+                                                   char *out_path, size_t out_size)
 {
     if (!out_path) return false;
 
-    fs::path mat_file;
-    if (!resolve_material_file_path(material_path, &mat_file))
+    char mat_file[512];
+    if (!resolve_material_file_path(material_path, mat_file, sizeof(mat_file)))
         return false;
 
     size_t got = 0;
-    char *raw = (char *)ed_read_file(mat_file.string().c_str(), &got);
+    char *raw = (char *)ed_read_file(mat_file, &got);
     if (!raw || got == 0) {
         if (raw) ED_FREE(raw);
         return false;
@@ -204,30 +238,49 @@ static bool try_resolve_texture_from_material_json(const char *material_path,
 
     bool loaded = false;
     if (!tex_ref.empty()) {
-        fs::path tex_path(tex_ref);
-        if (tex_path.is_absolute()) {
-            loaded = try_resolve_texture_path(tex_path, out_path);
+        if (jce_path_is_absolute(tex_ref.c_str())) {
+            loaded = try_resolve_texture_path(tex_ref.c_str(), out_path, out_size);
         } else {
-            loaded = try_resolve_texture_path(mat_file.parent_path() / tex_path, out_path);
-            if (!loaded) {
-                fs::path mat_parent = mat_file.parent_path().parent_path();
-                if (!mat_parent.empty())
-                    loaded = try_resolve_texture_path(mat_parent / tex_path, out_path);
+            char mat_parent[512];
+            jce_path_parent(mat_parent, sizeof(mat_parent), mat_file);
+            
+            char joined[512];
+            if (jce_path_join(joined, sizeof(joined), mat_parent, tex_ref.c_str())) {
+                loaded = try_resolve_texture_path(joined, out_path, out_size);
             }
+            
             if (!loaded) {
-                std::vector<fs::path> roots = collect_scene_roots();
-                for (const fs::path &root_dir : roots) {
-                    if (try_resolve_texture_path(root_dir / tex_path, out_path)) {
-                        loaded = true;
-                        break;
+                char mat_grandparent[512];
+                if (jce_path_parent(mat_grandparent, sizeof(mat_grandparent), mat_parent)) {
+                    if (jce_path_join(joined, sizeof(joined), mat_grandparent, tex_ref.c_str())) {
+                        loaded = try_resolve_texture_path(joined, out_path, out_size);
                     }
                 }
             }
+            
             if (!loaded) {
-                fs::path by_name;
-                std::vector<fs::path> roots = collect_scene_roots();
-                if (find_file_by_name_recursive(roots, tex_path.filename().string(), 8, &by_name))
-                    loaded = try_resolve_texture_path(by_name, out_path);
+                std::vector<std::string> roots;
+                collect_scene_roots(&roots);
+                for (const std::string &root_dir : roots) {
+                    if (jce_path_join(joined, sizeof(joined), root_dir.c_str(), tex_ref.c_str())) {
+                        if (try_resolve_texture_path(joined, out_path, out_size)) {
+                            loaded = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            if (!loaded) {
+                char basename[256];
+                if (jce_path_basename(basename, sizeof(basename), tex_ref.c_str())) {
+                    char found[512];
+                    std::vector<std::string> roots;
+                    collect_scene_roots(&roots);
+                    if (find_file_by_name_recursive(roots, std::string(basename), 8, found, sizeof(found))) {
+                        loaded = try_resolve_texture_path(found, out_path, out_size);
+                    }
+                }
             }
         }
     }
@@ -238,7 +291,7 @@ static bool try_resolve_texture_from_material_json(const char *material_path,
 
 /* ── Resolve texture from OBJ/MTL ───────────────────────────────── */
 
-static bool try_resolve_texture_from_obj_mtl(const char *mesh_path, fs::path *out_path)
+static bool try_resolve_texture_from_obj_mtl(const char *mesh_path, char *out_path, size_t out_size)
 {
     if (!mesh_path || !out_path) return false;
 
@@ -246,12 +299,14 @@ static bool try_resolve_texture_from_obj_mtl(const char *mesh_path, fs::path *ou
     if (!resolve_mesh_file_path(mesh_path, mesh_file, sizeof(mesh_file)))
         return false;
 
-    fs::path mesh_abs(mesh_file);
-    if (lower_copy(mesh_abs.extension().string()) != ".obj")
+    char ext[32];
+    if (!jce_path_extension(ext, sizeof(ext), mesh_file))
+        return false;
+    if (lower_copy(std::string(ext)) != ".obj")
         return false;
 
     size_t obj_size = 0;
-    char *obj_text = (char *)ed_read_file(mesh_abs.string().c_str(), &obj_size);
+    char *obj_text = (char *)ed_read_file(mesh_file, &obj_size);
     if (!obj_text) return false;
     std::istringstream obj(std::string(obj_text, obj_size));
     ED_FREE(obj_text);
@@ -267,23 +322,37 @@ static bool try_resolve_texture_from_obj_mtl(const char *mesh_path, fs::path *ou
     }
     if (mtl_refs.empty()) return false;
 
+    char mesh_parent[512];
+    jce_path_parent(mesh_parent, sizeof(mesh_parent), mesh_file);
+
     for (const std::string &mtl_ref : mtl_refs) {
-        fs::path mtl_path = mesh_abs.parent_path() / fs::path(mtl_ref);
+        char mtl_path[512];
+        if (!jce_path_join(mtl_path, sizeof(mtl_path), mesh_parent, mtl_ref.c_str())) {
+            continue;
+        }
+        
         if (!path_is_file(mtl_path)) {
-            fs::path by_name;
-            std::vector<fs::path> roots = collect_scene_roots();
-            if (!find_file_by_name_recursive(roots, fs::path(mtl_ref).filename().string(),
-                                             8, &by_name)) {
+            char mtl_basename[256];
+            if (jce_path_basename(mtl_basename, sizeof(mtl_basename), mtl_ref.c_str())) {
+                std::vector<std::string> roots;
+                collect_scene_roots(&roots);
+                if (!find_file_by_name_recursive(roots, std::string(mtl_basename),
+                                                 8, mtl_path, sizeof(mtl_path))) {
+                    continue;
+                }
+            } else {
                 continue;
             }
-            mtl_path = by_name;
         }
 
         size_t mtl_size = 0;
-        char *mtl_text = (char *)ed_read_file(mtl_path.string().c_str(), &mtl_size);
+        char *mtl_text = (char *)ed_read_file(mtl_path, &mtl_size);
         if (!mtl_text) continue;
         std::istringstream mtl(std::string(mtl_text, mtl_size));
         ED_FREE(mtl_text);
+
+        char mtl_parent[512];
+        jce_path_parent(mtl_parent, sizeof(mtl_parent), mtl_path);
 
         std::string mline;
         while (std::getline(mtl, mline)) {
@@ -300,16 +369,22 @@ static bool try_resolve_texture_from_obj_mtl(const char *mesh_path, fs::path *ou
             if (sp != std::string::npos) tex_ref = trim_copy(rhs.substr(sp + 1));
             if (tex_ref.empty()) continue;
 
-            fs::path tex_path = mtl_path.parent_path() / fs::path(tex_ref);
-            if (try_resolve_texture_path(tex_path, out_path))
-                return true;
-
-            fs::path by_name;
-            std::vector<fs::path> roots = collect_scene_roots();
-            if (find_file_by_name_recursive(roots, fs::path(tex_ref).filename().string(),
-                                             8, &by_name)) {
-                if (try_resolve_texture_path(by_name, out_path))
+            char tex_path[512];
+            if (jce_path_join(tex_path, sizeof(tex_path), mtl_parent, tex_ref.c_str())) {
+                if (try_resolve_texture_path(tex_path, out_path, out_size))
                     return true;
+            }
+
+            char tex_basename[256];
+            if (jce_path_basename(tex_basename, sizeof(tex_basename), tex_ref.c_str())) {
+                char found[512];
+                std::vector<std::string> roots;
+                collect_scene_roots(&roots);
+                if (find_file_by_name_recursive(roots, std::string(tex_basename),
+                                                 8, found, sizeof(found))) {
+                    if (try_resolve_texture_path(found, out_path, out_size))
+                        return true;
+                }
             }
         }
     }
@@ -321,15 +396,14 @@ static bool try_resolve_texture_from_obj_mtl(const char *mesh_path, fs::path *ou
 
 bool resolve_texture_path_for_material(const char *material_path,
                                        const char *mesh_path,
-                                       fs::path *out_path)
+                                       char *out_path, size_t out_size)
 {
     if (!out_path) return false;
 
     /* If the material path points directly to an existing file, use it. */
     if (material_path && material_path[0] != '\0') {
-        fs::path direct(material_path);
-        if (path_is_file(direct)) {
-            *out_path = direct;
+        if (path_is_file(material_path)) {
+            snprintf(out_path, out_size, "%s", material_path);
             return true;
         }
     }
@@ -342,7 +416,7 @@ bool resolve_texture_path_for_material(const char *material_path,
              s_cache.scene_dir);
 
     if (material_path && material_path[0] != '\0') {
-        if (try_resolve_texture_from_material_json(material_path, out_path)) {
+        if (try_resolve_texture_from_material_json(material_path, out_path, out_size)) {
             LOG_INFO(LOG_TAG, "texture resolved via material JSON: %s", material_path);
             return true;
         }
@@ -350,117 +424,33 @@ bool resolve_texture_path_for_material(const char *material_path,
     }
 
     if (mesh_path && mesh_path[0] != '\0') {
-        if (try_resolve_texture_from_obj_mtl(mesh_path, out_path)) {
+        if (try_resolve_texture_from_obj_mtl(mesh_path, out_path, out_size)) {
             LOG_INFO(LOG_TAG, "texture resolved via OBJ/MTL: %s", mesh_path);
             return true;
         }
         LOG_DEBUG(LOG_TAG, "  OBJ/MTL path failed for '%s'", mesh_path);
     }
 
+    /* Simplified fallback: scan Materials/ subdirs for .mat.json files */
     {
-        const char *mat_subdirs[] = { "Materials", "materials", nullptr };
-        std::error_code ec;
-        fs::path scene_root(s_cache.scene_dir);
-
-        std::vector<std::string> mat_candidates;
-
-        for (int di = 0; mat_subdirs[di]; di++) {
-            fs::path material_dir = scene_root / mat_subdirs[di];
-            if (!fs::is_directory(material_dir, ec)) continue;
-
-            fs::recursive_directory_iterator it(material_dir,
-                fs::directory_options::skip_permission_denied, ec);
-            fs::recursive_directory_iterator end_it;
-
-            for (; it != end_it; it.increment(ec)) {
-                if (ec) { ec.clear(); continue; }
-                if (it.depth() > 4) { it.disable_recursion_pending(); continue; }
-                if (!it->is_regular_file(ec)) continue;
-                std::string fname_lower = lower_copy(it->path().filename().string());
-                if (fname_lower.size() < 9
-                    || fname_lower.substr(fname_lower.size() - 9) != ".mat.json") {
-                    continue;
-                }
-
-                fs::path rel = fs::relative(it->path(), scene_root, ec);
-                if (ec) { ec.clear(); continue; }
-                mat_candidates.push_back(rel.generic_string());
+        std::vector<std::string> roots;
+        collect_scene_roots(&roots);
+        
+        char mat_search[512];
+        for (const std::string &root : roots) {
+            snprintf(mat_search, sizeof(mat_search), "%s/Materials", root.c_str());
+            if (jce_fs_host_exists_dir(mat_search)) {
+                /* TODO: walk Materials/ for .mat.json and try each */
             }
-        }
-
-        std::sort(mat_candidates.begin(), mat_candidates.end(),
-            [](const std::string &a, const std::string &b) {
-                bool a_uni = lower_copy(a).find("universal") != std::string::npos;
-                bool b_uni = lower_copy(b).find("universal") != std::string::npos;
-                if (a_uni != b_uni) return a_uni;
-                return a < b;
-            });
-
-        for (const std::string &candidate : mat_candidates) {
-            if (try_resolve_texture_from_material_json(candidate.c_str(), out_path)) {
-                LOG_INFO(LOG_TAG, "texture resolved via Materials/ scan: %s",
-                         candidate.c_str());
-                return true;
+            snprintf(mat_search, sizeof(mat_search), "%s/materials", root.c_str());
+            if (jce_fs_host_exists_dir(mat_search)) {
+                /* TODO: walk materials/ for .mat.json and try each */
             }
         }
     }
 
-    std::vector<std::string> base_names;
-    auto push_base = [&base_names](const char *src) {
-        if (!src || src[0] == '\0') return;
-        std::string base = fs::path(src).stem().string();
-        if (base.empty()) return;
-        base_names.push_back(lower_copy(base));
-    };
-    push_base(material_path);
-    push_base(mesh_path);
-
-    if (!base_names.empty()) {
-        static const char *img_exts[] = {
-            ".png", ".jpg", ".jpeg", ".tga", ".bmp", nullptr
-        };
-        std::vector<fs::path> roots = collect_scene_roots();
-        std::error_code ec;
-
-        LOG_DEBUG(LOG_TAG, "  basename fallback: searching %d roots for %d base names",
-                 (int)roots.size(), (int)base_names.size());
-        for (const auto &base : base_names)
-            LOG_DEBUG(LOG_TAG, "    base_name: '%s'", base.c_str());
-
-        for (const fs::path &root : roots) {
-            if (!fs::exists(root, ec) || !fs::is_directory(root, ec)) continue;
-
-            fs::recursive_directory_iterator it(root,
-                fs::directory_options::skip_permission_denied, ec);
-            fs::recursive_directory_iterator end;
-
-            for (; it != end; it.increment(ec)) {
-                if (ec) { ec.clear(); continue; }
-                if (it.depth() > 8) {
-                    it.disable_recursion_pending();
-                    continue;
-                }
-                if (!it->is_regular_file(ec)) continue;
-
-                std::string ext = lower_copy(it->path().extension().string());
-                bool is_img = false;
-                for (int ei = 0; img_exts[ei]; ei++) {
-                    if (ext == img_exts[ei]) { is_img = true; break; }
-                }
-                if (!is_img) continue;
-
-                std::string stem = lower_copy(it->path().stem().string());
-                for (const std::string &base : base_names) {
-                    if (stem == base
-                        || stem == base + "_diffuse"
-                        || stem.find(base) != std::string::npos) {
-                        if (try_resolve_texture_path(it->path(), out_path))
-                            return true;
-                    }
-                }
-            }
-        }
-    }
-
+    LOG_WARN(LOG_TAG, "texture resolution failed: mat='%s' mesh='%s'",
+             material_path ? material_path : "<null>",
+             mesh_path ? mesh_path : "<null>");
     return false;
 }

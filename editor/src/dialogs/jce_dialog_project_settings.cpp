@@ -16,7 +16,7 @@
 #include "ui/jce_editor_style.h"
 #include "core/jce_hotkeys.h"
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>

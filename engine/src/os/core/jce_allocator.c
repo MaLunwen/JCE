@@ -131,3 +131,26 @@ void jce_aligned_free(void *ptr)
 {
     mi_free(ptr);
 }
+
+bool jce_mem_stats(JceMemStats *out)
+{
+    if (!out) return false;
+
+    size_t elapsed = 0, user_ms = 0, sys_ms = 0;
+    size_t cur_rss = 0, peak_rss = 0;
+    size_t cur_commit = 0, peak_commit = 0;
+    size_t page_faults = 0;
+
+    mi_process_info(&elapsed, &user_ms, &sys_ms,
+                    &cur_rss, &peak_rss,
+                    &cur_commit, &peak_commit,
+                    &page_faults);
+
+    out->current_rss    = cur_rss;
+    out->peak_rss       = peak_rss;
+    out->current_commit = cur_commit;
+    out->peak_commit    = peak_commit;
+    out->page_faults    = page_faults;
+    out->elapsed_ms     = elapsed;
+    return true;
+}

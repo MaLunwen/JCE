@@ -15,7 +15,7 @@
 #include "ui/jce_editor_panels.h"
 #include "ui/jce_theme_palette.h"
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 extern "C" {
 #include <jce/os/core/jce_json.h>
 }

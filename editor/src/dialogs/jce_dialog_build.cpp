@@ -24,7 +24,6 @@ extern "C" {
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
-#include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -94,12 +93,17 @@ static std::vector<BuildPreset> load_presets_from_repo()
     const char *parents[] = { ".", "..", "../..", "../../..", "../../../..",
                               nullptr };
     for (int i = 0; parents[i]; ++i) {
-        std::string p = std::string(parents[i]) + "/CMakePresets.json";
-        std::ifstream f(p);
-        if (!f.is_open()) continue;
-        std::stringstream ss;
-        ss << f.rdbuf();
-        out = parse_build_presets(ss.str());
+        char path_buf[512];
+        snprintf(path_buf, sizeof(path_buf), "%s/CMakePresets.json", parents[i]);
+        
+        size_t file_size = 0;
+        void *data = ed_read_file(path_buf, &file_size);
+        if (!data) continue;
+        
+        std::string text((const char*)data, file_size);
+        ED_FREE(data);
+        
+        out = parse_build_presets(text);
         if (!out.empty()) break;
     }
     if (out.empty()) {

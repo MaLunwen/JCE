@@ -119,7 +119,11 @@ bool jce_subsystem_init_all(jce_subsystem_registry_t *reg,
         LOG_INFO(LOG_TAG, "init '%s' ...", d->name);
         if (d->init && !d->init(svc, d->ctx)) {
             LOG_ERROR(LOG_TAG, "'%s' init failed — aborting", d->name);
-            /* Shutdown already-initialised subsystems in reverse. */
+            /* Quiesce + shutdown already-initialised subsystems in reverse. */
+            for (uint32_t j = i; j-- > 0; ) {
+                if (reg->descs[j].quiesce)
+                    reg->descs[j].quiesce(reg->descs[j].ctx);
+            }
             for (uint32_t j = i; j-- > 0; ) {
                 if (reg->descs[j].shutdown)
                     reg->descs[j].shutdown(reg->descs[j].ctx);
@@ -145,6 +149,12 @@ void jce_subsystem_update_all(jce_subsystem_registry_t *reg, float dt)
 void jce_subsystem_shutdown_all(jce_subsystem_registry_t *reg)
 {
     if (!reg || !reg->initialised) return;
+
+    /* Quiesce all (reverse priority) so no new work spawns mid-teardown. */
+    for (uint32_t i = reg->count; i-- > 0; ) {
+        jce_subsystem_desc_t *d = &reg->descs[i];
+        if (d->quiesce) d->quiesce(d->ctx);
+    }
 
     /* Reverse priority order. */
     for (uint32_t i = reg->count; i-- > 0; ) {

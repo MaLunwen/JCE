@@ -15,18 +15,17 @@
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_path.h>
+#include <jce/tools/jce_imgui.hpp>
 extern "C" {
 #include <jce/os/core/jce_json.h>
 }
 
 #include <cstdio>
 #include <cstring>
-#include <filesystem>
 #include <string>
 #include <vector>
-
-namespace fs = std::filesystem;
 
 namespace {
 
@@ -110,9 +109,9 @@ const char *presets_path(void)
 
 void ensure_dir(const char *path)
 {
-    fs::path p(path);
-    std::error_code ec;
-    fs::create_directories(p.parent_path(), ec);
+    char parent[1024];
+    if (jce_path_parent(parent, sizeof(parent), path))
+        jce_fs_host_create_directory(parent);
 }
 
 void save_presets(void)
@@ -220,23 +219,40 @@ bool emit_sidecar(const char *asset_path, const Preset &p)
 
 int apply_to_folder(const char *folder, const Preset &p)
 {
-    std::error_code ec;
-    if (!fs::exists(folder, ec) || !fs::is_directory(folder, ec)) {
+    if (!jce_fs_host_exists_dir(folder)) {
         jce_editor_console_log_level(JCE_CONSOLE_ERROR,
             "apply: not a directory: %s", folder);
         return 0;
     }
-    int count = 0;
-    for (auto &de : fs::recursive_directory_iterator(folder, ec)) {
-        if (!de.is_regular_file()) continue;
-        std::string ext = de.path().extension().string();
-        for (auto &c : ext) c = (char)std::tolower((unsigned char)c);
-        bool match = (p.kind == PK_TEXTURE) ? ext_is_texture(ext)
-                                            : ext_is_model(ext);
-        if (!match) continue;
-        if (emit_sidecar(de.path().string().c_str(), p)) ++count;
-    }
-    return count;
+    
+    struct WalkCtx {
+        const Preset *preset;
+        int count;
+    } ctx;
+    ctx.preset = &p;
+    ctx.count = 0;
+    
+    auto cb = [](const char *path, bool is_dir, void *ud) -> bool {
+        if (is_dir) return true;
+        
+        WalkCtx *c = static_cast<WalkCtx*>(ud);
+        char ext_buf[64];
+        jce_path_extension(ext_buf, sizeof(ext_buf), path);
+        std::string ext = ext_buf;
+        for (auto &ch : ext) ch = (char)std::tolower((unsigned char)ch);
+        
+        bool match = (c->preset->kind == PK_TEXTURE) ? ext_is_texture(ext)
+                                                     : ext_is_model(ext);
+        if (!match) return true;
+        
+        if (emit_sidecar(path, *c->preset))
+            c->count++;
+        
+        return true;
+    };
+    
+    jce_fs_host_walk(folder, cb, &ctx);
+    return ctx.count;
 }
 
 /* --------- Phase B: directory scan & sidecar inspection ------------- */
@@ -263,40 +279,55 @@ void       make_summary(ScanRow &r);
 void do_scan(void)
 {
     s.scan.clear();
-    std::error_code ec;
-    if (!fs::exists(s.scan_root, ec) || !fs::is_directory(s.scan_root, ec)) {
+    if (!jce_fs_host_exists_dir(s.scan_root)) {
         jce_editor_console_log_level(JCE_CONSOLE_ERROR,
             "scan: not a directory: %s", s.scan_root);
         return;
     }
-    for (auto &de : fs::recursive_directory_iterator(s.scan_root, ec)) {
-        if (!de.is_regular_file()) continue;
-        std::string ext = de.path().extension().string();
-        for (auto &c : ext) c = (char)std::tolower((unsigned char)c);
+    
+    struct WalkCtx {
+        std::vector<ScanRow> *scan;
+    } ctx;
+    ctx.scan = &s.scan;
+    
+    auto cb = [](const char *path, bool is_dir, void *ud) -> bool {
+        if (is_dir) return true;
+        
+        WalkCtx *c = static_cast<WalkCtx*>(ud);
+        char ext_buf[64];
+        jce_path_extension(ext_buf, sizeof(ext_buf), path);
+        std::string ext = ext_buf;
+        for (auto &ch : ext) ch = (char)std::tolower((unsigned char)ch);
+        
         bool is_tex = ext_is_texture(ext);
         bool is_mdl = ext_is_model(ext);
-        if (!is_tex && !is_mdl) continue;
+        if (!is_tex && !is_mdl) return true;
+        
         ScanRow r;
-        r.path = de.path().string();
+        r.path = path;
         r.ext  = ext;
         r.kind = is_tex ? PK_TEXTURE : PK_MODEL;
         r.sidecar_preset = read_sidecar_preset(r.path);
         r.has_sidecar = !r.sidecar_preset.empty();
+        
         if (is_mdl && (ext == ".gltf" || ext == ".glb")) {
             r.report = inspect_gltf(r.path);
             r.report_loaded = true;
             make_summary(r);
         }
-        s.scan.push_back(std::move(r));
-    }
+        
+        c->scan->push_back(std::move(r));
+        return true;
+    };
+    
+    jce_fs_host_walk(s.scan_root, cb, &ctx);
     jce_editor_console_log("import scan: %zu assets under %s",
                            s.scan.size(), s.scan_root);
 }
 
 bool clear_sidecar(const std::string &asset_path)
 {
-    std::error_code ec;
-    return fs::remove(asset_path + ".import.json", ec);
+    return jce_fs_host_remove_file((asset_path + ".import.json").c_str());
 }
 
 /* --------- Phase C: GLTF / GLB inspector ---------------------------- */
@@ -321,10 +352,14 @@ bool resolve_image_uri(const std::string &asset_path, const std::string &uri)
 {
     if (uri.empty()) return true;  /* embedded images have no URI */
     if (uri.compare(0, 5, "data:") == 0) return true;
-    fs::path base = fs::path(asset_path).parent_path();
-    fs::path full = base / uri;
-    std::error_code ec;
-    return fs::exists(full, ec);
+    
+    char parent[1024];
+    jce_path_parent(parent, sizeof(parent), asset_path.c_str());
+    
+    char full[1024];
+    jce_path_join(full, sizeof(full), parent, uri.c_str());
+    
+    return jce_fs_host_exists_file(full);
 }
 
 GltfReport inspect_gltf(const std::string &asset_path)
@@ -337,8 +372,12 @@ GltfReport inspect_gltf(const std::string &asset_path)
     const char *json_buf = raw;
     size_t      json_len = sz;
     bool is_glb = false;
-    std::string ext = fs::path(asset_path).extension().string();
+    
+    char ext_buf[64];
+    jce_path_extension(ext_buf, sizeof(ext_buf), asset_path.c_str());
+    std::string ext = ext_buf;
     for (auto &c : ext) c = (char)std::tolower((unsigned char)c);
+    
     if (ext == ".glb") {
         is_glb = true;
         if (!extract_glb_json(raw, sz, &json_buf, &json_len)) {

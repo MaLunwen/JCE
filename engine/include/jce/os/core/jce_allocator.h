@@ -94,6 +94,24 @@ JCE_API void *jce_aligned_alloc(size_t size, size_t alignment);
 /* Release a buffer obtained from jce_aligned_alloc(). NULL is OK. */
 JCE_API void JCE_CALL jce_aligned_free(void *ptr);
 
+/* ================================================================== */
+/* Process-wide allocator stats (mimalloc-backed)                      */
+/* ================================================================== */
+
+typedef struct JceMemStats {
+    size_t current_rss;     /* current resident set size, bytes              */
+    size_t peak_rss;        /* peak resident set size, bytes                 */
+    size_t current_commit;  /* currently committed virtual memory, bytes     */
+    size_t peak_commit;     /* peak committed virtual memory, bytes          */
+    size_t page_faults;     /* hard page faults                              */
+    size_t elapsed_ms;      /* process wall time, milliseconds               */
+} JceMemStats;
+
+/* Snapshot the current allocator/process memory stats.  Backed by
+ * `mi_process_info()`.  Cheap enough to call once per frame for HUDs.
+ * Always populates `*out`; returns false only if `out` is NULL. */
+JCE_API bool jce_mem_stats(JceMemStats *out);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_ALLOCATOR_H */

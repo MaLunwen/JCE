@@ -396,3 +396,55 @@ void jce_rg_reset(JceRenderGraph *rg)
     rg->exec_count = 0;
     rg->compiled   = false;
 }
+
+/* ── Self-test ────────────────────────────────────────────────────── */
+
+bool jce_rg_self_test(void)
+{
+    bool ok = true;
+
+    /* ----- Test 1: linear DAG compiles in correct order ----- */
+    JceRenderGraph *rg = jce_rg_create();
+    if (!rg) return false;
+
+    JceRGResourceDesc d = { 256, 256, JCE_RG_FORMAT_RGBA8, "rt" };
+    JceRGResource a = jce_rg_create_resource(rg, &d);
+    JceRGResource b = jce_rg_create_resource(rg, &d);
+
+    JceRGPass p0 = jce_rg_add_pass(rg, "shadow",  NULL, NULL);
+    JceRGPass p1 = jce_rg_add_pass(rg, "opaque",  NULL, NULL);
+    JceRGPass p2 = jce_rg_add_pass(rg, "post",    NULL, NULL);
+
+    jce_rg_pass_write(rg, p0, a);
+    jce_rg_pass_read (rg, p1, a);
+    jce_rg_pass_write(rg, p1, b);
+    jce_rg_pass_read (rg, p2, b);
+
+    if (!jce_rg_compile(rg))                              ok = false;
+    if (rg->exec_count != 3)                              ok = false;
+    if (rg->exec_order[0] != p0.idx ||
+        rg->exec_order[1] != p1.idx ||
+        rg->exec_order[2] != p2.idx)                      ok = false;
+    jce_rg_destroy(rg);
+
+    /* ----- Test 2: cycle is detected ----- */
+    rg = jce_rg_create();
+    if (!rg) return false;
+
+    JceRGResource ra = jce_rg_create_resource(rg, &d);
+    JceRGResource rb = jce_rg_create_resource(rg, &d);
+    JceRGPass q0 = jce_rg_add_pass(rg, "loop_a", NULL, NULL);
+    JceRGPass q1 = jce_rg_add_pass(rg, "loop_b", NULL, NULL);
+    /* q0 writes a, reads b ; q1 writes b, reads a → cycle */
+    jce_rg_pass_write(rg, q0, ra); jce_rg_pass_read(rg, q0, rb);
+    jce_rg_pass_write(rg, q1, rb); jce_rg_pass_read(rg, q1, ra);
+
+    if (jce_rg_compile(rg)) {
+        /* Cycle MUST cause compile to fail. */
+        ok = false;
+    }
+    jce_rg_destroy(rg);
+
+    LOG_INFO(LOG_TAG, "self-test: %s", ok ? "PASS" : "FAIL");
+    return ok;
+}

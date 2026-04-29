@@ -27,7 +27,9 @@
 #include "core/jce_hotkeys.h"
 #include "scene/jce_editor_scene_render.h"
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/middleware/scene/jce_lod.h>
+#include <jce/renderer/jce_scene_renderer.h>
+#include <jce/tools/jce_imgui.hpp>
 #include <jce/tools/jce_imgui_internal.h>
 #include <stdio.h>
 #include <string.h>
@@ -35,6 +37,8 @@
 /* ── Dialog state ─────────────────────────────────────────────────── */
 
 static bool s_show_about       = false;
+static bool s_demo_lod_enabled = false;
+static JceLodGroup s_demo_lod_group = {};
 static bool s_show_new_project = false;
 static bool s_show_open_project = false;
 static bool s_show_new_scene   = false;
@@ -58,6 +62,7 @@ static int  s_layout_preset_pending = 0;
 static bool s_focus_scene_view = false;
 static bool s_focus_inspector = false;
 static bool s_focus_file_viewer = false;
+static void cmd_toggle_demo_lod_(void);  /* fwd-decl: defined further down */
 
 static bool should_draw_dialog_dimmer(void)
 {
@@ -162,6 +167,10 @@ static void handle_global_edit_shortcuts(void)
     if (jce_hotkey_pressed(JCE_HK_EDIT_REDO)) {
         if (jce_state_can_redo())
             jce_state_redo();
+    }
+
+    if (ImGui::IsKeyPressed(ImGuiKey_F9, false)) {
+        cmd_toggle_demo_lod_();
     }
 }
 
@@ -420,6 +429,26 @@ static void draw_command_palette(void)
  *  MENU BAR
  * ══════════════════════════════════════════════════════════════════════ */
 
+static void cmd_toggle_demo_lod_(void)
+{
+    JceSceneRenderer *sr = jce_editor_get_scene_renderer();
+    if (!sr) return;
+    if (s_demo_lod_enabled) {
+        jce_scene_renderer_set_global_lod(sr, nullptr);
+        s_demo_lod_enabled = false;
+    } else {
+        /* Build (high=cube, mid=sphere, low=plane) so the visual swap
+         * is unmistakable when the camera moves. Distances tuned for
+         * the JCE_STRESS_CUBES grid (~22 m wide). */
+        JceMesh *cube   = jce_scene_renderer_get_builtin_mesh(sr, 0);
+        JceMesh *sphere = jce_scene_renderer_get_builtin_mesh(sr, 1);
+        JceMesh *plane  = jce_scene_renderer_get_builtin_mesh(sr, 2);
+        jce_lod_setup(&s_demo_lod_group, cube, 8.0f, sphere, 18.0f, plane, 35.0f);
+        jce_scene_renderer_set_global_lod(sr, &s_demo_lod_group);
+        s_demo_lod_enabled = true;
+    }
+}
+
 static void draw_menu_bar(void)
 {
     ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10.0f, 8.0f));
@@ -485,6 +514,10 @@ static void draw_menu_bar(void)
         }
         if (ImGui::MenuItem(jce_editor_i18n("menu.edit.projectSettings")))
             s_show_proj_settings = true;
+        ImGui::Separator();
+        if (ImGui::MenuItem("Reload Shaders", "F5")) {
+            jce_editor_reload_shaders();
+        }
         ImGui::EndMenu();
     }
 
@@ -611,6 +644,14 @@ static void draw_menu_bar(void)
     }
 
     /* ── Help ──────────────────────────────────────────────────────── */
+    if (ImGui::BeginMenu(jce_editor_i18n("menu.debug"))) {
+        if (ImGui::MenuItem(jce_editor_i18n("menu.debug.toggleDemoLod"),
+                            "F9", s_demo_lod_enabled)) {
+            cmd_toggle_demo_lod_();
+        }
+        ImGui::EndMenu();
+    }
+
     if (ImGui::BeginMenu(jce_editor_i18n("menu.help"))) {
         if (ImGui::MenuItem(jce_editor_i18n("menu.help.about")))
             s_show_about = true;

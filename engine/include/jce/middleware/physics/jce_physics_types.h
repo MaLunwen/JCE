@@ -46,6 +46,15 @@ typedef struct { uint32_t idx; } JceCharacterHandle;
 
 static inline bool jce_character_valid(JceCharacterHandle h) { return h.idx != UINT32_MAX; }
 
+/* Vehicle controller handle. */
+typedef struct { uint32_t idx; } JceVehicleHandle;
+#define JCE_VEHICLE_INVALID ((JceVehicleHandle){ UINT32_MAX })
+
+static inline bool jce_vehicle_valid(JceVehicleHandle h) { return h.idx != UINT32_MAX; }
+
+/* Maximum wheels per vehicle (front 2 + rear 2 typical; allow 6×6 trucks). */
+#define JCE_VEHICLE_MAX_WHEELS 8
+
 /* ================================================================== */
 /* Shape descriptors                                                   */
 /* ================================================================== */

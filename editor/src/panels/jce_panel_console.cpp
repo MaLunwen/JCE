@@ -11,7 +11,7 @@
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_state.h"
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>

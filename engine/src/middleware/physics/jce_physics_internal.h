@@ -162,6 +162,46 @@ void jce_bullet_character_get_position(JceBulletWorld *bw, uint32_t idx,
                                         jce_vec3 *pos);
 bool jce_bullet_character_is_grounded(JceBulletWorld *bw, uint32_t idx);
 
+/* ================================================================== */
+/* Vehicle controller                                                  */
+/* ================================================================== */
+
+uint32_t jce_bullet_vehicle_create(JceBulletWorld *bw,
+                                    jce_vec3 pos, jce_quat rot,
+                                    jce_vec3 chassis_half_ext,
+                                    float chassis_mass,
+                                    float max_engine_force,
+                                    float max_brake_force,
+                                    float max_steering_rad,
+                                    uint16_t col_group, uint16_t col_mask);
+
+void jce_bullet_vehicle_destroy(JceBulletWorld *bw, uint32_t idx);
+
+uint32_t jce_bullet_vehicle_add_wheel(JceBulletWorld *bw, uint32_t idx,
+                                       jce_vec3 connection,
+                                       jce_vec3 wheel_dir,
+                                       jce_vec3 wheel_axle,
+                                       float suspension_rest_len,
+                                       float wheel_radius,
+                                       bool is_front,
+                                       float susp_stiffness,
+                                       float susp_damping,
+                                       float susp_compression,
+                                       float friction_slip,
+                                       float roll_influence);
+
+void jce_bullet_vehicle_set_input(JceBulletWorld *bw, uint32_t idx,
+                                   float throttle, float brake, float steer);
+
+void jce_bullet_vehicle_get_chassis_transform(JceBulletWorld *bw, uint32_t idx,
+                                                jce_vec3 *pos, jce_quat *rot);
+
+void jce_bullet_vehicle_get_wheel_transform(JceBulletWorld *bw, uint32_t idx,
+                                              uint32_t wheel,
+                                              jce_vec3 *pos, jce_quat *rot);
+
+float jce_bullet_vehicle_get_speed(JceBulletWorld *bw, uint32_t idx);
+
 #ifdef __cplusplus
 }
 #endif

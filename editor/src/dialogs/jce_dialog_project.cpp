@@ -6,6 +6,9 @@
  * jce_dialog_scene.cpp.
  */
 
+#include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_path.h>
+
 #include "jce_editor_dialogs_internal.h"
 #include "core/jce_assetdb.h"
 
@@ -28,39 +31,47 @@ void set_current_project_root(const char *path)
 bool is_valid_project_dir(const char *path)
 {
     if (!path || path[0] == '\0') return false;
-    try {
-        fs::path p(path);
-        return fs::exists(p) && fs::is_directory(p) && fs::exists(p / "project.jce");
-    } catch (...) {
+    
+    if (!jce_fs_host_exists_dir(path))
         return false;
-    }
+        
+    char project_file[1024];
+    jce_path_join(project_file, sizeof(project_file), path, "project.jce");
+    return jce_fs_host_exists_file(project_file);
 }
 
-static bool resolve_project_root_path(const char *path, fs::path *out_project_root)
+static bool resolve_project_root_path(const char *path, std::string *out_project_root)
 {
     if (!path || path[0] == '\0' || !out_project_root)
         return false;
 
-    try {
-        fs::path current(path);
-        if (!fs::exists(current))
-            return false;
+    char current[1024];
+    snprintf(current, sizeof(current), "%s", path);
+    
+    if (!jce_fs_host_exists_file(current) && !jce_fs_host_exists_dir(current))
+        return false;
 
-        if (fs::is_regular_file(current))
-            current = current.parent_path();
+    if (jce_fs_host_exists_file(current)) {
+        jce_path_parent(current, sizeof(current), current);
+    }
 
-        while (!current.empty()) {
-            if (fs::exists(current / "project.jce")) {
-                *out_project_root = current;
-                return true;
-            }
-
-            fs::path parent = current.parent_path();
-            if (parent.empty() || parent == current)
-                break;
-            current = parent;
+    while (current[0] != '\0') {
+        char project_file[1024];
+        jce_path_join(project_file, sizeof(project_file), current, "project.jce");
+        
+        if (jce_fs_host_exists_file(project_file)) {
+            *out_project_root = current;
+            return true;
         }
-    } catch (...) {
+
+        char parent[1024];
+        if (!jce_path_parent(parent, sizeof(parent), current))
+            break;
+            
+        if (parent[0] == '\0' || strcmp(parent, current) == 0)
+            break;
+            
+        snprintf(current, sizeof(current), "%s", parent);
     }
 
     return false;
@@ -305,62 +316,83 @@ void jce_editor_dialog_new_project(bool *p_open)
                      jce_editor_i18n("newProject.errorLocationEmpty"));
         } else {
             /* Create the project directory structure. */
-            fs::path project_dir = fs::path(s_new_project.project_location)
-                                 / s_new_project.project_name;
-            try {
-                if (fs::exists(project_dir) && !fs::is_empty(project_dir)) {
-                    snprintf(s_new_project.error_msg, sizeof(s_new_project.error_msg), "%s",
-                             jce_editor_i18n("newProject.errorExists"));
-                } else {
-                    fs::create_directories(project_dir);
-                    fs::create_directories(project_dir / "assets" / "scenes");
-                    fs::create_directories(project_dir / "assets" / "textures");
-                    fs::create_directories(project_dir / "assets" / "models");
-                    fs::create_directories(project_dir / "assets" / "audio");
-                    fs::create_directories(project_dir / "assets" / "scripts");
-                    fs::create_directories(project_dir / "build");
-
-                    /* Write a minimal project file with editor/engine version. */
-                    fs::path proj_file = project_dir / "project.jce";
-                    {
-                        char proj_buf[512];
-                        int proj_len = snprintf(proj_buf, sizeof(proj_buf),
-                            "{\n"
-                            "    \"name\": \"%s\",\n"
-                            "    \"type\": \"%s\",\n"
-                            "    \"version\": \"1.0\",\n"
-                            "    \"engineVersion\": \"0.1.0\",\n"
-                            "    \"editorVersion\": \"0.1.0\"\n"
-                            "}\n",
-                            s_new_project.project_name,
-                            s_new_project.project_type == 0 ? "3D" : "2D");
-                        if (proj_len > 0)
-                            ed_write_file(proj_file.string().c_str(), proj_buf, (size_t)proj_len);
-                    }
-
-                    /* Add to recent projects. */
-                    JceEditorConfig ecfg;
-                    jce_editor_config_load(&ecfg);
-                    jce_editor_config_add_recent(&ecfg, project_dir.string().c_str());
-                    ecfg.last_project[0] = '\0';
-                    jce_editor_config_save(&ecfg);
-
-                    /* Set the asset browser root to the new project. */
-                    jce_editor_assets_set_project(project_dir.string().c_str());
-                    set_current_project_root(project_dir.string().c_str());
-                    jce_editor_layout_request_focus_scene_view();
-
-                    jce_editor_console_log("Created project: %s at %s",
-                                           s_new_project.project_name,
-                                           project_dir.string().c_str());
-                    ImGui::CloseCurrentPopup();
-                    *p_open = false;
-                }
-            } catch (const std::exception &e) {
+            char project_dir[1024];
+            jce_path_join(project_dir, sizeof(project_dir),
+                         s_new_project.project_location,
+                         s_new_project.project_name);
+            
+            /* Check if exists and not empty */
+            bool dir_exists = jce_fs_host_exists_dir(project_dir);
+            bool has_files = false;
+            if (dir_exists) {
+                struct CheckCtx { bool has_any; };
+                CheckCtx chk = { false };
+                auto cb = [](const char *, bool, void *ud) -> bool {
+                    static_cast<CheckCtx*>(ud)->has_any = true;
+                    return false;
+                };
+                jce_fs_host_list_dir(project_dir, cb, &chk);
+                has_files = chk.has_any;
+            }
+            
+            if (dir_exists && has_files) {
                 snprintf(s_new_project.error_msg, sizeof(s_new_project.error_msg), "%s",
-                         jce_editor_i18n("newProject.errorCreate"));
-                jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-                    "Failed to create project: %s", e.what());
+                         jce_editor_i18n("newProject.errorExists"));
+            } else {
+                char sub_path[1024];
+                jce_fs_host_create_directory(project_dir);
+                
+                jce_path_join(sub_path, sizeof(sub_path), project_dir, "assets");
+                jce_fs_host_create_directory(sub_path);
+                jce_path_join(sub_path, sizeof(sub_path), project_dir, "assets/scenes");
+                jce_fs_host_create_directory(sub_path);
+                jce_path_join(sub_path, sizeof(sub_path), project_dir, "assets/textures");
+                jce_fs_host_create_directory(sub_path);
+                jce_path_join(sub_path, sizeof(sub_path), project_dir, "assets/models");
+                jce_fs_host_create_directory(sub_path);
+                jce_path_join(sub_path, sizeof(sub_path), project_dir, "assets/audio");
+                jce_fs_host_create_directory(sub_path);
+                jce_path_join(sub_path, sizeof(sub_path), project_dir, "assets/scripts");
+                jce_fs_host_create_directory(sub_path);
+                jce_path_join(sub_path, sizeof(sub_path), project_dir, "build");
+                jce_fs_host_create_directory(sub_path);
+
+                /* Write a minimal project file with editor/engine version. */
+                char proj_file[1024];
+                jce_path_join(proj_file, sizeof(proj_file), project_dir, "project.jce");
+                {
+                    char proj_buf[512];
+                    int proj_len = snprintf(proj_buf, sizeof(proj_buf),
+                        "{\n"
+                        "    \"name\": \"%s\",\n"
+                        "    \"type\": \"%s\",\n"
+                        "    \"version\": \"1.0\",\n"
+                        "    \"engineVersion\": \"0.1.0\",\n"
+                        "    \"editorVersion\": \"0.1.0\"\n"
+                        "}\n",
+                        s_new_project.project_name,
+                        s_new_project.project_type == 0 ? "3D" : "2D");
+                    if (proj_len > 0)
+                        ed_write_file(proj_file, proj_buf, (size_t)proj_len);
+                }
+
+                /* Add to recent projects. */
+                JceEditorConfig ecfg;
+                jce_editor_config_load(&ecfg);
+                jce_editor_config_add_recent(&ecfg, project_dir);
+                ecfg.last_project[0] = '\0';
+                jce_editor_config_save(&ecfg);
+
+                /* Set the asset browser root to the new project. */
+                jce_editor_assets_set_project(project_dir);
+                set_current_project_root(project_dir);
+                jce_editor_layout_request_focus_scene_view();
+
+                jce_editor_console_log("Created project: %s at %s",
+                                       s_new_project.project_name,
+                                       project_dir);
+                ImGui::CloseCurrentPopup();
+                *p_open = false;
             }
         }
     }
@@ -412,29 +444,47 @@ static void open_project_ensure_init(void)
     s_open_project.pick_cancelled  = false;
     s_open_project.request_open    = false;
     /* Default browse to current directory or user home. */
-    snprintf(s_open_project.browse_path, sizeof(s_open_project.browse_path),
-             "%s", fs::current_path().string().c_str());
+    char base_path[1024];
+    if (jce_fs_host_get_current_dir(base_path, sizeof(base_path))) {
+        snprintf(s_open_project.browse_path, sizeof(s_open_project.browse_path),
+                 "%s", base_path);
+    } else {
+        snprintf(s_open_project.browse_path, sizeof(s_open_project.browse_path), ".");
+    }
     s_open_project.initialized = true;
 }
 
 static void browse_refresh_entries(void)
 {
     s_open_project.browse_entries.clear();
-    try {
-        /* Add parent directory entry. */
-        fs::path cur(s_open_project.browse_path);
-        if (cur.has_parent_path() && cur.parent_path() != cur)
-            s_open_project.browse_entries.push_back("..");
+    
+    /* Add parent directory entry. */
+    char parent[1024];
+    if (jce_path_parent(parent, sizeof(parent), s_open_project.browse_path) &&
+        parent[0] != '\0') {
+        s_open_project.browse_entries.push_back("..");
+    }
 
-        std::vector<std::string> dirs, files;
-        for (auto &de : fs::directory_iterator(cur)) {
-            if (de.is_directory())
-                dirs.push_back(de.path().filename().string());
+    std::vector<std::string> dirs;
+    
+    struct ListCtx {
+        std::vector<std::string> *dirs;
+    } ctx;
+    ctx.dirs = &dirs;
+    
+    auto cb = [](const char *name, bool is_dir, void *ud) -> bool {
+        if (is_dir) {
+            static_cast<ListCtx*>(ud)->dirs->push_back(name);
         }
-        std::sort(dirs.begin(), dirs.end());
-        for (auto &d : dirs)
-            s_open_project.browse_entries.push_back(d);
-    } catch (...) {}
+        return true;
+    };
+    
+    jce_fs_host_list_dir(s_open_project.browse_path, cb, &ctx);
+    
+    std::sort(dirs.begin(), dirs.end());
+    for (auto &d : dirs)
+        s_open_project.browse_entries.push_back(d);
+    
     s_open_project.browse_refresh = false;
 }
 
@@ -574,26 +624,26 @@ void jce_editor_dialog_open_project(bool *p_open)
             ImGui::PushStyleColor(ImGuiCol_Text, JCE_COLOR_ASSET_FOLDER);
             if (ImGui::Selectable(name, false, ImGuiSelectableFlags_AllowDoubleClick)) {
                 if (ImGui::IsMouseDoubleClicked(0)) {
-                    fs::path cur(s_open_project.browse_path);
-                    fs::path next;
-                    if (strcmp(name, "..") == 0)
-                        next = cur.parent_path();
-                    else
-                        next = cur / name;
+                    char next[1024];
+                    if (strcmp(name, "..") == 0) {
+                        jce_path_parent(next, sizeof(next), s_open_project.browse_path);
+                    } else {
+                        jce_path_join(next, sizeof(next), s_open_project.browse_path, name);
+                    }
                     snprintf(s_open_project.browse_path,
                              sizeof(s_open_project.browse_path),
-                             "%s", next.string().c_str());
+                             "%s", next);
                     s_open_project.browse_refresh = true;
                 } else {
                     /* Single click: set as selected path. */
-                    fs::path selected;
+                    char selected[1024];
                     if (strcmp(name, "..") == 0)
-                        selected = fs::path(s_open_project.browse_path).parent_path();
+                        jce_path_parent(selected, sizeof(selected), s_open_project.browse_path);
                     else
-                        selected = fs::path(s_open_project.browse_path) / name;
+                        jce_path_join(selected, sizeof(selected), s_open_project.browse_path, name);
                     snprintf(s_open_project.manual_path,
                              sizeof(s_open_project.manual_path),
-                             "%s", selected.string().c_str());
+                             "%s", selected);
                 }
             }
             ImGui::PopStyleColor();
@@ -648,41 +698,34 @@ void jce_editor_dialog_open_project(bool *p_open)
             const char *path = s_open_project.manual_path;
             s_open_project.error_msg[0] = '\0';
             if (strlen(path) > 0) {
-                fs::path project_root;
+                std::string project_root;
                 if (resolve_project_root_path(path, &project_root)) {
-                    std::string resolved_root = project_root.string();
                     if (!s_open_project.cfg_loaded)
                         jce_editor_config_load(&s_open_project.cfg);
-                    jce_editor_config_add_recent(&s_open_project.cfg, resolved_root.c_str());
+                    jce_editor_config_add_recent(&s_open_project.cfg, project_root.c_str());
                     s_open_project.cfg.last_project[0] = '\0';
                     jce_editor_config_save(&s_open_project.cfg);
 
                     /* Set the asset browser root to the project directory. */
-                    jce_editor_assets_set_project(resolved_root.c_str());
-                    set_current_project_root(resolved_root.c_str());
+                    jce_editor_assets_set_project(project_root.c_str());
+                    set_current_project_root(project_root.c_str());
                     snprintf(s_open_project.manual_path,
                              sizeof(s_open_project.manual_path), "%s",
-                             resolved_root.c_str());
+                             project_root.c_str());
                     jce_editor_layout_request_focus_scene_view();
 
-                    jce_editor_console_log("Opened project: %s", resolved_root.c_str());
+                    jce_editor_console_log("Opened project: %s", project_root.c_str());
                     *p_open = false;
                 } else {
-                    try {
-                        if (!fs::exists(fs::path(path))) {
-                            snprintf(s_open_project.error_msg,
-                                     sizeof(s_open_project.error_msg), "%s",
-                                     jce_editor_i18n("openProject.errorNotExist"));
-                        } else {
-                            snprintf(s_open_project.error_msg,
-                                     sizeof(s_open_project.error_msg), "%s",
-                                     jce_editor_i18n("openProject.errorInvalid"));
-                        }
-                    } catch (...) {
+                    if (!jce_fs_host_exists_file(path) && !jce_fs_host_exists_dir(path)) {
                         snprintf(s_open_project.error_msg,
                                  sizeof(s_open_project.error_msg), "%s",
-                                 jce_editor_i18n("openProject.errorOpen"));
-                    }
+                                 jce_editor_i18n("openProject.errorNotExist"));
+                    } else {
+                        snprintf(s_open_project.error_msg,
+                                 sizeof(s_open_project.error_msg), "%s",
+                                     jce_editor_i18n("openProject.errorInvalid"));
+                        }
                     jce_editor_console_log_level(JCE_CONSOLE_WARNING,
                         "Project open failed for path: %s", path);
                 }

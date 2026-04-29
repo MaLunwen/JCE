@@ -20,7 +20,7 @@
 #include "core/jce_editor_config.h"
 #include "core/jce_reflect.h"
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 extern "C" {
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_json.h>

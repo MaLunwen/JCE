@@ -66,8 +66,8 @@ JCE_API void jce_camctrl_destroy(JceCameraController *ctrl);
 /* ================================================================== */
 
 /* Feed input and advance one frame (dt in seconds). */
-void jce_camctrl_update(JceCameraController *ctrl,
-                         const JceCameraInput *input, float dt);
+JCE_API void JCE_CALL jce_camctrl_update(JceCameraController *ctrl,
+                                         const JceCameraInput *input, float dt);
 
 /* ================================================================== */
 /* Queries                                                             */

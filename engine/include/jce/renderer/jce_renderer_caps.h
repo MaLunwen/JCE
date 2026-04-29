@@ -68,6 +68,33 @@ typedef struct JceRenderRecommendation {
     /* Enable FXAA. */
     bool       enable_fxaa;
 
+    /* Enable screen-space reflections (SSR).
+       OFF on LOW/MEDIUM by default — heavy ALU + extra pass.
+       Old / integrated GPUs can OOM or stutter; gate on tier + has_discrete_gpu. */
+    bool       enable_ssr;
+
+    /* Enable screen-space ambient occlusion (SSAO).
+       OFF on LOW by default — sampling ALU dominates fragment cost
+       on mobile / 2008-era GPUs. */
+    bool       enable_ssao;
+
+    /* Enable temporal anti-aliasing (TAA).
+       OFF on LOW by default — needs FP16 framebuffer + history target,
+       memory-prohibitive on 512MB GPUs. */
+    bool       enable_taa;
+
+    /* Enable volumetric fog (3D-texture based).
+       OFF unless the GPU supports compute shaders + 3D textures. */
+    bool       enable_volumetric_fog;
+
+    /* Enable GPU particle simulation (compute-driven).
+       OFF when BGFX_CAPS_COMPUTE is not present. */
+    bool       enable_gpu_particles;
+
+    /* True if the GPU is a discrete (NVIDIA / AMD desktop) part rather
+       than integrated / mobile.  Used to gate VRAM-heavy features. */
+    bool       has_discrete_gpu;
+
     /* Maximum texture resolution (e.g. 1024, 2048, 4096). */
     uint32_t   max_texture_size;
 } JceRenderRecommendation;
@@ -93,22 +120,41 @@ JCE_API const char *jce_gpu_tier_name(JceGpuTier tier);
 /* Backend enumeration                                                 */
 /* ================================================================== */
 
-/* Forward-decl of the renderer-backend enum that is canonically
-   defined in <jce/app/jce_config.h>.  The full definition is needed
-   by callers using the API below — include <jce/app/jce_config.h>
-   alongside this header.  We do not include it here to keep
-   jce_renderer_caps.h dependency-light. */
-enum JceRendererBackend;
+/* JceRendererBackend — canonical home is the renderer layer.
+   Defined here so that:
+     - jce_renderer_caps.h has no need for a forward decl
+     - app/middleware code can include just this header (which
+       already pulls in the renderer caps API anyway)
+     - resource/asset layers can use the enum without depending
+       on application/. */
+typedef enum JceRendererBackend {
+    JCE_BACKEND_AUTO = 0,
+    JCE_BACKEND_D3D11,
+    JCE_BACKEND_D3D12,
+    JCE_BACKEND_VULKAN,
+    JCE_BACKEND_OPENGL,
+    JCE_BACKEND_OPENGLES,
+    JCE_BACKEND_METAL
+} JceRendererBackend;
 
 /* Return a stable human-readable name for a backend.  Never NULL. */
-JCE_API const char *jce_renderer_backend_name(enum JceRendererBackend b);
+JCE_API const char *jce_renderer_backend_name(JceRendererBackend b);
 
 /* Fill `out` with the list of renderer backends supported by the
    compiled-in bgfx build (queried via bgfx::getSupportedRenderers).
    The first slot is always JCE_BACKEND_AUTO.  Returns the number of
    entries written (<= max).  Pass max=0 / out=NULL to query the
    needed count. */
-JCE_API int jce_renderer_caps_list_backends(enum JceRendererBackend *out, int max);
+JCE_API int jce_renderer_caps_list_backends(JceRendererBackend *out, int max);
+
+/* Platform-preferred backend order (without the JCE_BACKEND_AUTO leader).
+   This is the SINGLE SOURCE OF TRUTH used by:
+     - jce_renderer.c          (runtime auto-init fallback chain)
+     - the preferences UI      (dropdown order, prepended with Auto)
+   Stays in lock-step with JCE_SHADER_PROFILES in the top-level CMakeLists,
+   so we never offer a backend whose .bin shaders weren't built.
+   Returns the count of entries written (<= max). */
+JCE_API int jce_renderer_caps_preferred_chain(JceRendererBackend *out, int max);
 
 JCE_EXTERN_C_END
 

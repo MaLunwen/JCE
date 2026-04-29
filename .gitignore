@@ -38,3 +38,4 @@ scripts/android/app/src/main/res/*
 
 # Vendored single-header libraries (managed manually, excluded from style/CI scans)
 engine/src/renderer/internal/stb_image.h
+engine/src/renderer/internal

@@ -17,16 +17,13 @@
 #include "core/jce_editor_state.h"
 #include "viewers/jce_file_viewer.h"
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 #include <stdio.h>
 #include <string.h>
 
 #include <algorithm>
-#include <filesystem>
 #include <string>
 #include <vector>
-
-namespace fs = std::filesystem;
 
 /* Shared project root tracking. */
 extern char s_current_project_root[512];

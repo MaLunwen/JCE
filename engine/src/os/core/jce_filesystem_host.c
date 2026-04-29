@@ -324,7 +324,7 @@ static void s_split_stem_ext(const char *name,
 }
 
 bool jce_fs_host_make_unique_path(const char *desired,
-                                  char *out, size_t out_size)
+                                  char *out, uint32_t out_size)
 {
     if (s_empty(desired) || !out || out_size == 0) return false;
 
@@ -383,7 +383,7 @@ bool jce_fs_host_make_unique_path(const char *desired,
 /* jce_fs_read_all / jce_fs_write_all).                              */
 /* ----------------------------------------------------------------- */
 
-void *jce_fs_host_read_all(const char *path, size_t *out_size)
+void *jce_fs_host_read_all(const char *path, uint64_t *out_size)
 {
     if (out_size) *out_size = 0;
     if (s_empty(path)) return NULL;
@@ -412,7 +412,7 @@ void *jce_fs_host_read_all(const char *path, size_t *out_size)
     return buf;
 }
 
-bool jce_fs_host_write_all(const char *path, const void *data, size_t size)
+bool jce_fs_host_write_all(const char *path, const void *data, uint64_t size)
 {
     if (s_empty(path) || (size && !data)) return false;
     if (!s_ensure_parent_dir(path)) return false;
@@ -429,7 +429,7 @@ bool jce_fs_host_write_all(const char *path, const void *data, size_t size)
     return ok;
 }
 
-bool jce_fs_host_append(const char *path, const void *data, size_t size)
+bool jce_fs_host_append(const char *path, const void *data, uint64_t size)
 {
     if (s_empty(path) || (size && !data)) return false;
     if (!s_ensure_parent_dir(path)) return false;
@@ -447,8 +447,8 @@ bool jce_fs_host_append(const char *path, const void *data, size_t size)
     return ok;
 }
 
-void *jce_fs_host_read_capped(const char *path, size_t max_bytes,
-                              size_t *out_read, size_t *out_total)
+void *jce_fs_host_read_capped(const char *path, uint64_t max_bytes,
+                              uint64_t *out_read, uint64_t *out_total)
 {
     if (out_read) *out_read = 0;
     if (out_total) *out_total = 0;
@@ -459,10 +459,10 @@ void *jce_fs_host_read_capped(const char *path, size_t max_bytes,
 
     Sint64 sz = SDL_GetIOSize(io);
     if (sz < 0) { SDL_CloseIO(io); return NULL; }
-    if (out_total) *out_total = (size_t)sz;
+    if (out_total) *out_total = (uint64_t)sz;
 
     size_t read_size = (size_t)sz;
-    if (read_size > max_bytes) read_size = max_bytes;
+    if ((uint64_t)read_size > max_bytes) read_size = (size_t)max_bytes;
 
     void *buf = JCE_MALLOC(read_size + 1);
     if (!buf) { SDL_CloseIO(io); return NULL; }
@@ -476,7 +476,7 @@ void *jce_fs_host_read_capped(const char *path, size_t max_bytes,
     return buf;
 }
 
-bool jce_fs_host_get_base_path(char *out, size_t out_size)
+bool jce_fs_host_get_base_path(char *out, uint32_t out_size)
 {
     if (!out || out_size == 0) return false;
     const char *p = SDL_GetBasePath();
@@ -485,5 +485,34 @@ bool jce_fs_host_get_base_path(char *out, size_t out_size)
     if (n >= out_size) n = out_size - 1;
     memcpy(out, p, n);
     out[n] = '\0';
+    return true;
+}
+
+void jce_fs_buffer_free(void *buf)
+{
+    if (buf) JCE_FREE(buf);
+}
+
+bool jce_fs_host_get_current_dir(char *out, uint32_t out_size)
+{
+    if (!out || out_size == 0) return false;
+    out[0] = '\0';
+    /* SDL_GetCurrentDirectory returns a freshly allocated string the
+       caller must release with SDL_free.  It already includes a
+       trailing path separator on Windows; we strip it for consistency
+       with std::filesystem::current_path(). */
+    char *cwd = SDL_GetCurrentDirectory();
+    if (!cwd) return false;
+    size_t n = strlen(cwd);
+    while (n > 0 && (cwd[n - 1] == '/' || cwd[n - 1] == '\\')) --n;
+    if (n + 1 > out_size) {
+        SDL_free(cwd);
+        return false;
+    }
+    memcpy(out, cwd, n);
+    out[n] = '\0';
+    SDL_free(cwd);
+    /* Canonicalise to forward slashes for cross-platform consistency. */
+    for (size_t i = 0; i < n; ++i) if (out[i] == '\\') out[i] = '/';
     return true;
 }

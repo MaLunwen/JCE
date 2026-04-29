@@ -18,7 +18,7 @@
 #include <stddef.h>
 
 #include <jce/os/core/jce_defs.h>
-#include <jce/os/core/jce_pak_loader.h>
+#include <jce/resource/jce_pak_loader.h>
 #include <jce/renderer/jce_mesh.h>
 
 #ifdef __cplusplus

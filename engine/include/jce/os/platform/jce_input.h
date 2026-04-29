@@ -68,6 +68,46 @@ bool      jce_input_gamepad_button_pressed(const JceInput *input, int pad,
 float     jce_input_gamepad_axis(const JceInput *input, int pad,
               JceGamepadAxis axis);
 
+/* -- Frame snapshot (for record / replay) --------------------------- */
+
+/* Compact per-frame state snapshot.  Captures everything jce_input
+ * exposes via its query functions; "previous" state is reconstructed
+ * by the standard call to jce_input_update() between frames.
+ *
+ * Wire format == struct layout: keep this packed and stable across
+ * minor versions.  Breaking changes must bump JCE_INPUT_FRAME_VERSION. */
+#define JCE_INPUT_FRAME_VERSION 1u
+
+typedef struct {
+    uint32_t version;        /* JCE_INPUT_FRAME_VERSION */
+    uint32_t key_count;      /* JCE_KEY_COUNT (sanity check) */
+
+    /* Keyboard: 1 bit per key.  4096 bits comfortably covers
+     * SDL_SCANCODE_COUNT (~512) with growth headroom. */
+    uint64_t keys_bits[64];
+
+    /* Mouse */
+    float    mouse_x, mouse_y;
+    float    mouse_dx, mouse_dy;
+    float    mouse_wheel;
+    uint32_t mouse_buttons;
+
+    /* Gamepads — first JCE_MAX_GAMEPADS only. */
+    uint32_t gamepad_count;
+    struct {
+        uint32_t buttons;
+        float    axes[8];    /* >= SDL_GAMEPAD_AXIS_COUNT */
+    } gamepads[JCE_MAX_GAMEPADS];
+} JceInputFrame;
+
+/* Capture the current input state into `out`.  Safe to call any time. */
+JCE_API void jce_input_capture(const JceInput *input, JceInputFrame *out);
+
+/* Override the current input state from a previously captured frame.
+ * After this call, the next jce_input_update() will roll cur→prev as
+ * usual.  Returns false if the frame version does not match. */
+JCE_API bool jce_input_apply(JceInput *input, const JceInputFrame *frame);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_INPUT_H */

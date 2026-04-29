@@ -5,6 +5,7 @@
  * and mesh LODs based on camera proximity.
  *
  * STATUS: Implemented — background chunk loading with radial/rectangular modes.
+ *         JceWorldStreamer provides GTA-style scene-entity lifecycle management.
  */
 
 #ifndef JCE_API_STREAMING_H
@@ -15,6 +16,7 @@ extern "C" {
 #endif
 
 #include <jce/middleware/streaming/jce_streaming.h>
+#include <jce/resource/jce_world_streamer.h>
 
 
 

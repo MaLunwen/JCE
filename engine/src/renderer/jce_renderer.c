@@ -7,10 +7,13 @@
 #include <jce/os/core/jce_profiler.h>
 #include <jce/os/core/jce_thread.h>
 #include <jce/os/core/jce_timer.h>
+#include <jce/os/core/jce_allocator.h>
 #include <jce/os/platform/jce_window.h>
 #include <jce/renderer/jce_camera.h>
 #include <jce/renderer/jce_renderer.h>
+#include <jce/renderer/jce_renderer_caps.h>
 #include <jce/renderer/jce_shaders.h>
+#include <jce/renderer/jce_text.h>
 #include <jce/renderer/jce_views.h>
 
 #include "os/core/jce_memory.h"
@@ -40,8 +43,10 @@ struct JceRenderer {
     bgfx_program_handle_t program_mesh;     /* mesh (pos+normal+uv) */
     /* PBR programs */
     bgfx_program_handle_t program_pbr;
+    bgfx_program_handle_t program_pbr_inst;     /* GPU-instanced PBR */
     bgfx_program_handle_t program_pbr_skinned;
     bgfx_program_handle_t program_shadow;
+    bgfx_program_handle_t program_shadow_inst;     /* GPU-instanced shadow */
     bgfx_program_handle_t program_shadow_skinned;
     bgfx_program_handle_t program_terrain;
     bgfx_uniform_handle_t u_light_dir;   /* vec4: xyz = light direction */
@@ -61,14 +66,36 @@ static void jce_bgfx_fatal(bgfx_callback_interface_t *_this, const char *_filePa
               _filePath ? _filePath : "<null>", (unsigned)_line, _str ? _str : "<null>");
 }
 
+/* When JCE_GFX_DEBUG=1, mirror bgfx internal traces (including the
+ * D3D12 HRESULT printed right before "Failed to create PSO!") to our
+ * log.  Otherwise stays silent to avoid spamming. */
+static int s_bgfx_trace_enabled = -1;
+
 static void jce_bgfx_trace_vargs(bgfx_callback_interface_t *_this, const char *_filePath,
                                  uint16_t _line, const char *_format, va_list _argList)
 {
     (void)_this;
-    (void)_filePath;
-    (void)_line;
-    (void)_format;
-    (void)_argList;
+    if (s_bgfx_trace_enabled < 0) {
+        const char *v = getenv("JCE_GFX_DEBUG");
+        s_bgfx_trace_enabled = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    if (!s_bgfx_trace_enabled || !_format) return;
+
+    char buf[1024];
+    int n = vsnprintf(buf, sizeof(buf), _format, _argList);
+    if (n < 0) return;
+    /* Strip trailing newline that bgfx tends to append. */
+    while (n > 0 && (buf[n-1] == '\n' || buf[n-1] == '\r')) buf[--n] = '\0';
+    if (n == 0) return;
+
+    const char *file = _filePath ? _filePath : "<bgfx>";
+    /* Keep only the basename for compactness. */
+    const char *slash = strrchr(file, '/');
+    const char *back  = strrchr(file, '\\');
+    if (back && back > slash) slash = back;
+    if (slash) file = slash + 1;
+
+    LOG_INFO("bgfx", "%s:%u %s", file, (unsigned)_line, buf);
 }
 
 static void jce_bgfx_profiler_begin(bgfx_callback_interface_t *_this, const char *_name,
@@ -174,68 +201,51 @@ static bgfx_callback_interface_t s_bgfx_callback = {
     &s_bgfx_callback_vtbl,
 };
 
-/* Map backend enum to bgfx renderer type. */
-static bgfx_renderer_type_t map_backend(int backend)
+/* Map JceRendererBackend enum value to bgfx renderer type. */
+static bgfx_renderer_type_t to_bgfx_type(enum JceRendererBackend b)
 {
-    switch (backend) {
-    case 1:
-        return BGFX_RENDERER_TYPE_DIRECT3D11;
-    case 2:
-        return BGFX_RENDERER_TYPE_DIRECT3D12;
-    case 3:
-        return BGFX_RENDERER_TYPE_VULKAN;
-    case 4:
-        return BGFX_RENDERER_TYPE_OPENGL;
-    case 5:
-        return BGFX_RENDERER_TYPE_OPENGLES;
-    case 6:
-        return BGFX_RENDERER_TYPE_METAL;
-    default:
-        return BGFX_RENDERER_TYPE_COUNT; /* auto */
+    switch (b) {
+    case JCE_BACKEND_D3D11:    return BGFX_RENDERER_TYPE_DIRECT3D11;
+    case JCE_BACKEND_D3D12:    return BGFX_RENDERER_TYPE_DIRECT3D12;
+    case JCE_BACKEND_VULKAN:   return BGFX_RENDERER_TYPE_VULKAN;
+    case JCE_BACKEND_OPENGL:   return BGFX_RENDERER_TYPE_OPENGL;
+    case JCE_BACKEND_OPENGLES: return BGFX_RENDERER_TYPE_OPENGLES;
+    case JCE_BACKEND_METAL:    return BGFX_RENDERER_TYPE_METAL;
+    default:                   return BGFX_RENDERER_TYPE_COUNT; /* auto */
     }
 }
 
-/* Platform-specific preferred backend order (best first).
- * Sentinel: BGFX_RENDERER_TYPE_COUNT marks end of list. */
+/* Map legacy integer backend (config field) to bgfx renderer type.
+   Kept compatible with persisted JceConfig.backend values 0..6. */
+static bgfx_renderer_type_t map_backend(int backend)
+{
+    return to_bgfx_type((enum JceRendererBackend)backend);
+}
+
+/* Platform-preferred bgfx fallback chain.
+   Single source of truth lives in jce_renderer_caps_preferred_chain();
+   we just translate JceRendererBackend → bgfx_renderer_type_t and append
+   the BGFX_RENDERER_TYPE_COUNT sentinel.
+   Stays automatically aligned with the preferences UI dropdown and with
+   JCE_SHADER_PROFILES (we never list a backend whose .bin shaders weren't
+   built — see CMakeLists.txt). */
 static const bgfx_renderer_type_t *get_platform_fallback_chain(void)
 {
-#if defined(_WIN32)
-    static const bgfx_renderer_type_t chain[] = {
-        BGFX_RENDERER_TYPE_DIRECT3D12, BGFX_RENDERER_TYPE_DIRECT3D11, BGFX_RENDERER_TYPE_VULKAN,
-        BGFX_RENDERER_TYPE_OPENGL, BGFX_RENDERER_TYPE_COUNT};
-#elif defined(__APPLE__)
-#include <TargetConditionals.h>
-  #if TARGET_OS_IOS || TARGET_OS_TV
-    static const bgfx_renderer_type_t chain[] = {
-        BGFX_RENDERER_TYPE_METAL,
-        BGFX_RENDERER_TYPE_OPENGLES,
-        BGFX_RENDERER_TYPE_COUNT
-    };
-  #else /* macOS */
-    static const bgfx_renderer_type_t chain[] = {
-        BGFX_RENDERER_TYPE_METAL,
-        BGFX_RENDERER_TYPE_OPENGL,
-        BGFX_RENDERER_TYPE_COUNT
-    };
-  #endif
-#elif defined(__ANDROID__)
-    static const bgfx_renderer_type_t chain[] = {
-        BGFX_RENDERER_TYPE_OPENGLES,
-        BGFX_RENDERER_TYPE_VULKAN,
-        BGFX_RENDERER_TYPE_COUNT
-    };
-#elif defined(__EMSCRIPTEN__)
-    static const bgfx_renderer_type_t chain[] = {
-        BGFX_RENDERER_TYPE_OPENGLES,
-        BGFX_RENDERER_TYPE_COUNT
-    };
-#else /* Linux and other Unix */
-    static const bgfx_renderer_type_t chain[] = {
-        BGFX_RENDERER_TYPE_VULKAN,
-        BGFX_RENDERER_TYPE_OPENGL,
-        BGFX_RENDERER_TYPE_COUNT
-    };
-#endif
+    enum  { CAP = 8 };
+    static bgfx_renderer_type_t chain[CAP + 1];
+    static bool                 initialised = false;
+    if (!initialised) {
+        enum JceRendererBackend pref[CAP];
+        int n = jce_renderer_caps_preferred_chain(pref, CAP);
+        if (n > CAP) n = CAP;
+        int o = 0;
+        for (int i = 0; i < n; ++i) {
+            bgfx_renderer_type_t t = to_bgfx_type(pref[i]);
+            if (t != BGFX_RENDERER_TYPE_COUNT) chain[o++] = t;
+        }
+        chain[o] = BGFX_RENDERER_TYPE_COUNT;  /* sentinel */
+        initialised = true;
+    }
     return chain;
 }
 
@@ -277,6 +287,17 @@ JceRenderer *jce_renderer_create(JceWindow *win,
 
     uint32_t reset_flags = cfg->vsync ? BGFX_RESET_VSYNC : BGFX_RESET_NONE;
 
+    /* JCE_GFX_DEBUG=1 → enable bgfx debug device (forwards to the
+       D3D12 debug layer / Vulkan validation) so PSO compile failures
+       print the underlying HRESULT / validation message. */
+    bool gfx_debug = false;
+    {
+        const char *v = getenv("JCE_GFX_DEBUG");
+        gfx_debug = (v && v[0] && v[0] != '0');
+    }
+    if (gfx_debug)
+        LOG_INFO(LOG_TAG, "JCE_GFX_DEBUG enabled (D3D12/Vulkan validation on)");
+
     bgfx_renderer_type_t requested_type = map_backend(cfg->backend);
     const char *backend_name =
         requested_type == BGFX_RENDERER_TYPE_COUNT
@@ -313,6 +334,7 @@ JceRenderer *jce_renderer_create(JceWindow *win,
         init.resolution.reset  = reset_flags;
         init.platformData      = pd;
         init.callback          = &s_bgfx_callback;
+        init.debug             = gfx_debug;
         ok = bgfx_init(&init);
         if (!ok)
             LOG_WARN(LOG_TAG, "requested backend %s failed",
@@ -332,6 +354,7 @@ JceRenderer *jce_renderer_create(JceWindow *win,
             init.resolution.reset  = reset_flags;
             init.platformData      = pd;
             init.callback          = &s_bgfx_callback;
+            init.debug             = gfx_debug;
             if (bgfx_init(&init)) { ok = true; break; }
         }
     }
@@ -357,8 +380,13 @@ JceRenderer *jce_renderer_create(JceWindow *win,
         enable_debug_text = false;
     }
 
-    if (enable_debug_text)
-        bgfx_set_debug(BGFX_DEBUG_TEXT);
+    uint32_t debug_flags = enable_debug_text ? BGFX_DEBUG_TEXT : 0;
+#if defined(JCE_TRACY_ENABLED) && (JCE_TRACY_ENABLED + 0 == 1)
+    debug_flags |= BGFX_DEBUG_PROFILER;
+    LOG_INFO(LOG_TAG, "bgfx GPU profiler enabled (Tracy mode)");
+#endif
+    if (debug_flags)
+        bgfx_set_debug(debug_flags);
 
     /* View 0 (3D): clear color + depth. */
     bgfx_set_view_clear(JCE_VIEW_MAIN_3D,
@@ -385,7 +413,7 @@ JceRenderer *jce_renderer_create(JceWindow *win,
         return NULL;
     }
     r->reset_flags = reset_flags;
-    r->debug_flags = enable_debug_text ? BGFX_DEBUG_TEXT : 0;
+    r->debug_flags = debug_flags;
     s_dbg_text_enabled = enable_debug_text;
 
     /* Color vertex layout: pos(float3) + color(uint8x4). */
@@ -427,8 +455,10 @@ JceRenderer *jce_renderer_create(JceWindow *win,
     r->program_textured.idx     = UINT16_MAX;
     r->program_mesh.idx         = UINT16_MAX;
     r->program_pbr.idx          = UINT16_MAX;
+    r->program_pbr_inst.idx     = UINT16_MAX;
     r->program_pbr_skinned.idx  = UINT16_MAX;
     r->program_shadow.idx       = UINT16_MAX;
+    r->program_shadow_inst.idx  = UINT16_MAX;
     r->program_shadow_skinned.idx = UINT16_MAX;
     r->program_terrain.idx        = UINT16_MAX;
 
@@ -465,13 +495,58 @@ void jce_renderer_set_shaders(JceRenderer *r,
     r->program_mesh = (bgfx_program_handle_t){
         shaders->mesh.idx };
     r->program_pbr = (bgfx_program_handle_t){ shaders->pbr.idx };
+    r->program_pbr_inst = (bgfx_program_handle_t){ shaders->pbr_inst.idx };
     r->program_pbr_skinned = (bgfx_program_handle_t){ shaders->pbr_skinned.idx };
     r->program_shadow = (bgfx_program_handle_t){ shaders->shadow.idx };
+    r->program_shadow_inst = (bgfx_program_handle_t){ shaders->shadow_inst.idx };
     r->program_shadow_skinned = (bgfx_program_handle_t){ shaders->shadow_skinned.idx };
     r->program_terrain = (bgfx_program_handle_t){ shaders->terrain.idx };
 
     if (r->program.idx == UINT16_MAX)
         LOG_ERROR(LOG_TAG, "color shader not provided");
+}
+
+bool jce_renderer_reload_shaders_fs(JceRenderer        *r,
+                                    const char         *dev_dir,
+                                    const JcePakArchive *pak)
+{
+    if (!r || r->is_fallback || !pak) return false;
+
+    /* Snapshot old program handles so we can destroy them after the
+       new set is installed.  bgfx defers destruction to end-of-frame
+       which keeps any in-flight draws safe. */
+    bgfx_program_handle_t old[] = {
+        r->program, r->program_textured, r->program_mesh,
+        r->program_pbr, r->program_pbr_inst, r->program_pbr_skinned,
+        r->program_shadow, r->program_shadow_inst, r->program_shadow_skinned,
+        r->program_terrain,
+    };
+
+    JceShaderSet ns = jce_shaders_load_all_fs(dev_dir, pak);
+    if (!jce_shader_valid(ns.color)) {
+        LOG_ERROR(LOG_TAG, "reload: color shader load failed, aborting swap");
+        /* Destroy any partially-loaded handles to avoid leaking. */
+        bgfx_program_handle_t parts[] = {
+            { ns.color.idx }, { ns.textured.idx }, { ns.mesh.idx },
+            { ns.pbr.idx }, { ns.pbr_inst.idx }, { ns.pbr_skinned.idx },
+            { ns.shadow.idx }, { ns.shadow_inst.idx }, { ns.shadow_skinned.idx },
+            { ns.terrain.idx },
+        };
+        for (size_t i = 0; i < sizeof(parts)/sizeof(parts[0]); i++) {
+            if (parts[i].idx != UINT16_MAX)
+                bgfx_destroy_program(parts[i]);
+        }
+        return false;
+    }
+
+    jce_renderer_set_shaders(r, &ns);
+
+    for (size_t i = 0; i < sizeof(old)/sizeof(old[0]); i++) {
+        if (old[i].idx != UINT16_MAX)
+            bgfx_destroy_program(old[i]);
+    }
+    LOG_INFO(LOG_TAG, "shaders reloaded (dev_dir=%s)", dev_dir ? dev_dir : "(none)");
+    return true;
 }
 
 JceRenderer *jce_renderer_create_fallback(JceWindow *win)
@@ -653,6 +728,7 @@ void jce_renderer_destroy(JceRenderer *r)
             SDL_DestroyRenderer(r->sdl_renderer);
         }
         JCE_FREE(r);
+        LOG_INFO(LOG_TAG, "renderer destroyed (fallback)");
         return;
     }
     s_dbg_text_enabled = false;
@@ -666,10 +742,14 @@ void jce_renderer_destroy(JceRenderer *r)
         bgfx_destroy_program(r->program_mesh);
     if (r->program_pbr.idx != UINT16_MAX)
         bgfx_destroy_program(r->program_pbr);
+    if (r->program_pbr_inst.idx != UINT16_MAX)
+        bgfx_destroy_program(r->program_pbr_inst);
     if (r->program_pbr_skinned.idx != UINT16_MAX)
         bgfx_destroy_program(r->program_pbr_skinned);
     if (r->program_shadow.idx != UINT16_MAX)
         bgfx_destroy_program(r->program_shadow);
+    if (r->program_shadow_inst.idx != UINT16_MAX)
+        bgfx_destroy_program(r->program_shadow_inst);
     if (r->program_shadow_skinned.idx != UINT16_MAX)
         bgfx_destroy_program(r->program_shadow_skinned);
     if (r->program_terrain.idx != UINT16_MAX)
@@ -678,8 +758,16 @@ void jce_renderer_destroy(JceRenderer *r)
         bgfx_destroy_uniform(r->u_light_dir);
     if (r->u_light_color.idx != UINT16_MAX)
         bgfx_destroy_uniform(r->u_light_color);
+
+    /* Tear down the text/FreeType subsystem here so any future GPU-touching
+     * cleanup it grows runs while bgfx is still alive. Today FT_Done_FreeType
+     * is bgfx-agnostic, but routing the call through renderer destroy
+     * preserves the LIFO contract documented in jce_engine.c. */
+    jce_text_shutdown();
+
     bgfx_shutdown();
     JCE_FREE(r);
+    LOG_INFO(LOG_TAG, "renderer destroyed");
 }
 
 /* -- Per-frame ------------------------------------------------------ */
@@ -733,8 +821,9 @@ void jce_renderer_begin_frame(const JceRenderer *r, JceWindow *win)
 void jce_renderer_begin_frame_3d(const JceRenderer *r, JceWindow *win,
                                   const JceCamera *cam, uint16_t view_id)
 {
-    if (!r || !win) return;
-    if (r->is_fallback) return;
+    JCE_PROFILE_ZONE_N("Renderer::BeginFrame3D");
+    if (!r || !win) { JCE_PROFILE_ZONE_END; return; }
+    if (r->is_fallback) { JCE_PROFILE_ZONE_END; return; }
 
     uint16_t vp_x, vp_y, vp_w, vp_h;
     jce_window_calc_viewport(win, &vp_x, &vp_y, &vp_w, &vp_h);
@@ -759,7 +848,14 @@ void jce_renderer_begin_frame_3d(const JceRenderer *r, JceWindow *win,
     }
 
     bgfx_set_view_rect(view_id, vp_x, vp_y, vp_w, vp_h);
+    /* Force sequential submission order for the 3D view so the scene
+     * renderer's draw order (sky → shadows → opaques → transparents) is
+     * preserved when rendering directly to the backbuffer.  The editor's
+     * offscreen bridge already enables sequential mode, so this matches
+     * that behaviour for runtime games that bypass the bridge. */
+    bgfx_set_view_mode(view_id, BGFX_VIEW_MODE_SEQUENTIAL);
     bgfx_touch(view_id);
+    JCE_PROFILE_ZONE_END;
 }
 
 void jce_renderer_present_splash(const JceRenderer *r,
@@ -831,6 +927,26 @@ void jce_renderer_end_frame(const JceRenderer *r)
 #endif
 
     bgfx_frame(false);
+
+    /* Surface allocator + renderer stats to Tracy each frame. */
+#if defined(JCE_PROFILER_ENABLED)
+    {
+        JceMemStats ms;
+        if (jce_mem_stats(&ms)) {
+            JCE_PROFILE_PLOT_I("mem.rss_mb",    (int64_t)(ms.current_rss / (1024 * 1024)));
+            JCE_PROFILE_PLOT_I("mem.commit_mb", (int64_t)(ms.current_commit / (1024 * 1024)));
+        }
+
+        const bgfx_stats_t *st = bgfx_get_stats();
+        if (st) {
+            JCE_PROFILE_PLOT_I("render.draw_calls",  (int64_t)st->numDraw);
+            JCE_PROFILE_PLOT_I("render.num_prims",   (int64_t)st->numPrims);
+            JCE_PROFILE_PLOT_I("render.textures",    (int64_t)st->numTextures);
+            JCE_PROFILE_PLOT_I("render.gpu_mem_mb",  (int64_t)(st->gpuMemoryUsed >> 20));
+        }
+    }
+#endif
+
     JCE_PROFILE_ZONE_END;
 }
 
@@ -898,6 +1014,17 @@ void jce_renderer_dbg_text(uint16_t x, uint16_t y,
     bgfx_dbg_text_printf(x, y, attr, "%s", buf);
 }
 
+void jce_renderer_dbg_text_v(uint16_t x, uint16_t y,
+                             uint8_t attr, const char *fmt, va_list ap)
+{
+    if (!s_dbg_text_enabled)
+        return;
+
+    char buf[256];
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    bgfx_dbg_text_printf(x, y, attr, "%s", buf);
+}
+
 /* -- Accessors for primitives module -------------------------------- */
 
 const bgfx_vertex_layout_t *jce_renderer_get_layout(const JceRenderer *r)
@@ -950,6 +1077,13 @@ JceShaderHandle jce_renderer_get_program_pbr(const JceRenderer *r)
     return (JceShaderHandle){ r->program_pbr.idx };
 }
 
+JceShaderHandle jce_renderer_get_program_pbr_inst(const JceRenderer *r)
+{
+    JceShaderHandle invalid = JCE_INVALID_SHADER;
+    if (!r) return invalid;
+    return (JceShaderHandle){ r->program_pbr_inst.idx };
+}
+
 JceShaderHandle jce_renderer_get_program_pbr_skinned(const JceRenderer *r)
 {
     JceShaderHandle invalid = JCE_INVALID_SHADER;
@@ -962,6 +1096,13 @@ JceShaderHandle jce_renderer_get_program_shadow(const JceRenderer *r)
     JceShaderHandle invalid = JCE_INVALID_SHADER;
     if (!r) return invalid;
     return (JceShaderHandle){ r->program_shadow.idx };
+}
+
+JceShaderHandle jce_renderer_get_program_shadow_inst(const JceRenderer *r)
+{
+    JceShaderHandle invalid = JCE_INVALID_SHADER;
+    if (!r) return invalid;
+    return (JceShaderHandle){ r->program_shadow_inst.idx };
 }
 
 JceShaderHandle jce_renderer_get_program_shadow_skinned(const JceRenderer *r)

@@ -4,7 +4,7 @@
 
 #include "jce_editor_toast.h"
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 
 #include <stdarg.h>
 #include <stdio.h>

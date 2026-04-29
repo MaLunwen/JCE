@@ -13,7 +13,7 @@
 #ifndef JCE_WIDGET_TIMELINE_H
 #define JCE_WIDGET_TIMELINE_H
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 
 #ifdef __cplusplus
 extern "C++" {

@@ -67,14 +67,14 @@ JCE_API void jce_net_disconnect_now(JceNetHost *host, JcePeerHandle peer);
 /* ================================================================== */
 
 /* Send a message to a specific peer on a given channel. */
-bool jce_net_send(JceNetHost *host, JcePeerHandle peer,
-                  uint8_t channel, const void *data, uint32_t size,
-                  JceNetDelivery delivery);
+JCE_API bool JCE_CALL jce_net_send(JceNetHost *host, JcePeerHandle peer,
+                                   uint8_t channel, const void *data, uint32_t size,
+                                   JceNetDelivery delivery);
 
 /* Broadcast a message to all connected peers. */
-void jce_net_broadcast(JceNetHost *host, uint8_t channel,
-                       const void *data, uint32_t size,
-                       JceNetDelivery delivery);
+JCE_API void JCE_CALL jce_net_broadcast(JceNetHost *host, uint8_t channel,
+                                        const void *data, uint32_t size,
+                                        JceNetDelivery delivery);
 
 /* ================================================================== */
 /* Polling                                                             */
@@ -82,8 +82,8 @@ void jce_net_broadcast(JceNetHost *host, uint8_t channel,
 
 /* Poll for network events.  timeout_ms = 0 for non-blocking.
    Returns true if an event was received. */
-bool jce_net_poll(JceNetHost *host, JceNetEvent *out_event,
-                  uint32_t timeout_ms);
+JCE_API bool JCE_CALL jce_net_poll(JceNetHost *host, JceNetEvent *out_event,
+                                   uint32_t timeout_ms);
 
 /* Service the host: send queued packets, receive events.
    Call once per frame. */

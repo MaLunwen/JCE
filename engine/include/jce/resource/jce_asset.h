@@ -253,7 +253,7 @@ JceModel *jce_asset_get_model(const JceAssetManager *mgr,
                               JceAssetHandle handle);
 
 /* Sound handle — reuse existing audio type definition. */
-#include <jce/middleware/audio/jce_audio_types.h>
+#include <jce/os/core/jce_asset_types.h>
 
 JceSound jce_asset_get_sound(const JceAssetManager *mgr,
                              JceAssetHandle handle);
@@ -300,6 +300,37 @@ typedef struct JceAssetStats {
 
 void jce_asset_manager_stats(const JceAssetManager *mgr,
                              JceAssetStats *out);
+
+/* ================================================================== */
+/* Load-failure callback                                                */
+/* ================================================================== */
+
+/* Reasons an asset load can fail. */
+typedef enum JceAssetErrorCode {
+    JCE_ASSET_ERR_NOT_FOUND = 1,   /* path not in PAK / VFS */
+    JCE_ASSET_ERR_IO,              /* read failed mid-stream */
+    JCE_ASSET_ERR_BAD_FORMAT,      /* parser rejected payload */
+    JCE_ASSET_ERR_OUT_OF_MEMORY,
+    JCE_ASSET_ERR_UNSUPPORTED,     /* no loader registered for type */
+    JCE_ASSET_ERR_INTERNAL         /* loader returned false w/o detail */
+} JceAssetErrorCode;
+
+typedef struct JceAssetErrorInfo {
+    JceAssetHandle    handle;      /* slot whose load failed */
+    JceAssetType      type;
+    JceAssetErrorCode code;
+    const char       *path;        /* asset path (manager-owned, valid for callback duration) */
+    const char       *detail;      /* short human message, may be NULL */
+} JceAssetErrorInfo;
+
+typedef void (*jce_asset_error_fn)(const JceAssetErrorInfo *info, void *user);
+
+/* Install (or clear with NULL) a global error handler.
+   Replaces any previous handler.  Called on the main thread from
+   jce_asset_manager_update() for async loads, or inline for sync loads. */
+JCE_API void jce_asset_set_error_handler(JceAssetManager *mgr,
+                                         jce_asset_error_fn fn,
+                                         void *user);
 
 /* ================================================================== */
 /* Pluggable loader registration                                       */

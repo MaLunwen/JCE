@@ -53,6 +53,16 @@ void jce_mesh_submit_wireframe_overlay(const JceMesh *mesh, const JceRenderer *r
 JCE_API uint32_t jce_mesh_vertex_count(const JceMesh *mesh);
 JCE_API uint32_t jce_mesh_index_count(const JceMesh *mesh);
 
+/* Raw bgfx handle indices for direct queue submission (UINT16_MAX if invalid). */
+JCE_API uint32_t jce_mesh_get_vbh(const JceMesh *mesh);
+JCE_API uint32_t jce_mesh_get_ibh(const JceMesh *mesh);
+
+/* Local-space axis-aligned bounding box (computed at create time from
+ * the supplied vertices). For an empty / null mesh, both arrays are
+ * filled with zeros. Used by frustum culling. */
+JCE_API void jce_mesh_get_aabb(const JceMesh *mesh,
+                                float out_min[3], float out_max[3]);
+
 /* Built-in procedural meshes. */
 JCE_API JceMesh *jce_mesh_create_cube(float size);
 JCE_API JceMesh *jce_mesh_create_plane(float width, float depth, uint32_t subdivs);

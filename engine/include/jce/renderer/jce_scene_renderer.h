@@ -13,8 +13,10 @@
 
 #include <jce/os/core/jce_defs.h>
 #include <jce/renderer/jce_csm.h>
+#include <jce/renderer/jce_occlusion_culler.h>
 #include <jce/renderer/jce_postfx.h>
 #include <jce/renderer/jce_texture_types.h>
+#include <jce/renderer/jce_time_of_day.h>
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -26,6 +28,12 @@ typedef struct JceCamera         JceCamera;
 typedef struct JceScene          JceScene;
 typedef struct JcePakArchive     JcePakArchive;
 typedef struct JceSceneRenderer  JceSceneRenderer;
+typedef struct JceLodGroup       JceLodGroup;
+
+/* Mirror of middleware's JCE_LOD_MAX_LEVELS — kept local so the
+ * renderer's public header doesn't have to pull middleware/scene/.
+ * The implementation file _Static_assert()s these stay in sync. */
+#define JCE_SCENE_LOD_MAX_LEVELS 8
 
 /* ── Render configuration (passed per-frame) ──────────────────────── */
 
@@ -55,6 +63,20 @@ typedef struct {
     uint16_t             shadow_map_size;  /* 0 = use default (2048) */
     uint8_t              csm_cascades;     /* 0 = use default (4)   */
     JceSceneViewModeKind view_mode;        /* default 0 = shaded   */
+
+    /* Broadphase frustum culling using the spatial grid. Approximate AABBs
+     * are derived from each entity's transform position + scale (a precise
+     * mesh AABB hookup is a future-work item). Default OFF — opt in when
+     * scenes grow large enough to benefit from the index. */
+    bool                 frustum_culling;
+
+    /* GPU-query occlusion culling (two-pass coherence-based).
+     * Set to a valid JceOcclusionCuller instance to enable; NULL disables.
+     * When active, entities occluded in the previous frame are skipped
+     * and a depth-only proxy is submitted for the current frame instead.
+     * Falls back to always-visible if hardware queries are unsupported.
+     * The caller owns the culler lifetime. */
+    JceOcclusionCuller  *occlusion_culler;
 
     /* Overlay hook (editor-only). NULL in runtime games. */
     JceSceneOnAfterSkyFn on_after_sky;
@@ -137,6 +159,85 @@ JCE_API const JceCsmData *jce_scene_renderer_get_csm(const JceSceneRenderer *sr)
 /* Returns the engine-owned PostFX pipeline. Editor and runtime use this
    single instance — no separate global. Returns NULL before create(). */
 JCE_API JcePostFXPipeline *jce_scene_renderer_get_postfx(JceSceneRenderer *sr);
+
+/* Per-frame culling stats from the most recent render call. */
+typedef struct {
+    uint32_t total;     /* entities collected this frame */
+    uint32_t visible;   /* entities that passed frustum culling */
+    uint32_t culled;    /* entities removed by culling (== total - visible) */
+    bool     enabled;   /* whether culling was active this frame */
+} JceSceneCullStats;
+
+JCE_API void jce_scene_renderer_get_cull_stats(const JceSceneRenderer *sr,
+                                                JceSceneCullStats *out);
+
+/* Optional global LOD group: when set (non-NULL) every entity that has
+ * a resolved mesh has its mesh substituted by jce_lod_pick() based on
+ * camera distance. Pass NULL to disable. The pointer is borrowed; the
+ * caller must keep the group alive for as long as it is set. */
+JCE_API void jce_scene_renderer_set_global_lod(JceSceneRenderer *sr,
+                                                const JceLodGroup *group);
+
+/* Access built-in primitive meshes the renderer creates internally:
+ * 0=cube, 1=sphere, 2=plane, 3=capsule, 4=cylinder.
+ * Returns NULL for invalid shape or if the renderer is not initialised.
+ * Useful for building demo LOD groups without loading external assets. */
+JCE_API JceMesh *jce_scene_renderer_get_builtin_mesh(JceSceneRenderer *sr,
+                                                     int shape);
+
+/* Per-frame LOD pick stats. picks[i] = number of entities drawn at level i. */
+typedef struct {
+    uint32_t picks[JCE_SCENE_LOD_MAX_LEVELS];
+    uint32_t culled;     /* entities the LOD pick reported as past last threshold */
+    int      level_count;/* group->count or 0 if no group bound */
+    bool     enabled;    /* whether a global LOD group was bound this frame */
+} JceSceneLodStats;
+
+JCE_API void jce_scene_renderer_get_lod_stats(const JceSceneRenderer *sr,
+                                               JceSceneLodStats *out);
+
+/* Per-frame render-queue stats (sum of shadow + main mesh flushes).
+ * `enabled` indicates whether the queue path was taken this frame. */
+typedef struct {
+    uint32_t commands_in;     /* draw commands fed into flush(es) */
+    uint32_t submits_out;     /* actual bgfx_submit calls */
+    uint32_t batches_merged;  /* number of auto-merged instance batches */
+    uint32_t instances_total; /* total instances across merged batches */
+    bool     enabled;
+} JceSceneRqStats;
+
+JCE_API void jce_scene_renderer_get_rq_stats(const JceSceneRenderer *sr,
+                                              JceSceneRqStats *out);
+
+/* Per-frame occlusion culling stats.
+ * Only meaningful when an occlusion culler was bound in config. */
+typedef struct {
+    uint32_t total;     /* entities tested against the culler */
+    uint32_t visible;   /* passed (query returned > min_pixels) */
+    uint32_t occluded;  /* skipped (fully occluded last frame) */
+    uint32_t warm_up;   /* first frame for entity, always drawn */
+    bool     enabled;
+} JceSceneOcclusionStats;
+
+JCE_API void jce_scene_renderer_get_occlusion_stats(const JceSceneRenderer *sr,
+                                                     JceSceneOcclusionStats *out);
+
+/* ── Time-of-day override ─────────────────────────────────────────── */
+/*
+ * When set, the renderer uses the snapshot's sky_top/horizon/ground for
+ * the procedural-gradient sky pass and `sun_direction` as the implicit
+ * directional light when no JceDirLightComponent is present in the scene
+ * (also used as the shadow-cascade light vector).
+ *
+ * Pass NULL to clear the override and restore the renderer's hardcoded
+ * defaults.  The struct is copied; caller need not keep it alive.
+ */
+JCE_API void jce_scene_renderer_set_time_of_day(JceSceneRenderer        *sr,
+                                                 const JceTimeOfDayState *state);
+
+/* Returns the active ToD snapshot (may be NULL if no override). */
+JCE_API const JceTimeOfDayState *jce_scene_renderer_get_time_of_day(
+    const JceSceneRenderer *sr);
 
 JCE_EXTERN_C_END
 

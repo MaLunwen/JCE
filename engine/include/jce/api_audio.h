@@ -13,7 +13,7 @@ extern "C" {
 #endif
 
 #include <jce/middleware/audio/jce_audio.h>
-#include <jce/middleware/audio/jce_audio_types.h>
+#include <jce/os/core/jce_asset_types.h>
 
 
 

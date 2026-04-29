@@ -6,7 +6,7 @@
  */
 
 #include <jce/os/core/jce_profiler.h>
-#include <jce/os/core/jce_pak_loader.h>
+#include <jce/resource/jce_pak_loader.h>
 
 #include "os/core/jce_memory.h"
 #include "resource/jce_pak_format.h"
@@ -34,6 +34,7 @@ struct JcePakArchive {
     char         **paths;       /* heap-allocated NUL-terminated copies*/
     int            owns_blob;   /* 1 => blob was malloc'd; free on close*/
     ZSTD_DCtx     *dctx;        /* reusable decompression context      */
+    SDL_AtomicInt  refcount;    /* shared-ownership counter (>=1 while alive) */
 };
 
 /* ================================================================== */
@@ -58,7 +59,20 @@ JcePakArchive *jce_pak_open(const void *data, size_t size) {
     if (version != JPAK_VERSION) return NULL;
 
     uint32_t count    = jpak_read_le32(blob + 8);
-    /* skip flags (blob+12) */
+    uint32_t hflags   = jpak_read_le32(blob + 12);
+
+    /* Capability gate: reject if any REQUIRED bit we don't understand
+     * is set.  Unknown OPTIONAL bits are allowed (forward compat). */
+    {
+        uint32_t req = hflags & JPAK_HEADER_CAP_REQUIRED_MASK;
+        uint32_t unknown_req = req & ~JPAK_HEADER_CAP_KNOWN_REQUIRED;
+        if (unknown_req != 0) {
+            SDL_Log("[pak] reject: unknown required capability flags 0x%08X",
+                    (unsigned)unknown_req);
+            return NULL;
+        }
+    }
+
     uint64_t toc_off  = jpak_read_le64(blob + 16);
     uint64_t data_off = jpak_read_le64(blob + 24);
 
@@ -72,6 +86,7 @@ JcePakArchive *jce_pak_open(const void *data, size_t size) {
     pak->blob      = blob;
     pak->blob_size = size;
     pak->count     = count;
+    SDL_SetAtomicInt(&pak->refcount, 1);
 
     pak->dctx = ZSTD_createDCtx();
 
@@ -132,11 +147,16 @@ JcePakArchive *jce_pak_open(const void *data, size_t size) {
 }
 
 /* ================================================================== */
-/* jce_pak_close                                                           */
+/* jce_pak_close — releases one reference; frees when refcount hits 0  */
 /* ================================================================== */
 
 void jce_pak_close(JcePakArchive *pak) {
     if (!pak) return;
+    /* Decrement refcount; only the final release performs the actual
+     * teardown.  AtomicAdd returns the OLD value. */
+    int prev = SDL_AddAtomicInt(&pak->refcount, -1);
+    if (prev > 1) return;  /* other owners still hold the archive */
+
     if (pak->paths) {
         for (uint32_t i = 0; i < pak->count; ++i)
             JCE_FREE(pak->paths[i]);
@@ -147,6 +167,18 @@ void jce_pak_close(JcePakArchive *pak) {
     ZSTD_freeDCtx(pak->dctx);
     if (pak->owns_blob) JCE_FREE((void *)pak->blob);
     JCE_FREE(pak);
+}
+
+JcePakArchive *jce_pak_acquire(JcePakArchive *pak) {
+    if (!pak) return NULL;
+    SDL_AddAtomicInt(&pak->refcount, 1);
+    return pak;
+}
+
+int jce_pak_refcount(const JcePakArchive *pak) {
+    if (!pak) return 0;
+    /* SDL atomic getters take non-const; cast away here, value is read-only. */
+    return SDL_GetAtomicInt((SDL_AtomicInt *)&pak->refcount);
 }
 
 /* ================================================================== */
@@ -225,21 +257,23 @@ size_t jce_pak_decompress(const JcePakAsset *asset, void *buf, size_t buf_size) 
     if (!asset || !buf || buf_size < asset->original_size)
         return 0;
 
+    JCE_PROFILE_ZONE_N("Pak::Decompress");
     size_t result;
     if (asset->flags & JCE_PAK_ASSET_STORED) {
         if (asset->compressed_size != asset->original_size)
-            return 0;
+            { JCE_PROFILE_ZONE_END; return 0; }
         memcpy(buf, asset->compressed_data, (size_t)asset->original_size);
         result = (size_t)asset->original_size;
     } else {
         result =
             ZSTD_decompress(buf, buf_size, asset->compressed_data, (size_t)asset->compressed_size);
         if (ZSTD_isError(result))
-            return 0;
+            { JCE_PROFILE_ZONE_END; return 0; }
     }
 
     if (g_verify_on_decompress && !jce_pak_verify(asset, buf, result))
-        return 0;
+        { JCE_PROFILE_ZONE_END; return 0; }
+    JCE_PROFILE_ZONE_END;
     return result;
 }
 
@@ -248,26 +282,28 @@ size_t jce_pak_decompress_ex(const JcePakArchive *pak, const JcePakAsset *asset,
     if (!asset || !buf || buf_size < asset->original_size)
         return 0;
 
+    JCE_PROFILE_ZONE_N("Pak::DecompressEx");
     size_t result;
     if (asset->flags & JCE_PAK_ASSET_STORED) {
         if (asset->compressed_size != asset->original_size)
-            return 0;
+            { JCE_PROFILE_ZONE_END; return 0; }
         memcpy(buf, asset->compressed_data, (size_t)asset->original_size);
         result = (size_t)asset->original_size;
     } else if (pak && pak->dctx) {
         result = ZSTD_decompressDCtx(pak->dctx, buf, buf_size, asset->compressed_data,
                                      (size_t)asset->compressed_size);
         if (ZSTD_isError(result))
-            return 0;
+            { JCE_PROFILE_ZONE_END; return 0; }
     } else {
         result =
             ZSTD_decompress(buf, buf_size, asset->compressed_data, (size_t)asset->compressed_size);
         if (ZSTD_isError(result))
-            return 0;
+            { JCE_PROFILE_ZONE_END; return 0; }
     }
 
     if (g_verify_on_decompress && !jce_pak_verify(asset, buf, result))
-        return 0;
+        { JCE_PROFILE_ZONE_END; return 0; }
+    JCE_PROFILE_ZONE_END;
     return result;
 }
 

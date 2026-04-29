@@ -98,9 +98,14 @@ function(jce_compile_shaders)
 
     # ── profile table ─────────────────────────────────────────────
     #  suffix    platform   profile
-    set(_suffixes  dx11     spv    glsl  essl    mtl)
-    set(_platforms windows  linux  linux android osx)
-    set(_profiles  s_5_0    spirv  120   300_es  metal)
+    # essl1 = OpenGL ES 2.0 / WebGL 1.0 (P3-34).  Most modern shaders
+    # cannot target it (no derivatives without ext, no MRT, no instancing,
+    # no SSBO, no compute) — entries in the allowlist below are limited
+    # to a hand-vetted basic-rendering subset.  Other profiles continue
+    # to compile every shader.
+    set(_suffixes  dx11     spv    glsl  essl    essl1   mtl)
+    set(_platforms windows  linux  linux android android osx)
+    set(_profiles  s_5_0    spirv  120   300_es  100_es  metal)
 
     list(LENGTH _suffixes _num_profiles)
     math(EXPR _max_idx "${_num_profiles} - 1")
@@ -109,6 +114,21 @@ function(jce_compile_shaders)
     # may restrict the set of suffixes we compile for.  Empty/unset =
     # compile every profile (legacy behaviour).
     set(_profile_filter "${JCE_SHADER_PROFILES}")
+
+    # GLES2 / WebGL1 shader allowlist — only these names are compiled
+    # for the essl1 profile.  Keep this in sync with what the renderer
+    # actually needs on legacy mobile / WebGL1 backends.  Override from
+    # the parent scope by setting JCE_SHADER_GLES2_ALLOWLIST.
+    if(NOT DEFINED JCE_SHADER_GLES2_ALLOWLIST)
+        set(JCE_SHADER_GLES2_ALLOWLIST
+            vs_color fs_color
+            vs_textured fs_textured
+            vs_mesh fs_mesh
+            vs_grid fs_grid
+            vs_sky  fs_sky
+            vs_imgui fs_imgui
+            vs_postfx fs_chromatic fs_grayscale fs_vignette fs_tonemap)
+    endif()
 
     # Ensure output directory exists.
     file(MAKE_DIRECTORY "${ARG_OUTPUT_DIR}")
@@ -146,6 +166,17 @@ function(jce_compile_shaders)
             # only available on Windows hosts.  Skip on macOS/Linux hosts.
             if(_suffix STREQUAL "dx11" AND NOT CMAKE_HOST_WIN32)
                 continue()
+            endif()
+
+            # essl1 (GLES2/WebGL1) is opt-in per-shader via the allowlist.
+            if(_suffix STREQUAL "essl1")
+                if(NOT _name IN_LIST JCE_SHADER_GLES2_ALLOWLIST)
+                    continue()
+                endif()
+                # Compute shaders cannot exist on GLES2.
+                if(_type STREQUAL "compute")
+                    continue()
+                endif()
             endif()
 
             set(_out "${ARG_OUTPUT_DIR}/${_name}_${_suffix}.bin")

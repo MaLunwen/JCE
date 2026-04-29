@@ -85,6 +85,7 @@ class JCEConan(ConanFile):
 
         self.requires("box2d/3.1.1")
         self.requires("bullet3/3.25")
+        self.requires("recastnavigation/1.6.0")
 
         self.requires("rmlui/4.4")
 

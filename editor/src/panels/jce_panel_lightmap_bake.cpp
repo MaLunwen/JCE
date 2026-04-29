@@ -20,9 +20,10 @@
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_thread.h>
 }
@@ -34,10 +35,7 @@ extern "C" {
 #include <cstdio>
 #include <cstring>
 #include <ctime>
-#include <filesystem>
 #include <vector>
-
-namespace fs = std::filesystem;
 
 namespace {
 
@@ -156,11 +154,7 @@ bool write_png_rgba(const char *path, int w, int h, const uint8_t *rgba)
 
     write_chunk(file, "IEND", nullptr, 0);
 
-    FILE *fp = std::fopen(path, "wb");
-    if (!fp) return false;
-    std::fwrite(file.data(), 1, file.size(), fp);
-    std::fclose(fp);
-    return true;
+    return ed_write_file(path, file.data(), file.size());
 }
 
 /* -------------------------------------------------------------------- */
@@ -403,9 +397,17 @@ static void ensure_atomics(void)
 
 void ensure_dir(const char *path)
 {
-    fs::path p(path);
-    std::error_code ec;
-    fs::create_directories(p.parent_path(), ec);
+    if (!path || !*path) return;
+    /* Extract parent directory by trimming the basename. */
+    char dir[1024];
+    size_t n = std::strlen(path);
+    if (n >= sizeof(dir)) n = sizeof(dir) - 1;
+    std::memcpy(dir, path, n);
+    dir[n] = '\0';
+    while (n > 0 && dir[n - 1] != '/' && dir[n - 1] != '\\') --n;
+    if (n == 0) return;       /* no separator: cwd-relative, nothing to do */
+    dir[n - 1] = '\0';        /* drop trailing separator */
+    if (dir[0]) jce_fs_host_create_directory(dir);
 }
 
 struct WorkerArgs {

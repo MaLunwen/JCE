@@ -5,8 +5,8 @@
  * the editor scene viewport, so panel-side code does not manage bgfx FBOs.
  */
 
-#ifndef jce_offscreen_target_H
-#define jce_offscreen_target_H
+#ifndef JCE_OFFSCREEN_TARGET_H
+#define JCE_OFFSCREEN_TARGET_H
 
 
 #include <jce/os/core/jce_defs.h>
@@ -42,4 +42,4 @@ JCE_API uint16_t jce_offscreen_target_get_view_id(const JceOffscreenTarget *brid
 
 JCE_EXTERN_C_END
 
-#endif /* jce_offscreen_target_H */
+#endif /* JCE_OFFSCREEN_TARGET_H */

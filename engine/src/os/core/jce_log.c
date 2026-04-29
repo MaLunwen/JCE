@@ -413,3 +413,41 @@ void jce_log_write(JceLogLevel level, const char *tag,
     /* Fallback: synchronous emit (WASM, or before init / after shutdown). */
     emit_message(&m);
 }
+
+void jce_log_write_v(JceLogLevel level, const char *tag,
+                     const char *file, int line,
+                     const char *fmt, va_list ap)
+{
+    if (level < g_min_level) return;
+
+    /* Build the log message on the stack. */
+    JceLogMessage m;
+    m.level        = level;
+    m.line         = line;
+    m.timestamp_ms = jce_time_ticks_ms();
+    m.wall_time    = 0;
+
+    snprintf(m.tag,  sizeof(m.tag),  "%s", tag  ? tag  : "");
+    snprintf(m.file, sizeof(m.file), "%s", file ? file : "");
+
+    /* Capture the calling thread's display name. */
+    if (tl_thread_name[0] != '\0') {
+        snprintf(m.thread_name, sizeof(m.thread_name), "%s", tl_thread_name);
+    } else {
+        snprintf(m.thread_name, sizeof(m.thread_name), "T-%lu",
+                 (unsigned long)SDL_GetCurrentThreadID());
+    }
+
+    /* Format the user message using provided va_list. */
+    vsnprintf(m.message, sizeof(m.message), fmt, ap);
+
+#ifdef JCE_LOG_ASYNC
+    if (g_ring) {
+        jce_log_ring_push(g_ring, &m);
+        return;
+    }
+#endif
+
+    /* Fallback: synchronous emit (WASM, or before init / after shutdown). */
+    emit_message(&m);
+}

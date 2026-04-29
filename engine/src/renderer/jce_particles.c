@@ -7,6 +7,7 @@
  */
 
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_profiler.h>
 #include <jce/renderer/jce_particles.h>
 
 #include <math.h>
@@ -266,9 +267,11 @@ static void update_emitter(Emitter *em, float dt, uint32_t *rng)
 void jce_particles_update(JceParticleSystem *sys, float dt)
 {
     if (!sys) return;
+    JCE_PROFILE_ZONE_N("Particles::Update");
     for (uint32_t i = 0; i < MAX_EMITTERS; i++) {
         update_emitter(&sys->emitters[i], dt, &sys->rng_state);
     }
+    JCE_PROFILE_ZONE_END;
 }
 
 /* ── Alive count ───────────────────────────────────────────────────── */

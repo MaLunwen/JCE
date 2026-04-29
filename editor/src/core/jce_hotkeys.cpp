@@ -4,8 +4,9 @@
 
 #include "jce_hotkeys.h"
 #include "jce_editor_config.h"
+#include "io/jce_editor_file_util.h"
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -185,37 +186,42 @@ extern "C" bool jce_hotkeys_save(void)
     if (!initialized) return false;
     char path[640];
     hotkeys_path(path, sizeof(path));
-    FILE *fp = std::fopen(path, "wb");
-    if (!fp) return false;
-    std::fprintf(fp, "{\n  \"hotkeys\": [\n");
+
+    /* Build JSON in a heap buffer; bound estimate per row ≈ 120 bytes. */
+    size_t cap = 64 + (size_t)JCE_HK_COUNT * 128;
+    char *buf = (char *)std::malloc(cap);
+    if (!buf) return false;
+    size_t off = 0;
+    int n = std::snprintf(buf + off, cap - off, "{\n  \"hotkeys\": [\n");
+    if (n < 0 || (size_t)n >= cap - off) { std::free(buf); return false; }
+    off += (size_t)n;
     for (int i = 0; i < JCE_HK_COUNT; ++i) {
-        std::fprintf(fp,
+        n = std::snprintf(buf + off, cap - off,
             "    { \"id\": \"%s\", \"key\": %d, \"mods\": %u }%s\n",
             s_table[i].id_string,
             (int)s_table[i].cur.key,
             (unsigned)s_table[i].cur.mods,
             (i + 1 < JCE_HK_COUNT) ? "," : "");
+        if (n < 0 || (size_t)n >= cap - off) { std::free(buf); return false; }
+        off += (size_t)n;
     }
-    std::fprintf(fp, "  ]\n}\n");
-    std::fclose(fp);
-    return true;
+    n = std::snprintf(buf + off, cap - off, "  ]\n}\n");
+    if (n < 0 || (size_t)n >= cap - off) { std::free(buf); return false; }
+    off += (size_t)n;
+
+    bool ok = ed_write_file(path, buf, off);
+    std::free(buf);
+    return ok;
 }
 
 extern "C" bool jce_hotkeys_load(void)
 {
     char path[640];
     hotkeys_path(path, sizeof(path));
-    FILE *fp = std::fopen(path, "rb");
-    if (!fp) return false;
-    std::fseek(fp, 0, SEEK_END);
-    long len = std::ftell(fp);
-    std::fseek(fp, 0, SEEK_SET);
-    if (len <= 0 || len > (1 << 20)) { std::fclose(fp); return false; }
-    char *buf = (char *)std::malloc((size_t)len + 1);
-    if (!buf) { std::fclose(fp); return false; }
-    std::fread(buf, 1, (size_t)len, fp);
-    buf[len] = '\0';
-    std::fclose(fp);
+    size_t len = 0;
+    char *buf = (char *)ed_read_file(path, &len);
+    if (!buf) return false;
+    if (len > (1 << 20)) { ED_FREE(buf); return false; }
 
     /* Tiny scanner: look for "id": "...", "key": N, "mods": N triples. */
     const char *p = buf;
@@ -248,6 +254,6 @@ extern "C" bool jce_hotkeys_load(void)
         }
         p = mods_key + 1;
     }
-    std::free(buf);
+    ED_FREE(buf);
     return true;
 }

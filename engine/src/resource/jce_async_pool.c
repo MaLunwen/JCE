@@ -17,7 +17,7 @@
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/os/core/jce_thread.h>
-#include <jce/os/core/jce_pak_loader.h>
+#include <jce/resource/jce_pak_loader.h>
 #include <jce/resource/jce_asset_format.h>
 
 #include "jce_asset_reader.h"
@@ -48,6 +48,13 @@ typedef struct InFlight {
 
 struct JceAsyncPool {
     JceThreadPool *tp;
+
+    /* Quiesce flag set during shutdown.  All public APIs (submit, drain,
+     * destroy) MUST be called from the same thread (typically the main
+     * thread) — workers only touch their own JceAsyncRequest and set the
+     * atomic `req->done` flag.  The flag is provided so future code that
+     * adds worker callbacks accessing pool state can short-circuit safely. */
+    SDL_AtomicInt shutting_down;
 
     /* In-flight list (mutex-protected). */
     JceMutex  *lock;
@@ -423,12 +430,25 @@ void jce_pool_destroy(JceAsyncPool *pool)
 {
     if (!pool) return;
 
-    /* Destroy the thread pool — waits for all in-flight tasks to finish. */
+    /* Mark quiesce first so any future worker code that adds a pool-state
+     * touch can bail out gracefully.  Today workers only touch their own
+     * request struct (atomic `done` flag), so this is purely defensive. */
+    SDL_SetAtomicInt(&pool->shutting_down, 1);
+
+    /* Destroy the thread pool — calls enkiWaitforAllAndShutdown(), which
+     * blocks until every submitted task callback has returned.  After this
+     * point no worker can race with the cleanup below. */
     if (pool->tp)
         jce_thread_pool_destroy(pool->tp);
 
-    /* Free in-flight tracking nodes (tasks are already complete). */
+    /* Free in-flight tracking nodes (tasks are already complete).  Take
+     * the lock for symmetry with submit/drain even though no other thread
+     * can touch the list at this point. */
+    if (pool->lock) jce_mutex_lock(pool->lock);
     InFlight *inf = pool->inflight_head;
+    pool->inflight_head = NULL;
+    pool->inflight_count = 0;
+    if (pool->lock) jce_mutex_unlock(pool->lock);
     while (inf) {
         InFlight *next = inf->next;
         if (inf->task) jce_task_free(inf->task);
@@ -440,8 +460,12 @@ void jce_pool_destroy(JceAsyncPool *pool)
         inf = next;
     }
 
-    /* Free remaining done requests. */
+    /* Free remaining done requests (drained by main thread only). */
+    if (pool->done_lock) jce_mutex_lock(pool->done_lock);
     JceAsyncRequest *req = pool->done_head;
+    pool->done_head = NULL;
+    pool->done_tail = NULL;
+    if (pool->done_lock) jce_mutex_unlock(pool->done_lock);
     while (req) {
         JceAsyncRequest *next = req->next;
         if (req->decoded_data) JCE_FREE(req->decoded_data);

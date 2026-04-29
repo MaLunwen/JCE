@@ -14,7 +14,7 @@ extern "C" {
 #include <jce/os/platform/jce_host_dialog.h>
 }
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 #include <stdio.h>
 #include <string.h>
 

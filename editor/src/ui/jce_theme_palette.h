@@ -17,7 +17,7 @@
 #ifndef JCE_THEME_PALETTE_H
 #define JCE_THEME_PALETTE_H
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 
 #include "jce_editor_style.h" /* JCE_THEME_DARK / LIGHT / SSMS */
 

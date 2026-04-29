@@ -17,7 +17,10 @@
 JCE_EXTERN_C_BEGIN
 
 /* Install crash signal handlers.  Call once, early in main / engine init. */
-JCE_API void jce_crash_handler_init(void);
+JCE_API void JCE_CALL jce_crash_handler_init(void);
+
+/* Restore default signal handlers.  Call during engine shutdown. */
+JCE_API void JCE_CALL jce_crash_handler_shutdown(void);
 
 JCE_EXTERN_C_END
 

@@ -33,8 +33,8 @@ JCE_API JceAnimPlayer *jce_anim_player_create(const JceSkeleton *skel);
 JCE_API void           jce_anim_player_destroy(JceAnimPlayer *player);
 
 /* Start playing a clip. loop=true for continuous, speed=1.0 for normal. */
-void  jce_anim_player_play(JceAnimPlayer *p, const JceAnimClip *clip,
-                           bool loop, float speed);
+JCE_API void JCE_CALL jce_anim_player_play(JceAnimPlayer *p, const JceAnimClip *clip,
+                                           bool loop, float speed);
 JCE_API void  jce_anim_player_stop(JceAnimPlayer *p);
 JCE_API void  jce_anim_player_pause(JceAnimPlayer *p, bool paused);
 JCE_API void  jce_anim_player_set_speed(JceAnimPlayer *p, float speed);
@@ -47,6 +47,27 @@ JCE_API bool  jce_anim_player_is_playing(const JceAnimPlayer *p);
 uint32_t jce_anim_player_update(JceAnimPlayer *p, float dt,
                                 jce_mat4 *out_joint_matrices,
                                 uint32_t max_joints);
+
+/* Blend two clips into the skeleton without mutating the player's
+ * playback state.  Useful for animator state-machine cross-fades and
+ * blend-tree (e.g. JceAnimBlendTree) evaluation.
+ *
+ * Samples `clip_a` at `time_a` and `clip_b` at `time_b`, then blends
+ * the resulting per-joint TRS using the supplied weights (normalised
+ * internally if they don't sum to 1).  Either clip may be NULL — that
+ * branch simply contributes zero weight.  When both are NULL the
+ * skeleton evaluates against the rest pose.
+ *
+ * Returns the number of joints written to `out_joint_matrices`. */
+JCE_API uint32_t jce_anim_player_blend(JceAnimPlayer    *p,
+                                        const JceAnimClip *clip_a,
+                                        float              time_a,
+                                        float              weight_a,
+                                        const JceAnimClip *clip_b,
+                                        float              time_b,
+                                        float              weight_b,
+                                        jce_mat4         *out_joint_matrices,
+                                        uint32_t           max_joints);
 
 /* -- Skeleton queries ---------------------------------------------- */
 

@@ -152,6 +152,63 @@ JCE_API uint32_t jce_streaming_pending_count(const JceStreamingSystem *sys);
 /* Current memory usage in bytes. */
 JCE_API uint64_t jce_streaming_memory_used(const JceStreamingSystem *sys);
 
+/* Total number of LRU-evicted chunks since system creation.  An eviction
+   is triggered when memory_used would exceed budget_mb and at least one
+   loaded chunk lies *outside* the load radius (least-recently-touched
+   wins).  Use this stat to gauge whether your budget is too tight. */
+JCE_API uint32_t jce_streaming_evicted_count(const JceStreamingSystem *sys);
+
+/* ================================================================== */
+/* Memory pressure                                                     */
+/* ================================================================== */
+/* Three-level back-pressure signal driven by `memory_used /
+ * budget_bytes`.  Updated once per jce_streaming_update().
+ *
+ *   OK   (< 0.85)  : free to load anything
+ *   SOFT (>= 0.85) : near budget; gameplay/streaming code SHOULD
+ *                    downgrade mip selection or pause prefetch
+ *   HARD (>= 1.00) : at/over budget; new loads are refused even if
+ *                    LRU eviction failed to reclaim space
+ *
+ * Threshold for SOFT is tunable via a future config field; HARD is
+ * always exactly the configured budget.  Callers can poll
+ * jce_streaming_get_pressure() or register a callback to be notified
+ * on level transitions only (no per-frame spam). */
+typedef enum JceStreamingPressure {
+    JCE_STREAM_PRESSURE_OK   = 0,
+    JCE_STREAM_PRESSURE_SOFT = 1,
+    JCE_STREAM_PRESSURE_HARD = 2,
+} JceStreamingPressure;
+
+/* Current level (cheap to call, no locks). */
+JCE_API JceStreamingPressure jce_streaming_get_pressure(const JceStreamingSystem *sys);
+
+/* Highest level seen since system creation — useful for tuning the
+ * budget retroactively after a play session. */
+JCE_API JceStreamingPressure jce_streaming_pressure_high_water(const JceStreamingSystem *sys);
+
+/* String form for logs / profiler labels ("OK"/"SOFT"/"HARD"). */
+JCE_API const char *jce_streaming_pressure_name(JceStreamingPressure p);
+
+/* Optional callback fired ONCE on each pressure-level transition.
+ * Useful to e.g. nudge mip-bias settings or page out far chunks.
+ * `prev` and `curr` always differ.  Set fn=NULL to disable. */
+typedef void (*JceStreamingPressureFn)(JceStreamingPressure prev,
+                                        JceStreamingPressure curr,
+                                        uint64_t              memory_used,
+                                        uint64_t              budget_bytes,
+                                        void                 *user_data);
+
+JCE_API void jce_streaming_set_pressure_callback(JceStreamingSystem    *sys,
+                                                  JceStreamingPressureFn fn,
+                                                  void                  *user_data);
+
+/* Number of HARD-pressure load refusals since system creation.  Each
+ * tick that a load was refused due to over-budget memory increments
+ * this counter — a non-zero value proves the back-pressure path is
+ * actually firing (and your budget is too tight). */
+JCE_API uint32_t jce_streaming_refused_loads(const JceStreamingSystem *sys);
+
 /* Check if a specific chunk is loaded. */
 bool jce_streaming_chunk_loaded(const JceStreamingSystem *sys,
                                  uint32_t chunk_id);

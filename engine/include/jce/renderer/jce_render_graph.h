@@ -118,6 +118,16 @@ JCE_API void jce_rg_execute(JceRenderGraph *rg);
  * resource declarations.  Imported resources survive. */
 JCE_API void jce_rg_reset(JceRenderGraph *rg);
 
+/* ================================================================== */
+/* Self-test                                                            */
+/* ================================================================== */
+
+/* Build a small DAG (3 passes, 2 resources, including a known cycle in
+ * a sibling sub-graph), run topo-sort + cycle detection, and verify the
+ * outputs.  Does NOT touch bgfx — safe to call before/after the
+ * renderer is active.  Returns true if all assertions passed. */
+JCE_API bool jce_rg_self_test(void);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_RENDER_GRAPH_H */

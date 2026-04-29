@@ -38,6 +38,29 @@
  * memcpy compressed_size == original_size bytes directly. */
 #define JPAK_FLAG_STORED 0x00000001u
 
+/* -- Header capability flags (PAK v2.1+) ---------------------------- *
+ *
+ * The 32-bit `flags` field in JpakHeader carries archive-wide capability
+ * bits.  The space is split:
+ *
+ *   bits  0..15  REQUIRED capabilities  loader MUST understand every
+ *                set bit or the archive is rejected (forward incompat).
+ *   bits 16..31  OPTIONAL capabilities  unknown bits are logged and
+ *                ignored (forward compat for non-breaking features).
+ *
+ * No required caps are currently defined, so vintage v2 archives
+ * (flags == 0) load identically.  Tooling that adds e.g. encryption or
+ * mandatory signature verification would burn a REQUIRED bit; tooling
+ * that adds purely informational metadata would burn an OPTIONAL bit.
+ */
+#define JPAK_HEADER_CAP_REQUIRED_MASK 0x0000FFFFu
+#define JPAK_HEADER_CAP_OPTIONAL_MASK 0xFFFF0000u
+
+/* The set of REQUIRED bits this build of the loader understands.
+ * Update in lockstep with any new mandatory feature.  Loader rejects
+ * any archive whose (flags & REQUIRED_MASK & ~CAP_KNOWN_REQUIRED) != 0. */
+#define JPAK_HEADER_CAP_KNOWN_REQUIRED 0x00000000u
+
 /* -- On-disk structures (all fields little-endian) ------------------ */
 
 #pragma pack(push, 1)

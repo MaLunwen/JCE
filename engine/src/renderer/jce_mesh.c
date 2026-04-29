@@ -23,6 +23,8 @@ struct JceMesh {
     uint32_t                    num_verts;
     uint32_t                    num_indices;
     uint32_t                    num_wf_indices;
+    float                       aabb_min[3];
+    float                       aabb_max[3];
 };
 
 typedef struct JceEdgeKey {
@@ -142,6 +144,20 @@ JceMesh *jce_mesh_create(const JceMeshVertex *vertices, uint32_t num_verts,
     init_mesh_layout(&m->layout);
     m->num_verts   = num_verts;
     m->num_indices = num_indices;
+
+    /* Compute local-space AABB from the vertex stream. */
+    {
+        float mn[3] = { vertices[0].pos[0], vertices[0].pos[1], vertices[0].pos[2] };
+        float mx[3] = { vertices[0].pos[0], vertices[0].pos[1], vertices[0].pos[2] };
+        for (uint32_t i = 1; i < num_verts; i++) {
+            const float *p = vertices[i].pos;
+            if (p[0] < mn[0]) mn[0] = p[0]; if (p[0] > mx[0]) mx[0] = p[0];
+            if (p[1] < mn[1]) mn[1] = p[1]; if (p[1] > mx[1]) mx[1] = p[1];
+            if (p[2] < mn[2]) mn[2] = p[2]; if (p[2] > mx[2]) mx[2] = p[2];
+        }
+        m->aabb_min[0] = mn[0]; m->aabb_min[1] = mn[1]; m->aabb_min[2] = mn[2];
+        m->aabb_max[0] = mx[0]; m->aabb_max[1] = mx[1]; m->aabb_max[2] = mx[2];
+    }
 
     /* Create vertex buffer. */
     const bgfx_memory_t *vmem = bgfx_copy(vertices,
@@ -328,6 +344,35 @@ uint32_t jce_mesh_vertex_count(const JceMesh *mesh)
 uint32_t jce_mesh_index_count(const JceMesh *mesh)
 {
     return mesh ? mesh->num_indices : 0;
+}
+
+uint32_t jce_mesh_get_vbh(const JceMesh *mesh)
+{
+    return mesh ? (uint32_t)mesh->vbh.idx : (uint32_t)UINT16_MAX;
+}
+
+uint32_t jce_mesh_get_ibh(const JceMesh *mesh)
+{
+    return mesh ? (uint32_t)mesh->ibh.idx : (uint32_t)UINT16_MAX;
+}
+
+void jce_mesh_get_aabb(const JceMesh *mesh, float out_min[3], float out_max[3])
+{
+    if (!mesh) {
+        if (out_min) { out_min[0] = out_min[1] = out_min[2] = 0.0f; }
+        if (out_max) { out_max[0] = out_max[1] = out_max[2] = 0.0f; }
+        return;
+    }
+    if (out_min) {
+        out_min[0] = mesh->aabb_min[0];
+        out_min[1] = mesh->aabb_min[1];
+        out_min[2] = mesh->aabb_min[2];
+    }
+    if (out_max) {
+        out_max[0] = mesh->aabb_max[0];
+        out_max[1] = mesh->aabb_max[1];
+        out_max[2] = mesh->aabb_max[2];
+    }
 }
 
 /* -- Built-in procedural meshes ------------------------------------ */

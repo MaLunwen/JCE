@@ -159,8 +159,11 @@ JceDebugHud *jce_debug_hud_create(const JceDebugHudDesc *desc)
 void jce_debug_hud_destroy(JceDebugHud *hud)
 {
     if (!hud) return;
-    if (hud->ui && jce_ui_doc_valid(hud->doc))
-        jce_ui_doc_close(hud->ui, hud->doc);
+    /* Document lifetime is owned by the UI context. Avoid calling
+     * jce_ui_doc_close() here because doc->Close() during application
+     * shutdown can interact poorly with other still-live documents and
+     * cause an access violation. Rml::Shutdown() (invoked by
+     * jce_ui_destroy) cleans up all remaining documents safely. */
     JCE_FREE(hud);
 }
 

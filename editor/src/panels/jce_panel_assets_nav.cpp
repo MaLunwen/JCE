@@ -2,6 +2,8 @@
  * jce_panel_assets_nav.cpp  Directory tree, breadcrumb, search.
  */
 
+#include <jce/os/core/jce_path.h>
+
 #include "core/jce_editor_config.h"
 #include "jce_panel_assets_internal.h"
 
@@ -19,70 +21,89 @@ static void persist_asset_browser_view_mode(void)
 
 /* ── Directory tree (recursive) ──────────────────────────────────── */
 
-static void draw_dir_tree(const fs::path &dir, int depth)
+static void draw_dir_tree(const std::string &dir, int depth)
 {
     if (depth > 5) return;
-    try {
-        std::vector<fs::path> subdirs;
-        for (auto &de : fs::directory_iterator(dir)) {
-            if (de.is_directory())
-                subdirs.push_back(de.path());
+    
+    struct ListCtx {
+        std::vector<std::string> *subdirs;
+        std::string dir;
+    } ctx;
+    std::vector<std::string> subdirs;
+    ctx.subdirs = &subdirs;
+    ctx.dir = dir;
+    
+    auto cb = [](const char *name, bool is_dir, void *ud) -> bool {
+        if (!is_dir) return true;
+        
+        ListCtx *c = static_cast<ListCtx*>(ud);
+        char full[1024];
+        jce_path_join(full, sizeof(full), c->dir.c_str(), name);
+        c->subdirs->push_back(full);
+        return true;
+    };
+    
+    jce_fs_host_list_dir(dir.c_str(), cb, &ctx);
+    std::sort(subdirs.begin(), subdirs.end());
+
+    for (auto &sd : subdirs) {
+        char dirname[256];
+        jce_path_basename(dirname, sizeof(dirname), sd.c_str());
+
+        ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_SpanAvailWidth;
+
+        /* Check if current */
+        char norm_sd[1024], norm_cur[1024];
+        jce_path_normalize(norm_sd, sizeof(norm_sd), sd.c_str());
+        jce_path_normalize(norm_cur, sizeof(norm_cur), s_assets.current_path.c_str());
+        bool is_current = (strcmp(norm_sd, norm_cur) == 0);
+        if (is_current)
+            flags |= ImGuiTreeNodeFlags_Selected;
+
+        /* Check for children */
+        struct HasChildCtx { bool has; };
+        HasChildCtx hc_ctx = { false };
+        auto hc_cb = [](const char *, bool is_dir, void *ud) -> bool {
+            if (is_dir) {
+                static_cast<HasChildCtx*>(ud)->has = true;
+                return false;
+            }
+            return true;
+        };
+        jce_fs_host_list_dir(sd.c_str(), hc_cb, &hc_ctx);
+        bool has_children = hc_ctx.has;
+
+        if (!has_children)
+            flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+
+        bool open = ImGui::TreeNodeEx(dirname, flags);
+
+        /* Single-click anywhere on the row navigates into that folder
+           (TreeNode also toggles open/closed — both happen on the same click). */
+        if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
+            navigate_asset_directory(sd, false);
         }
-        std::sort(subdirs.begin(), subdirs.end());
-
-        for (auto &sd : subdirs) {
-            std::string dirname = sd.filename().string();
-
-            ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_SpanAvailWidth;
-
-            bool is_current = false;
-            try { is_current = fs::equivalent(sd, s_assets.current_path); }
-            catch (...) { is_current = (sd.string() == s_assets.current_path); }
-            if (is_current)
-                flags |= ImGuiTreeNodeFlags_Selected;
-
-            bool has_children = false;
-            try {
-                for (auto &child : fs::directory_iterator(sd)) {
-                    if (child.is_directory()) { has_children = true; break; }
-                }
-            } catch (...) {}
-
-            if (!has_children)
-                flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
-
-            bool open = ImGui::TreeNodeEx(dirname.c_str(), flags);
-
-            /* Single-click anywhere on the row navigates into that folder
-               (TreeNode also toggles open/closed — both happen on the same click). */
-            if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
-                navigate_asset_directory(sd.string(), false);
-            }
-            if (ImGui::IsMouseDoubleClicked(0) && ImGui::IsItemHovered() && !ImGui::IsItemToggledOpen()) {
-                navigate_asset_directory(sd.string(), false);
-            }
-
-            if (ImGui::BeginPopupContextItem()) {
-                if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInExplorer"))) {
-                    jce_host_reveal_path(sd.string().c_str());
-                }
-                if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInVSCode"))) {
-                    jce_host_open_in_text_editor(sd.string().c_str());
-                }
-                if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInTerminal"))) {
-                    jce_host_open_terminal(sd.string().c_str());
-                }
-                ImGui::EndPopup();
-            }
-
-            if (open && has_children) {
-                draw_dir_tree(sd, depth + 1);
-                ImGui::TreePop();
-            }
+        if (ImGui::IsMouseDoubleClicked(0) && ImGui::IsItemHovered() && !ImGui::IsItemToggledOpen()) {
+            navigate_asset_directory(sd, false);
         }
-    } catch (const std::exception &e) {
-        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-            "Asset tree: %s", e.what());
+
+        if (ImGui::BeginPopupContextItem()) {
+            if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInExplorer"))) {
+                jce_host_reveal_path(sd.c_str());
+            }
+            if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInVSCode"))) {
+                jce_host_open_in_text_editor(sd.c_str());
+            }
+            if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInTerminal"))) {
+                jce_host_open_terminal(sd.c_str());
+            }
+            ImGui::EndPopup();
+        }
+
+        if (open && has_children) {
+            draw_dir_tree(sd, depth + 1);
+            ImGui::TreePop();
+        }
     }
 }
 
@@ -92,15 +113,19 @@ void draw_asset_directory_tree(float tree_w, float panel_h)
 {
     ImGui::BeginChild("AssetTree", ImVec2(tree_w, panel_h), ImGuiChildFlags_Borders);
     {
-        std::string root_name = fs::path(s_assets.project_root).filename().string();
+        char root_name_buf[256];
+        jce_path_basename(root_name_buf, sizeof(root_name_buf), s_assets.project_root.c_str());
+        std::string root_name = root_name_buf;
         if (root_name.empty() || root_name == "." || root_name == "/" || root_name == "\\")
             root_name = "Project";
 
         ImGuiTreeNodeFlags root_flags = ImGuiTreeNodeFlags_DefaultOpen
                                       | ImGuiTreeNodeFlags_SpanAvailWidth;
-        bool root_is_current = false;
-        try { root_is_current = fs::equivalent(s_assets.project_root, s_assets.current_path); }
-        catch (...) { root_is_current = (s_assets.current_path == s_assets.project_root); }
+        
+        char norm_root[1024], norm_cur[1024];
+        jce_path_normalize(norm_root, sizeof(norm_root), s_assets.project_root.c_str());
+        jce_path_normalize(norm_cur, sizeof(norm_cur), s_assets.current_path.c_str());
+        bool root_is_current = (strcmp(norm_root, norm_cur) == 0);
         if (root_is_current)
             root_flags |= ImGuiTreeNodeFlags_Selected;
 
@@ -132,10 +157,10 @@ void draw_asset_directory_tree(float tree_w, float panel_h)
 
 /* ── B. Breadcrumb bar ───────────────────────────────────────────── */
 
-/* Strip trailing path separator(s). std::filesystem::path::parent_path()
-   on a path ending in "/" returns the same path (treats it as a
-   directory entry), which makes "Up" appear to do nothing on the second
-   click. Normalize first so parent_path() always pops one segment. */
+/* Strip trailing path separator(s).  jce_path_parent on a path ending
+   in "/" treats it as a directory entry and returns the same path,
+   which would make "Up" appear to do nothing on the second click.
+   Normalize first so parent always pops one segment. */
 static std::string strip_trailing_sep(const std::string &s)
 {
     if (s.empty()) return s;
@@ -151,54 +176,60 @@ static std::string strip_trailing_sep(const std::string &s)
 void draw_asset_breadcrumb_bar(void)
 {
     {
-        fs::path cur(strip_trailing_sep(s_assets.current_path));
-        fs::path root(strip_trailing_sep(s_assets.project_root));
+        std::string cur_str = strip_trailing_sep(s_assets.current_path);
+        std::string root_str = strip_trailing_sep(s_assets.project_root);
 
         /* Up button: disabled at the project root and at any path that
            cannot ascend further (filesystem root). Computed on the
            absolute form so trailing-relative paths still resolve. */
-        fs::path cur_abs;
-        try { cur_abs = fs::weakly_canonical(cur); }
-        catch (...) { cur_abs = fs::absolute(cur); }
-        fs::path root_abs;
-        try { root_abs = fs::weakly_canonical(root); }
-        catch (...) { root_abs = fs::absolute(root); }
-        fs::path parent_abs = cur_abs.parent_path();
-        bool at_root = (cur_abs.lexically_normal() == root_abs.lexically_normal());
+        char cur_abs[1024], root_abs[1024], parent_abs[1024];
+        jce_path_normalize(cur_abs, sizeof(cur_abs), cur_str.c_str());
+        jce_path_normalize(root_abs, sizeof(root_abs), root_str.c_str());
+        jce_path_parent(parent_abs, sizeof(parent_abs), cur_abs);
+        
+        bool at_root = (strcmp(cur_abs, root_abs) == 0);
+        
+        char parent_norm[1024];
+        jce_path_normalize(parent_norm, sizeof(parent_norm), parent_abs);
         bool can_go_up = !at_root
-                      && !parent_abs.empty()
-                      && parent_abs.lexically_normal() != cur_abs.lexically_normal();
+                      && parent_abs[0] != '\0'
+                      && strcmp(parent_norm, cur_abs) != 0;
 
         ImGui::BeginDisabled(!can_go_up);
         if (ImGui::SmallButton(jce_editor_i18n("assetBrowser.up"))) {
-            try {
-                navigate_asset_directory(parent_abs.string(), false);
-            } catch (const std::exception &e) {
-                jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-                    "Navigate up: %s", e.what());
-            }
+            navigate_asset_directory(parent_abs, false);
         }
         ImGui::EndDisabled();
         ImGui::SameLine();
-        (void)root;
 
         {
-            std::string root_name = fs::path(s_assets.project_root).filename().string();
+            char root_name_buf[256];
+            jce_path_basename(root_name_buf, sizeof(root_name_buf), s_assets.project_root.c_str());
+            std::string root_name = root_name_buf;
             if (root_name.empty() || root_name == "." || root_name == "/" || root_name == "\\")
                 root_name = "Project";
 
             std::vector<std::pair<std::string, std::string>> crumbs;
             crumbs.push_back({root_name, s_assets.project_root});
 
-            if (cur.lexically_normal() != root.lexically_normal()) {
-                fs::path rel;
-                try { rel = fs::relative(cur, root); }
-                catch (...) {}
-                if (!rel.empty() && rel != ".") {
-                    fs::path accum(s_assets.project_root);
-                    for (auto &part : rel) {
-                        accum = accum / part;
-                        crumbs.push_back({part.string(), accum.string()});
+            char norm_cur[1024], norm_root[1024];
+            jce_path_normalize(norm_cur, sizeof(norm_cur), cur_str.c_str());
+            jce_path_normalize(norm_root, sizeof(norm_root), root_str.c_str());
+            
+            if (strcmp(norm_cur, norm_root) != 0) {
+                char rel_buf[1024];
+                if (jce_path_relative(rel_buf, sizeof(rel_buf), cur_str.c_str(), root_str.c_str())) {
+                    if (rel_buf[0] != '\0' && strcmp(rel_buf, ".") != 0) {
+                        /* Split rel_buf by path separators and build crumbs */
+                        std::string accum = s_assets.project_root;
+                        char *tok = strtok(rel_buf, "/\\");
+                        while (tok) {
+                            char joined[1024];
+                            jce_path_join(joined, sizeof(joined), accum.c_str(), tok);
+                            accum = joined;
+                            crumbs.push_back({tok, accum});
+                            tok = strtok(NULL, "/\\");
+                        }
                     }
                 }
             }

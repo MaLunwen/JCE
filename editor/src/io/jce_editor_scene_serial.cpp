@@ -14,13 +14,13 @@
 extern "C" {
 #include <jce/middleware/scene/jce_scene_components_json.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_path.h>
 #include <jce/os/core/jce_alloc.h>
 #include <jce/renderer/jce_model.h>
 }
 
 #include <cmath>
 #include <cstring>
-#include <filesystem>
 
 /* ── Serialize entity tree to JSON (recursive, for prefabs) ────────── */
 
@@ -169,15 +169,15 @@ static void validate_mesh_cb(JceScene *sc, JceEntity e, void *ud)
     if (!mr || mr->mesh_path[0] == '\0') return;
     if (!is_gltf_extension(mr->mesh_path)) return;
 
-    namespace fs = std::filesystem;
-    fs::path mesh_p(mr->mesh_path);
-    if (!mesh_p.is_absolute() && ctx->scene_dir && ctx->scene_dir[0]) {
-        mesh_p = fs::path(ctx->scene_dir) / mesh_p;
+    char abs_path[1024];
+    if (!jce_path_is_absolute(mr->mesh_path) && ctx->scene_dir && ctx->scene_dir[0]) {
+        jce_path_join(abs_path, sizeof(abs_path), ctx->scene_dir, mr->mesh_path);
+    } else {
+        snprintf(abs_path, sizeof(abs_path), "%s", mr->mesh_path);
     }
-    std::string abs_path = mesh_p.string();
 
     size_t file_size = 0;
-    void *data = jce_fs_host_read_all(abs_path.c_str(), &file_size);
+    void *data = jce_fs_host_read_all(abs_path, &file_size);
     if (!data) return;
 
     ctx->checked++;
@@ -197,15 +197,12 @@ static void validate_mesh_cb(JceScene *sc, JceEntity e, void *ud)
 
 static void validate_mesh_assets(const char *scene_path)
 {
-    namespace fs = std::filesystem;
-    std::string scene_dir;
+    char scene_dir[1024] = "";
     if (scene_path) {
-        fs::path sp(scene_path);
-        if (sp.has_parent_path())
-            scene_dir = sp.parent_path().string();
+        jce_path_parent(scene_dir, sizeof(scene_dir), scene_path);
     }
 
-    MeshValidCtx ctx = { 0, 0, scene_dir.c_str() };
+    MeshValidCtx ctx = { 0, 0, scene_dir[0] ? scene_dir : NULL };
     jce_scene_each_entity(s.scene, validate_mesh_cb, &ctx);
 
     if (ctx.checked > 0 && ctx.failed == 0) {

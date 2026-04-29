@@ -5,6 +5,7 @@
  * tight-fitting ortho projections per cascade.
  */
 
+#include <jce/os/core/jce_profiler.h>
 #include <jce/renderer/jce_csm.h>
 #include <math.h>
 #include <string.h>
@@ -70,6 +71,7 @@ void jce_csm_compute(JceCsmData *out,
                      uint16_t shadow_map_size)
 {
     if (!out || !camera_view || !light_dir) return;
+    JCE_PROFILE_ZONE_N("CSM::Compute");
     if (cascade_count < 1) cascade_count = 1;
     if (cascade_count > JCE_CSM_MAX_CASCADES) cascade_count = JCE_CSM_MAX_CASCADES;
 
@@ -147,4 +149,5 @@ void jce_csm_compute(JceCsmData *out,
 
         out->vp[c] = jce_m4_multiply(&light_proj, &light_view);
     }
+    JCE_PROFILE_ZONE_END;
 }

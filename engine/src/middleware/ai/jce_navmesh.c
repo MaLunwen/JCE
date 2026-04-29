@@ -5,6 +5,7 @@
 #include <jce/middleware/ai/jce_navmesh.h>
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_profiler.h>
 
 #include "os/core/jce_memory.h"
 
@@ -180,6 +181,8 @@ int jce_navmesh_find_path(const JceNavMesh *nm,
         return 1;
     }
 
+    JCE_PROFILE_ZONE_N("NavMesh::FindPath");
+
     size_t cells = (size_t)nm->gx * (size_t)nm->gz;
     float    *gscore  = (float *)JCE_CALLOC(cells, sizeof(float));
     int      *parent  = (int   *)JCE_CALLOC(cells, sizeof(int));
@@ -187,6 +190,7 @@ int jce_navmesh_find_path(const JceNavMesh *nm,
     AStarOpen *open    = (AStarOpen *)JCE_CALLOC(cells, sizeof(AStarOpen));
     if (!gscore || !parent || !closed || !open) {
         JCE_FREE(gscore); JCE_FREE(parent); JCE_FREE(closed); JCE_FREE(open);
+        JCE_PROFILE_ZONE_END;
         return 0;
     }
     for (size_t i = 0; i < cells; ++i) { gscore[i] = 1e30f; parent[i] = -1; }
@@ -252,5 +256,6 @@ int jce_navmesh_find_path(const JceNavMesh *nm,
     }
 
     JCE_FREE(gscore); JCE_FREE(parent); JCE_FREE(closed); JCE_FREE(open);
+    JCE_PROFILE_ZONE_END;
     return written;
 }

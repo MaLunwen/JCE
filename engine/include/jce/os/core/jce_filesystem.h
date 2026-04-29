@@ -52,18 +52,18 @@ JCE_API JceFile *jce_fs_open(const JceFileSystem *fs, const char *virtual_path);
 JCE_API void JCE_CALL jce_fs_close(JceFile *file);
 
 /* Read up to buf_size bytes into buf.  Returns bytes actually read. */
-JCE_API size_t JCE_CALL jce_fs_read(JceFile *file, void *buf, size_t buf_size);
+JCE_API uint64_t JCE_CALL jce_fs_read(JceFile *file, void *buf, uint64_t buf_size);
 
 /* Get total file size in bytes (0 if unknown). */
-JCE_API size_t JCE_CALL jce_fs_size(const JceFile *file);
+JCE_API uint64_t JCE_CALL jce_fs_size(const JceFile *file);
 
 /* -- Convenience: load entire file into a newly allocated buffer ---- */
 
 /* Allocate and read the entire file.  Caller must JCE_FREE(buf).
    Sets *out_size to the number of bytes read.
    Returns NULL if the file cannot be opened. */
-void *jce_fs_read_all(const JceFileSystem *fs, const char *virtual_path,
-                      size_t *out_size);
+JCE_API void *JCE_CALL jce_fs_read_all(const JceFileSystem *fs, const char *virtual_path,
+                                       uint64_t *out_size);
 
 /* -- Query ---------------------------------------------------------- */
 
@@ -84,13 +84,13 @@ JCE_API bool JCE_CALL jce_fs_set_write_dir(JceFileSystem *fs, const char *direct
 JCE_API JceFile *jce_fs_open_write(JceFileSystem *fs, const char *virtual_path);
 
 /* Write bytes to an opened-for-write file.  Returns bytes written. */
-JCE_API size_t JCE_CALL jce_fs_write(JceFile *file, const void *buf, size_t size);
+JCE_API uint64_t JCE_CALL jce_fs_write(JceFile *file, const void *buf, uint64_t size);
 
 /* Convenience: write an entire buffer to a file in one call.
    Equivalent to open_write + write + close.
    Returns false on any error. */
 JCE_API bool JCE_CALL jce_fs_write_all(JceFileSystem *fs, const char *virtual_path,
-                      const void *data, size_t size);
+                      const void *data, uint64_t size);
 
 /* ================================================================== */
 /* Host filesystem helpers                                             */
@@ -160,37 +160,48 @@ JCE_API bool JCE_CALL jce_fs_host_remove_recursive(const char *path);
    the candidate.  Writes up to `out_size` bytes into `out`.  Returns
    true on success, false on overflow or invalid input. */
 JCE_API bool JCE_CALL jce_fs_host_make_unique_path(const char *desired,
-                                  char *out, size_t out_size);
+                                  char *out, uint32_t out_size);
 
 /* Read an entire host-path file into a freshly allocated buffer.
-   On success returns a JCE_MALLOC'd buffer of *out_size bytes (caller
-   frees with JCE_FREE) and writes the byte count to *out_size.
+   On success returns a buffer of *out_size bytes (caller frees with
+   jce_fs_buffer_free) and writes the byte count to *out_size.
    Returns NULL on any error (missing file, read truncation, OOM). */
-JCE_API void *jce_fs_host_read_all(const char *path, size_t *out_size);
+JCE_API void *jce_fs_host_read_all(const char *path, uint64_t *out_size);
 
 /* Write an entire buffer to a host-path file (truncate-and-replace).
    Creates parent directories that do not exist.  Returns true on
    success. */
 JCE_API bool JCE_CALL jce_fs_host_write_all(const char *path,
-                           const void *data, size_t size);
+                           const void *data, uint64_t size);
 
 /* Append a buffer to the end of a host-path file (creating it if missing).
    Returns true on success.  Suitable for log/KPI streams; not safe for
    concurrent multi-process appends. */
 JCE_API bool JCE_CALL jce_fs_host_append(const char *path,
-                           const void *data, size_t size);
+                           const void *data, uint64_t size);
 
 /* Read up to `max_bytes` of a host-path file into a freshly allocated
-   buffer.  On success returns a JCE_MALLOC'd buffer of *out_read bytes
-   (always NUL-terminated past the end so it's safe to cast to char*),
-   and writes the full file size to *out_total (caller may pass NULL
-   for either).  Returns NULL on failure. */
-JCE_API void *jce_fs_host_read_capped(const char *path, size_t max_bytes,
-                                      size_t *out_read, size_t *out_total);
+   buffer.  On success returns a buffer of *out_read bytes (always
+   NUL-terminated past the end so it's safe to cast to char*; caller
+   frees with jce_fs_buffer_free), and writes the full file size to
+   *out_total (caller may pass NULL for either).  Returns NULL on failure. */
+JCE_API void *jce_fs_host_read_capped(const char *path, uint64_t max_bytes,
+                                      uint64_t *out_read, uint64_t *out_total);
+
+/* Release a buffer returned by jce_fs_host_read_all / read_capped.
+   NULL is OK.  Required because the engine internal allocator is not
+   exposed in the public API. */
+JCE_API void JCE_CALL jce_fs_buffer_free(void *buf);
 
 /* Get the executable's directory (with trailing path separator) into
    `out`.  Returns true on success.  Equivalent to SDL_GetBasePath. */
-JCE_API bool JCE_CALL jce_fs_host_get_base_path(char *out, size_t out_size);
+JCE_API bool JCE_CALL jce_fs_host_get_base_path(char *out, uint32_t out_size);
+
+/* Get the process's current working directory (no trailing separator)
+   into `out`.  Returns true on success.  Use this rather than the
+   exe directory when the editor or tooling needs the user's launch
+   context (e.g. project root resolution, "open file" defaults). */
+JCE_API bool JCE_CALL jce_fs_host_get_current_dir(char *out, uint32_t out_size);
 
 JCE_EXTERN_C_END
 

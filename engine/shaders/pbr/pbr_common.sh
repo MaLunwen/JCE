@@ -82,4 +82,43 @@ vec3 fresnelSchlickRoughness(float cosTheta, vec3 F0, float roughness)
     return F0 + (maxVal - F0) * pow(max(1.0 - cosTheta, 0.0), 5.0);
 }
 
+// ---------------------------------------------------------------------
+// Variance Shadow Maps (VSM) sampling
+// ---------------------------------------------------------------------
+// Read the (depth, depth^2) moments from a VSM target and return the
+// lit-fraction upper bound at test depth `t`.
+// `min_variance` clamps numerical noise (~1e-5 typical).
+// CPU reference: jce_shadow_filter_vsm_chebyshev() in
+//                engine/include/jce/renderer/jce_shadow_filter.h
+float sample_vsm_chebyshev(vec2 moments, float t, float min_variance)
+{
+    if (t <= moments.x) return 1.0;
+
+    float variance = moments.y - moments.x * moments.x;
+    variance = max(variance, min_variance);
+
+    float d   = t - moments.x;
+    float p_max = variance / (variance + d * d);
+    return p_max;
+}
+
+// Light-bleed reduction: rescales `p` so values below `amount` clamp
+// to 0 and the rest linearly remap to [0,1].  Mitigates the classic
+// VSM over-soft halo around occluders.  Typical `amount` 0.1 - 0.3.
+// CPU reference: jce_shadow_filter_vsm_reduce_bleed().
+float sample_vsm_reduce_bleed(float p, float amount)
+{
+    return clamp((p - amount) / max(1.0 - amount, 1e-5), 0.0, 1.0);
+}
+
+// Convenience: full VSM lookup with default constants matching the
+// CPU helpers' typical call sites.
+float sample_vsm(sampler2D vsm_target, vec2 uv, float t,
+                 float min_variance, float bleed_reduction)
+{
+    vec4 sm = texture2D(vsm_target, uv);
+    float p = sample_vsm_chebyshev(sm.xy, t, min_variance);
+    return sample_vsm_reduce_bleed(p, bleed_reduction);
+}
+
 #endif // PBR_COMMON_SH

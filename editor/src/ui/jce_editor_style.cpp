@@ -9,7 +9,7 @@
 #include "jce_editor_colors.h"
 #include <jce/ui/jce_imgui_renderer.h>
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,7 +18,7 @@ extern "C" {
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_alloc.h>
-#include <jce/os/core/jce_pak_loader.h>
+#include <jce/resource/jce_pak_loader.h>
 #include <jce/os/core/jce_str.h>
 }
 
@@ -230,8 +230,15 @@ void jce_editor_apply_theme(int theme_idx)
     }
     s_current_theme = theme_idx;
 
-    const char *names[] = { "Dark", "Light", "SSMS" };
-    LOG_INFO(LOG_TAG, "%s theme applied", names[theme_idx]);
+    /* Dedupe identical re-applies — apply_theme is invoked from multiple
+     * sites during startup (config load → style init → font reload).
+     * Log only on actual theme change. */
+    static int s_last_logged_theme = -1;
+    if (s_last_logged_theme != theme_idx) {
+        const char *names[] = { "Dark", "Light", "SSMS" };
+        LOG_INFO(LOG_TAG, "%s theme applied", names[theme_idx]);
+        s_last_logged_theme = theme_idx;
+    }
 }
 
 int jce_editor_get_theme(void)

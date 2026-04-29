@@ -12,6 +12,8 @@
 #include <jce/renderer/jce_pbr_material.h>
 #include <jce/resource/jce_scene_contract.h>
 
+#include "os/core/jce_memory.h"
+
 #include <cJSON/cJSON.h>
 #include <math.h>
 #include <SDL3/SDL_filesystem.h>
@@ -1081,7 +1083,55 @@ cJSON *jce_scene_save_json(const JceScene *scene)
     return root;
 }
 
-/* Resolve entities array: unwrap contract envelope, legacy root, or nested "scene". */
+/* Subtree variant — same envelope, but the entities array contains only
+ * `root` and its transitive children. Used by the prefab system. */
+static void collect_subtree(const JceScene *scene, JceEntity e, SerCtx *ctx)
+{
+    ser_entity_cb((JceScene *)scene, e, ctx);
+
+    int n = jce_scene_get_child_count(scene, e);
+    if (n <= 0) return;
+    /* Use a small stack + heap fallback for very wide hierarchies. */
+    JceEntity stack_buf[16];
+    JceEntity *kids = stack_buf;
+    if ((size_t)n > sizeof(stack_buf) / sizeof(stack_buf[0]))
+        kids = (JceEntity *)JCE_MALLOC((size_t)n * sizeof(JceEntity));
+    if (!kids) return;
+
+    int got = jce_scene_get_children(scene, e, kids, n);
+    for (int i = 0; i < got; i++)
+        collect_subtree(scene, kids[i], ctx);
+
+    if (kids != stack_buf) JCE_FREE(kids);
+}
+
+cJSON *jce_scene_save_subtree_json(const JceScene *scene, JceEntity root)
+{
+    cJSON *r        = cJSON_CreateObject();
+    cJSON *contract = cJSON_CreateObject();
+    cJSON *sobj     = cJSON_CreateObject();
+    cJSON *entities = cJSON_CreateArray();
+    if (!r || !contract || !sobj || !entities) {
+        cJSON_Delete(r); cJSON_Delete(contract);
+        cJSON_Delete(sobj); cJSON_Delete(entities);
+        return NULL;
+    }
+    cJSON_AddItemToObject(r, "contract", contract);
+    cJSON_AddStringToObject(contract, "name", "jce.scene");
+    cJSON_AddNumberToObject(contract, "major", 1);
+    cJSON_AddNumberToObject(contract, "minor", 0);
+    cJSON_AddItemToObject(r, "scene", sobj);
+    cJSON_AddNumberToObject(sobj, "version", 1);
+    cJSON_AddItemToObject(sobj, "entities", entities);
+
+    if (scene && root) {
+        SerCtx ctx;
+        ctx.entities = entities;
+        ctx.scene    = (JceScene *)scene;
+        collect_subtree(scene, root, &ctx);
+    }
+    return r;
+}
 static const cJSON *resolve_entities(const cJSON *root)
 {
     if (!root || !cJSON_IsObject(root)) return NULL;

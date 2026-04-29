@@ -180,7 +180,7 @@ endif()
 _jce_add_layer(jce_audio
 	DIRS      middleware/audio
 	LINK_PUBLIC  jce_core
-	LINK_PRIVATE miniaudio::miniaudio jce_video
+	LINK_PRIVATE miniaudio::miniaudio jce_video flecs::flecs_static
 	            Opus::opus Ogg::ogg)
 
 if(JCE_PATENTED_CODECS_ENABLED)
@@ -211,7 +211,8 @@ _jce_add_layer(jce_animation
 _jce_add_layer(jce_ai
 	DIRS      middleware/ai
 	LINK_PUBLIC  jce_core
-	LINK_PRIVATE BT::behaviortree_cpp
+	LINK_PRIVATE BT::behaviortree_cpp recastnavigation::recastnavigation
+	            flecs::flecs_static
 	CXX)
 
 _jce_add_layer(jce_net
@@ -237,6 +238,15 @@ _jce_add_layer(jce_scene
 	LINK_PUBLIC  jce_core
 	LINK_PRIVATE flecs::flecs_static cjson::cjson)
 
+_jce_add_layer(jce_world
+	DIRS      middleware/world
+	LINK_PUBLIC  jce_core
+	LINK_PRIVATE flecs::flecs_static)
+
+_jce_add_layer(jce_save
+	DIRS      middleware/save
+	LINK_PUBLIC  jce_core)
+
 # ================================================================== #
 # L3 — Graphics + Render (depends on L0, L1, animation)              #
 # ================================================================== #
@@ -252,6 +262,8 @@ _jce_add_layer(jce_renderer
 		SDL3_image::SDL3_image
 		Freetype::Freetype
 		harfbuzz::harfbuzz
+		flecs::flecs_static
+		cgltf::cgltf
 	CXX)
 
 # ================================================================== #
@@ -340,6 +352,8 @@ target_link_libraries(JCE INTERFACE
 	jce_animation
 	jce_ai
 	jce_net
+	jce_world
+	jce_save
 	jce_scene
 	jce_renderer
 	jce_ui
@@ -382,6 +396,16 @@ elseif(JCE_PLATFORM_MACOS)
 		"-framework CoreHaptics")
 elseif(WIN32)
 	target_link_libraries(JCE INTERFACE psapi)
+endif()
+
+# Linux + macOS: dladdr() is in libdl on glibc; on macOS it's in libSystem
+# but linking ${CMAKE_DL_LIBS} is the portable spelling.
+if(JCE_PLATFORM_LINUX OR JCE_PLATFORM_MACOS)
+	target_link_libraries(JCE INTERFACE ${CMAKE_DL_LIBS})
+	# For backtrace_symbols() to produce useful output the executable
+	# must export its dynamic symbol table.
+	target_link_options(JCE INTERFACE
+		"$<$<PLATFORM_ID:Linux>:-rdynamic>")
 endif()
 
 # ------------------------------------------------------------------ #

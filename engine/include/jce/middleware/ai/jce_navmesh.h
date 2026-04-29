@@ -48,9 +48,9 @@ JCE_API bool jce_navmesh_is_walkable(const JceNavMesh *nm, float wx, float wz);
  *
  * The path is straight-line from start to first reachable cell, then
  * cell-centre waypoints (no LOS smoothing yet).  Coarse but functional. */
-int  jce_navmesh_find_path(const JceNavMesh *nm,
-                           float sx, float sz, float gx, float gz,
-                           float *out_xz, int max_points);
+JCE_API int JCE_CALL jce_navmesh_find_path(const JceNavMesh *nm,
+                                           float sx, float sz, float gx, float gz,
+                                           float *out_xz, int max_points);
 
 JCE_EXTERN_C_END
 

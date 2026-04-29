@@ -13,17 +13,17 @@
 
 #include "jce_assetdb.h"
 
+#include "io/jce_editor_file_util.h"
+
+#include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_path.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
-
-namespace fs = std::filesystem;
 
 namespace {
 
@@ -49,10 +49,13 @@ DB &db(void)
     return d;
 }
 
-std::string norm(const fs::path &p)
+std::string norm(const std::string &p)
 {
-    std::string s = p.lexically_normal().generic_string();
-    return s;
+    char buf[1024];
+    if (!jce_path_normalize(buf, sizeof(buf), p.c_str()))
+        return p;
+    jce_path_to_canonical(buf, sizeof(buf), buf);
+    return std::string(buf);
 }
 
 JceAssetKind classify(const std::string &ext_in)
@@ -88,32 +91,60 @@ bool is_reference_bearing(JceAssetKind k)
         || k == JCE_ASSET_KIND_DATA;
 }
 
-void scan_dir(const fs::path &root)
+void scan_dir(const std::string &root)
 {
     DB &d = db();
-    std::error_code ec;
-    for (auto it = fs::recursive_directory_iterator(root, fs::directory_options::skip_permission_denied, ec);
-         it != fs::recursive_directory_iterator(); it.increment(ec)) {
-        if (ec) { ec.clear(); continue; }
-        const fs::directory_entry &de = *it;
-        if (!de.is_regular_file(ec)) continue;
-        std::string path = norm(de.path());
-        std::string ext  = de.path().extension().string();
+    
+    struct WalkCtx {
+        DB *db;
+        std::string root;
+    } ctx;
+    ctx.db = &d;
+    ctx.root = root;
+    
+    auto cb = [](const char *path, bool is_dir, void *ud) -> bool {
+        if (is_dir) return true;
+        
+        WalkCtx *c = static_cast<WalkCtx*>(ud);
+        std::string spath = path;
+        std::string path_norm = norm(spath);
+        
+        char ext_buf[64];
+        jce_path_extension(ext_buf, sizeof(ext_buf), path);
+        std::string ext = ext_buf;
+        
         /* Compound extension support for .mat.json */
-        std::string stem = de.path().stem().string();
-        std::string second = fs::path(stem).extension().string();
+        char stem_buf[256];
+        jce_path_stem(stem_buf, sizeof(stem_buf), path);
+        std::string stem = stem_buf;
+        char second_buf[64];
+        jce_path_extension(second_buf, sizeof(second_buf), stem.c_str());
+        std::string second = second_buf;
         if (!second.empty()) ext = second + ext;
+        
         JceAssetKind kind = classify(ext);
-
+        
         Entry e;
-        e.path = path;
-        std::error_code rec;
-        e.rel = fs::relative(de.path(), root, rec).generic_string();
-        e.basename = de.path().filename().string();
+        e.path = path_norm;
+        
+        char rel_buf[1024];
+        if (jce_path_relative(rel_buf, sizeof(rel_buf), path, c->root.c_str())) {
+            jce_path_to_canonical(rel_buf, sizeof(rel_buf), rel_buf);
+            e.rel = rel_buf;
+        }
+        
+        char basename_buf[256];
+        jce_path_basename(basename_buf, sizeof(basename_buf), path);
+        e.basename = basename_buf;
         e.kind = kind;
-        d.path_to_idx[path] = (int)d.entries.size();
-        d.entries.push_back(std::move(e));
-    }
+        
+        c->db->path_to_idx[path_norm] = (int)c->db->entries.size();
+        c->db->entries.push_back(std::move(e));
+        
+        return true;
+    };
+    
+    jce_fs_host_walk(root.c_str(), cb, &ctx);
 }
 
 void build_refs(void)
@@ -131,10 +162,11 @@ void build_refs(void)
      * other entry's basename or rel path occurring as a substring. */
     for (int fi : ref_files) {
         const Entry &fe = d.entries[(size_t)fi];
-        std::ifstream f(fe.path, std::ios::binary);
-        if (!f) continue;
-        std::stringstream ss; ss << f.rdbuf();
-        std::string buf = ss.str();
+        size_t sz = 0;
+        char *raw = (char*)ed_read_file(fe.path.c_str(), &sz);
+        if (!raw) continue;
+        std::string buf(raw, sz);
+        ED_FREE(raw);
         if (buf.empty()) continue;
 
         for (size_t j = 0; j < d.entries.size(); ++j) {
@@ -189,11 +221,12 @@ void jce_assetdb_rescan(void)
     d.refs.clear();
     if (d.project_root.empty()) { d.initialized = true; return; }
 
-    fs::path root(d.project_root);
-    std::error_code ec;
-    if (!fs::exists(root, ec)) { d.initialized = true; return; }
+    if (!jce_fs_host_exists_dir(d.project_root.c_str())) { 
+        d.initialized = true; 
+        return; 
+    }
 
-    scan_dir(root);
+    scan_dir(d.project_root);
     build_refs();
     d.initialized = true;
 }
@@ -219,13 +252,14 @@ JceAssetKind jce_assetdb_get_kind(const char *path)
     if (!path || !path[0]) return JCE_ASSET_KIND_UNKNOWN;
     DB &d = db();
     /* Try direct path lookup */
-    std::string key = norm(fs::path(path));
+    std::string key = norm(path);
     auto it = d.path_to_idx.find(key);
     if (it != d.path_to_idx.end())
         return d.entries[(size_t)it->second].kind;
     /* Fall back to extension-based classification */
-    std::string ext = fs::path(path).extension().string();
-    return classify(ext);
+    char ext_buf[64];
+    jce_path_extension(ext_buf, sizeof(ext_buf), path);
+    return classify(ext_buf);
 }
 
 int jce_assetdb_find_references(const char *asset_path,
@@ -233,7 +267,7 @@ int jce_assetdb_find_references(const char *asset_path,
 {
     if (!asset_path) return 0;
     DB &d = db();
-    std::string key = norm(fs::path(asset_path));
+    std::string key = norm(asset_path);
     auto it = d.refs.find(key);
     if (it == d.refs.end()) return 0;
     int total = (int)it->second.size();

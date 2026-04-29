@@ -9,7 +9,7 @@
 
 #include "core/jce_editor_defaults.h"
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 #include <string.h>
 
 /* ── Internal state ────────────────────────────────────────────────── */

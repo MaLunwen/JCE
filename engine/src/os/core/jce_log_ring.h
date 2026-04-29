@@ -40,7 +40,7 @@ typedef struct JceLogMessage {
     char        tag[32];
     char        file[64];
     char        thread_name[32];
-    char        message[352];   /* pre-formatted user message */
+    char        message[512];   /* pre-formatted user message */
 } JceLogMessage;
 
 /* ================================================================== */

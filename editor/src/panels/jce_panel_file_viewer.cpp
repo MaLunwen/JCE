@@ -13,12 +13,12 @@
 #include "viewers/jce_fv_common.h"
 
 #include <jce/tools/jce_imgui_internal.h>
-#include <filesystem>
 #include <string>
 #include <vector>
 
 extern "C" {
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_path.h>
 #include <jce/os/platform/jce_host_shell.h>
 #include <jce/renderer/jce_image.h>
 #include <jce/renderer/jce_lowlevel.h>
@@ -30,19 +30,19 @@ extern "C" {
 
 #define LOG_TAG "file_viewer"
 
-namespace fs = std::filesystem;
-
 static std::string normalize_path_string(const char *path)
 {
     if (!path || !path[0]) return std::string();
-    try {
-        return fs::weakly_canonical(fs::path(path)).generic_string();
-    } catch (...) {
+    
+    char buf[1024];
+    if (!jce_path_normalize(buf, sizeof(buf), path)) {
+        /* fallback: manual backslash conversion */
         std::string s(path);
         for (char &ch : s)
             if (ch == '\\') ch = '/';
         return s;
     }
+    return std::string(buf);
 }
 
 static bool is_scene_file_path(const char *path)
@@ -285,24 +285,14 @@ void jce_file_viewer_open(const char *path)
     }
 
     /* Stat file size first so we can reject oversize previews before
-     * any allocation; std::filesystem keeps this dependency-free. */
-    long file_size = -1;
-    {
-        std::error_code ec;
-        auto sz = std::filesystem::file_size(open_path, ec);
-        if (ec) {
-            jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-                "file viewer: cannot open '%s'", open_path);
-            return;
-        }
-        file_size = (long)sz;
-    }
-
-    if (file_size < 0) {
+     * any allocation. */
+    uint64_t file_size_u64 = 0;
+    if (!jce_fs_host_get_size(open_path, &file_size_u64)) {
         jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-            "file viewer: failed to read size for '%s'", open_path);
+            "file viewer: cannot open '%s'", open_path);
         return;
     }
+    long file_size = (long)file_size_u64;
 
     if (file_size > FV_MAX_ASSET_BYTES) {
         char info_msg[384];

@@ -72,10 +72,10 @@ JCE_API void          jce_physics_body_destroy(JcePhysicsWorld *world, JceBodyHa
 /* Body state queries                                                  */
 /* ================================================================== */
 
-void     jce_physics_body_get_transform(const JcePhysicsWorld *world, JceBodyHandle body,
-                                        jce_vec3 *out_pos, jce_quat *out_rot);
-void     jce_physics_body_set_transform(JcePhysicsWorld *world, JceBodyHandle body,
-                                        jce_vec3 pos, jce_quat rot);
+JCE_API void JCE_CALL jce_physics_body_get_transform(const JcePhysicsWorld *world, JceBodyHandle body,
+                                                     jce_vec3 *out_pos, jce_quat *out_rot);
+JCE_API void JCE_CALL jce_physics_body_set_transform(JcePhysicsWorld *world, JceBodyHandle body,
+                                                     jce_vec3 pos, jce_quat rot);
 
 JCE_API jce_vec3 jce_physics_body_get_velocity(const JcePhysicsWorld *world, JceBodyHandle body);
 JCE_API void     jce_physics_body_set_velocity(JcePhysicsWorld *world, JceBodyHandle body, jce_vec3 vel);
@@ -126,9 +126,9 @@ JCE_API uint32_t jce_physics_body_count(const JcePhysicsWorld *world);
 /* ================================================================== */
 
 /* Change collision group/mask on an existing body. */
-void jce_physics_body_set_collision_filter(JcePhysicsWorld *world,
-                                           JceBodyHandle body,
-                                           uint16_t group, uint16_t mask);
+JCE_API void JCE_CALL jce_physics_body_set_collision_filter(JcePhysicsWorld *world,
+                                                            JceBodyHandle body,
+                                                            uint16_t group, uint16_t mask);
 
 /* ================================================================== */
 /* Constraints                                                         */
@@ -148,11 +148,11 @@ typedef struct {
 
 JceConstraintHandle jce_physics_constraint_create(JcePhysicsWorld *world,
                                                    const JceConstraintDesc *desc);
-void jce_physics_constraint_destroy(JcePhysicsWorld *world,
-                                     JceConstraintHandle con);
-void jce_physics_constraint_set_limits(JcePhysicsWorld *world,
-                                        JceConstraintHandle con,
-                                        float lower, float upper);
+JCE_API void JCE_CALL jce_physics_constraint_destroy(JcePhysicsWorld *world,
+                                                     JceConstraintHandle con);
+JCE_API void JCE_CALL jce_physics_constraint_set_limits(JcePhysicsWorld *world,
+                                                        JceConstraintHandle con,
+                                                        float lower, float upper);
 
 /* ================================================================== */
 /* Character controller                                                */
@@ -170,8 +170,8 @@ typedef struct {
 
 JceCharacterHandle jce_physics_character_create(JcePhysicsWorld *world,
                                                  const JceCharacterDesc *desc);
-void jce_physics_character_destroy(JcePhysicsWorld *world,
-                                    JceCharacterHandle ch);
+JCE_API void JCE_CALL jce_physics_character_destroy(JcePhysicsWorld *world,
+                                                    JceCharacterHandle ch);
 void jce_physics_character_move(JcePhysicsWorld *world,
                                  JceCharacterHandle ch,
                                  jce_vec3 walk_dir, float dt);
@@ -182,6 +182,98 @@ void jce_physics_character_get_position(const JcePhysicsWorld *world,
                                          jce_vec3 *out_pos);
 bool jce_physics_character_is_grounded(const JcePhysicsWorld *world,
                                         JceCharacterHandle ch);
+
+/* ================================================================== */
+/* Vehicle controller (raycast wheels)                                 */
+/* ================================================================== */
+
+/*
+ * GTA-style raycast vehicle.  Internally creates a single dynamic
+ * chassis rigid body with a box shape; per-wheel contacts are
+ * approximated by downward rays (no real wheel collider).  This is
+ * what every open-world driving game uses — full constraint-driven
+ * suspension is overkill for street vehicles and 5-10× slower.
+ *
+ * Coordinate convention: chassis local +X = right, +Y = up,
+ *                        +Z = forward.
+ *
+ * Typical workflow:
+ *   1. desc.chassis_half_extents = (0.9, 0.5, 2.2);   // sedan-ish
+ *   2. add 4 wheels via JceWheelDesc (FL, FR, RL, RR)
+ *   3. Each frame: jce_physics_vehicle_set_input(throttle, brake, steer)
+ *   4. Read chassis transform for rendering;
+ *      read each wheel's transform for rendering wheels.
+ */
+typedef struct {
+    /* Wheel attachment (chassis local-space). */
+    jce_vec3 connection_point;     /* where suspension attaches to chassis */
+    jce_vec3 wheel_direction;      /* down vector — typically (0,-1,0) */
+    jce_vec3 wheel_axle;           /* spin axis — typically (-1,0,0) */
+    float    suspension_rest_len;  /* spring rest length (m) */
+    float    wheel_radius;         /* m */
+    bool     is_front_wheel;       /* true = steers; false = doesn't */
+
+    /* Tuning (defaults are reasonable street-car values). */
+    float    suspension_stiffness;     /* 20.0 */
+    float    suspension_damping;       /* 2.3 (relaxation) */
+    float    suspension_compression;   /* 4.4 */
+    float    friction_slip;            /* 1000.0 (high = sticky tyres) */
+    float    roll_influence;           /* 0.1 (lower = less body roll) */
+} JceWheelDesc;
+
+typedef struct {
+    /* Chassis configuration. */
+    jce_vec3 position;
+    jce_quat rotation;
+    jce_vec3 chassis_half_extents;    /* box half-size around centre */
+    float    chassis_mass;            /* kg (≈ 1500 for sedan) */
+
+    /* Drive parameters. */
+    float    max_engine_force;        /* N (≈ 2000 for sedan) */
+    float    max_brake_force;         /* N (≈ 100 per wheel) */
+    float    max_steering_rad;        /* clamp on absolute steer input */
+
+    /* Collision filter for chassis. */
+    uint16_t collision_group;
+    uint16_t collision_mask;
+} JceVehicleDesc;
+
+JCE_API JceVehicleHandle jce_physics_vehicle_create(JcePhysicsWorld *world,
+                                                     const JceVehicleDesc *desc);
+JCE_API void             jce_physics_vehicle_destroy(JcePhysicsWorld *world,
+                                                      JceVehicleHandle veh);
+
+/* Add a wheel to the vehicle.  Returns wheel index (0..N-1) or
+ * UINT32_MAX on error.  Must be called before the first step. */
+JCE_API uint32_t jce_physics_vehicle_add_wheel(JcePhysicsWorld *world,
+                                                JceVehicleHandle veh,
+                                                const JceWheelDesc *wheel);
+
+/* Per-frame driver input.  Throttle in [-1,1] (negative = reverse),
+ * brake in [0,1], steer in [-1,1] (will be scaled by max_steering_rad). */
+JCE_API void jce_physics_vehicle_set_input(JcePhysicsWorld *world,
+                                            JceVehicleHandle veh,
+                                            float throttle, float brake,
+                                            float steer);
+
+/* Chassis transform (centre of mass, world space). */
+JCE_API void jce_physics_vehicle_get_chassis_transform(const JcePhysicsWorld *world,
+                                                       JceVehicleHandle veh,
+                                                       jce_vec3 *out_pos,
+                                                       jce_quat *out_rot);
+
+/* Per-wheel world-space transform (rolled + steered).  out_pos is
+ * the wheel hub centre. */
+JCE_API void jce_physics_vehicle_get_wheel_transform(const JcePhysicsWorld *world,
+                                                     JceVehicleHandle veh,
+                                                     uint32_t wheel_idx,
+                                                     jce_vec3 *out_pos,
+                                                     jce_quat *out_rot);
+
+/* Forward speed in m/s (chassis local +Z component of linear velocity).
+ * Negative when reversing. */
+JCE_API float jce_physics_vehicle_get_speed(const JcePhysicsWorld *world,
+                                             JceVehicleHandle veh);
 
 JCE_EXTERN_C_END
 

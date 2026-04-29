@@ -11,7 +11,7 @@
 #include <jce/middleware/audio/jce_audio.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
-#include <jce/os/core/jce_pak_loader.h>
+#include <jce/resource/jce_pak_loader.h>
 #include <jce/renderer/jce_mesh.h>
 #include <jce/renderer/jce_model.h>
 #include <jce/renderer/jce_text.h>
@@ -84,7 +84,7 @@ static void load_texture_sync(JceAssetManager *mgr, JceAssetSlot *slot,
     int sampler = (p) ? p->texture_sampler_mode : 0;
     JceTexture tex = jce_texture_load_ex(mgr->pak, path, sampler);
     if (!jce_texture_valid(tex)) {
-        slot->state = JCE_ASSET_STATE_FAILED;
+        JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
         LOG_ERROR(LOG_TAG, "texture load failed: %s", path);
         return;
     }
@@ -92,7 +92,7 @@ static void load_texture_sync(JceAssetManager *mgr, JceAssetSlot *slot,
     JceTexture *heap = JCE_MALLOC(sizeof(JceTexture));
     if (!heap) {
         jce_texture_destroy(tex);
-        slot->state = JCE_ASSET_STATE_FAILED;
+        JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
         return;
     }
     *heap = tex;
@@ -102,7 +102,7 @@ static void load_texture_sync(JceAssetManager *mgr, JceAssetSlot *slot,
 
     slot->data = heap;
     slot->memory_bytes = (size_t)w * h * 4;
-    slot->state = JCE_ASSET_STATE_READY;
+    JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_READY);
 }
 
 static void load_mesh_sync(JceAssetManager *mgr, JceAssetSlot *slot,
@@ -110,7 +110,7 @@ static void load_mesh_sync(JceAssetManager *mgr, JceAssetSlot *slot,
 {
     JceMesh *mesh = jce_mesh_load(mgr->pak, path);
     if (!mesh) {
-        slot->state = JCE_ASSET_STATE_FAILED;
+        JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
         LOG_ERROR(LOG_TAG, "mesh load failed: %s", path);
         return;
     }
@@ -118,32 +118,32 @@ static void load_mesh_sync(JceAssetManager *mgr, JceAssetSlot *slot,
     slot->data = mesh;
     slot->memory_bytes = (size_t)jce_mesh_vertex_count(mesh) * 32 +
                          (size_t)jce_mesh_index_count(mesh) * 4;
-    slot->state = JCE_ASSET_STATE_READY;
+    JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_READY);
 }
 
 static void load_sound_sync(JceAssetManager *mgr, JceAssetSlot *slot,
                             const char *path)
 {
     if (!mgr->audio) {
-        slot->state = JCE_ASSET_STATE_FAILED;
+        JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
         LOG_WARN(LOG_TAG, "no audio subsystem for: %s", path);
         return;
     }
 
     JceSound snd = jce_audio_load(mgr->audio, mgr->pak, path);
     if (snd == JCE_SOUND_INVALID) {
-        slot->state = JCE_ASSET_STATE_FAILED;
+        JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
         LOG_ERROR(LOG_TAG, "sound load failed: %s", path);
         return;
     }
 
     JceSound *heap = JCE_MALLOC(sizeof(JceSound));
-    if (!heap) { slot->state = JCE_ASSET_STATE_FAILED; return; }
+    if (!heap) { JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED); return; }
     *heap = snd;
 
     slot->data = heap;
     slot->memory_bytes = 0; /* audio system owns PCM memory */
-    slot->state = JCE_ASSET_STATE_READY;
+    JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_READY);
 }
 
 static void load_raw_sync(JceAssetManager *mgr, JceAssetSlot *slot,
@@ -151,24 +151,24 @@ static void load_raw_sync(JceAssetManager *mgr, JceAssetSlot *slot,
 {
     const JcePakAsset *asset = jce_pak_find(mgr->pak, path);
     if (!asset) {
-        slot->state = JCE_ASSET_STATE_FAILED;
+        JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
         LOG_ERROR(LOG_TAG, "raw asset not found: %s", path);
         return;
     }
 
     void *buf = JCE_MALLOC(asset->original_size);
-    if (!buf) { slot->state = JCE_ASSET_STATE_FAILED; return; }
+    if (!buf) { JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED); return; }
 
     size_t n = jce_pak_decompress(asset, buf, (size_t)asset->original_size);
     if (n == 0) {
         JCE_FREE(buf);
-        slot->state = JCE_ASSET_STATE_FAILED;
+        JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
         return;
     }
 
     slot->data = buf;
     slot->memory_bytes = n;
-    slot->state = JCE_ASSET_STATE_READY;
+    JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_READY);
 }
 
 static void load_model_sync(JceAssetManager *mgr, JceAssetSlot *slot,
@@ -176,14 +176,14 @@ static void load_model_sync(JceAssetManager *mgr, JceAssetSlot *slot,
 {
     JceModel *model = jce_model_load_gltf(mgr->pak, path);
     if (!model) {
-        slot->state = JCE_ASSET_STATE_FAILED;
+        JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
         LOG_ERROR(LOG_TAG, "model load failed: %s", path);
         return;
     }
 
     slot->data = model;
     slot->memory_bytes = 4096; /* opaque; rough estimate */
-    slot->state = JCE_ASSET_STATE_READY;
+    JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_READY);
 }
 
 static void load_font_sync(JceAssetManager *mgr, JceAssetSlot *slot,
@@ -192,14 +192,14 @@ static void load_font_sync(JceAssetManager *mgr, JceAssetSlot *slot,
     float pt_size = (p && p->font_size > 0.0f) ? p->font_size : 24.0f;
     JceFont *font = jce_font_open(mgr->pak, path, pt_size);
     if (!font) {
-        slot->state = JCE_ASSET_STATE_FAILED;
+        JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
         LOG_ERROR(LOG_TAG, "font load failed: %s", path);
         return;
     }
 
     slot->data = font;
     slot->memory_bytes = 256 * 1024; /* glyph atlas rough estimate */
-    slot->state = JCE_ASSET_STATE_READY;
+    JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_READY);
 }
 
 void load_slot_sync(JceAssetManager *mgr,
@@ -211,7 +211,7 @@ void load_slot_sync(JceAssetManager *mgr,
     if (!mgr || !slot || !asset_path) return;
 
     slot->type = type;
-    slot->state = JCE_ASSET_STATE_LOADING;
+    JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_LOADING);
     slot->data = NULL;
     slot->memory_bytes = 0;
 
@@ -226,15 +226,15 @@ void load_slot_sync(JceAssetManager *mgr,
             if (dec_size > 0 && mgr->ext_loaders[type](
                     decompressed, dec_size, params,
                     &slot->data, &slot->memory_bytes)) {
-                slot->state = JCE_ASSET_STATE_READY;
+                JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_READY);
             } else {
-                slot->state = JCE_ASSET_STATE_FAILED;
+                JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
             }
             JCE_FREE(decompressed);
         } else {
             LOG_ERROR(LOG_TAG, "ext loader: asset not found in PAK: %s",
                       asset_path);
-            slot->state = JCE_ASSET_STATE_FAILED;
+            JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
         }
         return;
     }
@@ -265,7 +265,7 @@ static void finalize_texture_inner(JceAssetManager *mgr, JceAssetSlot *slot,
                                    JceAsyncRequest *req)
 {
     if (!req->decoded_data) {
-        slot->state = JCE_ASSET_STATE_FAILED;
+        JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
         return;
     }
 
@@ -289,14 +289,14 @@ static void finalize_texture_inner(JceAssetManager *mgr, JceAssetSlot *slot,
     }
 
     if (!jce_texture_valid(tex)) {
-        slot->state = JCE_ASSET_STATE_FAILED;
+        JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
         return;
     }
 
     JceTexture *heap = JCE_MALLOC(sizeof(JceTexture));
     if (!heap) {
         jce_texture_destroy(tex);
-        slot->state = JCE_ASSET_STATE_FAILED;
+        JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
         return;
     }
     *heap = tex;
@@ -306,7 +306,7 @@ static void finalize_texture_inner(JceAssetManager *mgr, JceAssetSlot *slot,
 
     slot->data = heap;
     slot->memory_bytes = (size_t)w * h * 4;
-    slot->state = JCE_ASSET_STATE_READY;
+    JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_READY);
     mgr->total_loaded++;
     mgr->total_memory += slot->memory_bytes;
 }
@@ -323,7 +323,7 @@ static void finalize_audio_inner(JceAssetManager *mgr, JceAssetSlot *slot,
                                  JceAsyncRequest *req)
 {
     if (!mgr->audio || !req->decoded_data) {
-        slot->state = JCE_ASSET_STATE_FAILED;
+        JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
         return;
     }
 
@@ -346,17 +346,17 @@ static void finalize_audio_inner(JceAssetManager *mgr, JceAssetSlot *slot,
     req->decoded_data = NULL;
 
     if (snd == JCE_SOUND_INVALID) {
-        slot->state = JCE_ASSET_STATE_FAILED;
+        JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
         return;
     }
 
     JceSound *heap = JCE_MALLOC(sizeof(JceSound));
-    if (!heap) { slot->state = JCE_ASSET_STATE_FAILED; return; }
+    if (!heap) { JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED); return; }
     *heap = snd;
 
     slot->data = heap;
     slot->memory_bytes = 0;
-    slot->state = JCE_ASSET_STATE_READY;
+    JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_READY);
     mgr->total_loaded++;
 }
 
@@ -372,14 +372,14 @@ void finalize_raw(JceAssetManager *mgr, JceAssetSlot *slot,
                   JceAsyncRequest *req)
 {
     if (!req->decoded_data) {
-        slot->state = JCE_ASSET_STATE_FAILED;
+        JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
         return;
     }
 
     slot->data = req->decoded_data;
     slot->memory_bytes = req->decoded_size;
     req->decoded_data = NULL; /* ownership transferred */
-    slot->state = JCE_ASSET_STATE_READY;
+    JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_READY);
     mgr->total_loaded++;
     mgr->total_memory += slot->memory_bytes;
 }

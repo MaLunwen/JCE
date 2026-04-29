@@ -17,7 +17,7 @@
 extern "C" {
 #endif
 
-#include <jce/os/core/jce_pak_loader.h>
+#include <jce/resource/jce_pak_loader.h>
 #include <jce/renderer/jce_camera.h>
 #include <jce/renderer/jce_renderer.h>
 #include <jce/resource/jce_asset.h>
@@ -121,6 +121,11 @@ void jce_editor_scene_reset_anim_timer(void);
  * Used by panels (e.g., PostFX) to access engine-owned subsystems. */
 typedef struct JceSceneRenderer JceSceneRenderer;
 JceSceneRenderer *jce_editor_get_scene_renderer(void);
+
+/* Access the world streamer (open-world chunk I/O + scene entity lifecycle).
+ * Returns NULL if not initialized (e.g. before first frame). */
+typedef struct JceWorldStreamer JceWorldStreamer;
+JceWorldStreamer *jce_editor_get_world_streamer(void);
 
 typedef struct JceAnimPlayer JceAnimPlayer;
 typedef struct JceModel      JceModel;

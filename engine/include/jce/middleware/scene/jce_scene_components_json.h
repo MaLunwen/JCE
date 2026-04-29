@@ -43,6 +43,11 @@ JCE_API JceJson *jce_scene_serialize_entity_components(JceScene *scene, JceEntit
  * Caller owns the returned tree and must release it with jce_json_free(). */
 JCE_API JceJson *jce_scene_save_json(const JceScene *scene);
 
+/* Serialize a subtree (root + all transitive descendants in the
+ * parent/child hierarchy) to a JSON root. Used by the prefab system.
+ * Caller owns the returned tree and must release it with jce_json_free(). */
+JCE_API JceJson *jce_scene_save_subtree_json(const JceScene *scene, JceEntity root);
+
 /* Set the base directory used to resolve sibling material references
  * during the next jce_scene_load_json() call.
  * Pass NULL to clear. The resource-layer wrapper sets this around its

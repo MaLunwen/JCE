@@ -1,0 +1,274 @@
+/*
+ * jce_ssao.c -- screen-space ambient occlusion implementation.
+ *
+ * Two passes:
+ *   1. Sampling pass: full-screen quad reads depth, reconstructs
+ *      normal from depth derivatives, samples 16 hemisphere offsets,
+ *      accumulates occlusion. Output: R8 framebuffer (use RGBA8 for
+ *      simplicity).
+ *   2. Blur pass: 5x5 box blur of (1).
+ */
+
+#include <jce/os/core/jce_log.h>
+#include <jce/resource/jce_pak_loader.h>
+#include <jce/os/core/jce_profiler.h>
+#include <jce/renderer/jce_ssao.h>
+
+#include "os/core/jce_memory.h"
+
+#include <bgfx/c99/bgfx.h>
+
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+
+#define LOG_TAG "ssao"
+
+typedef struct { float pos[2]; float uv[2]; } SsaoQuadV;
+
+struct JceSsao {
+    int   w, h;
+    JceSsaoParams params;
+
+    bgfx_vertex_layout_t        layout;
+    bgfx_program_handle_t       prog_sample;
+    bgfx_program_handle_t       prog_blur;
+
+    bgfx_uniform_handle_t       u_p0;       /* radius/bias/intensity/scale */
+    bgfx_uniform_handle_t       u_p1;       /* near/far */
+    bgfx_uniform_handle_t       u_screen;
+    bgfx_uniform_handle_t       u_kernel;   /* 16 vec4 */
+    bgfx_uniform_handle_t       s_depth;
+    bgfx_uniform_handle_t       s_ao;
+
+    bgfx_vertex_buffer_handle_t vbh;
+    bgfx_index_buffer_handle_t  ibh;
+
+    bgfx_frame_buffer_handle_t  fb_raw;
+    bgfx_frame_buffer_handle_t  fb_blur;
+    bgfx_texture_handle_t       tex_raw;
+    bgfx_texture_handle_t       tex_blur;
+};
+
+static const char *ssao_backend_suffix(void)
+{
+    switch (bgfx_get_renderer_type()) {
+    case BGFX_RENDERER_TYPE_DIRECT3D11:
+    case BGFX_RENDERER_TYPE_DIRECT3D12: return "dx11";
+    case BGFX_RENDERER_TYPE_VULKAN:     return "spv";
+    case BGFX_RENDERER_TYPE_OPENGL:     return "glsl";
+    case BGFX_RENDERER_TYPE_OPENGLES:   return "essl";
+    case BGFX_RENDERER_TYPE_METAL:      return "mtl";
+    default:                            return NULL;
+    }
+}
+
+static bgfx_shader_handle_t ssao_load_shader(const JcePakArchive *pak,
+                                              const char *name, const char *sfx)
+{
+    bgfx_shader_handle_t invalid = { UINT16_MAX };
+    char path[256];
+    snprintf(path, sizeof(path), "shaders/%s_%s.bin", name, sfx);
+    const JcePakAsset *asset = jce_pak_find(pak, path);
+    if (!asset) { LOG_ERROR(LOG_TAG, "shader not in pak: %s", path); return invalid; }
+    void *buf = JCE_MALLOC((size_t)asset->original_size);
+    if (!buf) return invalid;
+    size_t n = jce_pak_decompress(asset, buf, (size_t)asset->original_size);
+    if (n == 0) { JCE_FREE(buf); return invalid; }
+    const bgfx_memory_t *mem = bgfx_copy(buf, (uint32_t)asset->original_size);
+    JCE_FREE(buf);
+    return bgfx_create_shader(mem);
+}
+
+static void create_targets(JceSsao *s)
+{
+    if (s->fb_raw.idx  != UINT16_MAX) bgfx_destroy_frame_buffer(s->fb_raw);
+    if (s->fb_blur.idx != UINT16_MAX) bgfx_destroy_frame_buffer(s->fb_blur);
+    s->fb_raw = bgfx_create_frame_buffer((uint16_t)s->w, (uint16_t)s->h,
+                                          BGFX_TEXTURE_FORMAT_RGBA8,
+                                          BGFX_TEXTURE_RT | BGFX_SAMPLER_POINT
+                                            | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
+    s->fb_blur = bgfx_create_frame_buffer((uint16_t)s->w, (uint16_t)s->h,
+                                           BGFX_TEXTURE_FORMAT_RGBA8,
+                                           BGFX_TEXTURE_RT
+                                             | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP);
+    s->tex_raw  = bgfx_get_texture(s->fb_raw, 0);
+    s->tex_blur = bgfx_get_texture(s->fb_blur, 0);
+}
+
+JceSsaoParams jce_ssao_default_params(void)
+{
+    JceSsaoParams p;
+    p.radius     = 1.0f;
+    p.bias       = 0.005f;
+    p.intensity  = 1.5f;
+    p.near_plane = 0.1f;
+    p.far_plane  = 1000.0f;
+    return p;
+}
+
+JceSsao *jce_ssao_create(const JceSsaoDesc *desc)
+{
+    if (!desc || !desc->pak) return NULL;
+    const char *sfx = ssao_backend_suffix();
+    if (!sfx) return NULL;
+
+    JceSsao *s = (JceSsao *)JCE_CALLOC(1, sizeof(*s));
+    if (!s) return NULL;
+    s->w = desc->width  > 0 ? desc->width  : 1280;
+    s->h = desc->height > 0 ? desc->height : 720;
+    s->params = jce_ssao_default_params();
+    s->fb_raw.idx = s->fb_blur.idx = UINT16_MAX;
+
+    bgfx_vertex_layout_begin(&s->layout, BGFX_RENDERER_TYPE_NOOP);
+    bgfx_vertex_layout_add(&s->layout, BGFX_ATTRIB_POSITION,  2, BGFX_ATTRIB_TYPE_FLOAT, false, false);
+    bgfx_vertex_layout_add(&s->layout, BGFX_ATTRIB_TEXCOORD0, 2, BGFX_ATTRIB_TYPE_FLOAT, false, false);
+    bgfx_vertex_layout_end(&s->layout);
+
+    static const SsaoQuadV verts[4] = {
+        { { -1.0f, -1.0f }, { 0.0f, 1.0f } },
+        { {  1.0f, -1.0f }, { 1.0f, 1.0f } },
+        { {  1.0f,  1.0f }, { 1.0f, 0.0f } },
+        { { -1.0f,  1.0f }, { 0.0f, 0.0f } },
+    };
+    static const uint16_t idx[6] = { 0, 1, 2, 0, 2, 3 };
+    s->vbh = bgfx_create_vertex_buffer(bgfx_copy(verts, sizeof(verts)),
+                                       &s->layout, BGFX_BUFFER_NONE);
+    s->ibh = bgfx_create_index_buffer(bgfx_copy(idx, sizeof(idx)), BGFX_BUFFER_NONE);
+
+    bgfx_shader_handle_t vsh   = ssao_load_shader(desc->pak, "vs_ssao",      sfx);
+    bgfx_shader_handle_t fsh_a = ssao_load_shader(desc->pak, "fs_ssao",      sfx);
+    bgfx_shader_handle_t fsh_b = ssao_load_shader(desc->pak, "fs_ssao_blur", sfx);
+    if (vsh.idx == UINT16_MAX || fsh_a.idx == UINT16_MAX || fsh_b.idx == UINT16_MAX) {
+        LOG_ERROR(LOG_TAG, "shader load failed");
+        if (vsh.idx   != UINT16_MAX) bgfx_destroy_shader(vsh);
+        if (fsh_a.idx != UINT16_MAX) bgfx_destroy_shader(fsh_a);
+        if (fsh_b.idx != UINT16_MAX) bgfx_destroy_shader(fsh_b);
+        bgfx_destroy_vertex_buffer(s->vbh);
+        bgfx_destroy_index_buffer(s->ibh);
+        JCE_FREE(s);
+        return NULL;
+    }
+    s->prog_sample = bgfx_create_program(vsh,   fsh_a, false);
+    s->prog_blur   = bgfx_create_program(vsh,   fsh_b, true);
+    bgfx_destroy_shader(vsh);
+
+    s->u_p0     = bgfx_create_uniform("u_ssao_params0", BGFX_UNIFORM_TYPE_VEC4, 1);
+    s->u_p1     = bgfx_create_uniform("u_ssao_params1", BGFX_UNIFORM_TYPE_VEC4, 1);
+    s->u_screen = bgfx_create_uniform("u_screen",       BGFX_UNIFORM_TYPE_VEC4, 1);
+    s->u_kernel = bgfx_create_uniform("u_kernel",       BGFX_UNIFORM_TYPE_VEC4, 16);
+    s->s_depth  = bgfx_create_uniform("s_depth",        BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    s->s_ao     = bgfx_create_uniform("s_ao",           BGFX_UNIFORM_TYPE_SAMPLER, 1);
+
+    create_targets(s);
+    return s;
+}
+
+void jce_ssao_destroy(JceSsao *s)
+{
+    if (!s) return;
+    if (s->prog_sample.idx != UINT16_MAX) bgfx_destroy_program(s->prog_sample);
+    if (s->prog_blur.idx   != UINT16_MAX) bgfx_destroy_program(s->prog_blur);
+    if (s->u_p0.idx     != UINT16_MAX) bgfx_destroy_uniform(s->u_p0);
+    if (s->u_p1.idx     != UINT16_MAX) bgfx_destroy_uniform(s->u_p1);
+    if (s->u_screen.idx != UINT16_MAX) bgfx_destroy_uniform(s->u_screen);
+    if (s->u_kernel.idx != UINT16_MAX) bgfx_destroy_uniform(s->u_kernel);
+    if (s->s_depth.idx  != UINT16_MAX) bgfx_destroy_uniform(s->s_depth);
+    if (s->s_ao.idx     != UINT16_MAX) bgfx_destroy_uniform(s->s_ao);
+    if (s->vbh.idx != UINT16_MAX) bgfx_destroy_vertex_buffer(s->vbh);
+    if (s->ibh.idx != UINT16_MAX) bgfx_destroy_index_buffer(s->ibh);
+    if (s->fb_raw.idx  != UINT16_MAX) bgfx_destroy_frame_buffer(s->fb_raw);
+    if (s->fb_blur.idx != UINT16_MAX) bgfx_destroy_frame_buffer(s->fb_blur);
+    JCE_FREE(s);
+}
+
+void jce_ssao_resize(JceSsao *s, int w, int h)
+{
+    if (!s || w <= 0 || h <= 0) return;
+    if (w == s->w && h == s->h) return;
+    s->w = w; s->h = h;
+    create_targets(s);
+}
+
+void jce_ssao_set_params(JceSsao *s, const JceSsaoParams *p)
+{
+    if (!s || !p) return;
+    s->params = *p;
+}
+
+static void build_kernel(float out[16][4])
+{
+    /* Pre-baked Halton-2,3 hemisphere samples. */
+    static const float seeds[16][3] = {
+        { 0.50f,  0.10f, 0.20f}, {-0.30f,  0.50f, 0.30f}, { 0.10f, -0.40f, 0.40f},
+        {-0.20f, -0.30f, 0.50f}, { 0.40f,  0.20f, 0.10f}, {-0.10f,  0.30f, 0.60f},
+        { 0.30f, -0.20f, 0.30f}, {-0.40f, -0.10f, 0.20f}, { 0.20f,  0.40f, 0.40f},
+        {-0.50f,  0.20f, 0.10f}, { 0.10f,  0.10f, 0.70f}, {-0.20f, -0.50f, 0.30f},
+        { 0.40f, -0.30f, 0.20f}, {-0.10f,  0.40f, 0.50f}, { 0.30f,  0.30f, 0.20f},
+        {-0.30f, -0.40f, 0.40f},
+    };
+    for (int i = 0; i < 16; i++) {
+        float s = (float)(i + 1) / 16.0f;
+        s = 0.1f + s * s * 0.9f;  /* concentrate near origin */
+        out[i][0] = seeds[i][0] * s;
+        out[i][1] = seeds[i][1] * s;
+        out[i][2] = seeds[i][2] * s;
+        out[i][3] = 0.0f;
+    }
+}
+
+void jce_ssao_render(JceSsao *s, uint16_t depth_tex_handle, uint16_t first_view_id)
+{
+    if (!s) return;
+    if (s->prog_sample.idx == UINT16_MAX) return;
+
+    JCE_PROFILE_ZONE_N("SSAO::Render");
+
+    uint16_t v_sample = first_view_id;
+    uint16_t v_blur   = first_view_id + 1;
+
+    /* ---- pass 1: sampling ---- */
+    bgfx_set_view_frame_buffer(v_sample, s->fb_raw);
+    bgfx_set_view_rect(v_sample, 0, 0, (uint16_t)s->w, (uint16_t)s->h);
+    bgfx_set_view_clear(v_sample, BGFX_CLEAR_COLOR, 0xFFFFFFFF, 1.0f, 0);
+    bgfx_touch(v_sample);
+
+    float p0[4] = { s->params.radius, s->params.bias, s->params.intensity, 1.0f };
+    float p1[4] = { s->params.near_plane, s->params.far_plane, 0.0f, 0.0f };
+    float screen[4] = { 1.0f / (float)s->w, 1.0f / (float)s->h,
+                        (float)s->w, (float)s->h };
+    float kernel[16][4];
+    build_kernel(kernel);
+
+    bgfx_set_uniform(s->u_p0, p0, 1);
+    bgfx_set_uniform(s->u_p1, p1, 1);
+    bgfx_set_uniform(s->u_screen, screen, 1);
+    bgfx_set_uniform(s->u_kernel, kernel, 16);
+
+    bgfx_texture_handle_t depth = { depth_tex_handle };
+    bgfx_set_texture(0, s->s_depth, depth, UINT32_MAX);
+    bgfx_set_vertex_buffer(0, s->vbh, 0, 4);
+    bgfx_set_index_buffer(s->ibh, 0, 6);
+    bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A, 0);
+    bgfx_submit(v_sample, s->prog_sample, 0, BGFX_DISCARD_ALL);
+
+    /* ---- pass 2: blur ---- */
+    bgfx_set_view_frame_buffer(v_blur, s->fb_blur);
+    bgfx_set_view_rect(v_blur, 0, 0, (uint16_t)s->w, (uint16_t)s->h);
+    bgfx_set_view_clear(v_blur, BGFX_CLEAR_COLOR, 0xFFFFFFFF, 1.0f, 0);
+    bgfx_touch(v_blur);
+
+    bgfx_set_uniform(s->u_screen, screen, 1);
+    bgfx_set_texture(0, s->s_ao, s->tex_raw, UINT32_MAX);
+    bgfx_set_vertex_buffer(0, s->vbh, 0, 4);
+    bgfx_set_index_buffer(s->ibh, 0, 6);
+    bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A, 0);
+    bgfx_submit(v_blur, s->prog_blur, 0, BGFX_DISCARD_ALL);
+    JCE_PROFILE_ZONE_END;
+}
+
+uint16_t jce_ssao_get_result_texture(const JceSsao *s)
+{
+    if (!s) return UINT16_MAX;
+    return s->tex_blur.idx;
+}

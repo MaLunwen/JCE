@@ -10,7 +10,7 @@
 #include <jce/middleware/audio/jce_m4a_decode.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
-#include <jce/os/core/jce_pak_loader.h>
+#include <jce/resource/jce_pak_loader.h>
 #include <jce/resource/jce_asset_format.h>
 
 #include "jce_miniaudio_opus_backend.h"
@@ -123,6 +123,7 @@ void jce_audio_destroy(JceAudio *audio)
         ma_engine_uninit(&audio->engine);
 
     JCE_FREE(audio);
+    LOG_INFO("jce_audio", "audio system destroyed");
 }
 
 /* -- Sound loading -------------------------------------------------- */
@@ -792,6 +793,83 @@ const int16_t *jce_audio_get_pcm_data(const JceAudio *audio, JceSound snd,
     return (const int16_t *)s->pcm_data;
 }
 
+/* ── 3D positional audio ──────────────────────────────────────────── */
+
+void jce_audio_set_listener(JceAudio *audio, const JceAudioListener *l)
+{
+    if (!audio || !l) return;
+    /* miniaudio supports multiple listeners; we use index 0 only. */
+    ma_engine_listener_set_position(&audio->engine, 0,
+                                    l->position[0], l->position[1], l->position[2]);
+    ma_engine_listener_set_direction(&audio->engine, 0,
+                                     l->forward[0], l->forward[1], l->forward[2]);
+    ma_engine_listener_set_world_up(&audio->engine, 0,
+                                    l->up[0], l->up[1], l->up[2]);
+    ma_engine_listener_set_velocity(&audio->engine, 0,
+                                    l->velocity[0], l->velocity[1], l->velocity[2]);
+}
+
+void jce_audio_set_doppler_factor(JceAudio *audio, float factor)
+{
+    if (!audio) return;
+    if (factor < 0.0f) factor = 0.0f;
+    /* miniaudio's Doppler is per-sound; apply to every active voice. */
+    for (int i = 0; i < JCE_MAX_VOICES; ++i) {
+        if (audio->voices[i].inited)
+            ma_sound_set_doppler_factor(&audio->voices[i].sound, factor);
+    }
+}
+
+void jce_audio_voice_set_3d(JceAudio *audio, JceVoice voice, bool spatial)
+{
+    if (!audio || voice == JCE_VOICE_INVALID) return;
+    int idx = (int)voice - 1;
+    if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return;
+    ma_sound_set_spatialization_enabled(&audio->voices[idx].sound,
+                                         spatial ? MA_TRUE : MA_FALSE);
+}
+
+void jce_audio_voice_set_position(JceAudio *audio, JceVoice voice,
+                                    float x, float y, float z)
+{
+    if (!audio || voice == JCE_VOICE_INVALID) return;
+    int idx = (int)voice - 1;
+    if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return;
+    ma_sound_set_position(&audio->voices[idx].sound, x, y, z);
+}
+
+void jce_audio_voice_set_velocity(JceAudio *audio, JceVoice voice,
+                                    float vx, float vy, float vz)
+{
+    if (!audio || voice == JCE_VOICE_INVALID) return;
+    int idx = (int)voice - 1;
+    if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return;
+    ma_sound_set_velocity(&audio->voices[idx].sound, vx, vy, vz);
+}
+
+void jce_audio_voice_set_attenuation(JceAudio *audio, JceVoice voice,
+                                       JceAudioAttenuation model,
+                                       float min_distance, float max_distance,
+                                       float rolloff)
+{
+    if (!audio || voice == JCE_VOICE_INVALID) return;
+    int idx = (int)voice - 1;
+    if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return;
+
+    ma_attenuation_model ma_model = ma_attenuation_model_inverse;
+    switch (model) {
+        case JCE_AUDIO_ATTEN_NONE:        ma_model = ma_attenuation_model_none;        break;
+        case JCE_AUDIO_ATTEN_INVERSE:     ma_model = ma_attenuation_model_inverse;     break;
+        case JCE_AUDIO_ATTEN_LINEAR:      ma_model = ma_attenuation_model_linear;      break;
+        case JCE_AUDIO_ATTEN_EXPONENTIAL: ma_model = ma_attenuation_model_exponential; break;
+    }
+    ma_sound *snd = &audio->voices[idx].sound;
+    ma_sound_set_attenuation_model(snd, ma_model);
+    if (min_distance > 0.0f) ma_sound_set_min_distance(snd, min_distance);
+    if (max_distance > 0.0f) ma_sound_set_max_distance(snd, max_distance);
+    if (rolloff      > 0.0f) ma_sound_set_rolloff(snd, rolloff);
+}
+
 #else /* JCE_NO_AUDIO */
 
 JceAudio *jce_audio_create(void) {
@@ -868,6 +946,30 @@ JceVoice jce_audio_play_stream(JceAudio *audio,
     (void)audio; (void)on_read; (void)ud; (void)channels;
     (void)sample_rate; (void)volume; (void)pitch;
     return JCE_VOICE_INVALID;
+}
+void jce_audio_set_listener(JceAudio *audio, const JceAudioListener *l) {
+    (void)audio; (void)l;
+}
+void jce_audio_set_doppler_factor(JceAudio *audio, float factor) {
+    (void)audio; (void)factor;
+}
+void jce_audio_voice_set_3d(JceAudio *audio, JceVoice voice, bool spatial) {
+    (void)audio; (void)voice; (void)spatial;
+}
+void jce_audio_voice_set_position(JceAudio *audio, JceVoice voice,
+                                    float x, float y, float z) {
+    (void)audio; (void)voice; (void)x; (void)y; (void)z;
+}
+void jce_audio_voice_set_velocity(JceAudio *audio, JceVoice voice,
+                                    float vx, float vy, float vz) {
+    (void)audio; (void)voice; (void)vx; (void)vy; (void)vz;
+}
+void jce_audio_voice_set_attenuation(JceAudio *audio, JceVoice voice,
+                                       JceAudioAttenuation model,
+                                       float min_distance, float max_distance,
+                                       float rolloff) {
+    (void)audio; (void)voice; (void)model;
+    (void)min_distance; (void)max_distance; (void)rolloff;
 }
 
 #endif /* JCE_NO_AUDIO */

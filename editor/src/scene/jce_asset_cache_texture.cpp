@@ -11,7 +11,11 @@ bool looks_like_texture_asset_path(const char *path)
     if (!path || path[0] == '\0')
         return false;
 
-    std::string ext = fs::path(path).extension().string();
+    char ext_buf[32];
+    if (!jce_path_extension(ext_buf, sizeof(ext_buf), path))
+        return false;
+        
+    std::string ext(ext_buf);
     std::transform(ext.begin(), ext.end(), ext.begin(),
                    [](unsigned char c) { return (char)tolower(c); });
     return ext == ".png" || ext == ".jpg" || ext == ".jpeg"
@@ -66,7 +70,7 @@ void clear_texture_cache(void)
 
 /* ── Texture RGBA decoding ──────────────────────────────────────── */
 
-bool decode_texture_rgba_path(const fs::path &path,
+bool decode_texture_rgba_path(const char *path,
                               std::vector<uint8_t> *out_rgba,
                               uint32_t *out_w,
                               uint32_t *out_h)
@@ -79,7 +83,7 @@ bool decode_texture_rgba_path(const fs::path &path,
     *out_h = 0;
 
     size_t img_size = 0;
-    void *img_buf = ed_read_file(path.string().c_str(), &img_size);
+    void *img_buf = ed_read_file(path, &img_size);
     if (!img_buf) return false;
 
     JceImage img;
@@ -100,7 +104,7 @@ bool decode_texture_rgba_path(const fs::path &path,
 
     jce_image_free(&img);
     LOG_DEBUG(LOG_TAG, "decoded texture: %s (%ux%u)",
-              path.string().c_str(), *out_w, *out_h);
+              path, *out_w, *out_h);
     return true;
 }
 
@@ -135,7 +139,7 @@ static void texture_async_worker_main(void *arg)
         result.key = req.key;
         result.generation = req.generation;
         if (req.resolve_path) {
-            fs::path resolved_path;
+            char resolved_path[512];
             const char *material_path = req.material_path.empty()
                                       ? NULL : req.material_path.c_str();
             const char *mesh_path = req.mesh_path.empty()
@@ -143,7 +147,7 @@ static void texture_async_worker_main(void *arg)
 
             if (resolve_texture_path_for_material(material_path,
                                                   mesh_path,
-                                                  &resolved_path)) {
+                                                  resolved_path, sizeof(resolved_path))) {
                 result.success = decode_texture_rgba_path(resolved_path,
                                                           &result.rgba,
                                                           &result.width,
@@ -152,7 +156,7 @@ static void texture_async_worker_main(void *arg)
                 result.success = false;
             }
         } else {
-            result.success = decode_texture_rgba_path(req.file_path,
+            result.success = decode_texture_rgba_path(req.file_path.c_str(),
                                                       &result.rgba,
                                                       &result.width,
                                                       &result.height);
@@ -221,9 +225,9 @@ uint64_t texture_async_current_generation(void)
     return s_tex_async.generation;
 }
 
-void texture_async_queue_request(const char *key, const fs::path &file_path)
+void texture_async_queue_request(const char *key, const char *file_path)
 {
-    if (!s_tex_async.running || !key || key[0] == '\0' || file_path.empty())
+    if (!s_tex_async.running || !key || key[0] == '\0' || !file_path || !file_path[0])
         return;
 
     bool inserted = false;
@@ -239,7 +243,7 @@ void texture_async_queue_request(const char *key, const fs::path &file_path)
         if (!inserted) {
             TextureLoadRequest req;
             req.key = key;
-            req.file_path = file_path.string();
+            req.file_path = file_path;
             req.material_path.clear();
             req.mesh_path.clear();
             req.resolve_path = false;
@@ -442,8 +446,7 @@ JceTexture asset_cache_get_texture(const char *material_path,
     bool is_filesystem_texture = false;
     if (material_path && material_path[0] != '\0'
         && looks_like_texture_asset_path(material_path)) {
-        fs::path direct(material_path);
-        if (path_is_file(direct))
+        if (path_is_file(material_path))
             is_filesystem_texture = true;
     }
 
@@ -493,7 +496,7 @@ JceTexture asset_cache_get_texture(const char *material_path,
     entry->request_generation = generation;
 
     if (is_filesystem_texture) {
-        texture_async_queue_request(key, fs::path(material_path));
+        texture_async_queue_request(key, material_path);
     } else {
         texture_async_queue_resolve_request(key, material_path, mesh_path);
     }

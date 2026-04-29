@@ -11,7 +11,7 @@
  */
 
 #include <jce/os/core/jce_log.h>
-#include <jce/os/core/jce_pak_loader.h>
+#include <jce/resource/jce_pak_loader.h>
 #include <jce/renderer/jce_primitives.h>
 #include <jce/renderer/jce_text.h>
 #include <jce/renderer/jce_texture.h>

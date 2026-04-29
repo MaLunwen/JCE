@@ -280,68 +280,37 @@ bool resolve_mesh_file_path(const char *mesh_path, char *out_path,
         return false;
 
     /* If the path already points to an existing file (e.g. absolute), use it. */
-    if (fs::exists(mesh_path))
+    if (jce_fs_host_exists_file(mesh_path))
         return copy_found_path(mesh_path, out_path, out_size);
 
     if (s_cache.scene_dir[0] == '\0')
         return false;
 
-    const char *slash = strrchr(mesh_path, '/');
-    if (!slash) slash = strrchr(mesh_path, '\\');
-    const char *base = slash ? slash + 1 : mesh_path;
-
-    char target_kebab[256];
-    snprintf(target_kebab, sizeof(target_kebab), "%s", base);
-    char *dot = strrchr(target_kebab, '.');
-    if (dot) *dot = '\0';
-    for (char *p = target_kebab; *p; p++) {
-        if (*p >= 'A' && *p <= 'Z')
-            *p = (char)(*p + 32);
+    char basename[256];
+    if (!jce_path_basename(basename, sizeof(basename), mesh_path)) {
+        snprintf(basename, sizeof(basename), "%s", mesh_path);
     }
 
+    /* Try joining with scene_dir */
     char full_path[512];
-    snprintf(full_path, sizeof(full_path), "%s/%s", s_cache.scene_dir, mesh_path);
-    for (char *p = full_path; *p; p++) {
-        if (*p == '/') *p = '\\';
+    if (jce_path_join(full_path, sizeof(full_path), s_cache.scene_dir, mesh_path)) {
+        if (jce_fs_host_exists_file(full_path))
+            return copy_found_path(full_path, out_path, out_size);
     }
 
-    if (fs::exists(full_path))
-        return copy_found_path(full_path, out_path, out_size);
-
-    /* Recursive search via std::filesystem (cross-platform).  Walks up
-       from the scene directory looking for a regular file whose
-       lower-cased name matches the requested mesh basename. */
+    /* Recursive search using find_file_by_name_recursive */
     {
-        std::error_code ec;
-        std::string target_name = base;
-        std::transform(target_name.begin(), target_name.end(), target_name.begin(),
-                       [](unsigned char c) { return (char)tolower(c); });
+        std::vector<std::string> roots;
+        roots.push_back(std::string(s_cache.scene_dir));
+        
+        char parent[512];
+        if (jce_path_parent(parent, sizeof(parent), s_cache.scene_dir)) {
+            roots.push_back(std::string(parent));
+        }
 
-        std::vector<fs::path> roots;
-        roots.push_back(fs::path(s_cache.scene_dir));
-        fs::path parent = fs::path(s_cache.scene_dir).parent_path();
-        if (!parent.empty()) roots.push_back(parent);
-
-        for (const fs::path &root : roots) {
-            if (!fs::exists(root, ec) || !fs::is_directory(root, ec)) continue;
-            fs::recursive_directory_iterator it(root,
-                fs::directory_options::skip_permission_denied, ec);
-            fs::recursive_directory_iterator end;
-            for (; it != end; it.increment(ec)) {
-                if (ec) { ec.clear(); continue; }
-                if (it.depth() > 8) {
-                    it.disable_recursion_pending();
-                    continue;
-                }
-                if (!it->is_regular_file(ec)) continue;
-                std::string fn = it->path().filename().string();
-                std::transform(fn.begin(), fn.end(), fn.begin(),
-                               [](unsigned char c) { return (char)tolower(c); });
-                if (fn == target_name) {
-                    return copy_found_path(it->path().string().c_str(),
-                                           out_path, out_size);
-                }
-            }
+        char found[512];
+        if (find_file_by_name_recursive(roots, std::string(basename), 8, found, sizeof(found))) {
+            return copy_found_path(found, out_path, out_size);
         }
     }
 

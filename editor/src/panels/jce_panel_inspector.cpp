@@ -13,7 +13,7 @@
 #include "scene/jce_editor_scene_render.h"
 #include "scene/jce_model_loader_assimp.h"
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>

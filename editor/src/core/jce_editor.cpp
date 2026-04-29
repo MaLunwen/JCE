@@ -28,14 +28,14 @@
 extern "C" void jce_reflect_register_builtin(void);
 extern "C" void jce_hotkeys_init(void);
 
-#include <jce/tools/jce_imgui.h>
+#include <jce/tools/jce_imgui.hpp>
 #include <stdio.h>
 #include <string.h>
 
 extern "C" {
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
-#include <jce/os/core/jce_pak_loader.h>
+#include <jce/resource/jce_pak_loader.h>
 #include <jce/os/core/jce_str.h>
 #include <jce/os/platform/jce_clipboard.h>
 #include <jce/os/platform/jce_cursor.h>
