@@ -33,7 +33,7 @@ fi
 CONAN_DIR="build/desktop/${ARCH_TAG}-conan"
 BUILD_DIR="build/desktop/${ARCH_TAG}"
 TOOLCHAIN="$CONAN_DIR/build/Release/generators/conan_toolchain.cmake"
-HOST_PAK="build/host/jce_pak"
+HOST_PAK="build/host/tools/jce_pak"
 CONAN_HOME_DIR="${CONAN_HOME:-$HOME/.conan2}"
 CONAN_HOOKS_DIR="$CONAN_HOME_DIR/extensions/hooks"
 VARIANT="release"

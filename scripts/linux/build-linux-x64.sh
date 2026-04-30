@@ -15,7 +15,7 @@ PROFILE="conan/profiles/linux-x64"
 CONAN_DIR="build/desktop/linux-x64-conan"
 BUILD_DIR="build/desktop/linux-x64"
 TOOLCHAIN="$CONAN_DIR/build/Release/generators/conan_toolchain.cmake"
-HOST_PAK="build/host/jce_pak"
+HOST_PAK="build/host/tools/jce_pak"
 
 # -- Handle --clean flag --
 if [[ "${1:-}" == "--clean" ]]; then
@@ -90,11 +90,11 @@ cmake $CMAKE_ARGS
 echo "=== Step 5: Build (linux-x64) ==="
 cmake --build "$BUILD_DIR"
 
-if [[ ! -f "$BUILD_DIR/CagedKingdom" ]]; then
-    echo "ERROR: CagedKingdom not found after build"
+if [[ ! -f "$BUILD_DIR/release/caged_kingdom" ]]; then
+    echo "ERROR: caged_kingdom not found after build"
     exit 1
 fi
 
 echo ""
-echo "[SUCCESS] Linux x64 build complete: $BUILD_DIR/CagedKingdom"
+echo "[SUCCESS] Linux x64 build complete: $BUILD_DIR/release/caged_kingdom"
 _jce_success_wait

@@ -7,6 +7,8 @@
 #include "io/jce_editor_file_util.h"
 #include "jce_panel_assets_internal.h"
 
+#include <jce/os/core/jce_str.h>
+
 static void open_asset_in_file_viewer(const char *path)
 {
     if (!path || !path[0]) {
@@ -26,7 +28,7 @@ static void open_asset_entry(const FileEntry &fe)
     }
 
     const char *ext = strrchr(fe.path.c_str(), '.');
-    if (ext && (_stricmp(ext, ".scene") == 0)) {
+    if (ext && (jce_strcasecmp(ext, ".scene") == 0)) {
         jce_state_load_scene_file(fe.path.c_str());
         std::string dir = fe.path;
         size_t sep = dir.find_last_of("/\\");

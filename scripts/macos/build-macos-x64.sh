@@ -18,7 +18,7 @@ fi
 CONAN_DIR="build/desktop/macos-x64-conan"
 BUILD_DIR="build/desktop/macos-x64"
 TOOLCHAIN="$CONAN_DIR/build/Release/generators/conan_toolchain.cmake"
-HOST_PAK="build/host/jce_pak"
+HOST_PAK="build/host/tools/jce_pak"
 MACOS_DEPLOYMENT_TARGET="10.15"
 # Use separate Conan cache for each architecture to prevent cache pollution
 CONAN_HOME_DIR="${CONAN_HOME:-$HOME/.conan2}"

@@ -70,6 +70,12 @@ function(_jce_add_layer NAME)
 	endif()
 
 	jce_target_warnings(${NAME} STRICT)
+
+	# Keep frame pointers so the crash handler can walk the call chain
+	# via ucontext when a signal fires.  Overhead is negligible.
+	if(NOT MSVC)
+		target_compile_options(${NAME} PRIVATE -fno-omit-frame-pointer)
+	endif()
 endfunction()
 
 # ================================================================== #
@@ -129,17 +135,28 @@ if(NOT DEFINED JCE_PATENTED_CODECS_ENABLED)
 	set(JCE_PATENTED_CODECS_ENABLED ${JCE_ENABLE_PATENTED_CODECS})
 endif()
 
+# If the vendor sources are absent, force-disable patented codecs to keep builds working.
+if(JCE_PATENTED_CODECS_ENABLED)
+	set(_JCE_LIBHEVC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/middleware/video/third_party/libhevc/jce_build")
+	set(_JCE_OPENH264_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/middleware/video/third_party/openh264/jce_build")
+	set(_JCE_FDKAAC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/middleware/audio/third_party/fdk-aac")
+	if(NOT EXISTS "${_JCE_LIBHEVC_DIR}" OR NOT EXISTS "${_JCE_OPENH264_DIR}" OR NOT EXISTS "${_JCE_FDKAAC_DIR}")
+		message(WARNING "JCE: patented codecs requested, but vendor sources are missing. Disabling.")
+		set(JCE_PATENTED_CODECS_ENABLED OFF)
+	endif()
+endif()
+
 if(JCE_PATENTED_CODECS_ENABLED)
 	message(STATUS "JCE: patented codecs ENABLED (AAC/H.264/H.265 via fdk-aac/OpenH264/libhevc)")
 
 	# AOSP libhevc decoder (Apache-2.0, static library)
 	add_subdirectory(
-		"${CMAKE_CURRENT_SOURCE_DIR}/src/middleware/video/third_party/libhevc/jce_build"
+		"${_JCE_LIBHEVC_DIR}"
 		"${CMAKE_CURRENT_BINARY_DIR}/libhevcdec")
 
 	# Cisco openh264 decoder (BSD-2, static library — pure-C path)
 	add_subdirectory(
-		"${CMAKE_CURRENT_SOURCE_DIR}/src/middleware/video/third_party/openh264/jce_build"
+		"${_JCE_OPENH264_DIR}"
 		"${CMAKE_CURRENT_BINARY_DIR}/openh264dec")
 
 	# Fraunhofer FDK-AAC decoder/encoder (vendored — see header note in
@@ -149,7 +166,7 @@ if(JCE_PATENTED_CODECS_ENABLED)
 	set(FDK_AAC_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
 	set(FDK_AAC_INSTALL_PKGCONFIG_MODULE    OFF CACHE BOOL "" FORCE)
 	add_subdirectory(
-		"${CMAKE_CURRENT_SOURCE_DIR}/src/middleware/audio/third_party/fdk-aac"
+		"${_JCE_FDKAAC_DIR}"
 		"${CMAKE_CURRENT_BINARY_DIR}/fdk-aac")
 	# Suppress strict-warnings for vendored 3rd-party.
 	if(TARGET fdk-aac)
@@ -166,11 +183,17 @@ _jce_add_layer(jce_video
 	LINK_PUBLIC jce_core
 	LINK_PRIVATE dav1d::dav1d libvpx::libvpx webm::webm Opus::opus)
 
-# S3: compile the AVX2 YUV conversion TU with SIMD flags only for that file.
-set_source_files_properties(
-    "${_ENGINE_SRC}/middleware/video/jce_yuv_convert_avx2.c"
-    PROPERTIES COMPILE_OPTIONS
-        "$<IF:$<C_COMPILER_ID:MSVC>,/arch:AVX2,-mavx2>")
+# S3: compile the AVX2 YUV conversion TU with SIMD flags on x86 only.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i686|i386")
+    set_source_files_properties(
+        "${_ENGINE_SRC}/middleware/video/jce_yuv_convert_avx2.c"
+        PROPERTIES COMPILE_OPTIONS
+            "$<IF:$<C_COMPILER_ID:MSVC>,/arch:AVX2,-mavx2>")
+else()
+    set_source_files_properties(
+        "${_ENGINE_SRC}/middleware/video/jce_yuv_convert_avx2.c"
+        PROPERTIES HEADER_FILE_ONLY TRUE)
+endif()
 
 if(JCE_PATENTED_CODECS_ENABLED)
 	target_link_libraries(jce_video PRIVATE fdk-aac openh264dec libhevcdec)
@@ -258,6 +281,8 @@ _jce_add_layer(jce_renderer
 		jce_platform
 		jce_animation
 	LINK_PRIVATE
+		jce_scene
+		jce_world
 		bgfx::bgfx
 		SDL3_image::SDL3_image
 		Freetype::Freetype

@@ -18,7 +18,7 @@ fi
 CONAN_DIR="build/desktop/macos-arm64-conan"
 BUILD_DIR="build/desktop/macos-arm64"
 TOOLCHAIN="$CONAN_DIR/build/Release/generators/conan_toolchain.cmake"
-HOST_PAK="build/host/jce_pak"
+HOST_PAK="build/host/tools/jce_pak"
 MACOS_DEPLOYMENT_TARGET="11.0"
 CONAN_HOME_DIR="${CONAN_HOME:-$HOME/.conan2}"
 CONAN_HOOKS_DIR="$CONAN_HOME_DIR/extensions/hooks"

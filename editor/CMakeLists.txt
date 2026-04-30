@@ -86,6 +86,11 @@ add_dependencies(JCE_Editor PackEditorAssets)
 # ── Compiler warnings ──
 jce_target_warnings(JCE_Editor)
 
+# Keep frame pointers so the crash handler can walk the editor call chain.
+if(NOT MSVC)
+	target_compile_options(JCE_Editor PRIVATE -fno-omit-frame-pointer)
+endif()
+
 set_target_properties(JCE_Editor PROPERTIES
 	OUTPUT_NAME jce_editor
 	RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/${JCE_BUILD_VARIANT}"

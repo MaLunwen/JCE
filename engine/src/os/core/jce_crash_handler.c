@@ -10,6 +10,11 @@
  *   - Re-raises the signal for normal OS crash reporting.
  */
 
+#ifndef _GNU_SOURCE
+// Required for Dl_info/dladdr on glibc.
+#define _GNU_SOURCE
+#endif
+
 #include <jce/os/core/jce_crash_handler.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
@@ -42,7 +47,15 @@
   #include <execinfo.h>
   #include <dlfcn.h>
   #include <unistd.h>
+  #include <ucontext.h>       /* ucontext_t, REG_RIP / .pc fields  */
   #define HAS_BACKTRACE 1
+#endif
+
+/* Linux: read /proc/self/task/<tid>/comm for thread name, and use
+   syscall(SYS_gettid) to avoid linking libpthread in the handler. */
+#if defined(__linux__) && defined(HAS_BACKTRACE)
+  #include <fcntl.h>
+  #include <sys/syscall.h>
 #endif
 
 /* Android (Bionic) lacks execinfo.h but ships libgcc-style _Unwind_*
@@ -167,6 +180,139 @@ static int capture_backtrace(char *buf, size_t buf_size)
     return 0;
 #endif
 }
+
+/* ------------------------------------------------------------------ */
+/* ucontext-based backtrace (Linux x86_64 / aarch64 / arm)            */
+/* ------------------------------------------------------------------ */
+
+#ifdef HAS_BACKTRACE
+/*
+ * Extracts the faulting PC and frame pointer from the interrupted thread's
+ * register state stored in the sigaction ucontext parameter.  This gives us
+ * the actual crash site (frame #0) rather than the signal handler's own stack.
+ * The frame pointer walk that follows requires -fno-omit-frame-pointer.
+ */
+static int capture_backtrace_from_ucontext(char *buf, size_t buf_size, void *uc_ptr)
+{
+    buf[0] = '\0';
+    size_t off = 0;
+    int n = 0;
+
+    uintptr_t crash_pc = 0, crash_fp = 0;
+#if defined(__linux__)
+    {
+        ucontext_t *uc = (ucontext_t *)uc_ptr;
+#  if defined(__x86_64__)
+        crash_pc = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+        crash_fp = (uintptr_t)uc->uc_mcontext.gregs[REG_RBP];
+#  elif defined(__aarch64__)
+        crash_pc = (uintptr_t)uc->uc_mcontext.pc;
+        crash_fp = (uintptr_t)uc->uc_mcontext.regs[29]; /* x29 = FP */
+#  elif defined(__arm__)
+        crash_pc = (uintptr_t)uc->uc_mcontext.arm_pc;
+        crash_fp = (uintptr_t)uc->uc_mcontext.arm_fp;
+#  endif
+    }
+#else
+    (void)uc_ptr;
+#endif
+
+    /* Frame 0: the exact instruction that faulted (from CPU registers). */
+    if (crash_pc) {
+        Dl_info info;
+        int w;
+        if (dladdr((void *)crash_pc, &info) && info.dli_sname) {
+            uintptr_t delta = crash_pc >= (uintptr_t)info.dli_saddr
+                            ? crash_pc - (uintptr_t)info.dli_saddr : 0;
+            w = snprintf(buf + off, buf_size - off,
+                         "  #%02d %s+0x%zx (%s) [%p]\n", n,
+                         info.dli_sname, (size_t)delta,
+                         info.dli_fname ? info.dli_fname : "?",
+                         (void *)crash_pc);
+        } else if (dladdr((void *)crash_pc, &info) && info.dli_fbase) {
+            w = snprintf(buf + off, buf_size - off,
+                         "  #%02d %s+0x%zx [%p]\n", n,
+                         info.dli_fname ? info.dli_fname : "?",
+                         (size_t)(crash_pc - (uintptr_t)info.dli_fbase),
+                         (void *)crash_pc);
+        } else {
+            w = snprintf(buf + off, buf_size - off,
+                         "  #%02d [%p]\n", n, (void *)crash_pc);
+        }
+        if (w > 0) off += (size_t)w;
+        n++;
+    }
+
+    /* Walk the frame pointer chain for callers.
+     * Requires -fno-omit-frame-pointer; silently yields 0 extra frames
+     * when the compiler elided frame pointers. */
+    uintptr_t fp = crash_fp;
+    while (fp && n < MAX_BT_FRAMES) {
+        if (fp & (sizeof(uintptr_t) - 1)) break; /* must be pointer-aligned */
+        uintptr_t *frame = (uintptr_t *)fp;
+        uintptr_t ret    = frame[1]; /* return address */
+        uintptr_t prev   = frame[0]; /* saved frame pointer */
+        if (!ret) break;
+
+        Dl_info info;
+        int w;
+        if (dladdr((void *)ret, &info) && info.dli_sname) {
+            uintptr_t delta = ret >= (uintptr_t)info.dli_saddr
+                            ? ret - (uintptr_t)info.dli_saddr : 0;
+            w = snprintf(buf + off, buf_size - off,
+                         "  #%02d %s+0x%zx (%s) [%p]\n", n,
+                         info.dli_sname, (size_t)delta,
+                         info.dli_fname ? info.dli_fname : "?",
+                         (void *)ret);
+        } else if (dladdr((void *)ret, &info) && info.dli_fbase) {
+            w = snprintf(buf + off, buf_size - off,
+                         "  #%02d %s+0x%zx [%p]\n", n,
+                         info.dli_fname ? info.dli_fname : "?",
+                         (size_t)(ret - (uintptr_t)info.dli_fbase),
+                         (void *)ret);
+        } else {
+            w = snprintf(buf + off, buf_size - off,
+                         "  #%02d [%p]\n", n, (void *)ret);
+        }
+        if (w > 0) off += (size_t)w;
+        n++;
+
+        if (!prev || prev <= fp) break; /* prevent loops / detect end */
+        fp = prev;
+    }
+
+    if (n == 0) {
+        /* ucontext gave nothing — fall back to the handler's own stack. */
+        return capture_backtrace(buf, buf_size);
+    }
+    return n;
+}
+#endif /* HAS_BACKTRACE */
+
+/* ------------------------------------------------------------------ */
+/* Thread name helper (Linux: /proc/self/task/<tid>/comm)              */
+/* ------------------------------------------------------------------ */
+
+#if defined(__linux__) && defined(HAS_BACKTRACE)
+static void get_thread_name(char *buf, size_t size)
+{
+    pid_t tid = (pid_t)syscall(SYS_gettid);
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/self/task/%d/comm", (int)tid);
+    int fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+        ssize_t nr = read(fd, buf, size - 1);
+        close(fd);
+        if (nr > 0) {
+            buf[nr] = '\0';
+            char *nl = strchr(buf, '\n');
+            if (nl) *nl = '\0';
+            return;
+        }
+    }
+    snprintf(buf, size, "tid=%d", (int)tid);
+}
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Signal name helper                                                  */
@@ -297,10 +443,18 @@ static void crash_signal_handler(int sig)
 
 static void crash_sigaction_handler(int sig, siginfo_t *info, void *ucontext)
 {
-    (void)ucontext;
-
     char bt_buf[2048];
+#ifdef HAS_BACKTRACE
+    capture_backtrace_from_ucontext(bt_buf, sizeof(bt_buf), ucontext);
+#else
+    (void)ucontext;
     capture_backtrace(bt_buf, sizeof(bt_buf));
+#endif
+
+    char thread_name[80] = "unknown";
+#if defined(__linux__) && defined(HAS_BACKTRACE)
+    get_thread_name(thread_name, sizeof(thread_name));
+#endif
 
     const char *code_str = "";
     if (sig == SIGSEGV) {
@@ -316,12 +470,14 @@ static void crash_sigaction_handler(int sig, siginfo_t *info, void *ucontext)
              "=== JCE CRASH ===\n"
              "Signal: %d (%s)\n"
              "Code: %d %s\n"
-             "Fault address: %p\n\n"
+             "Fault address: %p\n"
+             "Thread: %s\n\n"
              "Backtrace:\n%s\n"
              "Please report this crash with the above information.",
              sig, signal_name(sig),
              info->si_code, code_str,
              info->si_addr,
+             thread_name,
              bt_buf);
 
     LOG_ERROR(LOG_TAG, "%s", msg);

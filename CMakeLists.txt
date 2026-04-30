@@ -217,57 +217,55 @@ foreach(_pb_cfg RELEASE RELWITHDEBINFO DEBUG)
                 break()
             endif()
         endforeach()
-        # On Windows host, verify the found binary actually runs on this host.
-        # Cross-compile Conan packages ship executables the host cannot run:
-        #   - Linux ELF protoc (Android cross-compile)
-        #   - ARM64 PE protoc (Windows ARM64 cross-compile, can't run on x64 host)
-        #   - Only .js protoc files (Emscripten/WASM) with no native executable.
-        # Strategy: probe the found binary with execute_process(--version).
-        # If it fails (wrong arch, ELF, missing, .js), fall back to glob search.
-        if(CMAKE_HOST_WIN32)
-            set(_need_native_search FALSE)
-            if(_found_protoc)
-                execute_process(
-                    COMMAND "${_found_protoc}" --version
-                    RESULT_VARIABLE _run_rc
-                    OUTPUT_QUIET ERROR_QUIET
-                    TIMEOUT 10
-                )
-                if(NOT _run_rc EQUAL 0)
-                    message(STATUS "JCE: Conan protoc cannot run on this host (cross-compile pkg). Searching Conan2 cache for native protoc.exe")
-                    set(_need_native_search TRUE)
-                    set(_found_protoc "")
-                endif()
-                unset(_run_rc)
-            else()
-                # No executable protoc found in bin dir (e.g. WASM: only .js files)
-                message(STATUS "JCE: No native protoc in Conan package bin dir. Searching Conan2 cache for native protoc.exe")
+        # Verify the found binary can actually run on THIS host.
+        # Cross-compile packages may ship arm64/WASM executables that the
+        # build host cannot execute (Exec format error on Linux, wrong PE arch
+        # on Windows, or .js-only for WASM).  Probe with --version and fall
+        # back to a glob search over the full Conan2 cache when it fails.
+        set(_need_native_search FALSE)
+        if(_found_protoc)
+            execute_process(
+                COMMAND "${_found_protoc}" --version
+                RESULT_VARIABLE _run_rc
+                OUTPUT_QUIET ERROR_QUIET
+                TIMEOUT 10
+            )
+            if(NOT _run_rc EQUAL 0)
+                message(STATUS "JCE: Conan protoc cannot run on this host (cross-compile pkg). Searching Conan2 cache for native protoc.")
                 set(_need_native_search TRUE)
+                set(_found_protoc "")
             endif()
-            if(_need_native_search)
-                file(GLOB _win_protoc_list
-                    "$ENV{USERPROFILE}/.conan2/p/proto*/p/bin/protoc.exe")
-                list(SORT _win_protoc_list ORDER DESCENDING)
-                foreach(_candidate IN LISTS _win_protoc_list)
-                    if(EXISTS "${_candidate}")
-                        execute_process(
-                            COMMAND "${_candidate}" --version
-                            RESULT_VARIABLE _run_rc
-                            OUTPUT_QUIET ERROR_QUIET
-                            TIMEOUT 10
-                        )
-                        if(_run_rc EQUAL 0)
-                            set(_found_protoc "${_candidate}")
-                            break()
-                        endif()
-                    endif()
-                endforeach()
-                unset(_win_protoc_list)
-                unset(_candidate)
-                unset(_run_rc)
-            endif()
-            unset(_need_native_search)
+            unset(_run_rc)
+        else()
+            message(STATUS "JCE: No native protoc in Conan package bin dir. Searching Conan2 cache for native protoc.")
+            set(_need_native_search TRUE)
         endif()
+        if(_need_native_search)
+            if(CMAKE_HOST_WIN32)
+                file(GLOB _protoc_list "$ENV{USERPROFILE}/.conan2/p/b/proto*/p/bin/protoc.exe")
+            else()
+                file(GLOB _protoc_list "$ENV{HOME}/.conan2/p/b/proto*/p/bin/protoc")
+            endif()
+            list(SORT _protoc_list ORDER DESCENDING)
+            foreach(_candidate IN LISTS _protoc_list)
+                if(EXISTS "${_candidate}")
+                    execute_process(
+                        COMMAND "${_candidate}" --version
+                        RESULT_VARIABLE _run_rc
+                        OUTPUT_QUIET ERROR_QUIET
+                        TIMEOUT 10
+                    )
+                    if(_run_rc EQUAL 0)
+                        set(_found_protoc "${_candidate}")
+                        break()
+                    endif()
+                endif()
+            endforeach()
+            unset(_protoc_list)
+            unset(_candidate)
+            unset(_run_rc)
+        endif()
+        unset(_need_native_search)
         if(_found_protoc)
             set(Protobuf_PROTOC_EXECUTABLE "${_found_protoc}"
                 CACHE FILEPATH "The protoc compiler" FORCE)
