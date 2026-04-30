@@ -55,11 +55,15 @@
 
 #define LOG_TAG "scene_renderer"
 
+/* C99-compatible compile-time assertion. */
+#define JCE_SASSERT_CAT_(a, b)  a##b
+#define JCE_SASSERT_CAT(a, b)   JCE_SASSERT_CAT_(a, b)
+#define JCE_SASSERT(cond)       typedef char JCE_SASSERT_CAT(jce_ct_, __LINE__)[(cond) ? 1 : -1]
+
 /* Public scene_renderer.h declares JceSceneLodStats with picks[JCE_SCENE_LOD_MAX_LEVELS]
    so it does not have to include middleware/scene/jce_lod.h. Keep the
    constants in lock-step. */
-static_assert(JCE_SCENE_LOD_MAX_LEVELS == JCE_LOD_MAX_LEVELS,
-              "renderer / middleware LOD level cap drift");
+JCE_SASSERT(JCE_SCENE_LOD_MAX_LEVELS == JCE_LOD_MAX_LEVELS);
 
 #define SR_MODEL_CACHE_MAX     32
 #define SR_TEX_CACHE_MAX       512

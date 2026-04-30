@@ -23,8 +23,20 @@ set -euo pipefail
 # Absolute path of the directory containing THIS file (works when sourced).
 _JCE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+if [[ -z "${JCE_FAIL_TOKEN:-}" ]]; then
+    JCE_FAIL_TOKEN="$(date +%s)-$$"
+    export JCE_FAIL_TOKEN
+fi
+_JCE_FAIL_FILE="/tmp/jce_fail_${JCE_FAIL_TOKEN}"
+export _JCE_FAIL_FILE
+
 _jce_on_fail() {
-    "$_JCE_LIB_DIR/jce_beep.sh" fail
+    if [[ -f "$_JCE_FAIL_FILE" ]]; then
+        return
+    fi
+    : >"$_JCE_FAIL_FILE" 2>/dev/null || true
+    trap - ERR
+    "$_JCE_LIB_DIR/jce_beep.sh" fail || true
     echo ""
     echo "[FAILED] Build failed."
     [[ -t 0 ]] || return
@@ -51,7 +63,7 @@ trap '_jce_on_fail' ERR
 
 _jce_success_wait() {
     "$_JCE_LIB_DIR/jce_beep.sh" success
-    [[ -t 1 ]] || return
+    [[ -t 1 ]] || return 0
     local t=3 e=0 key="" key2=""
     while true; do
         printf "\r[SUCCESS] Auto-closing in %ds... (:q to quit)  " $((t - e))

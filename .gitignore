@@ -1,7 +1,12 @@
 
 .*
 !.gitattributes
-third_party/
+
+engine/src/middleware/audio/third_party
+engine/src/middleware/video/third_party/libhevc
+engine/src/middleware/video/third_party/openh264
+!engine/src/middleware/video/third_party/minimp4.h
+
 _*
 
 build/
@@ -35,7 +40,3 @@ scripts/android/app/src/main/assets/
 scripts/android/app/src/main/res/*
 !scripts/android/app/src/main/res/drawable-nodpi/
 !scripts/android/app/src/main/res/values/
-
-# Vendored single-header libraries (managed manually, excluded from style/CI scans)
-engine/src/renderer/internal/stb_image.h
-engine/src/renderer/internal

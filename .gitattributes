@@ -1,2 +1,3 @@
 # Vendored third-party sources — excluded from GitHub language statistics
 **/third_party/** linguist-vendored=true
+**/internal/** linguist-vendored=true

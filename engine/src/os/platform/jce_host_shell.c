@@ -172,21 +172,21 @@ bool jce_host_reveal_path(const char *path)
 
     /* Final fallback: hand the path (or its parent) to SDL_OpenURL. */
     const char *fallback_target = path;
-    char parent[1100];
+    char fallback_parent[1100];
     if (info.type == SDL_PATHTYPE_FILE) {
         size_t len = strlen(path);
-        if (len < sizeof(parent)) {
-            memcpy(parent, path, len + 1);
+        if (len < sizeof(fallback_parent)) {
+            memcpy(fallback_parent, path, len + 1);
             char *sep = NULL;
             for (size_t i = len; i > 0; --i) {
-                if (parent[i - 1] == '/' || parent[i - 1] == '\\') {
-                    sep = &parent[i - 1];
+                if (fallback_parent[i - 1] == '/' || fallback_parent[i - 1] == '\\') {
+                    sep = &fallback_parent[i - 1];
                     break;
                 }
             }
-            if (sep && sep != parent) {
+            if (sep && sep != fallback_parent) {
                 *sep = '\0';
-                fallback_target = parent;
+                fallback_target = fallback_parent;
             }
         }
     }

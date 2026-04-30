@@ -263,9 +263,9 @@ int jce_renderer_caps_preferred_chain(enum JceRendererBackend *out, int max)
 #if defined(_WIN32)
         JCE_BACKEND_D3D12, JCE_BACKEND_D3D11, JCE_BACKEND_VULKAN, JCE_BACKEND_OPENGL,
 #elif defined(__APPLE__)
-        JCE_BACKEND_METAL, JCE_BACKEND_VULKAN,
+        JCE_BACKEND_METAL, JCE_BACKEND_VULKAN, JCE_BACKEND_OPENGL,
 #elif defined(__ANDROID__)
-        JCE_BACKEND_OPENGLES, JCE_BACKEND_VULKAN,
+        JCE_BACKEND_VULKAN, JCE_BACKEND_OPENGLES,
 #elif defined(__EMSCRIPTEN__)
         JCE_BACKEND_OPENGLES,
 #else /* Linux / other Unix */
@@ -307,17 +307,6 @@ int jce_renderer_caps_list_backends(enum JceRendererBackend *out, int max)
             if ((int)b < (int)(sizeof(seen)/sizeof(seen[0]))) seen[(int)b] = true;
             break;
         }
-    }
-
-    /* Pass 2: catch any supported backend not in the preference table
-       (forward-compat for new bgfx renderers). */
-    for (uint8_t i = 0; i < n; ++i) {
-        if (supported[i] == BGFX_RENDERER_TYPE_NOOP) continue;
-        enum JceRendererBackend b = s_from_bgfx(supported[i]);
-        if (b == JCE_BACKEND_AUTO) continue;
-        if ((int)b < (int)(sizeof(seen)/sizeof(seen[0])) && seen[(int)b]) continue;
-        tmp[count++] = b;
-        if ((int)b < (int)(sizeof(seen)/sizeof(seen[0]))) seen[(int)b] = true;
     }
 
     if (out && max > 0) {

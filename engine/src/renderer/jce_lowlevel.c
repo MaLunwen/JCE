@@ -18,33 +18,37 @@
 
 #define LOG_TAG "jce_gfx"
 
+/* C99-compatible compile-time assertion.
+ * Three levels are needed: JCE_SASSERT_CAT forces expansion of __LINE__
+ * before passing it to JCE_SASSERT_CAT_ where ## is applied. */
+#define JCE_SASSERT_CAT_(a, b)  a##b
+#define JCE_SASSERT_CAT(a, b)   JCE_SASSERT_CAT_(a, b)
+#define JCE_SASSERT(cond)       typedef char JCE_SASSERT_CAT(jce_ct_, __LINE__)[(cond) ? 1 : -1]
+
 /* ── Compile-time ABI sanity ─────────────────────────────────────── */
 
-static_assert(sizeof(JceVertexLayout) >= sizeof(bgfx_vertex_layout_t),
-               "JceVertexLayout opaque storage too small for bgfx_vertex_layout_t");
+JCE_SASSERT(sizeof(JceVertexLayout) >= sizeof(bgfx_vertex_layout_t));
 
-static_assert((int)JCE_ATTRIB_POSITION  == (int)BGFX_ATTRIB_POSITION,  "attrib enum mismatch");
-static_assert((int)JCE_ATTRIB_COLOR0    == (int)BGFX_ATTRIB_COLOR0,    "attrib enum mismatch");
-static_assert((int)JCE_ATTRIB_TEXCOORD0 == (int)BGFX_ATTRIB_TEXCOORD0, "attrib enum mismatch");
-static_assert((int)JCE_ATTRIB_TYPE_FLOAT == (int)BGFX_ATTRIB_TYPE_FLOAT, "attrib type mismatch");
-static_assert((int)JCE_ATTRIB_TYPE_UINT8 == (int)BGFX_ATTRIB_TYPE_UINT8, "attrib type mismatch");
+JCE_SASSERT((int)JCE_ATTRIB_POSITION  == (int)BGFX_ATTRIB_POSITION);
+JCE_SASSERT((int)JCE_ATTRIB_COLOR0    == (int)BGFX_ATTRIB_COLOR0);
+JCE_SASSERT((int)JCE_ATTRIB_TEXCOORD0 == (int)BGFX_ATTRIB_TEXCOORD0);
+JCE_SASSERT((int)JCE_ATTRIB_TYPE_FLOAT == (int)BGFX_ATTRIB_TYPE_FLOAT);
+JCE_SASSERT((int)JCE_ATTRIB_TYPE_UINT8 == (int)BGFX_ATTRIB_TYPE_UINT8);
 
-static_assert((uint64_t)JCE_STATE_WRITE_RGB == (uint64_t)BGFX_STATE_WRITE_RGB, "state mismatch");
-static_assert((uint64_t)JCE_STATE_WRITE_A   == (uint64_t)BGFX_STATE_WRITE_A,   "state mismatch");
-static_assert((uint64_t)JCE_STATE_MSAA      == (uint64_t)BGFX_STATE_MSAA,      "state mismatch");
-static_assert((uint64_t)JCE_STATE_DEPTH_TEST_LESS   == (uint64_t)BGFX_STATE_DEPTH_TEST_LESS,   "state mismatch");
-static_assert((uint64_t)JCE_STATE_DEPTH_TEST_LEQUAL == (uint64_t)BGFX_STATE_DEPTH_TEST_LEQUAL, "state mismatch");
-static_assert((uint64_t)JCE_BLEND_ONE           == (uint64_t)BGFX_STATE_BLEND_ONE,           "blend mismatch");
-static_assert((uint64_t)JCE_BLEND_SRC_ALPHA     == (uint64_t)BGFX_STATE_BLEND_SRC_ALPHA,     "blend mismatch");
-static_assert((uint64_t)JCE_BLEND_INV_SRC_ALPHA == (uint64_t)BGFX_STATE_BLEND_INV_SRC_ALPHA, "blend mismatch");
-static_assert(JCE_DISCARD_ALL == BGFX_DISCARD_ALL, "discard mismatch");
-static_assert((int)JCE_UNIFORM_TYPE_VEC4 == (int)BGFX_UNIFORM_TYPE_VEC4, "uniform type mismatch");
-static_assert((int)JCE_TEXTURE_FORMAT_RGBA8 == (int)BGFX_TEXTURE_FORMAT_RGBA8, "texture format mismatch");
+JCE_SASSERT((uint64_t)JCE_STATE_WRITE_RGB == (uint64_t)BGFX_STATE_WRITE_RGB);
+JCE_SASSERT((uint64_t)JCE_STATE_WRITE_A   == (uint64_t)BGFX_STATE_WRITE_A);
+JCE_SASSERT((uint64_t)JCE_STATE_MSAA      == (uint64_t)BGFX_STATE_MSAA);
+JCE_SASSERT((uint64_t)JCE_STATE_DEPTH_TEST_LESS   == (uint64_t)BGFX_STATE_DEPTH_TEST_LESS);
+JCE_SASSERT((uint64_t)JCE_STATE_DEPTH_TEST_LEQUAL == (uint64_t)BGFX_STATE_DEPTH_TEST_LEQUAL);
+JCE_SASSERT((uint64_t)JCE_BLEND_ONE           == (uint64_t)BGFX_STATE_BLEND_ONE);
+JCE_SASSERT((uint64_t)JCE_BLEND_SRC_ALPHA     == (uint64_t)BGFX_STATE_BLEND_SRC_ALPHA);
+JCE_SASSERT((uint64_t)JCE_BLEND_INV_SRC_ALPHA == (uint64_t)BGFX_STATE_BLEND_INV_SRC_ALPHA);
+JCE_SASSERT(JCE_DISCARD_ALL == BGFX_DISCARD_ALL);
+JCE_SASSERT((int)JCE_UNIFORM_TYPE_VEC4 == (int)BGFX_UNIFORM_TYPE_VEC4);
+JCE_SASSERT((int)JCE_TEXTURE_FORMAT_RGBA8 == (int)BGFX_TEXTURE_FORMAT_RGBA8);
 
-static_assert(sizeof(JceTransientVertexBuffer) == sizeof(bgfx_transient_vertex_buffer_t),
-               "JceTransientVertexBuffer layout drift");
-static_assert(sizeof(JceTransientIndexBuffer) == sizeof(bgfx_transient_index_buffer_t),
-               "JceTransientIndexBuffer layout drift");
+JCE_SASSERT(sizeof(JceTransientVertexBuffer) == sizeof(bgfx_transient_vertex_buffer_t));
+JCE_SASSERT(sizeof(JceTransientIndexBuffer) == sizeof(bgfx_transient_index_buffer_t));
 
 /* ── Vertex layout ─────────────────────────────────────────────── */
 

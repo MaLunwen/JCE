@@ -14,7 +14,7 @@
 
 #include "os/core/jce_memory.h"
 
-#include <cJSON/cJSON.h>
+#include <cjson/cJSON.h>
 #include <math.h>
 #include <SDL3/SDL_filesystem.h>
 #include <stdio.h>

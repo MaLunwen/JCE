@@ -2,7 +2,7 @@
 # ================================================================
 # build-host-tools.sh -- Build host jce_pak on macOS
 # Usage: build-host-tools.sh [--clean]
-# Output: build/host/jce_pak
+# Output: build/host/tools/jce_pak
 # ================================================================
 source "$(dirname "$0")/../lib/jce_common.sh"
 CONAN_DIR="build/host-conan"
@@ -47,17 +47,18 @@ TOOLCHAIN="$(cd "$(dirname "$TOOLCHAIN")" && pwd)/$(basename "$TOOLCHAIN")"
 cmake -S . -B "$BUILD_DIR" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN" \
     -DCMAKE_BUILD_TYPE=Release \
-    -DJCE_ENABLE_CPPCHECK=OFF
+    -DJCE_ENABLE_CPPCHECK=OFF \
+    -DJCE_ENABLE_PATENTED_CODECS=OFF
 
 # -- Step 3: Build jce_pak --
 echo "=== Step 3: Build jce_pak ==="
 cmake --build "$BUILD_DIR" --target jce_pak
 
-if [[ ! -f "$BUILD_DIR/jce_pak" ]]; then
+if [[ ! -f "$BUILD_DIR/tools/jce_pak" ]]; then
     echo "ERROR: jce_pak not found after build"
     exit 1
 fi
 
 echo ""
-echo "[SUCCESS] Host jce_pak ready: $BUILD_DIR/jce_pak"
+echo "[SUCCESS] Host jce_pak ready: $BUILD_DIR/tools/jce_pak"
 _jce_success_wait

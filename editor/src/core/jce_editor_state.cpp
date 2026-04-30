@@ -20,6 +20,8 @@
 #include <algorithm>
 #include <cstdlib>
 
+#include <jce/os/core/jce_str.h>
+
 /* Forward-declare only the one function we need from scene_render,
    avoiding a full include that creates a cpp-level circular dependency. */
 extern "C" void jce_editor_scene_set_scene_dir(const char *dir);
@@ -90,7 +92,7 @@ void update_scene_dir_from_path(const char *scene_path)
         char *last_bcomp = strrchr(scene_dir, '\\');
         if (last_bcomp && (!last_comp || last_bcomp > last_comp)) last_comp = last_bcomp;
         const char *dir_name = last_comp ? last_comp + 1 : scene_dir;
-        if (_stricmp(dir_name, "Scenes") == 0 || _stricmp(dir_name, "scenes") == 0) {
+        if (jce_strcasecmp(dir_name, "Scenes") == 0) {
             if (last_comp) *last_comp = '\0';
         }
     }
@@ -199,11 +201,9 @@ static void build_demo_scene(void)
      * benchmark frustum culling, grid persistence, and LOD selection
      * with a non-trivial entity count. */
     {
-        const char *env = nullptr;
-        size_t      env_len = 0;
-        if (_dupenv_s((char **)&env, &env_len, "JCE_STRESS_CUBES") == 0 && env) {
+        const char *env = std::getenv("JCE_STRESS_CUBES");
+        if (env) {
             const long n = strtol(env, nullptr, 10);
-            free((void *)env);
             if (n > 0 && n <= 200000) {
                 LOG_INFO(LOG_TAG, "stress test: spawning %ld cubes", n);
                 uint32_t stress_root = jce_state_create_entity("Stress Cubes", root);
