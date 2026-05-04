@@ -87,7 +87,7 @@ JceSpriteSheet *jce_sprite_sheet_create_grid(const char *image_path,
 /* Aseprite JSON loading                                               */
 /* ================================================================== */
 
-static char *read_file_text(const char *path, size_t *out_size)
+static char *read_file_text(const char *path, uint64_t *out_size)
 {
     return (char *)jce_fs_host_read_all(path, out_size);
 }
@@ -97,7 +97,7 @@ JceSpriteSheet *jce_sprite_sheet_load_json(const char *json_path,
 {
     if (!json_path) return NULL;
 
-    size_t json_size = 0;
+    uint64_t json_size = 0;
     char *json_text = read_file_text(json_path, &json_size);
     if (!json_text) {
         LOG_WARN(LOG_TAG, "cannot read atlas: %s", json_path);

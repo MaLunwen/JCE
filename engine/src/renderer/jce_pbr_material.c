@@ -213,7 +213,7 @@ bool jce_pbr_material_load_json(const char *path, JcePbrMaterial *out,
 {
     if (!path || !out || !out_tex_paths) return false;
 
-    size_t sz = 0;
+    uint64_t sz = 0;
     char *buf = (char *)jce_fs_host_read_all(path, &sz);
     if (!buf) {
         LOG_WARN(LOG_TAG, "cannot open material file: %s", path);

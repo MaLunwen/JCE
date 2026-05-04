@@ -127,6 +127,8 @@ if [[ ! -f "$BUILD_DIR/$VARIANT/jce_editor" ]]; then
     exit 1
 fi
 
+strip --strip-unneeded "$BUILD_DIR/$VARIANT/jce_editor" 2>/dev/null || true
+
 echo ""
 echo "[SUCCESS] Editor build complete ($VARIANT): $BUILD_DIR/$VARIANT/jce_editor"
 _jce_success_wait

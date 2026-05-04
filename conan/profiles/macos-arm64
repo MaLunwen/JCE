@@ -10,6 +10,7 @@ build_type=Release
 
 [conf]
 tools.cmake.cmaketoolchain:generator=Ninja
+tools.cmake.cmaketoolchain:extra_variables={"CMAKE_POLICY_VERSION_MINIMUM": "3.5"}
 tools.build:cflags=["-mmacosx-version-min=11.0"]
 tools.build:cxxflags=["-mmacosx-version-min=11.0"]
 tools.build:sharedlinkflags=["-mmacosx-version-min=11.0"]

@@ -234,6 +234,7 @@ JceTexture jce_ibl_create_brdf_lut(uint32_t size)
             y               = jobs[i].y_end;
         }
 
+        LOG_INFO(LOG_TAG, "BRDF LUT: spawning %d worker threads", worker_count);
         for (int i = 0; i < worker_count; i++) {
             threads[i] = jce_thread_create(
                 jce_ibl_brdf_worker, &jobs[i], "brdf_lut");
@@ -242,9 +243,11 @@ JceTexture jce_ibl_create_brdf_lut(uint32_t size)
                 jce_ibl_brdf_worker(&jobs[i]);
             }
         }
+        LOG_INFO(LOG_TAG, "BRDF LUT: joining threads");
         for (int i = 0; i < worker_count; i++) {
             if (threads[i]) jce_thread_join(threads[i]);
         }
+        LOG_INFO(LOG_TAG, "BRDF LUT: computation done");
 
         /* ── Write cache for next run (best-effort) ─────────────────── */
         jce_fs_host_create_directory(".jce");
@@ -256,6 +259,7 @@ JceTexture jce_ibl_create_brdf_lut(uint32_t size)
         }
     }
 
+    LOG_INFO(LOG_TAG, "BRDF LUT: uploading to GPU");
     const bgfx_memory_t *mem = bgfx_copy(data, (uint32_t)bytes);
     JCE_FREE(data);
 
@@ -265,9 +269,8 @@ JceTexture jce_ibl_create_brdf_lut(uint32_t size)
         BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
         mem);
 
-    if (BGFX_HANDLE_IS_VALID(tex))
-        LOG_INFO(LOG_TAG, "BRDF LUT %s: %ux%u",
-                 from_cache ? "cached" : "created", size, size);
+    LOG_INFO(LOG_TAG, "BRDF LUT: texture idx=%u valid=%d",
+             (unsigned)tex.idx, BGFX_HANDLE_IS_VALID(tex) ? 1 : 0);
 
     return (JceTexture){ tex.idx };
 }

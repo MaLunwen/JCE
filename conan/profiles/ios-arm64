@@ -8,3 +8,6 @@ compiler.version=16
 compiler.libcxx=libc++
 compiler.cppstd=17
 build_type=Release
+
+[conf]
+tools.cmake.cmaketoolchain:extra_variables={"CMAKE_POLICY_VERSION_MINIMUM": "3.5"}

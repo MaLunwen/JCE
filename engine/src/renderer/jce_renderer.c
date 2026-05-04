@@ -25,11 +25,111 @@
 #include <stdio.h>
 #include <string.h>
 
+#define LOG_TAG "jce_renderer"
+
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 #endif
 
-#define LOG_TAG "jce_renderer"
+#ifdef __ANDROID__
+#include <pthread.h>
+#include <semaphore.h>
+
+/* ── Android bgfx-frame side thread ─────────────────────────────────────
+ * WSA (Windows Subsystem for Android) uses libEGL_emulation.so, whose
+ * eglSwapBuffers hangs indefinitely after ~16 frames.  bgfx's render
+ * thread blocks in that call, and bgfx_frame() on the SDL game thread
+ * then blocks in renderSemWait() waiting for the stuck render thread.
+ * That makes the SDL thread unresponsive → ANR.
+ *
+ * Fix: run bgfx_frame on a dedicated side thread.  The SDL game thread
+ * signals the side thread and returns immediately (fire-and-forget).
+ * When eglSwapBuffers hangs, only the side thread blocks; the SDL game
+ * thread stays alive and Android never fires ANR.
+ *
+ * Trade-off: once the EGL hang occurs, s_egl_hung=true and all further
+ * bgfx draw calls are skipped. Rendering freezes but the app lives.
+ */
+static pthread_t     s_frame_pthread;
+static sem_t         s_frame_req;           /* game→side: "call bgfx_frame" */
+static SDL_AtomicInt s_frame_done    = {1}; /* 1=idle, 0=in-progress         */
+static SDL_AtomicInt s_egl_hung      = {0}; /* 1=eglSwapBuffers hung          */
+static SDL_AtomicInt s_frame_kick_ms = {0}; /* SDL_GetTicks() at last kick    */
+static SDL_AtomicInt s_frame_thread_live = {0};
+
+#define ANDROID_EGL_HANG_TIMEOUT_MS 2000    /* 2 s without done → hung        */
+
+static void *android_bgfx_frame_thread(void *arg)
+{
+    (void)arg;
+    while (SDL_GetAtomicInt(&s_frame_thread_live)) {
+        sem_wait(&s_frame_req);
+        if (!SDL_GetAtomicInt(&s_frame_thread_live)) break;
+        bgfx_frame(false); /* may block forever in eglSwapBuffers on WSA */
+        SDL_SetAtomicInt(&s_frame_done, 1);
+    }
+    return NULL;
+}
+
+static void android_frame_thread_start(void)
+{
+    sem_init(&s_frame_req, 0, 0);
+    SDL_SetAtomicInt(&s_frame_thread_live, 1);
+    SDL_SetAtomicInt(&s_frame_done, 1);
+    SDL_SetAtomicInt(&s_egl_hung, 0);
+    pthread_create(&s_frame_pthread, NULL, android_bgfx_frame_thread, NULL);
+}
+
+static void android_frame_thread_stop(void)
+{
+    SDL_SetAtomicInt(&s_frame_thread_live, 0);
+    sem_post(&s_frame_req);  /* wake thread so it can exit cleanly */
+    pthread_join(s_frame_pthread, NULL);
+    sem_destroy(&s_frame_req);
+}
+
+/* Called instead of bgfx_frame(false) from jce_renderer_end_frame.
+ * Non-blocking: kicks the side thread if the previous frame is done.
+ * Detects hang when the side thread hasn't returned within
+ * ANDROID_EGL_HANG_TIMEOUT_MS and permanently suspends rendering. */
+static void android_end_frame(void)
+{
+    if (SDL_GetAtomicInt(&s_egl_hung)) return;   /* EGL already hung, skip */
+
+    if (SDL_GetAtomicInt(&s_frame_done)) {
+        /* Previous frame completed — kick a new one. */
+        SDL_SetAtomicInt(&s_frame_kick_ms, (int)(SDL_GetTicks() & 0x7fffffff));
+        SDL_SetAtomicInt(&s_frame_done, 0);
+        sem_post(&s_frame_req);
+    } else {
+        /* Still in-progress: check for hang. */
+        uint32_t now_ms  = (uint32_t)SDL_GetTicks();
+        uint32_t kick_ms = (uint32_t)SDL_GetAtomicInt(&s_frame_kick_ms);
+        if (now_ms - kick_ms > ANDROID_EGL_HANG_TIMEOUT_MS) {
+            SDL_SetAtomicInt(&s_egl_hung, 1);
+            LOG_WARN(LOG_TAG,
+                "eglSwapBuffers hung (WSA/libEGL_emulation bug) — "
+                "rendering suspended, app stays alive");
+        }
+    }
+    /* Do not wait — SDL game thread must stay responsive. */
+}
+
+bool jce_renderer_is_egl_hung(void)
+{
+    return SDL_GetAtomicInt(&s_egl_hung) != 0;
+}
+#endif /* __ANDROID__ */
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#include <setjmp.h>
+#include <signal.h>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
+#endif
 
 struct JceRenderer {
     bool is_fallback;
@@ -57,6 +157,125 @@ struct JceRenderer {
 };
 
 static bool s_dbg_text_enabled = false;
+
+/* ── Per-backend availability probe ──────────────────────────────── *
+ *                                                                    *
+ * Called before bgfx_init() to verify a backend is actually usable. *
+ * Runs entirely before bgfx allocates any state, so a crash in the  *
+ * probe is caught here (main thread, clean stack) and the fallback  *
+ * loop can safely continue to the next backend.                     *
+ * ─────────────────────────────────────────────────────────────────*/
+#ifdef _WIN32
+
+static bool s_win32_probe_dll(const char *dll)
+{
+    HMODULE h = LoadLibraryA(dll);
+    if (!h) return false;
+    FreeLibrary(h);
+    return true;
+}
+
+static bool backend_probe(bgfx_renderer_type_t type)
+{
+    switch (type) {
+    case BGFX_RENDERER_TYPE_VULKAN:
+        return s_win32_probe_dll("vulkan-1.dll");
+    case BGFX_RENDERER_TYPE_DIRECT3D12:
+        return s_win32_probe_dll("d3d12.dll");
+    case BGFX_RENDERER_TYPE_DIRECT3D11:
+        return s_win32_probe_dll("d3d11.dll");
+    default:
+        return true;
+    }
+}
+
+#else /* POSIX: Linux, macOS, Android, … */
+
+static sigjmp_buf s_probe_jmp;
+
+static void s_probe_sigsegv(int sig, siginfo_t *info, void *ctx)
+{
+    (void)sig; (void)info; (void)ctx;
+    siglongjmp(s_probe_jmp, 1);
+}
+
+static bool s_probe_vulkan(void)
+{
+#ifdef __ANDROID__
+    /* Houdini ARM64→x86_64 translation layer (WSA and some Intel Android
+     * devices) initialises libvulkan.so successfully but crashes inside
+     * bgfx's render thread at RendererContextVK::init with SEGV_MAPERR
+     * because certain function pointers returned by vkGetDeviceProcAddr
+     * are NULL.  That crash is in a thread we cannot intercept with
+     * sigsetjmp, so we must detect and skip Vulkan before bgfx creates
+     * any threads.  The reliable indicator is ro.dalvik.vm.isa.arm64 = "x86_64". */
+    {
+        char isa[PROP_VALUE_MAX];
+        if (__system_property_get("ro.dalvik.vm.isa.arm64", isa) > 0
+                && isa[0] == 'x' /* "x86_64" */) {
+            LOG_INFO(LOG_TAG,
+                "Vulkan probe: Houdini ARM64->x86_64 detected"
+                " -- skipping Vulkan (WSA)");
+            return false;
+        }
+    }
+#endif
+
+    /* Try to load the Vulkan loader and exercise the very first API call.
+     * If the library is absent or the call crashes (e.g. WSA/Houdini on
+     * Android), we catch the signal here and return false so the fallback
+     * chain can continue to the next backend (OpenGL ES, OpenGL, …). */
+#ifdef __APPLE__
+    void *lib = dlopen("libMoltenVK.dylib",      RTLD_NOW | RTLD_LOCAL);
+    if (!lib) lib = dlopen("libvulkan.1.dylib",  RTLD_NOW | RTLD_LOCAL);
+    if (!lib) lib = dlopen("@rpath/libvulkan.1.dylib", RTLD_NOW | RTLD_LOCAL);
+#else
+    void *lib = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!lib) lib = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+#endif
+    if (!lib) {
+        LOG_INFO(LOG_TAG, "Vulkan probe: library not found, skipping");
+        return false;
+    }
+
+    typedef int32_t (*PFN_vkEnumInstExt)(const char *, uint32_t *, void *);
+    PFN_vkEnumInstExt fn =
+        (PFN_vkEnumInstExt)dlsym(lib, "vkEnumerateInstanceExtensionProperties");
+
+    bool ok = false;
+    if (fn) {
+        struct sigaction sa, old_sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = s_probe_sigsegv;
+        sa.sa_flags     = SA_SIGINFO;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGSEGV, &sa, &old_sa);
+
+        if (sigsetjmp(s_probe_jmp, 1) == 0) {
+            uint32_t count = 0;
+            ok = (fn(NULL, &count, NULL) == 0); /* VK_SUCCESS == 0 */
+        } else {
+            LOG_WARN(LOG_TAG,
+                "Vulkan probe: vkEnumerateInstanceExtensionProperties crashed "
+                "— driver not usable on this device");
+        }
+
+        sigaction(SIGSEGV, &old_sa, NULL);
+    }
+
+    dlclose(lib);
+    if (ok) LOG_INFO(LOG_TAG, "Vulkan probe: OK");
+    return ok;
+}
+
+static bool backend_probe(bgfx_renderer_type_t type)
+{
+    if (type == BGFX_RENDERER_TYPE_VULKAN)
+        return s_probe_vulkan();
+    return true;
+}
+
+#endif /* _WIN32 / POSIX */
 
 static void jce_bgfx_fatal(bgfx_callback_interface_t *_this, const char *_filePath, uint16_t _line,
                            bgfx_fatal_t _code, const char *_str)
@@ -327,24 +546,34 @@ JceRenderer *jce_renderer_create(JceWindow *win,
     bool ok = false;
 
     if (requested_type != BGFX_RENDERER_TYPE_COUNT) {
-        bgfx_init_ctor(&init);
-        init.type              = requested_type;
-        init.resolution.width  = w;
-        init.resolution.height = h;
-        init.resolution.reset  = reset_flags;
-        init.platformData      = pd;
-        init.callback          = &s_bgfx_callback;
-        init.debug             = gfx_debug;
-        ok = bgfx_init(&init);
-        if (!ok)
-            LOG_WARN(LOG_TAG, "requested backend %s failed",
+        if (!backend_probe(requested_type)) {
+            LOG_WARN(LOG_TAG, "requested backend %s probe failed — trying fallback chain",
                      bgfx_get_renderer_name(requested_type));
+        } else {
+            bgfx_init_ctor(&init);
+            init.type              = requested_type;
+            init.resolution.width  = w;
+            init.resolution.height = h;
+            init.resolution.reset  = reset_flags;
+            init.platformData      = pd;
+            init.callback          = &s_bgfx_callback;
+            init.debug             = gfx_debug;
+            ok = bgfx_init(&init);
+            if (!ok)
+                LOG_WARN(LOG_TAG, "requested backend %s failed",
+                         bgfx_get_renderer_name(requested_type));
+        }
     }
 
     if (!ok) {
         const bgfx_renderer_type_t *chain = get_platform_fallback_chain();
         for (int i = 0; chain[i] != BGFX_RENDERER_TYPE_COUNT; i++) {
             if (chain[i] == requested_type) continue; /* already tried */
+            if (!backend_probe(chain[i])) {
+                LOG_INFO(LOG_TAG, "skipping backend %s (probe failed)",
+                         bgfx_get_renderer_name(chain[i]));
+                continue;
+            }
             LOG_INFO(LOG_TAG, "trying backend: %s",
                      bgfx_get_renderer_name(chain[i]));
             bgfx_init_ctor(&init);
@@ -900,6 +1129,7 @@ void jce_renderer_end_frame(const JceRenderer *r)
         const double now_s = (double)jce_time_ticks_ms() / 1000.0;
         if (now_s - s_last_log_s >= 15.0) {
             s_last_log_s = now_s;
+            LOG_INFO(LOG_TAG, "bgfx_get_stats");
             const bgfx_stats_t *st = bgfx_get_stats();
             if (st) {
                 if (st->numTextures     > s_max_textures)     s_max_textures     = st->numTextures;

@@ -263,7 +263,12 @@ int jce_renderer_caps_preferred_chain(enum JceRendererBackend *out, int max)
 #if defined(_WIN32)
         JCE_BACKEND_D3D12, JCE_BACKEND_D3D11, JCE_BACKEND_VULKAN, JCE_BACKEND_OPENGL,
 #elif defined(__APPLE__)
-        JCE_BACKEND_METAL, JCE_BACKEND_VULKAN, JCE_BACKEND_OPENGL,
+        /* Apple deprecated desktop OpenGL; bgfx ships with
+         * BGFX_CONFIG_RENDERER_OPENGL=0 on macOS and never reports
+         * BGFX_RENDERER_TYPE_OPENGL.  Listing it here would only
+         * pollute the editor preference dropdown with an unsupported
+         * entry, so we omit GL on Apple platforms. */
+        JCE_BACKEND_METAL, JCE_BACKEND_VULKAN,
 #elif defined(__ANDROID__)
         JCE_BACKEND_VULKAN, JCE_BACKEND_OPENGLES,
 #elif defined(__EMSCRIPTEN__)

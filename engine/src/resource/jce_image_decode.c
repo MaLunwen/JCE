@@ -50,10 +50,10 @@ bool jce_image_decode(const void *data, size_t size, JceImage *out)
 bool jce_image_decode_file(const char *path, JceImage *out)
 {
     if (!path || !out) return false;
-    size_t sz = 0;
+    uint64_t sz = 0;
     void *buf = jce_fs_host_read_all(path, &sz);
     if (!buf) return false;
-    bool ok = jce_image_decode(buf, sz, out);
+    bool ok = jce_image_decode(buf, (size_t)sz, out);
     JCE_FREE(buf);
     return ok;
 }

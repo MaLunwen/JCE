@@ -35,11 +35,11 @@ typedef struct JceModelCpuMeshData {
 
 /* ─── Material extraction result ──────────────────────────────── */
 typedef struct JceModelMaterialInfo {
-    char  albedo_tex[128];
-    char  mr_tex[128];
-    char  normal_tex[128];
-    char  ao_tex[128];
-    char  emissive_tex[128];
+    char  albedo_tex[256];
+    char  mr_tex[256];
+    char  normal_tex[256];
+    char  ao_tex[256];
+    char  emissive_tex[256];
     float base_color[4];
     float metallic;
     float roughness;

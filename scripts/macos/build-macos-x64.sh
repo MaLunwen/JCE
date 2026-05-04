@@ -2,7 +2,9 @@
 # ================================================================
 # build-macos-x64.sh -- Build JCE for macOS x86_64 (Intel)
 # Usage: build-macos-x64.sh [--clean]
-# Output: build/desktop/macos-x64/CagedKingdom
+# Output:
+#   Game exe : build/desktop/macos-x64/release/jce_editor
+#   JNI lib  : build/jni/natives/darwin-x86_64/libjce.dylib
 # ================================================================
 source "$(dirname "$0")/../lib/jce_common.sh"
 HOST_PROFILE="conan/profiles/macos-x64"
@@ -17,17 +19,18 @@ else
 fi
 CONAN_DIR="build/desktop/macos-x64-conan"
 BUILD_DIR="build/desktop/macos-x64"
+JNI_BUILD_DIR="build/jni/macos-x64"
+JNI_CLASSIFIER="darwin-x86_64"
 TOOLCHAIN="$CONAN_DIR/build/Release/generators/conan_toolchain.cmake"
 HOST_PAK="build/host/tools/jce_pak"
 MACOS_DEPLOYMENT_TARGET="10.15"
-# Use separate Conan cache for each architecture to prevent cache pollution
 CONAN_HOME_DIR="${CONAN_HOME:-$HOME/.conan2}"
 CONAN_HOOKS_DIR="$CONAN_HOME_DIR/extensions/hooks"
 
 # -- Handle --clean flag --
 if [[ "${1:-}" == "--clean" ]]; then
-    echo "=== Cleaning build directory ==="
-    rm -rf "$BUILD_DIR" "$CONAN_DIR"
+    echo "=== Cleaning build directories ==="
+    rm -rf "$BUILD_DIR" "$CONAN_DIR" "$JNI_BUILD_DIR"
     echo "  Done"
 fi
 
@@ -110,11 +113,77 @@ cmake $CMAKE_ARGS
 echo "=== Step 5: Build (macos-x64) ==="
 cmake --build "$BUILD_DIR"
 
-if [[ ! -f "$BUILD_DIR/CagedKingdom" ]]; then
-    echo "ERROR: CagedKingdom not found after build"
+if [[ ! -f "$BUILD_DIR/release/jce_editor" ]]; then
+    echo "ERROR: jce_editor not found after build"
     exit 1
 fi
 
 echo ""
-echo "[SUCCESS] macOS x64 build complete: $BUILD_DIR/CagedKingdom"
+echo "[SUCCESS] macOS x64 build complete: $BUILD_DIR/release/jce_editor"
+
+# -- Step 6: Build JNI shared library and stage for fat JAR --
+echo ""
+echo "=== Step 6: Build & stage JNI native (darwin-x86_64) ==="
+
+# Resolve JDK for JNI headers.
+# GraalVM / Temurin on macOS are .jdk bundles: <root>/Contents/Home is JAVA_HOME.
+_JDK_HOME="${JAVA_HOME:-}"
+if [[ -z "$_JDK_HOME" || ! -f "$_JDK_HOME/include/jni.h" ]]; then
+    for _try in \
+        "/Users/lunwen/opt/module/graalvm-community-openjdk-21.0.2+13.1/Contents/Home" \
+        "/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home" \
+        "/Library/Java/JavaVirtualMachines/openjdk-21.jdk/Contents/Home" \
+        "/usr/local/opt/openjdk@21" \
+        "$HOME/opt/module/graalvm-community-openjdk-21.0.2+13.1/Contents/Home"; do
+        if [[ -f "$_try/include/jni.h" ]]; then
+            _JDK_HOME="$_try"
+            break
+        fi
+    done
+    # Generic glob fallback
+    if [[ -z "$_JDK_HOME" ]]; then
+        for _bundle in /Library/Java/JavaVirtualMachines/*.jdk; do
+            _try="$_bundle/Contents/Home"
+            if [[ -f "$_try/include/jni.h" ]]; then
+                _JDK_HOME="$_try"; break
+            fi
+        done
+    fi
+fi
+if [[ -z "$_JDK_HOME" || ! -f "$_JDK_HOME/include/jni.h" ]]; then
+    echo "ERROR: No JDK found for JNI headers. Set JAVA_HOME or install a JDK."
+    exit 1
+fi
+echo "  JDK: $_JDK_HOME"
+
+JNI_CMAKE_ARGS="-S . -B $JNI_BUILD_DIR -G Ninja \
+    -DCMAKE_TOOLCHAIN_FILE=$TOOLCHAIN \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+    -DCMAKE_OSX_DEPLOYMENT_TARGET=$MACOS_DEPLOYMENT_TARGET \
+    -DJCE_PAK_EXECUTABLE=$HOST_PAK \
+    -DJCE_ENABLE_CPPCHECK=OFF \
+    -DJCE_BUILD_JNI=ON \
+    -DJAVA_INCLUDE_PATH=$_JDK_HOME/include \
+    -DJAVA_INCLUDE_PATH2=$_JDK_HOME/include/darwin \
+    -DJAVA_AWT_LIBRARY=$_JDK_HOME/lib/libjawt.dylib \
+    -DJAVA_JVM_LIBRARY=$_JDK_HOME/lib/server/libjvm.dylib"
+if [[ -n "$HOST_SHADERC" ]]; then
+    JNI_CMAKE_ARGS="$JNI_CMAKE_ARGS -DJCE_SHADERC_EXECUTABLE=$HOST_SHADERC"
+fi
+cmake $JNI_CMAKE_ARGS
+cmake --build "$JNI_BUILD_DIR" --target CagedKingdom
+
+JNI_LIB="$JNI_BUILD_DIR/release/libjce.dylib"
+if [[ -f "$JNI_LIB" ]]; then
+    JNI_STAGE="build/jni/natives/$JNI_CLASSIFIER"
+    mkdir -p "$JNI_STAGE"
+    cp "$JNI_LIB" "$JNI_STAGE/libjce.dylib"
+    # macOS strip: -x removes local symbols, preserves exported Java_* symbols
+    strip -x "$JNI_STAGE/libjce.dylib" 2>/dev/null || true
+    echo "  Staged: $JNI_STAGE/libjce.dylib ($(du -sh "$JNI_STAGE/libjce.dylib" | cut -f1))"
+else
+    echo "  WARNING: $JNI_LIB not found — JNI stage skipped."
+fi
+
 _jce_success_wait

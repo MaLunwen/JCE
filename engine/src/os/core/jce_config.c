@@ -139,7 +139,7 @@ bool jce_config_load(JceConfig *cfg, const char *path)
 {
     if (!cfg || !path) return false;
 
-    size_t total = 0;
+    uint64_t total = 0;
     char *buf = (char *)jce_fs_host_read_all(path, &total);
     if (!buf) return false;
 

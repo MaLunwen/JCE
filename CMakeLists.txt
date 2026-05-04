@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 # ── MUST be set before project() ──
 set(CMAKE_SUPPRESS_REGENERATION TRUE)
 
-project(JCE VERSION 0.7.6 LANGUAGES C)
+project(JCE VERSION 0.8.8 LANGUAGES C)
 
 # CXX is needed for C++ dependencies (bgfx, assimp, imgui) and the editor.
 enable_language(CXX)
@@ -47,6 +47,10 @@ if(CMAKE_GENERATOR STREQUAL "Xcode")
 endif()
 
 option(JCE_BUILD_JNI "Build JCE as a JNI shared library" OFF)
+if(JCE_BUILD_JNI)
+	# Shared library requires all static libraries compiled with -fPIC.
+	set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
 
 # Build variant: "release" (default) or "dist" (no logging + SHA-256 hash).
 set(JCE_BUILD_VARIANT "release" CACHE STRING "Build variant (release|dist)")
@@ -270,8 +274,12 @@ foreach(_pb_cfg RELEASE RELWITHDEBINFO DEBUG)
             set(Protobuf_PROTOC_EXECUTABLE "${_found_protoc}"
                 CACHE FILEPATH "The protoc compiler" FORCE)
             if(TARGET protobuf::protoc)
-                set_property(TARGET protobuf::protoc
-                    PROPERTY IMPORTED_LOCATION "${_found_protoc}")
+                set_target_properties(protobuf::protoc PROPERTIES
+                    IMPORTED_LOCATION               "${_found_protoc}"
+                    IMPORTED_LOCATION_RELEASE       "${_found_protoc}"
+                    IMPORTED_LOCATION_DEBUG         "${_found_protoc}"
+                    IMPORTED_LOCATION_RELWITHDEBINFO "${_found_protoc}"
+                    IMPORTED_LOCATION_MINSIZEREL    "${_found_protoc}")
             endif()
             message(STATUS "JCE: Using Conan protoc: ${_found_protoc}")
         endif()
@@ -351,6 +359,9 @@ if(NOT JCE_SHADER_PROFILES)
 	if(JCE_PLATFORM_WINDOWS)
 		set(JCE_SHADER_PROFILES dx11 spv glsl)
 	elseif(JCE_PLATFORM_MACOS OR JCE_PLATFORM_IOS)
+		# Apple deprecated desktop OpenGL and bgfx no longer reports
+		# BGFX_RENDERER_TYPE_OPENGL on Apple platforms, so the `glsl`
+		# profile would only bloat the .pak with unreachable binaries.
 		set(JCE_SHADER_PROFILES mtl spv)
 	elseif(JCE_PLATFORM_ANDROID)
 		# essl1 = GLES2 fallback (P3-34) for legacy mobile.

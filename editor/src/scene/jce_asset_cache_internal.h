@@ -38,7 +38,15 @@ extern "C" {
 /* ── Cache entry types ──────────────────────────────────────────── */
 
 struct MeshCacheEntry {
-    char     path[128];
+    /* Path buffer must accommodate the longest absolute mesh path the
+     * editor will ever cache. KayKit/Kenney asset packs nest content
+     * deeply (e.g. .../KayKit_Medieval_Hexagon_Pack_1.0_FREE/Assets/
+     * fbx/buildings/blue/building_archeryrange_blue.fbx), easily
+     * exceeding 128 bytes. A truncated key silently de-syncs from the
+     * full path used at lookup time, causing async load completions to
+     * orphan their cache entry and the entity to fall back to the cube
+     * shape with no error logged. */
+    char     path[512];
     JceMesh *mesh;
     bool     requested;
     bool     failed;
@@ -46,7 +54,9 @@ struct MeshCacheEntry {
 };
 
 struct TextureCacheEntry {
-    char           path[128];
+    /* See MeshCacheEntry::path comment — same truncation issue applies
+     * to texture cache keys (resolved absolute paths can be long). */
+    char           path[512];
     JceTexture     tex;
     JceAssetHandle asset_handle;
     bool           tex_from_asset_manager;
@@ -138,7 +148,7 @@ extern TextureAsyncState s_tex_async;
 
 struct MaterialAsyncContext {
     uint32_t              entity_id;
-    char                  mesh_path[128];
+    char                  mesh_path[256];
     char                  file_path[512];
     uint64_t              generation;
     bool                  success;
@@ -275,5 +285,8 @@ bool        find_file_by_name_recursive(const std::vector<std::string> &roots,
 bool resolve_texture_path_for_material(const char *material_path,
                                        const char *mesh_path,
                                        char *out_path, size_t out_size);
+
+bool resolve_material_file_path(const char *material_path,
+                                char *out_mat, size_t out_size);
 
 #endif /* JCE_ASSET_CACHE_INTERNAL_H */

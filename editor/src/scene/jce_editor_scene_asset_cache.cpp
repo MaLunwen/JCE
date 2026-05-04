@@ -83,6 +83,28 @@ JceTexture jce_editor_scene_asset_cache_get_texture(const char *material_path,
     return asset_cache_get_texture(material_path, mesh_path);
 }
 
+bool jce_editor_scene_asset_cache_texture_failed(const char *material_path,
+                                                 const char *mesh_path)
+{
+    if (!s_cache.initialized)
+        return false;
+
+    const char *key = (material_path && material_path[0] != '\0')
+                    ? material_path : mesh_path;
+    if (!key || key[0] == '\0')
+        return false;
+
+    int idx = find_texture_cache_entry(key);
+    if (idx < 0) {
+        /* Never requested → cannot say "failed". The renderer is asking
+         * before the cache had a chance to enqueue the load, which
+         * happens for one or two frames right after a scene opens. Treat
+         * as "not failed" so the checker doesn't briefly appear. */
+        return false;
+    }
+    return s_cache.tex_cache[idx].failed;
+}
+
 bool jce_editor_scene_asset_cache_take_texture_warning(const char *material_path,
                                                        const char *mesh_path)
 {

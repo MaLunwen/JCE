@@ -2,7 +2,9 @@
 # ================================================================
 # build-linux-x64.sh -- Build JCE for Linux x86_64
 # Usage: build-linux-x64.sh [--clean]
-# Output: build/desktop/linux-x64/CagedKingdom
+# Output:
+#   Game exe : build/desktop/linux-x64/release/caged_kingdom
+#   JNI lib  : build/jni/natives/linux-x86_64/libjce.so
 #
 # System dependencies (Ubuntu/Debian):
 #   sudo apt install libx11-dev libxrandr-dev libxcursor-dev libxi-dev \
@@ -14,13 +16,15 @@ source "$(dirname "$0")/../lib/jce_common.sh"
 PROFILE="conan/profiles/linux-x64"
 CONAN_DIR="build/desktop/linux-x64-conan"
 BUILD_DIR="build/desktop/linux-x64"
+JNI_BUILD_DIR="build/jni/linux-x64"
+JNI_CLASSIFIER="linux-x86_64"
 TOOLCHAIN="$CONAN_DIR/build/Release/generators/conan_toolchain.cmake"
 HOST_PAK="build/host/tools/jce_pak"
 
 # -- Handle --clean flag --
 if [[ "${1:-}" == "--clean" ]]; then
-    echo "=== Cleaning build directory ==="
-    rm -rf "$BUILD_DIR" "$CONAN_DIR"
+    echo "=== Cleaning build directories ==="
+    rm -rf "$BUILD_DIR" "$CONAN_DIR" "$JNI_BUILD_DIR"
     echo "  Done"
 fi
 
@@ -95,6 +99,35 @@ if [[ ! -f "$BUILD_DIR/release/caged_kingdom" ]]; then
     exit 1
 fi
 
+strip --strip-unneeded "$BUILD_DIR/release/caged_kingdom"
+
 echo ""
 echo "[SUCCESS] Linux x64 build complete: $BUILD_DIR/release/caged_kingdom"
+
+# -- Step 6: Build JNI shared library and stage for fat JAR --
+echo ""
+echo "=== Step 6: Build & stage JNI native (linux-x86_64) ==="
+JNI_CMAKE_ARGS="-S . -B $JNI_BUILD_DIR -G Ninja \
+    -DCMAKE_TOOLCHAIN_FILE=$TOOLCHAIN \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DJCE_PAK_EXECUTABLE=$HOST_PAK \
+    -DJCE_ENABLE_CPPCHECK=OFF \
+    -DJCE_BUILD_JNI=ON"
+if [[ -n "$HOST_SHADERC" ]]; then
+    JNI_CMAKE_ARGS="$JNI_CMAKE_ARGS -DJCE_SHADERC_EXECUTABLE=$HOST_SHADERC"
+fi
+cmake $JNI_CMAKE_ARGS
+cmake --build "$JNI_BUILD_DIR" --target CagedKingdom
+
+JNI_LIB="$JNI_BUILD_DIR/release/libjce.so"
+if [[ -f "$JNI_LIB" ]]; then
+    JNI_STAGE="build/jni/natives/$JNI_CLASSIFIER"
+    mkdir -p "$JNI_STAGE"
+    cp "$JNI_LIB" "$JNI_STAGE/libjce.so"
+    strip --strip-unneeded "$JNI_STAGE/libjce.so"
+    echo "  Staged: $JNI_STAGE/libjce.so"
+else
+    echo "  WARNING: $JNI_LIB not found — JNI stage skipped."
+fi
+
 _jce_success_wait

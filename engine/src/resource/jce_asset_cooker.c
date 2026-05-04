@@ -568,7 +568,7 @@ JceCookResult jce_cook_file(const char *input_path,
     }
 
     /* Read file. */
-    size_t nread = 0;
+    uint64_t nread = 0;
     void *data = jce_fs_host_read_all(input_path, &nread);
     if (!data) {
         snprintf(result.error, sizeof(result.error),

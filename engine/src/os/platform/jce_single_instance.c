@@ -8,6 +8,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#if defined(__APPLE__)
+#  include <TargetConditionals.h>
+#endif
+
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -55,11 +59,12 @@ static void sanitize_name(const char *name, char *out, size_t out_size)
 
 bool jce_single_instance_lock(const char *app_name)
 {
-#if defined(__ANDROID__) || defined(__EMSCRIPTEN__)
-    /* Android: the OS Activity Manager already enforces a single instance;
-     * /tmp is unavailable, so a file-lock would always fail.
-     * WASM: no persistent filesystem; single-tab semantics are enforced
-     * by the browser. Skip the lock in both cases. */
+#if defined(__ANDROID__) || defined(__EMSCRIPTEN__) || \
+    (defined(__APPLE__) && defined(TARGET_OS_IOS) && TARGET_OS_IOS)
+    /* Android / iOS: the OS enforces a single-instance app model; the
+     * sandbox /tmp path may not support flock(), and a second instance
+     * is architecturally impossible.
+     * WASM: single-tab semantics enforced by the browser. */
     (void)app_name;
     return true;
 #elif defined(_WIN32)
@@ -121,7 +126,8 @@ bool jce_single_instance_lock(const char *app_name)
 
 void jce_single_instance_unlock(void)
 {
-#if defined(__ANDROID__) || defined(__EMSCRIPTEN__)
+#if defined(__ANDROID__) || defined(__EMSCRIPTEN__) || \
+    (defined(__APPLE__) && defined(TARGET_OS_IOS) && TARGET_OS_IOS)
     return; /* no-op: lock was not acquired */
 #elif defined(_WIN32)
     if (!s_single_mutex) return;
@@ -141,7 +147,8 @@ void jce_single_instance_unlock(void)
 
 bool jce_single_instance_is_locked(void)
 {
-#if defined(__ANDROID__) || defined(__EMSCRIPTEN__)
+#if defined(__ANDROID__) || defined(__EMSCRIPTEN__) || \
+    (defined(__APPLE__) && defined(TARGET_OS_IOS) && TARGET_OS_IOS)
     return true; /* always considered locked (OS-enforced) */
 #elif defined(_WIN32)
     return s_single_mutex != NULL;

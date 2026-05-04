@@ -154,7 +154,7 @@ static JceSound play_load_audio_clip(const char *clip_path)
         snprintf(full, sizeof(full), "%s", clip_path);
     }
 
-    size_t fsize = 0;
+    uint64_t fsize = 0;
     void *data = jce_fs_host_read_all(full, &fsize);
     if (!data || fsize == 0) {
         LOG_WARN(LOG_TAG, "play audio: could not read '%s'", full);
@@ -276,6 +276,22 @@ void jce_state_stop(void)
 }
 
 JcePlayState jce_state_get_play_state(void) { return s.play_state; }
+
+void jce_state_step(float dt)
+{
+    /* Single-frame advance: only meaningful while paused.  Run one
+     * physics + scene tick without changing the play_state, so the
+     * editor can frame-step a paused simulation. */
+    if (s.play_state != JCE_PLAY_PAUSED) return;
+    if (dt <= 0.0f) dt = 1.0f / 60.0f;
+
+    if (s_play_physics) {
+        jce_physics_step(s_play_physics, dt);
+        play_sync_physics_to_entities();
+    }
+    if (s.scene)
+        jce_scene_update(s.scene, dt);
+}
 
 void jce_state_play_mode_tick(float dt)
 {

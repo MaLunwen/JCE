@@ -42,6 +42,12 @@ void jce_editor_dialog_project_settings(bool *p_open);
 /* Preferences dialog (global per-user: general / fonts / editor / input / paths). */
 void jce_editor_dialog_preferences(bool *p_open);
 
+/* Pump pending host-dialog callback results onto the main thread.  Must be
+   called once per frame from the editor's main loop.  This drains the
+   thread-safe queue populated by SDL's worker-thread folder/file picker
+   callbacks and applies the results safely (no data race with ImGui). */
+void jce_editor_dialogs_pump_pending(void);
+
 #ifdef __cplusplus
 }
 #endif

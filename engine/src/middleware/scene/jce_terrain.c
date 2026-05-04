@@ -219,7 +219,7 @@ JceTerrain *jce_terrain_load_file(const char *meta_json_path)
 
     size_t  expected = sizeof(uint32_t) * 2 + sizeof(int32_t) * 2
                        + (size_t)w * (size_t)h * (sizeof(float) + sizeof(uint32_t));
-    size_t  got      = 0;
+    uint64_t got     = 0;
     uint8_t *buf     = (uint8_t *)jce_fs_host_read_all(bin_path, &got);
     if (!buf) {
         LOG_WARN("terrain", "no side-car bin: %s", bin_path);

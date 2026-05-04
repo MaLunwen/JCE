@@ -112,8 +112,8 @@ static JceFileViewerType fv_detect_ext(const char *ext)
     if (!ext || !ext[0]) return JCE_FV_TEXT;
 
     if (strcmp(ext, ".png") == 0 || strcmp(ext, ".jpg") == 0
-        || strcmp(ext, ".jpeg") == 0 || strcmp(ext, ".bmp") == 0
-        || strcmp(ext, ".tga") == 0 || strcmp(ext, ".hdr") == 0
+        || strcmp(ext, ".jpeg") == 0 || strcmp(ext, ".jfif") == 0
+        || strcmp(ext, ".bmp") == 0 || strcmp(ext, ".tga") == 0 || strcmp(ext, ".hdr") == 0
         || strcmp(ext, ".gif") == 0 || strcmp(ext, ".webp") == 0
         || strcmp(ext, ".ico") == 0 || strcmp(ext, ".psd") == 0
         || strcmp(ext, ".dds") == 0 || strcmp(ext, ".ktx") == 0

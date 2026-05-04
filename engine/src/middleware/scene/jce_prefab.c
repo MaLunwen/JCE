@@ -105,7 +105,7 @@ JceEntity jce_prefab_instantiate(JceScene             *scene,
 {
     if (!scene || !virtual_path) return 0;
 
-    size_t size = 0;
+    uint64_t size = 0;
     void  *buf  = NULL;
 
     if (fs) {

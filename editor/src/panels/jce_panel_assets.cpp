@@ -12,6 +12,7 @@
 #include "core/jce_editor_config.h"
 #include "core/jce_hotkeys.h"
 #include "jce_panel_assets_internal.h"
+#include "scene/jce_asset_path_index.h"
 
 /* ── State instance (shared via extern in internal header) ───────── */
 
@@ -98,6 +99,14 @@ void ensure_assets_init(void)
         }
     }
     s_assets.initialized       = true;
+
+    /* Build initial asset path index over the launch CWD project root
+     * so even sessions that never call set_project() can resolve asset
+     * references.  Subsequent set_project() calls rebuild as needed. */
+    if (!s_assets.project_root.empty()) {
+        jce_asset_path_index_clear();
+        jce_asset_path_index_rebuild(s_assets.project_root.c_str());
+    }
 }
 
 void refresh_entries(void)
@@ -296,11 +305,11 @@ ImVec4 asset_color_for_ext(const std::string &ext, bool is_dir)
         || ext == ".tesc" || ext == ".tese" || ext == ".glsl" || ext == ".hlsl"
         || ext == ".sc" || ext == ".sh" || ext == ".bin")
         return JCE_COLOR_ASSET_SHADER;
-    if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".bmp"
-        || ext == ".tga" || ext == ".hdr" || ext == ".gif" || ext == ".webp"
-        || ext == ".tif" || ext == ".tiff" || ext == ".dds" || ext == ".ktx"
-        || ext == ".ktx2" || ext == ".exr" || ext == ".psd" || ext == ".svg"
-        || ext == ".ico")
+    if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".jfif"
+        || ext == ".bmp" || ext == ".tga" || ext == ".hdr" || ext == ".gif"
+        || ext == ".webp" || ext == ".tif" || ext == ".tiff" || ext == ".dds"
+        || ext == ".ktx" || ext == ".ktx2" || ext == ".exr" || ext == ".psd"
+        || ext == ".svg" || ext == ".ico")
         return JCE_COLOR_ASSET_IMAGE;
     if (ext == ".wav" || ext == ".ogg" || ext == ".mp3" || ext == ".flac"
         || ext == ".opus" || ext == ".aac" || ext == ".m4a" || ext == ".aiff"
@@ -455,6 +464,20 @@ void jce_editor_assets_set_project(const char *path)
     if (s_assets.project_root == normalized) return;
     s_assets.project_root  = normalized;
     navigate_asset_directory(normalized, true);
+
+    /* Rebuild the project-wide asset path index so resolvers can do
+     * O(1) basename lookups instead of recursive filesystem walks.
+     * Mirrors Unity's import-time GUID/path table at a coarser
+     * granularity (basename only).  Rebuild is one-shot per project
+     * switch — fast even on large packs (~10k files). */
+    jce_asset_path_index_clear();
+    jce_asset_path_index_rebuild(normalized.c_str());
+}
+
+const char *jce_editor_assets_get_project(void)
+{
+    ensure_assets_init();
+    return s_assets.project_root.c_str();
 }
 
 bool jce_editor_assets_delete_dialog_open(void)

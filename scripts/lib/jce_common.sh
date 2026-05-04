@@ -20,6 +20,21 @@
 # ================================================================
 set -euo pipefail
 
+# On macOS, SSH sessions inherit a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin).
+# Extend it here so every build script gets conan, cmake, ninja, etc.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    # Homebrew (Apple Silicon at /opt/homebrew, Intel at /usr/local)
+    for _brew_bin in /opt/homebrew/bin /usr/local/bin; do
+        [[ -d "$_brew_bin" ]] && PATH="$_brew_bin:$PATH"
+    done
+    # pip-installed tools (conan lives here when installed via pip)
+    for _py_bin in "$HOME"/Library/Python/*/bin; do
+        [[ -d "$_py_bin" ]] && PATH="$_py_bin:$PATH"
+    done
+    export PATH
+    unset _brew_bin _py_bin
+fi
+
 # Absolute path of the directory containing THIS file (works when sourced).
 _JCE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

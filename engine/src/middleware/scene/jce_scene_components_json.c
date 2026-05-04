@@ -8,6 +8,7 @@
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_scene_components_json.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_str.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/renderer/jce_pbr_material.h>
 #include <jce/resource/jce_scene_contract.h>
@@ -57,6 +58,259 @@ static bool sse_file_exists(const char *p)
     if (!p || !*p) return false;
     SDL_PathInfo info;
     return SDL_GetPathInfo(p, &info) && info.type == SDL_PATHTYPE_FILE;
+}
+
+static bool sse_dir_exists(const char *p)
+{
+    if (!p || !*p) return false;
+    SDL_PathInfo info;
+    return SDL_GetPathInfo(p, &info) && info.type == SDL_PATHTYPE_DIRECTORY;
+}
+
+/* Strip the last path segment from `path` in place, returning true if a
+ * parent exists (i.e. there was at least one separator). */
+static bool sse_path_parent_inplace(char *path)
+{
+    if (!path || !*path) return false;
+    size_t L = strlen(path);
+    while (L > 0 && (path[L-1] == '/' || path[L-1] == '\\')) path[--L] = '\0';
+    while (L > 0 && path[L-1] != '/' && path[L-1] != '\\') L--;
+    while (L > 0 && (path[L-1] == '/' || path[L-1] == '\\')) L--;
+    if (L == 0) return false;
+    path[L] = '\0';
+    return true;
+}
+
+/* Score a .mat.json basename for use as a fallback material when a
+ * scene's referenced material file is missing.  Higher score wins. */
+static int fallback_material_score(const char *basename)
+{
+    if (!basename) return 0;
+    const char *lc = basename;
+    /* Hand-rolled tolower compare (basename buffer is small). */
+    char low[128];
+    size_t i = 0;
+    for (; lc[i] && i + 1 < sizeof(low); i++) {
+        char ch = lc[i];
+        if (ch >= 'A' && ch <= 'Z') ch = (char)(ch + 32);
+        low[i] = ch;
+    }
+    low[i] = '\0';
+    if (strstr(low, "_default.mat.json")) return 100;
+    if (strstr(low, "default"))           return 90;
+    if (strstr(low, "universal_a"))       return 85;
+    if (strstr(low, "universal"))         return 80;
+    if (strstr(low, "main"))              return 60;
+    if (strstr(low, "base"))              return 55;
+    return 1;
+}
+
+/* Returns true when `needle` (case-insensitive) appears as a path
+ * segment inside `haystack`, e.g. "Nature" inside "Meshes/Nature/Grass". */
+static bool path_contains_segment_ci(const char *haystack, const char *needle)
+{
+    if (!haystack || !needle || !*needle) return false;
+    size_t nL = strlen(needle);
+    const char *p = haystack;
+    while (*p) {
+        const char *seg_start = p;
+        while (*p && *p != '/' && *p != '\\') p++;
+        size_t segL = (size_t)(p - seg_start);
+        if (segL == nL) {
+            bool eq = true;
+            for (size_t k = 0; k < segL; k++) {
+                char a = seg_start[k]; if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+                char b = needle[k];    if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+                if (a != b) { eq = false; break; }
+            }
+            if (eq) return true;
+        }
+        if (*p) p++;
+    }
+    return false;
+}
+
+/* Extract the leaf directory name of `dirpath` (no trailing slash)
+ * into `out`. */
+static void path_leaf_into(const char *dirpath, char *out, size_t out_size)
+{
+    if (out_size == 0) return;
+    out[0] = '\0';
+    if (!dirpath) return;
+    size_t L = strlen(dirpath);
+    while (L > 0 && (dirpath[L-1] == '/' || dirpath[L-1] == '\\')) L--;
+    size_t end = L;
+    while (L > 0 && dirpath[L-1] != '/' && dirpath[L-1] != '\\') L--;
+    size_t leafL = end - L;
+    if (leafL >= out_size) leafL = out_size - 1;
+    memcpy(out, dirpath + L, leafL);
+    out[leafL] = '\0';
+}
+
+struct FallbackMatScan {
+    char        best[1280];
+    int         best_score;
+    int         depth;       /* current recursion depth, capped to limit fanout */
+    /* Mesh path hint (lowercased preferred-form, e.g. "Meshes/Nature/Grass/SM_Foo.obj");
+     * empty when no hint available. Used to give domain-matched materials
+     * a large bonus so e.g. a foliage mesh maps to Materials/Nature/* and
+     * not the universal metallic material. */
+    const char *mesh_hint;
+};
+
+static bool fallback_mat_walker(void *user, const char *dirpath, const char *name)
+{
+    struct FallbackMatScan *st = (struct FallbackMatScan *)user;
+    if (!name) return true;
+    size_t L = strlen(name);
+    if (L < 9 || strcmp(name + L - 9, ".mat.json") != 0) return true;
+    int score = fallback_material_score(name);
+
+    /* Domain-match bonus: if the material lives inside a folder whose
+     * leaf name (e.g. "Nature", "VFX", "Colors") also appears as a
+     * segment in the mesh path, prefer it strongly over generic
+     * "universal" materials.  This is what fixes Unity-imported scenes
+     * where every MeshRenderer points at "default.mat" — without the
+     * bonus the scanner picks one universal material for ALL meshes,
+     * so e.g. grass renders with the metallic universal albedo. */
+    if (st->mesh_hint && st->mesh_hint[0] && dirpath && *dirpath) {
+        char leaf[64];
+        path_leaf_into(dirpath, leaf, sizeof(leaf));
+        if (leaf[0]
+            && jce_strcasecmp(leaf, "Materials") != 0
+            && jce_strcasecmp(leaf, "materials") != 0
+            && path_contains_segment_ci(st->mesh_hint, leaf)) {
+            score += 500;
+        }
+    }
+
+    if (score > st->best_score) {
+        st->best_score = score;
+        snprintf(st->best, sizeof(st->best), "%s/%s", dirpath, name);
+    }
+    return true;
+}
+
+/* SDL_EnumerateDirectory adapter — recurses into subdirectories so that
+ * nested Materials/Nature, Materials/VFX, Materials/Colors, ... are all
+ * considered (Unity asset packs typically organise materials this way). */
+static SDL_EnumerationResult SDLCALL sse_sdl_enum_cb(void *userdata, const char *dirpath, const char *fname);
+
+static void scan_dir_recursive(const char *dir, struct FallbackMatScan *st);
+
+static SDL_EnumerationResult SDLCALL
+sse_sdl_enum_cb(void *userdata, const char *dirpath, const char *fname)
+{
+    struct FallbackMatScan *st = (struct FallbackMatScan *)userdata;
+    if (!fname) return SDL_ENUM_CONTINUE;
+
+    char full[1280];
+    snprintf(full, sizeof(full), "%s/%s", dirpath, fname);
+
+    SDL_PathInfo info;
+    if (SDL_GetPathInfo(full, &info) && info.type == SDL_PATHTYPE_DIRECTORY) {
+        if (st->depth < 4) {
+            st->depth++;
+            scan_dir_recursive(full, st);
+            st->depth--;
+        }
+        return SDL_ENUM_CONTINUE;
+    }
+    fallback_mat_walker(userdata, dirpath, fname);
+    return SDL_ENUM_CONTINUE;
+}
+
+static void scan_dir_recursive(const char *dir, struct FallbackMatScan *st)
+{
+    if (!dir || !*dir || !sse_dir_exists(dir)) return;
+    SDL_EnumerateDirectory(dir, sse_sdl_enum_cb, st);
+}
+
+/* Walk `dir` recursively for .mat.json files; updates `st` with the
+ * highest-scoring candidate. */
+static void scan_dir_for_fallback_material(const char *dir,
+                                           struct FallbackMatScan *st)
+{
+    st->depth = 0;
+    scan_dir_recursive(dir, st);
+}
+
+/* Locate a sensible fallback .mat.json by scanning Materials/ folders
+ * near the scene file.  Returns true and fills out_path if one was
+ * found. Used when the scene's stated materialPath does not resolve
+ * (e.g. Unity-exported scenes that reference a non-existent
+ * "default.mat" for every MeshRenderer).
+ *
+ * `mesh_hint` (optional) gives the scoring routine a chance to prefer
+ * a material whose folder leaf matches a segment of the mesh path
+ * (e.g. mesh "Meshes/Nature/Grass/..." prefers "Materials/Nature/..."). */
+static bool find_fallback_material(const char *mesh_hint,
+                                   char *out_path, size_t out_size)
+{
+    if (!out_path || out_size == 0) return false;
+    if (s_scene_base_dir[0] == '\0') return false;
+
+    struct FallbackMatScan st;
+    st.best[0] = '\0';
+    st.best_score = 0;
+    st.depth = 0;
+    st.mesh_hint = (mesh_hint && *mesh_hint) ? mesh_hint : NULL;
+
+    char base[1024];
+    snprintf(base, sizeof(base), "%s", s_scene_base_dir);
+
+    /* Try scene_dir, then walk up to 4 ancestors, scanning Materials/
+     * and materials/ at each level. */
+    for (int up = 0; up <= 4; up++) {
+        char sub[1280];
+        snprintf(sub, sizeof(sub), "%s/Materials", base);
+        scan_dir_for_fallback_material(sub, &st);
+        snprintf(sub, sizeof(sub), "%s/materials", base);
+        scan_dir_for_fallback_material(sub, &st);
+        if (!sse_path_parent_inplace(base)) break;
+    }
+
+    if (st.best_score > 0) {
+        snprintf(out_path, out_size, "%s", st.best);
+        return true;
+    }
+    return false;
+}
+
+/* Resolve a (possibly relative) texture path stored inside a .mat.json
+ * to an absolute path on disk.  `mat_path` is the absolute path of the
+ * material file.  On success, copies the resolved path into `tex_path`
+ * (overwriting it).  On failure, leaves `tex_path` unchanged. */
+static void resolve_tex_relative_to_material(const char *mat_path,
+                                              char *tex_path,
+                                              size_t tex_path_sz)
+{
+    if (!mat_path || !*mat_path || !tex_path || !*tex_path) return;
+    if (sse_path_is_absolute(tex_path) && sse_file_exists(tex_path)) return;
+
+    char mat_dir[1024];
+    snprintf(mat_dir, sizeof(mat_dir), "%s", mat_path);
+    if (!sse_path_parent_inplace(mat_dir)) return;
+
+    char candidate[1280];
+    /* (1) sibling of the .mat.json. */
+    snprintf(candidate, sizeof(candidate), "%s/%s", mat_dir, tex_path);
+    if (sse_file_exists(candidate)) {
+        snprintf(tex_path, tex_path_sz, "%s", candidate);
+        return;
+    }
+    /* (2) walk parents up to 4 levels (Unity layout: Materials/ and
+     *     Textures/ are siblings under the project root). */
+    char base[1024];
+    snprintf(base, sizeof(base), "%s", mat_dir);
+    for (int up = 0; up < 4; up++) {
+        if (!sse_path_parent_inplace(base)) break;
+        snprintf(candidate, sizeof(candidate), "%s/%s", base, tex_path);
+        if (sse_file_exists(candidate)) {
+            snprintf(tex_path, tex_path_sz, "%s", candidate);
+            return;
+        }
+    }
 }
 
 /* ── Local Euler ↔ Quaternion helpers (degrees) ───────────────────── */
@@ -254,10 +508,34 @@ static void parse_mesh_renderer(JceScene *s, JceEntity e, const cJSON *c)
             }
         }
 
+        /* Final fallback (Unity-imported scenes): scan Materials/ folders
+         * near the scene file for a sensible substitute material when the
+         * stated material doesn't exist (e.g. "default.mat" placeholders).
+         * Without this, every mesh in a Unity-converted scene renders
+         * untextured because every MeshRenderer points at a missing file. */
+        char fallback_mat[1280] = { 0 };
+        if (!resolved && find_fallback_material(mr.mesh_path, fallback_mat, sizeof(fallback_mat))) {
+            resolved = fallback_mat;
+            LOG_INFO(LOG_TAG,
+                "material '%s' not found for mesh '%s'; fallback => '%s'",
+                mr.material_path, mr.mesh_path, fallback_mat);
+        }
+
         if (resolved) {
             JcePbrMaterial pbr;
             char tex_paths[5][256];
             if (jce_pbr_material_load_json(resolved, &pbr, tex_paths)) {
+                /* Resolve each texture relative to the material file
+                 * (which may be in Materials/ while textures are in
+                 * Textures/ at the project root) so the renderer can
+                 * load them regardless of the runtime cwd. */
+                for (int ti = 0; ti < 5; ti++) {
+                    if (tex_paths[ti][0]) {
+                        resolve_tex_relative_to_material(resolved,
+                                                         tex_paths[ti],
+                                                         sizeof(tex_paths[ti]));
+                    }
+                }
                 if (tex_paths[0][0]) copy_str(mr.albedo_tex,   sizeof(mr.albedo_tex),   tex_paths[0]);
                 if (tex_paths[1][0]) copy_str(mr.mr_tex,       sizeof(mr.mr_tex),       tex_paths[1]);
                 if (tex_paths[2][0]) copy_str(mr.normal_tex,   sizeof(mr.normal_tex),   tex_paths[2]);
@@ -924,9 +1202,15 @@ static void ser_skeletal_animator(const JceSkeletalAnimatorComponent *c, cJSON *
     cJSON_AddBoolToObject(o, "loop", c->loop);
     cJSON_AddBoolToObject(o, "playing", c->playing);
     cJSON_AddNumberToObject(o, "activeClip", c->active_clip);
-    if (c->clip_count > 0) {
+    /* Defensive clamp: clip_count must be in [0, ARRAY_LEN]. Garbage
+     * here would walk into adjacent memory and crash cJSON_strdup. */
+    int cc = c->clip_count;
+    if (cc < 0) cc = 0;
+    if (cc > (int)(sizeof(c->clip_names) / sizeof(c->clip_names[0])))
+        cc = (int)(sizeof(c->clip_names) / sizeof(c->clip_names[0]));
+    if (cc > 0) {
         cJSON *clips = cJSON_CreateArray();
-        for (int i = 0; i < c->clip_count; i++)
+        for (int i = 0; i < cc; i++)
             cJSON_AddItemToArray(clips, cJSON_CreateString(c->clip_names[i]));
         cJSON_AddItemToObject(o, "clipNames", clips);
     }

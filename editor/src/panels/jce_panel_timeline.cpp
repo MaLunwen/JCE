@@ -44,7 +44,7 @@ static struct {
     int      active_clip;
     bool     has_animator;
     bool     has_skeletal;
-    char     skeleton_path[128];
+    char     skeleton_path[256];
 } s_tl;
 
 static void ensure_init(void)

@@ -32,8 +32,8 @@ typedef struct {
     JceShaderHandle shader;
     bool            visible;
     /* Persistent asset paths (for serialization). */
-    char            mesh_path[128];
-    char            material_path[128];
+    char            mesh_path[256];
+    char            material_path[256];
     int             mesh_shape;         /* procedural: 0=cube, 1=sphere, etc. */
     /* Inline PBR material. */
     float           base_color[4];      /* RGBA linear */
@@ -45,11 +45,11 @@ typedef struct {
     int             alpha_mode;         /* 0=OPAQUE, 1=MASK, 2=BLEND */
     float           alpha_cutoff;
     bool            double_sided;
-    char            albedo_tex[128];
-    char            mr_tex[128];
-    char            normal_tex[128];
-    char            ao_tex[128];
-    char            emissive_tex[128];
+    char            albedo_tex[256];
+    char            mr_tex[256];
+    char            normal_tex[256];
+    char            ao_tex[256];
+    char            emissive_tex[256];
 } JceMeshRenderer;
 
 typedef struct {
@@ -96,7 +96,7 @@ typedef struct {
 /* ── Sprite renderer component ──────────────────────────────────── */
 
 typedef struct {
-    char  sprite_path[128];
+    char  sprite_path[256];
     float color[4];         /* RGBA linear */
     bool  flip_x;
     bool  flip_y;
@@ -106,8 +106,8 @@ typedef struct {
 /* ── Sprite animator component ──────────────────────────────────── */
 
 typedef struct {
-    char  sheet_path[128];
-    char  atlas_path[128];
+    char  sheet_path[256];
+    char  atlas_path[256];
     int   frame_width;
     int   frame_height;
     char  current_anim[64];
@@ -128,7 +128,7 @@ typedef struct {
 /* ── Skeletal animator component ────────────────────────────────── */
 
 typedef struct {
-    char  skeleton_path[128];
+    char  skeleton_path[256];
     char  clip_names[8][64];
     int   clip_count;
     int   active_clip;
@@ -202,7 +202,7 @@ typedef struct {
 /* ── Audio source component ──────────────────────────────────────── */
 
 typedef struct {
-    char  clip_path[128];
+    char  clip_path[256];
     float volume;
     float pitch;
     float spatial_blend;
@@ -213,7 +213,7 @@ typedef struct {
 /* ── Script component ────────────────────────────────────────────── */
 
 typedef struct {
-    char  script_path[128];
+    char  script_path[256];
 } JceScriptComponent;
 
 /* ── Particle emitter component ─────────────────────────────────── */

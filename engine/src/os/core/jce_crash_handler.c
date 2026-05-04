@@ -5,7 +5,7 @@
  * On crash:
  *   - Captures basic crash info (signal, fault address, mini backtrace).
  *   - Logs via jce_log and __android_log_print (Android) or stderr.
- *   - Writes crash dump to crashes/crash-YYYYMMDD-HHMMSS.txt
+ *   - Writes crash dump to .jce/crashes/crash-YYYYMMDD-HHMMSS.txt
  *   - Shows a visible error dialog so developers can read the crash info.
  *   - Re-raises the signal for normal OS crash reporting.
  */
@@ -47,13 +47,14 @@
   #include <execinfo.h>
   #include <dlfcn.h>
   #include <unistd.h>
-  #include <ucontext.h>       /* ucontext_t, REG_RIP / .pc fields  */
   #define HAS_BACKTRACE 1
 #endif
 
-/* Linux: read /proc/self/task/<tid>/comm for thread name, and use
-   syscall(SYS_gettid) to avoid linking libpthread in the handler. */
+/* ucontext_t register extraction is Linux-only.  On macOS, ucontext.h is
+   deprecated and requires _XOPEN_SOURCE; since we never use the registers
+   on macOS, simply don't include it there. */
 #if defined(__linux__) && defined(HAS_BACKTRACE)
+  #include <ucontext.h>       /* ucontext_t, REG_RIP / .pc fields  */
   #include <fcntl.h>
   #include <sys/syscall.h>
 #endif
@@ -352,9 +353,14 @@ static void android_show_crash_dialog(const char *title, const char *message)
 /* ------------------------------------------------------------------ */
 
 /*
- * Writes crash info to crashes/crash-YYYYMMDD-HHMMSS.txt and returns
+ * Writes crash info to .jce/crashes/crash-YYYYMMDD-HHMMSS.txt and returns
  * the path (static buffer) so the dialog can display it.  Returns NULL
  * if write fails or path formation fails.
+ *
+ * The crash dump lives under the per-user .jce/ directory (sibling to the
+ * existing .jce/cache/ used by the renderer's IBL cooker) rather than next
+ * to the executable, so we don't pollute the install directory and so the
+ * file is writable on locked-down installs (issue #7).
  */
 static const char *write_crash_dump(const char *msg)
 {
@@ -362,9 +368,14 @@ static const char *write_crash_dump(const char *msg)
     struct tm *now_tm = localtime(&now_t);
     if (!now_tm) return NULL;
 
+    /* Best-effort directory creation — ignore failure; write_all will
+       report the real error if the dir is genuinely unwritable. */
+    jce_fs_host_create_directory(".jce");
+    jce_fs_host_create_directory(".jce/crashes");
+
     static char dump_path[512];
     snprintf(dump_path, sizeof(dump_path),
-             "crashes/crash-%04d%02d%02d-%02d%02d%02d.txt",
+             ".jce/crashes/crash-%04d%02d%02d-%02d%02d%02d.txt",
              now_tm->tm_year + 1900, now_tm->tm_mon + 1, now_tm->tm_mday,
              now_tm->tm_hour, now_tm->tm_min, now_tm->tm_sec);
 
@@ -380,6 +391,12 @@ static const char *write_crash_dump(const char *msg)
 
 static void crash_signal_handler(int sig)
 {
+#ifdef __ANDROID__
+    /* Log signal immediately — capture_backtrace may crash on Houdini/WSA (broken unwind tables). */
+    __android_log_print(ANDROID_LOG_FATAL, "JCE",
+                        "NATIVE CRASH SIGNAL: %d (%s)", sig, signal_name(sig));
+#endif
+
     /* Build crash message. */
     char bt_buf[2048];
     capture_backtrace(bt_buf, sizeof(bt_buf));
@@ -443,6 +460,13 @@ static void crash_signal_handler(int sig)
 
 static void crash_sigaction_handler(int sig, siginfo_t *info, void *ucontext)
 {
+#ifdef __ANDROID__
+    /* Log signal immediately — backtrace may crash on Houdini/WSA (broken unwind tables). */
+    __android_log_print(ANDROID_LOG_FATAL, "JCE",
+                        "NATIVE CRASH SIGNAL: %d (%s) addr=%p",
+                        sig, signal_name(sig), info ? info->si_addr : NULL);
+#endif
+
     char bt_buf[2048];
 #ifdef HAS_BACKTRACE
     capture_backtrace_from_ucontext(bt_buf, sizeof(bt_buf), ucontext);
@@ -672,20 +696,36 @@ void jce_crash_handler_init(void)
     /* Emscripten: just use basic signal() for SIGABRT. */
     signal(SIGABRT, crash_signal_handler);
 
-#else
-    /* Unix / Android / macOS: use sigaction for fault address info. */
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_flags = SA_SIGINFO;
-    sa.sa_sigaction = crash_sigaction_handler;
-    sigemptyset(&sa.sa_mask);
+#elif defined(__ANDROID__)
+    /* Android: ART uses SIGSEGV/SIGBUS internally for null checks and JIT.
+     * Replacing those handlers conflicts with ART's signal chaining and can
+     * cause the app to crash during normal VM operation.  Only hook SIGABRT
+     * (triggered by abort() / assert()) which ART does not use internally. */
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_flags = SA_SIGINFO;
+        sa.sa_sigaction = crash_sigaction_handler;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGABRT, &sa, NULL);
+    }
 
-    sigaction(SIGSEGV, &sa, NULL);
-    sigaction(SIGABRT, &sa, NULL);
-    sigaction(SIGFPE,  &sa, NULL);
+#else
+    /* Unix / macOS: use sigaction for fault address info. */
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_flags = SA_SIGINFO;
+        sa.sa_sigaction = crash_sigaction_handler;
+        sigemptyset(&sa.sa_mask);
+
+        sigaction(SIGSEGV, &sa, NULL);
+        sigaction(SIGABRT, &sa, NULL);
+        sigaction(SIGFPE,  &sa, NULL);
 #ifdef SIGBUS
-    sigaction(SIGBUS,  &sa, NULL);
+        sigaction(SIGBUS,  &sa, NULL);
 #endif
+    }
 
 #endif /* platform */
 
@@ -702,8 +742,11 @@ void jce_crash_handler_shutdown(void)
     /* Restore default signal handler for SIGABRT. */
     signal(SIGABRT, SIG_DFL);
 
+#elif defined(__ANDROID__)
+    signal(SIGABRT, SIG_DFL);
+
 #else
-    /* Unix / Android / macOS: restore default signal handlers. */
+    /* Unix / macOS: restore default signal handlers. */
     signal(SIGSEGV, SIG_DFL);
     signal(SIGABRT, SIG_DFL);
     signal(SIGFPE,  SIG_DFL);

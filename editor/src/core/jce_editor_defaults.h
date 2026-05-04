@@ -58,10 +58,12 @@
 
 /* ── Gizmo ─────────────────────────────────────────────────────────── */
 
-#define JCE_GIZMO_AXIS_LENGTH       1.5f
-#define JCE_GIZMO_LINE_THICKNESS    3.0f
-#define JCE_GIZMO_HANDLE_SIZE       0.15f
-#define JCE_GIZMO_SELECT_THRESHOLD  10.0f
+/* These were bumped 1.6× / 1.5× / 1.7× to make gizmo handles easier to
+ * grab and the axis lines easier to see on HiDPI displays. */
+#define JCE_GIZMO_AXIS_LENGTH       2.4f
+#define JCE_GIZMO_LINE_THICKNESS    5.0f
+#define JCE_GIZMO_HANDLE_SIZE       0.25f
+#define JCE_GIZMO_SELECT_THRESHOLD  16.0f
 
 /* ── Timing ────────────────────────────────────────────────────────── */
 
