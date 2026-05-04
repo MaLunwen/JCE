@@ -39,6 +39,9 @@ const char *jce_assetdb_kind_label(JceAssetKind kind);
 void jce_assetdb_set_root(const char *project_root);
 void jce_assetdb_rescan(void);
 
+/* Returns the current project root (absolute path) or "" if unset. */
+const char *jce_assetdb_get_root(void);
+
 /* Flat enumeration. */
 int            jce_assetdb_count(void);
 const char    *jce_assetdb_path_at(int idx);

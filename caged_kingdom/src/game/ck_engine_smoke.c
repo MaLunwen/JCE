@@ -310,6 +310,8 @@ static bool s_vfog_params(void)
 
 /* ---------- Driver ---------- */
 
+int ck_engine_smoke_run_ecs(void *ecs_world); /* defined below */
+
 typedef bool (*SmokeFn)(void);
 typedef struct { const char *name; SmokeFn fn; } SmokeCase;
 

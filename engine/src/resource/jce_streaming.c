@@ -162,11 +162,11 @@ static void chunk_load_worker(void *arg)
         return;
     }
 
-    size_t size = 0;
+    uint64_t size = 0;
     void *data = jce_fs_read_all(job->fs, job->path, &size);
 
     job->record->loaded_data = data;
-    job->record->loaded_size = size;
+    job->record->loaded_size = (size_t)size;
     job->record->load_success = (data != NULL && size > 0);
 
     /* Signal completion (memory barrier). */
@@ -184,7 +184,7 @@ static bool load_chunk_sync(JceStreamingSystem *sys, ChunkRecord *c)
         return false;
     }
 
-    size_t size = 0;
+    uint64_t size = 0;
     void *data = jce_fs_read_all(sys->fs, c->asset_path, &size);
 
     if (!data || size == 0) {
@@ -194,7 +194,7 @@ static bool load_chunk_sync(JceStreamingSystem *sys, ChunkRecord *c)
     }
 
     c->data = data;
-    c->data_size = size;
+    c->data_size = (size_t)size;
     c->estimated_size = size;
     c->state = JCE_CHUNK_LOADED;
 

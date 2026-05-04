@@ -29,6 +29,7 @@ extern "C" {
 #include "core/jce_editor_config.h"
 #include "core/jce_editor_state.h"
 #include "core/jce_run_manager.h"
+#include "dialogs/jce_editor_dialogs.h"
 #include "scene/jce_editor_scene_render.h"
 #include "ui/jce_editor_layout.h"
 #include "ui/jce_editor_panels.h"
@@ -169,6 +170,11 @@ static void editor_app_update(float dt, void *ud)
 
     jce_state_play_mode_tick(real_dt);
     jce_run_manager_poll();
+
+    /* Drain any folder/file dialog results enqueued by SDL worker threads.
+     * Must run on the main thread before ImGui consumes the affected
+     * static buffers (issue #5). */
+    jce_editor_dialogs_pump_pending();
 }
 
 static void editor_app_draw(const JceServices *svc, void *ud)

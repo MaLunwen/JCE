@@ -96,8 +96,27 @@ void  jce_file_viewer_open(const char *path);
 
 /* Asset browser: set the project root directory. */
 void  jce_editor_assets_set_project(const char *path);
+/* Asset browser: returns the current project root (never NULL; may be ""). */
+const char *jce_editor_assets_get_project(void);
 /* Asset browser: returns true while the delete confirmation dialog is open. */
 bool  jce_editor_assets_delete_dialog_open(void);
+
+/* Path normalization helpers (#4 relative paths).
+ *
+ * Convert an absolute or arbitrary path to a path relative to the current
+ * project root when possible.  If the input is already relative or lies
+ * outside the project root, the input is copied verbatim (truncated to
+ * out_size).  Forward slashes are used in the relative output for cross-
+ * platform stability of serialized scenes.
+ */
+void jce_editor_path_to_relative(char *out, size_t out_size,
+                                 const char *abs_or_rel_path);
+/* Same as above but uses a caller-supplied base directory.  Useful when
+ * the natural anchor is the scene file's directory rather than project root.
+ */
+void jce_editor_path_to_relative_to(char *out, size_t out_size,
+                                    const char *abs_or_rel_path,
+                                    const char *base_dir);
 
 /* Inspector sync: hierarchy calls this when selection changes. */
 void  jce_editor_inspector_request_sync(void);

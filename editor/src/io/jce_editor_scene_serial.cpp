@@ -10,6 +10,7 @@
 
 #include "jce_editor_file_util.h"
 #include "core/jce_editor_state_internal.h"
+#include "ui/jce_editor_panels.h"
 
 extern "C" {
 #include <jce/middleware/scene/jce_scene_components_json.h>
@@ -17,7 +18,12 @@ extern "C" {
 #include <jce/os/core/jce_path.h>
 #include <jce/os/core/jce_alloc.h>
 #include <jce/renderer/jce_model.h>
+#include <jce/renderer/jce_pbr_material.h>
 }
+
+#include "scene/jce_asset_path_index.h"
+
+
 
 #include <cmath>
 #include <cstring>
@@ -176,7 +182,7 @@ static void validate_mesh_cb(JceScene *sc, JceEntity e, void *ud)
         snprintf(abs_path, sizeof(abs_path), "%s", mr->mesh_path);
     }
 
-    size_t file_size = 0;
+    uint64_t file_size = 0;
     void *data = jce_fs_host_read_all(abs_path, &file_size);
     if (!data) return;
 
@@ -211,6 +217,80 @@ static void validate_mesh_assets(const char *scene_path)
     } else if (ctx.failed > 0) {
         LOG_WARN(LOG_TAG, "mesh asset validation: %d/%d glTF files "
                  "failed engine cgltf load", ctx.failed, ctx.checked);
+    }
+}
+
+/* ── Post-load asset path repair (O(1) per path via asset index) ──── */
+struct PathRepairCtx { int mesh_repaired; int mat_repaired; int mat_backfilled; };
+
+static void repair_paths_cb(JceScene * /*sc*/, JceEntity e, void *ud)
+{
+    auto *ctx = static_cast<PathRepairCtx *>(ud);
+    JceMeshRenderer *mr = jce_scene_get_mesh_renderer(s.scene, e);
+    if (!mr) return;
+
+    char resolved[512];
+
+    if (mr->mesh_path[0] != '\0' && !jce_fs_host_exists_file(mr->mesh_path)) {
+        if (jce_asset_path_index_lookup(mr->mesh_path, resolved, (int)sizeof(resolved))) {
+            snprintf(mr->mesh_path, sizeof(mr->mesh_path), "%s", resolved);
+            ctx->mesh_repaired++;
+        }
+    }
+
+    if (mr->material_path[0] == '\0') return;
+
+    bool repaired_mat = false;
+    if (!jce_fs_host_exists_file(mr->material_path)) {
+        if (jce_asset_path_index_lookup(mr->material_path, resolved, (int)sizeof(resolved))) {
+            snprintf(mr->material_path, sizeof(mr->material_path), "%s", resolved);
+            ctx->mat_repaired++;
+            repaired_mat = true;
+        }
+    }
+
+    /* Re-run material backfill so baseColor / texture refs get applied
+     * even when the engine-side parser couldn't resolve the path.  We
+     * always reapply when a real material file exists — material is the
+     * single source of truth (Unity semantics).  Texture refs on the
+     * renderer that the material does NOT specify are preserved below. */
+    if (!jce_fs_host_exists_file(mr->material_path)) return;
+    (void)repaired_mat;
+
+    JcePbrMaterial pbr = {};
+    char tex_paths[5][256] = {};
+    if (!jce_pbr_material_load_json(mr->material_path, &pbr, tex_paths))
+        return;
+
+    if (tex_paths[0][0]) snprintf(mr->albedo_tex, sizeof(mr->albedo_tex), "%s", tex_paths[0]);
+    if (tex_paths[1][0]) snprintf(mr->mr_tex, sizeof(mr->mr_tex), "%s", tex_paths[1]);
+    if (tex_paths[2][0]) snprintf(mr->normal_tex, sizeof(mr->normal_tex), "%s", tex_paths[2]);
+    if (tex_paths[3][0]) snprintf(mr->ao_tex, sizeof(mr->ao_tex), "%s", tex_paths[3]);
+    if (tex_paths[4][0]) snprintf(mr->emissive_tex, sizeof(mr->emissive_tex), "%s", tex_paths[4]);
+    mr->base_color[0] = pbr.base_color_factor[0];
+    mr->base_color[1] = pbr.base_color_factor[1];
+    mr->base_color[2] = pbr.base_color_factor[2];
+    mr->base_color[3] = pbr.base_color_factor[3];
+    mr->metallic     = pbr.metallic_factor;
+    mr->roughness    = pbr.roughness_factor;
+    mr->emissive[0]  = pbr.emissive_factor[0];
+    mr->emissive[1]  = pbr.emissive_factor[1];
+    mr->emissive[2]  = pbr.emissive_factor[2];
+    mr->normal_scale = pbr.normal_scale;
+    mr->ao_strength  = pbr.ao_strength;
+    ctx->mat_backfilled++;
+}
+
+static void repair_scene_asset_paths(void)
+{
+    if (!s.scene) return;
+    if (jce_asset_path_index_size() == 0) return;
+    PathRepairCtx ctx = { 0, 0, 0 };
+    jce_scene_each_entity(s.scene, repair_paths_cb, &ctx);
+    if (ctx.mesh_repaired || ctx.mat_repaired || ctx.mat_backfilled) {
+        LOG_INFO(LOG_TAG,
+                 "scene asset paths repaired: mesh=%d mat=%d mat_backfill=%d",
+                 ctx.mesh_repaired, ctx.mat_repaired, ctx.mat_backfilled);
     }
 }
 
@@ -254,12 +334,73 @@ static bool validate_scene_round_trip(const char *path)
     return true;
 }
 
+/* ── Path relativization sweep (#4) ──────────────────────────────── */
+
+static void rel_in_place(char *field, size_t cap, const char *base_dir)
+{
+    if (!field || field[0] == '\0') return;
+    char tmp[1024];
+    jce_editor_path_to_relative_to(tmp, sizeof(tmp), field, base_dir);
+    if (tmp[0]) snprintf(field, cap, "%s", tmp);
+}
+
+struct RelSweepCtx { JceScene *scene; const char *base_dir; };
+
+static void normalize_entity_paths_cb(JceScene *sc, JceEntity e, void *ud)
+{
+    RelSweepCtx *ctx = (RelSweepCtx *)ud;
+    (void)sc;
+    const char *base = ctx->base_dir;
+    JceScene *scene = ctx->scene;
+
+    JceEditorMeta *meta = jce_scene_get_editor_meta(scene, e);
+    if (meta) rel_in_place(meta->prefab_path, sizeof(meta->prefab_path), base);
+
+    if (JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, e)) {
+        rel_in_place(mr->mesh_path,     sizeof(mr->mesh_path),     base);
+        rel_in_place(mr->material_path, sizeof(mr->material_path), base);
+        rel_in_place(mr->albedo_tex,    sizeof(mr->albedo_tex),    base);
+        rel_in_place(mr->mr_tex,        sizeof(mr->mr_tex),        base);
+        rel_in_place(mr->normal_tex,    sizeof(mr->normal_tex),    base);
+        rel_in_place(mr->ao_tex,        sizeof(mr->ao_tex),        base);
+        rel_in_place(mr->emissive_tex,  sizeof(mr->emissive_tex),  base);
+    }
+    if (JceSpriteRendererComponent *sr = jce_scene_get_sprite_renderer(scene, e)) {
+        rel_in_place(sr->sprite_path, sizeof(sr->sprite_path), base);
+    }
+    if (JceSpriteAnimatorComponent *sa = jce_scene_get_sprite_animator(scene, e)) {
+        rel_in_place(sa->sheet_path, sizeof(sa->sheet_path), base);
+        rel_in_place(sa->atlas_path, sizeof(sa->atlas_path), base);
+    }
+    if (JceSkeletalAnimatorComponent *ska = jce_scene_get_skeletal_animator(scene, e)) {
+        rel_in_place(ska->skeleton_path, sizeof(ska->skeleton_path), base);
+    }
+    if (JceScriptComponent *scp = jce_scene_get_script(scene, e)) {
+        rel_in_place(scp->script_path, sizeof(scp->script_path), base);
+    }
+    if (JceSkyboxComponent *sky = jce_scene_get_skybox(scene, e)) {
+        rel_in_place(sky->hdr_path, sizeof(sky->hdr_path), base);
+    }
+}
+
+static void normalize_all_scene_paths_to_relative(const char *scene_path)
+{
+    if (!s.scene || !scene_path) return;
+    char base[512] = {0};
+    if (!jce_path_parent(base, sizeof(base), scene_path)) return;
+    RelSweepCtx ctx{ s.scene, base };
+    jce_scene_each_entity(s.scene, normalize_entity_paths_cb, &ctx);
+}
+
 /* ── Scene file save ─────────────────────────────────────────────── */
 
 bool jce_state_save_scene_file(const char *scene_path)
 {
     if (!scene_path || scene_path[0] == '\0')
         return false;
+
+    /* Convert all path fields to scene-relative before writing. */
+    normalize_all_scene_paths_to_relative(scene_path);
 
     if (!jce_scene_serial_save_file(s.scene, scene_path)) {
         LOG_WARN(LOG_TAG, "scene save failed: %s", scene_path);
@@ -302,6 +443,7 @@ bool jce_state_load_scene_file(const char *scene_path)
             rebuild_entity_order_from_ecs();
             update_scene_dir_from_path(scene_path);
             set_current_scene_path_internal(scene_path);
+            repair_scene_asset_paths();
             LOG_INFO(LOG_TAG, "scene loaded from %s (%d entities)",
                      scene_path, (int)g_entity_order.size());
         } else {

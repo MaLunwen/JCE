@@ -160,6 +160,10 @@ static void texture_async_worker_main(void *arg)
                                                       &result.rgba,
                                                       &result.width,
                                                       &result.height);
+            if (!result.success) {
+                LOG_WARN(LOG_TAG, "texture async load FAILED: key='%s' file='%s'",
+                         req.key.c_str(), req.file_path.c_str());
+            }
         }
 
         JceMutexGuard lock(s_tex_async.mutex);

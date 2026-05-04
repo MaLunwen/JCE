@@ -122,7 +122,7 @@ bool jce_scene_serial_load_file(JceScene *scene, const char *path)
     }
 
     /* Scene file dialogs operate on real OS paths -> host filesystem. */
-    size_t size = 0;
+    uint64_t size = 0;
     char *buf = (char *)jce_fs_host_read_all(path, &size);
     if (!buf) {
         LOG_ERROR(LOG_TAG, "cannot open '%s' for reading", path);
@@ -140,7 +140,7 @@ bool jce_scene_serial_load_vfs(JceScene *scene,
 {
     if (!scene || !fs || !virtual_path) return false;
 
-    size_t size = 0;
+    uint64_t size = 0;
     void *data = jce_fs_read_all(fs, virtual_path, &size);
     if (!data) {
         LOG_ERROR(LOG_TAG, "cannot open '%s' via VFS", virtual_path);

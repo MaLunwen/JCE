@@ -96,6 +96,9 @@ void        jce_state_deselect_entity(uint32_t id);
 void        jce_state_clear_selection(void);
 bool        jce_state_is_selected(uint32_t id);
 uint32_t    jce_state_get_focused(void);
+/* Set the focused entity *without* mutating the selection array order.
+ * Caller must ensure id is currently in the selection (or 0 to clear). */
+void        jce_state_set_focused(uint32_t id);
 const uint32_t *jce_state_get_selection(int *out_count);
 
 /* Entity management — ECS is the single source of truth. */
@@ -188,6 +191,9 @@ void              jce_state_clear_scene_modified(void);
 void          jce_state_play(void);
 void          jce_state_pause(void);
 void          jce_state_stop(void);
+/* Advance the simulation by exactly one frame while paused.  No-op if not
+ * currently in JCE_PLAY_PAUSED.  Useful for frame-by-frame debugging. */
+void          jce_state_step(float dt);
 JcePlayState  jce_state_get_play_state(void);
 void          jce_state_play_mode_tick(float dt);
 

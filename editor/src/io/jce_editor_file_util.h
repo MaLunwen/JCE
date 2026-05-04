@@ -20,6 +20,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 
 /* Read an entire file into an ED_MALLOC'd buffer.
@@ -31,18 +32,18 @@ static inline void *ed_read_file(const char *path, size_t *out_size)
     if (out_size) *out_size = 0;
     if (!path) return NULL;
 
-    size_t n = 0;
+    uint64_t n = 0;
     void *raw = jce_fs_host_read_all(path, &n);
     if (!raw) return NULL;
 
-    void *buf = ED_MALLOC(n + 1);
+    void *buf = ED_MALLOC((size_t)n + 1);
     if (!buf) { jce_fs_buffer_free(raw); return NULL; }
 
-    if (n > 0) memcpy(buf, raw, n);
+    if (n > 0) memcpy(buf, raw, (size_t)n);
     ((char *)buf)[n] = '\0';
     jce_fs_buffer_free(raw);
 
-    if (out_size) *out_size = n;
+    if (out_size) *out_size = (size_t)n;
     return buf;
 }
 
@@ -76,20 +77,20 @@ static inline void *ed_read_file_capped(const char *path,
     if (out_total) *out_total = 0;
     if (!path) return NULL;
 
-    size_t got = 0, total = 0;
-    void *raw = jce_fs_host_read_capped(path, max_bytes, &got, &total);
+    uint64_t got = 0, total = 0;
+    void *raw = jce_fs_host_read_capped(path, (uint64_t)max_bytes, &got, &total);
     if (!raw) return NULL;
 
-    if (out_total) *out_total = total;
+    if (out_total) *out_total = (size_t)total;
 
-    void *buf = ED_MALLOC(got + 1);
+    void *buf = ED_MALLOC((size_t)got + 1);
     if (!buf) { jce_fs_buffer_free(raw); return NULL; }
 
-    if (got > 0) memcpy(buf, raw, got);
+    if (got > 0) memcpy(buf, raw, (size_t)got);
     ((char *)buf)[got] = '\0';
     jce_fs_buffer_free(raw);
 
-    if (out_size) *out_size = got;
+    if (out_size) *out_size = (size_t)got;
     return buf;
 }
 

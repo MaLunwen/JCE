@@ -2,7 +2,9 @@
 # ================================================================
 # build-linux-arm64.sh -- Build JCE for Linux aarch64
 # Usage: build-linux-arm64.sh [--clean]
-# Output: build/desktop/linux-arm64/CagedKingdom
+# Output:
+#   Game exe : build/desktop/linux-arm64/release/caged_kingdom
+#   JNI lib  : build/jni/natives/linux-aarch64/libjce.so
 #
 # System dependencies (Ubuntu/Debian):
 #   sudo apt install libx11-dev libxrandr-dev libxcursor-dev libxi-dev \
@@ -15,13 +17,15 @@ PROFILE="conan/profiles/linux-arm64"
 BUILD_PROFILE="conan/profiles/linux-x64"
 CONAN_DIR="build/desktop/linux-arm64-conan"
 BUILD_DIR="build/desktop/linux-arm64"
+JNI_BUILD_DIR="build/jni/linux-arm64"
+JNI_CLASSIFIER="linux-aarch64"
 TOOLCHAIN="$CONAN_DIR/build/Release/generators/conan_toolchain.cmake"
 HOST_PAK="build/host/tools/jce_pak"
 
 # -- Handle --clean flag --
 if [[ "${1:-}" == "--clean" ]]; then
-    echo "=== Cleaning build directory ==="
-    rm -rf "$BUILD_DIR" "$CONAN_DIR"
+    echo "=== Cleaning build directories ==="
+    rm -rf "$BUILD_DIR" "$CONAN_DIR" "$JNI_BUILD_DIR"
     echo "  Done"
 fi
 
@@ -96,6 +100,69 @@ if [[ ! -f "$BUILD_DIR/release/caged_kingdom" ]]; then
     exit 1
 fi
 
+(aarch64-linux-gnu-strip --strip-unneeded "$BUILD_DIR/release/caged_kingdom" 2>/dev/null \
+    || strip --strip-unneeded "$BUILD_DIR/release/caged_kingdom" 2>/dev/null \
+    || true)
+
 echo ""
 echo "[SUCCESS] Linux ARM64 build complete: $BUILD_DIR/release/caged_kingdom"
+
+# -- Step 6: Build JNI shared library and stage for fat JAR --
+echo ""
+echo "=== Step 6: Build & stage JNI native (linux-aarch64) ==="
+
+# Resolve JDK for JNI headers.  Cross-compile: host (x64) headers are fine
+# because jni.h is platform-agnostic and we never link against libjvm.
+_JDK_HOME="${JAVA_HOME:-}"
+if [[ -z "$_JDK_HOME" || ! -f "$_JDK_HOME/include/jni.h" ]]; then
+    for _try in \
+        /usr/lib/jvm/java-21-openjdk-amd64 \
+        /usr/lib/jvm/java-17-openjdk-amd64 \
+        /usr/lib/jvm/java-21-openjdk-arm64 \
+        /usr/lib/jvm/java-21-openjdk \
+        /usr/lib/jvm/temurin-21; do
+        if [[ -f "$_try/include/jni.h" ]]; then
+            _JDK_HOME="$_try"
+            break
+        fi
+    done
+fi
+if [[ -z "$_JDK_HOME" ]]; then
+    echo "ERROR: No JDK found for JNI headers. Install openjdk or set JAVA_HOME."
+    exit 1
+fi
+echo "  JDK: $_JDK_HOME"
+_JDK_JVM_LIB="$_JDK_HOME/lib/server/libjvm.so"
+[[ -f "$_JDK_JVM_LIB" ]] || _JDK_JVM_LIB="$_JDK_HOME/jre/lib/amd64/server/libjvm.so"
+
+JNI_CMAKE_ARGS="-S . -B $JNI_BUILD_DIR -G Ninja \
+    -DCMAKE_TOOLCHAIN_FILE=$TOOLCHAIN \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DJCE_PAK_EXECUTABLE=$HOST_PAK \
+    -DJCE_ENABLE_CPPCHECK=OFF \
+    -DJCE_BUILD_JNI=ON \
+    -DJAVA_INCLUDE_PATH=$_JDK_HOME/include \
+    -DJAVA_INCLUDE_PATH2=$_JDK_HOME/include/linux \
+    -DJAVA_AWT_LIBRARY=$_JDK_HOME/lib/libjawt.so \
+    -DJAVA_JVM_LIBRARY=$_JDK_JVM_LIB"
+if [[ -n "$HOST_SHADERC" ]]; then
+    JNI_CMAKE_ARGS="$JNI_CMAKE_ARGS -DJCE_SHADERC_EXECUTABLE=$HOST_SHADERC"
+fi
+cmake $JNI_CMAKE_ARGS
+cmake --build "$JNI_BUILD_DIR" --target CagedKingdom
+
+JNI_LIB="$JNI_BUILD_DIR/release/libjce.so"
+if [[ -f "$JNI_LIB" ]]; then
+    JNI_STAGE="build/jni/natives/$JNI_CLASSIFIER"
+    mkdir -p "$JNI_STAGE"
+    cp "$JNI_LIB" "$JNI_STAGE/libjce.so"
+    # Cross-strip: prefer aarch64 strip; fall back to host strip
+    (aarch64-linux-gnu-strip --strip-unneeded "$JNI_STAGE/libjce.so" 2>/dev/null \
+        || strip --strip-unneeded "$JNI_STAGE/libjce.so" 2>/dev/null \
+        || true)
+    echo "  Staged: $JNI_STAGE/libjce.so"
+else
+    echo "  WARNING: $JNI_LIB not found — JNI stage skipped."
+fi
+
 _jce_success_wait

@@ -133,7 +133,7 @@ static JceTexture load_gltf_texture(const JcePakArchive *pak,
             SDL_strlcpy(disk_path, image->uri, sizeof(disk_path));
         }
 
-        size_t img_size = 0;
+        uint64_t img_size = 0;
         void *img_buf = jce_fs_host_read_all(disk_path, &img_size);
         if (img_buf && img_size > 0) {
             SDL_IOStream *io = SDL_IOFromConstMem(img_buf, img_size);

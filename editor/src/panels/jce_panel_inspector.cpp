@@ -123,6 +123,16 @@ bool jce_editor_inspector_delete_dialog_open(void)
 
 static bool s_insp_batch_open = false;
 
+/* Deferred component removal — applied at end of frame to avoid
+ * mutating the entity while the inspector is still iterating its
+ * components (which would invalidate flecs pointers and crash the
+ * post-edit history snapshot). */
+static struct {
+    uint32_t entity_id;
+    uint32_t flag;
+    bool     pending;
+} s_pending_remove = { 0, 0, false };
+
 static void insp_track_edit(void)
 {
     if (ImGui::IsItemActivated() && !s_insp_batch_open) {
@@ -962,8 +972,11 @@ static bool comp_section_begin(uint32_t entity_id,
             ImGui::EndDisabled();
         } else {
             ImGui::PushStyleColor(ImGuiCol_Text, JCE_COLOR_TEXT_ERROR);
-            if (ImGui::MenuItem(jce_editor_i18n("inspector.removeComponent")))
-                jce_state_remove_component(entity_id, flag);
+            if (ImGui::MenuItem(jce_editor_i18n("inspector.removeComponent"))) {
+                s_pending_remove.entity_id = entity_id;
+                s_pending_remove.flag      = flag;
+                s_pending_remove.pending   = true;
+            }
             ImGui::PopStyleColor();
         }
         ImGui::EndPopup();
@@ -1037,6 +1050,17 @@ void jce_editor_panel_inspector_content(void)
     char lbl[128];
 
     JceScene *scene = jce_state_get_scene();
+
+    /* Play-mode warning: edits in PLAY mode will be reverted on STOP. */
+    {
+        JcePlayState ps = jce_state_get_play_state();
+        if (ps == JCE_PLAY_PLAYING || ps == JCE_PLAY_PAUSED) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.55f, 0.10f, 1.0f));
+            ImGui::TextWrapped("%s", jce_editor_i18n("inspector.playModeWarning"));
+            ImGui::PopStyleColor();
+            ImGui::Separator();
+        }
+    }
 
     /* ── Multi-entity selection header ─────────────────────────────── */
     int sel_count = 0;
@@ -1114,6 +1138,7 @@ void jce_editor_panel_inspector_content(void)
         /* ── Bulk Transform editor (multi-select) ──────────────────── */
         if (scene) {
             if (ImGui::CollapsingHeader(jce_editor_i18n("inspector.bulk.section"), ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::PushID("##jce_bulk_xform_section");
                 static float pos_delta[3] = {0,0,0};
                 static float rot_set[3]   = {0,0,0};
                 static float scl_set[3]   = {1,1,1};
@@ -1171,7 +1196,7 @@ void jce_editor_panel_inspector_content(void)
                 }
 
                 ImGui::Separator();
-                if (ImGui::Button(jce_editor_i18n_id("inspector.bulk.resetPos", "bulk"))) {
+                if (ImGui::Button(jce_editor_i18n_id("inspector.bulk.resetPos", "bulk_reset_pos"))) {
                     for (int i = 0; i < sel_count; i++) {
                         JceEntity e = jce_state_to_ecs_entity(sel_ids[i]);
                         JceTransform *t = jce_scene_get_transform(scene, e);
@@ -1179,24 +1204,79 @@ void jce_editor_panel_inspector_content(void)
                     }
                 }
                 ImGui::SameLine();
-                if (ImGui::Button(jce_editor_i18n_id("inspector.bulk.resetScale", "bulk"))) {
+                if (ImGui::Button(jce_editor_i18n_id("inspector.bulk.resetScale", "bulk_reset_scl"))) {
                     for (int i = 0; i < sel_count; i++) {
                         JceEntity e = jce_state_to_ecs_entity(sel_ids[i]);
                         JceTransform *t = jce_scene_get_transform(scene, e);
                         if (t) { t->scale.x = t->scale.y = t->scale.z = 1.0f; }
                     }
                 }
+                ImGui::PopID();
             }
 
             ImGui::Separator();
         }
 
-        for (int i = 0; i < sel_count && i < 20; i++) {
-            const char *nm = jce_state_entity_name(sel_ids[i]);
-            if (nm) ImGui::BulletText("%s", nm);
+        {
+            uint32_t focused_id = jce_state_get_focused();
+            uint32_t to_focus = 0;
+            uint32_t to_remove = 0;
+            int max_show = sel_count < 20 ? sel_count : 20;
+            for (int i = 0; i < max_show; i++) {
+                ImGui::PushID(i);
+                uint32_t id = sel_ids[i];
+                const char *nm = jce_state_entity_name(id);
+                if (!nm) nm = "(unnamed)";
+                bool is_focused = (id == focused_id);
+
+                /* Reserve room for the two SmallButtons on the right so
+                 * the Selectable does not (a) push them past the visible
+                 * region and (b) intercept their clicks across the row. */
+                const char *focus_lbl  = jce_editor_i18n_id("inspector.bulk.entity.focus", "focus");
+                const char *remove_lbl = jce_editor_i18n_id("inspector.bulk.entity.remove", "remove");
+                ImGuiStyle &style = ImGui::GetStyle();
+                float btn_focus_w  = ImGui::CalcTextSize(focus_lbl).x  + style.FramePadding.x * 2.0f;
+                float btn_remove_w = ImGui::CalcTextSize(remove_lbl).x + style.FramePadding.x * 2.0f;
+                float reserved     = btn_focus_w + btn_remove_w + style.ItemSpacing.x * 2.0f;
+                float avail_w      = ImGui::GetContentRegionAvail().x;
+                float sel_w        = avail_w - reserved;
+                if (sel_w < 32.0f) sel_w = 32.0f;
+
+                /* Selectable: click to make this the focused entity within the multi-selection. */
+                ImGui::SetNextItemAllowOverlap();
+                if (ImGui::Selectable(nm, is_focused,
+                                      ImGuiSelectableFlags_AllowOverlap,
+                                      ImVec2(sel_w, 0.0f))) {
+                    to_focus = id;
+                }
+                ImGui::SameLine();
+                /* Frame camera on this entity. */
+                if (ImGui::SmallButton(focus_lbl)) {
+                    JceEntity e = jce_state_to_ecs_entity(id);
+                    JceTransform *t = jce_scene_get_transform(scene, e);
+                    if (t) jce_editor_scene_camera_set_target(t->position.x, t->position.y, t->position.z);
+                    to_focus = id;
+                }
+                ImGui::SameLine();
+                /* Remove from current selection. */
+                if (ImGui::SmallButton(remove_lbl)) {
+                    to_remove = id;
+                }
+                ImGui::PopID();
+            }
+            if (sel_count > 20)
+                ImGui::Text("... %d %s", sel_count - 20, jce_editor_i18n("inspector.andMore"));
+
+            if (to_remove) jce_state_deselect_entity(to_remove);
+            else if (to_focus) {
+                /* Re-focus within multi-selection: just retarget the
+                 * focused id; do NOT remove+re-add, which would shove the
+                 * clicked entity to the tail of the selection array and
+                 * make this very list visually "swap" the clicked row
+                 * with the bottom row on every click. */
+                jce_state_set_focused(to_focus);
+            }
         }
-        if (sel_count > 20)
-            ImGui::Text("... %d %s", sel_count - 20, jce_editor_i18n("inspector.andMore"));
 
         ImGui::Separator();
 
@@ -1438,6 +1518,17 @@ void jce_editor_panel_inspector_content(void)
     }
 
     ImGui::EndDisabled();
+
+    /* Flush deferred component removal here, after all draw_comp_*
+     * functions have returned (so no stale flecs pointer is in use). */
+    if (s_pending_remove.pending) {
+        uint32_t eid = s_pending_remove.entity_id;
+        uint32_t fl  = s_pending_remove.flag;
+        s_pending_remove.pending   = false;
+        s_pending_remove.entity_id = 0;
+        s_pending_remove.flag      = 0;
+        jce_state_remove_component(eid, fl);
+    }
 }
 
 /* ── Standalone wrapper ───────────────────────────────────────────── */

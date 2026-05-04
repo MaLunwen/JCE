@@ -52,6 +52,14 @@ JceTexture get_cached_texture(const char *material_path,
     return jce_editor_scene_asset_cache_get_texture(material_path, mesh_path);
 }
 
+static bool ed_texture_failed_cb(const char *material_path,
+                                 const char *mesh_path,
+                                 void       *ud)
+{
+    (void)ud;
+    return jce_editor_scene_asset_cache_texture_failed(material_path, mesh_path);
+}
+
 /* ── Asset cache callbacks for the engine scene renderer ──────────── */
 
 static JceMesh *ed_load_mesh_cb(const char *path, void *ud)
@@ -194,8 +202,9 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     memset(&cbs, 0, sizeof(cbs));
     cbs.load_mesh    = ed_load_mesh_cb;
     cbs.load_model   = ed_load_model_cb;
-    cbs.load_texture = ed_load_texture_cb;
-    cbs.userdata     = NULL;
+    cbs.load_texture    = ed_load_texture_cb;
+    cbs.texture_failed  = ed_texture_failed_cb;
+    cbs.userdata        = NULL;
     s_sr.scene_renderer = jce_scene_renderer_create(renderer, pak, &cbs);
     if (!s_sr.scene_renderer) {
         LOG_WARN(LOG_TAG, "failed to create engine scene renderer");
@@ -583,6 +592,14 @@ JceAnimPlayer *jce_editor_scene_get_anim_player(const char *skeleton_path,
                                                  uint32_t entity_id)
 {
     (void)entity_id;
+    /* Prefer the live player driven by the scene renderer — that's the one
+     * whose time advances each frame.  Fall back to the editor's standalone
+     * query cache for tools that pre-load a model without rendering it. */
+    if (s_sr.scene_renderer && skeleton_path && skeleton_path[0]) {
+        JceAnimPlayer *p = (JceAnimPlayer *)jce_scene_renderer_get_anim_player(
+            s_sr.scene_renderer, skeleton_path);
+        if (p) return p;
+    }
     EdQueryCacheEntry *e = ed_query_cache_get(skeleton_path);
     return e ? e->player : nullptr;
 }
@@ -591,6 +608,11 @@ JceModel *jce_editor_scene_get_model(const char *skeleton_path,
                                      uint32_t entity_id)
 {
     (void)entity_id;
+    if (s_sr.scene_renderer && skeleton_path && skeleton_path[0]) {
+        JceModel *m = (JceModel *)jce_scene_renderer_get_model(
+            s_sr.scene_renderer, skeleton_path);
+        if (m) return m;
+    }
     EdQueryCacheEntry *e = ed_query_cache_get(skeleton_path);
     return e ? e->model : nullptr;
 }

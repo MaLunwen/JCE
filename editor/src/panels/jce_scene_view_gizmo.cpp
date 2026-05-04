@@ -191,6 +191,14 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
     }
 
     JceGizmoMode active_gm = jce_state_get_gizmo_mode();
+    bool s_view_2d = jce_state_get_2d_mode();
+    /* Snapshot pre-drag values so we can lock Z in 2D mode.  In 2D the
+     * gizmo only operates in the XY plane: Z translation is locked, and
+     * rotation is restricted to the Z axis. */
+    float pre_pos_z   = gizmo_raw_pos[2];
+    float pre_rot_x   = gizmo_raw_rot[0];
+    float pre_rot_y   = gizmo_raw_rot[1];
+    float pre_scale_z = gizmo_raw_scale[2];
     jce_gizmo_update(&gcam,
                      (int)active_gm,
                      (int)jce_state_get_gizmo_space(),
@@ -198,6 +206,12 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
                      gizmo_raw_pos,
                      gizmo_raw_rot,
                      gizmo_raw_scale);
+    if (s_view_2d) {
+        gizmo_raw_pos[2]   = pre_pos_z;
+        gizmo_raw_rot[0]   = pre_rot_x;
+        gizmo_raw_rot[1]   = pre_rot_y;
+        gizmo_raw_scale[2] = pre_scale_z;
+    }
 
     bool gizmo_dragging_after = jce_gizmo_is_active();
     if (!gizmo_dragging_before && gizmo_dragging_after && !s_gizmo_history_batch_open) {

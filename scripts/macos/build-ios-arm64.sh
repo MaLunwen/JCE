@@ -8,6 +8,17 @@
 # Requires: Xcode with iOS SDK installed
 # ================================================================
 source "$(dirname "$0")/../lib/jce_common.sh"
+
+# Unlock the login keychain before xcodebuild so codesign can access signing certs.
+# Works in both interactive and SSH/headless sessions.
+if [[ -n "${KEYCHAIN_PASSWORD:-}" ]]; then
+    security unlock-keychain -p "$KEYCHAIN_PASSWORD" ~/Library/Keychains/login.keychain-db 2>/dev/null || true
+else
+    # No password in env — try a silent unlock (no-op if already unlocked);
+    # on macOS this shows a system dialog if the keychain is locked.
+    security unlock-keychain ~/Library/Keychains/login.keychain-db 2>/dev/null || true
+fi
+
 # -- Parse flags --
 CLEAN=false
 for arg in "$@"; do
@@ -117,17 +128,30 @@ rm -rf "$BUILD_DIR/build/XCBuildData" 2>/dev/null || true
 
 XCODE_BUILD_ARGS=(
     -project "$BUILD_DIR/JCE.xcodeproj"
-    -target JCE
+    -target CagedKingdom
     -configuration Release
     -sdk "$SDK"
     -quiet
+    -allowProvisioningUpdates
 )
-XCODE_BUILD_ARGS+=(-allowProvisioningUpdates)
 
 xcodebuild "${XCODE_BUILD_ARGS[@]}"
 
-XCODE_APP="$BUILD_DIR/src/Release-${SDK}/JCE.app"
-if [[ -d "$XCODE_APP" ]]; then
+# Xcode places the .app in Release-iphoneos/ under the CMake RUNTIME_OUTPUT_DIRECTORY.
+# Try both the SDK-suffixed and plain paths to handle different CMake setups.
+XCODE_APP=""
+for _candidate in \
+    "$BUILD_DIR/release/Release-iphoneos/CagedKingdom.app" \
+    "$BUILD_DIR/Release-iphoneos/CagedKingdom.app" \
+    "$BUILD_DIR/release/Release/CagedKingdom.app" \
+    "$BUILD_DIR/release/Release/caged_kingdom.app"; do
+    if [[ -d "$_candidate" ]]; then
+        XCODE_APP="$_candidate"
+        break
+    fi
+done
+
+if [[ -n "$XCODE_APP" ]]; then
     echo ""
     echo "[SUCCESS] iOS build complete! ($SDK)"
     echo "  App: $XCODE_APP"
@@ -157,7 +181,10 @@ if [[ -d "$XCODE_APP" ]]; then
     _jce_success_wait
 else
     echo ""
-    echo "[WARNING] Xcode build completed but JCE.app not found at expected path."
+    echo "[WARNING] Xcode build completed but CagedKingdom.app not found."
+    echo "  Searched:"
+    echo "    $BUILD_DIR/release/Release-iphoneos/CagedKingdom.app"
+    echo "    $BUILD_DIR/Release-iphoneos/CagedKingdom.app"
     echo "  Open Xcode manually: open $BUILD_DIR/JCE.xcodeproj"
     _jce_success_wait
 fi

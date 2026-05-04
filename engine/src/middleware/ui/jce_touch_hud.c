@@ -31,6 +31,9 @@
 #include <math.h>
 #include <SDL3/SDL.h>
 #include <string.h>
+#include <jce/os/core/jce_log.h>
+
+#define LOG_TAG "touch_hud"
 
 /* ── Configuration ──────────────────────────────────────────────── */
 

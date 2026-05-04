@@ -3,6 +3,7 @@
  */
 
 #include "jce_asset_cache_internal.h"
+#include "../ui/jce_editor_panels.h"
 
 /* ── Mesh request priority ──────────────────────────────────────── */
 
@@ -244,28 +245,6 @@ void clear_mesh_cache(void)
 
 /* ── Mesh file path resolution ──────────────────────────────────── */
 
-/* Convert "SM_PascalCase_Name" or "SKM_PascalCase_Name" to "pascalcase-name". */
-static void sm_to_kebab(const char *sm_name, char *out, int out_size)
-{
-    int o = 0;
-    const char *src = sm_name;
-    if (src[0] == 'S' && src[1] == 'K' && src[2] == 'M' && src[3] == '_') src += 4;
-    else if (src[0] == 'S' && src[1] == 'K' && src[2] == '_') src += 3;
-    else if (src[0] == 'S' && src[1] == 'M' && src[2] == '_') src += 3;
-
-    for (int i = 0; src[i] && o < out_size - 1; i++) {
-        char c = src[i];
-        if (c == '_') {
-            out[o++] = '-';
-        } else if (c >= 'A' && c <= 'Z') {
-            out[o++] = (char)(c + 32);
-        } else {
-            out[o++] = c;
-        }
-    }
-    out[o] = '\0';
-}
-
 static bool copy_found_path(const char *src, char *out_path, size_t out_size)
 {
     if (!src || !out_path || out_size == 0) return false;
@@ -283,30 +262,27 @@ bool resolve_mesh_file_path(const char *mesh_path, char *out_path,
     if (jce_fs_host_exists_file(mesh_path))
         return copy_found_path(mesh_path, out_path, out_size);
 
-    if (s_cache.scene_dir[0] == '\0')
-        return false;
-
     char basename[256];
     if (!jce_path_basename(basename, sizeof(basename), mesh_path)) {
         snprintf(basename, sizeof(basename), "%s", mesh_path);
     }
 
-    /* Try joining with scene_dir */
-    char full_path[512];
-    if (jce_path_join(full_path, sizeof(full_path), s_cache.scene_dir, mesh_path)) {
-        if (jce_fs_host_exists_file(full_path))
-            return copy_found_path(full_path, out_path, out_size);
+    /* Try joining with scene_dir if known. */
+    if (s_cache.scene_dir[0] != '\0') {
+        char full_path[512];
+        if (jce_path_join(full_path, sizeof(full_path), s_cache.scene_dir, mesh_path)) {
+            if (jce_fs_host_exists_file(full_path))
+                return copy_found_path(full_path, out_path, out_size);
+        }
     }
 
-    /* Recursive search using find_file_by_name_recursive */
+    /* Recursive search across all scene + project roots so meshes resolve
+     * Unity-style by basename anywhere under the project. */
     {
         std::vector<std::string> roots;
-        roots.push_back(std::string(s_cache.scene_dir));
-        
-        char parent[512];
-        if (jce_path_parent(parent, sizeof(parent), s_cache.scene_dir)) {
-            roots.push_back(std::string(parent));
-        }
+        collect_scene_roots(&roots);
+        if (roots.empty())
+            return false;
 
         char found[512];
         if (find_file_by_name_recursive(roots, std::string(basename), 8, found, sizeof(found))) {
@@ -339,6 +315,16 @@ void mesh_finalize_completed_loads(void)
 
         int idx = find_mesh_cache_entry(res.mesh_path.c_str());
         if (idx < 0) {
+            /* The cache key was lost (e.g. path buffer was too small at
+             * queue time, or the cache was cleared mid-flight). Log so a
+             * future regression surfaces immediately rather than as a
+             * silent fallback to the procedural cube shape. */
+            LOG_WARN(LOG_TAG,
+                "mesh finalize: no cache entry for completed load: %s",
+                res.mesh_path.c_str());
+            jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+                "Mesh load completed but cache entry was lost: %s",
+                res.mesh_path.c_str());
             jce_editor_model_free_cpu_data(&res.cpu);
             continue;
         }
@@ -354,6 +340,9 @@ void mesh_finalize_completed_loads(void)
             s_cache.mesh_cache[idx].failed = true;
             LOG_WARN(LOG_TAG, "mesh async load failed: %s",
                      res.mesh_path.c_str());
+            jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                "Mesh import failed: %s (Assimp could not parse the file or path resolution failed)",
+                res.mesh_path.c_str());
             jce_editor_model_free_cpu_data(&res.cpu);
             continue;
         }
@@ -367,6 +356,9 @@ void mesh_finalize_completed_loads(void)
         if (!mesh) {
             s_cache.mesh_cache[idx].failed = true;
             LOG_WARN(LOG_TAG, "mesh finalize failed: %s", res.mesh_path.c_str());
+            jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                "Mesh GPU upload failed: %s (vertex/index buffer creation rejected)",
+                res.mesh_path.c_str());
             continue;
         }
 

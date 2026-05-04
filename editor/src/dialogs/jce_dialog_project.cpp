@@ -12,6 +12,9 @@
 #include "jce_editor_dialogs_internal.h"
 #include "core/jce_assetdb.h"
 
+#include <mutex>
+#include <vector>
+
 /* ── Shared state ─────────────────────────────────────────────────── */
 
 char s_current_project_root[512] = {0};
@@ -137,33 +140,75 @@ bool sanitize_recent_projects(JceEditorConfig *cfg)
  * frame instead of blocking.
  */
 
+/* ── Folder picker — main-thread-safe marshalling ─────────────────────
+ *
+ * Background:
+ *   On Windows, SDL3's SDL_ShowOpenFolderDialog runs the COM dialog on a
+ *   worker thread named "SDL_Windows_ShowFolderDialog" and fires the result
+ *   callback on that same worker thread.  The previous implementation wrote
+ *   the picked path directly into editor-owned char buffers (e.g.
+ *   s_save_as.save_location) from the worker thread, racing with ImGui
+ *   InputText reads/writes on the main thread.  This produced sporadic
+ *   ACCESS_VIOLATION crashes during heavy editing → save sequences (the
+ *   stripped-symbol stack misleadingly resolved to "cJSON_malloc" because
+ *   dladdr fell back to the nearest export — see issue #5).
+ *
+ * Fix:
+ *   The host-dialog callback now copies the path into a heap-owned struct
+ *   and pushes it onto a mutex-protected queue.  The main thread drains the
+ *   queue once per frame in jce_editor_dialogs_pump_pending() and applies
+ *   the snprintf updates safely.  Everything that touches editor state is
+ *   on the main thread; the worker thread only does atomic enqueue + free.
+ */
 namespace {
 
 struct FolderPickRequest {
+    /* Output targets — file-scope statics in caller, valid for app
+       lifetime.  We never free them; we only write through them on the
+       main thread. */
     char  *primary;
     size_t primary_size;
     char  *secondary;
     size_t secondary_size;
     bool  *ready_flag;
     bool  *cancelled_flag;
+
+    /* Result captured on worker thread, applied on main thread. */
+    bool        completed;
+    bool        cancelled;
+    std::string path;
 };
 
-void folder_pick_callback(void *user, JceDialogResult result, const char *path)
+std::mutex                       g_pending_mu;
+std::vector<FolderPickRequest *> g_pending_pick_requests;
+
+void folder_pick_callback_thread_safe(void *user,
+                                      JceDialogResult result,
+                                      const char *path)
 {
     FolderPickRequest *req = (FolderPickRequest *)user;
     if (!req) return;
 
+    /* WORKER THREAD — do not touch editor state directly. */
     if (result == JCE_DIALOG_OK && path && path[0] != '\0') {
-        if (req->primary && req->primary_size > 0)
-            snprintf(req->primary, req->primary_size, "%s", path);
-        if (req->secondary && req->secondary_size > 0)
-            snprintf(req->secondary, req->secondary_size, "%s", path);
-        snprintf(s_last_browse_folder, sizeof(s_last_browse_folder), "%s", path);
-        if (req->ready_flag)     *req->ready_flag     = true;
+        req->completed = true;
+        req->cancelled = false;
+        try {
+            req->path.assign(path);
+        } catch (...) {
+            req->path.clear();
+            req->cancelled = true;  /* treat OOM as cancel */
+            req->completed = false;
+        }
     } else {
-        if (req->cancelled_flag) *req->cancelled_flag = true;
+        req->cancelled = true;
+        req->completed = false;
     }
-    delete req;
+
+    {
+        std::lock_guard<std::mutex> lk(g_pending_mu);
+        g_pending_pick_requests.push_back(req);
+    }
 }
 
 } // namespace
@@ -184,6 +229,8 @@ void pick_folder_dialog_async(const char *title,
     req->secondary_size = secondary_size;
     req->ready_flag     = ready_flag;
     req->cancelled_flag = cancelled_flag;
+    req->completed      = false;
+    req->cancelled      = false;
 
     const char *initial = NULL;
     if (default_path && default_path[0] != '\0')
@@ -193,7 +240,37 @@ void pick_folder_dialog_async(const char *title,
     else if (primary_out[0] != '\0')
         initial = primary_out;
 
-    jce_host_dialog_pick_folder(title, initial, folder_pick_callback, req);
+    jce_host_dialog_pick_folder(title, initial,
+                                folder_pick_callback_thread_safe, req);
+}
+
+void jce_editor_dialogs_pump_pending(void)
+{
+    /* Move pending requests under the lock, then process outside the lock
+       to keep critical section minimal. */
+    std::vector<FolderPickRequest *> pending;
+    {
+        std::lock_guard<std::mutex> lk(g_pending_mu);
+        if (g_pending_pick_requests.empty()) return;
+        pending.swap(g_pending_pick_requests);
+    }
+
+    for (FolderPickRequest *req : pending) {
+        if (!req) continue;
+        if (req->completed && !req->path.empty()) {
+            const char *p = req->path.c_str();
+            if (req->primary && req->primary_size > 0)
+                snprintf(req->primary, req->primary_size, "%s", p);
+            if (req->secondary && req->secondary_size > 0)
+                snprintf(req->secondary, req->secondary_size, "%s", p);
+            snprintf(s_last_browse_folder, sizeof(s_last_browse_folder),
+                     "%s", p);
+            if (req->ready_flag)     *req->ready_flag     = true;
+        } else {
+            if (req->cancelled_flag) *req->cancelled_flag = true;
+        }
+        delete req;
+    }
 }
 
 /* ======================================================================

@@ -214,7 +214,10 @@ public:
             ? jce_renderer_get_program_textured(renderer_)
             : jce_renderer_get_program(renderer_);
 
-        if (!layout || prog.idx == UINT16_MAX) return;
+        if (!layout || prog.idx == UINT16_MAX) {
+            LOG_WARN(LOG_TAG, "RenderGeometry: no layout/prog (tex=%d)", (int)textured);
+            return;
+        }
 
         bgfx_transient_vertex_buffer_t tvb;
         bgfx_transient_index_buffer_t  tib;
@@ -330,7 +333,9 @@ public:
 
         const uint32_t width = (uint32_t)source_dimensions.x;
         const uint32_t height = (uint32_t)source_dimensions.y;
+        LOG_INFO(LOG_TAG, "GenerateTexture %ux%u", width, height);
         const bgfx_memory_t *mem = bgfx_alloc(width * height * 4);
+        if (!mem) { LOG_ERROR(LOG_TAG, "bgfx_alloc failed for %ux%u", width, height); return false; }
         memcpy(mem->data, source, width * height * 4);
 
         bgfx_texture_handle_t handle = bgfx_create_texture_2d(
@@ -511,18 +516,20 @@ void jce_rml_destroy(JceRmlBackend *b)
 {
     if (!b) return;
 
-    /* CRITICAL: Clear global interface pointers BEFORE shutdown to prevent
-     * dangling references in case engine is restarted. */
+    /* CRITICAL: Rml::Shutdown() walks every document and dispatches
+     * OnDetach() on each registered listener AND calls ReleaseTexture /
+     * ReleaseGeometry through the render interface to free GPU resources.
+     * The interfaces MUST remain set during Shutdown; clearing them first
+     * causes a null-pointer virtual-call crash inside Rml::Shutdown().
+     * Clear the global pointers AFTER Shutdown so they are not dangling
+     * if the engine is ever restarted.
+     * Also: keep JceRmlEventAdapter instances alive until AFTER Shutdown
+     * returns so the dispatcher never dereferences freed memory. */
+    Rml::Shutdown();
+
     Rml::SetSystemInterface(nullptr);
     Rml::SetRenderInterface(nullptr);
     Rml::SetFileInterface(nullptr);
-
-    /* CRITICAL: Rml::Shutdown() walks every document and dispatches
-     * OnDetach() on each registered listener. We must therefore keep
-     * JceRmlEventAdapter instances alive until AFTER Shutdown returns;
-     * otherwise the dispatcher dereferences freed memory (observed as
-     * ACCESS_VIOLATION inside Rml::EventDispatcher::DetachAllEvents). */
-    Rml::Shutdown();
 
     for (auto *adapter : b->event_adapters)
         delete adapter;
@@ -834,20 +841,27 @@ void jce_rml_process_pointer_input(JceRmlBackend *b, const JceInput *input)
     /* Mouse position. */
     float mx = 0, my = 0;
     jce_input_mouse_pos(input, &mx, &my);
-    b->context->ProcessMouseMove((int)mx, (int)my, 0);
+    try { b->context->ProcessMouseMove((int)mx, (int)my, 0); }
+    catch (...) { LOG_ERROR(LOG_TAG, "ProcessMouseMove threw"); return; }
 
     /* Mouse buttons (left=0, right=1, middle=2). */
     for (int btn = 0; btn < 3; btn++) {
-        if (jce_input_mouse_button_pressed(input, btn + 1))
-            b->context->ProcessMouseButtonDown(btn, 0);
-        if (jce_input_mouse_button_released(input, btn + 1))
-            b->context->ProcessMouseButtonUp(btn, 0);
+        if (jce_input_mouse_button_pressed(input, btn + 1)) {
+            try { b->context->ProcessMouseButtonDown(btn, 0); }
+            catch (...) { LOG_ERROR(LOG_TAG, "ProcessMouseButtonDown threw"); }
+        }
+        if (jce_input_mouse_button_released(input, btn + 1)) {
+            try { b->context->ProcessMouseButtonUp(btn, 0); }
+            catch (...) { LOG_ERROR(LOG_TAG, "ProcessMouseButtonUp threw"); }
+        }
     }
 
     /* Mouse wheel. */
     float wheel = jce_input_mouse_wheel(input);
-    if (wheel != 0.0f)
-        b->context->ProcessMouseWheel(-wheel, 0);
+    if (wheel != 0.0f) {
+        try { b->context->ProcessMouseWheel(-wheel, 0); }
+        catch (...) { LOG_ERROR(LOG_TAG, "ProcessMouseWheel threw"); }
+    }
 }
 
 void jce_rml_process_input(JceRmlBackend *b, const JceInput *input)
@@ -887,13 +901,29 @@ void jce_rml_update(JceRmlBackend *b, float dt)
 {
     if (!b || !b->context) return;
     b->sys_interface->AccumulateTime((double)dt);
-    b->context->Update();
+    try {
+        b->context->Update();
+    } catch (const std::exception &e) {
+        LOG_ERROR(LOG_TAG, "Context::Update threw std::exception: %s", e.what());
+        return;
+    } catch (...) {
+        LOG_ERROR(LOG_TAG, "Context::Update threw unknown exception");
+        return;
+    }
 }
 
 void jce_rml_render(JceRmlBackend *b)
 {
     if (!b || !b->context) return;
-    b->context->Render();
+    try {
+        b->context->Render();
+    } catch (const std::exception &e) {
+        LOG_ERROR(LOG_TAG, "Context::Render threw std::exception: %s", e.what());
+        return;
+    } catch (...) {
+        LOG_ERROR(LOG_TAG, "Context::Render threw unknown exception");
+        return;
+    }
 }
 
 void jce_rml_resize(JceRmlBackend *b, uint32_t w, uint32_t h)

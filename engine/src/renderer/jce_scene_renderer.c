@@ -1541,11 +1541,15 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                 pbr.double_sided = mr_comp->double_sided;
             }
 
-            /* Editor SHADED mode: skip texture loading entirely (factors only).
-             * Runtime / TEXTURED: load all maps. */
-            bool load_tex =
-                !editor_mode ||
-                cfg->view_mode == JCE_SCENE_VIEW_TEXTURED;
+            /* Always load all texture maps in editor + runtime. The
+             * previous "factors-only in SHADED" optimisation made every
+             * baseColor=[1,1,1,1] material render full white because
+             * jce_pbr_material_bind() falls back to s_white_tex when no
+             * albedo handle is bound. We now keep textures loading in
+             * SHADED too, and any missing/in-flight albedo triggers the
+             * pink-black checker shader fallback below — never a flat
+             * white "loading" surface. */
+            bool load_tex = true;
 
             if (load_tex && mr_comp) {
                 if (mr_comp->albedo_tex[0]) {
@@ -1563,8 +1567,13 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                         mr_comp->mesh_path[0]     ? mr_comp->mesh_path     : NULL);
                     if (jce_texture_valid(t)) pbr.albedo_map = t;
                 }
-                /* TEXTURED mode + missing albedo → trigger pink-checker shader fallback. */
-                if (editor_mode && cfg->view_mode == JCE_SCENE_VIEW_TEXTURED &&
+                /* Editor + missing albedo (in-flight OR failed) → pink-black
+                 * checker shader fallback. Applies in BOTH SHADED and
+                 * TEXTURED so the editor never displays the white loading
+                 * texture while the async loader is resolving the asset. */
+                if (editor_mode &&
+                    (cfg->view_mode == JCE_SCENE_VIEW_SHADED ||
+                     cfg->view_mode == JCE_SCENE_VIEW_TEXTURED) &&
                     !jce_texture_valid(pbr.albedo_map)) {
                     use_checker_fallback = true;
                 }
@@ -2083,6 +2092,7 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
         }
     }
 
+    LOG_INFO(LOG_TAG, "[init] sky shader + uniforms");
     /* Sky vertex layout & shader. */
     bgfx_vertex_layout_begin(&sr->sky_layout, bgfx_get_renderer_type());
     bgfx_vertex_layout_add(&sr->sky_layout, BGFX_ATTRIB_POSITION, 3,
@@ -2107,6 +2117,7 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
     sr->u_light_color = bgfx_create_uniform("u_lightColor",
                                             BGFX_UNIFORM_TYPE_VEC4, 1);
 
+    LOG_INFO(LOG_TAG, "[init] procedural meshes");
     /* Procedural meshes. */
     sr->cube_mesh     = jce_mesh_create_cube(1.0f);
     sr->plane_mesh    = jce_mesh_create_plane(1.0f, 1.0f, 0);
@@ -2114,6 +2125,7 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
     sr->capsule_mesh  = jce_mesh_create_capsule(0.25f, 1.0f);
     sr->cylinder_mesh = jce_mesh_create_cylinder(0.5f, 1.0f);
 
+    LOG_INFO(LOG_TAG, "[init] fallback textures");
     /* 1×1 white fallback texture. */
     {
         uint32_t white = 0xFFFFFFFFu;
@@ -2136,6 +2148,7 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
                                                  BGFX_TEXTURE_FORMAT_RGBA8, 0, mem);
     }
 
+    LOG_INFO(LOG_TAG, "[init] shadow map (depth_fmt=%d)", (int)depth_fmt);
     /* Shadow map (legacy single-cascade). */
     {
         const uint16_t sz = sr->shadow_map_size;
@@ -2154,8 +2167,10 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
         sr->u_shadowVP  = bgfx_create_uniform("u_shadowVP",
                                               BGFX_UNIFORM_TYPE_MAT4, 1);
         sr->shadow_valid = BGFX_HANDLE_IS_VALID(sr->shadow_fbo);
+        LOG_INFO(LOG_TAG, "[init] shadow_valid=%d", (int)sr->shadow_valid);
     }
 
+    LOG_INFO(LOG_TAG, "[init] CSM cascades");
     /* CSM cascades. */
     {
         const uint16_t sz = sr->shadow_map_size;
@@ -2187,11 +2202,14 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
             BGFX_UNIFORM_TYPE_VEC4, 1);
         sr->u_csm_bias_scales = bgfx_create_uniform("u_csmBiasScales",
             BGFX_UNIFORM_TYPE_VEC4, 1);
+        LOG_INFO(LOG_TAG, "[init] csm_valid=%d", (int)sr->csm_valid);
     }
 
+    LOG_INFO(LOG_TAG, "[init] light env");
     /* Multi-light env. */
     sr->light_env = jce_light_env_create();
 
+    LOG_INFO(LOG_TAG, "[init] IBL uniforms + BRDF LUT");
     /* IBL uniforms + BRDF LUT. */
     sr->u_ibl_irradiance = bgfx_create_uniform("s_irradiance",
         BGFX_UNIFORM_TYPE_SAMPLER, 1);
@@ -2218,15 +2236,19 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
         BGFX_UNIFORM_TYPE_SAMPLER, 1);
     for (int ti = 0; ti < 16; ti++)
         sr->terrain_cache[ti].splat_tex.idx = UINT16_MAX;
+
+    LOG_INFO(LOG_TAG, "[init] BRDF LUT");
     {
         JceTexture brdf = jce_ibl_create_brdf_lut(256);
         sr->brdf_lut.idx = brdf.idx;
+        LOG_INFO(LOG_TAG, "[init] BRDF LUT done: idx=%u", (unsigned)brdf.idx);
     }
     sr->skybox = NULL;
     sr->ibl_data = NULL;
     sr->skybox_active = false;
     sr->skybox_hdr_path[0] = '\0';
 
+    LOG_INFO(LOG_TAG, "[init] sprite batch + postfx");
     /* Sprite batch. */
     sr->sprite_batch = jce_sprite_batch_create(256);
 
@@ -2237,6 +2259,7 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
             LOG_WARN(LOG_TAG, "postfx shaders failed to load");
     }
 
+    LOG_INFO(LOG_TAG, "[init] render queue");
     LOG_INFO(LOG_TAG, "scene renderer created");
     /* Phase 2: per-frame material registry for queue-based instancing.
      * Queue itself is created lazily on first use to keep the create
@@ -2246,6 +2269,32 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
     sr->frame_view_id = 0;
     sr->frame_shadow_vp_valid = false;
     return sr;
+}
+
+/* Public accessors so editors/tools can read the live animation state
+ * without keeping a second cache of their own. */
+struct JceAnimPlayer *jce_scene_renderer_get_anim_player(
+    JceSceneRenderer *sr, const char *skeleton_path)
+{
+    if (!sr || !skeleton_path || !skeleton_path[0]) return NULL;
+    for (int i = 0; i < SR_MODEL_CACHE_MAX; i++) {
+        SrModelCache *e = &sr->model_cache[i];
+        if (e->used && strcmp(e->path, skeleton_path) == 0)
+            return (struct JceAnimPlayer *)e->player;
+    }
+    return NULL;
+}
+
+struct JceModel *jce_scene_renderer_get_model(
+    JceSceneRenderer *sr, const char *skeleton_path)
+{
+    if (!sr || !skeleton_path || !skeleton_path[0]) return NULL;
+    for (int i = 0; i < SR_MODEL_CACHE_MAX; i++) {
+        SrModelCache *e = &sr->model_cache[i];
+        if (e->used && strcmp(e->path, skeleton_path) == 0)
+            return (struct JceModel *)e->model;
+    }
+    return NULL;
 }
 
 void jce_scene_renderer_destroy(JceSceneRenderer *sr)

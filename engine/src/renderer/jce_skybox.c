@@ -83,7 +83,7 @@ static float *load_hdr_pixels(const char *path,
     float *pixels = NULL;
 
     if (path) {
-        size_t fsize = 0;
+        uint64_t fsize = 0;
         unsigned char *fbuf = (unsigned char *)jce_fs_host_read_all(path, &fsize);
         if (!fbuf) { LOG_WARN(LOG_TAG, "failed to open HDR file: %s", path); return NULL; }
         if (fsize == 0) { JCE_FREE(fbuf); return NULL; }

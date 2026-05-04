@@ -68,7 +68,7 @@
          An example Java class can be found in README-android.md
     -->
     <application android:label="@string/app_name"
-        android:icon="@drawable/jce_m256"
+        android:icon="@drawable/ck_m256"
         android:allowBackup="true"
         android:theme="@style/AppTheme"
         android:enableOnBackInvokedCallback="false"

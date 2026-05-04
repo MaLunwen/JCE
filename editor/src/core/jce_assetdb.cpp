@@ -233,6 +233,11 @@ void jce_assetdb_rescan(void)
 
 int jce_assetdb_count(void) { return (int)db().entries.size(); }
 
+const char *jce_assetdb_get_root(void)
+{
+    return db().project_root.c_str();
+}
+
 const char *jce_assetdb_path_at(int idx)
 {
     DB &d = db();

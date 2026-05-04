@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 
 #include <jce/os/core/jce_str.h>
 
@@ -347,9 +348,25 @@ void jce_state_deselect_entity(uint32_t id)
 {
     for (int i = 0; i < s.selected_count; i++) {
         if (s.selected[i] == id) {
-            s.selected[i] = s.selected[--s.selected_count];
+            /* STABLE removal: shift the tail down by one slot rather
+             * than the swap-with-last trick. The previous code did
+             *   s.selected[i] = s.selected[--s.selected_count];
+             * which silently reordered the selection — visible to the
+             * user as the "last" entity flickering into the slot of the
+             * one they just deselected, because hierarchy/inspector and
+             * outline rendering walk the selection array in index order.
+             * Preserving order keeps the focused/last/primary entity
+             * stable across deselect operations. */
+            int tail = s.selected_count - i - 1;
+            if (tail > 0) {
+                memmove(&s.selected[i], &s.selected[i + 1],
+                        (size_t)tail * sizeof(s.selected[0]));
+            }
+            s.selected_count--;
             if (s.focused == id)
-                s.focused = s.selected_count > 0 ? s.selected[0] : 0;
+                s.focused = s.selected_count > 0
+                    ? s.selected[s.selected_count - 1] /* fall back to new last (most recent) */
+                    : 0;
             return;
         }
     }
@@ -369,6 +386,17 @@ bool jce_state_is_selected(uint32_t id)
 }
 
 uint32_t jce_state_get_focused(void) { return s.focused; }
+
+void jce_state_set_focused(uint32_t id)
+{
+    /* Re-focus inside an existing multi-selection without disturbing
+     * insertion order. Callers (e.g. inspector multi-select detail rows)
+     * previously did deselect+select(true) which moved the clicked entry
+     * to the tail of the array — visible to the user as the clicked row
+     * and the bottom row swapping places. */
+    if (id != 0 && !jce_state_is_selected(id)) return;
+    s.focused = id;
+}
 
 const uint32_t *jce_state_get_selection(int *out_count)
 {

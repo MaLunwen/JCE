@@ -15,6 +15,7 @@
 #include "os/core/jce_memory.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <string.h>
 
 #define LOG_TAG "game_hud"

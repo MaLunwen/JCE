@@ -11,6 +11,7 @@
 #include "scene/jce_editor_scene_asset_cache.h"
 #include "core/jce_hotkeys.h"
 #include "core/jce_editor_config.h"
+#include <jce/os/core/jce_filesystem.h>
 
 extern "C" {
 #include <jce/renderer/jce_pbr_material.h>
@@ -205,18 +206,30 @@ static bool setup_scene_viewport(SceneViewCtx *ctx)
 
 /* ── Asset drag-and-drop into the viewport ───────────────────────── */
 
+/* Lowercase a path's extension into a small buffer (incl. leading dot). */
+static void copy_ext_lower(const char *path, char *out, size_t out_size)
+{
+    if (!out || out_size == 0) return;
+    out[0] = '\0';
+    if (!path) return;
+    const char *ext = strrchr(path, '.');
+    if (!ext) return;
+    size_t i = 0;
+    for (const char *p = ext; *p && i + 1 < out_size; ++p, ++i)
+        out[i] = (char)tolower((unsigned char)*p);
+    out[i] = '\0';
+}
+
 /* Returns true if the extension matches a supported 3-D mesh format. */
 static bool is_mesh_asset(const char *path)
 {
-    const char *ext = strrchr(path, '.');
-    if (!ext) return false;
+    char ext[16];
+    copy_ext_lower(path, ext, sizeof(ext));
+    if (ext[0] == '\0') return false;
     static const char *const mesh_exts[] = {
-        ".fbx", ".FBX",
-        ".glb", ".GLB",
-        ".gltf", ".GLTF",
-        ".obj", ".OBJ",
-        ".mesh", ".MESH",
-        ".dae", ".DAE",
+        ".fbx", ".glb", ".gltf", ".obj", ".mesh", ".dae",
+        ".stl", ".ply", ".usd", ".usdc", ".usdz",
+        ".3ds", ".blend",
         NULL
     };
     for (int i = 0; mesh_exts[i]; i++) {
@@ -229,21 +242,27 @@ static bool is_mesh_asset(const char *path)
 /* Returns true if the extension matches a supported texture/material format. */
 static bool is_texture_or_material_asset(const char *path)
 {
-    const char *ext = strrchr(path, '.');
-    if (!ext) return false;
-    /* Check for .mat.json (compound extension). */
-    const char *dot2 = ext - 1;
-    while (dot2 > path && *dot2 != '.' && *dot2 != '/' && *dot2 != '\\')
-        dot2--;
-    if (*dot2 == '.') {
-        size_t len = strlen(dot2);
-        if (len == 9 && strncmp(dot2, ".mat.json", 9) == 0)
-            return true;
+    if (!path) return false;
+    /* Check for compound .mat.json extension (case-insensitive). */
+    size_t plen = strlen(path);
+    if (plen >= 9) {
+        const char *tail = path + plen - 9;
+        bool mat_json = true;
+        const char *expect = ".mat.json";
+        for (int i = 0; i < 9 && mat_json; i++) {
+            if ((char)tolower((unsigned char)tail[i]) != expect[i])
+                mat_json = false;
+        }
+        if (mat_json) return true;
     }
+    char ext[16];
+    copy_ext_lower(path, ext, sizeof(ext));
+    if (ext[0] == '\0') return false;
     static const char *const tex_exts[] = {
-        ".png", ".PNG", ".jpg", ".JPG", ".jpeg", ".JPEG",
-        ".tga", ".TGA", ".bmp", ".BMP",
-        ".dds", ".DDS", ".ktx", ".KTX",
+        ".png", ".jpg", ".jpeg", ".jfif",
+        ".tga", ".bmp", ".dds", ".ktx", ".ktx2",
+        ".tif", ".tiff", ".gif", ".webp", ".psd",
+        ".hdr", ".exr",
         NULL
     };
     for (int i = 0; tex_exts[i]; i++) {
@@ -256,10 +275,9 @@ static bool is_texture_or_material_asset(const char *path)
 /* Returns true if the file is an HDR environment map. */
 static bool is_hdr_asset(const char *path)
 {
-    const char *ext = strrchr(path, '.');
-    if (!ext) return false;
-    return (strcmp(ext, ".hdr") == 0 || strcmp(ext, ".HDR") == 0 ||
-            strcmp(ext, ".exr") == 0 || strcmp(ext, ".EXR") == 0);
+    char ext[16];
+    copy_ext_lower(path, ext, sizeof(ext));
+    return (strcmp(ext, ".hdr") == 0 || strcmp(ext, ".exr") == 0);
 }
 
 static JceMeshRenderer *find_mesh_renderer_component(uint32_t entity_id)
@@ -565,7 +583,15 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail)
             ImGui::AcceptDragDropPayload("JCE_ASSET_PATH",
                                          ImGuiDragDropFlags_AcceptPeekOnly)) {
         const char *asset_path = (const char *)peek->Data;
-        if (is_mesh_asset(asset_path)) {
+        /* HDR must be checked BEFORE the generic texture branch because
+         * is_texture_or_material_asset() also matches *.hdr — without
+         * this ordering an HDR drop on empty viewport would fall into
+         * the texture branch and silently no-op. */
+        if (is_hdr_asset(asset_path)) {
+            /* HDR environment map: no ghost, just clear state. */
+            jce_editor_scene_clear_ghost();
+            jce_editor_scene_clear_hover_entity();
+        } else if (is_mesh_asset(asset_path)) {
             /* Mesh drag: ghost preview on ground plane, or highlight
              * entity if the cursor is over one (mesh-on-entity = replace). */
             uint32_t hit_id = pick_entity_at_mouse(screen_pos, avail);
@@ -585,10 +611,6 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail)
             if (!entity_accepts_mesh_material_drop(hit_id))
                 hit_id = 0;
             jce_editor_scene_set_hover_entity(hit_id);
-        } else if (is_hdr_asset(asset_path)) {
-            /* HDR environment map: no ghost, just clear state. */
-            jce_editor_scene_clear_ghost();
-            jce_editor_scene_clear_hover_entity();
         } else {
             jce_editor_scene_clear_ghost();
             jce_editor_scene_clear_hover_entity();
@@ -603,10 +625,78 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail)
         jce_editor_scene_clear_ghost();
         jce_editor_scene_clear_hover_entity();
 
+        /* Surface a warning early if the file does not exist on disk —
+         * this is the most common silent-failure cause when dragging from
+         * a stale asset browser cache or a path that contains characters
+         * the host filesystem rejects. */
+        if (asset_path && asset_path[0] != '\0'
+            && !jce_fs_host_exists_file(asset_path)) {
+            jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+                "Dropped asset path does not exist on disk: '%s' "
+                "(check the asset browser, working directory, or that "
+                "the file was not moved/renamed).",
+                asset_path);
+        }
+
+        /* ── HDR dropped: set as skybox (checked first so that HDR
+         *    files do not get caught by the generic texture branch
+         *    below — is_texture_or_material_asset() also matches .hdr) */
+        if (is_hdr_asset(asset_path)) {
+            if (!jce_fs_host_exists_file(asset_path)) {
+                jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+                    "HDR file not found, cannot apply skybox: %s", asset_path);
+            } else {
+            JceScene *scene = jce_state_get_scene();
+            uint32_t sky_id = 0;
+            int ent_count = jce_state_get_entity_count();
+            for (int ei = 0; ei < ent_count; ei++) {
+                uint32_t eid = jce_state_get_entity_id_by_index(ei);
+                if (eid == 0 || !jce_state_entity_exists(eid)) continue;
+                if (scene && jce_scene_has_skybox(scene, (JceEntity)eid)) {
+                    sky_id = eid;
+                    break;
+                }
+            }
+
+            jce_state_begin_batch_edit();
+            if (!sky_id) {
+                sky_id = jce_state_create_entity("Skybox", 0);
+                if (sky_id)
+                    jce_state_add_component(sky_id, JCE_COMP_FLAG_SKYBOX);
+            }
+            if (sky_id) {
+                scene = jce_state_get_scene();
+                JceSkyboxComponent *sky = scene
+                    ? jce_scene_get_skybox(scene, (JceEntity)sky_id)
+                    : NULL;
+                if (sky) {
+                    snprintf(sky->hdr_path, sizeof(sky->hdr_path),
+                             "%s", asset_path);
+                    if (sky->exposure <= 0.0f)
+                        sky->exposure = 1.0f;
+                }
+                jce_state_select_entity(sky_id, false);
+                jce_editor_inspector_request_sync();
+                jce_editor_layout_request_focus_inspector();
+                jce_editor_console_log(
+                    "Applied HDR skybox: %s", asset_path);
+            }
+            jce_state_end_batch_edit();
+            }
+        }
         /* ── Texture / material dropped onto an entity ──────────── */
-        if (is_texture_or_material_asset(asset_path)) {
+        else if (is_texture_or_material_asset(asset_path)) {
             uint32_t hit_id = pick_entity_at_mouse(screen_pos, avail);
             JceMeshRenderer *mesh_renderer_comp = find_mesh_renderer_component(hit_id);
+            if (!mesh_renderer_comp) {
+                /* No target — give the user explicit feedback instead
+                 * of silently doing nothing. */
+                jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+                    "Texture '%s' was dropped on empty space — drop it "
+                    "onto a mesh entity to assign it as a material slot, "
+                    "or use an HDR (.hdr/.exr) file to set the skybox.",
+                    asset_path);
+            }
             if (mesh_renderer_comp) {
                 bool is_mat_json = false;
                 size_t path_len = strlen(asset_path);
@@ -742,6 +832,9 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail)
                             mr->normal_tex[0] = '\0';
                             mr->ao_tex[0] = '\0';
                             mr->emissive_tex[0] = '\0';
+                            jce_editor_console_log_level(JCE_CONSOLE_INFO,
+                                "[drop-diag] new entity mesh_path='%s' exists=%d",
+                                mr->mesh_path, (int)jce_fs_host_exists_file(mr->mesh_path));
                         }
                     }
 
@@ -757,45 +850,9 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail)
                 jce_state_end_transient_edit();
             }
         }
-        /* ── HDR dropped: set as skybox ────────────────────────────── */
-        else if (is_hdr_asset(asset_path)) {
-            /* Find existing entity with Skybox component, or create one. */
-            JceScene *scene = jce_state_get_scene();
-            uint32_t sky_id = 0;
-            int ent_count = jce_state_get_entity_count();
-            for (int ei = 0; ei < ent_count; ei++) {
-                uint32_t eid = jce_state_get_entity_id_by_index(ei);
-                if (eid == 0 || !jce_state_entity_exists(eid)) continue;
-                if (scene && jce_scene_has_skybox(scene, (JceEntity)eid)) {
-                    sky_id = eid;
-                    break;
-                }
-            }
-
-            jce_state_begin_batch_edit();
-            if (!sky_id) {
-                sky_id = jce_state_create_entity("Skybox", 0);
-                if (sky_id)
-                    jce_state_add_component(sky_id, JCE_COMP_FLAG_SKYBOX);
-            }
-            if (sky_id) {
-                scene = jce_state_get_scene();
-                JceSkyboxComponent *sky = scene
-                    ? jce_scene_get_skybox(scene, (JceEntity)sky_id)
-                    : NULL;
-                if (sky) {
-                    snprintf(sky->hdr_path, sizeof(sky->hdr_path),
-                             "%s", asset_path);
-                    if (sky->exposure <= 0.0f)
-                        sky->exposure = 1.0f;
-                }
-                jce_state_select_entity(sky_id, false);
-                jce_editor_inspector_request_sync();
-                jce_editor_layout_request_focus_inspector();
-                jce_editor_console_log(
-                    "Applied HDR skybox: %s", asset_path);
-            }
-            jce_state_end_batch_edit();
+        else {
+            jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+                "Unrecognized asset type for scene drop: %s", asset_path);
         }
     }
 

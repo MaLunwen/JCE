@@ -274,7 +274,7 @@ static bool file_exists_readable(const char *path)
 static void *read_font_file(const char *path, size_t *out_size)
 {
     if (!path || !*path) return NULL;
-    size_t n = 0;
+    uint64_t n = 0;
     void *raw = jce_fs_host_read_all(path, &n);
     if (!raw || n == 0) {
         if (raw) jce_free(raw);
@@ -282,11 +282,11 @@ static void *read_font_file(const char *path, size_t *out_size)
     }
     /* ImGui calls free() on FontDataOwnedByAtlas, so copy into a malloc
        buffer rather than handing out the engine-allocated block. */
-    void *buf = malloc(n);
+    void *buf = malloc((size_t)n);
     if (!buf) { jce_free(raw); return NULL; }
-    memcpy(buf, raw, n);
+    memcpy(buf, raw, (size_t)n);
     jce_free(raw);
-    if (out_size) *out_size = n;
+    if (out_size) *out_size = (size_t)n;
     return buf;
 }
 

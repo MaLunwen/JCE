@@ -351,6 +351,10 @@ _jce_add_layer(jce_application
 		bgfx::bgfx)
 
 if(JCE_BUILD_JNI)
+	# jce_jni_bridge.c lives in jce_platform (os/platform/) and is guarded by
+	# JCE_BUILD_JNI — both the definition and JNI headers must be on that target.
+	target_include_directories(jce_platform PRIVATE ${JNI_INCLUDE_DIRS})
+	target_compile_definitions(jce_platform PRIVATE JCE_BUILD_JNI=1)
 	target_include_directories(jce_application PRIVATE ${JNI_INCLUDE_DIRS})
 	target_compile_definitions(jce_application PRIVATE JCE_BUILD_JNI=1)
 endif()

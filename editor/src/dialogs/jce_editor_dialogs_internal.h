@@ -48,4 +48,10 @@ void pick_folder_dialog_async(const char *title,
                               bool *ready_flag,
                               bool *cancelled_flag);
 
+/* Drains pending folder-picker results from the host-dialog worker thread
+   and applies them to the caller-supplied output buffers on the MAIN
+   thread.  Must be called once per frame from the editor's main loop.
+   Cheap when the queue is empty (single mutex-guarded check). */
+void jce_editor_dialogs_pump_pending(void);
+
 #endif /* JCE_EDITOR_DIALOGS_INTERNAL_H */

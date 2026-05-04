@@ -203,6 +203,7 @@ CkApp *ck_app_create(const JceServices *svc)
     if (!app) return NULL;
     app->svc = *svc;
 
+    LOG_INFO("ck_app", "[init] step 1: audio");
     /* Load sounds. */
     if (app->svc.audio) {
         app->snd_bounce = jce_audio_load(app->svc.audio, app->svc.pak,
@@ -216,6 +217,7 @@ CkApp *ck_app_create(const JceServices *svc)
         }
     }
 
+    LOG_INFO("ck_app", "[init] step 2: textures");
     /* Load textures via asset manager. */
     if (app->svc.assets) {
         app->h_tex_demo = jce_asset_load(app->svc.assets,
@@ -226,12 +228,16 @@ CkApp *ck_app_create(const JceServices *svc)
         app->tex_demo = jce_texture_load(app->svc.pak, "textures/texture.jpg");
     }
 
+    LOG_INFO("ck_app", "[init] step 3: i18n");
     /* Load i18n translations from PAK before opening fonts (defensive ordering). */
     jce_i18n_init(app->svc.pak);
 
+    LOG_INFO("ck_app", "[init] step 4: font_main");
     /* Load demo font (32pt, must run on main thread). */
     app->font_main = jce_font_open(app->svc.pak, "fonts/Caveat.ttf", 32.0f);
+    LOG_INFO("ck_app", "[init] step 4: font_main=%s", app->font_main ? "ok" : "NULL");
 
+    LOG_INFO("ck_app", "[init] step 5: font_i18n");
     /* Build CJK font atlas using i18n collected codepoints. */
     {
         uint32_t cps[256];
@@ -239,7 +245,9 @@ CkApp *ck_app_create(const JceServices *svc)
         app->font_i18n = jce_font_open_ex(app->svc.pak, "fonts/JCE.ttf",
                                            28.0f, cps, cp_count);
     }
+    LOG_INFO("ck_app", "[init] step 5: font_i18n=%s", app->font_i18n ? "ok" : "NULL");
 
+    LOG_INFO("ck_app", "[init] step 6: camera");
     /* 3D scene setup. */
     {
         JceCameraDesc cam_desc = {0};
@@ -253,6 +261,7 @@ CkApp *ck_app_create(const JceServices *svc)
     }
     app->cam_ctrl = jce_camctrl_create(app->camera, NULL);
 
+    LOG_INFO("ck_app", "[init] step 7: scene load");
     /* Create ECS scene and load entities from PAK-packed JSON via VFS.
        No programmatic fallback — ck must consume scene data, not build it. */
     app->scene = jce_scene_create();
@@ -267,10 +276,14 @@ CkApp *ck_app_create(const JceServices *svc)
         jce_fs_destroy(fs);
     }
 
+    LOG_INFO("ck_app", "[init] step 8: scene_renderer");
     /* Engine scene renderer (resolves textures/models from PAK). */
     app->scene_renderer = jce_scene_renderer_create(
         app->svc.renderer, app->svc.pak, NULL);
+    LOG_INFO("ck_app", "[init] step 8: scene_renderer=%s",
+             app->scene_renderer ? "ok" : "NULL");
 
+    LOG_INFO("ck_app", "[init] step 9: window icon");
     /* Set window icon from PAK. */
     {
         const JcePakAsset *icon = jce_pak_find(app->svc.pak, "CK_icon.png");
@@ -289,10 +302,12 @@ CkApp *ck_app_create(const JceServices *svc)
     }
 
     app->debug_hud = svc->config ? svc->config->debug_text : true;
-    app->timer = jce_timer_create(0.0);
 
+    LOG_INFO("ck_app", "[init] step 10: timer + sysinfo");
+    app->timer = jce_timer_create(0.0);
     jce_sysinfo_init(&app->sysinfo);
 
+    LOG_INFO("ck_app", "[init] step 11: touch HUD");
     /* Touch HUD: auto-create on native touch platforms. */
     {
         bool is_touch_platform = false;
@@ -313,9 +328,11 @@ CkApp *ck_app_create(const JceServices *svc)
         app->mouse_captured = true;
     }
 
+    LOG_INFO("ck_app", "[init] step 12: UI");
     /* Initialize RmlUI and load UI documents + engine panels. */
     ck_ui_init(app);
 
+    LOG_INFO("ck_app", "[init] step 13: font family + hud show");
     /* Set initial font family based on current language. */
     ck_update_font_family(app);
 
@@ -323,6 +340,7 @@ CkApp *ck_app_create(const JceServices *svc)
     if (app->debug_hud && app->engine_hud)
         jce_debug_hud_show(app->engine_hud);
 
+    LOG_INFO("ck_app", "[init] complete");
     return app;
 }
 
@@ -699,28 +717,42 @@ static void update_3d_scene(CkApp *app, float dt_ms)
 
 static void draw_3d_scene(CkApp *app, float dt_sec)
 {
-    /* Begin 3D frame. */
+    LOG_INFO("ck_draw", "begin_frame_3d");
     jce_renderer_begin_frame_3d(app->svc.renderer,
         app->svc.window, app->camera, JCE_VIEW_MAIN_3D);
 
-    /* Render the ECS scene via the engine scene renderer. */
+    LOG_INFO("ck_draw", "scene_renderer_render");
     JceSceneRenderConfig cfg = jce_scene_render_config_default();
     jce_scene_renderer_render(
         app->scene_renderer, app->scene, app->camera,
         JCE_VIEW_MAIN_3D, dt_sec, &cfg);
+    LOG_INFO("ck_draw", "scene_renderer_render done");
 }
 
 /* -- 2D overlay ---------------------------------------------------- */
 
 static void draw_2d_overlay(CkApp *app)
 {
-    /* Touch HUD overlay (on mobile / F9-toggled). */
+    LOG_INFO("ck_draw", "touch_hud_draw start hud=%p", (void*)app->touch_hud);
     jce_touch_hud_draw(app->touch_hud);
+    LOG_INFO("ck_draw", "touch_hud_draw done");
 }
+
+static int s_draw_frame_count = 0;
 
 static void ck_app_draw(CkApp *app)
 {
     if (!app) return;
+
+    int fc = ++s_draw_frame_count;
+    LOG_INFO("ck_draw", "frame=%d start", fc);
+
+#ifdef __ANDROID__
+    if (jce_renderer_is_egl_hung()) {
+        LOG_INFO("ck_draw", "frame=%d skipped (egl hung)", fc);
+        return;
+    }
+#endif
 
     if (jce_settings_is_open(app->engine_settings) || app->paused) {
         if (app->ui)
@@ -748,9 +780,14 @@ static void ck_app_draw(CkApp *app)
 
 void ck_app_update(CkApp *app)
 {
+    static int s_update_frame = 0;
+    int uf = ++s_update_frame;
+    LOG_INFO("ck_update", "frame=%d start", uf);
+
     JCE_PROFILE_ZONE_N("CkApp::Update");
     if (!app) { JCE_PROFILE_ZONE_END; return; }
 
+    LOG_INFO("ck_update", "frame=%d timer", uf);
     bool settings_open_before = jce_settings_is_open(app->engine_settings);
     jce_timer_tick(app->timer);
     float dt_ms = jce_timer_dt_ms(app->timer);
@@ -760,8 +797,10 @@ void ck_app_update(CkApp *app)
     record_frametime(app, dt_ms);
     update_sysinfo(app);
 
+    LOG_INFO("ck_update", "frame=%d input", uf);
     handle_input(app, dt_ms);
 
+    LOG_INFO("ck_update", "frame=%d hud", uf);
     /* Update RmlUI element data BEFORE Update() so layout is correct. */
     if (jce_settings_is_open(app->engine_settings)) {
         if (app->debug_hud)
@@ -776,13 +815,16 @@ void ck_app_update(CkApp *app)
             update_debug_hud(app, dt_ms);
     }
 
+    LOG_INFO("ck_update", "frame=%d ui_process_input", uf);
     /* Feed input to RmlUI, compute layout, then render. */
     if (app->ui) {
         if (jce_settings_is_open(app->engine_settings))
             jce_ui_process_pointer_input(app->ui, app->svc.input);
         else
             jce_ui_process_input(app->ui, app->svc.input);
+        LOG_INFO("ck_update", "frame=%d ui_update", uf);
         jce_ui_update(app->ui, dt_sec);
+        LOG_INFO("ck_update", "frame=%d ui_update done", uf);
     }
 
     if (settings_open_before &&
@@ -791,12 +833,14 @@ void ck_app_update(CkApp *app)
         jce_debug_hud_show(app->engine_hud);
     }
 
+    LOG_INFO("ck_update", "frame=%d scene3d", uf);
     if (!jce_settings_is_open(app->engine_settings) && !app->paused) {
         update_3d_scene(app, dt_ms);
         app->scene_render_dt_sec = dt_sec;
         app->scene_render_dt_fresh = true;
     }
 
+    LOG_INFO("ck_update", "frame=%d done", uf);
     JCE_PROFILE_ZONE_END;
 }
 

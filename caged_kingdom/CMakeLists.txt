@@ -43,7 +43,7 @@ else()
 	# ── iOS bundle properties ──
 	if(JCE_PLATFORM_IOS)
 		set(IOS_INFO_PLIST "${CMAKE_SOURCE_DIR}/scripts/macos/ios/Info.plist")
-		set(IOS_APP_ICON   "${CMAKE_SOURCE_DIR}/scripts/macos/ios/jce_i1024.png")
+		set(IOS_APP_ICON   "${CMAKE_SOURCE_DIR}/scripts/macos/ios/ck_i1024.png")
 		if(NOT EXISTS "${IOS_INFO_PLIST}")
 			message(FATAL_ERROR "Missing iOS Info.plist: ${IOS_INFO_PLIST}")
 		endif()
@@ -52,10 +52,10 @@ else()
 			MACOSX_BUNDLE TRUE
 			MACOSX_BUNDLE_INFO_PLIST "${IOS_INFO_PLIST}"
 			MACOSX_BUNDLE_BUNDLE_NAME "CagedKingdom"
-			MACOSX_BUNDLE_GUI_IDENTIFIER "com.caged_kingdom"
+			MACOSX_BUNDLE_GUI_IDENTIFIER "com.cagedKingdom"
 			MACOSX_BUNDLE_BUNDLE_VERSION "1.0"
 			MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0"
-			XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "com.caged_kingdom"
+			XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "com.cagedKingdom"
 			XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Automatic"
 			XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "4C98CBUY4F"
 			XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2")
@@ -88,7 +88,8 @@ target_include_directories(CagedKingdom PRIVATE
 # include ALL symbols from the JCE static archives — otherwise unreferenced JNI
 # entry points (Java_com_jce_JceRuntime_*) are silently discarded and Java gets
 # UnsatisfiedLinkError at runtime.
-# Android does NOT need WHOLE_ARCHIVE: SDL callbacks are referenced via main.c.
+# Android does not need WHOLE_ARCHIVE for most symbols, but SDL_main must be
+# force-included via -u because Java calls it via dlsym, not C code.
 #
 # We use platform-specific linker flags instead of CMake's LINK_LIBRARY feature
 # because transitive PUBLIC dependencies cause WHOLE_ARCHIVE/DEFAULT conflicts.
@@ -96,20 +97,38 @@ if(JCE_BUILD_JNI)
 	target_link_libraries(CagedKingdom PRIVATE JCE)
 	if(MSVC)
 		# MSVC: /WHOLEARCHIVE forces all .obj from each .lib to be included.
-		foreach(_lib jce_application jce_core)
+		# jce_platform must be included: jce_jni_bridge.c lives there.
+		foreach(_lib jce_application jce_platform jce_core)
 			target_link_options(CagedKingdom PRIVATE
 				"/WHOLEARCHIVE:$<TARGET_FILE:${_lib}>")
 		endforeach()
+	elseif(APPLE)
+		# macOS ld64 errors on duplicate symbols, unlike GNU ld which silently picks one.
+		# jce_core and jce_application share jce_config.c, so force-loading both causes
+		# duplicate '_jce_config_*' errors. Only jce_platform needs -force_load because
+		# jce_jni_bridge.c (Java_com_jce_JceRuntime_*) is unreferenced by C code and
+		# would otherwise be silently dropped. The other libs are pulled in via the
+		# normal target_link_libraries(CagedKingdom PRIVATE JCE) link above.
+		target_link_options(CagedKingdom PRIVATE
+			"-Wl,-force_load,$<TARGET_FILE:jce_platform>")
 	else()
-		# GCC / Clang: --whole-archive / --no-whole-archive bracket.
+		# GCC (Linux): --whole-archive / --no-whole-archive bracket.
+		# jce_platform must be included: jce_jni_bridge.c lives there.
 		target_link_options(CagedKingdom PRIVATE
 			"LINKER:--whole-archive"
 			"$<TARGET_FILE:jce_application>"
+			"$<TARGET_FILE:jce_platform>"
 			"$<TARGET_FILE:jce_core>"
 			"LINKER:--no-whole-archive")
 	endif()
 else()
 	target_link_libraries(CagedKingdom PRIVATE JCE)
+	# Android: SDL_main lives in jce_application but nothing in C references it
+	# (Java calls it via dlsym).  Force the linker to include the symbol so
+	# nativeRunMain() can find "SDL_main" in libJCE.so.
+	if(JCE_PLATFORM_ANDROID)
+		target_link_options(CagedKingdom PRIVATE "-Wl,-u,SDL_main")
+	endif()
 endif()
 
 # ------------------------------------------------------------------ #

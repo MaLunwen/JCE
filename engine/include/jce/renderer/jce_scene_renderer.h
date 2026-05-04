@@ -37,11 +37,36 @@ typedef struct JceLodGroup       JceLodGroup;
 
 /* ── Render configuration (passed per-frame) ──────────────────────── */
 
+/* Scene view mode (editor + runtime). The sign of u_normalScale.z in
+ * the PBR shader carries this value so a single fragment shader handles
+ * all four variants (see engine/shaders/pbr/fs_pbr.sc lines 329-339).
+ *
+ *   SHADED              — Textured + full PBR lighting (directional /
+ *                         point / spot lights, CSM shadows, IBL,
+ *                         AO, fog, post-fx). Default editor view; the
+ *                         "what the shipping build will look like"
+ *                         preview.
+ *   WIREFRAME           — Lines only, no fill, no lighting, no
+ *                         textures. Topology / mesh-density inspection.
+ *   TEXTURED            — Textured but UNLIT: shader emits the gamma-
+ *                         corrected raw albedo (`pow(albedo, 1/2.2)`)
+ *                         and returns before the lighting pipeline.
+ *                         Used to verify base-color textures and UVs
+ *                         independent of scene lighting / exposure.
+ *   WIREFRAME_TEXTURED  — Unlit textured fill + line overlay. Combined
+ *                         UV + topology check.
+ *
+ * Texture loading: ALL view modes load textures (including SHADED).
+ * If the albedo handle is invalid (in-flight async load OR resolution
+ * failed), the renderer flags `use_checker_fallback` so the shader
+ * substitutes a triplanar pink/black checker — never a flat white
+ * "loading" surface. See jce_scene_renderer.c around the
+ * `use_checker_fallback` block. */
 typedef enum {
-    JCE_SCENE_VIEW_SHADED = 0,
-    JCE_SCENE_VIEW_WIREFRAME,
-    JCE_SCENE_VIEW_TEXTURED,            /* unlit albedo-only (TODO) */
-    JCE_SCENE_VIEW_WIREFRAME_TEXTURED,
+    JCE_SCENE_VIEW_SHADED = 0,           /* textured + lit (full PBR) */
+    JCE_SCENE_VIEW_WIREFRAME,            /* lines only, unlit */
+    JCE_SCENE_VIEW_TEXTURED,             /* textured but UNLIT (raw albedo) */
+    JCE_SCENE_VIEW_WIREFRAME_TEXTURED,   /* unlit textured + line overlay */
 } JceSceneViewModeKind;
 
 /* Callback invoked between sky pass and entity pass. Editor uses this
@@ -110,6 +135,17 @@ typedef struct {
     JceTexture  (*load_texture)(const char *material_path,
                                 const char *mesh_path,
                                 void       *ud);
+    /* OPTIONAL. Returns true ONLY if a texture lookup has been attempted
+     * and is known to have permanently failed (asset missing, decode
+     * error, etc.). Returns false while the asset is still being
+     * resolved/loaded asynchronously. The renderer uses this to suppress
+     * the magenta/yellow "missing texture" checker during the brief
+     * in-flight window after a scene loads — without it, every textured
+     * entity briefly flashes white → pink-checker → final texture as
+     * each async load completes. */
+    bool        (*texture_failed)(const char *material_path,
+                                  const char *mesh_path,
+                                  void       *ud);
     void        *userdata;
 } JceSceneRendererCallbacks;
 
@@ -184,6 +220,22 @@ JCE_API void jce_scene_renderer_set_global_lod(JceSceneRenderer *sr,
  * Useful for building demo LOD groups without loading external assets. */
 JCE_API JceMesh *jce_scene_renderer_get_builtin_mesh(JceSceneRenderer *sr,
                                                      int shape);
+
+/* Forward decls for accessors below — full headers may not be in this TU. */
+struct JceAnimPlayer;
+struct JceModel;
+
+/* Look up the live JceAnimPlayer the renderer is driving for a given
+ * skeleton/model path.  Returns NULL if the model has not yet been seen
+ * by the renderer or if it has no skeletal animation.  Editors and tools
+ * use this to read the currently-playing time / state without keeping a
+ * second cache of their own (which would never advance). */
+JCE_API struct JceAnimPlayer *jce_scene_renderer_get_anim_player(
+    JceSceneRenderer *sr, const char *skeleton_path);
+
+/* Look up the JceModel cached by the renderer for a given path. */
+JCE_API struct JceModel *jce_scene_renderer_get_model(
+    JceSceneRenderer *sr, const char *skeleton_path);
 
 /* Per-frame LOD pick stats. picks[i] = number of entities drawn at level i. */
 typedef struct {

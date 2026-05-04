@@ -5,7 +5,7 @@
 #include <jce/renderer/jce_skeleton.h>
 #include <jce/os/core/jce_log.h>
 
-#include "../middleware/animation/jce_anim_ozz.h"
+#include "middleware/animation/jce_anim_ozz.h"
 #include "os/core/jce_memory.h"
 
 #include <string.h>

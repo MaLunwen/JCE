@@ -326,9 +326,20 @@ void main()
                * u_baseColorFactor.rgb;
     float alpha = texColor.a * u_baseColorFactor.a;
 
-    // --- View-mode override: TEXTURED / WIREFRAME_TEXTURED → unlit albedo ---
-    // u_normalScale.z carries view mode (0=shaded, 1=wireframe(no override),
-    // 2=textured/unlit, 3=wireframe+textured).
+    // --- View-mode dispatch ---------------------------------------------
+    // u_normalScale.z carries JceSceneViewModeKind:
+    //   0 SHADED              → fall through to full PBR lighting below
+    //   1 WIREFRAME           → handled by host (no fill); shader path
+    //                            is unused for plain-wireframe entities
+    //   2 TEXTURED            → unlit albedo-only: emit gamma-corrected
+    //                            raw albedo and return BEFORE lighting,
+    //                            so the user can inspect base-color
+    //                            textures / UVs independent of lights
+    //   3 WIREFRAME_TEXTURED  → same unlit-albedo branch (host overlays
+    //                            the wireframe pass)
+    // All view modes load textures; missing albedo is shown as the
+    // triplanar pink/black checker via useCheckerFallback above (never
+    // a flat white loading surface).
     float viewMode = u_normalScale.z;
     if (viewMode > 1.5)
     {

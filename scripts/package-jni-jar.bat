@@ -99,7 +99,7 @@ echo === Step 1: Conan install ===
 if exist "%TOOLCHAIN%" (
     echo   Toolchain exists, skipping. Use --clean to force.
 ) else (
-    conan install . -pr:h %PROFILE% -pr:b %PROFILE% -o "&:jce_jni=True" --output-folder=%CONAN_DIR% --build=missing
+    conan install . -pr:h %PROFILE% -pr:b %PROFILE% --output-folder=%CONAN_DIR% --build=missing
     if errorlevel 1 goto :error
 )
 
@@ -192,13 +192,34 @@ for /d %%D in ("%NATIVES_DIR%\*") do (
     )
 )
 
-:: Copy shared game_assets.pak (one copy for all platforms)
+:: Build universal PAK (all shader variants: dx11 + mtl + spv + glsl + ...)
+echo === Build universal PAK ===
+set "GAME_PAK="
+call :try_universal_pak
+echo.
+
+:: Copy shared game_assets.pak — prefer universal, fall back to platform-specific
 echo === Copy shared PAK ===
-set "GAME_PAK=%REPO_ROOT%\build\desktop\windows-x64\game_assets.pak"
-if not exist "%GAME_PAK%" set "GAME_PAK=%REPO_ROOT%\build\jni\desktop\game_assets.pak"
-if exist "%GAME_PAK%" (
+if not defined GAME_PAK (
+    :: Universal PAK not available; search for any pre-built PAK
+    for %%P in (
+        "%REPO_ROOT%\build\jni\desktop\release\game_assets.pak"
+        "%REPO_ROOT%\build\jni\desktop\game_assets.pak"
+        "%REPO_ROOT%\build\desktop\windows-x64\release\game_assets.pak"
+        "%REPO_ROOT%\build\desktop\windows-x64\game_assets.pak"
+        "%REPO_ROOT%\build\jni\macos-x64\release\game_assets.pak"
+        "%REPO_ROOT%\build\jni\macos-arm64\release\game_assets.pak"
+        "%REPO_ROOT%\build\jni\linux-x64\release\game_assets.pak"
+        "%REPO_ROOT%\build\jni\linux-arm64\release\game_assets.pak"
+        "%REPO_ROOT%\build\desktop\macos-x64\release\game_assets.pak"
+        "%REPO_ROOT%\build\desktop\linux-x64\release\game_assets.pak"
+    ) do (
+        if not defined GAME_PAK if exist %%P set "GAME_PAK=%%~P"
+    )
+)
+if defined GAME_PAK (
     copy /y "%GAME_PAK%" "%CLASSES_DIR%\game_assets.pak" >nul
-    echo   Packed: game_assets.pak [shared]
+    echo   Packed: game_assets.pak [from %GAME_PAK%]
 ) else (
     echo   WARNING: game_assets.pak not found, JAR will not include assets.
     echo   Build the game first to generate game_assets.pak.
@@ -219,6 +240,73 @@ echo   Run: %JAVA_DIR%\bin\java.exe -jar %FAT_JAR% 5
 popd
 call "%~dp0lib\jce_finish.bat" success
 exit /b 0
+
+::
+:: ================================================================
+:: Subroutine: build a universal PAK containing all shader variants
+:: (dx11 + mtl + spv + glsl + ...) so the fat JAR works on all
+:: desktop platforms without a platform-specific rebuild.
+::
+:: Sets GAME_PAK to the built PAK path on success.
+:: Leaves GAME_PAK unset on failure (caller falls back to pre-built).
+:: ================================================================
+:try_universal_pak
+set "_PAK_EXE="
+if exist "%REPO_ROOT%\build\jni\desktop\tools\jce_pak.exe" set "_PAK_EXE=%REPO_ROOT%\build\jni\desktop\tools\jce_pak.exe"
+if not defined _PAK_EXE if exist "%REPO_ROOT%\build\host\tools\jce_pak.exe" set "_PAK_EXE=%REPO_ROOT%\build\host\tools\jce_pak.exe"
+if not defined _PAK_EXE (
+    echo   jce_pak.exe not found - using pre-built PAK.
+    echo   Hint: run without --fat first to build jce_pak.exe.
+    goto :eof
+)
+
+:: Fetch Metal shaders from macOS (optional — failure is non-fatal)
+echo   Fetching Metal shaders from macOS...
+python "%REPO_ROOT%\scripts\sync_macos.py" --fetch-shaders >nul 2>&1
+if not errorlevel 1 (
+    echo   Metal shaders fetched.
+) else (
+    echo   WARNING: Metal shader fetch skipped (Mac offline or paramiko not installed).
+    echo   Copy *_mtl.bin shaders to engine\resources\assets\shaders\ for macOS Metal support.
+)
+
+:: Prepare icon staging directory (jce_pak needs the icon as a resource)
+set "_ICON_STAGE=%REPO_ROOT%\build\jni\desktop\_raw_game_icon"
+if not exist "%_ICON_STAGE%" mkdir "%_ICON_STAGE%"
+copy /y "%REPO_ROOT%\caged_kingdom\resources\CK_icon.png" "%_ICON_STAGE%\CK_icon.png" >nul 2>&1
+
+:: Output directory for the universal PAK
+set "_UNIV_DIR=%REPO_ROOT%\build\jni\universal"
+if not exist "%_UNIV_DIR%" mkdir "%_UNIV_DIR%"
+
+:: Build the PAK — no --exclude-suffix flags so every shader variant
+:: present on disk (dx11, mtl, spv, glsl, ...) is included.
+echo   Building universal PAK (all shader variants)...
+"%_PAK_EXE%" ^
+    --resource-dir "%REPO_ROOT%\engine\resources\assets" ^
+    --resource-dir "%REPO_ROOT%\engine\ui" ^
+    --resource-dir "%REPO_ROOT%\caged_kingdom\resources\assets" ^
+    --resource-dir "%REPO_ROOT%\caged_kingdom\ui" ^
+    --resource-dir "%_ICON_STAGE%" ^
+    --exclude-segment raw_assets ^
+    --level 19 ^
+    --pak-file      "%_UNIV_DIR%\game_assets.pak" ^
+    --header-file   "%_UNIV_DIR%\game_embedded_assets.h" ^
+    --manifest-file "%_UNIV_DIR%\_game_assets_manifest.cmake" ^
+    --obj-format    none
+if not errorlevel 1 (
+    echo   Universal PAK built: %_UNIV_DIR%\game_assets.pak
+    set "GAME_PAK=%_UNIV_DIR%\game_assets.pak"
+) else (
+    echo   WARNING: jce_pak exited with error.
+    if exist "%_UNIV_DIR%\game_assets.pak" (
+        echo   Reusing previously built universal PAK.
+        set "GAME_PAK=%_UNIV_DIR%\game_assets.pak"
+    ) else (
+        echo   No universal PAK available - will use platform-specific PAK.
+    )
+)
+goto :eof
 
 :error
 echo.

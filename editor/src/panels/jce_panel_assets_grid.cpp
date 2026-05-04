@@ -381,8 +381,11 @@ void draw_asset_grid_item(const FileEntry &fe, int index,
         want_ctx_popup = true;
     }
 
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
-        ImGui::SetTooltip("%s", fe.path.c_str());
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+        char rel[1024];
+        jce_editor_path_to_relative(rel, sizeof(rel), fe.path.c_str());
+        ImGui::SetTooltip("%s", rel[0] ? rel : fe.path.c_str());
+    }
 
     if (!fe.is_dir && ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
         const char *p = fe.path.c_str();
@@ -522,8 +525,11 @@ void draw_asset_details_list(const std::vector<FileEntry> &display_entries,
             want_ctx_popup = true;
         }
 
-        if (row_hovered && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
-            ImGui::SetTooltip("%s", fe.path.c_str());
+        if (row_hovered && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
+            char rel[1024];
+            jce_editor_path_to_relative(rel, sizeof(rel), fe.path.c_str());
+            ImGui::SetTooltip("%s", rel[0] ? rel : fe.path.c_str());
+        }
 
         if (row_hovered && !fe.is_dir
             && ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
