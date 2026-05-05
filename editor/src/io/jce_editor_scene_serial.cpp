@@ -10,6 +10,7 @@
 
 #include "jce_editor_file_util.h"
 #include "core/jce_editor_state_internal.h"
+#include "core/jce_editor_config.h"
 #include "ui/jce_editor_panels.h"
 
 extern "C" {
@@ -386,8 +387,18 @@ static void normalize_entity_paths_cb(JceScene *sc, JceEntity e, void *ud)
 static void normalize_all_scene_paths_to_relative(const char *scene_path)
 {
     if (!s.scene || !scene_path) return;
+    /* Relativize against the PROJECT ROOT, not the scene's parent dir.
+     * Scenes commonly live in subdirectories (.jce/, scenes/) while
+     * meshes/textures live under the project root sibling folders;
+     * relative-to-scene-dir would produce "../foo/..." which the path
+     * util rejects, leaking absolute paths into saved files. */
+    const char *project = jce_editor_assets_get_project();
     char base[512] = {0};
-    if (!jce_path_parent(base, sizeof(base), scene_path)) return;
+    if (project && project[0]) {
+        snprintf(base, sizeof(base), "%s", project);
+    } else if (!jce_path_parent(base, sizeof(base), scene_path)) {
+        return;
+    }
     RelSweepCtx ctx{ s.scene, base };
     jce_scene_each_entity(s.scene, normalize_entity_paths_cb, &ctx);
 }
@@ -413,6 +424,18 @@ bool jce_state_save_scene_file(const char *scene_path)
     update_scene_dir_from_path(scene_path);
     set_current_scene_path_internal(scene_path);
     s.scene_modified = false;
+
+    /* Persist as the most-recently used scene so the next editor launch
+     * can re-open it automatically. */
+    {
+        JceEditorConfig _ecfg;
+        if (jce_editor_config_load(&_ecfg)) {
+            snprintf(_ecfg.last_scene_path, sizeof(_ecfg.last_scene_path),
+                     "%s", scene_path);
+            jce_editor_config_add_recent_scene(&_ecfg, scene_path);
+            jce_editor_config_save(&_ecfg);
+        }
+    }
     LOG_INFO(LOG_TAG, "scene saved to %s (%d entities)",
              scene_path, (int)g_entity_order.size());
     return true;
@@ -444,6 +467,17 @@ bool jce_state_load_scene_file(const char *scene_path)
             update_scene_dir_from_path(scene_path);
             set_current_scene_path_internal(scene_path);
             repair_scene_asset_paths();
+            /* Persist as last-opened scene for next editor launch. */
+            {
+                JceEditorConfig _ecfg;
+                if (jce_editor_config_load(&_ecfg)) {
+                    snprintf(_ecfg.last_scene_path,
+                             sizeof(_ecfg.last_scene_path),
+                             "%s", scene_path);
+                    jce_editor_config_add_recent_scene(&_ecfg, scene_path);
+                    jce_editor_config_save(&_ecfg);
+                }
+            }
             LOG_INFO(LOG_TAG, "scene loaded from %s (%d entities)",
                      scene_path, (int)g_entity_order.size());
         } else {

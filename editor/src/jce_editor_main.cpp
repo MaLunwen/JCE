@@ -19,6 +19,7 @@ extern "C" {
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_timer.h>
+#include <jce/os/platform/jce_host_dialog.h>
 #include <jce/os/platform/jce_window.h>
 #include <jce/renderer/jce_postfx.h>
 #include <jce/renderer/jce_renderer.h>
@@ -31,6 +32,9 @@ extern "C" {
 #include "core/jce_run_manager.h"
 #include "dialogs/jce_editor_dialogs.h"
 #include "scene/jce_editor_scene_render.h"
+#include "scene/jce_editor_game_render.h"
+
+extern "C" void jce_editor_register_builtin_modules(void);
 #include "ui/jce_editor_layout.h"
 #include "ui/jce_editor_panels.h"
 
@@ -129,6 +133,17 @@ static bool editor_app_init(const JceServices *svc, void *ud)
     jce_renderer_present_splash(svc->renderer, svc->window, 0x1c1c1cff);
 
     jce_editor_scene_render_init(svc->renderer, svc->pak, svc->assets);
+    jce_editor_game_render_init(svc->renderer, svc->window);
+
+    /* Register editor built-in game modules (e.g. FPS Demo) so they
+     * appear in the Game View "Module" dropdown. */
+    jce_editor_register_builtin_modules();
+
+    /* Anchor native dialogs to our window so SDL3's IFileDialog has a
+       valid HWND owner.  Without this, SDL_ShowOpenFolderDialog can
+       crash on the worker thread (heap corruption inside SDL3). */
+    jce_host_dialog_set_parent_jce_window(svc->window);
+
     if (!jce_editor_init(svc->pak, svc->window))
         return false;
 
@@ -149,6 +164,9 @@ static bool editor_app_init(const JceServices *svc, void *ud)
 static void editor_app_exit(void *ud)
 {
     (void)ud;
+    /* Detach dialogs before tearing down the window. */
+    jce_host_dialog_set_parent_jce_window(NULL);
+    jce_editor_game_render_shutdown();
     jce_editor_scene_render_shutdown();
     jce_editor_shutdown();
 }

@@ -496,8 +496,22 @@ static bool sr_build_entity_model(JceSceneRenderer *sr, JceScene *scene,
                     strncpy(sr->terrain_cache[slot].path, tc->terrain_path,
                             sizeof sr->terrain_cache[slot].path - 1);
                     sr->terrain_cache[slot].used = true;
-                    JceTerrain *terr = jce_terrain_load_file(tc->terrain_path);
-                    if (!terr) { sr->terrain_cache[slot].failed = true; }
+                    /* Allow the host (editor / runtime) to map the
+                     * scene-JSON-relative path to something openable. */
+                    char        resolved[1024];
+                    const char *load_path = tc->terrain_path;
+                    if (sr->has_cbs && sr->cbs.resolve_path &&
+                        sr->cbs.resolve_path(tc->terrain_path,
+                                              resolved, (int)sizeof(resolved),
+                                              sr->cbs.userdata)) {
+                        load_path = resolved;
+                    }
+                    JceTerrain *terr = jce_terrain_load_file(load_path);
+                    if (!terr) { sr->terrain_cache[slot].failed = true;
+                        LOG_WARN(LOG_TAG,
+                                 "terrain load failed: '%s' (from '%s')",
+                                 load_path, tc->terrain_path);
+                    }
                     else {
                         sr->terrain_cache[slot].terrain = terr;
                         /* Combine all chunks into one mesh. */
@@ -578,8 +592,10 @@ static jce_vec3 sr_resolve_shadow_light_direction(JceSceneRenderer *sr,
 
     if (!scene) {
         if (sr && sr->tod_active) {
-            /* Lighting convention: shine direction (away from sun). */
-            return jce_v3_scale(sr->tod_state.sun_direction, -1.0f);
+            /* CSM expects to-light direction; tod_state.sun_direction is
+             * already the unit vector from origin TOWARD the sun, so
+             * return it as-is (do NOT negate). */
+            return sr->tod_state.sun_direction;
         }
         return fallback;
     }
@@ -596,7 +612,8 @@ static jce_vec3 sr_resolve_shadow_light_direction(JceSceneRenderer *sr,
         if (dl->casts_shadow) return dir;
     }
     if (!have_any && sr && sr->tod_active) {
-        return jce_v3_scale(sr->tod_state.sun_direction, -1.0f);
+        /* See comment above — sun_direction is already to-light. */
+        return sr->tod_state.sun_direction;
     }
     return have_any ? first_dir : fallback;
 }
@@ -832,17 +849,23 @@ static void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
         sr->shadow_far_cached = shadow_far_target;
         sr->shadow_far_valid = true;
     } else {
-        /* Smooth-track the shadow far plane every frame.  An earlier
-         * AND-hysteresis (>8 m AND >3%) caused the cached value to
-         * remain stale for many frames and then jump abruptly,
-         * snapping all 4 cascade splits at once and producing a
-         * visible flicker.  The texel-aligned snap inside jce_csm
-         * already provides per-cascade temporal stability, so a soft
-         * exponential smoothing here is enough to avoid hot-path
-         * recompute jitter without introducing a sudden step. */
-        float t = 0.25f;
-        sr->shadow_far_cached =
-            sr->shadow_far_cached + (shadow_far_target - sr->shadow_far_cached) * t;
+        /* Deadband + snap-to-target tracking.  Earlier code applied an
+         * exponential lerp every frame which meant the cached value
+         * micro-wobbled forever — that propagates into per-cascade radius
+         * and texel_size, breaking the texel-snap stability and producing
+         * the parallel-stripe shimmer the user reported.
+         *
+         * Strategy: only update when the target moves by >5% (or >2 m).
+         * On update, snap to a coarse 1 m bucket so the cached far moves
+         * in discrete steps.  This is what stabilises CSM during free
+         * camera movement (Unity's CullingResults.shadowDistance uses a
+         * similar coarse bucketing). */
+        float diff = fabsf(shadow_far_target - sr->shadow_far_cached);
+        float trigger = fmaxf(2.0f, sr->shadow_far_cached * 0.05f);
+        if (diff > trigger) {
+            float bucket = 1.0f;
+            sr->shadow_far_cached = ceilf(shadow_far_target / bucket) * bucket;
+        }
     }
     float shadow_far = sr->shadow_far_cached;
 
@@ -1885,6 +1908,15 @@ static void sr_bind_material_cb(uint32_t material_key, void *user)
     /* PBR textures + factor uniforms. */
     jce_pbr_material_bind(&e->pbr, sr->renderer, sr->frame_view_id);
 
+    /* Lighting uniforms (u_dirLights / u_pointLights / u_spotLights /
+     * u_lightCounts / u_ambientColor / u_cameraPos). bgfx clears uniform
+     * state after every submit, so we MUST re-apply the light env per
+     * material run — otherwise only the first submitted entity in the
+     * frame samples real lights and everything after renders unlit
+     * (the symptom users report as "shaded looks identical to textured"). */
+    if (sr->light_env)
+        jce_light_env_apply(sr->light_env, sr->renderer);
+
     /* Single-light shadow map. */
     if (sr->shadow_valid && !sr->shadow_use_csm && sr->frame_shadow_vp_valid) {
         bgfx_set_texture(5, sr->u_shadowMap, sr->shadow_tex, UINT32_MAX);
@@ -1958,6 +1990,9 @@ static void sr_inline_bind_pbr_global(JceSceneRenderer *sr,
                                       JceScene *scene, EntityList *list)
 {
     jce_pbr_material_bind(pbr, sr->renderer, view_id);
+    /* Re-apply lights per-entity — see sr_bind_material_cb for rationale. */
+    if (sr->light_env)
+        jce_light_env_apply(sr->light_env, sr->renderer);
     if (sr->shadow_valid && !sr->shadow_use_csm) {
         bgfx_set_texture(5, sr->u_shadowMap, sr->shadow_tex, UINT32_MAX);
         float shadow_vp[16];
@@ -2412,11 +2447,19 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
     if (sr->has_cbs && sr->cbs.load_texture)
         jce_renderer_set_wireframe(sr->renderer, false);
 
-    /* PBR view_mode shader branch was an experiment; the editor's TEXTURED
-     * mode actually wants PBR LIGHTING with textures (matching the old
-     * behavior), not unlit albedo. Pass 0 so the unlit branch stays
-     * dormant; texture loading is gated above instead. */
-    jce_pbr_material_set_view_mode(0);
+    /* Forward the editor's selected view mode to the PBR shader.
+     *   SHADED              → 0 (lit + textured)
+     *   WIREFRAME            → 1 (host fills the wireframe pass; shader
+     *                            still treated as shaded for the few
+     *                            entities that hit the PBR path)
+     *   TEXTURED             → 2 (unlit albedo only — raw base color)
+     *   WIREFRAME_TEXTURED   → 3 (unlit albedo + host wireframe overlay)
+     * Previously this was hard-coded to 0, which made TEXTURED look
+     * identical to SHADED. */
+    int sm = (int)cfg->view_mode;
+    if (sm < 0) sm = 0;
+    if (sm > 3) sm = 0;
+    jce_pbr_material_set_view_mode(sm);
 
     /* Push postfx params. */
     if (sr->postfx_pipeline)
@@ -2550,6 +2593,24 @@ JceMesh *jce_scene_renderer_get_builtin_mesh(JceSceneRenderer *sr, int shape)
     case 3: return sr->capsule_mesh;
     case 4: return sr->cylinder_mesh;
     default: return NULL;
+    }
+}
+
+void jce_scene_renderer_invalidate_terrain(JceSceneRenderer *sr,
+                                            const char *path)
+{
+    if (!sr) return;
+    for (int i = 0; i < 16; i++) {
+        if (!sr->terrain_cache[i].used) continue;
+        if (path && *path &&
+            strncmp(sr->terrain_cache[i].path, path,
+                    sizeof sr->terrain_cache[i].path) != 0)
+            continue;
+        if (sr->terrain_cache[i].mesh)    jce_mesh_destroy(sr->terrain_cache[i].mesh);
+        if (sr->terrain_cache[i].terrain) jce_terrain_free(sr->terrain_cache[i].terrain);
+        if (BGFX_HANDLE_IS_VALID(sr->terrain_cache[i].splat_tex))
+            bgfx_destroy_texture(sr->terrain_cache[i].splat_tex);
+        memset(&sr->terrain_cache[i], 0, sizeof sr->terrain_cache[i]);
     }
 }
 

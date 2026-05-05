@@ -23,6 +23,10 @@
 #include "core/jce_editor_i18n.h"
 #include "jce_editor_panels.h"
 #include "core/jce_editor_state.h"
+#include "core/jce_editor_config.h"
+extern "C" {
+#include <jce/os/core/jce_filesystem.h>
+}
 #include "core/jce_editor_toast.h"
 #include "core/jce_hotkeys.h"
 #include "scene/jce_editor_scene_render.h"
@@ -470,6 +474,59 @@ static void draw_menu_bar(void)
             s_show_new_scene = true;
         if (ImGui::MenuItem(jce_editor_i18n("menu.file.openScene"),   "Ctrl+O"))
             s_show_open_scene = true;
+        /* Recent Scenes submenu — fed from JceEditorConfig.recent_scene_paths.
+         * Missing files are grayed out (with a (missing) suffix) and clicking
+         * them removes them from the list. */
+        {
+            JceEditorConfig _ecfg;
+            (void)jce_editor_config_load(&_ecfg);
+            bool has_any = (_ecfg.recent_scene_count > 0);
+            if (ImGui::BeginMenu("Open Recent Scene", has_any)) {
+                int remove_idx = -1;
+                for (int i = 0; i < _ecfg.recent_scene_count; i++) {
+                    const char *p = _ecfg.recent_scene_paths[i];
+                    if (!p || !p[0]) continue;
+                    bool exists = jce_fs_host_exists_file(p);
+                    char label[600];
+                    if (exists) {
+                        snprintf(label, sizeof(label), "%s", p);
+                    } else {
+                        snprintf(label, sizeof(label), "%s (missing)", p);
+                    }
+                    if (!exists) ImGui::BeginDisabled(true);
+                    if (ImGui::MenuItem(label)) {
+                        if (!jce_state_load_scene_file(p)) {
+                            remove_idx = i;
+                        }
+                    }
+                    if (!exists) {
+                        ImGui::EndDisabled();
+                        /* Right-click to purge missing entries. */
+                        if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right))
+                            remove_idx = i;
+                    }
+                }
+                if (remove_idx >= 0) {
+                    for (int j = remove_idx; j < _ecfg.recent_scene_count - 1; j++) {
+                        strncpy(_ecfg.recent_scene_paths[j],
+                                _ecfg.recent_scene_paths[j + 1],
+                                sizeof(_ecfg.recent_scene_paths[j]) - 1);
+                        _ecfg.recent_scene_paths[j][sizeof(_ecfg.recent_scene_paths[j]) - 1] = '\0';
+                    }
+                    _ecfg.recent_scene_count--;
+                    if (_ecfg.recent_scene_count >= 0 && _ecfg.recent_scene_count < 10)
+                        _ecfg.recent_scene_paths[_ecfg.recent_scene_count][0] = '\0';
+                    jce_editor_config_save(&_ecfg);
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Clear Recent")) {
+                    _ecfg.recent_scene_count = 0;
+                    for (int i = 0; i < 10; i++) _ecfg.recent_scene_paths[i][0] = '\0';
+                    jce_editor_config_save(&_ecfg);
+                }
+                ImGui::EndMenu();
+            }
+        }
         if (ImGui::MenuItem(jce_editor_i18n("menu.file.saveScene"),   "Ctrl+S"))
             save_scene_or_open_save_as();
         if (ImGui::MenuItem(jce_editor_i18n("menu.file.saveAs"),   "Ctrl+Shift+S"))

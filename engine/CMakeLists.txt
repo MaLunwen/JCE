@@ -337,7 +337,7 @@ _jce_add_layer(jce_resource
 # L5 — Application orchestrator                                       #
 # ================================================================== #
 
-set(_APP_DIRS application)
+set(_APP_DIRS application runtime)
 
 _jce_add_layer(jce_application
 	DIRS      ${_APP_DIRS}
@@ -347,6 +347,7 @@ _jce_add_layer(jce_application
 		jce_renderer
 		jce_audio
 		jce_resource
+		jce_scene
 	LINK_PRIVATE
 		bgfx::bgfx)
 

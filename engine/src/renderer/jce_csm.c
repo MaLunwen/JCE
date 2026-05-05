@@ -105,39 +105,46 @@ void jce_csm_compute(JceCsmData *out,
             float d = jce_v3_len(jce_v3_sub(corners[i], center));
             if (d > radius) radius = d;
         }
-        /* Quantize radius to a single texel step so the bounding sphere
-         * grows in atomic shadow-texel increments.  Combined with the
-         * texel-aligned snap below this is sufficient to eliminate
-         * shimmer during camera rotation and small frustum changes.
-         * Earlier code over-quantized (4 texel + 0.25 m bucket) which
-         * fought against the snap and produced visible cascade jumps. */
-        {
-            float texel_approx = (radius * 2.0f) / (float)shadow_map_size;
-            if (texel_approx > 0.0f)
-                radius = ceilf(radius / texel_approx) * texel_approx;
-        }
+        /* Quantize radius to a stable absolute step independent of the
+         * radius itself.  Earlier "scale by fraction of radius" was an
+         * algebraic identity (ceil(r / (r/k)) * (r/k) == r) and provided
+         * NO stabilisation.  Use a fixed 0.5 m bucket: small enough to
+         * keep cascade-0 tight (radius ~9 m → 18 buckets) and large
+         * enough to absorb single-frame fov/aspect/split float jitter so
+         * that texel_size below stays bit-exact across frames during
+         * pure camera rotation. */
+        radius = ceilf(radius * 2.0f) * 0.5f;
 
-        /* Light view matrix: look from center along light direction. */
-        jce_vec3 light_pos = jce_v3_add(center, jce_v3_scale(ld, radius));
-        jce_vec3 up = (fabsf(ld.y) > 0.99f) ? jce_v3(0, 0, 1) : jce_v3(0, 1, 0);
-        jce_mat4 light_view = jce_m4_look_at(light_pos, center, up);
+        /* Build a stable light-space basis whose orientation depends ONLY on
+         * the light direction (not on camera state).  This guarantees the
+         * shadow-map texel grid is anchored to a fixed world frame, so when
+         * the camera rotates the cascade center snaps to the same texels
+         * every frame and shadows stop shimmering. */
+        jce_vec3 up_ref = (fabsf(ld.y) > 0.99f) ? jce_v3(0, 0, 1) : jce_v3(0, 1, 0);
+        jce_vec3 right_ws = jce_v3_normalize(jce_v3_cross(ld, up_ref));
+        jce_vec3 up_ws    = jce_v3_normalize(jce_v3_cross(right_ws, ld));
 
-        /* Snap the cascade center in light space to shadow texels to keep the
-         * projection stable during camera panning and small zoom changes. */
-        jce_vec4 center_ls4 = jce_m4_mul_v4(&light_view, jce_v4(center.x, center.y, center.z, 1.0f));
+        /* Snap cascade center onto the world-anchored light-space texel grid.
+         * Snap ALL THREE light-space axes (Unity / Frostbite practice) — the
+         * z-axis snap matters because the shadow map's depth quantization
+         * (24-bit) sees a continuously sliding origin otherwise, which
+         * appears as flickering depth comparisons across frames. */
         float map_size = shadow_map_size > 0 ? (float)shadow_map_size : 2048.0f;
         float texel_size = (radius * 2.0f) / map_size;
         if (texel_size > 0.0f) {
-            center_ls4.x = floorf(center_ls4.x / texel_size + 0.5f) * texel_size;
-            center_ls4.y = floorf(center_ls4.y / texel_size + 0.5f) * texel_size;
+            float cx = jce_v3_dot(center, right_ws);
+            float cy = jce_v3_dot(center, up_ws);
+            float cz = jce_v3_dot(center, ld);
+            cx = floorf(cx / texel_size + 0.5f) * texel_size;
+            cy = floorf(cy / texel_size + 0.5f) * texel_size;
+            cz = floorf(cz / texel_size + 0.5f) * texel_size;
+            center = jce_v3_add(jce_v3_add(jce_v3_scale(right_ws, cx),
+                                           jce_v3_scale(up_ws,    cy)),
+                                jce_v3_scale(ld, cz));
         }
-        jce_mat4 inv_light_view = jce_m4_inverse(&light_view);
-        jce_vec4 snapped_center_ws4 = jce_m4_mul_v4(&inv_light_view, center_ls4);
-        jce_vec3 snapped_center = jce_v3(snapped_center_ws4.x,
-                                         snapped_center_ws4.y,
-                                         snapped_center_ws4.z);
-        light_pos = jce_v3_add(snapped_center, jce_v3_scale(ld, radius));
-        light_view = jce_m4_look_at(light_pos, snapped_center, up);
+
+        jce_vec3 light_pos  = jce_v3_add(center, jce_v3_scale(ld, radius));
+        jce_mat4 light_view = jce_m4_look_at(light_pos, center, up_ws);
 
         /* Ortho projection around bounding sphere with Z padding for
          * world-space normal-offset bias applied in the fragment shader. */

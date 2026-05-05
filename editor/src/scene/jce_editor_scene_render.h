@@ -122,6 +122,12 @@ void jce_editor_scene_reset_anim_timer(void);
 typedef struct JceSceneRenderer JceSceneRenderer;
 JceSceneRenderer *jce_editor_get_scene_renderer(void);
 
+/* Resolve a scene-relative or assetdb-relative asset path to an absolute
+ * disk path the host filesystem can open.  Tries (in order): the input
+ * as-is, assetdb root + input, and a 5-level walk-up from the current
+ * scene file's directory.  Returns true and fills `out` on success. */
+bool jce_editor_resolve_asset_path(const char *in, char *out, int outsz);
+
 /* Access the world streamer (open-world chunk I/O + scene entity lifecycle).
  * Returns NULL if not initialized (e.g. before first frame). */
 typedef struct JceWorldStreamer JceWorldStreamer;

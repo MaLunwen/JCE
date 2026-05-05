@@ -8,15 +8,20 @@
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_state.h"
 #include "core/jce_run_manager.h"
+#include "scene/jce_editor_game_render.h"
 
 extern "C" {
 #include <jce/os/core/jce_defs.h>
 #include <jce/os/platform/jce_host_dialog.h>
+#include <jce/renderer/jce_camera.h>
+#include <jce/renderer/jce_renderer.h>
+#include <jce/runtime/jce_game_module.h>
 }
 
 #include <jce/tools/jce_imgui.hpp>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 /* Renderer backend list comes from jce_editor_panels.cpp via the
    editor's public accessor (populated lazily from
@@ -112,6 +117,32 @@ void jce_editor_panel_game_view_content(void)
     if (external_running) ImGui::EndDisabled();
     ImGui::PopItemWidth();
 
+    /* B6 — Game module dropdown (only for Editor Simulation; external
+     * mode runs the standalone exe which embeds its own module). */
+    if (s_run_mode_idx == JCE_GAME_VIEW_RUN_EDITOR_SIMULATION) {
+        ImGui::SameLine();
+        int mod_count = jce_game_module_count();
+        const JceGameModule *current = jce_editor_game_render_get_module();
+        int cur_idx = 0;
+        for (int i = 0; i < mod_count; ++i) {
+            if (jce_game_module_at(i) == current) { cur_idx = i; break; }
+        }
+        ImGui::PushItemWidth(180);
+        if (ImGui::BeginCombo("##gameModule",
+                              jce_game_module_name_at(cur_idx))) {
+            for (int i = 0; i < mod_count; ++i) {
+                const char *n = jce_game_module_name_at(i);
+                if (!n) continue;
+                bool sel = (i == cur_idx);
+                if (ImGui::Selectable(n, sel))
+                    jce_editor_game_render_set_module(jce_game_module_at(i));
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::PopItemWidth();
+    }
+
     ImGui::SameLine();
 
     if (s_run_mode_idx == JCE_GAME_VIEW_RUN_EXTERNAL_GAME) {
@@ -192,27 +223,248 @@ void jce_editor_panel_game_view_content(void)
 
     ImGui::Separator();
 
-    /* Viewport area */
-    ImVec2 size = ImGui::GetContentRegionAvail();
-    ImGui::SetCursorPos(ImVec2(8, ImGui::GetCursorPosY() + 8));
-    ImGui::TextColored(ImVec4(1, 1, 1, 0.6f),
-        "%s  %.0f x %.0f", jce_editor_i18n("Game"), size.x, size.y);
+    /* ── Embedded game viewport ──────────────────────────────────── */
+
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    if (avail.x < 16.0f) avail.x = 16.0f;
+    if (avail.y < 16.0f) avail.y = 16.0f;
+
+    /* Apply optional aspect-ratio letterboxing. */
+    static const float aspect_ratios[] = {
+        0.0f,            /* Free  */
+        16.0f / 9.0f,
+        16.0f / 10.0f,
+        4.0f / 3.0f,
+        21.0f / 9.0f,
+        1.0f,
+    };
+    ImVec2 view_size = avail;
+    float ar = aspect_ratios[s_aspect_idx >= 0 && s_aspect_idx < 6 ? s_aspect_idx : 0];
+    if (ar > 0.0f) {
+        float by_w = avail.x / ar;
+        if (by_w <= avail.y) {
+            view_size = ImVec2(avail.x, by_w);
+        } else {
+            view_size = ImVec2(avail.y * ar, avail.y);
+        }
+    }
+
+    ImVec2 region_start = ImGui::GetCursorScreenPos();
+    if (ar > 0.0f) {
+        float pad_x = (avail.x - view_size.x) * 0.5f;
+        float pad_y = (avail.y - view_size.y) * 0.5f;
+        ImGui::Dummy(ImVec2(pad_x, pad_y));
+        ImGui::SameLine();
+        region_start = ImGui::GetCursorScreenPos();
+    }
+
+    uint32_t vw = (uint32_t)view_size.x;
+    uint32_t vh = (uint32_t)view_size.y;
+    jce_editor_game_render_frame(vw, vh);
+
+    uint16_t tex_idx = jce_editor_game_render_get_texture();
+    if (tex_idx != UINT16_MAX) {
+        ImTextureID tid = (ImTextureID)(uintptr_t)tex_idx;
+        ImVec2 uv0(0.0f, 0.0f), uv1(1.0f, 1.0f);
+        if (jce_renderer_origin_bottom_left()) {
+            uv0 = ImVec2(0.0f, 1.0f);
+            uv1 = ImVec2(1.0f, 0.0f);
+        }
+        ImGui::Image(tid, view_size, uv0, uv1);
+    } else {
+        ImGui::Dummy(view_size);
+    }
+
+    bool   hovered   = ImGui::IsItemHovered();
+    ImVec2 image_min = region_start;
+    ImVec2 image_max = ImVec2(region_start.x + view_size.x,
+                              region_start.y + view_size.y);
+
+    /* ── FPS fly-cam input (CryEngine-style) ──────────────────────
+     *   Click on the viewport     → capture cursor (FPS lock)
+     *   Hold LeftAlt              → temporarily release while held
+     *   ESC                       → fully release capture
+     *   Mouse motion (captured)   → look (yaw / pitch)
+     *   WASD                      → move horizontal
+     *   Space / LeftShift         → move up / down
+     *   LeftCtrl                  → x5 boost
+     */
+    static bool s_user_wants_capture = false;
+
+    JceCamera *cam = jce_editor_game_render_get_camera();
+    JcePlayState play_state = jce_state_get_play_state();
+    bool play_active = (play_state == JCE_PLAY_PLAYING ||
+                        play_state == JCE_PLAY_PAUSED);
+
+    /* Auto-capture the cursor the moment the user presses Play, so the
+     * Game View behaves like an actual game window — no extra click
+     * required.  Only on the rising edge so that releasing capture
+     * (ALT / ESC) while play is still running stays released. */
+    static JcePlayState s_prev_play_state = JCE_PLAY_STOPPED;
+    if (play_state == JCE_PLAY_PLAYING &&
+        s_prev_play_state != JCE_PLAY_PLAYING) {
+        s_user_wants_capture = true;
+        ImGui::SetWindowFocus();
+    }
+    /* Stop edge: when the user presses Stop, immediately release the
+     * cursor (Unity-parity behavior).  Without this, s_user_wants_capture
+     * stays true and the Game View keeps the cursor locked even though
+     * play has ended, blocking the user from clicking other panels. */
+    if (play_state == JCE_PLAY_STOPPED &&
+        s_prev_play_state != JCE_PLAY_STOPPED) {
+        s_user_wants_capture = false;
+    }
+    s_prev_play_state = play_state;
+
+    if (cam) {
+        const ImGuiIO &io = ImGui::GetIO();
+        float dt = io.DeltaTime > 0.0f ? io.DeltaTime : (1.0f / 60.0f);
+
+        bool alt_held =
+            ImGui::IsKeyDown(ImGuiKey_LeftAlt) ||
+            ImGui::IsKeyDown(ImGuiKey_RightAlt);
+
+        /* Capture is available any time the Game View is hovered+clicked
+         * (CryEngine-style). When Play is active and a CharacterController
+         * exists, capture also drives the player; otherwise it's a pure
+         * free-fly camera. */
+        if (hovered &&
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+            !alt_held) {
+            s_user_wants_capture = true;
+            ImGui::SetWindowFocus();
+        }
+        if (s_user_wants_capture && ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            s_user_wants_capture = false;
+        }
+
+        bool effective_capture =
+            s_user_wants_capture && !alt_held;
+        bool was_captured = jce_editor_game_render_is_mouse_captured();
+        jce_editor_game_render_set_mouse_capture(effective_capture);
+
+        if (effective_capture) {
+            /* Use SDL relative-motion accumulator (xrel/yrel) instead of
+             * ImGui::IO::MouseDelta — the latter is always zero in
+             * relative-mouse-mode because the absolute cursor is pinned. */
+            float dx = 0.0f, dy = 0.0f;
+            jce_editor_game_render_consume_mouse_delta(&dx, &dy);
+            const float sensitivity = 0.0025f;
+            if (dx != 0.0f || dy != 0.0f) {
+                jce_camera_rotate(cam,
+                                   dx * sensitivity,
+                                  -dy * sensitivity);
+            }
+
+            float speed_mult = 1.0f;
+            if (ImGui::IsKeyDown(ImGuiKey_LeftCtrl) ||
+                ImGui::IsKeyDown(ImGuiKey_RightCtrl))
+                speed_mult = 5.0f;
+            else if (ImGui::IsKeyDown(ImGuiKey_LeftShift) ||
+                     ImGui::IsKeyDown(ImGuiKey_RightShift))
+                speed_mult = 0.4f;
+
+            float px, py, pz;
+            bool has_player =
+                play_active &&
+                jce_editor_play_get_player_position(&px, &py, &pz);
+
+            if (has_player) {
+                /* Drive the scene's CharacterController.  Walk direction
+                 * is computed from the camera's current forward / right
+                 * so look direction defines move direction (FPS feel). */
+                jce_vec3 fwd   = jce_camera_get_forward(cam);
+                jce_vec3 right = jce_camera_get_right(cam);
+                fwd.y = 0.0f; right.y = 0.0f;
+                float fl = sqrtf(fwd.x*fwd.x + fwd.z*fwd.z);
+                float rl = sqrtf(right.x*right.x + right.z*right.z);
+                if (fl > 0.0001f) { fwd.x   /= fl; fwd.z   /= fl; }
+                if (rl > 0.0001f) { right.x /= rl; right.z /= rl; }
+
+                float wx = 0.0f, wz = 0.0f;
+                const float walk_speed = 4.0f;
+                if (ImGui::IsKeyDown(ImGuiKey_W)) { wx += fwd.x;   wz += fwd.z;   }
+                if (ImGui::IsKeyDown(ImGuiKey_S)) { wx -= fwd.x;   wz -= fwd.z;   }
+                if (ImGui::IsKeyDown(ImGuiKey_D)) { wx += right.x; wz += right.z; }
+                if (ImGui::IsKeyDown(ImGuiKey_A)) { wx -= right.x; wz -= right.z; }
+                float wlen = sqrtf(wx*wx + wz*wz);
+                if (wlen > 0.0001f) { wx /= wlen; wz /= wlen; }
+
+                bool jump = ImGui::IsKeyPressed(ImGuiKey_Space, false);
+                jce_editor_play_set_player_input(wx * walk_speed,
+                                                  wz * walk_speed,
+                                                  jump,
+                                                  speed_mult);
+            } else {
+                /* No CharacterController in scene → classic free-fly cam. */
+                float speed = 5.0f * speed_mult;
+                float step  = speed * dt;
+                if (ImGui::IsKeyDown(ImGuiKey_W)) jce_camera_move_forward(cam,  step);
+                if (ImGui::IsKeyDown(ImGuiKey_S)) jce_camera_move_forward(cam, -step);
+                if (ImGui::IsKeyDown(ImGuiKey_D)) jce_camera_move_right  (cam,  step);
+                if (ImGui::IsKeyDown(ImGuiKey_A)) jce_camera_move_right  (cam, -step);
+                if (ImGui::IsKeyDown(ImGuiKey_Space))
+                    jce_camera_move_up(cam,  step);
+                if (ImGui::IsKeyDown(ImGuiKey_LeftShift) ||
+                    ImGui::IsKeyDown(ImGuiKey_RightShift))
+                    jce_camera_move_up(cam, -step);
+            }
+
+            ImGui::SetNextFrameWantCaptureKeyboard(true);
+            ImGui::SetNextFrameWantCaptureMouse(true);
+        }
+
+        /* On release edge: re-park the cursor at the centre of the
+         * viewport so the user finds it where they last looked, not
+         * stuck at the edge of the screen where SDL parked it before
+         * relative mode engaged. */
+        if (was_captured && !effective_capture) {
+            int cx = (int)((image_min.x + image_max.x) * 0.5f);
+            int cy = (int)((image_min.y + image_max.y) * 0.5f);
+            jce_editor_game_render_warp_cursor(cx, cy);
+        }
+
+        /* If there's a player character in Play mode, snap the game
+         * view camera to its eye position every frame (regardless of
+         * capture state) so the user always sees through the player. */
+        if (play_active) {
+            float px, py, pz;
+            if (jce_editor_play_get_player_position(&px, &py, &pz)) {
+                jce_vec3 eye = jce_v3(px, py + 1.6f, pz);
+                jce_camera_set_position(cam, eye);
+            }
+        }
+    }
+
+    /* HUD overlay: capture state + hint. */
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    if (jce_editor_game_render_is_mouse_captured()) {
+        dl->AddText(ImVec2(image_min.x + 6.0f, image_min.y + 4.0f),
+                    IM_COL32(80, 220, 120, 230),
+                    "[FPS] WASD move | Space up | Shift down | Ctrl x5  "
+                    "(hold ALT to free cursor, ESC to exit)");
+    } else if (s_user_wants_capture) {
+        dl->AddText(ImVec2(image_min.x + 6.0f, image_min.y + 4.0f),
+                    IM_COL32(255, 220, 120, 230),
+                    "[ALT held - cursor free]  release ALT to re-capture");
+    } else if (hovered) {
+        dl->AddText(ImVec2(image_min.x + 6.0f, image_min.y + 4.0f),
+                    IM_COL32(220, 220, 220, 200),
+                    "Click to enter FPS fly-cam (WASD/Space/Shift, "
+                    "Ctrl=boost, ALT=free, ESC=exit)");
+    }
 
     if (s_show_stats) {
         const char *const *names = nullptr;
         int n = jce_editor_renderer_backends(&names);
         const char *current = (names && s_renderer_idx >= 0 && s_renderer_idx < n)
                                   ? names[s_renderer_idx] : "?";
-        ImGui::SetCursorPos(ImVec2(8, ImGui::GetCursorPosY()));
-        ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 0.8f),
-            "%s: %s", jce_editor_i18n("game.renderer"), current);
-        ImGui::SetCursorPos(ImVec2(8, ImGui::GetCursorPosY()));
-        ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 0.8f),
-            "%s: %.1f | %s: -- | %s: --",
-            jce_editor_i18n("preferences.display.targetFps"),
-            ImGui::GetIO().Framerate,
-            jce_editor_i18n("game.drawCalls"),
-            jce_editor_i18n("game.triangles"));
+        char buf[128];
+        snprintf(buf, sizeof(buf), "%s: %s | %.1f fps  %ux%u",
+                 jce_editor_i18n("game.renderer"), current,
+                 ImGui::GetIO().Framerate, vw, vh);
+        dl->AddText(ImVec2(image_min.x + 6.0f, image_max.y - 18.0f),
+                    IM_COL32(160, 255, 160, 220), buf);
     }
 }
 

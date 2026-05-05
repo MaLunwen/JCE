@@ -197,6 +197,17 @@ void          jce_state_step(float dt);
 JcePlayState  jce_state_get_play_state(void);
 void          jce_state_play_mode_tick(float dt);
 
+/* Player-character input bridge (Game View panel → Play tick).
+ * Push the desired walk direction (world-space horizontal) and modifiers
+ * each frame the panel is captured + Play is active.  Ignored if no
+ * scene entity has a CharacterController. */
+void jce_editor_play_set_player_input(float walk_x, float walk_z,
+                                       bool jump_pressed, float speed_mult);
+
+/* Returns true and writes the player character's world position if a
+ * character is alive; false otherwise. */
+bool jce_editor_play_get_player_position(float *out_x, float *out_y, float *out_z);
+
 /* Undo/Redo history. */
 void  jce_state_undo(void);
 void  jce_state_redo(void);

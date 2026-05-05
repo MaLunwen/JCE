@@ -8,9 +8,11 @@
  */
 
 #include <jce/os/core/jce_timer.h>
+#include <jce/os/core/jce_filesystem.h>
 
 #include "io/jce_editor_file_util.h"
 #include "jce_scene_render_internal.h"
+#include "core/jce_assetdb.h"
 
 #include <cstdio>
 
@@ -60,6 +62,65 @@ static bool ed_texture_failed_cb(const char *material_path,
     return jce_editor_scene_asset_cache_texture_failed(material_path, mesh_path);
 }
 
+/* Generic asset-relative path resolver used by the engine for files it
+ * loads directly via jce_fs (e.g. terrain meta JSON / bin pair).  We try
+ * the assetdb project root first, then a recursive walk-up from the
+ * scene file directory.  Returns true if a readable file was located. */
+static bool ed_resolve_path_cb(const char *in, char *out, int outsz,
+                               void *ud)
+{
+    (void)ud;
+    return jce_editor_resolve_asset_path(in, out, outsz);
+}
+
+bool jce_editor_resolve_asset_path(const char *in, char *out, int outsz)
+{
+    if (!in || !*in || !out || outsz <= 0) return false;
+
+    /* If `in` already opens, accept it as-is. */
+    if (jce_fs_host_exists_file(in)) {
+        snprintf(out, (size_t)outsz, "%s", in);
+        return true;
+    }
+
+    /* Try assetdb root + path. */
+    const char *root = jce_assetdb_get_root();
+    if (root && root[0]) {
+        char cand[1024];
+        snprintf(cand, sizeof(cand), "%s/%s", root, in);
+        if (jce_fs_host_exists_file(cand)) {
+            snprintf(out, (size_t)outsz, "%s", cand);
+            return true;
+        }
+    }
+
+    /* Try walking up from the current scene file. */
+    const char *spath = jce_state_get_current_scene_path();
+    if (spath && spath[0]) {
+        char dir[512];
+        snprintf(dir, sizeof(dir), "%s", spath);
+        char *sep  = strrchr(dir, '/');
+        char *bsep = strrchr(dir, '\\');
+        if (bsep && (!sep || bsep > sep)) sep = bsep;
+        if (sep) *sep = '\0'; else dir[0] = '\0';
+        for (int level = 0; level < 5; ++level) {
+            if (!dir[0]) break;
+            char cand[1024];
+            snprintf(cand, sizeof(cand), "%s/%s", dir, in);
+            if (jce_fs_host_exists_file(cand)) {
+                snprintf(out, (size_t)outsz, "%s", cand);
+                return true;
+            }
+            char *s2  = strrchr(dir, '/');
+            char *bs2 = strrchr(dir, '\\');
+            if (bs2 && (!s2 || bs2 > s2)) s2 = bs2;
+            if (!s2) break;
+            *s2 = '\0';
+        }
+    }
+    return false;
+}
+
 /* ── Asset cache callbacks for the engine scene renderer ──────────── */
 
 static JceMesh *ed_load_mesh_cb(const char *path, void *ud)
@@ -72,10 +133,22 @@ static JceModel *ed_load_model_cb(const char *path, void *ud)
 {
     (void)ud;
     if (!path || path[0] == '\0') return NULL;
+
+    /* Resolve through the editor mesh path resolver: tries direct, then
+     * scene_dir + path, then recursive project search by basename. This
+     * lets scene JSON reference models like "models/PSX_BagMan.glb"
+     * regardless of editor cwd. */
+    char resolved[512];
+    const char *load_path = path;
+    if (jce_editor_scene_asset_cache_resolve_mesh_path(
+            path, resolved, (int)sizeof(resolved))) {
+        load_path = resolved;
+    }
+
     size_t fsize = 0;
-    void *buf = ed_read_file(path, &fsize);
+    void *buf = ed_read_file(load_path, &fsize);
     if (!buf) return NULL;
-    JceModel *m = jce_model_load_gltf_memory(buf, (uint32_t)fsize, path);
+    JceModel *m = jce_model_load_gltf_memory(buf, (uint32_t)fsize, load_path);
     ED_FREE(buf);
     return m;
 }
@@ -204,6 +277,7 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     cbs.load_model   = ed_load_model_cb;
     cbs.load_texture    = ed_load_texture_cb;
     cbs.texture_failed  = ed_texture_failed_cb;
+    cbs.resolve_path    = ed_resolve_path_cb;
     cbs.userdata        = NULL;
     s_sr.scene_renderer = jce_scene_renderer_create(renderer, pak, &cbs);
     if (!s_sr.scene_renderer) {

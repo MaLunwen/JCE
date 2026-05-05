@@ -268,6 +268,30 @@ void jce_window_set_relative_mouse_mode(JceWindow *win, bool enabled)
     SDL_SetWindowRelativeMouseMode(win->sdl_win, enabled);
 }
 
+void jce_window_set_mouse_grab(JceWindow *win, bool enabled)
+{
+    if (!win || !win->sdl_win) return;
+    SDL_SetWindowMouseGrab(win->sdl_win, enabled);
+}
+
+void jce_window_warp_mouse(JceWindow *win, int x, int y)
+{
+    if (!win || !win->sdl_win) return;
+    SDL_WarpMouseInWindow(win->sdl_win, (float)x, (float)y);
+}
+
+void jce_window_set_mouse_rect(JceWindow *win, int x, int y, int w, int h)
+{
+    if (!win || !win->sdl_win) return;
+    if (w <= 0 || h <= 0) {
+        SDL_SetWindowMouseRect(win->sdl_win, NULL);
+        return;
+    }
+    SDL_Rect r;
+    r.x = x; r.y = y; r.w = w; r.h = h;
+    SDL_SetWindowMouseRect(win->sdl_win, &r);
+}
+
 float jce_window_get_dpi_scale(const JceWindow *win)
 {
     if (!win || !win->sdl_win) return 1.0f;

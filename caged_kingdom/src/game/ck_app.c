@@ -263,15 +263,29 @@ CkApp *ck_app_create(const JceServices *svc)
 
     LOG_INFO("ck_app", "[init] step 7: scene load");
     /* Create ECS scene and load entities from PAK-packed JSON via VFS.
-       No programmatic fallback — ck must consume scene data, not build it. */
+       No programmatic fallback — ck must consume scene data, not build it.
+       Try the new editor-saved extension `.scene` first, then fall back
+       to the legacy `.scene.json` for backwards compatibility. */
     app->scene = jce_scene_create();
     {
         JceFileSystem *fs = jce_fs_create();
         jce_fs_mount_pak(fs, app->svc.pak);
-        if (!jce_scene_serial_load_vfs(app->scene, fs,
-                                       "scenes/main.scene.json")) {
+        const char *candidates[] = {
+            "scenes/main.scene",
+            "scenes/main.scene.json",
+        };
+        bool loaded = false;
+        for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); ++i) {
+            if (jce_scene_serial_load_vfs(app->scene, fs, candidates[i])) {
+                LOG_INFO("ck_app", "scene loaded from PAK: %s", candidates[i]);
+                loaded = true;
+                break;
+            }
+        }
+        if (!loaded) {
             LOG_ERROR("ck_app",
-                      "scenes/main.scene.json failed to load from PAK");
+                      "no startup scene found in PAK (tried scenes/main.scene "
+                      "and scenes/main.scene.json)");
         }
         jce_fs_destroy(fs);
     }

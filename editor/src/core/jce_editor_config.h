@@ -21,8 +21,11 @@ typedef struct {
     char theme[16];            /* "Dark", "Light", "Blue" (Blue maps to SSMS engine theme) */
     char renderer[16];         /* "OpenGL", "Vulkan" */
     char last_project[512];
+    char last_scene_path[512];
     char recent_projects[10][512];
     int  recent_count;
+    char recent_scene_paths[10][512];
+    int  recent_scene_count;
 
     /* Scene view render settings (persisted across sessions). */
     int  view_mode;            /* JceSceneViewMode enum (0=Shaded,1=Wireframe,2=Textured) */
@@ -74,6 +77,9 @@ void jce_editor_config_defaults(JceEditorConfig *cfg);
 
 /* Add a path to recent projects (front of list, deduped, max 10). */
 void jce_editor_config_add_recent(JceEditorConfig *cfg, const char *path);
+
+/* Add a path to recent scenes (front of list, deduped, max 10). */
+void jce_editor_config_add_recent_scene(JceEditorConfig *cfg, const char *path);
 
 /* Cached input preference flags — kept in sync by load/save.
    Read directly by scene/particle viewport input handlers (avoids
