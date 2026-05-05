@@ -145,7 +145,7 @@ float sample_csm_shadow(int cascade,
     float sin_theta = sqrt(max(1.0 - ndotl * ndotl, 0.0));
 
     float bias_scale = csm_bias_scale_for_cascade(cascade);
-    float normal_offset = u_csmParams.z * bias_scale * max(sin_theta, 0.05);
+    float normal_offset = u_csmParams.z * bias_scale * max(sin_theta, 0.15);
     vec3 biased_pos = world_pos + n * normal_offset;
 
     vec4 csm_clip = csm_clip_for_cascade(cascade, biased_pos);
@@ -167,8 +167,12 @@ float sample_csm_shadow(int cascade,
     vec2 texel = vec2_splat(inv_map_size);
     float cascade_lerp = clamp(float(cascade) * (1.0 / 3.0), 0.0, 1.0);
 
-    // Small constant depth bias for residual precision artifacts.
-    float depth_bias = inv_map_size * mix(1.0, 2.0, cascade_lerp);
+    // Depth bias: constant component + slope-scaled component to handle
+    // grazing-angle shadow acne (parallel-stripe wood-grain pattern).
+    float slope = sin_theta / max(ndotl, 0.1);
+    float depth_bias = inv_map_size * mix(1.0, 2.0, cascade_lerp)
+                     * bias_scale * (1.0 + slope * 4.0);
+    depth_bias = min(depth_bias, 0.01);
 
     float filter_radius = max(u_csmParams.w, 0.5) * mix(1.0, 2.0, cascade_lerp);
 
@@ -300,7 +304,7 @@ void main()
         // Normal-offset bias in world space before light-space projection.
         float leg_ndotl = max(dot(baseNormal, toLightDir), 0.0);
         float leg_sin = sqrt(max(1.0 - leg_ndotl * leg_ndotl, 0.0));
-        vec3 biased_worldpos = v_worldpos + baseNormal * u_csmParams.z * max(leg_sin, 0.05);
+        vec3 biased_worldpos = v_worldpos + baseNormal * u_csmParams.z * max(leg_sin, 0.15);
 
         vec4 shadowClip = mul(u_shadowVP, vec4(biased_worldpos, 1.0));
         vec3 shadowNDC  = shadowClip.xyz / shadowClip.w;
@@ -309,7 +313,10 @@ void main()
         shadowUV.y = 1.0 - shadowUV.y;
 #endif
         float shadowZ   = toShadowDepth(shadowNDC.z);
-        float shadowBias = max(u_csmParams.x, 1.0 / 2048.0) * 1.5;
+        float leg_slope = leg_sin / max(leg_ndotl, 0.1);
+        float shadowBias = max(u_csmParams.x, 1.0 / 2048.0)
+                         * 1.5 * (1.0 + leg_slope * 4.0);
+        shadowBias = min(shadowBias, 0.01);
 
         if (shadowUV.x >= 0.0 && shadowUV.x <= 1.0 &&
             shadowUV.y >= 0.0 && shadowUV.y <= 1.0 &&

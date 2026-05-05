@@ -77,6 +77,23 @@ JCE_API bool        jce_window_is_fullscreen(const JceWindow *win);
 /* Enable/disable relative (captured) mouse mode for FPS-style controls. */
 JCE_API void        jce_window_set_relative_mouse_mode(JceWindow *win, bool enabled);
 
+/* Force the OS cursor to stay inside the window (in addition to relative
+ * mode).  Use as a hard guard when embedding game viewports inside larger
+ * editor windows so the cursor cannot escape to other applications. */
+JCE_API void        jce_window_set_mouse_grab(JceWindow *win, bool enabled);
+
+/* Warp the OS cursor to (x, y) in window-local pixel coordinates.  Useful
+ * to re-center the cursor each frame to defend against cursor drifting
+ * outside an embedded viewport while in FPS capture. */
+JCE_API void        jce_window_warp_mouse(JceWindow *win, int x, int y);
+
+/* Confine the OS cursor to the rectangle (x, y, w, h) given in window-local
+ * pixel coordinates, even when the window has focus.  Pass w<=0 or h<=0 to
+ * clear the constraint and let the cursor roam the whole window again.
+ * Use to lock the cursor inside an embedded sub-viewport (e.g. Game View). */
+JCE_API void        jce_window_set_mouse_rect(JceWindow *win,
+                                              int x, int y, int w, int h);
+
 /* DPI scale factor: ratio of physical pixels to logical points.
    Returns 1.0 on standard displays, 2.0 on Retina/HiDPI, etc.
    Useful for scaling UI elements and touch targets. */

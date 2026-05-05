@@ -424,6 +424,12 @@ JceTexture asset_cache_get_texture(const char *material_path,
             entry->asset_handle = asset_handle_invalid();
             entry->tex = tex_invalid();
             entry->tex_from_asset_manager = false;
+            /* Mark as failed so we don't re-acquire on every frame and
+             * spam "not found in PAK" log messages.  Without this, the
+             * code below sees an invalid handle and re-issues the load
+             * each frame, producing torrents of identical errors. */
+            if (state == JCE_ASSET_STATE_FAILED)
+                entry->failed = true;
         } else {
             entry->tex = tex_invalid();
             return tex_invalid();

@@ -146,6 +146,14 @@ typedef struct {
     bool        (*texture_failed)(const char *material_path,
                                   const char *mesh_path,
                                   void       *ud);
+    /* OPTIONAL. Resolve an asset-relative path (as written in scene JSON)
+     * to a path that jce_fs_host_read_all can open.  Used for engine-side
+     * file loads that don't go through the load_mesh/load_model/load_texture
+     * paths (terrain meta JSON, terrain bin, etc).  Return true if the
+     * input was successfully resolved into out (NUL-terminated).  Return
+     * false to leave the engine using the path as-is. */
+    bool        (*resolve_path)(const char *in, char *out, int outsz,
+                                void *ud);
     void        *userdata;
 } JceSceneRendererCallbacks;
 
@@ -220,6 +228,12 @@ JCE_API void jce_scene_renderer_set_global_lod(JceSceneRenderer *sr,
  * Useful for building demo LOD groups without loading external assets. */
 JCE_API JceMesh *jce_scene_renderer_get_builtin_mesh(JceSceneRenderer *sr,
                                                      int shape);
+
+/* Drop the cached terrain mesh for `path` (or all cached terrains if
+ * path is NULL/empty) so the next frame re-loads from disk. Tools
+ * (Terrain panel) call this after Save so Scene View reflects edits. */
+JCE_API void jce_scene_renderer_invalidate_terrain(JceSceneRenderer *sr,
+                                                    const char *path);
 
 /* Forward decls for accessors below — full headers may not be in this TU. */
 struct JceAnimPlayer;

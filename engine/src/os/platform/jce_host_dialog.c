@@ -16,10 +16,29 @@
 
 #include <jce/os/platform/jce_host_dialog.h>
 
+#include "jce_window_internal.h"
+
+#include <SDL3/SDL_atomic.h>
 #include <SDL3/SDL_dialog.h>
 #include <SDL3/SDL_stdinc.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Parent window for all native dialogs (set by the host app).  When
+   non-NULL, SDL3 routes dialogs through this HWND, which both gives
+   correct modal behavior AND avoids the cJSON/wcsrchr crash that can
+   occur when the IFileDialog worker has no owner. */
+static SDL_Window *s_dialog_parent = NULL;
+
+void jce_host_dialog_set_parent_window(struct SDL_Window *window)
+{
+    s_dialog_parent = (SDL_Window *)window;
+}
+
+void jce_host_dialog_set_parent_jce_window(JceWindow *window)
+{
+    s_dialog_parent = window ? jce_window_sdl(window) : NULL;
+}
 
 typedef struct {
     JceDialogPathCallback cb;
@@ -28,6 +47,11 @@ typedef struct {
     int                   filter_count;
     char                **filter_storage; /* heap strings owned here */
     int                   storage_count;
+    /* Latched once the SDL worker has invoked us, to make double-callback
+       a no-op.  SDL3's Windows dialog backends have been observed to
+       fire the callback twice in some teardown paths, which would
+       otherwise dereference a freed ctx and crash. */
+    SDL_AtomicInt         invoked;
 } TrampolineCtx;
 
 static void s_free_ctx(TrampolineCtx *ctx)
@@ -47,6 +71,12 @@ static void s_dialog_cb(void *userdata, const char * const *filelist, int filter
     (void)filter;
     TrampolineCtx *ctx = (TrampolineCtx *)userdata;
     if (!ctx) return;
+
+    /* Make the callback idempotent: if SDL fires us twice, ignore the
+       second call.  CompareAndSwap returns true the first time only. */
+    if (!SDL_CompareAndSwapAtomicInt(&ctx->invoked, 0, 1)) {
+        return;
+    }
 
     JceDialogResult result;
     const char     *path = NULL;
@@ -205,6 +235,30 @@ static TrampolineCtx *s_make_ctx(JceDialogPathCallback cb, void *user,
     return ctx;
 }
 
+/* Normalize a path to native separators in a stack buffer.  On Windows,
+   SDL3's IFileDialog backend uses wcsrchr(L'\\') internally; if the
+   incoming default_path uses forward slashes, that lookup returns NULL
+   and SDL3 crashes during path parsing (well before our callback fires).
+   On non-Windows this is a no-op (returns the input pointer).
+   `out` must point to a buffer of at least `out_size` bytes. */
+static const char *s_normalize_default_path(const char *in, char *out,
+                                            size_t out_size)
+{
+    if (!in || !in[0]) return NULL;
+#ifdef _WIN32
+    if (!out || out_size == 0) return in;
+    size_t i = 0;
+    for (; in[i] && i + 1 < out_size; ++i)
+        out[i] = (in[i] == '/') ? '\\' : in[i];
+    out[i] = '\0';
+    return out;
+#else
+    (void)out;
+    (void)out_size;
+    return in;
+#endif
+}
+
 void jce_host_dialog_pick_folder(const char *title,
                                  const char *default_path,
                                  JceDialogPathCallback cb,
@@ -214,8 +268,10 @@ void jce_host_dialog_pick_folder(const char *title,
     if (!cb) return;
     TrampolineCtx *ctx = s_make_ctx(cb, user, NULL);
     if (!ctx) { cb(user, JCE_DIALOG_ERROR, NULL); return; }
-    SDL_ShowOpenFolderDialog(s_dialog_cb, ctx, NULL,
-                             (default_path && default_path[0]) ? default_path : NULL,
+    char norm[1024];
+    const char *path_arg = s_normalize_default_path(default_path, norm, sizeof(norm));
+    SDL_ShowOpenFolderDialog(s_dialog_cb, ctx, s_dialog_parent,
+                             path_arg,
                              false /* allow_many */);
 }
 
@@ -229,9 +285,11 @@ void jce_host_dialog_pick_file(const char *title,
     if (!cb) return;
     TrampolineCtx *ctx = s_make_ctx(cb, user, filters);
     if (!ctx) { cb(user, JCE_DIALOG_ERROR, NULL); return; }
-    SDL_ShowOpenFileDialog(s_dialog_cb, ctx, NULL,
+    char norm[1024];
+    const char *path_arg = s_normalize_default_path(default_path, norm, sizeof(norm));
+    SDL_ShowOpenFileDialog(s_dialog_cb, ctx, s_dialog_parent,
                            ctx->filters, ctx->filter_count,
-                           (default_path && default_path[0]) ? default_path : NULL,
+                           path_arg,
                            false /* allow_many */);
 }
 
@@ -245,7 +303,9 @@ void jce_host_dialog_save_file(const char *title,
     if (!cb) return;
     TrampolineCtx *ctx = s_make_ctx(cb, user, filters);
     if (!ctx) { cb(user, JCE_DIALOG_ERROR, NULL); return; }
-    SDL_ShowSaveFileDialog(s_dialog_cb, ctx, NULL,
+    char norm[1024];
+    const char *path_arg = s_normalize_default_path(default_path, norm, sizeof(norm));
+    SDL_ShowSaveFileDialog(s_dialog_cb, ctx, s_dialog_parent,
                            ctx->filters, ctx->filter_count,
-                           (default_path && default_path[0]) ? default_path : NULL);
+                           path_arg);
 }

@@ -48,9 +48,14 @@ bool jce_scene_serial_save_file(const JceScene *scene, const char *path)
 {
     if (!scene || !path) return false;
 
-    size_t len = 0;
-    char *json = jce_scene_serial_save(scene, &len);
+    /* File on disk uses pretty (multi-line) JSON so it diffs cleanly in
+     * git.  In-memory snapshot path keeps the compact form for speed. */
+    JceJson *root = jce_scene_save_json(scene);
+    if (!root) return false;
+    char *json = jce_json_print(root, /*pretty=*/true);
+    jce_json_free(root);
     if (!json) return false;
+    size_t len = strlen(json);
 
     bool ok = jce_fs_host_write_all(path, json, len);
     jce_json_free_string(json);

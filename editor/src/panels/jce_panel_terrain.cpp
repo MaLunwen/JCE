@@ -16,10 +16,12 @@
 #include "io/jce_editor_file_util.h"
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
+#include "scene/jce_editor_scene_render.h"
 
 #include <jce/tools/jce_imgui.hpp>
 extern "C" {
 #include <jce/middleware/scene/jce_terrain.h>
+#include <jce/renderer/jce_scene_renderer.h>
 }
 
 #include <algorithm>
@@ -124,19 +126,37 @@ void draw_toolbar()
         ImGui::TableNextColumn();
         if (ImGui::Button(jce_editor_i18n("terrain.toolbar.load"), ImVec2(-1, 0))) {
             if (s.terrain) { jce_terrain_free(s.terrain); s.terrain = nullptr; }
-            s.terrain = jce_terrain_load_file(s.io_path);
+            char resolved[1024];
+            const char *load_path = s.io_path;
+            if (jce_editor_resolve_asset_path(s.io_path, resolved, sizeof(resolved)))
+                load_path = resolved;
+            s.terrain = jce_terrain_load_file(load_path);
             s.preview_dirty = true;
             s.status = s.terrain
-                ? std::string(jce_editor_i18n("terrain.status.loaded")) + s.io_path
-                : std::string(jce_editor_i18n("terrain.status.loadFailed")) + s.io_path;
+                ? std::string(jce_editor_i18n("terrain.status.loaded")) + load_path
+                : std::string(jce_editor_i18n("terrain.status.loadFailed")) + load_path;
         }
         ImGui::TableNextColumn();
         ImGui::BeginDisabled(s.terrain == nullptr);
         if (ImGui::Button(jce_editor_i18n("terrain.toolbar.save"), ImVec2(-1, 0))) {
-            bool ok = jce_terrain_save_file(s.terrain, s.io_path);
+            char resolved[1024];
+            const char *save_path = s.io_path;
+            if (jce_editor_resolve_asset_path(s.io_path, resolved, sizeof(resolved)))
+                save_path = resolved;
+            bool ok = jce_terrain_save_file(s.terrain, save_path);
             s.status = ok
-                ? std::string(jce_editor_i18n("terrain.status.saved")) + s.io_path
-                : std::string(jce_editor_i18n("terrain.status.saveFailed")) + s.io_path;
+                ? std::string(jce_editor_i18n("terrain.status.saved")) + save_path
+                : std::string(jce_editor_i18n("terrain.status.saveFailed")) + save_path;
+            if (ok) {
+                /* Force the Scene View renderer to re-load this terrain
+                 * so authoring edits are reflected immediately.  Invalidate
+                 * by both the scene-relative key and the absolute path. */
+                JceSceneRenderer *sr = jce_editor_get_scene_renderer();
+                if (sr) {
+                    jce_scene_renderer_invalidate_terrain(sr, s.io_path);
+                    jce_scene_renderer_invalidate_terrain(sr, save_path);
+                }
+            }
         }
         ImGui::EndDisabled();
         ImGui::TableNextColumn();
@@ -152,6 +172,28 @@ void draw_toolbar()
         ImGui::EndTable();
     }
     ImGui::InputText(jce_editor_i18n("terrain.toolbar.path"), s.io_path, sizeof(s.io_path));
+    if (ImGui::BeginDragDropTarget()) {
+        if (const ImGuiPayload *payload =
+                ImGui::AcceptDragDropPayload("JCE_ASSET_PATH")) {
+            const char *path = (const char *)payload->Data;
+            snprintf(s.io_path, sizeof(s.io_path), "%s", path);
+            /* Auto-load if a .terrain.json was dropped. */
+            const char *ext = strrchr(path, '.');
+            if (ext && (strcmp(ext, ".json") == 0 || strstr(path, ".terrain."))) {
+                if (s.terrain) { jce_terrain_free(s.terrain); s.terrain = nullptr; }
+                char resolved[1024];
+                const char *load_path = s.io_path;
+                if (jce_editor_resolve_asset_path(s.io_path, resolved, sizeof(resolved)))
+                    load_path = resolved;
+                s.terrain = jce_terrain_load_file(load_path);
+                s.preview_dirty = true;
+                s.status = s.terrain
+                    ? std::string(jce_editor_i18n("terrain.status.loaded")) + load_path
+                    : std::string(jce_editor_i18n("terrain.status.loadFailed")) + load_path;
+            }
+        }
+        ImGui::EndDragDropTarget();
+    }
 }
 
 void draw_create_section()

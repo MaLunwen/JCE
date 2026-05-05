@@ -106,6 +106,10 @@ static void draw_scene_view_toolbar(void)
         if (ImGui::MenuItem(jce_editor_i18n("scene.grid"), NULL, grid))
             jce_state_set_show_grid(!grid);
 
+        bool phys = jce_state_get_show_physics_debug();
+        if (ImGui::MenuItem("Physics Debug (Wireframe)", "", phys))
+            jce_state_set_show_physics_debug(!phys);
+
         if (ImGui::BeginMenu(jce_editor_i18n("sceneView.menu.showFlags"))) {
             uint32_t f = jce_state_get_show_flags();
             struct { const char *i18n_key; uint32_t bit; } items[] = {

@@ -416,14 +416,22 @@ void jce_editor_dialog_open_scene(bool *p_open)
 }
 
 /* ======================================================================
- *  SAVE AS DIALOG
+ *  SAVE AS — native-only flow
+ *
+ *  No ImGui form.  When the menu fires Save Scene As (*p_open becomes
+ *  true), we synchronously kick off SDL_ShowSaveFileDialog with a
+ *  sensible default path/filename derived from the current scene.  The
+ *  callback writes the chosen path into a result buffer; on the next
+ *  frame we detect ready_flag and perform the save, then drop *p_open.
+ *  Cancel just clears *p_open.
  * ====================================================================== */
 
 static struct {
-    char save_name[256];
-    char save_location[512];
     char source_scene_path[512];
-    bool initialized;
+    char result_path[1024];
+    bool dispatched;   /* dialog has been launched, waiting for callback */
+    bool ready;        /* callback wrote a path */
+    bool cancelled;    /* callback was cancelled / errored */
 } s_save_as;
 
 static std::string strip_scene_extension(const std::string &file_name)
@@ -432,151 +440,113 @@ static std::string strip_scene_extension(const std::string &file_name)
         return file_name.substr(0, file_name.size() - 11);
     if (file_name.size() >= 6 && file_name.substr(file_name.size() - 6) == ".scene")
         return file_name.substr(0, file_name.size() - 6);
-    
+
     char stem[256];
     jce_path_stem(stem, sizeof(stem), file_name.c_str());
     return std::string(stem);
 }
 
-static void save_as_ensure_init(void)
+static void save_as_compute_default(char *out_path, size_t out_size)
 {
+    out_path[0] = '\0';
+
     const char *current_scene = jce_state_get_current_scene_path();
-    if (current_scene && current_scene[0] != '\0'
-        && (!s_save_as.initialized
-         || strcmp(s_save_as.source_scene_path, current_scene) != 0)) {
-        char parent[1024];
-        jce_path_parent(parent, sizeof(parent), current_scene);
-        char basename[256];
-        jce_path_basename(basename, sizeof(basename), current_scene);
-        std::string base = strip_scene_extension(basename);
+    char dir_buf[1024]  = {0};
+    char name_buf[256]  = {0};
 
-        memset(&s_save_as, 0, sizeof(s_save_as));
-        snprintf(s_save_as.save_name, sizeof(s_save_as.save_name), "%s",
-                 base.empty() ? "Scene" : base.c_str());
-        
-        if (parent[0] != '\0') {
-            snprintf(s_save_as.save_location, sizeof(s_save_as.save_location), "%s", parent);
-        } else {
-            char base_path[1024];
-            if (jce_fs_host_get_current_dir(base_path, sizeof(base_path))) {
-                snprintf(s_save_as.save_location, sizeof(s_save_as.save_location), "%s", base_path);
-            } else {
-                snprintf(s_save_as.save_location, sizeof(s_save_as.save_location), ".");
-            }
-        }
-        
-        snprintf(s_save_as.source_scene_path, sizeof(s_save_as.source_scene_path), "%s",
-                 current_scene);
-        s_save_as.initialized = true;
-        return;
-    }
-
-    if (s_save_as.initialized) return;
-
-    memset(&s_save_as, 0, sizeof(s_save_as));
-    if (s_current_project_root[0] != '\0') {
-        char path_buf[1024];
-        jce_path_join(path_buf, sizeof(path_buf), s_current_project_root, "assets");
-        jce_path_join(path_buf, sizeof(path_buf), path_buf, "scenes");
-        snprintf(s_save_as.save_location,
-                 sizeof(s_save_as.save_location), "%s", path_buf);
+    if (current_scene && current_scene[0] != '\0') {
+        jce_path_parent(dir_buf, sizeof(dir_buf), current_scene);
+        char base[256];
+        jce_path_basename(base, sizeof(base), current_scene);
+        std::string stem = strip_scene_extension(base);
+        snprintf(name_buf, sizeof(name_buf), "%s",
+                 stem.empty() ? "Scene" : stem.c_str());
     } else {
-        char base_path[1024];
-        if (jce_fs_host_get_current_dir(base_path, sizeof(base_path))) {
-            snprintf(s_save_as.save_location,
-                     sizeof(s_save_as.save_location), "%s", base_path);
-        } else {
-            snprintf(s_save_as.save_location,
-                     sizeof(s_save_as.save_location), ".");
+        if (s_current_project_root[0] != '\0') {
+            char tmp[1024];
+            jce_path_join(tmp, sizeof(tmp), s_current_project_root, "assets");
+            jce_path_join(dir_buf, sizeof(dir_buf), tmp, "scenes");
+        } else if (!jce_fs_host_get_current_dir(dir_buf, sizeof(dir_buf))) {
+            snprintf(dir_buf, sizeof(dir_buf), ".");
         }
+        snprintf(name_buf, sizeof(name_buf), "Scene");
     }
-    snprintf(s_save_as.save_name, sizeof(s_save_as.save_name), "Scene");
-    s_save_as.initialized = true;
+
+    /* Always suggest a .scene extension. */
+    std::string fname = name_buf;
+    if (!is_scene_filename(fname)) fname += ".scene";
+    jce_path_join(out_path, out_size, dir_buf, fname.c_str());
 }
 
 void jce_editor_dialog_save_as(bool *p_open)
 {
     if (!p_open || !*p_open) return;
 
-    save_as_ensure_init();
+    /* Rising edge: launch the native save-file dialog exactly once. */
+    if (!s_save_as.dispatched) {
+        memset(s_save_as.result_path, 0, sizeof(s_save_as.result_path));
+        s_save_as.ready     = false;
+        s_save_as.cancelled = false;
+        s_save_as.dispatched = true;
 
-    char title[256];
-    snprintf(title, sizeof(title), "%s###SaveAsScene", jce_editor_i18n("menu.file.saveAs"));
+        char default_full[1024];
+        save_as_compute_default(default_full, sizeof(default_full));
 
-    ImGui::SetNextWindowSize(ImVec2(500, 250), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin(title, p_open, ImGuiWindowFlags_NoCollapse)) {
-        ImGui::End();
+        save_file_dialog_async(jce_editor_i18n("menu.file.saveAs"),
+                               default_full[0] ? default_full : NULL,
+                               "Scene Files (*.scene *.scene.json);;All Files (*.*)",
+                               s_save_as.result_path,
+                               sizeof(s_save_as.result_path),
+                               &s_save_as.ready,
+                               &s_save_as.cancelled);
         return;
     }
 
-    /* Scene Name */
-    ImGui::Text("%s", jce_editor_i18n("sceneDialog.name"));
-    ImGui::SetNextItemWidth(-1);
-    ImGui::InputText("###sa_name_input", s_save_as.save_name,
-                     sizeof(s_save_as.save_name));
-
-    ImGui::Spacing();
-
-    /* Location */
-    ImGui::Text("%s", jce_editor_i18n("sceneDialog.directory"));
-    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 90.0f);
-    ImGui::InputText("###sa_loc_input", s_save_as.save_location,
-                     sizeof(s_save_as.save_location));
-    ImGui::SameLine();
-    if (ImGui::Button(jce_editor_i18n("openProject.browse"), ImVec2(80, 0))) {
-        pick_folder_dialog_async(jce_editor_i18n("sceneDialog.chooseDirectory"),
-                                 NULL,
-                                 s_save_as.save_location,
-                                 sizeof(s_save_as.save_location),
-                                 NULL, 0, NULL, NULL);
-    }
-
-    /* Buttons: Save | Cancel (right-aligned) */
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
-
-    float btn_w   = 80.0f;
-    float spacing  = ImGui::GetStyle().ItemSpacing.x;
-    float total_btn_w = btn_w * 2 + spacing;
-    ImGui::SetCursorPosX(ImGui::GetContentRegionAvail().x - total_btn_w
-                         + ImGui::GetCursorPosX());
-
-    if (ImGui::Button(jce_editor_i18n("dialog.save"), ImVec2(btn_w, 0))
-        || ImGui::IsKeyPressed(ImGuiKey_Enter)
-        || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter)) {
-        if (strlen(s_save_as.save_name) == 0 || strlen(s_save_as.save_location) == 0) {
-            jce_editor_console_log_level(JCE_CONSOLE_WARNING,
-                "%s", jce_editor_i18n("sceneDialog.errorRequired"));
-        } else {
-            jce_fs_host_create_directory(s_save_as.save_location);
-
-            std::string name = s_save_as.save_name;
-            if (!is_scene_filename(name)) name += ".scene";
-            
-            char out_path[1024];
-            jce_path_join(out_path, sizeof(out_path), s_save_as.save_location, name.c_str());
-
-            if (jce_state_save_scene_file(out_path)) {
-                snprintf(s_save_as.source_scene_path,
-                         sizeof(s_save_as.source_scene_path), "%s",
-                         out_path);
-                jce_editor_layout_request_focus_scene_view();
-                jce_editor_console_log("Saved scene as: %s", out_path);
-                *p_open = false;
-            } else {
-                jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-                    "Save scene failed: %s", out_path);
-            }
-        }
-    }
-    ImGui::SameLine();
-    if (ImGui::Button(jce_editor_i18n("dialog.cancel"), ImVec2(btn_w, 0))
-        || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+    /* Cancelled or errored — close. */
+    if (s_save_as.cancelled) {
+        s_save_as.dispatched = false;
+        s_save_as.cancelled  = false;
+        s_save_as.ready      = false;
         *p_open = false;
+        return;
     }
 
-    ImGui::End();
+    /* Result not ready yet — keep waiting; nothing to draw. */
+    if (!s_save_as.ready) return;
+
+    /* Have a path — finalize the save on the main thread. */
+    char out_path[1024];
+    snprintf(out_path, sizeof(out_path), "%s", s_save_as.result_path);
+
+    /* Append .scene if the user didn't type an extension. */
+    char base[256];
+    jce_path_basename(base, sizeof(base), out_path);
+    if (!is_scene_filename(base)) {
+        size_t cur = strlen(out_path);
+        snprintf(out_path + cur, sizeof(out_path) - cur, ".scene");
+    }
+
+    /* Make sure parent dir exists. */
+    char parent[1024];
+    jce_path_parent(parent, sizeof(parent), out_path);
+    if (parent[0] != '\0')
+        jce_fs_host_create_directory(parent);
+
+    if (jce_state_save_scene_file(out_path)) {
+        snprintf(s_save_as.source_scene_path,
+                 sizeof(s_save_as.source_scene_path), "%s", out_path);
+        jce_editor_layout_request_focus_scene_view();
+        jce_editor_console_log("Saved scene as: %s", out_path);
+    } else {
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+            "Save scene failed: %s", out_path);
+    }
+
+    /* Reset state and close. */
+    s_save_as.dispatched = false;
+    s_save_as.ready      = false;
+    s_save_as.cancelled  = false;
+    *p_open = false;
 }
 
 /* ======================================================================

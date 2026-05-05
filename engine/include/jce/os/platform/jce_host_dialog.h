@@ -19,6 +19,22 @@
 #include <jce/os/core/jce_defs.h>
 JCE_EXTERN_C_BEGIN
 
+/* Forward declare to avoid pulling SDL into every consumer. */
+struct SDL_Window;
+typedef struct JceWindow JceWindow;
+
+/* Register the application's primary SDL_Window as the parent of all
+   subsequent native dialogs.  This is required for stability on Windows:
+   SDL3's IFileDialog implementation can crash on the dialog worker
+   thread when no parent HWND is supplied (heap/COM teardown races).
+   Pass NULL to clear (e.g. on shutdown).  Safe to call from any thread,
+   but in practice only the main thread should set this. */
+void jce_host_dialog_set_parent_window(struct SDL_Window *window);
+
+/* Convenience: same as set_parent_window but takes a JceWindow.  The
+   engine knows how to extract the underlying SDL_Window. */
+void jce_host_dialog_set_parent_jce_window(JceWindow *window);
+
 typedef enum {
     JCE_DIALOG_OK        = 0,
     JCE_DIALOG_CANCELLED = 1,

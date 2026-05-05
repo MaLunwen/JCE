@@ -831,6 +831,26 @@ static void parse_script(JceScene *s, JceEntity e, const cJSON *c)
     jce_scene_set_script(s, e, &sc2);
 }
 
+static void parse_terrain(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceTerrainComponent tc;
+    memset(&tc, 0, sizeof(tc));
+    copy_str(tc.terrain_path, sizeof(tc.terrain_path),
+             j_str(c, "terrainPath", ""));
+    const char *keys[4] = { "layerAlbedoPath0", "layerAlbedoPath1",
+                            "layerAlbedoPath2", "layerAlbedoPath3" };
+    for (int i = 0; i < 4; ++i)
+        copy_str(tc.layer_albedo_path[i], sizeof(tc.layer_albedo_path[i]),
+                 j_str(c, keys[i], ""));
+    tc.tile_scale     = (float)j_num(c, "tileScale", 10.0);
+    tc.tint[0]        = (float)j_num(c, "tintR", 1.0);
+    tc.tint[1]        = (float)j_num(c, "tintG", 1.0);
+    tc.tint[2]        = (float)j_num(c, "tintB", 1.0);
+    tc.visible        = j_bool(c, "visible", true);
+    tc.splat_enabled  = j_bool(c, "splatEnabled", true);
+    jce_scene_set_terrain(s, e, &tc);
+}
+
 static void parse_constraint(JceScene *s, JceEntity e, const cJSON *c)
 {
     JceConstraintComponent cn;
@@ -938,6 +958,10 @@ static void parse_one_component(JceScene *s, JceEntity e, const cJSON *comp)
     /* Constraint. */
     if (strcmp(type, "Constraint") == 0 || strcmp(type, "constraint") == 0) {
         parse_constraint(s, e, props); return;
+    }
+    /* Terrain. */
+    if (strcmp(type, "Terrain") == 0 || strcmp(type, "terrain") == 0) {
+        parse_terrain(s, e, props); return;
     }
 }
 
@@ -1152,6 +1176,24 @@ static void ser_constraint(const JceConstraintComponent *c, cJSON *arr)
     cJSON_AddItemToArray(arr, o);
 }
 
+static void ser_terrain(const JceTerrainComponent *c, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "Terrain");
+    cJSON_AddStringToObject(o, "terrainPath", c->terrain_path);
+    cJSON_AddStringToObject(o, "layerAlbedoPath0", c->layer_albedo_path[0]);
+    cJSON_AddStringToObject(o, "layerAlbedoPath1", c->layer_albedo_path[1]);
+    cJSON_AddStringToObject(o, "layerAlbedoPath2", c->layer_albedo_path[2]);
+    cJSON_AddStringToObject(o, "layerAlbedoPath3", c->layer_albedo_path[3]);
+    cJSON_AddNumberToObject(o, "tileScale", c->tile_scale);
+    cJSON_AddNumberToObject(o, "tintR", c->tint[0]);
+    cJSON_AddNumberToObject(o, "tintG", c->tint[1]);
+    cJSON_AddNumberToObject(o, "tintB", c->tint[2]);
+    cJSON_AddBoolToObject(o, "visible", c->visible);
+    cJSON_AddBoolToObject(o, "splatEnabled", c->splat_enabled);
+    cJSON_AddItemToArray(arr, o);
+}
+
 static void ser_skybox(const JceSkyboxComponent *c, cJSON *arr)
 {
     cJSON *o = cJSON_CreateObject();
@@ -1222,11 +1264,20 @@ static void ser_editor_meta(const JceEditorMeta *m, cJSON *arr)
     cJSON *o = cJSON_CreateObject();
     cJSON_AddStringToObject(o, "type", "EditorMeta");
     cJSON_AddStringToObject(o, "name", m->name);
-    cJSON_AddStringToObject(o, "tag", m->tag);
-    cJSON_AddNumberToObject(o, "tagColor", m->tag_color);
-    cJSON_AddBoolToObject(o, "enabled", m->enabled);
-    cJSON_AddBoolToObject(o, "prefabInstance", m->prefab_instance);
-    cJSON_AddStringToObject(o, "prefabPath", m->prefab_path);
+    /* Only emit non-default fields — keeps runtime scene files small.
+     * Loader treats absent fields as defaults: enabled=true, tag="",
+     * tagColor=0, prefabInstance=false. */
+    if (m->tag[0] != '\0')
+        cJSON_AddStringToObject(o, "tag", m->tag);
+    if (m->tag_color != 0)
+        cJSON_AddNumberToObject(o, "tagColor", m->tag_color);
+    if (!m->enabled)
+        cJSON_AddBoolToObject(o, "enabled", false);
+    if (m->prefab_instance) {
+        cJSON_AddBoolToObject(o, "prefabInstance", true);
+        if (m->prefab_path[0] != '\0')
+            cJSON_AddStringToObject(o, "prefabPath", m->prefab_path);
+    }
     cJSON_AddItemToArray(arr, o);
 }
 
@@ -1323,6 +1374,10 @@ static void ser_entity_cb(JceScene *s, JceEntity e, void *ud)
     if (f & JCE_COMP_FLAG_CONSTRAINT) {
         JceConstraintComponent *c = jce_scene_get_constraint(s, e);
         if (c) ser_constraint(c, comps);
+    }
+    if (f & JCE_COMP_FLAG_TERRAIN) {
+        JceTerrainComponent *c = jce_scene_get_terrain(s, e);
+        if (c) ser_terrain(c, comps);
     }
     if (f & JCE_COMP_FLAG_EDITOR_META) {
         JceEditorMeta *m = jce_scene_get_editor_meta(s, e);
@@ -1478,34 +1533,33 @@ int jce_scene_load_json(JceScene *scene, const cJSON *root)
         map[loaded].parent_src = (JceEntity)j_num2(eobj, "parent_id", "parentId", 0.0);
         loaded++;
 
-        /* Apply entity-level EditorMeta fields (enabled, tag, tagColor, etc.)
-         * if they appear directly on the entity object (editor format). */
+        /* Apply entity-level EditorMeta fields (enabled, tag, tagColor, etc.).
+         * Always create EditorMeta with the entity name so the editor can see
+         * hand-authored scenes that omit these optional fields. */
         {
             bool has_enabled = cJSON_GetObjectItemCaseSensitive(eobj, "enabled") != NULL;
             bool has_tag     = cJSON_GetObjectItemCaseSensitive(eobj, "tag") != NULL;
             bool has_tc      = cJSON_GetObjectItemCaseSensitive(eobj, "tagColor") != NULL;
             bool has_pi      = cJSON_GetObjectItemCaseSensitive(eobj, "prefabInstance") != NULL;
             bool has_pp      = cJSON_GetObjectItemCaseSensitive(eobj, "prefabPath") != NULL;
-            if (has_enabled || has_tag || has_tc || has_pi || has_pp) {
-                JceEditorMeta *m = jce_scene_get_editor_meta(scene, new_e);
-                if (!m) {
-                    JceEditorMeta fresh;
-                    memset(&fresh, 0, sizeof(fresh));
-                    copy_str(fresh.name, sizeof(fresh.name),
-                             is_legacy_unnamed_entity_name(name) ? "Entity" : name);
-                    fresh.enabled = true;
-                    jce_scene_set_editor_meta(scene, new_e, &fresh);
-                    m = jce_scene_get_editor_meta(scene, new_e);
-                }
-                if (m) {
-                    if (has_enabled) m->enabled = j_bool(eobj, "enabled", true);
-                    if (has_tag) copy_str(m->tag, sizeof(m->tag),
-                                          j_str(eobj, "tag", ""));
-                    if (has_tc) m->tag_color = (uint8_t)j_num(eobj, "tagColor", 0);
-                    if (has_pi) m->prefab_instance = j_bool(eobj, "prefabInstance", false);
-                    if (has_pp) copy_str(m->prefab_path, sizeof(m->prefab_path),
-                                         j_str(eobj, "prefabPath", ""));
-                }
+            JceEditorMeta *m = jce_scene_get_editor_meta(scene, new_e);
+            if (!m) {
+                JceEditorMeta fresh;
+                memset(&fresh, 0, sizeof(fresh));
+                copy_str(fresh.name, sizeof(fresh.name),
+                         is_legacy_unnamed_entity_name(name) ? "Entity" : name);
+                fresh.enabled = true;
+                jce_scene_set_editor_meta(scene, new_e, &fresh);
+                m = jce_scene_get_editor_meta(scene, new_e);
+            }
+            if (m) {
+                if (has_enabled) m->enabled = j_bool(eobj, "enabled", true);
+                if (has_tag) copy_str(m->tag, sizeof(m->tag),
+                                      j_str(eobj, "tag", ""));
+                if (has_tc) m->tag_color = (uint8_t)j_num(eobj, "tagColor", 0);
+                if (has_pi) m->prefab_instance = j_bool(eobj, "prefabInstance", false);
+                if (has_pp) copy_str(m->prefab_path, sizeof(m->prefab_path),
+                                     j_str(eobj, "prefabPath", ""));
             }
         }
 
@@ -1658,6 +1712,10 @@ cJSON *jce_scene_serialize_entity_components(JceScene *scene, JceEntity e)
     if (f & JCE_COMP_FLAG_CONSTRAINT) {
         JceConstraintComponent *c = jce_scene_get_constraint(scene, e);
         if (c) ser_constraint(c, arr);
+    }
+    if (f & JCE_COMP_FLAG_TERRAIN) {
+        JceTerrainComponent *c = jce_scene_get_terrain(scene, e);
+        if (c) ser_terrain(c, arr);
     }
     if (f & JCE_COMP_FLAG_EDITOR_META) {
         JceEditorMeta *m = jce_scene_get_editor_meta(scene, e);

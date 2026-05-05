@@ -54,4 +54,16 @@ void pick_folder_dialog_async(const char *title,
    Cheap when the queue is empty (single mutex-guarded check). */
 void jce_editor_dialogs_pump_pending(void);
 
+/* Async save-file dialog.  Same threading/output-buffer contract as
+   pick_folder_dialog_async, but routed through SDL_ShowSaveFileDialog,
+   which is more stable on Windows than the folder picker.
+   - filters: Qt-style "Scenes (*.scene);;All Files (*.*)" or NULL.
+   - default_path: starting path (filename or directory) or NULL. */
+void save_file_dialog_async(const char *title,
+                            const char *default_path,
+                            const char *filters,
+                            char *primary_out, size_t primary_size,
+                            bool *ready_flag,
+                            bool *cancelled_flag);
+
 #endif /* JCE_EDITOR_DIALOGS_INTERNAL_H */

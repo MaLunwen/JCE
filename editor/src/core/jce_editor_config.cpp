@@ -44,7 +44,9 @@ void jce_editor_config_defaults(JceEditorConfig *cfg) {
     strncpy(cfg->theme, "Dark", sizeof(cfg->theme) - 1);
     strncpy(cfg->renderer, "OpenGL", sizeof(cfg->renderer) - 1);
     cfg->last_project[0] = '\0';
+    cfg->last_scene_path[0] = '\0';
     cfg->recent_count = 0;
+    cfg->recent_scene_count = 0;
     cfg->view_mode = 0;    /* JCE_VIEW_SHADED */
     cfg->show_grid = true;
     cfg->asset_browser_view_mode = 0; /* ASSET_BROWSER_VIEW_GRID */
@@ -141,6 +143,8 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
     cjson_read_str(root, "theme",    cfg->theme,    sizeof(cfg->theme));
     cjson_read_str(root, "renderer", cfg->renderer, sizeof(cfg->renderer));
     cjson_read_str(root, "last_project", cfg->last_project, sizeof(cfg->last_project));
+    cjson_read_str(root, "last_scene_path",
+                   cfg->last_scene_path, sizeof(cfg->last_scene_path));
 
     /* Scene view render settings. */
     cfg->view_mode = cjson_read_int(root, "view_mode", cfg->view_mode);
@@ -198,6 +202,22 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
         }
     }
 
+    /* recent_scene_0 .. recent_scene_9 */
+    cfg->recent_scene_count = 0;
+    for (int i = 0; i < 10; i++) {
+        char key[24];
+        snprintf(key, sizeof(key), "recent_scene_%d", i);
+        const char *s = jce_json_get_string(root, key, NULL);
+        if (s && s[0]) {
+            strncpy(cfg->recent_scene_paths[i], s,
+                    sizeof(cfg->recent_scene_paths[i]) - 1);
+            cfg->recent_scene_paths[i][sizeof(cfg->recent_scene_paths[i]) - 1] = '\0';
+            cfg->recent_scene_count = i + 1;
+        } else {
+            cfg->recent_scene_paths[i][0] = '\0';
+        }
+    }
+
     jce_json_free(root);
     /* Suppress repetitive logging: jce_editor_config_load() is called from
        ~30 sites during startup (panels, dialogs, state init, etc.) and each
@@ -236,6 +256,7 @@ bool jce_editor_config_save(const JceEditorConfig *cfg) {
     jce_json_set_string(root, "theme",        cfg->theme);
     jce_json_set_string(root, "renderer",     cfg->renderer);
     jce_json_set_string(root, "last_project", cfg->last_project);
+    jce_json_set_string(root, "last_scene_path", cfg->last_scene_path);
 
     /* Scene view render settings. */
     jce_json_set_int (root, "view_mode",  cfg->view_mode);
@@ -266,6 +287,12 @@ bool jce_editor_config_save(const JceEditorConfig *cfg) {
         char key[16];
         snprintf(key, sizeof(key), "recent_%d", i);
         const char *val = (i < cfg->recent_count) ? cfg->recent_projects[i] : "";
+        jce_json_set_string(root, key, val);
+    }
+    for (int i = 0; i < 10; i++) {
+        char key[24];
+        snprintf(key, sizeof(key), "recent_scene_%d", i);
+        const char *val = (i < cfg->recent_scene_count) ? cfg->recent_scene_paths[i] : "";
         jce_json_set_string(root, key, val);
     }
 
@@ -318,4 +345,61 @@ void jce_editor_config_add_recent(JceEditorConfig *cfg, const char *path) {
     /* Place the new path at the front */
     strncpy(cfg->recent_projects[0], path, sizeof(cfg->recent_projects[0]) - 1);
     cfg->recent_projects[0][sizeof(cfg->recent_projects[0]) - 1] = '\0';
+}
+
+void jce_editor_config_add_recent_scene(JceEditorConfig *cfg, const char *path) {
+    if (!cfg || !path || path[0] == '\0') return;
+
+    /* Filter: only accept .scene.json files (post A1-A6 unification). */
+    size_t plen = strlen(path);
+    const char *suffix = ".scene.json";
+    size_t slen = strlen(suffix);
+    if (plen < slen) return;
+    /* Case-insensitive ASCII suffix compare. */
+    bool suffix_ok = true;
+    for (size_t i = 0; i < slen; i++) {
+        char a = path[plen - slen + i];
+        char b = suffix[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (a != b) { suffix_ok = false; break; }
+    }
+    if (!suffix_ok) return;
+
+    /* Normalize backslashes to forward slashes so dedupe works regardless
+     * of whether the path came from Win32 APIs or our IO layer. */
+    char norm[512];
+    size_t n = plen < sizeof(norm) - 1 ? plen : sizeof(norm) - 1;
+    for (size_t i = 0; i < n; i++) {
+        char c = path[i];
+        norm[i] = (c == '\\') ? '/' : c;
+    }
+    norm[n] = '\0';
+
+    int dup_idx = -1;
+    for (int i = 0; i < cfg->recent_scene_count; i++) {
+        if (strcmp(cfg->recent_scene_paths[i], norm) == 0) {
+            dup_idx = i;
+            break;
+        }
+    }
+
+    if (dup_idx >= 0) {
+        for (int i = dup_idx; i > 0; i--) {
+            strncpy(cfg->recent_scene_paths[i], cfg->recent_scene_paths[i - 1],
+                    sizeof(cfg->recent_scene_paths[i]) - 1);
+            cfg->recent_scene_paths[i][sizeof(cfg->recent_scene_paths[i]) - 1] = '\0';
+        }
+    } else {
+        int count = cfg->recent_scene_count < 10 ? cfg->recent_scene_count : 9;
+        for (int i = count; i > 0; i--) {
+            strncpy(cfg->recent_scene_paths[i], cfg->recent_scene_paths[i - 1],
+                    sizeof(cfg->recent_scene_paths[i]) - 1);
+            cfg->recent_scene_paths[i][sizeof(cfg->recent_scene_paths[i]) - 1] = '\0';
+        }
+        if (cfg->recent_scene_count < 10)
+            cfg->recent_scene_count++;
+    }
+
+    strncpy(cfg->recent_scene_paths[0], norm, sizeof(cfg->recent_scene_paths[0]) - 1);
+    cfg->recent_scene_paths[0][sizeof(cfg->recent_scene_paths[0]) - 1] = '\0';
 }

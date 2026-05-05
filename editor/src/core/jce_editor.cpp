@@ -9,6 +9,7 @@
 
 #include <cstdlib>
 #include <cmath>
+#include <cfloat>
 
 #include <jce/os/core/jce_str.h>
 #include <jce/os/core/jce_timer.h>
@@ -24,6 +25,7 @@
 #include <jce/ui/jce_imgui_renderer.h>
 #include "jce_build_manager.h"
 #include "jce_run_manager.h"
+#include "scene/jce_editor_game_render.h"
 
 extern "C" void jce_reflect_register_builtin(void);
 extern "C" void jce_hotkeys_init(void);
@@ -331,6 +333,19 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
     s_editor.active      = true;
     s_editor.initialized = true;
 
+    /* Auto-restore last opened scene (if any), so the editor reopens
+     * exactly where the user left off.  Silent failure is fine — first
+     * launch or a deleted scene file simply leaves the default empty
+     * scene in place. */
+    {
+        JceEditorConfig _ecfg;
+        if (jce_editor_config_load(&_ecfg)
+            && _ecfg.last_scene_path[0] != '\0'
+            && jce_fs_host_exists_file(_ecfg.last_scene_path)) {
+            (void)jce_state_load_scene_file(_ecfg.last_scene_path);
+        }
+    }
+
     return true;
 }
 
@@ -376,12 +391,32 @@ bool jce_editor_process_event(const JceEvent *event)
 
     if (!s_editor.active) return false;
 
+    /* When the Game View has captured the cursor (FPS-look mode using SDL
+     * relative-mouse-mode), the OS still emits absolute MOUSE_MOTION events
+     * pinned to the warp point.  Forwarding them to ImGui makes its virtual
+     * cursor hover/click whatever panel sits behind that warp point — the
+     * user sees other panels react while playing.  Gate ImGui pointer
+     * events with the capture flag (Unity ImGUIEvents-during-Play model)
+     * and still forward xrel/yrel to the FPS accumulator. */
+    const bool game_capture = jce_editor_game_render_is_mouse_captured();
+
     switch (event->type) {
     case JCE_EVENT_MOUSE_MOTION:
-        io.AddMousePosEvent(event->motion.x, event->motion.y);
+        if (game_capture) {
+            /* Tell ImGui there is no mouse — official sentinel. */
+            io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+        } else {
+            io.AddMousePosEvent(event->motion.x, event->motion.y);
+        }
+        /* Always forward relative deltas: when SDL relative-mouse-mode is
+         * on, the absolute position is pinned and ImGui's MouseDelta is
+         * zero, so we need xrel/yrel to drive FPS look. */
+        jce_editor_game_render_push_mouse_delta(event->motion.xrel,
+                                                 event->motion.yrel);
         break;
 
     case JCE_EVENT_MOUSE_WHEEL: {
+        if (game_capture) break; /* wheel belongs to the game while captured */
         /* Distinguish touchpad from mouse-wheel by checking whether wheel.x
            is fractional. Windows Precision Touchpad reports values in the
            0.05..0.95 range per event; classic mouse wheels (incl. tilt)
@@ -399,6 +434,7 @@ bool jce_editor_process_event(const JceEvent *event)
 
     case JCE_EVENT_MOUSE_BUTTON_DOWN:
     case JCE_EVENT_MOUSE_BUTTON_UP: {
+        if (game_capture) break; /* clicks belong to the game while captured */
         int btn = -1;
         switch (event->button.button) {
         case JCE_MOUSE_BUTTON_LEFT:   btn = 0; break;
