@@ -100,6 +100,75 @@ static bgfx_texture_format_t to_bgfx_fmt(JceRGFormat fmt)
     }
 }
 
+/* ── Frame debug capture (Sprint 3 #10) ────────────────────────────── */
+
+#define FRAME_DEBUG_MAX_PASSES 64
+
+static struct {
+    bool                pending;       /* request set, not yet captured */
+    bool                has_capture;   /* at least one capture done */
+    uint32_t            count;         /* passes in current capture */
+    JceRGFrameDebugPass passes[FRAME_DEBUG_MAX_PASSES];
+} g_fd = { 0 };
+
+void jce_rg_frame_debug_request_capture(void)
+{
+    g_fd.pending = true;
+}
+
+bool jce_rg_frame_debug_pending(void)
+{
+    return g_fd.pending;
+}
+
+bool jce_rg_frame_debug_get(JceRGFrameDebugPass *out_passes,
+                             uint32_t cap, uint32_t *out_count)
+{
+    if (!g_fd.has_capture) {
+        if (out_count) *out_count = 0;
+        return false;
+    }
+    uint32_t n = g_fd.count;
+    if (n > cap) n = cap;
+    if (out_passes && n > 0)
+        memcpy(out_passes, g_fd.passes, n * sizeof(JceRGFrameDebugPass));
+    if (out_count) *out_count = n;
+    return true;
+}
+
+static void fd_capture_now(JceRenderGraph *rg)
+{
+    g_fd.count = 0;
+    if (!rg) return;
+    for (uint16_t i = 0; i < rg->exec_count && g_fd.count < FRAME_DEBUG_MAX_PASSES; i++) {
+        uint16_t pi = rg->exec_order[i];
+        PassRecord *p = &rg->passes[pi];
+        JceRGFrameDebugPass *out = &g_fd.passes[g_fd.count++];
+        memset(out, 0, sizeof(*out));
+        snprintf(out->name, sizeof(out->name), "%s", p->name);
+        out->view_id     = p->bgfx_view;
+        out->read_count  = p->read_count;
+        out->write_count = p->write_count;
+        out->culled      = p->culled;
+        uint16_t rn = p->read_count  > 8 ? 8 : p->read_count;
+        uint16_t wn = p->write_count > 8 ? 8 : p->write_count;
+        for (uint16_t k = 0; k < rn; k++) {
+            uint16_t ri = p->reads[k];
+            const char *nm = (ri < rg->resource_count && rg->resources[ri].desc.debug_name)
+                              ? rg->resources[ri].desc.debug_name : "?";
+            snprintf(out->read_names[k], sizeof(out->read_names[k]), "%s", nm);
+        }
+        for (uint16_t k = 0; k < wn; k++) {
+            uint16_t ri = p->writes[k];
+            const char *nm = (ri < rg->resource_count && rg->resources[ri].desc.debug_name)
+                              ? rg->resources[ri].desc.debug_name : "?";
+            snprintf(out->write_names[k], sizeof(out->write_names[k]), "%s", nm);
+        }
+    }
+    g_fd.has_capture = true;
+    g_fd.pending     = false;
+}
+
 /* ── Create / Destroy ─────────────────────────────────────────────── */
 
 JceRenderGraph *jce_rg_create(void)
@@ -355,6 +424,11 @@ void jce_rg_execute(JceRenderGraph *rg)
         if (p->culled || !p->fn) continue;
 
         p->fn((JceRGPass){ pi }, p->bgfx_view, p->userdata);
+    }
+
+    /* Frame debug capture (after pass execute so view IDs are stable). */
+    if (g_fd.pending) {
+        fd_capture_now(rg);
     }
     JCE_PROFILE_ZONE_END;
 }

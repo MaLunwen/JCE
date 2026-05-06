@@ -7,6 +7,7 @@
  */
 
 #include "ui/jce_editor_colors.h"
+#include "ui/jce_theme_palette.h"
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
 #include "scene/jce_editor_scene_render.h"
@@ -71,7 +72,7 @@ void jce_editor_panel_postfx_content(void)
     bool changed = false;
 
     /* Tonemap. */
-    ImGui::PushStyleColor(ImGuiCol_Header, JCE_COLOR_INSP_HEADER);
+    ImGui::PushStyleColor(ImGuiCol_Header, jce_theme::inspector_header_color());
     if (ImGui::CollapsingHeader(jce_editor_i18n("postfx.tonemapping"), ImGuiTreeNodeFlags_DefaultOpen)) {
         snprintf(lbl, sizeof(lbl), "%s##tonemap", jce_editor_i18n("postfx.enable"));
         changed |= ImGui::Checkbox(lbl, &s_pfx.enabled[JCE_POSTFX_TONEMAP]);
@@ -85,7 +86,7 @@ void jce_editor_panel_postfx_content(void)
     ImGui::PopStyleColor();
 
     /* Bloom. */
-    ImGui::PushStyleColor(ImGuiCol_Header, JCE_COLOR_INSP_HEADER);
+    ImGui::PushStyleColor(ImGuiCol_Header, jce_theme::inspector_header_color());
     if (ImGui::CollapsingHeader(jce_editor_i18n("postfx.bloom"), ImGuiTreeNodeFlags_DefaultOpen)) {
         snprintf(lbl, sizeof(lbl), "%s##bloom", jce_editor_i18n("postfx.enable"));
         changed |= ImGui::Checkbox(lbl, &s_pfx.enabled[JCE_POSTFX_BLOOM]);
@@ -100,7 +101,7 @@ void jce_editor_panel_postfx_content(void)
     ImGui::PopStyleColor();
 
     /* FXAA. */
-    ImGui::PushStyleColor(ImGuiCol_Header, JCE_COLOR_INSP_HEADER);
+    ImGui::PushStyleColor(ImGuiCol_Header, jce_theme::inspector_header_color());
     if (ImGui::CollapsingHeader(jce_editor_i18n("postfx.fxaa"), ImGuiTreeNodeFlags_DefaultOpen)) {
         snprintf(lbl, sizeof(lbl), "%s##fxaa", jce_editor_i18n("postfx.enable"));
         changed |= ImGui::Checkbox(lbl, &s_pfx.enabled[JCE_POSTFX_FXAA]);
@@ -112,7 +113,7 @@ void jce_editor_panel_postfx_content(void)
     ImGui::PopStyleColor();
 
     /* Vignette. */
-    ImGui::PushStyleColor(ImGuiCol_Header, JCE_COLOR_INSP_HEADER);
+    ImGui::PushStyleColor(ImGuiCol_Header, jce_theme::inspector_header_color());
     if (ImGui::CollapsingHeader(jce_editor_i18n("postfx.vignette"))) {
         snprintf(lbl, sizeof(lbl), "%s##vignette", jce_editor_i18n("postfx.enable"));
         changed |= ImGui::Checkbox(lbl, &s_pfx.enabled[JCE_POSTFX_VIGNETTE]);
@@ -127,7 +128,7 @@ void jce_editor_panel_postfx_content(void)
     ImGui::PopStyleColor();
 
     /* Chromatic Aberration. */
-    ImGui::PushStyleColor(ImGuiCol_Header, JCE_COLOR_INSP_HEADER);
+    ImGui::PushStyleColor(ImGuiCol_Header, jce_theme::inspector_header_color());
     if (ImGui::CollapsingHeader(jce_editor_i18n("postfx.chromaticAberration"))) {
         snprintf(lbl, sizeof(lbl), "%s##chrom", jce_editor_i18n("postfx.enable"));
         changed |= ImGui::Checkbox(lbl, &s_pfx.enabled[JCE_POSTFX_CHROMATIC]);
@@ -139,7 +140,7 @@ void jce_editor_panel_postfx_content(void)
     ImGui::PopStyleColor();
 
     /* Grayscale. */
-    ImGui::PushStyleColor(ImGuiCol_Header, JCE_COLOR_INSP_HEADER);
+    ImGui::PushStyleColor(ImGuiCol_Header, jce_theme::inspector_header_color());
     if (ImGui::CollapsingHeader(jce_editor_i18n("postfx.grayscale"))) {
         snprintf(lbl, sizeof(lbl), "%s##gray", jce_editor_i18n("postfx.enable"));
         changed |= ImGui::Checkbox(lbl, &s_pfx.enabled[JCE_POSTFX_GRAYSCALE]);

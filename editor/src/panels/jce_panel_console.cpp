@@ -10,6 +10,7 @@
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_state.h"
+#include "viewers/jce_file_viewer.h"
 
 #include <jce/tools/jce_imgui.hpp>
 #include <stdio.h>
@@ -156,6 +157,72 @@ static void copy_all_visible_to_clipboard(void)
     }
     if (!out.empty())
         ImGui::SetClipboardText(out.c_str());
+}
+
+/* ── path:line detection (best-effort) ────────────────────────────── */
+
+static bool _looks_like_src_ext(const char *e, size_t n)
+{
+    static const char *exts[] = {
+        "c","h","cc","cxx","cpp","hpp","hh","inl","ipp",
+        "lua","py","js","ts","glsl","hlsl","sc","sh",
+        "json","yaml","yml","toml","md","txt","ini","cfg"
+    };
+    for (size_t i = 0; i < sizeof(exts)/sizeof(exts[0]); i++) {
+        size_t el = strlen(exts[i]);
+        if (n == el) {
+            size_t j;
+            for (j = 0; j < n; j++)
+                if (tolower((unsigned char)e[j]) != exts[i][j]) break;
+            if (j == n) return true;
+        }
+    }
+    return false;
+}
+
+/* Scan a text line for a "path:line" token; return a pointer past the
+ * token along with the path and line number on success. */
+static bool console_try_parse_path_line(const char *text,
+                                        std::string &out_path, int &out_line)
+{
+    if (!text) return false;
+    const char *p = text;
+    while (*p) {
+        const char *colon = strchr(p, ':');
+        if (!colon) return false;
+
+        const char *line_start = colon + 1;
+        if (!isdigit((unsigned char)*line_start)) {
+            p = colon + 1;
+            continue;
+        }
+        int line = 0;
+        const char *q = line_start;
+        while (isdigit((unsigned char)*q)) { line = line*10 + (*q - '0'); ++q; }
+        if (line <= 0) { p = colon + 1; continue; }
+
+        const char *dot = NULL;
+        for (const char *r = colon - 1; r >= text; --r) {
+            char c = *r;
+            if (c == ' ' || c == '\t' || c == '"' || c == '\'' || c == '(' || c == '<')
+                break;
+            if (c == '.') { dot = r; break; }
+        }
+        if (!dot || dot == colon - 1) { p = q; continue; }
+        size_t ext_len = (size_t)(colon - dot - 1);
+        if (!_looks_like_src_ext(dot + 1, ext_len)) { p = q; continue; }
+
+        const char *path_start = dot;
+        for (; path_start > text; --path_start) {
+            char c = *(path_start - 1);
+            if (c == ' ' || c == '\t' || c == '"' || c == '\'' || c == '(' || c == '<' || c == '[')
+                break;
+        }
+        out_path.assign(path_start, (size_t)(colon - path_start));
+        out_line = line;
+        return true;
+    }
+    return false;
 }
 
 /* ── Content (embeddable in tabs) ─────────────────────────────────── */
@@ -309,6 +376,24 @@ void jce_editor_panel_console_content(void)
                 s_ui.selected.insert(idx);
                 s_ui.anchor = idx;
             }
+        }
+
+        /* Double-click: try to jump to a "path:line" reference in the message. */
+        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            std::string jpath;
+            int jline = 0;
+            if (console_try_parse_path_line(entry.text, jpath, jline)) {
+                jce_file_viewer_open(jpath.c_str());
+                jce_editor_console_log("jump → %s:%d", jpath.c_str(), jline);
+            }
+        }
+        if (ImGui::IsItemHovered()) {
+            std::string jpath;
+            int jline = 0;
+            if (console_try_parse_path_line(entry.text, jpath, jline))
+                ImGui::SetTooltip("%s %s:%d",
+                    jce_editor_i18n("console.doubleClickToOpen"),
+                    jpath.c_str(), jline);
         }
 
         if (ImGui::BeginPopupContextItem("##ctx")) {

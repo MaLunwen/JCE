@@ -602,6 +602,15 @@ static void browse_refresh_entries(void)
     s_open_project.browse_refresh = false;
 }
 
+void jce_editor_dialog_open_project_set_path(const char *path)
+{
+    open_project_ensure_init();
+    if (path && path[0]) {
+        snprintf(s_open_project.manual_path,
+                 sizeof(s_open_project.manual_path), "%s", path);
+    }
+}
+
 void jce_editor_dialog_open_project(bool *p_open)
 {
     static bool was_open = false;

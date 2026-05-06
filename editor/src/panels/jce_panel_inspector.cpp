@@ -5,6 +5,7 @@
  */
 
 #include "ui/jce_editor_colors.h"
+#include "ui/jce_theme_palette.h"
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_state.h"
@@ -33,6 +34,46 @@ extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/renderer/jce_model.h>
 #include <jce/renderer/jce_pbr_material.h>
+}
+
+/* ── Component clipboard for Copy/Paste Values ────────────────────── */
+
+static struct {
+    uint32_t flag;
+    char     data[4096];
+    size_t   data_size;
+} s_comp_clipboard = { 0, {0}, 0 };
+
+static void *comp_get_ptr_and_size(JceScene *scene, JceEntity e,
+                                   uint32_t flag, size_t *out_size)
+{
+    if (!scene) return NULL;
+    switch (flag) {
+    case JCE_COMP_FLAG_TRANSFORM:
+        *out_size = sizeof(JceTransform);
+        return jce_scene_get_transform(scene, e);
+    case JCE_COMP_FLAG_MESH_RENDERER:
+        *out_size = sizeof(JceMeshRenderer);
+        return jce_scene_get_mesh_renderer(scene, e);
+    case JCE_COMP_FLAG_CAMERA:
+        *out_size = sizeof(JceCameraComponent);
+        return jce_scene_get_camera(scene, e);
+    case JCE_COMP_FLAG_RIGIDBODY:
+        *out_size = sizeof(JceRigidBodyComponent);
+        return jce_scene_get_rigidbody(scene, e);
+    case JCE_COMP_FLAG_BOX_COLLIDER:
+        *out_size = sizeof(JceBoxColliderComponent);
+        return jce_scene_get_box_collider(scene, e);
+    case JCE_COMP_FLAG_SPHERE_COLLIDER:
+        *out_size = sizeof(JceSphereColliderComponent);
+        return jce_scene_get_sphere_collider(scene, e);
+    case JCE_COMP_FLAG_AUDIO_SOURCE:
+        *out_size = sizeof(JceAudioSourceComponent);
+        return jce_scene_get_audio_source(scene, e);
+    default:
+        *out_size = 0;
+        return NULL;
+    }
 }
 
 /* ── Tag colors (display data) ────────────────────────────────────── */
@@ -162,6 +203,21 @@ static void insp_undo_int(int *value, int prev)
     *value = now;
     jce_state_end_batch_edit();
 }
+
+/* ── Field-level "Reset" right-click context menu ─────────────────────
+ * Wraps the most-recently-drawn ImGui item with a Unity-style right-
+ * click "Reset" menu that restores the field to a known default. */
+#define INSP_RESET_CTX(POPUP_ID, ...)                                       \
+    do {                                                                    \
+        if (ImGui::BeginPopupContextItem(POPUP_ID)) {                       \
+            if (ImGui::MenuItem(jce_editor_i18n("inspector.resetField"))) { \
+                jce_state_begin_batch_edit();                               \
+                __VA_ARGS__;                                                \
+                jce_state_end_batch_edit();                                 \
+            }                                                               \
+            ImGui::EndPopup();                                              \
+        }                                                                   \
+    } while (0)
 
 /* ── Vec3 control (colored XYZ drag floats) ───────────────────────── */
 
@@ -369,6 +425,10 @@ static void draw_comp_light(JceScene *scene, JceEntity e, uint32_t flags)
         else if (light_type == 1) { JcePointLight       *l = jce_scene_get_point_light(scene, e); l->color.x=color[0]; l->color.y=color[1]; l->color.z=color[2]; }
         else                      { JceSpotLight        *l = jce_scene_get_spot_light(scene, e);  l->color.x=color[0]; l->color.y=color[1]; l->color.z=color[2]; }
     }
+    INSP_RESET_CTX("##rst_lightColor",
+        if (light_type == 0)      { JceDirectionalLight *l = jce_scene_get_dir_light(scene, e);   l->color = { 1.0f, 1.0f, 1.0f }; }
+        else if (light_type == 1) { JcePointLight       *l = jce_scene_get_point_light(scene, e); l->color = { 1.0f, 1.0f, 1.0f }; }
+        else                      { JceSpotLight        *l = jce_scene_get_spot_light(scene, e);  l->color = { 1.0f, 1.0f, 1.0f }; });
     insp_track_edit();
 
     snprintf(lbl, sizeof(lbl), "%s###Intensity", jce_editor_i18n("light.intensity"));
@@ -377,6 +437,10 @@ static void draw_comp_light(JceScene *scene, JceEntity e, uint32_t flags)
         else if (light_type == 1) { jce_scene_get_point_light(scene, e)->intensity = intensity; }
         else                      { jce_scene_get_spot_light(scene, e)->intensity  = intensity; }
     }
+    INSP_RESET_CTX("##rst_lightIntensity",
+        if (light_type == 0)      { jce_scene_get_dir_light(scene, e)->intensity   = 1.0f; }
+        else if (light_type == 1) { jce_scene_get_point_light(scene, e)->intensity = 1.0f; }
+        else                      { jce_scene_get_spot_light(scene, e)->intensity  = 1.0f; });
     insp_track_edit();
 
     /* Type combo. */
@@ -583,16 +647,25 @@ static void draw_comp_mesh_renderer(JceMeshRenderer *mr)
 
     if (ImGui::TreeNodeEx(jce_editor_i18n("inspector.pbrMaterial"), ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::ColorEdit4(jce_editor_i18n("inspector.baseColor"), mr->base_color);
+        INSP_RESET_CTX("##rst_baseColor",
+                       mr->base_color[0] = 1.0f; mr->base_color[1] = 1.0f;
+                       mr->base_color[2] = 1.0f; mr->base_color[3] = 1.0f);
         insp_track_edit();
         ImGui::DragFloat(jce_editor_i18n("viewer.metallic"), &mr->metallic, 0.01f, 0.0f, 1.0f);
+        INSP_RESET_CTX("##rst_metallic", mr->metallic = 0.0f);
         insp_track_edit();
         ImGui::DragFloat(jce_editor_i18n("viewer.roughness"), &mr->roughness, 0.01f, 0.0f, 1.0f);
+        INSP_RESET_CTX("##rst_roughness", mr->roughness = 0.5f);
         insp_track_edit();
         ImGui::ColorEdit3(jce_editor_i18n("inspector.emissive"), mr->emissive);
+        INSP_RESET_CTX("##rst_emissive",
+                       mr->emissive[0] = 0.0f; mr->emissive[1] = 0.0f; mr->emissive[2] = 0.0f);
         insp_track_edit();
         ImGui::DragFloat(jce_editor_i18n("inspector.normalScale"), &mr->normal_scale, 0.01f, 0.0f, 4.0f);
+        INSP_RESET_CTX("##rst_normalScale", mr->normal_scale = 1.0f);
         insp_track_edit();
         ImGui::DragFloat(jce_editor_i18n("inspector.aoStrength"), &mr->ao_strength, 0.01f, 0.0f, 2.0f);
+        INSP_RESET_CTX("##rst_aoStrength", mr->ao_strength = 1.0f);
         insp_track_edit();
         const char *alpha_modes[] = {
             jce_editor_i18n("inspector.alphaMode.opaque"),
@@ -639,6 +712,9 @@ static void draw_comp_sprite_renderer(JceSpriteRendererComponent *sr)
     insp_track_edit();
     accept_asset_drop(sr->sprite_path, 128);
     ImGui::ColorEdit4(jce_editor_i18n("spriteRenderer.color"), sr->color);
+    INSP_RESET_CTX("##rst_spriteColor",
+                   sr->color[0] = 1.0f; sr->color[1] = 1.0f;
+                   sr->color[2] = 1.0f; sr->color[3] = 1.0f);
     insp_track_edit();
     if (ImGui::Checkbox(jce_editor_i18n("spriteRenderer.flipX"), &sr->flip_x))
         insp_undo_bool(&sr->flip_x);
@@ -951,7 +1027,12 @@ static bool comp_section_begin(uint32_t entity_id,
     int tn_flags = ImGuiTreeNodeFlags_AllowOverlap |
                    (was_open ? ImGuiTreeNodeFlags_DefaultOpen : 0);
 
-    ImGui::PushStyleColor(ImGuiCol_Header, JCE_COLOR_INSP_HEADER);
+    /* Inspector collapsing-header tint:
+       - Dark themes: keep the slate slate-blue accent (#323744) so it
+         reads as a distinct band over the dark window bg.
+       - Light themes: defer to ImGuiCol_Header so the bar tracks the
+         active palette (avoids a near-black strip on white). */
+    ImGui::PushStyleColor(ImGuiCol_Header, jce_theme::inspector_header_color());
     bool open = ImGui::CollapsingHeader(display_name, tn_flags);
     if (open) sidecar.expanded_flags |= flag;
     else      sidecar.expanded_flags &= ~flag;
@@ -962,8 +1043,46 @@ static bool comp_section_begin(uint32_t entity_id,
         ImGui::OpenPopup("ComponentSettings");
 
     if (ImGui::BeginPopup("ComponentSettings")) {
-        if (ImGui::MenuItem(jce_editor_i18n("transform.reset")))
-            jce_editor_console_log("Reset %s (stub)", display_name);
+        JceScene *_cs = jce_state_get_scene();
+        JceEntity _ce = jce_state_to_ecs_entity(entity_id);
+        size_t _csz = 0;
+        void *_cptr = comp_get_ptr_and_size(_cs, _ce, flag, &_csz);
+
+        if (ImGui::MenuItem(jce_editor_i18n("inspector.copyComponent"),
+                            NULL, false, _cptr != NULL && _csz > 0 && _csz <= sizeof(s_comp_clipboard.data))) {
+            s_comp_clipboard.flag = flag;
+            s_comp_clipboard.data_size = _csz;
+            memcpy(s_comp_clipboard.data, _cptr, _csz);
+        }
+        bool can_paste = (s_comp_clipboard.flag == flag && s_comp_clipboard.data_size > 0
+                          && _cptr != NULL && _csz == s_comp_clipboard.data_size);
+        if (!can_paste) ImGui::BeginDisabled();
+        if (ImGui::MenuItem(jce_editor_i18n("inspector.pasteComponentValues"))) {
+            jce_state_begin_batch_edit();
+            memcpy(_cptr, s_comp_clipboard.data, s_comp_clipboard.data_size);
+            jce_state_end_batch_edit();
+        }
+        if (!can_paste) ImGui::EndDisabled();
+
+        ImGui::Separator();
+
+        if (ImGui::MenuItem(jce_editor_i18n("transform.reset"))) {
+            if (_cptr && _csz > 0) {
+                jce_state_begin_batch_edit();
+                if (flag == JCE_COMP_FLAG_TRANSFORM) {
+                    JceTransform *t = (JceTransform *)_cptr;
+                    t->position = { 0.0f, 0.0f, 0.0f };
+                    t->rotation = jce_q_identity();
+                    t->scale    = { 1.0f, 1.0f, 1.0f };
+                } else {
+                    memset(_cptr, 0, _csz);
+                }
+                jce_state_end_batch_edit();
+            }
+        }
+
+        ImGui::Separator();
+
         if (!removable) {
             ImGui::BeginDisabled();
             ImGui::PushStyleColor(ImGuiCol_Text, JCE_COLOR_TEXT_ERROR);
@@ -1503,17 +1622,52 @@ void jce_editor_panel_inspector_content(void)
         ImGui::OpenPopup("AddComponentPopup");
 
     if (ImGui::BeginPopup("AddComponentPopup")) {
+        static char s_addcomp_filter[64] = {0};
+        static bool s_addcomp_focus = false;
+        if (ImGui::IsWindowAppearing()) {
+            s_addcomp_filter[0] = '\0';
+            s_addcomp_focus = true;
+        }
+        if (s_addcomp_focus) {
+            ImGui::SetKeyboardFocusHere();
+            s_addcomp_focus = false;
+        }
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputTextWithHint("##addcomp_search",
+            jce_editor_i18n("inspector.searchComponents"),
+            s_addcomp_filter, sizeof(s_addcomp_filter));
+
+        ImGui::BeginChild("##addcomp_list", ImVec2(0, 200), false);
         const int n_opts = (int)(sizeof(s_add_options) / sizeof(s_add_options[0]));
+        int first_match = -1;
         for (int i = 0; i < n_opts; i++) {
             const AddCompOption &opt = s_add_options[i];
             if (flags & opt.flag) continue;
-            /* Hide light add-options when any light is already present. */
             if (opt.is_light && (flags & light_mask)) continue;
-            const char *name = jce_comp_flag_display_name(opt.flag);
-            if (!name) continue;
-            if (ImGui::MenuItem(name))
+            const char *cname = jce_comp_flag_display_name(opt.flag);
+            if (!cname) continue;
+            if (s_addcomp_filter[0]) {
+                bool match = false;
+                const char *h = cname, *n = s_addcomp_filter;
+                for (; *h; ++h) {
+                    const char *a = h, *b = n;
+                    while (*a && *b && ((*a | 32) == (*b | 32))) { ++a; ++b; }
+                    if (!*b) { match = true; break; }
+                }
+                if (!match) continue;
+            }
+            if (first_match < 0) first_match = i;
+            if (ImGui::MenuItem(cname))
                 jce_state_add_component(focused, opt.flag);
         }
+        ImGui::EndChild();
+
+        if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) && first_match >= 0) {
+            jce_state_add_component(focused, s_add_options[first_match].flag);
+            ImGui::CloseCurrentPopup();
+        }
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+            ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
 

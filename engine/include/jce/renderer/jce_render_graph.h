@@ -119,6 +119,43 @@ JCE_API void jce_rg_execute(JceRenderGraph *rg);
 JCE_API void jce_rg_reset(JceRenderGraph *rg);
 
 /* ================================================================== */
+/* Frame debug capture (Sprint 3 #10)                                   */
+/* ================================================================== */
+
+/*
+ * One captured pass entry. Filled when a capture is requested via
+ * jce_rg_frame_debug_request_capture() and the next jce_rg_execute()
+ * runs. The buffer is owned by the render-graph module; copy out
+ * before issuing another capture.
+ */
+typedef struct {
+    char     name[64];
+    uint16_t view_id;
+    uint16_t read_count;
+    uint16_t write_count;
+    bool     culled;
+    /* Up to 8 read / 8 write resource debug names per pass; longer
+       lists are truncated and the count fields still reflect the true
+       counts. */
+    char     read_names[8][32];
+    char     write_names[8][32];
+} JceRGFrameDebugPass;
+
+/* Request a single-frame capture on the *next* execute. Cheap; safe
+   to call from any thread that owns the graph. */
+JCE_API void jce_rg_frame_debug_request_capture(void);
+
+/* Copy out the most recent capture (if any). Returns true if a
+   capture is available; *out_count set to number of passes copied
+   (≤ cap). Returns false if no capture has run yet. */
+JCE_API bool jce_rg_frame_debug_get(JceRGFrameDebugPass *out_passes,
+                                     uint32_t cap, uint32_t *out_count);
+
+/* Returns true while a capture has been requested but not yet
+   fulfilled (i.e. waiting for the next execute). */
+JCE_API bool jce_rg_frame_debug_pending(void);
+
+/* ================================================================== */
 /* Self-test                                                            */
 /* ================================================================== */
 

@@ -104,6 +104,16 @@ inline ImU32 node_outline()
                       : IM_COL32(0, 0, 0, 220);
 }
 
+/* Inspector / PostFX collapsing-header tint. Returns the slate-blue
+   accent under dark themes (JCE_COLOR_INSP_HEADER) and the active
+   palette's ImGuiCol_Header under light themes so the bar doesn't
+   read as black on a white background. */
+inline ImVec4 inspector_header_color()
+{
+    if (is_light()) return ImGui::GetStyleColorVec4(ImGuiCol_Header);
+    return ImVec4(50.0f/255.0f, 55.0f/255.0f, 65.0f/255.0f, 1.0f);
+}
+
 } /* namespace jce_theme */
 
 } /* extern "C++" */

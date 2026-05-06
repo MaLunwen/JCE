@@ -612,16 +612,16 @@ void draw_content(void)
     }
 
     ImGui::SetNextItemWidth(120);
-    ImGui::DragFloat("##tmin", &s.t_min, 0.01f, -1e6f, s.t_max - 0.001f, "tMin %.3f");
+    ImGui::DragFloat("##tmin", &s.t_min, 0.01f, -1e6f, s.t_max - 0.001f, jce_editor_i18n("curveEditor.range.tMinFmt"));
     ImGui::SameLine();
     ImGui::SetNextItemWidth(120);
-    ImGui::DragFloat("##tmax", &s.t_max, 0.01f, s.t_min + 0.001f, 1e6f, "tMax %.3f");
+    ImGui::DragFloat("##tmax", &s.t_max, 0.01f, s.t_min + 0.001f, 1e6f, jce_editor_i18n("curveEditor.range.tMaxFmt"));
     ImGui::SameLine();
     ImGui::SetNextItemWidth(120);
-    ImGui::DragFloat("##vmin", &s.v_min, 0.01f, -1e6f, s.v_max - 0.001f, "vMin %.3f");
+    ImGui::DragFloat("##vmin", &s.v_min, 0.01f, -1e6f, s.v_max - 0.001f, jce_editor_i18n("curveEditor.range.vMinFmt"));
     ImGui::SameLine();
     ImGui::SetNextItemWidth(120);
-    ImGui::DragFloat("##vmax", &s.v_max, 0.01f, s.v_min + 0.001f, 1e6f, "vMax %.3f");
+    ImGui::DragFloat("##vmax", &s.v_max, 0.01f, s.v_min + 0.001f, 1e6f, jce_editor_i18n("curveEditor.range.vMaxFmt"));
 
     Channel *act = active_chan();
     int n_keys = act ? (int)act->keys.size() : 0;
