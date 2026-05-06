@@ -45,7 +45,17 @@ void jce_editor_panel_hierarchy_content(void)
         const ImGuiPayload *payload = ImGui::AcceptDragDropPayload("JCE_ENTITY");
         if (payload) {
             uint32_t dragged_id = *(uint32_t *)payload->Data;
-            jce_state_reparent_entity(dragged_id, 0);
+            if (jce_state_is_selected(dragged_id)) {
+                int sel_n = 0;
+                const uint32_t *sel = jce_state_get_selection(&sel_n);
+                uint32_t ids[256];
+                int n = sel_n < 256 ? sel_n : 256;
+                for (int i = 0; i < n; i++) ids[i] = sel[i];
+                for (int i = 0; i < n; i++)
+                    jce_state_reparent_entity(ids[i], 0);
+            } else {
+                jce_state_reparent_entity(dragged_id, 0);
+            }
         }
         ImGui::EndDragDropTarget();
     }

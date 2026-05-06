@@ -26,6 +26,7 @@ void jce_terrain_panel_apply_brush_world(float wx, float wz, float dt);
 
 /* ── Forward declarations ─────────────────────────────────────────── */
 static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail);
+static void scene_view_frame_entities(bool all);
 
 /* ── Toolbar ─────────────────────────────────────────────────────── */
 
@@ -79,6 +80,14 @@ static void draw_scene_view_toolbar(void)
 
     ImGui::SameLine();
     ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
+    ImGui::SameLine();
+
+    if (ImGui::Button(jce_editor_i18n("toolbar.frameSelected"))) {
+        scene_view_frame_entities(false);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s (F)", jce_editor_i18n("toolbar.frameSelected"));
+
     ImGui::SameLine();
 
     if (ImGui::Button(jce_editor_i18n("menu.view"))) {
@@ -572,10 +581,63 @@ static bool compute_ground_hit(ImVec2 screen_pos, ImVec2 avail, float out_pos[3]
     return true;
 }
 
+/* Frame the selection (or all entities) in the scene view by computing
+ * an AABB from JceTransform positions/scales and asking the editor scene
+ * camera to fit it. Shared by the F / Shift+F hotkeys and the toolbar. */
+static void scene_view_frame_entities(bool all)
+{
+    JceScene *scene = jce_state_get_scene();
+    if (!scene) return;
+
+    float bmin[3] = { 1e30f,  1e30f,  1e30f };
+    float bmax[3] = {-1e30f, -1e30f, -1e30f };
+    int counted = 0;
+
+    auto accumulate = [&](uint32_t id) {
+        JceTransform *t = jce_scene_get_transform(scene, (JceEntity)id);
+        if (!t) return;
+        float hx = fabsf(t->scale.x) * 0.5f;
+        float hy = fabsf(t->scale.y) * 0.5f;
+        float hz = fabsf(t->scale.z) * 0.5f;
+        if (hx < 0.1f) hx = 0.1f;
+        if (hy < 0.1f) hy = 0.1f;
+        if (hz < 0.1f) hz = 0.1f;
+        float lo[3] = { t->position.x - hx, t->position.y - hy, t->position.z - hz };
+        float hi[3] = { t->position.x + hx, t->position.y + hy, t->position.z + hz };
+        for (int k = 0; k < 3; k++) {
+            if (lo[k] < bmin[k]) bmin[k] = lo[k];
+            if (hi[k] > bmax[k]) bmax[k] = hi[k];
+        }
+        counted++;
+    };
+
+    if (all) {
+        int total = jce_state_get_entity_count();
+        for (int i = 0; i < total; i++) {
+            uint32_t id = jce_state_get_entity_id_by_index(i);
+            if (id != 0 && jce_state_entity_exists(id))
+                accumulate(id);
+        }
+    } else {
+        int sel_n = 0;
+        const uint32_t *sel = jce_state_get_selection(&sel_n);
+        if (sel_n == 0) {
+            uint32_t f_ent = jce_state_get_focused();
+            if (f_ent != 0) accumulate(f_ent);
+        } else {
+            for (int i = 0; i < sel_n; i++)
+                if (sel[i] != 0 && jce_state_entity_exists(sel[i]))
+                    accumulate(sel[i]);
+        }
+    }
+
+    if (counted > 0)
+        jce_editor_scene_camera_focus_aabb(bmin, bmax);
+}
+
 /* Called immediately after InvisibleButton so the drag-drop target
  * applies to the full viewport area. */
-static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail)
-{
+static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
     if (!ImGui::BeginDragDropTarget()) {
         jce_editor_scene_clear_ghost();
         jce_editor_scene_clear_hover_entity();
@@ -1133,54 +1195,7 @@ static void handle_scene_view_shortcuts(void)
         const bool frame_sel  = jce_hotkey_pressed(JCE_HK_VIEW_FRAME_SELECTED);
         const bool frame_all_ = jce_hotkey_pressed(JCE_HK_VIEW_FRAME_ALL);
         if (frame_sel || frame_all_) {
-            JceScene *scene = jce_state_get_scene();
-            const bool frame_all = frame_all_;
-            if (scene) {
-                float bmin[3] = { 1e30f,  1e30f,  1e30f };
-                float bmax[3] = {-1e30f, -1e30f, -1e30f };
-                int counted = 0;
-
-                auto accumulate = [&](uint32_t id) {
-                    JceTransform *t = jce_scene_get_transform(scene, (JceEntity)id);
-                    if (!t) return;
-                    float hx = fabsf(t->scale.x) * 0.5f;
-                    float hy = fabsf(t->scale.y) * 0.5f;
-                    float hz = fabsf(t->scale.z) * 0.5f;
-                    if (hx < 0.1f) hx = 0.1f;
-                    if (hy < 0.1f) hy = 0.1f;
-                    if (hz < 0.1f) hz = 0.1f;
-                    float lo[3] = { t->position.x - hx, t->position.y - hy, t->position.z - hz };
-                    float hi[3] = { t->position.x + hx, t->position.y + hy, t->position.z + hz };
-                    for (int k = 0; k < 3; k++) {
-                        if (lo[k] < bmin[k]) bmin[k] = lo[k];
-                        if (hi[k] > bmax[k]) bmax[k] = hi[k];
-                    }
-                    counted++;
-                };
-
-                if (frame_all) {
-                    int total = jce_state_get_entity_count();
-                    for (int i = 0; i < total; i++) {
-                        uint32_t id = jce_state_get_entity_id_by_index(i);
-                        if (id != 0 && jce_state_entity_exists(id))
-                            accumulate(id);
-                    }
-                } else {
-                    int sel_n = 0;
-                    const uint32_t *sel = jce_state_get_selection(&sel_n);
-                    if (sel_n == 0) {
-                        uint32_t f_ent = jce_state_get_focused();
-                        if (f_ent != 0) accumulate(f_ent);
-                    } else {
-                        for (int i = 0; i < sel_n; i++)
-                            if (sel[i] != 0 && jce_state_entity_exists(sel[i]))
-                                accumulate(sel[i]);
-                    }
-                }
-
-                if (counted > 0)
-                    jce_editor_scene_camera_focus_aabb(bmin, bmax);
-            }
+            scene_view_frame_entities(frame_all_);
         }
 
         if (jce_hotkey_pressed(JCE_HK_EDIT_DELETE)) {

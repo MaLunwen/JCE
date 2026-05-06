@@ -489,7 +489,16 @@ void draw_entity_node(uint32_t id)
 
     if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
         ImGui::SetDragDropPayload("JCE_ENTITY", &id, sizeof(uint32_t));
-        ImGui::Text("%s", name);
+        if (jce_state_is_selected(id)) {
+            int sel_n = 0;
+            jce_state_get_selection(&sel_n);
+            if (sel_n > 1)
+                ImGui::Text("%s  (+%d)", name, sel_n - 1);
+            else
+                ImGui::Text("%s", name);
+        } else {
+            ImGui::Text("%s", name);
+        }
         ImGui::EndDragDropSource();
     }
 
@@ -497,7 +506,20 @@ void draw_entity_node(uint32_t id)
         const ImGuiPayload *payload = ImGui::AcceptDragDropPayload("JCE_ENTITY");
         if (payload) {
             uint32_t dragged_id = *(uint32_t *)payload->Data;
-            jce_state_reparent_entity(dragged_id, id);
+            if (jce_state_is_selected(dragged_id)) {
+                int sel_n = 0;
+                const uint32_t *sel = jce_state_get_selection(&sel_n);
+                /* Copy out: reparenting may invalidate the pointer. */
+                uint32_t ids[256];
+                int n = sel_n < 256 ? sel_n : 256;
+                for (int i = 0; i < n; i++) ids[i] = sel[i];
+                for (int i = 0; i < n; i++) {
+                    if (ids[i] == id) continue;
+                    jce_state_reparent_entity(ids[i], id);
+                }
+            } else {
+                jce_state_reparent_entity(dragged_id, id);
+            }
         }
         ImGui::EndDragDropTarget();
     }
@@ -518,8 +540,20 @@ void draw_entity_node(uint32_t id)
             const ImGuiPayload *payload = ImGui::AcceptDragDropPayload("JCE_ENTITY");
             if (payload) {
                 uint32_t dragged_id = *(uint32_t *)payload->Data;
-                if (dragged_id != id)
+                if (jce_state_is_selected(dragged_id)) {
+                    int sel_n = 0;
+                    const uint32_t *sel = jce_state_get_selection(&sel_n);
+                    uint32_t ids[256];
+                    int n = sel_n < 256 ? sel_n : 256;
+                    for (int i = 0; i < n; i++) ids[i] = sel[i];
+                    /* Insert in reverse so first selected ends up just after id. */
+                    for (int i = n - 1; i >= 0; i--) {
+                        if (ids[i] == id) continue;
+                        jce_state_reorder_sibling(ids[i], id, true);
+                    }
+                } else if (dragged_id != id) {
                     jce_state_reorder_sibling(dragged_id, id, true);
+                }
             }
             ImGui::EndDragDropTarget();
         }

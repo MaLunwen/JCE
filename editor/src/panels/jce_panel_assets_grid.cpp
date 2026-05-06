@@ -9,6 +9,10 @@
 
 #include <jce/os/core/jce_str.h>
 
+extern "C" {
+#include <jce/renderer/jce_pbr_material.h>
+}
+
 static void open_asset_in_file_viewer(const char *path)
 {
     if (!path || !path[0]) {
@@ -716,6 +720,60 @@ void draw_asset_empty_area_menu(void)
                 jce_path_join(nf, sizeof(nf), s_assets.current_path.c_str(), "New Scene.scene");
                 ed_write_file(nf, "{}", 2);
                 s_assets.needs_refresh = true;
+            }
+            if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.newMaterial"))) {
+                char base_name[64] = "New Material.mat.json";
+                char nf[1024];
+                jce_path_join(nf, sizeof(nf), s_assets.current_path.c_str(), base_name);
+                int cnt = 1;
+                while (jce_fs_host_exists_file(nf)) {
+                    char name[96];
+                    snprintf(name, sizeof(name), "New Material %d.mat.json", cnt++);
+                    jce_path_join(nf, sizeof(nf), s_assets.current_path.c_str(), name);
+                }
+                JcePbrMaterial m = jce_pbr_material_default();
+                char tex_paths[5][256] = {};
+                if (jce_pbr_material_save_json(nf, &m, tex_paths)) {
+                    char basename[256];
+                    jce_path_basename(basename, sizeof(basename), nf);
+                    jce_editor_console_log("Created '%s'", basename);
+                    s_assets.needs_refresh = true;
+                } else {
+                    jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                        "New material failed");
+                }
+            }
+            if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.newPrefab"))) {
+                char base_name[64] = "New Prefab.prefab.json";
+                char nf[1024];
+                jce_path_join(nf, sizeof(nf), s_assets.current_path.c_str(), base_name);
+                int cnt = 1;
+                while (jce_fs_host_exists_file(nf)) {
+                    char name[96];
+                    snprintf(name, sizeof(name), "New Prefab %d.prefab.json", cnt++);
+                    jce_path_join(nf, sizeof(nf), s_assets.current_path.c_str(), name);
+                }
+                static const char kStubPrefab[] =
+                    "{\n"
+                    "  \"name\": \"New Prefab\",\n"
+                    "  \"components\": {\n"
+                    "    \"transform\": {\n"
+                    "      \"position\": [0.0, 0.0, 0.0],\n"
+                    "      \"rotation\": [0.0, 0.0, 0.0, 1.0],\n"
+                    "      \"scale\":    [1.0, 1.0, 1.0]\n"
+                    "    }\n"
+                    "  },\n"
+                    "  \"children\": []\n"
+                    "}\n";
+                if (ed_write_file(nf, kStubPrefab, sizeof(kStubPrefab) - 1)) {
+                    char basename[256];
+                    jce_path_basename(basename, sizeof(basename), nf);
+                    jce_editor_console_log("Created '%s'", basename);
+                    s_assets.needs_refresh = true;
+                } else {
+                    jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                        "New prefab failed");
+                }
             }
             if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.newScript"))) {
                 char nf[1024];

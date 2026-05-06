@@ -481,7 +481,7 @@ void draw_content(void)
         else                       chip_col = IM_COL32(230,  90,  90, 255);
 
         ImGui::PushStyleColor(ImGuiCol_Text, chip_col);
-        ImGui::Text("\xe2\x97\x8f %.1f FPS", fps_now);   /* ● */
+        ImGui::Text(jce_editor_i18n("profiler.fpsChipFmt"), fps_now);   /* ● %.1f FPS */
         ImGui::PopStyleColor();
         ImGui::SameLine();
         ImGui::TextDisabled("|");

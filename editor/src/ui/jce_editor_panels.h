@@ -31,6 +31,9 @@ typedef enum {
     JCE_PANEL_MATERIAL_GRAPH,
     JCE_PANEL_IMPORT_PRESETS,
     JCE_PANEL_LIGHTMAP_BAKE,
+    JCE_PANEL_LIGHTING,
+    JCE_PANEL_AUDIO_MIXER,
+    JCE_PANEL_INPUT_MANAGER,
     JCE_PANEL_CURVE_EDITOR,
     JCE_PANEL_ANIMATION_EDITOR,
     JCE_PANEL_ANIMATOR_SM,
@@ -38,6 +41,13 @@ typedef enum {
     JCE_PANEL_NAVMESH,
     JCE_PANEL_TERRAIN,
     JCE_PANEL_PREFERENCES,
+    JCE_PANEL_PACKAGE_MANAGER,
+    JCE_PANEL_FRAME_DEBUGGER,
+    JCE_PANEL_SPRITE_EDITOR,
+    JCE_PANEL_TILE_PALETTE,
+    JCE_PANEL_VFX_GRAPH,
+    JCE_PANEL_TEST_RUNNER,
+    JCE_PANEL_BUILD_PROFILES,
     JCE_PANEL_COUNT
 } JceEditorPanel;
 
@@ -68,6 +78,9 @@ void  jce_editor_panel_particle_editor(void);
 void  jce_editor_panel_material_graph(void);
 void  jce_editor_panel_import_presets(void);
 void  jce_editor_panel_lightmap_bake(void);
+void  jce_editor_panel_lighting(void);
+void  jce_editor_panel_audio_mixer(void);
+void  jce_editor_panel_input_manager(void);
 void  jce_editor_panel_curve_editor(void);
 void  jce_editor_panel_animation_editor(void);
 void  jce_editor_panel_animator_sm(void);
@@ -75,6 +88,13 @@ void  jce_editor_panel_sequencer(void);
 void  jce_editor_panel_navmesh(void);
 void  jce_editor_panel_terrain(void);
 void  jce_editor_panel_preferences(void);
+void  jce_editor_panel_package_manager(void);
+void  jce_editor_panel_frame_debugger(void);
+void  jce_editor_panel_sprite_editor(void);
+void  jce_editor_panel_tile_palette(void);
+void  jce_editor_panel_vfx_graph(void);
+void  jce_editor_panel_test_runner(void);
+void  jce_editor_panel_build_profiles(void);
 
 /* Draw panel content only (no Begin/End — for embedding in layout tabs). */
 void  jce_editor_panel_hierarchy_content(void);
@@ -86,6 +106,16 @@ void  jce_editor_panel_timeline_content(void);
 void  jce_editor_panel_assets_content(void);
 void  jce_editor_panel_file_viewer_content(void);
 void  jce_editor_panel_postfx_content(void);
+void  jce_editor_panel_lighting_content(void);
+void  jce_editor_panel_audio_mixer_content(void);
+void  jce_editor_panel_input_manager_content(void);
+void  jce_editor_panel_package_manager_content(void);
+void  jce_editor_panel_frame_debugger_content(void);
+void  jce_editor_panel_sprite_editor_content(void);
+void  jce_editor_panel_tile_palette_content(void);
+void  jce_editor_panel_vfx_graph_content(void);
+void  jce_editor_panel_test_runner_content(void);
+void  jce_editor_panel_build_profiles_content(void);
 void  jce_editor_panel_profiler_content(void);
 
 /* About dialog (modal). */

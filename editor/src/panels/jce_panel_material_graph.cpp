@@ -38,6 +38,7 @@ extern "C" {
 }
 
 #include <cctype>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <set>
@@ -46,13 +47,19 @@ extern "C" {
 namespace {
 
 enum NodeType {
-    NT_OUTPUT  = 0,
-    NT_COLOR   = 1,
-    NT_FLOAT   = 2,
-    NT_TEXTURE = 3,
-    NT_MUL_C   = 4,    /* Color * Color -> Color */
-    NT_MUL_F   = 5,    /* Float * Float -> Float */
-    NT_ADD_F   = 6,    /* Float + Float -> Float */
+    NT_OUTPUT     = 0,
+    NT_COLOR      = 1,
+    NT_FLOAT      = 2,
+    NT_TEXTURE    = 3,
+    NT_MUL_C      = 4,    /* Color * Color -> Color */
+    NT_MUL_F      = 5,    /* Float * Float -> Float */
+    NT_ADD_F      = 6,    /* Float + Float -> Float */
+    /* Phase D (Sprint 3 #11): node library expansion. */
+    NT_NORMAL_MAP = 7,    /* Normal texture sampler -> Color (tangent space) */
+    NT_UV         = 8,    /* UV constants (tile/offset) -> Float */
+    NT_SUB_F      = 9,    /* Float - Float -> Float */
+    NT_LERP_C     = 10,   /* Color lerp (A,B,t) -> Color */
+    NT_FRESNEL    = 11,   /* Pseudo-fresnel: 1 - bias -> Float (preview) */
 };
 
 enum SocketKind { SK_INPUT = 0, SK_OUTPUT = 1 };
@@ -97,6 +104,49 @@ struct Graph {
 };
 
 Graph s_g;
+
+/* Compile feedback log + last-resolved PBR Output for the preview pane.
+ * Captured at every compile_to_material() call so the user gets a
+ * consolidated "what did the graph evaluate to" view without having to
+ * re-open the resulting .mat.json on disk. */
+struct CompileLog {
+    char text[2048];
+    bool has_error;
+};
+CompileLog s_log;
+
+struct PreviewState {
+    float base_color[4]   = {1, 1, 1, 1};
+    float metallic        = 0.0f;
+    float roughness       = 0.5f;
+    float emissive[3]     = {0, 0, 0};
+    char  base_tex[256]   = {0};
+    char  mr_tex[256]     = {0};
+    char  emis_tex[256]   = {0};
+    bool  valid           = false;
+};
+PreviewState s_prev;
+
+void log_clear(void)
+{
+    s_log.text[0]   = 0;
+    s_log.has_error = false;
+}
+
+void log_append(bool err, const char *fmt, ...)
+{
+    if (err) s_log.has_error = true;
+    size_t cur = std::strlen(s_log.text);
+    if (cur + 256 >= sizeof(s_log.text)) return;
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(s_log.text + cur, sizeof(s_log.text) - cur, fmt, ap);
+    va_end(ap);
+    cur = std::strlen(s_log.text);
+    if (cur + 1 < sizeof(s_log.text)) {
+        s_log.text[cur]   = '\n';
+        s_log.text[cur+1] = 0;
+    }
+}
 
 /* Undo/redo stacks + clipboard (Phase C). */
 std::vector<Graph> s_undo;
@@ -153,14 +203,36 @@ const Socket *node_sockets(NodeType t, int *out_count)
         { SK_INPUT,  DT_FLOAT, "B" },
         { SK_OUTPUT, DT_FLOAT, "Out" },
     };
+    static const Socket s_normal [] = { { SK_OUTPUT, DT_COLOR, "Normal" } };
+    static const Socket s_uv     [] = { { SK_OUTPUT, DT_FLOAT, "Tile"   } };
+    static const Socket s_sub_f  [] = {
+        { SK_INPUT,  DT_FLOAT, "A" },
+        { SK_INPUT,  DT_FLOAT, "B" },
+        { SK_OUTPUT, DT_FLOAT, "Out" },
+    };
+    static const Socket s_lerp_c [] = {
+        { SK_INPUT,  DT_COLOR, "A" },
+        { SK_INPUT,  DT_COLOR, "B" },
+        { SK_INPUT,  DT_FLOAT, "T" },
+        { SK_OUTPUT, DT_COLOR, "Out" },
+    };
+    static const Socket s_fresnel[] = {
+        { SK_INPUT,  DT_FLOAT, "Bias" },
+        { SK_OUTPUT, DT_FLOAT, "Out"  },
+    };
     switch (t) {
-        case NT_OUTPUT:  *out_count = 4; return s_output;
-        case NT_COLOR:   *out_count = 1; return s_color;
-        case NT_FLOAT:   *out_count = 1; return s_float;
-        case NT_TEXTURE: *out_count = 1; return s_texture;
-        case NT_MUL_C:   *out_count = 3; return s_mul_c;
-        case NT_MUL_F:   *out_count = 3; return s_mul_f;
-        case NT_ADD_F:   *out_count = 3; return s_add_f;
+        case NT_OUTPUT:     *out_count = 4; return s_output;
+        case NT_COLOR:      *out_count = 1; return s_color;
+        case NT_FLOAT:      *out_count = 1; return s_float;
+        case NT_TEXTURE:    *out_count = 1; return s_texture;
+        case NT_MUL_C:      *out_count = 3; return s_mul_c;
+        case NT_MUL_F:      *out_count = 3; return s_mul_f;
+        case NT_ADD_F:      *out_count = 3; return s_add_f;
+        case NT_NORMAL_MAP: *out_count = 1; return s_normal;
+        case NT_UV:         *out_count = 1; return s_uv;
+        case NT_SUB_F:      *out_count = 3; return s_sub_f;
+        case NT_LERP_C:     *out_count = 4; return s_lerp_c;
+        case NT_FRESNEL:    *out_count = 2; return s_fresnel;
     }
     *out_count = 0;
     return nullptr;
@@ -173,9 +245,14 @@ const char *node_label(NodeType t)
         case NT_COLOR:   return "Color";
         case NT_FLOAT:   return "Float";
         case NT_TEXTURE: return "Texture";
-        case NT_MUL_C:   return "Multiply (Color)";
-        case NT_MUL_F:   return "Multiply (Float)";
-        case NT_ADD_F:   return "Add (Float)";
+        case NT_MUL_C:      return "Multiply (Color)";
+        case NT_MUL_F:      return "Multiply (Float)";
+        case NT_ADD_F:      return "Add (Float)";
+        case NT_NORMAL_MAP: return "Normal Map";
+        case NT_UV:         return "UV (Tile/Offset)";
+        case NT_SUB_F:      return "Subtract (Float)";
+        case NT_LERP_C:     return "Lerp (Color)";
+        case NT_FRESNEL:    return "Fresnel (Preview)";
     }
     return "?";
 }
@@ -197,7 +274,8 @@ void add_node_at(NodeType t, ImVec2 local)
 
 /* User-facing addable types (excludes NT_OUTPUT — there's only one). */
 const NodeType kAddable[] = {
-    NT_COLOR, NT_FLOAT, NT_TEXTURE, NT_MUL_C, NT_MUL_F, NT_ADD_F,
+    NT_COLOR, NT_FLOAT, NT_TEXTURE, NT_NORMAL_MAP, NT_UV,
+    NT_MUL_C, NT_MUL_F, NT_ADD_F, NT_SUB_F, NT_LERP_C, NT_FRESNEL,
 };
 const int kAddableCount = (int)(sizeof(kAddable) / sizeof(kAddable[0]));
 
@@ -313,6 +391,39 @@ void eval_socket(int node_id, int sock_idx, float out_color[4],
             out_color[0] = a[0] + b[0];
             return;
         }
+        case NT_NORMAL_MAP:
+            std::snprintf(out_tex, 256, "%s", n->text);
+            /* Default tangent-space "up" if not sampled. */
+            out_color[0] = 0.5f; out_color[1] = 0.5f;
+            out_color[2] = 1.0f; out_color[3] = 1.0f;
+            return;
+        case NT_UV:
+            /* Tile factor lives in scalar; preview-only constant. */
+            out_color[0] = n->scalar;
+            return;
+        case NT_SUB_F: {
+            float a[4], b[4]; char ta[256], tb[256];
+            eval_socket(n->id, 0, a, ta, depth + 1);
+            eval_socket(n->id, 1, b, tb, depth + 1);
+            out_color[0] = a[0] - b[0];
+            return;
+        }
+        case NT_LERP_C: {
+            float a[4], b[4], t[4]; char ta[256], tb[256], tt[256];
+            eval_socket(n->id, 0, a, ta, depth + 1);
+            eval_socket(n->id, 1, b, tb, depth + 1);
+            eval_socket(n->id, 2, t, tt, depth + 1);
+            float k = t[0]; if (k < 0) k = 0; if (k > 1) k = 1;
+            for (int i = 0; i < 4; ++i) out_color[i] = a[i] * (1.0f - k) + b[i] * k;
+            return;
+        }
+        case NT_FRESNEL: {
+            float a[4]; char ta[256];
+            eval_socket(n->id, 0, a, ta, depth + 1);
+            float bias = a[0]; if (bias < 0) bias = 0; if (bias > 1) bias = 1;
+            out_color[0] = 1.0f - bias;
+            return;
+        }
         case NT_OUTPUT:
             return;
     }
@@ -320,14 +431,18 @@ void eval_socket(int node_id, int sock_idx, float out_color[4],
 
 void compile_to_material(void)
 {
+    log_clear();
+    s_prev.valid = false;
     Node *out = nullptr;
     for (auto &n : s_g.nodes) if (n.type == NT_OUTPUT) { out = &n; break; }
     if (!out) {
+        log_append(true, "missing PBR Output node");
         jce_editor_console_log_level(JCE_CONSOLE_ERROR,
             "material graph: missing PBR Output node");
         return;
     }
     if (s_g.path[0] == 0) {
+        log_append(true, "no .matgraph.json file path set");
         jce_editor_console_log_level(JCE_CONSOLE_ERROR,
             "material graph: set a file path before compiling");
         return;
@@ -345,6 +460,10 @@ void compile_to_material(void)
         m.base_color_factor[2] = c[2];
         m.base_color_factor[3] = c[3];
         if (tex[0]) std::snprintf(tex_paths[0], 256, "%s", tex);
+        for (int i = 0; i < 4; ++i) s_prev.base_color[i] = c[i];
+        std::snprintf(s_prev.base_tex, sizeof(s_prev.base_tex), "%s", tex);
+        log_append(false, "BaseColor: rgba=(%.2f,%.2f,%.2f,%.2f) tex=\"%s\"",
+                   c[0], c[1], c[2], c[3], tex_paths[0][0] ? tex_paths[0] : "(none)");
     }
     /* Metallic (slot 1). */
     {
@@ -352,6 +471,10 @@ void compile_to_material(void)
         eval_socket(out->id, 1, c, tex, 0);
         m.metallic_factor = c[0];
         if (tex[0]) std::snprintf(tex_paths[1], 256, "%s", tex);
+        s_prev.metallic = c[0];
+        std::snprintf(s_prev.mr_tex, sizeof(s_prev.mr_tex), "%s", tex);
+        log_append(false, "Metallic: %.3f tex=\"%s\"", c[0],
+                   tex_paths[1][0] ? tex_paths[1] : "(none)");
     }
     /* Roughness (slot 2). */
     {
@@ -360,6 +483,9 @@ void compile_to_material(void)
         m.roughness_factor = c[0];
         if (tex[0] && !tex_paths[1][0])
             std::snprintf(tex_paths[1], 256, "%s", tex);
+        s_prev.roughness = c[0];
+        log_append(false, "Roughness: %.3f tex=\"%s\"", c[0],
+                   tex[0] ? tex : "(none)");
     }
     /* Emissive (slot 3). */
     {
@@ -369,13 +495,23 @@ void compile_to_material(void)
         m.emissive_factor[1] = c[1];
         m.emissive_factor[2] = c[2];
         if (tex[0]) std::snprintf(tex_paths[4], 256, "%s", tex);
+        s_prev.emissive[0] = c[0];
+        s_prev.emissive[1] = c[1];
+        s_prev.emissive[2] = c[2];
+        std::snprintf(s_prev.emis_tex, sizeof(s_prev.emis_tex), "%s", tex);
+        log_append(false, "Emissive: rgb=(%.2f,%.2f,%.2f) tex=\"%s\"",
+                   c[0], c[1], c[2], tex_paths[4][0] ? tex_paths[4] : "(none)");
     }
 
-    if (jce_pbr_material_save_json(s_g.path, &m, tex_paths))
+    s_prev.valid = true;
+    if (jce_pbr_material_save_json(s_g.path, &m, tex_paths)) {
+        log_append(false, "saved -> %s", s_g.path);
         jce_editor_console_log("material compiled: %s", s_g.path);
-    else
+    } else {
+        log_append(true, "save failed: %s", s_g.path);
         jce_editor_console_log_level(JCE_CONSOLE_ERROR,
             "material compile failed: %s", s_g.path);
+    }
 }
 
 void save_graph(const char *path)
@@ -628,10 +764,12 @@ void draw_node(Node &n, ImDrawList *dl, ImVec2 origin)
     int sock_count = 0;
     const Socket *socks = node_sockets(n.type, &sock_count);
     float content_h = sock_count * ImGui::GetTextLineHeightWithSpacing();
-    if (n.type == NT_COLOR)   content_h += 24.0f;
-    if (n.type == NT_FLOAT)   content_h += 24.0f;
-    if (n.type == NT_TEXTURE) content_h += 24.0f;
-    float node_w = (n.type == NT_TEXTURE) ? 220.0f : 170.0f;
+    if (n.type == NT_COLOR)      content_h += 24.0f;
+    if (n.type == NT_FLOAT)      content_h += 24.0f;
+    if (n.type == NT_TEXTURE)    content_h += 24.0f;
+    if (n.type == NT_NORMAL_MAP) content_h += 24.0f;
+    if (n.type == NT_UV)         content_h += 24.0f;
+    float node_w = (n.type == NT_TEXTURE || n.type == NT_NORMAL_MAP) ? 220.0f : 170.0f;
     ImVec2 size = ImVec2(node_w, 28.0f + content_h + 6.0f);
     ImVec2 tl   = ImVec2(origin.x + n.pos.x, origin.y + n.pos.y);
     ImVec2 br   = ImVec2(tl.x + size.x, tl.y + size.y);
@@ -743,12 +881,19 @@ void draw_node(Node &n, ImDrawList *dl, ImVec2 origin)
         ImGui::SetNextItemWidth(size.x - 12.0f);
         ImGui::SliderFloat("##s", &n.scalar, 0.0f, 1.0f, "%.3f");
         if (ImGui::IsItemActivated()) push_undo();
-    } else if (n.type == NT_TEXTURE) {
+    } else if (n.type == NT_TEXTURE || n.type == NT_NORMAL_MAP) {
         ImGui::SetCursorScreenPos(ImVec2(tl.x + 6.0f,
                                          tl.y + 28.0f + sock_count *
                                          ImGui::GetTextLineHeightWithSpacing()));
         ImGui::SetNextItemWidth(size.x - 12.0f);
         ImGui::InputText("##tex", n.text, sizeof(n.text));
+        if (ImGui::IsItemActivated()) push_undo();
+    } else if (n.type == NT_UV) {
+        ImGui::SetCursorScreenPos(ImVec2(tl.x + 6.0f,
+                                         tl.y + 28.0f + sock_count *
+                                         ImGui::GetTextLineHeightWithSpacing()));
+        ImGui::SetNextItemWidth(size.x - 12.0f);
+        ImGui::SliderFloat("##tile", &n.scalar, 0.1f, 16.0f, jce_editor_i18n("materialGraph.node.tileFmt"));
         if (ImGui::IsItemActivated()) push_undo();
     }
 
@@ -863,7 +1008,7 @@ void draw_canvas(void)
         if (ImGui::IsMouseReleased(0)) {
             for (auto &n : s_g.nodes) {
                 int sc = 0; (void)node_sockets(n.type, &sc);
-                float w = (n.type == NT_TEXTURE) ? 220.0f : 170.0f;
+                float w = (n.type == NT_TEXTURE || n.type == NT_NORMAL_MAP) ? 220.0f : 170.0f;
                 ImVec2 ntl(origin.x + n.pos.x, origin.y + n.pos.y);
                 ImVec2 nbr(ntl.x + w, ntl.y + 22.0f + 16.0f);
                 if (ntl.x < mx.x && nbr.x > mn.x &&
@@ -953,7 +1098,7 @@ void draw_canvas(void)
                              ImGuiInputTextFlags_EnterReturnsTrue);
 
         /* Build filtered list. */
-        int  visible[16];
+        int  visible[32];
         int  visible_n = 0;
         char fbuf[64];
         std::snprintf(fbuf, sizeof(fbuf), "%s", g_qa_filter);
@@ -1004,6 +1149,122 @@ void draw_canvas(void)
     }
 }
 
+/* Preview pane: stylised lit sphere driven by the last-compiled PBR Output
+ * + a compile-feedback log. Lives in a left-hand column inside the
+ * material graph window so the user sees node graph + result side by
+ * side, mimicking Unity's Shader Graph "Master Preview". */
+void draw_preview_sphere(ImVec2 size)
+{
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    ImVec2 p0 = ImGui::GetCursorScreenPos();
+    ImVec2 p1 = ImVec2(p0.x + size.x, p0.y + size.y);
+    dl->AddRectFilled(p0, p1, jce_theme::canvas_bg(), 6.0f);
+
+    ImVec2 c = ImVec2(p0.x + size.x * 0.5f, p0.y + size.y * 0.5f);
+    float  r = (size.x < size.y ? size.x : size.y) * 0.42f;
+
+    /* Resolve color: use compiled output when available, otherwise white. */
+    float bc[4] = { s_prev.base_color[0], s_prev.base_color[1],
+                    s_prev.base_color[2], s_prev.base_color[3] };
+    float em[3] = { s_prev.emissive[0], s_prev.emissive[1], s_prev.emissive[2] };
+    float met = s_prev.metallic;
+    float rough = s_prev.roughness;
+    if (!s_prev.valid) { bc[0]=bc[1]=bc[2]=0.7f; bc[3]=1.0f; met=0; rough=0.5f; }
+
+    /* Layered shaded disk: dark rim -> base -> highlight. Highlight size
+     * shrinks with roughness; metallic biases tint toward base color. */
+    auto col = [](float r, float g, float b, float a) {
+        auto C = [](float x){ x = x < 0 ? 0 : (x > 1 ? 1 : x);
+                              return (int)(x * 255.0f + 0.5f); };
+        return IM_COL32(C(r), C(g), C(b), C(a));
+    };
+    /* Background ambient ring */
+    dl->AddCircleFilled(c, r, col(bc[0]*0.15f, bc[1]*0.15f, bc[2]*0.15f, 1.0f), 64);
+    /* Diffuse body */
+    dl->AddCircleFilled(c, r * 0.94f,
+        col(bc[0]*0.55f + em[0]*0.5f,
+            bc[1]*0.55f + em[1]*0.5f,
+            bc[2]*0.55f + em[2]*0.5f, 1.0f), 64);
+    /* Highlight (top-left) — radius shrinks with roughness, intensity rises with metallic */
+    float hi_r = r * (0.35f - rough * 0.25f);
+    if (hi_r < 4.0f) hi_r = 4.0f;
+    ImVec2 hi = ImVec2(c.x - r * 0.35f, c.y - r * 0.35f);
+    float spec = 0.7f + 0.3f * met;
+    dl->AddCircleFilled(hi, hi_r,
+        col(bc[0]*0.4f + spec, bc[1]*0.4f + spec, bc[2]*0.4f + spec, 1.0f), 32);
+
+    /* Caption strip. */
+    char info[128];
+    std::snprintf(info, sizeof(info), "M=%.2f  R=%.2f", met, rough);
+    ImVec2 ts = ImGui::CalcTextSize(info);
+    dl->AddText(ImVec2(p1.x - ts.x - 6.0f, p1.y - ts.y - 4.0f),
+                jce_theme::text_secondary(), info);
+
+    ImGui::Dummy(size);
+}
+
+void draw_preview_pane(void)
+{
+    ImGui::TextUnformatted(jce_editor_i18n("materialGraph.preview.title"));
+    ImGui::Separator();
+
+    /* Sphere */
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    float  side = avail.x < 200.0f ? avail.x : 200.0f;
+    if (side < 80.0f) side = 80.0f;
+    draw_preview_sphere(ImVec2(side, side));
+
+    ImGui::Spacing();
+
+    /* Resolved values readout */
+    ImGui::TextUnformatted(jce_editor_i18n("materialGraph.preview.values"));
+    if (!s_prev.valid) {
+        ImGui::TextDisabled("%s", jce_editor_i18n("materialGraph.preview.notYetCompiled"));
+    } else {
+        ImGui::ColorButton("##bc", ImVec4(s_prev.base_color[0],
+                                          s_prev.base_color[1],
+                                          s_prev.base_color[2],
+                                          s_prev.base_color[3]),
+                           ImGuiColorEditFlags_NoTooltip, ImVec2(20, 20));
+        ImGui::SameLine(); ImGui::TextUnformatted(jce_editor_i18n("materialGraph.preview.baseColor"));
+        ImGui::Text(jce_editor_i18n("materialGraph.preview.metallicFmt"), s_prev.metallic);
+        ImGui::Text(jce_editor_i18n("materialGraph.preview.roughnessFmt"), s_prev.roughness);
+        ImGui::ColorButton("##em", ImVec4(s_prev.emissive[0],
+                                          s_prev.emissive[1],
+                                          s_prev.emissive[2], 1.0f),
+                           ImGuiColorEditFlags_NoTooltip, ImVec2(20, 20));
+        ImGui::SameLine(); ImGui::TextUnformatted(jce_editor_i18n("materialGraph.preview.emissive"));
+        if (s_prev.base_tex[0]) ImGui::TextDisabled(jce_editor_i18n("materialGraph.preview.bcTexFmt"), s_prev.base_tex);
+        if (s_prev.mr_tex[0])   ImGui::TextDisabled(jce_editor_i18n("materialGraph.preview.mrTexFmt"), s_prev.mr_tex);
+        if (s_prev.emis_tex[0]) ImGui::TextDisabled(jce_editor_i18n("materialGraph.preview.emTexFmt"), s_prev.emis_tex);
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+
+    /* Compile feedback log */
+    ImGui::TextUnformatted(jce_editor_i18n("materialGraph.preview.compileLog"));
+    /* Compile feedback log — tinted variants of the canvas bg so light
+       and dark themes both render legibly. */
+    ImU32 bg;
+    if (s_log.has_error) {
+        bg = jce_theme::is_light() ? IM_COL32(250, 220, 220, 255)
+                                   : IM_COL32( 60,  20,  20, 255);
+    } else {
+        bg = jce_theme::is_light() ? IM_COL32(225, 240, 225, 255)
+                                   : IM_COL32( 20,  30,  24, 255);
+    }
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, bg);
+    ImGui::BeginChild("##cmplog", ImVec2(0, 0), true,
+                      ImGuiWindowFlags_HorizontalScrollbar);
+    if (s_log.text[0])
+        ImGui::TextUnformatted(s_log.text);
+    else
+        ImGui::TextDisabled("%s", jce_editor_i18n("materialGraph.preview.logEmpty"));
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+}
+
 void draw_content(void)
 {
     ensure_output_node();
@@ -1018,7 +1279,6 @@ void draw_content(void)
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("materialGraph.button.import"))) {
         if (s_g.path[0]) {
-            /* Swap .matgraph.json -> .mat.json by stripping suffix */
             char p[260];
             std::snprintf(p, sizeof(p), "%s", s_g.path);
             char *dot = std::strrchr(p, '.');
@@ -1033,7 +1293,14 @@ void draw_content(void)
     ImGui::TextDisabled("%s", jce_editor_i18n("materialGraph.hint.import"));
     ImGui::Separator();
 
+    /* Two-column layout: preview/log on the left, node canvas on the right. */
+    ImGui::BeginChild("##matgraph_preview", ImVec2(220.0f, 0), true);
+    draw_preview_pane();
+    ImGui::EndChild();
+    ImGui::SameLine();
+    ImGui::BeginChild("##matgraph_canvas", ImVec2(0, 0), false);
     draw_canvas();
+    ImGui::EndChild();
 }
 
 } /* namespace */

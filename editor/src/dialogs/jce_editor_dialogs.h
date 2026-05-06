@@ -19,6 +19,10 @@ void jce_editor_dialog_new_project(bool *p_open);
 
 /* Open Project dialog. */
 void jce_editor_dialog_open_project(bool *p_open);
+/* Pre-fill the Open Project dialog's path field; safe to call before
+ * the dialog is opened. Used by the File > Open Recent Project menu
+ * to seed the path from a recents entry. */
+void jce_editor_dialog_open_project_set_path(const char *path);
 
 /* Save As dialog. */
 void jce_editor_dialog_save_as(bool *p_open);
