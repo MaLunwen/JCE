@@ -300,6 +300,19 @@ const char *jce_editor_i18n_or(const char *key, const char *fallback)
     return expanded;
 }
 
+const char *jce_editor_i18n_lookup_locale(JceLocale locale, const char *key)
+{
+    if (!s_i18n.initialized || !key) return NULL;
+    if (locale < 0 || locale >= JCE_LOCALE_COUNT) return NULL;
+    ensure_locale_loaded(locale);
+    return lookup_in_table(&s_i18n.tables[locale], key);
+}
+
+int jce_editor_i18n_locale_count(void)
+{
+    return (int)JCE_LOCALE_COUNT;
+}
+
 /* Rotating buffer pool for "label##id" strings. 16 slots avoids clobber
    even when many widgets share a single ImGui::SameLine() row. */
 #define LABEL_ID_RING 16
@@ -312,10 +325,22 @@ const char *jce_editor_i18n_id(const char *key, const char *id_suffix)
     const char *txt = jce_editor_i18n(key);
     char *buf = s_label_id_ring[s_label_id_idx % LABEL_ID_RING];
     s_label_id_idx = (s_label_id_idx + 1) % LABEL_ID_RING;
-    if (id_suffix && id_suffix[0])
+    /* The ImGui ID is encoded after "###" so it stays stable across
+       locale changes (the visible label may change but the ID does not).
+       We always include `key` in the ID portion because many call sites
+       reuse the same `id_suffix` for every widget in a component (e.g.
+       "uim", "uib", "wc", "j2d") — without `key` those widgets would
+       collide and ImGui would warn about conflicting IDs. */
+    if (key && key[0]) {
+        if (id_suffix && id_suffix[0])
+            snprintf(buf, LABEL_ID_LEN, "%s###%s.%s", txt, id_suffix, key);
+        else
+            snprintf(buf, LABEL_ID_LEN, "%s###%s", txt, key);
+    } else if (id_suffix && id_suffix[0]) {
         snprintf(buf, LABEL_ID_LEN, "%s###%s", txt, id_suffix);
-    else
+    } else {
         snprintf(buf, LABEL_ID_LEN, "%s", txt);
+    }
     return buf;
 }
 

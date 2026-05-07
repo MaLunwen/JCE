@@ -141,6 +141,11 @@ uint32_t          jce_state_from_ecs_entity(JceEntity e);
 void              jce_state_add_component(uint32_t entity_id, uint64_t comp_flag);
 void              jce_state_remove_component(uint32_t entity_id, uint64_t comp_flag);
 const char       *jce_comp_flag_display_name(uint64_t comp_flag);
+/* Return the i18n key (e.g. "comp.transform") for a component flag, or
+   NULL when the flag has no translation key registered. The Inspector
+   uses this for cross-locale search so users can find components by
+   typing in any language present in the loaded locale tables. */
+const char       *jce_comp_flag_i18n_key(uint64_t comp_flag);
 
 /* Root entity enumeration. */
 int               jce_state_get_root_count(void);
