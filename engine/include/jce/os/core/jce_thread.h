@@ -84,6 +84,30 @@ JCE_API bool     JCE_CALL jce_thread_is_main(void);
 JCE_API uint64_t JCE_CALL jce_thread_current_id(void);
 
 /* ================================================================== */
+/* Thread-local storage                                                */
+/*                                                                     */
+/* Cross-platform per-thread slot backed by SDL3.  Use instead of      */
+/* C `thread_local` so middleware does not depend on per-toolchain     */
+/* TLS semantics (e.g. dlopen() interaction on glibc/macOS).           */
+/*                                                                     */
+/* Pattern:                                                            */
+/*   static JceTLS *g_slot = NULL;                                     */
+/*   if (!g_slot) g_slot = jce_tls_create(my_dtor);                    */
+/*   MyState *s = (MyState *)jce_tls_get(g_slot);                      */
+/*   if (!s) { s = ...; jce_tls_set(g_slot, s); }                      */
+/*                                                                     */
+/* The destructor (if non-NULL) is invoked on the owning thread when   */
+/* the thread terminates.                                              */
+/* ================================================================== */
+
+typedef struct JceTLS JceTLS;
+typedef void (*JceTLSDestructor)(void *value);
+
+JCE_API JceTLS *jce_tls_create(JceTLSDestructor dtor);
+JCE_API void *  JCE_CALL jce_tls_get(JceTLS *tls);
+JCE_API void    JCE_CALL jce_tls_set(JceTLS *tls, void *value);
+
+/* ================================================================== */
 /* Atomic primitives                                                   */
 /*                                                                     */
 /* Engine-managed atomics so callers never include <atomic> /          */

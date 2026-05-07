@@ -260,6 +260,7 @@ void jce_editor_state_init(void)
     s.edit_mode   = JCE_EDIT_MODE_SELECT;
     s.gizmo_mode  = JCE_GIZMO_TRANSLATE;
     s.gizmo_space = JCE_GIZMO_LOCAL;
+    s.gizmo_pivot = JCE_GIZMO_PIVOT;
     s.play_state  = JCE_PLAY_STOPPED;
     s.current_scene_path[0] = '\0';
 
@@ -638,6 +639,17 @@ void jce_state_set_entity_tag_color(uint32_t id, JceTagColor color)
     m->tag_color = (uint8_t)color;
 }
 
+void jce_state_set_entity_layer(uint32_t id, int layer)
+{
+    HistoryEditScope edit_scope;
+
+    if (!s.scene || id == 0) return;
+    JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, (JceEntity)id);
+    if (!m) return;
+    if (layer < 0 || layer > 31) layer = 0;
+    m->layer = layer;
+}
+
 void jce_state_reparent_entity(uint32_t id, uint32_t new_parent)
 {
     HistoryEditScope edit_scope;
@@ -767,7 +779,7 @@ uint32_t jce_state_duplicate_entity(uint32_t id)
 
 /* ── Component management ────────────────────────────────────────── */
 
-void jce_state_add_component(uint32_t entity_id, uint32_t comp_flag)
+void jce_state_add_component(uint32_t entity_id, uint64_t comp_flag)
 {
     HistoryEditScope edit_scope;
 
@@ -964,6 +976,411 @@ void jce_state_add_component(uint32_t entity_id, uint32_t comp_flag)
         jce_scene_set_terrain(s.scene, e, &c);
         break;
     }
+    case JCE_COMP_FLAG_RIGIDBODY_2D: {
+        if (jce_scene_has_rigidbody2d(s.scene, e)) return;
+        JceRigidBody2DComponent c;
+        memset(&c, 0, sizeof(c));
+        c.mass = 1.0f;
+        c.friction = 0.5f;
+        c.restitution = 0.0f;
+        c.fixed_rotation = false;
+        jce_scene_set_rigidbody2d(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_PARTICLE_EMITTER: {
+        if (jce_scene_has_particle_emitter(s.scene, e)) return;
+        JceParticleEmitterComponent c;
+        memset(&c, 0, sizeof(c));
+        c.emit_rate    = 10.0f;
+        c.lifetime_min = 1.0f;
+        c.lifetime_max = 2.0f;
+        jce_scene_set_particle_emitter(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_BEHAVIOR_TREE: {
+        if (jce_scene_has_behavior_tree(s.scene, e)) return;
+        JceBehaviorTree c;
+        memset(&c, 0, sizeof(c));
+        c.active = true;
+        jce_scene_set_behavior_tree(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_LOD_GROUP: {
+        if (jce_scene_has_lod_group(s.scene, e)) return;
+        JceLodGroupComponent c;
+        memset(&c, 0, sizeof(c));
+        c.level_count = 3;
+        c.distances[0] = 15.0f;
+        c.distances[1] = 50.0f;
+        c.distances[2] = 150.0f;
+        c.hysteresis = 0.05f;
+        c.cull_when_too_far = true;
+        jce_scene_set_lod_group(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_VIRTUAL_CAMERA: {
+        if (jce_scene_has_virtual_camera(s.scene, e)) return;
+        JceVirtualCameraComponent c;
+        memset(&c, 0, sizeof(c));
+        snprintf(c.vcam_name, sizeof(c.vcam_name), "VCam");
+        c.priority   = 10;
+        c.active     = true;
+        c.track_mode = 0;
+        c.fov_deg    = 60.0f;
+        c.damping    = 0.5f;
+        jce_scene_set_virtual_camera(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_TRIGGER_VOLUME: {
+        if (jce_scene_has_trigger_volume(s.scene, e)) return;
+        JceTriggerVolumeComponent c;
+        memset(&c, 0, sizeof(c));
+        c.shape = 0; /* AABB */
+        c.half_extents[0] = c.half_extents[1] = c.half_extents[2] = 0.5f;
+        c.axis_x[0] = 1.0f; c.axis_y[1] = 1.0f; c.axis_z[2] = 1.0f;
+        c.enabled = true;
+        c.fire_stay = false;
+        jce_scene_set_trigger_volume(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_CAPSULE_COLLIDER: {
+        if (jce_scene_has_capsule_collider(s.scene, e)) return;
+        JceCapsuleColliderComponent c;
+        memset(&c, 0, sizeof(c));
+        c.radius = 0.5f;
+        c.height = 2.0f;
+        c.axis   = 1; /* Y */
+        jce_scene_set_capsule_collider(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_MESH_COLLIDER: {
+        if (jce_scene_has_mesh_collider(s.scene, e)) return;
+        JceMeshColliderComponent c;
+        memset(&c, 0, sizeof(c));
+        c.friction    = 0.5f;
+        c.restitution = 0.0f;
+        jce_scene_set_mesh_collider(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_COLLIDER_2D: {
+        if (jce_scene_has_collider2d(s.scene, e)) return;
+        JceCollider2DComponent c;
+        memset(&c, 0, sizeof(c));
+        c.shape = 0; /* Box */
+        c.size[0] = c.size[1] = 1.0f;
+        c.radius  = 0.5f;
+        c.friction    = 0.4f;
+        c.restitution = 0.0f;
+        jce_scene_set_collider2d(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_TRAIL_RENDERER: {
+        if (jce_scene_has_trail_renderer(s.scene, e)) return;
+        JceTrailRendererComponent c;
+        memset(&c, 0, sizeof(c));
+        c.time = 1.0f;
+        c.min_vertex_distance = 0.1f;
+        c.width_start = 0.1f;
+        c.width_end   = 0.0f;
+        c.color_start[0] = c.color_start[1] = c.color_start[2] = c.color_start[3] = 1.0f;
+        c.color_end[0]   = c.color_end[1]   = c.color_end[2]   = 1.0f;
+        c.color_end[3]   = 0.0f;
+        c.emitting = true;
+        jce_scene_set_trail_renderer(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_LINE_RENDERER: {
+        if (jce_scene_has_line_renderer(s.scene, e)) return;
+        JceLineRendererComponent c;
+        memset(&c, 0, sizeof(c));
+        c.position_count = 2;
+        c.positions[1][0] = 1.0f; /* default 2-point line along +X */
+        c.width_start = 0.1f;
+        c.width_end   = 0.1f;
+        c.color_start[0] = c.color_start[1] = c.color_start[2] = c.color_start[3] = 1.0f;
+        c.color_end[0]   = c.color_end[1]   = c.color_end[2]   = c.color_end[3]   = 1.0f;
+        c.use_world_space = true;
+        jce_scene_set_line_renderer(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_REFLECTION_PROBE: {
+        if (jce_scene_has_reflection_probe(s.scene, e)) return;
+        JceReflectionProbeComponent c;
+        memset(&c, 0, sizeof(c));
+        c.mode = 0; /* Baked */
+        c.resolution = 128;
+        c.intensity = 1.0f;
+        c.box_size[0] = c.box_size[1] = c.box_size[2] = 10.0f;
+        c.near_clip = 0.3f;
+        c.far_clip  = 1000.0f;
+        c.box_projection = true;
+        c.hdr = true;
+        jce_scene_set_reflection_probe(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_DECAL: {
+        if (jce_scene_has_decal(s.scene, e)) return;
+        JceDecalComponent c;
+        memset(&c, 0, sizeof(c));
+        c.size[0] = c.size[1] = c.size[2] = 1.0f;
+        c.color[0] = c.color[1] = c.color[2] = c.color[3] = 1.0f;
+        c.opacity = 1.0f;
+        c.draw_distance = 1000.0f;
+        c.fade_factor = 1.0f;
+        c.layer_mask = -1;
+        jce_scene_set_decal(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_LIGHT_PROBE_GROUP: {
+        if (jce_scene_has_light_probe_group(s.scene, e)) return;
+        JceLightProbeGroupComponent c;
+        memset(&c, 0, sizeof(c));
+        /* Default: 8 corners of a unit cube. */
+        c.probe_count = 8;
+        for (int i = 0; i < 8; ++i) {
+            c.positions[i][0] = (i & 1) ? 1.0f : -1.0f;
+            c.positions[i][1] = (i & 2) ? 1.0f : -1.0f;
+            c.positions[i][2] = (i & 4) ? 1.0f : -1.0f;
+        }
+        jce_scene_set_light_probe_group(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_AUDIO_LISTENER: {
+        if (jce_scene_has_audio_listener(s.scene, e)) return;
+        JceAudioListenerComponent c;
+        memset(&c, 0, sizeof(c));
+        c.volume = 1.0f;
+        c.spatialize = true;
+        c.doppler_factor = 1.0f;
+        jce_scene_set_audio_listener(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_AUDIO_REVERB_ZONE: {
+        if (jce_scene_has_audio_reverb_zone(s.scene, e)) return;
+        JceAudioReverbZoneComponent c;
+        memset(&c, 0, sizeof(c));
+        c.preset = JCE_REVERB_ZONE_PRESET_GENERIC;
+        c.min_distance = 10.0f;
+        c.max_distance = 15.0f;
+        c.room = -1000.0f;
+        c.room_hf = -100.0f;
+        c.decay_time = 1.49f;
+        c.decay_hf_ratio = 0.83f;
+        c.reflections = -2602.0f;
+        c.reflections_delay = 0.007f;
+        c.reverb = 200.0f;
+        c.reverb_delay = 0.011f;
+        c.hf_reference = 5000.0f;
+        c.diffusion = 100.0f;
+        c.density = 100.0f;
+        jce_scene_set_audio_reverb_zone(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_AUDIO_OCCLUSION: {
+        if (jce_scene_has_audio_occlusion(s.scene, e)) return;
+        JceAudioOcclusionComponent c;
+        memset(&c, 0, sizeof(c));
+        c.radius = 5.0f;
+        c.attenuation_db = -12.0f;
+        c.lowpass_cutoff_hz = 1000.0f;
+        c.layer_mask = -1;
+        c.affects_reverb = true;
+        jce_scene_set_audio_occlusion(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_SPAWN_MANAGER: {
+        if (jce_scene_has_spawn_manager(s.scene, e)) return;
+        JceSpawnManagerComponent c;
+        memset(&c, 0, sizeof(c));
+        c.enabled = 1;
+        c.max_peds = 32;
+        c.max_vehicles = 16;
+        c.min_spawn_radius = 30.0f;
+        c.max_spawn_radius = 120.0f;
+        c.despawn_pad = 30.0f;
+        c.spawn_interval = 0.5f;
+        jce_scene_set_spawn_manager(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_WEAPON: {
+        if (jce_scene_has_weapon(s.scene, e)) return;
+        JceWeaponComponent c;
+        memset(&c, 0, sizeof(c));
+        snprintf(c.name, sizeof(c.name), "%s", "Weapon");
+        c.kind = JCE_WEAPON_COMP_HITSCAN;
+        c.damage = 10.0f;
+        c.range = 100.0f;
+        c.rpm = 600.0f;
+        c.clip_size = 30;
+        c.reserve_max = 120;
+        c.reload_seconds = 2.0f;
+        c.spread_deg = 0.5f;
+        c.recoil_per_shot = 0.5f;
+        c.recoil_recovery = 8.0f;
+        c.pellets = 1;
+        c.projectile_speed = 200.0f;
+        c.full_auto = false;
+        jce_scene_set_weapon(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_SAVE_POINT: {
+        if (jce_scene_has_save_point(s.scene, e)) return;
+        JceSavePointComponent c;
+        memset(&c, 0, sizeof(c));
+        snprintf(c.save_id,      sizeof(c.save_id),      "%s", "save_point");
+        snprintf(c.display_name, sizeof(c.display_name), "%s", "Save Point");
+        c.kind = JCE_SAVE_POINT_MANUAL;
+        c.radius = 1.5f;
+        c.slot = -1;
+        c.one_shot = false;
+        c.require_interact = true;
+        jce_scene_set_save_point(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_WHEEL_COLLIDER: {
+        if (jce_scene_has_wheel_collider(s.scene, e)) return;
+        JceWheelColliderComponent c;
+        memset(&c, 0, sizeof(c));
+        c.radius = 0.5f;
+        c.suspension_distance = 0.3f;
+        c.suspension_spring = 35000.0f;
+        c.suspension_damper = 4500.0f;
+        c.suspension_target_pos = 0.5f;
+        c.mass = 20.0f;
+        c.forward_friction = 1.0f;
+        c.sideways_friction = 1.0f;
+        jce_scene_set_wheel_collider(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_CONSTANT_FORCE: {
+        if (jce_scene_has_constant_force(s.scene, e)) return;
+        JceConstantForceComponent c;
+        memset(&c, 0, sizeof(c));
+        c.enabled = true;
+        jce_scene_set_constant_force(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_CONFIGURABLE_JOINT: {
+        if (jce_scene_has_configurable_joint(s.scene, e)) return;
+        JceConfigurableJointComponent c;
+        memset(&c, 0, sizeof(c));
+        c.x_motion = c.y_motion = c.z_motion = JCE_CFG_JOINT_LOCKED;
+        c.x_rotation = c.y_rotation = c.z_rotation = JCE_CFG_JOINT_FREE;
+        c.linear_limit = 0.0f;
+        c.angular_x_limit_deg = 45.0f;
+        c.angular_y_limit_deg = 45.0f;
+        c.angular_z_limit_deg = 45.0f;
+        c.break_force = 3.4e38f;
+        c.break_torque = 3.4e38f;
+        c.enable_collision = false;
+        jce_scene_set_configurable_joint(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_JOINT_2D: {
+        if (jce_scene_has_joint2d(s.scene, e)) return;
+        JceJoint2DComponent c;
+        memset(&c, 0, sizeof(c));
+        c.kind = JCE_JOINT_2D_DISTANCE;
+        c.distance = 1.0f;
+        c.frequency = 5.0f;
+        c.damping_ratio = 0.7f;
+        c.motor_speed_deg_s = 90.0f;
+        c.motor_max_torque = 10000.0f;
+        c.lower_angle_deg = -90.0f;
+        c.upper_angle_deg =  90.0f;
+        c.break_force = 3.4e38f;
+        c.break_torque = 3.4e38f;
+        c.auto_configure_distance = true;
+        jce_scene_set_joint2d(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_BILLBOARD_RENDERER: {
+        if (jce_scene_has_billboard_renderer(s.scene, e)) return;
+        JceBillboardRendererComponent c;
+        memset(&c, 0, sizeof(c));
+        c.mode = JCE_BILLBOARD_FULL;
+        c.size[0] = 1.0f; c.size[1] = 1.0f;
+        c.color[0] = c.color[1] = c.color[2] = c.color[3] = 1.0f;
+        c.visible = true;
+        jce_scene_set_billboard_renderer(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_CANVAS: {
+        if (jce_scene_has_canvas(s.scene, e)) return;
+        JceCanvasComponent c;
+        memset(&c, 0, sizeof(c));
+        c.render_mode = JCE_CANVAS_OVERLAY;
+        c.sort_order = 0;
+        c.reference_resolution[0] = 1920.0f;
+        c.reference_resolution[1] = 1080.0f;
+        c.scale_factor = 1.0f;
+        c.pixel_perfect = false;
+        jce_scene_set_canvas(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_CANVAS_GROUP: {
+        if (jce_scene_has_canvas_group(s.scene, e)) return;
+        JceCanvasGroupComponent c;
+        memset(&c, 0, sizeof(c));
+        c.alpha = 1.0f;
+        c.interactable = true;
+        c.blocks_raycasts = true;
+        c.ignore_parent_groups = false;
+        jce_scene_set_canvas_group(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_LAYOUT_GROUP: {
+        if (jce_scene_has_layout_group(s.scene, e)) return;
+        JceLayoutGroupComponent c;
+        memset(&c, 0, sizeof(c));
+        c.layout_kind = JCE_LAYOUT_VERTICAL;
+        c.spacing[0] = c.spacing[1] = 4.0f;
+        c.cell_size[0] = c.cell_size[1] = 64.0f;
+        c.child_alignment = 0;
+        c.control_child_size_w = true;
+        c.control_child_size_h = false;
+        jce_scene_set_layout_group(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_UI_IMAGE: {
+        if (jce_scene_has_ui_image(s.scene, e)) return;
+        JceUIImageComponent c;
+        memset(&c, 0, sizeof(c));
+        c.image_type = JCE_UI_IMAGE_SIMPLE;
+        c.color[0] = c.color[1] = c.color[2] = c.color[3] = 1.0f;
+        c.fill_amount = 1.0f;
+        c.preserve_aspect = false;
+        c.raycast_target = true;
+        jce_scene_set_ui_image(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_UI_TEXT: {
+        if (jce_scene_has_ui_text(s.scene, e)) return;
+        JceUITextComponent c;
+        memset(&c, 0, sizeof(c));
+        snprintf(c.text, sizeof(c.text), "%s", "New Text");
+        c.font_size = 14.0f;
+        c.alignment = JCE_UI_TEXT_ALIGN_LEFT;
+        c.color[0] = c.color[1] = c.color[2] = c.color[3] = 1.0f;
+        c.line_spacing = 1.0f;
+        c.min_size = 10;
+        c.max_size = 40;
+        jce_scene_set_ui_text(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_UI_BUTTON: {
+        if (jce_scene_has_ui_button(s.scene, e)) return;
+        JceUIButtonComponent c;
+        memset(&c, 0, sizeof(c));
+        c.interactable = true;
+        c.normal_color[0] = c.normal_color[1] = c.normal_color[2] = c.normal_color[3] = 1.0f;
+        c.highlighted_color[0] = 0.96f; c.highlighted_color[1] = 0.96f; c.highlighted_color[2] = 0.96f; c.highlighted_color[3] = 1.0f;
+        c.pressed_color[0] = 0.78f; c.pressed_color[1] = 0.78f; c.pressed_color[2] = 0.78f; c.pressed_color[3] = 1.0f;
+        c.disabled_color[0] = 0.78f; c.disabled_color[1] = 0.78f; c.disabled_color[2] = 0.78f; c.disabled_color[3] = 0.50f;
+        c.fade_duration = 0.1f;
+        jce_scene_set_ui_button(s.scene, e, &c);
+        break;
+    }
     default:
         return;
     }
@@ -974,7 +1391,7 @@ void jce_state_add_component(uint32_t entity_id, uint32_t comp_flag)
     }
 }
 
-void jce_state_remove_component(uint32_t entity_id, uint32_t comp_flag)
+void jce_state_remove_component(uint32_t entity_id, uint64_t comp_flag)
 {
     HistoryEditScope edit_scope;
 
@@ -1001,6 +1418,37 @@ void jce_state_remove_component(uint32_t entity_id, uint32_t comp_flag)
     case JCE_COMP_FLAG_AUDIO_SOURCE:         jce_scene_remove_audio_source(s.scene, e); break;
     case JCE_COMP_FLAG_SCRIPT:               jce_scene_remove_script(s.scene, e); break;
     case JCE_COMP_FLAG_TERRAIN:              jce_scene_remove_terrain(s.scene, e); break;
+    case JCE_COMP_FLAG_RIGIDBODY_2D:         jce_scene_remove_rigidbody2d(s.scene, e); break;
+    case JCE_COMP_FLAG_PARTICLE_EMITTER:     jce_scene_remove_particle_emitter(s.scene, e); break;
+    case JCE_COMP_FLAG_BEHAVIOR_TREE:        jce_scene_remove_behavior_tree(s.scene, e); break;
+    case JCE_COMP_FLAG_LOD_GROUP:            jce_scene_remove_lod_group(s.scene, e); break;
+    case JCE_COMP_FLAG_VIRTUAL_CAMERA:       jce_scene_remove_virtual_camera(s.scene, e); break;
+    case JCE_COMP_FLAG_TRIGGER_VOLUME:       jce_scene_remove_trigger_volume(s.scene, e); break;
+    case JCE_COMP_FLAG_CAPSULE_COLLIDER:     jce_scene_remove_capsule_collider(s.scene, e); break;
+    case JCE_COMP_FLAG_MESH_COLLIDER:        jce_scene_remove_mesh_collider(s.scene, e); break;
+    case JCE_COMP_FLAG_COLLIDER_2D:          jce_scene_remove_collider2d(s.scene, e); break;
+    case JCE_COMP_FLAG_TRAIL_RENDERER:       jce_scene_remove_trail_renderer(s.scene, e); break;
+    case JCE_COMP_FLAG_LINE_RENDERER:        jce_scene_remove_line_renderer(s.scene, e); break;
+    case JCE_COMP_FLAG_REFLECTION_PROBE:     jce_scene_remove_reflection_probe(s.scene, e); break;
+    case JCE_COMP_FLAG_DECAL:                jce_scene_remove_decal(s.scene, e); break;
+    case JCE_COMP_FLAG_LIGHT_PROBE_GROUP:    jce_scene_remove_light_probe_group(s.scene, e); break;
+    case JCE_COMP_FLAG_AUDIO_LISTENER:       jce_scene_remove_audio_listener(s.scene, e); break;
+    case JCE_COMP_FLAG_AUDIO_REVERB_ZONE:    jce_scene_remove_audio_reverb_zone(s.scene, e); break;
+    case JCE_COMP_FLAG_AUDIO_OCCLUSION:      jce_scene_remove_audio_occlusion(s.scene, e); break;
+    case JCE_COMP_FLAG_SPAWN_MANAGER:        jce_scene_remove_spawn_manager(s.scene, e); break;
+    case JCE_COMP_FLAG_WEAPON:               jce_scene_remove_weapon(s.scene, e); break;
+    case JCE_COMP_FLAG_SAVE_POINT:           jce_scene_remove_save_point(s.scene, e); break;
+    case JCE_COMP_FLAG_WHEEL_COLLIDER:       jce_scene_remove_wheel_collider(s.scene, e); break;
+    case JCE_COMP_FLAG_CONSTANT_FORCE:       jce_scene_remove_constant_force(s.scene, e); break;
+    case JCE_COMP_FLAG_CONFIGURABLE_JOINT:   jce_scene_remove_configurable_joint(s.scene, e); break;
+    case JCE_COMP_FLAG_JOINT_2D:             jce_scene_remove_joint2d(s.scene, e); break;
+    case JCE_COMP_FLAG_BILLBOARD_RENDERER:   jce_scene_remove_billboard_renderer(s.scene, e); break;
+    case JCE_COMP_FLAG_CANVAS:               jce_scene_remove_canvas(s.scene, e); break;
+    case JCE_COMP_FLAG_CANVAS_GROUP:         jce_scene_remove_canvas_group(s.scene, e); break;
+    case JCE_COMP_FLAG_LAYOUT_GROUP:         jce_scene_remove_layout_group(s.scene, e); break;
+    case JCE_COMP_FLAG_UI_IMAGE:             jce_scene_remove_ui_image(s.scene, e); break;
+    case JCE_COMP_FLAG_UI_TEXT:              jce_scene_remove_ui_text(s.scene, e); break;
+    case JCE_COMP_FLAG_UI_BUTTON:            jce_scene_remove_ui_button(s.scene, e); break;
     default: return;
     }
 
@@ -1008,7 +1456,7 @@ void jce_state_remove_component(uint32_t entity_id, uint32_t comp_flag)
              jce_comp_flag_display_name(comp_flag), entity_id);
 }
 
-const char *jce_comp_flag_display_name(uint32_t comp_flag)
+const char *jce_comp_flag_display_name(uint64_t comp_flag)
 {
     switch (comp_flag) {
     case JCE_COMP_FLAG_TRANSFORM:            return "Transform";
@@ -1034,6 +1482,34 @@ const char *jce_comp_flag_display_name(uint32_t comp_flag)
     case JCE_COMP_FLAG_BEHAVIOR_TREE:        return "Behavior Tree";
     case JCE_COMP_FLAG_EDITOR_META:          return "Editor Meta";
     case JCE_COMP_FLAG_TERRAIN:              return "Terrain";
+    case JCE_COMP_FLAG_LOD_GROUP:            return "LOD Group";
+    case JCE_COMP_FLAG_VIRTUAL_CAMERA:       return "Virtual Camera";
+    case JCE_COMP_FLAG_TRIGGER_VOLUME:       return "Trigger Volume";
+    case JCE_COMP_FLAG_CAPSULE_COLLIDER:     return "Capsule Collider";
+    case JCE_COMP_FLAG_MESH_COLLIDER:        return "Mesh Collider";
+    case JCE_COMP_FLAG_COLLIDER_2D:          return "Collider 2D";
+    case JCE_COMP_FLAG_TRAIL_RENDERER:       return "Trail Renderer";
+    case JCE_COMP_FLAG_LINE_RENDERER:        return "Line Renderer";
+    case JCE_COMP_FLAG_REFLECTION_PROBE:     return "Reflection Probe";
+    case JCE_COMP_FLAG_DECAL:                return "Decal Projector";
+    case JCE_COMP_FLAG_LIGHT_PROBE_GROUP:    return "Light Probe Group";
+    case JCE_COMP_FLAG_AUDIO_LISTENER:       return "Audio Listener";
+    case JCE_COMP_FLAG_AUDIO_REVERB_ZONE:    return "Audio Reverb Zone";
+    case JCE_COMP_FLAG_AUDIO_OCCLUSION:      return "Audio Occlusion";
+    case JCE_COMP_FLAG_SPAWN_MANAGER:        return "Spawn Manager";
+    case JCE_COMP_FLAG_WEAPON:               return "Weapon";
+    case JCE_COMP_FLAG_SAVE_POINT:           return "Save Point";
+    case JCE_COMP_FLAG_WHEEL_COLLIDER:       return "Wheel Collider";
+    case JCE_COMP_FLAG_CONSTANT_FORCE:       return "Constant Force";
+    case JCE_COMP_FLAG_CONFIGURABLE_JOINT:   return "Configurable Joint";
+    case JCE_COMP_FLAG_JOINT_2D:             return "Joint 2D";
+    case JCE_COMP_FLAG_BILLBOARD_RENDERER:   return "Billboard Renderer";
+    case JCE_COMP_FLAG_CANVAS:               return "Canvas";
+    case JCE_COMP_FLAG_CANVAS_GROUP:         return "Canvas Group";
+    case JCE_COMP_FLAG_LAYOUT_GROUP:         return "Layout Group";
+    case JCE_COMP_FLAG_UI_IMAGE:             return "UI Image";
+    case JCE_COMP_FLAG_UI_TEXT:              return "UI Text";
+    case JCE_COMP_FLAG_UI_BUTTON:            return "UI Button";
     default:                                 return "Unknown";
     }
 }
@@ -1048,6 +1524,9 @@ JceGizmoMode  jce_state_get_gizmo_mode(void)               { return s.gizmo_mode
 
 void          jce_state_set_gizmo_space(JceGizmoSpace sp)  { s.gizmo_space = sp; }
 JceGizmoSpace jce_state_get_gizmo_space(void)              { return s.gizmo_space; }
+
+void          jce_state_set_gizmo_pivot(JceGizmoPivot p)   { s.gizmo_pivot = p; }
+JceGizmoPivot jce_state_get_gizmo_pivot(void)              { return s.gizmo_pivot; }
 
 /* Persist view_mode and show_grid to editor-config.json. */
 static void persist_render_settings(void)

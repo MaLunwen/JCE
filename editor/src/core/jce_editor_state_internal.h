@@ -50,6 +50,7 @@ struct EditorInternalState {
     JceEditMode      edit_mode;
     JceGizmoMode     gizmo_mode;
     JceGizmoSpace    gizmo_space;
+    JceGizmoPivot    gizmo_pivot;
     JceSceneViewMode view_mode;
     JcePlayState     play_state;
     bool             show_grid;
@@ -73,7 +74,12 @@ extern std::vector<uint32_t> g_entity_order;
 
 /* ── Editor per-entity sidecar (UI-only state) ────────────────────── */
 struct EditorEntitySidecar {
-    uint32_t expanded_flags = 0xFFFFFFFFu; /* Inspector fold state bitmask */
+    uint64_t expanded_flags = 0xFFFFFFFFFFFFFFFFull; /* Inspector fold state bitmask */
+    /* Inspector display order of components (one slot per visible flag).
+       Empty until first inspector pass; entries are component flag values
+       (uint64). Reordered via popup Move Up/Down or drag-and-drop on
+       header. Flags missing here fall back to default order. */
+    std::vector<uint64_t> component_order;
 };
 extern std::unordered_map<uint32_t, EditorEntitySidecar> g_entity_sidecar;
 
@@ -82,6 +88,11 @@ extern std::unordered_map<uint32_t, EditorEntitySidecar> g_entity_sidecar;
 struct EditorHistorySnapshot {
     std::string scene_json;
     std::string scene_path;
+    /* Per-entity Inspector component display order. Captured alongside
+       the scene so undo/redo of Move Up/Move Down/drag-reorder restores
+       the prior layout. Sidecar fold-state is intentionally NOT undoable
+       (matches Unity behaviour). */
+    std::unordered_map<uint32_t, std::vector<uint64_t>> component_orders;
 };
 
 extern std::vector<EditorHistorySnapshot> s_undo_history;
@@ -139,19 +150,7 @@ void         mark_prefab_instance_recursive(uint32_t entity_id,
 
 /* ── Euler ↔ Quaternion helpers (degrees) ─────────────────────────── */
 
-static inline void jce_q_to_euler_deg(jce_quat q, float out[3])
-{
-    jce_vec3 e = jce_q_to_euler(q);
-    out[0] = e.x * JCE_RAD2DEG;
-    out[1] = e.y * JCE_RAD2DEG;
-    out[2] = e.z * JCE_RAD2DEG;
-}
-static inline jce_quat jce_q_from_euler_deg(const float in[3])
-{
-    return jce_q_from_euler(in[0] * JCE_DEG2RAD,
-                            in[1] * JCE_DEG2RAD,
-                            in[2] * JCE_DEG2RAD);
-}
+#include "core/jce_editor_quat.h"
 
 /* ── RAII Scopes ──────────────────────────────────────────────────── */
 

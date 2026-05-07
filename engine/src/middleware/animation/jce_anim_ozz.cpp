@@ -15,12 +15,17 @@
 
 #include "jce_anim_ozz.h"
 
+extern "C" {
+#include <jce/os/core/jce_alloc.h>
+}
+
 #include <ozz/base/maths/simd_math.h>
 #include <ozz/base/maths/soa_float4x4.h>
 #include <ozz/base/maths/vec_float.h>
 
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <vector>
 
 /* ================================================================== */
@@ -64,8 +69,9 @@ JceOzzSkeleton *jce_ozz_skeleton_create(const jce_mat4 *rest_locals,
     if (!rest_locals || !parents || num_joints == 0)
         return nullptr;
 
-    auto *s     = new (std::nothrow) JceOzzSkeleton();
-    if (!s) return nullptr;
+    auto *raw = jce_malloc(sizeof(JceOzzSkeleton));
+    if (!raw) return nullptr;
+    auto *s = new (raw) JceOzzSkeleton();
 
     s->num_joints = num_joints;
     s->rest_locals.resize(num_joints);
@@ -79,7 +85,9 @@ JceOzzSkeleton *jce_ozz_skeleton_create(const jce_mat4 *rest_locals,
 
 void jce_ozz_skeleton_destroy(JceOzzSkeleton *s)
 {
-    delete s;
+    if (!s) return;
+    s->~JceOzzSkeleton();
+    jce_free(s);
 }
 
 /*
@@ -130,8 +138,9 @@ struct JceOzzContext {
 
 JceOzzContext *jce_ozz_context_create(uint32_t max_joints)
 {
-    auto *ctx = new (std::nothrow) JceOzzContext();
-    if (!ctx) return nullptr;
+    auto *raw = jce_malloc(sizeof(JceOzzContext));
+    if (!raw) return nullptr;
+    auto *ctx = new (raw) JceOzzContext();
 
     ctx->max_joints = max_joints;
     ctx->locals_buf.resize(max_joints);
@@ -140,7 +149,9 @@ JceOzzContext *jce_ozz_context_create(uint32_t max_joints)
 
 void jce_ozz_context_destroy(JceOzzContext *ctx)
 {
-    delete ctx;
+    if (!ctx) return;
+    ctx->~JceOzzContext();
+    jce_free(ctx);
 }
 
 /*

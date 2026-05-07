@@ -11,6 +11,7 @@
 #include "ck_engine_smoke.h"
 
 #include <jce/api.h>
+#include <jce/os/core/jce_alloc.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/resource/jce_scene_serial.h>
 
@@ -199,8 +200,9 @@ static void ck_ui_init(CkApp *app)
 
 CkApp *ck_app_create(const JceServices *svc)
 {
-    CkApp *app = (CkApp *)calloc(1, sizeof(*app));
+    CkApp *app = (CkApp *)jce_malloc(sizeof(*app));
     if (!app) return NULL;
+    memset(app, 0, sizeof(*app));
     app->svc = *svc;
 
     LOG_INFO("ck_app", "[init] step 1: audio");
@@ -302,13 +304,13 @@ CkApp *ck_app_create(const JceServices *svc)
     {
         const JcePakAsset *icon = jce_pak_find(app->svc.pak, "CK_icon.png");
         if (icon) {
-            void *buf = malloc((size_t)icon->original_size);
+            void *buf = jce_malloc((size_t)icon->original_size);
             if (buf) {
                 size_t sz = jce_pak_decompress(icon, buf,
                                            (size_t)icon->original_size);
                 if (sz > 0)
                     jce_window_set_icon(app->svc.window, buf, sz);
-                free(buf);
+                jce_free(buf);
             }
         } else {
             LOG_WARN("ck_app", "CK_icon.png not found in PAK");
@@ -390,7 +392,7 @@ void ck_app_destroy(CkApp *app)
     }
     jce_font_close(app->font_i18n);
     jce_font_close(app->font_main);
-    free(app);
+    jce_free(app);
 }
 
 /* ================================================================== */

@@ -249,10 +249,12 @@ void draw_fonts_page()
     ImGui::PopItemWidth();
 
     if (en_idx > 0)
-        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Latin: %s",
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "%s: %s",
+                           jce_editor_i18n("fonts.latin"),
                            s_entries[en_idx - 1].path);
     if (zh_idx > 0)
-        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "CJK:   %s",
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "%s:   %s",
+                           jce_editor_i18n("fonts.cjk"),
                            s_entries[zh_idx - 1].path);
 
     ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "%s (%d %s)",

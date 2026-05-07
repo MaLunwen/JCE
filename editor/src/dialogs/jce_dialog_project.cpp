@@ -8,11 +8,11 @@
 
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_path.h>
+#include <jce/os/core/jce_thread.h>
 
 #include "jce_editor_dialogs_internal.h"
 #include "core/jce_assetdb.h"
 
-#include <mutex>
 #include <vector>
 
 /* ── Shared state ─────────────────────────────────────────────────── */
@@ -179,8 +179,14 @@ struct FolderPickRequest {
     std::string path;
 };
 
-std::mutex                       g_pending_mu;
+JceMutex *g_pending_mu = nullptr;
 std::vector<FolderPickRequest *> g_pending_pick_requests;
+
+JceMutex *get_pending_mu()
+{
+    if (!g_pending_mu) g_pending_mu = jce_mutex_create();
+    return g_pending_mu;
+}
 
 void folder_pick_callback_thread_safe(void *user,
                                       JceDialogResult result,
@@ -206,8 +212,10 @@ void folder_pick_callback_thread_safe(void *user,
     }
 
     {
-        std::lock_guard<std::mutex> lk(g_pending_mu);
+        JceMutex *mu = get_pending_mu();
+        jce_mutex_lock(mu);
         g_pending_pick_requests.push_back(req);
+        jce_mutex_unlock(mu);
     }
 }
 
@@ -287,9 +295,11 @@ void jce_editor_dialogs_pump_pending(void)
        to keep critical section minimal. */
     std::vector<FolderPickRequest *> pending;
     {
-        std::lock_guard<std::mutex> lk(g_pending_mu);
-        if (g_pending_pick_requests.empty()) return;
+        JceMutex *mu = get_pending_mu();
+        jce_mutex_lock(mu);
+        if (g_pending_pick_requests.empty()) { jce_mutex_unlock(mu); return; }
         pending.swap(g_pending_pick_requests);
+        jce_mutex_unlock(mu);
     }
 
     for (FolderPickRequest *req : pending) {

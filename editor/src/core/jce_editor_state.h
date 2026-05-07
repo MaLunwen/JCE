@@ -43,6 +43,13 @@ typedef enum {
     JCE_GIZMO_WORLD,
 } JceGizmoSpace;
 
+/* ── Gizmo Pivot ───────────────────────────────────────────────────── */
+
+typedef enum {
+    JCE_GIZMO_PIVOT  = 0,  /* gizmo at the active object's transform origin */
+    JCE_GIZMO_CENTER,      /* gizmo at the geometric center of the selection */
+} JceGizmoPivot;
+
 /* ── Scene View Mode ───────────────────────────────────────────────── */
 
 typedef enum {
@@ -111,6 +118,7 @@ void              jce_state_rename_entity(uint32_t id, const char *name);
 void              jce_state_set_entity_enabled(uint32_t id, bool enabled);
 void              jce_state_set_entity_tag(uint32_t id, const char *tag);
 void              jce_state_set_entity_tag_color(uint32_t id, JceTagColor color);
+void              jce_state_set_entity_layer(uint32_t id, int layer);
 void              jce_state_reparent_entity(uint32_t id, uint32_t new_parent);
 void              jce_state_reorder_sibling(uint32_t entity_id, uint32_t ref_id,
                                             bool insert_after);
@@ -130,9 +138,9 @@ JceEntity         jce_state_to_ecs_entity(uint32_t id);
 uint32_t          jce_state_from_ecs_entity(JceEntity e);
 
 /* Component management (thin wrappers — uses JceComponentFlag from jce_scene.h). */
-void              jce_state_add_component(uint32_t entity_id, uint32_t comp_flag);
-void              jce_state_remove_component(uint32_t entity_id, uint32_t comp_flag);
-const char       *jce_comp_flag_display_name(uint32_t comp_flag);
+void              jce_state_add_component(uint32_t entity_id, uint64_t comp_flag);
+void              jce_state_remove_component(uint32_t entity_id, uint64_t comp_flag);
+const char       *jce_comp_flag_display_name(uint64_t comp_flag);
 
 /* Root entity enumeration. */
 int               jce_state_get_root_count(void);
@@ -147,6 +155,8 @@ void          jce_state_set_gizmo_mode(JceGizmoMode mode);
 JceGizmoMode  jce_state_get_gizmo_mode(void);
 void          jce_state_set_gizmo_space(JceGizmoSpace space);
 JceGizmoSpace jce_state_get_gizmo_space(void);
+void          jce_state_set_gizmo_pivot(JceGizmoPivot pivot);
+JceGizmoPivot jce_state_get_gizmo_pivot(void);
 
 /* Scene view */
 void              jce_state_set_view_mode(JceSceneViewMode mode);

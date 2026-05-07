@@ -40,7 +40,8 @@ void history_end_edit(bool active)
     if (history_capture_snapshot(&current) && !s_undo_history.empty()) {
         const EditorHistorySnapshot &before = s_undo_history.back();
         changed = !(before.scene_json == current.scene_json
-                    && before.scene_path == current.scene_path);
+                    && before.scene_path == current.scene_path
+                    && before.component_orders == current.component_orders);
     }
 
     if (changed) {
@@ -68,13 +69,24 @@ bool history_capture_snapshot(EditorHistorySnapshot *out)
     out->scene_json = json_text;
     out->scene_path = s.current_scene_path;
     jce_json_free_string(json_text);
+
+    /* Capture per-entity inspector component_order so reorder ops are
+       undoable. Empty orders are skipped to keep snapshots small. */
+    out->component_orders.clear();
+    for (const auto &kv : g_entity_sidecar) {
+        if (!kv.second.component_order.empty())
+            out->component_orders.emplace(kv.first, kv.second.component_order);
+    }
     return true;
 }
 
 static size_t history_snapshot_bytes(const EditorHistorySnapshot &snap)
 {
-    return snap.scene_json.capacity() + snap.scene_path.capacity()
-           + sizeof(EditorHistorySnapshot);
+    size_t n = snap.scene_json.capacity() + snap.scene_path.capacity()
+               + sizeof(EditorHistorySnapshot);
+    for (const auto &kv : snap.component_orders)
+        n += sizeof(uint32_t) + kv.second.capacity() * sizeof(uint64_t);
+    return n;
 }
 
 static size_t history_total_bytes(void)
@@ -115,7 +127,9 @@ bool history_push_undo_snapshot(void)
 
     if (!s_undo_history.empty()) {
         const EditorHistorySnapshot &last = s_undo_history.back();
-        if (last.scene_json == snap.scene_json && last.scene_path == snap.scene_path)
+        if (last.scene_json == snap.scene_json
+            && last.scene_path == snap.scene_path
+            && last.component_orders == snap.component_orders)
             return false;
     }
 
@@ -150,6 +164,14 @@ bool history_restore_snapshot(const EditorHistorySnapshot &snapshot,
 
     /* Rebuild the editor's iteration order from the freshly-loaded ECS. */
     rebuild_entity_order_from_ecs();
+
+    /* Restore Inspector component_order for entities we have data for.
+       Sidecar entries without snapshot data keep current order; the next
+       inspector pass will re-sync against new flag set. */
+    for (auto &kv : g_entity_sidecar)
+        kv.second.component_order.clear();
+    for (const auto &kv : snapshot.component_orders)
+        g_entity_sidecar[kv.first].component_order = kv.second;
 
     if (!snapshot.scene_path.empty())
         set_current_scene_path_internal(snapshot.scene_path.c_str());

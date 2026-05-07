@@ -34,6 +34,7 @@
 #include <jce/tools/jce_imgui.hpp>
 extern "C" {
 #include <jce/os/core/jce_json.h>
+#include <jce/os/core/jce_filesystem.h>
 }
 
 #include <cstdio>
@@ -41,9 +42,6 @@ extern "C" {
 #include <cstring>
 #include <string>
 #include <vector>
-#ifdef _WIN32
-#include <io.h>
-#endif
 
 namespace {
 
@@ -78,59 +76,69 @@ static void set_default_dir()
     snprintf(s_tr.dir, sizeof(s_tr.dir), "scripts/tests");
 }
 
+static bool ends_with_test_json(const char *name)
+{
+    size_t ln = std::strlen(name);
+    const char *suf = ".test.json";
+    size_t ls = std::strlen(suf);
+    if (ln < ls) return false;
+    return std::strcmp(name + (ln - ls), suf) == 0;
+}
+
+static bool tr_list_cb(const char *name, bool is_dir, void *user)
+{
+    (void)user;
+    if (is_dir) return true;
+    if (!ends_with_test_json(name)) return true;
+
+    char fp[512]; snprintf(fp, sizeof(fp), "%s/%s", s_tr.dir, name);
+    size_t sz = 0;
+    char *buf = (char *)ed_read_file(fp, &sz);
+    if (!buf) return true;
+    JceJson *root = jce_json_parse(buf, (int)sz);
+    ED_FREE(buf);
+    if (!root) return true;
+
+    TestSuite s;
+    s.source_path = fp;
+    const char *nm = jce_json_get_string(root, "suite", "");
+    const char *ex = jce_json_get_string(root, "exe",   "");
+    s.name = (nm && *nm) ? nm : name;
+    s.exe  = ex ? ex : "";
+    JceJson *cases = jce_json_get(root, "cases");
+    if (jce_json_is_array(cases)) {
+        int n = jce_json_array_size(cases);
+        for (int i = 0; i < n; ++i) {
+            JceJson *c = jce_json_array_at(cases, i);
+            TestCase tc;
+            const char *cn = jce_json_get_string(c, "name", "case");
+            tc.name = cn ? cn : "case";
+            JceJson *args = jce_json_get(c, "args");
+            if (jce_json_is_array(args)) {
+                int an = jce_json_array_size(args);
+                for (int j = 0; j < an; ++j) {
+                    JceJson *a = jce_json_array_at(args, j);
+                    const char *as = a ? jce_json_get_string(a, "", "") : "";
+                    if (j) tc.args += ' ';
+                    tc.args += (as ? as : "");
+                }
+            }
+            s.cases.push_back(tc);
+        }
+    }
+    jce_json_free(root);
+    s_tr.suites.push_back(s);
+    return true;
+}
+
 static void rescan()
 {
     s_tr.suites.clear();
-    char pat[300]; snprintf(pat, sizeof(pat), "%s/*.test.json", s_tr.dir);
-    /* Use ed file walker if exposed; else dir-listing via _findfirst. */
-#ifdef _WIN32
-    struct _finddata_t fd; intptr_t h = _findfirst(pat, &fd);
-    if (h == -1) {
+    if (!jce_fs_host_exists_dir(s_tr.dir)) {
         jce_editor_console_log("[Test Runner] no manifests found in %s", s_tr.dir);
         return;
     }
-    do {
-        char fp[512]; snprintf(fp, sizeof(fp), "%s/%s", s_tr.dir, fd.name);
-        size_t sz = 0;
-        char *buf = (char *)ed_read_file(fp, &sz);
-        if (!buf) continue;
-        JceJson *root = jce_json_parse(buf, (int)sz);
-        ED_FREE(buf);
-        if (!root) continue;
-        TestSuite s;
-        s.source_path = fp;
-        const char *nm = jce_json_get_string(root, "suite", "");
-        const char *ex = jce_json_get_string(root, "exe",   "");
-        s.name = nm ? nm : fd.name;
-        s.exe  = ex ? ex : "";
-        JceJson *cases = jce_json_get(root, "cases");
-        if (jce_json_is_array(cases)) {
-            int n = jce_json_array_size(cases);
-            for (int i = 0; i < n; ++i) {
-                JceJson *c = jce_json_array_at(cases, i);
-                TestCase tc;
-                const char *cn = jce_json_get_string(c, "name", "case");
-                tc.name = cn ? cn : "case";
-                JceJson *args = jce_json_get(c, "args");
-                if (jce_json_is_array(args)) {
-                    int an = jce_json_array_size(args);
-                    for (int j = 0; j < an; ++j) {
-                        JceJson *a = jce_json_array_at(args, j);
-                        const char *as = a ? jce_json_get_string(a, "", "") : "";
-                        if (j) tc.args += ' ';
-                        tc.args += (as ? as : "");
-                    }
-                }
-                s.cases.push_back(tc);
-            }
-        }
-        jce_json_free(root);
-        s_tr.suites.push_back(s);
-    } while (_findnext(h, &fd) == 0);
-    _findclose(h);
-#else
-    (void)pat;
-#endif
+    jce_fs_host_list_dir(s_tr.dir, &tr_list_cb, nullptr);
     jce_editor_console_log("[Test Runner] discovered %d suite(s)", (int)s_tr.suites.size());
 }
 

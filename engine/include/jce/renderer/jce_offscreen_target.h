@@ -38,6 +38,8 @@ bool jce_offscreen_target_prepare(JceOffscreenTarget *bridge,
 /* Query bridge-owned texture/view handles for panel integration. */
 uint16_t jce_offscreen_target_get_color_texture(
     const JceOffscreenTarget *bridge);
+JCE_API uint16_t jce_offscreen_target_get_depth_texture(
+    const JceOffscreenTarget *bridge);
 JCE_API uint16_t jce_offscreen_target_get_view_id(const JceOffscreenTarget *bridge);
 
 JCE_EXTERN_C_END

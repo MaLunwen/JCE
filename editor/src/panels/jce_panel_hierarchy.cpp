@@ -29,11 +29,22 @@ void jce_editor_panel_hierarchy_content(void)
     ImGui::PopItemWidth();
 
     ImGui::PushItemWidth(100);
-    ImGui::Combo("##tag_filter", &s_hier.tag_filter,
-                  "All\0Red\0Orange\0Yellow\0Green\0Blue\0Purple\0Gray\0");
+    {
+        static const char *kTagFilter[] = {
+            "tagColor.all", "tagColor.red", "tagColor.orange", "tagColor.yellow",
+            "tagColor.green", "tagColor.blue", "tagColor.purple", "tagColor.gray"
+        };
+        ImGui::Combo("##tag_filter", &s_hier.tag_filter,
+                     jce_editor_i18n_combo(kTagFilter, 8));
+    }
     ImGui::SameLine();
-    ImGui::Combo("##sort", &s_hier.sort_mode,
-                  "Default\0By Name\0By Tag\0");
+    {
+        static const char *kSort[] = {
+            "hierarchy.sort.default", "hierarchy.sort.byName", "hierarchy.sort.byTag"
+        };
+        ImGui::Combo("##sort", &s_hier.sort_mode,
+                     jce_editor_i18n_combo(kSort, 3));
+    }
     ImGui::PopItemWidth();
 
     ImGui::Separator();

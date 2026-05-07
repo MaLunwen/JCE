@@ -8,6 +8,7 @@
  */
 
 #include "jce_scene_view_internal.h"
+#include "core/jce_editor_i18n.h"
 #include "scene/jce_editor_scene_asset_cache.h"
 #include "core/jce_hotkeys.h"
 #include "core/jce_editor_config.h"
@@ -116,7 +117,7 @@ static void draw_scene_view_toolbar(void)
             jce_state_set_show_grid(!grid);
 
         bool phys = jce_state_get_show_physics_debug();
-        if (ImGui::MenuItem("Physics Debug (Wireframe)", "", phys))
+        if (ImGui::MenuItem(jce_editor_i18n("sceneView.physicsDebug"), "", phys))
             jce_state_set_show_physics_debug(!phys);
 
         if (ImGui::BeginMenu(jce_editor_i18n("sceneView.menu.showFlags"))) {

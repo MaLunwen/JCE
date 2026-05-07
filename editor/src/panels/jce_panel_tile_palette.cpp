@@ -148,7 +148,7 @@ void draw_palette_pane(void)
     ImGui::TextUnformatted(jce_editor_i18n("tilePalette.brush"));
 
     /* Brush 0 = eraser; 1..palette_count = paint. */
-    if (ImGui::Selectable("0  (erase)", s.active_brush == 0))
+    if (ImGui::Selectable(jce_editor_i18n("tilePalette.brush.erase"), s.active_brush == 0))
         s.active_brush = 0;
     for (int i = 1; i <= s.palette_count; ++i) {
         char lbl[32]; std::snprintf(lbl, sizeof(lbl), "%d", i);

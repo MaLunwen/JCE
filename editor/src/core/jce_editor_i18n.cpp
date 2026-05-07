@@ -318,3 +318,27 @@ const char *jce_editor_i18n_id(const char *key, const char *id_suffix)
         snprintf(buf, LABEL_ID_LEN, "%s", txt);
     return buf;
 }
+
+/* Combo NUL-separated string buffer pool. */
+#define COMBO_RING 8
+#define COMBO_LEN  1024
+static char s_combo_ring[COMBO_RING][COMBO_LEN];
+static unsigned s_combo_idx = 0;
+
+const char *jce_editor_i18n_combo(const char *const *keys, int count)
+{
+    char *buf = s_combo_ring[s_combo_idx % COMBO_RING];
+    s_combo_idx = (s_combo_idx + 1) % COMBO_RING;
+    size_t off = 0;
+    for (int i = 0; i < count; ++i) {
+        const char *t = jce_editor_i18n(keys[i]);
+        size_t len = strlen(t);
+        if (off + len + 2 >= COMBO_LEN) break;
+        memcpy(buf + off, t, len);
+        off += len;
+        buf[off++] = '\0';
+    }
+    if (off < COMBO_LEN) buf[off] = '\0';
+    else buf[COMBO_LEN - 1] = '\0';
+    return buf;
+}

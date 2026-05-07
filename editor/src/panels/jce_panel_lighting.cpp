@@ -33,6 +33,7 @@
 
 extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/renderer/jce_volumetric_fog.h>
 }
 
 /* ── Editor-side persistent settings (per session). ─────────────────── */
@@ -116,7 +117,6 @@ static void draw_env_section(JceScene *scene, const LightCollect &c)
                       s_light.ambient_color);
     ImGui::DragFloat(jce_editor_i18n("lighting.ambientIntensity"),
                      &s_light.ambient_intensity, 0.01f, 0.0f, 4.0f);
-    ImGui::TextDisabled("(%s)", jce_editor_i18n("lighting.notWired"));
 }
 
 static void draw_lights_section(JceScene *scene, const LightCollect &c)
@@ -225,7 +225,7 @@ static void draw_fog_section(void)
     ImGui::DragFloat(jce_editor_i18n("lighting.fog.heightOrigin"),
                      &s_light.fog_height_origin, 0.1f);
     ImGui::EndDisabled();
-    ImGui::TextDisabled("(%s)", jce_editor_i18n("lighting.notWired"));
+    ImGui::TextDisabled("(%s)", jce_editor_i18n("lighting.fog.note"));
 }
 
 /* ── Public entry points ────────────────────────────────────────────── */
@@ -250,4 +250,33 @@ extern "C" void jce_editor_panel_lighting(void)
     if (ImGui::Begin(lbl, vis))
         jce_editor_panel_lighting_content();
     ImGui::End();
+}
+
+/* ── Renderer-facing accessors (consumed by jce_editor_scene_render) ── */
+
+extern "C" bool jce_editor_lighting_get_fog_enabled(void)
+{
+    return s_light.fog_enabled;
+}
+
+extern "C" void jce_editor_lighting_get_fog_params(JceVolumetricFogParams *out)
+{
+    if (!out) return;
+    *out = jce_volumetric_fog_default_params();
+    out->color_r        = s_light.fog_color[0];
+    out->color_g        = s_light.fog_color[1];
+    out->color_b        = s_light.fog_color[2];
+    out->density        = s_light.fog_density;
+    out->height_falloff = s_light.fog_height_falloff;
+    out->height_origin  = s_light.fog_height_origin;
+}
+
+extern "C" void jce_editor_lighting_get_ambient(float out_color_rgb[3], float *out_intensity)
+{
+    if (out_color_rgb) {
+        out_color_rgb[0] = s_light.ambient_color[0];
+        out_color_rgb[1] = s_light.ambient_color[1];
+        out_color_rgb[2] = s_light.ambient_color[2];
+    }
+    if (out_intensity) *out_intensity = s_light.ambient_intensity;
 }

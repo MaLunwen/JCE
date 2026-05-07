@@ -234,3 +234,67 @@ void jce_sysinfo_update(JceSysInfo *info)
     }
 #endif
 }
+
+bool jce_sysinfo_process_mem(uint64_t *out_working_set,
+                             uint64_t *out_private_bytes,
+                             uint64_t *out_peak_working_set)
+{
+    bool ok = false;
+#ifdef __EMSCRIPTEN__
+    (void)out_working_set; (void)out_private_bytes; (void)out_peak_working_set;
+#elif defined(SDL_PLATFORM_WINDOWS)
+    {
+        PROCESS_MEMORY_COUNTERS_EX pmc;
+        memset(&pmc, 0, sizeof(pmc));
+        if (GetProcessMemoryInfo(GetCurrentProcess(),
+                                 (PROCESS_MEMORY_COUNTERS *)&pmc, sizeof(pmc))) {
+            if (out_working_set)      *out_working_set      = (uint64_t)pmc.WorkingSetSize;
+            if (out_peak_working_set) *out_peak_working_set = (uint64_t)pmc.PeakWorkingSetSize;
+            if (out_private_bytes)    *out_private_bytes    = (uint64_t)pmc.PrivateUsage;
+            ok = true;
+        }
+    }
+#elif defined(SDL_PLATFORM_LINUX)
+    {
+        SDL_IOStream *io = SDL_IOFromFile("/proc/self/status", "r");
+        if (io) {
+            char buf[8192];
+            size_t nread = SDL_ReadIO(io, buf, sizeof(buf) - 1);
+            SDL_CloseIO(io);
+            if (nread > 0) {
+                buf[nread] = '\0';
+                long kb = 0;
+                const char *p;
+                if (out_working_set && (p = strstr(buf, "VmRSS:"))) {
+                    if (sscanf(p + 6, " %ld", &kb) == 1) {
+                        *out_working_set = (uint64_t)kb * 1024ULL; ok = true;
+                    }
+                }
+                if (out_peak_working_set && (p = strstr(buf, "VmHWM:"))) {
+                    if (sscanf(p + 6, " %ld", &kb) == 1) {
+                        *out_peak_working_set = (uint64_t)kb * 1024ULL; ok = true;
+                    }
+                }
+                if (out_private_bytes && (p = strstr(buf, "VmData:"))) {
+                    if (sscanf(p + 7, " %ld", &kb) == 1) {
+                        *out_private_bytes = (uint64_t)kb * 1024ULL; ok = true;
+                    }
+                }
+            }
+        }
+    }
+#elif defined(SDL_PLATFORM_MACOS)
+    {
+        /* macOS exposes resident_size via mach_task_basic_info; peak and
+           private bytes aren't directly available without sampling VM
+           regions, so only working_set is provided here. */
+        mach_task_basic_info_data_t ti;
+        mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+        if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                      (task_info_t)&ti, &count) == KERN_SUCCESS) {
+            if (out_working_set) { *out_working_set = (uint64_t)ti.resident_size; ok = true; }
+        }
+    }
+#endif
+    return ok;
+}

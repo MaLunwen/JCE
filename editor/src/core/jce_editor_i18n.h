@@ -51,6 +51,12 @@ const char *jce_editor_i18n_or(const char *key, const char *fallback);
    Pass id_suffix as the bare id (no leading "##"). */
 const char *jce_editor_i18n_id(const char *key, const char *id_suffix);
 
+/* Build a NUL-separated combo string from i18n keys.
+   Result: "<txt0>\0<txt1>\0...\0<txtN-1>\0\0" suitable for ImGui::Combo
+   (immediate-mode array form). Returns a pointer into a rotating
+   buffer pool (8 slots * 1024 bytes); good for one frame. */
+const char *jce_editor_i18n_combo(const char *const *keys, int count);
+
 #ifdef __cplusplus
 }
 #endif

@@ -12,11 +12,13 @@
 
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
 #include <memory>
-#include <sstream>
 #include <string>
 #include <vector>
+
+extern "C" {
+#include <jce/os/core/jce_filesystem.h>
+}
 
 extern "C" {
 #include <jce/os/core/jce_log.h>
@@ -127,15 +129,14 @@ uint32_t jce_bt_backend_load_tree_file(JceBtBackend *b, const char *path)
     if (!b || !path) return UINT32_MAX;
 
     try {
-        std::ifstream file(path);
-        if (!file.is_open()) {
+        uint64_t got = 0;
+        void *buf = jce_fs_host_read_all(path, &got);
+        if (!buf) {
             LOG_ERROR(LOG_TAG, "cannot open '%s'", path);
             return UINT32_MAX;
         }
-
-        std::ostringstream ss;
-        ss << file.rdbuf();
-        std::string xml = ss.str();
+        std::string xml(static_cast<const char *>(buf), (size_t)got);
+        jce_fs_buffer_free(buf);
 
         auto tree = std::make_unique<BT::Tree>(
             b->factory.createTreeFromText(xml));

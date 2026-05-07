@@ -11,6 +11,7 @@
 
 #include <jce/os/core/jce_defs.h>
 
+#include <stdbool.h>
 #include <stdint.h>
 
 JCE_EXTERN_C_BEGIN
@@ -35,6 +36,14 @@ JCE_API void jce_sysinfo_init(JceSysInfo *info);
 
 /* Update dynamic info. Call roughly once per second. */
 JCE_API void jce_sysinfo_update(JceSysInfo *info);
+
+/* Cross-platform process memory query in bytes.  Each out pointer is
+   optional (NULL is OK).  Returns true if at least one value was filled.
+   On platforms without a meaningful equivalent the corresponding output
+   stays untouched (caller should pre-zero). */
+JCE_API bool jce_sysinfo_process_mem(uint64_t *out_working_set,
+                                     uint64_t *out_private_bytes,
+                                     uint64_t *out_peak_working_set);
 
 JCE_EXTERN_C_END
 

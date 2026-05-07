@@ -276,3 +276,66 @@ bool jce_host_open_terminal(const char *cwd)
     return false;
 #endif
 }
+
+/* ------------------------------------------------------------------ */
+/* Run-and-capture                                                      */
+/* ------------------------------------------------------------------ */
+
+#include <jce/os/core/jce_alloc.h>
+
+bool jce_host_run_capture(const char *const *argv,
+                          const char *cwd,
+                          char **out_buf,
+                          size_t *out_size,
+                          int *out_exit)
+{
+    if (!argv || !argv[0] || !out_buf) return false;
+    *out_buf = NULL;
+    if (out_size) *out_size = 0;
+    if (out_exit) *out_exit = -1;
+
+    SDL_PropertiesID props = SDL_CreateProperties();
+    if (!props) return false;
+
+    SDL_SetPointerProperty(props, SDL_PROP_PROCESS_CREATE_ARGS_POINTER,
+                           (void *)argv);
+    SDL_SetNumberProperty(props, SDL_PROP_PROCESS_CREATE_STDIN_NUMBER,
+                          SDL_PROCESS_STDIO_NULL);
+    SDL_SetNumberProperty(props, SDL_PROP_PROCESS_CREATE_STDOUT_NUMBER,
+                          SDL_PROCESS_STDIO_APP);
+    SDL_SetBooleanProperty(props, SDL_PROP_PROCESS_CREATE_STDERR_TO_STDOUT_BOOLEAN,
+                           true);
+    if (cwd && cwd[0]) {
+        SDL_SetStringProperty(props,
+                              SDL_PROP_PROCESS_CREATE_WORKING_DIRECTORY_STRING,
+                              cwd);
+    }
+
+    SDL_Process *p = SDL_CreateProcessWithProperties(props);
+    SDL_DestroyProperties(props);
+    if (!p) return false;
+
+    size_t got = 0;
+    int    exit_code = -1;
+    /* SDL_ReadProcess returns a buffer allocated with SDL_malloc. */
+    void *sdl_buf = SDL_ReadProcess(p, &got, &exit_code);
+
+    /* Copy into a jce_malloc-owned buffer so callers free with jce_free. */
+    char *buf = NULL;
+    if (sdl_buf || got == 0) {
+        buf = (char *)jce_malloc(got + 1);
+        if (buf) {
+            if (got && sdl_buf) memcpy(buf, sdl_buf, got);
+            buf[got] = '\0';
+        }
+        SDL_free(sdl_buf);
+    }
+    SDL_DestroyProcess(p);
+
+    if (!buf) return false;
+
+    *out_buf = buf;
+    if (out_size) *out_size = got;
+    if (out_exit) *out_exit = exit_code;
+    return true;
+}

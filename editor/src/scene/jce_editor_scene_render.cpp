@@ -21,6 +21,12 @@ extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/renderer/jce_model.h>
 #include <jce/renderer/jce_postfx.h>
+#include <jce/renderer/jce_offscreen_target.h>
+#include <jce/renderer/jce_volumetric_fog.h>
+
+bool jce_editor_lighting_get_fog_enabled(void);
+void jce_editor_lighting_get_fog_params(JceVolumetricFogParams *out);
+void jce_editor_lighting_get_ambient(float out_color_rgb[3], float *out_intensity);
 }
 
 /* ── State instance (shared via extern in internal header) ────────── */
@@ -509,10 +515,39 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
      * when hardware queries are unsupported (ES2/WebGL1). */
     cfg.occlusion_culler = s_sr.occlusion_culler;
 
+    /* Volumetric fog (Stage 1: render only — composite pass deferred).
+     * Lighting panel writes; renderer consumes here. */
+    cfg.fog_enabled = jce_editor_lighting_get_fog_enabled();
+    if (cfg.fog_enabled) {
+        jce_editor_lighting_get_fog_params(&cfg.fog);
+        cfg.fog_depth_tex_handle =
+            jce_offscreen_target_get_depth_texture(s_sr.bridge);
+        cfg.fog_rt_width  = (int)s_sr.viewport_width;
+        cfg.fog_rt_height = (int)s_sr.viewport_height;
+    } else {
+        cfg.fog_depth_tex_handle = UINT16_MAX;
+        cfg.fog_rt_width = 0;
+        cfg.fog_rt_height = 0;
+    }
+
     JceScene *scene = jce_state_get_scene();
     if (scene && s_sr.scene_renderer) {
+        float amb_color[3];
+        float amb_intensity = 0.15f;
+        jce_editor_lighting_get_ambient(amb_color, &amb_intensity);
+        jce_scene_renderer_set_ambient_override(s_sr.scene_renderer,
+                                                 amb_color, amb_intensity);
         jce_scene_renderer_render(s_sr.scene_renderer, scene, s_sr.camera,
                                   scene_view_id(), dt_sec, &cfg);
+    }
+
+    /* Composite volumetric fog into the bridge color RT (after the
+     * scene draws into it but before overlays / PostFX run). The
+     * scene renderer has already filled the depth buffer & fog RT;
+     * here we blend rgb in-scatter + transmittance into the bridge.
+     * No-op when fog is disabled or composite shader unavailable. */
+    if (cfg.fog_enabled && s_sr.scene_renderer) {
+        jce_scene_renderer_composite_fog(s_sr.scene_renderer, scene_view_id());
     }
 
     /* Tick the world streamer each frame so pending chunk loads are applied

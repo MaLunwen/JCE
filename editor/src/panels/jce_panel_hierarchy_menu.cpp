@@ -27,7 +27,7 @@ extern "C" {
  * is added, `mesh_shape` is written into the ECS component.
  */
 static uint32_t create_entity_select(const char *name, uint32_t parent,
-                                     uint32_t extra_flag, int mesh_shape)
+                                     uint64_t extra_flag, int mesh_shape)
 {
     uint32_t id = jce_state_create_entity(name, parent);
     jce_state_add_component(id, JCE_COMP_FLAG_TRANSFORM);
@@ -340,7 +340,7 @@ static void draw_entity_menu(uint32_t ctx_id)
     const char *delete_label = multi_on_ctx
         ? jce_editor_i18n("hierarchy.deleteSelected")
         : jce_editor_i18n("hierarchy.delete");
-    if (ImGui::MenuItem(delete_label, "Del")) {
+    if (ImGui::MenuItem(delete_label, jce_editor_i18n("shortcut.del"))) {
         int selected_count = 0;
         const uint32_t *selected_ids = jce_state_get_selection(&selected_count);
         if (selected_count > 0) {

@@ -9,7 +9,9 @@
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_state.h"
+#include "core/jce_editor_presets.h"
 #include "core/jce_editor_state_internal.h"
+#include "core/jce_project_settings.h"
 #include "core/jce_reflect.h"
 #include "scene/jce_editor_scene_render.h"
 #include "scene/jce_model_loader_assimp.h"
@@ -19,6 +21,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <algorithm>
 #include <cmath>
 
 /* Per-entity euler cache shared with the scene-view gizmo. Implemented in
@@ -39,13 +42,22 @@ extern "C" {
 /* ── Component clipboard for Copy/Paste Values ────────────────────── */
 
 static struct {
-    uint32_t flag;
+    uint64_t flag;
     char     data[4096];
     size_t   data_size;
 } s_comp_clipboard = { 0, {0}, 0 };
 
 static void *comp_get_ptr_and_size(JceScene *scene, JceEntity e,
-                                   uint32_t flag, size_t *out_size)
+                                   uint64_t flag, size_t *out_size);
+
+void *jce_inspector_comp_blob(JceScene *scene, JceEntity e,
+                              uint64_t flag, size_t *out_size)
+{
+    return comp_get_ptr_and_size(scene, e, flag, out_size);
+}
+
+static void *comp_get_ptr_and_size(JceScene *scene, JceEntity e,
+                                   uint64_t flag, size_t *out_size)
 {
     if (!scene) return NULL;
     switch (flag) {
@@ -70,6 +82,99 @@ static void *comp_get_ptr_and_size(JceScene *scene, JceEntity e,
     case JCE_COMP_FLAG_AUDIO_SOURCE:
         *out_size = sizeof(JceAudioSourceComponent);
         return jce_scene_get_audio_source(scene, e);
+    case JCE_COMP_FLAG_RIGIDBODY_2D:
+        *out_size = sizeof(JceRigidBody2DComponent);
+        return jce_scene_get_rigidbody2d(scene, e);
+    case JCE_COMP_FLAG_PARTICLE_EMITTER:
+        *out_size = sizeof(JceParticleEmitterComponent);
+        return jce_scene_get_particle_emitter(scene, e);
+    case JCE_COMP_FLAG_BEHAVIOR_TREE:
+        *out_size = sizeof(JceBehaviorTree);
+        return jce_scene_get_behavior_tree(scene, e);
+    case JCE_COMP_FLAG_LOD_GROUP:
+        *out_size = sizeof(JceLodGroupComponent);
+        return jce_scene_get_lod_group(scene, e);
+    case JCE_COMP_FLAG_VIRTUAL_CAMERA:
+        *out_size = sizeof(JceVirtualCameraComponent);
+        return jce_scene_get_virtual_camera(scene, e);
+    case JCE_COMP_FLAG_TRIGGER_VOLUME:
+        *out_size = sizeof(JceTriggerVolumeComponent);
+        return jce_scene_get_trigger_volume(scene, e);
+    case JCE_COMP_FLAG_CAPSULE_COLLIDER:
+        *out_size = sizeof(JceCapsuleColliderComponent);
+        return jce_scene_get_capsule_collider(scene, e);
+    case JCE_COMP_FLAG_MESH_COLLIDER:
+        *out_size = sizeof(JceMeshColliderComponent);
+        return jce_scene_get_mesh_collider(scene, e);
+    case JCE_COMP_FLAG_COLLIDER_2D:
+        *out_size = sizeof(JceCollider2DComponent);
+        return jce_scene_get_collider2d(scene, e);
+    case JCE_COMP_FLAG_TRAIL_RENDERER:
+        *out_size = sizeof(JceTrailRendererComponent);
+        return jce_scene_get_trail_renderer(scene, e);
+    case JCE_COMP_FLAG_LINE_RENDERER:
+        *out_size = sizeof(JceLineRendererComponent);
+        return jce_scene_get_line_renderer(scene, e);
+    case JCE_COMP_FLAG_REFLECTION_PROBE:
+        *out_size = sizeof(JceReflectionProbeComponent);
+        return jce_scene_get_reflection_probe(scene, e);
+    case JCE_COMP_FLAG_DECAL:
+        *out_size = sizeof(JceDecalComponent);
+        return jce_scene_get_decal(scene, e);
+    case JCE_COMP_FLAG_LIGHT_PROBE_GROUP:
+        *out_size = sizeof(JceLightProbeGroupComponent);
+        return jce_scene_get_light_probe_group(scene, e);
+    case JCE_COMP_FLAG_AUDIO_LISTENER:
+        *out_size = sizeof(JceAudioListenerComponent);
+        return jce_scene_get_audio_listener(scene, e);
+    case JCE_COMP_FLAG_AUDIO_REVERB_ZONE:
+        *out_size = sizeof(JceAudioReverbZoneComponent);
+        return jce_scene_get_audio_reverb_zone(scene, e);
+    case JCE_COMP_FLAG_AUDIO_OCCLUSION:
+        *out_size = sizeof(JceAudioOcclusionComponent);
+        return jce_scene_get_audio_occlusion(scene, e);
+    case JCE_COMP_FLAG_SPAWN_MANAGER:
+        *out_size = sizeof(JceSpawnManagerComponent);
+        return jce_scene_get_spawn_manager(scene, e);
+    case JCE_COMP_FLAG_WEAPON:
+        *out_size = sizeof(JceWeaponComponent);
+        return jce_scene_get_weapon(scene, e);
+    case JCE_COMP_FLAG_SAVE_POINT:
+        *out_size = sizeof(JceSavePointComponent);
+        return jce_scene_get_save_point(scene, e);
+    case JCE_COMP_FLAG_WHEEL_COLLIDER:
+        *out_size = sizeof(JceWheelColliderComponent);
+        return jce_scene_get_wheel_collider(scene, e);
+    case JCE_COMP_FLAG_CONSTANT_FORCE:
+        *out_size = sizeof(JceConstantForceComponent);
+        return jce_scene_get_constant_force(scene, e);
+    case JCE_COMP_FLAG_CONFIGURABLE_JOINT:
+        *out_size = sizeof(JceConfigurableJointComponent);
+        return jce_scene_get_configurable_joint(scene, e);
+    case JCE_COMP_FLAG_JOINT_2D:
+        *out_size = sizeof(JceJoint2DComponent);
+        return jce_scene_get_joint2d(scene, e);
+    case JCE_COMP_FLAG_BILLBOARD_RENDERER:
+        *out_size = sizeof(JceBillboardRendererComponent);
+        return jce_scene_get_billboard_renderer(scene, e);
+    case JCE_COMP_FLAG_CANVAS:
+        *out_size = sizeof(JceCanvasComponent);
+        return jce_scene_get_canvas(scene, e);
+    case JCE_COMP_FLAG_CANVAS_GROUP:
+        *out_size = sizeof(JceCanvasGroupComponent);
+        return jce_scene_get_canvas_group(scene, e);
+    case JCE_COMP_FLAG_LAYOUT_GROUP:
+        *out_size = sizeof(JceLayoutGroupComponent);
+        return jce_scene_get_layout_group(scene, e);
+    case JCE_COMP_FLAG_UI_IMAGE:
+        *out_size = sizeof(JceUIImageComponent);
+        return jce_scene_get_ui_image(scene, e);
+    case JCE_COMP_FLAG_UI_TEXT:
+        *out_size = sizeof(JceUITextComponent);
+        return jce_scene_get_ui_text(scene, e);
+    case JCE_COMP_FLAG_UI_BUTTON:
+        *out_size = sizeof(JceUIButtonComponent);
+        return jce_scene_get_ui_button(scene, e);
     default:
         *out_size = 0;
         return NULL;
@@ -170,9 +275,31 @@ static bool s_insp_batch_open = false;
  * post-edit history snapshot). */
 static struct {
     uint32_t entity_id;
-    uint32_t flag;
+    uint64_t flag;
     bool     pending;
 } s_pending_remove = { 0, 0, false };
+
+/* Preset save modal — name buffer is shared across sections. */
+static char s_preset_save_buf[64] = { 0 };
+
+/* Deferred component reorder — applied at end of frame. dir = -1 (up),
+ * +1 (down), or 0 (drag set absolute target index). */
+static struct {
+    uint32_t entity_id;
+    uint64_t src_flag;
+    int      dir;        /* -1, +1, or 0 (use target_index) */
+    size_t   target_index;
+    bool     pending;
+} s_pending_move = { 0, 0, 0, 0, false };
+
+/* Drag-reorder transient state: which header is being dragged, and over
+ * which header the cursor currently hovers. Cleared on mouse release. */
+static struct {
+    uint32_t entity_id;
+    uint64_t src_flag;
+    uint64_t hover_flag;
+    bool     active;
+} s_drag = { 0, 0, 0, false };
 
 static void insp_track_edit(void)
 {
@@ -362,7 +489,7 @@ static void draw_comp_transform(uint32_t entity_id, JceTransform *t)
     float scl[3] = {t->scale.x,    t->scale.y,    t->scale.z};
     float rot[3];
     if (!jce_editor_get_cached_euler_deg(entity_id, t->rotation, rot))
-        jce_q_to_euler_deg(t->rotation, rot);
+        editor_q_to_euler_deg(t->rotation, rot);
 
     ImGui::Text("%s", jce_editor_i18n("transform.position"));
     ImGui::SameLine(80);
@@ -380,7 +507,7 @@ static void draw_comp_transform(uint32_t entity_id, JceTransform *t)
         if (rot[a] < 0.0f) rot[a] += 360.0f;
     }
     if (rot[0] != rot_in[0] || rot[1] != rot_in[1] || rot[2] != rot_in[2]) {
-        t->rotation = jce_q_from_euler_deg(rot);
+        t->rotation = editor_q_from_euler_deg(rot);
         jce_editor_set_cached_euler_deg(entity_id, t->rotation, rot);
     }
 
@@ -392,7 +519,7 @@ static void draw_comp_transform(uint32_t entity_id, JceTransform *t)
     }
 }
 
-static void draw_comp_light(JceScene *scene, JceEntity e, uint32_t flags)
+static void draw_comp_light(JceScene *scene, JceEntity e, uint64_t flags)
 {
     char lbl[256];
 
@@ -698,7 +825,7 @@ static void draw_comp_mesh_renderer(JceMeshRenderer *mr)
         ImGui::InputText(jce_editor_i18n("inspector.texture.ao"), mr->ao_tex, 128);
         insp_track_edit();
         accept_asset_drop(mr->ao_tex, 128);
-        snprintf(lbl, sizeof(lbl), "%s##tex", jce_editor_i18n("inspector.texture.emissive"));
+        snprintf(lbl, sizeof(lbl), "%s###tex", jce_editor_i18n("inspector.texture.emissive"));
         ImGui::InputText(lbl, mr->emissive_tex, 128);
         insp_track_edit();
         accept_asset_drop(mr->emissive_tex, 128);
@@ -767,10 +894,10 @@ static void draw_comp_skeletal_animator(JceSkeletalAnimatorComponent *skel)
         }
     }
 
-    snprintf(lbl, sizeof(lbl), "%s##skel", jce_editor_i18n("timeline.speed"));
+    snprintf(lbl, sizeof(lbl), "%s###skel", jce_editor_i18n("timeline.speed"));
     ImGui::DragFloat(lbl, &skel->speed, 0.01f, 0.01f, 10.0f);
     insp_track_edit();
-    snprintf(lbl, sizeof(lbl), "%s##skel", jce_editor_i18n("timeline.loop"));
+    snprintf(lbl, sizeof(lbl), "%s###skel", jce_editor_i18n("timeline.loop"));
     if (ImGui::Checkbox(lbl, &skel->loop))
         insp_undo_bool(&skel->loop);
 
@@ -810,7 +937,7 @@ static void draw_comp_skeletal_animator(JceSkeletalAnimatorComponent *skel)
         }
     }
 
-    snprintf(lbl, sizeof(lbl), "%s##skel",
+    snprintf(lbl, sizeof(lbl), "%s###skel",
              skel->playing ? jce_editor_i18n("toolbar.stop")
                            : jce_editor_i18n("toolbar.play"));
     if (ImGui::Button(lbl))
@@ -820,19 +947,19 @@ static void draw_comp_skeletal_animator(JceSkeletalAnimatorComponent *skel)
 static void draw_comp_rigidbody(JceRigidBodyComponent *rb)
 {
     char lbl[256];
-    snprintf(lbl, sizeof(lbl), "%s##rbMass", jce_editor_i18n("rigidbody.mass"));
+    snprintf(lbl, sizeof(lbl), "%s###rbMass", jce_editor_i18n("rigidbody.mass"));
     ImGui::DragFloat(lbl, &rb->mass, 0.1f, 0.0f, 10000.0f);
     insp_track_edit();
-    snprintf(lbl, sizeof(lbl), "%s##rbDrag", jce_editor_i18n("rigidbody.drag"));
+    snprintf(lbl, sizeof(lbl), "%s###rbDrag", jce_editor_i18n("rigidbody.drag"));
     ImGui::DragFloat(lbl, &rb->drag, 0.01f, 0.0f, 100.0f);
     insp_track_edit();
-    snprintf(lbl, sizeof(lbl), "%s##rbAngularDrag", jce_editor_i18n("rigidbody.angularDrag"));
+    snprintf(lbl, sizeof(lbl), "%s###rbAngularDrag", jce_editor_i18n("rigidbody.angularDrag"));
     ImGui::DragFloat(lbl, &rb->angular_drag, 0.01f, 0.0f, 100.0f);
     insp_track_edit();
-    snprintf(lbl, sizeof(lbl), "%s##rbUseGravity", jce_editor_i18n("rigidbody.useGravity"));
+    snprintf(lbl, sizeof(lbl), "%s###rbUseGravity", jce_editor_i18n("rigidbody.useGravity"));
     if (ImGui::Checkbox(lbl, &rb->use_gravity))
         insp_undo_bool(&rb->use_gravity);
-    snprintf(lbl, sizeof(lbl), "%s##rbIsKinematic", jce_editor_i18n("rigidbody.isKinematic"));
+    snprintf(lbl, sizeof(lbl), "%s###rbIsKinematic", jce_editor_i18n("rigidbody.isKinematic"));
     if (ImGui::Checkbox(lbl, &rb->is_kinematic))
         insp_undo_bool(&rb->is_kinematic);
 }
@@ -846,7 +973,7 @@ static void draw_comp_box_collider(JceBoxColliderComponent *bc)
     ImGui::Text("%s", jce_editor_i18n("collider.size"));
     ImGui::SameLine(80);
     draw_vec3_control("BoxSize", bc->size, 0.01f, 1.0f);
-    snprintf(lbl, sizeof(lbl), "%s##box", jce_editor_i18n("collider.isTrigger"));
+    snprintf(lbl, sizeof(lbl), "%s###box", jce_editor_i18n("collider.isTrigger"));
     if (ImGui::Checkbox(lbl, &bc->is_trigger))
         insp_undo_bool(&bc->is_trigger);
 }
@@ -859,7 +986,7 @@ static void draw_comp_sphere_collider(JceSphereColliderComponent *sc)
     draw_vec3_control("SphereCenter", sc->center);
     ImGui::DragFloat(jce_editor_i18n("collider.radius"), &sc->radius, 0.01f, 0.001f, 1000.0f);
     insp_track_edit();
-    snprintf(lbl, sizeof(lbl), "%s##sphere", jce_editor_i18n("collider.isTrigger"));
+    snprintf(lbl, sizeof(lbl), "%s###sphere", jce_editor_i18n("collider.isTrigger"));
     if (ImGui::Checkbox(lbl, &sc->is_trigger))
         insp_undo_bool(&sc->is_trigger);
 }
@@ -869,7 +996,7 @@ static void draw_comp_character_controller(JceCharacterControllerComponent *cc)
     char lbl[256];
     ImGui::DragFloat(jce_editor_i18n("collider.height"), &cc->height, 0.1f, 0.1f, 100.0f);
     insp_track_edit();
-    snprintf(lbl, sizeof(lbl), "%s##cc", jce_editor_i18n("collider.radius"));
+    snprintf(lbl, sizeof(lbl), "%s###cc", jce_editor_i18n("collider.radius"));
     ImGui::DragFloat(lbl, &cc->radius, 0.01f, 0.01f, 50.0f);
     insp_track_edit();
     ImGui::DragFloat(jce_editor_i18n("inspector.stepOffset"), &cc->step_offset, 0.01f, 0.0f, 10.0f);
@@ -890,7 +1017,7 @@ static void draw_comp_audio_source(JceAudioSourceComponent *as)
     insp_track_edit();
     ImGui::DragFloat(jce_editor_i18n("inspector.spatialBlend"), &as->spatial_blend, 0.01f, 0.0f, 1.0f);
     insp_track_edit();
-    snprintf(lbl, sizeof(lbl), "%s##audio", jce_editor_i18n("audioSource.loop"));
+    snprintf(lbl, sizeof(lbl), "%s###audio", jce_editor_i18n("audioSource.loop"));
     if (ImGui::Checkbox(lbl, &as->loop))
         insp_undo_bool(&as->loop);
     if (ImGui::Checkbox(jce_editor_i18n("audioSource.playOnAwake"), &as->play_on_awake))
@@ -1010,6 +1137,706 @@ static void draw_comp_terrain(JceTerrainComponent *tc)
     }
 }
 
+static void draw_comp_lod_group(JceLodGroupComponent *lg)
+{
+    if (!lg) return;
+    if (lg->level_count < 0) lg->level_count = 0;
+    if (lg->level_count > JCE_LOD_COMP_MAX_LEVELS) lg->level_count = JCE_LOD_COMP_MAX_LEVELS;
+    int lc = lg->level_count;
+    if (ImGui::SliderInt(jce_editor_i18n_id("inspector.lod.levelCount", "lod"), &lc, 0, JCE_LOD_COMP_MAX_LEVELS)) {
+        lg->level_count = lc;
+        insp_track_edit();
+    }
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.lod.hysteresis", "lod"), &lg->hysteresis, 0.01f, 0.0f, 0.5f, "%.2f");
+    insp_track_edit();
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.lod.cullWhenTooFar", "lod"), &lg->cull_when_too_far))
+        insp_undo_bool(&lg->cull_when_too_far);
+    ImGui::Separator();
+    for (int i = 0; i < lg->level_count; ++i) {
+        ImGui::PushID(i);
+        char hdr[32];
+        snprintf(hdr, sizeof hdr, "LOD %d", i);
+        ImGui::TextUnformatted(hdr);
+        ImGui::DragFloat(jce_editor_i18n("inspector.lod.lodDistance"), &lg->distances[i], 0.5f, 0.0f, 100000.0f, "%.1f");
+        insp_track_edit();
+        ImGui::InputText(jce_editor_i18n("inspector.lod.meshOverride"), lg->level_mesh_paths[i],
+                         sizeof lg->level_mesh_paths[i]);
+        insp_track_edit();
+        accept_asset_drop(lg->level_mesh_paths[i], sizeof lg->level_mesh_paths[i]);
+        ImGui::Separator();
+        ImGui::PopID();
+    }
+    ImGui::TextDisabled(jce_editor_i18n("inspector.lod.emptyMeshNote"));
+}
+
+static void draw_comp_virtual_camera(JceVirtualCameraComponent *vc)
+{
+    if (!vc) return;
+    ImGui::InputText(jce_editor_i18n_id("inspector.vcam.name", "vcam"), vc->vcam_name, sizeof vc->vcam_name);
+    insp_track_edit();
+    int prio = vc->priority;
+    if (ImGui::DragInt(jce_editor_i18n_id("inspector.vcam.priority", "vcam"), &prio, 1, -1000, 1000)) {
+        vc->priority = prio; insp_track_edit();
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton(jce_editor_i18n_id("inspector.vcam.solo", "vcam"))) {
+        /* Bump priority above any reasonable other VCam, mark active. */
+        vc->priority = 9999;
+        vc->active   = true;
+        insp_track_edit();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(jce_editor_i18n("inspector.vcam.soloTooltip"));
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.vcam.active", "vcam"), &vc->active))
+        insp_undo_bool(&vc->active);
+
+    static const char *track_modes[] = {
+        "None", "Follow", "Look At", "Follow + Look At"
+    };
+    int tm = vc->track_mode; if (tm < 0 || tm > 3) tm = 0;
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.vcam.trackMode", "vcam"), &tm, track_modes, 4)) {
+        vc->track_mode = tm; insp_track_edit();
+    }
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.vcam.fov", "vcam"), &vc->fov_deg, 0.5f, 1.0f, 179.0f, "%.1f");
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.vcam.damping", "vcam"), &vc->damping, 0.01f, 0.0f, 1.0f, "%.2f");
+    insp_track_edit();
+
+    ImGui::Separator();
+    ImGui::DragFloat3(jce_editor_i18n_id("inspector.vcam.position", "vcam"), vc->position, 0.1f);
+    insp_track_edit();
+    ImGui::DragFloat3(jce_editor_i18n_id("inspector.vcam.lookAt", "vcam"), vc->look_at, 0.1f);
+    insp_track_edit();
+    ImGui::DragFloat3(jce_editor_i18n_id("inspector.vcam.followOffset", "vcam"), vc->follow_offset, 0.1f);
+    insp_track_edit();
+
+    ImGui::Separator();
+    int ft = (int)vc->follow_target;
+    if (ImGui::InputInt(jce_editor_i18n_id("inspector.vcam.followTargetEntity", "vcam"), &ft)) {
+        vc->follow_target = (uint64_t)(ft < 0 ? 0 : ft);
+        insp_track_edit();
+    }
+    int lt = (int)vc->look_at_target;
+    if (ImGui::InputInt(jce_editor_i18n_id("inspector.vcam.lookAtTargetEntity", "vcam"), &lt)) {
+        vc->look_at_target = (uint64_t)(lt < 0 ? 0 : lt);
+        insp_track_edit();
+    }
+    ImGui::TextDisabled(jce_editor_i18n("inspector.vcam.targetNote"));
+    ImGui::Separator();
+    ImGui::TextDisabled(jce_editor_i18n("inspector.vcam.playModeNote"));
+    ImGui::TextDisabled("%s", jce_editor_i18n("inspector.vcam.priorityNote"));
+}
+
+static void draw_comp_trigger_volume(JceTriggerVolumeComponent *tv)
+{
+    if (!tv) return;
+    static const char *shapes[] = { "AABB", "Sphere", "OBB" };
+    int sh = tv->shape; if (sh < 0 || sh > 2) sh = 0;
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.trig.shape", "trig"), &sh, shapes, 3)) {
+        tv->shape = sh; insp_track_edit();
+    }
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.trig.enabled", "trig"), &tv->enabled))
+        insp_undo_bool(&tv->enabled);
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.trig.fireStayEvents", "trig"), &tv->fire_stay))
+        insp_undo_bool(&tv->fire_stay);
+    ImGui::InputText(jce_editor_i18n_id("inspector.trig.tag", "trig"), tv->tag, sizeof tv->tag);
+    insp_track_edit();
+
+    ImGui::Separator();
+    ImGui::DragFloat3(jce_editor_i18n_id("inspector.trig.center", "trig"), tv->center, 0.1f);
+    insp_track_edit();
+    if (tv->shape == 1) {
+        ImGui::DragFloat(jce_editor_i18n_id("inspector.trig.radius", "trig"), &tv->half_extents[0], 0.05f, 0.0f, 10000.0f, "%.2f");
+        insp_track_edit();
+    } else {
+        ImGui::DragFloat3(jce_editor_i18n_id("inspector.trig.halfExtents", "trig"), tv->half_extents, 0.05f, 0.0f, 10000.0f, "%.2f");
+        insp_track_edit();
+    }
+    if (tv->shape == 2) {
+        ImGui::Separator();
+        ImGui::TextUnformatted(jce_editor_i18n("inspector.trig.obbAxes"));
+        ImGui::DragFloat3(jce_editor_i18n_id("inspector.trig.axisX", "trig"), tv->axis_x, 0.01f);
+        insp_track_edit();
+        ImGui::DragFloat3(jce_editor_i18n_id("inspector.trig.axisY", "trig"), tv->axis_y, 0.01f);
+        insp_track_edit();
+        ImGui::DragFloat3(jce_editor_i18n_id("inspector.trig.axisZ", "trig"), tv->axis_z, 0.01f);
+        insp_track_edit();
+    }
+}
+
+static void draw_comp_capsule_collider(JceCapsuleColliderComponent *cc)
+{
+    if (!cc) return;
+    static const char *axes[] = { "X", "Y", "Z" };
+    int ax = cc->axis; if (ax < 0 || ax > 2) ax = 1;
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.capcol.axis", "capcol"), &ax, axes, 3)) { cc->axis = ax; insp_track_edit(); }
+    ImGui::DragFloat3(jce_editor_i18n_id("inspector.capcol.center", "capcol"), cc->center, 0.05f); insp_track_edit();
+    ImGui::DragFloat (jce_editor_i18n_id("inspector.capcol.radius", "capcol"), &cc->radius, 0.01f, 0.0f, 10000.0f, "%.3f"); insp_track_edit();
+    ImGui::DragFloat (jce_editor_i18n_id("inspector.capcol.height", "capcol"), &cc->height, 0.01f, 0.0f, 10000.0f, "%.3f"); insp_track_edit();
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.capcol.isTrigger", "capcol"), &cc->is_trigger))
+        insp_undo_bool(&cc->is_trigger);
+}
+
+static void draw_comp_mesh_collider(JceMeshColliderComponent *mc)
+{
+    if (!mc) return;
+    ImGui::InputText(jce_editor_i18n_id("inspector.meshcol.mesh", "meshcol"), mc->mesh_path, sizeof mc->mesh_path);
+    insp_track_edit();
+    accept_asset_drop(mc->mesh_path, sizeof mc->mesh_path);
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.meshcol.convex", "meshcol"), &mc->convex))
+        insp_undo_bool(&mc->convex);
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.meshcol.isTrigger", "meshcol"), &mc->is_trigger))
+        insp_undo_bool(&mc->is_trigger);
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.meshcol.friction", "meshcol"),    &mc->friction,    0.01f, 0.0f, 10.0f, "%.2f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.meshcol.restitution", "meshcol"), &mc->restitution, 0.01f, 0.0f, 1.0f,  "%.2f"); insp_track_edit();
+    if (mc->is_trigger || !mc->convex)
+        ImGui::TextDisabled(jce_editor_i18n("inspector.meshcol.convexNote"));
+}
+
+static void draw_comp_collider2d(JceCollider2DComponent *cd)
+{
+    if (!cd) return;
+    static const char *shapes[] = { "Box", "Circle", "Capsule", "Edge", "Polygon" };
+    int sh = cd->shape; if (sh < 0 || sh > 4) sh = 0;
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.c2d.shape", "c2d"), &sh, shapes, 5)) { cd->shape = sh; insp_track_edit(); }
+    ImGui::DragFloat2(jce_editor_i18n_id("inspector.c2d.offset", "c2d"), cd->offset, 0.05f); insp_track_edit();
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.c2d.isTrigger", "c2d"), &cd->is_trigger))
+        insp_undo_bool(&cd->is_trigger);
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.c2d.friction", "c2d"),    &cd->friction,    0.01f, 0.0f, 10.0f, "%.2f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.c2d.restitution", "c2d"), &cd->restitution, 0.01f, 0.0f, 1.0f,  "%.2f"); insp_track_edit();
+    ImGui::Separator();
+    switch (cd->shape) {
+    case JCE_COLLIDER_2D_BOX:
+        ImGui::DragFloat2(jce_editor_i18n_id("inspector.c2d.size", "c2d"), cd->size, 0.05f, 0.0f, 10000.0f, "%.3f");
+        insp_track_edit();
+        break;
+    case JCE_COLLIDER_2D_CIRCLE:
+        ImGui::DragFloat(jce_editor_i18n_id("inspector.c2d.radius", "c2d"), &cd->radius, 0.01f, 0.0f, 10000.0f, "%.3f");
+        insp_track_edit();
+        break;
+    case JCE_COLLIDER_2D_CAPSULE: {
+        ImGui::DragFloat2(jce_editor_i18n_id("inspector.c2d.size", "c2d"), cd->size, 0.05f, 0.0f, 10000.0f, "%.3f");
+        insp_track_edit();
+        static const char *dirs[] = { "Vertical", "Horizontal" };
+        int dir = cd->capsule_direction; if (dir < 0 || dir > 1) dir = 0;
+        if (ImGui::Combo(jce_editor_i18n_id("inspector.c2d.direction", "c2d"), &dir, dirs, 2)) { cd->capsule_direction = dir; insp_track_edit(); }
+        break;
+    }
+    case JCE_COLLIDER_2D_EDGE:
+    case JCE_COLLIDER_2D_POLYGON: {
+        int n = cd->point_count;
+        if (ImGui::SliderInt(jce_editor_i18n_id("inspector.c2d.pointCount", "c2d"), &n, 0, JCE_COLLIDER_2D_MAX_POINTS)) {
+            cd->point_count = n; insp_track_edit();
+        }
+        for (int i = 0; i < cd->point_count; ++i) {
+            ImGui::PushID(i);
+            char lbl[16]; snprintf(lbl, sizeof lbl, jce_editor_i18n_id("inspector.c2d.pD", "c2d"), i);
+            ImGui::DragFloat2(lbl, cd->points[i], 0.05f);
+            insp_track_edit();
+            ImGui::PopID();
+        }
+        if (cd->shape == JCE_COLLIDER_2D_POLYGON)
+            ImGui::TextDisabled(jce_editor_i18n("inspector.c2d.polygonNote"));
+        else
+            ImGui::TextDisabled(jce_editor_i18n("inspector.c2d.edgeNote"));
+        break;
+    }
+    }
+}
+
+static void draw_comp_rigidbody2d(JceRigidBody2DComponent *rb)
+{
+    if (!rb) return;
+    static const char *body_types[] = { "Static", "Kinematic", "Dynamic" };
+    int bt = (int)rb->body_type; if (bt < 0 || bt > 2) bt = 0;
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.rb2d.bodyType", "rb2d"), &bt, body_types, 3)) {
+        rb->body_type = (uint8_t)bt;
+        insp_track_edit();
+    }
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.rb2d.mass", "rb2d"), &rb->mass, 0.1f, 0.0f, 10000.0f);
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.rb2d.friction", "rb2d"), &rb->friction, 0.01f, 0.0f, 10.0f);
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.rb2d.restitution", "rb2d"), &rb->restitution, 0.01f, 0.0f, 1.0f);
+    insp_track_edit();
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.rb2d.fixedRotation", "rb2d"), &rb->fixed_rotation))
+        insp_undo_bool(&rb->fixed_rotation);
+}
+
+static void draw_comp_particle_emitter(JceParticleEmitterComponent *pe)
+{
+    if (!pe) return;
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.pe.emitRate", "pe"), &pe->emit_rate, 0.5f, 0.0f, 10000.0f);
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.pe.lifetimeMin", "pe"), &pe->lifetime_min, 0.05f, 0.0f, 1000.0f);
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.pe.lifetimeMax", "pe"), &pe->lifetime_max, 0.05f, 0.0f, 1000.0f);
+    insp_track_edit();
+    if (pe->lifetime_max < pe->lifetime_min) pe->lifetime_max = pe->lifetime_min;
+    ImGui::TextDisabled(jce_editor_i18n("inspector.pe.useParticleSystemPanel"));
+}
+
+static void draw_comp_behavior_tree(JceBehaviorTree *bt)
+{
+    if (!bt) return;
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.bt.active", "bt"), &bt->active))
+        insp_undo_bool(&bt->active);
+    ImGui::Text("%s: %u", jce_editor_i18n("inspector.bt.treeHandle"), (unsigned)bt->tree_handle_idx);
+    ImGui::Text("%s: %u", jce_editor_i18n("inspector.bt.contextHandle"), (unsigned)bt->context_handle_idx);
+    ImGui::TextDisabled(jce_editor_i18n("inspector.bt.editInBtEditor"));
+}
+
+/* ── P2-C renderer components ────────────────────────────────────── */
+
+static void draw_comp_trail_renderer(JceTrailRendererComponent *t)
+{
+    if (!t) return;
+    ImGui::InputText(jce_editor_i18n_id("inspector.trail.material", "trail"), t->material_path, sizeof t->material_path);
+    insp_track_edit();
+    accept_asset_drop(t->material_path, sizeof t->material_path);
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.trail.time", "trail"), &t->time, 0.05f, 0.0f, 600.0f, "%.2fs"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.trail.minVertexDistance", "trail"), &t->min_vertex_distance, 0.01f, 0.0f, 100.0f, "%.3f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.trail.widthStart", "trail"), &t->width_start, 0.01f, 0.0f, 100.0f, "%.3f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.trail.widthEnd", "trail"),   &t->width_end,   0.01f, 0.0f, 100.0f, "%.3f"); insp_track_edit();
+    ImGui::ColorEdit4(jce_editor_i18n_id("inspector.trail.colorStart", "trail"), t->color_start); insp_track_edit();
+    ImGui::ColorEdit4(jce_editor_i18n_id("inspector.trail.colorEnd", "trail"),   t->color_end);   insp_track_edit();
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.trail.emitting", "trail"), &t->emitting))         insp_undo_bool(&t->emitting);
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.trail.autodestruct", "trail"), &t->autodestruct)) insp_undo_bool(&t->autodestruct);
+    ImGui::TextDisabled("%s: %d / %d", jce_editor_i18n("inspector.trail.capturedPoints"), t->point_count, JCE_TRAIL_MAX_POINTS);
+}
+
+static void draw_comp_line_renderer(JceLineRendererComponent *l)
+{
+    if (!l) return;
+    ImGui::InputText(jce_editor_i18n_id("inspector.line.material", "line"), l->material_path, sizeof l->material_path);
+    insp_track_edit();
+    accept_asset_drop(l->material_path, sizeof l->material_path);
+    int n = l->position_count;
+    if (ImGui::DragInt(jce_editor_i18n_id("inspector.line.positions", "line"), &n, 1.0f, 0, JCE_LINE_MAX_POINTS)) {
+        if (n < 0) n = 0; if (n > JCE_LINE_MAX_POINTS) n = JCE_LINE_MAX_POINTS;
+        l->position_count = n; insp_track_edit();
+    }
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.line.widthStart", "line"), &l->width_start, 0.01f, 0.0f, 100.0f, "%.3f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.line.widthEnd", "line"),   &l->width_end,   0.01f, 0.0f, 100.0f, "%.3f"); insp_track_edit();
+    ImGui::ColorEdit4(jce_editor_i18n_id("inspector.line.colorStart", "line"), l->color_start); insp_track_edit();
+    ImGui::ColorEdit4(jce_editor_i18n_id("inspector.line.colorEnd", "line"),   l->color_end);   insp_track_edit();
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.line.useWorldSpace", "line"), &l->use_world_space))
+        insp_undo_bool(&l->use_world_space);
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.line.loop", "line"), &l->loop))
+        insp_undo_bool(&l->loop);
+    if (ImGui::TreeNode(jce_editor_i18n_id("inspector.line.points", "line"))) {
+        char lbl[32];
+        for (int i = 0; i < l->position_count; ++i) {
+            snprintf(lbl, sizeof lbl, "P%d##line%d", i, i);
+            ImGui::DragFloat3(lbl, l->positions[i], 0.05f);
+            insp_track_edit();
+        }
+        ImGui::TreePop();
+    }
+}
+
+static void draw_comp_reflection_probe(JceReflectionProbeComponent *r)
+{
+    if (!r) return;
+    static const char *modes[] = { "Baked", "Realtime", "Custom" };
+    int m = r->mode; if (m < 0 || m > 2) m = 0;
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.refl.mode", "refl"), &m, modes, 3)) { r->mode = m; insp_track_edit(); }
+    static const int res_choices[] = { 16, 32, 64, 128, 256, 512, 1024 };
+    int ri = 3;
+    for (int i = 0; i < 7; ++i) if (res_choices[i] == r->resolution) { ri = i; break; }
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.refl.resolution", "refl"), &ri, "16\0" "32\0" "64\0" "128\0" "256\0" "512\0" "1024\0\0")) {
+        r->resolution = res_choices[ri]; insp_track_edit();
+    }
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.refl.intensity", "refl"),      &r->intensity,      0.05f, 0.0f, 100.0f, "%.2f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.refl.blendDistance", "refl"), &r->blend_distance, 0.05f, 0.0f, 100.0f, "%.2f"); insp_track_edit();
+    ImGui::DragFloat3(jce_editor_i18n_id("inspector.refl.boxSize", "refl"),   r->box_size,   0.1f); insp_track_edit();
+    ImGui::DragFloat3(jce_editor_i18n_id("inspector.refl.boxOffset", "refl"), r->box_offset, 0.05f); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.refl.nearClip", "refl"), &r->near_clip, 0.01f, 0.001f, 10.0f, "%.3f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.refl.farClip", "refl"),  &r->far_clip,  1.0f, 0.1f, 100000.0f, "%.1f"); insp_track_edit();
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.refl.boxProjection", "refl"), &r->box_projection)) insp_undo_bool(&r->box_projection);
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.refl.hdr", "refl"), &r->hdr)) insp_undo_bool(&r->hdr);
+    if (r->mode == JCE_REFLECTION_PROBE_CUSTOM) {
+        ImGui::InputText(jce_editor_i18n_id("inspector.refl.customHdr", "refl"), r->custom_hdr_path, sizeof r->custom_hdr_path);
+        insp_track_edit();
+        accept_asset_drop(r->custom_hdr_path, sizeof r->custom_hdr_path);
+    }
+}
+
+static void draw_comp_decal(JceDecalComponent *d)
+{
+    if (!d) return;
+    ImGui::InputText(jce_editor_i18n_id("inspector.decal.material", "decal"), d->material_path, sizeof d->material_path);
+    insp_track_edit();
+    accept_asset_drop(d->material_path, sizeof d->material_path);
+    ImGui::DragFloat3(jce_editor_i18n_id("inspector.decal.size", "decal"),  d->size,  0.05f, 0.0f, 1000.0f, "%.3f"); insp_track_edit();
+    ImGui::DragFloat3(jce_editor_i18n_id("inspector.decal.pivot", "decal"), d->pivot, 0.05f); insp_track_edit();
+    ImGui::ColorEdit4(jce_editor_i18n_id("inspector.decal.color", "decal"), d->color); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.decal.opacity", "decal"),       &d->opacity,       0.01f, 0.0f, 1.0f, "%.2f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.decal.drawDistance", "decal"), &d->draw_distance, 1.0f, 0.0f, 100000.0f, "%.1f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.decal.fadeFactor", "decal"),   &d->fade_factor,   0.01f, 0.0f, 1.0f, "%.2f"); insp_track_edit();
+    ImGui::DragInt  (jce_editor_i18n_id("inspector.decal.layerMask", "decal"),    &d->layer_mask,    1.0f, -1, 0xFFFFFF); insp_track_edit();
+}
+
+static void draw_comp_light_probe_group(JceLightProbeGroupComponent *g)
+{
+    if (!g) return;
+    int n = g->probe_count;
+    if (ImGui::DragInt(jce_editor_i18n_id("inspector.lpg.probeCount", "lpg"), &n, 1.0f, 0, JCE_LIGHT_PROBE_MAX)) {
+        if (n < 0) n = 0; if (n > JCE_LIGHT_PROBE_MAX) n = JCE_LIGHT_PROBE_MAX;
+        g->probe_count = n; insp_track_edit();
+    }
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.lpg.dering", "lpg"), &g->dering)) insp_undo_bool(&g->dering);
+    if (ImGui::TreeNode(jce_editor_i18n_id("inspector.lpg.probes", "lpg"))) {
+        char lbl[32];
+        for (int i = 0; i < g->probe_count; ++i) {
+            snprintf(lbl, sizeof lbl, "Probe %d##lpg%d", i, i);
+            ImGui::DragFloat3(lbl, g->positions[i], 0.05f);
+            insp_track_edit();
+        }
+        ImGui::TreePop();
+    }
+}
+
+static void draw_comp_audio_listener(JceAudioListenerComponent *l)
+{
+    if (!l) return;
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.al.volume", "al"), &l->volume, 0.01f, 0.0f, 1.0f, "%.2f"); insp_track_edit();
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.al.paused", "al"), &l->paused))         insp_undo_bool(&l->paused);
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.al.spatialize", "al"), &l->spatialize)) insp_undo_bool(&l->spatialize);
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.al.dopplerFactor", "al"), &l->doppler_factor, 0.01f, 0.0f, 10.0f, "%.2f"); insp_track_edit();
+    ImGui::TextDisabled(jce_editor_i18n("inspector.al.singletonNote"));
+}
+
+static void draw_comp_audio_reverb_zone(JceAudioReverbZoneComponent *r)
+{
+    if (!r) return;
+    static const char *presets[] = {
+        "Off", "Generic", "Padded Cell", "Room", "Bathroom", "Living Room",
+        "Stone Room", "Auditorium", "Concert Hall", "Cave", "Arena", "Hangar",
+        "Hallway", "Stone Corridor", "Alley", "Forest", "City", "Mountains",
+        "Quarry", "Plain", "Parking Lot", "Sewer Pipe", "Underwater",
+        "(reserved 23)", "(reserved 24)", "(reserved 25)", "User"
+    };
+    int p = r->preset; if (p < 0 || p > 26) p = 0;
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.rz.preset", "rz"), &p, presets, IM_ARRAYSIZE(presets))) {
+        r->preset = p; insp_track_edit();
+    }
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.rz.minDistance", "rz"), &r->min_distance, 0.1f, 0.0f, 100000.0f, "%.2f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.rz.maxDistance", "rz"), &r->max_distance, 0.1f, 0.0f, 100000.0f, "%.2f"); insp_track_edit();
+    if (r->preset == JCE_REVERB_ZONE_PRESET_USER) {
+        ImGui::Separator();
+        ImGui::TextDisabled(jce_editor_i18n("inspector.rz.customParams"));
+        ImGui::DragFloat(jce_editor_i18n_id("inspector.rz.room", "rz"),          &r->room,              1.0f, -10000.0f, 0.0f,    "%.0f"); insp_track_edit();
+        ImGui::DragFloat(jce_editor_i18n_id("inspector.rz.roomHf", "rz"),       &r->room_hf,           1.0f, -10000.0f, 0.0f,    "%.0f"); insp_track_edit();
+        ImGui::DragFloat(jce_editor_i18n_id("inspector.rz.decayTime", "rz"),     &r->decay_time,        0.01f, 0.1f, 20.0f,       "%.2f"); insp_track_edit();
+        ImGui::DragFloat(jce_editor_i18n_id("inspector.rz.decayHfRatio", "rz"),     &r->decay_hf_ratio,    0.01f, 0.1f, 2.0f,        "%.2f"); insp_track_edit();
+        ImGui::DragFloat(jce_editor_i18n_id("inspector.rz.reflections", "rz"),   &r->reflections,       1.0f, -10000.0f, 1000.0f, "%.0f"); insp_track_edit();
+        ImGui::DragFloat(jce_editor_i18n_id("inspector.rz.reflectionsDelay", "rz"),  &r->reflections_delay, 0.001f, 0.0f, 0.3f,       "%.3f"); insp_track_edit();
+        ImGui::DragFloat(jce_editor_i18n_id("inspector.rz.reverb", "rz"),        &r->reverb,            1.0f, -10000.0f, 2000.0f, "%.0f"); insp_track_edit();
+        ImGui::DragFloat(jce_editor_i18n_id("inspector.rz.reverbDelay", "rz"),       &r->reverb_delay,      0.001f, 0.0f, 0.1f,       "%.3f"); insp_track_edit();
+        ImGui::DragFloat(jce_editor_i18n_id("inspector.rz.hfReference", "rz"),  &r->hf_reference,      10.0f, 1000.0f, 20000.0f, "%.0f"); insp_track_edit();
+        ImGui::DragFloat(jce_editor_i18n_id("inspector.rz.diffusion", "rz"),     &r->diffusion,         1.0f, 0.0f, 100.0f,       "%.1f"); insp_track_edit();
+        ImGui::DragFloat(jce_editor_i18n_id("inspector.rz.density", "rz"),       &r->density,           1.0f, 0.0f, 100.0f,       "%.1f"); insp_track_edit();
+    }
+}
+
+static void draw_comp_audio_occlusion(JceAudioOcclusionComponent *o)
+{
+    if (!o) return;
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.ao.radius", "ao"),            &o->radius,            0.1f,  0.0f, 100000.0f, "%.2f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.ao.attenuation", "ao"),  &o->attenuation_db,    0.1f, -96.0f, 0.0f,     "%.2f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.ao.lowpassCutoff", "ao"), &o->lowpass_cutoff_hz, 10.0f, 20.0f, 22000.0f, "%.0f"); insp_track_edit();
+    ImGui::DragInt  (jce_editor_i18n_id("inspector.ao.layerMask", "ao"),        &o->layer_mask,        1.0f, -1, 0xFFFFFF); insp_track_edit();
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.ao.affectsReverb", "ao"), &o->affects_reverb))
+        insp_undo_bool(&o->affects_reverb);
+}
+
+static void draw_comp_spawn_manager(JceSpawnManagerComponent *m)
+{
+    if (!m) return;
+    bool en = m->enabled != 0;
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.sm.enabled", "sm"), &en)) { m->enabled = en ? 1 : 0; insp_track_edit(); }
+    ImGui::DragInt  (jce_editor_i18n_id("inspector.sm.maxPeds", "sm"),          &m->max_peds,         1.0f, 0, 1024); insp_track_edit();
+    ImGui::DragInt  (jce_editor_i18n_id("inspector.sm.maxVehicles", "sm"),      &m->max_vehicles,     1.0f, 0, 1024); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.sm.minSpawnRadius", "sm"),  &m->min_spawn_radius, 0.5f, 0.0f, 100000.0f, "%.1f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.sm.maxSpawnRadius", "sm"),  &m->max_spawn_radius, 0.5f, 0.0f, 100000.0f, "%.1f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.sm.despawnPad", "sm"),       &m->despawn_pad,      0.5f, 0.0f, 100000.0f, "%.1f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.sm.spawnInterval", "sm"),&m->spawn_interval,   0.05f, 0.0f, 60.0f,    "%.2f"); insp_track_edit();
+    if (m->max_spawn_radius < m->min_spawn_radius) m->max_spawn_radius = m->min_spawn_radius;
+
+    int pn = m->ped_archetype_count;
+    if (ImGui::DragInt(jce_editor_i18n_id("inspector.sm.pedArchetypes", "sm"), &pn, 1.0f, 0, 8)) {
+        if (pn < 0) pn = 0; if (pn > 8) pn = 8;
+        m->ped_archetype_count = pn; insp_track_edit();
+    }
+    char lbl[32];
+    for (int i = 0; i < m->ped_archetype_count; ++i) {
+        snprintf(lbl, sizeof lbl, "Ped[%d] id##sm%d", i, i);
+        int v = (int)m->ped_archetypes[i];
+        if (ImGui::DragInt(lbl, &v, 1.0f, 0, INT_MAX)) {
+            m->ped_archetypes[i] = (uint32_t)(v < 0 ? 0 : v);
+            insp_track_edit();
+        }
+    }
+
+    int vn = m->vehicle_archetype_count;
+    if (ImGui::DragInt(jce_editor_i18n_id("inspector.sm.vehicleArchetypes", "sm"), &vn, 1.0f, 0, 8)) {
+        if (vn < 0) vn = 0; if (vn > 8) vn = 8;
+        m->vehicle_archetype_count = vn; insp_track_edit();
+    }
+    for (int i = 0; i < m->vehicle_archetype_count; ++i) {
+        snprintf(lbl, sizeof lbl, "Vehicle[%d] id##smv%d", i, i);
+        int v = (int)m->vehicle_archetypes[i];
+        if (ImGui::DragInt(lbl, &v, 1.0f, 0, INT_MAX)) {
+            m->vehicle_archetypes[i] = (uint32_t)(v < 0 ? 0 : v);
+            insp_track_edit();
+        }
+    }
+
+    /* RNG seed (display as two 32-bit halves to avoid ImGui int64 absence). */
+    uint32_t lo = (uint32_t)(m->rng_seed & 0xFFFFFFFFu);
+    uint32_t hi = (uint32_t)(m->rng_seed >> 32);
+    int lo_i = (int)lo, hi_i = (int)hi;
+    if (ImGui::DragInt(jce_editor_i18n_id("inspector.sm.rngSeedLo", "sm"), &lo_i, 1.0f)) {
+        m->rng_seed = ((uint64_t)(uint32_t)hi_i << 32) | (uint32_t)lo_i;
+        insp_track_edit();
+    }
+    if (ImGui::DragInt(jce_editor_i18n_id("inspector.sm.rngSeedHi", "sm"), &hi_i, 1.0f)) {
+        m->rng_seed = ((uint64_t)(uint32_t)hi_i << 32) | (uint32_t)lo_i;
+        insp_track_edit();
+    }
+    ImGui::TextDisabled(jce_editor_i18n("inspector.sm.roadNetworkNote"));
+}
+
+static void draw_comp_weapon(JceWeaponComponent *w)
+{
+    if (!w) return;
+    ImGui::InputText(jce_editor_i18n_id("inspector.wp.name", "wp"), w->name, sizeof w->name); insp_track_edit();
+    static const char *kinds[] = { "Hitscan", "Projectile" };
+    int k = w->kind; if (k < 0 || k > 1) k = 0;
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.wp.kind", "wp"), &k, kinds, 2)) { w->kind = k; insp_track_edit(); }
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.wp.damage", "wp"),         &w->damage,          0.1f, 0.0f, 100000.0f, "%.2f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.wp.range", "wp"),      &w->range,           0.5f, 0.0f, 100000.0f, "%.1f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.wp.rpm", "wp"),            &w->rpm,             1.0f, 0.0f, 10000.0f,  "%.0f"); insp_track_edit();
+    ImGui::DragInt  (jce_editor_i18n_id("inspector.wp.clipSize", "wp"),      &w->clip_size,       1.0f, 0, 10000); insp_track_edit();
+    ImGui::DragInt  (jce_editor_i18n_id("inspector.wp.reserveMax", "wp"),    &w->reserve_max,     1.0f, 0, 1000000); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.wp.reload", "wp"),     &w->reload_seconds,  0.05f, 0.0f, 60.0f,    "%.2f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.wp.spread", "wp"),   &w->spread_deg,      0.05f, 0.0f, 90.0f,    "%.2f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.wp.recoilShot", "wp"),    &w->recoil_per_shot, 0.05f, 0.0f, 90.0f,    "%.2f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.wp.recoilRecovery", "wp"),&w->recoil_recovery, 0.1f, 0.0f, 360.0f,    "%.2f"); insp_track_edit();
+    ImGui::DragInt  (jce_editor_i18n_id("inspector.wp.pellets", "wp"),        &w->pellets,         1.0f, 1, 64); insp_track_edit();
+    if (w->kind == JCE_WEAPON_COMP_PROJECTILE) {
+        ImGui::DragFloat(jce_editor_i18n_id("inspector.wp.projectileSpeed", "wp"), &w->projectile_speed, 1.0f, 0.0f, 10000.0f, "%.1f");
+        insp_track_edit();
+    }
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.wp.fullAuto", "wp"), &w->full_auto)) insp_undo_bool(&w->full_auto);
+}
+
+static void draw_comp_save_point(JceSavePointComponent *sp)
+{
+    if (!sp) return;
+    ImGui::InputText(jce_editor_i18n_id("inspector.sv.saveId", "sv"),     sp->save_id,      sizeof sp->save_id);      insp_track_edit();
+    ImGui::InputText(jce_editor_i18n_id("inspector.sv.displayName", "sv"),sp->display_name, sizeof sp->display_name); insp_track_edit();
+    static const char *kinds[] = { "Manual", "Auto", "Checkpoint" };
+    int k = sp->kind; if (k < 0 || k > 2) k = 0;
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.sv.kind", "sv"), &k, kinds, 3)) { sp->kind = k; insp_track_edit(); }
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.sv.radius", "sv"), &sp->radius, 0.05f, 0.0f, 1000.0f, "%.2f"); insp_track_edit();
+    ImGui::DragInt  (jce_editor_i18n_id("inspector.sv.slot", "sv"),   &sp->slot,   1.0f, -1, 256);              insp_track_edit();
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.sv.oneShot", "sv"),          &sp->one_shot))         insp_undo_bool(&sp->one_shot);
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.sv.requireInteract", "sv"),  &sp->require_interact)) insp_undo_bool(&sp->require_interact);
+}
+
+/* ── P2 add-on component drawers ───────────────────────────────── */
+
+static void draw_comp_wheel_collider(JceWheelColliderComponent *w)
+{
+    if (!w) return;
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.wc.radius", "wc"),               &w->radius,                0.01f, 0.01f, 100.0f,   "%.3f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.wc.suspensionDistance", "wc"),  &w->suspension_distance,   0.01f, 0.0f, 10.0f,     "%.3f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.wc.suspensionSpring", "wc"),    &w->suspension_spring,     50.0f, 0.0f, 1.0e7f,    "%.0f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.wc.suspensionDamper", "wc"),    &w->suspension_damper,     10.0f, 0.0f, 1.0e6f,    "%.1f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.wc.suspensionTargetPos", "wc"),&w->suspension_target_pos, 0.01f, 0.0f, 1.0f,      "%.2f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.wc.mass", "wc"),                 &w->mass,                  0.1f, 0.001f, 100000.0f,"%.3f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.wc.forwardFriction", "wc"),     &w->forward_friction,      0.01f, 0.0f, 10.0f,     "%.3f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.wc.sidewaysFriction", "wc"),    &w->sideways_friction,     0.01f, 0.0f, 10.0f,     "%.3f"); insp_track_edit();
+    ImGui::DragFloat3(jce_editor_i18n_id("inspector.wc.center", "wc"),              w->center,                 0.01f, -100.0f, 100.0f, "%.3f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.wc.motorTorque", "wc"),         &w->motor_torque,          1.0f, -100000.0f, 100000.0f, "%.1f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.wc.brakeTorque", "wc"),         &w->brake_torque,          1.0f, 0.0f, 100000.0f,  "%.1f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.wc.steerAngle", "wc"),    &w->steer_angle_deg,       0.5f, -90.0f, 90.0f,    "%.2f"); insp_track_edit();
+}
+
+static void draw_comp_constant_force(JceConstantForceComponent *cf)
+{
+    if (!cf) return;
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.cf.enabled", "cf"), &cf->enabled)) insp_undo_bool(&cf->enabled);
+    ImGui::DragFloat3(jce_editor_i18n_id("inspector.cf.force", "cf"),          cf->force,           0.1f, -1.0e6f, 1.0e6f, "%.3f"); insp_track_edit();
+    ImGui::DragFloat3(jce_editor_i18n_id("inspector.cf.relativeForce", "cf"), cf->relative_force,  0.1f, -1.0e6f, 1.0e6f, "%.3f"); insp_track_edit();
+    ImGui::DragFloat3(jce_editor_i18n_id("inspector.cf.torque", "cf"),         cf->torque,          0.1f, -1.0e6f, 1.0e6f, "%.3f"); insp_track_edit();
+    ImGui::DragFloat3(jce_editor_i18n_id("inspector.cf.relativeTorque", "cf"),cf->relative_torque, 0.1f, -1.0e6f, 1.0e6f, "%.3f"); insp_track_edit();
+}
+
+static void draw_comp_configurable_joint(JceConfigurableJointComponent *cj)
+{
+    if (!cj) return;
+    int connected = (int)cj->connected_body;
+    if (ImGui::DragInt(jce_editor_i18n_id("inspector.cjj.connectedBody", "cjj"), &connected, 1.0f, 0, 1<<30)) {
+        cj->connected_body = (uint64_t)(connected < 0 ? 0 : connected);
+        insp_track_edit();
+    }
+    ImGui::DragFloat3(jce_editor_i18n_id("inspector.cjj.anchor", "cjj"),            cj->anchor,           0.01f, -1000.0f, 1000.0f, "%.3f"); insp_track_edit();
+    ImGui::DragFloat3(jce_editor_i18n_id("inspector.cjj.connectedAnchor", "cjj"),  cj->connected_anchor, 0.01f, -1000.0f, 1000.0f, "%.3f"); insp_track_edit();
+    static const char *motion_names[] = { "Locked", "Limited", "Free" };
+    ImGui::TextUnformatted(jce_editor_i18n("inspector.cjj.linearMotion"));
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.cjj_lx.x", "cjj_lx"), &cj->x_motion, motion_names, 3)) insp_track_edit();
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.cjj_ly.y", "cjj_ly"), &cj->y_motion, motion_names, 3)) insp_track_edit();
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.cjj_lz.z", "cjj_lz"), &cj->z_motion, motion_names, 3)) insp_track_edit();
+    ImGui::TextUnformatted(jce_editor_i18n("inspector.cjj.angularMotion"));
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.cjj_ax.x", "cjj_ax"), &cj->x_rotation, motion_names, 3)) insp_track_edit();
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.cjj_ay.y", "cjj_ay"), &cj->y_rotation, motion_names, 3)) insp_track_edit();
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.cjj_az.z", "cjj_az"), &cj->z_rotation, motion_names, 3)) insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.cjj.linearLimit", "cjj"),   &cj->linear_limit,        0.01f, 0.0f, 1.0e6f, "%.3f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.cjj.angularXLimit", "cjj"),&cj->angular_x_limit_deg, 0.5f, 0.0f, 180.0f, "%.2f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.cjj.angularYLimit", "cjj"),&cj->angular_y_limit_deg, 0.5f, 0.0f, 180.0f, "%.2f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.cjj.angularZLimit", "cjj"),&cj->angular_z_limit_deg, 0.5f, 0.0f, 180.0f, "%.2f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.cjj.breakForce", "cjj"),    &cj->break_force,  10.0f, 0.0f, 3.4e38f, "%.1f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.cjj.breakTorque", "cjj"),   &cj->break_torque, 10.0f, 0.0f, 3.4e38f, "%.1f"); insp_track_edit();
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.cjj.enableCollision", "cjj"), &cj->enable_collision)) insp_undo_bool(&cj->enable_collision);
+}
+
+static void draw_comp_joint2d(JceJoint2DComponent *j)
+{
+    if (!j) return;
+    static const char *kinds[] = { "Distance", "Hinge", "Spring" };
+    int k = j->kind; if (k < 0 || k > 2) k = 0;
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.j2d.kind", "j2d"), &k, kinds, 3)) { j->kind = k; insp_track_edit(); }
+    int connected = (int)j->connected_body;
+    if (ImGui::DragInt(jce_editor_i18n_id("inspector.j2d.connectedBody", "j2d"), &connected, 1.0f, 0, 1<<30)) {
+        j->connected_body = (uint64_t)(connected < 0 ? 0 : connected);
+        insp_track_edit();
+    }
+    ImGui::DragFloat2(jce_editor_i18n_id("inspector.j2d.anchor", "j2d"),            j->anchor,           0.01f, -1000.0f, 1000.0f, "%.3f"); insp_track_edit();
+    ImGui::DragFloat2(jce_editor_i18n_id("inspector.j2d.connectedAnchor", "j2d"),  j->connected_anchor, 0.01f, -1000.0f, 1000.0f, "%.3f"); insp_track_edit();
+    if (j->kind == JCE_JOINT_2D_DISTANCE || j->kind == JCE_JOINT_2D_SPRING) {
+        ImGui::DragFloat(jce_editor_i18n_id("inspector.j2d.distance", "j2d"), &j->distance, 0.01f, 0.0f, 1.0e6f, "%.3f"); insp_track_edit();
+        if (ImGui::Checkbox(jce_editor_i18n_id("inspector.j2d.autoConfigureDistance", "j2d"), &j->auto_configure_distance)) insp_undo_bool(&j->auto_configure_distance);
+    }
+    if (j->kind == JCE_JOINT_2D_SPRING) {
+        ImGui::DragFloat(jce_editor_i18n_id("inspector.j2d.frequency", "j2d"),     &j->frequency,     0.05f, 0.0f, 10000.0f, "%.3f"); insp_track_edit();
+        ImGui::DragFloat(jce_editor_i18n_id("inspector.j2d.dampingRatio", "j2d"), &j->damping_ratio, 0.01f, 0.0f, 1.0f,     "%.3f"); insp_track_edit();
+    }
+    if (j->kind == JCE_JOINT_2D_HINGE) {
+        if (ImGui::Checkbox(jce_editor_i18n_id("inspector.j2d.useMotor", "j2d"), &j->use_motor)) insp_undo_bool(&j->use_motor);
+        if (j->use_motor) {
+            ImGui::DragFloat(jce_editor_i18n_id("inspector.j2d.motorSpeed", "j2d"), &j->motor_speed_deg_s, 1.0f, -3600.0f, 3600.0f, "%.1f"); insp_track_edit();
+            ImGui::DragFloat(jce_editor_i18n_id("inspector.j2d.motorMaxTorque", "j2d"),    &j->motor_max_torque,  10.0f, 0.0f, 1.0e7f,     "%.1f"); insp_track_edit();
+        }
+        if (ImGui::Checkbox(jce_editor_i18n_id("inspector.j2d.useLimits", "j2d"), &j->use_limits)) insp_undo_bool(&j->use_limits);
+        if (j->use_limits) {
+            ImGui::DragFloat(jce_editor_i18n_id("inspector.j2d.lowerAngle", "j2d"), &j->lower_angle_deg, 0.5f, -360.0f, 360.0f, "%.2f"); insp_track_edit();
+            ImGui::DragFloat(jce_editor_i18n_id("inspector.j2d.upperAngle", "j2d"), &j->upper_angle_deg, 0.5f, -360.0f, 360.0f, "%.2f"); insp_track_edit();
+        }
+    }
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.j2d.breakForce", "j2d"),  &j->break_force,  10.0f, 0.0f, 3.4e38f, "%.1f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.j2d.breakTorque", "j2d"), &j->break_torque, 10.0f, 0.0f, 3.4e38f, "%.1f"); insp_track_edit();
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.j2d.enableCollision", "j2d"), &j->enable_collision)) insp_undo_bool(&j->enable_collision);
+}
+
+static void draw_comp_billboard_renderer(JceBillboardRendererComponent *b)
+{
+    if (!b) return;
+    ImGui::InputText(jce_editor_i18n_id("inspector.br.texturePath", "br"), b->texture_path, sizeof b->texture_path); insp_track_edit();
+    static const char *modes[] = { "Full", "Y-Axis Only" };
+    int m = b->mode; if (m < 0 || m > 1) m = 0;
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.br.mode", "br"), &m, modes, 2)) { b->mode = m; insp_track_edit(); }
+    ImGui::DragFloat2(jce_editor_i18n_id("inspector.br.size", "br"), b->size, 0.01f, 0.0f, 1.0e4f, "%.3f"); insp_track_edit();
+    if (ImGui::ColorEdit4(jce_editor_i18n_id("inspector.br.color", "br"), b->color)) insp_track_edit();
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.br.visible", "br"), &b->visible)) insp_undo_bool(&b->visible);
+}
+
+static void draw_comp_canvas(JceCanvasComponent *cv)
+{
+    if (!cv) return;
+    static const char *modes[] = { "Screen Space - Overlay", "Screen Space - Camera", "World Space" };
+    int m = cv->render_mode; if (m < 0 || m > 2) m = 0;
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.cv.renderMode", "cv"), &m, modes, 3)) { cv->render_mode = m; insp_track_edit(); }
+    if (ImGui::DragInt(jce_editor_i18n_id("inspector.cv.sortOrder", "cv"), &cv->sort_order, 1.0f, -32768, 32767)) insp_track_edit();
+    ImGui::DragFloat2(jce_editor_i18n_id("inspector.cv.referenceResolution", "cv"), cv->reference_resolution, 1.0f, 1.0f, 16384.0f, "%.0f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.cv.scaleFactor", "cv"), &cv->scale_factor, 0.01f, 0.0001f, 1000.0f, "%.4f"); insp_track_edit();
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.cv.pixelPerfect", "cv"), &cv->pixel_perfect)) insp_undo_bool(&cv->pixel_perfect);
+}
+
+static void draw_comp_canvas_group(JceCanvasGroupComponent *cg)
+{
+    if (!cg) return;
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.cg.alpha", "cg"), &cg->alpha, 0.01f, 0.0f, 1.0f, "%.3f"); insp_track_edit();
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.cg.interactable", "cg"),         &cg->interactable))          insp_undo_bool(&cg->interactable);
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.cg.blocksRaycasts", "cg"),      &cg->blocks_raycasts))       insp_undo_bool(&cg->blocks_raycasts);
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.cg.ignoreParentGroups", "cg"), &cg->ignore_parent_groups))  insp_undo_bool(&cg->ignore_parent_groups);
+}
+
+static void draw_comp_layout_group(JceLayoutGroupComponent *lg)
+{
+    if (!lg) return;
+    static const char *kinds[] = { "Horizontal", "Vertical", "Grid" };
+    int k = lg->layout_kind; if (k < 0 || k > 2) k = 0;
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.lg.layout", "lg"), &k, kinds, 3)) { lg->layout_kind = k; insp_track_edit(); }
+    ImGui::DragFloat4(jce_editor_i18n_id("inspector.lg.padding", "lg"), lg->padding, 1.0f, 0.0f, 4096.0f, "%.0f"); insp_track_edit();
+    ImGui::DragFloat2(jce_editor_i18n_id("inspector.lg.spacing", "lg"), lg->spacing, 0.5f, 0.0f, 4096.0f, "%.1f"); insp_track_edit();
+    if (lg->layout_kind == JCE_LAYOUT_GRID) {
+        ImGui::DragFloat2(jce_editor_i18n_id("inspector.lg.cellSize", "lg"), lg->cell_size, 1.0f, 1.0f, 4096.0f, "%.0f"); insp_track_edit();
+    }
+    if (ImGui::DragInt(jce_editor_i18n_id("inspector.lg.childAlignment", "lg"), &lg->child_alignment, 1.0f, 0, 8)) insp_track_edit();
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.lg.controlChildWidth", "lg"),   &lg->control_child_size_w)) insp_undo_bool(&lg->control_child_size_w);
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.lg.controlChildHeight", "lg"),  &lg->control_child_size_h)) insp_undo_bool(&lg->control_child_size_h);
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.lg.reverseArrangement", "lg"),   &lg->reverse_arrangement))  insp_undo_bool(&lg->reverse_arrangement);
+}
+
+static void draw_comp_ui_image(JceUIImageComponent *im)
+{
+    if (!im) return;
+    ImGui::InputText(jce_editor_i18n_id("inspector.uim.spritePath", "uim"), im->sprite_path, sizeof im->sprite_path); insp_track_edit();
+    static const char *types[] = { "Simple", "Sliced", "Tiled", "Filled" };
+    int t = im->image_type; if (t < 0 || t > 3) t = 0;
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.uim.imageType", "uim"), &t, types, 4)) { im->image_type = t; insp_track_edit(); }
+    if (ImGui::ColorEdit4(jce_editor_i18n_id("inspector.uim.color", "uim"), im->color)) insp_track_edit();
+    if (im->image_type == JCE_UI_IMAGE_FILLED) {
+        ImGui::DragFloat(jce_editor_i18n_id("inspector.uim.fillAmount", "uim"), &im->fill_amount, 0.01f, 0.0f, 1.0f, "%.3f"); insp_track_edit();
+    }
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.uim.preserveAspect", "uim"), &im->preserve_aspect)) insp_undo_bool(&im->preserve_aspect);
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.uim.raycastTarget", "uim"),  &im->raycast_target))  insp_undo_bool(&im->raycast_target);
+}
+
+static void draw_comp_ui_text(JceUITextComponent *tx)
+{
+    if (!tx) return;
+    ImGui::InputTextMultiline(jce_editor_i18n_id("inspector.uit.text", "uit"), tx->text, sizeof tx->text, ImVec2(0, ImGui::GetTextLineHeight() * 4)); insp_track_edit();
+    ImGui::InputText(jce_editor_i18n_id("inspector.uit.fontPath", "uit"), tx->font_path, sizeof tx->font_path); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.uit.fontSize", "uit"), &tx->font_size, 0.5f, 1.0f, 512.0f, "%.1f"); insp_track_edit();
+    static const char *aligns[] = { "Left", "Center", "Right" };
+    int a = tx->alignment; if (a < 0 || a > 2) a = 0;
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.uit.alignment", "uit"), &a, aligns, 3)) { tx->alignment = a; insp_track_edit(); }
+    if (ImGui::ColorEdit4(jce_editor_i18n_id("inspector.uit.color", "uit"), tx->color)) insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.uit.lineSpacing", "uit"), &tx->line_spacing, 0.05f, 0.0f, 10.0f, "%.3f"); insp_track_edit();
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.uit.richText", "uit"), &tx->rich_text)) insp_undo_bool(&tx->rich_text);
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.uit.bestFit", "uit"),  &tx->best_fit))  insp_undo_bool(&tx->best_fit);
+    if (tx->best_fit) {
+        if (ImGui::DragInt(jce_editor_i18n_id("inspector.uit.minSize", "uit"), &tx->min_size, 1.0f, 1, 512)) insp_track_edit();
+        if (ImGui::DragInt(jce_editor_i18n_id("inspector.uit.maxSize", "uit"), &tx->max_size, 1.0f, 1, 512)) insp_track_edit();
+    }
+}
+
+static void draw_comp_ui_button(JceUIButtonComponent *bt)
+{
+    if (!bt) return;
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.uib.interactable", "uib"), &bt->interactable)) insp_undo_bool(&bt->interactable);
+    if (ImGui::ColorEdit4(jce_editor_i18n_id("inspector.uib.normalColor", "uib"),      bt->normal_color))      insp_track_edit();
+    if (ImGui::ColorEdit4(jce_editor_i18n_id("inspector.uib.highlightedColor", "uib"), bt->highlighted_color)) insp_track_edit();
+    if (ImGui::ColorEdit4(jce_editor_i18n_id("inspector.uib.pressedColor", "uib"),     bt->pressed_color))     insp_track_edit();
+    if (ImGui::ColorEdit4(jce_editor_i18n_id("inspector.uib.disabledColor", "uib"),    bt->disabled_color))    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.uib.fadeDuration", "uib"), &bt->fade_duration, 0.01f, 0.0f, 5.0f, "%.3f"); insp_track_edit();
+    ImGui::InputText(jce_editor_i18n_id("inspector.uib.onClickHandler", "uib"), bt->on_click_handler, sizeof bt->on_click_handler); insp_track_edit();
+}
+
 /* ── Component header / settings popup helper ─────────────────────── */
 
 /* Returns true if the component's body should be drawn this frame.
@@ -1017,11 +1844,11 @@ static void draw_comp_terrain(JceTerrainComponent *tc)
  * with a Remove menu (disabled when not removable, e.g. Transform). */
 static bool comp_section_begin(uint32_t entity_id,
                                EditorEntitySidecar &sidecar,
-                               uint32_t flag,
+                               uint64_t flag,
                                const char *display_name,
                                bool removable)
 {
-    ImGui::PushID((int)flag);
+    ImGui::PushID((int)(flag ^ (flag >> 32)));
 
     bool was_open = (sidecar.expanded_flags & flag) != 0;
     int tn_flags = ImGuiTreeNodeFlags_AllowOverlap |
@@ -1036,6 +1863,26 @@ static bool comp_section_begin(uint32_t entity_id,
     bool open = ImGui::CollapsingHeader(display_name, tn_flags);
     if (open) sidecar.expanded_flags |= flag;
     else      sidecar.expanded_flags &= ~flag;
+
+    /* Drag-reorder: pressing & dragging a header begins a drag; while
+     * active, hovering another header records it as the drop target. On
+     * mouse release the loop applies the move. */
+    if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 4.0f)) {
+        if (!s_drag.active) {
+            s_drag.active   = true;
+            s_drag.entity_id = entity_id;
+            s_drag.src_flag  = flag;
+        }
+    }
+    if (s_drag.active && s_drag.entity_id == entity_id && ImGui::IsItemHovered()) {
+        s_drag.hover_flag = flag;
+        /* Visual cue: thin line above the hovered header. */
+        ImVec2 mn = ImGui::GetItemRectMin();
+        ImVec2 mx = ImGui::GetItemRectMax();
+        ImGui::GetWindowDrawList()->AddLine(
+            ImVec2(mn.x, mn.y), ImVec2(mx.x, mn.y),
+            ImGui::GetColorU32(ImGuiCol_DragDropTarget), 2.0f);
+    }
 
     float header_w = ImGui::GetContentRegionAvail().x;
     ImGui::SameLine(header_w - 20);
@@ -1063,6 +1910,64 @@ static bool comp_section_begin(uint32_t entity_id,
             jce_state_end_batch_edit();
         }
         if (!can_paste) ImGui::EndDisabled();
+
+        ImGui::Separator();
+
+        /* Move Up / Move Down — defer to end-of-frame loop. */
+        if (ImGui::MenuItem(jce_editor_i18n("inspector.moveUp"))) {
+            s_pending_move.entity_id = entity_id;
+            s_pending_move.src_flag  = flag;
+            s_pending_move.dir       = -1;
+            s_pending_move.pending   = true;
+        }
+        if (ImGui::MenuItem(jce_editor_i18n("inspector.moveDown"))) {
+            s_pending_move.entity_id = entity_id;
+            s_pending_move.src_flag  = flag;
+            s_pending_move.dir       = +1;
+            s_pending_move.pending   = true;
+        }
+
+        ImGui::Separator();
+
+        /* Preset submenu — save the focused entity's component values to
+         * a named preset, or apply a previously saved preset. The actual
+         * OpenPopup must run outside BeginMenu (different ID-stack) so the
+         * matching BeginPopup below can find it. */
+        bool open_preset_save = false;
+        if (ImGui::BeginMenu(jce_editor_i18n("inspector.preset"))) {
+            if (ImGui::MenuItem(jce_editor_i18n("inspector.preset.saveAs"))) {
+                open_preset_save = true;
+            }
+            ImGui::Separator();
+            std::vector<std::string> names = jce_preset_list(flag);
+            if (names.empty()) {
+                ImGui::TextDisabled("%s", jce_editor_i18n("inspector.preset.empty"));
+            } else {
+                std::string pending_delete;
+                for (const auto &n : names) {
+                    if (ImGui::BeginMenu(n.c_str())) {
+                        if (ImGui::MenuItem(jce_editor_i18n("inspector.preset.apply"))) {
+                            jce_preset_apply(flag, n.c_str(), _cs, _ce);
+                        }
+                        ImGui::Separator();
+                        ImGui::PushStyleColor(ImGuiCol_Text, JCE_COLOR_TEXT_ERROR);
+                        if (ImGui::MenuItem(jce_editor_i18n("inspector.preset.delete"))) {
+                            pending_delete = n;
+                        }
+                        ImGui::PopStyleColor();
+                        ImGui::EndMenu();
+                    }
+                }
+                if (!pending_delete.empty()) {
+                    jce_preset_delete(flag, pending_delete.c_str());
+                }
+            }
+            ImGui::EndMenu();
+        }
+        if (open_preset_save) {
+            s_preset_save_buf[0] = '\0';
+            ImGui::OpenPopup("##preset_save_popup");
+        }
 
         ImGui::Separator();
 
@@ -1102,6 +2007,28 @@ static bool comp_section_begin(uint32_t entity_id,
     }
     ImGui::PopStyleColor();
 
+    /* Preset save modal — shared per-section so opening one closes others. */
+    if (ImGui::BeginPopup("##preset_save_popup")) {
+        ImGui::Text(jce_editor_i18n("inspector.preset.savePromptFmt"),
+                    jce_comp_flag_display_name(flag));
+        ImGui::SetNextItemWidth(220);
+        if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+        bool commit = ImGui::InputText("##preset_name", s_preset_save_buf,
+                                       sizeof(s_preset_save_buf),
+                                       ImGuiInputTextFlags_EnterReturnsTrue);
+        if (ImGui::Button(jce_editor_i18n("dialog.save")) || commit) {
+            if (s_preset_save_buf[0]) {
+                JceScene *_ps = jce_state_get_scene();
+                JceEntity _pe = jce_state_to_ecs_entity(entity_id);
+                jce_preset_save(flag, s_preset_save_buf, _ps, _pe);
+            }
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(jce_editor_i18n("dialog.cancel"))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
     return open;
 }
 
@@ -1109,6 +2036,374 @@ static void comp_section_end(void)
 {
     ImGui::Spacing();
     ImGui::PopID();
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ *  COMPONENT DISPLAY ORDER + DISPATCH
+ *
+ *  Inspector iterates components in user-controlled order stored in
+ *  EditorEntitySidecar.component_order.  We use a synthetic "Light Group"
+ *  flag (high bit) so the unified Light section (dir/point/spot) gets
+ *  one slot that survives switching light type.
+ * ══════════════════════════════════════════════════════════════════════ */
+
+static constexpr uint64_t LIGHT_GROUP_BIT = (UINT64_C(1) << 63);
+static constexpr uint64_t LIGHT_MASK      = JCE_COMP_FLAG_DIR_LIGHT |
+                                            JCE_COMP_FLAG_POINT_LIGHT |
+                                            JCE_COMP_FLAG_SPOT_LIGHT;
+
+/* Default ordering follows the historic hard-coded layout. */
+static const uint64_t kDefaultComponentOrder[] = {
+    JCE_COMP_FLAG_TRANSFORM,
+    LIGHT_GROUP_BIT,
+    JCE_COMP_FLAG_CAMERA,
+    JCE_COMP_FLAG_MESH_RENDERER,
+    JCE_COMP_FLAG_SPRITE_RENDERER,
+    JCE_COMP_FLAG_ANIMATOR,
+    JCE_COMP_FLAG_SKELETAL_ANIMATOR,
+    JCE_COMP_FLAG_RIGIDBODY,
+    JCE_COMP_FLAG_BOX_COLLIDER,
+    JCE_COMP_FLAG_SPHERE_COLLIDER,
+    JCE_COMP_FLAG_CHARACTER_CONTROLLER,
+    JCE_COMP_FLAG_AUDIO_SOURCE,
+    JCE_COMP_FLAG_SCRIPT,
+    JCE_COMP_FLAG_SKYBOX,
+    JCE_COMP_FLAG_SPRITE_ANIMATOR,
+    JCE_COMP_FLAG_CONSTRAINT,
+    JCE_COMP_FLAG_TERRAIN,
+    JCE_COMP_FLAG_RIGIDBODY_2D,
+    JCE_COMP_FLAG_PARTICLE_EMITTER,
+    JCE_COMP_FLAG_BEHAVIOR_TREE,
+    JCE_COMP_FLAG_LOD_GROUP,
+    JCE_COMP_FLAG_VIRTUAL_CAMERA,
+    JCE_COMP_FLAG_TRIGGER_VOLUME,
+    JCE_COMP_FLAG_CAPSULE_COLLIDER,
+    JCE_COMP_FLAG_MESH_COLLIDER,
+    JCE_COMP_FLAG_COLLIDER_2D,
+    JCE_COMP_FLAG_TRAIL_RENDERER,
+    JCE_COMP_FLAG_LINE_RENDERER,
+    JCE_COMP_FLAG_REFLECTION_PROBE,
+    JCE_COMP_FLAG_DECAL,
+    JCE_COMP_FLAG_LIGHT_PROBE_GROUP,
+    JCE_COMP_FLAG_AUDIO_LISTENER,
+    JCE_COMP_FLAG_AUDIO_REVERB_ZONE,
+    JCE_COMP_FLAG_AUDIO_OCCLUSION,
+    JCE_COMP_FLAG_SPAWN_MANAGER,
+    JCE_COMP_FLAG_WEAPON,
+    JCE_COMP_FLAG_SAVE_POINT,
+    JCE_COMP_FLAG_WHEEL_COLLIDER,
+    JCE_COMP_FLAG_CONSTANT_FORCE,
+    JCE_COMP_FLAG_CONFIGURABLE_JOINT,
+    JCE_COMP_FLAG_JOINT_2D,
+    JCE_COMP_FLAG_BILLBOARD_RENDERER,
+    JCE_COMP_FLAG_CANVAS,
+    JCE_COMP_FLAG_CANVAS_GROUP,
+    JCE_COMP_FLAG_LAYOUT_GROUP,
+    JCE_COMP_FLAG_UI_IMAGE,
+    JCE_COMP_FLAG_UI_TEXT,
+    JCE_COMP_FLAG_UI_BUTTON,
+};
+
+/* Ensures sidecar.component_order contains exactly the slots we want to
+ * draw, given the entity's currently-set component flags:
+ *   - Removes entries no longer present (component was removed).
+ *   - Appends new entries in default-order positions (component added).
+ *   - Light flags collapse into the synthetic LIGHT_GROUP_BIT slot. */
+static void sync_component_order(EditorEntitySidecar &sidecar, uint64_t flags)
+{
+    auto wanted = [&](uint64_t entry) -> bool {
+        if (entry == LIGHT_GROUP_BIT) return (flags & LIGHT_MASK) != 0;
+        /* Skip raw light flags — they live under LIGHT_GROUP_BIT. */
+        if (entry & LIGHT_MASK) return false;
+        return (flags & entry) != 0;
+    };
+
+    /* Drop stale entries while preserving order of survivors. */
+    auto &v = sidecar.component_order;
+    v.erase(std::remove_if(v.begin(), v.end(),
+                           [&](uint64_t f) { return !wanted(f); }),
+            v.end());
+
+    /* Add any missing entries by walking the default order. */
+    for (uint64_t def : kDefaultComponentOrder) {
+        if (!wanted(def)) continue;
+        if (std::find(v.begin(), v.end(), def) == v.end())
+            v.push_back(def);
+    }
+}
+
+static void draw_one_component_section(uint32_t focused,
+                                       EditorEntitySidecar &sidecar,
+                                       JceScene *scene,
+                                       JceEntity ecs_e,
+                                       uint64_t flag);
+
+/* ══════════════════════════════════════════════════════════════════════
+ *  MULTI-OBJECT EDITING
+ *  component flag, edits made through the focused entity's section are
+ *  byte-mirrored onto the others. We restrict the broadcast to a
+ *  whitelist of pure value-type components — string buffers and asset
+ *  handles inside other components must be edited per-entity.
+ * ══════════════════════════════════════════════════════════════════════ */
+
+static bool multi_edit_supported(uint64_t flag)
+{
+    switch (flag) {
+        case JCE_COMP_FLAG_TRANSFORM:
+        case JCE_COMP_FLAG_CAMERA:
+        case JCE_COMP_FLAG_MESH_RENDERER:
+        case JCE_COMP_FLAG_SPRITE_RENDERER:
+        case JCE_COMP_FLAG_RIGIDBODY:
+        case JCE_COMP_FLAG_BOX_COLLIDER:
+        case JCE_COMP_FLAG_SPHERE_COLLIDER:
+        case JCE_COMP_FLAG_CAPSULE_COLLIDER:
+        case JCE_COMP_FLAG_MESH_COLLIDER:
+        case JCE_COMP_FLAG_AUDIO_SOURCE:
+        case JCE_COMP_FLAG_CONSTRAINT:
+        case JCE_COMP_FLAG_SKELETAL_ANIMATOR:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void *multi_get_comp_ptr(JceScene *scene, JceEntity e,
+                                uint64_t flag, size_t *out_size)
+{
+#define M(F, GETTER, T)                                                   \
+    case F: {                                                             \
+        T *p = GETTER(scene, e);                                          \
+        if (out_size) *out_size = sizeof(T);                              \
+        return (void *)p;                                                 \
+    }
+    switch (flag) {
+        M(JCE_COMP_FLAG_TRANSFORM,         jce_scene_get_transform,         JceTransform)
+        M(JCE_COMP_FLAG_CAMERA,            jce_scene_get_camera,            JceCameraComponent)
+        M(JCE_COMP_FLAG_MESH_RENDERER,     jce_scene_get_mesh_renderer,     JceMeshRenderer)
+        M(JCE_COMP_FLAG_SPRITE_RENDERER,   jce_scene_get_sprite_renderer,   JceSpriteRendererComponent)
+        M(JCE_COMP_FLAG_RIGIDBODY,         jce_scene_get_rigidbody,         JceRigidBodyComponent)
+        M(JCE_COMP_FLAG_BOX_COLLIDER,      jce_scene_get_box_collider,      JceBoxColliderComponent)
+        M(JCE_COMP_FLAG_SPHERE_COLLIDER,   jce_scene_get_sphere_collider,   JceSphereColliderComponent)
+        M(JCE_COMP_FLAG_CAPSULE_COLLIDER,  jce_scene_get_capsule_collider,  JceCapsuleColliderComponent)
+        M(JCE_COMP_FLAG_MESH_COLLIDER,     jce_scene_get_mesh_collider,     JceMeshColliderComponent)
+        M(JCE_COMP_FLAG_AUDIO_SOURCE,      jce_scene_get_audio_source,      JceAudioSourceComponent)
+        M(JCE_COMP_FLAG_CONSTRAINT,        jce_scene_get_constraint,        JceConstraintComponent)
+        M(JCE_COMP_FLAG_SKELETAL_ANIMATOR, jce_scene_get_skeletal_animator, JceSkeletalAnimatorComponent)
+        default:
+            if (out_size) *out_size = 0;
+            return nullptr;
+    }
+#undef M
+}
+
+/* Wrap a single-component draw with a before/after byte diff and broadcast
+ * the diff to every other selected entity that holds the same flag. */
+static void draw_section_with_multi_broadcast(uint32_t focused,
+                                              EditorEntitySidecar &sidecar,
+                                              JceScene *scene,
+                                              JceEntity ecs_e,
+                                              uint64_t entry)
+{
+    int sel_count = 0;
+    const uint32_t *sel = jce_state_get_selection(&sel_count);
+    bool multi = (sel_count > 1) && multi_edit_supported(entry);
+
+    void *focused_ptr = nullptr;
+    size_t comp_size = 0;
+    std::vector<uint8_t> before;
+    if (multi) {
+        focused_ptr = multi_get_comp_ptr(scene, ecs_e, entry, &comp_size);
+        if (focused_ptr && comp_size > 0)
+            before.assign((uint8_t *)focused_ptr,
+                          (uint8_t *)focused_ptr + comp_size);
+    }
+
+    draw_one_component_section(focused, sidecar, scene, ecs_e, entry);
+
+    if (!multi || !focused_ptr || comp_size == 0) return;
+    if (memcmp(focused_ptr, before.data(), comp_size) == 0) return;
+
+    /* Focused changed during this draw — broadcast the new bytes to peers. */
+    for (int i = 0; i < sel_count; ++i) {
+        uint32_t other = sel[i];
+        if (other == focused) continue;
+        JceEntity oe = jce_state_to_ecs_entity(other);
+        if (!oe) continue;
+        uint64_t oflags = jce_scene_get_component_flags(scene, oe);
+        if (!(oflags & entry)) continue;
+        size_t osize = 0;
+        void *optr = multi_get_comp_ptr(scene, oe, entry, &osize);
+        if (optr && osize == comp_size)
+            memcpy(optr, focused_ptr, comp_size);
+    }
+}
+
+/* Apply a pending Move Up / Move Down menu action or drag-reorder drop.
+ * Called once per inspector frame after the iteration loop. */
+static void apply_pending_reorder(uint32_t focused_entity,
+                                  EditorEntitySidecar &sidecar)
+{
+    /* Drag drop: on mouse release, move src before/after hover. */
+    if (s_drag.active && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        if (s_drag.entity_id == focused_entity &&
+            s_drag.src_flag != s_drag.hover_flag &&
+            s_drag.hover_flag != 0) {
+            auto &v = sidecar.component_order;
+            auto it_src = std::find(v.begin(), v.end(), s_drag.src_flag);
+            auto it_dst = std::find(v.begin(), v.end(), s_drag.hover_flag);
+            if (it_src != v.end() && it_dst != v.end()) {
+                jce_state_begin_batch_edit();
+                uint64_t f = *it_src;
+                size_t dst_idx = (size_t)(it_dst - v.begin());
+                v.erase(it_src);
+                if (dst_idx > (size_t)(it_src - v.begin())) dst_idx--;
+                v.insert(v.begin() + dst_idx, f);
+                jce_state_end_batch_edit();
+            }
+        }
+        s_drag = { 0, 0, 0, false };
+    }
+
+    if (!s_pending_move.pending) return;
+    if (s_pending_move.entity_id != focused_entity) {
+        s_pending_move.pending = false;
+        return;
+    }
+
+    auto &v = sidecar.component_order;
+    auto it = std::find(v.begin(), v.end(), s_pending_move.src_flag);
+    if (it != v.end()) {
+        size_t idx = (size_t)(it - v.begin());
+        if (s_pending_move.dir < 0 && idx > 0) {
+            jce_state_begin_batch_edit();
+            std::swap(v[idx], v[idx - 1]);
+            jce_state_end_batch_edit();
+        } else if (s_pending_move.dir > 0 && idx + 1 < v.size()) {
+            jce_state_begin_batch_edit();
+            std::swap(v[idx], v[idx + 1]);
+            jce_state_end_batch_edit();
+        }
+    }
+    s_pending_move = { 0, 0, 0, 0, false };
+}
+
+/* Single dispatch from a flag value to the matching draw_comp_X call.
+ * Mirrors the historic per-flag if-block sequence verbatim so behaviour
+ * is byte-identical except for ordering. Light is handled inline by the
+ * caller (LIGHT_GROUP_BIT path). */
+static void draw_one_component_section(uint32_t focused,
+                                       EditorEntitySidecar &sidecar,
+                                       JceScene *scene,
+                                       JceEntity ecs_e,
+                                       uint64_t flag)
+{
+    const char *nm = jce_comp_flag_display_name(flag);
+    bool removable = (flag != JCE_COMP_FLAG_TRANSFORM);
+
+#define JCE_DRAW(F, EXPR)                                                  \
+    case F:                                                                \
+        if (comp_section_begin(focused, sidecar, F, nm, removable)) EXPR;  \
+        comp_section_end();                                                \
+        break
+
+    switch (flag) {
+        JCE_DRAW(JCE_COMP_FLAG_TRANSFORM,
+                 draw_comp_transform(focused, jce_scene_get_transform(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_CAMERA,
+                 draw_comp_camera(jce_scene_get_camera(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_MESH_RENDERER,
+                 draw_comp_mesh_renderer(jce_scene_get_mesh_renderer(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_SPRITE_RENDERER,
+                 draw_comp_sprite_renderer(jce_scene_get_sprite_renderer(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_ANIMATOR,
+                 draw_comp_animator(jce_scene_get_animator(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_SKELETAL_ANIMATOR,
+                 draw_comp_skeletal_animator(jce_scene_get_skeletal_animator(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_RIGIDBODY,
+                 draw_comp_rigidbody(jce_scene_get_rigidbody(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_BOX_COLLIDER,
+                 draw_comp_box_collider(jce_scene_get_box_collider(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_SPHERE_COLLIDER,
+                 draw_comp_sphere_collider(jce_scene_get_sphere_collider(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_CHARACTER_CONTROLLER,
+                 draw_comp_character_controller(jce_scene_get_character_controller(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_AUDIO_SOURCE,
+                 draw_comp_audio_source(jce_scene_get_audio_source(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_SCRIPT,
+                 draw_comp_script(jce_scene_get_script(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_SKYBOX,
+                 draw_comp_skybox(jce_scene_get_skybox(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_SPRITE_ANIMATOR,
+                 draw_comp_sprite_animator(jce_scene_get_sprite_animator(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_CONSTRAINT,
+                 draw_comp_constraint(jce_scene_get_constraint(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_TERRAIN,
+                 draw_comp_terrain(jce_scene_get_terrain(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_RIGIDBODY_2D,
+                 draw_comp_rigidbody2d(jce_scene_get_rigidbody2d(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_PARTICLE_EMITTER,
+                 draw_comp_particle_emitter(jce_scene_get_particle_emitter(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_BEHAVIOR_TREE,
+                 draw_comp_behavior_tree(jce_scene_get_behavior_tree(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_LOD_GROUP,
+                 draw_comp_lod_group(jce_scene_get_lod_group(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_VIRTUAL_CAMERA,
+                 draw_comp_virtual_camera(jce_scene_get_virtual_camera(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_TRIGGER_VOLUME,
+                 draw_comp_trigger_volume(jce_scene_get_trigger_volume(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_CAPSULE_COLLIDER,
+                 draw_comp_capsule_collider(jce_scene_get_capsule_collider(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_MESH_COLLIDER,
+                 draw_comp_mesh_collider(jce_scene_get_mesh_collider(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_COLLIDER_2D,
+                 draw_comp_collider2d(jce_scene_get_collider2d(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_TRAIL_RENDERER,
+                 draw_comp_trail_renderer(jce_scene_get_trail_renderer(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_LINE_RENDERER,
+                 draw_comp_line_renderer(jce_scene_get_line_renderer(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_REFLECTION_PROBE,
+                 draw_comp_reflection_probe(jce_scene_get_reflection_probe(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_DECAL,
+                 draw_comp_decal(jce_scene_get_decal(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_LIGHT_PROBE_GROUP,
+                 draw_comp_light_probe_group(jce_scene_get_light_probe_group(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_AUDIO_LISTENER,
+                 draw_comp_audio_listener(jce_scene_get_audio_listener(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_AUDIO_REVERB_ZONE,
+                 draw_comp_audio_reverb_zone(jce_scene_get_audio_reverb_zone(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_AUDIO_OCCLUSION,
+                 draw_comp_audio_occlusion(jce_scene_get_audio_occlusion(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_SPAWN_MANAGER,
+                 draw_comp_spawn_manager(jce_scene_get_spawn_manager(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_WEAPON,
+                 draw_comp_weapon(jce_scene_get_weapon(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_SAVE_POINT,
+                 draw_comp_save_point(jce_scene_get_save_point(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_WHEEL_COLLIDER,
+                 draw_comp_wheel_collider(jce_scene_get_wheel_collider(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_CONSTANT_FORCE,
+                 draw_comp_constant_force(jce_scene_get_constant_force(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_CONFIGURABLE_JOINT,
+                 draw_comp_configurable_joint(jce_scene_get_configurable_joint(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_JOINT_2D,
+                 draw_comp_joint2d(jce_scene_get_joint2d(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_BILLBOARD_RENDERER,
+                 draw_comp_billboard_renderer(jce_scene_get_billboard_renderer(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_CANVAS,
+                 draw_comp_canvas(jce_scene_get_canvas(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_CANVAS_GROUP,
+                 draw_comp_canvas_group(jce_scene_get_canvas_group(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_LAYOUT_GROUP,
+                 draw_comp_layout_group(jce_scene_get_layout_group(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_UI_IMAGE,
+                 draw_comp_ui_image(jce_scene_get_ui_image(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_UI_TEXT,
+                 draw_comp_ui_text(jce_scene_get_ui_text(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_UI_BUTTON,
+                 draw_comp_ui_button(jce_scene_get_ui_button(scene, ecs_e)));
+        default: break;
+    }
+#undef JCE_DRAW
 }
 
 /* ── Material file sync ───────────────────────────────────────────── */
@@ -1135,7 +2430,7 @@ void jce_editor_inspector_reload_material(const char *material_path)
 /* ── Add Component menu options ───────────────────────────────────── */
 
 struct AddCompOption {
-    uint32_t flag;
+    uint64_t flag;
     bool     is_light;       /* True for the 3 light flags (light section). */
     bool     is_collider;    /* True for box/sphere collider (mutually exclusive). */
 };
@@ -1152,6 +2447,7 @@ static const AddCompOption s_add_options[] = {
     { JCE_COMP_FLAG_ANIMATOR,             false, false },
     { JCE_COMP_FLAG_SKELETAL_ANIMATOR,    false, false },
     { JCE_COMP_FLAG_RIGIDBODY,            false, false },
+    { JCE_COMP_FLAG_RIGIDBODY_2D,         false, false },
     { JCE_COMP_FLAG_BOX_COLLIDER,         false, true  },
     { JCE_COMP_FLAG_SPHERE_COLLIDER,      false, true  },
     { JCE_COMP_FLAG_CHARACTER_CONTROLLER, false, false },
@@ -1159,6 +2455,36 @@ static const AddCompOption s_add_options[] = {
     { JCE_COMP_FLAG_SCRIPT,               false, false },
     { JCE_COMP_FLAG_CONSTRAINT,           false, false },
     { JCE_COMP_FLAG_TERRAIN,              false, false },
+    { JCE_COMP_FLAG_PARTICLE_EMITTER,     false, false },
+    { JCE_COMP_FLAG_BEHAVIOR_TREE,        false, false },
+    { JCE_COMP_FLAG_LOD_GROUP,            false, false },
+    { JCE_COMP_FLAG_VIRTUAL_CAMERA,       false, false },
+    { JCE_COMP_FLAG_TRIGGER_VOLUME,       false, false },
+    { JCE_COMP_FLAG_CAPSULE_COLLIDER,     false, false },
+    { JCE_COMP_FLAG_MESH_COLLIDER,        false, false },
+    { JCE_COMP_FLAG_COLLIDER_2D,          false, false },
+    { JCE_COMP_FLAG_TRAIL_RENDERER,       false, false },
+    { JCE_COMP_FLAG_LINE_RENDERER,        false, false },
+    { JCE_COMP_FLAG_REFLECTION_PROBE,     false, false },
+    { JCE_COMP_FLAG_DECAL,                false, false },
+    { JCE_COMP_FLAG_LIGHT_PROBE_GROUP,    false, false },
+    { JCE_COMP_FLAG_AUDIO_LISTENER,       false, false },
+    { JCE_COMP_FLAG_AUDIO_REVERB_ZONE,    false, false },
+    { JCE_COMP_FLAG_AUDIO_OCCLUSION,      false, false },
+    { JCE_COMP_FLAG_SPAWN_MANAGER,        false, false },
+    { JCE_COMP_FLAG_WEAPON,               false, false },
+    { JCE_COMP_FLAG_SAVE_POINT,           false, false },
+    { JCE_COMP_FLAG_WHEEL_COLLIDER,       false, false },
+    { JCE_COMP_FLAG_CONSTANT_FORCE,       false, false },
+    { JCE_COMP_FLAG_CONFIGURABLE_JOINT,   false, false },
+    { JCE_COMP_FLAG_JOINT_2D,             false, false },
+    { JCE_COMP_FLAG_BILLBOARD_RENDERER,   false, false },
+    { JCE_COMP_FLAG_CANVAS,               false, false },
+    { JCE_COMP_FLAG_CANVAS_GROUP,         false, false },
+    { JCE_COMP_FLAG_LAYOUT_GROUP,         false, false },
+    { JCE_COMP_FLAG_UI_IMAGE,             false, false },
+    { JCE_COMP_FLAG_UI_TEXT,              false, false },
+    { JCE_COMP_FLAG_UI_BUTTON,            false, false },
 };
 
 /* ── Content (embeddable in tabs) ─────────────────────────────────── */
@@ -1287,7 +2613,7 @@ void jce_editor_panel_inspector_content(void)
                         JceEntity e = jce_state_to_ecs_entity(sel_ids[i]);
                         JceTransform *t = jce_scene_get_transform(scene, e);
                         if (t) {
-                            t->rotation = jce_q_from_euler_deg(rot_set);
+                            t->rotation = editor_q_from_euler_deg(rot_set);
                             jce_editor_set_cached_euler_deg(sel_ids[i], t->rotation, rot_set);
                         }
                     }
@@ -1454,25 +2780,94 @@ void jce_editor_panel_inspector_content(void)
     {
         char _lbl[256];
         snprintf(_lbl, sizeof(_lbl), "%s###TagColor", jce_editor_i18n("inspector.tagColor"));
-        if (ImGui::Combo(_lbl, &tag_color,
-                          "None\0Red\0Orange\0Yellow\0Green\0Blue\0Purple\0Gray\0"))
+        static const char *kTagColors[] = {
+            "tagColor.none", "tagColor.red", "tagColor.orange", "tagColor.yellow",
+            "tagColor.green", "tagColor.blue", "tagColor.purple", "tagColor.gray"
+        };
+        if (ImGui::Combo(_lbl, &tag_color, jce_editor_i18n_combo(kTagColors, 8)))
             jce_state_set_entity_tag_color(focused, (JceTagColor)tag_color);
     }
     ImGui::PopItemWidth();
 
     ImGui::PushItemWidth(-1);
     {
+        const JceProjectSettings *ps = jce_project_settings_current();
         char _lbl[256];
         snprintf(_lbl, sizeof(_lbl), "%s###tag", jce_editor_i18n("inspector.tag"));
-        bool tag_committed = false;
-        if (ImGui::InputTextWithHint(_lbl, jce_editor_i18n("inspector.tag"), s_insp.tag_buf,
-                                      sizeof(s_insp.tag_buf),
-                                      ImGuiInputTextFlags_EnterReturnsTrue)) {
-            jce_state_set_entity_tag(focused, s_insp.tag_buf);
-            tag_committed = true;
+
+        /* Tag picker — combo from project tags + "Untagged" + "Add Tag..." */
+        const char *current = (s_insp.tag_buf[0] != '\0') ? s_insp.tag_buf : jce_editor_i18n("inspector.tagAdd.untagged");
+        if (ImGui::BeginCombo(_lbl, current)) {
+            if (ImGui::Selectable(jce_editor_i18n("inspector.tagAdd.untagged"), s_insp.tag_buf[0] == '\0')) {
+                s_insp.tag_buf[0] = '\0';
+                jce_state_set_entity_tag(focused, s_insp.tag_buf);
+            }
+            if (ps) {
+                for (int i = 0; i < ps->tags_layers.tag_count && i < JCE_PS_MAX_TAGS; i++) {
+                    const char *t = ps->tags_layers.tags[i];
+                    if (!t || !*t) continue;
+                    bool sel = (strcmp(s_insp.tag_buf, t) == 0);
+                    if (ImGui::Selectable(t, sel)) {
+                        snprintf(s_insp.tag_buf, sizeof(s_insp.tag_buf), "%s", t);
+                        jce_state_set_entity_tag(focused, s_insp.tag_buf);
+                    }
+                }
+            }
+            ImGui::Separator();
+            if (ImGui::Selectable(jce_editor_i18n_id("inspector.tagAdd.addTag", "tagAdd")))
+                ImGui::OpenPopup("##addTagPopup");
+            ImGui::EndCombo();
         }
-        if (!tag_committed && ImGui::IsItemDeactivatedAfterEdit())
-            jce_state_set_entity_tag(focused, s_insp.tag_buf);
+        if (ImGui::BeginPopup("##addTagPopup")) {
+            static char new_tag[64] = {0};
+            ImGui::TextUnformatted(jce_editor_i18n("inspector.tagAdd.newTagName"));
+            ImGui::SetNextItemWidth(220);
+            bool commit = ImGui::InputText("##newTagName", new_tag, sizeof(new_tag),
+                                            ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::SameLine();
+            if (ImGui::Button(jce_editor_i18n("common.add")) || commit) {
+                if (new_tag[0] != '\0' && ps) {
+                    JceProjectSettings *pm = (JceProjectSettings *)ps;
+                    if (pm->tags_layers.tag_count < JCE_PS_MAX_TAGS) {
+                        snprintf(pm->tags_layers.tags[pm->tags_layers.tag_count],
+                                 JCE_PS_NAME_LEN, "%s", new_tag);
+                        pm->tags_layers.tag_count++;
+                        jce_project_settings_save(pm);
+                    }
+                    snprintf(s_insp.tag_buf, sizeof(s_insp.tag_buf), "%s", new_tag);
+                    jce_state_set_entity_tag(focused, s_insp.tag_buf);
+                    new_tag[0] = '\0';
+                }
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
+        /* Layer picker — combo from project layers (32 slots, 0..7 builtin). */
+        JceEditorMeta *meta_for_layer = jce_scene_get_editor_meta(scene,
+                                            jce_state_to_ecs_entity(focused));
+        int cur_layer = meta_for_layer ? meta_for_layer->layer : 0;
+        if (cur_layer < 0 || cur_layer > 31) cur_layer = 0;
+        char layer_label[256];
+        snprintf(layer_label, sizeof(layer_label), "%s###layer",
+                 jce_editor_i18n_or("inspector.layer", "Layer"));
+        const char *cur_layer_name = "Default";
+        if (ps && ps->tags_layers.layers[cur_layer][0] != '\0')
+            cur_layer_name = ps->tags_layers.layers[cur_layer];
+        char preview[96];
+        snprintf(preview, sizeof(preview), "%d: %s", cur_layer, cur_layer_name);
+        if (ImGui::BeginCombo(layer_label, preview)) {
+            for (int i = 0; i < 32; i++) {
+                const char *nm = (ps && ps->tags_layers.layers[i][0] != '\0')
+                                    ? ps->tags_layers.layers[i]
+                                    : (i == 0 ? "Default" : "(unnamed)");
+                char row[128];
+                snprintf(row, sizeof(row), "%d: %s", i, nm);
+                if (ImGui::Selectable(row, i == cur_layer))
+                    jce_state_set_entity_layer(focused, i);
+            }
+            ImGui::EndCombo();
+        }
     }
     ImGui::PopItemWidth();
 
@@ -1485,135 +2880,50 @@ void jce_editor_panel_inspector_content(void)
 
     ImGui::BeginDisabled(!ent_enabled);
 
+    /* ── Multi-selection banner ──────────────────────────────────── */
+    {
+        int sel_count = 0;
+        jce_state_get_selection(&sel_count);
+        if (sel_count > 1) {
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                ImGui::GetColorU32(ImGuiCol_HeaderHovered));
+            ImGui::Text(jce_editor_i18n("inspector.multiEditTitle"), sel_count);
+            ImGui::PopStyleColor();
+            ImGui::TextDisabled("%s", jce_editor_i18n("inspector.multiEditHint"));
+            ImGui::Separator();
+        }
+    }
+
     /* ── Components ───────────────────────────────────────────────── */
     JceEntity ecs_e = jce_state_to_ecs_entity(focused);
-    uint32_t flags = jce_scene_get_component_flags(scene, ecs_e);
+    uint64_t flags = jce_scene_get_component_flags(scene, ecs_e);
     EditorEntitySidecar &sidecar = g_entity_sidecar[focused];
 
-    if (flags & JCE_COMP_FLAG_TRANSFORM) {
-        if (comp_section_begin(focused, sidecar, JCE_COMP_FLAG_TRANSFORM,
-                                jce_comp_flag_display_name(JCE_COMP_FLAG_TRANSFORM), false))
-            draw_comp_transform(focused, jce_scene_get_transform(scene, ecs_e));
-        comp_section_end();
+    sync_component_order(sidecar, flags);
+
+    /* Iterate components in user-defined display order. The dispatcher
+     * delegates to the same comp_section_begin / draw_comp_X / end
+     * sequence the previous code used per-flag. */
+    bool light_drawn = false;
+    for (uint64_t entry : sidecar.component_order) {
+        if (entry == LIGHT_GROUP_BIT) {
+            if (light_drawn) continue;
+            if (!(flags & LIGHT_MASK)) continue;
+            uint64_t lf = (flags & JCE_COMP_FLAG_DIR_LIGHT)   ? JCE_COMP_FLAG_DIR_LIGHT
+                       : (flags & JCE_COMP_FLAG_POINT_LIGHT) ? JCE_COMP_FLAG_POINT_LIGHT
+                                                              : JCE_COMP_FLAG_SPOT_LIGHT;
+            if (comp_section_begin(focused, sidecar, lf, "Light", true))
+                draw_comp_light(scene, ecs_e, flags);
+            comp_section_end();
+            light_drawn = true;
+            continue;
+        }
+        if (!(flags & entry)) continue;
+        draw_section_with_multi_broadcast(focused, sidecar, scene, ecs_e, entry);
     }
 
-    /* Light: unified section (one of dir/point/spot). */
-    uint32_t light_mask = JCE_COMP_FLAG_DIR_LIGHT | JCE_COMP_FLAG_POINT_LIGHT |
-                          JCE_COMP_FLAG_SPOT_LIGHT;
-    if (flags & light_mask) {
-        /* Pick whichever flag is present for the section's identity / fold state. */
-        uint32_t light_flag = (flags & JCE_COMP_FLAG_DIR_LIGHT)   ? JCE_COMP_FLAG_DIR_LIGHT
-                            : (flags & JCE_COMP_FLAG_POINT_LIGHT) ? JCE_COMP_FLAG_POINT_LIGHT
-                                                                  : JCE_COMP_FLAG_SPOT_LIGHT;
-        if (comp_section_begin(focused, sidecar, light_flag, "Light", true))
-            draw_comp_light(scene, ecs_e, flags);
-        comp_section_end();
-    }
+    apply_pending_reorder(focused, sidecar);
 
-    if (flags & JCE_COMP_FLAG_CAMERA) {
-        if (comp_section_begin(focused, sidecar, JCE_COMP_FLAG_CAMERA,
-                                jce_comp_flag_display_name(JCE_COMP_FLAG_CAMERA), true))
-            draw_comp_camera(jce_scene_get_camera(scene, ecs_e));
-        comp_section_end();
-    }
-
-    if (flags & JCE_COMP_FLAG_MESH_RENDERER) {
-        if (comp_section_begin(focused, sidecar, JCE_COMP_FLAG_MESH_RENDERER,
-                                jce_comp_flag_display_name(JCE_COMP_FLAG_MESH_RENDERER), true))
-            draw_comp_mesh_renderer(jce_scene_get_mesh_renderer(scene, ecs_e));
-        comp_section_end();
-    }
-
-    if (flags & JCE_COMP_FLAG_SPRITE_RENDERER) {
-        if (comp_section_begin(focused, sidecar, JCE_COMP_FLAG_SPRITE_RENDERER,
-                                jce_comp_flag_display_name(JCE_COMP_FLAG_SPRITE_RENDERER), true))
-            draw_comp_sprite_renderer(jce_scene_get_sprite_renderer(scene, ecs_e));
-        comp_section_end();
-    }
-
-    if (flags & JCE_COMP_FLAG_ANIMATOR) {
-        if (comp_section_begin(focused, sidecar, JCE_COMP_FLAG_ANIMATOR,
-                                jce_comp_flag_display_name(JCE_COMP_FLAG_ANIMATOR), true))
-            draw_comp_animator(jce_scene_get_animator(scene, ecs_e));
-        comp_section_end();
-    }
-
-    if (flags & JCE_COMP_FLAG_SKELETAL_ANIMATOR) {
-        if (comp_section_begin(focused, sidecar, JCE_COMP_FLAG_SKELETAL_ANIMATOR,
-                                jce_comp_flag_display_name(JCE_COMP_FLAG_SKELETAL_ANIMATOR), true))
-            draw_comp_skeletal_animator(jce_scene_get_skeletal_animator(scene, ecs_e));
-        comp_section_end();
-    }
-
-    if (flags & JCE_COMP_FLAG_RIGIDBODY) {
-        if (comp_section_begin(focused, sidecar, JCE_COMP_FLAG_RIGIDBODY,
-                                jce_comp_flag_display_name(JCE_COMP_FLAG_RIGIDBODY), true))
-            draw_comp_rigidbody(jce_scene_get_rigidbody(scene, ecs_e));
-        comp_section_end();
-    }
-
-    if (flags & JCE_COMP_FLAG_BOX_COLLIDER) {
-        if (comp_section_begin(focused, sidecar, JCE_COMP_FLAG_BOX_COLLIDER,
-                                jce_comp_flag_display_name(JCE_COMP_FLAG_BOX_COLLIDER), true))
-            draw_comp_box_collider(jce_scene_get_box_collider(scene, ecs_e));
-        comp_section_end();
-    }
-
-    if (flags & JCE_COMP_FLAG_SPHERE_COLLIDER) {
-        if (comp_section_begin(focused, sidecar, JCE_COMP_FLAG_SPHERE_COLLIDER,
-                                jce_comp_flag_display_name(JCE_COMP_FLAG_SPHERE_COLLIDER), true))
-            draw_comp_sphere_collider(jce_scene_get_sphere_collider(scene, ecs_e));
-        comp_section_end();
-    }
-
-    if (flags & JCE_COMP_FLAG_CHARACTER_CONTROLLER) {
-        if (comp_section_begin(focused, sidecar, JCE_COMP_FLAG_CHARACTER_CONTROLLER,
-                                jce_comp_flag_display_name(JCE_COMP_FLAG_CHARACTER_CONTROLLER), true))
-            draw_comp_character_controller(jce_scene_get_character_controller(scene, ecs_e));
-        comp_section_end();
-    }
-
-    if (flags & JCE_COMP_FLAG_AUDIO_SOURCE) {
-        if (comp_section_begin(focused, sidecar, JCE_COMP_FLAG_AUDIO_SOURCE,
-                                jce_comp_flag_display_name(JCE_COMP_FLAG_AUDIO_SOURCE), true))
-            draw_comp_audio_source(jce_scene_get_audio_source(scene, ecs_e));
-        comp_section_end();
-    }
-
-    if (flags & JCE_COMP_FLAG_SCRIPT) {
-        if (comp_section_begin(focused, sidecar, JCE_COMP_FLAG_SCRIPT,
-                                jce_comp_flag_display_name(JCE_COMP_FLAG_SCRIPT), true))
-            draw_comp_script(jce_scene_get_script(scene, ecs_e));
-        comp_section_end();
-    }
-
-    if (flags & JCE_COMP_FLAG_SKYBOX) {
-        if (comp_section_begin(focused, sidecar, JCE_COMP_FLAG_SKYBOX,
-                                jce_comp_flag_display_name(JCE_COMP_FLAG_SKYBOX), true))
-            draw_comp_skybox(jce_scene_get_skybox(scene, ecs_e));
-        comp_section_end();
-    }
-
-    if (flags & JCE_COMP_FLAG_SPRITE_ANIMATOR) {
-        if (comp_section_begin(focused, sidecar, JCE_COMP_FLAG_SPRITE_ANIMATOR,
-                                jce_comp_flag_display_name(JCE_COMP_FLAG_SPRITE_ANIMATOR), true))
-            draw_comp_sprite_animator(jce_scene_get_sprite_animator(scene, ecs_e));
-        comp_section_end();
-    }
-
-    if (flags & JCE_COMP_FLAG_CONSTRAINT) {
-        if (comp_section_begin(focused, sidecar, JCE_COMP_FLAG_CONSTRAINT,
-                                jce_comp_flag_display_name(JCE_COMP_FLAG_CONSTRAINT), true))
-            draw_comp_constraint(jce_scene_get_constraint(scene, ecs_e));
-        comp_section_end();
-    }
-
-    if (flags & JCE_COMP_FLAG_TERRAIN) {
-        if (comp_section_begin(focused, sidecar, JCE_COMP_FLAG_TERRAIN,
-                                jce_comp_flag_display_name(JCE_COMP_FLAG_TERRAIN), true))
-            draw_comp_terrain(jce_scene_get_terrain(scene, ecs_e));
-        comp_section_end();
-    }
 
     /* ── Add Component button ─────────────────────────────────────── */
     ImGui::Spacing();
@@ -1643,7 +2953,7 @@ void jce_editor_panel_inspector_content(void)
         for (int i = 0; i < n_opts; i++) {
             const AddCompOption &opt = s_add_options[i];
             if (flags & opt.flag) continue;
-            if (opt.is_light && (flags & light_mask)) continue;
+            if (opt.is_light && (flags & LIGHT_MASK)) continue;
             const char *cname = jce_comp_flag_display_name(opt.flag);
             if (!cname) continue;
             if (s_addcomp_filter[0]) {
@@ -1677,7 +2987,7 @@ void jce_editor_panel_inspector_content(void)
      * functions have returned (so no stale flecs pointer is in use). */
     if (s_pending_remove.pending) {
         uint32_t eid = s_pending_remove.entity_id;
-        uint32_t fl  = s_pending_remove.flag;
+        uint64_t fl  = s_pending_remove.flag;
         s_pending_remove.pending   = false;
         s_pending_remove.entity_id = 0;
         s_pending_remove.flag      = 0;
