@@ -24,12 +24,35 @@
 #include <bgfx/c99/bgfx.h>
 #include <RmlUi/Core.h>
 
+extern "C" {
+#include <jce/os/core/jce_alloc.h>
+}
+
 #include <cstring>
+#include <new>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #define LOG_TAG "ui.rml"
+
+namespace {
+template <typename T, typename... Args>
+T *jce_cxx_new(Args &&...args)
+{
+    void *raw = jce_malloc(sizeof(T));
+    if (!raw) return nullptr;
+    return new (raw) T(static_cast<Args &&>(args)...);
+}
+
+template <typename T>
+void jce_cxx_delete(T *ptr)
+{
+    if (!ptr) return;
+    ptr->~T();
+    jce_free(ptr);
+}
+} /* namespace */
 
 /* ================================================================== */
 /* Vertex layout matching engine's PosColorTexVertex                   */
@@ -99,13 +122,13 @@ public:
             return 0;
         }
 
-        auto *f = new (std::nothrow) FileState();
+        auto *f = jce_cxx_new<FileState>();
         if (!f) return 0;
 
         f->size = (size_t)asset->original_size;
         f->data = (uint8_t *)JCE_MALLOC(f->size);
         if (!f->data) {
-            delete f;
+            jce_cxx_delete(f);
             return 0;
         }
 
@@ -113,7 +136,7 @@ public:
         if (decompressed == 0) {
             LOG_ERROR(LOG_TAG, "jce_pak_decompress failed: %s", path.c_str());
             JCE_FREE(f->data);
-            delete f;
+            jce_cxx_delete(f);
             return 0;
         }
 
@@ -126,7 +149,7 @@ public:
         auto *f = reinterpret_cast<FileState *>(file);
         if (f) {
             JCE_FREE(f->data);
-            delete f;
+            jce_cxx_delete(f);
         }
     }
 
@@ -455,7 +478,7 @@ static float compute_dp_ratio(uint32_t h)
 JceRmlBackend *jce_rml_create(uint32_t width, uint32_t height,
                               JceRenderer *renderer, JcePakArchive *pak)
 {
-    auto *b = new (std::nothrow) JceRmlBackend();
+    auto *b = jce_cxx_new<JceRmlBackend>();
     if (!b) {
         LOG_ERROR(LOG_TAG, "failed to allocate JceRmlBackend");
         return nullptr;
@@ -466,15 +489,15 @@ JceRmlBackend *jce_rml_create(uint32_t width, uint32_t height,
     b->renderer = renderer;
     b->pak      = pak;
 
-    b->sys_interface    = new (std::nothrow) JceRmlSystemInterface();
-    b->render_interface = new (std::nothrow) JceRmlRenderInterface(renderer);
-    b->file_interface   = new (std::nothrow) JceRmlFileInterface(pak);
+    b->sys_interface    = jce_cxx_new<JceRmlSystemInterface>();
+    b->render_interface = jce_cxx_new<JceRmlRenderInterface>(renderer);
+    b->file_interface   = jce_cxx_new<JceRmlFileInterface>(pak);
     if (!b->sys_interface || !b->render_interface || !b->file_interface) {
         LOG_ERROR(LOG_TAG, "failed to allocate RmlUi interfaces");
-        delete b->file_interface;
-        delete b->render_interface;
-        delete b->sys_interface;
-        delete b;
+        jce_cxx_delete(b->file_interface);
+        jce_cxx_delete(b->render_interface);
+        jce_cxx_delete(b->sys_interface);
+        jce_cxx_delete(b);
         return nullptr;
     }
     b->render_interface->SetPak(pak);
@@ -485,10 +508,10 @@ JceRmlBackend *jce_rml_create(uint32_t width, uint32_t height,
 
     if (!Rml::Initialise()) {
         LOG_ERROR(LOG_TAG, "Rml::Initialise() failed");
-        delete b->file_interface;
-        delete b->render_interface;
-        delete b->sys_interface;
-        delete b;
+        jce_cxx_delete(b->file_interface);
+        jce_cxx_delete(b->render_interface);
+        jce_cxx_delete(b->sys_interface);
+        jce_cxx_delete(b);
         return nullptr;
     }
 
@@ -497,10 +520,10 @@ JceRmlBackend *jce_rml_create(uint32_t width, uint32_t height,
     if (!b->context) {
         LOG_ERROR(LOG_TAG, "Rml::CreateContext() failed");
         Rml::Shutdown();
-        delete b->file_interface;
-        delete b->render_interface;
-        delete b->sys_interface;
-        delete b;
+        jce_cxx_delete(b->file_interface);
+        jce_cxx_delete(b->render_interface);
+        jce_cxx_delete(b->sys_interface);
+        jce_cxx_delete(b);
         return nullptr;
     }
 
@@ -532,7 +555,7 @@ void jce_rml_destroy(JceRmlBackend *b)
     Rml::SetFileInterface(nullptr);
 
     for (auto *adapter : b->event_adapters)
-        delete adapter;
+        jce_cxx_delete(adapter);
     b->event_adapters.clear();
 
     /* Free font data buffers AFTER Rml::Shutdown (FreeType is done). */
@@ -540,10 +563,10 @@ void jce_rml_destroy(JceRmlBackend *b)
         JCE_FREE(buf);
     b->font_data_buffers.clear();
 
-    delete b->file_interface;
-    delete b->render_interface;
-    delete b->sys_interface;
-    delete b;
+    jce_cxx_delete(b->file_interface);
+    jce_cxx_delete(b->render_interface);
+    jce_cxx_delete(b->sys_interface);
+    jce_cxx_delete(b);
 
     LOG_INFO(LOG_TAG, "RmlUi backend destroyed");
 }
@@ -766,7 +789,7 @@ void jce_rml_elem_on(JceRmlBackend *b, uint32_t elem_idx,
     Rml::Element *elem = b->elements[elem_idx];
     if (!elem) return;
 
-    auto *adapter = new (std::nothrow) JceRmlEventAdapter(elem_idx, fn, ud);
+    auto *adapter = jce_cxx_new<JceRmlEventAdapter>(elem_idx, fn, ud);
     if (!adapter) {
         LOG_ERROR(LOG_TAG, "failed to allocate event adapter");
         return;

@@ -16,6 +16,8 @@ extern "C" {
 #include <jce/middleware/audio/jce_audio.h>
 #include <jce/middleware/physics/jce_physics.h>
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/middleware/scene/jce_scene_components_json.h>
+#include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_alloc.h>
 }
@@ -571,9 +573,11 @@ struct ClipEntry {
     char        tag[JCE_MAX_TAG_STRING];
     bool        prefab_instance;
     char        prefab_path[JCE_MAX_PREFAB_PATH];
+    std::string components_json;     /* serialized component array, may be empty */
 };
 
 #include <vector>
+#include <string>
 static std::vector<ClipEntry> s_clip_entries;
 static bool                   s_clip_cut = false;
 
@@ -595,6 +599,19 @@ static bool clip_capture(uint32_t id, ClipEntry *out)
     snprintf(out->tag, sizeof(out->tag), "%s", tag ? tag : "");
     out->prefab_instance = jce_state_entity_is_prefab(id);
     snprintf(out->prefab_path, sizeof(out->prefab_path), "%s", pp ? pp : "");
+    out->components_json.clear();
+
+    if (s.scene) {
+        JceJson *arr = jce_scene_serialize_entity_components(s.scene, (JceEntity)id);
+        if (arr) {
+            char *txt = jce_json_print(arr, false);
+            if (txt) {
+                out->components_json.assign(txt);
+                jce_json_free_string(txt);
+            }
+            jce_json_free(arr);
+        }
+    }
     return true;
 }
 
@@ -616,6 +633,22 @@ static uint32_t clip_paste_one(const ClipEntry &e, uint32_t parent_id,
             m->prefab_instance = true;
             snprintf(m->prefab_path, sizeof(m->prefab_path), "%s",
                      e.prefab_path);
+        }
+    }
+
+    if (s.scene && !e.components_json.empty()) {
+        JceJson *arr = jce_json_parse(e.components_json.c_str(),
+                                      e.components_json.size());
+        if (arr) {
+            JceJson *wrapper = jce_json_object();
+            if (wrapper) {
+                jce_json_set_child(wrapper, "components", arr);
+                jce_scene_parse_entity_json(s.scene,
+                                            (JceEntity)new_id, wrapper);
+                jce_json_free(wrapper); /* frees nested arr too */
+            } else {
+                jce_json_free(arr);
+            }
         }
     }
     return new_id;

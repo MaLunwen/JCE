@@ -38,6 +38,34 @@ static ECS_COMPONENT_DECLARE(JceAudioSourceComponent);
 static ECS_COMPONENT_DECLARE(JceScriptComponent);
 static ECS_COMPONENT_DECLARE(JceEditorMeta);
 static ECS_COMPONENT_DECLARE(JceTerrainComponent);
+static ECS_COMPONENT_DECLARE(JceLodGroupComponent);
+static ECS_COMPONENT_DECLARE(JceVirtualCameraComponent);
+static ECS_COMPONENT_DECLARE(JceTriggerVolumeComponent);
+static ECS_COMPONENT_DECLARE(JceCapsuleColliderComponent);
+static ECS_COMPONENT_DECLARE(JceMeshColliderComponent);
+static ECS_COMPONENT_DECLARE(JceCollider2DComponent);
+static ECS_COMPONENT_DECLARE(JceTrailRendererComponent);
+static ECS_COMPONENT_DECLARE(JceLineRendererComponent);
+static ECS_COMPONENT_DECLARE(JceReflectionProbeComponent);
+static ECS_COMPONENT_DECLARE(JceDecalComponent);
+static ECS_COMPONENT_DECLARE(JceLightProbeGroupComponent);
+static ECS_COMPONENT_DECLARE(JceAudioListenerComponent);
+static ECS_COMPONENT_DECLARE(JceAudioReverbZoneComponent);
+static ECS_COMPONENT_DECLARE(JceAudioOcclusionComponent);
+static ECS_COMPONENT_DECLARE(JceSpawnManagerComponent);
+static ECS_COMPONENT_DECLARE(JceWeaponComponent);
+static ECS_COMPONENT_DECLARE(JceSavePointComponent);
+static ECS_COMPONENT_DECLARE(JceWheelColliderComponent);
+static ECS_COMPONENT_DECLARE(JceConstantForceComponent);
+static ECS_COMPONENT_DECLARE(JceConfigurableJointComponent);
+static ECS_COMPONENT_DECLARE(JceJoint2DComponent);
+static ECS_COMPONENT_DECLARE(JceBillboardRendererComponent);
+static ECS_COMPONENT_DECLARE(JceCanvasComponent);
+static ECS_COMPONENT_DECLARE(JceCanvasGroupComponent);
+static ECS_COMPONENT_DECLARE(JceLayoutGroupComponent);
+static ECS_COMPONENT_DECLARE(JceUIImageComponent);
+static ECS_COMPONENT_DECLARE(JceUITextComponent);
+static ECS_COMPONENT_DECLARE(JceUIButtonComponent);
 
 /* ── Scene struct ──────────────────────────────────────────────────── */
 
@@ -82,6 +110,34 @@ JceScene *jce_scene_create(void)
     ECS_COMPONENT_DEFINE(s->world, JceScriptComponent);
     ECS_COMPONENT_DEFINE(s->world, JceEditorMeta);
     ECS_COMPONENT_DEFINE(s->world, JceTerrainComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceLodGroupComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceVirtualCameraComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceTriggerVolumeComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceCapsuleColliderComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceMeshColliderComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceCollider2DComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceTrailRendererComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceLineRendererComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceReflectionProbeComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceDecalComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceLightProbeGroupComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceAudioListenerComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceAudioReverbZoneComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceAudioOcclusionComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceSpawnManagerComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceWeaponComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceSavePointComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceWheelColliderComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceConstantForceComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceConfigurableJointComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceJoint2DComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceBillboardRendererComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceCanvasComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceCanvasGroupComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceLayoutGroupComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceUIImageComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceUITextComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceUIButtonComponent);
 
     LOG_SUCCESS(LOG_TAG, "scene created");
     return s;
@@ -253,17 +309,45 @@ JCE_COMP_IMPL(JceParticleEmitterComponent,    particle_emitter)
 JCE_COMP_IMPL(JceBehaviorTree,                behavior_tree)
 JCE_COMP_IMPL(JceEditorMeta,                  editor_meta)
 JCE_COMP_IMPL(JceTerrainComponent,            terrain)
+JCE_COMP_IMPL(JceLodGroupComponent,           lod_group)
+JCE_COMP_IMPL(JceVirtualCameraComponent,      virtual_camera)
+JCE_COMP_IMPL(JceTriggerVolumeComponent,      trigger_volume)
+JCE_COMP_IMPL(JceCapsuleColliderComponent,    capsule_collider)
+JCE_COMP_IMPL(JceMeshColliderComponent,       mesh_collider)
+JCE_COMP_IMPL(JceCollider2DComponent,         collider2d)
+JCE_COMP_IMPL(JceTrailRendererComponent,      trail_renderer)
+JCE_COMP_IMPL(JceLineRendererComponent,       line_renderer)
+JCE_COMP_IMPL(JceReflectionProbeComponent,    reflection_probe)
+JCE_COMP_IMPL(JceDecalComponent,              decal)
+JCE_COMP_IMPL(JceLightProbeGroupComponent,    light_probe_group)
+JCE_COMP_IMPL(JceAudioListenerComponent,      audio_listener)
+JCE_COMP_IMPL(JceAudioReverbZoneComponent,    audio_reverb_zone)
+JCE_COMP_IMPL(JceAudioOcclusionComponent,     audio_occlusion)
+JCE_COMP_IMPL(JceSpawnManagerComponent,       spawn_manager)
+JCE_COMP_IMPL(JceWeaponComponent,             weapon)
+JCE_COMP_IMPL(JceSavePointComponent,          save_point)
+JCE_COMP_IMPL(JceWheelColliderComponent,      wheel_collider)
+JCE_COMP_IMPL(JceConstantForceComponent,      constant_force)
+JCE_COMP_IMPL(JceConfigurableJointComponent,  configurable_joint)
+JCE_COMP_IMPL(JceJoint2DComponent,            joint2d)
+JCE_COMP_IMPL(JceBillboardRendererComponent,  billboard_renderer)
+JCE_COMP_IMPL(JceCanvasComponent,             canvas)
+JCE_COMP_IMPL(JceCanvasGroupComponent,        canvas_group)
+JCE_COMP_IMPL(JceLayoutGroupComponent,        layout_group)
+JCE_COMP_IMPL(JceUIImageComponent,            ui_image)
+JCE_COMP_IMPL(JceUITextComponent,             ui_text)
+JCE_COMP_IMPL(JceUIButtonComponent,           ui_button)
 
 #undef JCE_COMP_IMPL
 
 /* ── Component enumeration ─────────────────────────────────────────── */
 
-uint32_t jce_scene_get_component_flags(const JceScene *s, JceEntity e)
+uint64_t jce_scene_get_component_flags(const JceScene *s, JceEntity e)
 {
     if (!s || e == JCE_ENTITY_INVALID) return 0;
     ecs_entity_t ent = (ecs_entity_t)e;
     if (!ecs_is_alive(s->world, ent)) return 0;
-    uint32_t flags = 0;
+    uint64_t flags = 0;
 
     if (ecs_has(s->world, ent, JceTransform))                   flags |= JCE_COMP_FLAG_TRANSFORM;
     if (ecs_has(s->world, ent, JceMeshRenderer))                flags |= JCE_COMP_FLAG_MESH_RENDERER;
@@ -288,6 +372,34 @@ uint32_t jce_scene_get_component_flags(const JceScene *s, JceEntity e)
     if (ecs_has(s->world, ent, JceBehaviorTree))                flags |= JCE_COMP_FLAG_BEHAVIOR_TREE;
     if (ecs_has(s->world, ent, JceEditorMeta))                  flags |= JCE_COMP_FLAG_EDITOR_META;
     if (ecs_has(s->world, ent, JceTerrainComponent))            flags |= JCE_COMP_FLAG_TERRAIN;
+    if (ecs_has(s->world, ent, JceLodGroupComponent))           flags |= JCE_COMP_FLAG_LOD_GROUP;
+    if (ecs_has(s->world, ent, JceVirtualCameraComponent))      flags |= JCE_COMP_FLAG_VIRTUAL_CAMERA;
+    if (ecs_has(s->world, ent, JceTriggerVolumeComponent))      flags |= JCE_COMP_FLAG_TRIGGER_VOLUME;
+    if (ecs_has(s->world, ent, JceCapsuleColliderComponent))    flags |= JCE_COMP_FLAG_CAPSULE_COLLIDER;
+    if (ecs_has(s->world, ent, JceMeshColliderComponent))       flags |= JCE_COMP_FLAG_MESH_COLLIDER;
+    if (ecs_has(s->world, ent, JceCollider2DComponent))         flags |= JCE_COMP_FLAG_COLLIDER_2D;
+    if (ecs_has(s->world, ent, JceTrailRendererComponent))      flags |= JCE_COMP_FLAG_TRAIL_RENDERER;
+    if (ecs_has(s->world, ent, JceLineRendererComponent))       flags |= JCE_COMP_FLAG_LINE_RENDERER;
+    if (ecs_has(s->world, ent, JceReflectionProbeComponent))    flags |= JCE_COMP_FLAG_REFLECTION_PROBE;
+    if (ecs_has(s->world, ent, JceDecalComponent))              flags |= JCE_COMP_FLAG_DECAL;
+    if (ecs_has(s->world, ent, JceLightProbeGroupComponent))    flags |= JCE_COMP_FLAG_LIGHT_PROBE_GROUP;
+    if (ecs_has(s->world, ent, JceAudioListenerComponent))      flags |= JCE_COMP_FLAG_AUDIO_LISTENER;
+    if (ecs_has(s->world, ent, JceAudioReverbZoneComponent))    flags |= JCE_COMP_FLAG_AUDIO_REVERB_ZONE;
+    if (ecs_has(s->world, ent, JceAudioOcclusionComponent))     flags |= JCE_COMP_FLAG_AUDIO_OCCLUSION;
+    if (ecs_has(s->world, ent, JceSpawnManagerComponent))       flags |= JCE_COMP_FLAG_SPAWN_MANAGER;
+    if (ecs_has(s->world, ent, JceWeaponComponent))             flags |= JCE_COMP_FLAG_WEAPON;
+    if (ecs_has(s->world, ent, JceSavePointComponent))          flags |= JCE_COMP_FLAG_SAVE_POINT;
+    if (ecs_has(s->world, ent, JceWheelColliderComponent))      flags |= JCE_COMP_FLAG_WHEEL_COLLIDER;
+    if (ecs_has(s->world, ent, JceConstantForceComponent))      flags |= JCE_COMP_FLAG_CONSTANT_FORCE;
+    if (ecs_has(s->world, ent, JceConfigurableJointComponent))  flags |= JCE_COMP_FLAG_CONFIGURABLE_JOINT;
+    if (ecs_has(s->world, ent, JceJoint2DComponent))            flags |= JCE_COMP_FLAG_JOINT_2D;
+    if (ecs_has(s->world, ent, JceBillboardRendererComponent))  flags |= JCE_COMP_FLAG_BILLBOARD_RENDERER;
+    if (ecs_has(s->world, ent, JceCanvasComponent))             flags |= JCE_COMP_FLAG_CANVAS;
+    if (ecs_has(s->world, ent, JceCanvasGroupComponent))        flags |= JCE_COMP_FLAG_CANVAS_GROUP;
+    if (ecs_has(s->world, ent, JceLayoutGroupComponent))        flags |= JCE_COMP_FLAG_LAYOUT_GROUP;
+    if (ecs_has(s->world, ent, JceUIImageComponent))            flags |= JCE_COMP_FLAG_UI_IMAGE;
+    if (ecs_has(s->world, ent, JceUITextComponent))             flags |= JCE_COMP_FLAG_UI_TEXT;
+    if (ecs_has(s->world, ent, JceUIButtonComponent))           flags |= JCE_COMP_FLAG_UI_BUTTON;
 
     return flags;
 }

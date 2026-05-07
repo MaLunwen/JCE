@@ -594,11 +594,7 @@ void draw_content(void)
         ImGui::TextWrapped(jce_editor_i18n("lightmapBake.label.lastOutput"), s.last_output_path);
 
     ImGui::Spacing();
-    ImGui::TextDisabled(
-        "Phase C: snapshots the active scene and bakes a floor AO\n"
-        "lightmap (XZ plane at minY) by ray-tracing every texel\n"
-        "against per-entity OBB / sphere proxies. Samples = rays per\n"
-        "texel; bounces = soft skylight re-injection passes.");
+    ImGui::TextDisabled("%s", jce_editor_i18n("lightmapBake.note.phaseC"));
 }
 
 } /* namespace */

@@ -203,7 +203,7 @@ extern "C" void jce_editor_dialog_build_settings(bool *p_open)
             }
             ImGui::EndCombo();
         }
-        ImGui::TextDisabled("name=%s  configurePreset=%s",
+        ImGui::TextDisabled(jce_editor_i18n("buildDialog.nameAndConfig"),
                             s_presets[s_selected].name.c_str(),
                             s_presets[s_selected].config_pre.c_str());
     }
@@ -251,11 +251,12 @@ extern "C" void jce_editor_dialog_build_settings(bool *p_open)
     if (st.state == JCE_BUILD_RUNNING)   col = ImVec4(1.0f, 0.85f, 0.2f, 1.0f);
     if (st.state == JCE_BUILD_SUCCEEDED) col = ImVec4(0.4f, 1.0f, 0.4f, 1.0f);
     if (st.state == JCE_BUILD_FAILED)    col = ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
-    ImGui::TextColored(col, "State: %s   Stage: %s   Preset: %s",
+    ImGui::TextColored(col, jce_editor_i18n("buildDialog.statusLine"),
                        state_names[s_idx], stage_names[g_idx],
                        st.preset[0] ? st.preset : "(none)");
     if (st.last_error[0])
-        ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "Last error: %s",
+        ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "%s: %s",
+                           jce_editor_i18n("buildDialog.lastError"),
                            st.last_error);
 
     /* Auto-rewire game_executable_path on first success transition. */

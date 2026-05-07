@@ -207,6 +207,19 @@ void jce_editor_panels_init(void)
     s_visible[JCE_PANEL_FRAME_DEBUGGER]   = false;
     s_visible[JCE_PANEL_SPRITE_EDITOR]    = false;
     s_visible[JCE_PANEL_TILE_PALETTE]     = false;
+    s_visible[JCE_PANEL_TOOLBAR]          = true;
+    s_visible[JCE_PANEL_STATUS_BAR]       = true;
+    s_visible[JCE_PANEL_MEMORY_PROFILER]  = false;
+    s_visible[JCE_PANEL_PHYSICS_DEBUGGER] = false;
+    s_visible[JCE_PANEL_LIGHT_EXPLORER]   = false;
+    s_visible[JCE_PANEL_REFLECTION_PROBES]= false;
+    s_visible[JCE_PANEL_SHADER_GRAPH]     = false;
+    s_visible[JCE_PANEL_SEARCH]           = false;
+    s_visible[JCE_PANEL_VERSION_CONTROL]  = false;
+    s_visible[JCE_PANEL_TIME_OF_DAY]      = false;
+    s_visible[JCE_PANEL_VCAM_MANAGER]     = false;
+    s_visible[JCE_PANEL_REVERB_ZONES]     = false;
+    s_visible[JCE_PANEL_SAVE_BROWSER]     = false;
 
     /* Console ring buffer. */
     memset(&s_console, 0, sizeof(s_console));
@@ -613,10 +626,12 @@ void jce_editor_settings_dialog(bool *p_open)
     /* Show the resolved absolute path of the current selection (helpful
        when two installed fonts share a display name). */
     if (en_idx > 0)
-        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Latin: %s",
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "%s: %s",
+                           jce_editor_i18n("fonts.latin"),
                            s_font_entries[en_idx - 1].path);
     if (zh_idx > 0)
-        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "CJK:   %s",
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "%s:   %s",
+                           jce_editor_i18n("fonts.cjk"),
                            s_font_entries[zh_idx - 1].path);
 
     ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f),

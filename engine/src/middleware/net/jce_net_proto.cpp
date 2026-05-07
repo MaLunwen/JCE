@@ -12,16 +12,45 @@
 
 #include <cstring>
 #include <string>
+#include <new>
 
 extern "C" {
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_thread.h>
 }
 
 #define LOG_TAG "net_proto"
 
-/* ── Internal text buffer for decoded chat messages ─────────────── */
+/* ── Internal text buffer for decoded chat messages ─────────────────
+ * Per-thread so concurrent decode calls from worker threads do not
+ * trample each other.  Backed by jce_tls_* (SDL3) instead of C
+ * `thread_local` to keep middleware off per-toolchain TLS quirks. */
 
-static thread_local std::string s_chat_text_buf;
+static void s_chat_text_buf_dtor(void *p)
+{
+    std::string *s = static_cast<std::string *>(p);
+    if (s) { s->~basic_string(); JCE_FREE(s); }
+}
+
+static JceTLS *s_chat_text_buf_tls = nullptr;
+
+static std::string &s_chat_text_buf(void)
+{
+    if (!s_chat_text_buf_tls) {
+        /* First-touch lazy init.  Race here is benign: at most one
+           leaked JceTLS handle until process exit, and SDL_TLSID
+           creation is idempotent under the SetTLS path. */
+        s_chat_text_buf_tls = jce_tls_create(s_chat_text_buf_dtor);
+    }
+    void *raw = jce_tls_get(s_chat_text_buf_tls);
+    if (!raw) {
+        void *mem = JCE_MALLOC(sizeof(std::string));
+        std::string *s = new (mem) std::string();
+        jce_tls_set(s_chat_text_buf_tls, s);
+        raw = s;
+    }
+    return *static_cast<std::string *>(raw);
+}
 
 /* ── Encode ─────────────────────────────────────────────────────── */
 
@@ -182,8 +211,9 @@ bool jce_net_proto_decode(const uint8_t *data, uint32_t size,
         out_env->type = JCE_NET_MSG_CHAT;
         const auto &cm = msg.chat_message();
         out_env->chat.sender_id = cm.sender_id();
-        s_chat_text_buf = cm.text();
-        out_env->chat.text = s_chat_text_buf.c_str();
+        std::string &buf = s_chat_text_buf();
+        buf = cm.text();
+        out_env->chat.text = buf.c_str();
         out_env->chat.channel = cm.channel();
         break;
     }

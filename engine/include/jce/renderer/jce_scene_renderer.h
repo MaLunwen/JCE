@@ -17,6 +17,7 @@
 #include <jce/renderer/jce_postfx.h>
 #include <jce/renderer/jce_texture_types.h>
 #include <jce/renderer/jce_time_of_day.h>
+#include <jce/renderer/jce_volumetric_fog.h>
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -106,6 +107,21 @@ typedef struct {
     /* Overlay hook (editor-only). NULL in runtime games. */
     JceSceneOnAfterSkyFn on_after_sky;
     void                *on_after_sky_ud;
+
+    /* Volumetric fog (analytic + raymarched).  When fog_enabled is true
+     * AND fog_depth_tex_handle is a valid bgfx texture id (the depth tex
+     * matching this frame's view+proj), the renderer will allocate /
+     * resize a JceVolumetricFog instance, push fog params, and execute
+     * the fog raymarch into a private RT.  The result texture handle is
+     * exposed via jce_scene_renderer_get_fog_result_texture() so callers
+     * can composite it (multiply scene by alpha, add rgb) themselves.
+     * The renderer does NOT composite into the caller's color RT yet —
+     * that is a separate phase (composite shader pending). */
+    bool                     fog_enabled;
+    JceVolumetricFogParams   fog;
+    uint16_t                 fog_depth_tex_handle;  /* UINT16_MAX = none */
+    int                      fog_rt_width;          /* 0 = skip fog */
+    int                      fog_rt_height;         /* 0 = skip fog */
 } JceSceneRenderConfig;
 
 /* Returns true if a skybox component is currently active in the scene
@@ -203,6 +219,21 @@ JCE_API const JceCsmData *jce_scene_renderer_get_csm(const JceSceneRenderer *sr)
 /* Returns the engine-owned PostFX pipeline. Editor and runtime use this
    single instance — no separate global. Returns NULL before create(). */
 JCE_API JcePostFXPipeline *jce_scene_renderer_get_postfx(JceSceneRenderer *sr);
+
+/* Most-recent volumetric fog result texture (RGBA8: rgb in-scatter,
+ * a transmittance).  Returns UINT16_MAX when fog was disabled this
+ * frame, params/depth were invalid, or fog has never been rendered.
+ * Caller composites:  final = scene.rgb * a + rgb. */
+JCE_API uint16_t jce_scene_renderer_get_fog_result_texture(const JceSceneRenderer *sr);
+
+/* Composite the most recent volumetric fog RT into the currently bound
+ * frame buffer of `view_id` using blend ONE/SRC_ALPHA.  Caller must
+ * configure the view's frame buffer / viewport BEFORE calling — the
+ * fog quad is fullscreen NDC so no camera transform is required.
+ *
+ * No-op when fog was disabled this frame, the composite shader is
+ * unavailable on this backend, or the renderer has never run. */
+JCE_API void jce_scene_renderer_composite_fog(JceSceneRenderer *sr, uint16_t view_id);
 
 /* Per-frame culling stats from the most recent render call. */
 typedef struct {
@@ -304,6 +335,13 @@ JCE_API void jce_scene_renderer_set_time_of_day(JceSceneRenderer        *sr,
 /* Returns the active ToD snapshot (may be NULL if no override). */
 JCE_API const JceTimeOfDayState *jce_scene_renderer_get_time_of_day(
     const JceSceneRenderer *sr);
+
+/* Editor-side ambient override.
+ * Pass color_rgb=NULL to disable and restore the renderer's hardcoded
+ * (1,1,1) * 0.15 ambient. ToD, when active, still wins over this. */
+JCE_API void jce_scene_renderer_set_ambient_override(JceSceneRenderer *sr,
+                                                      const float       color_rgb[3],
+                                                      float             intensity);
 
 JCE_EXTERN_C_END
 

@@ -8,11 +8,10 @@
 #include "scene/jce_editor_scene_render.h"
 #include "core/jce_editor_state.h"
 
-#include <chrono>
-
 extern "C" {
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
+#include <jce/os/core/jce_timer.h>
 #include <jce/os/platform/jce_window.h>
 #include <jce/renderer/jce_camera.h>
 #include <jce/renderer/jce_debug_draw.h>
@@ -232,12 +231,12 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
     }
     g.last_play_state = play_state;
 
-    /* Compute real frame dt (steady_clock) so the engine scene renderer
-     * can advance skeletal animation, particles, and other time-based
-     * components in PLAY mode (Game View). */
-    static auto s_last_tp = std::chrono::steady_clock::now();
-    auto now_tp  = std::chrono::steady_clock::now();
-    float frame_dt = std::chrono::duration<float>(now_tp - s_last_tp).count();
+    /* Compute real frame dt (jce_time_perf_counter) so the engine scene
+     * renderer can advance skeletal animation, particles, and other
+     * time-based components in PLAY mode (Game View). */
+    static uint64_t s_last_tp = jce_time_perf_counter();
+    uint64_t now_tp  = jce_time_perf_counter();
+    float    frame_dt = (float)jce_time_perf_to_seconds(s_last_tp, now_tp);
     s_last_tp = now_tp;
     if (frame_dt < 0.0f || frame_dt > 0.25f) frame_dt = 1.0f / 60.0f;
 

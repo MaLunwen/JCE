@@ -173,6 +173,23 @@ static void handle_global_edit_shortcuts(void)
             jce_state_redo();
     }
 
+    /* Panel toggle hotkeys — flip Window-menu visibility flags. */
+    struct PT { JceHotkeyId hk; JceEditorPanel panel; };
+    static const PT toggles[] = {
+        { JCE_HK_PANEL_CONSOLE,   JCE_PANEL_CONSOLE   },
+        { JCE_HK_PANEL_PROFILER,  JCE_PANEL_PROFILER  },
+        { JCE_HK_PANEL_HIERARCHY, JCE_PANEL_HIERARCHY },
+        { JCE_HK_PANEL_INSPECTOR, JCE_PANEL_INSPECTOR },
+        { JCE_HK_PANEL_ASSETS,    JCE_PANEL_ASSETS    },
+        { JCE_HK_PANEL_SEARCH,    JCE_PANEL_SEARCH    },
+    };
+    for (const auto &t : toggles) {
+        if (jce_hotkey_pressed(t.hk)) {
+            bool *v = jce_editor_panel_visible_ptr(t.panel);
+            if (v) *v = !*v;
+        }
+    }
+
     if (ImGui::IsKeyPressed(ImGuiKey_F9, false)) {
         cmd_toggle_demo_lod_();
     }
@@ -373,7 +390,7 @@ static void draw_command_palette(void)
     }
     ImGui::SetNextItemWidth(-1);
     if (ImGui::InputTextWithHint("##palette_query",
-            "Type a command\u2026  (Esc to close)",
+            jce_editor_i18n("commandPalette.hint"),
             s_palette_query, sizeof s_palette_query,
             ImGuiInputTextFlags_AutoSelectAll))
     {
@@ -601,8 +618,33 @@ static void draw_menu_bar(void)
         if (ImGui::MenuItem(jce_editor_i18n("menu.edit.redo"),  "Ctrl+Y", false, jce_state_can_redo()))
             jce_state_redo();
         ImGui::Separator();
-        if (ImGui::MenuItem(jce_editor_i18n("menu.edit.copy"),  "Ctrl+C"))  { /* TODO */ }
-        if (ImGui::MenuItem(jce_editor_i18n("menu.edit.paste"), "Ctrl+V"))  { /* TODO */ }
+        {
+            int sel_count = 0;
+            const uint32_t *sel = jce_state_get_selection(&sel_count);
+            uint32_t focused = jce_state_get_focused();
+            bool has_target = (sel_count > 0) || (focused != 0);
+            if (ImGui::MenuItem(jce_editor_i18n("menu.edit.copy"),  "Ctrl+C", false, has_target)) {
+                if (sel_count > 0)        jce_state_copy_entities(sel, sel_count, false);
+                else if (focused)         jce_state_copy_entity(focused);
+            }
+            if (ImGui::MenuItem(jce_editor_i18n("menu.edit.cut"),   "Ctrl+X", false, has_target)) {
+                if (sel_count > 0)        jce_state_copy_entities(sel, sel_count, true);
+                else if (focused)         jce_state_copy_entities(&focused, 1, true);
+            }
+            bool can_paste = jce_state_clipboard_count() > 0 || jce_state_has_copied();
+            if (ImGui::MenuItem(jce_editor_i18n("menu.edit.paste"), "Ctrl+V", false, can_paste)) {
+                uint32_t parent = focused; /* paste under focused if any, else root */
+                if (jce_state_clipboard_count() > 0) {
+                    uint32_t new_ids[64];
+                    int n = jce_state_paste_entities(parent, new_ids, 64);
+                    if (n > 0) jce_state_select_entity(new_ids[0], false);
+                    for (int i = 1; i < n; ++i) jce_state_select_entity(new_ids[i], true);
+                } else if (jce_state_has_copied()) {
+                    uint32_t nid = jce_state_paste_entity(parent);
+                    if (nid) jce_state_select_entity(nid, false);
+                }
+            }
+        }
         if (ImGui::MenuItem(jce_editor_i18n("menu.edit.duplicate"), "Ctrl+D")) {
             uint32_t f = jce_state_get_focused();
             if (f) {
@@ -621,7 +663,7 @@ static void draw_menu_bar(void)
         if (ImGui::MenuItem(jce_editor_i18n("menu.edit.projectSettings")))
             s_show_proj_settings = true;
         ImGui::Separator();
-        if (ImGui::MenuItem("Reload Shaders", "F5")) {
+        if (ImGui::MenuItem(jce_editor_i18n("shaders.reload"), "F5")) {
             jce_editor_reload_shaders();
         }
         ImGui::EndMenu();
@@ -752,8 +794,37 @@ static void draw_menu_bar(void)
                             jce_editor_panel_visible_ptr(JCE_PANEL_TEST_RUNNER));
             ImGui::MenuItem(jce_editor_i18n("buildProfiles.title"), NULL,
                             jce_editor_panel_visible_ptr(JCE_PANEL_BUILD_PROFILES));
+            ImGui::Separator();
+            ImGui::MenuItem(jce_editor_i18n("window.memoryProfiler"),   NULL,
+                            jce_editor_panel_visible_ptr(JCE_PANEL_MEMORY_PROFILER));
+            ImGui::MenuItem(jce_editor_i18n("window.physicsDebugger"),  NULL,
+                            jce_editor_panel_visible_ptr(JCE_PANEL_PHYSICS_DEBUGGER));
+            ImGui::MenuItem(jce_editor_i18n("window.lightExplorer"),    NULL,
+                            jce_editor_panel_visible_ptr(JCE_PANEL_LIGHT_EXPLORER));
+            ImGui::MenuItem(jce_editor_i18n("window.reflectionProbes"), NULL,
+                            jce_editor_panel_visible_ptr(JCE_PANEL_REFLECTION_PROBES));
+            ImGui::MenuItem(jce_editor_i18n("window.shaderGraph"),      NULL,
+                            jce_editor_panel_visible_ptr(JCE_PANEL_SHADER_GRAPH));
+            ImGui::MenuItem(jce_editor_i18n("window.search"),            "Ctrl+K",
+                            jce_editor_panel_visible_ptr(JCE_PANEL_SEARCH));
+            ImGui::MenuItem(jce_editor_i18n("window.versionControl"),   NULL,
+                            jce_editor_panel_visible_ptr(JCE_PANEL_VERSION_CONTROL));
+            ImGui::Separator();
+            ImGui::MenuItem(jce_editor_i18n("window.timeOfDay"),       NULL,
+                            jce_editor_panel_visible_ptr(JCE_PANEL_TIME_OF_DAY));
+            ImGui::MenuItem(jce_editor_i18n("window.vcamManager"),      NULL,
+                            jce_editor_panel_visible_ptr(JCE_PANEL_VCAM_MANAGER));
+            ImGui::MenuItem(jce_editor_i18n("window.reverbZones"),      NULL,
+                            jce_editor_panel_visible_ptr(JCE_PANEL_REVERB_ZONES));
+            ImGui::MenuItem(jce_editor_i18n("window.saveBrowser"),      NULL,
+                            jce_editor_panel_visible_ptr(JCE_PANEL_SAVE_BROWSER));
             ImGui::EndMenu();
         }
+        ImGui::Separator();
+        ImGui::MenuItem(jce_editor_i18n("window.toolbar"), NULL,
+                        jce_editor_panel_visible_ptr(JCE_PANEL_TOOLBAR));
+        ImGui::MenuItem(jce_editor_i18n("window.statusBar"), NULL,
+                        jce_editor_panel_visible_ptr(JCE_PANEL_STATUS_BAR));
         ImGui::Separator();
         if (ImGui::BeginMenu(jce_editor_i18n("window.layoutPresets"))) {
             if (ImGui::MenuItem(jce_editor_i18n("window.layout.default")))   { s_layout_preset_pending = 0; s_reset_layout_requested = true; }
@@ -764,6 +835,10 @@ static void draw_menu_bar(void)
             if (ImGui::MenuItem(jce_editor_i18n("window.layout.programmer"))){ s_layout_preset_pending = 4; s_reset_layout_requested = true; }
             if (ImGui::MenuItem(jce_editor_i18n("window.layout.twoD")))      { s_layout_preset_pending = 5; s_reset_layout_requested = true; }
             if (ImGui::MenuItem(jce_editor_i18n("window.layout.mobilePortrait"))){ s_layout_preset_pending = 6; s_reset_layout_requested = true; }
+            ImGui::Separator();
+            if (ImGui::MenuItem(jce_editor_i18n("window.layout.cinematic")))  { s_layout_preset_pending = 7; s_reset_layout_requested = true; }
+            if (ImGui::MenuItem(jce_editor_i18n("window.layout.profiling")))  { s_layout_preset_pending = 8; s_reset_layout_requested = true; }
+            if (ImGui::MenuItem(jce_editor_i18n("window.layout.lighting")))   { s_layout_preset_pending = 9; s_reset_layout_requested = true; }
             ImGui::EndMenu();
         }
         if (ImGui::MenuItem(jce_editor_i18n("menu.window.resetLayout"))) {
@@ -1175,6 +1250,93 @@ static void setup_mobile_portrait_docking_layout(ImGuiID dockspace_id)
     ImGui::DockBuilderFinish(dockspace_id);
 }
 
+static void setup_cinematic_docking_layout(ImGuiID dockspace_id)
+{
+    const ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImGui::DockBuilderRemoveNode(dockspace_id);
+    ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_None);
+    ImGui::DockBuilderSetNodeSize(dockspace_id, ImVec2(vp->WorkSize.x, vp->WorkSize.y));
+
+    /* Cinematic: scene view dominant; cinematics tools on the right;
+       hierarchy on the left; timeline + curve editor on the bottom. */
+    ImGuiID bottom_id = 0, top_id = 0;
+    ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Down, 0.30f, &bottom_id, &top_id);
+
+    ImGuiID left_id = 0, mid_block = 0;
+    ImGui::DockBuilderSplitNode(top_id, ImGuiDir_Left, 0.16f, &left_id, &mid_block);
+
+    ImGuiID right_id = 0, center_id = 0;
+    ImGui::DockBuilderSplitNode(mid_block, ImGuiDir_Right, 0.28f, &right_id, &center_id);
+
+    ImGui::DockBuilderDockWindow("Hierarchy###hierarchy",      left_id);
+    ImGui::DockBuilderDockWindow("Scene###scene_view",         center_id);
+    ImGui::DockBuilderDockWindow("Game###game_view",           center_id);
+    ImGui::DockBuilderDockWindow("VCam Manager###vcam_manager",right_id);
+    ImGui::DockBuilderDockWindow("Time of Day###time_of_day",  right_id);
+    ImGui::DockBuilderDockWindow("Inspector###inspector",      right_id);
+    ImGui::DockBuilderDockWindow("Timeline###timeline",        bottom_id);
+    ImGui::DockBuilderDockWindow("###curve_editor",            bottom_id);
+    ImGui::DockBuilderDockWindow("Console###console",          bottom_id);
+    dock_extension_panels(left_id, center_id, right_id, bottom_id);
+    ImGui::DockBuilderFinish(dockspace_id);
+}
+
+static void setup_profiling_docking_layout(ImGuiID dockspace_id)
+{
+    const ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImGui::DockBuilderRemoveNode(dockspace_id);
+    ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_None);
+    ImGui::DockBuilderSetNodeSize(dockspace_id, ImVec2(vp->WorkSize.x, vp->WorkSize.y));
+
+    /* Profiling: profilers fill the upper area; game view + console below. */
+    ImGuiID bottom_id = 0, top_id = 0;
+    ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Down, 0.40f, &bottom_id, &top_id);
+
+    ImGuiID left_id = 0, right_id = 0;
+    ImGui::DockBuilderSplitNode(top_id, ImGuiDir_Left, 0.55f, &left_id, &right_id);
+
+    ImGui::DockBuilderDockWindow("###jce_profiler",                  left_id);
+    ImGui::DockBuilderDockWindow("Memory Profiler###memory_profiler",left_id);
+    ImGui::DockBuilderDockWindow("Physics Debugger###physics_debugger",right_id);
+    ImGui::DockBuilderDockWindow("Game###game_view",                 right_id);
+    ImGui::DockBuilderDockWindow("Console###console",                bottom_id);
+    ImGui::DockBuilderDockWindow("Scene###scene_view",               bottom_id);
+    ImGui::DockBuilderDockWindow("Inspector###inspector",            bottom_id);
+    dock_extension_panels(left_id, right_id, right_id, bottom_id);
+    ImGui::DockBuilderFinish(dockspace_id);
+}
+
+static void setup_lighting_docking_layout(ImGuiID dockspace_id)
+{
+    const ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImGui::DockBuilderRemoveNode(dockspace_id);
+    ImGui::DockBuilderAddNode(dockspace_id, ImGuiDockNodeFlags_None);
+    ImGui::DockBuilderSetNodeSize(dockspace_id, ImVec2(vp->WorkSize.x, vp->WorkSize.y));
+
+    /* Lighting: scene view in the middle; lighting tools on the right;
+       light explorer on the left; reflection probes + console below. */
+    ImGuiID bottom_id = 0, top_id = 0;
+    ImGui::DockBuilderSplitNode(dockspace_id, ImGuiDir_Down, 0.28f, &bottom_id, &top_id);
+
+    ImGuiID left_id = 0, mid_block = 0;
+    ImGui::DockBuilderSplitNode(top_id, ImGuiDir_Left, 0.20f, &left_id, &mid_block);
+
+    ImGuiID right_id = 0, center_id = 0;
+    ImGui::DockBuilderSplitNode(mid_block, ImGuiDir_Right, 0.30f, &right_id, &center_id);
+
+    ImGui::DockBuilderDockWindow("Light Explorer###light_explorer",      left_id);
+    ImGui::DockBuilderDockWindow("Hierarchy###hierarchy",                left_id);
+    ImGui::DockBuilderDockWindow("Scene###scene_view",                   center_id);
+    ImGui::DockBuilderDockWindow("Game###game_view",                     center_id);
+    ImGui::DockBuilderDockWindow("###lighting",                          right_id);
+    ImGui::DockBuilderDockWindow("Time of Day###time_of_day",            right_id);
+    ImGui::DockBuilderDockWindow("Inspector###inspector",                right_id);
+    ImGui::DockBuilderDockWindow("Reflection Probes###reflection_probes",bottom_id);
+    ImGui::DockBuilderDockWindow("Console###console",                    bottom_id);
+    dock_extension_panels(left_id, center_id, right_id, bottom_id);
+    ImGui::DockBuilderFinish(dockspace_id);
+}
+
 static void apply_layout_preset(ImGuiID dockspace_id, int preset)
 {
     switch (preset) {
@@ -1184,6 +1346,9 @@ static void apply_layout_preset(ImGuiID dockspace_id, int preset)
         case 4: setup_programmer_docking_layout(dockspace_id);      break;
         case 5: setup_two_d_docking_layout(dockspace_id);           break;
         case 6: setup_mobile_portrait_docking_layout(dockspace_id); break;
+        case 7: setup_cinematic_docking_layout(dockspace_id);       break;
+        case 8: setup_profiling_docking_layout(dockspace_id);       break;
+        case 9: setup_lighting_docking_layout(dockspace_id);        break;
         default: setup_default_docking_layout(dockspace_id);        break;
     }
 }
@@ -1391,6 +1556,80 @@ static void draw_panel_windows(void)
         }
         ImGui::End();
     }
+
+    /* ── P3 panels (Memory Profiler / Physics Debugger / Light Explorer /
+     * Reflection Probes / Shader Graph / Search / Version Control) ── */
+    if (*jce_editor_panel_visible_ptr(JCE_PANEL_MEMORY_PROFILER)) {
+        snprintf(lbl, sizeof(lbl), "Memory Profiler###memory_profiler");
+        if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_MEMORY_PROFILER)))
+            jce_editor_panel_memory_profiler_content();
+        ImGui::End();
+    }
+    if (*jce_editor_panel_visible_ptr(JCE_PANEL_PHYSICS_DEBUGGER)) {
+        snprintf(lbl, sizeof(lbl), "Physics Debugger###physics_debugger");
+        if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_PHYSICS_DEBUGGER)))
+            jce_editor_panel_physics_debugger_content();
+        ImGui::End();
+    }
+    if (*jce_editor_panel_visible_ptr(JCE_PANEL_LIGHT_EXPLORER)) {
+        snprintf(lbl, sizeof(lbl), "Light Explorer###light_explorer");
+        if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_LIGHT_EXPLORER)))
+            jce_editor_panel_light_explorer_content();
+        ImGui::End();
+    }
+    if (*jce_editor_panel_visible_ptr(JCE_PANEL_REFLECTION_PROBES)) {
+        snprintf(lbl, sizeof(lbl), "Reflection Probes###reflection_probes");
+        if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_REFLECTION_PROBES)))
+            jce_editor_panel_reflection_probes_content();
+        ImGui::End();
+    }
+    if (*jce_editor_panel_visible_ptr(JCE_PANEL_SHADER_GRAPH)) {
+        snprintf(lbl, sizeof(lbl), "Shader Graph###shader_graph");
+        if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_SHADER_GRAPH)))
+            jce_editor_panel_shader_graph_content();
+        ImGui::End();
+    }
+    if (*jce_editor_panel_visible_ptr(JCE_PANEL_SEARCH)) {
+        snprintf(lbl, sizeof(lbl), "Search###search");
+        if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_SEARCH)))
+            jce_editor_panel_search_content();
+        ImGui::End();
+    }
+    if (*jce_editor_panel_visible_ptr(JCE_PANEL_VERSION_CONTROL)) {
+        snprintf(lbl, sizeof(lbl), "Version Control###version_control");
+        if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_VERSION_CONTROL)))
+            jce_editor_panel_version_control_content();
+        ImGui::End();
+    }
+    if (*jce_editor_panel_visible_ptr(JCE_PANEL_TIME_OF_DAY)) {
+        snprintf(lbl, sizeof(lbl), "Time of Day###time_of_day");
+        if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_TIME_OF_DAY)))
+            jce_editor_panel_time_of_day_content();
+        ImGui::End();
+    }
+    if (*jce_editor_panel_visible_ptr(JCE_PANEL_VCAM_MANAGER)) {
+        snprintf(lbl, sizeof(lbl), "VCam Manager###vcam_manager");
+        if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_VCAM_MANAGER)))
+            jce_editor_panel_vcam_manager_content();
+        ImGui::End();
+    }
+    if (*jce_editor_panel_visible_ptr(JCE_PANEL_REVERB_ZONES)) {
+        snprintf(lbl, sizeof(lbl), "Reverb Zones###reverb_zones");
+        if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_REVERB_ZONES)))
+            jce_editor_panel_reverb_zones_content();
+        ImGui::End();
+    }
+    if (*jce_editor_panel_visible_ptr(JCE_PANEL_SAVE_BROWSER)) {
+        snprintf(lbl, sizeof(lbl), "Save Browser###save_browser");
+        if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_SAVE_BROWSER)))
+            jce_editor_panel_save_browser_content();
+        ImGui::End();
+    }
+
+    /* ── Top-level Toolbar (P0) ───────────────────────────────────── */
+    jce_editor_panel_toolbar();
+    /* ── Bottom Status Bar (P0) ───────────────────────────────────── */
+    jce_editor_panel_status_bar();
 
     /* ── Profiler ─────────────────────────────────────────────────── */
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_PROFILER)) {
@@ -1673,7 +1912,18 @@ void jce_editor_layout_draw(void)
                 && p != JCE_PANEL_TILE_PALETTE
                 && p != JCE_PANEL_VFX_GRAPH
                 && p != JCE_PANEL_TEST_RUNNER
-                && p != JCE_PANEL_BUILD_PROFILES)
+                && p != JCE_PANEL_BUILD_PROFILES
+                && p != JCE_PANEL_MEMORY_PROFILER
+                && p != JCE_PANEL_PHYSICS_DEBUGGER
+                && p != JCE_PANEL_LIGHT_EXPLORER
+                && p != JCE_PANEL_REFLECTION_PROBES
+                && p != JCE_PANEL_SHADER_GRAPH
+                && p != JCE_PANEL_SEARCH
+                && p != JCE_PANEL_VERSION_CONTROL
+                && p != JCE_PANEL_TIME_OF_DAY
+                && p != JCE_PANEL_VCAM_MANAGER
+                && p != JCE_PANEL_REVERB_ZONES
+                && p != JCE_PANEL_SAVE_BROWSER)
                 *jce_editor_panel_visible_ptr((JceEditorPanel)p) = true;
         }
         *jce_editor_panel_visible_ptr(JCE_PANEL_POSTFX)           = false;
@@ -1690,6 +1940,17 @@ void jce_editor_layout_draw(void)
         *jce_editor_panel_visible_ptr(JCE_PANEL_VFX_GRAPH)        = false;
         *jce_editor_panel_visible_ptr(JCE_PANEL_TEST_RUNNER)      = false;
         *jce_editor_panel_visible_ptr(JCE_PANEL_BUILD_PROFILES)   = false;
+        *jce_editor_panel_visible_ptr(JCE_PANEL_MEMORY_PROFILER)  = false;
+        *jce_editor_panel_visible_ptr(JCE_PANEL_PHYSICS_DEBUGGER) = false;
+        *jce_editor_panel_visible_ptr(JCE_PANEL_LIGHT_EXPLORER)   = false;
+        *jce_editor_panel_visible_ptr(JCE_PANEL_REFLECTION_PROBES)= false;
+        *jce_editor_panel_visible_ptr(JCE_PANEL_SHADER_GRAPH)     = false;
+        *jce_editor_panel_visible_ptr(JCE_PANEL_SEARCH)           = false;
+        *jce_editor_panel_visible_ptr(JCE_PANEL_VERSION_CONTROL)  = false;
+        *jce_editor_panel_visible_ptr(JCE_PANEL_TIME_OF_DAY)      = false;
+        *jce_editor_panel_visible_ptr(JCE_PANEL_VCAM_MANAGER)     = false;
+        *jce_editor_panel_visible_ptr(JCE_PANEL_REVERB_ZONES)     = false;
+        *jce_editor_panel_visible_ptr(JCE_PANEL_SAVE_BROWSER)     = false;
 
         /* Animation preset: enable anim/curve panels so they actually dock. */
         if (s_layout_preset_pending == 2) {

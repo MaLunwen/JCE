@@ -48,6 +48,19 @@ typedef enum {
     JCE_PANEL_VFX_GRAPH,
     JCE_PANEL_TEST_RUNNER,
     JCE_PANEL_BUILD_PROFILES,
+    JCE_PANEL_TOOLBAR,
+    JCE_PANEL_STATUS_BAR,
+    JCE_PANEL_MEMORY_PROFILER,
+    JCE_PANEL_PHYSICS_DEBUGGER,
+    JCE_PANEL_LIGHT_EXPLORER,
+    JCE_PANEL_REFLECTION_PROBES,
+    JCE_PANEL_SHADER_GRAPH,
+    JCE_PANEL_SEARCH,
+    JCE_PANEL_VERSION_CONTROL,
+    JCE_PANEL_TIME_OF_DAY,
+    JCE_PANEL_VCAM_MANAGER,
+    JCE_PANEL_REVERB_ZONES,
+    JCE_PANEL_SAVE_BROWSER,
     JCE_PANEL_COUNT
 } JceEditorPanel;
 
@@ -95,6 +108,8 @@ void  jce_editor_panel_tile_palette(void);
 void  jce_editor_panel_vfx_graph(void);
 void  jce_editor_panel_test_runner(void);
 void  jce_editor_panel_build_profiles(void);
+void  jce_editor_panel_toolbar(void);
+void  jce_editor_panel_status_bar(void);
 
 /* Draw panel content only (no Begin/End — for embedding in layout tabs). */
 void  jce_editor_panel_hierarchy_content(void);
@@ -117,6 +132,17 @@ void  jce_editor_panel_vfx_graph_content(void);
 void  jce_editor_panel_test_runner_content(void);
 void  jce_editor_panel_build_profiles_content(void);
 void  jce_editor_panel_profiler_content(void);
+void  jce_editor_panel_memory_profiler_content(void);
+void  jce_editor_panel_physics_debugger_content(void);
+void  jce_editor_panel_light_explorer_content(void);
+void  jce_editor_panel_reflection_probes_content(void);
+void  jce_editor_panel_shader_graph_content(void);
+void  jce_editor_panel_search_content(void);
+void  jce_editor_panel_version_control_content(void);
+void  jce_editor_panel_time_of_day_content(void);
+void  jce_editor_panel_vcam_manager_content(void);
+void  jce_editor_panel_reverb_zones_content(void);
+void  jce_editor_panel_save_browser_content(void);
 
 /* About dialog (modal). */
 void  jce_editor_about_dialog(bool *p_open);
@@ -166,6 +192,12 @@ bool  jce_editor_inspector_delete_dialog_open(void);
 
 /* Inspector delete dialog: call each frame from top-level layout. */
 void  jce_editor_inspector_delete_dialog(void);
+
+/* Returns pointer + size of an entity's component struct for the given flag,
+ * or NULL if the entity doesn't have it. Used by component clipboard,
+ * preset I/O, and multi-edit broadcast. Pointer is owned by the scene. */
+void *jce_inspector_comp_blob(struct JceScene *scene, uint64_t e,
+                              uint64_t flag, size_t *out_size);
 
 /* Preference getters (for scene view / gizmo integration). */
 bool  jce_editor_prefs_show_gizmos(void);

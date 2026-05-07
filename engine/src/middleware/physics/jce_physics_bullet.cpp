@@ -8,12 +8,67 @@
 #include "jce_physics_internal.h"
 #include "os/core/jce_memory.h"
 
+extern "C" {
+#include <jce/os/core/jce_alloc.h>
+}
+
 #include <btBulletDynamicsCommon.h>
 #include <BulletCollision/CollisionDispatch/btGhostObject.h>
 #include <BulletDynamics/Character/btKinematicCharacterController.h>
 #include <BulletDynamics/Vehicle/btRaycastVehicle.h>
 
+#include <cstdint>
 #include <cstring>
+
+/* ================================================================== */
+/* Allocator integration                                               */
+/*                                                                    */
+/* Bullet exposes btAlignedAllocSetCustom* hooks; once installed every */
+/* internal `new` (via BT_DECLARE_ALIGNED_ALLOCATOR) routes through    */
+/* our engine allocator.  Aligned variant over-allocates and stashes  */
+/* the original pointer one slot before the user pointer.             */
+/* ================================================================== */
+
+namespace {
+void *bt_jce_alloc_unaligned(size_t size)
+{
+    return jce_malloc(size);
+}
+
+void  bt_jce_free_unaligned(void *ptr)
+{
+    jce_free(ptr);
+}
+
+void *bt_jce_alloc_aligned(size_t size, int alignment)
+{
+    if (alignment < (int)sizeof(void *)) alignment = (int)sizeof(void *);
+    size_t total = size + alignment + sizeof(void *);
+    void *raw = jce_malloc(total);
+    if (!raw) return nullptr;
+    uintptr_t base = reinterpret_cast<uintptr_t>(raw) + sizeof(void *);
+    uintptr_t aligned = (base + alignment - 1) & ~(uintptr_t)(alignment - 1);
+    void **slot = reinterpret_cast<void **>(aligned) - 1;
+    *slot = raw;
+    return reinterpret_cast<void *>(aligned);
+}
+
+void  bt_jce_free_aligned(void *ptr)
+{
+    if (!ptr) return;
+    void *raw = reinterpret_cast<void **>(ptr)[-1];
+    jce_free(raw);
+}
+
+void install_bullet_allocator_once()
+{
+    static bool installed = false;
+    if (installed) return;
+    btAlignedAllocSetCustom(&bt_jce_alloc_unaligned, &bt_jce_free_unaligned);
+    btAlignedAllocSetCustomAligned(&bt_jce_alloc_aligned, &bt_jce_free_aligned);
+    installed = true;
+}
+} /* namespace */
 
 /* ================================================================== */
 /* Conversion helpers                                                  */
@@ -153,6 +208,8 @@ static void post_tick_callback(btDynamicsWorld *dyn_world, btScalar /*ts*/)
 
 JceBulletWorld *jce_bullet_create(jce_vec3 gravity, uint32_t max_bodies)
 {
+    install_bullet_allocator_once();
+
     auto *bw = static_cast<JceBulletWorld *>(
         JCE_CALLOC(1, sizeof(JceBulletWorld)));
     if (!bw) return nullptr;

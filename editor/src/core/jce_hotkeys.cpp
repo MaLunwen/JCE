@@ -47,6 +47,7 @@ HotkeyEntry s_table[JCE_HK_COUNT] = {
     { "gizmo.none",                "Gizmo / None",                { ImGuiKey_Q, JCE_HKM_NONE }, {} },
     { "gizmo.toggle_space",        "Gizmo / Toggle Local/World",  { ImGuiKey_X, JCE_HKM_NONE }, {} },
     { "gizmo.toggle_snap",         "Gizmo / Toggle Snap",         { ImGuiKey_S, JCE_HKM_NONE }, {} },
+    { "gizmo.toggle_pivot",        "Gizmo / Toggle Pivot/Center", { ImGuiKey_Z, JCE_HKM_NONE }, {} },
 
     /* view */
     { "view.frame_selected",       "View / Frame Selected",       { ImGuiKey_F, JCE_HKM_NONE }, {} },
@@ -68,6 +69,14 @@ HotkeyEntry s_table[JCE_HK_COUNT] = {
     { "ui.find_in_hierarchy",      "UI / Find in Hierarchy",      { ImGuiKey_F, JCE_HKM_CTRL }, {} },
     { "ui.find_in_assets",         "UI / Find in Assets",         { ImGuiKey_F, (uint8_t)(JCE_HKM_CTRL | JCE_HKM_ALT) }, {} },
     { "ui.toggle_fullscreen_view", "UI / Toggle Fullscreen Panel",{ ImGuiKey_F12, JCE_HKM_NONE }, {} },
+
+    /* panel toggles */
+    { "panel.console",             "Panel / Toggle Console",      { ImGuiKey_F4,  JCE_HKM_NONE }, {} },
+    { "panel.profiler",            "Panel / Toggle Profiler",     { ImGuiKey_F7,  JCE_HKM_NONE }, {} },
+    { "panel.hierarchy",           "Panel / Toggle Hierarchy",    { ImGuiKey_F6,  JCE_HKM_NONE }, {} },
+    { "panel.inspector",           "Panel / Toggle Inspector",    { ImGuiKey_F8,  JCE_HKM_NONE }, {} },
+    { "panel.assets",              "Panel / Toggle Assets",       { ImGuiKey_F3,  JCE_HKM_NONE }, {} },
+    { "panel.search",              "Panel / Toggle Search",       { ImGuiKey_F,   (uint8_t)(JCE_HKM_CTRL | JCE_HKM_SHIFT) }, {} },
 };
 /* clang-format on */
 

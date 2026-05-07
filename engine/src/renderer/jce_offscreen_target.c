@@ -169,6 +169,15 @@ uint16_t jce_offscreen_target_get_color_texture(
     return bridge->target_color.idx;
 }
 
+uint16_t jce_offscreen_target_get_depth_texture(
+    const JceOffscreenTarget *bridge)
+{
+    if (!bridge || !BGFX_HANDLE_IS_VALID(bridge->target_fbo))
+        return UINT16_MAX;
+    bgfx_texture_handle_t depth = bgfx_get_texture(bridge->target_fbo, 1);
+    return BGFX_HANDLE_IS_VALID(depth) ? depth.idx : (uint16_t)UINT16_MAX;
+}
+
 uint16_t jce_offscreen_target_get_view_id(const JceOffscreenTarget *bridge)
 {
     if (!bridge)

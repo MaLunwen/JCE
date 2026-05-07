@@ -35,6 +35,12 @@ struct JceVolumetricFog {
     bgfx_uniform_handle_t  u_color;
     bgfx_uniform_handle_t  s_depth;
 
+    /* Composite pass — draws the fog RT into a destination frame
+     * buffer with blend ONE/SRC_ALPHA. */
+    bgfx_program_handle_t  prog_composite;
+    bgfx_uniform_handle_t  s_fog;
+    bool                   composite_ok;
+
     bgfx_vertex_buffer_handle_t vbh;
     bgfx_index_buffer_handle_t  ibh;
 
@@ -147,6 +153,28 @@ JceVolumetricFog *jce_volumetric_fog_create(const JceVolumetricFogDesc *desc)
     f->u_color = bgfx_create_uniform("u_volfog_color", BGFX_UNIFORM_TYPE_VEC4, 1);
     f->s_depth = bgfx_create_uniform("s_depth",        BGFX_UNIFORM_TYPE_SAMPLER, 1);
 
+    /* Composite pass program (vs_volfog reused). Optional — if the
+     * shader binary is missing on this backend the renderer still
+     * renders fog into its private RT and callers can fall back to
+     * jce_scene_renderer_get_fog_result_texture(). */
+    f->prog_composite.idx = UINT16_MAX;
+    f->s_fog.idx          = UINT16_MAX;
+    f->composite_ok       = false;
+    {
+        bgfx_shader_handle_t cvsh = vf_load_shader(desc->pak, "vs_volfog", sfx);
+        bgfx_shader_handle_t cfsh = vf_load_shader(desc->pak, "fs_volfog_composite", sfx);
+        if (cvsh.idx != UINT16_MAX && cfsh.idx != UINT16_MAX) {
+            f->prog_composite = bgfx_create_program(cvsh, cfsh, true);
+            f->s_fog          = bgfx_create_uniform("s_fog",
+                                                    BGFX_UNIFORM_TYPE_SAMPLER, 1);
+            f->composite_ok   = (f->prog_composite.idx != UINT16_MAX);
+        } else {
+            if (cvsh.idx != UINT16_MAX) bgfx_destroy_shader(cvsh);
+            if (cfsh.idx != UINT16_MAX) bgfx_destroy_shader(cfsh);
+            LOG_INFO(LOG_TAG, "composite shader unavailable; render-only");
+        }
+    }
+
     create_target(f);
     return f;
 }
@@ -154,11 +182,13 @@ JceVolumetricFog *jce_volumetric_fog_create(const JceVolumetricFogDesc *desc)
 void jce_volumetric_fog_destroy(JceVolumetricFog *f)
 {
     if (!f) return;
-    if (f->prog.idx     != UINT16_MAX) bgfx_destroy_program(f->prog);
-    if (f->u_p0.idx     != UINT16_MAX) bgfx_destroy_uniform(f->u_p0);
-    if (f->u_p1.idx     != UINT16_MAX) bgfx_destroy_uniform(f->u_p1);
-    if (f->u_color.idx  != UINT16_MAX) bgfx_destroy_uniform(f->u_color);
-    if (f->s_depth.idx  != UINT16_MAX) bgfx_destroy_uniform(f->s_depth);
+    if (f->prog.idx           != UINT16_MAX) bgfx_destroy_program(f->prog);
+    if (f->prog_composite.idx != UINT16_MAX) bgfx_destroy_program(f->prog_composite);
+    if (f->u_p0.idx           != UINT16_MAX) bgfx_destroy_uniform(f->u_p0);
+    if (f->u_p1.idx           != UINT16_MAX) bgfx_destroy_uniform(f->u_p1);
+    if (f->u_color.idx        != UINT16_MAX) bgfx_destroy_uniform(f->u_color);
+    if (f->s_depth.idx        != UINT16_MAX) bgfx_destroy_uniform(f->s_depth);
+    if (f->s_fog.idx          != UINT16_MAX) bgfx_destroy_uniform(f->s_fog);
     if (f->vbh.idx      != UINT16_MAX) bgfx_destroy_vertex_buffer(f->vbh);
     if (f->ibh.idx      != UINT16_MAX) bgfx_destroy_index_buffer(f->ibh);
     if (f->fb.idx       != UINT16_MAX) bgfx_destroy_frame_buffer(f->fb);
@@ -233,4 +263,30 @@ uint16_t jce_volumetric_fog_get_result_texture(const JceVolumetricFog *f)
 {
     if (!f || f->fb.idx == UINT16_MAX) return UINT16_MAX;
     return f->tex.idx;
+}
+
+void jce_volumetric_fog_composite(JceVolumetricFog *f, uint16_t view_id)
+{
+    if (!f || !f->composite_ok)                    return;
+    if (f->prog_composite.idx == UINT16_MAX)       return;
+    if (f->fb.idx == UINT16_MAX)                   return;
+    JCE_PROFILE_ZONE_N("Renderer::VolumetricFog::composite");
+
+    bgfx_touch(view_id);
+
+    bgfx_set_texture(0, f->s_fog, f->tex,
+                     BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
+                     | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT);
+
+    bgfx_set_vertex_buffer(0, f->vbh, 0, 4);
+    bgfx_set_index_buffer(f->ibh, 0, 6);
+
+    /* dst.rgb = dst.rgb * fog.a + fog.rgb
+     * src factor = ONE, dst factor = SRC_ALPHA. */
+    uint64_t state = BGFX_STATE_WRITE_RGB
+                   | BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_ONE,
+                                           BGFX_STATE_BLEND_SRC_ALPHA);
+    bgfx_set_state(state, 0);
+    bgfx_submit(view_id, f->prog_composite, 0, BGFX_DISCARD_ALL);
+    JCE_PROFILE_ZONE_END;
 }

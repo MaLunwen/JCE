@@ -481,7 +481,7 @@ void set_entity_mesh_shape(uint32_t entity_id, int mesh_shape)
 
 uint32_t create_default_scene_entity(const char *name,
                                      uint32_t parent_id,
-                                     uint32_t extra_comp_flag,
+                                     uint64_t extra_comp_flag,
                                      int mesh_shape)
 {
     jce_state_begin_batch_edit();

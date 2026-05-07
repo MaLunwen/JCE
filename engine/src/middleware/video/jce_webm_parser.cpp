@@ -11,6 +11,10 @@
 
 #include "os/core/jce_memory.h"
 
+extern "C" {
+#include <jce/os/core/jce_alloc.h>
+}
+
 #include <mkvparser/mkvparser.h>
 
 #include <cstring>
@@ -225,12 +229,13 @@ JceWebmParser *jce_webm_open_memory(const void *data, size_t size,
         return nullptr;
     }
 
-    JceWebmParser *p = new (std::nothrow) JceWebmParser();
-    if (!p) return nullptr;
+    void *raw = jce_malloc(sizeof(JceWebmParser));
+    if (!raw) return nullptr;
+    JceWebmParser *p = new (raw) JceWebmParser();
 
     p->reader = new (std::nothrow) MemReader(static_cast<const uint8_t *>(data),
                                              (long long)size);
-    if (!p->reader) { delete p; return nullptr; }
+    if (!p->reader) { p->~JceWebmParser(); jce_free(p); return nullptr; }
 
     long long pos = 0;
     mkvparser::EBMLHeader hdr;
@@ -354,5 +359,6 @@ void jce_webm_close(JceWebmParser *p)
     delete p->segment;
     delete p->reader;
     if (p->frame_buf) JCE_FREE(p->frame_buf);
-    delete p;
+    p->~JceWebmParser();
+    jce_free(p);
 }

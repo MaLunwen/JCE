@@ -150,7 +150,7 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
     };
     float gizmo_rot[3];
     if (!jce_editor_get_cached_euler_deg(focused, xform->rotation, gizmo_rot))
-        scene_view_q_to_euler_deg(xform->rotation, gizmo_rot);
+        editor_q_to_euler_deg(xform->rotation, gizmo_rot);
     float gizmo_scale[3] = {
         xform->scale.x, xform->scale.y, xform->scale.z
     };
@@ -298,12 +298,12 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
                     /* Decompose-add-recompose to apply euler delta consistently
                      * with the focused entity's gizmo handle. */
                     float other_rot[3];
-                    scene_view_q_to_euler_deg(other->rotation, other_rot);
+                    editor_q_to_euler_deg(other->rotation, other_rot);
                     other_rot[0] += drot[0];
                     other_rot[1] += drot[1];
                     other_rot[2] += drot[2];
                     normalize_euler_deg(other_rot);
-                    other->rotation = scene_view_q_from_euler_deg(other_rot);
+                    other->rotation = editor_q_from_euler_deg(other_rot);
                 } else if (active_gm == JCE_GIZMO_SCALE) {
                     other->scale.x += dscale[0];
                     other->scale.y += dscale[1];
@@ -320,7 +320,7 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
             xform->position.z = gizmo_pos[2];
 
             normalize_euler_deg(gizmo_rot);
-            xform->rotation = scene_view_q_from_euler_deg(gizmo_rot);
+            xform->rotation = editor_q_from_euler_deg(gizmo_rot);
             jce_editor_set_cached_euler_deg(focused, xform->rotation, gizmo_rot);
 
             xform->scale.x = gizmo_scale[0] < 0.001f ? 0.001f : gizmo_scale[0];

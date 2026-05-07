@@ -150,6 +150,34 @@ uint64_t jce_thread_current_id(void)
     return (uint64_t)SDL_GetCurrentThreadID();
 }
 
+/* ── Thread-local storage ─────────────────────────────────────────── */
+
+struct JceTLS {
+    SDL_TLSID                 id;   /* SDL_AtomicInt; zero-init OK */
+    SDL_TLSDestructorCallback dtor;
+};
+
+JceTLS *jce_tls_create(JceTLSDestructor dtor)
+{
+    JceTLS *tls = (JceTLS *)JCE_MALLOC(sizeof(*tls));
+    if (!tls) return NULL;
+    SDL_memset(&tls->id, 0, sizeof(tls->id));
+    tls->dtor = (SDL_TLSDestructorCallback)dtor;
+    return tls;
+}
+
+void *jce_tls_get(JceTLS *tls)
+{
+    if (!tls) return NULL;
+    return SDL_GetTLS(&tls->id);
+}
+
+void jce_tls_set(JceTLS *tls, void *value)
+{
+    if (!tls) return;
+    SDL_SetTLS(&tls->id, value, tls->dtor);
+}
+
 /* ================================================================== */
 /* Atomics                                                             */
 /*                                                                     */

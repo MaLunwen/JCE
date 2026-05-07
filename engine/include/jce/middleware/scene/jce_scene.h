@@ -190,6 +190,45 @@ typedef struct {
     bool  is_trigger;
 } JceSphereColliderComponent;
 
+/* Capsule along a chosen local axis (0=X, 1=Y, 2=Z). */
+typedef struct {
+    float   center[3];
+    float   radius;
+    float   height;        /* total length including both hemispheres */
+    int     axis;          /* 0=X, 1=Y, 2=Z */
+    bool    is_trigger;
+} JceCapsuleColliderComponent;
+
+typedef struct {
+    char    mesh_path[256];
+    bool    convex;        /* required true if attached to dynamic Rigidbody */
+    bool    is_trigger;
+    float   friction;
+    float   restitution;
+} JceMeshColliderComponent;
+
+/* Combined 2D collider (shape selector keeps bitfield budget tight). */
+enum {
+    JCE_COLLIDER_2D_BOX     = 0,
+    JCE_COLLIDER_2D_CIRCLE  = 1,
+    JCE_COLLIDER_2D_CAPSULE = 2,
+    JCE_COLLIDER_2D_EDGE    = 3,
+    JCE_COLLIDER_2D_POLYGON = 4,
+};
+#define JCE_COLLIDER_2D_MAX_POINTS 32
+typedef struct {
+    int   shape;             /* one of JCE_COLLIDER_2D_* */
+    float offset[2];
+    float size[2];           /* Box/Capsule extents (.x = radius for circle) */
+    float radius;            /* Circle/Capsule radius                        */
+    int   capsule_direction; /* 0 = vertical, 1 = horizontal                 */
+    int   point_count;       /* Edge/Polygon vertex count                    */
+    float points[JCE_COLLIDER_2D_MAX_POINTS][2];
+    bool  is_trigger;
+    float friction;
+    float restitution;
+} JceCollider2DComponent;
+
 /* ── Character controller component ──────────────────────────────── */
 
 typedef struct {
@@ -249,6 +288,8 @@ typedef struct {
      * this holds the source prefab path the variant inherits from. Empty
      * string means "not a variant". */
     char     variant_parent_path[260];
+    /* Unity-style layer index 0..31. References JceProjectTagsAndLayers.layers[]. */
+    int      layer;
 } JceEditorMeta;
 
 /* ── Terrain (Phase 2 scene integration) ─────────────────────────── */
@@ -262,33 +303,500 @@ typedef struct {
     bool  splat_enabled;            /* false -> render layer0 only       */
 } JceTerrainComponent;
 
-/* ── Component type flags (bitmask for enumeration) ──────────────── */
+/* ── LOD Group (per-entity multi-mesh distance switch) ─────────── */
+
+#define JCE_LOD_COMP_MAX_LEVELS 8
+
+typedef struct {
+    /* Optional override mesh per LOD level. Empty string means
+     * "reuse the entity's MeshRenderer mesh" so designers can simply
+     * tweak distances without authoring distinct meshes. */
+    char  level_mesh_paths[JCE_LOD_COMP_MAX_LEVELS][256];
+    /* Switch distance (camera->object) for each LOD; ascending. */
+    float distances[JCE_LOD_COMP_MAX_LEVELS];
+    int   level_count;
+    float hysteresis;          /* fraction (0..1) of distance overlap */
+    bool  cull_when_too_far;   /* hide instead of pinning to last LOD */
+} JceLodGroupComponent;
+
+/* ── Virtual Camera (Cinemachine-style cinematic camera) ───────── */
+
+/* Track mode values (same numeric range as engine's JceVcamTrackMode
+ * defined in jce_virtual_camera.h, but kept as a plain int here so the
+ * scene component header does not depend on that runtime header). */
+enum {
+    JCE_VCAM_COMP_TRACK_NONE        = 0,
+    JCE_VCAM_COMP_TRACK_FOLLOW      = 1,
+    JCE_VCAM_COMP_TRACK_LOOK_AT     = 2,
+    JCE_VCAM_COMP_TRACK_FOLLOW_LOOK = 3,
+};
+
+typedef struct {
+    char     vcam_name[64];
+    int32_t  priority;          /* higher wins when multiple are active */
+    bool     active;
+    int      track_mode;        /* JceVcamTrackMode */
+    float    position[3];       /* used when no follow target */
+    float    look_at[3];        /* used when no look-at target */
+    float    fov_deg;
+    float    follow_offset[3];  /* offset from follow target */
+    float    damping;           /* 0 = snap, 1 = heavy smoothing */
+    uint64_t follow_target;     /* JceEntity supplying follow position  */
+    uint64_t look_at_target;    /* JceEntity supplying look-at position */
+} JceVirtualCameraComponent;
+
+/* ── Trigger Volume (event-emitting overlap region) ────────────── */
 
 typedef enum {
-    JCE_COMP_FLAG_TRANSFORM            = (1 <<  0),
-    JCE_COMP_FLAG_MESH_RENDERER        = (1 <<  1),
-    JCE_COMP_FLAG_CAMERA               = (1 <<  2),
-    JCE_COMP_FLAG_DIR_LIGHT            = (1 <<  3),
-    JCE_COMP_FLAG_POINT_LIGHT          = (1 <<  4),
-    JCE_COMP_FLAG_SPOT_LIGHT           = (1 <<  5),
-    JCE_COMP_FLAG_SKYBOX               = (1 <<  6),
-    JCE_COMP_FLAG_SPRITE_RENDERER      = (1 <<  7),
-    JCE_COMP_FLAG_SPRITE_ANIMATOR      = (1 <<  8),
-    JCE_COMP_FLAG_ANIMATOR             = (1 <<  9),
-    JCE_COMP_FLAG_SKELETAL_ANIMATOR    = (1 << 10),
-    JCE_COMP_FLAG_CONSTRAINT           = (1 << 11),
-    JCE_COMP_FLAG_RIGIDBODY            = (1 << 12),
-    JCE_COMP_FLAG_RIGIDBODY_2D         = (1 << 13),
-    JCE_COMP_FLAG_BOX_COLLIDER         = (1 << 14),
-    JCE_COMP_FLAG_SPHERE_COLLIDER      = (1 << 15),
-    JCE_COMP_FLAG_CHARACTER_CONTROLLER = (1 << 16),
-    JCE_COMP_FLAG_AUDIO_SOURCE         = (1 << 17),
-    JCE_COMP_FLAG_SCRIPT               = (1 << 18),
-    JCE_COMP_FLAG_PARTICLE_EMITTER     = (1 << 19),
-    JCE_COMP_FLAG_BEHAVIOR_TREE        = (1 << 20),
-    JCE_COMP_FLAG_EDITOR_META          = (1 << 21),
-    JCE_COMP_FLAG_TERRAIN              = (1 << 22),
-} JceComponentFlag;
+    JCE_TRIGGER_VOL_AABB   = 0,
+    JCE_TRIGGER_VOL_SPHERE = 1,
+    JCE_TRIGGER_VOL_OBB    = 2,
+} JceTriggerVolumeShape;
+
+typedef struct {
+    int   shape;             /* JceTriggerVolumeShape */
+    float center[3];
+    float half_extents[3];   /* AABB/OBB extents; .x = radius for sphere */
+    float axis_x[3];
+    float axis_y[3];
+    float axis_z[3];
+    bool  enabled;
+    bool  fire_stay;         /* emit STAY event each tick while overlapping */
+    char  tag[64];           /* user label propagated to event payload */
+} JceTriggerVolumeComponent;
+
+/* ── Renderer components (P2-C) ────────────────────────────────── */
+
+/* Trail Renderer (Unity TrailRenderer equivalent). */
+#define JCE_TRAIL_MAX_POINTS 64
+typedef struct {
+    char  material_path[256];
+    float time;                 /* seconds points persist */
+    float min_vertex_distance;  /* drop points closer than this */
+    float width_start;
+    float width_end;
+    float color_start[4];
+    float color_end[4];
+    bool  emitting;
+    bool  autodestruct;
+    /* Runtime sample buffer (also captured for round-trip serialization
+     * so designers can preview and tweak captured trails). */
+    int   point_count;
+    float points[JCE_TRAIL_MAX_POINTS][3];
+} JceTrailRendererComponent;
+
+/* Line Renderer (Unity LineRenderer equivalent). */
+#define JCE_LINE_MAX_POINTS 64
+typedef struct {
+    char  material_path[256];
+    int   position_count;
+    float positions[JCE_LINE_MAX_POINTS][3];
+    float width_start;
+    float width_end;
+    float color_start[4];
+    float color_end[4];
+    bool  use_world_space;
+    bool  loop;
+} JceLineRendererComponent;
+
+/* Reflection Probe (Unity ReflectionProbe equivalent). */
+typedef enum {
+    JCE_REFLECTION_PROBE_BAKED    = 0,
+    JCE_REFLECTION_PROBE_REALTIME = 1,
+    JCE_REFLECTION_PROBE_CUSTOM   = 2,
+} JceReflectionProbeMode;
+
+typedef struct {
+    int   mode;                /* JceReflectionProbeMode */
+    int   resolution;          /* cubemap face px (16/32/64/128/256/512/1024) */
+    float intensity;
+    float blend_distance;
+    float box_size[3];
+    float box_offset[3];
+    float near_clip;
+    float far_clip;
+    char  custom_hdr_path[256]; /* used when mode == CUSTOM */
+    bool  box_projection;
+    bool  hdr;
+} JceReflectionProbeComponent;
+
+/* Decal Projector (Unity URP/HDRP decal). */
+typedef struct {
+    char  material_path[256];
+    float size[3];             /* projector box size (x,y depth) */
+    float pivot[3];
+    float color[4];
+    float opacity;             /* 0..1 multiplier */
+    float draw_distance;
+    float fade_factor;
+    int   layer_mask;
+} JceDecalComponent;
+
+/* Light Probe Group (Unity LightProbeGroup). */
+#define JCE_LIGHT_PROBE_MAX 64
+typedef struct {
+    int   probe_count;
+    float positions[JCE_LIGHT_PROBE_MAX][3];
+    bool  dering;              /* enable ring artifact reduction */
+} JceLightProbeGroupComponent;
+
+/* ── Audio components (Unity equivalents) ────────────────────────── */
+
+/* Audio Listener — exactly one per scene typically (camera-attached). */
+typedef struct {
+    float volume;            /* master volume (0..1) */
+    bool  paused;
+    bool  spatialize;        /* whether listener performs HRTF */
+    float doppler_factor;    /* global doppler scale */
+} JceAudioListenerComponent;
+
+/* Audio Reverb Zone — Unity AudioReverbZone analogue.
+ * Note: this is the Unity-style component-side preset *selector*.
+ * The DSP preset *parameters* (decay/wet/dry/...) live in
+ * jce_reverb_zones.h as JceReverbPreset (struct). */
+typedef enum {
+    JCE_REVERB_ZONE_PRESET_OFF        = 0,
+    JCE_REVERB_ZONE_PRESET_GENERIC    = 1,
+    JCE_REVERB_ZONE_PRESET_PADDED_CELL= 2,
+    JCE_REVERB_ZONE_PRESET_ROOM       = 3,
+    JCE_REVERB_ZONE_PRESET_BATHROOM   = 4,
+    JCE_REVERB_ZONE_PRESET_LIVING_ROOM= 5,
+    JCE_REVERB_ZONE_PRESET_STONE_ROOM = 6,
+    JCE_REVERB_ZONE_PRESET_AUDITORIUM = 7,
+    JCE_REVERB_ZONE_PRESET_CONCERT_HALL=8,
+    JCE_REVERB_ZONE_PRESET_CAVE       = 9,
+    JCE_REVERB_ZONE_PRESET_ARENA      = 10,
+    JCE_REVERB_ZONE_PRESET_HANGAR     = 11,
+    JCE_REVERB_ZONE_PRESET_HALLWAY    = 12,
+    JCE_REVERB_ZONE_PRESET_STONE_CORRIDOR = 13,
+    JCE_REVERB_ZONE_PRESET_ALLEY      = 14,
+    JCE_REVERB_ZONE_PRESET_FOREST     = 15,
+    JCE_REVERB_ZONE_PRESET_CITY       = 16,
+    JCE_REVERB_ZONE_PRESET_MOUNTAINS  = 17,
+    JCE_REVERB_ZONE_PRESET_QUARRY     = 18,
+    JCE_REVERB_ZONE_PRESET_PLAIN      = 19,
+    JCE_REVERB_ZONE_PRESET_PARKINGLOT = 20,
+    JCE_REVERB_ZONE_PRESET_SEWER_PIPE = 21,
+    JCE_REVERB_ZONE_PRESET_UNDERWATER = 22,
+    JCE_REVERB_ZONE_PRESET_USER       = 26,
+} JceReverbZonePreset;
+
+typedef struct {
+    int   preset;            /* JceReverbZonePreset */
+    float min_distance;
+    float max_distance;
+    /* User-preset detail params (used when preset == USER). */
+    float room;              /* dB at mid frequencies (-10000..0) */
+    float room_hf;           /* relative HF level (-10000..0) */
+    float decay_time;        /* seconds (0.1..20) */
+    float decay_hf_ratio;    /* 0.1..2.0 */
+    float reflections;       /* early reflections level (-10000..1000) */
+    float reflections_delay; /* seconds 0..0.3 */
+    float reverb;            /* late reverb level (-10000..2000) */
+    float reverb_delay;      /* seconds 0..0.1 */
+    float hf_reference;      /* Hz (1000..20000) */
+    float diffusion;         /* % (0..100) */
+    float density;           /* % (0..100) */
+} JceAudioReverbZoneComponent;
+
+/* Audio Occlusion probe — used by audio system to attenuate sources
+ * whose line-of-sight to the listener is blocked. */
+typedef struct {
+    float radius;            /* sphere radius the probe affects */
+    float attenuation_db;    /* additional dB attenuation when occluded */
+    float lowpass_cutoff_hz; /* lowpass applied to occluded sources */
+    int   layer_mask;        /* obstruction layer mask */
+    bool  affects_reverb;    /* also dampens reverb send when occluded */
+} JceAudioOcclusionComponent;
+
+/* ── Gameplay components ─────────────────────────────────────────── */
+
+/* Spawn Manager — scene-attached spawn zone configuration. Runtime
+ * binds JceSpawnManager (jce_spawn_manager.h) to an entity carrying
+ * this component to drive distance-based ped/vehicle spawning. */
+typedef struct {
+    int      enabled;
+    int      max_peds;
+    int      max_vehicles;
+    float    min_spawn_radius;
+    float    max_spawn_radius;
+    float    despawn_pad;
+    float    spawn_interval;
+    int      ped_archetype_count;          /* up to 8 archetype ids */
+    int      vehicle_archetype_count;      /* up to 8 archetype ids */
+    uint32_t ped_archetypes[8];
+    uint32_t vehicle_archetypes[8];
+    uint64_t rng_seed;                     /* 0 → default */
+} JceSpawnManagerComponent;
+
+/* Weapon — scene-attached weapon archetype (Unity-style item config).
+ * Runtime instantiates JceWeaponInstance bound to a JceWeaponArchetype
+ * derived from this component. */
+typedef enum {
+    JCE_WEAPON_COMP_HITSCAN    = 0,
+    JCE_WEAPON_COMP_PROJECTILE = 1,
+} JceWeaponCompKind;
+
+typedef struct {
+    char  name[64];
+    int   kind;                /* JceWeaponCompKind */
+    float damage;
+    float range;
+    float rpm;
+    int   clip_size;
+    int   reserve_max;
+    float reload_seconds;
+    float spread_deg;
+    float recoil_per_shot;
+    float recoil_recovery;
+    int   pellets;
+    float projectile_speed;    /* used when kind == PROJECTILE */
+    bool  full_auto;
+} JceWeaponComponent;
+
+/* Save Point — interaction marker that triggers a save snapshot when
+ * the player overlaps it. Multiple save points can share a save_id to
+ * implement checkpoint groups. */
+typedef enum {
+    JCE_SAVE_POINT_MANUAL    = 0,
+    JCE_SAVE_POINT_AUTO      = 1,
+    JCE_SAVE_POINT_CHECKPOINT= 2,
+} JceSavePointKind;
+
+typedef struct {
+    char  save_id[64];          /* logical identifier */
+    char  display_name[128];    /* shown in UI prompt */
+    int   kind;                 /* JceSavePointKind */
+    float radius;               /* trigger radius */
+    int   slot;                 /* save slot index, -1 = current */
+    bool  one_shot;             /* destroy after first use */
+    bool  require_interact;     /* player must press interact key */
+} JceSavePointComponent;
+
+/* ── Wheel Collider (vehicle physics) ──────────────────────────── */
+typedef struct {
+    float radius;
+    float suspension_distance;
+    float suspension_spring;     /* N/m */
+    float suspension_damper;
+    float suspension_target_pos; /* 0..1 along travel */
+    float mass;
+    float forward_friction;
+    float sideways_friction;
+    float center[3];             /* local offset */
+    float motor_torque;          /* current applied N·m */
+    float brake_torque;
+    float steer_angle_deg;
+} JceWheelColliderComponent;
+
+/* ── Constant Force (continuous additive force on rigidbody) ───── */
+typedef struct {
+    float force[3];          /* world-space N */
+    float relative_force[3]; /* local-space N */
+    float torque[3];         /* world-space N·m */
+    float relative_torque[3];/* local-space N·m */
+    bool  enabled;
+} JceConstantForceComponent;
+
+/* ── Configurable Joint (generic 6DOF) ─────────────────────────── */
+enum {
+    JCE_CFG_JOINT_LOCKED = 0,
+    JCE_CFG_JOINT_LIMITED = 1,
+    JCE_CFG_JOINT_FREE = 2,
+};
+typedef struct {
+    uint64_t connected_body;     /* JceEntity, 0 = world */
+    float    anchor[3];
+    float    connected_anchor[3];
+    int      x_motion, y_motion, z_motion;          /* JCE_CFG_JOINT_* */
+    int      x_rotation, y_rotation, z_rotation;
+    float    linear_limit;
+    float    angular_x_limit_deg;
+    float    angular_y_limit_deg;
+    float    angular_z_limit_deg;
+    float    break_force;
+    float    break_torque;
+    bool     enable_collision;
+} JceConfigurableJointComponent;
+
+/* ── 2D Joint (Distance / Hinge / Spring) ──────────────────────── */
+enum {
+    JCE_JOINT_2D_DISTANCE = 0,
+    JCE_JOINT_2D_HINGE    = 1,
+    JCE_JOINT_2D_SPRING   = 2,
+};
+typedef struct {
+    int      kind;                /* JCE_JOINT_2D_* */
+    uint64_t connected_body;      /* JceEntity, 0 = world */
+    float    anchor[2];
+    float    connected_anchor[2];
+    float    distance;            /* Distance/Spring rest length */
+    float    frequency;           /* Spring */
+    float    damping_ratio;       /* Spring */
+    bool     use_motor;           /* Hinge */
+    float    motor_speed_deg_s;   /* Hinge */
+    float    motor_max_torque;    /* Hinge */
+    bool     use_limits;          /* Hinge */
+    float    lower_angle_deg;
+    float    upper_angle_deg;
+    float    break_force;
+    float    break_torque;
+    bool     enable_collision;
+    bool     auto_configure_distance;
+} JceJoint2DComponent;
+
+/* ── Billboard Renderer (always-faces-camera quad) ─────────────── */
+enum {
+    JCE_BILLBOARD_FULL    = 0, /* face camera fully */
+    JCE_BILLBOARD_Y_AXIS  = 1, /* lock Y, rotate around it */
+};
+typedef struct {
+    char  texture_path[256];
+    int   mode;                  /* JCE_BILLBOARD_* */
+    float size[2];
+    float color[4];
+    bool  visible;
+} JceBillboardRendererComponent;
+
+/* ── UI: Canvas (root render target for 2D overlay) ────────────── */
+enum {
+    JCE_CANVAS_OVERLAY     = 0, /* screen-space overlay */
+    JCE_CANVAS_CAMERA      = 1, /* screen-space camera */
+    JCE_CANVAS_WORLD       = 2, /* world-space */
+};
+typedef struct {
+    int   render_mode;       /* JCE_CANVAS_* */
+    int   sort_order;
+    float reference_resolution[2];
+    float scale_factor;      /* world-space only */
+    bool  pixel_perfect;
+} JceCanvasComponent;
+
+/* ── UI: Canvas Group (alpha + interactivity gating) ───────────── */
+typedef struct {
+    float alpha;             /* 0..1 */
+    bool  interactable;
+    bool  blocks_raycasts;
+    bool  ignore_parent_groups;
+} JceCanvasGroupComponent;
+
+/* ── UI: Layout Group (auto-arrange children) ──────────────────── */
+enum {
+    JCE_LAYOUT_HORIZONTAL = 0,
+    JCE_LAYOUT_VERTICAL   = 1,
+    JCE_LAYOUT_GRID       = 2,
+};
+typedef struct {
+    int   layout_kind;        /* JCE_LAYOUT_* */
+    float padding[4];         /* L,R,T,B */
+    float spacing[2];
+    float cell_size[2];       /* grid only */
+    int   child_alignment;    /* 0..8 (Unity TextAnchor) */
+    bool  control_child_size_w;
+    bool  control_child_size_h;
+    bool  reverse_arrangement;
+} JceLayoutGroupComponent;
+
+/* ── UI: Image (textured RectTransform graphic) ────────────────── */
+enum {
+    JCE_UI_IMAGE_SIMPLE   = 0,
+    JCE_UI_IMAGE_SLICED   = 1,
+    JCE_UI_IMAGE_TILED    = 2,
+    JCE_UI_IMAGE_FILLED   = 3,
+};
+typedef struct {
+    char  sprite_path[256];
+    int   image_type;         /* JCE_UI_IMAGE_* */
+    float color[4];
+    float fill_amount;        /* 0..1 (filled only) */
+    bool  preserve_aspect;
+    bool  raycast_target;
+} JceUIImageComponent;
+
+/* ── UI: Text (font-rendered string) ───────────────────────────── */
+enum {
+    JCE_UI_TEXT_ALIGN_LEFT   = 0,
+    JCE_UI_TEXT_ALIGN_CENTER = 1,
+    JCE_UI_TEXT_ALIGN_RIGHT  = 2,
+};
+typedef struct {
+    char  text[512];
+    char  font_path[256];
+    float font_size;
+    int   alignment;          /* JCE_UI_TEXT_ALIGN_* */
+    float color[4];
+    float line_spacing;
+    bool  rich_text;
+    bool  best_fit;
+    int   min_size, max_size; /* best_fit range */
+} JceUITextComponent;
+
+/* ── UI: Button (clickable Image + state colors) ───────────────── */
+typedef struct {
+    bool  interactable;
+    float normal_color[4];
+    float highlighted_color[4];
+    float pressed_color[4];
+    float disabled_color[4];
+    float fade_duration;
+    char  on_click_handler[128]; /* script handler name (placeholder) */
+} JceUIButtonComponent;
+
+/* ── Component type flags (bitmask for enumeration) ──────────────── */
+
+typedef uint64_t JceComponentFlag;
+
+#define JCE_COMP_FLAG_TRANSFORM            (UINT64_C(1) <<  0)
+#define JCE_COMP_FLAG_MESH_RENDERER        (UINT64_C(1) <<  1)
+#define JCE_COMP_FLAG_CAMERA               (UINT64_C(1) <<  2)
+#define JCE_COMP_FLAG_DIR_LIGHT            (UINT64_C(1) <<  3)
+#define JCE_COMP_FLAG_POINT_LIGHT          (UINT64_C(1) <<  4)
+#define JCE_COMP_FLAG_SPOT_LIGHT           (UINT64_C(1) <<  5)
+#define JCE_COMP_FLAG_SKYBOX               (UINT64_C(1) <<  6)
+#define JCE_COMP_FLAG_SPRITE_RENDERER      (UINT64_C(1) <<  7)
+#define JCE_COMP_FLAG_SPRITE_ANIMATOR      (UINT64_C(1) <<  8)
+#define JCE_COMP_FLAG_ANIMATOR             (UINT64_C(1) <<  9)
+#define JCE_COMP_FLAG_SKELETAL_ANIMATOR    (UINT64_C(1) << 10)
+#define JCE_COMP_FLAG_CONSTRAINT           (UINT64_C(1) << 11)
+#define JCE_COMP_FLAG_RIGIDBODY            (UINT64_C(1) << 12)
+#define JCE_COMP_FLAG_RIGIDBODY_2D         (UINT64_C(1) << 13)
+#define JCE_COMP_FLAG_BOX_COLLIDER         (UINT64_C(1) << 14)
+#define JCE_COMP_FLAG_SPHERE_COLLIDER      (UINT64_C(1) << 15)
+#define JCE_COMP_FLAG_CHARACTER_CONTROLLER (UINT64_C(1) << 16)
+#define JCE_COMP_FLAG_AUDIO_SOURCE         (UINT64_C(1) << 17)
+#define JCE_COMP_FLAG_SCRIPT               (UINT64_C(1) << 18)
+#define JCE_COMP_FLAG_PARTICLE_EMITTER     (UINT64_C(1) << 19)
+#define JCE_COMP_FLAG_BEHAVIOR_TREE        (UINT64_C(1) << 20)
+#define JCE_COMP_FLAG_EDITOR_META          (UINT64_C(1) << 21)
+#define JCE_COMP_FLAG_TERRAIN              (UINT64_C(1) << 22)
+#define JCE_COMP_FLAG_LOD_GROUP            (UINT64_C(1) << 23)
+#define JCE_COMP_FLAG_VIRTUAL_CAMERA       (UINT64_C(1) << 24)
+#define JCE_COMP_FLAG_TRIGGER_VOLUME       (UINT64_C(1) << 25)
+#define JCE_COMP_FLAG_CAPSULE_COLLIDER     (UINT64_C(1) << 26)
+#define JCE_COMP_FLAG_MESH_COLLIDER        (UINT64_C(1) << 27)
+#define JCE_COMP_FLAG_COLLIDER_2D          (UINT64_C(1) << 28)
+#define JCE_COMP_FLAG_TRAIL_RENDERER       (UINT64_C(1) << 29)
+#define JCE_COMP_FLAG_LINE_RENDERER        (UINT64_C(1) << 30)
+#define JCE_COMP_FLAG_REFLECTION_PROBE     (UINT64_C(1) << 31)
+#define JCE_COMP_FLAG_DECAL                (UINT64_C(1) << 32)
+#define JCE_COMP_FLAG_LIGHT_PROBE_GROUP    (UINT64_C(1) << 33)
+#define JCE_COMP_FLAG_AUDIO_LISTENER       (UINT64_C(1) << 34)
+#define JCE_COMP_FLAG_AUDIO_REVERB_ZONE    (UINT64_C(1) << 35)
+#define JCE_COMP_FLAG_AUDIO_OCCLUSION      (UINT64_C(1) << 36)
+#define JCE_COMP_FLAG_SPAWN_MANAGER        (UINT64_C(1) << 37)
+#define JCE_COMP_FLAG_WEAPON               (UINT64_C(1) << 38)
+#define JCE_COMP_FLAG_SAVE_POINT           (UINT64_C(1) << 39)
+#define JCE_COMP_FLAG_WHEEL_COLLIDER       (UINT64_C(1) << 40)
+#define JCE_COMP_FLAG_CONSTANT_FORCE       (UINT64_C(1) << 41)
+#define JCE_COMP_FLAG_CONFIGURABLE_JOINT   (UINT64_C(1) << 42)
+#define JCE_COMP_FLAG_JOINT_2D             (UINT64_C(1) << 43)
+#define JCE_COMP_FLAG_BILLBOARD_RENDERER   (UINT64_C(1) << 44)
+#define JCE_COMP_FLAG_CANVAS               (UINT64_C(1) << 45)
+#define JCE_COMP_FLAG_CANVAS_GROUP         (UINT64_C(1) << 46)
+#define JCE_COMP_FLAG_LAYOUT_GROUP         (UINT64_C(1) << 47)
+#define JCE_COMP_FLAG_UI_IMAGE             (UINT64_C(1) << 48)
+#define JCE_COMP_FLAG_UI_TEXT              (UINT64_C(1) << 49)
+#define JCE_COMP_FLAG_UI_BUTTON            (UINT64_C(1) << 50)
 
 /* ── Entity handle ───────────────────────────────────────────────── */
 
@@ -455,8 +963,176 @@ JCE_API JceTerrainComponent          *jce_scene_get_terrain(JceScene *s, JceEnti
 JCE_API bool                          jce_scene_has_terrain(const JceScene *s, JceEntity e);
 JCE_API void                          jce_scene_remove_terrain(JceScene *s, JceEntity e);
 
+/* Component access — LOD Group. */
+JCE_API void                          jce_scene_set_lod_group(JceScene *s, JceEntity e, const JceLodGroupComponent *c);
+JCE_API JceLodGroupComponent         *jce_scene_get_lod_group(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_lod_group(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_lod_group(JceScene *s, JceEntity e);
+
+/* Component access — Virtual Camera. */
+JCE_API void                          jce_scene_set_virtual_camera(JceScene *s, JceEntity e, const JceVirtualCameraComponent *c);
+JCE_API JceVirtualCameraComponent    *jce_scene_get_virtual_camera(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_virtual_camera(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_virtual_camera(JceScene *s, JceEntity e);
+
+/* Component access — Trigger Volume. */
+JCE_API void                          jce_scene_set_trigger_volume(JceScene *s, JceEntity e, const JceTriggerVolumeComponent *c);
+JCE_API JceTriggerVolumeComponent    *jce_scene_get_trigger_volume(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_trigger_volume(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_trigger_volume(JceScene *s, JceEntity e);
+
+/* Component access — Capsule Collider (3D). */
+JCE_API void                          jce_scene_set_capsule_collider(JceScene *s, JceEntity e, const JceCapsuleColliderComponent *c);
+JCE_API JceCapsuleColliderComponent  *jce_scene_get_capsule_collider(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_capsule_collider(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_capsule_collider(JceScene *s, JceEntity e);
+
+/* Component access — Mesh Collider (3D). */
+JCE_API void                          jce_scene_set_mesh_collider(JceScene *s, JceEntity e, const JceMeshColliderComponent *c);
+JCE_API JceMeshColliderComponent     *jce_scene_get_mesh_collider(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_mesh_collider(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_mesh_collider(JceScene *s, JceEntity e);
+
+/* Component access — Collider 2D (combined Box/Circle/Capsule/Edge/Polygon). */
+JCE_API void                          jce_scene_set_collider2d(JceScene *s, JceEntity e, const JceCollider2DComponent *c);
+JCE_API JceCollider2DComponent       *jce_scene_get_collider2d(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_collider2d(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_collider2d(JceScene *s, JceEntity e);
+
+/* Component access — Trail Renderer. */
+JCE_API void                          jce_scene_set_trail_renderer(JceScene *s, JceEntity e, const JceTrailRendererComponent *c);
+JCE_API JceTrailRendererComponent    *jce_scene_get_trail_renderer(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_trail_renderer(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_trail_renderer(JceScene *s, JceEntity e);
+
+/* Component access — Line Renderer. */
+JCE_API void                          jce_scene_set_line_renderer(JceScene *s, JceEntity e, const JceLineRendererComponent *c);
+JCE_API JceLineRendererComponent     *jce_scene_get_line_renderer(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_line_renderer(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_line_renderer(JceScene *s, JceEntity e);
+
+/* Component access — Reflection Probe. */
+JCE_API void                          jce_scene_set_reflection_probe(JceScene *s, JceEntity e, const JceReflectionProbeComponent *c);
+JCE_API JceReflectionProbeComponent  *jce_scene_get_reflection_probe(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_reflection_probe(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_reflection_probe(JceScene *s, JceEntity e);
+
+/* Component access — Decal Projector. */
+JCE_API void                          jce_scene_set_decal(JceScene *s, JceEntity e, const JceDecalComponent *c);
+JCE_API JceDecalComponent            *jce_scene_get_decal(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_decal(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_decal(JceScene *s, JceEntity e);
+
+/* Component access — Light Probe Group. */
+JCE_API void                          jce_scene_set_light_probe_group(JceScene *s, JceEntity e, const JceLightProbeGroupComponent *c);
+JCE_API JceLightProbeGroupComponent  *jce_scene_get_light_probe_group(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_light_probe_group(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_light_probe_group(JceScene *s, JceEntity e);
+
+/* Component access — Audio Listener. */
+JCE_API void                          jce_scene_set_audio_listener(JceScene *s, JceEntity e, const JceAudioListenerComponent *c);
+JCE_API JceAudioListenerComponent    *jce_scene_get_audio_listener(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_audio_listener(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_audio_listener(JceScene *s, JceEntity e);
+
+/* Component access — Audio Reverb Zone. */
+JCE_API void                          jce_scene_set_audio_reverb_zone(JceScene *s, JceEntity e, const JceAudioReverbZoneComponent *c);
+JCE_API JceAudioReverbZoneComponent  *jce_scene_get_audio_reverb_zone(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_audio_reverb_zone(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_audio_reverb_zone(JceScene *s, JceEntity e);
+
+/* Component access — Audio Occlusion. */
+JCE_API void                          jce_scene_set_audio_occlusion(JceScene *s, JceEntity e, const JceAudioOcclusionComponent *c);
+JCE_API JceAudioOcclusionComponent   *jce_scene_get_audio_occlusion(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_audio_occlusion(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_audio_occlusion(JceScene *s, JceEntity e);
+
+/* Component access — Spawn Manager. */
+JCE_API void                          jce_scene_set_spawn_manager(JceScene *s, JceEntity e, const JceSpawnManagerComponent *c);
+JCE_API JceSpawnManagerComponent     *jce_scene_get_spawn_manager(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_spawn_manager(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_spawn_manager(JceScene *s, JceEntity e);
+
+/* Component access — Weapon. */
+JCE_API void                          jce_scene_set_weapon(JceScene *s, JceEntity e, const JceWeaponComponent *c);
+JCE_API JceWeaponComponent           *jce_scene_get_weapon(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_weapon(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_weapon(JceScene *s, JceEntity e);
+
+/* Component access — Save Point. */
+JCE_API void                          jce_scene_set_save_point(JceScene *s, JceEntity e, const JceSavePointComponent *c);
+JCE_API JceSavePointComponent        *jce_scene_get_save_point(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_save_point(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_save_point(JceScene *s, JceEntity e);
+
+/* Component access — Wheel Collider. */
+JCE_API void                          jce_scene_set_wheel_collider(JceScene *s, JceEntity e, const JceWheelColliderComponent *c);
+JCE_API JceWheelColliderComponent    *jce_scene_get_wheel_collider(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_wheel_collider(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_wheel_collider(JceScene *s, JceEntity e);
+
+/* Component access — Constant Force. */
+JCE_API void                          jce_scene_set_constant_force(JceScene *s, JceEntity e, const JceConstantForceComponent *c);
+JCE_API JceConstantForceComponent    *jce_scene_get_constant_force(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_constant_force(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_constant_force(JceScene *s, JceEntity e);
+
+/* Component access — Configurable Joint. */
+JCE_API void                          jce_scene_set_configurable_joint(JceScene *s, JceEntity e, const JceConfigurableJointComponent *c);
+JCE_API JceConfigurableJointComponent*jce_scene_get_configurable_joint(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_configurable_joint(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_configurable_joint(JceScene *s, JceEntity e);
+
+/* Component access — Joint 2D. */
+JCE_API void                          jce_scene_set_joint2d(JceScene *s, JceEntity e, const JceJoint2DComponent *c);
+JCE_API JceJoint2DComponent          *jce_scene_get_joint2d(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_joint2d(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_joint2d(JceScene *s, JceEntity e);
+
+/* Component access — Billboard Renderer. */
+JCE_API void                          jce_scene_set_billboard_renderer(JceScene *s, JceEntity e, const JceBillboardRendererComponent *c);
+JCE_API JceBillboardRendererComponent*jce_scene_get_billboard_renderer(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_billboard_renderer(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_billboard_renderer(JceScene *s, JceEntity e);
+
+/* Component access — UI Canvas. */
+JCE_API void                          jce_scene_set_canvas(JceScene *s, JceEntity e, const JceCanvasComponent *c);
+JCE_API JceCanvasComponent           *jce_scene_get_canvas(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_canvas(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_canvas(JceScene *s, JceEntity e);
+
+/* Component access — UI Canvas Group. */
+JCE_API void                          jce_scene_set_canvas_group(JceScene *s, JceEntity e, const JceCanvasGroupComponent *c);
+JCE_API JceCanvasGroupComponent      *jce_scene_get_canvas_group(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_canvas_group(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_canvas_group(JceScene *s, JceEntity e);
+
+/* Component access — UI Layout Group. */
+JCE_API void                          jce_scene_set_layout_group(JceScene *s, JceEntity e, const JceLayoutGroupComponent *c);
+JCE_API JceLayoutGroupComponent      *jce_scene_get_layout_group(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_layout_group(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_layout_group(JceScene *s, JceEntity e);
+
+/* Component access — UI Image. */
+JCE_API void                          jce_scene_set_ui_image(JceScene *s, JceEntity e, const JceUIImageComponent *c);
+JCE_API JceUIImageComponent          *jce_scene_get_ui_image(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_ui_image(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_ui_image(JceScene *s, JceEntity e);
+
+/* Component access — UI Text. */
+JCE_API void                          jce_scene_set_ui_text(JceScene *s, JceEntity e, const JceUITextComponent *c);
+JCE_API JceUITextComponent           *jce_scene_get_ui_text(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_ui_text(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_ui_text(JceScene *s, JceEntity e);
+
+/* Component access — UI Button. */
+JCE_API void                          jce_scene_set_ui_button(JceScene *s, JceEntity e, const JceUIButtonComponent *c);
+JCE_API JceUIButtonComponent         *jce_scene_get_ui_button(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_ui_button(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_ui_button(JceScene *s, JceEntity e);
+
 /* Component enumeration — returns bitmask of JceComponentFlag. */
-JCE_API uint32_t jce_scene_get_component_flags(const JceScene *s, JceEntity e);
+JCE_API uint64_t jce_scene_get_component_flags(const JceScene *s, JceEntity e);
 
 /* Iteration helpers for the editor. */
 typedef void (*JceEntityCallback)(JceScene *s, JceEntity e, void *user_data);

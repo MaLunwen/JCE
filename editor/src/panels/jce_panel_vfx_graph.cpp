@@ -344,7 +344,7 @@ static void draw_node(Node &n)
         s_g.dirty = true;
     }
     if (ImGui::BeginPopupContextItem("ctx")) {
-        if (ImGui::MenuItem("Delete")) {
+        if (ImGui::MenuItem(jce_editor_i18n("common.delete"))) {
             int id = n.id;
             for (auto it = s_g.links.begin(); it != s_g.links.end();) {
                 if (it->from_node == id || it->to_node == id) it = s_g.links.erase(it); else ++it;

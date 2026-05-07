@@ -138,6 +138,13 @@ struct JceSceneRenderer {
     bool                    tod_active;
     JceTimeOfDayState       tod_state;
 
+    /* Optional editor-supplied ambient override. When active and ToD is
+     * inactive, replaces the renderer's hardcoded ambient before lights
+     * are gathered each frame. */
+    bool                    ambient_override_active;
+    jce_vec3                ambient_override_color;
+    float                   ambient_override_intensity;
+
     /* Shadow map resources. */
     bgfx_texture_handle_t      shadow_tex;
     bgfx_frame_buffer_handle_t shadow_fbo;
@@ -266,6 +273,12 @@ struct JceSceneRenderer {
     JceScene         *frame_scene;
     float             frame_shadow_vp[16];
     bool              frame_shadow_vp_valid;
+
+    /* Volumetric fog (lazily created when first enabled). */
+    JceVolumetricFog *vfog;
+    int               vfog_w;
+    int               vfog_h;
+    bool              vfog_last_rendered;
 };
 
 /* ── Entity collection ────────────────────────────────────────────── */
@@ -1177,7 +1190,13 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
     /* Gather lights. */
     if (sr->light_env) {
         jce_light_env_clear(sr->light_env);
-        jce_light_env_set_ambient(sr->light_env, jce_v3(1, 1, 1), 0.15f);
+        if (sr->ambient_override_active) {
+            jce_light_env_set_ambient(sr->light_env,
+                                       sr->ambient_override_color,
+                                       sr->ambient_override_intensity);
+        } else {
+            jce_light_env_set_ambient(sr->light_env, jce_v3(1, 1, 1), 0.15f);
+        }
 
         bool has_any_light = false;
         for (int i = 0; i < list->count; i++) {
@@ -2039,6 +2058,9 @@ JceSceneRenderConfig jce_scene_render_config_default(void)
     c.postfx           = jce_postfx_default_params();
     c.shadow_map_size  = 0;
     c.csm_cascades     = 0;
+    c.fog_enabled            = false;
+    c.fog                    = jce_volumetric_fog_default_params();
+    c.fog_depth_tex_handle   = UINT16_MAX;
     return c;
 }
 
@@ -2394,6 +2416,7 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
     if (sr->light_env) jce_light_env_destroy(sr->light_env);
     if (sr->ibl_data)  jce_ibl_destroy(sr->ibl_data);
     if (sr->skybox)    jce_skybox_destroy(sr->skybox);
+    if (sr->vfog)      jce_volumetric_fog_destroy(sr->vfog);
 
     if (BGFX_HANDLE_IS_VALID(sr->brdf_lut))         bgfx_destroy_texture(sr->brdf_lut);
     if (BGFX_HANDLE_IS_VALID(sr->u_ibl_irradiance)) bgfx_destroy_uniform(sr->u_ibl_irradiance);
@@ -2539,6 +2562,48 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
        output remains consistent. */
     (void)cfg->apply_postfx;
 
+    /* ── Volumetric fog (Stage 1 wiring) ──────────────────────────────
+     * Renders fog into a private RT.  Composite into the caller's color
+     * RT is a deferred Stage 2 (composite shader pending).  The result
+     * texture handle is exposed via jce_scene_renderer_get_fog_result_texture()
+     * so callers can consume it once the composite pass is in place. */
+    sr->vfog_last_rendered = false;
+    if (cfg->fog_enabled
+        && cfg->fog_depth_tex_handle != UINT16_MAX
+        && cfg->fog_rt_width > 0 && cfg->fog_rt_height > 0
+        && sr->pak)
+    {
+        if (!sr->vfog) {
+            JceVolumetricFogDesc d = { sr->pak, cfg->fog_rt_width, cfg->fog_rt_height };
+            sr->vfog   = jce_volumetric_fog_create(&d);
+            sr->vfog_w = cfg->fog_rt_width;
+            sr->vfog_h = cfg->fog_rt_height;
+        } else if (sr->vfog_w != cfg->fog_rt_width
+                || sr->vfog_h != cfg->fog_rt_height) {
+            jce_volumetric_fog_resize(sr->vfog, cfg->fog_rt_width, cfg->fog_rt_height);
+            sr->vfog_w = cfg->fog_rt_width;
+            sr->vfog_h = cfg->fog_rt_height;
+        }
+        if (sr->vfog) {
+            JceVolumetricFogParams p = cfg->fog;
+            p.near_plane = camera ? jce_camera_get_near(camera) : 0.1f;
+            p.far_plane  = camera ? jce_camera_get_far(camera)  : 200.0f;
+            jce_volumetric_fog_set_params(sr->vfog, &p);
+
+            const jce_mat4 vmat = camera ? jce_camera_view(camera) : jce_m4_identity();
+            const float aspect  = (float)cfg->fog_rt_width / (float)cfg->fog_rt_height;
+            const jce_mat4 pmat = camera
+                ? jce_camera_proj(camera, aspect, sr->homogeneous_depth)
+                : jce_m4_identity();
+
+            jce_volumetric_fog_render(sr->vfog,
+                                      cfg->fog_depth_tex_handle,
+                                      &vmat, &pmat,
+                                      (uint16_t)(view_id_base + 15));
+            sr->vfog_last_rendered = true;
+        }
+    }
+
     JCE_PROFILE_ZONE_END;
     return view_id_base;
 }
@@ -2552,6 +2617,18 @@ const JceCsmData *jce_scene_renderer_get_csm(const JceSceneRenderer *sr)
 JcePostFXPipeline *jce_scene_renderer_get_postfx(JceSceneRenderer *sr)
 {
     return sr ? sr->postfx_pipeline : NULL;
+}
+
+uint16_t jce_scene_renderer_get_fog_result_texture(const JceSceneRenderer *sr)
+{
+    if (!sr || !sr->vfog || !sr->vfog_last_rendered) return UINT16_MAX;
+    return jce_volumetric_fog_get_result_texture(sr->vfog);
+}
+
+void jce_scene_renderer_composite_fog(JceSceneRenderer *sr, uint16_t view_id)
+{
+    if (!sr || !sr->vfog || !sr->vfog_last_rendered) return;
+    jce_volumetric_fog_composite(sr->vfog, view_id);
 }
 
 bool jce_scene_renderer_is_skybox_active(const JceSceneRenderer *sr)
@@ -2670,4 +2747,18 @@ const JceTimeOfDayState *jce_scene_renderer_get_time_of_day(
 {
     if (!sr || !sr->tod_active) return NULL;
     return &sr->tod_state;
+}
+
+void jce_scene_renderer_set_ambient_override(JceSceneRenderer *sr,
+                                              const float       color_rgb[3],
+                                              float             intensity)
+{
+    if (!sr) return;
+    if (color_rgb) {
+        sr->ambient_override_color     = jce_v3(color_rgb[0], color_rgb[1], color_rgb[2]);
+        sr->ambient_override_intensity = intensity;
+        sr->ambient_override_active    = true;
+    } else {
+        sr->ambient_override_active    = false;
+    }
 }

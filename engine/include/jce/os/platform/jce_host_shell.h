@@ -40,6 +40,21 @@ JCE_API bool jce_host_open_in_text_editor(const char *path);
    Returns false if no terminal could be launched. */
 JCE_API bool jce_host_open_terminal(const char *cwd);
 
+/* Run a child process and capture its merged stdout+stderr into a freshly
+   allocated NUL-terminated buffer.  `argv` is a NULL-terminated argument
+   vector (argv[0] is the executable, looked up in PATH).  `cwd` is the
+   working directory for the child (NULL = inherit).
+   On success returns true, sets *out_buf to a buffer the caller must
+   release with jce_free, and writes the byte count to *out_size and the
+   exit code to *out_exit (each pointer is optional / NULL-OK, except
+   out_buf which must be non-NULL).
+   Returns false if the process could not be spawned or the wait failed. */
+JCE_API bool jce_host_run_capture(const char *const *argv,
+                                  const char *cwd,
+                                  char **out_buf,
+                                  size_t *out_size,
+                                  int *out_exit);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_HOST_SHELL_H */

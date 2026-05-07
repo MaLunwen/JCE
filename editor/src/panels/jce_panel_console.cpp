@@ -280,7 +280,7 @@ void jce_editor_panel_console_content(void)
 
     /* Search row */
     ImGui::SetNextItemWidth(-1);
-    ImGui::InputTextWithHint("##search", "Search (substring, case-insensitive)",
+    ImGui::InputTextWithHint("##search", jce_editor_i18n("console.searchHint"),
                               s_ui.search_buf, sizeof(s_ui.search_buf));
 
     ImGui::Separator();

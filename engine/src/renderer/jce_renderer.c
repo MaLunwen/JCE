@@ -27,14 +27,7 @@
 
 #define LOG_TAG "jce_renderer"
 
-#ifdef __APPLE__
-#include <TargetConditionals.h>
-#endif
-
-#ifdef __ANDROID__
-#include <pthread.h>
-#include <semaphore.h>
-
+#if JCE_PLATFORM_ANDROID
 /* ── Android bgfx-frame side thread ─────────────────────────────────────
  * WSA (Windows Subsystem for Android) uses libEGL_emulation.so, whose
  * eglSwapBuffers hangs indefinitely after ~16 frames.  bgfx's render
@@ -49,43 +42,52 @@
  *
  * Trade-off: once the EGL hang occurs, s_egl_hung=true and all further
  * bgfx draw calls are skipped. Rendering freezes but the app lives.
+ *
+ * Threading is done through the engine's portable jce_thread/semaphore
+ * wrappers (SDL3-backed) — no raw pthread/sem_t in engine code.
  */
-static pthread_t     s_frame_pthread;
-static sem_t         s_frame_req;           /* game→side: "call bgfx_frame" */
-static SDL_AtomicInt s_frame_done    = {1}; /* 1=idle, 0=in-progress         */
-static SDL_AtomicInt s_egl_hung      = {0}; /* 1=eglSwapBuffers hung          */
-static SDL_AtomicInt s_frame_kick_ms = {0}; /* SDL_GetTicks() at last kick    */
-static SDL_AtomicInt s_frame_thread_live = {0};
+static JceThread    *s_frame_thread       = NULL;
+static JceSemaphore *s_frame_req          = NULL; /* game→side: "call bgfx_frame" */
+static SDL_AtomicInt s_frame_done         = {1}; /* 1=idle, 0=in-progress         */
+static SDL_AtomicInt s_egl_hung           = {0}; /* 1=eglSwapBuffers hung          */
+static SDL_AtomicInt s_frame_kick_ms      = {0}; /* SDL_GetTicks() at last kick    */
+static SDL_AtomicInt s_frame_thread_live  = {0};
 
 #define ANDROID_EGL_HANG_TIMEOUT_MS 2000    /* 2 s without done → hung        */
 
-static void *android_bgfx_frame_thread(void *arg)
+static void android_bgfx_frame_thread(void *arg)
 {
     (void)arg;
     while (SDL_GetAtomicInt(&s_frame_thread_live)) {
-        sem_wait(&s_frame_req);
+        jce_semaphore_wait(s_frame_req);
         if (!SDL_GetAtomicInt(&s_frame_thread_live)) break;
         bgfx_frame(false); /* may block forever in eglSwapBuffers on WSA */
         SDL_SetAtomicInt(&s_frame_done, 1);
     }
-    return NULL;
 }
 
 static void android_frame_thread_start(void)
 {
-    sem_init(&s_frame_req, 0, 0);
+    s_frame_req = jce_semaphore_create(0);
     SDL_SetAtomicInt(&s_frame_thread_live, 1);
     SDL_SetAtomicInt(&s_frame_done, 1);
     SDL_SetAtomicInt(&s_egl_hung, 0);
-    pthread_create(&s_frame_pthread, NULL, android_bgfx_frame_thread, NULL);
+    s_frame_thread = jce_thread_create(android_bgfx_frame_thread, NULL,
+                                       "jce-bgfx-frame");
 }
 
 static void android_frame_thread_stop(void)
 {
     SDL_SetAtomicInt(&s_frame_thread_live, 0);
-    sem_post(&s_frame_req);  /* wake thread so it can exit cleanly */
-    pthread_join(s_frame_pthread, NULL);
-    sem_destroy(&s_frame_req);
+    if (s_frame_req) jce_semaphore_signal(s_frame_req);  /* wake thread to exit */
+    if (s_frame_thread) {
+        jce_thread_join(s_frame_thread);
+        s_frame_thread = NULL;
+    }
+    if (s_frame_req) {
+        jce_semaphore_destroy(s_frame_req);
+        s_frame_req = NULL;
+    }
 }
 
 /* Called instead of bgfx_frame(false) from jce_renderer_end_frame.
@@ -100,7 +102,7 @@ static void android_end_frame(void)
         /* Previous frame completed — kick a new one. */
         SDL_SetAtomicInt(&s_frame_kick_ms, (int)(SDL_GetTicks() & 0x7fffffff));
         SDL_SetAtomicInt(&s_frame_done, 0);
-        sem_post(&s_frame_req);
+        jce_semaphore_signal(s_frame_req);
     } else {
         /* Still in-progress: check for hang. */
         uint32_t now_ms  = (uint32_t)SDL_GetTicks();
@@ -119,14 +121,15 @@ bool jce_renderer_is_egl_hung(void)
 {
     return SDL_GetAtomicInt(&s_egl_hung) != 0;
 }
-#endif /* __ANDROID__ */
-#ifdef _WIN32
-#include <windows.h>
+#endif /* JCE_PLATFORM_ANDROID */
+#if JCE_PLATFORM_WINDOWS
+/* Windows backend probe uses SDL_LoadObject for vulkan/d3d DLL presence —
+ * keeps <windows.h> out of engine sources. */
 #else
 #include <dlfcn.h>
 #include <setjmp.h>
 #include <signal.h>
-#ifdef __ANDROID__
+#if JCE_PLATFORM_ANDROID
 #include <sys/system_properties.h>
 #endif
 #endif
@@ -165,13 +168,13 @@ static bool s_dbg_text_enabled = false;
  * probe is caught here (main thread, clean stack) and the fallback  *
  * loop can safely continue to the next backend.                     *
  * ─────────────────────────────────────────────────────────────────*/
-#ifdef _WIN32
+#if JCE_PLATFORM_WINDOWS
 
 static bool s_win32_probe_dll(const char *dll)
 {
-    HMODULE h = LoadLibraryA(dll);
+    SDL_SharedObject *h = SDL_LoadObject(dll);
     if (!h) return false;
-    FreeLibrary(h);
+    SDL_UnloadObject(h);
     return true;
 }
 
@@ -201,7 +204,7 @@ static void s_probe_sigsegv(int sig, siginfo_t *info, void *ctx)
 
 static bool s_probe_vulkan(void)
 {
-#ifdef __ANDROID__
+#if JCE_PLATFORM_ANDROID
     /* Houdini ARM64→x86_64 translation layer (WSA and some Intel Android
      * devices) initialises libvulkan.so successfully but crashes inside
      * bgfx's render thread at RendererContextVK::init with SEGV_MAPERR
@@ -225,7 +228,7 @@ static bool s_probe_vulkan(void)
      * If the library is absent or the call crashes (e.g. WSA/Houdini on
      * Android), we catch the signal here and return false so the fallback
      * chain can continue to the next backend (OpenGL ES, OpenGL, …). */
-#ifdef __APPLE__
+#if JCE_PLATFORM_APPLE
     void *lib = dlopen("libMoltenVK.dylib",      RTLD_NOW | RTLD_LOCAL);
     if (!lib) lib = dlopen("libvulkan.1.dylib",  RTLD_NOW | RTLD_LOCAL);
     if (!lib) lib = dlopen("@rpath/libvulkan.1.dylib", RTLD_NOW | RTLD_LOCAL);
@@ -275,7 +278,7 @@ static bool backend_probe(bgfx_renderer_type_t type)
     return true;
 }
 
-#endif /* _WIN32 / POSIX */
+#endif /* JCE_PLATFORM_WINDOWS / POSIX */
 
 static void jce_bgfx_fatal(bgfx_callback_interface_t *_this, const char *_filePath, uint16_t _line,
                            bgfx_fatal_t _code, const char *_str)
@@ -535,7 +538,7 @@ JceRenderer *jce_renderer_create(JceWindow *win,
      * iOS does NOT have this problem — UIKit's run-loop allows bgfx's render
      * thread to initialise Metal without deadlocking, so we leave bgfx in its
      * default multi-threaded mode on iOS. */
-#if defined(__APPLE__) && TARGET_OS_OSX
+#if JCE_PLATFORM_MACOS
     bgfx_render_frame(-1);
 #endif
 

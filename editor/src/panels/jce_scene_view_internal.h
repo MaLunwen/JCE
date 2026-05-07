@@ -35,22 +35,9 @@ extern "C" {
 #define JCE_MESH_SHAPE_CYLINDER 4
 #endif
 
-/* ── Quat ↔ Euler degrees (local helpers) ─────────────────────────── */
+/* ── Quat ↔ Euler degrees (shared editor helper) ──────────────────── */
 
-static inline void scene_view_q_to_euler_deg(jce_quat q, float out[3])
-{
-    jce_vec3 e = jce_q_to_euler(q);
-    out[0] = e.x * JCE_RAD2DEG;
-    out[1] = e.y * JCE_RAD2DEG;
-    out[2] = e.z * JCE_RAD2DEG;
-}
-
-static inline jce_quat scene_view_q_from_euler_deg(const float in[3])
-{
-    return jce_q_from_euler(in[0] * JCE_DEG2RAD,
-                            in[1] * JCE_DEG2RAD,
-                            in[2] * JCE_DEG2RAD);
-}
+#include "core/jce_editor_quat.h"
 
 /* ── Shared viewport context ─────────────────────────────────────── */
 
@@ -111,7 +98,7 @@ void set_entity_mesh_shape(uint32_t entity_id, int mesh_shape);
  * pass a single JCE_COMP_FLAG_* value. */
 uint32_t create_default_scene_entity(const char *name,
                                      uint32_t parent_id,
-                                     uint32_t extra_comp_flag,
+                                     uint64_t extra_comp_flag,
                                      int mesh_shape);
 
 /* ── Functions from jce_scene_view_cube.cpp ───────────────────────── */

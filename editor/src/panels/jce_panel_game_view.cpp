@@ -16,6 +16,7 @@ extern "C" {
 #include <jce/renderer/jce_camera.h>
 #include <jce/renderer/jce_renderer.h>
 #include <jce/runtime/jce_game_module.h>
+#include <jce/middleware/scene/jce_vcam_system.h>
 }
 
 #include <jce/tools/jce_imgui.hpp>
@@ -153,7 +154,7 @@ void jce_editor_panel_game_view_content(void)
             ImGui::SameLine();
             if (ImGui::SmallButton("...##pickExe")) {
                 jce_host_dialog_pick_file(
-                    "Select Game Executable", nullptr,
+                    jce_editor_i18n("gameView.selectGameExe"), nullptr,
 #if JCE_PLATFORM_WINDOWS
                     "Executables (*.exe);;All Files (*.*)",
 #else
@@ -183,9 +184,10 @@ void jce_editor_panel_game_view_content(void)
             if (ImGui::IsItemHovered()) {
                 JceEditorConfig c;
                 jce_editor_config_load(&c);
-                ImGui::SetTooltip("Game executable:\n%s",
+                ImGui::SetTooltip("%s\n%s",
+                                  jce_editor_i18n("gameView.gameExePath"),
                                   c.game_executable_path[0] ? c.game_executable_path
-                                                            : "(not set)");
+                                                            : jce_editor_i18n("gameView.notSet"));
             }
             if (rs.last_error[0]) {
                 ImGui::SameLine();
@@ -196,9 +198,9 @@ void jce_editor_panel_game_view_content(void)
             if (ImGui::SmallButton("[]")) jce_run_manager_request_stop();
             ImGui::SameLine();
             if (rs.state == JCE_RUN_STOPPING)
-                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Stopping external game");
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "%s", jce_editor_i18n("gameView.stoppingExternal"));
             else
-                ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "External game running");
+                ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "%s", jce_editor_i18n("gameView.externalRunning"));
         }
     } else {
         JcePlayState ps = jce_state_get_play_state();
@@ -215,9 +217,9 @@ void jce_editor_panel_game_view_content(void)
             }
             ImGui::SameLine();
             if (ps == JCE_PLAY_PLAYING)
-                ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), ">> Playing");
+                ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "%s", jce_editor_i18n("gameView.playing"));
             else
-                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "|| Paused");
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "%s", jce_editor_i18n("gameView.paused"));
         }
     }
 
@@ -433,6 +435,28 @@ void jce_editor_panel_game_view_content(void)
                 jce_vec3 eye = jce_v3(px, py + 1.6f, pz);
                 jce_camera_set_position(cam, eye);
             }
+        }
+
+        /* Cinemachine-style VCam override: if any active VCam exists in
+         * the scene, it wins over both player-snap and free-fly. Active
+         * only in Play mode so designers can keep editing freely. */
+        if (play_active) {
+            JceScene *scene = jce_state_get_scene();
+            if (scene) {
+                JceVcamOutput vout;
+                bool has_vcam = false;
+                jce_vcam_system_evaluate(scene, dt, &vout, &has_vcam);
+                if (has_vcam) {
+                    jce_camera_set_position(cam,
+                        jce_v3(vout.position[0], vout.position[1], vout.position[2]));
+                    jce_camera_look_at(cam,
+                        jce_v3(vout.target[0], vout.target[1], vout.target[2]));
+                    jce_camera_set_fov(cam, vout.fov_deg);
+                }
+            }
+        } else {
+            /* Reset damping when not playing so the next Play snaps. */
+            jce_vcam_system_reset();
         }
     }
 
