@@ -165,15 +165,33 @@ void jce_editor_panel_toolbar(void)
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_TOOLBAR);
     if (!*vis) return;
 
-    char title[128];
-    std::snprintf(title, sizeof(title), "%s###Toolbar",
-                  jce_editor_i18n("Toolbar"));
+    /* Pin the toolbar to the very top of the main viewport (Unity-style)
+       so layout presets never spawn it as a floating window. It stays
+       above the menu bar's WorkPos area; the host DockSpace below shrinks
+       automatically because we draw before the host window. */
+    const ImGuiViewport *vp = ImGui::GetMainViewport();
+    const float bar_h = ImGui::GetFrameHeight() + ImGui::GetStyle().WindowPadding.y * 2.0f;
 
-    ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse |
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x, vp->WorkPos.y));
+    ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x, bar_h));
+    ImGui::SetNextWindowViewport(vp->ID);
+
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar |
+                             ImGuiWindowFlags_NoResize |
+                             ImGuiWindowFlags_NoMove |
+                             ImGuiWindowFlags_NoCollapse |
                              ImGuiWindowFlags_NoScrollbar |
-                             ImGuiWindowFlags_NoScrollWithMouse;
-    if (ImGui::Begin(title, vis, flags)) {
+                             ImGuiWindowFlags_NoScrollWithMouse |
+                             ImGuiWindowFlags_NoSavedSettings |
+                             ImGuiWindowFlags_NoBringToFrontOnFocus |
+                             ImGuiWindowFlags_NoNavFocus |
+                             ImGuiWindowFlags_NoDocking;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    if (ImGui::Begin("##jce_top_toolbar", nullptr, flags)) {
         draw_toolbar_content();
     }
     ImGui::End();
+    ImGui::PopStyleVar(2);
 }

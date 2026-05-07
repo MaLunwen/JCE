@@ -1514,6 +1514,64 @@ const char *jce_comp_flag_display_name(uint64_t comp_flag)
     }
 }
 
+const char *jce_comp_flag_i18n_key(uint64_t comp_flag)
+{
+    switch (comp_flag) {
+    case JCE_COMP_FLAG_TRANSFORM:            return "comp.transform";
+    case JCE_COMP_FLAG_MESH_RENDERER:        return "comp.meshRenderer";
+    case JCE_COMP_FLAG_CAMERA:               return "comp.camera";
+    case JCE_COMP_FLAG_DIR_LIGHT:            return "comp.dirLight";
+    case JCE_COMP_FLAG_POINT_LIGHT:          return "comp.pointLight";
+    case JCE_COMP_FLAG_SPOT_LIGHT:           return "comp.spotLight";
+    case JCE_COMP_FLAG_SKYBOX:               return "comp.skybox";
+    case JCE_COMP_FLAG_SPRITE_RENDERER:      return "comp.spriteRenderer";
+    case JCE_COMP_FLAG_SPRITE_ANIMATOR:      return "comp.spriteAnimator";
+    case JCE_COMP_FLAG_ANIMATOR:             return "comp.animator";
+    case JCE_COMP_FLAG_SKELETAL_ANIMATOR:    return "comp.skeletalAnimator";
+    case JCE_COMP_FLAG_CONSTRAINT:           return "comp.constraint";
+    case JCE_COMP_FLAG_RIGIDBODY:            return "comp.rigidbody";
+    case JCE_COMP_FLAG_RIGIDBODY_2D:         return "comp.rigidbody2d";
+    case JCE_COMP_FLAG_BOX_COLLIDER:         return "comp.boxCollider";
+    case JCE_COMP_FLAG_SPHERE_COLLIDER:      return "comp.sphereCollider";
+    case JCE_COMP_FLAG_CHARACTER_CONTROLLER: return "comp.characterController";
+    case JCE_COMP_FLAG_AUDIO_SOURCE:         return "comp.audioSource";
+    case JCE_COMP_FLAG_SCRIPT:               return "comp.script";
+    case JCE_COMP_FLAG_PARTICLE_EMITTER:     return "comp.particleEmitter";
+    case JCE_COMP_FLAG_BEHAVIOR_TREE:        return "comp.behaviorTree";
+    case JCE_COMP_FLAG_EDITOR_META:          return "comp.editorMeta";
+    case JCE_COMP_FLAG_TERRAIN:              return "comp.terrain";
+    case JCE_COMP_FLAG_LOD_GROUP:            return "comp.lodGroup";
+    case JCE_COMP_FLAG_VIRTUAL_CAMERA:       return "comp.virtualCamera";
+    case JCE_COMP_FLAG_TRIGGER_VOLUME:       return "comp.triggerVolume";
+    case JCE_COMP_FLAG_CAPSULE_COLLIDER:     return "comp.capsuleCollider";
+    case JCE_COMP_FLAG_MESH_COLLIDER:        return "comp.meshCollider";
+    case JCE_COMP_FLAG_COLLIDER_2D:          return "comp.collider2d";
+    case JCE_COMP_FLAG_TRAIL_RENDERER:       return "comp.lineRenderer"; /* fallback */
+    case JCE_COMP_FLAG_LINE_RENDERER:        return "comp.lineRenderer";
+    case JCE_COMP_FLAG_REFLECTION_PROBE:     return "comp.reflectionProbe";
+    case JCE_COMP_FLAG_DECAL:                return "comp.decal";
+    case JCE_COMP_FLAG_LIGHT_PROBE_GROUP:    return "comp.lightProbeGroup";
+    case JCE_COMP_FLAG_AUDIO_LISTENER:       return "comp.audioListener";
+    case JCE_COMP_FLAG_AUDIO_REVERB_ZONE:    return "comp.audioReverbZone";
+    case JCE_COMP_FLAG_AUDIO_OCCLUSION:      return "comp.audioOcclusion";
+    case JCE_COMP_FLAG_SPAWN_MANAGER:        return "comp.spawnManager";
+    case JCE_COMP_FLAG_WEAPON:               return "comp.weapon";
+    case JCE_COMP_FLAG_SAVE_POINT:           return "comp.savePoint";
+    case JCE_COMP_FLAG_WHEEL_COLLIDER:       return "comp.wheelCollider";
+    case JCE_COMP_FLAG_CONSTANT_FORCE:       return "comp.constantForce";
+    case JCE_COMP_FLAG_CONFIGURABLE_JOINT:   return "comp.configurableJoint";
+    case JCE_COMP_FLAG_JOINT_2D:             return "comp.joint2d";
+    case JCE_COMP_FLAG_BILLBOARD_RENDERER:   return "comp.billboardRenderer";
+    case JCE_COMP_FLAG_CANVAS:               return "comp.canvas";
+    case JCE_COMP_FLAG_CANVAS_GROUP:         return "comp.canvasGroup";
+    case JCE_COMP_FLAG_LAYOUT_GROUP:         return "comp.layoutGroup";
+    case JCE_COMP_FLAG_UI_IMAGE:             return "comp.uiImage";
+    case JCE_COMP_FLAG_UI_TEXT:              return "comp.uiText";
+    case JCE_COMP_FLAG_UI_BUTTON:            return "comp.uiButton";
+    default:                                 return NULL;
+    }
+}
+
 /* ── Mode Accessors ──────────────────────────────────────────────── */
 
 void          jce_state_set_edit_mode(JceEditMode m)       { s.edit_mode = m; }

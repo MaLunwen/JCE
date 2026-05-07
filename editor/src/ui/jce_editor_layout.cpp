@@ -1848,8 +1848,10 @@ void jce_editor_layout_draw(void)
     }
 
     /* Bottom status bar — must be created before host window so it
-       reduces viewport->WorkSize and the DockSpace adapts. */
-    draw_status_bar();
+       reduces viewport->WorkSize and the DockSpace adapts. Respect the
+       Window > Status Bar visibility toggle. */
+    if (*jce_editor_panel_visible_ptr(JCE_PANEL_STATUS_BAR))
+        draw_status_bar();
 
     /* Full-viewport host window for the menu bar + DockSpace. */
     const ImGuiViewport *viewport = ImGui::GetMainViewport();

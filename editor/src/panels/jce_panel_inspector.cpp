@@ -2795,10 +2795,48 @@ void jce_editor_panel_inspector_content(void)
         char _lbl[256];
         snprintf(_lbl, sizeof(_lbl), "%s###tag", jce_editor_i18n("inspector.tag"));
 
-        /* Tag picker — combo from project tags + "Untagged" + "Add Tag..." */
-        const char *current = (s_insp.tag_buf[0] != '\0') ? s_insp.tag_buf : jce_editor_i18n("inspector.tagAdd.untagged");
-        if (ImGui::BeginCombo(_lbl, current)) {
-            if (ImGui::Selectable(jce_editor_i18n("inspector.tagAdd.untagged"), s_insp.tag_buf[0] == '\0')) {
+        /* Tag field — InputText so users can type a new tag inline (Enter
+           commits and registers it in project settings). A small "▾"
+           button next to the field opens a dropdown of existing tags. */
+        const float arrow_w = ImGui::GetFrameHeight();
+        const float spacing = ImGui::GetStyle().ItemInnerSpacing.x;
+        const float label_w = ImGui::CalcTextSize(jce_editor_i18n("inspector.tag")).x;
+        const float field_w = ImGui::GetContentRegionAvail().x - arrow_w - spacing - label_w - spacing;
+        ImGui::PushItemWidth(field_w > 80.0f ? field_w : 80.0f);
+        bool tag_commit = ImGui::InputTextWithHint(
+            "##tagInput",
+            jce_editor_i18n_or("inspector.tagAdd.untagged", "Untagged"),
+            s_insp.tag_buf, sizeof(s_insp.tag_buf),
+            ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::PopItemWidth();
+        if (tag_commit) {
+            /* Register the typed tag if it's new. */
+            if (s_insp.tag_buf[0] != '\0' && ps) {
+                bool exists = false;
+                for (int i = 0; i < ps->tags_layers.tag_count && i < JCE_PS_MAX_TAGS; i++) {
+                    if (strcmp(ps->tags_layers.tags[i], s_insp.tag_buf) == 0) {
+                        exists = true; break;
+                    }
+                }
+                if (!exists && ps->tags_layers.tag_count < JCE_PS_MAX_TAGS) {
+                    JceProjectSettings *pm = (JceProjectSettings *)ps;
+                    snprintf(pm->tags_layers.tags[pm->tags_layers.tag_count],
+                             JCE_PS_NAME_LEN, "%s", s_insp.tag_buf);
+                    pm->tags_layers.tag_count++;
+                    jce_project_settings_save(pm);
+                }
+            }
+            jce_state_set_entity_tag(focused, s_insp.tag_buf);
+        }
+        ImGui::SameLine(0.0f, spacing);
+        if (ImGui::ArrowButton("##tagPick", ImGuiDir_Down))
+            ImGui::OpenPopup("##tagDropdown");
+        ImGui::SameLine(0.0f, spacing);
+        ImGui::TextUnformatted(jce_editor_i18n("inspector.tag"));
+
+        if (ImGui::BeginPopup("##tagDropdown")) {
+            if (ImGui::Selectable(jce_editor_i18n("inspector.tagAdd.untagged"),
+                                   s_insp.tag_buf[0] == '\0')) {
                 s_insp.tag_buf[0] = '\0';
                 jce_state_set_entity_tag(focused, s_insp.tag_buf);
             }
@@ -2812,33 +2850,6 @@ void jce_editor_panel_inspector_content(void)
                         jce_state_set_entity_tag(focused, s_insp.tag_buf);
                     }
                 }
-            }
-            ImGui::Separator();
-            if (ImGui::Selectable(jce_editor_i18n_id("inspector.tagAdd.addTag", "tagAdd")))
-                ImGui::OpenPopup("##addTagPopup");
-            ImGui::EndCombo();
-        }
-        if (ImGui::BeginPopup("##addTagPopup")) {
-            static char new_tag[64] = {0};
-            ImGui::TextUnformatted(jce_editor_i18n("inspector.tagAdd.newTagName"));
-            ImGui::SetNextItemWidth(220);
-            bool commit = ImGui::InputText("##newTagName", new_tag, sizeof(new_tag),
-                                            ImGuiInputTextFlags_EnterReturnsTrue);
-            ImGui::SameLine();
-            if (ImGui::Button(jce_editor_i18n("common.add")) || commit) {
-                if (new_tag[0] != '\0' && ps) {
-                    JceProjectSettings *pm = (JceProjectSettings *)ps;
-                    if (pm->tags_layers.tag_count < JCE_PS_MAX_TAGS) {
-                        snprintf(pm->tags_layers.tags[pm->tags_layers.tag_count],
-                                 JCE_PS_NAME_LEN, "%s", new_tag);
-                        pm->tags_layers.tag_count++;
-                        jce_project_settings_save(pm);
-                    }
-                    snprintf(s_insp.tag_buf, sizeof(s_insp.tag_buf), "%s", new_tag);
-                    jce_state_set_entity_tag(focused, s_insp.tag_buf);
-                    new_tag[0] = '\0';
-                }
-                ImGui::CloseCurrentPopup();
             }
             ImGui::EndPopup();
         }
@@ -2854,16 +2865,19 @@ void jce_editor_panel_inspector_content(void)
         const char *cur_layer_name = "Default";
         if (ps && ps->tags_layers.layers[cur_layer][0] != '\0')
             cur_layer_name = ps->tags_layers.layers[cur_layer];
-        char preview[96];
-        snprintf(preview, sizeof(preview), "%d: %s", cur_layer, cur_layer_name);
-        if (ImGui::BeginCombo(layer_label, preview)) {
+        if (ImGui::BeginCombo(layer_label, cur_layer_name)) {
+            /* Show only NAMED layers (Unity convention). Slot 0 falls
+               back to "Default" even when its name field is empty;
+               unnamed user slots are hidden — manage them in
+               Project Settings → Tags & Layers. */
             for (int i = 0; i < 32; i++) {
-                const char *nm = (ps && ps->tags_layers.layers[i][0] != '\0')
-                                    ? ps->tags_layers.layers[i]
-                                    : (i == 0 ? "Default" : "(unnamed)");
-                char row[128];
-                snprintf(row, sizeof(row), "%d: %s", i, nm);
-                if (ImGui::Selectable(row, i == cur_layer))
+                const char *nm = NULL;
+                if (ps && ps->tags_layers.layers[i][0] != '\0')
+                    nm = ps->tags_layers.layers[i];
+                else if (i == 0)
+                    nm = "Default";
+                if (!nm) continue;
+                if (ImGui::Selectable(nm, i == cur_layer))
                     jce_state_set_entity_layer(focused, i);
             }
             ImGui::EndCombo();
@@ -2928,8 +2942,16 @@ void jce_editor_panel_inspector_content(void)
     /* ── Add Component button ─────────────────────────────────────── */
     ImGui::Spacing();
     float btn_w = ImGui::GetContentRegionAvail().x;
-    if (ImGui::Button(jce_editor_i18n("inspector.addComponent"), ImVec2(btn_w, 0)))
+    if (ImGui::Button(jce_editor_i18n("inspector.addComponent"), ImVec2(btn_w, 0))) {
         ImGui::OpenPopup("AddComponentPopup");
+    }
+
+    /* Force a sensible default size on the popup's first appearing frame.
+       Without this the popup auto-sizes to its (initially zero) content
+       width, so the BeginChild list inside collapses to a few pixels and
+       the items become invisible — only the *second* open recovers
+       because ImGui then reuses the stored window size. */
+    ImGui::SetNextWindowSize(ImVec2(280.0f, 260.0f), ImGuiCond_Appearing);
 
     if (ImGui::BeginPopup("AddComponentPopup")) {
         static char s_addcomp_filter[64] = {0};
@@ -2957,18 +2979,38 @@ void jce_editor_panel_inspector_content(void)
             const char *cname = jce_comp_flag_display_name(opt.flag);
             if (!cname) continue;
             if (s_addcomp_filter[0]) {
-                bool match = false;
-                const char *h = cname, *n = s_addcomp_filter;
-                for (; *h; ++h) {
-                    const char *a = h, *b = n;
-                    while (*a && *b && ((*a | 32) == (*b | 32))) { ++a; ++b; }
-                    if (!*b) { match = true; break; }
+                /* Match against the EN display name AND every loaded
+                   locale's translation of the component's i18n key, so
+                   users can search in any language present in the
+                   editor's locale tables — not just the active one. */
+                auto substr_ci = [](const char *hay, const char *needle) -> bool {
+                    if (!hay || !needle || !*needle) return false;
+                    for (const char *h = hay; *h; ++h) {
+                        const char *a = h, *b = needle;
+                        while (*a && *b && ((*a | 32) == (*b | 32))) { ++a; ++b; }
+                        if (!*b) return true;
+                    }
+                    return false;
+                };
+                bool match = substr_ci(cname, s_addcomp_filter);
+                if (!match) {
+                    const char *i18n_key = jce_comp_flag_i18n_key(opt.flag);
+                    if (i18n_key) {
+                        int n_loc = jce_editor_i18n_locale_count();
+                        for (int li = 0; li < n_loc && !match; ++li) {
+                            const char *loc_name = jce_editor_i18n_lookup_locale(
+                                (JceLocale)li, i18n_key);
+                            if (substr_ci(loc_name, s_addcomp_filter)) match = true;
+                        }
+                    }
                 }
                 if (!match) continue;
             }
             if (first_match < 0) first_match = i;
-            if (ImGui::MenuItem(cname))
+            if (ImGui::MenuItem(cname)) {
                 jce_state_add_component(focused, opt.flag);
+                ImGui::CloseCurrentPopup();
+            }
         }
         ImGui::EndChild();
 

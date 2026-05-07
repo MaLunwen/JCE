@@ -45,6 +45,17 @@ const char *jce_editor_i18n(const char *key);
    in code (e.g. reflection field labels). */
 const char *jce_editor_i18n_or(const char *key, const char *fallback);
 
+/* Look up a translated string in a SPECIFIC locale (not the active one).
+   Used for cross-locale searches such as the Inspector "Add Component"
+   filter that should match queries typed in any installed language.
+   Returns NULL when the key is not registered in that locale.
+   The returned pointer is valid for the lifetime of the i18n system. */
+const char *jce_editor_i18n_lookup_locale(JceLocale locale, const char *key);
+
+/* Number of supported locales (fixed compile-time count). Useful for
+   loops that walk every locale, e.g. multi-language search. */
+int jce_editor_i18n_locale_count(void);
+
 /* Look up a translated string and append "##id_suffix" for ImGui IDs.
    Returns a pointer into a thread-local rotating buffer pool
    (16 slots * 192 bytes), safe across many SameLine() calls per frame.
