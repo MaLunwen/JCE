@@ -763,12 +763,10 @@ static void ck_app_draw(CkApp *app)
     int fc = ++s_draw_frame_count;
     LOG_INFO("ck_draw", "frame=%d start", fc);
 
-#ifdef __ANDROID__
     if (jce_renderer_is_egl_hung()) {
         LOG_INFO("ck_draw", "frame=%d skipped (egl hung)", fc);
         return;
     }
-#endif
 
     if (jce_settings_is_open(app->engine_settings) || app->paused) {
         if (app->ui)

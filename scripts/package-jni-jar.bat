@@ -266,7 +266,7 @@ python "%REPO_ROOT%\scripts\sync_macos.py" --fetch-shaders >nul 2>&1
 if not errorlevel 1 (
     echo   Metal shaders fetched.
 ) else (
-    echo   WARNING: Metal shader fetch skipped (Mac offline or paramiko not installed).
+    echo   WARNING: Metal shader fetch skipped ^(Mac offline or paramiko not installed^).
     echo   Copy *_mtl.bin shaders to engine\resources\assets\shaders\ for macOS Metal support.
 )
 

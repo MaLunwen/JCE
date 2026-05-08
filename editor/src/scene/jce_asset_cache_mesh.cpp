@@ -3,7 +3,7 @@
  */
 
 #include "jce_asset_cache_internal.h"
-#include "../ui/jce_editor_panels.h"
+#include "ui/jce_editor_panels.h"
 
 /* ── Mesh request priority ──────────────────────────────────────── */
 

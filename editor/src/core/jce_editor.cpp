@@ -213,8 +213,16 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
 {
     if (s_editor.initialized) return true;
 
-    /* Create ImGui context. */
+    /* Create ImGui context.
+     * Route ImGui's IM_ALLOC/IM_FREE through the editor allocator (mimalloc-
+     * backed, Tracy-tracked) BEFORE CreateContext so the context itself and
+     * every subsequent ImGui allocation (including FontDataOwnedByAtlas
+     * buffers freed by ImGui) flow through ED_MALLOC/ED_FREE. */
     IMGUI_CHECKVERSION();
+    ImGui::SetAllocatorFunctions(
+        [](size_t sz, void * /*ud*/) -> void * { return ED_MALLOC(sz); },
+        [](void *p, void * /*ud*/) { ED_FREE(p); },
+        nullptr);
     ImGui::CreateContext();
 
     ImGuiIO &io = ImGui::GetIO();

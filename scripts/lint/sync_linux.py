@@ -7,12 +7,13 @@ import posixpath
 sys.path.insert(0, os.path.dirname(__file__))
 from ssh_helper import SSHSession
 
-HOST = "192.168.10.10"
+HOST = "192.168.10.9"
 USER = "lunwen"
 PASSWORD = "1014"
 REMOTE_ROOT = "/home/lunwen/Code/JCE"
-LOCAL_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOCAL_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Individual source files that have changed and need pushing
 SYNC_FILES = [
     "scripts/lib/jce_beep.sh",
     "scripts/lib/jce_common.sh",
@@ -38,6 +39,7 @@ SYNC_FILES = [
     "engine/src/middleware/ui/jce_game_hud.c",
     "engine/src/middleware/ui/jce_ui_rmlui.cpp",
     "engine/src/middleware/scene/jce_scene_components_json.c",
+    "engine/src/middleware/scene/jce_scene.c",
     "editor/src/io/jce_editor_file_util.h",
     "editor/src/core/jce_editor_play.cpp",
     "editor/src/io/jce_editor_scene_serial.cpp",
@@ -45,7 +47,16 @@ SYNC_FILES = [
     "editor/src/core/jce_editor_state.cpp",
     "editor/src/core/jce_hotkeys.h",
     "editor/src/panels/jce_panel_assets_grid.cpp",
-    "caged_kingdom/src/game/ck_engine_smoke.c",
+    "caged_kingdom/src/game/ck_app.c",
+]
+
+# Entire local directories to mirror recursively to the remote
+SYNC_DIRS = [
+    "engine/include",
+    "engine/src",
+    "editor/src",
+    "caged_kingdom/src",
+    "caged_kingdom/include",
 ]
 
 
@@ -65,7 +76,20 @@ def _mkdir_p(sftp, remote_dir):
 
 def sync_files(session: SSHSession):
     print("=== Syncing files to Linux remote ===")
+    TEXT_EXTS = {".sh", ".py", ".c", ".cpp", ".h", ".cmake", ".txt", ".md", ""}
+
+    def _upload(sftp, local_path, remote_path):
+        ext = os.path.splitext(local_path)[1].lower()
+        if ext in TEXT_EXTS or not ext:
+            with open(local_path, "rb") as f:
+                data = f.read().replace(b"\r\n", b"\n")
+            import io
+            sftp.putfo(io.BytesIO(data), remote_path)
+        else:
+            sftp.put(local_path, remote_path)
+
     with session._client.open_sftp() as sftp:
+        # Individual files
         for rel_path in SYNC_FILES:
             local = os.path.join(LOCAL_ROOT, rel_path.replace("/", os.sep))
             remote = posixpath.join(REMOTE_ROOT, rel_path)
@@ -73,8 +97,28 @@ def sync_files(session: SSHSession):
                 print(f"  SKIP (not found): {rel_path}")
                 continue
             _mkdir_p(sftp, posixpath.dirname(remote))
-            sftp.put(local, remote)
+            _upload(sftp, local, remote)
             print(f"  UP: {rel_path}")
+
+        # Entire directories (recursive mirror)
+        for rel_dir in SYNC_DIRS:
+            local_dir = os.path.join(LOCAL_ROOT, rel_dir.replace("/", os.sep))
+            remote_dir = posixpath.join(REMOTE_ROOT, rel_dir)
+            print(f"  DIR: {rel_dir}/")
+            count = 0
+            for dirpath, _dirs, files in os.walk(local_dir):
+                rel_from_root = os.path.relpath(dirpath, LOCAL_ROOT)
+                remote_subdir = posixpath.join(
+                    REMOTE_ROOT,
+                    rel_from_root.replace(os.sep, "/")
+                )
+                _mkdir_p(sftp, remote_subdir)
+                for fname in files:
+                    lfile = os.path.join(dirpath, fname)
+                    rfile = posixpath.join(remote_subdir, fname)
+                    _upload(sftp, lfile, rfile)
+                    count += 1
+            print(f"       {count} files uploaded")
 
     session.run(
         f"find {REMOTE_ROOT}/scripts -name '*.sh' | xargs chmod +x 2>/dev/null; echo done"

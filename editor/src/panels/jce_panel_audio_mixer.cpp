@@ -52,11 +52,11 @@ static void mixer_save(void)
     uint32_t      n        = jce_audio_mixer_list_buses(s_mixer, ids, 256);
 
     size_t cap = 64 + n * 160;
-    char  *buf = (char *)std::malloc(cap);
+    char  *buf = (char *)ED_MALLOC(cap);
     if (!buf) return;
     size_t off = 0;
     int w = std::snprintf(buf + off, cap - off, "{\n  \"buses\": [\n");
-    if (w < 0) { std::free(buf); return; }
+    if (w < 0) { ED_FREE(buf); return; }
     off += (size_t)w;
     for (uint32_t i = 0; i < n; ++i) {
         JceAudioBusId id     = ids[i];
@@ -71,14 +71,14 @@ static void mixer_save(void)
             jce_audio_mixer_is_muted(s_mixer, id) ? 1 : 0,
             jce_audio_mixer_is_solo(s_mixer, id)  ? 1 : 0,
             (i + 1 < n) ? "," : "");
-        if (w < 0 || (size_t)w >= cap - off) { std::free(buf); return; }
+        if (w < 0 || (size_t)w >= cap - off) { ED_FREE(buf); return; }
         off += (size_t)w;
     }
     w = std::snprintf(buf + off, cap - off, "  ]\n}\n");
-    if (w < 0) { std::free(buf); return; }
+    if (w < 0) { ED_FREE(buf); return; }
     off += (size_t)w;
     ed_write_file(MIXER_PATH, buf, off);
-    std::free(buf);
+    ED_FREE(buf);
 }
 
 static void mixer_seed_default(void)

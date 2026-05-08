@@ -177,8 +177,9 @@ extern "C" void jce_editor_panel_build_profiles_content(void)
 extern "C" void jce_editor_panel_build_profiles(void)
 {
     if (!*jce_editor_panel_visible_ptr(JCE_PANEL_BUILD_PROFILES)) return;
-    if (ImGui::Begin(jce_editor_i18n("buildProfiles.title"),
-                     jce_editor_panel_visible_ptr(JCE_PANEL_BUILD_PROFILES))) {
+    char _wt[128];
+    snprintf(_wt, sizeof(_wt), "%s###build_profiles", jce_editor_i18n("buildProfiles.title"));
+    if (ImGui::Begin(_wt, jce_editor_panel_visible_ptr(JCE_PANEL_BUILD_PROFILES))) {
         jce_editor_panel_build_profiles_content();
     }
     ImGui::End();

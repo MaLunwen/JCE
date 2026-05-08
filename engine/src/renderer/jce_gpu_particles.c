@@ -40,6 +40,10 @@ struct JceGpuParticleSystem {
     uint32_t  max_particles;        /* rounded to multiple of 64 */
     uint32_t  emit_cursor;          /* round-robin probe base */
 
+    /* Allocator stashed at create() so destroy() can free with the
+     * matching free function (paired-allocator invariant). */
+    jce_allocator_t alloc;
+
     /* Pool buffer (compute UAV + instance VBO). */
     bgfx_dynamic_vertex_buffer_handle_t pool;
 
@@ -134,6 +138,7 @@ JceGpuParticleSystem *jce_gpu_particles_create(
         sizeof(JceGpuParticleSystem), alloc.ctx);
     if (!sys) return NULL;
     memset(sys, 0, sizeof(*sys));
+    sys->alloc = alloc;
 
     /* Round capacity up to the compute thread-group size. */
     uint32_t cap = desc->max_particles;
@@ -259,11 +264,8 @@ void jce_gpu_particles_destroy(JceGpuParticleSystem *sys)
         bgfx_destroy_uniform(sys->u_color_start);
         bgfx_destroy_uniform(sys->u_color_end);
     }
-    /* Caller's allocator is unknown at destroy time — fall back to
-     * the global libc free; create() used the caller allocator but
-     * we stash nothing else.  This mirrors the lifecycle convention
-     * already used by jce_particles_destroy. */
-    free(sys);
+    /* Free with the same allocator the caller passed to create(). */
+    sys->alloc.free(sys, sys->alloc.ctx);
 }
 
 bool jce_gpu_particles_is_supported(const JceGpuParticleSystem *sys)

@@ -22,7 +22,7 @@ set_target_properties(JCE_Editor PROPERTIES
 	CXX_EXTENSIONS NO)
 
 target_link_libraries(JCE_Editor PRIVATE
-	JCE imgui::imgui
+	JCE jce_tools_imgui
 	cjson::cjson SDL3_image::SDL3_image bgfx::bgfx)
 
 target_include_directories(JCE_Editor PRIVATE

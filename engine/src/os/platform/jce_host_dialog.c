@@ -17,6 +17,7 @@
 #include <jce/os/platform/jce_host_dialog.h>
 
 #include "jce_window_internal.h"
+#include "os/core/jce_memory.h"
 
 #include <SDL3/SDL_atomic.h>
 #include <SDL3/SDL_dialog.h>
@@ -59,11 +60,11 @@ static void s_free_ctx(TrampolineCtx *ctx)
     if (!ctx) return;
     if (ctx->filter_storage) {
         for (int i = 0; i < ctx->storage_count; ++i)
-            free(ctx->filter_storage[i]);
-        free(ctx->filter_storage);
+            JCE_FREE(ctx->filter_storage[i]);
+        JCE_FREE(ctx->filter_storage);
     }
-    free(ctx->filters);
-    free(ctx);
+    JCE_FREE(ctx->filters);
+    JCE_FREE(ctx);
 }
 
 static void s_dialog_cb(void *userdata, const char * const *filelist, int filter)
@@ -113,13 +114,13 @@ static SDL_DialogFileFilter *s_parse_filters(const char *raw,
     }
 
     SDL_DialogFileFilter *arr =
-        (SDL_DialogFileFilter *)calloc((size_t)max_groups,
-                                       sizeof(SDL_DialogFileFilter));
+        (SDL_DialogFileFilter *)JCE_CALLOC((size_t)max_groups,
+                                           sizeof(SDL_DialogFileFilter));
     if (!arr) return NULL;
 
     /* Each group needs up to 2 heap strings (name + pattern), so 2*max. */
-    char **storage = (char **)calloc((size_t)max_groups * 2, sizeof(char *));
-    if (!storage) { free(arr); return NULL; }
+    char **storage = (char **)JCE_CALLOC((size_t)max_groups * 2, sizeof(char *));
+    if (!storage) { JCE_FREE(arr); return NULL; }
     int storage_n = 0;
 
     int  count = 0;
@@ -146,7 +147,7 @@ static SDL_DialogFileFilter *s_parse_filters(const char *raw,
             patterns_end   = paren_close;
         }
 
-        char *name = (char *)malloc(name_len + 1);
+        char *name = (char *)JCE_MALLOC(name_len + 1);
         if (!name) goto fail;
         memcpy(name, p, name_len);
         name[name_len] = '\0';
@@ -155,7 +156,7 @@ static SDL_DialogFileFilter *s_parse_filters(const char *raw,
         /* Build extension list: "*.scn *.json" -> "scn;json", "*.*" -> "*". */
         size_t pat_cap = 32;
         size_t pat_len = 0;
-        char  *pat = (char *)malloc(pat_cap);
+        char  *pat = (char *)JCE_MALLOC(pat_cap);
         if (!pat) goto fail;
         pat[0] = '\0';
 
@@ -180,8 +181,8 @@ static SDL_DialogFileFilter *s_parse_filters(const char *raw,
             size_t need = pat_len + (pat_len ? 1u : 0u) + elen + 1;
             if (need > pat_cap) {
                 while (need > pat_cap) pat_cap *= 2;
-                char *grown = (char *)realloc(pat, pat_cap);
-                if (!grown) { free(pat); goto fail; }
+                char *grown = (char *)JCE_REALLOC(pat, pat_cap);
+                if (!grown) { JCE_FREE(pat); goto fail; }
                 pat = grown;
             }
             if (pat_len) pat[pat_len++] = ';';
@@ -193,8 +194,8 @@ static SDL_DialogFileFilter *s_parse_filters(const char *raw,
 
         if (pat_len == 0) {
             /* No usable patterns: accept everything. */
-            free(pat);
-            pat = (char *)malloc(2);
+            JCE_FREE(pat);
+            pat = (char *)JCE_MALLOC(2);
             if (!pat) goto fail;
             pat[0] = '*';
             pat[1] = '\0';
@@ -214,16 +215,16 @@ static SDL_DialogFileFilter *s_parse_filters(const char *raw,
     return arr;
 
 fail:
-    for (int i = 0; i < storage_n; ++i) free(storage[i]);
-    free(storage);
-    free(arr);
+    for (int i = 0; i < storage_n; ++i) JCE_FREE(storage[i]);
+    JCE_FREE(storage);
+    JCE_FREE(arr);
     return NULL;
 }
 
 static TrampolineCtx *s_make_ctx(JceDialogPathCallback cb, void *user,
                                  const char *filters)
 {
-    TrampolineCtx *ctx = (TrampolineCtx *)calloc(1, sizeof(TrampolineCtx));
+    TrampolineCtx *ctx = (TrampolineCtx *)JCE_CALLOC(1, sizeof(TrampolineCtx));
     if (!ctx) return NULL;
     ctx->cb   = cb;
     ctx->user = user;

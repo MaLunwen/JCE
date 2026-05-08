@@ -16,7 +16,7 @@
 #include <jce/renderer/jce_occlusion_culler.h>
 #include <jce/renderer/jce_postfx.h>
 #include <jce/renderer/jce_texture_types.h>
-#include <jce/renderer/jce_time_of_day.h>
+#include <jce/middleware/world/jce_time_of_day.h>
 #include <jce/renderer/jce_volumetric_fog.h>
 
 #include <stdbool.h>

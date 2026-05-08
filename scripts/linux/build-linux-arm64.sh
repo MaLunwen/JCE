@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # ================================================================
 # build-linux-arm64.sh -- Build JCE for Linux aarch64
-# Usage: build-linux-arm64.sh [--clean]
+# Usage: build-linux-arm64.sh [--clean] [--dist]
 # Output:
 #   Game exe : build/desktop/linux-arm64/release/caged_kingdom
+#              build/desktop/linux-arm64/dist/caged_kingdom    (with --dist)
 #   JNI lib  : build/jni/natives/linux-aarch64/libjce.so
 #
 # System dependencies (Ubuntu/Debian):
@@ -21,13 +22,26 @@ JNI_BUILD_DIR="build/jni/linux-arm64"
 JNI_CLASSIFIER="linux-aarch64"
 TOOLCHAIN="$CONAN_DIR/build/Release/generators/conan_toolchain.cmake"
 HOST_PAK="build/host/tools/jce_pak"
+VARIANT="release"
 
-# -- Handle --clean flag --
-if [[ "${1:-}" == "--clean" ]]; then
-    echo "=== Cleaning build directories ==="
-    rm -rf "$BUILD_DIR" "$CONAN_DIR" "$JNI_BUILD_DIR"
-    echo "  Done"
-fi
+# -- Parse arguments --
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --clean)
+            echo "=== Cleaning build directories ==="
+            rm -rf "$BUILD_DIR" "$CONAN_DIR" "$JNI_BUILD_DIR"
+            echo "  Done"
+            ;;
+        --dist)
+            VARIANT="dist"
+            ;;
+        *)
+            echo "Unknown argument: $1"
+            exit 1
+            ;;
+    esac
+    shift
+done
 
 # -- Step 1: Ensure host jce_pak exists --
 echo "=== Step 1: Resolve host jce_pak ==="
@@ -85,6 +99,7 @@ CMAKE_ARGS="-S . -B $BUILD_DIR -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE=$TOOLCHAIN \
     -DCMAKE_BUILD_TYPE=Release \
     -DJCE_PAK_EXECUTABLE=$HOST_PAK \
+    -DJCE_BUILD_VARIANT=$VARIANT \
     -DJCE_ENABLE_CPPCHECK=OFF"
 if [[ -n "$HOST_SHADERC" ]]; then
     CMAKE_ARGS="$CMAKE_ARGS -DJCE_SHADERC_EXECUTABLE=$HOST_SHADERC"
@@ -92,20 +107,20 @@ fi
 cmake $CMAKE_ARGS
 
 # -- Step 5: Build (Ninja handles incremental) --
-echo "=== Step 5: Build (linux-arm64) ==="
+echo "=== Step 5: Build (linux-arm64, $VARIANT) ==="
 cmake --build "$BUILD_DIR"
 
-if [[ ! -f "$BUILD_DIR/release/caged_kingdom" ]]; then
-    echo "ERROR: caged_kingdom not found after build"
+if [[ ! -f "$BUILD_DIR/$VARIANT/caged_kingdom" ]]; then
+    echo "ERROR: caged_kingdom not found after build: $BUILD_DIR/$VARIANT/caged_kingdom"
     exit 1
 fi
 
-(aarch64-linux-gnu-strip --strip-unneeded "$BUILD_DIR/release/caged_kingdom" 2>/dev/null \
-    || strip --strip-unneeded "$BUILD_DIR/release/caged_kingdom" 2>/dev/null \
+(aarch64-linux-gnu-strip --strip-unneeded "$BUILD_DIR/$VARIANT/caged_kingdom" 2>/dev/null \
+    || strip --strip-unneeded "$BUILD_DIR/$VARIANT/caged_kingdom" 2>/dev/null \
     || true)
 
 echo ""
-echo "[SUCCESS] Linux ARM64 build complete: $BUILD_DIR/release/caged_kingdom"
+echo "[SUCCESS] Linux ARM64 build complete ($VARIANT): $BUILD_DIR/$VARIANT/caged_kingdom"
 
 # -- Step 6: Build JNI shared library and stage for fat JAR --
 echo ""

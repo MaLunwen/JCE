@@ -7,6 +7,7 @@
 #include "jce_editor_style.h"
 
 #include "jce_editor_colors.h"
+#include "core/jce_editor_alloc.h"
 #include <jce/ui/jce_imgui_renderer.h>
 
 #include <jce/tools/jce_imgui.hpp>
@@ -280,9 +281,9 @@ static void *read_font_file(const char *path, size_t *out_size)
         if (raw) jce_free(raw);
         return NULL;
     }
-    /* ImGui calls free() on FontDataOwnedByAtlas, so copy into a malloc
-       buffer rather than handing out the engine-allocated block. */
-    void *buf = malloc((size_t)n);
+    /* ImGui frees FontDataOwnedByAtlas via IM_FREE, which is wired to
+     * ED_FREE in jce_editor_init() — so allocate via ED_MALLOC here. */
+    void *buf = ED_MALLOC((size_t)n);
     if (!buf) { jce_free(raw); return NULL; }
     memcpy(buf, raw, (size_t)n);
     jce_free(raw);
@@ -430,7 +431,7 @@ static ImFont *load_font_with_fallback(
             }
             LOG_WARN(LOG_TAG, "%s font load failed for %s",
                      role, fs_path);
-            free(buf);
+            ED_FREE(buf);
         } else {
             LOG_WARN(LOG_TAG, "%s font: cannot read %s", role, fs_path);
         }

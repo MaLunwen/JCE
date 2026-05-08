@@ -3,9 +3,13 @@
 !.gitattributes
 
 engine/src/middleware/audio/third_party
-engine/src/middleware/video/third_party/libhevc
-engine/src/middleware/video/third_party/openh264
 !engine/src/middleware/video/third_party/minimp4.h
+
+engine/src/middleware/video/third_party/libhevc/*
+!engine/src/middleware/video/third_party/libhevc/jce_build
+engine/src/middleware/video/third_party/openh264/*
+!engine/src/middleware/video/third_party/openh264/jce_build
+
 
 _*
 

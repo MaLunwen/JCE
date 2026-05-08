@@ -20,6 +20,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <limits.h>
 
 #include <algorithm>
 #include <cmath>
@@ -894,10 +895,10 @@ static void draw_comp_skeletal_animator(JceSkeletalAnimatorComponent *skel)
         }
     }
 
-    snprintf(lbl, sizeof(lbl), "%s###skel", jce_editor_i18n("timeline.speed"));
+    snprintf(lbl, sizeof(lbl), "%s###skelSpeed", jce_editor_i18n("timeline.speed"));
     ImGui::DragFloat(lbl, &skel->speed, 0.01f, 0.01f, 10.0f);
     insp_track_edit();
-    snprintf(lbl, sizeof(lbl), "%s###skel", jce_editor_i18n("timeline.loop"));
+    snprintf(lbl, sizeof(lbl), "%s###skelLoop", jce_editor_i18n("timeline.loop"));
     if (ImGui::Checkbox(lbl, &skel->loop))
         insp_undo_bool(&skel->loop);
 
@@ -937,7 +938,7 @@ static void draw_comp_skeletal_animator(JceSkeletalAnimatorComponent *skel)
         }
     }
 
-    snprintf(lbl, sizeof(lbl), "%s###skel",
+    snprintf(lbl, sizeof(lbl), "%s###skelPlay",
              skel->playing ? jce_editor_i18n("toolbar.stop")
                            : jce_editor_i18n("toolbar.play"));
     if (ImGui::Button(lbl))
@@ -3045,7 +3046,7 @@ void jce_editor_panel_inspector(void)
     if (!*vis) return;
 
     char title[256];
-    snprintf(title, sizeof(title), "%s###Inspector", jce_editor_i18n("Inspector"));
+    snprintf(title, sizeof(title), "%s###inspector", jce_editor_i18n("Inspector"));
     if (ImGui::Begin(title, vis))
         jce_editor_panel_inspector_content();
     ImGui::End();

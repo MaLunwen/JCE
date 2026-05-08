@@ -539,9 +539,9 @@ static bool sr_build_entity_model(JceSceneRenderer *sr, JceScene *scene,
                         }
                         if (total_v > 0 && total_i > 0) {
                             JceTerrainVertex *tv = (JceTerrainVertex *)
-                                malloc(sizeof(JceTerrainVertex) * (size_t)total_v);
+                                JCE_MALLOC(sizeof(JceTerrainVertex) * (size_t)total_v);
                             uint32_t *tiidx = (uint32_t *)
-                                malloc(sizeof(uint32_t) * (size_t)total_i);
+                                JCE_MALLOC(sizeof(uint32_t) * (size_t)total_i);
                             int v_off = 0, i_off = 0;
                             for (int cz = 0; cz < ncz; cz++)
                             for (int cx = 0; cx < ncx; cx++) {
@@ -567,7 +567,7 @@ static bool sr_build_entity_model(JceSceneRenderer *sr, JceScene *scene,
                             sr->terrain_cache[slot].mesh = jce_mesh_create(
                                 (const JceMeshVertex *)tv, (uint32_t)v_off,
                                 tiidx, (uint32_t)i_off);
-                            free(tv); free(tiidx);
+                            JCE_FREE(tv); JCE_FREE(tiidx);
                             if (!sr->terrain_cache[slot].mesh)
                                 sr->terrain_cache[slot].failed = true;
                         } else {
@@ -2070,7 +2070,7 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
 {
     if (!renderer) return NULL;
 
-    JceSceneRenderer *sr = (JceSceneRenderer *)calloc(1, sizeof(JceSceneRenderer));
+    JceSceneRenderer *sr = (JceSceneRenderer *)JCE_CALLOC(1, sizeof(JceSceneRenderer));
     if (!sr) return NULL;
 
     sr->renderer = renderer;
@@ -2431,7 +2431,7 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
     if (sr->cull_aabbs) JCE_FREE(sr->cull_aabbs);
     if (sr->render_queue) jce_rq_destroy(sr->render_queue);
 
-    free(sr);
+    JCE_FREE(sr);
 }
 
 uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,

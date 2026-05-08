@@ -1,31 +1,49 @@
-# JCE (JAVA CAT ENGINE) Build Guide (Windows)
+# JCE — Java Cat Engine
 
-This document provides working build flows for:
+A cross-platform, data-driven, native-callable game engine written in C99
+with a C++17 ImGui editor on top.
 
-1. Native C/C++ executables (standalone game + editor)
-2. Java + JNI mode (Java drives the native engine)
+- **Cross-platform**: Windows, macOS, Linux, Android, iOS, Web (WASM),
+  consoles (planned). x86_64 / arm / arm64.
+- **Cross-architecture, cross-vintage**: baseline target is a single-core,
+  512 MB, no-discrete-GPU machine (~2010-class hardware).
+- **Native-callable from any language**: engine ships as a flat C API
+  (`<jce/api.h>`); a JNI bridge demonstrates Java embedding.
+- **Data-driven ECS**: scenes, prefabs, components are pure data; no
+  inheritance, no scripts hard-wired into the engine.
 
-All commands below are tested in PowerShell from the repository root.
+> **Architecture reference**: see [`ARCHITECTURE.md`](ARCHITECTURE.md)
+> for the layered model, module map, ECS doctrine, and conventions.
+> This README focuses on **build flows**.
 
 ## Canonical Dependencies
 
-JCE deliberately keeps its third-party dependency surface small and
-cross-platform. Every entry below is a sanctioned, architecturally-load-
-bearing dependency — *not* an incidental transitive pull. New direct deps
-are only added with explicit project-owner approval and require updating
-this list plus `THIRD_PARTY_LICENSES.md`.
+JCE keeps its third-party surface small and cross-platform. Every entry
+below is sanctioned and architecturally load-bearing — *not* an incidental
+transitive pull. New direct deps require explicit owner approval, an
+update to this list, and an entry in `THIRD_PARTY_LICENSES.md`.
 
-| Dep      | Role                              | Layer       |
-|----------|-----------------------------------|-------------|
-| SDL3     | Window / input / platform abstraction | os/platform |
-| bgfx     | Graphics backend abstraction      | renderer    |
-| cglm     | SIMD math (wrapped by `jce_math`) | os/core     |
-| PhysFS   | Virtual filesystem / archive I/O  | os/core     |
-| enkiTS   | Task scheduler                    | os/core     |
-| mimalloc | Allocator                         | os/core     |
-| Tracy    | Profiling                         | os/core     |
-| flecs    | Data-driven ECS                   | scene / renderer / ui |
-| Recast & Detour | Navigation mesh generation + pathfinding | middleware/navigation |
+| Dep             | Role                                            | Layer                  |
+|-----------------|-------------------------------------------------|------------------------|
+| SDL3            | Window / input / platform abstraction           | os/platform            |
+| bgfx            | Graphics backend abstraction                    | renderer               |
+| PhysFS          | Virtual filesystem / archive I/O                | os/core                |
+| enkiTS          | Task scheduler                                  | os/core                |
+| mimalloc        | Allocator                                       | os/core                |
+| Tracy           | Profiling                                       | os/core                |
+| flecs           | Data-driven ECS                                 | scene / renderer / ui  |
+| Recast & Detour | Navmesh generation + pathfinding                | middleware/ai          |
+| miniaudio       | Audio device + mixing                           | middleware/audio       |
+| Bullet          | 3D rigid-body physics                           | middleware/physics     |
+| RmlUI           | HTML/CSS UI for in-game HUD                     | middleware/ui          |
+| ImGui           | Editor UI (editor target only)                  | editor                 |
+| cJSON           | JSON parsing                                    | os/core                |
+| stb_image       | Common image decode                             | resource               |
+
+Codec sources (fdk-aac, libhevc, openh264) are pulled locally on demand
+and live under `engine/src/middleware/{audio,video}/third_party/`. They
+are **not committed** to the repository — see
+[`ARCHITECTURE.md`](ARCHITECTURE.md#vendored-third-party).
 
 Platform-specific native APIs (Win32, POSIX, Cocoa, NDK) must always be
 accessed through one of the canonical wrappers above; they are never
@@ -35,24 +53,52 @@ called directly from engine source.
 
 ```
 JCE/
-├── engine/              # C99 static library (core engine)
-│   ├── include/jce/     # Public API headers
-│   ├── src/             # Engine implementation
-│   ├── shaders/         # Engine shaders
-│   ├── resources/assets # Engine assets
-│   └── java/com/jce/    # JNI Java sources
-├── caged_kingdom/       # Sandbox game executable
-│   ├── src/             # Game code (main.c + game/)
-│   └── resources/assets # Game-specific assets
-├── editor/              # C++17 editor executable
-│   ├── src/             # Editor code
-│   ├── shaders/         # Editor shaders
-│   └── resources/assets # Editor assets
-├── tools/               # Build-time tools
-│   └── jce_pak.c        # Asset packer
-├── conan/profiles/      # Conan profiles per platform
-└── scripts/             # Build scripts
+├── engine/                # C99 static library — the engine
+│   ├── include/jce/       # Public API (api.h + per-layer umbrellas)
+│   ├── src/               # Layered implementation (os → renderer → middleware → application → runtime)
+│   ├── shaders/           # Engine shaders (bgfx)
+│   ├── resources/assets/  # Engine assets
+│   └── java/com/jce/      # JNI Java bindings
+├── caged_kingdom/         # Sandbox game (engine consumer)
+├── editor/                # C++17 ImGui editor (engine consumer)
+├── tools/                 # Build-time tools (asset packer, etc.)
+├── ARCHITECTURE.md        # Layered model & module map (read this first)
+├── conan/profiles/        # Per-platform Conan profiles
+└── scripts/               # Build orchestration scripts
 ```
+
+## Hosting Modes
+
+The engine can be driven by three different hosts:
+
+```
+        ┌──────────────┐  flat C API
+        │  jce engine  │ ─────────────────────────────┐
+        │   (C99 .a)   │                              │
+        └──────┬───────┘                              │
+               │                                      │
+   ┌───────────┼─────────────────┐                    │
+   │           │                 │                    │
+   ▼           ▼                 ▼                    ▼
+ game.exe   editor.exe        jce.dll              (your app)
+ (caged_*)  (ImGui driven)    + JNI Java host     (any C-ABI lang)
+```
+
+The editor *embeds* the engine; game modules register through
+`jce_game_module_register` and are driven by `JceAppDesc` lifecycle hooks
+identically in both standalone and editor-Play modes.
+
+---
+
+# Build Guide (Windows)
+
+This guide covers:
+
+1. Native C/C++ executables (standalone game + editor)
+2. Java + JNI mode (Java drives the native engine)
+3. Cross-compilation (Android / Windows-ARM64 / WebAssembly)
+
+All commands below are tested in PowerShell from the repository root.
 
 ## Prerequisites
 
@@ -74,7 +120,7 @@ Set-Location JCE
 
 ## A. Build Native Standalone Game (caged_kingdom)
 
-This mode builds the standalone game executable (`caged_kingdom.exe`).
+Builds the standalone game executable (`caged_kingdom.exe`).
 
 ### A1) Install dependencies and generate toolchain
 
@@ -91,7 +137,8 @@ cmake -S . -B build/desktop/windows-x64 -G Ninja `
     -DJCE_BUILD_VARIANT=release
 ```
 
-Use `-DJCE_BUILD_VARIANT=dist` for distribution builds (no logging, SHA-256 integrity).
+Use `-DJCE_BUILD_VARIANT=dist` for distribution builds (no logging,
+SHA-256 integrity).
 
 ### A3) Build
 
@@ -114,8 +161,6 @@ Or use the build script:
 
 ## B. Build Editor (jce_editor)
 
-### Using the build script
-
 ```powershell
 ./scripts/build-editor.bat           # release build
 ./scripts/build-editor.bat --dist    # distribution build
@@ -125,7 +170,7 @@ Output: `build/desktop/windows-x64/release/jce_editor.exe`
 
 ## C. Build Java + JNI Mode
 
-This mode builds `jce.dll` and runs the app from Java (`com.jce.Main`).
+Builds `jce.dll` and runs the app from Java (`com.jce.Main`).
 
 ### C1) Install dependencies and generate toolchain
 
@@ -207,4 +252,5 @@ Then run `C/C++: Rescan Workspace` or reload window.
 
 ### `cppcheck` target fails in VS generator
 
-Configure with `-DJCE_ENABLE_CPPCHECK=OFF` for Visual Studio builds, or switch to Ninja generator for compile database workflows.
+Configure with `-DJCE_ENABLE_CPPCHECK=OFF` for Visual Studio builds, or
+switch to Ninja generator for compile database workflows.

@@ -100,6 +100,15 @@ PORTABILITY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
 ]
 
 
+# Raw platform-detection macros — banned in client (caged_kingdom) where
+# game code should be 100% platform-agnostic.  The engine routes platform
+# detection through JCE_PLATFORM_* macros from <jce/os/core/jce_platform.h>.
+CLIENT_PLATFORM_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"#if(?:def|\s+defined\s*\()?\s*(_WIN32|_WIN64|__APPLE__|__linux__|__ANDROID__|__EMSCRIPTEN__)\b"),
+     "raw platform macro — use JCE_PLATFORM_* (or call engine API that wraps it)"),
+]
+
+
 def rel(p: Path) -> str:
     return p.relative_to(REPO_ROOT).as_posix()
 
@@ -107,6 +116,8 @@ def rel(p: Path) -> str:
 def patterns_for(tree: str) -> list[tuple[re.Pattern[str], str]]:
     if tree == "engine":
         return NATIVE_PATTERNS
+    if tree == "client":
+        return NATIVE_PATTERNS + PORTABILITY_PATTERNS + CLIENT_PLATFORM_PATTERNS
     return NATIVE_PATTERNS + PORTABILITY_PATTERNS
 
 

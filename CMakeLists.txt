@@ -3,10 +3,25 @@ cmake_minimum_required(VERSION 3.20)
 # ── MUST be set before project() ──
 set(CMAKE_SUPPRESS_REGENERATION TRUE)
 
-project(JCE VERSION 0.8.14 LANGUAGES C)
+project(JCE VERSION 0.8.15 LANGUAGES C)
 
 # CXX is needed for C++ dependencies (bgfx, assimp, imgui) and the editor.
 enable_language(CXX)
+
+# AppleClang's enable_language(ASM) succeeds at detection but fails to
+# install a CMAKE_ASM_COMPILE_OBJECT rule on cross-compile toolchains.
+# Same issue affects Linux ARM64 cross-compile toolchains where the ASM
+# rule isn't auto-generated. Force a sensible rule globally before any
+# subdir calls enable_language(ASM).
+if(APPLE OR (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$"))
+	if(NOT CMAKE_ASM_COMPILER)
+		set(CMAKE_ASM_COMPILER "${CMAKE_C_COMPILER}" CACHE FILEPATH "" FORCE)
+	endif()
+	set(CMAKE_ASM_COMPILE_OBJECT
+		"<CMAKE_ASM_COMPILER> <DEFINES> <INCLUDES> <FLAGS> -o <OBJECT> -c <SOURCE>"
+		CACHE STRING "" FORCE)
+	set(CMAKE_ASM_SOURCE_FILE_EXTENSIONS s;S;asm CACHE STRING "" FORCE)
+endif()
 
 # Export compile database for tooling (cppcheck/clangd/etc.).
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)

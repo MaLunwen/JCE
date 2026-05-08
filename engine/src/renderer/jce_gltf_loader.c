@@ -8,7 +8,7 @@
 
 #include "jce_gltf_loader.h"
 
-#include <jce/renderer/jce_skeleton.h>
+#include <jce/middleware/animation/jce_skeleton.h>
 #include <jce/renderer/jce_skinned_mesh.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>

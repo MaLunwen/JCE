@@ -169,7 +169,7 @@ void jce_editor_panel_postfx(void)
     if (!*vis) return;
 
     char title[256];
-    snprintf(title, sizeof(title), "%s###PostFX", jce_editor_i18n("postfx.title"));
+    snprintf(title, sizeof(title), "%s###postfx", jce_editor_i18n("postfx.title"));
     if (ImGui::Begin(title, vis))
         jce_editor_panel_postfx_content();
     ImGui::End();

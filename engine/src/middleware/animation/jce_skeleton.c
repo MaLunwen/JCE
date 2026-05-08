@@ -2,7 +2,7 @@
  * jce_skeleton.c  Bone/joint hierarchy implementation.
  */
 
-#include <jce/renderer/jce_skeleton.h>
+#include <jce/middleware/animation/jce_skeleton.h>
 #include <jce/os/core/jce_log.h>
 
 #include "middleware/animation/jce_anim_ozz.h"

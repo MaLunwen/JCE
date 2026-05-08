@@ -84,11 +84,11 @@ static void pkgs_save(void)
     for (auto &p : s_pkgs)
         cap += p.name.size() + p.version.size() + p.description.size() + 96;
 
-    char *buf = (char *)std::malloc(cap);
+    char *buf = (char *)ED_MALLOC(cap);
     if (!buf) return;
     size_t off = 0;
     int    w   = std::snprintf(buf + off, cap - off, "{\n  \"packages\": [\n");
-    if (w < 0) { std::free(buf); return; }
+    if (w < 0) { ED_FREE(buf); return; }
     off += (size_t)w;
 
     int written = 0;
@@ -105,15 +105,15 @@ static void pkgs_save(void)
             p.enabled    ? 1 : 0,
             p.user_added ? 1 : 0,
             p.description.c_str());
-        if (w < 0 || (size_t)w >= cap - off) { std::free(buf); return; }
+        if (w < 0 || (size_t)w >= cap - off) { ED_FREE(buf); return; }
         off += (size_t)w;
         ++written;
     }
     w = std::snprintf(buf + off, cap - off, "\n  ]\n}\n");
-    if (w < 0) { std::free(buf); return; }
+    if (w < 0) { ED_FREE(buf); return; }
     off += (size_t)w;
     ed_write_file(PACKAGES_PATH, buf, off);
-    std::free(buf);
+    ED_FREE(buf);
 }
 
 static bool extract_str(const char *block, const char *key, std::string &out)

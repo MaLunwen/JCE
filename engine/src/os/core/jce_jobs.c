@@ -5,6 +5,8 @@
 #include <jce/os/core/jce_jobs.h>
 #include <jce/os/core/jce_thread.h>
 
+#include "jce_memory.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -73,13 +75,13 @@ jce_jobs_create(int worker_count)
     if (worker_count < 1) worker_count = 1;
     if (worker_count > 64) worker_count = 64;
 
-    JceJobSystem *s = (JceJobSystem *)calloc(1, sizeof *s);
+    JceJobSystem *s = (JceJobSystem *)JCE_CALLOC(1, sizeof *s);
     if (!s) return NULL;
     s->mu      = jce_mutex_create();
     s->cv_have = jce_cond_create();
     s->cv_done = jce_cond_create();
     s->worker_count = worker_count;
-    s->workers = (JceThread **)calloc((size_t)worker_count, sizeof(JceThread *));
+    s->workers = (JceThread **)JCE_CALLOC((size_t)worker_count, sizeof(JceThread *));
 
     char name[32];
     for (int i = 0; i < worker_count; ++i) {
@@ -100,11 +102,11 @@ jce_jobs_destroy(JceJobSystem *s)
 
     for (int i = 0; i < s->worker_count; ++i) jce_thread_join(s->workers[i]);
 
-    free(s->workers);
+    JCE_FREE(s->workers);
     jce_cond_destroy(s->cv_done);
     jce_cond_destroy(s->cv_have);
     jce_mutex_destroy(s->mu);
-    free(s);
+    JCE_FREE(s);
 }
 
 JCE_API int JCE_CALL
@@ -141,7 +143,7 @@ JCE_API JceJobGroup *JCE_CALL
 jce_jobs_group_create(JceJobSystem *s)
 {
     if (!s) return NULL;
-    JceJobGroup *g = (JceJobGroup *)calloc(1, sizeof *g);
+    JceJobGroup *g = (JceJobGroup *)JCE_CALLOC(1, sizeof *g);
     if (!g) return NULL;
     g->sys     = s;
     g->pending = jce_atomic_i32_create(0);
@@ -153,7 +155,7 @@ jce_jobs_group_destroy(JceJobGroup *g)
 {
     if (!g) return;
     if (g->pending) jce_atomic_i32_destroy(g->pending);
-    free(g);
+    JCE_FREE(g);
 }
 
 JCE_API void JCE_CALL
@@ -212,7 +214,7 @@ jce_jobs_parallel_for(JceJobSystem *s, int count, int chunk,
         if (chunk < 1) chunk = 1;
     }
     int n_chunks = (count + chunk - 1) / chunk;
-    JcePForChunk *chunks = (JcePForChunk *)malloc(sizeof(JcePForChunk) * (size_t)n_chunks);
+    JcePForChunk *chunks = (JcePForChunk *)JCE_MALLOC(sizeof(JcePForChunk) * (size_t)n_chunks);
     JceJobGroup *g = jce_jobs_group_create(s);
     for (int i = 0; i < n_chunks; ++i) {
         int b = i * chunk;
@@ -222,5 +224,5 @@ jce_jobs_parallel_for(JceJobSystem *s, int count, int chunk,
     }
     jce_jobs_group_wait(g);
     jce_jobs_group_destroy(g);
-    free(chunks);
+    JCE_FREE(chunks);
 }

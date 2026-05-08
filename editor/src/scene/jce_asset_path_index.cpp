@@ -7,6 +7,7 @@
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_path.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_timer.h>
 
 #include <algorithm>
 #include <cctype>
@@ -84,11 +85,35 @@ std::string strip_asset_prefix(const std::string &stem)
     return stem;
 }
 
+/* Hard ceiling on auto-index walks.  Protects against starting the
+ * editor in `$HOME` or another massive directory tree where the walk
+ * would block the splash for many seconds.  Tuned for typical mid-
+ * size game projects (under 50k indexable assets). */
+static const size_t kAutoIndexFileCap = 50000;
+
+/* Wall-clock budget (milliseconds) for a single rebuild walk.  When
+ * exceeded the walker aborts.  Belt-and-suspenders alongside the file
+ * cap; covers cases where each callback is slow (e.g. SMB/sshfs). */
+static const uint64_t kAutoIndexTimeBudgetMs = 3000;
+
+static uint64_t g_walk_start_ms = 0;
+static bool     g_walk_budget_exceeded = false;
+
 bool walk_cb(const char *path, bool is_dir, void *user);
 
 bool walk_cb(const char *path, bool is_dir, void *user)
 {
     (void)user;
+    /* Abort the entire walk once any cap is reached.  jce_fs_host_walk
+     * treats a `false` return as STOP-WHOLE-WALK. */
+    if (g_total >= kAutoIndexFileCap) {
+        return false;
+    }
+    if (g_walk_start_ms != 0 &&
+        (jce_time_ticks_ms() - g_walk_start_ms) > kAutoIndexTimeBudgetMs) {
+        g_walk_budget_exceeded = true;
+        return false;
+    }
     if (is_dir) {
         /* Note: jce_fs_host_walk treats cb returning false as STOP-WHOLE-WALK,
          * not "skip this subtree".  We can't safely refuse a directory here,
@@ -96,12 +121,19 @@ bool walk_cb(const char *path, bool is_dir, void *user)
          * for filtering.  Skip only happens via filename heuristics on hits. */
         return true;
     }
-    /* Heuristic: skip files inside obvious build/cache dirs by checking
-     * the path for those segments.  Cheap O(strlen(path)) substring scan. */
+    /* Heuristic: skip files inside obvious build/cache/system dirs by
+     * checking the path for those segments.  Cheap O(strlen(path))
+     * substring scan.  The macOS/Linux entries (Library, .Trash, etc.)
+     * matter when the editor is launched with cwd=$HOME (e.g. Finder
+     * `open` of a bare Mach-O). */
     static const char *const skip_segments[] = {
         "/.git/", "\\.git\\", "/node_modules/", "\\node_modules\\",
         "/CMakeFiles/", "\\CMakeFiles\\", "/.cache_", "\\.cache_",
-        "/.vs/", "\\.vs\\"
+        "/.vs/", "\\.vs\\",
+        "/Library/", "/.Trash/", "/.npm/", "/.cache/", "/.conan2/",
+        "/Applications/", "/.vscode/", "/.rustup/", "/.cargo/",
+        "/.gradle/", "/.docker/", "/Pods/", "/.android/", "/.m2/",
+        "/.nuget/", "/.pub-cache/",
     };
     for (const char *seg : skip_segments) {
         if (std::strstr(path, seg)) return true;
@@ -164,11 +196,39 @@ int jce_asset_path_index_rebuild(const char *root)
 {
     if (!root || !*root) return 0;
     if (!jce_fs_host_exists_dir(root)) return 0;
+    /* Refuse to walk a filesystem root.  Indexing the entire disk is
+     * never the intended behavior and would block the caller (often
+     * the splash screen) for an unbounded amount of time.  Mirrors
+     * the guard in panels/jce_panel_assets.cpp:ensure_assets_init. */
+    {
+        const char *p = root;
+        bool is_root = false;
+        if (p[0] == '/' && p[1] == '\0') is_root = true;
+        else if (p[0] && p[1] == ':' &&
+                 (p[2] == '\0' ||
+                  ((p[2] == '/' || p[2] == '\\') && p[3] == '\0')))
+            is_root = true;
+        if (is_root) {
+            LOG_INFO(LOG_TAG, "refusing to index filesystem root '%s'", root);
+            return 0;
+        }
+    }
     size_t before = g_total;
+    g_walk_start_ms = jce_time_ticks_ms();
+    g_walk_budget_exceeded = false;
     jce_fs_host_walk(root, walk_cb, nullptr);
+    g_walk_start_ms = 0;
     int added = (int)(g_total - before);
-    LOG_INFO(LOG_TAG, "indexed %d files under %s (total=%d)",
-             added, root, (int)g_total);
+    if (g_total >= kAutoIndexFileCap) {
+        LOG_INFO(LOG_TAG, "indexed %d files under %s (total=%d, file cap %d hit)",
+                 added, root, (int)g_total, (int)kAutoIndexFileCap);
+    } else if (g_walk_budget_exceeded) {
+        LOG_INFO(LOG_TAG, "indexed %d files under %s (total=%d, %dms budget hit)",
+                 added, root, (int)g_total, (int)kAutoIndexTimeBudgetMs);
+    } else {
+        LOG_INFO(LOG_TAG, "indexed %d files under %s (total=%d)",
+                 added, root, (int)g_total);
+    }
     return added;
 }
 

@@ -21,6 +21,13 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#  define jce_strncasecmp _strnicmp
+#else
+#  include <strings.h>
+#  define jce_strncasecmp strncasecmp
+#endif
+
 extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/os/core/jce_filesystem.h>
@@ -42,7 +49,7 @@ static bool ci_contains(const char *hay, const char *needle)
     if (!hay || !needle || !*needle) return false;
     size_t n = strlen(needle);
     for (const char *p = hay; *p; p++) {
-        if (_strnicmp(p, needle, n) == 0) return true;
+        if (jce_strncasecmp(p, needle, n) == 0) return true;
     }
     return false;
 }

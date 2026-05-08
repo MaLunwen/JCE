@@ -5,7 +5,7 @@
  * glTF loader which constructs JceModel instances).
  */
 
-#include <jce/renderer/jce_skeleton.h>
+#include <jce/middleware/animation/jce_skeleton.h>
 #include <jce/renderer/jce_skinned_mesh.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/renderer/jce_mesh.h>

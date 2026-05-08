@@ -56,6 +56,9 @@ JCE_API JceRenderer *jce_renderer_create_fallback(JceWindow *win);
 /* Check if the renderer is running in fallback mode. */
 JCE_API bool         jce_renderer_is_fallback(const JceRenderer *r);
 
+/* Check if the EGL swap-buffers call has hung (Android only). */
+JCE_API bool         jce_renderer_is_egl_hung(void);
+
 /* Render the fallback error screen. */
 JCE_API void         jce_renderer_render_fallback_frame(const JceRenderer *r);
 

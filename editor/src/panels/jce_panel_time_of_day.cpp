@@ -19,7 +19,7 @@
 #include <cstdio>
 
 extern "C" {
-#include <jce/renderer/jce_time_of_day.h>
+#include <jce/middleware/world/jce_time_of_day.h>
 #include <jce/renderer/jce_scene_renderer.h>
 }
 

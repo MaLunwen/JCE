@@ -11,7 +11,7 @@
  * pipeline (Reinhard at exposure ~1.0).
  */
 
-#include <jce/renderer/jce_time_of_day.h>
+#include <jce/middleware/world/jce_time_of_day.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/os/core/jce_profiler.h>
 
