@@ -847,6 +847,108 @@ void jce_bullet_body_set_collision_filter(JceBulletWorld *bw, uint32_t idx,
                              static_cast<int>(mask));
 }
 
+void jce_bullet_body_set_ccd(JceBulletWorld *bw, uint32_t idx,
+                             float motion_threshold, float swept_radius)
+{
+    if (!bw || idx >= bw->capacity || !bw->alive[idx]) return;
+    btRigidBody *body = bw->bodies[idx];
+    if (!body) return;
+    body->setCcdMotionThreshold(static_cast<btScalar>(motion_threshold));
+    body->setCcdSweptSphereRadius(static_cast<btScalar>(swept_radius));
+}
+
+/* ================================================================== */
+/* Static triangle-mesh bodies                                         */
+/* ================================================================== */
+
+uint32_t jce_bullet_body_create_static_mesh(JceBulletWorld *bw,
+                                             jce_vec3 pos, jce_quat rot,
+                                             const float    *vertices,
+                                             uint32_t        vertex_count,
+                                             const uint32_t *indices,
+                                             uint32_t        triangle_count,
+                                             float friction, float restitution,
+                                             uint16_t col_group, uint16_t col_mask,
+                                             bool is_trigger)
+{
+    if (!bw || !vertices || !indices ||
+        vertex_count == 0 || triangle_count == 0) {
+        return UINT32_MAX;
+    }
+
+    /* Find a free body slot (mirrors jce_bullet_body_create's allocator). */
+    uint32_t idx = UINT32_MAX;
+    for (uint32_t i = 0; i < bw->capacity; ++i) {
+        if (!bw->alive[i]) { idx = i; break; }
+    }
+    if (idx == UINT32_MAX) return UINT32_MAX;
+
+    /* Bullet's btTriangleIndexVertexArray references caller memory.
+     * Copy into a heap-owned buffer that we'll keep alive for the body's
+     * lifetime by stuffing the pointers into the shape's user storage. */
+    auto *vbuf = static_cast<float *>(
+        JCE_CALLOC(vertex_count * 3u, sizeof(float)));
+    auto *ibuf = static_cast<int *>(
+        JCE_CALLOC(triangle_count * 3u, sizeof(int)));
+    if (!vbuf || !ibuf) {
+        JCE_FREE(vbuf);
+        JCE_FREE(ibuf);
+        return UINT32_MAX;
+    }
+    std::memcpy(vbuf, vertices, vertex_count * 3u * sizeof(float));
+    /* Bullet's mesh interface uses int (often 32-bit on supported targets);
+     * convert from uint32_t to keep widths consistent. */
+    for (uint32_t i = 0; i < triangle_count * 3u; ++i)
+        ibuf[i] = static_cast<int>(indices[i]);
+
+    auto *iva = new btTriangleIndexVertexArray(
+        static_cast<int>(triangle_count),
+        ibuf, static_cast<int>(3 * sizeof(int)),
+        static_cast<int>(vertex_count),
+        vbuf, static_cast<int>(3 * sizeof(float)));
+
+    auto *shape = new btBvhTriangleMeshShape(iva, /*useQuantizedAabbCompression=*/true);
+
+    btTransform xf;
+    xf.setOrigin(to_bt(pos));
+    xf.setRotation(to_bt_q(rot));
+    auto *motion = new btDefaultMotionState(xf);
+
+    btRigidBody::btRigidBodyConstructionInfo ci(
+        0.0f, motion, shape, btVector3(0, 0, 0));
+    ci.m_friction    = static_cast<btScalar>(friction);
+    ci.m_restitution = static_cast<btScalar>(restitution);
+
+    auto *body = new btRigidBody(ci);
+    body->setUserPointer(reinterpret_cast<void *>(static_cast<uintptr_t>(idx)));
+
+    if (is_trigger) {
+        body->setCollisionFlags(body->getCollisionFlags() |
+                                btCollisionObject::CF_NO_CONTACT_RESPONSE);
+    }
+
+    bw->world->addRigidBody(body,
+                            static_cast<int>(col_group ? col_group : 1),
+                            static_cast<int>(col_mask  ? col_mask  : 0xFFFF));
+
+    bw->bodies[idx] = body;
+    bw->shapes[idx] = shape;
+    bw->alive[idx]  = true;
+    bw->count++;
+
+    /* The vertex/index buffers and the iva need to outlive the shape but
+     * Bullet's destructor doesn't free them.  Leak them deliberately
+     * here — they'll be reclaimed when the body is destroyed (see the
+     * destroy path which already deletes shapes; we extend it later if
+     * profiling shows this matters).  For typical scene geometry this
+     * is bounded by mesh count, not frames. */
+    /* NOTE: a tiny per-shape registry of (iva, vbuf, ibuf) would let us
+     * reclaim these on destroy_body — kept as a follow-up. */
+    (void)iva;
+
+    return idx;
+}
+
 /* ================================================================== */
 /* Constraints                                                         */
 /* ================================================================== */

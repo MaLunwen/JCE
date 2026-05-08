@@ -33,6 +33,24 @@ struct JceAnimPlayer {
     jce_mat4           *blend_buffer;      /* secondary buffer for clip B     */
     uint32_t            num_joints;
     JceOzzContext      *ozz_ctx;           /* ozz sampling context */
+
+    /* Root motion: track joint 0's transform delta between frames and
+     * accumulate it so the caller can read & apply it to the entity. */
+    bool                root_motion_enabled;
+    bool                root_prev_valid;
+    jce_vec3            root_prev_pos;
+    jce_quat            root_prev_rot;
+    jce_vec3            root_acc_pos;       /* accumulated translation since last consume */
+    jce_quat            root_acc_rot;       /* accumulated rotation since last consume    */
+
+    /* Animation events: fired when playback time crosses a registered
+     * timestamp.  prev_time tracks the last sampled clip time so we can
+     * detect crossings. */
+    JceAnimEvent        events[JCE_ANIM_MAX_EVENTS];
+    uint32_t            event_count;
+    JceAnimEventFn      event_fn;
+    void               *event_ud;
+    float               event_prev_time;
 };
 
 /* ================================================================== */
@@ -268,6 +286,9 @@ JceAnimPlayer *jce_anim_player_create(const JceSkeleton *skel)
     p->skeleton   = skel;
     p->num_joints = nj;
     p->speed      = 1.0f;
+    /* Root motion accumulators: quat must be identity (CALLOC gives 0). */
+    p->root_acc_rot  = jce_q_identity();
+    p->root_prev_rot = jce_q_identity();
 
     p->local_transforms = (jce_mat4 *)JCE_MALLOC(nj * sizeof(jce_mat4));
     if (!p->local_transforms) {
@@ -353,6 +374,7 @@ uint32_t jce_anim_player_update(JceAnimPlayer *p, float dt,
 
     JCE_PROFILE_ZONE_N("Anim::PlayerUpdate");
 
+    float t_before_advance = p->time;
     if (!p->paused) {
         /* Advance time. */
         p->time += dt * p->speed;
@@ -374,6 +396,28 @@ uint32_t jce_anim_player_update(JceAnimPlayer *p, float dt,
                 p->playing = false;
             }
         }
+
+        /* Fire any events crossed during this advance.  Forward play
+         * with possible wrap (loop): events whose timestamp lies in
+         * (prev, dur] then [0, time] for a wrap, otherwise (prev, time].
+         * Reverse play (negative speed) is not currently event-aware. */
+        if (p->event_count > 0 && p->event_fn && p->speed >= 0.0f) {
+            float prev = p->event_prev_time;
+            float cur  = p->time;
+            bool wrapped = (dur > 0.0f) && cur < prev;
+            for (uint32_t i = 0; i < p->event_count; ++i) {
+                float et = p->events[i].time;
+                bool fire = false;
+                if (wrapped) {
+                    if (et > prev || et <= cur) fire = true;
+                } else {
+                    if (et > prev && et <= cur) fire = true;
+                }
+                if (fire) p->event_fn(&p->events[i], p->event_ud);
+            }
+        }
+        p->event_prev_time = p->time;
+        (void)t_before_advance;
     }
 
     /* Reset to rest pose before sampling. */
@@ -390,6 +434,44 @@ uint32_t jce_anim_player_update(JceAnimPlayer *p, float dt,
     jce_anim_clip_sample(p->clip, p->time, p->local_transforms,
                           p->num_joints, rt, rr, rs);
 
+    /* Root-motion extraction.  Joint 0 is conventionally the skeleton
+     * root.  Compute delta from previous sample, accumulate into the
+     * consume buffer, then zero the local root translation/rotation
+     * so the mesh stays at the entity origin. */
+    if (p->root_motion_enabled && p->num_joints > 0) {
+        jce_vec3 cur_pos = extract_translation(&p->local_transforms[0]);
+        jce_quat cur_rot = extract_rotation(&p->local_transforms[0]);
+        if (p->root_prev_valid) {
+            jce_vec3 dpos;
+            dpos.x = cur_pos.x - p->root_prev_pos.x;
+            dpos.y = cur_pos.y - p->root_prev_pos.y;
+            dpos.z = cur_pos.z - p->root_prev_pos.z;
+            /* Loop wrap correction: if the clip looped this frame, the
+             * delta will be a huge negative; ignore it to avoid teleport. */
+            float dlen2 = dpos.x*dpos.x + dpos.y*dpos.y + dpos.z*dpos.z;
+            if (dlen2 < 100.0f) { /* > 10 m/frame is almost certainly a wrap */
+                p->root_acc_pos.x += dpos.x;
+                p->root_acc_pos.y += dpos.y;
+                p->root_acc_pos.z += dpos.z;
+                /* Rotation delta = cur * conj(prev). */
+                jce_quat conj = { -p->root_prev_rot.x, -p->root_prev_rot.y,
+                                  -p->root_prev_rot.z,  p->root_prev_rot.w };
+                jce_quat drot = jce_q_multiply(cur_rot, conj);
+                p->root_acc_rot = jce_q_normalize(jce_q_multiply(drot, p->root_acc_rot));
+            }
+        }
+        p->root_prev_pos   = cur_pos;
+        p->root_prev_rot   = cur_rot;
+        p->root_prev_valid = true;
+        /* Strip root translation from the local transform so the mesh
+         * doesn't double-move with the entity.  Rotation stripping is
+         * left optional — many rigs author root rotation as part of
+         * the animation. */
+        jce_vec3 zero = { 0.0f, 0.0f, 0.0f };
+        jce_vec3 sc = extract_scale(&p->local_transforms[0]);
+        p->local_transforms[0] = compose_trs(zero, cur_rot, sc);
+    }
+
     /* Evaluate skeleton to produce skinning matrices. */
     uint32_t count = p->num_joints < max_joints ? p->num_joints : max_joints;
     if (out_joint_matrices)
@@ -398,6 +480,56 @@ uint32_t jce_anim_player_update(JceAnimPlayer *p, float dt,
 
     JCE_PROFILE_ZONE_END;
     return count;
+}
+
+void jce_anim_player_set_root_motion(JceAnimPlayer *p, bool enabled)
+{
+    if (!p) return;
+    p->root_motion_enabled = enabled;
+    if (!enabled) {
+        p->root_prev_valid = false;
+        p->root_acc_pos = jce_v3(0, 0, 0);
+        p->root_acc_rot = jce_q_identity();
+    }
+}
+
+bool jce_anim_player_get_root_motion(const JceAnimPlayer *p)
+{
+    return p ? p->root_motion_enabled : false;
+}
+
+void jce_anim_player_consume_root_motion(JceAnimPlayer *p,
+                                         jce_vec3 *out_translation,
+                                         jce_quat *out_rotation)
+{
+    if (!p) return;
+    if (out_translation) *out_translation = p->root_acc_pos;
+    if (out_rotation)    *out_rotation    = p->root_acc_rot;
+    p->root_acc_pos = jce_v3(0, 0, 0);
+    p->root_acc_rot = jce_q_identity();
+}
+
+void jce_anim_player_set_events(JceAnimPlayer *p,
+                                const JceAnimEvent *events,
+                                uint32_t count)
+{
+    if (!p) return;
+    if (count > JCE_ANIM_MAX_EVENTS) count = JCE_ANIM_MAX_EVENTS;
+    p->event_count = count;
+    if (events && count > 0)
+        memcpy(p->events, events, count * sizeof(JceAnimEvent));
+    /* Reset crossing tracker so the first update after replacing events
+     * doesn't re-fire stale ones. */
+    p->event_prev_time = p->time;
+}
+
+void jce_anim_player_set_event_callback(JceAnimPlayer *p,
+                                        JceAnimEventFn fn,
+                                        void *user_data)
+{
+    if (!p) return;
+    p->event_fn = fn;
+    p->event_ud = user_data;
 }
 
 /* ================================================================== */

@@ -15,6 +15,7 @@
  */
 
 #include "jce_editor_layout.h"
+#include "jce_editor_layout_persistence.h"
 
 #include "dialogs/jce_editor_dialogs.h"
 #include "core/jce_editor.h"
@@ -841,11 +842,61 @@ static void draw_menu_bar(void)
             if (ImGui::MenuItem(jce_editor_i18n("window.layout.lighting")))   { s_layout_preset_pending = 9; s_reset_layout_requested = true; }
             ImGui::EndMenu();
         }
+        /* User-saved layouts (Unity's Window > Layouts > Save/Load/Delete). */
+        if (ImGui::BeginMenu("Custom Layouts")) {
+            char names[16][64];
+            uint32_t n = jce_editor_layout_list(names, 16);
+            if (n == 0) {
+                ImGui::TextDisabled("(no saved layouts)");
+            } else {
+                for (uint32_t i = 0; i < n; ++i) {
+                    if (ImGui::MenuItem(names[i])) {
+                        jce_editor_layout_load(names[i]);
+                    }
+                }
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Save Current As...")) {
+                ImGui::OpenPopup("##saveLayoutAs");
+            }
+            if (n > 0 && ImGui::BeginMenu("Delete Layout")) {
+                for (uint32_t i = 0; i < n; ++i) {
+                    if (ImGui::MenuItem(names[i])) {
+                        jce_editor_layout_delete(names[i]);
+                    }
+                }
+                ImGui::EndMenu();
+            }
+            ImGui::EndMenu();
+        }
         if (ImGui::MenuItem(jce_editor_i18n("menu.window.resetLayout"))) {
             s_layout_preset_pending = 0;
             s_reset_layout_requested = true;
         }
         ImGui::EndMenu();
+    }
+    /* Modal name-prompt for "Save Current As..." (must live outside the
+     * menu since menus close before the popup can render). */
+    if (ImGui::BeginPopupModal("##saveLayoutAs", NULL,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        static char name_buf[64] = {0};
+        ImGui::Text("Layout name:");
+        ImGui::InputText("##name", name_buf, sizeof(name_buf));
+        ImGui::Separator();
+        bool can_save = name_buf[0] != '\0';
+        if (!can_save) ImGui::BeginDisabled();
+        if (ImGui::Button("Save", ImVec2(120, 0))) {
+            jce_editor_layout_save(name_buf);
+            name_buf[0] = '\0';
+            ImGui::CloseCurrentPopup();
+        }
+        if (!can_save) ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+            name_buf[0] = '\0';
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
     }
 
     /* ── Help ──────────────────────────────────────────────────────── */

@@ -63,7 +63,12 @@ typedef enum {
     JCE_SHAPE_BOX      = 0,
     JCE_SHAPE_SPHERE   = 1,
     JCE_SHAPE_CAPSULE  = 2,
-    JCE_SHAPE_PLANE    = 3
+    JCE_SHAPE_PLANE    = 3,
+    /* Triangle-mesh collider — only valid for STATIC bodies (Bullet's
+     * btBvhTriangleMeshShape).  Mesh data is supplied via the dedicated
+     * jce_physics_body_create_mesh() entry point; the JceBodyDesc.shape
+     * field is set to JCE_SHAPE_MESH internally. */
+    JCE_SHAPE_MESH     = 4
 } JceShapeType;
 
 typedef enum {

@@ -163,6 +163,15 @@ bool draw_field(const JceReflectField *f, void *base, const void *defaults_base)
         changed = ImGui::InputText(label, p, f->size);
         track_undo();
     } break;
+    case JCE_FT_STRING_MULTILINE: {
+        char *p = as_char(base, f);
+        /* Roughly 4 lines of editable space — feels right for typical
+         * description / dialogue text.  Caller can request more via
+         * a custom drawer if needed; this is the default. */
+        changed = ImGui::InputTextMultiline(label, p, f->size,
+                                            ImVec2(0.0f, ImGui::GetTextLineHeight() * 4.0f));
+        track_undo();
+    } break;
     case JCE_FT_ENUM_INT: {
         int *p = as_int(base, f);
         const char *preview =
@@ -286,6 +295,12 @@ bool draw_field(const JceReflectField *f, void *base, const void *defaults_base)
     default:
         ImGui::TextDisabled("%s", jce_editor_i18n("reflect.label.unsupportedField"));
         break;
+    }
+
+    /* Tooltip on hover (Unity's [Tooltip("...")]) — applies to any field
+     * type after the widget is drawn so hover-detection covers it. */
+    if (f->tooltip && f->tooltip[0] && ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", f->tooltip);
     }
 
     /* Right-click "Reset to Default" — Unity-style. Only when the type

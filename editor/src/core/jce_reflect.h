@@ -44,7 +44,8 @@ typedef enum {
     JCE_FT_QUAT,        /* edited as Euler degrees */
     JCE_FT_COLOR3,      /* float[3] colour swatch */
     JCE_FT_COLOR4,      /* float[4] colour swatch */
-    JCE_FT_STRING,      /* fixed-size char[] */
+    JCE_FT_STRING,      /* fixed-size char[] (single line) */
+    JCE_FT_STRING_MULTILINE, /* fixed-size char[] rendered as multi-line text box */
     JCE_FT_ENUM_INT,    /* int with named labels (extra: const char* const*) */
     JCE_FT_ASSET_REF,   /* fixed-size char[] holding asset path + Browse + DnD target */
     JCE_FT_STRUCT_NESTED, /* recurse into another registered reflect type (by display name) */
@@ -72,6 +73,8 @@ typedef struct JceReflectField {
     size_t              element_size;     /* JCE_FT_ARRAY: sizeof(element) */
     size_t              count_offset;     /* JCE_FT_ARRAY: offsetof(struct, counter int/size_t sibling) */
     int                 max_count;        /* JCE_FT_ARRAY: array capacity */
+    /* Optional Unity-style attribute: hover tooltip text.  NULL = none. */
+    const char         *tooltip;
 } JceReflectField;
 
 typedef struct JceReflectType {
@@ -132,6 +135,27 @@ extern "C" {
       sizeof(((STRUCT *)0)->MEMBER), 0.0f, 0.0f, 0.0f, NULL, 0,             \
       NULL, NULL, (ELEM_TYPE), (ELEM_SIZE),                                 \
       offsetof(STRUCT, COUNT_MEMBER), (MAX_COUNT) },
+
+/* Unity-style attribute macros — additive on top of JCE_FIELD*.  Wrap
+ * an existing field declaration's value to attach metadata. */
+
+/* Field with hover tooltip (Unity's [Tooltip("...")]). */
+#define JCE_FIELD_TOOLTIP(STRUCT, MEMBER, TYPE, LABEL, TOOLTIP)             \
+    { #MEMBER, LABEL, TYPE, offsetof(STRUCT, MEMBER),                       \
+      sizeof(((STRUCT *)0)->MEMBER), 0.0f, 0.0f, 0.0f, NULL, 0,             \
+      NULL, NULL, JCE_FT_NONE, 0, 0, 0, TOOLTIP },
+
+/* Range slider (Unity's [Range(min,max)]).  Caller picks step. */
+#define JCE_FIELD_RANGE_TT(STRUCT, MEMBER, TYPE, LABEL, MN, MX, STEP, TT)   \
+    { #MEMBER, LABEL, TYPE, offsetof(STRUCT, MEMBER),                       \
+      sizeof(((STRUCT *)0)->MEMBER), (MN), (MX), (STEP), NULL, 0,           \
+      NULL, NULL, JCE_FT_NONE, 0, 0, 0, TT },
+
+/* Multi-line text area (Unity's [Multiline] / [TextArea]). */
+#define JCE_FIELD_MULTILINE(STRUCT, MEMBER, LABEL)                          \
+    { #MEMBER, LABEL, JCE_FT_STRING_MULTILINE, offsetof(STRUCT, MEMBER),    \
+      sizeof(((STRUCT *)0)->MEMBER), 0.0f, 0.0f, 0.0f, NULL, 0,             \
+      NULL, NULL, JCE_FT_NONE, 0, 0, 0, NULL },
 
 #define JCE_REFLECT_END(STRUCT, DISPLAY)                                    \
     };                                                                      \

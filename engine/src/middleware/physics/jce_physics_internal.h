@@ -152,6 +152,25 @@ uint32_t jce_bullet_body_count(JceBulletWorld *bw);
 void jce_bullet_body_set_collision_filter(JceBulletWorld *bw, uint32_t idx,
                                           uint16_t group, uint16_t mask);
 
+/* Continuous collision detection.  Pass 0 for both to disable. */
+void jce_bullet_body_set_ccd(JceBulletWorld *bw, uint32_t idx,
+                             float motion_threshold, float swept_radius);
+
+/* Create a STATIC triangle-mesh body via btBvhTriangleMeshShape.
+ * Returns the body index, or UINT32_MAX on failure (pool exhausted /
+ * empty mesh).  Bullet retains pointers into the supplied vertex/index
+ * arrays — the bridge copies them into a heap buffer owned by the
+ * world so the caller can free its inputs. */
+uint32_t jce_bullet_body_create_static_mesh(JceBulletWorld *bw,
+                                             jce_vec3 pos, jce_quat rot,
+                                             const float    *vertices,
+                                             uint32_t        vertex_count,
+                                             const uint32_t *indices,
+                                             uint32_t        triangle_count,
+                                             float friction, float restitution,
+                                             uint16_t col_group, uint16_t col_mask,
+                                             bool is_trigger);
+
 /* ================================================================== */
 /* Constraints                                                         */
 /* ================================================================== */

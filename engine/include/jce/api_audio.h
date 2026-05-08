@@ -14,6 +14,8 @@ extern "C" {
 
 #include <jce/middleware/audio/jce_audio.h>
 #include <jce/middleware/audio/jce_audio_mixer.h>
+#include <jce/middleware/audio/jce_audio_snapshot.h>
+#include <jce/middleware/audio/jce_audio_dsp.h>
 #include <jce/middleware/audio/jce_audio_occlusion.h>
 #include <jce/middleware/audio/jce_reverb_zones.h>
 #include <jce/os/core/jce_asset_types.h>

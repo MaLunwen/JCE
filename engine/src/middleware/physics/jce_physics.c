@@ -186,6 +186,42 @@ JceBodyHandle jce_physics_body_create(JcePhysicsWorld *world,
         return JCE_BODY_INVALID;
     }
 
+    /* Apply continuous collision detection if either field is non-zero
+     * (Bullet treats both 0 as off, so this is the natural opt-in). */
+    if (desc->ccd_motion_threshold > 0.0f || desc->ccd_swept_radius > 0.0f) {
+        jce_bullet_body_set_ccd(world->bullet, idx,
+                                desc->ccd_motion_threshold,
+                                desc->ccd_swept_radius);
+    }
+
+    return (JceBodyHandle){ idx };
+}
+
+JceBodyHandle jce_physics_body_create_mesh(JcePhysicsWorld *world,
+                                           const JceBodyDesc *desc,
+                                           const float    *vertices,
+                                           uint32_t        vertex_count,
+                                           const uint32_t *indices,
+                                           uint32_t        triangle_count)
+{
+    if (!world || !desc || !vertices || !indices) return JCE_BODY_INVALID;
+
+    float    friction    = desc->friction > 0.0f ? desc->friction : 0.5f;
+    uint16_t group       = desc->collision_group;
+    uint16_t mask        = desc->collision_mask;
+    if (group == 0) group = JCE_COLLISION_DEFAULT_GROUP;
+    if (mask  == 0) mask  = JCE_COLLISION_ALL_MASK;
+
+    uint32_t idx = jce_bullet_body_create_static_mesh(
+        world->bullet,
+        desc->position, desc->rotation,
+        vertices, vertex_count, indices, triangle_count,
+        friction, desc->restitution, group, mask, desc->is_trigger);
+
+    if (idx == UINT32_MAX) {
+        LOG_ERROR(LOG_TAG, "mesh body create failed (pool full or empty mesh)");
+        return JCE_BODY_INVALID;
+    }
     return (JceBodyHandle){ idx };
 }
 

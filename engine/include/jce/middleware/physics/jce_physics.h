@@ -63,10 +63,39 @@ typedef struct {
     uint16_t     collision_group; /* default: JCE_COLLISION_DEFAULT_GROUP */
     uint16_t     collision_mask;  /* default: JCE_COLLISION_ALL_MASK */
     bool         is_trigger;      /* trigger bodies: no contact response */
+
+    /* Continuous Collision Detection (CCD).  When motion-per-step
+     * exceeds `ccd_motion_threshold` the body is swept as a sphere of
+     * `ccd_swept_radius` to prevent tunnelling.  Both 0 = CCD off
+     * (default).  Recommended for fast-moving small dynamic bodies
+     * (bullets, projectiles).  Maps to Bullet's
+     * setCcdMotionThreshold/setCcdSweptSphereRadius. */
+    float        ccd_motion_threshold;
+    float        ccd_swept_radius;
 } JceBodyDesc;
 
 JCE_API JceBodyHandle jce_physics_body_create(JcePhysicsWorld *world, const JceBodyDesc *desc);
 JCE_API void          jce_physics_body_destroy(JcePhysicsWorld *world, JceBodyHandle body);
+
+/* Create a triangle-mesh STATIC collider.  desc->type is forced to
+ * JCE_BODY_STATIC and desc->shape to JCE_SHAPE_MESH internally; the
+ * other fields (position/rotation/friction/restitution/collision
+ * group/mask/is_trigger) are honoured.
+ *
+ * Vertices are tightly-packed x,y,z floats (length = vertex_count * 3);
+ * indices are uint32 with length = triangle_count * 3.  The caller
+ * retains ownership of `vertices` and `indices`; Bullet copies what it
+ * needs internally.
+ *
+ * Dynamic mesh colliders are not supported (Bullet has the same limit);
+ * convex hull approximation is the appropriate path for moving meshes
+ * — that's a separate API. */
+JCE_API JceBodyHandle jce_physics_body_create_mesh(JcePhysicsWorld *world,
+                                                    const JceBodyDesc *desc,
+                                                    const float    *vertices,
+                                                    uint32_t        vertex_count,
+                                                    const uint32_t *indices,
+                                                    uint32_t        triangle_count);
 
 /* ================================================================== */
 /* Body state queries                                                  */

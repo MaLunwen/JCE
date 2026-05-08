@@ -38,6 +38,12 @@ static struct {
 } s_play_bodies[PLAY_MAX_BODIES];
 static int s_play_body_count = 0;
 
+/* Constraints created from JceConstraintComponent at play start.
+ * Destroyed in lock-step with bodies on stop. */
+#define PLAY_MAX_CONSTRAINTS 128
+static JceConstraintHandle s_play_constraints[PLAY_MAX_CONSTRAINTS];
+static int                 s_play_constraint_count = 0;
+
 /* Player character (only one supported per scene). */
 static JceCharacterHandle s_play_character    = { UINT32_MAX };
 static int                s_play_player_eidx  = -1;
@@ -194,15 +200,67 @@ static void play_create_physics_world(void)
         }
     }
 
+    /* ── Second pass: instantiate constraints ──
+     * Bodies must already exist for both endpoints, so this runs after
+     * the body-spawn loop above.  body_a is the entity carrying the
+     * JceConstraintComponent; body_b is the entity referenced by
+     * target_entity (may be JCE_BODY_INVALID for "world anchor"). */
+    s_play_constraint_count = 0;
+    for (int i = 0; i < entity_count; i++) {
+        if (s_play_constraint_count >= PLAY_MAX_CONSTRAINTS) break;
+        uint32_t id = g_entity_order[i];
+        if (!jce_state_entity_enabled(id)) continue;
+        JceEntity e = (JceEntity)id;
+        JceConstraintComponent *cn = jce_scene_get_constraint(s.scene, e);
+        if (!cn) continue;
+
+        JceBodyHandle body_a = JCE_BODY_INVALID;
+        for (int b = 0; b < s_play_body_count; b++)
+            if (g_entity_order[s_play_bodies[b].entity_index] == id) {
+                body_a = s_play_bodies[b].body; break;
+            }
+        if (!jce_body_valid(body_a)) continue;
+
+        JceBodyHandle body_b = JCE_BODY_INVALID;
+        if (cn->target_entity != 0) {
+            for (int b = 0; b < s_play_body_count; b++)
+                if (g_entity_order[s_play_bodies[b].entity_index]
+                        == cn->target_entity) {
+                    body_b = s_play_bodies[b].body; break;
+                }
+        }
+
+        JceConstraintDesc cd;
+        memset(&cd, 0, sizeof(cd));
+        cd.type   = (JceConstraintType)cn->constraint_type;
+        cd.body_a = body_a;
+        cd.body_b = body_b;
+        cd.pivot_a.x = cn->pivot_a[0]; cd.pivot_a.y = cn->pivot_a[1]; cd.pivot_a.z = cn->pivot_a[2];
+        cd.pivot_b.x = cn->pivot_b[0]; cd.pivot_b.y = cn->pivot_b[1]; cd.pivot_b.z = cn->pivot_b[2];
+        cd.axis.x    = cn->axis[0];    cd.axis.y    = cn->axis[1];    cd.axis.z    = cn->axis[2];
+        cd.lower_limit       = cn->lower_limit;
+        cd.upper_limit       = cn->upper_limit;
+        cd.disable_collision = cn->disable_collision;
+
+        JceConstraintHandle h = jce_physics_constraint_create(s_play_physics, &cd);
+        if (jce_constraint_valid(h))
+            s_play_constraints[s_play_constraint_count++] = h;
+    }
+
     LOG_INFO(LOG_TAG,
-             "play physics: %d bodies, character=%s",
-             s_play_body_count,
+             "play physics: %d bodies, %d constraints, character=%s",
+             s_play_body_count, s_play_constraint_count,
              jce_character_valid(s_play_character) ? "yes" : "no");
 }
 
 static void play_destroy_physics_world(void)
 {
     if (s_play_physics) {
+        /* Destroy constraints first so Bullet doesn't keep stale rigid-
+         * body pointers when the bodies they reference go away. */
+        for (int i = 0; i < s_play_constraint_count; i++)
+            jce_physics_constraint_destroy(s_play_physics, s_play_constraints[i]);
+        s_play_constraint_count = 0;
         if (jce_character_valid(s_play_character))
             jce_physics_character_destroy(s_play_physics, s_play_character);
         jce_physics_destroy(s_play_physics);

@@ -69,6 +69,63 @@ JCE_API uint32_t jce_anim_player_blend(JceAnimPlayer    *p,
                                         jce_mat4         *out_joint_matrices,
                                         uint32_t           max_joints);
 
+/* -- Root motion --------------------------------------------------- *
+ *
+ * When enabled, joint 0 (the root) is treated as movement of the
+ * entity rather than the mesh itself.  Each call to player_update
+ * accumulates the root delta (translation since previous frame and
+ * rotation around the up axis); the local root transform is then
+ * zeroed so the mesh stays at the entity origin.  Game code reads back
+ * the accumulated motion via consume_root_motion() and applies it to
+ * the entity's Transform.
+ *
+ * Mirrors Unity's `Animator.applyRootMotion = true` + the
+ * deltaPosition / deltaRotation properties read in OnAnimatorMove. */
+
+JCE_API void jce_anim_player_set_root_motion(JceAnimPlayer *p, bool enabled);
+JCE_API bool jce_anim_player_get_root_motion(const JceAnimPlayer *p);
+
+/* Read and reset the accumulated root motion since the last call.
+ * Either out parameter may be NULL.  Returned translation is in the
+ * skeleton's coordinate space — typically the model's local space, so
+ * game code should rotate it by the entity's current orientation
+ * before adding to position. */
+JCE_API void jce_anim_player_consume_root_motion(JceAnimPlayer *p,
+                                                 jce_vec3 *out_translation,
+                                                 jce_quat *out_rotation);
+
+/* -- Animation events ---------------------------------------------- *
+ *
+ * Discrete callbacks fired when the playback time crosses configured
+ * timestamps.  Mirrors Unity's `AnimationEvent`.  Typical use cases:
+ * footstep sounds, weapon swing impact frames, particle spawns.
+ *
+ * The player owns a copy of the event array — caller can free its
+ * source after the call.  Up to JCE_ANIM_MAX_EVENTS events per clip.
+ * Looping clips re-fire events on each loop. */
+
+#define JCE_ANIM_MAX_EVENTS 32
+
+typedef struct {
+    float time;          /* seconds into clip */
+    char  name[48];      /* user identifier */
+    int   int_payload;
+    float float_payload;
+} JceAnimEvent;
+
+/* fn is invoked with the user-data passed to set_event_callback and a
+ * pointer to the event that just fired (must not be retained beyond
+ * the callback). */
+typedef void (*JceAnimEventFn)(const JceAnimEvent *evt, void *user_data);
+
+JCE_API void jce_anim_player_set_events(JceAnimPlayer *p,
+                                        const JceAnimEvent *events,
+                                        uint32_t count);
+
+JCE_API void jce_anim_player_set_event_callback(JceAnimPlayer *p,
+                                                JceAnimEventFn fn,
+                                                void *user_data);
+
 /* -- Skeleton queries ---------------------------------------------- */
 
 /* Return the number of joints in a skeleton. */
