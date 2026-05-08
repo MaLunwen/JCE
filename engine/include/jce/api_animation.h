@@ -14,6 +14,10 @@ extern "C" {
 
 #include <jce/middleware/animation/jce_animation.h>
 #include <jce/middleware/animation/jce_skeleton.h>
+#include <jce/middleware/animation/jce_anim_sm.h>
+#include <jce/middleware/animation/jce_anim_sm_binding.h>
+#include <jce/middleware/animation/jce_anim_blend_tree.h>
+#include <jce/middleware/animation/jce_anim_ik.h>
 #include <jce/renderer/jce_skinned_mesh.h>
 
 

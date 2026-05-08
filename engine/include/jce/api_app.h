@@ -18,6 +18,7 @@ extern "C" {
 #include <jce/application/jce_engine.h>
 #include <jce/application/jce_screenshot.h>
 #include <jce/application/jce_subsystem.h>
+#include <jce/application/jce_time.h>
 
 /* NOTE: jce_main.h is intentionally excluded.
  * It defines SDL_MAIN_USE_CALLBACKS and generates entry-point functions

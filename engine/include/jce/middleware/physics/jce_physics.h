@@ -108,6 +108,71 @@ JceRaycastResult jce_physics_raycast(const JcePhysicsWorld *world,
                                      float max_distance);
 
 /* ================================================================== */
+/* Overlap & shape-cast queries (Unity-style Physics.Overlap*)         */
+/* ================================================================== */
+
+/* Collect bodies whose colliders overlap a sphere/box/capsule volume.
+ * `collision_mask` filters by collision group (use 0xFFFF for any).
+ * Writes up to `max_bodies` body handles to `out_bodies`; returns the
+ * actual count.  Identical bodies are de-duplicated.
+ *
+ * These mirror Unity's Physics.OverlapSphere / Box / Capsule. */
+JCE_API uint32_t jce_physics_overlap_sphere(const JcePhysicsWorld *world,
+                                            jce_vec3 center, float radius,
+                                            uint16_t collision_mask,
+                                            JceBodyHandle *out_bodies,
+                                            uint32_t max_bodies);
+
+JCE_API uint32_t jce_physics_overlap_box(const JcePhysicsWorld *world,
+                                         jce_vec3 center, jce_vec3 half_extents,
+                                         jce_quat rotation,
+                                         uint16_t collision_mask,
+                                         JceBodyHandle *out_bodies,
+                                         uint32_t max_bodies);
+
+JCE_API uint32_t jce_physics_overlap_capsule(const JcePhysicsWorld *world,
+                                             jce_vec3 center, float radius,
+                                             float half_height,
+                                             jce_quat rotation,
+                                             uint16_t collision_mask,
+                                             JceBodyHandle *out_bodies,
+                                             uint32_t max_bodies);
+
+/* Boolean shortcuts — true if any collider overlaps the volume. */
+JCE_API bool jce_physics_check_sphere(const JcePhysicsWorld *world,
+                                      jce_vec3 center, float radius,
+                                      uint16_t collision_mask);
+
+JCE_API bool jce_physics_check_box(const JcePhysicsWorld *world,
+                                   jce_vec3 center, jce_vec3 half_extents,
+                                   jce_quat rotation, uint16_t collision_mask);
+
+JCE_API bool jce_physics_check_capsule(const JcePhysicsWorld *world,
+                                       jce_vec3 center, float radius,
+                                       float half_height, jce_quat rotation,
+                                       uint16_t collision_mask);
+
+/* Sweep a shape from `origin` along `direction` for `max_distance`,
+ * returning the closest hit (or hit==false if nothing was struck). */
+JCE_API JceRaycastResult jce_physics_sphere_cast(const JcePhysicsWorld *world,
+                                                 jce_vec3 origin, float radius,
+                                                 jce_vec3 direction,
+                                                 float max_distance);
+
+JCE_API JceRaycastResult jce_physics_box_cast(const JcePhysicsWorld *world,
+                                              jce_vec3 origin, jce_vec3 half_extents,
+                                              jce_quat rotation,
+                                              jce_vec3 direction,
+                                              float max_distance);
+
+JCE_API JceRaycastResult jce_physics_capsule_cast(const JcePhysicsWorld *world,
+                                                  jce_vec3 origin, float radius,
+                                                  float half_height,
+                                                  jce_quat rotation,
+                                                  jce_vec3 direction,
+                                                  float max_distance);
+
+/* ================================================================== */
 /* Collision callbacks                                                 */
 /* ================================================================== */
 

@@ -104,6 +104,28 @@ JceBulletRayResult jce_bullet_raycast(JceBulletWorld *bw, jce_vec3 origin,
                                       jce_vec3 dir, float max_dist);
 
 /* ================================================================== */
+/* Overlap queries (Unity-style Physics.Overlap*)                      */
+/* ================================================================== */
+
+/* shape: 0=sphere(half_ext.x=radius), 1=box(half_ext), 2=capsule(x=radius,y=halfH).
+ * Writes up to `cap` body indices to out_bodies; returns count actually
+ * written.  collision_mask filters which groups are considered. */
+uint32_t jce_bullet_overlap_shape(JceBulletWorld *bw,
+                                  uint8_t shape, jce_vec3 center,
+                                  jce_quat rot, jce_vec3 half_ext,
+                                  uint16_t collision_mask,
+                                  uint32_t *out_bodies, uint32_t cap);
+
+/* Convex sweep — returns first hit along `dir` for `max_dist`.  Same
+ * shape encoding as overlap_shape.  Result.body_idx == UINT32_MAX iff no
+ * hit. */
+JceBulletRayResult jce_bullet_shape_cast(JceBulletWorld *bw,
+                                         uint8_t shape,
+                                         jce_vec3 origin, jce_quat rot,
+                                         jce_vec3 half_ext,
+                                         jce_vec3 dir, float max_dist);
+
+/* ================================================================== */
 /* Contact callbacks                                                   */
 /* ================================================================== */
 

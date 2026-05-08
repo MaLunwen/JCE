@@ -1138,6 +1138,31 @@ JCE_API uint64_t jce_scene_get_component_flags(const JceScene *s, JceEntity e);
 typedef void (*JceEntityCallback)(JceScene *s, JceEntity e, void *user_data);
 JCE_API void jce_scene_each_entity(JceScene *s, JceEntityCallback cb, void *user_data);
 
+/* ── Discovery (Unity-style GameObject.Find / FindWithTag) ───────── */
+
+/* Return the first entity whose display-name (EditorMeta.name if present,
+ * else flecs registered name) matches `name` exactly.  Returns
+ * JCE_ENTITY_INVALID if none. */
+JCE_API JceEntity jce_scene_find_by_name(const JceScene *s, const char *name);
+
+/* Return the first entity whose EditorMeta.tag matches `tag`.  Entities
+ * without EditorMeta are skipped.  JCE_ENTITY_INVALID if none. */
+JCE_API JceEntity jce_scene_find_by_tag(const JceScene *s, const char *tag);
+
+/* Collect up to `max_out` entities whose EditorMeta.tag matches `tag`.
+ * Returns the actual count written. */
+JCE_API uint32_t  jce_scene_find_all_by_tag(const JceScene *s, const char *tag,
+                                            JceEntity *out, uint32_t max_out);
+
+/* Collect up to `max_out` entities that carry every component bit set
+ * in `component_flags` (a bitmask of JCE_COMP_FLAG_*).  Pass a single
+ * flag to find all entities with one component (Unity's
+ * Object.FindObjectsOfType<T>()). */
+JCE_API uint32_t  jce_scene_find_all_with_components(const JceScene *s,
+                                                     uint64_t component_flags,
+                                                     JceEntity *out,
+                                                     uint32_t max_out);
+
 /* Get the flecs world (for advanced queries). */
 JCE_API void *jce_scene_get_world(JceScene *s);
 

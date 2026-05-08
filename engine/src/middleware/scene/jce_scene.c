@@ -440,6 +440,100 @@ void jce_scene_each_entity(JceScene *s, JceEntityCallback cb, void *user_data)
     ecs_query_fini(q);
 }
 
+/* ── Discovery (Unity-style GameObject.Find / FindWithTag) ────────── */
+
+/* Resolve display name: EditorMeta.name if present and non-empty,
+ * otherwise the flecs registered name. */
+static const char *display_name(const JceScene *s, JceEntity e)
+{
+    JceEditorMeta *meta = jce_scene_get_editor_meta((JceScene *)s, e);
+    if (meta && meta->name[0]) return meta->name;
+    return jce_scene_entity_registered_name(s, e);
+}
+
+JceEntity jce_scene_find_by_name(const JceScene *s, const char *name)
+{
+    if (!s || !name) return JCE_ENTITY_INVALID;
+    JceEntity found = JCE_ENTITY_INVALID;
+
+    ecs_query_t *q = ecs_query(((JceScene *)s)->world, {
+        .terms = {{ .id = ecs_id(JceTransform) }},
+    });
+    ecs_iter_t it = ecs_query_iter(((JceScene *)s)->world, q);
+    while (ecs_query_next(&it) && !found) {
+        for (int i = 0; i < it.count; i++) {
+            JceEntity e = (JceEntity)it.entities[i];
+            const char *dn = display_name(s, e);
+            if (dn && strcmp(dn, name) == 0) { found = e; break; }
+        }
+    }
+    ecs_query_fini(q);
+    return found;
+}
+
+JceEntity jce_scene_find_by_tag(const JceScene *s, const char *tag)
+{
+    if (!s || !tag) return JCE_ENTITY_INVALID;
+    JceEntity found = JCE_ENTITY_INVALID;
+
+    ecs_query_t *q = ecs_query(((JceScene *)s)->world, {
+        .terms = {{ .id = ecs_id(JceTransform) }},
+    });
+    ecs_iter_t it = ecs_query_iter(((JceScene *)s)->world, q);
+    while (ecs_query_next(&it) && !found) {
+        for (int i = 0; i < it.count; i++) {
+            JceEntity e = (JceEntity)it.entities[i];
+            JceEditorMeta *m = jce_scene_get_editor_meta((JceScene *)s, e);
+            if (m && strcmp(m->tag, tag) == 0) { found = e; break; }
+        }
+    }
+    ecs_query_fini(q);
+    return found;
+}
+
+uint32_t jce_scene_find_all_by_tag(const JceScene *s, const char *tag,
+                                   JceEntity *out, uint32_t max_out)
+{
+    if (!s || !tag || !out || max_out == 0) return 0;
+    uint32_t n = 0;
+
+    ecs_query_t *q = ecs_query(((JceScene *)s)->world, {
+        .terms = {{ .id = ecs_id(JceTransform) }},
+    });
+    ecs_iter_t it = ecs_query_iter(((JceScene *)s)->world, q);
+    while (ecs_query_next(&it) && n < max_out) {
+        for (int i = 0; i < it.count && n < max_out; i++) {
+            JceEntity e = (JceEntity)it.entities[i];
+            JceEditorMeta *m = jce_scene_get_editor_meta((JceScene *)s, e);
+            if (m && strcmp(m->tag, tag) == 0) out[n++] = e;
+        }
+    }
+    ecs_query_fini(q);
+    return n;
+}
+
+uint32_t jce_scene_find_all_with_components(const JceScene *s,
+                                            uint64_t component_flags,
+                                            JceEntity *out, uint32_t max_out)
+{
+    if (!s || !out || max_out == 0 || component_flags == 0) return 0;
+    uint32_t n = 0;
+
+    ecs_query_t *q = ecs_query(((JceScene *)s)->world, {
+        .terms = {{ .id = ecs_id(JceTransform) }},
+    });
+    ecs_iter_t it = ecs_query_iter(((JceScene *)s)->world, q);
+    while (ecs_query_next(&it) && n < max_out) {
+        for (int i = 0; i < it.count && n < max_out; i++) {
+            JceEntity e = (JceEntity)it.entities[i];
+            uint64_t flags = jce_scene_get_component_flags(s, e);
+            if ((flags & component_flags) == component_flags) out[n++] = e;
+        }
+    }
+    ecs_query_fini(q);
+    return n;
+}
+
 void *jce_scene_get_world(JceScene *s)
 {
     return s ? s->world : NULL;

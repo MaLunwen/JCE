@@ -297,6 +297,148 @@ JceRaycastResult jce_physics_raycast(const JcePhysicsWorld *world,
     return result;
 }
 
+/* ── Overlap & shape-cast queries ─────────────────────────────────── */
+
+#define JCE_OVERLAP_LOCAL_CAP 64u
+
+static uint32_t overlap_dispatch(const JcePhysicsWorld *world,
+                                 uint8_t shape, jce_vec3 center,
+                                 jce_quat rot, jce_vec3 half_ext,
+                                 uint16_t mask,
+                                 JceBodyHandle *out, uint32_t cap)
+{
+    if (!world || !out || cap == 0) return 0;
+    /* Bullet bridge writes raw indices; translate to handles. */
+    uint32_t local[JCE_OVERLAP_LOCAL_CAP];
+    uint32_t use_cap = cap < JCE_OVERLAP_LOCAL_CAP ? cap : JCE_OVERLAP_LOCAL_CAP;
+    uint32_t n = jce_bullet_overlap_shape(
+        (JceBulletWorld *)world->bullet, shape, center, rot, half_ext,
+        mask, local, use_cap);
+    for (uint32_t i = 0; i < n; ++i)
+        out[i] = (JceBodyHandle){ local[i] };
+    return n;
+}
+
+uint32_t jce_physics_overlap_sphere(const JcePhysicsWorld *world,
+                                    jce_vec3 center, float radius,
+                                    uint16_t collision_mask,
+                                    JceBodyHandle *out_bodies,
+                                    uint32_t max_bodies)
+{
+    JCE_PROFILE_ZONE_N("Physics::overlap_sphere");
+    jce_vec3 he = { radius, 0.0f, 0.0f };
+    jce_quat id = { 0.0f, 0.0f, 0.0f, 1.0f };
+    uint32_t n = overlap_dispatch(world, 0, center, id, he, collision_mask,
+                                  out_bodies, max_bodies);
+    JCE_PROFILE_ZONE_END;
+    return n;
+}
+
+uint32_t jce_physics_overlap_box(const JcePhysicsWorld *world,
+                                 jce_vec3 center, jce_vec3 half_extents,
+                                 jce_quat rotation,
+                                 uint16_t collision_mask,
+                                 JceBodyHandle *out_bodies,
+                                 uint32_t max_bodies)
+{
+    JCE_PROFILE_ZONE_N("Physics::overlap_box");
+    uint32_t n = overlap_dispatch(world, 1, center, rotation, half_extents,
+                                  collision_mask, out_bodies, max_bodies);
+    JCE_PROFILE_ZONE_END;
+    return n;
+}
+
+uint32_t jce_physics_overlap_capsule(const JcePhysicsWorld *world,
+                                     jce_vec3 center, float radius,
+                                     float half_height, jce_quat rotation,
+                                     uint16_t collision_mask,
+                                     JceBodyHandle *out_bodies,
+                                     uint32_t max_bodies)
+{
+    JCE_PROFILE_ZONE_N("Physics::overlap_capsule");
+    jce_vec3 he = { radius, half_height, 0.0f };
+    uint32_t n = overlap_dispatch(world, 2, center, rotation, he,
+                                  collision_mask, out_bodies, max_bodies);
+    JCE_PROFILE_ZONE_END;
+    return n;
+}
+
+bool jce_physics_check_sphere(const JcePhysicsWorld *world,
+                              jce_vec3 center, float radius, uint16_t mask)
+{
+    JceBodyHandle one[1];
+    return jce_physics_overlap_sphere(world, center, radius, mask, one, 1) > 0u;
+}
+
+bool jce_physics_check_box(const JcePhysicsWorld *world,
+                           jce_vec3 center, jce_vec3 half_extents,
+                           jce_quat rotation, uint16_t mask)
+{
+    JceBodyHandle one[1];
+    return jce_physics_overlap_box(world, center, half_extents, rotation,
+                                   mask, one, 1) > 0u;
+}
+
+bool jce_physics_check_capsule(const JcePhysicsWorld *world,
+                               jce_vec3 center, float radius,
+                               float half_height, jce_quat rotation,
+                               uint16_t mask)
+{
+    JceBodyHandle one[1];
+    return jce_physics_overlap_capsule(world, center, radius, half_height,
+                                       rotation, mask, one, 1) > 0u;
+}
+
+static JceRaycastResult shape_cast_dispatch(const JcePhysicsWorld *world,
+                                            uint8_t shape, jce_vec3 origin,
+                                            jce_quat rot, jce_vec3 half_ext,
+                                            jce_vec3 dir, float max_dist)
+{
+    JceRaycastResult result;
+    memset(&result, 0, sizeof(result));
+    result.body = JCE_BODY_INVALID;
+    if (!world) return result;
+
+    JceBulletRayResult br = jce_bullet_shape_cast(
+        (JceBulletWorld *)world->bullet, shape, origin, rot, half_ext,
+        dir, max_dist);
+    result.hit      = br.hit;
+    result.point    = br.point;
+    result.normal   = br.normal;
+    result.distance = br.distance;
+    result.body     = (JceBodyHandle){ br.body_idx };
+    return result;
+}
+
+JceRaycastResult jce_physics_sphere_cast(const JcePhysicsWorld *world,
+                                         jce_vec3 origin, float radius,
+                                         jce_vec3 direction, float max_distance)
+{
+    jce_vec3 he = { radius, 0.0f, 0.0f };
+    jce_quat id = { 0.0f, 0.0f, 0.0f, 1.0f };
+    return shape_cast_dispatch(world, 0, origin, id, he, direction, max_distance);
+}
+
+JceRaycastResult jce_physics_box_cast(const JcePhysicsWorld *world,
+                                      jce_vec3 origin, jce_vec3 half_extents,
+                                      jce_quat rotation, jce_vec3 direction,
+                                      float max_distance)
+{
+    return shape_cast_dispatch(world, 1, origin, rotation, half_extents,
+                               direction, max_distance);
+}
+
+JceRaycastResult jce_physics_capsule_cast(const JcePhysicsWorld *world,
+                                          jce_vec3 origin, float radius,
+                                          float half_height, jce_quat rotation,
+                                          jce_vec3 direction,
+                                          float max_distance)
+{
+    jce_vec3 he = { radius, half_height, 0.0f };
+    return shape_cast_dispatch(world, 2, origin, rotation, he,
+                               direction, max_distance);
+}
+
 /* ── Contact callbacks ─────────────────────────────────────────────── */
 
 void jce_physics_set_contact_begin(JcePhysicsWorld *world,

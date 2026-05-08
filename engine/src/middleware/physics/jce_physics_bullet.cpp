@@ -663,6 +663,143 @@ JceBulletRayResult jce_bullet_raycast(JceBulletWorld *bw, jce_vec3 origin,
 }
 
 /* ================================================================== */
+/* Overlap / shape-cast queries                                        */
+/* ================================================================== */
+
+/* Allocate a Bullet convex shape matching the JCE shape encoding.
+ * Caller must `delete` it after use. */
+static btConvexShape *make_query_shape(uint8_t shape, jce_vec3 half_ext)
+{
+    switch (shape) {
+        case 0: /* sphere */
+            return new btSphereShape(static_cast<btScalar>(half_ext.x));
+        case 2: /* capsule */
+            return new btCapsuleShape(
+                static_cast<btScalar>(half_ext.x),
+                static_cast<btScalar>(half_ext.y * 2.0f));
+        case 1: /* box */
+        default:
+            return new btBoxShape(to_bt(half_ext));
+    }
+}
+
+namespace {
+struct OverlapCollector : public btCollisionWorld::ContactResultCallback {
+    uint32_t *out;
+    uint32_t  cap;
+    uint32_t  count;
+    uint16_t  mask;
+
+    OverlapCollector(uint32_t *o, uint32_t c, uint16_t m)
+        : out(o), cap(c), count(0), mask(m) {}
+
+    btScalar addSingleResult(btManifoldPoint &,
+                             const btCollisionObjectWrapper *colObj0Wrap, int, int,
+                             const btCollisionObjectWrapper *colObj1Wrap, int, int) override
+    {
+        if (count >= cap) return 0;
+        /* The query object is one of the two; pick the OTHER one. */
+        const btCollisionObject *other =
+            (colObj0Wrap->getCollisionObject() == m_self)
+                ? colObj1Wrap->getCollisionObject()
+                : colObj0Wrap->getCollisionObject();
+        if (!other) return 0;
+        /* Mask filter — broadphase already prunes most, but be defensive. */
+        if (mask != 0xFFFF) {
+            const btBroadphaseProxy *bp = other->getBroadphaseHandle();
+            if (bp && (bp->m_collisionFilterGroup & mask) == 0) return 0;
+        }
+        uint32_t idx = static_cast<uint32_t>(
+            reinterpret_cast<uintptr_t>(other->getUserPointer()));
+        /* De-dup against earlier hits (same body can register multiple
+         * contact points). */
+        for (uint32_t i = 0; i < count; ++i)
+            if (out[i] == idx) return 0;
+        out[count++] = idx;
+        return 0;
+    }
+
+    /* Set by caller before contactTest so addSingleResult can identify
+     * which side of the pair is the query body. */
+    const btCollisionObject *m_self = nullptr;
+};
+} /* anonymous namespace */
+
+uint32_t jce_bullet_overlap_shape(JceBulletWorld *bw,
+                                  uint8_t shape, jce_vec3 center,
+                                  jce_quat rot, jce_vec3 half_ext,
+                                  uint16_t collision_mask,
+                                  uint32_t *out_bodies, uint32_t cap)
+{
+    if (!bw || !bw->world || !out_bodies || cap == 0) return 0;
+
+    btConvexShape *qshape = make_query_shape(shape, half_ext);
+    btCollisionObject *qobj = new btCollisionObject();
+    qobj->setCollisionShape(qshape);
+    btTransform xf;
+    xf.setIdentity();
+    xf.setOrigin(to_bt(center));
+    xf.setRotation(to_bt_q(rot));
+    qobj->setWorldTransform(xf);
+
+    OverlapCollector cb(out_bodies, cap, collision_mask);
+    cb.m_self = qobj;
+    cb.m_collisionFilterMask  = collision_mask;
+    cb.m_collisionFilterGroup = 1; /* arbitrary; Bullet checks both ways */
+
+    bw->world->contactTest(qobj, cb);
+
+    delete qobj;
+    delete qshape;
+    return cb.count;
+}
+
+JceBulletRayResult jce_bullet_shape_cast(JceBulletWorld *bw,
+                                         uint8_t shape,
+                                         jce_vec3 origin, jce_quat rot,
+                                         jce_vec3 half_ext,
+                                         jce_vec3 dir, float max_dist)
+{
+    JceBulletRayResult result;
+    std::memset(&result, 0, sizeof(result));
+    result.body_idx = UINT32_MAX;
+
+    if (!bw || !bw->world) return result;
+
+    btConvexShape *qshape = make_query_shape(shape, half_ext);
+
+    btTransform from, to;
+    from.setIdentity();
+    to.setIdentity();
+    from.setOrigin(to_bt(origin));
+    from.setRotation(to_bt_q(rot));
+    btVector3 d = to_bt(dir);
+    btScalar  dlen = d.length();
+    if (dlen < SIMD_EPSILON) { delete qshape; return result; }
+    d /= dlen;
+    to.setOrigin(from.getOrigin() + d * static_cast<btScalar>(max_dist));
+    to.setRotation(from.getRotation());
+
+    btCollisionWorld::ClosestConvexResultCallback ccb(
+        from.getOrigin(), to.getOrigin());
+    bw->world->convexSweepTest(qshape, from, to, ccb);
+
+    if (ccb.hasHit()) {
+        result.hit      = true;
+        result.point    = from_bt_v3(ccb.m_hitPointWorld);
+        result.normal   = from_bt_v3(ccb.m_hitNormalWorld);
+        result.distance = static_cast<float>(max_dist) * ccb.m_closestHitFraction;
+        if (ccb.m_hitCollisionObject) {
+            result.body_idx = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
+                ccb.m_hitCollisionObject->getUserPointer()));
+        }
+    }
+
+    delete qshape;
+    return result;
+}
+
+/* ================================================================== */
 /* Contact callback registration                                       */
 /* ================================================================== */
 

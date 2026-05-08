@@ -48,6 +48,41 @@ void collect_cb(JceScene *s, JceEntity e, void *ud)
 
 } /* namespace */
 
+/* Spawn a new entity with a default Reverb Zone component, ready for
+ * the user to position via the Inspector / scene gizmo. */
+static void create_default_reverb_zone(JceScene *scene)
+{
+    if (!scene) return;
+    JceEntity e = jce_scene_create_entity(scene, "Reverb Zone");
+    if (e == JCE_ENTITY_INVALID) return;
+
+    /* Identity transform at the origin. */
+    JceTransform t = {};
+    t.scale.x = t.scale.y = t.scale.z = 1.0f;
+    t.rotation.w = 1.0f;
+    jce_scene_set_transform(scene, e, &t);
+
+    JceAudioReverbZoneComponent rz{};
+    rz.preset       = 1;       /* Generic */
+    rz.min_distance = 5.0f;
+    rz.max_distance = 25.0f;
+    /* User preset defaults — in case user switches preset to USER. */
+    rz.room               = -1000.0f;
+    rz.room_hf            = -100.0f;
+    rz.decay_time         = 1.49f;
+    rz.decay_hf_ratio     = 0.83f;
+    rz.reflections        = -2602.0f;
+    rz.reflections_delay  = 0.007f;
+    rz.reverb             = 200.0f;
+    rz.reverb_delay       = 0.011f;
+    rz.hf_reference       = 5000.0f;
+    rz.diffusion          = 100.0f;
+    rz.density            = 100.0f;
+    jce_scene_set_audio_reverb_zone(scene, e, &rz);
+
+    jce_state_select_entity((uint32_t)e, false);
+}
+
 extern "C" void jce_editor_panel_reverb_zones_content(void)
 {
     JceScene *scene = jce_state_get_scene();
@@ -56,6 +91,8 @@ extern "C" void jce_editor_panel_reverb_zones_content(void)
     std::vector<RZRow> rows;
     jce_scene_each_entity(scene, collect_cb, &rows);
 
+    if (ImGui::Button("+ Create Zone")) create_default_reverb_zone(scene);
+    ImGui::SameLine();
     ImGui::Text("%s %zu", jce_editor_i18n("reverbZones.count"), rows.size());
     ImGui::Separator();
     if (rows.empty()) {

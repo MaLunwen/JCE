@@ -8,6 +8,7 @@
 
 #include <jce/application/jce_app_interface.h>
 #include <jce/application/jce_engine.h>
+#include <jce/application/jce_time.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/os/core/jce_thread.h>
 #include <jce/os/core/jce_timer.h>
@@ -145,6 +146,9 @@ static void jce_engine_reset_frame_clock(JceEngine *e)
     if (!e) return;
     e->perf_freq = jce_time_perf_freq();
     e->frame_counter_prev = jce_time_perf_counter();
+    /* Reset the global Time singleton in lock-step with the frame clock
+     * so realtime / frame_count stay consistent across resets. */
+    jce_time_reset();
 }
 
 static uint32_t read_positive_u32_env(const char *env_name, uint32_t fallback)
@@ -758,6 +762,10 @@ JceAppResult jce_engine_iterate(JceEngine *e)
 
     if (dt < 0.0f) dt = 0.0f;
     if (dt > JCE_MAX_FRAME_DT) dt = JCE_MAX_FRAME_DT;
+
+    /* Publish dt to the global Time singleton so game code can read
+     * jce_time_delta() / jce_time_realtime_since_startup() etc. */
+    jce_time_advance(dt);
 
     if (g_app_desc.should_quit) {
         if (g_app_desc.should_quit(g_app_desc.user_data))
