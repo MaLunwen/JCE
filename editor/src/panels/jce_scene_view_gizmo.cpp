@@ -6,6 +6,34 @@
 
 #include "jce_scene_view_internal.h"
 
+/* ── User-configurable snap steps (Edit > Snap Settings) ────────────
+ *
+ * Held in this TU (unique owner), exposed via inline accessors below
+ * so the Scene View toolbar UI can read & write them without pulling
+ * a second header.  Defaults match the original hardcoded constants
+ * so behaviour is unchanged until the user adjusts them. */
+
+static float s_snap_translate_step = 0.5f;
+static float s_snap_angle_step     = 15.0f;
+static float s_snap_scale_step     = 0.25f;
+
+extern "C" float jce_editor_get_snap_translate_step(void) { return s_snap_translate_step; }
+extern "C" float jce_editor_get_snap_angle_step    (void) { return s_snap_angle_step;     }
+extern "C" float jce_editor_get_snap_scale_step    (void) { return s_snap_scale_step;     }
+
+extern "C" void jce_editor_set_snap_translate_step(float v) {
+    if (v < 0.001f) v = 0.001f;
+    s_snap_translate_step = v;
+}
+extern "C" void jce_editor_set_snap_angle_step(float v) {
+    if (v < 0.1f) v = 0.1f;
+    s_snap_angle_step = v;
+}
+extern "C" void jce_editor_set_snap_scale_step(float v) {
+    if (v < 0.001f) v = 0.001f;
+    s_snap_scale_step = v;
+}
+
 /* ── Selection box (marquee) ─────────────────────────────────────── */
 
 void handle_scene_selection_box(const SceneViewCtx *ctx)
@@ -241,9 +269,9 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
      * preventing the final value from drifting to the un-snapped raw
      * position. */
     if (ImGui::GetIO().KeyCtrl && (gizmo_dragging_before || gizmo_dragging_after)) {
-        const float snap_translate = 0.5f;
-        const float snap_angle     = 15.0f;
-        const float snap_scale     = 0.25f;
+        const float snap_translate = s_snap_translate_step;
+        const float snap_angle     = s_snap_angle_step;
+        const float snap_scale     = s_snap_scale_step;
         switch (active_gm) {
             case JCE_GIZMO_TRANSLATE:
                 gizmo_pos[0] = roundf(gizmo_pos[0] / snap_translate) * snap_translate;

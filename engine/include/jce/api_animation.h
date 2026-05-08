@@ -13,6 +13,7 @@ extern "C" {
 #endif
 
 #include <jce/middleware/animation/jce_animation.h>
+#include <jce/middleware/animation/jce_anim_layers.h>
 #include <jce/middleware/animation/jce_skeleton.h>
 #include <jce/middleware/animation/jce_anim_sm.h>
 #include <jce/middleware/animation/jce_anim_sm_binding.h>

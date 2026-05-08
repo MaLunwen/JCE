@@ -223,3 +223,53 @@ void jce_registry_clear(JceAssetRegistry *reg)
     memset(reg->buckets, 0, reg->capacity * sizeof(JceRegistryEntry));
     reg->count = 0;
 }
+
+/* ── Label management ─────────────────────────────────────────────── */
+
+/* Internal helper: find the bucket index of a path_hash, or UINT32_MAX
+ * if not present.  Mirrors the probe logic used by find/remove. */
+static uint32_t find_bucket(const JceAssetRegistry *reg, uint64_t path_hash)
+{
+    if (!reg || !reg->buckets || reg->count == 0) return UINT32_MAX;
+    uint32_t mask = reg->capacity - 1;
+    uint32_t idx  = bucket_index(path_hash, mask);
+    for (uint32_t i = 0; i < reg->capacity; ++i) {
+        uint32_t probe = (idx + i) & mask;
+        const JceRegistryEntry *e = &reg->buckets[probe];
+        if (!e->occupied) return UINT32_MAX;
+        if (e->path_hash == path_hash) return probe;
+    }
+    return UINT32_MAX;
+}
+
+bool jce_registry_set_labels(JceAssetRegistry *reg,
+                              uint64_t path_hash, uint64_t label_bits)
+{
+    uint32_t idx = find_bucket(reg, path_hash);
+    if (idx == UINT32_MAX) return false;
+    reg->buckets[idx].label_bits = label_bits;
+    return true;
+}
+
+uint64_t jce_registry_get_labels(const JceAssetRegistry *reg, uint64_t path_hash)
+{
+    uint32_t idx = find_bucket(reg, path_hash);
+    if (idx == UINT32_MAX) return 0;
+    return reg->buckets[idx].label_bits;
+}
+
+uint32_t jce_registry_find_by_labels(const JceAssetRegistry *reg,
+                                      uint64_t label_bits,
+                                      uint16_t *out_slots, uint32_t max_out)
+{
+    if (!reg || !reg->buckets || !out_slots || max_out == 0 || label_bits == 0)
+        return 0;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < reg->capacity && n < max_out; ++i) {
+        const JceRegistryEntry *e = &reg->buckets[i];
+        if (!e->occupied) continue;
+        if ((e->label_bits & label_bits) == 0) continue;
+        out_slots[n++] = e->slot_index;
+    }
+    return n;
+}

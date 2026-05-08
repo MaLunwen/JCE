@@ -21,6 +21,7 @@ extern "C" {
 /* Registry entry stored in the hash map. */
 typedef struct JceRegistryEntry {
     uint64_t path_hash;      /* XXH3_64bits of virtual path */
+    uint64_t label_bits;     /* up to 64 user-defined labels (Addressables-style). */
     uint16_t slot_index;     /* index into asset slot array */
     bool     occupied;       /* true if this bucket is in use */
 } JceRegistryEntry;
@@ -55,6 +56,21 @@ bool jce_registry_remove(JceAssetRegistry *reg, uint64_t path_hash);
 
 /* Clear all entries without freeing bucket memory. */
 void jce_registry_clear(JceAssetRegistry *reg);
+
+/* Label management.  Labels are a 64-bit bitmask per asset; callers
+ * map symbolic names to bit positions externally (see
+ * jce_asset_labels.h public API for the recommended pattern). */
+bool     jce_registry_set_labels(JceAssetRegistry *reg,
+                                 uint64_t path_hash, uint64_t label_bits);
+uint64_t jce_registry_get_labels(const JceAssetRegistry *reg,
+                                 uint64_t path_hash);
+
+/* Collect slot indices of every asset whose label_bits intersects
+ * `label_bits`.  Writes up to `max_out` slots; returns the count. */
+uint32_t jce_registry_find_by_labels(const JceAssetRegistry *reg,
+                                     uint64_t  label_bits,
+                                     uint16_t *out_slots,
+                                     uint32_t  max_out);
 
 #ifdef __cplusplus
 }

@@ -88,19 +88,12 @@ void jce_anim_clip_sample(const JceAnimClip *clip, float time,
 
 typedef struct JceAnimPlayer JceAnimPlayer;
 
-/* Animation event — fired when playback time crosses `time`.
- * Mirror of the public API definition in
- * <jce/middleware/animation/jce_animation.h>. */
-#ifndef JCE_ANIM_MAX_EVENTS
-#define JCE_ANIM_MAX_EVENTS 32
+/* JceAnimEvent + JceAnimEventFn live in the public header; pull them
+ * in here when the public guard hasn't been seen yet so this internal
+ * header remains usable in implementations that only include it. */
+#ifndef JCE_ANIMATION_PUBLIC_H
+#  include <jce/middleware/animation/jce_animation.h>
 #endif
-typedef struct {
-    float time;
-    char  name[48];
-    int   int_payload;
-    float float_payload;
-} JceAnimEvent;
-typedef void (*JceAnimEventFn)(const JceAnimEvent *evt, void *user_data);
 
 /* Create a player bound to a skeleton (for joint count / rest pose). */
 JceAnimPlayer *jce_anim_player_create(const JceSkeleton *skel);

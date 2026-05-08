@@ -95,6 +95,54 @@ JceShaderHandle jce_shader_manager_acquire(JceShaderManager *mgr,
     return h;
 }
 
+JceShaderHandle jce_shader_manager_acquire_variant(JceShaderManager *mgr,
+                                                    const char *base,
+                                                    JceShaderKeywordSet set)
+{
+    if (!mgr || !base) return JCE_INVALID_SHADER;
+    if (set == 0) return jce_shader_manager_acquire(mgr, base);
+
+    /* Build canonical variant name and try to load it.  If the variant
+     * binary doesn't exist on disk / in the PAK, fall back to the base
+     * so the renderer still draws (possibly with the wrong keywords
+     * compiled in, but that's the cooker's job to surface). */
+    char variant[160];
+    uint32_t n = jce_shader_variant_resolve_name(base, set,
+                                                 variant, sizeof(variant));
+    if (n == 0) return jce_shader_manager_acquire(mgr, base);
+
+    /* First check the cache for the variant; if missing, attempt to
+     * load it; on failure, transparently fall through to the base. */
+    for (int i = 0; i < mgr->count; i++) {
+        if (strcmp(mgr->entries[i].name, variant) == 0) {
+            mgr->entries[i].ref_count++;
+            return mgr->entries[i].handle;
+        }
+    }
+
+    if (mgr->count < MAX_SHADERS) {
+        JceShaderHandle h = mgr->has_dev_dir
+            ? shader_load_program_fs(mgr->dev_dir, variant)
+            : shader_load_program(mgr->pak, variant);
+        if (!jce_shader_valid(h) && mgr->has_dev_dir)
+            h = shader_load_program(mgr->pak, variant);
+        if (jce_shader_valid(h)) {
+            ShaderEntry *e = &mgr->entries[mgr->count++];
+            snprintf(e->name, MAX_NAME_LEN, "%s", variant);
+            e->handle    = h;
+            e->ref_count = 1;
+            LOG_INFO(LOG_TAG, "loaded shader variant '%s'", variant);
+            return h;
+        }
+    }
+
+    /* Variant unavailable — fall back to the base.  Logged once per
+     * miss to help cooker debugging without spamming. */
+    LOG_INFO(LOG_TAG, "variant '%s' not found, falling back to '%s'",
+             variant, base);
+    return jce_shader_manager_acquire(mgr, base);
+}
+
 void jce_shader_manager_release(JceShaderManager *mgr, const char *name)
 {
     if (!mgr || !name) return;

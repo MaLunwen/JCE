@@ -166,3 +166,42 @@ uint32_t jce_prefab_count_instances(const JceScene *scene,
     jce_scene_each_entity((JceScene *)scene, count_cb, &ctx);
     return ctx.count;
 }
+
+/* ── Variant support ──────────────────────────────────────────────── */
+
+static uint32_t mark_variant_recursive(JceScene *scene, JceEntity e,
+                                       const char *parent_path)
+{
+    uint32_t n = 0;
+    JceEditorMeta *m = jce_scene_get_editor_meta(scene, e);
+    if (m) {
+        size_t cap = sizeof(m->variant_parent_path);
+        strncpy(m->variant_parent_path, parent_path, cap - 1);
+        m->variant_parent_path[cap - 1] = '\0';
+        n++;
+    }
+    /* Recurse into children. */
+    JceEntity kids[64];
+    int kc = jce_scene_get_children(scene, e, kids, 64);
+    for (int i = 0; i < kc; ++i)
+        n += mark_variant_recursive(scene, kids[i], parent_path);
+    return n;
+}
+
+uint32_t jce_prefab_mark_as_variant(JceScene *scene, JceEntity root,
+                                    const char *parent_virtual_path)
+{
+    if (!scene || !root || !parent_virtual_path) return 0;
+    return mark_variant_recursive(scene, root, parent_virtual_path);
+}
+
+bool jce_prefab_save_subtree_as_variant(JceScene *scene, JceEntity root,
+                                         const char *output_path,
+                                         const char *parent_virtual_path)
+{
+    if (!scene || !root || !output_path || !parent_virtual_path) return false;
+    /* Tag in-scene first so the serialiser captures the variant link. */
+    if (jce_prefab_mark_as_variant(scene, root, parent_virtual_path) == 0)
+        return false;
+    return jce_prefab_save_subtree(scene, root, output_path);
+}

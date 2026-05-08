@@ -30,6 +30,16 @@ void              jce_shader_manager_destroy(JceShaderManager *mgr);
 JceShaderHandle jce_shader_manager_acquire(JceShaderManager *mgr,
                                             const char *name);
 
+/* Acquire a shader variant compiled with the keyword bits in `set`
+ * (see jce_shader_variant.h).  Looks up "<base>_<KW1>_<KW2>"; falls
+ * back to the base shader if the variant binary doesn't exist.  This
+ * lets material code call set/clear keywords without having to author
+ * separate program names. */
+#include <jce/resource/jce_shader_variant.h>
+JceShaderHandle jce_shader_manager_acquire_variant(JceShaderManager *mgr,
+                                                    const char *base,
+                                                    JceShaderKeywordSet set);
+
 /* Release a shader (ref-count decrement; destroyed at zero). */
 void jce_shader_manager_release(JceShaderManager *mgr,
                                  const char *name);

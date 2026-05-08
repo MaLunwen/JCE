@@ -701,6 +701,12 @@ static void parse_editor_meta(JceScene *s, JceEntity e, const cJSON *c)
     m.enabled         = j_bool(c, "enabled", true);
     m.prefab_instance = j_bool(c, "prefabInstance", false);
     copy_str(m.prefab_path, sizeof(m.prefab_path), j_str(c, "prefabPath", ""));
+    /* Prefab Variant: see writer side for context.  Empty string means
+     * "not a variant" — variant_parent_path may coexist with
+     * prefab_path/prefab_instance when the variant is itself an instance
+     * placed in the scene. */
+    copy_str(m.variant_parent_path, sizeof(m.variant_parent_path),
+             j_str(c, "variantParentPath", ""));
     m.layer = (int)j_num(c, "layer", 0);
     if (m.layer < 0 || m.layer > 31) m.layer = 0;
     jce_scene_set_editor_meta(s, e, &m);
@@ -2516,6 +2522,11 @@ static void ser_editor_meta(const JceEditorMeta *m, cJSON *arr)
         if (m->prefab_path[0] != '\0')
             cJSON_AddStringToObject(o, "prefabPath", m->prefab_path);
     }
+    /* Prefab Variant: when this entity was created via "Save as
+     * Variant", record the parent prefab path so reload reconstructs
+     * the inheritance chain. */
+    if (m->variant_parent_path[0] != '\0')
+        cJSON_AddStringToObject(o, "variantParentPath", m->variant_parent_path);
     if (m->layer != 0)
         cJSON_AddNumberToObject(o, "layer", m->layer);
     cJSON_AddItemToArray(arr, o);
@@ -2912,6 +2923,11 @@ int jce_scene_load_json(JceScene *scene, const cJSON *root)
                 if (has_pi) m->prefab_instance = j_bool(eobj, "prefabInstance", false);
                 if (has_pp) copy_str(m->prefab_path, sizeof(m->prefab_path),
                                      j_str(eobj, "prefabPath", ""));
+                /* Variant inheritance link — defaults to "" (not a variant). */
+                if (cJSON_HasObjectItem(eobj, "variantParentPath"))
+                    copy_str(m->variant_parent_path,
+                             sizeof(m->variant_parent_path),
+                             j_str(eobj, "variantParentPath", ""));
             }
         }
 

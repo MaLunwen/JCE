@@ -75,6 +75,26 @@ JCE_API JceEntity jce_prefab_instantiate_file(JceScene       *scene,
 JCE_API uint32_t jce_prefab_count_instances(const JceScene *scene,
                                               const char     *virtual_path);
 
+/* ── Variant support ──────────────────────────────────────────────── */
+
+/* Tag every entity in the subtree rooted at `root` as a variant of
+ * the prefab at `parent_virtual_path`.  Sets EditorMeta.variant_parent_path
+ * on each so the link round-trips through scene serialization.
+ * Returns the number of entities tagged. */
+JCE_API uint32_t jce_prefab_mark_as_variant(JceScene   *scene,
+                                              JceEntity   root,
+                                              const char *parent_virtual_path);
+
+/* Save a subtree as a variant of an existing prefab.  Identical to
+ * jce_prefab_save_subtree() except the saved file's entities carry
+ * variant_parent_path so reloading reconstructs the chain.  The base
+ * prefab file at `parent_virtual_path` is NOT modified — variants
+ * are independent files that just remember their parent. */
+JCE_API bool jce_prefab_save_subtree_as_variant(JceScene   *scene,
+                                                  JceEntity   root,
+                                                  const char *output_path,
+                                                  const char *parent_virtual_path);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_PREFAB_H */

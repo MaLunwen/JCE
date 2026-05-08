@@ -161,6 +161,27 @@ static void draw_scene_view_toolbar(void)
         if (ImGui::MenuItem(jce_editor_i18n("sceneView.frontView")))    { jce_editor_scene_camera_snap_view(JCE_CAM_VIEW_FRONT); }
         if (ImGui::MenuItem(jce_editor_i18n("sceneView.sideView")))     { jce_editor_scene_camera_snap_view(JCE_CAM_VIEW_RIGHT); }
 
+        ImGui::Separator();
+        /* Snap Settings — Unity has a separate Increment Snap window;
+         * keep it in-line here for discoverability while we don't have
+         * a dedicated panel.  Held in jce_scene_view_gizmo.cpp. */
+        if (ImGui::BeginMenu("Snap Settings")) {
+            float t = jce_editor_get_snap_translate_step();
+            float r = jce_editor_get_snap_angle_step();
+            float s = jce_editor_get_snap_scale_step();
+            ImGui::SetNextItemWidth(120);
+            if (ImGui::DragFloat("Move",   &t, 0.01f, 0.001f, 100.0f, "%.3f m"))
+                jce_editor_set_snap_translate_step(t);
+            ImGui::SetNextItemWidth(120);
+            if (ImGui::DragFloat("Rotate", &r, 0.5f,  0.1f,   180.0f, "%.1f deg"))
+                jce_editor_set_snap_angle_step(r);
+            ImGui::SetNextItemWidth(120);
+            if (ImGui::DragFloat("Scale",  &s, 0.01f, 0.001f, 10.0f,  "%.3f"))
+                jce_editor_set_snap_scale_step(s);
+            ImGui::TextDisabled("(hold Ctrl while dragging gizmo)");
+            ImGui::EndMenu();
+        }
+
         ImGui::EndPopup();
     }
 

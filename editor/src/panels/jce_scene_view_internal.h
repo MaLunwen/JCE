@@ -113,4 +113,13 @@ int draw_view_cube(ImDrawList *dl, ImVec2 origin, ImVec2 size,
 void handle_scene_selection_box(const SceneViewCtx *ctx);
 void update_and_draw_scene_gizmo(const SceneViewCtx *ctx);
 
+/* ── User-configurable snap step accessors (Unity Increment Snap).
+ *    Static state lives in jce_scene_view_gizmo.cpp. */
+extern "C" float jce_editor_get_snap_translate_step(void);
+extern "C" float jce_editor_get_snap_angle_step    (void);
+extern "C" float jce_editor_get_snap_scale_step    (void);
+extern "C" void  jce_editor_set_snap_translate_step(float v);
+extern "C" void  jce_editor_set_snap_angle_step    (float v);
+extern "C" void  jce_editor_set_snap_scale_step    (float v);
+
 #endif /* JCE_SCENE_VIEW_INTERNAL_H */
