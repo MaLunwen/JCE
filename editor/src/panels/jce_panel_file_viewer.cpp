@@ -690,7 +690,7 @@ void jce_file_viewer_draw_window(bool *p_visible)
     }
 
     char title[256];
-    snprintf(title, sizeof(title), "%s###FileViewer", jce_editor_i18n("File Viewer"));
+    snprintf(title, sizeof(title), "%s###file_viewer", jce_editor_i18n("File Viewer"));
     if (ImGui::Begin(title, p_visible))
         jce_file_viewer_draw_content();
     ImGui::End();

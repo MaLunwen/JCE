@@ -1,5 +1,5 @@
 /*
- * jce_event.h  Backend-neutral input/window event type for JCE.
+ * jce_window_event.h  Backend-neutral input/window event type for JCE.
  *
  * Replaces the leaky  on_event(const void*)  contract that used to
  * forward raw SDL_Event pointers to applications. With JceEvent the
@@ -12,8 +12,8 @@
  * translator can copy them through unchanged.
  */
 
-#ifndef JCE_PLATFORM_EVENT_H
-#define JCE_PLATFORM_EVENT_H
+#ifndef JCE_PLATFORM_WINDOW_EVENT_H
+#define JCE_PLATFORM_WINDOW_EVENT_H
 
 #include <jce/os/core/jce_defs.h>
 #include <jce/os/platform/jce_keys.h>
@@ -122,4 +122,4 @@ typedef struct JceEvent {
 
 JCE_EXTERN_C_END
 
-#endif /* JCE_PLATFORM_EVENT_H */
+#endif /* JCE_PLATFORM_WINDOW_EVENT_H */

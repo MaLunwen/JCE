@@ -11,7 +11,7 @@
 #ifndef JCE_MODEL_H
 #define JCE_MODEL_H
 
-#include <jce/renderer/jce_skeleton.h>
+#include <jce/middleware/animation/jce_skeleton.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/renderer/jce_pbr_material.h>
 

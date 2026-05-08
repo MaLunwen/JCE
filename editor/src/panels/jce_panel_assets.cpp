@@ -9,6 +9,8 @@
 #include <jce/os/core/jce_path.h>
 #include <jce/os/core/jce_timer.h>
 
+#include <cstring>
+
 #include "core/jce_editor_config.h"
 #include "core/jce_hotkeys.h"
 #include "jce_panel_assets_internal.h"
@@ -19,6 +21,37 @@
 AssetBrowserState s_assets;
 
 /* ── Shared helpers ──────────────────────────────────────────────── */
+
+/* Recognize filesystem roots that must not be used as a project root.
+ * Walking these would index the entire disk and block the splash for
+ * an unbounded time.  Cases:
+ *   - POSIX: "/"
+ *   - Windows: "X:\", "X:/", or just "X:"
+ *   - UNC roots: "\\server\share\" or "//server/share/" (treated as root
+ *     when nothing follows the share name)
+ * Used by ensure_assets_init() to decide whether to rebuild the asset
+ * path index from launch CWD. */
+static bool is_filesystem_root(const char *p)
+{
+    if (!p || !p[0]) return true;
+    if (p[0] == '/' && p[1] == '\0') return true;
+    if ((p[0] == '/' || p[0] == '\\') &&
+        (p[1] == '/' || p[1] == '\\')) {
+        const char *q = p + 2;
+        const char *slash = std::strpbrk(q, "/\\");
+        if (!slash || !slash[1] ||
+            ((slash[1] == '/' || slash[1] == '\\') && !slash[2]))
+            return true;
+        const char *slash2 = std::strpbrk(slash + 1, "/\\");
+        if (!slash2 || !slash2[1]) return true;
+        return false;
+    }
+    if (p[0] && p[1] == ':' &&
+        (p[2] == '\0' ||
+         ((p[2] == '/' || p[2] == '\\') && p[3] == '\0')))
+        return true;
+    return false;
+}
 
 std::string normalized_path_string(const std::string &p)
 {
@@ -62,14 +95,43 @@ static std::string format_modified_time(const char *path)
 void ensure_assets_init(void)
 {
     if (s_assets.initialized) return;
-    /* Use the launch CWD as the initial project root.  Anything else
-       (e.g. ".") becomes ambiguous once the editor changes process cwd
-       or is launched from a build folder. */
-    char cwd_buf[1024];
-    if (jce_fs_host_get_current_dir(cwd_buf, sizeof(cwd_buf)))
-        s_assets.project_root = cwd_buf;
-    else
-        s_assets.project_root = ".";
+
+    /* Resolve the initial project root.  Priority:
+     *   1. cfg.last_project (most recent open) if still valid
+     *   2. cfg.recent_projects[0] if still valid
+     *   3. Launch CWD — preserves the shell-launch workflow where
+     *      running `build/.../release/jce_editor` from the project
+     *      root correctly auto-indexes the project.
+     * Filesystem roots (`/`, `X:\`) are never accepted.  Even when
+     * CWD is something massive like `$HOME` (Finder/`open` double-
+     * click on macOS), the rebuild walker enforces a hard file-count
+     * cap so the splash never blocks for an unbounded amount of
+     * time.  See jce_asset_path_index.cpp:kAutoIndexFileCap. */
+    char cwd_buf[1024]; cwd_buf[0] = '\0';
+    bool have_cwd = jce_fs_host_get_current_dir(cwd_buf, sizeof(cwd_buf));
+
+    std::string resolved_root;
+    {
+        JceEditorConfig ecfg;
+        if (jce_editor_config_load(&ecfg)) {
+            if (ecfg.last_project[0] &&
+                jce_fs_host_exists_dir(ecfg.last_project)) {
+                resolved_root = ecfg.last_project;
+            } else if (ecfg.recent_count > 0 &&
+                       ecfg.recent_projects[0][0] &&
+                       jce_fs_host_exists_dir(ecfg.recent_projects[0])) {
+                resolved_root = ecfg.recent_projects[0];
+            }
+        }
+    }
+    if (resolved_root.empty() && have_cwd &&
+        !is_filesystem_root(cwd_buf)) {
+        resolved_root = cwd_buf;
+    }
+    if (resolved_root.empty()) {
+        resolved_root = ".";
+    }
+    s_assets.project_root = resolved_root;
     s_assets.current_path      = s_assets.project_root;
     s_assets.last_clicked_idx  = -1;
     s_assets.renaming_idx      = -1;
@@ -100,10 +162,11 @@ void ensure_assets_init(void)
     }
     s_assets.initialized       = true;
 
-    /* Build initial asset path index over the launch CWD project root
-     * so even sessions that never call set_project() can resolve asset
-     * references.  Subsequent set_project() calls rebuild as needed. */
-    if (!s_assets.project_root.empty()) {
+    /* Index the resolved root, but only if it is a bounded directory.
+     * Filesystem roots (`/`, `X:\`) are always refused — those
+     * indicate a fallback that hit no useful candidate. */
+    if (!s_assets.project_root.empty() &&
+        !is_filesystem_root(s_assets.project_root.c_str())) {
         jce_asset_path_index_clear();
         jce_asset_path_index_rebuild(s_assets.project_root.c_str());
     }
@@ -782,7 +845,7 @@ void jce_editor_panel_assets(void)
     if (!*vis) return;
 
     char title[256];
-    snprintf(title, sizeof(title), "%s###AssetBrowser", jce_editor_i18n("assetBrowser.title"));
+    snprintf(title, sizeof(title), "%s###assets", jce_editor_i18n("assetBrowser.title"));
     if (ImGui::Begin(title, vis))
         jce_editor_panel_assets_content();
     ImGui::End();

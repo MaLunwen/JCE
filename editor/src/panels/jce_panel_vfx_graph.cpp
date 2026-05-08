@@ -512,7 +512,9 @@ extern "C" void jce_editor_panel_vfx_graph_content(void)
 extern "C" void jce_editor_panel_vfx_graph(void)
 {
     if (!*jce_editor_panel_visible_ptr(JCE_PANEL_VFX_GRAPH)) return;
-    if (ImGui::Begin(jce_editor_i18n("vfxGraph.title"), jce_editor_panel_visible_ptr(JCE_PANEL_VFX_GRAPH))) {
+    char _wt[128];
+    snprintf(_wt, sizeof(_wt), "%s###vfx_graph", jce_editor_i18n("vfxGraph.title"));
+    if (ImGui::Begin(_wt, jce_editor_panel_visible_ptr(JCE_PANEL_VFX_GRAPH))) {
         jce_editor_panel_vfx_graph_content();
     }
     ImGui::End();

@@ -4,6 +4,8 @@
 
 #include <jce/middleware/scene/jce_virtual_camera.h>
 
+#include "os/core/jce_memory.h"
+
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,7 +30,7 @@ struct JceVcamManager {
 JCE_API JceVcamManager *JCE_CALL
 jce_vcam_manager_create(void)
 {
-    JceVcamManager *m = (JceVcamManager *)calloc(1, sizeof *m);
+    JceVcamManager *m = (JceVcamManager *)JCE_CALLOC(1, sizeof *m);
     if (!m) return NULL;
     m->active_handle  = -1;
     m->prev_handle    = -1;
@@ -37,7 +39,7 @@ jce_vcam_manager_create(void)
 }
 
 JCE_API void JCE_CALL
-jce_vcam_manager_destroy(JceVcamManager *m) { free(m); }
+jce_vcam_manager_destroy(JceVcamManager *m) { JCE_FREE(m); }
 
 JCE_API int JCE_CALL
 jce_vcam_add(JceVcamManager *m, const JceVirtualCamera *cam)

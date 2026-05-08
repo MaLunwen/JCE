@@ -2860,7 +2860,7 @@ int jce_scene_load_json(JceScene *scene, const cJSON *root)
     if (total <= 0) return 0;
 
     /* Pre-allocate remap table to resolve parent_id references after creation. */
-    EntityRemap *map = (EntityRemap *)calloc((size_t)total, sizeof(EntityRemap));
+    EntityRemap *map = (EntityRemap *)JCE_CALLOC((size_t)total, sizeof(EntityRemap));
     if (!map) return -1;
 
     int loaded = 0;
@@ -2938,7 +2938,7 @@ int jce_scene_load_json(JceScene *scene, const cJSON *root)
         }
     }
 
-    free(map);
+    JCE_FREE(map);
     return loaded;
 }
 

@@ -12,7 +12,7 @@
 #include <jce/os/core/jce_log.h>
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/os/core/jce_profiler.h>
-#include <jce/renderer/jce_weather.h>
+#include <jce/middleware/world/jce_weather.h>
 
 #include "os/core/jce_memory.h"
 

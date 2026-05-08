@@ -4,6 +4,7 @@
 
 #include "jce_hotkeys.h"
 #include "jce_editor_config.h"
+#include "jce_editor_alloc.h"
 #include "io/jce_editor_file_util.h"
 
 #include <jce/tools/jce_imgui.hpp>
@@ -198,11 +199,11 @@ extern "C" bool jce_hotkeys_save(void)
 
     /* Build JSON in a heap buffer; bound estimate per row ≈ 120 bytes. */
     size_t cap = 64 + (size_t)JCE_HK_COUNT * 128;
-    char *buf = (char *)std::malloc(cap);
+    char *buf = (char *)ED_MALLOC(cap);
     if (!buf) return false;
     size_t off = 0;
     int n = std::snprintf(buf + off, cap - off, "{\n  \"hotkeys\": [\n");
-    if (n < 0 || (size_t)n >= cap - off) { std::free(buf); return false; }
+    if (n < 0 || (size_t)n >= cap - off) { ED_FREE(buf); return false; }
     off += (size_t)n;
     for (int i = 0; i < JCE_HK_COUNT; ++i) {
         n = std::snprintf(buf + off, cap - off,
@@ -211,15 +212,15 @@ extern "C" bool jce_hotkeys_save(void)
             (int)s_table[i].cur.key,
             (unsigned)s_table[i].cur.mods,
             (i + 1 < JCE_HK_COUNT) ? "," : "");
-        if (n < 0 || (size_t)n >= cap - off) { std::free(buf); return false; }
+        if (n < 0 || (size_t)n >= cap - off) { ED_FREE(buf); return false; }
         off += (size_t)n;
     }
     n = std::snprintf(buf + off, cap - off, "  ]\n}\n");
-    if (n < 0 || (size_t)n >= cap - off) { std::free(buf); return false; }
+    if (n < 0 || (size_t)n >= cap - off) { ED_FREE(buf); return false; }
     off += (size_t)n;
 
     bool ok = ed_write_file(path, buf, off);
-    std::free(buf);
+    ED_FREE(buf);
     return ok;
 }
 

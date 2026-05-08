@@ -13,7 +13,7 @@ extern "C" {
 #endif
 
 #include <jce/middleware/animation/jce_animation.h>
-#include <jce/renderer/jce_skeleton.h>
+#include <jce/middleware/animation/jce_skeleton.h>
 #include <jce/renderer/jce_skinned_mesh.h>
 
 

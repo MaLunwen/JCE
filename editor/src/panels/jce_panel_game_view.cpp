@@ -501,7 +501,7 @@ void jce_editor_panel_game_view(void)
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     char title[256];
-    snprintf(title, sizeof(title), "%s###GameView", jce_editor_i18n("Game"));
+    snprintf(title, sizeof(title), "%s###game_view", jce_editor_i18n("Game"));
     if (ImGui::Begin(title, vis))
         jce_editor_panel_game_view_content();
     ImGui::End();

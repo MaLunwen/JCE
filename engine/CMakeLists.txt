@@ -10,6 +10,18 @@
 
 set(_ENGINE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set(_ENGINE_INC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set(_ENGINE_TOOLS_INC "${CMAKE_CURRENT_SOURCE_DIR}/tools_include")
+
+# ================================================================== #
+# jce_tools_imgui — Tools-layer ImGui wrapper.                       #
+# Headers live under engine/tools_include/ (NOT engine/include/),    #
+# so game SDK consumers (caged_kingdom, third-party games) cannot    #
+# accidentally reach Dear ImGui via <jce/...>. Only editor and the   #
+# engine UI middleware opt-in by linking this INTERFACE target.      #
+# ================================================================== #
+add_library(jce_tools_imgui INTERFACE)
+target_include_directories(jce_tools_imgui INTERFACE "${_ENGINE_TOOLS_INC}")
+target_link_libraries(jce_tools_imgui INTERFACE imgui::imgui)
 
 # ================================================================== #
 # Helper: create one engine sub-layer                                 #
@@ -259,12 +271,18 @@ target_include_directories(jce_net PRIVATE "${JCE_PROTO_OUT}")
 _jce_add_layer(jce_scene
 	DIRS      middleware/scene
 	LINK_PUBLIC  jce_core
-	LINK_PRIVATE flecs::flecs_static cjson::cjson)
+	LINK_PRIVATE
+		jce_animation
+		flecs::flecs_static
+		cjson::cjson
+		bgfx::bgfx
+		cgltf::cgltf
+	CXX)
 
 _jce_add_layer(jce_world
 	DIRS      middleware/world
 	LINK_PUBLIC  jce_core
-	LINK_PRIVATE flecs::flecs_static)
+	LINK_PRIVATE flecs::flecs_static bgfx::bgfx)
 
 _jce_add_layer(jce_save
 	DIRS      middleware/save
@@ -281,8 +299,6 @@ _jce_add_layer(jce_renderer
 		jce_platform
 		jce_animation
 	LINK_PRIVATE
-		jce_scene
-		jce_world
 		bgfx::bgfx
 		SDL3_image::SDL3_image
 		Freetype::Freetype
@@ -290,6 +306,11 @@ _jce_add_layer(jce_renderer
 		flecs::flecs_static
 		cgltf::cgltf
 	CXX)
+
+# Late-bound dependency: jce_scene_renderer.c lives in middleware/scene
+# but consumes the renderer low-level API.  Declared here (after both
+# targets exist) to keep the link order valid.
+target_link_libraries(jce_scene PRIVATE jce_renderer)
 
 # ================================================================== #
 # L3 — UI (depends on core, graphics, platform, audio, app)          #
@@ -308,7 +329,7 @@ _jce_add_layer(jce_ui
 	LINK_PRIVATE
 		rmlui::rmlui
 		bgfx::bgfx
-		imgui::imgui
+		jce_tools_imgui
 	CXX)
 
 # ================================================================== #

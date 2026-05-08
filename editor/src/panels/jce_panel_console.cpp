@@ -481,7 +481,7 @@ void jce_editor_panel_console(void)
     if (!*vis) return;
 
     char title[256];
-    snprintf(title, sizeof(title), "%s###Console", jce_editor_i18n("console.title"));
+    snprintf(title, sizeof(title), "%s###console", jce_editor_i18n("console.title"));
     if (ImGui::Begin(title, vis))
         jce_editor_panel_console_content();
     ImGui::End();

@@ -10,7 +10,7 @@
 #ifndef JCE_EDITOR_H
 #define JCE_EDITOR_H
 
-#include <jce/os/platform/jce_event.h>
+#include <jce/os/platform/jce_window_event.h>
 #include <stdbool.h>
 #include <stdint.h>
 

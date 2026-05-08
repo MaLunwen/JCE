@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # ================================================================
 # build-macos-arm64.sh -- Build JCE for macOS ARM64 (Apple Silicon)
-# Usage: build-macos-arm64.sh [--clean]
+# Usage: build-macos-arm64.sh [--clean] [--dist]
 # Output:
 #   Game exe : build/desktop/macos-arm64/release/jce_editor
+#              build/desktop/macos-arm64/dist/jce_editor    (with --dist)
 #   JNI lib  : build/jni/natives/darwin-aarch64/libjce.dylib
 # ================================================================
 source "$(dirname "$0")/../lib/jce_common.sh"
@@ -26,13 +27,26 @@ HOST_PAK="build/host/tools/jce_pak"
 MACOS_DEPLOYMENT_TARGET="11.0"
 CONAN_HOME_DIR="${CONAN_HOME:-$HOME/.conan2}"
 CONAN_HOOKS_DIR="$CONAN_HOME_DIR/extensions/hooks"
+VARIANT="release"
 
-# -- Handle --clean flag --
-if [[ "${1:-}" == "--clean" ]]; then
-    echo "=== Cleaning build directories ==="
-    rm -rf "$BUILD_DIR" "$CONAN_DIR" "$JNI_BUILD_DIR"
-    echo "  Done"
-fi
+# -- Parse arguments --
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --clean)
+            echo "=== Cleaning build directories ==="
+            rm -rf "$BUILD_DIR" "$CONAN_DIR" "$JNI_BUILD_DIR"
+            echo "  Done"
+            ;;
+        --dist)
+            VARIANT="dist"
+            ;;
+        *)
+            echo "Unknown argument: $1"
+            exit 1
+            ;;
+    esac
+    shift
+done
 
 # -- Step 1: Ensure host jce_pak exists --
 echo "=== Step 1: Resolve host jce_pak ==="
@@ -103,6 +117,7 @@ CMAKE_ARGS="-S . -B $BUILD_DIR -G Ninja \
     -DCMAKE_OSX_ARCHITECTURES=arm64 \
     -DCMAKE_OSX_DEPLOYMENT_TARGET=$MACOS_DEPLOYMENT_TARGET \
     -DJCE_PAK_EXECUTABLE=$HOST_PAK \
+    -DJCE_BUILD_VARIANT=$VARIANT \
     -DJCE_ENABLE_CPPCHECK=OFF"
 if [[ -n "$HOST_SHADERC" ]]; then
     CMAKE_ARGS="$CMAKE_ARGS -DJCE_SHADERC_EXECUTABLE=$HOST_SHADERC"
@@ -110,16 +125,16 @@ fi
 cmake $CMAKE_ARGS
 
 # -- Step 5: Build (Ninja handles incremental) --
-echo "=== Step 5: Build (macos-arm64) ==="
+echo "=== Step 5: Build (macos-arm64, $VARIANT) ==="
 cmake --build "$BUILD_DIR"
 
-if [[ ! -f "$BUILD_DIR/release/jce_editor" ]]; then
-    echo "ERROR: jce_editor not found after build"
+if [[ ! -f "$BUILD_DIR/$VARIANT/jce_editor" ]]; then
+    echo "ERROR: jce_editor not found after build: $BUILD_DIR/$VARIANT/jce_editor"
     exit 1
 fi
 
 echo ""
-echo "[SUCCESS] macOS ARM64 build complete: $BUILD_DIR/release/jce_editor"
+echo "[SUCCESS] macOS ARM64 build complete ($VARIANT): $BUILD_DIR/$VARIANT/jce_editor"
 
 # -- Step 6: Build JNI shared library and stage for fat JAR --
 echo ""

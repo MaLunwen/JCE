@@ -914,6 +914,10 @@ static void dock_extension_panels(ImGuiID left_id,
     /* Right column (alongside Inspector): scene-wide settings panes. */
     ImGui::DockBuilderDockWindow("###lighting",         right_id);
     ImGui::DockBuilderDockWindow("###tile_palette",     right_id);
+    ImGui::DockBuilderDockWindow("###light_explorer",   right_id);
+    ImGui::DockBuilderDockWindow("###reflection_probes",right_id);
+    ImGui::DockBuilderDockWindow("###time_of_day",      right_id);
+    ImGui::DockBuilderDockWindow("###vcam_manager",     right_id);
 
     /* Bottom strip (alongside Console / Asset Browser). */
     ImGui::DockBuilderDockWindow("###audio_mixer",      bottom_id);
@@ -922,6 +926,8 @@ static void dock_extension_panels(ImGuiID left_id,
     ImGui::DockBuilderDockWindow("###frame_debugger",   bottom_id);
     ImGui::DockBuilderDockWindow("###test_runner",      bottom_id);
     ImGui::DockBuilderDockWindow("###build_profiles",   bottom_id);
+    ImGui::DockBuilderDockWindow("###memory_profiler",  bottom_id);
+    ImGui::DockBuilderDockWindow("###physics_debugger", bottom_id);
 
     /* Center (alongside Scene/Game): authoring graphs / canvases. */
     ImGui::DockBuilderDockWindow("###vfx_graph",        center_id);
@@ -943,8 +949,6 @@ static void dock_extension_panels(ImGuiID left_id,
     ImGui::DockBuilderDockWindow("###jce_curve_editor",      bottom_id);
     ImGui::DockBuilderDockWindow("###jce_seq",               bottom_id);
     ImGui::DockBuilderDockWindow("###jce_import_presets",    bottom_id);
-    ImGui::DockBuilderDockWindow("Animation Editor###animation_editor", bottom_id);
-    ImGui::DockBuilderDockWindow("Curve Editor###curve_editor",         bottom_id);
 
     (void)left_id;
 }
@@ -1045,9 +1049,7 @@ static void setup_wide_docking_layout(ImGuiID dockspace_id)
     ImGui::DockBuilderDockWindow("Timeline###timeline",       bottom_id);
     ImGui::DockBuilderDockWindow("Console###console",         bottom_id);
     ImGui::DockBuilderDockWindow("Asset Browser###assets",    bottom_id);
-    ImGui::DockBuilderDockWindow("Animation Editor###animation_editor", bottom_id);
     ImGui::DockBuilderDockWindow("###jce_anim_editor",        bottom_id);
-    ImGui::DockBuilderDockWindow("Curve Editor###curve_editor", bottom_id);
     ImGui::DockBuilderDockWindow("###jce_curve_editor",       bottom_id);
     ImGui::DockBuilderDockWindow("###jce_seq",                bottom_id);
     /* Specialized panels: dock to sensible target so they appear in the
@@ -1087,9 +1089,7 @@ static void setup_animation_docking_layout(ImGuiID dockspace_id)
     ImGui::DockBuilderDockWindow("File Viewer###file_viewer",   right_id);
     ImGui::DockBuilderDockWindow("###jce_profiler",             right_id);
     ImGui::DockBuilderDockWindow("###postfx",                   right_id);
-    ImGui::DockBuilderDockWindow("Animation Editor###animation_editor", bottom_id);
     ImGui::DockBuilderDockWindow("###jce_anim_editor",          bottom_id);
-    ImGui::DockBuilderDockWindow("Curve Editor###curve_editor", bottom_id);
     ImGui::DockBuilderDockWindow("###jce_curve_editor",         bottom_id);
     ImGui::DockBuilderDockWindow("###jce_anim_sm",              bottom_id);
     ImGui::DockBuilderDockWindow("###jce_seq",                  bottom_id);
@@ -1130,9 +1130,7 @@ static void setup_two_by_two_docking_layout(ImGuiID dockspace_id)
     ImGui::DockBuilderDockWindow("Console###console",         br);
     ImGui::DockBuilderDockWindow("Inspector###inspector",     br);
     ImGui::DockBuilderDockWindow("Timeline###timeline",       br);
-    ImGui::DockBuilderDockWindow("Animation Editor###animation_editor", br);
     ImGui::DockBuilderDockWindow("###jce_anim_editor",        br);
-    ImGui::DockBuilderDockWindow("Curve Editor###curve_editor", br);
     ImGui::DockBuilderDockWindow("###jce_curve_editor",       br);
     ImGui::DockBuilderDockWindow("###jce_seq",                br);
     /* Specialized panels: route to right column / bottom-left when shown. */
@@ -1269,14 +1267,15 @@ static void setup_cinematic_docking_layout(ImGuiID dockspace_id)
     ImGui::DockBuilderSplitNode(mid_block, ImGuiDir_Right, 0.28f, &right_id, &center_id);
 
     ImGui::DockBuilderDockWindow("Hierarchy###hierarchy",      left_id);
+    ImGui::DockBuilderDockWindow("File Viewer###file_viewer",  left_id);
     ImGui::DockBuilderDockWindow("Scene###scene_view",         center_id);
     ImGui::DockBuilderDockWindow("Game###game_view",           center_id);
     ImGui::DockBuilderDockWindow("VCam Manager###vcam_manager",right_id);
     ImGui::DockBuilderDockWindow("Time of Day###time_of_day",  right_id);
     ImGui::DockBuilderDockWindow("Inspector###inspector",      right_id);
     ImGui::DockBuilderDockWindow("Timeline###timeline",        bottom_id);
-    ImGui::DockBuilderDockWindow("###curve_editor",            bottom_id);
     ImGui::DockBuilderDockWindow("Console###console",          bottom_id);
+    ImGui::DockBuilderDockWindow("Asset Browser###assets",     bottom_id);
     dock_extension_panels(left_id, center_id, right_id, bottom_id);
     ImGui::DockBuilderFinish(dockspace_id);
 }
@@ -1297,11 +1296,15 @@ static void setup_profiling_docking_layout(ImGuiID dockspace_id)
 
     ImGui::DockBuilderDockWindow("###jce_profiler",                  left_id);
     ImGui::DockBuilderDockWindow("Memory Profiler###memory_profiler",left_id);
+    ImGui::DockBuilderDockWindow("Hierarchy###hierarchy",            left_id);
     ImGui::DockBuilderDockWindow("Physics Debugger###physics_debugger",right_id);
     ImGui::DockBuilderDockWindow("Game###game_view",                 right_id);
+    ImGui::DockBuilderDockWindow("File Viewer###file_viewer",        right_id);
     ImGui::DockBuilderDockWindow("Console###console",                bottom_id);
     ImGui::DockBuilderDockWindow("Scene###scene_view",               bottom_id);
     ImGui::DockBuilderDockWindow("Inspector###inspector",            bottom_id);
+    ImGui::DockBuilderDockWindow("Asset Browser###assets",           bottom_id);
+    ImGui::DockBuilderDockWindow("Timeline###timeline",              bottom_id);
     dock_extension_panels(left_id, right_id, right_id, bottom_id);
     ImGui::DockBuilderFinish(dockspace_id);
 }
@@ -1326,6 +1329,7 @@ static void setup_lighting_docking_layout(ImGuiID dockspace_id)
 
     ImGui::DockBuilderDockWindow("Light Explorer###light_explorer",      left_id);
     ImGui::DockBuilderDockWindow("Hierarchy###hierarchy",                left_id);
+    ImGui::DockBuilderDockWindow("File Viewer###file_viewer",            left_id);
     ImGui::DockBuilderDockWindow("Scene###scene_view",                   center_id);
     ImGui::DockBuilderDockWindow("Game###game_view",                     center_id);
     ImGui::DockBuilderDockWindow("###lighting",                          right_id);
@@ -1333,6 +1337,8 @@ static void setup_lighting_docking_layout(ImGuiID dockspace_id)
     ImGui::DockBuilderDockWindow("Inspector###inspector",                right_id);
     ImGui::DockBuilderDockWindow("Reflection Probes###reflection_probes",bottom_id);
     ImGui::DockBuilderDockWindow("Console###console",                    bottom_id);
+    ImGui::DockBuilderDockWindow("Asset Browser###assets",               bottom_id);
+    ImGui::DockBuilderDockWindow("Timeline###timeline",                  bottom_id);
     dock_extension_panels(left_id, center_id, right_id, bottom_id);
     ImGui::DockBuilderFinish(dockspace_id);
 }

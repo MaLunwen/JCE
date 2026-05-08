@@ -1579,7 +1579,7 @@ void jce_editor_panel_scene_view(void)
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     char title[256];
-    snprintf(title, sizeof(title), "%s###SceneView", jce_editor_i18n("Scene"));
+    snprintf(title, sizeof(title), "%s###scene_view", jce_editor_i18n("Scene"));
     if (ImGui::Begin(title, vis))
         jce_editor_panel_scene_view_content();
     ImGui::End();

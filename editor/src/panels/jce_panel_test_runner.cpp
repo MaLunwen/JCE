@@ -281,8 +281,9 @@ extern "C" void jce_editor_panel_test_runner_content(void)
 extern "C" void jce_editor_panel_test_runner(void)
 {
     if (!*jce_editor_panel_visible_ptr(JCE_PANEL_TEST_RUNNER)) return;
-    if (ImGui::Begin(jce_editor_i18n("testRunner.title"),
-                     jce_editor_panel_visible_ptr(JCE_PANEL_TEST_RUNNER))) {
+    char _wt[128];
+    snprintf(_wt, sizeof(_wt), "%s###test_runner", jce_editor_i18n("testRunner.title"));
+    if (ImGui::Begin(_wt, jce_editor_panel_visible_ptr(JCE_PANEL_TEST_RUNNER))) {
         jce_editor_panel_test_runner_content();
     }
     ImGui::End();

@@ -16,7 +16,7 @@
 
 
 #include <jce/os/core/jce_defs.h>
-#include <jce/os/platform/jce_event.h>
+#include <jce/os/platform/jce_window_event.h>
 
 #include <stdbool.h>
 #include <stdint.h>

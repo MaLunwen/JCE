@@ -8,6 +8,8 @@
 #include "ui/jce_editor_panels.h"
 #include "jce_asset_path_index.h"
 
+#include <cstring>
+
 
 /* ── String utilities ───────────────────────────────────────────── */
 

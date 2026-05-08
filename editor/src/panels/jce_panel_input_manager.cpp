@@ -74,17 +74,17 @@ static void input_save(void)
 {
     size_t cap = 256;
     for (auto &a : s_actions) cap += a.name.size() + 64 + a.binds.size() * 80;
-    char *buf = (char *)std::malloc(cap);
+    char *buf = (char *)ED_MALLOC(cap);
     if (!buf) return;
     size_t off = 0;
     int    w   = std::snprintf(buf + off, cap - off, "{\n  \"actions\": [\n");
-    if (w < 0) { std::free(buf); return; }
+    if (w < 0) { ED_FREE(buf); return; }
     off += (size_t)w;
     for (size_t i = 0; i < s_actions.size(); ++i) {
         const EditAction &a = s_actions[i];
         w = std::snprintf(buf + off, cap - off,
             "    { \"name\": \"%s\", \"binds\": [", a.name.c_str());
-        if (w < 0 || (size_t)w >= cap - off) { std::free(buf); return; }
+        if (w < 0 || (size_t)w >= cap - off) { ED_FREE(buf); return; }
         off += (size_t)w;
         for (size_t j = 0; j < a.binds.size(); ++j) {
             const EditBinding &b = a.binds[j];
@@ -92,19 +92,19 @@ static void input_save(void)
                 "%s{\"type\":%d,\"code\":%d,\"scale\":%.4f,\"deadzone\":%.4f}",
                 (j == 0 ? "" : ","),
                 b.type, b.code, (double)b.scale, (double)b.deadzone);
-            if (w < 0 || (size_t)w >= cap - off) { std::free(buf); return; }
+            if (w < 0 || (size_t)w >= cap - off) { ED_FREE(buf); return; }
             off += (size_t)w;
         }
         w = std::snprintf(buf + off, cap - off, "] }%s\n",
                           (i + 1 < s_actions.size()) ? "," : "");
-        if (w < 0 || (size_t)w >= cap - off) { std::free(buf); return; }
+        if (w < 0 || (size_t)w >= cap - off) { ED_FREE(buf); return; }
         off += (size_t)w;
     }
     w = std::snprintf(buf + off, cap - off, "  ]\n}\n");
-    if (w < 0) { std::free(buf); return; }
+    if (w < 0) { ED_FREE(buf); return; }
     off += (size_t)w;
     ed_write_file(INPUT_PATH, buf, off);
-    std::free(buf);
+    ED_FREE(buf);
 }
 
 static void seed_default_actions(void)
