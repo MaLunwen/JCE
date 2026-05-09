@@ -253,6 +253,231 @@ bool jce_prefab_overrides_save_to_file(const JcePrefabOverrideSet *s,
     return ok;
 }
 
+/* ── Apply / Revert helpers ───────────────────────────────────────── */
+
+uint32_t jce_prefab_overrides_count_for_entity(const JcePrefabOverrideSet *s,
+                                                const char *entity_path)
+{
+    if (!s) return 0;
+    if (!entity_path) entity_path = "";
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < s->count; ++i) {
+        const Entry *e = &s->entries[i];
+        if (strcmp(e->entity_path ? e->entity_path : "", entity_path) == 0)
+            n++;
+    }
+    return n;
+}
+
+bool jce_prefab_overrides_has_any(const JcePrefabOverrideSet *s)
+{
+    return s && s->count > 0u;
+}
+
+/* Compact step: swap-with-last.  Returns the new count after removal. */
+static void compact_remove_at(JcePrefabOverrideSet *s, uint32_t idx)
+{
+    entry_free(&s->entries[idx]);
+    if (idx + 1u < s->count) {
+        s->entries[idx] = s->entries[s->count - 1];
+        memset(&s->entries[s->count - 1], 0, sizeof(Entry));
+    }
+    s->count--;
+}
+
+uint32_t jce_prefab_overrides_revert_entity(JcePrefabOverrideSet *s,
+                                             const char *entity_path)
+{
+    if (!s) return 0;
+    if (!entity_path) entity_path = "";
+    uint32_t removed = 0;
+    /* Iterate backwards so swap-with-last doesn't break the cursor. */
+    for (uint32_t i = s->count; i-- > 0u; ) {
+        const Entry *e = &s->entries[i];
+        if (strcmp(e->entity_path ? e->entity_path : "", entity_path) == 0) {
+            compact_remove_at(s, i);
+            removed++;
+        }
+    }
+    return removed;
+}
+
+uint32_t jce_prefab_overrides_revert_component(JcePrefabOverrideSet *s,
+                                                const char *entity_path,
+                                                uint64_t component_id)
+{
+    if (!s) return 0;
+    if (!entity_path) entity_path = "";
+    uint32_t removed = 0;
+    for (uint32_t i = s->count; i-- > 0u; ) {
+        const Entry *e = &s->entries[i];
+        if (e->component_id != component_id) continue;
+        if (strcmp(e->entity_path ? e->entity_path : "", entity_path) != 0) continue;
+        compact_remove_at(s, i);
+        removed++;
+    }
+    return removed;
+}
+
+/* Apply: load base prefab JSON, walk every override, mutate the JSON
+ * tree in place, and write it back.  This is intentionally surgical —
+ * we only touch entities/components/fields the override mentions, so
+ * formatting and comments in untouched parts of the file are
+ * preserved (cJSON re-emits but at least field order is stable).
+ *
+ * Implementation strategy:
+ *   1. Parse base file → cJSON tree.
+ *   2. For each override, navigate to the right entity by walking the
+ *      "entities" array using EditorMeta.name slash-separated path.
+ *   3. Find or insert the matching component object in that entity's
+ *      "components" array (component_id → string mapping).
+ *   4. Set `field_path` (dot-delimited; "position.x" splits) on the
+ *      component, parsing value_json into a cJSON node.
+ *   5. Re-emit and write back.
+ *   6. On success, clear all overrides (they're now baked in).
+ */
+
+/* Walk a slash-path against the scene's entity tree and return the
+ * matching entity cJSON object (or NULL).  Empty path returns the
+ * first entity (treated as root). */
+static cJSON *find_entity_by_path(cJSON *entities_arr, const char *path)
+{
+    if (!entities_arr || !cJSON_IsArray(entities_arr)) return NULL;
+    if (!path || !path[0]) {
+        return cJSON_GetArrayItem(entities_arr, 0);
+    }
+    /* For non-root, match against EditorMeta.name in any depth. */
+    cJSON *e = NULL;
+    cJSON_ArrayForEach(e, entities_arr) {
+        const cJSON *meta_arr = cJSON_GetObjectItemCaseSensitive(e, "components");
+        if (!cJSON_IsArray(meta_arr)) continue;
+        const cJSON *c = NULL;
+        cJSON_ArrayForEach(c, meta_arr) {
+            const cJSON *type = cJSON_GetObjectItemCaseSensitive(c, "type");
+            if (!cJSON_IsString(type)) continue;
+            if (strcmp(type->valuestring, "editorMeta") != 0) continue;
+            const cJSON *name = cJSON_GetObjectItemCaseSensitive(c, "name");
+            if (cJSON_IsString(name) && strcmp(name->valuestring, path) == 0)
+                return e;
+        }
+    }
+    return NULL;
+}
+
+/* Find or create a component object of the given string type within an
+ * entity's `components` array. */
+static cJSON *find_or_add_component(cJSON *entity_obj, const char *type)
+{
+    if (!entity_obj || !type) return NULL;
+    cJSON *comps = cJSON_GetObjectItemCaseSensitive(entity_obj, "components");
+    if (!cJSON_IsArray(comps)) {
+        comps = cJSON_AddArrayToObject(entity_obj, "components");
+    }
+    cJSON *c = NULL;
+    cJSON_ArrayForEach(c, comps) {
+        const cJSON *t = cJSON_GetObjectItemCaseSensitive(c, "type");
+        if (cJSON_IsString(t) && strcmp(t->valuestring, type) == 0) return c;
+    }
+    cJSON *fresh = cJSON_CreateObject();
+    cJSON_AddStringToObject(fresh, "type", type);
+    cJSON_AddItemToArray(comps, fresh);
+    return fresh;
+}
+
+/* Set a dot-delimited field path on `obj` to `value` (taking ownership
+ * of value).  Intermediate nodes are auto-created as objects. */
+static void set_field_path(cJSON *obj, const char *field_path, cJSON *value)
+{
+    if (!obj || !field_path || !value) {
+        if (value) cJSON_Delete(value);
+        return;
+    }
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%s", field_path);
+
+    cJSON *cur = obj;
+    char *save = NULL;
+    char *tok = strtok_r(buf, ".", &save);
+    char *next = tok ? strtok_r(NULL, ".", &save) : NULL;
+    while (tok) {
+        if (!next) {
+            /* Leaf — replace existing or add new. */
+            cJSON_DeleteItemFromObject(cur, tok);
+            cJSON_AddItemToObject(cur, tok, value);
+            return;
+        }
+        cJSON *child = cJSON_GetObjectItemCaseSensitive(cur, tok);
+        if (!child || !cJSON_IsObject(child)) {
+            cJSON_DeleteItemFromObject(cur, tok);
+            child = cJSON_CreateObject();
+            cJSON_AddItemToObject(cur, tok, child);
+        }
+        cur = child;
+        tok = next;
+        next = strtok_r(NULL, ".", &save);
+    }
+    /* Path was empty — fall through; release the unattached value. */
+    cJSON_Delete(value);
+}
+
+bool jce_prefab_overrides_apply_to_base(JcePrefabOverrideSet *s,
+                                         const char *base_prefab_path)
+{
+    if (!s || !base_prefab_path) return false;
+
+    uint64_t size = 0;
+    void *buf = jce_fs_host_read_all(base_prefab_path, &size);
+    if (!buf || size == 0) {
+        if (buf) jce_fs_buffer_free(buf);
+        LOG_ERROR(LOG_TAG, "apply: cannot read base prefab '%s'", base_prefab_path);
+        return false;
+    }
+    cJSON *root = cJSON_ParseWithLength((const char *)buf, (size_t)size);
+    jce_fs_buffer_free(buf);
+    if (!root) {
+        LOG_ERROR(LOG_TAG, "apply: invalid JSON in '%s'", base_prefab_path);
+        return false;
+    }
+
+    cJSON *entities = cJSON_GetObjectItemCaseSensitive(root, "entities");
+    if (!cJSON_IsArray(entities)) {
+        cJSON_Delete(root);
+        LOG_ERROR(LOG_TAG, "apply: prefab missing 'entities' array");
+        return false;
+    }
+
+    uint32_t applied = 0;
+    for (uint32_t i = 0; i < s->count; ++i) {
+        const Entry *e = &s->entries[i];
+        cJSON *entity = find_entity_by_path(entities,
+                                            e->entity_path ? e->entity_path : "");
+        if (!entity) continue;
+
+        const char *type = component_id_to_string(e->component_id);
+        if (!type) continue; /* Unknown component id — skip. */
+        cJSON *comp = find_or_add_component(entity, type);
+        if (!comp) continue;
+
+        cJSON *value = cJSON_Parse(e->value_json ? e->value_json : "null");
+        if (!value) continue;
+        set_field_path(comp, e->field_path ? e->field_path : "", value);
+        applied++;
+    }
+
+    char *txt = cJSON_Print(root);
+    cJSON_Delete(root);
+    if (!txt) return false;
+
+    bool ok = jce_fs_host_write_all(base_prefab_path, txt, strlen(txt));
+    free(txt);
+    if (ok) {
+        LOG_INFO(LOG_TAG, "apply: %u overrides → %s",
+                 (unsigned)applied, base_prefab_path);
+        jce_prefab_overrides_clear_all(s);
+    }
+    return ok;
+}
+
 bool jce_prefab_overrides_load_from_file(JcePrefabOverrideSet *s,
                                           const char *path)
 {

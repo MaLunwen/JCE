@@ -804,6 +804,28 @@ typedef uint64_t JceComponentFlag;
 #define JCE_COMP_FLAG_UI_BUTTON            (UINT64_C(1) << 50)
 #define JCE_COMP_FLAG_AUDIO_BUS_ROUTE      (UINT64_C(1) << 51)
 #define JCE_COMP_FLAG_ANIMATION_LAYER_STATE (UINT64_C(1) << 52)
+#define JCE_COMP_FLAG_BLEND_SHAPE_WEIGHTS  (UINT64_C(1) << 53)
+
+/* ── Blend Shape weights (Unity-style morph target driving) ─────── *
+ *
+ * Names blend-shape targets and their current weights for the mesh
+ * referenced by the entity's MeshRenderer / SkinnedMesh.  The mesh's
+ * morph_targets array is the source of authoring data; this component
+ * just stores the per-instance weights that drive them.  Up to 16
+ * named targets — projects with denser face rigs can extend the cap. */
+
+#define JCE_BLEND_SHAPE_MAX 16
+#define JCE_BLEND_SHAPE_NAME_LEN 48
+
+typedef struct {
+    char  name[JCE_BLEND_SHAPE_NAME_LEN];
+    float weight;        /* 0..1 typical; > 1 allowed for over-shoot */
+} JceBlendShapeEntry;
+
+typedef struct {
+    JceBlendShapeEntry shapes[JCE_BLEND_SHAPE_MAX];
+    int                shape_count;
+} JceBlendShapeWeightsComponent;
 
 /* ── Audio Bus Route (Unity-style routing of an AudioSource to a bus) ─ */
 
@@ -1180,6 +1202,12 @@ JCE_API void                              jce_scene_set_animation_layer_state(Jc
 JCE_API JceAnimationLayerStateComponent  *jce_scene_get_animation_layer_state(JceScene *s, JceEntity e);
 JCE_API bool                              jce_scene_has_animation_layer_state(const JceScene *s, JceEntity e);
 JCE_API void                              jce_scene_remove_animation_layer_state(JceScene *s, JceEntity e);
+
+/* Component access — Blend Shape Weights. */
+JCE_API void                              jce_scene_set_blend_shape_weights(JceScene *s, JceEntity e, const JceBlendShapeWeightsComponent *c);
+JCE_API JceBlendShapeWeightsComponent    *jce_scene_get_blend_shape_weights(JceScene *s, JceEntity e);
+JCE_API bool                              jce_scene_has_blend_shape_weights(const JceScene *s, JceEntity e);
+JCE_API void                              jce_scene_remove_blend_shape_weights(JceScene *s, JceEntity e);
 
 /* Component enumeration — returns bitmask of JceComponentFlag. */
 JCE_API uint64_t jce_scene_get_component_flags(const JceScene *s, JceEntity e);

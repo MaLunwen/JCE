@@ -2747,6 +2747,23 @@ void jce_editor_panel_inspector_content(void)
     const char *ent_tag     = jce_state_entity_tag(focused);
     JceTagColor ent_tcolor  = jce_state_entity_tag_color(focused);
 
+    /* Prefab inheritance badge: shows the parent prefab path if this
+     * entity was created as a Variant.  Mirrors Unity's
+     * "Variant of <prefab>" hint at the top of the Inspector. */
+    {
+        JceEditorMeta *m_top = jce_scene_get_editor_meta(
+            scene, jce_state_to_ecs_entity(focused));
+        if (m_top) {
+            if (m_top->variant_parent_path[0]) {
+                ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f),
+                                   "Variant of: %s", m_top->variant_parent_path);
+            } else if (m_top->prefab_instance && m_top->prefab_path[0]) {
+                ImGui::TextColored(ImVec4(0.40f, 0.75f, 0.95f, 1.0f),
+                                   "Prefab: %s", m_top->prefab_path);
+            }
+        }
+    }
+
     if (s_insp.needs_sync) {
         snprintf(s_insp.name_buf, sizeof(s_insp.name_buf), "%s", ent_name ? ent_name : "");
         snprintf(s_insp.tag_buf,  sizeof(s_insp.tag_buf),  "%s", ent_tag  ? ent_tag  : "");

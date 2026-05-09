@@ -91,6 +91,37 @@ JCE_API bool jce_prefab_overrides_save_to_file(const JcePrefabOverrideSet *set,
 JCE_API bool jce_prefab_overrides_load_from_file(JcePrefabOverrideSet *set,
                                                   const char *path);
 
+/* ── Apply / Revert helpers (Unity prefab Apply / Revert) ─────────── */
+
+/* Number of overrides whose `entity_path` exactly matches.  Used by
+ * editor UX to show "(N overrides)" badges on entity rows. */
+JCE_API uint32_t jce_prefab_overrides_count_for_entity(const JcePrefabOverrideSet *set,
+                                                       const char *entity_path);
+
+/* Total number of overrides (alias for count) — convenience for UX
+ * code that wants "Has overrides?" style decisions. */
+JCE_API bool jce_prefab_overrides_has_any(const JcePrefabOverrideSet *set);
+
+/* Drop every override whose `entity_path` matches.  Returns the
+ * number of entries removed.  Mirrors Unity "Revert all on this
+ * GameObject". */
+JCE_API uint32_t jce_prefab_overrides_revert_entity(JcePrefabOverrideSet *set,
+                                                    const char *entity_path);
+
+/* Drop overrides whose entity_path AND component_id both match —
+ * equivalent to Unity's per-component "Revert" button. */
+JCE_API uint32_t jce_prefab_overrides_revert_component(JcePrefabOverrideSet *set,
+                                                       const char *entity_path,
+                                                       uint64_t    component_id);
+
+/* Apply: rewrite the base prefab JSON file at `base_prefab_path` with
+ * every override merged in, then clear the override set.  Returns
+ * true on success.  This is destructive against the base prefab — the
+ * caller is responsible for any backups / version-control safety.
+ * Mirrors Unity "Apply All to Prefab". */
+JCE_API bool jce_prefab_overrides_apply_to_base(JcePrefabOverrideSet *set,
+                                                 const char *base_prefab_path);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_PREFAB_OVERRIDES_H */
