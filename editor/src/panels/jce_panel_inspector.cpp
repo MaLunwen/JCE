@@ -13,6 +13,7 @@
 #include "core/jce_editor_state_internal.h"
 #include "core/jce_project_settings.h"
 #include "core/jce_reflect.h"
+#include "core/jce_editor_prefab_overrides.h"
 #include "scene/jce_editor_scene_render.h"
 #include "scene/jce_model_loader_assimp.h"
 
@@ -2754,12 +2755,41 @@ void jce_editor_panel_inspector_content(void)
         JceEditorMeta *m_top = jce_scene_get_editor_meta(
             scene, jce_state_to_ecs_entity(focused));
         if (m_top) {
+            const char *base_path = NULL;
             if (m_top->variant_parent_path[0]) {
                 ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f),
                                    "Variant of: %s", m_top->variant_parent_path);
+                base_path = m_top->variant_parent_path;
             } else if (m_top->prefab_instance && m_top->prefab_path[0]) {
                 ImGui::TextColored(ImVec4(0.40f, 0.75f, 0.95f, 1.0f),
                                    "Prefab: %s", m_top->prefab_path);
+                base_path = m_top->prefab_path;
+            }
+
+            if (base_path) {
+                /* Apply / Revert buttons.  Operate on the editor-wide
+                 * override session keyed by entity name (the same
+                 * convention prefab_overrides uses for entity_path).
+                 * "Apply All" rewrites the base prefab file with every
+                 * recorded override; "Revert" drops overrides for this
+                 * specific entity. */
+                const char *ent_path = m_top->name[0] ? m_top->name : "";
+                uint32_t over_count = jce_editor_prefab_overrides_count(ent_path);
+                if (over_count > 0) {
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.4f, 1.0f),
+                                       "(%u override%s)",
+                                       over_count, over_count == 1 ? "" : "s");
+                }
+                if (ImGui::SmallButton("Apply All to Base")) {
+                    if (jce_editor_prefab_overrides_apply(base_path)) {
+                        /* Successful apply clears the session set. */
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Revert Overrides")) {
+                    jce_editor_prefab_overrides_revert(ent_path);
+                }
             }
         }
     }

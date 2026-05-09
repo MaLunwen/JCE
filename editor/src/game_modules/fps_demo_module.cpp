@@ -231,6 +231,8 @@ JceGameModule g_fps_demo_desc = {
 } /* anon namespace */
 
 extern "C" void jce_editor_register_builtin_modules(void);
+extern "C" void jce_editor_register_asset_labels_panel(void);
+
 void jce_editor_register_builtin_modules(void)
 {
     /* The previous standalone "FPS Demo" module has been replaced by
@@ -239,4 +241,9 @@ void jce_editor_register_builtin_modules(void)
      * character through `jce_editor_play.cpp`.  See
      * `caged_kingdom/resources/assets/scenes/fps_demo.scene.json`.
      * Left as a no-op so existing call sites still link. */
+
+    /* Register builtin plugin panels.  As more panels migrate to the
+     * plugin API (instead of the hardcoded panel enum), they're
+     * registered here. */
+    jce_editor_register_asset_labels_panel();
 }

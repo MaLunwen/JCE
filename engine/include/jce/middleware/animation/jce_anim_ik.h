@@ -44,6 +44,55 @@ typedef struct {
 JCE_API int JCE_CALL
 jce_anim_ik_two_bone_solve(const JceIkTwoBoneInput *in, JceIkTwoBoneOutput *out);
 
+/* ── Look-At IK (Unity LookAt constraint) ───────────────────────── *
+ *
+ * Compute the rotation quaternion (world-space) that orients a bone's
+ * forward axis toward `target` while keeping its up axis as close as
+ * possible to `world_up`.  Applied to a head / eye / turret bone to
+ * track an entity at runtime.
+ *
+ * The bone's authored forward and up axes (in bone-local space) are
+ * passed in so different rigs / coordinate systems work without
+ * special-casing inside the helper.  Defaults for typical glTF rigs:
+ *   forward = (0, 0, 1)
+ *   up      = (0, 1, 0)
+ *   world_up = (0, 1, 0)
+ *
+ * `weight` ∈ [0, 1] blends from "no rotation change" (current_rot)
+ * toward the look-at solution (slerp).  Returns the blended rotation
+ * as a quaternion (xyzw).
+ */
+typedef struct {
+    float bone_pos     [3];   /* world-space bone origin */
+    float current_rot  [4];   /* xyzw current bone rotation (world-space) */
+    float target_pos   [3];   /* world-space look target */
+    float bone_forward [3];   /* +axis in bone-local space */
+    float bone_up      [3];   /* up axis in bone-local space */
+    float world_up     [3];   /* world-space up reference */
+    float weight;             /* 0..1 blend toward solution */
+} JceIkLookAtInput;
+
+JCE_API void JCE_CALL
+jce_anim_ik_look_at_solve(const JceIkLookAtInput *in, float out_rot_xyzw[4]);
+
+/* ── FABRIK n-bone chain solver ─────────────────────────────────── *
+ *
+ * Forward And Backward Reaching Inverse Kinematics.  Iteratively
+ * adjusts joint positions (preserving segment lengths) so the last
+ * joint reaches `target`.  Works for any chain length ≥ 2 and is
+ * O(N × iterations) per call.  Typical use: spine bend, multi-bone
+ * tentacle, mech arm.
+ *
+ * `joints` is an array of `joint_count` xyz positions; the function
+ * mutates it in place.  Segment lengths are computed from the input
+ * positions before the first iteration.  `iterations` 8–16 is plenty
+ * for visually smooth results. */
+JCE_API void JCE_CALL
+jce_anim_ik_fabrik_solve(float        *joints,    /* joint_count × 3 floats */
+                         uint32_t      joint_count,
+                         const float   target[3],
+                         uint32_t      iterations);
+
 /* ── Frame events ──────────────────────────────────────────────────── */
 
 typedef struct {
