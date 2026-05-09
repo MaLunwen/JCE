@@ -66,6 +66,8 @@ static ECS_COMPONENT_DECLARE(JceLayoutGroupComponent);
 static ECS_COMPONENT_DECLARE(JceUIImageComponent);
 static ECS_COMPONENT_DECLARE(JceUITextComponent);
 static ECS_COMPONENT_DECLARE(JceUIButtonComponent);
+static ECS_COMPONENT_DECLARE(JceAudioBusRouteComponent);
+static ECS_COMPONENT_DECLARE(JceAnimationLayerStateComponent);
 
 /* ── Scene struct ──────────────────────────────────────────────────── */
 
@@ -138,6 +140,8 @@ JceScene *jce_scene_create(void)
     ECS_COMPONENT_DEFINE(s->world, JceUIImageComponent);
     ECS_COMPONENT_DEFINE(s->world, JceUITextComponent);
     ECS_COMPONENT_DEFINE(s->world, JceUIButtonComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceAudioBusRouteComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceAnimationLayerStateComponent);
 
     LOG_SUCCESS(LOG_TAG, "scene created");
     return s;
@@ -337,6 +341,8 @@ JCE_COMP_IMPL(JceLayoutGroupComponent,        layout_group)
 JCE_COMP_IMPL(JceUIImageComponent,            ui_image)
 JCE_COMP_IMPL(JceUITextComponent,             ui_text)
 JCE_COMP_IMPL(JceUIButtonComponent,           ui_button)
+JCE_COMP_IMPL(JceAudioBusRouteComponent,      audio_bus_route)
+JCE_COMP_IMPL(JceAnimationLayerStateComponent, animation_layer_state)
 
 #undef JCE_COMP_IMPL
 
@@ -400,6 +406,8 @@ uint64_t jce_scene_get_component_flags(const JceScene *s, JceEntity e)
     if (ecs_has(s->world, ent, JceUIImageComponent))            flags |= JCE_COMP_FLAG_UI_IMAGE;
     if (ecs_has(s->world, ent, JceUITextComponent))             flags |= JCE_COMP_FLAG_UI_TEXT;
     if (ecs_has(s->world, ent, JceUIButtonComponent))           flags |= JCE_COMP_FLAG_UI_BUTTON;
+    if (ecs_has(s->world, ent, JceAudioBusRouteComponent))      flags |= JCE_COMP_FLAG_AUDIO_BUS_ROUTE;
+    if (ecs_has(s->world, ent, JceAnimationLayerStateComponent)) flags |= JCE_COMP_FLAG_ANIMATION_LAYER_STATE;
 
     return flags;
 }

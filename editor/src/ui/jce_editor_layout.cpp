@@ -16,6 +16,7 @@
 
 #include "jce_editor_layout.h"
 #include "jce_editor_layout_persistence.h"
+#include "core/jce_editor_plugin.h"
 
 #include "dialogs/jce_editor_dialogs.h"
 #include "core/jce_editor.h"
@@ -872,6 +873,23 @@ static void draw_menu_bar(void)
         if (ImGui::MenuItem(jce_editor_i18n("menu.window.resetLayout"))) {
             s_layout_preset_pending = 0;
             s_reset_layout_requested = true;
+        }
+        /* Plugin panels (registered via jce_editor_plugin_register_panel).
+         * Each appears as a checkable Window-menu item that toggles its
+         * visibility flag. */
+        uint32_t plug_n = jce_editor_plugin_panel_count();
+        if (plug_n > 0) {
+            ImGui::Separator();
+            if (ImGui::BeginMenu("Plugins")) {
+                for (uint32_t i = 0; i < plug_n; ++i) {
+                    const JceEditorPluginPanel *pp = jce_editor_plugin_panel_at(i);
+                    if (!pp) continue;
+                    bool *vis = jce_editor_plugin_panel_visible_ptr(pp->id);
+                    const char *lbl = pp->display_name ? pp->display_name : pp->id;
+                    ImGui::MenuItem(lbl, NULL, vis);
+                }
+                ImGui::EndMenu();
+            }
         }
         ImGui::EndMenu();
     }
@@ -2103,6 +2121,11 @@ void jce_editor_layout_draw(void)
         fg->AddText(ImVec2(ba.x + pad, ba.y + pad * 0.5f),
                     IM_COL32(20, 20, 20, 255), lbl);
     }
+
+    /* Render every plugin-registered panel (compile-time registry).
+     * Drawn after built-in panels so their windows can dock alongside
+     * the standard set, with no special-case Window menu plumbing. */
+    jce_editor_plugin_render_all();
 
     /* Persist Window menu visibility (writes only when mask changes). */
     jce_editor_panels_persist_visibility();

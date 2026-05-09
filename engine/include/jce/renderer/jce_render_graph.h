@@ -139,6 +139,12 @@ typedef struct {
        counts. */
     char     read_names[8][32];
     char     write_names[8][32];
+    /* CPU-side timing of the pass execute callback, microseconds.
+     * Captured every frame regardless of has_capture so the editor's
+     * frame-debugger panel can show a live HUD without explicit
+     * capture requests.  GPU timing is left as TODO until bgfx
+     * timestamp queries are wired. */
+    uint64_t cpu_time_us;
 } JceRGFrameDebugPass;
 
 /* Request a single-frame capture on the *next* execute. Cheap; safe

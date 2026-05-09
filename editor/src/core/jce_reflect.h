@@ -38,6 +38,7 @@ typedef enum {
     JCE_FT_BOOL,
     JCE_FT_INT,
     JCE_FT_FLOAT,
+    JCE_FT_FLOAT_SLIDER, /* float with min/max — rendered as a slider, Unity [Range(min,max)] */
     JCE_FT_VEC2,
     JCE_FT_VEC3,
     JCE_FT_VEC4,
@@ -155,6 +156,12 @@ extern "C" {
 #define JCE_FIELD_MULTILINE(STRUCT, MEMBER, LABEL)                          \
     { #MEMBER, LABEL, JCE_FT_STRING_MULTILINE, offsetof(STRUCT, MEMBER),    \
       sizeof(((STRUCT *)0)->MEMBER), 0.0f, 0.0f, 0.0f, NULL, 0,             \
+      NULL, NULL, JCE_FT_NONE, 0, 0, 0, NULL },
+
+/* Float field rendered as a slider with hard min/max (Unity [Range]). */
+#define JCE_FIELD_SLIDER(STRUCT, MEMBER, LABEL, MN, MX)                     \
+    { #MEMBER, LABEL, JCE_FT_FLOAT_SLIDER, offsetof(STRUCT, MEMBER),        \
+      sizeof(((STRUCT *)0)->MEMBER), (MN), (MX), 0.0f, NULL, 0,             \
       NULL, NULL, JCE_FT_NONE, 0, 0, 0, NULL },
 
 #define JCE_REFLECT_END(STRUCT, DISPLAY)                                    \

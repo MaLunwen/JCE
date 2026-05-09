@@ -13,6 +13,7 @@
 #include <jce/os/core/jce_defs.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/renderer/jce_gfx_types.h>
+#include <jce/renderer/jce_material_property_block.h>
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -50,6 +51,10 @@ typedef struct {
     char            normal_tex[256];
     char            ao_tex[256];
     char            emissive_tex[256];
+    /* Per-instance Material Property Block — sparse uniform overrides
+     * applied AFTER the base material binds.  Defaults to "no
+     * overrides" (zero-initialised) so existing meshes are unchanged. */
+    JceMaterialPropertyBlock prop_block;
 } JceMeshRenderer;
 
 typedef struct {
@@ -797,6 +802,39 @@ typedef uint64_t JceComponentFlag;
 #define JCE_COMP_FLAG_UI_IMAGE             (UINT64_C(1) << 48)
 #define JCE_COMP_FLAG_UI_TEXT              (UINT64_C(1) << 49)
 #define JCE_COMP_FLAG_UI_BUTTON            (UINT64_C(1) << 50)
+#define JCE_COMP_FLAG_AUDIO_BUS_ROUTE      (UINT64_C(1) << 51)
+#define JCE_COMP_FLAG_ANIMATION_LAYER_STATE (UINT64_C(1) << 52)
+
+/* ── Audio Bus Route (Unity-style routing of an AudioSource to a bus) ─ */
+
+/* Names a target bus ("SFX" / "Music" / "Voice") so the audio runtime
+ * can call jce_audio_mixer_assign_voice with the matching JceAudioBusId
+ * each time the entity's AudioSource starts a voice.  If `bus_name` is
+ * empty, voices route to Master (default behaviour). */
+typedef struct {
+    char bus_name[64];
+} JceAudioBusRouteComponent;
+
+/* ── Animation Layer State (per-entity layer stack config) ─────────── */
+
+#define JCE_ANIM_LAYER_STATE_MAX 4
+
+/* Per-layer authoring data persisted on the entity.  Runtime systems
+ * read this and feed a JceAnimLayerStack each frame.  `clip_path` is
+ * empty for unused slots; weight=0 also disables the layer. */
+typedef struct {
+    char  clip_path[256];      /* asset path of the clip */
+    float weight;              /* 0..1 */
+    int   blend_mode;          /* JceAnimBlendMode enum value */
+    float speed;               /* clip playback speed (default 1.0) */
+    bool  enabled;
+} JceAnimLayerSlot;
+
+typedef struct {
+    JceAnimLayerSlot layers[JCE_ANIM_LAYER_STATE_MAX];
+    int              active_layer_count;  /* 0..JCE_ANIM_LAYER_STATE_MAX */
+    bool             apply_root_motion;   /* propagate root delta to Transform */
+} JceAnimationLayerStateComponent;
 
 /* ── Entity handle ───────────────────────────────────────────────── */
 
@@ -1130,6 +1168,18 @@ JCE_API void                          jce_scene_set_ui_button(JceScene *s, JceEn
 JCE_API JceUIButtonComponent         *jce_scene_get_ui_button(JceScene *s, JceEntity e);
 JCE_API bool                          jce_scene_has_ui_button(const JceScene *s, JceEntity e);
 JCE_API void                          jce_scene_remove_ui_button(JceScene *s, JceEntity e);
+
+/* Component access — Audio Bus Route. */
+JCE_API void                          jce_scene_set_audio_bus_route(JceScene *s, JceEntity e, const JceAudioBusRouteComponent *c);
+JCE_API JceAudioBusRouteComponent    *jce_scene_get_audio_bus_route(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_audio_bus_route(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_audio_bus_route(JceScene *s, JceEntity e);
+
+/* Component access — Animation Layer State. */
+JCE_API void                              jce_scene_set_animation_layer_state(JceScene *s, JceEntity e, const JceAnimationLayerStateComponent *c);
+JCE_API JceAnimationLayerStateComponent  *jce_scene_get_animation_layer_state(JceScene *s, JceEntity e);
+JCE_API bool                              jce_scene_has_animation_layer_state(const JceScene *s, JceEntity e);
+JCE_API void                              jce_scene_remove_animation_layer_state(JceScene *s, JceEntity e);
 
 /* Component enumeration — returns bitmask of JceComponentFlag. */
 JCE_API uint64_t jce_scene_get_component_flags(const JceScene *s, JceEntity e);

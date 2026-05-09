@@ -167,15 +167,34 @@ static void draw_rg_capture(void)
         return;
     }
 
-    ImGui::BeginChild("##fd_pass_list", ImVec2(260, 240), true);
+    /* Build a max-CPU bound for relative bar widths.  Recompute every
+     * frame because the capture only refreshes on request, but
+     * cpu_time_us inside captured passes is updated live. */
+    uint64_t max_us = 1;
+    for (uint32_t i = 0; i < s_pass_count; i++)
+        if (s_passes[i].cpu_time_us > max_us) max_us = s_passes[i].cpu_time_us;
+
+    ImGui::BeginChild("##fd_pass_list", ImVec2(360, 240), true);
     for (uint32_t i = 0; i < s_pass_count; i++) {
         const JceRGFrameDebugPass *p = &s_passes[i];
-        char lbl[160];
-        snprintf(lbl, sizeof(lbl), "[%u] %s%s",
+        char lbl[200];
+        snprintf(lbl, sizeof(lbl), "[%u] %-20s %6.3f ms%s",
                  (uint32_t)p->view_id, p->name,
+                 (double)p->cpu_time_us / 1000.0,
                  p->culled ? " (culled)" : "");
         bool sel = (int)i == s_selected;
         if (ImGui::Selectable(lbl, sel)) s_selected = (int)i;
+        /* Relative-CPU bar drawn under each row. */
+        if (max_us > 0) {
+            float frac = (float)((double)p->cpu_time_us / (double)max_us);
+            ImVec2 cur = ImGui::GetCursorScreenPos();
+            ImDrawList *dl = ImGui::GetWindowDrawList();
+            float bar_w = ImGui::GetContentRegionAvail().x;
+            dl->AddRectFilled(cur,
+                              ImVec2(cur.x + bar_w * frac, cur.y + 2),
+                              IM_COL32(80, 200, 255, 220));
+            ImGui::Dummy(ImVec2(bar_w, 3));
+        }
     }
     ImGui::EndChild();
     ImGui::SameLine();
@@ -189,6 +208,9 @@ static void draw_rg_capture(void)
         ImGui::Text("%s: %u",  jce_editor_i18n("frameDebugger.detail.view"), (uint32_t)p->view_id);
         ImGui::Text("%s: %s",  jce_editor_i18n("frameDebugger.detail.culled"),
                     p->culled ? "yes" : "no");
+        ImGui::Text("CPU: %.3f ms (%llu us)",
+                    (double)p->cpu_time_us / 1000.0,
+                    (unsigned long long)p->cpu_time_us);
         ImGui::Separator();
         ImGui::Text("%s (%u):", jce_editor_i18n("frameDebugger.detail.reads"),
                     (uint32_t)p->read_count);

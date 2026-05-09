@@ -100,6 +100,20 @@ bool draw_field(const JceReflectField *f, void *base, const void *defaults_base)
             changed = ImGui::DragFloat(label, p, step);
         track_undo();
     } break;
+    case JCE_FT_FLOAT_SLIDER: {
+        /* Always slider regardless of vmin/vmax sanity — caller asked
+         * explicitly for [Range]-style UI.  Clamp to the declared range
+         * on edit so out-of-range typed values get coerced. */
+        float *p = as_float(base, f);
+        float lo = f->vmin, hi = f->vmax;
+        if (hi <= lo) { lo = 0.0f; hi = 1.0f; }
+        changed = ImGui::SliderFloat(label, p, lo, hi);
+        if (changed) {
+            if (*p < lo) *p = lo;
+            if (*p > hi) *p = hi;
+        }
+        track_undo();
+    } break;
     case JCE_FT_VEC2: {
         float *p = as_float(base, f);
         changed = ImGui::DragFloat2(label, p,

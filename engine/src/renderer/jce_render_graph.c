@@ -12,6 +12,7 @@
 
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
+#include <jce/os/core/jce_timer.h>
 #include <jce/renderer/jce_render_graph.h>
 
 #include "os/core/jce_memory.h"
@@ -66,6 +67,10 @@ typedef struct {
 
     /* Assigned bgfx view at execution. */
     uint16_t bgfx_view;
+
+    /* Last-frame CPU execute time in microseconds.  Updated unconditionally
+     * (every frame) so frame_debug_get can return live values. */
+    uint64_t last_cpu_time_us;
 } PassRecord;
 
 /* ── Graph struct ─────────────────────────────────────────────────── */
@@ -150,6 +155,7 @@ static void fd_capture_now(JceRenderGraph *rg)
         out->read_count  = p->read_count;
         out->write_count = p->write_count;
         out->culled      = p->culled;
+        out->cpu_time_us = p->last_cpu_time_us;
         uint16_t rn = p->read_count  > 8 ? 8 : p->read_count;
         uint16_t wn = p->write_count > 8 ? 8 : p->write_count;
         for (uint16_t k = 0; k < rn; k++) {
@@ -423,7 +429,16 @@ void jce_rg_execute(JceRenderGraph *rg)
         PassRecord *p = &rg->passes[pi];
         if (p->culled || !p->fn) continue;
 
+        /* CPU-time wrap (microsecond resolution).  Updates every
+         * frame so frame_debug_get returns live numbers without the
+         * caller having to issue a capture request. */
+        const uint64_t t0   = jce_time_perf_counter();
+        const uint64_t freq = jce_time_perf_freq();
         p->fn((JceRGPass){ pi }, p->bgfx_view, p->userdata);
+        if (freq > 0) {
+            const uint64_t dt = jce_time_perf_counter() - t0;
+            p->last_cpu_time_us = (dt * 1000000ull) / freq;
+        }
     }
 
     /* Frame debug capture (after pass execute so view IDs are stable). */
