@@ -13,6 +13,7 @@ extern "C" {
 
 #include <jce/middleware/net/jce_net.h>
 #include <jce/middleware/net/jce_net_replication.h>
+#include <jce/middleware/net/jce_net_interp.h>
 #include <jce/middleware/net/jce_net_types.h>
 
 

@@ -17,6 +17,7 @@ extern "C" {
 #include <jce/renderer/jce_gi_probes.h>
 #include <jce/renderer/jce_material_property_block.h>
 #include <jce/renderer/jce_morph_target.h>
+#include <jce/renderer/jce_reflection_probe.h>
 #include <jce/renderer/jce_render_graph.h>
 #include <jce/renderer/jce_render_queue.h>
 #include <jce/renderer/jce_scene_renderer.h>

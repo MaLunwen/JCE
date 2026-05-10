@@ -262,11 +262,56 @@ typedef struct {
 
 /* ── Particle emitter component ─────────────────────────────────── */
 
+/* Color stop in a "color over lifetime" gradient.  Up to 8 stops
+ * across the [0,1] normalised lifetime range. */
+typedef struct {
+    float position;       /* 0..1 along lifetime */
+    float color[4];       /* RGBA */
+} JceParticleColorStop;
+
+#define JCE_PARTICLE_GRADIENT_MAX 8
+#define JCE_PARTICLE_CURVE_MAX 8   /* keyframes for size-over-lifetime */
+
+typedef struct {
+    float time;           /* 0..1 along lifetime */
+    float value;
+} JceParticleCurveKey;
+
+/* Emission shape controls the volume new particles spawn within.
+ * 0 = point, 1 = sphere, 2 = box, 3 = cone (Unity-style). */
+typedef enum {
+    JCE_PARTICLE_SHAPE_POINT  = 0,
+    JCE_PARTICLE_SHAPE_SPHERE = 1,
+    JCE_PARTICLE_SHAPE_BOX    = 2,
+    JCE_PARTICLE_SHAPE_CONE   = 3,
+} JceParticleShape;
+
 typedef struct {
     uint32_t emitter_handle_idx; /* JceEmitterHandle.idx */
     float    emit_rate;
     float    lifetime_min;
     float    lifetime_max;
+
+    /* Emission shape module. */
+    int   shape;              /* JceParticleShape */
+    float shape_radius;       /* sphere/cone */
+    float shape_size[3];      /* box half-extents / cone height (z) */
+    float shape_angle_deg;    /* cone */
+
+    /* Color over lifetime (gradient). */
+    JceParticleColorStop color_stops[JCE_PARTICLE_GRADIENT_MAX];
+    int                  color_stop_count;
+    bool                 color_over_lifetime_enabled;
+
+    /* Size over lifetime (curve). */
+    JceParticleCurveKey size_curve[JCE_PARTICLE_CURVE_MAX];
+    int                 size_curve_count;
+    bool                size_over_lifetime_enabled;
+
+    /* Velocity over lifetime — single linear vector (drag) for
+     * simplicity; full module deferred. */
+    float velocity_over_lifetime[3];
+    bool  velocity_over_lifetime_enabled;
 } JceParticleEmitterComponent;
 
 /* Tag components (zero-size). */

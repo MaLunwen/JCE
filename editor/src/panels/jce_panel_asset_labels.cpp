@@ -12,6 +12,7 @@
 
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_plugin.h"
+#include "core/jce_editor_asset_label_map.h"
 
 #include <jce/tools/jce_imgui.hpp>
 #include <cstdio>
@@ -65,6 +66,41 @@ void asset_labels_panel_content(void)
     if (n >= JCE_ASSET_LABEL_MAX) {
         ImGui::TextDisabled("Registry full (cap = %u).", JCE_ASSET_LABEL_MAX);
     }
+
+    ImGui::Separator();
+    /* Per-asset tagging.  User pastes (or drags-into) an asset path
+     * and toggles which registered labels apply.  Editor-side map is
+     * persisted to <project>/.jce/asset_labels.json so it round-trips
+     * across editor sessions. */
+    ImGui::TextWrapped("Tag a specific asset:");
+    static char asset_path[512] = {0};
+    ImGui::InputText("Asset path", asset_path, sizeof(asset_path));
+    if (asset_path[0] && n > 0) {
+        uint64_t bits = jce_editor_asset_labels_get(asset_path);
+        bool dirty = false;
+        for (uint32_t i = 0; i < n; ++i) {
+            const char *lbl = jce_asset_label_name(i);
+            if (!lbl) continue;
+            uint64_t bit = ((uint64_t)1u << i);
+            bool on = (bits & bit) != 0;
+            if (ImGui::Checkbox(lbl, &on)) {
+                bits = on ? (bits | bit) : (bits & ~bit);
+                dirty = true;
+            }
+        }
+        if (dirty) jce_editor_asset_labels_set(asset_path, bits);
+        ImGui::TextDisabled("Mask: 0x%llx", (unsigned long long)bits);
+    } else if (n == 0) {
+        ImGui::TextDisabled("(register at least one label first)");
+    }
+
+    ImGui::Separator();
+    if (ImGui::Button("Save Map"))   { jce_editor_asset_labels_save(); }
+    ImGui::SameLine();
+    if (ImGui::Button("Reload Map")) { jce_editor_asset_labels_load(); }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%u entries)",
+                        jce_editor_asset_labels_entry_count());
 }
 
 } /* namespace */

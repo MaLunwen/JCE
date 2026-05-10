@@ -45,6 +45,8 @@ typedef enum {
     JCE_FT_QUAT,        /* edited as Euler degrees */
     JCE_FT_COLOR3,      /* float[3] colour swatch */
     JCE_FT_COLOR4,      /* float[4] colour swatch */
+    JCE_FT_COLOR3_HDR,  /* float[3] HDR colour (>1 components allowed) */
+    JCE_FT_COLOR4_HDR,  /* float[4] HDR colour */
     JCE_FT_STRING,      /* fixed-size char[] (single line) */
     JCE_FT_STRING_MULTILINE, /* fixed-size char[] rendered as multi-line text box */
     JCE_FT_ENUM_INT,    /* int with named labels (extra: const char* const*) */
@@ -155,6 +157,18 @@ extern "C" {
 /* Multi-line text area (Unity's [Multiline] / [TextArea]). */
 #define JCE_FIELD_MULTILINE(STRUCT, MEMBER, LABEL)                          \
     { #MEMBER, LABEL, JCE_FT_STRING_MULTILINE, offsetof(STRUCT, MEMBER),    \
+      sizeof(((STRUCT *)0)->MEMBER), 0.0f, 0.0f, 0.0f, NULL, 0,             \
+      NULL, NULL, JCE_FT_NONE, 0, 0, 0, NULL },
+
+/* HDR color field (Unity [ColorUsage(showAlpha, hdr=true)]).  The
+ * picker lets users author values > 1 to drive bloom / emissive.
+ * Use COLOR3_HDR for RGB, COLOR4_HDR for RGBA. */
+#define JCE_FIELD_COLOR_HDR(STRUCT, MEMBER, LABEL)                          \
+    { #MEMBER, LABEL, JCE_FT_COLOR3_HDR, offsetof(STRUCT, MEMBER),          \
+      sizeof(((STRUCT *)0)->MEMBER), 0.0f, 0.0f, 0.0f, NULL, 0,             \
+      NULL, NULL, JCE_FT_NONE, 0, 0, 0, NULL },
+#define JCE_FIELD_COLOR4_HDR(STRUCT, MEMBER, LABEL)                         \
+    { #MEMBER, LABEL, JCE_FT_COLOR4_HDR, offsetof(STRUCT, MEMBER),          \
       sizeof(((STRUCT *)0)->MEMBER), 0.0f, 0.0f, 0.0f, NULL, 0,             \
       NULL, NULL, JCE_FT_NONE, 0, 0, 0, NULL },
 

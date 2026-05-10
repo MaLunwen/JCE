@@ -172,6 +172,24 @@ bool draw_field(const JceReflectField *f, void *base, const void *defaults_base)
         changed = ImGui::ColorEdit4(label, as_float(base, f));
         track_undo();
         break;
+    case JCE_FT_COLOR3_HDR: {
+        /* Unity-style HDR color picker: HDR + Float flags allow values
+         * > 1 (used to drive bloom / emissive intensity).  Show
+         * intensity exposure in the popup, and the linear values get
+         * stored unchanged. */
+        ImGuiColorEditFlags flags = ImGuiColorEditFlags_HDR
+                                  | ImGuiColorEditFlags_Float
+                                  | ImGuiColorEditFlags_NoInputs;
+        changed = ImGui::ColorEdit3(label, as_float(base, f), flags);
+        track_undo();
+    } break;
+    case JCE_FT_COLOR4_HDR: {
+        ImGuiColorEditFlags flags = ImGuiColorEditFlags_HDR
+                                  | ImGuiColorEditFlags_Float
+                                  | ImGuiColorEditFlags_NoInputs;
+        changed = ImGui::ColorEdit4(label, as_float(base, f), flags);
+        track_undo();
+    } break;
     case JCE_FT_STRING: {
         char *p = as_char(base, f);
         changed = ImGui::InputText(label, p, f->size);
