@@ -12,7 +12,12 @@
 extern "C" {
 #endif
 
+#include <jce/middleware/scene/jce_camera_helpers.h>
+#include <jce/middleware/scene/jce_particle_modules.h>
+#include <jce/middleware/scene/jce_prefab.h>
+#include <jce/middleware/scene/jce_prefab_overrides.h>
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/middleware/scene/jce_scene_async.h>
 #include <jce/middleware/scene/jce_space_partition.h>
 
 

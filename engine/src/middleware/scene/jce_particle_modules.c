@@ -6,8 +6,13 @@
  */
 
 #include <jce/middleware/scene/jce_particle_modules.h>
+#include <jce/middleware/animation/jce_anim_curve.h>
+#include <jce/middleware/animation/jce_anim_curve_serial.h>
+
+#include "os/core/jce_memory.h"
 
 #include <math.h>
+#include <string.h>
 
 #ifndef JCE_PI
 #define JCE_PI 3.14159265358979323846f
@@ -175,4 +180,74 @@ jce_vec3 jce_particle_sample_initial_velocity(
         v.z += e->velocity_over_lifetime[2];
     }
     return v;
+}
+
+/* ── Emission rate over time ─────────────────────────────────── *
+ *
+ * Per-process cache: linear-search table mapping curve path → loaded
+ * JceAnimCurve*.  Small cap (32) since typical projects have a
+ * handful of authored emission curves.  Larger projects can call
+ * jce_particle_emission_curve_cache_clear() between levels.
+ */
+
+#define EMIT_CURVE_CACHE_MAX 32
+
+typedef struct {
+    char           path[256];
+    JceAnimCurve  *curve;
+} EmitCurveEntry;
+
+static EmitCurveEntry s_emit_curve_cache[EMIT_CURVE_CACHE_MAX];
+
+static JceAnimCurve *emit_curve_get_or_load(const char *path)
+{
+    if (!path || !path[0]) return NULL;
+    /* Hit. */
+    for (int i = 0; i < EMIT_CURVE_CACHE_MAX; ++i) {
+        if (s_emit_curve_cache[i].path[0] == '\0') continue;
+        if (strcmp(s_emit_curve_cache[i].path, path) == 0)
+            return s_emit_curve_cache[i].curve;
+    }
+    /* Miss — load. */
+    JceAnimCurve *c = jce_anim_curve_load_json(path);
+    if (!c) return NULL;
+    /* Insert into first free slot, or evict the first one if full. */
+    int slot = -1;
+    for (int i = 0; i < EMIT_CURVE_CACHE_MAX; ++i) {
+        if (s_emit_curve_cache[i].path[0] == '\0') { slot = i; break; }
+    }
+    if (slot < 0) {
+        /* Evict slot 0 (FIFO-ish). */
+        if (s_emit_curve_cache[0].curve)
+            jce_anim_curve_destroy(s_emit_curve_cache[0].curve);
+        memmove(&s_emit_curve_cache[0], &s_emit_curve_cache[1],
+                sizeof(EmitCurveEntry) * (EMIT_CURVE_CACHE_MAX - 1));
+        slot = EMIT_CURVE_CACHE_MAX - 1;
+        memset(&s_emit_curve_cache[slot], 0, sizeof(EmitCurveEntry));
+    }
+    strncpy(s_emit_curve_cache[slot].path, path,
+            sizeof(s_emit_curve_cache[slot].path) - 1);
+    s_emit_curve_cache[slot].path[sizeof(s_emit_curve_cache[slot].path) - 1] = '\0';
+    s_emit_curve_cache[slot].curve = c;
+    return c;
+}
+
+float jce_particle_sample_emission_rate(const JceParticleEmitterComponent *e,
+                                         float t)
+{
+    if (!e) return 1.0f;
+    if (!e->emission_rate_curve_enabled) return 1.0f;
+    if (!e->emission_rate_curve_path[0])  return 1.0f;
+    JceAnimCurve *c = emit_curve_get_or_load(e->emission_rate_curve_path);
+    if (!c) return 1.0f;
+    return jce_anim_curve_evaluate(c, t);
+}
+
+void jce_particle_emission_curve_cache_clear(void)
+{
+    for (int i = 0; i < EMIT_CURVE_CACHE_MAX; ++i) {
+        if (s_emit_curve_cache[i].curve)
+            jce_anim_curve_destroy(s_emit_curve_cache[i].curve);
+        memset(&s_emit_curve_cache[i], 0, sizeof(EmitCurveEntry));
+    }
 }

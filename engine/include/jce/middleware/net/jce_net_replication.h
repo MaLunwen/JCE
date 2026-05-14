@@ -51,7 +51,11 @@
 
 JCE_EXTERN_C_BEGIN
 
-#define JCE_NET_PROTOCOL_VERSION 1u
+#define JCE_NET_PROTOCOL_VERSION 2u   /* v2 adds owner_peer_id per entity */
+#define JCE_NET_PROTOCOL_V1      1u   /* legacy decoder fallback */
+
+/* Sentinel peer id meaning "no owner" / server-owned. */
+#define JCE_NET_PEER_SERVER  ((uint16_t)0xFFFFu)
 
 /* Per-entity field bits (extend as gameplay code needs more).
  * The mask is 32-bit so we have plenty of headroom; reserved bits at
@@ -74,6 +78,12 @@ typedef enum {
 typedef struct {
     uint32_t entity_id;
     uint32_t mask;             /* JCE_NET_FIELD_* bits set */
+    /* Owning peer id.  Used by `jce_net_should_replicate` to decide
+     * whether the local host writes back this entity.  v1 wire data
+     * decodes with owner_peer_id = JCE_NET_PEER_SERVER for backwards
+     * compatibility. */
+    uint16_t owner_peer_id;
+    uint16_t _pad;             /* reserved — keeps the struct 4-aligned */
     /* Field payloads — only those whose bit is set in `mask` are read. */
     jce_vec3 position;
     jce_quat rotation;
@@ -102,12 +112,26 @@ JCE_API uint32_t jce_net_snapshot_encode(const JceNetEntitySnap *entities,
 
 /* Decode `in` (size bytes).  Writes entities to `out_entities` (capped
  * at `max_entities`), and returns the actual count.  Returns 0 on
- * malformed input or protocol-version mismatch. */
+ * malformed input or protocol-version mismatch.  Both v1 (no owner)
+ * and v2 (with owner) blobs decode — v1 entries default owner to
+ * JCE_NET_PEER_SERVER. */
 JCE_API uint32_t jce_net_snapshot_decode(const uint8_t        *in,
                                           uint32_t              size,
                                           uint32_t             *out_server_tick,
                                           JceNetEntitySnap     *out_entities,
                                           uint32_t              max_entities);
+
+/* Authority check: returns true when the local peer should apply
+ * its own input + simulation to the entity described by `snap`.
+ *
+ * The convention:
+ *   - server (`local_peer == JCE_NET_PEER_SERVER`) always writes.
+ *   - clients write iff snap.owner_peer_id matches local_peer.
+ *
+ * Game code calls this before running input / physics on a remote
+ * peer's character or pickup. */
+JCE_API bool jce_net_should_replicate(const JceNetEntitySnap *snap,
+                                       uint16_t                local_peer);
 
 /* ── Delta encoding ──────────────────────────────────────────────── *
  *

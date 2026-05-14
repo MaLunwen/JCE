@@ -12,6 +12,7 @@ extern "C" {
 #endif
 
 #include <jce/middleware/ai/jce_bt.h>
+#include <jce/middleware/ai/jce_bt_blackboard.h>
 #include <jce/middleware/ai/jce_navmesh.h>
 #include <jce/middleware/ai/jce_navmesh_recast.h>
 #include <jce/middleware/ai/jce_navmesh_scene_bake.h>

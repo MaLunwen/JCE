@@ -101,6 +101,9 @@ static bool encode_entity(const JceNetEntitySnap *e,
 {
     if (!w_u32(e->entity_id, p, end)) return false;
     if (!w_u32(e->mask,      p, end)) return false;
+    /* v2: owner_peer_id appended after mask. */
+    if (!w_u16(e->owner_peer_id, p, end)) return false;
+    if (!w_u16(0u, p, end)) return false; /* pad / reserved */
 
     if (e->mask & JCE_NET_FIELD_TRANSFORM) {
         if (!w_f32(e->position.x, p, end)) return false;
@@ -136,11 +139,23 @@ static bool encode_entity(const JceNetEntitySnap *e,
     return true;
 }
 
-static bool decode_entity(JceNetEntitySnap *e,
+static bool decode_entity(JceNetEntitySnap *e, uint32_t protocol_version,
                           const uint8_t **p, const uint8_t *end)
 {
     if (!r_u32(&e->entity_id, p, end)) return false;
     if (!r_u32(&e->mask,      p, end)) return false;
+    /* v2 stream carries owner_peer_id + pad after mask.  v1 has none
+     * — default to server ownership so legacy senders keep working. */
+    if (protocol_version >= JCE_NET_PROTOCOL_VERSION) {
+        uint16_t owner = 0, pad = 0;
+        if (!r_u16(&owner, p, end)) return false;
+        if (!r_u16(&pad,   p, end)) return false;
+        e->owner_peer_id = owner;
+        e->_pad = pad;
+    } else {
+        e->owner_peer_id = JCE_NET_PEER_SERVER;
+        e->_pad = 0;
+    }
 
     if (e->mask & JCE_NET_FIELD_TRANSFORM) {
         if (!r_f32(&e->position.x, p, end)) return false;
@@ -184,7 +199,9 @@ uint32_t jce_net_snapshot_max_bytes(uint32_t entity_count)
     /* Header (12) + per-entity worst case (8 + transform 40 + velocity 24
      * + health 4 + anim 36 + input 24 = 136). */
     const uint32_t kHeader = 12;
-    const uint32_t kPerEntityWorst = 8 + 40 + 24 + 4 + 36 + 24;
+    /* Per-entity worst case: 8 (id+mask) + 4 (owner+pad, v2)
+     * + transform 40 + velocity 24 + health 4 + anim 36 + input 24. */
+    const uint32_t kPerEntityWorst = 8 + 4 + 40 + 24 + 4 + 36 + 24;
     return kHeader + entity_count * kPerEntityWorst;
 }
 
@@ -219,7 +236,11 @@ uint32_t jce_net_snapshot_decode(const uint8_t *in, uint32_t size,
     uint16_t reserved = 0;
     uint32_t tick = 0;
     if (!r_u32(&version, &p, end)) return 0;
-    if (version != JCE_NET_PROTOCOL_VERSION) return 0;
+    /* Accept v1 (legacy) and v2 (current) wire blobs.  v1 entries
+     * default owner_peer_id to JCE_NET_PEER_SERVER on the receive
+     * side so legacy senders interoperate. */
+    if (version != JCE_NET_PROTOCOL_VERSION
+        && version != JCE_NET_PROTOCOL_V1) return 0;
     if (!r_u16(&entity_count, &p, end)) return 0;
     if (!r_u16(&reserved, &p, end))    return 0;
     if (!r_u32(&tick, &p, end))        return 0;
@@ -228,14 +249,14 @@ uint32_t jce_net_snapshot_decode(const uint8_t *in, uint32_t size,
     uint32_t to_write = entity_count > max_entities ? max_entities : entity_count;
     for (uint32_t i = 0; i < to_write; ++i) {
         memset(&out_entities[i], 0, sizeof(out_entities[i]));
-        if (!decode_entity(&out_entities[i], &p, end)) return 0;
+        if (!decode_entity(&out_entities[i], version, &p, end)) return 0;
     }
     /* Skip remaining entities the caller couldn't accommodate so the
      * decoder leaves `p` at the end-of-buffer position. */
     for (uint32_t i = to_write; i < entity_count; ++i) {
         JceNetEntitySnap discard;
         memset(&discard, 0, sizeof(discard));
-        if (!decode_entity(&discard, &p, end)) return 0;
+        if (!decode_entity(&discard, version, &p, end)) return 0;
     }
     return to_write;
 }
@@ -372,4 +393,13 @@ bool jce_net_rpc_decode(const uint8_t *in, uint32_t size, JceNetRpc *out_rpc)
         out_rpc->payload = NULL;
     }
     return true;
+}
+
+bool jce_net_should_replicate(const JceNetEntitySnap *snap, uint16_t local_peer)
+{
+    if (!snap) return false;
+    /* The server (sentinel local_peer) always replicates. */
+    if (local_peer == JCE_NET_PEER_SERVER) return true;
+    /* Client only writes its own entities. */
+    return snap->owner_peer_id == local_peer;
 }

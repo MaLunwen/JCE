@@ -312,6 +312,13 @@ typedef struct {
      * simplicity; full module deferred. */
     float velocity_over_lifetime[3];
     bool  velocity_over_lifetime_enabled;
+
+    /* Emission rate over time — path to a .curve.json (B7.3 / B8.7).
+     * When set, runtime evaluates the curve at the emitter's local
+     * time and multiplies emit_rate by the sampled scalar.  Empty
+     * string means "use emit_rate as-is". */
+    char  emission_rate_curve_path[256];
+    bool  emission_rate_curve_enabled;
 } JceParticleEmitterComponent;
 
 /* Tag components (zero-size). */

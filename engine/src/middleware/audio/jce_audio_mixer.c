@@ -21,6 +21,8 @@ typedef struct Bus {
     float         volume;
     bool          muted;
     bool          solo;
+    /* B9.4: effect slots — chain of DSP processors applied in order. */
+    JceMixerEffectSlot effects[JCE_MIXER_BUS_EFFECT_SLOTS];
 } Bus;
 
 /* Open-addressed hash for voice -> bus mapping. */
@@ -273,3 +275,48 @@ const char *jce_audio_mixer_get_name(const JceAudioMixer *m, JceAudioBusId b)
 
 JceAudioBusId jce_audio_mixer_get_parent(const JceAudioMixer *m, JceAudioBusId b)
 { return bus_valid(m, b) ? m->buses[b].parent : JCE_AUDIO_BUS_INVALID; }
+
+/* ── Effect chain ─────────────────────────────────────────────── */
+
+bool jce_audio_mixer_bus_attach_effect(JceAudioMixer *m, JceAudioBusId b,
+                                        uint32_t slot_index,
+                                        JceMixerEffectKind kind,
+                                        const float params[4])
+{
+    if (!bus_valid(m, b)) return false;
+    if (slot_index >= JCE_MIXER_BUS_EFFECT_SLOTS) return false;
+    JceMixerEffectSlot *s = &m->buses[b].effects[slot_index];
+    s->kind = kind;
+    if (params) {
+        s->params[0] = params[0];
+        s->params[1] = params[1];
+        s->params[2] = params[2];
+        s->params[3] = params[3];
+    } else {
+        s->params[0] = s->params[1] = s->params[2] = s->params[3] = 0.0f;
+    }
+    s->enabled = kind != JCE_MIXER_EFFECT_NONE;
+    return true;
+}
+
+bool jce_audio_mixer_bus_detach_effect(JceAudioMixer *m, JceAudioBusId b,
+                                        uint32_t slot_index)
+{
+    if (!bus_valid(m, b)) return false;
+    if (slot_index >= JCE_MIXER_BUS_EFFECT_SLOTS) return false;
+    JceMixerEffectSlot *s = &m->buses[b].effects[slot_index];
+    s->kind    = JCE_MIXER_EFFECT_NONE;
+    s->enabled = false;
+    s->params[0] = s->params[1] = s->params[2] = s->params[3] = 0.0f;
+    return true;
+}
+
+bool jce_audio_mixer_bus_get_effect(const JceAudioMixer *m, JceAudioBusId b,
+                                     uint32_t slot_index,
+                                     JceMixerEffectSlot *out)
+{
+    if (!bus_valid(m, b) || !out) return false;
+    if (slot_index >= JCE_MIXER_BUS_EFFECT_SLOTS) return false;
+    *out = m->buses[b].effects[slot_index];
+    return true;
+}

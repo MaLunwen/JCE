@@ -85,6 +85,53 @@ JCE_API uint32_t       jce_audio_mixer_list_buses(const JceAudioMixer *m,
 JCE_API const char    *jce_audio_mixer_get_name(const JceAudioMixer *m, JceAudioBusId bus);
 JCE_API JceAudioBusId  jce_audio_mixer_get_parent(const JceAudioMixer *m, JceAudioBusId bus);
 
+/* ── Effect chain (B9.4) ────────────────────────────────────── *
+ *
+ * Each bus carries up to JCE_MIXER_BUS_EFFECT_SLOTS DSP effects
+ * (Biquad LP/HP/BP/Notch from jce_audio_dsp.h or future plugins).
+ * The audio backend walks the chain in slot order for every sample
+ * block that routes through the bus.
+ *
+ * Slot 0 closest to the source; slot last closest to the parent
+ * bus's output — mirrors Unity's mixer-group effect order. */
+
+#define JCE_MIXER_BUS_EFFECT_SLOTS 2
+
+typedef enum {
+    JCE_MIXER_EFFECT_NONE        = 0,
+    JCE_MIXER_EFFECT_BIQUAD_LP   = 1,  /* params[0]=cutoff_hz, params[1]=q */
+    JCE_MIXER_EFFECT_BIQUAD_HP   = 2,
+    JCE_MIXER_EFFECT_BIQUAD_BP   = 3,
+    JCE_MIXER_EFFECT_BIQUAD_NOTCH= 4,
+    JCE_MIXER_EFFECT_DUCKER      = 5,  /* params[0]=threshold_db, [1]=ratio, [2]=attack_ms, [3]=release_ms */
+} JceMixerEffectKind;
+
+typedef struct {
+    JceMixerEffectKind kind;
+    float              params[4];
+    bool               enabled;
+} JceMixerEffectSlot;
+
+/* Attach (or replace) an effect at `slot_index`.  Returns false if
+ * slot_index >= JCE_MIXER_BUS_EFFECT_SLOTS or the bus is invalid. */
+JCE_API bool jce_audio_mixer_bus_attach_effect(JceAudioMixer *m,
+                                                JceAudioBusId  bus,
+                                                uint32_t       slot_index,
+                                                JceMixerEffectKind kind,
+                                                const float    params[4]);
+
+/* Disable + clear an effect slot. */
+JCE_API bool jce_audio_mixer_bus_detach_effect(JceAudioMixer *m,
+                                                JceAudioBusId  bus,
+                                                uint32_t       slot_index);
+
+/* Read back a slot's config.  Returns false if invalid; out_slot
+ * unchanged. */
+JCE_API bool jce_audio_mixer_bus_get_effect(const JceAudioMixer *m,
+                                             JceAudioBusId        bus,
+                                             uint32_t             slot_index,
+                                             JceMixerEffectSlot  *out_slot);
+
 #ifdef __cplusplus
 }
 #endif

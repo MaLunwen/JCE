@@ -16,6 +16,7 @@ extern "C" {
 #include <jce/resource/jce_asset.h>
 #include <jce/resource/jce_asset_format.h>
 #include <jce/resource/jce_asset_labels.h>
+#include <jce/resource/jce_asset_watcher.h>
 #include <jce/resource/jce_scene_contract.h>
 #include <jce/resource/jce_scene_serial.h>
 #include <jce/resource/jce_shader_variant.h>

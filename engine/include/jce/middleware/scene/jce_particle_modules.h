@@ -57,6 +57,24 @@ JCE_API jce_vec3 jce_particle_sample_initial_velocity(
     const JceParticleEmitterComponent *emitter,
     jce_vec3                           spawn_local);
 
+/* ── Emission rate over time ──────────────────────────────────── *
+ *
+ * When the emitter has `emission_rate_curve_enabled = true` and a
+ * non-empty `emission_rate_curve_path`, return the curve value at
+ * `local_time` (typically the emitter's age in seconds).  The curve
+ * is loaded lazily on first call and cached process-wide to keep
+ * per-frame sampling cheap.  Returns 1.0 (pass-through) when the
+ * module is disabled or the curve fails to load.
+ *
+ * Caller multiplies this by `emitter->emit_rate` to get the
+ * per-second particle count for that instant. */
+JCE_API float jce_particle_sample_emission_rate(
+    const JceParticleEmitterComponent *emitter,
+    float                              local_time);
+
+/* Drop all entries from the curve cache (e.g. on scene unload). */
+JCE_API void  jce_particle_emission_curve_cache_clear(void);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_PARTICLE_MODULES_H */

@@ -19,6 +19,7 @@ extern "C" {
 #include <jce/renderer/jce_morph_target.h>
 #include <jce/renderer/jce_reflection_probe.h>
 #include <jce/renderer/jce_render_graph.h>
+#include <jce/renderer/jce_skinned_morph_pack.h>
 #include <jce/renderer/jce_taa_jitter.h>
 #include <jce/renderer/jce_render_queue.h>
 #include <jce/renderer/jce_scene_renderer.h>
