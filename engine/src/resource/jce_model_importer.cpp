@@ -770,4 +770,129 @@ void jce_model_importer_free_inspect(JceModelInspectResult *r)
     r->face_sizes     = nullptr;
 }
 
+/* ── Morph target import (glTF / FBX BlendShape via Assimp) ─────── *
+ *
+ * Assimp exposes morph targets via `aiMesh::mAnimMeshes[]` — each
+ * entry holds absolute vertex / normal arrays the same length as the
+ * base mesh.  Convert those to deltas (relative to the base) and
+ * register the resulting JceMorphSet against the supplied mesh key
+ * via jce_morph_attach_to_mesh.
+ *
+ * The current importer aggregates all aiMeshes into a single
+ * JceMesh.  For morph support we follow the same convention:
+ * concatenate per-primitive morph deltas into one set covering the
+ * total vertex count.  This works cleanly when the model has a
+ * single primitive (typical character glTFs) and degrades to "morph
+ * applies only to first primitive's vertex range" otherwise.
+ */
+
+extern "C" {
+#include <jce/renderer/jce_morph_target.h>
+}
+
+#include <vector>
+#include <string>
+
+extern "C" bool jce_model_importer_load_morphs(const char *file_path,
+                                                const void *mesh_key)
+{
+    if (!file_path || !file_path[0] || !mesh_key) return false;
+
+    Assimp::Importer importer;
+    /* Don't pre-transform — that bakes morph targets together. */
+    const aiScene *scene = importer.ReadFile(
+        file_path,
+        aiProcess_Triangulate | aiProcess_GenSmoothNormals);
+    if (!scene || scene->mNumMeshes == 0) {
+        LOG_WARN("morph_import", "no scene / meshes in '%s'", file_path);
+        return false;
+    }
+
+    /* Compute total vertex count across all primitives. */
+    uint32_t total_verts = 0;
+    for (unsigned m = 0; m < scene->mNumMeshes; ++m)
+        total_verts += scene->mMeshes[m]->mNumVertices;
+    if (total_verts == 0) return false;
+
+    /* Find the max anim-mesh count across primitives.  Assimp models
+     * with per-primitive morphs usually share the same target list,
+     * so taking the max works in practice. */
+    unsigned max_targets = 0;
+    for (unsigned m = 0; m < scene->mNumMeshes; ++m)
+        if (scene->mMeshes[m]->mNumAnimMeshes > max_targets)
+            max_targets = scene->mMeshes[m]->mNumAnimMeshes;
+    if (max_targets == 0) return false;
+
+    JceMorphSet *set = jce_morph_set_create(total_verts);
+    if (!set) return false;
+
+    /* Pre-allocate scratch buffers for one target's position+normal
+     * deltas, sized to the full concat. */
+    std::vector<float> pos_deltas((size_t)total_verts * 3u, 0.0f);
+    std::vector<float> nrm_deltas((size_t)total_verts * 3u, 0.0f);
+
+    for (unsigned t = 0; t < max_targets; ++t) {
+        /* Build the concat for target index t.  Primitives without
+         * this target leave zeros (= no influence). */
+        std::fill(pos_deltas.begin(), pos_deltas.end(), 0.0f);
+        std::fill(nrm_deltas.begin(), nrm_deltas.end(), 0.0f);
+
+        const char *name = nullptr;
+        bool any_normals = false;
+        size_t vert_off = 0;
+        for (unsigned m = 0; m < scene->mNumMeshes; ++m) {
+            const aiMesh *base = scene->mMeshes[m];
+            if (t < base->mNumAnimMeshes && base->mAnimMeshes[t]) {
+                const aiAnimMesh *am = base->mAnimMeshes[t];
+                if (!name && am->mName.length > 0) name = am->mName.C_Str();
+                /* Position deltas. */
+                if (am->mVertices && base->mVertices) {
+                    for (unsigned i = 0; i < base->mNumVertices; ++i) {
+                        pos_deltas[(vert_off + i) * 3 + 0] =
+                            am->mVertices[i].x - base->mVertices[i].x;
+                        pos_deltas[(vert_off + i) * 3 + 1] =
+                            am->mVertices[i].y - base->mVertices[i].y;
+                        pos_deltas[(vert_off + i) * 3 + 2] =
+                            am->mVertices[i].z - base->mVertices[i].z;
+                    }
+                }
+                /* Normal deltas — optional. */
+                if (am->mNormals && base->mNormals) {
+                    any_normals = true;
+                    for (unsigned i = 0; i < base->mNumVertices; ++i) {
+                        nrm_deltas[(vert_off + i) * 3 + 0] =
+                            am->mNormals[i].x - base->mNormals[i].x;
+                        nrm_deltas[(vert_off + i) * 3 + 1] =
+                            am->mNormals[i].y - base->mNormals[i].y;
+                        nrm_deltas[(vert_off + i) * 3 + 2] =
+                            am->mNormals[i].z - base->mNormals[i].z;
+                    }
+                }
+            }
+            vert_off += base->mNumVertices;
+        }
+
+        char fallback_name[16];
+        if (!name || !name[0]) {
+            std::snprintf(fallback_name, sizeof(fallback_name), "Morph_%u", t);
+            name = fallback_name;
+        }
+        jce_morph_set_add(set, name, pos_deltas.data(),
+                          any_normals ? nrm_deltas.data() : nullptr);
+    }
+
+    if (jce_morph_set_target_count(set) == 0) {
+        jce_morph_set_destroy(set);
+        return false;
+    }
+
+    if (!jce_morph_attach_to_mesh(mesh_key, set)) {
+        jce_morph_set_destroy(set);
+        return false;
+    }
+    LOG_INFO("morph_import", "loaded %u morph targets from '%s'",
+             jce_morph_set_target_count(set), file_path);
+    return true;
+}
+
 } /* extern "C" */

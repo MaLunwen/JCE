@@ -97,6 +97,20 @@ JCE_API bool jce_model_importer_inspect_file(const char *file_path,
                                              JceModelInspectResult *out);
 JCE_API void jce_model_importer_free_inspect(JceModelInspectResult *r);
 
+/* ── Morph target import (glTF / FBX BlendShape) ─────────────────── *
+ *
+ * Walks Assimp's `aiMesh::mAnimMeshes[]` for the file at `file_path`,
+ * computes per-vertex deltas relative to the base mesh, and registers
+ * the resulting JceMorphSet against `mesh_key` via
+ * jce_morph_attach_to_mesh().  Returns true if at least one morph
+ * target was loaded.
+ *
+ * `mesh_key` is the same opaque pointer game code later passes to
+ * jce_morph_find_for_mesh() — typically the JceMesh* the model was
+ * loaded into. */
+JCE_API bool jce_model_importer_load_morphs(const char *file_path,
+                                            const void *mesh_key);
+
 #ifdef __cplusplus
 }
 #endif

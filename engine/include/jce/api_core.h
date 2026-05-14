@@ -22,6 +22,7 @@ extern "C" {
 #include <jce/os/core/jce_i18n.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
+#include <jce/os/core/jce_object_pool.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/os/core/jce_sysinfo.h>
 #include <jce/os/core/jce_thread.h>
