@@ -17,6 +17,7 @@
 #include "jce_editor_layout.h"
 #include "jce_editor_layout_persistence.h"
 #include "core/jce_editor_plugin.h"
+#include "core/jce_editor_command_palette.h"
 
 #include "dialogs/jce_editor_dialogs.h"
 #include "core/jce_editor.h"
@@ -2126,6 +2127,18 @@ void jce_editor_layout_draw(void)
      * Drawn after built-in panels so their windows can dock alongside
      * the standard set, with no special-case Window menu plumbing. */
     jce_editor_plugin_render_all();
+
+    /* Command palette (Ctrl+Shift+P).  Render last so the overlay sits
+     * above all docked panels.  Opening is gated by the hotkey check
+     * here — keeps the integration point tiny. */
+    {
+        ImGuiIO &io = ImGui::GetIO();
+        bool mod = io.KeyCtrl && io.KeyShift;
+        if (mod && ImGui::IsKeyPressed(ImGuiKey_P, false)) {
+            jce_editor_command_palette_open();
+        }
+        jce_editor_command_palette_render();
+    }
 
     /* Persist Window menu visibility (writes only when mask changes). */
     jce_editor_panels_persist_visibility();
