@@ -14,11 +14,15 @@
 extern "C" {
 #endif
 
+#include <jce/renderer/jce_compute.h>
 #include <jce/renderer/jce_gi_probes.h>
 #include <jce/renderer/jce_material_property_block.h>
 #include <jce/renderer/jce_morph_target.h>
+#include <jce/renderer/jce_proc_mesh.h>
 #include <jce/renderer/jce_reflection_probe.h>
 #include <jce/renderer/jce_render_graph.h>
+#include <jce/renderer/jce_shader_graph.h>
+#include <jce/renderer/jce_shader_graph_nodes.h>
 #include <jce/renderer/jce_skinned_morph_pack.h>
 #include <jce/renderer/jce_taa_jitter.h>
 #include <jce/renderer/jce_render_queue.h>
