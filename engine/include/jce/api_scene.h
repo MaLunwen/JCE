@@ -21,6 +21,7 @@ extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_scene_async.h>
 #include <jce/middleware/scene/jce_space_partition.h>
+#include <jce/middleware/scene/jce_terrain_foliage.h>
 
 
 

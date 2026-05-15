@@ -12,6 +12,7 @@
 extern "C" {
 #endif
 
+#include <jce/middleware/physics/jce_cloth.h>
 #include <jce/middleware/physics/jce_physics.h>
 #include <jce/middleware/physics/jce_physics2d.h>
 #include <jce/middleware/physics/jce_physics_types.h>
