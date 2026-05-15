@@ -17,8 +17,12 @@ extern "C" {
 #include <jce/middleware/ai/jce_navmesh_recast.h>
 #include <jce/middleware/ai/jce_navmesh_scene_bake.h>
 #include <jce/middleware/ai/jce_nav_agent.h>
+#include <jce/middleware/ai/jce_sensor.h>
 #include <jce/middleware/ai/jce_steering.h>
 #include <jce/middleware/ai/jce_graph_astar.h>
+#include <jce/middleware/ai/jce_vscript.h>
+#include <jce/middleware/ai/jce_vscript_nodes.h>
+#include <jce/middleware/ai/jce_vscript_vm.h>
 
 
 #ifdef __cplusplus
