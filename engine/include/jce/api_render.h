@@ -15,12 +15,18 @@ extern "C" {
 #endif
 
 #include <jce/renderer/jce_compute.h>
+#include <jce/renderer/jce_frame_debugger.h>
 #include <jce/renderer/jce_gi_probes.h>
 #include <jce/renderer/jce_light_cookie.h>
+#include <jce/renderer/jce_light_probe_eval.h>
+#include <jce/renderer/jce_lightmap_uv.h>
+#include <jce/renderer/jce_lightmapper_bake.h>
+#include <jce/renderer/jce_lightmapper_embree.h>
 #include <jce/renderer/jce_material_property_block.h>
 #include <jce/renderer/jce_morph_target.h>
 #include <jce/renderer/jce_proc_mesh.h>
 #include <jce/renderer/jce_reflection_probe.h>
+#include <jce/renderer/jce_reflection_probe_bake.h>
 #include <jce/renderer/jce_render_graph.h>
 #include <jce/renderer/jce_sdf_font.h>
 #include <jce/renderer/jce_shader_graph.h>
