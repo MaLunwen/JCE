@@ -15,8 +15,10 @@ extern "C" {
 #include <jce/middleware/ui/jce_ui.h>
 #include <jce/middleware/ui/jce_ui_debug_hud.h>
 #include <jce/middleware/ui/jce_ui_dom_serialize.h>
+#include <jce/middleware/ui/jce_ui_layout.h>
 #include <jce/middleware/ui/jce_ui_rect.h>
 #include <jce/middleware/ui/jce_ui_settings.h>
+#include <jce/middleware/ui/jce_ui_world_canvas.h>
 
 
 
