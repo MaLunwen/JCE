@@ -37,6 +37,7 @@ extern "C" {
 #include <jce/renderer/jce_tilemap.h>
 #include <jce/renderer/jce_render_queue.h>
 #include <jce/renderer/jce_scene_renderer.h>
+#include <jce/renderer/jce_xr_camera.h>
 
 
 

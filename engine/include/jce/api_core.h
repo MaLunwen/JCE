@@ -25,6 +25,7 @@ extern "C" {
 #include <jce/os/core/jce_math.h>
 #include <jce/os/core/jce_math_ext.h>
 #include <jce/os/core/jce_mem_profiler.h>
+#include <jce/os/core/jce_mem_profiler_gpu.h>
 #include <jce/os/core/jce_object_pool.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/os/core/jce_sysinfo.h>
