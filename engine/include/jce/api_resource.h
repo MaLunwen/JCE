@@ -13,6 +13,7 @@ extern "C" {
 #endif
 
 #include <jce/resource/jce_addressable.h>
+#include <jce/resource/jce_data_asset.h>
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/resource/jce_asset.h>
 #include <jce/resource/jce_asset_format.h>

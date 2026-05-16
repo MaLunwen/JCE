@@ -86,12 +86,15 @@ typedef struct { uint32_t idx; } JceUIElementHandle;
 
 static inline bool jce_ui_elem_valid(JceUIElementHandle h) { return h.idx != UINT32_MAX; }
 
+#ifndef JCE_UI_RECT_TYPEDEF_DEFINED
+#define JCE_UI_RECT_TYPEDEF_DEFINED
 typedef struct JceUIRect {
    float x;
    float y;
    float w;
    float h;
 } JceUIRect;
+#endif
 
 /* Find an element by ID within a document. */
 JceUIElementHandle jce_ui_find_element(JceUIContext *ctx, JceUIDocHandle doc,

@@ -35,10 +35,13 @@ JCE_EXTERN_C_BEGIN
 
 /* Axis-aligned rectangle in pixels (or virtual pixels).  x/y is the
  * top-left corner; w/h are non-negative dimensions. */
+#ifndef JCE_UI_RECT_TYPEDEF_DEFINED
+#define JCE_UI_RECT_TYPEDEF_DEFINED
 typedef struct {
     float x, y;
     float w, h;
 } JceUIRect;
+#endif
 
 /* Anchored layout description for a child rect. */
 typedef struct {

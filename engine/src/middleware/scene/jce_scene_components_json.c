@@ -1422,6 +1422,114 @@ static void parse_ui_button(JceScene *s, JceEntity e, const cJSON *c)
     jce_scene_set_ui_button(s, e, &b);
 }
 
+static void parse_ui_toggle(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceUIToggleComponent t; memset(&t, 0, sizeof t);
+    t.interactable  = j_bool(c, "interactable", true);
+    t.is_on         = j_bool(c, "isOn", false);
+    t.group_id      = (int)j_num(c, "groupId", 0);
+    t.fade_duration = (float)j_num(c, "fadeDuration", 0.1);
+    copy_str(t.on_value_changed, sizeof t.on_value_changed,
+              j_str(c, "onValueChanged", ""));
+    jce_scene_set_ui_toggle(s, e, &t);
+}
+
+static void parse_ui_slider(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceUISliderComponent sl; memset(&sl, 0, sizeof sl);
+    sl.interactable  = j_bool(c, "interactable", true);
+    sl.min_value     = (float)j_num(c, "minValue", 0.0);
+    sl.max_value     = (float)j_num(c, "maxValue", 1.0);
+    sl.value         = (float)j_num(c, "value", 0.0);
+    sl.whole_numbers = j_bool(c, "wholeNumbers", false);
+    sl.direction     = (int)j_num(c, "direction", 0);
+    copy_str(sl.on_value_changed, sizeof sl.on_value_changed,
+              j_str(c, "onValueChanged", ""));
+    jce_scene_set_ui_slider(s, e, &sl);
+}
+
+static void parse_ui_dropdown(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceUIDropdownComponent d; memset(&d, 0, sizeof d);
+    d.interactable = j_bool(c, "interactable", true);
+    d.value        = (int)j_num(c, "value", 0);
+    const cJSON *opts = cJSON_GetObjectItemCaseSensitive(c, "options");
+    if (cJSON_IsArray(opts)) {
+        int n = cJSON_GetArraySize(opts);
+        if (n > JCE_UI_DROPDOWN_MAX_OPTIONS) n = JCE_UI_DROPDOWN_MAX_OPTIONS;
+        d.option_count = n;
+        for (int i = 0; i < n; ++i) {
+            const cJSON *it = cJSON_GetArrayItem(opts, i);
+            if (cJSON_IsString(it))
+                copy_str(d.options[i], sizeof d.options[i], it->valuestring);
+        }
+    }
+    copy_str(d.on_value_changed, sizeof d.on_value_changed,
+              j_str(c, "onValueChanged", ""));
+    jce_scene_set_ui_dropdown(s, e, &d);
+}
+
+static void parse_ui_input_field(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceUIInputFieldComponent f; memset(&f, 0, sizeof f);
+    f.interactable    = j_bool(c, "interactable", true);
+    f.character_limit = (int)j_num(c, "characterLimit", 0);
+    f.content_type    = (int)j_num(c, "contentType", 0);
+    f.read_only       = j_bool(c, "readOnly", false);
+    f.multi_line      = j_bool(c, "multiLine", false);
+    copy_str(f.text,        sizeof f.text,        j_str(c, "text", ""));
+    copy_str(f.placeholder, sizeof f.placeholder, j_str(c, "placeholder", ""));
+    copy_str(f.on_value_changed, sizeof f.on_value_changed,
+              j_str(c, "onValueChanged", ""));
+    copy_str(f.on_end_edit, sizeof f.on_end_edit,
+              j_str(c, "onEndEdit", ""));
+    f.caret_pos = (int)strlen(f.text);
+    jce_scene_set_ui_input_field(s, e, &f);
+}
+
+static void parse_ui_raw_image(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceUIRawImageComponent r; memset(&r, 0, sizeof r);
+    copy_str(r.texture_path, sizeof r.texture_path,
+              j_str(c, "texturePath", ""));
+    r.uv_rect[0] = (float)j_num(c, "u0", 0.0);
+    r.uv_rect[1] = (float)j_num(c, "v0", 0.0);
+    r.uv_rect[2] = (float)j_num(c, "u1", 1.0);
+    r.uv_rect[3] = (float)j_num(c, "v1", 1.0);
+    r.color[0]   = (float)j_num(c, "colorR", 1.0);
+    r.color[1]   = (float)j_num(c, "colorG", 1.0);
+    r.color[2]   = (float)j_num(c, "colorB", 1.0);
+    r.color[3]   = (float)j_num(c, "colorA", 1.0);
+    r.preserve_aspect = j_bool(c, "preserveAspect", false);
+    jce_scene_set_ui_raw_image(s, e, &r);
+}
+
+static void parse_ui_outline_effect(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceUIOutlineEffect o; memset(&o, 0, sizeof o);
+    o.effect_color[0] = (float)j_num(c, "colorR", 0.0);
+    o.effect_color[1] = (float)j_num(c, "colorG", 0.0);
+    o.effect_color[2] = (float)j_num(c, "colorB", 0.0);
+    o.effect_color[3] = (float)j_num(c, "colorA", 1.0);
+    o.effect_distance[0] = (float)j_num(c, "distX", 1.0);
+    o.effect_distance[1] = (float)j_num(c, "distY", -1.0);
+    o.use_graphic_alpha  = j_bool(c, "useGraphicAlpha", true);
+    jce_scene_set_ui_outline_effect(s, e, &o);
+}
+
+static void parse_ui_shadow_effect(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceUIShadowEffect o; memset(&o, 0, sizeof o);
+    o.effect_color[0] = (float)j_num(c, "colorR", 0.0);
+    o.effect_color[1] = (float)j_num(c, "colorG", 0.0);
+    o.effect_color[2] = (float)j_num(c, "colorB", 0.0);
+    o.effect_color[3] = (float)j_num(c, "colorA", 0.5);
+    o.effect_distance[0] = (float)j_num(c, "distX", 1.0);
+    o.effect_distance[1] = (float)j_num(c, "distY", -1.0);
+    o.use_graphic_alpha  = j_bool(c, "useGraphicAlpha", true);
+    jce_scene_set_ui_shadow_effect(s, e, &o);
+}
+
 static void parse_constraint(JceScene *s, JceEntity e, const cJSON *c)
 {
     JceConstraintComponent cn;
@@ -1645,6 +1753,33 @@ static void parse_one_component(JceScene *s, JceEntity e, const cJSON *comp)
     /* UI Button. */
     if (strcmp(type, "UIButton") == 0 || strcmp(type, "uiButton") == 0) {
         parse_ui_button(s, e, props); return;
+    }
+    /* UI Toggle. */
+    if (strcmp(type, "UIToggle") == 0 || strcmp(type, "uiToggle") == 0) {
+        parse_ui_toggle(s, e, props); return;
+    }
+    /* UI Slider. */
+    if (strcmp(type, "UISlider") == 0 || strcmp(type, "uiSlider") == 0) {
+        parse_ui_slider(s, e, props); return;
+    }
+    /* UI Dropdown. */
+    if (strcmp(type, "UIDropdown") == 0 || strcmp(type, "uiDropdown") == 0) {
+        parse_ui_dropdown(s, e, props); return;
+    }
+    /* UI InputField. */
+    if (strcmp(type, "UIInputField") == 0 || strcmp(type, "uiInputField") == 0) {
+        parse_ui_input_field(s, e, props); return;
+    }
+    /* UI RawImage. */
+    if (strcmp(type, "UIRawImage") == 0 || strcmp(type, "uiRawImage") == 0) {
+        parse_ui_raw_image(s, e, props); return;
+    }
+    /* UI Outline / Shadow effects. */
+    if (strcmp(type, "UIOutline") == 0 || strcmp(type, "uiOutline") == 0) {
+        parse_ui_outline_effect(s, e, props); return;
+    }
+    if (strcmp(type, "UIShadow") == 0 || strcmp(type, "uiShadow") == 0) {
+        parse_ui_shadow_effect(s, e, props); return;
     }
 }
 
@@ -2438,6 +2573,106 @@ static void ser_ui_button(const JceUIButtonComponent *b, cJSON *arr)
     cJSON_AddItemToArray(arr, o);
 }
 
+static void ser_ui_toggle(const JceUIToggleComponent *t, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "UIToggle");
+    cJSON_AddBoolToObject  (o, "interactable", t->interactable);
+    cJSON_AddBoolToObject  (o, "isOn", t->is_on);
+    cJSON_AddNumberToObject(o, "groupId", t->group_id);
+    cJSON_AddNumberToObject(o, "fadeDuration", t->fade_duration);
+    cJSON_AddStringToObject(o, "onValueChanged", t->on_value_changed);
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_ui_slider(const JceUISliderComponent *sl, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "UISlider");
+    cJSON_AddBoolToObject  (o, "interactable", sl->interactable);
+    cJSON_AddNumberToObject(o, "minValue", sl->min_value);
+    cJSON_AddNumberToObject(o, "maxValue", sl->max_value);
+    cJSON_AddNumberToObject(o, "value", sl->value);
+    cJSON_AddBoolToObject  (o, "wholeNumbers", sl->whole_numbers);
+    cJSON_AddNumberToObject(o, "direction", sl->direction);
+    cJSON_AddStringToObject(o, "onValueChanged", sl->on_value_changed);
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_ui_dropdown(const JceUIDropdownComponent *d, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "UIDropdown");
+    cJSON_AddBoolToObject  (o, "interactable", d->interactable);
+    cJSON_AddNumberToObject(o, "value", d->value);
+    cJSON *opts = cJSON_AddArrayToObject(o, "options");
+    for (int i = 0; i < d->option_count; ++i)
+        cJSON_AddItemToArray(opts, cJSON_CreateString(d->options[i]));
+    cJSON_AddStringToObject(o, "onValueChanged", d->on_value_changed);
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_ui_input_field(const JceUIInputFieldComponent *f, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "UIInputField");
+    cJSON_AddBoolToObject  (o, "interactable", f->interactable);
+    cJSON_AddNumberToObject(o, "characterLimit", f->character_limit);
+    cJSON_AddNumberToObject(o, "contentType", f->content_type);
+    cJSON_AddBoolToObject  (o, "readOnly", f->read_only);
+    cJSON_AddBoolToObject  (o, "multiLine", f->multi_line);
+    cJSON_AddStringToObject(o, "text", f->text);
+    cJSON_AddStringToObject(o, "placeholder", f->placeholder);
+    cJSON_AddStringToObject(o, "onValueChanged", f->on_value_changed);
+    cJSON_AddStringToObject(o, "onEndEdit", f->on_end_edit);
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_ui_raw_image(const JceUIRawImageComponent *r, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "UIRawImage");
+    cJSON_AddStringToObject(o, "texturePath", r->texture_path);
+    cJSON_AddNumberToObject(o, "u0", r->uv_rect[0]);
+    cJSON_AddNumberToObject(o, "v0", r->uv_rect[1]);
+    cJSON_AddNumberToObject(o, "u1", r->uv_rect[2]);
+    cJSON_AddNumberToObject(o, "v1", r->uv_rect[3]);
+    cJSON_AddNumberToObject(o, "colorR", r->color[0]);
+    cJSON_AddNumberToObject(o, "colorG", r->color[1]);
+    cJSON_AddNumberToObject(o, "colorB", r->color[2]);
+    cJSON_AddNumberToObject(o, "colorA", r->color[3]);
+    cJSON_AddBoolToObject  (o, "preserveAspect", r->preserve_aspect);
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_ui_outline_effect(const JceUIOutlineEffect *eo, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "UIOutline");
+    cJSON_AddNumberToObject(o, "colorR", eo->effect_color[0]);
+    cJSON_AddNumberToObject(o, "colorG", eo->effect_color[1]);
+    cJSON_AddNumberToObject(o, "colorB", eo->effect_color[2]);
+    cJSON_AddNumberToObject(o, "colorA", eo->effect_color[3]);
+    cJSON_AddNumberToObject(o, "distX",  eo->effect_distance[0]);
+    cJSON_AddNumberToObject(o, "distY",  eo->effect_distance[1]);
+    cJSON_AddBoolToObject  (o, "useGraphicAlpha", eo->use_graphic_alpha);
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_ui_shadow_effect(const JceUIShadowEffect *eo, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "UIShadow");
+    cJSON_AddNumberToObject(o, "colorR", eo->effect_color[0]);
+    cJSON_AddNumberToObject(o, "colorG", eo->effect_color[1]);
+    cJSON_AddNumberToObject(o, "colorB", eo->effect_color[2]);
+    cJSON_AddNumberToObject(o, "colorA", eo->effect_color[3]);
+    cJSON_AddNumberToObject(o, "distX",  eo->effect_distance[0]);
+    cJSON_AddNumberToObject(o, "distY",  eo->effect_distance[1]);
+    cJSON_AddBoolToObject  (o, "useGraphicAlpha", eo->use_graphic_alpha);
+    cJSON_AddItemToArray(arr, o);
+}
+
 static void ser_skybox(const JceSkyboxComponent *c, cJSON *arr)
 {
     cJSON *o = cJSON_CreateObject();
@@ -2741,6 +2976,34 @@ static void ser_entity_cb(JceScene *s, JceEntity e, void *ud)
     if (f & JCE_COMP_FLAG_UI_BUTTON) {
         JceUIButtonComponent *c = jce_scene_get_ui_button(s, e);
         if (c) ser_ui_button(c, comps);
+    }
+    if (f & JCE_COMP_FLAG_UI_TOGGLE) {
+        JceUIToggleComponent *c = jce_scene_get_ui_toggle(s, e);
+        if (c) ser_ui_toggle(c, comps);
+    }
+    if (f & JCE_COMP_FLAG_UI_SLIDER) {
+        JceUISliderComponent *c = jce_scene_get_ui_slider(s, e);
+        if (c) ser_ui_slider(c, comps);
+    }
+    if (f & JCE_COMP_FLAG_UI_DROPDOWN) {
+        JceUIDropdownComponent *c = jce_scene_get_ui_dropdown(s, e);
+        if (c) ser_ui_dropdown(c, comps);
+    }
+    if (f & JCE_COMP_FLAG_UI_INPUT_FIELD) {
+        JceUIInputFieldComponent *c = jce_scene_get_ui_input_field(s, e);
+        if (c) ser_ui_input_field(c, comps);
+    }
+    if (f & JCE_COMP_FLAG_UI_RAW_IMAGE) {
+        JceUIRawImageComponent *c = jce_scene_get_ui_raw_image(s, e);
+        if (c) ser_ui_raw_image(c, comps);
+    }
+    if (f & JCE_COMP_FLAG_UI_OUTLINE_EFFECT) {
+        JceUIOutlineEffect *c = jce_scene_get_ui_outline_effect(s, e);
+        if (c) ser_ui_outline_effect(c, comps);
+    }
+    if (f & JCE_COMP_FLAG_UI_SHADOW_EFFECT) {
+        JceUIShadowEffect *c = jce_scene_get_ui_shadow_effect(s, e);
+        if (c) ser_ui_shadow_effect(c, comps);
     }
     if (f & JCE_COMP_FLAG_EDITOR_META) {
         JceEditorMeta *m = jce_scene_get_editor_meta(s, e);
@@ -3196,6 +3459,34 @@ cJSON *jce_scene_serialize_entity_components(JceScene *scene, JceEntity e)
     if (f & JCE_COMP_FLAG_UI_BUTTON) {
         JceUIButtonComponent *c = jce_scene_get_ui_button(scene, e);
         if (c) ser_ui_button(c, arr);
+    }
+    if (f & JCE_COMP_FLAG_UI_TOGGLE) {
+        JceUIToggleComponent *c = jce_scene_get_ui_toggle(scene, e);
+        if (c) ser_ui_toggle(c, arr);
+    }
+    if (f & JCE_COMP_FLAG_UI_SLIDER) {
+        JceUISliderComponent *c = jce_scene_get_ui_slider(scene, e);
+        if (c) ser_ui_slider(c, arr);
+    }
+    if (f & JCE_COMP_FLAG_UI_DROPDOWN) {
+        JceUIDropdownComponent *c = jce_scene_get_ui_dropdown(scene, e);
+        if (c) ser_ui_dropdown(c, arr);
+    }
+    if (f & JCE_COMP_FLAG_UI_INPUT_FIELD) {
+        JceUIInputFieldComponent *c = jce_scene_get_ui_input_field(scene, e);
+        if (c) ser_ui_input_field(c, arr);
+    }
+    if (f & JCE_COMP_FLAG_UI_RAW_IMAGE) {
+        JceUIRawImageComponent *c = jce_scene_get_ui_raw_image(scene, e);
+        if (c) ser_ui_raw_image(c, arr);
+    }
+    if (f & JCE_COMP_FLAG_UI_OUTLINE_EFFECT) {
+        JceUIOutlineEffect *c = jce_scene_get_ui_outline_effect(scene, e);
+        if (c) ser_ui_outline_effect(c, arr);
+    }
+    if (f & JCE_COMP_FLAG_UI_SHADOW_EFFECT) {
+        JceUIShadowEffect *c = jce_scene_get_ui_shadow_effect(scene, e);
+        if (c) ser_ui_shadow_effect(c, arr);
     }
     if (f & JCE_COMP_FLAG_EDITOR_META) {
         JceEditorMeta *m = jce_scene_get_editor_meta(scene, e);

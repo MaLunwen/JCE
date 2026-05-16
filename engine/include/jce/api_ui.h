@@ -13,6 +13,7 @@ extern "C" {
 
 #include <jce/middleware/ui/jce_touch_hud.h>
 #include <jce/middleware/ui/jce_ui.h>
+#include <jce/middleware/ui/jce_ui_controls.h>
 #include <jce/middleware/ui/jce_ui_debug_hud.h>
 #include <jce/middleware/ui/jce_ui_dom_serialize.h>
 #include <jce/middleware/ui/jce_ui_layout.h>

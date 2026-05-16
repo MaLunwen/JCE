@@ -25,11 +25,11 @@ static void mul4(const float a[16], const float b[16], float o[16])
     memcpy(o, r, 16 * sizeof(float));
 }
 
-void jce_canvas_build_world_matrix(const JceCanvasComponent *c,
+void jce_canvas_build_world_matrix(const JceWorldCanvasComponent *c,
                                      float out[16])
 {
     if (!c || !out) return;
-    if (c->mode != JCE_CANVAS_WORLD) {
+    if (c->mode != JCE_WORLD_CANVAS_WORLD) {
         identity4(out);
         return;
     }
@@ -74,11 +74,11 @@ void jce_canvas_build_world_matrix(const JceCanvasComponent *c,
 /* Plane = canvas (z=0 in canvas-local space).  Build inverse of the
  * forward matrix to map the ray into local coords + intersect with
  * z=0. */
-bool jce_canvas_world_pick(const JceCanvasComponent *c,
+bool jce_canvas_world_pick(const JceWorldCanvasComponent *c,
                             const float ro[3], const float rd[3],
                             float *out_u, float *out_v)
 {
-    if (!c || c->mode != JCE_CANVAS_WORLD || !ro || !rd) return false;
+    if (!c || c->mode != JCE_WORLD_CANVAS_WORLD || !ro || !rd) return false;
     /* Build world matrix's inverse — for the simple TRS with scale
      * absorbed into the basis, inverse = transpose of rotation part
      * combined with translation negation in original space.  We do

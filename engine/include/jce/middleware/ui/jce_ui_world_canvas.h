@@ -24,13 +24,13 @@
 JCE_EXTERN_C_BEGIN
 
 typedef enum {
-    JCE_CANVAS_SCREEN_OVERLAY = 0,
-    JCE_CANVAS_SCREEN_CAMERA  = 1,
-    JCE_CANVAS_WORLD          = 2,
-} JceCanvasRenderMode;
+    JCE_WORLD_CANVAS_SCREEN_OVERLAY = 0,
+    JCE_WORLD_CANVAS_SCREEN_CAMERA  = 1,
+    JCE_WORLD_CANVAS_WORLD          = 2,
+} JceWorldCanvasRenderMode;
 
 typedef struct {
-    JceCanvasRenderMode mode;
+    JceWorldCanvasRenderMode mode;
 
     /* World-space settings (mode == WORLD). */
     float position[3];
@@ -49,18 +49,18 @@ typedef struct {
 
     /* Sort order across multiple canvases (higher draws on top). */
     int sort_order;
-} JceCanvasComponent;
+} JceWorldCanvasComponent;
 
 /* Build the world-space TRS matrix used to place a WORLD canvas's
  * rect.  `out_mat4` is column-major 16 floats.  For non-WORLD modes
  * this fills identity. */
-JCE_API void jce_canvas_build_world_matrix(const JceCanvasComponent *c,
+JCE_API void jce_canvas_build_world_matrix(const JceWorldCanvasComponent *c,
                                              float out_mat4[16]);
 
 /* Hit-test: project a world-space ray onto the canvas plane and
  * return the resulting (u, v) in [0,1] coordinates.  Returns false
  * if the ray misses the plane or the canvas is not in WORLD mode. */
-JCE_API bool jce_canvas_world_pick(const JceCanvasComponent *c,
+JCE_API bool jce_canvas_world_pick(const JceWorldCanvasComponent *c,
                                      const float ray_origin[3],
                                      const float ray_dir[3],
                                      float *out_u,

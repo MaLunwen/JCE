@@ -32,14 +32,25 @@ typedef struct {
     float threshold;
 } SmCondition;
 
+/* One group: list of atomic conditions combined by `logic`. */
 typedef struct {
-    int   from;
-    int   to;
-    float duration;
-    bool  has_exit;
-    float exit_time;
+    int          logic;        /* JceAnimSmCondLogic */
     SmCondition *conds;
-    int   cond_count;
+    int          cond_count;
+} SmCondGroup;
+
+typedef struct {
+    int           from;        /* state index or JCE_ANIM_SM_ANYSTATE */
+    int           to;
+    float         duration;
+    bool          has_exit;
+    float         exit_time;
+    int           interrupt;   /* JceAnimSmInterruptSource */
+    /* Top-level groups are combined with AND (legacy single-group
+     * loads land here as one group with AND logic, matching prior
+     * behaviour). */
+    SmCondGroup  *groups;
+    int           group_count;
 } SmTransition;
 
 typedef struct {
@@ -182,17 +193,57 @@ static JceAnimSm *load_root(JceJson *root)
             t->duration  = (float)jce_json_get_number(o, "duration", 0.25);
             t->has_exit  = jce_json_get_bool(o, "hasExit", false);
             t->exit_time = (float)jce_json_get_number(o, "exitTime", 1.0);
-            JceJson *carr = jce_json_get(o, "conds");
-            if (carr && jce_json_is_array(carr)) {
-                t->cond_count = jce_json_array_size(carr);
-                t->conds = JCE_NEW_ARRAY(SmCondition,
-                                         t->cond_count > 0 ? t->cond_count : 1);
-                for (int j = 0; j < t->cond_count; ++j) {
-                    JceJson *co = jce_json_array_at(carr, j);
-                    SmCondition *c = &t->conds[j];
-                    c->param_idx = jce_json_get_int(co, "param", 0);
-                    c->op        = jce_json_get_int(co, "op", SM_OP_GT);
-                    c->threshold = (float)jce_json_get_number(co, "thr", 0.0);
+            t->interrupt = jce_json_get_int(o, "interrupt",
+                                              JCE_ANIM_SM_INTERRUPT_NONE);
+            /* "anyState":true is an alternate way to encode AnyState. */
+            if (jce_json_get_bool(o, "anyState", false))
+                t->from = JCE_ANIM_SM_ANYSTATE;
+
+            /* Preferred schema: groups: [ { logic, conds: [...] }, ... ].
+             * Legacy schema: conds: [...] (treated as one AND group). */
+            JceJson *groups = jce_json_get(o, "groups");
+            if (groups && jce_json_is_array(groups)) {
+                t->group_count = jce_json_array_size(groups);
+                t->groups = JCE_NEW_ARRAY(SmCondGroup,
+                                           t->group_count > 0 ? t->group_count : 1);
+                for (int g = 0; g < t->group_count; ++g) {
+                    JceJson *go = jce_json_array_at(groups, g);
+                    SmCondGroup *gp = &t->groups[g];
+                    gp->logic = jce_json_get_int(go, "logic",
+                                                  JCE_ANIM_SM_LOGIC_AND);
+                    JceJson *carr = jce_json_get(go, "conds");
+                    if (carr && jce_json_is_array(carr)) {
+                        gp->cond_count = jce_json_array_size(carr);
+                        gp->conds = JCE_NEW_ARRAY(SmCondition,
+                                                    gp->cond_count > 0 ? gp->cond_count : 1);
+                        for (int j = 0; j < gp->cond_count; ++j) {
+                            JceJson *co = jce_json_array_at(carr, j);
+                            SmCondition *c = &gp->conds[j];
+                            c->param_idx = jce_json_get_int(co, "param", 0);
+                            c->op        = jce_json_get_int(co, "op", SM_OP_GT);
+                            c->threshold = (float)jce_json_get_number(co, "thr", 0.0);
+                        }
+                    }
+                }
+            } else {
+                /* Legacy: single AND group from top-level conds[]. */
+                JceJson *carr = jce_json_get(o, "conds");
+                if (carr && jce_json_is_array(carr)) {
+                    int cc = jce_json_array_size(carr);
+                    if (cc > 0) {
+                        t->group_count = 1;
+                        t->groups = JCE_NEW_ARRAY(SmCondGroup, 1);
+                        t->groups[0].logic = JCE_ANIM_SM_LOGIC_AND;
+                        t->groups[0].cond_count = cc;
+                        t->groups[0].conds = JCE_NEW_ARRAY(SmCondition, cc);
+                        for (int j = 0; j < cc; ++j) {
+                            JceJson *co = jce_json_array_at(carr, j);
+                            SmCondition *c = &t->groups[0].conds[j];
+                            c->param_idx = jce_json_get_int(co, "param", 0);
+                            c->op        = jce_json_get_int(co, "op", SM_OP_GT);
+                            c->threshold = (float)jce_json_get_number(co, "thr", 0.0);
+                        }
+                    }
                 }
             }
         }
@@ -231,8 +282,14 @@ void jce_anim_sm_free(JceAnimSm *sm)
 {
     if (!sm) return;
     if (sm->trans) {
-        for (int i = 0; i < sm->trans_count; ++i)
-            JCE_FREE(sm->trans[i].conds);
+        for (int i = 0; i < sm->trans_count; ++i) {
+            SmTransition *t = &sm->trans[i];
+            if (t->groups) {
+                for (int g = 0; g < t->group_count; ++g)
+                    JCE_FREE(t->groups[g].conds);
+                JCE_FREE(t->groups);
+            }
+        }
         JCE_FREE(sm->trans);
     }
     JCE_FREE(sm->states);
@@ -306,41 +363,68 @@ void jce_anim_sm_reset(JceAnimSm *sm)
         sm->params[i].triggered = false;
 }
 
+static bool eval_group(const JceAnimSm *sm, const SmCondGroup *g)
+{
+    if (g->cond_count == 0) return false;
+    if (g->logic == JCE_ANIM_SM_LOGIC_OR) {
+        for (int j = 0; j < g->cond_count; ++j) {
+            bool consume = false;
+            if (eval_condition(sm, &g->conds[j], &consume)) return true;
+        }
+        return false;
+    }
+    /* AND */
+    for (int j = 0; j < g->cond_count; ++j) {
+        bool consume = false;
+        if (!eval_condition(sm, &g->conds[j], &consume)) return false;
+    }
+    return true;
+}
+
+static void consume_triggers(JceAnimSm *sm, const SmTransition *t)
+{
+    for (int g = 0; g < t->group_count; ++g) {
+        const SmCondGroup *gp = &t->groups[g];
+        for (int j = 0; j < gp->cond_count; ++j) {
+            int pi = gp->conds[j].param_idx;
+            if (pi >= 0 && pi < sm->param_count &&
+                sm->params[pi].type == JCE_ANIM_SM_PARAM_TRIGGER)
+                sm->params[pi].triggered = false;
+        }
+    }
+}
+
 static int find_ready_transition(JceAnimSm *sm, int from_state, float state_time)
 {
-    /* Returns first transition that is satisfied; consumes triggers. */
     for (int ti = 0; ti < sm->trans_count; ++ti) {
         SmTransition *t = &sm->trans[ti];
-        if (t->from != from_state) continue;
-        if (t->has_exit) {
+        bool any_state = (t->from == JCE_ANIM_SM_ANYSTATE);
+        if (!any_state && t->from != from_state) continue;
+        /* exit_time gate only meaningful when leaving a real state. */
+        if (t->has_exit && !any_state) {
             int s = t->from;
             if (s < 0 || s >= sm->state_count) continue;
             float st_speed = sm->states[s].speed;
-            float pct = (st_speed > 0.0001f) ? (state_time * st_speed) : state_time;
+            float pct = (st_speed > 0.0001f) ? (state_time * st_speed)
+                                              : state_time;
             if (pct < t->exit_time) continue;
         }
+        /* Outer AND across groups; inner logic per group. */
         bool all_ok = true;
-        bool consume = false;
-        for (int ci = 0; ci < t->cond_count; ++ci) {
-            if (!eval_condition(sm, &t->conds[ci], &consume)) {
+        for (int g = 0; g < t->group_count; ++g) {
+            if (!eval_group(sm, &t->groups[g])) {
                 all_ok = false;
                 break;
             }
         }
-        if (all_ok && t->cond_count > 0) {
-            /* Consume any triggers used. */
-            for (int ci = 0; ci < t->cond_count; ++ci) {
-                int pi = t->conds[ci].param_idx;
-                if (pi >= 0 && pi < sm->param_count &&
-                    sm->params[pi].type == JCE_ANIM_SM_PARAM_TRIGGER)
-                {
-                    sm->params[pi].triggered = false;
-                }
-            }
+        if (all_ok && t->group_count > 0) {
+            consume_triggers(sm, t);
             return ti;
         }
-        /* If transition has 0 conditions but exit-time satisfied, also fire. */
-        if (all_ok && t->cond_count == 0 && t->has_exit) return ti;
+        /* 0 condition + exit-time-only transition. */
+        if (all_ok && t->group_count == 0 && t->has_exit && !any_state)
+            return ti;
+        /* AnyState transition with 0 groups: must NOT fire (would loop forever). */
     }
     return -1;
 }
@@ -353,7 +437,42 @@ void jce_anim_sm_update(JceAnimSm *sm, float dt)
 
     sm->current_time += dt;
 
-    /* If a transition is in flight, advance its blend. */
+    /* Mid-transition interruption: re-scan transitions from either the
+     * source or the destination state, depending on the in-flight
+     * transition's `interrupt` policy.  When a new ready transition is
+     * found, replace the current one. */
+    if (sm->active_trans >= 0 && sm->active_trans < sm->trans_count) {
+        SmTransition *t = &sm->trans[sm->active_trans];
+        int interrupt_from = -1;
+        switch (t->interrupt) {
+        case JCE_ANIM_SM_INTERRUPT_FROM_CURRENT:
+            interrupt_from = t->from;
+            break;
+        case JCE_ANIM_SM_INTERRUPT_FROM_NEXT:
+            interrupt_from = t->to;
+            break;
+        case JCE_ANIM_SM_INTERRUPT_CURRENT_THEN_NEXT: {
+            int ti = find_ready_transition(sm, t->from, sm->current_time);
+            if (ti < 0) ti = find_ready_transition(sm, t->to, 0.0f);
+            if (ti >= 0 && ti != sm->active_trans) {
+                sm->active_trans  = ti;
+                sm->trans_elapsed = 0.0f;
+            }
+            break;
+        }
+        default: break; /* NONE — finish current transition */
+        }
+        if (interrupt_from >= 0) {
+            int ti = find_ready_transition(sm, interrupt_from,
+                                            sm->current_time);
+            if (ti >= 0 && ti != sm->active_trans) {
+                sm->active_trans  = ti;
+                sm->trans_elapsed = 0.0f;
+            }
+        }
+    }
+
+    /* Advance the (possibly newly-elected) transition's blend. */
     if (sm->active_trans >= 0 && sm->active_trans < sm->trans_count) {
         SmTransition *t = &sm->trans[sm->active_trans];
         sm->trans_elapsed += dt;
@@ -365,13 +484,12 @@ void jce_anim_sm_update(JceAnimSm *sm, float dt)
         }
     }
 
-    /* Look for a new transition to fire (only when not already transitioning). */
+    /* Idle: look for a new transition to fire. */
     if (sm->active_trans < 0) {
         int ti = find_ready_transition(sm, sm->current_state, sm->current_time);
         if (ti >= 0) {
             sm->active_trans  = ti;
             sm->trans_elapsed = 0.0f;
-            /* Instant transition (duration 0): apply immediately. */
             if (sm->trans[ti].duration <= 0.0001f) {
                 sm->current_state = sm->trans[ti].to;
                 sm->current_time  = 0.0f;

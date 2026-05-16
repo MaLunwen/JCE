@@ -30,6 +30,23 @@ typedef enum {
     JCE_ANIM_SM_PARAM_TRIGGER = 3,
 } JceAnimSmParamType;
 
+/* Logic combiner inside a transition condition group. */
+typedef enum {
+    JCE_ANIM_SM_LOGIC_AND = 0,
+    JCE_ANIM_SM_LOGIC_OR  = 1,
+} JceAnimSmCondLogic;
+
+/* Transition interruption policy.  Matches Unity Mecanim. */
+typedef enum {
+    JCE_ANIM_SM_INTERRUPT_NONE              = 0, /* queue; finish current first */
+    JCE_ANIM_SM_INTERRUPT_FROM_CURRENT      = 1, /* current state may re-fire */
+    JCE_ANIM_SM_INTERRUPT_FROM_NEXT         = 2, /* destination's transitions win */
+    JCE_ANIM_SM_INTERRUPT_CURRENT_THEN_NEXT = 3,
+} JceAnimSmInterruptSource;
+
+/* Sentinel state index meaning "AnyState" for a transition's `from`. */
+#define JCE_ANIM_SM_ANYSTATE (-2)
+
 /* Snapshot of evaluation result for a single frame. */
 typedef struct {
     int   state_index;        /* -1 if no active state */

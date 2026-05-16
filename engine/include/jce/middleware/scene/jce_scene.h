@@ -799,6 +799,72 @@ typedef struct {
     char  on_click_handler[128]; /* script handler name (placeholder) */
 } JceUIButtonComponent;
 
+/* ── UI: Toggle (checkbox / radio) ─────────────────────────────── */
+typedef struct {
+    bool  interactable;
+    bool  is_on;
+    int   group_id;                /* >0 = exclusive group; 0 = standalone */
+    float fade_duration;
+    char  on_value_changed[128];
+} JceUIToggleComponent;
+
+/* ── UI: Slider ────────────────────────────────────────────────── */
+typedef struct {
+    bool  interactable;
+    float min_value;
+    float max_value;
+    float value;
+    bool  whole_numbers;
+    int   direction;              /* 0=LTR 1=RTL 2=BTT 3=TTB */
+    char  on_value_changed[128];
+} JceUISliderComponent;
+
+/* ── UI: Dropdown ──────────────────────────────────────────────── */
+#define JCE_UI_DROPDOWN_MAX_OPTIONS 32
+typedef struct {
+    bool  interactable;
+    int   value;                  /* selected option index */
+    int   option_count;
+    char  options[JCE_UI_DROPDOWN_MAX_OPTIONS][48];
+    char  on_value_changed[128];
+} JceUIDropdownComponent;
+
+/* ── UI: InputField (single-line text input) ───────────────────── */
+typedef struct {
+    bool  interactable;
+    int   character_limit;        /* 0 = unbounded (capped by buffer) */
+    int   content_type;           /* 0=Std 1=Int 2=Decimal 3=Email 4=Password */
+    bool  read_only;
+    bool  multi_line;
+    char  text[256];
+    char  placeholder[128];
+    char  on_value_changed[128];
+    char  on_end_edit[128];
+    bool  has_focus;
+    int   caret_pos;
+} JceUIInputFieldComponent;
+
+/* ── UI: RawImage (display a texture without slicing) ──────────── */
+typedef struct {
+    char  texture_path[128];
+    float uv_rect[4];             /* u0, v0, u1, v1 */
+    float color[4];
+    bool  preserve_aspect;
+} JceUIRawImageComponent;
+
+/* ── UI Effects (siblings of Text/Image, modify rendering) ─────── */
+typedef struct {
+    float effect_color[4];
+    float effect_distance[2];     /* px offset, both axes */
+    bool  use_graphic_alpha;
+} JceUIOutlineEffect;
+
+typedef struct {
+    float effect_color[4];
+    float effect_distance[2];
+    bool  use_graphic_alpha;
+} JceUIShadowEffect;
+
 /* ── Component type flags (bitmask for enumeration) ──────────────── */
 
 typedef uint64_t JceComponentFlag;
@@ -857,6 +923,13 @@ typedef uint64_t JceComponentFlag;
 #define JCE_COMP_FLAG_AUDIO_BUS_ROUTE      (UINT64_C(1) << 51)
 #define JCE_COMP_FLAG_ANIMATION_LAYER_STATE (UINT64_C(1) << 52)
 #define JCE_COMP_FLAG_BLEND_SHAPE_WEIGHTS  (UINT64_C(1) << 53)
+#define JCE_COMP_FLAG_UI_TOGGLE            (UINT64_C(1) << 54)
+#define JCE_COMP_FLAG_UI_SLIDER            (UINT64_C(1) << 55)
+#define JCE_COMP_FLAG_UI_DROPDOWN          (UINT64_C(1) << 56)
+#define JCE_COMP_FLAG_UI_INPUT_FIELD       (UINT64_C(1) << 57)
+#define JCE_COMP_FLAG_UI_RAW_IMAGE         (UINT64_C(1) << 58)
+#define JCE_COMP_FLAG_UI_OUTLINE_EFFECT    (UINT64_C(1) << 59)
+#define JCE_COMP_FLAG_UI_SHADOW_EFFECT     (UINT64_C(1) << 60)
 
 /* ── Blend Shape weights (Unity-style morph target driving) ─────── *
  *
@@ -1242,6 +1315,48 @@ JCE_API void                          jce_scene_set_ui_button(JceScene *s, JceEn
 JCE_API JceUIButtonComponent         *jce_scene_get_ui_button(JceScene *s, JceEntity e);
 JCE_API bool                          jce_scene_has_ui_button(const JceScene *s, JceEntity e);
 JCE_API void                          jce_scene_remove_ui_button(JceScene *s, JceEntity e);
+
+/* Component access — UI Toggle. */
+JCE_API void                          jce_scene_set_ui_toggle(JceScene *s, JceEntity e, const JceUIToggleComponent *c);
+JCE_API JceUIToggleComponent         *jce_scene_get_ui_toggle(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_ui_toggle(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_ui_toggle(JceScene *s, JceEntity e);
+
+/* Component access — UI Slider. */
+JCE_API void                          jce_scene_set_ui_slider(JceScene *s, JceEntity e, const JceUISliderComponent *c);
+JCE_API JceUISliderComponent         *jce_scene_get_ui_slider(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_ui_slider(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_ui_slider(JceScene *s, JceEntity e);
+
+/* Component access — UI Dropdown. */
+JCE_API void                          jce_scene_set_ui_dropdown(JceScene *s, JceEntity e, const JceUIDropdownComponent *c);
+JCE_API JceUIDropdownComponent       *jce_scene_get_ui_dropdown(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_ui_dropdown(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_ui_dropdown(JceScene *s, JceEntity e);
+
+/* Component access — UI InputField. */
+JCE_API void                          jce_scene_set_ui_input_field(JceScene *s, JceEntity e, const JceUIInputFieldComponent *c);
+JCE_API JceUIInputFieldComponent     *jce_scene_get_ui_input_field(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_ui_input_field(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_ui_input_field(JceScene *s, JceEntity e);
+
+/* Component access — UI RawImage. */
+JCE_API void                          jce_scene_set_ui_raw_image(JceScene *s, JceEntity e, const JceUIRawImageComponent *c);
+JCE_API JceUIRawImageComponent       *jce_scene_get_ui_raw_image(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_ui_raw_image(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_ui_raw_image(JceScene *s, JceEntity e);
+
+/* Component access — UI Outline effect. */
+JCE_API void                          jce_scene_set_ui_outline_effect(JceScene *s, JceEntity e, const JceUIOutlineEffect *c);
+JCE_API JceUIOutlineEffect           *jce_scene_get_ui_outline_effect(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_ui_outline_effect(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_ui_outline_effect(JceScene *s, JceEntity e);
+
+/* Component access — UI Shadow effect. */
+JCE_API void                          jce_scene_set_ui_shadow_effect(JceScene *s, JceEntity e, const JceUIShadowEffect *c);
+JCE_API JceUIShadowEffect            *jce_scene_get_ui_shadow_effect(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_ui_shadow_effect(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_ui_shadow_effect(JceScene *s, JceEntity e);
 
 /* Component access — Audio Bus Route. */
 JCE_API void                          jce_scene_set_audio_bus_route(JceScene *s, JceEntity e, const JceAudioBusRouteComponent *c);

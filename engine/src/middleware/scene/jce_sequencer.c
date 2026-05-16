@@ -20,6 +20,15 @@ typedef struct {
     float t;
     float v;
     float rgb[3];
+    /* Phase-2 extras — used only by Animation/Audio/Signal/Marker
+     * track types.  Memory cost ≈ 250 B per key; sequencer key
+     * counts are O(100) per project, fine. */
+    float duration;
+    float volume;
+    float pan;
+    char  clip_path[SEQ_MAX_BIND];
+    char  signal_name[SEQ_MAX_NAME];
+    char  marker_name[SEQ_MAX_NAME];
 } SeqKey;
 
 typedef struct {
@@ -94,6 +103,16 @@ static JceSequencer *load_root(JceJson *root)
                     k->v = (float)jce_json_get_number(ko, "v", 0.0);
                     k->rgb[0] = 1.0f; k->rgb[1] = 1.0f; k->rgb[2] = 1.0f;
                     jce_json_get_floats(ko, "rgb", k->rgb, 3, NULL);
+                    /* Phase-2 fields (defaults match legacy behaviour). */
+                    k->duration = (float)jce_json_get_number(ko, "duration", 0.0);
+                    k->volume   = (float)jce_json_get_number(ko, "volume", 1.0);
+                    k->pan      = (float)jce_json_get_number(ko, "pan", 0.0);
+                    copy_str(k->clip_path,   sizeof(k->clip_path),
+                              jce_json_get_string(ko, "clip", ""));
+                    copy_str(k->signal_name, sizeof(k->signal_name),
+                              jce_json_get_string(ko, "signal", ""));
+                    copy_str(k->marker_name, sizeof(k->marker_name),
+                              jce_json_get_string(ko, "marker", ""));
                 }
                 if (t->key_count > 1)
                     qsort(t->keys, t->key_count, sizeof(SeqKey), key_cmp);
@@ -256,4 +275,94 @@ int jce_sequencer_track_events_in_range(const JceSequencer *seq, int idx,
         if (tk > t_prev && tk <= t_now) ++n;
     }
     return n;
+}
+
+/* ── Phase-2 track type evaluators ───────────────────────────── */
+
+bool jce_sequencer_track_eval_activation(const JceSequencer *seq, int idx, float ti)
+{
+    if (!seq || idx < 0 || idx >= seq->track_count) return false;
+    const SeqTrack *t = &seq->tracks[idx];
+    if (t->type != JCE_SEQ_TRACK_ACTIVATION) return false;
+    for (int i = 0; i < t->key_count; ++i) {
+        float lo = t->keys[i].t;
+        float hi = lo + t->keys[i].duration;
+        if (ti >= lo && ti <= hi) return true;
+    }
+    return false;
+}
+
+bool jce_sequencer_track_eval_anim_clip(const JceSequencer *seq, int idx, float ti,
+                                          const char **out_clip_path,
+                                          float *out_clip_t, float *out_weight)
+{
+    if (!seq || idx < 0 || idx >= seq->track_count) return false;
+    const SeqTrack *t = &seq->tracks[idx];
+    if (t->type != JCE_SEQ_TRACK_ANIMATION) return false;
+    for (int i = 0; i < t->key_count; ++i) {
+        const SeqKey *k = &t->keys[i];
+        float lo = k->t;
+        float hi = lo + k->duration;
+        if (ti < lo || ti > hi) continue;
+        if (out_clip_path) *out_clip_path = k->clip_path;
+        if (out_clip_t)   *out_clip_t   = (k->duration > 0.0001f)
+                                            ? (ti - lo) / k->duration : 0.0f;
+        if (out_weight)   *out_weight   = (k->v > 0.0f) ? k->v : 1.0f;
+        return true;
+    }
+    return false;
+}
+
+bool jce_sequencer_track_eval_audio_clip(const JceSequencer *seq, int idx, float ti,
+                                           const char **out_clip_path,
+                                           float *out_volume, float *out_pan)
+{
+    if (!seq || idx < 0 || idx >= seq->track_count) return false;
+    const SeqTrack *t = &seq->tracks[idx];
+    if (t->type != JCE_SEQ_TRACK_AUDIO) return false;
+    for (int i = 0; i < t->key_count; ++i) {
+        const SeqKey *k = &t->keys[i];
+        float lo = k->t;
+        float hi = lo + k->duration;
+        if (ti < lo || ti > hi) continue;
+        if (out_clip_path) *out_clip_path = k->clip_path;
+        if (out_volume)    *out_volume    = k->volume;
+        if (out_pan)       *out_pan       = k->pan;
+        return true;
+    }
+    return false;
+}
+
+int jce_sequencer_track_signals_in_range(const JceSequencer *seq, int idx,
+                                           float t_prev, float t_now,
+                                           const char **out_names, int cap)
+{
+    if (!seq || idx < 0 || idx >= seq->track_count) return 0;
+    const SeqTrack *t = &seq->tracks[idx];
+    if (t->type != JCE_SEQ_TRACK_SIGNAL) return 0;
+    int n = 0;
+    for (int i = 0; i < t->key_count && (out_names ? n < cap : 1); ++i) {
+        float tk = t->keys[i].t;
+        if (tk > t_prev && tk <= t_now) {
+            if (out_names && n < cap)
+                out_names[n] = t->keys[i].signal_name;
+            n++;
+        }
+    }
+    return n;
+}
+
+const char *jce_sequencer_track_marker_at(const JceSequencer *seq, int idx,
+                                            float ti, float tolerance)
+{
+    if (!seq || idx < 0 || idx >= seq->track_count) return NULL;
+    const SeqTrack *t = &seq->tracks[idx];
+    if (t->type != JCE_SEQ_TRACK_MARKER) return NULL;
+    if (tolerance < 0) tolerance = 0;
+    for (int i = 0; i < t->key_count; ++i) {
+        float d = t->keys[i].t - ti;
+        if (d < 0) d = -d;
+        if (d <= tolerance) return t->keys[i].marker_name;
+    }
+    return NULL;
 }
