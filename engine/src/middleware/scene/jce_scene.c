@@ -350,6 +350,9 @@ JCE_COMP_IMPL(JceUIInputFieldComponent,       ui_input_field)
 JCE_COMP_IMPL(JceUIRawImageComponent,         ui_raw_image)
 JCE_COMP_IMPL(JceUIOutlineEffect,             ui_outline_effect)
 JCE_COMP_IMPL(JceUIShadowEffect,              ui_shadow_effect)
+JCE_COMP_IMPL(JcePointLight2DComponent,       point_light_2d)
+JCE_COMP_IMPL(JceSpotLight2DComponent,        spot_light_2d)
+JCE_COMP_IMPL(JceGlobalLight2DComponent,      global_light_2d)
 JCE_COMP_IMPL(JceAudioBusRouteComponent,      audio_bus_route)
 JCE_COMP_IMPL(JceAnimationLayerStateComponent, animation_layer_state)
 JCE_COMP_IMPL(JceBlendShapeWeightsComponent,   blend_shape_weights)
@@ -423,6 +426,9 @@ uint64_t jce_scene_get_component_flags(const JceScene *s, JceEntity e)
     if (ecs_has(s->world, ent, JceUIRawImageComponent))         flags |= JCE_COMP_FLAG_UI_RAW_IMAGE;
     if (ecs_has(s->world, ent, JceUIOutlineEffect))             flags |= JCE_COMP_FLAG_UI_OUTLINE_EFFECT;
     if (ecs_has(s->world, ent, JceUIShadowEffect))              flags |= JCE_COMP_FLAG_UI_SHADOW_EFFECT;
+    if (ecs_has(s->world, ent, JcePointLight2DComponent))       flags |= JCE_COMP_FLAG_POINT_LIGHT_2D;
+    if (ecs_has(s->world, ent, JceSpotLight2DComponent))        flags |= JCE_COMP_FLAG_SPOT_LIGHT_2D;
+    if (ecs_has(s->world, ent, JceGlobalLight2DComponent))      flags |= JCE_COMP_FLAG_GLOBAL_LIGHT_2D;
     if (ecs_has(s->world, ent, JceAudioBusRouteComponent))      flags |= JCE_COMP_FLAG_AUDIO_BUS_ROUTE;
     if (ecs_has(s->world, ent, JceAnimationLayerStateComponent)) flags |= JCE_COMP_FLAG_ANIMATION_LAYER_STATE;
     if (ecs_has(s->world, ent, JceBlendShapeWeightsComponent))  flags |= JCE_COMP_FLAG_BLEND_SHAPE_WEIGHTS;

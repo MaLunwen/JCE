@@ -1530,6 +1530,53 @@ static void parse_ui_shadow_effect(JceScene *s, JceEntity e, const cJSON *c)
     jce_scene_set_ui_shadow_effect(s, e, &o);
 }
 
+static void parse_point_light_2d(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JcePointLight2DComponent p; memset(&p, 0, sizeof p);
+    p.color[0]          = (float)j_num(c, "colorR", 1.0);
+    p.color[1]          = (float)j_num(c, "colorG", 1.0);
+    p.color[2]          = (float)j_num(c, "colorB", 1.0);
+    p.color[3]          = (float)j_num(c, "colorA", 1.0);
+    p.intensity         = (float)j_num(c, "intensity", 1.0);
+    p.outer_radius      = (float)j_num(c, "outerRadius", 5.0);
+    p.inner_radius      = (float)j_num(c, "innerRadius", 1.0);
+    p.target_layer_mask = (uint32_t)j_num(c, "layerMask", 0xFFFFFFFFu);
+    p.blend             = (int)j_num(c, "blend", 0);
+    p.volumetric        = j_bool(c, "volumetric", false);
+    jce_scene_set_point_light_2d(s, e, &p);
+}
+
+static void parse_spot_light_2d(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceSpotLight2DComponent p; memset(&p, 0, sizeof p);
+    p.color[0]          = (float)j_num(c, "colorR", 1.0);
+    p.color[1]          = (float)j_num(c, "colorG", 1.0);
+    p.color[2]          = (float)j_num(c, "colorB", 1.0);
+    p.color[3]          = (float)j_num(c, "colorA", 1.0);
+    p.intensity         = (float)j_num(c, "intensity", 1.0);
+    p.outer_radius      = (float)j_num(c, "outerRadius", 5.0);
+    p.inner_radius      = (float)j_num(c, "innerRadius", 1.0);
+    p.inner_angle_deg   = (float)j_num(c, "innerAngleDeg", 30.0);
+    p.outer_angle_deg   = (float)j_num(c, "outerAngleDeg", 60.0);
+    p.target_layer_mask = (uint32_t)j_num(c, "layerMask", 0xFFFFFFFFu);
+    p.blend             = (int)j_num(c, "blend", 0);
+    p.volumetric        = j_bool(c, "volumetric", false);
+    jce_scene_set_spot_light_2d(s, e, &p);
+}
+
+static void parse_global_light_2d(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceGlobalLight2DComponent p; memset(&p, 0, sizeof p);
+    p.color[0]          = (float)j_num(c, "colorR", 1.0);
+    p.color[1]          = (float)j_num(c, "colorG", 1.0);
+    p.color[2]          = (float)j_num(c, "colorB", 1.0);
+    p.color[3]          = (float)j_num(c, "colorA", 1.0);
+    p.intensity         = (float)j_num(c, "intensity", 0.5);
+    p.target_layer_mask = (uint32_t)j_num(c, "layerMask", 0xFFFFFFFFu);
+    p.blend             = (int)j_num(c, "blend", 0);
+    jce_scene_set_global_light_2d(s, e, &p);
+}
+
 static void parse_constraint(JceScene *s, JceEntity e, const cJSON *c)
 {
     JceConstraintComponent cn;
@@ -1780,6 +1827,19 @@ static void parse_one_component(JceScene *s, JceEntity e, const cJSON *comp)
     }
     if (strcmp(type, "UIShadow") == 0 || strcmp(type, "uiShadow") == 0) {
         parse_ui_shadow_effect(s, e, props); return;
+    }
+    /* 2D lights. */
+    if (strcmp(type, "PointLight2D") == 0 ||
+        strcmp(type, "pointLight2D") == 0) {
+        parse_point_light_2d(s, e, props); return;
+    }
+    if (strcmp(type, "SpotLight2D") == 0 ||
+        strcmp(type, "spotLight2D") == 0) {
+        parse_spot_light_2d(s, e, props); return;
+    }
+    if (strcmp(type, "GlobalLight2D") == 0 ||
+        strcmp(type, "globalLight2D") == 0) {
+        parse_global_light_2d(s, e, props); return;
     }
 }
 
@@ -2673,6 +2733,56 @@ static void ser_ui_shadow_effect(const JceUIShadowEffect *eo, cJSON *arr)
     cJSON_AddItemToArray(arr, o);
 }
 
+static void ser_point_light_2d(const JcePointLight2DComponent *p, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "PointLight2D");
+    cJSON_AddNumberToObject(o, "colorR", p->color[0]);
+    cJSON_AddNumberToObject(o, "colorG", p->color[1]);
+    cJSON_AddNumberToObject(o, "colorB", p->color[2]);
+    cJSON_AddNumberToObject(o, "colorA", p->color[3]);
+    cJSON_AddNumberToObject(o, "intensity", p->intensity);
+    cJSON_AddNumberToObject(o, "outerRadius", p->outer_radius);
+    cJSON_AddNumberToObject(o, "innerRadius", p->inner_radius);
+    cJSON_AddNumberToObject(o, "layerMask", (double)p->target_layer_mask);
+    cJSON_AddNumberToObject(o, "blend", p->blend);
+    cJSON_AddBoolToObject  (o, "volumetric", p->volumetric);
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_spot_light_2d(const JceSpotLight2DComponent *p, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "SpotLight2D");
+    cJSON_AddNumberToObject(o, "colorR", p->color[0]);
+    cJSON_AddNumberToObject(o, "colorG", p->color[1]);
+    cJSON_AddNumberToObject(o, "colorB", p->color[2]);
+    cJSON_AddNumberToObject(o, "colorA", p->color[3]);
+    cJSON_AddNumberToObject(o, "intensity", p->intensity);
+    cJSON_AddNumberToObject(o, "outerRadius", p->outer_radius);
+    cJSON_AddNumberToObject(o, "innerRadius", p->inner_radius);
+    cJSON_AddNumberToObject(o, "innerAngleDeg", p->inner_angle_deg);
+    cJSON_AddNumberToObject(o, "outerAngleDeg", p->outer_angle_deg);
+    cJSON_AddNumberToObject(o, "layerMask", (double)p->target_layer_mask);
+    cJSON_AddNumberToObject(o, "blend", p->blend);
+    cJSON_AddBoolToObject  (o, "volumetric", p->volumetric);
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_global_light_2d(const JceGlobalLight2DComponent *p, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "GlobalLight2D");
+    cJSON_AddNumberToObject(o, "colorR", p->color[0]);
+    cJSON_AddNumberToObject(o, "colorG", p->color[1]);
+    cJSON_AddNumberToObject(o, "colorB", p->color[2]);
+    cJSON_AddNumberToObject(o, "colorA", p->color[3]);
+    cJSON_AddNumberToObject(o, "intensity", p->intensity);
+    cJSON_AddNumberToObject(o, "layerMask", (double)p->target_layer_mask);
+    cJSON_AddNumberToObject(o, "blend", p->blend);
+    cJSON_AddItemToArray(arr, o);
+}
+
 static void ser_skybox(const JceSkyboxComponent *c, cJSON *arr)
 {
     cJSON *o = cJSON_CreateObject();
@@ -3004,6 +3114,18 @@ static void ser_entity_cb(JceScene *s, JceEntity e, void *ud)
     if (f & JCE_COMP_FLAG_UI_SHADOW_EFFECT) {
         JceUIShadowEffect *c = jce_scene_get_ui_shadow_effect(s, e);
         if (c) ser_ui_shadow_effect(c, comps);
+    }
+    if (f & JCE_COMP_FLAG_POINT_LIGHT_2D) {
+        JcePointLight2DComponent *c = jce_scene_get_point_light_2d(s, e);
+        if (c) ser_point_light_2d(c, comps);
+    }
+    if (f & JCE_COMP_FLAG_SPOT_LIGHT_2D) {
+        JceSpotLight2DComponent *c = jce_scene_get_spot_light_2d(s, e);
+        if (c) ser_spot_light_2d(c, comps);
+    }
+    if (f & JCE_COMP_FLAG_GLOBAL_LIGHT_2D) {
+        JceGlobalLight2DComponent *c = jce_scene_get_global_light_2d(s, e);
+        if (c) ser_global_light_2d(c, comps);
     }
     if (f & JCE_COMP_FLAG_EDITOR_META) {
         JceEditorMeta *m = jce_scene_get_editor_meta(s, e);
@@ -3487,6 +3609,18 @@ cJSON *jce_scene_serialize_entity_components(JceScene *scene, JceEntity e)
     if (f & JCE_COMP_FLAG_UI_SHADOW_EFFECT) {
         JceUIShadowEffect *c = jce_scene_get_ui_shadow_effect(scene, e);
         if (c) ser_ui_shadow_effect(c, arr);
+    }
+    if (f & JCE_COMP_FLAG_POINT_LIGHT_2D) {
+        JcePointLight2DComponent *c = jce_scene_get_point_light_2d(scene, e);
+        if (c) ser_point_light_2d(c, arr);
+    }
+    if (f & JCE_COMP_FLAG_SPOT_LIGHT_2D) {
+        JceSpotLight2DComponent *c = jce_scene_get_spot_light_2d(scene, e);
+        if (c) ser_spot_light_2d(c, arr);
+    }
+    if (f & JCE_COMP_FLAG_GLOBAL_LIGHT_2D) {
+        JceGlobalLight2DComponent *c = jce_scene_get_global_light_2d(scene, e);
+        if (c) ser_global_light_2d(c, arr);
     }
     if (f & JCE_COMP_FLAG_EDITOR_META) {
         JceEditorMeta *m = jce_scene_get_editor_meta(scene, e);

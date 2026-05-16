@@ -29,12 +29,52 @@ typedef enum {
     JCE_VCAM_TRACK_FOLLOW_LOOK = 3  /* both */
 } JceVcamTrackMode;
 
+/* Body / aim rigs (Cinemachine taxonomy, phase 2). */
+typedef enum {
+    JCE_VCAM_RIG_BASIC       = 0,  /* legacy behaviour */
+    JCE_VCAM_RIG_FREELOOK    = 1,  /* three-orbit arc */
+    JCE_VCAM_RIG_THIRD_PERSON_AIM = 2,
+} JceVcamRigType;
+
+typedef enum {
+    JCE_VCAM_LOOKAT_DAMPED = 0,
+    JCE_VCAM_LOOKAT_HARD   = 1,    /* snap, ignore damping */
+} JceVcamLookatMode;
+
+/* FreeLook rig: three orbits stacked vertically; pitch (-1..1) selects
+ * which orbit + interpolates between adjacent ones. */
+typedef struct {
+    /* Orbit radii + heights (top, middle, bottom). */
+    float orbit_radius[3];
+    float orbit_height[3];
+    /* Current orbit position in [-1, 1]: -1 bottom, 0 mid, +1 top. */
+    float vertical_axis;
+    /* Yaw in radians (rotation around target's up axis). */
+    float horizontal_axis;
+    /* Speed multipliers (input × speed = axis delta per second). */
+    float vertical_speed;
+    float horizontal_speed;
+} JceVcamFreeLookRig;
+
+/* Composer framing rule: keep target inside a screen-space rect. */
+typedef struct {
+    float screen_x;          /* desired NDC X of target (-1..1) */
+    float screen_y;
+    float dead_zone_w;       /* tolerance before any correction */
+    float dead_zone_h;
+    float soft_zone_w;       /* outside dead zone but inside soft, damped */
+    float soft_zone_h;
+    /* If true, snap target instantly to screen center (hard look-at). */
+    JceVcamLookatMode lookat_mode;
+} JceVcamComposer;
+
 typedef struct {
     char    name[64];
     int32_t priority;     /* higher = wins */
     int     active;       /* 0 = ignored */
 
     JceVcamTrackMode mode;
+    JceVcamRigType   rig;          /* basic / freelook / third-person */
 
     float position[3];
     float target  [3];
@@ -45,6 +85,10 @@ typedef struct {
     float offset     [3];
 
     float damping;        /* 0 = snap, larger = slower; ~5 is "filmic" */
+
+    /* Phase-2 rig + composer (active when rig != BASIC). */
+    JceVcamFreeLookRig freelook;
+    JceVcamComposer    composer;
 } JceVirtualCamera;
 
 typedef struct {

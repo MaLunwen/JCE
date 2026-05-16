@@ -132,6 +132,47 @@ JCE_API bool jce_audio_mixer_bus_get_effect(const JceAudioMixer *m,
                                              uint32_t             slot_index,
                                              JceMixerEffectSlot  *out_slot);
 
+/* ── VCA (Volume Control Automation, B19.5) ───────────────────
+ *
+ * VCAs are a named, runtime-settable multiplier on a bus's
+ * effective volume.  Multiple buses can share the same VCA name
+ * — typical use: an "underwater" VCA dampens every bus mapped to
+ * it at once.  The resolve path multiplies the bus's own volume,
+ * its ancestor chain, AND any VCAs it subscribes to.
+ *
+ * Defaults: every bus has zero VCAs; vca_value defaults to 1.0
+ * so adding an empty VCA is a no-op. */
+
+#define JCE_MIXER_VCA_NAME_LEN 32
+
+/* Subscribe a bus to a VCA channel.  When `vca_name` doesn't yet
+ * exist, it's created with value 1.0.  Each bus can subscribe to
+ * up to JCE_MIXER_BUS_VCA_SLOTS distinct VCAs (default 4). */
+#define JCE_MIXER_BUS_VCA_SLOTS 4
+
+JCE_API bool jce_audio_mixer_bus_attach_vca(JceAudioMixer *m,
+                                              JceAudioBusId  bus,
+                                              const char    *vca_name);
+
+JCE_API bool jce_audio_mixer_bus_detach_vca(JceAudioMixer *m,
+                                              JceAudioBusId  bus,
+                                              const char    *vca_name);
+
+/* Global setter — moves the VCA's value, affecting every subscribed
+ * bus on the next resolve_volume call. */
+JCE_API void  jce_audio_mixer_set_vca_value(JceAudioMixer *m,
+                                              const char    *vca_name,
+                                              float          value);
+
+JCE_API float jce_audio_mixer_get_vca_value(const JceAudioMixer *m,
+                                              const char *vca_name);
+
+/* Iterate VCA names — caller-supplied buffer of `cap` pointer
+ * slots; returns count. */
+JCE_API uint32_t jce_audio_mixer_list_vcas(const JceAudioMixer *m,
+                                             const char        **out_names,
+                                             uint32_t            cap);
+
 #ifdef __cplusplus
 }
 #endif

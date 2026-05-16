@@ -14,6 +14,8 @@
 extern "C" {
 #endif
 
+#include <jce/renderer/jce_2d_lights.h>
+#include <jce/renderer/jce_2d_lights_apply.h>
 #include <jce/renderer/jce_compute.h>
 #include <jce/renderer/jce_frame_debugger.h>
 #include <jce/renderer/jce_gi_probes.h>

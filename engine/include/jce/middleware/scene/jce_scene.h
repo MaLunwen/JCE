@@ -865,6 +865,36 @@ typedef struct {
     bool  use_graphic_alpha;
 } JceUIShadowEffect;
 
+/* ── 2D Lighting components (URP 2D Renderer parity) ──────────── */
+typedef struct {
+    float    color[4];
+    float    intensity;
+    float    outer_radius;
+    float    inner_radius;
+    uint32_t target_layer_mask;
+    int      blend;                 /* 0 = additive, 1 = multiply */
+    bool     volumetric;
+} JcePointLight2DComponent;
+
+typedef struct {
+    float    color[4];
+    float    intensity;
+    float    outer_radius;
+    float    inner_radius;
+    float    inner_angle_deg;
+    float    outer_angle_deg;
+    uint32_t target_layer_mask;
+    int      blend;
+    bool     volumetric;
+} JceSpotLight2DComponent;
+
+typedef struct {
+    float    color[4];
+    float    intensity;
+    uint32_t target_layer_mask;
+    int      blend;
+} JceGlobalLight2DComponent;
+
 /* ── Component type flags (bitmask for enumeration) ──────────────── */
 
 typedef uint64_t JceComponentFlag;
@@ -930,6 +960,9 @@ typedef uint64_t JceComponentFlag;
 #define JCE_COMP_FLAG_UI_RAW_IMAGE         (UINT64_C(1) << 58)
 #define JCE_COMP_FLAG_UI_OUTLINE_EFFECT    (UINT64_C(1) << 59)
 #define JCE_COMP_FLAG_UI_SHADOW_EFFECT     (UINT64_C(1) << 60)
+#define JCE_COMP_FLAG_POINT_LIGHT_2D       (UINT64_C(1) << 61)
+#define JCE_COMP_FLAG_SPOT_LIGHT_2D        (UINT64_C(1) << 62)
+#define JCE_COMP_FLAG_GLOBAL_LIGHT_2D      (UINT64_C(1) << 63)
 
 /* ── Blend Shape weights (Unity-style morph target driving) ─────── *
  *
@@ -1357,6 +1390,24 @@ JCE_API void                          jce_scene_set_ui_shadow_effect(JceScene *s
 JCE_API JceUIShadowEffect            *jce_scene_get_ui_shadow_effect(JceScene *s, JceEntity e);
 JCE_API bool                          jce_scene_has_ui_shadow_effect(const JceScene *s, JceEntity e);
 JCE_API void                          jce_scene_remove_ui_shadow_effect(JceScene *s, JceEntity e);
+
+/* Component access — 2D Point Light. */
+JCE_API void                          jce_scene_set_point_light_2d(JceScene *s, JceEntity e, const JcePointLight2DComponent *c);
+JCE_API JcePointLight2DComponent     *jce_scene_get_point_light_2d(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_point_light_2d(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_point_light_2d(JceScene *s, JceEntity e);
+
+/* Component access — 2D Spot Light. */
+JCE_API void                          jce_scene_set_spot_light_2d(JceScene *s, JceEntity e, const JceSpotLight2DComponent *c);
+JCE_API JceSpotLight2DComponent      *jce_scene_get_spot_light_2d(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_spot_light_2d(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_spot_light_2d(JceScene *s, JceEntity e);
+
+/* Component access — 2D Global Light. */
+JCE_API void                          jce_scene_set_global_light_2d(JceScene *s, JceEntity e, const JceGlobalLight2DComponent *c);
+JCE_API JceGlobalLight2DComponent    *jce_scene_get_global_light_2d(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_global_light_2d(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_global_light_2d(JceScene *s, JceEntity e);
 
 /* Component access — Audio Bus Route. */
 JCE_API void                          jce_scene_set_audio_bus_route(JceScene *s, JceEntity e, const JceAudioBusRouteComponent *c);
