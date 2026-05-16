@@ -29,6 +29,7 @@
 
 extern "C" void jce_reflect_register_builtin(void);
 extern "C" void jce_hotkeys_init(void);
+extern "C" void jce_editor_commands_register_builtin(void);
 
 #include <jce/tools/jce_imgui.hpp>
 #include <stdio.h>
@@ -295,6 +296,7 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
     jce_reflect_register_builtin();
     jce_hotkeys_init();
     jce_gizmo_init();
+    jce_editor_commands_register_builtin();
 
     /* Set window icon from embedded PAK. */
     {

@@ -220,6 +220,7 @@ void jce_editor_panels_init(void)
     s_visible[JCE_PANEL_VCAM_MANAGER]     = false;
     s_visible[JCE_PANEL_REVERB_ZONES]     = false;
     s_visible[JCE_PANEL_SAVE_BROWSER]     = false;
+    s_visible[JCE_PANEL_VSCRIPT_GRAPH]    = false;
 
     /* Console ring buffer. */
     memset(&s_console, 0, sizeof(s_console));

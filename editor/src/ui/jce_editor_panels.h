@@ -62,6 +62,7 @@ typedef enum {
     JCE_PANEL_VCAM_MANAGER,
     JCE_PANEL_REVERB_ZONES,
     JCE_PANEL_SAVE_BROWSER,
+    JCE_PANEL_VSCRIPT_GRAPH,
     JCE_PANEL_COUNT
 } JceEditorPanel;
 
@@ -144,6 +145,7 @@ void  jce_editor_panel_time_of_day_content(void);
 void  jce_editor_panel_vcam_manager_content(void);
 void  jce_editor_panel_reverb_zones_content(void);
 void  jce_editor_panel_save_browser_content(void);
+void  jce_editor_panel_vscript_graph_content(void);
 
 /* About dialog (modal). */
 void  jce_editor_about_dialog(bool *p_open);

@@ -40,15 +40,14 @@ extern "C" {
 typedef struct JceEmbreeScene  JceEmbreeScene;
 typedef struct JceEmbreeDevice JceEmbreeDevice;
 
-/* Lifecycle.  All return NULL / false when Embree isn't compiled in. */
+#ifdef JCE_HAS_EMBREE
+/* Lifecycle.  Real implementations live in the (gated) impl TU. */
 JceEmbreeDevice *jce_embree_create_device(void);
 void             jce_embree_destroy_device(JceEmbreeDevice *d);
 
 JceEmbreeScene  *jce_embree_create_scene(JceEmbreeDevice *d);
 void             jce_embree_destroy_scene(JceEmbreeScene  *s);
 
-/* Add a triangle mesh.  Indices interpreted as triangles
- * (triangle_count*3 entries).  Returns the geometry id. */
 uint32_t jce_embree_add_triangle_mesh(JceEmbreeScene *s,
                                        const float    *positions,
                                        uint32_t        vertex_count,
@@ -57,13 +56,10 @@ uint32_t jce_embree_add_triangle_mesh(JceEmbreeScene *s,
 
 void     jce_embree_commit(JceEmbreeScene *s);
 
-/* Single-ray any-hit query.  Returns true if any triangle is hit
- * within `max_t`.  Used by the lightmap AO loop. */
 bool     jce_embree_occluded(JceEmbreeScene *s,
                               const float ro[3], const float rd[3],
                               float max_t);
-
-#ifndef JCE_HAS_EMBREE
+#else
 /* No-op stubs so referring TUs link without Embree at all. */
 static inline JceEmbreeDevice *jce_embree_create_device(void)  { return NULL; }
 static inline void             jce_embree_destroy_device(JceEmbreeDevice *d) { (void)d; }
