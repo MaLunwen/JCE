@@ -53,6 +53,13 @@ typedef enum {
     JCE_FT_ASSET_REF,   /* fixed-size char[] holding asset path + Browse + DnD target */
     JCE_FT_STRUCT_NESTED, /* recurse into another registered reflect type (by display name) */
     JCE_FT_ARRAY,       /* inline array of POD elements (extra: element_type/size/max/count_offset) */
+    /* B20.2 extras — Unity Inspector parity. */
+    JCE_FT_VECTOR2INT,  /* int32_t[2] */
+    JCE_FT_VECTOR3INT,  /* int32_t[3] */
+    JCE_FT_RECT,        /* float[4] = (x, y, w, h) */
+    JCE_FT_BOUNDS,      /* float[6] = (center.xyz, extents.xyz) */
+    JCE_FT_LAYER_MASK,  /* uint32_t bitmask, 32 layer-name slots */
+    JCE_FT_TAG,         /* fixed-size char[] from a tag-name list */
     JCE_FT_COUNT
 } JceFieldType;
 

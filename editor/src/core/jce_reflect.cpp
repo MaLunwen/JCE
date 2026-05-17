@@ -324,6 +324,98 @@ bool draw_field(const JceReflectField *f, void *base, const void *defaults_base)
             ImGui::TreePop();
         }
     } break;
+    case JCE_FT_VECTOR2INT: {
+        int32_t *v = reinterpret_cast<int32_t *>(static_cast<char *>(base) + f->offset);
+        if (ImGui::InputInt2(f->display_name, v)) {
+            jce_state_track_edit();
+        }
+    } break;
+    case JCE_FT_VECTOR3INT: {
+        int32_t *v = reinterpret_cast<int32_t *>(static_cast<char *>(base) + f->offset);
+        if (ImGui::InputInt3(f->display_name, v)) {
+            jce_state_track_edit();
+        }
+    } break;
+    case JCE_FT_RECT: {
+        float *r = reinterpret_cast<float *>(static_cast<char *>(base) + f->offset);
+        ImGui::PushID(f->display_name);
+        ImGui::TextUnformatted(f->display_name);
+        ImGui::Indent();
+        if (ImGui::DragFloat2("Position##rect", r,     0.5f)) jce_state_track_edit();
+        if (ImGui::DragFloat2("Size##rect",     r + 2, 0.5f)) jce_state_track_edit();
+        ImGui::Unindent();
+        ImGui::PopID();
+    } break;
+    case JCE_FT_BOUNDS: {
+        float *b = reinterpret_cast<float *>(static_cast<char *>(base) + f->offset);
+        ImGui::PushID(f->display_name);
+        ImGui::TextUnformatted(f->display_name);
+        ImGui::Indent();
+        if (ImGui::DragFloat3("Center##bounds",  b,     0.05f)) jce_state_track_edit();
+        if (ImGui::DragFloat3("Extents##bounds", b + 3, 0.05f)) jce_state_track_edit();
+        ImGui::Unindent();
+        ImGui::PopID();
+    } break;
+    case JCE_FT_LAYER_MASK: {
+        uint32_t *mask = reinterpret_cast<uint32_t *>(static_cast<char *>(base) + f->offset);
+        const char *const *names = f->enum_labels;  /* optional layer names */
+        char preview[64] = "Nothing";
+        if (*mask == 0xFFFFFFFFu)      snprintf(preview, sizeof(preview), "Everything");
+        else if (*mask != 0) {
+            int shown = 0;
+            size_t off = 0;
+            for (int i = 0; i < 32 && shown < 3; ++i) {
+                if (!(*mask & (1u << i))) continue;
+                const char *n = (names && names[i] && names[i][0]) ? names[i] : "Layer";
+                int w = snprintf(preview + off, sizeof(preview) - off,
+                                  "%s%s", shown ? ", " : "", n);
+                if (w < 0) break;
+                off += (size_t)w;
+                shown++;
+            }
+        }
+        if (ImGui::BeginCombo(f->display_name, preview)) {
+            if (ImGui::Selectable("Everything", *mask == 0xFFFFFFFFu)) {
+                *mask = 0xFFFFFFFFu; jce_state_track_edit();
+            }
+            if (ImGui::Selectable("Nothing", *mask == 0)) {
+                *mask = 0; jce_state_track_edit();
+            }
+            ImGui::Separator();
+            for (int i = 0; i < 32; ++i) {
+                const char *n = (names && names[i] && names[i][0]) ? names[i] : nullptr;
+                if (!n) continue;
+                bool on = (*mask & (1u << i)) != 0;
+                if (ImGui::Checkbox(n, &on)) {
+                    if (on) *mask |=  (1u << i);
+                    else    *mask &= ~(1u << i);
+                    jce_state_track_edit();
+                }
+            }
+            ImGui::EndCombo();
+        }
+    } break;
+    case JCE_FT_TAG: {
+        char *tag = reinterpret_cast<char *>(static_cast<char *>(base) + f->offset);
+        const char *const *tag_names = f->enum_labels;  /* NULL-terminated */
+        if (ImGui::BeginCombo(f->display_name, tag[0] ? tag : "Untagged")) {
+            if (ImGui::Selectable("Untagged", tag[0] == '\0')) {
+                tag[0] = '\0'; jce_state_track_edit();
+            }
+            ImGui::Separator();
+            if (tag_names) {
+                for (int i = 0; tag_names[i]; ++i) {
+                    bool sel = (std::strncmp(tag, tag_names[i], f->size) == 0);
+                    if (ImGui::Selectable(tag_names[i], sel)) {
+                        std::strncpy(tag, tag_names[i], f->size - 1);
+                        tag[f->size - 1] = '\0';
+                        jce_state_track_edit();
+                    }
+                }
+            }
+            ImGui::EndCombo();
+        }
+    } break;
     default:
         ImGui::TextDisabled("%s", jce_editor_i18n("reflect.label.unsupportedField"));
         break;

@@ -13,6 +13,7 @@ extern "C" {
 #endif
 
 #include <jce/middleware/animation/jce_animation.h>
+#include <jce/middleware/animation/jce_anim_clip_events.h>
 #include <jce/middleware/animation/jce_anim_curve.h>
 #include <jce/middleware/animation/jce_anim_curve_serial.h>
 #include <jce/middleware/animation/jce_anim_layers.h>

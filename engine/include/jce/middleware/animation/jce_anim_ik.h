@@ -100,22 +100,22 @@ typedef struct {
     uint32_t id;         /* user-defined event id (e.g. footstep, hitbox-on) */
     float    f0, f1;     /* small payload (avoid heap) */
     int      i0;
-} JceAnimEvent;
+} JceAnimIkEvent;
 
 typedef struct {
-    JceAnimEvent *events; /* externally owned; sorted by time */
-    int           count;
-    float         clip_duration;
-} JceAnimEventTrack;
+    JceAnimIkEvent *events; /* externally owned; sorted by time */
+    int             count;
+    float           clip_duration;
+} JceAnimIkEventTrack;
 
-typedef void (*JceAnimEventFn)(const JceAnimEvent *ev, void *user);
+typedef void (*JceAnimIkEventFn)(const JceAnimIkEvent *ev, void *user);
 
 /* Fire callbacks for events in the (prev_t, cur_t] interval, supporting
    wrap-around when cur_t < prev_t (looped clip). */
 JCE_API void JCE_CALL
-jce_anim_events_advance(const JceAnimEventTrack *track,
+jce_anim_events_advance(const JceAnimIkEventTrack *track,
                         float prev_t, float cur_t,
-                        JceAnimEventFn fn, void *user);
+                        JceAnimIkEventFn fn, void *user);
 
 JCE_EXTERN_C_END
 

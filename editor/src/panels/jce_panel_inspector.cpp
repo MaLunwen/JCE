@@ -177,6 +177,36 @@ static void *comp_get_ptr_and_size(JceScene *scene, JceEntity e,
     case JCE_COMP_FLAG_UI_BUTTON:
         *out_size = sizeof(JceUIButtonComponent);
         return jce_scene_get_ui_button(scene, e);
+    case JCE_COMP_FLAG_UI_TOGGLE:
+        *out_size = sizeof(JceUIToggleComponent);
+        return jce_scene_get_ui_toggle(scene, e);
+    case JCE_COMP_FLAG_UI_SLIDER:
+        *out_size = sizeof(JceUISliderComponent);
+        return jce_scene_get_ui_slider(scene, e);
+    case JCE_COMP_FLAG_UI_DROPDOWN:
+        *out_size = sizeof(JceUIDropdownComponent);
+        return jce_scene_get_ui_dropdown(scene, e);
+    case JCE_COMP_FLAG_UI_INPUT_FIELD:
+        *out_size = sizeof(JceUIInputFieldComponent);
+        return jce_scene_get_ui_input_field(scene, e);
+    case JCE_COMP_FLAG_UI_RAW_IMAGE:
+        *out_size = sizeof(JceUIRawImageComponent);
+        return jce_scene_get_ui_raw_image(scene, e);
+    case JCE_COMP_FLAG_UI_OUTLINE_EFFECT:
+        *out_size = sizeof(JceUIOutlineEffect);
+        return jce_scene_get_ui_outline_effect(scene, e);
+    case JCE_COMP_FLAG_UI_SHADOW_EFFECT:
+        *out_size = sizeof(JceUIShadowEffect);
+        return jce_scene_get_ui_shadow_effect(scene, e);
+    case JCE_COMP_FLAG_POINT_LIGHT_2D:
+        *out_size = sizeof(JcePointLight2DComponent);
+        return jce_scene_get_point_light_2d(scene, e);
+    case JCE_COMP_FLAG_SPOT_LIGHT_2D:
+        *out_size = sizeof(JceSpotLight2DComponent);
+        return jce_scene_get_spot_light_2d(scene, e);
+    case JCE_COMP_FLAG_GLOBAL_LIGHT_2D:
+        *out_size = sizeof(JceGlobalLight2DComponent);
+        return jce_scene_get_global_light_2d(scene, e);
     default:
         *out_size = 0;
         return NULL;
@@ -1839,6 +1869,138 @@ static void draw_comp_ui_button(JceUIButtonComponent *bt)
     ImGui::InputText(jce_editor_i18n_id("inspector.uib.onClickHandler", "uib"), bt->on_click_handler, sizeof bt->on_click_handler); insp_track_edit();
 }
 
+static void draw_comp_ui_toggle(JceUIToggleComponent *t)
+{
+    if (!t) return;
+    if (ImGui::Checkbox("Interactable##uit", &t->interactable)) insp_undo_bool(&t->interactable);
+    if (ImGui::Checkbox("Is On##uit",        &t->is_on))        insp_undo_bool(&t->is_on);
+    if (ImGui::InputInt ("Group ID##uit",     &t->group_id))    insp_track_edit();
+    ImGui::DragFloat   ("Fade Duration##uit", &t->fade_duration, 0.01f, 0.0f, 5.0f); insp_track_edit();
+    ImGui::InputText   ("On Value Changed##uit", t->on_value_changed, sizeof t->on_value_changed); insp_track_edit();
+}
+
+static void draw_comp_ui_slider(JceUISliderComponent *sl)
+{
+    if (!sl) return;
+    if (ImGui::Checkbox ("Interactable##uisl", &sl->interactable)) insp_undo_bool(&sl->interactable);
+    ImGui::DragFloat    ("Min Value##uisl",    &sl->min_value, 0.1f); insp_track_edit();
+    ImGui::DragFloat    ("Max Value##uisl",    &sl->max_value, 0.1f); insp_track_edit();
+    if (sl->min_value > sl->max_value) sl->max_value = sl->min_value;
+    ImGui::SliderFloat  ("Value##uisl",        &sl->value, sl->min_value, sl->max_value); insp_track_edit();
+    if (ImGui::Checkbox ("Whole Numbers##uisl",&sl->whole_numbers)) insp_undo_bool(&sl->whole_numbers);
+    const char *dir_items[] = { "Left→Right", "Right→Left", "Bottom→Top", "Top→Bottom" };
+    if (ImGui::Combo("Direction##uisl",        &sl->direction, dir_items, 4)) insp_track_edit();
+    ImGui::InputText    ("On Value Changed##uisl", sl->on_value_changed, sizeof sl->on_value_changed); insp_track_edit();
+}
+
+static void draw_comp_ui_dropdown(JceUIDropdownComponent *d)
+{
+    if (!d) return;
+    if (ImGui::Checkbox("Interactable##uid", &d->interactable)) insp_undo_bool(&d->interactable);
+    ImGui::Text("Selected Index: %d", d->value);
+    int oc = (int)d->option_count;
+    if (ImGui::InputInt("Option Count##uid", &oc)) {
+        if (oc < 0) oc = 0;
+        if (oc > JCE_UI_DROPDOWN_MAX_OPTIONS) oc = JCE_UI_DROPDOWN_MAX_OPTIONS;
+        d->option_count = (int)oc;
+        insp_track_edit();
+    }
+    for (int i = 0; i < d->option_count; ++i) {
+        char label[32];
+        snprintf(label, sizeof(label), "Option %d##uid_o", i);
+        ImGui::InputText(label, d->options[i], sizeof d->options[i]); insp_track_edit();
+    }
+    ImGui::InputText("On Value Changed##uid", d->on_value_changed, sizeof d->on_value_changed); insp_track_edit();
+}
+
+static void draw_comp_ui_input_field(JceUIInputFieldComponent *f)
+{
+    if (!f) return;
+    if (ImGui::Checkbox("Interactable##uif", &f->interactable)) insp_undo_bool(&f->interactable);
+    ImGui::InputInt    ("Character Limit##uif", &f->character_limit); insp_track_edit();
+    const char *ct_items[] = { "Standard", "Integer", "Decimal", "Email", "Password" };
+    if (ImGui::Combo   ("Content Type##uif", &f->content_type, ct_items, 5)) insp_track_edit();
+    if (ImGui::Checkbox("Read Only##uif",   &f->read_only))  insp_undo_bool(&f->read_only);
+    if (ImGui::Checkbox("Multi Line##uif",  &f->multi_line)) insp_undo_bool(&f->multi_line);
+    ImGui::InputText   ("Text##uif",         f->text,        sizeof f->text); insp_track_edit();
+    ImGui::InputText   ("Placeholder##uif",  f->placeholder, sizeof f->placeholder); insp_track_edit();
+    ImGui::InputText   ("On Value Changed##uif", f->on_value_changed, sizeof f->on_value_changed); insp_track_edit();
+    ImGui::InputText   ("On End Edit##uif",      f->on_end_edit,      sizeof f->on_end_edit); insp_track_edit();
+}
+
+static void draw_comp_ui_raw_image(JceUIRawImageComponent *r)
+{
+    if (!r) return;
+    ImGui::InputText    ("Texture Path##uiri", r->texture_path, sizeof r->texture_path); insp_track_edit();
+    ImGui::DragFloat2   ("UV Min (u0,v0)##uiri", r->uv_rect,     0.01f); insp_track_edit();
+    ImGui::DragFloat2   ("UV Max (u1,v1)##uiri", r->uv_rect + 2, 0.01f); insp_track_edit();
+    if (ImGui::ColorEdit4("Color##uiri",      r->color))           insp_track_edit();
+    if (ImGui::Checkbox ("Preserve Aspect##uiri", &r->preserve_aspect)) insp_undo_bool(&r->preserve_aspect);
+}
+
+static void draw_comp_ui_outline_effect(JceUIOutlineEffect *o)
+{
+    if (!o) return;
+    if (ImGui::ColorEdit4("Color##uioe",          o->effect_color))     insp_track_edit();
+    ImGui::DragFloat2   ("Distance##uioe",        o->effect_distance, 0.5f); insp_track_edit();
+    if (ImGui::Checkbox ("Use Graphic Alpha##uioe", &o->use_graphic_alpha)) insp_undo_bool(&o->use_graphic_alpha);
+}
+
+static void draw_comp_ui_shadow_effect(JceUIShadowEffect *o)
+{
+    if (!o) return;
+    if (ImGui::ColorEdit4("Color##uise",          o->effect_color))     insp_track_edit();
+    ImGui::DragFloat2   ("Distance##uise",        o->effect_distance, 0.5f); insp_track_edit();
+    if (ImGui::Checkbox ("Use Graphic Alpha##uise", &o->use_graphic_alpha)) insp_undo_bool(&o->use_graphic_alpha);
+}
+
+static void draw_comp_point_light_2d(JcePointLight2DComponent *p)
+{
+    if (!p) return;
+    if (ImGui::ColorEdit4("Color##pl2d",       p->color))            insp_track_edit();
+    ImGui::DragFloat    ("Intensity##pl2d",    &p->intensity,    0.05f); insp_track_edit();
+    ImGui::DragFloat    ("Outer Radius##pl2d", &p->outer_radius, 0.1f, 0.0f, 100.0f); insp_track_edit();
+    ImGui::DragFloat    ("Inner Radius##pl2d", &p->inner_radius, 0.1f, 0.0f, p->outer_radius); insp_track_edit();
+    int mask = (int)p->target_layer_mask;
+    if (ImGui::InputInt ("Layer Mask##pl2d", &mask, 0)) {
+        p->target_layer_mask = (uint32_t)mask; insp_track_edit();
+    }
+    const char *blend_items[] = { "Additive", "Multiply" };
+    if (ImGui::Combo    ("Blend##pl2d",        &p->blend, blend_items, 2)) insp_track_edit();
+    if (ImGui::Checkbox ("Volumetric##pl2d",   &p->volumetric)) insp_undo_bool(&p->volumetric);
+}
+
+static void draw_comp_spot_light_2d(JceSpotLight2DComponent *p)
+{
+    if (!p) return;
+    if (ImGui::ColorEdit4("Color##sl2d",       p->color))            insp_track_edit();
+    ImGui::DragFloat    ("Intensity##sl2d",    &p->intensity,    0.05f); insp_track_edit();
+    ImGui::DragFloat    ("Outer Radius##sl2d", &p->outer_radius, 0.1f, 0.0f, 100.0f); insp_track_edit();
+    ImGui::DragFloat    ("Inner Radius##sl2d", &p->inner_radius, 0.1f, 0.0f, p->outer_radius); insp_track_edit();
+    ImGui::DragFloat    ("Inner Angle##sl2d",  &p->inner_angle_deg, 1.0f, 0.0f, 180.0f); insp_track_edit();
+    ImGui::DragFloat    ("Outer Angle##sl2d",  &p->outer_angle_deg, 1.0f, p->inner_angle_deg, 180.0f); insp_track_edit();
+    int mask = (int)p->target_layer_mask;
+    if (ImGui::InputInt ("Layer Mask##sl2d", &mask, 0)) {
+        p->target_layer_mask = (uint32_t)mask; insp_track_edit();
+    }
+    const char *blend_items[] = { "Additive", "Multiply" };
+    if (ImGui::Combo    ("Blend##sl2d",        &p->blend, blend_items, 2)) insp_track_edit();
+    if (ImGui::Checkbox ("Volumetric##sl2d",   &p->volumetric)) insp_undo_bool(&p->volumetric);
+}
+
+static void draw_comp_global_light_2d(JceGlobalLight2DComponent *p)
+{
+    if (!p) return;
+    if (ImGui::ColorEdit4("Color##gl2d",       p->color)) insp_track_edit();
+    ImGui::DragFloat    ("Intensity##gl2d",    &p->intensity, 0.05f, 0.0f, 4.0f); insp_track_edit();
+    int mask = (int)p->target_layer_mask;
+    if (ImGui::InputInt ("Layer Mask##gl2d", &mask, 0)) {
+        p->target_layer_mask = (uint32_t)mask; insp_track_edit();
+    }
+    const char *blend_items[] = { "Additive", "Multiply" };
+    if (ImGui::Combo    ("Blend##gl2d",        &p->blend, blend_items, 2)) insp_track_edit();
+}
+
 /* ── Component header / settings popup helper ─────────────────────── */
 
 /* Returns true if the component's body should be drawn this frame.
@@ -2403,6 +2565,26 @@ static void draw_one_component_section(uint32_t focused,
                  draw_comp_ui_text(jce_scene_get_ui_text(scene, ecs_e)));
         JCE_DRAW(JCE_COMP_FLAG_UI_BUTTON,
                  draw_comp_ui_button(jce_scene_get_ui_button(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_UI_TOGGLE,
+                 draw_comp_ui_toggle(jce_scene_get_ui_toggle(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_UI_SLIDER,
+                 draw_comp_ui_slider(jce_scene_get_ui_slider(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_UI_DROPDOWN,
+                 draw_comp_ui_dropdown(jce_scene_get_ui_dropdown(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_UI_INPUT_FIELD,
+                 draw_comp_ui_input_field(jce_scene_get_ui_input_field(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_UI_RAW_IMAGE,
+                 draw_comp_ui_raw_image(jce_scene_get_ui_raw_image(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_UI_OUTLINE_EFFECT,
+                 draw_comp_ui_outline_effect(jce_scene_get_ui_outline_effect(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_UI_SHADOW_EFFECT,
+                 draw_comp_ui_shadow_effect(jce_scene_get_ui_shadow_effect(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_POINT_LIGHT_2D,
+                 draw_comp_point_light_2d(jce_scene_get_point_light_2d(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_SPOT_LIGHT_2D,
+                 draw_comp_spot_light_2d(jce_scene_get_spot_light_2d(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_GLOBAL_LIGHT_2D,
+                 draw_comp_global_light_2d(jce_scene_get_global_light_2d(scene, ecs_e)));
         default: break;
     }
 #undef JCE_DRAW

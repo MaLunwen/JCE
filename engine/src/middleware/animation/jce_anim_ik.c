@@ -110,9 +110,9 @@ jce_anim_ik_two_bone_solve(const JceIkTwoBoneInput *in, JceIkTwoBoneOutput *out)
 /* ────────── Event dispatch ────────── */
 
 JCE_API void JCE_CALL
-jce_anim_events_advance(const JceAnimEventTrack *track,
+jce_anim_events_advance(const JceAnimIkEventTrack *track,
                         float prev_t, float cur_t,
-                        JceAnimEventFn fn, void *user)
+                        JceAnimIkEventFn fn, void *user)
 {
     if (!track || !fn || track->count <= 0 || !track->events) return;
     if (prev_t == cur_t) return;
