@@ -13,6 +13,7 @@
 
 #include "core/jce_editor_config.h"
 #include "core/jce_hotkeys.h"
+#include "core/jce_assetdb.h"
 #include "jce_panel_assets_internal.h"
 #include "scene/jce_asset_path_index.h"
 
@@ -169,6 +170,12 @@ void ensure_assets_init(void)
         !is_filesystem_root(s_assets.project_root.c_str())) {
         jce_asset_path_index_clear();
         jce_asset_path_index_rebuild(s_assets.project_root.c_str());
+        /* Mirror the resolved root into the editor-wide asset DB so the
+         * in-modal asset picker (and any other consumer that queries
+         * jce_assetdb_*) sees the same content as this browser even
+         * when the user launched a standalone scene/bundle without
+         * going through Open Project. */
+        jce_assetdb_set_root(s_assets.project_root.c_str());
     }
 }
 
@@ -535,6 +542,7 @@ void jce_editor_assets_set_project(const char *path)
      * switch — fast even on large packs (~10k files). */
     jce_asset_path_index_clear();
     jce_asset_path_index_rebuild(normalized.c_str());
+    jce_assetdb_set_root(normalized.c_str());
 }
 
 const char *jce_editor_assets_get_project(void)
@@ -846,7 +854,7 @@ void jce_editor_panel_assets(void)
 
     char title[256];
     snprintf(title, sizeof(title), "%s###assets", jce_editor_i18n("assetBrowser.title"));
-    if (ImGui::Begin(title, vis))
+    if (ImGui::Begin(title, vis, ImGuiWindowFlags_NoFocusOnAppearing))
         jce_editor_panel_assets_content();
     ImGui::End();
 }

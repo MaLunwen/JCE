@@ -23,6 +23,8 @@
 #include "io/jce_editor_file_util.h"
 
 #include <jce/tools/jce_imgui.hpp>
+#include "dialogs/jce_path_input.h"
+#include "core/jce_assetdb.h"
 extern "C" {
 #include <jce/os/core/jce_json.h>
 }
@@ -139,7 +141,7 @@ ImU32 brush_color(int brush)
 void draw_palette_pane(void)
 {
     ImGui::TextUnformatted(jce_editor_i18n("tilePalette.spritesAsset"));
-    ImGui::InputText("##sprlnk", s.sprites_path, sizeof(s.sprites_path));
+    jce_draw_path_input_asset("##sprlnk", s.sprites_path, sizeof(s.sprites_path), JCE_ASSET_KIND_DATA);
     if (ImGui::Button(jce_editor_i18n("tilePalette.refreshPalette"))) load_palette_count();
     ImGui::TextDisabled("%s: %d", jce_editor_i18n("tilePalette.tileCount"),
                         s.palette_count);
@@ -177,7 +179,7 @@ void draw_palette_pane(void)
 
     ImGui::Separator();
     ImGui::TextUnformatted(jce_editor_i18n("tilePalette.persist"));
-    ImGui::InputText("##mp", s.tilemap_path, sizeof(s.tilemap_path));
+    jce_draw_path_input_asset("##mp", s.tilemap_path, sizeof(s.tilemap_path), JCE_ASSET_KIND_DATA);
     if (ImGui::Button(jce_editor_i18n("tilePalette.save"))) save_map();
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("tilePalette.load"))) load_map();
@@ -266,7 +268,7 @@ extern "C" void jce_editor_panel_tile_palette(void)
     char wt[96];
     std::snprintf(wt, sizeof(wt), "%s###jce_tile_palette",
                   jce_editor_i18n("tilePalette.title"));
-    if (ImGui::Begin(wt, vis)) {
+    if (ImGui::Begin(wt, vis, ImGuiWindowFlags_NoFocusOnAppearing)) {
         jce_editor_panel_tile_palette_content();
     }
     ImGui::End();

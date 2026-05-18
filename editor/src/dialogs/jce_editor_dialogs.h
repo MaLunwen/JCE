@@ -33,12 +33,21 @@ void jce_editor_dialog_new_scene(bool *p_open);
 /* Open Scene dialog. */
 void jce_editor_dialog_open_scene(bool *p_open);
 
+/* Open a packed .jbundle / bundle_catalog.json for scene preview. */
+void jce_editor_dialog_open_bundle(bool *p_open);
+
 /* Unsaved Changes dialog.
    result: 0 = pending, 1 = save, 2 = don't save, 3 = cancel. */
 void jce_editor_dialog_unsaved_changes(bool *p_open, int *result);
 
 /* Build Settings dialog (CMake preset launcher). */
 void jce_editor_dialog_build_settings(bool *p_open);
+
+/* Build Scene Bundles dialog (jce_bundle_pack launcher). */
+void jce_editor_dialog_bundles(bool *p_open);
+/* Open Build Bundles dialog pre-configured for "Single scene" mode
+ * targeting the currently open scene.  No-op if no scene is loaded. */
+bool jce_editor_dialog_bundles_open_for_current_scene(void);
 
 /* Project Settings dialog (centralized: project / build / run / render / hotkeys). */
 void jce_editor_dialog_project_settings(bool *p_open);

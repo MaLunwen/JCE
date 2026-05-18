@@ -448,52 +448,21 @@ JceTexture asset_cache_get_texture(const char *material_path,
     if (entry->failed)
         return tex_invalid();
 
-    /* If the path points directly to an existing file on disk, bypass the
-     * PAK asset manager entirely and go straight to the async file-based
-     * texture loader.  The editor always works with real filesystem paths
-     * (never packed assets), so this avoids noisy "not found in PAK"
-     * errors for every drag-dropped model texture. */
+    /* The editor resolves scene textures from the project filesystem via
+     * resolve_texture_path_for_material (scene-root joins, basename search,
+     * material JSON, MTL parsing).  A sync PAK acquire is never correct
+     * here: editor scene textures are raw project files, not in the game
+     * PAK.  Attempting one would only produce spurious "not found in PAK"
+     * warnings before the async resolver finds the real file anyway.
+     *
+     * Direct filesystem paths (absolute or CWD-relative) are routed to
+     * texture_async_queue_request; everything else (asset-style relative
+     * paths like "textures/chalet.jpg") goes to the richer resolver. */
     bool is_filesystem_texture = false;
     if (material_path && material_path[0] != '\0'
         && looks_like_texture_asset_path(material_path)) {
         if (path_is_file(material_path))
             is_filesystem_texture = true;
-    }
-
-    if (s_cache.assets && material_path && looks_like_texture_asset_path(material_path)
-        && !is_filesystem_texture) {
-        if (!asset_handle_valid(entry->asset_handle)) {
-            JceAssetLoadParams params = asset_load_params_default();
-            params.texture_sampler_mode = JCE_TEX_WRAP;
-            params.sync = true;
-            entry->asset_handle =
-                jce_asset_acquire(s_cache.assets,
-                                  material_path,
-                                  JCE_ASSET_TEXTURE,
-                                  &params);
-        }
-
-        if (asset_handle_valid(entry->asset_handle)) {
-            JceAssetState state = jce_asset_state(s_cache.assets,
-                                                  entry->asset_handle);
-            if (state == JCE_ASSET_STATE_READY) {
-                JceTexture tex = jce_asset_get_texture(s_cache.assets,
-                                                       entry->asset_handle);
-                if (jce_texture_valid(tex)) {
-                    entry->tex = tex;
-                    entry->tex_from_asset_manager = true;
-                    entry->warned_missing = false;
-                    entry->failed = false;
-                    return tex;
-                }
-            } else if (state == JCE_ASSET_STATE_FAILED
-                    || state == JCE_ASSET_STATE_UNLOADED) {
-                jce_asset_release(s_cache.assets, entry->asset_handle);
-                entry->asset_handle = asset_handle_invalid();
-            } else {
-                return tex_invalid();
-            }
-        }
     }
 
     const uint64_t generation = texture_async_current_generation();

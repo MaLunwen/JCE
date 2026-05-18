@@ -162,27 +162,57 @@ bool jce_model_importer_load_cpu_file(const char *file_path,
     out->index_count = 0;
 
     Assimp::Importer importer;
-    const aiScene *scene = importer.ReadFile(
-        file_path,
-        aiProcess_Triangulate
-        | aiProcess_GenSmoothNormals
-        | aiProcess_FlipUVs
-        | aiProcess_CalcTangentSpace
-        | aiProcess_PreTransformVertices);
+    const aiScene *scene = nullptr;
+
+    /* VFS-first: if an active filesystem override is installed (editor
+     * scene preview from a .jbundle), satisfy the read through it and
+     * hand Assimp an in-memory buffer.  Falls back to direct ReadFile
+     * on miss so on-disk projects keep working unchanged. */
+    void   *vbuf = nullptr;
+    {
+        uint64_t vsz = 0;
+        vbuf = jce_fs_host_read_all(file_path, &vsz);
+        if (vbuf && vsz > 0) {
+            const char *ext = "";
+            const char *dot = strrchr(file_path, '.');
+            if (dot) ext = dot;
+            scene = importer.ReadFileFromMemory(
+                vbuf, (size_t)vsz,
+                aiProcess_Triangulate
+                | aiProcess_GenSmoothNormals
+                | aiProcess_FlipUVs
+                | aiProcess_CalcTangentSpace
+                | aiProcess_PreTransformVertices,
+                ext);
+        }
+    }
+
+    if (!scene) {
+        scene = importer.ReadFile(
+            file_path,
+            aiProcess_Triangulate
+            | aiProcess_GenSmoothNormals
+            | aiProcess_FlipUVs
+            | aiProcess_CalcTangentSpace
+            | aiProcess_PreTransformVertices);
+    }
 
     if (!scene || !scene->mNumMeshes) {
         LOG_ERROR(LOG_TAG, "assimp cpu file load failed: %s  %s",
                   file_path, importer.GetErrorString());
+        if (vbuf) jce_fs_buffer_free(vbuf);
         return false;
     }
 
     if (!build_cpu_mesh_data(scene, out)) {
         LOG_ERROR(LOG_TAG, "cpu mesh conversion failed: %s", file_path);
+        if (vbuf) jce_fs_buffer_free(vbuf);
         return false;
     }
 
     LOG_DEBUG(LOG_TAG, "decoded cpu mesh %s (%u verts, %u tris)",
               file_path, out->vertex_count, out->index_count / 3);
+    if (vbuf) jce_fs_buffer_free(vbuf);
     return true;
 }
 

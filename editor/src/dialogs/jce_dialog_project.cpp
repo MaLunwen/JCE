@@ -289,6 +289,37 @@ void save_file_dialog_async(const char *title,
                               folder_pick_callback_thread_safe, req);
 }
 
+void open_file_dialog_async(const char *title,
+                            const char *default_path,
+                            const char *filters,
+                            char *primary_out, size_t primary_size,
+                            bool *ready_flag,
+                            bool *cancelled_flag)
+{
+    if (!primary_out || primary_size == 0) return;
+
+    FolderPickRequest *req = new FolderPickRequest{};
+    req->primary        = primary_out;
+    req->primary_size   = primary_size;
+    req->secondary      = NULL;
+    req->secondary_size = 0;
+    req->ready_flag     = ready_flag;
+    req->cancelled_flag = cancelled_flag;
+    req->completed      = false;
+    req->cancelled      = false;
+
+    const char *initial = NULL;
+    if (default_path && default_path[0] != '\0')
+        initial = default_path;
+    else if (s_last_browse_folder[0] != '\0')
+        initial = s_last_browse_folder;
+    else if (primary_out[0] != '\0')
+        initial = primary_out;
+
+    jce_host_dialog_pick_file(title, initial, filters,
+                              folder_pick_callback_thread_safe, req);
+}
+
 void jce_editor_dialogs_pump_pending(void)
 {
     /* Move pending requests under the lock, then process outside the lock

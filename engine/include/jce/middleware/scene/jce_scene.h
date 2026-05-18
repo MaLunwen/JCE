@@ -811,6 +811,24 @@ typedef struct JceScene JceScene;
 JCE_API JceScene *jce_scene_create(void);
 JCE_API void      jce_scene_destroy(JceScene *scene);
 
+/*
+ * Clear all user entities from the scene without destroying the scene object.
+ *
+ * Removes every entity that was created via jce_scene_create_entity()
+ * (identified by the presence of a JceTransform component), so callers can
+ * load a different scene file into the same JceScene/renderer pair without
+ * paying the cost of re-registering components and rebuilding asset caches.
+ *
+ * The scene handle, registered component IDs, and any external observers
+ * remain valid after this call.
+ *
+ * Returns the number of entities actually deleted, or -1 on invalid input.
+ *
+ * Typical use: implementing scene transitions (e.g. caged_kingdom level
+ * stitching) where a single director swaps scene content at runtime.
+ */
+JCE_API int       jce_scene_clear(JceScene *scene);
+
 /* Entity management. */
 JCE_API JceEntity jce_scene_create_entity(JceScene *s, const char *name);
 JCE_API void      jce_scene_destroy_entity(JceScene *s, JceEntity e);

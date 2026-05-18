@@ -482,7 +482,7 @@ void jce_editor_panel_console(void)
 
     char title[256];
     snprintf(title, sizeof(title), "%s###console", jce_editor_i18n("console.title"));
-    if (ImGui::Begin(title, vis))
+    if (ImGui::Begin(title, vis, ImGuiWindowFlags_NoFocusOnAppearing))
         jce_editor_panel_console_content();
     ImGui::End();
 }

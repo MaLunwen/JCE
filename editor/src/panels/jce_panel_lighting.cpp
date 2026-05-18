@@ -26,10 +26,13 @@
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_state.h"
+#include "core/jce_project_settings.h"
 
 #include <jce/tools/jce_imgui.hpp>
 #include <cstdio>
 #include <cstring>
+#include "dialogs/jce_path_input.h"
+#include "core/jce_assetdb.h"
 
 extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
@@ -49,6 +52,49 @@ static struct {
     float fog_height_falloff = 0.05f;
     float fog_height_origin = 0.0f;
 } s_light;
+
+static bool s_light_initialized = false;
+
+static void light_ensure_init(void)
+{
+    if (s_light_initialized) return;
+    /* Cache is pre-warmed by jce_editor_init; this is a pointer read, no disk I/O. */
+    const JceProjectSettings *ps = jce_project_settings_current();
+    if (ps) {
+        s_light.ambient_color[0] = ps->rendering.ambient_color[0];
+        s_light.ambient_color[1] = ps->rendering.ambient_color[1];
+        s_light.ambient_color[2] = ps->rendering.ambient_color[2];
+        s_light.ambient_intensity  = ps->rendering.ambient_intensity;
+        s_light.fog_enabled        = ps->rendering.fog_enabled;
+        s_light.fog_color[0]       = ps->rendering.fog_color[0];
+        s_light.fog_color[1]       = ps->rendering.fog_color[1];
+        s_light.fog_color[2]       = ps->rendering.fog_color[2];
+        s_light.fog_density        = ps->rendering.fog_density;
+        s_light.fog_height_falloff = ps->rendering.fog_height_falloff;
+        s_light.fog_height_origin  = ps->rendering.fog_height_origin;
+    }
+    s_light_initialized = true;
+}
+
+static void light_save_to_project_settings(void)
+{
+    /* Use the cached snapshot as base to avoid a disk read per panel change. */
+    const JceProjectSettings *cur = jce_project_settings_current();
+    JceProjectSettings ps;
+    if (cur) ps = *cur; else jce_project_settings_defaults(&ps);
+    ps.rendering.ambient_color[0]   = s_light.ambient_color[0];
+    ps.rendering.ambient_color[1]   = s_light.ambient_color[1];
+    ps.rendering.ambient_color[2]   = s_light.ambient_color[2];
+    ps.rendering.ambient_intensity  = s_light.ambient_intensity;
+    ps.rendering.fog_enabled        = s_light.fog_enabled;
+    ps.rendering.fog_color[0]       = s_light.fog_color[0];
+    ps.rendering.fog_color[1]       = s_light.fog_color[1];
+    ps.rendering.fog_color[2]       = s_light.fog_color[2];
+    ps.rendering.fog_density        = s_light.fog_density;
+    ps.rendering.fog_height_falloff = s_light.fog_height_falloff;
+    ps.rendering.fog_height_origin  = s_light.fog_height_origin;
+    jce_project_settings_save(&ps);
+}
 
 /* ── Helpers ────────────────────────────────────────────────────────── */
 
@@ -81,11 +127,11 @@ static void ping_entity(uint32_t id)
 
 /* ── Section drawers ────────────────────────────────────────────────── */
 
-static void draw_env_section(JceScene *scene, const LightCollect &c)
+static bool draw_env_section(JceScene *scene, const LightCollect &c)
 {
     if (!ImGui::CollapsingHeader(jce_editor_i18n("lighting.section.env"),
                                  ImGuiTreeNodeFlags_DefaultOpen))
-        return;
+        return false;
 
     ImGui::TextDisabled("%s", jce_editor_i18n("lighting.skybox"));
     if (c.has_skybox) {
@@ -97,7 +143,7 @@ static void draw_env_section(JceScene *scene, const LightCollect &c)
             ImGui::SameLine();
             if (ImGui::SmallButton(jce_editor_i18n("lighting.ping")))
                 ping_entity(c.skybox);
-            ImGui::InputText(jce_editor_i18n("skybox.hdrPath"),
+            jce_draw_path_input_asset(jce_editor_i18n("skybox.hdrPath"),
                              sky->hdr_path, sizeof(sky->hdr_path));
             ImGui::DragFloat(jce_editor_i18n("skybox.rotation"),
                              &sky->rotation, 1.0f, 0.0f, 360.0f, "%.1f deg");
@@ -113,10 +159,12 @@ static void draw_env_section(JceScene *scene, const LightCollect &c)
 
     ImGui::Spacing();
     ImGui::TextDisabled("%s", jce_editor_i18n("lighting.ambient"));
-    ImGui::ColorEdit3(jce_editor_i18n("lighting.ambientColor"),
-                      s_light.ambient_color);
-    ImGui::DragFloat(jce_editor_i18n("lighting.ambientIntensity"),
+    bool changed = false;
+    changed |= ImGui::ColorEdit3(jce_editor_i18n("lighting.ambientColor"),
+                                  s_light.ambient_color);
+    changed |= ImGui::DragFloat(jce_editor_i18n("lighting.ambientIntensity"),
                      &s_light.ambient_intensity, 0.01f, 0.0f, 4.0f);
+    return changed;
 }
 
 static void draw_lights_section(JceScene *scene, const LightCollect &c)
@@ -211,34 +259,39 @@ static void draw_lights_section(JceScene *scene, const LightCollect &c)
     }
 }
 
-static void draw_fog_section(void)
+static bool draw_fog_section(void)
 {
     if (!ImGui::CollapsingHeader(jce_editor_i18n("lighting.section.fog")))
-        return;
-    ImGui::Checkbox(jce_editor_i18n("lighting.fog.enabled"), &s_light.fog_enabled);
+        return false;
+    bool changed = false;
+    changed |= ImGui::Checkbox(jce_editor_i18n("lighting.fog.enabled"), &s_light.fog_enabled);
     ImGui::BeginDisabled(!s_light.fog_enabled);
-    ImGui::ColorEdit3(jce_editor_i18n("lighting.fog.color"), s_light.fog_color);
-    ImGui::DragFloat(jce_editor_i18n("lighting.fog.density"),
+    changed |= ImGui::ColorEdit3(jce_editor_i18n("lighting.fog.color"), s_light.fog_color);
+    changed |= ImGui::DragFloat(jce_editor_i18n("lighting.fog.density"),
                      &s_light.fog_density, 0.001f, 0.0f, 1.0f, "%.4f");
-    ImGui::DragFloat(jce_editor_i18n("lighting.fog.heightFalloff"),
+    changed |= ImGui::DragFloat(jce_editor_i18n("lighting.fog.heightFalloff"),
                      &s_light.fog_height_falloff, 0.001f, 0.0f, 1.0f, "%.4f");
-    ImGui::DragFloat(jce_editor_i18n("lighting.fog.heightOrigin"),
+    changed |= ImGui::DragFloat(jce_editor_i18n("lighting.fog.heightOrigin"),
                      &s_light.fog_height_origin, 0.1f);
     ImGui::EndDisabled();
     ImGui::TextDisabled("(%s)", jce_editor_i18n("lighting.fog.note"));
+    return changed;
 }
 
 /* ── Public entry points ────────────────────────────────────────────── */
 
 extern "C" void jce_editor_panel_lighting_content(void)
 {
+    light_ensure_init();
     JceScene *scene = jce_state_get_scene();
     LightCollect c{};
     if (scene) jce_scene_each_entity(scene, collect_cb, &c);
 
-    draw_env_section(scene, c);
+    bool changed = false;
+    changed |= draw_env_section(scene, c);
     draw_lights_section(scene, c);
-    draw_fog_section();
+    changed |= draw_fog_section();
+    if (changed) light_save_to_project_settings();
 }
 
 extern "C" void jce_editor_panel_lighting(void)
@@ -247,7 +300,7 @@ extern "C" void jce_editor_panel_lighting(void)
     if (!vis || !*vis) return;
     char lbl[128];
     snprintf(lbl, sizeof(lbl), "%s###lighting", jce_editor_i18n("lighting.title"));
-    if (ImGui::Begin(lbl, vis))
+    if (ImGui::Begin(lbl, vis, ImGuiWindowFlags_NoFocusOnAppearing))
         jce_editor_panel_lighting_content();
     ImGui::End();
 }
@@ -256,6 +309,10 @@ extern "C" void jce_editor_panel_lighting(void)
 
 extern "C" bool jce_editor_lighting_get_fog_enabled(void)
 {
+    /* Fog preview is gated by the Lighting panel being open, so closing
+     * the panel immediately removes fog from the viewport. */
+    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_LIGHTING);
+    if (!vis || !*vis) return false;
     return s_light.fog_enabled;
 }
 
@@ -269,6 +326,12 @@ extern "C" void jce_editor_lighting_get_fog_params(JceVolumetricFogParams *out)
     out->density        = s_light.fog_density;
     out->height_falloff = s_light.fog_height_falloff;
     out->height_origin  = s_light.fog_height_origin;
+}
+
+extern "C" void jce_editor_panel_lighting_tick(void)
+{
+    /* Fog/ambient queries already gate on panel visibility, so no
+     * push-side reconciliation is needed here. */
 }
 
 extern "C" void jce_editor_lighting_get_ambient(float out_color_rgb[3], float *out_intensity)

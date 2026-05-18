@@ -13,6 +13,7 @@
 
 #include "jce_editor_dialogs.h"
 #include "jce_editor_dialogs_internal.h"
+#include "jce_path_input.h"
 #include "ui/jce_editor_style.h"
 #include "core/jce_hotkeys.h"
 #include "core/jce_project_settings.h"
@@ -530,8 +531,8 @@ void draw_player_page()
     DIRTY_IF(ImGui::InputText(jce_editor_i18n("projectSettings.player.productName"), p.product_name, JCE_PS_NAME_LEN));
     DIRTY_IF(ImGui::InputText(jce_editor_i18n("projectSettings.player.version"),      p.version,      sizeof(p.version)));
     ImGui::Spacing();
-    DIRTY_IF(ImGui::InputText(jce_editor_i18n("projectSettings.player.defaultIconPath"),   p.default_icon_path,   JCE_PS_PATH_LEN));
-    DIRTY_IF(ImGui::InputText(jce_editor_i18n("projectSettings.player.defaultCursorPath"), p.default_cursor_path, JCE_PS_PATH_LEN));
+    DIRTY_IF(jce_draw_path_input_asset(jce_editor_i18n("projectSettings.player.defaultIconPath"),   p.default_icon_path,   JCE_PS_PATH_LEN));
+    DIRTY_IF(jce_draw_path_input_asset(jce_editor_i18n("projectSettings.player.defaultCursorPath"), p.default_cursor_path, JCE_PS_PATH_LEN));
     DIRTY_IF(ImGui::ColorEdit3(jce_editor_i18n("projectSettings.player.splashBgColor"),    p.splash_bg_color));
     DIRTY_IF(ImGui::Checkbox(jce_editor_i18n("projectSettings.player.showSplash"),         &p.show_splash));
     DIRTY_IF(ImGui::Checkbox(jce_editor_i18n("projectSettings.player.runInBackground"),   &p.run_in_background));
@@ -567,7 +568,7 @@ void draw_preset_manager_page()
             DIRTY_IF(ImGui::InputText("##ct", pm.bindings[i].component_type, JCE_PS_NAME_LEN));
             ImGui::TableSetColumnIndex(1);
             ImGui::SetNextItemWidth(-1);
-            DIRTY_IF(ImGui::InputText("##pp", pm.bindings[i].preset_path, JCE_PS_PATH_LEN));
+            DIRTY_IF(jce_draw_path_input_asset("##pp", pm.bindings[i].preset_path, JCE_PS_PATH_LEN));
             ImGui::TableSetColumnIndex(2);
             ImGui::SetNextItemWidth(-1);
             DIRTY_IF(ImGui::InputText("##ft", pm.bindings[i].filter, JCE_PS_NAME_LEN));

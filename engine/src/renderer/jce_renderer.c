@@ -121,6 +121,8 @@ bool jce_renderer_is_egl_hung(void)
 {
     return SDL_GetAtomicInt(&s_egl_hung) != 0;
 }
+#else  /* !JCE_PLATFORM_ANDROID — stub: EGL hang detection is Android-only */
+bool jce_renderer_is_egl_hung(void) { return false; }
 #endif /* JCE_PLATFORM_ANDROID */
 #if JCE_PLATFORM_WINDOWS
 /* Windows backend probe uses SDL_LoadObject for vulkan/d3d DLL presence —
@@ -433,6 +435,7 @@ static bgfx_renderer_type_t to_bgfx_type(enum JceRendererBackend b)
     case JCE_BACKEND_OPENGL:   return BGFX_RENDERER_TYPE_OPENGL;
     case JCE_BACKEND_OPENGLES: return BGFX_RENDERER_TYPE_OPENGLES;
     case JCE_BACKEND_METAL:    return BGFX_RENDERER_TYPE_METAL;
+    case JCE_BACKEND_NOOP:     return BGFX_RENDERER_TYPE_NOOP;
     default:                   return BGFX_RENDERER_TYPE_COUNT; /* auto */
     }
 }
@@ -477,6 +480,24 @@ JceRenderer *jce_renderer_create(JceWindow *win,
                                   const JceRendererConfig *cfg)
 {
     if (!win || !cfg) return NULL;
+
+    /* Test/diagnostic hook: JCE_FORCE_FALLBACK=1 short-circuits the
+     * entire bgfx init path so the engine drops straight into the
+     * SDL software fallback (the blue/orange info-panel UI in
+     * jce_renderer_render_fallback_frame()).  Use this in caged_kingdom
+     * to exercise the fallback live without needing a broken GPU:
+     *     PowerShell:  $env:JCE_FORCE_FALLBACK=1; .\caged_kingdom.exe
+     *     bash:        JCE_FORCE_FALLBACK=1 ./caged_kingdom
+     * Any non-empty value other than "0" enables it. */
+    {
+        const char *force = getenv("JCE_FORCE_FALLBACK");
+        if (force && force[0] && force[0] != '0') {
+            LOG_WARN(LOG_TAG,
+                "JCE_FORCE_FALLBACK=%s set — skipping bgfx init, "
+                "engine will use SDL software renderer", force);
+            return NULL;
+        }
+    }
 
     /* Retrieve native window handle.
      * On iOS the native handle may become available slightly after window
@@ -791,7 +812,32 @@ JceRenderer *jce_renderer_create_fallback(JceWindow *win)
 
     SDL_Window *sdl_win = jce_window_sdl(win);
 
-    /* 1) Let SDL pick the best available GPU-backed renderer. */
+    /* This path is reached after the entire bgfx fallback chain
+     * (D3D12 → Vulkan → D3D11 → OpenGL on Windows; Vulkan → GL on
+     * Linux; Metal → Vulkan on macOS; Vulkan → GLES on Android) has
+     * been exhausted, which means every GPU driver path on this
+     * machine refused to initialise.  Per the engine policy
+     * (performance → compatibility → safe software), we go straight
+     * to SDL's pure-CPU software renderer here so the user always
+     * sees the diagnostic UI (the blue/orange info panel painted by
+     * jce_renderer_render_fallback_frame()) instead of risking yet
+     * another hardware-path crash via SDL's HW-accelerated 2D
+     * backends. */
+
+    /* 1) Force the pure CPU software renderer — no GPU touched. */
+    r->sdl_renderer = SDL_CreateRenderer(sdl_win, SDL_SOFTWARE_RENDERER);
+    if (r->sdl_renderer) {
+        snprintf(r->gpu_name, sizeof(r->gpu_name), "Fallback: software (CPU)");
+        LOG_SUCCESS(LOG_TAG, "fallback initialized (software CPU renderer)");
+        return r;
+    }
+    LOG_WARN(LOG_TAG,
+        "SDL software renderer failed: %s — trying SDL auto as last resort",
+        SDL_GetError());
+
+    /* 2) Last-resort: let SDL pick anything it can (HW or SW).  Only
+     * runs if the software renderer itself failed to create, which
+     * normally indicates a deeper SDL/window issue. */
     r->sdl_renderer = SDL_CreateRenderer(sdl_win, NULL);
     if (r->sdl_renderer) {
         snprintf(r->gpu_name, sizeof(r->gpu_name), "Fallback: %s",
@@ -799,16 +845,7 @@ JceRenderer *jce_renderer_create_fallback(JceWindow *win)
         LOG_SUCCESS(LOG_TAG, "fallback initialized (%s)", r->gpu_name);
         return r;
     }
-    LOG_WARN(LOG_TAG, "SDL auto renderer failed: %s — trying software", SDL_GetError());
-
-    /* 2) Force pure CPU software renderer (no GPU needed at all). */
-    r->sdl_renderer = SDL_CreateRenderer(sdl_win, SDL_SOFTWARE_RENDERER);
-    if (r->sdl_renderer) {
-        snprintf(r->gpu_name, sizeof(r->gpu_name), "Fallback: software (CPU)");
-        LOG_SUCCESS(LOG_TAG, "fallback initialized (software CPU renderer)");
-        return r;
-    }
-    LOG_ERROR(LOG_TAG, "SDL software renderer failed: %s", SDL_GetError());
+    LOG_ERROR(LOG_TAG, "SDL auto renderer also failed: %s", SDL_GetError());
 
     JCE_FREE(r);
     return NULL;
@@ -1132,7 +1169,6 @@ void jce_renderer_end_frame(const JceRenderer *r)
         const double now_s = (double)jce_time_ticks_ms() / 1000.0;
         if (now_s - s_last_log_s >= 15.0) {
             s_last_log_s = now_s;
-            LOG_INFO(LOG_TAG, "bgfx_get_stats");
             const bgfx_stats_t *st = bgfx_get_stats();
             if (st) {
                 if (st->numTextures     > s_max_textures)     s_max_textures     = st->numTextures;

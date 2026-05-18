@@ -165,7 +165,8 @@ static JceTexture jce_texture_load_ex_inner(const JcePakArchive *pak,
 
     const JcePakAsset *asset = jce_pak_find(pak, asset_path);
     if (!asset) {
-        LOG_ERROR(LOG_TAG, "not found in PAK: %s", asset_path);
+        /* LOG_DEBUG instead of ERROR — PAK may still be loading or resource deferred. */
+        LOG_DEBUG(LOG_TAG, "not found in PAK (may retry): %s", asset_path);
         return JCE_TEXTURE_INVALID;
     }
 

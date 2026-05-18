@@ -547,7 +547,10 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
      * here we blend rgb in-scatter + transmittance into the bridge.
      * No-op when fog is disabled or composite shader unavailable. */
     if (cfg.fog_enabled && s_sr.scene_renderer) {
-        jce_scene_renderer_composite_fog(s_sr.scene_renderer, scene_view_id());
+        uint16_t fog_composite_view = (uint16_t)(scene_view_id() + 16);
+        uint16_t dst_fb = jce_offscreen_target_get_frame_buffer(s_sr.bridge);
+        jce_scene_renderer_composite_fog(s_sr.scene_renderer,
+                                         fog_composite_view, dst_fb);
     }
 
     /* Tick the world streamer each frame so pending chunk loads are applied

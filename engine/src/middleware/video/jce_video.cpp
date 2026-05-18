@@ -9,6 +9,7 @@
 #include <jce/middleware/video/jce_mp4_parser.h>
 #include <jce/middleware/video/jce_video.h>
 #include <jce/middleware/video/jce_vp8_decode.h>
+#include <jce/middleware/video/jce_vp9_decode.h>
 #include <jce/middleware/video/jce_webm_parser.h>
 
 #include "jce_audio_stream.h"
@@ -70,6 +71,7 @@ typedef struct {
      * Audio is not currently routed through the worker (silent track). */
     JceWebmParser       *webm;
     JceVp8Decoder       *vp8;
+    JceVp9Decoder       *vp9;
     uint8_t             *webm_copy;      /* owned copy of raw WebM stream */
     size_t               webm_copy_size;
     uint64_t             webm_duration_ns;
@@ -1335,6 +1337,16 @@ static bool webm_decoder_open(VideoSlot *slot, const void *data, uint32_t size)
             slot->decoder.webm_copy_size = 0;
             return false;
         }
+    } else if (info.video_codec == JCE_WEBM_VIDEO_VP9) {
+        slot->decoder.vp9 = jce_vp9_decoder_open();
+        if (!slot->decoder.vp9) {
+            jce_webm_close(slot->decoder.webm);
+            slot->decoder.webm = NULL;
+            JCE_FREE(slot->decoder.webm_copy);
+            slot->decoder.webm_copy = NULL;
+            slot->decoder.webm_copy_size = 0;
+            return false;
+        }
     } else if (info.video_codec == JCE_WEBM_VIDEO_AV1) {
         slot->decoder.av1 = jce_av1_open_packet();
         if (!slot->decoder.av1) {
@@ -1346,7 +1358,7 @@ static bool webm_decoder_open(VideoSlot *slot, const void *data, uint32_t size)
             return false;
         }
     } else {
-        LOG_WARN(LOG_TAG, "WebM video codec %d not supported (VP8/AV1 only)",
+        LOG_WARN(LOG_TAG, "WebM video codec %d not supported (VP8/VP9/AV1 only)",
                  (int)info.video_codec);
         jce_webm_close(slot->decoder.webm);
         slot->decoder.webm = NULL;
@@ -1387,6 +1399,9 @@ static bool webm_decoder_read_next(VideoSlot *slot)
     if (slot->decoder.vp8) {
         got = jce_vp8_decode_packet(slot->decoder.vp8, pkt, pkt_sz,
                                     &yp, &ys, &up, &uvs, &vp, &fw, &fh);
+    } else if (slot->decoder.vp9) {
+        got = jce_vp9_decode_packet(slot->decoder.vp9, pkt, pkt_sz,
+                                    &yp, &ys, &up, &uvs, &vp, &fw, &fh);
     } else if (slot->decoder.av1) {
         got = jce_av1_decode_packet(slot->decoder.av1, pkt, pkt_sz,
                                     &yp, &ys, &up, &uvs, &vp, &fw, &fh);
@@ -1416,6 +1431,10 @@ static bool webm_decoder_seek(VideoSlot *slot, double time_sec, bool exact)
         jce_vp8_close(slot->decoder.vp8);
         slot->decoder.vp8 = jce_vp8_decoder_open();
         if (!slot->decoder.vp8) { slot->decoder.ended = true; return false; }
+    } else if (slot->decoder.vp9) {
+        jce_vp9_close(slot->decoder.vp9);
+        slot->decoder.vp9 = jce_vp9_decoder_open();
+        if (!slot->decoder.vp9) { slot->decoder.ended = true; return false; }
     } else if (slot->decoder.av1) {
         jce_av1_close(slot->decoder.av1);
         slot->decoder.av1 = jce_av1_open_packet();
@@ -1460,6 +1479,10 @@ static void webm_decoder_close(VideoSlot *slot)
         jce_vp8_close(slot->decoder.vp8);
         slot->decoder.vp8 = NULL;
     }
+    if (slot->decoder.vp9) {
+        jce_vp9_close(slot->decoder.vp9);
+        slot->decoder.vp9 = NULL;
+    }
     if (slot->decoder.webm) {
         jce_webm_close(slot->decoder.webm);
         slot->decoder.webm = NULL;
@@ -1468,6 +1491,144 @@ static void webm_decoder_close(VideoSlot *slot)
         JCE_FREE(slot->decoder.webm_copy);
         slot->decoder.webm_copy = NULL;
         slot->decoder.webm_copy_size = 0;
+    }
+}
+
+/* ======================================================================
+ *  MP4-VP9 backend (vp09-in-MP4 / .mp4 with VP9, royalty-free)
+ *
+ *  Sample data in MP4 vp09 is a single raw VP9 frame (no NAL framing) —
+ *  feed each sample directly to libvpx via jce_vp9_decode_packet().
+ *  Discriminator vs WebM/IVF: vp9 != NULL && parser != NULL && !webm.
+ * ====================================================================== */
+static bool mp4_vp9_is_active(const VideoSlot *slot)
+{
+    return slot && slot->decoder.vp9 && slot->decoder.parser
+        && !slot->decoder.webm;
+}
+
+static bool mp4_vp9_decode_one_sample(VideoSlot *slot, uint32_t sample_idx,
+                                      bool *out_got_frame)
+{
+    JceMp4SampleInfo si;
+    if (!jce_mp4_parser_get_video_sample(slot->decoder.parser, sample_idx, &si))
+        return false;
+
+    const uint8_t *yp = NULL, *up = NULL, *vp = NULL;
+    ptrdiff_t ys = 0, uvs = 0;
+    uint32_t fw = 0, fh = 0;
+    bool got = jce_vp9_decode_packet(
+        slot->decoder.vp9,
+        slot->decoder.mp4_copy + si.offset, si.size_bytes,
+        &yp, &ys, &up, &uvs, &vp, &fw, &fh);
+    if (out_got_frame) *out_got_frame = got;
+    if (!got) return true;
+
+    if (!decoder_emit_frame_yuv420(slot, yp, ys, up, uvs, vp, fw, fh)) return false;
+
+    double ts_sec = 0.0;
+    if (slot->decoder.vtrack.timescale > 0) {
+        ts_sec = (double)si.timestamp / (double)slot->decoder.vtrack.timescale;
+    }
+    slot->frame_time = normalize_frame_time(slot, ts_sec, true);
+    slot->frame_counter++;
+    slot->decoder.ended = false;
+    return true;
+}
+
+static bool mp4_vp9_decoder_open(VideoSlot *slot)
+{
+    /* Presumes slot->decoder.parser + slot->decoder.vtrack already set up
+     * by decoder_open's MP4 setup. Creates packet-driven libvpx ctx and
+     * decodes the first sample so the slot has frame data immediately. */
+    slot->decoder.vp9 = jce_vp9_decoder_open();
+    if (!slot->decoder.vp9) {
+        LOG_WARN(LOG_TAG, "mp4_vp9_decoder_open: jce_vp9_decoder_open failed");
+        return false;
+    }
+    slot->decoder.width  = slot->decoder.vtrack.width;
+    slot->decoder.height = slot->decoder.vtrack.height;
+    slot->decoder.sample_idx = 0;
+    slot->decoder.ended = false;
+
+    bool got = false;
+    if (!mp4_vp9_decode_one_sample(slot, 0, &got)) {
+        jce_vp9_close(slot->decoder.vp9);
+        slot->decoder.vp9 = NULL;
+        return false;
+    }
+    if (!got) {
+        slot->frame_counter = 0;
+        LOG_INFO(LOG_TAG, "mp4_vp9_decoder_open: first frame deferred");
+    }
+    slot->decoder.sample_idx = 1;
+    slot->frame_time = normalize_frame_time(slot, 0.0, true);
+    return true;
+}
+
+static bool mp4_vp9_decoder_read_next(VideoSlot *slot)
+{
+    if (slot->decoder.sample_idx >= slot->decoder.vtrack.sample_count) {
+        slot->decoder.ended = true;
+        return false;
+    }
+    bool got = false;
+    bool ok = mp4_vp9_decode_one_sample(slot, slot->decoder.sample_idx, &got);
+    slot->decoder.sample_idx++;
+    return ok && got;
+}
+
+static bool mp4_vp9_decoder_seek(VideoSlot *slot, double time_sec, bool exact)
+{
+    /* Coarse seek: recreate the libvpx context (drops reference frames)
+     * and drain forward from sample 0 to the target timestamp. VP9
+     * keyframes are not pre-indexed for MP4 — typical clips are short
+     * enough that draining is fine. Bounded for inexact (preview) seek. */
+    if (time_sec < 0.0) time_sec = 0.0;
+    if (slot->decoder.vp9) {
+        jce_vp9_close(slot->decoder.vp9);
+        slot->decoder.vp9 = NULL;
+    }
+    slot->decoder.vp9 = jce_vp9_decoder_open();
+    if (!slot->decoder.vp9) {
+        slot->decoder.ended = true;
+        return false;
+    }
+
+    uint32_t ts_scale = slot->decoder.vtrack.timescale;
+    if (ts_scale == 0) ts_scale = 1;
+    uint64_t target_ts = (uint64_t)(time_sec * (double)ts_scale);
+
+    slot->decoder.sample_idx = 0;
+    slot->decoder.ended = false;
+    /* Anchor decode_ts_base to 0; see webm_decoder_seek for rationale. */
+    slot->frame_counter = 1;
+    slot->decode_ts_base_set = true;
+    slot->decode_ts_base_sec = 0.0;
+    slot->time = time_sec;
+    slot->frame_time = 0.0;
+
+    const uint64_t start_ms = jce_time_ticks_ms();
+    while (slot->decoder.sample_idx < slot->decoder.vtrack.sample_count) {
+        JceMp4SampleInfo si;
+        if (!jce_mp4_parser_get_video_sample(slot->decoder.parser,
+                                             slot->decoder.sample_idx, &si))
+            break;
+        bool got = false;
+        mp4_vp9_decode_one_sample(slot, slot->decoder.sample_idx, &got);
+        slot->decoder.sample_idx++;
+        if (si.timestamp >= target_ts) break;
+        if (!exact && (jce_time_ticks_ms() - start_ms) > 50u) break;
+    }
+    return true;
+}
+
+static void mp4_vp9_decoder_close(VideoSlot *slot)
+{
+    if (!slot) return;
+    if (slot->decoder.vp9) {
+        jce_vp9_close(slot->decoder.vp9);
+        slot->decoder.vp9 = NULL;
     }
 }
 
@@ -1486,13 +1647,14 @@ static bool decoder_open(VideoSlot *slot, const void *data, uint32_t size,
         return false;
     }
 
-    /* Check for supported codecs: AV1 (royalty-free), H.264 (AVC), or
+    /* Check for supported codecs: AV1 / VP9 (royalty-free), or H.264 (AVC) /
      * H.265 (HEVC). H.264/H.265 are patent-encumbered and gated behind
      * JCE_ENABLE_PATENTED_CODECS. */
     bool is_av1  = (strcmp(vti.codec, "av01") == 0);
+    bool is_vp9  = (strcmp(vti.codec, "vp09") == 0);
     bool is_avc  = (strcmp(vti.codec, "avc1") == 0 || strcmp(vti.codec, "avc3") == 0);
     bool is_hevc = (strcmp(vti.codec, "hvc1") == 0 || strcmp(vti.codec, "hev1") == 0);
-    if (!is_av1 && !is_avc && !is_hevc) {
+    if (!is_av1 && !is_vp9 && !is_avc && !is_hevc) {
         LOG_WARN(LOG_TAG, "decoder_open: unsupported video codec '%s'",
                  vti.codec);
         return false;
@@ -1509,8 +1671,10 @@ static bool decoder_open(VideoSlot *slot, const void *data, uint32_t size,
 #endif
 
     /* AV1 needs no avcC/hvcC-style DSI (av1C is metadata only — OBUs are
-     * self-describing). H.264/H.265 require a parsed config blob. */
-    if (!is_av1) {
+     * self-describing). VP9 likewise: vpcC carries profile/bit-depth
+     * metadata only; sample data is a self-describing VP9 bitstream.
+     * H.264/H.265 require a parsed config blob. */
+    if (!is_av1 && !is_vp9) {
         uint32_t min_dsi = is_avc ? 7u : 23u;
         if (!vti.decoder_config || vti.decoder_config_bytes < min_dsi) {
             LOG_WARN(LOG_TAG, "decoder_open: missing %s decoder config",
@@ -1561,6 +1725,17 @@ static bool decoder_open(VideoSlot *slot, const void *data, uint32_t size,
          * access points. This lets seek match WebM cluster-seek perf. */
         mp4_av1_build_keyframe_index(slot);
         slot->decoder.last_seek_kf_idx = 0;
+        return true;
+    }
+    if (is_vp9) {
+        if (!mp4_vp9_decoder_open(slot)) {
+            LOG_WARN(LOG_TAG, "decoder_open: failed to init libvpx for MP4-VP9");
+            jce_mp4_parser_close(slot->decoder.parser);
+            slot->decoder.parser = NULL;
+            JCE_FREE(slot->decoder.mp4_copy);
+            slot->decoder.mp4_copy = NULL;
+            return false;
+        }
         return true;
     }
     if (is_avc) {
@@ -1711,6 +1886,7 @@ static bool decoder_read_next(VideoSlot *slot)
     if (!slot) return false;
     if (slot->decoder.webm) return webm_decoder_read_next(slot);
     if (mp4_av1_is_active(slot)) return mp4_av1_decoder_read_next(slot);
+    if (mp4_vp9_is_active(slot)) return mp4_vp9_decoder_read_next(slot);
     if (slot->decoder.av1) return av1_decoder_read_next(slot);
     if ((!slot->decoder.h264 && !slot->decoder.h265)
         || !slot->decoder.parser) return false;
@@ -1853,6 +2029,7 @@ static bool decoder_seek(VideoSlot *slot, double time_sec, bool exact)
     if (!slot) return false;
     if (slot->decoder.webm) return webm_decoder_seek(slot, time_sec, exact);
     if (mp4_av1_is_active(slot)) return mp4_av1_decoder_seek(slot, time_sec, exact);
+    if (mp4_vp9_is_active(slot)) return mp4_vp9_decoder_seek(slot, time_sec, exact);
     if (slot->decoder.av1) return av1_decoder_seek(slot, time_sec, exact);
     if ((!slot->decoder.h264 && !slot->decoder.h265)
         || !slot->decoder.parser) return false;
@@ -1992,6 +2169,7 @@ static void decoder_close(VideoSlot *slot)
     if (!slot) return;
     av1_decoder_close(slot);
     webm_decoder_close(slot);
+    mp4_vp9_decoder_close(slot);
     if (slot->decoder.h264) {
         jce_h264_decoder_close(slot->decoder.h264);
         slot->decoder.h264 = NULL;
@@ -2626,7 +2804,9 @@ JceVideo jce_video_load_memory(const void *data, uint32_t size,
                          ? (double)slot->decoder.webm_duration_ns / 1.0e9
                          : 0.0;
         snprintf(slot->video_codec, sizeof(slot->video_codec), "%s",
-                 slot->decoder.av1 ? "av01" : "vp8");
+                 slot->decoder.av1 ? "av01"
+               : slot->decoder.vp9 ? "vp09"
+               : "vp8");
 
         /* WebM audio: route Opus to libopus → PCM (synchronous decode). */
         slot->has_audio = false;

@@ -81,6 +81,12 @@ JCE_API void               jce_postfx_destroy(JcePostFXPipeline *pipeline);
 void jce_postfx_resize(JcePostFXPipeline *pipeline,
                        uint32_t width, uint32_t height);
 
+/* Override the first bgfx view ID used by jce_postfx_apply().
+ * Default is JCE_VIEW_POST_BASE (20).  Use a different base when two
+ * PostFX pipelines must coexist in the same frame (e.g. scene viewport
+ * + game viewport) to avoid view-ID conflicts. */
+JCE_API void jce_postfx_set_view_base(JcePostFXPipeline *pipeline, uint16_t base);
+
 /* ================================================================== */
 /* Effect chain                                                        */
 /* ================================================================== */

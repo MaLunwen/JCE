@@ -21,6 +21,8 @@
 #include "ui/jce_editor_panels.h"
 
 #include <jce/tools/jce_imgui.hpp>
+#include "dialogs/jce_path_input.h"
+#include "core/jce_assetdb.h"
 extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/os/core/jce_filesystem.h>
@@ -566,7 +568,7 @@ void draw_content(void)
     ImGui::SliderInt(jce_editor_i18n_id("lightmapBake.field.padding",  "lmb_pad"), &s.cfg.padding, 0, 16);
     ImGui::SliderInt(jce_editor_i18n_id("lightmapBake.field.bounces",  "lmb_bnc"), &s.cfg.bounces, 0, 8);
     ImGui::SliderInt(jce_editor_i18n_id("lightmapBake.field.samples",  "lmb_smp"), &s.cfg.samples, 1, 256);
-    ImGui::InputText(jce_editor_i18n_id("lightmapBake.field.output",   "lmb_out"), s.cfg.output, sizeof(s.cfg.output));
+    jce_draw_path_input(jce_editor_i18n_id("lightmapBake.field.output",   "lmb_out"), s.cfg.output, sizeof(s.cfg.output), JcePathKind::FolderAbs);
 
     ImGui::EndDisabled();
     ImGui::Separator();
@@ -605,7 +607,7 @@ extern "C" void jce_editor_panel_lightmap_bake(void)
     if (!vis || !*vis) return;
     char _wt[96];
     snprintf(_wt, sizeof(_wt), "%s###jce_lightmap_bake", jce_editor_i18n("lightmapBake.title"));
-    if (ImGui::Begin(_wt, vis)) {
+    if (ImGui::Begin(_wt, vis, ImGuiWindowFlags_NoFocusOnAppearing)) {
         draw_content();
     }
     ImGui::End();

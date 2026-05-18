@@ -17,6 +17,8 @@
 #include "ui/jce_theme_palette.h"
 
 #include <jce/tools/jce_imgui.hpp>
+#include "dialogs/jce_path_input.h"
+#include "core/jce_assetdb.h"
 extern "C" {
 #include <jce/os/core/jce_json.h>
 }
@@ -595,7 +597,7 @@ void draw_content(void)
 {
     seed_default();
 
-    ImGui::InputText(jce_editor_i18n_id("curveEditor.field.file", "ce_file"), s.path, sizeof(s.path));
+    jce_draw_path_input(jce_editor_i18n_id("curveEditor.field.file", "ce_file"), s.path, sizeof(s.path), JcePathKind::FileAbs);
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n_id("curveEditor.button.save", "ce_save")) && s.path[0]) save_curve(s.path);
     ImGui::SameLine();

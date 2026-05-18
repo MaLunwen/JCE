@@ -123,6 +123,11 @@ void  jce_editor_panel_assets_content(void);
 void  jce_editor_panel_file_viewer_content(void);
 void  jce_editor_panel_postfx_content(void);
 void  jce_editor_panel_lighting_content(void);
+/* Per-frame tick: detect panel open/close transitions and apply
+ * preview enable/disable to the live engine pipeline. Must be called
+ * every frame regardless of panel visibility. */
+void  jce_editor_panel_postfx_tick(void);
+void  jce_editor_panel_lighting_tick(void);
 void  jce_editor_panel_audio_mixer_content(void);
 void  jce_editor_panel_input_manager_content(void);
 void  jce_editor_panel_package_manager_content(void);

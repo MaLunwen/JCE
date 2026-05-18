@@ -233,7 +233,8 @@ JCE_API uint16_t jce_scene_renderer_get_fog_result_texture(const JceSceneRendere
  *
  * No-op when fog was disabled this frame, the composite shader is
  * unavailable on this backend, or the renderer has never run. */
-JCE_API void jce_scene_renderer_composite_fog(JceSceneRenderer *sr, uint16_t view_id);
+JCE_API void jce_scene_renderer_composite_fog(JceSceneRenderer *sr, uint16_t view_id,
+                                              uint16_t dst_fb_idx);
 
 /* Per-frame culling stats from the most recent render call. */
 typedef struct {

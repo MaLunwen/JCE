@@ -450,10 +450,15 @@ const char *jce_state_get_current_scene_path(void)
 
 /* ── Scene file load ─────────────────────────────────────────────── */
 
+namespace { void close_active_bundle_mount(); }   /* fwd */
+
 bool jce_state_load_scene_file(const char *scene_path)
 {
     if (!scene_path || scene_path[0] == '\0')
         return false;
+
+    /* Plain-file load: drop any bundle VFS override from a prior preview. */
+    close_active_bundle_mount();
 
     bool ok = false;
     {
@@ -496,5 +501,189 @@ bool jce_state_load_scene_file(const char *scene_path)
         s_transaction.before.scene_json.clear();
         s_transaction.before.scene_path.clear();
     }
+    return ok;
+}
+
+extern "C" {
+#include <jce/resource/jce_bundle_loader.h>
+}
+
+/* ── Scene from bundle (read-only) ───────────────────────────────────
+ *
+ * We keep at most one bundle mounted at a time for scene-preview.
+ * Opening another bundle (or a plain .scene.json) closes the previous
+ * handle so the VFS doesn't accumulate stale mounts.
+ */
+
+namespace {
+struct BundleMount {
+    JceFileSystem    *fs   = nullptr;   /* private fs for this mount   */
+    JceBundleFile    *bf   = nullptr;   /* single-file mode handle     */
+    JceBundleCatalog *cat  = nullptr;   /* catalog mode handle         */
+    std::string       active_bundle_id; /* mounted via cat (for unmount)*/
+};
+BundleMount g_bm;
+
+void close_active_bundle_mount()
+{
+    /* Clear global asset-loader fallback first so any in-flight read
+     * doesn't hit a torn-down fs. */
+    if (jce_fs_get_active() == g_bm.fs) jce_fs_set_active(nullptr);
+
+    if (g_bm.cat) {
+        if (!g_bm.active_bundle_id.empty())
+            jce_bundle_unmount(g_bm.cat, g_bm.active_bundle_id.c_str());
+        jce_bundle_catalog_close(g_bm.cat);
+        g_bm.cat = nullptr;
+    }
+    if (g_bm.bf) {
+        jce_bundle_file_close(g_bm.bf);
+        g_bm.bf = nullptr;
+    }
+    if (g_bm.fs) {
+        jce_fs_destroy(g_bm.fs);
+        g_bm.fs = nullptr;
+    }
+    g_bm.active_bundle_id.clear();
+}
+
+bool apply_scene_bytes(const char *display_path,
+                       const char *bytes, size_t size)
+{
+    bool ok = false;
+    {
+        HistorySuspendScope suspend;
+        clear_scene_entities();
+        ok = jce_scene_serial_load(s.scene, bytes, size);
+        if (ok) {
+            rebuild_entity_order_from_ecs();
+            update_scene_dir_from_path(display_path);
+            set_current_scene_path_internal(display_path);
+            repair_scene_asset_paths();
+            LOG_INFO(LOG_TAG, "scene loaded from %s (%d entities)",
+                     display_path, (int)g_entity_order.size());
+        } else {
+            LOG_WARN(LOG_TAG, "scene load failed: %s", display_path);
+        }
+    }
+    if (ok) {
+        s_undo_history.clear();
+        s_redo_history.clear();
+        s.scene_modified = false;
+        s_history_edit_nesting = 0;
+        s_history_outer_edit_pushed_snapshot = false;
+        s_history_manual_batch_depth = 0;
+        s_transaction.active = false;
+        s_transaction.label[0] = '\0';
+        s_transaction.before.scene_json.clear();
+        s_transaction.before.scene_path.clear();
+    }
+    return ok;
+}
+} /* namespace */
+
+bool jce_state_load_scene_from_jbundle(const char *jbundle_path)
+{
+    if (!jbundle_path || jbundle_path[0] == '\0') return false;
+
+    close_active_bundle_mount();
+    g_bm.fs = jce_fs_create();
+    if (!g_bm.fs) return false;
+
+    g_bm.bf = jce_bundle_file_open(g_bm.fs, jbundle_path, nullptr);
+    if (!g_bm.bf) {
+        LOG_WARN(LOG_TAG, "open bundle failed: %s", jbundle_path);
+        close_active_bundle_mount();
+        return false;
+    }
+    const char *scene_vpath = jce_bundle_file_scene_path(g_bm.bf);
+    if (!scene_vpath || scene_vpath[0] == '\0') {
+        LOG_WARN(LOG_TAG, "bundle has no scene path: %s", jbundle_path);
+        close_active_bundle_mount();
+        return false;
+    }
+    uint64_t  sz  = 0;
+    void     *raw = jce_fs_read_all(g_bm.fs, scene_vpath, &sz);
+    if (!raw) {
+        LOG_WARN(LOG_TAG, "cannot read scene '%s' from bundle %s",
+                 scene_vpath, jbundle_path);
+        close_active_bundle_mount();
+        return false;
+    }
+    char display[1024];
+    snprintf(display, sizeof(display), "bundle://%s!%s",
+             jbundle_path, scene_vpath);
+    jce_fs_set_active(g_bm.fs);
+    bool ok = apply_scene_bytes(display, (const char *)raw, (size_t)sz);
+    jce_fs_buffer_free(raw);
+    if (!ok) close_active_bundle_mount();
+    return ok;
+}
+
+bool jce_state_load_scene_from_catalog(const char *catalog_path,
+                                       const char *bundle_id_or_scene)
+{
+    if (!catalog_path || catalog_path[0] == '\0') return false;
+
+    close_active_bundle_mount();
+    g_bm.fs = jce_fs_create();
+    if (!g_bm.fs) return false;
+
+    g_bm.cat = jce_bundle_catalog_open(g_bm.fs, catalog_path);
+    if (!g_bm.cat) {
+        LOG_WARN(LOG_TAG, "open catalog failed: %s", catalog_path);
+        close_active_bundle_mount();
+        return false;
+    }
+    /* Resolve which bundle to mount. */
+    const char *bundle_id = nullptr;
+    if (bundle_id_or_scene && bundle_id_or_scene[0] != '\0') {
+        /* Either a scene vpath (mount via scene_path lookup) or a
+         * literal bundle id. */
+        bundle_id = jce_bundle_mount_for_scene(g_bm.cat, bundle_id_or_scene);
+        if (!bundle_id) {
+            /* Treat as bundle id directly. */
+            if (jce_bundle_mount(g_bm.cat, bundle_id_or_scene))
+                bundle_id = bundle_id_or_scene;
+        }
+    } else {
+        /* Pick the first scene-bundle. */
+        uint32_t n = jce_bundle_catalog_count(g_bm.cat);
+        for (uint32_t i = 0; i < n; ++i) {
+            const char *id   = jce_bundle_catalog_id_at(g_bm.cat, i);
+            const char *kind = id ? jce_bundle_catalog_kind(g_bm.cat, id) : nullptr;
+            if (kind && strcmp(kind, "scene") == 0) {
+                if (jce_bundle_mount(g_bm.cat, id)) { bundle_id = id; break; }
+            }
+        }
+    }
+    if (!bundle_id) {
+        LOG_WARN(LOG_TAG, "catalog has no mountable scene bundle");
+        close_active_bundle_mount();
+        return false;
+    }
+    g_bm.active_bundle_id = bundle_id;
+
+    const char *scene_vpath = jce_bundle_catalog_scene_path(g_bm.cat, bundle_id);
+    if (!scene_vpath || scene_vpath[0] == '\0') {
+        LOG_WARN(LOG_TAG, "bundle '%s' has no scene_path in catalog", bundle_id);
+        close_active_bundle_mount();
+        return false;
+    }
+    uint64_t  sz  = 0;
+    void     *raw = jce_fs_read_all(g_bm.fs, scene_vpath, &sz);
+    if (!raw) {
+        LOG_WARN(LOG_TAG, "cannot read scene '%s' from catalog bundle %s",
+                 scene_vpath, bundle_id);
+        close_active_bundle_mount();
+        return false;
+    }
+    char display[1024];
+    snprintf(display, sizeof(display), "catalog://%s#%s",
+             catalog_path, bundle_id);
+    jce_fs_set_active(g_bm.fs);
+    bool ok = apply_scene_bytes(display, (const char *)raw, (size_t)sz);
+    jce_fs_buffer_free(raw);
+    if (!ok) close_active_bundle_mount();
     return ok;
 }

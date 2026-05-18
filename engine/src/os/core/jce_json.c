@@ -6,6 +6,7 @@
  */
 
 #include "jce/os/core/jce_json.h"
+#include "jce/os/core/jce_filesystem.h"
 
 #include <cjson/cJSON.h>
 #include <SDL3/SDL.h>
@@ -26,6 +27,20 @@ JceJson *jce_json_parse(const char *text, size_t len)
 JceJson *jce_json_parse_file(const char *path)
 {
     if (!path) return NULL;
+
+    /* Prefer the unified host_read_all path so an active VFS override
+     * (e.g. editor scene preview from a .jbundle) can intercept reads
+     * for project-relative JSON files like terrain/material metadata. */
+    {
+        uint64_t  sz   = 0;
+        void     *vbuf = jce_fs_host_read_all(path, &sz);
+        if (vbuf) {
+            JceJson *j = cJSON_ParseWithLength((const char *)vbuf, (size_t)sz);
+            jce_fs_buffer_free(vbuf);
+            if (j) return j;
+            /* fall through to host attempt if parse failed (defensive) */
+        }
+    }
 
     SDL_IOStream *io = SDL_IOFromFile(path, "rb");
     if (!io) return NULL;

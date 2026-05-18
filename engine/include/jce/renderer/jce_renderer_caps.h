@@ -134,7 +134,16 @@ typedef enum JceRendererBackend {
     JCE_BACKEND_VULKAN,
     JCE_BACKEND_OPENGL,
     JCE_BACKEND_OPENGLES,
-    JCE_BACKEND_METAL
+    JCE_BACKEND_METAL,
+    /* Headless / no-op renderer.  Backed by BGFX_RENDERER_TYPE_NOOP:
+       bgfx initialises but issues no GPU commands and never touches a
+       driver, making it the canonical choice for dedicated servers,
+       CI nodes and unit tests.  Intentionally excluded from
+       jce_renderer_caps_preferred_chain() so JCE_BACKEND_AUTO never
+       silently picks it on machines whose real GPU drivers all fail
+       — those machines must still drop to the SDL software fallback
+       (the blue/orange info-panel UI). */
+    JCE_BACKEND_NOOP
 } JceRendererBackend;
 
 /* Return a stable human-readable name for a backend.  Never NULL. */

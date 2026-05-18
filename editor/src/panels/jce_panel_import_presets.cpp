@@ -18,6 +18,8 @@
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_path.h>
 #include <jce/tools/jce_imgui.hpp>
+#include "dialogs/jce_path_input.h"
+#include "core/jce_assetdb.h"
 extern "C" {
 #include <jce/os/core/jce_json.h>
 }
@@ -513,7 +515,7 @@ void draw_scan_section(void)
                                  ImGuiTreeNodeFlags_DefaultOpen))
         return;
 
-    ImGui::InputText(jce_editor_i18n("importPresets.scan.scanRoot"), s.scan_root, sizeof(s.scan_root));
+    jce_draw_path_input(jce_editor_i18n("importPresets.scan.scanRoot"), s.scan_root, sizeof(s.scan_root), JcePathKind::FolderAbs);
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("importPresets.scan.scan"))) do_scan();
     ImGui::SameLine();
@@ -775,7 +777,7 @@ void draw_content(void)
         draw_preset_editor(p);
         ImGui::Separator();
         ImGui::TextUnformatted(jce_editor_i18n("importPresets.apply.heading"));
-        ImGui::InputText(jce_editor_i18n("importPresets.apply.file"),   s.target_file,   sizeof(s.target_file));
+        jce_draw_path_input(jce_editor_i18n("importPresets.apply.file"),   s.target_file,   sizeof(s.target_file), JcePathKind::FileAbs);
         ImGui::SameLine();
         if (ImGui::Button(jce_editor_i18n("importPresets.apply.applyFile")) && s.target_file[0]) {
             if (emit_sidecar(s.target_file, p))
@@ -785,7 +787,7 @@ void draw_content(void)
                 jce_editor_console_log_level(JCE_CONSOLE_ERROR,
                     "import sidecar write failed: %s", s.target_file);
         }
-        ImGui::InputText(jce_editor_i18n("importPresets.apply.folder"), s.target_folder, sizeof(s.target_folder));
+        jce_draw_path_input(jce_editor_i18n("importPresets.apply.folder"), s.target_folder, sizeof(s.target_folder), JcePathKind::FolderAbs);
         ImGui::SameLine();
         if (ImGui::Button(jce_editor_i18n("importPresets.apply.applyFolder")) && s.target_folder[0]) {
             int n = apply_to_folder(s.target_folder, p);
@@ -809,7 +811,7 @@ extern "C" void jce_editor_panel_import_presets(void)
     if (!vis || !*vis) return;
     char _wt[96];
     snprintf(_wt, sizeof(_wt), "%s###jce_import_presets", jce_editor_i18n("importPresets.title"));
-    if (ImGui::Begin(_wt, vis)) {
+    if (ImGui::Begin(_wt, vis, ImGuiWindowFlags_NoFocusOnAppearing)) {
         draw_content();
     }
     ImGui::End();

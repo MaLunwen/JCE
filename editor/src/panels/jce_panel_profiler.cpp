@@ -918,7 +918,7 @@ extern "C" void jce_editor_panel_profiler(void)
 
     char _wt[96];
     snprintf(_wt, sizeof(_wt), "%s###jce_profiler", jce_editor_i18n("profiler.title"));
-    if (ImGui::Begin(_wt, vis)) {
+    if (ImGui::Begin(_wt, vis, ImGuiWindowFlags_NoFocusOnAppearing)) {
         draw_content();
     }
     ImGui::End();

@@ -60,6 +60,18 @@ JCE_API JceAppResult JCE_CALL jce_engine_iterate(JceEngine *e);
 /* Shut down everything in reverse order. */
 JCE_API void JCE_CALL jce_engine_destroy(JceEngine *e);
 
+/* ---- Optional scene-asset bundle catalog ----------------------- */
+
+/* Set the bundle catalog path *before* jce_engine_create().  When set,
+ * the engine opens the catalog after the legacy monolithic PAK and
+ * keeps it accessible via jce_engine_get_bundle_catalog().  Game/editor
+ * code can then mount/unmount per-scene bundles on demand. */
+JCE_API void JCE_CALL jce_engine_set_bundle_catalog_path(const char *path);
+
+/* Returns the active JceBundleCatalog* (opaque) or NULL.  Cast to
+ * JceBundleCatalog* (declared in <jce/resource/jce_bundle_loader.h>). */
+JCE_API void *JCE_CALL jce_engine_get_bundle_catalog(JceEngine *e);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_ENGINE_H */

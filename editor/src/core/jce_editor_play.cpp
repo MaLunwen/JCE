@@ -302,6 +302,12 @@ static JceSound play_load_audio_clip(const char *clip_path)
     char candidates[8][1024];
     int  cand_n = 0;
 
+    /* VFS-first: when an active bundle is mounted (scene opened from a
+     * .jbundle) the clip lives at its virtual path unprefixed.  Try the
+     * raw clip_path before any disk roots so jce_fs_host_read_all hits
+     * the bundle reader instead of probing the project tree. */
+    snprintf(candidates[cand_n++], sizeof(candidates[0]), "%s", clip_path);
+
     const char *project_root = jce_assetdb_get_root();
     if (project_root && project_root[0] != '\0' && cand_n < 8) {
         snprintf(candidates[cand_n++], sizeof(candidates[0]), "%s/%s",

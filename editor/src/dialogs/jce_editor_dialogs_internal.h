@@ -66,4 +66,13 @@ void save_file_dialog_async(const char *title,
                             bool *ready_flag,
                             bool *cancelled_flag);
 
+/* Async open-file dialog.  Same contract as save_file_dialog_async but
+   for picking an existing file (SDL_ShowOpenFileDialog under the hood). */
+void open_file_dialog_async(const char *title,
+                            const char *default_path,
+                            const char *filters,
+                            char *primary_out, size_t primary_size,
+                            bool *ready_flag,
+                            bool *cancelled_flag);
+
 #endif /* JCE_EDITOR_DIALOGS_INTERNAL_H */

@@ -9,6 +9,7 @@
 #include <jce/os/core/jce_log.h>
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/os/core/jce_profiler.h>
+#include <jce/renderer/jce_views.h>
 #include <jce/renderer/jce_volumetric_fog.h>
 
 #include "os/core/jce_memory.h"
@@ -250,7 +251,10 @@ void jce_volumetric_fog_render(JceVolumetricFog *f,
     bgfx_set_uniform(f->u_color, col, 1);
 
     bgfx_texture_handle_t depth = { depth_tex_handle };
-    bgfx_set_texture(0, f->s_depth, depth, UINT32_MAX);
+    bgfx_set_texture(0, f->s_depth, depth,
+                     BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
+                     | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT
+                     | BGFX_SAMPLER_MIP_POINT);
 
     bgfx_set_vertex_buffer(0, f->vbh, 0, 4);
     bgfx_set_index_buffer(f->ibh, 0, 6);
@@ -265,18 +269,29 @@ uint16_t jce_volumetric_fog_get_result_texture(const JceVolumetricFog *f)
     return f->tex.idx;
 }
 
-void jce_volumetric_fog_composite(JceVolumetricFog *f, uint16_t view_id)
+void jce_volumetric_fog_composite(JceVolumetricFog *f,
+                                  uint16_t view_id,
+                                  uint16_t dst_fb_idx)
 {
     if (!f || !f->composite_ok)                    return;
     if (f->prog_composite.idx == UINT16_MAX)       return;
     if (f->fb.idx == UINT16_MAX)                   return;
     JCE_PROFILE_ZONE_N("Renderer::VolumetricFog::composite");
 
+    /* Bind the destination FBO and view rect explicitly. Callers must
+     * pass a view-id strictly greater than the fog-render view-id used
+     * in jce_volumetric_fog_render(); otherwise composite would sample
+     * stale data from the previous frame's fog RT. */
+    bgfx_frame_buffer_handle_t dst = { dst_fb_idx };
+    bgfx_set_view_frame_buffer(view_id, dst);
+    bgfx_set_view_rect(view_id, 0, 0, (uint16_t)f->w, (uint16_t)f->h);
+    bgfx_set_view_mode(view_id, BGFX_VIEW_MODE_SEQUENTIAL);
     bgfx_touch(view_id);
 
     bgfx_set_texture(0, f->s_fog, f->tex,
                      BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
-                     | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT);
+                     | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT
+                     | BGFX_SAMPLER_MIP_POINT);
 
     bgfx_set_vertex_buffer(0, f->vbh, 0, 4);
     bgfx_set_index_buffer(f->ibh, 0, 6);

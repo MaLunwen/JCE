@@ -9,6 +9,7 @@
 
 #include "ck_app.h"
 #include "ck_engine_smoke.h"
+#include "ck_scene_director.h"
 
 #include <jce/api.h>
 #include <jce/os/core/jce_alloc.h>
@@ -42,9 +43,12 @@ struct CkApp {
     float         scene_render_dt_sec;
     bool          scene_render_dt_fresh;
 
-    /* 3D scene (ECS + engine renderer). */
+    /* 3D scene (ECS + engine renderer), owned by the director.
+       Direct pointers kept for hot-path call sites; ownership belongs
+       to `director`. */
     JceCamera          *camera;
     JceCameraController *cam_ctrl;
+    CkSceneDirector    *director;
     JceScene           *scene;
     JceSceneRenderer   *scene_renderer;
 
@@ -263,39 +267,41 @@ CkApp *ck_app_create(const JceServices *svc)
     }
     app->cam_ctrl = jce_camctrl_create(app->camera, NULL);
 
-    LOG_INFO("ck_app", "[init] step 7: scene load");
-    /* Create ECS scene and load entities from PAK-packed JSON via VFS.
-       No programmatic fallback — ck must consume scene data, not build it.
-       Try the new editor-saved extension `.scene` first, then fall back
-       to the legacy `.scene.json` for backwards compatibility. */
-    app->scene = jce_scene_create();
-    {
-        JceFileSystem *fs = jce_fs_create();
-        jce_fs_mount_pak(fs, app->svc.pak);
-        const char *candidates[] = {
-            "scenes/main.scene",
-            "scenes/main.scene.json",
-        };
-        bool loaded = false;
-        for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); ++i) {
-            if (jce_scene_serial_load_vfs(app->scene, fs, candidates[i])) {
-                LOG_INFO("ck_app", "scene loaded from PAK: %s", candidates[i]);
-                loaded = true;
-                break;
+    LOG_INFO("ck_app", "[init] step 7: scene load (director)");
+    /* Create scene + scene renderer via the director, which owns both
+       and provides the runtime swap path used by level transitions
+       (see caged_kingdom/SCENES_DESIGN.md appendix A). */
+    app->director = ck_scene_director_create(app->svc.renderer, app->svc.pak);
+    if (!app->director) {
+        LOG_ERROR("ck_app", "ck_scene_director_create failed");
+    } else {
+        /* Preferred path: storyline graph picks the start scene.
+           Fallback: legacy editor smoke scene, then the historical
+           main.scene.json — keeps headless smoke tests green even when
+           the storyline data isn't cooked into the PAK. */
+        bool loaded = ck_scene_director_load_start(app->director);
+        if (!loaded) {
+            const char *candidates[] = {
+                "scenes/act1_m01_wake.scene.json",
+                "scenes/main.scene",
+                "scenes/main.scene.json",
+            };
+            for (size_t i = 0; i < sizeof(candidates)/sizeof(candidates[0]); ++i) {
+                if (ck_scene_director_load_initial(app->director, candidates[i])) {
+                    loaded = true;
+                    break;
+                }
             }
         }
         if (!loaded) {
             LOG_ERROR("ck_app",
-                      "no startup scene found in PAK (tried scenes/main.scene "
-                      "and scenes/main.scene.json)");
+                      "no startup scene found in PAK (quest graph "
+                      "+ fallbacks all failed)");
         }
-        jce_fs_destroy(fs);
     }
+    app->scene          = ck_scene_director_scene(app->director);
+    app->scene_renderer = ck_scene_director_renderer(app->director);
 
-    LOG_INFO("ck_app", "[init] step 8: scene_renderer");
-    /* Engine scene renderer (resolves textures/models from PAK). */
-    app->scene_renderer = jce_scene_renderer_create(
-        app->svc.renderer, app->svc.pak, NULL);
     LOG_INFO("ck_app", "[init] step 8: scene_renderer=%s",
              app->scene_renderer ? "ok" : "NULL");
 
@@ -378,9 +384,11 @@ void ck_app_destroy(CkApp *app)
     jce_touch_hud_destroy(app->touch_hud);
     jce_timer_destroy(app->timer);
 
-    /* Scene renderer + ECS scene + camera. */
-    jce_scene_renderer_destroy(app->scene_renderer);
-    jce_scene_destroy(app->scene);
+    /* Scene renderer + ECS scene (both owned by the director) + camera. */
+    ck_scene_director_destroy(app->director);
+    app->director       = NULL;
+    app->scene          = NULL;
+    app->scene_renderer = NULL;
     jce_camctrl_destroy(app->cam_ctrl);
     jce_camera_destroy(app->camera);
 
@@ -729,6 +737,22 @@ static void update_3d_scene(CkApp *app, float dt_ms)
     }
 
     jce_camctrl_update(app->cam_ctrl, &cam_in, dt_sec);
+
+    /* After the camera moves, feed its position to the director so
+       trigger zones in the active scene can fire transitions.  v1 uses
+       the camera as the player proxy; once a real player entity exists
+       this will switch to its Transform's position.  Y is ignored
+       inside ck_trigger (XZ disc check), so the camera's flight height
+       does not affect zone tests. */
+    {
+        jce_vec3 p = jce_camera_get_position(app->camera);
+        const float pos[3] = { p.x, p.y, p.z };
+        ck_scene_director_tick(app->director, dt_sec, pos);
+        /* The director may have swapped scene/renderer underneath us;
+           keep our cached pointers in sync. */
+        app->scene          = ck_scene_director_scene(app->director);
+        app->scene_renderer = ck_scene_director_renderer(app->director);
+    }
 }
 
 static void draw_3d_scene(CkApp *app, float dt_sec)

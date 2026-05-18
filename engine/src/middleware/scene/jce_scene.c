@@ -151,6 +151,76 @@ void jce_scene_destroy(JceScene *s)
     LOG_INFO(LOG_TAG, "scene destroyed");
 }
 
+int jce_scene_clear(JceScene *s)
+{
+    JCE_PROFILE_ZONE_N("Scene::Clear");
+    if (!s || !s->world) { JCE_PROFILE_ZONE_END; return -1; }
+
+    /*
+     * Collect all user-entity ids first, then delete them after the query
+     * is finalized. This avoids the undefined behaviour of mutating world
+     * entity tables while a query iterator is live.
+     *
+     * We treat "presence of JceTransform" as the canonical "user entity"
+     * marker, mirroring jce_scene_each_entity() and the implicit contract
+     * established by jce_scene_create_entity() (which always installs one).
+     */
+    enum { CHUNK = 256 };
+    ecs_entity_t  stack_buf[CHUNK];
+    ecs_entity_t *ids    = stack_buf;
+    int           count  = 0;
+    int           cap    = CHUNK;
+
+    ecs_query_t *q = ecs_query(s->world, {
+        .terms = {{ .id = ecs_id(JceTransform) }},
+    });
+    if (!q) { JCE_PROFILE_ZONE_END; return -1; }
+
+    ecs_iter_t it = ecs_query_iter(s->world, q);
+    while (ecs_query_next(&it)) {
+        for (int i = 0; i < it.count; i++) {
+            if (count == cap) {
+                int new_cap = cap * 2;
+                ecs_entity_t *grown = (ecs_entity_t *)JCE_CALLOC(
+                    (size_t)new_cap, sizeof(ecs_entity_t));
+                if (!grown) {
+                    if (ids != stack_buf) JCE_FREE(ids);
+                    ecs_query_fini(q);
+                    JCE_PROFILE_ZONE_END;
+                    return -1;
+                }
+                memcpy(grown, ids, (size_t)count * sizeof(ecs_entity_t));
+                if (ids != stack_buf) JCE_FREE(ids);
+                ids = grown;
+                cap = new_cap;
+            }
+            ids[count++] = it.entities[i];
+        }
+    }
+    ecs_query_fini(q);
+
+    /*
+     * Delete inside a deferred block so child-of relationships and observer
+     * callbacks see a consistent view of the world. flecs cascades deletes
+     * across (ChildOf, ...) automatically, so deleting parents implicitly
+     * removes their children; the duplicate ecs_delete on an already-dead
+     * child is a no-op.
+     */
+    ecs_defer_begin(s->world);
+    for (int i = 0; i < count; i++) {
+        if (ecs_is_alive(s->world, ids[i])) {
+            ecs_delete(s->world, ids[i]);
+        }
+    }
+    ecs_defer_end(s->world);
+
+    if (ids != stack_buf) JCE_FREE(ids);
+
+    LOG_INFO(LOG_TAG, "scene cleared (%d entities)", count);
+    JCE_PROFILE_ZONE_END;
+    return count;
+}
+
 /* ── Entity management ─────────────────────────────────────────────── */
 
 JceEntity jce_scene_create_entity(JceScene *s, const char *name)

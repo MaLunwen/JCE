@@ -35,7 +35,9 @@ CMakeUserPresets.json
 bak/
 TODO/
 
-docs/
+agents.*
+tests/
+
 
 # Android APK build
 scripts/android/app/src/main/jniLibs/

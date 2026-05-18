@@ -15,6 +15,12 @@ file(GLOB_RECURSE EDITOR_SOURCES CONFIGURE_DEPENDS
 
 add_executable(JCE_Editor ${EDITOR_SOURCES})
 
+# Auto-normalize i18n JSON before each editor build (no-op when files
+# are already normalized).  See top-level CMakeLists.txt -> jce_i18n_auto.
+if(TARGET jce_i18n_auto)
+	add_dependencies(JCE_Editor jce_i18n_auto)
+endif()
+
 # Editor is C++17 (per project policy: engine = C99, editor = C++17).
 set_target_properties(JCE_Editor PROPERTIES
 	CXX_STANDARD 17

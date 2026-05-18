@@ -185,6 +185,7 @@ void jce_editor_panel_toolbar(void)
                              ImGuiWindowFlags_NoSavedSettings |
                              ImGuiWindowFlags_NoBringToFrontOnFocus |
                              ImGuiWindowFlags_NoNavFocus |
+                             ImGuiWindowFlags_NoFocusOnAppearing |
                              ImGuiWindowFlags_NoDocking;
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);

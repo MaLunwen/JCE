@@ -163,6 +163,28 @@ void jce_project_settings_defaults(JceProjectSettings *s)
 
     /* Presets */
     s->presets.count = 0;
+
+    /* Rendering */
+    for (int i = 0; i < 6; i++) s->rendering.postfx_enabled[i] = false;
+    s->rendering.exposure            = 1.0f;
+    s->rendering.gamma               = 2.2f;
+    s->rendering.bloom_threshold     = 1.0f;
+    s->rendering.bloom_intensity     = 0.5f;
+    s->rendering.fxaa_span_max       = 8.0f;
+    s->rendering.vignette_intensity  = 0.3f;
+    s->rendering.vignette_smoothness = 2.0f;
+    s->rendering.chromatic_strength  = 0.005f;
+    s->rendering.fog_enabled         = false;
+    s->rendering.fog_color[0]        = 0.7f;
+    s->rendering.fog_color[1]        = 0.75f;
+    s->rendering.fog_color[2]        = 0.85f;
+    s->rendering.fog_density         = 0.02f;
+    s->rendering.fog_height_falloff  = 0.05f;
+    s->rendering.fog_height_origin   = 0.0f;
+    s->rendering.ambient_color[0]    = 0.1f;
+    s->rendering.ambient_color[1]    = 0.1f;
+    s->rendering.ambient_color[2]    = 0.12f;
+    s->rendering.ambient_intensity   = 1.0f;
 }
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
@@ -345,6 +367,34 @@ bool jce_project_settings_save(const JceProjectSettings *s)
         jce_json_set_int   (o, "maximum_particle_timestep_ms",
                             s->time.maximum_particle_timestep_ms);
         jce_json_set_child(root, "time", o);
+    }
+
+    /* rendering */
+    {
+        JceJson *o = jce_json_object();
+        /* PostFX enabled flags — stored as individual named booleans */
+        jce_json_set_bool  (o, "postfx_tonemap",   s->rendering.postfx_enabled[0]);
+        jce_json_set_bool  (o, "postfx_bloom",     s->rendering.postfx_enabled[1]);
+        jce_json_set_bool  (o, "postfx_fxaa",      s->rendering.postfx_enabled[2]);
+        jce_json_set_bool  (o, "postfx_vignette",  s->rendering.postfx_enabled[3]);
+        jce_json_set_bool  (o, "postfx_chromatic", s->rendering.postfx_enabled[4]);
+        jce_json_set_bool  (o, "postfx_grayscale", s->rendering.postfx_enabled[5]);
+        jce_json_set_number(o, "exposure",            s->rendering.exposure);
+        jce_json_set_number(o, "gamma",               s->rendering.gamma);
+        jce_json_set_number(o, "bloom_threshold",     s->rendering.bloom_threshold);
+        jce_json_set_number(o, "bloom_intensity",     s->rendering.bloom_intensity);
+        jce_json_set_number(o, "fxaa_span_max",       s->rendering.fxaa_span_max);
+        jce_json_set_number(o, "vignette_intensity",  s->rendering.vignette_intensity);
+        jce_json_set_number(o, "vignette_smoothness", s->rendering.vignette_smoothness);
+        jce_json_set_number(o, "chromatic_strength",  s->rendering.chromatic_strength);
+        jce_json_set_bool  (o, "fog_enabled",         s->rendering.fog_enabled);
+        jce_json_set_float_array(o, "fog_color",      s->rendering.fog_color, 3);
+        jce_json_set_number(o, "fog_density",         s->rendering.fog_density);
+        jce_json_set_number(o, "fog_height_falloff",  s->rendering.fog_height_falloff);
+        jce_json_set_number(o, "fog_height_origin",   s->rendering.fog_height_origin);
+        jce_json_set_float_array(o, "ambient_color",  s->rendering.ambient_color, 3);
+        jce_json_set_number(o, "ambient_intensity",   s->rendering.ambient_intensity);
+        jce_json_set_child(root, "rendering", o);
     }
 
     bool ok = jce_json_write_file(PS_PATH, root, true, true);
@@ -534,6 +584,30 @@ bool jce_project_settings_load(JceProjectSettings *out)
         out->time.max_allowed_timestep            = (float)jce_json_get_number(o, "max_allowed_timestep", out->time.max_allowed_timestep);
         out->time.time_scale                      = (float)jce_json_get_number(o, "time_scale",           out->time.time_scale);
         out->time.maximum_particle_timestep_ms    = jce_json_get_int(o, "maximum_particle_timestep_ms", out->time.maximum_particle_timestep_ms);
+    }
+
+    if (JceJson *o = child_obj_or_null(root, "rendering")) {
+        out->rendering.postfx_enabled[0] = jce_json_get_bool(o, "postfx_tonemap",   out->rendering.postfx_enabled[0]);
+        out->rendering.postfx_enabled[1] = jce_json_get_bool(o, "postfx_bloom",     out->rendering.postfx_enabled[1]);
+        out->rendering.postfx_enabled[2] = jce_json_get_bool(o, "postfx_fxaa",      out->rendering.postfx_enabled[2]);
+        out->rendering.postfx_enabled[3] = jce_json_get_bool(o, "postfx_vignette",  out->rendering.postfx_enabled[3]);
+        out->rendering.postfx_enabled[4] = jce_json_get_bool(o, "postfx_chromatic", out->rendering.postfx_enabled[4]);
+        out->rendering.postfx_enabled[5] = jce_json_get_bool(o, "postfx_grayscale", out->rendering.postfx_enabled[5]);
+        out->rendering.exposure            = (float)jce_json_get_number(o, "exposure",            out->rendering.exposure);
+        out->rendering.gamma               = (float)jce_json_get_number(o, "gamma",               out->rendering.gamma);
+        out->rendering.bloom_threshold     = (float)jce_json_get_number(o, "bloom_threshold",     out->rendering.bloom_threshold);
+        out->rendering.bloom_intensity     = (float)jce_json_get_number(o, "bloom_intensity",     out->rendering.bloom_intensity);
+        out->rendering.fxaa_span_max       = (float)jce_json_get_number(o, "fxaa_span_max",       out->rendering.fxaa_span_max);
+        out->rendering.vignette_intensity  = (float)jce_json_get_number(o, "vignette_intensity",  out->rendering.vignette_intensity);
+        out->rendering.vignette_smoothness = (float)jce_json_get_number(o, "vignette_smoothness", out->rendering.vignette_smoothness);
+        out->rendering.chromatic_strength  = (float)jce_json_get_number(o, "chromatic_strength",  out->rendering.chromatic_strength);
+        out->rendering.fog_enabled         = jce_json_get_bool(o, "fog_enabled", out->rendering.fog_enabled);
+        jce_json_get_floats(o, "fog_color", out->rendering.fog_color, 3, out->rendering.fog_color);
+        out->rendering.fog_density         = (float)jce_json_get_number(o, "fog_density",         out->rendering.fog_density);
+        out->rendering.fog_height_falloff  = (float)jce_json_get_number(o, "fog_height_falloff",  out->rendering.fog_height_falloff);
+        out->rendering.fog_height_origin   = (float)jce_json_get_number(o, "fog_height_origin",   out->rendering.fog_height_origin);
+        jce_json_get_floats(o, "ambient_color", out->rendering.ambient_color, 3, out->rendering.ambient_color);
+        out->rendering.ambient_intensity   = (float)jce_json_get_number(o, "ambient_intensity",   out->rendering.ambient_intensity);
     }
 
     jce_json_free(root);

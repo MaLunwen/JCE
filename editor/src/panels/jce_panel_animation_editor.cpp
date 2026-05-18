@@ -23,6 +23,8 @@
 #include "ui/jce_theme_palette.h"
 
 #include <jce/tools/jce_imgui.hpp>
+#include "dialogs/jce_path_input.h"
+#include "core/jce_assetdb.h"
 extern "C" {
 #include <jce/os/core/jce_json.h>
 }
@@ -233,7 +235,7 @@ void draw_toolbar(void)
         s.cursor = 0.0f; s.sel_track = -1; s.sel_event = -1;
     }
 
-    ImGui::InputText(jce_editor_i18n("animationEditor.field.file"), s.path, sizeof(s.path));
+    jce_draw_path_input(jce_editor_i18n("animationEditor.field.file"), s.path, sizeof(s.path), JcePathKind::FileAbs);
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("animationEditor.button.save")) && s.path[0]) save_clip(s.path);
     ImGui::SameLine();
@@ -589,7 +591,7 @@ extern "C" void jce_editor_panel_animation_editor(void)
     if (!vis || !*vis) return;
     char _wt[96];
     snprintf(_wt, sizeof(_wt), "%s###jce_anim_editor", jce_editor_i18n("animationEditor.title"));
-    if (ImGui::Begin(_wt, vis)) {
+    if (ImGui::Begin(_wt, vis, ImGuiWindowFlags_NoFocusOnAppearing)) {
         draw_content();
     }
     ImGui::End();

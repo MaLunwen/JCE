@@ -2217,7 +2217,7 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
         bgfx_attachment_t at;
         memset(&at, 0, sizeof(at));
         bgfx_attachment_init(&at, sr->shadow_tex, BGFX_ACCESS_WRITE,
-                             0, 1, 0, BGFX_RESOLVE_AUTO_GEN_MIPS);
+                             0, 1, 0, BGFX_RESOLVE_NONE);
         sr->shadow_fbo = bgfx_create_frame_buffer_from_attachment(1, &at, false);
         sr->u_shadowMap = bgfx_create_uniform("s_shadowMap",
                                               BGFX_UNIFORM_TYPE_SAMPLER, 1);
@@ -2245,7 +2245,7 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
             bgfx_attachment_t at;
             memset(&at, 0, sizeof(at));
             bgfx_attachment_init(&at, sr->csm_tex[i], BGFX_ACCESS_WRITE,
-                                 0, 1, 0, BGFX_RESOLVE_AUTO_GEN_MIPS);
+                                 0, 1, 0, BGFX_RESOLVE_NONE);
             sr->csm_fbo[i] = bgfx_create_frame_buffer_from_attachment(1, &at, false);
             sr->u_csm_samplers[i] = bgfx_create_uniform(names[i],
                 BGFX_UNIFORM_TYPE_SAMPLER, 1);
@@ -2625,10 +2625,11 @@ uint16_t jce_scene_renderer_get_fog_result_texture(const JceSceneRenderer *sr)
     return jce_volumetric_fog_get_result_texture(sr->vfog);
 }
 
-void jce_scene_renderer_composite_fog(JceSceneRenderer *sr, uint16_t view_id)
+void jce_scene_renderer_composite_fog(JceSceneRenderer *sr, uint16_t view_id,
+                                      uint16_t dst_fb_idx)
 {
     if (!sr || !sr->vfog || !sr->vfog_last_rendered) return;
-    jce_volumetric_fog_composite(sr->vfog, view_id);
+    jce_volumetric_fog_composite(sr->vfog, view_id, dst_fb_idx);
 }
 
 bool jce_scene_renderer_is_skybox_active(const JceSceneRenderer *sr)

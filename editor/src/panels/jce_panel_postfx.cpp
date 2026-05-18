@@ -11,6 +11,7 @@
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
 #include "scene/jce_editor_scene_render.h"
+#include "core/jce_project_settings.h"
 
 #include <jce/tools/jce_imgui.hpp>
 #include <cstdio>
@@ -39,17 +40,34 @@ static struct {
 static void ensure_init(void)
 {
     if (s_pfx.initialized) return;
-    JcePostFXPipeline *pfx = get_postfx();
-    if (pfx) {
-        jce_postfx_get_params(pfx, &s_pfx.params);
+
+    /* Cache is pre-warmed by jce_editor_init; this is a pointer read, no disk I/O. */
+    const JceProjectSettings *ps = jce_project_settings_current();
+    if (ps) {
+        s_pfx.params.exposure            = ps->rendering.exposure;
+        s_pfx.params.gamma               = ps->rendering.gamma;
+        s_pfx.params.bloom_threshold     = ps->rendering.bloom_threshold;
+        s_pfx.params.bloom_intensity     = ps->rendering.bloom_intensity;
+        s_pfx.params.fxaa_span_max       = ps->rendering.fxaa_span_max;
+        s_pfx.params.vignette_intensity  = ps->rendering.vignette_intensity;
+        s_pfx.params.vignette_smoothness = ps->rendering.vignette_smoothness;
+        s_pfx.params.chromatic_strength  = ps->rendering.chromatic_strength;
         for (int i = 0; i < JCE_POSTFX_COUNT; i++)
-            s_pfx.enabled[i] = jce_postfx_is_enabled(pfx,
-                                                     (JcePostFXType)i);
+            s_pfx.enabled[i] = (i < 6) ? ps->rendering.postfx_enabled[i] : false;
     } else {
         s_pfx.params = jce_postfx_default_params();
         for (int i = 0; i < JCE_POSTFX_COUNT; i++)
             s_pfx.enabled[i] = false;
     }
+
+    /* Push the loaded values into the live pipeline. */
+    JcePostFXPipeline *pfx = get_postfx();
+    if (pfx) {
+        jce_postfx_set_params(pfx, &s_pfx.params);
+        for (int i = 0; i < JCE_POSTFX_COUNT; i++)
+            jce_postfx_enable(pfx, (JcePostFXType)i, s_pfx.enabled[i]);
+    }
+
     s_pfx.initialized = true;
 }
 
@@ -60,6 +78,34 @@ static void sync_to_pipeline(void)
     jce_postfx_set_params(pfx, &s_pfx.params);
     for (int i = 0; i < JCE_POSTFX_COUNT; i++)
         jce_postfx_enable(pfx, (JcePostFXType)i, s_pfx.enabled[i]);
+
+    /* Persist to project settings. Use the cached snapshot as base so we
+     * don't do a disk read on every slider drag. */
+    const JceProjectSettings *cur = jce_project_settings_current();
+    JceProjectSettings ps;
+    if (cur) ps = *cur; else jce_project_settings_defaults(&ps);
+    ps.rendering.exposure            = s_pfx.params.exposure;
+    ps.rendering.gamma               = s_pfx.params.gamma;
+    ps.rendering.bloom_threshold     = s_pfx.params.bloom_threshold;
+    ps.rendering.bloom_intensity     = s_pfx.params.bloom_intensity;
+    ps.rendering.fxaa_span_max       = s_pfx.params.fxaa_span_max;
+    ps.rendering.vignette_intensity  = s_pfx.params.vignette_intensity;
+    ps.rendering.vignette_smoothness = s_pfx.params.vignette_smoothness;
+    ps.rendering.chromatic_strength  = s_pfx.params.chromatic_strength;
+    for (int i = 0; i < JCE_POSTFX_COUNT; i++)
+        ps.rendering.postfx_enabled[i] = s_pfx.enabled[i];
+    jce_project_settings_save(&ps);
+}
+
+/* Disable all postfx effects in the live pipeline without touching the
+ * cached / persisted enabled flags. Used when the panel is closed so the
+ * editor scene/game viewports immediately preview "no postfx". */
+static void disable_pipeline_only(void)
+{
+    JcePostFXPipeline *pfx = get_postfx();
+    if (!pfx) return;
+    for (int i = 0; i < JCE_POSTFX_COUNT; i++)
+        jce_postfx_enable(pfx, (JcePostFXType)i, false);
 }
 
 /* ── Content ──────────────────────────────────────────────────────── */
@@ -163,6 +209,21 @@ void jce_editor_panel_postfx_content(void)
 
 /* ── Standalone window wrapper ────────────────────────────────────── */
 
+void jce_editor_panel_postfx_tick(void)
+{
+    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_POSTFX);
+    static bool s_was_visible = false;
+    if (*vis != s_was_visible) {
+        if (*vis) {
+            ensure_init();
+            sync_to_pipeline();
+        } else {
+            disable_pipeline_only();
+        }
+        s_was_visible = *vis;
+    }
+}
+
 void jce_editor_panel_postfx(void)
 {
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_POSTFX);
@@ -170,7 +231,7 @@ void jce_editor_panel_postfx(void)
 
     char title[256];
     snprintf(title, sizeof(title), "%s###postfx", jce_editor_i18n("postfx.title"));
-    if (ImGui::Begin(title, vis))
+    if (ImGui::Begin(title, vis, ImGuiWindowFlags_NoFocusOnAppearing))
         jce_editor_panel_postfx_content();
     ImGui::End();
 }

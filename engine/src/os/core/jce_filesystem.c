@@ -24,9 +24,23 @@
 /* Internal types                                                      */
 /* ================================================================== */
 
-struct JceFileSystem {
+/* Single mounted PAK entry within the priority list.  When `name` is
+ * NULL the entry was added through the legacy jce_fs_mount_pak() API
+ * and represents the default monolithic archive. */
+typedef struct JceFsPakEntry {
     JcePakArchive *pak;
-    bool        physfs_owned;   /* true if we called PHYSFS_init */
+    char          *name;     /* NULL or heap-allocated id (e.g. bundle id) */
+} JceFsPakEntry;
+
+#define JCE_FS_MAX_PAKS 64
+
+struct JceFileSystem {
+    JceFsPakEntry  paks[JCE_FS_MAX_PAKS];
+    uint32_t       pak_count;
+    /* Convenience alias to the legacy unnamed slot (or first slot if none).
+     * Kept so static helpers below stay readable; not authoritative. */
+    JcePakArchive *pak;
+    bool           physfs_owned;   /* true if we called PHYSFS_init */
 };
 
 /* File opened from PhysFS. */
@@ -80,6 +94,9 @@ JceFileSystem *jce_fs_create(void)
 void jce_fs_destroy(JceFileSystem *fs)
 {
     if (!fs) return;
+    for (uint32_t i = 0; i < fs->pak_count; ++i) {
+        if (fs->paks[i].name) JCE_FREE(fs->paks[i].name);
+    }
     if (fs->physfs_owned && PHYSFS_isInit())
         PHYSFS_deinit();
     JCE_FREE(fs);
@@ -91,7 +108,92 @@ void jce_fs_destroy(JceFileSystem *fs)
 
 void jce_fs_mount_pak(JceFileSystem *fs, JcePakArchive *pak)
 {
-    if (fs) fs->pak = pak;
+    if (!fs) return;
+
+    /* Replace the legacy unnamed slot if present; otherwise append. */
+    for (uint32_t i = 0; i < fs->pak_count; ++i) {
+        if (fs->paks[i].name == NULL) {
+            fs->paks[i].pak = pak;
+            fs->pak = pak;
+            return;
+        }
+    }
+
+    if (fs->pak_count >= JCE_FS_MAX_PAKS) {
+        LOG_WARN(LOG_TAG, "mount table full (%u); refusing legacy pak mount",
+                 (unsigned)JCE_FS_MAX_PAKS);
+        return;
+    }
+
+    fs->paks[fs->pak_count].pak  = pak;
+    fs->paks[fs->pak_count].name = NULL;
+    ++fs->pak_count;
+    fs->pak = pak;
+}
+
+bool jce_fs_mount_pak_named(JceFileSystem *fs, const char *name,
+                            JcePakArchive *pak)
+{
+    if (!fs || !pak || !name) return false;
+
+    /* Reject duplicate names so refcounting in higher layers stays sane. */
+    for (uint32_t i = 0; i < fs->pak_count; ++i) {
+        if (fs->paks[i].name && strcmp(fs->paks[i].name, name) == 0) {
+            LOG_WARN(LOG_TAG, "pak '%s' already mounted", name);
+            return false;
+        }
+    }
+
+    if (fs->pak_count >= JCE_FS_MAX_PAKS) {
+        LOG_ERROR(LOG_TAG, "mount table full (%u); cannot mount '%s'",
+                  (unsigned)JCE_FS_MAX_PAKS, name);
+        return false;
+    }
+
+    /* Heap-copy the name (callers free their own strings). */
+    size_t n = strlen(name) + 1;
+    char *copy = (char *)JCE_MALLOC(n);
+    if (!copy) return false;
+    memcpy(copy, name, n);
+
+    /* Insert at the FRONT (highest priority) so newer mounts win.  This
+     * matches Unity AssetBundle behaviour where a freshly-mounted bundle
+     * can shadow assets from older bundles. */
+    for (uint32_t i = fs->pak_count; i > 0; --i)
+        fs->paks[i] = fs->paks[i - 1];
+
+    fs->paks[0].pak  = pak;
+    fs->paks[0].name = copy;
+    ++fs->pak_count;
+    return true;
+}
+
+bool jce_fs_unmount_pak_named(JceFileSystem *fs, const char *name)
+{
+    if (!fs || !name) return false;
+
+    for (uint32_t i = 0; i < fs->pak_count; ++i) {
+        if (fs->paks[i].name && strcmp(fs->paks[i].name, name) == 0) {
+            JCE_FREE(fs->paks[i].name);
+            for (uint32_t j = i; j + 1 < fs->pak_count; ++j)
+                fs->paks[j] = fs->paks[j + 1];
+            --fs->pak_count;
+            fs->paks[fs->pak_count].pak  = NULL;
+            fs->paks[fs->pak_count].name = NULL;
+
+            /* Re-pick `pak` alias if the legacy slot still exists. */
+            fs->pak = NULL;
+            for (uint32_t k = 0; k < fs->pak_count; ++k)
+                if (fs->paks[k].name == NULL) { fs->pak = fs->paks[k].pak; break; }
+            return true;
+        }
+    }
+    return false;
+}
+
+uint32_t jce_fs_mounted_pak_count(const JceFileSystem *fs)
+{
+    return fs ? fs->pak_count : 0;
 }
 
 void jce_fs_mount_dir(JceFileSystem *fs, const char *prefix,
@@ -129,38 +231,44 @@ static JceFile *try_open_physfs(const char *vpath)
     return f;
 }
 
-/* Try to open a virtual path from the PAK archive.
-   Decompresses the entire asset into a memory buffer. */
+/* Try to open a virtual path from any mounted PAK archive.
+   Walks the priority list (front → back) and returns the first hit. */
 static JceFile *try_open_pak(const JceFileSystem *fs, const char *vpath)
 {
-    if (!fs->pak) return NULL;
+    if (!fs || fs->pak_count == 0) return NULL;
 
-    const JcePakAsset *asset = jce_pak_find(fs->pak, vpath);
-    if (!asset) return NULL;
+    for (uint32_t i = 0; i < fs->pak_count; ++i) {
+        JcePakArchive *p = fs->paks[i].pak;
+        if (!p) continue;
 
-    /* Guard against uint64 → size_t truncation on 32-bit platforms. */
-    if (asset->original_size > (uint64_t)SIZE_MAX) {
-        LOG_ERROR(LOG_TAG, "asset too large for address space: %s", vpath);
-        return NULL;
+        const JcePakAsset *asset = jce_pak_find(p, vpath);
+        if (!asset) continue;
+
+        if (asset->original_size > (uint64_t)SIZE_MAX) {
+            LOG_ERROR(LOG_TAG, "asset too large for address space: %s", vpath);
+            return NULL;
+        }
+
+        void *buf = JCE_MALLOC((size_t)asset->original_size);
+        if (!buf) return NULL;
+
+        size_t decompressed = jce_pak_decompress(asset, buf,
+                                                 asset->original_size);
+        if (decompressed == 0) {
+            JCE_FREE(buf);
+            continue; /* try next pak — corrupt entry shouldn't kill lookup */
+        }
+
+        JceFile *f = JCE_NEW(JceFile);
+        if (!f) { JCE_FREE(buf); return NULL; }
+
+        f->kind = JCE_FILE_PAK;
+        f->u.pak.data   = buf;
+        f->u.pak.size   = decompressed;
+        f->u.pak.cursor = 0;
+        return f;
     }
-
-    void *buf = JCE_MALLOC((size_t)asset->original_size);
-    if (!buf) return NULL;
-
-    size_t decompressed = jce_pak_decompress(asset, buf, asset->original_size);
-    if (decompressed == 0) {
-        JCE_FREE(buf);
-        return NULL;
-    }
-
-    JceFile *f = JCE_NEW(JceFile);
-    if (!f) { JCE_FREE(buf); return NULL; }
-
-    f->kind = JCE_FILE_PAK;
-    f->u.pak.data   = buf;
-    f->u.pak.size   = decompressed;
-    f->u.pak.cursor = 0;
-    return f;
+    return NULL;
 }
 
 /* ================================================================== */
@@ -252,10 +360,12 @@ bool jce_fs_exists(const JceFileSystem *fs, const char *virtual_path)
     if (PHYSFS_exists(virtual_path))
         return true;
 
-    /* Check PAK. */
-    if (fs->pak)
-        return jce_pak_find(fs->pak, virtual_path) != NULL;
-
+    /* Check every mounted PAK. */
+    for (uint32_t i = 0; i < fs->pak_count; ++i) {
+        if (fs->paks[i].pak &&
+            jce_pak_find(fs->paks[i].pak, virtual_path) != NULL)
+            return true;
+    }
     return false;
 }
 
@@ -337,4 +447,30 @@ bool jce_fs_write_all(JceFileSystem *fs, const char *virtual_path,
     }
 
     return true;
+}
+
+/* ================================================================== */
+/* Active VFS override                                                  */
+/*                                                                      */
+/* Single-process editor preview hook.  A scene loaded from a mounted   */
+/* bundle parks its JceFileSystem* here so that asset cache loaders     */
+/* (which call jce_fs_host_read_all with project-relative paths)        */
+/* transparently resolve through the bundle VFS without changing every  */
+/* loader.  See jce_fs_host_read_all in jce_filesystem_host.c.          */
+/* ================================================================== */
+
+/* ================================================================== */
+/* Active VFS override                                                  */
+/*                                                                      */
+/* Convenience: install jce_fs_read_all as the active reader.  Storage  */
+/* of the active fs pointer and reader fn lives in jce_filesystem_host.c*/
+/* (so consumers that link only that TU still get a working stub).      */
+/* ================================================================== */
+
+void jce_fs_set_active(JceFileSystem *fs)
+{
+    jce_fs_set_active_reader(fs ? jce_fs_read_all : NULL);
+    /* Store the handle through the host-side setter via a small helper. */
+    extern void jce__fs_store_active(JceFileSystem *fs);
+    jce__fs_store_active(fs);
 }

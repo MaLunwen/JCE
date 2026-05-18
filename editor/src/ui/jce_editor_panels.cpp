@@ -8,6 +8,7 @@
 
 #include "jce_editor_panels.h"
 
+#include "dialogs/jce_path_input.h"
 #include "core/jce_editor.h"
 #include "core/jce_editor_alloc.h"
 #include "jce_editor_colors.h"
@@ -58,19 +59,25 @@ bool *jce_editor_panel_visible_ptr(JceEditorPanel panel)
 
 void jce_editor_panels_persist_visibility(void)
 {
-    static uint32_t s_last_saved_mask = JCE_EDITOR_PANELS_MASK_UNSET;
-    uint32_t mask = 0;
-    for (int i = 0; i < JCE_PANEL_COUNT && i < 32; i++) {
-        if (s_visible[i]) mask |= (1u << i);
+    static uint64_t s_last_saved_mask = ~(uint64_t)0;
+    uint64_t mask = 0;
+    for (int i = 0; i < JCE_PANEL_COUNT && i < 64; i++) {
+        if (s_visible[i]) mask |= ((uint64_t)1u << i);
     }
     if (mask == s_last_saved_mask) return;
     JceEditorConfig _cfg = {};
     jce_editor_config_load(&_cfg);
-    if (_cfg.panels_visible_mask == mask) {
+    uint64_t cur = ((uint64_t)_cfg.panels_visible_mask_hi << 32) |
+                   (uint64_t)_cfg.panels_visible_mask;
+    /* On first save the low half holds the unset sentinel (0xFFFFFFFF);
+       force a write in that case to migrate from 32-bit format. */
+    bool first_save = (_cfg.panels_visible_mask == JCE_EDITOR_PANELS_MASK_UNSET);
+    if (!first_save && cur == mask) {
         s_last_saved_mask = mask;
         return;
     }
-    _cfg.panels_visible_mask = mask;
+    _cfg.panels_visible_mask    = (uint32_t)(mask & 0xFFFFFFFFu);
+    _cfg.panels_visible_mask_hi = (uint32_t)(mask >> 32);
     if (jce_editor_config_save(&_cfg)) {
         s_last_saved_mask = mask;
     }
@@ -234,8 +241,10 @@ void jce_editor_panels_init(void)
         JceEditorConfig _ecfg;
         if (jce_editor_config_load(&_ecfg) &&
             _ecfg.panels_visible_mask != JCE_EDITOR_PANELS_MASK_UNSET) {
-            for (int i = 0; i < JCE_PANEL_COUNT && i < 32; i++) {
-                s_visible[i] = (_ecfg.panels_visible_mask >> i) & 1u;
+            uint64_t mask = ((uint64_t)_ecfg.panels_visible_mask_hi << 32) |
+                            (uint64_t)_ecfg.panels_visible_mask;
+            for (int i = 0; i < JCE_PANEL_COUNT && i < 64; i++) {
+                s_visible[i] = (mask >> i) & 1u;
             }
         }
     }
@@ -835,7 +844,7 @@ void jce_editor_panel_preferences(void)
     char panel_title[256];
     snprintf(panel_title, sizeof(panel_title), "%s###Preferences",
              jce_editor_i18n("preferences.title"));
-    if (ImGui::Begin(panel_title, vis)) {
+    if (ImGui::Begin(panel_title, vis, ImGuiWindowFlags_NoFocusOnAppearing)) {
 
         char _lbl[256];
 
@@ -1103,13 +1112,13 @@ void jce_editor_panel_preferences(void)
                                    jce_editor_i18n("preferences.paths.projectPaths"));
                 ImGui::Spacing();
                 snprintf(_lbl, sizeof(_lbl), "%s###assetsPath", jce_editor_i18n("preferences.paths.assetsPath"));
-                ImGui::InputText(_lbl, s_prefs.assets_path, sizeof(s_prefs.assets_path));
+                jce_draw_path_input(_lbl, s_prefs.assets_path, sizeof(s_prefs.assets_path), JcePathKind::FolderAbs);
                 snprintf(_lbl, sizeof(_lbl), "%s###scenesPath", jce_editor_i18n("preferences.paths.scenesPath"));
-                ImGui::InputText(_lbl, s_prefs.scenes_path, sizeof(s_prefs.scenes_path));
+                jce_draw_path_input(_lbl, s_prefs.scenes_path, sizeof(s_prefs.scenes_path), JcePathKind::FolderAbs);
                 snprintf(_lbl, sizeof(_lbl), "%s###prefabsPath", jce_editor_i18n("preferences.paths.prefabsPath"));
-                ImGui::InputText(_lbl, s_prefs.prefabs_path, sizeof(s_prefs.prefabs_path));
+                jce_draw_path_input(_lbl, s_prefs.prefabs_path, sizeof(s_prefs.prefabs_path), JcePathKind::FolderAbs);
                 snprintf(_lbl, sizeof(_lbl), "%s###buildPath", jce_editor_i18n("preferences.paths.buildOutputPath"));
-                ImGui::InputText(_lbl, s_prefs.build_output_path, sizeof(s_prefs.build_output_path));
+                jce_draw_path_input(_lbl, s_prefs.build_output_path, sizeof(s_prefs.build_output_path), JcePathKind::FolderAbs);
                 ImGui::EndTabItem();
             }
 
@@ -1120,11 +1129,11 @@ void jce_editor_panel_preferences(void)
                 ImGui::TextWrapped("%s", jce_editor_i18n("preferences.fonts.help"));
                 ImGui::Spacing();
                 ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s", jce_editor_i18n("preferences.fonts.latin"));
-                ImGui::InputText("##fontEn", s_prefs.font_en_path, sizeof(s_prefs.font_en_path));
+                jce_draw_path_input_file("##fontEn", s_prefs.font_en_path, sizeof(s_prefs.font_en_path), "Font (*.ttf *.otf *.ttc);;All Files (*.*)");
                 ImGui::SameLine();
                 if (ImGui::SmallButton(jce_editor_i18n_id("preferences.fonts.clear", "fontEnClr"))) s_prefs.font_en_path[0] = '\0';
                 ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s", jce_editor_i18n("preferences.fonts.cjk"));
-                ImGui::InputText("##fontZh", s_prefs.font_zh_path, sizeof(s_prefs.font_zh_path));
+                jce_draw_path_input_file("##fontZh", s_prefs.font_zh_path, sizeof(s_prefs.font_zh_path), "Font (*.ttf *.otf *.ttc);;All Files (*.*)");
                 ImGui::SameLine();
                 if (ImGui::SmallButton(jce_editor_i18n_id("preferences.fonts.clear", "fontZhClr"))) s_prefs.font_zh_path[0] = '\0';
                 ImGui::Spacing();

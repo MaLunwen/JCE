@@ -260,8 +260,10 @@ void jce_editor_panel_game_view_content(void)
         region_start = ImGui::GetCursorScreenPos();
     }
 
-    uint32_t vw = (uint32_t)view_size.x;
-    uint32_t vh = (uint32_t)view_size.y;
+    uint32_t vw = (uint32_t)fmaxf(1.0f, view_size.x);
+    uint32_t vh = (uint32_t)fmaxf(1.0f, view_size.y);
+    if (vw < 16u) vw = 16u;
+    if (vh < 16u) vh = 16u;
     jce_editor_game_render_frame(vw, vh);
 
     uint16_t tex_idx = jce_editor_game_render_get_texture();
@@ -502,7 +504,7 @@ void jce_editor_panel_game_view(void)
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     char title[256];
     snprintf(title, sizeof(title), "%s###game_view", jce_editor_i18n("Game"));
-    if (ImGui::Begin(title, vis))
+    if (ImGui::Begin(title, vis, ImGuiWindowFlags_NoFocusOnAppearing))
         jce_editor_panel_game_view_content();
     ImGui::End();
     ImGui::PopStyleVar();

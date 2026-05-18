@@ -92,6 +92,7 @@ void jce_editor_config_defaults(JceEditorConfig *cfg) {
     cfg->invert_drag_y      = false;
     cfg->touchpad_h_invert  = true;
     cfg->panels_visible_mask = JCE_EDITOR_PANELS_MASK_UNSET;
+    cfg->panels_visible_mask_hi = 0u;
 }
 
 /* --------------- helpers --------------- */
@@ -182,6 +183,8 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
                                                 cfg->touchpad_h_invert);
     cfg->panels_visible_mask = (uint32_t)jce_json_get_int(
         root, "panels_visible_mask", (int)cfg->panels_visible_mask);
+    cfg->panels_visible_mask_hi = (uint32_t)jce_json_get_int(
+        root, "panels_visible_mask_hi", (int)cfg->panels_visible_mask_hi);
     jce_editor_pref_invert_scroll_zoom = cfg->invert_scroll_zoom;
     jce_editor_pref_invert_drag_y      = cfg->invert_drag_y;
     jce_editor_pref_touchpad_h_invert  = cfg->touchpad_h_invert;
@@ -279,6 +282,7 @@ bool jce_editor_config_save(const JceEditorConfig *cfg) {
     jce_json_set_bool(root, "invert_drag_y",      cfg->invert_drag_y);
     jce_json_set_bool(root, "touchpad_h_invert",  cfg->touchpad_h_invert);
     jce_json_set_int (root, "panels_visible_mask", (int)cfg->panels_visible_mask);
+    jce_json_set_int (root, "panels_visible_mask_hi", (int)cfg->panels_visible_mask_hi);
     jce_editor_pref_invert_scroll_zoom = cfg->invert_scroll_zoom;
     jce_editor_pref_invert_drag_y      = cfg->invert_drag_y;
     jce_editor_pref_touchpad_h_invert  = cfg->touchpad_h_invert;

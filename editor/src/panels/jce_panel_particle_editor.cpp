@@ -21,6 +21,8 @@
 #include "core/jce_reflect.h"
 
 #include <jce/tools/jce_imgui.hpp>
+#include "dialogs/jce_path_input.h"
+#include "core/jce_assetdb.h"
 extern "C" {
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_json.h>
@@ -344,7 +346,7 @@ void draw_content(void)
     ImGui::Separator();
 
     /* Path + Save / Load. */
-    ImGui::InputText(jce_editor_i18n("particleEditor.field.file"), s_pe.path, sizeof(s_pe.path));
+    jce_draw_path_input(jce_editor_i18n("particleEditor.field.file"), s_pe.path, sizeof(s_pe.path), JcePathKind::FileAbs);
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("particleEditor.button.save")) && s_pe.path[0]) {
         if (save_to_json(s_pe.path, &s_pe.desc))
@@ -379,7 +381,7 @@ void draw_content(void)
      * editor exposes a string->JceTextureHandle loader). */
     ImGui::Separator();
     ImGui::TextUnformatted(jce_editor_i18n("particleEditor.section.texture"));
-    ImGui::InputText("##texpath", s_pe.texture_path, sizeof(s_pe.texture_path));
+    jce_draw_path_input_asset("##texpath", s_pe.texture_path, sizeof(s_pe.texture_path), JCE_ASSET_KIND_TEXTURE);
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n_id("particleEditor.button.clear", "tex"))) s_pe.texture_path[0] = 0;
     ImGui::TextDisabled("%s", jce_editor_i18n("particleEditor.hint.texturePath"));
@@ -613,7 +615,7 @@ extern "C" void jce_editor_panel_particle_editor(void)
     if (!vis || !*vis) return;
     char _wt[96];
     snprintf(_wt, sizeof(_wt), "%s###jce_particle_editor", jce_editor_i18n("particleEditor.title"));
-    if (ImGui::Begin(_wt, vis)) {
+    if (ImGui::Begin(_wt, vis, ImGuiWindowFlags_NoFocusOnAppearing)) {
         draw_content();
     }
     ImGui::End();

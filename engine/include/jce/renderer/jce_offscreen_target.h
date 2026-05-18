@@ -42,6 +42,13 @@ JCE_API uint16_t jce_offscreen_target_get_depth_texture(
     const JceOffscreenTarget *bridge);
 JCE_API uint16_t jce_offscreen_target_get_view_id(const JceOffscreenTarget *bridge);
 
+/* Raw frame-buffer handle index of the offscreen target (or UINT16_MAX
+ * when no target has been allocated yet). Used by post-passes that need
+ * to bind the same destination FBO from a different view-id (e.g. the
+ * volumetric-fog composite, which must run AFTER fog render in view
+ * ordering and therefore cannot share the offscreen view-id). */
+JCE_API uint16_t jce_offscreen_target_get_frame_buffer(const JceOffscreenTarget *bridge);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_OFFSCREEN_TARGET_H */

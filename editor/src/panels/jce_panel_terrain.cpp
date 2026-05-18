@@ -19,6 +19,8 @@
 #include "scene/jce_editor_scene_render.h"
 
 #include <jce/tools/jce_imgui.hpp>
+#include "dialogs/jce_path_input.h"
+#include "core/jce_assetdb.h"
 extern "C" {
 #include <jce/middleware/scene/jce_terrain.h>
 #include <jce/renderer/jce_scene_renderer.h>
@@ -171,7 +173,7 @@ void draw_toolbar()
         ImGui::EndDisabled();
         ImGui::EndTable();
     }
-    ImGui::InputText(jce_editor_i18n("terrain.toolbar.path"), s.io_path, sizeof(s.io_path));
+    jce_draw_path_input(jce_editor_i18n("terrain.toolbar.path"), s.io_path, sizeof(s.io_path), JcePathKind::FileAbs);
     if (ImGui::BeginDragDropTarget()) {
         if (const ImGuiPayload *payload =
                 ImGui::AcceptDragDropPayload("JCE_ASSET_PATH")) {
@@ -320,7 +322,7 @@ extern "C" void jce_editor_panel_terrain(void)
     ImGui::SetNextWindowSize(ImVec2(420, 720), ImGuiCond_FirstUseEver);
     char _wt[96];
     snprintf(_wt, sizeof(_wt), "%s###jce_terrain", jce_editor_i18n("terrain.title"));
-    if (!ImGui::Begin(_wt, p_open)) {
+    if (!ImGui::Begin(_wt, p_open, ImGuiWindowFlags_NoFocusOnAppearing)) {
         ImGui::End();
         return;
     }

@@ -59,8 +59,11 @@ typedef struct {
     /* Window panel visibility persistence. Bit i corresponds to
        JceEditorPanel value i. Sentinel JCE_EDITOR_PANELS_MASK_UNSET
        means "never saved" — defaults from jce_editor_panels_init()
-       apply. Updated whenever the user toggles a Window menu item. */
+       apply. Updated whenever the user toggles a Window menu item.
+       `panels_visible_mask` covers panels 0..31; `panels_visible_mask_hi`
+       covers panels 32..63 (added when panel count exceeded 32). */
     uint32_t panels_visible_mask;
+    uint32_t panels_visible_mask_hi;
 } JceEditorConfig;
 
 /* Load config from .jce/editor-config.json. Returns false if not found. */

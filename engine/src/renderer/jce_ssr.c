@@ -10,6 +10,7 @@
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/renderer/jce_ssr.h>
+#include <jce/renderer/jce_views.h>
 
 #include "os/core/jce_memory.h"
 

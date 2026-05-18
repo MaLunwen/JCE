@@ -197,6 +197,19 @@ void              jce_state_set_live_preview(bool on);
 
 /* Scene loading */
 bool              jce_state_load_scene_file(const char *scene_path);
+/* Load a scene from a standalone .jbundle (single-file mode product).
+ * Mounts the bundle internally, reads the scene JSON through the VFS,
+ * and applies it as the current scene.  The bundle stays mounted (so
+ * referenced assets can resolve) until the next bundle/scene load.
+ * The current_scene_path is set to "bundle://<jbundle>" — saving is
+ * disabled in this mode (the bundle is read-only). */
+bool              jce_state_load_scene_from_jbundle(const char *jbundle_path);
+/* Load a scene from a bundle_catalog.json + bundle id (or scene vpath).
+ * If bundle_id_or_scene is NULL, the first bundle in the catalog is
+ * picked.  Behaves like jce_state_load_scene_from_jbundle wrt mounting
+ * and read-only semantics. */
+bool              jce_state_load_scene_from_catalog(const char *catalog_path,
+                                                    const char *bundle_id_or_scene);
 bool              jce_state_save_scene_file(const char *scene_path);
 const char       *jce_state_get_current_scene_path(void);
 bool              jce_state_is_scene_modified(void);

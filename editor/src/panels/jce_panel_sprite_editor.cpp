@@ -22,6 +22,8 @@
 #include "io/jce_editor_file_util.h"
 
 #include <jce/tools/jce_imgui.hpp>
+#include "dialogs/jce_path_input.h"
+#include "core/jce_assetdb.h"
 extern "C" {
 #include <jce/os/core/jce_json.h>
 }
@@ -209,7 +211,7 @@ void draw_canvas(void)
 void draw_left_pane(void)
 {
     ImGui::TextUnformatted(jce_editor_i18n("spriteEditor.source"));
-    ImGui::InputText("##src", s.source_path, sizeof(s.source_path));
+    jce_draw_path_input_asset("##src", s.source_path, sizeof(s.source_path), JCE_ASSET_KIND_TEXTURE);
     ImGui::SameLine();
     if (ImGui::SmallButton(jce_editor_i18n("spriteEditor.openInViewer")) && s.source_path[0])
         jce_file_viewer_open(s.source_path);
@@ -249,7 +251,7 @@ void draw_left_pane(void)
 
     ImGui::Separator();
     ImGui::TextUnformatted(jce_editor_i18n("spriteEditor.persist"));
-    ImGui::InputText("##spath", s.sprites_path, sizeof(s.sprites_path));
+    jce_draw_path_input_asset("##spath", s.sprites_path, sizeof(s.sprites_path), JCE_ASSET_KIND_DATA);
     if (ImGui::Button(jce_editor_i18n("spriteEditor.save"))) save_json();
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("spriteEditor.load"))) load_json();
@@ -283,7 +285,7 @@ extern "C" void jce_editor_panel_sprite_editor(void)
     char wt[96];
     std::snprintf(wt, sizeof(wt), "%s###jce_sprite_editor",
                   jce_editor_i18n("spriteEditor.title"));
-    if (ImGui::Begin(wt, vis)) {
+    if (ImGui::Begin(wt, vis, ImGuiWindowFlags_NoFocusOnAppearing)) {
         jce_editor_panel_sprite_editor_content();
     }
     ImGui::End();

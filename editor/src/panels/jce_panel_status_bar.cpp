@@ -57,6 +57,7 @@ void jce_editor_panel_status_bar(void)
                              ImGuiWindowFlags_NoSavedSettings |
                              ImGuiWindowFlags_NoBringToFrontOnFocus |
                              ImGuiWindowFlags_NoNavFocus |
+                             ImGuiWindowFlags_NoFocusOnAppearing |
                              ImGuiWindowFlags_NoDocking;
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8, 4));

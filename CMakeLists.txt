@@ -537,6 +537,33 @@ if(NOT CMAKE_CROSSCOMPILING)
 endif()
 
 # ------------------------------------------------------------------ #
+# Host bundle packer tool: jce_bundle_pack                            #
+# ------------------------------------------------------------------ #
+
+if(NOT CMAKE_CROSSCOMPILING)
+	add_executable(jce_bundle_pack
+		"${JCE_TOOLS_DIR}/jce_bundle_pack.c"
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_bundle_pack.c"
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_bundle_deps.c"
+		"${JCE_ENGINE_SRC_DIR}/os/core/jce_memory.c")
+	set_target_properties(jce_bundle_pack PROPERTIES
+		EXCLUDE_FROM_ALL      ON
+		RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tools"
+		C_STANDARD            99
+		C_STANDARD_REQUIRED   YES
+		C_EXTENSIONS          OFF)
+	target_include_directories(jce_bundle_pack PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/engine/include"
+		"${JCE_ENGINE_SRC_DIR}")
+	target_link_libraries(jce_bundle_pack PRIVATE
+		cjson::cjson
+		mimalloc-static
+		zstd::libzstd_static
+		xxHash::xxhash)
+	jce_target_warnings(jce_bundle_pack)
+endif()
+
+# ------------------------------------------------------------------ #
 # Asset cooking (optional — pre-decode textures & audio at build time)#
 # ------------------------------------------------------------------ #
 
@@ -836,6 +863,16 @@ add_subdirectory(engine)
 add_subdirectory(editor)
 add_subdirectory(caged_kingdom)
 
+# ------------------------------------------------------------------ #
+# Unit tests (opt-in via -DJCE_BUILD_TESTS=ON; default OFF to keep   #
+# baseline configure-time small for non-developer builds).            #
+# ------------------------------------------------------------------ #
+option(JCE_BUILD_TESTS "Build JCE unit tests (Unity + CTest)" OFF)
+if(JCE_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
+
 # ── Dist mode: suppress all logging ──
 if(JCE_BUILD_VARIANT STREQUAL "dist")
 	target_compile_definitions(jce_core PUBLIC JCE_DIST=1)
@@ -859,6 +896,53 @@ if(JCE_ENABLE_PUBLIC_API_GUARD)
 			WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
 			COMMENT "Verifying public headers have no third-party leaks"
 			VERBATIM)
+	endif()
+endif()
+
+# ------------------------------------------------------------------ #
+# i18n JSON normalization                                             #
+#                                                                     #
+# `i18n-sort`  — rewrite editor/resources/assets/i18n/*.json in place #
+# `i18n-check` — CI gate, fails if any file would be reformatted      #
+#                                                                     #
+# Automation: a stamp-driven custom command runs sort_i18n.py on      #
+# every build whose JSON inputs have changed, so the in-tree files    #
+# stay normalized without anyone having to remember to run a target.  #
+# The editor target depends on the stamp so an editor build always    #
+# re-normalizes drifted i18n files.                                   #
+# ------------------------------------------------------------------ #
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_FOUND)
+	set(_JCE_I18N_SCRIPT "${CMAKE_SOURCE_DIR}/tools/sort_i18n.py")
+	file(GLOB _JCE_I18N_FILES
+		"${CMAKE_SOURCE_DIR}/editor/resources/assets/i18n/*.json")
+
+	add_custom_target(i18n-sort
+		COMMAND ${Python3_EXECUTABLE} "${_JCE_I18N_SCRIPT}"
+		WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+		COMMENT "Normalizing editor i18n JSON files"
+		VERBATIM)
+
+	add_custom_target(i18n-check
+		COMMAND ${Python3_EXECUTABLE} "${_JCE_I18N_SCRIPT}" --check
+		WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+		COMMENT "Checking editor i18n JSON normalization"
+		VERBATIM)
+
+	if(_JCE_I18N_FILES)
+		set(_JCE_I18N_STAMP
+			"${CMAKE_BINARY_DIR}/jce_i18n_sort.stamp")
+		add_custom_command(
+			OUTPUT  "${_JCE_I18N_STAMP}"
+			COMMAND ${Python3_EXECUTABLE} "${_JCE_I18N_SCRIPT}"
+			COMMAND ${CMAKE_COMMAND} -E touch "${_JCE_I18N_STAMP}"
+			DEPENDS ${_JCE_I18N_FILES} "${_JCE_I18N_SCRIPT}"
+			WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+			COMMENT "Auto-normalizing editor i18n JSON files"
+			VERBATIM)
+		add_custom_target(jce_i18n_auto ALL
+			DEPENDS "${_JCE_I18N_STAMP}")
 	endif()
 endif()
 

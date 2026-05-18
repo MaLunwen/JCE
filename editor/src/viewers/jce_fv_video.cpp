@@ -599,20 +599,30 @@ void fv_render_video(FvTab *tab)
     ImGui::SameLine();
     double kb = (double)tab->file_size / 1024.0;
     if (has_video) {
+        const char *vc = st->info.video_codec[0] ? st->info.video_codec : "unkn";
+        const char *ac = st->info.audio_codec[0] ? st->info.audio_codec : NULL;
+        char codec_buf[64];
+        if (st->info.has_audio && ac) {
+            snprintf(codec_buf, sizeof(codec_buf),
+                     "v:%s a:%s %dHz %dch", vc, ac,
+                     st->info.samplerate, st->info.audio_channels);
+        } else if (st->info.has_audio) {
+            snprintf(codec_buf, sizeof(codec_buf),
+                     "v:%s a:unkn %dHz %dch", vc,
+                     st->info.samplerate, st->info.audio_channels);
+        } else {
+            snprintf(codec_buf, sizeof(codec_buf), "v:%s a:none", vc);
+        }
         if (kb >= 1024.0)
             ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
                 "%s  |  %dx%d  |  %.2f fps  |  %s  |  %.2f MB",
                 tab->display_name, st->info.width, st->info.height,
-                st->info.framerate,
-                st->info.video_codec[0] ? st->info.video_codec : "unkn",
-                kb / 1024.0);
+                st->info.framerate, codec_buf, kb / 1024.0);
         else
             ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
                 "%s  |  %dx%d  |  %.2f fps  |  %s  |  %.1f KB",
                 tab->display_name, st->info.width, st->info.height,
-                st->info.framerate,
-                st->info.video_codec[0] ? st->info.video_codec : "unkn",
-                kb);
+                st->info.framerate, codec_buf, kb);
     } else {
         ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
             "%s  |  %.1f KB", tab->display_name, kb);

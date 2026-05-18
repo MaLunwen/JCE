@@ -20,6 +20,7 @@ extern "C" {
 
 typedef struct JceRenderer JceRenderer;
 typedef struct JceCamera   JceCamera;
+typedef struct JcePakArchive JcePakArchive;
 struct JceWindow;
 
 /* Set / clear the FPS-style relative-mouse capture on the editor window.
@@ -57,8 +58,11 @@ void jce_editor_game_render_consume_mouse_delta(float *dx, float *dy);
 /* Initialise the embedded game viewport renderer.
  * Must be called AFTER jce_editor_scene_render_init() so the engine
  * scene renderer is already available. The window is used for the
- * relative-mouse / cursor capture toggle (FPS fly-cam). */
-bool jce_editor_game_render_init(JceRenderer *renderer, struct JceWindow *window);
+ * relative-mouse / cursor capture toggle (FPS fly-cam).
+ * pak is used to load the post-processing shaders for the game view's
+ * dedicated PostFX pipeline. */
+bool jce_editor_game_render_init(JceRenderer *renderer, struct JceWindow *window,
+                                 const JcePakArchive *pak);
 
 /* Tear down. Safe to call even if init failed. */
 void jce_editor_game_render_shutdown(void);

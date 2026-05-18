@@ -29,6 +29,7 @@ struct JcePostFXPipeline {
     bool            enabled[JCE_POSTFX_COUNT];
     JcePostFXParams params;
     bool            shaders_loaded;
+    uint16_t        view_base;  /* First bgfx view ID used by jce_postfx_apply(). */
 
     /* Intermediate framebuffers for ping-pong rendering. */
     bgfx_texture_handle_t    fbo_tex[POSTFX_MAX_FBOS];
@@ -124,8 +125,13 @@ static void create_fbos(JcePostFXPipeline *p)
             NULL);
         bgfx_attachment_t at;
         memset(&at, 0, sizeof(at));
-        bgfx_attachment_init(&at, p->fbo_tex[i], BGFX_ACCESS_WRITE, 0, 1, 0, BGFX_RESOLVE_AUTO_GEN_MIPS);
-        p->fbo[i] = bgfx_create_frame_buffer_from_attachment(1, &at, false);
+        bgfx_attachment_init(&at, p->fbo_tex[i], BGFX_ACCESS_WRITE, 0, 1, 0, BGFX_RESOLVE_NONE);
+        /* destroyTextures=true so destroying the FBO also frees the
+         * attached color texture. Otherwise destroy_fbos() leaks the
+         * texture handles, which during ImGui drag-resize quickly
+         * exhausts bgfx's texture pool and yields recycled-handle AVs
+         * deep inside the GPU driver. */
+        p->fbo[i] = bgfx_create_frame_buffer_from_attachment(1, &at, true);
     }
     p->fbos_valid = true;
 }
@@ -137,7 +143,7 @@ static void destroy_fbos(JcePostFXPipeline *p)
         if (p->fbo[i].idx != UINT16_MAX)
             bgfx_destroy_frame_buffer(p->fbo[i]);
         p->fbo[i].idx = UINT16_MAX;
-        /* Textures are owned by the FBs when created via attachment. */
+        /* Textures are owned by the FBs (destroyTextures=true). */
         p->fbo_tex[i].idx = UINT16_MAX;
     }
     p->fbos_valid = false;
@@ -187,6 +193,7 @@ JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
     p->prog_chromatic.idx     = UINT16_MAX;
     p->prog_grayscale.idx     = UINT16_MAX;
     reset_output_state(p);
+    p->view_base = JCE_VIEW_POST_BASE;
 
     /* Create full-screen quad geometry. */
     bgfx_vertex_layout_begin(&p->quad_layout, bgfx_get_renderer_type());
@@ -352,6 +359,13 @@ bool jce_postfx_load_shaders(JcePostFXPipeline *pipeline,
     return pipeline->shaders_loaded;
 }
 
+/* ── View base ─────────────────────────────────────────────────────── */
+
+void jce_postfx_set_view_base(JcePostFXPipeline *pipeline, uint16_t base)
+{
+    if (pipeline) pipeline->view_base = base;
+}
+
 /* ── Apply ─────────────────────────────────────────────────────────── */
 
 void jce_postfx_apply(JcePostFXPipeline *pipeline,
@@ -395,16 +409,24 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
 
     /* Track current input texture. Start with the scene color. */
     bgfx_texture_handle_t current_tex = { scene_color.idx };
-    uint16_t view_id = JCE_VIEW_POST_BASE;
+    uint16_t view_id = pipeline->view_base;
     int ping = 0; /* ping-pong FBO index (0 or 1) */
     int current_fb_index = -1;
 
-/* Helper macro: set up view for a post-processing pass. */
+/* Helper macro: set up view for a post-processing pass.
+ *
+ * Always issues a hardware clear before the fullscreen quad. The quad
+ * does fully overwrite RGB+A across the view rect, but on the very
+ * first frame after create_fbos() the underlying GPU texture contains
+ * uninitialised VRAM (visible as rainbow noise) and any tile/region
+ * the fullscreen pass doesn't perfectly touch (driver edge cases on
+ * Vulkan/D3D12 after handle recycling) leaks through. The clear is a
+ * fast tile-init on modern GPUs and removes the resize artifact. */
 #define POSTFX_SETUP_VIEW(vid, fb)                                                                 \
     do {                                                                                           \
         bgfx_set_view_rect((vid), 0, 0, (uint16_t)pipeline->width, (uint16_t)pipeline->height);    \
         bgfx_set_view_frame_buffer((vid), (fb));                                                   \
-        bgfx_set_view_clear((vid), BGFX_CLEAR_NONE, 0, 1.0f, 0);                                   \
+        bgfx_set_view_clear((vid), BGFX_CLEAR_COLOR, 0x00000000, 1.0f, 0);                         \
     } while (0)
 
 #define POSTFX_LABEL(vid, name) bgfx_set_view_name((vid), (name), INT32_MAX)

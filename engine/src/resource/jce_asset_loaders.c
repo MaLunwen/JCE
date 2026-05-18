@@ -85,7 +85,8 @@ static void load_texture_sync(JceAssetManager *mgr, JceAssetSlot *slot,
     JceTexture tex = jce_texture_load_ex(mgr->pak, path, sampler);
     if (!jce_texture_valid(tex)) {
         JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
-        LOG_ERROR(LOG_TAG, "texture load failed: %s", path);
+        /* LOG_WARN instead of ERROR — PAK may still be loading. True failures logged by jce_texture_load_ex. */
+        LOG_WARN(LOG_TAG, "texture load failed (may retry): %s", path);
         return;
     }
 

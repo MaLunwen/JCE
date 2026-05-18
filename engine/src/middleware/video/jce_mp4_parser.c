@@ -129,6 +129,9 @@ static void jce_mp4_codec_from_object_type(unsigned oti, char out_codec[5])
         case MP4_OBJECT_TYPE_AV1:
             snprintf(out_codec, 5u, "av01");
             break;
+        case MP4_OBJECT_TYPE_VP9:
+            snprintf(out_codec, 5u, "vp09");
+            break;
         case MP4_OBJECT_TYPE_OPUS:
             snprintf(out_codec, 5u, "opus");
             break;

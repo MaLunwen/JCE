@@ -225,6 +225,7 @@ const char *jce_renderer_backend_name(enum JceRendererBackend b)
     case JCE_BACKEND_METAL:    return "Metal";
     case JCE_BACKEND_OPENGL:   return "OpenGL";
     case JCE_BACKEND_OPENGLES: return "OpenGL ES";
+    case JCE_BACKEND_NOOP:     return "Headless (NoOp)";
     default:                   return "Unknown";
     }
 }
@@ -245,15 +246,24 @@ static enum JceRendererBackend s_from_bgfx(bgfx_renderer_type_t t)
 int jce_renderer_caps_preferred_chain(enum JceRendererBackend *out, int max)
 {
     /* Single source of truth for per-platform preferred backend order.
+     * Ordered from PERFORMANCE → COMPATIBILITY: modern explicit APIs
+     * (D3D12 / Vulkan / Metal) come first because they have the lowest
+     * CPU overhead and the best driver paths on current hardware;
+     * older APIs (D3D11 / OpenGL / OpenGL ES) are listed last as
+     * broadly-compatible safety nets.  When every backend in this list
+     * fails to bgfx_init(), jce_renderer_create() returns NULL and the
+     * engine drops to the SDL software renderer (the blue/orange
+     * info-panel UI in jce_renderer_render_fallback_frame()).
+     *
      * Must stay aligned with JCE_SHADER_PROFILES in the top-level
      * CMakeLists.txt (we only list backends whose .bin shaders are
      * actually built on this platform):
      *
-     *   Windows : dx11 spv glsl  → D3D12 D3D11 Vulkan OpenGL
+     *   Windows : dx11 spv glsl  → D3D12 Vulkan D3D11 OpenGL
      *   macOS   : mtl  spv       → Metal Vulkan
      *   iOS/tvOS: mtl  spv       → Metal Vulkan
      *   Linux   : spv  glsl      → Vulkan OpenGL
-     *   Android : essl spv       → OpenGLES Vulkan
+     *   Android : essl spv       → Vulkan OpenGLES
      *   Web     : essl           → OpenGLES
      *
      * jce_renderer.c::get_platform_fallback_chain() also calls this
@@ -261,19 +271,26 @@ int jce_renderer_caps_preferred_chain(enum JceRendererBackend *out, int max)
      * UI dropdown and shader compilation all stay in lock-step. */
     static const enum JceRendererBackend chain[] = {
 #if defined(_WIN32)
-        JCE_BACKEND_D3D12, JCE_BACKEND_D3D11, JCE_BACKEND_VULKAN, JCE_BACKEND_OPENGL,
+        /* D3D12 (lowest overhead, modern PSO model) →
+         * Vulkan  (modern explicit API, good perf on NV/AMD) →
+         * D3D11  (mature, broadest driver compatibility) →
+         * OpenGL (final compatibility fallback). */
+        JCE_BACKEND_D3D12, JCE_BACKEND_VULKAN, JCE_BACKEND_D3D11, JCE_BACKEND_OPENGL,
 #elif defined(__APPLE__)
-        /* Apple deprecated desktop OpenGL; bgfx ships with
+        /* Metal (native, best perf) → Vulkan via MoltenVK (compat).
+         * Apple deprecated desktop OpenGL; bgfx ships with
          * BGFX_CONFIG_RENDERER_OPENGL=0 on macOS and never reports
          * BGFX_RENDERER_TYPE_OPENGL.  Listing it here would only
          * pollute the editor preference dropdown with an unsupported
          * entry, so we omit GL on Apple platforms. */
         JCE_BACKEND_METAL, JCE_BACKEND_VULKAN,
 #elif defined(__ANDROID__)
+        /* Vulkan (modern, perf) → OpenGL ES (universal compat). */
         JCE_BACKEND_VULKAN, JCE_BACKEND_OPENGLES,
 #elif defined(__EMSCRIPTEN__)
         JCE_BACKEND_OPENGLES,
 #else /* Linux / other Unix */
+        /* Vulkan (modern, perf) → OpenGL (compat). */
         JCE_BACKEND_VULKAN, JCE_BACKEND_OPENGL,
 #endif
     };

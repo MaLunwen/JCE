@@ -325,7 +325,7 @@ void jce_editor_panel_timeline(void)
 
     char title[256];
     snprintf(title, sizeof(title), "%s###timeline", jce_editor_i18n("Timeline"));
-    if (ImGui::Begin(title, vis))
+    if (ImGui::Begin(title, vis, ImGuiWindowFlags_NoFocusOnAppearing))
         jce_editor_panel_timeline_content();
     ImGui::End();
 }

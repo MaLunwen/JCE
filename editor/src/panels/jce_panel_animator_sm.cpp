@@ -26,6 +26,8 @@
 #include "ui/jce_theme_palette.h"
 
 #include <jce/tools/jce_imgui.hpp>
+#include "dialogs/jce_path_input.h"
+#include "core/jce_assetdb.h"
 extern "C" {
 #include <jce/os/core/jce_json.h>
 }
@@ -567,7 +569,7 @@ void draw_state_inspector(void)
     }
     State &s = g.states[g.sel_state];
     ImGui::InputText(jce_editor_i18n_id("animatorSM.field.name", "s"), s.name,      sizeof(s.name));
-    ImGui::InputText(jce_editor_i18n_id("animatorSM.field.clip", "s"), s.clip_path, sizeof(s.clip_path));
+    jce_draw_path_input_asset(jce_editor_i18n_id("animatorSM.field.clip", "s"), s.clip_path, sizeof(s.clip_path), JCE_ASSET_KIND_DATA);
     if (ImGui::BeginDragDropTarget()) {
         if (const ImGuiPayload *pl = ImGui::AcceptDragDropPayload("JCE_ASSET_PATH")) {
             std::strncpy(s.clip_path, (const char *)pl->Data, sizeof(s.clip_path) - 1);
@@ -703,7 +705,7 @@ void draw_toolbar(void)
     }
     ImGui::SameLine();
     ImGui::SetNextItemWidth(380);
-    ImGui::InputText(jce_editor_i18n_id("animatorSM.field.path", "sm"), g.path, sizeof(g.path));
+    jce_draw_path_input(jce_editor_i18n_id("animatorSM.field.path", "sm"), g.path, sizeof(g.path), JcePathKind::FileAbs);
     ImGui::SameLine();
     if (g.adding_from >= 0)
         ImGui::TextColored(ImVec4(0.4f, 0.85f, 1.0f, 1.0f),
@@ -748,7 +750,7 @@ extern "C" void jce_editor_panel_animator_sm(void)
     char _wt[96];
     snprintf(_wt, sizeof(_wt), "%s###jce_anim_sm", jce_editor_i18n("animatorSM.title"));
     if (!ImGui::Begin(_wt,
-                      jce_editor_panel_visible_ptr(JCE_PANEL_ANIMATOR_SM)))
+                      jce_editor_panel_visible_ptr(JCE_PANEL_ANIMATOR_SM), ImGuiWindowFlags_NoFocusOnAppearing))
     {
         ImGui::End();
         return;

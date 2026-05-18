@@ -33,8 +33,29 @@ JCE_API void JCE_CALL jce_fs_destroy(JceFileSystem *fs);
 /* -- Mount points --------------------------------------------------- */
 
 /* Register a PAK archive as a read source.
-   Assets stored in PAK are resolved by their embedded path. */
+   Assets stored in PAK are resolved by their embedded path.
+   This is the legacy single-pak entry point: the archive occupies the
+   "unnamed" slot in the priority list and is replaced (not stacked)
+   by subsequent calls to this function. */
 JCE_API void JCE_CALL jce_fs_mount_pak(JceFileSystem *fs, JcePakArchive *pak);
+
+/* Mount an additional named PAK at the FRONT of the priority list so
+ * its assets shadow earlier mounts (Unity AssetBundle semantics).
+ * `name` is copied internally — typically the bundle id.  Returns false
+ * if the name is already mounted, the table is full, or out of memory.
+ * Pair with jce_fs_unmount_pak_named() for symmetry. */
+JCE_API bool JCE_CALL jce_fs_mount_pak_named(JceFileSystem *fs,
+                                             const char *name,
+                                             JcePakArchive *pak);
+
+/* Remove a previously named-mounted PAK.  Returns true if found.  The
+ * caller owns the JcePakArchive lifetime — this only detaches it from
+ * the VFS lookup chain. */
+JCE_API bool JCE_CALL jce_fs_unmount_pak_named(JceFileSystem *fs,
+                                               const char *name);
+
+/* Number of mounted PAK archives (named + legacy combined). */
+JCE_API uint32_t JCE_CALL jce_fs_mounted_pak_count(const JceFileSystem *fs);
 
 /* Register a loose-file directory as a read source.
    prefix: virtual path prefix (e.g. "assets/").
@@ -192,6 +213,26 @@ JCE_API void *jce_fs_host_read_capped(const char *path, uint64_t max_bytes,
    NULL is OK.  Required because the engine internal allocator is not
    exposed in the public API. */
 JCE_API void JCE_CALL jce_fs_buffer_free(void *buf);
+
+/* Active VFS override.
+ *
+ * Function-pointer hook to avoid a hard link dependency on the VFS
+ * read API (jce_fs_read_all lives in jce_filesystem.c, which not every
+ * jce_filesystem_host.c consumer links — e.g. the cooker tool).
+ *
+ * Editor wiring:
+ *   jce_fs_set_active(g_bm.fs);   // installs jce_fs_read_all as reader
+ *
+ * Asset cache loaders calling jce_fs_host_read_all will then transparently
+ * see bundle-resident files first, with host-file fallback on miss. */
+typedef void *(*JceFsReadFn)(const JceFileSystem *fs, const char *path,
+                             uint64_t *out_size);
+JCE_API void              JCE_CALL jce_fs_set_active(JceFileSystem *fs);
+JCE_API JceFileSystem *   JCE_CALL jce_fs_get_active(void);
+/* Low-level: install a custom reader paired with the active fs handle.
+ * Default reader is set to jce_fs_read_all when you call
+ * jce_fs_set_active(); use this only for tests or alternate backends. */
+JCE_API void              JCE_CALL jce_fs_set_active_reader(JceFsReadFn fn);
 
 /* Get the executable's directory (with trailing path separator) into
    `out`.  Returns true on success.  Equivalent to SDL_GetBasePath. */

@@ -16,6 +16,7 @@
  */
 
 #include "jce_editor_dialogs.h"
+#include "jce_path_input.h"
 #include "core/jce_editor_config.h"
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_style.h"
@@ -332,9 +333,10 @@ void draw_paths_page()
     ImGui::TextWrapped("%s", jce_editor_i18n("preferences.paths.help"));
     ImGui::Spacing();
 
-    if (ImGui::InputText(jce_editor_i18n("preferences.paths.buildOutput"),
-                         s_p.cfg.build_output_path,
-                         sizeof(s_p.cfg.build_output_path)))
+    if (jce_draw_path_input(jce_editor_i18n("preferences.paths.buildOutput"),
+                            s_p.cfg.build_output_path,
+                            sizeof(s_p.cfg.build_output_path),
+                            JcePathKind::FolderAbs))
         MARK_DIRTY();
 }
 

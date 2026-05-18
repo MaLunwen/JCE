@@ -32,6 +32,8 @@
 #include "ui/jce_editor_panels.h"
 
 #include <jce/tools/jce_imgui.hpp>
+#include "dialogs/jce_path_input.h"
+#include "core/jce_assetdb.h"
 extern "C" {
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_filesystem.h>
@@ -207,7 +209,7 @@ extern "C" void jce_editor_panel_test_runner_content(void)
     ImGui::TextUnformatted(jce_editor_i18n("testRunner.dir"));
     ImGui::SameLine();
     ImGui::SetNextItemWidth(-260);
-    ImGui::InputText("##trdir", s_tr.dir, sizeof(s_tr.dir));
+    jce_draw_path_input("##trdir", s_tr.dir, sizeof(s_tr.dir), JcePathKind::FolderAbs);
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("testRunner.rescan"))) rescan();
     ImGui::SameLine();
@@ -283,7 +285,7 @@ extern "C" void jce_editor_panel_test_runner(void)
     if (!*jce_editor_panel_visible_ptr(JCE_PANEL_TEST_RUNNER)) return;
     char _wt[128];
     snprintf(_wt, sizeof(_wt), "%s###test_runner", jce_editor_i18n("testRunner.title"));
-    if (ImGui::Begin(_wt, jce_editor_panel_visible_ptr(JCE_PANEL_TEST_RUNNER))) {
+    if (ImGui::Begin(_wt, jce_editor_panel_visible_ptr(JCE_PANEL_TEST_RUNNER), ImGuiWindowFlags_NoFocusOnAppearing)) {
         jce_editor_panel_test_runner_content();
     }
     ImGui::End();

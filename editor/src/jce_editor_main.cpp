@@ -133,7 +133,7 @@ static bool editor_app_init(const JceServices *svc, void *ud)
     jce_renderer_present_splash(svc->renderer, svc->window, 0x1c1c1cff);
 
     jce_editor_scene_render_init(svc->renderer, svc->pak, svc->assets);
-    jce_editor_game_render_init(svc->renderer, svc->window);
+    jce_editor_game_render_init(svc->renderer, svc->window, svc->pak);
 
     /* Register editor built-in game modules (e.g. FPS Demo) so they
      * appear in the Game View "Module" dropdown. */

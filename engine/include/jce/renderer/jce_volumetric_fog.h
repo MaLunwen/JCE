@@ -82,15 +82,18 @@ JCE_API uint16_t                jce_volumetric_fog_get_result_texture(const JceV
 /* Composite the most recently rendered fog RT into the destination
  * frame buffer using blend equation:
  *   dst.rgb = dst.rgb * fog.a + fog.rgb
- * Submits one fullscreen quad on `view_id`, leaving the bound view
- * frame buffer to be configured by the caller (or BGFX_INVALID_HANDLE
- * to draw to the back buffer).  Caller is expected to set the view's
- * frame buffer + viewport before calling.
+ * Submits one fullscreen quad on `view_id` after binding `dst_fb_idx`
+ * (UINT16_MAX = back buffer) and the view rect to the fog RT size.
+ * IMPORTANT: `view_id` must be greater than the view-id passed to
+ * jce_volumetric_fog_render(); bgfx executes views in ascending order,
+ * so composite runs AFTER fog render so it samples this-frame's fog
+ * tex (not the previous frame's).
  *
  * No-op when fog was not rendered this frame, or the program failed
  * to load. */
 JCE_API void                    jce_volumetric_fog_composite(JceVolumetricFog *f,
-                                                             uint16_t view_id);
+                                                             uint16_t view_id,
+                                                             uint16_t dst_fb_idx);
 
 #ifdef __cplusplus
 }

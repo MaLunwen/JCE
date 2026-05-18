@@ -177,9 +177,22 @@ static bool setup_scene_viewport(SceneViewCtx *ctx)
         return false;
     }
 
-    uint32_t vp_w = (uint32_t)fmaxf(1.0f, floorf(avail_raw.x));
-    uint32_t vp_h = (uint32_t)fmaxf(1.0f, floorf(avail_raw.y));
-    ImVec2 avail((float)vp_w, (float)vp_h);
+    /* Use the real avail size as the render target. Original FBO churn
+     * mitigation (32-px quantization) caused a visible aspect mismatch
+     * because the renderer fills the quantized texture but ImGui
+     * displays the avail rect — switching back to real size now that
+     * the offscreen-target retire pool handles the handle-recycle race
+     * that originally caused crashes during drag-resize. */
+    uint32_t avail_w = (uint32_t)fmaxf(1.0f, floorf(avail_raw.x));
+    uint32_t avail_h = (uint32_t)fmaxf(1.0f, floorf(avail_raw.y));
+    uint32_t vp_w = avail_w;
+    uint32_t vp_h = avail_h;
+    if (vp_w < 16u) vp_w = 16u;
+    if (vp_h < 16u) vp_h = 16u;
+    ImVec2 avail((float)avail_w, (float)avail_h);
+
+    float uv_u1 = 1.0f;
+    float uv_v1 = 1.0f;
 
     ImVec2 screen_pos = ImGui::GetCursorScreenPos();
     ImDrawList *dl = ImGui::GetWindowDrawList();
@@ -195,9 +208,10 @@ static bool setup_scene_viewport(SceneViewCtx *ctx)
         const bool origin_bl = jce_renderer_origin_bottom_left();
         if (origin_bl) {
             ImGui::Image((ImTextureID)(uintptr_t)tex_idx, avail,
-                         ImVec2(0.0f, 1.0f), ImVec2(1.0f, 0.0f));
+                         ImVec2(0.0f, uv_v1), ImVec2(uv_u1, 0.0f));
         } else {
-            ImGui::Image((ImTextureID)(uintptr_t)tex_idx, avail);
+            ImGui::Image((ImTextureID)(uintptr_t)tex_idx, avail,
+                         ImVec2(0.0f, 0.0f), ImVec2(uv_u1, uv_v1));
         }
     } else {
         ImGui::SetCursorScreenPos(ImVec2(screen_pos.x + 8, screen_pos.y + 8));
@@ -1580,7 +1594,7 @@ void jce_editor_panel_scene_view(void)
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     char title[256];
     snprintf(title, sizeof(title), "%s###scene_view", jce_editor_i18n("Scene"));
-    if (ImGui::Begin(title, vis))
+    if (ImGui::Begin(title, vis, ImGuiWindowFlags_NoFocusOnAppearing))
         jce_editor_panel_scene_view_content();
     ImGui::End();
     ImGui::PopStyleVar();

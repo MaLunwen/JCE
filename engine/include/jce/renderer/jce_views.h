@@ -42,6 +42,39 @@
  * of editor panels. */
 #define JCE_VIEW_UI          254
 
-/* no extern "C" needed — this header contains only #define macros */
+/* Range of transient view ids reserved exclusively for clearing
+ * freshly-created render-target textures. NOT USED any more —
+ * view-id-based ordering doesn't work for this purpose because bgfx
+ * runs all views per frame and the renderer's own writes to the FBO
+ * happen via lower view ids that run BEFORE our clear. Kept as
+ * reserved range; clears are now done via direct CPU-zero upload at
+ * texture creation time (see jce_clear_freshly_created_fbo). */
+#define JCE_VIEW_INIT_CLEAR_BASE  232
+#define JCE_VIEW_INIT_CLEAR_COUNT 16
+#define JCE_VIEW_INIT_CLEAR       JCE_VIEW_INIT_CLEAR_BASE  /* legacy alias */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* No-op stub kept for ABI; see jce_views.c. The right way to scrub
+ * fresh GPU textures is to upload zero memory at create time, which
+ * each subsystem now does directly via bgfx_create_texture_2d's _mem
+ * parameter when needed. */
+void jce_clear_freshly_created_fbo(unsigned short fb_idx,
+                                   unsigned short width,
+                                   unsigned short height);
+
+/* Returns a bgfx_memory_t of `size_bytes` filled with zeros (or NULL
+ * on alloc failure). Pass to bgfx_create_texture_2d's _mem parameter
+ * so the new texture's GPU storage starts as solid black instead of
+ * leftover uninitialised VRAM ("rainbow garbage"). bgfx releases the
+ * memory once the upload is enqueued. */
+struct bgfx_memory;
+const struct bgfx_memory *jce_zero_init_mem(unsigned int size_bytes);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* JCE_VIEWS_H */

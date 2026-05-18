@@ -27,6 +27,8 @@
 #include <jce/os/core/jce_event.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/resource/jce_pak_loader.h>
+#include <jce/resource/jce_bundle_loader.h>
+#include <jce/os/core/jce_filesystem.h>
 #include <jce/os/platform/jce_input.h>
 #include <jce/os/platform/jce_single_instance.h>
 #include <jce/os/platform/jce_window.h>
@@ -49,6 +51,7 @@ static JceAppDesc  g_app_desc;
 static bool        g_app_desc_set;
 static char        g_config_path_override[512];
 static char        g_pak_path_override[512];
+static char        g_bundle_catalog_path[512];
 static int         g_renderer_backend_override = -1;  /* -1 = no override */
 
 void jce_engine_set_app_desc(const JceAppDesc *desc)
@@ -84,6 +87,15 @@ void jce_engine_set_pak_path(const char *path)
 void jce_engine_set_renderer_override(int backend)
 {
     g_renderer_backend_override = backend;
+}
+
+void jce_engine_set_bundle_catalog_path(const char *path)
+{
+    if (!path || !path[0]) {
+        g_bundle_catalog_path[0] = '\0';
+        return;
+    }
+    snprintf(g_bundle_catalog_path, sizeof(g_bundle_catalog_path), "%s", path);
 }
 
 static bool jce_path_exists(const char *path)
@@ -125,6 +137,10 @@ struct JceEngine {
     JcePakArchive      *pak;
     JceAssetManager *assets;
     JceServices      svc;           /* subsystem handles for IApp */
+
+    /* Optional scene-asset bundle catalog (NULL when unused). */
+    void               *bundle_catalog; /* JceBundleCatalog* (opaque) */
+    JceFileSystem      *bundle_fs;      /* multi-pak FS for mounted bundles */
 
     /* L1/L2 infrastructure (Phase 0) */
     jce_event_bus_t            *event_bus;
@@ -341,6 +357,21 @@ JceEngine *jce_engine_create(int argc, char *argv[])
     if (!e->pak) {
         fatal_msg("Failed to open PAK archive");
         goto fail;
+    }
+
+    /* Optional bundle catalog (opt-in via jce_engine_set_bundle_catalog_path). */
+    if (g_bundle_catalog_path[0]) {
+        e->bundle_fs      = jce_fs_create();
+        e->bundle_catalog = jce_bundle_catalog_open(e->bundle_fs,
+                                                    g_bundle_catalog_path);
+        if (!e->bundle_catalog) {
+            LOG_WARN(LOG_TAG, "bundle catalog open failed: %s",
+                     g_bundle_catalog_path);
+            if (e->bundle_fs) {
+                jce_fs_destroy(e->bundle_fs);
+                e->bundle_fs = NULL;
+            }
+        }
     }
 
     /* Override window dimensions from app descriptor if set. */
@@ -709,9 +740,28 @@ JceAppResult jce_engine_event(JceEngine *e, const void *platform_event)
     JceEvent ev = (JceEvent){0};
     translate_sdl_event(event, &ev);
 
-    if (event->type == SDL_EVENT_QUIT) {
+    /* Treat both SDL_EVENT_QUIT and SDL_EVENT_WINDOW_CLOSE_REQUESTED as
+     * application-level quit signals.  SDL3 does not automatically
+     * synthesise SDL_EVENT_QUIT when a window's close button is
+     * clicked, so without this we would silently drop the close
+     * request — which is exactly the bug reported in SDL software
+     * fallback mode (the blue/orange info-panel window had no in-app
+     * quit UI, so its X button appeared dead). */
+    if (event->type == SDL_EVENT_QUIT ||
+        event->type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) {
         if (g_app_desc.on_event)
             g_app_desc.on_event(&ev, g_app_desc.user_data);
+
+        /* In SDL software fallback mode the application's init() callback
+         * was skipped (we early-return after creating the fallback
+         * renderer so heavy subsystems like input/audio/scripting are
+         * never brought up).  That means any `should_quit` callback the
+         * app registered will dereference a null app-state and return
+         * false — leaving the user with an unclosable window.  Bypass
+         * the callback in fallback mode and quit immediately so the
+         * window's X button always works in the safe-mode UI. */
+        if (e->renderer && jce_renderer_is_fallback(e->renderer))
+            return JCE_APP_SUCCESS;
 
         /* If the application registered a should_quit callback, give it
            a chance to intercept the quit (e.g. to show an unsaved-changes
@@ -905,6 +955,11 @@ JceAppResult jce_engine_iterate(JceEngine *e)
 
 /* -- Shutdown ------------------------------------------------------ */
 
+void *jce_engine_get_bundle_catalog(JceEngine *e)
+{
+    return e ? e->bundle_catalog : NULL;
+}
+
 void jce_engine_destroy(JceEngine *e)
 {
     if (!e) return;
@@ -936,6 +991,11 @@ void jce_engine_destroy(JceEngine *e)
      * GPU-touching cleanup the text subsystem may grow. */
     if (e->renderer) jce_renderer_destroy(e->renderer);
     if (e->audio)    jce_audio_destroy(e->audio);
+    if (e->bundle_catalog) {
+        jce_bundle_catalog_close((JceBundleCatalog *)e->bundle_catalog);
+        e->bundle_catalog = NULL;
+    }
+    if (e->bundle_fs) { jce_fs_destroy(e->bundle_fs); e->bundle_fs = NULL; }
     if (e->pak)      jce_pak_close(e->pak);
     if (e->input)    jce_input_destroy(e->input);
     if (e->window)   jce_window_destroy(e->window);

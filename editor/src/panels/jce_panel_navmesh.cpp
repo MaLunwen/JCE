@@ -16,6 +16,8 @@
 #include "ui/jce_theme_palette.h"
 
 #include <jce/tools/jce_imgui.hpp>
+#include "dialogs/jce_path_input.h"
+#include "core/jce_assetdb.h"
 extern "C" {
 #include <jce/os/core/jce_json.h>
 }
@@ -262,7 +264,7 @@ void draw_actions(void)
     if (ImGui::Button(jce_editor_i18n_id("navmesh.button.load", "nav_load"))) load_from(s.path);
     ImGui::SameLine();
     ImGui::SetNextItemWidth(360);
-    ImGui::InputText(jce_editor_i18n_id("navmesh.field.path", "nav_path"), s.path, sizeof(s.path));
+    jce_draw_path_input(jce_editor_i18n_id("navmesh.field.path", "nav_path"), s.path, sizeof(s.path), JcePathKind::FileAbs);
     ImGui::SameLine();
     ImGui::Checkbox(jce_editor_i18n_id("navmesh.field.showOverlay", "nav_overlay"), &s.show_overlay);
 }
@@ -335,7 +337,7 @@ extern "C" void jce_editor_panel_navmesh(void)
     char _wt[96];
     snprintf(_wt, sizeof(_wt), "%s###jce_navmesh", jce_editor_i18n("navmesh.title"));
     if (!ImGui::Begin(_wt,
-                      jce_editor_panel_visible_ptr(JCE_PANEL_NAVMESH)))
+                      jce_editor_panel_visible_ptr(JCE_PANEL_NAVMESH), ImGuiWindowFlags_NoFocusOnAppearing))
     {
         ImGui::End();
         return;

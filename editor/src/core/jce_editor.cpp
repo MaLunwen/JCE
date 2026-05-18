@@ -22,6 +22,7 @@
 #include "ui/jce_editor_panels.h"
 #include "jce_editor_state.h"
 #include "ui/jce_editor_style.h"
+#include "jce_project_settings.h"
 #include <jce/ui/jce_imgui_renderer.h>
 #include "jce_build_manager.h"
 #include "jce_run_manager.h"
@@ -247,18 +248,19 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
     /* Apply JCE dark theme and load custom font. */
     jce_editor_setup_style();
 
+    /* Load editor config once; reuse for theme, font, and scene restore. */
+    JceEditorConfig ecfg = {};
+    const bool have_ecfg = jce_editor_config_load(&ecfg);
+
     /* Apply persisted theme from editor config. setup_style applies the
        default dark theme; this overrides if the user previously chose
        Light/SSMS so the saved preference takes effect at startup. */
-    {
-        JceEditorConfig _ecfg;
-        if (jce_editor_config_load(&_ecfg)) {
-            int t = JCE_THEME_DARK;
-            if      (jce_strcasecmp(_ecfg.theme, "Light") == 0) t = JCE_THEME_LIGHT;
-            else if (jce_strcasecmp(_ecfg.theme, "SSMS")  == 0) t = JCE_THEME_SSMS;
-            else if (jce_strcasecmp(_ecfg.theme, "Blue")  == 0) t = JCE_THEME_SSMS;
-            jce_editor_apply_theme(t);
-        }
+    if (have_ecfg) {
+        int t = JCE_THEME_DARK;
+        if      (jce_strcasecmp(ecfg.theme, "Light") == 0) t = JCE_THEME_LIGHT;
+        else if (jce_strcasecmp(ecfg.theme, "SSMS")  == 0) t = JCE_THEME_SSMS;
+        else if (jce_strcasecmp(ecfg.theme, "Blue")  == 0) t = JCE_THEME_SSMS;
+        jce_editor_apply_theme(t);
     }
 
     /* Cursors. */
@@ -270,11 +272,8 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
         return false;
     }
 
-    /* Load custom font (after bgfx backend is ready).
-       Read saved font size from config; fall back to 14 (default). */
+    /* Load custom font (after bgfx backend is ready). */
     {
-        JceEditorConfig ecfg;
-        jce_editor_config_load(&ecfg);
         float fs = (ecfg.font_size >= 12 && ecfg.font_size <= 48)
                        ? (float)ecfg.font_size : 14.0f;
         jce_editor_load_fonts(pak, fs,
@@ -295,6 +294,14 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
     jce_reflect_register_builtin();
     jce_hotkeys_init();
     jce_gizmo_init();
+
+    /* Pre-warm project settings cache so panels can use
+     * jce_project_settings_current() without a per-panel disk read. */
+    {
+        JceProjectSettings ps;
+        jce_project_settings_load(&ps);
+        (void)ps; /* result already cached inside jce_project_settings_load */
+    }
 
     /* Set window icon from embedded PAK. */
     {
@@ -341,17 +348,11 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
     s_editor.active      = true;
     s_editor.initialized = true;
 
-    /* Auto-restore last opened scene (if any), so the editor reopens
-     * exactly where the user left off.  Silent failure is fine — first
-     * launch or a deleted scene file simply leaves the default empty
-     * scene in place. */
-    {
-        JceEditorConfig _ecfg;
-        if (jce_editor_config_load(&_ecfg)
-            && _ecfg.last_scene_path[0] != '\0'
-            && jce_fs_host_exists_file(_ecfg.last_scene_path)) {
-            (void)jce_state_load_scene_file(_ecfg.last_scene_path);
-        }
+    /* Auto-restore last opened scene. */
+    if (have_ecfg
+        && ecfg.last_scene_path[0] != '\0'
+        && jce_fs_host_exists_file(ecfg.last_scene_path)) {
+        (void)jce_state_load_scene_file(ecfg.last_scene_path);
     }
 
     return true;

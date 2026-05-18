@@ -15,6 +15,8 @@
 #include "core/jce_reflect.h"
 #include "scene/jce_editor_scene_render.h"
 #include "scene/jce_model_loader_assimp.h"
+#include "dialogs/jce_path_input.h"
+#include "core/jce_assetdb.h"
 
 #include <jce/tools/jce_imgui.hpp>
 #include <math.h>
@@ -750,13 +752,13 @@ static void draw_comp_mesh_renderer(JceMeshRenderer *mr)
 
     ImGui::TextColored(JCE_COLOR_INSP_LABEL, "%s", jce_editor_i18n("meshRenderer.mesh"));
     ImGui::SameLine();
-    ImGui::InputText("##mesh_path", mr->mesh_path, sizeof(mr->mesh_path));
+    jce_draw_path_input_asset("##mesh_path", mr->mesh_path, sizeof(mr->mesh_path), JCE_ASSET_KIND_MODEL);
     insp_track_edit();
     accept_mesh_drop_with_material(mr);
 
     ImGui::TextColored(JCE_COLOR_INSP_LABEL, "%s", jce_editor_i18n("meshRenderer.materials"));
     ImGui::SameLine();
-    ImGui::InputText("##mat_path", mr->material_path, sizeof(mr->material_path));
+    jce_draw_path_input_asset("##mat_path", mr->material_path, sizeof(mr->material_path), JCE_ASSET_KIND_MATERIAL);
     if (ImGui::IsItemDeactivatedAfterEdit() && is_mat_json(mr->material_path)) {
         jce_state_begin_batch_edit();
         load_material_into_renderer(mr);
@@ -814,20 +816,20 @@ static void draw_comp_mesh_renderer(JceMeshRenderer *mr)
     }
 
     if (ImGui::TreeNodeEx(jce_editor_i18n("inspector.textures"), ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::InputText(jce_editor_i18n("inspector.texture.albedo"), mr->albedo_tex, 128);
+        jce_draw_path_input_asset(jce_editor_i18n("inspector.texture.albedo"), mr->albedo_tex, 128, JCE_ASSET_KIND_TEXTURE);
         insp_track_edit();
         accept_asset_drop(mr->albedo_tex, 128);
-        ImGui::InputText(jce_editor_i18n("inspector.texture.metalRough"), mr->mr_tex, 128);
+        jce_draw_path_input_asset(jce_editor_i18n("inspector.texture.metalRough"), mr->mr_tex, 128, JCE_ASSET_KIND_TEXTURE);
         insp_track_edit();
         accept_asset_drop(mr->mr_tex, 128);
-        ImGui::InputText(jce_editor_i18n("inspector.texture.normal"), mr->normal_tex, 128);
+        jce_draw_path_input_asset(jce_editor_i18n("inspector.texture.normal"), mr->normal_tex, 128, JCE_ASSET_KIND_TEXTURE);
         insp_track_edit();
         accept_asset_drop(mr->normal_tex, 128);
-        ImGui::InputText(jce_editor_i18n("inspector.texture.ao"), mr->ao_tex, 128);
+        jce_draw_path_input_asset(jce_editor_i18n("inspector.texture.ao"), mr->ao_tex, 128, JCE_ASSET_KIND_TEXTURE);
         insp_track_edit();
         accept_asset_drop(mr->ao_tex, 128);
         snprintf(lbl, sizeof(lbl), "%s###tex", jce_editor_i18n("inspector.texture.emissive"));
-        ImGui::InputText(lbl, mr->emissive_tex, 128);
+        jce_draw_path_input_asset(lbl, mr->emissive_tex, 128, JCE_ASSET_KIND_TEXTURE);
         insp_track_edit();
         accept_asset_drop(mr->emissive_tex, 128);
         ImGui::TreePop();
@@ -836,7 +838,7 @@ static void draw_comp_mesh_renderer(JceMeshRenderer *mr)
 
 static void draw_comp_sprite_renderer(JceSpriteRendererComponent *sr)
 {
-    ImGui::InputText(jce_editor_i18n("spriteRenderer.sprite"), sr->sprite_path, 128);
+    jce_draw_path_input_asset(jce_editor_i18n("spriteRenderer.sprite"), sr->sprite_path, 128, JCE_ASSET_KIND_TEXTURE);
     insp_track_edit();
     accept_asset_drop(sr->sprite_path, 128);
     ImGui::ColorEdit4(jce_editor_i18n("spriteRenderer.color"), sr->color);
@@ -876,7 +878,7 @@ static void draw_comp_skeletal_animator(JceSkeletalAnimatorComponent *skel)
 
     if (skel->speed <= 0.0f) skel->speed = 1.0f;
 
-    ImGui::InputText(jce_editor_i18n("inspector.skeleton"), skel->skeleton_path, 128);
+    jce_draw_path_input_asset(jce_editor_i18n("inspector.skeleton"), skel->skeleton_path, 128, JCE_ASSET_KIND_DATA);
     insp_track_edit();
     accept_asset_drop(skel->skeleton_path, 128);
 
@@ -1009,7 +1011,7 @@ static void draw_comp_character_controller(JceCharacterControllerComponent *cc)
 static void draw_comp_audio_source(JceAudioSourceComponent *as)
 {
     char lbl[256];
-    ImGui::InputText(jce_editor_i18n("audioSource.clip"), as->clip_path, 128);
+    jce_draw_path_input_asset(jce_editor_i18n("audioSource.clip"), as->clip_path, 128, JCE_ASSET_KIND_AUDIO);
     insp_track_edit();
     accept_asset_drop(as->clip_path, 128);
     ImGui::DragFloat(jce_editor_i18n("audioSource.volume"), &as->volume, 0.01f, 0.0f, 1.0f);
@@ -1027,14 +1029,14 @@ static void draw_comp_audio_source(JceAudioSourceComponent *as)
 
 static void draw_comp_script(JceScriptComponent *scr)
 {
-    ImGui::InputText("##script_path", scr->script_path, 128);
+    jce_draw_path_input_asset("##script_path", scr->script_path, 128, JCE_ASSET_KIND_SCRIPT);
     insp_track_edit();
     accept_asset_drop(scr->script_path, 128);
 }
 
 static void draw_comp_skybox(JceSkyboxComponent *sky)
 {
-    ImGui::InputText(jce_editor_i18n("skybox.hdrPath"), sky->hdr_path, 256);
+    jce_draw_path_input_asset(jce_editor_i18n("skybox.hdrPath"), sky->hdr_path, 256, JCE_ASSET_KIND_TEXTURE);
     insp_track_edit();
     accept_asset_drop(sky->hdr_path, 256);
     ImGui::DragFloat(jce_editor_i18n("skybox.rotation"), &sky->rotation, 1.0f, 0.0f, 360.0f, "%.1f deg");
@@ -1048,10 +1050,10 @@ static void draw_comp_skybox(JceSkyboxComponent *sky)
 
 static void draw_comp_sprite_animator(JceSpriteAnimatorComponent *sa)
 {
-    ImGui::InputText(jce_editor_i18n("spriteAnimator.sheetPath"), sa->sheet_path, 128);
+    jce_draw_path_input_asset(jce_editor_i18n("spriteAnimator.sheetPath"), sa->sheet_path, 128, JCE_ASSET_KIND_DATA);
     insp_track_edit();
     accept_asset_drop(sa->sheet_path, 128);
-    ImGui::InputText(jce_editor_i18n("spriteAnimator.atlasPath"), sa->atlas_path, 128);
+    jce_draw_path_input_asset(jce_editor_i18n("spriteAnimator.atlasPath"), sa->atlas_path, 128, JCE_ASSET_KIND_DATA);
     insp_track_edit();
     accept_asset_drop(sa->atlas_path, 128);
     ImGui::DragInt(jce_editor_i18n("spriteAnimator.frameWidth"), &sa->frame_width, 1, 1, 4096);
@@ -1093,7 +1095,7 @@ static void draw_comp_constraint(JceConstraintComponent *con)
 static void draw_comp_terrain(JceTerrainComponent *tc)
 {
     if (!tc) return;
-    ImGui::InputText(jce_editor_i18n("inspector.terrain.path"), tc->terrain_path, sizeof tc->terrain_path);
+    jce_draw_path_input_asset(jce_editor_i18n("inspector.terrain.path"), tc->terrain_path, sizeof tc->terrain_path, JCE_ASSET_KIND_DATA);
     insp_track_edit();
     accept_asset_drop(tc->terrain_path, sizeof tc->terrain_path);
     ImGui::TextDisabled("%s", jce_editor_i18n("inspector.terrain.dropHint"));
@@ -1116,8 +1118,8 @@ static void draw_comp_terrain(JceTerrainComponent *tc)
         char label[32];
         snprintf(label, sizeof label, jce_editor_i18n("inspector.terrain.layerFmt"), i);
         ImGui::PushID(i);
-        ImGui::InputText(label, tc->layer_albedo_path[i],
-                         sizeof tc->layer_albedo_path[i]);
+        jce_draw_path_input_asset(label, tc->layer_albedo_path[i],
+                         sizeof tc->layer_albedo_path[i], JCE_ASSET_KIND_TEXTURE);
         insp_track_edit();
         accept_asset_drop(tc->layer_albedo_path[i],
                           sizeof tc->layer_albedo_path[i]);
@@ -1160,8 +1162,8 @@ static void draw_comp_lod_group(JceLodGroupComponent *lg)
         ImGui::TextUnformatted(hdr);
         ImGui::DragFloat(jce_editor_i18n("inspector.lod.lodDistance"), &lg->distances[i], 0.5f, 0.0f, 100000.0f, "%.1f");
         insp_track_edit();
-        ImGui::InputText(jce_editor_i18n("inspector.lod.meshOverride"), lg->level_mesh_paths[i],
-                         sizeof lg->level_mesh_paths[i]);
+        jce_draw_path_input_asset(jce_editor_i18n("inspector.lod.meshOverride"), lg->level_mesh_paths[i],
+                         sizeof lg->level_mesh_paths[i], JCE_ASSET_KIND_MODEL);
         insp_track_edit();
         accept_asset_drop(lg->level_mesh_paths[i], sizeof lg->level_mesh_paths[i]);
         ImGui::Separator();
@@ -1281,7 +1283,7 @@ static void draw_comp_capsule_collider(JceCapsuleColliderComponent *cc)
 static void draw_comp_mesh_collider(JceMeshColliderComponent *mc)
 {
     if (!mc) return;
-    ImGui::InputText(jce_editor_i18n_id("inspector.meshcol.mesh", "meshcol"), mc->mesh_path, sizeof mc->mesh_path);
+    jce_draw_path_input_asset(jce_editor_i18n_id("inspector.meshcol.mesh", "meshcol"), mc->mesh_path, sizeof mc->mesh_path, JCE_ASSET_KIND_MODEL);
     insp_track_edit();
     accept_asset_drop(mc->mesh_path, sizeof mc->mesh_path);
     if (ImGui::Checkbox(jce_editor_i18n_id("inspector.meshcol.convex", "meshcol"), &mc->convex))
@@ -1392,7 +1394,7 @@ static void draw_comp_behavior_tree(JceBehaviorTree *bt)
 static void draw_comp_trail_renderer(JceTrailRendererComponent *t)
 {
     if (!t) return;
-    ImGui::InputText(jce_editor_i18n_id("inspector.trail.material", "trail"), t->material_path, sizeof t->material_path);
+    jce_draw_path_input_asset(jce_editor_i18n_id("inspector.trail.material", "trail"), t->material_path, sizeof t->material_path, JCE_ASSET_KIND_MATERIAL);
     insp_track_edit();
     accept_asset_drop(t->material_path, sizeof t->material_path);
     ImGui::DragFloat(jce_editor_i18n_id("inspector.trail.time", "trail"), &t->time, 0.05f, 0.0f, 600.0f, "%.2fs"); insp_track_edit();
@@ -1409,7 +1411,7 @@ static void draw_comp_trail_renderer(JceTrailRendererComponent *t)
 static void draw_comp_line_renderer(JceLineRendererComponent *l)
 {
     if (!l) return;
-    ImGui::InputText(jce_editor_i18n_id("inspector.line.material", "line"), l->material_path, sizeof l->material_path);
+    jce_draw_path_input_asset(jce_editor_i18n_id("inspector.line.material", "line"), l->material_path, sizeof l->material_path, JCE_ASSET_KIND_MATERIAL);
     insp_track_edit();
     accept_asset_drop(l->material_path, sizeof l->material_path);
     int n = l->position_count;
@@ -1457,7 +1459,7 @@ static void draw_comp_reflection_probe(JceReflectionProbeComponent *r)
     if (ImGui::Checkbox(jce_editor_i18n_id("inspector.refl.boxProjection", "refl"), &r->box_projection)) insp_undo_bool(&r->box_projection);
     if (ImGui::Checkbox(jce_editor_i18n_id("inspector.refl.hdr", "refl"), &r->hdr)) insp_undo_bool(&r->hdr);
     if (r->mode == JCE_REFLECTION_PROBE_CUSTOM) {
-        ImGui::InputText(jce_editor_i18n_id("inspector.refl.customHdr", "refl"), r->custom_hdr_path, sizeof r->custom_hdr_path);
+        jce_draw_path_input_asset(jce_editor_i18n_id("inspector.refl.customHdr", "refl"), r->custom_hdr_path, sizeof r->custom_hdr_path, JCE_ASSET_KIND_TEXTURE);
         insp_track_edit();
         accept_asset_drop(r->custom_hdr_path, sizeof r->custom_hdr_path);
     }
@@ -1466,7 +1468,7 @@ static void draw_comp_reflection_probe(JceReflectionProbeComponent *r)
 static void draw_comp_decal(JceDecalComponent *d)
 {
     if (!d) return;
-    ImGui::InputText(jce_editor_i18n_id("inspector.decal.material", "decal"), d->material_path, sizeof d->material_path);
+    jce_draw_path_input_asset(jce_editor_i18n_id("inspector.decal.material", "decal"), d->material_path, sizeof d->material_path, JCE_ASSET_KIND_MATERIAL);
     insp_track_edit();
     accept_asset_drop(d->material_path, sizeof d->material_path);
     ImGui::DragFloat3(jce_editor_i18n_id("inspector.decal.size", "decal"),  d->size,  0.05f, 0.0f, 1000.0f, "%.3f"); insp_track_edit();
@@ -1745,7 +1747,7 @@ static void draw_comp_joint2d(JceJoint2DComponent *j)
 static void draw_comp_billboard_renderer(JceBillboardRendererComponent *b)
 {
     if (!b) return;
-    ImGui::InputText(jce_editor_i18n_id("inspector.br.texturePath", "br"), b->texture_path, sizeof b->texture_path); insp_track_edit();
+    jce_draw_path_input_asset(jce_editor_i18n_id("inspector.br.texturePath", "br"), b->texture_path, sizeof b->texture_path, JCE_ASSET_KIND_TEXTURE); insp_track_edit();
     static const char *modes[] = { "Full", "Y-Axis Only" };
     int m = b->mode; if (m < 0 || m > 1) m = 0;
     if (ImGui::Combo(jce_editor_i18n_id("inspector.br.mode", "br"), &m, modes, 2)) { b->mode = m; insp_track_edit(); }
@@ -1795,7 +1797,7 @@ static void draw_comp_layout_group(JceLayoutGroupComponent *lg)
 static void draw_comp_ui_image(JceUIImageComponent *im)
 {
     if (!im) return;
-    ImGui::InputText(jce_editor_i18n_id("inspector.uim.spritePath", "uim"), im->sprite_path, sizeof im->sprite_path); insp_track_edit();
+    jce_draw_path_input_asset(jce_editor_i18n_id("inspector.uim.spritePath", "uim"), im->sprite_path, sizeof im->sprite_path, JCE_ASSET_KIND_TEXTURE); insp_track_edit();
     static const char *types[] = { "Simple", "Sliced", "Tiled", "Filled" };
     int t = im->image_type; if (t < 0 || t > 3) t = 0;
     if (ImGui::Combo(jce_editor_i18n_id("inspector.uim.imageType", "uim"), &t, types, 4)) { im->image_type = t; insp_track_edit(); }
@@ -1811,7 +1813,7 @@ static void draw_comp_ui_text(JceUITextComponent *tx)
 {
     if (!tx) return;
     ImGui::InputTextMultiline(jce_editor_i18n_id("inspector.uit.text", "uit"), tx->text, sizeof tx->text, ImVec2(0, ImGui::GetTextLineHeight() * 4)); insp_track_edit();
-    ImGui::InputText(jce_editor_i18n_id("inspector.uit.fontPath", "uit"), tx->font_path, sizeof tx->font_path); insp_track_edit();
+    jce_draw_path_input_asset(jce_editor_i18n_id("inspector.uit.fontPath", "uit"), tx->font_path, sizeof tx->font_path, JCE_ASSET_KIND_DATA); insp_track_edit();
     ImGui::DragFloat(jce_editor_i18n_id("inspector.uit.fontSize", "uit"), &tx->font_size, 0.5f, 1.0f, 512.0f, "%.1f"); insp_track_edit();
     static const char *aligns[] = { "Left", "Center", "Right" };
     int a = tx->alignment; if (a < 0 || a > 2) a = 0;
@@ -3047,7 +3049,7 @@ void jce_editor_panel_inspector(void)
 
     char title[256];
     snprintf(title, sizeof(title), "%s###inspector", jce_editor_i18n("Inspector"));
-    if (ImGui::Begin(title, vis))
+    if (ImGui::Begin(title, vis, ImGuiWindowFlags_NoFocusOnAppearing))
         jce_editor_panel_inspector_content();
     ImGui::End();
 }

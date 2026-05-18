@@ -32,6 +32,8 @@
 
 #include <jce/tools/jce_imgui.hpp>
 #include <jce/tools/jce_imgui_internal.h>
+#include "dialogs/jce_path_input.h"
+#include "core/jce_assetdb.h"
 extern "C" {
 #include <jce/os/core/jce_json.h>
 #include <jce/renderer/jce_pbr_material.h>
@@ -1269,7 +1271,7 @@ void draw_content(void)
 {
     ensure_output_node();
 
-    ImGui::InputText(jce_editor_i18n("materialGraph.field.file"), s_g.path, sizeof(s_g.path));
+    jce_draw_path_input(jce_editor_i18n("materialGraph.field.file"), s_g.path, sizeof(s_g.path), JcePathKind::FileAbs);
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("materialGraph.button.saveGraph")) && s_g.path[0]) save_graph(s_g.path);
     ImGui::SameLine();
@@ -1311,7 +1313,7 @@ extern "C" void jce_editor_panel_material_graph(void)
     if (!vis || !*vis) return;
     char _wt[96];
     snprintf(_wt, sizeof(_wt), "%s###jce_material_graph", jce_editor_i18n("materialGraph.title"));
-    if (ImGui::Begin(_wt, vis)) {
+    if (ImGui::Begin(_wt, vis, ImGuiWindowFlags_NoFocusOnAppearing)) {
         draw_content();
     }
     ImGui::End();

@@ -350,6 +350,7 @@ _jce_add_layer(jce_resource
 		miniaudio::miniaudio
 		zstd::libzstd_static
 		xxHash::xxhash
+		cjson::cjson
 		bgfx::bgfx
 		assimp::assimp
 	CXX)

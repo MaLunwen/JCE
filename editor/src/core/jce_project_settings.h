@@ -166,6 +166,31 @@ typedef struct {
     int   maximum_particle_timestep_ms;
 } JceProjectTime;
 
+/* ── Rendering (PostFX + Fog + Ambient) ────────────────────────────── */
+typedef struct {
+    /* PostFX — mirrors JcePostFXParams + per-effect enabled flags */
+    bool  postfx_enabled[6];      /* indexed by JcePostFXType order */
+    float exposure;               /* tonemap: default 1.0 */
+    float gamma;                  /* tonemap: default 2.2 */
+    float bloom_threshold;        /* bloom:   default 1.0 */
+    float bloom_intensity;        /* bloom:   default 0.5 */
+    float fxaa_span_max;          /* fxaa:    default 8.0 */
+    float vignette_intensity;     /* vignette: default 0.3 */
+    float vignette_smoothness;    /* vignette: default 2.0 */
+    float chromatic_strength;     /* chromatic: default 0.005 */
+
+    /* Volumetric fog */
+    bool  fog_enabled;
+    float fog_color[3];           /* default: 0.7, 0.75, 0.85 */
+    float fog_density;            /* default: 0.02 */
+    float fog_height_falloff;     /* default: 0.05 */
+    float fog_height_origin;      /* default: 0.0 */
+
+    /* Ambient light */
+    float ambient_color[3];       /* default: 0.1, 0.1, 0.12 */
+    float ambient_intensity;      /* default: 1.0 */
+} JceProjectRendering;
+
 /* ── Aggregate ─────────────────────────────────────────────────────── */
 typedef struct {
     JceProjectAudio          audio;
@@ -179,6 +204,7 @@ typedef struct {
     JceProjectQuality        quality;
     JceProjectTagsAndLayers  tags_layers;
     JceProjectTime           time;
+    JceProjectRendering      rendering;
 } JceProjectSettings;
 
 /* ── Lifecycle ─────────────────────────────────────────────────────── */

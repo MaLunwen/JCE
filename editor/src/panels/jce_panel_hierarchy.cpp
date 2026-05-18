@@ -218,7 +218,7 @@ void jce_editor_panel_hierarchy(void)
 
     char title[256];
     snprintf(title, sizeof(title), "%s###hierarchy", jce_editor_i18n("Hierarchy"));
-    if (ImGui::Begin(title, vis))
+    if (ImGui::Begin(title, vis, ImGuiWindowFlags_NoFocusOnAppearing))
         jce_editor_panel_hierarchy_content();
     ImGui::End();
 }

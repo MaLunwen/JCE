@@ -44,6 +44,14 @@ std::string trim_copy(const std::string &s)
 
 bool path_is_file(const char *path)
 {
+    if (!path || !path[0]) return false;
+    /* VFS-first: bundle/PAK mounts surface virtual paths that don't
+     * exist on the host filesystem.  Asking the active VFS first lets
+     * the resolver tree (texture / material / mesh path lookups) treat
+     * mounted-bundle entries as "first-class" files without any other
+     * call site having to special-case bundles. */
+    JceFileSystem *afs = jce_fs_get_active();
+    if (afs && jce_fs_exists(afs, path)) return true;
     return jce_fs_host_exists_file(path);
 }
 

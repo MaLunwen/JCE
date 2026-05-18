@@ -222,7 +222,7 @@ extern "C" void jce_editor_panel_frame_debugger(void)
     char lbl[128];
     snprintf(lbl, sizeof(lbl), "%s###frame_debugger",
              jce_editor_i18n("frameDebugger.title"));
-    if (ImGui::Begin(lbl, vis))
+    if (ImGui::Begin(lbl, vis, ImGuiWindowFlags_NoFocusOnAppearing))
         jce_editor_panel_frame_debugger_content();
     ImGui::End();
 }

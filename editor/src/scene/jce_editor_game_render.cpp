@@ -9,6 +9,7 @@
 #include "core/jce_editor_state.h"
 
 extern "C" {
+#include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/os/core/jce_timer.h>
@@ -17,12 +18,18 @@ extern "C" {
 #include <jce/renderer/jce_debug_draw.h>
 #include <jce/renderer/jce_lowlevel.h>
 #include <jce/renderer/jce_offscreen_target.h>
+#include <jce/renderer/jce_postfx.h>
 #include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_scene_renderer.h>
 #include <jce/renderer/jce_views.h>
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/runtime/jce_game_module.h>
 extern void jce_game_module_set_active_scene(JceScene *scene);
+
+/* Lighting panel accessors — defined in jce_panel_lighting.cpp */
+bool jce_editor_lighting_get_fog_enabled(void);
+void jce_editor_lighting_get_fog_params(JceVolumetricFogParams *out);
+void jce_editor_lighting_get_ambient(float out_color_rgb[3], float *out_intensity);
 }
 
 #include <cstring>
@@ -40,6 +47,8 @@ struct GameRenderState {
     JceWindow             *window            = nullptr;
     JceOffscreenTarget    *bridge            = nullptr;
     JceCamera             *camera            = nullptr;
+    JcePostFXPipeline     *postfx            = nullptr;  /* game-view own pipeline */
+    uint16_t               postfx_output_tex = UINT16_MAX;
 
     /* Active game module + lifecycle bookkeeping. */
     const JceGameModule   *module            = nullptr;
@@ -67,7 +76,8 @@ void game_reset_camera_internal(void)
 
 } /* anon namespace */
 
-bool jce_editor_game_render_init(JceRenderer *renderer, JceWindow *window)
+bool jce_editor_game_render_init(JceRenderer *renderer, JceWindow *window,
+                                 const JcePakArchive *pak)
 {
     if (g.initialized) return true;
     if (!renderer) return false;
@@ -102,6 +112,23 @@ bool jce_editor_game_render_init(JceRenderer *renderer, JceWindow *window)
     g.initialized = true;
     LOG_INFO(LOG_TAG, "[init] game view renderer ready (view id=%u)",
              (unsigned)GAME_VIEW_BASE);
+
+    /* Create a dedicated PostFX pipeline for the game view so it can
+     * apply the same effects as the scene view without conflicting on
+     * bgfx view IDs.  Uses view IDs starting at GAME_VIEW_BASE +
+     * JCE_VIEW_POST_BASE (= 100) — well clear of the scene view's range
+     * (20-29) and of the editor overlay (50) and ImGui (250). */
+    g.postfx = jce_postfx_create(jce_allocator_default(), 1, 1);
+    if (g.postfx) {
+        jce_postfx_set_view_base(g.postfx,
+                                 (uint16_t)(GAME_VIEW_BASE + JCE_VIEW_POST_BASE));
+        if (pak) {
+            jce_postfx_load_shaders(g.postfx, pak);
+        }
+    } else {
+        LOG_WARN(LOG_TAG, "[init] failed to create game view PostFX pipeline");
+    }
+
     return true;
 }
 
@@ -117,6 +144,8 @@ void jce_editor_game_render_shutdown(void)
     }
     if (g.bridge) { jce_offscreen_target_destroy(g.bridge); g.bridge = nullptr; }
     if (g.camera) { jce_camera_destroy(g.camera); g.camera = nullptr; }
+    if (g.postfx) { jce_postfx_destroy(g.postfx); g.postfx = nullptr; }
+    g.postfx_output_tex = UINT16_MAX;
     g.renderer = nullptr;
     g.window   = nullptr;
     g.initialized = false;
@@ -185,6 +214,9 @@ void jce_editor_game_render_reset_camera(void)
 uint16_t jce_editor_game_render_get_texture(void)
 {
     if (!g.bridge) return UINT16_MAX;
+    /* Return PostFX output when available (same as scene viewport). */
+    if (g.postfx_output_tex != UINT16_MAX)
+        return g.postfx_output_tex;
     return jce_offscreen_target_get_color_texture(g.bridge);
 }
 
@@ -272,12 +304,79 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
 
     cfg.frustum_culling = true;
 
+    /* ── Lighting settings from the editor Lighting panel ──────────
+     * Apply the same ambient override and volumetric fog that the scene
+     * viewport uses so both viewports reflect lighting panel changes. */
+    {
+        float amb_color[3];
+        float amb_intensity = 0.15f;
+        jce_editor_lighting_get_ambient(amb_color, &amb_intensity);
+        jce_scene_renderer_set_ambient_override(engine_sr, amb_color, amb_intensity);
+    }
+
+    cfg.fog_enabled = jce_editor_lighting_get_fog_enabled();
+    if (cfg.fog_enabled) {
+        jce_editor_lighting_get_fog_params(&cfg.fog);
+        cfg.fog_depth_tex_handle =
+            jce_offscreen_target_get_depth_texture(g.bridge);
+        cfg.fog_rt_width  = (int)width;
+        cfg.fog_rt_height = (int)height;
+    } else {
+        cfg.fog_depth_tex_handle = UINT16_MAX;
+        cfg.fog_rt_width  = 0;
+        cfg.fog_rt_height = 0;
+    }
+
     uint16_t base = jce_offscreen_target_get_view_id(g.bridge);
     /* Pass real dt only while actually PLAYING — paused/stopped states
      * should freeze animation, matching Unity's Game View semantics. */
     float render_dt = (play_state == 1) ? frame_dt : 0.0f;
     jce_scene_renderer_render(engine_sr, scene, g.camera, base,
                               render_dt, &cfg);
+
+    /* Composite volumetric fog (mirrors scene view path). */
+    if (cfg.fog_enabled) {
+        uint16_t fog_composite_view = (uint16_t)(base + 16);
+        uint16_t dst_fb = jce_offscreen_target_get_frame_buffer(g.bridge);
+        jce_scene_renderer_composite_fog(engine_sr, fog_composite_view, dst_fb);
+    }
+
+    /* ── PostFX ─────────────────────────────────────────────────────
+     * Sync enabled flags and params from the shared scene renderer
+     * pipeline so PostFX panel changes are reflected in the game view.
+     * Uses the game view's OWN pipeline (different view IDs) to avoid
+     * conflicts with the scene view applying PostFX in the same frame. */
+    g.postfx_output_tex = UINT16_MAX;
+    if (g.postfx) {
+        JcePostFXPipeline *shared_pfx =
+            jce_scene_renderer_get_postfx(engine_sr);
+        if (shared_pfx) {
+            /* Mirror enabled state. */
+            bool any_effect = false;
+            for (int i = 0; i < JCE_POSTFX_COUNT; i++) {
+                bool en = jce_postfx_is_enabled(shared_pfx, (JcePostFXType)i);
+                jce_postfx_enable(g.postfx, (JcePostFXType)i, en);
+                if (en) any_effect = true;
+            }
+            /* Mirror params. */
+            JcePostFXParams pfx_params;
+            jce_postfx_get_params(shared_pfx, &pfx_params);
+            jce_postfx_set_params(g.postfx, &pfx_params);
+
+            if (any_effect) {
+                jce_postfx_resize(g.postfx, width, height);
+                JceTextureHandle game_color = { UINT16_MAX };
+                JceTextureHandle prev_pass  = { UINT16_MAX };
+                game_color.idx = jce_offscreen_target_get_color_texture(g.bridge);
+                if (jce_gfx_texture_valid(game_color)) {
+                    jce_postfx_apply(g.postfx, game_color, prev_pass);
+                    JceTextureHandle out = jce_postfx_get_output(g.postfx);
+                    if (jce_gfx_texture_valid(out))
+                        g.postfx_output_tex = out.idx;
+                }
+            }
+        }
+    }
 
     /* Physics debug wireframes (toggled via scene-view View menu). */
     if (jce_state_get_show_physics_debug() && scene) {

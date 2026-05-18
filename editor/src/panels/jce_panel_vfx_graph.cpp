@@ -27,6 +27,8 @@
 #include "ui/jce_theme_palette.h"
 
 #include <jce/tools/jce_imgui.hpp>
+#include "dialogs/jce_path_input.h"
+#include "core/jce_assetdb.h"
 extern "C" {
 #include <jce/os/core/jce_json.h>
 }
@@ -439,7 +441,7 @@ extern "C" void jce_editor_panel_vfx_graph_content(void)
     ImGui::TextUnformatted(jce_editor_i18n("vfxGraph.path"));
     ImGui::SameLine();
     ImGui::SetNextItemWidth(-220);
-    if (ImGui::InputText("##vfxpath", s_g.path, sizeof(s_g.path))) {}
+    if (jce_draw_path_input("##vfxpath", s_g.path, sizeof(s_g.path), JcePathKind::FileAbs)) {}
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("vfxGraph.save")))    graph_save();
     ImGui::SameLine();
@@ -514,7 +516,7 @@ extern "C" void jce_editor_panel_vfx_graph(void)
     if (!*jce_editor_panel_visible_ptr(JCE_PANEL_VFX_GRAPH)) return;
     char _wt[128];
     snprintf(_wt, sizeof(_wt), "%s###vfx_graph", jce_editor_i18n("vfxGraph.title"));
-    if (ImGui::Begin(_wt, jce_editor_panel_visible_ptr(JCE_PANEL_VFX_GRAPH))) {
+    if (ImGui::Begin(_wt, jce_editor_panel_visible_ptr(JCE_PANEL_VFX_GRAPH), ImGuiWindowFlags_NoFocusOnAppearing)) {
         jce_editor_panel_vfx_graph_content();
     }
     ImGui::End();

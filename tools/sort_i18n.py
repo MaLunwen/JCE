@@ -8,9 +8,16 @@ line so the file remains diff-friendly.
 Default targets: ``editor/resources/assets/i18n/*.json``.
 
 Examples:
-    python scripts/lint/sort_i18n.py                   # in-place, default tree
-    python scripts/lint/sort_i18n.py --check           # CI mode (non-zero on drift)
-    python scripts/lint/sort_i18n.py path/to/file.json # specific file(s)
+    python tools/sort_i18n.py                   # in-place, default tree
+    python tools/sort_i18n.py --check           # CI mode (non-zero on drift)
+    python tools/sort_i18n.py path/to/file.json # specific file(s)
+
+CMake integration:
+    Auto: editor builds depend on the ``jce_i18n_auto`` ALL-target which
+          re-runs this script whenever any i18n JSON file changes
+          (idempotent + stamp-driven).  Nobody has to remember to invoke it.
+    cmake --build <build> --target i18n-sort   # apply normalization manually
+    cmake --build <build> --target i18n-check  # CI gate (drift = failure)
 
 Behaviour:
     * Top-level only — values may be strings or any JSON, untouched.
@@ -29,7 +36,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 
-REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DIR = REPO_ROOT / "editor" / "resources" / "assets" / "i18n"
 
 

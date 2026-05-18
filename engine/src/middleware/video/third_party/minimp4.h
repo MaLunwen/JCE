@@ -76,6 +76,10 @@ extern "C" {
 // "av01" + av1C config box). We synthesise a private value here so the
 // existing object_type_indication-based dispatch works.
 #define MP4_OBJECT_TYPE_AV1                                    0xA1
+// VP9 (Google / WebM Project, royalty-free) video.
+// Same situation as AV1: ISOBMFF VP9 uses a SampleEntry FourCC "vp09"
+// + vpcC config box (no MPEG-4 OTI). Synthesised private value.
+#define MP4_OBJECT_TYPE_VP9                                    0xA2
 // Opus audio (RFC 7845) — like AV1, MP4 has no official OTI for Opus
 // (it uses 'Opus' SampleEntry + 'dOps' OpusSpecificBox). We synthesise
 // a private value so the existing object_type_indication-based dispatch
@@ -586,6 +590,9 @@ enum
     // AV1 (ISO/IEC 23091-2 + AV1-ISOBMFF)
     BOX_av01    = FOUR_CHAR_INT( 'a', 'v', '0', '1' ),
     BOX_av1C    = FOUR_CHAR_INT( 'a', 'v', '1', 'C' ),
+    // VP9 (vp9-in-ISOBMFF, https://www.webmproject.org/vp9/mp4/)
+    BOX_vp09    = FOUR_CHAR_INT( 'v', 'p', '0', '9' ),
+    BOX_vpcC    = FOUR_CHAR_INT( 'v', 'p', 'c', 'C' ),
     // Opus audio in MP4 (RFC 7845 / Opus-in-ISOBMFF)
     BOX_Opus    = FOUR_CHAR_INT( 'O', 'p', 'u', 's' ),
     BOX_dOps    = FOUR_CHAR_INT( 'd', 'O', 'p', 's' ),
@@ -2673,6 +2680,7 @@ int MP4D_open(MP4D_demux_t *mp4, int (*read_callback)(int64_t offset, void *buff
             {BOX_hev1, BOX_ATOM},
 #endif
             {BOX_av01, BOX_ATOM},
+            {BOX_vp09, BOX_ATOM},
             {BOX_Opus, BOX_ATOM},
             {BOX_udta, BOX_ATOM},
             {BOX_meta, BOX_ATOM},
@@ -3121,6 +3129,36 @@ broken_android_meta_hack:
                     unsigned k;
                     tr->dsi_bytes = av1C_size;
                     for (k = 0; k < av1C_size; k++) {
+                        tr->dsi[k] = READ(1);
+                    }
+                }
+            }
+            break;
+
+        // VP9 (Google / WebM Project) — royalty-free, always enabled.
+        case BOX_vp09:  // VP9SampleEntry extends VisualSampleEntry
+            if (!tr) { ERROR("broken file structure!"); }
+#if MP4D_INFO_SUPPORTED
+            SKIP(6*1 + 2/*Base SampleEntry*/ + 2 + 2 + 4*3);
+            tr->SampleDescription.video.width  = READ(2);
+            tr->SampleDescription.video.height = READ(2);
+            SKIP(4 + 4 + 4 + 2 + 32 + 2 + 2);
+#else
+            SKIP(78);
+#endif
+            // Followed by BOX_vpcC config record (handled below).
+            break;
+
+        case BOX_vpcC:  // VPCodecConfigurationBox
+            if (!tr) { ERROR("broken file structure!"); }
+            tr->object_type_indication = MP4_OBJECT_TYPE_VP9;
+            {
+                unsigned vpcC_size = (unsigned)payload_bytes;
+                tr->dsi = (unsigned char*)malloc(vpcC_size);
+                if (tr->dsi) {
+                    unsigned k;
+                    tr->dsi_bytes = vpcC_size;
+                    for (k = 0; k < vpcC_size; k++) {
                         tr->dsi[k] = READ(1);
                     }
                 }

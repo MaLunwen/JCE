@@ -8,7 +8,8 @@ Scope: editor/src/{panels,ui,dialogs}/**/*.cpp.
 Heuristic:
   * Match a curated set of ImGui calls that render user-visible text.
   * Inside the call, look for string literals.
-  * Skip the literal if any jce_editor_i18n[_or|_id]() appears in the same
+  * Skip the literal if any jce_editor_i18n[_or|_id]() — or the project's
+    `BL()` helper, which wraps jce_editor_i18n_or() — appears in the same
     call expression (handles wrapped or raw fallback patterns).
   * Skip ID-only literals ("##foo", "###foo"), printf format strings
     starting with '%', and pure-punctuation/number tokens.
@@ -46,7 +47,7 @@ CALL_RE = re.compile(
     r'BeginPopupContextVoid|BeginDragDropSource|BeginDragDropTarget|'
     r'PushID'
     r')\s*\(')
-I18N_RE = re.compile(r'jce_editor_i18n(?:_or|_id)?\s*\(')
+I18N_RE = re.compile(r'(?:jce_editor_i18n(?:_or|_id)?|\bBL)\s*\(')
 STR_RE  = re.compile(r'"((?:[^"\\]|\\.)*?)"')
 
 # Calls whose first string argument is an internal ID, not user-visible text.
