@@ -2001,6 +2001,100 @@ static void draw_comp_global_light_2d(JceGlobalLight2DComponent *p)
     if (ImGui::Combo    ("Blend##gl2d",        &p->blend, blend_items, 2)) insp_track_edit();
 }
 
+/* ── B21.1 2D effector drawers ──────────────────────────────── */
+
+static void draw_comp_point_effector_2d(JcePointEffector2DComponent *p)
+{
+    if (!p) return;
+    ImGui::DragFloat ("Force Magnitude##pef2d", &p->force_magnitude, 0.1f); insp_track_edit();
+    ImGui::DragFloat ("Distance Scale##pef2d",  &p->distance_scale,  0.01f, 0.001f, 100.0f); insp_track_edit();
+    const char *falloff_items[] = { "Constant", "Inv-Linear", "Inv-Square" };
+    if (ImGui::Combo ("Falloff##pef2d",         &p->falloff, falloff_items, 3)) insp_track_edit();
+    ImGui::DragFloat ("Drag##pef2d",            &p->drag,         0.01f, 0.0f); insp_track_edit();
+    ImGui::DragFloat ("Angular Drag##pef2d",    &p->angular_drag, 0.01f, 0.0f); insp_track_edit();
+    if (ImGui::Checkbox("Attract##pef2d",        &p->attract)) insp_undo_bool(&p->attract);
+}
+
+static void draw_comp_area_effector_2d(JceAreaEffector2DComponent *p)
+{
+    if (!p) return;
+    ImGui::DragFloat ("Force Angle (deg)##aef2d", &p->force_angle_deg, 1.0f); insp_track_edit();
+    ImGui::DragFloat ("Force Magnitude##aef2d",   &p->force_magnitude, 0.1f); insp_track_edit();
+    ImGui::DragFloat ("Force Variation##aef2d",   &p->force_variation, 0.1f, 0.0f); insp_track_edit();
+    ImGui::DragFloat ("Drag##aef2d",              &p->drag,            0.01f, 0.0f); insp_track_edit();
+    ImGui::DragFloat ("Angular Drag##aef2d",      &p->angular_drag,    0.01f, 0.0f); insp_track_edit();
+    if (ImGui::Checkbox("Use Global Angle##aef2d", &p->use_global_angle)) insp_undo_bool(&p->use_global_angle);
+}
+
+static void draw_comp_buoyancy_effector_2d(JceBuoyancyEffector2DComponent *p)
+{
+    if (!p) return;
+    ImGui::DragFloat ("Surface Y##bef2d",   &p->surface_level_y, 0.1f); insp_track_edit();
+    ImGui::DragFloat ("Density##bef2d",     &p->density,       0.05f, 0.0f, 10.0f); insp_track_edit();
+    ImGui::DragFloat ("Linear Drag##bef2d", &p->linear_drag,   0.01f, 0.0f); insp_track_edit();
+    ImGui::DragFloat ("Angular Drag##bef2d",&p->angular_drag,  0.01f, 0.0f); insp_track_edit();
+    ImGui::DragFloat ("Flow Angle##bef2d",  &p->flow_angle_deg, 1.0f); insp_track_edit();
+    ImGui::DragFloat ("Flow Magnitude##bef2d",&p->flow_magnitude,0.1f); insp_track_edit();
+    ImGui::DragFloat ("Flow Variation##bef2d",&p->flow_variation,0.1f, 0.0f); insp_track_edit();
+}
+
+static void draw_comp_platform_effector_2d(JcePlatformEffector2DComponent *p)
+{
+    if (!p) return;
+    ImGui::DragFloat ("Surface Arc##plat2d", &p->surface_arc_deg, 1.0f, 0.0f, 180.0f); insp_track_edit();
+    if (ImGui::Checkbox("One-Way##plat2d",        &p->use_one_way))        insp_undo_bool(&p->use_one_way);
+    if (ImGui::Checkbox("Side Friction##plat2d",  &p->use_side_friction))  insp_undo_bool(&p->use_side_friction);
+    if (ImGui::Checkbox("Side Bounce##plat2d",    &p->use_side_bounce))    insp_undo_bool(&p->use_side_bounce);
+    ImGui::DragFloat ("Side Arc##plat2d",    &p->side_arc_deg,    0.5f, 0.0f, 180.0f); insp_track_edit();
+}
+
+/* ── B21.2 uGUI container drawers ───────────────────────────── */
+
+static void draw_comp_ui_scroll_rect(JceUIScrollRectComponent *p)
+{
+    if (!p) return;
+    ImGui::DragFloat ("Viewport W##sr", &p->viewport_w, 1.0f, 0.0f); insp_track_edit();
+    ImGui::DragFloat ("Viewport H##sr", &p->viewport_h, 1.0f, 0.0f); insp_track_edit();
+    ImGui::DragFloat ("Content W##sr",  &p->content_w,  1.0f, 0.0f); insp_track_edit();
+    ImGui::DragFloat ("Content H##sr",  &p->content_h,  1.0f, 0.0f); insp_track_edit();
+    ImGui::SliderFloat("Position X##sr",&p->position_x, 0.0f, 1.0f); insp_track_edit();
+    ImGui::SliderFloat("Position Y##sr",&p->position_y, 0.0f, 1.0f); insp_track_edit();
+    ImGui::DragFloat ("Deceleration##sr", &p->deceleration, 0.005f, 0.0f, 1.0f); insp_track_edit();
+    ImGui::DragFloat ("Elasticity##sr",   &p->elasticity,   0.1f,  0.0f, 50.0f); insp_track_edit();
+    const char *mv[] = { "Unrestricted", "Elastic", "Clamped" };
+    if (ImGui::Combo("Movement##sr",      &p->movement, mv, 3)) insp_track_edit();
+    if (ImGui::Checkbox("Inertia##sr",    &p->inertia))    insp_undo_bool(&p->inertia);
+    if (ImGui::Checkbox("Horizontal##sr", &p->horizontal)) insp_undo_bool(&p->horizontal);
+    if (ImGui::Checkbox("Vertical##sr",   &p->vertical))   insp_undo_bool(&p->vertical);
+}
+
+static void draw_comp_ui_mask(JceUIMaskComponent *p)
+{
+    if (!p) return;
+    if (ImGui::Checkbox("Show Mask Graphic##m", &p->show_mask_graphic)) insp_undo_bool(&p->show_mask_graphic);
+    ImGui::SliderFloat("Alpha Cutoff##m", &p->alpha_cutoff, 0.0f, 1.0f); insp_track_edit();
+}
+
+static void draw_comp_ui_rect_mask_2d(JceUIRectMask2DComponent *p)
+{
+    if (!p) return;
+    ImGui::DragFloat4("Padding (L,T,R,B)##rm2d", p->padding, 0.5f); insp_track_edit();
+    if (ImGui::Checkbox("Enabled##rm2d", &p->enabled)) insp_undo_bool(&p->enabled);
+}
+
+static void draw_comp_ui_layout_element(JceUILayoutElementComponent *p)
+{
+    if (!p) return;
+    ImGui::DragFloat ("Min Width##le",        &p->min_width,        0.5f, 0.0f); insp_track_edit();
+    ImGui::DragFloat ("Min Height##le",       &p->min_height,       0.5f, 0.0f); insp_track_edit();
+    ImGui::DragFloat ("Preferred Width##le",  &p->preferred_width,  0.5f, 0.0f); insp_track_edit();
+    ImGui::DragFloat ("Preferred Height##le", &p->preferred_height, 0.5f, 0.0f); insp_track_edit();
+    ImGui::DragFloat ("Flexible Width##le",   &p->flexible_width,   0.05f, 0.0f); insp_track_edit();
+    ImGui::DragFloat ("Flexible Height##le",  &p->flexible_height,  0.05f, 0.0f); insp_track_edit();
+    ImGui::InputInt  ("Priority##le",         &p->layout_priority); insp_track_edit();
+    if (ImGui::Checkbox("Ignore Layout##le",  &p->ignore_layout)) insp_undo_bool(&p->ignore_layout);
+}
+
 /* ── Component header / settings popup helper ─────────────────────── */
 
 /* Returns true if the component's body should be drawn this frame.
@@ -2588,6 +2682,66 @@ static void draw_one_component_section(uint32_t focused,
         default: break;
     }
 #undef JCE_DRAW
+
+    /* B21 components — no flag bits (mask full); render explicitly
+     * after the regular dispatch.  Each section uses a synthetic
+     * uint64 id so comp_section_begin's ImGui::PushID hash is
+     * stable across frames. */
+#define JCE_DRAW_B21(SYN_ID, HAS_FN, GET_FN, NM, DRAW_FN, REMOVE_FLAG) \
+    do {                                                                \
+        if (HAS_FN(scene, ecs_e)) {                                     \
+            if (comp_section_begin(focused, sidecar,                    \
+                                     (uint64_t)(SYN_ID), NM, true)) {   \
+                DRAW_FN(GET_FN(scene, ecs_e));                          \
+            }                                                           \
+            comp_section_end();                                         \
+        }                                                               \
+        (void)(REMOVE_FLAG);                                            \
+    } while (0)
+
+    /* Use high-numbered synthetic IDs (>= 2^60) outside the normal
+     * JCE_COMP_FLAG_* bit range. */
+    JCE_DRAW_B21(0x1000000000000001ull,
+                  jce_scene_has_point_effector_2d,
+                  jce_scene_get_point_effector_2d,
+                  "Point Effector 2D",
+                  draw_comp_point_effector_2d, 0);
+    JCE_DRAW_B21(0x1000000000000002ull,
+                  jce_scene_has_area_effector_2d,
+                  jce_scene_get_area_effector_2d,
+                  "Area Effector 2D",
+                  draw_comp_area_effector_2d, 0);
+    JCE_DRAW_B21(0x1000000000000003ull,
+                  jce_scene_has_buoyancy_effector_2d,
+                  jce_scene_get_buoyancy_effector_2d,
+                  "Buoyancy Effector 2D",
+                  draw_comp_buoyancy_effector_2d, 0);
+    JCE_DRAW_B21(0x1000000000000004ull,
+                  jce_scene_has_platform_effector_2d,
+                  jce_scene_get_platform_effector_2d,
+                  "Platform Effector 2D",
+                  draw_comp_platform_effector_2d, 0);
+    JCE_DRAW_B21(0x1000000000000005ull,
+                  jce_scene_has_ui_scroll_rect,
+                  jce_scene_get_ui_scroll_rect,
+                  "Scroll Rect",
+                  draw_comp_ui_scroll_rect, 0);
+    JCE_DRAW_B21(0x1000000000000006ull,
+                  jce_scene_has_ui_mask,
+                  jce_scene_get_ui_mask,
+                  "Mask",
+                  draw_comp_ui_mask, 0);
+    JCE_DRAW_B21(0x1000000000000007ull,
+                  jce_scene_has_ui_rect_mask_2d,
+                  jce_scene_get_ui_rect_mask_2d,
+                  "Rect Mask 2D",
+                  draw_comp_ui_rect_mask_2d, 0);
+    JCE_DRAW_B21(0x1000000000000008ull,
+                  jce_scene_has_ui_layout_element,
+                  jce_scene_get_ui_layout_element,
+                  "Layout Element",
+                  draw_comp_ui_layout_element, 0);
+#undef JCE_DRAW_B21
 }
 
 /* ── Material file sync ───────────────────────────────────────────── */

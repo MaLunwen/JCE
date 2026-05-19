@@ -18,6 +18,8 @@ extern "C" {
 #include <jce/middleware/animation/jce_anim_curve_serial.h>
 #include <jce/middleware/animation/jce_anim_layers.h>
 #include <jce/middleware/animation/jce_anim_layer_apply.h>
+#include <jce/middleware/animation/jce_anim_rigging.h>
+#include <jce/middleware/animation/jce_avatar_humanoid.h>
 #include <jce/middleware/animation/jce_skeleton.h>
 #include <jce/middleware/animation/jce_anim_sm.h>
 #include <jce/middleware/animation/jce_anim_sm_binding.h>
