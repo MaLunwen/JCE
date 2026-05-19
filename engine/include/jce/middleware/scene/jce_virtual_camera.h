@@ -18,6 +18,7 @@
 
 #include <jce/os/core/jce_defs.h>
 
+#include <stdbool.h>
 #include <stdint.h>
 
 JCE_EXTERN_C_BEGIN
@@ -68,6 +69,40 @@ typedef struct {
     JceVcamLookatMode lookat_mode;
 } JceVcamComposer;
 
+/* DollyCart rig: position the camera along a path curve.  The path
+ * is a polyline of waypoints; `position_along_path` ∈ [0, 1] picks
+ * the interpolated point.  Speed is units/second along path length. */
+#define JCE_VCAM_DOLLY_MAX_WAYPOINTS 32
+
+typedef struct {
+    float    waypoints[JCE_VCAM_DOLLY_MAX_WAYPOINTS][3];
+    uint32_t waypoint_count;
+    float    position_along_path; /* 0..1 normalised */
+    float    speed;               /* units per second */
+    bool     auto_advance;
+    bool     loop;
+} JceVcamDollyCart;
+
+/* Group composer: aim at the weighted centroid of N targets and
+ * frame a bounding circle around them. */
+#define JCE_VCAM_GROUP_MAX_TARGETS 8
+
+typedef struct {
+    float    target_pos[JCE_VCAM_GROUP_MAX_TARGETS][3];
+    float    target_weight[JCE_VCAM_GROUP_MAX_TARGETS];
+    /* Per-target radius added when computing the bounding circle. */
+    float    target_radius[JCE_VCAM_GROUP_MAX_TARGETS];
+    uint32_t target_count;
+    /* When true, framing pulls the camera back so the bounding
+     * circle fits inside the frame; else only re-aims look-at. */
+    bool     adjust_distance;
+    /* Minimum allowed framing distance (camera-to-centroid). */
+    float    min_distance;
+    /* Maximum allowed framing distance — caps zoom-out for very
+     * spread groups. */
+    float    max_distance;
+} JceVcamGroupComposer;
+
 typedef struct {
     char    name[64];
     int32_t priority;     /* higher = wins */
@@ -89,6 +124,9 @@ typedef struct {
     /* Phase-2 rig + composer (active when rig != BASIC). */
     JceVcamFreeLookRig freelook;
     JceVcamComposer    composer;
+    /* B21 extras (active when respective struct has data). */
+    JceVcamDollyCart      dolly;
+    JceVcamGroupComposer  group;
 } JceVirtualCamera;
 
 typedef struct {

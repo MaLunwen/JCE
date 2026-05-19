@@ -1577,6 +1577,109 @@ static void parse_global_light_2d(JceScene *s, JceEntity e, const cJSON *c)
     jce_scene_set_global_light_2d(s, e, &p);
 }
 
+/* ── B21.1 2D physics effectors ─────────────────────────────── */
+
+static void parse_point_effector_2d(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JcePointEffector2DComponent x; memset(&x, 0, sizeof x);
+    x.force_magnitude  = (float)j_num(c, "forceMagnitude", 1.0);
+    x.distance_scale   = (float)j_num(c, "distanceScale",  1.0);
+    x.falloff          = (int)  j_num(c, "falloff",        0);
+    x.drag             = (float)j_num(c, "drag",           0.0);
+    x.angular_drag     = (float)j_num(c, "angularDrag",    0.0);
+    x.attract          = j_bool (c, "attract",             false);
+    jce_scene_set_point_effector_2d(s, e, &x);
+}
+
+static void parse_area_effector_2d(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceAreaEffector2DComponent x; memset(&x, 0, sizeof x);
+    x.force_angle_deg    = (float)j_num(c, "forceAngleDeg",    0.0);
+    x.force_magnitude    = (float)j_num(c, "forceMagnitude",   1.0);
+    x.force_variation    = (float)j_num(c, "forceVariation",   0.0);
+    x.drag               = (float)j_num(c, "drag",             0.0);
+    x.angular_drag       = (float)j_num(c, "angularDrag",      0.0);
+    x.use_global_angle   = j_bool (c, "useGlobalAngle",        true);
+    jce_scene_set_area_effector_2d(s, e, &x);
+}
+
+static void parse_buoyancy_effector_2d(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceBuoyancyEffector2DComponent x; memset(&x, 0, sizeof x);
+    x.surface_level_y   = (float)j_num(c, "surfaceLevelY", 0.0);
+    x.density           = (float)j_num(c, "density",       1.0);
+    x.linear_drag       = (float)j_num(c, "linearDrag",    0.05);
+    x.angular_drag      = (float)j_num(c, "angularDrag",   0.05);
+    x.flow_angle_deg    = (float)j_num(c, "flowAngleDeg",  0.0);
+    x.flow_magnitude    = (float)j_num(c, "flowMagnitude", 0.0);
+    x.flow_variation    = (float)j_num(c, "flowVariation", 0.0);
+    jce_scene_set_buoyancy_effector_2d(s, e, &x);
+}
+
+static void parse_platform_effector_2d(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JcePlatformEffector2DComponent x; memset(&x, 0, sizeof x);
+    x.surface_arc_deg     = (float)j_num(c, "surfaceArcDeg", 170.0);
+    x.use_one_way         = j_bool (c, "useOneWay",        true);
+    x.use_side_friction   = j_bool (c, "useSideFriction",  false);
+    x.use_side_bounce     = j_bool (c, "useSideBounce",    false);
+    x.side_arc_deg        = (float)j_num(c, "sideArcDeg",  1.0);
+    jce_scene_set_platform_effector_2d(s, e, &x);
+}
+
+/* ── B21.2 uGUI containers + effects ────────────────────────── */
+
+static void parse_ui_scroll_rect(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceUIScrollRectComponent x; memset(&x, 0, sizeof x);
+    x.viewport_w   = (float)j_num(c, "viewportW",   200.0);
+    x.viewport_h   = (float)j_num(c, "viewportH",   200.0);
+    x.content_w    = (float)j_num(c, "contentW",    400.0);
+    x.content_h    = (float)j_num(c, "contentH",    400.0);
+    x.position_x   = (float)j_num(c, "positionX",   0.0);
+    x.position_y   = (float)j_num(c, "positionY",   0.0);
+    x.deceleration = (float)j_num(c, "deceleration",0.135);
+    x.elasticity   = (float)j_num(c, "elasticity",  5.0);
+    x.movement     = (int)  j_num(c, "movement",    1);
+    x.inertia      = j_bool (c, "inertia",          true);
+    x.horizontal   = j_bool (c, "horizontal",       true);
+    x.vertical     = j_bool (c, "vertical",         true);
+    jce_scene_set_ui_scroll_rect(s, e, &x);
+}
+
+static void parse_ui_mask(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceUIMaskComponent x; memset(&x, 0, sizeof x);
+    x.show_mask_graphic = j_bool (c, "showMaskGraphic", false);
+    x.alpha_cutoff      = (float)j_num(c, "alphaCutoff", 0.0);
+    jce_scene_set_ui_mask(s, e, &x);
+}
+
+static void parse_ui_rect_mask_2d(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceUIRectMask2DComponent x; memset(&x, 0, sizeof x);
+    x.padding[0] = (float)j_num(c, "paddingL", 0.0);
+    x.padding[1] = (float)j_num(c, "paddingT", 0.0);
+    x.padding[2] = (float)j_num(c, "paddingR", 0.0);
+    x.padding[3] = (float)j_num(c, "paddingB", 0.0);
+    x.enabled    = j_bool (c, "enabled", true);
+    jce_scene_set_ui_rect_mask_2d(s, e, &x);
+}
+
+static void parse_ui_layout_element(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceUILayoutElementComponent x; memset(&x, 0, sizeof x);
+    x.min_width        = (float)j_num(c, "minWidth",       0.0);
+    x.min_height       = (float)j_num(c, "minHeight",      0.0);
+    x.preferred_width  = (float)j_num(c, "preferredWidth", 0.0);
+    x.preferred_height = (float)j_num(c, "preferredHeight",0.0);
+    x.flexible_width   = (float)j_num(c, "flexibleWidth",  0.0);
+    x.flexible_height  = (float)j_num(c, "flexibleHeight", 0.0);
+    x.layout_priority  = (int)  j_num(c, "layoutPriority", 0);
+    x.ignore_layout    = j_bool (c, "ignoreLayout",        false);
+    jce_scene_set_ui_layout_element(s, e, &x);
+}
+
 static void parse_constraint(JceScene *s, JceEntity e, const cJSON *c)
 {
     JceConstraintComponent cn;
@@ -1840,6 +1943,39 @@ static void parse_one_component(JceScene *s, JceEntity e, const cJSON *comp)
     if (strcmp(type, "GlobalLight2D") == 0 ||
         strcmp(type, "globalLight2D") == 0) {
         parse_global_light_2d(s, e, props); return;
+    }
+    /* B21.1 2D effectors. */
+    if (strcmp(type, "PointEffector2D") == 0 ||
+        strcmp(type, "pointEffector2D") == 0) {
+        parse_point_effector_2d(s, e, props); return;
+    }
+    if (strcmp(type, "AreaEffector2D") == 0 ||
+        strcmp(type, "areaEffector2D") == 0) {
+        parse_area_effector_2d(s, e, props); return;
+    }
+    if (strcmp(type, "BuoyancyEffector2D") == 0 ||
+        strcmp(type, "buoyancyEffector2D") == 0) {
+        parse_buoyancy_effector_2d(s, e, props); return;
+    }
+    if (strcmp(type, "PlatformEffector2D") == 0 ||
+        strcmp(type, "platformEffector2D") == 0) {
+        parse_platform_effector_2d(s, e, props); return;
+    }
+    /* B21.2 uGUI containers + effects. */
+    if (strcmp(type, "UIScrollRect") == 0 ||
+        strcmp(type, "uiScrollRect") == 0) {
+        parse_ui_scroll_rect(s, e, props); return;
+    }
+    if (strcmp(type, "UIMask") == 0 || strcmp(type, "uiMask") == 0) {
+        parse_ui_mask(s, e, props); return;
+    }
+    if (strcmp(type, "UIRectMask2D") == 0 ||
+        strcmp(type, "uiRectMask2D") == 0) {
+        parse_ui_rect_mask_2d(s, e, props); return;
+    }
+    if (strcmp(type, "UILayoutElement") == 0 ||
+        strcmp(type, "uiLayoutElement") == 0) {
+        parse_ui_layout_element(s, e, props); return;
     }
 }
 
@@ -2783,6 +2919,117 @@ static void ser_global_light_2d(const JceGlobalLight2DComponent *p, cJSON *arr)
     cJSON_AddItemToArray(arr, o);
 }
 
+/* ── B21.1 2D effector serializers ──────────────────────────── */
+
+static void ser_point_effector_2d(const JcePointEffector2DComponent *p, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "PointEffector2D");
+    cJSON_AddNumberToObject(o, "forceMagnitude", p->force_magnitude);
+    cJSON_AddNumberToObject(o, "distanceScale",  p->distance_scale);
+    cJSON_AddNumberToObject(o, "falloff",        p->falloff);
+    cJSON_AddNumberToObject(o, "drag",           p->drag);
+    cJSON_AddNumberToObject(o, "angularDrag",    p->angular_drag);
+    cJSON_AddBoolToObject  (o, "attract",        p->attract);
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_area_effector_2d(const JceAreaEffector2DComponent *p, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "AreaEffector2D");
+    cJSON_AddNumberToObject(o, "forceAngleDeg",  p->force_angle_deg);
+    cJSON_AddNumberToObject(o, "forceMagnitude", p->force_magnitude);
+    cJSON_AddNumberToObject(o, "forceVariation", p->force_variation);
+    cJSON_AddNumberToObject(o, "drag",           p->drag);
+    cJSON_AddNumberToObject(o, "angularDrag",    p->angular_drag);
+    cJSON_AddBoolToObject  (o, "useGlobalAngle", p->use_global_angle);
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_buoyancy_effector_2d(const JceBuoyancyEffector2DComponent *p, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "BuoyancyEffector2D");
+    cJSON_AddNumberToObject(o, "surfaceLevelY", p->surface_level_y);
+    cJSON_AddNumberToObject(o, "density",       p->density);
+    cJSON_AddNumberToObject(o, "linearDrag",    p->linear_drag);
+    cJSON_AddNumberToObject(o, "angularDrag",   p->angular_drag);
+    cJSON_AddNumberToObject(o, "flowAngleDeg",  p->flow_angle_deg);
+    cJSON_AddNumberToObject(o, "flowMagnitude", p->flow_magnitude);
+    cJSON_AddNumberToObject(o, "flowVariation", p->flow_variation);
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_platform_effector_2d(const JcePlatformEffector2DComponent *p, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "PlatformEffector2D");
+    cJSON_AddNumberToObject(o, "surfaceArcDeg",   p->surface_arc_deg);
+    cJSON_AddBoolToObject  (o, "useOneWay",       p->use_one_way);
+    cJSON_AddBoolToObject  (o, "useSideFriction", p->use_side_friction);
+    cJSON_AddBoolToObject  (o, "useSideBounce",   p->use_side_bounce);
+    cJSON_AddNumberToObject(o, "sideArcDeg",      p->side_arc_deg);
+    cJSON_AddItemToArray(arr, o);
+}
+
+/* ── B21.2 uGUI container serializers ───────────────────────── */
+
+static void ser_ui_scroll_rect(const JceUIScrollRectComponent *p, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "UIScrollRect");
+    cJSON_AddNumberToObject(o, "viewportW",   p->viewport_w);
+    cJSON_AddNumberToObject(o, "viewportH",   p->viewport_h);
+    cJSON_AddNumberToObject(o, "contentW",    p->content_w);
+    cJSON_AddNumberToObject(o, "contentH",    p->content_h);
+    cJSON_AddNumberToObject(o, "positionX",   p->position_x);
+    cJSON_AddNumberToObject(o, "positionY",   p->position_y);
+    cJSON_AddNumberToObject(o, "deceleration",p->deceleration);
+    cJSON_AddNumberToObject(o, "elasticity",  p->elasticity);
+    cJSON_AddNumberToObject(o, "movement",    p->movement);
+    cJSON_AddBoolToObject  (o, "inertia",     p->inertia);
+    cJSON_AddBoolToObject  (o, "horizontal",  p->horizontal);
+    cJSON_AddBoolToObject  (o, "vertical",    p->vertical);
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_ui_mask(const JceUIMaskComponent *p, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "UIMask");
+    cJSON_AddBoolToObject  (o, "showMaskGraphic", p->show_mask_graphic);
+    cJSON_AddNumberToObject(o, "alphaCutoff",     p->alpha_cutoff);
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_ui_rect_mask_2d(const JceUIRectMask2DComponent *p, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "UIRectMask2D");
+    cJSON_AddNumberToObject(o, "paddingL", p->padding[0]);
+    cJSON_AddNumberToObject(o, "paddingT", p->padding[1]);
+    cJSON_AddNumberToObject(o, "paddingR", p->padding[2]);
+    cJSON_AddNumberToObject(o, "paddingB", p->padding[3]);
+    cJSON_AddBoolToObject  (o, "enabled",  p->enabled);
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_ui_layout_element(const JceUILayoutElementComponent *p, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "UILayoutElement");
+    cJSON_AddNumberToObject(o, "minWidth",        p->min_width);
+    cJSON_AddNumberToObject(o, "minHeight",       p->min_height);
+    cJSON_AddNumberToObject(o, "preferredWidth",  p->preferred_width);
+    cJSON_AddNumberToObject(o, "preferredHeight", p->preferred_height);
+    cJSON_AddNumberToObject(o, "flexibleWidth",   p->flexible_width);
+    cJSON_AddNumberToObject(o, "flexibleHeight",  p->flexible_height);
+    cJSON_AddNumberToObject(o, "layoutPriority",  p->layout_priority);
+    cJSON_AddBoolToObject  (o, "ignoreLayout",    p->ignore_layout);
+    cJSON_AddItemToArray(arr, o);
+}
+
 static void ser_skybox(const JceSkyboxComponent *c, cJSON *arr)
 {
     cJSON *o = cJSON_CreateObject();
@@ -3126,6 +3373,39 @@ static void ser_entity_cb(JceScene *s, JceEntity e, void *ud)
     if (f & JCE_COMP_FLAG_GLOBAL_LIGHT_2D) {
         JceGlobalLight2DComponent *c = jce_scene_get_global_light_2d(s, e);
         if (c) ser_global_light_2d(c, comps);
+    }
+    /* B21 components — no flag bits (mask full); explicit ecs_has. */
+    if (jce_scene_has_point_effector_2d(s, e)) {
+        JcePointEffector2DComponent *c = jce_scene_get_point_effector_2d(s, e);
+        if (c) ser_point_effector_2d(c, comps);
+    }
+    if (jce_scene_has_area_effector_2d(s, e)) {
+        JceAreaEffector2DComponent *c = jce_scene_get_area_effector_2d(s, e);
+        if (c) ser_area_effector_2d(c, comps);
+    }
+    if (jce_scene_has_buoyancy_effector_2d(s, e)) {
+        JceBuoyancyEffector2DComponent *c = jce_scene_get_buoyancy_effector_2d(s, e);
+        if (c) ser_buoyancy_effector_2d(c, comps);
+    }
+    if (jce_scene_has_platform_effector_2d(s, e)) {
+        JcePlatformEffector2DComponent *c = jce_scene_get_platform_effector_2d(s, e);
+        if (c) ser_platform_effector_2d(c, comps);
+    }
+    if (jce_scene_has_ui_scroll_rect(s, e)) {
+        JceUIScrollRectComponent *c = jce_scene_get_ui_scroll_rect(s, e);
+        if (c) ser_ui_scroll_rect(c, comps);
+    }
+    if (jce_scene_has_ui_mask(s, e)) {
+        JceUIMaskComponent *c = jce_scene_get_ui_mask(s, e);
+        if (c) ser_ui_mask(c, comps);
+    }
+    if (jce_scene_has_ui_rect_mask_2d(s, e)) {
+        JceUIRectMask2DComponent *c = jce_scene_get_ui_rect_mask_2d(s, e);
+        if (c) ser_ui_rect_mask_2d(c, comps);
+    }
+    if (jce_scene_has_ui_layout_element(s, e)) {
+        JceUILayoutElementComponent *c = jce_scene_get_ui_layout_element(s, e);
+        if (c) ser_ui_layout_element(c, comps);
     }
     if (f & JCE_COMP_FLAG_EDITOR_META) {
         JceEditorMeta *m = jce_scene_get_editor_meta(s, e);
@@ -3621,6 +3901,39 @@ cJSON *jce_scene_serialize_entity_components(JceScene *scene, JceEntity e)
     if (f & JCE_COMP_FLAG_GLOBAL_LIGHT_2D) {
         JceGlobalLight2DComponent *c = jce_scene_get_global_light_2d(scene, e);
         if (c) ser_global_light_2d(c, arr);
+    }
+    /* B21 components — no flag bits (mask full); explicit ecs_has. */
+    if (jce_scene_has_point_effector_2d(scene, e)) {
+        JcePointEffector2DComponent *c = jce_scene_get_point_effector_2d(scene, e);
+        if (c) ser_point_effector_2d(c, arr);
+    }
+    if (jce_scene_has_area_effector_2d(scene, e)) {
+        JceAreaEffector2DComponent *c = jce_scene_get_area_effector_2d(scene, e);
+        if (c) ser_area_effector_2d(c, arr);
+    }
+    if (jce_scene_has_buoyancy_effector_2d(scene, e)) {
+        JceBuoyancyEffector2DComponent *c = jce_scene_get_buoyancy_effector_2d(scene, e);
+        if (c) ser_buoyancy_effector_2d(c, arr);
+    }
+    if (jce_scene_has_platform_effector_2d(scene, e)) {
+        JcePlatformEffector2DComponent *c = jce_scene_get_platform_effector_2d(scene, e);
+        if (c) ser_platform_effector_2d(c, arr);
+    }
+    if (jce_scene_has_ui_scroll_rect(scene, e)) {
+        JceUIScrollRectComponent *c = jce_scene_get_ui_scroll_rect(scene, e);
+        if (c) ser_ui_scroll_rect(c, arr);
+    }
+    if (jce_scene_has_ui_mask(scene, e)) {
+        JceUIMaskComponent *c = jce_scene_get_ui_mask(scene, e);
+        if (c) ser_ui_mask(c, arr);
+    }
+    if (jce_scene_has_ui_rect_mask_2d(scene, e)) {
+        JceUIRectMask2DComponent *c = jce_scene_get_ui_rect_mask_2d(scene, e);
+        if (c) ser_ui_rect_mask_2d(c, arr);
+    }
+    if (jce_scene_has_ui_layout_element(scene, e)) {
+        JceUILayoutElementComponent *c = jce_scene_get_ui_layout_element(scene, e);
+        if (c) ser_ui_layout_element(c, arr);
     }
     if (f & JCE_COMP_FLAG_EDITOR_META) {
         JceEditorMeta *m = jce_scene_get_editor_meta(scene, e);

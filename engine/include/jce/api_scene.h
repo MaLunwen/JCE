@@ -27,6 +27,7 @@ extern "C" {
 #include <jce/middleware/scene/jce_terrain_foliage.h>
 #include <jce/middleware/scene/jce_vcam_blend.h>
 #include <jce/middleware/scene/jce_vcam_confiner.h>
+#include <jce/middleware/scene/jce_vcam_dolly_group.h>
 #include <jce/middleware/scene/jce_vcam_freelook_apply.h>
 #include <jce/middleware/scene/jce_vcam_impulse.h>
 #include <jce/middleware/scene/jce_volume_stack_manager.h>

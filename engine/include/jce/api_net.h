@@ -17,6 +17,7 @@ extern "C" {
 #include <jce/middleware/net/jce_net_lobby.h>
 #include <jce/middleware/net/jce_net_prediction.h>
 #include <jce/middleware/net/jce_net_types.h>
+#include <jce/middleware/net/jce_net_vars.h>
 
 
 

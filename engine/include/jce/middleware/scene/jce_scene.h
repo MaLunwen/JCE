@@ -865,6 +865,85 @@ typedef struct {
     bool  use_graphic_alpha;
 } JceUIShadowEffect;
 
+/* ── 2D Physics effectors (B21.1) ───────────────────────────── */
+typedef struct {
+    float force_magnitude;
+    float distance_scale;
+    int   falloff;                 /* 0 const, 1 inv-linear, 2 inv-square */
+    float drag;
+    float angular_drag;
+    bool  attract;
+} JcePointEffector2DComponent;
+
+typedef struct {
+    float force_angle_deg;
+    float force_magnitude;
+    float force_variation;
+    float drag;
+    float angular_drag;
+    bool  use_global_angle;
+} JceAreaEffector2DComponent;
+
+typedef struct {
+    float surface_level_y;
+    float density;
+    float linear_drag;
+    float angular_drag;
+    float flow_angle_deg;
+    float flow_magnitude;
+    float flow_variation;
+} JceBuoyancyEffector2DComponent;
+
+typedef struct {
+    float surface_arc_deg;
+    bool  use_one_way;
+    bool  use_side_friction;
+    bool  use_side_bounce;
+    float side_arc_deg;
+} JcePlatformEffector2DComponent;
+
+/* ── uGUI containers + effects (B21.2) ──────────────────────── */
+#ifndef JCE_UI_SCROLL_RECT_TYPEDEFS_DEFINED
+#define JCE_UI_SCROLL_RECT_TYPEDEFS_DEFINED
+typedef struct {
+    float viewport_w;
+    float viewport_h;
+    float content_w;
+    float content_h;
+    float position_x;
+    float position_y;
+    float velocity_x;
+    float velocity_y;
+    float deceleration;
+    float elasticity;
+    int   movement;                /* 0 unrestricted, 1 elastic, 2 clamped */
+    bool  inertia;
+    bool  horizontal;
+    bool  vertical;
+} JceUIScrollRectComponent;
+
+typedef struct {
+    bool  show_mask_graphic;
+    float alpha_cutoff;
+} JceUIMaskComponent;
+
+typedef struct {
+    float padding[4];
+    bool  enabled;
+} JceUIRectMask2DComponent;
+
+typedef struct {
+    float min_width;
+    float min_height;
+    float preferred_width;
+    float preferred_height;
+    float flexible_width;
+    float flexible_height;
+    int   layout_priority;
+    bool  ignore_layout;
+} JceUILayoutElementComponent;
+#endif /* JCE_UI_SCROLL_RECT_TYPEDEFS_DEFINED */
+
 /* ── 2D Lighting components (URP 2D Renderer parity) ──────────── */
 typedef struct {
     float    color[4];
@@ -1408,6 +1487,48 @@ JCE_API void                          jce_scene_set_global_light_2d(JceScene *s,
 JCE_API JceGlobalLight2DComponent    *jce_scene_get_global_light_2d(JceScene *s, JceEntity e);
 JCE_API bool                          jce_scene_has_global_light_2d(const JceScene *s, JceEntity e);
 JCE_API void                          jce_scene_remove_global_light_2d(JceScene *s, JceEntity e);
+
+/* Component access — 2D Effectors (B21.1). */
+JCE_API void                          jce_scene_set_point_effector_2d(JceScene *s, JceEntity e, const JcePointEffector2DComponent *c);
+JCE_API JcePointEffector2DComponent  *jce_scene_get_point_effector_2d(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_point_effector_2d(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_point_effector_2d(JceScene *s, JceEntity e);
+
+JCE_API void                          jce_scene_set_area_effector_2d(JceScene *s, JceEntity e, const JceAreaEffector2DComponent *c);
+JCE_API JceAreaEffector2DComponent   *jce_scene_get_area_effector_2d(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_area_effector_2d(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_area_effector_2d(JceScene *s, JceEntity e);
+
+JCE_API void                          jce_scene_set_buoyancy_effector_2d(JceScene *s, JceEntity e, const JceBuoyancyEffector2DComponent *c);
+JCE_API JceBuoyancyEffector2DComponent *jce_scene_get_buoyancy_effector_2d(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_buoyancy_effector_2d(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_buoyancy_effector_2d(JceScene *s, JceEntity e);
+
+JCE_API void                          jce_scene_set_platform_effector_2d(JceScene *s, JceEntity e, const JcePlatformEffector2DComponent *c);
+JCE_API JcePlatformEffector2DComponent *jce_scene_get_platform_effector_2d(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_platform_effector_2d(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_platform_effector_2d(JceScene *s, JceEntity e);
+
+/* Component access — uGUI containers + effects (B21.2). */
+JCE_API void                          jce_scene_set_ui_scroll_rect(JceScene *s, JceEntity e, const JceUIScrollRectComponent *c);
+JCE_API JceUIScrollRectComponent     *jce_scene_get_ui_scroll_rect(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_ui_scroll_rect(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_ui_scroll_rect(JceScene *s, JceEntity e);
+
+JCE_API void                          jce_scene_set_ui_mask(JceScene *s, JceEntity e, const JceUIMaskComponent *c);
+JCE_API JceUIMaskComponent           *jce_scene_get_ui_mask(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_ui_mask(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_ui_mask(JceScene *s, JceEntity e);
+
+JCE_API void                          jce_scene_set_ui_rect_mask_2d(JceScene *s, JceEntity e, const JceUIRectMask2DComponent *c);
+JCE_API JceUIRectMask2DComponent     *jce_scene_get_ui_rect_mask_2d(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_ui_rect_mask_2d(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_ui_rect_mask_2d(JceScene *s, JceEntity e);
+
+JCE_API void                          jce_scene_set_ui_layout_element(JceScene *s, JceEntity e, const JceUILayoutElementComponent *c);
+JCE_API JceUILayoutElementComponent  *jce_scene_get_ui_layout_element(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_ui_layout_element(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_ui_layout_element(JceScene *s, JceEntity e);
 
 /* Component access — Audio Bus Route. */
 JCE_API void                          jce_scene_set_audio_bus_route(JceScene *s, JceEntity e, const JceAudioBusRouteComponent *c);
