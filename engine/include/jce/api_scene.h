@@ -13,6 +13,7 @@ extern "C" {
 #endif
 
 #include <jce/middleware/scene/jce_camera_helpers.h>
+#include <jce/middleware/scene/jce_decal_projector.h>
 #include <jce/middleware/scene/jce_particle_force_fields.h>
 #include <jce/middleware/scene/jce_particle_modules.h>
 #include <jce/middleware/scene/jce_postfx_stack.h>
@@ -24,6 +25,7 @@ extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_scene_async.h>
 #include <jce/middleware/scene/jce_space_partition.h>
+#include <jce/middleware/scene/jce_sprite_animator.h>
 #include <jce/middleware/scene/jce_terrain_foliage.h>
 #include <jce/middleware/scene/jce_vcam_blend.h>
 #include <jce/middleware/scene/jce_vcam_confiner.h>

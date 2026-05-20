@@ -44,6 +44,7 @@ extern "C" {
 #include <jce/renderer/jce_taa_apply.h>
 #include <jce/renderer/jce_taa_jitter.h>
 #include <jce/renderer/jce_tilemap.h>
+#include <jce/renderer/jce_tilemap_rules.h>
 #include <jce/renderer/jce_render_queue.h>
 #include <jce/renderer/jce_scene_renderer.h>
 #include <jce/renderer/jce_vfx_graph.h>
