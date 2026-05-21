@@ -38,12 +38,14 @@
 #include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_renderer_caps.h>
 #include <jce/renderer/jce_occlusion_culler.h>
+#include <jce/renderer/jce_render_pipeline.h>
 #include <jce/renderer/jce_scene_renderer.h>
 #include <jce/renderer/jce_shaders.h>
 #include <jce/renderer/jce_skybox.h>
 #include <jce/renderer/jce_sprite_batch.h>
 #include <jce/renderer/jce_texture.h>
 #include <jce/renderer/jce_views.h>
+#include <jce/renderer/jce_volume_profile.h>
 
 #include <bgfx/c99/bgfx.h>
 #include <assert.h>
@@ -779,7 +781,8 @@ static void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
                       && sr->render_queue
                       && shadow_inst_sh.idx != UINT16_MAX;
 
-    const bool use_csm = sr->csm_valid && sr->csm_cascade_count > 0;
+    const bool use_csm = sr->csm_valid && sr->csm_cascade_count > 0
+                      && jce_render_pipeline_is_feature_enabled("csm");
     jce_vec3 shadow_dir = sr_resolve_shadow_light_direction(sr, scene, list);
 
     /* Compute shadow view IDs from base. */
@@ -1212,6 +1215,9 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                     dl.color = dlc->color;
                     dl.intensity = dlc->intensity > 0.0f ? dlc->intensity : 1.0f;
                     dl.direction = sr_light_shine_direction(&dlc->direction);
+                    /* P3-E.5 — propagate optional cookie. */
+                    dl.cookie_texture  = dlc->cookie_texture;
+                    dl.cookie_strength = dlc->cookie_strength;
                     jce_light_env_add_dir_light(sr->light_env, &dl);
                     has_any_light = true;
                 }
@@ -1241,6 +1247,10 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                     sl.outer_cone_cos = slc->outer_cone_cos;
                     sl.position  = xf ? xf->position : slc->position;
                     sl.direction = sr_light_shine_direction(&slc->direction);
+                    /* P3-E.5 — propagate cookie + IES profile bindings. */
+                    sl.cookie_texture  = slc->cookie_texture;
+                    sl.ies_lut_texture = slc->ies_lut_texture;
+                    sl.cookie_strength = slc->cookie_strength;
                     jce_light_env_add_spot_light(sr->light_env, &sl);
                     has_any_light = true;
                 }
@@ -2484,6 +2494,12 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
     if (sm > 3) sm = 0;
     jce_pbr_material_set_view_mode(sm);
 
+    /* Blend active Volume components into postfx params before pushing. */
+    if (camera) {
+        jce_vec3 cp = jce_camera_get_position(camera);
+        jce_volume_system_tick(scene, cp, &cfg->postfx);
+    }
+
     /* Push postfx params. */
     if (sr->postfx_pipeline)
         jce_postfx_set_params(sr->postfx_pipeline, &cfg->postfx);
@@ -2569,6 +2585,7 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
      * so callers can consume it once the composite pass is in place. */
     sr->vfog_last_rendered = false;
     if (cfg->fog_enabled
+        && jce_render_pipeline_is_feature_enabled("volumetric_fog")
         && cfg->fog_depth_tex_handle != UINT16_MAX
         && cfg->fog_rt_width > 0 && cfg->fog_rt_height > 0
         && sr->pak)

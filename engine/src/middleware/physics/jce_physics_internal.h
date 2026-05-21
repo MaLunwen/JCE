@@ -50,7 +50,7 @@ uint32_t jce_bullet_body_create(JceBulletWorld *bw,
                                 jce_vec3 half_ext, float mass,
                                 float friction, float restitution,
                                 float lin_damp, float ang_damp,
-                                uint16_t col_group, uint16_t col_mask,
+                                uint32_t col_group, uint32_t col_mask,
                                 bool is_trigger);
 
 void jce_bullet_body_destroy(JceBulletWorld *bw, uint32_t idx);
@@ -123,12 +123,78 @@ void jce_bullet_set_contact_end(JceBulletWorld *bw,
 
 uint32_t jce_bullet_body_count(JceBulletWorld *bw);
 
+/* Returns true if the body has the trigger flag (CF_NO_CONTACT_RESPONSE)
+ * set.  Used by the C layer when populating JceContactEvent.is_trigger. */
+bool jce_bullet_body_is_trigger(JceBulletWorld *bw, uint32_t idx);
+
+/* ================================================================== */
+/* Manifold enumeration (P3-C.5 — trigger / contact events)            */
+/* ================================================================== */
+
+/* Per-pair callback.  `is_trigger` is true if either body is a sensor.
+ * Coordinates are world-space.  depth is positive penetration. */
+typedef void (*jce_bullet_pair_fn)(uint32_t body_a, uint32_t body_b,
+                                   const float normal[3],
+                                   const float point[3],
+                                   float depth, bool is_trigger,
+                                   void *ud);
+
+/* Walk every persistent manifold with >=1 active contact point and
+ * invoke `fn` once per pair (using the first / deepest contact).
+ * Called from the C layer right after jce_bullet_step(). */
+void jce_bullet_enumerate_pairs(JceBulletWorld *bw,
+                                jce_bullet_pair_fn fn, void *ud);
+
+/* ================================================================== */
+/* Debug draw bridge (P3-C.5)                                          */
+/* ================================================================== */
+
+/* Line-sink signature passed through to the debug drawer.  Coordinates
+ * are world-space; abgr is 0xAABBGGRR. */
+typedef void (*jce_bullet_line_fn)(float fx, float fy, float fz,
+                                   float tx, float ty, float tz,
+                                   uint32_t abgr, void *ud);
+
+/* Set the debug-draw mode (mirrors btIDebugDraw mode bits — same
+ * values exposed by JcePhysicsDebugFlag).  Installs / removes the
+ * btIDebugDraw subclass on first non-zero / zero transition. */
+void jce_bullet_debug_set_mode(JceBulletWorld *bw, uint32_t flags);
+
+/* Drive Bullet's debug-draw pass and forward every line to `fn`.
+ * No-op when the installed mode is 0 or `fn` is NULL. */
+void jce_bullet_debug_draw(JceBulletWorld *bw,
+                           jce_bullet_line_fn fn, void *ud);
+
+/* Internal: release the debug-drawer slot when the world is torn
+ * down.  Called by jce_bullet_destroy(). */
+void jce_bullet_debug_world_destroyed_(JceBulletWorld *bw);
+
 /* ================================================================== */
 /* Collision filter                                                    */
 /* ================================================================== */
 
 void jce_bullet_body_set_collision_filter(JceBulletWorld *bw, uint32_t idx,
-                                          uint16_t group, uint16_t mask);
+                                          uint32_t group, uint32_t mask);
+
+/* Set friction + restitution on an existing body. */
+void jce_bullet_body_set_material(JceBulletWorld *bw, uint32_t idx,
+                                  float friction, float restitution);
+
+/* ================================================================== */
+/* Continuous Collision Detection (CCD)  (P3-C.3)                      */
+/* ================================================================== */
+
+/* Returns 0.0f if idx invalid.  swept_sphere_radius=0 means "auto":
+ * derive it from the shape AABB. */
+void  jce_bullet_body_set_ccd(JceBulletWorld *bw, uint32_t idx,
+                              float motion_threshold,
+                              float swept_sphere_radius);
+float jce_bullet_body_get_ccd_motion_threshold(JceBulletWorld *bw, uint32_t idx);
+float jce_bullet_body_get_ccd_swept_sphere_radius(JceBulletWorld *bw, uint32_t idx);
+
+/* Computed default swept-sphere radius for the body's current shape.
+ * Returns 0.0f if idx invalid. */
+float jce_bullet_body_compute_auto_swept_radius(JceBulletWorld *bw, uint32_t idx);
 
 /* ================================================================== */
 /* Constraints                                                         */
@@ -144,6 +210,35 @@ uint32_t jce_bullet_constraint_create(JceBulletWorld *bw,
 void jce_bullet_constraint_destroy(JceBulletWorld *bw, uint32_t idx);
 void jce_bullet_constraint_set_limits(JceBulletWorld *bw, uint32_t idx,
                                        float lower, float upper);
+
+/* ================================================================== */
+/* Joint introspection (P3-C.6 — editor gizmo)                         */
+/* ================================================================== */
+
+/* Plain-C mirror of JcePhysicsJointInfo so this internal header keeps
+ * its zero-dependency stance on physics public headers.  Field order
+ * matches one-for-one; jce_physics_joint_query.c copies between them. */
+typedef struct {
+    uint8_t  kind;            /* JcePhysicsJointKind */
+    uint32_t body_a;
+    uint32_t body_b;          /* UINT32_MAX = world anchor */
+    jce_vec3 anchor_a;        /* world space */
+    jce_vec3 anchor_b;        /* world space */
+    jce_vec3 axis;            /* world space, normalised */
+    float    limit_low;
+    float    limit_high;
+    jce_vec3 linear_lower;
+    jce_vec3 linear_upper;
+    jce_vec3 angular_lower;
+    jce_vec3 angular_upper;
+} JceBulletJointInfo;
+
+/* Find the first constraint touching `body_idx` and fill `out`.  v1
+ * returns the lowest-index match only.  Returns false if the body
+ * has no constraint or any argument is invalid. */
+bool jce_bullet_joint_get_info_for_body(JceBulletWorld *bw,
+                                        uint32_t body_idx,
+                                        JceBulletJointInfo *out);
 
 /* ================================================================== */
 /* Character controller                                                */
@@ -173,7 +268,7 @@ uint32_t jce_bullet_vehicle_create(JceBulletWorld *bw,
                                     float max_engine_force,
                                     float max_brake_force,
                                     float max_steering_rad,
-                                    uint16_t col_group, uint16_t col_mask);
+                                    uint32_t col_group, uint32_t col_mask);
 
 void jce_bullet_vehicle_destroy(JceBulletWorld *bw, uint32_t idx);
 
@@ -201,6 +296,24 @@ void jce_bullet_vehicle_get_wheel_transform(JceBulletWorld *bw, uint32_t idx,
                                               jce_vec3 *pos, jce_quat *rot);
 
 float jce_bullet_vehicle_get_speed(JceBulletWorld *bw, uint32_t idx);
+
+/* ================================================================== */
+/* P3-C.4 (cloth): native rigid-body pointer accessor + default world  */
+/* lookup.  Cloth lives in its own secondary btSoftRigidDynamicsWorld  */
+/* and needs a btRigidBody* to anchor against the primary rigid world. */
+/* ================================================================== */
+
+/* Returns the underlying btRigidBody* (opaque void*) for `idx`, or
+ * NULL on invalid idx / dead slot. */
+void *jce_bullet_body_get_rigid_native_(JceBulletWorld *bw, uint32_t idx);
+
+/* The most recently created (non-destroyed) JceBulletWorld — used by
+ * the cloth module's anchor helper.  Returns NULL if no rigid world
+ * is alive.  Updated by jce_physics_create / jce_physics_destroy. */
+JceBulletWorld *jce_physics_default_bullet_world_(void);
+
+/* Setter used internally by jce_physics_create / jce_physics_destroy. */
+void jce_physics_set_default_bullet_world_(JceBulletWorld *bw);
 
 #ifdef __cplusplus
 }

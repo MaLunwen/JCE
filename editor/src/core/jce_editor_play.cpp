@@ -188,6 +188,19 @@ static void play_create_physics_world(void)
 
         JceBodyHandle body = jce_physics_body_create(s_play_physics, &bd);
         if (jce_body_valid(body)) {
+            /* Apply Continuous Collision Detection settings (P3-C.3). */
+            if (rb->ccd_mode != JCE_CCD_DISCRETE) {
+                jce_physics_body_set_ccd_mode(s_play_physics, body,
+                                              (JceCcdMode)rb->ccd_mode);
+                if (rb->ccd_threshold > 0.0f) {
+                    jce_physics_body_set_ccd_motion_threshold(
+                        s_play_physics, body, rb->ccd_threshold);
+                }
+                if (rb->ccd_sphere_radius > 0.0f) {
+                    jce_physics_body_set_ccd_swept_sphere_radius(
+                        s_play_physics, body, rb->ccd_sphere_radius);
+                }
+            }
             s_play_bodies[s_play_body_count].entity_index = i;
             s_play_bodies[s_play_body_count].body         = body;
             s_play_body_count++;
@@ -286,6 +299,11 @@ bool jce_editor_play_get_player_position(float *out_x, float *out_y, float *out_
     if (out_y) *out_y = p.y;
     if (out_z) *out_z = p.z;
     return true;
+}
+
+JcePhysicsWorld *jce_editor_play_get_physics_world(void)
+{
+    return s_play_physics;
 }
 
 /* ── Audio helpers ────────────────────────────────────────────────── */

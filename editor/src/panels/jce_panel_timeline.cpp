@@ -318,14 +318,28 @@ void jce_editor_panel_timeline_content(void)
 
 /* ── Standalone wrapper ───────────────────────────────────────────── */
 
+extern "C" void timeline_draw_content(void)
+{
+    jce_editor_panel_timeline_content();
+}
+
 void jce_editor_panel_timeline(void)
 {
+    /* Shim: Timeline has been merged into the Animation Editor
+     * workbench as a tab.  Activating this panel now redirects to
+     * that workbench and requests the Timeline tab.  Symbol kept so
+     * menu/hotkey entries registered against JCE_PANEL_TIMELINE
+     * keep working. */
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_TIMELINE);
-    if (!*vis) return;
+    if (!vis || !*vis) return;
+    *vis = false;
 
-    char title[256];
-    snprintf(title, sizeof(title), "%s###timeline", jce_editor_i18n("Timeline"));
-    if (ImGui::Begin(title, vis, ImGuiWindowFlags_NoFocusOnAppearing))
-        jce_editor_panel_timeline_content();
-    ImGui::End();
+    bool *ae_vis = jce_editor_panel_visible_ptr(JCE_PANEL_ANIMATION_EDITOR);
+    if (ae_vis) *ae_vis = true;
+
+    char title[128];
+    snprintf(title, sizeof(title), "%s###jce_anim_editor",
+             jce_editor_i18n("animationEditor.title"));
+    ImGui::SetWindowFocus(title);
+    jce_panel_animation_editor_request_tab(4);
 }

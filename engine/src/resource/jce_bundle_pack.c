@@ -667,6 +667,36 @@ static char *build_manifest(const Bundle *b, const PakEntry *entries,
     return s;
 }
 
+/* Per-asset record captured for the editor build report.  Kept on the
+ * CatalogEntry so the post-build report writer can walk one structure
+ * regardless of whether the bundle was freshly built or reused from
+ * the incremental cache (in which case we rehydrate from the sidecar). */
+typedef struct {
+    char    *path;
+    char    *hash;
+    uint64_t size;
+} ReportEntry;
+
+typedef struct { ReportEntry *items; size_t n, c; } ReportEntryVec;
+
+static ReportEntry *rv_create(ReportEntryVec *v) {
+    if (v->n == v->c) {
+        v->c = v->c ? v->c * 2 : 16;
+        v->items = (ReportEntry *)JCE_REALLOC(v->items, v->c * sizeof(ReportEntry));
+        if (!v->items) die("oom");
+    }
+    ReportEntry *e = &v->items[v->n++];
+    memset(e, 0, sizeof(*e));
+    return e;
+}
+static void rv_free(ReportEntryVec *v) {
+    for (size_t i = 0; i < v->n; ++i) {
+        JCE_FREE(v->items[i].path);
+        JCE_FREE(v->items[i].hash);
+    }
+    JCE_FREE(v->items); v->items = NULL; v->n = v->c = 0;
+}
+
 typedef struct {
     char *id;
     char *file;
@@ -675,6 +705,7 @@ typedef struct {
     char *content_hash;
     uint64_t size;
     StrVec deps;
+    ReportEntryVec entries;
 } CatalogEntry;
 
 typedef struct { CatalogEntry *items; size_t n, c; } CatalogVec;
@@ -697,6 +728,7 @@ static void cv_free(CatalogVec *v) {
         JCE_FREE(v->items[i].scene_path);
         JCE_FREE(v->items[i].content_hash);
         sv_free(&v->items[i].deps);
+        rv_free(&v->items[i].entries);
     }
     JCE_FREE(v->items); v->items = NULL; v->n = v->c = 0;
 }
@@ -762,6 +794,153 @@ static char *load_text_file(const char *path, size_t *out_len) {
     memcpy(s, b, sz); s[sz] = '\0';
     JCE_FREE(b);
     if (out_len) *out_len = sz;
+    return s;
+}
+
+/* ================================================================== */
+/* Build report (P3-A.4)                                                */
+/* ================================================================== */
+
+/* Filename written next to bundle_catalog.json after a full build.
+ * Consumed by editor "Build Report" panel.  Schema version is encoded
+ * in the `$schema` field; bump when changing keys. */
+#define JCE_BUILD_REPORT_NAME    "build_report.json"
+#define JCE_BUILD_REPORT_SCHEMA  "jce.buildreport.v1"
+
+/* Best-effort asset-type classification from extension.  Used purely for
+ * the editor's filter/grouping affordances — runtime never reads this. */
+static const char *report_guess_type(const char *path) {
+    const char *dot = NULL;
+    for (const char *p = path; *p; ++p) if (*p == '.') dot = p;
+    if (!dot) return "other";
+    char ext[16]; size_t n = 0;
+    for (const char *p = dot + 1; *p && n + 1 < sizeof(ext); ++p) {
+        char c = *p;
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        ext[n++] = c;
+    }
+    ext[n] = '\0';
+    size_t pl = strlen(path);
+    if (pl >= 11 && strcmp(path + pl - 11, ".scene.json") == 0)
+        return "scene";
+    if (strcmp(ext, "gltf") == 0 || strcmp(ext, "glb")  == 0 ||
+        strcmp(ext, "fbx")  == 0 || strcmp(ext, "obj")  == 0 ||
+        strcmp(ext, "mesh") == 0)                          return "mesh";
+    if (strcmp(ext, "png")  == 0 || strcmp(ext, "jpg")  == 0 ||
+        strcmp(ext, "jpeg") == 0 || strcmp(ext, "tga")  == 0 ||
+        strcmp(ext, "bmp")  == 0 || strcmp(ext, "hdr")  == 0 ||
+        strcmp(ext, "ktx")  == 0 || strcmp(ext, "ktx2") == 0 ||
+        strcmp(ext, "basis")== 0 || strcmp(ext, "dds")  == 0 ||
+        strcmp(ext, "webp") == 0)                          return "texture";
+    if (strcmp(ext, "wav")  == 0 || strcmp(ext, "ogg")  == 0 ||
+        strcmp(ext, "mp3")  == 0 || strcmp(ext, "opus") == 0 ||
+        strcmp(ext, "flac") == 0)                          return "audio";
+    if (strcmp(ext, "mp4")  == 0 || strcmp(ext, "webm") == 0 ||
+        strcmp(ext, "mkv")  == 0 || strcmp(ext, "ivf")  == 0)
+        return "video";
+    if (strcmp(ext, "ttf")  == 0 || strcmp(ext, "otf")  == 0)
+        return "font";
+    if (strcmp(ext, "bin")  == 0 || strcmp(ext, "sc")   == 0)
+        return "shader";
+    if (strcmp(ext, "json") == 0)                          return "json";
+    return ext[0] ? ext : "other";
+}
+
+static void iso8601_utc_now(char *buf, size_t n) {
+    time_t t = time(NULL);
+    struct tm tm;
+#ifdef _WIN32
+    gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
+    strftime(buf, n, "%Y-%m-%dT%H:%M:%SZ", &tm);
+}
+
+/* Build the build_report.json document.  Returns malloc'd string;
+ * caller frees with JCE_FREE().  *out_len receives strlen. */
+static char *build_report_json(const CatalogVec *cat, size_t *out_len) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "$schema", JCE_BUILD_REPORT_SCHEMA);
+    char ts[32]; iso8601_utc_now(ts, sizeof(ts));
+    cJSON_AddStringToObject(root, "timestamp", ts);
+
+    uint64_t total_bytes = 0;
+    size_t   unique_assets = 0;
+
+    /* Duplicate detection: hash -> { size, bundle ids[] }.  cJSON
+     * map of `hash -> object` is the most compact representation
+     * here; flattened to an array at the end. */
+    cJSON *hash_map = cJSON_CreateObject();
+
+    cJSON *bundles = cJSON_AddArrayToObject(root, "bundles");
+    for (size_t i = 0; i < cat->n; ++i) {
+        const CatalogEntry *e = &cat->items[i];
+        cJSON *bo = cJSON_CreateObject();
+        cJSON_AddStringToObject(bo, "name", e->id);
+        cJSON_AddStringToObject(bo, "file", e->file);
+        cJSON_AddNumberToObject(bo, "size_bytes", (double)e->size);
+        cJSON_AddNumberToObject(bo, "entry_count", (double)e->entries.n);
+        total_bytes += e->size;
+
+        cJSON *deps = cJSON_AddArrayToObject(bo, "dependencies");
+        for (size_t d = 0; d < e->deps.n; ++d)
+            cJSON_AddItemToArray(deps, cJSON_CreateString(e->deps.items[d]));
+
+        cJSON *ents = cJSON_AddArrayToObject(bo, "entries");
+        for (size_t k = 0; k < e->entries.n; ++k) {
+            const ReportEntry *re = &e->entries.items[k];
+            cJSON *eo = cJSON_CreateObject();
+            cJSON_AddStringToObject(eo, "path", re->path ? re->path : "");
+            cJSON_AddNumberToObject(eo, "size_bytes", (double)re->size);
+            cJSON_AddStringToObject(eo, "hash", re->hash ? re->hash : "");
+            cJSON_AddStringToObject(eo, "type",
+                report_guess_type(re->path ? re->path : ""));
+            cJSON_AddItemToArray(ents, eo);
+
+            if (re->hash && re->hash[0]) {
+                cJSON *slot = cJSON_GetObjectItemCaseSensitive(hash_map, re->hash);
+                if (!slot) {
+                    slot = cJSON_CreateObject();
+                    cJSON_AddNumberToObject(slot, "size_bytes", (double)re->size);
+                    cJSON_AddArrayToObject(slot, "in_bundles");
+                    cJSON_AddItemToObject(hash_map, re->hash, slot);
+                    ++unique_assets;
+                }
+                cJSON *arr = cJSON_GetObjectItemCaseSensitive(slot, "in_bundles");
+                cJSON_AddItemToArray(arr, cJSON_CreateString(e->id));
+            }
+        }
+        cJSON_AddItemToArray(bundles, bo);
+    }
+
+    cJSON *dups = cJSON_AddArrayToObject(root, "duplicates");
+    cJSON *slot = NULL;
+    cJSON_ArrayForEach(slot, hash_map) {
+        const cJSON *arr = cJSON_GetObjectItemCaseSensitive(slot, "in_bundles");
+        if (!cJSON_IsArray(arr) || cJSON_GetArraySize(arr) < 2) continue;
+        cJSON *d = cJSON_CreateObject();
+        cJSON_AddStringToObject(d, "hash", slot->string);
+        const cJSON *sz = cJSON_GetObjectItemCaseSensitive(slot, "size_bytes");
+        cJSON_AddNumberToObject(d, "size_bytes",
+                                sz ? sz->valuedouble : 0.0);
+        cJSON *dub = cJSON_AddArrayToObject(d, "in_bundles");
+        const cJSON *bid;
+        cJSON_ArrayForEach(bid, arr)
+            cJSON_AddItemToArray(dub, cJSON_Duplicate(bid, 1));
+        cJSON_AddItemToArray(dups, d);
+    }
+    cJSON_Delete(hash_map);
+
+    cJSON *totals = cJSON_AddObjectToObject(root, "totals");
+    cJSON_AddNumberToObject(totals, "bundle_count", (double)cat->n);
+    cJSON_AddNumberToObject(totals, "total_size_bytes", (double)total_bytes);
+    cJSON_AddNumberToObject(totals, "unique_asset_count",
+                            (double)unique_assets);
+
+    char *s = cJSON_Print(root);
+    cJSON_Delete(root);
+    *out_len = s ? strlen(s) : 0;
     return s;
 }
 
@@ -1464,7 +1643,6 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                     uint8_t *sblob = read_file(src_side, &ssz);
                     if (sblob) {
                         write_file(sidecar_path, sblob, ssz);
-                        JCE_FREE(sblob);
                     }
                     CatalogEntry *ce = cv_create(&catalog);
                     ce->id   = _strdup(b->id);
@@ -1475,6 +1653,33 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                     ce->size = sz;
                     for (size_t d = 0; d < b->deps.n; ++d)
                         sv_push(&ce->deps, b->deps.items[d]);
+                    /* Rehydrate report entries from the reused sidecar so
+                     * the build report is consistent regardless of cache
+                     * hits.  Best-effort: if parsing fails we still ship
+                     * the bundle row with zero entries. */
+                    if (sblob) {
+                        cJSON *sj = cJSON_ParseWithLength(
+                            (const char *)sblob, ssz);
+                        if (sj) {
+                            const cJSON *assets = cJSON_GetObjectItemCaseSensitive(
+                                sj, JCE_BUNDLE_KEY_ASSETS);
+                            if (cJSON_IsArray(assets)) {
+                                const cJSON *ae;
+                                cJSON_ArrayForEach(ae, assets) {
+                                    const cJSON *ap = cJSON_GetObjectItemCaseSensitive(ae, JCE_BUNDLE_KEY_ASSET_PATH);
+                                    const cJSON *az = cJSON_GetObjectItemCaseSensitive(ae, JCE_BUNDLE_KEY_ASSET_SIZE);
+                                    const cJSON *ah = cJSON_GetObjectItemCaseSensitive(ae, JCE_BUNDLE_KEY_ASSET_HASH);
+                                    if (!(ap && cJSON_IsString(ap))) continue;
+                                    ReportEntry *re = rv_create(&ce->entries);
+                                    re->path = _strdup(ap->valuestring);
+                                    re->size = (az && cJSON_IsNumber(az)) ? (uint64_t)az->valuedouble : 0;
+                                    re->hash = (ah && cJSON_IsString(ah)) ? _strdup(ah->valuestring) : _strdup("");
+                                }
+                            }
+                            cJSON_Delete(sj);
+                        }
+                        JCE_FREE(sblob);
+                    }
                     total_bytes += sz;
                     reused_count++;
                     JCE_FREE(blob);
@@ -1553,6 +1758,17 @@ static int run_build_impl(const JceBundlePackOptions *opts)
         ce->size = pak_size;
         for (size_t d = 0; d < b->deps.n; ++d)
             sv_push(&ce->deps, b->deps.items[d]);
+        /* Capture per-asset entries for the build report.  Skip the
+         * manifest pseudo-entry — it's an implementation detail of the
+         * pak format, not a user-visible asset. */
+        for (size_t i = 0; i < actual; ++i) {
+            const PakEntry *pe = &entries[i];
+            if (strcmp(pe->vpath, JCE_BUNDLE_MANIFEST_VPATH) == 0) continue;
+            ReportEntry *re = rv_create(&ce->entries);
+            re->path = _strdup(pe->vpath);
+            re->size = (uint64_t)pe->raw_size;
+            re->hash = hex16(pe->content_hash);
+        }
         total_bytes += pak_size;
 
         for (size_t i = 0; i < actual; ++i) {
@@ -1593,6 +1809,26 @@ static int run_build_impl(const JceBundlePackOptions *opts)
         if (reused_count)
             LOG("incremental: reused %zu unchanged bundle(s)", reused_count);
         JCE_FREE(cat_json);
+
+        /* P3-A.4 — emit build_report.json for the editor's Build Report
+         * panel.  Best-effort: failure to write the report is not fatal
+         * to the build itself; just log a warning. */
+        {
+            size_t rlen = 0;
+            char *rjson = build_report_json(&catalog, &rlen);
+            if (rjson) {
+                char rpath[1280];
+                snprintf(rpath, sizeof(rpath), "%s/%s",
+                         out_dir, JCE_BUILD_REPORT_NAME);
+                if (write_file(rpath, rjson, rlen)) {
+                    LOG("build report written: %s (%zu bundles)",
+                        rpath, catalog.n);
+                } else {
+                    pack_log_warn("cannot write %s", rpath);
+                }
+                JCE_FREE(rjson);
+            }
+        }
     }
 
     sv_free(&scene_paths);

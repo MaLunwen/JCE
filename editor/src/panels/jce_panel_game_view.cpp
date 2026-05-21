@@ -197,7 +197,9 @@ void jce_editor_panel_game_view_content(void)
         } else {
             if (ImGui::SmallButton("[]")) jce_run_manager_request_stop();
             ImGui::SameLine();
-            if (rs.state == JCE_RUN_STOPPING)
+            if (rs.state == JCE_RUN_BUILDING)
+                ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1.0f), "%s", jce_editor_i18n("gameView.repackingAssets"));
+            else if (rs.state == JCE_RUN_STOPPING)
                 ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "%s", jce_editor_i18n("gameView.stoppingExternal"));
             else
                 ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f), "%s", jce_editor_i18n("gameView.externalRunning"));

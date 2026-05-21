@@ -58,6 +58,9 @@ extern "C" {
 /* ── Layer 5: Scene ──────────────────────────────────────────────── */
 #include <jce/api_scene.h>
 
+/* ── Layer 5: Runtime (PlayerLoop, game-module bridge) ───────────── */
+#include <jce/api_runtime.h>
+
 /* ── Layer 6: Application ────────────────────────────────────────── */
 #include <jce/api_app.h>
 

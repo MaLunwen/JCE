@@ -21,6 +21,8 @@ typedef enum {
     JCE_FV_MODEL,       /* gltf, glb, obj, fbx */
     JCE_FV_SCENE,       /* .scene, .scene.json */
     JCE_FV_MATERIAL,    /* .mat.json PBR material */
+    JCE_FV_PHYSMAT,     /* .physmat.json Physics material */
+    JCE_FV_RENDER_PIPELINE, /* .rp.json Render Pipeline asset */
     JCE_FV_AUDIO,       /* wav, ogg, mp3, flac */
     JCE_FV_VIDEO,       /* mp4, webm, mov, mkv, avi, flv, m4v */
     JCE_FV_BINARY,      /* unknown binary */

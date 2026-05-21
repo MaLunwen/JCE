@@ -71,6 +71,39 @@ SAMPLER2D(s_csmShadow1, 10);
 SAMPLER2D(s_csmShadow2, 11);
 SAMPLER2D(s_csmShadow3, 12);
 
+// P3-E.5  — Light cookies + IES profiles (stages 13-14)
+// P3-E.5b — Directional light cookie projection (shares sampler 13).
+// Atlas slot index per-light is uploaded in u_dirLights[i*2+1].w and
+// u_spotLights[i*4+3].y; the CPU side currently single-binds the
+// first eligible cookie texture, but once s_cookie is promoted to
+// SAMPLER2DARRAY the per-light slot can drive texture2DArray sampling
+// with no further engine changes.  See engine/src/renderer/AGENTS.md.
+#ifdef JCE_RENDER_COOKIE_2D_ARRAY
+SAMPLER2DARRAY(s_cookie, 13);
+#else
+SAMPLER2D(s_cookie, 13);
+#endif
+SAMPLER2D(s_iesLut, 14);
+
+// u_cookieParams.x = has_cookie_spot   (1.0 / 0.0)
+// u_cookieParams.y = cookie_strength   (0..1)
+// u_cookieParams.z = has_ies_spot      (1.0 / 0.0)
+// u_cookieParams.w = cookie_spot_index (which u_spotLights[] slot owns
+//                                        the cookie/IES sampler binding)
+uniform vec4 u_cookieParams;
+
+// Clip-from-world for the spot light that owns the cookie/IES binding.
+uniform mat4 u_cookieSpotVP;
+
+// P3-E.5b — Directional cookie.
+// u_cookieDirParams.x = has_cookie_dir   (1.0 / 0.0)
+// u_cookieDirParams.y = cookie_strength  (0..1)
+// u_cookieDirParams.z = cookie_dir_index (which u_dirLights[] slot owns
+//                                          the cookie sampler binding)
+// u_cookieDirParams.w = 0
+uniform vec4 u_cookieDirParams;
+uniform mat4 u_cookieDirVP;
+
 // Convert NDC depth to [0,1] range for shadow comparison.
 // OpenGL (GLSL): NDC z is in [-1,1], needs remap.
 // D3D / Vulkan / Metal: NDC z is already in [0,1].
@@ -427,6 +460,42 @@ void main()
         vec3 lightColor = u_dirLights[i * 2 + 1].xyz;
 
         vec3 radiance = lightColor * intensity;
+
+        // ── P3-E.5b: directional light cookie projection ───────────
+        // Only the directional light selected by u_cookieDirParams.z
+        // receives the cookie sampler bind (v1 single-bind shared
+        // with spot cookies via sampler 13).  World-aligned ortho VP
+        // built CPU-side around the camera position; UV outside
+        // [0,1] is clamped to "no cookie" (multiplier 1.0).
+        if (u_cookieDirParams.x > 0.5 && float(i) == u_cookieDirParams.z)
+        {
+            // P4-E.3a: when CSM is active (u_csmSplits.x > 0) cascade-0's
+            // ortho VP is identical to the cookie VP — reuse it to save a
+            // uniform slot and guarantee pixel-perfect agreement.
+            mat4 _dirCookieVP = (u_csmSplits.x > 0.0) ? u_csmVP[0] : u_cookieDirVP;
+            vec4 clipD = mul(_dirCookieVP, vec4(v_worldpos, 1.0));
+            if (clipD.w > 0.0)
+            {
+                vec3 ndcD = clipD.xyz / clipD.w;
+                vec2 uvD  = ndcD.xy * 0.5 + vec2(0.5, 0.5);
+            #if BGFX_SHADER_LANGUAGE_GLSL
+                uvD.y = 1.0 - uvD.y;
+            #endif
+                vec2 inUVd  = step(vec2_splat(0.0), uvD) * step(uvD, vec2_splat(1.0));
+                float inMaskD = inUVd.x * inUVd.y;
+#ifdef JCE_RENDER_COOKIE_2D_ARRAY
+                float _dirSlice = u_cookieDirParams.w; /* atlas layer for this dir light */
+                vec4  cookieDSample = texture2DArray(s_cookie, vec3(uvD, _dirSlice));
+#else
+                vec4  cookieDSample = texture2D(s_cookie, uvD);
+#endif
+                vec3  cookieDRGB = mix(vec3_splat(1.0),
+                                       cookieDSample.rgb,
+                                       u_cookieDirParams.y * inMaskD);
+                radiance *= cookieDRGB;
+            }
+        }
+
         Lo += cookTorranceBRDF(N, V, lightDir, F0, albedo, metallic, roughness) * radiance * shadow;
     }
 
@@ -481,6 +550,55 @@ void main()
         float cone = clamp((theta - outerCos) / max(epsilon, 0.0001), 0.0, 1.0);
 
         vec3 radiance = lightColor * intensity * attenuation * cone;
+
+        // ── P3-E.5: light cookie projection ────────────────────────
+        // Only the spot light selected by u_cookieParams.w receives
+        // the cookie / IES sampler bind (bgfx samplers are global per
+        // draw, so v1 supports at most one cookie + one IES profile
+        // per frame). Other lights pass through unchanged.
+        if (u_cookieParams.x > 0.5 && float(i) == u_cookieParams.w)
+        {
+            vec4 clip = mul(u_cookieSpotVP, vec4(v_worldpos, 1.0));
+            // Reject points behind the light's near plane.
+            if (clip.w > 0.0)
+            {
+                vec3 ndc = clip.xyz / clip.w;
+                vec2 uv  = ndc.xy * 0.5 + vec2(0.5, 0.5);
+            #if BGFX_SHADER_LANGUAGE_GLSL
+                // bgfx framebuffer y is flipped on GL; cookie textures
+                // are authored top-left origin, mirror to match D3D.
+                uv.y = 1.0 - uv.y;
+            #endif
+                // Clip outside the frustum.
+                vec2 inUV = step(vec2_splat(0.0), uv) * step(uv, vec2_splat(1.0));
+                float inMask = inUV.x * inUV.y;
+#ifdef JCE_RENDER_COOKIE_2D_ARRAY
+                float _spotSlice = u_cookieParams.x; /* atlas layer for this spot light */
+                vec4  cookieSample = texture2DArray(s_cookie, vec3(uv, _spotSlice));
+#else
+                vec4  cookieSample = texture2D(s_cookie, uv);
+#endif
+                // Blend toward white by (1 - strength) so a partial
+                // strength still tints rather than fully masks.
+                vec3 cookieRGB = mix(vec3_splat(1.0),
+                                     cookieSample.rgb,
+                                     u_cookieParams.y * inMask);
+                radiance *= cookieRGB;
+            }
+        }
+
+        // ── P3-E.5: IES photometric profile ────────────────────────
+        // Sample the 1-D LUT (256x1) by the angle between the light's
+        // forward and the surface->light vector.
+        if (u_cookieParams.z > 0.5 && float(i) == u_cookieParams.w)
+        {
+            float cosA = clamp(dot(-spotDir, lightDir), -1.0, 1.0);
+            // Map [1..-1] (axis -> back) to [0..1] U.
+            float u = (1.0 - cosA) * 0.5;
+            float ies = texture2D(s_iesLut, vec2(u, 0.5)).r;
+            radiance *= ies;
+        }
+
         Lo += cookTorranceBRDF(N, V, lightDir, F0, albedo, metallic, roughness) * radiance;
     }
 

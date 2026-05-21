@@ -10,6 +10,7 @@
 
 #include <jce/middleware/audio/jce_audio.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_mem_profile.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/renderer/jce_mesh.h>
@@ -26,12 +27,32 @@
 #define LOG_TAG "jce_asset"
 
 /* ================================================================== */
+/* Tag mapping for memory profiler (P3-A.5)                            */
+/* ================================================================== */
+
+static JceMemTag tag_for_asset_type(uint32_t type)
+{
+    switch (type) {
+    case JCE_ASSET_TEXTURE: return JCE_MEM_TAG_RESOURCE_TEXTURES;
+    case JCE_ASSET_MESH:
+    case JCE_ASSET_MODEL:   return JCE_MEM_TAG_RESOURCE_MESHES;
+    case JCE_ASSET_SOUND:   return JCE_MEM_TAG_RESOURCE_AUDIO;
+    default:                return JCE_MEM_TAG_RESOURCE_OTHER;
+    }
+}
+
+/* ================================================================== */
 /* Per-type payload destruction                                        */
 /* ================================================================== */
 
 void destroy_slot_payload(JceAssetManager *mgr, JceAssetSlot *slot)
 {
     if (!slot || !slot->data) return;
+
+    if (slot->memory_bytes > 0) {
+        jce_mem_profile_record_free(tag_for_asset_type(slot->type),
+                                    slot->memory_bytes);
+    }
 
     /* Try registered external destroyer first. */
     if ((uint32_t)slot->type < JCE_ASSET_TYPE_COUNT &&
@@ -256,6 +277,15 @@ void load_slot_sync(JceAssetManager *mgr,
         load_raw_sync(mgr, slot, asset_path);
         break;
     }
+
+    /* P3-A.5: feed the Memory Profiler panel. We track on the central
+     * READY transition so every loader path (built-in, ext, async
+     * finalize that funnels through here) contributes uniformly. */
+    if (SDL_GetAtomicInt(&slot->state) == JCE_ASSET_STATE_READY &&
+        slot->memory_bytes > 0) {
+        jce_mem_profile_record_alloc(tag_for_asset_type((uint32_t)type),
+                                     slot->memory_bytes);
+    }
 }
 
 /* ================================================================== */
@@ -308,6 +338,7 @@ static void finalize_texture_inner(JceAssetManager *mgr, JceAssetSlot *slot,
     slot->data = heap;
     slot->memory_bytes = (size_t)w * h * 4;
     JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_READY);
+    jce_mem_profile_record_alloc(JCE_MEM_TAG_RESOURCE_TEXTURES, slot->memory_bytes);
     mgr->total_loaded++;
     mgr->total_memory += slot->memory_bytes;
 }
@@ -381,6 +412,7 @@ void finalize_raw(JceAssetManager *mgr, JceAssetSlot *slot,
     slot->memory_bytes = req->decoded_size;
     req->decoded_data = NULL; /* ownership transferred */
     JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_READY);
+    jce_mem_profile_record_alloc(JCE_MEM_TAG_RESOURCE_OTHER, slot->memory_bytes);
     mgr->total_loaded++;
     mgr->total_memory += slot->memory_bytes;
 }

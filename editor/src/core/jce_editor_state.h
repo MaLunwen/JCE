@@ -170,6 +170,10 @@ bool              jce_state_get_show_grid(void);
 void              jce_state_set_show_grid(bool show);
 bool              jce_state_get_show_physics_debug(void);
 void              jce_state_set_show_physics_debug(bool show);
+bool              jce_state_get_show_joint_gizmos(void);
+void              jce_state_set_show_joint_gizmos(bool show);
+bool              jce_state_get_show_cloth_gizmos(void);
+void              jce_state_set_show_cloth_gizmos(bool show);
 
 /* Show Flags (UE-style overlay toggles).  Bitmask, see JceShowFlag below.
  * Existing show_grid / show_physics_debug remain authoritative; the bitmask
@@ -235,6 +239,11 @@ void jce_editor_play_set_player_input(float walk_x, float walk_z,
 /* Returns true and writes the player character's world position if a
  * character is alive; false otherwise. */
 bool jce_editor_play_get_player_position(float *out_x, float *out_y, float *out_z);
+
+/* Returns the live physics world during Play (or NULL if not running).
+ * Editor-side debug-draw / contact-listener wiring uses this. */
+struct JcePhysicsWorld;
+struct JcePhysicsWorld *jce_editor_play_get_physics_world(void);
 
 /* Undo/Redo history. */
 void  jce_state_undo(void);

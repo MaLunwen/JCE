@@ -405,4 +405,29 @@ JceNetTransport jce_net_get_transport(void)
     return JCE_NET_TRANSPORT_WEBSOCKET;
 }
 
+bool jce_net_peer_stats(const JceNetHost *host, JcePeerHandle peer,
+                        JceNetPeerStats *out)
+{
+    if (!out) return false;
+    out->rtt_ms = 0;
+    out->packets_sent = 0;
+    out->packets_lost = 0;
+    out->bytes_in = 0;
+    out->bytes_out = 0;
+    if (!host || !jce_peer_valid(peer) || peer.idx >= host->max_peers)
+        return false;
+    if (host->peers[peer.idx].state != PEER_STATE_CONNECTED) return false;
+    out->rtt_ms = host->peers[peer.idx].rtt_ms;
+    return true;
+}
+
+bool jce_net_peer_address_str(const JceNetHost *host, JcePeerHandle peer,
+                              char *buf, uint32_t buf_size)
+{
+    (void)host; (void)peer;
+    if (!buf || buf_size == 0) return false;
+    buf[0] = '\0';
+    return false;
+}
+
 #endif /* __EMSCRIPTEN__ */

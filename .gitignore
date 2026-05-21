@@ -18,7 +18,7 @@ out/
 
 
 caged_kingdom/resources/assets/
-engine/resources/assets/
+engine/resources/assets/shaders/
 editor/resources/assets/fonts/
 !editor/resources/assets/i18n/
 !editor/resources/assets/i18n/**

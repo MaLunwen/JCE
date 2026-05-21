@@ -282,6 +282,31 @@ void jce_mesh_submit_pbr(const JceMesh *mesh, const JceRenderer *r, uint16_t vie
     bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
 }
 
+void jce_mesh_submit_pbr_with_program(const JceMesh        *mesh,
+                                       const JceRenderer    *r,
+                                       uint16_t              view_id,
+                                       JceShaderHandle       program)
+{
+    if (!mesh || !r) return;
+
+    bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
+
+    if (mesh->ibh.idx != UINT16_MAX)
+        bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
+
+    bgfx_set_state(BGFX_STATE_DEFAULT, 0);
+
+    /* Fall back to the renderer's default PBR program when the
+     * override handle is invalid — keeps callers simple (they can
+     * always pass the material's custom_program even if unset). */
+    uint16_t idx = program.idx;
+    if (idx == UINT16_MAX)
+        idx = jce_renderer_get_program_pbr(r).idx;
+
+    bgfx_program_handle_t prog = { idx };
+    bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+}
+
 void jce_mesh_submit_terrain(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id)
 {
     if (!mesh || !r) return;

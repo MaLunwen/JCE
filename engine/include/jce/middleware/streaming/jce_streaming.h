@@ -203,6 +203,45 @@ JCE_API void jce_streaming_set_pressure_callback(JceStreamingSystem    *sys,
                                                   JceStreamingPressureFn fn,
                                                   void                  *user_data);
 
+/*
+ * Engine-internal pressure hook chain.
+ *
+ * The streaming subsystem invokes every registered hook (in registration
+ * order) BEFORE firing the user callback set via
+ * jce_streaming_set_pressure_callback().  Hooks let engine layers
+ * (texture mip streaming, audio quality, etc.) react to back-pressure
+ * without stomping on the single user slot.
+ *
+ * Returns true on success, false if the hook table is full or `fn` is
+ * NULL.  At most JCE_STREAMING_MAX_PRESSURE_HOOKS hooks may be
+ * registered per system.
+ */
+#define JCE_STREAMING_MAX_PRESSURE_HOOKS 4
+
+JCE_API bool jce_streaming_add_pressure_hook(JceStreamingSystem    *sys,
+                                              JceStreamingPressureFn fn,
+                                              void                  *user_data);
+
+/*
+ * Force the streaming system to HARD pressure level immediately and
+ * fire all registered hooks + the user callback.  Used by the
+ * application lifecycle bridge to react to OS LOW_MEMORY signals
+ * (P3-B.3): even though our own budget is not yet exceeded, the OS
+ * has told us to release everything we can.  The actual pressure
+ * level is then recomputed from used/budget on the next streaming
+ * update, so callers do not need to "reset" it.
+ *
+ * Safe to call with NULL.  Main-thread only.
+ */
+JCE_API void jce_streaming_signal_low_memory(JceStreamingSystem *sys);
+
+/*
+ * Broadcast jce_streaming_signal_low_memory() to every live streaming
+ * system created in this process.  Called from the engine's internal
+ * lifecycle listener registered at jce_engine_create().
+ */
+JCE_API void jce_streaming_signal_low_memory_all(void);
+
 /* Number of HARD-pressure load refusals since system creation.  Each
  * tick that a load was refused due to over-budget memory increments
  * this counter — a non-zero value proves the back-pressure path is

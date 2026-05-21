@@ -24,6 +24,8 @@
 
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/renderer/jce_scene_renderer.h>
+#include <jce/renderer/jce_material_registry.h>
+#include <jce/application/jce_args.h>
 #include <jce/os/core/jce_alloc.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
@@ -105,6 +107,84 @@ static void refresh_quest_state(CkSceneDirector *dir, const char *vfs_path)
     }
 }
 
+/* ── Hot-reload glue (dev mode only) ───────────────────────────────── */
+
+typedef struct {
+    JceScene *scene;
+    const char *changed_path;
+    const JcePbrMaterial *pbr;
+    const char (*tex_paths)[256];   /* 5 slots */
+    int hit_count;
+} PatchCtx;
+
+static void patch_matching_mesh_renderer(JceScene *s, JceEntity e, void *ud)
+{
+    PatchCtx *ctx = (PatchCtx *)ud;
+    JceMeshRenderer *mr = jce_scene_get_mesh_renderer(s, e);
+    if (!mr) return;
+    if (mr->material_path[0] == '\0') return;
+    if (strcmp(mr->material_path, ctx->changed_path) != 0) return;
+
+    /* Apply new PBR factors. We deliberately keep mesh_path,
+     * material_path, and per-entity overrides like base_color
+     * alpha untouched only when the new file specifies them — the
+     * .mat.json is authoritative for everything in the PBR block. */
+    const JcePbrMaterial *p = ctx->pbr;
+    mr->base_color[0] = p->base_color_factor[0];
+    mr->base_color[1] = p->base_color_factor[1];
+    mr->base_color[2] = p->base_color_factor[2];
+    mr->base_color[3] = p->base_color_factor[3];
+    mr->metallic     = p->metallic_factor;
+    mr->roughness    = p->roughness_factor;
+    mr->emissive[0]  = p->emissive_factor[0];
+    mr->emissive[1]  = p->emissive_factor[1];
+    mr->emissive[2]  = p->emissive_factor[2];
+    mr->normal_scale = p->normal_scale;
+    mr->ao_strength  = p->ao_strength;
+    mr->alpha_mode   = (uint8_t)p->alpha_mode;
+    mr->alpha_cutoff = p->alpha_cutoff;
+    mr->double_sided = p->double_sided;
+
+    /* Texture slots: only overwrite when the new file actually names
+     * a texture, so a designer can save a factor tweak without losing
+     * a per-entity texture override. */
+    const char (*tp)[256] = ctx->tex_paths;
+    if (tp[0][0]) { strncpy(mr->albedo_tex,   tp[0], sizeof(mr->albedo_tex)   - 1); mr->albedo_tex[sizeof(mr->albedo_tex)     - 1] = '\0'; }
+    if (tp[1][0]) { strncpy(mr->mr_tex,       tp[1], sizeof(mr->mr_tex)       - 1); mr->mr_tex[sizeof(mr->mr_tex)             - 1] = '\0'; }
+    if (tp[2][0]) { strncpy(mr->normal_tex,   tp[2], sizeof(mr->normal_tex)   - 1); mr->normal_tex[sizeof(mr->normal_tex)     - 1] = '\0'; }
+    if (tp[3][0]) { strncpy(mr->ao_tex,       tp[3], sizeof(mr->ao_tex)       - 1); mr->ao_tex[sizeof(mr->ao_tex)             - 1] = '\0'; }
+    if (tp[4][0]) { strncpy(mr->emissive_tex, tp[4], sizeof(mr->emissive_tex) - 1); mr->emissive_tex[sizeof(mr->emissive_tex) - 1] = '\0'; }
+
+    ctx->hit_count++;
+}
+
+static void on_material_reloaded(const char *vfs_path,
+                                 const JcePbrMaterial *pbr,
+                                 const char tex_paths[5][256],
+                                 void *user)
+{
+    CkSceneDirector *dir = (CkSceneDirector *)user;
+    if (!dir || !dir->scene) return;
+    PatchCtx ctx;
+    ctx.scene        = dir->scene;
+    ctx.changed_path = vfs_path;
+    ctx.pbr          = pbr;
+    ctx.tex_paths    = tex_paths;
+    ctx.hit_count    = 0;
+    jce_scene_each_entity(dir->scene, patch_matching_mesh_renderer, &ctx);
+    LOG_INFO(LOG_TAG, "applied '%s' to %d entity(ies)",
+             vfs_path, ctx.hit_count);
+}
+
+static void track_scene_materials(JceScene *s, JceEntity e, void *ud)
+{
+    (void)ud;
+    JceMeshRenderer *mr = jce_scene_get_mesh_renderer(s, e);
+    if (mr && mr->material_path[0]) {
+        jce_material_registry_track(mr->material_path);
+    }
+}
+
 static bool dir_load_path(CkSceneDirector *dir, const char *vfs_path)
 {
     if (!dir || !dir->scene || !vfs_path || !vfs_path[0]) return false;
@@ -121,6 +201,10 @@ static bool dir_load_path(CkSceneDirector *dir, const char *vfs_path)
     set_current_path(dir, vfs_path);
     refresh_quest_state(dir, vfs_path);
     dir->post_transition_lock = POST_TRANSITION_LOCK_SEC;
+
+    /* Dev-mode: rebuild the hot-reload watch list for this scene. */
+    jce_material_registry_clear();
+    jce_scene_each_entity(dir->scene, track_scene_materials, NULL);
 
     LOG_INFO(LOG_TAG, "scene loaded: %s", vfs_path);
     return true;
@@ -149,6 +233,24 @@ CkSceneDirector *ck_scene_director_create(JceRenderer *renderer, JcePakArchive *
         return NULL;
     }
     jce_fs_mount_pak(dir->fs, pak);
+
+    /* Dev-mode override: when the editor (or a developer) passes
+     * `--dev <project_assets_dir>`, mount that loose folder so any
+     * .mat.json / .scene.json / texture saved by the editor is picked
+     * up immediately by the running game without rebuilding the PAK.
+     * jce_filesystem checks loose mounts BEFORE the PAK (see header
+     * contract), so this gives source files priority. */
+    {
+        char dev_dir[512];
+        if (jce_args_get_dev_assets(dev_dir, sizeof(dev_dir))) {
+            jce_fs_mount_dir(dir->fs, "", dev_dir);
+            LOG_INFO(LOG_TAG,
+                "dev-mode: loose assets mounted from '%s' (overrides PAK)",
+                dev_dir);
+            jce_material_registry_init();
+            jce_material_registry_set_reload_cb(on_material_reloaded, dir);
+        }
+    }
 
     dir->scene = jce_scene_create();
     if (!dir->scene) {
@@ -183,6 +285,7 @@ CkSceneDirector *ck_scene_director_create(JceRenderer *renderer, JcePakArchive *
 void ck_scene_director_destroy(CkSceneDirector *dir)
 {
     if (!dir) return;
+    jce_material_registry_shutdown();
     ck_trigger_set_destroy(dir->triggers);
     ck_quest_graph_destroy(dir->quests);
     if (dir->scene_renderer) jce_scene_renderer_destroy(dir->scene_renderer);
@@ -231,6 +334,9 @@ void ck_scene_director_tick(CkSceneDirector *dir, float dt_sec,
                             const float player_pos[3])
 {
     if (!dir) return;
+
+    /* Dev-mode .mat.json hot-reload poll. Cheap (no-op outside dev). */
+    jce_material_registry_poll((double)dt_sec);
 
     if (dir->post_transition_lock > 0.0f) {
         dir->post_transition_lock -= dt_sec;

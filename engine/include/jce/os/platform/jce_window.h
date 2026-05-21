@@ -46,6 +46,9 @@ JCE_API void        jce_window_destroy(JceWindow *win);
 JCE_API void        jce_window_get_size(JceWindow *win, uint32_t *w, uint32_t *h);
 JCE_API void        jce_window_get_logical(JceWindow *win, int *w, int *h);
 
+/* Update the window-manager title (UTF-8). No-op when win or title is NULL. */
+JCE_API void        jce_window_set_title(JceWindow *win, const char *title);
+
 /* Native window handle info for renderer backends. */
 typedef struct JceNativeWindow {
     void *nwh;    /* native window handle */

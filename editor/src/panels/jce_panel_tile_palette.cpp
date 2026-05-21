@@ -260,16 +260,3 @@ extern "C" void jce_editor_panel_tile_palette_content(void)
     draw_map_pane();
     ImGui::EndChild();
 }
-
-extern "C" void jce_editor_panel_tile_palette(void)
-{
-    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_TILE_PALETTE);
-    if (!vis || !*vis) return;
-    char wt[96];
-    std::snprintf(wt, sizeof(wt), "%s###jce_tile_palette",
-                  jce_editor_i18n("tilePalette.title"));
-    if (ImGui::Begin(wt, vis, ImGuiWindowFlags_NoFocusOnAppearing)) {
-        jce_editor_panel_tile_palette_content();
-    }
-    ImGui::End();
-}

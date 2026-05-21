@@ -14,9 +14,36 @@
 
 #define LOG_TAG "renderer_caps"
 
+/* ── Editor / test tier override ──────────────────────────────────── */
+
+/* Single int read/written from the editor UI thread and read from the
+   render thread.  Aligned int writes are atomic on x86/arm64, which is
+   sufficient for this debug-only knob — we don't need acquire/release
+   ordering because nothing else depends on it. */
+static volatile int s_tier_override_active = 0;
+static volatile int s_tier_override_value  = (int)JCE_GPU_TIER_HIGH;
+
+void jce_renderer_set_tier_override(JceGpuTier tier)
+{
+    if ((int)tier < 0 || (int)tier >= (int)JCE_GPU_TIER_COUNT)
+        return;
+    s_tier_override_value  = (int)tier;
+    s_tier_override_active = 1;
+}
+
+void jce_renderer_clear_tier_override(void)
+{
+    s_tier_override_active = 0;
+}
+
+bool jce_renderer_tier_is_overridden(void)
+{
+    return s_tier_override_active != 0;
+}
+
 /* ── Tier classification ──────────────────────────────────────────── */
 
-JceGpuTier jce_renderer_get_tier(void)
+static JceGpuTier s_detect_tier(void)
 {
     const bgfx_caps_t *caps = bgfx_get_caps();
     if (!caps)
@@ -75,6 +102,13 @@ JceGpuTier jce_renderer_get_tier(void)
     return JCE_GPU_TIER_LOW;
 }
 
+JceGpuTier jce_renderer_get_tier(void)
+{
+    if (s_tier_override_active)
+        return (JceGpuTier)s_tier_override_value;
+    return s_detect_tier();
+}
+
 /* ── Capability flags ─────────────────────────────────────────────── */
 
 uint32_t jce_renderer_get_caps(void)
@@ -130,6 +164,7 @@ JceRenderRecommendation jce_renderer_get_recommendation(void)
     rec.has_discrete_gpu = has_discrete;
 
     switch (tier) {
+    case JCE_GPU_TIER_ULTRA:
     case JCE_GPU_TIER_HIGH:
         rec.shadow_map_size = 2048;
         rec.max_postfx = 6; /* all effects */
@@ -208,6 +243,8 @@ const char *jce_gpu_tier_name(JceGpuTier tier)
         return "MEDIUM";
     case JCE_GPU_TIER_HIGH:
         return "HIGH";
+    case JCE_GPU_TIER_ULTRA:
+        return "ULTRA";
     default:
         return "UNKNOWN";
     }

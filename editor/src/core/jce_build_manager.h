@@ -62,6 +62,14 @@ bool jce_build_manager_configure(const char *preset);
  * if a build is already running or the spawn fails. */
 bool jce_build_manager_build(const char *preset);
 
+/* Run `cmake --build --preset <preset> --target PackGameAssets` —
+ * targeted incremental repack used by the editor's save/launch hooks
+ * to close the "designer edits → game sees change" loop without
+ * rebuilding the whole project.  CMake-side mtime tracking keeps the
+ * cost near-zero when no inputs changed.  Returns false if a build is
+ * already running or the spawn fails. */
+bool jce_build_manager_repack_game_assets(const char *preset);
+
 /* Request graceful stop (SIGINT / Ctrl+C semantics).  Falls back to
  * force-kill after ~5 s if the child does not exit. */
 void jce_build_manager_request_stop(void);

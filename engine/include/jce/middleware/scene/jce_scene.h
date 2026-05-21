@@ -13,6 +13,8 @@
 #include <jce/os/core/jce_defs.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/renderer/jce_gfx_types.h>
+#include <jce/renderer/jce_texture_types.h>
+#include <jce/renderer/jce_volume_profile.h>
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -52,12 +54,21 @@ typedef struct {
     char            emissive_tex[256];
 } JceMeshRenderer;
 
+typedef enum {
+    JCE_CAMERA_CLEAR_SKYBOX     = 0, /* clear with skybox (default) */
+    JCE_CAMERA_CLEAR_COLOR      = 1, /* clear with solid background colour */
+    JCE_CAMERA_CLEAR_DEPTH_ONLY = 2, /* clear depth buffer only (overlay) */
+    JCE_CAMERA_CLEAR_NOTHING    = 3, /* no clear (transparent overlay) */
+} JceCameraClearMode;
+
 typedef struct {
-    float fov_deg;
-    float near_plane;
-    float far_plane;
-    bool  is_primary;
-    bool  ortho;
+    float   fov_deg;
+    float   near_plane;
+    float   far_plane;
+    bool    is_primary;
+    bool    ortho;
+    uint8_t stack_index; /* 0 = base camera; 1..3 = overlay cameras */
+    uint8_t clear_mode;  /* JceCameraClearMode */
 } JceCameraComponent;
 
 typedef struct {
@@ -65,6 +76,10 @@ typedef struct {
     jce_vec3 color;
     float    intensity;
     bool     casts_shadow;
+    /* P3-E.5 — Light cookies (directional projector mask). Optional. */
+    JceTexture cookie_texture;       /* JCE_TEXTURE_INVALID = no cookie */
+    float      cookie_strength;      /* 0..1 lerp from cookie sample to white */
+    char       cookie_path[256];     /* asset path (for serializer / inspector) */
 } JceDirectionalLight;
 
 typedef struct {
@@ -82,6 +97,12 @@ typedef struct {
     float    radius;
     float    inner_cone_cos;
     float    outer_cone_cos;
+    /* P3-E.5 — Light cookies + IES profile. Optional, opt-in per light. */
+    JceTexture cookie_texture;       /* JCE_TEXTURE_INVALID = no cookie */
+    JceTexture ies_lut_texture;      /* JCE_TEXTURE_INVALID = no IES profile */
+    float      cookie_strength;      /* 0..1 lerp from cookie sample to white */
+    char       cookie_path[256];     /* asset path for serializer */
+    char       ies_path[256];        /* .ies asset path for serializer */
 } JceSpotLight;
 
 /* ── Skybox component ───────────────────────────────────────────── */
@@ -164,6 +185,12 @@ typedef struct {
     float    angular_drag;       /* angular damping */
     bool     use_gravity;
     bool     is_kinematic;
+    /* Continuous Collision Detection (P3-C.3).  Defaults to DISCRETE.
+     * ccd_sphere_radius == 0 ⇒ auto-derive from collision-shape AABB
+     * when CCD is enabled. */
+    uint8_t  ccd_mode;           /* JceCcdMode enum value (0 = DISCRETE) */
+    float    ccd_threshold;      /* metres/frame; 0 ⇒ engine default */
+    float    ccd_sphere_radius;  /* metres; 0 ⇒ auto */
 } JceRigidBodyComponent;
 
 typedef struct {
@@ -266,6 +293,52 @@ typedef struct {
 
 /* Tag components (zero-size). */
 typedef struct { char _unused; } JceTagActive;
+
+/* ── Tags & Layers (P4-A.4) ─────────────────────────────────────────
+ *
+ * Unity-style scene-level Tag (interned string id) and Layer (uint8
+ * index 0..31) per entity, distinct from the physics-only collision
+ * mask in <jce/api_physics.h>.  Other systems (camera culling, ray
+ * filters, render queue groupings) consume the same layer index.
+ *
+ * Persisted to "<project>/Settings/TagsAndLayers.json" — loaded on
+ * scene init via jce_scene_tags_layers_load(), saved on edit. */
+
+#define JCE_LAYER_COUNT             32
+#define JCE_TAG_NAME_MAX            32
+#define JCE_TAG_REGISTRY_MAX        1024
+#define JCE_LAYER_NAME_MAX          32
+
+/* Reserved tag id: 0 = "Untagged". */
+
+typedef struct {
+    uint16_t tag_id;
+} JceTagComponent;
+
+typedef struct {
+    uint8_t  layer;
+} JceLayerComponent;
+
+/* Tag registry — interned strings (global, process-wide). */
+JCE_API uint16_t    jce_tag_intern(const char *name);
+JCE_API const char *jce_tag_name(uint16_t tag_id);
+JCE_API int         jce_tag_count(void);
+JCE_API const char *jce_tag_at(int idx);
+/* Returns false if name is "Untagged" or unknown (cannot remove
+ * reserved slot 0). */
+JCE_API bool        jce_tag_remove(const char *name);
+
+/* Layer registry — 32 named slots.  Unity defaults pre-populated by
+ * jce_layer_reset_defaults() (also called on first scene init). */
+JCE_API void        jce_layer_set_name(uint8_t layer, const char *name);
+JCE_API const char *jce_layer_name(uint8_t layer);
+JCE_API void        jce_layer_reset_defaults(void);
+
+/* Persistence (host filesystem).  `project_root` may be NULL/"" to use
+ * the current working directory; the file lives at
+ * "<root>/Settings/TagsAndLayers.json".  Both return true on success. */
+JCE_API bool        jce_scene_tags_layers_load(const char *project_root);
+JCE_API bool        jce_scene_tags_layers_save(const char *project_root);
 
 /* ── Behavior tree component ───────────────────────────────────── */
 
@@ -416,6 +489,7 @@ typedef struct {
     float near_clip;
     float far_clip;
     char  custom_hdr_path[256]; /* used when mode == CUSTOM */
+    char  baked_cubemap_path[256]; /* set by reflection probe bake (P3-E.3) */
     bool  box_projection;
     bool  hdr;
 } JceReflectionProbeComponent;
@@ -438,6 +512,9 @@ typedef struct {
     int   probe_count;
     float positions[JCE_LIGHT_PROBE_MAX][3];
     bool  dering;              /* enable ring artifact reduction */
+    /* SH9: 9 coeffs × 3 channels (RGB) per probe; valid when sh9_baked. */
+    float sh9[JCE_LIGHT_PROBE_MAX][9][3];
+    bool  sh9_baked;
 } JceLightProbeGroupComponent;
 
 /* ── Audio components (Unity equivalents) ────────────────────────── */
@@ -619,6 +696,48 @@ typedef struct {
     bool     enable_collision;
 } JceConfigurableJointComponent;
 
+/* ── Cloth (P3-C.4 follow-up) ──────────────────────────────────── */
+/*
+ * Authoring data for a regular cloth grid patch. Mirrors JceClothDesc
+ * (engine/include/jce/middleware/physics/jce_cloth.h) without dragging
+ * that header into the scene public surface — the runtime `handle` is
+ * kept as a plain uint32_t alias of JceClothHandle.
+ *
+ * Setting `dirty = true` instructs the scene's cloth reconciliation pass
+ * (jce_scene_update) to destroy the current handle and rebuild from the
+ * authoring fields below.  The handle is opaque to JSON.
+ */
+enum { JCE_CLOTH_MAX_PINNED = 64 };
+typedef struct {
+    /* Grid patch geometry. */
+    jce_vec3 corner_00;
+    jce_vec3 corner_10;
+    jce_vec3 corner_01;
+    jce_vec3 corner_11;
+    uint32_t res_u;            /* >=2 */
+    uint32_t res_v;            /* >=2 */
+
+    /* Solver tuning. */
+    float    mass_total;
+    float    stiffness_linear;
+    float    stiffness_angular;
+    float    damping;
+    uint32_t iterations;
+
+    /* Pinned vertex indices (row-major: i = v*res_u + u). */
+    uint32_t pinned_indices[JCE_CLOTH_MAX_PINNED];
+    uint32_t pinned_count;
+
+    /* Misc. */
+    bool     self_collision;
+    bool     wind_enabled;
+    jce_vec3 wind_velocity;
+
+    /* Runtime — not serialized. */
+    uint32_t handle;           /* JceClothHandle; 0 = none */
+    bool     dirty;            /* true = needs (re)create */
+} JceClothComponent;
+
 /* ── 2D Joint (Distance / Hinge / Spring) ──────────────────────── */
 enum {
     JCE_JOINT_2D_DISTANCE = 0,
@@ -729,6 +848,9 @@ typedef struct {
     bool  rich_text;
     bool  best_fit;
     int   min_size, max_size; /* best_fit range */
+    /* Runtime localization: when non-empty, jce_loc_t(locale_key)
+       overrides `text` at display time; `text` acts as fallback. */
+    char  locale_key[64];
 } JceUITextComponent;
 
 /* ── UI: Button (clickable Image + state colors) ───────────────── */
@@ -741,6 +863,113 @@ typedef struct {
     float fade_duration;
     char  on_click_handler[128]; /* script handler name (placeholder) */
 } JceUIButtonComponent;
+
+/* ── Network object component (P3-D.3) ────────────────────────────
+ *
+ * Tags an entity as networked. `net_id` and `owner` mirror
+ * JceNetObjectId / JceClientId (declared in jce_replication.h); we
+ * carry plain integer types here to keep this scene header free of
+ * any L4-net dependency.  `is_owner` is a cached convenience flag
+ * (owner == local client id), refreshed by replication whenever
+ * either side of that equation changes. */
+typedef struct {
+    uint32_t net_id;   /* server-assigned; 0 until spawned   */
+    uint16_t owner;    /* 0 = server, 1..N = remote clients  */
+    uint16_t flags;    /* reserved (interp / prediction ...) */
+    bool     is_owner; /* convenience: owner == local client */
+} JceNetworkObjectComponent;
+
+/* ── Network ECS component overrides (P4-C.1) ───────────────────────
+ *
+ * These thin ECS components hang the P3-D networking state onto
+ * scene entities in a data-driven way.  sync_rate_hz / interp_ms /
+ * tolerance mirror JceNetTransformConfig fields; authority_mode
+ * mirrors JceNetTransformAuthorityMode (stored as uint8_t to keep
+ * the struct POD / serialiser-friendly). */
+typedef struct {
+    uint8_t  sync_rate_hz;   /* snapshot Hz; 0 = use global default (20) */
+    uint16_t interp_ms;      /* interpolation buffer ms; 0 = default (100) */
+    float    tolerance;      /* divergence snap distance (m); 0 = default  */
+    uint8_t  authority_mode; /* 0=server, 1=owner */
+} JceNetTransformComponent;
+
+typedef struct {
+    uint8_t  sync_rate_hz;
+    uint16_t interp_ms;
+    uint8_t  authority_mode;
+} JceNetAnimatorComponent;
+
+typedef struct {
+    uint8_t  sync_rate_hz;
+    uint16_t interp_ms;
+    float    tolerance;
+    uint8_t  authority_mode;
+} JceNetRigidbodyComponent;
+
+/* ── P4-C.3: VFX graph + tilemap rendering/collider ──────────────── */
+
+typedef struct {
+    char     graph_path[128];   /* asset path to .vfxgraph file */
+    bool     play_on_awake;
+    bool     loop;
+    float    rate_multiplier;   /* 1.0 = nominal */
+    float    intensity;         /* 0..1 emission scale */
+} JceVfxGraphComponent;
+
+typedef struct {
+    char     tilemap_path[128]; /* asset path to .tilemap data */
+    char     sprites_path[128]; /* shared sprite atlas */
+    uint16_t cell_size_px;      /* px per cell */
+    uint16_t sort_order;
+    uint8_t  orientation;       /* 0=ortho, 1=iso */
+    bool     visible;
+    float    color[4];          /* tint */
+} JceTilemapComponent;
+
+typedef struct {
+    bool     used_by_composite;
+    bool     trigger;
+    float    offset[2];
+    uint16_t friction_x100;     /* 0..10000 -> 0..100.0 */
+    uint16_t bounciness_x100;
+} JceTilemapCollider2DComponent;
+
+/*
+ * Avatar (humanoid rig) — points at a skeleton asset plus an optional bone
+ * mask. The runtime evaluator lands in P5; today this only stores authoring
+ * intent so scenes round-trip and the inspector can show the configuration.
+ */
+typedef struct {
+    char     avatar_path[128];        /* .avatar asset */
+    char     mask_path  [128];        /* optional .mask asset */
+    char     override_controller[128];/* optional anim override controller */
+    bool     apply_root_motion;
+    bool     human_rig;               /* false = generic */
+} JceAvatarComponent;
+
+/* ── Volume component (P4-C — post-FX blending volumes, flag 62) ── */
+
+typedef enum {
+    JCE_VOLUME_SHAPE_BOX    = 0,
+    JCE_VOLUME_SHAPE_SPHERE = 1,
+} JceVolumeShape;
+
+typedef struct {
+    JceVolumeProfile profile;        /* per-field post-FX overrides      */
+    JceVolumeShape   shape;          /* bounding shape for weight falloff */
+    jce_vec3         extents;        /* box half-extents or sphere radius in .x */
+    float            blend_distance; /* fade-in distance in world units   */
+    float            weight;         /* global weight multiplier 0..1     */
+    bool             is_global;      /* true = always applies, no distance test */
+} JceVolumeComponent;
+
+/* ── Occlusion portal (P4-C — flag 63) ────────────────────────────── */
+
+typedef struct {
+    jce_vec3 size;      /* portal extents (world-space box around the entity) */
+    bool     open;      /* true = portal open; objects behind it are visible  */
+    int32_t  portal_id; /* user-assigned ID for pairing portals               */
+} JceOcclusionPortalComponent;
 
 /* ── Component type flags (bitmask for enumeration) ──────────────── */
 
@@ -797,6 +1026,19 @@ typedef uint64_t JceComponentFlag;
 #define JCE_COMP_FLAG_UI_IMAGE             (UINT64_C(1) << 48)
 #define JCE_COMP_FLAG_UI_TEXT              (UINT64_C(1) << 49)
 #define JCE_COMP_FLAG_UI_BUTTON            (UINT64_C(1) << 50)
+#define JCE_COMP_FLAG_NETWORK_OBJECT       (UINT64_C(1) << 51)
+#define JCE_COMP_FLAG_CLOTH                (UINT64_C(1) << 52)
+#define JCE_COMP_FLAG_NET_TRANSFORM        (UINT64_C(1) << 53)
+#define JCE_COMP_FLAG_NET_ANIMATOR         (UINT64_C(1) << 54)
+#define JCE_COMP_FLAG_NET_RIGIDBODY        (UINT64_C(1) << 55)
+#define JCE_COMP_FLAG_VFX_GRAPH            (UINT64_C(1) << 56)
+#define JCE_COMP_FLAG_TILEMAP              (UINT64_C(1) << 57)
+#define JCE_COMP_FLAG_TILEMAP_COLLIDER_2D  (UINT64_C(1) << 58)
+#define JCE_COMP_FLAG_AVATAR               (UINT64_C(1) << 59)
+#define JCE_COMP_FLAG_TAG                  (UINT64_C(1) << 60)
+#define JCE_COMP_FLAG_LAYER                (UINT64_C(1) << 61)
+#define JCE_COMP_FLAG_VOLUME               (UINT64_C(1) << 62)
+#define JCE_COMP_FLAG_OCCLUSION_PORTAL     (UINT64_C(1) << 63)
 
 /* ── Entity handle ───────────────────────────────────────────────── */
 
@@ -1148,6 +1390,88 @@ JCE_API void                          jce_scene_set_ui_button(JceScene *s, JceEn
 JCE_API JceUIButtonComponent         *jce_scene_get_ui_button(JceScene *s, JceEntity e);
 JCE_API bool                          jce_scene_has_ui_button(const JceScene *s, JceEntity e);
 JCE_API void                          jce_scene_remove_ui_button(JceScene *s, JceEntity e);
+
+/* ── Network object (P3-D.3) ─────────────────────────────────────── */
+JCE_API void                          jce_scene_set_network_object(JceScene *s, JceEntity e, const JceNetworkObjectComponent *c);
+JCE_API JceNetworkObjectComponent    *jce_scene_get_network_object(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_network_object(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_network_object(JceScene *s, JceEntity e);
+
+/* ── Cloth (P3-C.4 follow-up) ────────────────────────────────────── */
+JCE_API void                          jce_scene_set_cloth(JceScene *s, JceEntity e, const JceClothComponent *c);
+JCE_API JceClothComponent            *jce_scene_get_cloth(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_cloth(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_cloth(JceScene *s, JceEntity e);
+
+/* ── Network ECS components (P4-C.1) ────────────────────────────────── */
+JCE_API void                          jce_scene_set_net_transform(JceScene *s, JceEntity e, const JceNetTransformComponent *c);
+JCE_API JceNetTransformComponent     *jce_scene_get_net_transform(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_net_transform(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_net_transform(JceScene *s, JceEntity e);
+
+JCE_API void                          jce_scene_set_net_animator(JceScene *s, JceEntity e, const JceNetAnimatorComponent *c);
+JCE_API JceNetAnimatorComponent      *jce_scene_get_net_animator(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_net_animator(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_net_animator(JceScene *s, JceEntity e);
+
+JCE_API void                          jce_scene_set_net_rigidbody(JceScene *s, JceEntity e, const JceNetRigidbodyComponent *c);
+JCE_API JceNetRigidbodyComponent     *jce_scene_get_net_rigidbody(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_net_rigidbody(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_net_rigidbody(JceScene *s, JceEntity e);
+
+JCE_API void                          jce_scene_set_vfx_graph(JceScene *s, JceEntity e, const JceVfxGraphComponent *c);
+JCE_API JceVfxGraphComponent         *jce_scene_get_vfx_graph(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_vfx_graph(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_vfx_graph(JceScene *s, JceEntity e);
+
+JCE_API void                          jce_scene_set_tilemap(JceScene *s, JceEntity e, const JceTilemapComponent *c);
+JCE_API JceTilemapComponent          *jce_scene_get_tilemap(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_tilemap(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_tilemap(JceScene *s, JceEntity e);
+
+JCE_API void                          jce_scene_set_tilemap_collider2d(JceScene *s, JceEntity e, const JceTilemapCollider2DComponent *c);
+JCE_API JceTilemapCollider2DComponent*jce_scene_get_tilemap_collider2d(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_tilemap_collider2d(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_tilemap_collider2d(JceScene *s, JceEntity e);
+
+JCE_API void                          jce_scene_set_avatar(JceScene *s, JceEntity e, const JceAvatarComponent *c);
+JCE_API JceAvatarComponent           *jce_scene_get_avatar(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_avatar(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_avatar(JceScene *s, JceEntity e);
+
+/* ── Tag / Layer per-entity components (P4-A.4) ──────────────────── */
+JCE_API void                          jce_scene_set_tag_component(JceScene *s, JceEntity e, const JceTagComponent *c);
+JCE_API JceTagComponent              *jce_scene_get_tag_component(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_tag_component(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_tag_component(JceScene *s, JceEntity e);
+
+JCE_API void                          jce_scene_set_layer_component(JceScene *s, JceEntity e, const JceLayerComponent *c);
+JCE_API JceLayerComponent            *jce_scene_get_layer_component(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_layer_component(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_layer_component(JceScene *s, JceEntity e);
+
+/* Convenience: set tag by name (interns automatically) / read tag name. */
+JCE_API void                          jce_scene_set_entity_tag_name(JceScene *s, JceEntity e, const char *tag);
+JCE_API const char                   *jce_scene_get_entity_tag_name(JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_set_entity_layer(JceScene *s, JceEntity e, uint8_t layer);
+JCE_API uint8_t                       jce_scene_get_entity_layer(JceScene *s, JceEntity e);
+
+/* Lookup helpers — return first/all entities with a given tag/layer. */
+JCE_API JceEntity                     jce_scene_find_with_tag(JceScene *s, const char *tag);
+JCE_API int                           jce_scene_find_all_with_tag(JceScene *s, const char *tag, JceEntity *out, int max);
+JCE_API int                           jce_scene_find_all_in_layer(JceScene *s, uint8_t layer, JceEntity *out, int max);
+
+/* ── Volume component (P4-C) ─────────────────────────────────────── */
+JCE_API void                          jce_scene_set_volume(JceScene *s, JceEntity e, const JceVolumeComponent *c);
+JCE_API JceVolumeComponent           *jce_scene_get_volume(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_volume(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_volume(JceScene *s, JceEntity e);
+
+/* ── Occlusion portal (P4-C) ─────────────────────────────────────── */
+JCE_API void                          jce_scene_set_occlusion_portal(JceScene *s, JceEntity e, const JceOcclusionPortalComponent *c);
+JCE_API JceOcclusionPortalComponent  *jce_scene_get_occlusion_portal(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_occlusion_portal(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_occlusion_portal(JceScene *s, JceEntity e);
 
 /* Component enumeration — returns bitmask of JceComponentFlag. */
 JCE_API uint64_t jce_scene_get_component_flags(const JceScene *s, JceEntity e);

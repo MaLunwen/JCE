@@ -29,6 +29,15 @@ void jce_game_module_set_active_scene(JceScene *scene)
     s_active_scene = scene;
 }
 
+/* Getter mirroring the setter above (used by the editor's Systems
+ * panel via the scene-systems introspection helpers).  Declared here
+ * to avoid expanding the public header before the design stabilizes. */
+JCE_API JceScene *jce_game_module_active_scene(void);
+JceScene *jce_game_module_active_scene(void)
+{
+    return s_active_scene;
+}
+
 /* ── default module ───────────────────────────────────────────────── */
 
 static bool default_init(const JceServices *svc, void *ud)

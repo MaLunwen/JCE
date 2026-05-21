@@ -20,8 +20,22 @@ extern "C" {
 typedef enum {
     JCE_LOCALE_EN = 0,
     JCE_LOCALE_ZH_CN,
+    JCE_LOCALE_KO,
     JCE_LOCALE_COUNT
 } JceLocale;
+
+/* Stable identifier code for a locale (matches the JSON filename stem and
+   the value persisted to JceEditorConfig.language).  Returns "en" for any
+   out-of-range input so callers can use it as a safe default. */
+const char *jce_editor_i18n_locale_code(JceLocale locale);
+
+/* Parse a stable code (e.g. "en", "zh_cn", "ko") back to its enum value.
+   Returns JCE_LOCALE_EN when the code is unknown or NULL. */
+JceLocale   jce_editor_i18n_locale_from_code(const char *code);
+
+/* Native display name of a locale (UTF-8, written in that language) for
+   use in language pickers.  Returns "English" for unknown locales. */
+const char *jce_editor_i18n_locale_native_name(JceLocale locale);
 
 /* Initialize the i18n system and load all locale files from PAK. */
 bool jce_editor_i18n_init(const JcePakArchive *pak);

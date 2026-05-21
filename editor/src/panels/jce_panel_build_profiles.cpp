@@ -1,36 +1,34 @@
 /*
  * jce_panel_build_profiles.cpp  Unity-style Build Profiles panel.
- *                               Sprint 3 #14 / 0.8.26
  *
- * Surfaces a curated list of build "profiles" that wrap the existing
- * CMakePresets.json entries plus an editor-side label (icon, scenes,
- * extra defines). One profile == one CMake preset + per-profile
- * metadata persisted to .jce/build_profiles.json.
+ * Single surface for build configuration AND build triggering:
+ * lists every configurePreset from CMakePresets.json and drives the
+ * async jce_build_manager so output streams into the editor Console
+ * (with a "[build]" prefix) instead of blocking the UI.
  *
- * Capabilities:
- *   - List discovered configure presets (read CMakePresets.json).
- *   - Tag each preset with a human label and an "active" marker.
- *   - "Build" button shells out to: cmake --build --preset <name>.
- *   - "Switch & Build" sets active profile + builds.
+ * On a successful compile we also:
+ *   - rewrite editor-config game_executable_path / game_working_directory
+ *     so a subsequent Play "just works" (opt-in checkbox, default on);
+ *   - flip the Build Report panel visible so the user lands directly
+ *     on the post-build summary.
  *
- * The intent is to give the user one click to compile for, say,
- * windows-x64-debug vs android-arm64-release without typing CMake CLI.
- *
- * Engine-side cross-platform compile is unchanged; this is purely a
- * shortcut UI on top of CMakePresets.json.
+ * The legacy modal jce_dialog_build.cpp is now a thin shim that just
+ * opens this panel.
  */
 
 #include "io/jce_editor_file_util.h"
 #include "core/jce_editor_i18n.h"
+#include "core/jce_build_manager.h"
+#include "core/jce_editor_config.h"
 #include "ui/jce_editor_panels.h"
 
 #include <jce/tools/jce_imgui.hpp>
 extern "C" {
+#include <jce/os/core/jce_defs.h>
 #include <jce/os/core/jce_json.h>
 }
 
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -42,14 +40,14 @@ struct Profile {
     std::string display;
     std::string description;
     std::string generator;
-    bool        is_default = false;
 };
 
 static struct {
     std::vector<Profile> profiles;
     int                  active = -1;
-    char                 last_log[2048] = {0};
     bool                 loaded = false;
+    bool                 auto_update_run_path = true;
+    JceBuildState        prev_state = JCE_BUILD_IDLE;
 } s_bp;
 
 static void load_profiles()
@@ -79,7 +77,7 @@ static void load_profiles()
             pr.display     = dn && *dn ? dn : pr.preset;
             pr.description = ds ? ds : "";
             pr.generator   = gn ? gn : "";
-            if (!pr.preset.empty() && pr.preset[0] != '_') /* skip "hidden": _xxx pattern */
+            if (!pr.preset.empty() && pr.preset[0] != '_')
                 s_bp.profiles.push_back(pr);
         }
     }
@@ -88,38 +86,78 @@ static void load_profiles()
     jce_editor_console_log("[Build Profiles] loaded %d preset(s)", (int)s_bp.profiles.size());
 }
 
-static void run_command(const char *cmd)
+/* Derive a likely output exe path from a preset name, mirroring the
+ * scripts/build-*.{bat,sh} layout used by the editor's launcher. */
+static std::string guess_output_exe(const std::string &preset_name)
 {
-    char tmp[256]; snprintf(tmp, sizeof(tmp), "_jce_buildprof.log");
-    char full[2048]; snprintf(full, sizeof(full), "%s > \"%s\" 2>&1", cmd, tmp);
-    int rc = std::system(full);
-    size_t sz = 0;
-    char *buf = (char *)ed_read_file(tmp, &sz);
-    if (buf) {
-        size_t copy = sz < sizeof(s_bp.last_log) - 1 ? sz : sizeof(s_bp.last_log) - 1;
-        memcpy(s_bp.last_log, buf, copy);
-        s_bp.last_log[copy] = 0;
-        ED_FREE(buf);
+    std::string p = preset_name;
+    if (p.rfind("build-", 0) == 0) p.erase(0, 6);
+
+    std::string variant = "release";
+    auto dash = p.find_last_of('-');
+    if (dash != std::string::npos) {
+        std::string tail = p.substr(dash + 1);
+        if (tail == "release" || tail == "debug" || tail == "asan")
+            variant = tail;
     }
-    std::remove(tmp);
-    jce_editor_console_log("[Build Profiles] '%s' rc=%d", cmd, rc);
+    std::string arch = (dash != std::string::npos) ? p.substr(0, dash) : p;
+
+    if (arch.rfind("windows-", 0) == 0)
+        return "build/desktop/" + arch + "/" + variant + "/caged_kingdom.exe";
+    if (arch.rfind("macos-", 0) == 0 || arch.rfind("linux-", 0) == 0)
+        return "build/desktop/" + arch + "/CagedKingdom";
+    return "build/host/" + variant + "/caged_kingdom"
+#if JCE_PLATFORM_WINDOWS
+           ".exe"
+#endif
+        ;
 }
 
-static void configure_preset(const Profile &p)
+static void apply_post_success(const JceBuildStatus &st)
 {
-    char cmd[512]; snprintf(cmd, sizeof(cmd), "cmake --preset %s", p.preset.c_str());
-    run_command(cmd);
-}
+    /* Make sure the workbench is open and focus the Report tab. */
+    bool *bp_vis = jce_editor_panel_visible_ptr(JCE_PANEL_BUILD_PROFILES);
+    if (bp_vis) *bp_vis = true;
+    jce_panel_build_profiles_request_tab(1);
 
-static void build_preset(const Profile &p)
-{
-    char cmd[512]; snprintf(cmd, sizeof(cmd), "cmake --build --preset %s", p.preset.c_str());
-    run_command(cmd);
+    if (!s_bp.auto_update_run_path) return;
+
+    std::string exe = guess_output_exe(st.preset);
+    JceEditorConfig cfg;
+    jce_editor_config_load(&cfg);
+    snprintf(cfg.game_executable_path, sizeof(cfg.game_executable_path),
+             "%s", exe.c_str());
+    size_t slash = exe.find_last_of("/\\");
+    if (slash != std::string::npos) {
+        std::string cwd = exe.substr(0, slash);
+        snprintf(cfg.game_working_directory,
+                 sizeof(cfg.game_working_directory), "%s", cwd.c_str());
+    }
+    jce_editor_config_save(&cfg);
+    jce_editor_console_log("[build] game_executable_path updated to %s",
+                           exe.c_str());
 }
 
 } /* anonymous namespace */
 
-extern "C" void jce_editor_panel_build_profiles_content(void)
+/* Forward decl from jce_panel_build_report.cpp — the report body without
+ * its own window chrome, so we can render it as a tab here. */
+extern "C" void build_report_draw_content(void);
+
+static int g_request_tab = -1;
+static int g_current_tab = 0;  /* mirror of active TabItem for menu markers */
+
+extern "C" void jce_panel_build_profiles_request_tab(int idx)
+{
+    g_request_tab = idx;
+}
+
+extern "C" int jce_panel_build_profiles_current_tab(void)
+{
+    return g_current_tab;
+}
+
+static void draw_profiles_tab(void)
 {
     if (!s_bp.loaded) load_profiles();
 
@@ -131,7 +169,12 @@ extern "C" void jce_editor_panel_build_profiles_content(void)
     ImGui::Separator();
     ImVec2 sz = ImGui::GetContentRegionAvail();
     float left_w = sz.x * 0.45f; if (left_w < 240) left_w = 240;
+
     ImGui::BeginChild("##bplist", ImVec2(left_w, sz.y), true);
+    if (s_bp.profiles.empty()) {
+        ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "%s",
+                           jce_editor_i18n("buildProfiles.noPresets"));
+    }
     for (size_t i = 0; i < s_bp.profiles.size(); ++i) {
         Profile &p = s_bp.profiles[i];
         ImGui::PushID((int)i);
@@ -144,8 +187,14 @@ extern "C" void jce_editor_panel_build_profiles_content(void)
         ImGui::PopID();
     }
     ImGui::EndChild();
+
     ImGui::SameLine();
     ImGui::BeginChild("##bpdetail", ImVec2(0, sz.y), true);
+
+    JceBuildStatus st;
+    jce_build_manager_get_status(&st);
+    const bool running = jce_build_manager_is_running();
+
     if (s_bp.active >= 0 && s_bp.active < (int)s_bp.profiles.size()) {
         Profile &p = s_bp.profiles[s_bp.active];
         ImGui::Text("%s: %s",   jce_editor_i18n("buildProfiles.preset"),     p.preset.c_str());
@@ -154,24 +203,102 @@ extern "C" void jce_editor_panel_build_profiles_content(void)
         ImGui::TextWrapped("%s: %s",
                            jce_editor_i18n("buildProfiles.description"),
                            p.description.empty() ? "—" : p.description.c_str());
+
+        /* Predicted output path — mirrors what auto-update would write. */
+        std::string predicted = guess_output_exe(p.preset);
+        ImGui::Text("%s: %s",   jce_editor_i18n("buildProfiles.outputPath"),
+                    predicted.c_str());
+
         ImGui::Separator();
-        if (ImGui::Button(jce_editor_i18n("buildProfiles.configure"))) configure_preset(p);
+
+        if (running) ImGui::BeginDisabled();
+        if (ImGui::Button(jce_editor_i18n("buildProfiles.configure")))
+            jce_build_manager_configure(p.preset.c_str());
         ImGui::SameLine();
-        if (ImGui::Button(jce_editor_i18n("buildProfiles.build"))) build_preset(p);
+        if (ImGui::Button(jce_editor_i18n("buildProfiles.build")))
+            jce_build_manager_build(p.preset.c_str());
         ImGui::SameLine();
         if (ImGui::Button(jce_editor_i18n("buildProfiles.switchAndBuild"))) {
-            configure_preset(p);
-            build_preset(p);
+            jce_build_manager_configure(p.preset.c_str());
+            jce_build_manager_build(p.preset.c_str());
         }
+        if (running) ImGui::EndDisabled();
+
+        ImGui::SameLine();
+        if (!running) ImGui::BeginDisabled();
+        if (ImGui::Button(jce_editor_i18n("buildProfiles.stop")))
+            jce_build_manager_request_stop();
+        if (!running) ImGui::EndDisabled();
+
+        ImGui::Checkbox(jce_editor_i18n("buildProfiles.autoUpdatePath"),
+                        &s_bp.auto_update_run_path);
+
         ImGui::Separator();
-        ImGui::TextUnformatted(jce_editor_i18n("buildProfiles.lastOutput"));
-        ImGui::BeginChild("##bplog", ImVec2(0, 0), true);
-        ImGui::TextUnformatted(s_bp.last_log[0] ? s_bp.last_log : jce_editor_i18n("buildProfiles.noOutput"));
-        ImGui::EndChild();
+
+        const char *stage_names[] = { "idle", "configure", "compile" };
+        const char *state_names[] = { "idle", "running", "succeeded", "failed" };
+        int s_idx = (int) st.state;
+        int g_idx = (int) st.stage;
+        if (s_idx < 0 || s_idx > 3) s_idx = 0;
+        if (g_idx < 0 || g_idx > 2) g_idx = 0;
+
+        ImVec4 col = ImVec4(0.85f, 0.85f, 0.85f, 1.0f);
+        if (st.state == JCE_BUILD_RUNNING)   col = ImVec4(1.0f, 0.85f, 0.2f, 1.0f);
+        if (st.state == JCE_BUILD_SUCCEEDED) col = ImVec4(0.4f, 1.0f, 0.4f, 1.0f);
+        if (st.state == JCE_BUILD_FAILED)    col = ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
+        ImGui::TextColored(col, jce_editor_i18n("buildProfiles.statusLine"),
+                           state_names[s_idx], stage_names[g_idx],
+                           st.preset[0] ? st.preset : "(none)");
+        if (st.last_error[0])
+            ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1), "%s: %s",
+                               jce_editor_i18n("buildProfiles.lastError"),
+                               st.last_error);
+
+        ImGui::TextDisabled("%s", jce_editor_i18n("buildProfiles.consoleHint"));
     } else {
         ImGui::TextDisabled("%s", jce_editor_i18n("buildProfiles.selectPreset"));
     }
     ImGui::EndChild();
+
+    /* Detect the IDLE→SUCCEEDED transition on the compile stage and
+     * focus the Build Report tab + rewrite Play exe path. */
+    if (s_bp.prev_state != JCE_BUILD_SUCCEEDED &&
+        st.state       == JCE_BUILD_SUCCEEDED &&
+        st.stage       == JCE_BUILD_STAGE_COMPILE)
+    {
+        apply_post_success(st);
+    }
+    s_bp.prev_state = st.state;
+}
+
+extern "C" void jce_editor_panel_build_profiles_content(void)
+{
+    if (!ImGui::BeginTabBar("##bp_tabs"))
+        return;
+
+    ImGuiTabItemFlags prof_flags   = (g_request_tab == 0) ? ImGuiTabItemFlags_SetSelected : 0;
+    ImGuiTabItemFlags report_flags = (g_request_tab == 1) ? ImGuiTabItemFlags_SetSelected : 0;
+
+    char prof_label[64];
+    char report_label[64];
+    std::snprintf(prof_label, sizeof(prof_label), "%s###bp_tab_profiles",
+                  jce_editor_i18n("buildProfiles.title"));
+    std::snprintf(report_label, sizeof(report_label), "%s###bp_tab_report",
+                  jce_editor_i18n("panel.build_report.title"));
+
+    if (ImGui::BeginTabItem(prof_label, nullptr, prof_flags)) {
+        g_current_tab = 0;
+        draw_profiles_tab();
+        ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem(report_label, nullptr, report_flags)) {
+        g_current_tab = 1;
+        build_report_draw_content();
+        ImGui::EndTabItem();
+    }
+
+    ImGui::EndTabBar();
+    g_request_tab = -1;
 }
 
 extern "C" void jce_editor_panel_build_profiles(void)

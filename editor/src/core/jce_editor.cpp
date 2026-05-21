@@ -26,10 +26,13 @@
 #include <jce/ui/jce_imgui_renderer.h>
 #include "jce_build_manager.h"
 #include "jce_run_manager.h"
+#include "panels/jce_panel_assets_thumb.h"
 #include "scene/jce_editor_game_render.h"
 
 extern "C" void jce_reflect_register_builtin(void);
 extern "C" void jce_hotkeys_init(void);
+extern "C" void jce_workspace_init(void);
+extern "C" void jce_editor_prefs_load_and_apply(void);
 
 #include <jce/tools/jce_imgui.hpp>
 #include <stdio.h>
@@ -278,7 +281,10 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
                        ? (float)ecfg.font_size : 14.0f;
         jce_editor_load_fonts(pak, fs,
                               ecfg.font_en_path, ecfg.font_zh_path);
-        ImGui::GetIO().FontGlobalScale = (ecfg.ui_scale > 0.1f) ? ecfg.ui_scale : 1.0f;
+        /* Use ImGui 1.92 FontScaleMain (not legacy FontGlobalScale)
+         * so the value composes correctly with style.FontSizeBase. */
+        ImGui::GetStyle().FontScaleMain = (ecfg.ui_scale > 0.1f) ? ecfg.ui_scale : 1.0f;
+        ImGui::GetIO().FontGlobalScale = 1.0f;
         s_editor.pak       = pak;
         s_editor.font_size = fs;
     }
@@ -293,6 +299,8 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
     jce_build_manager_init();
     jce_reflect_register_builtin();
     jce_hotkeys_init();
+    jce_workspace_init();
+    jce_editor_prefs_load_and_apply();
     jce_gizmo_init();
 
     /* Pre-warm project settings cache so panels can use
@@ -373,6 +381,7 @@ void jce_editor_shutdown(void)
     jce_build_manager_shutdown();
     jce_run_manager_shutdown();
     jce_editor_panels_shutdown();
+    jce_thumb_shutdown();
     jce_editor_state_shutdown();
     jce_editor_i18n_shutdown();
     jce_imgui_renderer_shutdown();
@@ -522,6 +531,38 @@ void jce_editor_update(JceWindow *window)
     /* Setup bgfx view. */
     jce_imgui_renderer_setup_view((uint16_t)w, (uint16_t)h);
 
+    /* Sync OS window title with scene name + dirty marker. Only push to
+       SDL when the composed string actually changes — avoids per-frame
+       allocation / windowing churn. */
+    {
+        static char s_last_title[256] = {0};
+        char        title[256];
+        const char *spath = jce_state_get_current_scene_path();
+        const bool  dirty = jce_state_is_scene_modified();
+
+        const char *base = (spath && spath[0]) ? spath : NULL;
+        const char *name = base;
+        if (base) {
+            const char *slash = strrchr(base, '/');
+            const char *bslash = strrchr(base, '\\');
+            if (bslash && (!slash || bslash > slash)) slash = bslash;
+            if (slash && slash[1]) name = slash + 1;
+        }
+
+        if (name) {
+            snprintf(title, sizeof(title), "JCE Editor %s %s%s",
+                     "\xe2\x80\x94", name, dirty ? " *" : "");
+        } else {
+            snprintf(title, sizeof(title), "JCE Editor%s",
+                     dirty ? " *" : "");
+        }
+
+        if (strcmp(title, s_last_title) != 0) {
+            jce_window_set_title(window, title);
+            snprintf(s_last_title, sizeof(s_last_title), "%s", title);
+        }
+    }
+
     /* Apply any pending font reload BEFORE starting the next frame. */
     jce_editor_apply_pending_font_reload();
 
@@ -538,6 +579,11 @@ void jce_editor_update(JceWindow *window)
     /* Render and submit to bgfx. */
     ImGui::Render();
     jce_imgui_renderer_draw();
+
+    /* Decode a small slice of pending asset thumbnails this frame.
+       Budget chosen so a folder of ~100 images warms in ~2 s without a
+       perceptible spike on the editor's old-hardware target. */
+    jce_thumb_pump(2);
 
     /* The platform window does not emit text-input events unless text
        input is started.  Mirror ImGui's WantTextInput here. */

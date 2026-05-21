@@ -13,6 +13,8 @@ extern "C" {
 #endif
 
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/middleware/scene/jce_scene_async.h>
+#include <jce/middleware/scene/jce_scene_systems.h>
 #include <jce/middleware/scene/jce_space_partition.h>
 
 

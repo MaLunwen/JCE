@@ -44,10 +44,16 @@ function(jce_compile_shaders)
     endforeach()
 
     # ── locate shaderc ────────────────────────────────────────────
-    # JCE_SHADERC_EXECUTABLE can override the auto-detected path.
-    # Required for cross-compilation (e.g. Emscripten/Android) where the bgfx
-    # target package has tools=False and a host-built shaderc.exe must be used.
-    if(JCE_SHADERC_EXECUTABLE)
+    # Priority order:
+    #   1. $ENV{JCE_SHADERC_EXECUTABLE}  — environment variable (CI / shell)
+    #   2. JCE_SHADERC_EXECUTABLE        — CMake cache variable (-D flag)
+    #   3. Conan package folder candidates
+    # If none is found, emit a WARNING and skip shader custom commands so
+    # that a pre-baked pak can still link the editor without re-compiling
+    # shaders.  Do NOT FATAL_ERROR — shipped paks keep working.
+    if(DEFINED ENV{JCE_SHADERC_EXECUTABLE} AND EXISTS "$ENV{JCE_SHADERC_EXECUTABLE}")
+        set(_shaderc "$ENV{JCE_SHADERC_EXECUTABLE}")
+    elseif(JCE_SHADERC_EXECUTABLE AND EXISTS "${JCE_SHADERC_EXECUTABLE}")
         set(_shaderc "${JCE_SHADERC_EXECUTABLE}")
     else()
         # Try Release package folder first (typical native build),
@@ -67,11 +73,19 @@ function(jce_compile_shaders)
         endforeach()
     endif()
     if(NOT _shaderc OR NOT EXISTS "${_shaderc}")
-        message(FATAL_ERROR
-            "shaderc not found.\n"
-            "Tried: ${_shaderc_candidates}\n"
-            "Native builds:      ensure bgfx is built with tools=True.\n"
-            "Cross-compilation:  pass -DJCE_SHADERC_EXECUTABLE=/path/to/shaderc.exe")
+        message(WARNING
+            "shaderc not found — shader rebuilds disabled.\n"
+            "Pre-baked pak shaders are still usable.\n"
+            "To enable shader compilation set one of:\n"
+            "  env  JCE_SHADERC_EXECUTABLE=/path/to/shaderc${CMAKE_EXECUTABLE_SUFFIX}\n"
+            "  cmake -DJCE_SHADERC_EXECUTABLE=/path/to/shaderc${CMAKE_EXECUTABLE_SUFFIX}\n"
+            "Or ensure bgfx is built with tools=True.")
+        # Create an empty no-op target so callers that add_dependencies on
+        # ARG_TARGET still configure cleanly.
+        if(NOT TARGET ${ARG_TARGET})
+            add_custom_target(${ARG_TARGET})
+        endif()
+        return()
     endif()
 
     # ── bgfx shader include path ──────────────────────────────────

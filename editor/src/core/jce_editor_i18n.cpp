@@ -218,7 +218,38 @@ static const char *locale_filename(JceLocale locale)
     switch (locale) {
         case JCE_LOCALE_EN:    return "i18n/en.json";
         case JCE_LOCALE_ZH_CN: return "i18n/zh_cn.json";
+        case JCE_LOCALE_KO:    return "i18n/ko.json";
         default:               return NULL;
+    }
+}
+
+const char *jce_editor_i18n_locale_code(JceLocale locale)
+{
+    switch (locale) {
+        case JCE_LOCALE_EN:    return "en";
+        case JCE_LOCALE_ZH_CN: return "zh_cn";
+        case JCE_LOCALE_KO:    return "ko";
+        default:               return "en";
+    }
+}
+
+JceLocale jce_editor_i18n_locale_from_code(const char *code)
+{
+    if (!code) return JCE_LOCALE_EN;
+    if (strcmp(code, "zh_cn") == 0) return JCE_LOCALE_ZH_CN;
+    if (strcmp(code, "ko")    == 0) return JCE_LOCALE_KO;
+    return JCE_LOCALE_EN;
+}
+
+const char *jce_editor_i18n_locale_native_name(JceLocale locale)
+{
+    switch (locale) {
+        case JCE_LOCALE_EN:    return "English";
+        /* "中文(简体)" */
+        case JCE_LOCALE_ZH_CN: return "\xe4\xb8\xad\xe6\x96\x87(\xe7\xae\x80\xe4\xbd\x93)";
+        /* "한국어" */
+        case JCE_LOCALE_KO:    return "\xed\x95\x9c\xea\xb5\xad\xec\x96\xb4";
+        default:               return "English";
     }
 }
 

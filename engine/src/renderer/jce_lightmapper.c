@@ -188,3 +188,190 @@ jce_lightmapper_bake_direct(const JceLightmapBakeDesc      *desc,
     (void)desc->shadow_samples;
     return 0;
 }
+
+/* ── SH9 light probe bake ──────────────────────────────────────────── */
+
+/* Real spherical harmonics (L0 + L1 + L2): basis evaluation for direction d. */
+static void sh9_eval(float *sh, const float *d)
+{
+    float x = d[0], y = d[1], z = d[2];
+    sh[0] =  0.282095f;                          /* L0,0 */
+    sh[1] =  0.488603f * y;                      /* L1,-1 */
+    sh[2] =  0.488603f * z;                      /* L1, 0 */
+    sh[3] =  0.488603f * x;                      /* L1, 1 */
+    sh[4] =  1.092548f * x * y;                  /* L2,-2 */
+    sh[5] =  1.092548f * y * z;                  /* L2,-1 */
+    sh[6] =  0.315392f * (3.0f * z*z - 1.0f);   /* L2, 0 */
+    sh[7] =  1.092548f * x * z;                  /* L2, 1 */
+    sh[8] =  0.546274f * (x*x - y*y);            /* L2, 2 */
+}
+
+/* Evaluate irradiance from all lights at point P in direction L (hemisphere
+   sample direction). Returns irradiance energy per channel. */
+static void eval_light_irradiance(const float *P,
+                                  const float *Ldir,
+                                  const JceLightmapOccluder *occ, int occ_count,
+                                  const JceLightmapLight *lights, int light_count,
+                                  float *out_rgb)
+{
+    out_rgb[0] = out_rgb[1] = out_rgb[2] = 0.0f;
+
+    for (int li = 0; li < light_count; ++li) {
+        const JceLightmapLight *L = &lights[li];
+
+        /* Check hemisphere agreement: sample dir vs light dir. */
+        float light_dir[3];
+        if (L->kind == JCE_LM_LIGHT_DIRECTIONAL) {
+            light_dir[0] = -L->direction[0];
+            light_dir[1] = -L->direction[1];
+            light_dir[2] = -L->direction[2];
+        } else {
+            float tmp[3];
+            v3_sub(tmp, L->position, P);
+            float d = v3_len(tmp);
+            if (d < 1e-8f) continue;
+            light_dir[0] = tmp[0]/d; light_dir[1] = tmp[1]/d; light_dir[2] = tmp[2]/d;
+        }
+
+        float ndotl = v3_dot(Ldir, light_dir);
+        if (ndotl <= 0.0f) continue;
+
+        /* Range and spot checks. */
+        float dist = 0.0f;
+        if (L->kind != JCE_LM_LIGHT_DIRECTIONAL) {
+            float tmp[3]; v3_sub(tmp, L->position, P);
+            dist = v3_len(tmp);
+            if (L->range > 0 && dist > L->range) continue;
+        }
+        if (L->kind == JCE_LM_LIGHT_SPOT) {
+            float toFrag[3] = { -light_dir[0], -light_dir[1], -light_dir[2] };
+            if (v3_dot(toFrag, L->direction) < L->cone_cos) continue;
+        }
+
+        /* Visibility segment. */
+        float startP[3] = { P[0] + Ldir[0]*1e-3f,
+                            P[1] + Ldir[1]*1e-3f,
+                            P[2] + Ldir[2]*1e-3f };
+        float endP[3];
+        if (L->kind == JCE_LM_LIGHT_DIRECTIONAL) {
+            endP[0] = P[0] + light_dir[0]*1e4f;
+            endP[1] = P[1] + light_dir[1]*1e4f;
+            endP[2] = P[2] + light_dir[2]*1e4f;
+        } else {
+            endP[0] = L->position[0];
+            endP[1] = L->position[1];
+            endP[2] = L->position[2];
+        }
+        if (occluded(startP, endP, occ, occ_count)) continue;
+
+        float atten = 1.0f;
+        if (L->kind != JCE_LM_LIGHT_DIRECTIONAL && L->range > 0) {
+            float t = dist / L->range;
+            atten = 1.0f - t; if (atten < 0.0f) atten = 0.0f;
+            atten *= atten;
+        }
+
+        float k = ndotl * atten * L->intensity;
+        out_rgb[0] += L->color[0] * k;
+        out_rgb[1] += L->color[1] * k;
+        out_rgb[2] += L->color[2] * k;
+    }
+}
+
+/*
+ * LCG pseudo-random float in [0, 1) — lightweight, avoids rand() which is
+ * not thread-safe on all platforms and requires <stdlib.h> globally.
+ */
+static float lcg_randf(unsigned *state)
+{
+    *state = *state * 1664525u + 1013904223u;
+    return (float)(*state >> 8) * (1.0f / 16777216.0f);
+}
+
+/* Cosine-weighted hemisphere sample in the canonical (0,0,1) space then
+   rotated to the surface normal frame.  normal must be unit-length. */
+static void cosine_sample_hemisphere(float *out, const float *normal,
+                                     unsigned *rng)
+{
+    float u1 = lcg_randf(rng);
+    float u2 = lcg_randf(rng);
+    /* Malley's method: uniform disk then project up. */
+    float r   = sqrtf(u1);
+    float phi = 6.28318530f * u2;
+    float lx  = r * cosf(phi);
+    float ly  = r * sinf(phi);
+    float lz  = sqrtf(1.0f - u1 < 0.0f ? 0.0f : 1.0f - u1);
+
+    /* Build ONB around normal (Duff et al. 2017). */
+    float nx = normal[0], ny = normal[1], nz = normal[2];
+    float sign = (nz >= 0.0f) ? 1.0f : -1.0f;
+    float a  = -1.0f / (sign + nz);
+    float b  = nx * ny * a;
+    float tx = 1.0f + sign * nx * nx * a;
+    float ty = sign * b;
+    float tz = -sign * nx;
+    float bx = b;
+    float by = sign + ny * ny * a;
+    float bz = -ny;
+
+    out[0] = lx*tx + ly*bx + lz*nx;
+    out[1] = lx*ty + ly*by + lz*ny;
+    out[2] = lx*tz + ly*bz + lz*nz;
+}
+
+int JCE_CALL
+jce_lightmapper_bake_sh9(const float          (*positions)[3],
+                         int                   probe_count,
+                         const JceLightmapOccluder *occ,  int occ_count,
+                         const JceLightmapLight    *lights, int light_count,
+                         int                   sample_count,
+                         float               (*out_sh9)[9][3])
+{
+    if (!positions || probe_count <= 0 || !out_sh9 || sample_count <= 0)
+        return -1;
+
+    /* Use upward hemisphere (Y+) per probe as the dominant normal; for a
+       full-sphere probe we sample the whole sphere by using both +Y and -Y
+       halves (alternating). */
+    const float up[3]   = { 0.0f, 1.0f, 0.0f };
+    const float down[3] = { 0.0f, -1.0f, 0.0f };
+
+    for (int pi = 0; pi < probe_count; ++pi) {
+        float acc[9][3];
+        for (int i = 0; i < 9; ++i) {
+            acc[i][0] = acc[i][1] = acc[i][2] = 0.0f;
+        }
+
+        unsigned rng = (unsigned)(pi * 2654435761u + 1u);
+        float inv_n = 1.0f / (float)sample_count;
+        const float *P = positions[pi];
+
+        for (int si = 0; si < sample_count; ++si) {
+            /* Alternate hemisphere to approximate full-sphere coverage. */
+            const float *normal = (si & 1) ? down : up;
+            float sdir[3];
+            cosine_sample_hemisphere(sdir, normal, &rng);
+
+            float irr[3];
+            eval_light_irradiance(P, sdir, occ, occ_count, lights, light_count, irr);
+
+            float basis[9];
+            sh9_eval(basis, sdir);
+
+            /* SH projection weight: π (cosine-weighted PDF = cos/π). */
+            float w = 3.14159265f * inv_n;
+            for (int c = 0; c < 9; ++c) {
+                acc[c][0] += irr[0] * basis[c] * w;
+                acc[c][1] += irr[1] * basis[c] * w;
+                acc[c][2] += irr[2] * basis[c] * w;
+            }
+        }
+
+        for (int c = 0; c < 9; ++c) {
+            out_sh9[pi][c][0] = acc[c][0];
+            out_sh9[pi][c][1] = acc[c][1];
+            out_sh9[pi][c][2] = acc[c][2];
+        }
+    }
+    return 0;
+}

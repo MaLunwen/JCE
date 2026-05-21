@@ -11,7 +11,12 @@
 
 extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/middleware/physics/jce_physics_debug.h>
 }
+
+#include "../core/jce_editor_state.h"
+#include "../gizmo/jce_gizmo_joint.h"
+#include "../gizmo/jce_gizmo_cloth.h"
 
 /* ── Animation timer reset (kept for play.cpp compatibility) ─────── */
 
@@ -190,6 +195,79 @@ void draw_physics_debug(void)
     }
 
     jce_debug_draw_flush(scene_view_id(), s_sr.renderer);
+
+    /* P3-C.5 — flush Bullet's debug-draw (wireframes / AABBs / contacts)
+     * for the live Play world.  The line sink + flag mask are installed
+     * once at editor startup (see jce_panel_physics_debugger.cpp). */
+    JcePhysicsWorld *pw = jce_editor_play_get_physics_world();
+    if (pw && jce_physics_debug_get_flags() != 0) {
+        jce_physics_debug_flush(pw);
+        jce_debug_draw_flush(scene_view_id(), s_sr.renderer);
+    }
+}
+
+/* ── Joint gizmos (P3-C.6) ────────────────────────────────────────── */
+
+/* Draw Unity-parity joint visualisation (anchors, A↔B line, axis,
+ * type-specific limit geometry) for every selected entity that owns a
+ * JceConstraintComponent.  Selection-driven by design — gizmos for all
+ * joints would clutter Scene View. */
+void draw_joint_gizmos(void)
+{
+    JceScene *scene = jce_state_get_scene();
+    if (!scene) return;
+
+    int sel_count = 0;
+    const uint32_t *sel = jce_state_get_selection(&sel_count);
+    if (!sel || sel_count <= 0) return;
+
+    bool drew_any = false;
+    for (int i = 0; i < sel_count; ++i) {
+        uint32_t id = sel[i];
+        if (id == 0 || !jce_state_entity_exists(id)) continue;
+        if (!jce_state_entity_enabled(id)) continue;
+
+        JceEntity e = (JceEntity)id;
+        if (!jce_scene_has_constraint(scene, e)) continue;
+
+        JceConstraintComponent *c = jce_scene_get_constraint(scene, e);
+        if (!c) continue;
+
+        jce_gizmo_joint_draw_from_component(scene, e, c);
+        drew_any = true;
+    }
+
+    if (drew_any) jce_debug_draw_flush(scene_view_id(), s_sr.renderer);
+}
+
+/* Draw cloth wireframe for every selected entity that owns a
+ * JceClothComponent.  Selection-driven for the same reason as joints. */
+void draw_cloth_gizmos(void)
+{
+    JceScene *scene = jce_state_get_scene();
+    if (!scene) return;
+
+    int sel_count = 0;
+    const uint32_t *sel = jce_state_get_selection(&sel_count);
+    if (!sel || sel_count <= 0) return;
+
+    bool drew_any = false;
+    for (int i = 0; i < sel_count; ++i) {
+        uint32_t id = sel[i];
+        if (id == 0 || !jce_state_entity_exists(id)) continue;
+        if (!jce_state_entity_enabled(id)) continue;
+
+        JceEntity e = (JceEntity)id;
+        if (!jce_scene_has_cloth(scene, e)) continue;
+
+        JceClothComponent *cl = jce_scene_get_cloth(scene, e);
+        if (!cl) continue;
+
+        jce_gizmo_cloth_draw_from_component(cl);
+        drew_any = true;
+    }
+
+    if (drew_any) jce_debug_draw_flush(scene_view_id(), s_sr.renderer);
 }
 
 /* ── Ghost (drag-preview) model rendering ─────────────────────────── */

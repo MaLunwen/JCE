@@ -111,6 +111,24 @@ JCE_API uint32_t jce_net_peer_rtt(const JceNetHost *host, JcePeerHandle peer);
 /* Number of currently connected peers. */
 JCE_API uint32_t jce_net_peer_count(const JceNetHost *host);
 
+typedef struct JceNetPeerStats {
+    uint32_t rtt_ms;
+    uint32_t packets_sent;
+    uint32_t packets_lost;
+    uint64_t bytes_in;
+    uint64_t bytes_out;
+} JceNetPeerStats;
+
+/* Fill `out` with current transport stats for `peer`.  Returns false
+ * if the peer is not connected. */
+JCE_API bool jce_net_peer_stats(const JceNetHost *host, JcePeerHandle peer,
+                                JceNetPeerStats *out);
+
+/* Write a human-readable "ip:port" string for `peer` into `buf` (NUL-
+ * terminated).  Returns false on bad args / unconnected peer. */
+JCE_API bool jce_net_peer_address_str(const JceNetHost *host, JcePeerHandle peer,
+                                      char *buf, uint32_t buf_size);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_NET_H */

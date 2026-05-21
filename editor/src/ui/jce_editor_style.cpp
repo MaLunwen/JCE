@@ -26,6 +26,7 @@ extern "C" {
 #define LOG_TAG "editor_style"
 
 static int s_current_theme = JCE_THEME_DARK;
+static float s_baked_font_size = 14.0f;  /* last size passed to load_fonts() */
 
 /* ── Style parameters (shared by all themes) ──────────────────────── */
 
@@ -324,6 +325,72 @@ static bool find_system_font(const char *family, char *out, size_t out_size)
         mac_file   = "Kaiti.ttc";
         linux_file = "ukai.ttc";       /* AR PL UKai (common Linux Kaiti) */
     } else {
+        /* Generic family lookup: treat `family` as a filename stem and
+         * probe common font extensions in the per-platform font dirs.
+         * This is how the Korean / Japanese / Latin fallback chains
+         * actually resolve (e.g. "malgun" -> "malgun.ttf" in C:\Windows
+         * \Fonts, "msyh" -> "msyh.ttc", "AppleSDGothicNeo" -> ".ttc"
+         * under /System/Library/Fonts). Without this branch the
+         * fallback walk silently no-ops and Hangul renders as ?. */
+        static const char *exts[] = { ".ttf", ".ttc", ".otf", NULL };
+        char tryname[160];
+        char candidate2[1024];
+
+        if (strcmp(plat, "Windows") == 0) {
+            const char *windir = getenv("WINDIR");
+            if (!windir || !*windir) windir = getenv("SystemRoot");
+            if (windir && *windir) {
+                char fontdir[1024];
+                snprintf(fontdir, sizeof(fontdir), "%s/Fonts", windir);
+                for (int e = 0; exts[e]; ++e) {
+                    snprintf(tryname, sizeof(tryname), "%s%s",
+                             family, exts[e]);
+                    join_path(candidate2, sizeof(candidate2),
+                              fontdir, tryname);
+                    if (file_exists_readable(candidate2)) {
+                        jce_strlcpy(out, candidate2, out_size);
+                        return true;
+                    }
+                }
+            }
+        } else if (strcmp(plat, "macOS") == 0) {
+            const char *dirs[] = {
+                "/System/Library/Fonts/Supplemental",
+                "/System/Library/Fonts",
+                "/Library/Fonts",
+                NULL };
+            for (int i = 0; dirs[i]; ++i) {
+                for (int e = 0; exts[e]; ++e) {
+                    snprintf(tryname, sizeof(tryname), "%s%s",
+                             family, exts[e]);
+                    join_path(candidate2, sizeof(candidate2),
+                              dirs[i], tryname);
+                    if (file_exists_readable(candidate2)) {
+                        jce_strlcpy(out, candidate2, out_size);
+                        return true;
+                    }
+                }
+            }
+        } else if (strcmp(plat, "Linux") == 0) {
+            const char *dirs[] = {
+                "/usr/share/fonts/truetype",
+                "/usr/share/fonts/opentype",
+                "/usr/share/fonts",
+                "/usr/local/share/fonts",
+                NULL };
+            for (int i = 0; dirs[i]; ++i) {
+                for (int e = 0; exts[e]; ++e) {
+                    snprintf(tryname, sizeof(tryname), "%s%s",
+                             family, exts[e]);
+                    join_path(candidate2, sizeof(candidate2),
+                              dirs[i], tryname);
+                    if (file_exists_readable(candidate2)) {
+                        jce_strlcpy(out, candidate2, out_size);
+                        return true;
+                    }
+                }
+            }
+        }
         return false;
     }
 
@@ -537,13 +604,18 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
        even if the string isn't in the i18n table. */
     ImFontGlyphRangesBuilder cjk_builder;
     cjk_builder.AddRanges(io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+    /* Korean Hangul Syllables + Jamo — covers the entire ko.json domain
+       even if a particular CJK font happens to lack glyphs for an
+       infrequent character.  Cost: ~11k codepoints, ~50 ms one-time
+       atlas bake; negligible at startup. */
+    cjk_builder.AddRanges(io.Fonts->GetGlyphRangesKorean());
     cjk_builder.AddRanges(cjk_extra_ranges);
 
     /* Scan i18n PAK files: for every UTF-8 codepoint encountered, mark
        it as required. This is fast (~1 ms per file) and exact. */
     if (use_pak) {
         const char *i18n_paths[] = {
-            "i18n/en.json", "i18n/zh_cn.json", NULL
+            "i18n/en.json", "i18n/zh_cn.json", "i18n/ko.json", NULL
         };
         for (int i = 0; i18n_paths[i]; i++) {
             const JcePakAsset *a = jce_pak_find(use_pak, i18n_paths[i]);
@@ -618,6 +690,45 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
         }
     }
 
+    /* --- Korean font (merged) --------------------------------------- */
+    /* KaiTi (default zh_override) and many Chinese-first CJK fonts ship
+       *no* Hangul glyphs, so ko.json text renders as ? marks once the
+       user switches the editor locale to Korean. Force-merge a
+       Korean-capable system font onto the atlas so Hangul resolves
+       regardless of which Chinese fallback won above. The list mirrors
+       common defaults per platform: Malgun Gothic / Gulim / Batang on
+       Windows; AppleSDGothicNeo on macOS; NotoSansCJK-KR / NanumGothic
+       on Linux. Quiet-on-miss so users without any Korean font installed
+       still don't get spurious warnings (translation just falls back). */
+    static const ImWchar korean_ranges[] = {
+        0x1100, 0x11FF,   /* Hangul Jamo */
+        0x3130, 0x318F,   /* Hangul Compatibility Jamo */
+        0xA960, 0xA97F,   /* Hangul Jamo Extended-A */
+        0xAC00, 0xD7AF,   /* Hangul Syllables (the bulk) */
+        0xD7B0, 0xD7FF,   /* Hangul Jamo Extended-B */
+        0,
+    };
+    const char *korean_fallbacks[] = {
+        "malgun",                 /* Malgun Gothic — Windows default */
+        "malgunbd",
+        "gulim",                  /* Gulim / GulimChe */
+        "batang",                 /* Batang / BatangChe */
+        "dotum",
+        "AppleSDGothicNeo",       /* macOS */
+        "AppleGothic",
+        "NotoSansCJK-KR",         /* Linux */
+        "NotoSansKR",
+        "NanumGothic",
+        "NanumMyeongjo",
+        NULL };
+    for (int i = 0; korean_fallbacks[i]; i++) {
+        ImFont *kf = load_font_with_fallback(
+            "Korean", NULL, korean_fallbacks[i],
+            size_pixels, &merge_cfg, korean_ranges,
+            /*quiet_on_miss=*/true);
+        if (kf) break;
+    }
+
     /* --- Icon font (merged) ----------------------------------------- */
     /* Dedicated icon-coverage merge pass: KaiTi and many other CJK fonts
        LACK U+25C6 / U+25C9 / U+25CB even though their character chart
@@ -648,6 +759,15 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
     }
 
     io.FontDefault = font;
+
+    /* ImGui 1.92 introduced dynamic font sizing: text is rendered at
+     * style.FontSizeBase * (FontScaleMain * FontScaleDpi). Adding a
+     * font at a given size only sets its baked / "legacy" size — the
+     * displayed size is governed by FontSizeBase. Mirror it here so
+     * font_size changes from Preferences and Project Settings actually
+     * affect the on-screen pixel height instead of just the atlas. */
+    ImGui::GetStyle().FontSizeBase = size_pixels;
+    s_baked_font_size = size_pixels;
 
     /* Rebuild font atlas on bgfx side. */
     jce_imgui_renderer_rebuild_fonts();
@@ -834,6 +954,11 @@ struct PendingReload {
     char  zh[1024] = {0};
 } g_pending;
 } // namespace
+
+extern "C" float jce_editor_get_baked_font_size(void)
+{
+    return s_baked_font_size;
+}
 
 extern "C" void jce_editor_request_font_reload(float size_pixels,
                                                const char *en_override,

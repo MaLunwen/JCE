@@ -10,7 +10,10 @@
 
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
+
+#include <jce/renderer/jce_renderer_caps.h>   /* JceRendererBackend */
 
 JCE_EXTERN_C_BEGIN
 
@@ -109,6 +112,11 @@ JCE_API void JCE_CALL jce_renderer_dbg_text_v(uint16_t x, uint16_t y,
 /* -- Queries (for debug HUD) --------------------------------------- */
 
 JCE_API const char  *jce_renderer_get_backend_name(const JceRenderer *r);
+
+/* Canonical JceRendererBackend enum for the live bgfx renderer.
+ * Mirrors bgfx::getRendererType() at call time.  Returns
+ * JCE_BACKEND_AUTO if bgfx is not yet initialised. */
+JCE_API JceRendererBackend jce_renderer_get_backend(const JceRenderer *r);
 JCE_API const char  *jce_renderer_get_gpu_name(const JceRenderer *r);
 JCE_API bool         jce_renderer_get_vsync(const JceRenderer *r);
 JCE_API void         jce_renderer_set_vsync(JceRenderer *r, bool enabled);
@@ -134,6 +142,24 @@ JCE_API JceShaderHandle  jce_renderer_get_program_shadow(const JceRenderer *r);
 JCE_API JceShaderHandle  jce_renderer_get_program_shadow_inst(const JceRenderer *r);
 JCE_API JceShaderHandle  jce_renderer_get_program_shadow_skinned(const JceRenderer *r);
 JCE_API JceShaderHandle  jce_renderer_get_program_terrain(const JceRenderer *r);
+
+/* Create a linked graphics program from raw vertex + fragment shader
+ * blobs (bgfx .bin format — output of shaderc).  Used by the editor's
+ * shader graph "Compile & Bind" workflow to install graph-generated
+ * fragment shaders at runtime.  Both blobs are copied internally; the
+ * caller retains ownership of the input buffers.
+ *
+ * Returns JCE_INVALID_SHADER on failure.  Caller is responsible for
+ * destroying the returned program via jce_renderer_destroy_program()
+ * (which also destroys the two underlying shader objects). */
+JCE_API JceShaderHandle  jce_renderer_create_program_from_blobs(
+    const void *vs_blob, size_t vs_size,
+    const void *fs_blob, size_t fs_size);
+
+/* Destroy a program created via jce_renderer_create_program_from_blobs.
+ * Safe to call with JCE_INVALID_SHADER.  bgfx defers actual destruction
+ * to end-of-frame, so in-flight draws remain valid. */
+JCE_API void jce_renderer_destroy_program(JceShaderHandle prog);
 
 /* Texture sampler uniform (s_texColor). */
 JCE_API JceUniformHandle jce_renderer_get_tex_uniform(const JceRenderer *r);

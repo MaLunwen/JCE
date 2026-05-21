@@ -12,6 +12,9 @@
 
 #include "jce_run_manager.h"
 
+#include "jce_build_manager.h"
+#include "jce_editor_config.h"
+#include "jce_assetdb.h"
 #include "ui/jce_editor_panels.h"
 
 extern "C" {
@@ -27,6 +30,8 @@ extern "C" {
 #include <jce/os/core/jce_defs.h>
 
 namespace {
+
+static bool do_spawn_now(const JceRunConfig *cfg);
 
 #if JCE_PLATFORM_WINDOWS
 static constexpr const char *kExeSuffix = ".exe";
@@ -135,6 +140,14 @@ struct RunManager {
 
     std::string stdout_partial;
     std::string stderr_partial;
+
+    /* Async pre-launch repack state.  When the user clicks Run we
+     * spawn a `cmake --build … --target PackGameAssets` first and
+     * stash the pending spawn config; poll_process_state drives the
+     * transition to RUNNING once the build completes. */
+    JceRunConfig pending_cfg{};
+    bool         has_pending = false;
+    std::string  pending_preset;
 };
 
 RunManager g_run;
@@ -221,6 +234,33 @@ void release_process()
 
 void poll_process_state()
 {
+    /* Async pre-launch repack: drive the build_manager and transition
+     * to RUNNING (or FAILED) when it finishes.  Must come before the
+     * RUNNING/STOPPING short-circuit below. */
+    if (g_run.state == JCE_RUN_BUILDING) {
+        jce_build_manager_poll();
+        JceBuildStatus bs{};
+        jce_build_manager_get_status(&bs);
+        if (bs.state == JCE_BUILD_RUNNING) return;
+        if (bs.state == JCE_BUILD_SUCCEEDED && g_run.has_pending) {
+            log_line(JCE_CONSOLE_INFO,
+                     "[run] asset repack done; launching game");
+            JceRunConfig cfg = g_run.pending_cfg;
+            g_run.has_pending = false;
+            g_run.pending_cfg = JceRunConfig{};
+            g_run.pending_preset.clear();
+            g_run.state = JCE_RUN_IDLE;
+            do_spawn_now(&cfg);
+            return;
+        }
+        /* FAILED / unexpected — abort the queued launch. */
+        g_run.has_pending = false;
+        g_run.pending_cfg = JceRunConfig{};
+        g_run.pending_preset.clear();
+        set_error("asset repack failed; launch aborted");
+        return;
+    }
+
     if (g_run.state != JCE_RUN_RUNNING && g_run.state != JCE_RUN_STOPPING)
         return;
 
@@ -307,6 +347,40 @@ bool jce_run_manager_start(const JceRunConfig *cfg)
 
     release_process();
 
+    /* Always try to refresh the game PAK before launching so the
+     * external ck.exe sees designer edits without a manual CLI step.
+     * Skip if no preset is configured or another build is already in
+     * flight — fall through to launching with the existing PAK in
+     * those cases (with a warning). */
+    JceEditorConfig ecfg{};
+    bool have_preset = jce_editor_config_load(&ecfg) &&
+                       ecfg.build_preset[0] != '\0';
+    if (have_preset && !jce_build_manager_is_running()) {
+        if (jce_build_manager_repack_game_assets(ecfg.build_preset)) {
+            g_run.pending_cfg     = *cfg;
+            g_run.has_pending     = true;
+            g_run.pending_preset  = ecfg.build_preset;
+            g_run.state           = JCE_RUN_BUILDING;
+            g_run.exit_code       = 0;
+            g_run.last_error.clear();
+            log_line(JCE_CONSOLE_INFO,
+                     std::string("[run] auto-repacking assets before launch "
+                                 "(preset: ") + g_run.pending_preset + ")");
+            return true;
+        }
+        log_line(JCE_CONSOLE_WARNING,
+                 "[run] asset repack spawn failed; launching with existing PAK");
+    } else if (have_preset) {
+        log_line(JCE_CONSOLE_WARNING,
+                 "[run] build in progress; launching with existing PAK");
+    }
+
+    return do_spawn_now(cfg);
+}
+
+namespace {
+static bool do_spawn_now(const JceRunConfig *cfg)
+{
     std::string resolved_exe = resolve_executable(cfg->executable_path);
     std::string resolved_cwd = cfg->working_directory ? cfg->working_directory : "";
     if (!path_exists(resolved_exe)) {
@@ -329,7 +403,29 @@ bool jce_run_manager_start(const JceRunConfig *cfg)
     JceProcessConfig pcfg{};
     pcfg.executable_path   = resolved_exe.c_str();
     pcfg.working_directory = resolved_cwd.empty() ? nullptr : resolved_cwd.c_str();
-    pcfg.arguments         = cfg->arguments;
+
+    /* Build the argv string. Start with whatever the caller asked for,
+     * then append `--dev <project_assets_dir>` when the editor is in
+     * dev mode and the project root resolves to a real assets folder.
+     * Keeping this composition in one place avoids every Run UI having
+     * to re-implement it. The buffer must outlive the spawn call. */
+    std::string final_args = cfg->arguments ? cfg->arguments : "";
+    JceEditorConfig dev_cfg{};
+    if (jce_editor_config_load(&dev_cfg) && dev_cfg.run_dev_mode) {
+        const char *proj_root = jce_assetdb_get_root();
+        if (proj_root && proj_root[0]) {
+            std::string assets_dir = std::string(proj_root) + "/assets";
+            if (path_exists(assets_dir)) {
+                if (!final_args.empty()) final_args += ' ';
+                final_args += "--dev \"";
+                final_args += assets_dir;
+                final_args += '"';
+                log_line(JCE_CONSOLE_INFO,
+                         std::string("[run] dev-mode: --dev ") + assets_dir);
+            }
+        }
+    }
+    pcfg.arguments         = final_args.empty() ? nullptr : final_args.c_str();
     pcfg.capture_stdout    = cfg->capture_stdout;
     pcfg.capture_stderr    = cfg->capture_stderr;
 
@@ -354,6 +450,7 @@ bool jce_run_manager_start(const JceRunConfig *cfg)
                                    : (std::string(" (cwd: ") + resolved_cwd + ")")));
     return true;
 }
+} // namespace
 
 void jce_run_manager_request_stop(void)
 {
@@ -376,7 +473,9 @@ void jce_run_manager_request_stop(void)
 
 bool jce_run_manager_is_running(void)
 {
-    return g_run.state == JCE_RUN_RUNNING || g_run.state == JCE_RUN_STOPPING;
+    return g_run.state == JCE_RUN_RUNNING ||
+           g_run.state == JCE_RUN_STOPPING ||
+           g_run.state == JCE_RUN_BUILDING;
 }
 
 JceRunState jce_run_manager_state(void)

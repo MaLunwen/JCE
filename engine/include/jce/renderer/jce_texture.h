@@ -50,6 +50,42 @@ JCE_API void       jce_texture_get_size(JceTexture tex, uint32_t *w, uint32_t *h
 /* Destroy a texture. */
 JCE_API void       jce_texture_destroy(JceTexture tex);
 
+/* ================================================================== */
+/* Runtime mip streaming (P3-A.2)                                      */
+/* ================================================================== */
+/*
+ * Per-texture mip bias.  0 = full quality, +1 = drop top mip, +2 = drop
+ * two top mips, etc.  Negative values are clamped to 0.
+ *
+ * The final bias actually applied on the GPU is the maximum of:
+ *   - the global bias       (jce_texture_set_global_mip_bias),
+ *   - the per-texture bias  (jce_texture_set_mip_bias),
+ *   - the caps floor        (derived from jce_renderer_get_tier(); see
+ *                            engine/src/renderer/jce_texture.c for the
+ *                            Low/Mid/High → floor matrix).
+ *
+ * The smallest 4x4 mip-tail is always considered resident.
+ */
+JCE_API void   jce_texture_set_mip_bias(JceTextureId tex, int8_t bias);
+JCE_API int8_t jce_texture_get_mip_bias(JceTextureId tex);
+
+/*
+ * Request a given top-mip residency (e.g. top_mip = 0 to upload the full
+ * chain).  Honored on the next streaming tick; may be denied / clamped
+ * upward under HARD streaming pressure or by the caps floor.
+ */
+JCE_API void    jce_texture_request_mip_residency(JceTextureId tex, uint8_t top_mip);
+JCE_API uint8_t jce_texture_get_resident_top_mip(JceTextureId tex);
+
+/*
+ * Global mip bias.  Added on top of per-texture bias and the caps floor.
+ * Driven automatically by the streaming pressure hook
+ * (OK -> 0, SOFT -> 1, HARD -> 2) but also callable directly by tools
+ * (editor quality slider, headless tests, etc.).
+ */
+JCE_API void   jce_texture_set_global_mip_bias(int8_t bias);
+JCE_API int8_t jce_texture_get_global_mip_bias(void);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_TEXTURE_H */

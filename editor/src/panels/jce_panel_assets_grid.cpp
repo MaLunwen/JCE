@@ -6,11 +6,14 @@
 
 #include "io/jce_editor_file_util.h"
 #include "jce_panel_assets_internal.h"
+#include "jce_panel_assets_thumb.h"
 
 #include <jce/os/core/jce_str.h>
 
 extern "C" {
+#include <jce/middleware/physics/jce_physics_material.h>
 #include <jce/renderer/jce_pbr_material.h>
+#include <jce/renderer/jce_render_pipeline.h>
 }
 
 static void open_asset_in_file_viewer(const char *path)
@@ -165,35 +168,48 @@ void draw_asset_grid_item(const FileEntry &fe, int index,
     }
 
     /* ── Thumbnail button ── */
-    ImVec4 col4 = asset_color_for_ext(fe.ext, fe.is_dir);
-    ImGui::PushStyleColor(ImGuiCol_Button, col4);
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
-        ImVec4(col4.x * 1.1f, col4.y * 1.1f, col4.z * 1.1f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive,
-        ImVec4(col4.x * 0.9f, col4.y * 0.9f, col4.z * 0.9f, 1.0f));
+    JceThumb thumb{};
+    const bool has_thumb =
+        !fe.is_dir && jce_thumb_request(fe.path.c_str(), &thumb);
+    const bool thumb_ready = has_thumb && thumb.state == JCE_THUMB_READY;
 
-    const char *label = type_label_for_entry(fe);
-    bool clicked = ImGui::Button("##icon",
-        ImVec2((float)JCE_THUMBNAIL_SIZE, (float)JCE_THUMBNAIL_SIZE));
+    bool clicked = false;
 
-    {
-        ImVec2 mn = ImGui::GetItemRectMin();
-        ImVec2 mx = ImGui::GetItemRectMax();
-        ImVec2 tsz = ImGui::CalcTextSize(label);
-        float cx = mn.x + (mx.x - mn.x - tsz.x) * 0.5f;
-        float cy = mn.y + (mx.y - mn.y - tsz.y) * 0.5f;
-        ImDrawList *dl = ImGui::GetWindowDrawList();
-        ImU32 text_col = ImGui::GetColorU32(ImGuiCol_Text);
-        ImVec4 bg = ImGui::GetStyleColorVec4(ImGuiCol_WindowBg);
-        float lum = bg.x * 0.299f + bg.y * 0.587f + bg.z * 0.114f;
-        ImU32 shadow_col = (lum > 0.5f)
-            ? IM_COL32(255, 255, 255, 200)
-            : IM_COL32(0, 0, 0, 200);
-        dl->AddText(ImVec2(cx + 1, cy + 1), shadow_col, label);
-        dl->AddText(ImVec2(cx, cy), text_col, label);
+    if (thumb_ready) {
+        clicked = ImGui::ImageButton("##icon",
+            (ImTextureID)(uintptr_t)thumb.handle.idx,
+            ImVec2((float)JCE_THUMBNAIL_SIZE, (float)JCE_THUMBNAIL_SIZE));
+    } else {
+        ImVec4 col4 = asset_color_for_ext(fe.ext, fe.is_dir);
+        ImGui::PushStyleColor(ImGuiCol_Button, col4);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
+            ImVec4(col4.x * 1.1f, col4.y * 1.1f, col4.z * 1.1f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive,
+            ImVec4(col4.x * 0.9f, col4.y * 0.9f, col4.z * 0.9f, 1.0f));
+
+        const char *label = type_label_for_entry(fe);
+        clicked = ImGui::Button("##icon",
+            ImVec2((float)JCE_THUMBNAIL_SIZE, (float)JCE_THUMBNAIL_SIZE));
+
+        {
+            ImVec2 mn = ImGui::GetItemRectMin();
+            ImVec2 mx = ImGui::GetItemRectMax();
+            ImVec2 tsz = ImGui::CalcTextSize(label);
+            float cx = mn.x + (mx.x - mn.x - tsz.x) * 0.5f;
+            float cy = mn.y + (mx.y - mn.y - tsz.y) * 0.5f;
+            ImDrawList *dl = ImGui::GetWindowDrawList();
+            ImU32 text_col = ImGui::GetColorU32(ImGuiCol_Text);
+            ImVec4 bg = ImGui::GetStyleColorVec4(ImGuiCol_WindowBg);
+            float lum = bg.x * 0.299f + bg.y * 0.587f + bg.z * 0.114f;
+            ImU32 shadow_col = (lum > 0.5f)
+                ? IM_COL32(255, 255, 255, 200)
+                : IM_COL32(0, 0, 0, 200);
+            dl->AddText(ImVec2(cx + 1, cy + 1), shadow_col, label);
+            dl->AddText(ImVec2(cx, cy), text_col, label);
+        }
+
+        ImGui::PopStyleColor(3);
     }
-
-    ImGui::PopStyleColor(3);
 
     /* Single click: select (Ctrl/Shift multi-select) */
     bool ctrl  = ImGui::GetIO().KeyCtrl;
@@ -741,6 +757,52 @@ void draw_asset_empty_area_menu(void)
                 } else {
                     jce_editor_console_log_level(JCE_CONSOLE_ERROR,
                         "New material failed");
+                }
+            }
+            if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.newPhysmat"))) {
+                char base_name[64] = "New Physics Material.physmat.json";
+                char nf[1024];
+                jce_path_join(nf, sizeof(nf), s_assets.current_path.c_str(), base_name);
+                int cnt = 1;
+                while (jce_fs_host_exists_file(nf)) {
+                    char name[96];
+                    snprintf(name, sizeof(name),
+                             "New Physics Material %d.physmat.json", cnt++);
+                    jce_path_join(nf, sizeof(nf), s_assets.current_path.c_str(), name);
+                }
+                JcePhysicsMaterial pm;
+                jce_physics_material_init_default(&pm);
+                if (jce_physics_material_save(nf, &pm)) {
+                    char basename[256];
+                    jce_path_basename(basename, sizeof(basename), nf);
+                    jce_editor_console_log("Created '%s'", basename);
+                    s_assets.needs_refresh = true;
+                } else {
+                    jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                        "New physics material failed");
+                }
+            }
+            if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.newRenderPipeline"))) {
+                char base_name[64] = "New Render Pipeline.rp.json";
+                char nf[1024];
+                jce_path_join(nf, sizeof(nf), s_assets.current_path.c_str(), base_name);
+                int cnt = 1;
+                while (jce_fs_host_exists_file(nf)) {
+                    char name[96];
+                    snprintf(name, sizeof(name),
+                             "New Render Pipeline %d.rp.json", cnt++);
+                    jce_path_join(nf, sizeof(nf), s_assets.current_path.c_str(), name);
+                }
+                JceRenderPipelineDesc rp;
+                jce_render_pipeline_preset_for_current_tier(&rp);
+                if (jce_render_pipeline_save(nf, &rp)) {
+                    char basename[256];
+                    jce_path_basename(basename, sizeof(basename), nf);
+                    jce_editor_console_log("Created '%s'", basename);
+                    s_assets.needs_refresh = true;
+                } else {
+                    jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                        "New render pipeline failed");
                 }
             }
             if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.newPrefab"))) {

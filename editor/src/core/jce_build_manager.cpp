@@ -222,6 +222,14 @@ bool jce_build_manager_build(const char *preset)
     return spawn_cmake(JCE_BUILD_STAGE_COMPILE, preset, args.c_str());
 }
 
+bool jce_build_manager_repack_game_assets(const char *preset)
+{
+    if (!preset) return false;
+    std::string args = std::string("--build --preset ") + preset +
+                       " --target PackGameAssets";
+    return spawn_cmake(JCE_BUILD_STAGE_COMPILE, preset, args.c_str());
+}
+
 void jce_build_manager_request_stop(void)
 {
     if (!g_build.process || g_build.state != JCE_BUILD_RUNNING) return;

@@ -14,9 +14,14 @@
 extern "C" {
 #endif
 
+#include <jce/renderer/jce_ies_profile.h>
+#include <jce/renderer/jce_quality_preset.h>
 #include <jce/renderer/jce_render_graph.h>
+#include <jce/renderer/jce_render_pipeline.h>
 #include <jce/renderer/jce_render_queue.h>
+#include <jce/renderer/jce_reflection_probe_bake.h>
 #include <jce/renderer/jce_scene_renderer.h>
+#include <jce/renderer/jce_volume_profile.h>
 
 
 

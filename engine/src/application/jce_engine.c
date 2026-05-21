@@ -7,10 +7,14 @@
  */
 
 #include <jce/application/jce_app_interface.h>
+#include <jce/application/jce_args.h>
 #include <jce/application/jce_engine.h>
+#include <jce/application/jce_lifecycle.h>
+#include <jce/os/core/jce_fixed_clock.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/os/core/jce_thread.h>
 #include <jce/os/core/jce_timer.h>
+#include <jce/runtime/jce_player_loop.h>
 
 #include "os/core/jce_memory.h"
 
@@ -22,6 +26,7 @@
 #include <jce/os/core/jce_config.h>
 #include <jce/application/jce_subsystem.h>
 #include <jce/middleware/audio/jce_audio.h>
+#include <jce/middleware/streaming/jce_streaming.h>
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_crash_handler.h>
 #include <jce/os/core/jce_event.h>
@@ -34,6 +39,7 @@
 #include <jce/os/platform/jce_window.h>
 #include <jce/os/platform/jce_window_modal_loop.h>
 #include <jce/renderer/jce_renderer.h>
+#include <jce/renderer/jce_render_pipeline.h>
 #include <jce/renderer/jce_shaders.h>
 #include <jce/resource/jce_asset.h>
 
@@ -123,6 +129,19 @@ static void jce_select_config_path(char *out_path, size_t out_size)
     }
 
     snprintf(out_path, out_size, "%s.config/jce.ini", base ? base : "");
+}
+
+/* P3-B.3 — engine-internal lifecycle listener.  Bridges OS LOW_MEMORY
+ * signals to the streaming pressure system so registered mip-streaming
+ * / cache hooks fire even before our own budget tripped.  Other events
+ * are logged at info level when JCE_DEBUG is on (lifecycle visibility
+ * is cheap and very useful during platform bring-up). */
+static void JCE_CALL engine_lifecycle_listener(JceLifecycleEvent event, void *user)
+{
+    (void)user;
+    LOG_INFO(LOG_TAG, "lifecycle: %s", jce_lifecycle_event_to_string(event));
+    if (event == JCE_LIFECYCLE_LOW_MEMORY)
+        jce_streaming_signal_low_memory_all();
 }
 
 /* -- Engine state -------------------------------------------------- */
@@ -230,7 +249,9 @@ static SDL_AtomicInt s_render_paused = {0};
 
 JceEngine *jce_engine_create(int argc, char *argv[])
 {
-    (void)argc; (void)argv;
+    /* Snapshot argv first so any subsystem init below can read launch
+     * flags through jce_args_* without each one re-parsing argv. */
+    jce_args_stash(argc, argv);
 
     /* Logger + crash handler + config. */
     jce_log_init();
@@ -444,6 +465,10 @@ JceEngine *jce_engine_create(int argc, char *argv[])
     }
     jce_gpu_caps_init(&e->gpu_caps);
 
+    /* Render Pipeline Asset (P3-E.4): pick `<cwd>/Settings/RenderPipeline.rp.json`
+     * if present, otherwise fall back to the preset matching the GPU tier. */
+    jce_render_pipeline_apply_boot("Settings/RenderPipeline.rp.json");
+
     e->input = jce_input_create();
     if (!e->input) {
         fatal_msg("Input system init failed");
@@ -532,6 +557,16 @@ JceEngine *jce_engine_create(int argc, char *argv[])
     /* Keep rendering while the user holds the title bar / window border
        on platforms with a modal sizing loop (Windows). No-op elsewhere. */
     jce_window_install_modal_tick(jce_modal_tick_cb, e);
+
+    /* P3-B.3 — wire OS LOW_MEMORY signals into the streaming pressure
+     * system (pairs with the P3-A.2 mip-streaming hook).  Priority is
+     * very low so engine-internal teardown runs before any consumer
+     * listeners (consumers may free game-specific caches afterwards). */
+    {
+        JceLifecycleHandle h = jce_lifecycle_register(
+            engine_lifecycle_listener, /*priority*/ -1000, NULL);
+        (void)h;   /* released in bulk via jce_lifecycle_shutdown() */
+    }
 
     jce_engine_reset_frame_clock(e);
 
@@ -734,8 +769,54 @@ JceAppResult jce_engine_event(JceEngine *e, const void *platform_event)
 {
     const SDL_Event *event = (const SDL_Event *)platform_event;
 
-    if (event->type == SDL_EVENT_TERMINATING)
+    /* P3-B.3 — translate SDL platform-lifecycle events to JCE lifecycle
+     * events.  Runs BEFORE quit handling so listeners get WILL_QUIT
+     * just before we propagate JCE_APP_SUCCESS.  Single switch keeps
+     * the dispatch table near the SDL_Event types it consumes; unmapped
+     * SDL events simply fall through.
+     *
+     * SDL3 event coverage (vendored):
+     *   SDL_EVENT_WINDOW_FOCUS_GAINED / _LOST       (all platforms)
+     *   SDL_EVENT_WINDOW_MINIMIZED / _RESTORED      (desktop pause/resume)
+     *   SDL_EVENT_DID_ENTER_BACKGROUND               (mobile pause)
+     *   SDL_EVENT_WILL_ENTER_FOREGROUND              (mobile resume)
+     *   SDL_EVENT_LOW_MEMORY                         (mobile, sometimes desktop)
+     *   SDL_EVENT_TERMINATING                        (mobile force-kill warning)
+     *   SDL_EVENT_RENDER_DEVICE_RESET                (D3D/Vulkan device-lost recovery)
+     *
+     * DEVICE_LOST has no direct SDL3 counterpart yet; the enum value
+     * is defined so the renderer layer can emit it manually when bgfx
+     * surfaces a device-lost state.  Document changes in the commit
+     * body if SDL exposes a dedicated event later. */
+    switch (event->type) {
+    case SDL_EVENT_WINDOW_FOCUS_GAINED:
+        jce_lifecycle_emit(JCE_LIFECYCLE_FOCUS_GAINED);
+        break;
+    case SDL_EVENT_WINDOW_FOCUS_LOST:
+        jce_lifecycle_emit(JCE_LIFECYCLE_FOCUS_LOST);
+        break;
+    case SDL_EVENT_WINDOW_MINIMIZED:
+    case SDL_EVENT_DID_ENTER_BACKGROUND:
+        jce_lifecycle_emit(JCE_LIFECYCLE_PAUSE);
+        break;
+    case SDL_EVENT_WINDOW_RESTORED:
+    case SDL_EVENT_WILL_ENTER_FOREGROUND:
+        jce_lifecycle_emit(JCE_LIFECYCLE_RESUME);
+        break;
+    case SDL_EVENT_LOW_MEMORY:
+        jce_lifecycle_emit(JCE_LIFECYCLE_LOW_MEMORY);
+        break;
+    case SDL_EVENT_RENDER_DEVICE_RESET:
+        jce_lifecycle_emit(JCE_LIFECYCLE_DEVICE_RESET);
+        break;
+    default:
+        break;
+    }
+
+    if (event->type == SDL_EVENT_TERMINATING) {
+        jce_lifecycle_emit(JCE_LIFECYCLE_WILL_QUIT);
         return JCE_APP_SUCCESS;
+    }
 
     JceEvent ev = (JceEvent){0};
     translate_sdl_event(event, &ev);
@@ -760,17 +841,22 @@ JceAppResult jce_engine_event(JceEngine *e, const void *platform_event)
          * false — leaving the user with an unclosable window.  Bypass
          * the callback in fallback mode and quit immediately so the
          * window's X button always works in the safe-mode UI. */
-        if (e->renderer && jce_renderer_is_fallback(e->renderer))
+        if (e->renderer && jce_renderer_is_fallback(e->renderer)) {
+            jce_lifecycle_emit(JCE_LIFECYCLE_WILL_QUIT);
             return JCE_APP_SUCCESS;
+        }
 
         /* If the application registered a should_quit callback, give it
            a chance to intercept the quit (e.g. to show an unsaved-changes
            dialog).  If the callback returns false, swallow the event. */
         if (g_app_desc.should_quit) {
-            if (g_app_desc.should_quit(g_app_desc.user_data))
+            if (g_app_desc.should_quit(g_app_desc.user_data)) {
+                jce_lifecycle_emit(JCE_LIFECYCLE_WILL_QUIT);
                 return JCE_APP_SUCCESS;
+            }
             return JCE_APP_CONTINUE;
         }
+        jce_lifecycle_emit(JCE_LIFECYCLE_WILL_QUIT);
         return JCE_APP_SUCCESS;
     }
 
@@ -887,6 +973,35 @@ JceAppResult jce_engine_iterate(JceEngine *e)
     }
     SDL_SetAtomicInt(&s_in_render_frame, 1);
 
+    /* ── PlayerLoop: INITIALIZATION / EARLY_UPDATE ──────────────────
+     * Initialization runs before any per-frame work; EarlyUpdate is
+     * for input poll and event-drain style hooks that need to see a
+     * fresh frame.  Engine-owned input update remains at END_OF_FRAME
+     * below (it drives swap-edge / just-pressed detection). */
+    jce_player_loop_run_phase(JCE_PHASE_INITIALIZATION, dt);
+    jce_player_loop_run_phase(JCE_PHASE_EARLY_UPDATE, dt);
+
+    /* ── PlayerLoop: FIXED_UPDATE (P3-B.2) ──────────────────────────
+     * Glenn Fiedler accumulator: drives 0..N fixed steps per frame so
+     * physics + future deterministic netcode see a stable cadence
+     * regardless of render rate.  Spiral-of-death clamp lives inside
+     * jce_fixed_clock_advance.  Configurable via
+     * jce_engine_set_fixed_hz (default 50 Hz, Unity parity). */
+    {
+        JceFixedClock *fc = jce_fixed_clock_default();
+        const uint32_t steps = jce_fixed_clock_advance(fc, (double)dt);
+        const float    fdt   = (float)fc->fixed_dt;
+        for (uint32_t i = 0; i < steps; ++i) {
+            jce_player_loop_run_phase(JCE_PHASE_FIXED_UPDATE, fdt);
+            jce_fixed_clock_tick(fc);
+        }
+    }
+
+    /* ── PlayerLoop: PRE_RENDER ─────────────────────────────────────
+     * Fires immediately before bgfx begin_frame so hooks can prep
+     * frame-local GPU state without racing the renderer. */
+    jce_player_loop_run_phase(JCE_PHASE_PRE_RENDER, dt);
+
     jce_renderer_begin_frame(e->renderer, e->window);
 
     /* Finalize async asset loads (GPU resource creation). */
@@ -930,6 +1045,11 @@ JceAppResult jce_engine_iterate(JceEngine *e)
         JCE_PROFILE_ZONE_END;
     }
 
+    /* ── PlayerLoop: UPDATE ─────────────────────────────────────────
+     * Gameplay / ECS world tick.  Runs after legacy subsystem update
+     * so phase consumers observe the same world state the app does. */
+    jce_player_loop_run_phase(JCE_PHASE_UPDATE, dt);
+
     if (g_app_desc.update) {
         JCE_PROFILE_ZONE_N("App::UpdateAndDraw");
         g_app_desc.update(dt, g_app_desc.user_data);
@@ -938,7 +1058,16 @@ JceAppResult jce_engine_iterate(JceEngine *e)
         JCE_PROFILE_ZONE_END;
     }
 
+    /* ── PlayerLoop: LATE_UPDATE ────────────────────────────────────
+     * Post-gameplay: cameras, IK, anim post-processing. */
+    jce_player_loop_run_phase(JCE_PHASE_LATE_UPDATE, dt);
+
     jce_renderer_end_frame(e->renderer);
+
+    /* ── PlayerLoop: POST_RENDER ────────────────────────────────────
+     * After the renderer submits but before we release the in-frame
+     * guard, so hooks can still touch frame-local resources. */
+    jce_player_loop_run_phase(JCE_PHASE_POST_RENDER, dt);
 
     SDL_SetAtomicInt(&s_in_render_frame, 0);
 
@@ -947,6 +1076,11 @@ JceAppResult jce_engine_iterate(JceEngine *e)
         jce_input_update(e->input);
         JCE_PROFILE_ZONE_END;
     }
+
+    /* ── PlayerLoop: END_OF_FRAME ───────────────────────────────────
+     * Last thing before the profiler frame mark.  Use for screenshot
+     * captures, async readbacks, and per-frame analytics. */
+    jce_player_loop_run_phase(JCE_PHASE_END_OF_FRAME, dt);
 
     JCE_PROFILE_FRAME_MARK;
     JCE_PROFILE_ZONE_END;
@@ -1009,7 +1143,31 @@ void jce_engine_destroy(JceEngine *e)
     /* Restore default crash handlers after all subsystems are down. */
     jce_crash_handler_shutdown();
 
+    /* Release PlayerLoop storage after all subsystems are torn down so
+     * any teardown-time callbacks have already fired. */
+    jce_player_loop_shutdown();
+    jce_lifecycle_shutdown();
+
     /* Flush and shut down the async log backend (last, so all
        teardown messages are captured). */
     jce_log_shutdown();
+}
+
+/* ---- FixedUpdate cadence (P3-B.2) ------------------------------ */
+
+void jce_engine_set_fixed_hz(double hz)
+{
+    JceFixedClock *fc = jce_fixed_clock_default();
+    const double fixed_dt = (hz > 0.0) ? (1.0 / hz) : (1.0 / 50.0);
+    /* Preserve max_frame_dt + counters; only retune cadence. */
+    fc->fixed_dt = fixed_dt;
+    /* Drop a stale accumulator that no longer matches the new step. */
+    if (fc->accumulator > fixed_dt)
+        fc->accumulator = fixed_dt;
+}
+
+double jce_engine_get_fixed_hz(void)
+{
+    const JceFixedClock *fc = jce_fixed_clock_default();
+    return (fc->fixed_dt > 0.0) ? (1.0 / fc->fixed_dt) : 0.0;
 }

@@ -215,14 +215,23 @@ extern "C" void jce_editor_panel_frame_debugger_content(void)
     draw_rg_capture();
 }
 
+/* Shim: Frame Debugger has been merged into the Profiler "Profiling"
+ * workbench as a tab.  Activating this panel now redirects to that
+ * workbench and requests the Frame Debugger tab.  Symbol kept so
+ * menu/hotkey entries registered against JCE_PANEL_FRAME_DEBUGGER
+ * keep working. */
 extern "C" void jce_editor_panel_frame_debugger(void)
 {
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_FRAME_DEBUGGER);
     if (!vis || !*vis) return;
-    char lbl[128];
-    snprintf(lbl, sizeof(lbl), "%s###frame_debugger",
-             jce_editor_i18n("frameDebugger.title"));
-    if (ImGui::Begin(lbl, vis, ImGuiWindowFlags_NoFocusOnAppearing))
-        jce_editor_panel_frame_debugger_content();
-    ImGui::End();
+    *vis = false;
+
+    bool *pf_vis = jce_editor_panel_visible_ptr(JCE_PANEL_PROFILER);
+    if (pf_vis) *pf_vis = true;
+
+    char title[96];
+    snprintf(title, sizeof(title), "%s###profiler",
+             jce_editor_i18n("panel.profiler"));
+    ImGui::SetWindowFocus(title);
+    jce_panel_profiler_request_tab(3);
 }

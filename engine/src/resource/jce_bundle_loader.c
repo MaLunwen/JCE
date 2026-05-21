@@ -265,6 +265,11 @@ JCE_API uint64_t jce_bundle_catalog_size_bytes(const JceBundleCatalog *cat,
     const BundleEntry *e = find_entry(cat, bundle_id);
     return e ? e->size : 0;
 }
+JCE_API const char *jce_bundle_catalog_content_hash(const JceBundleCatalog *cat,
+                                                    const char *bundle_id) {
+    const BundleEntry *e = find_entry(cat, bundle_id);
+    return e ? e->content_hash : NULL;
+}
 
 /* ================================================================== */
 /* Mount / unmount                                                      */

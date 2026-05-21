@@ -1,0 +1,6 @@
+{
+    "runtime.ui.example.greeting": "Hello",
+    "runtime.ui.example.goodbye":  "Goodbye",
+    "runtime.ui.example.score":    "Score: {0}",
+    "runtime.ui.example.lives":    "Lives: {0}"
+}

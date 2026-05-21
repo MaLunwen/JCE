@@ -91,8 +91,11 @@ void jce_editor_config_defaults(JceEditorConfig *cfg) {
     cfg->invert_scroll_zoom = false;
     cfg->invert_drag_y      = false;
     cfg->touchpad_h_invert  = true;
+    cfg->auto_repack_on_save = false;
+    cfg->run_dev_mode = true;
     cfg->panels_visible_mask = JCE_EDITOR_PANELS_MASK_UNSET;
     cfg->panels_visible_mask_hi = 0u;
+    strncpy(cfg->workspace_id, "default", sizeof(cfg->workspace_id) - 1);
 }
 
 /* --------------- helpers --------------- */
@@ -181,10 +184,16 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
                                                 cfg->invert_drag_y);
     cfg->touchpad_h_invert  = jce_json_get_bool(root, "touchpad_h_invert",
                                                 cfg->touchpad_h_invert);
+    cfg->auto_repack_on_save = jce_json_get_bool(root, "auto_repack_on_save",
+                                                 cfg->auto_repack_on_save);
+    cfg->run_dev_mode = jce_json_get_bool(root, "run_dev_mode",
+                                          cfg->run_dev_mode);
     cfg->panels_visible_mask = (uint32_t)jce_json_get_int(
         root, "panels_visible_mask", (int)cfg->panels_visible_mask);
     cfg->panels_visible_mask_hi = (uint32_t)jce_json_get_int(
         root, "panels_visible_mask_hi", (int)cfg->panels_visible_mask_hi);
+    cjson_read_str(root, "workspace_id",
+                   cfg->workspace_id, sizeof(cfg->workspace_id));
     jce_editor_pref_invert_scroll_zoom = cfg->invert_scroll_zoom;
     jce_editor_pref_invert_drag_y      = cfg->invert_drag_y;
     jce_editor_pref_touchpad_h_invert  = cfg->touchpad_h_invert;
@@ -281,8 +290,11 @@ bool jce_editor_config_save(const JceEditorConfig *cfg) {
     jce_json_set_bool(root, "invert_scroll_zoom", cfg->invert_scroll_zoom);
     jce_json_set_bool(root, "invert_drag_y",      cfg->invert_drag_y);
     jce_json_set_bool(root, "touchpad_h_invert",  cfg->touchpad_h_invert);
+    jce_json_set_bool(root, "auto_repack_on_save", cfg->auto_repack_on_save);
+    jce_json_set_bool(root, "run_dev_mode",        cfg->run_dev_mode);
     jce_json_set_int (root, "panels_visible_mask", (int)cfg->panels_visible_mask);
     jce_json_set_int (root, "panels_visible_mask_hi", (int)cfg->panels_visible_mask_hi);
+    jce_json_set_string(root, "workspace_id", cfg->workspace_id);
     jce_editor_pref_invert_scroll_zoom = cfg->invert_scroll_zoom;
     jce_editor_pref_invert_drag_y      = cfg->invert_drag_y;
     jce_editor_pref_touchpad_h_invert  = cfg->touchpad_h_invert;

@@ -78,6 +78,17 @@ HotkeyEntry s_table[JCE_HK_COUNT] = {
     { "panel.inspector",           "Panel / Toggle Inspector",    { ImGuiKey_F8,  JCE_HKM_NONE }, {} },
     { "panel.assets",              "Panel / Toggle Assets",       { ImGuiKey_F3,  JCE_HKM_NONE }, {} },
     { "panel.search",              "Panel / Toggle Search",       { ImGuiKey_F,   (uint8_t)(JCE_HKM_CTRL | JCE_HKM_SHIFT) }, {} },
+    { "panel.project_settings",    "Panel / Project Settings",    { ImGuiKey_P,   (uint8_t)(JCE_HKM_CTRL | JCE_HKM_SHIFT) }, {} },
+    { "edit.preferences",          "Edit / Preferences",          { ImGuiKey_Comma, JCE_HKM_CTRL }, {} },
+
+    /* Maya-style workspaces (Ctrl+F1..F7). */
+    { "workspace.default",         "Workspace / Default",         { ImGuiKey_F1, JCE_HKM_CTRL }, {} },
+    { "workspace.modeling",        "Workspace / Modeling",        { ImGuiKey_F2, JCE_HKM_CTRL }, {} },
+    { "workspace.rigging",         "Workspace / Rigging",         { ImGuiKey_F3, JCE_HKM_CTRL }, {} },
+    { "workspace.animation",       "Workspace / Animation",       { ImGuiKey_F4, JCE_HKM_CTRL }, {} },
+    { "workspace.fx",              "Workspace / FX",              { ImGuiKey_F5, JCE_HKM_CTRL }, {} },
+    { "workspace.rendering",       "Workspace / Rendering",       { ImGuiKey_F6, JCE_HKM_CTRL }, {} },
+    { "workspace.uv_editing",      "Workspace / UV Editing",      { ImGuiKey_F7, JCE_HKM_CTRL }, {} },
 };
 /* clang-format on */
 
@@ -128,6 +139,35 @@ extern "C" void jce_hotkeys_reset_all(void)
     for (int i = 0; i < JCE_HK_COUNT; ++i) {
         s_table[i].cur = s_table[i].def;
     }
+}
+
+extern "C" void jce_hotkey_reset(JceHotkeyId id)
+{
+    if (id < 0 || id >= JCE_HK_COUNT) return;
+    s_table[id].cur = s_table[id].def;
+}
+
+extern "C" int jce_hotkeys_count(void)
+{
+    return (int)JCE_HK_COUNT;
+}
+
+extern "C" bool jce_hotkey_chord_equal(JceHotkeyChord a, JceHotkeyChord b)
+{
+    if (a.key <= 0 || b.key <= 0) return false;
+    return a.key == b.key && a.mods == b.mods;
+}
+
+extern "C" JceHotkeyId jce_hotkey_find_conflict(JceHotkeyId for_id,
+                                                 JceHotkeyChord chord)
+{
+    if (chord.key <= 0) return JCE_HK_COUNT;
+    for (int i = 0; i < JCE_HK_COUNT; ++i) {
+        if (i == (int)for_id) continue;
+        if (jce_hotkey_chord_equal(s_table[i].cur, chord))
+            return (JceHotkeyId)i;
+    }
+    return JCE_HK_COUNT;
 }
 
 extern "C" const char *jce_hotkey_name(JceHotkeyId id)

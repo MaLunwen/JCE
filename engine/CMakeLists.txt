@@ -253,7 +253,7 @@ _jce_add_layer(jce_ai
 _jce_add_layer(jce_net
 	DIRS      middleware/net
 	LINK_PUBLIC  jce_core
-	LINK_PRIVATE enet::enet protobuf::protobuf
+	LINK_PRIVATE enet::enet protobuf::protobuf flecs::flecs_static
 	CXX)
 
 # Protobuf code generation (net layer owns the proto files).
@@ -311,6 +311,16 @@ _jce_add_layer(jce_renderer
 # but consumes the renderer low-level API.  Declared here (after both
 # targets exist) to keep the link order valid.
 target_link_libraries(jce_scene PRIVATE jce_renderer)
+
+# P3-C.4 follow-up: jce_scene_update reconciles JceClothComponent against
+# the cloth runtime (create/destroy handles, update wind).  Late-bound
+# because jce_physics is declared before jce_scene above.
+target_link_libraries(jce_scene PRIVATE jce_physics)
+
+# P3-C.4: jce_physics installs an observer on the Render Pipeline Asset
+# (renderer layer) to wire the cloth/soft-body HW gate.  Late-bound link
+# because jce_physics is declared before jce_renderer.
+target_link_libraries(jce_physics PRIVATE jce_renderer)
 
 # ================================================================== #
 # L3 — UI (depends on core, graphics, platform, audio, app)          #

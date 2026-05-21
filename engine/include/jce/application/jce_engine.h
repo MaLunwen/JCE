@@ -60,6 +60,18 @@ JCE_API JceAppResult JCE_CALL jce_engine_iterate(JceEngine *e);
 /* Shut down everything in reverse order. */
 JCE_API void JCE_CALL jce_engine_destroy(JceEngine *e);
 
+/* ---- FixedUpdate cadence (P3-B.2) ------------------------------ */
+
+/* Configure the JCE_PHASE_FIXED_UPDATE rate driven by the default
+ * fixed clock.  `hz` is in Hertz; the corresponding `fixed_dt` is
+ * 1/hz.  Default: 50 Hz (Unity parity).  Pass <= 0 to restore the
+ * default.  Safe to call at any time; the change takes effect on the
+ * next jce_engine_iterate. */
+JCE_API void   JCE_CALL jce_engine_set_fixed_hz(double hz);
+
+/* Current FixedUpdate cadence in Hertz (1.0 / fixed_dt). */
+JCE_API double JCE_CALL jce_engine_get_fixed_hz(void);
+
 /* ---- Optional scene-asset bundle catalog ----------------------- */
 
 /* Set the bundle catalog path *before* jce_engine_create().  When set,

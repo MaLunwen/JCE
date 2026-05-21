@@ -33,7 +33,10 @@
 
 extern "C" {
 #include <jce/middleware/audio/jce_audio_mixer.h>
+#include <jce/middleware/scene/jce_scene.h>
 }
+
+#include "core/jce_editor_state.h"
 
 #define MIXER_PATH ".jce/audio_mixer.json"
 
@@ -42,6 +45,7 @@ static bool           s_initialized      = false;
 static JceAudioBusId  s_selected_bus     = JCE_AUDIO_BUS_MASTER;
 static char           s_rename_buf[64]   = {0};
 static JceAudioBusId  s_renaming_bus     = JCE_AUDIO_BUS_INVALID;
+static int            s_pending_focus_tab = -1; /* 0=mixer, 1=reverb, -1=none */
 
 /* ── Persistence ────────────────────────────────────────────────────── */
 
@@ -241,15 +245,8 @@ static void collect_children(JceAudioBusId parent,
     }
 }
 
-extern "C" void jce_editor_panel_audio_mixer_content(void)
+static void draw_mixer_tab(void)
 {
-    ensure_mixer();
-    if (!s_mixer) {
-        ImGui::TextDisabled("%s", jce_editor_i18n("audioMixer.unavailable"));
-        return;
-    }
-
-    /* ── Toolbar ─────────────────────────────────────────────────── */
     if (ImGui::Button(jce_editor_i18n("audioMixer.addGroup"))) {
         JceAudioBusId par = (s_selected_bus != JCE_AUDIO_BUS_INVALID)
                           ? s_selected_bus : JCE_AUDIO_BUS_MASTER;
@@ -327,6 +324,132 @@ extern "C" void jce_editor_panel_audio_mixer_content(void)
     ImGui::Separator();
     ImGui::TextDisabled("%s",
         jce_editor_i18n("audioMixer.runtimeNote"));
+}
+
+/* ── Reverb Zones tab (merged from jce_panel_reverb_zones.cpp in P6-A.1).
+ * Lists every entity carrying a JceAudioReverbZoneComponent so the user
+ * can audit and tune all reverb zones in one place. */
+
+struct RZRow {
+    JceEntity                    e;
+    JceAudioReverbZoneComponent *c;
+    char                         name[64];
+};
+
+static const char *kReverbPresetNames[] = {
+    "Off","Generic","Padded Cell","Room","Bathroom","Living Room","Stone Room",
+    "Auditorium","Concert Hall","Cave","Arena","Hangar","Hallway",
+    "Stone Corridor","Alley","Forest","City","Mountains","Quarry","Plain",
+    "Parking Lot","Sewer Pipe","Underwater","-","-","-","User"
+};
+
+static void rz_collect_cb(JceScene *s, JceEntity e, void *ud)
+{
+    auto *out = (std::vector<RZRow> *)ud;
+    if (!jce_scene_has_audio_reverb_zone(s, e)) return;
+    RZRow r{};
+    r.e = e;
+    r.c = jce_scene_get_audio_reverb_zone(s, e);
+    JceEditorMeta *m = jce_scene_get_editor_meta(s, e);
+    std::snprintf(r.name, sizeof(r.name), "%s",
+                  (m && m->name[0]) ? m->name : "(unnamed)");
+    out->push_back(r);
+}
+
+static void draw_reverb_zones_tab(void)
+{
+    JceScene *scene = jce_state_get_scene();
+    if (!scene) {
+        ImGui::TextDisabled("%s", jce_editor_i18n("common.noSceneLoaded"));
+        return;
+    }
+
+    std::vector<RZRow> rows;
+    jce_scene_each_entity(scene, rz_collect_cb, &rows);
+
+    ImGui::Text("%s %zu", jce_editor_i18n("reverbZones.count"), rows.size());
+    ImGui::Separator();
+    if (rows.empty()) {
+        ImGui::TextDisabled("%s", jce_editor_i18n("reverbZones.empty"));
+        return;
+    }
+
+    if (ImGui::BeginTable("##rz_tbl", 5,
+            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
+        ImGui::TableSetupColumn("Owner",   ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Preset",  ImGuiTableColumnFlags_WidthFixed, 140);
+        ImGui::TableSetupColumn("Min",     ImGuiTableColumnFlags_WidthFixed, 90);
+        ImGui::TableSetupColumn("Max",     ImGuiTableColumnFlags_WidthFixed, 90);
+        ImGui::TableSetupColumn("",        ImGuiTableColumnFlags_WidthFixed, 60);
+        ImGui::TableHeadersRow();
+
+        for (auto &r : rows) {
+            if (!r.c) continue;
+            ImGui::PushID((int)r.e);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0); ImGui::TextUnformatted(r.name);
+
+            ImGui::TableSetColumnIndex(1);
+            ImGui::SetNextItemWidth(-1);
+            int idx = r.c->preset;
+            int n = (int)(sizeof(kReverbPresetNames) /
+                          sizeof(kReverbPresetNames[0]));
+            if (idx < 0 || idx >= n) idx = 0;
+            if (ImGui::Combo("##pre", &idx, kReverbPresetNames, n))
+                r.c->preset = idx;
+
+            ImGui::TableSetColumnIndex(2);
+            ImGui::SetNextItemWidth(-1);
+            ImGui::DragFloat("##mn", &r.c->min_distance,
+                             0.1f, 0.0f, 100000.0f, "%.1f");
+
+            ImGui::TableSetColumnIndex(3);
+            ImGui::SetNextItemWidth(-1);
+            ImGui::DragFloat("##mx", &r.c->max_distance,
+                             0.1f, 0.0f, 100000.0f, "%.1f");
+
+            ImGui::TableSetColumnIndex(4);
+            if (ImGui::SmallButton(jce_editor_i18n("common.ping")))
+                jce_state_select_entity((uint32_t)r.e, false);
+
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+}
+
+extern "C" void jce_editor_panel_audio_mixer_content(void)
+{
+    ensure_mixer();
+    if (!s_mixer) {
+        ImGui::TextDisabled("%s", jce_editor_i18n("audioMixer.unavailable"));
+        return;
+    }
+
+    if (ImGui::BeginTabBar("##audio_mixer_tabs")) {
+        ImGuiTabItemFlags mixer_flags = (s_pending_focus_tab == 0)
+            ? ImGuiTabItemFlags_SetSelected : 0;
+        ImGuiTabItemFlags reverb_flags = (s_pending_focus_tab == 1)
+            ? ImGuiTabItemFlags_SetSelected : 0;
+        s_pending_focus_tab = -1;
+        if (ImGui::BeginTabItem(jce_editor_i18n("audioMixer.tab.mixer"),
+                                nullptr, mixer_flags)) {
+            draw_mixer_tab();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem(jce_editor_i18n("audioMixer.tab.reverb"),
+                                nullptr, reverb_flags)) {
+            draw_reverb_zones_tab();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+}
+
+extern "C" void jce_editor_audio_mixer_focus_reverb_tab(void)
+{
+    s_pending_focus_tab = 1;
 }
 
 extern "C" void jce_editor_panel_audio_mixer(void)

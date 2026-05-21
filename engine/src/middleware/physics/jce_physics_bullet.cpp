@@ -295,6 +295,9 @@ void jce_bullet_destroy(JceBulletWorld *bw)
 {
     if (!bw) return;
 
+    /* Detach any debug drawer attached to this world (P3-C.5). */
+    jce_bullet_debug_world_destroyed_(bw);
+
     /* Remove and delete all live vehicles (must come before bodies). */
     if (bw->vehicles && bw->vehicle_alive) {
         for (uint32_t i = 0; i < bw->vehicle_capacity; ++i) {
@@ -408,7 +411,7 @@ uint32_t jce_bullet_body_create(JceBulletWorld *bw,
                                 jce_vec3 half_ext, float mass,
                                 float friction, float restitution,
                                 float lin_damp, float ang_damp,
-                                uint16_t col_group, uint16_t col_mask,
+                                uint32_t col_group, uint32_t col_mask,
                                 bool is_trigger)
 {
     if (!bw) return UINT32_MAX;
@@ -696,7 +699,7 @@ uint32_t jce_bullet_body_count(JceBulletWorld *bw)
 /* ================================================================== */
 
 void jce_bullet_body_set_collision_filter(JceBulletWorld *bw, uint32_t idx,
-                                          uint16_t group, uint16_t mask)
+                                          uint32_t group, uint32_t mask)
 {
     if (!bw || idx >= bw->capacity || !bw->alive[idx]) return;
 
@@ -708,6 +711,82 @@ void jce_bullet_body_set_collision_filter(JceBulletWorld *bw, uint32_t idx,
     bw->world->addRigidBody(body,
                              static_cast<int>(group),
                              static_cast<int>(mask));
+}
+
+void jce_bullet_body_set_material(JceBulletWorld *bw, uint32_t idx,
+                                  float friction, float restitution)
+{
+    if (!bw || idx >= bw->capacity || !bw->alive[idx]) return;
+    btRigidBody *body = bw->bodies[idx];
+    if (!body) return;
+    body->setFriction(static_cast<btScalar>(friction));
+    body->setRestitution(static_cast<btScalar>(restitution));
+    body->activate();
+}
+
+/* ================================================================== */
+/* Continuous Collision Detection (CCD)  (P3-C.3)                      */
+/*                                                                    */
+/* Bullet enables CCD on a body when its motion threshold is > 0; the */
+/* swept-sphere radius defines an embedded sphere used by the         */
+/* time-of-impact (TOI) solver.  Setting threshold to 0 disables CCD. */
+/* ================================================================== */
+
+float jce_bullet_body_compute_auto_swept_radius(JceBulletWorld *bw, uint32_t idx)
+{
+    if (!bw || idx >= bw->capacity || !bw->alive[idx]) return 0.0f;
+    btCollisionShape *shape = bw->shapes[idx];
+    if (!shape) return 0.0f;
+
+    btTransform t;
+    t.setIdentity();
+    btVector3 aabb_min, aabb_max;
+    shape->getAabb(t, aabb_min, aabb_max);
+    btVector3 half = (aabb_max - aabb_min) * btScalar(0.5);
+
+    btScalar min_half = half.x();
+    if (half.y() < min_half) min_half = half.y();
+    if (half.z() < min_half) min_half = half.z();
+    if (min_half <= btScalar(0)) return 0.0f;
+
+    /* Slightly smaller than the smallest half-extent so the embedded
+     * sphere stays inside the shape and TOI queries remain stable. */
+    return static_cast<float>(min_half * btScalar(0.5));
+}
+
+void jce_bullet_body_set_ccd(JceBulletWorld *bw, uint32_t idx,
+                             float motion_threshold,
+                             float swept_sphere_radius)
+{
+    if (!bw || idx >= bw->capacity || !bw->alive[idx]) return;
+    btRigidBody *body = bw->bodies[idx];
+    if (!body) return;
+
+    if (motion_threshold < 0.0f) motion_threshold = 0.0f;
+
+    if (motion_threshold > 0.0f && swept_sphere_radius <= 0.0f) {
+        swept_sphere_radius = jce_bullet_body_compute_auto_swept_radius(bw, idx);
+    }
+    if (swept_sphere_radius < 0.0f) swept_sphere_radius = 0.0f;
+
+    body->setCcdMotionThreshold(static_cast<btScalar>(motion_threshold));
+    body->setCcdSweptSphereRadius(static_cast<btScalar>(swept_sphere_radius));
+}
+
+float jce_bullet_body_get_ccd_motion_threshold(JceBulletWorld *bw, uint32_t idx)
+{
+    if (!bw || idx >= bw->capacity || !bw->alive[idx]) return 0.0f;
+    btRigidBody *body = bw->bodies[idx];
+    if (!body) return 0.0f;
+    return static_cast<float>(body->getCcdMotionThreshold());
+}
+
+float jce_bullet_body_get_ccd_swept_sphere_radius(JceBulletWorld *bw, uint32_t idx)
+{
+    if (!bw || idx >= bw->capacity || !bw->alive[idx]) return 0.0f;
+    btRigidBody *body = bw->bodies[idx];
+    if (!body) return 0.0f;
+    return static_cast<float>(body->getCcdSweptSphereRadius());
 }
 
 /* ================================================================== */
@@ -869,6 +948,137 @@ void jce_bullet_constraint_set_limits(JceBulletWorld *bw, uint32_t idx,
 }
 
 /* ================================================================== */
+/* Joint introspection (P3-C.6)                                        */
+/* ================================================================== */
+
+/* Map a btRigidBody back to its pool index via the userPointer stash
+ * set up at body_create time.  Returns UINT32_MAX when the body was
+ * never tagged (e.g. the static "fixed body" Bullet uses internally
+ * for world-anchored constraints). */
+static uint32_t body_index_from_rb(const btRigidBody *rb)
+{
+    if (!rb) return UINT32_MAX;
+    const void *up = rb->getUserPointer();
+    if (!up) return UINT32_MAX;
+    uintptr_t v = reinterpret_cast<uintptr_t>(up);
+    /* userPointer is "(idx)" — UINT32_MAX is a valid sentinel for
+     * "no real index", which collides with our return.  Bodies always
+     * fit in uint32_t so the cast below is lossless on real entries. */
+    return static_cast<uint32_t>(v);
+}
+
+bool jce_bullet_joint_get_info_for_body(JceBulletWorld *bw,
+                                        uint32_t body_idx,
+                                        JceBulletJointInfo *out)
+{
+    if (!bw || !out) return false;
+    if (body_idx >= bw->capacity || !bw->alive[body_idx]) return false;
+
+    btRigidBody *target = bw->bodies[body_idx];
+    if (!target || !bw->constraints) return false;
+
+    /* Locate the first constraint where either side is `target`. */
+    btTypedConstraint *con = nullptr;
+    for (uint32_t i = 0; i < bw->con_capacity; ++i) {
+        if (!bw->con_alive[i] || !bw->constraints[i]) continue;
+        btTypedConstraint *c = bw->constraints[i];
+        if (&c->getRigidBodyA() == target || &c->getRigidBodyB() == target) {
+            con = c;
+            break;
+        }
+    }
+    if (!con) return false;
+
+    btRigidBody &rb_a = con->getRigidBodyA();
+    btRigidBody &rb_b = con->getRigidBodyB();
+
+    memset(out, 0, sizeof(*out));
+    out->body_a = body_index_from_rb(&rb_a);
+    out->body_b = body_index_from_rb(&rb_b);
+
+    /* World-anchored constraints sometimes reference Bullet's static
+     * "fixed body" singleton on side B.  Mark it as invalid. */
+    if (&rb_b == &btTypedConstraint::getFixedBody()) {
+        out->body_b = UINT32_MAX;
+    }
+
+    switch (con->getConstraintType()) {
+    case POINT2POINT_CONSTRAINT_TYPE: {
+        auto *p2p = static_cast<btPoint2PointConstraint *>(con);
+        btVector3 wa = rb_a.getCenterOfMassTransform() * p2p->getPivotInA();
+        btVector3 wb = rb_b.getCenterOfMassTransform() * p2p->getPivotInB();
+        out->kind = 1; /* BALL */
+        out->anchor_a = from_bt_v3(wa);
+        out->anchor_b = from_bt_v3(wb);
+        out->axis = jce_v3(0.0f, 1.0f, 0.0f);
+        break;
+    }
+    case HINGE_CONSTRAINT_TYPE: {
+        auto *h = static_cast<btHingeConstraint *>(con);
+        const btTransform &fa = h->getAFrame();
+        const btTransform &fb = h->getBFrame();
+        btTransform wa_xf = rb_a.getCenterOfMassTransform() * fa;
+        btTransform wb_xf = rb_b.getCenterOfMassTransform() * fb;
+        /* Hinge axis is the Z column of the constraint frame (Bullet
+         * convention — see btHingeConstraint.cpp). */
+        btVector3 axis_world = wa_xf.getBasis().getColumn(2);
+        if (axis_world.length2() > 1e-8f) axis_world.normalize();
+        out->kind = 2; /* HINGE */
+        out->anchor_a = from_bt_v3(wa_xf.getOrigin());
+        out->anchor_b = from_bt_v3(wb_xf.getOrigin());
+        out->axis = from_bt_v3(axis_world);
+        out->limit_low  = static_cast<float>(h->getLowerLimit());
+        out->limit_high = static_cast<float>(h->getUpperLimit());
+        break;
+    }
+    case SLIDER_CONSTRAINT_TYPE: {
+        auto *s = static_cast<btSliderConstraint *>(con);
+        const btTransform &fa = s->getFrameOffsetA();
+        const btTransform &fb = s->getFrameOffsetB();
+        btTransform wa_xf = rb_a.getCenterOfMassTransform() * fa;
+        btTransform wb_xf = rb_b.getCenterOfMassTransform() * fb;
+        /* Slider axis is the X column of frame A (Bullet convention). */
+        btVector3 axis_world = wa_xf.getBasis().getColumn(0);
+        if (axis_world.length2() > 1e-8f) axis_world.normalize();
+        out->kind = 3; /* SLIDER */
+        out->anchor_a = from_bt_v3(wa_xf.getOrigin());
+        out->anchor_b = from_bt_v3(wb_xf.getOrigin());
+        out->axis = from_bt_v3(axis_world);
+        out->limit_low  = static_cast<float>(s->getLowerLinLimit());
+        out->limit_high = static_cast<float>(s->getUpperLinLimit());
+        break;
+    }
+    case D6_CONSTRAINT_TYPE: {
+        auto *d = static_cast<btGeneric6DofConstraint *>(con);
+        const btTransform &fa = d->getFrameOffsetA();
+        const btTransform &fb = d->getFrameOffsetB();
+        btTransform wa_xf = rb_a.getCenterOfMassTransform() * fa;
+        btTransform wb_xf = rb_b.getCenterOfMassTransform() * fb;
+        btVector3 axis_world = wa_xf.getBasis().getColumn(0);
+        if (axis_world.length2() > 1e-8f) axis_world.normalize();
+        out->kind = 4; /* 6DOF */
+        out->anchor_a = from_bt_v3(wa_xf.getOrigin());
+        out->anchor_b = from_bt_v3(wb_xf.getOrigin());
+        out->axis = from_bt_v3(axis_world);
+
+        btVector3 ll, lu, al, au;
+        d->getLinearLowerLimit(ll);
+        d->getLinearUpperLimit(lu);
+        d->getAngularLowerLimit(al);
+        d->getAngularUpperLimit(au);
+        out->linear_lower  = from_bt_v3(ll);
+        out->linear_upper  = from_bt_v3(lu);
+        out->angular_lower = from_bt_v3(al);
+        out->angular_upper = from_bt_v3(au);
+        break;
+    }
+    default:
+        return false;
+    }
+    return true;
+}
+
+/* ================================================================== */
 /* Character controller                                                */
 /* ================================================================== */
 
@@ -984,7 +1194,7 @@ uint32_t jce_bullet_vehicle_create(JceBulletWorld *bw,
                                     float max_engine_force,
                                     float max_brake_force,
                                     float max_steering_rad,
-                                    uint16_t col_group, uint16_t col_mask)
+                                    uint32_t col_group, uint32_t col_mask)
 {
     if (!bw) return UINT32_MAX;
 
@@ -1155,3 +1365,232 @@ float jce_bullet_vehicle_get_speed(JceBulletWorld *bw, uint32_t idx)
     /* Bullet returns km/h — convert to m/s for SI consistency. */
     return static_cast<float>(bw->vehicles[idx]->getCurrentSpeedKmHour()) * (1.0f / 3.6f);
 }
+
+/* ================================================================== */
+/* P3-C.5: trigger flag query                                          */
+/* ================================================================== */
+
+bool jce_bullet_body_is_trigger(JceBulletWorld *bw, uint32_t idx)
+{
+    if (!bw || idx >= bw->capacity || !bw->alive[idx]) return false;
+    const btRigidBody *body = bw->bodies[idx];
+    if (!body) return false;
+    return (body->getCollisionFlags() &
+            btCollisionObject::CF_NO_CONTACT_RESPONSE) != 0;
+}
+
+/* ================================================================== */
+/* P3-C.5: manifold pair enumeration                                   */
+/*                                                                     */
+/* Walks every persistent manifold once and reports the deepest active */
+/* contact point per pair.  Trigger pairs (CF_NO_CONTACT_RESPONSE) are */
+/* reported with is_trigger=true so the C layer can flag the event.    */
+/* ================================================================== */
+
+void jce_bullet_enumerate_pairs(JceBulletWorld *bw,
+                                jce_bullet_pair_fn fn, void *ud)
+{
+    if (!bw || !bw->world || !fn) return;
+
+    btDispatcher *dp = bw->world->getDispatcher();
+    int num_manifolds = dp->getNumManifolds();
+
+    for (int i = 0; i < num_manifolds; ++i) {
+        btPersistentManifold *manifold = dp->getManifoldByIndexInternal(i);
+        int num_contacts = manifold->getNumContacts();
+        if (num_contacts == 0) continue;
+
+        const btCollisionObject *obj_a = manifold->getBody0();
+        const btCollisionObject *obj_b = manifold->getBody1();
+        if (!obj_a || !obj_b) continue;
+
+        /* Pick the deepest (most negative distance) active contact. */
+        int  best   = -1;
+        float worst = 0.0f;
+        for (int c = 0; c < num_contacts; ++c) {
+            const btManifoldPoint &pt = manifold->getContactPoint(c);
+            float d = pt.getDistance();
+            if (d > 0.0f) continue;          /* separating */
+            if (best < 0 || d < worst) { best = c; worst = d; }
+        }
+        if (best < 0) continue;
+
+        const btManifoldPoint &pt = manifold->getContactPoint(best);
+        const btVector3 &n   = pt.m_normalWorldOnB;
+        const btVector3 &pos = pt.getPositionWorldOnB();
+
+        uint32_t idx_a = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
+            obj_a->getUserPointer()));
+        uint32_t idx_b = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
+            obj_b->getUserPointer()));
+
+        bool is_trigger =
+            (obj_a->getCollisionFlags() &
+             btCollisionObject::CF_NO_CONTACT_RESPONSE) ||
+            (obj_b->getCollisionFlags() &
+             btCollisionObject::CF_NO_CONTACT_RESPONSE);
+
+        float normal[3] = { n.x(), n.y(), n.z() };
+        float point[3]  = { pos.x(), pos.y(), pos.z() };
+
+        fn(idx_a, idx_b, normal, point,
+           -pt.getDistance(), is_trigger, ud);
+    }
+}
+
+/* ================================================================== */
+/* P3-C.5: btIDebugDraw bridge                                         */
+/*                                                                     */
+/* The drawer is owned by the JceBulletWorld and lazily attached the   */
+/* first time set_mode() goes non-zero.  Bullet's draw modes are bit   */
+/* flags that line up with JcePhysicsDebugFlag.                        */
+/* ================================================================== */
+
+namespace {
+
+class JceBulletDebugDrawer : public btIDebugDraw {
+public:
+    JceBulletDebugDrawer() : m_mode(0), m_fn(nullptr), m_ud(nullptr) {}
+
+    void set_sink(jce_bullet_line_fn fn, void *ud) { m_fn = fn; m_ud = ud; }
+
+    /* --- btIDebugDraw --- */
+    void drawLine(const btVector3 &from, const btVector3 &to,
+                  const btVector3 &color) override
+    {
+        if (!m_fn) return;
+        /* Bullet supplies linear RGB in [0,1]; pack as 0xAABBGGRR. */
+        auto clamp01 = [](float v) { return v < 0 ? 0.0f : (v > 1 ? 1.0f : v); };
+        uint32_t r = (uint32_t)(clamp01(color.x()) * 255.0f);
+        uint32_t g = (uint32_t)(clamp01(color.y()) * 255.0f);
+        uint32_t b = (uint32_t)(clamp01(color.z()) * 255.0f);
+        uint32_t abgr = 0xFF000000u | (b << 16) | (g << 8) | r;
+        m_fn(from.x(), from.y(), from.z(),
+             to.x(),   to.y(),   to.z(), abgr, m_ud);
+    }
+
+    void drawContactPoint(const btVector3 &point, const btVector3 &normal,
+                          btScalar distance, int /*lifetime*/,
+                          const btVector3 &color) override
+    {
+        btVector3 tip = point + normal * distance;
+        drawLine(point, tip, color);
+    }
+
+    void reportErrorWarning(const char * /*warning*/) override {}
+    void draw3dText(const btVector3 & /*location*/,
+                    const char * /*text*/) override {}
+
+    void  setDebugMode(int mode) override { m_mode = mode; }
+    int   getDebugMode() const override   { return m_mode; }
+
+private:
+    int                m_mode;
+    jce_bullet_line_fn m_fn;
+    void              *m_ud;
+};
+
+/* One drawer per world — Bullet stores a raw pointer, no ownership. */
+struct DebugDrawerSlot {
+    JceBulletWorld       *bw;
+    JceBulletDebugDrawer *drawer;
+};
+
+/* Single-world editor / game today; a 4-slot fixed table is plenty
+ * and keeps the bridge alloc-free per frame. */
+static DebugDrawerSlot s_drawers[4];
+
+static JceBulletDebugDrawer *get_or_create_drawer(JceBulletWorld *bw)
+{
+    for (auto &slot : s_drawers) {
+        if (slot.bw == bw) return slot.drawer;
+    }
+    for (auto &slot : s_drawers) {
+        if (slot.bw == nullptr) {
+            slot.bw     = bw;
+            slot.drawer = new JceBulletDebugDrawer();
+            return slot.drawer;
+        }
+    }
+    return nullptr; /* table exhausted — debug draw simply disabled */
+}
+
+static void release_drawer(JceBulletWorld *bw)
+{
+    for (auto &slot : s_drawers) {
+        if (slot.bw == bw) {
+            delete slot.drawer;
+            slot.drawer = nullptr;
+            slot.bw     = nullptr;
+            return;
+        }
+    }
+}
+
+} /* namespace */
+
+void jce_bullet_debug_set_mode(JceBulletWorld *bw, uint32_t flags)
+{
+    if (!bw || !bw->world) return;
+
+    if (flags == 0) {
+        /* Detach drawer to keep step() fast in the common case. */
+        bw->world->setDebugDrawer(nullptr);
+        release_drawer(bw);
+        return;
+    }
+
+    JceBulletDebugDrawer *drawer = get_or_create_drawer(bw);
+    if (!drawer) return;
+    drawer->setDebugMode(static_cast<int>(flags));
+    bw->world->setDebugDrawer(drawer);
+}
+
+void jce_bullet_debug_draw(JceBulletWorld *bw,
+                           jce_bullet_line_fn fn, void *ud)
+{
+    if (!bw || !bw->world || !fn) return;
+
+    /* Find the existing drawer — don't create one on the draw path. */
+    JceBulletDebugDrawer *drawer = nullptr;
+    for (auto &slot : s_drawers) {
+        if (slot.bw == bw) { drawer = slot.drawer; break; }
+    }
+    if (!drawer || drawer->getDebugMode() == 0) return;
+
+    drawer->set_sink(fn, ud);
+    bw->world->debugDrawWorld();
+    drawer->set_sink(nullptr, nullptr);
+}
+
+/* Clean up debug-drawer slot when the world is destroyed.  Tacked
+ * onto jce_bullet_destroy via this helper called from the existing
+ * destroy path. */
+extern "C" void jce_bullet_debug_world_destroyed_(JceBulletWorld *bw)
+{
+    release_drawer(bw);
+}
+
+/* ── P3-C.4: native pointer + default-world tracking ──────────────── */
+
+extern "C" void *jce_bullet_body_get_rigid_native_(JceBulletWorld *bw,
+                                                   uint32_t idx)
+{
+    if (!bw || idx >= bw->capacity || !bw->alive[idx]) return nullptr;
+    return static_cast<void *>(bw->bodies[idx]);
+}
+
+namespace {
+JceBulletWorld *g_default_bullet_world = nullptr;
+}
+
+extern "C" JceBulletWorld *jce_physics_default_bullet_world_(void)
+{
+    return g_default_bullet_world;
+}
+
+extern "C" void jce_physics_set_default_bullet_world_(JceBulletWorld *bw)
+{
+    g_default_bullet_world = bw;
+}
+

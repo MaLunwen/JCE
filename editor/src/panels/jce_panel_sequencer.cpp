@@ -617,16 +617,28 @@ void draw_content(void)
 
 } /* namespace */
 
+extern "C" void sequencer_draw_content(void)
+{
+    draw_content();
+}
+
 extern "C" void jce_editor_panel_sequencer(void)
 {
-    char _wt[96];
-    snprintf(_wt, sizeof(_wt), "%s###jce_seq", jce_editor_i18n("sequencer.title"));
-    if (!ImGui::Begin(_wt,
-                      jce_editor_panel_visible_ptr(JCE_PANEL_SEQUENCER), ImGuiWindowFlags_NoFocusOnAppearing))
-    {
-        ImGui::End();
-        return;
-    }
-    draw_content();
-    ImGui::End();
+    /* Shim: Sequencer has been merged into the Animation Editor
+     * workbench as a tab.  Activating this panel now redirects to
+     * that workbench and requests the Sequencer tab.  Symbol kept so
+     * menu/hotkey entries registered against JCE_PANEL_SEQUENCER
+     * keep working. */
+    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_SEQUENCER);
+    if (!vis || !*vis) return;
+    *vis = false;
+
+    bool *ae_vis = jce_editor_panel_visible_ptr(JCE_PANEL_ANIMATION_EDITOR);
+    if (ae_vis) *ae_vis = true;
+
+    char title[128];
+    snprintf(title, sizeof(title), "%s###jce_anim_editor",
+             jce_editor_i18n("animationEditor.title"));
+    ImGui::SetWindowFocus(title);
+    jce_panel_animation_editor_request_tab(3);
 }

@@ -609,14 +609,28 @@ void draw_content(void)
 
 } /* namespace */
 
+extern "C" void jce_editor_panel_particle_editor_content(void)
+{
+    draw_content();
+}
+
+/* Shim: Particle Editor has been merged into the Material Graph
+ * "Graph Authoring" workbench as a tab.  Activating this panel now
+ * redirects to that workbench and requests the Particles tab.  Symbol
+ * kept so menu/hotkey entries registered against JCE_PANEL_PARTICLE_EDITOR
+ * keep working. */
 extern "C" void jce_editor_panel_particle_editor(void)
 {
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_PARTICLE_EDITOR);
     if (!vis || !*vis) return;
-    char _wt[96];
-    snprintf(_wt, sizeof(_wt), "%s###jce_particle_editor", jce_editor_i18n("particleEditor.title"));
-    if (ImGui::Begin(_wt, vis, ImGuiWindowFlags_NoFocusOnAppearing)) {
-        draw_content();
-    }
-    ImGui::End();
+    *vis = false;
+
+    bool *mg_vis = jce_editor_panel_visible_ptr(JCE_PANEL_MATERIAL_GRAPH);
+    if (mg_vis) *mg_vis = true;
+
+    char title[96];
+    snprintf(title, sizeof(title), "%s###jce_material_graph",
+             jce_editor_i18n("materialGraph.title"));
+    ImGui::SetWindowFocus(title);
+    jce_panel_material_graph_request_tab(3);
 }

@@ -64,6 +64,12 @@ void jce_editor_request_font_reload(float size_pixels,
    pending reload requested via jce_editor_request_font_reload(). */
 void jce_editor_apply_pending_font_reload(void);
 
+/* Returns the pixel size most recently passed to jce_editor_load_fonts().
+   Used by the Preferences font-size slider to compute a live visual
+   scale proxy via style.FontScaleMain while dragging (avoids an atlas
+   re-bake every frame). */
+float jce_editor_get_baked_font_size(void);
+
 #ifdef __cplusplus
 }
 #endif

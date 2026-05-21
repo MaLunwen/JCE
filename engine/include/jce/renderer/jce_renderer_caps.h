@@ -29,7 +29,12 @@ JCE_EXTERN_C_BEGIN
 typedef enum {
     JCE_GPU_TIER_LOW    = 0,   /* Mobile / GLES 3.0 / old integrated  */
     JCE_GPU_TIER_MEDIUM = 1,   /* Mid-range / GLES 3.1+ / integrated  */
-    JCE_GPU_TIER_HIGH   = 2    /* Desktop discrete / modern Metal/Vk  */
+    JCE_GPU_TIER_HIGH   = 2,   /* Desktop discrete / modern Metal/Vk  */
+    JCE_GPU_TIER_ULTRA  = 3,   /* High-end discrete; reserved for     */
+                               /* future use — currently gates the    */
+                               /* same features as HIGH but is        */
+                               /* exposed for forward compatibility.  */
+    JCE_GPU_TIER_COUNT  = 4
 } JceGpuTier;
 
 /* ================================================================== */
@@ -115,6 +120,24 @@ JCE_API JceRenderRecommendation jce_renderer_get_recommendation(void);
 
 /* Return a human-readable name for the tier. */
 JCE_API const char *jce_gpu_tier_name(JceGpuTier tier);
+
+/* ================================================================== */
+/* Editor / test tier override                                         */
+/* ================================================================== */
+
+/* Force jce_renderer_get_tier() (and therefore the recommendation
+   pipeline) to return `tier` regardless of detected GPU capabilities.
+   Used by the editor status-bar "GPU tier" widget so devs can preview
+   how the engine behaves on the 512 MB / no-discrete-GPU baseline
+   without actually owning that hardware.
+
+   This is a runtime knob only — it does NOT alter the underlying
+   bgfx caps queried by jce_renderer_get_caps(); features that probe
+   raw hardware bits (e.g. compute, FP framebuffers) continue to do
+   so.  Call jce_renderer_clear_tier_override() to restore detection. */
+JCE_API void  jce_renderer_set_tier_override(JceGpuTier tier);
+JCE_API void  jce_renderer_clear_tier_override(void);
+JCE_API bool  jce_renderer_tier_is_overridden(void);
 
 /* ================================================================== */
 /* Backend enumeration                                                 */

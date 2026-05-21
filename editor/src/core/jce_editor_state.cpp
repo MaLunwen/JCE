@@ -22,6 +22,7 @@
 #include <cstring>
 
 #include <jce/os/core/jce_str.h>
+#include <jce/middleware/physics/jce_cloth.h>
 
 /* Forward-declare only the one function we need from scene_render,
    avoiding a full include that creates a cpp-level circular dependency. */
@@ -1276,6 +1277,96 @@ void jce_state_add_component(uint32_t entity_id, uint64_t comp_flag)
         jce_scene_set_configurable_joint(s.scene, e, &c);
         break;
     }
+    case JCE_COMP_FLAG_CLOTH: {
+        if (jce_scene_has_cloth(s.scene, e)) return;
+        JceClothComponent c;
+        memset(&c, 0, sizeof(c));
+        /* 1x1 m horizontal patch as a sensible default. */
+        c.corner_00 = jce_v3(0.0f, 0.0f, 0.0f);
+        c.corner_10 = jce_v3(1.0f, 0.0f, 0.0f);
+        c.corner_01 = jce_v3(0.0f, 0.0f, 1.0f);
+        c.corner_11 = jce_v3(1.0f, 0.0f, 1.0f);
+        c.res_u = 8;
+        c.res_v = 8;
+        c.mass_total = 1.0f;
+        c.stiffness_linear  = 0.5f;
+        c.stiffness_angular = 0.5f;
+        c.damping    = 0.02f;
+        c.iterations = 4;
+        c.self_collision = false;
+        c.wind_enabled   = false;
+        c.wind_velocity  = jce_v3(0.0f, 0.0f, 0.0f);
+        c.pinned_count   = 0;
+        c.handle = 0;
+        c.dirty  = true;
+        jce_scene_set_cloth(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_NET_TRANSFORM: {
+        if (jce_scene_has_net_transform(s.scene, e)) return;
+        JceNetTransformComponent c; memset(&c, 0, sizeof c);
+        c.sync_rate_hz   = 20;
+        c.interp_ms      = 100;
+        c.tolerance      = 0.5f;
+        c.authority_mode = 0;
+        jce_scene_set_net_transform(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_NET_ANIMATOR: {
+        if (jce_scene_has_net_animator(s.scene, e)) return;
+        JceNetAnimatorComponent c; memset(&c, 0, sizeof c);
+        c.sync_rate_hz   = 20;
+        c.interp_ms      = 100;
+        c.authority_mode = 0;
+        jce_scene_set_net_animator(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_NET_RIGIDBODY: {
+        if (jce_scene_has_net_rigidbody(s.scene, e)) return;
+        JceNetRigidbodyComponent c; memset(&c, 0, sizeof c);
+        c.sync_rate_hz   = 20;
+        c.interp_ms      = 100;
+        c.tolerance      = 0.5f;
+        c.authority_mode = 0;
+        jce_scene_set_net_rigidbody(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_VFX_GRAPH: {
+        if (jce_scene_has_vfx_graph(s.scene, e)) return;
+        JceVfxGraphComponent c; memset(&c, 0, sizeof c);
+        c.play_on_awake   = true;
+        c.loop            = true;
+        c.rate_multiplier = 1.0f;
+        c.intensity       = 1.0f;
+        jce_scene_set_vfx_graph(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_TILEMAP: {
+        if (jce_scene_has_tilemap(s.scene, e)) return;
+        JceTilemapComponent c; memset(&c, 0, sizeof c);
+        c.cell_size_px = 16;
+        c.sort_order   = 0;
+        c.orientation  = 0;
+        c.visible      = true;
+        c.color[0] = c.color[1] = c.color[2] = c.color[3] = 1.0f;
+        jce_scene_set_tilemap(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_TILEMAP_COLLIDER_2D: {
+        if (jce_scene_has_tilemap_collider2d(s.scene, e)) return;
+        JceTilemapCollider2DComponent c; memset(&c, 0, sizeof c);
+        c.friction_x100   = 40;
+        c.bounciness_x100 = 0;
+        jce_scene_set_tilemap_collider2d(s.scene, e, &c);
+        break;
+    }
+    case JCE_COMP_FLAG_AVATAR: {
+        if (jce_scene_has_avatar(s.scene, e)) return;
+        JceAvatarComponent c; memset(&c, 0, sizeof c);
+        c.human_rig = true;
+        jce_scene_set_avatar(s.scene, e, &c);
+        break;
+    }
     case JCE_COMP_FLAG_JOINT_2D: {
         if (jce_scene_has_joint2d(s.scene, e)) return;
         JceJoint2DComponent c;
@@ -1449,6 +1540,24 @@ void jce_state_remove_component(uint32_t entity_id, uint64_t comp_flag)
     case JCE_COMP_FLAG_UI_IMAGE:             jce_scene_remove_ui_image(s.scene, e); break;
     case JCE_COMP_FLAG_UI_TEXT:              jce_scene_remove_ui_text(s.scene, e); break;
     case JCE_COMP_FLAG_UI_BUTTON:            jce_scene_remove_ui_button(s.scene, e); break;
+    case JCE_COMP_FLAG_CLOTH: {
+        /* Destroy the runtime cloth handle (if any) before dropping
+         * the component so the cloth runtime doesn't leak. */
+        JceClothComponent *cc = jce_scene_get_cloth(s.scene, e);
+        if (cc && cc->handle != 0) {
+            jce_cloth_destroy((JceClothHandle)cc->handle);
+            cc->handle = 0;
+        }
+        jce_scene_remove_cloth(s.scene, e);
+        break;
+    }
+    case JCE_COMP_FLAG_NET_TRANSFORM:        jce_scene_remove_net_transform(s.scene, e); break;
+    case JCE_COMP_FLAG_NET_ANIMATOR:         jce_scene_remove_net_animator(s.scene, e); break;
+    case JCE_COMP_FLAG_NET_RIGIDBODY:        jce_scene_remove_net_rigidbody(s.scene, e); break;
+    case JCE_COMP_FLAG_VFX_GRAPH:            jce_scene_remove_vfx_graph(s.scene, e); break;
+    case JCE_COMP_FLAG_TILEMAP:              jce_scene_remove_tilemap(s.scene, e); break;
+    case JCE_COMP_FLAG_TILEMAP_COLLIDER_2D:  jce_scene_remove_tilemap_collider2d(s.scene, e); break;
+    case JCE_COMP_FLAG_AVATAR:               jce_scene_remove_avatar(s.scene, e); break;
     default: return;
     }
 
@@ -1510,6 +1619,16 @@ const char *jce_comp_flag_display_name(uint64_t comp_flag)
     case JCE_COMP_FLAG_UI_IMAGE:             return "UI Image";
     case JCE_COMP_FLAG_UI_TEXT:              return "UI Text";
     case JCE_COMP_FLAG_UI_BUTTON:            return "UI Button";
+    case JCE_COMP_FLAG_CLOTH:                return "Cloth";
+    case JCE_COMP_FLAG_NET_TRANSFORM:        return "Network Transform";
+    case JCE_COMP_FLAG_NET_ANIMATOR:         return "Network Animator";
+    case JCE_COMP_FLAG_NET_RIGIDBODY:        return "Network Rigidbody";
+    case JCE_COMP_FLAG_VFX_GRAPH:            return "VFX Graph";
+    case JCE_COMP_FLAG_TILEMAP:              return "Tilemap";
+    case JCE_COMP_FLAG_TILEMAP_COLLIDER_2D:  return "Tilemap Collider 2D";
+    case JCE_COMP_FLAG_AVATAR:               return "Avatar";
+    case JCE_COMP_FLAG_VOLUME:               return "Volume";
+    case JCE_COMP_FLAG_OCCLUSION_PORTAL:     return "Occlusion Portal";
     default:                                 return "Unknown";
     }
 }
@@ -1568,6 +1687,16 @@ const char *jce_comp_flag_i18n_key(uint64_t comp_flag)
     case JCE_COMP_FLAG_UI_IMAGE:             return "comp.uiImage";
     case JCE_COMP_FLAG_UI_TEXT:              return "comp.uiText";
     case JCE_COMP_FLAG_UI_BUTTON:            return "comp.uiButton";
+    case JCE_COMP_FLAG_CLOTH:                return "comp.cloth";
+    case JCE_COMP_FLAG_NET_TRANSFORM:        return "comp.netTransform";
+    case JCE_COMP_FLAG_NET_ANIMATOR:         return "comp.netAnimator";
+    case JCE_COMP_FLAG_NET_RIGIDBODY:        return "comp.netRigidbody";
+    case JCE_COMP_FLAG_VFX_GRAPH:            return "comp.vfxGraph";
+    case JCE_COMP_FLAG_TILEMAP:              return "comp.tilemap";
+    case JCE_COMP_FLAG_TILEMAP_COLLIDER_2D:  return "comp.tilemapCollider2d";
+    case JCE_COMP_FLAG_AVATAR:               return "comp.avatar";
+    case JCE_COMP_FLAG_VOLUME:               return "comp.volume";
+    case JCE_COMP_FLAG_OCCLUSION_PORTAL:     return "comp.occlusionPortal";
     default:                                 return NULL;
     }
 }
@@ -1605,6 +1734,14 @@ void  jce_state_set_show_grid(bool show)     { s.show_grid = show; persist_rende
 static bool s_show_physics_debug = false;
 bool  jce_state_get_show_physics_debug(void)  { return s_show_physics_debug; }
 void  jce_state_set_show_physics_debug(bool v){ s_show_physics_debug = v; }
+
+static bool s_show_joint_gizmos = true;
+bool  jce_state_get_show_joint_gizmos(void)   { return s_show_joint_gizmos; }
+void  jce_state_set_show_joint_gizmos(bool v) { s_show_joint_gizmos = v; }
+
+static bool s_show_cloth_gizmos = true;
+bool  jce_state_get_show_cloth_gizmos(void)   { return s_show_cloth_gizmos; }
+void  jce_state_set_show_cloth_gizmos(bool v) { s_show_cloth_gizmos = v; }
 
 /* Show flags bitmask. Defaults: gizmos + light icons + camera icons +
  * skybox + world axis on; rest off. */

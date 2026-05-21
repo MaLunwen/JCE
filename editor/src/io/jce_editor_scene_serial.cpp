@@ -11,6 +11,9 @@
 #include "jce_editor_file_util.h"
 #include "core/jce_editor_state_internal.h"
 #include "core/jce_editor_config.h"
+#include "core/jce_build_manager.h"
+#include "core/jce_editor_toast.h"
+#include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
 
 extern "C" {
@@ -427,17 +430,30 @@ bool jce_state_save_scene_file(const char *scene_path)
 
     /* Persist as the most-recently used scene so the next editor launch
      * can re-open it automatically. */
-    {
-        JceEditorConfig _ecfg;
-        if (jce_editor_config_load(&_ecfg)) {
-            snprintf(_ecfg.last_scene_path, sizeof(_ecfg.last_scene_path),
-                     "%s", scene_path);
-            jce_editor_config_add_recent_scene(&_ecfg, scene_path);
-            jce_editor_config_save(&_ecfg);
-        }
+    JceEditorConfig _ecfg;
+    bool _ecfg_loaded = jce_editor_config_load(&_ecfg);
+    if (_ecfg_loaded) {
+        snprintf(_ecfg.last_scene_path, sizeof(_ecfg.last_scene_path),
+                 "%s", scene_path);
+        jce_editor_config_add_recent_scene(&_ecfg, scene_path);
+        jce_editor_config_save(&_ecfg);
     }
     LOG_INFO(LOG_TAG, "scene saved to %s (%d entities)",
              scene_path, (int)g_entity_order.size());
+
+    /* Auto-rebuild the game PAK so external ck.exe picks up the change
+     * without a manual `cmake --build … --target PackGameAssets`.
+     * Gated behind a Preferences toggle (default off) since the compile
+     * can be slow on low-end machines.  CMake's mtime tracking makes the
+     * cost near-zero when no inputs actually changed. */
+    if (_ecfg_loaded && _ecfg.auto_repack_on_save &&
+        _ecfg.build_preset[0] != '\0') {
+        if (jce_build_manager_repack_game_assets(_ecfg.build_preset)) {
+            jce_toast_info("%s", jce_editor_i18n("save.autoRepack.started"));
+        } else {
+            jce_toast_warn("%s", jce_editor_i18n("save.autoRepack.skipped"));
+        }
+    }
     return true;
 }
 

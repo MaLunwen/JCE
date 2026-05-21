@@ -10,9 +10,12 @@
 
 #include "io/jce_editor_file_util.h"
 #include "core/jce_editor_state.h"
+#include "ui/jce_editor_panels.h"
 #include "viewers/jce_fv_common.h"
 
 #include <jce/tools/jce_imgui_internal.h>
+#include <cctype>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -247,6 +250,26 @@ void jce_file_viewer_open(const char *path)
     std::string normalized = normalize_path_string(path);
     const char *open_path = normalized.empty() ? path : normalized.c_str();
 
+    /* .matgraph.json belongs to the Material Graph panel, not a
+     * generic preview tab. */
+    {
+        const size_t pn = std::strlen(open_path);
+        const char  *suf = ".matgraph.json";
+        const size_t sn = std::strlen(suf);
+        if (pn >= sn) {
+            bool match = true;
+            for (size_t i = 0; i < sn; ++i) {
+                const char a = (char)tolower((unsigned char)open_path[pn - sn + i]);
+                const char b = (char)tolower((unsigned char)suf[i]);
+                if (a != b) { match = false; break; }
+            }
+            if (match) {
+                jce_editor_open_material_graph(open_path);
+                return;
+            }
+        }
+    }
+
     /* Already open -> switch to its tab. */
     for (int i = 0; i < s_fv.tab_count; i++) {
         std::string tab_norm = normalize_path_string(s_fv.tabs[i].path);
@@ -360,6 +383,14 @@ void jce_file_viewer_open(const char *path)
         size_t pl = lower_path.size();
         if (pl >= 9 && lower_path.substr(pl - 9) == ".mat.json")
             ftype = JCE_FV_MATERIAL;
+
+        /* .physmat.json compound extension → PHYSMAT viewer. */
+        if (pl >= 13 && lower_path.substr(pl - 13) == ".physmat.json")
+            ftype = JCE_FV_PHYSMAT;
+
+        /* .rp.json compound extension → RENDER_PIPELINE viewer. */
+        if (pl >= 8 && lower_path.substr(pl - 8) == ".rp.json")
+            ftype = JCE_FV_RENDER_PIPELINE;
 
         const char *sp = strstr(lower_path.c_str(), ".scene");
         if (sp && (strcmp(sp, ".scene") == 0 || strcmp(sp, ".scene.json") == 0))
@@ -633,6 +664,8 @@ void jce_file_viewer_draw_content(void)
                 case JCE_FV_MODEL:    fv_render_model(tab);    break;
                 case JCE_FV_SCENE:    fv_render_scene(tab);    break;
                 case JCE_FV_MATERIAL: fv_render_material(tab); break;
+                case JCE_FV_PHYSMAT:  fv_render_physmat(tab);  break;
+                case JCE_FV_RENDER_PIPELINE: fv_render_render_pipeline(tab); break;
                 case JCE_FV_AUDIO:
                     active_audio_path = tab->path;
                     fv_render_audio(tab);

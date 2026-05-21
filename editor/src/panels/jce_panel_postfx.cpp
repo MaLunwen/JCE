@@ -226,12 +226,21 @@ void jce_editor_panel_postfx_tick(void)
 
 void jce_editor_panel_postfx(void)
 {
+    /* Shim: Post-FX has been merged into the Lighting Settings
+     * "Rendering" workbench as a tab.  Activating this panel now
+     * redirects to that workbench and requests the Post-FX tab.
+     * Symbol kept so menu/hotkey entries registered against
+     * JCE_PANEL_POSTFX keep working. */
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_POSTFX);
-    if (!*vis) return;
+    if (!vis || !*vis) return;
+    *vis = false;
 
-    char title[256];
-    snprintf(title, sizeof(title), "%s###postfx", jce_editor_i18n("postfx.title"));
-    if (ImGui::Begin(title, vis, ImGuiWindowFlags_NoFocusOnAppearing))
-        jce_editor_panel_postfx_content();
-    ImGui::End();
+    bool *ls_vis = jce_editor_panel_visible_ptr(JCE_PANEL_LIGHTING_SETTINGS);
+    if (ls_vis) *ls_vis = true;
+
+    char title[128];
+    snprintf(title, sizeof(title), "%s###lighting_settings",
+             jce_editor_i18n("panel.lighting.title"));
+    ImGui::SetWindowFocus(title);
+    jce_panel_lighting_settings_request_tab(1);
 }

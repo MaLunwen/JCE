@@ -71,6 +71,20 @@ typedef enum {
     JCE_HK_PANEL_INSPECTOR,
     JCE_HK_PANEL_ASSETS,
     JCE_HK_PANEL_SEARCH,
+    JCE_HK_PANEL_PROJECT_SETTINGS,
+    JCE_HK_EDIT_PREFERENCES,
+
+    /* Maya-style Workspace switching (Ctrl+F1..Ctrl+F7). The eighth
+       workspace (Sculpting) is intentionally unbound by default so the
+       seven slots cover the most common authoring modes. Users can
+       rebind any of these via Preferences > Hotkeys. */
+    JCE_HK_WORKSPACE_1,
+    JCE_HK_WORKSPACE_2,
+    JCE_HK_WORKSPACE_3,
+    JCE_HK_WORKSPACE_4,
+    JCE_HK_WORKSPACE_5,
+    JCE_HK_WORKSPACE_6,
+    JCE_HK_WORKSPACE_7,
 
     JCE_HK_COUNT
 } JceHotkeyId;
@@ -95,6 +109,10 @@ void                jce_hotkeys_shutdown(void);
 bool                jce_hotkeys_load(void);
 bool                jce_hotkeys_save(void);
 void                jce_hotkeys_reset_all(void);
+void                jce_hotkey_reset(JceHotkeyId id);
+
+/* Enumeration helper for the Preferences > Hotkeys editor. */
+int                 jce_hotkeys_count(void);                  /* == JCE_HK_COUNT */
 
 /* Query / mutation. */
 const char         *jce_hotkey_name(JceHotkeyId id);          /* "File / Save" */
@@ -102,6 +120,14 @@ const char         *jce_hotkey_id_string(JceHotkeyId id);     /* "file.save"   *
 JceHotkeyChord      jce_hotkey_get(JceHotkeyId id);
 JceHotkeyChord      jce_hotkey_get_default(JceHotkeyId id);
 void                jce_hotkey_set(JceHotkeyId id, JceHotkeyChord chord);
+
+/* Chord comparison; treats (key<=0) chords as "unbound" and never equal. */
+bool                jce_hotkey_chord_equal(JceHotkeyChord a, JceHotkeyChord b);
+
+/* Returns the first other action sharing `chord`, or JCE_HK_COUNT if none.
+ * `for_id` is excluded from the search (pass JCE_HK_COUNT to search all). */
+JceHotkeyId         jce_hotkey_find_conflict(JceHotkeyId for_id,
+                                              JceHotkeyChord chord);
 
 /* Per-frame query (ImGui-context required). True only on the first frame
  * the chord is satisfied (rising edge), regardless of whether ImGui has

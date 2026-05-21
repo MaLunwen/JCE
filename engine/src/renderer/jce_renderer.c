@@ -1346,6 +1346,46 @@ JceShaderHandle jce_renderer_get_program_pbr(const JceRenderer *r)
     return (JceShaderHandle){ r->program_pbr.idx };
 }
 
+JceShaderHandle jce_renderer_create_program_from_blobs(
+    const void *vs_blob, size_t vs_size,
+    const void *fs_blob, size_t fs_size)
+{
+    JceShaderHandle invalid = JCE_INVALID_SHADER;
+    if (!vs_blob || vs_size == 0 || !fs_blob || fs_size == 0)
+        return invalid;
+
+    /* bgfx_copy: bgfx allocates internal memory and copies the bytes,
+       so the caller's buffers may be freed immediately after this. */
+    const bgfx_memory_t *vs_mem = bgfx_copy(vs_blob, (uint32_t)vs_size);
+    const bgfx_memory_t *fs_mem = bgfx_copy(fs_blob, (uint32_t)fs_size);
+    if (!vs_mem || !fs_mem) return invalid;
+
+    bgfx_shader_handle_t vs = bgfx_create_shader(vs_mem);
+    bgfx_shader_handle_t fs = bgfx_create_shader(fs_mem);
+    if (vs.idx == UINT16_MAX || fs.idx == UINT16_MAX) {
+        if (vs.idx != UINT16_MAX) bgfx_destroy_shader(vs);
+        if (fs.idx != UINT16_MAX) bgfx_destroy_shader(fs);
+        return invalid;
+    }
+
+    /* destroy_shaders=true: bgfx ref-counts the shaders to the program,
+       and destroys them when the program is destroyed.  We never need
+       to touch the vs/fs handles after this point. */
+    bgfx_program_handle_t prog = bgfx_create_program(vs, fs, true);
+    if (prog.idx == UINT16_MAX) {
+        bgfx_destroy_shader(vs);
+        bgfx_destroy_shader(fs);
+        return invalid;
+    }
+    return (JceShaderHandle){ prog.idx };
+}
+
+void jce_renderer_destroy_program(JceShaderHandle prog)
+{
+    if (prog.idx == UINT16_MAX) return;
+    bgfx_destroy_program((bgfx_program_handle_t){ prog.idx });
+}
+
 JceShaderHandle jce_renderer_get_program_pbr_inst(const JceRenderer *r)
 {
     JceShaderHandle invalid = JCE_INVALID_SHADER;
@@ -1436,6 +1476,21 @@ const char *jce_renderer_get_backend_name(const JceRenderer *r)
 {
     (void)r;
     return bgfx_get_renderer_name(bgfx_get_renderer_type());
+}
+
+JceRendererBackend jce_renderer_get_backend(const JceRenderer *r)
+{
+    (void)r;
+    switch (bgfx_get_renderer_type()) {
+    case BGFX_RENDERER_TYPE_DIRECT3D11: return JCE_BACKEND_D3D11;
+    case BGFX_RENDERER_TYPE_DIRECT3D12: return JCE_BACKEND_D3D12;
+    case BGFX_RENDERER_TYPE_VULKAN:     return JCE_BACKEND_VULKAN;
+    case BGFX_RENDERER_TYPE_METAL:      return JCE_BACKEND_METAL;
+    case BGFX_RENDERER_TYPE_OPENGL:     return JCE_BACKEND_OPENGL;
+    case BGFX_RENDERER_TYPE_OPENGLES:   return JCE_BACKEND_OPENGLES;
+    case BGFX_RENDERER_TYPE_NOOP:       return JCE_BACKEND_NOOP;
+    default:                            return JCE_BACKEND_AUTO;
+    }
 }
 
 const char *jce_renderer_get_gpu_name(const JceRenderer *r)

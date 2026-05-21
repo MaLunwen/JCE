@@ -17,6 +17,9 @@ extern "C" {
 #include <jce/resource/jce_asset_format.h>
 #include <jce/resource/jce_scene_contract.h>
 #include <jce/resource/jce_scene_serial.h>
+#include <jce/resource/jce_bundle_format.h>
+#include <jce/resource/jce_bundle_loader.h>
+#include <jce/resource/jce_bundle_deps.h>
 
 
 

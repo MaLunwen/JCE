@@ -20,6 +20,27 @@
 
 extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/middleware/physics/jce_physics_debug.h>
+#include <jce/renderer/jce_debug_draw.h>
+}
+
+/* P3-C.5 — adapter: physics' line-sink signature matches jce_debug_draw
+ * exactly except for the trailing void *ud, so a thin trampoline is all
+ * we need to plug them together. */
+static void debug_line_to_renderer(jce_vec3 from, jce_vec3 to,
+                                   uint32_t abgr, void * /*ud*/)
+{
+    jce_debug_draw_line(from, to, abgr);
+}
+
+/* Install the line sink once on first panel paint — keeps the wiring
+ * lazy so headless / non-editor consumers never pay for it. */
+static void ensure_line_sink_installed(void)
+{
+    static bool installed = false;
+    if (installed) return;
+    jce_physics_debug_set_line_sink(debug_line_to_renderer, nullptr);
+    installed = true;
 }
 
 static void draw_matrix(const char *id, uint32_t matrix[JCE_PS_LAYER_COUNT],
@@ -59,6 +80,8 @@ static void draw_matrix(const char *id, uint32_t matrix[JCE_PS_LAYER_COUNT],
 
 extern "C" void jce_editor_panel_physics_debugger_content(void)
 {
+    ensure_line_sink_installed();
+
     JceProjectSettings *ps = (JceProjectSettings *)jce_project_settings_current();
     if (!ps) {
         ImGui::TextDisabled("%s", jce_editor_i18n("physicsDebugger.noProjectSettings"));
@@ -67,6 +90,39 @@ extern "C" void jce_editor_panel_physics_debugger_content(void)
 
     ImGui::TextWrapped("%s", jce_editor_i18n("physicsDebugger.toggleHint"));
     ImGui::Spacing();
+
+    /* ── Debug draw flags (P3-C.5) ─────────────────────────────────── */
+    if (ImGui::CollapsingHeader(jce_editor_i18n("physicsDebugger.debugDraw"),
+                                ImGuiTreeNodeFlags_DefaultOpen)) {
+        uint32_t flags = jce_physics_debug_get_flags();
+        uint32_t before = flags;
+
+        struct Toggle { const char *key; uint32_t bit; };
+        const Toggle toggles[] = {
+            { "physicsDebugger.flags.wireframe",   JCE_PHYS_DBG_WIREFRAME   },
+            { "physicsDebugger.flags.aabb",        JCE_PHYS_DBG_AABB        },
+            { "physicsDebugger.flags.contacts",    JCE_PHYS_DBG_CONTACTS    },
+            { "physicsDebugger.flags.constraints", JCE_PHYS_DBG_CONSTRAINTS },
+            { "physicsDebugger.flags.normals",     JCE_PHYS_DBG_NORMALS     },
+        };
+        for (const auto &t : toggles) {
+            bool on = (flags & t.bit) != 0;
+            if (ImGui::Checkbox(jce_editor_i18n(t.key), &on)) {
+                if (on) flags |= t.bit; else flags &= ~t.bit;
+            }
+        }
+        if (flags != before) jce_physics_debug_set_flags(flags);
+
+        ImGui::Separator();
+        bool show_joints = jce_state_get_show_joint_gizmos();
+        if (ImGui::Checkbox(jce_editor_i18n("physicsDebugger.flags.jointGizmos"),
+                            &show_joints))
+            jce_state_set_show_joint_gizmos(show_joints);
+        bool show_cloth = jce_state_get_show_cloth_gizmos();
+        if (ImGui::Checkbox(jce_editor_i18n("physicsDebugger.flags.clothGizmos"),
+                            &show_cloth))
+            jce_state_set_show_cloth_gizmos(show_cloth);
+    }
 
     bool dirty = false;
     if (ImGui::CollapsingHeader(jce_editor_i18n("physicsDebugger.matrix3D"), ImGuiTreeNodeFlags_DefaultOpen)) {

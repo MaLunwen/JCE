@@ -17,10 +17,12 @@ extern "C" {
 #include <jce/os/core/jce_defs.h>
 #include <jce/os/core/jce_event.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_fixed_clock.h>
 #include <jce/os/core/jce_handle.h>
 #include <jce/os/core/jce_i18n.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
+#include <jce/os/core/jce_mem_profile.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/os/core/jce_sysinfo.h>
 #include <jce/os/core/jce_thread.h>

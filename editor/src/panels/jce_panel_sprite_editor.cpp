@@ -277,16 +277,3 @@ extern "C" void jce_editor_panel_sprite_editor_content(void)
     draw_canvas();
     ImGui::EndChild();
 }
-
-extern "C" void jce_editor_panel_sprite_editor(void)
-{
-    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_SPRITE_EDITOR);
-    if (!vis || !*vis) return;
-    char wt[96];
-    std::snprintf(wt, sizeof(wt), "%s###jce_sprite_editor",
-                  jce_editor_i18n("spriteEditor.title"));
-    if (ImGui::Begin(wt, vis, ImGuiWindowFlags_NoFocusOnAppearing)) {
-        jce_editor_panel_sprite_editor_content();
-    }
-    ImGui::End();
-}

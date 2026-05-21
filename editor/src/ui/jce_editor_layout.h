@@ -36,6 +36,20 @@ bool jce_editor_layout_is_quit_confirmed(void);
    the running executable.  Returns true on success. */
 bool jce_editor_reload_shaders(void);
 
+/* Apply a sensible centered-and-large default size+position to a panel window
+   the very first time it is encountered (no effect once the user moves it,
+   no effect if the panel is already docked). Call BEFORE the panel's
+   ImGui::Begin(name, ...). Uses ImGuiCond_FirstUseEver so user drags,
+   docking, and persisted imgui.ini state are always preserved. */
+void jce_editor_panel_default_pose(const char *imgui_window_name);
+
+/* Request a specific layout preset (0..9) be applied on the next frame.
+   Mirrors the Window > Layout Presets menu entries and is the seam used
+   by the Maya-style Workspace switcher (jce_workspace_set_active). Safe
+   to call from any UI code path; the actual rebuild happens inside
+   jce_editor_layout_draw(). preset_idx is clamped to [0,9]. */
+void jce_editor_layout_request_preset(int preset_idx);
+
 #ifdef __cplusplus
 }
 #endif

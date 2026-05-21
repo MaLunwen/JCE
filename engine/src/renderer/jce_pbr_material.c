@@ -107,7 +107,16 @@ JcePbrMaterial jce_pbr_material_default(void)
     mat.alpha_mode              = JCE_ALPHA_OPAQUE;
     mat.alpha_cutoff            = 0.5f;
     mat.double_sided            = false;
+    mat.custom_program          = UINT16_MAX;
     return mat;
+}
+
+uint16_t jce_pbr_material_effective_program(const JcePbrMaterial *mat,
+                                             uint16_t default_program)
+{
+    if (mat && mat->custom_program != UINT16_MAX)
+        return mat->custom_program;
+    return default_program;
 }
 
 void jce_pbr_material_bind(const JcePbrMaterial *mat,

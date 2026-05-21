@@ -16,6 +16,8 @@
 
 extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/renderer/jce_reflection_probe_bake.h>
+#include <jce/os/core/jce_math.h>
 }
 
 struct RP_Row { JceEntity e; char name[64]; };
@@ -30,6 +32,59 @@ static void rp_collect_cb(JceScene *s, JceEntity e, void *ud)
     rows->push_back(r);
 }
 
+/* Submit a bake for one probe; engine rejects further submits while one
+ * is in flight, so the panel-level "Bake All" walks them sequentially
+ * across frames. We push onto a static queue; the next-frame visit
+ * dispatches one bake whenever the previous has reached a terminal
+ * state. v1 model: one-at-a-time, matches the engine's single-slot
+ * worker. */
+static std::vector<JceEntity> &rp_bake_queue(void)
+{
+    static std::vector<JceEntity> q;
+    return q;
+}
+static JceReflectionProbeBakeHandle &rp_active_handle(void)
+{
+    static JceReflectionProbeBakeHandle h = 0u;
+    return h;
+}
+
+static void rp_kick_next(JceScene *scene)
+{
+    auto &q = rp_bake_queue();
+    if (q.empty()) return;
+    auto &h = rp_active_handle();
+    if (h != 0u) {
+        JceReflectionProbeBakeProgress p{};
+        bool live = jce_reflection_probe_bake_poll(h, &p);
+        if (live && p.status != JCE_BAKE_STATUS_DONE &&
+                    p.status != JCE_BAKE_STATUS_FAILED &&
+                    p.status != JCE_BAKE_STATUS_CANCELLED) {
+            return;
+        }
+        h = 0u;
+    }
+    JceEntity e = q.back(); q.pop_back();
+    JceReflectionProbeComponent *p = jce_scene_get_reflection_probe(scene, e);
+    if (!p) return;
+    char out[256];
+    snprintf(out, sizeof(out),
+             "ReflectionProbes/probe_%u.ktx", (unsigned)e);
+    JceReflectionProbeBakeDesc desc{};
+    desc.position                = jce_v3(p->box_offset[0],
+                                          p->box_offset[1],
+                                          p->box_offset[2]);
+    desc.cubemap_size            = (uint32_t)(p->resolution > 0 ? p->resolution : 256);
+    if (desc.cubemap_size > 512u) desc.cubemap_size = 512u;
+    desc.specular_mip_count      = 5u;
+    desc.output_path_ktx2        = out;
+    desc.include_skybox          = true;
+    desc.include_dynamic_objects = true;
+    h = jce_reflection_probe_bake_submit(&desc);
+    if (h != 0u) snprintf(p->baked_cubemap_path,
+                          sizeof p->baked_cubemap_path, "%s", out);
+}
+
 extern "C" void jce_editor_panel_reflection_probes_content(void)
 {
     JceScene *scene = jce_state_get_scene();
@@ -41,12 +96,13 @@ extern "C" void jce_editor_panel_reflection_probes_content(void)
     ImGui::Text("%s %zu", jce_editor_i18n("reflectionProbes.probesCount"), rows.size());
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("reflectionProbes.bakeAll"))) {
-        for (auto &r : rows) {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "[ReflectionProbes] bake requested for '%s'", r.name);
-            jce_editor_console_log_level(JCE_CONSOLE_INFO, buf);
-        }
+        auto &q = rp_bake_queue();
+        q.clear();
+        for (auto it = rows.rbegin(); it != rows.rend(); ++it) q.push_back(it->e);
+        jce_editor_console_log_level(JCE_CONSOLE_INFO,
+            "[ReflectionProbes] bake-all queued");
     }
+    rp_kick_next(scene);
     ImGui::Separator();
 
     if (rows.empty()) {
@@ -98,12 +154,32 @@ extern "C" void jce_editor_panel_reflection_probes_content(void)
             if (ImGui::SmallButton(jce_editor_i18n("common.ping"))) jce_state_select_entity((uint32_t)r.e, false);
             ImGui::SameLine();
             if (ImGui::SmallButton(jce_editor_i18n("reflectionProbes.bake"))) {
-                char buf[128];
-                snprintf(buf, sizeof(buf), "[ReflectionProbes] bake requested for '%s'", r.name);
-                jce_editor_console_log_level(JCE_CONSOLE_INFO, buf);
+                rp_bake_queue().clear();
+                rp_bake_queue().push_back(r.e);
             }
             ImGui::PopID();
         }
         ImGui::EndTable();
     }
+}
+
+/* Shim: Reflection Probes has been merged into the Lighting Settings
+ * "Rendering" workbench as a tab.  Activating this panel now redirects
+ * to that workbench and requests the Reflection Probes tab.  Symbol
+ * kept so menu/hotkey entries registered against JCE_PANEL_REFLECTION_PROBES
+ * keep working. */
+extern "C" void jce_editor_panel_reflection_probes(void)
+{
+    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_REFLECTION_PROBES);
+    if (!vis || !*vis) return;
+    *vis = false;
+
+    bool *ls_vis = jce_editor_panel_visible_ptr(JCE_PANEL_LIGHTING_SETTINGS);
+    if (ls_vis) *ls_vis = true;
+
+    char title[128];
+    snprintf(title, sizeof(title), "%s###lighting_settings",
+             jce_editor_i18n("panel.lighting.title"));
+    ImGui::SetWindowFocus(title);
+    jce_panel_lighting_settings_request_tab(3);
 }

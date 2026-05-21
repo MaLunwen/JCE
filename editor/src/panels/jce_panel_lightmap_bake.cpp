@@ -28,10 +28,12 @@ extern "C" {
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_thread.h>
+#include <jce/renderer/jce_lightmapper.h>
 }
 
 #include "core/jce_editor_state.h"
 
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -397,6 +399,268 @@ static void ensure_atomics(void)
     if (!s.cancel)   s.cancel   = jce_atomic_i32_create(0);
 }
 
+/* -------------------------------------------------------------------- */
+/* Light probe SH9 bake                                                 */
+/* -------------------------------------------------------------------- */
+
+struct ProbeState {
+    JceThread    *worker   = nullptr;
+    JceAtomicI32 *progress = nullptr;  /* 0..100 */
+    JceAtomicI32 *running  = nullptr;
+    JceAtomicI32 *cancel   = nullptr;
+    char          status[160] = "Idle";
+    int           sample_count = 256;
+};
+
+ProbeState ps;
+
+static void ensure_probe_atomics(void)
+{
+    if (!ps.progress) ps.progress = jce_atomic_i32_create(0);
+    if (!ps.running)  ps.running  = jce_atomic_i32_create(0);
+    if (!ps.cancel)   ps.cancel   = jce_atomic_i32_create(0);
+}
+
+struct ProbeWorkerArgs {
+    /* Flat probe positions [count][3]. */
+    std::vector<std::array<float, 3>> positions;
+    /* Entity IDs — used to write results back; bake is offline so safe. */
+    std::vector<JceEntity>            entities;
+    /* Occluders from the scene snapshot (mesh-rendered objects). */
+    std::vector<JceLightmapOccluder>  occ;
+    /* Lights — only directional / point collected from scene. */
+    std::vector<JceLightmapLight>     lights;
+    int                               sample_count = 256;
+    /* Baked SH9 results per probe; allocated in worker. */
+    std::vector<std::array<float, 27>> sh9; /* [N][9*3] flattened */
+    JceScene                         *scene = nullptr;
+};
+
+extern "C" void lp_scene_visit(JceScene *scene, JceEntity e, void *user)
+{
+    ProbeWorkerArgs *args = (ProbeWorkerArgs *)user;
+
+    /* Collect light probe group positions. */
+    if (jce_scene_has_light_probe_group(scene, e)) {
+        JceLightProbeGroupComponent *lpg = jce_scene_get_light_probe_group(scene, e);
+        JceTransform *tr = jce_scene_has_transform(scene, e)
+                           ? jce_scene_get_transform(scene, e) : nullptr;
+        if (lpg) {
+            for (int i = 0; i < lpg->probe_count; ++i) {
+                std::array<float, 3> pos;
+                pos[0] = lpg->positions[i][0];
+                pos[1] = lpg->positions[i][1];
+                pos[2] = lpg->positions[i][2];
+                if (tr) {
+                    pos[0] += tr->position.x;
+                    pos[1] += tr->position.y;
+                    pos[2] += tr->position.z;
+                }
+                args->positions.push_back(pos);
+                args->entities.push_back(e);
+            }
+        }
+    }
+
+    /* Collect mesh-renderer occluders (same logic as lm_scene_visit). */
+    if (jce_scene_has_mesh_renderer(scene, e) && jce_scene_has_transform(scene, e)) {
+        JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, e);
+        JceTransform    *tr = jce_scene_get_transform(scene, e);
+        if (mr && tr && mr->visible) {
+            JceLightmapOccluder o{};
+            o.center[0] = tr->position.x;
+            o.center[1] = tr->position.y;
+            o.center[2] = tr->position.z;
+            if (mr->mesh_shape == 1 || mr->mesh_shape == 5) {
+                o.kind = JCE_LM_OCC_SPHERE;
+                float r = 0.5f * std::fmax(tr->scale.x,
+                                            std::fmax(tr->scale.y, tr->scale.z));
+                if (r < 0.05f) r = 0.05f;
+                o.extent_or_radius[0] = r;
+            } else {
+                o.kind = JCE_LM_OCC_BOX;
+                o.extent_or_radius[0] = 0.5f * std::fabs(tr->scale.x);
+                o.extent_or_radius[1] = 0.5f * std::fabs(tr->scale.y);
+                o.extent_or_radius[2] = 0.5f * std::fabs(tr->scale.z);
+            }
+            args->occ.push_back(o);
+        }
+    }
+
+    /* Collect directional lights. */
+    if (jce_scene_has_dir_light(scene, e)) {
+        JceDirectionalLight *dl = jce_scene_get_dir_light(scene, e);
+        if (dl) {
+            JceLightmapLight l{};
+            l.kind        = JCE_LM_LIGHT_DIRECTIONAL;
+            l.direction[0] = dl->direction.x;
+            l.direction[1] = dl->direction.y;
+            l.direction[2] = dl->direction.z;
+            l.color[0]     = dl->color.x;
+            l.color[1]     = dl->color.y;
+            l.color[2]     = dl->color.z;
+            l.intensity    = dl->intensity;
+            l.range        = 0;
+            args->lights.push_back(l);
+        }
+    }
+
+    /* Collect point lights. */
+    if (jce_scene_has_point_light(scene, e)) {
+        JcePointLight *pl = jce_scene_get_point_light(scene, e);
+        if (pl) {
+            JceLightmapLight l{};
+            l.kind        = JCE_LM_LIGHT_POINT;
+            l.position[0] = pl->position.x;
+            l.position[1] = pl->position.y;
+            l.position[2] = pl->position.z;
+            l.color[0]     = pl->color.x;
+            l.color[1]     = pl->color.y;
+            l.color[2]     = pl->color.z;
+            l.intensity    = pl->intensity;
+            l.range        = pl->radius;
+            args->lights.push_back(l);
+        }
+    }
+}
+
+void probe_worker_run(void *arg_ptr)
+{
+    ProbeWorkerArgs *args = static_cast<ProbeWorkerArgs *>(arg_ptr);
+
+    int total = (int)args->positions.size();
+    if (total == 0) {
+        std::snprintf(ps.status, sizeof(ps.status), "No light probe groups in scene.");
+        jce_atomic_i32_store(ps.running, 0);
+        delete args;
+        return;
+    }
+
+    args->sh9.resize((size_t)total);
+
+    /* Build flat position array for the C bake function. */
+    std::vector<std::array<float, 3>> flat_pos((size_t)total);
+    for (int i = 0; i < total; ++i) {
+        flat_pos[i][0] = args->positions[i][0];
+        flat_pos[i][1] = args->positions[i][1];
+        flat_pos[i][2] = args->positions[i][2];
+    }
+
+    /* Bake one probe at a time so we can update progress and check cancel. */
+    float sh_single[9][3];
+    for (int pi = 0; pi < total; ++pi) {
+        if (jce_atomic_i32_load(ps.cancel) != 0) {
+            std::snprintf(ps.status, sizeof(ps.status), "Cancelled at probe %d/%d", pi, total);
+            jce_atomic_i32_store(ps.running, 0);
+            delete args;
+            return;
+        }
+
+        float pos_single[1][3];
+        pos_single[0][0] = args->positions[pi][0];
+        pos_single[0][1] = args->positions[pi][1];
+        pos_single[0][2] = args->positions[pi][2];
+
+        float sh_out[1][9][3];
+        jce_lightmapper_bake_sh9(pos_single, 1,
+                                 args->occ.empty()    ? nullptr : args->occ.data(),
+                                 (int)args->occ.size(),
+                                 args->lights.empty() ? nullptr : args->lights.data(),
+                                 (int)args->lights.size(),
+                                 args->sample_count,
+                                 sh_out);
+
+        for (int c = 0; c < 9; ++c) {
+            args->sh9[pi][c * 3 + 0] = sh_out[0][c][0];
+            args->sh9[pi][c * 3 + 1] = sh_out[0][c][1];
+            args->sh9[pi][c * 3 + 2] = sh_out[0][c][2];
+        }
+
+        jce_atomic_i32_store(ps.progress, (pi + 1) * 100 / total);
+    }
+
+    /* Write results back to scene components (main-thread-safe for read/write
+       when no other system is mutating the same components). */
+    if (args->scene) {
+        /* Track per-entity offset: group probes belong to the same entity.
+           Simple approach: track last entity and its base index. */
+        JceEntity last_e = JCE_ENTITY_INVALID;
+        int       probe_idx_in_group = 0;
+        for (int pi = 0; pi < total; ++pi) {
+            JceEntity e = args->entities[pi];
+            if (e != last_e) { last_e = e; probe_idx_in_group = 0; }
+            JceLightProbeGroupComponent *lpg =
+                jce_scene_get_light_probe_group(args->scene, e);
+            if (lpg && probe_idx_in_group < lpg->probe_count) {
+                for (int c = 0; c < 9; ++c) {
+                    lpg->sh9[probe_idx_in_group][c][0] = args->sh9[pi][c * 3 + 0];
+                    lpg->sh9[probe_idx_in_group][c][1] = args->sh9[pi][c * 3 + 1];
+                    lpg->sh9[probe_idx_in_group][c][2] = args->sh9[pi][c * 3 + 2];
+                }
+                lpg->sh9_baked = true;
+            }
+            ++probe_idx_in_group;
+        }
+    }
+
+    std::snprintf(ps.status, sizeof(ps.status),
+                  "Done — baked %d probe(s), %d spp each.", total, args->sample_count);
+    jce_atomic_i32_store(ps.running, 0);
+    delete args;
+}
+
+void start_probe_bake(void)
+{
+    ensure_probe_atomics();
+    if (jce_atomic_i32_load(ps.running) != 0) return;
+    jce_atomic_i32_store(ps.cancel,   0);
+    jce_atomic_i32_store(ps.progress, 0);
+    std::snprintf(ps.status, sizeof(ps.status), "Baking probes...");
+    jce_atomic_i32_store(ps.running, 1);
+
+    ProbeWorkerArgs *args = new ProbeWorkerArgs();
+    args->sample_count = ps.sample_count;
+    args->scene = jce_state_get_scene();
+    if (args->scene)
+        jce_scene_each_entity(args->scene, lp_scene_visit, args);
+
+    if (ps.worker) {
+        jce_thread_join(ps.worker);
+        ps.worker = nullptr;
+    }
+    ps.worker = jce_thread_create(probe_worker_run, args, "jce_lp_bake");
+}
+
+void draw_probe_tab(void)
+{
+    bool busy = ps.running ? (jce_atomic_i32_load(ps.running) != 0) : false;
+
+    ImGui::BeginDisabled(busy);
+    ImGui::SliderInt(jce_editor_i18n_id("lightmapBake.probe.samples", "lp_smp"),
+                     &ps.sample_count, 64, 2048);
+    ImGui::EndDisabled();
+    ImGui::Separator();
+
+    if (!busy) {
+        if (ImGui::Button(jce_editor_i18n_id("lightmapBake.probe.button.bake", "lp_bake")))
+            start_probe_bake();
+    } else {
+        if (ImGui::Button(jce_editor_i18n_id("lightmapBake.probe.button.cancel", "lp_cancel"))) {
+            if (ps.cancel) jce_atomic_i32_store(ps.cancel, 1);
+        }
+    }
+
+    ImGui::Separator();
+    int p = ps.progress ? jce_atomic_i32_load(ps.progress) : 0;
+    char overlay[32];
+    std::snprintf(overlay, sizeof(overlay), "%d%%", p);
+    ImGui::ProgressBar(p / 100.0f, ImVec2(-FLT_MIN, 0.0f), overlay);
+    ImGui::TextUnformatted(ps.status);
+    ImGui::Spacing();
+    ImGui::TextDisabled("%s", jce_editor_i18n_or("lightmapBake.probe.note",
+        "SH9 data is written into JceLightProbeGroupComponent at runtime."));
+}
+
 void ensure_dir(const char *path)
 {
     if (!path || !*path) return;
@@ -550,7 +814,26 @@ void write_binding(void)
             "lightmap binding write failed: %s", bind_path);
 }
 
+void draw_lightmap_tab(void);
+
 void draw_content(void)
+{
+    if (!ImGui::BeginTabBar("##lm_tabs")) return;
+
+    if (ImGui::BeginTabItem(
+            jce_editor_i18n_or("lightmapBake.tab.lightmap", "Lightmap"))) {
+        draw_lightmap_tab();
+        ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem(
+            jce_editor_i18n_or("lightmapBake.tab.lightProbes", "Light Probes"))) {
+        draw_probe_tab();
+        ImGui::EndTabItem();
+    }
+    ImGui::EndTabBar();
+}
+
+void draw_lightmap_tab(void)
 {
     bool busy = s.running ? (jce_atomic_i32_load(s.running) != 0) : false;
 
@@ -601,14 +884,30 @@ void draw_content(void)
 
 } /* namespace */
 
+extern "C" void jce_editor_panel_lightmap_bake_content(void)
+{
+    /* draw_content() lives in this TU's anonymous namespace and is
+     * visible at file scope. */
+    draw_content();
+}
+
 extern "C" void jce_editor_panel_lightmap_bake(void)
 {
+    /* Shim: Lightmap Bake has been merged into the Lighting Settings
+     * "Rendering" workbench as a tab.  Activating this panel now
+     * redirects to that workbench and requests the Lightmap tab.
+     * Symbol kept so menu/hotkey entries registered against
+     * JCE_PANEL_LIGHTMAP_BAKE keep working. */
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_LIGHTMAP_BAKE);
     if (!vis || !*vis) return;
-    char _wt[96];
-    snprintf(_wt, sizeof(_wt), "%s###jce_lightmap_bake", jce_editor_i18n("lightmapBake.title"));
-    if (ImGui::Begin(_wt, vis, ImGuiWindowFlags_NoFocusOnAppearing)) {
-        draw_content();
-    }
-    ImGui::End();
+    *vis = false;
+
+    bool *ls_vis = jce_editor_panel_visible_ptr(JCE_PANEL_LIGHTING_SETTINGS);
+    if (ls_vis) *ls_vis = true;
+
+    char title[128];
+    snprintf(title, sizeof(title), "%s###lighting_settings",
+             jce_editor_i18n("panel.lighting.title"));
+    ImGui::SetWindowFocus(title);
+    jce_panel_lighting_settings_request_tab(2);
 }

@@ -1598,4 +1598,49 @@ void jce_editor_panel_scene_view(void)
         jce_editor_panel_scene_view_content();
     ImGui::End();
     ImGui::PopStyleVar();
+
+    /* Camera Preview: shown when selected entity has a Camera component. */
+    {
+        JceScene *scene = jce_state_get_scene();
+        uint32_t focused = jce_state_get_focused();
+        if (scene && focused != 0) {
+            uint64_t cf = jce_scene_get_component_flags(scene, (JceEntity)focused);
+            if (cf & JCE_COMP_FLAG_CAMERA) {
+                JceCameraComponent *cam = jce_scene_get_camera(scene, (JceEntity)focused);
+                if (cam) {
+                    ImGui::SetNextWindowSize(ImVec2(280.0f, 180.0f), ImGuiCond_FirstUseEver);
+                    ImGui::SetNextWindowBgAlpha(0.85f);
+                    char win_title[128];
+                    snprintf(win_title, sizeof(win_title), "%s##jce_cam_preview",
+                             jce_editor_i18n("inspector.camera.preview.title"));
+                    if (ImGui::Begin(win_title, nullptr,
+                                     ImGuiWindowFlags_NoFocusOnAppearing |
+                                     ImGuiWindowFlags_NoCollapse)) {
+                        static const char *clear_i18n[] = {
+                            "inspector.camera.clearMode.skybox",
+                            "inspector.camera.clearMode.color",
+                            "inspector.camera.clearMode.depthOnly",
+                            "inspector.camera.clearMode.nothing",
+                        };
+                        int cm = (int)cam->clear_mode;
+                        if (cm < 0 || cm > 3) cm = 0;
+                        ImGui::Text(jce_editor_i18n("inspector.camera.preview.fov"),
+                                    (double)cam->fov_deg);
+                        ImGui::Text(jce_editor_i18n("inspector.camera.preview.nearFar"),
+                                    (double)cam->near_plane, (double)cam->far_plane);
+                        ImGui::Text(jce_editor_i18n("inspector.camera.preview.clear"),
+                                    jce_editor_i18n(clear_i18n[cm]));
+                        ImGui::Text(jce_editor_i18n("inspector.camera.preview.stack"),
+                                    (int)cam->stack_index,
+                                    cam->is_primary
+                                        ? jce_editor_i18n("inspector.camera.preview.stackPrimary")
+                                        : "");
+                        ImGui::TextDisabled("%s",
+                                    jce_editor_i18n("inspector.camera.preview.noTarget"));
+                    }
+                    ImGui::End();
+                }
+            }
+        }
+    }
 }

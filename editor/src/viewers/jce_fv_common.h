@@ -109,6 +109,8 @@ void fv_render_image(FvTab *tab);
 void fv_render_model(FvTab *tab);
 void fv_render_scene(FvTab *tab);
 void fv_render_material(FvTab *tab);
+void fv_render_physmat(FvTab *tab);
+void fv_render_render_pipeline(FvTab *tab);
 void fv_render_audio(FvTab *tab);
 void fv_render_video(FvTab *tab);
 void fv_render_hex(FvTab *tab);

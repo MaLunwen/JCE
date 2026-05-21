@@ -805,14 +805,28 @@ void draw_content(void)
 
 } /* namespace */
 
+extern "C" void import_presets_draw_content(void)
+{
+    draw_content();
+}
+
+/* Shim: Import Presets has been merged into the Bundle Browser
+ * "Asset Pipeline" workbench as a tab.  Activating this panel now
+ * redirects to that workbench and requests the Import Presets tab.
+ * Symbol kept so the menu/hotkey entries registered against
+ * JCE_PANEL_IMPORT_PRESETS keep working. */
 extern "C" void jce_editor_panel_import_presets(void)
 {
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_IMPORT_PRESETS);
     if (!vis || !*vis) return;
-    char _wt[96];
-    snprintf(_wt, sizeof(_wt), "%s###jce_import_presets", jce_editor_i18n("importPresets.title"));
-    if (ImGui::Begin(_wt, vis, ImGuiWindowFlags_NoFocusOnAppearing)) {
-        draw_content();
-    }
-    ImGui::End();
+    *vis = false;
+
+    bool *bb_vis = jce_editor_panel_visible_ptr(JCE_PANEL_BUNDLE_BROWSER);
+    if (bb_vis) *bb_vis = true;
+
+    char title[128];
+    std::snprintf(title, sizeof(title), "%s###bundle_browser",
+                  jce_editor_i18n("panel.bundle_browser.title"));
+    ImGui::SetWindowFocus(title);
+    jce_panel_bundle_browser_request_tab(1);
 }

@@ -200,7 +200,7 @@ void jce_editor_panels_init(void)
     s_visible[JCE_PANEL_MATERIAL_GRAPH]   = false;
     s_visible[JCE_PANEL_IMPORT_PRESETS]   = false;
     s_visible[JCE_PANEL_LIGHTMAP_BAKE]    = false;
-    s_visible[JCE_PANEL_LIGHTING]         = false;
+    s_visible[JCE_PANEL_LIGHTING_DEPRECATED] = false;
     s_visible[JCE_PANEL_AUDIO_MIXER]      = false;
     s_visible[JCE_PANEL_INPUT_MANAGER]    = false;
     s_visible[JCE_PANEL_CURVE_EDITOR]     = false;
@@ -227,6 +227,12 @@ void jce_editor_panels_init(void)
     s_visible[JCE_PANEL_VCAM_MANAGER]     = false;
     s_visible[JCE_PANEL_REVERB_ZONES]     = false;
     s_visible[JCE_PANEL_SAVE_BROWSER]     = false;
+    s_visible[JCE_PANEL_BUNDLE_BROWSER]   = false;
+    s_visible[JCE_PANEL_LIGHTING_SETTINGS]= false;
+    s_visible[JCE_PANEL_BUILD_REPORT]     = false;
+    s_visible[JCE_PANEL_SYSTEMS]          = false;
+    s_visible[JCE_PANEL_PROJECT_SETTINGS] = false;
+    s_visible[JCE_PANEL_USER_PREFERENCES] = false;
 
     /* Console ring buffer. */
     memset(&s_console, 0, sizeof(s_console));
@@ -343,15 +349,12 @@ static void settings_ensure_init(void)
 
     /* Load persisted editor config. */
     JceEditorConfig ecfg;
-    if (jce_editor_config_load(&ecfg)) {
-        /* Language */
-        if (strcmp(ecfg.language, "zh_cn") == 0) {
-            s_settings.language_idx = 1;
-            jce_editor_i18n_set_locale(JCE_LOCALE_ZH_CN);
-        } else {
-            s_settings.language_idx = 0;
-            jce_editor_i18n_set_locale(JCE_LOCALE_EN);
-        }
+        if (jce_editor_config_load(&ecfg)) {
+            /* Language — derived from the persisted stable code (handles
+               any number of locales without index-magic). */
+            JceLocale _persisted = jce_editor_i18n_locale_from_code(ecfg.language);
+            s_settings.language_idx = (int)_persisted;
+            jce_editor_i18n_set_locale(_persisted);
 
         /* Theme — accept Blue (preferred) and SSMS (legacy) for the SSMS engine theme. */
         if (strcmp(ecfg.theme, "Light") == 0) s_settings.theme_idx = JCE_THEME_LIGHT;
@@ -382,7 +385,7 @@ static void settings_ensure_init(void)
         snprintf(s_settings.font_zh_path, sizeof(s_settings.font_zh_path),
                  "%s", ecfg.font_zh_path);
     } else {
-        s_settings.language_idx  = (jce_editor_i18n_get_locale() == JCE_LOCALE_ZH_CN) ? 1 : 0;
+        s_settings.language_idx  = (int)jce_editor_i18n_get_locale();
         s_settings.theme_idx     = jce_editor_get_theme();
         s_settings.renderer_idx  = 0;
         s_settings.font_size     = jce_editor_get_font_size();
@@ -421,7 +424,7 @@ static void settings_apply(void)
         jce_editor_config_load(&ecfg);
 
         snprintf(ecfg.language, sizeof(ecfg.language), "%s",
-                 s_settings.language_idx == 0 ? "en" : "zh_cn");
+                 jce_editor_i18n_locale_code((JceLocale)s_settings.language_idx));
         ecfg.font_size = (int)s_settings.font_size;
 
         const char *theme_names[] = { "Dark", "Light", "Blue" };
@@ -456,8 +459,7 @@ static void settings_cancel(void)
     /* Revert language. */
     if (s_settings.language_idx != s_settings.orig_language_idx) {
         s_settings.language_idx = s_settings.orig_language_idx;
-        jce_editor_i18n_set_locale(
-            s_settings.language_idx == 0 ? JCE_LOCALE_EN : JCE_LOCALE_ZH_CN);
+        jce_editor_i18n_set_locale((JceLocale)s_settings.language_idx);
     }
     /* Revert theme. */
     if (s_settings.theme_idx != s_settings.orig_theme_idx) {
@@ -519,13 +521,16 @@ void jce_editor_settings_dialog(bool *p_open)
 
     char _lbl[256];
 
-    /* Language */
+    /* Language — built from the live locale registry so adding a locale
+       only requires updating the enum + JSON file. */
     snprintf(_lbl, sizeof(_lbl), "%s###settings_lang", jce_editor_i18n("settings.language"));
-    const char *languages[] = { "English", "\xe4\xb8\xad\xe6\x96\x87(\xe7\xae\x80\xe4\xbd\x93)" };
+    const int   n_loc = jce_editor_i18n_locale_count();
+    const char *languages[JCE_LOCALE_COUNT];
+    for (int i = 0; i < n_loc; i++)
+        languages[i] = jce_editor_i18n_locale_native_name((JceLocale)i);
     ImGui::PushItemWidth(200);
-    if (ImGui::Combo(_lbl, &s_settings.language_idx, languages, 2)) {
-        jce_editor_i18n_set_locale(
-            s_settings.language_idx == 0 ? JCE_LOCALE_EN : JCE_LOCALE_ZH_CN);
+    if (ImGui::Combo(_lbl, &s_settings.language_idx, languages, n_loc)) {
+        jce_editor_i18n_set_locale((JceLocale)s_settings.language_idx);
     }
     ImGui::SameLine();
     ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%s",
@@ -810,6 +815,7 @@ static void prefs_ensure_init(void)
     snprintf(s_prefs.scenes_path, sizeof(s_prefs.scenes_path), "assets/scenes");
     snprintf(s_prefs.prefabs_path, sizeof(s_prefs.prefabs_path), "assets/prefabs");
     snprintf(s_prefs.build_output_path, sizeof(s_prefs.build_output_path), "build");
+    s_prefs.language_idx = (int)jce_editor_i18n_get_locale();
 
     /* Pull persisted font overrides from editor config. */
     JceEditorConfig _ecfg;
@@ -1074,11 +1080,13 @@ void jce_editor_panel_preferences(void)
                     jce_editor_pref_touchpad_h_invert = _new;
                 }
                 ImGui::Separator();
-                const char *languages[] = { "English", "Chinese" };
+                const int   _n_loc = jce_editor_i18n_locale_count();
+                const char *languages[JCE_LOCALE_COUNT];
+                for (int i = 0; i < _n_loc; i++)
+                    languages[i] = jce_editor_i18n_locale_native_name((JceLocale)i);
                 snprintf(_lbl, sizeof(_lbl), "%s###language", jce_editor_i18n("preferences.language"));
-                if (ImGui::Combo(_lbl, &s_prefs.language_idx, languages, 2)) {
-                    jce_editor_i18n_set_locale(
-                        s_prefs.language_idx == 0 ? JCE_LOCALE_EN : JCE_LOCALE_ZH_CN);
+                if (ImGui::Combo(_lbl, &s_prefs.language_idx, languages, _n_loc)) {
+                    jce_editor_i18n_set_locale((JceLocale)s_prefs.language_idx);
                     s_settings.language_idx = s_prefs.language_idx;
                     settings_apply();
                 }

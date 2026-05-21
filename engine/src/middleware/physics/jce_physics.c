@@ -7,14 +7,19 @@
  */
 
 #include <jce/middleware/physics/jce_physics.h>
+#include <jce/middleware/physics/jce_physics_debug.h>
+#include <jce/middleware/physics/jce_physics_material.h>
+#include <jce/middleware/physics/jce_cloth.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/os/core/jce_profiler.h>
+#include <jce/renderer/jce_render_pipeline.h>
 
 #include "jce_physics_internal.h"
 #include "os/core/jce_memory.h"
 
 #include <string.h>
+#include <stdlib.h>
 
 #define LOG_TAG "physics"
 
@@ -27,6 +32,7 @@ struct JcePhysicsWorld {
     jce_vec3  gravity;
     float     fixed_timestep;
     int32_t   max_sub_steps;
+    uint32_t  body_capacity;
 
     /* Public-facing contact callbacks.  The bullet layer uses its own
        simpler signature; we adapt between the two in the trampoline. */
@@ -34,6 +40,39 @@ struct JcePhysicsWorld {
     void          *contact_begin_ud;
     jce_contact_fn contact_end_fn;
     void          *contact_end_ud;
+
+    /* ── P3-C.5: opaque per-body entity tags (parallel to bullet pool). */
+    uint64_t      *body_entity;
+
+    /* ── P3-C.5: BEGIN/STAY/END listeners. */
+    struct {
+        jce_contact_listener_fn fn;
+        void                   *ud;
+    } listeners[JCE_PHYSICS_MAX_LISTENERS];
+    uint32_t       listener_count;
+
+    /* ── P3-C.5: manifold pair diff state.
+     *
+     * Pairs are encoded as uint64 with the smaller body index in the
+     * high 32 bits.  Two arrays alternate as "current" and "previous"
+     * frame so we never re-allocate per step.  Each slot also caches
+     * the deepest contact for the pair so STAY events carry useful
+     * data instead of stale geometry. */
+    struct PairRecord {
+        uint64_t key;
+        float    normal[3];
+        float    point[3];
+        float    depth;
+        uint8_t  is_trigger;
+    } *pairs_a;
+    uint32_t pairs_a_count;
+    uint32_t pairs_capacity;
+
+    struct PairRecord *pairs_b;
+    uint32_t pairs_b_count;
+
+    /* Toggle: which buffer is "current".  Flipped per step. */
+    uint8_t use_a;
 };
 
 /* ── Contact-callback trampoline ──────────────────────────────────── */
@@ -104,6 +143,15 @@ static JcePhysicsWorldDesc defaults(void)
 
 /* ── Create / Destroy ──────────────────────────────────────────────── */
 
+/* P3-C.4 — RPA observer: routes the cloth feature flag into the cloth
+ * subsystem.  Registered once on first jce_physics_create(). */
+static void cloth_rpa_observer(const JceRenderPipelineDesc *desc, void *ud)
+{
+    (void)ud;
+    if (!desc) return;
+    jce_cloth_set_simulation_enabled(desc->enable_cloth);
+}
+
 JcePhysicsWorld *jce_physics_create(const JcePhysicsWorldDesc *desc)
 {
     JcePhysicsWorldDesc cfg = desc ? *desc : defaults();
@@ -124,12 +172,45 @@ JcePhysicsWorld *jce_physics_create(const JcePhysicsWorldDesc *desc)
     w->gravity        = cfg.gravity;
     w->fixed_timestep = cfg.fixed_timestep;
     w->max_sub_steps  = cfg.max_sub_steps;
+    w->body_capacity  = cfg.max_bodies;
+
+    /* P3-C.5 — per-body entity tags (one slot per pool index). */
+    w->body_entity = (uint64_t *)JCE_CALLOC(cfg.max_bodies,
+                                            sizeof(uint64_t));
+
+    /* P3-C.5 — pair-diff buffers.  Sized as a fraction of the body
+     * pool: a fully populated n*(n-1)/2 set is unrealistic; max_bodies*4
+     * gives plenty of headroom for typical scenes while keeping memory
+     * bounded.  Clamped to a 256-pair minimum for tiny worlds. */
+    uint32_t pair_cap = cfg.max_bodies * 4u;
+    if (pair_cap < 256u) pair_cap = 256u;
+    w->pairs_capacity = pair_cap;
+    w->pairs_a = (struct PairRecord *)JCE_CALLOC(pair_cap,
+                                                 sizeof(*w->pairs_a));
+    w->pairs_b = (struct PairRecord *)JCE_CALLOC(pair_cap,
+                                                 sizeof(*w->pairs_b));
+    if (!w->body_entity || !w->pairs_a || !w->pairs_b) {
+        JCE_FREE(w->body_entity);
+        JCE_FREE(w->pairs_a);
+        JCE_FREE(w->pairs_b);
+        jce_bullet_destroy(w->bullet);
+        JCE_FREE(w);
+        LOG_ERROR(LOG_TAG, "out of memory allocating physics state");
+        return NULL;
+    }
 
     /* Wire up trampolines so Bullet contacts reach the C callbacks. */
     jce_bullet_set_contact_begin(w->bullet,
                                  contact_begin_trampoline, w);
     jce_bullet_set_contact_end(w->bullet,
                                contact_end_trampoline, w);
+
+    /* P3-C.4 — register as the "default" rigid world for cloth anchoring. */
+    jce_physics_set_default_bullet_world_(w->bullet);
+
+    /* P3-C.4 — install the RPA observer (idempotent: re-registering
+     * just overwrites the slot; fires once now with the current desc). */
+    jce_render_pipeline_set_observer(cloth_rpa_observer, NULL);
 
     LOG_SUCCESS(LOG_TAG,
                 "3D physics world created (Bullet3, capacity=%u)",
@@ -140,12 +221,115 @@ JcePhysicsWorld *jce_physics_create(const JcePhysicsWorldDesc *desc)
 void jce_physics_destroy(JcePhysicsWorld *world)
 {
     if (!world) return;
+    /* P3-C.4 — clear default-world pointer if it was us; tear down all
+     * cloth/soft bodies because they may hold anchors into the rigid
+     * pool we're about to delete. */
+    if (jce_physics_default_bullet_world_() == world->bullet) {
+        jce_cloth_shutdown_();
+        jce_physics_set_default_bullet_world_(NULL);
+    }
     jce_bullet_destroy(world->bullet);
+    JCE_FREE(world->body_entity);
+    JCE_FREE(world->pairs_a);
+    JCE_FREE(world->pairs_b);
     JCE_FREE(world);
     LOG_INFO(LOG_TAG, "3D physics world destroyed");
 }
 
 /* ── Step ──────────────────────────────────────────────────────────── */
+
+/* qsort comparator for PairRecord by key ascending. */
+static int pair_cmp(const void *a, const void *b)
+{
+    uint64_t ka = ((const struct PairRecord *)a)->key;
+    uint64_t kb = ((const struct PairRecord *)b)->key;
+    return (ka < kb) ? -1 : (ka > kb) ? 1 : 0;
+}
+
+/* Bullet pair-enumerate callback — accumulates into world->pairs_*[use_a]. */
+static void pair_collect(uint32_t a, uint32_t b,
+                         const float normal[3], const float point[3],
+                         float depth, bool is_trigger, void *ud)
+{
+    JcePhysicsWorld *w = (JcePhysicsWorld *)ud;
+    struct PairRecord *cur = w->use_a ? w->pairs_a : w->pairs_b;
+    uint32_t *count        = w->use_a ? &w->pairs_a_count : &w->pairs_b_count;
+    if (*count >= w->pairs_capacity) return;
+
+    uint32_t lo = a < b ? a : b;
+    uint32_t hi = a < b ? b : a;
+
+    struct PairRecord *p = &cur[(*count)++];
+    p->key  = ((uint64_t)lo << 32) | (uint64_t)hi;
+    p->normal[0] = normal[0]; p->normal[1] = normal[1]; p->normal[2] = normal[2];
+    p->point[0]  = point[0];  p->point[1]  = point[1];  p->point[2]  = point[2];
+    p->depth      = depth;
+    p->is_trigger = is_trigger ? 1u : 0u;
+}
+
+/* Fire a single typed event to every registered listener. */
+static void emit_event(const JcePhysicsWorld *w,
+                       const struct PairRecord *p,
+                       JceContactEventType type)
+{
+    if (w->listener_count == 0) return;
+
+    uint32_t lo = (uint32_t)(p->key >> 32);
+    uint32_t hi = (uint32_t)(p->key & 0xFFFFFFFFu);
+
+    JceContactEvent ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.body_a    = (JceBodyHandle){ lo };
+    ev.body_b    = (JceBodyHandle){ hi };
+    ev.normal[0] = p->normal[0];
+    ev.normal[1] = p->normal[1];
+    ev.normal[2] = p->normal[2];
+    ev.point[0]  = p->point[0];
+    ev.point[1]  = p->point[1];
+    ev.point[2]  = p->point[2];
+    ev.depth     = p->depth;
+    ev.is_trigger = p->is_trigger ? true : false;
+    ev.type      = (JceContactEventTypeRaw)type;
+    ev.entity_a  = (lo < w->body_capacity && w->body_entity)
+                       ? w->body_entity[lo] : 0;
+    ev.entity_b  = (hi < w->body_capacity && w->body_entity)
+                       ? w->body_entity[hi] : 0;
+
+    for (uint32_t i = 0; i < w->listener_count; ++i) {
+        w->listeners[i].fn(&ev, w->listeners[i].ud);
+    }
+}
+
+/* Merge-walk the sorted current vs previous arrays and emit BEGIN /
+ * STAY / END events.  Both inputs must be sorted by `key`. */
+static void diff_pairs_and_emit(JcePhysicsWorld *w)
+{
+    const struct PairRecord *cur, *prev;
+    uint32_t ncur, nprev;
+    if (w->use_a) {
+        cur = w->pairs_a; ncur = w->pairs_a_count;
+        prev = w->pairs_b; nprev = w->pairs_b_count;
+    } else {
+        cur = w->pairs_b; ncur = w->pairs_b_count;
+        prev = w->pairs_a; nprev = w->pairs_a_count;
+    }
+
+    uint32_t i = 0, j = 0;
+    while (i < ncur && j < nprev) {
+        if (cur[i].key == prev[j].key) {
+            emit_event(w, &cur[i], JCE_CONTACT_STAY);
+            ++i; ++j;
+        } else if (cur[i].key < prev[j].key) {
+            emit_event(w, &cur[i], JCE_CONTACT_BEGIN);
+            ++i;
+        } else {
+            emit_event(w, &prev[j], JCE_CONTACT_END);
+            ++j;
+        }
+    }
+    for (; i < ncur; ++i)  emit_event(w, &cur[i],  JCE_CONTACT_BEGIN);
+    for (; j < nprev; ++j) emit_event(w, &prev[j], JCE_CONTACT_END);
+}
 
 void jce_physics_step(JcePhysicsWorld *world, float dt)
 {
@@ -154,6 +338,34 @@ void jce_physics_step(JcePhysicsWorld *world, float dt)
     jce_bullet_step(world->bullet, dt,
                     world->fixed_timestep,
                     world->max_sub_steps);
+
+    /* P3-C.4 — step the cloth/soft-body world.  Internally no-ops when
+     * simulation is globally disabled or no soft bodies exist. */
+    jce_cloth_step_(dt);
+
+    /* P3-C.5 — collect this frame's manifold pairs, diff against the
+     * previous frame, dispatch BEGIN/STAY/END to listeners, then flip
+     * the double-buffer for the next step. */
+    if (world->listener_count > 0) {
+        if (world->use_a) world->pairs_a_count = 0;
+        else              world->pairs_b_count = 0;
+
+        jce_bullet_enumerate_pairs(world->bullet, pair_collect, world);
+
+        struct PairRecord *cur = world->use_a ? world->pairs_a : world->pairs_b;
+        uint32_t           n   = world->use_a ? world->pairs_a_count
+                                              : world->pairs_b_count;
+        if (n > 1) qsort(cur, n, sizeof(*cur), pair_cmp);
+
+        diff_pairs_and_emit(world);
+        world->use_a = !world->use_a;
+    } else {
+        /* No listeners — keep state coherent so the first listener
+         * doesn't see a synthetic flood of END events later. */
+        world->pairs_a_count = 0;
+        world->pairs_b_count = 0;
+    }
+
     JCE_PROFILE_ZONE_END;
 }
 
@@ -166,8 +378,8 @@ JceBodyHandle jce_physics_body_create(JcePhysicsWorld *world,
 
     float friction = desc->friction > 0.0f ? desc->friction : 0.5f;
 
-    uint16_t group = desc->collision_group;
-    uint16_t mask  = desc->collision_mask;
+    uint32_t group = desc->collision_group;
+    uint32_t mask  = desc->collision_mask;
     if (group == 0) group = JCE_COLLISION_DEFAULT_GROUP;
     if (mask  == 0) mask  = JCE_COLLISION_ALL_MASK;
 
@@ -193,6 +405,9 @@ void jce_physics_body_destroy(JcePhysicsWorld *world, JceBodyHandle body)
 {
     if (!world || !jce_body_valid(body)) return;
     jce_bullet_body_destroy(world->bullet, body.idx);
+    if (world->body_entity && body.idx < world->body_capacity) {
+        world->body_entity[body.idx] = 0;
+    }
 }
 
 /* ── Body state queries ────────────────────────────────────────────── */
@@ -327,11 +542,157 @@ uint32_t jce_physics_body_count(const JcePhysicsWorld *world)
 
 void jce_physics_body_set_collision_filter(JcePhysicsWorld *world,
                                            JceBodyHandle body,
-                                           uint16_t group, uint16_t mask)
+                                           uint32_t group, uint32_t mask)
 {
     if (!world || !jce_body_valid(body)) return;
     jce_bullet_body_set_collision_filter(world->bullet, body.idx,
                                           group, mask);
+}
+
+/* ── Material ─────────────────────────────────────────────────────── */
+
+void jce_physics_body_set_material(JcePhysicsWorld *world,
+                                   JceBodyHandle body,
+                                   const struct JcePhysicsMaterial *material)
+{
+    if (!world || !jce_body_valid(body) || !material) return;
+    /* v1: feed dynamic_friction + restitution directly to Bullet, which
+     * runs its own per-contact combine.  Static friction is recorded in
+     * the asset for future use (Bullet has no separate static-friction
+     * channel on btRigidBody).  Combine modes are surfaced through
+     * jce_physics_material_combine() for advanced users. */
+    jce_bullet_body_set_material(world->bullet, body.idx,
+                                  material->dynamic_friction,
+                                  material->restitution);
+}
+
+/* ── Continuous Collision Detection (CCD)  (P3-C.3) ───────────────── */
+
+/*
+ * CCD-mode → Bullet mapping.  DISCRETE disables; the three CONTINUOUS
+ * modes all enable Bullet's swept-CCD with the same parameters.
+ * Distinguishing CONTINUOUS_DYNAMIC / CONTINUOUS_SPECULATIVE matters
+ * to the editor (round-trips through scene save/load) but Bullet 3
+ * exposes only the single setCcdMotionThreshold / SweptSphereRadius
+ * pair.  Aliasing is documented in jce_physics.h.
+ */
+
+/* Per-world side-table: remember the user-selected CCD mode so getters
+ * round-trip through save/load.  Bullet only stores the threshold +
+ * radius, not the enum.  Stored sparsely — DISCRETE = absent. */
+struct JceCcdSlot {
+    uint32_t   idx;
+    JceCcdMode mode;
+};
+
+/* Tiny static cache; physics worlds are singletons in practice but we
+ * key by world pointer to remain correct if multiple worlds exist. */
+#define JCE_CCD_CACHE_CAPACITY 1024
+static struct {
+    const JcePhysicsWorld *world;
+    struct JceCcdSlot      slots[JCE_CCD_CACHE_CAPACITY];
+    uint32_t               count;
+} s_ccd_cache;
+
+static void ccd_cache_set(const JcePhysicsWorld *world, uint32_t idx,
+                          JceCcdMode mode)
+{
+    if (s_ccd_cache.world != world) {
+        s_ccd_cache.world = world;
+        s_ccd_cache.count = 0;
+    }
+    for (uint32_t i = 0; i < s_ccd_cache.count; ++i) {
+        if (s_ccd_cache.slots[i].idx == idx) {
+            if (mode == JCE_CCD_DISCRETE) {
+                /* Compact: swap with last. */
+                s_ccd_cache.slots[i] =
+                    s_ccd_cache.slots[s_ccd_cache.count - 1];
+                s_ccd_cache.count--;
+            } else {
+                s_ccd_cache.slots[i].mode = mode;
+            }
+            return;
+        }
+    }
+    if (mode == JCE_CCD_DISCRETE) return;
+    if (s_ccd_cache.count >= JCE_CCD_CACHE_CAPACITY) return;
+    s_ccd_cache.slots[s_ccd_cache.count].idx  = idx;
+    s_ccd_cache.slots[s_ccd_cache.count].mode = mode;
+    s_ccd_cache.count++;
+}
+
+static JceCcdMode ccd_cache_get(const JcePhysicsWorld *world, uint32_t idx)
+{
+    if (s_ccd_cache.world != world) return JCE_CCD_DISCRETE;
+    for (uint32_t i = 0; i < s_ccd_cache.count; ++i) {
+        if (s_ccd_cache.slots[i].idx == idx)
+            return s_ccd_cache.slots[i].mode;
+    }
+    return JCE_CCD_DISCRETE;
+}
+
+void jce_physics_body_set_ccd_mode(JcePhysicsWorld *world, JceBodyHandle body,
+                                   JceCcdMode mode)
+{
+    if (!world || !jce_body_valid(body)) return;
+
+    if (mode == JCE_CCD_DISCRETE) {
+        jce_bullet_body_set_ccd(world->bullet, body.idx, 0.0f, 0.0f);
+    } else {
+        /* Apply defaults (auto sphere radius from shape AABB). */
+        jce_bullet_body_set_ccd(world->bullet, body.idx,
+                                JCE_CCD_DEFAULT_MOTION_THRESHOLD, 0.0f);
+    }
+    ccd_cache_set(world, body.idx, mode);
+}
+
+JceCcdMode jce_physics_body_get_ccd_mode(const JcePhysicsWorld *world,
+                                         JceBodyHandle body)
+{
+    if (!world || !jce_body_valid(body)) return JCE_CCD_DISCRETE;
+    /* Reconcile the cache with the Bullet state: if the threshold has
+     * been zeroed externally, demote to DISCRETE. */
+    float thr = jce_bullet_body_get_ccd_motion_threshold(world->bullet, body.idx);
+    JceCcdMode cached = ccd_cache_get(world, body.idx);
+    if (thr <= 0.0f) return JCE_CCD_DISCRETE;
+    if (cached == JCE_CCD_DISCRETE) return JCE_CCD_CONTINUOUS;
+    return cached;
+}
+
+void jce_physics_body_set_ccd_motion_threshold(JcePhysicsWorld *world,
+                                               JceBodyHandle body,
+                                               float threshold)
+{
+    if (!world || !jce_body_valid(body)) return;
+    float radius = jce_bullet_body_get_ccd_swept_sphere_radius(world->bullet,
+                                                                body.idx);
+    jce_bullet_body_set_ccd(world->bullet, body.idx, threshold, radius);
+}
+
+float jce_physics_body_get_ccd_motion_threshold(const JcePhysicsWorld *world,
+                                                JceBodyHandle body)
+{
+    if (!world || !jce_body_valid(body)) return 0.0f;
+    return jce_bullet_body_get_ccd_motion_threshold(world->bullet, body.idx);
+}
+
+void jce_physics_body_set_ccd_swept_sphere_radius(JcePhysicsWorld *world,
+                                                  JceBodyHandle body,
+                                                  float radius)
+{
+    if (!world || !jce_body_valid(body)) return;
+    float thr = jce_bullet_body_get_ccd_motion_threshold(world->bullet,
+                                                          body.idx);
+    /* Preserve threshold; only the radius changes.  Pass radius<=0 to
+     * trigger auto-derivation from the shape AABB. */
+    jce_bullet_body_set_ccd(world->bullet, body.idx, thr, radius);
+}
+
+float jce_physics_body_get_ccd_swept_sphere_radius(const JcePhysicsWorld *world,
+                                                   JceBodyHandle body)
+{
+    if (!world || !jce_body_valid(body)) return 0.0f;
+    return jce_bullet_body_get_ccd_swept_sphere_radius(world->bullet, body.idx);
 }
 
 /* ── Constraints ──────────────────────────────────────────────────── */
@@ -372,6 +733,12 @@ void jce_physics_constraint_set_limits(JcePhysicsWorld *world,
 {
     if (!world || !jce_constraint_valid(con)) return;
     jce_bullet_constraint_set_limits(world->bullet, con.idx, lower, upper);
+}
+
+/* Internal accessor used by jce_physics_joint_query.c (P3-C.6). */
+JceBulletWorld *jce_physics_world_bullet_(const JcePhysicsWorld *world)
+{
+    return world ? world->bullet : NULL;
 }
 
 /* ── Character controller ─────────────────────────────────────────── */
@@ -446,9 +813,9 @@ JceVehicleHandle jce_physics_vehicle_create(JcePhysicsWorld *world,
                                               const JceVehicleDesc *desc)
 {
     if (!world || !desc) return JCE_VEHICLE_INVALID;
-    uint16_t group = desc->collision_group ? desc->collision_group
+    uint32_t group = desc->collision_group ? desc->collision_group
                                             : JCE_COLLISION_DEFAULT_GROUP;
-    uint16_t mask  = desc->collision_mask  ? desc->collision_mask
+    uint32_t mask  = desc->collision_mask  ? desc->collision_mask
                                             : JCE_COLLISION_ALL_MASK;
     uint32_t idx = jce_bullet_vehicle_create(world->bullet,
                                               desc->position, desc->rotation,
@@ -523,3 +890,92 @@ float jce_physics_vehicle_get_speed(const JcePhysicsWorld *world,
     return jce_bullet_vehicle_get_speed(
         (JceBulletWorld *)world->bullet, veh.idx);
 }
+
+/* ── P3-C.5: per-body entity tags ──────────────────────────────────── */
+
+void jce_physics_body_set_entity(JcePhysicsWorld *world,
+                                 JceBodyHandle body, uint64_t entity)
+{
+    if (!world || !jce_body_valid(body)) return;
+    if (body.idx >= world->body_capacity || !world->body_entity) return;
+    world->body_entity[body.idx] = entity;
+}
+
+uint64_t jce_physics_body_get_entity(const JcePhysicsWorld *world,
+                                     JceBodyHandle body)
+{
+    if (!world || !jce_body_valid(body)) return 0;
+    if (body.idx >= world->body_capacity || !world->body_entity) return 0;
+    return world->body_entity[body.idx];
+}
+
+/* ── P3-C.5: contact listener subscription ─────────────────────────── */
+
+bool jce_physics_add_contact_listener(JcePhysicsWorld *world,
+                                      jce_contact_listener_fn fn,
+                                      void *ud)
+{
+    if (!world || !fn) return false;
+    if (world->listener_count >= JCE_PHYSICS_MAX_LISTENERS) return false;
+
+    for (uint32_t i = 0; i < world->listener_count; ++i) {
+        if (world->listeners[i].fn == fn && world->listeners[i].ud == ud)
+            return false;
+    }
+
+    world->listeners[world->listener_count].fn = fn;
+    world->listeners[world->listener_count].ud = ud;
+    world->listener_count++;
+    return true;
+}
+
+void jce_physics_remove_contact_listener(JcePhysicsWorld *world,
+                                         jce_contact_listener_fn fn,
+                                         void *ud)
+{
+    if (!world || !fn) return;
+    for (uint32_t i = 0; i < world->listener_count; ++i) {
+        if (world->listeners[i].fn == fn && world->listeners[i].ud == ud) {
+            for (uint32_t j = i + 1; j < world->listener_count; ++j)
+                world->listeners[j - 1] = world->listeners[j];
+            world->listener_count--;
+            return;
+        }
+    }
+}
+
+/* ── P3-C.5: debug draw per-world flush ────────────────────────────── */
+/*
+ * The active line-sink and debug-draw flags live in process-wide
+ * statics in jce_physics_debug.c — they are installed once by the
+ * editor / game.  This per-world function forwards them to the
+ * bullet bridge.
+ */
+
+extern uint32_t              jce_physics_debug_state_flags_(void);
+extern jce_debug_line_fn     jce_physics_debug_state_sink_fn_(void);
+extern void                 *jce_physics_debug_state_sink_ud_(void);
+
+static void debug_line_adapter(float fx, float fy, float fz,
+                               float tx, float ty, float tz,
+                               uint32_t abgr, void *ud)
+{
+    (void)ud;
+    jce_debug_line_fn fn = jce_physics_debug_state_sink_fn_();
+    if (!fn) return;
+    jce_vec3 a = jce_v3(fx, fy, fz);
+    jce_vec3 b = jce_v3(tx, ty, tz);
+    fn(a, b, abgr, jce_physics_debug_state_sink_ud_());
+}
+
+void jce_physics_debug_flush(JcePhysicsWorld *world)
+{
+    if (!world) return;
+    uint32_t flags       = jce_physics_debug_state_flags_();
+    jce_debug_line_fn fn = jce_physics_debug_state_sink_fn_();
+    if (flags == 0 || !fn) return;
+
+    jce_bullet_debug_set_mode(world->bullet, flags);
+    jce_bullet_debug_draw(world->bullet, debug_line_adapter, NULL);
+}
+

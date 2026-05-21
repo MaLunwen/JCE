@@ -16,6 +16,7 @@
 #include <jce/os/core/jce_log.h>
 
 #include <enet/enet.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -324,6 +325,39 @@ uint32_t jce_net_peer_count(const JceNetHost *host)
 JceNetTransport jce_net_get_transport(void)
 {
     return JCE_NET_TRANSPORT_ENET;
+}
+
+bool jce_net_peer_stats(const JceNetHost *host, JcePeerHandle peer,
+                        JceNetPeerStats *out)
+{
+    if (!out) return false;
+    memset(out, 0, sizeof *out);
+    if (!host || !host->enet_host || !peer_idx_valid(host, peer))
+        return false;
+    const ENetPeer *p = &host->enet_host->peers[peer.idx];
+    if (p->state != ENET_PEER_STATE_CONNECTED) return false;
+    out->rtt_ms       = (uint32_t)p->roundTripTime;
+    out->packets_sent = (uint32_t)p->packetsSent;
+    out->packets_lost = (uint32_t)p->packetsLost;
+    out->bytes_in     = (uint64_t)p->incomingDataTotal;
+    out->bytes_out    = (uint64_t)p->outgoingDataTotal;
+    return true;
+}
+
+bool jce_net_peer_address_str(const JceNetHost *host, JcePeerHandle peer,
+                              char *buf, uint32_t buf_size)
+{
+    if (!buf || buf_size == 0) return false;
+    buf[0] = '\0';
+    if (!host || !host->enet_host || !peer_idx_valid(host, peer))
+        return false;
+    const ENetPeer *p = &host->enet_host->peers[peer.idx];
+    if (p->state != ENET_PEER_STATE_CONNECTED) return false;
+    char ip[64] = {0};
+    if (enet_address_get_host_ip(&p->address, ip, sizeof ip) < 0)
+        return false;
+    snprintf(buf, buf_size, "%s:%u", ip, (unsigned)p->address.port);
+    return true;
 }
 
 #endif /* !__EMSCRIPTEN__ */

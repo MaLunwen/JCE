@@ -83,12 +83,16 @@ typedef enum {
 /* Collision layer defaults                                            */
 /* ================================================================== */
 
-#define JCE_COLLISION_DEFAULT_GROUP  0x0001
-#define JCE_COLLISION_ALL_MASK      0xFFFF
+#define JCE_COLLISION_DEFAULT_GROUP  0x00000001u
+#define JCE_COLLISION_ALL_MASK      0xFFFFFFFFu
 
 /* ================================================================== */
 /* Contact / collision event                                           */
 /* ================================================================== */
+
+/* Forward-declared in jce_physics_debug.h — kept as int8_t storage here
+ * so this POD header stays free of additional includes. */
+typedef int8_t JceContactEventTypeRaw;
 
 typedef struct {
     JceBodyHandle body_a;
@@ -97,6 +101,18 @@ typedef struct {
     float         point[3];      /* world-space contact point */
     float         depth;         /* penetration depth */
     bool          is_trigger;    /* true if one of the bodies is a trigger */
+
+    /* --- P3-C.5 additive fields --------------------------------- */
+    /* Holds a JceContactEventType (see jce_physics_debug.h).  Stored
+     * as int8_t to keep this header dependency-free.  Defaults to
+     * JCE_CONTACT_BEGIN (0) for legacy callers. */
+    JceContactEventTypeRaw type;
+    uint8_t       _pad[3];
+
+    /* Opaque per-body tags (e.g. ecs_entity_t cast to u64).  Populated
+     * from jce_physics_body_set_entity(); 0 if unset. */
+    uint64_t      entity_a;
+    uint64_t      entity_b;
 } JceContactEvent;
 
 /* Callback invoked on collision begin / end. */

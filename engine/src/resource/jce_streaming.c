@@ -99,10 +99,22 @@ struct JceStreamingSystem {
     uint32_t               refused_loads;
     JceStreamingPressureFn pressure_cb;
     void                  *pressure_cb_user;
+
+    /* Engine-internal pressure hook chain (P3-A.2).  Fires before the
+     * user-facing pressure_cb so layers like texture mip streaming can
+     * react without consuming the single user callback slot. */
+    JceStreamingPressureFn pressure_hooks[JCE_STREAMING_MAX_PRESSURE_HOOKS];
+    void                  *pressure_hook_users[JCE_STREAMING_MAX_PRESSURE_HOOKS];
+    uint32_t               pressure_hook_count;
 };
 
 /* Soft threshold: we enter SOFT pressure at 85% of budget. */
 #define JCE_STREAMING_SOFT_THRESHOLD 0.85f
+
+/* Live-system registration for the P3-B.3 lifecycle bridge.  Defined
+ * below; forward-declared here so create/destroy can plug in. */
+static void live_register(JceStreamingSystem *sys);
+static void live_unregister(JceStreamingSystem *sys);
 
 static JceStreamingPressure compute_pressure(uint64_t used, uint64_t budget)
 {
@@ -120,6 +132,12 @@ static void update_pressure(JceStreamingSystem *sys, uint64_t budget_bytes)
     if (now != sys->pressure) {
         JceStreamingPressure prev = sys->pressure;
         sys->pressure = now;
+        /* Engine-internal hooks first (e.g. texture mip streaming). */
+        for (uint32_t i = 0; i < sys->pressure_hook_count; i++) {
+            if (sys->pressure_hooks[i])
+                sys->pressure_hooks[i](prev, now, sys->memory_used, budget_bytes,
+                                       sys->pressure_hook_users[i]);
+        }
         if (sys->pressure_cb)
             sys->pressure_cb(prev, now, sys->memory_used, budget_bytes,
                              sys->pressure_cb_user);
@@ -355,12 +373,15 @@ JceStreamingSystem *jce_streaming_create(const JceStreamingConfig *config)
                 config->mode == JCE_STREAM_RADIAL ? "radial" : "rectangular",
                 (double)sys->config.frame_budget_ms,
                 sys->config.single_thread ? "single-thread" : "multi-thread");
+    live_register(sys);
     return sys;
 }
 
 void jce_streaming_destroy(JceStreamingSystem *sys)
 {
     if (!sys) return;
+
+    live_unregister(sys);
 
     /* Wait for pending loads and unload all chunks. */
     for (uint32_t i = 0; i < sys->chunk_count; i++) {
@@ -647,6 +668,92 @@ void jce_streaming_set_pressure_callback(JceStreamingSystem    *sys,
     if (!sys) return;
     sys->pressure_cb      = fn;
     sys->pressure_cb_user = user;
+}
+
+bool jce_streaming_add_pressure_hook(JceStreamingSystem    *sys,
+                                      JceStreamingPressureFn fn,
+                                      void                  *user)
+{
+    if (!sys || !fn) return false;
+    if (sys->pressure_hook_count >= JCE_STREAMING_MAX_PRESSURE_HOOKS) {
+        LOG_WARN(LOG_TAG, "pressure hook table full (%d) — refusing registration",
+                 JCE_STREAMING_MAX_PRESSURE_HOOKS);
+        return false;
+    }
+    uint32_t i = sys->pressure_hook_count++;
+    sys->pressure_hooks[i]      = fn;
+    sys->pressure_hook_users[i] = user;
+    return true;
+}
+
+/* ── Low-memory broadcast (P3-B.3 lifecycle bridge) ───────────────── */
+
+/* Track every live streaming system so the engine's lifecycle listener
+ * can broadcast OS LOW_MEMORY signals without holding an explicit
+ * reference.  Bounded fixed array — typical apps create 0..2 systems. */
+#define JCE_STREAMING_MAX_LIVE 8
+static JceStreamingSystem *s_live_systems[JCE_STREAMING_MAX_LIVE];
+static uint32_t            s_live_count;
+
+static void live_register(JceStreamingSystem *sys)
+{
+    if (!sys) return;
+    if (s_live_count >= JCE_STREAMING_MAX_LIVE) {
+        LOG_WARN(LOG_TAG, "live system table full (%d) — low-memory broadcast may miss this system",
+                 JCE_STREAMING_MAX_LIVE);
+        return;
+    }
+    s_live_systems[s_live_count++] = sys;
+}
+
+static void live_unregister(JceStreamingSystem *sys)
+{
+    if (!sys) return;
+    for (uint32_t i = 0; i < s_live_count; i++) {
+        if (s_live_systems[i] != sys) continue;
+        const uint32_t tail = s_live_count - i - 1u;
+        if (tail > 0u)
+            memmove(&s_live_systems[i], &s_live_systems[i + 1u],
+                    (size_t)tail * sizeof(s_live_systems[0]));
+        s_live_count--;
+        return;
+    }
+}
+
+void jce_streaming_signal_low_memory(JceStreamingSystem *sys)
+{
+    if (!sys) return;
+
+    JceStreamingPressure prev = sys->pressure;
+    if (prev == JCE_STREAM_PRESSURE_HARD) {
+        /* Re-fire hooks anyway so listeners can free additional caches
+         * each time the OS nags us; treat it as a HARD→HARD pulse. */
+    } else {
+        sys->pressure            = JCE_STREAM_PRESSURE_HARD;
+        sys->pressure_high_water = JCE_STREAM_PRESSURE_HARD;
+    }
+
+    const uint64_t budget = (uint64_t)sys->config.budget_mb * 1024ULL * 1024ULL;
+    for (uint32_t i = 0; i < sys->pressure_hook_count; i++) {
+        if (sys->pressure_hooks[i])
+            sys->pressure_hooks[i](prev, JCE_STREAM_PRESSURE_HARD,
+                                   sys->memory_used, budget,
+                                   sys->pressure_hook_users[i]);
+    }
+    if (sys->pressure_cb)
+        sys->pressure_cb(prev, JCE_STREAM_PRESSURE_HARD,
+                         sys->memory_used, budget,
+                         sys->pressure_cb_user);
+
+    LOG_INFO(LOG_TAG, "low-memory signal: pressure forced to HARD (used=%llu budget=%llu)",
+             (unsigned long long)sys->memory_used,
+             (unsigned long long)budget);
+}
+
+void jce_streaming_signal_low_memory_all(void)
+{
+    for (uint32_t i = 0; i < s_live_count; i++)
+        jce_streaming_signal_low_memory(s_live_systems[i]);
 }
 
 bool jce_streaming_chunk_loaded(const JceStreamingSystem *sys,

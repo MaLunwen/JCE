@@ -214,3 +214,19 @@ java "-Djava.library.path=build/jni/desktop/caged_kingdom" -cp build/jni/desktop
 
 **`cppcheck` fails in VS generator** — configure with `-DJCE_ENABLE_CPPCHECK=OFF`
 or switch to Ninja.
+
+**Shader compile disabled / shaderc not found** — CMake warns instead of failing so
+a pre-baked pak still links the editor. To re-enable shader builds, point CMake or your
+shell at a host shaderc binary via **either** mechanism (env takes priority):
+
+```powershell
+# Option A — environment variable (CI-friendly, no CMake reconfigure needed)
+$env:JCE_SHADERC_EXECUTABLE = "C:\path\to\shaderc.exe"
+cmake --build ...
+
+# Option B — CMake cache variable
+cmake ... -DJCE_SHADERC_EXECUTABLE="C:\path\to\shaderc.exe"
+```
+
+The native Windows build produces `shaderc.exe` under the bgfx Conan package folder
+and is picked up automatically when `bgfx` is built with `tools=True` (the default).

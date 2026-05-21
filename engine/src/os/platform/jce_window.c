@@ -119,6 +119,12 @@ void jce_window_get_size(JceWindow *win, uint32_t *w, uint32_t *h)
     if (h) *h = win ? win->pixel_h : 0;
 }
 
+void jce_window_set_title(JceWindow *win, const char *title)
+{
+    if (!win || !win->sdl_win || !title) return;
+    SDL_SetWindowTitle(win->sdl_win, title);
+}
+
 void jce_window_get_logical(JceWindow *win, int *w, int *h)
 {
     if (w) *w = win ? win->logical_w : 0;

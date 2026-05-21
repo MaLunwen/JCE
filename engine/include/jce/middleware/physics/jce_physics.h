@@ -60,8 +60,8 @@ typedef struct {
     float        restitution;  /* default: 0.0 */
     float        linear_damping;
     float        angular_damping;
-    uint16_t     collision_group; /* default: JCE_COLLISION_DEFAULT_GROUP */
-    uint16_t     collision_mask;  /* default: JCE_COLLISION_ALL_MASK */
+    uint32_t     collision_group; /* default: JCE_COLLISION_DEFAULT_GROUP */
+    uint32_t     collision_mask;  /* default: JCE_COLLISION_ALL_MASK */
     bool         is_trigger;      /* trigger bodies: no contact response */
 } JceBodyDesc;
 
@@ -108,6 +108,67 @@ JceRaycastResult jce_physics_raycast(const JcePhysicsWorld *world,
                                      float max_distance);
 
 /* ================================================================== */
+/* Continuous Collision Detection (CCD)  (P3-C.3)                      */
+/* ================================================================== */
+
+/*
+ * Per-body collision-detection mode.  Unity parity.
+ *
+ * DISCRETE                — Bullet default.  Fastest, but fast-moving
+ *                           bodies may tunnel through thin colliders.
+ * CONTINUOUS              — Swept CCD against static / kinematic
+ *                           geometry.  ~2-5× more expensive than
+ *                           discrete; use only for small fast objects
+ *                           (bullets, thrown items).
+ * CONTINUOUS_DYNAMIC      — Same as CONTINUOUS in this Bullet build.
+ *                           Bullet's swept CCD already checks against
+ *                           dynamic bodies whenever both sides have a
+ *                           non-zero motion threshold; kept as a
+ *                           distinct enum for Unity parity / future
+ *                           backends.
+ * CONTINUOUS_SPECULATIVE  — Speculative contacts are a world-wide
+ *                           solver toggle in Bullet, not a per-body
+ *                           flag.  Aliased to CONTINUOUS for now; the
+ *                           inspector still records the user's choice
+ *                           so it round-trips through save/load.
+ */
+typedef enum JceCcdMode {
+    JCE_CCD_DISCRETE              = 0,
+    JCE_CCD_CONTINUOUS            = 1,
+    JCE_CCD_CONTINUOUS_DYNAMIC    = 2,
+    JCE_CCD_CONTINUOUS_SPECULATIVE = 3
+} JceCcdMode;
+
+/* Sensible Bullet defaults applied by set_ccd_mode when mode != DISCRETE.
+ * Threshold = distance per frame above which CCD kicks in. */
+#define JCE_CCD_DEFAULT_MOTION_THRESHOLD 0.01f
+
+/* Switch the body's CCD mode.  When enabling CCD, motion threshold is
+ * reset to the default and the swept-sphere radius is auto-computed
+ * from the body's collision shape AABB (≈ 0.5 × min half-extent).
+ * Use the explicit setters below to override after enabling. */
+JCE_API void       JCE_CALL jce_physics_body_set_ccd_mode(JcePhysicsWorld *world,
+                                                          JceBodyHandle body,
+                                                          JceCcdMode mode);
+JCE_API JceCcdMode JCE_CALL jce_physics_body_get_ccd_mode(const JcePhysicsWorld *world,
+                                                          JceBodyHandle body);
+
+/* Motion threshold (metres / frame).  0 disables CCD on Bullet's side. */
+JCE_API void  JCE_CALL jce_physics_body_set_ccd_motion_threshold(JcePhysicsWorld *world,
+                                                                 JceBodyHandle body,
+                                                                 float threshold);
+JCE_API float JCE_CALL jce_physics_body_get_ccd_motion_threshold(const JcePhysicsWorld *world,
+                                                                 JceBodyHandle body);
+
+/* Embedded swept-sphere radius used by Bullet's CCD solver.  Should be
+ * a little smaller than the shape's smallest half-extent. */
+JCE_API void  JCE_CALL jce_physics_body_set_ccd_swept_sphere_radius(JcePhysicsWorld *world,
+                                                                    JceBodyHandle body,
+                                                                    float radius);
+JCE_API float JCE_CALL jce_physics_body_get_ccd_swept_sphere_radius(const JcePhysicsWorld *world,
+                                                                    JceBodyHandle body);
+
+/* ================================================================== */
 /* Collision callbacks                                                 */
 /* ================================================================== */
 
@@ -128,7 +189,21 @@ JCE_API uint32_t jce_physics_body_count(const JcePhysicsWorld *world);
 /* Change collision group/mask on an existing body. */
 JCE_API void JCE_CALL jce_physics_body_set_collision_filter(JcePhysicsWorld *world,
                                                             JceBodyHandle body,
-                                                            uint16_t group, uint16_t mask);
+                                                            uint32_t group, uint32_t mask);
+
+/* ================================================================== */
+/* Material                                                            */
+/* ================================================================== */
+
+/* Apply a JcePhysicsMaterial to a live body.  Sets the body's friction
+ * to material->dynamic_friction and restitution to material->restitution.
+ * Bullet's per-contact combine (multiply for friction, max for
+ * restitution) runs on these per-body values.  For JCE-level combine
+ * semantics, use jce_physics_material_combine() at material-set time. */
+struct JcePhysicsMaterial;
+JCE_API void JCE_CALL jce_physics_body_set_material(JcePhysicsWorld *world,
+                                                    JceBodyHandle body,
+                                                    const struct JcePhysicsMaterial *material);
 
 /* ================================================================== */
 /* Constraints                                                         */
@@ -234,8 +309,8 @@ typedef struct {
     float    max_steering_rad;        /* clamp on absolute steer input */
 
     /* Collision filter for chassis. */
-    uint16_t collision_group;
-    uint16_t collision_mask;
+    uint32_t collision_group;
+    uint32_t collision_mask;
 } JceVehicleDesc;
 
 JCE_API JceVehicleHandle jce_physics_vehicle_create(JcePhysicsWorld *world,

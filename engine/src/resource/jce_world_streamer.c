@@ -21,6 +21,7 @@
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/renderer/jce_texture.h>
 
 #include "os/core/jce_memory.h"
 
@@ -31,6 +32,36 @@
 #define LOG_TAG             "world_streamer"
 #define MAX_WORLD_CHUNKS    256
 #define MAX_ENTITY_SLOTS    2048   /* per-chunk entity roster capacity */
+
+/* P3-A.2 — streaming pressure → texture mip-bias bridge.
+ *
+ * Translates the three-level streaming pressure signal into a global
+ * mip bias that the renderer/texture system honors when scheduling
+ * mip residency.  Registered as an internal chained hook so it never
+ * stomps on the user-facing pressure callback slot.
+ *
+ *   OK   -> bias 0  (full quality)
+ *   SOFT -> bias 1  (drop top mip)
+ *   HARD -> bias 2  (drop two top mips)
+ */
+static void mip_streaming_pressure_hook(JceStreamingPressure prev,
+                                         JceStreamingPressure curr,
+                                         uint64_t              memory_used,
+                                         uint64_t              budget_bytes,
+                                         void                 *user_data)
+{
+    (void)prev; (void)memory_used; (void)budget_bytes; (void)user_data;
+    int8_t bias;
+    switch (curr) {
+    case JCE_STREAM_PRESSURE_SOFT: bias = 1; break;
+    case JCE_STREAM_PRESSURE_HARD: bias = 2; break;
+    case JCE_STREAM_PRESSURE_OK:   /* fallthrough */
+    default:                       bias = 0; break;
+    }
+    jce_texture_set_global_mip_bias(bias);
+    LOG_DEBUG(LOG_TAG, "streaming pressure %s -> global texture mip bias %d",
+              jce_streaming_pressure_name(curr), (int)bias);
+}
 
 /* ── Per-chunk entity roster ─────────────────────────────────────── */
 
@@ -183,6 +214,12 @@ JceWorldStreamer *jce_world_streamer_create(
         jce_streaming_set_thread_pool(ws->ss, thread_pool);
 
     jce_streaming_set_callbacks(ws->ss, on_chunk_loaded, on_chunk_unloaded, ws);
+
+    /* P3-A.2: install runtime mip-streaming pressure hook so the
+     * texture system drops/restores top mips automatically as the
+     * streaming budget tightens.  Chained so the user-facing
+     * pressure callback slot stays free. */
+    jce_streaming_add_pressure_hook(ws->ss, mip_streaming_pressure_hook, NULL);
 
     LOG_INFO(LOG_TAG, "world streamer created (r=%.0f/%.0f, budget=%u MiB)",
              config->load_radius, config->unload_radius, config->budget_mb);

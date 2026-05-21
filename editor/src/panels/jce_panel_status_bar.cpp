@@ -12,6 +12,7 @@
 #include "core/jce_editor_state.h"
 #include "core/jce_editor_i18n.h"
 
+#include <jce/renderer/jce_renderer_caps.h>
 #include <jce/tools/jce_imgui.hpp>
 #include <cstdio>
 #include <cstring>
@@ -33,6 +34,75 @@ static const char *short_scene_name(const char *path)
     const char *bslash = std::strrchr(path, '\\');
     const char *name = slash > bslash ? slash : bslash;
     return name ? name + 1 : path;
+}
+
+/* GPU tier widget — colored label + click popup to override the
+ * renderer-detected tier (editor-session only; never persisted). */
+static const char *tier_i18n_key(JceGpuTier t)
+{
+    switch (t) {
+        case JCE_GPU_TIER_LOW:    return "statusBar.gpuTier.low";
+        case JCE_GPU_TIER_MEDIUM: return "statusBar.gpuTier.mid";
+        case JCE_GPU_TIER_HIGH:   return "statusBar.gpuTier.high";
+        case JCE_GPU_TIER_ULTRA:  return "statusBar.gpuTier.ultra";
+        default:                  return "statusBar.gpuTier.low";
+    }
+}
+
+static ImVec4 tier_color(JceGpuTier t)
+{
+    switch (t) {
+        case JCE_GPU_TIER_LOW:    return ImVec4(0.95f, 0.35f, 0.35f, 1.0f); /* red    */
+        case JCE_GPU_TIER_MEDIUM: return ImVec4(0.95f, 0.80f, 0.25f, 1.0f); /* yellow */
+        case JCE_GPU_TIER_HIGH:   return ImVec4(0.40f, 0.85f, 0.45f, 1.0f); /* green  */
+        case JCE_GPU_TIER_ULTRA:  return ImVec4(0.45f, 0.85f, 0.95f, 1.0f); /* cyan   */
+        default:                  return ImVec4(0.80f, 0.80f, 0.80f, 1.0f);
+    }
+}
+
+static void draw_gpu_tier_segment(void)
+{
+    JceGpuTier  tier        = jce_renderer_get_tier();
+    bool        overridden  = jce_renderer_tier_is_overridden();
+    const char *label       = jce_editor_i18n("statusBar.gpuTier.label");
+    const char *name        = jce_editor_i18n(tier_i18n_key(tier));
+    const char *over_suffix = overridden
+        ? jce_editor_i18n("statusBar.gpuTier.overridden")
+        : "";
+
+    ImGui::TextUnformatted(label);
+    ImGui::SameLine(0, 4);
+    ImGui::PushStyleColor(ImGuiCol_Text, tier_color(tier));
+    /* Use a Selectable so the whole segment is clickable. */
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "%s%s%s##jce_gpu_tier",
+                  name, overridden ? " " : "", over_suffix);
+    ImVec2 sz = ImGui::CalcTextSize(buf);
+    if (ImGui::Selectable(buf, false, ImGuiSelectableFlags_DontClosePopups,
+                          ImVec2(sz.x, 0))) {
+        ImGui::OpenPopup("##jce_gpu_tier_menu");
+    }
+    ImGui::PopStyleColor();
+
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", jce_editor_i18n("statusBar.gpuTier.tooltip"));
+    }
+
+    if (ImGui::BeginPopup("##jce_gpu_tier_menu")) {
+        if (ImGui::MenuItem(jce_editor_i18n("statusBar.gpuTier.menu.setLow")))
+            jce_renderer_set_tier_override(JCE_GPU_TIER_LOW);
+        if (ImGui::MenuItem(jce_editor_i18n("statusBar.gpuTier.menu.setMid")))
+            jce_renderer_set_tier_override(JCE_GPU_TIER_MEDIUM);
+        if (ImGui::MenuItem(jce_editor_i18n("statusBar.gpuTier.menu.setHigh")))
+            jce_renderer_set_tier_override(JCE_GPU_TIER_HIGH);
+        if (ImGui::MenuItem(jce_editor_i18n("statusBar.gpuTier.menu.setUltra")))
+            jce_renderer_set_tier_override(JCE_GPU_TIER_ULTRA);
+        ImGui::Separator();
+        if (ImGui::MenuItem(jce_editor_i18n("statusBar.gpuTier.menu.clearOverride"),
+                            nullptr, false, overridden))
+            jce_renderer_clear_tier_override();
+        ImGui::EndPopup();
+    }
 }
 
 void jce_editor_panel_status_bar(void)
@@ -81,6 +151,10 @@ void jce_editor_panel_status_bar(void)
         ImGui::SameLine(); ImGui::TextUnformatted(" | ");
         ImGui::SameLine();
         ImGui::Text("%s", play_state_label(jce_state_get_play_state()));
+
+        ImGui::SameLine(); ImGui::TextUnformatted(" | ");
+        ImGui::SameLine();
+        draw_gpu_tier_segment();
 
         /* Right side: build/status placeholder. Hooks in once a build
          * subsystem reports progress globally. */

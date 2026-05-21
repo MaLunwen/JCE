@@ -72,6 +72,8 @@ JCE_API const char *jce_bundle_catalog_dep_at  (const JceBundleCatalog *cat,
                                                 uint32_t idx);
 JCE_API uint64_t    jce_bundle_catalog_size_bytes(const JceBundleCatalog *cat,
                                                   const char *bundle_id);
+JCE_API const char *jce_bundle_catalog_content_hash(const JceBundleCatalog *cat,
+                                                    const char *bundle_id);
 
 /* Mount a bundle (and all its declared dependencies) onto the
  * filesystem.  Each call bumps the bundle's refcount.  Returns

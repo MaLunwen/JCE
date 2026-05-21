@@ -26,7 +26,7 @@ extern "C" {
 #include <jce/runtime/jce_game_module.h>
 extern void jce_game_module_set_active_scene(JceScene *scene);
 
-/* Lighting panel accessors — defined in jce_panel_lighting.cpp */
+/* Lighting panel accessors — defined in jce_panel_lighting_settings.cpp */
 bool jce_editor_lighting_get_fog_enabled(void);
 void jce_editor_lighting_get_fog_params(JceVolumetricFogParams *out);
 void jce_editor_lighting_get_ambient(float out_color_rgb[3], float *out_intensity);

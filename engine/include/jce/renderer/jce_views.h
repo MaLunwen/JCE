@@ -34,6 +34,12 @@
  * doesn't get tone-mapped or bloomed. Targets the postfx output FBO. */
 #define JCE_VIEW_EDITOR_OVERLAY 50
 
+/* Editor material-graph live preview (offscreen sphere). Sits between
+ * the editor's main scene viewport (3) and the post-fx / overlay
+ * range, so the preview can be drawn while editor scene rendering is
+ * still in progress without view-ordering surprises. */
+#define JCE_VIEW_EDITOR_PREVIEW 60
+
 /* ImGui editor overlay (renders before UI overlay so HUD sits on top). */
 #define JCE_VIEW_IMGUI       250
 

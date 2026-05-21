@@ -11,6 +11,8 @@
 
 #include <jce/tools/jce_imgui.hpp>
 
+#include <cstdio>
+
 extern "C" void jce_editor_panel_shader_graph_content(void)
 {
     ImGui::TextWrapped("%s", jce_editor_i18n("shaderGraph.intro"));
@@ -23,4 +25,25 @@ extern "C" void jce_editor_panel_shader_graph_content(void)
     ImGui::Separator();
     ImGui::TextDisabled("%s", jce_editor_i18n("shaderGraph.future1"));
     ImGui::TextDisabled("%s", jce_editor_i18n("shaderGraph.future2"));
+}
+
+/* Shim: Shader Graph has been merged into the Material Graph
+ * "Graph Authoring" workbench as a tab.  Activating this panel now
+ * redirects to that workbench and requests the Shader tab.  Symbol
+ * kept so menu/hotkey entries registered against JCE_PANEL_SHADER_GRAPH
+ * keep working. */
+extern "C" void jce_editor_panel_shader_graph(void)
+{
+    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_SHADER_GRAPH);
+    if (!vis || !*vis) return;
+    *vis = false;
+
+    bool *mg_vis = jce_editor_panel_visible_ptr(JCE_PANEL_MATERIAL_GRAPH);
+    if (mg_vis) *mg_vis = true;
+
+    char title[96];
+    snprintf(title, sizeof(title), "%s###jce_material_graph",
+             jce_editor_i18n("materialGraph.title"));
+    ImGui::SetWindowFocus(title);
+    jce_panel_material_graph_request_tab(1);
 }

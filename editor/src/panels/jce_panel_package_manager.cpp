@@ -302,7 +302,28 @@ extern "C" void jce_editor_panel_package_manager_content(void)
         jce_editor_i18n("packageManager.runtimeNote"));
 }
 
+extern "C" void package_manager_draw_content(void)
+{
+    jce_editor_panel_package_manager_content();
+}
+
+/* Shim: Package Manager has been merged into the Bundle Browser
+ * "Asset Pipeline" workbench as a tab.  Activating this panel now
+ * redirects to that workbench and requests the Package Manager tab.
+ * Symbol kept so the menu/hotkey entries registered against
+ * JCE_PANEL_PACKAGE_MANAGER keep working. */
 extern "C" void jce_editor_panel_package_manager(void)
 {
-    /* Reserved for future toolbar/integration logic. Drawn by layout. */
+    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_PACKAGE_MANAGER);
+    if (!vis || !*vis) return;
+    *vis = false;
+
+    bool *bb_vis = jce_editor_panel_visible_ptr(JCE_PANEL_BUNDLE_BROWSER);
+    if (bb_vis) *bb_vis = true;
+
+    char title[128];
+    std::snprintf(title, sizeof(title), "%s###bundle_browser",
+                  jce_editor_i18n("panel.bundle_browser.title"));
+    ImGui::SetWindowFocus(title);
+    jce_panel_bundle_browser_request_tab(2);
 }

@@ -13,6 +13,7 @@ extern "C" {
 
 typedef enum {
     JCE_RUN_IDLE = 0,
+    JCE_RUN_BUILDING,
     JCE_RUN_RUNNING,
     JCE_RUN_STOPPING,
     JCE_RUN_EXITED,

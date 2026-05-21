@@ -20,6 +20,9 @@ JCE_EXTERN_C_BEGIN
 /* Opaque texture handle wrapping bgfx_texture_handle_t. */
 typedef struct { uint16_t idx; } JceTexture;
 
+/* Public alias used by the streaming / mip residency API. */
+typedef JceTexture JceTextureId;
+
 #define JCE_TEXTURE_INVALID ((JceTexture){ UINT16_MAX })
 
 /* Sampler flags for texture loading. */

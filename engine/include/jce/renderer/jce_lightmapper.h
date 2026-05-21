@@ -70,6 +70,30 @@ jce_lightmapper_bake_direct(const JceLightmapBakeDesc      *desc,
                             const JceLightmapLight    *lights, int light_count,
                             uint8_t                  *out_rgba);
 
+/*
+ * Bake SH9 (order-2 real spherical harmonics) for an array of probe positions.
+ *
+ * For each probe, hemisphere samples are drawn (Monte-Carlo with cosine
+ * weighting) against the provided occluder list; surviving rays accumulate
+ * per-light irradiance projected onto the 9 SH basis functions.
+ *
+ *   positions    — probe positions in world space, shape [probe_count][3]
+ *   probe_count  — number of probes
+ *   occ, occ_count   — scene occluder list (reuse from lightmap bake)
+ *   lights, light_count — scene light list
+ *   sample_count — hemisphere samples per probe (recommended: 256–2048)
+ *   out_sh9      — output array [probe_count][9][3] (9 coeffs × RGB)
+ *
+ * Returns 0 on success, negative on failure (NULL pointer / zero count).
+ */
+JCE_API int JCE_CALL
+jce_lightmapper_bake_sh9(const float           (*positions)[3],
+                         int                    probe_count,
+                         const JceLightmapOccluder *occ,  int occ_count,
+                         const JceLightmapLight    *lights, int light_count,
+                         int                    sample_count,
+                         float                (*out_sh9)[9][3]);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_LIGHTMAPPER_H */

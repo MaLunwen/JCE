@@ -15,6 +15,7 @@
 #include <jce/renderer/jce_texture_types.h>
 
 #include <stdbool.h>
+#include <stdint.h>
 
 JCE_EXTERN_C_BEGIN
 
@@ -63,6 +64,12 @@ typedef struct JcePbrMaterial {
 
     /* Render state. */
     bool         double_sided;
+
+    /* Optional custom shader program (runtime-only, NOT serialized).
+     * Set by editor shader-graph "Compile & Bind" to override the
+     * default PBR program for this material.  UINT16_MAX = unset
+     * (caller picks default PBR program). */
+    uint16_t     custom_program;
 } JcePbrMaterial;
 
 /* ================================================================== */
@@ -75,8 +82,18 @@ JCE_API JcePbrMaterial jce_pbr_material_default(void);
 /* Bind the PBR material state (textures, uniforms) for the next draw call.
  * Selects the appropriate PBR shader program.
  * Must be called after jce_renderer_begin_frame_3d. */
-void jce_pbr_material_bind(const JcePbrMaterial *mat,
-                            const JceRenderer *r, uint16_t view_id);
+JCE_API void jce_pbr_material_bind(const JcePbrMaterial *mat,
+                                    const JceRenderer *r, uint16_t view_id);
+
+/* Resolve the effective shader program for this material.
+ *   - returns mat->custom_program (wrapped) when set (!= UINT16_MAX)
+ *   - otherwise returns `default_program` (typically program_pbr).
+ * Callers that submit draws should use this to honour graph-generated
+ * shaders bound at runtime by the editor's Material Graph "Compile &
+ * Bind".  Returns UINT16_MAX inside the wrapper if neither source is
+ * valid, in which case the caller should skip submission. */
+JCE_API uint16_t jce_pbr_material_effective_program(const JcePbrMaterial *mat,
+                                                     uint16_t default_program);
 
 /* Set the global PBR view mode (0=shaded, 1=wireframe, 2=textured/unlit,
  * 3=wireframe+textured). Affects all subsequent jce_pbr_material_bind

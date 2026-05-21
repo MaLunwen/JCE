@@ -32,7 +32,12 @@ typedef enum {
     JCE_PANEL_MATERIAL_GRAPH,
     JCE_PANEL_IMPORT_PRESETS,
     JCE_PANEL_LIGHTMAP_BAKE,
-    JCE_PANEL_LIGHTING,
+    /* DEPRECATED (P5-A.4): merged into JCE_PANEL_LIGHTING_SETTINGS.
+     * Slot kept to preserve the integer index — the visibility bitmap is
+     * serialized to disk by ordinal, so removing this would silently
+     * shift every later panel's persisted toggle. New code must not
+     * reference this; use JCE_PANEL_LIGHTING_SETTINGS instead. */
+    JCE_PANEL_LIGHTING_DEPRECATED,
     JCE_PANEL_AUDIO_MIXER,
     JCE_PANEL_INPUT_MANAGER,
     JCE_PANEL_CURVE_EDITOR,
@@ -62,6 +67,19 @@ typedef enum {
     JCE_PANEL_VCAM_MANAGER,
     JCE_PANEL_REVERB_ZONES,
     JCE_PANEL_SAVE_BROWSER,
+    JCE_PANEL_BUNDLE_BROWSER,
+    JCE_PANEL_PHYSICS_LAYERS,
+    JCE_PANEL_TAGS_LAYERS,
+    JCE_PANEL_LIGHTING_SETTINGS,
+    JCE_PANEL_BUILD_REPORT,
+    JCE_PANEL_SYSTEMS,
+    JCE_PANEL_PROJECT_SETTINGS,
+    JCE_PANEL_USER_PREFERENCES,
+    JCE_PANEL_LAN_DISCOVERY,
+    JCE_PANEL_NETWORK_STATS,
+    JCE_PANEL_ANIMATION_RIGGING,
+    JCE_PANEL_RENDER_PIPELINE,
+    JCE_PANEL_PROFILE_ANALYZER,
     JCE_PANEL_COUNT
 } JceEditorPanel;
 
@@ -87,26 +105,34 @@ void  jce_editor_panel_timeline(void);
 void  jce_editor_panel_assets(void);
 void  jce_editor_panel_file_viewer(void);
 void  jce_editor_panel_postfx(void);
-void  jce_editor_panel_profiler(void);
 void  jce_editor_panel_particle_editor(void);
 void  jce_editor_panel_material_graph(void);
+/* Open .matgraph.json (or auto-derive one from a .mat.json) in the
+ * Material Graph panel.  Routes used by the Asset Browser double-click,
+ * the file viewer (.matgraph.json route), and the Inspector's
+ * "Open in Material Graph" button.  No-op on NULL / empty path. */
+void  jce_editor_open_material_graph(const char *path);
 void  jce_editor_panel_import_presets(void);
 void  jce_editor_panel_lightmap_bake(void);
-void  jce_editor_panel_lighting(void);
 void  jce_editor_panel_audio_mixer(void);
 void  jce_editor_panel_input_manager(void);
 void  jce_editor_panel_curve_editor(void);
 void  jce_editor_panel_animation_editor(void);
+void  jce_panel_animation_editor_request_tab(int idx);
+/* 0=Editor 1=StateMachine 2=Curves 3=Sequencer 4=Timeline 5=Rigging */
+int   jce_panel_animation_editor_current_tab(void);
 void  jce_editor_panel_animator_sm(void);
 void  jce_editor_panel_sequencer(void);
 void  jce_editor_panel_navmesh(void);
 void  jce_editor_panel_terrain(void);
 void  jce_editor_panel_preferences(void);
+void  jce_editor_panel_user_preferences(void);
 void  jce_editor_panel_package_manager(void);
 void  jce_editor_panel_frame_debugger(void);
-void  jce_editor_panel_sprite_editor(void);
-void  jce_editor_panel_tile_palette(void);
 void  jce_editor_panel_vfx_graph(void);
+void  jce_editor_panel_animation_rigging(void);
+void  jce_editor_panel_render_pipeline_content(void);
+void  jce_editor_panel_render_pipeline_tick(void);
 void  jce_editor_panel_test_runner(void);
 void  jce_editor_panel_build_profiles(void);
 void  jce_editor_panel_toolbar(void);
@@ -122,12 +148,10 @@ void  jce_editor_panel_timeline_content(void);
 void  jce_editor_panel_assets_content(void);
 void  jce_editor_panel_file_viewer_content(void);
 void  jce_editor_panel_postfx_content(void);
-void  jce_editor_panel_lighting_content(void);
 /* Per-frame tick: detect panel open/close transitions and apply
  * preview enable/disable to the live engine pipeline. Must be called
  * every frame regardless of panel visibility. */
 void  jce_editor_panel_postfx_tick(void);
-void  jce_editor_panel_lighting_tick(void);
 void  jce_editor_panel_audio_mixer_content(void);
 void  jce_editor_panel_input_manager_content(void);
 void  jce_editor_panel_package_manager_content(void);
@@ -143,12 +167,50 @@ void  jce_editor_panel_physics_debugger_content(void);
 void  jce_editor_panel_light_explorer_content(void);
 void  jce_editor_panel_reflection_probes_content(void);
 void  jce_editor_panel_shader_graph_content(void);
+void  jce_editor_panel_shader_graph(void);
+void  jce_editor_panel_particle_editor_content(void);
+void  jce_panel_material_graph_request_tab(int idx);
+int   jce_panel_material_graph_current_tab(void);
 void  jce_editor_panel_search_content(void);
 void  jce_editor_panel_version_control_content(void);
 void  jce_editor_panel_time_of_day_content(void);
 void  jce_editor_panel_vcam_manager_content(void);
 void  jce_editor_panel_reverb_zones_content(void);
 void  jce_editor_panel_save_browser_content(void);
+void  jce_editor_panel_bundle_browser_content(void);
+void  jce_panel_bundle_browser_request_tab(int idx);
+int   jce_panel_bundle_browser_current_tab(void);
+void  jce_editor_panel_physics_layers(void);
+void  jce_editor_panel_physics_layers_content(void);
+void  jce_editor_panel_tags_layers(void);
+void  jce_editor_panel_tags_layers_content(void);
+void  jce_editor_panel_lighting_settings_content(void);
+void  jce_panel_lighting_settings_request_tab(int idx);
+int   jce_panel_lighting_settings_current_tab(void);
+int   jce_panel_lighting_settings_current_inner_tab(void);
+void  jce_editor_lighting_settings_focus_tab_time_of_day(void);
+void  jce_editor_lighting_settings_focus_tab_light_explorer(void);
+void  jce_editor_panel_lightmap_bake_content(void);
+void  jce_editor_panel_reflection_probes(void);
+void  jce_editor_panel_render_pipeline(void);
+void  jce_editor_panel_build_report(void);
+void  jce_editor_panel_build_report_content(void);
+void  jce_panel_build_profiles_request_tab(int idx);
+int   jce_panel_build_profiles_current_tab(void);
+void  jce_editor_panel_systems_content(void);
+void  jce_editor_panel_project_settings(void);
+void  jce_editor_panel_project_settings_content(void);
+void  jce_editor_panel_lan_discovery(void);
+void  jce_editor_panel_lan_discovery_content(void);
+void  jce_editor_panel_network_stats(void);
+void  jce_editor_panel_network_stats_content(void);
+void  jce_panel_network_stats_request_tab(int idx);
+int   jce_panel_network_stats_current_tab(void);
+void  jce_editor_panel_profile_analyzer(void);
+void  jce_editor_panel_profile_analyzer_content(void);
+void  jce_editor_panel_memory_profiler(void);
+void  jce_panel_profiler_request_tab(int idx);
+int   jce_panel_profiler_current_tab(void);
 
 /* About dialog (modal). */
 void  jce_editor_about_dialog(bool *p_open);

@@ -511,13 +511,23 @@ extern "C" void jce_editor_panel_vfx_graph_content(void)
     ImGui::EndChild();
 }
 
+/* Shim: VFX Graph has been merged into the Material Graph
+ * "Graph Authoring" workbench as a tab.  Activating this panel now
+ * redirects to that workbench and requests the VFX tab.  Symbol kept
+ * so menu/hotkey entries registered against JCE_PANEL_VFX_GRAPH keep
+ * working. */
 extern "C" void jce_editor_panel_vfx_graph(void)
 {
-    if (!*jce_editor_panel_visible_ptr(JCE_PANEL_VFX_GRAPH)) return;
-    char _wt[128];
-    snprintf(_wt, sizeof(_wt), "%s###vfx_graph", jce_editor_i18n("vfxGraph.title"));
-    if (ImGui::Begin(_wt, jce_editor_panel_visible_ptr(JCE_PANEL_VFX_GRAPH), ImGuiWindowFlags_NoFocusOnAppearing)) {
-        jce_editor_panel_vfx_graph_content();
-    }
-    ImGui::End();
+    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_VFX_GRAPH);
+    if (!vis || !*vis) return;
+    *vis = false;
+
+    bool *mg_vis = jce_editor_panel_visible_ptr(JCE_PANEL_MATERIAL_GRAPH);
+    if (mg_vis) *mg_vis = true;
+
+    char title[96];
+    snprintf(title, sizeof(title), "%s###jce_material_graph",
+             jce_editor_i18n("materialGraph.title"));
+    ImGui::SetWindowFocus(title);
+    jce_panel_material_graph_request_tab(2);
 }

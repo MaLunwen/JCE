@@ -571,6 +571,8 @@ static void parse_camera(JceScene *s, JceEntity e, const cJSON *c)
     cc.ortho      = j_bool(c, "orthographic", false);
     if (!cc.ortho) cc.ortho = j_bool(c, "ortho", false);
     if (!cc.ortho) cc.ortho = j_bool(c, "isOrtho", false);
+    cc.stack_index = (uint8_t)(int)j_num(c, "stackIndex", 0);
+    cc.clear_mode  = (uint8_t)(int)j_num(c, "clearMode",  0);
     jce_scene_set_camera(s, e, &cc);
 }
 
@@ -586,6 +588,9 @@ static void parse_dir_light(JceScene *s, JceEntity e, const cJSON *c)
     dl.color.z = (float)j_num(c, "colorB", 1.0);
     dl.intensity = (float)j_num(c, "intensity", 1.0);
     dl.casts_shadow = j_bool(c, "castsShadow", false);
+    /* P3-E.5 — optional cookie projection. */
+    copy_str(dl.cookie_path, sizeof(dl.cookie_path), j_str(c, "cookiePath", ""));
+    dl.cookie_strength = (float)j_num(c, "cookieStrength", 0.0);
     jce_scene_set_dir_light(s, e, &dl);
 }
 
@@ -623,6 +628,10 @@ static void parse_spot_light(JceScene *s, JceEntity e, const cJSON *c)
     float outer_deg = (float)j_num(c, "outerConeDeg", 45.0);
     sl.inner_cone_cos = cosf(inner_deg * JCE_DEG2RAD);
     sl.outer_cone_cos = cosf(outer_deg * JCE_DEG2RAD);
+    /* P3-E.5 — cookie + IES profile (optional, additive). */
+    copy_str(sl.cookie_path, sizeof(sl.cookie_path), j_str(c, "cookiePath", ""));
+    copy_str(sl.ies_path,    sizeof(sl.ies_path),    j_str(c, "iesPath", ""));
+    sl.cookie_strength = (float)j_num(c, "cookieStrength", 0.0);
     jce_scene_set_spot_light(s, e, &sl);
 }
 
@@ -741,6 +750,10 @@ static void parse_unified_light(JceScene *s, JceEntity e, const cJSON *c)
         float outer_deg = (float)j_num2(c, "outerConeDeg", "outer_cone_deg", 35.0);
         sl.inner_cone_cos = cosf(inner_deg * JCE_DEG2RAD);
         sl.outer_cone_cos = cosf(outer_deg * JCE_DEG2RAD);
+        /* P3-E.5 — cookie + IES profile (additive). */
+        copy_str(sl.cookie_path, sizeof(sl.cookie_path), j_str(c, "cookiePath", ""));
+        copy_str(sl.ies_path,    sizeof(sl.ies_path),    j_str(c, "iesPath", ""));
+        sl.cookie_strength = (float)j_num(c, "cookieStrength", 0.0);
         jce_scene_set_spot_light(s, e, &sl);
     } else {
         JceDirectionalLight dl;
@@ -748,6 +761,9 @@ static void parse_unified_light(JceScene *s, JceEntity e, const cJSON *c)
         dl.color.x = colorR; dl.color.y = colorG; dl.color.z = colorB;
         dl.intensity    = intensity;
         dl.casts_shadow = casts_shadow;
+        /* P3-E.5 — directional cookie (data-side scaffold). */
+        copy_str(dl.cookie_path, sizeof(dl.cookie_path), j_str(c, "cookiePath", ""));
+        dl.cookie_strength = (float)j_num(c, "cookieStrength", 0.0);
         jce_scene_set_dir_light(s, e, &dl);
     }
 }
@@ -772,6 +788,15 @@ static void parse_rigidbody(JceScene *s, JceEntity e, const cJSON *c)
     rb.angular_drag = (float)j_num(c, "angularDrag", 0.05);
     rb.use_gravity  = j_bool(c, "useGravity", true);
     rb.is_kinematic = j_bool(c, "isKinematic", false);
+    /* CCD (P3-C.3) — DISCRETE if absent for backwards compatibility. */
+    {
+        int mode = (int)j_num(c, "ccdMode", 0.0);
+        if (mode < 0) mode = 0;
+        if (mode > 3) mode = 3;
+        rb.ccd_mode = (uint8_t)mode;
+    }
+    rb.ccd_threshold     = (float)j_num(c, "ccdThreshold", 0.0);
+    rb.ccd_sphere_radius = (float)j_num(c, "ccdSphereRadius", 0.0);
     jce_scene_set_rigidbody(s, e, &rb);
 }
 
@@ -1053,6 +1078,8 @@ static void parse_reflection_probe(JceScene *s, JceEntity e, const cJSON *c)
     r.far_clip       = (float)j_num(c, "farClip", 1000.0);
     const char *hp = j_str(c, "hdrPath", "");
     snprintf(r.custom_hdr_path, sizeof(r.custom_hdr_path), "%s", hp ? hp : "");
+    const char *bp = j_str(c, "bakedCubemapPath", "");
+    snprintf(r.baked_cubemap_path, sizeof(r.baked_cubemap_path), "%s", bp ? bp : "");
     r.box_projection = j_bool(c, "boxProjection", true);
     r.hdr            = j_bool(c, "hdr", true);
     jce_scene_set_reflection_probe(s, e, &r);
@@ -1273,6 +1300,42 @@ static void parse_configurable_joint(JceScene *s, JceEntity e, const cJSON *c)
     j.break_torque = (float)j_num(c, "breakTorque", 1e30);
     j.enable_collision = j_bool(c, "enableCollision", false);
     jce_scene_set_configurable_joint(s, e, &j);
+}
+
+static void parse_cloth(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceClothComponent cl; memset(&cl, 0, sizeof cl);
+    cl.corner_00 = jce_v3((float)j_num(c, "c00X", 0.0), (float)j_num(c, "c00Y", 0.0), (float)j_num(c, "c00Z", 0.0));
+    cl.corner_10 = jce_v3((float)j_num(c, "c10X", 1.0), (float)j_num(c, "c10Y", 0.0), (float)j_num(c, "c10Z", 0.0));
+    cl.corner_01 = jce_v3((float)j_num(c, "c01X", 0.0), (float)j_num(c, "c01Y", 0.0), (float)j_num(c, "c01Z", 1.0));
+    cl.corner_11 = jce_v3((float)j_num(c, "c11X", 1.0), (float)j_num(c, "c11Y", 0.0), (float)j_num(c, "c11Z", 1.0));
+    cl.res_u = (uint32_t)j_num(c, "resU", 8);
+    cl.res_v = (uint32_t)j_num(c, "resV", 8);
+    if (cl.res_u < 2) cl.res_u = 2;
+    if (cl.res_v < 2) cl.res_v = 2;
+    cl.mass_total        = (float)j_num(c, "mass", 1.0);
+    cl.stiffness_linear  = (float)j_num(c, "stiffLin", 0.5);
+    cl.stiffness_angular = (float)j_num(c, "stiffAng", 0.5);
+    cl.damping           = (float)j_num(c, "damping", 0.02);
+    cl.iterations        = (uint32_t)j_num(c, "iters", 4);
+    cl.self_collision    = j_bool(c, "selfColl", false);
+    cl.wind_enabled      = j_bool(c, "windOn", false);
+    cl.wind_velocity     = jce_v3((float)j_num(c, "windX", 0.0),
+                                  (float)j_num(c, "windY", 0.0),
+                                  (float)j_num(c, "windZ", 0.0));
+    const cJSON *pin = cJSON_GetObjectItemCaseSensitive(c, "pinned");
+    if (cJSON_IsArray(pin)) {
+        int n = cJSON_GetArraySize(pin);
+        if (n > (int)JCE_CLOTH_MAX_PINNED) n = (int)JCE_CLOTH_MAX_PINNED;
+        for (int i = 0; i < n; ++i) {
+            const cJSON *it = cJSON_GetArrayItem(pin, i);
+            if (cJSON_IsNumber(it))
+                cl.pinned_indices[cl.pinned_count++] = (uint32_t)it->valuedouble;
+        }
+    }
+    cl.handle = 0;
+    cl.dirty  = true;
+    jce_scene_set_cloth(s, e, &cl);
 }
 
 static void parse_joint2d(JceScene *s, JceEntity e, const cJSON *c)
@@ -1608,6 +1671,10 @@ static void parse_one_component(JceScene *s, JceEntity e, const cJSON *comp)
     if (strcmp(type, "ConfigurableJoint") == 0 || strcmp(type, "configurableJoint") == 0) {
         parse_configurable_joint(s, e, props); return;
     }
+    /* Cloth (P3-C.4 follow-up). */
+    if (strcmp(type, "Cloth") == 0 || strcmp(type, "cloth") == 0) {
+        parse_cloth(s, e, props); return;
+    }
     /* Joint 2D. */
     if (strcmp(type, "Joint2D") == 0 || strcmp(type, "joint2D") == 0) {
         parse_joint2d(s, e, props); return;
@@ -1639,6 +1706,122 @@ static void parse_one_component(JceScene *s, JceEntity e, const cJSON *comp)
     /* UI Button. */
     if (strcmp(type, "UIButton") == 0 || strcmp(type, "uiButton") == 0) {
         parse_ui_button(s, e, props); return;
+    }
+    /* Network Object (P3-D.3). */
+    if (strcmp(type, "NetworkObject") == 0 || strcmp(type, "networkObject") == 0) {
+        JceNetworkObjectComponent n; memset(&n, 0, sizeof n);
+        n.net_id   = (uint32_t)j_num(props, "netId",  0);
+        n.owner    = (uint16_t)j_num(props, "owner",  0);
+        n.flags    = (uint16_t)j_num(props, "flags",  0);
+        n.is_owner = j_bool(props, "isOwner", false);
+        jce_scene_set_network_object(s, e, &n);
+        return;
+    }
+    /* Network ECS components (P4-C.1). */
+    if (strcmp(type, "NetworkTransform") == 0 || strcmp(type, "networkTransform") == 0) {
+        JceNetTransformComponent nc; memset(&nc, 0, sizeof nc);
+        nc.sync_rate_hz   = (uint8_t) j_num(props, "syncRateHz",   0);
+        nc.interp_ms      = (uint16_t)j_num(props, "interpMs",     0);
+        nc.tolerance      = (float)   j_num(props, "tolerance",    0);
+        nc.authority_mode = (uint8_t) j_num(props, "authorityMode",0);
+        jce_scene_set_net_transform(s, e, &nc);
+        return;
+    }
+    if (strcmp(type, "NetworkAnimator") == 0 || strcmp(type, "networkAnimator") == 0) {
+        JceNetAnimatorComponent nc; memset(&nc, 0, sizeof nc);
+        nc.sync_rate_hz   = (uint8_t) j_num(props, "syncRateHz",   0);
+        nc.interp_ms      = (uint16_t)j_num(props, "interpMs",     0);
+        nc.authority_mode = (uint8_t) j_num(props, "authorityMode",0);
+        jce_scene_set_net_animator(s, e, &nc);
+        return;
+    }
+    if (strcmp(type, "NetworkRigidbody") == 0 || strcmp(type, "networkRigidbody") == 0) {
+        JceNetRigidbodyComponent nc; memset(&nc, 0, sizeof nc);
+        nc.sync_rate_hz   = (uint8_t) j_num(props, "syncRateHz",   0);
+        nc.interp_ms      = (uint16_t)j_num(props, "interpMs",     0);
+        nc.tolerance      = (float)   j_num(props, "tolerance",    0);
+        nc.authority_mode = (uint8_t) j_num(props, "authorityMode",0);
+        jce_scene_set_net_rigidbody(s, e, &nc);
+        return;
+    }
+    if (strcmp(type, "VfxGraph") == 0 || strcmp(type, "vfxGraph") == 0) {
+        JceVfxGraphComponent vc; memset(&vc, 0, sizeof vc);
+        copy_str(vc.graph_path, sizeof vc.graph_path, j_str(props, "graphPath", ""));
+        vc.play_on_awake   = j_bool(props, "playOnAwake", true);
+        vc.loop            = j_bool(props, "loop", true);
+        vc.rate_multiplier = (float)j_num(props, "rateMultiplier", 1.0);
+        vc.intensity       = (float)j_num(props, "intensity", 1.0);
+        jce_scene_set_vfx_graph(s, e, &vc);
+        return;
+    }
+    if (strcmp(type, "Tilemap") == 0 || strcmp(type, "tilemap") == 0) {
+        JceTilemapComponent tc; memset(&tc, 0, sizeof tc);
+        copy_str(tc.tilemap_path, sizeof tc.tilemap_path, j_str(props, "tilemapPath", ""));
+        copy_str(tc.sprites_path, sizeof tc.sprites_path, j_str(props, "spritesPath", ""));
+        tc.cell_size_px = (uint16_t)j_num(props, "cellSizePx", 16);
+        tc.sort_order   = (uint16_t)j_num(props, "sortOrder", 0);
+        tc.orientation  = (uint8_t) j_num(props, "orientation", 0);
+        tc.visible      = j_bool(props, "visible", true);
+        tc.color[0]     = (float)j_num(props, "colorR", 1.0);
+        tc.color[1]     = (float)j_num(props, "colorG", 1.0);
+        tc.color[2]     = (float)j_num(props, "colorB", 1.0);
+        tc.color[3]     = (float)j_num(props, "colorA", 1.0);
+        jce_scene_set_tilemap(s, e, &tc);
+        return;
+    }
+    if (strcmp(type, "TilemapCollider2D") == 0 || strcmp(type, "tilemapCollider2D") == 0) {
+        JceTilemapCollider2DComponent cc; memset(&cc, 0, sizeof cc);
+        cc.used_by_composite = j_bool(props, "usedByComposite", false);
+        cc.trigger           = j_bool(props, "trigger", false);
+        cc.offset[0]         = (float)j_num(props, "offsetX", 0);
+        cc.offset[1]         = (float)j_num(props, "offsetY", 0);
+        cc.friction_x100     = (uint16_t)j_num(props, "frictionX100", 40);
+        cc.bounciness_x100   = (uint16_t)j_num(props, "bouncinessX100", 0);
+        jce_scene_set_tilemap_collider2d(s, e, &cc);
+        return;
+    }
+    if (strcmp(type, "Avatar") == 0 || strcmp(type, "avatar") == 0) {
+        JceAvatarComponent cc; memset(&cc, 0, sizeof cc);
+        copy_str(cc.avatar_path,         sizeof cc.avatar_path,         j_str(props, "avatarPath",         ""));
+        copy_str(cc.mask_path,           sizeof cc.mask_path,           j_str(props, "maskPath",           ""));
+        copy_str(cc.override_controller, sizeof cc.override_controller, j_str(props, "overrideController", ""));
+        cc.apply_root_motion = j_bool(props, "applyRootMotion", false);
+        cc.human_rig         = j_bool(props, "humanRig",        true);
+        jce_scene_set_avatar(s, e, &cc);
+        return;
+    }
+    if (strcmp(type, "Volume") == 0 || strcmp(type, "volume") == 0) {
+        JceVolumeComponent vc; memset(&vc, 0, sizeof vc);
+        vc.shape          = (JceVolumeShape)(int)j_num(props, "shape",         0);
+        vc.extents.x      = (float)j_num(props, "extentsX",     1.0);
+        vc.extents.y      = (float)j_num(props, "extentsY",     1.0);
+        vc.extents.z      = (float)j_num(props, "extentsZ",     1.0);
+        vc.blend_distance = (float)j_num(props, "blendDistance", 1.0);
+        vc.weight         = (float)j_num(props, "weight",        1.0);
+        vc.is_global      = j_bool(props, "isGlobal", false);
+        vc.profile.enabled_mask = (uint16_t)(int)j_num(props, "profileMask", 0);
+        vc.profile.values.exposure            = (float)j_num(props, "exposure",           1.0);
+        vc.profile.values.gamma               = (float)j_num(props, "gamma",              2.2);
+        vc.profile.values.bloom_threshold     = (float)j_num(props, "bloomThreshold",     1.0);
+        vc.profile.values.bloom_intensity     = (float)j_num(props, "bloomIntensity",     0.5);
+        vc.profile.values.fxaa_span_max       = (float)j_num(props, "fxaaSpanMax",        8.0);
+        vc.profile.values.fxaa_reduce_min     = (float)j_num(props, "fxaaReduceMin",      1.0 / 128.0);
+        vc.profile.values.fxaa_reduce_mul     = (float)j_num(props, "fxaaReduceMul",      1.0 / 8.0);
+        vc.profile.values.vignette_intensity  = (float)j_num(props, "vignetteIntensity",  0.3);
+        vc.profile.values.vignette_smoothness = (float)j_num(props, "vignetteSmoothness", 2.0);
+        vc.profile.values.chromatic_strength  = (float)j_num(props, "chromaticStrength",  0.005);
+        jce_scene_set_volume(s, e, &vc);
+        return;
+    }
+    if (strcmp(type, "OcclusionPortal") == 0 || strcmp(type, "occlusionPortal") == 0) {
+        JceOcclusionPortalComponent op; memset(&op, 0, sizeof op);
+        op.size.x   = (float)j_num(props, "sizeX",    1.0);
+        op.size.y   = (float)j_num(props, "sizeY",    2.0);
+        op.size.z   = (float)j_num(props, "sizeZ",    0.1);
+        op.open     = j_bool(props, "open", true);
+        op.portal_id = (int32_t)j_num(props, "portalId", 0);
+        jce_scene_set_occlusion_portal(s, e, &op);
+        return;
     }
 }
 
@@ -1700,6 +1883,51 @@ static void ser_camera(const JceCameraComponent *c, cJSON *arr)
     cJSON_AddNumberToObject(o, "farClip",  c->far_plane);
     cJSON_AddBoolToObject(o, "primary", c->is_primary);
     cJSON_AddBoolToObject(o, "orthographic", c->ortho);
+    if (c->stack_index != 0)
+        cJSON_AddNumberToObject(o, "stackIndex", c->stack_index);
+    if (c->clear_mode != 0)
+        cJSON_AddNumberToObject(o, "clearMode",  c->clear_mode);
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_volume(const JceVolumeComponent *c, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "Volume");
+    cJSON *p = cJSON_CreateObject();
+    cJSON_AddNumberToObject(p, "shape",              (double)c->shape);
+    cJSON_AddNumberToObject(p, "extentsX",           c->extents.x);
+    cJSON_AddNumberToObject(p, "extentsY",           c->extents.y);
+    cJSON_AddNumberToObject(p, "extentsZ",           c->extents.z);
+    cJSON_AddNumberToObject(p, "blendDistance",      c->blend_distance);
+    cJSON_AddNumberToObject(p, "weight",             c->weight);
+    cJSON_AddBoolToObject  (p, "isGlobal",           c->is_global);
+    cJSON_AddNumberToObject(p, "profileMask",        (double)c->profile.enabled_mask);
+    cJSON_AddNumberToObject(p, "exposure",           c->profile.values.exposure);
+    cJSON_AddNumberToObject(p, "gamma",              c->profile.values.gamma);
+    cJSON_AddNumberToObject(p, "bloomThreshold",     c->profile.values.bloom_threshold);
+    cJSON_AddNumberToObject(p, "bloomIntensity",     c->profile.values.bloom_intensity);
+    cJSON_AddNumberToObject(p, "fxaaSpanMax",        c->profile.values.fxaa_span_max);
+    cJSON_AddNumberToObject(p, "fxaaReduceMin",      c->profile.values.fxaa_reduce_min);
+    cJSON_AddNumberToObject(p, "fxaaReduceMul",      c->profile.values.fxaa_reduce_mul);
+    cJSON_AddNumberToObject(p, "vignetteIntensity",  c->profile.values.vignette_intensity);
+    cJSON_AddNumberToObject(p, "vignetteSmoothness", c->profile.values.vignette_smoothness);
+    cJSON_AddNumberToObject(p, "chromaticStrength",  c->profile.values.chromatic_strength);
+    cJSON_AddItemToObject(o, "properties", p);
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_occlusion_portal(const JceOcclusionPortalComponent *c, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "OcclusionPortal");
+    cJSON *p = cJSON_CreateObject();
+    cJSON_AddNumberToObject(p, "sizeX",    c->size.x);
+    cJSON_AddNumberToObject(p, "sizeY",    c->size.y);
+    cJSON_AddNumberToObject(p, "sizeZ",    c->size.z);
+    cJSON_AddBoolToObject  (p, "open",     c->open);
+    cJSON_AddNumberToObject(p, "portalId", (double)c->portal_id);
+    cJSON_AddItemToObject(o, "properties", p);
     cJSON_AddItemToArray(arr, o);
 }
 
@@ -1716,6 +1944,11 @@ static void ser_light_unified(JceScene *s, JceEntity e, cJSON *arr)
         cJSON_AddNumberToObject(o, "intensity", dl->intensity);
         cJSON_AddNumberToObject(o, "lightType", 0);
         cJSON_AddBoolToObject(o, "castsShadow", dl->casts_shadow);
+        /* P3-E.5 — emit cookie fields only when set (omit-on-default). */
+        if (dl->cookie_path[0] != '\0')
+            cJSON_AddStringToObject(o, "cookiePath", dl->cookie_path);
+        if (dl->cookie_strength > 0.0f)
+            cJSON_AddNumberToObject(o, "cookieStrength", dl->cookie_strength);
         cJSON_AddItemToArray(arr, o);
         return;
     }
@@ -1748,6 +1981,13 @@ static void ser_light_unified(JceScene *s, JceEntity e, cJSON *arr)
         cJSON_AddNumberToObject(o, "innerConeDeg", inner_deg);
         cJSON_AddNumberToObject(o, "outerConeDeg", outer_deg);
         cJSON_AddBoolToObject(o, "castsShadow", false);
+        /* P3-E.5 — emit cookie + IES paths only when set. */
+        if (sl->cookie_path[0] != '\0')
+            cJSON_AddStringToObject(o, "cookiePath", sl->cookie_path);
+        if (sl->ies_path[0] != '\0')
+            cJSON_AddStringToObject(o, "iesPath", sl->ies_path);
+        if (sl->cookie_strength > 0.0f)
+            cJSON_AddNumberToObject(o, "cookieStrength", sl->cookie_strength);
         cJSON_AddItemToArray(arr, o);
     }
 }
@@ -1771,6 +2011,13 @@ static void ser_rigidbody(const JceRigidBodyComponent *c, cJSON *arr)
     cJSON_AddNumberToObject(o, "angularDrag", c->angular_drag);
     cJSON_AddBoolToObject(o, "useGravity", c->use_gravity);
     cJSON_AddBoolToObject(o, "isKinematic", c->is_kinematic);
+    /* CCD (P3-C.3) — only emit when non-default to keep diffs small. */
+    if (c->ccd_mode != 0)
+        cJSON_AddNumberToObject(o, "ccdMode", (double)c->ccd_mode);
+    if (c->ccd_threshold > 0.0f)
+        cJSON_AddNumberToObject(o, "ccdThreshold", c->ccd_threshold);
+    if (c->ccd_sphere_radius > 0.0f)
+        cJSON_AddNumberToObject(o, "ccdSphereRadius", c->ccd_sphere_radius);
     cJSON_AddItemToArray(arr, o);
 }
 
@@ -2062,6 +2309,7 @@ static void ser_reflection_probe(const JceReflectionProbeComponent *c, cJSON *ar
     cJSON_AddNumberToObject(o, "nearClip", c->near_clip);
     cJSON_AddNumberToObject(o, "farClip",  c->far_clip);
     cJSON_AddStringToObject(o, "hdrPath",  c->custom_hdr_path);
+    cJSON_AddStringToObject(o, "bakedCubemapPath", c->baked_cubemap_path);
     cJSON_AddBoolToObject  (o, "boxProjection", c->box_projection);
     cJSON_AddBoolToObject  (o, "hdr", c->hdr);
     cJSON_AddItemToArray(arr, o);
@@ -2281,6 +2529,43 @@ static void ser_configurable_joint(const JceConfigurableJointComponent *j, cJSON
     cJSON_AddNumberToObject(o, "breakForce",  j->break_force);
     cJSON_AddNumberToObject(o, "breakTorque", j->break_torque);
     cJSON_AddBoolToObject  (o, "enableCollision", j->enable_collision);
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_cloth(const JceClothComponent *cl, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "Cloth");
+    cJSON_AddNumberToObject(o, "c00X", cl->corner_00.x);
+    cJSON_AddNumberToObject(o, "c00Y", cl->corner_00.y);
+    cJSON_AddNumberToObject(o, "c00Z", cl->corner_00.z);
+    cJSON_AddNumberToObject(o, "c10X", cl->corner_10.x);
+    cJSON_AddNumberToObject(o, "c10Y", cl->corner_10.y);
+    cJSON_AddNumberToObject(o, "c10Z", cl->corner_10.z);
+    cJSON_AddNumberToObject(o, "c01X", cl->corner_01.x);
+    cJSON_AddNumberToObject(o, "c01Y", cl->corner_01.y);
+    cJSON_AddNumberToObject(o, "c01Z", cl->corner_01.z);
+    cJSON_AddNumberToObject(o, "c11X", cl->corner_11.x);
+    cJSON_AddNumberToObject(o, "c11Y", cl->corner_11.y);
+    cJSON_AddNumberToObject(o, "c11Z", cl->corner_11.z);
+    cJSON_AddNumberToObject(o, "resU",     cl->res_u);
+    cJSON_AddNumberToObject(o, "resV",     cl->res_v);
+    cJSON_AddNumberToObject(o, "mass",     cl->mass_total);
+    cJSON_AddNumberToObject(o, "stiffLin", cl->stiffness_linear);
+    cJSON_AddNumberToObject(o, "stiffAng", cl->stiffness_angular);
+    cJSON_AddNumberToObject(o, "damping",  cl->damping);
+    cJSON_AddNumberToObject(o, "iters",    cl->iterations);
+    cJSON_AddBoolToObject  (o, "selfColl", cl->self_collision);
+    cJSON_AddBoolToObject  (o, "windOn",   cl->wind_enabled);
+    cJSON_AddNumberToObject(o, "windX",    cl->wind_velocity.x);
+    cJSON_AddNumberToObject(o, "windY",    cl->wind_velocity.y);
+    cJSON_AddNumberToObject(o, "windZ",    cl->wind_velocity.z);
+    cJSON *pin = cJSON_CreateArray();
+    uint32_t pc = cl->pinned_count;
+    if (pc > JCE_CLOTH_MAX_PINNED) pc = JCE_CLOTH_MAX_PINNED;
+    for (uint32_t i = 0; i < pc; ++i)
+        cJSON_AddItemToArray(pin, cJSON_CreateNumber((double)cl->pinned_indices[i]));
+    cJSON_AddItemToObject(o, "pinned", pin);
     cJSON_AddItemToArray(arr, o);
 }
 
@@ -2545,6 +2830,21 @@ static void ser_entity_cb(JceScene *s, JceEntity e, void *ud)
     cJSON_AddStringToObject(eobj, "name", name ? name : "");
     cJSON_AddNumberToObject(eobj, "parentId", (double)jce_scene_get_parent(s, e));
 
+    /* P4-A.4 Tag & Layer — emit at entity level when present. */
+    {
+        uint64_t pf = jce_scene_get_component_flags(s, e);
+        if (pf & JCE_COMP_FLAG_TAG) {
+            const char *tn = jce_scene_get_entity_tag_name(s, e);
+            if (tn && *tn && strcmp(tn, "Untagged") != 0)
+                cJSON_AddStringToObject(eobj, "tag", tn);
+        }
+        if (pf & JCE_COMP_FLAG_LAYER) {
+            uint8_t lyr = jce_scene_get_entity_layer(s, e);
+            if (lyr != 0)
+                cJSON_AddNumberToObject(eobj, "layer", (double)lyr);
+        }
+    }
+
     cJSON *comps = cJSON_CreateArray();
     if (!comps) { cJSON_Delete(eobj); return; }
 
@@ -2699,6 +2999,10 @@ static void ser_entity_cb(JceScene *s, JceEntity e, void *ud)
         JceConfigurableJointComponent *c = jce_scene_get_configurable_joint(s, e);
         if (c) ser_configurable_joint(c, comps);
     }
+    if (f & JCE_COMP_FLAG_CLOTH) {
+        JceClothComponent *c = jce_scene_get_cloth(s, e);
+        if (c) ser_cloth(c, comps);
+    }
     if (f & JCE_COMP_FLAG_JOINT_2D) {
         JceJoint2DComponent *c = jce_scene_get_joint2d(s, e);
         if (c) ser_joint2d(c, comps);
@@ -2730,6 +3034,133 @@ static void ser_entity_cb(JceScene *s, JceEntity e, void *ud)
     if (f & JCE_COMP_FLAG_UI_BUTTON) {
         JceUIButtonComponent *c = jce_scene_get_ui_button(s, e);
         if (c) ser_ui_button(c, comps);
+    }
+    if (f & JCE_COMP_FLAG_NETWORK_OBJECT) {
+        JceNetworkObjectComponent *n = jce_scene_get_network_object(s, e);
+        if (n) {
+            cJSON *o = cJSON_CreateObject();
+            cJSON_AddStringToObject(o, "type",    "NetworkObject");
+            cJSON_AddNumberToObject(o, "netId",   n->net_id);
+            cJSON_AddNumberToObject(o, "owner",   n->owner);
+            cJSON_AddNumberToObject(o, "flags",   n->flags);
+            cJSON_AddBoolToObject  (o, "isOwner", n->is_owner);
+            cJSON_AddItemToArray(comps, o);
+        }
+    }
+    if (f & JCE_COMP_FLAG_NET_TRANSFORM) {
+        JceNetTransformComponent *c = jce_scene_get_net_transform(s, e);
+        if (c) {
+            cJSON *o = cJSON_CreateObject();
+            cJSON_AddStringToObject(o, "type", "NetworkTransform");
+            cJSON *p = cJSON_CreateObject();
+            cJSON_AddNumberToObject(p, "syncRateHz",    c->sync_rate_hz);
+            cJSON_AddNumberToObject(p, "interpMs",      c->interp_ms);
+            cJSON_AddNumberToObject(p, "tolerance",     c->tolerance);
+            cJSON_AddNumberToObject(p, "authorityMode", c->authority_mode);
+            cJSON_AddItemToObject(o, "properties", p);
+            cJSON_AddItemToArray(comps, o);
+        }
+    }
+    if (f & JCE_COMP_FLAG_NET_ANIMATOR) {
+        JceNetAnimatorComponent *c = jce_scene_get_net_animator(s, e);
+        if (c) {
+            cJSON *o = cJSON_CreateObject();
+            cJSON_AddStringToObject(o, "type", "NetworkAnimator");
+            cJSON *p = cJSON_CreateObject();
+            cJSON_AddNumberToObject(p, "syncRateHz",    c->sync_rate_hz);
+            cJSON_AddNumberToObject(p, "interpMs",      c->interp_ms);
+            cJSON_AddNumberToObject(p, "authorityMode", c->authority_mode);
+            cJSON_AddItemToObject(o, "properties", p);
+            cJSON_AddItemToArray(comps, o);
+        }
+    }
+    if (f & JCE_COMP_FLAG_NET_RIGIDBODY) {
+        JceNetRigidbodyComponent *c = jce_scene_get_net_rigidbody(s, e);
+        if (c) {
+            cJSON *o = cJSON_CreateObject();
+            cJSON_AddStringToObject(o, "type", "NetworkRigidbody");
+            cJSON *p = cJSON_CreateObject();
+            cJSON_AddNumberToObject(p, "syncRateHz",    c->sync_rate_hz);
+            cJSON_AddNumberToObject(p, "interpMs",      c->interp_ms);
+            cJSON_AddNumberToObject(p, "tolerance",     c->tolerance);
+            cJSON_AddNumberToObject(p, "authorityMode", c->authority_mode);
+            cJSON_AddItemToObject(o, "properties", p);
+            cJSON_AddItemToArray(comps, o);
+        }
+    }
+    if (f & JCE_COMP_FLAG_VFX_GRAPH) {
+        JceVfxGraphComponent *c = jce_scene_get_vfx_graph(s, e);
+        if (c) {
+            cJSON *o = cJSON_CreateObject();
+            cJSON_AddStringToObject(o, "type", "VfxGraph");
+            cJSON *p = cJSON_CreateObject();
+            cJSON_AddStringToObject(p, "graphPath",      c->graph_path);
+            cJSON_AddBoolToObject  (p, "playOnAwake",    c->play_on_awake);
+            cJSON_AddBoolToObject  (p, "loop",           c->loop);
+            cJSON_AddNumberToObject(p, "rateMultiplier", c->rate_multiplier);
+            cJSON_AddNumberToObject(p, "intensity",      c->intensity);
+            cJSON_AddItemToObject(o, "properties", p);
+            cJSON_AddItemToArray(comps, o);
+        }
+    }
+    if (f & JCE_COMP_FLAG_TILEMAP) {
+        JceTilemapComponent *c = jce_scene_get_tilemap(s, e);
+        if (c) {
+            cJSON *o = cJSON_CreateObject();
+            cJSON_AddStringToObject(o, "type", "Tilemap");
+            cJSON *p = cJSON_CreateObject();
+            cJSON_AddStringToObject(p, "tilemapPath", c->tilemap_path);
+            cJSON_AddStringToObject(p, "spritesPath", c->sprites_path);
+            cJSON_AddNumberToObject(p, "cellSizePx",  c->cell_size_px);
+            cJSON_AddNumberToObject(p, "sortOrder",   c->sort_order);
+            cJSON_AddNumberToObject(p, "orientation", c->orientation);
+            cJSON_AddBoolToObject  (p, "visible",     c->visible);
+            cJSON_AddNumberToObject(p, "colorR",      c->color[0]);
+            cJSON_AddNumberToObject(p, "colorG",      c->color[1]);
+            cJSON_AddNumberToObject(p, "colorB",      c->color[2]);
+            cJSON_AddNumberToObject(p, "colorA",      c->color[3]);
+            cJSON_AddItemToObject(o, "properties", p);
+            cJSON_AddItemToArray(comps, o);
+        }
+    }
+    if (f & JCE_COMP_FLAG_TILEMAP_COLLIDER_2D) {
+        JceTilemapCollider2DComponent *c = jce_scene_get_tilemap_collider2d(s, e);
+        if (c) {
+            cJSON *o = cJSON_CreateObject();
+            cJSON_AddStringToObject(o, "type", "TilemapCollider2D");
+            cJSON *p = cJSON_CreateObject();
+            cJSON_AddBoolToObject  (p, "usedByComposite", c->used_by_composite);
+            cJSON_AddBoolToObject  (p, "trigger",         c->trigger);
+            cJSON_AddNumberToObject(p, "offsetX",         c->offset[0]);
+            cJSON_AddNumberToObject(p, "offsetY",         c->offset[1]);
+            cJSON_AddNumberToObject(p, "frictionX100",    c->friction_x100);
+            cJSON_AddNumberToObject(p, "bouncinessX100",  c->bounciness_x100);
+            cJSON_AddItemToObject(o, "properties", p);
+            cJSON_AddItemToArray(comps, o);
+        }
+    }
+    if (f & JCE_COMP_FLAG_AVATAR) {
+        JceAvatarComponent *c = jce_scene_get_avatar(s, e);
+        if (c) {
+            cJSON *o = cJSON_CreateObject();
+            cJSON_AddStringToObject(o, "type", "Avatar");
+            cJSON *p = cJSON_CreateObject();
+            cJSON_AddStringToObject(p, "avatarPath",         c->avatar_path);
+            cJSON_AddStringToObject(p, "maskPath",           c->mask_path);
+            cJSON_AddStringToObject(p, "overrideController", c->override_controller);
+            cJSON_AddBoolToObject  (p, "applyRootMotion",    c->apply_root_motion);
+            cJSON_AddBoolToObject  (p, "humanRig",           c->human_rig);
+            cJSON_AddItemToObject(o, "properties", p);
+            cJSON_AddItemToArray(comps, o);
+        }
+    }
+    if (f & JCE_COMP_FLAG_VOLUME) {
+        JceVolumeComponent *c = jce_scene_get_volume(s, e);
+        if (c) ser_volume(c, comps);
+    }
+    if (f & JCE_COMP_FLAG_OCCLUSION_PORTAL) {
+        JceOcclusionPortalComponent *c = jce_scene_get_occlusion_portal(s, e);
+        if (c) ser_occlusion_portal(c, comps);
     }
     if (f & JCE_COMP_FLAG_EDITOR_META) {
         JceEditorMeta *m = jce_scene_get_editor_meta(s, e);
@@ -2913,6 +3344,18 @@ int jce_scene_load_json(JceScene *scene, const cJSON *root)
                 if (has_pp) copy_str(m->prefab_path, sizeof(m->prefab_path),
                                      j_str(eobj, "prefabPath", ""));
             }
+            /* P4-A.4 — mirror tag/layer into engine ECS components. */
+            if (has_tag) {
+                const char *tn = j_str(eobj, "tag", "");
+                if (tn && *tn)
+                    jce_scene_set_entity_tag_name(scene, new_e, tn);
+            }
+            if (cJSON_GetObjectItemCaseSensitive(eobj, "layer") != NULL) {
+                int lyr = (int)j_num(eobj, "layer", 0);
+                if (lyr < 0) lyr = 0;
+                if (lyr > 31) lyr = 31;
+                jce_scene_set_entity_layer(scene, new_e, (uint8_t)lyr);
+            }
         }
 
         const cJSON *comps = cJSON_GetObjectItemCaseSensitive(eobj, "components");
@@ -2974,6 +3417,19 @@ void jce_scene_parse_entity_json(JceScene *scene, JceEntity e,
                 if (has_pi) m->prefab_instance = j_bool(entity_obj, "prefabInstance", false);
                 if (has_pp) copy_str(m->prefab_path, sizeof(m->prefab_path),
                                      j_str(entity_obj, "prefabPath", ""));
+            }
+        }
+        /* P4-A.4 — mirror tag/layer into engine ECS components. */
+        {
+            const cJSON *tag_it = cJSON_GetObjectItemCaseSensitive(entity_obj, "tag");
+            if (cJSON_IsString(tag_it) && tag_it->valuestring && tag_it->valuestring[0])
+                jce_scene_set_entity_tag_name(scene, e, tag_it->valuestring);
+            const cJSON *layer_it = cJSON_GetObjectItemCaseSensitive(entity_obj, "layer");
+            if (cJSON_IsNumber(layer_it)) {
+                int lyr = (int)layer_it->valuedouble;
+                if (lyr < 0) lyr = 0;
+                if (lyr > 31) lyr = 31;
+                jce_scene_set_entity_layer(scene, e, (uint8_t)lyr);
             }
         }
     }
@@ -3148,6 +3604,10 @@ cJSON *jce_scene_serialize_entity_components(JceScene *scene, JceEntity e)
     if (f & JCE_COMP_FLAG_CONFIGURABLE_JOINT) {
         JceConfigurableJointComponent *c = jce_scene_get_configurable_joint(scene, e);
         if (c) ser_configurable_joint(c, arr);
+    }
+    if (f & JCE_COMP_FLAG_CLOTH) {
+        JceClothComponent *c = jce_scene_get_cloth(scene, e);
+        if (c) ser_cloth(c, arr);
     }
     if (f & JCE_COMP_FLAG_JOINT_2D) {
         JceJoint2DComponent *c = jce_scene_get_joint2d(scene, e);

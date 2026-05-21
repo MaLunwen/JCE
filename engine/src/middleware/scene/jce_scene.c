@@ -3,6 +3,7 @@
  */
 
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/middleware/physics/jce_cloth.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
 #include "os/core/jce_memory.h"
@@ -66,6 +67,19 @@ static ECS_COMPONENT_DECLARE(JceLayoutGroupComponent);
 static ECS_COMPONENT_DECLARE(JceUIImageComponent);
 static ECS_COMPONENT_DECLARE(JceUITextComponent);
 static ECS_COMPONENT_DECLARE(JceUIButtonComponent);
+static ECS_COMPONENT_DECLARE(JceNetworkObjectComponent);
+static ECS_COMPONENT_DECLARE(JceClothComponent);
+static ECS_COMPONENT_DECLARE(JceNetTransformComponent);
+static ECS_COMPONENT_DECLARE(JceNetAnimatorComponent);
+static ECS_COMPONENT_DECLARE(JceNetRigidbodyComponent);
+static ECS_COMPONENT_DECLARE(JceVfxGraphComponent);
+static ECS_COMPONENT_DECLARE(JceTilemapComponent);
+static ECS_COMPONENT_DECLARE(JceTilemapCollider2DComponent);
+static ECS_COMPONENT_DECLARE(JceAvatarComponent);
+static ECS_COMPONENT_DECLARE(JceTagComponent);
+static ECS_COMPONENT_DECLARE(JceLayerComponent);
+static ECS_COMPONENT_DECLARE(JceVolumeComponent);
+static ECS_COMPONENT_DECLARE(JceOcclusionPortalComponent);
 
 /* ── Scene struct ──────────────────────────────────────────────────── */
 
@@ -138,6 +152,19 @@ JceScene *jce_scene_create(void)
     ECS_COMPONENT_DEFINE(s->world, JceUIImageComponent);
     ECS_COMPONENT_DEFINE(s->world, JceUITextComponent);
     ECS_COMPONENT_DEFINE(s->world, JceUIButtonComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceNetworkObjectComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceClothComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceNetTransformComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceNetAnimatorComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceNetRigidbodyComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceVfxGraphComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceTilemapComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceTilemapCollider2DComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceAvatarComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceTagComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceLayerComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceVolumeComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceOcclusionPortalComponent);
 
     LOG_SUCCESS(LOG_TAG, "scene created");
     return s;
@@ -407,6 +434,19 @@ JCE_COMP_IMPL(JceLayoutGroupComponent,        layout_group)
 JCE_COMP_IMPL(JceUIImageComponent,            ui_image)
 JCE_COMP_IMPL(JceUITextComponent,             ui_text)
 JCE_COMP_IMPL(JceUIButtonComponent,           ui_button)
+JCE_COMP_IMPL(JceNetworkObjectComponent,      network_object)
+JCE_COMP_IMPL(JceClothComponent,              cloth)
+JCE_COMP_IMPL(JceNetTransformComponent,       net_transform)
+JCE_COMP_IMPL(JceNetAnimatorComponent,        net_animator)
+JCE_COMP_IMPL(JceNetRigidbodyComponent,       net_rigidbody)
+JCE_COMP_IMPL(JceVfxGraphComponent,           vfx_graph)
+JCE_COMP_IMPL(JceTilemapComponent,            tilemap)
+JCE_COMP_IMPL(JceTilemapCollider2DComponent,  tilemap_collider2d)
+JCE_COMP_IMPL(JceAvatarComponent,             avatar)
+JCE_COMP_IMPL(JceTagComponent,                tag_component)
+JCE_COMP_IMPL(JceLayerComponent,              layer_component)
+JCE_COMP_IMPL(JceVolumeComponent,             volume)
+JCE_COMP_IMPL(JceOcclusionPortalComponent,    occlusion_portal)
 
 #undef JCE_COMP_IMPL
 
@@ -470,6 +510,19 @@ uint64_t jce_scene_get_component_flags(const JceScene *s, JceEntity e)
     if (ecs_has(s->world, ent, JceUIImageComponent))            flags |= JCE_COMP_FLAG_UI_IMAGE;
     if (ecs_has(s->world, ent, JceUITextComponent))             flags |= JCE_COMP_FLAG_UI_TEXT;
     if (ecs_has(s->world, ent, JceUIButtonComponent))           flags |= JCE_COMP_FLAG_UI_BUTTON;
+    if (ecs_has(s->world, ent, JceNetworkObjectComponent))      flags |= JCE_COMP_FLAG_NETWORK_OBJECT;
+    if (ecs_has(s->world, ent, JceClothComponent))              flags |= JCE_COMP_FLAG_CLOTH;
+    if (ecs_has(s->world, ent, JceNetTransformComponent))       flags |= JCE_COMP_FLAG_NET_TRANSFORM;
+    if (ecs_has(s->world, ent, JceNetAnimatorComponent))        flags |= JCE_COMP_FLAG_NET_ANIMATOR;
+    if (ecs_has(s->world, ent, JceNetRigidbodyComponent))       flags |= JCE_COMP_FLAG_NET_RIGIDBODY;
+    if (ecs_has(s->world, ent, JceVfxGraphComponent))           flags |= JCE_COMP_FLAG_VFX_GRAPH;
+    if (ecs_has(s->world, ent, JceTilemapComponent))            flags |= JCE_COMP_FLAG_TILEMAP;
+    if (ecs_has(s->world, ent, JceTilemapCollider2DComponent))  flags |= JCE_COMP_FLAG_TILEMAP_COLLIDER_2D;
+    if (ecs_has(s->world, ent, JceAvatarComponent))             flags |= JCE_COMP_FLAG_AVATAR;
+    if (ecs_has(s->world, ent, JceTagComponent))                flags |= JCE_COMP_FLAG_TAG;
+    if (ecs_has(s->world, ent, JceLayerComponent))              flags |= JCE_COMP_FLAG_LAYER;
+    if (ecs_has(s->world, ent, JceVolumeComponent))             flags |= JCE_COMP_FLAG_VOLUME;
+    if (ecs_has(s->world, ent, JceOcclusionPortalComponent))    flags |= JCE_COMP_FLAG_OCCLUSION_PORTAL;
 
     return flags;
 }
@@ -520,6 +573,64 @@ void jce_scene_update(JceScene *s, float dt)
     JCE_PROFILE_ZONE_N("Scene::Update");
     if (!s) { JCE_PROFILE_ZONE_END; return; }
     ecs_progress(s->world, dt);
+
+    /* ── Cloth reconciliation (P3-C.4 follow-up) ─────────────────────
+     * For every entity with a JceClothComponent whose runtime handle is
+     * absent or whose authoring fields have been edited (`dirty`), destroy
+     * the old handle (if any) and create a fresh one from the desc.
+     *
+     * Wind updates on an already-existing handle are applied in-place to
+     * avoid a full rebuild for cheap parameter tweaks. */
+    {
+        ecs_query_t *q = ecs_query(s->world, {
+            .terms = {{ .id = ecs_id(JceClothComponent) }},
+        });
+        if (q) {
+            ecs_iter_t it = ecs_query_iter(s->world, q);
+            while (ecs_query_next(&it)) {
+                JceClothComponent *c = ecs_field(&it, JceClothComponent, 0);
+                if (!c) continue;
+                for (int i = 0; i < it.count; ++i) {
+                    JceClothComponent *cc = &c[i];
+                    if (cc->dirty || cc->handle == 0) {
+                        if (cc->handle != 0) {
+                            jce_cloth_destroy((JceClothHandle)cc->handle);
+                            cc->handle = 0;
+                        }
+                        if (cc->res_u < 2) cc->res_u = 2;
+                        if (cc->res_v < 2) cc->res_v = 2;
+                        uint32_t pc = cc->pinned_count;
+                        if (pc > JCE_CLOTH_MAX_PINNED) pc = JCE_CLOTH_MAX_PINNED;
+                        JceClothDesc d;
+                        memset(&d, 0, sizeof d);
+                        d.corner_00 = cc->corner_00;
+                        d.corner_10 = cc->corner_10;
+                        d.corner_01 = cc->corner_01;
+                        d.corner_11 = cc->corner_11;
+                        d.res_u = cc->res_u;
+                        d.res_v = cc->res_v;
+                        d.mass_total       = cc->mass_total;
+                        d.stiffness_linear = cc->stiffness_linear;
+                        d.stiffness_angular= cc->stiffness_angular;
+                        d.damping          = cc->damping;
+                        d.iterations       = cc->iterations ? cc->iterations : 4;
+                        d.pinned_indices   = pc ? cc->pinned_indices : NULL;
+                        d.pinned_count     = pc;
+                        d.self_collision   = cc->self_collision;
+                        d.wind_enabled     = cc->wind_enabled;
+                        d.wind_velocity    = cc->wind_velocity;
+                        cc->handle = (uint32_t)jce_cloth_create(&d);
+                        cc->dirty  = false;
+                    } else {
+                        jce_cloth_set_wind((JceClothHandle)cc->handle,
+                                           cc->wind_velocity,
+                                           cc->wind_enabled);
+                    }
+                }
+            }
+            ecs_query_fini(q);
+        }
+    }
 
 #if defined(JCE_PROFILER_ENABLED)
     {

@@ -906,20 +906,86 @@ void draw_content(void)
 
 } /* anonymous namespace */
 
-extern "C" void jce_editor_panel_profiler_content(void)
+/* ──────────────────────────────────────────────────────────────────
+ * Profiling Workbench tabs
+ *
+ * Profiler hosts Memory Profiler / Profile Analyzer / Frame Debugger
+ * as sibling tabs of an outer TabBar.  Sibling panels remain registered
+ * (JCE_PANEL_MEMORY_PROFILER / _PROFILE_ANALYZER / _FRAME_DEBUGGER) and
+ * route here via jce_panel_profiler_request_tab().
+ * ────────────────────────────────────────────────────────────────── */
+
+extern "C" void jce_editor_panel_memory_profiler_content(void);
+extern "C" void jce_editor_panel_profile_analyzer_content(void);
+extern "C" void jce_editor_panel_frame_debugger_content(void);
+
+namespace {
+
+int g_request_tab = -1;
+int g_current_tab = 0;  /* mirror of active profiling TabItem for menu markers */
+
+void draw_workbench(void)
 {
-    draw_content();
+    if (!ImGui::BeginTabBar("##profiling_tabs"))
+        return;
+
+    ImGuiTabItemFlags cpu_flags = (g_request_tab == 0) ? ImGuiTabItemFlags_SetSelected : 0;
+    ImGuiTabItemFlags mem_flags = (g_request_tab == 1) ? ImGuiTabItemFlags_SetSelected : 0;
+    ImGuiTabItemFlags ana_flags = (g_request_tab == 2) ? ImGuiTabItemFlags_SetSelected : 0;
+    ImGuiTabItemFlags fd_flags  = (g_request_tab == 3) ? ImGuiTabItemFlags_SetSelected : 0;
+
+    char cpu_label[96];
+    char mem_label[96];
+    char ana_label[96];
+    char fd_label [96];
+    std::snprintf(cpu_label, sizeof(cpu_label), "%s###pf_tab_cpu",
+                  jce_editor_i18n("profiler.title"));
+    /* No memoryProfiler.title key exists; layout historically uses a
+     * literal "Memory Profiler" label too. */
+    std::snprintf(mem_label, sizeof(mem_label), "Memory###pf_tab_memory");
+    std::snprintf(ana_label, sizeof(ana_label), "%s###pf_tab_analyzer",
+                  jce_editor_i18n("profileAnalyzer.title"));
+    std::snprintf(fd_label,  sizeof(fd_label),  "%s###pf_tab_framedbg",
+                  jce_editor_i18n("frameDebugger.title"));
+
+    if (ImGui::BeginTabItem(cpu_label, nullptr, cpu_flags)) {
+        g_current_tab = 0;
+        draw_content();
+        ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem(mem_label, nullptr, mem_flags)) {
+        g_current_tab = 1;
+        jce_editor_panel_memory_profiler_content();
+        ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem(ana_label, nullptr, ana_flags)) {
+        g_current_tab = 2;
+        jce_editor_panel_profile_analyzer_content();
+        ImGui::EndTabItem();
+    }
+    if (ImGui::BeginTabItem(fd_label, nullptr, fd_flags)) {
+        g_current_tab = 3;
+        jce_editor_panel_frame_debugger_content();
+        ImGui::EndTabItem();
+    }
+
+    ImGui::EndTabBar();
+    g_request_tab = -1;
 }
 
-extern "C" void jce_editor_panel_profiler(void)
-{
-    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_PROFILER);
-    if (!vis || !*vis) return;
+} /* anonymous namespace */
 
-    char _wt[96];
-    snprintf(_wt, sizeof(_wt), "%s###jce_profiler", jce_editor_i18n("profiler.title"));
-    if (ImGui::Begin(_wt, vis, ImGuiWindowFlags_NoFocusOnAppearing)) {
-        draw_content();
-    }
-    ImGui::End();
+extern "C" void jce_panel_profiler_request_tab(int idx)
+{
+    g_request_tab = idx;
+}
+
+extern "C" int jce_panel_profiler_current_tab(void)
+{
+    return g_current_tab;
+}
+
+extern "C" void jce_editor_panel_profiler_content(void)
+{
+    draw_workbench();
 }

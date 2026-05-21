@@ -10,6 +10,7 @@
 
 
 #include <jce/os/core/jce_defs.h>
+#include <jce/renderer/jce_gfx_types.h>
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -75,6 +76,17 @@ JCE_API JceMesh *jce_mesh_create_cylinder(float radius, float height);
 /* Submit mesh for PBR rendering using the PBR shader program.
    Caller must call jce_pbr_material_bind() and set transforms before this. */
 JCE_API void jce_mesh_submit_pbr(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id);
+
+/* Variant of jce_mesh_submit_pbr that uses an explicit shader program
+   handle instead of the renderer's default PBR program.  Used by the
+   editor material-graph preview to render a sphere with a custom
+   graph-generated program (or any other valid program with PBR vertex
+   layout).  When `program.idx == UINT16_MAX`, falls back to the
+   renderer's default PBR program (same behaviour as jce_mesh_submit_pbr). */
+JCE_API void jce_mesh_submit_pbr_with_program(const JceMesh        *mesh,
+                                               const JceRenderer    *r,
+                                               uint16_t              view_id,
+                                               JceShaderHandle       program);
 
 /* Submit mesh for terrain rendering using the terrain shader program.
    Caller must bind splat / layer textures and u_terrainParams before this

@@ -43,6 +43,21 @@ typedef struct {
     char build_preset[128];
     char build_output_path[512];
 
+    /* When true, saving a scene file kicks an incremental
+       `cmake --build … --target PackGameAssets` so external ck.exe sees
+       the change without a manual CLI round-trip.  Default false to
+       avoid surprising users on slow machines.  Launching ck always
+       repacks unconditionally (see jce_run_manager). */
+    bool auto_repack_on_save;
+
+    /* When true, the editor passes `--dev <project_assets_dir>` to the
+       spawned game so it mounts loose source files on top of the PAK.
+       Material .mat.json edits then hot-reload in the running game
+       without rebuilding the PAK.  Default true: this is the common
+       "designer iteration" workflow. Disable for clean-room launches
+       that should mirror a shipped build. */
+    bool run_dev_mode;
+
     /* Font overrides (empty -> default lookup: try system Ink Free /
        KaiTi by name, fall back to ImGui built-in proggy). */
     char font_en_path[512];
@@ -64,6 +79,13 @@ typedef struct {
        covers panels 32..63 (added when panel count exceeded 32). */
     uint32_t panels_visible_mask;
     uint32_t panels_visible_mask_hi;
+
+    /* Maya-style Workspace persistence. Stable id string of the active
+       workspace ("default", "modeling", "rigging", "animation", "fx",
+       "rendering", "uvEditing", "sculpting"). Loaded at startup by
+       jce_workspace_init() and rewritten whenever the user switches
+       workspace via the menu-bar dropdown or Ctrl+F1..F7. */
+    char workspace_id[32];
 } JceEditorConfig;
 
 /* Load config from .jce/editor-config.json. Returns false if not found. */
