@@ -537,6 +537,7 @@
     "game.newWindow.tooltip": "Launch game in a separate window with full input support",
     "game.notPlaying": "Click Play to start the game",
     "game.renderer": "Renderer",
+    "game.renderer.restartRequired": "⚠ Restart editor to apply: %s",
     "game.renderingActive": "Rendering Active",
     "game.resolution": "Resolution",
     "game.stats": "Stats",

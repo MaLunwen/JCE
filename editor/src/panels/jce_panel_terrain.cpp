@@ -178,7 +178,10 @@ void draw_toolbar()
         if (const ImGuiPayload *payload =
                 ImGui::AcceptDragDropPayload("JCE_ASSET_PATH")) {
             const char *path = (const char *)payload->Data;
-            snprintf(s.io_path, sizeof(s.io_path), "%s", path);
+            char rel[1024];
+            jce_editor_path_to_relative(rel, sizeof(rel), path);
+            const char *store_path = rel[0] ? rel : path;
+            snprintf(s.io_path, sizeof(s.io_path), "%s", store_path);
             /* Auto-load if a .terrain.json was dropped. */
             const char *ext = strrchr(path, '.');
             if (ext && (strcmp(ext, ".json") == 0 || strstr(path, ".terrain."))) {

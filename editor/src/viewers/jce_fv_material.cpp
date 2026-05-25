@@ -16,6 +16,7 @@ extern "C" {
 }
 
 #include "io/jce_editor_file_util.h"
+#include "ui/jce_editor_panels.h"
 
 #define LOG_TAG "fv_material"
 
@@ -316,7 +317,11 @@ void fv_render_material(FvTab *tab)
             if (ImGui::BeginDragDropTarget()) {
                 if (const ImGuiPayload *payload =
                         ImGui::AcceptDragDropPayload("JCE_ASSET_PATH")) {
-                    snprintf(path, 256, "%s", (const char *)payload->Data);
+                    const char *src = (const char *)payload->Data;
+                    char rel[1024];
+                    jce_editor_path_to_relative(rel, sizeof(rel), src);
+                    const char *store_path = rel[0] ? rel : src;
+                    snprintf(path, 256, "%s", store_path);
                     ms->modified = true;
                     ms->thumbs[ti].tried = false;
                     ms->thumbs[ti].handle.idx = UINT16_MAX;

@@ -27,6 +27,7 @@ extern "C" {
 #include <jce/renderer/jce_lowlevel.h>
 #include <jce/renderer/jce_material.h>
 #include <jce/renderer/jce_mesh.h>
+#include <jce/renderer/jce_model.h>
 #include <jce/renderer/jce_occlusion_culler.h>
 #include <jce/renderer/jce_offscreen_target.h>
 #include <jce/renderer/jce_renderer.h>

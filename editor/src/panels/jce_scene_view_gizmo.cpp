@@ -99,7 +99,12 @@ static void normalize_euler_deg(float rot[3])
 
 void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
 {
-    if (!(jce_editor_prefs_show_gizmos() && jce_state_get_play_state() == JCE_PLAY_STOPPED))
+    /* Gizmo is allowed in any play state (Unity-parity). Transform
+       edits during PLAYING/PAUSED apply to the live scene; a future
+       snapshot/rollback pass should snapshot transforms on Play and
+       restore on Stop so design-time state isn't permanently polluted.
+       For now the only gate is the global Show-Gizmos preference. */
+    if (!jce_editor_prefs_show_gizmos())
         return;
 
     uint32_t focused = jce_state_get_focused();

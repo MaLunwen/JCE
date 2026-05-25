@@ -214,6 +214,44 @@ void jce_skinned_mesh_set_bones(const jce_mat4 *joint_matrices,
     bgfx_set_transform(joint_matrices->raw[0], (uint16_t)num_joints);
 }
 
+/* Wireframe overlay: line-topology submit using the per-mesh wf_ibh.
+ * For skinned variants the caller must have uploaded the bone palette
+ * via jce_skinned_mesh_set_bones() (or bgfx_set_transform for static
+ * PBR variants).  Uses the PBR shader matching the layout so the
+ * vertex stage produces correctly skinned positions; fragment output
+ * is overwritten by the line rasterizer, so colour is irrelevant. */
+void jce_skinned_mesh_submit_wireframe_overlay(const JceSkinnedMesh *mesh,
+                                                const JceRenderer *r,
+                                                uint16_t view_id)
+{
+    if (!mesh || !r) return;
+    JCE_PROFILE_ZONE_N("SkinnedMesh::SubmitWireframeOverlay");
+
+    bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
+
+    if (mesh->wf_ibh.idx != UINT16_MAX) {
+        bgfx_set_index_buffer(mesh->wf_ibh, 0, mesh->num_wf_indices);
+    } else if (mesh->ibh.idx != UINT16_MAX) {
+        bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
+    }
+
+    uint64_t state = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                   | BGFX_STATE_DEPTH_TEST_LEQUAL
+                   | BGFX_STATE_MSAA | BGFX_STATE_PT_LINES;
+    if (mesh->num_wf_indices < 1500000u)
+        state |= BGFX_STATE_LINEAA;
+
+    bgfx_set_state(state, 0);
+
+    JceShaderHandle sh = mesh->is_skinned
+        ? jce_renderer_get_program_pbr_skinned(r)
+        : jce_renderer_get_program_pbr(r);
+    bgfx_program_handle_t prog = { sh.idx };
+    bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+
+    JCE_PROFILE_ZONE_END;
+}
+
 /* ================================================================== */
 /* Queries                                                             */
 /* ================================================================== */

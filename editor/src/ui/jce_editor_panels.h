@@ -136,6 +136,12 @@ void  jce_editor_panel_render_pipeline_tick(void);
 void  jce_editor_panel_test_runner(void);
 void  jce_editor_panel_build_profiles(void);
 void  jce_editor_panel_toolbar(void);
+/* Inline variant: draw the toolbar's contents at the current cursor
+   position (no Begin/End, no SetNextWindowPos). Used by the DockSpace
+   host to render the toolbar between the menu bar and the DockSpace,
+   so the Window > Toolbar visibility toggle actually re-flows the
+   layout instead of pinning a separate window underneath the host. */
+void  jce_editor_panel_toolbar_inline(void);
 void  jce_editor_panel_status_bar(void);
 
 /* Draw panel content only (no Begin/End — for embedding in layout tabs). */

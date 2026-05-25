@@ -94,8 +94,12 @@ static void accept_material_drop(JceMeshRenderer *mr)
         if (const ImGuiPayload *payload =
                 ImGui::AcceptDragDropPayload("JCE_ASSET_PATH")) {
             const char *path = (const char *)payload->Data;
+            char rel[1024];
+            jce_editor_path_to_relative(rel, sizeof(rel), path);
+            const char *stored = rel[0] ? rel : path;
             jce_state_begin_batch_edit();
-            snprintf(mr->material_path, sizeof(mr->material_path), "%s", path);
+            snprintf(mr->material_path, sizeof(mr->material_path),
+                     "%s", stored);
             load_material_into_renderer(mr);
             jce_state_end_batch_edit();
         }

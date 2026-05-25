@@ -167,19 +167,12 @@ void draw_asset_grid_item(const FileEntry &fe, int index,
         return;
     }
 
-    /* ── Thumbnail button ── */
-    JceThumb thumb{};
-    const bool has_thumb =
-        !fe.is_dir && jce_thumb_request(fe.path.c_str(), &thumb);
-    const bool thumb_ready = has_thumb && thumb.state == JCE_THUMB_READY;
-
+    /* ── Type-label tile ── */
+    /* Grid view intentionally renders every entry as a uniform colored
+     * type-label tile.  Image thumbnails are disabled by user request so
+     * the grid stays consistent across all file types. */
     bool clicked = false;
-
-    if (thumb_ready) {
-        clicked = ImGui::ImageButton("##icon",
-            (ImTextureID)(uintptr_t)thumb.handle.idx,
-            ImVec2((float)JCE_THUMBNAIL_SIZE, (float)JCE_THUMBNAIL_SIZE));
-    } else {
+    {
         ImVec4 col4 = asset_color_for_ext(fe.ext, fe.is_dir);
         ImGui::PushStyleColor(ImGuiCol_Button, col4);
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered,

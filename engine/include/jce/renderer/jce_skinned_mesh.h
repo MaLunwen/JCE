@@ -78,6 +78,13 @@ JCE_API void jce_skinned_mesh_destroy(JceSkinnedMesh *mesh);
 JCE_API void JCE_CALL jce_skinned_mesh_submit(const JceSkinnedMesh *mesh,
                                               const JceRenderer *r, uint16_t view_id);
 
+/* Submit a wireframe overlay (line topology, LEQUAL depth) of the
+ * mesh's geometry. For skinned meshes the bone palette must already
+ * have been uploaded via jce_skinned_mesh_set_bones() (or
+ * bgfx_set_transform for non-skinned PBR variants). */
+JCE_API void JCE_CALL jce_skinned_mesh_submit_wireframe_overlay(
+    const JceSkinnedMesh *mesh, const JceRenderer *r, uint16_t view_id);
+
 /* Upload bone matrices for the next skinned draw call.
  * joint_matrices: array of [num_joints] mat4, each = globalTransform * inverseBindMatrix.
  * Uses bgfx_set_transform to populate u_model[0..N]. */

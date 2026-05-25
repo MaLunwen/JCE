@@ -245,6 +245,19 @@ const char *jce_assetdb_path_at(int idx)
     return d.entries[(size_t)idx].path.c_str();
 }
 
+/* Return the project-relative path for an asset entry, falling back to
+ * the absolute path when no project root is mounted (e.g. when an asset
+ * lives outside the current project). Callers that persist paths into
+ * components or scene files MUST prefer this over jce_assetdb_path_at()
+ * so saved scenes stay portable across machines and platforms. */
+const char *jce_assetdb_rel_at(int idx)
+{
+    DB &d = db();
+    if (idx < 0 || idx >= (int)d.entries.size()) return nullptr;
+    const Entry &e = d.entries[(size_t)idx];
+    return e.rel.empty() ? e.path.c_str() : e.rel.c_str();
+}
+
 JceAssetKind jce_assetdb_kind_at(int idx)
 {
     DB &d = db();

@@ -537,6 +537,7 @@
     "game.newWindow.tooltip": "別ウィンドウでゲームを起動し、入力をフルにサポートします",
     "game.notPlaying": "再生を開始するには Play をクリックしてください",
     "game.renderer": "レンダラー",
+    "game.renderer.restartRequired": "⚠ エディタを再起動して適用: %s",
     "game.renderingActive": "描画中",
     "game.resolution": "解像度",
     "game.stats": "統計",

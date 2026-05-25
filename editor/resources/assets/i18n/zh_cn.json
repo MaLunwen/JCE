@@ -537,6 +537,7 @@
     "game.newWindow.tooltip": "在独立窗口中启动游戏，支持完整输入控制",
     "game.notPlaying": "点击播放按钮启动游戏",
     "game.renderer": "渲染器",
+    "game.renderer.restartRequired": "⚠ 重启编辑器以应用: %s",
     "game.renderingActive": "渲染中",
     "game.resolution": "分辨率",
     "game.stats": "统计",

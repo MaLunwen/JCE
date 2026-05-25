@@ -45,6 +45,7 @@ const char *jce_assetdb_get_root(void);
 /* Flat enumeration. */
 int            jce_assetdb_count(void);
 const char    *jce_assetdb_path_at(int idx);
+const char    *jce_assetdb_rel_at(int idx);
 JceAssetKind   jce_assetdb_kind_at(int idx);
 
 /* Lookups (path is project-relative or absolute, both accepted). */

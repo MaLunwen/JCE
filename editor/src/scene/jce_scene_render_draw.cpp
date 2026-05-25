@@ -115,6 +115,108 @@ void draw_grid(void)
 
 /* ── Selection outlines ───────────────────────────────────────────── */
 
+/* Draw 4 axial rays + an end-cap ring → cone gizmo for spot lights. */
+static void outline_draw_cone(jce_vec3 apex, jce_vec3 axis_unit,
+                              float length, float half_angle_rad,
+                              uint32_t abgr)
+{
+    if (length <= 0.0f) length = 1.0f;
+    if (half_angle_rad < 0.01f) half_angle_rad = 0.01f;
+
+    /* Build an orthonormal basis (axis, u, v). */
+    jce_vec3 up = (fabsf(axis_unit.y) < 0.95f)
+                  ? jce_v3(0.0f, 1.0f, 0.0f)
+                  : jce_v3(1.0f, 0.0f, 0.0f);
+    jce_vec3 u = jce_v3_normalize(jce_v3_cross(axis_unit, up));
+    jce_vec3 v = jce_v3_cross(axis_unit, u);
+
+    jce_vec3 base   = jce_v3_add(apex, jce_v3_scale(axis_unit, length));
+    float    radius = length * tanf(half_angle_rad);
+
+    /* End-cap ring (16 segments). */
+    const int seg = 16;
+    jce_vec3 prev = base;
+    for (int k = 0; k <= seg; k++) {
+        float a = (float)k * (6.2831853f / (float)seg);
+        jce_vec3 p = jce_v3_add(base,
+                        jce_v3_add(jce_v3_scale(u, cosf(a) * radius),
+                                   jce_v3_scale(v, sinf(a) * radius)));
+        if (k > 0) jce_debug_draw_line(prev, p, abgr);
+        prev = p;
+    }
+
+    /* 4 axial rays from apex to ring at 0°, 90°, 180°, 270°. */
+    for (int k = 0; k < 4; k++) {
+        float a = (float)k * (3.1415927f * 0.5f);
+        jce_vec3 p = jce_v3_add(base,
+                        jce_v3_add(jce_v3_scale(u, cosf(a) * radius),
+                                   jce_v3_scale(v, sinf(a) * radius)));
+        jce_debug_draw_line(apex, p, abgr);
+    }
+}
+
+/* Draw a perspective/ortho frustum gizmo for camera entities. */
+static void outline_draw_frustum(jce_vec3 origin, jce_quat rot,
+                                  float fov_deg, float near_z, float far_z,
+                                  bool ortho, uint32_t abgr)
+{
+    if (near_z <= 0.0f) near_z = 0.1f;
+    if (far_z  <= near_z) far_z = near_z + 1.0f;
+
+    /* Right-handed: forward = -Z, up = +Y, right = +X. */
+    jce_vec3 fwd   = jce_q_rotate(rot, jce_v3(0.0f, 0.0f, -1.0f));
+    jce_vec3 up    = jce_q_rotate(rot, jce_v3(0.0f, 1.0f,  0.0f));
+    jce_vec3 right = jce_q_rotate(rot, jce_v3(1.0f, 0.0f,  0.0f));
+
+    const float aspect = 16.0f / 9.0f;
+    float hn, wn, hf, wf;
+    if (ortho) {
+        hn = hf = 1.0f;
+        wn = wf = aspect;
+    } else {
+        float t = tanf(fov_deg * 0.5f * 3.1415927f / 180.0f);
+        hn = near_z * t;
+        wn = hn * aspect;
+        hf = far_z  * t;
+        wf = hf * aspect;
+    }
+
+    jce_vec3 nc = jce_v3_add(origin, jce_v3_scale(fwd, near_z));
+    jce_vec3 fc = jce_v3_add(origin, jce_v3_scale(fwd, far_z));
+
+    jce_vec3 ntl = jce_v3_add(nc, jce_v3_add(jce_v3_scale(up,  hn), jce_v3_scale(right, -wn)));
+    jce_vec3 ntr = jce_v3_add(nc, jce_v3_add(jce_v3_scale(up,  hn), jce_v3_scale(right,  wn)));
+    jce_vec3 nbl = jce_v3_add(nc, jce_v3_add(jce_v3_scale(up, -hn), jce_v3_scale(right, -wn)));
+    jce_vec3 nbr = jce_v3_add(nc, jce_v3_add(jce_v3_scale(up, -hn), jce_v3_scale(right,  wn)));
+    jce_vec3 ftl = jce_v3_add(fc, jce_v3_add(jce_v3_scale(up,  hf), jce_v3_scale(right, -wf)));
+    jce_vec3 ftr = jce_v3_add(fc, jce_v3_add(jce_v3_scale(up,  hf), jce_v3_scale(right,  wf)));
+    jce_vec3 fbl = jce_v3_add(fc, jce_v3_add(jce_v3_scale(up, -hf), jce_v3_scale(right, -wf)));
+    jce_vec3 fbr = jce_v3_add(fc, jce_v3_add(jce_v3_scale(up, -hf), jce_v3_scale(right,  wf)));
+
+    /* Near rect. */
+    jce_debug_draw_line(ntl, ntr, abgr); jce_debug_draw_line(ntr, nbr, abgr);
+    jce_debug_draw_line(nbr, nbl, abgr); jce_debug_draw_line(nbl, ntl, abgr);
+    /* Far rect. */
+    jce_debug_draw_line(ftl, ftr, abgr); jce_debug_draw_line(ftr, fbr, abgr);
+    jce_debug_draw_line(fbr, fbl, abgr); jce_debug_draw_line(fbl, ftl, abgr);
+    /* Connectors. */
+    jce_debug_draw_line(ntl, ftl, abgr); jce_debug_draw_line(ntr, ftr, abgr);
+    jce_debug_draw_line(nbl, fbl, abgr); jce_debug_draw_line(nbr, fbr, abgr);
+    /* Apex stub so the origin is visible for ortho cameras too. */
+    jce_debug_draw_line(origin, nc, abgr);
+}
+
+/* Draws a highlight on every selected entity:
+ *   - With a static mesh        → wireframe overlay on the actual geometry.
+ *   - Point/Spot light          → real influence sphere or cone.
+ *   - Camera                    → real view frustum (fov / near / far).
+ *   - Box/Sphere/Capsule/CC     → real collider shape.
+ *   - Anything else (empties,
+ *     audio sources, particles,
+ *     prefab roots, …)         → AABB sized by transform.scale.
+ *
+ * Goal: selection feedback that visually matches each entity's actual
+ * shape — not just static meshes. */
 void draw_selection_outlines(void)
 {
     int sel_count = 0;
@@ -126,24 +228,199 @@ void draw_selection_outlines(void)
 
     JceUniformHandle uh = jce_renderer_get_tex_uniform(s_sr.renderer);
 
+    /* ABGR (debug-draw convention). Orange-amber matches the
+     * wireframe overlay tone used for selected meshes. */
+    const uint32_t col_outline = 0xFF00BFFF;
+    bool drew_any_debug = false;
+
+    JceScene *scene = jce_state_get_scene();
+
     for (int i = 0; i < sel_count; i++) {
         uint32_t id = sel[i];
         if (id == 0 || !jce_state_entity_exists(id)) continue;
         if (!jce_state_entity_enabled(id)) continue;
 
+        JceEntity e = (JceEntity)id;
+
+        /* --- Static mesh: keep the high-fidelity wireframe overlay. */
         jce_mat4 model;
         JceMesh *mesh = NULL;
-        if (!build_overlay_entity_model(id, &model, &mesh)) continue;
-        if (!mesh) continue;
+        if (build_overlay_entity_model(id, &model, &mesh) && mesh) {
+            jce_set_transform(model.raw[0], 1);
+            jce_uniform_set(s_sr.u_light_dir,   flat_dir,   1);
+            jce_uniform_set(s_sr.u_light_color, flat_color, 1);
+            jce_set_texture(0, uh, s_sr.white_tex, JCE_SAMPLER_INHERIT);
+            jce_mesh_submit_wireframe_overlay(mesh, s_sr.renderer,
+                                              scene_view_id());
+            continue;
+        }
 
-        jce_set_transform(model.raw[0], 1);
+        if (!scene) continue;
+        JceTransform *t = jce_scene_get_transform(scene, e);
+        if (!t) continue;
 
-        jce_uniform_set(s_sr.u_light_dir,   flat_dir,   1);
-        jce_uniform_set(s_sr.u_light_color, flat_color, 1);
-        jce_set_texture(0, uh, s_sr.white_tex, JCE_SAMPLER_INHERIT);
+        bool drew_shape = false;
 
-        jce_mesh_submit_wireframe_overlay(mesh, s_sr.renderer, scene_view_id());
+        /* --- Point light → influence sphere. */
+        if (jce_scene_has_point_light(scene, e)) {
+            JcePointLight *pl = jce_scene_get_point_light(scene, e);
+            float r = (pl && pl->radius > 0.0f) ? pl->radius : 1.0f;
+            jce_debug_draw_sphere(t->position, r, col_outline);
+            drew_shape = true;
+        }
+
+        /* --- Spot light → real cone (apex, axis, length, opening). */
+        if (jce_scene_has_spot_light(scene, e)) {
+            JceSpotLight *sl = jce_scene_get_spot_light(scene, e);
+            if (sl) {
+                jce_vec3 axis = jce_v3_normalize(sl->direction);
+                if (axis.x == 0.0f && axis.y == 0.0f && axis.z == 0.0f)
+                    axis = jce_q_rotate(t->rotation, jce_v3(0, 0, -1));
+                float len   = (sl->radius > 0.0f) ? sl->radius : 1.0f;
+                float cosA  = (sl->outer_cone_cos > 0.0f)
+                              ? sl->outer_cone_cos : 0.7071f;
+                if (cosA > 0.9999f) cosA = 0.9999f;
+                outline_draw_cone(t->position, axis, len,
+                                  acosf(cosA), col_outline);
+            }
+            drew_shape = true;
+        }
+
+        /* --- Camera → real view frustum. */
+        if (jce_scene_has_camera(scene, e)) {
+            JceCameraComponent *cc = jce_scene_get_camera(scene, e);
+            if (cc) {
+                outline_draw_frustum(t->position, t->rotation,
+                                     (cc->fov_deg > 0.0f) ? cc->fov_deg : 60.0f,
+                                     (cc->near_plane > 0.0f) ? cc->near_plane : 0.1f,
+                                     (cc->far_plane > cc->near_plane) ? cc->far_plane : 100.0f,
+                                     cc->ortho, col_outline);
+            }
+            drew_shape = true;
+        }
+
+        /* --- Collider shapes (real geometry).  size/radius are
+         *     interpreted in local entity space and scaled by the
+         *     entity's TRS scale, matching Unity-style authoring. */
+        if (jce_scene_has_box_collider(scene, e)) {
+            JceBoxColliderComponent *bc = jce_scene_get_box_collider(scene, e);
+            jce_vec3 ofs = bc
+                ? jce_v3(bc->center[0], bc->center[1], bc->center[2])
+                : jce_v3(0, 0, 0);
+            float sx = (t->scale.x != 0.0f) ? fabsf(t->scale.x) : 1.0f;
+            float sy = (t->scale.y != 0.0f) ? fabsf(t->scale.y) : 1.0f;
+            float sz = (t->scale.z != 0.0f) ? fabsf(t->scale.z) : 1.0f;
+            float bx = bc ? bc->size[0] : 1.0f;
+            float by = bc ? bc->size[1] : 1.0f;
+            float bz = bc ? bc->size[2] : 1.0f;
+            jce_vec3 half = jce_v3(0.5f * bx * sx, 0.5f * by * sy, 0.5f * bz * sz);
+            jce_vec3 c = jce_v3_add(t->position,
+                              jce_q_rotate(t->rotation,
+                                  jce_v3(ofs.x * sx, ofs.y * sy, ofs.z * sz)));
+            jce_debug_draw_box(c, half, t->rotation, col_outline);
+            drew_shape = true;
+        }
+        if (jce_scene_has_sphere_collider(scene, e)) {
+            JceSphereColliderComponent *sc = jce_scene_get_sphere_collider(scene, e);
+            jce_vec3 ofs = sc
+                ? jce_v3(sc->center[0], sc->center[1], sc->center[2])
+                : jce_v3(0, 0, 0);
+            float sx = (t->scale.x != 0.0f) ? fabsf(t->scale.x) : 1.0f;
+            float sy = (t->scale.y != 0.0f) ? fabsf(t->scale.y) : 1.0f;
+            float sz = (t->scale.z != 0.0f) ? fabsf(t->scale.z) : 1.0f;
+            float smax = fmaxf(sx, fmaxf(sy, sz));
+            float r = ((sc && sc->radius > 0.0f) ? sc->radius : 0.5f) * smax;
+            jce_vec3 c = jce_v3_add(t->position,
+                              jce_q_rotate(t->rotation,
+                                  jce_v3(ofs.x * sx, ofs.y * sy, ofs.z * sz)));
+            jce_debug_draw_sphere(c, r, col_outline);
+            drew_shape = true;
+        }
+        if (jce_scene_has_capsule_collider(scene, e)) {
+            JceCapsuleColliderComponent *cc = jce_scene_get_capsule_collider(scene, e);
+            jce_vec3 ofs = cc
+                ? jce_v3(cc->center[0], cc->center[1], cc->center[2])
+                : jce_v3(0, 0, 0);
+            float sx = (t->scale.x != 0.0f) ? fabsf(t->scale.x) : 1.0f;
+            float sy = (t->scale.y != 0.0f) ? fabsf(t->scale.y) : 1.0f;
+            float sz = (t->scale.z != 0.0f) ? fabsf(t->scale.z) : 1.0f;
+            float r_scale = fmaxf(sx, sz);
+            float r = ((cc && cc->radius > 0.0f) ? cc->radius : 0.3f) * r_scale;
+            float h = ((cc && cc->height > 0.0f) ? cc->height : 1.0f) * sy;
+            float hh = 0.5f * fmaxf(0.0f, h - 2.0f * r);
+            jce_vec3 c = jce_v3_add(t->position,
+                              jce_q_rotate(t->rotation,
+                                  jce_v3(ofs.x * sx, ofs.y * sy, ofs.z * sz)));
+            jce_debug_draw_capsule(c, r, hh, t->rotation, col_outline);
+            drew_shape = true;
+        }
+        if (jce_scene_has_character_controller(scene, e)) {
+            JceCharacterControllerComponent *cc =
+                jce_scene_get_character_controller(scene, e);
+            float sx = (t->scale.x != 0.0f) ? fabsf(t->scale.x) : 1.0f;
+            float sy = (t->scale.y != 0.0f) ? fabsf(t->scale.y) : 1.0f;
+            float sz = (t->scale.z != 0.0f) ? fabsf(t->scale.z) : 1.0f;
+            float r_scale = fmaxf(sx, sz);
+            float r = ((cc && cc->radius > 0.0f) ? cc->radius : 0.3f) * r_scale;
+            float h = ((cc && cc->height > 0.0f) ? cc->height : 1.6f) * sy;
+            float hh = 0.5f * fmaxf(0.0f, h - 2.0f * r);
+            jce_debug_draw_capsule(t->position, r, hh, t->rotation, col_outline);
+            drew_shape = true;
+        }
+
+        /* --- Skeletal-animated (skinned) model.
+         *     Submit the true geometric wireframe of every primitive in
+         *     the cached JceModel, walking the full node hierarchy. The
+         *     bone palette comes from the live animation player when
+         *     available; otherwise the bind pose is used. */
+        if (!drew_shape && jce_scene_has_skeletal_animator(scene, e)) {
+            JceSkeletalAnimatorComponent *sa =
+                jce_scene_get_skeletal_animator(scene, e);
+            JceModel *mdl = (sa && sa->skeleton_path[0])
+                ? jce_editor_scene_get_model(sa->skeleton_path, id)
+                : NULL;
+            if (mdl) {
+                float sx = (t->scale.x != 0.0f) ? t->scale.x : 1.0f;
+                float sy = (t->scale.y != 0.0f) ? t->scale.y : 1.0f;
+                float sz = (t->scale.z != 0.0f) ? t->scale.z : 1.0f;
+                jce_mat4 world = jce_m4_from_trs(t->position, t->rotation,
+                                                  jce_v3(sx, sy, sz));
+                jce_uniform_set(s_sr.u_light_dir,   flat_dir,   1);
+                jce_uniform_set(s_sr.u_light_color, flat_color, 1);
+                jce_set_texture(0, uh, s_sr.white_tex, JCE_SAMPLER_INHERIT);
+                jce_model_submit_wireframe_overlay(mdl, s_sr.renderer,
+                                                    scene_view_id(),
+                                                    &world, NULL, 0);
+                drew_shape = true;
+            } else {
+                /* Model not cached yet: humanoid AABB placeholder. */
+                float sx = (t->scale.x != 0.0f) ? fabsf(t->scale.x) : 1.0f;
+                float sy = (t->scale.y != 0.0f) ? fabsf(t->scale.y) : 1.0f;
+                float sz = (t->scale.z != 0.0f) ? fabsf(t->scale.z) : 1.0f;
+                jce_vec3 half = jce_v3(0.25f * sx, 1.0f * sy, 0.25f * sz);
+                jce_vec3 center = jce_v3_add(t->position,
+                                      jce_q_rotate(t->rotation,
+                                          jce_v3(0.0f, 1.0f * sy, 0.0f)));
+                jce_debug_draw_box(center, half, t->rotation, col_outline);
+                drew_shape = true;
+            }
+        }
+
+        /* --- Generic fallback for transform-only entities (empties,
+         *     audio sources, particle emitters, prefab roots …). */
+        if (!drew_shape) {
+            float sx = (t->scale.x != 0.0f) ? fabsf(t->scale.x) : 1.0f;
+            float sy = (t->scale.y != 0.0f) ? fabsf(t->scale.y) : 1.0f;
+            float sz = (t->scale.z != 0.0f) ? fabsf(t->scale.z) : 1.0f;
+            jce_vec3 half = jce_v3(0.5f * sx, 0.5f * sy, 0.5f * sz);
+            jce_debug_draw_box(t->position, half, t->rotation, col_outline);
+        }
+
+        drew_any_debug = true;
     }
+
+    if (drew_any_debug)
+        jce_debug_draw_flush(scene_view_id(), s_sr.renderer);
 
     /* Restore default lighting so subsequent draws aren't tinted. */
     JceDirLight sun = jce_dir_light_default();

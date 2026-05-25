@@ -6,6 +6,7 @@
  * for post-processing, shadow maps, and material complexity.
  */
 
+#include <jce/os/core/jce_defs.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/renderer/jce_renderer_caps.h>
 
@@ -307,13 +308,13 @@ int jce_renderer_caps_preferred_chain(enum JceRendererBackend *out, int max)
      * (then converts to bgfx_renderer_type_t) so runtime fallback,
      * UI dropdown and shader compilation all stay in lock-step. */
     static const enum JceRendererBackend chain[] = {
-#if defined(_WIN32)
+#if JCE_PLATFORM_WINDOWS
         /* D3D12 (lowest overhead, modern PSO model) →
          * Vulkan  (modern explicit API, good perf on NV/AMD) →
          * D3D11  (mature, broadest driver compatibility) →
          * OpenGL (final compatibility fallback). */
         JCE_BACKEND_D3D12, JCE_BACKEND_VULKAN, JCE_BACKEND_D3D11, JCE_BACKEND_OPENGL,
-#elif defined(__APPLE__)
+#elif JCE_PLATFORM_APPLE
         /* Metal (native, best perf) → Vulkan via MoltenVK (compat).
          * Apple deprecated desktop OpenGL; bgfx ships with
          * BGFX_CONFIG_RENDERER_OPENGL=0 on macOS and never reports
@@ -321,14 +322,16 @@ int jce_renderer_caps_preferred_chain(enum JceRendererBackend *out, int max)
          * pollute the editor preference dropdown with an unsupported
          * entry, so we omit GL on Apple platforms. */
         JCE_BACKEND_METAL, JCE_BACKEND_VULKAN,
-#elif defined(__ANDROID__)
+#elif JCE_PLATFORM_ANDROID
         /* Vulkan (modern, perf) → OpenGL ES (universal compat). */
         JCE_BACKEND_VULKAN, JCE_BACKEND_OPENGLES,
-#elif defined(__EMSCRIPTEN__)
+#elif JCE_PLATFORM_WEB
         JCE_BACKEND_OPENGLES,
-#else /* Linux / other Unix */
+#elif JCE_PLATFORM_LINUX
         /* Vulkan (modern, perf) → OpenGL (compat). */
         JCE_BACKEND_VULKAN, JCE_BACKEND_OPENGL,
+#else
+#  error "jce_renderer_caps_preferred_chain: unknown platform — add a JCE_PLATFORM_* branch"
 #endif
     };
     const int n = (int)(sizeof(chain) / sizeof(chain[0]));

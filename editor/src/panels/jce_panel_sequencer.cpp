@@ -493,7 +493,10 @@ void draw_inspector(void)
     ImGui::InputText(jce_editor_i18n_id("sequencer.field.binding", "seq_t_bind"), t.binding, sizeof(t.binding));
     if (ImGui::BeginDragDropTarget()) {
         if (const ImGuiPayload *pl = ImGui::AcceptDragDropPayload("JCE_ASSET_PATH")) {
-            std::strncpy(t.binding, (const char *)pl->Data, sizeof(t.binding) - 1);
+            char rel[1024];
+            jce_editor_path_to_relative(rel, sizeof(rel), (const char *)pl->Data);
+            const char *src = rel[0] ? rel : (const char *)pl->Data;
+            std::strncpy(t.binding, src, sizeof(t.binding) - 1);
             t.binding[sizeof(t.binding) - 1] = 0;
         }
         ImGui::EndDragDropTarget();

@@ -7,6 +7,7 @@
  */
 
 #include "jce_reflect.h"
+#include "ui/jce_editor_panels.h"
 
 #include "jce_editor_i18n.h"
 #include "jce_editor_state.h"
@@ -179,9 +180,14 @@ bool draw_field(const JceReflectField *f, void *base, const void *defaults_base)
             if (const ImGuiPayload *pl = ImGui::AcceptDragDropPayload("JCE_ASSET_PATH")) {
                 const char *src = (const char *)pl->Data;
                 if (src && pl->DataSize > 0) {
-                    size_t n = (size_t)pl->DataSize;
+                    /* Normalize to project-relative so reflected asset
+                     * refs never store the user's absolute disk path. */
+                    char rel[1024];
+                    jce_editor_path_to_relative(rel, sizeof(rel), src);
+                    const char *stored = rel[0] ? rel : src;
+                    size_t n = strlen(stored);
                     if (n >= f->size) n = f->size - 1;
-                    std::memcpy(p, src, n);
+                    std::memcpy(p, stored, n);
                     p[n] = '\0';
                     changed = true;
                     jce_state_begin_batch_edit();

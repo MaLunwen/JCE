@@ -47,6 +47,21 @@ void jce_model_draw(const JceModel *model,
                     const jce_mat4 *joint_matrices,
                     uint32_t num_joints);
 
+/* Submit a wireframe overlay of every primitive in the model, walking
+ * the full node hierarchy. Used by editor tooling (selection outlines)
+ * to draw the true geometric silhouette of skinned/static models that
+ * already had their materials/lights bound by the regular pass.
+ *
+ * Pass joint_matrices == NULL for the bind pose (skinned meshes only);
+ * otherwise pass the live bone palette so the wireframe deforms with
+ * the current animation. */
+JCE_API void jce_model_submit_wireframe_overlay(const JceModel *model,
+                                                const JceRenderer *r,
+                                                uint16_t view_id,
+                                                const jce_mat4 *transform,
+                                                const jce_mat4 *joint_matrices,
+                                                uint32_t num_joints);
+
 /* -- Skeleton & animation accessors -------------------------------- */
 
 /* Returns the skeleton, or NULL if the model has no skinning. */

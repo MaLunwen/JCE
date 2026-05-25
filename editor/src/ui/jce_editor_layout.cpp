@@ -1038,9 +1038,12 @@ static void draw_menu_bar(void)
             ImGui::EndMenu();
         }
         ImGui::Separator();
-        /* Toolbar / Status Bar — visibility only, no dedicated focusable window. */
-        ImGui::MenuItem(jce_editor_i18n("window.toolbar"), NULL,
-                        jce_editor_panel_visible_ptr(JCE_PANEL_TOOLBAR));
+        /* Status Bar — visibility only, no dedicated focusable window.
+           (The previous "Toolbar" entry was removed: its play controls
+           duplicated the menu-bar right-aligned Play/Stop, and its
+           gizmo radios duplicated the Scene viewport's inline toolbar.
+           Q/W/E/R/X/Z hotkeys are still processed globally — see
+           jce_editor_panel_toolbar_inline().) */
         ImGui::MenuItem(jce_editor_i18n("window.statusBar"), NULL,
                         jce_editor_panel_visible_ptr(JCE_PANEL_STATUS_BAR));
         ImGui::Separator();
@@ -2005,9 +2008,10 @@ static void draw_panel_windows(void)
     jce_editor_panel_lan_discovery();
     jce_editor_panel_network_stats();
 
-    /* ── Top-level Toolbar (P0) ───────────────────────────────────── */
-    jce_editor_panel_toolbar();
-    /* ── Bottom Status Bar (P0) ───────────────────────────────────── */
+    /* ── Top-level Toolbar (P0) ─────────────────────────────────────
+       Drawn inline inside the DockSpace host (see above); the legacy
+       standalone call is now a no-op kept only for ABI continuity. */
+    /* Bottom Status Bar (P0) */
     jce_editor_panel_status_bar();
 
     /* ── Profiler ─────────────────────────────────────────────────── */
@@ -2286,6 +2290,12 @@ void jce_editor_layout_draw(void)
 
     /* Menu bar */
     draw_menu_bar();
+
+    /* Top toolbar — drawn inline so the Window > Toolbar visibility
+       toggle re-flows the layout (the DockSpace below naturally takes
+       the row back when the toolbar is hidden). Previously this lived
+       in a separate pinned window which the DockSpace host covered. */
+    jce_editor_panel_toolbar_inline();
 
     /* Create DockSpace. */
     ImGuiID dockspace_id = ImGui::GetID("JCEDockSpace");

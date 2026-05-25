@@ -182,7 +182,9 @@ void jce_editor_asset_picker_draw(void)
     for (int i = 0; i < total; ++i) {
         int k = (int)jce_assetdb_kind_at(i);
         if (g_pk.kind_filter != 0 && k != g_pk.kind_filter) continue;
-        const char *p = jce_assetdb_path_at(i);
+        /* Filter against the project-relative path so users searching
+         * for "textures/foo" find it without their absolute prefix. */
+        const char *p = jce_assetdb_rel_at(i);
         if (!p || !icontains(p, g_pk.search)) continue;
         filtered.push_back(i);
     }
@@ -206,7 +208,10 @@ void jce_editor_asset_picker_draw(void)
         while (clip.Step()) {
             for (int row = clip.DisplayStart; row < clip.DisplayEnd; ++row) {
                 int idx = filtered[row];
-                const char *path = jce_assetdb_path_at(idx);
+                /* Display project-relative paths so users never see their
+                 * home directory or drive letter — keeps the picker
+                 * consistent with what we actually store. */
+                const char *path = jce_assetdb_rel_at(idx);
                 int kind = (int)jce_assetdb_kind_at(idx);
                 /* Build a two-column-ish row: [KIND]  filename  (path-dim) */
                 const char *file = path ? path : "";
@@ -253,7 +258,7 @@ void jce_editor_asset_picker_draw(void)
             commit_via_keyboard = true;
 
         if (commit_via_keyboard) {
-            const char *path = jce_assetdb_path_at(g_pk.selected_idx);
+            const char *path = jce_assetdb_rel_at(g_pk.selected_idx);
             if (g_pk.out_buf && g_pk.out_size > 0 && path)
                 snprintf(g_pk.out_buf, g_pk.out_size, "%s", path);
             if (g_pk.ready_flag) *g_pk.ready_flag = true;
@@ -291,7 +296,7 @@ void jce_editor_asset_picker_draw(void)
         bool can_select = (g_pk.selected_idx >= 0);
         if (!can_select) ImGui::BeginDisabled();
         if (ImGui::Button(sel_lbl)) {
-            const char *path = jce_assetdb_path_at(g_pk.selected_idx);
+            const char *path = jce_assetdb_rel_at(g_pk.selected_idx);
             if (g_pk.out_buf && g_pk.out_size > 0 && path)
                 snprintf(g_pk.out_buf, g_pk.out_size, "%s", path);
             if (g_pk.ready_flag) *g_pk.ready_flag = true;

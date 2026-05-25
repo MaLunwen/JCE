@@ -319,16 +319,27 @@ bool jce_path_relative(char *out, size_t out_size,
     /* Whole base matches up to a '/' or end. */
     if (!nb[i] && (np[i] == '/' || !np[i])) common = i + (np[i] == '/' ? 1 : 0);
 
-    /* Count '/' segments remaining in base after `common` -> that many "../". */
+    /* Count '/' segments remaining in base after `common` -> that many "../".
+     * `common` is an index into np that may also legitimately equal
+     * strlen(nb)+1 when nb was fully consumed (post-loop +1 to skip the
+     * separator in np).  Indexing nb with that value reads past its
+     * null terminator (UB → phantom "../" prefixes), so cap to nb's
+     * length here. */
+    size_t nblen = strlen(nb);
+    size_t cstart = (common <= nblen) ? common : nblen;
     size_t up = 0;
-    for (size_t j = common; nb[j]; ++j) if (nb[j] == '/') ++up;
-    if (nb[common] || (common < strlen(nb) && nb[common - 1] != '/')) {
-        /* leftover non-empty segment */
-        if (common < strlen(nb)) ++up;
-    }
+    for (size_t j = cstart; j < nblen; ++j) if (nb[j] == '/') ++up;
+    /* If there's still un-matched text in nb past `cstart`, that's an
+     * extra segment to climb out of (preserves the original semantics
+     * of "++up for the leftover segment").  The cstart<nblen guard
+     * makes the safety against reading past nb's terminator explicit,
+     * which the old code lacked when common was set to strlen(nb)+1
+     * after fully consuming nb. */
+    if (cstart < nblen) ++up;
 
     size_t need = up * 3;                   /* "../" per up step */
-    size_t tail_off = (np[common] == '/') ? common + 1 : common;
+    size_t tail_off = (common < strlen(np) && np[common] == '/') ? common + 1 : common;
+    if (tail_off > strlen(np)) tail_off = strlen(np);
     size_t tail_len = strlen(np + tail_off);
     if (need + tail_len + 1 > out_size) return false;
     if (need == 0 && tail_len == 0) {

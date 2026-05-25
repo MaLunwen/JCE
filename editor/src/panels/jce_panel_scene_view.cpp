@@ -12,6 +12,7 @@
 #include "scene/jce_editor_scene_asset_cache.h"
 #include "core/jce_hotkeys.h"
 #include "core/jce_editor_config.h"
+#include "ui/jce_editor_panels.h"
 #include <jce/os/core/jce_filesystem.h>
 
 extern "C" {
@@ -148,9 +149,10 @@ static void draw_scene_view_toolbar(void)
             ImGui::EndMenu();
         }
 
-        bool lp = jce_state_get_live_preview();
-        if (ImGui::MenuItem(jce_editor_i18n("sceneView.livePreview"), NULL, lp))
-            jce_state_set_live_preview(!lp);
+        /* (livePreview menu item removed — the underlying
+           jce_state_live_preview flag was a no-op: nothing ever read it
+           to change behavior. If/when real-time preview lands, restore
+           this entry and wire the flag into the render loop.) */
 
         ImGui::Separator();
 
@@ -362,23 +364,29 @@ static void assign_texture_drop_to_mesh_renderer(JceMeshRenderer *mesh_renderer_
 {
     if (!mesh_renderer_comp) return;
 
+    /* Always store project-relative so component paths survive
+     * cwd / project moves and don't leak the user's home dir. */
+    char rel[1024];
+    jce_editor_path_to_relative(rel, sizeof(rel), asset_path);
+    const char *store_path = rel[0] ? rel : asset_path;
+
     auto &mr = *mesh_renderer_comp;
     switch (slot) {
     case 1:
-        snprintf(mr.mr_tex, sizeof(mr.mr_tex), "%s", asset_path);
+        snprintf(mr.mr_tex, sizeof(mr.mr_tex), "%s", store_path);
         break;
     case 2:
-        snprintf(mr.normal_tex, sizeof(mr.normal_tex), "%s", asset_path);
+        snprintf(mr.normal_tex, sizeof(mr.normal_tex), "%s", store_path);
         break;
     case 3:
-        snprintf(mr.ao_tex, sizeof(mr.ao_tex), "%s", asset_path);
+        snprintf(mr.ao_tex, sizeof(mr.ao_tex), "%s", store_path);
         break;
     case 4:
-        snprintf(mr.emissive_tex, sizeof(mr.emissive_tex), "%s", asset_path);
+        snprintf(mr.emissive_tex, sizeof(mr.emissive_tex), "%s", store_path);
         break;
     case 0:
     default:
-        snprintf(mr.albedo_tex, sizeof(mr.albedo_tex), "%s", asset_path);
+        snprintf(mr.albedo_tex, sizeof(mr.albedo_tex), "%s", store_path);
         break;
     }
 }
@@ -390,11 +398,17 @@ static bool apply_material_asset_to_mesh_renderer(JceMeshRenderer *mesh_renderer
 
     JcePbrMaterial material = {};
     char tex_paths[5][256] = {};
+    /* Load uses the absolute host path; the value we *store* into the
+     * component must be project-relative so it round-trips through save. */
     if (!jce_pbr_material_load_json(asset_path, &material, tex_paths))
         return false;
 
+    char rel[1024];
+    jce_editor_path_to_relative(rel, sizeof(rel), asset_path);
+    const char *store_path = rel[0] ? rel : asset_path;
+
     auto &mr = *mesh_renderer_comp;
-    snprintf(mr.material_path, sizeof(mr.material_path), "%s", asset_path);
+    snprintf(mr.material_path, sizeof(mr.material_path), "%s", store_path);
     mr.albedo_tex[0] = '\0';
     mr.mr_tex[0] = '\0';
     mr.normal_tex[0] = '\0';
@@ -751,8 +765,12 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
                     ? jce_scene_get_skybox(scene, (JceEntity)sky_id)
                     : NULL;
                 if (sky) {
+                    char rel_hdr[1024];
+                    jce_editor_path_to_relative(rel_hdr, sizeof(rel_hdr),
+                                                 asset_path);
+                    const char *store_hdr = rel_hdr[0] ? rel_hdr : asset_path;
                     snprintf(sky->hdr_path, sizeof(sky->hdr_path),
-                             "%s", asset_path);
+                             "%s", store_hdr);
                     if (sky->exposure <= 0.0f)
                         sky->exposure = 1.0f;
                 }
@@ -826,11 +844,15 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
             JceMeshRenderer *mesh_renderer_comp = find_mesh_renderer_component(hit_id);
             if (mesh_renderer_comp) {
                 /* Replace the existing entity's mesh + extract material. */
+                char rel_mesh[1024];
+                jce_editor_path_to_relative(rel_mesh, sizeof(rel_mesh),
+                                             asset_path);
+                const char *store_mesh = rel_mesh[0] ? rel_mesh : asset_path;
                 jce_state_begin_transient_edit();
                 {
                     auto &mr = *mesh_renderer_comp;
                     snprintf(mr.mesh_path, sizeof(mr.mesh_path),
-                             "%s", asset_path);
+                             "%s", store_mesh);
                     mr.mesh_shape = 0;
                     mr.material_path[0] = '\0';
                     mr.albedo_tex[0] = '\0';
@@ -904,8 +926,13 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
                         }
                         JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, (JceEntity)id);
                         if (mr) {
+                            char rel_mesh2[1024];
+                            jce_editor_path_to_relative(rel_mesh2, sizeof(rel_mesh2),
+                                                         asset_path);
+                            const char *store_mesh2 = rel_mesh2[0]
+                                                       ? rel_mesh2 : asset_path;
                             snprintf(mr->mesh_path, sizeof(mr->mesh_path),
-                                     "%s", asset_path);
+                                     "%s", store_mesh2);
                             mr->mesh_shape = 0;
                             mr->material_path[0] = '\0';
                             mr->albedo_tex[0] = '\0';

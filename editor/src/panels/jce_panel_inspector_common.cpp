@@ -113,13 +113,26 @@ void draw_vec3_control(const char *label,
 
 /* ── Asset drag-drop target for path fields ───────────────────────── */
 
+/* Drag-drop payloads carry the asset's absolute disk path, but every
+ * inspector path field stores a project-relative VFS path (matching
+ * the asset picker contract).  Normalize here so dropped paths never
+ * leak the user's full disk layout into a scene/prefab. */
+static void copy_payload_as_relative(char *buf, size_t buf_size,
+                                     const void *payload_data)
+{
+    char rel[1024];
+    jce_editor_path_to_relative(rel, sizeof(rel),
+                                (const char *)payload_data);
+    snprintf(buf, buf_size, "%s",
+             rel[0] ? rel : (const char *)payload_data);
+}
+
 void accept_asset_drop(char *buf, size_t buf_size)
 {
     if (ImGui::BeginDragDropTarget()) {
         if (const ImGuiPayload *payload =
                 ImGui::AcceptDragDropPayload("JCE_ASSET_PATH")) {
-            const char *path = (const char *)payload->Data;
-            snprintf(buf, buf_size, "%s", path);
+            copy_payload_as_relative(buf, buf_size, payload->Data);
         }
         ImGui::EndDragDropTarget();
     }
@@ -144,7 +157,12 @@ void accept_mesh_drop_with_material(JceMeshRenderer *mr)
         if (const ImGuiPayload *payload =
                 ImGui::AcceptDragDropPayload("JCE_ASSET_PATH")) {
             const char *path = (const char *)payload->Data;
-            snprintf(mr->mesh_path, sizeof(mr->mesh_path), "%s", path);
+            /* Store the mesh ref as project-relative.  Keep the
+             * absolute `path` for the importer call below — assimp
+             * needs a real filesystem path. */
+            copy_payload_as_relative(mr->mesh_path,
+                                     sizeof(mr->mesh_path),
+                                     payload->Data);
             mr->mesh_shape = 0;
 
             if (is_mesh_ext(path)) {

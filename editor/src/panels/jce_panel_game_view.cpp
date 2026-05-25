@@ -12,9 +12,11 @@
 
 extern "C" {
 #include <jce/os/core/jce_defs.h>
+#include <jce/os/core/jce_log.h>
 #include <jce/os/platform/jce_host_dialog.h>
 #include <jce/renderer/jce_camera.h>
 #include <jce/renderer/jce_renderer.h>
+#include <jce/renderer/jce_renderer_caps.h>
 #include <jce/runtime/jce_game_module.h>
 #include <jce/middleware/scene/jce_vcam_system.h>
 }
@@ -91,12 +93,59 @@ void jce_editor_panel_game_view_content(void)
     ImGui::PopItemWidth();
 
     ImGui::SameLine();
-    static int s_renderer_idx = 0;
+    /* Renderer backend selector.
+     * The combo reflects the user's PERSISTED choice (editor config),
+     * NOT the live bgfx backend.  Why: bgfx cannot hot-swap backends,
+     * so the chosen value only takes effect at next launch — if we
+     * live-synced the combo to the running backend, a user who tries
+     * to re-pick the same backend as the live one wouldn't generate
+     * a change event (ImGui::Combo returns false when idx is unchanged),
+     * leaving the "restart required" hint stuck on screen.  Mirroring
+     * the persisted value makes re-selecting the live backend a real
+     * write (config := live), which clears the hint cleanly. */
     const char *const *renderer_names = nullptr;
     int renderer_count = jce_editor_renderer_backends(&renderer_names);
-    ImGui::PushItemWidth(80);
-    ImGui::Combo("##renderer", &s_renderer_idx, renderer_names, renderer_count);
+    JceRendererBackend live_bk = jce_renderer_get_backend(NULL);
+    const char *live_name = jce_renderer_backend_name(live_bk);
+
+    JceEditorConfig ren_cfg;
+    jce_editor_config_load(&ren_cfg);
+    int renderer_idx = 0;
+    for (int i = 0; i < renderer_count; ++i) {
+        if (renderer_names[i] && ren_cfg.renderer[0]
+                && strcmp(renderer_names[i], ren_cfg.renderer) == 0) {
+            renderer_idx = i;
+            break;
+        }
+    }
+    ImGui::PushItemWidth(110);
+    if (ImGui::Combo("##renderer", &renderer_idx,
+                     renderer_names, renderer_count)
+            && renderer_idx >= 0 && renderer_idx < renderer_count) {
+        const char *picked = renderer_names[renderer_idx];
+        if (picked && strcmp(ren_cfg.renderer, picked) != 0) {
+            snprintf(ren_cfg.renderer, sizeof(ren_cfg.renderer), "%s",
+                     picked);
+            jce_editor_config_save(&ren_cfg);
+            LOG_INFO("editor.game_view",
+                "renderer backend selection changed to '%s' — "
+                "restart the editor to apply", picked);
+        }
+    }
     ImGui::PopItemWidth();
+
+    /* Inline hint: shown whenever the persisted choice differs from
+     * the actually-running bgfx backend.  Disappears as soon as the
+     * user picks the live backend again (or restarts the editor). */
+    if (ren_cfg.renderer[0] && live_name
+            && strcmp(ren_cfg.renderer, live_name) != 0) {
+        ImGui::SameLine();
+        char buf[160];
+        snprintf(buf, sizeof(buf),
+                 jce_editor_i18n("game.renderer.restartRequired"),
+                 ren_cfg.renderer);
+        ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.30f, 1.0f), "%s", buf);
+    }
 
     ImGui::SameLine();
     {
@@ -302,16 +351,14 @@ void jce_editor_panel_game_view_content(void)
     bool play_active = (play_state == JCE_PLAY_PLAYING ||
                         play_state == JCE_PLAY_PAUSED);
 
-    /* Auto-capture the cursor the moment the user presses Play, so the
-     * Game View behaves like an actual game window — no extra click
-     * required.  Only on the rising edge so that releasing capture
-     * (ALT / ESC) while play is still running stays released. */
+    /* Cursor capture is now user-initiated only (click into the Game
+       View → capture; ESC / ALT / Stop → release). Auto-capturing on
+       the Play rising edge was Unity-ish for "instant game feel" but
+       it also stole the cursor from the Scene viewport, so dragging
+       gizmos (TRS) during Play silently failed because the absolute
+       mouse position was pinned by SDL relative-mouse mode. Let the
+       user opt in to capture by clicking the Game View. */
     static JcePlayState s_prev_play_state = JCE_PLAY_STOPPED;
-    if (play_state == JCE_PLAY_PLAYING &&
-        s_prev_play_state != JCE_PLAY_PLAYING) {
-        s_user_wants_capture = true;
-        ImGui::SetWindowFocus();
-    }
     /* Stop edge: when the user presses Stop, immediately release the
      * cursor (Unity-parity behavior).  Without this, s_user_wants_capture
      * stays true and the Game View keeps the cursor locked even though
@@ -483,10 +530,8 @@ void jce_editor_panel_game_view_content(void)
     }
 
     if (s_show_stats) {
-        const char *const *names = nullptr;
-        int n = jce_editor_renderer_backends(&names);
-        const char *current = (names && s_renderer_idx >= 0 && s_renderer_idx < n)
-                                  ? names[s_renderer_idx] : "?";
+        const char *current = jce_renderer_get_backend_name(NULL);
+        if (!current || !current[0]) current = "?";
         char buf[128];
         snprintf(buf, sizeof(buf), "%s: %s | %.1f fps  %ux%u",
                  jce_editor_i18n("game.renderer"), current,

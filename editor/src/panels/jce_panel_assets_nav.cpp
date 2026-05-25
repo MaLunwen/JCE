@@ -88,6 +88,10 @@ static void draw_dir_tree(const std::string &dir, int depth)
         }
 
         if (ImGui::BeginPopupContextItem()) {
+            if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.copyPath"))) {
+                ImGui::SetClipboardText(sd.c_str());
+            }
+            ImGui::Separator();
             if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInExplorer"))) {
                 jce_host_reveal_path(sd.c_str());
             }
@@ -137,6 +141,10 @@ void draw_asset_directory_tree(float tree_w, float panel_h)
                 navigate_asset_directory(s_assets.project_root, false);
             }
             if (ImGui::BeginPopupContextItem()) {
+                if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.copyPath"))) {
+                    ImGui::SetClipboardText(s_assets.project_root.c_str());
+                }
+                ImGui::Separator();
                 if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInExplorer"))) {
                     jce_host_reveal_path(s_assets.project_root.c_str());
                 }
@@ -242,8 +250,11 @@ void draw_asset_breadcrumb_bar(void)
                 }
                 bool is_last = (i == crumbs.size() - 1);
                 if (is_last) {
-                    ImGui::TextColored(JCE_COLOR_TEXT_PRIMARY,
-                                       "%s", crumbs[i].first.c_str());
+                    /* Use ImGui's theme-default text color (ImGuiCol_Text)
+                     * so the crumb stays legible under both light and dark
+                     * editor themes.  Hard-coding white made the current
+                     * directory invisible on the light theme background. */
+                    ImGui::TextUnformatted(crumbs[i].first.c_str());
                 } else {
                     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
                     ImGui::PushStyleColor(ImGuiCol_ButtonHovered,
