@@ -16,13 +16,33 @@ extern "C" {
 
 #include <jce/resource/jce_pak_loader.h>
 
-/* Supported locales. */
-typedef enum {
-    JCE_LOCALE_EN = 0,
-    JCE_LOCALE_ZH_CN,
-    JCE_LOCALE_KO,
-    JCE_LOCALE_COUNT
-} JceLocale;
+/* Locale handle.
+ *
+ * The set of available locales is discovered at runtime by scanning
+ * the editor PAK for ``i18n/*.json`` files — there is no compile-time
+ * enum any more.  A ``JceLocale`` is just an index into the locale
+ * registry; valid values are ``0 .. jce_editor_i18n_locale_count()-1``.
+ *
+ * Index 0 is always English (``en.json``); it is the universal fallback
+ * and the only locale guaranteed to exist.  Adding a new translation
+ * is purely a content change: drop ``editor/resources/assets/i18n/<code>.json``
+ * into the tree, rebuild, and it appears in the language picker.
+ *
+ * To advertise a human-readable label for the language picker the JSON
+ * file may include a meta entry:
+ *
+ *     "_meta.nativeName": "한국어"
+ *
+ * If absent, the uppercased filename stem is used (``"ko"`` -> ``"KO"``). */
+typedef int JceLocale;
+
+#define JCE_LOCALE_INVALID ((JceLocale)-1)
+#define JCE_LOCALE_EN      ((JceLocale)0)
+
+/* Hard cap on the number of installed locales.  Stack arrays sized by
+   this constant remain ABI-stable for callers that build language
+   pickers without heap allocation. */
+#define JCE_MAX_LOCALES    32
 
 /* Stable identifier code for a locale (matches the JSON filename stem and
    the value persisted to JceEditorConfig.language).  Returns "en" for any

@@ -78,12 +78,16 @@ static bool ci_contains(const char *hay, const char *needle)
 
 static void locale_short_tag(JceLocale loc, char out[4])
 {
-    switch (loc) {
-        case JCE_LOCALE_EN:    strcpy(out, "EN"); break;
-        case JCE_LOCALE_ZH_CN: strcpy(out, "ZH"); break;
-        case JCE_LOCALE_KO:    strcpy(out, "KO"); break;
-        default:               snprintf(out, 4, "L%d", (int)loc); break;
+    const char *code = jce_editor_i18n_locale_code(loc);
+    /* First two ASCII letters of the code, uppercased — "en"→"EN",
+       "zh_cn"→"ZH", "ko"→"KO", "ja"→"JA", "pt_br"→"PT", etc. */
+    int n = 0;
+    for (int i = 0; code[i] && n < 2; i++) {
+        if (code[i] == '_' || code[i] == '-') continue;
+        out[n++] = (char)toupper((unsigned char)code[i]);
     }
+    if (n == 0) snprintf(out, 4, "L%d", (int)loc);
+    else        out[n] = '\0';
 }
 
 /* ── Panel registry (panel id ↔ i18n title key) ────────────────────── */

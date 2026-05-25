@@ -612,14 +612,21 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
     cjk_builder.AddRanges(cjk_extra_ranges);
 
     /* Scan i18n PAK files: for every UTF-8 codepoint encountered, mark
-       it as required. This is fast (~1 ms per file) and exact. */
+       it as required. This is fast (~1 ms per file) and exact.
+       Enumerates every `i18n/*.json` in the PAK so newly-added locales
+       (ja, etc.) automatically contribute their codepoints — no
+       hardcoded path list to keep in sync. */
     if (use_pak) {
-        const char *i18n_paths[] = {
-            "i18n/en.json", "i18n/zh_cn.json", "i18n/ko.json", NULL
-        };
-        for (int i = 0; i18n_paths[i]; i++) {
-            const JcePakAsset *a = jce_pak_find(use_pak, i18n_paths[i]);
-            if (!a) continue;
+        const uint32_t pak_n = jce_pak_count(use_pak);
+        for (uint32_t pi = 0; pi < pak_n; pi++) {
+            const JcePakAsset *a = jce_pak_get(use_pak, pi);
+            if (!a || !a->path) continue;
+            /* Match exactly i18n/<name>.json (no nested dirs). */
+            if (strncmp(a->path, "i18n/", 5) != 0) continue;
+            const char *rest = a->path + 5;
+            if (strchr(rest, '/')) continue;
+            size_t rlen = strlen(rest);
+            if (rlen < 6 || strcmp(rest + rlen - 5, ".json") != 0) continue;
             char *buf = (char *)jce_malloc((size_t)a->original_size + 1);
             if (!buf) continue;
             size_t n = jce_pak_decompress(a, buf, (size_t)a->original_size);

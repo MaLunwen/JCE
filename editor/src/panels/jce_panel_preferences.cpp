@@ -316,6 +316,15 @@ void draw_tab_appearance()
                 bool sel = (i == cur_loc);
                 if (ImGui::Selectable(unique, sel) && i != cur_loc) {
                     jce_editor_i18n_set_locale((JceLocale)i);
+                    /* Persist the new locale into editor-config.json so it
+                       survives a restart. Without this the runtime switch
+                       happens but the config save below writes the OLD
+                       language back to disk. */
+                    const char *code = jce_editor_i18n_locale_code((JceLocale)i);
+                    if (code && *code) {
+                        snprintf(s_cfg.language, sizeof(s_cfg.language),
+                                 "%s", code);
+                    }
                     cfg_dirty = true;
                 }
                 if (sel) ImGui::SetItemDefaultFocus();

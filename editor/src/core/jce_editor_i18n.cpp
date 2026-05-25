@@ -2,13 +2,26 @@
  * jce_editor_i18n.cpp  Internationalisation implementation.
  *
  * Parses the JSON string tables in i18n/*.json from the PAK.
- * Uses the engine JSON facade for parsing.
+ *
+ * The set of locales is *discovered* at startup by walking the PAK
+ * archive for entries that match ``i18n/<code>.json``. Adding a new
+ * translation therefore needs no code change at all — drop the JSON
+ * into editor/resources/assets/i18n/, rebuild (CMake GLOB picks it up
+ * and packs it into the editor PAK), and the locale appears in the
+ * language picker automatically.
+ *
+ * Convention:
+ *   - filename stem == ISO-ish locale code (``en``, ``zh_cn``, ``ko`` …)
+ *   - optional ``"_meta.nativeName"`` key supplies the picker label
+ *     in its own language; missing values fall back to uppercased code.
+ *   - ``en`` is mandatory and is always index 0 (universal fallback).
  */
 
 #include "jce_editor_i18n.h"
 
 #include "jce_editor_alloc.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +39,11 @@ extern "C" {
 #define MAX_EXPAND_LEN 1024
 #define MAX_EXPAND_DEPTH 6
 #define EXPAND_RING_SIZE 8
+#define MAX_CODE_LEN  16
+#define MAX_NATIVE_LEN 64
+#define I18N_DIR_PREFIX "i18n/"
+#define I18N_FILE_SUFFIX ".json"
+#define I18N_META_KEY "_meta.nativeName"
 
 /* ── String entry ──────────────────────────────────────────────────── */
 
@@ -39,20 +57,28 @@ typedef struct {
     int       count;
 } I18nTable;
 
+typedef struct {
+    char       code[MAX_CODE_LEN];        /* e.g. "en", "zh_cn", "ko"   */
+    char       native_name[MAX_NATIVE_LEN];/* picker label, UTF-8       */
+    char       path[MAX_CODE_LEN + sizeof(I18N_DIR_PREFIX) + sizeof(I18N_FILE_SUFFIX)];
+    I18nTable *table;                     /* heap-allocated, lazy-loaded */
+    bool       loaded;
+} LocaleSlot;
+
 /* ── State ─────────────────────────────────────────────────────────── */
 
 static struct {
-    I18nTable             tables[JCE_LOCALE_COUNT];
-    bool                  loaded[JCE_LOCALE_COUNT];
+    LocaleSlot            slots[JCE_MAX_LOCALES];
+    int                   count;
     JceLocale             active;
     bool                  initialized;
-    const JcePakArchive  *pak;   /* kept so we can lazy-load other locales */
+    const JcePakArchive  *pak;
 } s_i18n;
 
 static char s_expand_ring[EXPAND_RING_SIZE][MAX_EXPAND_LEN];
 static int  s_expand_ring_index;
 
-/* ── JSON parser using jce_json ────────────────────────────────────── */
+/* ── JSON parser ──────────────────────────────────────────────────── */
 
 static bool parse_json_table(const char *json, I18nTable *table)
 {
@@ -84,6 +110,37 @@ static bool parse_json_table(const char *json, I18nTable *table)
 
     jce_json_free(root);
     return true;
+}
+
+/* Pull one string field out of the JSON without parsing the entire
+   table — used during the discovery scan to read ``_meta.nativeName``
+   so the language picker can show a label before the table is fully
+   loaded. Returns false if the key is absent. */
+static bool peek_json_string(const char *json, const char *want_key,
+                             char *out, size_t out_cap)
+{
+    if (!out || out_cap == 0) return false;
+    out[0] = '\0';
+    JceJson *root = jce_json_parse(json, 0);
+    if (!root || !jce_json_is_object(root)) {
+        jce_json_free(root);
+        return false;
+    }
+    bool found = false;
+    for (JceJson *item = jce_json_first_child(root); item;
+         item = jce_json_next_sibling(item)) {
+        const char *k = jce_json_member_key(item);
+        if (!k || !jce_json_is_string(item)) continue;
+        if (strcmp(k, want_key) == 0) {
+            const char *v = jce_json_string_value(item, "");
+            strncpy(out, v, out_cap - 1);
+            out[out_cap - 1] = '\0';
+            found = true;
+            break;
+        }
+    }
+    jce_json_free(root);
+    return found;
 }
 
 /* ── Load a single locale file from PAK ────────────────────────────── */
@@ -125,12 +182,44 @@ static const char *lookup_in_table(const I18nTable *table, const char *key)
     return NULL;
 }
 
+static bool locale_in_range(JceLocale locale)
+{
+    return locale >= 0 && locale < s_i18n.count;
+}
+
+static void ensure_locale_loaded(JceLocale locale)
+{
+    if (!locale_in_range(locale)) return;
+    LocaleSlot *slot = &s_i18n.slots[locale];
+    if (slot->loaded) return;
+    if (!s_i18n.pak) return;
+    if (!slot->table) {
+        slot->table = (I18nTable *)ED_MALLOC(sizeof(I18nTable));
+        if (!slot->table) return;
+        memset(slot->table, 0, sizeof(I18nTable));
+    }
+    if (load_locale(s_i18n.pak, slot->path, slot->table))
+        slot->loaded = true;
+}
+
+static const I18nTable *active_table(void)
+{
+    if (!locale_in_range(s_i18n.active)) return NULL;
+    return s_i18n.slots[s_i18n.active].table;
+}
+
+static const I18nTable *en_table(void)
+{
+    if (s_i18n.count == 0) return NULL;
+    return s_i18n.slots[JCE_LOCALE_EN].table;
+}
+
 static const char *lookup_raw_value(const char *key, bool *out_found)
 {
     if (out_found) *out_found = false;
     if (!key) return "";
 
-    const I18nTable *table = &s_i18n.tables[s_i18n.active];
+    const I18nTable *table = active_table();
     const char *value = lookup_in_table(table, key);
     if (value) {
         if (out_found) *out_found = true;
@@ -138,11 +227,10 @@ static const char *lookup_raw_value(const char *key, bool *out_found)
     }
 
     if (s_i18n.active != JCE_LOCALE_EN) {
-        const I18nTable *en = &s_i18n.tables[JCE_LOCALE_EN];
-        value = lookup_in_table(en, key);
-        if (value) {
+        const char *en = lookup_in_table(en_table(), key);
+        if (en) {
             if (out_found) *out_found = true;
-            return value;
+            return en;
         }
     }
 
@@ -211,57 +299,144 @@ static void expand_placeholders(const char *src, char *dst, size_t cap, int dept
     dst[out_pos] = '\0';
 }
 
-/* ── Public API ────────────────────────────────────────────────────── */
+/* ── Locale discovery (PAK scan) ────────────────────────────────────── */
 
-static const char *locale_filename(JceLocale locale)
+/* Returns true when ``path`` matches ``i18n/<stem>.json`` with a stem
+   that is a plausible locale code (lower-case ASCII letters / digits /
+   underscores / hyphens, max MAX_CODE_LEN-1 chars). Extracts the stem
+   into ``out_code``. */
+static bool match_locale_path(const char *path, char out_code[MAX_CODE_LEN])
 {
-    switch (locale) {
-        case JCE_LOCALE_EN:    return "i18n/en.json";
-        case JCE_LOCALE_ZH_CN: return "i18n/zh_cn.json";
-        case JCE_LOCALE_KO:    return "i18n/ko.json";
-        default:               return NULL;
+    if (!path) return false;
+    const size_t prefix_len = sizeof(I18N_DIR_PREFIX) - 1;
+    if (strncmp(path, I18N_DIR_PREFIX, prefix_len) != 0) return false;
+    const char *stem = path + prefix_len;
+    /* Reject nested paths like i18n/sub/foo.json — locales live flat. */
+    if (strchr(stem, '/') || strchr(stem, '\\')) return false;
+    size_t n = strlen(stem);
+    const size_t suffix_len = sizeof(I18N_FILE_SUFFIX) - 1;
+    if (n <= suffix_len) return false;
+    if (strcmp(stem + n - suffix_len, I18N_FILE_SUFFIX) != 0) return false;
+    size_t stem_len = n - suffix_len;
+    if (stem_len == 0 || stem_len >= MAX_CODE_LEN) return false;
+    for (size_t i = 0; i < stem_len; i++) {
+        char c = stem[i];
+        bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+                  || c == '_' || c == '-';
+        if (!ok) return false;
+    }
+    memcpy(out_code, stem, stem_len);
+    out_code[stem_len] = '\0';
+    return true;
+}
+
+static int find_slot_by_code(const char *code)
+{
+    for (int i = 0; i < s_i18n.count; i++) {
+        if (strcmp(s_i18n.slots[i].code, code) == 0) return i;
+    }
+    return -1;
+}
+
+/* Populate ``slot->native_name`` — prefer the JSON's _meta.nativeName,
+   else fall back to the uppercased code (e.g. "JA"). */
+static void resolve_native_name(LocaleSlot *slot)
+{
+    slot->native_name[0] = '\0';
+
+    if (s_i18n.pak) {
+        const JcePakAsset *asset = jce_pak_find(s_i18n.pak, slot->path);
+        if (asset) {
+            char *buf = (char *)ED_MALLOC((size_t)asset->original_size + 1);
+            if (buf) {
+                size_t n = jce_pak_decompress(asset, buf, (size_t)asset->original_size);
+                if (n > 0) {
+                    buf[n] = '\0';
+                    peek_json_string(buf, I18N_META_KEY,
+                                     slot->native_name, sizeof(slot->native_name));
+                }
+                ED_FREE(buf);
+            }
+        }
+    }
+
+    if (slot->native_name[0] == '\0') {
+        /* English is special: most files omit _meta.nativeName, but the
+           historical label is "English". */
+        if (strcmp(slot->code, "en") == 0) {
+            strncpy(slot->native_name, "English", sizeof(slot->native_name) - 1);
+            slot->native_name[sizeof(slot->native_name) - 1] = '\0';
+        } else {
+            size_t i = 0;
+            for (; slot->code[i] && i + 1 < sizeof(slot->native_name); i++)
+                slot->native_name[i] = (char)toupper((unsigned char)slot->code[i]);
+            slot->native_name[i] = '\0';
+        }
     }
 }
 
+static int compare_slots(const void *a, const void *b)
+{
+    const LocaleSlot *sa = (const LocaleSlot *)a;
+    const LocaleSlot *sb = (const LocaleSlot *)b;
+    /* English is pinned to index 0 — handled by the caller before
+       sorting the remainder, but be defensive. */
+    if (strcmp(sa->code, "en") == 0) return -1;
+    if (strcmp(sb->code, "en") == 0) return  1;
+    return strcmp(sa->code, sb->code);
+}
+
+static void discover_locales(const JcePakArchive *pak)
+{
+    s_i18n.count = 0;
+    if (!pak) return;
+
+    uint32_t n = jce_pak_count(pak);
+    for (uint32_t i = 0; i < n && s_i18n.count < JCE_MAX_LOCALES; i++) {
+        const JcePakAsset *asset = jce_pak_get(pak, i);
+        if (!asset || !asset->path) continue;
+
+        char code[MAX_CODE_LEN];
+        if (!match_locale_path(asset->path, code)) continue;
+        if (find_slot_by_code(code) >= 0) continue; /* duplicate guard */
+
+        LocaleSlot *slot = &s_i18n.slots[s_i18n.count++];
+        memset(slot, 0, sizeof(*slot));
+        strncpy(slot->code, code, sizeof(slot->code) - 1);
+        slot->code[sizeof(slot->code) - 1] = '\0';
+        snprintf(slot->path, sizeof(slot->path),
+                 I18N_DIR_PREFIX "%s" I18N_FILE_SUFFIX, code);
+    }
+
+    /* Sort: "en" first, then the rest alphabetically by code. */
+    if (s_i18n.count > 1)
+        qsort(s_i18n.slots, (size_t)s_i18n.count, sizeof(LocaleSlot), compare_slots);
+
+    /* Read native names from each JSON once (cheap; one parse per file). */
+    for (int i = 0; i < s_i18n.count; i++)
+        resolve_native_name(&s_i18n.slots[i]);
+}
+
+/* ── Public API ────────────────────────────────────────────────────── */
+
 const char *jce_editor_i18n_locale_code(JceLocale locale)
 {
-    switch (locale) {
-        case JCE_LOCALE_EN:    return "en";
-        case JCE_LOCALE_ZH_CN: return "zh_cn";
-        case JCE_LOCALE_KO:    return "ko";
-        default:               return "en";
-    }
+    if (!locale_in_range(locale)) return "en";
+    return s_i18n.slots[locale].code;
 }
 
 JceLocale jce_editor_i18n_locale_from_code(const char *code)
 {
     if (!code) return JCE_LOCALE_EN;
-    if (strcmp(code, "zh_cn") == 0) return JCE_LOCALE_ZH_CN;
-    if (strcmp(code, "ko")    == 0) return JCE_LOCALE_KO;
+    int idx = find_slot_by_code(code);
+    if (idx >= 0) return (JceLocale)idx;
     return JCE_LOCALE_EN;
 }
 
 const char *jce_editor_i18n_locale_native_name(JceLocale locale)
 {
-    switch (locale) {
-        case JCE_LOCALE_EN:    return "English";
-        /* "中文(简体)" */
-        case JCE_LOCALE_ZH_CN: return "\xe4\xb8\xad\xe6\x96\x87(\xe7\xae\x80\xe4\xbd\x93)";
-        /* "한국어" */
-        case JCE_LOCALE_KO:    return "\xed\x95\x9c\xea\xb5\xad\xec\x96\xb4";
-        default:               return "English";
-    }
-}
-
-static void ensure_locale_loaded(JceLocale locale)
-{
-    if (locale < 0 || locale >= JCE_LOCALE_COUNT) return;
-    if (s_i18n.loaded[locale]) return;
-    if (!s_i18n.pak) return;
-    const char *path = locale_filename(locale);
-    if (!path) return;
-    if (load_locale(s_i18n.pak, path, &s_i18n.tables[locale]))
-        s_i18n.loaded[locale] = true;
+    if (!locale_in_range(locale)) return "English";
+    return s_i18n.slots[locale].native_name;
 }
 
 bool jce_editor_i18n_init(const JcePakArchive *pak)
@@ -271,28 +446,46 @@ bool jce_editor_i18n_init(const JcePakArchive *pak)
     s_i18n.pak    = pak;
     s_expand_ring_index = 0;
 
-    /* Only load the English fallback up-front. The currently-active
-       non-English locale (if any) is loaded lazily on the first
-       jce_editor_i18n_set_locale() call, which during startup typically
-       happens once when the editor reads the saved language preference.
-       This trims one ~1 ms JSON parse from cold start when the user
-       stays in EN — and avoids loading translations the user never
-       switches to. */
+    discover_locales(pak);
+
+    /* English must exist — synthesise a placeholder slot otherwise so
+       that the rest of the code (and the language picker) can keep
+       running with key-as-value fallback. */
+    if (s_i18n.count == 0 || strcmp(s_i18n.slots[0].code, "en") != 0) {
+        LOG_WARN(LOG_TAG, "no en.json found in editor PAK; falling back to keys");
+        LocaleSlot *slot = &s_i18n.slots[0];
+        memset(slot, 0, sizeof(*slot));
+        strcpy(slot->code, "en");
+        strcpy(slot->native_name, "English");
+        snprintf(slot->path, sizeof(slot->path), "i18n/en.json");
+        if (s_i18n.count == 0) s_i18n.count = 1;
+    }
+
+    /* Eager-load EN; other locales are loaded lazily on first switch
+       (most users stay in EN, so this trims ~1 ms of cold-start work
+       per installed locale). */
     ensure_locale_loaded(JCE_LOCALE_EN);
 
+    LOG_INFO(LOG_TAG, "discovered %d locale(s)", s_i18n.count);
     s_i18n.initialized = true;
     return true;
 }
 
 void jce_editor_i18n_shutdown(void)
 {
+    for (int i = 0; i < s_i18n.count; i++) {
+        if (s_i18n.slots[i].table) {
+            ED_FREE(s_i18n.slots[i].table);
+            s_i18n.slots[i].table = NULL;
+        }
+    }
     memset(&s_i18n, 0, sizeof(s_i18n));
     s_expand_ring_index = 0;
 }
 
 void jce_editor_i18n_set_locale(JceLocale locale)
 {
-    if (locale < 0 || locale >= JCE_LOCALE_COUNT) return;
+    if (!locale_in_range(locale)) return;
     ensure_locale_loaded(locale);
     s_i18n.active = locale;
 }
@@ -334,14 +527,14 @@ const char *jce_editor_i18n_or(const char *key, const char *fallback)
 const char *jce_editor_i18n_lookup_locale(JceLocale locale, const char *key)
 {
     if (!s_i18n.initialized || !key) return NULL;
-    if (locale < 0 || locale >= JCE_LOCALE_COUNT) return NULL;
+    if (!locale_in_range(locale)) return NULL;
     ensure_locale_loaded(locale);
-    return lookup_in_table(&s_i18n.tables[locale], key);
+    return lookup_in_table(s_i18n.slots[locale].table, key);
 }
 
 int jce_editor_i18n_locale_count(void)
 {
-    return (int)JCE_LOCALE_COUNT;
+    return s_i18n.count;
 }
 
 /* Rotating buffer pool for "label##id" strings. 16 slots avoids clobber

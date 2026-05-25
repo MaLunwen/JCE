@@ -1,39 +1,87 @@
+"""i18n_audit.py — Validate i18n key coverage across all locales.
+
+Auto-discovers every ``editor/resources/assets/i18n/*.json`` file so a
+new translation needs no script change: drop the JSON into the folder
+and the audit picks it up.
+
+Rules:
+    * ``en.json`` is the source of truth — every key used in the editor
+      C/C++ sources must exist in EN.
+    * ``zh_cn.json`` must be a 1:1 superset/match of EN (full coverage).
+    * Other locales (ko, ja, de, …) are best-effort: missing keys fall
+      back to EN at runtime; extra keys not present in EN are flagged
+      as typo/orphan candidates (FAIL).
+    * The reserved ``_meta.*`` namespace (e.g. ``_meta.nativeName``) is
+      ignored by the coverage checks — it carries metadata, not strings
+      used by jce_editor_i18n() lookups.
+"""
 import json, re, sys
 from pathlib import Path
-root = Path('editor/src')
+
+ROOT = Path('editor/src')
+I18N_DIR = Path('editor/resources/assets/i18n')
+META_PREFIX = '_meta.'
+
+def is_meta(k: str) -> bool:
+    return k.startswith(META_PREFIX)
+
+# Collect keys actually used by the editor source.
 keys = set()
 pat = re.compile(r'jce_editor_i18n(?:_or|_id)?\(\s*"([^"]+)"')
-for p in root.rglob('*'):
+for p in ROOT.rglob('*'):
     if p.suffix in ('.cpp','.h','.hpp','.c'):
         try: t = p.read_text(encoding='utf-8', errors='ignore')
         except: continue
         for m in pat.findall(t): keys.add(m)
-en = json.load(open('editor/resources/assets/i18n/en.json', encoding='utf-8'))
-zh = json.load(open('editor/resources/assets/i18n/zh_cn.json', encoding='utf-8'))
-ko_path = Path('editor/resources/assets/i18n/ko.json')
-ko = json.load(open(ko_path, encoding='utf-8')) if ko_path.exists() else {}
-print('used:', len(keys), 'en:', len(en), 'zh:', len(zh), 'ko:', len(ko))
-miss_en = sorted(keys - set(en.keys()))
-miss_zh = sorted(keys - set(zh.keys()))
-extra_en = sorted(set(en.keys()) - set(zh.keys()))
-extra_zh = sorted(set(zh.keys()) - set(en.keys()))
+
+# Discover all locale files automatically.
+locales = {p.stem: json.load(open(p, encoding='utf-8'))
+           for p in sorted(I18N_DIR.glob('*.json'))}
+if 'en' not in locales:
+    print('FAIL: en.json missing', file=sys.stderr)
+    sys.exit(1)
+
+en = {k: v for k, v in locales['en'].items() if not is_meta(k)}
+en_keys = set(en.keys())
+
+print('locales:', ', '.join(sorted(locales.keys())))
+print('used:', len(keys), 'en:', len(en))
+
+# EN must cover every used key.
+miss_en = sorted(keys - en_keys)
 print('missing EN:', len(miss_en))
 for k in miss_en: print('  EN-MISS', k)
-print('missing ZH:', len(miss_zh))
-for k in miss_zh: print('  ZH-MISS', k)
-print('en-only (zh missing):', len(extra_en))
-for k in extra_en[:80]: print('  ZH-NEED', k)
-if len(extra_en)>80: print(' ...', len(extra_en)-80, 'more')
-print('zh-only (en missing):', len(extra_zh))
-for k in extra_zh[:80]: print('  EN-NEED', k)
-if len(extra_zh)>80: print(' ...', len(extra_zh)-80, 'more')
 
-# Korean is intentionally partial — KO keys must be a subset of EN
-# (no extras / typos), but missing KO keys fall back to EN at runtime
-# and are reported here for informational purposes only.
-ko_extras = sorted(set(ko.keys()) - set(en.keys()))
-print('ko-extra (typo/orphan, FAIL):', len(ko_extras))
-for k in ko_extras: print('  KO-ORPHAN', k)
-print('ko coverage:',
-      f'{len(set(ko.keys()) & set(en.keys()))}/{len(en)}',
-      f'({100.0*len(set(ko.keys()) & set(en.keys()))/max(1,len(en)):.1f}%)')
+failed = bool(miss_en)
+
+# zh_cn must match EN exactly (full coverage is a release requirement).
+if 'zh_cn' in locales:
+    zh = {k: v for k, v in locales['zh_cn'].items() if not is_meta(k)}
+    zh_keys = set(zh.keys())
+    miss_zh = sorted(keys - zh_keys)
+    extra_en = sorted(en_keys - zh_keys)
+    extra_zh = sorted(zh_keys - en_keys)
+    print('missing ZH:', len(miss_zh))
+    for k in miss_zh: print('  ZH-MISS', k)
+    print('en-only (zh missing):', len(extra_en))
+    for k in extra_en[:80]: print('  ZH-NEED', k)
+    if len(extra_en) > 80: print(' ...', len(extra_en) - 80, 'more')
+    print('zh-only (en missing):', len(extra_zh))
+    for k in extra_zh[:80]: print('  EN-NEED', k)
+    if len(extra_zh) > 80: print(' ...', len(extra_zh) - 80, 'more')
+    if miss_zh or extra_en or extra_zh: failed = True
+
+# Best-effort locales: must be subset of EN (no orphan / typo keys).
+for code, table in sorted(locales.items()):
+    if code in ('en', 'zh_cn'): continue
+    data = {k: v for k, v in table.items() if not is_meta(k)}
+    data_keys = set(data.keys())
+    orphans = sorted(data_keys - en_keys)
+    covered = len(data_keys & en_keys)
+    print(f'{code}-extra (typo/orphan, FAIL):', len(orphans))
+    for k in orphans: print(f'  {code.upper()}-ORPHAN', k)
+    pct = 100.0 * covered / max(1, len(en))
+    print(f'{code} coverage: {covered}/{len(en)} ({pct:.1f}%)')
+    if orphans: failed = True
+
+sys.exit(1 if failed else 0)

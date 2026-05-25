@@ -17,6 +17,8 @@
     "Timeline": "Timeline",
     "Toolbar": "Toolbar",
 
+    "_meta.nativeName": "English",
+
     "about.buildLabel": "Build",
     "about.copyright": "Copyright (c) {app.copyrightYear}",
     "about.credits": "Credits",

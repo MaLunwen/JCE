@@ -17,6 +17,8 @@
     "Timeline": "时间轴",
     "Toolbar": "工具栏",
 
+    "_meta.nativeName": "中文(简体)",
+
     "about.buildLabel": "构建",
     "about.copyright": "版权所有 © {app.copyrightYear}",
     "about.credits": "致谢",

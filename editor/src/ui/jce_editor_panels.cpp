@@ -525,7 +525,7 @@ void jce_editor_settings_dialog(bool *p_open)
        only requires updating the enum + JSON file. */
     snprintf(_lbl, sizeof(_lbl), "%s###settings_lang", jce_editor_i18n("settings.language"));
     const int   n_loc = jce_editor_i18n_locale_count();
-    const char *languages[JCE_LOCALE_COUNT];
+    const char *languages[JCE_MAX_LOCALES];
     for (int i = 0; i < n_loc; i++)
         languages[i] = jce_editor_i18n_locale_native_name((JceLocale)i);
     ImGui::PushItemWidth(200);
@@ -1081,7 +1081,7 @@ void jce_editor_panel_preferences(void)
                 }
                 ImGui::Separator();
                 const int   _n_loc = jce_editor_i18n_locale_count();
-                const char *languages[JCE_LOCALE_COUNT];
+                const char *languages[JCE_MAX_LOCALES];
                 for (int i = 0; i < _n_loc; i++)
                     languages[i] = jce_editor_i18n_locale_native_name((JceLocale)i);
                 snprintf(_lbl, sizeof(_lbl), "%s###language", jce_editor_i18n("preferences.language"));
