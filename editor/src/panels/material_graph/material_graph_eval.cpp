@@ -216,22 +216,16 @@ bool split_output_paths(const char *path, char *out_dir, size_t dir_cap,
                         char *out_base, size_t base_cap)
 {
     if (!path || !path[0]) return false;
-    std::snprintf(out_dir, dir_cap, "%s", path);
-    /* Find rightmost separator. */
-    char *sep = std::strrchr(out_dir, '/');
-    char *sep2 = std::strrchr(out_dir, '\\');
-    if (sep2 && (!sep || sep2 > sep)) sep = sep2;
-
-    const char *file = sep ? sep + 1 : out_dir;
+    const char *file = jce_editor_path_basename_view(path);
     std::snprintf(out_base, base_cap, "%s", file);
     /* strip trailing .matgraph.json (or any double extension). */
-    char *dot = std::strrchr(out_base, '.');
-    if (dot) *dot = '\0';
+    jce_editor_path_strip_extension(out_base);
     char *dot2 = std::strrchr(out_base, '.');
     if (dot2 && std::strcmp(dot2, ".matgraph") == 0) *dot2 = '\0';
 
-    if (sep) *sep = '\0';
-    else     out_dir[0] = '.', out_dir[1] = '\0';
+    std::snprintf(out_dir, dir_cap, "%s", path);
+    jce_editor_path_trim_to_parent(out_dir);
+    if (!out_dir[0]) out_dir[0] = '.', out_dir[1] = '\0';
 
     return out_base[0] != '\0';
 }

@@ -17,6 +17,7 @@
  */
 
 #include "ui/jce_editor_colors.h"
+#include "ui/jce_editor_tip.h"
 #include "core/jce_editor_i18n.h"
 #include "core/jce_editor_toast.h"
 #include "scene/jce_editor_scene_render.h"
@@ -220,7 +221,7 @@ void draw_bars_block(const char *id, float cpu, float gpu, float wait, float fra
 
     ImGui::PushID(id);
     bar(jce_editor_i18n("profiler.bar.frame"), frame, IM_COL32(220, 220, 220, 255));
-    bar(jce_editor_i18n("profiler.bar.cpu"),   cpu,   IM_COL32( 80, 200, 120, 255));
+    bar(jce_editor_i18n("profiler.bar.cpu"),   cpu,   JCE_COL32_STATUS_OK);
     bar(jce_editor_i18n("profiler.bar.gpu"),   gpu,   IM_COL32( 80, 160, 230, 255));
     bar(jce_editor_i18n("profiler.bar.wait"),  wait,  IM_COL32(220, 160,  60, 255));
     ImGui::PopID();
@@ -476,8 +477,8 @@ void draw_content(void)
     {
         float fps_now = (dt_ms > 0.0f) ? 1000.0f / dt_ms : 0.0f;
         ImU32 chip_col;
-        if (fps_now >= 55.0f)      chip_col = IM_COL32( 80, 200, 120, 255);
-        else if (fps_now >= 30.0f) chip_col = IM_COL32(240, 180,  60, 255);
+        if (fps_now >= 55.0f)      chip_col = JCE_COL32_STATUS_OK;
+        else if (fps_now >= 30.0f) chip_col = JCE_COL32_STATUS_WARN;
         else                       chip_col = IM_COL32(230,  90,  90, 255);
 
         ImGui::PushStyleColor(ImGuiCol_Text, chip_col);
@@ -501,8 +502,7 @@ void draw_content(void)
             reset_history();
             jce_toast_success("%s", jce_editor_i18n("profiler.toast.historyReset"));
         }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", jce_editor_i18n("profiler.tooltip.resetHistory"));
+        jce_editor::help_tip(jce_editor_i18n("profiler.tooltip.resetHistory"));
         ImGui::SameLine();
         if (ImGui::Button(copy_lbl)) {
             std::string snap = build_clipboard_snapshot(
@@ -512,8 +512,7 @@ void draw_content(void)
                               jce_editor_i18n("profiler.toast.copied"),
                               snap.size());
         }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", jce_editor_i18n("profiler.tooltip.copyAll"));
+        jce_editor::help_tip(jce_editor_i18n("profiler.tooltip.copyAll"));
         ImGui::Separator();
     }
 
@@ -693,7 +692,7 @@ void draw_content(void)
         }
         if (cs.enabled && cs.total > 0) {
             float frac = (float)cs.culled / (float)cs.total;
-            ImU32 c = (frac >= 0.5f) ? IM_COL32(80, 200, 120, 255)
+            ImU32 c = (frac >= 0.5f) ? JCE_COL32_STATUS_OK
                                      : IM_COL32(160, 200, 240, 255);
             ImGui::PushStyleColor(ImGuiCol_PlotHistogram, c);
             ImGui::ProgressBar(frac, ImVec2(-1, 6.0f), "");
@@ -852,7 +851,7 @@ void draw_content(void)
         }
         if (ocs.enabled && ocs.total > 0) {
             float frac = (float)ocs.occluded / (float)ocs.total;
-            ImU32 c = (frac >= 0.3f) ? IM_COL32(80, 200, 120, 255)
+            ImU32 c = (frac >= 0.3f) ? JCE_COL32_STATUS_OK
                                      : IM_COL32(160, 200, 240, 255);
             ImGui::PushStyleColor(ImGuiCol_PlotHistogram, c);
             ImGui::ProgressBar(frac, ImVec2(-1, 6.0f), "");

@@ -21,6 +21,7 @@
  */
 
 #include "io/jce_editor_file_util.h"
+#include "ui/jce_editor_dnd.h"
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
 #include "ui/jce_theme_palette.h"
@@ -571,10 +572,9 @@ void draw_state_inspector(void)
     ImGui::InputText(jce_editor_i18n_id("animatorSM.field.name", "s"), s.name,      sizeof(s.name));
     jce_draw_path_input_asset(jce_editor_i18n_id("animatorSM.field.clip", "s"), s.clip_path, sizeof(s.clip_path), JCE_ASSET_KIND_DATA);
     if (ImGui::BeginDragDropTarget()) {
-        if (const ImGuiPayload *pl = ImGui::AcceptDragDropPayload("JCE_ASSET_PATH")) {
+        if (const ImGuiPayload *pl = ImGui::AcceptDragDropPayload(JCE_DND_ASSET_PATH)) {
             char rel[1024];
-            jce_editor_path_to_relative(rel, sizeof(rel), (const char *)pl->Data);
-            const char *src = rel[0] ? rel : (const char *)pl->Data;
+            const char *src = jce_editor_path_relative_or(rel, sizeof(rel), (const char *)pl->Data);
             std::strncpy(s.clip_path, src, sizeof(s.clip_path) - 1);
             s.clip_path[sizeof(s.clip_path) - 1] = 0;
         }

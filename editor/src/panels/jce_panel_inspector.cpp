@@ -9,6 +9,7 @@
  */
 
 #include "jce_panel_inspector_common.h"
+#include "ui/jce_editor_modals.h"
 
 static void *comp_get_ptr_and_size(JceScene *scene, JceEntity e,
                                    uint64_t flag, size_t *out_size);
@@ -1160,44 +1161,23 @@ void jce_editor_inspector_delete_dialog(void)
         return;
     }
 
-    const ImGuiViewport *vp = ImGui::GetMainViewport();
-
-    const char *popup_id = "###ConfirmDeleteEntityDlg";
-    if (s_insp.delete_requested && !ImGui::IsPopupOpen(popup_id))
-        ImGui::OpenPopup(popup_id);
-
-    ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(330, 0), ImGuiCond_Appearing);
-    ImGui::SetNextWindowViewport(vp->ID);
-
     bool keep_open = s_insp.delete_requested;
+    jce_modal::Result r = jce_modal::confirm_delete(
+        &keep_open,
+        "###ConfirmDeleteEntityDlg",
+        "inspector.yes",
+        "inspector.no",
+        330.0f,
+        [&]() {
+            if (s_insp.delete_entity_count == 1)
+                ImGui::TextUnformatted(jce_editor_i18n("inspector.confirmDelete"));
+            else
+                ImGui::Text("%s: %d",
+                            jce_editor_i18n("inspector.confirmDeleteMultiple"),
+                            s_insp.delete_entity_count);
+        });
 
-    char title[256];
-    snprintf(title, sizeof(title), "%s%s", jce_editor_i18n("dialog.confirmDelete"), popup_id);
-    if (!ImGui::BeginPopupModal(title,
-                                        &keep_open,
-                      ImGuiWindowFlags_NoCollapse
-                    | ImGuiWindowFlags_NoDocking
-                    | ImGuiWindowFlags_AlwaysAutoResize)) {
-        s_insp.delete_requested = keep_open;
-        return;
-    }
-
-    if (s_insp.delete_entity_count == 1)
-        ImGui::TextUnformatted(jce_editor_i18n("inspector.confirmDelete"));
-    else
-        ImGui::Text("%s: %d",
-                    jce_editor_i18n("inspector.confirmDeleteMultiple"),
-                    s_insp.delete_entity_count);
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
-
-    float btn_w = 140.0f;
-    ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.3f, 0.3f, 1.0f));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.7f, 0.15f, 0.15f, 1.0f));
-    if (ImGui::Button(jce_editor_i18n("inspector.yes"), ImVec2(btn_w, 0))) {
+    if (r == jce_modal::CONFIRM) {
         uint32_t ids[JCE_MAX_SELECTED];
         int n = s_insp.delete_entity_count;
         if (n > JCE_MAX_SELECTED) n = JCE_MAX_SELECTED;
@@ -1213,26 +1193,8 @@ void jce_editor_inspector_delete_dialog(void)
             jce_state_delete_entity(ids[i]);
         }
         if (n > 1) jce_state_end_batch_edit();
-
-        keep_open = false;
-        ImGui::PopStyleColor(3);
-        ImGui::CloseCurrentPopup();
-        ImGui::EndPopup();
-        s_insp.delete_requested = keep_open;
-        if (!keep_open) s_insp.delete_entity_count = 0;
-        return;
-    }
-    ImGui::PopStyleColor(3);
-
-    ImGui::SameLine();
-    if (ImGui::Button(jce_editor_i18n("inspector.no"), ImVec2(btn_w, 0))
-        || ImGui::IsKeyPressed(ImGuiKey_Escape))
-    {
-        ImGui::CloseCurrentPopup();
-        keep_open = false;
     }
 
-    ImGui::EndPopup();
     s_insp.delete_requested = keep_open;
     if (!keep_open) s_insp.delete_entity_count = 0;
 }

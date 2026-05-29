@@ -13,6 +13,7 @@
 #include "os/core/jce_memory.h"
 
 #include <string.h>
+#include <jce/os/core/jce_str.h>
 
 #define LOG_TAG "prefab"
 
@@ -77,8 +78,7 @@ static JceEntity finalize_instance(JceScene       *scene,
         tmp.prefab_instance = true;
         /* Truncating copy is fine — header-defined bound. */
         size_t cap = sizeof(tmp.prefab_path);
-        strncpy(tmp.prefab_path, prefab_path, cap - 1);
-        tmp.prefab_path[cap - 1] = '\0';
+        jce_strlcpy(tmp.prefab_path, prefab_path, cap);
         jce_scene_set_editor_meta(scene, e, &tmp);
     }
 

@@ -96,6 +96,18 @@
       }
     },
     {
+      "name": "windows-x86-release",
+      "displayName": "Desktop Windows x86 (32-bit) Release",
+      "description": "Desktop cross-compile build (Windows x86 / i686)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/desktop/windows-x86",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/windows-x86-conan/build/Release/generators/conan_toolchain.cmake"
+      }
+    },
+    {
       "name": "android-arm64-release",
       "displayName": "Mobile Android arm64 Release",
       "description": "Android arm64 build with Conan toolchain",
@@ -119,8 +131,8 @@
     },
     {
       "name": "linux-x64-release",
-      "displayName": "Desktop Linux x64 Release (zig)",
-      "description": "Linux x86_64 cross-compile via zig cc",
+      "displayName": "Desktop Linux x64 Release",
+      "description": "Linux x86_64 native build",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/desktop/linux-x64",
       "cacheVariables": {
@@ -131,8 +143,8 @@
     },
     {
       "name": "linux-arm64-release",
-      "displayName": "Desktop Linux ARM64 Release (zig)",
-      "description": "Linux aarch64 cross-compile via zig cc",
+      "displayName": "Desktop Linux ARM64 Release",
+      "description": "Linux aarch64 native build",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/desktop/linux-arm64",
       "cacheVariables": {

@@ -25,6 +25,7 @@
 #include "jce_project_settings.h"
 #include <jce/ui/jce_imgui_renderer.h>
 #include "jce_build_manager.h"
+#include "jce_cook_manager.h"
 #include "jce_run_manager.h"
 #include "panels/jce_panel_assets_thumb.h"
 #include "scene/jce_editor_game_render.h"
@@ -297,6 +298,7 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
     jce_editor_panels_init();
     jce_run_manager_init();
     jce_build_manager_init();
+    jce_cook_manager_init();
     jce_reflect_register_builtin();
     jce_hotkeys_init();
     jce_workspace_init();
@@ -378,6 +380,7 @@ void jce_editor_shutdown(void)
     }
 
     jce_gizmo_shutdown();
+    jce_cook_manager_shutdown();
     jce_build_manager_shutdown();
     jce_run_manager_shutdown();
     jce_editor_panels_shutdown();
@@ -541,13 +544,7 @@ void jce_editor_update(JceWindow *window)
         const bool  dirty = jce_state_is_scene_modified();
 
         const char *base = (spath && spath[0]) ? spath : NULL;
-        const char *name = base;
-        if (base) {
-            const char *slash = strrchr(base, '/');
-            const char *bslash = strrchr(base, '\\');
-            if (bslash && (!slash || bslash > slash)) slash = bslash;
-            if (slash && slash[1]) name = slash + 1;
-        }
+        const char *name = base ? jce_editor_path_basename_view(base) : NULL;
 
         if (name) {
             snprintf(title, sizeof(title), "JCE Editor %s %s%s",

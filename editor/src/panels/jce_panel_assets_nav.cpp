@@ -3,6 +3,8 @@
  */
 
 #include <jce/os/core/jce_path.h>
+#include <jce/os/platform/jce_host_dialog.h>
+#include <jce/os/platform/jce_host_paths.h>
 
 #include "core/jce_editor_config.h"
 #include "jce_panel_assets_internal.h"
@@ -111,12 +113,219 @@ static void draw_dir_tree(const std::string &dir, int depth)
     }
 }
 
+/* ── Path helpers shared by tree / breadcrumb / locations ─────────── */
+
+/* Case-aware "is `child` the same path as `parent`, or nested inside
+ * it?".  Both sides are normalised first so trailing-separator and
+ * drive-case differences don't trip us up.  On Windows comparison is
+ * case-insensitive (NTFS / FAT default semantics); on POSIX it's
+ * case-sensitive. */
+static bool path_starts_with(const std::string &parent,
+                             const std::string &child)
+{
+    char p[1024], c[1024];
+    if (!jce_path_normalize(p, sizeof(p), parent.c_str())) return false;
+    if (!jce_path_normalize(c, sizeof(c), child.c_str()))  return false;
+
+    auto eq_ch = [](char a, char b) -> bool {
+#ifdef _WIN32
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+#endif
+        return a == b;
+    };
+
+    size_t plen = strlen(p);
+    size_t clen = strlen(c);
+    if (clen < plen) return false;
+    for (size_t i = 0; i < plen; i++)
+        if (!eq_ch(p[i], c[i])) return false;
+    if (clen == plen) return true;
+    char sep = c[plen];
+    return sep == '/' || sep == '\\';
+}
+
+/* Deferred folder-pick result.  SDL3 dialog callbacks fire from the
+ * platform event thread; navigate_asset_directory() ultimately mutates
+ * vectors the panel is still iterating, so we stash the picked path
+ * here and apply it on the next panel frame. */
+static std::string s_pending_browse_path;
+
+static void on_browse_folder_picked(void *ud, JceDialogResult result,
+                                    const char *path)
+{
+    (void)ud;
+    if (result == JCE_DIALOG_OK && path && path[0])
+        s_pending_browse_path = path;
+}
+
+static void apply_pending_browse(void)
+{
+    if (s_pending_browse_path.empty()) return;
+    std::string pick;
+    pick.swap(s_pending_browse_path);
+    navigate_asset_directory(pick, true);
+}
+
 /* ── A. Directory tree panel (left side) ─────────────────────────── */
+
+/* ── A. Directory tree panel (left side) ─────────────────────────── */
+
+/* Render a single Locations row that navigates to `path` when clicked
+ * and exposes the usual right-click menu (copy / reveal / open). */
+static void draw_location_row(const char *icon_label,
+                              const std::string &display_name,
+                              const std::string &path,
+                              const char *unique_id_suffix,
+                              bool removable)
+{
+    char norm_path[1024], norm_cur[1024];
+    jce_path_normalize(norm_path, sizeof(norm_path), path.c_str());
+    jce_path_normalize(norm_cur, sizeof(norm_cur),
+                       s_assets.current_path.c_str());
+    bool is_current = (strcmp(norm_path, norm_cur) == 0);
+
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_Leaf
+                             | ImGuiTreeNodeFlags_NoTreePushOnOpen
+                             | ImGuiTreeNodeFlags_SpanAvailWidth;
+    if (is_current) flags |= ImGuiTreeNodeFlags_Selected;
+
+    char label[320];
+    if (icon_label && icon_label[0])
+        snprintf(label, sizeof(label), "%s %s###loc_%s",
+                 icon_label, display_name.c_str(), unique_id_suffix);
+    else
+        snprintf(label, sizeof(label), "%s###loc_%s",
+                 display_name.c_str(), unique_id_suffix);
+
+    ImGui::TreeNodeEx(label, flags);
+    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
+        navigate_asset_directory(path, true);
+    if (ImGui::BeginPopupContextItem()) {
+        if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.copyPath")))
+            ImGui::SetClipboardText(path.c_str());
+        ImGui::Separator();
+        if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInExplorer")))
+            jce_host_reveal_path(path.c_str());
+        if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInTerminal")))
+            jce_host_open_terminal(path.c_str());
+        if (removable) {
+            ImGui::Separator();
+            if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.removeFavorite"))) {
+                JceEditorConfig ec;
+                if (jce_editor_config_load(&ec)) {
+                    if (jce_editor_config_remove_favorite(&ec, path.c_str()))
+                        jce_editor_config_save(&ec);
+                }
+            }
+        }
+        ImGui::EndPopup();
+    }
+}
+
+/* Locations sidebar — drives, user folders, project root, favourites.
+ * Drawn above the per-project directory tree so the user always has a
+ * one-click way out of the current sandbox. */
+static void draw_asset_locations_section(void)
+{
+    /* Locations root collapsing header */
+    ImGuiTreeNodeFlags hdr_flags = ImGuiTreeNodeFlags_DefaultOpen
+                                 | ImGuiTreeNodeFlags_SpanAvailWidth
+                                 | ImGuiTreeNodeFlags_Framed;
+    if (!ImGui::TreeNodeEx(jce_editor_i18n("assetBrowser.locations"), hdr_flags))
+        return;
+
+    /* Project root — always available; uses the leaf root icon. */
+    draw_location_row("[P]",
+                      jce_editor_i18n("assetBrowser.goHome"),
+                      s_assets.project_root, "project", false);
+
+    /* Well-known user folders. */
+    static const struct {
+        JceUserFolder kind;
+        const char *icon;
+        const char *i18n_key;
+        const char *id;
+    } kFolders[] = {
+        { JCE_USER_FOLDER_HOME,      "[~]", "assetBrowser.home",      "home"  },
+        { JCE_USER_FOLDER_DESKTOP,   "[D]", "assetBrowser.desktop",   "desk"  },
+        { JCE_USER_FOLDER_DOCUMENTS, "[F]", "assetBrowser.documents", "docs"  },
+        { JCE_USER_FOLDER_DOWNLOADS, "[v]", "assetBrowser.downloads", "dl"    },
+    };
+    for (const auto &f : kFolders) {
+        char p[1024];
+        if (!jce_host_get_user_folder(f.kind, p, sizeof(p))) continue;
+        if (!p[0]) continue;
+        draw_location_row(f.icon, jce_editor_i18n(f.i18n_key),
+                          std::string(p), f.id, false);
+    }
+
+    /* Drive roots (Windows). On POSIX this is a single "/" entry —
+       still useful as an escape hatch from sandboxed paths. */
+    char drives[JCE_HOST_PATHS_MAX_DRIVES][8];
+    int ndrives = jce_host_list_drives(drives, JCE_HOST_PATHS_MAX_DRIVES);
+    if (ndrives > 0) {
+        if (ImGui::TreeNodeEx(jce_editor_i18n("assetBrowser.drives"),
+                              ImGuiTreeNodeFlags_DefaultOpen
+                            | ImGuiTreeNodeFlags_SpanAvailWidth)) {
+            for (int i = 0; i < ndrives; i++) {
+                char id[16];
+                snprintf(id, sizeof(id), "drv%d", i);
+                draw_location_row("[#]", drives[i], drives[i], id, false);
+            }
+            ImGui::TreePop();
+        }
+    }
+
+    /* Favourites + add button. */
+    {
+        ImGui::Separator();
+        ImGui::TextDisabled("%s", jce_editor_i18n("assetBrowser.favorites"));
+        ImGui::SameLine();
+        float w = ImGui::GetContentRegionAvail().x;
+        if (w > 24.0f) ImGui::SameLine(ImGui::GetCursorPosX() + w - 24.0f);
+        if (ImGui::SmallButton("+##fav_add")) {
+            JceEditorConfig ec;
+            if (jce_editor_config_load(&ec)) {
+                if (jce_editor_config_add_favorite(&ec,
+                        s_assets.current_path.c_str())) {
+                    jce_editor_config_save(&ec);
+                }
+            }
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s",
+                jce_editor_i18n("assetBrowser.addFavorite"));
+
+        JceEditorConfig ec;
+        if (jce_editor_config_load(&ec)) {
+            for (int i = 0; i < ec.asset_favorite_count; i++) {
+                const char *fp = ec.asset_favorites[i];
+                if (!fp[0]) continue;
+                char base[256];
+                jce_path_basename(base, sizeof(base), fp);
+                std::string name = base[0] ? base : fp;
+                char id[16];
+                snprintf(id, sizeof(id), "fav%d", i);
+                draw_location_row("[*]", name, std::string(fp), id, true);
+            }
+            if (ec.asset_favorite_count == 0) {
+                ImGui::TextDisabled("    (none)");
+            }
+        }
+    }
+
+    ImGui::TreePop();
+}
 
 void draw_asset_directory_tree(float tree_w, float panel_h)
 {
     ImGui::BeginChild("AssetTree", ImVec2(tree_w, panel_h), ImGuiChildFlags_Borders);
     {
+        /* Locations sidebar (drives / Home / Project / Favourites). */
+        draw_asset_locations_section();
+        ImGui::Separator();
+
         char root_name_buf[256];
         jce_path_basename(root_name_buf, sizeof(root_name_buf), s_assets.project_root.c_str());
         std::string root_name = root_name_buf;
@@ -183,24 +392,25 @@ static std::string strip_trailing_sep(const std::string &s)
 
 void draw_asset_breadcrumb_bar(void)
 {
+    /* Apply any folder picked via Browse… on the previous frame. */
+    apply_pending_browse();
+
     {
         std::string cur_str = strip_trailing_sep(s_assets.current_path);
         std::string root_str = strip_trailing_sep(s_assets.project_root);
 
-        /* Up button: disabled at the project root and at any path that
-           cannot ascend further (filesystem root). Computed on the
-           absolute form so trailing-relative paths still resolve. */
+        /* Up button: allowed all the way to the filesystem root.  We
+           used to gate this on "current == project_root" which trapped
+           users inside the project sandbox; now the only stop is when
+           the path can't ascend any further. */
         char cur_abs[1024], root_abs[1024], parent_abs[1024];
         jce_path_normalize(cur_abs, sizeof(cur_abs), cur_str.c_str());
         jce_path_normalize(root_abs, sizeof(root_abs), root_str.c_str());
         jce_path_parent(parent_abs, sizeof(parent_abs), cur_abs);
-        
-        bool at_root = (strcmp(cur_abs, root_abs) == 0);
-        
+
         char parent_norm[1024];
         jce_path_normalize(parent_norm, sizeof(parent_norm), parent_abs);
-        bool can_go_up = !at_root
-                      && parent_abs[0] != '\0'
+        bool can_go_up = parent_abs[0] != '\0'
                       && strcmp(parent_norm, cur_abs) != 0;
 
         ImGui::BeginDisabled(!can_go_up);
@@ -210,36 +420,104 @@ void draw_asset_breadcrumb_bar(void)
         ImGui::EndDisabled();
         ImGui::SameLine();
 
-        {
-            char root_name_buf[256];
-            jce_path_basename(root_name_buf, sizeof(root_name_buf), s_assets.project_root.c_str());
-            std::string root_name = root_name_buf;
-            if (root_name.empty() || root_name == "." || root_name == "/" || root_name == "\\")
-                root_name = "Project";
+        /* Home — jump back to the project root. */
+        if (ImGui::SmallButton(jce_editor_i18n("assetBrowser.goHome"))) {
+            navigate_asset_directory(s_assets.project_root, true);
+        }
+        ImGui::SameLine();
 
+        /* Browse… — open the OS folder picker.  Result lands in
+           s_pending_browse_path and is consumed next frame. */
+        if (ImGui::SmallButton(jce_editor_i18n("assetBrowser.browse"))) {
+            jce_host_dialog_pick_folder(
+                jce_editor_i18n("assetBrowser.pickFolderTitle"),
+                s_assets.current_path.c_str(),
+                on_browse_folder_picked, NULL);
+        }
+        ImGui::SameLine();
+
+        {
             std::vector<std::pair<std::string, std::string>> crumbs;
-            crumbs.push_back({root_name, s_assets.project_root});
 
             char norm_cur[1024], norm_root[1024];
             jce_path_normalize(norm_cur, sizeof(norm_cur), cur_str.c_str());
             jce_path_normalize(norm_root, sizeof(norm_root), root_str.c_str());
-            
-            if (strcmp(norm_cur, norm_root) != 0) {
-                char rel_buf[1024];
-                if (jce_path_relative(rel_buf, sizeof(rel_buf), cur_str.c_str(), root_str.c_str())) {
-                    if (rel_buf[0] != '\0' && strcmp(rel_buf, ".") != 0) {
-                        /* Split rel_buf by path separators and build crumbs */
-                        std::string accum = s_assets.project_root;
-                        char *tok = strtok(rel_buf, "/\\");
-                        while (tok) {
-                            char joined[1024];
-                            jce_path_join(joined, sizeof(joined), accum.c_str(), tok);
-                            accum = joined;
-                            crumbs.push_back({tok, accum});
-                            tok = strtok(NULL, "/\\");
+
+            bool inside_project = path_starts_with(root_str, cur_str);
+
+            if (inside_project) {
+                /* Project-relative breadcrumb (legacy behaviour). */
+                char root_name_buf[256];
+                jce_path_basename(root_name_buf, sizeof(root_name_buf),
+                                  s_assets.project_root.c_str());
+                std::string root_name = root_name_buf;
+                if (root_name.empty() || root_name == "."
+                 || root_name == "/" || root_name == "\\")
+                    root_name = "Project";
+                crumbs.push_back({root_name, s_assets.project_root});
+
+                if (strcmp(norm_cur, norm_root) != 0) {
+                    char rel_buf[1024];
+                    if (jce_path_relative(rel_buf, sizeof(rel_buf),
+                                          cur_str.c_str(), root_str.c_str())) {
+                        if (rel_buf[0] != '\0' && strcmp(rel_buf, ".") != 0) {
+                            std::string accum = s_assets.project_root;
+                            char *tok = strtok(rel_buf, "/\\");
+                            while (tok) {
+                                char joined[1024];
+                                jce_path_join(joined, sizeof(joined),
+                                              accum.c_str(), tok);
+                                accum = joined;
+                                crumbs.push_back({tok, accum});
+                                tok = strtok(NULL, "/\\");
+                            }
                         }
                     }
                 }
+            } else {
+                /* External path — build crumbs from the absolute path
+                   itself.  Each segment is independently navigable so
+                   the user can ascend / descend at will. */
+                std::string acc;
+                const char *p = norm_cur;
+#ifdef _WIN32
+                /* "C:/foo/bar" → first crumb "C:/" anchored at drive. */
+                if (p[0] && p[1] == ':') {
+                    char drv[8];
+                    snprintf(drv, sizeof(drv), "%c:/", p[0]);
+                    acc = drv;
+                    crumbs.push_back({drv, acc});
+                    p += 2;
+                    if (*p == '/' || *p == '\\') p++;
+                } else if (*p == '/' || *p == '\\') {
+                    acc = "/";
+                    crumbs.push_back({"/", acc});
+                    while (*p == '/' || *p == '\\') p++;
+                }
+#else
+                if (*p == '/') {
+                    acc = "/";
+                    crumbs.push_back({"/", acc});
+                    while (*p == '/') p++;
+                }
+#endif
+                /* Tokenise the rest. */
+                std::string rest(p);
+                char *buf = rest.empty() ? NULL : &rest[0];
+                char *tok = buf ? strtok(buf, "/\\") : NULL;
+                while (tok) {
+                    char joined[1024];
+                    if (acc.empty())
+                        snprintf(joined, sizeof(joined), "%s", tok);
+                    else
+                        jce_path_join(joined, sizeof(joined),
+                                      acc.c_str(), tok);
+                    acc = joined;
+                    crumbs.push_back({tok, acc});
+                    tok = strtok(NULL, "/\\");
+                }
+                if (crumbs.empty())
+                    crumbs.push_back({cur_str, cur_str});
             }
 
             for (size_t i = 0; i < crumbs.size(); i++) {

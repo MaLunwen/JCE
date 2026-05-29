@@ -1,9 +1,9 @@
 @echo off
 :: ================================================================
-:: build-desktop.bat -- Build standalone caged_kingdom.exe for Windows x64
-:: Usage: build-desktop.bat [--clean] [--dist]
-:: Output: build\desktop\windows-x64\release\caged_kingdom.exe
-::         build\desktop\windows-x64\dist\caged_kingdom.exe  (with --dist)
+:: build-desktop.bat -- Build a standalone .exe for Windows x64
+:: Usage: build-desktop.bat [--clean] [--dist] [--target <CMakeTarget>] [--exe <name.exe>]
+:: Defaults: --target CagedKingdom --exe caged_kingdom.exe
+:: Output: build\desktop\windows-x64\<release|dist>\<exe>
 :: ================================================================
 setlocal enabledelayedexpansion
 
@@ -14,6 +14,8 @@ set "CONAN_DIR=build\desktop\windows-x64-conan"
 set "BUILD_DIR=build\desktop\windows-x64"
 set "TOOLCHAIN=%CONAN_DIR%\build\Release\generators\conan_toolchain.cmake"
 set "VARIANT=release"
+set "TARGET=CagedKingdom"
+set "EXE_NAME=caged_kingdom.exe"
 
 :: -- Parse arguments --
 :parse_args
@@ -29,6 +31,22 @@ if /i "%~1"=="--dist" (
     set "VARIANT=dist"
     shift
     goto :parse_args
+)
+if /i "%~1"=="--target" (
+    set "TARGET=%~2"
+    shift
+    shift
+    goto :parse_args
+)
+if /i "%~1"=="--exe" (
+    set "EXE_NAME=%~2"
+    shift
+    shift
+    goto :parse_args
+)
+if not "%~1"=="" (
+    echo ERROR: unknown argument: %~1
+    goto :error
 )
 
 :: -- Step 1: Conan install (skip if toolchain exists) --
@@ -51,12 +69,12 @@ cmake -S . -B %BUILD_DIR% -G Ninja -DCMAKE_TOOLCHAIN_FILE=%TOOLCHAIN% -DCMAKE_BU
 if errorlevel 1 goto :error
 
 :: -- Step 3: Build (Ninja handles incremental) --
-echo === Step 3: Build ===
-cmake --build %BUILD_DIR%
+echo === Step 3: Build target %TARGET% ===
+cmake --build %BUILD_DIR% --target %TARGET%
 if errorlevel 1 goto :error
 
-if not exist "%BUILD_DIR%\%VARIANT%\caged_kingdom.exe" (
-    echo ERROR: caged_kingdom.exe not found after build
+if not exist "%BUILD_DIR%\%VARIANT%\%EXE_NAME%" (
+    echo ERROR: %EXE_NAME% not found at %BUILD_DIR%\%VARIANT%\%EXE_NAME%
     goto :error
 )
 
@@ -68,14 +86,14 @@ if exist "%CPPCHECK_XML%" (
 )
 
 echo.
-echo [SUCCESS] Desktop build complete (%VARIANT%): %BUILD_DIR%\%VARIANT%\caged_kingdom.exe
-popd
+echo [SUCCESS] Desktop build complete (%VARIANT%): %BUILD_DIR%\%VARIANT%\%EXE_NAME%
+popd 2>nul
 call "%~dp0lib\jce_finish.bat" success
 exit /b 0
 
 :error
 echo.
 echo [FAILED] Build failed.
-popd
+popd 2>nul
 call "%~dp0lib\jce_finish.bat" fail
 exit /b 1

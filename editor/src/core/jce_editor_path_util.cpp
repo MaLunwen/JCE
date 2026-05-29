@@ -63,4 +63,46 @@ void jce_editor_path_to_relative(char *out, size_t out_size,
     jce_editor_path_to_relative_to(out, out_size, abs_or_rel_path, root);
 }
 
+const char *jce_editor_path_relative_or(char *buf, size_t buf_size,
+                                        const char *src)
+{
+    if (!buf || buf_size == 0) return src;
+    buf[0] = '\0';
+    if (!src) return "";
+    jce_editor_path_to_relative(buf, buf_size, src);
+    return buf[0] ? buf : src;
+}
+
+const char *jce_editor_path_basename_view(const char *path)
+{
+    if (!path || !path[0]) return "";
+    const char *slash  = strrchr(path, '/');
+    const char *bslash = strrchr(path, '\\');
+    const char *sep    = (slash > bslash) ? slash : bslash;
+    return sep ? sep + 1 : path;
+}
+
+void jce_editor_path_trim_to_parent(char *path)
+{
+    if (!path || !path[0]) return;
+    char *slash  = strrchr(path, '/');
+    char *bslash = strrchr(path, '\\');
+    char *sep    = (slash > bslash) ? slash : bslash;
+    if (sep) *sep = '\0';
+    else     path[0] = '\0';
+}
+
+void jce_editor_path_strip_extension(char *path)
+{
+    if (!path || !path[0]) return;
+    char *dot    = strrchr(path, '.');
+    if (!dot) return;
+    char *slash  = strrchr(path, '/');
+    char *bslash = strrchr(path, '\\');
+    char *sep    = (slash > bslash) ? slash : bslash;
+    /* Only strip when the dot belongs to the basename (not "../foo"). */
+    if (sep && dot < sep) return;
+    *dot = '\0';
+}
+
 } /* extern "C" */

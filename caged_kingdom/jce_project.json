@@ -1,0 +1,13 @@
+{
+  "schema":         2,
+  "name":           "caged_kingdom",
+  "version":        "0.1.0",
+  "target":         "CagedKingdom",
+  "exe":            "caged_kingdom.exe",
+  "platform":       "win",
+  "assets":         ["resources/assets"],
+  "source_assets":  "resources/assets",
+  "cooked_assets":  "resources/_cooked",
+  "startup_scene":  "scenes/main.scene.json",
+  "variants":       ["debug", "release", "dist"]
+}

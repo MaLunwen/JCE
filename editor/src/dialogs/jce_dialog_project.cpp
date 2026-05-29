@@ -6,12 +6,17 @@
  * jce_dialog_scene.cpp.
  */
 
+#include <jce/application/jce_project.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_path.h>
+#include <jce/os/core/jce_str.h>
 #include <jce/os/core/jce_thread.h>
+#include <jce/renderer/jce_render_pipeline.h>
 
 #include "jce_editor_dialogs_internal.h"
 #include "core/jce_assetdb.h"
+#include "ui/jce_editor_tip.h"
+#include "core/jce_editor_project.h"
 
 #include <vector>
 
@@ -25,22 +30,54 @@ void set_current_project_root(const char *path)
     if (!path || path[0] == '\0') {
         s_current_project_root[0] = '\0';
         jce_assetdb_set_root("");
+        jce_editor_project_set_root(nullptr);
         return;
     }
-    snprintf(s_current_project_root, sizeof(s_current_project_root), "%s", path);
+
+    /* Normalize: callers occasionally hand us a path to jce_project.json
+     * itself (Welcome dialog "Open File…" pick, drag-drop, recents that
+     * captured the manifest path).  Treat that as the containing dir.
+     * Also unify backslashes and drop a trailing separator so all
+     * downstream string-concat code (build profiles, asset DB, etc.)
+     * sees a canonical form. */
+    char buf[512];
+    snprintf(buf, sizeof(buf), "%s", path);
+    for (char *q = buf; *q; ++q)
+        if (*q == '\\') *q = '/';
+    size_t L = strlen(buf);
+    const char *suffix = "/jce_project.json";
+    size_t slen = strlen(suffix);
+    if (L >= slen) {
+        const char *tail = buf + (L - slen);
+        if (jce_strcasecmp(tail, suffix) == 0) { buf[L - slen] = '\0'; L -= slen; }
+    } else if (L == slen - 1 &&
+               jce_strcasecmp(buf, suffix + 1) == 0) {
+        /* Pure "jce_project.json" with no parent — fall back to "." */
+        buf[0] = '.'; buf[1] = '\0'; L = 1;
+    }
+    while (L > 1 && (buf[L - 1] == '/' || buf[L - 1] == '\\'))
+        buf[--L] = '\0';
+
+    snprintf(s_current_project_root, sizeof(s_current_project_root), "%s", buf);
     jce_assetdb_set_root(s_current_project_root);
+    jce_editor_project_set_root(s_current_project_root);
 }
 
 bool is_valid_project_dir(const char *path)
 {
     if (!path || path[0] == '\0') return false;
-    
+
     if (!jce_fs_host_exists_dir(path))
         return false;
-        
-    char project_file[1024];
-    jce_path_join(project_file, sizeof(project_file), path, "project.jce");
-    return jce_fs_host_exists_file(project_file);
+
+    /* New canonical: jce_project.json.  Legacy: project.jce. */
+    char project_json[1024];
+    jce_path_join(project_json, sizeof(project_json), path, "jce_project.json");
+    if (jce_fs_host_exists_file(project_json)) return true;
+
+    char legacy[1024];
+    jce_path_join(legacy, sizeof(legacy), path, "project.jce");
+    return jce_fs_host_exists_file(legacy);
 }
 
 static bool resolve_project_root_path(const char *path, std::string *out_project_root)
@@ -59,10 +96,16 @@ static bool resolve_project_root_path(const char *path, std::string *out_project
     }
 
     while (current[0] != '\0') {
-        char project_file[1024];
-        jce_path_join(project_file, sizeof(project_file), current, "project.jce");
-        
-        if (jce_fs_host_exists_file(project_file)) {
+        char project_json[1024];
+        jce_path_join(project_json, sizeof(project_json), current, "jce_project.json");
+        if (jce_fs_host_exists_file(project_json)) {
+            *out_project_root = current;
+            return true;
+        }
+
+        char legacy[1024];
+        jce_path_join(legacy, sizeof(legacy), current, "project.jce");
+        if (jce_fs_host_exists_file(legacy)) {
             *out_project_root = current;
             return true;
         }
@@ -494,60 +537,73 @@ void jce_editor_dialog_new_project(bool *p_open)
                 snprintf(s_new_project.error_msg, sizeof(s_new_project.error_msg), "%s",
                          jce_editor_i18n("newProject.errorExists"));
             } else {
-                char sub_path[1024];
-                jce_fs_host_create_directory(project_dir);
-                
-                jce_path_join(sub_path, sizeof(sub_path), project_dir, "assets");
-                jce_fs_host_create_directory(sub_path);
-                jce_path_join(sub_path, sizeof(sub_path), project_dir, "assets/scenes");
-                jce_fs_host_create_directory(sub_path);
-                jce_path_join(sub_path, sizeof(sub_path), project_dir, "assets/textures");
-                jce_fs_host_create_directory(sub_path);
-                jce_path_join(sub_path, sizeof(sub_path), project_dir, "assets/models");
-                jce_fs_host_create_directory(sub_path);
-                jce_path_join(sub_path, sizeof(sub_path), project_dir, "assets/audio");
-                jce_fs_host_create_directory(sub_path);
-                jce_path_join(sub_path, sizeof(sub_path), project_dir, "assets/scripts");
-                jce_fs_host_create_directory(sub_path);
-                jce_path_join(sub_path, sizeof(sub_path), project_dir, "build");
-                jce_fs_host_create_directory(sub_path);
+                /* Use the engine's template generator: lays down
+                 * jce_project.json + CMakeLists.txt + src/main.c +
+                 * assets/.gitkeep so the project is buildable out of
+                 * the box.  (Engine API — works the same in headless
+                 * tooling later.) */
+                JceProjectTemplate tpl = (s_new_project.project_type == 1)
+                    ? JCE_PROJECT_TEMPLATE_BASIC_2D
+                    : JCE_PROJECT_TEMPLATE_BASIC_3D;
+                char tpl_err[256] = {0};
+                if (!jce_project_create_from_template(project_dir,
+                                                     s_new_project.project_name,
+                                                     tpl,
+                                                     tpl_err, sizeof tpl_err)) {
+                    snprintf(s_new_project.error_msg,
+                             sizeof(s_new_project.error_msg),
+                             "%s", tpl_err[0] ? tpl_err
+                                  : jce_editor_i18n("newProject.errorExists"));
+                } else {
+                    /* Optional asset sub-trees that are convenient to
+                     * pre-create for the inspector / asset browser. */
+                    char sub_path[1024];
+                    jce_path_join(sub_path, sizeof(sub_path), project_dir, "assets/scenes");
+                    jce_fs_host_create_directory(sub_path);
+                    jce_path_join(sub_path, sizeof(sub_path), project_dir, "assets/textures");
+                    jce_fs_host_create_directory(sub_path);
+                    jce_path_join(sub_path, sizeof(sub_path), project_dir, "assets/models");
+                    jce_fs_host_create_directory(sub_path);
+                    jce_path_join(sub_path, sizeof(sub_path), project_dir, "assets/audio");
+                    jce_fs_host_create_directory(sub_path);
+                    jce_path_join(sub_path, sizeof(sub_path), project_dir, "assets/scripts");
+                    jce_fs_host_create_directory(sub_path);
+                    jce_path_join(sub_path, sizeof(sub_path), project_dir, "build");
+                    jce_fs_host_create_directory(sub_path);
 
-                /* Write a minimal project file with editor/engine version. */
-                char proj_file[1024];
-                jce_path_join(proj_file, sizeof(proj_file), project_dir, "project.jce");
-                {
-                    char proj_buf[512];
-                    int proj_len = snprintf(proj_buf, sizeof(proj_buf),
-                        "{\n"
-                        "    \"name\": \"%s\",\n"
-                        "    \"type\": \"%s\",\n"
-                        "    \"version\": \"1.0\",\n"
-                        "    \"engineVersion\": \"0.1.0\",\n"
-                        "    \"editorVersion\": \"0.1.0\"\n"
-                        "}\n",
-                        s_new_project.project_name,
-                        s_new_project.project_type == 0 ? "3D" : "2D");
-                    if (proj_len > 0)
-                        ed_write_file(proj_file, proj_buf, (size_t)proj_len);
+                    /* Write Settings/RenderPipeline.rp.json with MID preset so
+                     * the built exe doesn't auto-detect HIGH tier and enable
+                     * SSR/volfog/TAA at full resolution.  The file is user-editable
+                     * and deployed next to the exe by the CMake POST_BUILD step. */
+                    {
+                        char settings_dir[1024];
+                        char rp_path[1024];
+                        jce_path_join(settings_dir, sizeof(settings_dir), project_dir, "Settings");
+                        jce_fs_host_create_directory(settings_dir);
+                        jce_path_join(rp_path, sizeof(rp_path), settings_dir, "RenderPipeline.rp.json");
+                        JceRenderPipelineDesc rp_desc;
+                        jce_render_pipeline_preset_mid(&rp_desc);
+                        jce_render_pipeline_save(rp_path, &rp_desc);
+                    }
+
+                    /* Add to recent projects. */
+                    JceEditorConfig ecfg;
+                    jce_editor_config_load(&ecfg);
+                    jce_editor_config_add_recent(&ecfg, project_dir);
+                    ecfg.last_project[0] = '\0';
+                    jce_editor_config_save(&ecfg);
+
+                    /* Set the asset browser root to the new project. */
+                    jce_editor_assets_set_project(project_dir);
+                    set_current_project_root(project_dir);
+                    jce_editor_layout_request_focus_scene_view();
+
+                    jce_editor_console_log("Created project: %s at %s",
+                                           s_new_project.project_name,
+                                           project_dir);
+                    ImGui::CloseCurrentPopup();
+                    *p_open = false;
                 }
-
-                /* Add to recent projects. */
-                JceEditorConfig ecfg;
-                jce_editor_config_load(&ecfg);
-                jce_editor_config_add_recent(&ecfg, project_dir);
-                ecfg.last_project[0] = '\0';
-                jce_editor_config_save(&ecfg);
-
-                /* Set the asset browser root to the new project. */
-                jce_editor_assets_set_project(project_dir);
-                set_current_project_root(project_dir);
-                jce_editor_layout_request_focus_scene_view();
-
-                jce_editor_console_log("Created project: %s at %s",
-                                       s_new_project.project_name,
-                                       project_dir);
-                ImGui::CloseCurrentPopup();
-                *p_open = false;
             }
         }
     }
@@ -731,8 +787,7 @@ void jce_editor_dialog_open_project(bool *p_open)
             if (s_open_project.selected_recent >= s_open_project.cfg.recent_count)
                 s_open_project.selected_recent = -1;
         }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", jce_editor_i18n("openProject.removeTooltip"));
+            jce_editor::help_tip(jce_editor_i18n("openProject.removeTooltip"));
         ImGui::PopID();
     }
     ImGui::EndChild();

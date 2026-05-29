@@ -20,8 +20,10 @@
 
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_path.h>
+#include <jce/application/jce_project.h>
 
 #include "jce_editor_dialogs_internal.h"
+#include "core/jce_editor_project.h"
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
 
@@ -39,21 +41,67 @@ bool has_scene_ext(const char *name)
     return false;
 }
 
-/* Default starting path for a Save/New dialog: <project>/assets/scenes/<name>
- * (or <cwd>/<name> when no project is loaded). */
+/* Default starting path for a Save/New dialog.
+ * Prefers the active JceProject's source_assets dir (schema v2) so
+ * scenes land where the cook pipeline expects them.  Falls back to
+ * "<project>/assets/scenes" for legacy projects and "<cwd>/<name>"
+ * when no project is loaded. */
 void compute_default_scene_path(char *out, size_t out_size,
                                 const char *fallback_name)
 {
     out[0] = '\0';
     char dir[1024] = {0};
-    if (s_current_project_root[0] != '\0') {
+
+    const JceProject *jp = jce_editor_project_get();
+    if (jp && jp->project_root[0] != '\0') {
+        const char *src = (jp->source_assets[0] != '\0')
+                              ? jp->source_assets : "assets";
+        char tmp[1024];
+        if (jce_path_is_absolute(src)) {
+            snprintf(tmp, sizeof(tmp), "%s", src);
+        } else {
+            jce_path_join(tmp, sizeof(tmp), jp->project_root, src);
+        }
+        jce_path_join(dir, sizeof(dir), tmp, "scenes");
+    } else if (s_current_project_root[0] != '\0') {
         char tmp[1024];
         jce_path_join(tmp, sizeof(tmp), s_current_project_root, "assets");
         jce_path_join(dir, sizeof(dir), tmp, "scenes");
     } else if (!jce_fs_host_get_current_dir(dir, sizeof(dir))) {
         snprintf(dir, sizeof(dir), ".");
     }
+    jce_fs_host_create_directory(dir);
     jce_path_join(out, out_size, dir, fallback_name);
+}
+
+/* Soft warn (Console) when the picked scene path is outside the
+ * project's source_assets tree.  The pipeline still cooks/builds, but
+ * artifacts outside source_assets won't be packaged by the cooker. */
+void warn_if_outside_source_assets(const char *path)
+{
+    const JceProject *jp = jce_editor_project_get();
+    if (!jp || !jp->project_root[0] || !path || !path[0]) return;
+    const char *src = (jp->source_assets[0] != '\0')
+                          ? jp->source_assets : "assets";
+    char src_abs[1024];
+    if (jce_path_is_absolute(src)) {
+        snprintf(src_abs, sizeof(src_abs), "%s", src);
+    } else {
+        jce_path_join(src_abs, sizeof(src_abs), jp->project_root, src);
+    }
+    /* Normalise separators for prefix compare. */
+    char a[1024]; char b[1024];
+    snprintf(a, sizeof(a), "%s", src_abs);
+    snprintf(b, sizeof(b), "%s", path);
+    for (char *p = a; *p; ++p) if (*p == '\\') *p = '/';
+    for (char *p = b; *p; ++p) if (*p == '\\') *p = '/';
+    size_t na = strlen(a);
+    if (strncmp(b, a, na) != 0) {
+        jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+            "Scene '%s' is outside source_assets ('%s') — it will be "
+            "excluded from the cook step.  Move it under the source_assets "
+            "tree to package it with the game.", path, src_abs);
+    }
 }
 
 /* Single-shot async dialog state, identical layout for all three shims. */
@@ -109,6 +157,7 @@ void jce_editor_dialog_new_scene(bool *p_open)
     if (!s.ready)    return;
 
     ensure_scene_ext(s.path, sizeof(s.path));
+    warn_if_outside_source_assets(s.path);
 
     char parent[1024];
     jce_path_parent(parent, sizeof(parent), s.path);
@@ -195,6 +244,7 @@ void jce_editor_dialog_save_as(bool *p_open)
     if (!s.ready)    return;
 
     ensure_scene_ext(s.path, sizeof(s.path));
+    warn_if_outside_source_assets(s.path);
 
     char parent[1024];
     jce_path_parent(parent, sizeof(parent), s.path);

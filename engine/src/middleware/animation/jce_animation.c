@@ -11,6 +11,7 @@
 #include "os/core/jce_memory.h"
 
 #include <string.h>
+#include <jce/os/core/jce_str.h>
 
 #define LOG_TAG "jce_animation"
 
@@ -96,8 +97,7 @@ JceAnimClip *jce_anim_clip_create(const char *name,
     if (!clip) return NULL;
 
     if (name) {
-        strncpy(clip->name, name, sizeof(clip->name) - 1);
-        clip->name[sizeof(clip->name) - 1] = '\0';
+        jce_strlcpy(clip->name, name, sizeof(clip->name));
     }
     clip->num_channels = num_channels;
     clip->duration     = duration;

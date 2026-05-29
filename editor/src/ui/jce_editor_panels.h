@@ -248,6 +248,29 @@ void jce_editor_path_to_relative_to(char *out, size_t out_size,
                                     const char *abs_or_rel_path,
                                     const char *base_dir);
 
+/* Common combo: normalize `src` into `buf` (project-relative) and return
+ * either `buf` (success) or `src` (fallback when normalization yielded
+ * an empty string). Saves the `rel[0] ? rel : src` ternary that
+ * appears in every drag-drop accept path field.
+ */
+const char *jce_editor_path_relative_or(char *buf, size_t buf_size,
+                                        const char *src);
+
+/* Zero-copy view of the last path component (filename or final dir name)
+ * inside `path` — returns a pointer into the input string after the last
+ * '/' or '\\'.  If no separator, returns `path` itself.  Empty/NULL -> "".
+ * Cheaper than jce_path_basename when you don't need a writable copy. */
+const char *jce_editor_path_basename_view(const char *path);
+
+/* In-place truncate `path` at its last '/' or '\\' separator, removing
+ * the trailing component.  No-op (path becomes "") if no separator. */
+void jce_editor_path_trim_to_parent(char *path);
+
+/* In-place strip the final extension from `path` (e.g. "foo/bar.png" -> "foo/bar").
+ * Only strips when the last '.' appears after the last path separator (so
+ * dotfiles and "../foo" are safe).  No-op when no extension present. */
+void jce_editor_path_strip_extension(char *path);
+
 /* Inspector sync: hierarchy calls this when selection changes. */
 void  jce_editor_inspector_request_sync(void);
 

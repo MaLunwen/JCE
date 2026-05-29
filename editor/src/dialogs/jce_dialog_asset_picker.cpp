@@ -8,6 +8,7 @@
 
 #include "jce_dialog_asset_picker.h"
 #include "core/jce_editor_i18n.h"
+#include "ui/jce_editor_panels.h"
 
 extern "C" {
 #include <jce/os/core/jce_log.h>
@@ -215,10 +216,7 @@ void jce_editor_asset_picker_draw(void)
                 int kind = (int)jce_assetdb_kind_at(idx);
                 /* Build a two-column-ish row: [KIND]  filename  (path-dim) */
                 const char *file = path ? path : "";
-                const char *slash = file ? strrchr(file, '/') : NULL;
-                const char *bs    = file ? strrchr(file, '\\') : NULL;
-                if (bs && (!slash || bs > slash)) slash = bs;
-                const char *name  = slash ? (slash + 1) : file;
+                const char *name = jce_editor_path_basename_view(file);
 
                 ImGui::PushID(idx);
                 char line[800];
@@ -233,12 +231,12 @@ void jce_editor_asset_picker_draw(void)
                         commit_via_keyboard = true;
                 }
                 /* Path on the same line, right-aligned in dim text. */
-                if (path && path != name && slash) {
+                if (path && path != name && name > file) {
                     ImGui::SameLine();
                     ImVec4 dim = ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
                     /* Truncate from the left for long paths. */
                     char folder[256];
-                    size_t flen = (size_t)(slash - file);
+                    size_t flen = (size_t)(name - 1 - file);
                     if (flen >= sizeof(folder)) flen = sizeof(folder) - 1;
                     memcpy(folder, file, flen);
                     folder[flen] = '\0';

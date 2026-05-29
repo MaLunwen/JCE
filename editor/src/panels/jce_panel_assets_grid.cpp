@@ -3,14 +3,18 @@
  */
 
 #include <jce/os/core/jce_path.h>
+#include "ui/jce_editor_dnd.h"
 
 #include "io/jce_editor_file_util.h"
 #include "jce_panel_assets_internal.h"
 #include "jce_panel_assets_thumb.h"
+#include "core/jce_editor_project.h"
+#include "core/jce_assetdb.h"
 
 #include <jce/os/core/jce_str.h>
 
 extern "C" {
+#include <jce/application/jce_project.h>
 #include <jce/middleware/physics/jce_physics_material.h>
 #include <jce/renderer/jce_pbr_material.h>
 #include <jce/renderer/jce_render_pipeline.h>
@@ -34,8 +38,7 @@ static void open_asset_entry(const FileEntry &fe)
         return;
     }
 
-    const char *ext = strrchr(fe.path.c_str(), '.');
-    if (ext && (jce_strcasecmp(ext, ".scene") == 0)) {
+    if (jce_assetdb_get_kind(fe.path.c_str()) == JCE_ASSET_KIND_SCENE) {
         jce_state_load_scene_file(fe.path.c_str());
         std::string dir = fe.path;
         size_t sep = dir.find_last_of("/\\");
@@ -396,15 +399,20 @@ void draw_asset_grid_item(const FileEntry &fe, int index,
 
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
         char rel[1024];
-        jce_editor_path_to_relative(rel, sizeof(rel), fe.path.c_str());
-        ImGui::SetTooltip("%s", rel[0] ? rel : fe.path.c_str());
+        ImGui::SetTooltip("%s", jce_editor_path_relative_or(rel, sizeof(rel), fe.path.c_str()));
     }
 
     if (!fe.is_dir && ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
         const char *p = fe.path.c_str();
-        ImGui::SetDragDropPayload("JCE_ASSET_PATH", p, strlen(p) + 1);
+        ImGui::SetDragDropPayload(JCE_DND_ASSET_PATH, p, strlen(p) + 1);
         ImGui::Text("%s", fe.name.c_str());
         ImGui::EndDragDropSource();
+    }
+
+    /* Alpha-jump scroll: bring this tile into view when jump lands here. */
+    if (s_assets.jump_scroll_idx == index) {
+        ImGui::SetScrollHereY(0.35f);
+        s_assets.jump_scroll_idx = -1;
     }
 
     ImGui::PopID();
@@ -527,6 +535,12 @@ void draw_asset_details_list(const std::vector<FileEntry> &display_entries,
         if (detect_open_trigger(fe, clicked, row_hovered, ctrl, shift))
             open_asset_entry(fe);
 
+        /* Alpha-jump scroll: bring this row into view when jump lands here. */
+        if (s_assets.jump_scroll_idx == i) {
+            ImGui::SetScrollHereY(0.35f);
+            s_assets.jump_scroll_idx = -1;
+        }
+
         if (row_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
             s_assets.context_idx = i;
             if (s_assets.selected_set.find(i) == s_assets.selected_set.end()) {
@@ -540,14 +554,13 @@ void draw_asset_details_list(const std::vector<FileEntry> &display_entries,
 
         if (row_hovered && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) {
             char rel[1024];
-            jce_editor_path_to_relative(rel, sizeof(rel), fe.path.c_str());
-            ImGui::SetTooltip("%s", rel[0] ? rel : fe.path.c_str());
+            ImGui::SetTooltip("%s", jce_editor_path_relative_or(rel, sizeof(rel), fe.path.c_str()));
         }
 
         if (row_hovered && !fe.is_dir
             && ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
             const char *p = fe.path.c_str();
-            ImGui::SetDragDropPayload("JCE_ASSET_PATH", p, strlen(p) + 1);
+            ImGui::SetDragDropPayload(JCE_DND_ASSET_PATH, p, strlen(p) + 1);
             ImGui::Text("%s", fe.name.c_str());
             ImGui::EndDragDropSource();
         }
@@ -613,6 +626,42 @@ void draw_asset_item_context_menu(const std::vector<FileEntry> &display_entries)
                 }
                 if (!dir.empty())
                     jce_host_open_terminal(dir.c_str());
+            }
+        }
+
+        /* Scene-only: "Set as Startup Scene" writes the relative path
+         * (from <project_root>/<source_assets>/) into jce_project.json
+         * so the runtime template auto-loads it on boot. */
+        if (cfe && !cfe->is_dir) {
+            bool is_scene =
+                jce_assetdb_get_kind(cfe->path.c_str()) == JCE_ASSET_KIND_SCENE;
+            const JceProject *jp = is_scene ? jce_editor_project_get() : nullptr;
+            if (jp && jp->project_root) {
+                const char *src = (jp->source_assets && jp->source_assets[0])
+                                  ? jp->source_assets : "assets";
+                char base[1024];
+                jce_path_join(base, sizeof(base), jp->project_root, src);
+                char norm_base[1024], norm_file[1024];
+                jce_path_normalize(norm_base, sizeof(norm_base), base);
+                jce_path_normalize(norm_file, sizeof(norm_file), cfe->path.c_str());
+                char rel[1024];
+                bool inside = jce_path_relative(rel, sizeof(rel),
+                                                norm_file, norm_base);
+                if (inside) {
+                    ImGui::Separator();
+                    if (ImGui::MenuItem(jce_editor_i18n_or(
+                            "assetBrowser.setAsStartupScene",
+                            "Set as Startup Scene"))) {
+                        if (jce_editor_project_update_field("startup_scene",
+                                                            rel)) {
+                            jce_editor_console_log(
+                                "startup_scene = %s", rel);
+                        } else {
+                            jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                                "Failed to update startup_scene");
+                        }
+                    }
+                }
             }
         }
 

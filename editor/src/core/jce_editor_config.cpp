@@ -50,6 +50,8 @@ void jce_editor_config_defaults(JceEditorConfig *cfg) {
     cfg->view_mode = 0;    /* JCE_VIEW_SHADED */
     cfg->show_grid = true;
     cfg->asset_browser_view_mode = 0; /* ASSET_BROWSER_VIEW_GRID */
+    cfg->asset_favorite_count = 0;
+    /* asset_favorites left zero-initialised by the memset above. */
     cfg->run_mode = 0; /* Editor Simulation */
     /* Default points to the canonical CMake-preset output.  Forward slashes
      * work on every host (Windows accepts them in CreateProcess paths).
@@ -96,6 +98,7 @@ void jce_editor_config_defaults(JceEditorConfig *cfg) {
     cfg->panels_visible_mask = JCE_EDITOR_PANELS_MASK_UNSET;
     cfg->panels_visible_mask_hi = 0u;
     strncpy(cfg->workspace_id, "default", sizeof(cfg->workspace_id) - 1);
+    cfg->build_project_root[0] = '\0';
 }
 
 /* --------------- helpers --------------- */
@@ -194,6 +197,8 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
         root, "panels_visible_mask_hi", (int)cfg->panels_visible_mask_hi);
     cjson_read_str(root, "workspace_id",
                    cfg->workspace_id, sizeof(cfg->workspace_id));
+    cjson_read_str(root, "build_project_root",
+                   cfg->build_project_root, sizeof(cfg->build_project_root));
     jce_editor_pref_invert_scroll_zoom = cfg->invert_scroll_zoom;
     jce_editor_pref_invert_drag_y      = cfg->invert_drag_y;
     jce_editor_pref_touchpad_h_invert  = cfg->touchpad_h_invert;
@@ -227,6 +232,27 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
             cfg->recent_scene_count = i + 1;
         } else {
             cfg->recent_scene_paths[i][0] = '\0';
+        }
+    }
+
+    /* asset_favorite_0 .. asset_favorite_11  (asset browser Locations) */
+    cfg->asset_favorite_count = 0;
+    {
+        int cap = (int)(sizeof(cfg->asset_favorites) /
+                        sizeof(cfg->asset_favorites[0]));
+        for (int i = 0; i < cap; i++) {
+            char key[24];
+            snprintf(key, sizeof(key), "asset_favorite_%d", i);
+            const char *s = jce_json_get_string(root, key, NULL);
+            if (s && s[0]) {
+                strncpy(cfg->asset_favorites[i], s,
+                        sizeof(cfg->asset_favorites[i]) - 1);
+                cfg->asset_favorites[i]
+                                    [sizeof(cfg->asset_favorites[i]) - 1] = '\0';
+                cfg->asset_favorite_count = i + 1;
+            } else {
+                cfg->asset_favorites[i][0] = '\0';
+            }
         }
     }
 
@@ -295,6 +321,7 @@ bool jce_editor_config_save(const JceEditorConfig *cfg) {
     jce_json_set_int (root, "panels_visible_mask", (int)cfg->panels_visible_mask);
     jce_json_set_int (root, "panels_visible_mask_hi", (int)cfg->panels_visible_mask_hi);
     jce_json_set_string(root, "workspace_id", cfg->workspace_id);
+    jce_json_set_string(root, "build_project_root", cfg->build_project_root);
     jce_editor_pref_invert_scroll_zoom = cfg->invert_scroll_zoom;
     jce_editor_pref_invert_drag_y      = cfg->invert_drag_y;
     jce_editor_pref_touchpad_h_invert  = cfg->touchpad_h_invert;
@@ -310,6 +337,18 @@ bool jce_editor_config_save(const JceEditorConfig *cfg) {
         snprintf(key, sizeof(key), "recent_scene_%d", i);
         const char *val = (i < cfg->recent_scene_count) ? cfg->recent_scene_paths[i] : "";
         jce_json_set_string(root, key, val);
+    }
+
+    {
+        int cap = (int)(sizeof(cfg->asset_favorites) /
+                        sizeof(cfg->asset_favorites[0]));
+        for (int i = 0; i < cap; i++) {
+            char key[24];
+            snprintf(key, sizeof(key), "asset_favorite_%d", i);
+            const char *val = (i < cfg->asset_favorite_count) ?
+                              cfg->asset_favorites[i] : "";
+            jce_json_set_string(root, key, val);
+        }
     }
 
     if (!ed_write_json_to_file(CONFIG_PATH, root)) {
@@ -418,4 +457,70 @@ void jce_editor_config_add_recent_scene(JceEditorConfig *cfg, const char *path) 
 
     strncpy(cfg->recent_scene_paths[0], norm, sizeof(cfg->recent_scene_paths[0]) - 1);
     cfg->recent_scene_paths[0][sizeof(cfg->recent_scene_paths[0]) - 1] = '\0';
+}
+
+/* --------------- favourites --------------- */
+
+/* Normalise an arbitrary host path to the canonical form we store on
+   disk: forward slashes, no trailing separator (except for drive roots
+   like "C:/" which collapse to "C:/").  Idempotent. */
+static void favorite_normalize(const char *in, char *out, size_t cap)
+{
+    if (cap == 0) return;
+    out[0] = '\0';
+    if (!in || !in[0]) return;
+    size_t len = strlen(in);
+    if (len + 1 > cap) len = cap - 1;
+    for (size_t i = 0; i < len; i++)
+        out[i] = (in[i] == '\\') ? '/' : in[i];
+    out[len] = '\0';
+    while (len > 1 && out[len - 1] == '/' &&
+           !(len == 3 && out[1] == ':')) {
+        out[--len] = '\0';
+    }
+}
+
+bool jce_editor_config_add_favorite(JceEditorConfig *cfg, const char *path)
+{
+    if (!cfg || !path || !path[0]) return false;
+    char norm[512];
+    favorite_normalize(path, norm, sizeof(norm));
+    if (!norm[0]) return false;
+
+    for (int i = 0; i < cfg->asset_favorite_count; i++) {
+        if (strcmp(cfg->asset_favorites[i], norm) == 0)
+            return false;
+    }
+    int cap = (int)(sizeof(cfg->asset_favorites) /
+                    sizeof(cfg->asset_favorites[0]));
+    if (cfg->asset_favorite_count >= cap) return false;
+    strncpy(cfg->asset_favorites[cfg->asset_favorite_count], norm,
+            sizeof(cfg->asset_favorites[0]) - 1);
+    cfg->asset_favorites[cfg->asset_favorite_count]
+                       [sizeof(cfg->asset_favorites[0]) - 1] = '\0';
+    cfg->asset_favorite_count++;
+    return true;
+}
+
+bool jce_editor_config_remove_favorite(JceEditorConfig *cfg, const char *path)
+{
+    if (!cfg || !path || !path[0]) return false;
+    char norm[512];
+    favorite_normalize(path, norm, sizeof(norm));
+    if (!norm[0]) return false;
+
+    for (int i = 0; i < cfg->asset_favorite_count; i++) {
+        if (strcmp(cfg->asset_favorites[i], norm) == 0) {
+            for (int j = i + 1; j < cfg->asset_favorite_count; j++) {
+                strncpy(cfg->asset_favorites[j - 1], cfg->asset_favorites[j],
+                        sizeof(cfg->asset_favorites[0]) - 1);
+                cfg->asset_favorites[j - 1]
+                                    [sizeof(cfg->asset_favorites[0]) - 1] = '\0';
+            }
+            cfg->asset_favorite_count--;
+            cfg->asset_favorites[cfg->asset_favorite_count][0] = '\0';
+            return true;
+        }
+    }
+    return false;
 }

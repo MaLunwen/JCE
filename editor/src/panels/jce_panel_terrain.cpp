@@ -14,6 +14,7 @@
  */
 
 #include "io/jce_editor_file_util.h"
+#include "ui/jce_editor_dnd.h"
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
 #include "scene/jce_editor_scene_render.h"
@@ -176,11 +177,10 @@ void draw_toolbar()
     jce_draw_path_input(jce_editor_i18n("terrain.toolbar.path"), s.io_path, sizeof(s.io_path), JcePathKind::FileAbs);
     if (ImGui::BeginDragDropTarget()) {
         if (const ImGuiPayload *payload =
-                ImGui::AcceptDragDropPayload("JCE_ASSET_PATH")) {
+                ImGui::AcceptDragDropPayload(JCE_DND_ASSET_PATH)) {
             const char *path = (const char *)payload->Data;
             char rel[1024];
-            jce_editor_path_to_relative(rel, sizeof(rel), path);
-            const char *store_path = rel[0] ? rel : path;
+            const char *store_path = jce_editor_path_relative_or(rel, sizeof(rel), path);
             snprintf(s.io_path, sizeof(s.io_path), "%s", store_path);
             /* Auto-load if a .terrain.json was dropped. */
             const char *ext = strrchr(path, '.');

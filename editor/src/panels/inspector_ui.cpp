@@ -5,6 +5,7 @@
  */
 
 #include "jce_panel_inspector_common.h"
+#include "ui/jce_editor_tip.h"
 
 void draw_comp_canvas(JceCanvasComponent *cv)
 {
@@ -65,8 +66,7 @@ void draw_comp_ui_text(JceUITextComponent *tx)
     ImGui::InputText(jce_editor_i18n_id("inspector.uit.localeKey", "uit_lk"), tx->locale_key, sizeof tx->locale_key); insp_track_edit();
     ImGui::SameLine();
     ImGui::TextDisabled("(?)");
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
-        ImGui::SetTooltip("%s", jce_editor_i18n_or("inspector.uit.localeKey.tip",
+    jce_editor::help_tip_delayed(jce_editor_i18n_or("inspector.uit.localeKey.tip",
             "Locale key for runtime localization. When set, jce_loc_t(key) overrides the Text field at runtime."));
     ImGui::InputTextMultiline(jce_editor_i18n_id("inspector.uit.text", "uit"), tx->text, sizeof tx->text, ImVec2(0, ImGui::GetTextLineHeight() * 4)); insp_track_edit();
     jce_draw_path_input_asset(jce_editor_i18n_id("inspector.uit.fontPath", "uit"), tx->font_path, sizeof tx->font_path, JCE_ASSET_KIND_DATA); insp_track_edit();

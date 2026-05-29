@@ -5,6 +5,7 @@
  */
 
 #include "jce_panel_inspector_common.h"
+#include "ui/jce_editor_dnd.h"
 
 /* ── Shared mutable state ─────────────────────────────────────────── */
 
@@ -131,7 +132,7 @@ void accept_asset_drop(char *buf, size_t buf_size)
 {
     if (ImGui::BeginDragDropTarget()) {
         if (const ImGuiPayload *payload =
-                ImGui::AcceptDragDropPayload("JCE_ASSET_PATH")) {
+                ImGui::AcceptDragDropPayload(JCE_DND_ASSET_PATH)) {
             copy_payload_as_relative(buf, buf_size, payload->Data);
         }
         ImGui::EndDragDropTarget();
@@ -155,7 +156,7 @@ void accept_mesh_drop_with_material(JceMeshRenderer *mr)
 {
     if (ImGui::BeginDragDropTarget()) {
         if (const ImGuiPayload *payload =
-                ImGui::AcceptDragDropPayload("JCE_ASSET_PATH")) {
+                ImGui::AcceptDragDropPayload(JCE_DND_ASSET_PATH)) {
             const char *path = (const char *)payload->Data;
             /* Store the mesh ref as project-relative.  Keep the
              * absolute `path` for the importer call below — assimp

@@ -45,6 +45,10 @@ function(_jce_add_layer NAME)
 			"${_ENGINE_SRC}/${_dir}/*.cpp")
 		# Skip vendored third_party trees (e.g., libhevc has its own build).
 		list(FILTER _dir_srcs EXCLUDE REGEX "/third_party/")
+		# Skip host-tool-only TUs that get explicitly compiled into the
+		# tools/ targets (jce_cook, jce_pak, …) and pull in symbols
+		# (jce_tex_compress, …) that the runtime engine does not link.
+		list(FILTER _dir_srcs EXCLUDE REGEX "/jce_asset_cooker\\.c$")
 		list(APPEND _srcs ${_dir_srcs})
 	endforeach()
 
@@ -363,6 +367,7 @@ _jce_add_layer(jce_resource
 		cjson::cjson
 		bgfx::bgfx
 		assimp::assimp
+		meshoptimizer::meshoptimizer
 	CXX)
 
 # ================================================================== #
@@ -378,6 +383,7 @@ _jce_add_layer(jce_application
 		jce_platform
 		jce_renderer
 		jce_audio
+		jce_physics
 		jce_resource
 		jce_scene
 	LINK_PRIVATE
@@ -512,3 +518,28 @@ if(JCE_PLATFORM_LINUX)
 	# Export shim dir for executables that link JCE.
 	set(_STATIC_SHIM_DIR "${_STATIC_SHIM_DIR}" PARENT_SCOPE)
 endif()
+
+# ================================================================== #
+# SDK link-time shims (MSVC only).                                    #
+#                                                                      #
+# A tiny static lib that back-ports MSVC STL vectorised helpers       #
+# missing from older toolchain CRTs.  Kept OUT of any layer GLOB so   #
+# it does NOT land in the /WHOLEARCHIVE'd core fat lib — instead it   #
+# is merged into the normally-linked deps fat lib so the linker only  #
+# pulls its obj when the symbol is genuinely unresolved (future MSVC  #
+# versions that ship the helper will silently win).                   #
+# ================================================================== #
+if(WIN32 AND MSVC)
+	add_library(jce_msvc_stl_shims STATIC
+		"${_ENGINE_SRC}/sdk_shims/jce_msvc_stl_shims.cpp")
+	set_target_properties(jce_msvc_stl_shims PROPERTIES LINKER_LANGUAGE CXX)
+	target_compile_definitions(jce_msvc_stl_shims PRIVATE JCE_BUILDING_ENGINE=1)
+endif()
+
+# ================================================================== #
+# SDK packaging (Phase 3) — produce a redistributable JCE SDK.        #
+# Opt-in via -DJCE_ENABLE_SDK_INSTALL=ON. End-users then consume the  #
+# install tree with find_package(JCE REQUIRED) — no Conan required.   #
+# ================================================================== #
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/JCESDKInstall.cmake")
+jce_register_sdk_install()

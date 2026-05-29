@@ -17,6 +17,8 @@
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_i18n.h"
 #include "core/jce_editor_config.h"
+#include <jce/os/core/jce_log.h>
+#include "core/jce_editor_project.h"
 #include "core/jce_hotkeys.h"
 #include "core/jce_project_settings.h"
 #include "dialogs/jce_path_input.h"
@@ -27,9 +29,13 @@
 #include <cstring>
 #include <cctype>
 #include <cfloat>
+#include <string>
+#include <vector>
 #include <cstdlib>
 
 extern "C" {
+#include <jce/application/jce_project.h>
+#include <jce/os/core/jce_path.h>
 #include <jce/renderer/jce_renderer_caps.h>
 #include <jce/renderer/jce_quality_preset.h>
 }
@@ -65,6 +71,24 @@ struct State {
     JceEditorConfig     cfg;
     int                 hk_recording_id = -1;
     char                hk_filter[64] = {0};
+
+    /* ── Active jce_project.json editable buffers (TAB_PROJECT) ── */
+    char                jp_root_cached[1024] = {0};
+    bool                jp_loaded            = false;
+    char                jp_name[128]         = {0};
+    char                jp_version[64]       = {0};
+    char                jp_source_assets[256]= {0};
+    char                jp_cooked_assets[256]= {0};
+    char                jp_startup_scene[512]= {0};
+    char                jp_save_msg[256]     = {0};
+    /* Bundles list: editable in-memory (relative-to-root strings), kept
+     * in sync with the cached JceProject on load + on save. */
+    std::vector<std::string> jp_bundles;
+    bool                jp_bundle_picker_open = false;
+    /* Persistent buffer for the bundle picker — jce_draw_path_input is
+     * async, so the buffer must outlive the frame in which "Browse" is
+     * clicked.  We push to jp_bundles + clear once a path appears. */
+    char                jp_bundle_add_buf[1024] = {0};
 };
 
 State g_st;
@@ -699,6 +723,229 @@ void draw_project(void)
         g_st.cfg.recent_count = 0;
         mark_dirty();
     }
+
+    /* ── Active project manifest editor ───────────────────────────── */
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextUnformatted(jce_editor_i18n_or(
+        "projectSettings.project.manifestHeader",
+        "Active Project (jce_project.json)"));
+
+    const JceProject *jp = jce_editor_project_get();
+    if (!jp) {
+        ImGui::TextDisabled("%s", jce_editor_i18n_or(
+            "projectSettings.project.noManifest",
+            "No project open — File > Open Project to load a jce_project.json."));
+        g_st.jp_loaded = false;
+        g_st.jp_root_cached[0] = '\0';
+        return;
+    }
+
+    /* (Re)load editable buffers when the active project changes. */
+    const char *jp_root = jp->project_root ? jp->project_root : "";
+    if (!g_st.jp_loaded || std::strcmp(jp_root, g_st.jp_root_cached) != 0) {
+        std::snprintf(g_st.jp_root_cached, sizeof(g_st.jp_root_cached),
+                      "%s", jp_root);
+        std::snprintf(g_st.jp_name, sizeof(g_st.jp_name),
+                      "%s", jp->name ? jp->name : "");
+        std::snprintf(g_st.jp_version, sizeof(g_st.jp_version),
+                      "%s", jp->version ? jp->version : "");
+        std::snprintf(g_st.jp_source_assets, sizeof(g_st.jp_source_assets),
+                      "%s", jp->source_assets ? jp->source_assets : "");
+        std::snprintf(g_st.jp_cooked_assets, sizeof(g_st.jp_cooked_assets),
+                      "%s", jp->cooked_assets ? jp->cooked_assets : "");
+        std::snprintf(g_st.jp_startup_scene, sizeof(g_st.jp_startup_scene),
+                      "%s", jp->startup_scene ? jp->startup_scene : "");
+        g_st.jp_bundles.clear();
+        for (int i = 0; i < jp->bundles_count; ++i) {
+            if (jp->bundles && jp->bundles[i])
+                g_st.jp_bundles.emplace_back(jp->bundles[i]);
+        }
+        g_st.jp_save_msg[0] = '\0';
+        g_st.jp_loaded = true;
+    }
+
+    ImGui::TextDisabled("%s", jp_root);
+    ImGui::PushItemWidth(-1);
+    ImGui::TextUnformatted(jce_editor_i18n_or("projectSettings.project.name", "Name"));
+    ImGui::InputText("##jp_name", g_st.jp_name, sizeof(g_st.jp_name));
+    ImGui::TextUnformatted(jce_editor_i18n_or("projectSettings.project.version", "Version"));
+    ImGui::InputText("##jp_version", g_st.jp_version, sizeof(g_st.jp_version));
+    ImGui::PopItemWidth();
+
+    /* Picker-driven path fields — no manual typing.  After the OS
+     * dialog hands us an absolute path, we collapse it back to a path
+     * relative to the project root (or to source_assets for the scene). */
+    if (jce_draw_path_input_folder(
+            jce_editor_i18n_or("projectSettings.project.sourceAssets",
+                               "Source assets dir (relative to project root)"),
+            g_st.jp_source_assets, sizeof(g_st.jp_source_assets))) {
+        char rel[512];
+        jce_editor_path_to_relative_to(rel, sizeof(rel),
+                        g_st.jp_source_assets, jp_root);
+        std::snprintf(g_st.jp_source_assets,
+                      sizeof(g_st.jp_source_assets), "%s", rel);
+    }
+    if (jce_draw_path_input_folder(
+            jce_editor_i18n_or("projectSettings.project.cookedAssets",
+                               "Cooked assets dir (cook output, fed to PAK)"),
+            g_st.jp_cooked_assets, sizeof(g_st.jp_cooked_assets))) {
+        char rel[512];
+        jce_editor_path_to_relative_to(rel, sizeof(rel),
+                        g_st.jp_cooked_assets, jp_root);
+        std::snprintf(g_st.jp_cooked_assets,
+                      sizeof(g_st.jp_cooked_assets), "%s", rel);
+    }
+    {
+        const char *src = (g_st.jp_source_assets[0]) ? g_st.jp_source_assets
+                                                     : "assets";
+        char src_abs[1024];
+        if (jp_root[0])
+            jce_path_join(src_abs, sizeof(src_abs), jp_root, src);
+        else
+            std::snprintf(src_abs, sizeof(src_abs), "%s", src);
+        if (jce_draw_path_input_file(
+                jce_editor_i18n_or("projectSettings.project.startupScene",
+                                   "Startup scene (relative to source assets dir)"),
+                g_st.jp_startup_scene, sizeof(g_st.jp_startup_scene),
+                "Scenes (*.scene *.json);;All Files (*.*)")) {
+            char rel[512];
+            jce_editor_path_to_relative_to(rel, sizeof(rel),
+                            g_st.jp_startup_scene, src_abs);
+            std::snprintf(g_st.jp_startup_scene,
+                          sizeof(g_st.jp_startup_scene), "%s", rel);
+        }
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextUnformatted(jce_editor_i18n_or(
+        "projectSettings.project.bundles", "Bundles (.jbundle mounted at runtime)"));
+    {
+        int remove_idx = -1;
+        for (size_t i = 0; i < g_st.jp_bundles.size(); ++i) {
+            ImGui::PushID((int)i);
+            char buf[1024];
+            std::snprintf(buf, sizeof(buf), "%s", g_st.jp_bundles[i].c_str());
+            ImGui::PushItemWidth(-90.0f);
+            if (ImGui::InputText("##jp_bundle", buf, sizeof(buf)))
+                g_st.jp_bundles[i] = buf;
+            ImGui::PopItemWidth();
+            ImGui::SameLine();
+            if (ImGui::Button(jce_editor_i18n_or(
+                    "projectSettings.project.bundles.remove", "Remove")))
+                remove_idx = (int)i;
+            ImGui::PopID();
+        }
+        if (remove_idx >= 0)
+            g_st.jp_bundles.erase(g_st.jp_bundles.begin() + remove_idx);
+
+        /* Picker writes asynchronously to add_buf; when it lands we
+         * auto-commit + clear so the user just picks a file and the
+         * row appears in the list above. */
+        char *add_buf = g_st.jp_bundle_add_buf;
+        const size_t add_cap = sizeof(g_st.jp_bundle_add_buf);
+        bool picked = jce_draw_path_input_file(
+                jce_editor_i18n_or("projectSettings.project.bundles.add",
+                                   "Add bundle (.jbundle)"),
+                add_buf, add_cap,
+                "JCE Bundle (*.jbundle);;All Files (*.*)");
+        if (picked && add_buf[0]) {
+            char rel[1024];
+            jce_editor_path_to_relative_to(rel, sizeof(rel),
+                                           add_buf, jp_root);
+            g_st.jp_bundles.emplace_back(rel[0] ? rel : add_buf);
+            add_buf[0] = '\0';
+        }
+        ImGui::TextDisabled("%s", jce_editor_i18n_or(
+            "projectSettings.project.bundles.hint",
+            "Pick a .jbundle file above; it is added to the list. "
+            "Click 'Save jce_project.json' to persist."));
+    }
+
+    ImGui::Spacing();
+    if (ImGui::Button(jce_editor_i18n_or(
+            "projectSettings.project.saveManifest", "Save jce_project.json"))) {
+        std::vector<const char *> ptrs;
+        ptrs.reserve(g_st.jp_bundles.size());
+        for (auto &s : g_st.jp_bundles) ptrs.push_back(s.c_str());
+        /* Apply every field independently so an empty optional value
+         * (e.g. version) does not short-circuit the bundle write. */
+        bool ok_n = jce_editor_project_update_field("name",          g_st.jp_name);
+        bool ok_v = jce_editor_project_update_field("version",       g_st.jp_version);
+        bool ok_s = jce_editor_project_update_field("source_assets", g_st.jp_source_assets);
+        bool ok_c = jce_editor_project_update_field("cooked_assets", g_st.jp_cooked_assets);
+        bool ok_e = jce_editor_project_update_field("startup_scene", g_st.jp_startup_scene);
+        bool ok_b = jce_editor_project_set_bundles(
+                        ptrs.empty() ? nullptr : ptrs.data(), (int)ptrs.size());
+        bool ok = ok_n && ok_v && ok_s && ok_c && ok_e && ok_b;
+        jce_log_write(JCE_LOG_LEVEL_INFO, "project_settings", __FILE__, __LINE__,
+                     "save: name=%d ver=%d src=%d cooked=%d scene=%d bundles=%d (%zu)",
+                     (int)ok_n, (int)ok_v, (int)ok_s, (int)ok_c,
+                     (int)ok_e, (int)ok_b, g_st.jp_bundles.size());
+        std::snprintf(g_st.jp_save_msg, sizeof(g_st.jp_save_msg),
+                      "%s", ok ? "Saved." : "Save failed (see console).");
+        /* Force re-read of buffers from refreshed cache next frame. */
+        g_st.jp_loaded = false;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(jce_editor_i18n_or(
+            "projectSettings.project.revertManifest", "Revert"))) {
+        g_st.jp_loaded = false;
+        g_st.jp_save_msg[0] = '\0';
+    }
+    if (g_st.jp_save_msg[0])
+        ImGui::TextDisabled("%s", g_st.jp_save_msg);
+
+    /* ── main.c maintenance (Reset / Eject) ───────────────────────── */
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextUnformatted(jce_editor_i18n_or(
+        "projectSettings.project.mainC", "Application entry point (src/main.c)"));
+    ImGui::TextDisabled("%s", jce_editor_i18n_or(
+        "projectSettings.project.mainC.hint",
+        "Reset: re-write src/main.c from the SDK template "
+        "(thin shim that tracks engine upgrades). "
+        "Eject: inline the default body so you can deeply customise "
+        "boot flow (stops tracking engine upgrades for this file)."));
+
+    static char s_main_msg[256] = {0};
+    const JceProject *cur = jce_editor_project_get();
+    const bool        have_project = (cur && cur->project_root && *cur->project_root);
+
+    if (!have_project) ImGui::BeginDisabled();
+    if (ImGui::Button(jce_editor_i18n_or(
+            "projectSettings.project.resetMain", "Reset main.c"))) {
+        char err[256] = {0};
+        bool ok = jce_project_reset_main_c(
+                      cur ? cur->project_root : "",
+                      cur ? cur->name         : nullptr,
+                      err, sizeof err);
+        std::snprintf(s_main_msg, sizeof s_main_msg, "%s",
+                      ok ? "Reset OK — rebuild to apply." :
+                           (err[0] ? err : "Reset failed."));
+        jce_log_write(ok ? JCE_LOG_LEVEL_INFO : JCE_LOG_LEVEL_ERROR,
+                      "project_settings", __FILE__, __LINE__,
+                      "reset main.c: %s", s_main_msg);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(jce_editor_i18n_or(
+            "projectSettings.project.ejectMain", "Eject main.c"))) {
+        char err[256] = {0};
+        bool ok = jce_project_eject_main_c(
+                      cur ? cur->project_root : "",
+                      cur ? cur->name         : nullptr,
+                      err, sizeof err);
+        std::snprintf(s_main_msg, sizeof s_main_msg, "%s",
+                      ok ? "Ejected — main.c now owned by this project." :
+                           (err[0] ? err : "Eject failed."));
+        jce_log_write(ok ? JCE_LOG_LEVEL_INFO : JCE_LOG_LEVEL_ERROR,
+                      "project_settings", __FILE__, __LINE__,
+                      "eject main.c: %s", s_main_msg);
+    }
+    if (!have_project) ImGui::EndDisabled();
+
+    if (s_main_msg[0]) ImGui::TextDisabled("%s", s_main_msg);
 }
 
 void draw_build(void)
@@ -712,10 +959,13 @@ void draw_build(void)
     if (ImGui::InputText("##build_preset", g_st.cfg.build_preset,
                          sizeof(g_st.cfg.build_preset)))
         mark_dirty();
-    ImGui::TextUnformatted(jce_editor_i18n("projectSettings.build.outputDir"));
-    if (ImGui::InputText("##out_dir", g_st.cfg.build_output_path,
-                         sizeof(g_st.cfg.build_output_path)))
+    ImGui::PopItemWidth();
+    if (jce_draw_path_input_folder(
+            jce_editor_i18n("projectSettings.build.outputDir"),
+            g_st.cfg.build_output_path,
+            sizeof(g_st.cfg.build_output_path)))
         mark_dirty();
+    ImGui::PushItemWidth(-1);
     ImGui::TextUnformatted(jce_editor_i18n("projectSettings.build.cmakeTarget"));
     if (ImGui::InputText("##target", g_st.cfg.game_target_name,
                          sizeof(g_st.cfg.game_target_name)))
@@ -737,16 +987,22 @@ void draw_run(void)
         mark_dirty();
     }
     ImGui::Spacing();
-    ImGui::TextUnformatted(jce_editor_i18n("projectSettings.run.gameExe"));
-    ImGui::PushItemWidth(-1);
-    if (ImGui::InputText("##exe_path", g_st.cfg.game_executable_path,
-                         sizeof(g_st.cfg.game_executable_path)))
+    if (jce_draw_path_input_file(
+            jce_editor_i18n("projectSettings.run.gameExe"),
+            g_st.cfg.game_executable_path,
+            sizeof(g_st.cfg.game_executable_path),
+#if defined(_WIN32)
+            "Executables (*.exe);;All Files (*.*)"
+#else
+            "All Files (*.*)"
+#endif
+            ))
         mark_dirty();
-    ImGui::TextUnformatted(jce_editor_i18n("projectSettings.run.workDir"));
-    if (ImGui::InputText("##work_dir", g_st.cfg.game_working_directory,
-                         sizeof(g_st.cfg.game_working_directory)))
+    if (jce_draw_path_input_folder(
+            jce_editor_i18n("projectSettings.run.workDir"),
+            g_st.cfg.game_working_directory,
+            sizeof(g_st.cfg.game_working_directory)))
         mark_dirty();
-    ImGui::PopItemWidth();
 }
 
 void draw_hotkeys(void)

@@ -72,6 +72,7 @@ class JCEConan(ConanFile):
         self.requires("cjson/1.7.19")
         self.requires("assimp/6.0.2")
         self.requires("cgltf/1.15")
+        self.requires("meshoptimizer/1.0")
 
         self.requires("ozz-animation/0.14.1")
         self.requires("behaviortree.cpp/4.9.0")

@@ -19,6 +19,43 @@
 
 #define LOG_TAG "jce_shaders"
 
+/* -- Embedded engine-shader PAK fallback ----------------------------- *
+ * The engine static library bundles all stock shader bins (vs_color,
+ * fs_pbr, …) for every backend (dx11, spv, glsl, essl, mtl).  When the
+ * user PAK is NULL — or doesn't contain a particular shader — we fall
+ * back to this embedded archive so a freshly-scaffolded SDK consumer
+ * project still renders without shipping a separate engine_shaders.pak.
+ *
+ * The symbols `jce_engine_shaders_pak_data[]` /
+ * `jce_engine_shaders_pak_size` are emitted at build time by
+ * `tools/jce_pak --symbol-prefix jce_engine_shaders_pak`.
+ *
+ * When the engine is built without the embedded shader pack
+ * (`-DJCE_EMBED_ENGINE_SHADERS=OFF`), a 1-byte stub keeps the link
+ * happy and the fallback becomes a no-op.
+ */
+extern const unsigned char jce_engine_shaders_pak[];
+extern const size_t        jce_engine_shaders_pak_size;
+
+static const JcePakArchive *embedded_pak(void)
+{
+    static const JcePakArchive *cached = NULL;
+    static int                  tried  = 0;
+    if (!tried) {
+        tried = 1;
+        if (jce_engine_shaders_pak_size > 1) {
+            cached = jce_pak_open(jce_engine_shaders_pak,
+                                  jce_engine_shaders_pak_size);
+            if (!cached) {
+                LOG_WARN(LOG_TAG,
+                         "embedded engine shader pak failed to open "
+                         "(size=%zu)", (size_t)jce_engine_shaders_pak_size);
+            }
+        }
+    }
+    return cached;
+}
+
 /* Map bgfx renderer type to the file suffix produced by shaderc. */
 static const char *shader_suffix(bgfx_renderer_type_t type)
 {
@@ -39,13 +76,22 @@ static const char *shader_suffix(bgfx_renderer_type_t type)
     }
 }
 
-/* Load one shader (.bin) from the PAK, return a bgfx handle. */
+/* Load one shader (.bin) from the PAK, return a bgfx handle.
+   Falls back to the engine-embedded shader pak when the caller-supplied
+   pak is NULL or the path is missing. */
 static bgfx_shader_handle_t load_single(const JcePakArchive *pak, const char *path)
 {
     bgfx_shader_handle_t invalid;
     invalid.idx = UINT16_MAX;
 
-    const JcePakAsset *asset = jce_pak_find(pak, path);
+    const JcePakAsset *asset = pak ? jce_pak_find(pak, path) : NULL;
+    if (!asset) {
+        const JcePakArchive *fb = embedded_pak();
+        if (fb && fb != pak) {
+            asset = jce_pak_find(fb, path);
+            if (asset) pak = fb;
+        }
+    }
     if (!asset) {
         LOG_ERROR(LOG_TAG, "not found in PAK: %s", path);
         return invalid;

@@ -373,9 +373,21 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         }
     }
 #else
-    e->pak = jce_pak_open(assets_pak_data, assets_pak_data_size);
+    /* Empty stub PAK (a freshly scaffolded project ships a 1-byte
+     * placeholder) — skip opening so the engine boots; logical asset
+     * lookups will fall back to the bundle catalog or fail gracefully. */
+    if (assets_pak_data_size > 1) {
+        e->pak = jce_pak_open(assets_pak_data, assets_pak_data_size);
+    } else {
+        LOG_WARN(LOG_TAG,
+                 "no PAK embedded (assets_pak_data_size=%zu) — "
+                 "running without an asset PAK.  Replace the stub by "
+                 "running the asset packer for this project.",
+                 (size_t)assets_pak_data_size);
+        e->pak = NULL;
+    }
 #endif
-    if (!e->pak) {
+    if (!e->pak && assets_pak_data_size > 1) {
         fatal_msg("Failed to open PAK archive");
         goto fail;
     }

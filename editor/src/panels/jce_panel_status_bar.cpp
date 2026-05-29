@@ -9,6 +9,7 @@
  */
 
 #include "ui/jce_editor_panels.h"
+#include "ui/jce_editor_tip.h"
 #include "core/jce_editor_state.h"
 #include "core/jce_editor_i18n.h"
 
@@ -30,10 +31,7 @@ static const char *play_state_label(JcePlayState ps)
 static const char *short_scene_name(const char *path)
 {
     if (!path || !*path) return jce_editor_i18n("statusBar.untitled");
-    const char *slash = std::strrchr(path, '/');
-    const char *bslash = std::strrchr(path, '\\');
-    const char *name = slash > bslash ? slash : bslash;
-    return name ? name + 1 : path;
+    return jce_editor_path_basename_view(path);
 }
 
 /* GPU tier widget — colored label + click popup to override the
@@ -84,9 +82,7 @@ static void draw_gpu_tier_segment(void)
     }
     ImGui::PopStyleColor();
 
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("%s", jce_editor_i18n("statusBar.gpuTier.tooltip"));
-    }
+    jce_editor::help_tip(jce_editor_i18n("statusBar.gpuTier.tooltip"));
 
     if (ImGui::BeginPopup("##jce_gpu_tier_menu")) {
         if (ImGui::MenuItem(jce_editor_i18n("statusBar.gpuTier.menu.setLow")))

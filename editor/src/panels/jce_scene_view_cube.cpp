@@ -3,6 +3,7 @@
  */
 
 #include "jce_scene_view_internal.h"
+#include "ui/jce_editor_colors.h"
 
 /* ── Helper: transform 3D direction by camera view matrix -> 2D ──── */
 
@@ -31,9 +32,9 @@ int draw_axis_indicator(ImDrawList *dl, ImVec2 origin, ImVec2 size,
     dl->AddCircle(ImVec2(cx, cy), radius + 8.0f, IM_COL32(80, 80, 90, 120), 32, 1.0f);
 
     struct { float dx, dy, dz; ImU32 col; const char *label; } axes[3] = {
-        { 1, 0, 0, IM_COL32(255, 80, 80, 255), "X" },
-        { 0, 1, 0, IM_COL32(80, 255, 80, 255), "Y" },
-        { 0, 0, 1, IM_COL32(80, 80, 255, 255), "Z" },
+        { 1, 0, 0, JCE_COL32_AXIS_X, "X" },
+        { 0, 1, 0, JCE_COL32_AXIS_Y, "Y" },
+        { 0, 0, 1, JCE_COL32_AXIS_Z, "Z" },
     };
 
     float depths[3];

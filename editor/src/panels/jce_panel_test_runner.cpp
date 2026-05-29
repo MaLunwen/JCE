@@ -30,6 +30,7 @@
 #include "io/jce_editor_file_util.h"
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
+#include "ui/jce_editor_colors.h"
 
 #include <jce/tools/jce_imgui.hpp>
 #include "dialogs/jce_path_input.h"
@@ -183,8 +184,8 @@ static void run_all()
 static ImU32 status_color(CaseStatus st)
 {
     switch (st) {
-        case CS_PASS:    return IM_COL32(80, 220, 120, 255);
-        case CS_FAIL:    return IM_COL32(220, 80, 80,  255);
+        case CS_PASS:    return JCE_COL32_STATUS_OK;
+        case CS_FAIL:    return JCE_COL32_STATUS_ERR;
         case CS_RUNNING: return IM_COL32(220, 200, 80, 255);
         default:         return IM_COL32(160, 160, 160, 255);
     }

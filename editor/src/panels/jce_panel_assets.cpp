@@ -14,6 +14,7 @@
 #include "core/jce_editor_config.h"
 #include "core/jce_hotkeys.h"
 #include "core/jce_assetdb.h"
+#include "ui/jce_editor_modals.h"
 #include "jce_panel_assets_internal.h"
 #include "scene/jce_asset_path_index.h"
 
@@ -153,6 +154,10 @@ void ensure_assets_init(void)
     s_assets.search_active = false;
     s_assets.view_mode = ASSET_BROWSER_VIEW_GRID;
     s_assets.kind_filter = 0;
+    s_assets.jump_scroll_idx  = -1;
+    s_assets.jump_last_char   = '\0';
+    s_assets.jump_next_start  = 0;
+    s_assets.jump_reset_time  = 0.0;
     {
         JceEditorConfig ecfg;
         if (jce_editor_config_load(&ecfg)) {
@@ -630,6 +635,70 @@ static void handle_asset_keyboard_shortcuts(
             s_assets.selected_set.clear();
             s_assets.last_clicked_idx = -1;
         }
+
+        /* Alpha-jump: Windows Explorer-style — press a letter/digit (no
+         * modifier) to jump to the first item whose name starts with it.
+         * Press the same key again within 1.5 s to cycle to the next match. */
+        {
+            const double kCycleWindow = 1.5;
+            ImGuiIO &io = ImGui::GetIO();
+            /* Ignore if any modifier is held (avoids eating Ctrl+A etc.) */
+            if (!io.KeyCtrl && !io.KeyAlt && !io.KeySuper) {
+                /* Map ImGuiKey → char.  Covers letters, digits, numpad digits,
+                 * dot, minus, space — mirrors Windows Explorer. */
+                char typed = '\0';
+                for (ImGuiKey key = ImGuiKey_A; key <= ImGuiKey_Z && !typed;
+                     key = (ImGuiKey)(key + 1))
+                    if (ImGui::IsKeyPressed(key, false))
+                        typed = (char)('a' + (key - ImGuiKey_A));
+                for (ImGuiKey key = ImGuiKey_0; key <= ImGuiKey_9 && !typed;
+                     key = (ImGuiKey)(key + 1))
+                    if (ImGui::IsKeyPressed(key, false))
+                        typed = (char)('0' + (key - ImGuiKey_0));
+                for (ImGuiKey key = ImGuiKey_Keypad0; key <= ImGuiKey_Keypad9 && !typed;
+                     key = (ImGuiKey)(key + 1))
+                    if (ImGui::IsKeyPressed(key, false))
+                        typed = (char)('0' + (key - ImGuiKey_Keypad0));
+                if (!typed && ImGui::IsKeyPressed(ImGuiKey_Space, false))          typed = ' ';
+                if (!typed && ImGui::IsKeyPressed(ImGuiKey_Minus, false))          typed = '-';
+                if (!typed && ImGui::IsKeyPressed(ImGuiKey_Period, false))         typed = '.';
+                if (!typed && ImGui::IsKeyPressed(ImGuiKey_KeypadDecimal, false))  typed = '.';
+                if (!typed && ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, false)) typed = '-';
+
+                if (typed) {
+                    char lc = (char)tolower((unsigned char)typed);
+                    double now = ImGui::GetTime();
+                    bool cycling = (lc == s_assets.jump_last_char
+                                    && (now - s_assets.jump_reset_time) < kCycleWindow);
+                    int start = cycling ? s_assets.jump_next_start : 0;
+                    int n = (int)view.size();
+                    int found = -1;
+
+                    for (int pass = 0; pass < 2 && found < 0; ++pass) {
+                        int from = (pass == 0) ? start : 0;
+                        int to   = (pass == 0) ? n     : start;
+                        for (int k = from; k < to; ++k) {
+                            if (!view[k].name.empty()
+                                && tolower((unsigned char)view[k].name[0]) == (unsigned char)lc)
+                            {
+                                found = k;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (found >= 0) {
+                        s_assets.selected_set.clear();
+                        s_assets.selected_set.insert(found);
+                        s_assets.last_clicked_idx  = found;
+                        s_assets.jump_scroll_idx   = found;
+                        s_assets.jump_last_char    = lc;
+                        s_assets.jump_next_start   = found + 1;
+                        s_assets.jump_reset_time   = ImGui::GetTime();
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -642,73 +711,42 @@ static void draw_asset_delete_dialog(void)
         s_assets.show_delete_confirm = false;
     }
     if (s_assets.show_delete_dialog_open) {
-        const char *popup_id = "###AssetDeleteConfirm";
-        if (s_assets.show_delete_dialog_open && !ImGui::IsPopupOpen(popup_id))
-            ImGui::OpenPopup(popup_id);
-
-        const ImGuiViewport *vp = ImGui::GetMainViewport();
-        ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-        ImGui::SetNextWindowSize(ImVec2(400, 0), ImGuiCond_Appearing);
-        ImGui::SetNextWindowViewport(vp->ID);
-
-        char title[256];
-        snprintf(title, sizeof(title), "%s%s", jce_editor_i18n("dialog.confirmDelete"), popup_id);
-        if (ImGui::BeginPopupModal(title,
-                    &s_assets.show_delete_dialog_open,
-                    ImGuiWindowFlags_NoCollapse
-                  | ImGuiWindowFlags_NoDocking
-                  | ImGuiWindowFlags_AlwaysAutoResize))
-        {
-            ImGui::Text("%s", jce_editor_i18n("assetBrowser.deleteDialogPrompt"));
-            if (s_assets.pending_delete_names.size() > 1)
-                ImGui::Text("(%d %s)", (int)s_assets.pending_delete_names.size(),
-                            jce_editor_i18n("assetBrowser.items"));
-            ImGui::Spacing();
-            for (auto &name : s_assets.pending_delete_names)
-                ImGui::TextWrapped("  %s", name.c_str());
-            if (s_assets.pending_delete_dir_count > 0) {
+        jce_modal::Result r = jce_modal::confirm_delete(
+            &s_assets.show_delete_dialog_open,
+            "###AssetDeleteConfirm",
+            "assetBrowser.deleteConfirm",
+            "dialog.cancel",
+            400.0f,
+            [&]() {
+                ImGui::Text("%s", jce_editor_i18n("assetBrowser.deleteDialogPrompt"));
+                if (s_assets.pending_delete_names.size() > 1)
+                    ImGui::Text("(%d %s)", (int)s_assets.pending_delete_names.size(),
+                                jce_editor_i18n("assetBrowser.items"));
                 ImGui::Spacing();
-                ImGui::PushStyleColor(ImGuiCol_Text, JCE_COLOR_TEXT_WARNING);
-                if (s_assets.pending_delete_dir_count == 1)
-                    ImGui::TextWrapped("%s", jce_editor_i18n("assetBrowser.deleteFolderWarningSingle"));
-                else
-                    ImGui::TextWrapped("%s: %d",
-                                       jce_editor_i18n("assetBrowser.deleteFolderWarningMulti"),
-                                       s_assets.pending_delete_dir_count);
-                ImGui::PopStyleColor();
-            }
-            ImGui::Spacing();
-            ImGui::Separator();
-            ImGui::Spacing();
-
-            const float btn_w = 120.0f;
-            const float btn_gap = ImGui::GetStyle().ItemSpacing.x;
-            const float total_btn_w = btn_w * 2.0f + btn_gap;
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - total_btn_w);
-
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.3f, 0.3f, 1.0f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.7f, 0.15f, 0.15f, 1.0f));
-            if (ImGui::Button(jce_editor_i18n("assetBrowser.deleteConfirm"), ImVec2(btn_w, 0))) {
-                for (size_t di = 0; di < s_assets.pending_delete_paths.size(); di++) {
-                    jce_fs_host_remove_recursive(s_assets.pending_delete_paths[di].c_str());
-                    jce_editor_console_log("Deleted '%s'",
-                        s_assets.pending_delete_names[di].c_str());
+                for (auto &name : s_assets.pending_delete_names)
+                    ImGui::TextWrapped("  %s", name.c_str());
+                if (s_assets.pending_delete_dir_count > 0) {
+                    ImGui::Spacing();
+                    ImGui::PushStyleColor(ImGuiCol_Text, JCE_COLOR_TEXT_WARNING);
+                    if (s_assets.pending_delete_dir_count == 1)
+                        ImGui::TextWrapped("%s", jce_editor_i18n("assetBrowser.deleteFolderWarningSingle"));
+                    else
+                        ImGui::TextWrapped("%s: %d",
+                                           jce_editor_i18n("assetBrowser.deleteFolderWarningMulti"),
+                                           s_assets.pending_delete_dir_count);
+                    ImGui::PopStyleColor();
                 }
-                s_assets.needs_refresh = true;
-                s_assets.selected_set.clear();
-                s_assets.last_clicked_idx = -1;
-                ImGui::CloseCurrentPopup();
-                s_assets.show_delete_dialog_open = false;
-            }
-            ImGui::PopStyleColor(3);
-            ImGui::SameLine();
+            });
 
-            if (ImGui::Button(jce_editor_i18n("dialog.cancel"), ImVec2(btn_w, 0))) {
-                ImGui::CloseCurrentPopup();
-                s_assets.show_delete_dialog_open = false;
+        if (r == jce_modal::CONFIRM) {
+            for (size_t di = 0; di < s_assets.pending_delete_paths.size(); di++) {
+                jce_fs_host_remove_recursive(s_assets.pending_delete_paths[di].c_str());
+                jce_editor_console_log("Deleted '%s'",
+                    s_assets.pending_delete_names[di].c_str());
             }
-            ImGui::EndPopup();
+            s_assets.needs_refresh = true;
+            s_assets.selected_set.clear();
+            s_assets.last_clicked_idx = -1;
         }
     }
 }

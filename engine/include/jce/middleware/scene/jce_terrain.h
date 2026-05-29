@@ -35,6 +35,7 @@
 JCE_EXTERN_C_BEGIN
 
 typedef struct JceTerrain JceTerrain;
+struct JcePakArchive;
 
 /* Vertex layout of generated chunk meshes:  (pos.xyz, normal.xyz, uv.xy) */
 typedef struct {
@@ -60,6 +61,15 @@ JceTerrain *jce_terrain_create(int width, int height,
                                float max_height, int chunk_size);
 
 JCE_API JceTerrain *jce_terrain_load_file(const char *meta_json_path);
+
+/* Same as jce_terrain_load_file but reads the meta JSON and its side-car .bin
+ * from a PAK archive (e.g. an embedded engine PAK with bundle overlays).
+ * `meta_vpath` is the asset path inside the PAK (e.g.
+ * "terrains/sample.terrain.json").  Returns NULL if the meta is not in the
+ * PAK (caller may then fall back to jce_terrain_load_file).  When the meta
+ * is present but the .bin is missing, an empty terrain is returned. */
+JCE_API JceTerrain *jce_terrain_load_from_pak(const struct JcePakArchive *pak,
+                                              const char *meta_vpath);
 bool        jce_terrain_save_file(const JceTerrain *t,
                                   const char *meta_json_path);
 

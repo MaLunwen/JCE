@@ -8,6 +8,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <jce/os/core/jce_str.h>
 
 typedef struct {
     char               name[64];      /* clip lookup key                  */
@@ -51,8 +52,7 @@ int jce_anim_blend_tree_add(JceAnimBlendTree *bt,
     if (bt->count >= bt->cap) return -1;
 
     BtEntry *e = &bt->entries[bt->count];
-    strncpy(e->name, clip_name, sizeof(e->name) - 1);
-    e->name[sizeof(e->name) - 1] = '\0';
+    jce_strlcpy(e->name, clip_name, sizeof(e->name));
     e->threshold = threshold;
     e->clip      = NULL;
 

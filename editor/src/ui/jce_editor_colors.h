@@ -143,4 +143,11 @@
 #define JCE_COL32_GRID_MAJOR  JCE_COLOR32(100, 100, 110, 255)
 #define JCE_COL32_SELECTION   JCE_COLOR32(255, 180,  50, 255)
 
+/* Semantic status colors (profiler bars, test runner badges, navmesh
+   walkable/blocked, toast accents, vfx graph nodes). Saturated so they
+   register on dark *and* light themes without further tinting. */
+#define JCE_COL32_STATUS_OK    JCE_COLOR32( 80, 200, 120, 255)
+#define JCE_COL32_STATUS_WARN  JCE_COLOR32(240, 180,  60, 255)
+#define JCE_COL32_STATUS_ERR   JCE_COLOR32(220,  80,  80, 255)
+
 #endif /* JCE_EDITOR_COLORS_H */

@@ -20,6 +20,11 @@ JCE_EXTERN_C_BEGIN
 /* Case-insensitive strcmp.  Returns 0 if equal, <0 / >0 like strcmp. */
 JCE_API int JCE_CALL jce_strcasecmp(const char *a, const char *b);
 
+/* Heap-allocated copy of `s` using the engine allocator (JCE_MALLOC).
+   Returns NULL when `s` is NULL or allocation fails.  Free with JCE_FREE.
+   Centralizes the strdup/_strdup naming fork. */
+JCE_API char *JCE_CALL jce_strdup(const char *s);
+
 /* Bounded copy with guaranteed NUL termination when n > 0.
    Returns the length of the source string (not the number of bytes
    written), matching BSD strlcpy semantics. */

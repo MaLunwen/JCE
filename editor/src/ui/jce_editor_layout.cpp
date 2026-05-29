@@ -64,6 +64,7 @@ static bool s_show_build       = false;
 static bool s_show_bundles     = false;
 static bool s_show_proj_settings = false;
 static bool s_show_preferences = false;
+static bool s_show_welcome     = true;  /* shown at startup; auto-closes if a project is already loaded */
 static int  s_unsaved_result   = 0;
 static bool s_quit_after_save_as = false;
 static bool s_quit_confirmed = false;
@@ -267,6 +268,12 @@ static void cmd_save_scene_(void)        { save_scene_or_open_save_as(); }
 static void cmd_save_scene_as_(void)     { s_show_save_as = true; }
 static void cmd_new_project_(void)       { s_show_new_project = true; }
 static void cmd_open_project_(void)      { s_show_open_project = true; }
+
+/* Public entry points for the Welcome screen. */
+extern "C" void jce_editor_layout_request_new_project(void)
+    { s_show_new_project = true; }
+extern "C" void jce_editor_layout_request_open_project(void)
+    { s_show_open_project = true; }
 static void cmd_build_settings_(void)    { s_show_build = true; }
 static void cmd_build_bundles_(void)     { s_show_bundles = true; }
 static void cmd_pack_current_scene_(void) {
@@ -355,7 +362,7 @@ static const PaletteCmd s_palette_cmds[] = {
     { "edit.undo",           "Undo",                        "Edit",      cmd_undo_ },
     { "edit.redo",           "Redo",                        "Edit",      cmd_redo_ },
     { "edit.settings",       "Editor Settings\u2026",       "Edit",      cmd_settings_ },
-    { "edit.project_settings","Project Settings\u2026",     "Edit",      cmd_proj_settings_ },
+    { "edit.project_settings","Project Settings\u2026",     "File",      cmd_proj_settings_ },
     /* Create */
     { "create.empty",        "Create Empty",                "Create",    cmd_create_empty_ },
     { "create.cube",         "Create Cube",                 "Create",    cmd_create_cube_ },
@@ -795,8 +802,8 @@ static void draw_menu_bar(void)
             bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_USER_PREFERENCES);
             if (vis) *vis = true;
         }
-        if (ImGui::MenuItem(jce_editor_i18n("menu.edit.projectSettings")))
-            s_show_proj_settings = true;
+        /* Project Settings moved to File menu (Ctrl+Shift+P) to match
+         * Unity / Unreal convention; do not duplicate here. */
         ImGui::Separator();
         if (ImGui::MenuItem(jce_editor_i18n("shaders.reload"), "F5")) {
             jce_editor_reload_shaders();
@@ -2180,10 +2187,7 @@ static void draw_status_bar(void)
         ? scene_path
         : jce_editor_i18n("statusBar.untitled");
     /* Show only basename if it looks like a path. */
-    const char *slash = strrchr(scene_name, '/');
-    const char *bslash = strrchr(scene_name, '\\');
-    if (bslash && bslash > slash) slash = bslash;
-    if (slash) scene_name = slash + 1;
+    scene_name = jce_editor_path_basename_view(scene_name);
 
     ImGui::Text("%s %s", jce_editor_i18n("statusBar.scene"), scene_name);
     if (jce_state_is_scene_modified()) {
@@ -2429,6 +2433,7 @@ void jce_editor_layout_draw(void)
     jce_editor_inspector_delete_dialog();
     jce_editor_dialog_new_project(&s_show_new_project);
     jce_editor_dialog_open_project(&s_show_open_project);
+    jce_editor_dialog_welcome(&s_show_welcome);
     jce_editor_dialog_new_scene(&s_show_new_scene);
     jce_editor_dialog_open_scene(&s_show_open_scene);
     jce_editor_dialog_open_bundle(&s_show_open_bundle);

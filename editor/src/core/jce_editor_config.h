@@ -86,6 +86,18 @@ typedef struct {
        jce_workspace_init() and rewritten whenever the user switches
        workspace via the menu-bar dropdown or Ctrl+F1..F7. */
     char workspace_id[32];
+
+    /* Project root for the Build Profiles panel.  Empty = use editor's
+     * cwd.  Picked via the panel's "Browse…" button (a file picker for
+     * CMakePresets.json — its parent directory is stored here).
+     * Used as the working_directory for spawned cmake / conan tools. */
+    char build_project_root[512];
+
+    /* Asset Browser "Locations" favourites — user-pinned folders shown
+     * in the left sidebar above the project tree.  Persisted so the
+     * user's curated quick-access list survives editor restarts. */
+    char asset_favorites[12][512];
+    int  asset_favorite_count;
 } JceEditorConfig;
 
 /* Load config from .jce/editor-config.json. Returns false if not found. */
@@ -105,6 +117,10 @@ void jce_editor_config_add_recent(JceEditorConfig *cfg, const char *path);
 
 /* Add a path to recent scenes (front of list, deduped, max 10). */
 void jce_editor_config_add_recent_scene(JceEditorConfig *cfg, const char *path);
+
+/* Asset Browser favourites helpers — dedupe-aware, max 12.  Idempotent. */
+bool jce_editor_config_add_favorite(JceEditorConfig *cfg, const char *path);
+bool jce_editor_config_remove_favorite(JceEditorConfig *cfg, const char *path);
 
 /* Cached input preference flags — kept in sync by load/save.
    Read directly by scene/particle viewport input handlers (avoids

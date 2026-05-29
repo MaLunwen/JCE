@@ -322,11 +322,7 @@ static bool is_json_asset(const char *path)
 
 static const char *path_leaf(const char *path)
 {
-    if (!path) return "";
-    const char *slash = strrchr(path, '/');
-    const char *bsl   = strrchr(path, '\\');
-    const char *p = slash > bsl ? slash : bsl;
-    return p ? p + 1 : path;
+    return jce_editor_path_basename_view(path);
 }
 
 static void json_collect_names(const JceJson *node, std::vector<std::string> *out,

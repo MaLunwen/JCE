@@ -3,6 +3,7 @@
  */
 
 #include "jce_panel_hierarchy_internal.h"
+#include "ui/jce_editor_dnd.h"
 
 extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
@@ -488,7 +489,7 @@ void draw_entity_node(uint32_t id)
     }
 
     if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
-        ImGui::SetDragDropPayload("JCE_ENTITY", &id, sizeof(uint32_t));
+        ImGui::SetDragDropPayload(JCE_DND_ENTITY, &id, sizeof(uint32_t));
         if (jce_state_is_selected(id)) {
             int sel_n = 0;
             jce_state_get_selection(&sel_n);
@@ -503,7 +504,7 @@ void draw_entity_node(uint32_t id)
     }
 
     if (ImGui::BeginDragDropTarget()) {
-        const ImGuiPayload *payload = ImGui::AcceptDragDropPayload("JCE_ENTITY");
+        const ImGuiPayload *payload = ImGui::AcceptDragDropPayload(JCE_DND_ENTITY);
         if (payload) {
             uint32_t dragged_id = *(uint32_t *)payload->Data;
             if (jce_state_is_selected(dragged_id)) {
@@ -537,7 +538,7 @@ void draw_entity_node(uint32_t id)
                 ImVec2(p0.x, p0.y + 1), ImVec2(p1.x, p0.y + 1),
                 IM_COL32(100, 160, 255, 200), 2.0f);
 
-            const ImGuiPayload *payload = ImGui::AcceptDragDropPayload("JCE_ENTITY");
+            const ImGuiPayload *payload = ImGui::AcceptDragDropPayload(JCE_DND_ENTITY);
             if (payload) {
                 uint32_t dragged_id = *(uint32_t *)payload->Data;
                 if (jce_state_is_selected(dragged_id)) {

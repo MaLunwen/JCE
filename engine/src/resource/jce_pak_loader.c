@@ -35,6 +35,12 @@ struct JcePakArchive {
     int            owns_blob;   /* 1 => blob was malloc'd; free on close*/
     ZSTD_DCtx     *dctx;        /* reusable decompression context      */
     SDL_AtomicInt  refcount;    /* shared-ownership counter (>=1 while alive) */
+    /* Overlay chain: when a path misses in *this* archive jce_pak_find()
+     * walks `overlay_next` (lower priority).  Used by the runtime to
+     * stack project bundles on top of the engine PAK so that all engine
+     * subsystems (skybox, audio, scene_renderer fallback, asset_manager)
+     * transparently see bundle contents without any per-call cb wiring. */
+    struct JcePakArchive *overlay_next;
 };
 
 /* ================================================================== */
@@ -226,7 +232,12 @@ JcePakArchive *jce_pak_open_file(const char *path) {
 /* ================================================================== */
 
 const JcePakAsset *jce_pak_find(const JcePakArchive *pak, const char *path) {
-    if (!pak || !path || pak->count == 0) return NULL;
+    if (!pak || !path || pak->count == 0) {
+        /* Empty/null base may still have overlays. */
+        if (pak && pak->overlay_next && path)
+            return jce_pak_find(pak->overlay_next, path);
+        return NULL;
+    }
 
     uint64_t hash = XXH3_64bits(path, strlen(path));
 
@@ -246,7 +257,44 @@ const JcePakAsset *jce_pak_find(const JcePakArchive *pak, const char *path) {
             return &pak->assets[i];
     }
 
+    /* Miss in this archive — walk overlay chain (lower priority). */
+    if (pak->overlay_next)
+        return jce_pak_find(pak->overlay_next, path);
+
     return NULL;
+}
+
+/* ================================================================== */
+/* jce_pak_overlay_push / _remove                                      */
+/* ================================================================== */
+/* Append `layer` to the END of `base`'s overlay chain so newly-pushed
+ * layers have the LOWEST priority — engine PAK content always wins for
+ * a path, bundle content fills the gaps.  Caller retains ownership of
+ * both archives; nothing is acquired/released here. */
+
+void jce_pak_overlay_push(JcePakArchive *base, JcePakArchive *layer) {
+    if (!base || !layer || base == layer) return;
+    /* Prevent cycles by walking the layer's existing chain first. */
+    for (JcePakArchive *p = layer; p; p = p->overlay_next) {
+        if (p == base) return; /* would form a cycle */
+    }
+    JcePakArchive *tail = base;
+    while (tail->overlay_next) {
+        if (tail->overlay_next == layer) return; /* already attached */
+        tail = tail->overlay_next;
+    }
+    tail->overlay_next = layer;
+}
+
+void jce_pak_overlay_remove(JcePakArchive *base, JcePakArchive *layer) {
+    if (!base || !layer) return;
+    JcePakArchive *prev = base;
+    while (prev->overlay_next && prev->overlay_next != layer)
+        prev = prev->overlay_next;
+    if (prev->overlay_next == layer) {
+        prev->overlay_next = layer->overlay_next;
+        layer->overlay_next = NULL;
+    }
 }
 
 /* ================================================================== */

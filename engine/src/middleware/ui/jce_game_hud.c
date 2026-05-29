@@ -17,6 +17,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <jce/os/core/jce_str.h>
 
 #define LOG_TAG "game_hud"
 
@@ -80,16 +81,14 @@ void jce_game_hud_set_state(JceGameHud *h, const JceGameHudState *st)
     h->state = *st;
     /* Snapshot strings into internal buffers — caller may overwrite. */
     if (st->weapon_name) {
-        strncpy(h->weapon_name_buf, st->weapon_name, sizeof(h->weapon_name_buf) - 1);
-        h->weapon_name_buf[sizeof(h->weapon_name_buf)-1] = 0;
+        jce_strlcpy(h->weapon_name_buf, st->weapon_name, sizeof(h->weapon_name_buf));
         h->state.weapon_name = h->weapon_name_buf;
     } else {
         h->weapon_name_buf[0] = 0;
         h->state.weapon_name = h->weapon_name_buf;
     }
     if (st->objective) {
-        strncpy(h->objective_buf, st->objective, sizeof(h->objective_buf) - 1);
-        h->objective_buf[sizeof(h->objective_buf)-1] = 0;
+        jce_strlcpy(h->objective_buf, st->objective, sizeof(h->objective_buf));
         h->state.objective = h->objective_buf;
     } else {
         h->objective_buf[0] = 0;
@@ -110,8 +109,7 @@ void jce_game_hud_show_pickup(JceGameHud *h, const char *label, float seconds)
     if (!h || !label) return;
     for (int i = 0; i < MAX_PICKUPS; i++) {
         if (!h->pickups[i].used) {
-            strncpy(h->pickups[i].text, label, sizeof(h->pickups[i].text) - 1);
-            h->pickups[i].text[sizeof(h->pickups[i].text)-1] = 0;
+            jce_strlcpy(h->pickups[i].text, label, sizeof(h->pickups[i].text));
             h->pickups[i].age      = 0.0f;
             h->pickups[i].lifetime = seconds > 0.0f ? seconds : 2.5f;
             h->pickups[i].used     = true;
@@ -123,8 +121,7 @@ void jce_game_hud_show_pickup(JceGameHud *h, const char *label, float seconds)
     for (int i = 0; i < MAX_PICKUPS; i++) {
         if (h->pickups[i].age > oldest_age) { oldest_age = h->pickups[i].age; oldest = i; }
     }
-    strncpy(h->pickups[oldest].text, label, sizeof(h->pickups[oldest].text) - 1);
-    h->pickups[oldest].text[sizeof(h->pickups[oldest].text)-1] = 0;
+    jce_strlcpy(h->pickups[oldest].text, label, sizeof(h->pickups[oldest].text));
     h->pickups[oldest].age      = 0.0f;
     h->pickups[oldest].lifetime = seconds > 0.0f ? seconds : 2.5f;
     h->pickups[oldest].used     = true;

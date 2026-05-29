@@ -2,10 +2,79 @@
 #
 # "Caged Kingdom" — sandbox game project built on top of JCE engine.
 #
-# Standalone mode:  SDL3 callback executable  (desktop / iOS / Web)
-# JNI mode:         shared library            (Android / host-JNI)
+# Two build modes:
+#
+#   1. In-tree:  added via add_subdirectory() from the JCE root build.
+#                Inherits JCE_BUILD_VARIANT, GAME_PAK_FILE, etc.; supports
+#                Android / JNI / Web / iOS variants and embedded PAK blobs.
+#
+#   2. Standalone (SDK consumer mode):  configured directly via
+#                `cmake -S caged_kingdom -B build -G Ninja
+#                  -DJCE_DIR=<sdk>/lib/cmake/JCE`.
+#                Uses find_package(JCE) and a stub empty-PAK translation
+#                unit so the engine links cleanly.  Runtime asset loading
+#                will fail (no real PAK shipped) — this mode dogfoods
+#                the SDK link-surface only.
 
 # ------------------------------------------------------------------ #
+# Standalone branch                                                   #
+# ------------------------------------------------------------------ #
+
+if(NOT DEFINED JCE_BUILD_VARIANT)
+	cmake_minimum_required(VERSION 3.20)
+	project(CagedKingdom C)
+
+	find_package(JCE REQUIRED)
+
+	file(GLOB_RECURSE CK_SOURCES CONFIGURE_DEPENDS
+		"${CMAKE_CURRENT_SOURCE_DIR}/src/*.c")
+
+	add_executable(CagedKingdom ${CK_SOURCES})
+	set_target_properties(CagedKingdom PROPERTIES OUTPUT_NAME caged_kingdom)
+
+	target_compile_definitions(CagedKingdom PRIVATE SDL_MAIN_USE_CALLBACKS=1)
+	target_include_directories(CagedKingdom PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/src")
+	target_link_libraries(CagedKingdom PRIVATE JCE::JCE)
+
+	# ---- Game asset PAK ------------------------------------------- #
+	# Use jce_target_embed_pak() from the SDK if jce_pak shipped AND
+	# the resource tree exists; otherwise emit a stub blob so the
+	# linker is satisfied (engine reports "no PAK" at boot).
+	set(_ck_res "${CMAKE_CURRENT_SOURCE_DIR}/resources/assets")
+	set(_ck_ui  "${CMAKE_CURRENT_SOURCE_DIR}/ui")
+	set(_ck_dirs)
+	if(IS_DIRECTORY "${_ck_res}")
+		list(APPEND _ck_dirs "${_ck_res}")
+	endif()
+	if(IS_DIRECTORY "${_ck_ui}")
+		list(APPEND _ck_dirs "${_ck_ui}")
+	endif()
+	if(JCE_PAK_EXECUTABLE AND _ck_dirs
+	   AND COMMAND jce_target_embed_pak)
+		jce_target_embed_pak(CagedKingdom
+			RESOURCE_DIRS ${_ck_dirs})
+	else()
+		set(_stub "${CMAKE_CURRENT_BINARY_DIR}/jce_stub_pak.c")
+		file(WRITE "${_stub}"
+"#include <stddef.h>\n"
+"const unsigned char assets_pak_data[1] = {0};\n"
+"const size_t        assets_pak_data_size = 0;\n")
+		target_sources(CagedKingdom PRIVATE "${_stub}")
+	endif()
+
+	if(WIN32 AND CMAKE_BUILD_TYPE STREQUAL "Dist")
+		set_target_properties(CagedKingdom PROPERTIES WIN32_EXECUTABLE TRUE)
+	endif()
+
+	install(TARGETS CagedKingdom DESTINATION bin)
+	return()
+endif()
+
+# ------------------------------------------------------------------ #
+# In-tree branch (original behaviour)                                 #
+# ------------------------------------------------------------------ #
+
 # Source files                                                        #
 # ------------------------------------------------------------------ #
 
@@ -264,4 +333,11 @@ endif()
 # Install                                                             #
 # ------------------------------------------------------------------ #
 
-install(TARGETS CagedKingdom DESTINATION bin)
+# The in-tree caged_kingdom binary is a sample — it must NOT end up in
+# the JCE SDK install tree (that would bloat <sdk>/bin/ with a 100 MB+
+# executable that's not part of the SDK contract).  Standalone-mode
+# builds (the SDK-consumer dogfood) still install via the early return
+# branch above.
+if(NOT JCE_ENABLE_SDK_INSTALL)
+	install(TARGETS CagedKingdom DESTINATION bin)
+endif()

@@ -349,28 +349,36 @@ bool jce_run_manager_start(const JceRunConfig *cfg)
 
     /* Always try to refresh the game PAK before launching so the
      * external ck.exe sees designer edits without a manual CLI step.
-     * Skip if no preset is configured or another build is already in
-     * flight — fall through to launching with the existing PAK in
-     * those cases (with a warning). */
+     * Two trigger modes:
+     *   1. Engine workspace + configured build preset (legacy CK path).
+     *   2. An editor project is open — build_manager dispatches
+     *      scripts/build-project.bat against the project root.
+     * Skip if another build is already in flight; fall through to
+     * launching with the existing artefacts in that case. */
     JceEditorConfig ecfg{};
     bool have_preset = jce_editor_config_load(&ecfg) &&
                        ecfg.build_preset[0] != '\0';
-    if (have_preset && !jce_build_manager_is_running()) {
-        if (jce_build_manager_repack_game_assets(ecfg.build_preset)) {
+    extern char s_current_project_root[512]; /* dialog_project.cpp */
+    bool have_project = s_current_project_root[0] != '\0';
+    if ((have_preset || have_project) && !jce_build_manager_is_running()) {
+        const char *preset_arg = have_preset ? ecfg.build_preset : "";
+        if (jce_build_manager_repack_game_assets(preset_arg)) {
             g_run.pending_cfg     = *cfg;
             g_run.has_pending     = true;
-            g_run.pending_preset  = ecfg.build_preset;
+            g_run.pending_preset  = have_preset
+                                        ? std::string(ecfg.build_preset)
+                                        : std::string("project");
             g_run.state           = JCE_RUN_BUILDING;
             g_run.exit_code       = 0;
             g_run.last_error.clear();
             log_line(JCE_CONSOLE_INFO,
-                     std::string("[run] auto-repacking assets before launch "
-                                 "(preset: ") + g_run.pending_preset + ")");
+                     std::string("[run] auto-repacking assets before launch (") +
+                     g_run.pending_preset + ")");
             return true;
         }
         log_line(JCE_CONSOLE_WARNING,
                  "[run] asset repack spawn failed; launching with existing PAK");
-    } else if (have_preset) {
+    } else if (have_preset || have_project) {
         log_line(JCE_CONSOLE_WARNING,
                  "[run] build in progress; launching with existing PAK");
     }

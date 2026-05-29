@@ -41,6 +41,7 @@ extern "C" {
 #include <jce/api_graphics.h>
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_str.h>
+#include <jce/os/core/jce_toolchain.h>
 #include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_renderer_caps.h>
 }
@@ -188,6 +189,18 @@ void load_from_disk()
                                    0, STARTUP_COUNT - 1);
     s_prefs.recent_max = clamp_int(jce_json_get_int(root, "recent_max", s_prefs.recent_max),
                                    1, 20);
+
+    /* Toolchain overrides (P6).  Keyed by canonical kind name. */
+    JceJson *tc = jce_json_get(root, "toolchain_overrides");
+    if (tc && jce_json_is_object(tc)) {
+        for (int i = 0; i < JCE_TOOLCHAIN_COUNT; ++i) {
+            const char *k = jce_toolchain_kind_name((JceToolchainKind)i);
+            const char *p = jce_json_get_string(tc, k, "");
+            if (p && p[0]) {
+                jce_toolchain_set_override((JceToolchainKind)i, p);
+            }
+        }
+    }
     jce_json_free(root);
 }
 
@@ -202,6 +215,22 @@ void save_to_disk()
     jce_json_set_int   (root, "autosave",   s_prefs.autosave);
     jce_json_set_int   (root, "startup",    s_prefs.startup);
     jce_json_set_int   (root, "recent_max", s_prefs.recent_max);
+
+    /* Toolchain overrides: only persist kinds the user actually set
+     * (non-empty path & from_override flag). */
+    JceJson *tc = jce_json_object();
+    if (tc) {
+        for (int i = 0; i < JCE_TOOLCHAIN_COUNT; ++i) {
+            const JceToolchain *t = jce_toolchain_get((JceToolchainKind)i);
+            if (t && t->from_override && t->path[0]) {
+                jce_json_set_string(tc,
+                    jce_toolchain_kind_name((JceToolchainKind)i),
+                    t->path);
+            }
+        }
+        jce_json_set_child(root, "toolchain_overrides", tc);
+    }
+
     jce_json_write_file(PREFS_PATH, root, /*pretty=*/true,
                         /*take_ownership=*/true);
 }
@@ -562,6 +591,101 @@ void draw_tab_paths()
     if (cfg_dirty) jce_editor_config_save(&s_cfg);
 }
 
+void draw_tab_toolchains()
+{
+    /* Localised display names for each kind. */
+    static const char *const k_titles[JCE_TOOLCHAIN_COUNT] = {
+        "CMake", "Ninja", "MSVC (Visual Studio)", "GCC", "Clang",
+        "Android NDK", "Emscripten SDK", "Xcode"
+    };
+
+    ImGui::TextWrapped("%s",
+        jce_editor_i18n_or("panel.preferences.toolchains.hint",
+            "Toolchains the editor detected on this machine. "
+            "Override a path manually if auto-detection picked the wrong one."));
+
+    if (ImGui::Button(jce_editor_i18n_or(
+            "panel.preferences.toolchains.refresh", "Re-detect"))) {
+        jce_toolchain_refresh();
+    }
+    ImGui::Separator();
+
+    const ImGuiTableFlags tflags =
+        ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+        ImGuiTableFlags_SizingStretchProp;
+
+    if (!ImGui::BeginTable("##tc_table", 4, tflags))
+        return;
+    ImGui::TableSetupColumn("Tool",     ImGuiTableColumnFlags_WidthStretch, 0.18f);
+    ImGui::TableSetupColumn("Status",   ImGuiTableColumnFlags_WidthStretch, 0.10f);
+    ImGui::TableSetupColumn("Version",  ImGuiTableColumnFlags_WidthStretch, 0.15f);
+    ImGui::TableSetupColumn("Path / override",
+                                        ImGuiTableColumnFlags_WidthStretch, 0.57f);
+    ImGui::TableHeadersRow();
+
+    /* Per-kind input buffer cache.  Initialised lazily from current
+     * toolchain path so the user sees the existing override / detected
+     * path and can edit it in place. */
+    static char  s_buf[JCE_TOOLCHAIN_COUNT][JCE_TOOLCHAIN_PATH_MAX] = {{0}};
+    static bool  s_buf_init = false;
+    if (!s_buf_init) {
+        for (int i = 0; i < JCE_TOOLCHAIN_COUNT; ++i) {
+            const JceToolchain *t = jce_toolchain_get((JceToolchainKind)i);
+            if (t && t->from_override) {
+                std::snprintf(s_buf[i], sizeof s_buf[i], "%s", t->path);
+            }
+        }
+        s_buf_init = true;
+    }
+
+    for (int i = 0; i < JCE_TOOLCHAIN_COUNT; ++i) {
+        const JceToolchain *t = jce_toolchain_get((JceToolchainKind)i);
+        if (!t) continue;
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::TextUnformatted(k_titles[i]);
+
+        ImGui::TableSetColumnIndex(1);
+        if (t->present) {
+            ImVec4 col = t->from_override
+                ? ImVec4(0.4f, 0.7f, 1.0f, 1.0f)
+                : ImVec4(0.4f, 0.9f, 0.4f, 1.0f);
+            ImGui::TextColored(col, t->from_override ? "override" : "OK");
+        } else {
+            ImGui::TextColored(ImVec4(0.9f, 0.5f, 0.5f, 1.0f), "missing");
+        }
+
+        ImGui::TableSetColumnIndex(2);
+        ImGui::TextUnformatted(t->version[0] ? t->version : "-");
+
+        ImGui::TableSetColumnIndex(3);
+        ImGui::PushID(i);
+        ImGui::SetNextItemWidth(-1.0f);
+        char label[64];
+        std::snprintf(label, sizeof label, "##tcpath_%d", i);
+        if (ImGui::InputTextWithHint(label, t->path,
+                                     s_buf[i], sizeof s_buf[i],
+                                     ImGuiInputTextFlags_EnterReturnsTrue)) {
+            jce_toolchain_set_override((JceToolchainKind)i, s_buf[i]);
+            save_to_disk();
+        }
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            jce_toolchain_set_override((JceToolchainKind)i, s_buf[i]);
+            save_to_disk();
+        }
+        if (t->from_override) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("X")) {
+                s_buf[i][0] = 0;
+                jce_toolchain_set_override((JceToolchainKind)i, NULL);
+                save_to_disk();
+            }
+        }
+        ImGui::PopID();
+    }
+    ImGui::EndTable();
+}
+
 void draw_tab_hotkeys()
 {
     static char s_filter[64] = {0};
@@ -777,6 +901,7 @@ extern "C" void jce_editor_panel_user_preferences(void)
             { 4, "panel.preferences.tab.input"      },
             { 5, "panel.preferences.tab.paths"      },
             { 6, "panel.preferences.tab.hotkeys"    },
+            { 7, "panel.preferences.tab.toolchains" },
         };
         for (const auto &t : kTabs) {
             bool sel = (s_active_tab == t.id);
@@ -796,6 +921,7 @@ extern "C" void jce_editor_panel_user_preferences(void)
         case 4: draw_tab_input();      break;
         case 5: draw_tab_paths();      break;
         case 6: draw_tab_hotkeys();    break;
+        case 7: draw_tab_toolchains(); break;
         default: break;
         }
         ImGui::EndChild();

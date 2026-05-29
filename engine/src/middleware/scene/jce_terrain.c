@@ -6,6 +6,7 @@
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/resource/jce_pak_loader.h>
 
 #include "os/core/jce_memory.h"
 
@@ -177,6 +178,64 @@ bool jce_terrain_save_file(const JceTerrain *t, const char *meta_json_path)
     return ok;
 }
 
+/* Build a terrain from already-parsed meta JSON.  On success, *out_bin_leaf
+ * holds the side-car .bin leaf name (caller resolves how to load it).
+ * Returns NULL on bad meta. */
+static JceTerrain *terrain_from_meta_json(JceJson *root, char *out_bin_leaf,
+                                          size_t out_bin_cap)
+{
+    if (!root) return NULL;
+    int   w  = jce_json_get_int   (root, "width",  0);
+    int   h  = jce_json_get_int   (root, "height", 0);
+    float wx = (float)jce_json_get_number(root, "world_size_x", 100.0);
+    float wz = (float)jce_json_get_number(root, "world_size_z", 100.0);
+    float mh = (float)jce_json_get_number(root, "max_height",    20.0);
+    int   cs = jce_json_get_int   (root, "chunk_size", 32);
+    const char *bin_leaf = jce_json_get_string(root, "bin", "");
+    if (out_bin_leaf && out_bin_cap) {
+        snprintf(out_bin_leaf, out_bin_cap, "%s", bin_leaf ? bin_leaf : "");
+    }
+    if (w < 2 || h < 2) {
+        LOG_WARN("terrain", "invalid dims %dx%d", w, h);
+        return NULL;
+    }
+    return jce_terrain_create(w, h, wx, wz, mh, cs);
+}
+
+/* Parse a .bin payload into an already-created terrain.  Returns true on
+ * success.  On any error (header mismatch / truncation) the terrain is left
+ * with its current (zeroed) heightmap/splat. */
+static bool terrain_decode_bin(JceTerrain *t, const uint8_t *buf, size_t got,
+                               const char *diag_path)
+{
+    if (!t || !buf) return false;
+    int w = t->w, h = t->h;
+    size_t expected = sizeof(uint32_t) * 2 + sizeof(int32_t) * 2
+                       + (size_t)w * (size_t)h * (sizeof(float) + sizeof(uint32_t));
+    if (got < expected) {
+        LOG_WARN("terrain", "bin truncated: %s (got %zu, want %zu)",
+                 diag_path ? diag_path : "<pak>", got, expected);
+        return false;
+    }
+    uint32_t magic = 0, version = 0;
+    int32_t  iw = 0, ih = 0;
+    size_t   off = 0;
+    memcpy(&magic,   buf + off, sizeof(magic));   off += sizeof(magic);
+    memcpy(&version, buf + off, sizeof(version)); off += sizeof(version);
+    memcpy(&iw,      buf + off, sizeof(iw));      off += sizeof(iw);
+    memcpy(&ih,      buf + off, sizeof(ih));      off += sizeof(ih);
+    if (magic != TERRAIN_MAGIC || version != TERRAIN_BIN_VERSION
+        || iw != w || ih != h) {
+        LOG_WARN("terrain", "bin header mismatch: %s",
+                 diag_path ? diag_path : "<pak>");
+        return false;
+    }
+    size_t n = (size_t)w * (size_t)h;
+    memcpy(t->heights, buf + off, sizeof(float)    * n); off += sizeof(float)    * n;
+    memcpy(t->splat,   buf + off, sizeof(uint32_t) * n);
+    return true;
+}
+
 JceTerrain *jce_terrain_load_file(const char *meta_json_path)
 {
     if (!meta_json_path) return NULL;
@@ -185,15 +244,13 @@ JceTerrain *jce_terrain_load_file(const char *meta_json_path)
         LOG_WARN("terrain", "failed to parse %s", meta_json_path);
         return NULL;
     }
-    int   w  = jce_json_get_int   (root, "width",  0);
-    int   h  = jce_json_get_int   (root, "height", 0);
-    float wx = (float)jce_json_get_number(root, "world_size_x", 100.0);
-    float wz = (float)jce_json_get_number(root, "world_size_z", 100.0);
-    float mh = (float)jce_json_get_number(root, "max_height",    20.0);
-    int   cs = jce_json_get_int   (root, "chunk_size", 32);
-    const char *bin_leaf = jce_json_get_string(root, "bin", "");
+    char bin_leaf[512] = {0};
+    JceTerrain *t = terrain_from_meta_json(root, bin_leaf, sizeof bin_leaf);
+    jce_json_free(root);
+    if (!t) return NULL;
+
     char bin_path[1024];
-    if (bin_leaf && bin_leaf[0]) {
+    if (bin_leaf[0]) {
         /* Resolve next to the meta file. */
         size_t plen = strlen(meta_json_path);
         size_t cut  = plen;
@@ -208,46 +265,75 @@ JceTerrain *jce_terrain_load_file(const char *meta_json_path)
     } else {
         make_bin_path(meta_json_path, bin_path, sizeof(bin_path));
     }
-    jce_json_free(root);
 
-    if (w < 2 || h < 2) {
-        LOG_WARN("terrain", "invalid dims %dx%d", w, h);
-        return NULL;
-    }
-    JceTerrain *t = jce_terrain_create(w, h, wx, wz, mh, cs);
-    if (!t) return NULL;
-
-    size_t  expected = sizeof(uint32_t) * 2 + sizeof(int32_t) * 2
-                       + (size_t)w * (size_t)h * (sizeof(float) + sizeof(uint32_t));
-    uint64_t got     = 0;
-    uint8_t *buf     = (uint8_t *)jce_fs_host_read_all(bin_path, &got);
+    uint64_t got = 0;
+    uint8_t *buf = (uint8_t *)jce_fs_host_read_all(bin_path, &got);
     if (!buf) {
         LOG_WARN("terrain", "no side-car bin: %s", bin_path);
         return t;
     }
-    if (got < expected) {
-        LOG_WARN("terrain", "bin truncated: %s (got %zu, want %zu)",
-                 bin_path, got, expected);
-        JCE_FREE(buf);
-        return t;
-    }
-    uint32_t magic = 0, version = 0;
-    int32_t  iw = 0, ih = 0;
-    size_t   off = 0;
-    memcpy(&magic,   buf + off, sizeof(magic));   off += sizeof(magic);
-    memcpy(&version, buf + off, sizeof(version)); off += sizeof(version);
-    memcpy(&iw,      buf + off, sizeof(iw));      off += sizeof(iw);
-    memcpy(&ih,      buf + off, sizeof(ih));      off += sizeof(ih);
-    if (magic != TERRAIN_MAGIC || version != TERRAIN_BIN_VERSION
-        || iw != w || ih != h) {
-        LOG_WARN("terrain", "bin header mismatch: %s", bin_path);
-        JCE_FREE(buf);
-        return t;
-    }
-    size_t n = (size_t)w * (size_t)h;
-    memcpy(t->heights, buf + off, sizeof(float)    * n); off += sizeof(float)    * n;
-    memcpy(t->splat,   buf + off, sizeof(uint32_t) * n);
+    (void)terrain_decode_bin(t, buf, (size_t)got, bin_path);
     JCE_FREE(buf);
+    return t;
+}
+
+JceTerrain *jce_terrain_load_from_pak(const struct JcePakArchive *pak,
+                                      const char *meta_vpath)
+{
+    if (!pak || !meta_vpath || !*meta_vpath) return NULL;
+
+    const JcePakAsset *meta_asset = jce_pak_find(pak, meta_vpath);
+    if (!meta_asset) return NULL;
+
+    /* Decode the meta JSON entry. */
+    void *meta_buf = JCE_MALLOC((size_t)meta_asset->original_size + 1);
+    if (!meta_buf) return NULL;
+    size_t mn = jce_pak_decompress_ex(pak, meta_asset, meta_buf,
+                                       (size_t)meta_asset->original_size);
+    if (mn == 0) { JCE_FREE(meta_buf); return NULL; }
+    ((char *)meta_buf)[mn] = '\0';
+
+    JceJson *root = jce_json_parse((const char *)meta_buf, mn);
+    JCE_FREE(meta_buf);
+    if (!root) {
+        LOG_WARN("terrain", "pak meta parse failed: %s", meta_vpath);
+        return NULL;
+    }
+    char bin_leaf[512] = {0};
+    JceTerrain *t = terrain_from_meta_json(root, bin_leaf, sizeof bin_leaf);
+    jce_json_free(root);
+    if (!t) return NULL;
+
+    /* Resolve the .bin sibling inside the PAK. */
+    char bin_vpath[1024];
+    if (bin_leaf[0]) {
+        size_t plen = strlen(meta_vpath);
+        size_t cut  = plen;
+        for (size_t i = plen; i > 0; --i) {
+            char c = meta_vpath[i - 1];
+            if (c == '/' || c == '\\') { cut = i; break; }
+            if (i == 1) cut = 0;
+        }
+        if (cut > sizeof(bin_vpath) - 1) cut = sizeof(bin_vpath) - 1;
+        memcpy(bin_vpath, meta_vpath, cut);
+        snprintf(bin_vpath + cut, sizeof(bin_vpath) - cut, "%s", bin_leaf);
+    } else {
+        make_bin_path(meta_vpath, bin_vpath, sizeof(bin_vpath));
+    }
+
+    const JcePakAsset *bin_asset = jce_pak_find(pak, bin_vpath);
+    if (!bin_asset) {
+        LOG_WARN("terrain", "no side-car bin in pak: %s", bin_vpath);
+        return t;
+    }
+    void *bin_buf = JCE_MALLOC((size_t)bin_asset->original_size);
+    if (!bin_buf) return t;
+    size_t bn = jce_pak_decompress_ex(pak, bin_asset, bin_buf,
+                                       (size_t)bin_asset->original_size);
+    if (bn) {
+        (void)terrain_decode_bin(t, (const uint8_t *)bin_buf, bn, bin_vpath);
+    }
+    JCE_FREE(bin_buf);
     return t;
 }
 

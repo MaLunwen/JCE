@@ -7,7 +7,9 @@
  */
 
 #include "jce_panel_hierarchy_internal.h"
+#include "ui/jce_editor_dnd.h"
 #include "core/jce_hotkeys.h"
+#include <cctype>
 
 /* ── Content (embeddable in tabs) ─────────────────────────────────── */
 
@@ -53,7 +55,7 @@ void jce_editor_panel_hierarchy_content(void)
     ImGui::BeginChild("EntityTree", ImVec2(0, 0), ImGuiChildFlags_None);
 
     if (ImGui::BeginDragDropTarget()) {
-        const ImGuiPayload *payload = ImGui::AcceptDragDropPayload("JCE_ENTITY");
+        const ImGuiPayload *payload = ImGui::AcceptDragDropPayload(JCE_DND_ENTITY);
         if (payload) {
             uint32_t dragged_id = *(uint32_t *)payload->Data;
             if (jce_state_is_selected(dragged_id)) {
@@ -205,6 +207,73 @@ void jce_editor_panel_hierarchy_content(void)
             }
             if (jce_hotkey_pressed(JCE_HK_VIEW_FRAME_SELECTED))
                 focus_entity_in_scene(focused);
+        }
+
+        /* Alpha-jump: press a letter/digit/symbol (no modifier) to select
+         * and reveal the next entity whose name starts with that char.
+         * Same key within 1.5 s cycles through subsequent matches. */
+        if (!ImGui::GetIO().WantTextInput && s_hier.renaming_id == 0) {
+            static char   s_jump_char   = '\0';
+            static int    s_jump_start  = 0;
+            static double s_jump_reset  = 0.0;
+            const double  kCycleWindow  = 1.5;
+
+            ImGuiIO &io = ImGui::GetIO();
+            if (!io.KeyCtrl && !io.KeyAlt && !io.KeySuper) {
+                char typed = '\0';
+                for (ImGuiKey key = ImGuiKey_A; key <= ImGuiKey_Z && !typed;
+                     key = (ImGuiKey)(key + 1))
+                    if (ImGui::IsKeyPressed(key, false))
+                        typed = (char)('a' + (key - ImGuiKey_A));
+                for (ImGuiKey key = ImGuiKey_0; key <= ImGuiKey_9 && !typed;
+                     key = (ImGuiKey)(key + 1))
+                    if (ImGui::IsKeyPressed(key, false))
+                        typed = (char)('0' + (key - ImGuiKey_0));
+                for (ImGuiKey key = ImGuiKey_Keypad0; key <= ImGuiKey_Keypad9 && !typed;
+                     key = (ImGuiKey)(key + 1))
+                    if (ImGui::IsKeyPressed(key, false))
+                        typed = (char)('0' + (key - ImGuiKey_Keypad0));
+                if (!typed && ImGui::IsKeyPressed(ImGuiKey_Space, false))          typed = ' ';
+                if (!typed && ImGui::IsKeyPressed(ImGuiKey_Minus, false))          typed = '-';
+                if (!typed && ImGui::IsKeyPressed(ImGuiKey_Period, false))         typed = '.';
+                if (!typed && ImGui::IsKeyPressed(ImGuiKey_KeypadDecimal, false))  typed = '.';
+                if (!typed && ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, false)) typed = '-';
+
+                if (typed) {
+                    char lc = (char)tolower((unsigned char)typed);
+                    double now = ImGui::GetTime();
+                    bool cycling = (lc == s_jump_char
+                                    && (now - s_jump_reset) < kCycleWindow);
+                    int start = cycling ? s_jump_start : 0;
+                    int n = s_hier.display_count;
+                    int found = -1;
+
+                    for (int pass = 0; pass < 2 && found < 0; ++pass) {
+                        int from = (pass == 0) ? start : 0;
+                        int to   = (pass == 0) ? n     : start;
+                        for (int k = from; k < to; ++k) {
+                            uint32_t eid = s_hier.display_order[k];
+                            const char *nm = jce_state_entity_name(eid);
+                            if (nm && nm[0]
+                                && tolower((unsigned char)nm[0]) == (unsigned char)lc)
+                            {
+                                found = k;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (found >= 0) {
+                        uint32_t target = s_hier.display_order[found];
+                        jce_state_select_entity(target, false);
+                        s_hier.reveal_target  = target;
+                        s_hier.reveal_pending = true;
+                        s_jump_char  = lc;
+                        s_jump_start = found + 1;
+                        s_jump_reset = ImGui::GetTime();
+                    }
+                }
+            }
         }
     }
 }

@@ -25,6 +25,11 @@ void jce_editor_layout_request_focus_file_viewer(void);
    window).  Safe to call multiple times — only opens once. */
 void jce_editor_layout_request_quit(void);
 
+/* Welcome screen helpers — open the corresponding dialog from any
+ * caller (used by the Welcome screen's action buttons). */
+void jce_editor_layout_request_new_project(void);
+void jce_editor_layout_request_open_project(void);
+
 /* Returns true once the user has confirmed the quit action (either
    saved or chose "Don't Save" in the unsaved-changes dialog). */
 bool jce_editor_layout_is_quit_confirmed(void);

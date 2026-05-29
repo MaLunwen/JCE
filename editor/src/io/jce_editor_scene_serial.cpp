@@ -257,8 +257,14 @@ static void repair_paths_cb(JceScene * /*sc*/, JceEntity e, void *ud)
      * even when the engine-side parser couldn't resolve the path.  We
      * always reapply when a real material file exists — material is the
      * single source of truth (Unity semantics).  Texture refs on the
-     * renderer that the material does NOT specify are preserved below. */
-    if (!jce_fs_host_exists_file(mr->material_path)) return;
+     * renderer that the material does NOT specify are preserved below.
+     * Use VFS-aware check so bundle-relative material paths also work. */
+    {
+        JceFileSystem *_afs = jce_fs_get_active();
+        bool mat_accessible = (_afs && jce_fs_exists(_afs, mr->material_path))
+                              || jce_fs_host_exists_file(mr->material_path);
+        if (!mat_accessible) return;
+    }
     (void)repaired_mat;
 
     JcePbrMaterial pbr = {};
@@ -346,6 +352,27 @@ static void rel_in_place(char *field, size_t cap, const char *base_dir)
     char tmp[1024];
     jce_editor_path_to_relative_to(tmp, sizeof(tmp), field, base_dir);
     if (tmp[0]) snprintf(field, cap, "%s", tmp);
+
+    /* Self-contained-bundle warning: after relativization, an absolute path
+     * (drive letter or UNC) means the asset lives outside the project root
+     * and will NOT travel with a bundle.  Keep the path so the editor / Play
+     * mode still resolves it on this machine; warn the user so they can
+     * relocate the asset before packing a bundle. */
+    bool is_abs = false;
+    if (field[0] && field[1] == ':' &&
+        ((field[0] >= 'A' && field[0] <= 'Z') || (field[0] >= 'a' && field[0] <= 'z'))) {
+        is_abs = true;
+    } else if (field[0] == '\\' && field[1] == '\\') {
+        is_abs = true;
+    } else if (field[0] == '/' && field[1] == '/') {
+        is_abs = true;
+    }
+    if (is_abs) {
+        LOG_WARN(LOG_TAG,
+                 "scene references an asset outside the project root: '%s' "
+                 "(kept; move it under the project root before packing a bundle)",
+                 field);
+    }
 }
 
 struct RelSweepCtx { JceScene *scene; const char *base_dir; };

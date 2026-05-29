@@ -7,6 +7,7 @@
 #include "os/core/jce_memory.h"
 
 #include <string.h>
+#include <jce/os/core/jce_str.h>
 
 struct JceAnimSmBinding {
     JceAnimSm    *sm;            /* owned */
@@ -28,8 +29,7 @@ JceAnimSmBinding *jce_anim_sm_binding_create(const char *definition_path)
     }
 
     b->sm = sm;
-    strncpy(b->path, definition_path, sizeof(b->path) - 1);
-    b->path[sizeof(b->path) - 1] = '\0';
+    jce_strlcpy(b->path, definition_path, sizeof(b->path));
 
     /* Pre-populate the cached eval so callers can query immediately
      * after create() without having to tick first. */

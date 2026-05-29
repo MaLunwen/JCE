@@ -57,33 +57,33 @@ NATIVE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bfwrite\s*\("),      "stdio fwrite — use SDL_WriteIO"),
     (re.compile(r"\bfclose\s*\("),      "stdio fclose — use SDL_CloseIO"),
     (re.compile(r"\bCreateFile[AW]\b"), "Win32 CreateFile — use SDL_IOFromFile"),
-    (re.compile(r"#include\s*<windows\.h>"),  "raw <windows.h> outside platform shim"),
-    (re.compile(r"#include\s*<unistd\.h>"),   "raw <unistd.h> outside platform shim"),
-    (re.compile(r"#include\s*<sys/stat\.h>"), "raw <sys/stat.h> outside platform shim"),
-    (re.compile(r"#include\s*<sys/socket\.h>"), "raw <sys/socket.h> — use SDL_net"),
-    (re.compile(r"#include\s*<winsock2?\.h>"),  "raw <winsock.h> — use SDL_net"),
-    (re.compile(r"#include\s*<pthread\.h>"),    "raw <pthread.h> — use jce_thread / SDL_thread"),
+    (re.compile(r"#\s*include\s*<windows\.h>"),  "raw <windows.h> outside platform shim"),
+    (re.compile(r"#\s*include\s*<unistd\.h>"),   "raw <unistd.h> outside platform shim"),
+    (re.compile(r"#\s*include\s*<sys/stat\.h>"), "raw <sys/stat.h> outside platform shim"),
+    (re.compile(r"#\s*include\s*<sys/socket\.h>"), "raw <sys/socket.h> — use SDL_net"),
+    (re.compile(r"#\s*include\s*<winsock2?\.h>"),  "raw <winsock.h> — use SDL_net"),
+    (re.compile(r"#\s*include\s*<pthread\.h>"),    "raw <pthread.h> — use jce_thread / SDL_thread"),
 ]
 
 # Portable-but-banned-in-client/editor C++ stdlib bar.
 # Engine code may still touch these where appropriate (e.g. third-party
 # bindings) so the patterns are scoped to client + editor trees.
 PORTABILITY_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"#include\s*<filesystem>"),
+    (re.compile(r"#\s*include\s*<filesystem>"),
      "<filesystem> — use jce_fs_host_* + jce_path_*"),
-    (re.compile(r"#include\s*<fstream>"),
+    (re.compile(r"#\s*include\s*<fstream>"),
      "<fstream> — use jce_fs_host_read_all/write_all (or ed_read_file/ed_write_file)"),
-    (re.compile(r"#include\s*<thread>"),
+    (re.compile(r"#\s*include\s*<thread>"),
      "<thread> — use jce_thread"),
-    (re.compile(r"#include\s*<mutex>"),
+    (re.compile(r"#\s*include\s*<mutex>"),
      "<mutex> — use jce_thread mutex API"),
-    (re.compile(r"#include\s*<atomic>"),
+    (re.compile(r"#\s*include\s*<atomic>"),
      "<atomic> — use jce_atomic_*"),
-    (re.compile(r"#include\s*<chrono>"),
+    (re.compile(r"#\s*include\s*<chrono>"),
      "<chrono> — use engine timer wrappers"),
-    (re.compile(r"#include\s*<future>"),
+    (re.compile(r"#\s*include\s*<future>"),
      "<future> — use jce_thread / task system"),
-    (re.compile(r"#include\s*<condition_variable>"),
+    (re.compile(r"#\s*include\s*<condition_variable>"),
      "<condition_variable> — use jce_thread cond var API"),
     (re.compile(r"\bstd::filesystem\b"),
      "std::filesystem — use jce_fs_host_* + jce_path_*"),
@@ -141,6 +141,10 @@ def scan_tree(root: Path, tree: str) -> list[tuple[str, int, str, str]]:
             p = Path(r) / fn
             rp = rel(p)
             if rp in ALLOW_FILES:
+                continue
+            # All files under engine/src/os/platform/ are sanctioned
+            # platform shims (this is the entire purpose of that dir).
+            if rp.startswith("engine/src/os/platform/"):
                 continue
             try:
                 lines = p.read_text(encoding="utf-8", errors="replace").splitlines()

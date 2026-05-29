@@ -54,6 +54,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <jce/os/core/jce_str.h>
 
 #define LOG_TAG "scene_renderer"
 
@@ -508,20 +509,26 @@ static bool sr_build_entity_model(JceSceneRenderer *sr, JceScene *scene,
                     slot = free_slot;
                     memset(&sr->terrain_cache[slot], 0,
                            sizeof sr->terrain_cache[slot]);
-                    strncpy(sr->terrain_cache[slot].path, tc->terrain_path,
-                            sizeof sr->terrain_cache[slot].path - 1);
+                    jce_strlcpy(sr->terrain_cache[slot].path, tc->terrain_path,
+                            sizeof sr->terrain_cache[slot].path);
                     sr->terrain_cache[slot].used = true;
-                    /* Allow the host (editor / runtime) to map the
-                     * scene-JSON-relative path to something openable. */
+                    /* PAK-first: deployed bundles overlay sr->pak, so a
+                     * bundled terrain meta+bin can be loaded with zero host
+                     * filesystem access.  If the path isn't in the PAK, fall
+                     * back to the host-resolved path (editor / loose files). */
+                    JceTerrain *terr = jce_terrain_load_from_pak(sr->pak,
+                                                                  tc->terrain_path);
                     char        resolved[1024];
                     const char *load_path = tc->terrain_path;
-                    if (sr->has_cbs && sr->cbs.resolve_path &&
-                        sr->cbs.resolve_path(tc->terrain_path,
-                                              resolved, (int)sizeof(resolved),
-                                              sr->cbs.userdata)) {
-                        load_path = resolved;
+                    if (!terr) {
+                        if (sr->has_cbs && sr->cbs.resolve_path &&
+                            sr->cbs.resolve_path(tc->terrain_path,
+                                                  resolved, (int)sizeof(resolved),
+                                                  sr->cbs.userdata)) {
+                            load_path = resolved;
+                        }
+                        terr = jce_terrain_load_file(load_path);
                     }
-                    JceTerrain *terr = jce_terrain_load_file(load_path);
                     if (!terr) { sr->terrain_cache[slot].failed = true;
                         LOG_WARN(LOG_TAG,
                                  "terrain load failed: '%s' (from '%s')",
@@ -1005,7 +1012,24 @@ static void sr_scan_skybox(JceSceneRenderer *sr, JceScene *scene, EntityList *li
     if (hdr_path && strcmp(hdr_path, sr->skybox_hdr_path) != 0) {
         if (sr->ibl_data) { jce_ibl_destroy(sr->ibl_data); sr->ibl_data = NULL; }
         if (sr->skybox)   { jce_skybox_destroy(sr->skybox); sr->skybox = NULL; }
-        sr->skybox = jce_skybox_create_from_hdr_file(hdr_path, 512);
+        /* Try PAK chain first (engine + bundle overlays) so a bundled
+         * HDR works without a sidecar file on disk.  Fall back to the
+         * host filesystem for user-authored / loose HDRs. */
+        const JcePakAsset *hdr_asset = jce_pak_find(sr->pak, hdr_path);
+        if (hdr_asset && hdr_asset->original_size > 0) {
+            void *hdr_buf = malloc((size_t)hdr_asset->original_size);
+            if (hdr_buf) {
+                size_t got = jce_pak_decompress_ex(sr->pak, hdr_asset,
+                                                  hdr_buf,
+                                                  (size_t)hdr_asset->original_size);
+                if (got == (size_t)hdr_asset->original_size)
+                    sr->skybox = jce_skybox_create_from_hdr_memory(
+                                     hdr_buf, (uint32_t)got, 512);
+                free(hdr_buf);
+            }
+        }
+        if (!sr->skybox)
+            sr->skybox = jce_skybox_create_from_hdr_file(hdr_path, 512);
         if (sr->skybox) {
             snprintf(sr->skybox_hdr_path, sizeof(sr->skybox_hdr_path),
                      "%s", hdr_path);

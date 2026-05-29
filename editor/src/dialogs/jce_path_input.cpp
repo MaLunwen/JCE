@@ -10,6 +10,8 @@
 #include "jce_editor_dialogs_internal.h"
 #include "core/jce_editor_i18n.h"
 #include "jce_dialog_asset_picker.h"
+#include "ui/jce_editor_dnd.h"
+#include "ui/jce_editor_panels.h"  /* jce_editor_path_to_relative */
 
 #include <imgui.h>
 #include "core/jce_assetdb.h"
@@ -177,6 +179,27 @@ bool jce_draw_path_input(const char *label,
     /* Hover tooltip: full path (useful when truncated in narrow panels). */
     if (buf[0] != '\0' && ImGui::IsItemHovered())
         ImGui::SetTooltip("%s", buf);
+    /* Drag-drop target: accept asset paths from the asset browser (and any
+     * other source that publishes JCE_DND_ASSET_PATH).  For AssetVfs kind
+     * we relativize against the project root so the saved value stays
+     * portable; for *Abs kinds we keep the dropped path verbatim. */
+    if (ImGui::BeginDragDropTarget()) {
+        if (const ImGuiPayload *pl =
+                ImGui::AcceptDragDropPayload(JCE_DND_ASSET_PATH)) {
+            const char *src = (const char *)pl->Data;
+            if (src && src[0]) {
+                if (kind == JcePathKind::AssetVfs) {
+                    char rel[1024];
+                    jce_editor_path_to_relative(rel, sizeof(rel), src);
+                    snprintf(buf, buf_size, "%s", rel[0] ? rel : src);
+                } else {
+                    snprintf(buf, buf_size, "%s", src);
+                }
+                changed = true;
+            }
+        }
+        ImGui::EndDragDropTarget();
+    }
     ImGui::PopItemWidth();
 
     if (!opts->button_first) {

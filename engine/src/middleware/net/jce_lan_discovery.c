@@ -29,6 +29,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <jce/os/core/jce_str.h>
 
 #define LOG_TAG "lan-disc"
 
@@ -413,7 +414,7 @@ static JceLanDiscoveredServer *find_or_insert(const ENetAddress *src_addr,
     }
     JceLanDiscoveredServer *slot = &g_servers[g_server_count++];
     memset(slot, 0, sizeof(*slot));
-    strncpy(slot->address_text, addr_text, sizeof(slot->address_text) - 1u);
+    jce_strlcpy(slot->address_text, addr_text, sizeof(slot->address_text));
     slot->ping_ms = -1;
     *out_is_new = true;
     return slot;

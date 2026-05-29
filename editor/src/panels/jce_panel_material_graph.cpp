@@ -60,8 +60,7 @@ static void draw_content(void)
         if (s_g.path[0]) {
             char p[260];
             std::snprintf(p, sizeof(p), "%s", s_g.path);
-            char *dot = std::strrchr(p, '.');
-            if (dot) *dot = '\0';
+            jce_editor_path_strip_extension(p);
             char *dot2 = std::strrchr(p, '.');
             if (dot2 && std::strcmp(dot2, ".matgraph") == 0) *dot2 = '\0';
             std::strncat(p, ".mat.json", sizeof(p) - std::strlen(p) - 1);

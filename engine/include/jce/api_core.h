@@ -27,6 +27,7 @@ extern "C" {
 #include <jce/os/core/jce_sysinfo.h>
 #include <jce/os/core/jce_thread.h>
 #include <jce/os/core/jce_timer.h>
+#include <jce/os/core/jce_toolchain.h>
 
 
 

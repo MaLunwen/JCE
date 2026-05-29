@@ -21,6 +21,7 @@
  */
 
 #include "ui/jce_editor_colors.h"
+#include "ui/jce_editor_tip.h"
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
 #include "io/jce_editor_file_util.h"
@@ -216,13 +217,13 @@ static void draw_bus_row(JceAudioBusId id)
         jce_audio_mixer_set_muted(s_mixer, id, muted);
         mixer_save();
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", jce_editor_i18n("audioMixer.mute"));
+    jce_editor::help_tip(jce_editor_i18n("audioMixer.mute"));
     ImGui::SameLine();
     if (ImGui::Checkbox("S", &solo)) {
         jce_audio_mixer_set_solo(s_mixer, id, solo);
         mixer_save();
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", jce_editor_i18n("audioMixer.solo"));
+    jce_editor::help_tip(jce_editor_i18n("audioMixer.solo"));
 
     ImGui::SameLine();
     ImGui::TextDisabled("%s %.2f", jce_editor_i18n("audioMixer.effective"),

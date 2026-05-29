@@ -208,6 +208,34 @@ static JceTexture jce_texture_load_ex_inner(const JcePakArchive *pak,
 {
     if (!pak || !asset_path) return JCE_TEXTURE_INVALID;
 
+    /* Extension whitelist — silently reject obvious non-image assets.
+     * Some scenes accidentally point texture fields at .obj / .glb /
+     * .fbx files; the asset manager finds them in the PAK and feeds the
+     * bytes to IMG_Load which then spams ERROR every frame. Filtering by
+     * extension keeps the log clean and short-circuits the wasted work. */
+    {
+        const char *dot = strrchr(asset_path, '.');
+        if (dot) {
+            static const char *exts[] = {
+                ".png", ".jpg", ".jpeg", ".tga", ".dds", ".ktx",
+                ".ktx2", ".bmp", ".hdr", ".webp", ".psd", ".gif",
+                ".jceasset", NULL
+            };
+            bool ok = false;
+            for (int i = 0; exts[i] && !ok; ++i) {
+#ifdef _MSC_VER
+                if (_stricmp(dot, exts[i]) == 0) ok = true;
+#else
+                if (strcasecmp(dot, exts[i]) == 0) ok = true;
+#endif
+            }
+            if (!ok) {
+                LOG_DEBUG(LOG_TAG, "skipping non-image asset: %s", asset_path);
+                return JCE_TEXTURE_INVALID;
+            }
+        }
+    }
+
     const JcePakAsset *asset = jce_pak_find(pak, asset_path);
     if (!asset) {
         /* LOG_DEBUG instead of ERROR — PAK may still be loading or resource deferred. */

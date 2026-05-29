@@ -9,6 +9,7 @@
 #include "os/core/jce_memory.h"
 
 #include <string.h>
+#include <jce/os/core/jce_str.h>
 
 #define LOG_TAG       "mixer"
 #define MAX_BUSES     128
@@ -57,7 +58,7 @@ JceAudioMixer *jce_audio_mixer_create(void)
     /* Master at id=1, parent=INVALID. */
     m->buses[1].alive  = true;
     m->buses[1].parent = JCE_AUDIO_BUS_INVALID;
-    strncpy(m->buses[1].name, "Master", MAX_NAME - 1);
+    jce_strlcpy(m->buses[1].name, "Master", MAX_NAME);
     m->buses[1].volume = 1.0f;
     m->bus_count = 1;
     return m;
@@ -85,8 +86,7 @@ JceAudioBusId jce_audio_mixer_add_bus(JceAudioMixer *m, JceAudioBusId parent,
         if (!m->buses[i].alive) {
             m->buses[i].alive  = true;
             m->buses[i].parent = parent;
-            strncpy(m->buses[i].name, name, MAX_NAME - 1);
-            m->buses[i].name[MAX_NAME - 1] = '\0';
+            jce_strlcpy(m->buses[i].name, name, MAX_NAME);
             m->buses[i].volume = volume;
             m->buses[i].muted  = false;
             m->buses[i].solo   = false;

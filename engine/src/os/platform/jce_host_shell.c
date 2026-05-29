@@ -339,3 +339,50 @@ bool jce_host_run_capture(const char *const *argv,
     if (out_exit) *out_exit = exit_code;
     return true;
 }
+
+
+/* ------------------------------------------------------------------ */
+/* PATH executable resolution                                          */
+/* ------------------------------------------------------------------ */
+
+#if defined(_WIN32)
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#endif
+
+static bool s_has_path_sep(const char *s)
+{
+    for (; s && *s; ++s)
+        if (*s == '/' || *s == '\\' || *s == ':') return true;
+    return false;
+}
+
+bool jce_host_resolve_executable(const char *name, char *dst, size_t dst_cap)
+{
+    if (!name || !name[0] || !dst || dst_cap == 0) return false;
+    dst[0] = '\0';
+    if (s_has_path_sep(name)) {
+        /* Caller passed an absolute / relative path — keep as-is. */
+        size_t n = strlen(name);
+        if (n + 1 > dst_cap) return false;
+        memcpy(dst, name, n + 1);
+        return true;
+    }
+#if defined(_WIN32)
+    {
+        const char *exts[] = { ".exe", ".bat", ".cmd", NULL };
+        for (int i = 0; exts[i]; ++i) {
+            DWORD n = SearchPathA(NULL, name, exts[i], (DWORD)dst_cap, dst, NULL);
+            if (n > 0 && n < dst_cap) return true;
+        }
+        dst[0] = '\0';
+        return false;
+    }
+#else
+    /* POSIX: SDL_CreateProcess defers to execvp which already searches
+     * PATH correctly regardless of working_directory.  Returning false
+     * tells the caller to use the original name unchanged. */
+    (void)dst; (void)dst_cap;
+    return false;
+#endif
+}

@@ -55,6 +55,19 @@ JCE_API bool jce_host_run_capture(const char *const *argv,
                                   size_t *out_size,
                                   int *out_exit);
 
+/* Resolve a bare program name (e.g. "conan", "cmake") to an absolute
+ * path by searching the host PATH.  Writes up to dst_cap bytes (NUL
+ * terminated) into dst.  Returns true on success.  On Windows this
+ * walks SearchPath() trying .exe / .bat / .cmd extensions; on POSIX
+ * it scans $PATH for an executable file.
+ *
+ * Useful when spawning a child with a custom working_directory — the
+ * implicit PATH lookup may otherwise behave inconsistently between
+ * backends.  Names that already contain a path separator are returned
+ * unchanged (callers can short-circuit). */
+JCE_API bool jce_host_resolve_executable(const char *name,
+                                         char *dst, size_t dst_cap);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_HOST_SHELL_H */

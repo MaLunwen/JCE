@@ -5,6 +5,7 @@
  */
 
 #include "jce_panel_inspector_common.h"
+#include "ui/jce_editor_dnd.h"
 
 static bool is_mat_json(const char *path)
 {
@@ -92,11 +93,10 @@ static void accept_material_drop(JceMeshRenderer *mr)
 {
     if (ImGui::BeginDragDropTarget()) {
         if (const ImGuiPayload *payload =
-                ImGui::AcceptDragDropPayload("JCE_ASSET_PATH")) {
+                ImGui::AcceptDragDropPayload(JCE_DND_ASSET_PATH)) {
             const char *path = (const char *)payload->Data;
             char rel[1024];
-            jce_editor_path_to_relative(rel, sizeof(rel), path);
-            const char *stored = rel[0] ? rel : path;
+            const char *stored = jce_editor_path_relative_or(rel, sizeof(rel), path);
             jce_state_begin_batch_edit();
             snprintf(mr->material_path, sizeof(mr->material_path),
                      "%s", stored);

@@ -884,7 +884,16 @@ void ck_app_update(CkApp *app)
 
 void ck_app_event(CkApp *app, const JceEvent *event)
 {
-    (void)app; (void)event;
+    if (!app || !event) return;
+
+    /* Honour OS-level quit signals (window X button, SDL_EVENT_QUIT,
+     * SDL_EVENT_WINDOW_CLOSE_REQUESTED, Alt-F4).  Without this the
+     * engine's should_quit callback returns false and the window
+     * becomes unclosable. */
+    if (event->type == JCE_EVENT_QUIT ||
+        event->type == JCE_EVENT_WINDOW_CLOSE) {
+        app->quit_requested = true;
+    }
 }
 
 bool ck_app_should_quit(const CkApp *app)

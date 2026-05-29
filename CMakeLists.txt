@@ -67,6 +67,11 @@ if(JCE_BUILD_JNI)
 	set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 endif()
 
+# SDK packaging — when ON, engine/CMakeLists.txt registers install rules
+# that produce a redistributable SDK consumable via `find_package(JCE)`.
+option(JCE_ENABLE_SDK_INSTALL
+	"Generate install rules to package JCE as a redistributable SDK." OFF)
+
 # Build variant: "release" (default) or "dist" (no logging + SHA-256 hash).
 set(JCE_BUILD_VARIANT "release" CACHE STRING "Build variant (release|dist)")
 set_property(CACHE JCE_BUILD_VARIANT PROPERTY STRINGS release dist)
@@ -183,6 +188,7 @@ find_package(Freetype     REQUIRED)
 find_package(harfbuzz     REQUIRED)
 find_package(cgltf        REQUIRED)
 find_package(assimp       REQUIRED)
+find_package(meshoptimizer REQUIRED)
 find_package(zstd         REQUIRED)
 find_package(xxHash       REQUIRED)
 find_package(mimalloc     REQUIRED)
@@ -492,8 +498,14 @@ if(CMAKE_CROSSCOMPILING)
 		IMPORTED_LOCATION_MINSIZEREL "${JCE_PAK_EXECUTABLE}")
 else()
 	add_executable(jce_pak "${JCE_TOOLS_DIR}/jce_pak.c")
+	# When the SDK install is enabled, jce_pak must be built (it ships in
+	# <sdk>/bin/) so end-user projects can pack their own assets without
+	# having a JCE source tree.  Otherwise keep it out of the default
+	# build to save engine-developer build time.
+	if(NOT JCE_ENABLE_SDK_INSTALL)
+		set_target_properties(jce_pak PROPERTIES EXCLUDE_FROM_ALL ON)
+	endif()
 	set_target_properties(jce_pak PROPERTIES
-		EXCLUDE_FROM_ALL      ON
 		RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tools"
 		C_STANDARD            99
 		C_STANDARD_REQUIRED   YES
@@ -503,6 +515,32 @@ else()
 		zstd::libzstd_static
 		xxHash::xxhash)
 	jce_target_warnings(jce_pak)
+endif()
+
+# ------------------------------------------------------------------ #
+# Host bin→obj tool: jce_bin2obj                                      #
+# ------------------------------------------------------------------ #
+# Wraps an arbitrary binary file (e.g. a .jbundle) into a COFF .obj
+# or GAS .S so it can be linked into an exe.  Used by the SDK helper
+# jce_target_embed_bundle() to deliver true single-file builds.
+
+if(CMAKE_CROSSCOMPILING)
+	if(JCE_BIN2OBJ_EXECUTABLE)
+		add_executable(jce_bin2obj IMPORTED)
+		set_target_properties(jce_bin2obj PROPERTIES
+			IMPORTED_LOCATION "${JCE_BIN2OBJ_EXECUTABLE}")
+	endif()
+else()
+	add_executable(jce_bin2obj "${JCE_TOOLS_DIR}/jce_bin2obj.c")
+	if(NOT JCE_ENABLE_SDK_INSTALL)
+		set_target_properties(jce_bin2obj PROPERTIES EXCLUDE_FROM_ALL ON)
+	endif()
+	set_target_properties(jce_bin2obj PROPERTIES
+		RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tools"
+		C_STANDARD            99
+		C_STANDARD_REQUIRED   YES
+		C_EXTENSIONS          OFF)
+	jce_target_warnings(jce_bin2obj)
 endif()
 
 # ------------------------------------------------------------------ #
@@ -855,6 +893,73 @@ endif()
 
 set(REPORT_SCRIPT "${JCE_TOOLS_DIR}/build_report.cmake")
 
+# ================================================================== #
+# Engine-shader embedded PAK (linked into the engine static lib).    #
+#                                                                    #
+# A freshly-scaffolded SDK consumer project ships with a 1-byte stub #
+# PAK and therefore has no shader bins.  To avoid rendering nothing  #
+# we bake the stock engine shaders into `jce_renderer` itself.       #
+#                                                                    #
+# Output:                                                            #
+#   ${CMAKE_BINARY_DIR}/engine_shaders.pak                           #
+#   ${CMAKE_BINARY_DIR}/jce_engine_shaders_pak.c   (C array)         #
+#   ${CMAKE_BINARY_DIR}/jce_engine_shaders_pak.h   (extern decls)    #
+#                                                                    #
+# When `JCE_EMBED_ENGINE_SHADERS=OFF`, the stub TU                   #
+# `engine/src/renderer/jce_engine_shaders_pak_stub.c` provides the   #
+# symbols at zero cost.                                              #
+# ================================================================== #
+option(JCE_EMBED_ENGINE_SHADERS
+	"Bake the stock engine shader PAK into the jce_renderer static library so SDK consumer projects can render without shipping a separate engine_shaders.pak"
+	ON)
+
+if(JCE_EMBED_ENGINE_SHADERS)
+	set(JCE_ENGSH_PAK_FILE      "${CMAKE_BINARY_DIR}/engine_shaders.pak")
+	set(JCE_ENGSH_C_ARRAY       "${CMAKE_BINARY_DIR}/jce_engine_shaders_pak.c")
+	set(JCE_ENGSH_HEADER_FILE   "${CMAKE_BINARY_DIR}/jce_engine_shaders_pak.h")
+	set(JCE_ENGSH_MANIFEST_FILE "${CMAKE_BINARY_DIR}/_engine_shaders_manifest.cmake")
+	set(JCE_ENGSH_STAMP_FILE    "${CMAKE_BINARY_DIR}/_engine_shaders_pak.stamp")
+
+	add_custom_command(
+		OUTPUT     "${JCE_ENGSH_STAMP_FILE}"
+		BYPRODUCTS "${JCE_ENGSH_PAK_FILE}" "${JCE_ENGSH_C_ARRAY}"
+		           "${JCE_ENGSH_HEADER_FILE}" "${JCE_ENGSH_MANIFEST_FILE}"
+		COMMAND    $<TARGET_FILE:jce_pak>
+		           --resource-dir "${ENGINE_RESOURCE_DIR}"
+		           --exclude-segment i18n
+		           --exclude-segment raw_assets
+		           ${JCE_PAK_SHADER_EXCLUDE_FLAGS}
+		           ${_PAK_LEVEL_FLAGS}
+		           --symbol-prefix jce_engine_shaders_pak
+		           --pak-file      "${JCE_ENGSH_PAK_FILE}"
+		           --header-file   "${JCE_ENGSH_HEADER_FILE}"
+		           --manifest-file "${JCE_ENGSH_MANIFEST_FILE}"
+		           --obj-format    c-array
+		           --c-file        "${JCE_ENGSH_C_ARRAY}"
+		COMMAND    "${CMAKE_COMMAND}" -E touch "${JCE_ENGSH_STAMP_FILE}"
+		DEPENDS    jce_pak
+		           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES}
+		           ${COMPILED_IMGUI_SHADER_FILES} ${COMPILED_POSTFX_SHADER_FILES}
+		           ${COMPILED_PARTICLES_SHADER_FILES} ${COMPILED_DECALS_SHADER_FILES}
+		           ${COMPILED_WEATHER_SHADER_FILES} ${COMPILED_SSAO_SHADER_FILES}
+		           ${COMPILED_SSR_SHADER_FILES} ${COMPILED_VOLFOG_SHADER_FILES}
+		COMMENT    "Packing engine shaders -> ${JCE_ENGSH_C_ARRAY}"
+		VERBATIM)
+
+	set_source_files_properties(
+		"${JCE_ENGSH_PAK_FILE}" "${JCE_ENGSH_C_ARRAY}"
+		"${JCE_ENGSH_HEADER_FILE}" "${JCE_ENGSH_MANIFEST_FILE}"
+		"${JCE_ENGSH_STAMP_FILE}"
+		PROPERTIES GENERATED TRUE)
+
+	add_custom_target(PackEngineShaders DEPENDS "${JCE_ENGSH_STAMP_FILE}")
+	add_dependencies(PackEngineShaders
+		CompileShaders CompileShadersPBR CompileShadersImGui
+		CompileShadersPostFX CompileShadersParticles CompileShadersDecals
+		CompileShadersWeather CompileShadersSSAO CompileShadersSSR
+		CompileShadersVolFog)
+endif()
+
 # ------------------------------------------------------------------ #
 # Sub-modules                                                         #
 # ------------------------------------------------------------------ #
@@ -862,6 +967,14 @@ set(REPORT_SCRIPT "${JCE_TOOLS_DIR}/build_report.cmake")
 add_subdirectory(engine)
 add_subdirectory(editor)
 add_subdirectory(caged_kingdom)
+
+# After jce_renderer has been declared in engine/CMakeLists.txt, hook
+# in the generated embedded-shader C array (and exclude the stub TU).
+if(JCE_EMBED_ENGINE_SHADERS AND TARGET jce_renderer)
+	target_sources(jce_renderer PRIVATE "${JCE_ENGSH_C_ARRAY}")
+	target_compile_definitions(jce_renderer PRIVATE JCE_ENGINE_SHADERS_EMBED=1)
+	add_dependencies(jce_renderer PackEngineShaders)
+endif()
 
 # ------------------------------------------------------------------ #
 # Unit tests (opt-in via -DJCE_BUILD_TESTS=ON; default OFF to keep   #

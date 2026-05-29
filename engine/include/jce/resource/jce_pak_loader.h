@@ -111,6 +111,21 @@ JCE_API const JcePakAsset *jce_pak_get(const JcePakArchive *pak, uint32_t index)
  * Useful when loading PAK data from a file/stream into a heap buffer. */
 JCE_API JcePakArchive *jce_pak_open_owned(void *data, size_t size);
 
+/* ── PAK overlay chain ────────────────────────────────────────────────
+ * Stack additional archives behind a base PAK so that any miss in the
+ * base transparently falls through to the next layer.  Used by the
+ * runtime to mount project bundles on top of the engine PAK so all
+ * engine subsystems (skybox, audio, asset_manager, scene_renderer
+ * fallback) see bundle content without per-call callback wiring.
+ *
+ * Ownership: caller retains both archives; neither is acquired/closed.
+ * Priority: the base archive always wins for a given path; layers are
+ * searched in push order (FIFO — first pushed = first fallback).
+ * Cycle-safe: pushing an already-attached layer or one that would form
+ * a cycle is a no-op. */
+JCE_API void jce_pak_overlay_push(JcePakArchive *base, JcePakArchive *layer);
+JCE_API void jce_pak_overlay_remove(JcePakArchive *base, JcePakArchive *layer);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_PAK_LOADER_H */

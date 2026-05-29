@@ -6,6 +6,7 @@
  */
 
 #include "jce_fv_common.h"
+#include "ui/jce_editor_dnd.h"
 
 #include <string>
 #include <vector>
@@ -316,11 +317,10 @@ void fv_render_material(FvTab *tab)
             /* Accept texture drag-drop from asset browser. */
             if (ImGui::BeginDragDropTarget()) {
                 if (const ImGuiPayload *payload =
-                        ImGui::AcceptDragDropPayload("JCE_ASSET_PATH")) {
+                        ImGui::AcceptDragDropPayload(JCE_DND_ASSET_PATH)) {
                     const char *src = (const char *)payload->Data;
                     char rel[1024];
-                    jce_editor_path_to_relative(rel, sizeof(rel), src);
-                    const char *store_path = rel[0] ? rel : src;
+                    const char *store_path = jce_editor_path_relative_or(rel, sizeof(rel), src);
                     snprintf(path, 256, "%s", store_path);
                     ms->modified = true;
                     ms->thumbs[ti].tried = false;

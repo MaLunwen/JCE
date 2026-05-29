@@ -155,6 +155,38 @@ size_t jce_time_format_local(int64_t epoch_seconds, const char *fmt,
     return n;
 }
 
+size_t jce_time_format_utc(int64_t epoch_seconds, const char *fmt,
+                           char *out, size_t out_size)
+{
+    if (!out || out_size == 0) return 0;
+    if (!fmt) { out[0] = '\0'; return 0; }
+
+    time_t t = (time_t)epoch_seconds;
+    struct tm utc_tm;
+
+#if defined(_MSC_VER)
+    if (gmtime_s(&utc_tm, &t) != 0) {
+        out[0] = '\0';
+        return 0;
+    }
+#elif defined(_WIN32)
+    /* MinGW: gmtime_r may be missing.  gmtime() is thread-safe on
+       Windows due to thread-local storage in the CRT. */
+    struct tm *gp = gmtime(&t);
+    if (!gp) { out[0] = '\0'; return 0; }
+    utc_tm = *gp;
+#else
+    if (!gmtime_r(&t, &utc_tm)) {
+        out[0] = '\0';
+        return 0;
+    }
+#endif
+
+    size_t n = strftime(out, out_size, fmt, &utc_tm);
+    if (n == 0 && out_size > 0) out[0] = '\0';
+    return n;
+}
+
 /* ── Cross-platform clock primitives ─────────────────────────────── */
 
 uint64_t jce_time_perf_counter(void)

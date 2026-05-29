@@ -134,7 +134,17 @@ static JceTexture load_gltf_texture(const JcePakArchive *pak,
         }
 
         uint64_t img_size = 0;
-        void *img_buf = jce_fs_host_read_all(disk_path, &img_size);
+        void *img_buf = NULL;
+        /* Disk fallback only when there is no PAK to serve from (i.e. editor
+         * / dev path).  In a deployed game the PAK overlay chain (engine PAK
+         * + mounted bundles) must contain every texture; reaching out to the
+         * host disk would silently break portability. */
+        if (!pak) {
+            img_buf = jce_fs_host_read_all(disk_path, &img_size);
+        } else {
+            LOG_WARN("gltf", "texture missing from pak (no host fallback in runtime): %s",
+                     resolved);
+        }
         if (img_buf && img_size > 0) {
             SDL_IOStream *io = SDL_IOFromConstMem(img_buf, img_size);
             if (io) {

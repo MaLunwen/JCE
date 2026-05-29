@@ -9,6 +9,7 @@
 #include <jce/middleware/scene/jce_scene_components_json.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_str.h>
+#include <jce/os/core/jce_path.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/renderer/jce_pbr_material.h>
 #include <jce/resource/jce_scene_contract.h>
@@ -186,7 +187,7 @@ static bool fallback_mat_walker(void *user, const char *dirpath, const char *nam
 
     if (score > st->best_score) {
         st->best_score = score;
-        snprintf(st->best, sizeof(st->best), "%s/%s", dirpath, name);
+        jce_path_join(st->best, sizeof(st->best), dirpath, name);
     }
     return true;
 }
@@ -205,7 +206,7 @@ sse_sdl_enum_cb(void *userdata, const char *dirpath, const char *fname)
     if (!fname) return SDL_ENUM_CONTINUE;
 
     char full[1280];
-    snprintf(full, sizeof(full), "%s/%s", dirpath, fname);
+    jce_path_join(full, sizeof(full), dirpath, fname);
 
     SDL_PathInfo info;
     if (SDL_GetPathInfo(full, &info) && info.type == SDL_PATHTYPE_DIRECTORY) {
@@ -294,7 +295,7 @@ static void resolve_tex_relative_to_material(const char *mat_path,
 
     char candidate[1280];
     /* (1) sibling of the .mat.json. */
-    snprintf(candidate, sizeof(candidate), "%s/%s", mat_dir, tex_path);
+    jce_path_join(candidate, sizeof(candidate), mat_dir, tex_path);
     if (sse_file_exists(candidate)) {
         snprintf(tex_path, tex_path_sz, "%s", candidate);
         return;
@@ -305,7 +306,7 @@ static void resolve_tex_relative_to_material(const char *mat_path,
     snprintf(base, sizeof(base), "%s", mat_dir);
     for (int up = 0; up < 4; up++) {
         if (!sse_path_parent_inplace(base)) break;
-        snprintf(candidate, sizeof(candidate), "%s/%s", base, tex_path);
+        jce_path_join(candidate, sizeof(candidate), base, tex_path);
         if (sse_file_exists(candidate)) {
             snprintf(tex_path, tex_path_sz, "%s", candidate);
             return;
@@ -468,7 +469,7 @@ static void parse_mesh_renderer(JceScene *s, JceEntity e, const cJSON *c)
             try_paths[n_try++] = mr.material_path;
         } else {
             if (s_scene_base_dir[0]) {
-                snprintf(mat_full, sizeof(mat_full), "%s/%s",
+                jce_path_join(mat_full, sizeof(mat_full),
                          s_scene_base_dir, mr.material_path);
                 try_paths[n_try++] = mat_full;
             }
@@ -492,7 +493,7 @@ static void parse_mesh_renderer(JceScene *s, JceEntity e, const cJSON *c)
                 while (L > 0 && (base[L-1] == '/' || base[L-1] == '\\')) L--;
                 if (L <= 0) break;
                 base[L] = '\0';
-                snprintf(parent_try, sizeof(parent_try), "%s/%s", base, mr.material_path);
+                jce_path_join(parent_try, sizeof(parent_try), base, mr.material_path);
                 if (sse_file_exists(parent_try)) { resolved = parent_try; break; }
             }
         }

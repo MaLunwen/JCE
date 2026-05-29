@@ -85,6 +85,11 @@ JCE_API bool jce_process_force_kill(JceProcess *p);
    Returns false while the process is still running. */
 JCE_API bool jce_process_poll_exit(JceProcess *p, int *out_exit_code);
 
+/* Return the SDL error message captured by the most recent failed
+ * jce_process_spawn() call on the current thread.  Returns "" if no
+ * error is pending.  Useful for diagnosing why spawn returned NULL. */
+JCE_API const char *jce_process_get_last_spawn_error(void);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_PROCESS_H */

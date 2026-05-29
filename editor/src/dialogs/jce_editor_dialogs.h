@@ -24,6 +24,10 @@ void jce_editor_dialog_open_project(bool *p_open);
  * to seed the path from a recents entry. */
 void jce_editor_dialog_open_project_set_path(const char *path);
 
+/* Welcome / start screen dialog (shown at startup when no project
+ * is open). */
+void jce_editor_dialog_welcome(bool *p_open);
+
 /* Save As dialog. */
 void jce_editor_dialog_save_as(bool *p_open);
 

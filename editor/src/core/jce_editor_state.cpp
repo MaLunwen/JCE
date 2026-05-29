@@ -16,6 +16,7 @@
 #include "jce_editor_config.h"
 #include "jce_editor_i18n.h"
 #include "jce_editor_state_internal.h"
+#include "ui/jce_editor_panels.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -83,19 +84,13 @@ void update_scene_dir_from_path(const char *scene_path)
     char scene_dir[512];
     snprintf(scene_dir, sizeof(scene_dir), "%s", scene_path);
 
-    /* Find last path separator. */
-    char *sep = strrchr(scene_dir, '/');
-    char *bsep = strrchr(scene_dir, '\\');
-    if (bsep && (!sep || bsep > sep)) sep = bsep;
-    if (sep) {
-        *sep = '\0';
+    /* Trim to parent directory. */
+    jce_editor_path_trim_to_parent(scene_dir);
+    if (scene_dir[0]) {
         /* Go up one more level if we're in a "Scenes" subdirectory. */
-        char *last_comp = strrchr(scene_dir, '/');
-        char *last_bcomp = strrchr(scene_dir, '\\');
-        if (last_bcomp && (!last_comp || last_bcomp > last_comp)) last_comp = last_bcomp;
-        const char *dir_name = last_comp ? last_comp + 1 : scene_dir;
+        const char *dir_name = jce_editor_path_basename_view(scene_dir);
         if (jce_strcasecmp(dir_name, "Scenes") == 0) {
-            if (last_comp) *last_comp = '\0';
+            jce_editor_path_trim_to_parent(scene_dir);
         }
     }
 

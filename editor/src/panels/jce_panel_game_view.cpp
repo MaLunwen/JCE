@@ -13,6 +13,7 @@
 extern "C" {
 #include <jce/os/core/jce_defs.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_path.h>
 #include <jce/os/platform/jce_host_dialog.h>
 #include <jce/renderer/jce_camera.h>
 #include <jce/renderer/jce_renderer.h>
@@ -215,17 +216,9 @@ void jce_editor_panel_game_view_content(void)
                         jce_editor_config_load(&c);
                         snprintf(c.game_executable_path,
                                  sizeof(c.game_executable_path), "%s", path);
-                        const char *slash = strrchr(path, '/');
-                        const char *bslash = strrchr(path, '\\');
-                        const char *sep = (slash && bslash) ? (slash > bslash ? slash : bslash)
-                                                            : (slash ? slash : bslash);
-                        if (sep) {
-                            size_t n = (size_t) (sep - path);
-                            if (n >= sizeof(c.game_working_directory))
-                                n = sizeof(c.game_working_directory) - 1;
-                            memcpy(c.game_working_directory, path, n);
-                            c.game_working_directory[n] = '\0';
-                        }
+                        jce_path_parent(c.game_working_directory,
+                                        sizeof(c.game_working_directory),
+                                        path);
                         jce_editor_config_save(&c);
                     },
                     nullptr);

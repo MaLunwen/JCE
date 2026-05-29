@@ -5,6 +5,7 @@
  */
 
 #include "jce_panel_inspector_common.h"
+#include "ui/jce_editor_tip.h"
 
 #include <unordered_map>
 
@@ -255,8 +256,7 @@ void draw_comp_virtual_camera(JceVirtualCameraComponent *vc)
         vc->active   = true;
         insp_track_edit();
     }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip(jce_editor_i18n("inspector.vcam.soloTooltip"));
+    jce_editor::help_tip(jce_editor_i18n("inspector.vcam.soloTooltip"));
     if (ImGui::Checkbox(jce_editor_i18n_id("inspector.vcam.active", "vcam"), &vc->active))
         insp_undo_bool(&vc->active);
 

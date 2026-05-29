@@ -13,6 +13,7 @@
 #include "io/jce_editor_file_util.h"
 #include "jce_scene_render_internal.h"
 #include "core/jce_assetdb.h"
+#include "ui/jce_editor_panels.h"
 
 #include <cstdio>
 
@@ -105,10 +106,7 @@ bool jce_editor_resolve_asset_path(const char *in, char *out, int outsz)
     if (spath && spath[0]) {
         char dir[512];
         snprintf(dir, sizeof(dir), "%s", spath);
-        char *sep  = strrchr(dir, '/');
-        char *bsep = strrchr(dir, '\\');
-        if (bsep && (!sep || bsep > sep)) sep = bsep;
-        if (sep) *sep = '\0'; else dir[0] = '\0';
+        jce_editor_path_trim_to_parent(dir);
         for (int level = 0; level < 5; ++level) {
             if (!dir[0]) break;
             char cand[1024];
@@ -117,11 +115,7 @@ bool jce_editor_resolve_asset_path(const char *in, char *out, int outsz)
                 snprintf(out, (size_t)outsz, "%s", cand);
                 return true;
             }
-            char *s2  = strrchr(dir, '/');
-            char *bs2 = strrchr(dir, '\\');
-            if (bs2 && (!s2 || bs2 > s2)) s2 = bs2;
-            if (!s2) break;
-            *s2 = '\0';
+            jce_editor_path_trim_to_parent(dir);
         }
     }
     return false;

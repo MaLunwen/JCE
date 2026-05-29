@@ -24,11 +24,16 @@ static char **split_args(const char *exe, const char *args, int *out_count)
 {
     *out_count = 0;
     int cap = 8;
-    char **argv = (char **)JCE_CALLOC((size_t)cap, sizeof(char *));
+    /* IMPORTANT: argv elements are allocated with SDL_strdup, and we
+     * grow this buffer with SDL_realloc — so the buffer itself MUST
+     * come from the SDL allocator family.  Mixing JCE_CALLOC (mimalloc)
+     * with SDL_realloc (libc malloc) corrupts the heap and crashes the
+     * editor the moment argv grows past `cap`. */
+    char **argv = (char **)SDL_calloc((size_t)cap, sizeof(char *));
     if (!argv) return NULL;
 
     argv[0] = SDL_strdup(exe ? exe : "");
-    if (!argv[0]) { JCE_FREE(argv); return NULL; }
+    if (!argv[0]) { SDL_free(argv); return NULL; }
     int n = 1;
 
     if (args && args[0]) {
@@ -91,7 +96,7 @@ static char **split_args(const char *exe, const char *args, int *out_count)
 
 fail:
     for (int i = 0; i < n; ++i) SDL_free(argv[i]);
-    JCE_FREE(argv);
+    SDL_free(argv);
     return NULL;
 }
 
@@ -99,7 +104,7 @@ static void free_argv(char **argv, int count)
 {
     if (!argv) return;
     for (int i = 0; i < count; ++i) SDL_free(argv[i]);
-    JCE_FREE(argv);
+    SDL_free(argv);
 }
 
 JceProcess *jce_process_spawn(const JceProcessConfig *cfg)
@@ -131,9 +136,20 @@ JceProcess *jce_process_spawn(const JceProcessConfig *cfg)
                                               : SDL_PROCESS_STDIO_INHERITED);
 
     SDL_Process *raw = SDL_CreateProcessWithProperties(props);
+    /* Stash any SDL error before we destroy the property bag (some
+     * implementations clear errno on success). */
+    const char *err = NULL;
+    if (!raw) err = SDL_GetError();
     SDL_DestroyProperties(props);
     free_argv(argv, argc);
-    if (!raw) return NULL;
+    if (!raw) {
+        if (err && err[0]) {
+            /* Surface the message via SDL_SetError so callers can
+             * retrieve it through jce_process_get_last_spawn_error(). */
+            SDL_SetError("%s", err);
+        }
+        return NULL;
+    }
 
     JceProcess *p = (JceProcess *)JCE_CALLOC(1, sizeof(*p));
     if (!p) {
@@ -207,4 +223,11 @@ bool jce_process_poll_exit(JceProcess *p, int *out_exit_code)
         return true;
     }
     return false;
+}
+
+
+const char *jce_process_get_last_spawn_error(void)
+{
+    const char *e = SDL_GetError();
+    return e ? e : "";
 }

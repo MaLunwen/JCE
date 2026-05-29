@@ -8,6 +8,8 @@
  */
 
 #include "jce_scene_view_internal.h"
+#include "ui/jce_editor_dnd.h"
+#include "ui/jce_editor_tip.h"
 #include "core/jce_editor_i18n.h"
 #include "scene/jce_editor_scene_asset_cache.h"
 #include "core/jce_hotkeys.h"
@@ -37,18 +39,15 @@ static void draw_scene_view_toolbar(void)
     JceGizmoMode gm = jce_state_get_gizmo_mode();
     if (ImGui::RadioButton("T", gm == JCE_GIZMO_TRANSLATE))
         jce_state_set_gizmo_mode(JCE_GIZMO_TRANSLATE);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("%s", jce_editor_i18n("sceneView.tooltip.translate"));
+    jce_editor::help_tip(jce_editor_i18n("sceneView.tooltip.translate"));
     ImGui::SameLine();
     if (ImGui::RadioButton("R", gm == JCE_GIZMO_ROTATE))
         jce_state_set_gizmo_mode(JCE_GIZMO_ROTATE);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("%s", jce_editor_i18n("sceneView.tooltip.rotate"));
+    jce_editor::help_tip(jce_editor_i18n("sceneView.tooltip.rotate"));
     ImGui::SameLine();
     if (ImGui::RadioButton("S", gm == JCE_GIZMO_SCALE))
         jce_state_set_gizmo_mode(JCE_GIZMO_SCALE);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("%s", jce_editor_i18n("sceneView.tooltip.scale"));
+    jce_editor::help_tip(jce_editor_i18n("sceneView.tooltip.scale"));
 
     ImGui::SameLine();
     ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
@@ -325,11 +324,7 @@ static bool entity_accepts_mesh_material_drop(uint32_t entity_id)
 
 static int detect_texture_drop_slot(const char *path)
 {
-    const char *name = path ? path : "";
-    const char *sep = strrchr(name, '/');
-    const char *sep2 = strrchr(name, '\\');
-    if (sep2 > sep) sep = sep2;
-    if (sep) name = sep + 1;
+    const char *name = jce_editor_path_basename_view(path ? path : "");
 
     char lowered[256];
     snprintf(lowered, sizeof(lowered), "%s", name);
@@ -367,8 +362,7 @@ static void assign_texture_drop_to_mesh_renderer(JceMeshRenderer *mesh_renderer_
     /* Always store project-relative so component paths survive
      * cwd / project moves and don't leak the user's home dir. */
     char rel[1024];
-    jce_editor_path_to_relative(rel, sizeof(rel), asset_path);
-    const char *store_path = rel[0] ? rel : asset_path;
+    const char *store_path = jce_editor_path_relative_or(rel, sizeof(rel), asset_path);
 
     auto &mr = *mesh_renderer_comp;
     switch (slot) {
@@ -404,8 +398,7 @@ static bool apply_material_asset_to_mesh_renderer(JceMeshRenderer *mesh_renderer
         return false;
 
     char rel[1024];
-    jce_editor_path_to_relative(rel, sizeof(rel), asset_path);
-    const char *store_path = rel[0] ? rel : asset_path;
+    const char *store_path = jce_editor_path_relative_or(rel, sizeof(rel), asset_path);
 
     auto &mr = *mesh_renderer_comp;
     snprintf(mr.material_path, sizeof(mr.material_path), "%s", store_path);
@@ -675,7 +668,7 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
 
     /* ── Ghost / hover preview while hovering ───────────────────── */
     if (const ImGuiPayload *peek =
-            ImGui::AcceptDragDropPayload("JCE_ASSET_PATH",
+            ImGui::AcceptDragDropPayload(JCE_DND_ASSET_PATH,
                                          ImGuiDragDropFlags_AcceptPeekOnly)) {
         const char *asset_path = (const char *)peek->Data;
         /* HDR must be checked BEFORE the generic texture branch because
@@ -714,7 +707,7 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
 
     /* ── Actual drop ────────────────────────────────────────────── */
     if (const ImGuiPayload *payload =
-            ImGui::AcceptDragDropPayload("JCE_ASSET_PATH")) {
+            ImGui::AcceptDragDropPayload(JCE_DND_ASSET_PATH)) {
         const char *asset_path = (const char *)payload->Data;
 
         jce_editor_scene_clear_ghost();
@@ -880,14 +873,9 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
                 compute_ground_hit(screen_pos, avail, drop_pos);
 
                 char name_buf[128];
-                const char *fname  = asset_path;
-                const char *sep    = strrchr(asset_path, '/');
-                const char *sep2   = strrchr(asset_path, '\\');
-                if (sep2 > sep) sep = sep2;
-                if (sep) fname = sep + 1;
+                const char *fname = jce_editor_path_basename_view(asset_path);
                 snprintf(name_buf, sizeof(name_buf), "%s", fname);
-                char *dot = strrchr(name_buf, '.');
-                if (dot) *dot = '\0';
+                jce_editor_path_strip_extension(name_buf);
 
                 {
                     char base[128];

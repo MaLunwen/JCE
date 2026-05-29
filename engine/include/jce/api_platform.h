@@ -16,6 +16,7 @@ extern "C" {
 #include <jce/os/platform/jce_window_event.h>
 #include <jce/os/platform/jce_gamepad.h>
 #include <jce/os/platform/jce_input.h>
+#include <jce/os/platform/jce_host_paths.h>
 #include <jce/os/platform/jce_input_actions.h>
 #include <jce/os/platform/jce_keys.h>
 #include <jce/os/platform/jce_single_instance.h>

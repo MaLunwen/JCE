@@ -81,6 +81,11 @@ struct AssetBrowserState {
     AssetBrowserViewMode view_mode;
     /* Type filter (kind mask): 0=all, 1=images, 2=models, 3=audio, 4=text/code, 5=archives */
     int             kind_filter;
+    /* Alpha-jump (Windows Explorer style): scroll to / select item starting with typed char. */
+    int             jump_scroll_idx;   /* -1 = no pending scroll */
+    char            jump_last_char;    /* last char used, for cycling */
+    int             jump_next_start;   /* where to search from next time */
+    double          jump_reset_time;   /* time of last jump, to detect cycling window */
 };
 
 extern AssetBrowserState s_assets;

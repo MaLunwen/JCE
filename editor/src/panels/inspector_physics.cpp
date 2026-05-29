@@ -6,6 +6,7 @@
  */
 
 #include "jce_panel_inspector_common.h"
+#include "ui/jce_editor_tip.h"
 
 void draw_comp_rigidbody(JceRigidBodyComponent *rb)
 {
@@ -42,8 +43,7 @@ void draw_comp_rigidbody(JceRigidBodyComponent *rb)
         rb->ccd_mode = (uint8_t)ccd_mode;
         insp_track_edit();
     }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("%s", jce_editor_i18n("inspector.rigidbody.ccd.tooltip"));
+    jce_editor::help_tip(jce_editor_i18n("inspector.rigidbody.ccd.tooltip"));
 
     if (rb->ccd_mode != 0) {
         snprintf(lbl, sizeof(lbl), "%s###rbCcdThr",

@@ -71,7 +71,8 @@ JceAssetKind classify(const std::string &ext_in)
     if (e == ".wav" || e == ".mp3" || e == ".ogg" || e == ".flac"
         || e == ".opus" || e == ".aac" || e == ".m4a") return JCE_ASSET_KIND_AUDIO;
     if (e == ".mat" || e == ".mat.json") return JCE_ASSET_KIND_MATERIAL;
-    if (e == ".scn" || e == ".scene") return JCE_ASSET_KIND_SCENE;
+    if (e == ".scn" || e == ".scene" || e == ".scene.json")
+        return JCE_ASSET_KIND_SCENE;
     if (e == ".sc" || e == ".sh" || e == ".bin" || e == ".sb")
         return JCE_ASSET_KIND_SHADER;
     if (e == ".lua" || e == ".js" || e == ".ts" || e == ".py"
@@ -274,10 +275,16 @@ JceAssetKind jce_assetdb_get_kind(const char *path)
     auto it = d.path_to_idx.find(key);
     if (it != d.path_to_idx.end())
         return d.entries[(size_t)it->second].kind;
-    /* Fall back to extension-based classification */
+    /* Fall back to extension-based classification (with compound ext support) */
     char ext_buf[64];
     jce_path_extension(ext_buf, sizeof(ext_buf), path);
-    return classify(ext_buf);
+    std::string ext = ext_buf;
+    char stem_buf[256];
+    jce_path_stem(stem_buf, sizeof(stem_buf), path);
+    char second_buf[64];
+    jce_path_extension(second_buf, sizeof(second_buf), stem_buf);
+    if (second_buf[0]) ext = std::string(second_buf) + ext;
+    return classify(ext);
 }
 
 int jce_assetdb_find_references(const char *asset_path,

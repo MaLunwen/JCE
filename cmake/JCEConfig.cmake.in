@@ -1,0 +1,190 @@
+@PACKAGE_INIT@
+
+# JCEConfig.cmake — find_package(JCE) entry for end-user projects.
+#
+#   find_package(JCE REQUIRED)
+#   add_executable(MyGame src/main.c)
+#   target_link_libraries(MyGame PRIVATE JCE::JCE)
+
+set(JCE_VERSION "@PROJECT_VERSION@")
+
+set(_jce_include_dir "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_INCLUDEDIR@")
+set(_jce_lib_dir     "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_LIBDIR@")
+set(_jce_bin_dir     "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_BINDIR@")
+set(_jce_share_dir   "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_DATAROOTDIR@/jce")
+
+# ---- Engine-side runtime resources shipped with the SDK. ----------- #
+# jce_target_embed_pak() prepends these to every consumer PAK so the
+# engine can find its built-in RML documents (HUD/settings/pause), the
+# fallback font, default shaders, etc.
+if(IS_DIRECTORY "${_jce_share_dir}/engine_resources")
+	set(JCE_ENGINE_RESOURCES_DIR "${_jce_share_dir}/engine_resources")
+endif()
+if(IS_DIRECTORY "${_jce_share_dir}/engine_ui")
+	set(JCE_ENGINE_UI_DIR "${_jce_share_dir}/engine_ui")
+endif()
+if(EXISTS "${_jce_share_dir}/THIRD_PARTY_LICENSES.md")
+	set(JCE_THIRD_PARTY_LICENSES_FILE "${_jce_share_dir}/THIRD_PARTY_LICENSES.md")
+endif()
+
+# ---- Host packer (jce_pak) location, if the SDK shipped it. -------- #
+# End-user projects use this via jce_target_embed_pak() to bake their
+# own game_assets.pak at build time.  May be empty on SDKs that did
+# not include the packer (e.g. release-only minimal redist).
+if(WIN32)
+	set(_jce_pak_exe "${_jce_bin_dir}/jce_pak.exe")
+else()
+	set(_jce_pak_exe "${_jce_bin_dir}/jce_pak")
+endif()
+if(EXISTS "${_jce_pak_exe}")
+	set(JCE_PAK_EXECUTABLE "${_jce_pak_exe}"
+		CACHE FILEPATH "Path to the JCE asset packer (jce_pak)." FORCE)
+endif()
+
+# ---- Host bundle wrapper (jce_bin2obj) location, if shipped. ------- #
+# Used by jce_target_embed_bundle() to bake .jbundle files into the
+# consumer's exe so the deliverable is genuinely a single file.
+if(WIN32)
+	set(_jce_bin2obj_exe "${_jce_bin_dir}/jce_bin2obj.exe")
+else()
+	set(_jce_bin2obj_exe "${_jce_bin_dir}/jce_bin2obj")
+endif()
+if(EXISTS "${_jce_bin2obj_exe}")
+	set(JCE_BIN2OBJ_EXECUTABLE "${_jce_bin2obj_exe}"
+		CACHE FILEPATH "Path to the JCE bundle→obj wrapper (jce_bin2obj)." FORCE)
+endif()
+
+set(_jce_core_release "${_jce_lib_dir}/Release/jce_engine_core@CMAKE_STATIC_LIBRARY_SUFFIX@")
+set(_jce_core_debug   "${_jce_lib_dir}/Debug/jce_engine_core@CMAKE_STATIC_LIBRARY_SUFFIX@")
+set(_jce_deps_release "${_jce_lib_dir}/Release/jce_engine_deps@CMAKE_STATIC_LIBRARY_SUFFIX@")
+set(_jce_deps_debug   "${_jce_lib_dir}/Debug/jce_engine_deps@CMAKE_STATIC_LIBRARY_SUFFIX@")
+
+if(NOT EXISTS "${_jce_core_release}" AND NOT EXISTS "${_jce_core_debug}")
+	set(JCE_FOUND FALSE)
+	set(JCE_NOT_FOUND_MESSAGE
+		"JCE: no fat lib under ${_jce_lib_dir} (looked for Release/Debug).")
+	return()
+endif()
+
+# JCE::JCE points at the *core* (first-party) fat lib; the dependency
+# fat lib is exposed as INTERFACE_LINK_LIBRARIES so the linker sees
+# them on the command line WITHOUT /WHOLEARCHIVE.
+add_library(JCE::JCE STATIC IMPORTED)
+
+set_target_properties(JCE::JCE PROPERTIES
+	INTERFACE_INCLUDE_DIRECTORIES "${_jce_include_dir}")
+
+if(EXISTS "${_jce_core_release}")
+	set_property(TARGET JCE::JCE APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+	set_target_properties(JCE::JCE PROPERTIES
+		IMPORTED_LOCATION_RELEASE             "${_jce_core_release}"
+		IMPORTED_LINK_INTERFACE_LANGUAGES_RELEASE "CXX")
+endif()
+if(EXISTS "${_jce_core_debug}")
+	set_property(TARGET JCE::JCE APPEND PROPERTY IMPORTED_CONFIGURATIONS DEBUG)
+	set_target_properties(JCE::JCE PROPERTIES
+		IMPORTED_LOCATION_DEBUG             "${_jce_core_debug}"
+		IMPORTED_LINK_INTERFACE_LANGUAGES_DEBUG "CXX")
+endif()
+
+if(EXISTS "${_jce_core_release}")
+	set_target_properties(JCE::JCE PROPERTIES
+		MAP_IMPORTED_CONFIG_RELWITHDEBINFO RELEASE
+		MAP_IMPORTED_CONFIG_MINSIZEREL     RELEASE)
+endif()
+
+# ---- Force-link the *core* fat lib only --------------------------- #
+# jce_engine_core bundles every first-party JCE TU, including ones the
+# user game never *explicitly* references (RmlUI binding, SDL_main,
+# the window event pump, scene-renderer registration ctors, …).
+# Without /WHOLEARCHIVE the linker drops those TUs as dead code,
+# producing an exe that boots but has no HUD and ignores WM_CLOSE.
+#
+# jce_engine_deps (3rd-party) is linked *without* whole-archive so
+# unused tooling code (e.g. protoc compiler TUs that need upb_*)
+# stays dead-stripped and does not produce unresolved-symbol errors.
+if(WIN32 AND MSVC)
+	set_property(TARGET JCE::JCE APPEND PROPERTY
+		INTERFACE_LINK_OPTIONS
+			"$<$<CONFIG:Release>:/WHOLEARCHIVE:${_jce_core_release}>"
+			"$<$<CONFIG:RelWithDebInfo>:/WHOLEARCHIVE:${_jce_core_release}>"
+			"$<$<CONFIG:MinSizeRel>:/WHOLEARCHIVE:${_jce_core_release}>"
+			"$<$<CONFIG:Debug>:/WHOLEARCHIVE:${_jce_core_debug}>")
+elseif(APPLE)
+	if(EXISTS "${_jce_core_release}")
+		set_property(TARGET JCE::JCE APPEND PROPERTY
+			INTERFACE_LINK_OPTIONS
+				"$<$<NOT:$<CONFIG:Debug>>:-Wl,-force_load,${_jce_core_release}>")
+	endif()
+	if(EXISTS "${_jce_core_debug}")
+		set_property(TARGET JCE::JCE APPEND PROPERTY
+			INTERFACE_LINK_OPTIONS
+				"$<$<CONFIG:Debug>:-Wl,-force_load,${_jce_core_debug}>")
+	endif()
+elseif(UNIX)
+	if(EXISTS "${_jce_core_release}")
+		set_property(TARGET JCE::JCE APPEND PROPERTY
+			INTERFACE_LINK_OPTIONS
+				"$<$<NOT:$<CONFIG:Debug>>:LINKER:--whole-archive,${_jce_core_release},--no-whole-archive>")
+	endif()
+	if(EXISTS "${_jce_core_debug}")
+		set_property(TARGET JCE::JCE APPEND PROPERTY
+			INTERFACE_LINK_OPTIONS
+				"$<$<CONFIG:Debug>:LINKER:--whole-archive,${_jce_core_debug},--no-whole-archive>")
+	endif()
+endif()
+
+# ---- The 3rd-party fat lib: link normally (no whole-archive) ------ #
+set(_jce_deps_genex "")
+if(EXISTS "${_jce_deps_release}" AND EXISTS "${_jce_deps_debug}")
+	set(_jce_deps_genex "$<IF:$<CONFIG:Debug>,${_jce_deps_debug},${_jce_deps_release}>")
+elseif(EXISTS "${_jce_deps_release}")
+	set(_jce_deps_genex "${_jce_deps_release}")
+elseif(EXISTS "${_jce_deps_debug}")
+	set(_jce_deps_genex "${_jce_deps_debug}")
+endif()
+if(_jce_deps_genex)
+	set_property(TARGET JCE::JCE APPEND PROPERTY
+		INTERFACE_LINK_LIBRARIES "${_jce_deps_genex}")
+endif()
+
+if(WIN32)
+	set_property(TARGET JCE::JCE APPEND PROPERTY
+		INTERFACE_LINK_LIBRARIES
+			psapi user32 gdi32 winmm imm32 ole32 oleaut32 version uuid
+			advapi32 setupapi shell32 ws2_32 dbghelp bcrypt
+			rpcrt4 usp10)
+	# Engine bundles C++ TUs (bgfx, RmlUI, ozz, Bullet, abseil, …).
+	# When the consumer target is pure C, link.exe does not auto-pull
+	# the MSVC C++ runtime, so STL helper symbols
+	# (e.g. __std_find_first_of_trivial_pos_1) go unresolved.  Force
+	# the dynamic C++ runtime here.  CMake selects /MD by default, so
+	# msvcprt.lib (DLL flavour) is the right pick; downstream targets
+	# that opt into the static CRT must override at their own scope.
+	if(MSVC)
+		set_property(TARGET JCE::JCE APPEND PROPERTY
+			INTERFACE_LINK_LIBRARIES
+				"$<$<NOT:$<CONFIG:Debug>>:msvcprt>"
+				"$<$<CONFIG:Debug>:msvcprtd>")
+	endif()
+elseif(APPLE)
+	set_property(TARGET JCE::JCE APPEND PROPERTY
+		INTERFACE_LINK_LIBRARIES
+			"-framework Cocoa" "-framework Metal" "-framework QuartzCore"
+			"-framework IOKit" "-framework CoreVideo" "-framework CoreAudio"
+			"-framework AudioToolbox" "-framework Carbon" "-framework ForceFeedback"
+			"-framework GameController" "-framework CoreHaptics")
+elseif(UNIX)
+	find_package(Threads REQUIRED)
+	set_property(TARGET JCE::JCE APPEND PROPERTY
+		INTERFACE_LINK_LIBRARIES Threads::Threads ${CMAKE_DL_LIBS} m)
+endif()
+
+set(JCE_INCLUDE_DIRS "${_jce_include_dir}")
+set(JCE_LIBRARIES    JCE::JCE)
+set(JCE_FOUND        TRUE)
+
+# ---- SDK helpers (jce_target_embed_pak, …). ----------------------- #
+include("${CMAKE_CURRENT_LIST_DIR}/JCESDKHelpers.cmake" OPTIONAL)
+
+check_required_components(JCE)

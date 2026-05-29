@@ -71,6 +71,13 @@ JCE_API size_t JCE_CALL jce_time_format_local(int64_t epoch_seconds,
                              char *out,
                              size_t out_size);
 
+/* Same as jce_time_format_local but formats UTC (gmtime_r/gmtime_s).
+   Centralizes the reentrant-call portability fork. */
+JCE_API size_t JCE_CALL jce_time_format_utc(int64_t epoch_seconds,
+                             const char *fmt,
+                             char *out,
+                             size_t out_size);
+
 /* ================================================================== */
 /* Cross-platform clock primitives                                     */
 /* ================================================================== */

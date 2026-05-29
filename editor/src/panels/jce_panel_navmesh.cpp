@@ -14,6 +14,7 @@
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
 #include "ui/jce_theme_palette.h"
+#include "ui/jce_editor_colors.h"
 
 #include <jce/tools/jce_imgui.hpp>
 #include "dialogs/jce_path_input.h"
@@ -301,8 +302,8 @@ void draw_preview(void)
     for (int z = 0; z < s.result.gz; z += step_z) {
         for (int x = 0; x < s.result.gx; x += step_x) {
             uint8_t w = s.result.walkable[(size_t)z * s.result.gx + x];
-            ImU32 col = w ? IM_COL32(80, 200, 120, 200)
-                          : IM_COL32(220, 80, 80, 200);
+            ImU32 col = w ? JCE_COL32_STATUS_OK
+                          : JCE_COL32_STATUS_ERR;
             float x0 = origin.x + x * cw;
             float y0 = origin.y + z * ch;
             dl->AddRectFilled(ImVec2(x0, y0),

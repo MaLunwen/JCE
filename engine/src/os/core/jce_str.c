@@ -3,6 +3,7 @@
  */
 
 #include <jce/os/core/jce_str.h>
+#include "os/core/jce_memory.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -37,6 +38,16 @@ size_t jce_strlcpy(char *dst, const char *src, size_t n)
         dst[copy] = '\0';
     }
     return src_len;
+}
+
+char *jce_strdup(const char *s)
+{
+    if (!s) return NULL;
+    size_t n = strlen(s) + 1;
+    char *p = (char *)JCE_MALLOC(n);
+    if (!p) return NULL;
+    memcpy(p, s, n);
+    return p;
 }
 
 const char *jce_platform_name(void)

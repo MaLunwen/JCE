@@ -121,12 +121,32 @@ typedef struct JceBundleFile JceBundleFile;
 JCE_API JceBundleFile *jce_bundle_file_open (struct JceFileSystem *fs,
                                              const char *jbundle_path,
                                              const char *mount_name_or_null);
+
+/* Same as jce_bundle_file_open but reads the JPAK image from an
+ * already-loaded memory buffer.  Used by exes that embed their
+ * bundles as `.rdata` symbols via jce_target_embed_bundle() so the
+ * shipped binary is genuinely a single file with no sidecar bundles
+ * dir.  The runtime takes a borrowed view of `data`; the caller must
+ * keep the buffer alive for the lifetime of the returned handle (a
+ * trivial property when the buffer lives in `.rdata`). */
+JCE_API JceBundleFile *jce_bundle_file_open_memory(struct JceFileSystem *fs,
+                                                   const void *data,
+                                                   size_t      size,
+                                                   const char *mount_name_or_null);
 JCE_API void           jce_bundle_file_close(JceBundleFile *bf);
 
 /* Inspectors. */
 JCE_API const char *jce_bundle_file_id        (const JceBundleFile *bf);
 JCE_API const char *jce_bundle_file_scene_path(const JceBundleFile *bf);
 JCE_API const char *jce_bundle_file_kind      (const JceBundleFile *bf);
+
+/* Underlying JPAK archive for the bundle.  Lets game code feed
+ * jce_model_load_gltf / jce_mesh_load / jce_texture_load directly
+ * with the bundle's pak when scene_renderer callbacks need to resolve
+ * mesh / model / texture paths that live inside the bundle (no
+ * sidecar files). Lifetime tied to the JceBundleFile handle. */
+struct JcePakArchive;
+JCE_API const struct JcePakArchive *jce_bundle_file_pak(const JceBundleFile *bf);
 
 JCE_EXTERN_C_END
 
