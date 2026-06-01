@@ -55,6 +55,34 @@ uint32_t jce_bullet_body_create(JceBulletWorld *bw,
 
 void jce_bullet_body_destroy(JceBulletWorld *bw, uint32_t idx);
 
+/* ------------------------------------------------------------------ */
+/* Compound / mesh bodies                                              */
+/* ------------------------------------------------------------------ */
+
+/* Plain-C mirror of JceColliderChild so this header keeps its
+ * zero-dependency stance on the physics public headers. */
+typedef struct {
+    uint8_t         shape;        /* JceShapeType */
+    jce_vec3        position;
+    jce_quat        rotation;
+    jce_vec3        half_extents;
+    const float    *vertices;     /* xyz triplets */
+    uint32_t        vertex_count;
+    const uint32_t *indices;
+    uint32_t        index_count;
+} JceBulletColliderChild;
+
+uint32_t jce_bullet_body_create_compound(JceBulletWorld *bw,
+                                         uint8_t type,
+                                         jce_vec3 pos, jce_quat rot,
+                                         float mass, float friction,
+                                         float restitution,
+                                         float lin_damp, float ang_damp,
+                                         uint32_t col_group, uint32_t col_mask,
+                                         bool is_trigger,
+                                         const JceBulletColliderChild *children,
+                                         uint32_t child_count);
+
 /* ================================================================== */
 /* Transform                                                           */
 /* ================================================================== */

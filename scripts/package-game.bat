@@ -107,18 +107,19 @@ set "PLATFORM=win32"
 :: the latest editor-authored content.  Reads paths from
 :: jce_project.json (schema v2 fields) and falls back to the v1
 :: convention "assets" -> "resources/_cooked".
-::
-:: Delegated to PowerShell to avoid cmd.exe paren-nesting issues with
-:: inline JSON parsing.
-set "COOK_PS1=%SCRIPT_DIR%cook-project.ps1"
-if exist "%COOK_PS1%" (
-    powershell -NoProfile -ExecutionPolicy Bypass -File "%COOK_PS1%" -ProjectDir "%PROJECT_DIR%" -Manifest "%MANIFEST%"
+set "_CK_SRC=assets"
+set "_CK_DST=resources/_cooked"
+call :json_str "%MANIFEST%" source_assets _CK_SRC
+call :json_str "%MANIFEST%" cooked_assets _CK_DST
+set "COOK_BAT=%SCRIPT_DIR%cook-project.bat"
+if exist "%COOK_BAT%" (
+    call "%COOK_BAT%" "%PROJECT_DIR%" "%_CK_SRC%" "%_CK_DST%"
     if errorlevel 1 (
         echo [package-game] cook step failed
         exit /b 2
     )
 ) else (
-    echo [package-game] cook helper missing: %COOK_PS1% — skipping cook
+    echo [package-game] cook helper missing: %COOK_BAT% — skipping cook
 )
 
 :: ---- Run the build -------------------------------------------------

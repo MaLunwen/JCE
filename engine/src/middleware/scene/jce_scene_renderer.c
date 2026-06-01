@@ -1017,7 +1017,7 @@ static void sr_scan_skybox(JceSceneRenderer *sr, JceScene *scene, EntityList *li
          * host filesystem for user-authored / loose HDRs. */
         const JcePakAsset *hdr_asset = jce_pak_find(sr->pak, hdr_path);
         if (hdr_asset && hdr_asset->original_size > 0) {
-            void *hdr_buf = malloc((size_t)hdr_asset->original_size);
+            void *hdr_buf = JCE_MALLOC((size_t)hdr_asset->original_size);
             if (hdr_buf) {
                 size_t got = jce_pak_decompress_ex(sr->pak, hdr_asset,
                                                   hdr_buf,
@@ -1025,7 +1025,7 @@ static void sr_scan_skybox(JceSceneRenderer *sr, JceScene *scene, EntityList *li
                 if (got == (size_t)hdr_asset->original_size)
                     sr->skybox = jce_skybox_create_from_hdr_memory(
                                      hdr_buf, (uint32_t)got, 512);
-                free(hdr_buf);
+                JCE_FREE(hdr_buf);
             }
         }
         if (!sr->skybox)

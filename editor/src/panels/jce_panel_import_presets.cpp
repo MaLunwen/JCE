@@ -46,6 +46,11 @@ struct ModelOpts {
     bool  gen_tangents  = true;
     bool  flip_uv       = false;
     bool  merge_meshes  = false;
+    bool  gen_collider  = false;
+    int   col_split     = 0;     /* 0 = by part, 1 = whole */
+    int   col_mode      = 0;     /* 0 auto..6 trimesh (JceColliderMode) */
+    bool  col_static    = true;
+    bool  col_detect    = true;  /* detect by naming / separated objects */
 };
 
 struct Preset {
@@ -136,6 +141,11 @@ void save_presets(void)
             jce_json_set_bool  (o, "gen_tangents",p.mdl.gen_tangents);
             jce_json_set_bool  (o, "flip_uv",     p.mdl.flip_uv);
             jce_json_set_bool  (o, "merge_meshes",p.mdl.merge_meshes);
+            jce_json_set_bool  (o, "gen_collider", p.mdl.gen_collider);
+            jce_json_set_int   (o, "col_split",    p.mdl.col_split);
+            jce_json_set_int   (o, "col_mode",     p.mdl.col_mode);
+            jce_json_set_bool  (o, "col_static",   p.mdl.col_static);
+            jce_json_set_bool  (o, "col_detect",   p.mdl.col_detect);
         }
         jce_json_array_push(arr, o);
     }
@@ -178,6 +188,11 @@ void load_presets(void)
                 p.mdl.gen_tangents = jce_json_get_bool(o, "gen_tangents", true);
                 p.mdl.flip_uv      = jce_json_get_bool(o, "flip_uv",      false);
                 p.mdl.merge_meshes = jce_json_get_bool(o, "merge_meshes", false);
+                p.mdl.gen_collider = jce_json_get_bool(o, "gen_collider", false);
+                p.mdl.col_split    = jce_json_get_int (o, "col_split", 0);
+                p.mdl.col_mode     = jce_json_get_int (o, "col_mode",  0);
+                p.mdl.col_static   = jce_json_get_bool(o, "col_static", true);
+                p.mdl.col_detect   = jce_json_get_bool(o, "col_detect", true);
             }
             s.presets.push_back(p);
         }
@@ -215,6 +230,11 @@ bool emit_sidecar(const char *asset_path, const Preset &p)
         jce_json_set_bool  (root, "gen_tangents", p.mdl.gen_tangents);
         jce_json_set_bool  (root, "flip_uv",      p.mdl.flip_uv);
         jce_json_set_bool  (root, "merge_meshes", p.mdl.merge_meshes);
+        jce_json_set_bool  (root, "gen_collider", p.mdl.gen_collider);
+        jce_json_set_int   (root, "col_split",    p.mdl.col_split);
+        jce_json_set_int   (root, "col_mode",     p.mdl.col_mode);
+        jce_json_set_bool  (root, "col_static",   p.mdl.col_static);
+        jce_json_set_bool  (root, "col_detect",   p.mdl.col_detect);
     }
     return ed_write_json_to_file(out_path, root);
 }
@@ -722,6 +742,18 @@ void draw_preset_editor(Preset &p)
         ImGui::Checkbox(jce_editor_i18n("importPresets.editor.genTangents"), &p.mdl.gen_tangents);
         ImGui::Checkbox(jce_editor_i18n("importPresets.editor.flipUV"),      &p.mdl.flip_uv);
         ImGui::Checkbox(jce_editor_i18n("importPresets.editor.mergeMeshes"), &p.mdl.merge_meshes);
+
+        ImGui::SeparatorText(jce_editor_i18n("importPresets.editor.collider"));
+        ImGui::Checkbox(jce_editor_i18n("importPresets.editor.genCollider"), &p.mdl.gen_collider);
+        if (p.mdl.gen_collider) {
+            const char *splits[] = { "By Part", "Whole" };
+            ImGui::Combo(jce_editor_i18n("importPresets.editor.colSplit"), &p.mdl.col_split, splits, 2);
+            const char *modes[] = { "Auto", "Box", "Sphere", "Capsule",
+                                    "Convex Hull", "Convex Decomp", "Triangle Mesh" };
+            ImGui::Combo(jce_editor_i18n("importPresets.editor.colMode"), &p.mdl.col_mode, modes, 7);
+            ImGui::Checkbox(jce_editor_i18n("importPresets.editor.colStatic"), &p.mdl.col_static);
+            ImGui::Checkbox(jce_editor_i18n("importPresets.editor.colDetect"), &p.mdl.col_detect);
+        }
     }
 }
 

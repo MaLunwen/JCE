@@ -400,9 +400,9 @@ JceAsyncPool *jce_pool_create(uint32_t num_workers)
     if (!pool) return NULL;
 
     if (num_workers == 0) {
-#if defined(__EMSCRIPTEN__)
+#if JCE_PLATFORM_WEB
         num_workers = 1;  /* single-threaded WASM: no pthreads, no worker threads */
-#elif defined(__ANDROID__)
+#elif JCE_PLATFORM_ANDROID
         num_workers = 2;
 #else
         num_workers = 3;

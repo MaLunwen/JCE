@@ -78,6 +78,10 @@ if "%ENG_ARCH%"=="" (
 	exit /b 2
 )
 
+REM ------ Build-machine profile (always x64 on SDK packaging host) ------
+REM For cross-compile targets (i686, aarch64) this diverges from CONAN_PROFILE.
+set "BUILD_PROFILE=windows-x64"
+
 set "CONAN_DIR=%ROOT%\build\desktop\windows-%ENG_ARCH%-conan"
 set "CONAN_TOOLCHAIN_REL=%CONAN_DIR%\build\Release\generators\conan_toolchain.cmake"
 set "CONAN_TOOLCHAIN_DBG=%CONAN_DIR%\build\Debug\generators\conan_toolchain.cmake"
@@ -143,11 +147,8 @@ if not exist "%BUILD_REL%\CMakeCache.txt" (
 		exit /b 1
 	)
 	REM dist variant: ensure conan toolchain present, then fresh configure.
-	if not exist "%CONAN_TOOLCHAIN_REL%" (
-		echo [package-sdk] [%V_NAME%] running Conan install ^(profile %CONAN_PROFILE%, Release^)
-		conan install "%ROOT%" -pr:h conan/profiles/%CONAN_PROFILE% -pr:b conan/profiles/%CONAN_PROFILE% --output-folder="%CONAN_DIR%" --build=missing
-		if errorlevel 1 exit /b 1
-	)
+	echo [package-sdk] [%V_NAME%] ensuring Conan toolchain (profile %CONAN_PROFILE%, Release)
+	call "%SCRIPT_DIR%lib\jce_build_common.bat" conan "conan/profiles/%CONAN_PROFILE%" "conan/profiles/%BUILD_PROFILE%" "%CONAN_DIR%" "%CONAN_TOOLCHAIN_REL%" || exit /b 1
 	echo [package-sdk] [%V_NAME%] configuring fresh Release build tree
 	cmake -S "%ROOT%" -B "%BUILD_REL%" -G Ninja -DCMAKE_TOOLCHAIN_FILE="%CONAN_TOOLCHAIN_REL%" -DCMAKE_BUILD_TYPE=Release -DJCE_BUILD_VARIANT=%V_NAME% %PATENTED_FLAG% -DJCE_ENABLE_SDK_INSTALL=ON -DCMAKE_INSTALL_PREFIX="%INSTALL_DIR%"
 	if errorlevel 1 exit /b 1
@@ -157,8 +158,12 @@ if not exist "%BUILD_REL%\CMakeCache.txt" (
 	if errorlevel 1 exit /b 1
 )
 
-echo [package-sdk] [%V_NAME%] building Release fat lib
-cmake --build "%BUILD_REL%" --target jce_sdk_fat_lib -j 8
+echo [package-sdk] [%V_NAME%] building Release fat lib + SDK tools
+REM  jce_sdk_fat_lib does not depend on the host tools that the SDK
+REM  install ships in <sdk>/bin (jce_bin2obj, jce_pak).  A fresh build
+REM  tree (e.g. the dist variant) therefore never builds jce_bin2obj
+REM  unless we ask for it explicitly, and `cmake --install` then fails.
+cmake --build "%BUILD_REL%" --target jce_sdk_fat_lib jce_bin2obj jce_pak -j 8
 if errorlevel 1 exit /b 1
 
 echo [package-sdk] [%V_NAME%] installing Release
@@ -166,35 +171,41 @@ cmake --install "%BUILD_REL%"
 if errorlevel 1 exit /b 1
 
 REM ---- Debug (optional) ----
-if "%SKIP_DEBUG%"=="0" (
-	if not exist "%BUILD_DBG%\CMakeCache.txt" (
-		if /I "%V_NAME%"=="release" (
-			echo [package-sdk] Debug build dir missing: %BUILD_DBG%
-			echo [package-sdk] Run the matching debug build first, or pass --skip-debug.
-			exit /b 1
-		)
-		if not exist "%CONAN_TOOLCHAIN_DBG%" (
-			echo [package-sdk] [%V_NAME%] running Conan install ^(profile %CONAN_PROFILE%, Debug^)
-			conan install "%ROOT%" -pr:h conan/profiles/%CONAN_PROFILE% -pr:b conan/profiles/%CONAN_PROFILE% --output-folder="%CONAN_DIR%" --build=missing -s build_type=Debug
-			if errorlevel 1 exit /b 1
-		)
-		echo [package-sdk] [%V_NAME%] configuring fresh Debug build tree
-		cmake -S "%ROOT%" -B "%BUILD_DBG%" -G Ninja -DCMAKE_TOOLCHAIN_FILE="%CONAN_TOOLCHAIN_DBG%" -DCMAKE_BUILD_TYPE=Debug -DJCE_BUILD_VARIANT=%V_NAME% %PATENTED_FLAG% -DJCE_ENABLE_SDK_INSTALL=ON -DCMAKE_INSTALL_PREFIX="%INSTALL_DIR%"
-		if errorlevel 1 exit /b 1
-	) else (
-		echo [package-sdk] [%V_NAME%] reconfiguring existing Debug tree
-		cmake "%BUILD_DBG%" %PATENTED_FLAG% -DJCE_ENABLE_SDK_INSTALL=ON -DCMAKE_INSTALL_PREFIX="%INSTALL_DIR%"
-		if errorlevel 1 exit /b 1
+REM  Skip via a plain goto rather than wrapping ~25 lines (with nested
+REM  if/else + literal parens in echoes) in one fragile parenthesised
+REM  block: such blocks have historically mis-parsed and run the Debug
+REM  config even when --skip-debug set SKIP_DEBUG=1.
+if "%SKIP_DEBUG%"=="1" (
+	echo [package-sdk] [%V_NAME%] skipping Debug SDK ^(--skip-debug^)
+	goto :after_debug
+)
+
+if not exist "%BUILD_DBG%\CMakeCache.txt" (
+	if /I "%V_NAME%"=="release" (
+		echo [package-sdk] Debug build dir missing: %BUILD_DBG%
+		echo [package-sdk] Run the matching debug build first, or pass --skip-debug.
+		exit /b 1
 	)
-
-	echo [package-sdk] [%V_NAME%] building Debug fat lib
-	cmake --build "%BUILD_DBG%" --target jce_sdk_fat_lib -j 8
+	echo [package-sdk] [%V_NAME%] ensuring Conan toolchain (profile %CONAN_PROFILE%, Debug)
+	call "%SCRIPT_DIR%lib\jce_build_common.bat" conan "conan/profiles/%CONAN_PROFILE%" "conan/profiles/%BUILD_PROFILE%" "%CONAN_DIR%" "%CONAN_TOOLCHAIN_DBG%" "-s build_type=Debug" || exit /b 1
+	echo [package-sdk] [%V_NAME%] configuring fresh Debug build tree
+	cmake -S "%ROOT%" -B "%BUILD_DBG%" -G Ninja -DCMAKE_TOOLCHAIN_FILE="%CONAN_TOOLCHAIN_DBG%" -DCMAKE_BUILD_TYPE=Debug -DJCE_BUILD_VARIANT=%V_NAME% %PATENTED_FLAG% -DJCE_ENABLE_SDK_INSTALL=ON -DCMAKE_INSTALL_PREFIX="%INSTALL_DIR%"
 	if errorlevel 1 exit /b 1
-
-	echo [package-sdk] [%V_NAME%] installing Debug
-	cmake --install "%BUILD_DBG%"
+) else (
+	echo [package-sdk] [%V_NAME%] reconfiguring existing Debug tree
+	cmake "%BUILD_DBG%" %PATENTED_FLAG% -DJCE_ENABLE_SDK_INSTALL=ON -DCMAKE_INSTALL_PREFIX="%INSTALL_DIR%"
 	if errorlevel 1 exit /b 1
 )
+
+echo [package-sdk] [%V_NAME%] building Debug fat lib + SDK tools
+cmake --build "%BUILD_DBG%" --target jce_sdk_fat_lib jce_bin2obj jce_pak -j 8
+if errorlevel 1 exit /b 1
+
+echo [package-sdk] [%V_NAME%] installing Debug
+cmake --install "%BUILD_DBG%"
+if errorlevel 1 exit /b 1
+
+:after_debug
 
 REM ---- VERSION.txt ----
 for /f "delims=" %%v in ('git -C "%ROOT%" rev-parse --short HEAD 2^>nul') do set "SHA=%%v"

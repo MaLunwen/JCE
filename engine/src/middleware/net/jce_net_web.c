@@ -10,11 +10,13 @@
  *   - Broadcast is implemented by iterating connected peers.
  *   - RTT measurement is approximate (ping/pong timestamps).
  *
- * Compiled ONLY when __EMSCRIPTEN__ is defined; on other platforms
+ * Compiled ONLY on WASM (JCE_PLATFORM_WEB); on other platforms
  * jce_net.c (ENet backend) is used instead.
  */
 
-#ifdef __EMSCRIPTEN__
+#include <jce/os/core/jce_defs.h>
+
+#if JCE_PLATFORM_WEB
 
 #include <jce/middleware/net/jce_net.h>
 #include <jce/os/core/jce_log.h>

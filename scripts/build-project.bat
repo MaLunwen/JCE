@@ -20,6 +20,11 @@
 ::                               for now; others print a helpful stub).
 ::   --clean                    Remove the project's build/ subdir first.
 ::
+::   The editor passes these so the script never parses jce_project.json:
+::   --cooked-assets <rel>      Cook output dir (rel to project), fed to PAK.
+::   --source-assets <rel>      Editor-author source dir (rel to project).
+::   --bundles "<a;b;c>"        Semicolon-joined .jbundle paths to stage.
+::
 :: Resolution order for the SDK:
 ::   1. --sdk <dir>
 ::   2. <project_dir>\jce_project.json "sdk"
@@ -47,6 +52,13 @@ set "EXE_NAME="
 set "VARIANT=release"
 set "PLATFORM=win32"
 set "DO_CLEAN=0"
+:: Editor-supplied (already-parsed) manifest values.  When the editor
+:: drives this script it passes these explicitly so the script never has
+:: to parse the (compact) jce_project.json itself.  Standalone CLI use
+:: falls back to best-effort scrapes / defaults below.
+set "COOKED_ARG="
+set "SRC_ARG="
+set "BUNDLES_ARG="
 :: Probe host arch (overridable via --arch).  We accept short aliases
 :: (x64/x86/arm64) and normalise to the GNU-triplet style names used
 :: across the SDK install tree (x86_64/i686/aarch64).
@@ -69,6 +81,9 @@ if /i "%~1"=="--variant"         ( set "VARIANT=%~2"  & shift & shift & goto :pa
 if /i "%~1"=="--target-platform" ( set "PLATFORM=%~2" & shift & shift & goto :parse_args )
 if /i "%~1"=="--arch"            ( set "ARCH=%~2"     & shift & shift & goto :parse_args )
 if /i "%~1"=="--clean"           ( set "DO_CLEAN=1"   & shift & goto :parse_args )
+if /i "%~1"=="--cooked-assets"   ( set "COOKED_ARG=%~2" & shift & shift & goto :parse_args )
+if /i "%~1"=="--source-assets"   ( set "SRC_ARG=%~2"    & shift & shift & goto :parse_args )
+if /i "%~1"=="--bundles"         ( set "BUNDLES_ARG=%~2" & shift & shift & goto :parse_args )
 if /i "%~1"=="-h"                goto :usage
 if /i "%~1"=="--help"            goto :usage
 echo ERROR: unknown argument: %~1
@@ -143,18 +158,29 @@ if /i not "!_tail!"==".exe" set "EXE_NAME=!EXE_NAME!.exe"
 
 :: ------- Cook source -> cooked assets ------------------------------
 :: Mirror source_assets -> cooked_assets so the in-source PAK pack step
-:: sees the editor-authored content.  Defaults come from schema v2.
-:: Delegated to PowerShell to avoid cmd.exe JSON-parsing pain.
+:: sees the editor-authored content.  The editor cooks natively (via
+:: jce_cook_run_all) before invoking us and passes --cooked-assets, so
+:: this xcopy is usually a fast no-op; it also covers standalone CLI use.
 set "_COOKED=resources/_cooked"
-call :json_str "%MANIFEST%" cooked_assets _COOKED
-set "COOK_PS1=%SCRIPT_DIR%cook-project.ps1"
-if exist "%COOK_PS1%" (
-    powershell -NoProfile -ExecutionPolicy Bypass -File "%COOK_PS1%" -ProjectDir "%PROJECT_DIR%" -Manifest "%MANIFEST%"
+set "_SRC=assets"
+if defined COOKED_ARG (
+    set "_COOKED=%COOKED_ARG%"
+) else (
+    call :json_str "%MANIFEST%" cooked_assets _COOKED
+)
+if defined SRC_ARG (
+    set "_SRC=%SRC_ARG%"
+) else (
+    call :json_str "%MANIFEST%" source_assets _SRC
+)
+set "COOK_BAT=%SCRIPT_DIR%cook-project.bat"
+if exist "%COOK_BAT%" (
+    call "%COOK_BAT%" "%PROJECT_DIR%" "%_SRC%" "%_COOKED%"
     if errorlevel 1 (
         echo [build-project] WARN: cook step failed — continuing with stale cooked tree
     )
 ) else (
-    echo [build-project] WARN: cook helper missing: %COOK_PS1%
+    echo [build-project] WARN: cook helper missing: %COOK_BAT%
 )
 
 :: ------- Platform dispatch -----------------------------------------
@@ -320,11 +346,11 @@ if not defined JCE_SKIP_VCVARS (
 :: ------- Resolve bundles list ---------------------------------------
 :: Extract `bundles` (JSON array of strings) and pass semicolon-joined
 :: paths to CMake via -DJCE_PROJECT_BUNDLES; the template's POST_BUILD
-:: step then copies each into `<exe_dir>/bundles/`.
-set "BUNDLES="
-for /f "usebackq delims=" %%B in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $j = Get-Content -Raw -LiteralPath '%MANIFEST%' | ConvertFrom-Json; if ($j.bundles) { ($j.bundles -join ';') } } catch {}"`) do (
-    set "BUNDLES=%%B"
-)
+:: step then copies each into `<exe_dir>/bundles/`.  The editor passes
+:: the already-parsed, semicolon-joined list via --bundles; standalone
+:: CLI use simply ships no bundles (the manifest's compact JSON array is
+:: not reliably parseable in cmd.exe without a JSON tool).
+set "BUNDLES=%BUNDLES_ARG%"
 
 cmake -S "%PROJECT_DIR%" -B "%BUILD_DIR%" -G Ninja ^
       -DCMAKE_BUILD_TYPE=%CMAKE_BUILD_TYPE% ^

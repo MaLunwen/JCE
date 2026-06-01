@@ -122,6 +122,55 @@ const char *jce_build_manager_default_project_script(void);
 bool jce_build_manager_run_script(const JceBuildScriptConfig *cfg);
 
 /* ---------------------------------------------------------------- *
+ * Native project build (single-executable path — NO scripts)        *
+ * ---------------------------------------------------------------- *
+ *
+ * Replaces scripts/build-project.bat and scripts/package-game.bat for
+ * end-user PROJECT mode (a directory with jce_project.json consumed
+ * against a packaged SDK).  The editor drives cmake/ninja directly via
+ * jce_process — on Windows the system MSVC environment is activated
+ * inline through Microsoft's own vcvarsall.bat (located via
+ * jce_toolchain); on POSIX cmake is spawned directly in two steps.  No
+ * first-party .bat / .sh files are involved, so the editor ships as a
+ * single executable next to the SDK with no scripts/ folder.
+ *
+ * The configure + compile (+ optional package staging) run as one
+ * logical operation: status flips to RUNNING and then SUCCEEDED /
+ * FAILED.  Stop / poll behave exactly as for run_script.
+ *
+ * Engine-workspace mode (building targets inside a full JCE source
+ * checkout, which needs the Conan->preset pipeline) still uses
+ * run_script() — that path is dev-only and always has scripts/ present.
+ */
+typedef struct {
+    const char *label;          /* status label; default "build-project" */
+    const char *project_dir;    /* required; absolute project root */
+    const char *sdk_dir;        /* SDK root; <sdk>/lib/cmake/JCE must exist */
+    const char *target;         /* CMake target (required) */
+    const char *exe_name;       /* expected artifact; default "<target>.exe" */
+    const char *variant;        /* "release"|"debug"|"dist"; default release */
+    const char *arch;           /* "x86_64"|"i686"|"aarch64"; default host */
+    const char *cooked_assets;  /* cooked dir rel to project (optional) */
+    const char *bundles;        /* ';'-joined .jbundle paths (optional) */
+    bool        clean;          /* wipe the project build/ subdir first */
+    /* When non-NULL and non-empty: after a successful build the built
+     * exe (+ cooked assets + a VERSION.txt) are staged into this
+     * directory, replacing package-game.bat.  NULL = plain build. */
+    const char *package_out_dir;
+    /* Optional metadata written into the staged VERSION.txt.  When
+     * NULL the staging step falls back to target/arch/variant only. */
+    const char *app_name;
+    const char *app_version;
+} JceBuildProjectConfig;
+
+/* Start a native project build (optionally followed by package staging).
+ * Returns false if a build is already running, required fields are
+ * missing, or the toolchain cannot be located.  On Windows, requires a
+ * detectable MSVC install (jce_toolchain) unless cl.exe is already on
+ * PATH. */
+bool jce_build_manager_start_project_build(const JceBuildProjectConfig *cfg);
+
+/* ---------------------------------------------------------------- *
  * Tool availability probe                                            *
  * ---------------------------------------------------------------- */
 

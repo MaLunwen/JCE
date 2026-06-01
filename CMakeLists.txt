@@ -497,7 +497,17 @@ if(CMAKE_CROSSCOMPILING)
 		IMPORTED_LOCATION_RELWITHDEBINFO "${JCE_PAK_EXECUTABLE}"
 		IMPORTED_LOCATION_MINSIZEREL "${JCE_PAK_EXECUTABLE}")
 else()
-	add_executable(jce_pak "${JCE_TOOLS_DIR}/jce_pak.c")
+	add_executable(jce_pak
+		"${JCE_TOOLS_DIR}/jce_pak.c"
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_archive_cook.c"
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_archive_writer.c"
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_archive_reader.c"
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_archive_path.c"
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_archive_dict.c"
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_archive_crypto.c"
+		"${JCE_ENGINE_SRC_DIR}/os/platform/jce_mmap.c"
+		"${JCE_ENGINE_SRC_DIR}/os/core/jce_alloc.c"
+		"${JCE_ENGINE_SRC_DIR}/os/core/jce_memory.c")
 	# When the SDK install is enabled, jce_pak must be built (it ships in
 	# <sdk>/bin/) so end-user projects can pack their own assets without
 	# having a JCE source tree.  Otherwise keep it out of the default
@@ -510,8 +520,11 @@ else()
 		C_STANDARD            99
 		C_STANDARD_REQUIRED   YES
 		C_EXTENSIONS          OFF)
-	target_include_directories(jce_pak PRIVATE "${JCE_ENGINE_SRC_DIR}")
+	target_include_directories(jce_pak PRIVATE
+		"${CMAKE_CURRENT_SOURCE_DIR}/engine/include"
+		"${JCE_ENGINE_SRC_DIR}")
 	target_link_libraries(jce_pak PRIVATE
+		mimalloc-static
 		zstd::libzstd_static
 		xxHash::xxhash)
 	jce_target_warnings(jce_pak)
@@ -574,32 +587,6 @@ if(NOT CMAKE_CROSSCOMPILING)
 	jce_target_warnings(jce_cook)
 endif()
 
-# ------------------------------------------------------------------ #
-# Host bundle packer tool: jce_bundle_pack                            #
-# ------------------------------------------------------------------ #
-
-if(NOT CMAKE_CROSSCOMPILING)
-	add_executable(jce_bundle_pack
-		"${JCE_TOOLS_DIR}/jce_bundle_pack.c"
-		"${JCE_ENGINE_SRC_DIR}/resource/jce_bundle_pack.c"
-		"${JCE_ENGINE_SRC_DIR}/resource/jce_bundle_deps.c"
-		"${JCE_ENGINE_SRC_DIR}/os/core/jce_memory.c")
-	set_target_properties(jce_bundle_pack PROPERTIES
-		EXCLUDE_FROM_ALL      ON
-		RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tools"
-		C_STANDARD            99
-		C_STANDARD_REQUIRED   YES
-		C_EXTENSIONS          OFF)
-	target_include_directories(jce_bundle_pack PRIVATE
-		"${CMAKE_CURRENT_SOURCE_DIR}/engine/include"
-		"${JCE_ENGINE_SRC_DIR}")
-	target_link_libraries(jce_bundle_pack PRIVATE
-		cjson::cjson
-		mimalloc-static
-		zstd::libzstd_static
-		xxHash::xxhash)
-	jce_target_warnings(jce_bundle_pack)
-endif()
 
 # ------------------------------------------------------------------ #
 # Asset cooking (optional — pre-decode textures & audio at build time)#
@@ -783,6 +770,7 @@ set(GAME_PAK_OBJ_FILE   "${CMAKE_CURRENT_BINARY_DIR}/game_assets_pak.obj")
 set(GAME_PAK_C_ARRAY    "${CMAKE_CURRENT_BINARY_DIR}/game_assets_pak_data.c")
 set(GAME_HEADER_FILE    "${CMAKE_CURRENT_BINARY_DIR}/game_embedded_assets.h")
 set(GAME_MANIFEST_FILE  "${CMAKE_CURRENT_BINARY_DIR}/_game_assets_manifest.cmake")
+set(GAME_BOM_FILE       "${CMAKE_CURRENT_BINARY_DIR}/reports/game_assets_bom.json")
 set(GAME_STAMP_FILE     "${CMAKE_CURRENT_BINARY_DIR}/_game_assets_pak.stamp")
 
 if(_OBJ_FORMAT STREQUAL "c-array")
@@ -795,7 +783,7 @@ endif()
 
 if(Python3_FOUND)
 	set(_GAME_REPORT_CMD COMMAND "${Python3_EXECUTABLE}" "${_PAK_REPORT_SCRIPT}"
-		"${GAME_MANIFEST_FILE}"
+		"${GAME_BOM_FILE}"
 		"${CMAKE_CURRENT_BINARY_DIR}/reports/game_assets_report.html"
 		--title "Game Assets Report")
 else()
@@ -804,8 +792,9 @@ endif()
 
 add_custom_command(
 	OUTPUT     "${GAME_STAMP_FILE}"
-	BYPRODUCTS "${GAME_PAK_FILE}" "${GAME_PAK_OBJ_FILE}" "${GAME_PAK_C_ARRAY}" "${GAME_HEADER_FILE}" "${GAME_MANIFEST_FILE}"
+	BYPRODUCTS "${GAME_PAK_FILE}" "${GAME_PAK_OBJ_FILE}" "${GAME_PAK_C_ARRAY}" "${GAME_HEADER_FILE}" "${GAME_MANIFEST_FILE}" "${GAME_BOM_FILE}"
 	${_GAME_PAK_PREP_COMMANDS}
+	COMMAND    "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/reports"
 	COMMAND    $<TARGET_FILE:jce_pak>
 	           ${_GAME_PAK_RES_FLAGS}
 	           --exclude-segment raw_assets
@@ -814,6 +803,7 @@ add_custom_command(
 	           --pak-file      "${GAME_PAK_FILE}"
 	           --header-file   "${GAME_HEADER_FILE}"
 	           --manifest-file "${GAME_MANIFEST_FILE}"
+	           --json          "${GAME_BOM_FILE}"
 	           ${_GAME_OBJ_FLAGS}
 	${_GAME_REPORT_CMD}
 	COMMAND    "${CMAKE_COMMAND}" -E touch "${GAME_STAMP_FILE}"
@@ -827,6 +817,7 @@ add_custom_command(
 set_source_files_properties(
 	"${GAME_PAK_FILE}" "${GAME_PAK_OBJ_FILE}" "${GAME_HEADER_FILE}"
 	"${GAME_MANIFEST_FILE}" "${GAME_STAMP_FILE}" "${GAME_PAK_C_ARRAY}"
+	"${GAME_BOM_FILE}"
 	PROPERTIES GENERATED TRUE)
 
 add_custom_target(PackGameAssets DEPENDS "${GAME_STAMP_FILE}")
@@ -841,6 +832,7 @@ set(EDITOR_PAK_OBJ_FILE   "${CMAKE_CURRENT_BINARY_DIR}/editor_assets_pak.obj")
 set(EDITOR_PAK_C_ARRAY    "${CMAKE_CURRENT_BINARY_DIR}/editor_assets_pak_data.c")
 set(EDITOR_HEADER_FILE    "${CMAKE_CURRENT_BINARY_DIR}/editor_embedded_assets.h")
 set(EDITOR_MANIFEST_FILE  "${CMAKE_CURRENT_BINARY_DIR}/_editor_assets_manifest.cmake")
+set(EDITOR_BOM_FILE       "${CMAKE_CURRENT_BINARY_DIR}/reports/editor_assets_bom.json")
 set(EDITOR_STAMP_FILE     "${CMAKE_CURRENT_BINARY_DIR}/_editor_assets_pak.stamp")
 
 if(_OBJ_FORMAT STREQUAL "c-array")
@@ -853,7 +845,7 @@ endif()
 
 if(Python3_FOUND)
 	set(_EDITOR_REPORT_CMD COMMAND "${Python3_EXECUTABLE}" "${_PAK_REPORT_SCRIPT}"
-		"${EDITOR_MANIFEST_FILE}"
+		"${EDITOR_BOM_FILE}"
 		"${CMAKE_CURRENT_BINARY_DIR}/reports/editor_assets_report.html"
 		--title "Editor Assets Report")
 else()
@@ -862,7 +854,8 @@ endif()
 
 add_custom_command(
 	OUTPUT     "${EDITOR_STAMP_FILE}"
-	BYPRODUCTS "${EDITOR_PAK_FILE}" "${EDITOR_PAK_OBJ_FILE}" "${EDITOR_PAK_C_ARRAY}" "${EDITOR_HEADER_FILE}" "${EDITOR_MANIFEST_FILE}"
+	BYPRODUCTS "${EDITOR_PAK_FILE}" "${EDITOR_PAK_OBJ_FILE}" "${EDITOR_PAK_C_ARRAY}" "${EDITOR_HEADER_FILE}" "${EDITOR_MANIFEST_FILE}" "${EDITOR_BOM_FILE}"
+	COMMAND    "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/reports"
 	COMMAND    $<TARGET_FILE:jce_pak>
 	           ${_EDITOR_PAK_RES_FLAGS}
 	           --exclude-segment raw_assets
@@ -871,6 +864,7 @@ add_custom_command(
 	           --pak-file      "${EDITOR_PAK_FILE}"
 	           --header-file   "${EDITOR_HEADER_FILE}"
 	           --manifest-file "${EDITOR_MANIFEST_FILE}"
+	           --json          "${EDITOR_BOM_FILE}"
 	           ${_EDITOR_OBJ_FLAGS}
 	${_EDITOR_REPORT_CMD}
 	COMMAND    "${CMAKE_COMMAND}" -E touch "${EDITOR_STAMP_FILE}"
@@ -883,6 +877,7 @@ add_custom_command(
 set_source_files_properties(
 	"${EDITOR_PAK_FILE}" "${EDITOR_PAK_OBJ_FILE}" "${EDITOR_HEADER_FILE}"
 	"${EDITOR_MANIFEST_FILE}" "${EDITOR_STAMP_FILE}" "${EDITOR_PAK_C_ARRAY}"
+	"${EDITOR_BOM_FILE}"
 	PROPERTIES GENERATED TRUE)
 
 add_custom_target(PackEditorAssets DEPENDS "${EDITOR_STAMP_FILE}")
@@ -918,12 +913,24 @@ if(JCE_EMBED_ENGINE_SHADERS)
 	set(JCE_ENGSH_C_ARRAY       "${CMAKE_BINARY_DIR}/jce_engine_shaders_pak.c")
 	set(JCE_ENGSH_HEADER_FILE   "${CMAKE_BINARY_DIR}/jce_engine_shaders_pak.h")
 	set(JCE_ENGSH_MANIFEST_FILE "${CMAKE_BINARY_DIR}/_engine_shaders_manifest.cmake")
+	set(JCE_ENGSH_BOM_FILE      "${CMAKE_BINARY_DIR}/reports/engine_shaders_bom.json")
 	set(JCE_ENGSH_STAMP_FILE    "${CMAKE_BINARY_DIR}/_engine_shaders_pak.stamp")
+
+	if(Python3_FOUND)
+		set(_ENGSH_REPORT_CMD COMMAND "${Python3_EXECUTABLE}" "${_PAK_REPORT_SCRIPT}"
+			"${JCE_ENGSH_BOM_FILE}"
+			"${CMAKE_BINARY_DIR}/reports/engine_shaders_report.html"
+			--title "Engine Shaders Report")
+	else()
+		set(_ENGSH_REPORT_CMD "")
+	endif()
 
 	add_custom_command(
 		OUTPUT     "${JCE_ENGSH_STAMP_FILE}"
 		BYPRODUCTS "${JCE_ENGSH_PAK_FILE}" "${JCE_ENGSH_C_ARRAY}"
 		           "${JCE_ENGSH_HEADER_FILE}" "${JCE_ENGSH_MANIFEST_FILE}"
+		           "${JCE_ENGSH_BOM_FILE}"
+		COMMAND    "${CMAKE_COMMAND}" -E make_directory "${CMAKE_BINARY_DIR}/reports"
 		COMMAND    $<TARGET_FILE:jce_pak>
 		           --resource-dir "${ENGINE_RESOURCE_DIR}"
 		           --exclude-segment i18n
@@ -934,8 +941,10 @@ if(JCE_EMBED_ENGINE_SHADERS)
 		           --pak-file      "${JCE_ENGSH_PAK_FILE}"
 		           --header-file   "${JCE_ENGSH_HEADER_FILE}"
 		           --manifest-file "${JCE_ENGSH_MANIFEST_FILE}"
+		           --json          "${JCE_ENGSH_BOM_FILE}"
 		           --obj-format    c-array
 		           --c-file        "${JCE_ENGSH_C_ARRAY}"
+		${_ENGSH_REPORT_CMD}
 		COMMAND    "${CMAKE_COMMAND}" -E touch "${JCE_ENGSH_STAMP_FILE}"
 		DEPENDS    jce_pak
 		           ${COMPILED_SHADER_FILES} ${COMPILED_PBR_SHADER_FILES}
@@ -949,6 +958,7 @@ if(JCE_EMBED_ENGINE_SHADERS)
 	set_source_files_properties(
 		"${JCE_ENGSH_PAK_FILE}" "${JCE_ENGSH_C_ARRAY}"
 		"${JCE_ENGSH_HEADER_FILE}" "${JCE_ENGSH_MANIFEST_FILE}"
+		"${JCE_ENGSH_BOM_FILE}"
 		"${JCE_ENGSH_STAMP_FILE}"
 		PROPERTIES GENERATED TRUE)
 
@@ -1056,6 +1066,17 @@ if(Python3_FOUND)
 			VERBATIM)
 		add_custom_target(jce_i18n_auto ALL
 			DEPENDS "${_JCE_I18N_STAMP}")
+
+		# The ALL membership only fires for the default build; an explicit
+		# `--target JCE_Editor` build skips it.  Wire the editor (and game)
+		# to depend on the stamp so every editor build re-normalizes drifted
+		# i18n files, matching this block's documented contract.
+		if(TARGET JCE_Editor)
+			add_dependencies(JCE_Editor jce_i18n_auto)
+		endif()
+		if(TARGET caged_kingdom)
+			add_dependencies(caged_kingdom jce_i18n_auto)
+		endif()
 	endif()
 endif()
 

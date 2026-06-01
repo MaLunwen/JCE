@@ -158,7 +158,7 @@ static void refresh_prefill_from_project(void)
         snprintf(s_bp.build_exe, sizeof(s_bp.build_exe),
                  "%s", p->output_exe);
     } else if (p->target_name && p->target_name[0]) {
-#if defined(_WIN32)
+#if JCE_PLATFORM_WINDOWS
         snprintf(s_bp.build_exe, sizeof(s_bp.build_exe),
                  "%s.exe", p->target_name);
 #else
@@ -479,7 +479,7 @@ static void apply_post_success(const JceBuildStatus &st)
         while (!root.empty() &&
                (root.back() == '/' || root.back() == '\\'))
             root.pop_back();
-#if defined(_WIN32)
+#if JCE_PLATFORM_WINDOWS
         const char sep = '\\';
 #else
         const char sep = '/';
@@ -717,9 +717,72 @@ static void draw_profiles_tab(void)
             const JceProject *jp = jce_editor_project_get();
             const bool project_mode = (!engine_ws) && (jp != nullptr);
 
-            const char *def = project_mode
-                                  ? jce_build_manager_default_project_script()
-                                  : jce_build_manager_default_desktop_script();
+            /* PROJECT mode (end-user, SDK-based) builds natively through
+             * jce_build_manager — no first-party scripts.  This is what
+             * keeps the shipped editor a single executable next to the
+             * SDK.  ENGINE-WORKSPACE mode (JCE devs in a full checkout)
+             * still uses scripts/build-desktop.* below since it needs the
+             * Conan->preset pipeline and always has scripts/ present. */
+            if (project_mode) {
+                const char *root = s_bp.project_root[0]
+                                       ? s_bp.project_root
+                                       : jp->project_root;
+                const char *sdk = (jp->sdk_path && jp->sdk_path[0])
+                                      ? jp->sdk_path : nullptr;
+                if (!sdk) {
+                    const char *env_sdk = std::getenv("JCE_SDK_DIR");
+                    if (env_sdk && env_sdk[0]) sdk = env_sdk;
+                }
+                if (!sdk || !sdk[0]) {
+                    jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                        "[build] project mode needs an SDK: set project.sdk_path "
+                        "or the JCE_SDK_DIR environment variable");
+                    return;
+                }
+                const char *tgt = s_bp.build_target[0]
+                                      ? s_bp.build_target
+                                      : (jp->target_name && jp->target_name[0]
+                                             ? jp->target_name : jp->name);
+                const char *exe = s_bp.build_exe[0]
+                                      ? s_bp.build_exe
+                                      : (jp->output_exe && jp->output_exe[0]
+                                             ? jp->output_exe : nullptr);
+                std::string bundles_joined;
+                if (jp->bundles && jp->bundles_count > 0) {
+                    for (int i = 0; i < jp->bundles_count; ++i) {
+                        if (!jp->bundles[i] || !jp->bundles[i][0]) continue;
+                        if (!bundles_joined.empty()) bundles_joined += ";";
+                        bundles_joined += jp->bundles[i];
+                    }
+                }
+                const char *arch = (s_bp.arch_idx > 0 &&
+                    s_bp.arch_idx < (int)(sizeof(s_arch_cli)/sizeof(s_arch_cli[0])))
+                        ? s_arch_cli[s_bp.arch_idx] : nullptr;
+
+                JceBuildProjectConfig pcfg{};
+                pcfg.label         = p.preset.c_str();
+                pcfg.project_dir   = root;
+                pcfg.sdk_dir       = sdk;
+                pcfg.target        = tgt;
+                pcfg.exe_name      = exe;
+                pcfg.variant       = s_bp.use_dist ? "dist" : "release";
+                pcfg.arch          = arch;
+                pcfg.cooked_assets = (jp->cooked_assets && jp->cooked_assets[0])
+                                         ? jp->cooked_assets : nullptr;
+                pcfg.bundles       = bundles_joined.empty()
+                                         ? nullptr : bundles_joined.c_str();
+                pcfg.clean         = s_bp.use_clean;
+                pcfg.package_out_dir = nullptr;   /* plain build (no staging) */
+                pcfg.app_name      = jp->name;
+                pcfg.app_version   = nullptr;
+                jce_editor_console_log_level(JCE_CONSOLE_INFO,
+                    "[build] native project build: target=%s sdk=%s",
+                    tgt ? tgt : "(none)", sdk);
+                jce_build_manager_start_project_build(&pcfg);
+                return;
+            }
+
+            const char *def = jce_build_manager_default_desktop_script();
             const char *script = s_bp.script_override[0]
                                      ? s_bp.script_override
                                      : def;
@@ -736,53 +799,9 @@ static void draw_profiles_tab(void)
                 if (!args.empty()) args += " ";
                 args += a;
             };
-            auto append_quoted = [&](const char *a) {
-                if (!a || !a[0]) return;
-                if (!args.empty()) args += " ";
-                args += "\"";
-                args += a;
-                args += "\"";
-            };
 
             if (project_mode) {
-                /* Positional <project_dir> first. */
-                const char *root = s_bp.project_root[0]
-                                       ? s_bp.project_root
-                                       : jp->project_root;
-                append_quoted(root);
-                /* Variant: dist > debug > release. */
-                if      (s_bp.use_dist)  { append_arg("--variant"); append_arg("dist");  }
-                else                     { append_arg("--variant"); append_arg("release"); }
-                if (s_bp.use_clean)      append_arg("--clean");
-                /* SDK resolution: manifest > env (script also handles
-                 * fallback, but be explicit if we have a value). */
-                const char *sdk = (jp->sdk_path && jp->sdk_path[0])
-                                      ? jp->sdk_path
-                                      : nullptr;
-                if (!sdk) {
-                    const char *env_sdk = std::getenv("JCE_SDK_DIR");
-                    if (env_sdk && env_sdk[0]) sdk = env_sdk;
-                }
-                if (sdk) { append_arg("--sdk"); append_quoted(sdk); }
-                /* Target / exe overrides. */
-                const char *tgt = s_bp.build_target[0]
-                                      ? s_bp.build_target
-                                      : (jp->target_name && jp->target_name[0]
-                                             ? jp->target_name
-                                             : jp->name);
-                const char *exe = s_bp.build_exe[0]
-                                      ? s_bp.build_exe
-                                      : (jp->output_exe && jp->output_exe[0]
-                                             ? jp->output_exe
-                                             : nullptr);
-                if (tgt && tgt[0]) { append_arg("--target"); append_arg(tgt); }
-                if (exe && exe[0]) { append_arg("--exe");    append_arg(exe); }
-                /* Optional --arch (omitted = host default). */
-                if (s_bp.arch_idx > 0 &&
-                    s_bp.arch_idx < (int)(sizeof(s_arch_cli)/sizeof(s_arch_cli[0]))) {
-                    append_arg("--arch");
-                    append_arg(s_arch_cli[s_bp.arch_idx]);
-                }
+                /* Unreachable: project mode dispatched natively above. */
             } else {
                 /* Engine-workspace mode (legacy, build-desktop.bat). */
                 if (s_bp.use_clean) append_arg("--clean");
@@ -821,23 +840,35 @@ static void draw_profiles_tab(void)
             const bool _engine_ws_display = jce_editor_project_is_engine_workspace();
             const bool _project_mode_display = (!_engine_ws_display) &&
                                                 (jce_editor_project_get() != nullptr);
-            const char *def_script = _project_mode_display
-                                         ? jce_build_manager_default_project_script()
-                                         : jce_build_manager_default_desktop_script();
-            const char *eff_script = s_bp.script_override[0]
-                                         ? s_bp.script_override
-                                         : (def_script ? def_script : "(unsupported platform)");
-            ImGui::TextDisabled("%s", jce_editor_i18n("buildProfiles.script"));
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "%s", eff_script);
-            ImGui::SetNextItemWidth(360.0f);
-            ImGui::InputTextWithHint("##bpScriptOverride",
-                                     def_script ? def_script : "scripts/...",
-                                     s_bp.script_override,
-                                     sizeof(s_bp.script_override));
+            if (_project_mode_display) {
+                /* Project mode builds natively (cmake/ninja against the
+                 * SDK) — no script is involved, so we surface that rather
+                 * than a misleading scripts/ path.  The override field is
+                 * intentionally hidden here. */
+                ImGui::TextDisabled("%s", jce_editor_i18n("buildProfiles.script"));
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f),
+                                   "%s",
+                                   jce_editor_i18n("buildProfiles.nativeBuild"));
+            } else {
+                const char *def_script =
+                    jce_build_manager_default_desktop_script();
+                const char *eff_script = s_bp.script_override[0]
+                                             ? s_bp.script_override
+                                             : (def_script ? def_script
+                                                  : "(unsupported platform)");
+                ImGui::TextDisabled("%s", jce_editor_i18n("buildProfiles.script"));
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "%s", eff_script);
+                ImGui::SetNextItemWidth(360.0f);
+                ImGui::InputTextWithHint("##bpScriptOverride",
+                                         def_script ? def_script : "scripts/...",
+                                         s_bp.script_override,
+                                         sizeof(s_bp.script_override));
+            }
             ImGui::SameLine();
             ImGui::Checkbox("--clean", &s_bp.use_clean);
-#if defined(_WIN32)
+#if JCE_PLATFORM_WINDOWS
             ImGui::SameLine();
             ImGui::Checkbox("--dist", &s_bp.use_dist);
 #endif
@@ -1030,24 +1061,87 @@ static void draw_profiles_tab(void)
             const bool can_pack = (root && *root) && !running;
             if (!can_pack) ImGui::BeginDisabled();
             if (ImGui::Button(jce_editor_i18n("buildProfiles.pack"))) {
-                static char pack_args[1024];
-                snprintf(pack_args, sizeof pack_args,
-                         "\"%s\" --target %s --exe %s --variant %s",
-                         root,
-                         s_bp.build_target[0] ? s_bp.build_target : "",
-                         s_bp.build_exe[0] ? s_bp.build_exe : "",
-                         s_bp.use_dist ? "dist" : "release");
-                JceBuildScriptConfig pcfg{};
-                pcfg.label       = "package-game";
-                pcfg.script_path = "scripts/package-game.bat";
-                pcfg.script_args = pack_args;
-                pcfg.working_dir = nullptr;  /* editor cwd = engine root */
-                if (jce_build_manager_run_script(&pcfg)) {
-                    jce_editor_console_log_level(JCE_CONSOLE_INFO,
-                        "[pack] package-game.bat started for %s", root);
-                } else {
+                /* Native package staging: build + verify + copy exe and
+                 * cooked assets into dist/games/<name>-<ver>-<plat>-<arch>.
+                 * Replaces scripts/package-game.bat so the editor ships
+                 * without first-party scripts. */
+                const JceProject *jpk = jp_pack;
+                const char *sdk = (jpk && jpk->sdk_path && jpk->sdk_path[0])
+                                      ? jpk->sdk_path : nullptr;
+                if (!sdk) {
+                    const char *env_sdk = std::getenv("JCE_SDK_DIR");
+                    if (env_sdk && env_sdk[0]) sdk = env_sdk;
+                }
+                if (!sdk || !sdk[0]) {
                     jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-                        "[pack] failed to start package-game.bat");
+                        "[pack] needs an SDK: set project.sdk_path or "
+                        "JCE_SDK_DIR");
+                } else {
+                    const char *tgt = s_bp.build_target[0]
+                                          ? s_bp.build_target
+                                          : (jpk && jpk->target_name &&
+                                             jpk->target_name[0]
+                                                 ? jpk->target_name
+                                                 : (jpk ? jpk->name : ""));
+                    const char *exe = s_bp.build_exe[0]
+                                          ? s_bp.build_exe
+                                          : (jpk && jpk->output_exe &&
+                                             jpk->output_exe[0]
+                                                 ? jpk->output_exe : nullptr);
+                    const char *arch_cli = (s_bp.arch_idx > 0 &&
+                        s_bp.arch_idx <
+                            (int)(sizeof(s_arch_cli)/sizeof(s_arch_cli[0])))
+                            ? s_arch_cli[s_bp.arch_idx] : host_arch_triplet();
+#if JCE_PLATFORM_WINDOWS
+                    const char *plat = "win32";
+#elif JCE_PLATFORM_MACOS
+                    const char *plat = "darwin";
+#else
+                    const char *plat = "linux";
+#endif
+                    std::string bundles_joined;
+                    if (jpk && jpk->bundles && jpk->bundles_count > 0) {
+                        for (int i = 0; i < jpk->bundles_count; ++i) {
+                            if (!jpk->bundles[i] || !jpk->bundles[i][0]) continue;
+                            if (!bundles_joined.empty()) bundles_joined += ";";
+                            bundles_joined += jpk->bundles[i];
+                        }
+                    }
+                    const char *name = (jpk && jpk->name && jpk->name[0])
+                                           ? jpk->name : "game";
+                    const char *ver = (jpk && jpk->version && jpk->version[0])
+                                          ? jpk->version : "0.0.0";
+                    std::string out_dir = std::string(root) +
+                        "/dist/games/" + name + "-" + ver + "-" +
+                        plat + "-" + arch_cli;
+
+                    JceBuildProjectConfig pcfg{};
+                    pcfg.label         = "package-game";
+                    pcfg.project_dir   = root;
+                    pcfg.sdk_dir       = sdk;
+                    pcfg.target        = tgt;
+                    pcfg.exe_name      = exe;
+                    pcfg.variant       = s_bp.use_dist ? "dist" : "release";
+                    pcfg.arch          = (s_bp.arch_idx > 0) ?
+                                             s_arch_cli[s_bp.arch_idx] : nullptr;
+                    pcfg.cooked_assets = (jpk && jpk->cooked_assets &&
+                                          jpk->cooked_assets[0])
+                                             ? jpk->cooked_assets : nullptr;
+                    pcfg.bundles       = bundles_joined.empty()
+                                             ? nullptr
+                                             : bundles_joined.c_str();
+                    pcfg.clean         = s_bp.use_clean;
+                    pcfg.package_out_dir = out_dir.c_str();
+                    pcfg.app_name      = name;
+                    pcfg.app_version   = ver;
+                    if (jce_build_manager_start_project_build(&pcfg)) {
+                        jce_editor_console_log_level(JCE_CONSOLE_INFO,
+                            "[pack] native package started -> %s",
+                            out_dir.c_str());
+                    } else {
+                        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                            "[pack] failed to start native package");
+                    }
                 }
             }
             if (!can_pack) ImGui::EndDisabled();

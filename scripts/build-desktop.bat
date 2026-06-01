@@ -13,17 +13,16 @@ pushd "%REPO_ROOT%" || goto :error
 set "CONAN_DIR=build\desktop\windows-x64-conan"
 set "BUILD_DIR=build\desktop\windows-x64"
 set "TOOLCHAIN=%CONAN_DIR%\build\Release\generators\conan_toolchain.cmake"
+set "PROFILE=conan/profiles/windows-x64"
 set "VARIANT=release"
 set "TARGET=CagedKingdom"
 set "EXE_NAME=caged_kingdom.exe"
+set "COMMON=%~dp0lib\jce_build_common.bat"
 
 :: -- Parse arguments --
 :parse_args
 if /i "%~1"=="--clean" (
-    echo === Cleaning build directory ===
-    if exist "%BUILD_DIR%" rmdir /s /q "%BUILD_DIR%"
-    if exist "%CONAN_DIR%" rmdir /s /q "%CONAN_DIR%"
-    echo   Done
+    call "%COMMON%" clean "%BUILD_DIR%" "%CONAN_DIR%"
     shift
     goto :parse_args
 )
@@ -51,17 +50,7 @@ if not "%~1"=="" (
 
 :: -- Step 1: Conan install (skip if toolchain exists) --
 echo === Step 1: Conan install (windows-x64) ===
-if exist "%TOOLCHAIN%" (
-    echo   Toolchain exists, skipping. Use --clean to force.
-) else (
-    conan install . -pr:h conan/profiles/windows-x64 -pr:b conan/profiles/windows-x64 --output-folder=%CONAN_DIR% --build=missing
-    if errorlevel 1 goto :error
-)
-
-if not exist "%TOOLCHAIN%" (
-    echo ERROR: Conan toolchain not found: %TOOLCHAIN%
-    goto :error
-)
+call "%COMMON%" conan "%PROFILE%" "%PROFILE%" "%CONAN_DIR%" "%TOOLCHAIN%" || goto :error
 
 :: -- Step 2: CMake configure (always, picks up new/removed sources) --
 echo === Step 2: CMake configure (%VARIANT%) ===
@@ -73,10 +62,7 @@ echo === Step 3: Build target %TARGET% ===
 cmake --build %BUILD_DIR% --target %TARGET%
 if errorlevel 1 goto :error
 
-if not exist "%BUILD_DIR%\%VARIANT%\%EXE_NAME%" (
-    echo ERROR: %EXE_NAME% not found at %BUILD_DIR%\%VARIANT%\%EXE_NAME%
-    goto :error
-)
+call "%COMMON%" verify "%BUILD_DIR%\%VARIANT%\%EXE_NAME%" "%EXE_NAME%" || goto :error
 
 set "CPPCHECK_XML=%BUILD_DIR%\reports\cppcheck-report.xml"
 if exist "%CPPCHECK_XML%" (

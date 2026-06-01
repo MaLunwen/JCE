@@ -60,10 +60,13 @@ static inline bool jce_vehicle_valid(JceVehicleHandle h) { return h.idx != UINT3
 /* ================================================================== */
 
 typedef enum {
-    JCE_SHAPE_BOX      = 0,
-    JCE_SHAPE_SPHERE   = 1,
-    JCE_SHAPE_CAPSULE  = 2,
-    JCE_SHAPE_PLANE    = 3
+    JCE_SHAPE_BOX           = 0,
+    JCE_SHAPE_SPHERE        = 1,
+    JCE_SHAPE_CAPSULE       = 2,
+    JCE_SHAPE_PLANE         = 3,
+    JCE_SHAPE_CONVEX_HULL   = 4,  /* point cloud → convex hull (dynamic-safe) */
+    JCE_SHAPE_TRIANGLE_MESH = 5,  /* exact triangle soup (static bodies only) */
+    JCE_SHAPE_COMPOUND      = 6   /* container of child shapes (per-object) */
 } JceShapeType;
 
 typedef enum {

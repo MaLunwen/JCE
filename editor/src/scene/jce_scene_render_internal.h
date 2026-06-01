@@ -140,6 +140,7 @@ void draw_hover_highlight(void);
 void draw_physics_debug(void);
 void draw_joint_gizmos(void);
 void draw_cloth_gizmos(void);
+void draw_compound_collider_gizmos(void);
 
 /* ── Functions from jce_scene_render_camera.cpp ───────────────────── */
 

@@ -42,7 +42,7 @@ void jce_editor_config_defaults(JceEditorConfig *cfg) {
     cfg->font_size = 24;
     cfg->ui_scale  = 1.0f;
     strncpy(cfg->theme, "Dark", sizeof(cfg->theme) - 1);
-    strncpy(cfg->renderer, "OpenGL", sizeof(cfg->renderer) - 1);
+    strncpy(cfg->renderer, "Auto", sizeof(cfg->renderer) - 1);
     cfg->last_project[0] = '\0';
     cfg->last_scene_path[0] = '\0';
     cfg->recent_count = 0;

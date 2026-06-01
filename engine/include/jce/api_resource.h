@@ -13,6 +13,10 @@ extern "C" {
 #endif
 
 #include <jce/resource/jce_pak_loader.h>
+#include <jce/resource/jce_archive.h>
+#include <jce/resource/jce_archive_cook.h>
+#include <jce/resource/jce_archive_loader.h>
+#include <jce/resource/jce_archive_writer.h>
 #include <jce/resource/jce_asset.h>
 #include <jce/resource/jce_asset_format.h>
 #include <jce/resource/jce_scene_contract.h>

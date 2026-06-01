@@ -575,6 +575,7 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     if (jce_state_get_show_cloth_gizmos()) {
         draw_cloth_gizmos();
     }
+    draw_compound_collider_gizmos();
     draw_hover_highlight();
     draw_ghost_entity();
 

@@ -27,7 +27,10 @@
 #include <jce/middleware/audio/jce_audio.h>
 #include <jce/middleware/physics/jce_physics.h>
 #include <jce/middleware/physics/jce_physics_types.h>
+#include <jce/middleware/physics/jce_collider_cook.h>
+#include <jce/middleware/physics/jce_collider_asset.h>
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/resource/jce_model_importer.h>
 #include <jce/os/core/jce_alloc.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
@@ -120,6 +123,112 @@ static bool rt_grow_voices(JceRuntime *rt)
 
 /* ── Scene walk: spawn physics + audio for each entity ───────────── */
 
+/*
+ * Try to materialise a per-object compound collider for entity `e`.
+ * Loads the referenced model WITHOUT flattening its node hierarchy, cooks
+ * each part into its own child shape, and instantiates the lot as a single
+ * compound body — so a model holding N separated objects yields N child
+ * colliders rather than one fat hull spanning the gaps between them.
+ *
+ * Returns true if a body was spawned (caller then skips the regular
+ * rigid-body path so the entity does not get a second body).
+ */
+static bool rt_try_spawn_compound(JceRuntime *rt, JceScene *scene,
+                                  JceEntity e, const JceTransform *tf)
+{
+	JceCompoundColliderComponent *cc = jce_scene_get_compound_collider(scene, e);
+	if (!cc || cc->model_path[0] == '\0') return false;
+
+	/* Load parts from the pak (deployed) or the host filesystem (editor). */
+	JceModelParts parts;
+	memset(&parts, 0, sizeof parts);
+	bool loaded = false;
+	if (rt->pak) {
+		const JcePakAsset *asset = jce_pak_find(rt->pak, cc->model_path);
+		if (asset) {
+			void *buf = jce_malloc((size_t)asset->original_size);
+			if (buf) {
+				size_t n = jce_pak_decompress(asset, buf,
+				                              (size_t)asset->original_size);
+				if (n > 0) {
+					const char *ext = strrchr(cc->model_path, '.');
+					loaded = jce_model_importer_load_parts_memory(
+						buf, n, ext ? ext : "", &parts);
+				}
+				jce_free(buf);
+			}
+		}
+	}
+	if (!loaded)
+		loaded = jce_model_importer_load_parts_file(cc->model_path, &parts);
+	if (!loaded) {
+		LOG_WARN(LOG_TAG, "compound collider: cannot load %s", cc->model_path);
+		return false;
+	}
+
+	JceColliderPart *cparts =
+		(JceColliderPart *)jce_malloc((size_t)parts.count * sizeof(*cparts));
+	if (!cparts) { jce_model_importer_free_parts(&parts); return false; }
+	for (uint32_t i = 0; i < parts.count; i++) {
+		cparts[i].name         = parts.parts[i].name;
+		cparts[i].vertices     = parts.parts[i].positions;
+		cparts[i].vertex_count = parts.parts[i].vertex_count;
+		cparts[i].indices      = parts.parts[i].indices;
+		cparts[i].index_count  = parts.parts[i].index_count;
+		memcpy(cparts[i].transform, parts.parts[i].transform,
+		       sizeof cparts[i].transform);
+	}
+
+	JceColliderCookConfig cfg = jce_collider_cook_config_default();
+	cfg.mode          = (JceColliderMode)cc->mode;
+	cfg.split         = (JceColliderSplitMode)cc->split;
+	cfg.is_static     = cc->is_static;
+	cfg.detect_naming = cc->detect_naming;
+	if (cc->vhacd_resolution)         cfg.vhacd_resolution = cc->vhacd_resolution;
+	if (cc->vhacd_max_hulls)          cfg.vhacd_max_hulls = cc->vhacd_max_hulls;
+	if (cc->vhacd_max_verts_per_hull) cfg.vhacd_max_verts_per_hull = cc->vhacd_max_verts_per_hull;
+
+	JceCookedCollider cooked;
+	bool cooked_ok = jce_collider_cook(cparts, parts.count, &cfg, &cooked);
+	jce_free(cparts);
+	jce_model_importer_free_parts(&parts);
+	if (!cooked_ok) {
+		LOG_WARN(LOG_TAG, "compound collider: cook failed for %s", cc->model_path);
+		return false;
+	}
+
+	JceColliderInstanceDesc id;
+	memset(&id, 0, sizeof id);
+	id.position    = tf->position;
+	id.rotation    = jce_q_identity();
+	id.friction    = cc->friction > 0.0f ? cc->friction : 0.5f;
+	id.restitution = cc->restitution;
+	id.is_trigger  = cc->is_trigger;
+
+	JceRigidBodyComponent *rb = jce_scene_get_rigidbody(scene, e);
+	if (rb) {
+		id.mass            = rb->mass;
+		id.linear_damping  = rb->drag;
+		id.angular_damping = rb->angular_drag;
+		if (rb->is_kinematic)      id.type = JCE_BODY_KINEMATIC;
+		else if (rb->mass <= 0.0f) id.type = JCE_BODY_STATIC;
+		else                       id.type = JCE_BODY_DYNAMIC;
+	} else {
+		id.type = JCE_BODY_STATIC;
+	}
+
+	JceBodyHandle body = jce_collider_instantiate(rt->physics, &cooked, &id);
+	jce_collider_cooked_free(&cooked);
+	if (!jce_body_valid(body)) return false;
+
+	if (rt->body_count >= rt->body_cap && !rt_grow_bodies(rt))
+		return true;   /* spawned but cannot track — still skip box path */
+	rt->bodies[rt->body_count].entity = e;
+	rt->bodies[rt->body_count].body   = body;
+	rt->body_count++;
+	return true;
+}
+
 static void rt_spawn_entity(JceScene *scene, JceEntity e, void *ud)
 {
 	JceRuntime *rt = (JceRuntime *)ud;
@@ -148,6 +257,10 @@ static void rt_spawn_entity(JceScene *scene, JceEntity e, void *ud)
 			goto try_audio;
 		}
 	}
+
+	/* ── Compound collider (per-object cooked) takes priority ── */
+	if (rt->physics && rt_try_spawn_compound(rt, scene, e, tf))
+		goto try_audio;
 
 	/* ── Rigid body ── */
 	if (rt->physics) {

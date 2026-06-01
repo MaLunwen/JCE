@@ -364,8 +364,8 @@ JceStreamingSystem *jce_streaming_create(const JceStreamingConfig *config)
     if (sys->config.frame_budget_ms <= 0.0f)
         sys->config.frame_budget_ms = DEFAULT_BUDGET_MS;
 
-    /* Auto-detect single-thread mode on Emscripten. */
-#ifdef __EMSCRIPTEN__
+    /* Auto-detect single-thread mode on WebAssembly. */
+#if JCE_PLATFORM_WEB
     sys->config.single_thread = true;
 #endif
 

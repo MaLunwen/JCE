@@ -44,6 +44,7 @@ static ECS_COMPONENT_DECLARE(JceVirtualCameraComponent);
 static ECS_COMPONENT_DECLARE(JceTriggerVolumeComponent);
 static ECS_COMPONENT_DECLARE(JceCapsuleColliderComponent);
 static ECS_COMPONENT_DECLARE(JceMeshColliderComponent);
+static ECS_COMPONENT_DECLARE(JceCompoundColliderComponent);
 static ECS_COMPONENT_DECLARE(JceCollider2DComponent);
 static ECS_COMPONENT_DECLARE(JceTrailRendererComponent);
 static ECS_COMPONENT_DECLARE(JceLineRendererComponent);
@@ -129,6 +130,7 @@ JceScene *jce_scene_create(void)
     ECS_COMPONENT_DEFINE(s->world, JceTriggerVolumeComponent);
     ECS_COMPONENT_DEFINE(s->world, JceCapsuleColliderComponent);
     ECS_COMPONENT_DEFINE(s->world, JceMeshColliderComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceCompoundColliderComponent);
     ECS_COMPONENT_DEFINE(s->world, JceCollider2DComponent);
     ECS_COMPONENT_DEFINE(s->world, JceTrailRendererComponent);
     ECS_COMPONENT_DEFINE(s->world, JceLineRendererComponent);
@@ -411,6 +413,7 @@ JCE_COMP_IMPL(JceVirtualCameraComponent,      virtual_camera)
 JCE_COMP_IMPL(JceTriggerVolumeComponent,      trigger_volume)
 JCE_COMP_IMPL(JceCapsuleColliderComponent,    capsule_collider)
 JCE_COMP_IMPL(JceMeshColliderComponent,       mesh_collider)
+JCE_COMP_IMPL(JceCompoundColliderComponent,   compound_collider)
 JCE_COMP_IMPL(JceCollider2DComponent,         collider2d)
 JCE_COMP_IMPL(JceTrailRendererComponent,      trail_renderer)
 JCE_COMP_IMPL(JceLineRendererComponent,       line_renderer)

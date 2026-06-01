@@ -234,6 +234,30 @@ typedef struct {
     float   restitution;
 } JceMeshColliderComponent;
 
+/*
+ * Compound collider — per-object colliders cooked from a model that holds
+ * several separated objects. Each object becomes one child shape and the
+ * children combine into a single compound, so the holes between objects
+ * stay empty instead of being filled by one fat box/hull.
+ *
+ * The runtime loads `model_path`, splits it into parts, cooks each part
+ * per `mode`/`split` (honoring COL_/UCX_/UBX_/USP_/UCP_/TRI_ naming when
+ * detect_naming is set), and instantiates the result as a compound body.
+ */
+typedef struct {
+    char     model_path[256]; /* source model the collider is cooked from   */
+    uint8_t  mode;            /* JceColliderMode (0 = AUTO)                  */
+    uint8_t  split;           /* JceColliderSplitMode (0 = by-part)          */
+    bool     is_static;       /* affects AUTO; trimesh requires static       */
+    bool     detect_naming;   /* honor COL_/UCX_/UBX_/USP_/UCP_/TRI_         */
+    bool     is_trigger;
+    float    friction;
+    float    restitution;
+    uint32_t vhacd_resolution;         /* 0 ⇒ library default                */
+    uint32_t vhacd_max_hulls;          /* 0 ⇒ library default                */
+    uint32_t vhacd_max_verts_per_hull; /* 0 ⇒ library default                */
+} JceCompoundColliderComponent;
+
 /* Combined 2D collider (shape selector keeps bitfield budget tight). */
 enum {
     JCE_COLLIDER_2D_BOX     = 0,
@@ -1252,6 +1276,12 @@ JCE_API void                          jce_scene_set_mesh_collider(JceScene *s, J
 JCE_API JceMeshColliderComponent     *jce_scene_get_mesh_collider(JceScene *s, JceEntity e);
 JCE_API bool                          jce_scene_has_mesh_collider(const JceScene *s, JceEntity e);
 JCE_API void                          jce_scene_remove_mesh_collider(JceScene *s, JceEntity e);
+
+/* Component access — Compound Collider (per-object cooked colliders). */
+JCE_API void                          jce_scene_set_compound_collider(JceScene *s, JceEntity e, const JceCompoundColliderComponent *c);
+JCE_API JceCompoundColliderComponent *jce_scene_get_compound_collider(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_compound_collider(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_compound_collider(JceScene *s, JceEntity e);
 
 /* Component access — Collider 2D (combined Box/Circle/Capsule/Edge/Polygon). */
 JCE_API void                          jce_scene_set_collider2d(JceScene *s, JceEntity e, const JceCollider2DComponent *c);

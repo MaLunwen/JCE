@@ -187,6 +187,67 @@ JCE_API bool jce_renderer_get_wireframe(const JceRenderer *r);
    Useful for UV flipping when displaying FBO textures in UI. */
 JCE_API bool jce_renderer_origin_bottom_left(void);
 
+/* -- GPU frame statistics ------------------------------------------ */
+
+/* Maximum per-view timing rows reported by jce_renderer_get_gpu_stats. */
+#define JCE_GPU_MAX_VIEW_STATS 64
+
+/* One render view's timing, with names/durations already resolved so
+   consumers (editor profiler, in-game overlays) never touch the GPU
+   backend directly. */
+typedef struct JceGpuViewStat {
+    uint16_t view_id;
+    char     name[64];
+    double   gpu_ms;
+    double   cpu_ms;
+} JceGpuViewStat;
+
+/* Flat, backend-agnostic snapshot of the last submitted frame.  All
+   timings are pre-resolved to milliseconds; memory counters are bytes.
+   This is the public surface that replaces direct bgfx_get_stats()
+   access in consumer code. */
+typedef struct JceGpuStats {
+    bool     valid;             /* false when the backend has no stats  */
+
+    /* Timing (milliseconds). */
+    double   cpu_frame_ms;
+    double   cpu_submit_ms;
+    double   gpu_ms;
+    double   wait_submit_ms;
+    double   wait_render_ms;
+
+    /* Per-frame counts. */
+    uint32_t num_draw;
+    uint32_t num_compute;
+    uint32_t num_blit;
+
+    /* Backbuffer + latency. */
+    uint16_t backbuffer_width;
+    uint16_t backbuffer_height;
+    uint32_t max_gpu_latency;
+
+    /* Resource counts. */
+    uint16_t num_textures;
+    uint16_t num_frame_buffers;
+    uint16_t num_programs;
+    uint16_t num_shaders;
+
+    /* Memory (bytes; <0 when the backend cannot report it). */
+    int64_t  rt_memory_used;
+    int64_t  texture_memory_used;
+    int64_t  gpu_memory_used;
+    int64_t  gpu_memory_max;
+
+    /* Per-view timing. */
+    uint16_t       num_views;
+    JceGpuViewStat views[JCE_GPU_MAX_VIEW_STATS];
+} JceGpuStats;
+
+/* Fill `out` with the most recent frame's GPU statistics.  Returns true
+   and sets out->valid when the backend reports stats, false otherwise
+   (out is still zero-initialized so callers can render placeholders). */
+JCE_API bool jce_renderer_get_gpu_stats(JceGpuStats *out);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_RENDERER_H */

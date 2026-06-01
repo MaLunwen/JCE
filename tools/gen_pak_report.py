@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 """
-gen_pak_report.py  ── Generate a self-contained HTML report from a
-jce_pak manifest (.cmake) emitted by tools/jce_pak.c.
+gen_pak_report.py  ── Generate a self-contained HTML report from either a
+jce_pak manifest (.cmake) or a `jce.pakbom.v1` JSON bill-of-materials
+(emitted by `jce_pak --inspect <pak> --json out.json`).
 
 Usage:
-    python gen_pak_report.py <manifest.cmake> <output.html> [--title "..."]
+    python gen_pak_report.py <manifest.cmake | bom.json> <output.html> [--title "..."]
+
+The input type is auto-detected (by extension and leading byte). The JSON
+source additionally surfaces archive content hashes (XXH3-64 data/index),
+per-entry path hash + CRC32, dictionary tags + per-dict usage counts,
+per-entry audit badges (page-aligned / encrypted / duplicate / verify state),
+and duplicate/verify summary cards (verify state requires `--verify`).
 
 The HTML report is fully self-contained (no external deps) and provides:
   * Summary card (file count, raw size, compressed size, overall ratio)
-  * Sortable table of all assets (path / size / compressed / ratio)
+  * Archive hash panel (JSON source only)
+  * Sortable table of all assets (path / size / compressed / ratio [+ hashes])
   * Aggregation by file extension and top-level folder
   * Top 20 largest assets bar chart (pure CSS, no JS libs)
   * SVG donut by extension, log-log scatter (raw vs compressed),
@@ -66,7 +74,92 @@ def parse_manifest(path: Path) -> Dict[str, object]:
         "file_count": int(raw.get("ASSET_FILE_COUNT", "0") or 0),
         "stored_count": int(raw.get("ASSET_STORED_COUNT", "0") or 0),
         "stored_raw_total": int(raw.get("ASSET_STORED_RAW_TOTAL", "0") or 0),
+        "hashes": None,
+        "crcs": None,
+        "header": None,
     }
+
+
+def parse_bom_json(path: Path) -> Dict[str, object]:
+    """Parse a `jce.pakbom.v1` JSON document emitted by `jce_pak --inspect`."""
+    import json
+
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    schema = doc.get("schema", "")
+    if schema != "jce.pakbom.v1":
+        raise SystemExit(f"unsupported BOM schema: {schema!r} (expected jce.pakbom.v1)")
+
+    hdr = doc.get("header", {}) or {}
+    totals = doc.get("totals", {}) or {}
+    entries = doc.get("entries", []) or []
+
+    paths, sizes, comp, flags, hashes, crcs = [], [], [], [], [], []
+    comp_names, dict_ids, page_aligned, encrypted, dup_e, verified_e = [], [], [], [], [], []
+    dict_usage: Dict[int, int] = {}
+    stored_raw_total = 0
+    for i, e in enumerate(entries):
+        p = e.get("path") or f"<hash:{e.get('path_hash', i)}>"
+        orig = int(e.get("original_size", 0))
+        stored = int(e.get("stored_size", 0))
+        is_stored = int(e.get("compression", 0)) == 0
+        paths.append(p)
+        sizes.append(orig)
+        comp.append(stored)
+        # Flag bit 0 == STORED/uncompressed, matching the .cmake manifest convention.
+        flags.append(1 if is_stored else 0)
+        hashes.append(str(e.get("path_hash", "")))
+        crcs.append(str(e.get("content_crc", "")))
+        comp_names.append(str(e.get("compression_name", "")))
+        did = e.get("dict_id")
+        dict_ids.append(did)
+        if did is not None:
+            dict_usage[int(did)] = dict_usage.get(int(did), 0) + 1
+        page_aligned.append(bool(e.get("page_aligned", False)))
+        encrypted.append(bool(e.get("encrypted", False)))
+        dup_e.append(bool(e.get("duplicate", False)))
+        verified_e.append(e.get("verified"))
+        if is_stored:
+            stored_raw_total += orig
+
+    return {
+        "paths": paths,
+        "sizes": sizes,
+        "compressed": comp,
+        "flags": flags,
+        "raw_total": int(totals.get("original_size", 0)),
+        "comp_total": int(totals.get("stored_size", 0)),
+        "pak_total": int(doc.get("file_size", 0)),
+        "file_count": int(totals.get("entries", len(entries))),
+        "stored_count": int(totals.get("stored_count", 0)),
+        "stored_raw_total": stored_raw_total,
+        "hashes": hashes,
+        "crcs": crcs,
+        "comp_names": comp_names,
+        "dict_ids": dict_ids,
+        "page_aligned": page_aligned,
+        "encrypted": encrypted,
+        "duplicate": dup_e,
+        "verified": verified_e,
+        "dict_usage": dict_usage,
+        "totals": totals,
+        "header": hdr,
+        "file": doc.get("file", ""),
+        "dictionaries": doc.get("dictionaries", []) or [],
+    }
+
+
+def _looks_like_json(path: Path) -> bool:
+    if path.suffix.lower() == ".json":
+        return True
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for ch in iter(lambda: fh.read(1), ""):
+                if ch.isspace():
+                    continue
+                return ch in "{["
+    except OSError:
+        return False
+    return False
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -148,10 +241,24 @@ th:hover {{ color: var(--accent); }}
 th.sort-asc::after {{ content: " ▲"; color: var(--accent); }}
 th.sort-desc::after {{ content: " ▼"; color: var(--accent); }}
 td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+td.hash {{ font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; color: #9fb3c8; white-space: nowrap; }}
+.hashbar {{ display: flex; flex-wrap: wrap; gap: 18px; margin: 0 0 8px; padding: 12px 16px;
+  background: #14202b; border: 1px solid #243441; border-radius: 8px;
+  font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }}
+.hashbar b {{ color: #7fa8c9; font-weight: 600; }}
+.hashbar span {{ color: #cfe2f0; }}
 tr:hover td {{ background: #1d232b; }}
 .ratio-good {{ color: var(--good); }}
 .ratio-bad {{ color: var(--warn); }}
 .ratio-stored {{ color: #ce93d8; font-weight: 600; }}
+td.audit {{ text-align: center; white-space: nowrap; }}
+.badge {{ display: inline-block; min-width: 22px; padding: 1px 5px; border-radius: 4px;
+  font-size: 11px; font-weight: 700; font-family: ui-monospace, Menlo, Consolas, monospace; }}
+.badge.off {{ color: #44525e; }}
+.badge.ok {{ background: #16361f; color: #6fd58a; }}
+.badge.bad {{ background: #3a1717; color: #f0726a; }}
+.badge.warn {{ background: #3a2f14; color: #e6b54a; }}
+.badge.info {{ background: #14283a; color: #5aa9e6; }}
 .bar-row {{ display: grid; grid-template-columns: 280px 1fr 90px;
             gap: 8px; align-items: center; padding: 4px 0;
             font-variant-numeric: tabular-nums; font-size: 12px; }}
@@ -205,6 +312,7 @@ footer {{ color: var(--muted); margin-top: 32px; font-size: 11px;
        <div class="value">{stored_count}</div>
        <div class="sub">{stored_raw_h} &middot; {stored_pct:.1f}% of raw</div></div>
 </div>
+{hash_panel}
 
 <h2>Top 20 largest assets (raw size)</h2>
 <div class="top-list">
@@ -240,7 +348,7 @@ footer {{ color: var(--muted); margin-top: 32px; font-size: 11px;
   <th data-key="path">Path</th>
   <th data-key="size" data-num="1" class="sort-desc">Raw</th>
   <th data-key="comp" data-num="1">Compressed</th>
-  <th data-key="ratio" data-num="1">Ratio</th>
+  <th data-key="ratio" data-num="1">Ratio</th>{extra_th}
 </tr></thead>
 <tbody>
 {rows}
@@ -335,10 +443,29 @@ def render_agg_table(rows: List[Tuple[str, int, int, int]]) -> str:
 
 
 def render_rows(paths: List[str], sizes: List[int], comp: List[int],
-                flags: List[int]) -> str:
+                flags: List[int],
+                hashes: List[str] | None = None,
+                crcs: List[str] | None = None,
+                page_aligned: List[bool] | None = None,
+                encrypted: List[bool] | None = None,
+                duplicate: List[bool] | None = None,
+                verified: list | None = None) -> str:
     rows: List[str] = []
-    indexed = sorted(zip(sizes, comp, paths, flags), reverse=True)
-    for size, c, path, fl in indexed:
+    n = len(paths)
+    hashes = hashes or [""] * n
+    crcs = crcs or [""] * n
+    page_aligned = page_aligned or [False] * n
+    encrypted = encrypted or [False] * n
+    duplicate = duplicate or [False] * n
+    verified = verified if verified is not None else [None] * n
+    have_hash = any(hashes) or any(crcs)
+    have_audit = any(page_aligned) or any(encrypted) or any(duplicate) \
+        or any(v is not None for v in verified)
+    indexed = sorted(
+        zip(sizes, comp, paths, flags, hashes, crcs,
+            page_aligned, encrypted, duplicate, verified),
+        reverse=True, key=lambda t: t[0])
+    for size, c, path, fl, ph, crc, pa, enc, dup, ver in indexed:
         ratio = (size / c) if c else 0.0
         stored = bool(fl & 1)
         if stored:
@@ -347,13 +474,37 @@ def render_rows(paths: List[str], sizes: List[int], comp: List[int],
         else:
             cls = "ratio-good" if ratio >= 2.0 else ("ratio-bad" if ratio < 1.05 else "")
             ratio_html = f'<span class="{cls}">{ratio:.2f}×</span>'
+        hash_cells = ""
+        if have_hash:
+            hash_cells = (
+                f'<td class="hash">{html.escape(str(ph))}</td>'
+                f'<td class="hash">{html.escape(str(crc))}</td>'
+            )
+        audit_cells = ""
+        if have_audit:
+            def _badge(on: bool, txt: str, kind: str) -> str:
+                return f'<span class="badge {kind}">{txt}</span>' if on else \
+                    '<span class="badge off">·</span>'
+            if ver is None:
+                ver_html = '<span class="badge off">·</span>'
+            elif ver:
+                ver_html = '<span class="badge ok">OK</span>'
+            else:
+                ver_html = '<span class="badge bad">FAIL</span>'
+            audit_cells = (
+                f'<td class="audit">{_badge(bool(pa), "PG", "info")}</td>'
+                f'<td class="audit">{_badge(bool(enc), "EN", "warn")}</td>'
+                f'<td class="audit">{_badge(bool(dup), "DUP", "warn")}</td>'
+                f'<td class="audit">{ver_html}</td>'
+            )
         rows.append(
             f'<tr data-path="{html.escape(path)}" data-size="{size}" '
-            f'data-comp="{c}" data-ratio="{ratio:.4f}" data-stored="{int(stored)}">'
+            f'data-comp="{c}" data-ratio="{ratio:.4f}" data-stored="{int(stored)}" '
+            f'data-dup="{int(bool(dup))}">'
             f'<td>{html.escape(path)}</td>'
             f'<td class="num">{fmt_bytes(size)}</td>'
             f'<td class="num">{fmt_bytes(c)}</td>'
-            f'<td class="num">{ratio_html}</td></tr>'
+            f'<td class="num">{ratio_html}</td>{hash_cells}{audit_cells}</tr>'
         )
     return "\n".join(rows)
 
@@ -680,6 +831,9 @@ def render_html(data: Dict[str, object], manifest_path: Path, title: str) -> str
     sizes = data["sizes"]
     comp = data["compressed"]
     flags = data.get("flags") or [0] * len(paths)
+    hashes = data.get("hashes")
+    crcs = data.get("crcs")
+    header = data.get("header") or {}
     raw_total = data["raw_total"] or sum(sizes)
     comp_total = data["comp_total"] or sum(comp)
     pak_total = data["pak_total"] or comp_total
@@ -691,6 +845,26 @@ def render_html(data: Dict[str, object], manifest_path: Path, title: str) -> str
     by_ext = aggregate(paths, sizes, comp, ext_key)
     by_folder = aggregate(paths, sizes, comp, folder_key)
 
+    have_hash = bool((hashes and any(hashes)) or (crcs and any(crcs)))
+    page_aligned = data.get("page_aligned")
+    encrypted = data.get("encrypted")
+    duplicate = data.get("duplicate")
+    verified = data.get("verified")
+    have_audit = bool(
+        (page_aligned and any(page_aligned)) or (encrypted and any(encrypted))
+        or (duplicate and any(duplicate))
+        or (verified and any(v is not None for v in verified)))
+    extra_th = ""
+    if have_hash:
+        extra_th += ('  <th data-key="phash">Path hash</th>\n'
+                     '  <th data-key="crc">CRC32</th>')
+    if have_audit:
+        extra_th += ('\n  <th data-key="pg">Page</th>\n'
+                     '  <th data-key="enc">Enc</th>\n'
+                     '  <th data-key="dup">Dup</th>\n'
+                     '  <th data-key="ver">Verify</th>')
+    hash_panel = _render_hash_panel(header, data) if header else ""
+
     return HTML_TEMPLATE.format(
         title=html.escape(title),
         file_count=data["file_count"] or len(paths),
@@ -701,15 +875,60 @@ def render_html(data: Dict[str, object], manifest_path: Path, title: str) -> str
         stored_count=stored_count,
         stored_raw_h=fmt_bytes(stored_raw),
         stored_pct=stored_pct,
+        hash_panel=hash_panel,
+        extra_th=extra_th,
         top_bars=render_top_bars(paths, sizes),
         pie_svg=render_pie_svg(by_ext),
         scatter_svg=render_scatter_svg(sizes, comp, flags),
         treemap_svg=render_treemap_svg(paths, sizes),
         ext_table=render_agg_table(by_ext),
         folder_table=render_agg_table(by_folder),
-        rows=render_rows(paths, sizes, comp, flags),
+        rows=render_rows(paths, sizes, comp, flags, hashes, crcs,
+                         page_aligned, encrypted, duplicate, verified),
         manifest_path=html.escape(str(manifest_path)),
     )
+
+
+def _render_hash_panel(header: Dict[str, object], data: Dict[str, object]) -> str:
+    def cell(label: str, value) -> str:
+        return f'<div><b>{html.escape(label)}</b> <span>{html.escape(str(value))}</span></div>'
+
+    parts = []
+    if data.get("file"):
+        parts.append(cell("archive", data["file"]))
+    if "data_content_hash" in header:
+        parts.append(cell("data XXH3-64", header["data_content_hash"]))
+    if "index_content_hash" in header:
+        parts.append(cell("index XXH3-64", header["index_content_hash"]))
+    verified = header.get("header_verified")
+    if verified is not None:
+        parts.append(cell("header integrity", "OK" if verified else "FAILED"))
+    dicts = data.get("dictionaries") or []
+    if dicts:
+        usage = data.get("dict_usage") or {}
+        tags = ", ".join(
+            f'{d.get("tag")}({fmt_bytes(int(d.get("size", 0)))}'
+            f'{", " + str(usage.get(int(d.get("id", -1)), 0)) + " files" if usage else ""})'
+            for d in dicts)
+        parts.append(cell(f"dictionaries ({len(dicts)})", tags))
+    totals = data.get("totals") or {}
+    dg = int(totals.get("duplicate_groups", 0))
+    if dg:
+        reclaimed = int(totals.get("duplicate_reclaimed_bytes", 0))
+        wasted = int(totals.get("duplicate_wasted_bytes", 0))
+        parts.append(cell(
+            "duplicates",
+            f'{dg} groups / {int(totals.get("duplicate_entries", 0))} files / '
+            f'{fmt_bytes(reclaimed)} reclaimed / {fmt_bytes(wasted)} wasted'))
+    if totals.get("verify_ran"):
+        corrupt = int(totals.get("corrupt_count", 0))
+        parts.append(cell(
+            "verify",
+            f'{int(totals.get("verified_count", 0))} OK / {corrupt} corrupt / '
+            f'{int(totals.get("skipped_count", 0))} skipped'))
+    if not parts:
+        return ""
+    return '<div class="hashbar">' + "".join(parts) + "</div>"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -719,21 +938,26 @@ def render_html(data: Dict[str, object], manifest_path: Path, title: str) -> str
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Generate HTML asset report.")
-    ap.add_argument("manifest", type=Path, help="Path to *_assets_manifest.cmake")
+    ap.add_argument("input", type=Path,
+                    help="Path to *_assets_manifest.cmake OR a jce.pakbom.v1 JSON "
+                         "(from `jce_pak --inspect ... --json out.json`)")
     ap.add_argument("output", type=Path, help="Output HTML file")
     ap.add_argument("--title", default=None, help="Report title")
     args = ap.parse_args()
 
-    if not args.manifest.is_file():
-        print(f"manifest not found: {args.manifest}", file=sys.stderr)
+    if not args.input.is_file():
+        print(f"input not found: {args.input}", file=sys.stderr)
         return 1
 
-    title = args.title or f"JCE Asset Report — {args.manifest.stem}"
-    data = parse_manifest(args.manifest)
-    html_str = render_html(data, args.manifest, title)
+    is_json = _looks_like_json(args.input)
+    title = args.title or f"JCE Asset Report — {args.input.stem}"
+    data = parse_bom_json(args.input) if is_json else parse_manifest(args.input)
+    html_str = render_html(data, args.input, title)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(html_str, encoding="utf-8")
-    print(f"wrote {args.output} ({len(html_str)} bytes, {data['file_count']} assets)")
+    src = "BOM JSON" if is_json else "manifest"
+    print(f"wrote {args.output} ({len(html_str)} bytes, "
+          f"{data['file_count']} assets, source={src})")
     return 0
 
 

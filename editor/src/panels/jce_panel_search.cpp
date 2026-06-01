@@ -30,7 +30,9 @@
 #include <unordered_map>
 #include <vector>
 
-#if defined(_WIN32)
+#include <jce/os/core/jce_defs.h>
+
+#if JCE_PLATFORM_WINDOWS
 #  define jce_strncasecmp _strnicmp
 #else
 #  include <strings.h>

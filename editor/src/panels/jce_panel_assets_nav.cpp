@@ -128,7 +128,7 @@ static bool path_starts_with(const std::string &parent,
     if (!jce_path_normalize(c, sizeof(c), child.c_str()))  return false;
 
     auto eq_ch = [](char a, char b) -> bool {
-#ifdef _WIN32
+#if JCE_PLATFORM_WINDOWS
         if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
         if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
 #endif
@@ -310,7 +310,8 @@ static void draw_asset_locations_section(void)
                 draw_location_row("[*]", name, std::string(fp), id, true);
             }
             if (ec.asset_favorite_count == 0) {
-                ImGui::TextDisabled("    (none)");
+                ImGui::TextDisabled("    %s",
+                    jce_editor_i18n_or("assetBrowser.favorites.empty", "(none)"));
             }
         }
     }
@@ -480,7 +481,7 @@ void draw_asset_breadcrumb_bar(void)
                    the user can ascend / descend at will. */
                 std::string acc;
                 const char *p = norm_cur;
-#ifdef _WIN32
+#if JCE_PLATFORM_WINDOWS
                 /* "C:/foo/bar" → first crumb "C:/" anchored at drive. */
                 if (p[0] && p[1] == ':') {
                     char drv[8];

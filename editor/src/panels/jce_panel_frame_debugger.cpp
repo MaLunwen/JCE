@@ -29,12 +29,12 @@
 #include "ui/jce_editor_panels.h"
 
 #include <jce/tools/jce_imgui.hpp>
-#include <bgfx/c99/bgfx.h>
 #include <cstdio>
 #include <cstring>
 
 extern "C" {
 #include <jce/renderer/jce_render_graph.h>
+#include <jce/renderer/jce_renderer.h>
 }
 
 #define MAX_CAPTURED_PASSES 64
@@ -45,62 +45,52 @@ static int                 s_selected   = -1;
 
 /* ── Helpers ────────────────────────────────────────────────────────── */
 
-static double ticks_to_ms(int64_t delta, int64_t freq)
-{
-    if (freq <= 0) return 0.0;
-    return (double)delta * 1000.0 / (double)freq;
-}
-
-static void draw_frame_totals(const bgfx_stats_t *st)
+static void draw_frame_totals(const JceGpuStats *st)
 {
     if (!ImGui::CollapsingHeader(jce_editor_i18n("frameDebugger.section.totals"),
                                  ImGuiTreeNodeFlags_DefaultOpen))
         return;
-    if (!st) {
+    if (!st || !st->valid) {
         ImGui::TextDisabled("%s", jce_editor_i18n("frameDebugger.noStats"));
         return;
     }
-    double cpu_ms     = ticks_to_ms(st->cpuTimeEnd  - st->cpuTimeBegin, st->cpuTimerFreq);
-    double cpu_frame  = ticks_to_ms(st->cpuTimeFrame,                    st->cpuTimerFreq);
-    double gpu_ms     = ticks_to_ms(st->gpuTimeEnd  - st->gpuTimeBegin, st->gpuTimerFreq);
-    double wait_sub   = ticks_to_ms(st->waitSubmit,                      st->cpuTimerFreq);
-    double wait_rnd   = ticks_to_ms(st->waitRender,                      st->cpuTimerFreq);
 
     ImGui::Text("%s: %u  |  %s: %u  |  %s: %u",
-        jce_editor_i18n("frameDebugger.numDraw"),    st->numDraw,
-        jce_editor_i18n("frameDebugger.numCompute"), st->numCompute,
-        jce_editor_i18n("frameDebugger.numBlit"),    st->numBlit);
+        jce_editor_i18n("frameDebugger.numDraw"),    st->num_draw,
+        jce_editor_i18n("frameDebugger.numCompute"), st->num_compute,
+        jce_editor_i18n("frameDebugger.numBlit"),    st->num_blit);
     ImGui::Text("%s: %.3f ms  (%s: %.3f ms)",
-        jce_editor_i18n("frameDebugger.cpuFrame"),  cpu_frame,
-        jce_editor_i18n("frameDebugger.cpuSubmit"), cpu_ms);
+        jce_editor_i18n("frameDebugger.cpuFrame"),  st->cpu_frame_ms,
+        jce_editor_i18n("frameDebugger.cpuSubmit"), st->cpu_submit_ms);
     ImGui::Text("%s: %.3f ms",
-        jce_editor_i18n("frameDebugger.gpu"), gpu_ms);
+        jce_editor_i18n("frameDebugger.gpu"), st->gpu_ms);
     ImGui::Text("%s: %.3f ms  |  %s: %.3f ms",
-        jce_editor_i18n("frameDebugger.waitSubmit"), wait_sub,
-        jce_editor_i18n("frameDebugger.waitRender"), wait_rnd);
+        jce_editor_i18n("frameDebugger.waitSubmit"), st->wait_submit_ms,
+        jce_editor_i18n("frameDebugger.waitRender"), st->wait_render_ms);
     ImGui::Separator();
     ImGui::Text("%s: %ux%u  |  %s: %u",
-        jce_editor_i18n("frameDebugger.backbuffer"), st->width, st->height,
-        jce_editor_i18n("frameDebugger.maxLatency"), st->maxGpuLatency);
+        jce_editor_i18n("frameDebugger.backbuffer"),
+        st->backbuffer_width, st->backbuffer_height,
+        jce_editor_i18n("frameDebugger.maxLatency"), st->max_gpu_latency);
     ImGui::Text("%s: tex=%u fb=%u prog=%u shd=%u  |  rt=%lld KB tex=%lld KB",
         jce_editor_i18n("frameDebugger.resources"),
-        st->numTextures, st->numFrameBuffers, st->numPrograms, st->numShaders,
-        (long long)(st->rtMemoryUsed      / 1024),
-        (long long)(st->textureMemoryUsed / 1024));
-    if (st->gpuMemoryMax > 0) {
+        st->num_textures, st->num_frame_buffers, st->num_programs, st->num_shaders,
+        (long long)(st->rt_memory_used      / 1024),
+        (long long)(st->texture_memory_used / 1024));
+    if (st->gpu_memory_max > 0) {
         ImGui::Text("%s: %lld / %lld MB",
             jce_editor_i18n("frameDebugger.gpuMem"),
-            (long long)(st->gpuMemoryUsed / (1024 * 1024)),
-            (long long)(st->gpuMemoryMax  / (1024 * 1024)));
+            (long long)(st->gpu_memory_used / (1024 * 1024)),
+            (long long)(st->gpu_memory_max  / (1024 * 1024)));
     }
 }
 
-static void draw_view_stats(const bgfx_stats_t *st)
+static void draw_view_stats(const JceGpuStats *st)
 {
     if (!ImGui::CollapsingHeader(jce_editor_i18n("frameDebugger.section.views"),
                                  ImGuiTreeNodeFlags_DefaultOpen))
         return;
-    if (!st || st->numViews == 0 || !st->viewStats) {
+    if (!st || !st->valid || st->num_views == 0) {
         ImGui::TextDisabled("%s", jce_editor_i18n("frameDebugger.noViews"));
         return;
     }
@@ -119,17 +109,13 @@ static void draw_view_stats(const bgfx_stats_t *st)
                                 ImGuiTableColumnFlags_WidthFixed, 90.0f);
         ImGui::TableHeadersRow();
 
-        for (uint16_t i = 0; i < st->numViews; i++) {
-            const bgfx_view_stats_t *vs = &st->viewStats[i];
+        for (uint16_t i = 0; i < st->num_views; i++) {
+            const JceGpuViewStat *vs = &st->views[i];
             ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0); ImGui::Text("%u", (uint32_t)vs->view);
+            ImGui::TableSetColumnIndex(0); ImGui::Text("%u", (uint32_t)vs->view_id);
             ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(vs->name[0] ? vs->name : "(unnamed)");
-            ImGui::TableSetColumnIndex(2);
-            double gpu_ms = ticks_to_ms(vs->gpuTimeEnd - vs->gpuTimeBegin, st->gpuTimerFreq);
-            ImGui::Text("%.3f", gpu_ms);
-            ImGui::TableSetColumnIndex(3);
-            double cpu_ms = ticks_to_ms(vs->cpuTimeEnd - vs->cpuTimeBegin, st->cpuTimerFreq);
-            ImGui::Text("%.3f", cpu_ms);
+            ImGui::TableSetColumnIndex(2); ImGui::Text("%.3f", vs->gpu_ms);
+            ImGui::TableSetColumnIndex(3); ImGui::Text("%.3f", vs->cpu_ms);
         }
         ImGui::EndTable();
     }
@@ -209,9 +195,10 @@ static void draw_rg_capture(void)
 
 extern "C" void jce_editor_panel_frame_debugger_content(void)
 {
-    const bgfx_stats_t *st = bgfx_get_stats();
-    draw_frame_totals(st);
-    draw_view_stats(st);
+    JceGpuStats stats;
+    bool ok = jce_renderer_get_gpu_stats(&stats);
+    draw_frame_totals(ok ? &stats : nullptr);
+    draw_view_stats(ok ? &stats : nullptr);
     draw_rg_capture();
 }
 

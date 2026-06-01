@@ -31,7 +31,7 @@
 
 #define LOG_TAG "toolchain"
 
-#if defined(_WIN32)
+#if JCE_PLATFORM_WINDOWS
     #define TC_PATH_SEP        ';'
     #define TC_EXE_SUFFIX      ".exe"
     #define TC_NATIVE_DIR_SEP  '\\'
@@ -305,7 +305,7 @@ static bool try_install_dir(JceToolchain *out, const char *dir,
  * tool is not on $PATH.  Env-var refs of the form "$NAME/sub" are
  * expanded; the dir is skipped if the env var is unset/empty. */
 static const char *const k_cmake_dirs[] = {
-#if defined(_WIN32)
+#if JCE_PLATFORM_WINDOWS
     "$ProgramFiles\\CMake\\bin",
     "$ProgramFiles(x86)\\CMake\\bin",
     "$LOCALAPPDATA\\Programs\\CMake\\bin",
@@ -320,7 +320,7 @@ static const char *const k_cmake_dirs[] = {
 };
 
 static const char *const k_ninja_dirs[] = {
-#if defined(_WIN32)
+#if JCE_PLATFORM_WINDOWS
     "$ProgramFiles\\Ninja",
     "$LOCALAPPDATA\\Programs\\Ninja",
 #else
@@ -331,7 +331,7 @@ static const char *const k_ninja_dirs[] = {
 };
 
 static const char *const k_clang_dirs[] = {
-#if defined(_WIN32)
+#if JCE_PLATFORM_WINDOWS
     "$ProgramFiles\\LLVM\\bin",
     "$ProgramFiles(x86)\\LLVM\\bin",
     "C:\\msys64\\mingw64\\bin",
@@ -346,7 +346,7 @@ static const char *const k_clang_dirs[] = {
 };
 
 static const char *const k_gcc_dirs[] = {
-#if defined(_WIN32)
+#if JCE_PLATFORM_WINDOWS
     "C:\\msys64\\mingw64\\bin",
     "C:\\msys64\\ucrt64\\bin",
     "$MINGW_HOME\\bin",
@@ -405,7 +405,7 @@ static void probe_clang(JceToolchain *out) { probe_with_fallbacks(out, "clang", 
 
 static void probe_msvc(JceToolchain *out)
 {
-#if defined(_WIN32)
+#if JCE_PLATFORM_WINDOWS
     /* Standard installer path for vswhere — shipped with every VS
      * 2017+ install, even Build Tools. */
     const char *pf86 = tc_getenv("ProgramFiles(x86)");
@@ -542,7 +542,7 @@ static void probe_emsdk(JceToolchain *out)
 
 static void probe_xcode(JceToolchain *out)
 {
-#if defined(__APPLE__)
+#if JCE_PLATFORM_APPLE
     char line[JCE_TOOLCHAIN_PATH_MAX];
     if (!tc_capture_first_line("/usr/bin/xcode-select", "-p",
                                2000, line, sizeof line)) {

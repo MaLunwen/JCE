@@ -113,6 +113,65 @@ void draw_comp_mesh_collider(JceMeshColliderComponent *mc)
         ImGui::TextDisabled(jce_editor_i18n("inspector.meshcol.convexNote"));
 }
 
+void draw_comp_compound_collider(JceCompoundColliderComponent *cc)
+{
+    if (!cc) return;
+
+    jce_draw_path_input_asset(jce_editor_i18n_id("inspector.compcol.model", "compcol"),
+                              cc->model_path, sizeof cc->model_path, JCE_ASSET_KIND_MODEL);
+    insp_track_edit();
+    accept_asset_drop(cc->model_path, sizeof cc->model_path);
+
+    static const char *modes[] = {
+        "Auto", "Box", "Sphere", "Capsule", "Convex Hull", "Convex Decomp", "Triangle Mesh"
+    };
+    int mode = cc->mode; if (mode < 0 || mode > 6) mode = 0;
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.compcol.mode", "compcol"), &mode, modes, 7)) {
+        cc->mode = (uint8_t)mode; insp_track_edit();
+    }
+    jce_editor::help_tip(jce_editor_i18n("inspector.compcol.mode.tooltip"));
+
+    static const char *splits[] = { "By Part", "Whole" };
+    int split = cc->split; if (split < 0 || split > 1) split = 0;
+    if (ImGui::Combo(jce_editor_i18n_id("inspector.compcol.split", "compcol"), &split, splits, 2)) {
+        cc->split = (uint8_t)split; insp_track_edit();
+    }
+
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.compcol.isStatic", "compcol"), &cc->is_static))
+        insp_undo_bool(&cc->is_static);
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.compcol.detectNaming", "compcol"), &cc->detect_naming))
+        insp_undo_bool(&cc->detect_naming);
+    jce_editor::help_tip(jce_editor_i18n("inspector.compcol.detectNaming.tooltip"));
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.compcol.isTrigger", "compcol"), &cc->is_trigger))
+        insp_undo_bool(&cc->is_trigger);
+
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.compcol.friction", "compcol"),
+                     &cc->friction, 0.01f, 0.0f, 10.0f, "%.2f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.compcol.restitution", "compcol"),
+                     &cc->restitution, 0.01f, 0.0f, 1.0f, "%.2f"); insp_track_edit();
+
+    /* VHACD tuning only matters for the convex-decomposition mode. */
+    if (cc->mode == 5) {
+        ImGui::SeparatorText(jce_editor_i18n("inspector.compcol.vhacd"));
+        int res = (int)cc->vhacd_resolution;
+        if (ImGui::DragInt(jce_editor_i18n_id("inspector.compcol.vhacdRes", "compcol"),
+                           &res, 1000.0f, 0, 16000000)) {
+            cc->vhacd_resolution = (uint32_t)(res < 0 ? 0 : res); insp_track_edit();
+        }
+        int hulls = (int)cc->vhacd_max_hulls;
+        if (ImGui::DragInt(jce_editor_i18n_id("inspector.compcol.vhacdHulls", "compcol"),
+                           &hulls, 1.0f, 0, 1024)) {
+            cc->vhacd_max_hulls = (uint32_t)(hulls < 0 ? 0 : hulls); insp_track_edit();
+        }
+        int verts = (int)cc->vhacd_max_verts_per_hull;
+        if (ImGui::DragInt(jce_editor_i18n_id("inspector.compcol.vhacdVerts", "compcol"),
+                           &verts, 1.0f, 0, 256)) {
+            cc->vhacd_max_verts_per_hull = (uint32_t)(verts < 0 ? 0 : verts); insp_track_edit();
+        }
+        ImGui::TextDisabled("%s", jce_editor_i18n("inspector.compcol.vhacd.zeroNote"));
+    }
+}
+
 void draw_comp_character_controller(JceCharacterControllerComponent *cc)
 {
     char lbl[256];

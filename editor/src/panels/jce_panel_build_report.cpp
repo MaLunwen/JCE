@@ -27,7 +27,7 @@
 
 extern "C" {
 #include <jce/os/core/jce_filesystem.h>
-#include <cjson/cJSON.h>
+#include <jce/os/core/jce_json.h>
 }
 
 /* jce_editor_assets_get_project() lives in editor C runtime. */
@@ -156,8 +156,7 @@ void refresh()
         return;
     }
 
-    /* cJSON_ParseWithLength needs NUL-safe input but doesn't require it. */
-    cJSON *root = cJSON_ParseWithLength((const char *)buf, (size_t)sz);
+    JceJson *root = jce_json_parse((const char *)buf, (size_t)sz);
     jce_fs_buffer_free(buf);
     if (!root) {
         snprintf(g_st.status_msg, sizeof(g_st.status_msg), "%s",
@@ -165,52 +164,38 @@ void refresh()
         return;
     }
 
-    const cJSON *schema = cJSON_GetObjectItemCaseSensitive(root, "$schema");
-    if (cJSON_IsString(schema) && schema->valuestring) g_st.schema = schema->valuestring;
-    const cJSON *ts = cJSON_GetObjectItemCaseSensitive(root, "timestamp");
-    if (cJSON_IsString(ts) && ts->valuestring) g_st.timestamp = ts->valuestring;
-    const cJSON *totals = cJSON_GetObjectItemCaseSensitive(root, "totals");
-    if (cJSON_IsObject(totals)) {
-        const cJSON *tb = cJSON_GetObjectItemCaseSensitive(totals, "total_bytes");
-        if (cJSON_IsNumber(tb)) g_st.total_bytes = (uint64_t)tb->valuedouble;
-        const cJSON *ua = cJSON_GetObjectItemCaseSensitive(totals, "unique_assets");
-        if (cJSON_IsNumber(ua)) g_st.unique_assets = (uint32_t)ua->valuedouble;
+    if (const char *s = jce_json_get_string(root, "$schema", nullptr)) g_st.schema = s;
+    if (const char *s = jce_json_get_string(root, "timestamp", nullptr)) g_st.timestamp = s;
+    const JceJson *totals = jce_json_get(root, "totals");
+    if (jce_json_is_object(totals)) {
+        g_st.total_bytes   = (uint64_t)jce_json_get_number(totals, "total_bytes", 0.0);
+        g_st.unique_assets = (uint32_t)jce_json_get_number(totals, "unique_assets", 0.0);
     }
 
-    const cJSON *bundles = cJSON_GetObjectItemCaseSensitive(root, "bundles");
-    if (cJSON_IsArray(bundles)) {
-        cJSON *b = nullptr;
-        cJSON_ArrayForEach(b, bundles) {
-            if (!cJSON_IsObject(b)) continue;
+    const JceJson *bundles = jce_json_get(root, "bundles");
+    if (jce_json_is_array(bundles)) {
+        int bn = jce_json_array_size(bundles);
+        for (int bi = 0; bi < bn; ++bi) {
+            const JceJson *b = jce_json_array_at(bundles, bi);
+            if (!jce_json_is_object(b)) continue;
             BundleRow br;
-            const cJSON *v;
-            v = cJSON_GetObjectItemCaseSensitive(b, "id");
-            if (cJSON_IsString(v) && v->valuestring) br.id = v->valuestring;
-            v = cJSON_GetObjectItemCaseSensitive(b, "file");
-            if (cJSON_IsString(v) && v->valuestring) br.file = v->valuestring;
-            v = cJSON_GetObjectItemCaseSensitive(b, "hash");
-            if (cJSON_IsString(v) && v->valuestring) br.hash = v->valuestring;
-            v = cJSON_GetObjectItemCaseSensitive(b, "size_bytes");
-            if (cJSON_IsNumber(v)) br.size_bytes = (uint64_t)v->valuedouble;
-            v = cJSON_GetObjectItemCaseSensitive(b, "entry_count");
-            if (cJSON_IsNumber(v)) br.entry_count = (uint32_t)v->valuedouble;
-            v = cJSON_GetObjectItemCaseSensitive(b, "dep_count");
-            if (cJSON_IsNumber(v)) br.dep_count = (uint32_t)v->valuedouble;
-            const cJSON *entries = cJSON_GetObjectItemCaseSensitive(b, "entries");
-            if (cJSON_IsArray(entries)) {
-                cJSON *e = nullptr;
-                cJSON_ArrayForEach(e, entries) {
-                    if (!cJSON_IsObject(e)) continue;
+            if (const char *s = jce_json_get_string(b, "id", nullptr))   br.id = s;
+            if (const char *s = jce_json_get_string(b, "file", nullptr)) br.file = s;
+            if (const char *s = jce_json_get_string(b, "hash", nullptr)) br.hash = s;
+            br.size_bytes   = (uint64_t)jce_json_get_number(b, "size_bytes", 0.0);
+            br.entry_count  = (uint32_t)jce_json_get_number(b, "entry_count", 0.0);
+            br.dep_count    = (uint32_t)jce_json_get_number(b, "dep_count", 0.0);
+            const JceJson *entries = jce_json_get(b, "entries");
+            if (jce_json_is_array(entries)) {
+                int en = jce_json_array_size(entries);
+                for (int ei = 0; ei < en; ++ei) {
+                    const JceJson *e = jce_json_array_at(entries, ei);
+                    if (!jce_json_is_object(e)) continue;
                     EntryRow er;
-                    const cJSON *ev;
-                    ev = cJSON_GetObjectItemCaseSensitive(e, "path");
-                    if (cJSON_IsString(ev) && ev->valuestring) er.path = ev->valuestring;
-                    ev = cJSON_GetObjectItemCaseSensitive(e, "hash");
-                    if (cJSON_IsString(ev) && ev->valuestring) er.hash = ev->valuestring;
-                    ev = cJSON_GetObjectItemCaseSensitive(e, "type");
-                    if (cJSON_IsString(ev) && ev->valuestring) er.type = ev->valuestring;
-                    ev = cJSON_GetObjectItemCaseSensitive(e, "size_bytes");
-                    if (cJSON_IsNumber(ev)) er.size_bytes = (uint64_t)ev->valuedouble;
+                    if (const char *s = jce_json_get_string(e, "path", nullptr)) er.path = s;
+                    if (const char *s = jce_json_get_string(e, "hash", nullptr)) er.hash = s;
+                    if (const char *s = jce_json_get_string(e, "type", nullptr)) er.type = s;
+                    er.size_bytes = (uint64_t)jce_json_get_number(e, "size_bytes", 0.0);
                     br.entries.push_back(std::move(er));
                 }
             }
@@ -218,30 +203,28 @@ void refresh()
         }
     }
 
-    const cJSON *dups = cJSON_GetObjectItemCaseSensitive(root, "duplicates");
-    if (cJSON_IsArray(dups)) {
-        cJSON *d = nullptr;
-        cJSON_ArrayForEach(d, dups) {
-            if (!cJSON_IsObject(d)) continue;
+    const JceJson *dups = jce_json_get(root, "duplicates");
+    if (jce_json_is_array(dups)) {
+        int dn = jce_json_array_size(dups);
+        for (int di = 0; di < dn; ++di) {
+            const JceJson *d = jce_json_array_at(dups, di);
+            if (!jce_json_is_object(d)) continue;
             DuplicateRow dr;
-            const cJSON *v;
-            v = cJSON_GetObjectItemCaseSensitive(d, "hash");
-            if (cJSON_IsString(v) && v->valuestring) dr.hash = v->valuestring;
-            v = cJSON_GetObjectItemCaseSensitive(d, "size_bytes");
-            if (cJSON_IsNumber(v)) dr.size_bytes = (uint64_t)v->valuedouble;
-            v = cJSON_GetObjectItemCaseSensitive(d, "bundles");
-            if (cJSON_IsArray(v)) {
-                cJSON *bid = nullptr;
-                cJSON_ArrayForEach(bid, v) {
-                    if (cJSON_IsString(bid) && bid->valuestring)
-                        dr.bundles.emplace_back(bid->valuestring);
+            if (const char *s = jce_json_get_string(d, "hash", nullptr)) dr.hash = s;
+            dr.size_bytes = (uint64_t)jce_json_get_number(d, "size_bytes", 0.0);
+            const JceJson *db = jce_json_get(d, "bundles");
+            if (jce_json_is_array(db)) {
+                int dbn = jce_json_array_size(db);
+                for (int k = 0; k < dbn; ++k) {
+                    const char *s = jce_json_string_value(jce_json_array_at(db, k), nullptr);
+                    if (s) dr.bundles.emplace_back(s);
                 }
             }
             g_st.duplicates.push_back(std::move(dr));
         }
     }
 
-    cJSON_Delete(root);
+    jce_json_free(root);
 
     /* Build flat entries index for the Entries / Top-N tabs. */
     for (uint32_t bi = 0; bi < (uint32_t)g_st.bundles.size(); ++bi) {

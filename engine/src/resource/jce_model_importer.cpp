@@ -151,6 +151,206 @@ static JceMesh *convert_all_meshes(const aiScene *scene)
     return mesh;
 }
 
+/* ─── Per-part extraction ─────────────────────────────────────────
+ * Walk the node tree (no PreTransformVertices) and emit one part per
+ * node that owns geometry, merging that node's meshes and recording the
+ * accumulated world transform. */
+
+/* assimp aiMatrix4x4 is row-major; jce wants column-major float[16]. */
+static void ai_to_colmajor(const aiMatrix4x4 &m, float out[16])
+{
+    out[0]  = m.a1; out[1]  = m.b1; out[2]  = m.c1; out[3]  = m.d1;
+    out[4]  = m.a2; out[5]  = m.b2; out[6]  = m.c2; out[7]  = m.d2;
+    out[8]  = m.a3; out[9]  = m.b3; out[10] = m.c3; out[11] = m.d3;
+    out[12] = m.a4; out[13] = m.b4; out[14] = m.c4; out[15] = m.d4;
+}
+
+/* Count how many nodes in the subtree carry at least one mesh. */
+static uint32_t count_geo_nodes(const aiNode *node)
+{
+    if (!node) return 0;
+    uint32_t n = (node->mNumMeshes > 0) ? 1u : 0u;
+    for (unsigned i = 0; i < node->mNumChildren; i++)
+        n += count_geo_nodes(node->mChildren[i]);
+    return n;
+}
+
+/* Emit one part for `node` (merging its meshes), then recurse. `parent`
+ * is the accumulated world transform of the parent chain. Returns false
+ * only on allocation failure. */
+static bool emit_node_parts(const aiScene *scene, const aiNode *node,
+                            const aiMatrix4x4 &parent,
+                            JceModelParts *out, uint32_t *cursor)
+{
+    aiMatrix4x4 world = parent * node->mTransformation;
+
+    if (node->mNumMeshes > 0) {
+        uint32_t total_verts = 0, total_tris = 0;
+        for (unsigned i = 0; i < node->mNumMeshes; i++) {
+            const aiMesh *ai = scene->mMeshes[node->mMeshes[i]];
+            total_verts += ai->mNumVertices;
+            for (unsigned f = 0; f < ai->mNumFaces; f++)
+                if (ai->mFaces[f].mNumIndices == 3) total_tris += 1;
+        }
+
+        if (total_verts > 0) {
+            JceModelPart *part = &out->parts[*cursor];
+
+            const char *nm = (node->mName.length > 0)
+                ? node->mName.data : "part";
+            snprintf(part->name, sizeof(part->name), "%s", nm);
+            ai_to_colmajor(world, part->transform);
+
+            float *pos = static_cast<float *>(
+                JCE_MALLOC(static_cast<size_t>(total_verts) * 3 * sizeof(float)));
+            uint32_t *idx = (total_tris > 0)
+                ? static_cast<uint32_t *>(JCE_MALLOC(
+                    static_cast<size_t>(total_tris) * 3 * sizeof(uint32_t)))
+                : nullptr;
+            if (!pos || (total_tris > 0 && !idx)) {
+                JCE_FREE(pos);
+                JCE_FREE(idx);
+                return false;
+            }
+
+            uint32_t voff = 0, icnt = 0;
+            for (unsigned i = 0; i < node->mNumMeshes; i++) {
+                const aiMesh *ai = scene->mMeshes[node->mMeshes[i]];
+                for (unsigned v = 0; v < ai->mNumVertices; v++) {
+                    pos[(voff + v) * 3 + 0] = ai->mVertices[v].x;
+                    pos[(voff + v) * 3 + 1] = ai->mVertices[v].y;
+                    pos[(voff + v) * 3 + 2] = ai->mVertices[v].z;
+                }
+                for (unsigned f = 0; f < ai->mNumFaces; f++) {
+                    const aiFace &face = ai->mFaces[f];
+                    if (face.mNumIndices != 3) continue;
+                    idx[icnt++] = face.mIndices[0] + voff;
+                    idx[icnt++] = face.mIndices[1] + voff;
+                    idx[icnt++] = face.mIndices[2] + voff;
+                }
+                voff += ai->mNumVertices;
+            }
+
+            part->positions    = pos;
+            part->vertex_count = total_verts;
+            part->indices      = idx;
+            part->index_count  = icnt;
+            (*cursor)++;
+        }
+    }
+
+    for (unsigned i = 0; i < node->mNumChildren; i++)
+        if (!emit_node_parts(scene, node->mChildren[i], world, out, cursor))
+            return false;
+    return true;
+}
+
+static bool build_parts(const aiScene *scene, JceModelParts *out)
+{
+    out->parts = nullptr;
+    out->count = 0;
+    if (!scene || !scene->mRootNode) return false;
+
+    uint32_t node_count = count_geo_nodes(scene->mRootNode);
+    if (node_count == 0) return false;
+
+    out->parts = static_cast<JceModelPart *>(
+        JCE_CALLOC(node_count, sizeof(JceModelPart)));
+    if (!out->parts) return false;
+
+    aiMatrix4x4 identity;   /* default ctor is identity */
+    uint32_t cursor = 0;
+    if (!emit_node_parts(scene, scene->mRootNode, identity, out, &cursor)) {
+        jce_model_importer_free_parts(out);
+        return false;
+    }
+    out->count = cursor;
+    if (cursor == 0) {
+        jce_model_importer_free_parts(out);
+        return false;
+    }
+    return true;
+}
+
+/* Postprocess flags shared by the part loaders: deliberately WITHOUT
+ * aiProcess_PreTransformVertices so node separation survives. */
+static unsigned parts_postprocess_flags(void)
+{
+    return aiProcess_Triangulate
+         | aiProcess_GenSmoothNormals
+         | aiProcess_FlipUVs;
+}
+
+bool jce_model_importer_load_parts_memory(const void *data, size_t size,
+                                          const char *ext_hint,
+                                          JceModelParts *out)
+{
+    if (!data || size == 0 || !out) return false;
+    out->parts = nullptr;
+    out->count = 0;
+
+    Assimp::Importer importer;
+    const aiScene *scene = importer.ReadFileFromMemory(
+        data, size, parts_postprocess_flags(),
+        ext_hint ? ext_hint : "");
+    if (!scene || !scene->mNumMeshes) {
+        LOG_ERROR(LOG_TAG, "assimp parts load failed: %s",
+                  importer.GetErrorString());
+        return false;
+    }
+    return build_parts(scene, out);
+}
+
+bool jce_model_importer_load_parts_file(const char *file_path,
+                                        JceModelParts *out)
+{
+    if (!file_path || file_path[0] == '\0' || !out) return false;
+    out->parts = nullptr;
+    out->count = 0;
+
+    Assimp::Importer importer;
+    const aiScene *scene = nullptr;
+
+    /* Try host-FS read first (mirrors load_cpu_file), else direct read. */
+    void *vbuf = nullptr;
+    uint64_t vsz = 0;
+    vbuf = jce_fs_host_read_all(file_path, &vsz);
+    if (vbuf && vsz > 0) {
+        const char *ext = "";
+        const char *dot = strrchr(file_path, '.');
+        if (dot) ext = dot;
+        scene = importer.ReadFileFromMemory(vbuf, (size_t)vsz,
+                                            parts_postprocess_flags(), ext);
+    }
+    if (!scene)
+        scene = importer.ReadFile(file_path, parts_postprocess_flags());
+
+    bool ok = false;
+    if (!scene || !scene->mNumMeshes) {
+        LOG_ERROR(LOG_TAG, "assimp parts file load failed: %s  %s",
+                  file_path, importer.GetErrorString());
+    } else {
+        ok = build_parts(scene, out);
+    }
+    if (vbuf) jce_fs_buffer_free(vbuf);
+    return ok;
+}
+
+void jce_model_importer_free_parts(JceModelParts *parts)
+{
+    if (!parts || !parts->parts) {
+        if (parts) { parts->parts = nullptr; parts->count = 0; }
+        return;
+    }
+    for (uint32_t i = 0; i < parts->count; i++) {
+        JCE_FREE(parts->parts[i].positions);
+        JCE_FREE(parts->parts[i].indices);
+    }
+    JCE_FREE(parts->parts);
+    parts->parts = nullptr;
+    parts->count = 0;
+}
+
 bool jce_model_importer_load_cpu_file(const char *file_path,
                                     JceModelCpuMeshData *out)
 {

@@ -4,7 +4,7 @@
 :: Usage: build-android.bat [ndk_path] [sdk_path] [arch] [--clean]
 ::   ndk_path  - Android NDK root (default: D:\Code\C_CPP\cross_platform\android-ndk-r27d)
 ::   sdk_path  - Android SDK root (default: ANDROID_HOME or D:\Code\C_CPP\cross_platform\android-sdk)
-::   arch      - arm64 or arm (default: arm64)
+::   arch      - arm64, arm, x86_64, or x86 (default: arm64)
 ::   --clean   - Force full rebuild (remove CMake + Conan caches)
 :: Output: scripts\android\app\build\outputs\apk\debug\app-debug.apk
 :: ================================================================
@@ -42,8 +42,14 @@ if /i "%ARCH%"=="arm64" (
 ) else if /i "%ARCH%"=="arm" (
     set "ABI=armeabi-v7a"
     set "NDK_TRIPLE=arm-linux-androideabi"
+) else if /i "%ARCH%"=="x86_64" (
+    set "ABI=x86_64"
+    set "NDK_TRIPLE=x86_64-linux-android"
+) else if /i "%ARCH%"=="x86" (
+    set "ABI=x86"
+    set "NDK_TRIPLE=i686-linux-android"
 ) else (
-    echo ERROR: Invalid arch "%ARCH%". Use arm64 or arm.
+    echo ERROR: Invalid arch "%ARCH%". Use arm64, arm, x86_64, or x86.
     goto :error
 )
 

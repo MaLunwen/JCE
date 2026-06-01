@@ -17,6 +17,7 @@ extern "C" {
 #include "../core/jce_editor_state.h"
 #include "../gizmo/jce_gizmo_joint.h"
 #include "../gizmo/jce_gizmo_cloth.h"
+#include "../gizmo/jce_gizmo_compound_collider.h"
 
 /* ── Animation timer reset (kept for play.cpp compatibility) ─────── */
 
@@ -541,6 +542,38 @@ void draw_cloth_gizmos(void)
         if (!cl) continue;
 
         jce_gizmo_cloth_draw_from_component(cl);
+        drew_any = true;
+    }
+
+    if (drew_any) jce_debug_draw_flush(scene_view_id(), s_sr.renderer);
+}
+
+/* Draw per-object compound-collider wireframe for every selected entity
+ * that owns a JceCompoundColliderComponent.  Selection-driven; the cooked
+ * wireframe is cached inside the gizmo (model path + settings keyed). */
+void draw_compound_collider_gizmos(void)
+{
+    JceScene *scene = jce_state_get_scene();
+    if (!scene) return;
+
+    int sel_count = 0;
+    const uint32_t *sel = jce_state_get_selection(&sel_count);
+    if (!sel || sel_count <= 0) return;
+
+    bool drew_any = false;
+    for (int i = 0; i < sel_count; ++i) {
+        uint32_t id = sel[i];
+        if (id == 0 || !jce_state_entity_exists(id)) continue;
+        if (!jce_state_entity_enabled(id)) continue;
+
+        JceEntity e = (JceEntity)id;
+        if (!jce_scene_has_compound_collider(scene, e)) continue;
+
+        JceCompoundColliderComponent *cc =
+            jce_scene_get_compound_collider(scene, e);
+        if (!cc) continue;
+
+        jce_gizmo_compound_collider_draw_from_component(scene, e, cc);
         drew_any = true;
     }
 

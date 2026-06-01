@@ -27,23 +27,17 @@ set "CONAN_DIR=build\desktop\windows-x64-conan"
 set "BUILD_DIR=build\desktop\windows-x64-asan"
 set "TOOLCHAIN=%CONAN_DIR%\build\Release\generators\conan_toolchain.cmake"
 set "PROFILE=conan/profiles/windows-x64"
+set "COMMON=%~dp0lib\jce_build_common.bat"
 
 :parse_args
 if /i "%~1"=="--clean" (
-    echo === Cleaning ASan build directory ===
-    if exist "%BUILD_DIR%" rmdir /s /q "%BUILD_DIR%"
-    echo   Done
+    call "%COMMON%" clean "%BUILD_DIR%" ""
     shift
     goto :parse_args
 )
 
 echo === Step 1: Conan install (reuses windows-x64 release deps) ===
-if exist "%TOOLCHAIN%" (
-    echo   Toolchain exists, skipping.
-) else (
-    conan install . -pr:h %PROFILE% -pr:b %PROFILE% --output-folder=%CONAN_DIR% --build=missing
-    if errorlevel 1 goto :error
-)
+call "%COMMON%" conan "%PROFILE%" "%PROFILE%" "%CONAN_DIR%" "%TOOLCHAIN%" || goto :error
 
 echo === Step 2: CMake configure (Release + Zi + ASan) ===
 cmake -S . -B %BUILD_DIR% -G Ninja ^
@@ -62,10 +56,7 @@ echo === Step 3: Build JCE_Editor with ASan ===
 cmake --build %BUILD_DIR% --target JCE_Editor
 if errorlevel 1 goto :error
 
-if not exist "%BUILD_DIR%\asan\jce_editor.exe" (
-    echo ERROR: jce_editor.exe not found after build
-    goto :error
-)
+call "%COMMON%" verify "%BUILD_DIR%\asan\jce_editor.exe" "jce_editor.exe" || goto :error
 
 echo.
 echo [SUCCESS] ASan editor build complete:

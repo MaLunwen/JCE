@@ -69,6 +69,62 @@ JCE_API JceBodyHandle jce_physics_body_create(JcePhysicsWorld *world, const JceB
 JCE_API void          jce_physics_body_destroy(JcePhysicsWorld *world, JceBodyHandle body);
 
 /* ================================================================== */
+/* Compound / mesh bodies (per-object colliders)                       */
+/* ================================================================== */
+
+/*
+ * A single child collider inside a compound body.  Each child carries
+ * its own shape, a transform LOCAL to the owning body, and (for hull /
+ * triangle-mesh shapes) borrowed geometry that is copied into Bullet at
+ * create time — the caller may free `vertices` / `indices` afterwards.
+ *
+ * The whole point of the compound is that a model with N separated
+ * objects produces N children rather than one fat box/hull that fills
+ * the empty space between them.
+ */
+typedef struct {
+    JceShapeType shape;        /* BOX/SPHERE/CAPSULE/CONVEX_HULL/TRIANGLE_MESH */
+    jce_vec3     position;     /* child origin, relative to the body */
+    jce_quat     rotation;     /* child rotation, relative to the body */
+
+    /* Primitive parameters (box: half-size; sphere: (radius,0,0);
+       capsule: (radius, half_height, 0)).  Ignored for hull / mesh. */
+    jce_vec3     half_extents;
+
+    /* Geometry for CONVEX_HULL (point cloud) and TRIANGLE_MESH.
+       `vertices` is xyz-triplets, `vertex_count` points.
+       `indices` (TRIANGLE_MESH only) is 3 per triangle. */
+    const float    *vertices;
+    uint32_t        vertex_count;
+    const uint32_t *indices;
+    uint32_t        index_count;
+} JceColliderChild;
+
+typedef struct {
+    JceBodyType  type;            /* static / dynamic / kinematic */
+    jce_vec3     position;        /* body origin */
+    jce_quat     rotation;        /* body rotation */
+    float        mass;            /* 0 = static */
+    float        friction;        /* default 0.5 when <= 0 */
+    float        restitution;
+    float        linear_damping;
+    float        angular_damping;
+    uint32_t     collision_group; /* default group when 0 */
+    uint32_t     collision_mask;  /* default all when 0 */
+    bool         is_trigger;
+
+    const JceColliderChild *children;
+    uint32_t                child_count;
+} JceCompoundBodyDesc;
+
+/* Create a body whose collision shape is a compound of `child_count`
+   children (or, when there is a single child at identity transform, the
+   child shape directly).  TRIANGLE_MESH children require a non-dynamic
+   body.  Returns JCE_BODY_INVALID on failure. */
+JCE_API JceBodyHandle jce_physics_body_create_compound(JcePhysicsWorld           *world,
+                                                       const JceCompoundBodyDesc *desc);
+
+/* ================================================================== */
 /* Body state queries                                                  */
 /* ================================================================== */
 

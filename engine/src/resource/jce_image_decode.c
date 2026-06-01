@@ -7,7 +7,6 @@
 
 #include "os/core/jce_memory.h"
 
-#include <stdlib.h>  /* free() — stb_image_free is just free in our config */
 #include <string.h>
 
 /* stb_image is implemented in renderer/jce_stb_image_impl.c with the

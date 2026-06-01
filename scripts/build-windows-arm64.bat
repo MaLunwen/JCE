@@ -126,17 +126,7 @@ if not exist "%CONAN_HOOKS_DIR%" mkdir "%CONAN_HOOKS_DIR%"
 for %%F in (conan\hooks\hook_*.py) do copy /Y "%%F" "%CONAN_HOOKS_DIR%\" >nul
 echo   Synced hooks -> %CONAN_HOOKS_DIR%
 
-if exist "%TOOLCHAIN%" (
-    echo   Toolchain exists, skipping. Use --clean to force.
-) else (
-    conan install . -pr:b conan/profiles/windows-x64 -pr:h conan/profiles/windows-arm64 --output-folder=%CONAN_DIR% --build=missing
-    if errorlevel 1 goto :error
-)
-
-if not exist "%TOOLCHAIN%" (
-    echo ERROR: Conan toolchain not found: %TOOLCHAIN%
-    goto :error
-)
+call "%~dp0lib\jce_build_common.bat" conan "conan/profiles/windows-arm64" "conan/profiles/windows-x64" "%CONAN_DIR%" "%TOOLCHAIN%" || goto :error
 
 :: -- Step 5: CMake configure --
 echo === Step 5: CMake configure (windows-arm64) ===

@@ -991,7 +991,7 @@ void draw_run(void)
             jce_editor_i18n("projectSettings.run.gameExe"),
             g_st.cfg.game_executable_path,
             sizeof(g_st.cfg.game_executable_path),
-#if defined(_WIN32)
+#if JCE_PLATFORM_WINDOWS
             "Executables (*.exe);;All Files (*.*)"
 #else
             "All Files (*.*)"

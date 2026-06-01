@@ -801,6 +801,37 @@ static void parse_rigidbody(JceScene *s, JceEntity e, const cJSON *c)
     jce_scene_set_rigidbody(s, e, &rb);
 }
 
+static void parse_rigidbody2d(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceRigidBody2DComponent rb;
+    memset(&rb, 0, sizeof(rb));
+    rb.body_type      = (uint8_t)(int)j_num(c, "bodyType", 0.0);
+    rb.shape_type     = (uint8_t)(int)j_num(c, "shapeType", 0.0);
+    rb.mass           = (float)j_num(c, "mass", 1.0);
+    rb.friction       = (float)j_num(c, "friction", 0.4);
+    rb.restitution    = (float)j_num(c, "restitution", 0.0);
+    rb.fixed_rotation = j_bool(c, "fixedRotation", false);
+    jce_scene_set_rigidbody2d(s, e, &rb);
+}
+
+static void parse_particle_emitter(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceParticleEmitterComponent pe;
+    memset(&pe, 0, sizeof(pe));
+    pe.emit_rate     = (float)j_num(c, "emitRate", 10.0);
+    pe.lifetime_min  = (float)j_num(c, "lifetimeMin", 1.0);
+    pe.lifetime_max  = (float)j_num(c, "lifetimeMax", 2.0);
+    jce_scene_set_particle_emitter(s, e, &pe);
+}
+
+static void parse_behavior_tree(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceBehaviorTree bt;
+    memset(&bt, 0, sizeof(bt));
+    bt.active = j_bool(c, "active", true);
+    jce_scene_set_behavior_tree(s, e, &bt);
+}
+
 static void parse_box_collider(JceScene *s, JceEntity e, const cJSON *c)
 {
     JceBoxColliderComponent bc;
@@ -967,6 +998,24 @@ static void parse_mesh_collider(JceScene *s, JceEntity e, const cJSON *c)
     mc.friction    = (float)j_num(c, "friction", 0.5);
     mc.restitution = (float)j_num(c, "restitution", 0.0);
     jce_scene_set_mesh_collider(s, e, &mc);
+}
+
+static void parse_compound_collider(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceCompoundColliderComponent cc;
+    memset(&cc, 0, sizeof(cc));
+    copy_str(cc.model_path, sizeof(cc.model_path), j_str(c, "modelPath", ""));
+    cc.mode          = (uint8_t)j_num(c, "mode", 0);
+    cc.split         = (uint8_t)j_num(c, "split", 0);
+    cc.is_static     = j_bool(c, "isStatic", true);
+    cc.detect_naming = j_bool(c, "detectNaming", true);
+    cc.is_trigger    = j_bool(c, "isTrigger", false);
+    cc.friction      = (float)j_num(c, "friction", 0.5);
+    cc.restitution   = (float)j_num(c, "restitution", 0.0);
+    cc.vhacd_resolution         = (uint32_t)j_num(c, "vhacdResolution", 0);
+    cc.vhacd_max_hulls          = (uint32_t)j_num(c, "vhacdMaxHulls", 0);
+    cc.vhacd_max_verts_per_hull = (uint32_t)j_num(c, "vhacdMaxVertsPerHull", 0);
+    jce_scene_set_compound_collider(s, e, &cc);
 }
 
 static void parse_collider2d(JceScene *s, JceEntity e, const cJSON *c)
@@ -1564,6 +1613,21 @@ static void parse_one_component(JceScene *s, JceEntity e, const cJSON *comp)
     if (strcmp(type, "Rigidbody") == 0 || strcmp(type, "rigidbody") == 0) {
         parse_rigidbody(s, e, props); return;
     }
+    /* Rigidbody2D. */
+    if (strcmp(type, "Rigidbody2D") == 0 || strcmp(type, "rigidbody2d") == 0
+        || strcmp(type, "Rigidbody 2D") == 0) {
+        parse_rigidbody2d(s, e, props); return;
+    }
+    /* Particle emitter. */
+    if (strcmp(type, "ParticleEmitter") == 0 || strcmp(type, "particleEmitter") == 0
+        || strcmp(type, "Particle Emitter") == 0) {
+        parse_particle_emitter(s, e, props); return;
+    }
+    /* Behavior tree. */
+    if (strcmp(type, "BehaviorTree") == 0 || strcmp(type, "behaviorTree") == 0
+        || strcmp(type, "Behavior Tree") == 0 || strcmp(type, "BehaviourTree") == 0) {
+        parse_behavior_tree(s, e, props); return;
+    }
     /* Box collider. */
     if (strcmp(type, "BoxCollider") == 0 || strcmp(type, "Box Collider") == 0) {
         parse_box_collider(s, e, props); return;
@@ -1611,6 +1675,10 @@ static void parse_one_component(JceScene *s, JceEntity e, const cJSON *comp)
     /* Mesh Collider (3D). */
     if (strcmp(type, "MeshCollider") == 0 || strcmp(type, "meshCollider") == 0) {
         parse_mesh_collider(s, e, props); return;
+    }
+    /* Compound Collider (per-object cooked). */
+    if (strcmp(type, "CompoundCollider") == 0 || strcmp(type, "compoundCollider") == 0) {
+        parse_compound_collider(s, e, props); return;
     }
     /* Collider 2D (combined). */
     if (strcmp(type, "Collider2D") == 0 || strcmp(type, "collider2D") == 0) {
@@ -2022,6 +2090,37 @@ static void ser_rigidbody(const JceRigidBodyComponent *c, cJSON *arr)
     cJSON_AddItemToArray(arr, o);
 }
 
+static void ser_rigidbody2d(const JceRigidBody2DComponent *c, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "Rigidbody2D");
+    cJSON_AddNumberToObject(o, "bodyType", (double)c->body_type);
+    cJSON_AddNumberToObject(o, "shapeType", (double)c->shape_type);
+    cJSON_AddNumberToObject(o, "mass", c->mass);
+    cJSON_AddNumberToObject(o, "friction", c->friction);
+    cJSON_AddNumberToObject(o, "restitution", c->restitution);
+    cJSON_AddBoolToObject(o, "fixedRotation", c->fixed_rotation);
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_particle_emitter(const JceParticleEmitterComponent *c, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "ParticleEmitter");
+    cJSON_AddNumberToObject(o, "emitRate", c->emit_rate);
+    cJSON_AddNumberToObject(o, "lifetimeMin", c->lifetime_min);
+    cJSON_AddNumberToObject(o, "lifetimeMax", c->lifetime_max);
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_behavior_tree(const JceBehaviorTree *c, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "BehaviorTree");
+    cJSON_AddBoolToObject(o, "active", c->active);
+    cJSON_AddItemToArray(arr, o);
+}
+
 static void ser_box_collider(const JceBoxColliderComponent *c, cJSON *arr)
 {
     cJSON *o = cJSON_CreateObject();
@@ -2201,8 +2300,24 @@ static void ser_mesh_collider(const JceMeshColliderComponent *c, cJSON *arr)
     cJSON_AddStringToObject(o, "meshPath", c->mesh_path);
     cJSON_AddBoolToObject  (o, "convex",    c->convex);
     cJSON_AddBoolToObject  (o, "isTrigger", c->is_trigger);
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_compound_collider(const JceCompoundColliderComponent *c, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "CompoundCollider");
+    cJSON_AddStringToObject(o, "modelPath", c->model_path);
+    cJSON_AddNumberToObject(o, "mode",  c->mode);
+    cJSON_AddNumberToObject(o, "split", c->split);
+    cJSON_AddBoolToObject  (o, "isStatic",     c->is_static);
+    cJSON_AddBoolToObject  (o, "detectNaming", c->detect_naming);
+    cJSON_AddBoolToObject  (o, "isTrigger",    c->is_trigger);
     cJSON_AddNumberToObject(o, "friction",    c->friction);
     cJSON_AddNumberToObject(o, "restitution", c->restitution);
+    cJSON_AddNumberToObject(o, "vhacdResolution",      c->vhacd_resolution);
+    cJSON_AddNumberToObject(o, "vhacdMaxHulls",        c->vhacd_max_hulls);
+    cJSON_AddNumberToObject(o, "vhacdMaxVertsPerHull", c->vhacd_max_verts_per_hull);
     cJSON_AddItemToArray(arr, o);
 }
 
@@ -2892,6 +3007,18 @@ static void ser_entity_cb(JceScene *s, JceEntity e, void *ud)
         JceRigidBodyComponent *c = jce_scene_get_rigidbody(s, e);
         if (c) ser_rigidbody(c, comps);
     }
+    if (f & JCE_COMP_FLAG_RIGIDBODY_2D) {
+        JceRigidBody2DComponent *c = jce_scene_get_rigidbody2d(s, e);
+        if (c) ser_rigidbody2d(c, comps);
+    }
+    if (f & JCE_COMP_FLAG_PARTICLE_EMITTER) {
+        JceParticleEmitterComponent *c = jce_scene_get_particle_emitter(s, e);
+        if (c) ser_particle_emitter(c, comps);
+    }
+    if (f & JCE_COMP_FLAG_BEHAVIOR_TREE) {
+        JceBehaviorTree *c = jce_scene_get_behavior_tree(s, e);
+        if (c) ser_behavior_tree(c, comps);
+    }
     if (f & JCE_COMP_FLAG_BOX_COLLIDER) {
         JceBoxColliderComponent *c = jce_scene_get_box_collider(s, e);
         if (c) ser_box_collider(c, comps);
@@ -2939,6 +3066,10 @@ static void ser_entity_cb(JceScene *s, JceEntity e, void *ud)
     if (f & JCE_COMP_FLAG_MESH_COLLIDER) {
         JceMeshColliderComponent *c = jce_scene_get_mesh_collider(s, e);
         if (c) ser_mesh_collider(c, comps);
+    }
+    if (jce_scene_has_compound_collider(s, e)) {
+        JceCompoundColliderComponent *c = jce_scene_get_compound_collider(s, e);
+        if (c) ser_compound_collider(c, comps);
     }
     if (f & JCE_COMP_FLAG_COLLIDER_2D) {
         JceCollider2DComponent *c = jce_scene_get_collider2d(s, e);
@@ -3498,6 +3629,18 @@ cJSON *jce_scene_serialize_entity_components(JceScene *scene, JceEntity e)
         JceRigidBodyComponent *c = jce_scene_get_rigidbody(scene, e);
         if (c) ser_rigidbody(c, arr);
     }
+    if (f & JCE_COMP_FLAG_RIGIDBODY_2D) {
+        JceRigidBody2DComponent *c = jce_scene_get_rigidbody2d(scene, e);
+        if (c) ser_rigidbody2d(c, arr);
+    }
+    if (f & JCE_COMP_FLAG_PARTICLE_EMITTER) {
+        JceParticleEmitterComponent *c = jce_scene_get_particle_emitter(scene, e);
+        if (c) ser_particle_emitter(c, arr);
+    }
+    if (f & JCE_COMP_FLAG_BEHAVIOR_TREE) {
+        JceBehaviorTree *c = jce_scene_get_behavior_tree(scene, e);
+        if (c) ser_behavior_tree(c, arr);
+    }
     if (f & JCE_COMP_FLAG_BOX_COLLIDER) {
         JceBoxColliderComponent *c = jce_scene_get_box_collider(scene, e);
         if (c) ser_box_collider(c, arr);
@@ -3545,6 +3688,10 @@ cJSON *jce_scene_serialize_entity_components(JceScene *scene, JceEntity e)
     if (f & JCE_COMP_FLAG_MESH_COLLIDER) {
         JceMeshColliderComponent *c = jce_scene_get_mesh_collider(scene, e);
         if (c) ser_mesh_collider(c, arr);
+    }
+    if (jce_scene_has_compound_collider(scene, e)) {
+        JceCompoundColliderComponent *c = jce_scene_get_compound_collider(scene, e);
+        if (c) ser_compound_collider(c, arr);
     }
     if (f & JCE_COMP_FLAG_COLLIDER_2D) {
         JceCollider2DComponent *c = jce_scene_get_collider2d(scene, e);

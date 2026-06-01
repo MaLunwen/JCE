@@ -14,6 +14,8 @@ extern "C" {
 
 #include <jce/middleware/physics/jce_physics.h>
 #include <jce/middleware/physics/jce_physics2d.h>
+#include <jce/middleware/physics/jce_collider_cook.h>
+#include <jce/middleware/physics/jce_collider_asset.h>
 #include <jce/middleware/physics/jce_physics_debug.h>
 #include <jce/middleware/physics/jce_physics_joint_query.h>
 #include <jce/middleware/physics/jce_physics_layers.h>

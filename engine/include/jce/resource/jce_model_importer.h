@@ -60,6 +60,38 @@ JCE_API bool jce_model_importer_load_cpu_file(const char          *file_path,
                                               JceModelCpuMeshData *out);
 JCE_API void jce_model_importer_free_cpu(JceModelCpuMeshData *data);
 
+/* ─── Per-part extraction (collider cooking) ──────────────────────
+ * Unlike the loaders above, this does NOT flatten the node hierarchy.
+ * Each scene node that carries geometry becomes one part, named by the
+ * node, with its meshes merged and its accumulated world transform kept
+ * separate (column-major). This preserves the "N separated objects"
+ * structure a model file expresses so colliders stay per-object instead
+ * of collapsing into one fat hull spanning the empty gaps between them.
+ *
+ * Geometry is part-local; apply `transform` to reach model space. The
+ * layout matches JceColliderPart so a part feeds the cooker directly. */
+typedef struct JceModelPart {
+    char      name[128];
+    float    *positions;     /* 3 * vertex_count, part-local            */
+    uint32_t  vertex_count;
+    uint32_t *indices;       /* 3 per triangle, local to this part      */
+    uint32_t  index_count;
+    float     transform[16]; /* part-local → model space, column-major  */
+} JceModelPart;
+
+typedef struct JceModelParts {
+    JceModelPart *parts;
+    uint32_t      count;
+} JceModelParts;
+
+JCE_API bool jce_model_importer_load_parts_file(const char     *file_path,
+                                                JceModelParts  *out);
+JCE_API bool jce_model_importer_load_parts_memory(const void    *data,
+                                                  size_t          size,
+                                                  const char     *ext_hint,
+                                                  JceModelParts  *out);
+JCE_API void jce_model_importer_free_parts(JceModelParts *parts);
+
 JCE_API bool jce_model_importer_extract_material(const char           *file_path,
                                                  JceModelMaterialInfo *out);
 

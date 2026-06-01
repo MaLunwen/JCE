@@ -29,14 +29,12 @@ set "CONAN_DIR=build\desktop\windows-x64-debug-conan"
 set "BUILD_DIR=build\desktop\windows-x64-debug"
 set "TOOLCHAIN=%CONAN_DIR%\build\Debug\generators\conan_toolchain.cmake"
 set "PROFILE=conan/profiles/windows-x64-debug"
+set "COMMON=%~dp0lib\jce_build_common.bat"
 
 :: -- Parse arguments --
 :parse_args
 if /i "%~1"=="--clean" (
-    echo === Cleaning debug build directory ===
-    if exist "%BUILD_DIR%" rmdir /s /q "%BUILD_DIR%"
-    if exist "%CONAN_DIR%" rmdir /s /q "%CONAN_DIR%"
-    echo   Done
+    call "%COMMON%" clean "%BUILD_DIR%" "%CONAN_DIR%"
     shift
     goto :parse_args
 )
@@ -45,34 +43,16 @@ if /i "%~1"=="--clean" (
 echo === Step 1: Conan install (windows-x64-debug) ===
 echo   This will (re)build third-party deps in Debug mode the first time.
 echo   It can take 10-20 minutes initially; subsequent runs are instant.
-if exist "%TOOLCHAIN%" (
-    echo   Toolchain exists, skipping. Use --clean to force rebuild.
-) else (
-    conan install . -pr:h %PROFILE% -pr:b %PROFILE% --output-folder=%CONAN_DIR% --build=missing
-    if errorlevel 1 goto :error
-)
-
-if not exist "%TOOLCHAIN%" (
-    echo ERROR: Conan toolchain not found: %TOOLCHAIN%
-    goto :error
-)
+call "%COMMON%" conan "%PROFILE%" "%PROFILE%" "%CONAN_DIR%" "%TOOLCHAIN%" || goto :error
 
 :: -- Step 2: CMake configure (direct, bypasses CMakePresets to avoid
 ::    "Duplicate conan-release" error from legacy CMakeUserPresets.json) --
 echo === Step 2: CMake configure (Debug) ===
 
-:: Locate shaderc from Debug Conan build (bgfx tools=True). The cmake helper
+:: Locate shaderc from the Conan cache (bgfx tools=True). The cmake helper
 :: hardcodes bgfx_PACKAGE_FOLDER_RELEASE which is empty in Debug builds, so we
 :: pass the path explicitly. shaderc is a host tool; build_type doesn't matter.
-set "SHADERC_EXE="
-for /f "delims=" %%S in ('powershell -NoProfile -Command "$paths=@('%USERPROFILE%\.conan2\p\b'); Get-ChildItem -Path $paths -Recurse -Filter shaderc.exe -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'bgfx.+\\(b\\build\\Debug|p\\bin)\\' } | Sort-Object { if ($_.FullName -match '\\b\\build\\Debug\\') { 0 } else { 1 } } | Select-Object -First 1 -ExpandProperty FullName"') do (
-    set "SHADERC_EXE=%%S"
-)
-if defined SHADERC_EXE (
-    echo   Using shaderc: !SHADERC_EXE!
-) else (
-    echo WARNING: shaderc.exe not found; CMake configure will fail.
-)
+call "%COMMON%" shaderc
 
 cmake -S . -B %BUILD_DIR% -G Ninja ^
     -DCMAKE_TOOLCHAIN_FILE=%TOOLCHAIN% ^
@@ -92,10 +72,7 @@ echo === Step 3: Build JCE_Editor (Debug) ===
 cmake --build %BUILD_DIR% --target JCE_Editor
 if errorlevel 1 goto :error
 
-if not exist "%BUILD_DIR%\debug\jce_editor.exe" (
-    echo ERROR: jce_editor.exe not found after build
-    goto :error
-)
+call "%COMMON%" verify "%BUILD_DIR%\debug\jce_editor.exe" "jce_editor.exe" || goto :error
 if not exist "%BUILD_DIR%\debug\jce_editor.pdb" (
     echo WARNING: jce_editor.pdb missing -- VS debugger will only show addresses.
 )

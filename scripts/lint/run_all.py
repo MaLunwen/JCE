@@ -23,8 +23,10 @@ LINT_DIR = Path(__file__).resolve().parent
 LINTS = [
     "check_agents_md.py",
     "check_public_api_purity.py",
+    "check_editor_consumer_purity.py",
     "check_layer_dependencies.py",
     "check_engine_native_io.py",
+    "check_platform_macros.py",
     "check_raw_allocator.py",
     "i18n_audit.py",
     "i18n_hardcoded.py",

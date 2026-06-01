@@ -1,177 +1,145 @@
-/* pak_loader.c
+/* jce_pak_loader.c
  *
- * Runtime PAK archive loader.
- * Parses an in-memory JPAK blob, builds a lookup table sorted by
- * XXH3_64bits hash, and decompresses assets on demand via ZSTD.
+ * Runtime PAK loader.  Since the format migration (1a), the legacy
+ * `jce_pak_*` API is a thin compatibility shim over the richer JCE
+ * Archive format (JPAK v1, <jce/resource/jce_archive.h>): the on-disk
+ * container is now a v1 archive, so the loader inherits dictionary
+ * compression (spec §7), mmap zero-copy (§8), explicit-offset/cross-
+ * endian I/O (§4/§10) and layered integrity (§9) for free, while every
+ * existing caller keeps using the same jce_pak_* entry points.
+ *
+ * Each JcePakAsset is embedded as the first member of an internal
+ * PakAsset record that also carries the owning archive and the matching
+ * JceArchiveEntry, so the handle-less jce_pak_decompress(asset, buf) can
+ * recover everything it needs to drive jce_archive_read() — which
+ * transparently handles NONE / ZSTD / ZSTD_DICT.
+ *
+ * Thread-safety: jce_async_pool decodes from worker threads via the
+ * handle-less jce_pak_decompress().  jce_archive_read() shares a zstd
+ * decompression context per archive, so the shim serializes just that
+ * decompression step behind a per-archive lock (the surrounding image /
+ * audio decode stays parallel).  This matches the single-core baseline
+ * priority (spec §1.3).
  */
 
 #include <jce/os/core/jce_profiler.h>
 #include <jce/resource/jce_pak_loader.h>
+#include <jce/resource/jce_archive.h>
 
 #include "os/core/jce_memory.h"
-#include "resource/jce_pak_format.h"
 
 #include <SDL3/SDL.h>
 #include <string.h>
 
 #include <xxhash.h>
-#include <zstd.h>
 
-/* Module-global toggle: when non-zero, jce_pak_decompress[_ex] will re-hash
- * the output buffer with XXH3 and compare against asset->content_hash. */
+/* Module-global toggle: when non-zero, jce_pak_decompress[_ex] re-hashes
+ * the output buffer and compares against the entry's recorded checksum. */
 static int g_verify_on_decompress = 0;
 
 /* ================================================================== */
 /* Internal types                                                      */
 /* ================================================================== */
 
+/* JcePakAsset MUST be the first member so a public `const JcePakAsset *`
+ * can be cast back to its owning PakAsset (recovering archive + entry). */
+typedef struct PakAsset {
+    JcePakAsset            pub;
+    const JceArchiveEntry *entry;   /* matching v1 index entry           */
+    struct JcePakArchive  *owner;   /* archive that owns entry + dctx     */
+} PakAsset;
+
 struct JcePakArchive {
-    const uint8_t *blob;        /* start of the in-memory PAK         */
-    size_t         blob_size;
-    uint32_t       count;       /* number of entries                   */
-    JcePakAsset      *assets;      /* heap-allocated array, sorted by hash*/
-    uint64_t      *hashes;      /* parallel array of path hashes       */
-    char         **paths;       /* heap-allocated NUL-terminated copies*/
-    int            owns_blob;   /* 1 => blob was malloc'd; free on close*/
-    ZSTD_DCtx     *dctx;        /* reusable decompression context      */
-    SDL_AtomicInt  refcount;    /* shared-ownership counter (>=1 while alive) */
-    /* Overlay chain: when a path misses in *this* archive jce_pak_find()
-     * walks `overlay_next` (lower priority).  Used by the runtime to
-     * stack project bundles on top of the engine PAK so that all engine
-     * subsystems (skybox, audio, scene_renderer fallback, asset_manager)
-     * transparently see bundle contents without any per-call cb wiring. */
+    JceArchive   *ar;          /* backing v1 archive (owns blob/mmap)    */
+    uint32_t      count;
+    PakAsset     *assets;      /* count records, archive index order      */
+    SDL_AtomicInt refcount;    /* shared-ownership counter (>=1 while alive)*/
+    SDL_Mutex    *decode_lock; /* serializes jce_archive_read (shared dctx)*/
+    /* Overlay chain: a miss in *this* archive falls through to the next
+     * (lower-priority) layer.  Base archive wins for a given path. */
     struct JcePakArchive *overlay_next;
 };
 
 /* ================================================================== */
-/* jce_pak_open                                                            */
+/* Construction                                                        */
 /* ================================================================== */
 
-JcePakArchive *jce_pak_open(const void *data, size_t size) {
-    if (!data || size < JPAK_HEADER_SIZE) return NULL;
-
-    const uint8_t *blob = (const uint8_t *)data;
-
-    /* Validate magic (single bytes  endian-neutral). */
-    if (blob[0] != JPAK_MAGIC_0 ||
-        blob[1] != JPAK_MAGIC_1 ||
-        blob[2] != JPAK_MAGIC_2 ||
-        blob[3] != JPAK_MAGIC_3) {
-        return NULL;
-    }
-
-    /* Read header fields via LE helpers  safe on any byte order. */
-    uint32_t version  = jpak_read_le32(blob + 4);
-    if (version != JPAK_VERSION) return NULL;
-
-    uint32_t count    = jpak_read_le32(blob + 8);
-    uint32_t hflags   = jpak_read_le32(blob + 12);
-
-    /* Capability gate: reject if any REQUIRED bit we don't understand
-     * is set.  Unknown OPTIONAL bits are allowed (forward compat). */
-    {
-        uint32_t req = hflags & JPAK_HEADER_CAP_REQUIRED_MASK;
-        uint32_t unknown_req = req & ~JPAK_HEADER_CAP_KNOWN_REQUIRED;
-        if (unknown_req != 0) {
-            SDL_Log("[pak] reject: unknown required capability flags 0x%08X",
-                    (unsigned)unknown_req);
-            return NULL;
-        }
-    }
-
-    uint64_t toc_off  = jpak_read_le64(blob + 16);
-    uint64_t data_off = jpak_read_le64(blob + 24);
-
-    /* Bounds check the TOC region. */
-    uint64_t toc_end = toc_off + (uint64_t)count * JPAK_TOC_ENTRY_SIZE;
-    if (toc_end > size || data_off > size) return NULL;
+static JcePakArchive *wrap_archive(JceArchive *ar) {
+    if (!ar) return NULL;
 
     JcePakArchive *pak = (JcePakArchive *)JCE_CALLOC(1, sizeof(JcePakArchive));
-    if (!pak) return NULL;
+    if (!pak) { jce_archive_close(ar); return NULL; }
 
-    pak->blob      = blob;
-    pak->blob_size = size;
-    pak->count     = count;
+    pak->ar    = ar;
+    pak->count = jce_archive_count(ar);
     SDL_SetAtomicInt(&pak->refcount, 1);
+    pak->decode_lock = SDL_CreateMutex();
+    if (!pak->decode_lock) { jce_archive_close(ar); JCE_FREE(pak); return NULL; }
 
-    pak->dctx = ZSTD_createDCtx();
+    if (pak->count == 0) return pak;
 
-    if (count == 0) return pak;
+    pak->assets = (PakAsset *)JCE_CALLOC(pak->count, sizeof(PakAsset));
+    if (!pak->assets) { jce_pak_close(pak); return NULL; }
 
-    pak->assets = (JcePakAsset *)JCE_CALLOC(count, sizeof(JcePakAsset));
-    pak->hashes = (uint64_t *)JCE_CALLOC(count, sizeof(uint64_t));
-    pak->paths  = (char **)JCE_CALLOC(count, sizeof(char *));
-    if (!pak->assets || !pak->hashes || !pak->paths) {
-        jce_pak_close(pak);
-        return NULL;
-    }
+    for (uint32_t i = 0; i < pak->count; ++i) {
+        const JceArchiveEntry *e = jce_archive_get(ar, i);
+        PakAsset *pa = &pak->assets[i];
+        pa->entry = e;
+        pa->owner = pak;
 
-    for (uint32_t i = 0; i < count; ++i) {
-        /* Pointer to the i-th TOC entry (v2: 56 bytes). */
-        const uint8_t *e = blob + toc_off + (uint64_t)i * JPAK_TOC_ENTRY_SIZE;
+        const char *name = jce_archive_debug_path(ar, i);
+        pa->pub.path = name ? name : "";
 
-        uint64_t path_hash       = jpak_read_le64(e + 0);
-        uint32_t name_offset     = jpak_read_le32(e + 8);
-        uint32_t name_length     = jpak_read_le32(e + 12);
-        uint64_t entry_data_off  = jpak_read_le64(e + 16);
-        uint64_t compressed_size = jpak_read_le64(e + 24);
-        uint64_t original_size = jpak_read_le64(e + 32);
-        uint32_t entry_flags = jpak_read_le32(e + 40);
-        /* skip _pad at +44 */
-        uint64_t content_hash = jpak_read_le64(e + 48);
+        /* Uncompressed, unencrypted entries expose a zero-copy pointer;
+         * compressed entries have no flat pointer (decode via read). */
+        const void *zc = NULL; size_t zc_size = 0;
+        if (jce_archive_map_entry(ar, e, &zc, &zc_size))
+            pa->pub.compressed_data = (const uint8_t *)zc;
+        else
+            pa->pub.compressed_data = NULL;
 
-        /* Bounds-check name region. */
-        if ((uint64_t)name_offset + name_length > size) {
-            jce_pak_close(pak);
-            return NULL;
-        }
-
-        /* Build a NUL-terminated path copy. */
-        char *path_copy = (char *)JCE_MALLOC(name_length + 1);
-        if (!path_copy) { jce_pak_close(pak); return NULL; }
-        memcpy(path_copy, blob + name_offset, name_length);
-        path_copy[name_length] = '\0';
-
-        pak->paths[i]  = path_copy;
-        pak->hashes[i] = path_hash;
-
-        pak->assets[i].path            = path_copy;
-        pak->assets[i].compressed_data = blob + data_off + entry_data_off;
-        pak->assets[i].compressed_size = compressed_size;
-        pak->assets[i].original_size = original_size;
-        pak->assets[i].flags = entry_flags;
-        pak->assets[i].content_hash = content_hash;
-
-        /* Bounds-check data region. */
-        if (data_off + entry_data_off + compressed_size > size) {
-            jce_pak_close(pak);
-            return NULL;
-        }
+        pa->pub.compressed_size = e->stored_size;
+        pa->pub.original_size   = e->original_size;
+        pa->pub.flags = (e->compression == JCE_ARCHIVE_COMP_NONE)
+                            ? JCE_PAK_ASSET_STORED : 0u;
+        /* v1 records a per-entry XXH32 content_crc; surface it in the
+         * u64 field so jce_pak_verify() can check it (whole-archive
+         * integrity additionally uses XXH3, spec §9.1). */
+        pa->pub.content_hash = (uint64_t)e->content_crc;
     }
 
     return pak;
 }
 
 /* ================================================================== */
-/* jce_pak_close — releases one reference; frees when refcount hits 0  */
+/* jce_pak_open*                                                        */
+/* ================================================================== */
+
+JcePakArchive *jce_pak_open(const void *data, size_t size) {
+    return wrap_archive(jce_archive_open(data, size));
+}
+
+JcePakArchive *jce_pak_open_owned(void *data, size_t size) {
+    return wrap_archive(jce_archive_open_owned(data, size));
+}
+
+JcePakArchive *jce_pak_open_file(const char *path) {
+    if (!path) return NULL;
+    return wrap_archive(jce_archive_open_file(path));
+}
+
+/* ================================================================== */
+/* Reference counting / teardown                                       */
 /* ================================================================== */
 
 void jce_pak_close(JcePakArchive *pak) {
     if (!pak) return;
-    /* Decrement refcount; only the final release performs the actual
-     * teardown.  AtomicAdd returns the OLD value. */
     int prev = SDL_AddAtomicInt(&pak->refcount, -1);
-    if (prev > 1) return;  /* other owners still hold the archive */
+    if (prev > 1) return; /* other owners still hold the archive */
 
-    if (pak->paths) {
-        for (uint32_t i = 0; i < pak->count; ++i)
-            JCE_FREE(pak->paths[i]);
-        JCE_FREE(pak->paths);
-    }
-    JCE_FREE(pak->hashes);
     JCE_FREE(pak->assets);
-    ZSTD_freeDCtx(pak->dctx);
-    if (pak->owns_blob) JCE_FREE((void *)pak->blob);
+    if (pak->decode_lock) SDL_DestroyMutex(pak->decode_lock);
+    if (pak->ar) jce_archive_close(pak->ar);
     JCE_FREE(pak);
 }
 
@@ -183,101 +151,55 @@ JcePakArchive *jce_pak_acquire(JcePakArchive *pak) {
 
 int jce_pak_refcount(const JcePakArchive *pak) {
     if (!pak) return 0;
-    /* SDL atomic getters take non-const; cast away here, value is read-only. */
     return SDL_GetAtomicInt((SDL_AtomicInt *)&pak->refcount);
 }
 
 /* ================================================================== */
-/* jce_pak_open_owned                                                      */
-/* ================================================================== */
-
-JcePakArchive *jce_pak_open_owned(void *data, size_t size) {
-    JcePakArchive *pak = jce_pak_open(data, size);
-    if (pak) pak->owns_blob = 1;
-    return pak;
-}
-
-/* ================================================================== */
-/* jce_pak_open_file                                                       */
-/* ================================================================== */
-
-JcePakArchive *jce_pak_open_file(const char *path) {
-    if (!path) return NULL;
-
-    SDL_IOStream *io = SDL_IOFromFile(path, "rb");
-    if (!io) return NULL;
-
-    Sint64 lsize = SDL_GetIOSize(io);
-    if (lsize <= 0) { SDL_CloseIO(io); return NULL; }
-
-    uint8_t *buf = (uint8_t *)JCE_MALLOC((size_t)lsize);
-    if (!buf) { SDL_CloseIO(io); return NULL; }
-
-    if (SDL_ReadIO(io, buf, (size_t)lsize) != (size_t)lsize) {
-        JCE_FREE(buf); SDL_CloseIO(io); return NULL;
-    }
-    SDL_CloseIO(io);
-
-    JcePakArchive *pak = jce_pak_open(buf, (size_t)lsize);
-    if (pak) {
-        pak->owns_blob = 1;
-    } else {
-        JCE_FREE(buf);
-    }
-    return pak;
-}
-
-/* ================================================================== */
-/* jce_pak_find    XXH3 hash + binary search                              */
+/* jce_pak_find — normalized hash + binary search                      */
 /* ================================================================== */
 
 const JcePakAsset *jce_pak_find(const JcePakArchive *pak, const char *path) {
-    if (!pak || !path || pak->count == 0) {
-        /* Empty/null base may still have overlays. */
+    if (!pak || !path) {
         if (pak && pak->overlay_next && path)
             return jce_pak_find(pak->overlay_next, path);
         return NULL;
     }
 
-    uint64_t hash = XXH3_64bits(path, strlen(path));
-
-    /* Binary search on the hash-sorted array. */
-    uint32_t lo = 0, hi = pak->count;
-    while (lo < hi) {
-        uint32_t mid = lo + (hi - lo) / 2;
-        if (pak->hashes[mid] < hash)
-            lo = mid + 1;
-        else
-            hi = mid;
+    const JceArchiveEntry *e = jce_archive_find(pak->ar, path);
+    if (e) {
+        /* Map the entry back to its PakAsset.  Entries are sorted
+         * ascending by path_hash and unique (the writer rejects hash
+         * collisions, spec §12.3), so a hash binary search is exact. */
+        uint64_t h = e->path_hash;
+        uint32_t lo = 0, hi = pak->count;
+        while (lo < hi) {
+            uint32_t mid = lo + (hi - lo) / 2;
+            if (pak->assets[mid].entry->path_hash < h)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        if (lo < pak->count && pak->assets[lo].entry == e)
+            return &pak->assets[lo].pub;
+        /* Defensive linear fallback (should not happen). */
+        for (uint32_t i = 0; i < pak->count; ++i)
+            if (pak->assets[i].entry == e)
+                return &pak->assets[i].pub;
     }
 
-    /* There may be hash collisions  scan forward while hash matches. */
-    for (uint32_t i = lo; i < pak->count && pak->hashes[i] == hash; ++i) {
-        if (strcmp(pak->assets[i].path, path) == 0)
-            return &pak->assets[i];
-    }
-
-    /* Miss in this archive — walk overlay chain (lower priority). */
     if (pak->overlay_next)
         return jce_pak_find(pak->overlay_next, path);
-
     return NULL;
 }
 
 /* ================================================================== */
 /* jce_pak_overlay_push / _remove                                      */
 /* ================================================================== */
-/* Append `layer` to the END of `base`'s overlay chain so newly-pushed
- * layers have the LOWEST priority — engine PAK content always wins for
- * a path, bundle content fills the gaps.  Caller retains ownership of
- * both archives; nothing is acquired/released here. */
 
 void jce_pak_overlay_push(JcePakArchive *base, JcePakArchive *layer) {
     if (!base || !layer || base == layer) return;
-    /* Prevent cycles by walking the layer's existing chain first. */
-    for (JcePakArchive *p = layer; p; p = p->overlay_next) {
+    for (JcePakArchive *p = layer; p; p = p->overlay_next)
         if (p == base) return; /* would form a cycle */
-    }
     JcePakArchive *tail = base;
     while (tail->overlay_next) {
         if (tail->overlay_next == layer) return; /* already attached */
@@ -298,92 +220,60 @@ void jce_pak_overlay_remove(JcePakArchive *base, JcePakArchive *layer) {
 }
 
 /* ================================================================== */
-/* jce_pak_decompress                                                      */
+/* Decompression                                                       */
 /* ================================================================== */
 
-size_t jce_pak_decompress(const JcePakAsset *asset, void *buf, size_t buf_size) {
-    if (!asset || !buf || buf_size < asset->original_size)
+static size_t pak_read(const JcePakAsset *asset, void *buf, size_t buf_size) {
+    if (!asset || !buf) return 0;
+    PakAsset *pa = (PakAsset *)asset; /* pub is the first member */
+    JcePakArchive *owner = pa->owner;
+    if (!owner || buf_size < pa->pub.original_size) return 0;
+
+    /* Serialize the shared-dctx decode step (worker threads, spec §1.3). */
+    SDL_LockMutex(owner->decode_lock);
+    size_t n = jce_archive_read(owner->ar, pa->entry, buf, buf_size);
+    SDL_UnlockMutex(owner->decode_lock);
+
+    if (n && g_verify_on_decompress && !jce_pak_verify(asset, buf, n))
         return 0;
+    return n;
+}
 
+size_t jce_pak_decompress(const JcePakAsset *asset, void *buf, size_t buf_size) {
     JCE_PROFILE_ZONE_N("Pak::Decompress");
-    size_t result;
-    if (asset->flags & JCE_PAK_ASSET_STORED) {
-        if (asset->compressed_size != asset->original_size)
-            { JCE_PROFILE_ZONE_END; return 0; }
-        memcpy(buf, asset->compressed_data, (size_t)asset->original_size);
-        result = (size_t)asset->original_size;
-    } else {
-        result =
-            ZSTD_decompress(buf, buf_size, asset->compressed_data, (size_t)asset->compressed_size);
-        if (ZSTD_isError(result))
-            { JCE_PROFILE_ZONE_END; return 0; }
-    }
-
-    if (g_verify_on_decompress && !jce_pak_verify(asset, buf, result))
-        { JCE_PROFILE_ZONE_END; return 0; }
+    size_t n = pak_read(asset, buf, buf_size);
     JCE_PROFILE_ZONE_END;
-    return result;
+    return n;
 }
 
 size_t jce_pak_decompress_ex(const JcePakArchive *pak, const JcePakAsset *asset,
-                         void *buf, size_t buf_size) {
-    if (!asset || !buf || buf_size < asset->original_size)
-        return 0;
-
+                             void *buf, size_t buf_size) {
+    (void)pak; /* the asset already records its owning archive */
     JCE_PROFILE_ZONE_N("Pak::DecompressEx");
-    size_t result;
-    if (asset->flags & JCE_PAK_ASSET_STORED) {
-        if (asset->compressed_size != asset->original_size)
-            { JCE_PROFILE_ZONE_END; return 0; }
-        memcpy(buf, asset->compressed_data, (size_t)asset->original_size);
-        result = (size_t)asset->original_size;
-    } else if (pak && pak->dctx) {
-        result = ZSTD_decompressDCtx(pak->dctx, buf, buf_size, asset->compressed_data,
-                                     (size_t)asset->compressed_size);
-        if (ZSTD_isError(result))
-            { JCE_PROFILE_ZONE_END; return 0; }
-    } else {
-        result =
-            ZSTD_decompress(buf, buf_size, asset->compressed_data, (size_t)asset->compressed_size);
-        if (ZSTD_isError(result))
-            { JCE_PROFILE_ZONE_END; return 0; }
-    }
-
-    if (g_verify_on_decompress && !jce_pak_verify(asset, buf, result))
-        { JCE_PROFILE_ZONE_END; return 0; }
+    size_t n = pak_read(asset, buf, buf_size);
     JCE_PROFILE_ZONE_END;
-    return result;
+    return n;
 }
 
 /* ================================================================== */
 /* Integrity verification                                              */
 /* ================================================================== */
 
-int jce_pak_verify(const JcePakAsset *asset, const void *buf, size_t size)
-{
-    if (!asset || !buf)
-        return 0;
-    if (asset->content_hash == 0)
-        return 1; /* legacy / not recorded */
-    uint64_t actual = XXH3_64bits(buf, size);
-    return actual == asset->content_hash ? 1 : 0;
+int jce_pak_verify(const JcePakAsset *asset, const void *buf, size_t size) {
+    if (!asset || !buf) return 0;
+    const PakAsset *pa = (const PakAsset *)asset;
+    return jce_archive_verify_entry(pa->entry, buf, size);
 }
 
-uint32_t jce_pak_verify_all(const JcePakArchive *pak)
-{
-    if (!pak)
-        return 0;
+uint32_t jce_pak_verify_all(const JcePakArchive *pak) {
+    if (!pak) return 0;
     uint32_t mismatches = 0;
     for (uint32_t i = 0; i < pak->count; ++i) {
-        const JcePakAsset *a = &pak->assets[i];
-        if (a->original_size == 0 || a->content_hash == 0)
-            continue;
+        const JcePakAsset *a = &pak->assets[i].pub;
+        if (a->original_size == 0) continue;
         void *buf = JCE_MALLOC((size_t)a->original_size);
-        if (!buf) {
-            mismatches++;
-            continue;
-        }
-        size_t got = jce_pak_decompress_ex(pak, a, buf, (size_t)a->original_size);
+        if (!buf) { mismatches++; continue; }
+        size_t got = jce_pak_decompress(a, buf, (size_t)a->original_size);
         if (got != a->original_size || !jce_pak_verify(a, buf, got))
             mismatches++;
         JCE_FREE(buf);
@@ -391,13 +281,12 @@ uint32_t jce_pak_verify_all(const JcePakArchive *pak)
     return mismatches;
 }
 
-void jce_pak_set_verify_on_decompress(int enable)
-{
+void jce_pak_set_verify_on_decompress(int enable) {
     g_verify_on_decompress = enable ? 1 : 0;
 }
 
 /* ================================================================== */
-/* jce_pak_count / jce_pak_get                                                 */
+/* jce_pak_count / jce_pak_get                                         */
 /* ================================================================== */
 
 uint32_t jce_pak_count(const JcePakArchive *pak) {
@@ -406,5 +295,5 @@ uint32_t jce_pak_count(const JcePakArchive *pak) {
 
 const JcePakAsset *jce_pak_get(const JcePakArchive *pak, uint32_t index) {
     if (!pak || index >= pak->count) return NULL;
-    return &pak->assets[index];
+    return &pak->assets[index].pub;
 }

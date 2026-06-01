@@ -1120,6 +1120,26 @@ void jce_editor_panel_inspector_content(void)
 
     apply_pending_reorder(focused, sidecar);
 
+    /* Compound Collider has no component-flag bit (the 64-bit flag space is
+     * fully allocated), so it is drawn as a standalone section keyed off a
+     * direct has-check instead of the flag-driven dispatcher above. */
+    if (jce_scene_has_compound_collider(scene, ecs_e)) {
+        ImGui::PushID("compound_collider_section");
+        ImGui::PushStyleColor(ImGuiCol_Header, jce_theme::inspector_header_color());
+        bool open = ImGui::CollapsingHeader(jce_editor_i18n("inspector.compcol.title"),
+                                            ImGuiTreeNodeFlags_DefaultOpen);
+        ImGui::PopStyleColor();
+        if (open) {
+            draw_comp_compound_collider(jce_scene_get_compound_collider(scene, ecs_e));
+            if (ImGui::Button(jce_editor_i18n("inspector.compcol.remove"))) {
+                jce_state_begin_batch_edit();
+                jce_scene_remove_compound_collider(scene, ecs_e);
+                jce_state_end_batch_edit();
+            }
+        }
+        ImGui::PopID();
+    }
+
 
     insp_add_component_button_and_popup(focused, flags);
 

@@ -31,6 +31,7 @@
 #include "resource/jce_pak_format.h"
 #include <jce/resource/jce_bundle_format.h>
 #include <jce/resource/jce_bundle_deps.h>
+#include <jce/resource/jce_archive_cook.h>
 
 #include <cjson/cJSON.h>
 #include <xxhash.h>
@@ -124,29 +125,6 @@ static void die(const char *m)
 /* ================================================================== */
 /* Small dynamic vectors                                                */
 /* ================================================================== */
-
-typedef struct { uint8_t *d; size_t n, c; } Bytes;
-static void bytes_reserve(Bytes *b, size_t need) {
-    if (b->c >= need) return;
-    size_t nc = b->c ? b->c : 256;
-    while (nc < need) nc *= 2;
-    b->d = (uint8_t *)JCE_REALLOC(b->d, nc);
-    if (!b->d) die("oom");
-    b->c = nc;
-}
-static void bytes_push(Bytes *b, uint8_t v) { bytes_reserve(b, b->n + 1); b->d[b->n++] = v; }
-static void bytes_append(Bytes *b, const void *s, size_t n) {
-    bytes_reserve(b, b->n + n); memcpy(b->d + b->n, s, n); b->n += n;
-}
-static void bytes_free(Bytes *b) { JCE_FREE(b->d); b->d = NULL; b->n = b->c = 0; }
-
-static void le32(Bytes *b, uint32_t v) {
-    bytes_push(b, (uint8_t)v); bytes_push(b, (uint8_t)(v >> 8));
-    bytes_push(b, (uint8_t)(v >> 16)); bytes_push(b, (uint8_t)(v >> 24));
-}
-static void le64(Bytes *b, uint64_t v) {
-    for (int i = 0; i < 8; ++i) bytes_push(b, (uint8_t)(v >> (i * 8)));
-}
 
 typedef struct { char **items; size_t n, c; } StrVec;
 static void sv_push(StrVec *v, const char *s) {
@@ -805,7 +783,7 @@ static char *make_scene_vpath(const char *full_path, const char *resource_root) 
 }
 
 /* ================================================================== */
-/* JPAK v2 builder                                                      */
+/* JPAK v1 bundle builder                                              */
 /* ================================================================== */
 
 typedef struct {
@@ -819,120 +797,41 @@ typedef struct {
     uint32_t flags;
 } PakEntry;
 
-static int pak_entry_cmp(const void *a, const void *b) {
-    uint64_t ha = ((const PakEntry *)a)->path_hash;
-    uint64_t hb = ((const PakEntry *)b)->path_hash;
-    return (ha < hb) ? -1 : (ha > hb) ? 1 : 0;
-}
-
-static int is_already_compressed(const char *p) {
-    static const char *exts[] = {
-        ".png", ".jpg", ".jpeg", ".webp", ".ktx", ".ktx2", ".basis", ".dds",
-        ".ogg", ".mp3", ".opus", ".flac", ".aac", ".wav", ".m4a", ".mp4",
-        ".webm", ".mkv", ".mov", ".avi", ".ivf", ".zip", ".7z", ".gz",
-        ".zst", ".xz", ".bz2", ".pak", ".jceasset", ".heic", ".heif", ".avif",
-        NULL
-    };
-    size_t n = strlen(p);
-    for (size_t i = 0; exts[i]; ++i) {
-        size_t e = strlen(exts[i]);
-        if (n < e) continue;
-        int eq = 1;
-        for (size_t k = 0; k < e; ++k) {
-            char c = p[n - e + k];
-            if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
-            if (c != exts[i][k]) { eq = 0; break; }
-        }
-        if (eq) return 1;
-    }
-    return 0;
-}
-
+/* Build the on-disk bundle container.  The bundle rides on the JPAK v1
+ * archive format (spec) just like the engine paks; the cook routine
+ * classifies entries, trains shared dictionaries and applies the
+ * keep-if-helps guard.  Bundles are recognized at runtime by the
+ * presence of the manifest entry (JCE_BUNDLE_MANIFEST_VPATH), not by a
+ * header flag, so no bundle-specific capability bit is needed. */
 static uint8_t *build_jbundle(PakEntry *entries, size_t count, int zstd_level,
                               size_t *out_size) {
-    ZSTD_CCtx *cctx = ZSTD_createCCtx();
-    if (!cctx) die("ZSTD_createCCtx");
-
+    JceCookInput *inputs =
+        (JceCookInput *)JCE_MALLOC((count ? count : 1) * sizeof(JceCookInput));
+    if (!inputs) die("oom");
     for (size_t i = 0; i < count; ++i) {
-        PakEntry *e = &entries[i];
-        e->path_hash    = XXH3_64bits(e->vpath, strlen(e->vpath));
-        e->content_hash = XXH3_64bits(e->raw, e->raw_size);
-        int store_raw   = is_already_compressed(e->vpath) || e->raw_size < 256;
-        if (store_raw) {
-            e->compressed      = (uint8_t *)JCE_MALLOC(e->raw_size ? e->raw_size : 1);
-            if (!e->compressed) die("oom");
-            if (e->raw_size) memcpy(e->compressed, e->raw, e->raw_size);
-            e->compressed_size = e->raw_size;
-            e->flags           = JPAK_FLAG_STORED;
-        } else {
-            size_t bound  = ZSTD_compressBound(e->raw_size);
-            e->compressed = (uint8_t *)JCE_MALLOC(bound);
-            if (!e->compressed) die("oom");
-            size_t cs = ZSTD_compressCCtx(cctx, e->compressed, bound,
-                                          e->raw, e->raw_size, zstd_level);
-            if (ZSTD_isError(cs)) die("zstd");
-            if (cs >= e->raw_size && e->raw_size > 0) {
-                memcpy(e->compressed, e->raw, e->raw_size);
-                e->compressed_size = e->raw_size;
-                e->flags           = JPAK_FLAG_STORED;
-            } else {
-                e->compressed_size = cs;
-                e->flags           = 0;
-            }
-        }
+        entries[i].content_hash = XXH3_64bits(entries[i].raw, entries[i].raw_size);
+        inputs[i].vpath = entries[i].vpath;
+        inputs[i].data  = entries[i].raw;
+        inputs[i].size  = entries[i].raw_size;
     }
-    ZSTD_freeCCtx(cctx);
 
-    qsort(entries, count, sizeof(PakEntry), pak_entry_cmp);
+    JceCookConfig cfg = {0};
+    cfg.zstd_level       = zstd_level;
+    cfg.alignment_log2   = 4;
+    cfg.mmap_friendly    = false;
+    cfg.emit_debug_paths = true;
+    cfg.compress_index   = true;
+    cfg.use_dict         = true;
+    cfg.dedup_content    = true;
 
-    uint32_t names_size = 0;
-    uint32_t name_off[1024];
-    if (count > 1024) die("bundle has more than 1024 entries (raise table)");
-    for (size_t i = 0; i < count; ++i) {
-        name_off[i] = names_size;
-        names_size += (uint32_t)strlen(entries[i].vpath);
-    }
-    uint64_t data_cursor = 0;
-    uint64_t data_off_per[1024];
-    for (size_t i = 0; i < count; ++i) {
-        data_off_per[i] = data_cursor;
-        data_cursor += entries[i].compressed_size;
-    }
-    const uint64_t toc_offset = JPAK_HEADER_SIZE;
-    const uint64_t toc_size   = (uint64_t)count * JPAK_TOC_ENTRY_SIZE;
-    const uint64_t names_off  = toc_offset + toc_size;
-    const uint64_t data_off   = names_off + names_size;
-    const uint64_t total      = data_off + data_cursor;
+    void  *blob      = NULL;
+    size_t blob_size = 0;
+    if (!jce_archive_cook(inputs, count, &cfg, &blob, &blob_size, NULL))
+        die("archive cook failed");
+    JCE_FREE(inputs);
 
-    Bytes pak; memset(&pak, 0, sizeof(pak));
-    bytes_reserve(&pak, (size_t)total);
-
-    bytes_push(&pak, JPAK_MAGIC_0); bytes_push(&pak, JPAK_MAGIC_1);
-    bytes_push(&pak, JPAK_MAGIC_2); bytes_push(&pak, JPAK_MAGIC_3);
-    le32(&pak, JPAK_VERSION);
-    le32(&pak, (uint32_t)count);
-    le32(&pak, JPAK_CAP_OPT_BUNDLE);
-    le64(&pak, toc_offset);
-    le64(&pak, data_off);
-    for (size_t i = 0; i < count; ++i) {
-        const PakEntry *e = &entries[i];
-        le64(&pak, e->path_hash);
-        le32(&pak, (uint32_t)(names_off + name_off[i]));
-        le32(&pak, (uint32_t)strlen(e->vpath));
-        le64(&pak, data_off_per[i]);
-        le64(&pak, e->compressed_size);
-        le64(&pak, (uint64_t)e->raw_size);
-        le32(&pak, e->flags);
-        le32(&pak, 0);
-        le64(&pak, e->content_hash);
-    }
-    for (size_t i = 0; i < count; ++i)
-        bytes_append(&pak, entries[i].vpath, strlen(entries[i].vpath));
-    for (size_t i = 0; i < count; ++i)
-        bytes_append(&pak, entries[i].compressed, entries[i].compressed_size);
-
-    *out_size = pak.n;
-    return pak.d;
+    *out_size = blob_size;
+    return (uint8_t *)blob;
 }
 
 /* ================================================================== */

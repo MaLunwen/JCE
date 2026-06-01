@@ -8,19 +8,15 @@
 #include <stddef.h>
 #include <string.h>
 
-#if defined(_WIN32)
+#if JCE_PLATFORM_WINDOWS
 #  include <string.h>  /* _stricmp */
 #else
 #  include <strings.h> /* strcasecmp */
 #endif
 
-#if defined(__APPLE__)
-#  include <TargetConditionals.h>
-#endif
-
 int jce_strcasecmp(const char *a, const char *b)
 {
-#if defined(_WIN32)
+#if JCE_PLATFORM_WINDOWS
     return _stricmp(a, b);
 #else
     return strcasecmp(a, b);
@@ -52,19 +48,17 @@ char *jce_strdup(const char *s)
 
 const char *jce_platform_name(void)
 {
-#if defined(_WIN32)
+#if JCE_PLATFORM_WINDOWS
     return "Windows";
-#elif defined(__APPLE__)
-#  if TARGET_OS_IOS
+#elif JCE_PLATFORM_IOS
     return "iOS";
-#  else
+#elif JCE_PLATFORM_MACOS
     return "macOS";
-#  endif
-#elif defined(__ANDROID__)
+#elif JCE_PLATFORM_ANDROID
     return "Android";
-#elif defined(__EMSCRIPTEN__)
-    return "Emscripten";
-#elif defined(__linux__)
+#elif JCE_PLATFORM_WEB
+    return "WebAssembly";
+#elif JCE_PLATFORM_LINUX
     return "Linux";
 #elif defined(__FreeBSD__)
     return "FreeBSD";

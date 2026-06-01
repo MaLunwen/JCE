@@ -8,7 +8,9 @@
  * backend (jce_net_web.c) is used instead and this file is skipped.
  */
 
-#ifdef __EMSCRIPTEN__
+#include <jce/os/core/jce_defs.h>
+
+#if JCE_PLATFORM_WEB
 /* WebSocket backend (jce_net_web.c) provides the implementation. */
 #else
 

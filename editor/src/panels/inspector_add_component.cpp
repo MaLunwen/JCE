@@ -156,6 +156,43 @@ void insp_add_component_button_and_popup(uint32_t focused, uint64_t flags)
                 ImGui::CloseCurrentPopup();
             }
         }
+
+        /* Compound Collider has no component-flag bit (flag space is full),
+         * so it is offered here as a special, non-flag entry that adds the
+         * component directly through the scene API. */
+        {
+            JceScene *scene = jce_state_get_scene();
+            JceEntity ce = jce_state_to_ecs_entity(focused);
+            bool present = scene && jce_scene_has_compound_collider(scene, ce);
+            const char *cc_name = jce_editor_i18n("inspector.compcol.title");
+            bool flt_ok = true;
+            if (s_addcomp_filter[0]) {
+                auto substr_ci2 = [](const char *hay, const char *needle) -> bool {
+                    if (!hay || !needle || !*needle) return false;
+                    for (const char *h = hay; *h; ++h) {
+                        const char *a = h, *b = needle;
+                        while (*a && *b && ((*a | 32) == (*b | 32))) { ++a; ++b; }
+                        if (!*b) return true;
+                    }
+                    return false;
+                };
+                flt_ok = substr_ci2(cc_name, s_addcomp_filter) ||
+                         substr_ci2("compound collider", s_addcomp_filter);
+            }
+            if (scene && !present && flt_ok && ImGui::MenuItem(cc_name)) {
+                JceCompoundColliderComponent def;
+                memset(&def, 0, sizeof def);
+                def.mode          = 0;     /* AUTO */
+                def.split         = 0;     /* by part */
+                def.is_static     = true;
+                def.detect_naming = true;
+                def.friction      = 0.5f;
+                jce_state_begin_batch_edit();
+                jce_scene_set_compound_collider(scene, ce, &def);
+                jce_state_end_batch_edit();
+                ImGui::CloseCurrentPopup();
+            }
+        }
         ImGui::EndChild();
 
         if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) && first_match >= 0) {

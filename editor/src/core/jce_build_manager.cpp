@@ -16,6 +16,7 @@
 
 #include "jce_build_manager.h"
 
+#include "jce_editor_project.h"
 #include "ui/jce_editor_panels.h"
 
 extern "C" {
@@ -23,11 +24,13 @@ extern "C" {
 #include <jce/os/core/jce_process.h>
 #include <jce/os/core/jce_thread.h>
 #include <jce/os/core/jce_timer.h>
+#include <jce/os/core/jce_toolchain.h>
 #include <jce/os/platform/jce_host_shell.h>
 #include <jce/os/core/jce_filesystem.h>
 }
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -37,7 +40,7 @@ namespace {
 constexpr int kGracefulStopMs   = 5000;
 constexpr int kToolProbeTimeoutMs = 2000;
 
-#if defined(_WIN32)
+#if JCE_PLATFORM_WINDOWS
 constexpr char PATH_SEP_CHR_LOCAL = '\\';
 #else
 constexpr char PATH_SEP_CHR_LOCAL = '/';
@@ -62,6 +65,43 @@ struct Build {
 };
 
 Build g_build;
+
+/* ---------------------------------------------------------------- *
+ * Native project-build pipeline state (start_project_build).         *
+ * A small command queue lets one logical build run as several child  *
+ * processes (e.g. POSIX configure then compile) through the existing *
+ * single-process poll loop.  When the queue drains, an optional       *
+ * "finish" plan verifies the artifact and stages a package.          *
+ * ---------------------------------------------------------------- */
+struct QueuedStep {
+    JceBuildStage stage = JCE_BUILD_STAGE_COMPILE;
+    std::string   exe;
+    std::string   args;
+    std::string   wd;
+    std::string   label;
+};
+std::vector<QueuedStep> g_queue;   /* steps after the one in flight */
+size_t                  g_queue_pos = 0;
+
+struct FinishPlan {
+    bool        verify = false;    /* confirm the artifact exists */
+    std::string artifact_a;        /* <build>/<exe> */
+    std::string artifact_b;        /* <build>/<config>/<exe> fallback */
+    std::string exe_name;
+    bool        stage = false;     /* package staging (replaces package-game) */
+    std::string out_dir;
+    std::string cooked_src;        /* <project>/<cooked_rel> */
+    std::string cooked_rel;        /* relative, for the staged layout */
+    std::string version_text;      /* full VERSION.txt body */
+};
+FinishPlan g_finish;
+
+void reset_pipeline()
+{
+    g_queue.clear();
+    g_queue_pos = 0;
+    g_finish = FinishPlan{};
+}
 
 /* Process-wide fallback working directory.  Used by spawn_tool() when
  * the caller does not supply one — i.e. legacy Configure / Build /
@@ -221,6 +261,89 @@ bool spawn_tool(JceBuildStage stage, const char *exe,
     return true;
 }
 
+/* Resolve which artifact candidate actually exists (a preferred, b
+ * fallback).  Returns empty when neither is present. */
+std::string resolve_artifact()
+{
+    if (!g_finish.artifact_a.empty() &&
+        jce_fs_host_exists_file(g_finish.artifact_a.c_str()))
+        return g_finish.artifact_a;
+    if (!g_finish.artifact_b.empty() &&
+        jce_fs_host_exists_file(g_finish.artifact_b.c_str()))
+        return g_finish.artifact_b;
+    return std::string();
+}
+
+/* Post-pipeline finish: verify the build artifact and, when requested,
+ * stage a redistributable package directory (exe + cooked assets +
+ * VERSION.txt).  Runs natively via jce_fs — no scripts.  On any hard
+ * failure it flips g_build to FAILED with a descriptive error. */
+void run_finish_plan()
+{
+    std::string exe = resolve_artifact();
+
+    if (g_finish.verify) {
+        if (exe.empty()) {
+            g_build.state = JCE_BUILD_FAILED;
+            set_error("build succeeded but artifact missing: " +
+                      g_finish.exe_name);
+            return;
+        }
+        log_line(JCE_CONSOLE_INFO, "[build] artifact: " + exe);
+    }
+
+    if (!g_finish.stage)
+        return;
+
+    if (exe.empty()) {
+        g_build.state = JCE_BUILD_FAILED;
+        set_error("package: built artifact not found for staging");
+        return;
+    }
+
+    const std::string &out = g_finish.out_dir;
+    if (jce_fs_host_exists_dir(out.c_str()))
+        jce_fs_host_remove_recursive(out.c_str());
+    if (!jce_fs_host_create_directory(out.c_str())) {
+        g_build.state = JCE_BUILD_FAILED;
+        set_error("package: cannot create output dir: " + out);
+        return;
+    }
+
+    std::string dst_exe = out + PATH_SEP_CHR_LOCAL + g_finish.exe_name;
+    if (!jce_fs_host_copy_file(exe.c_str(), dst_exe.c_str())) {
+        g_build.state = JCE_BUILD_FAILED;
+        set_error("package: failed to copy exe to " + dst_exe);
+        return;
+    }
+
+    /* Stage cooked assets so the packaged game has its PhysFS mount
+     * root alongside the exe (mirrors package-game.bat). */
+    if (!g_finish.cooked_rel.empty() && !g_finish.cooked_src.empty() &&
+        jce_fs_host_exists_dir(g_finish.cooked_src.c_str())) {
+        std::string cooked_dst = out + PATH_SEP_CHR_LOCAL + g_finish.cooked_rel;
+        if (!jce_fs_host_copy_recursive(g_finish.cooked_src.c_str(),
+                                        cooked_dst.c_str())) {
+            log_line(JCE_CONSOLE_WARNING,
+                     "[build] package: failed to stage cooked assets from " +
+                     g_finish.cooked_src);
+        }
+    } else {
+        log_line(JCE_CONSOLE_WARNING,
+                 "[build] package: cooked assets dir missing (packaged game "
+                 "may have no content): " + g_finish.cooked_src);
+    }
+
+    if (!g_finish.version_text.empty()) {
+        std::string ver_path = out + PATH_SEP_CHR_LOCAL + "VERSION.txt";
+        jce_fs_host_write_all(ver_path.c_str(),
+                              g_finish.version_text.data(),
+                              g_finish.version_text.size());
+    }
+
+    log_line(JCE_CONSOLE_INFO, "[build] package staged at: " + out);
+}
+
 void poll_state()
 {
     if (g_build.state != JCE_BUILD_RUNNING || !g_build.process) return;
@@ -242,8 +365,26 @@ void poll_state()
 
     drain_pipes();
     g_build.exit_code = exit_code;
-    g_build.state     = (exit_code == 0) ? JCE_BUILD_SUCCEEDED
-                                         : JCE_BUILD_FAILED;
+
+    /* Pipeline advance: if this step succeeded and more steps are
+     * queued (and we are not stopping), launch the next one and stay
+     * RUNNING.  This drives multi-process native builds (POSIX
+     * configure -> compile) through the same poll loop. */
+    if (exit_code == 0 && !g_build.stopping && g_queue_pos < g_queue.size()) {
+        log_line(JCE_CONSOLE_INFO, "[build] step finished OK");
+        QueuedStep step = g_queue[g_queue_pos++];
+        release_process();   /* frees handle, keeps state RUNNING */
+        if (!spawn_tool(step.stage, step.exe.c_str(), step.label.c_str(),
+                        step.args.empty() ? nullptr : step.args.c_str(),
+                        step.wd.empty() ? nullptr : step.wd.c_str())) {
+            /* spawn_tool already set FAILED + last_error. */
+            reset_pipeline();
+        }
+        return;
+    }
+
+    g_build.state = (exit_code == 0) ? JCE_BUILD_SUCCEEDED
+                                     : JCE_BUILD_FAILED;
     if (exit_code != 0) {
         char buf[64];
         snprintf(buf, sizeof(buf), "tool exited with code %d", exit_code);
@@ -257,6 +398,14 @@ void poll_state()
         log_line(JCE_CONSOLE_ERROR,
                  std::string("[build] step failed (exit ") +
                  std::to_string(exit_code) + ")");
+
+    /* Finish plan: artifact verification + optional package staging.
+     * Only runs on a fully successful pipeline. */
+    if (g_build.state == JCE_BUILD_SUCCEEDED &&
+        (g_finish.verify || g_finish.stage)) {
+        run_finish_plan();
+    }
+    reset_pipeline();
 }
 
 } // namespace
@@ -282,33 +431,59 @@ void jce_build_manager_poll(void)
 
 bool jce_build_manager_repack_game_assets(const char *preset)
 {
-    /* Project mode: if an editor project is currently open, dispatch
-     * scripts/build-project.bat against its root.  This is the one
-     * automatic path that keeps the embedded PAK + cooked tree in sync
-     * with designer edits.  When no project is open we currently have
-     * no way to drive the in-tree CK build — `cmake --build --preset`
-     * is broken by a CMakeUserPresets.json Duplicate-preset bug — so
-     * we return false and the caller falls back to launching with the
+    /* Project mode: if an editor project is currently open, rebuild it
+     * natively (no scripts) so the embedded PAK + cooked tree stay in
+     * sync with designer edits.  Requires a resolvable SDK (manifest
+     * sdk_path or JCE_SDK_DIR).  When no project / SDK is available we
+     * return false and the caller falls back to launching with the
      * existing artefacts. */
     (void)preset;
     extern char s_current_project_root[512]; /* dialog_project.cpp */
     if (s_current_project_root[0] == '\0')
         return false;
 
-    const char *script = jce_build_manager_default_project_script();
-    if (!script || !script[0])
+    const JceProject *jp = jce_editor_project_get();
+    if (!jp || jce_editor_project_is_engine_workspace())
         return false;
 
-    JceBuildScriptConfig cfg{};
-    cfg.script_path  = script;
-    cfg.working_dir  = nullptr;             /* run from repo root */
-    cfg.label        = "build-project";
-    /* build-project.bat / .sh take the project directory as the first
-     * positional argument.  Quote it so spaces survive the cmd.exe /
-     * bash splitting layer in run_script(). */
-    std::string args = std::string("\"") + s_current_project_root + "\"";
-    cfg.script_args  = args.c_str();
-    return jce_build_manager_run_script(&cfg);
+    const char *sdk = (jp->sdk_path && jp->sdk_path[0]) ? jp->sdk_path
+                                                        : nullptr;
+    if (!sdk) {
+        const char *env_sdk = std::getenv("JCE_SDK_DIR");
+        if (env_sdk && env_sdk[0]) sdk = env_sdk;
+    }
+    if (!sdk || !sdk[0])
+        return false;
+
+    std::string bundles_joined;
+    if (jp->bundles && jp->bundles_count > 0) {
+        for (int i = 0; i < jp->bundles_count; ++i) {
+            if (!jp->bundles[i] || !jp->bundles[i][0]) continue;
+            if (!bundles_joined.empty()) bundles_joined += ";";
+            bundles_joined += jp->bundles[i];
+        }
+    }
+
+    JceBuildProjectConfig pcfg{};
+    pcfg.label         = "repack";
+    pcfg.project_dir   = (s_current_project_root[0] ? s_current_project_root
+                                                    : jp->project_root);
+    pcfg.sdk_dir       = sdk;
+    pcfg.target        = (jp->target_name && jp->target_name[0])
+                             ? jp->target_name : jp->name;
+    pcfg.exe_name      = (jp->output_exe && jp->output_exe[0])
+                             ? jp->output_exe : nullptr;
+    pcfg.variant       = "release";
+    pcfg.arch          = nullptr;   /* host default */
+    pcfg.cooked_assets = (jp->cooked_assets && jp->cooked_assets[0])
+                             ? jp->cooked_assets : nullptr;
+    pcfg.bundles       = bundles_joined.empty() ? nullptr
+                                                : bundles_joined.c_str();
+    pcfg.clean         = false;
+    pcfg.package_out_dir = nullptr;
+    pcfg.app_name      = jp->name;
+    pcfg.app_version   = jp->version;
+    return jce_build_manager_start_project_build(&pcfg);
 }
 
 /* ---------------------------------------------------------------- *
@@ -317,11 +492,11 @@ bool jce_build_manager_repack_game_assets(const char *preset)
 
 const char *jce_build_manager_default_desktop_script(void)
 {
-#if defined(_WIN32)
+#if JCE_PLATFORM_WINDOWS
     return "scripts/build-desktop.bat";
-#elif defined(__APPLE__)
+#elif JCE_PLATFORM_APPLE
     return "scripts/macos/build-macos-x64.sh";
-#elif defined(__linux__)
+#elif JCE_PLATFORM_LINUX
     return "scripts/linux/build-linux-x64.sh";
 #else
     return NULL;
@@ -330,7 +505,7 @@ const char *jce_build_manager_default_desktop_script(void)
 
 const char *jce_build_manager_default_project_script(void)
 {
-#if defined(_WIN32)
+#if JCE_PLATFORM_WINDOWS
     return "scripts/build-project.bat";
 #else
     return "scripts/build-project.sh";
@@ -349,6 +524,7 @@ bool jce_build_manager_run_script(const JceBuildScriptConfig *cfg)
         set_error("run_script: a build is already running");
         return false;
     }
+    reset_pipeline();   /* drop any stale native-pipeline queue/finish plan */
 
     const char *wd = (cfg->working_dir && cfg->working_dir[0])
                          ? cfg->working_dir
@@ -367,7 +543,7 @@ bool jce_build_manager_run_script(const JceBuildScriptConfig *cfg)
      * "scripts" + switch "/build-desktop.bat".  Backslashes sidestep
      * the entire ambiguity. */
     std::string script_norm = cfg->script_path;
-#if defined(_WIN32)
+#if JCE_PLATFORM_WINDOWS
     for (char &c : script_norm) if (c == '/') c = '\\';
 #endif
 
@@ -377,7 +553,7 @@ bool jce_build_manager_run_script(const JceBuildScriptConfig *cfg)
      * `scripts\\build-project.bat` with cwd=<user project> always
      * fails (and historically crashed deeper in the spawn path). */
     auto is_absolute_path = [](const std::string &p) {
-#if defined(_WIN32)
+#if JCE_PLATFORM_WINDOWS
         return p.size() >= 2 &&
                ((p[1] == ':') || (p[0] == '\\' && p[1] == '\\') ||
                 (p[0] == '/'  && p[1] == '/'));
@@ -436,7 +612,7 @@ bool jce_build_manager_run_script(const JceBuildScriptConfig *cfg)
         return false;
     }
 
-#if defined(_WIN32)
+#if JCE_PLATFORM_WINDOWS
     shell = "cmd.exe";
     args  = "/c ";
     args += "\"";
@@ -607,4 +783,240 @@ void jce_build_manager_check_tools(JceBuildToolStatus *out)
              std::string("[build] tools: cmake=") + (s.cmake_ok ? "OK" : "MISSING") +
              " conan=" + (s.conan_ok ? "OK" : "MISSING") +
              " ninja=" + (s.ninja_ok ? "OK" : "MISSING"));
+}
+
+/* ---------------------------------------------------------------- *
+ * Native project build (single-executable path — no scripts)        *
+ * ---------------------------------------------------------------- */
+
+namespace {
+
+/* Wrap a token in ONE outer quote pair when it contains whitespace.
+ * jce_process's split_args consumes the outer quotes and keeps the
+ * inner bytes as a single argv token (even with embedded spaces); SDL
+ * then re-quotes space-bearing tokens when it rebuilds the Windows
+ * command line, so cmd.exe / cmake receive each path intact.  Tokens
+ * without spaces are emitted bare so cmd operators like "&&" stay
+ * operators rather than literals. */
+std::string qtok(const std::string &s)
+{
+    bool has_ws = false;
+    for (char c : s)
+        if (c == ' ' || c == '\t') { has_ws = true; break; }
+    if (!has_ws) return s;
+    return "\"" + s + "\"";
+}
+
+std::string join_norm_sep(const std::string &in)
+{
+    std::string out = in;
+#if JCE_PLATFORM_WINDOWS
+    for (char &c : out) if (c == '/') c = '\\';
+#endif
+    return out;
+}
+
+} // namespace
+
+bool jce_build_manager_start_project_build(const JceBuildProjectConfig *cfg)
+{
+    if (!cfg) { set_error("start_project_build: cfg is null"); return false; }
+    if (g_build.process) {
+        set_error("start_project_build: a build is already running");
+        return false;
+    }
+    if (!cfg->project_dir || !cfg->project_dir[0]) {
+        set_error("start_project_build: project_dir is required");
+        return false;
+    }
+    if (!cfg->target || !cfg->target[0]) {
+        set_error("start_project_build: target is required");
+        return false;
+    }
+    if (!cfg->sdk_dir || !cfg->sdk_dir[0]) {
+        set_error("start_project_build: sdk_dir is required");
+        return false;
+    }
+
+    reset_pipeline();
+
+    const std::string project = join_norm_sep(cfg->project_dir);
+    const std::string sdk     = join_norm_sep(cfg->sdk_dir);
+    const std::string target  = cfg->target;
+    const std::string variant = (cfg->variant && cfg->variant[0])
+                                    ? std::string(cfg->variant) : "release";
+    const std::string arch    = (cfg->arch && cfg->arch[0])
+                                    ? std::string(cfg->arch) : "x86_64";
+    const std::string label   = (cfg->label && cfg->label[0])
+                                    ? std::string(cfg->label) : "build-project";
+
+#if JCE_PLATFORM_WINDOWS
+    const char *exe_default_suffix = ".exe";
+    const char *platform_tag       = "win32";
+#elif JCE_PLATFORM_MACOS
+    const char *exe_default_suffix = "";
+    const char *platform_tag       = "darwin";
+#else
+    const char *exe_default_suffix = "";
+    const char *platform_tag       = "linux";
+#endif
+    const std::string exe_name = (cfg->exe_name && cfg->exe_name[0])
+                                     ? std::string(cfg->exe_name)
+                                     : (target + exe_default_suffix);
+
+    /* Resolve the SDK's CMake package dir: prefer the installed
+     * <sdk>/lib/cmake/JCE layout, fall back to <sdk>/cmake. */
+    std::string cmake_dir;
+    {
+        const std::string a = sdk + PATH_SEP_CHR_LOCAL + "lib" +
+                              PATH_SEP_CHR_LOCAL + "cmake" +
+                              PATH_SEP_CHR_LOCAL + "JCE";
+        const std::string b = sdk + PATH_SEP_CHR_LOCAL + "cmake";
+        if (jce_fs_host_exists_file(
+                (a + PATH_SEP_CHR_LOCAL + "JCEConfig.cmake").c_str()) ||
+            jce_fs_host_exists_dir(a.c_str()))
+            cmake_dir = a;
+        else
+            cmake_dir = b;
+    }
+
+    const std::string build_dir = project + PATH_SEP_CHR_LOCAL + "build" +
+                                  PATH_SEP_CHR_LOCAL +
+                                  std::string(platform_tag) + "-" + arch +
+                                  "-" + variant;
+    const std::string build_type =
+        (variant == "debug") ? std::string("Debug") : std::string("Release");
+
+    if (cfg->clean && jce_fs_host_exists_dir(build_dir.c_str())) {
+        log_line(JCE_CONSOLE_INFO, "[build] clean: removing " + build_dir);
+        jce_fs_host_remove_recursive(build_dir.c_str());
+    }
+
+    const std::string cooked = (cfg->cooked_assets && cfg->cooked_assets[0])
+                                   ? std::string(cfg->cooked_assets) : "";
+    const std::string bundles = (cfg->bundles && cfg->bundles[0])
+                                    ? std::string(cfg->bundles) : "";
+
+    /* Shared configure flags (identical across platforms). */
+    auto append_configure = [&](std::string &a) {
+        a += " -S " + qtok(project);
+        a += " -B " + qtok(build_dir);
+        a += " -G Ninja";
+        a += " -DCMAKE_BUILD_TYPE=" + build_type;
+        a += " -DJCE_PROJECT_COOKED_ASSETS=" + qtok(cooked);
+        a += " -DJCE_PROJECT_BUNDLES=" + qtok(bundles);
+        a += " -DJCE_DIR=" + qtok(cmake_dir);
+    };
+
+#if JCE_PLATFORM_WINDOWS
+    /* The Windows SDK ships MSVC-built static libs, so force cl and
+     * activate the MSVC environment inline via Microsoft's own
+     * vcvarsall.bat (NOT a first-party script).  Both configure and
+     * build run in one cmd.exe /c chain so the env survives between
+     * them. */
+    jce_toolchain_refresh();
+    const JceToolchain *msvc = jce_toolchain_get(JCE_TOOLCHAIN_MSVC);
+    std::string vcvars;
+    if (msvc && msvc->present && msvc->path[0]) {
+        std::string cand = std::string(msvc->path) +
+                           "\\VC\\Auxiliary\\Build\\vcvarsall.bat";
+        if (jce_fs_host_exists_file(cand.c_str()))
+            vcvars = cand;
+    }
+    std::string vc_arch = "x64";
+    if (arch == "i686")    vc_arch = "x64_x86";
+    if (arch == "aarch64") vc_arch = "x64_arm64";
+
+    std::string args = "/c ";
+    if (!vcvars.empty()) {
+        args += "call " + qtok(vcvars) + " " + vc_arch + " && ";
+    } else {
+        log_line(JCE_CONSOLE_WARNING,
+                 "[build] MSVC vcvarsall.bat not found; assuming cl.exe is "
+                 "already on PATH");
+    }
+    args += "cmake";
+    append_configure(args);
+    args += " -DCMAKE_C_COMPILER=cl";
+    args += " && cmake --build " + qtok(build_dir) +
+            " --target " + qtok(target);
+
+    QueuedStep step;
+    step.stage = JCE_BUILD_STAGE_COMPILE;
+    step.exe   = "cmd.exe";
+    step.args  = args;
+    step.wd    = project;
+    step.label = label;
+    g_queue.push_back(step);
+#else
+    /* POSIX: two direct cmake invocations (configure, then build).
+     * cmake picks the default system compiler. */
+    {
+        QueuedStep configure;
+        configure.stage = JCE_BUILD_STAGE_CONFIGURE;
+        configure.exe   = "cmake";
+        std::string a;
+        append_configure(a);
+        /* Leading space from append_configure is harmless to split. */
+        configure.args  = a;
+        configure.wd    = project;
+        configure.label = label;
+        g_queue.push_back(configure);
+
+        QueuedStep compile;
+        compile.stage = JCE_BUILD_STAGE_COMPILE;
+        compile.exe   = "cmake";
+        compile.args  = "--build " + qtok(build_dir) +
+                        " --target " + qtok(target);
+        compile.wd    = project;
+        compile.label = label;
+        g_queue.push_back(compile);
+    }
+#endif
+
+    /* Finish plan: always verify the artifact; stage a package when an
+     * output directory was requested. */
+    g_finish.verify     = true;
+    g_finish.exe_name   = exe_name;
+    g_finish.artifact_a = build_dir + PATH_SEP_CHR_LOCAL + exe_name;
+    g_finish.artifact_b = build_dir + PATH_SEP_CHR_LOCAL + build_type +
+                          PATH_SEP_CHR_LOCAL + exe_name;
+
+    if (cfg->package_out_dir && cfg->package_out_dir[0]) {
+        g_finish.stage      = true;
+        g_finish.out_dir    = join_norm_sep(cfg->package_out_dir);
+        g_finish.cooked_rel = cooked;
+        if (!cooked.empty())
+            g_finish.cooked_src = project + PATH_SEP_CHR_LOCAL +
+                                  join_norm_sep(cooked);
+
+        std::string vt;
+        vt += "name:     ";
+        vt += (cfg->app_name && cfg->app_name[0]) ? cfg->app_name
+                                                  : target.c_str();
+        vt += "\n";
+        if (cfg->app_version && cfg->app_version[0]) {
+            vt += "version:  "; vt += cfg->app_version; vt += "\n";
+        }
+        vt += "platform: "; vt += platform_tag; vt += "\n";
+        vt += "arch:     "; vt += arch;         vt += "\n";
+        vt += "variant:  "; vt += variant;      vt += "\n";
+        g_finish.version_text = vt;
+    }
+
+    log_line(JCE_CONSOLE_INFO,
+             "[build] native project build: " + target +
+             " (" + std::string(platform_tag) + "/" + arch + "/" + variant +
+             ")  sdk=" + sdk);
+
+    /* Spawn the first queued step; poll_state() advances the rest. */
+    QueuedStep first = g_queue.front();
+    g_queue_pos = 1;
+    if (!spawn_tool(first.stage, first.exe.c_str(), first.label.c_str(),
+                    first.args.empty() ? nullptr : first.args.c_str(),
+                    first.wd.empty() ? nullptr : first.wd.c_str())) {
+        reset_pipeline();
+        return false;
+    }
+    return true;
 }

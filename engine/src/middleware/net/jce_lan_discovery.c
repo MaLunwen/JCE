@@ -16,7 +16,9 @@
  * ENET_SOCKOPT_BROADCAST, and sends REQ to ENET_HOST_BROADCAST.
  */
 
-#ifdef __EMSCRIPTEN__
+#include <jce/os/core/jce_defs.h>
+
+#if JCE_PLATFORM_WEB
 /* WebSocket build (jce_net_web.c) has no UDP broadcast — discovery is a
  * native-build-only feature. */
 #else

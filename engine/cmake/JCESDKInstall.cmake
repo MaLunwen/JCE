@@ -145,30 +145,31 @@ function(jce_register_sdk_install)
 		return()
 	endif()
 
-	if(NOT MSVC)
-		message(STATUS "JCE SDK: non-MSVC host — fat-lib merge skipped (later phase).")
+	if(NOT MSVC AND NOT APPLE AND NOT UNIX)
+		message(STATUS "JCE SDK: unsupported host — fat-lib merge skipped.")
 		return()
 	endif()
 
 	jce_collect_static_libs(JCE _jce_sdk)
 
-	# --- Belt-and-suspenders: capture sibling abseil libs ---------- #
-	# The walker only reaches absl targets the engine *directly* uses.
-	# Some absl libs (e.g. absl_log_internal_fnmatch) ship the MSVC STL
-	# vectorised helpers (__std_find_first_of_trivial_pos_1, …) that
-	# abseil's compiled TUs reference but the local MSVC toolchain's
-	# CRT does not export.  If we miss them, the consumer link of the
-	# fat lib fails with LNK2019.  Grab every absl_*.lib that sits next
-	# to the libs we already collected.
-	set(_extra_libs "")
-	foreach(_f IN LISTS _jce_sdk_FILES)
-		get_filename_component(_d "${_f}" DIRECTORY)
-		file(GLOB _siblings "${_d}/absl_*.lib" "${_d}/absl_*.a")
-		list(APPEND _extra_libs ${_siblings})
-	endforeach()
-	if(_extra_libs)
-		list(APPEND _jce_sdk_FILES ${_extra_libs})
-		list(REMOVE_DUPLICATES _jce_sdk_FILES)
+	# --- Belt-and-suspenders: capture sibling abseil libs (MSVC only) ---- #
+	# On MSVC, some absl libs ship vectorised STL helpers
+	# (__std_find_first_of_trivial_pos_1, …) that abseil TUs reference but
+	# the MSVC CRT doesn't export.  If we miss them the consumer link fails
+	# with LNK2019.  Grab every absl_*.lib next to the already-collected
+	# imported libs.  GCC/Clang expose these symbols from the standard
+	# library automatically; no extra glob needed on Linux/macOS.
+	if(MSVC)
+		set(_extra_libs "")
+		foreach(_f IN LISTS _jce_sdk_FILES)
+			get_filename_component(_d "${_f}" DIRECTORY)
+			file(GLOB _siblings "${_d}/absl_*.lib" "${_d}/absl_*.a")
+			list(APPEND _extra_libs ${_siblings})
+		endforeach()
+		if(_extra_libs)
+			list(APPEND _jce_sdk_FILES ${_extra_libs})
+			list(REMOVE_DUPLICATES _jce_sdk_FILES)
+		endif()
 	endif()
 
 	list(LENGTH _jce_sdk_TARGETS _n_owned)
@@ -235,32 +236,71 @@ function(jce_register_sdk_install)
 	set(_fat_lib_core "${_merge_dir}/$<CONFIG>/jce_engine_core${CMAKE_STATIC_LIBRARY_SUFFIX}")
 	set(_fat_lib_deps "${_merge_dir}/$<CONFIG>/jce_engine_deps${CMAKE_STATIC_LIBRARY_SUFFIX}")
 
-	# Drive lib.exe via a tiny wrapper that resolves paths into a single
-	# response file — avoids Ninja's quoting weirdness with /OUT:"...".
-	set(_driver "${CMAKE_CURRENT_SOURCE_DIR}/cmake/jce_sdk_merge_libs.cmake")
+	if(MSVC)
+		# Drive lib.exe via a tiny wrapper that resolves paths into a single
+		# response file — avoids Ninja's quoting weirdness with /OUT:"...".
+		set(_driver "${CMAKE_CURRENT_SOURCE_DIR}/cmake/jce_sdk_merge_libs.cmake")
 
-	add_custom_command(
-		OUTPUT  "${_fat_lib_core}"
-		COMMAND "${CMAKE_COMMAND}"
-			-DLIB_EXE=${CMAKE_AR}
-			-DOUT_LIB=${_fat_lib_core}
-			-DRSP_IMPORTED=${_empty_rsp}
-			-DRSP_OWNED=${_owned_rsp}
-			-P "${_driver}"
-		DEPENDS ${_jce_sdk_TARGETS} "${_empty_rsp}" "${_owned_rsp}" "${_driver}"
-		VERBATIM)
+		add_custom_command(
+			OUTPUT  "${_fat_lib_core}"
+			COMMAND "${CMAKE_COMMAND}"
+				-DLIB_EXE=${CMAKE_AR}
+				-DOUT_LIB=${_fat_lib_core}
+				-DRSP_IMPORTED=${_empty_rsp}
+				-DRSP_OWNED=${_owned_rsp}
+				-P "${_driver}"
+			DEPENDS ${_jce_sdk_TARGETS} "${_empty_rsp}" "${_owned_rsp}" "${_driver}"
+			VERBATIM)
 
-	add_custom_command(
-		OUTPUT  "${_fat_lib_deps}"
-		COMMAND "${CMAKE_COMMAND}"
-			-DLIB_EXE=${CMAKE_AR}
-			-DOUT_LIB=${_fat_lib_deps}
-			-DRSP_IMPORTED=${_rsp_imported}
-			-DRSP_OWNED=${_deps_extra_rsp}
-			-P "${_driver}"
-		DEPENDS "${_rsp_imported}" "${_deps_extra_rsp}" "${_driver}"
-			${_deps_extra_targets}
-		VERBATIM)
+		add_custom_command(
+			OUTPUT  "${_fat_lib_deps}"
+			COMMAND "${CMAKE_COMMAND}"
+				-DLIB_EXE=${CMAKE_AR}
+				-DOUT_LIB=${_fat_lib_deps}
+				-DRSP_IMPORTED=${_rsp_imported}
+				-DRSP_OWNED=${_deps_extra_rsp}
+				-P "${_driver}"
+			DEPENDS "${_rsp_imported}" "${_deps_extra_rsp}" "${_driver}"
+				${_deps_extra_targets}
+			VERBATIM)
+
+	elseif(APPLE OR UNIX)
+		# macOS: libtool -static.  Linux: ar MRI script.
+		# Both are handled by jce_sdk_merge_libs_unix.cmake.
+		set(_unix_driver "${CMAKE_CURRENT_SOURCE_DIR}/cmake/jce_sdk_merge_libs_unix.cmake")
+		set(_is_apple "0")
+		if(APPLE)
+			set(_is_apple "1")
+		endif()
+
+		add_custom_command(
+			OUTPUT  "${_fat_lib_core}"
+			COMMAND "${CMAKE_COMMAND}"
+				-DAR_EXE=${CMAKE_AR}
+				-DOUT_LIB=${_fat_lib_core}
+				-DRSP_IMPORTED=${_empty_rsp}
+				-DRSP_OWNED=${_owned_rsp}
+				-DJCE_SDK_APPLE=${_is_apple}
+				-P "${_unix_driver}"
+			DEPENDS ${_jce_sdk_TARGETS} "${_empty_rsp}" "${_owned_rsp}" "${_unix_driver}"
+			VERBATIM)
+
+		add_custom_command(
+			OUTPUT  "${_fat_lib_deps}"
+			COMMAND "${CMAKE_COMMAND}"
+				-DAR_EXE=${CMAKE_AR}
+				-DOUT_LIB=${_fat_lib_deps}
+				-DRSP_IMPORTED=${_rsp_imported}
+				-DRSP_OWNED=${_deps_extra_rsp}
+				-DJCE_SDK_APPLE=${_is_apple}
+				-P "${_unix_driver}"
+			DEPENDS "${_rsp_imported}" "${_deps_extra_rsp}" "${_unix_driver}"
+			VERBATIM)
+
+	else()
+		message(WARNING "JCE SDK: unrecognised toolchain — fat-lib merge skipped.")
+		return()
+	endif()
 
 	add_custom_target(jce_sdk_fat_lib ALL
 		DEPENDS "${_fat_lib_core}" "${_fat_lib_deps}")
@@ -352,13 +392,19 @@ function(jce_register_sdk_install)
 	# the standalone lib + headers shaves ~6 MB and prevents accidental  #
 	# double-link / pulled-in CRT symbol collisions on the consumer end. #
 	if(JCE_PATENTED_CODECS_ENABLED)
-		# MSVC-only branch (gated above) so the static-lib suffix is .lib.
+		# fdk-aac's own CMakeLists.txt fires install(TARGETS fdk-aac …) and
+		# header install rules whenever we add_subdirectory it.  Strip those
+		# artefacts: fdk-aac is already inside jce_engine_core/deps, and
+		# consumers only reach it through <jce/api_audio.h>.
 		install(CODE [[
-			set(_redundant_lib "${CMAKE_INSTALL_PREFIX}/lib/fdk-aac.lib")
-			if(EXISTS "${_redundant_lib}")
-				message(STATUS "JCE SDK: removing redundant ${_redundant_lib}")
-				file(REMOVE "${_redundant_lib}")
-			endif()
+			foreach(_redundant_lib
+					"${CMAKE_INSTALL_PREFIX}/lib/fdk-aac.lib"
+					"${CMAKE_INSTALL_PREFIX}/lib/libfdk-aac.a")
+				if(EXISTS "${_redundant_lib}")
+					message(STATUS "JCE SDK: removing redundant ${_redundant_lib}")
+					file(REMOVE "${_redundant_lib}")
+				endif()
+			endforeach()
 			set(_redundant_inc "${CMAKE_INSTALL_PREFIX}/include/fdk-aac")
 			if(IS_DIRECTORY "${_redundant_inc}")
 				message(STATUS "JCE SDK: removing redundant ${_redundant_inc}")

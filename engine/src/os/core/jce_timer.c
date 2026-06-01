@@ -131,12 +131,12 @@ size_t jce_time_format_local(int64_t epoch_seconds, const char *fmt,
     time_t t = (time_t)epoch_seconds;
     struct tm local_tm;
 
-#if defined(_MSC_VER)
+#if JCE_COMPILER_MSVC
     if (localtime_s(&local_tm, &t) != 0) {
         out[0] = '\0';
         return 0;
     }
-#elif defined(_WIN32)
+#elif JCE_PLATFORM_WINDOWS
     /* MinGW: localtime_r may be missing.  localtime() is not thread-
        safe, but on Windows the underlying CRT call uses thread-local
        storage (_localtime64), making it safe in practice. */
@@ -164,12 +164,12 @@ size_t jce_time_format_utc(int64_t epoch_seconds, const char *fmt,
     time_t t = (time_t)epoch_seconds;
     struct tm utc_tm;
 
-#if defined(_MSC_VER)
+#if JCE_COMPILER_MSVC
     if (gmtime_s(&utc_tm, &t) != 0) {
         out[0] = '\0';
         return 0;
     }
-#elif defined(_WIN32)
+#elif JCE_PLATFORM_WINDOWS
     /* MinGW: gmtime_r may be missing.  gmtime() is thread-safe on
        Windows due to thread-local storage in the CRT. */
     struct tm *gp = gmtime(&t);

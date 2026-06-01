@@ -39,7 +39,7 @@ extern "C" {
 #include <jce/resource/jce_bundle_pack.h>
 #include "scene/jce_asset_path_index.h"
 
-#include <cjson/cJSON.h>
+#include <jce/os/core/jce_json.h>
 }
 
 namespace {
@@ -615,27 +615,27 @@ void load_summary_from_catalog()
     std::string text(static_cast<const char *>(vbuf), static_cast<size_t>(sz));
     jce_fs_buffer_free(vbuf);
 
-    cJSON *root = cJSON_ParseWithLength(text.data(), text.size());
+    JceJson *root = jce_json_parse(text.data(), text.size());
     if (!root) return;
-    cJSON *bundles = cJSON_GetObjectItemCaseSensitive(root,
-                            JCE_BUNDLE_CATALOG_KEY_BUNDLES);
-    if (bundles && cJSON_IsObject(bundles)) {
-        cJSON *e = nullptr;
-        cJSON_ArrayForEach(e, bundles) {
+    const JceJson *bundles = jce_json_get(root, JCE_BUNDLE_CATALOG_KEY_BUNDLES);
+    if (jce_json_is_object(bundles)) {
+        for (JceJson *e = jce_json_first_child(bundles); e;
+             e = jce_json_next_sibling(e)) {
             BundleSummary bs;
-            bs.id = e->string ? e->string : "?";
-            cJSON *jk = cJSON_GetObjectItemCaseSensitive(e, JCE_BUNDLE_CATALOG_KEY_KIND);
-            cJSON *js = cJSON_GetObjectItemCaseSensitive(e, JCE_BUNDLE_CATALOG_KEY_SCENE);
-            cJSON *jz = cJSON_GetObjectItemCaseSensitive(e, JCE_BUNDLE_CATALOG_KEY_SIZE);
-            cJSON *jd = cJSON_GetObjectItemCaseSensitive(e, JCE_BUNDLE_CATALOG_KEY_DEPS);
-            if (jk && cJSON_IsString(jk)) bs.kind = jk->valuestring;
-            if (js && cJSON_IsString(js)) bs.scene_path = js->valuestring;
-            if (jz) bs.size_bytes = static_cast<uint64_t>(jz->valuedouble);
-            if (jd && cJSON_IsArray(jd)) bs.dep_count = cJSON_GetArraySize(jd);
+            const char *key = jce_json_member_key(e);
+            bs.id = key ? key : "?";
+            if (const char *s = jce_json_get_string(e, JCE_BUNDLE_CATALOG_KEY_KIND, nullptr))
+                bs.kind = s;
+            if (const char *s = jce_json_get_string(e, JCE_BUNDLE_CATALOG_KEY_SCENE, nullptr))
+                bs.scene_path = s;
+            const JceJson *jz = jce_json_get(e, JCE_BUNDLE_CATALOG_KEY_SIZE);
+            if (jz) bs.size_bytes = static_cast<uint64_t>(jce_json_number_value(jz, 0.0));
+            const JceJson *jd = jce_json_get(e, JCE_BUNDLE_CATALOG_KEY_DEPS);
+            if (jce_json_is_array(jd)) bs.dep_count = jce_json_array_size(jd);
             gb.summary.push_back(std::move(bs));
         }
     }
-    cJSON_Delete(root);
+    jce_json_free(root);
 }
 
 void draw_build_tab()

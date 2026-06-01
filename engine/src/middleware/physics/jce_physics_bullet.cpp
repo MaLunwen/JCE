@@ -116,6 +116,12 @@ struct JceBulletWorld {
     btRigidBody      **bodies;
     btCollisionShape  **shapes;
     bool               *alive;
+    /* Per-body auxiliary ownership for compound / mesh bodies.  NULL for
+       primitive bodies.  owned_shapes holds compound child shapes to be
+       deleted; owned_meshes holds the striding mesh interfaces backing
+       btBvhTriangleMeshShape children (must outlive the shape). */
+    btAlignedObjectArray<btCollisionShape *>        **owned_shapes;
+    btAlignedObjectArray<btStridingMeshInterface *> **owned_meshes;
     uint32_t            capacity;
     uint32_t            count;
 
@@ -241,8 +247,13 @@ JceBulletWorld *jce_bullet_create(jce_vec3 gravity, uint32_t max_bodies)
         JCE_CALLOC(max_bodies, sizeof(btCollisionShape *)));
     bw->alive    = static_cast<bool *>(
         JCE_CALLOC(max_bodies, sizeof(bool)));
+    bw->owned_shapes = static_cast<btAlignedObjectArray<btCollisionShape *> **>(
+        JCE_CALLOC(max_bodies, sizeof(void *)));
+    bw->owned_meshes = static_cast<btAlignedObjectArray<btStridingMeshInterface *> **>(
+        JCE_CALLOC(max_bodies, sizeof(void *)));
 
-    if (!bw->bodies || !bw->shapes || !bw->alive) {
+    if (!bw->bodies || !bw->shapes || !bw->alive ||
+        !bw->owned_shapes || !bw->owned_meshes) {
         jce_bullet_destroy(bw);
         return nullptr;
     }
@@ -289,6 +300,26 @@ JceBulletWorld *jce_bullet_create(jce_vec3 gravity, uint32_t max_bodies)
         JCE_CALLOC(bw->vehicle_capacity, sizeof(float)));
 
     return bw;
+}
+
+/* Delete the compound child shapes and triangle-mesh interfaces owned by
+   body `idx` (if any) and release the holder arrays.  Safe to call on a
+   primitive body (no-op).  Does NOT touch bw->shapes[idx] — the caller
+   deletes the top-level shape separately. */
+static void free_body_aux(JceBulletWorld *bw, uint32_t idx)
+{
+    if (bw->owned_shapes && bw->owned_shapes[idx]) {
+        btAlignedObjectArray<btCollisionShape *> *arr = bw->owned_shapes[idx];
+        for (int c = 0; c < arr->size(); ++c) delete (*arr)[c];
+        delete arr;
+        bw->owned_shapes[idx] = nullptr;
+    }
+    if (bw->owned_meshes && bw->owned_meshes[idx]) {
+        btAlignedObjectArray<btStridingMeshInterface *> *arr = bw->owned_meshes[idx];
+        for (int c = 0; c < arr->size(); ++c) delete (*arr)[c];
+        delete arr;
+        bw->owned_meshes[idx] = nullptr;
+    }
 }
 
 void jce_bullet_destroy(JceBulletWorld *bw)
@@ -357,6 +388,7 @@ void jce_bullet_destroy(JceBulletWorld *bw)
                 delete body;
             }
             delete bw->shapes[i];
+            free_body_aux(bw, i);
             bw->alive[i] = false;
         }
     }
@@ -383,6 +415,8 @@ void jce_bullet_destroy(JceBulletWorld *bw)
     JCE_FREE(bw->con_alive);
     JCE_FREE(bw->constraints);
     JCE_FREE(bw->alive);
+    JCE_FREE(bw->owned_meshes);
+    JCE_FREE(bw->owned_shapes);
     JCE_FREE(bw->shapes);
     JCE_FREE(bw->bodies);
     JCE_FREE(bw);
@@ -516,11 +550,162 @@ void jce_bullet_body_destroy(JceBulletWorld *bw, uint32_t idx)
         delete body;
     }
     delete bw->shapes[idx];
+    free_body_aux(bw, idx);
 
     bw->bodies[idx] = nullptr;
     bw->shapes[idx] = nullptr;
     bw->alive[idx]  = false;
     bw->count--;
+}
+
+/* ================================================================== */
+/* Compound / mesh body create                                         */
+/* ================================================================== */
+
+/* Build a single child collision shape from a descriptor.  Convex-hull
+   and triangle-mesh children record their owned sub-objects so the body
+   can release them later.  Returns nullptr on bad input. */
+static btCollisionShape *build_child_shape(const JceBulletColliderChild *c,
+                                           btAlignedObjectArray<btStridingMeshInterface *> *meshes)
+{
+    switch (static_cast<JceShapeType>(c->shape)) {
+    case JCE_SHAPE_BOX:
+        return new btBoxShape(to_bt(c->half_extents));
+    case JCE_SHAPE_SPHERE:
+        return new btSphereShape(static_cast<btScalar>(c->half_extents.x));
+    case JCE_SHAPE_CAPSULE:
+        return new btCapsuleShape(static_cast<btScalar>(c->half_extents.x),
+                                  static_cast<btScalar>(c->half_extents.y * 2.0f));
+    case JCE_SHAPE_CONVEX_HULL: {
+        if (!c->vertices || c->vertex_count == 0) return nullptr;
+        auto *hull = new btConvexHullShape();
+        for (uint32_t v = 0; v < c->vertex_count; ++v) {
+            const float *p = &c->vertices[v * 3];
+            hull->addPoint(btVector3(p[0], p[1], p[2]), false);
+        }
+        hull->recalcLocalAabb();
+        /* Light simplification keeps the dynamic solver fast on the
+           512MB / single-core baseline without changing the silhouette. */
+        hull->optimizeConvexHull();
+        return hull;
+    }
+    case JCE_SHAPE_TRIANGLE_MESH: {
+        if (!c->vertices || c->vertex_count == 0 ||
+            !c->indices  || c->index_count < 3) return nullptr;
+        auto *mesh = new btTriangleMesh();
+        for (uint32_t t = 0; t + 2 < c->index_count; t += 3) {
+            const float *a = &c->vertices[c->indices[t + 0] * 3];
+            const float *b = &c->vertices[c->indices[t + 1] * 3];
+            const float *d = &c->vertices[c->indices[t + 2] * 3];
+            mesh->addTriangle(btVector3(a[0], a[1], a[2]),
+                              btVector3(b[0], b[1], b[2]),
+                              btVector3(d[0], d[1], d[2]), true);
+        }
+        if (meshes) meshes->push_back(mesh);
+        return new btBvhTriangleMeshShape(mesh, /*useQuantizedAabb=*/true);
+    }
+    default:
+        return nullptr;
+    }
+}
+
+uint32_t jce_bullet_body_create_compound(JceBulletWorld *bw,
+                                         uint8_t type,
+                                         jce_vec3 pos, jce_quat rot,
+                                         float mass, float friction,
+                                         float restitution,
+                                         float lin_damp, float ang_damp,
+                                         uint32_t col_group, uint32_t col_mask,
+                                         bool is_trigger,
+                                         const JceBulletColliderChild *children,
+                                         uint32_t child_count)
+{
+    if (!bw || !children || child_count == 0) return UINT32_MAX;
+
+    uint32_t idx = UINT32_MAX;
+    for (uint32_t i = 0; i < bw->capacity; ++i) {
+        if (!bw->alive[i]) { idx = i; break; }
+    }
+    if (idx == UINT32_MAX) return UINT32_MAX;
+
+    auto *meshes = new btAlignedObjectArray<btStridingMeshInterface *>();
+    auto *owned  = new btAlignedObjectArray<btCollisionShape *>();
+
+    /* Build children. */
+    btCollisionShape *top = nullptr;
+    bool single_identity =
+        (child_count == 1 &&
+         children[0].position.x == 0.0f && children[0].position.y == 0.0f &&
+         children[0].position.z == 0.0f &&
+         children[0].rotation.x == 0.0f && children[0].rotation.y == 0.0f &&
+         children[0].rotation.z == 0.0f && children[0].rotation.w == 1.0f);
+
+    if (single_identity) {
+        top = build_child_shape(&children[0], meshes);
+        if (!top) { delete owned; for (int m=0;m<meshes->size();++m) delete (*meshes)[m]; delete meshes; return UINT32_MAX; }
+    } else {
+        auto *compound = new btCompoundShape();
+        for (uint32_t i = 0; i < child_count; ++i) {
+            btCollisionShape *cs = build_child_shape(&children[i], meshes);
+            if (!cs) continue; /* skip malformed child, keep the rest */
+            owned->push_back(cs);
+            btTransform xf;
+            xf.setOrigin(to_bt(children[i].position));
+            xf.setRotation(to_bt_q(children[i].rotation));
+            compound->addChildShape(xf, cs);
+        }
+        if (compound->getNumChildShapes() == 0) {
+            delete compound; delete owned;
+            for (int m=0;m<meshes->size();++m) delete (*meshes)[m];
+            delete meshes;
+            return UINT32_MAX;
+        }
+        top = compound;
+    }
+
+    btScalar bt_mass = 0.0f;
+    if (static_cast<JceBodyType>(type) == JCE_BODY_DYNAMIC)
+        bt_mass = static_cast<btScalar>(mass);
+
+    btVector3 local_inertia(0, 0, 0);
+    if (bt_mass > 0.0f) top->calculateLocalInertia(bt_mass, local_inertia);
+
+    btTransform start_xf;
+    start_xf.setOrigin(to_bt(pos));
+    start_xf.setRotation(to_bt_q(rot));
+    auto *motion = new btDefaultMotionState(start_xf);
+
+    btRigidBody::btRigidBodyConstructionInfo ci(bt_mass, motion, top, local_inertia);
+    ci.m_friction       = static_cast<btScalar>(friction);
+    ci.m_restitution    = static_cast<btScalar>(restitution);
+    ci.m_linearDamping  = static_cast<btScalar>(lin_damp);
+    ci.m_angularDamping = static_cast<btScalar>(ang_damp);
+
+    auto *body = new btRigidBody(ci);
+
+    if (static_cast<JceBodyType>(type) == JCE_BODY_KINEMATIC) {
+        body->setCollisionFlags(body->getCollisionFlags() |
+                                btCollisionObject::CF_KINEMATIC_OBJECT);
+        body->setActivationState(DISABLE_DEACTIVATION);
+    }
+    if (is_trigger) {
+        body->setCollisionFlags(body->getCollisionFlags() |
+                                btCollisionObject::CF_NO_CONTACT_RESPONSE);
+    }
+    body->setUserPointer(reinterpret_cast<void *>(static_cast<uintptr_t>(idx)));
+
+    bw->world->addRigidBody(body, static_cast<int>(col_group),
+                            static_cast<int>(col_mask));
+
+    bw->bodies[idx] = body;
+    bw->shapes[idx] = top;
+    bw->alive[idx]  = true;
+    /* Keep child + mesh holders only when non-empty (compound path). */
+    if (owned->size() > 0) bw->owned_shapes[idx] = owned; else delete owned;
+    if (meshes->size() > 0) bw->owned_meshes[idx] = meshes; else delete meshes;
+    bw->count++;
+
+    return idx;
 }
 
 /* ================================================================== */

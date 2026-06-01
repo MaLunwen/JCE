@@ -145,6 +145,7 @@ void draw_comp_box_collider(JceBoxColliderComponent *bc);
 void draw_comp_sphere_collider(JceSphereColliderComponent *sc);
 void draw_comp_capsule_collider(JceCapsuleColliderComponent *cc);
 void draw_comp_mesh_collider(JceMeshColliderComponent *mc);
+void draw_comp_compound_collider(JceCompoundColliderComponent *cc);
 void draw_comp_character_controller(JceCharacterControllerComponent *cc);
 void draw_comp_constraint(JceConstraintComponent *con);
 void draw_comp_wheel_collider(JceWheelColliderComponent *w);

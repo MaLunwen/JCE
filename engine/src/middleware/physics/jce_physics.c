@@ -11,6 +11,7 @@
 #include <jce/middleware/physics/jce_physics_material.h>
 #include <jce/middleware/physics/jce_cloth.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_alloc.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/renderer/jce_render_pipeline.h>
@@ -398,6 +399,51 @@ JceBodyHandle jce_physics_body_create(JcePhysicsWorld *world,
         return JCE_BODY_INVALID;
     }
 
+    return (JceBodyHandle){ idx };
+}
+
+JceBodyHandle jce_physics_body_create_compound(JcePhysicsWorld           *world,
+                                               const JceCompoundBodyDesc *desc)
+{
+    if (!world || !desc || !desc->children || desc->child_count == 0)
+        return JCE_BODY_INVALID;
+
+    float friction = desc->friction > 0.0f ? desc->friction : 0.5f;
+    uint32_t group = desc->collision_group ? desc->collision_group
+                                           : JCE_COLLISION_DEFAULT_GROUP;
+    uint32_t mask  = desc->collision_mask  ? desc->collision_mask
+                                           : JCE_COLLISION_ALL_MASK;
+
+    JceBulletColliderChild *bc = (JceBulletColliderChild *)jce_malloc(
+        (size_t)desc->child_count * sizeof(JceBulletColliderChild));
+    if (!bc) return JCE_BODY_INVALID;
+
+    for (uint32_t i = 0; i < desc->child_count; ++i) {
+        const JceColliderChild *s = &desc->children[i];
+        bc[i].shape        = (uint8_t)s->shape;
+        bc[i].position     = s->position;
+        bc[i].rotation     = s->rotation;
+        bc[i].half_extents = s->half_extents;
+        bc[i].vertices     = s->vertices;
+        bc[i].vertex_count = s->vertex_count;
+        bc[i].indices      = s->indices;
+        bc[i].index_count  = s->index_count;
+    }
+
+    uint32_t idx = jce_bullet_body_create_compound(
+        world->bullet, (uint8_t)desc->type,
+        desc->position, desc->rotation,
+        desc->mass, friction, desc->restitution,
+        desc->linear_damping, desc->angular_damping,
+        group, mask, desc->is_trigger,
+        bc, desc->child_count);
+
+    jce_free(bc);
+
+    if (idx == UINT32_MAX) {
+        LOG_ERROR(LOG_TAG, "compound body create failed");
+        return JCE_BODY_INVALID;
+    }
     return (JceBodyHandle){ idx };
 }
 
