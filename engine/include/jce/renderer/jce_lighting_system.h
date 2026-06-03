@@ -45,7 +45,7 @@ typedef struct JceLightEnv JceLightEnv;
 /* ================================================================== */
 
 typedef struct {
-    jce_vec3 direction;       /* normalized, toward the light source */
+    jce_vec3 direction;       /* normalized direction light travels */
     jce_vec3 color;           /* linear RGB */
     float    intensity;       /* multiplier, default 1.0 */
     bool     casts_shadow;    /* enable shadow map for this light */
@@ -63,7 +63,7 @@ typedef struct {
 
 typedef struct {
     jce_vec3 position;
-    jce_vec3 direction;       /* normalized, direction the spot points */
+    jce_vec3 direction;       /* normalized direction the spot points */
     jce_vec3 color;           /* linear RGB */
     float    intensity;
     float    inner_cone_cos;  /* cos(inner half-angle), full intensity inside */

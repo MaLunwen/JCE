@@ -4,81 +4,99 @@
  * "Add Component" button + filterable popup menu.  Carved out of
  * jce_panel_inspector.cpp to keep the dispatcher under its size budget.
  *
- * The popup body and its data table live here together because the
- * `s_add_options[]` array is consulted exclusively by the popup loop.
+ * The popup body uses the editor component registry so flag-backed and
+ * synthetic components follow the same identity path.
  */
 
 #include "jce_panel_inspector_common.h"
 
 namespace {
 
-struct AddCompOption {
-    uint64_t flag;
-    bool     is_light;       /* True for the 3 light flags (light section). */
-    bool     is_collider;    /* True for box/sphere collider (mutually exclusive). */
-};
+bool substr_ci(const char *hay, const char *needle)
+{
+    if (!hay || !needle || !*needle)
+        return false;
+    for (const char *h = hay; *h; ++h) {
+        const char *a = h;
+        const char *b = needle;
+        while (*a && *b) {
+            unsigned char ca = (unsigned char)*a;
+            unsigned char cb = (unsigned char)*b;
+            if (ca >= 'A' && ca <= 'Z')
+                ca = (unsigned char)(ca + ('a' - 'A'));
+            if (cb >= 'A' && cb <= 'Z')
+                cb = (unsigned char)(cb + ('a' - 'A'));
+            if (ca != cb)
+                break;
+            ++a;
+            ++b;
+        }
+        if (!*b)
+            return true;
+    }
+    return false;
+}
 
-const AddCompOption s_add_options[] = {
-    { JCE_COMP_FLAG_MESH_RENDERER,        false, false },
-    { JCE_COMP_FLAG_CAMERA,               false, false },
-    { JCE_COMP_FLAG_DIR_LIGHT,            true,  false },
-    { JCE_COMP_FLAG_POINT_LIGHT,          true,  false },
-    { JCE_COMP_FLAG_SPOT_LIGHT,           true,  false },
-    { JCE_COMP_FLAG_SKYBOX,               false, false },
-    { JCE_COMP_FLAG_SPRITE_RENDERER,      false, false },
-    { JCE_COMP_FLAG_SPRITE_ANIMATOR,      false, false },
-    { JCE_COMP_FLAG_ANIMATOR,             false, false },
-    { JCE_COMP_FLAG_SKELETAL_ANIMATOR,    false, false },
-    { JCE_COMP_FLAG_RIGIDBODY,            false, false },
-    { JCE_COMP_FLAG_RIGIDBODY_2D,         false, false },
-    { JCE_COMP_FLAG_BOX_COLLIDER,         false, true  },
-    { JCE_COMP_FLAG_SPHERE_COLLIDER,      false, true  },
-    { JCE_COMP_FLAG_CHARACTER_CONTROLLER, false, false },
-    { JCE_COMP_FLAG_AUDIO_SOURCE,         false, false },
-    { JCE_COMP_FLAG_SCRIPT,               false, false },
-    { JCE_COMP_FLAG_CONSTRAINT,           false, false },
-    { JCE_COMP_FLAG_TERRAIN,              false, false },
-    { JCE_COMP_FLAG_PARTICLE_EMITTER,     false, false },
-    { JCE_COMP_FLAG_BEHAVIOR_TREE,        false, false },
-    { JCE_COMP_FLAG_LOD_GROUP,            false, false },
-    { JCE_COMP_FLAG_VIRTUAL_CAMERA,       false, false },
-    { JCE_COMP_FLAG_TRIGGER_VOLUME,       false, false },
-    { JCE_COMP_FLAG_CAPSULE_COLLIDER,     false, false },
-    { JCE_COMP_FLAG_MESH_COLLIDER,        false, false },
-    { JCE_COMP_FLAG_COLLIDER_2D,          false, false },
-    { JCE_COMP_FLAG_TRAIL_RENDERER,       false, false },
-    { JCE_COMP_FLAG_LINE_RENDERER,        false, false },
-    { JCE_COMP_FLAG_REFLECTION_PROBE,     false, false },
-    { JCE_COMP_FLAG_DECAL,                false, false },
-    { JCE_COMP_FLAG_LIGHT_PROBE_GROUP,    false, false },
-    { JCE_COMP_FLAG_AUDIO_LISTENER,       false, false },
-    { JCE_COMP_FLAG_AUDIO_REVERB_ZONE,    false, false },
-    { JCE_COMP_FLAG_AUDIO_OCCLUSION,      false, false },
-    { JCE_COMP_FLAG_SPAWN_MANAGER,        false, false },
-    { JCE_COMP_FLAG_WEAPON,               false, false },
-    { JCE_COMP_FLAG_SAVE_POINT,           false, false },
-    { JCE_COMP_FLAG_WHEEL_COLLIDER,       false, false },
-    { JCE_COMP_FLAG_CONSTANT_FORCE,       false, false },
-    { JCE_COMP_FLAG_CONFIGURABLE_JOINT,   false, false },
-    { JCE_COMP_FLAG_JOINT_2D,             false, false },
-    { JCE_COMP_FLAG_BILLBOARD_RENDERER,   false, false },
-    { JCE_COMP_FLAG_CANVAS,               false, false },
-    { JCE_COMP_FLAG_CANVAS_GROUP,         false, false },
-    { JCE_COMP_FLAG_LAYOUT_GROUP,         false, false },
-    { JCE_COMP_FLAG_UI_IMAGE,             false, false },
-    { JCE_COMP_FLAG_UI_TEXT,              false, false },
-    { JCE_COMP_FLAG_UI_BUTTON,            false, false },
-    { JCE_COMP_FLAG_CLOTH,                false, false },
-    { JCE_COMP_FLAG_NET_TRANSFORM,        false, false },
-    { JCE_COMP_FLAG_NET_ANIMATOR,         false, false },
-    { JCE_COMP_FLAG_NET_RIGIDBODY,        false, false },
-    { JCE_COMP_FLAG_VFX_GRAPH,            false, false },
-    { JCE_COMP_FLAG_TILEMAP,              false, false },
-    { JCE_COMP_FLAG_TILEMAP_COLLIDER_2D,  false, false },
-    { JCE_COMP_FLAG_AVATAR,               false, false },
-    { JCE_COMP_FLAG_VOLUME,               false, false },
-    { JCE_COMP_FLAG_OCCLUSION_PORTAL,     false, false },
-};
+bool component_matches_filter(const JceEditorComponentDescriptor *desc,
+                              const char *filter)
+{
+    if (!desc || !filter || !*filter)
+        return true;
+
+    if (substr_ci(desc->display_name, filter))
+        return true;
+
+    if (!desc->i18n_key)
+        return false;
+
+    int n_loc = jce_editor_i18n_locale_count();
+    for (int li = 0; li < n_loc; ++li) {
+        const char *loc_name = jce_editor_i18n_lookup_locale(
+            (JceLocale)li, desc->i18n_key);
+        if (substr_ci(loc_name, filter))
+            return true;
+    }
+    return false;
+}
+
+bool component_already_present(const JceEditorComponentDescriptor *desc,
+                               JceScene *scene,
+                               JceEntity entity,
+                               uint64_t flags)
+{
+    if (!desc)
+        return true;
+    if ((desc->legacy_flag & INSP_LIGHT_MASK) != 0)
+        return (flags & INSP_LIGHT_MASK) != 0;
+    return jce_editor_component_slot_present(scene, entity, flags, desc->slot);
+}
+
+void add_component_slot(uint32_t focused, JceEditorComponentSlot slot)
+{
+    const JceEditorComponentDescriptor *desc =
+        jce_editor_component_find(slot);
+    if (!desc)
+        return;
+
+    if (desc->legacy_flag != 0) {
+        jce_state_add_component(focused, desc->legacy_flag);
+        return;
+    }
+
+    if (!jce_editor_component_slot_is_compound_collider(slot))
+        return;
+
+    JceScene *scene = jce_state_get_scene();
+    JceEntity ce = jce_state_to_ecs_entity(focused);
+    if (!scene || !ce || jce_scene_has_compound_collider(scene, ce))
+        return;
+
+    JceCompoundColliderComponent def;
+    jce_editor_component_compound_default(&def);
+    jce_state_begin_batch_edit();
+    jce_scene_set_compound_collider(scene, ce, &def);
+    jce_state_end_batch_edit();
+}
 
 }  /* anonymous namespace */
 
@@ -114,89 +132,36 @@ void insp_add_component_button_and_popup(uint32_t focused, uint64_t flags)
             s_addcomp_filter, sizeof(s_addcomp_filter));
 
         ImGui::BeginChild("##addcomp_list", ImVec2(0, 200), false);
-        const int n_opts = (int)(sizeof(s_add_options) / sizeof(s_add_options[0]));
-        int first_match = -1;
-        for (int i = 0; i < n_opts; i++) {
-            const AddCompOption &opt = s_add_options[i];
-            if (flags & opt.flag) continue;
-            if (opt.is_light && (flags & INSP_LIGHT_MASK)) continue;
-            const char *cname = jce_comp_flag_display_name(opt.flag);
-            if (!cname) continue;
-            if (s_addcomp_filter[0]) {
-                /* Match against the EN display name AND every loaded
-                   locale's translation of the component's i18n key, so
-                   users can search in any language present in the
-                   editor's locale tables — not just the active one. */
-                auto substr_ci = [](const char *hay, const char *needle) -> bool {
-                    if (!hay || !needle || !*needle) return false;
-                    for (const char *h = hay; *h; ++h) {
-                        const char *a = h, *b = needle;
-                        while (*a && *b && ((*a | 32) == (*b | 32))) { ++a; ++b; }
-                        if (!*b) return true;
-                    }
-                    return false;
-                };
-                bool match = substr_ci(cname, s_addcomp_filter);
-                if (!match) {
-                    const char *i18n_key = jce_comp_flag_i18n_key(opt.flag);
-                    if (i18n_key) {
-                        int n_loc = jce_editor_i18n_locale_count();
-                        for (int li = 0; li < n_loc && !match; ++li) {
-                            const char *loc_name = jce_editor_i18n_lookup_locale(
-                                (JceLocale)li, i18n_key);
-                            if (substr_ci(loc_name, s_addcomp_filter)) match = true;
-                        }
-                    }
-                }
-                if (!match) continue;
-            }
-            if (first_match < 0) first_match = i;
-            if (ImGui::MenuItem(cname)) {
-                jce_state_add_component(focused, opt.flag);
-                ImGui::CloseCurrentPopup();
-            }
-        }
+        bool have_first_match = false;
+        JceEditorComponentSlot first_match = 0;
+        JceScene *scene = jce_state_get_scene();
+        JceEntity ce = jce_state_to_ecs_entity(focused);
 
-        /* Compound Collider has no component-flag bit (flag space is full),
-         * so it is offered here as a special, non-flag entry that adds the
-         * component directly through the scene API. */
-        {
-            JceScene *scene = jce_state_get_scene();
-            JceEntity ce = jce_state_to_ecs_entity(focused);
-            bool present = scene && jce_scene_has_compound_collider(scene, ce);
-            const char *cc_name = jce_editor_i18n("inspector.compcol.title");
-            bool flt_ok = true;
-            if (s_addcomp_filter[0]) {
-                auto substr_ci2 = [](const char *hay, const char *needle) -> bool {
-                    if (!hay || !needle || !*needle) return false;
-                    for (const char *h = hay; *h; ++h) {
-                        const char *a = h, *b = needle;
-                        while (*a && *b && ((*a | 32) == (*b | 32))) { ++a; ++b; }
-                        if (!*b) return true;
-                    }
-                    return false;
-                };
-                flt_ok = substr_ci2(cc_name, s_addcomp_filter) ||
-                         substr_ci2("compound collider", s_addcomp_filter);
+        int n_desc = jce_editor_component_descriptor_count();
+        for (int i = 0; i < n_desc; i++) {
+            const JceEditorComponentDescriptor *desc =
+                jce_editor_component_descriptor_at(i);
+            if (!desc || !desc->addable)
+                continue;
+            if (component_already_present(desc, scene, ce, flags))
+                continue;
+            if (!component_matches_filter(desc, s_addcomp_filter))
+                continue;
+
+            if (!have_first_match) {
+                have_first_match = true;
+                first_match = desc->slot;
             }
-            if (scene && !present && flt_ok && ImGui::MenuItem(cc_name)) {
-                JceCompoundColliderComponent def;
-                memset(&def, 0, sizeof def);
-                def.mode          = 0;     /* AUTO */
-                def.split         = 0;     /* by part */
-                def.is_static     = true;
-                def.detect_naming = true;
-                def.friction      = 0.5f;
-                jce_state_begin_batch_edit();
-                jce_scene_set_compound_collider(scene, ce, &def);
-                jce_state_end_batch_edit();
+
+            if (ImGui::MenuItem(desc->display_name)) {
+                add_component_slot(focused, desc->slot);
                 ImGui::CloseCurrentPopup();
             }
         }
         ImGui::EndChild();
 
-        if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) && first_match >= 0) {
-            jce_state_add_component(focused, s_add_options[first_match].flag);
+        if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) && have_first_match) {
+            add_component_slot(focused, first_match);
             ImGui::CloseCurrentPopup();
         }
         if (ImGui::IsKeyPressed(ImGuiKey_Escape, false))

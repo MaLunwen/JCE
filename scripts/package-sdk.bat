@@ -158,17 +158,16 @@ if not exist "%BUILD_REL%\CMakeCache.txt" (
 	if errorlevel 1 exit /b 1
 )
 
-echo [package-sdk] [%V_NAME%] building Release fat lib + SDK tools
-REM  jce_sdk_fat_lib does not depend on the host tools that the SDK
-REM  install ships in <sdk>/bin (jce_bin2obj, jce_pak).  A fresh build
-REM  tree (e.g. the dist variant) therefore never builds jce_bin2obj
-REM  unless we ask for it explicitly, and `cmake --install` then fails.
-cmake --build "%BUILD_REL%" --target jce_sdk_fat_lib jce_bin2obj jce_pak -j 8
+echo [package-sdk] [%V_NAME%] building Release SDK libraries
+REM  The packaged editor now generates PAK/BOM/embed sources in-process,
+REM  so the redistributable SDK no longer ships first-party host tools.
+cmake --build "%BUILD_REL%" --target jce_sdk_fat_lib jce_msvc_stl_shims -j 8
 if errorlevel 1 exit /b 1
 
 echo [package-sdk] [%V_NAME%] installing Release
 cmake --install "%BUILD_REL%"
 if errorlevel 1 exit /b 1
+call :prune_host_tools "%INSTALL_DIR%" || exit /b 1
 
 REM ---- Debug (optional) ----
 REM  Skip via a plain goto rather than wrapping ~25 lines (with nested
@@ -197,13 +196,14 @@ if not exist "%BUILD_DBG%\CMakeCache.txt" (
 	if errorlevel 1 exit /b 1
 )
 
-echo [package-sdk] [%V_NAME%] building Debug fat lib + SDK tools
-cmake --build "%BUILD_DBG%" --target jce_sdk_fat_lib jce_bin2obj jce_pak -j 8
+echo [package-sdk] [%V_NAME%] building Debug SDK libraries
+cmake --build "%BUILD_DBG%" --target jce_sdk_fat_lib jce_msvc_stl_shims -j 8
 if errorlevel 1 exit /b 1
 
 echo [package-sdk] [%V_NAME%] installing Debug
 cmake --install "%BUILD_DBG%"
 if errorlevel 1 exit /b 1
+call :prune_host_tools "%INSTALL_DIR%" || exit /b 1
 
 :after_debug
 
@@ -216,6 +216,17 @@ if "%SHA%"=="" set "SHA=unknown"
 >> "%INSTALL_DIR%\VERSION.txt" echo variant: %V_NAME%
 
 echo [package-sdk] [%V_NAME%] done -^> %INSTALL_DIR%
+exit /b 0
+
+:prune_host_tools
+set "SDK_ROOT=%~1"
+if "%SDK_ROOT%"=="" exit /b 1
+if exist "%SDK_ROOT%\bin\jce_pak.exe" (
+	del /q "%SDK_ROOT%\bin\jce_pak.exe" || exit /b 1
+)
+if exist "%SDK_ROOT%\bin\jce_bin2obj.exe" (
+	del /q "%SDK_ROOT%\bin\jce_bin2obj.exe" || exit /b 1
+)
 exit /b 0
 
 :error

@@ -18,6 +18,7 @@ extern "C" {
 #endif
 
 #include <jce/resource/jce_pak_loader.h>
+#include <jce/middleware/scene/jce_scene.h>
 #include <jce/renderer/jce_camera.h>
 #include <jce/renderer/jce_renderer.h>
 #include <jce/resource/jce_asset.h>
@@ -88,6 +89,19 @@ void jce_editor_scene_camera_reset(void);
  * Pass min_extent_pad to enforce a minimum size when the AABB is very small
  * (e.g. focusing a single point light). Pitch/yaw are preserved. */
 void jce_editor_scene_camera_focus_aabb(const float min3[3], const float max3[3]);
+
+/* Frame the camera onto an entity transform using the same fallback bounds
+ * as Scene View selection framing. */
+void jce_editor_scene_camera_focus_transform(const JceTransform *transform);
+
+/* Resolve the best available focus bounds for an entity. Mesh renderers use
+ * the cached mesh's true local AABB when loaded; other entities fall back to
+ * a small transform-scale box. Returns false when the entity cannot be framed. */
+bool jce_editor_scene_camera_get_entity_focus_bounds(uint32_t entity_id,
+                                                     float out_min3[3],
+                                                     float out_max3[3]);
+
+void jce_editor_scene_camera_focus_entity(uint32_t entity_id);
 
 /* Set the scene base directory for resolving mesh paths. */
 void jce_editor_scene_set_scene_dir(const char *dir);

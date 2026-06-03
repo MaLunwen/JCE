@@ -357,6 +357,26 @@ static bool j_bool(const cJSON *o, const char *k, bool def)
     return def;
 }
 
+static void j_float3(const cJSON *o, const char *k, float out[3],
+                     const float def[3])
+{
+    if (!out) return;
+    if (def) {
+        out[0] = def[0];
+        out[1] = def[1];
+        out[2] = def[2];
+    }
+    const cJSON *it = cJSON_GetObjectItemCaseSensitive(o, k);
+    if (!cJSON_IsArray(it) || cJSON_GetArraySize(it) < 3)
+        return;
+    const cJSON *x = cJSON_GetArrayItem(it, 0);
+    const cJSON *y = cJSON_GetArrayItem(it, 1);
+    const cJSON *z = cJSON_GetArrayItem(it, 2);
+    if (cJSON_IsNumber(x)) out[0] = (float)x->valuedouble;
+    if (cJSON_IsNumber(y)) out[1] = (float)y->valuedouble;
+    if (cJSON_IsNumber(z)) out[2] = (float)z->valuedouble;
+}
+
 static const char *j_str(const cJSON *o, const char *k, const char *def)
 {
     const cJSON *it = cJSON_GetObjectItemCaseSensitive(o, k);
@@ -394,6 +414,167 @@ static int streq_ci(const char *a, const char *b)
         a++; b++;
     }
     return *a == '\0' && *b == '\0';
+}
+
+static cJSON *json_float3(const float v[3])
+{
+    cJSON *a = cJSON_CreateArray();
+    if (!a) return NULL;
+    cJSON_AddItemToArray(a, cJSON_CreateNumber(v ? v[0] : 0.0f));
+    cJSON_AddItemToArray(a, cJSON_CreateNumber(v ? v[1] : 0.0f));
+    cJSON_AddItemToArray(a, cJSON_CreateNumber(v ? v[2] : 0.0f));
+    return a;
+}
+
+static cJSON *ser_scene_rendering_settings(
+    const JceSceneRenderingSettings *r)
+{
+    if (!r) return NULL;
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *ambient = cJSON_CreateObject();
+    cJSON *fog = cJSON_CreateObject();
+    cJSON *shadows = cJSON_CreateObject();
+    cJSON *postfx = cJSON_CreateObject();
+    if (!root || !ambient || !fog || !shadows || !postfx) {
+        cJSON_Delete(root);
+        cJSON_Delete(ambient);
+        cJSON_Delete(fog);
+        cJSON_Delete(shadows);
+        cJSON_Delete(postfx);
+        return NULL;
+    }
+
+    cJSON_AddNumberToObject(root, "version", (double)r->version);
+
+    cJSON_AddItemToObject(ambient, "color", json_float3(r->ambient_color));
+    cJSON_AddNumberToObject(ambient, "intensity", r->ambient_intensity);
+    cJSON_AddItemToObject(root, "ambient", ambient);
+
+    cJSON_AddBoolToObject(fog, "enabled", r->fog_enabled);
+    cJSON_AddNumberToObject(fog, "mode", r->fog_mode);
+    cJSON_AddItemToObject(fog, "color", json_float3(r->fog_color));
+    cJSON_AddNumberToObject(fog, "density", r->fog_density);
+    cJSON_AddNumberToObject(fog, "start", r->fog_start);
+    cJSON_AddNumberToObject(fog, "end", r->fog_end);
+    cJSON_AddNumberToObject(fog, "heightFalloff", r->fog_height_falloff);
+    cJSON_AddNumberToObject(fog, "heightOrigin", r->fog_height_origin);
+    cJSON_AddItemToObject(root, "fog", fog);
+
+    cJSON_AddNumberToObject(shadows, "distance", r->shadow_distance);
+    cJSON_AddNumberToObject(shadows, "cascades", r->cascade_count);
+    cJSON_AddNumberToObject(shadows, "splitLambda", r->split_lambda);
+    cJSON_AddNumberToObject(shadows, "resolution", r->shadow_resolution);
+    cJSON_AddNumberToObject(shadows, "soft", r->soft_shadow_mode);
+    cJSON_AddItemToObject(root, "shadows", shadows);
+
+    cJSON_AddBoolToObject(postfx, "tonemap", r->postfx_enabled[0]);
+    cJSON_AddBoolToObject(postfx, "bloom", r->postfx_enabled[1]);
+    cJSON_AddBoolToObject(postfx, "fxaa", r->postfx_enabled[2]);
+    cJSON_AddBoolToObject(postfx, "vignette", r->postfx_enabled[3]);
+    cJSON_AddBoolToObject(postfx, "chromatic", r->postfx_enabled[4]);
+    cJSON_AddBoolToObject(postfx, "grayscale", r->postfx_enabled[5]);
+    cJSON_AddNumberToObject(postfx, "exposure", r->exposure);
+    cJSON_AddNumberToObject(postfx, "gamma", r->gamma);
+    cJSON_AddNumberToObject(postfx, "bloomThreshold", r->bloom_threshold);
+    cJSON_AddNumberToObject(postfx, "bloomIntensity", r->bloom_intensity);
+    cJSON_AddNumberToObject(postfx, "fxaaSpanMax", r->fxaa_span_max);
+    cJSON_AddNumberToObject(postfx, "vignetteIntensity", r->vignette_intensity);
+    cJSON_AddNumberToObject(postfx, "vignetteSmoothness", r->vignette_smoothness);
+    cJSON_AddNumberToObject(postfx, "chromaticStrength", r->chromatic_strength);
+    cJSON_AddItemToObject(root, "postfx", postfx);
+
+    return root;
+}
+
+static const cJSON *scene_root_object(const cJSON *root)
+{
+    if (!root || !cJSON_IsObject(root)) return NULL;
+    const cJSON *scene_obj = cJSON_GetObjectItemCaseSensitive(root, "scene");
+    return cJSON_IsObject(scene_obj) ? scene_obj : root;
+}
+
+static bool parse_scene_rendering_settings(JceScene *scene,
+                                           const cJSON *root)
+{
+    const cJSON *scene_obj = scene_root_object(root);
+    if (!scene_obj) return false;
+
+    const cJSON *src = cJSON_GetObjectItemCaseSensitive(scene_obj, "rendering");
+    if (!cJSON_IsObject(src))
+        src = cJSON_GetObjectItemCaseSensitive(scene_obj, "lighting");
+    if (!cJSON_IsObject(src))
+        return false;
+
+    JceSceneRenderingSettings r = jce_scene_rendering_settings_default();
+    r.version = (uint32_t)j_num(src, "version", 1.0);
+
+    const cJSON *ambient = cJSON_GetObjectItemCaseSensitive(src, "ambient");
+    if (cJSON_IsObject(ambient)) {
+        j_float3(ambient, "color", r.ambient_color, r.ambient_color);
+        r.ambient_intensity =
+            (float)j_num(ambient, "intensity", r.ambient_intensity);
+    }
+
+    const cJSON *fog = cJSON_GetObjectItemCaseSensitive(src, "fog");
+    if (cJSON_IsObject(fog)) {
+        r.fog_enabled = j_bool(fog, "enabled", r.fog_enabled);
+        r.fog_mode = (int)j_num(fog, "mode", r.fog_mode);
+        j_float3(fog, "color", r.fog_color, r.fog_color);
+        r.fog_density =
+            (float)j_num(fog, "density", r.fog_density);
+        r.fog_start =
+            (float)j_num(fog, "start", r.fog_start);
+        r.fog_end =
+            (float)j_num(fog, "end", r.fog_end);
+        r.fog_height_falloff =
+            (float)j_num(fog, "heightFalloff", r.fog_height_falloff);
+        r.fog_height_origin =
+            (float)j_num(fog, "heightOrigin", r.fog_height_origin);
+    }
+
+    const cJSON *shadows = cJSON_GetObjectItemCaseSensitive(src, "shadows");
+    if (cJSON_IsObject(shadows)) {
+        r.shadow_distance =
+            (float)j_num(shadows, "distance", r.shadow_distance);
+        r.cascade_count =
+            (int)j_num(shadows, "cascades", r.cascade_count);
+        r.split_lambda =
+            (float)j_num(shadows, "splitLambda", r.split_lambda);
+        r.shadow_resolution =
+            (int)j_num(shadows, "resolution", r.shadow_resolution);
+        r.soft_shadow_mode =
+            (int)j_num(shadows, "soft", r.soft_shadow_mode);
+    }
+
+    const cJSON *postfx = cJSON_GetObjectItemCaseSensitive(src, "postfx");
+    if (cJSON_IsObject(postfx)) {
+        r.postfx_enabled[0] = j_bool(postfx, "tonemap", r.postfx_enabled[0]);
+        r.postfx_enabled[1] = j_bool(postfx, "bloom", r.postfx_enabled[1]);
+        r.postfx_enabled[2] = j_bool(postfx, "fxaa", r.postfx_enabled[2]);
+        r.postfx_enabled[3] = j_bool(postfx, "vignette", r.postfx_enabled[3]);
+        r.postfx_enabled[4] = j_bool(postfx, "chromatic", r.postfx_enabled[4]);
+        r.postfx_enabled[5] = j_bool(postfx, "grayscale", r.postfx_enabled[5]);
+        r.exposure =
+            (float)j_num(postfx, "exposure", r.exposure);
+        r.gamma =
+            (float)j_num(postfx, "gamma", r.gamma);
+        r.bloom_threshold =
+            (float)j_num(postfx, "bloomThreshold", r.bloom_threshold);
+        r.bloom_intensity =
+            (float)j_num(postfx, "bloomIntensity", r.bloom_intensity);
+        r.fxaa_span_max =
+            (float)j_num(postfx, "fxaaSpanMax", r.fxaa_span_max);
+        r.vignette_intensity =
+            (float)j_num(postfx, "vignetteIntensity", r.vignette_intensity);
+        r.vignette_smoothness =
+            (float)j_num(postfx, "vignetteSmoothness", r.vignette_smoothness);
+        r.chromatic_strength =
+            (float)j_num(postfx, "chromaticStrength", r.chromatic_strength);
+    }
+
+    jce_scene_set_rendering_settings(scene, &r);
+    return true;
 }
 
 /* ── Component parsing ────────────────────────────────────────────── */
@@ -724,6 +905,9 @@ static void parse_unified_light(JceScene *s, JceEntity e, const cJSON *c)
     float colorB = (float)j_num2(c, "colorB", "color_b", 1.0);
     float intensity = (float)j_num(c, "intensity", 1.0);
     bool  casts_shadow = j_bool(c, "castsShadow", false);
+    float dirX = (float)j_num2(c, "dirX", "dir_x", 0.0);
+    float dirY = (float)j_num2(c, "dirY", "dir_y", -1.0);
+    float dirZ = (float)j_num2(c, "dirZ", "dir_z", 0.0);
 
     int ltype = 0;
     const cJSON *lt = cJSON_GetObjectItemCaseSensitive(c, "lightType");
@@ -744,6 +928,9 @@ static void parse_unified_light(JceScene *s, JceEntity e, const cJSON *c)
     } else if (ltype == 2) {
         JceSpotLight sl;
         memset(&sl, 0, sizeof(sl));
+        sl.direction.x = dirX;
+        sl.direction.y = dirY;
+        sl.direction.z = dirZ;
         sl.color.x = colorR; sl.color.y = colorG; sl.color.z = colorB;
         sl.intensity = intensity;
         sl.radius    = (float)j_num(c, "radius", 10.0);
@@ -759,6 +946,9 @@ static void parse_unified_light(JceScene *s, JceEntity e, const cJSON *c)
     } else {
         JceDirectionalLight dl;
         memset(&dl, 0, sizeof(dl));
+        dl.direction.x = dirX;
+        dl.direction.y = dirY;
+        dl.direction.z = dirZ;
         dl.color.x = colorR; dl.color.y = colorG; dl.color.z = colorB;
         dl.intensity    = intensity;
         dl.casts_shadow = casts_shadow;
@@ -2012,6 +2202,9 @@ static void ser_light_unified(JceScene *s, JceEntity e, cJSON *arr)
         cJSON_AddNumberToObject(o, "colorB", dl->color.z);
         cJSON_AddNumberToObject(o, "intensity", dl->intensity);
         cJSON_AddNumberToObject(o, "lightType", 0);
+        cJSON_AddNumberToObject(o, "dirX", dl->direction.x);
+        cJSON_AddNumberToObject(o, "dirY", dl->direction.y);
+        cJSON_AddNumberToObject(o, "dirZ", dl->direction.z);
         cJSON_AddBoolToObject(o, "castsShadow", dl->casts_shadow);
         /* P3-E.5 — emit cookie fields only when set (omit-on-default). */
         if (dl->cookie_path[0] != '\0')
@@ -2045,6 +2238,9 @@ static void ser_light_unified(JceScene *s, JceEntity e, cJSON *arr)
         cJSON_AddNumberToObject(o, "intensity", sl->intensity);
         cJSON_AddNumberToObject(o, "lightType", 2);
         cJSON_AddNumberToObject(o, "radius", sl->radius);
+        cJSON_AddNumberToObject(o, "dirX", sl->direction.x);
+        cJSON_AddNumberToObject(o, "dirY", sl->direction.y);
+        cJSON_AddNumberToObject(o, "dirZ", sl->direction.z);
         float inner_deg = acosf(sl->inner_cone_cos) * JCE_RAD2DEG;
         float outer_deg = acosf(sl->outer_cone_cos) * JCE_RAD2DEG;
         cJSON_AddNumberToObject(o, "innerConeDeg", inner_deg);
@@ -3328,6 +3524,14 @@ cJSON *jce_scene_save_json(const JceScene *scene)
     cJSON_AddItemToObject(sobj, "entities", entities);
 
     if (scene) {
+        const JceSceneRenderingSettings *rendering =
+            jce_scene_get_rendering_settings(scene);
+        if (rendering) {
+            cJSON *r = ser_scene_rendering_settings(rendering);
+            if (r)
+                cJSON_AddItemToObject(sobj, "rendering", r);
+        }
+
         SerCtx ctx;
         ctx.entities = entities;
         ctx.scene = (JceScene *)scene;
@@ -3409,6 +3613,15 @@ static bool is_legacy_unnamed_entity_name(const char *name)
     return !name || name[0] == '\0' || strcmp(name, "(unnamed)") == 0;
 }
 
+static void count_existing_entity_cb(JceScene *scene, JceEntity e, void *ud)
+{
+    (void)scene;
+    (void)e;
+    uint32_t *count = (uint32_t *)ud;
+    if (count)
+        (*count)++;
+}
+
 int jce_scene_load_json(JceScene *scene, const cJSON *root)
 {
     if (!scene || !root) return -1;
@@ -3418,6 +3631,13 @@ int jce_scene_load_json(JceScene *scene, const cJSON *root)
         LOG_WARN(LOG_TAG, "scene JSON has no 'entities' array");
         return -1;
     }
+
+    uint32_t existing_entities = 0;
+    jce_scene_each_entity(scene, count_existing_entity_cb,
+                          &existing_entities);
+    if (!parse_scene_rendering_settings(scene, root) &&
+        existing_entities == 0)
+        jce_scene_clear_rendering_settings(scene);
 
     int total = cJSON_GetArraySize(entities);
     if (total <= 0) return 0;

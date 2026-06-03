@@ -12,7 +12,7 @@ REM  just the exe plus the SDK it links projects against:               REM
 REM                                                                   REM
 REM      dist\editor\win32-<arch>[-dist]\                             REM
 REM      |-- jce_editor.exe          (+ jce_editor_sha256.txt, dist)  REM
-REM      |-- sdk\                    (headers, libs, jce_pak, cmake)   REM
+REM      |-- sdk\                    (headers, libs, cmake, resources) REM
 REM      |-- VERSION.txt                                              REM
 REM      \-- README.txt                                              REM
 REM                                                                   REM
@@ -198,7 +198,7 @@ REM ---- README.txt ----
 	echo.
 	echo Contents:
 	echo   jce_editor.exe   The editor. Double-click to launch.
-	echo   sdk\             Engine SDK ^(headers, libs, jce_pak, CMake config^).
+	echo   sdk\             Engine SDK ^(headers, libs, CMake config, resources^).
 	echo.
 	echo Prerequisites on this machine ^(NOT bundled^):
 	echo   * Microsoft Visual C++ Build Tools ^(MSVC^) - the editor compiles

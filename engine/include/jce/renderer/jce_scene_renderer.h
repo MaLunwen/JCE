@@ -88,6 +88,8 @@ typedef struct {
     JcePostFXParams      postfx;
     uint16_t             shadow_map_size;  /* 0 = use default (2048) */
     uint8_t              csm_cascades;     /* 0 = use default (4)   */
+    float                shadow_distance;  /* 0 = scene/default     */
+    float                csm_split_lambda; /* <0 = scene/default    */
     JceSceneViewModeKind view_mode;        /* default 0 = shaded   */
 
     /* Broadphase frustum culling using the spatial grid. Approximate AABBs

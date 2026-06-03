@@ -20,11 +20,10 @@
  *     LNK2019: unresolved external symbol
  *     __std_find_first_of_trivial_pos_1
  *
- * This TU provides a portable fallback compiled into the SDK's deps
- * fat lib.  Because deps is linked *normally* (not /WHOLEARCHIVE'd),
- * the linker only pulls this obj when the symbol is genuinely
- * unresolved — so once MSVC adds the export, the CRT wins and our
- * shim is silently skipped.  No duplicate-symbol risk.
+ * This TU provides a portable fallback packaged as a standalone SDK
+ * static library.  JCEConfig.cmake links it only for consuming MSVC
+ * toolchains older than 19.50, because MSVC 19.50+ exports the same
+ * helper from msvcprt.lib and would otherwise report LNK2005.
  *
  * Layer: OS / Platform.  Windows + MSVC only.
  */

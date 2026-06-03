@@ -75,10 +75,14 @@ extern std::vector<uint32_t> g_entity_order;
 /* ── Editor per-entity sidecar (UI-only state) ────────────────────── */
 struct EditorEntitySidecar {
     uint64_t expanded_flags = 0xFFFFFFFFFFFFFFFFull; /* Inspector fold state bitmask */
-    /* Inspector display order of components (one slot per visible flag).
-       Empty until first inspector pass; entries are component flag values
-       (uint64). Reordered via popup Move Up/Down or drag-and-drop on
-       header. Flags missing here fall back to default order. */
+    /* Non-flag editor component slots cannot live in expanded_flags because
+       they are not single-bit masks. Empty means every synthetic slot is open. */
+    std::vector<uint64_t> collapsed_component_slots;
+    /* Inspector display order of components (one slot per visible component).
+       Empty until first inspector pass; entries are component slots, which
+       are usually JCE_COMP_FLAG_* values but may be editor-only synthetic
+       slots. Reordered via popup Move Up/Down or drag-and-drop on header.
+       Missing slots fall back to default order. */
     std::vector<uint64_t> component_order;
 };
 extern std::unordered_map<uint32_t, EditorEntitySidecar> g_entity_sidecar;

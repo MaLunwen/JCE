@@ -8,7 +8,6 @@
 
 #include "jce_dialog_asset_picker.h"
 #include "core/jce_editor_i18n.h"
-#include "ui/jce_editor_panels.h"
 
 extern "C" {
 #include <jce/os/core/jce_log.h>
@@ -183,9 +182,7 @@ void jce_editor_asset_picker_draw(void)
     for (int i = 0; i < total; ++i) {
         int k = (int)jce_assetdb_kind_at(i);
         if (g_pk.kind_filter != 0 && k != g_pk.kind_filter) continue;
-        /* Filter against the project-relative path so users searching
-         * for "textures/foo" find it without their absolute prefix. */
-        const char *p = jce_assetdb_rel_at(i);
+        const char *p = jce_assetdb_path_at(i);
         if (!p || !icontains(p, g_pk.search)) continue;
         filtered.push_back(i);
     }
@@ -209,14 +206,14 @@ void jce_editor_asset_picker_draw(void)
         while (clip.Step()) {
             for (int row = clip.DisplayStart; row < clip.DisplayEnd; ++row) {
                 int idx = filtered[row];
-                /* Display project-relative paths so users never see their
-                 * home directory or drive letter — keeps the picker
-                 * consistent with what we actually store. */
-                const char *path = jce_assetdb_rel_at(idx);
+                const char *path = jce_assetdb_path_at(idx);
                 int kind = (int)jce_assetdb_kind_at(idx);
                 /* Build a two-column-ish row: [KIND]  filename  (path-dim) */
                 const char *file = path ? path : "";
-                const char *name = jce_editor_path_basename_view(file);
+                const char *slash = file ? strrchr(file, '/') : NULL;
+                const char *bs    = file ? strrchr(file, '\\') : NULL;
+                if (bs && (!slash || bs > slash)) slash = bs;
+                const char *name  = slash ? (slash + 1) : file;
 
                 ImGui::PushID(idx);
                 char line[800];
@@ -231,12 +228,12 @@ void jce_editor_asset_picker_draw(void)
                         commit_via_keyboard = true;
                 }
                 /* Path on the same line, right-aligned in dim text. */
-                if (path && path != name && name > file) {
+                if (path && path != name && slash) {
                     ImGui::SameLine();
                     ImVec4 dim = ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
                     /* Truncate from the left for long paths. */
                     char folder[256];
-                    size_t flen = (size_t)(name - 1 - file);
+                    size_t flen = (size_t)(slash - file);
                     if (flen >= sizeof(folder)) flen = sizeof(folder) - 1;
                     memcpy(folder, file, flen);
                     folder[flen] = '\0';
@@ -256,7 +253,7 @@ void jce_editor_asset_picker_draw(void)
             commit_via_keyboard = true;
 
         if (commit_via_keyboard) {
-            const char *path = jce_assetdb_rel_at(g_pk.selected_idx);
+            const char *path = jce_assetdb_path_at(g_pk.selected_idx);
             if (g_pk.out_buf && g_pk.out_size > 0 && path)
                 snprintf(g_pk.out_buf, g_pk.out_size, "%s", path);
             if (g_pk.ready_flag) *g_pk.ready_flag = true;
@@ -294,7 +291,7 @@ void jce_editor_asset_picker_draw(void)
         bool can_select = (g_pk.selected_idx >= 0);
         if (!can_select) ImGui::BeginDisabled();
         if (ImGui::Button(sel_lbl)) {
-            const char *path = jce_assetdb_rel_at(g_pk.selected_idx);
+            const char *path = jce_assetdb_path_at(g_pk.selected_idx);
             if (g_pk.out_buf && g_pk.out_size > 0 && path)
                 snprintf(g_pk.out_buf, g_pk.out_size, "%s", path);
             if (g_pk.ready_flag) *g_pk.ready_flag = true;

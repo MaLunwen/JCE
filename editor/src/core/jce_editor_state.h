@@ -200,6 +200,7 @@ bool              jce_state_get_live_preview(void);
 void              jce_state_set_live_preview(bool on);
 
 /* Scene loading */
+bool              jce_state_new_default_scene(void);
 bool              jce_state_load_scene_file(const char *scene_path);
 /* Load a scene from a standalone .jbundle (single-file mode product).
  * Mounts the bundle internally, reads the scene JSON through the VFS,
@@ -217,6 +218,7 @@ bool              jce_state_load_scene_from_catalog(const char *catalog_path,
 bool              jce_state_save_scene_file(const char *scene_path);
 const char       *jce_state_get_current_scene_path(void);
 bool              jce_state_is_scene_modified(void);
+void              jce_state_mark_scene_modified(void);
 void              jce_state_clear_scene_modified(void);
 
 /* Play mode */

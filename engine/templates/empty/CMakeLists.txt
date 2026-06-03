@@ -8,7 +8,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 #   Override on the command line with:
 #     cmake -DJCE_DIR=<sdk>/lib/cmake/JCE ..
 #   or set the JCE_SDK_DIR environment variable (preferred).
-#   build-project.bat / build-project.sh handle this for you.
+#   The editor forwards this automatically for project builds.
 if(NOT DEFINED JCE_DIR AND DEFINED ENV{JCE_SDK_DIR})
     if(EXISTS "$ENV{JCE_SDK_DIR}/lib/cmake/JCE/JCEConfig.cmake")
         set(JCE_DIR "$ENV{JCE_SDK_DIR}/lib/cmake/JCE")
@@ -31,14 +31,27 @@ if(NOT DEFINED JCE_PROJECT_COOKED_ASSETS)
 endif()
 set(_cooked "${CMAKE_SOURCE_DIR}/${JCE_PROJECT_COOKED_ASSETS}")
 
-# jce_target_embed_pak runs the SDK's jce_pak host tool over the
-# cooked tree.  Engine + game assets get baked into a COFF/.S blob
-# linked into the exe so the runtime can mount the PAK with zero
-# external files.  When jce_pak is unavailable (no SDK install) or
-# the cooked tree hasn't been produced yet, fall back to an empty
-# stub PAK so the link still resolves and the engine boots cleanly.
-if(COMMAND jce_target_embed_pak AND IS_DIRECTORY "${_cooked}")
-    jce_target_embed_pak(@JCE_PROJECT_NAME@ RESOURCE_DIRS "${_cooked}")
+# In editor-driven builds, jce_target_embed_pak consumes the
+# editor-prebuilt asset source passed through JCE_PROJECT_PREBUILT_ASSETS_C.
+# Manual SDK consumers may still provide a host packer, but the packaged
+# editor path does not require first-party external tools.
+set(_has_prebuilt_assets OFF)
+if(DEFINED JCE_PROJECT_PREBUILT_ASSETS_C AND
+   EXISTS "${JCE_PROJECT_PREBUILT_ASSETS_C}")
+    set(_has_prebuilt_assets ON)
+endif()
+if(COMMAND jce_target_embed_pak)
+    if(_has_prebuilt_assets OR IS_DIRECTORY "${_cooked}")
+        jce_target_embed_pak(@JCE_PROJECT_NAME@ RESOURCE_DIRS "${_cooked}")
+    else()
+        set(_stub "${CMAKE_CURRENT_BINARY_DIR}/jce_stub_pak.c")
+        file(WRITE "${_stub}"
+"#include <stddef.h>\n"
+"const unsigned char assets_pak_data[1] = {0};\n"
+"const size_t        assets_pak_data_size = 0;\n")
+        target_sources(@JCE_PROJECT_NAME@ PRIVATE "${_stub}")
+        message(STATUS "@JCE_PROJECT_NAME@: no cooked assets at ${_cooked} - linking empty PAK stub")
+    endif()
 else()
     set(_stub "${CMAKE_CURRENT_BINARY_DIR}/jce_stub_pak.c")
     file(WRITE "${_stub}"
@@ -46,9 +59,7 @@ else()
 "const unsigned char assets_pak_data[1] = {0};\n"
 "const size_t        assets_pak_data_size = 0;\n")
     target_sources(@JCE_PROJECT_NAME@ PRIVATE "${_stub}")
-    if(NOT IS_DIRECTORY "${_cooked}")
-        message(STATUS "@JCE_PROJECT_NAME@: no cooked assets at ${_cooked} — linking empty PAK stub")
-    endif()
+    message(STATUS "@JCE_PROJECT_NAME@: JCE asset helper unavailable - linking empty PAK stub")
 endif()
 
 # Stage runtime data alongside the exe so the template's main.c can
@@ -68,10 +79,10 @@ if(IS_DIRECTORY "${_cooked}")
 endif()
 
 # ── Embed project bundles directly into the exe ─────────────────
-# JCE_PROJECT_BUNDLES is a CMake list (semicolon-separated) of
-# source paths to .jbundle files, forwarded by build-project.bat
-# from the manifest's bundles[] array.  Each bundle gets baked as
-# a COFF/.S blob in `.rdata` with two externs:
+# JCE_PROJECT_BUNDLES is a CMake list (semicolon-separated) of source paths
+# to .jbundle files.  Editor-driven builds pre-generate linkable objects or
+# sources under JCE_PROJECT_PREBUILT_BUNDLE_DIR so no SDK-side wrapper tool is
+# needed.  Each bundle gets baked with two externs:
 #   const unsigned char bundle_<name>[];   // payload
 #   const size_t        bundle_<name>_size;
 # main.c then declares matching externs and mounts via

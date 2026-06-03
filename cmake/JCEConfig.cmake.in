@@ -27,10 +27,11 @@ if(EXISTS "${_jce_share_dir}/THIRD_PARTY_LICENSES.md")
 	set(JCE_THIRD_PARTY_LICENSES_FILE "${_jce_share_dir}/THIRD_PARTY_LICENSES.md")
 endif()
 
-# ---- Host packer (jce_pak) location, if the SDK shipped it. -------- #
-# End-user projects use this via jce_target_embed_pak() to bake their
-# own game_assets.pak at build time.  May be empty on SDKs that did
-# not include the packer (e.g. release-only minimal redist).
+# ---- Optional host packer (legacy/developer SDK extension). -------- #
+# The packaged editor generates PAK/BOM/embed sources in-process and
+# passes them through JCE_PROJECT_PREBUILT_* variables.  These probes
+# only support manual CMake consumers that deliberately add host tools
+# beside the SDK.
 if(WIN32)
 	set(_jce_pak_exe "${_jce_bin_dir}/jce_pak.exe")
 else()
@@ -41,9 +42,8 @@ if(EXISTS "${_jce_pak_exe}")
 		CACHE FILEPATH "Path to the JCE asset packer (jce_pak)." FORCE)
 endif()
 
-# ---- Host bundle wrapper (jce_bin2obj) location, if shipped. ------- #
-# Used by jce_target_embed_bundle() to bake .jbundle files into the
-# consumer's exe so the deliverable is genuinely a single file.
+# ---- Optional host bundle wrapper (legacy/developer SDK extension). #
+# Editor-driven builds use JCE_PROJECT_PREBUILT_BUNDLE_DIR instead.
 if(WIN32)
 	set(_jce_bin2obj_exe "${_jce_bin_dir}/jce_bin2obj.exe")
 else()
@@ -58,6 +58,8 @@ set(_jce_core_release "${_jce_lib_dir}/Release/jce_engine_core@CMAKE_STATIC_LIBR
 set(_jce_core_debug   "${_jce_lib_dir}/Debug/jce_engine_core@CMAKE_STATIC_LIBRARY_SUFFIX@")
 set(_jce_deps_release "${_jce_lib_dir}/Release/jce_engine_deps@CMAKE_STATIC_LIBRARY_SUFFIX@")
 set(_jce_deps_debug   "${_jce_lib_dir}/Debug/jce_engine_deps@CMAKE_STATIC_LIBRARY_SUFFIX@")
+set(_jce_msvc_stl_shims_release "${_jce_lib_dir}/Release/jce_msvc_stl_shims@CMAKE_STATIC_LIBRARY_SUFFIX@")
+set(_jce_msvc_stl_shims_debug   "${_jce_lib_dir}/Debug/jce_msvc_stl_shims@CMAKE_STATIC_LIBRARY_SUFFIX@")
 
 if(NOT EXISTS "${_jce_core_release}" AND NOT EXISTS "${_jce_core_debug}")
 	set(JCE_FOUND FALSE)
@@ -166,6 +168,28 @@ if(WIN32)
 			INTERFACE_LINK_LIBRARIES
 				"$<$<NOT:$<CONFIG:Debug>>:msvcprt>"
 				"$<$<CONFIG:Debug>:msvcprtd>")
+
+		# Some MSVC runtimes miss STL helper exports while Conan-built
+		# C++ deps reference them.  Keep the fallback as a normal static
+		# archive, not whole-archive: link.exe pulls it only when the
+		# symbol is unresolved after the runtime import libs.
+		set(_jce_msvc_stl_shims_genex "")
+		if(EXISTS "${_jce_msvc_stl_shims_release}" AND EXISTS "${_jce_msvc_stl_shims_debug}")
+			set(_jce_msvc_stl_shims_genex "$<IF:$<CONFIG:Debug>,${_jce_msvc_stl_shims_debug},${_jce_msvc_stl_shims_release}>")
+		elseif(EXISTS "${_jce_msvc_stl_shims_release}")
+			set(_jce_msvc_stl_shims_genex "${_jce_msvc_stl_shims_release}")
+		elseif(EXISTS "${_jce_msvc_stl_shims_debug}")
+			set(_jce_msvc_stl_shims_genex "${_jce_msvc_stl_shims_debug}")
+		endif()
+
+		if(_jce_msvc_stl_shims_genex)
+			set_property(TARGET JCE::JCE APPEND PROPERTY
+				INTERFACE_LINK_LIBRARIES "${_jce_msvc_stl_shims_genex}")
+		else()
+			message(WARNING
+				"JCE: this MSVC toolchain may require jce_msvc_stl_shims, "
+				"but the SDK did not install it.")
+		endif()
 	endif()
 elseif(APPLE)
 	set_property(TARGET JCE::JCE APPEND PROPERTY

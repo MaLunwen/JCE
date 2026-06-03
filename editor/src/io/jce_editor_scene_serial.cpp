@@ -14,6 +14,7 @@
 #include "core/jce_build_manager.h"
 #include "core/jce_editor_toast.h"
 #include "core/jce_editor_i18n.h"
+#include "core/jce_editor_scene_rendering_defaults.h"
 #include "ui/jce_editor_panels.h"
 
 extern "C" {
@@ -396,6 +397,9 @@ static void normalize_entity_paths_cb(JceScene *sc, JceEntity e, void *ud)
         rel_in_place(mr->ao_tex,        sizeof(mr->ao_tex),        base);
         rel_in_place(mr->emissive_tex,  sizeof(mr->emissive_tex),  base);
     }
+    if (JceCompoundColliderComponent *cc = jce_scene_get_compound_collider(scene, e)) {
+        rel_in_place(cc->model_path, sizeof(cc->model_path), base);
+    }
     if (JceSpriteRendererComponent *sr = jce_scene_get_sprite_renderer(scene, e)) {
         rel_in_place(sr->sprite_path, sizeof(sr->sprite_path), base);
     }
@@ -511,6 +515,7 @@ bool jce_state_load_scene_file(const char *scene_path)
 
         ok = jce_scene_serial_load_file(s.scene, scene_path);
         if (ok) {
+            jce_editor_scene_ensure_rendering_settings(s.scene);
             rebuild_entity_order_from_ecs();
             update_scene_dir_from_path(scene_path);
             set_current_scene_path_internal(scene_path);
@@ -567,6 +572,38 @@ struct BundleMount {
 };
 BundleMount g_bm;
 
+bool ends_with_ci_local(const char *path, const char *suffix)
+{
+    if (!path || !suffix) return false;
+    size_t n = std::strlen(path);
+    size_t m = std::strlen(suffix);
+    if (n < m) return false;
+    const char *tail = path + n - m;
+    for (size_t i = 0; i < m; ++i) {
+        char a = tail[i];
+        char b = suffix[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+        if (a != b) return false;
+    }
+    return true;
+}
+
+bool bundle_path_from_sidecar(const char *sidecar, char *out, size_t outsz)
+{
+    if (!ends_with_ci_local(sidecar, ".jbundle.json") ||
+        !out || outsz == 0) {
+        return false;
+    }
+    size_t n = std::strlen(sidecar);
+    size_t keep = n - std::strlen(".json");
+    if (keep >= outsz)
+        return false;
+    std::memcpy(out, sidecar, keep);
+    out[keep] = '\0';
+    return true;
+}
+
 void close_active_bundle_mount()
 {
     /* Clear global asset-loader fallback first so any in-flight read
@@ -599,6 +636,7 @@ bool apply_scene_bytes(const char *display_path,
         clear_scene_entities();
         ok = jce_scene_serial_load(s.scene, bytes, size);
         if (ok) {
+            jce_editor_scene_ensure_rendering_settings(s.scene);
             rebuild_entity_order_from_ecs();
             update_scene_dir_from_path(display_path);
             set_current_scene_path_internal(display_path);
@@ -628,6 +666,19 @@ bool apply_scene_bytes(const char *display_path,
 bool jce_state_load_scene_from_jbundle(const char *jbundle_path)
 {
     if (!jbundle_path || jbundle_path[0] == '\0') return false;
+
+    char sibling_bundle[1024];
+    if (bundle_path_from_sidecar(jbundle_path, sibling_bundle,
+                                 sizeof(sibling_bundle))) {
+        if (!jce_fs_host_exists_file(sibling_bundle)) {
+            LOG_WARN(LOG_TAG, "bundle sidecar has no sibling .jbundle: %s",
+                     jbundle_path);
+            return false;
+        }
+        LOG_INFO(LOG_TAG, "bundle sidecar selected; opening %s",
+                 sibling_bundle);
+        jbundle_path = sibling_bundle;
+    }
 
     close_active_bundle_mount();
     g_bm.fs = jce_fs_create();
@@ -667,6 +718,11 @@ bool jce_state_load_scene_from_catalog(const char *catalog_path,
                                        const char *bundle_id_or_scene)
 {
     if (!catalog_path || catalog_path[0] == '\0') return false;
+
+    char sibling_bundle[1024];
+    if (bundle_path_from_sidecar(catalog_path, sibling_bundle,
+                                 sizeof(sibling_bundle)))
+        return jce_state_load_scene_from_jbundle(sibling_bundle);
 
     close_active_bundle_mount();
     g_bm.fs = jce_fs_create();

@@ -275,7 +275,7 @@ if "%USE_SDK%"=="0" (
         exit /b 9
     )
     rem Always re-run cmake --install in engine-workspace mode so the
-    rem bundled SDK (headers, CMake exports, fat libs, host tools) stays
+    rem bundled SDK (headers, CMake exports, fat libs, resources) stays
     rem in sync with whatever the engine tree currently builds. cmake's
     rem install step is itself incremental (content-identical files are
     rem skipped) so the steady-state cost is just stat() per file.
@@ -313,6 +313,15 @@ if /i "%VARIANT%"=="debug" set "CMAKE_BUILD_TYPE=Debug"
 if /i "%VARIANT%"=="dist"  set "CMAKE_BUILD_TYPE=Release"
 
 echo [build-project] Configuring %TARGET% (%PLATFORM%/%ARCH%/%VARIANT%) with SDK at %SDK_DIR%
+
+set "CMAKE_FRESH="
+if exist "%BUILD_DIR%\CMakeCache.txt" (
+    findstr /i /c:"JCE_DIR:PATH=JCE_DIR-NOTFOUND" "%BUILD_DIR%\CMakeCache.txt" >nul 2>&1
+    if not errorlevel 1 (
+        set "CMAKE_FRESH=--fresh"
+        echo [build-project] stale JCE_DIR cache detected; configuring with cmake --fresh
+    )
+)
 
 :: The Windows SDK ships MSVC-built static libs.  Force cmake to pick
 :: cl.exe regardless of PATH order, and activate vcvars if needed so
@@ -352,7 +361,7 @@ if not defined JCE_SKIP_VCVARS (
 :: not reliably parseable in cmd.exe without a JSON tool).
 set "BUNDLES=%BUNDLES_ARG%"
 
-cmake -S "%PROJECT_DIR%" -B "%BUILD_DIR%" -G Ninja ^
+cmake %CMAKE_FRESH% -S "%PROJECT_DIR%" -B "%BUILD_DIR%" -G Ninja ^
       -DCMAKE_BUILD_TYPE=%CMAKE_BUILD_TYPE% ^
       -DCMAKE_C_COMPILER=cl ^
       -DJCE_PROJECT_COOKED_ASSETS="%_COOKED%" ^

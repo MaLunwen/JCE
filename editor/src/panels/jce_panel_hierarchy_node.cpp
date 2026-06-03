@@ -241,12 +241,7 @@ void focus_entity_in_scene(uint32_t id)
 {
     JceScene *scene = jce_state_get_scene();
     if (scene && jce_state_entity_exists(id)) {
-        JceEntity e = jce_state_to_ecs_entity(id);
-        JceTransform *t = jce_scene_get_transform(scene, e);
-        if (t) {
-            jce_editor_scene_camera_set_target(
-                t->position.x, t->position.y, t->position.z);
-        }
+        jce_editor_scene_camera_focus_entity(id);
     }
     jce_editor_layout_request_focus_inspector();
 }

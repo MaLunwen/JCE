@@ -24,6 +24,11 @@ static void *comp_get_ptr_and_size(JceScene *scene, JceEntity e,
                                    uint64_t flag, size_t *out_size)
 {
     if (!scene) return NULL;
+    if (jce_editor_component_slot_is_compound_collider(flag)) {
+        *out_size = sizeof(JceCompoundColliderComponent);
+        return jce_scene_get_compound_collider(scene, e);
+    }
+
     switch (flag) {
     case JCE_COMP_FLAG_TRANSFORM:
         *out_size = sizeof(JceTransform);
@@ -261,8 +266,45 @@ bool jce_editor_inspector_delete_dialog_open(void)
 
 /* ── Component header / settings popup helper ─────────────────────── */
 
+static bool comp_slot_uses_expanded_bit(uint64_t slot)
+{
+    return slot != 0 && (slot & (slot - 1)) == 0;
+}
+
+static bool comp_section_is_open(const EditorEntitySidecar &sidecar,
+                                 uint64_t slot)
+{
+    if (comp_slot_uses_expanded_bit(slot))
+        return (sidecar.expanded_flags & slot) != 0;
+    return std::find(sidecar.collapsed_component_slots.begin(),
+                     sidecar.collapsed_component_slots.end(),
+                     slot) == sidecar.collapsed_component_slots.end();
+}
+
+static void comp_section_set_open(EditorEntitySidecar &sidecar,
+                                  uint64_t slot,
+                                  bool open)
+{
+    if (comp_slot_uses_expanded_bit(slot)) {
+        if (open)
+            sidecar.expanded_flags |= slot;
+        else
+            sidecar.expanded_flags &= ~slot;
+        return;
+    }
+
+    auto &collapsed = sidecar.collapsed_component_slots;
+    auto it = std::find(collapsed.begin(), collapsed.end(), slot);
+    if (open) {
+        if (it != collapsed.end())
+            collapsed.erase(it);
+    } else if (it == collapsed.end()) {
+        collapsed.push_back(slot);
+    }
+}
+
 /* Returns true if the component's body should be drawn this frame.
- * Updates sidecar.expanded_flags fold state.  Handles the "..." popup
+ * Updates sidecar fold state.  Handles the "..." popup
  * with a Remove menu (disabled when not removable, e.g. Transform). */
 static bool comp_section_begin(uint32_t entity_id,
                                EditorEntitySidecar &sidecar,
@@ -272,7 +314,7 @@ static bool comp_section_begin(uint32_t entity_id,
 {
     ImGui::PushID((int)(flag ^ (flag >> 32)));
 
-    bool was_open = (sidecar.expanded_flags & flag) != 0;
+    bool was_open = comp_section_is_open(sidecar, flag);
     int tn_flags = ImGuiTreeNodeFlags_AllowOverlap |
                    (was_open ? ImGuiTreeNodeFlags_DefaultOpen : 0);
 
@@ -283,8 +325,7 @@ static bool comp_section_begin(uint32_t entity_id,
          active palette (avoids a near-black strip on white). */
     ImGui::PushStyleColor(ImGuiCol_Header, jce_theme::inspector_header_color());
     bool open = ImGui::CollapsingHeader(display_name, tn_flags);
-    if (open) sidecar.expanded_flags |= flag;
-    else      sidecar.expanded_flags &= ~flag;
+    comp_section_set_open(sidecar, flag, open);
 
     /* Drag-reorder: pressing & dragging a header begins a drag; while
      * active, hovering another header records it as the drop target. On
@@ -401,6 +442,9 @@ static bool comp_section_begin(uint32_t entity_id,
                     t->position = { 0.0f, 0.0f, 0.0f };
                     t->rotation = jce_q_identity();
                     t->scale    = { 1.0f, 1.0f, 1.0f };
+                } else if (jce_editor_component_slot_is_compound_collider(flag)) {
+                    jce_editor_component_compound_default(
+                        (JceCompoundColliderComponent *)_cptr);
                 } else {
                     memset(_cptr, 0, _csz);
                 }
@@ -464,94 +508,30 @@ static void comp_section_end(void)
  *  COMPONENT DISPLAY ORDER + DISPATCH
  *
  *  Inspector iterates components in user-controlled order stored in
- *  EditorEntitySidecar.component_order.  We use a synthetic "Light Group"
- *  flag (high bit) so the unified Light section (dir/point/spot) gets
- *  one slot that survives switching light type.
+ *  EditorEntitySidecar.component_order.  The editor component registry owns
+ *  both real flag slots and synthetic flagless slots.
  * ══════════════════════════════════════════════════════════════════════ */
-
-/* LIGHT_GROUP_BIT is a synthetic editor-only slot that groups all three light
- * types (dir/point/spot) into a single ordered entry.  It must never equal
- * any real JCE_COMP_FLAG_* value (all of which have exactly one bit set).
- * Using UINT64_MAX is safe because it has all 64 bits set. */
-static constexpr uint64_t LIGHT_GROUP_BIT = UINT64_C(0xFFFFFFFFFFFFFFFF);
-static constexpr uint64_t LIGHT_MASK      = JCE_COMP_FLAG_DIR_LIGHT |
-                                            JCE_COMP_FLAG_POINT_LIGHT |
-                                            JCE_COMP_FLAG_SPOT_LIGHT;
-
-/* Default ordering follows the historic hard-coded layout. */
-static const uint64_t kDefaultComponentOrder[] = {
-    JCE_COMP_FLAG_TRANSFORM,
-    LIGHT_GROUP_BIT,
-    JCE_COMP_FLAG_CAMERA,
-    JCE_COMP_FLAG_MESH_RENDERER,
-    JCE_COMP_FLAG_SPRITE_RENDERER,
-    JCE_COMP_FLAG_ANIMATOR,
-    JCE_COMP_FLAG_SKELETAL_ANIMATOR,
-    JCE_COMP_FLAG_RIGIDBODY,
-    JCE_COMP_FLAG_BOX_COLLIDER,
-    JCE_COMP_FLAG_SPHERE_COLLIDER,
-    JCE_COMP_FLAG_CHARACTER_CONTROLLER,
-    JCE_COMP_FLAG_AUDIO_SOURCE,
-    JCE_COMP_FLAG_SCRIPT,
-    JCE_COMP_FLAG_SKYBOX,
-    JCE_COMP_FLAG_SPRITE_ANIMATOR,
-    JCE_COMP_FLAG_CONSTRAINT,
-    JCE_COMP_FLAG_TERRAIN,
-    JCE_COMP_FLAG_RIGIDBODY_2D,
-    JCE_COMP_FLAG_PARTICLE_EMITTER,
-    JCE_COMP_FLAG_BEHAVIOR_TREE,
-    JCE_COMP_FLAG_LOD_GROUP,
-    JCE_COMP_FLAG_VIRTUAL_CAMERA,
-    JCE_COMP_FLAG_TRIGGER_VOLUME,
-    JCE_COMP_FLAG_CAPSULE_COLLIDER,
-    JCE_COMP_FLAG_MESH_COLLIDER,
-    JCE_COMP_FLAG_COLLIDER_2D,
-    JCE_COMP_FLAG_TRAIL_RENDERER,
-    JCE_COMP_FLAG_LINE_RENDERER,
-    JCE_COMP_FLAG_REFLECTION_PROBE,
-    JCE_COMP_FLAG_DECAL,
-    JCE_COMP_FLAG_LIGHT_PROBE_GROUP,
-    JCE_COMP_FLAG_AUDIO_LISTENER,
-    JCE_COMP_FLAG_AUDIO_REVERB_ZONE,
-    JCE_COMP_FLAG_AUDIO_OCCLUSION,
-    JCE_COMP_FLAG_SPAWN_MANAGER,
-    JCE_COMP_FLAG_WEAPON,
-    JCE_COMP_FLAG_SAVE_POINT,
-    JCE_COMP_FLAG_WHEEL_COLLIDER,
-    JCE_COMP_FLAG_CONSTANT_FORCE,
-    JCE_COMP_FLAG_CONFIGURABLE_JOINT,
-    JCE_COMP_FLAG_JOINT_2D,
-    JCE_COMP_FLAG_BILLBOARD_RENDERER,
-    JCE_COMP_FLAG_CANVAS,
-    JCE_COMP_FLAG_CANVAS_GROUP,
-    JCE_COMP_FLAG_LAYOUT_GROUP,
-    JCE_COMP_FLAG_UI_IMAGE,
-    JCE_COMP_FLAG_UI_TEXT,
-    JCE_COMP_FLAG_UI_BUTTON,
-    JCE_COMP_FLAG_CLOTH,
-    JCE_COMP_FLAG_NET_TRANSFORM,
-    JCE_COMP_FLAG_NET_ANIMATOR,
-    JCE_COMP_FLAG_NET_RIGIDBODY,
-    JCE_COMP_FLAG_VFX_GRAPH,
-    JCE_COMP_FLAG_TILEMAP,
-    JCE_COMP_FLAG_TILEMAP_COLLIDER_2D,
-    JCE_COMP_FLAG_AVATAR,
-    JCE_COMP_FLAG_VOLUME,
-    JCE_COMP_FLAG_OCCLUSION_PORTAL,
-};
 
 /* Ensures sidecar.component_order contains exactly the slots we want to
  * draw, given the entity's currently-set component flags:
  *   - Removes entries no longer present (component was removed).
  *   - Appends new entries in default-order positions (component added).
- *   - Light flags collapse into the synthetic LIGHT_GROUP_BIT slot. */
-static void sync_component_order(EditorEntitySidecar &sidecar, uint64_t flags)
+ *   - Light flags collapse into the synthetic light group slot. */
+static void sync_component_order(EditorEntitySidecar &sidecar,
+                                 JceScene *scene,
+                                 JceEntity entity,
+                                 uint64_t flags)
 {
     auto wanted = [&](uint64_t entry) -> bool {
-        if (entry == LIGHT_GROUP_BIT) return (flags & LIGHT_MASK) != 0;
-        /* Skip raw light flags — they live under LIGHT_GROUP_BIT. */
-        if (entry & LIGHT_MASK) return false;
-        return (flags & entry) != 0;
+        if (jce_editor_component_slot_is_light_group(entry))
+            return (flags & INSP_LIGHT_MASK) != 0;
+
+        const JceEditorComponentDescriptor *desc =
+            jce_editor_component_find(entry);
+        if (desc && (desc->legacy_flag & INSP_LIGHT_MASK) != 0)
+            return false;
+
+        return jce_editor_component_slot_present(scene, entity, flags, entry);
     };
 
     /* Drop stale entries while preserving order of survivors. */
@@ -561,7 +541,9 @@ static void sync_component_order(EditorEntitySidecar &sidecar, uint64_t flags)
             v.end());
 
     /* Add any missing entries by walking the default order. */
-    for (uint64_t def : kDefaultComponentOrder) {
+    int n_order = jce_editor_component_default_order_count();
+    for (int i = 0; i < n_order; i++) {
+        uint64_t def = jce_editor_component_default_order_at(i);
         if (!wanted(def)) continue;
         if (std::find(v.begin(), v.end(), def) == v.end())
             v.push_back(def);
@@ -584,23 +566,9 @@ static void draw_one_component_section(uint32_t focused,
 
 static bool multi_edit_supported(uint64_t flag)
 {
-    switch (flag) {
-        case JCE_COMP_FLAG_TRANSFORM:
-        case JCE_COMP_FLAG_CAMERA:
-        case JCE_COMP_FLAG_MESH_RENDERER:
-        case JCE_COMP_FLAG_SPRITE_RENDERER:
-        case JCE_COMP_FLAG_RIGIDBODY:
-        case JCE_COMP_FLAG_BOX_COLLIDER:
-        case JCE_COMP_FLAG_SPHERE_COLLIDER:
-        case JCE_COMP_FLAG_CAPSULE_COLLIDER:
-        case JCE_COMP_FLAG_MESH_COLLIDER:
-        case JCE_COMP_FLAG_AUDIO_SOURCE:
-        case JCE_COMP_FLAG_CONSTRAINT:
-        case JCE_COMP_FLAG_SKELETAL_ANIMATOR:
-            return true;
-        default:
-            return false;
-    }
+    const JceEditorComponentDescriptor *desc =
+        jce_editor_component_find(flag);
+    return desc && desc->multi_edit_supported;
 }
 
 static void *multi_get_comp_ptr(JceScene *scene, JceEntity e,
@@ -626,6 +594,12 @@ static void *multi_get_comp_ptr(JceScene *scene, JceEntity e,
         M(JCE_COMP_FLAG_CONSTRAINT,        jce_scene_get_constraint,        JceConstraintComponent)
         M(JCE_COMP_FLAG_SKELETAL_ANIMATOR, jce_scene_get_skeletal_animator, JceSkeletalAnimatorComponent)
         default:
+            if (jce_editor_component_slot_is_compound_collider(flag)) {
+                JceCompoundColliderComponent *p =
+                    jce_scene_get_compound_collider(scene, e);
+                if (out_size) *out_size = sizeof(JceCompoundColliderComponent);
+                return (void *)p;
+            }
             if (out_size) *out_size = 0;
             return nullptr;
     }
@@ -666,7 +640,8 @@ static void draw_section_with_multi_broadcast(uint32_t focused,
         JceEntity oe = jce_state_to_ecs_entity(other);
         if (!oe) continue;
         uint64_t oflags = jce_scene_get_component_flags(scene, oe);
-        if (!(oflags & entry)) continue;
+        if (!jce_editor_component_slot_present(scene, oe, oflags, entry))
+            continue;
         size_t osize = 0;
         void *optr = multi_get_comp_ptr(scene, oe, entry, &osize);
         if (optr && osize == comp_size)
@@ -723,18 +698,28 @@ static void apply_pending_reorder(uint32_t focused_entity,
     s_pending_move = { 0, 0, 0, 0, false };
 }
 
-/* Single dispatch from a flag value to the matching draw_comp_X call.
+/* Single dispatch from a component slot to the matching draw_comp_X call.
  * Mirrors the historic per-flag if-block sequence verbatim so behaviour
  * is byte-identical except for ordering. Light is handled inline by the
- * caller (LIGHT_GROUP_BIT path). */
+ * caller (light-group path). */
 static void draw_one_component_section(uint32_t focused,
                                        EditorEntitySidecar &sidecar,
                                        JceScene *scene,
                                        JceEntity ecs_e,
                                        uint64_t flag)
 {
-    const char *nm = jce_comp_flag_display_name(flag);
-    bool removable = (flag != JCE_COMP_FLAG_TRANSFORM);
+    const char *nm = jce_editor_component_display_name(flag);
+    const JceEditorComponentDescriptor *desc =
+        jce_editor_component_find(flag);
+    bool removable = desc ? desc->removable : (flag != JCE_COMP_FLAG_TRANSFORM);
+
+    if (jce_editor_component_slot_is_compound_collider(flag)) {
+        if (comp_section_begin(focused, sidecar, flag, nm, removable))
+            draw_comp_compound_collider(
+                jce_scene_get_compound_collider(scene, ecs_e));
+        comp_section_end();
+        return;
+    }
 
 #define JCE_DRAW(F, EXPR)                                                  \
     case F:                                                                \
@@ -1095,16 +1080,16 @@ void jce_editor_panel_inspector_content(void)
     uint64_t flags = jce_scene_get_component_flags(scene, ecs_e);
     EditorEntitySidecar &sidecar = g_entity_sidecar[focused];
 
-    sync_component_order(sidecar, flags);
+    sync_component_order(sidecar, scene, ecs_e, flags);
 
     /* Iterate components in user-defined display order. The dispatcher
      * delegates to the same comp_section_begin / draw_comp_X / end
      * sequence the previous code used per-flag. */
     bool light_drawn = false;
     for (uint64_t entry : sidecar.component_order) {
-        if (entry == LIGHT_GROUP_BIT) {
+        if (jce_editor_component_slot_is_light_group(entry)) {
             if (light_drawn) continue;
-            if (!(flags & LIGHT_MASK)) continue;
+            if (!(flags & INSP_LIGHT_MASK)) continue;
             uint64_t lf = (flags & JCE_COMP_FLAG_DIR_LIGHT)   ? JCE_COMP_FLAG_DIR_LIGHT
                        : (flags & JCE_COMP_FLAG_POINT_LIGHT) ? JCE_COMP_FLAG_POINT_LIGHT
                                                               : JCE_COMP_FLAG_SPOT_LIGHT;
@@ -1114,32 +1099,12 @@ void jce_editor_panel_inspector_content(void)
             light_drawn = true;
             continue;
         }
-        if (!(flags & entry)) continue;
+        if (!jce_editor_component_slot_present(scene, ecs_e, flags, entry))
+            continue;
         draw_section_with_multi_broadcast(focused, sidecar, scene, ecs_e, entry);
     }
 
     apply_pending_reorder(focused, sidecar);
-
-    /* Compound Collider has no component-flag bit (the 64-bit flag space is
-     * fully allocated), so it is drawn as a standalone section keyed off a
-     * direct has-check instead of the flag-driven dispatcher above. */
-    if (jce_scene_has_compound_collider(scene, ecs_e)) {
-        ImGui::PushID("compound_collider_section");
-        ImGui::PushStyleColor(ImGuiCol_Header, jce_theme::inspector_header_color());
-        bool open = ImGui::CollapsingHeader(jce_editor_i18n("inspector.compcol.title"),
-                                            ImGuiTreeNodeFlags_DefaultOpen);
-        ImGui::PopStyleColor();
-        if (open) {
-            draw_comp_compound_collider(jce_scene_get_compound_collider(scene, ecs_e));
-            if (ImGui::Button(jce_editor_i18n("inspector.compcol.remove"))) {
-                jce_state_begin_batch_edit();
-                jce_scene_remove_compound_collider(scene, ecs_e);
-                jce_state_end_batch_edit();
-            }
-        }
-        ImGui::PopID();
-    }
-
 
     insp_add_component_button_and_popup(focused, flags);
 
@@ -1153,7 +1118,16 @@ void jce_editor_panel_inspector_content(void)
         s_pending_remove.pending   = false;
         s_pending_remove.entity_id = 0;
         s_pending_remove.flag      = 0;
-        jce_state_remove_component(eid, fl);
+        if (jce_editor_component_slot_is_compound_collider(fl)) {
+            JceEntity ce = jce_state_to_ecs_entity(eid);
+            if (scene && ce) {
+                jce_state_begin_batch_edit();
+                jce_scene_remove_compound_collider(scene, ce);
+                jce_state_end_batch_edit();
+            }
+        } else {
+            jce_state_remove_component(eid, fl);
+        }
     }
 }
 

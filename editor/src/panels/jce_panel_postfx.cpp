@@ -9,14 +9,16 @@
 #include "ui/jce_editor_colors.h"
 #include "ui/jce_theme_palette.h"
 #include "core/jce_editor_i18n.h"
+#include "core/jce_editor_scene_rendering_defaults.h"
+#include "core/jce_editor_state.h"
 #include "ui/jce_editor_panels.h"
 #include "scene/jce_editor_scene_render.h"
-#include "core/jce_project_settings.h"
 
 #include <jce/tools/jce_imgui.hpp>
 #include <cstdio>
 
 extern "C" {
+#include <jce/middleware/scene/jce_scene.h>
 #include <jce/renderer/jce_postfx.h>
 #include <jce/renderer/jce_scene_renderer.h>
 }
@@ -29,77 +31,67 @@ static JcePostFXPipeline *get_postfx(void)
     return sr ? jce_scene_renderer_get_postfx(sr) : NULL;
 }
 
-/* ── Panel state ──────────────────────────────────────────────────── */
+/* ── Scene-owned state bridge ─────────────────────────────────────── */
 
-static struct {
-    JcePostFXParams params;
-    bool            enabled[JCE_POSTFX_COUNT];
-    bool            initialized;
-} s_pfx;
-
-static void ensure_init(void)
+static JceSceneRenderingSettings *current_rendering_settings_mut(void)
 {
-    if (s_pfx.initialized) return;
-
-    /* Cache is pre-warmed by jce_editor_init; this is a pointer read, no disk I/O. */
-    const JceProjectSettings *ps = jce_project_settings_current();
-    if (ps) {
-        s_pfx.params.exposure            = ps->rendering.exposure;
-        s_pfx.params.gamma               = ps->rendering.gamma;
-        s_pfx.params.bloom_threshold     = ps->rendering.bloom_threshold;
-        s_pfx.params.bloom_intensity     = ps->rendering.bloom_intensity;
-        s_pfx.params.fxaa_span_max       = ps->rendering.fxaa_span_max;
-        s_pfx.params.vignette_intensity  = ps->rendering.vignette_intensity;
-        s_pfx.params.vignette_smoothness = ps->rendering.vignette_smoothness;
-        s_pfx.params.chromatic_strength  = ps->rendering.chromatic_strength;
-        for (int i = 0; i < JCE_POSTFX_COUNT; i++)
-            s_pfx.enabled[i] = (i < 6) ? ps->rendering.postfx_enabled[i] : false;
-    } else {
-        s_pfx.params = jce_postfx_default_params();
-        for (int i = 0; i < JCE_POSTFX_COUNT; i++)
-            s_pfx.enabled[i] = false;
-    }
-
-    /* Push the loaded values into the live pipeline. */
-    JcePostFXPipeline *pfx = get_postfx();
-    if (pfx) {
-        jce_postfx_set_params(pfx, &s_pfx.params);
-        for (int i = 0; i < JCE_POSTFX_COUNT; i++)
-            jce_postfx_enable(pfx, (JcePostFXType)i, s_pfx.enabled[i]);
-    }
-
-    s_pfx.initialized = true;
+    JceScene *scene = jce_state_get_scene();
+    if (!scene)
+        return NULL;
+    jce_editor_scene_ensure_rendering_settings(scene);
+    return jce_scene_get_rendering_settings_mut(scene);
 }
 
-static void sync_to_pipeline(void)
+static void params_from_settings(const JceSceneRenderingSettings *s,
+                                 JcePostFXParams *out)
+{
+    if (!out)
+        return;
+    *out = jce_postfx_default_params();
+    if (!s)
+        return;
+    out->exposure            = s->exposure;
+    out->gamma               = s->gamma;
+    out->bloom_threshold     = s->bloom_threshold;
+    out->bloom_intensity     = s->bloom_intensity;
+    out->fxaa_span_max       = s->fxaa_span_max;
+    out->vignette_intensity  = s->vignette_intensity;
+    out->vignette_smoothness = s->vignette_smoothness;
+    out->chromatic_strength  = s->chromatic_strength;
+}
+
+static void params_to_settings(JceSceneRenderingSettings *s,
+                               const JcePostFXParams *params)
+{
+    if (!s || !params)
+        return;
+    s->exposure            = params->exposure;
+    s->gamma               = params->gamma;
+    s->bloom_threshold     = params->bloom_threshold;
+    s->bloom_intensity     = params->bloom_intensity;
+    s->fxaa_span_max       = params->fxaa_span_max;
+    s->vignette_intensity  = params->vignette_intensity;
+    s->vignette_smoothness = params->vignette_smoothness;
+    s->chromatic_strength  = params->chromatic_strength;
+}
+
+static void sync_to_pipeline(const JceSceneRenderingSettings *settings)
 {
     JcePostFXPipeline *pfx = get_postfx();
     if (!pfx) return;
-    jce_postfx_set_params(pfx, &s_pfx.params);
-    for (int i = 0; i < JCE_POSTFX_COUNT; i++)
-        jce_postfx_enable(pfx, (JcePostFXType)i, s_pfx.enabled[i]);
 
-    /* Persist to project settings. Use the cached snapshot as base so we
-     * don't do a disk read on every slider drag. */
-    const JceProjectSettings *cur = jce_project_settings_current();
-    JceProjectSettings ps;
-    if (cur) ps = *cur; else jce_project_settings_defaults(&ps);
-    ps.rendering.exposure            = s_pfx.params.exposure;
-    ps.rendering.gamma               = s_pfx.params.gamma;
-    ps.rendering.bloom_threshold     = s_pfx.params.bloom_threshold;
-    ps.rendering.bloom_intensity     = s_pfx.params.bloom_intensity;
-    ps.rendering.fxaa_span_max       = s_pfx.params.fxaa_span_max;
-    ps.rendering.vignette_intensity  = s_pfx.params.vignette_intensity;
-    ps.rendering.vignette_smoothness = s_pfx.params.vignette_smoothness;
-    ps.rendering.chromatic_strength  = s_pfx.params.chromatic_strength;
-    for (int i = 0; i < JCE_POSTFX_COUNT; i++)
-        ps.rendering.postfx_enabled[i] = s_pfx.enabled[i];
-    jce_project_settings_save(&ps);
+    JcePostFXParams params;
+    params_from_settings(settings, &params);
+    jce_postfx_set_params(pfx, &params);
+    for (int i = 0; i < JCE_POSTFX_COUNT; i++) {
+        bool enabled = settings &&
+            i < JCE_SCENE_RENDERING_POSTFX_COUNT &&
+            settings->postfx_enabled[i];
+        jce_postfx_enable(pfx, (JcePostFXType)i, enabled);
+    }
 }
 
-/* Disable all postfx effects in the live pipeline without touching the
- * cached / persisted enabled flags. Used when the panel is closed so the
- * editor scene/game viewports immediately preview "no postfx". */
+/* Disable all PostFX effects only when there is no active scene to mirror. */
 static void disable_pipeline_only(void)
 {
     JcePostFXPipeline *pfx = get_postfx();
@@ -112,7 +104,15 @@ static void disable_pipeline_only(void)
 
 void jce_editor_panel_postfx_content(void)
 {
-    ensure_init();
+    JceSceneRenderingSettings *settings = current_rendering_settings_mut();
+    if (!settings) {
+        ImGui::TextDisabled("%s", jce_editor_i18n("common.noScene"));
+        return;
+    }
+
+    JcePostFXParams params;
+    params_from_settings(settings, &params);
+    bool *enabled = settings->postfx_enabled;
     char lbl[128];
 
     bool changed = false;
@@ -121,11 +121,11 @@ void jce_editor_panel_postfx_content(void)
     ImGui::PushStyleColor(ImGuiCol_Header, jce_theme::inspector_header_color());
     if (ImGui::CollapsingHeader(jce_editor_i18n("postfx.tonemapping"), ImGuiTreeNodeFlags_DefaultOpen)) {
         snprintf(lbl, sizeof(lbl), "%s##tonemap", jce_editor_i18n("postfx.enable"));
-        changed |= ImGui::Checkbox(lbl, &s_pfx.enabled[JCE_POSTFX_TONEMAP]);
-        ImGui::BeginDisabled(!s_pfx.enabled[JCE_POSTFX_TONEMAP]);
-        changed |= ImGui::DragFloat(jce_editor_i18n("postfx.exposure"), &s_pfx.params.exposure,
+        changed |= ImGui::Checkbox(lbl, &enabled[JCE_POSTFX_TONEMAP]);
+        ImGui::BeginDisabled(!enabled[JCE_POSTFX_TONEMAP]);
+        changed |= ImGui::DragFloat(jce_editor_i18n("postfx.exposure"), &params.exposure,
                                     0.01f, 0.0f, 10.0f);
-        changed |= ImGui::DragFloat(jce_editor_i18n("postfx.gamma"), &s_pfx.params.gamma,
+        changed |= ImGui::DragFloat(jce_editor_i18n("postfx.gamma"), &params.gamma,
                                     0.01f, 1.0f, 4.0f);
         ImGui::EndDisabled();
     }
@@ -135,12 +135,12 @@ void jce_editor_panel_postfx_content(void)
     ImGui::PushStyleColor(ImGuiCol_Header, jce_theme::inspector_header_color());
     if (ImGui::CollapsingHeader(jce_editor_i18n("postfx.bloom"), ImGuiTreeNodeFlags_DefaultOpen)) {
         snprintf(lbl, sizeof(lbl), "%s##bloom", jce_editor_i18n("postfx.enable"));
-        changed |= ImGui::Checkbox(lbl, &s_pfx.enabled[JCE_POSTFX_BLOOM]);
-        ImGui::BeginDisabled(!s_pfx.enabled[JCE_POSTFX_BLOOM]);
-        changed |= ImGui::DragFloat(jce_editor_i18n("postfx.threshold"), &s_pfx.params.bloom_threshold,
+        changed |= ImGui::Checkbox(lbl, &enabled[JCE_POSTFX_BLOOM]);
+        ImGui::BeginDisabled(!enabled[JCE_POSTFX_BLOOM]);
+        changed |= ImGui::DragFloat(jce_editor_i18n("postfx.threshold"), &params.bloom_threshold,
                                      0.01f, 0.0f, 5.0f);
         snprintf(lbl, sizeof(lbl), "%s##bloom", jce_editor_i18n("light.intensity"));
-        changed |= ImGui::DragFloat(lbl, &s_pfx.params.bloom_intensity,
+        changed |= ImGui::DragFloat(lbl, &params.bloom_intensity,
                                      0.01f, 0.0f, 5.0f);
         ImGui::EndDisabled();
     }
@@ -150,9 +150,9 @@ void jce_editor_panel_postfx_content(void)
     ImGui::PushStyleColor(ImGuiCol_Header, jce_theme::inspector_header_color());
     if (ImGui::CollapsingHeader(jce_editor_i18n("postfx.fxaa"), ImGuiTreeNodeFlags_DefaultOpen)) {
         snprintf(lbl, sizeof(lbl), "%s##fxaa", jce_editor_i18n("postfx.enable"));
-        changed |= ImGui::Checkbox(lbl, &s_pfx.enabled[JCE_POSTFX_FXAA]);
-        ImGui::BeginDisabled(!s_pfx.enabled[JCE_POSTFX_FXAA]);
-        changed |= ImGui::DragFloat(jce_editor_i18n("postfx.spanMax"), &s_pfx.params.fxaa_span_max,
+        changed |= ImGui::Checkbox(lbl, &enabled[JCE_POSTFX_FXAA]);
+        ImGui::BeginDisabled(!enabled[JCE_POSTFX_FXAA]);
+        changed |= ImGui::DragFloat(jce_editor_i18n("postfx.spanMax"), &params.fxaa_span_max,
                                      0.5f, 1.0f, 16.0f);
         ImGui::EndDisabled();
     }
@@ -162,12 +162,12 @@ void jce_editor_panel_postfx_content(void)
     ImGui::PushStyleColor(ImGuiCol_Header, jce_theme::inspector_header_color());
     if (ImGui::CollapsingHeader(jce_editor_i18n("postfx.vignette"))) {
         snprintf(lbl, sizeof(lbl), "%s##vignette", jce_editor_i18n("postfx.enable"));
-        changed |= ImGui::Checkbox(lbl, &s_pfx.enabled[JCE_POSTFX_VIGNETTE]);
-        ImGui::BeginDisabled(!s_pfx.enabled[JCE_POSTFX_VIGNETTE]);
+        changed |= ImGui::Checkbox(lbl, &enabled[JCE_POSTFX_VIGNETTE]);
+        ImGui::BeginDisabled(!enabled[JCE_POSTFX_VIGNETTE]);
         snprintf(lbl, sizeof(lbl), "%s##vig", jce_editor_i18n("light.intensity"));
-        changed |= ImGui::DragFloat(lbl, &s_pfx.params.vignette_intensity,
+        changed |= ImGui::DragFloat(lbl, &params.vignette_intensity,
                                      0.01f, 0.0f, 2.0f);
-        changed |= ImGui::DragFloat(jce_editor_i18n("postfx.smoothness"), &s_pfx.params.vignette_smoothness,
+        changed |= ImGui::DragFloat(jce_editor_i18n("postfx.smoothness"), &params.vignette_smoothness,
                                      0.01f, 0.1f, 5.0f);
         ImGui::EndDisabled();
     }
@@ -177,9 +177,9 @@ void jce_editor_panel_postfx_content(void)
     ImGui::PushStyleColor(ImGuiCol_Header, jce_theme::inspector_header_color());
     if (ImGui::CollapsingHeader(jce_editor_i18n("postfx.chromaticAberration"))) {
         snprintf(lbl, sizeof(lbl), "%s##chrom", jce_editor_i18n("postfx.enable"));
-        changed |= ImGui::Checkbox(lbl, &s_pfx.enabled[JCE_POSTFX_CHROMATIC]);
-        ImGui::BeginDisabled(!s_pfx.enabled[JCE_POSTFX_CHROMATIC]);
-        changed |= ImGui::DragFloat(jce_editor_i18n("postfx.strength"), &s_pfx.params.chromatic_strength,
+        changed |= ImGui::Checkbox(lbl, &enabled[JCE_POSTFX_CHROMATIC]);
+        ImGui::BeginDisabled(!enabled[JCE_POSTFX_CHROMATIC]);
+        changed |= ImGui::DragFloat(jce_editor_i18n("postfx.strength"), &params.chromatic_strength,
                                      0.001f, 0.0f, 0.1f, "%.4f");
         ImGui::EndDisabled();
     }
@@ -189,21 +189,35 @@ void jce_editor_panel_postfx_content(void)
     ImGui::PushStyleColor(ImGuiCol_Header, jce_theme::inspector_header_color());
     if (ImGui::CollapsingHeader(jce_editor_i18n("postfx.grayscale"))) {
         snprintf(lbl, sizeof(lbl), "%s##gray", jce_editor_i18n("postfx.enable"));
-        changed |= ImGui::Checkbox(lbl, &s_pfx.enabled[JCE_POSTFX_GRAYSCALE]);
+        changed |= ImGui::Checkbox(lbl, &enabled[JCE_POSTFX_GRAYSCALE]);
     }
     ImGui::PopStyleColor();
 
     /* Push changes to the engine pipeline. */
-    if (changed)
-        sync_to_pipeline();
+    if (changed) {
+        params_to_settings(settings, &params);
+        sync_to_pipeline(settings);
+        jce_state_mark_scene_modified();
+    }
 
     /* Reset button. */
     ImGui::Spacing();
     if (ImGui::Button(jce_editor_i18n("postfx.resetAll"))) {
-        s_pfx.params = jce_postfx_default_params();
-        for (int i = 0; i < JCE_POSTFX_COUNT; i++)
-            s_pfx.enabled[i] = false;
-        sync_to_pipeline();
+        JceSceneRenderingSettings defaults =
+            jce_scene_rendering_settings_default();
+        for (int i = 0; i < JCE_POSTFX_COUNT &&
+             i < JCE_SCENE_RENDERING_POSTFX_COUNT; i++)
+            settings->postfx_enabled[i] = defaults.postfx_enabled[i];
+        settings->exposure = defaults.exposure;
+        settings->gamma = defaults.gamma;
+        settings->bloom_threshold = defaults.bloom_threshold;
+        settings->bloom_intensity = defaults.bloom_intensity;
+        settings->fxaa_span_max = defaults.fxaa_span_max;
+        settings->vignette_intensity = defaults.vignette_intensity;
+        settings->vignette_smoothness = defaults.vignette_smoothness;
+        settings->chromatic_strength = defaults.chromatic_strength;
+        sync_to_pipeline(settings);
+        jce_state_mark_scene_modified();
     }
 }
 
@@ -211,17 +225,11 @@ void jce_editor_panel_postfx_content(void)
 
 void jce_editor_panel_postfx_tick(void)
 {
-    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_POSTFX);
-    static bool s_was_visible = false;
-    if (*vis != s_was_visible) {
-        if (*vis) {
-            ensure_init();
-            sync_to_pipeline();
-        } else {
-            disable_pipeline_only();
-        }
-        s_was_visible = *vis;
-    }
+    JceSceneRenderingSettings *settings = current_rendering_settings_mut();
+    if (settings)
+        sync_to_pipeline(settings);
+    else
+        disable_pipeline_only();
 }
 
 void jce_editor_panel_postfx(void)

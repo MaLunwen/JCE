@@ -208,9 +208,7 @@ bool insp_draw_multi_select_view(JceScene *scene)
             ImGui::SameLine();
             /* Frame camera on this entity. */
             if (ImGui::SmallButton(focus_lbl)) {
-                JceEntity e = jce_state_to_ecs_entity(id);
-                JceTransform *t = jce_scene_get_transform(scene, e);
-                if (t) jce_editor_scene_camera_set_target(t->position.x, t->position.y, t->position.z);
+                jce_editor_scene_camera_focus_entity(id);
                 to_focus = id;
             }
             ImGui::SameLine();

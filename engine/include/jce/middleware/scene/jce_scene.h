@@ -72,7 +72,7 @@ typedef struct {
 } JceCameraComponent;
 
 typedef struct {
-    jce_vec3 direction;
+    jce_vec3 direction;       /* local direction light travels */
     jce_vec3 color;
     float    intensity;
     bool     casts_shadow;
@@ -91,7 +91,7 @@ typedef struct {
 
 typedef struct {
     jce_vec3 position;
-    jce_vec3 direction;
+    jce_vec3 direction;       /* local direction the spot points */
     jce_vec3 color;
     float    intensity;
     float    radius;
@@ -113,6 +113,55 @@ typedef struct {
     float exposure;
     bool  use_as_ibl;
 } JceSkyboxComponent;
+
+/* ── Scene rendering environment ────────────────────────────────── */
+
+#define JCE_SCENE_RENDERING_POSTFX_COUNT 6
+
+typedef enum {
+    JCE_SCENE_FOG_NONE   = 0,
+    JCE_SCENE_FOG_LINEAR = 1,
+    JCE_SCENE_FOG_EXP    = 2,
+    JCE_SCENE_FOG_EXP2   = 3,
+} JceSceneFogMode;
+
+typedef enum {
+    JCE_SCENE_SOFT_SHADOW_OFF = 0,
+    JCE_SCENE_SOFT_SHADOW_PCF = 1,
+    JCE_SCENE_SOFT_SHADOW_VSM = 2,
+} JceSceneSoftShadowMode;
+
+typedef struct {
+    uint32_t version;
+
+    float ambient_color[3];
+    float ambient_intensity;
+
+    bool  fog_enabled;
+    int   fog_mode;            /* JceSceneFogMode */
+    float fog_color[3];
+    float fog_density;
+    float fog_start;
+    float fog_end;
+    float fog_height_falloff;
+    float fog_height_origin;
+
+    float shadow_distance;
+    int   cascade_count;
+    float split_lambda;
+    int   shadow_resolution;   /* pixels: 512 / 1024 / 2048 / 4096 */
+    int   soft_shadow_mode;    /* JceSceneSoftShadowMode */
+
+    bool  postfx_enabled[JCE_SCENE_RENDERING_POSTFX_COUNT];
+    float exposure;
+    float gamma;
+    float bloom_threshold;
+    float bloom_intensity;
+    float fxaa_span_max;
+    float vignette_intensity;
+    float vignette_smoothness;
+    float chromatic_strength;
+} JceSceneRenderingSettings;
 
 /* ── Sprite renderer component ──────────────────────────────────── */
 
@@ -1076,6 +1125,21 @@ typedef struct JceScene JceScene;
 /* Create / destroy. */
 JCE_API JceScene *jce_scene_create(void);
 JCE_API void      jce_scene_destroy(JceScene *scene);
+
+/* Scene-level rendering environment. This data is serialized with the
+ * scene and is independent of editor panel visibility. Project settings
+ * may seed defaults, but authored scenes own their final values. */
+JCE_API JceSceneRenderingSettings
+                  jce_scene_rendering_settings_default(void);
+JCE_API bool      jce_scene_has_rendering_settings(const JceScene *scene);
+JCE_API void      jce_scene_set_rendering_settings(
+                      JceScene *scene,
+                      const JceSceneRenderingSettings *settings);
+JCE_API const JceSceneRenderingSettings *
+                  jce_scene_get_rendering_settings(const JceScene *scene);
+JCE_API JceSceneRenderingSettings *
+                  jce_scene_get_rendering_settings_mut(JceScene *scene);
+JCE_API void      jce_scene_clear_rendering_settings(JceScene *scene);
 
 /*
  * Clear all user entities from the scene without destroying the scene object.

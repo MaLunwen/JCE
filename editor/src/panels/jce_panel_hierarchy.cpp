@@ -7,6 +7,7 @@
  */
 
 #include "jce_panel_hierarchy_internal.h"
+#include "jce_panel_hierarchy_input.h"
 #include "ui/jce_editor_dnd.h"
 #include "core/jce_hotkeys.h"
 #include <cctype>
@@ -127,6 +128,8 @@ void jce_editor_panel_hierarchy_content(void)
     /* Keyboard shortcuts */
     if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
         uint32_t focused = jce_state_get_focused();
+        JceHotkeyChord consumed_chords[8];
+        int consumed_chord_count = 0;
 
         /* Paste is allowed regardless of focus (pastes under focused if
          * any, else at scene root). */
@@ -205,8 +208,13 @@ void jce_editor_panel_hierarchy_content(void)
                 else
                     jce_state_copy_entities(&focused, 1, true);
             }
-            if (jce_hotkey_pressed(JCE_HK_VIEW_FRAME_SELECTED))
+            if (jce_hotkey_pressed(JCE_HK_VIEW_FRAME_SELECTED)) {
+                if (consumed_chord_count < (int)(sizeof(consumed_chords) /
+                                                 sizeof(consumed_chords[0])))
+                    consumed_chords[consumed_chord_count++] =
+                        jce_hotkey_get(JCE_HK_VIEW_FRAME_SELECTED);
                 focus_entity_in_scene(focused);
+            }
         }
 
         /* Alpha-jump: press a letter/digit/symbol (no modifier) to select
@@ -238,6 +246,13 @@ void jce_editor_panel_hierarchy_content(void)
                 if (!typed && ImGui::IsKeyPressed(ImGuiKey_Period, false))         typed = '.';
                 if (!typed && ImGui::IsKeyPressed(ImGuiKey_KeypadDecimal, false))  typed = '.';
                 if (!typed && ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract, false)) typed = '-';
+
+                if (jce_hierarchy_alpha_jump_key_consumed(
+                        typed,
+                        consumed_chords,
+                        consumed_chord_count)) {
+                    typed = '\0';
+                }
 
                 if (typed) {
                     char lc = (char)tolower((unsigned char)typed);

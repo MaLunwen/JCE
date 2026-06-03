@@ -12,14 +12,11 @@
 
 #include <jce/resource/jce_bundle_pack.h>
 #include <jce/os/core/jce_filesystem.h>
-#include <jce/os/core/jce_str.h>
-#include <jce/os/core/jce_path.h>
-#include <jce/os/core/jce_timer.h>
+#include <jce/resource/jce_archive_cook.h>
 
 #include "os/core/jce_memory.h"
 
 #include <limits.h>
-#include <inttypes.h>
 #include <setjmp.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -28,14 +25,11 @@
 #include <string.h>
 #include <time.h>
 
-#include "resource/jce_pak_format.h"
 #include <jce/resource/jce_bundle_format.h>
 #include <jce/resource/jce_bundle_deps.h>
-#include <jce/resource/jce_archive_cook.h>
 
 #include <cjson/cJSON.h>
 #include <xxhash.h>
-#include <zstd.h>
 
 /* ================================================================== */
 /* Per-call context — lets static helpers reach the log/jmp without    */
@@ -122,6 +116,37 @@ static void die(const char *m)
     abort();
 }
 
+static char *pack_strdup(const char *s)
+{
+    if (!s) s = "";
+    size_t n = strlen(s) + 1;
+    char *out = (char *)JCE_MALLOC(n);
+    if (!out) die("oom");
+    memcpy(out, s, n);
+    return out;
+}
+
+static char *pack_cjson_print_owned(const cJSON *item, size_t *out_len,
+                                    bool unformatted)
+{
+    char *tmp = unformatted ? cJSON_PrintUnformatted(item) : cJSON_Print(item);
+    if (!tmp) {
+        if (out_len) *out_len = 0;
+        return NULL;
+    }
+
+    size_t n = strlen(tmp);
+    char *out = (char *)JCE_MALLOC(n + 1);
+    if (!out) {
+        cJSON_free(tmp);
+        die("oom");
+    }
+    memcpy(out, tmp, n + 1);
+    cJSON_free(tmp);
+    if (out_len) *out_len = n;
+    return out;
+}
+
 /* ================================================================== */
 /* Small dynamic vectors                                                */
 /* ================================================================== */
@@ -133,7 +158,7 @@ static void sv_push(StrVec *v, const char *s) {
         v->items = (char **)JCE_REALLOC(v->items, v->c * sizeof(char *));
         if (!v->items) die("oom");
     }
-    v->items[v->n++] = jce_strdup(s);
+    v->items[v->n++] = pack_strdup(s);
 }
 static void sv_free(StrVec *v) {
     for (size_t i = 0; i < v->n; ++i) JCE_FREE(v->items[i]);
@@ -145,16 +170,14 @@ static int sv_contains(const StrVec *v, const char *s) {
 }
 
 /* ================================================================== */
-/* External-asset map — virtualises absolute-path deps into a portable */
-/*  `_external/<8hex>_<basename>` vpath so a packed bundle is truly    */
-/*  self-contained (no drive letters / project-root leakage).          */
+/* External-asset map                                                   */
 /* ================================================================== */
 
 #define JCE_BUNDLE_EXTERNAL_PREFIX "_external/"
 
 typedef struct {
-    char *abs;    /* original on-disk path the user authored (absolute) */
-    char *vpath;  /* portable in-bundle vpath ("_external/<hash>_<base>") */
+    char *abs;
+    char *vpath;
 } ExternalEntry;
 
 typedef struct {
@@ -162,362 +185,271 @@ typedef struct {
     size_t         n, c;
 } ExternalMap;
 
-static void ext_free(ExternalMap *m) {
-    if (!m) return;
+static int pack_is_abs_path(const char *path)
+{
+    if (!path || !path[0])
+        return 0;
+    if ((path[0] >= 'A' && path[0] <= 'Z') ||
+        (path[0] >= 'a' && path[0] <= 'z')) {
+        if (path[1] == ':' && (path[2] == '/' || path[2] == '\\'))
+            return 1;
+    }
+    return path[0] == '/' || (path[0] == '\\' && path[1] == '\\');
+}
+
+static int ends_with_ci(const char *s, const char *suffix)
+{
+    if (!s || !suffix)
+        return 0;
+    size_t n = strlen(s);
+    size_t m = strlen(suffix);
+    if (n < m)
+        return 0;
+    s += n - m;
+    for (size_t i = 0; i < m; ++i) {
+        char a = s[i];
+        char b = suffix[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+        if (a != b)
+            return 0;
+    }
+    return 1;
+}
+
+static void ext_free(ExternalMap *m)
+{
+    if (!m)
+        return;
     for (size_t i = 0; i < m->n; ++i) {
         JCE_FREE(m->items[i].abs);
         JCE_FREE(m->items[i].vpath);
     }
     JCE_FREE(m->items);
-    m->items = NULL; m->n = m->c = 0;
+    m->items = NULL;
+    m->n = m->c = 0;
 }
 
-/* Follow the substitution chain: Phase 4 maps abs→vpath1; Phase 5 maps
- * vpath1→vpath2.  A single call must resolve the full chain so that
- * D:/foo.obj → _external/foo.obj → _external/foo.glb collapses to
- * _external/foo.glb in one shot.  Cap at 8 hops to prevent cycles. */
-static const char *ext_lookup_vpath(const ExternalMap *m, const char *abs) {
-    if (!m || !abs) return NULL;
-    const char *result = NULL;
-    const char *key = abs;
-    for (int hops = 0; hops < 8; ++hops) {
-        const char *next = NULL;
-        for (size_t i = 0; i < m->n; ++i) {
-            if (strcmp(m->items[i].abs, key) == 0) {
-                next = m->items[i].vpath;
-                break;
-            }
-        }
-        if (!next || next == result) break;
-        result = next;
-        key    = next; /* follow the chain */
+static const char *ext_lookup_vpath(const ExternalMap *m, const char *abs)
+{
+    if (!m || !abs)
+        return NULL;
+    for (size_t i = 0; i < m->n; ++i) {
+        if (strcmp(m->items[i].abs, abs) == 0)
+            return m->items[i].vpath;
     }
-    return result;
+    return NULL;
 }
 
-/* Reverse chain: given a final vpath (e.g. _external/foo.glb), walk
- * backwards through substitution entries until we reach a real on-disk
- * absolute path that read_file() can open.  Cap at 8 hops. */
-static const char *ext_lookup_abs(const ExternalMap *m, const char *vpath) {
-    if (!m || !vpath) return NULL;
-    const char *key = vpath;
-    for (int hops = 0; hops < 8; ++hops) {
-        const char *found = NULL;
-        for (size_t i = 0; i < m->n; ++i) {
-            if (strcmp(m->items[i].vpath, key) == 0) {
-                found = m->items[i].abs;
-                break;
-            }
-        }
-        if (!found) return NULL;
-        /* If `found` is itself a vpath key in the map, follow the chain. */
-        bool is_key = false;
-        for (size_t i = 0; i < m->n; ++i) {
-            if (strcmp(m->items[i].vpath, found) == 0) { is_key = true; break; }
-        }
-        if (!is_key) return found; /* terminal abs path */
-        key = found;
+static const char *ext_lookup_abs(const ExternalMap *m, const char *vpath)
+{
+    if (!m || !vpath)
+        return NULL;
+    for (size_t i = 0; i < m->n; ++i) {
+        if (strcmp(m->items[i].vpath, vpath) == 0)
+            return m->items[i].abs;
     }
-    return NULL; /* chain too long or circular */
+    return NULL;
 }
 
-/* Compose the portable vpath for an absolute path.  We hash the FULL
- * abspath (so cross-drive `tex.png` collisions become distinct), then
- * append the basename so a human eyeballing the PAK can still recognise
- * what it was.  Characters that JSON / VFS dislike are sanitised. */
-static char *ext_make_vpath(const char *abs) {
-    if (!abs || !*abs) return NULL;
+static char *ext_make_vpath(const char *abs)
+{
     const char *base = abs;
-    for (const char *p = abs; *p; ++p)
-        if (*p == '/' || *p == '\\') base = p + 1;
-    if (!*base) base = "file";
+    for (const char *p = abs; p && *p; ++p) {
+        if (*p == '/' || *p == '\\')
+            base = p + 1;
+    }
+    if (!base || !*base)
+        base = "file";
 
     uint64_t h = XXH3_64bits(abs, strlen(abs));
-    /* sizeof "_external/" + 8 hex + '_' + basename + NUL */
-    size_t blen = strlen(base);
-    size_t need = sizeof(JCE_BUNDLE_EXTERNAL_PREFIX) + 8 + 1 + blen + 1;
+    size_t need = sizeof(JCE_BUNDLE_EXTERNAL_PREFIX) + 8 + 1 +
+                  strlen(base) + 1;
     char *out = (char *)JCE_MALLOC(need);
-    if (!out) die("oom");
+    if (!out)
+        die("oom");
     snprintf(out, need, JCE_BUNDLE_EXTERNAL_PREFIX "%08x_%s",
              (unsigned)(h ^ (h >> 32)), base);
-    /* Sanitise: vpath uses '/' as separator only — strip any others. */
     for (char *p = out; *p; ++p) {
-        if (*p == '\\' || *p == ':') *p = '_';
+        if (*p == '\\' || *p == ':')
+            *p = '_';
     }
     return out;
 }
 
-/* Insert (abs -> vpath) into `m` if not already present.  Returns the
- * (possibly cached) vpath; caller must NOT free it. */
-static const char *ext_register(ExternalMap *m, const char *abs) {
-    const char *v = ext_lookup_vpath(m, abs);
-    if (v) return v;
+static const char *ext_register(ExternalMap *m, const char *abs)
+{
+    const char *vpath = ext_lookup_vpath(m, abs);
+    if (vpath)
+        return vpath;
     if (m->n == m->c) {
         m->c = m->c ? m->c * 2 : 16;
         m->items = (ExternalEntry *)JCE_REALLOC(m->items,
                                                 m->c * sizeof(ExternalEntry));
-        if (!m->items) die("oom");
+        if (!m->items)
+            die("oom");
     }
     ExternalEntry *e = &m->items[m->n++];
-    e->abs   = jce_strdup(abs);
+    e->abs = pack_strdup(abs);
     e->vpath = ext_make_vpath(abs);
-    if (!e->abs || !e->vpath) die("oom");
     return e->vpath;
 }
 
-/* Rewrite every JSON string in the tree rooted at `root` if its value
- * matches an external-mapped source path.  Iterative (heap-allocated
- * worklist) so deeply-nested scene JSONs cannot overflow the worker
- * thread's stack. */
-static void ext_rewrite_cjson(cJSON *root, const ExternalMap *m) {
-    if (!root || !m || m->n == 0) return;
-    cJSON **stack = NULL;
-    size_t  n = 0, c = 0;
-    #define PUSH(p) do { \
-        if (!(p)) break; \
-        if (n == c) { \
-            c = c ? c * 2 : 64; \
-            cJSON **g = (cJSON **)JCE_REALLOC(stack, c * sizeof(*g)); \
-            if (!g) { JCE_FREE(stack); return; } \
-            stack = g; \
-        } \
-        stack[n++] = (p); \
-    } while (0)
-    PUSH(root);
-    while (n > 0) {
-        cJSON *node = stack[--n];
-        if (cJSON_IsString(node) && node->valuestring) {
-            const char *vp = ext_lookup_vpath(m, node->valuestring);
-            if (vp) cJSON_SetValuestring(node, vp);
-        }
-        for (cJSON *child = node->child; child; child = child->next)
-            PUSH(child);
-    }
-    #undef PUSH
-    JCE_FREE(stack);
-}
-
-/* Replace every occurrence of any mapped absolute path in `src` with
- * its portable vpath.  Allocates a fresh JCE_MALLOC buffer; *out_size
- * receives the new byte count (no NUL).  Returns NULL on OOM.
- *
- * Used for OBJ / MTL text bodies — strncmp-based, so we match on the
- * exact char-for-char abspath the user authored.  Vpaths registered in
- * the map are always shorter than (or close to) the originals because
- * we strip drive letters, so the output buffer is sized as input * 2
- * for safety. */
 static uint8_t *ext_rewrite_text(const uint8_t *src, size_t src_sz,
-                                 const ExternalMap *m, size_t *out_size) {
-    if (!src) { if (out_size) *out_size = 0; return NULL; }
+                                 const ExternalMap *m, size_t *out_size)
+{
+    if (!src) {
+        if (out_size) *out_size = 0;
+        return NULL;
+    }
     if (!m || m->n == 0) {
         uint8_t *copy = (uint8_t *)JCE_MALLOC(src_sz ? src_sz : 1);
-        if (!copy) return NULL;
-        if (src_sz) memcpy(copy, src, src_sz);
+        if (!copy)
+            die("oom");
+        if (src_sz)
+            memcpy(copy, src, src_sz);
         if (out_size) *out_size = src_sz;
         return copy;
     }
-    /* Worst-case: every byte expands into the longest vpath we have. */
-    size_t max_vp = 0;
-    for (size_t i = 0; i < m->n; ++i) {
-        size_t vl = strlen(m->items[i].vpath);
-        if (vl > max_vp) max_vp = vl;
-    }
-    size_t cap = src_sz + 1 + (max_vp + 16) * m->n;
-    uint8_t *out = (uint8_t *)JCE_MALLOC(cap);
-    if (!out) return NULL;
-    size_t op = 0;
+
+    size_t cap = src_sz + 1;
+    for (size_t i = 0; i < m->n; ++i)
+        cap += strlen(m->items[i].vpath) + 16;
+
+    uint8_t *out = (uint8_t *)JCE_MALLOC(cap ? cap : 1);
+    if (!out)
+        die("oom");
+
     size_t ip = 0;
+    size_t op = 0;
     while (ip < src_sz) {
-        bool matched = false;
+        int matched = 0;
         for (size_t i = 0; i < m->n; ++i) {
             const char *abs = m->items[i].abs;
-            size_t alen     = strlen(abs);
-            if (alen == 0 || ip + alen > src_sz) continue;
-            if (memcmp(src + ip, abs, alen) != 0) continue;
+            size_t alen = strlen(abs);
+            if (alen == 0 || ip + alen > src_sz)
+                continue;
+            if (memcmp(src + ip, abs, alen) != 0)
+                continue;
+
             const char *vp = m->items[i].vpath;
-            size_t vlen    = strlen(vp);
-            if (op + vlen >= cap) {
+            size_t vlen = strlen(vp);
+            if (op + vlen > cap) {
                 cap = (op + vlen + 1) * 2;
                 uint8_t *grow = (uint8_t *)JCE_REALLOC(out, cap);
-                if (!grow) { JCE_FREE(out); return NULL; }
+                if (!grow) {
+                    JCE_FREE(out);
+                    die("oom");
+                }
                 out = grow;
             }
             memcpy(out + op, vp, vlen);
             op += vlen;
             ip += alen;
-            matched = true;
+            matched = 1;
             break;
         }
-        if (!matched) out[op++] = src[ip++];
+        if (!matched)
+            out[op++] = src[ip++];
     }
+
     if (out_size) *out_size = op;
     return out;
 }
 
-/* Convenience: rewrite a JSON text buffer by parsing → walking →
- * re-serialising.  Falls back to the textual replacer on parse failure
- * so we never silently ship un-rewritten content. */
+static void ext_rewrite_cjson(cJSON *root, const ExternalMap *m)
+{
+    if (!root || !m || m->n == 0)
+        return;
+
+    cJSON **stack = NULL;
+    size_t n = 0;
+    size_t c = 0;
+#define PUSH_NODE(NODE) do {                                                   \
+        cJSON *_node = (NODE);                                                 \
+        if (!_node) break;                                                     \
+        if (n == c) {                                                          \
+            c = c ? c * 2 : 64;                                                \
+            cJSON **grow = (cJSON **)JCE_REALLOC(stack, c * sizeof(*stack));   \
+            if (!grow) { JCE_FREE(stack); return; }                            \
+            stack = grow;                                                      \
+        }                                                                      \
+        stack[n++] = _node;                                                    \
+    } while (0)
+
+    PUSH_NODE(root);
+    while (n > 0) {
+        cJSON *node = stack[--n];
+        if (cJSON_IsString(node) && node->valuestring) {
+            const char *vp = ext_lookup_vpath(m, node->valuestring);
+            if (vp)
+                cJSON_SetValuestring(node, vp);
+        }
+        for (cJSON *child = node->child; child; child = child->next)
+            PUSH_NODE(child);
+    }
+
+#undef PUSH_NODE
+    JCE_FREE(stack);
+}
+
 static uint8_t *ext_rewrite_json(const uint8_t *src, size_t src_sz,
-                                 const ExternalMap *m, size_t *out_size) {
+                                 const ExternalMap *m, size_t *out_size)
+{
     if (!src || !m || m->n == 0)
         return ext_rewrite_text(src, src_sz, m, out_size);
-    cJSON *j = cJSON_ParseWithLength((const char *)src, src_sz);
-    if (!j) return ext_rewrite_text(src, src_sz, m, out_size);
-    ext_rewrite_cjson(j, m);
-    char *txt = cJSON_PrintUnformatted(j);
-    cJSON_Delete(j);
-    if (!txt) return ext_rewrite_text(src, src_sz, m, out_size);
-    size_t tlen = strlen(txt);
-    uint8_t *out = (uint8_t *)JCE_MALLOC(tlen ? tlen : 1);
-    if (!out) { cJSON_free(txt); return NULL; }
-    memcpy(out, txt, tlen);
-    cJSON_free(txt);
-    if (out_size) *out_size = tlen;
-    return out;
+
+    cJSON *root = cJSON_ParseWithLength((const char *)src, src_sz);
+    if (!root)
+        return ext_rewrite_text(src, src_sz, m, out_size);
+
+    ext_rewrite_cjson(root, m);
+    size_t len = 0;
+    char *txt = pack_cjson_print_owned(root, &len, true);
+    cJSON_Delete(root);
+    if (!txt)
+        return ext_rewrite_text(src, src_sz, m, out_size);
+
+    if (out_size) *out_size = len;
+    return (uint8_t *)txt;
 }
 
-/* Dispatch by vpath extension: JSON-like (.json / .scene.json / .gltf /
- * .mat.json / etc.) goes through cJSON; OBJ / MTL go through the
- * line-safe textual replacer; anything else is copied verbatim. */
-static uint8_t *ext_rewrite_asset(const char *vpath,
-                                  uint8_t *raw, size_t raw_sz,
-                                  const ExternalMap *m,
+static uint8_t *ext_rewrite_asset(const char *vpath, uint8_t *raw,
+                                  size_t raw_size, const ExternalMap *m,
                                   size_t *out_size)
 {
-    if (!raw) { if (out_size) *out_size = 0; return NULL; }
-    if (!m || m->n == 0) { if (out_size) *out_size = raw_sz; return raw; }
-    size_t vn = vpath ? strlen(vpath) : 0;
-    bool is_json = (vn >= 5 && jce_strcasecmp(vpath + vn - 5, ".json") == 0) ||
-                   (vn >= 5 && jce_strcasecmp(vpath + vn - 5, ".gltf") == 0) ||
-                   (vn >= 6 && jce_strcasecmp(vpath + vn - 6, ".scene") == 0);
-    bool is_obj  = (vn >= 4 && jce_strcasecmp(vpath + vn - 4, ".obj")  == 0);
-    bool is_mtl  = (vn >= 4 && jce_strcasecmp(vpath + vn - 4, ".mtl")  == 0);
-    if (!is_json && !is_obj && !is_mtl) {
-        if (out_size) *out_size = raw_sz;
+    if (!raw) {
+        if (out_size) *out_size = 0;
+        return NULL;
+    }
+    if (!m || m->n == 0) {
+        if (out_size) *out_size = raw_size;
         return raw;
     }
-    size_t nsz = 0;
-    uint8_t *rew = is_json ? ext_rewrite_json(raw, raw_sz, m, &nsz)
-                           : ext_rewrite_text(raw, raw_sz, m, &nsz);
-    if (!rew) { if (out_size) *out_size = raw_sz; return raw; }
+
+    if (!ends_with_ci(vpath, ".json") &&
+        !ends_with_ci(vpath, ".gltf") &&
+        !ends_with_ci(vpath, ".scene") &&
+        !ends_with_ci(vpath, ".obj") &&
+        !ends_with_ci(vpath, ".mtl")) {
+        if (out_size) *out_size = raw_size;
+        return raw;
+    }
+
+    size_t new_size = 0;
+    uint8_t *rewritten =
+        (ends_with_ci(vpath, ".json") || ends_with_ci(vpath, ".gltf") ||
+         ends_with_ci(vpath, ".scene"))
+            ? ext_rewrite_json(raw, raw_size, m, &new_size)
+            : ext_rewrite_text(raw, raw_size, m, &new_size);
+    if (!rewritten) {
+        if (out_size) *out_size = raw_size;
+        return raw;
+    }
+
     JCE_FREE(raw);
-    if (out_size) *out_size = nsz;
-    return rew;
-}
-
-/* ================================================================== */
-/* Phase 5 — Bundle-time mesh-to-glb conversion                        */
-/*                                                                     */
-/* Non-glTF source meshes (.obj, .fbx, .dae, .3ds, .ply, .stl, ...)    */
-/* are coerced into binary glTF (.glb) at pack time so the runtime     */
-/* only needs cgltf.  Conversion runs from inside this packer TU via   */
-/* `jce_bundle_convert_to_glb` (an Assimp-backed C ABI exposed by      */
-/* `jce_bundle_mesh_convert.cpp`).                                     */
-/* ================================================================== */
-
-extern int jce_bundle_convert_to_glb(const uint8_t *src, size_t src_sz,
-                                     const char *ext_hint,
-                                     uint8_t **out_buf, size_t *out_size);
-
-typedef struct {
-    char *final_vpath; /* what the bundle ships (".glb") */
-    char *src_vpath;   /* what to read_asset() for source bytes */
-    char *src_ext;     /* format hint for Assimp ("obj", "fbx", ...) */
-} MeshEntry;
-
-typedef struct {
-    MeshEntry *items;
-    size_t     n, c;
-} MeshMap;
-
-static void mesh_free(MeshMap *m) {
-    if (!m) return;
-    for (size_t i = 0; i < m->n; ++i) {
-        JCE_FREE(m->items[i].final_vpath);
-        JCE_FREE(m->items[i].src_vpath);
-        JCE_FREE(m->items[i].src_ext);
-    }
-    JCE_FREE(m->items);
-    m->items = NULL; m->n = m->c = 0;
-}
-
-static const MeshEntry *mesh_lookup(const MeshMap *m, const char *final_vp) {
-    if (!m || !final_vp) return NULL;
-    for (size_t i = 0; i < m->n; ++i)
-        if (strcmp(m->items[i].final_vpath, final_vp) == 0)
-            return &m->items[i];
-    return NULL;
-}
-
-static void mesh_register(MeshMap *m, const char *final_vp,
-                          const char *src_vp, const char *src_ext) {
-    if (!m || !final_vp || !src_vp) return;
-    if (mesh_lookup(m, final_vp)) return;
-    if (m->n == m->c) {
-        m->c = m->c ? m->c * 2 : 16;
-        m->items = (MeshEntry *)JCE_REALLOC(m->items,
-                                            m->c * sizeof(MeshEntry));
-        if (!m->items) die("oom");
-    }
-    MeshEntry *e = &m->items[m->n++];
-    e->final_vpath = jce_strdup(final_vp);
-    e->src_vpath   = jce_strdup(src_vp);
-    e->src_ext     = src_ext ? jce_strdup(src_ext) : NULL;
-    if (!e->final_vpath || !e->src_vpath) die("oom");
-}
-
-/* Returns the Assimp format hint string ("obj", "fbx", ...) if this
- * vpath has a supported source-mesh extension, else NULL.  glTF and
- * GLB pass through (NULL) because no conversion is needed. */
-static const char *mesh_convertible_ext(const char *vpath) {
-    if (!vpath) return NULL;
-    const char *dot = strrchr(vpath, '.');
-    if (!dot) return NULL;
-    if (jce_strcasecmp(dot, ".obj")   == 0) return "obj";
-    if (jce_strcasecmp(dot, ".fbx")   == 0) return "fbx";
-    if (jce_strcasecmp(dot, ".dae")   == 0) return "dae";
-    if (jce_strcasecmp(dot, ".3ds")   == 0) return "3ds";
-    if (jce_strcasecmp(dot, ".ply")   == 0) return "ply";
-    if (jce_strcasecmp(dot, ".stl")   == 0) return "stl";
-    if (jce_strcasecmp(dot, ".blend") == 0) return "blend";
-    if (jce_strcasecmp(dot, ".x")     == 0) return "x";
-    return NULL;
-}
-
-/* Returns a fresh JCE_MALLOC'd copy of `vp` with its extension
- * replaced by ".glb".  Caller frees with JCE_FREE. */
-static char *mesh_dst_vpath(const char *vp) {
-    if (!vp) return NULL;
-    const char *dot = strrchr(vp, '.');
-    size_t stem_len = dot ? (size_t)(dot - vp) : strlen(vp);
-    size_t need = stem_len + 5; /* ".glb" + NUL */
-    char *out = (char *)JCE_MALLOC(need);
-    if (!out) die("oom");
-    memcpy(out, vp, stem_len);
-    memcpy(out + stem_len, ".glb", 5);
-    return out;
-}
-
-/* Generic substitution registration: teach the rewrite machinery that
- * any string-literal reference to `old_str` (in scene JSON / MTL /
- * glTF / etc.) should be replaced by `new_str`.  Re-uses the
- * ExternalMap storage because the rewrite helpers already key off
- * (items[i].abs -> items[i].vpath). */
-static void emap_register_substitution(ExternalMap *m,
-                                       const char *old_str,
-                                       const char *new_str) {
-    if (!m || !old_str || !new_str) return;
-    if (ext_lookup_vpath(m, old_str)) return;
-    if (m->n == m->c) {
-        m->c = m->c ? m->c * 2 : 16;
-        m->items = (ExternalEntry *)JCE_REALLOC(m->items,
-                                                m->c * sizeof(ExternalEntry));
-        if (!m->items) die("oom");
-    }
-    ExternalEntry *e = &m->items[m->n++];
-    e->abs   = jce_strdup(old_str);
-    e->vpath = jce_strdup(new_str);
-    if (!e->abs || !e->vpath) die("oom");
+    if (out_size) *out_size = new_size;
+    return rewritten;
 }
 
 /* ================================================================== */
@@ -555,14 +487,13 @@ static uint8_t *read_asset(const char *vpath, const char *resource_root,
     *out_size = 0;
     if (!vpath || !vpath[0]) return NULL;
 
-    /* External-map fast path: portable vpaths (`_external/<hash>_<base>`)
-     * are not really in any VFS — they exist only inside the bundle we
-     * are building.  Resolve to the on-disk source path so the binary
-     * content lands in the PAK under the portable vpath. */
     if (emap) {
         const char *abs = ext_lookup_abs(emap, vpath);
         if (abs) return read_file(abs, out_size);
     }
+
+    if (pack_is_abs_path(vpath))
+        return read_file(vpath, out_size);
 
     JceFileSystem *fs = jce_fs_get_active();
     if (fs) {
@@ -581,7 +512,7 @@ static uint8_t *read_asset(const char *vpath, const char *resource_root,
     }
     if (resource_root && resource_root[0]) {
         char path[1280];
-        jce_path_join(path, sizeof(path), resource_root, vpath);
+        snprintf(path, sizeof(path), "%s/%s", resource_root, vpath);
         uint8_t *buf = read_file(path, out_size);
         if (buf) return buf;
     }
@@ -593,29 +524,81 @@ static uint8_t *read_asset(const char *vpath, const char *resource_root,
     return NULL;
 }
 
+static int can_read_asset(const char *vpath, const char *resource_root,
+                          PackResolveFn resolve_fn, void *resolve_user,
+                          const ExternalMap *emap)
+{
+    size_t sz = 0;
+    uint8_t *raw = read_asset(vpath, resource_root, resolve_fn, resolve_user,
+                              emap, &sz);
+    if (!raw)
+        return 0;
+    JCE_FREE(raw);
+    return 1;
+}
+
 static int write_file(const char *path, const void *data, size_t size) {
     return jce_fs_host_write_all(path, data, (uint64_t)size) ? 1 : 0;
 }
 
 static void mkdir_p(const char *path) {
-    jce_fs_host_create_directory(path);
+    if (path && path[0])
+        jce_fs_host_create_directory(path);
 }
 
 static void normalise_sep(char *s) { for (; *s; ++s) if (*s == '\\') *s = '/'; }
 
-/* Recursive enumeration of *.scene.json under a directory.
-   Implemented on top of jce_fs_host_walk so no platform-specific
-   directory API leaks into resource layer. */
-static bool walk_scenes_cb(const char *path, bool is_dir, void *user) {
-    if (is_dir) return true;
-    size_t n = strlen(path);
-    if (n > 11 && strcmp(path + n - 11, ".scene.json") == 0)
+static int ends_with_lit(const char *s, const char *suffix)
+{
+    if (!s || !suffix)
+        return 0;
+    size_t n = strlen(s);
+    size_t m = strlen(suffix);
+    return n >= m && strcmp(s + n - m, suffix) == 0;
+}
+
+static size_t scene_suffix_len(const char *path)
+{
+    if (ends_with_lit(path, ".scene.json"))
+        return 11;
+    if (ends_with_lit(path, ".scene"))
+        return 6;
+    return 0;
+}
+
+static int is_scene_file_path(const char *path)
+{
+    return scene_suffix_len(path) != 0;
+}
+
+static void strip_scene_suffix(char *path)
+{
+    size_t ext = scene_suffix_len(path);
+    if (ext)
+        path[strlen(path) - ext] = '\0';
+}
+
+/* Recursive enumeration of .scene / .scene.json under a directory. */
+static bool walk_scenes_cb(const char *path, bool is_dir, void *user)
+{
+    if (is_dir || !path || !user)
+        return true;
+
+    const char *leaf = path;
+    for (const char *p = path; *p; ++p)
+        if (*p == '/' || *p == '\\') leaf = p + 1;
+    if (leaf[0] == '.')
+        return true;
+
+    if (is_scene_file_path(leaf))
         sv_push((StrVec *)user, path);
     return true;
 }
 
-static void walk_scenes(const char *dir, StrVec *out) {
-    jce_fs_host_walk(dir, walk_scenes_cb, out);
+static void walk_scenes(const char *dir, StrVec *out)
+{
+    if (dir && out)
+        jce_fs_host_walk(dir, walk_scenes_cb, out);
 }
 
 /* ================================================================== */
@@ -645,7 +628,7 @@ static AssetRef *am_get_or_create(AssetMap *m, const char *asset) {
     }
     AssetRef *n = &m->items[m->n++];
     memset(n, 0, sizeof(*n));
-    n->asset = jce_strdup(asset);
+    n->asset = pack_strdup(asset);
     return n;
 }
 static void am_free(AssetMap *m) {
@@ -661,7 +644,7 @@ typedef struct {
     char  *id;
     char  *kind;
     char  *scene_path;     /* vpath inside the bundle (where the engine loads it) */
-    char  *scene_src_path; /* absolute host path of the .scene.json (NULL for shared) */
+    char  *scene_src_path; /* absolute host path of the scene file (NULL for shared) */
     StrVec assets;
     StrVec deps;
 } Bundle;
@@ -681,8 +664,8 @@ static Bundle *bv_create(BundleVec *v, const char *id, const char *kind) {
     }
     Bundle *b = &v->items[v->n++];
     memset(b, 0, sizeof(*b));
-    b->id = jce_strdup(id);
-    b->kind = jce_strdup(kind);
+    b->id = pack_strdup(id);
+    b->kind = pack_strdup(kind);
     return b;
 }
 static void bv_free(BundleVec *v) {
@@ -713,11 +696,12 @@ static void bundle_add_dep(Bundle *b, const char *dep) {
  *
  * Common case (project / selected-scenes-under-scenes_dir): the path
  * starts with `scenes_dir`, so we strip that prefix and the trailing
- * `.scene.json`, then replace path separators with `_`.
+ * scene suffix (`.scene` or `.scene.json`), then replace path
+ * separators with `_`.
  *
  * Standalone case: when the scene lives OUTSIDE `scenes_dir` (selected
  * scenes / single-scene mode with a floating file), we fall back to
- * the basename minus `.scene.json` and append an 8-hex collision tag
+ * the basename minus its scene suffix and append an 8-hex collision tag
  * derived from the full path so two files with the same basename in
  * different directories cannot clobber each other in the catalog. */
 static char *make_scene_id(const char *full_path, const char *scenes_dir) {
@@ -727,11 +711,9 @@ static char *make_scene_id(const char *full_path, const char *scenes_dir) {
     if (inside) {
         const char *rel = full_path + blen;
         while (*rel == '/' || *rel == '\\') ++rel;
-        char *out = jce_strdup(rel);
+        char *out = pack_strdup(rel);
         if (!out) die("oom");
-        size_t n = strlen(out);
-        if (n > 11 && strcmp(out + n - 11, ".scene.json") == 0) out[n - 11] = '\0';
-        else if (n > 6 && strcmp(out + n - 6, ".scene") == 0)   out[n -  6] = '\0';
+        strip_scene_suffix(out);
         for (char *p = out; *p; ++p) {
             if (*p == '\\' || *p == '/') *p = '_';
         }
@@ -743,9 +725,8 @@ static char *make_scene_id(const char *full_path, const char *scenes_dir) {
     for (const char *p = full_path; *p; ++p)
         if (*p == '/' || *p == '\\') base = p + 1;
     size_t bn = strlen(base);
-    size_t stem = bn;
-    if (bn > 11 && strcmp(base + bn - 11, ".scene.json") == 0) stem = bn - 11;
-    else if (bn > 6 && strcmp(base + bn - 6, ".scene") == 0)   stem = bn -  6;
+    size_t ext = scene_suffix_len(base);
+    size_t stem = ext ? bn - ext : bn;
     uint64_t h = XXH3_64bits(full_path, strlen(full_path));
     char *out = (char *)JCE_MALLOC(stem + 1 /* '.' */ + 8 + 1);
     if (!out) die("oom");
@@ -768,7 +749,7 @@ static char *make_scene_vpath(const char *full_path, const char *resource_root) 
     if (blen > 0 && strncmp(full_path, resource_root, blen) == 0) {
         const char *rel = full_path + blen;
         while (*rel == '/' || *rel == '\\') ++rel;
-        char *out = jce_strdup(rel);
+        char *out = pack_strdup(rel);
         if (!out) die("oom");
         normalise_sep(out);
         return out;
@@ -776,60 +757,57 @@ static char *make_scene_vpath(const char *full_path, const char *resource_root) 
     const char *base = full_path;
     for (const char *p = full_path; *p; ++p)
         if (*p == '/' || *p == '\\') base = p + 1;
-    char *out = jce_strdup(base);
+    char *out = pack_strdup(base);
     if (!out) die("oom");
     normalise_sep(out);
     return out;
 }
 
 /* ================================================================== */
-/* JPAK v1 bundle builder                                              */
+/* JPAK v1 builder                                                      */
 /* ================================================================== */
 
 typedef struct {
     char    *vpath;
     uint8_t *raw;
     size_t   raw_size;
-    uint8_t *compressed;
-    size_t   compressed_size;
-    uint64_t path_hash;
     uint64_t content_hash;
-    uint32_t flags;
 } PakEntry;
 
-/* Build the on-disk bundle container.  The bundle rides on the JPAK v1
- * archive format (spec) just like the engine paks; the cook routine
- * classifies entries, trains shared dictionaries and applies the
- * keep-if-helps guard.  Bundles are recognized at runtime by the
- * presence of the manifest entry (JCE_BUNDLE_MANIFEST_VPATH), not by a
- * header flag, so no bundle-specific capability bit is needed. */
 static uint8_t *build_jbundle(PakEntry *entries, size_t count, int zstd_level,
-                              size_t *out_size) {
-    JceCookInput *inputs =
-        (JceCookInput *)JCE_MALLOC((count ? count : 1) * sizeof(JceCookInput));
-    if (!inputs) die("oom");
+                              size_t *out_size)
+{
+    JceCookInput *inputs = (JceCookInput *)JCE_MALLOC(
+        sizeof(JceCookInput) * (count ? count : 1));
+    if (!inputs)
+        die("oom");
     for (size_t i = 0; i < count; ++i) {
-        entries[i].content_hash = XXH3_64bits(entries[i].raw, entries[i].raw_size);
-        inputs[i].vpath = entries[i].vpath;
-        inputs[i].data  = entries[i].raw;
-        inputs[i].size  = entries[i].raw_size;
+        PakEntry *e = &entries[i];
+        e->content_hash = XXH3_64bits(e->raw, e->raw_size);
+        inputs[i].vpath = e->vpath;
+        inputs[i].data  = e->raw;
+        inputs[i].size  = e->raw_size;
     }
 
-    JceCookConfig cfg = {0};
+    JceCookConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
     cfg.zstd_level       = zstd_level;
-    cfg.alignment_log2   = 4;
-    cfg.mmap_friendly    = false;
     cfg.emit_debug_paths = true;
     cfg.compress_index   = true;
     cfg.use_dict         = true;
     cfg.dedup_content    = true;
 
-    void  *blob      = NULL;
+    void *blob = NULL;
     size_t blob_size = 0;
-    if (!jce_archive_cook(inputs, count, &cfg, &blob, &blob_size, NULL))
-        die("archive cook failed");
-    JCE_FREE(inputs);
+    uint16_t dict_count = 0;
+    if (!jce_archive_cook(inputs, count, &cfg, &blob, &blob_size,
+                          &dict_count)) {
+        JCE_FREE(inputs);
+        die("bundle archive cook failed");
+    }
 
+    (void)dict_count;
+    JCE_FREE(inputs);
     *out_size = blob_size;
     return (uint8_t *)blob;
 }
@@ -837,24 +815,6 @@ static uint8_t *build_jbundle(PakEntry *entries, size_t count, int zstd_level,
 /* ================================================================== */
 /* Manifest + catalog builders                                          */
 /* ================================================================== */
-
-/* cJSON_Print() allocates via cJSON's own hooks.  Callers in this TU
- * release the result with JCE_FREE (mimalloc), so without this round-
- * trip the post-build cleanup hits mimalloc with a foreign pointer and
- * corrupts the heap.  Copy into a JCE_MALLOC'd buffer and release the
- * original with cJSON_free so heap-of-origin stays consistent. */
-static char *cjson_to_jce_string(cJSON *root, size_t *out_len) {
-    char *s = cJSON_Print(root);
-    cJSON_Delete(root);
-    if (!s) { if (out_len) *out_len = 0; return NULL; }
-    size_t slen = strlen(s);
-    char *out = (char *)JCE_MALLOC(slen + 1);
-    if (!out) { cJSON_free(s); if (out_len) *out_len = 0; return NULL; }
-    memcpy(out, s, slen + 1);
-    cJSON_free(s);
-    if (out_len) *out_len = slen;
-    return out;
-}
 
 static char *hex16(uint64_t h) {
     char *r = (char *)JCE_MALLOC(17);
@@ -910,7 +870,11 @@ static char *build_manifest(const Bundle *b, const PakEntry *entries,
         JCE_FREE(eh);
         cJSON_AddItemToArray(assets, o);
     }
-    return cjson_to_jce_string(root, out_len);
+    char *s = pack_cjson_print_owned(root, out_len, false);
+    cJSON_Delete(root);
+    if (!s)
+        die("cJSON_Print manifest failed");
+    return s;
 }
 
 /* Per-asset record captured for the editor build report.  Kept on the
@@ -1002,7 +966,11 @@ static char *build_catalog_json(const CatalogVec *cat, uint32_t version,
         for (size_t j = 0; j < e->deps.n; ++j)
             cJSON_AddItemToArray(deps, cJSON_CreateString(e->deps.items[j]));
     }
-    return cjson_to_jce_string(root, out_len);
+    char *s = pack_cjson_print_owned(root, out_len, false);
+    cJSON_Delete(root);
+    if (!s)
+        die("cJSON_Print catalog failed");
+    return s;
 }
 
 static const char *prev_hash_lookup(const cJSON *prev_catalog, const char *id) {
@@ -1063,10 +1031,7 @@ static const char *report_guess_type(const char *path) {
         ext[n++] = c;
     }
     ext[n] = '\0';
-    size_t pl = strlen(path);
-    if (pl >= 11 && strcmp(path + pl - 11, ".scene.json") == 0)
-        return "scene";
-    if (pl >=  6 && strcmp(path + pl -  6, ".scene")      == 0)
+    if (is_scene_file_path(path))
         return "scene";
     if (strcmp(ext, "gltf") == 0 || strcmp(ext, "glb")  == 0 ||
         strcmp(ext, "fbx")  == 0 || strcmp(ext, "obj")  == 0 ||
@@ -1092,7 +1057,12 @@ static const char *report_guess_type(const char *path) {
 }
 
 static void iso8601_utc_now(char *buf, size_t n) {
-    jce_time_format_utc((int64_t)time(NULL), "%Y-%m-%dT%H:%M:%SZ", buf, n);
+    time_t t = time(NULL);
+    struct tm tm;
+    struct tm *utc = gmtime(&t);
+    if (utc) tm = *utc;
+    else memset(&tm, 0, sizeof(tm));
+    strftime(buf, n, "%Y-%m-%dT%H:%M:%SZ", &tm);
 }
 
 /* Build the build_report.json document.  Returns malloc'd string;
@@ -1176,7 +1146,9 @@ static char *build_report_json(const CatalogVec *cat, size_t *out_len) {
     cJSON_AddNumberToObject(totals, "unique_asset_count",
                             (double)unique_assets);
 
-    return cjson_to_jce_string(root, out_len);
+    char *s = pack_cjson_print_owned(root, out_len, false);
+    cJSON_Delete(root);
+    return s;
 }
 
 /* ================================================================== */
@@ -1250,8 +1222,9 @@ static int run_diff_impl(const char *old_path, const char *new_path,
         }
     }
 
-    char *out = cJSON_Print(diff);
-    int ok = write_file(out_path, out, strlen(out));
+    size_t out_len = 0;
+    char *out = pack_cjson_print_owned(diff, &out_len, false);
+    int ok = out ? write_file(out_path, out, out_len) : 0;
     JCE_FREE(out);
     cJSON_Delete(diff);
     cJSON_Delete(oj);
@@ -1462,10 +1435,7 @@ static int run_build_impl(const JceBundlePackOptions *opts)
         for (size_t i = 0; i < opts->scene_file_count; ++i) {
             const char *p = opts->scene_files[i];
             if (!p || !p[0]) continue;
-            size_t n = strlen(p);
-            int ok_json  = (n > 11 && strcmp(p + n - 11, ".scene.json") == 0);
-            int ok_scene = (n >  6 && strcmp(p + n -  6, ".scene")      == 0);
-            if (!ok_json && !ok_scene) {
+            if (!is_scene_file_path(p)) {
                 ERR("scene_files[%zu] does not end in .scene or .scene.json: %s",
                     i, p);
                 continue;
@@ -1502,7 +1472,7 @@ static int run_build_impl(const JceBundlePackOptions *opts)
         /* Single-file mode: caller-supplied bundle id takes precedence. */
         if (single_file && opts->single_bundle_id &&
             opts->single_bundle_id[0]) {
-            sid = jce_strdup(opts->single_bundle_id);
+            sid = pack_strdup(opts->single_bundle_id);
             if (!sid) die("oom");
         } else {
             sid = make_scene_id(scene_paths.items[i], scenes_dir);
@@ -1520,7 +1490,7 @@ static int run_build_impl(const JceBundlePackOptions *opts)
             AssetRef *r = am_get_or_create(&am, deps.items[k].path);
             if (!sv_contains(&r->refs, id_now)) sv_push(&r->refs, id_now);
             if (deps.items[k].bundle && !r->override)
-                r->override = jce_strdup(deps.items[k].bundle);
+                r->override = pack_strdup(deps.items[k].bundle);
         }
 
         /* Depth-1..N recursion: a scene's first-level deps are usually
@@ -1567,14 +1537,14 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                             deps.capacity = _nc;                             \
                         }                                                    \
                         JceBundleDep *_nd = &deps.items[deps.count++];       \
-                        _nd->path   = jce_strdup(_vp);                          \
+                        _nd->path   = pack_strdup(_vp);                      \
                         _nd->bundle = (BUNDLE_TAG)                           \
-                                      ? jce_strdup(BUNDLE_TAG) : NULL;          \
+                                      ? pack_strdup(BUNDLE_TAG) : NULL;      \
                         AssetRef *_r = am_get_or_create(&am, _vp);           \
                         if (!sv_contains(&_r->refs, id_now))                 \
                             sv_push(&_r->refs, id_now);                      \
                         if ((BUNDLE_TAG) && !_r->override)                   \
-                            _r->override = jce_strdup(BUNDLE_TAG);              \
+                            _r->override = pack_strdup(BUNDLE_TAG);          \
                         grew = true;                                         \
                     }                                                        \
                 } while (0)
@@ -1589,9 +1559,9 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                     size_t dn = strlen(dp);
                     if (dn < 4) continue;
 
-                    bool is_json = (dn >= 5 && jce_strcasecmp(dp + dn - 5, ".json") == 0);
-                    bool is_obj  = (dn >= 4 && jce_strcasecmp(dp + dn - 4, ".obj")  == 0);
-                    bool is_mtl  = (dn >= 4 && jce_strcasecmp(dp + dn - 4, ".mtl")  == 0);
+                    bool is_json = (dn >= 5 && _stricmp(dp + dn - 5, ".json") == 0);
+                    bool is_obj  = (dn >= 4 && _stricmp(dp + dn - 4, ".obj")  == 0);
+                    bool is_mtl  = (dn >= 4 && _stricmp(dp + dn - 4, ".mtl")  == 0);
                     if (!is_json && !is_obj && !is_mtl) continue;
 
                     size_t   child_sz  = 0;
@@ -1706,20 +1676,29 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                                     for (char *q = norm; *q; ++q)
                                         if (*q == '\\') *q = '/';
                                     char joined[1536];
-                                    if (norm[0] == '/' ||
-                                        (norm[1] == ':' && norm[2] == '/')) {
-                                        /* absolute */
-                                        snprintf(joined, sizeof(joined), "%s", norm);
-                                    } else if (base_dir[0]) {
+                                     if (norm[0] == '/' ||
+                                         (norm[1] == ':' && norm[2] == '/')) {
+                                         /* absolute */
+                                         snprintf(joined, sizeof(joined), "%s", norm);
+                                     } else if (base_dir[0]) {
                                         snprintf(joined, sizeof(joined),
                                                  "%s/%s", base_dir, norm);
-                                    } else {
-                                        snprintf(joined, sizeof(joined), "%s", norm);
-                                    }
-                                    PUSH_DEP_IF_NEW(joined, NULL);
-                                    *t = saved;
-                                }
-                            } else {
+                                     } else {
+                                         snprintf(joined, sizeof(joined), "%s", norm);
+                                     }
+                                     if (can_read_asset(joined, resource_root,
+                                                        opts->resolve_fn,
+                                                        opts->resolve_user,
+                                                        NULL)) {
+                                         PUSH_DEP_IF_NEW(joined, NULL);
+                                     } else {
+                                         pack_log_warn(
+                                             "optional OBJ material library missing: %s (referenced by %s)",
+                                             joined, dp);
+                                     }
+                                     *t = saved;
+                                 }
+                             } else {
                                 char norm[1280];
                                 snprintf(norm, sizeof(norm), "%s", last_tok);
                                 for (char *q = norm; *q; ++q)
@@ -1750,64 +1729,23 @@ static int run_build_impl(const JceBundlePackOptions *opts)
         jce_bundle_deps_free(&deps);
     }
 
-    /* ── External-asset virtualisation ────────────────────────────────
-     *
-     * After dep expansion, `am` may contain absolute on-disk paths
-     * (e.g. a texture the user dragged from `D:/photos/foo.png` into a
-     * material slot, or an OBJ at `E:/meshes/x.obj` whose `mtllib`
-     * resolved to `E:/meshes/x.mtl`).  Storing those as PAK vpaths
-     * would leak drive letters and absolute project layout into the
-     * bundle, breaking portability.
-     *
-     * We sweep `am` once: each absolute key is registered in the
-     * `emap` and renamed in-place to a portable
-     * `_external/<8hex>_<basename>` vpath.  All later passes
-     * (per-bundle assignment, hash, write, manifest) see only portable
-     * vpaths.  `read_asset()` consults `emap` to recover the source
-     * file when an `_external/` vpath needs its bytes read.
-     *
-     * Scene / OBJ / MTL / glTF descriptor bodies are textual and may
-     * still embed the original absolute strings — those get rewritten
-     * just before being emitted to the PAK (see `rewrite_*_external`
-     * below). */
     ExternalMap emap = {0};
     for (size_t i = 0; i < am.n; ++i) {
         AssetRef *r = &am.items[i];
-        if (!r->asset || !*r->asset) continue;
-        if (!jce_path_is_absolute(r->asset)) continue;
-        const char *vp = ext_register(&emap, r->asset);
-        if (!vp) continue;
-        if (strcmp(vp, r->asset) == 0) continue;
-        LOG("external asset virtualised: %s -> %s", r->asset, vp);
-        char *new_key = jce_strdup(vp);
-        if (!new_key) die("oom");
-        JCE_FREE(r->asset);
-        r->asset = new_key;
-    }
+        if (!r->asset || !pack_is_abs_path(r->asset))
+            continue;
 
-    /* ── Mesh-to-glb conversion sweep (Phase 5) ──────────────────────
-     *
-     * Any asset whose extension is a supported source-mesh format
-     * (.obj/.fbx/.dae/...) is renamed in-place to the same path with
-     * a `.glb` extension; the original vpath is recorded in `mcmap`
-     * (final → src) so the write loop knows to fetch the source bytes
-     * and run them through Assimp.  A substitution is also recorded
-     * in `emap` so any scene JSON / MTL / glTF reference to the old
-     * name gets transparently rewritten to the new `.glb` name. */
-    MeshMap mcmap = {0};
-    for (size_t i = 0; i < am.n; ++i) {
-        AssetRef *r = &am.items[i];
-        if (!r->asset || !*r->asset) continue;
-        const char *hint = mesh_convertible_ext(r->asset);
-        if (!hint) continue;
-        char *dst = mesh_dst_vpath(r->asset);
-        if (!dst) continue;
-        if (strcmp(dst, r->asset) == 0) { JCE_FREE(dst); continue; }
-        mesh_register(&mcmap, dst, r->asset, hint);
-        emap_register_substitution(&emap, r->asset, dst);
-        LOG("mesh converted (bundle-time): %s -> %s", r->asset, dst);
+        char abs[1280];
+        snprintf(abs, sizeof(abs), "%s", r->asset);
+        normalise_sep(abs);
+
+        const char *vp = ext_register(&emap, abs);
+        if (!vp)
+            continue;
+
+        LOG("external asset virtualised: %s -> %s", r->asset, vp);
         JCE_FREE(r->asset);
-        r->asset = dst; /* takes ownership */
+        r->asset = pack_strdup(vp);
     }
 
     BundleVec bundles = {0};
@@ -1816,7 +1754,7 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                               JCE_BUNDLE_KIND_SCENE);
         b->scene_path     = make_scene_vpath(scene_paths.items[i],
                                              resource_root);
-        b->scene_src_path = jce_strdup(scene_paths.items[i]);
+        b->scene_src_path = pack_strdup(scene_paths.items[i]);
         if (!b->scene_src_path) die("oom");
     }
 
@@ -1858,17 +1796,15 @@ static int run_build_impl(const JceBundlePackOptions *opts)
     CatalogVec catalog = {0};
     size_t total_bytes = 0;
     size_t reused_count = 0;
+    int had_errors = 0;
 
     for (size_t bi = 0; bi < bundles.n; ++bi) {
         Bundle *b = &bundles.items[bi];
         if (b->assets.n == 0 && !b->scene_path) continue;
+        int bundle_errors = 0;
 
         XXH3_state_t *xs = XXH3_createState();
         XXH3_64bits_reset(xs);
-        /* Packer pipeline version — bump when conversion logic changes so
-         * previously-cached bundles are unconditionally rebuilt. */
-        static const uint32_t PACKER_VERSION = 3; /* custom GLB writer */
-        XXH3_64bits_update(xs, &PACKER_VERSION, sizeof(PACKER_VERSION));
         if (b->scene_path)
             XXH3_64bits_update(xs, b->scene_path, strlen(b->scene_path));
         /* Fold scene file content into the hash so editing only the
@@ -1901,6 +1837,11 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                 uint64_t ch = XXH3_64bits(raw, sz);
                 XXH3_64bits_update(xs, &ch, sizeof(ch));
                 JCE_FREE(raw);
+            } else {
+                ERR("missing asset %s (referenced by bundle %s)",
+                    b->assets.items[i], b->id);
+                bundle_errors = 1;
+                had_errors = 1;
             }
         }
         uint64_t input_hash = XXH3_64bits_digest(xs);
@@ -1927,14 +1868,20 @@ static int run_build_impl(const JceBundlePackOptions *opts)
         JCE_FREE(short_h);
 
         char out_path[1280];
-        jce_path_join(out_path, sizeof(out_path), out_dir, fname);
+        snprintf(out_path, sizeof(out_path), "%s/%s", out_dir, fname);
         char sidecar_path[1280];
         snprintf(sidecar_path, sizeof(sidecar_path), "%s/%s.json",
                  out_dir, fname);
 
+        if (bundle_errors) {
+            (void)jce_fs_host_remove_file(out_path);
+            (void)jce_fs_host_remove_file(sidecar_path);
+            continue;
+        }
+
         if (prev_h && strcmp(prev_h, prev_h_str) == 0) {
             char src_path[1280];
-            jce_path_join(src_path, sizeof(src_path),
+            snprintf(src_path, sizeof(src_path), "%s/%s",
                      prev_dir, prev_f ? prev_f : fname);
             size_t sz = 0;
             uint8_t *blob = read_file(src_path, &sz);
@@ -1948,11 +1895,11 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                         write_file(sidecar_path, sblob, ssz);
                     }
                     CatalogEntry *ce = cv_create(&catalog);
-                    ce->id   = jce_strdup(b->id);
-                    ce->file = jce_strdup(fname);
-                    ce->kind = jce_strdup(b->kind);
-                    if (b->scene_path) ce->scene_path = jce_strdup(b->scene_path);
-                    ce->content_hash = jce_strdup(prev_h_str);
+                    ce->id   = pack_strdup(b->id);
+                    ce->file = pack_strdup(fname);
+                    ce->kind = pack_strdup(b->kind);
+                    if (b->scene_path) ce->scene_path = pack_strdup(b->scene_path);
+                    ce->content_hash = pack_strdup(prev_h_str);
                     ce->size = sz;
                     for (size_t d = 0; d < b->deps.n; ++d)
                         sv_push(&ce->deps, b->deps.items[d]);
@@ -1974,9 +1921,9 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                                     const cJSON *ah = cJSON_GetObjectItemCaseSensitive(ae, JCE_BUNDLE_KEY_ASSET_HASH);
                                     if (!(ap && cJSON_IsString(ap))) continue;
                                     ReportEntry *re = rv_create(&ce->entries);
-                                    re->path = jce_strdup(ap->valuestring);
+                                    re->path = pack_strdup(ap->valuestring);
                                     re->size = (az && cJSON_IsNumber(az)) ? (uint64_t)az->valuedouble : 0;
-                                    re->hash = (ah && cJSON_IsString(ah)) ? jce_strdup(ah->valuestring) : jce_strdup("");
+                                    re->hash = (ah && cJSON_IsString(ah)) ? pack_strdup(ah->valuestring) : pack_strdup("");
                                 }
                             }
                             cJSON_Delete(sj);
@@ -2011,11 +1958,13 @@ static int run_build_impl(const JceBundlePackOptions *opts)
             if (!sraw) {
                 ERR("cannot read scene source %s for bundle %s",
                     b->scene_src_path, b->id);
+                bundle_errors = 1;
+                had_errors = 1;
             } else {
-                size_t   rsz  = 0;
+                size_t rsz = 0;
                 uint8_t *rraw = ext_rewrite_asset(b->scene_path, sraw, ssz,
                                                   &emap, &rsz);
-                entries[actual].vpath    = jce_strdup(b->scene_path);
+                entries[actual].vpath    = pack_strdup(b->scene_path);
                 entries[actual].raw      = rraw ? rraw : sraw;
                 entries[actual].raw_size = rraw ? rsz : ssz;
                 actual++;
@@ -2023,104 +1972,45 @@ static int run_build_impl(const JceBundlePackOptions *opts)
         }
 
         for (size_t i = 0; i < b->assets.n; ++i) {
-            const char *final_vp = b->assets.items[i];
-            const MeshEntry *me = mesh_lookup(&mcmap, final_vp);
-
-            size_t   sz  = 0;
-            uint8_t *raw = NULL;
-            if (me) {
-                /* Read the SOURCE bytes (the .obj/.fbx/...) via the
-                 * normal resolver chain; emap will fast-path external
-                 * sources back to disk. */
-                raw = read_asset(me->src_vpath, resource_root,
-                                 opts->resolve_fn, opts->resolve_user,
-                                 &emap, &sz);
-            } else {
-                raw = read_asset(final_vp, resource_root,
-                                 opts->resolve_fn, opts->resolve_user,
-                                 &emap, &sz);
-            }
+            size_t sz = 0;
+            uint8_t *raw = read_asset(b->assets.items[i], resource_root,
+                                      opts->resolve_fn, opts->resolve_user,
+                                      &emap, &sz);
             if (!raw) {
                 ERR("missing asset %s (referenced by bundle %s)",
-                    final_vp, b->id);
+                    b->assets.items[i], b->id);
+                bundle_errors = 1;
+                had_errors = 1;
                 continue;
             }
-
-            if (me) {
-                /* Cache key — hash the SOURCE bytes (post-VFS, so an
-                 * identical .obj used by N projects shares one cache
-                 * entry).  Fold in the format hint so two formats with
-                 * the same byte fingerprint (theoretical) stay
-                 * distinct.  MESH_CONVERTER_VERSION must be bumped
-                 * whenever `jce_bundle_convert_to_glb` logic changes
-                 * (new writer, meshopt upgrade, etc.) so stale cached
-                 * GLBs are automatically discarded on the next pack. */
-                static const uint32_t MESH_CONVERTER_VERSION = 3; /* always cache-optimise indices */
-                uint64_t key = XXH3_64bits(raw, sz);
-                key ^= (uint64_t)MESH_CONVERTER_VERSION << 32;
-                if (me->src_ext && *me->src_ext) {
-                    key ^= XXH3_64bits(me->src_ext, strlen(me->src_ext));
-                }
-                char cache_dir [1400];
-                char cache_path[1536];
-                snprintf(cache_dir,  sizeof(cache_dir),  "%s/.mesh_cache",
-                         out_dir);
-                snprintf(cache_path, sizeof(cache_path),
-                         "%s/%016" PRIx64 ".glb", cache_dir, key);
-
-                uint8_t *glb_buf = NULL;
-                size_t   glb_sz  = 0;
-
-                /* Cache lookup. */
-                uint8_t *cached = read_file(cache_path, &glb_sz);
-                if (cached) {
-                    glb_buf = cached;
-                    LOG("mesh cache hit:  %s (%zu B) <- %s",
-                        final_vp, glb_sz, cache_path);
-                } else {
-                    if (!jce_bundle_convert_to_glb(raw, sz, me->src_ext,
-                                                   &glb_buf, &glb_sz)) {
-                        ERR("mesh conversion failed: %s (hint=%s) for bundle %s",
-                            me->src_vpath,
-                            me->src_ext ? me->src_ext : "auto",
-                            b->id);
-                        JCE_FREE(raw);
-                        continue;
-                    }
-                    mkdir_p(cache_dir);
-                    if (write_file(cache_path, glb_buf, glb_sz)) {
-                        LOG("mesh cache store: %s (%zu B) -> %s",
-                            final_vp, glb_sz, cache_path);
-                    }
-                }
-                JCE_FREE(raw);
-                raw = glb_buf;
-                sz  = glb_sz;
-                /* .glb is a binary container — DO NOT run the textual /
-                 * cJSON rewriter over it.  Any embedded references
-                 * Assimp generates were already against the (in-memory)
-                 * source and the runtime will resolve them from the
-                 * bundle's vpath table. */
-                entries[actual].vpath    = jce_strdup(final_vp);
-                entries[actual].raw      = raw;
-                entries[actual].raw_size = sz;
-                actual++;
-                continue;
-            }
-
-            size_t   rsz  = 0;
-            uint8_t *rraw = ext_rewrite_asset(final_vp, raw, sz,
+            size_t rsz = 0;
+            uint8_t *rraw = ext_rewrite_asset(b->assets.items[i], raw, sz,
                                               &emap, &rsz);
-            entries[actual].vpath    = jce_strdup(final_vp);
-            entries[actual].raw      = rraw;
-            entries[actual].raw_size = rsz;
+            entries[actual].vpath    = pack_strdup(b->assets.items[i]);
+            entries[actual].raw      = rraw ? rraw : raw;
+            entries[actual].raw_size = rraw ? rsz : sz;
             actual++;
         }
+
+        if (bundle_errors) {
+            for (size_t i = 0; i < actual; ++i) {
+                JCE_FREE(entries[i].vpath);
+                JCE_FREE(entries[i].raw);
+            }
+            JCE_FREE(entries);
+            (void)jce_fs_host_remove_file(out_path);
+            (void)jce_fs_host_remove_file(sidecar_path);
+            continue;
+        }
+
+        for (size_t i = 1; i < actual; ++i)
+            entries[i].content_hash = XXH3_64bits(entries[i].raw,
+                                                  entries[i].raw_size);
 
         size_t mlen = 0;
         char *mtext = build_manifest(b, entries + 1, actual - 1,
                                      input_hash, catalog_version, &mlen);
-        entries[manifest_slot].vpath    = jce_strdup(JCE_BUNDLE_MANIFEST_VPATH);
+        entries[manifest_slot].vpath    = pack_strdup(JCE_BUNDLE_MANIFEST_VPATH);
         entries[manifest_slot].raw      = (uint8_t *)mtext;
         entries[manifest_slot].raw_size = mlen;
 
@@ -2129,18 +2019,40 @@ static int run_build_impl(const JceBundlePackOptions *opts)
 
         if (!write_file(out_path, pak, pak_size)) {
             ERR("cannot write %s", out_path);
+            had_errors = 1;
+            (void)jce_fs_host_remove_file(out_path);
+            (void)jce_fs_host_remove_file(sidecar_path);
+            for (size_t i = 0; i < actual; ++i) {
+                JCE_FREE(entries[i].vpath);
+                JCE_FREE(entries[i].raw);
+            }
+            JCE_FREE(entries);
+            JCE_FREE(pak);
+            continue;
         } else {
             LOG("built %s (%zu B, %zu asset%s)", fname, pak_size,
                 actual - 1, (actual - 1) == 1 ? "" : "s");
         }
-        write_file(sidecar_path, mtext, mlen);
+        if (!write_file(sidecar_path, mtext, mlen)) {
+            ERR("cannot write %s", sidecar_path);
+            had_errors = 1;
+            (void)jce_fs_host_remove_file(out_path);
+            (void)jce_fs_host_remove_file(sidecar_path);
+            for (size_t i = 0; i < actual; ++i) {
+                JCE_FREE(entries[i].vpath);
+                JCE_FREE(entries[i].raw);
+            }
+            JCE_FREE(entries);
+            JCE_FREE(pak);
+            continue;
+        }
 
         CatalogEntry *ce = cv_create(&catalog);
-        ce->id   = jce_strdup(b->id);
-        ce->file = jce_strdup(fname);
-        ce->kind = jce_strdup(b->kind);
-        if (b->scene_path) ce->scene_path = jce_strdup(b->scene_path);
-        ce->content_hash = jce_strdup(prev_h_str);
+        ce->id   = pack_strdup(b->id);
+        ce->file = pack_strdup(fname);
+        ce->kind = pack_strdup(b->kind);
+        if (b->scene_path) ce->scene_path = pack_strdup(b->scene_path);
+        ce->content_hash = pack_strdup(prev_h_str);
         ce->size = pak_size;
         for (size_t d = 0; d < b->deps.n; ++d)
             sv_push(&ce->deps, b->deps.items[d]);
@@ -2151,7 +2063,7 @@ static int run_build_impl(const JceBundlePackOptions *opts)
             const PakEntry *pe = &entries[i];
             if (strcmp(pe->vpath, JCE_BUNDLE_MANIFEST_VPATH) == 0) continue;
             ReportEntry *re = rv_create(&ce->entries);
-            re->path = jce_strdup(pe->vpath);
+            re->path = pack_strdup(pe->vpath);
             re->size = (uint64_t)pe->raw_size;
             re->hash = hex16(pe->content_hash);
         }
@@ -2160,7 +2072,6 @@ static int run_build_impl(const JceBundlePackOptions *opts)
         for (size_t i = 0; i < actual; ++i) {
             JCE_FREE(entries[i].vpath);
             JCE_FREE(entries[i].raw);
-            JCE_FREE(entries[i].compressed);
         }
         JCE_FREE(entries);
         JCE_FREE(pak);
@@ -2182,7 +2093,7 @@ static int run_build_impl(const JceBundlePackOptions *opts)
         char *cat_json = build_catalog_json(&catalog, catalog_version,
                                             &cjson_len);
         char cat_path[1280];
-        jce_path_join(cat_path, sizeof(cat_path),
+        snprintf(cat_path, sizeof(cat_path), "%s/%s",
                  out_dir, JCE_BUNDLE_CATALOG_NAME);
         cat_ok = write_file(cat_path, cat_json, cjson_len);
         if (!cat_ok) {
@@ -2204,7 +2115,7 @@ static int run_build_impl(const JceBundlePackOptions *opts)
             char *rjson = build_report_json(&catalog, &rlen);
             if (rjson) {
                 char rpath[1280];
-                jce_path_join(rpath, sizeof(rpath),
+                snprintf(rpath, sizeof(rpath), "%s/%s",
                          out_dir, JCE_BUILD_REPORT_NAME);
                 if (write_file(rpath, rjson, rlen)) {
                     LOG("build report written: %s (%zu bundles)",
@@ -2223,9 +2134,8 @@ static int run_build_impl(const JceBundlePackOptions *opts)
     bv_free(&bundles);
     cv_free(&catalog);
     ext_free(&emap);
-    mesh_free(&mcmap);
     if (prev_catalog_j) cJSON_Delete(prev_catalog_j);
-    return cat_ok ? 0 : 1;
+    return (cat_ok && !had_errors) ? 0 : 1;
 }
 
 /* ================================================================== */

@@ -27,6 +27,7 @@
 #include "dialogs/jce_dialog_asset_picker.h"
 #include "core/jce_editor.h"
 #include "jce_editor_colors.h"
+#include "jce_editor_layout_scene_commands.h"
 #include "core/jce_editor_defaults.h"
 #include "core/jce_editor_i18n.h"
 #include "jce_editor_panels.h"
@@ -55,7 +56,6 @@ static bool s_demo_lod_enabled = false;
 static JceLodGroup s_demo_lod_group = {};
 static bool s_show_new_project = false;
 static bool s_show_open_project = false;
-static bool s_show_new_scene   = false;
 static bool s_show_open_scene  = false;
 static bool s_show_open_bundle = false;
 static bool s_show_save_as     = false;
@@ -85,7 +85,6 @@ static bool should_draw_dialog_dimmer(void)
 {
     return s_show_new_project
         || s_show_open_project
-        || s_show_new_scene
         || s_show_open_scene
         || s_show_save_as
         || s_show_unsaved
@@ -179,6 +178,11 @@ static void handle_global_edit_shortcuts(void)
     if (should_block_editor_interaction())
         return;
 
+    if (jce_hotkey_pressed(JCE_HK_FILE_NEW)) {
+        (void)jce_editor_layout_run_new_scene_command();
+        return;
+    }
+
     if (jce_hotkey_pressed(JCE_HK_EDIT_UNDO)) {
         if (jce_state_can_undo())
             jce_state_undo();
@@ -262,7 +266,7 @@ static bool  s_palette_focus_query = false;
 /* Action helpers -- thin wrappers around existing code paths. */
 static void cmd_undo_(void)              { if (jce_state_can_undo()) jce_state_undo(); }
 static void cmd_redo_(void)              { if (jce_state_can_redo()) jce_state_redo(); }
-static void cmd_new_scene_(void)         { s_show_new_scene = true; }
+static void cmd_new_scene_(void)         { (void)jce_editor_layout_run_new_scene_command(); }
 static void cmd_open_scene_(void)        { s_show_open_scene = true; }
 static void cmd_save_scene_(void)        { save_scene_or_open_save_as(); }
 static void cmd_save_scene_as_(void)     { s_show_save_as = true; }
@@ -610,7 +614,7 @@ static void draw_menu_bar(void)
     /* ── File ──────────────────────────────────────────────────────── */
     if (ImGui::BeginMenu(jce_editor_i18n("menu.file"))) {
         if (ImGui::MenuItem(jce_editor_i18n("menu.file.newScene"),    "Ctrl+N"))
-            s_show_new_scene = true;
+            (void)jce_editor_layout_run_new_scene_command();
         if (ImGui::MenuItem(jce_editor_i18n("menu.file.openScene"),   "Ctrl+O"))
             s_show_open_scene = true;
         /* Recent Scenes submenu — fed from JceEditorConfig.recent_scene_paths.
@@ -2434,7 +2438,6 @@ void jce_editor_layout_draw(void)
     jce_editor_dialog_new_project(&s_show_new_project);
     jce_editor_dialog_open_project(&s_show_open_project);
     jce_editor_dialog_welcome(&s_show_welcome);
-    jce_editor_dialog_new_scene(&s_show_new_scene);
     jce_editor_dialog_open_scene(&s_show_open_scene);
     jce_editor_dialog_open_bundle(&s_show_open_bundle);
     jce_editor_dialog_save_as(&s_show_save_as);

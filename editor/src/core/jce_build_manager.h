@@ -147,7 +147,7 @@ typedef struct {
     const char *project_dir;    /* required; absolute project root */
     const char *sdk_dir;        /* SDK root; <sdk>/lib/cmake/JCE must exist */
     const char *target;         /* CMake target (required) */
-    const char *exe_name;       /* expected artifact; default "<target>.exe" */
+    const char *exe_name;       /* expected artifact; Windows appends .exe */
     const char *variant;        /* "release"|"debug"|"dist"; default release */
     const char *arch;           /* "x86_64"|"i686"|"aarch64"; default host */
     const char *cooked_assets;  /* cooked dir rel to project (optional) */

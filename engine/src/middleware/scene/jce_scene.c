@@ -86,7 +86,133 @@ static ECS_COMPONENT_DECLARE(JceOcclusionPortalComponent);
 
 struct JceScene {
     ecs_world_t *world;
+    JceSceneRenderingSettings rendering_settings;
+    bool has_rendering_settings;
 };
+
+static void scene_rendering_settings_sanitize(JceSceneRenderingSettings *r)
+{
+    if (!r) return;
+
+    r->version = 1u;
+
+    if (r->ambient_intensity < 0.0f)
+        r->ambient_intensity = 0.0f;
+
+    if (!r->fog_enabled || r->fog_mode == JCE_SCENE_FOG_NONE) {
+        r->fog_enabled = false;
+        r->fog_mode = JCE_SCENE_FOG_NONE;
+    } else if (r->fog_mode < JCE_SCENE_FOG_LINEAR ||
+               r->fog_mode > JCE_SCENE_FOG_EXP2) {
+        r->fog_mode = JCE_SCENE_FOG_EXP;
+    }
+    if (r->fog_density < 0.0f)
+        r->fog_density = 0.0f;
+    if (r->fog_end < r->fog_start)
+        r->fog_end = r->fog_start;
+    if (r->fog_height_falloff < 0.0f)
+        r->fog_height_falloff = 0.0f;
+
+    if (r->shadow_distance < 0.0f)
+        r->shadow_distance = 0.0f;
+    if (r->cascade_count < 1)
+        r->cascade_count = 1;
+    if (r->cascade_count > 4)
+        r->cascade_count = 4;
+    if (r->split_lambda < 0.0f)
+        r->split_lambda = 0.0f;
+    if (r->split_lambda > 1.0f)
+        r->split_lambda = 1.0f;
+    if (r->shadow_resolution < 512)
+        r->shadow_resolution = 512;
+    if (r->shadow_resolution > 4096)
+        r->shadow_resolution = 4096;
+    if (r->soft_shadow_mode < JCE_SCENE_SOFT_SHADOW_OFF ||
+        r->soft_shadow_mode > JCE_SCENE_SOFT_SHADOW_VSM)
+        r->soft_shadow_mode = JCE_SCENE_SOFT_SHADOW_PCF;
+
+    if (r->exposure < 0.0f)
+        r->exposure = 0.0f;
+    if (r->gamma <= 0.0f)
+        r->gamma = 2.2f;
+}
+
+JceSceneRenderingSettings jce_scene_rendering_settings_default(void)
+{
+    JceSceneRenderingSettings r;
+    memset(&r, 0, sizeof(r));
+
+    r.version = 1u;
+    r.ambient_color[0] = 0.1f;
+    r.ambient_color[1] = 0.1f;
+    r.ambient_color[2] = 0.12f;
+    r.ambient_intensity = 1.0f;
+
+    r.fog_enabled = false;
+    r.fog_mode = JCE_SCENE_FOG_NONE;
+    r.fog_color[0] = 0.7f;
+    r.fog_color[1] = 0.75f;
+    r.fog_color[2] = 0.85f;
+    r.fog_density = 0.02f;
+    r.fog_start = 10.0f;
+    r.fog_end = 200.0f;
+    r.fog_height_falloff = 0.05f;
+    r.fog_height_origin = 0.0f;
+
+    r.shadow_distance = 100.0f;
+    r.cascade_count = 4;
+    r.split_lambda = 0.7f;
+    r.shadow_resolution = 2048;
+    r.soft_shadow_mode = JCE_SCENE_SOFT_SHADOW_PCF;
+
+    r.exposure = 1.0f;
+    r.gamma = 2.2f;
+    r.bloom_threshold = 1.0f;
+    r.bloom_intensity = 0.5f;
+    r.fxaa_span_max = 8.0f;
+    r.vignette_intensity = 0.3f;
+    r.vignette_smoothness = 2.0f;
+    r.chromatic_strength = 0.005f;
+    return r;
+}
+
+bool jce_scene_has_rendering_settings(const JceScene *s)
+{
+    return s && s->has_rendering_settings;
+}
+
+void jce_scene_set_rendering_settings(JceScene *s,
+                                      const JceSceneRenderingSettings *settings)
+{
+    if (!s || !settings) return;
+    s->rendering_settings = *settings;
+    scene_rendering_settings_sanitize(&s->rendering_settings);
+    s->has_rendering_settings = true;
+}
+
+const JceSceneRenderingSettings *jce_scene_get_rendering_settings(
+    const JceScene *s)
+{
+    if (!s || !s->has_rendering_settings) return NULL;
+    return &s->rendering_settings;
+}
+
+JceSceneRenderingSettings *jce_scene_get_rendering_settings_mut(JceScene *s)
+{
+    if (!s) return NULL;
+    if (!s->has_rendering_settings) {
+        s->rendering_settings = jce_scene_rendering_settings_default();
+        s->has_rendering_settings = true;
+    }
+    return &s->rendering_settings;
+}
+
+void jce_scene_clear_rendering_settings(JceScene *s)
+{
+    if (!s) return;
+    s->rendering_settings = jce_scene_rendering_settings_default();
+    s->has_rendering_settings = false;
+}
 
 /* ── Create / destroy ──────────────────────────────────────────────── */
 
@@ -98,7 +224,10 @@ JceScene *jce_scene_create(void)
     s->world = ecs_init();
     if (!s->world) {
         JCE_FREE(s);
+        return NULL;
     }
+    s->rendering_settings = jce_scene_rendering_settings_default();
+    s->has_rendering_settings = false;
 
     /* Register components. */
     ECS_COMPONENT_DEFINE(s->world, JceTransform);
@@ -244,6 +373,8 @@ int jce_scene_clear(JceScene *s)
     ecs_defer_end(s->world);
 
     if (ids != stack_buf) JCE_FREE(ids);
+
+    jce_scene_clear_rendering_settings(s);
 
     LOG_INFO(LOG_TAG, "scene cleared (%d entities)", count);
     JCE_PROFILE_ZONE_END;

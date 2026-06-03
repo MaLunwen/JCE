@@ -13,6 +13,7 @@
 #include "jce_editor_scene_render.h"
 #include "core/jce_editor_state.h"
 #include "scene/jce_editor_scene_asset_cache.h"
+#include "scene/jce_scene_camera_focus.h"
 
 #include <math.h>
 #include <string.h>
@@ -88,6 +89,13 @@ struct SceneRenderState {
     float                   orbit_near_cached;
     float                   orbit_far_cached;
 
+    /* Smooth frame-selection focus state. */
+    JceEditorSceneFocusAnim focus_anim;
+    bool                    focus_last_bounds_valid;
+    float                   focus_last_min[3];
+    float                   focus_last_max[3];
+    int                     focus_zoom_step;
+
     /* Cached camera matrices for the current frame. */
     bool                    camera_cache_valid;
     float                   cached_view[16];
@@ -145,5 +153,6 @@ void draw_compound_collider_gizmos(void);
 /* ── Functions from jce_scene_render_camera.cpp ───────────────────── */
 
 void orbit_apply(void);
+void jce_editor_scene_camera_update(float dt_sec);
 
 #endif /* JCE_SCENE_RENDER_INTERNAL_H */

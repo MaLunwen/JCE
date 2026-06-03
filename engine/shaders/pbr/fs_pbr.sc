@@ -371,8 +371,17 @@ void main()
         texColor = vec4(triplanar_checker(v_localpos), 1.0);
     }
 
-    vec3 albedo = pow(clamp(texColor.rgb, vec3_splat(0.0), vec3_splat(1.0)), vec3_splat(2.2))
+    vec3 albedo;
+    if (useCheckerFallback)
+    {
+        albedo = clamp(texColor.rgb, vec3_splat(0.0), vec3_splat(1.0))
                * u_baseColorFactor.rgb;
+    }
+    else
+    {
+        albedo = pow(clamp(texColor.rgb, vec3_splat(0.0), vec3_splat(1.0)), vec3_splat(2.2))
+               * u_baseColorFactor.rgb;
+    }
     float alpha = texColor.a * u_baseColorFactor.a;
 
     // --- View-mode dispatch ---------------------------------------------

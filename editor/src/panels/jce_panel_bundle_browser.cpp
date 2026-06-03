@@ -707,7 +707,7 @@ void draw_build_tab()
         }
         if (needs_list) {
             JcePathInputOpts so;
-            so.filter = "Scene (*.scene.json);;All Files (*.*)";
+            so.filter = "Scene (*.scene *.scene.json);;All Files (*.*)";
             jce_draw_path_input(BL("field.add_scene", "Add scene file"),
                                 gb.scene_file_input, sizeof(gb.scene_file_input),
                                 JcePathKind::FileAbs, &so);
@@ -855,7 +855,7 @@ void draw_build_tab()
         } else {
             static char preview_scene[256] = "";
             JcePathInputOpts po;
-            po.filter = "Scene (*.scene.json);;All Files (*.*)";
+            po.filter = "Scene (*.scene *.scene.json);;All Files (*.*)";
             jce_draw_path_input(BL("field.scene_file", "Scene file"),
                                 preview_scene, sizeof(preview_scene),
                                 JcePathKind::FileAbs, &po);
@@ -920,6 +920,24 @@ bool ends_with_ci(const char *s, const char *suf)
     return true;
 }
 
+bool is_bundle_sidecar_path(const char *path)
+{
+    return ends_with_ci(path, ".jbundle.json");
+}
+
+bool bundle_path_from_sidecar(const char *sidecar, char *out, size_t outsz)
+{
+    if (!is_bundle_sidecar_path(sidecar) || !out || outsz == 0)
+        return false;
+    size_t n = strlen(sidecar);
+    size_t keep = n - strlen(".json");
+    if (keep >= outsz)
+        return false;
+    memcpy(out, sidecar, keep);
+    out[keep] = '\0';
+    return true;
+}
+
 void open_detect_mode()
 {
     if (g_ob.path_input[0] && jce_fs_host_exists_dir(g_ob.path_input)) {
@@ -941,6 +959,23 @@ void open_detect_mode()
             snprintf(g_ob.status_msg, sizeof(g_ob.status_msg), "%s",
                      BL("msg.is_dir",
                         "path is a directory — pick a .jbundle file or bundle_catalog.json"));
+        }
+    }
+    char bundle_path[1024];
+    if (bundle_path_from_sidecar(g_ob.path_input, bundle_path,
+                                 sizeof(bundle_path))) {
+        if (jce_fs_host_exists_file(bundle_path)) {
+            snprintf(g_ob.path_input, sizeof(g_ob.path_input), "%s",
+                     bundle_path);
+            snprintf(g_ob.status_msg, sizeof(g_ob.status_msg), "%s",
+                     BL("msg.sidecar_bundle",
+                        "sidecar manifest detected - opening sibling .jbundle"));
+        } else {
+            g_ob.is_catalog = false;
+            snprintf(g_ob.status_msg, sizeof(g_ob.status_msg), "%s",
+                     BL("msg.sidecar_missing_bundle",
+                        "sidecar manifest selected, but sibling .jbundle is missing"));
+            return;
         }
     }
     g_ob.is_catalog = ends_with_ci(g_ob.path_input, ".json");
@@ -1008,8 +1043,8 @@ void draw_open_tab()
         }
     }
     if (path_changed) {
-        open_detect_mode();
         g_ob.status_msg[0] = '\0';
+        open_detect_mode();
     }
 
     ImGui::TextDisabled("%s: %s", BL("label.detected", "Detected"),

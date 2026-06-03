@@ -12,6 +12,8 @@
 #define ORBIT_CLIP_HYSTERESIS     0.02f
 #define ORBIT_CLIP_MIN_NEAR_DELTA 0.00025f
 #define ORBIT_CLIP_MIN_FAR_DELTA  1.0f
+#define ORBIT_FOCUS_DURATION      0.30f
+#define ORBIT_FOCUS_BOUNDS_EPS    0.001f
 
 /* ── Internal: recompute camera position from orbit state ─────────── */
 
@@ -68,6 +70,26 @@ void orbit_apply(void)
                             s_sr.orbit_far_cached);
 }
 
+static void orbit_cancel_focus_anim(void)
+{
+    jce_editor_scene_focus_anim_cancel(&s_sr.focus_anim);
+}
+
+void jce_editor_scene_camera_update(float dt_sec)
+{
+    if (!s_sr.initialized || !s_sr.camera || !s_sr.focus_anim.active) return;
+
+    JceEditorSceneFocusSample sample =
+        jce_editor_scene_focus_anim_step(&s_sr.focus_anim, dt_sec);
+    s_sr.orbit_target = sample.center;
+    s_sr.orbit_distance = sample.distance;
+    if (s_sr.orbit_distance < ORBIT_DIST_MIN)
+        s_sr.orbit_distance = ORBIT_DIST_MIN;
+    if (s_sr.orbit_distance > ORBIT_DIST_MAX)
+        s_sr.orbit_distance = ORBIT_DIST_MAX;
+    orbit_apply();
+}
+
 /* ── Public camera API ────────────────────────────────────────────── */
 
 JceCamera *jce_editor_scene_get_camera(void)
@@ -122,6 +144,7 @@ bool jce_editor_scene_get_camera_matrices(float *out_view16,
 void jce_editor_scene_camera_orbit(float dyaw, float dpitch)
 {
     if (!s_sr.initialized) return;
+    orbit_cancel_focus_anim();
     s_sr.orbit_yaw   += dyaw;
     s_sr.orbit_pitch += dpitch;
     if (s_sr.orbit_pitch >  ORBIT_PITCH_MAX) s_sr.orbit_pitch =  ORBIT_PITCH_MAX;
@@ -132,6 +155,7 @@ void jce_editor_scene_camera_orbit(float dyaw, float dpitch)
 void jce_editor_scene_camera_pan(float dx, float dy)
 {
     if (!s_sr.initialized || !s_sr.camera) return;
+    orbit_cancel_focus_anim();
     jce_vec3 right = jce_camera_get_right(s_sr.camera);
     jce_vec3 up    = jce_camera_get_up(s_sr.camera);
 
@@ -193,6 +217,7 @@ static float nearest_hit_along_view_ray(void)
 void jce_editor_scene_camera_zoom(float delta)
 {
     if (!s_sr.initialized) return;
+    orbit_cancel_focus_anim();
 
     float base_step = delta * s_sr.orbit_distance * 0.1f;
 
@@ -226,6 +251,7 @@ void jce_editor_scene_camera_get_target(float *out3)
 
 void jce_editor_scene_camera_set_target(float x, float y, float z)
 {
+    orbit_cancel_focus_anim();
     s_sr.orbit_target = jce_v3(x, y, z);
     if (s_sr.initialized) orbit_apply();
 }
@@ -233,6 +259,7 @@ void jce_editor_scene_camera_set_target(float x, float y, float z)
 void jce_editor_scene_camera_snap_view(JceCamPresetView preset)
 {
     if (!s_sr.initialized) return;
+    orbit_cancel_focus_anim();
 
     switch (preset) {
     case JCE_CAM_VIEW_FRONT:   s_sr.orbit_yaw = 0;              s_sr.orbit_pitch = 0;   break;
@@ -248,6 +275,9 @@ void jce_editor_scene_camera_snap_view(JceCamPresetView preset)
 void jce_editor_scene_camera_reset(void)
 {
     if (!s_sr.initialized) return;
+    orbit_cancel_focus_anim();
+    s_sr.focus_last_bounds_valid = false;
+    s_sr.focus_zoom_step = 0;
     s_sr.orbit_target   = jce_v3(0.0f, 0.0f, 0.0f);
     s_sr.orbit_distance = sqrtf(8.0f*8.0f + 6.0f*6.0f + 8.0f*8.0f);
     s_sr.orbit_yaw      = atan2f(8.0f, -8.0f);
@@ -259,32 +289,119 @@ void jce_editor_scene_camera_focus_aabb(const float min3[3], const float max3[3]
 {
     if (!s_sr.initialized || !s_sr.camera || !min3 || !max3) return;
 
-    float cx = (min3[0] + max3[0]) * 0.5f;
-    float cy = (min3[1] + max3[1]) * 0.5f;
-    float cz = (min3[2] + max3[2]) * 0.5f;
-
-    float ex = (max3[0] - min3[0]) * 0.5f;
-    float ey = (max3[1] - min3[1]) * 0.5f;
-    float ez = (max3[2] - min3[2]) * 0.5f;
-    if (ex < 0.0f) ex = -ex;
-    if (ey < 0.0f) ey = -ey;
-    if (ez < 0.0f) ez = -ez;
-
-    /* Bounding sphere radius from extents (cheap upper bound). */
-    float radius = sqrtf(ex*ex + ey*ey + ez*ez);
-    if (radius < 0.5f) radius = 0.5f;       /* don't zoom in past 0.5m */
-
-    /* Distance to fit sphere into vertical FOV; use the camera's actual
-     * FOV with a small margin so the object isn't flush with the edges. */
     float fov_deg = jce_camera_get_fov(s_sr.camera);
-    if (fov_deg < 1.0f) fov_deg = 45.0f;
-    float fov_y = fov_deg * JCE_DEG2RAD;
-    float dist = radius / sinf(fov_y * 0.5f);
-    dist *= 1.15f;                          /* breathing room */
-    if (dist < ORBIT_DIST_MIN) dist = ORBIT_DIST_MIN;
-    if (dist > ORBIT_DIST_MAX) dist = ORBIT_DIST_MAX;
+    bool same_bounds = s_sr.focus_last_bounds_valid
+        && jce_editor_scene_focus_same_bounds(s_sr.focus_last_min,
+                                              s_sr.focus_last_max,
+                                              min3,
+                                              max3,
+                                              ORBIT_FOCUS_BOUNDS_EPS);
+    int zoom_step =
+        jce_editor_scene_focus_next_zoom_step(same_bounds,
+                                              s_sr.focus_zoom_step);
+    JceEditorSceneFocusTarget focus =
+        jce_editor_scene_focus_make_target(min3, max3, fov_deg, zoom_step);
 
-    s_sr.orbit_target   = jce_v3(cx, cy, cz);
-    s_sr.orbit_distance = dist;
-    orbit_apply();
+    jce_editor_scene_focus_anim_start(&s_sr.focus_anim,
+                                      s_sr.orbit_target,
+                                      s_sr.orbit_distance,
+                                      focus.center,
+                                      focus.distance,
+                                      ORBIT_FOCUS_DURATION);
+
+    memcpy(s_sr.focus_last_min, min3, sizeof(s_sr.focus_last_min));
+    memcpy(s_sr.focus_last_max, max3, sizeof(s_sr.focus_last_max));
+    s_sr.focus_last_bounds_valid = true;
+    s_sr.focus_zoom_step = focus.zoom_step;
+}
+
+void jce_editor_scene_camera_focus_transform(const JceTransform *transform)
+{
+    if (!transform) return;
+
+    float bmin[3] = {
+        -0.5f,
+        -0.5f,
+        -0.5f,
+    };
+    float bmax[3] = {
+         0.5f,
+         0.5f,
+         0.5f,
+    };
+
+    jce_vec3 scale = transform->scale;
+    if (fabsf(scale.x) < 0.2f) scale.x = 0.2f;
+    if (fabsf(scale.y) < 0.2f) scale.y = 0.2f;
+    if (fabsf(scale.z) < 0.2f) scale.z = 0.2f;
+
+    float world_min[3];
+    float world_max[3];
+    jce_editor_scene_focus_transform_aabb(bmin, bmax,
+                                          transform->position,
+                                          transform->rotation,
+                                          scale,
+                                          world_min,
+                                          world_max);
+    jce_editor_scene_camera_focus_aabb(world_min, world_max);
+}
+
+bool jce_editor_scene_camera_get_entity_focus_bounds(uint32_t entity_id,
+                                                     float out_min3[3],
+                                                     float out_max3[3])
+{
+    if (!out_min3 || !out_max3) return false;
+
+    JceScene *scene = jce_state_get_scene();
+    if (!scene || entity_id == 0 || !jce_state_entity_exists(entity_id))
+        return false;
+
+    JceEntity e = (JceEntity)entity_id;
+    JceTransform *t = jce_scene_get_transform(scene, e);
+    if (!t) return false;
+
+    if (jce_scene_has_mesh_renderer(scene, e)) {
+        JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, e);
+        if (mr && mr->mesh_path[0] != '\0') {
+            float wp[3] = { t->position.x, t->position.y, t->position.z };
+            JceMesh *mesh = get_cached_mesh(mr->mesh_path, wp);
+            if (mesh) {
+                float local_min[3];
+                float local_max[3];
+                jce_mesh_get_aabb(mesh, local_min, local_max);
+                jce_editor_scene_focus_transform_aabb(local_min,
+                                                      local_max,
+                                                      t->position,
+                                                      t->rotation,
+                                                      t->scale,
+                                                      out_min3,
+                                                      out_max3);
+                return true;
+            }
+        }
+    }
+
+    float local_min[3] = { -0.5f, -0.5f, -0.5f };
+    float local_max[3] = {  0.5f,  0.5f,  0.5f };
+    jce_vec3 scale = t->scale;
+    if (fabsf(scale.x) < 0.2f) scale.x = 0.2f;
+    if (fabsf(scale.y) < 0.2f) scale.y = 0.2f;
+    if (fabsf(scale.z) < 0.2f) scale.z = 0.2f;
+
+    jce_editor_scene_focus_transform_aabb(local_min,
+                                          local_max,
+                                          t->position,
+                                          t->rotation,
+                                          scale,
+                                          out_min3,
+                                          out_max3);
+    return true;
+}
+
+void jce_editor_scene_camera_focus_entity(uint32_t entity_id)
+{
+    float bmin[3];
+    float bmax[3];
+    if (jce_editor_scene_camera_get_entity_focus_bounds(entity_id, bmin, bmax))
+        jce_editor_scene_camera_focus_aabb(bmin, bmax);
 }

@@ -23,6 +23,7 @@
 #include "core/jce_run_manager.h"
 #include "core/jce_editor_config.h"
 #include "core/jce_editor_project.h"
+#include "dialogs/jce_path_input.h"
 #include "ui/jce_editor_panels.h"
 
 #include <jce/tools/jce_imgui.hpp>
@@ -100,6 +101,10 @@ static struct {
     bool                 root_loaded_from_cfg = false;
     /* Inline editable input mirror so user can type a path. */
     char                 root_input[512] = {0};
+    /* Project-mode SDK root.  Empty means fall back to project.sdk_path,
+     * then JCE_SDK_DIR; Build/Pack also accept this unsaved buffer so the
+     * user can fix a missing SDK and immediately retry. */
+    char                 sdk_input[512] = {0};
     /* Async file-picker plumbing.  Dialog callback runs on the UI
      * thread (per jce_host_dialog contract), so a plain int is enough
      * — no <atomic> needed. */
@@ -118,6 +123,8 @@ static struct {
      * from.  When the user opens a new project containing
      * jce_project.json we refresh the inputs once. */
     std::string          last_prefill_root;
+    std::string          last_sdk_root;
+    std::string          last_sdk_manifest;
     /* Cook-before-build toggle (▶ Play workflow). */
     bool                 cook_before_build = true;
     /* Play (Cook→Build→Run) state machine. */
@@ -168,6 +175,30 @@ static void refresh_prefill_from_project(void)
     }
 }
 
+static void refresh_sdk_from_project(void)
+{
+    const JceProject *p = jce_editor_project_get();
+    const char *root = (p && p->project_root) ? p->project_root : "";
+    const char *sdk = (p && p->sdk_path) ? p->sdk_path : "";
+
+    if (s_bp.last_sdk_root == root && s_bp.last_sdk_manifest == sdk)
+        return;
+
+    s_bp.last_sdk_root = root;
+    s_bp.last_sdk_manifest = sdk;
+    snprintf(s_bp.sdk_input, sizeof(s_bp.sdk_input), "%s", sdk);
+}
+
+static const char *resolve_project_sdk(const JceProject *p)
+{
+    (void)p;
+    if (s_bp.sdk_input[0])
+        return s_bp.sdk_input;
+
+    const char *env_sdk = std::getenv("JCE_SDK_DIR");
+    return (env_sdk && env_sdk[0]) ? env_sdk : nullptr;
+}
+
 /* Concatenate project_root + name into a host-absolute path.  If
  * project_root is empty, returns just `name` so the existing relative
  * lookup still works (editor cwd).  Always uses forward slashes —
@@ -181,13 +212,50 @@ static std::string make_root_path(const char *name)
     return p;
 }
 
+static std::string normalize_project_root_path(const char *raw)
+{
+    if (!raw || !raw[0]) return std::string();
+    std::string p = raw;
+
+    auto trim_slash = [](std::string &s) {
+        while (!s.empty() && (s.back() == '/' || s.back() == '\\'))
+            s.pop_back();
+    };
+
+    if (jce_fs_host_exists_file(p.c_str()) &&
+        !jce_fs_host_exists_dir(p.c_str())) {
+        size_t slash = p.find_last_of("/\\");
+        p = (slash == std::string::npos) ? std::string() : p.substr(0, slash);
+    } else if (!jce_fs_host_exists_dir(p.c_str())) {
+        size_t slash = p.find_last_of("/\\");
+        std::string base = (slash == std::string::npos)
+                               ? p : p.substr(slash + 1);
+        if (base == "CMakePresets.json" ||
+            base == "CMakeUserPresets.json" ||
+            base == "jce_project.json" ||
+            base == "CMakeLists.txt" ||
+            base == "project.jce") {
+            p = (slash == std::string::npos) ? std::string() : p.substr(0, slash);
+        }
+    }
+
+    trim_slash(p);
+    return p;
+}
+
 static void load_root_from_config_once(void)
 {
     if (s_bp.root_loaded_from_cfg) return;
     JceEditorConfig cfg;
     if (jce_editor_config_load(&cfg)) {
+        std::string normalized = normalize_project_root_path(cfg.build_project_root);
         snprintf(s_bp.project_root, sizeof(s_bp.project_root), "%s",
-                 cfg.build_project_root);
+                 normalized.c_str());
+        if (strcmp(cfg.build_project_root, s_bp.project_root) != 0) {
+            snprintf(cfg.build_project_root, sizeof(cfg.build_project_root),
+                     "%s", s_bp.project_root);
+            jce_editor_config_save(&cfg);
+        }
     }
     snprintf(s_bp.root_input, sizeof(s_bp.root_input), "%s",
              s_bp.project_root);
@@ -228,34 +296,7 @@ static void on_pick_presets_cb(void *user, JceDialogResult result,
 static void apply_picked_path(const char *raw)
 {
     if (!raw || !raw[0]) return;
-    std::string p = raw;
-    auto trim_slash = [](std::string &s) {
-        while (!s.empty() && (s.back() == '/' || s.back() == '\\'))
-            s.pop_back();
-    };
-    /* If the path points at an existing file, strip to parent.
-     * If it doesn't exist as either file/dir, fall back to the
-     * basename heuristic so manual-typed paths still work. */
-    if (jce_fs_host_exists_file(p.c_str()) &&
-        !jce_fs_host_exists_dir(p.c_str())) {
-        size_t slash = p.find_last_of("/\\");
-        if (slash == std::string::npos) p.clear();
-        else p = p.substr(0, slash);
-    } else if (!jce_fs_host_exists_dir(p.c_str())) {
-        size_t slash = p.find_last_of("/\\");
-        std::string base = (slash == std::string::npos)
-                               ? p : p.substr(slash + 1);
-        /* Heuristic: anything that looks like a known project file. */
-        if (base == "CMakePresets.json" ||
-            base == "CMakeUserPresets.json" ||
-            base == "jce_project.json"  ||
-            base == "CMakeLists.txt"    ||
-            base == "project.jce") {
-            if (slash == std::string::npos) p.clear();
-            else p = p.substr(0, slash);
-        }
-    }
-    trim_slash(p);
+    std::string p = normalize_project_root_path(raw);
     snprintf(s_bp.project_root, sizeof(s_bp.project_root), "%s", p.c_str());
     snprintf(s_bp.root_input,   sizeof(s_bp.root_input),   "%s", p.c_str());
     save_root_to_config();
@@ -399,9 +440,8 @@ static void load_profiles()
  * scripts/build-*.{bat,sh} layout used by the editor's launcher. */
 static std::string guess_output_exe(const std::string &preset_name)
 {
-    /* Project mode: the synthetic "project" preset maps to whatever
-     * build-project.bat produces:
-     *   <project_root>/build/<platform>-<variant>/<exe>
+    /* Project mode maps to the editor-native build tree:
+     *   <project_root>/build/<platform>-<arch>/<variant>/<exe>
      * We default to release/win since the panel doesn't yet expose
      * a variant selector for the synthetic preset. */
     if (preset_name == "project") {
@@ -422,7 +462,7 @@ static std::string guess_output_exe(const std::string &preset_name)
             const char *arch = arch_sel ? arch_sel : host_arch_triplet();
             std::string dir = "build/win32-";
             dir += arch;
-            dir += "-release/";
+            dir += "/release/";
             return dir + exe_name;
         }
     }
@@ -616,6 +656,7 @@ static void draw_profiles_tab(void)
     draw_project_root_strip();
     draw_tool_status_strip();
     refresh_prefill_from_project();
+    refresh_sdk_from_project();
     ImGui::Separator();
 
     /* Loaded-project banner: lets the user see at a glance whether the
@@ -727,16 +768,11 @@ static void draw_profiles_tab(void)
                 const char *root = s_bp.project_root[0]
                                        ? s_bp.project_root
                                        : jp->project_root;
-                const char *sdk = (jp->sdk_path && jp->sdk_path[0])
-                                      ? jp->sdk_path : nullptr;
-                if (!sdk) {
-                    const char *env_sdk = std::getenv("JCE_SDK_DIR");
-                    if (env_sdk && env_sdk[0]) sdk = env_sdk;
-                }
+                const char *sdk = resolve_project_sdk(jp);
                 if (!sdk || !sdk[0]) {
                     jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-                        "[build] project mode needs an SDK: set project.sdk_path "
-                        "or the JCE_SDK_DIR environment variable");
+                        "[build] project mode needs an SDK: set SDK Root in "
+                        "Build Profiles, project.sdk_path, or JCE_SDK_DIR");
                     return;
                 }
                 const char *tgt = s_bp.build_target[0]
@@ -850,6 +886,48 @@ static void draw_profiles_tab(void)
                 ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f),
                                    "%s",
                                    jce_editor_i18n("buildProfiles.nativeBuild"));
+
+                ImGui::TextDisabled("%s", jce_editor_i18n("buildProfiles.sdk"));
+                ImGui::SameLine();
+                JcePathInputOpts sdk_opts;
+                sdk_opts.title = jce_editor_i18n("buildProfiles.sdk.title");
+                sdk_opts.width = 360.0f;
+                jce_draw_path_input("##bpSdkRoot",
+                                    s_bp.sdk_input, sizeof(s_bp.sdk_input),
+                                    JcePathKind::FolderAbs, &sdk_opts);
+                ImGui::SameLine();
+                if (ImGui::Button(jce_editor_i18n("buildProfiles.sdk.save"))) {
+                    bool ok = jce_editor_project_update_field("sdk_path",
+                                                              s_bp.sdk_input);
+                    if (ok) {
+                        jce_editor_console_log_level(JCE_CONSOLE_INFO,
+                            "[build] project SDK saved: %s",
+                            s_bp.sdk_input[0] ? s_bp.sdk_input : "(empty)");
+                    } else {
+                        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                            "[build] failed to save project SDK path");
+                    }
+                    const JceProject *fresh = jce_editor_project_get();
+                    s_bp.last_sdk_root =
+                        (fresh && fresh->project_root) ? fresh->project_root : "";
+                    s_bp.last_sdk_manifest =
+                        (fresh && fresh->sdk_path) ? fresh->sdk_path : "";
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("%s",
+                        jce_editor_i18n("buildProfiles.sdk.save.tip"));
+                }
+                if (!s_bp.sdk_input[0]) {
+                    const char *env_sdk = std::getenv("JCE_SDK_DIR");
+                    if (env_sdk && env_sdk[0]) {
+                        ImGui::TextDisabled(jce_editor_i18n("buildProfiles.sdk.env"),
+                                            env_sdk);
+                    } else {
+                        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f),
+                                           "%s",
+                                           jce_editor_i18n("buildProfiles.sdk.required"));
+                    }
+                }
             } else {
                 const char *def_script =
                     jce_build_manager_default_desktop_script();
@@ -1062,20 +1140,15 @@ static void draw_profiles_tab(void)
             if (!can_pack) ImGui::BeginDisabled();
             if (ImGui::Button(jce_editor_i18n("buildProfiles.pack"))) {
                 /* Native package staging: build + verify + copy exe and
-                 * cooked assets into dist/games/<name>-<ver>-<plat>-<arch>.
+                 * cooked assets into build/<plat>-<arch>/dist/<package>.
                  * Replaces scripts/package-game.bat so the editor ships
                  * without first-party scripts. */
                 const JceProject *jpk = jp_pack;
-                const char *sdk = (jpk && jpk->sdk_path && jpk->sdk_path[0])
-                                      ? jpk->sdk_path : nullptr;
-                if (!sdk) {
-                    const char *env_sdk = std::getenv("JCE_SDK_DIR");
-                    if (env_sdk && env_sdk[0]) sdk = env_sdk;
-                }
+                const char *sdk = resolve_project_sdk(jpk);
                 if (!sdk || !sdk[0]) {
                     jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-                        "[pack] needs an SDK: set project.sdk_path or "
-                        "JCE_SDK_DIR");
+                        "[pack] needs an SDK: set SDK Root in Build Profiles, "
+                        "project.sdk_path, or JCE_SDK_DIR");
                 } else {
                     const char *tgt = s_bp.build_target[0]
                                           ? s_bp.build_target
@@ -1112,7 +1185,8 @@ static void draw_profiles_tab(void)
                     const char *ver = (jpk && jpk->version && jpk->version[0])
                                           ? jpk->version : "0.0.0";
                     std::string out_dir = std::string(root) +
-                        "/dist/games/" + name + "-" + ver + "-" +
+                        "/build/" + std::string(plat) + "-" + arch_cli +
+                        "/dist/" + name + "-" + ver + "-" +
                         plat + "-" + arch_cli;
 
                     JceBuildProjectConfig pcfg{};

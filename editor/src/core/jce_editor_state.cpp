@@ -14,7 +14,9 @@
  */
 
 #include "jce_editor_config.h"
+#include "jce_editor_component_registry.h"
 #include "jce_editor_i18n.h"
+#include "jce_editor_scene_rendering_defaults.h"
 #include "jce_editor_state_internal.h"
 #include "ui/jce_editor_panels.h"
 
@@ -294,11 +296,51 @@ void jce_editor_state_init(void)
         s_suppress_add_component_log = true;
         build_demo_scene();
         s_suppress_add_component_log = false;
+        jce_editor_scene_ensure_rendering_settings(s.scene);
     }
 
     s.initialized = true;
     LOG_INFO(LOG_TAG, "editor state initialized (%d demo entities)",
              (int)g_entity_order.size());
+}
+
+bool jce_state_new_default_scene(void)
+{
+    if (!s.scene)
+        s.scene = jce_scene_create();
+    else
+        clear_scene_entities();
+
+    if (!s.scene) {
+        LOG_ERROR(LOG_TAG, "new default scene failed: cannot create engine scene");
+        return false;
+    }
+
+    {
+        HistorySuspendScope suspend;
+        bool prev_suppress = s_suppress_add_component_log;
+        s_suppress_add_component_log = true;
+        build_demo_scene();
+        s_suppress_add_component_log = prev_suppress;
+        jce_editor_scene_ensure_rendering_settings(s.scene);
+    }
+
+    set_current_scene_path_internal(NULL);
+    jce_editor_scene_set_scene_dir("");
+    s_undo_history.clear();
+    s_redo_history.clear();
+    s.scene_modified = false;
+    s_history_edit_nesting = 0;
+    s_history_outer_edit_pushed_snapshot = false;
+    s_history_manual_batch_depth = 0;
+    s_transaction.active = false;
+    s_transaction.label[0] = '\0';
+    s_transaction.before.scene_json.clear();
+    s_transaction.before.scene_path.clear();
+
+    LOG_INFO(LOG_TAG, "new default scene created (%d entities)",
+             (int)g_entity_order.size());
+    return true;
 }
 
 void jce_editor_state_shutdown(void)
@@ -695,6 +737,8 @@ static void duplicate_components(JceEntity src, JceEntity dst)
         jce_scene_set_transform(s.scene, dst, jce_scene_get_transform(s.scene, src));
     if (jce_scene_has_mesh_renderer(s.scene, src))
         jce_scene_set_mesh_renderer(s.scene, dst, jce_scene_get_mesh_renderer(s.scene, src));
+    if (jce_scene_has_compound_collider(s.scene, src))
+        jce_scene_set_compound_collider(s.scene, dst, jce_scene_get_compound_collider(s.scene, src));
     if (jce_scene_has_camera(s.scene, src))
         jce_scene_set_camera(s.scene, dst, jce_scene_get_camera(s.scene, src));
     if (jce_scene_has_dir_light(s.scene, src))
@@ -1562,6 +1606,11 @@ void jce_state_remove_component(uint32_t entity_id, uint64_t comp_flag)
 
 const char *jce_comp_flag_display_name(uint64_t comp_flag)
 {
+    const JceEditorComponentDescriptor *desc =
+        jce_editor_component_find(comp_flag);
+    if (desc)
+        return desc->display_name;
+
     switch (comp_flag) {
     case JCE_COMP_FLAG_TRANSFORM:            return "Transform";
     case JCE_COMP_FLAG_MESH_RENDERER:        return "Mesh Renderer";
@@ -1630,6 +1679,11 @@ const char *jce_comp_flag_display_name(uint64_t comp_flag)
 
 const char *jce_comp_flag_i18n_key(uint64_t comp_flag)
 {
+    const JceEditorComponentDescriptor *desc =
+        jce_editor_component_find(comp_flag);
+    if (desc)
+        return desc->i18n_key;
+
     switch (comp_flag) {
     case JCE_COMP_FLAG_TRANSFORM:            return "comp.transform";
     case JCE_COMP_FLAG_MESH_RENDERER:        return "comp.meshRenderer";
@@ -1767,4 +1821,5 @@ JceScene *jce_state_get_scene(void) { return s.scene; }
 
 
 bool jce_state_is_scene_modified(void) { return s.scene_modified; }
+void jce_state_mark_scene_modified(void) { s.scene_modified = true; }
 void jce_state_clear_scene_modified(void) { s.scene_modified = false; }

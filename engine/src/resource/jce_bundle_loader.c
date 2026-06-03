@@ -8,13 +8,13 @@
 #include <jce/resource/jce_bundle_format.h>
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/os/core/jce_filesystem.h>
-#include <jce/os/core/jce_path.h>
 #include <jce/os/core/jce_log.h>
 
 #include "os/core/jce_memory.h"
 
 #include <cjson/cJSON.h>
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -295,8 +295,8 @@ static bool mount_recursive(JceBundleCatalog *cat, BundleEntry *be) {
 
     /* Construct full path. */
     char path[1024];
-    jce_path_join(path, sizeof(path),
-                  cat->base_dir ? cat->base_dir : ".", be->file);
+    snprintf(path, sizeof(path), "%s/%s",
+             cat->base_dir ? cat->base_dir : ".", be->file);
 
     JcePakArchive *pak = jce_pak_open_file(path);
     if (!pak) {
@@ -388,17 +388,14 @@ struct JceBundleFile {
     char          *kind;          /* from manifest (nullable)            */
 };
 
-/* Shared post-open path used by both jce_bundle_file_open (file-backed)
- * and jce_bundle_file_open_memory (in-exe `.rdata` blob).  Consumes
- * `pak`: on success the returned handle owns it; on failure the pak is
- * closed before returning NULL.  `source_label` is only used to derive
- * a basename mount name when the manifest lacks an id and the caller
- * didn't pass mount_name_or_null. */
-static JceBundleFile *bundle_finalize_from_pak(JceFileSystem *fs,
-                                               JcePakArchive *pak,
-                                               const char *source_label,
-                                               const char *mount_name_or_null)
+static JceBundleFile *bundle_file_open_pak(JceFileSystem *fs,
+                                           JcePakArchive *pak,
+                                           const char *fallback_name,
+                                           const char *mount_name_or_null,
+                                           const char *source_label)
 {
+    if (!pak) return NULL;
+
     /* Pull manifest to learn id / scene_path. */
     const JcePakAsset *mf = jce_pak_find(pak, JCE_BUNDLE_MANIFEST_VPATH);
     char  *id_str        = NULL;
@@ -432,11 +429,10 @@ static JceBundleFile *bundle_finalize_from_pak(JceFileSystem *fs,
         mname = dup_str(mount_name_or_null);
     } else if (id_str) {
         mname = dup_str(id_str);
-    } else if (source_label) {
-        const char *base = source_label;
-        for (const char *p = source_label; *p; ++p)
-            if (*p == '/' || *p == '\\') base = p + 1;
-        mname = dup_str(base);
+    } else {
+        mname = dup_str((fallback_name && fallback_name[0])
+                            ? fallback_name
+                            : "bundle");
     }
     if (!mname) {
         jce_pak_close(pak);
@@ -468,7 +464,8 @@ static JceBundleFile *bundle_finalize_from_pak(JceFileSystem *fs,
     bf->scene_path = scene_str;
     bf->kind       = kind_str;
     LOG_INFO("jce_bundle", "mounted standalone '%s' from %s",
-             bf->mount_name, source_label ? source_label : "<memory>");
+             bf->mount_name,
+             source_label ? source_label : "(memory)");
     return bf;
 }
 
@@ -483,28 +480,32 @@ JCE_API JceBundleFile *jce_bundle_file_open(JceFileSystem *fs,
         LOG_ERROR("jce_bundle", "failed to open '%s'", jbundle_path);
         return NULL;
     }
-    return bundle_finalize_from_pak(fs, pak, jbundle_path, mount_name_or_null);
+
+    const char *base = jbundle_path;
+    for (const char *p = jbundle_path; *p; ++p)
+        if (*p == '/' || *p == '\\') base = p + 1;
+
+    return bundle_file_open_pak(fs, pak, base,
+                                mount_name_or_null, jbundle_path);
 }
 
-JCE_API JceBundleFile *jce_bundle_file_open_memory(JceFileSystem *fs,
-                                                   const void *data,
-                                                   size_t      size,
-                                                   const char *mount_name_or_null)
+JCE_API JceBundleFile *jce_bundle_file_open_memory(
+                                            JceFileSystem *fs,
+                                            const void *data,
+                                            size_t size,
+                                            const char *mount_name_or_null)
 {
     if (!data || size == 0) return NULL;
+
     JcePakArchive *pak = jce_pak_open(data, size);
     if (!pak) {
-        LOG_ERROR("jce_bundle", "failed to open in-memory bundle (%zu bytes)",
-                  size);
+        LOG_ERROR("jce_bundle", "%s",
+                  "failed to open embedded standalone bundle");
         return NULL;
     }
-    /* Pass a synthetic label as the "source path" so the basename
-     * fallback for mount-name selection yields a usable string when
-     * the caller hasn't supplied mount_name_or_null and the manifest
-     * lacks an id. */
-    const char *label = (mount_name_or_null && mount_name_or_null[0])
-                        ? mount_name_or_null : "<memory>";
-    return bundle_finalize_from_pak(fs, pak, label, mount_name_or_null);
+
+    return bundle_file_open_pak(fs, pak, mount_name_or_null,
+                                mount_name_or_null, "(memory)");
 }
 
 JCE_API void jce_bundle_file_close(JceBundleFile *bf)
@@ -529,6 +530,6 @@ JCE_API const char *jce_bundle_file_scene_path(const JceBundleFile *bf) {
 JCE_API const char *jce_bundle_file_kind(const JceBundleFile *bf) {
     return bf ? bf->kind : NULL;
 }
-JCE_API const JcePakArchive *jce_bundle_file_pak(const JceBundleFile *bf) {
+JCE_API JcePakArchive *jce_bundle_file_pak(const JceBundleFile *bf) {
     return bf ? bf->pak : NULL;
 }

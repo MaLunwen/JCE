@@ -8,6 +8,7 @@
  */
 
 #include "jce_scene_render_internal.h"
+#include "jce_scene_outline_policy.h"
 
 extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
@@ -29,9 +30,8 @@ void jce_editor_scene_reset_anim_timer(void)
 /* ── Local entity model builder (overlay-only) ───────────────────── */
 
 /* Builds a TRS model matrix from the entity's Transform component and
- * resolves its mesh from the editor asset cache.  Procedural-shape
- * fallback meshes are not provided here: overlays simply skip entities
- * whose mesh isn't loadable from a file path. */
+ * resolves the same mesh the engine scene renderer would draw: first the
+ * file mesh from the editor cache, then the renderer-owned primitive mesh. */
 static bool build_overlay_entity_model(uint32_t entity_id,
                                         jce_mat4 *out_model,
                                         JceMesh **out_mesh)
@@ -53,9 +53,18 @@ static bool build_overlay_entity_model(uint32_t entity_id,
         *out_mesh = NULL;
         if (jce_scene_has_mesh_renderer(scene, e)) {
             JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, e);
-            if (mr && mr->mesh_path[0] != '\0') {
-                float wp[3] = { t->position.x, t->position.y, t->position.z };
-                *out_mesh = get_cached_mesh(mr->mesh_path, wp);
+            if (mr) {
+                if (mr->mesh_path[0] != '\0') {
+                    float wp[3] = {
+                        t->position.x, t->position.y, t->position.z
+                    };
+                    *out_mesh = get_cached_mesh(mr->mesh_path, wp);
+                }
+                if (!*out_mesh) {
+                    *out_mesh = jce_scene_renderer_get_builtin_mesh(
+                        s_sr.scene_renderer,
+                        mr->mesh_shape);
+                }
             }
         }
     }
@@ -242,8 +251,14 @@ void draw_selection_outlines(void)
         if (!jce_state_entity_enabled(id)) continue;
 
         JceEntity e = (JceEntity)id;
+        bool has_visual_renderer = false;
+        if (scene) {
+            has_visual_renderer =
+                jce_scene_has_mesh_renderer(scene, e) ||
+                jce_scene_has_skeletal_animator(scene, e);
+        }
 
-        /* --- Static mesh: keep the high-fidelity wireframe overlay. */
+        /* --- Rendered mesh: keep the high-fidelity wireframe overlay. */
         jce_mat4 model;
         JceMesh *mesh = NULL;
         if (build_overlay_entity_model(id, &model, &mesh) && mesh) {
@@ -261,6 +276,39 @@ void draw_selection_outlines(void)
         if (!t) continue;
 
         bool drew_shape = false;
+
+        /* --- Skeletal-animated (skinned) model.
+         *     Submit the true geometric wireframe of every primitive in
+         *     the cached JceModel, walking the full node hierarchy. The
+         *     bone palette comes from the live animation player when
+         *     available; otherwise the bind pose is used. */
+        if (jce_scene_has_skeletal_animator(scene, e)) {
+            JceSkeletalAnimatorComponent *sa =
+                jce_scene_get_skeletal_animator(scene, e);
+            JceModel *mdl = (sa && sa->skeleton_path[0])
+                ? jce_editor_scene_get_model(sa->skeleton_path, id)
+                : NULL;
+            if (mdl) {
+                float sx = (t->scale.x != 0.0f) ? t->scale.x : 1.0f;
+                float sy = (t->scale.y != 0.0f) ? t->scale.y : 1.0f;
+                float sz = (t->scale.z != 0.0f) ? t->scale.z : 1.0f;
+                jce_mat4 world = jce_m4_from_trs(t->position, t->rotation,
+                                                  jce_v3(sx, sy, sz));
+                jce_uniform_set(s_sr.u_light_dir,   flat_dir,   1);
+                jce_uniform_set(s_sr.u_light_color, flat_color, 1);
+                jce_set_texture(0, uh, s_sr.white_tex, JCE_SAMPLER_INHERIT);
+                jce_model_submit_wireframe_overlay(mdl, s_sr.renderer,
+                                                    scene_view_id(),
+                                                    &world, NULL, 0);
+                continue;
+            }
+        }
+
+        if (!jce_editor_scene_outline_should_use_debug_fallback(
+                has_visual_renderer,
+                drew_shape)) {
+            continue;
+        }
 
         /* --- Point light → influence sphere. */
         if (jce_scene_has_point_light(scene, e)) {
@@ -367,44 +415,6 @@ void draw_selection_outlines(void)
             float hh = 0.5f * fmaxf(0.0f, h - 2.0f * r);
             jce_debug_draw_capsule(t->position, r, hh, t->rotation, col_outline);
             drew_shape = true;
-        }
-
-        /* --- Skeletal-animated (skinned) model.
-         *     Submit the true geometric wireframe of every primitive in
-         *     the cached JceModel, walking the full node hierarchy. The
-         *     bone palette comes from the live animation player when
-         *     available; otherwise the bind pose is used. */
-        if (!drew_shape && jce_scene_has_skeletal_animator(scene, e)) {
-            JceSkeletalAnimatorComponent *sa =
-                jce_scene_get_skeletal_animator(scene, e);
-            JceModel *mdl = (sa && sa->skeleton_path[0])
-                ? jce_editor_scene_get_model(sa->skeleton_path, id)
-                : NULL;
-            if (mdl) {
-                float sx = (t->scale.x != 0.0f) ? t->scale.x : 1.0f;
-                float sy = (t->scale.y != 0.0f) ? t->scale.y : 1.0f;
-                float sz = (t->scale.z != 0.0f) ? t->scale.z : 1.0f;
-                jce_mat4 world = jce_m4_from_trs(t->position, t->rotation,
-                                                  jce_v3(sx, sy, sz));
-                jce_uniform_set(s_sr.u_light_dir,   flat_dir,   1);
-                jce_uniform_set(s_sr.u_light_color, flat_color, 1);
-                jce_set_texture(0, uh, s_sr.white_tex, JCE_SAMPLER_INHERIT);
-                jce_model_submit_wireframe_overlay(mdl, s_sr.renderer,
-                                                    scene_view_id(),
-                                                    &world, NULL, 0);
-                drew_shape = true;
-            } else {
-                /* Model not cached yet: humanoid AABB placeholder. */
-                float sx = (t->scale.x != 0.0f) ? fabsf(t->scale.x) : 1.0f;
-                float sy = (t->scale.y != 0.0f) ? fabsf(t->scale.y) : 1.0f;
-                float sz = (t->scale.z != 0.0f) ? fabsf(t->scale.z) : 1.0f;
-                jce_vec3 half = jce_v3(0.25f * sx, 1.0f * sy, 0.25f * sz);
-                jce_vec3 center = jce_v3_add(t->position,
-                                      jce_q_rotate(t->rotation,
-                                          jce_v3(0.0f, 1.0f * sy, 0.0f)));
-                jce_debug_draw_box(center, half, t->rotation, col_outline);
-                drew_shape = true;
-            }
         }
 
         /* --- Generic fallback for transform-only entities (empties,

@@ -420,6 +420,17 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     s_sr.camera_cache_valid = false;
     s_sr.postfx_output_tex = UINT16_MAX;
 
+    uint64_t now_ticks = jce_time_perf_counter();
+    float dt_sec = 0.0f;
+    if (s_sr.anim_last_ticks > 0) {
+        dt_sec = (float)(now_ticks - s_sr.anim_last_ticks)
+               / (float)jce_time_perf_freq();
+        if (dt_sec > 0.1f) dt_sec = 0.1f;
+    }
+    s_sr.anim_last_ticks = now_ticks;
+
+    jce_editor_scene_camera_update(dt_sec);
+
     float aspect = (float)width / (float)height;
 
     jce_mat4 view = jce_camera_view(s_sr.camera);
@@ -453,16 +464,6 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     }
 
     jce_editor_scene_asset_cache_finalize();
-
-    /* Compute frame delta time for skeletal animation. */
-    uint64_t now_ticks = jce_time_perf_counter();
-    float dt_sec = 0.0f;
-    if (s_sr.anim_last_ticks > 0) {
-        dt_sec = (float)(now_ticks - s_sr.anim_last_ticks)
-               / (float)jce_time_perf_freq();
-        if (dt_sec > 0.1f) dt_sec = 0.1f;
-    }
-    s_sr.anim_last_ticks = now_ticks;
 
     /* Engine renders sky, shadows, entities, and PostFX into the bridge view.
      * PostFX is driven via the engine's pipeline (same one the panel controls). */

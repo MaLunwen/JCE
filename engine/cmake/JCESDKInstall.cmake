@@ -206,15 +206,12 @@ function(jce_register_sdk_install)
 	set(_empty_rsp "${_merge_dir}/empty.rsp")
 	file(WRITE "${_empty_rsp}" "")
 
-	# ---- SDK shim libs (deps-bound, generator-expression paths) ----- #
-	# Owned-but-not-core: extra static libs we author that should land  #
-	# in the *deps* fat lib so they are linked NORMALLY (not under     #
-	# /WHOLEARCHIVE).  Today this is the MSVC STL helper backport — see #
-	# engine/src/sdk_shims/jce_msvc_stl_shims.cpp.                      #
+	# ---- SDK shim libs (standalone, conditionally linked) ------------ #
+	# Keep ABI-compatibility shims out of the deps fat lib.  They must  #
+	# only be linked when the consuming toolchain actually needs them;   #
+	# otherwise a newer MSVC runtime that provides the same STL helper   #
+	# will report duplicate symbols.
 	set(_deps_extra_targets "")
-	if(TARGET jce_msvc_stl_shims)
-		list(APPEND _deps_extra_targets jce_msvc_stl_shims)
-	endif()
 	set(_deps_extra_rsp "${_merge_dir}/$<CONFIG>/deps_extra.rsp")
 	set(_deps_extra_content "")
 	foreach(_t IN LISTS _deps_extra_targets)
@@ -321,19 +318,16 @@ function(jce_register_sdk_install)
 	install(FILES "${_fat_lib_core}" "${_fat_lib_deps}"
 		DESTINATION "${CMAKE_INSTALL_LIBDIR}/$<CONFIG>")
 
-	# ---- jce_pak (host packer) — required by end-user projects to bake
-	# their own asset PAK at build time.
-	if(TARGET jce_pak)
-		install(TARGETS jce_pak
-			RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+	if(TARGET jce_msvc_stl_shims)
+		install(TARGETS jce_msvc_stl_shims
+			ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}/$<CONFIG>")
 	endif()
-	# ---- jce_bin2obj (host binary→COFF/asm wrapper) — required by
-	# jce_target_embed_bundle() to bake .jbundle archives into the exe
-	# for true single-file consumer builds.
-	if(TARGET jce_bin2obj)
-		install(TARGETS jce_bin2obj
-			RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
-	endif()
+
+	# Host-side pack/wrap tools stay in the source tree for engine
+	# developers.  The distributable SDK intentionally omits them: the
+	# packaged editor generates PAK/BOM/bundle embed sources in-process
+	# before invoking CMake, so end-user projects only need headers,
+	# libs, CMake config, and shared engine resources.
 
 	# ---- Engine-side runtime resources that the engine *always* expects
 	# to find in the PAK at boot (HUD/settings RML, fallback fonts,

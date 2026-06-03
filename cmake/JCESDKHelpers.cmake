@@ -9,19 +9,21 @@
 #   jce_target_embed_pak(<target>
 #       RESOURCE_DIRS  <dir> [<dir>...]
 #       [PAK_FILE      <path>]                  # default: <bin>/<target>_assets.pak
-#       [SYMBOL_PREFIX <symbol>]                # default: assets
-#       [EXCLUDE_SEGMENTS <seg> [<seg>...]])    # forwarded to jce_pak
+#       [SYMBOL_PREFIX <symbol>]                # default: assets_pak_data
+#       [EXCLUDE_SEGMENTS <seg> [<seg>...]])
 #
-# Builds a PAK from the listed resource dirs using `${JCE_PAK_EXECUTABLE}`
-# and links it into <target> so the engine can mount it at boot.
+# Links editor-prebuilt assets into <target> when
+# `JCE_PROJECT_PREBUILT_ASSETS_OBJ`, `JCE_PROJECT_PREBUILT_ASSETS_ASM`, or
+# `JCE_PROJECT_PREBUILT_ASSETS_C` is set.  Manual SDK consumers can still
+# provide `${JCE_PAK_EXECUTABLE}` and let this helper pack resource dirs.
 #
 # On MSVC the packer emits a COFF .obj that we link directly.  On
 # GNU/Clang/Apple targets the packer emits a tiny .S wrapper that
 # `.incbin`s the raw PAK; we add the .S to the target sources.
 #
-# The embedded symbols are: <SYMBOL_PREFIX>_pak_data (uint8_t[]) and
-# <SYMBOL_PREFIX>_pak_data_size (uint32_t).  The engine's bootstrap
-# looks for "assets" by default.
+# The embedded symbols are: <SYMBOL_PREFIX> (uint8_t[]) and
+# <SYMBOL_PREFIX>_size (size_t).  The engine's bootstrap looks for
+# assets_pak_data / assets_pak_data_size by default.
 
 include_guard(GLOBAL)
 
@@ -29,17 +31,79 @@ function(jce_target_embed_pak TARGET)
 	if(NOT TARGET ${TARGET})
 		message(FATAL_ERROR "jce_target_embed_pak: '${TARGET}' is not a target.")
 	endif()
-	if(NOT JCE_PAK_EXECUTABLE)
-		message(FATAL_ERROR
-			"jce_target_embed_pak: JCE_PAK_EXECUTABLE is not set. "
-			"The SDK at '${PACKAGE_PREFIX_DIR}' does not ship jce_pak — "
-			"rebuild the SDK with -DJCE_ENABLE_SDK_INSTALL=ON.")
-	endif()
 
 	set(_opts NO_ENGINE_RESOURCES)
 	set(_one  PAK_FILE SYMBOL_PREFIX)
 	set(_multi RESOURCE_DIRS EXCLUDE_SEGMENTS)
 	cmake_parse_arguments(EP "${_opts}" "${_one}" "${_multi}" ${ARGN})
+
+	if(NOT EP_SYMBOL_PREFIX)
+		# Default matches the engine's expected externs:
+		# `assets_pak_data` + `assets_pak_data_size`.
+		set(EP_SYMBOL_PREFIX "assets_pak_data")
+	endif()
+
+	if(DEFINED JCE_PROJECT_PREBUILT_ASSETS_OBJ AND
+	   EXISTS "${JCE_PROJECT_PREBUILT_ASSETS_OBJ}")
+		if(NOT EP_SYMBOL_PREFIX STREQUAL "assets_pak_data")
+			message(FATAL_ERROR
+				"jce_target_embed_pak: editor prebuilt assets use "
+				"symbol prefix assets_pak_data, but '${TARGET}' requested "
+				"'${EP_SYMBOL_PREFIX}'.")
+		endif()
+		set_source_files_properties("${JCE_PROJECT_PREBUILT_ASSETS_OBJ}"
+			PROPERTIES
+				GENERATED       TRUE
+				EXTERNAL_OBJECT TRUE)
+		target_sources(${TARGET} PRIVATE "${JCE_PROJECT_PREBUILT_ASSETS_OBJ}")
+		add_custom_target(${TARGET}_pak
+			DEPENDS "${JCE_PROJECT_PREBUILT_ASSETS_OBJ}")
+		add_dependencies(${TARGET} ${TARGET}_pak)
+		return()
+	endif()
+
+	if(DEFINED JCE_PROJECT_PREBUILT_ASSETS_ASM AND
+	   EXISTS "${JCE_PROJECT_PREBUILT_ASSETS_ASM}")
+		if(NOT EP_SYMBOL_PREFIX STREQUAL "assets_pak_data")
+			message(FATAL_ERROR
+				"jce_target_embed_pak: editor prebuilt assets use "
+				"symbol prefix assets_pak_data, but '${TARGET}' requested "
+				"'${EP_SYMBOL_PREFIX}'.")
+		endif()
+		set_source_files_properties("${JCE_PROJECT_PREBUILT_ASSETS_ASM}"
+			PROPERTIES GENERATED TRUE)
+		target_sources(${TARGET} PRIVATE "${JCE_PROJECT_PREBUILT_ASSETS_ASM}")
+		add_custom_target(${TARGET}_pak
+			DEPENDS "${JCE_PROJECT_PREBUILT_ASSETS_ASM}")
+		add_dependencies(${TARGET} ${TARGET}_pak)
+		return()
+	endif()
+
+	if(DEFINED JCE_PROJECT_PREBUILT_ASSETS_C AND
+	   EXISTS "${JCE_PROJECT_PREBUILT_ASSETS_C}")
+		if(NOT EP_SYMBOL_PREFIX STREQUAL "assets_pak_data")
+			message(FATAL_ERROR
+				"jce_target_embed_pak: editor prebuilt assets use "
+				"symbol prefix assets_pak_data, but '${TARGET}' requested "
+				"'${EP_SYMBOL_PREFIX}'.")
+		endif()
+		set_source_files_properties("${JCE_PROJECT_PREBUILT_ASSETS_C}"
+			PROPERTIES GENERATED TRUE)
+		target_sources(${TARGET} PRIVATE "${JCE_PROJECT_PREBUILT_ASSETS_C}")
+		add_custom_target(${TARGET}_pak
+			DEPENDS "${JCE_PROJECT_PREBUILT_ASSETS_C}")
+		add_dependencies(${TARGET} ${TARGET}_pak)
+		return()
+	endif()
+
+	if(NOT JCE_PAK_EXECUTABLE)
+		message(FATAL_ERROR
+			"jce_target_embed_pak: no prebuilt assets were provided "
+			"(JCE_PROJECT_PREBUILT_ASSETS_OBJ/ASM/C), and "
+			"JCE_PAK_EXECUTABLE is not set. Build through the JCE "
+			"editor, or provide a host packer explicitly for manual "
+			"CMake builds.")
+	endif()
 
 	if(NOT EP_RESOURCE_DIRS)
 		message(FATAL_ERROR "jce_target_embed_pak: RESOURCE_DIRS is required.")
@@ -64,11 +128,6 @@ function(jce_target_embed_pak TARGET)
 
 	if(NOT EP_PAK_FILE)
 		set(EP_PAK_FILE "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}_assets.pak")
-	endif()
-	if(NOT EP_SYMBOL_PREFIX)
-		# Default matches the engine's expected externs:
-		# `assets_pak_data` + `assets_pak_data_size`.
-		set(EP_SYMBOL_PREFIX "assets_pak_data")
 	endif()
 
 	# Per-dir CLI flags.
@@ -158,19 +217,14 @@ endfunction()
 # and feeds them to jce_bundle_file_open_memory() so the shipped exe  #
 # is a single self-contained file — no sidecar `bundles/` directory.  #
 #                                                                     #
-# Requires JCE_BIN2OBJ_EXECUTABLE (set by JCEConfig.cmake when the    #
-# SDK was built with -DJCE_ENABLE_SDK_INSTALL=ON).                    #
+# Editor-driven builds consume pre-generated C sources from           #
+# JCE_PROJECT_PREBUILT_BUNDLE_DIR.  Manual SDK consumers may still    #
+# provide JCE_BIN2OBJ_EXECUTABLE for host-side wrapping.               #
 # ------------------------------------------------------------------ #
 
 function(jce_target_embed_bundle TARGET)
 	if(NOT TARGET ${TARGET})
 		message(FATAL_ERROR "jce_target_embed_bundle: '${TARGET}' is not a target.")
-	endif()
-	if(NOT JCE_BIN2OBJ_EXECUTABLE)
-		message(FATAL_ERROR
-			"jce_target_embed_bundle: JCE_BIN2OBJ_EXECUTABLE is not set. "
-			"The SDK does not ship jce_bin2obj — rebuild the SDK with "
-			"-DJCE_ENABLE_SDK_INSTALL=ON.")
 	endif()
 
 	set(_opts)
@@ -193,6 +247,50 @@ function(jce_target_embed_bundle TARGET)
 		# Sanitize basename → valid C identifier, prefixed with bundle_.
 		string(REGEX REPLACE "[^A-Za-z0-9_]" "_" _sym "${_bname}")
 		set(EB_SYMBOL "bundle_${_sym}")
+	endif()
+
+	if(DEFINED JCE_PROJECT_PREBUILT_BUNDLE_DIR AND
+	   IS_DIRECTORY "${JCE_PROJECT_PREBUILT_BUNDLE_DIR}")
+		set(_prebuilt "")
+		set(_prebuilt_is_obj OFF)
+		if(MSVC)
+			set(_candidate "${JCE_PROJECT_PREBUILT_BUNDLE_DIR}/_embed_bundle_${EB_SYMBOL}.obj")
+			if(EXISTS "${_candidate}")
+				set(_prebuilt "${_candidate}")
+				set(_prebuilt_is_obj ON)
+			endif()
+		else()
+			set(_candidate "${JCE_PROJECT_PREBUILT_BUNDLE_DIR}/_embed_bundle_${EB_SYMBOL}.S")
+			if(EXISTS "${_candidate}")
+				set(_prebuilt "${_candidate}")
+			endif()
+		endif()
+		if(NOT _prebuilt)
+			set(_candidate "${JCE_PROJECT_PREBUILT_BUNDLE_DIR}/_embed_bundle_${EB_SYMBOL}.c")
+			if(EXISTS "${_candidate}")
+				set(_prebuilt "${_candidate}")
+			endif()
+		endif()
+		if(_prebuilt)
+			set_source_files_properties("${_prebuilt}" PROPERTIES GENERATED TRUE)
+			if(_prebuilt_is_obj)
+				set_source_files_properties("${_prebuilt}"
+					PROPERTIES EXTERNAL_OBJECT TRUE)
+			endif()
+			target_sources(${TARGET} PRIVATE "${_prebuilt}")
+			add_custom_target(${TARGET}_embed_${EB_SYMBOL}
+				DEPENDS "${_prebuilt}")
+			add_dependencies(${TARGET} ${TARGET}_embed_${EB_SYMBOL})
+			return()
+		endif()
+	endif()
+
+	if(NOT JCE_BIN2OBJ_EXECUTABLE)
+		message(FATAL_ERROR
+			"jce_target_embed_bundle: no prebuilt bundle source was found "
+			"for ${EB_SYMBOL}, and JCE_BIN2OBJ_EXECUTABLE is not set. "
+			"Build through the JCE editor, or provide a host wrapper "
+			"explicitly for manual CMake builds.")
 	endif()
 
 	# Pick output format + arch per toolchain (mirrors jce_target_embed_pak).

@@ -10,18 +10,17 @@
 #include <math.h>
 #include <string.h>
 
-/* Lambda for practical split scheme (0=linear, 1=logarithmic). */
-#define CSM_LAMBDA 0.5f
-
 static void compute_splits(float *splits, uint32_t count,
-                           float near, float far)
+                           float near, float far, float lambda)
 {
+    if (lambda < 0.0f) lambda = 0.0f;
+    if (lambda > 1.0f) lambda = 1.0f;
     splits[0] = near;
     for (uint32_t i = 1; i <= count; i++) {
         float p = (float)i / (float)count;
         float log_split = near * powf(far / near, p);
         float lin_split = near + (far - near) * p;
-        splits[i] = CSM_LAMBDA * log_split + (1.0f - CSM_LAMBDA) * lin_split;
+        splits[i] = lambda * log_split + (1.0f - lambda) * lin_split;
     }
 }
 
@@ -68,7 +67,8 @@ void jce_csm_compute(JceCsmData *out,
                      const jce_mat4 *camera_view,
                      const jce_vec3 *light_dir,
                      bool homogeneous_depth,
-                     uint16_t shadow_map_size)
+                     uint16_t shadow_map_size,
+                     float split_lambda)
 {
     if (!out || !camera_view || !light_dir) return;
     JCE_PROFILE_ZONE_N("CSM::Compute");
@@ -78,7 +78,8 @@ void jce_csm_compute(JceCsmData *out,
     memset(out, 0, sizeof(*out));
     out->cascade_count = cascade_count;
 
-    compute_splits(out->splits, cascade_count, near_plane, far_plane);
+    compute_splits(out->splits, cascade_count, near_plane, far_plane,
+                   split_lambda);
 
     /* Compute inverse view matrix for frustum corner generation. */
     jce_mat4 inv_view = jce_m4_inverse(camera_view);
@@ -125,10 +126,9 @@ void jce_csm_compute(JceCsmData *out,
         jce_vec3 up_ws    = jce_v3_normalize(jce_v3_cross(right_ws, ld));
 
         /* Snap cascade center onto the world-anchored light-space texel grid.
-         * Snap ALL THREE light-space axes (Unity / Frostbite practice) — the
-         * z-axis snap matters because the shadow map's depth quantization
-         * (24-bit) sees a continuously sliding origin otherwise, which
-         * appears as flickering depth comparisons across frames. */
+         * Only the atlas-plane axes need texel snapping. Quantising the
+         * light-depth axis changes the shadow compare origin in discrete
+         * steps during camera dolly/zoom, which reads as brightness flicker. */
         float map_size = shadow_map_size > 0 ? (float)shadow_map_size : 2048.0f;
         float texel_size = (radius * 2.0f) / map_size;
         if (texel_size > 0.0f) {
@@ -137,7 +137,6 @@ void jce_csm_compute(JceCsmData *out,
             float cz = jce_v3_dot(center, ld);
             cx = floorf(cx / texel_size + 0.5f) * texel_size;
             cy = floorf(cy / texel_size + 0.5f) * texel_size;
-            cz = floorf(cz / texel_size + 0.5f) * texel_size;
             center = jce_v3_add(jce_v3_add(jce_v3_scale(right_ws, cx),
                                            jce_v3_scale(up_ws,    cy)),
                                 jce_v3_scale(ld, cz));

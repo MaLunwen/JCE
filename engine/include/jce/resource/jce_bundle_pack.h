@@ -43,7 +43,7 @@ typedef void (*JceBundlePackLogFn)(JceBundlePackLogLevel level,
 typedef struct JceBundlePackOptions {
     /* Convenience: when non-empty AND the explicit fields below are
      * empty, every other path is auto-derived from the project root:
-     *   scenes_dir    = <project_root>          (recursive *.scene.json)
+     *   scenes_dir    = <project_root>          (recursive *.scene/*.scene.json)
      *   resource_root = <project_root>          (asset paths relative)
      *   out_dir       = <project_root>/.bundles
      *   prev_catalog  = <project_root>/.bundles/.prev/bundle_catalog.json
@@ -63,9 +63,9 @@ typedef struct JceBundlePackOptions {
     /* ── Standalone / selected-scenes mode (v1.1) ──────────────────────
      *
      * The fields above pack every scene reachable from a directory tree
-     * (recursive scan of `*.scene.json`).  The fields below let callers
+     * (recursive scan of `*.scene` / `*.scene.json`).  The fields below let callers
      * package an explicit list of scene files instead — including a
-     * single "floating" `.scene.json` that does not live inside any
+     * single "floating" `.scene` or `.scene.json` that does not live inside any
      * project layout.  This mirrors Unity's BuildPipeline.BuildAssetBundles
      * `scenes[]` argument and Addressables' single-asset group flow.
      *
@@ -73,10 +73,12 @@ typedef struct JceBundlePackOptions {
      * zero-initialised), behaviour is identical to v1.0.
      */
 
-    /* Explicit array of `.scene.json` paths.  When non-NULL and
+    /* Explicit array of `.scene` / `.scene.json` paths.  When non-NULL and
      * `scene_file_count > 0`, the packer skips `walk_scenes()` and
      * uses this list verbatim.  Paths must exist and end in
-     * `.scene.json`; missing entries are logged and skipped.  When
+     * `.scene` or `.scene.json`; missing scene entries are logged and skipped.
+     * Asset references inside accepted scenes are strict: any missing asset
+     * fails the producing bundle/run instead of emitting a partial bundle. When
      * combined with `scenes_dir`, the dir is used only for id/vpath
      * derivation (paths inside it use the relative form; those outside
      * fall back to basename + 8-hex collision tag). */
@@ -101,7 +103,7 @@ typedef struct JceBundlePackOptions {
 
     /* Override the bundle id used in single-file mode.  When NULL or
      * empty, the id is derived from the scene file's basename minus
-     * `.scene.json`. */
+     * its scene suffix. */
     const char *single_bundle_id;
 
     /* ── Project-scope path resolver (v1.2) ────────────────────────────

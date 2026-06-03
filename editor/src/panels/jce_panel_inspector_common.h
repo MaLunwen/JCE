@@ -13,6 +13,7 @@
 #include "ui/jce_editor_colors.h"
 #include "ui/jce_theme_palette.h"
 #include "core/jce_editor_i18n.h"
+#include "core/jce_editor_component_registry.h"
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_state.h"
 #include "core/jce_editor_presets.h"
@@ -204,9 +205,5 @@ bool insp_draw_multi_select_view(JceScene *scene);
 /* inspector_add_component.cpp */
 void insp_add_component_button_and_popup(uint32_t focused, uint64_t flags);
 
-/* Composite "light" group bit + mask, shared between the dispatcher,
- * sync_component_order, and the Add Component popup so they agree on
- * which raw light flags collapse into a single display slot. */
-#define INSP_LIGHT_MASK (JCE_COMP_FLAG_DIR_LIGHT   |   \
-                         JCE_COMP_FLAG_POINT_LIGHT |   \
-                         JCE_COMP_FLAG_SPOT_LIGHT)
+/* Composite light mask, shared between the dispatcher and Add Component. */
+#define INSP_LIGHT_MASK JCE_EDITOR_COMPONENT_LIGHT_MASK

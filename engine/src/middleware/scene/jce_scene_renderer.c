@@ -156,6 +156,9 @@ struct JceSceneRenderer {
     bool                       shadow_valid;
     bool                       shadow_use_csm;
     uint16_t                   shadow_map_size;
+    bgfx_texture_format_t      shadow_depth_fmt;
+    bool                       shadow_near_valid;
+    float                      shadow_near_cached;
     bool                       shadow_far_valid;
     float                      shadow_far_cached;
 
@@ -596,12 +599,24 @@ static bool sr_build_entity_model(JceSceneRenderer *sr, JceScene *scene,
 
 static jce_vec3 sr_light_shine_direction(const jce_vec3 *comp_dir)
 {
-    if (!comp_dir) return jce_dir_light_default().direction;
+    jce_vec3 fallback = jce_v3(0.0f, -1.0f, 0.0f);
+    if (!comp_dir) return fallback;
     float len2 = comp_dir->x * comp_dir->x +
                  comp_dir->y * comp_dir->y +
                  comp_dir->z * comp_dir->z;
-    if (len2 < 1e-8f) return jce_dir_light_default().direction;
-    return *comp_dir;
+    if (len2 < 1e-8f) return fallback;
+    return jce_v3_scale(*comp_dir, 1.0f / sqrtf(len2));
+}
+
+static jce_vec3 sr_light_world_shine_direction(const jce_vec3 *comp_dir,
+                                               const JceTransform *xf)
+{
+    jce_vec3 dir = sr_light_shine_direction(comp_dir);
+    if (xf) {
+        jce_quat q = jce_q_normalize(xf->rotation);
+        dir = jce_q_rotate(q, dir);
+    }
+    return sr_light_shine_direction(&dir);
 }
 
 static jce_vec3 sr_resolve_shadow_light_direction(JceSceneRenderer *sr,
@@ -628,7 +643,8 @@ static jce_vec3 sr_resolve_shadow_light_direction(JceSceneRenderer *sr,
         if (!jce_scene_has_dir_light(scene, e)) continue;
         JceDirectionalLight *dl = jce_scene_get_dir_light(scene, e);
         if (!dl) continue;
-        jce_vec3 dir = sr_light_shine_direction(&dl->direction);
+        JceTransform *xf = jce_scene_get_transform(scene, e);
+        jce_vec3 dir = sr_light_world_shine_direction(&dl->direction, xf);
         dir = jce_v3_scale(dir, -1.0f);
         if (!have_any) { first_dir = dir; have_any = true; }
         if (dl->casts_shadow) return dir;
@@ -743,9 +759,89 @@ static void sr_draw_sky_gradient(JceSceneRenderer *sr, uint16_t view_id)
 
 /* ── Shadow pass ──────────────────────────────────────────────────── */
 
+static void sr_destroy_shadow_targets(JceSceneRenderer *sr)
+{
+    if (!sr) return;
+    if (BGFX_HANDLE_IS_VALID(sr->shadow_fbo)) {
+        bgfx_destroy_frame_buffer(sr->shadow_fbo);
+        sr->shadow_fbo.idx = UINT16_MAX;
+    }
+    if (BGFX_HANDLE_IS_VALID(sr->shadow_tex)) {
+        bgfx_destroy_texture(sr->shadow_tex);
+        sr->shadow_tex.idx = UINT16_MAX;
+    }
+    for (uint32_t i = 0; i < JCE_CSM_MAX_CASCADES; i++) {
+        if (BGFX_HANDLE_IS_VALID(sr->csm_fbo[i])) {
+            bgfx_destroy_frame_buffer(sr->csm_fbo[i]);
+            sr->csm_fbo[i].idx = UINT16_MAX;
+        }
+        if (BGFX_HANDLE_IS_VALID(sr->csm_tex[i])) {
+            bgfx_destroy_texture(sr->csm_tex[i]);
+            sr->csm_tex[i].idx = UINT16_MAX;
+        }
+    }
+    sr->shadow_valid = false;
+    sr->csm_valid = false;
+    sr->last_csm_valid = false;
+}
+
+static void sr_create_shadow_targets(JceSceneRenderer *sr)
+{
+    if (!sr || sr->shadow_map_size == 0) return;
+
+    const uint16_t sz = sr->shadow_map_size;
+    const bgfx_texture_format_t depth_fmt = sr->shadow_depth_fmt;
+    bgfx_attachment_t at;
+
+    sr->shadow_tex = bgfx_create_texture_2d(sz, sz, false, 1, depth_fmt,
+        BGFX_TEXTURE_RT
+        | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
+        | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT,
+        NULL);
+    memset(&at, 0, sizeof(at));
+    bgfx_attachment_init(&at, sr->shadow_tex, BGFX_ACCESS_WRITE,
+                         0, 1, 0, BGFX_RESOLVE_NONE);
+    sr->shadow_fbo = bgfx_create_frame_buffer_from_attachment(1, &at, false);
+    sr->shadow_valid = BGFX_HANDLE_IS_VALID(sr->shadow_fbo);
+
+    sr->csm_valid = true;
+    for (uint32_t i = 0; i < JCE_CSM_MAX_CASCADES; i++) {
+        sr->csm_tex[i] = bgfx_create_texture_2d(sz, sz, false, 1, depth_fmt,
+            BGFX_TEXTURE_RT
+            | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
+            | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT,
+            NULL);
+        memset(&at, 0, sizeof(at));
+        bgfx_attachment_init(&at, sr->csm_tex[i], BGFX_ACCESS_WRITE,
+                             0, 1, 0, BGFX_RESOLVE_NONE);
+        sr->csm_fbo[i] = bgfx_create_frame_buffer_from_attachment(1, &at, false);
+        if (!BGFX_HANDLE_IS_VALID(sr->csm_fbo[i]))
+            sr->csm_valid = false;
+    }
+}
+
+static void sr_ensure_shadow_map_size(JceSceneRenderer *sr, uint16_t size)
+{
+    if (!sr || size == 0) return;
+    if (size < 512) size = 512;
+    if (size > 4096) size = 4096;
+    if (sr->shadow_map_size == size &&
+        BGFX_HANDLE_IS_VALID(sr->shadow_fbo) &&
+        BGFX_HANDLE_IS_VALID(sr->csm_fbo[0]))
+        return;
+
+    sr_destroy_shadow_targets(sr);
+    sr->shadow_map_size = size;
+    sr_create_shadow_targets(sr);
+    sr->shadow_near_valid = false;
+    sr->shadow_far_valid = false;
+}
+
 static void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
                                 const JceCamera *camera, EntityList *list,
-                                uint16_t view_id_base, uint32_t vp_w, uint32_t vp_h)
+                                uint16_t view_id_base, uint32_t vp_w,
+                                uint32_t vp_h, float shadow_distance,
+                                float split_lambda)
 {
     sr->shadow_use_csm = false;
     sr->last_csm_valid = false;
@@ -863,10 +959,37 @@ static void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
     if (cam_near <= 0.0f) cam_near = 0.1f;
     if (cam_far <= cam_near) cam_far = cam_near + 200.0f;
 
+    float shadow_near_target = cam_near;
+    if (shadow_near_target < 0.001f) shadow_near_target = 0.001f;
+    if (shadow_near_target > 1.0f)   shadow_near_target = 1.0f;
+
+    if (!sr->shadow_near_valid) {
+        float bucket = 0.005f;
+        sr->shadow_near_cached =
+            ceilf(shadow_near_target / bucket) * bucket;
+        sr->shadow_near_valid = true;
+    } else {
+        float diff = fabsf(shadow_near_target - sr->shadow_near_cached);
+        float trigger = fmaxf(0.01f, sr->shadow_near_cached * 0.10f);
+        if (diff > trigger) {
+            float bucket = 0.01f;
+            sr->shadow_near_cached =
+                ceilf(shadow_near_target / bucket) * bucket;
+        }
+    }
+    float shadow_near = sr->shadow_near_cached;
+    if (shadow_near < 0.001f) shadow_near = 0.001f;
+
     float shadow_far_target = cam_far;
-    shadow_far_target = fminf(shadow_far_target,
-        fmaxf(cam_near * CSM_DIST_SCALE, CSM_DIST_MAX));
-    shadow_far_target = fmaxf(shadow_far_target, cam_near + CSM_DIST_MIN);
+    if (shadow_distance > 0.0f) {
+        shadow_far_target = fminf(shadow_far_target, shadow_distance);
+        shadow_far_target = fmaxf(shadow_far_target, shadow_near + 1.0f);
+    } else {
+        shadow_far_target = fminf(shadow_far_target,
+            fmaxf(shadow_near * CSM_DIST_SCALE, CSM_DIST_MAX));
+        shadow_far_target = fmaxf(shadow_far_target,
+                                  shadow_near + CSM_DIST_MIN);
+    }
 
     if (!sr->shadow_far_valid) {
         sr->shadow_far_cached = shadow_far_target;
@@ -891,15 +1014,18 @@ static void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
         }
     }
     float shadow_far = sr->shadow_far_cached;
+    if (shadow_far <= shadow_near)
+        shadow_far = shadow_near + CSM_DIST_MIN;
 
     jce_mat4 cam_view = camera ? jce_camera_view(camera) : jce_m4_identity();
     jce_vec3 light_dir = shadow_dir;
 
     JceCsmData csm;
     jce_csm_compute(&csm, sr->csm_cascade_count,
-                    cam_near, shadow_far, cam_fov, aspect,
+                    shadow_near, shadow_far, cam_fov, aspect,
                     &cam_view, &light_dir,
-                    sr->homogeneous_depth, sr->shadow_map_size);
+                    sr->homogeneous_depth, sr->shadow_map_size,
+                    split_lambda);
 
     sr->last_csm = csm;
     sr->last_csm_valid = true;
@@ -1221,6 +1347,14 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
             jce_light_env_set_ambient(sr->light_env,
                                        sr->ambient_override_color,
                                        sr->ambient_override_intensity);
+        } else if (jce_scene_has_rendering_settings(scene)) {
+            const JceSceneRenderingSettings *r =
+                jce_scene_get_rendering_settings(scene);
+            jce_vec3 color = jce_v3(r->ambient_color[0],
+                                    r->ambient_color[1],
+                                    r->ambient_color[2]);
+            jce_light_env_set_ambient(sr->light_env, color,
+                                       r->ambient_intensity);
         } else {
             jce_light_env_set_ambient(sr->light_env, jce_v3(1, 1, 1), 0.15f);
         }
@@ -1238,7 +1372,8 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                     memset(&dl, 0, sizeof(dl));
                     dl.color = dlc->color;
                     dl.intensity = dlc->intensity > 0.0f ? dlc->intensity : 1.0f;
-                    dl.direction = sr_light_shine_direction(&dlc->direction);
+                    dl.direction =
+                        sr_light_world_shine_direction(&dlc->direction, xf);
                     /* P3-E.5 — propagate optional cookie. */
                     dl.cookie_texture  = dlc->cookie_texture;
                     dl.cookie_strength = dlc->cookie_strength;
@@ -1270,7 +1405,8 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                     sl.inner_cone_cos = slc->inner_cone_cos;
                     sl.outer_cone_cos = slc->outer_cone_cos;
                     sl.position  = xf ? xf->position : slc->position;
-                    sl.direction = sr_light_shine_direction(&slc->direction);
+                    sl.direction =
+                        sr_light_world_shine_direction(&slc->direction, xf);
                     /* P3-E.5 — propagate cookie + IES profile bindings. */
                     sl.cookie_texture  = slc->cookie_texture;
                     sl.ies_lut_texture = slc->ies_lut_texture;
@@ -2092,6 +2228,8 @@ JceSceneRenderConfig jce_scene_render_config_default(void)
     c.postfx           = jce_postfx_default_params();
     c.shadow_map_size  = 0;
     c.csm_cascades     = 0;
+    c.shadow_distance  = 0.0f;
+    c.csm_split_lambda = -1.0f;
     c.fog_enabled            = false;
     c.fog                    = jce_volumetric_fog_default_params();
     c.fog_depth_tex_handle   = UINT16_MAX;
@@ -2154,6 +2292,7 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
                  && (d24 & BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER))
             depth_fmt = BGFX_TEXTURE_FORMAT_D24S8;
     }
+    sr->shadow_depth_fmt = depth_fmt;
 
     /* GPU-tier-driven shadow defaults. */
     {
@@ -2432,13 +2571,11 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
     if (BGFX_HANDLE_IS_VALID(sr->u_light_dir))    bgfx_destroy_uniform(sr->u_light_dir);
     if (BGFX_HANDLE_IS_VALID(sr->u_light_color))  bgfx_destroy_uniform(sr->u_light_color);
 
-    if (BGFX_HANDLE_IS_VALID(sr->shadow_fbo))  bgfx_destroy_frame_buffer(sr->shadow_fbo);
+    sr_destroy_shadow_targets(sr);
     if (BGFX_HANDLE_IS_VALID(sr->u_shadowMap)) bgfx_destroy_uniform(sr->u_shadowMap);
     if (BGFX_HANDLE_IS_VALID(sr->u_shadowVP))  bgfx_destroy_uniform(sr->u_shadowVP);
 
     for (uint32_t i = 0; i < JCE_CSM_MAX_CASCADES; i++) {
-        if (BGFX_HANDLE_IS_VALID(sr->csm_fbo[i]))
-            bgfx_destroy_frame_buffer(sr->csm_fbo[i]);
         if (BGFX_HANDLE_IS_VALID(sr->u_csm_samplers[i]))
             bgfx_destroy_uniform(sr->u_csm_samplers[i]);
     }
@@ -2489,14 +2626,25 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
 
     JceSceneRenderConfig defcfg = jce_scene_render_config_default();
     const JceSceneRenderConfig *cfg = config ? config : &defcfg;
+    const JceSceneRenderingSettings *scene_rendering =
+        jce_scene_get_rendering_settings(scene);
 
     /* Apply optional config overrides. */
-    if (cfg->shadow_map_size != 0)
-        sr->shadow_map_size = cfg->shadow_map_size;
-    if (cfg->csm_cascades != 0)
+    if (cfg->shadow_map_size != 0) {
+        sr_ensure_shadow_map_size(sr, cfg->shadow_map_size);
+    } else if (scene_rendering && scene_rendering->shadow_resolution > 0) {
+        sr_ensure_shadow_map_size(sr,
+                                  (uint16_t)scene_rendering->shadow_resolution);
+    }
+    if (cfg->csm_cascades != 0) {
         sr->csm_cascade_count =
             cfg->csm_cascades < JCE_CSM_MAX_CASCADES
             ? cfg->csm_cascades : JCE_CSM_MAX_CASCADES;
+    } else if (scene_rendering && scene_rendering->cascade_count > 0) {
+        uint8_t cascades = (uint8_t)scene_rendering->cascade_count;
+        sr->csm_cascade_count =
+            cascades < JCE_CSM_MAX_CASCADES ? cascades : JCE_CSM_MAX_CASCADES;
+    }
 
     /* Ensure wireframe is OFF before sky draws (sky's fullscreen quad must
      * render solid). The previous frame may have left it ON. Editor mode
@@ -2518,15 +2666,46 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
     if (sm > 3) sm = 0;
     jce_pbr_material_set_view_mode(sm);
 
+    /* Scene rendering settings own PostFX defaults; render config remains
+     * the fallback for callers that render scenes without authored settings. */
+    JcePostFXParams active_postfx = cfg->postfx;
+    if (scene_rendering) {
+        active_postfx.exposure =
+            scene_rendering->exposure;
+        active_postfx.gamma =
+            scene_rendering->gamma;
+        active_postfx.bloom_threshold =
+            scene_rendering->bloom_threshold;
+        active_postfx.bloom_intensity =
+            scene_rendering->bloom_intensity;
+        active_postfx.fxaa_span_max =
+            scene_rendering->fxaa_span_max;
+        active_postfx.vignette_intensity =
+            scene_rendering->vignette_intensity;
+        active_postfx.vignette_smoothness =
+            scene_rendering->vignette_smoothness;
+        active_postfx.chromatic_strength =
+            scene_rendering->chromatic_strength;
+
+        if (sr->postfx_pipeline) {
+            for (int i = 0; i < JCE_POSTFX_COUNT &&
+                 i < JCE_SCENE_RENDERING_POSTFX_COUNT; i++) {
+                jce_postfx_enable(sr->postfx_pipeline,
+                                  (JcePostFXType)i,
+                                  scene_rendering->postfx_enabled[i]);
+            }
+        }
+    }
+
     /* Blend active Volume components into postfx params before pushing. */
     if (camera) {
         jce_vec3 cp = jce_camera_get_position(camera);
-        jce_volume_system_tick(scene, cp, &cfg->postfx);
+        jce_volume_system_tick(scene, cp, &active_postfx);
     }
 
     /* Push postfx params. */
     if (sr->postfx_pipeline)
-        jce_postfx_set_params(sr->postfx_pipeline, &cfg->postfx);
+        jce_postfx_set_params(sr->postfx_pipeline, &active_postfx);
 
     sr->postfx_tonemap_active = false;
     if (sr->postfx_pipeline)
@@ -2568,7 +2747,14 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
     if (cfg->draw_shadows) {
         /* Determine viewport from camera bounds — if absent, assume 16:9. */
         uint32_t vp_w = 1920, vp_h = 1080;
-        sr_draw_shadow_pass(sr, scene, camera, &list, view_id_base, vp_w, vp_h);
+        float shadow_distance = cfg->shadow_distance;
+        float split_lambda = cfg->csm_split_lambda;
+        if (shadow_distance <= 0.0f && scene_rendering)
+            shadow_distance = scene_rendering->shadow_distance;
+        if (split_lambda < 0.0f)
+            split_lambda = scene_rendering ? scene_rendering->split_lambda : 0.5f;
+        sr_draw_shadow_pass(sr, scene, camera, &list, view_id_base,
+                            vp_w, vp_h, shadow_distance, split_lambda);
     } else {
         sr->shadow_use_csm = false;
         sr->last_csm_valid = false;

@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 # ── MUST be set before project() ──
 set(CMAKE_SUPPRESS_REGENERATION TRUE)
 
-project(JCE VERSION 0.8.15 LANGUAGES C)
+project(JCE VERSION 0.9.2 LANGUAGES C)
 
 # CXX is needed for C++ dependencies (bgfx, assimp, imgui) and the editor.
 enable_language(CXX)
@@ -560,7 +560,10 @@ endif()
 # Host cooker tool: jce_cook                                          #
 # ------------------------------------------------------------------ #
 
-if(NOT CMAKE_CROSSCOMPILING)
+if(NOT CMAKE_CROSSCOMPILING AND
+   EXISTS "${JCE_TOOLS_DIR}/jce_cook.c" AND
+   EXISTS "${JCE_TOOLS_DIR}/jce_tex_compress.c" AND
+   EXISTS "${JCE_TOOLS_DIR}/miniaudio_impl_cook.c")
 	add_executable(jce_cook
 		"${JCE_TOOLS_DIR}/jce_cook.c"
 		"${JCE_TOOLS_DIR}/jce_tex_compress.c"
@@ -592,7 +595,12 @@ endif()
 # Asset cooking (optional — pre-decode textures & audio at build time)#
 # ------------------------------------------------------------------ #
 
-option(JCE_ENABLE_ASSET_COOKING "Pre-cook assets at build time (raw→.jceasset)" ON)
+option(JCE_ENABLE_ASSET_COOKING "Pre-cook assets at build time (raw->.jceasset)" ON)
+if(JCE_ENABLE_ASSET_COOKING AND NOT CMAKE_CROSSCOMPILING AND NOT TARGET jce_cook)
+	message(STATUS
+		"JCE asset cooking requested, but host cooker sources are not "
+		"available; PAK targets will read raw resource directories.")
+endif()
 
 # ------------------------------------------------------------------ #
 # Asset embedding (per-module PAK files)                              #
@@ -626,7 +634,7 @@ list(FILTER EDITOR_ASSET_FILES EXCLUDE REGEX "(/|\\\\)raw_assets(/|\\\\)")
 # When enabled, jce_cook pre-decodes textures (PNG→RGBA8) and audio
 # (WAV/OGG→PCM s16).  PAK then packs the cooked containers.
 # Level 0 = no per-chunk ZSTD (PAK already compresses the whole entry).
-if(JCE_ENABLE_ASSET_COOKING AND NOT CMAKE_CROSSCOMPILING)
+if(JCE_ENABLE_ASSET_COOKING AND NOT CMAKE_CROSSCOMPILING AND TARGET jce_cook)
 	set(GAME_COOKED_DIR    "${CMAKE_CURRENT_BINARY_DIR}/_cooked/game")
 	set(EDITOR_COOKED_DIR  "${CMAKE_CURRENT_BINARY_DIR}/_cooked/editor")
 	set(COOK_GAME_STAMP    "${CMAKE_CURRENT_BINARY_DIR}/_cook_game.stamp")

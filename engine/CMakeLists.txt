@@ -531,11 +531,9 @@ endif()
 # SDK link-time shims (MSVC only).                                    #
 #                                                                      #
 # A tiny static lib that back-ports MSVC STL vectorised helpers       #
-# missing from older toolchain CRTs.  Kept OUT of any layer GLOB so   #
-# it does NOT land in the /WHOLEARCHIVE'd core fat lib — instead it   #
-# is merged into the normally-linked deps fat lib so the linker only  #
-# pulls its obj when the symbol is genuinely unresolved (future MSVC  #
-# versions that ship the helper will silently win).                   #
+# missing from older toolchain CRTs.  Kept OUT of layer GLOBs and     #
+# fat libs; the installed JCEConfig.cmake links it only for consumer  #
+# MSVC versions that need the compatibility symbol.                   #
 # ================================================================== #
 if(WIN32 AND MSVC)
 	add_library(jce_msvc_stl_shims STATIC

@@ -28,6 +28,8 @@ LINTS = [
     "check_engine_native_io.py",
     "check_platform_macros.py",
     "check_raw_allocator.py",
+    "check_sdk_asset_embed_shape.py",
+    "check_project_build_layout.py",
     "i18n_audit.py",
     "i18n_hardcoded.py",
 ]

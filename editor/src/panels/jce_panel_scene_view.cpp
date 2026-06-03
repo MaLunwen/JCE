@@ -616,16 +616,10 @@ static void scene_view_frame_entities(bool all)
     int counted = 0;
 
     auto accumulate = [&](uint32_t id) {
-        JceTransform *t = jce_scene_get_transform(scene, (JceEntity)id);
-        if (!t) return;
-        float hx = fabsf(t->scale.x) * 0.5f;
-        float hy = fabsf(t->scale.y) * 0.5f;
-        float hz = fabsf(t->scale.z) * 0.5f;
-        if (hx < 0.1f) hx = 0.1f;
-        if (hy < 0.1f) hy = 0.1f;
-        if (hz < 0.1f) hz = 0.1f;
-        float lo[3] = { t->position.x - hx, t->position.y - hy, t->position.z - hz };
-        float hi[3] = { t->position.x + hx, t->position.y + hy, t->position.z + hz };
+        float lo[3];
+        float hi[3];
+        if (!jce_editor_scene_camera_get_entity_focus_bounds(id, lo, hi))
+            return;
         for (int k = 0; k < 3; k++) {
             if (lo[k] < bmin[k]) bmin[k] = lo[k];
             if (hi[k] > bmax[k]) bmax[k] = hi[k];
@@ -1108,16 +1102,7 @@ static void draw_scene_context_menu(const SceneViewCtx *ctx)
             ImGui::Separator();
 
             if (ImGui::MenuItem(jce_editor_i18n("scene.focusSelected"), "F")) {
-                if (focused != 0) {
-                    JceScene *scene = jce_state_get_scene();
-                    JceTransform *t = scene
-                        ? jce_scene_get_transform(scene, (JceEntity)focused)
-                        : NULL;
-                    if (t) {
-                        jce_editor_scene_camera_set_target(
-                            t->position.x, t->position.y, t->position.z);
-                    }
-                }
+                scene_view_frame_entities(false);
             }
 
             if (ImGui::BeginMenu(jce_editor_i18n("sceneView.gizmoMode"))) {

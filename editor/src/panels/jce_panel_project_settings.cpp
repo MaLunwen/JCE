@@ -77,6 +77,7 @@ struct State {
     bool                jp_loaded            = false;
     char                jp_name[128]         = {0};
     char                jp_version[64]       = {0};
+    char                jp_sdk_path[512]     = {0};
     char                jp_source_assets[256]= {0};
     char                jp_cooked_assets[256]= {0};
     char                jp_startup_scene[512]= {0};
@@ -750,6 +751,8 @@ void draw_project(void)
                       "%s", jp->name ? jp->name : "");
         std::snprintf(g_st.jp_version, sizeof(g_st.jp_version),
                       "%s", jp->version ? jp->version : "");
+        std::snprintf(g_st.jp_sdk_path, sizeof(g_st.jp_sdk_path),
+                      "%s", jp->sdk_path ? jp->sdk_path : "");
         std::snprintf(g_st.jp_source_assets, sizeof(g_st.jp_source_assets),
                       "%s", jp->source_assets ? jp->source_assets : "");
         std::snprintf(g_st.jp_cooked_assets, sizeof(g_st.jp_cooked_assets),
@@ -772,6 +775,13 @@ void draw_project(void)
     ImGui::TextUnformatted(jce_editor_i18n_or("projectSettings.project.version", "Version"));
     ImGui::InputText("##jp_version", g_st.jp_version, sizeof(g_st.jp_version));
     ImGui::PopItemWidth();
+
+    /* SDK paths intentionally stay absolute: projects may live outside
+     * the installed SDK and need an unambiguous package root. */
+    jce_draw_path_input_folder(
+        jce_editor_i18n_or("projectSettings.project.sdkPath",
+                           "JCE SDK root (absolute, optional)"),
+        g_st.jp_sdk_path, sizeof(g_st.jp_sdk_path));
 
     /* Picker-driven path fields — no manual typing.  After the OS
      * dialog hands us an absolute path, we collapse it back to a path
@@ -873,15 +883,16 @@ void draw_project(void)
          * (e.g. version) does not short-circuit the bundle write. */
         bool ok_n = jce_editor_project_update_field("name",          g_st.jp_name);
         bool ok_v = jce_editor_project_update_field("version",       g_st.jp_version);
+        bool ok_sdk = jce_editor_project_update_field("sdk_path",    g_st.jp_sdk_path);
         bool ok_s = jce_editor_project_update_field("source_assets", g_st.jp_source_assets);
         bool ok_c = jce_editor_project_update_field("cooked_assets", g_st.jp_cooked_assets);
         bool ok_e = jce_editor_project_update_field("startup_scene", g_st.jp_startup_scene);
         bool ok_b = jce_editor_project_set_bundles(
                         ptrs.empty() ? nullptr : ptrs.data(), (int)ptrs.size());
-        bool ok = ok_n && ok_v && ok_s && ok_c && ok_e && ok_b;
+        bool ok = ok_n && ok_v && ok_sdk && ok_s && ok_c && ok_e && ok_b;
         jce_log_write(JCE_LOG_LEVEL_INFO, "project_settings", __FILE__, __LINE__,
-                     "save: name=%d ver=%d src=%d cooked=%d scene=%d bundles=%d (%zu)",
-                     (int)ok_n, (int)ok_v, (int)ok_s, (int)ok_c,
+                     "save: name=%d ver=%d sdk=%d src=%d cooked=%d scene=%d bundles=%d (%zu)",
+                     (int)ok_n, (int)ok_v, (int)ok_sdk, (int)ok_s, (int)ok_c,
                      (int)ok_e, (int)ok_b, g_st.jp_bundles.size());
         std::snprintf(g_st.jp_save_msg, sizeof(g_st.jp_save_msg),
                       "%s", ok ? "Saved." : "Save failed (see console).");

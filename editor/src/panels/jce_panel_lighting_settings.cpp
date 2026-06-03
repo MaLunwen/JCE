@@ -4,8 +4,8 @@
  * Single, consolidated editor surface for scene-wide lighting. Mirrors
  * Unity's "Window > Rendering > Lighting" panel. Replaces the older
  * `jce_panel_lighting.cpp` (merged in P5-A.4 — skybox component editing,
- * scene-light enumeration, project-settings persistence for ambient+fog,
- * and the renderer-facing fog/ambient accessors all moved here).
+ * scene-light enumeration, and renderer-facing fog/ambient accessors all
+ * moved here).
  *
  * Per-component (Light / Sun / Probe) inspection still lives in
  * `inspector_lighting.cpp` — this panel is strictly scene-level.
@@ -13,8 +13,7 @@
  * Sections (collapsing headers, all default-open):
  *   1. Environment           Sky type / HDRI / sky+ambient intensity /
  *                            reflection probe slot, plus the per-entity
- *                            Skybox component editor and the ambient
- *                            colour persisted to project settings.
+ *                            Skybox component editor and scene ambient.
  *   2. Directional Light     Sun colour, intensity, yaw/pitch direction,
  *                            shadow toggle.
  *   3. Shadows (CSM)         Distance, cascade count, split lambda,
@@ -28,15 +27,14 @@
  *                            Exp/Exp²) feeding the volumetric-fog
  *                            renderer params (height-falloff aware).
  *
- * The ambient + fog values round-trip through `JceProjectSettings` so
- * they survive editor restarts. Sky/sun/shadow/IBL state is currently
- * per-session and intended to be picked up by the scene serializer.
+ * Ambient, fog, shadows, and PostFX are owned by the current scene's
+ * JceSceneRenderingSettings. Project settings seed new/legacy scenes only.
  */
 
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_i18n.h"
+#include "core/jce_editor_scene_rendering_defaults.h"
 #include "core/jce_editor_state.h"
-#include "core/jce_project_settings.h"
 #include "dialogs/jce_path_input.h"
 #include "scene/jce_editor_scene_render.h"
 
@@ -64,8 +62,6 @@ namespace {
 /* ── Editor-side authoritative state ───────────────────────────────── */
 
 enum SkyType { SKY_NONE = 0, SKY_PROCEDURAL = 1, SKY_HDRI = 2 };
-enum SoftShadow { SOFT_OFF = 0, SOFT_PCF = 1, SOFT_VSM = 2 };
-enum FogMode { FOG_NONE = 0, FOG_LINEAR = 1, FOG_EXP = 2, FOG_EXP2 = 3 };
 
 struct JceLightingSettings {
     /* Environment (in-session) */
@@ -74,10 +70,6 @@ struct JceLightingSettings {
     float sky_intensity       = 1.0f;
     char  reflection_probe[260] = {0};
 
-    /* Ambient (persisted to JceProjectSettings) */
-    float ambient_color[3]    = { 0.1f, 0.1f, 0.12f };
-    float ambient_intensity   = 1.0f;
-
     /* Directional Light (Sun, in-session) */
     float sun_color[3]        = { 1.0f, 0.96f, 0.9f };
     float sun_intensity       = 3.0f;
@@ -85,73 +77,21 @@ struct JceLightingSettings {
     float sun_pitch_deg       = -55.0f;
     bool  sun_cast_shadows    = true;
 
-    /* Shadows (CSM, in-session) */
-    float shadow_distance     = 100.0f;
-    int   cascade_count       = 4;
-    float split_lambda        = 0.7f;
-    int   shadow_resolution   = 2048;
-    int   soft_shadow_mode    = SOFT_PCF;
-
     /* IBL (in-session) */
     int   ibl_sh_bands        = 3;
     int   ibl_spec_mips       = 5;
     bool  ibl_dirty           = false;
-
-    /* Fog (persisted to JceProjectSettings; mode is in-session) */
-    int   fog_mode            = FOG_NONE;
-    bool  fog_enabled         = false;          /* legacy on/off, mirrors mode != NONE */
-    float fog_color[3]        = { 0.7f, 0.75f, 0.85f };
-    float fog_density         = 0.02f;
-    float fog_start           = 10.0f;          /* linear mode */
-    float fog_end             = 200.0f;         /* linear mode */
-    float fog_height_falloff  = 0.05f;
-    float fog_height_origin   = 0.0f;
 };
 
 JceLightingSettings g_lit;
 bool g_lit_initialized = false;
 
-/* ── Persistence (project settings) ─────────────────────────────── */
+/* ── Session-only lighting workbench state ───────────────────────── */
 
 void lit_ensure_init(void)
 {
     if (g_lit_initialized) return;
-    /* Cache is pre-warmed by jce_editor_init; pointer read, no disk I/O. */
-    const JceProjectSettings *ps = jce_project_settings_current();
-    if (ps) {
-        g_lit.ambient_color[0]    = ps->rendering.ambient_color[0];
-        g_lit.ambient_color[1]    = ps->rendering.ambient_color[1];
-        g_lit.ambient_color[2]    = ps->rendering.ambient_color[2];
-        g_lit.ambient_intensity   = ps->rendering.ambient_intensity;
-        g_lit.fog_enabled         = ps->rendering.fog_enabled;
-        g_lit.fog_mode            = ps->rendering.fog_enabled ? FOG_EXP : FOG_NONE;
-        g_lit.fog_color[0]        = ps->rendering.fog_color[0];
-        g_lit.fog_color[1]        = ps->rendering.fog_color[1];
-        g_lit.fog_color[2]        = ps->rendering.fog_color[2];
-        g_lit.fog_density         = ps->rendering.fog_density;
-        g_lit.fog_height_falloff  = ps->rendering.fog_height_falloff;
-        g_lit.fog_height_origin   = ps->rendering.fog_height_origin;
-    }
     g_lit_initialized = true;
-}
-
-void lit_save_to_project_settings(void)
-{
-    const JceProjectSettings *cur = jce_project_settings_current();
-    JceProjectSettings ps;
-    if (cur) ps = *cur; else jce_project_settings_defaults(&ps);
-    ps.rendering.ambient_color[0]   = g_lit.ambient_color[0];
-    ps.rendering.ambient_color[1]   = g_lit.ambient_color[1];
-    ps.rendering.ambient_color[2]   = g_lit.ambient_color[2];
-    ps.rendering.ambient_intensity  = g_lit.ambient_intensity;
-    ps.rendering.fog_enabled        = (g_lit.fog_mode != FOG_NONE);
-    ps.rendering.fog_color[0]       = g_lit.fog_color[0];
-    ps.rendering.fog_color[1]       = g_lit.fog_color[1];
-    ps.rendering.fog_color[2]       = g_lit.fog_color[2];
-    ps.rendering.fog_density        = g_lit.fog_density;
-    ps.rendering.fog_height_falloff = g_lit.fog_height_falloff;
-    ps.rendering.fog_height_origin  = g_lit.fog_height_origin;
-    jce_project_settings_save(&ps);
 }
 
 /* ── Scene light collection ─────────────────────────────────────── */
@@ -184,9 +124,59 @@ void ping_entity(uint32_t id)
     jce_state_select_entity(id, false);
 }
 
+float clamp_float(float v, float lo, float hi)
+{
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+JceSceneRenderingSettings *scene_rendering_settings_mut(JceScene *scene)
+{
+    if (!scene)
+        return nullptr;
+    jce_editor_scene_ensure_rendering_settings(scene);
+    return jce_scene_get_rendering_settings_mut(scene);
+}
+
+const JceSceneRenderingSettings *current_scene_rendering_settings(void)
+{
+    JceScene *scene = jce_state_get_scene();
+    if (!scene)
+        return nullptr;
+    jce_editor_scene_ensure_rendering_settings(scene);
+    return jce_scene_get_rendering_settings(scene);
+}
+
+JceDirectionalLight *first_directional_light(JceScene *scene,
+                                             const LightCollect &c)
+{
+    if (!scene || c.n_dir <= 0)
+        return nullptr;
+    return jce_scene_get_dir_light(scene, (JceEntity)c.dir[0]);
+}
+
+void direction_to_angles(const jce_vec3 &dir, float *yaw_deg, float *pitch_deg)
+{
+    if (!yaw_deg || !pitch_deg)
+        return;
+    *yaw_deg = std::atan2(dir.x, dir.z) * (180.0f / JCE_PI_F);
+    *pitch_deg = std::asin(clamp_float(dir.y, -1.0f, 1.0f)) *
+        (180.0f / JCE_PI_F);
+}
+
+jce_vec3 angles_to_direction(float yaw_deg, float pitch_deg)
+{
+    const float yaw = yaw_deg * (JCE_PI_F / 180.0f);
+    const float pitch = pitch_deg * (JCE_PI_F / 180.0f);
+    const float cp = std::cos(pitch);
+    return jce_v3(std::sin(yaw) * cp, std::sin(pitch), std::cos(yaw) * cp);
+}
+
 /* ── Section helpers ──────────────────────────────────────────────── */
 
-bool draw_environment(JceScene *scene, const LightCollect &c)
+bool draw_environment(JceScene *scene, const LightCollect &c,
+                      JceSceneRenderingSettings *rendering)
 {
     if (!ImGui::CollapsingHeader(
             jce_editor_i18n("panel.lighting.section.environment"),
@@ -215,11 +205,16 @@ bool draw_environment(JceScene *scene, const LightCollect &c)
     changed |= ImGui::SliderFloat(
         jce_editor_i18n("panel.lighting.env.sky_intensity"),
         &g_lit.sky_intensity, 0.0f, 4.0f, "%.2f");
-    changed |= ImGui::SliderFloat(
-        jce_editor_i18n("panel.lighting.env.ambient_intensity"),
-        &g_lit.ambient_intensity, 0.0f, 4.0f, "%.2f");
-    changed |= ImGui::ColorEdit3(jce_editor_i18n("lighting.ambientColor"),
-                                 g_lit.ambient_color);
+
+    ImGui::BeginDisabled(!rendering);
+    if (rendering) {
+        changed |= ImGui::SliderFloat(
+            jce_editor_i18n("panel.lighting.env.ambient_intensity"),
+            &rendering->ambient_intensity, 0.0f, 4.0f, "%.2f");
+        changed |= ImGui::ColorEdit3(jce_editor_i18n("lighting.ambientColor"),
+                                     rendering->ambient_color);
+    }
+    ImGui::EndDisabled();
 
     ImGui::PushID("refprobe");
     changed |= ImGui::InputText(
@@ -256,69 +251,95 @@ bool draw_environment(JceScene *scene, const LightCollect &c)
     return changed;
 }
 
-bool draw_directional_light(void)
+bool draw_directional_light(JceScene *scene, const LightCollect &c)
 {
     if (!ImGui::CollapsingHeader(
             jce_editor_i18n("panel.lighting.section.directional_light"),
             ImGuiTreeNodeFlags_DefaultOpen))
         return false;
 
+    JceDirectionalLight *light = first_directional_light(scene, c);
+    if (!light) {
+        ImGui::TextDisabled("%s", jce_editor_i18n("lighting.noDirectionalLight"));
+        return false;
+    }
+
     bool changed = false;
+    float color[3] = { light->color.x, light->color.y, light->color.z };
     changed |= ImGui::ColorEdit3(jce_editor_i18n("panel.lighting.sun.color"),
-                                 g_lit.sun_color);
+                                 color);
+    if (changed) {
+        light->color.x = color[0];
+        light->color.y = color[1];
+        light->color.z = color[2];
+    }
     changed |= ImGui::SliderFloat(
         jce_editor_i18n("panel.lighting.sun.intensity"),
-        &g_lit.sun_intensity, 0.0f, 10.0f, "%.2f");
+        &light->intensity, 0.0f, 10.0f, "%.2f");
 
     ImGui::TextDisabled("%s",
         jce_editor_i18n("panel.lighting.sun.direction"));
-    changed |= ImGui::SliderFloat(jce_editor_i18n("panel.lighting.sun.yaw"),
-                                  &g_lit.sun_yaw_deg,
-                                  -180.0f, 180.0f, "%.1f\xc2\xb0");
-    changed |= ImGui::SliderFloat(jce_editor_i18n("panel.lighting.sun.pitch"),
-                                  &g_lit.sun_pitch_deg,
-                                  -90.0f, 90.0f, "%.1f\xc2\xb0");
+    float yaw_deg = 0.0f;
+    float pitch_deg = -55.0f;
+    direction_to_angles(light->direction, &yaw_deg, &pitch_deg);
+    bool yaw_changed = ImGui::SliderFloat(
+        jce_editor_i18n("panel.lighting.sun.yaw"),
+        &yaw_deg, -180.0f, 180.0f, "%.1f\xc2\xb0");
+    bool pitch_changed = ImGui::SliderFloat(
+        jce_editor_i18n("panel.lighting.sun.pitch"),
+        &pitch_deg, -90.0f, 90.0f, "%.1f\xc2\xb0");
+    if (yaw_changed || pitch_changed) {
+        light->direction = angles_to_direction(yaw_deg, pitch_deg);
+        changed = true;
+    }
 
     changed |= ImGui::Checkbox(
         jce_editor_i18n("panel.lighting.sun.cast_shadows"),
-        &g_lit.sun_cast_shadows);
+        &light->casts_shadow);
     return changed;
 }
 
-bool draw_shadows(void)
+bool draw_shadows(JceSceneRenderingSettings *rendering)
 {
     if (!ImGui::CollapsingHeader(
             jce_editor_i18n("panel.lighting.section.shadows"),
             ImGuiTreeNodeFlags_DefaultOpen))
         return false;
 
+    ImGui::BeginDisabled(!rendering);
     bool changed = false;
+    if (!rendering) {
+        ImGui::TextDisabled("%s", jce_editor_i18n("common.noScene"));
+        ImGui::EndDisabled();
+        return false;
+    }
+
     changed |= ImGui::SliderFloat(
         jce_editor_i18n("panel.lighting.shadows.distance"),
-        &g_lit.shadow_distance, 10.0f, 500.0f, "%.0f m");
+        &rendering->shadow_distance, 10.0f, 500.0f, "%.0f m");
 
     const char *cc_items[4] = { "1", "2", "3", "4" };
-    int cc_idx = g_lit.cascade_count - 1;
+    int cc_idx = rendering->cascade_count - 1;
     if (cc_idx < 0) cc_idx = 0;
     if (cc_idx > 3) cc_idx = 3;
     if (ImGui::Combo(jce_editor_i18n("panel.lighting.shadows.cascade_count"),
                      &cc_idx, cc_items, 4)) {
-        g_lit.cascade_count = cc_idx + 1;
+        rendering->cascade_count = cc_idx + 1;
         changed = true;
     }
 
     changed |= ImGui::SliderFloat(
         jce_editor_i18n("panel.lighting.shadows.split_lambda"),
-        &g_lit.split_lambda, 0.0f, 1.0f, "%.2f");
+        &rendering->split_lambda, 0.0f, 1.0f, "%.2f");
 
     const char *res_labels[4] = { "512", "1024", "2048", "4096" };
     const int   res_values[4] = { 512, 1024, 2048, 4096 };
     int res_idx = 2;
     for (int i = 0; i < 4; i++)
-        if (res_values[i] == g_lit.shadow_resolution) { res_idx = i; break; }
+        if (res_values[i] == rendering->shadow_resolution) { res_idx = i; break; }
     if (ImGui::Combo(jce_editor_i18n("panel.lighting.shadows.resolution"),
                      &res_idx, res_labels, 4)) {
-        g_lit.shadow_resolution = res_values[res_idx];
+        rendering->shadow_resolution = res_values[res_idx];
         changed = true;
     }
 
@@ -328,7 +349,8 @@ bool draw_shadows(void)
         jce_editor_i18n("panel.lighting.shadows.soft.vsm"),
     };
     changed |= ImGui::Combo(jce_editor_i18n("panel.lighting.shadows.soft"),
-                            &g_lit.soft_shadow_mode, soft_items, 3);
+                            &rendering->soft_shadow_mode, soft_items, 3);
+    ImGui::EndDisabled();
     return changed;
 }
 
@@ -459,14 +481,21 @@ void draw_scene_lights(JceScene *scene, const LightCollect &c)
     }
 }
 
-bool draw_fog(void)
+bool draw_fog(JceSceneRenderingSettings *rendering)
 {
     if (!ImGui::CollapsingHeader(
             jce_editor_i18n("panel.lighting.section.fog"),
             ImGuiTreeNodeFlags_DefaultOpen))
         return false;
 
+    ImGui::BeginDisabled(!rendering);
     bool changed = false;
+    if (!rendering) {
+        ImGui::TextDisabled("%s", jce_editor_i18n("common.noScene"));
+        ImGui::EndDisabled();
+        return false;
+    }
+
     const char *items[4] = {
         jce_editor_i18n("panel.lighting.fog.mode.none"),
         jce_editor_i18n("panel.lighting.fog.mode.linear"),
@@ -474,33 +503,35 @@ bool draw_fog(void)
         jce_editor_i18n("panel.lighting.fog.mode.exp2"),
     };
     if (ImGui::Combo(jce_editor_i18n("panel.lighting.fog.mode"),
-                     &g_lit.fog_mode, items, 4)) {
-        g_lit.fog_enabled = (g_lit.fog_mode != FOG_NONE);
+                     &rendering->fog_mode, items, 4)) {
+        rendering->fog_enabled = (rendering->fog_mode != JCE_SCENE_FOG_NONE);
         changed = true;
     }
 
-    ImGui::BeginDisabled(g_lit.fog_mode == FOG_NONE);
+    ImGui::BeginDisabled(rendering->fog_mode == JCE_SCENE_FOG_NONE);
     changed |= ImGui::ColorEdit3(jce_editor_i18n("panel.lighting.fog.color"),
-                                 g_lit.fog_color);
-    if (g_lit.fog_mode == FOG_LINEAR) {
+                                 rendering->fog_color);
+    if (rendering->fog_mode == JCE_SCENE_FOG_LINEAR) {
         changed |= ImGui::DragFloat(
             jce_editor_i18n("panel.lighting.fog.start"),
-            &g_lit.fog_start, 0.5f, 0.0f, 1000.0f, "%.1f");
+            &rendering->fog_start, 0.5f, 0.0f, 1000.0f, "%.1f");
         changed |= ImGui::DragFloat(
             jce_editor_i18n("panel.lighting.fog.end"),
-            &g_lit.fog_end, 0.5f, 0.0f, 5000.0f, "%.1f");
-    } else if (g_lit.fog_mode == FOG_EXP || g_lit.fog_mode == FOG_EXP2) {
+            &rendering->fog_end, 0.5f, 0.0f, 5000.0f, "%.1f");
+    } else if (rendering->fog_mode == JCE_SCENE_FOG_EXP ||
+               rendering->fog_mode == JCE_SCENE_FOG_EXP2) {
         changed |= ImGui::DragFloat(
             jce_editor_i18n("panel.lighting.fog.density"),
-            &g_lit.fog_density, 0.001f, 0.0f, 1.0f, "%.4f");
+            &rendering->fog_density, 0.001f, 0.0f, 1.0f, "%.4f");
     }
     /* Volumetric fog tuning (consumed by renderer accessor below). */
     changed |= ImGui::DragFloat(jce_editor_i18n("lighting.fog.heightFalloff"),
-                                &g_lit.fog_height_falloff, 0.001f, 0.0f, 1.0f, "%.4f");
+                                &rendering->fog_height_falloff, 0.001f, 0.0f, 1.0f, "%.4f");
     changed |= ImGui::DragFloat(jce_editor_i18n("lighting.fog.heightOrigin"),
-                                &g_lit.fog_height_origin, 0.1f);
+                                &rendering->fog_height_origin, 0.1f);
     ImGui::EndDisabled();
     ImGui::TextDisabled("(%s)", jce_editor_i18n("lighting.fog.note"));
+    ImGui::EndDisabled();
     return changed;
 }
 
@@ -713,16 +744,18 @@ static void lit_draw_settings_tab(void)
 {
     lit_ensure_init();
     JceScene *scene = jce_state_get_scene();
+    JceSceneRenderingSettings *rendering =
+        scene_rendering_settings_mut(scene);
     LightCollect c;
     if (scene) jce_scene_each_entity(scene, collect_cb, &c);
 
     bool dirty = false;
-    dirty |= draw_environment(scene, c);
-    dirty |= draw_directional_light();
-    dirty |= draw_shadows();
+    dirty |= draw_environment(scene, c, rendering);
+    dirty |= draw_directional_light(scene, c);
+    dirty |= draw_shadows(rendering);
     dirty |= draw_ibl();
     draw_scene_lights(scene, c);
-    dirty |= draw_fog();
+    dirty |= draw_fog(rendering);
 
     /* Cross-cut convenience: surface "Bake All Probes" here so users
      * don't have to open the Reflection Probes panel first. The actual
@@ -733,7 +766,7 @@ static void lit_draw_settings_tab(void)
         /* No-op invocation guard for now (see comment above). */
     }
 
-    if (dirty) lit_save_to_project_settings();
+    if (dirty) jce_state_mark_scene_modified();
 }
 
 /* ──────────────────────────────────────────────────────────────────
@@ -883,6 +916,28 @@ extern "C" void jce_editor_lighting_settings_get_sun(
     float out_dir_xyz[3],
     int *out_cast_shadows)
 {
+    JceScene *scene = jce_state_get_scene();
+    LightCollect c;
+    if (scene) jce_scene_each_entity(scene, collect_cb, &c);
+    JceDirectionalLight *light = first_directional_light(scene, c);
+
+    if (light) {
+        if (out_color_rgb) {
+            out_color_rgb[0] = light->color.x;
+            out_color_rgb[1] = light->color.y;
+            out_color_rgb[2] = light->color.z;
+        }
+        if (out_intensity) *out_intensity = light->intensity;
+        if (out_dir_xyz) {
+            out_dir_xyz[0] = light->direction.x;
+            out_dir_xyz[1] = light->direction.y;
+            out_dir_xyz[2] = light->direction.z;
+        }
+        if (out_cast_shadows)
+            *out_cast_shadows = light->casts_shadow ? 1 : 0;
+        return;
+    }
+
     if (out_color_rgb) {
         out_color_rgb[0] = g_lit.sun_color[0];
         out_color_rgb[1] = g_lit.sun_color[1];
@@ -890,12 +945,11 @@ extern "C" void jce_editor_lighting_settings_get_sun(
     }
     if (out_intensity) *out_intensity = g_lit.sun_intensity;
     if (out_dir_xyz) {
-        const float yaw   = g_lit.sun_yaw_deg   * (JCE_PI_F / 180.0f);
-        const float pitch = g_lit.sun_pitch_deg * (JCE_PI_F / 180.0f);
-        const float cp = std::cos(pitch);
-        out_dir_xyz[0] = std::sin(yaw)   * cp;
-        out_dir_xyz[1] = std::sin(pitch);
-        out_dir_xyz[2] = std::cos(yaw)   * cp;
+        jce_vec3 dir = angles_to_direction(g_lit.sun_yaw_deg,
+                                           g_lit.sun_pitch_deg);
+        out_dir_xyz[0] = dir.x;
+        out_dir_xyz[1] = dir.y;
+        out_dir_xyz[2] = dir.z;
     }
     if (out_cast_shadows)
         *out_cast_shadows = g_lit.sun_cast_shadows ? 1 : 0;
@@ -903,31 +957,32 @@ extern "C" void jce_editor_lighting_settings_get_sun(
 
 extern "C" bool jce_editor_lighting_get_fog_enabled(void)
 {
-    /* Fog preview gated on the panel being open, so closing it
-     * immediately removes fog from the viewport. */
-    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_LIGHTING_SETTINGS);
-    if (!vis || !*vis) return false;
-    return g_lit.fog_mode != FOG_NONE;
+    const JceSceneRenderingSettings *r = current_scene_rendering_settings();
+    return r && r->fog_enabled && r->fog_mode != JCE_SCENE_FOG_NONE;
 }
 
 extern "C" void jce_editor_lighting_get_fog_params(JceVolumetricFogParams *out)
 {
     if (!out) return;
+    const JceSceneRenderingSettings *r = current_scene_rendering_settings();
     *out = jce_volumetric_fog_default_params();
-    out->color_r        = g_lit.fog_color[0];
-    out->color_g        = g_lit.fog_color[1];
-    out->color_b        = g_lit.fog_color[2];
-    out->density        = g_lit.fog_density;
-    out->height_falloff = g_lit.fog_height_falloff;
-    out->height_origin  = g_lit.fog_height_origin;
+    if (!r)
+        return;
+    out->color_r        = r->fog_color[0];
+    out->color_g        = r->fog_color[1];
+    out->color_b        = r->fog_color[2];
+    out->density        = r->fog_density;
+    out->height_falloff = r->fog_height_falloff;
+    out->height_origin  = r->fog_height_origin;
 }
 
 extern "C" void jce_editor_lighting_get_ambient(float out_color_rgb[3], float *out_intensity)
 {
+    const JceSceneRenderingSettings *r = current_scene_rendering_settings();
     if (out_color_rgb) {
-        out_color_rgb[0] = g_lit.ambient_color[0];
-        out_color_rgb[1] = g_lit.ambient_color[1];
-        out_color_rgb[2] = g_lit.ambient_color[2];
+        out_color_rgb[0] = r ? r->ambient_color[0] : 0.1f;
+        out_color_rgb[1] = r ? r->ambient_color[1] : 0.1f;
+        out_color_rgb[2] = r ? r->ambient_color[2] : 0.12f;
     }
-    if (out_intensity) *out_intensity = g_lit.ambient_intensity;
+    if (out_intensity) *out_intensity = r ? r->ambient_intensity : 1.0f;
 }

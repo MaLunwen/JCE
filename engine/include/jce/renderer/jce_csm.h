@@ -40,6 +40,7 @@ typedef struct {
  * @param light_dir      Normalized light direction (world space).
  * @param homogeneous_depth  bgfx homogeneous depth flag.
  * @param shadow_map_size Shadow map resolution used by cascades.
+ * @param split_lambda   Practical split blend (0=linear, 1=logarithmic).
  */
 void jce_csm_compute(JceCsmData *out,
                      uint32_t cascade_count,
@@ -50,7 +51,8 @@ void jce_csm_compute(JceCsmData *out,
                      const jce_mat4 *camera_view,
                      const jce_vec3 *light_dir,
                      bool homogeneous_depth,
-                     uint16_t shadow_map_size);
+                     uint16_t shadow_map_size,
+                     float split_lambda);
 
 JCE_EXTERN_C_END
 
