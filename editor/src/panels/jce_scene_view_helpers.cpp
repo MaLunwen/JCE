@@ -28,7 +28,7 @@ bool  s_gizmo_raw_dragging = false;
 float s_gizmo_raw_pos[3]   = {0.0f, 0.0f, 0.0f};
 float s_gizmo_raw_rot[3]   = {0.0f, 0.0f, 0.0f};
 float s_gizmo_raw_scale[3] = {1.0f, 1.0f, 1.0f};
-bool  s_gizmo_history_batch_open = false;
+bool  s_gizmo_transaction_open = false;
 
 /* ── Per-entity persistent euler cache (see internal header) ─────── */
 
@@ -74,9 +74,9 @@ void clear_stale_gizmo_interaction_state(void)
     if (jce_gizmo_is_active() || jce_gizmo_hovered_axis() != JCE_GIZMO_AXIS_NONE)
         jce_gizmo_cancel_interaction();
 
-    if (s_gizmo_history_batch_open) {
-        jce_state_end_batch_edit();
-        s_gizmo_history_batch_open = false;
+    if (s_gizmo_transaction_open) {
+        jce_state_cancel_transaction();
+        s_gizmo_transaction_open = false;
     }
 
     s_gizmo_raw_dragging = false;

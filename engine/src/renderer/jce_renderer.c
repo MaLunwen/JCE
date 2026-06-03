@@ -27,6 +27,8 @@
 
 #define LOG_TAG "jce_renderer"
 
+static uint32_t s_bgfx_frame_index = 0;
+
 #if JCE_PLATFORM_ANDROID
 /* ── Android bgfx-frame side thread ─────────────────────────────────────
  * WSA (Windows Subsystem for Android) uses libEGL_emulation.so, whose
@@ -61,7 +63,7 @@ static void android_bgfx_frame_thread(void *arg)
     while (SDL_GetAtomicInt(&s_frame_thread_live)) {
         jce_semaphore_wait(s_frame_req);
         if (!SDL_GetAtomicInt(&s_frame_thread_live)) break;
-        bgfx_frame(false); /* may block forever in eglSwapBuffers on WSA */
+        s_bgfx_frame_index = bgfx_frame(false); /* may block forever in eglSwapBuffers on WSA */
         SDL_SetAtomicInt(&s_frame_done, 1);
     }
 }
@@ -1143,7 +1145,7 @@ void jce_renderer_present_splash(const JceRenderer *r,
                         rgba_color, 1.0f, 0);
     bgfx_set_view_rect(0, 0, 0, (uint16_t)w, (uint16_t)h);
     bgfx_touch(0);
-    bgfx_frame(false);
+    s_bgfx_frame_index = bgfx_frame(false);
 }
 
 void jce_renderer_end_frame(const JceRenderer *r)
@@ -1195,7 +1197,7 @@ void jce_renderer_end_frame(const JceRenderer *r)
     }
 #endif
 
-    bgfx_frame(false);
+    s_bgfx_frame_index = bgfx_frame(false);
 
     /* Surface allocator + renderer stats to Tracy each frame. */
 #if defined(JCE_PROFILER_ENABLED)
@@ -1578,4 +1580,10 @@ bool jce_renderer_origin_bottom_left(void)
 {
     const bgfx_caps_t *caps = bgfx_get_caps();
     return caps ? caps->originBottomLeft : false;
+}
+
+uint32_t jce_renderer_get_frame_index(const JceRenderer *r)
+{
+    (void)r;
+    return s_bgfx_frame_index;
 }

@@ -279,6 +279,7 @@ struct JceSceneRenderer {
     JceScene         *frame_scene;
     float             frame_shadow_vp[16];
     bool              frame_shadow_vp_valid;
+    bool              frame_shadow_active;
 
     /* Volumetric fog (lazily created when first enabled). */
     JceVolumetricFog *vfog;
@@ -619,41 +620,45 @@ static jce_vec3 sr_light_world_shine_direction(const jce_vec3 *comp_dir,
     return sr_light_shine_direction(&dir);
 }
 
-static jce_vec3 sr_resolve_shadow_light_direction(JceSceneRenderer *sr,
-                                                  JceScene *scene,
-                                                  EntityList *list)
+static bool sr_resolve_primary_dir_light(JceSceneRenderer *sr,
+                                         JceScene *scene,
+                                         EntityList *list,
+                                         bool shadow_only,
+                                         jce_vec3 *out_to_light,
+                                         jce_vec3 *out_color,
+                                         float *out_intensity)
 {
-    jce_vec3 fallback = jce_dir_light_default().direction;
-    jce_vec3 first_dir = fallback;
-    bool have_any = false;
+    bool have_any = false; uint32_t dir_seen = 0;
 
-    if (!scene) {
-        if (sr && sr->tod_active) {
-            /* CSM expects to-light direction; tod_state.sun_direction is
-             * already the unit vector from origin TOWARD the sun, so
-             * return it as-is (do NOT negate). */
-            return sr->tod_state.sun_direction;
+    if (scene && list) {
+        for (int i = 0; i < list->count; i++) {
+            JceEntity e = list->entities[i];
+            if (!entity_enabled(scene, e)) continue;
+            if (!jce_scene_has_dir_light(scene, e)) continue;
+            if (dir_seen++ >= JCE_MAX_DIR_LIGHTS) continue;
+            JceDirectionalLight *dl = jce_scene_get_dir_light(scene, e);
+            if (!dl) continue;
+            have_any = true;
+            if (shadow_only && !dl->casts_shadow) continue;
+
+            JceTransform *xf = jce_scene_get_transform(scene, e);
+            jce_vec3 shine = sr_light_world_shine_direction(&dl->direction, xf);
+            if (out_to_light) *out_to_light = jce_v3_scale(shine, -1.0f);
+            if (out_color) *out_color = dl->color;
+            if (out_intensity) *out_intensity = dl->intensity > 0.0f ? dl->intensity : 1.0f;
+            return true;
         }
-        return fallback;
     }
 
-    for (int i = 0; i < list->count; i++) {
-        JceEntity e = list->entities[i];
-        if (!entity_enabled(scene, e)) continue;
-        if (!jce_scene_has_dir_light(scene, e)) continue;
-        JceDirectionalLight *dl = jce_scene_get_dir_light(scene, e);
-        if (!dl) continue;
-        JceTransform *xf = jce_scene_get_transform(scene, e);
-        jce_vec3 dir = sr_light_world_shine_direction(&dl->direction, xf);
-        dir = jce_v3_scale(dir, -1.0f);
-        if (!have_any) { first_dir = dir; have_any = true; }
-        if (dl->casts_shadow) return dir;
-    }
     if (!have_any && sr && sr->tod_active) {
-        /* See comment above — sun_direction is already to-light. */
-        return sr->tod_state.sun_direction;
+        /* tod_state.sun_direction is already a to-light unit vector. */
+        if (out_to_light) *out_to_light = sr->tod_state.sun_direction;
+        if (out_color) *out_color = sr->tod_state.sun_color;
+        if (out_intensity) *out_intensity = 1.0f;
+        return true;
     }
-    return have_any ? first_dir : fallback;
+
+    return false;
 }
 
 /* ── Shadow VP / CSM helpers ──────────────────────────────────────── */
@@ -693,6 +698,63 @@ static void sr_fill_csm_bias_scales(const JceCsmData *csm, float out_scales[4])
         }
         out_scales[i] = scale;
     }
+}
+
+static void sr_bind_shadow_params(JceSceneRenderer *sr, float inv_map_size)
+{
+    if (!sr) return;
+    float disabled_splits[4] = { 0, 0, 0, 0 };
+    float params[4] = { inv_map_size, sr->csm_blend_ratio,
+                        sr->csm_normal_bias, sr->csm_filter_radius };
+    float bias_scales[4] = { 1, 1, 1, 1 };
+    bgfx_set_uniform(sr->u_csm_splits, disabled_splits, 1);
+    bgfx_set_uniform(sr->u_csm_params, params, 1);
+    bgfx_set_uniform(sr->u_csm_bias_scales, bias_scales, 1);
+}
+
+static void sr_bind_shadow_uniforms_disabled(JceSceneRenderer *sr)
+{
+    sr_bind_shadow_params(sr, 0.0f);
+}
+
+static void sr_bind_frame_shadow_state(JceSceneRenderer *sr)
+{
+    if (!sr || !sr->frame_shadow_active) {
+        sr_bind_shadow_uniforms_disabled(sr);
+        return;
+    }
+
+    if (sr->shadow_use_csm && sr->last_csm_valid) {
+        const JceCsmData *csm = &sr->last_csm;
+        bgfx_set_uniform(sr->u_csm_vp, csm->vp[0].raw[0], (uint16_t)csm->cascade_count);
+        float splits_v4[4] = { 0, 0, 0, 0 };
+        for (uint32_t ci = 0; ci < csm->cascade_count && ci < 4; ci++)
+            splits_v4[ci] = csm->splits[ci + 1];
+        bgfx_set_uniform(sr->u_csm_splits, splits_v4, 1);
+
+        float csm_params[4] = { sr->shadow_map_size > 0 ? 1.0f / (float)sr->shadow_map_size : 0.0f,
+            sr->csm_blend_ratio, sr->csm_normal_bias, sr->csm_filter_radius };
+        bgfx_set_uniform(sr->u_csm_params, csm_params, 1);
+
+        float bias_scales[4];
+        sr_fill_csm_bias_scales(csm, bias_scales);
+        bgfx_set_uniform(sr->u_csm_bias_scales, bias_scales, 1);
+
+        for (uint32_t ci = 0;
+             ci < sr->csm_cascade_count && ci < JCE_CSM_MAX_CASCADES; ci++)
+            bgfx_set_texture((uint8_t)(9 + ci), sr->u_csm_samplers[ci], sr->csm_tex[ci], UINT32_MAX);
+        return;
+    }
+
+    if (!sr->shadow_use_csm && sr->frame_shadow_vp_valid && BGFX_HANDLE_IS_VALID(sr->shadow_tex)) {
+        bgfx_set_texture(5, sr->u_shadowMap, sr->shadow_tex, UINT32_MAX);
+        bgfx_set_uniform(sr->u_shadowVP, sr->frame_shadow_vp, 1);
+        sr_bind_shadow_params(sr, sr->shadow_map_size > 0
+                              ? 1.0f / (float)sr->shadow_map_size : 0.0f);
+        return;
+    }
+
+    sr_bind_shadow_uniforms_disabled(sr);
 }
 
 /* ── Sky pass ─────────────────────────────────────────────────────── */
@@ -843,26 +905,9 @@ static void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
                                 uint32_t vp_h, float shadow_distance,
                                 float split_lambda)
 {
-    sr->shadow_use_csm = false;
-    sr->last_csm_valid = false;
-
-    /* Default uniforms even if shadows aren't rendered. */
-    {
-        float disabled_splits[4] = { 0, 0, 0, 0 };
-        float csm_params[4] = {
-            sr->shadow_map_size > 0 ? 1.0f / (float)sr->shadow_map_size : 0.0f,
-            sr->csm_blend_ratio,
-            sr->csm_normal_bias,
-            sr->csm_filter_radius,
-        };
-        float bias_scales[4] = { 1, 1, 1, 1 };
-        if (BGFX_HANDLE_IS_VALID(sr->u_csm_splits))
-            bgfx_set_uniform(sr->u_csm_splits, disabled_splits, 1);
-        if (BGFX_HANDLE_IS_VALID(sr->u_csm_params))
-            bgfx_set_uniform(sr->u_csm_params, csm_params, 1);
-        if (BGFX_HANDLE_IS_VALID(sr->u_csm_bias_scales))
-            bgfx_set_uniform(sr->u_csm_bias_scales, bias_scales, 1);
-    }
+    sr->shadow_use_csm = false; sr->last_csm_valid = false;
+    sr->frame_shadow_active = false; sr->frame_shadow_vp_valid = false;
+    sr_bind_shadow_uniforms_disabled(sr);
 
     if (!sr->shadow_valid) return;
 
@@ -886,7 +931,9 @@ static void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
 
     const bool use_csm = sr->csm_valid && sr->csm_cascade_count > 0
                       && jce_render_pipeline_is_feature_enabled("csm");
-    jce_vec3 shadow_dir = sr_resolve_shadow_light_direction(sr, scene, list);
+    jce_vec3 shadow_dir;
+    if (!sr_resolve_primary_dir_light(sr, scene, list, true, &shadow_dir, NULL, NULL))
+        return;
 
     /* Compute shadow view IDs from base. */
     const uint16_t shadow_view_0 = (uint16_t)(view_id_base + 10);
@@ -903,6 +950,10 @@ static void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
         float identity[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
         bgfx_set_view_transform(shadow_view_0, identity, shadow_vp);
         bgfx_set_uniform(sr->u_shadowVP, shadow_vp, 1);
+        bgfx_touch(shadow_view_0);
+
+        memcpy(sr->frame_shadow_vp, shadow_vp, sizeof(shadow_vp));
+        sr->frame_shadow_vp_valid = true; sr->frame_shadow_active = true;
 
         if (use_rq_shadow) {
             jce_rq_clear(sr->render_queue);
@@ -1029,6 +1080,7 @@ static void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
 
     sr->last_csm = csm;
     sr->last_csm_valid = true;
+    sr->frame_shadow_active = true;
 
     if (use_rq_shadow) {
         jce_rq_clear(sr->render_queue);
@@ -1042,6 +1094,7 @@ static void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
 
             float identity[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
             bgfx_set_view_transform(cv, identity, csm.vp[c].raw[0]);
+            bgfx_touch(cv);
 
             for (int i = 0; i < list->count; i++) {
                 JceEntity e = list->entities[i];
@@ -1078,6 +1131,7 @@ static void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
 
             float identity[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
             bgfx_set_view_transform(cv, identity, csm.vp[c].raw[0]);
+            bgfx_touch(cv);
 
             for (int i = 0; i < list->count; i++) {
                 JceEntity e = list->entities[i];
@@ -1092,28 +1146,7 @@ static void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
         }
     }
 
-    /* Upload CSM uniforms. */
-    bgfx_set_uniform(sr->u_csm_vp, csm.vp[0].raw[0], (uint16_t)csm.cascade_count);
-
-    float splits_v4[4] = {
-        csm.cascade_count > 0 ? csm.splits[1] : shadow_far,
-        csm.cascade_count > 1 ? csm.splits[2] : shadow_far,
-        csm.cascade_count > 2 ? csm.splits[3] : shadow_far,
-        csm.cascade_count > 3 ? csm.splits[4] : shadow_far,
-    };
-    bgfx_set_uniform(sr->u_csm_splits, splits_v4, 1);
-
-    float csm_params[4] = {
-        1.0f / (float)sr->shadow_map_size,
-        sr->csm_blend_ratio,
-        sr->csm_normal_bias,
-        sr->csm_filter_radius,
-    };
-    bgfx_set_uniform(sr->u_csm_params, csm_params, 1);
-
-    float bias_scales[4];
-    sr_fill_csm_bias_scales(&csm, bias_scales);
-    bgfx_set_uniform(sr->u_csm_bias_scales, bias_scales, 1);
+    sr_bind_frame_shadow_state(sr);
 }
 
 /* ── Skybox scan ──────────────────────────────────────────────────── */
@@ -1371,7 +1404,7 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                     JceDirLightDesc dl;
                     memset(&dl, 0, sizeof(dl));
                     dl.color = dlc->color;
-                    dl.intensity = dlc->intensity > 0.0f ? dlc->intensity : 1.0f;
+                    dl.intensity = dlc->intensity > 0.0f ? dlc->intensity : 1.0f; dl.casts_shadow = dlc->casts_shadow;
                     dl.direction =
                         sr_light_world_shine_direction(&dlc->direction, xf);
                     /* P3-E.5 — propagate optional cookie. */
@@ -1417,25 +1450,17 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
             }
         }
 
-        if (!has_any_light) {
+        if (!has_any_light && sr->tod_active) {
             JceDirLightDesc dl;
             memset(&dl, 0, sizeof(dl));
-            if (sr->tod_active) {
-                dl.direction = jce_v3_scale(sr->tod_state.sun_direction, -1.0f);
-                dl.color     = sr->tod_state.sun_color;
-                dl.intensity = 1.0f;
-            } else {
-                dl.direction = jce_v3(-0.5f, -1.0f, -0.3f);
-                dl.color = jce_v3(1, 1, 1);
-                dl.intensity = 1.0f;
-            }
+            dl.direction = jce_v3_scale(sr->tod_state.sun_direction, -1.0f);
+            dl.color     = sr->tod_state.sun_color;
+            dl.intensity = 1.0f; dl.casts_shadow = true;
             jce_light_env_add_dir_light(sr->light_env, &dl);
         }
 
-        if (sr->tod_active) {
-            jce_light_env_set_ambient(sr->light_env,
-                                       sr->tod_state.ambient_color, 1.0f);
-        }
+        if (sr->tod_active)
+            jce_light_env_set_ambient(sr->light_env, sr->tod_state.ambient_color, 1.0f);
 
         if (camera) {
             jce_vec3 cp = jce_camera_get_position(camera);
@@ -1444,9 +1469,21 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
         jce_light_env_apply(sr->light_env, sr->renderer);
     }
 
-    JceDirLight sun = jce_dir_light_default();
-    sun.direction = sr_resolve_shadow_light_direction(sr, scene, list);
-    jce_lighting_apply(sr->renderer, &sun);
+    jce_vec3 legacy_dir, legacy_color;
+    float legacy_intensity = 1.0f;
+    bool legacy_has_dir = sr_resolve_primary_dir_light(sr, scene, list, false,
+        &legacy_dir, &legacy_color, &legacy_intensity);
+    if (legacy_has_dir) {
+        JceDirLight sun = jce_dir_light_default();
+        sun.direction = legacy_dir;
+        sun.color = jce_v3_scale(legacy_color, legacy_intensity);
+        jce_lighting_apply(sr->renderer, &sun);
+    } else {
+        float raw_dir[4] = { 0.0f, 1.0f, 0.0f, 1.0f };
+        float raw_color[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
+        bgfx_set_uniform(sr->u_light_dir, raw_dir, 1);
+        bgfx_set_uniform(sr->u_light_color, raw_color, 1);
+    }
 
     /* WIREFRAME_TEXTURED debug view: trigger fs_mesh.sc hue-Lambert branch by
      * setting u_lightDir.w = 0.25 (matches 0.5.7 behaviour). Done after
@@ -1454,7 +1491,7 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
     if (cfg->view_mode == JCE_SCENE_VIEW_WIREFRAME_TEXTURED &&
         sr->has_cbs && sr->cbs.load_texture)
     {
-        jce_vec3 sd = sun.direction;
+        jce_vec3 sd = legacy_has_dir ? legacy_dir : jce_v3(0.0f, 1.0f, 0.0f);
         float len = sqrtf(sd.x * sd.x + sd.y * sd.y + sd.z * sd.z);
         if (len > 1e-6f) { sd.x /= len; sd.y /= len; sd.z /= len; }
         float wf_dir[4]   = { sd.x, sd.y, sd.z, 0.25f };
@@ -1538,12 +1575,6 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
         jce_rq_clear(sr->render_queue);
         sr->frame_view_id = view_id;
         sr->frame_scene = scene;
-        sr->frame_shadow_vp_valid = false;
-        if (sr->shadow_valid && !sr->shadow_use_csm) {
-            jce_vec3 sd = sr_resolve_shadow_light_direction(sr, scene, list);
-            sr_compute_shadow_vp(sr, &sd, sr->frame_shadow_vp);
-            sr->frame_shadow_vp_valid = true;
-        }
     }
 
     for (int i = 0; i < list->count; i++) {
@@ -2036,7 +2067,6 @@ static uint32_t sr_compute_material_key(const JcePbrMaterial *pbr,
 static void sr_reset_material_cache(JceSceneRenderer *sr)
 {
     sr->mat_count = 0;
-    sr->frame_shadow_vp_valid = false;
 }
 
 /* Look up an existing entry by key, or append a new one. Returns the
@@ -2106,18 +2136,7 @@ static void sr_bind_material_cb(uint32_t material_key, void *user)
     if (sr->light_env)
         jce_light_env_apply(sr->light_env, sr->renderer);
 
-    /* Single-light shadow map. */
-    if (sr->shadow_valid && !sr->shadow_use_csm && sr->frame_shadow_vp_valid) {
-        bgfx_set_texture(5, sr->u_shadowMap, sr->shadow_tex, UINT32_MAX);
-        bgfx_set_uniform(sr->u_shadowVP, sr->frame_shadow_vp, 1);
-    }
-    /* CSM cascade samplers. */
-    if (sr->csm_valid && sr->shadow_use_csm) {
-        for (uint32_t ci = 0;
-             ci < sr->csm_cascade_count && ci < JCE_CSM_MAX_CASCADES; ci++)
-            bgfx_set_texture((uint8_t)(9 + ci), sr->u_csm_samplers[ci],
-                             sr->csm_tex[ci], UINT32_MAX);
-    }
+    sr_bind_frame_shadow_state(sr);
 
     /* IBL. */
     float ibl_params[4] = {
@@ -2167,10 +2186,6 @@ static void sr_bind_material_cb(uint32_t material_key, void *user)
 }
 
 /* Suppress unused-static warnings until Phase 3 wires these in. */
-static void sr_phase2_anchor(void) {
-    (void)sr_phase2_anchor;
-}
-
 /* Inline binding helper extracted from the legacy mesh main loop. Used
  * by the non-queue path (terrain, queue overflow, queue-disabled). */
 static void sr_inline_bind_pbr_global(JceSceneRenderer *sr,
@@ -2178,23 +2193,14 @@ static void sr_inline_bind_pbr_global(JceSceneRenderer *sr,
                                       uint16_t view_id,
                                       JceScene *scene, EntityList *list)
 {
+    (void)scene;
+    (void)list;
+
     jce_pbr_material_bind(pbr, sr->renderer, view_id);
     /* Re-apply lights per-entity — see sr_bind_material_cb for rationale. */
     if (sr->light_env)
         jce_light_env_apply(sr->light_env, sr->renderer);
-    if (sr->shadow_valid && !sr->shadow_use_csm) {
-        bgfx_set_texture(5, sr->u_shadowMap, sr->shadow_tex, UINT32_MAX);
-        float shadow_vp[16];
-        jce_vec3 shadow_dir = sr_resolve_shadow_light_direction(sr, scene, list);
-        sr_compute_shadow_vp(sr, &shadow_dir, shadow_vp);
-        bgfx_set_uniform(sr->u_shadowVP, shadow_vp, 1);
-    }
-    if (sr->csm_valid && sr->shadow_use_csm) {
-        for (uint32_t ci = 0;
-             ci < sr->csm_cascade_count && ci < JCE_CSM_MAX_CASCADES; ci++)
-            bgfx_set_texture((uint8_t)(9 + ci), sr->u_csm_samplers[ci],
-                             sr->csm_tex[ci], UINT32_MAX);
-    }
+    sr_bind_frame_shadow_state(sr);
     float ibl_params[4] = {
         0.0f, 5.0f, 0.0f,
         sr->postfx_tonemap_active ? 1.0f : 0.0f
@@ -2497,7 +2503,7 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
     sr->render_queue = jce_rq_create(4096);
     sr->mat_count = 0;
     sr->frame_view_id = 0;
-    sr->frame_shadow_vp_valid = false;
+    sr->frame_shadow_vp_valid = false; sr->frame_shadow_active = false;
     return sr;
 }
 
@@ -2629,6 +2635,9 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
     const JceSceneRenderingSettings *scene_rendering =
         jce_scene_get_rendering_settings(scene);
 
+    sr->frame_shadow_active = false; sr->frame_shadow_vp_valid = false;
+    sr->shadow_use_csm = false; sr->last_csm_valid = false;
+
     /* Apply optional config overrides. */
     if (cfg->shadow_map_size != 0) {
         sr_ensure_shadow_map_size(sr, cfg->shadow_map_size);
@@ -2746,7 +2755,7 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
     /* Shadow passes (do them BEFORE entity pass so PBR can sample). */
     if (cfg->draw_shadows) {
         /* Determine viewport from camera bounds — if absent, assume 16:9. */
-        uint32_t vp_w = 1920, vp_h = 1080;
+        uint32_t vp_w = cfg->viewport_width ? cfg->viewport_width : 1920, vp_h = cfg->viewport_height ? cfg->viewport_height : 1080;
         float shadow_distance = cfg->shadow_distance;
         float split_lambda = cfg->csm_split_lambda;
         if (shadow_distance <= 0.0f && scene_rendering)
@@ -2756,8 +2765,7 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
         sr_draw_shadow_pass(sr, scene, camera, &list, view_id_base,
                             vp_w, vp_h, shadow_distance, split_lambda);
     } else {
-        sr->shadow_use_csm = false;
-        sr->last_csm_valid = false;
+        sr->shadow_use_csm = false; sr->last_csm_valid = false;
     }
 
     /* Apply view-mode wireframe via the renderer. CRITICAL: this MUST come

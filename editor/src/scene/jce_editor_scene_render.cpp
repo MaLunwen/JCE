@@ -288,6 +288,16 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
         return false;
     }
 
+    JceScenePickDesc pick_desc;
+    memset(&pick_desc, 0, sizeof(pick_desc));
+    pick_desc.renderer  = renderer;
+    pick_desc.pak       = pak;
+    pick_desc.callbacks = &cbs;
+    pick_desc.view_id   = (uint16_t)JCE_VIEW_EDITOR_PICK;
+    s_sr.pick_pass = jce_scene_pick_create(&pick_desc);
+    if (!s_sr.pick_pass)
+        LOG_WARN(LOG_TAG, "scene GPU picking unavailable");
+
     s_sr.anim_last_ticks = 0;
 
     /* Occlusion culler: GPU-query two-pass coherence culling.
@@ -342,6 +352,11 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
 void jce_editor_scene_render_shutdown(void)
 {
     if (!s_sr.initialized) return;
+
+    if (s_sr.pick_pass) {
+        jce_scene_pick_destroy(s_sr.pick_pass);
+        s_sr.pick_pass = NULL;
+    }
 
     if (s_sr.scene_renderer) {
         jce_scene_renderer_destroy(s_sr.scene_renderer);
@@ -505,6 +520,8 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
      * the Profiler panel under "Scene Culling". Approximate AABBs derived
      * from transform position + scale; precise mesh AABBs are a TODO. */
     cfg.frustum_culling = true;
+    cfg.viewport_width = width;
+    cfg.viewport_height = height;
 
     /* Two-pass GPU-query occlusion culling. Falls back to always-visible
      * when hardware queries are unsupported (ES2/WebGL1). */
@@ -534,6 +551,11 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
                                                  amb_color, amb_intensity);
         jce_scene_renderer_render(s_sr.scene_renderer, scene, s_sr.camera,
                                   scene_view_id(), dt_sec, &cfg);
+    }
+
+    if (scene && s_sr.pick_pass) {
+        jce_scene_pick_render(s_sr.pick_pass, scene, s_sr.camera,
+                              width, height);
     }
 
     /* Composite volumetric fog into the bridge color RT (after the
@@ -623,6 +645,31 @@ uint16_t jce_editor_scene_render_get_texture(void)
         return s_sr.postfx_output_tex;
 
     return jce_offscreen_target_get_color_texture(s_sr.bridge);
+}
+
+bool jce_editor_scene_pick_supported(void)
+{
+    return s_sr.pick_pass != NULL && jce_scene_pick_supported();
+}
+
+bool jce_editor_scene_pick_request(uint32_t x, uint32_t y)
+{
+    if (!s_sr.pick_pass)
+        return false;
+    return jce_scene_pick_request(s_sr.pick_pass, x, y);
+}
+
+bool jce_editor_scene_pick_poll(uint32_t *out_entity_id)
+{
+    if (!s_sr.pick_pass || !out_entity_id)
+        return false;
+
+    JceScenePickResult result;
+    if (!jce_scene_pick_poll(s_sr.pick_pass, &result))
+        return false;
+
+    *out_entity_id = (uint32_t)result.entity;
+    return true;
 }
 
 void jce_editor_scene_set_scene_dir(const char *dir)

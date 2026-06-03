@@ -299,3 +299,69 @@ void jce_model_submit_wireframe_overlay(const JceModel *model,
         }
     }
 }
+
+void jce_model_submit_pick_id(const JceModel *model,
+                              const JceRenderer *r,
+                              uint16_t view_id,
+                              const jce_mat4 *transform,
+                              const jce_mat4 *joint_matrices,
+                              uint32_t num_joints,
+                              JceShaderHandle static_program,
+                              JceShaderHandle skinned_program)
+{
+    if (!model || !r)
+        return;
+
+    jce_mat4 identity = jce_m4_identity();
+    const jce_mat4 *root = transform ? transform : &identity;
+
+    for (uint32_t n = 0; n < model->num_nodes; n++) {
+        const JceModelNode *node = &model->nodes[n];
+        jce_mat4 world = jce_m4_multiply(root, &node->local_transform);
+
+        for (uint32_t p = 0; p < node->num_primitives; p++) {
+            const JceModelPrimitive *prim = &node->primitives[p];
+
+            bool double_sided = false;
+            if (prim->material_index < model->num_materials)
+                double_sided = model->materials[prim->material_index].double_sided;
+
+            if (prim->skinned_mesh) {
+                if (jce_skinned_mesh_is_skinned(prim->skinned_mesh)) {
+                    if (joint_matrices && num_joints > 0) {
+                        uint32_t nb = num_joints < 256 ? num_joints : 256;
+                        jce_mat4 world_bones[256];
+                        for (uint32_t bi = 0; bi < nb; bi++)
+                            world_bones[bi] = jce_m4_multiply(root, &joint_matrices[bi]);
+                        jce_skinned_mesh_set_bones(world_bones, nb);
+                    } else if (model->skeleton) {
+                        uint32_t num_j = jce_skeleton_joint_count(model->skeleton);
+                        if (num_j > 256)
+                            num_j = 256;
+                        jce_mat4 bind_pose[256];
+                        jce_skeleton_evaluate(model->skeleton, NULL, bind_pose, num_j);
+                        for (uint32_t bi = 0; bi < num_j; bi++)
+                            bind_pose[bi] = jce_m4_multiply(root, &bind_pose[bi]);
+                        jce_skinned_mesh_set_bones(bind_pose, num_j);
+                    } else {
+                        bgfx_set_transform(world.raw[0], 1);
+                    }
+                    jce_skinned_mesh_submit_pick_id(prim->skinned_mesh, r, view_id,
+                                                    skinned_program, double_sided);
+                } else {
+                    jce_mat4 static_world = compute_static_node_world(
+                        model, node, root, &world, joint_matrices, num_joints);
+                    bgfx_set_transform(static_world.raw[0], 1);
+                    jce_skinned_mesh_submit_pick_id(prim->skinned_mesh, r, view_id,
+                                                    static_program, double_sided);
+                }
+            } else if (prim->static_mesh) {
+                jce_mat4 static_world = compute_static_node_world(
+                    model, node, root, &world, joint_matrices, num_joints);
+                bgfx_set_transform(static_world.raw[0], 1);
+                jce_mesh_submit_pick_id(prim->static_mesh, r, view_id,
+                                        static_program, double_sided);
+            }
+        }
+    }
+}

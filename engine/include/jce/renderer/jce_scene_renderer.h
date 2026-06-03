@@ -91,6 +91,8 @@ typedef struct {
     float                shadow_distance;  /* 0 = scene/default     */
     float                csm_split_lambda; /* <0 = scene/default    */
     JceSceneViewModeKind view_mode;        /* default 0 = shaded   */
+    uint32_t             viewport_width;   /* 0 = fallback 16:9    */
+    uint32_t             viewport_height;  /* 0 = fallback 16:9    */
 
     /* Broadphase frustum culling using the spatial grid. Approximate AABBs
      * are derived from each entity's transform position + scale (a precise

@@ -88,6 +88,14 @@ JCE_API void jce_mesh_submit_pbr_with_program(const JceMesh        *mesh,
                                                uint16_t              view_id,
                                                JceShaderHandle       program);
 
+/* Submit mesh to an object-ID picking pass.
+ * Caller must set transform and ID uniforms before calling. */
+JCE_API void jce_mesh_submit_pick_id(const JceMesh        *mesh,
+                                     const JceRenderer    *r,
+                                     uint16_t              view_id,
+                                     JceShaderHandle       program,
+                                     bool                  double_sided);
+
 /* Submit mesh for terrain rendering using the terrain shader program.
    Caller must bind splat / layer textures and u_terrainParams before this
    (in addition to the usual PBR uniforms / lighting / shadows). */

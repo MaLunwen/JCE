@@ -16,6 +16,7 @@
 
 #include <jce/os/core/jce_defs.h>
 #include <jce/os/core/jce_math.h>
+#include <jce/renderer/jce_gfx_types.h>
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -84,6 +85,15 @@ JCE_API void JCE_CALL jce_skinned_mesh_submit(const JceSkinnedMesh *mesh,
  * bgfx_set_transform for non-skinned PBR variants). */
 JCE_API void JCE_CALL jce_skinned_mesh_submit_wireframe_overlay(
     const JceSkinnedMesh *mesh, const JceRenderer *r, uint16_t view_id);
+
+/* Submit mesh to an object-ID picking pass.  For skinned meshes the bone
+ * palette must already be uploaded with jce_skinned_mesh_set_bones(). */
+JCE_API void JCE_CALL jce_skinned_mesh_submit_pick_id(
+    const JceSkinnedMesh *mesh,
+    const JceRenderer *r,
+    uint16_t view_id,
+    JceShaderHandle program,
+    bool double_sided);
 
 /* Upload bone matrices for the next skinned draw call.
  * joint_matrices: array of [num_joints] mat4, each = globalTransform * inverseBindMatrix.

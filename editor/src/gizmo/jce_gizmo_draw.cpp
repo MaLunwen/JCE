@@ -42,6 +42,19 @@ static ImU32 plane_color(JceGizmoAxis axis, JceGizmoAxis hovered, JceGizmoAxis d
     return ImGui::GetColorU32(ImVec4(0.5f, 0.5f, 0.5f, 0.15f));
 }
 
+static bool gizmo_is_2d(void)
+{
+    return jce_gizmo_internal_dimension() == JCE_GIZMO_DIMENSION_2D;
+}
+
+static bool center_highlighted(JceGizmoAxis hovered, JceGizmoAxis dragging)
+{
+    if (hovered == JCE_GIZMO_AXIS_XYZ || dragging == JCE_GIZMO_AXIS_XYZ)
+        return true;
+    return gizmo_is_2d()
+        && (hovered == JCE_GIZMO_AXIS_XY || dragging == JCE_GIZMO_AXIS_XY);
+}
+
 /* ── Axis direction vectors ────────────────────────────────────────── */
 
 static const float s_axis_x[3] = {1,0,0};
@@ -183,8 +196,10 @@ void jce_gizmo_draw_translate(ImDrawList *dl,
                          JCE_GIZMO_AXIS_X, hovered, dragging);
     draw_translate_arrow(dl, cam, position, ax_y, px_len,
                          JCE_GIZMO_AXIS_Y, hovered, dragging);
-    draw_translate_arrow(dl, cam, position, ax_z, px_len,
-                         JCE_GIZMO_AXIS_Z, hovered, dragging);
+    if (!gizmo_is_2d()) {
+        draw_translate_arrow(dl, cam, position, ax_z, px_len,
+                             JCE_GIZMO_AXIS_Z, hovered, dragging);
+    }
 
     /* Plane handles */
     float d[3];
@@ -195,15 +210,17 @@ void jce_gizmo_draw_translate(ImDrawList *dl,
 
     draw_translate_plane_handle(dl, cam, position, ax_x, ax_y,
                                 world_len, JCE_GIZMO_AXIS_XY, hovered, dragging);
-    draw_translate_plane_handle(dl, cam, position, ax_x, ax_z,
-                                world_len, JCE_GIZMO_AXIS_XZ, hovered, dragging);
-    draw_translate_plane_handle(dl, cam, position, ax_y, ax_z,
-                                world_len, JCE_GIZMO_AXIS_YZ, hovered, dragging);
+    if (!gizmo_is_2d()) {
+        draw_translate_plane_handle(dl, cam, position, ax_x, ax_z,
+                                    world_len, JCE_GIZMO_AXIS_XZ, hovered, dragging);
+        draw_translate_plane_handle(dl, cam, position, ax_y, ax_z,
+                                    world_len, JCE_GIZMO_AXIS_YZ, hovered, dragging);
+    }
 
     /* Center dot */
     float scr_o[2];
     if (gm_world_to_screen(cam, position, scr_o)) {
-        ImU32 center_col = (hovered == JCE_GIZMO_AXIS_XYZ || dragging == JCE_GIZMO_AXIS_XYZ)
+        ImU32 center_col = center_highlighted(hovered, dragging)
                          ? ImGui::GetColorU32(JCE_COLOR_GIZMO_HOVERED)
                          : ImGui::GetColorU32(ImVec4(0.9f,0.9f,0.9f,1.0f));
         dl->AddCircleFilled(ImVec2(scr_o[0], scr_o[1]), 5.0f, center_col);
@@ -284,13 +301,15 @@ void jce_gizmo_draw_rotate(ImDrawList *dl,
     float ax_x[3], ax_y[3], ax_z[3];
     jce_gizmo_internal_get_axes(ax_x, ax_y, ax_z);
 
-    /* X ring: normal=X, tangent=Y, bitangent=Z */
-    draw_rotation_ring(dl, cam, position, ax_x, ax_y, ax_z, world_radius,
-                       JCE_GIZMO_AXIS_X, hovered, dragging);
+    if (!gizmo_is_2d()) {
+        /* X ring: normal=X, tangent=Y, bitangent=Z */
+        draw_rotation_ring(dl, cam, position, ax_x, ax_y, ax_z, world_radius,
+                           JCE_GIZMO_AXIS_X, hovered, dragging);
 
-    /* Y ring: normal=Y, tangent=Z, bitangent=X */
-    draw_rotation_ring(dl, cam, position, ax_y, ax_z, ax_x, world_radius,
-                       JCE_GIZMO_AXIS_Y, hovered, dragging);
+        /* Y ring: normal=Y, tangent=Z, bitangent=X */
+        draw_rotation_ring(dl, cam, position, ax_y, ax_z, ax_x, world_radius,
+                           JCE_GIZMO_AXIS_Y, hovered, dragging);
+    }
 
     /* Z ring: normal=Z, tangent=X, bitangent=Y */
     draw_rotation_ring(dl, cam, position, ax_z, ax_x, ax_y, world_radius,
@@ -358,13 +377,30 @@ void jce_gizmo_draw_scale(ImDrawList *dl,
                     JCE_GIZMO_AXIS_X, hovered, dragging);
     draw_scale_axis(dl, cam, position, ax_y, px_len,
                     JCE_GIZMO_AXIS_Y, hovered, dragging);
-    draw_scale_axis(dl, cam, position, ax_z, px_len,
-                    JCE_GIZMO_AXIS_Z, hovered, dragging);
+    if (!gizmo_is_2d()) {
+        draw_scale_axis(dl, cam, position, ax_z, px_len,
+                        JCE_GIZMO_AXIS_Z, hovered, dragging);
+    }
+
+    float d[3];
+    gm_v3_sub(d, position, cam->eye);
+    float dist = gm_v3_len(d);
+    if (dist < 0.01f) dist = 0.01f;
+    float world_len = JCE_GIZMO_AXIS_LENGTH * dist * 0.07f * (px_len / 120.0f);
+
+    draw_translate_plane_handle(dl, cam, position, ax_x, ax_y,
+                                world_len, JCE_GIZMO_AXIS_XY, hovered, dragging);
+    if (!gizmo_is_2d()) {
+        draw_translate_plane_handle(dl, cam, position, ax_x, ax_z,
+                                    world_len, JCE_GIZMO_AXIS_XZ, hovered, dragging);
+        draw_translate_plane_handle(dl, cam, position, ax_y, ax_z,
+                                    world_len, JCE_GIZMO_AXIS_YZ, hovered, dragging);
+    }
 
     /* Center cube */
     float scr_o[2];
     if (gm_world_to_screen(cam, position, scr_o)) {
-        ImU32 center_col = (hovered == JCE_GIZMO_AXIS_XYZ || dragging == JCE_GIZMO_AXIS_XYZ)
+        ImU32 center_col = center_highlighted(hovered, dragging)
                          ? ImGui::GetColorU32(JCE_COLOR_GIZMO_HOVERED)
                          : ImGui::GetColorU32(ImVec4(0.9f,0.9f,0.9f,1.0f));
         dl->AddRectFilled(ImVec2(scr_o[0]-5, scr_o[1]-5),

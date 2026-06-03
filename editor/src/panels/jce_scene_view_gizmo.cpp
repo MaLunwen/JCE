@@ -78,12 +78,65 @@ static JceTransform *get_transform_for_id(JceScene *scene, uint32_t id)
     return jce_scene_get_transform(scene, (JceEntity)id);
 }
 
+static void set_transform_for_id(JceScene *scene, uint32_t id,
+                                 const JceTransform *value)
+{
+    if (!scene || id == 0 || !value || !jce_state_entity_exists(id))
+        return;
+    jce_scene_set_transform(scene, (JceEntity)id, value);
+}
+
 static void normalize_euler_deg(float rot[3])
 {
     for (int a = 0; a < 3; a++) {
         rot[a] = fmodf(rot[a], 360.0f);
         if (rot[a] < 0.0f) rot[a] += 360.0f;
     }
+}
+
+static float clamp_transform_scale(float v)
+{
+    return v < 0.001f ? 0.001f : v;
+}
+
+static void apply_2d_constraints(float pos[3], float rot[3], float scale[3],
+                                 float lock_pos_z, float lock_rot_x,
+                                 float lock_rot_y, float lock_scale_z)
+{
+    pos[2]   = lock_pos_z;
+    rot[0]   = lock_rot_x;
+    rot[1]   = lock_rot_y;
+    scale[2] = lock_scale_z;
+}
+
+static void rotate_relative(float out[3], const float rel[3], jce_quat q)
+{
+    jce_vec3 r = jce_q_rotate(q, jce_v3(rel[0], rel[1], rel[2]));
+    out[0] = r.x;
+    out[1] = r.y;
+    out[2] = r.z;
+}
+
+static void scale_relative_on_axes(float out[3],
+                                   const float rel[3],
+                                   const float factor[3],
+                                   const float ax_x[3],
+                                   const float ax_y[3],
+                                   const float ax_z[3])
+{
+    float dx = rel[0]*ax_x[0] + rel[1]*ax_x[1] + rel[2]*ax_x[2];
+    float dy = rel[0]*ax_y[0] + rel[1]*ax_y[1] + rel[2]*ax_y[2];
+    float dz = rel[0]*ax_z[0] + rel[1]*ax_z[1] + rel[2]*ax_z[2];
+
+    out[0] = ax_x[0] * dx * factor[0]
+           + ax_y[0] * dy * factor[1]
+           + ax_z[0] * dz * factor[2];
+    out[1] = ax_x[1] * dx * factor[0]
+           + ax_y[1] * dy * factor[1]
+           + ax_z[1] * dz * factor[2];
+    out[2] = ax_x[2] * dx * factor[0]
+           + ax_y[2] * dy * factor[1]
+           + ax_z[2] * dz * factor[2];
 }
 
 /* Per-entity persistent euler cache. JceTransform stores rotation as a
@@ -111,6 +164,19 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
     if (focused == 0) return;
 
     JceScene *scene = jce_state_get_scene();
+    if (!scene) return;
+
+    if (jce_gizmo_is_active() && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+        jce_gizmo_cancel_interaction();
+        if (s_gizmo_transaction_open) {
+            jce_state_cancel_transaction();
+            s_gizmo_transaction_open = false;
+        }
+        s_gizmo_raw_dragging = false;
+        jce_editor_inspector_request_sync();
+        return;
+    }
+
     JceTransform *xform = get_transform_for_id(scene, focused);
     if (!xform) return;
 
@@ -161,22 +227,30 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
     };
 
     if (multi_select) {
-        float sum_pos[3] = {0.0f, 0.0f, 0.0f};
+        float min_pos[3] = {0.0f, 0.0f, 0.0f};
+        float max_pos[3] = {0.0f, 0.0f, 0.0f};
         int valid_xforms = 0;
         for (int i = 0; i < sel_count; i++) {
             JceTransform *other = get_transform_for_id(scene, sel_ids[i]);
             if (!other) continue;
-            sum_pos[0] += other->position.x;
-            sum_pos[1] += other->position.y;
-            sum_pos[2] += other->position.z;
+            float p[3] = { other->position.x, other->position.y, other->position.z };
+            if (valid_xforms == 0) {
+                memcpy(min_pos, p, sizeof(min_pos));
+                memcpy(max_pos, p, sizeof(max_pos));
+            } else {
+                for (int a = 0; a < 3; a++) {
+                    if (p[a] < min_pos[a]) min_pos[a] = p[a];
+                    if (p[a] > max_pos[a]) max_pos[a] = p[a];
+                }
+            }
             valid_xforms++;
         }
-        if (valid_xforms > 0) {
-            gizmo_pos[0] = sum_pos[0] / (float)valid_xforms;
-            gizmo_pos[1] = sum_pos[1] / (float)valid_xforms;
-            gizmo_pos[2] = sum_pos[2] / (float)valid_xforms;
-        } else {
+        if (valid_xforms <= 0) {
             multi_select = false;
+        } else if (jce_state_get_gizmo_pivot() == JCE_GIZMO_CENTER) {
+            gizmo_pos[0] = (min_pos[0] + max_pos[0]) * 0.5f;
+            gizmo_pos[1] = (min_pos[1] + max_pos[1]) * 0.5f;
+            gizmo_pos[2] = (min_pos[2] + max_pos[2]) * 0.5f;
         }
     }
 
@@ -197,6 +271,10 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
 
     JceGizmoMode active_gm = jce_state_get_gizmo_mode();
     bool s_view_2d = jce_state_get_2d_mode();
+    jce_gizmo_set_dimension(s_view_2d
+        ? JCE_GIZMO_DIMENSION_2D
+        : JCE_GIZMO_DIMENSION_3D);
+
     /* Snapshot pre-drag values so we can lock Z in 2D mode.  In 2D the
      * gizmo only operates in the XY plane: Z translation is locked, and
      * rotation is restricted to the Z axis. */
@@ -212,21 +290,16 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
                      gizmo_raw_rot,
                      gizmo_raw_scale);
     if (s_view_2d) {
-        gizmo_raw_pos[2]   = pre_pos_z;
-        gizmo_raw_rot[0]   = pre_rot_x;
-        gizmo_raw_rot[1]   = pre_rot_y;
-        gizmo_raw_scale[2] = pre_scale_z;
+        apply_2d_constraints(gizmo_raw_pos, gizmo_raw_rot, gizmo_raw_scale,
+                             pre_pos_z, pre_rot_x, pre_rot_y, pre_scale_z);
     }
 
     bool gizmo_dragging_after = jce_gizmo_is_active();
-    if (!gizmo_dragging_before && gizmo_dragging_after && !s_gizmo_history_batch_open) {
-        jce_state_begin_batch_edit();
-        s_gizmo_history_batch_open = true;
-    }
-    if (gizmo_dragging_before && !gizmo_dragging_after && s_gizmo_history_batch_open) {
-        jce_state_end_batch_edit();
-        s_gizmo_history_batch_open = false;
-    }
+    bool gizmo_drag_started = !gizmo_dragging_before && gizmo_dragging_after;
+    bool gizmo_drag_ended   = gizmo_dragging_before && !gizmo_dragging_after;
+    if (gizmo_drag_started && !s_gizmo_transaction_open)
+        s_gizmo_transaction_open = jce_state_begin_transaction("gizmo-transform");
+
     if (gizmo_dragging_after) {
         s_gizmo_raw_dragging = true;
         memcpy(s_gizmo_raw_pos,   gizmo_raw_pos,   sizeof(s_gizmo_raw_pos));
@@ -268,6 +341,10 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
             default: break;
         }
     }
+    if (s_view_2d) {
+        apply_2d_constraints(gizmo_pos, gizmo_rot, gizmo_scale,
+                             pre_pos_z, pre_rot_x, pre_rot_y, pre_scale_z);
+    }
 
     float dpos[3]   = { gizmo_pos[0]   - pos_before[0],
                         gizmo_pos[1]   - pos_before[1],
@@ -291,15 +368,50 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
 
     if (gizmo_changed) {
         if (multi_select) {
+            float ax_x[3], ax_y[3], ax_z[3];
+            jce_gizmo_get_axes(ax_x, ax_y, ax_z);
+
+            float scale_ratio[3] = {1.0f, 1.0f, 1.0f};
+            if (active_gm == JCE_GIZMO_SCALE) {
+                for (int a = 0; a < 3; a++) {
+                    if (fabsf(scale_before[a]) > eps)
+                        scale_ratio[a] = gizmo_scale[a] / scale_before[a];
+                    else
+                        scale_ratio[a] = 1.0f + dscale[a];
+                    if (scale_ratio[a] < 0.001f)
+                        scale_ratio[a] = 0.001f;
+                }
+                if (s_view_2d)
+                    scale_ratio[2] = 1.0f;
+            }
+
+            jce_quat delta_rot = editor_q_from_euler_deg(drot);
+
             for (int i = 0; i < sel_count; i++) {
                 JceTransform *other = get_transform_for_id(scene, sel_ids[i]);
                 if (!other) continue;
+                JceTransform next = *other;
 
                 if (active_gm == JCE_GIZMO_TRANSLATE) {
-                    other->position.x += dpos[0];
-                    other->position.y += dpos[1];
-                    other->position.z += dpos[2];
+                    next.position.x += dpos[0];
+                    next.position.y += dpos[1];
+                    next.position.z += dpos[2];
+                    if (s_view_2d)
+                        next.position.z = other->position.z;
                 } else if (active_gm == JCE_GIZMO_ROTATE) {
+                    float rel[3] = {
+                        other->position.x - pos_before[0],
+                        other->position.y - pos_before[1],
+                        other->position.z - pos_before[2],
+                    };
+                    float rel_rot[3];
+                    rotate_relative(rel_rot, rel, delta_rot);
+                    next.position.x = pos_before[0] + rel_rot[0];
+                    next.position.y = pos_before[1] + rel_rot[1];
+                    next.position.z = pos_before[2] + rel_rot[2];
+                    if (s_view_2d)
+                        next.position.z = other->position.z;
+
                     /* Decompose-add-recompose to apply euler delta consistently
                      * with the focused entity's gizmo handle. */
                     float other_rot[3];
@@ -308,32 +420,53 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
                     other_rot[1] += drot[1];
                     other_rot[2] += drot[2];
                     normalize_euler_deg(other_rot);
-                    other->rotation = editor_q_from_euler_deg(other_rot);
+                    next.rotation = editor_q_from_euler_deg(other_rot);
+                    if (sel_ids[i] == focused)
+                        jce_editor_set_cached_euler_deg(focused, next.rotation, other_rot);
                 } else if (active_gm == JCE_GIZMO_SCALE) {
-                    other->scale.x += dscale[0];
-                    other->scale.y += dscale[1];
-                    other->scale.z += dscale[2];
+                    float rel[3] = {
+                        other->position.x - pos_before[0],
+                        other->position.y - pos_before[1],
+                        other->position.z - pos_before[2],
+                    };
+                    float rel_scaled[3];
+                    scale_relative_on_axes(rel_scaled, rel, scale_ratio, ax_x, ax_y, ax_z);
+                    next.position.x = pos_before[0] + rel_scaled[0];
+                    next.position.y = pos_before[1] + rel_scaled[1];
+                    next.position.z = pos_before[2] + rel_scaled[2];
+                    if (s_view_2d)
+                        next.position.z = other->position.z;
 
-                    if (other->scale.x < 0.001f) other->scale.x = 0.001f;
-                    if (other->scale.y < 0.001f) other->scale.y = 0.001f;
-                    if (other->scale.z < 0.001f) other->scale.z = 0.001f;
+                    next.scale.x = clamp_transform_scale(other->scale.x * scale_ratio[0]);
+                    next.scale.y = clamp_transform_scale(other->scale.y * scale_ratio[1]);
+                    next.scale.z = s_view_2d
+                                 ? other->scale.z
+                                 : clamp_transform_scale(other->scale.z * scale_ratio[2]);
                 }
+                set_transform_for_id(scene, sel_ids[i], &next);
             }
         } else {
-            xform->position.x = gizmo_pos[0];
-            xform->position.y = gizmo_pos[1];
-            xform->position.z = gizmo_pos[2];
+            JceTransform next = *xform;
+            next.position.x = gizmo_pos[0];
+            next.position.y = gizmo_pos[1];
+            next.position.z = gizmo_pos[2];
 
             normalize_euler_deg(gizmo_rot);
-            xform->rotation = editor_q_from_euler_deg(gizmo_rot);
-            jce_editor_set_cached_euler_deg(focused, xform->rotation, gizmo_rot);
+            next.rotation = editor_q_from_euler_deg(gizmo_rot);
+            jce_editor_set_cached_euler_deg(focused, next.rotation, gizmo_rot);
 
-            xform->scale.x = gizmo_scale[0] < 0.001f ? 0.001f : gizmo_scale[0];
-            xform->scale.y = gizmo_scale[1] < 0.001f ? 0.001f : gizmo_scale[1];
-            xform->scale.z = gizmo_scale[2] < 0.001f ? 0.001f : gizmo_scale[2];
+            next.scale.x = clamp_transform_scale(gizmo_scale[0]);
+            next.scale.y = clamp_transform_scale(gizmo_scale[1]);
+            next.scale.z = clamp_transform_scale(gizmo_scale[2]);
+            set_transform_for_id(scene, focused, &next);
         }
 
         jce_editor_inspector_request_sync();
+    }
+
+    if (gizmo_drag_ended && s_gizmo_transaction_open) {
+        jce_state_commit_transaction();
+        s_gizmo_transaction_open = false;
     }
 
     jce_gizmo_draw(ctx->dl, &gcam,

@@ -33,6 +33,7 @@ extern "C" {
 #include <jce/renderer/jce_offscreen_target.h>
 #include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_renderer_caps.h>
+#include <jce/renderer/jce_scene_pick.h>
 #include <jce/renderer/jce_scene_renderer.h>
 #include <jce/renderer/jce_shaders.h>
 #include <jce/renderer/jce_texture.h>
@@ -64,6 +65,9 @@ struct SceneRenderState {
 
     /* Engine-owned scene renderer (sky, shadows, entities, sprites, IBL). */
     JceSceneRenderer       *scene_renderer;
+
+    /* Hidden GPU object-ID pass used by Scene View picking. */
+    JceScenePickPass       *pick_pass;
 
     /* Pos+color vertex layout used by grid / overlay transient buffers. */
     JceVertexLayout         layout;

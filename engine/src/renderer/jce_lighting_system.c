@@ -351,12 +351,20 @@ void jce_light_env_apply(const JceLightEnv *env, const JceRenderer *r)
         bgfx_set_uniform(s_u_spot_lights, data, JCE_MAX_SPOT_LIGHTS * 4);
     }
 
-    /* Light counts: x=numDir, y=numPoint, z=numSpot, w=0. */
+    float shadow_dir_slot = 0.0f;
+    for (uint32_t i = 0; i < env->num_dir; i++) {
+        if (env->dir_lights[i].casts_shadow) {
+            shadow_dir_slot = (float)i + 1.0f;
+            break;
+        }
+    }
+
+    /* Light counts: x=numDir, y=numPoint, z=numSpot, w=shadow dir index+1. */
     float counts[4] = {
         (float)env->num_dir,
         (float)env->num_point,
         (float)env->num_spot,
-        0.0f
+        shadow_dir_slot
     };
     bgfx_set_uniform(s_u_light_counts, counts, 1);
 

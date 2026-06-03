@@ -1331,16 +1331,79 @@ static void handle_marquee_selection(const SceneViewCtx *ctx,
         jce_editor_layout_request_focus_inspector();
 }
 
+static bool s_gpu_pick_selection_pending = false;
+static bool s_gpu_pick_add_mode = false;
+
+static void apply_single_pick_selection(uint32_t best_id, bool add_mode)
+{
+    if (best_id != 0) {
+        if (add_mode && jce_state_is_selected(best_id))
+            jce_state_deselect_entity(best_id);
+        else
+            jce_state_select_entity(best_id, add_mode);
+        jce_editor_inspector_request_sync();
+        jce_editor_layout_request_focus_inspector();
+    } else if (!add_mode) {
+        jce_state_clear_selection();
+        jce_editor_inspector_request_sync();
+    }
+}
+
+static bool request_gpu_pick_for_click(const SceneViewCtx *ctx,
+                                       ImVec2 click_pos,
+                                       bool add_mode)
+{
+    if (!ctx || !jce_editor_scene_pick_supported())
+        return false;
+
+    float local_x = click_pos.x - ctx->screen_pos.x;
+    float local_y = click_pos.y - ctx->screen_pos.y;
+    if (local_x < 0.0f || local_y < 0.0f ||
+        local_x >= ctx->avail.x || local_y >= ctx->avail.y)
+        return false;
+
+    uint32_t rt_w = (uint32_t)fmaxf(16.0f, floorf(ctx->avail.x));
+    uint32_t rt_h = (uint32_t)fmaxf(16.0f, floorf(ctx->avail.y));
+    uint32_t px = (uint32_t)floorf(local_x * (float)rt_w / ctx->avail.x);
+    uint32_t py = (uint32_t)floorf(local_y * (float)rt_h / ctx->avail.y);
+    if (px >= rt_w) px = rt_w - 1u;
+    if (py >= rt_h) py = rt_h - 1u;
+
+    if (jce_renderer_origin_bottom_left())
+        py = rt_h - 1u - py;
+
+    if (!jce_editor_scene_pick_request(px, py))
+        return false;
+
+    s_gpu_pick_selection_pending = true;
+    s_gpu_pick_add_mode = add_mode;
+    return true;
+}
+
 /* Single-click ray pick. */
 static void handle_ray_pick(const SceneViewCtx *ctx,
                             const float *view_mat,
                             const float *proj_mat,
                             const float *eye)
 {
+    if (s_gpu_pick_selection_pending) {
+        uint32_t gpu_hit = 0;
+        if (jce_editor_scene_pick_poll(&gpu_hit)) {
+            apply_single_pick_selection(gpu_hit, s_gpu_pick_add_mode);
+            s_gpu_pick_selection_pending = false;
+        } else {
+            if (s_sel_click_pending)
+                s_sel_click_pending = false;
+            return;
+        }
+    }
+
     if (!s_sel_click_pending) return;
     s_sel_click_pending = false;
 
     bool add_mode = ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift;
+    if (request_gpu_pick_for_click(ctx, s_sel_click_pos, add_mode))
+        return;
 
     JceGizmoCamera pick_cam;
     memcpy(pick_cam.view, view_mat, sizeof(float) * 16);
@@ -1393,17 +1456,7 @@ static void handle_ray_pick(const SceneViewCtx *ctx,
         }
     }
 
-    if (best_id != 0) {
-        if (add_mode && jce_state_is_selected(best_id))
-            jce_state_deselect_entity(best_id);
-        else
-            jce_state_select_entity(best_id, add_mode);
-        jce_editor_inspector_request_sync();
-        jce_editor_layout_request_focus_inspector();
-    } else if (!add_mode) {
-        jce_state_clear_selection();
-        jce_editor_inspector_request_sync();
-    }
+    apply_single_pick_selection(best_id, add_mode);
 }
 
 /* Orange diamond outline on all selected entities. */
@@ -1575,9 +1628,9 @@ void jce_editor_panel_scene_view_content(void)
     if (jce_state_show_flag(JCE_SHOW_FLAG_GIZMOS))
         update_and_draw_scene_gizmo(&ctx);
 
-    if (s_gizmo_history_batch_open && !jce_gizmo_is_active()) {
-        jce_state_end_batch_edit();
-        s_gizmo_history_batch_open = false;
+    if (s_gizmo_transaction_open && !jce_gizmo_is_active()) {
+        jce_state_commit_transaction();
+        s_gizmo_transaction_open = false;
     }
 
     handle_scene_view_shortcuts();

@@ -31,10 +31,18 @@ typedef enum {
     JCE_GIZMO_AXIS_VIEW = (1 << 3),
 } JceGizmoAxis;
 
+typedef enum {
+    JCE_GIZMO_DIMENSION_3D = 0,
+    JCE_GIZMO_DIMENSION_2D = 1,
+} JceGizmoDimension;
+
 /* ── Lifecycle ─────────────────────────────────────────────────────── */
 
 void jce_gizmo_init(void);
 void jce_gizmo_shutdown(void);
+
+void              jce_gizmo_set_dimension(JceGizmoDimension dimension);
+JceGizmoDimension jce_gizmo_get_dimension(void);
 
 /* ── Per-frame entry points (called from scene view panel) ─────────── */
 
@@ -75,6 +83,7 @@ void jce_gizmo_draw(struct ImDrawList *dl,
 
 bool         jce_gizmo_is_active(void);
 JceGizmoAxis jce_gizmo_hovered_axis(void);
+void         jce_gizmo_get_axes(float ax_x[3], float ax_y[3], float ax_z[3]);
 void         jce_gizmo_cancel_interaction(void);
 
 #ifdef __cplusplus

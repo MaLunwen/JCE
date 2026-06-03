@@ -44,6 +44,14 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height);
  *   ImGui::Image((ImTextureID)(uintptr_t)handle, size); */
 uint16_t jce_editor_scene_render_get_texture(void);
 
+/* GPU object-ID picking for the Scene View.  Coordinates are render-target
+ * pixels, not absolute ImGui screen coordinates.  Requests are asynchronous:
+ * call request() after jce_editor_scene_render_frame(), then poll on later
+ * frames until it returns true. */
+bool jce_editor_scene_pick_supported(void);
+bool jce_editor_scene_pick_request(uint32_t x, uint32_t y);
+bool jce_editor_scene_pick_poll(uint32_t *out_entity_id);
+
 /* Get the editor camera (for gizmo projection, etc.). */
 JceCamera *jce_editor_scene_get_camera(void);
 

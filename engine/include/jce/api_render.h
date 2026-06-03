@@ -20,6 +20,7 @@ extern "C" {
 #include <jce/renderer/jce_render_pipeline.h>
 #include <jce/renderer/jce_render_queue.h>
 #include <jce/renderer/jce_reflection_probe_bake.h>
+#include <jce/renderer/jce_scene_pick.h>
 #include <jce/renderer/jce_scene_renderer.h>
 #include <jce/renderer/jce_volume_profile.h>
 

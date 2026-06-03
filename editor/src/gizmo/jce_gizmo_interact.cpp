@@ -31,6 +31,11 @@ static const JceGizmoAxis s_plane_ids[3] = {
     JCE_GIZMO_AXIS_XY, JCE_GIZMO_AXIS_XZ, JCE_GIZMO_AXIS_YZ
 };
 
+static bool gizmo_is_2d(void)
+{
+    return jce_gizmo_internal_dimension() == JCE_GIZMO_DIMENSION_2D;
+}
+
 /* ── Helper: compute world-space axis length for a gizmo ───────────── */
 
 static float compute_world_axis_len(const JceGizmoCamera *cam,
@@ -176,7 +181,8 @@ JceGizmoAxis jce_gizmo_hit_test_translate(const JceGizmoCamera *cam,
 
     /* Center dot first (highest priority, enlarged hit area) */
     float center_d = hit_test_center(cam, position, mouse_x, mouse_y);
-    if (center_d < 12.0f) return JCE_GIZMO_AXIS_XYZ;
+    if (center_d < 12.0f)
+        return gizmo_is_2d() ? JCE_GIZMO_AXIS_XY : JCE_GIZMO_AXIS_XYZ;
 
     /* Plane handles (priority over single axes) */
     const float *plane_axes[3][2] = {
@@ -184,7 +190,8 @@ JceGizmoAxis jce_gizmo_hit_test_translate(const JceGizmoCamera *cam,
         { ax_x, ax_z }, /* XZ */
         { ax_y, ax_z }, /* YZ */
     };
-    for (int i = 0; i < 3; i++) {
+    int plane_count = gizmo_is_2d() ? 1 : 3;
+    for (int i = 0; i < plane_count; i++) {
         float d = hit_test_plane(cam, position, plane_axes[i][0], plane_axes[i][1],
                                   world_len, mouse_x, mouse_y);
         if (d < threshold) return s_plane_ids[i];
@@ -193,7 +200,8 @@ JceGizmoAxis jce_gizmo_hit_test_translate(const JceGizmoCamera *cam,
     /* Single axes */
     JceGizmoAxis best_axis = JCE_GIZMO_AXIS_NONE;
     float best_dist = threshold;
-    for (int i = 0; i < 3; i++) {
+    int axis_count = gizmo_is_2d() ? 2 : 3;
+    for (int i = 0; i < axis_count; i++) {
         float d = hit_test_axis(cam, position, axes[i], world_len,
                                  mouse_x, mouse_y);
         if (d < best_dist) {
@@ -228,7 +236,8 @@ JceGizmoAxis jce_gizmo_hit_test_rotate(const JceGizmoCamera *cam,
     JceGizmoAxis best_axis = JCE_GIZMO_AXIS_NONE;
     float best_dist = threshold;
 
-    for (int i = 0; i < 3; i++) {
+    int first_axis = gizmo_is_2d() ? 2 : 0;
+    for (int i = first_axis; i < 3; i++) {
         float d = hit_test_ring(cam, position, rings[i][0], rings[i][1],
                                  world_radius, mouse_x, mouse_y);
         if (d < best_dist) {
@@ -255,12 +264,27 @@ JceGizmoAxis jce_gizmo_hit_test_scale(const JceGizmoCamera *cam,
 
     /* Center cube first (enlarged hit area) */
     float center_d = hit_test_center(cam, position, mouse_x, mouse_y);
-    if (center_d < 12.0f) return JCE_GIZMO_AXIS_XYZ;
+    if (center_d < 12.0f)
+        return gizmo_is_2d() ? JCE_GIZMO_AXIS_XY : JCE_GIZMO_AXIS_XYZ;
+
+    /* Plane handles provide multi-axis scaling, matching translate. */
+    const float *plane_axes[3][2] = {
+        { ax_x, ax_y },
+        { ax_x, ax_z },
+        { ax_y, ax_z },
+    };
+    int plane_count = gizmo_is_2d() ? 1 : 3;
+    for (int i = 0; i < plane_count; i++) {
+        float d = hit_test_plane(cam, position, plane_axes[i][0], plane_axes[i][1],
+                                  world_len, mouse_x, mouse_y);
+        if (d < threshold) return s_plane_ids[i];
+    }
 
     /* Single axes */
     JceGizmoAxis best_axis = JCE_GIZMO_AXIS_NONE;
     float best_dist = threshold;
-    for (int i = 0; i < 3; i++) {
+    int axis_count = gizmo_is_2d() ? 2 : 3;
+    for (int i = 0; i < axis_count; i++) {
         float d = hit_test_axis(cam, position, axes[i], world_len,
                                  mouse_x, mouse_y);
         if (d < best_dist) {
@@ -488,6 +512,12 @@ void jce_gizmo_drag_scale(const JceGizmoCamera *cam,
     if (dist_prev < 1.0f) dist_prev = 1.0f;
 
     float ratio = (dist_cur - dist_prev) * 0.01f;
+    if (ImGui::GetIO().KeyShift)
+        ratio *= 0.2f;
+    if (ratio < -0.95f)
+        ratio = -0.95f;
+    if (ratio > 4.0f)
+        ratio = 4.0f;
 
     if (axis == JCE_GIZMO_AXIS_XYZ || axis == JCE_GIZMO_AXIS_VIEW) {
         out_delta_scale[0] = out_delta_scale[1] = out_delta_scale[2] = ratio;

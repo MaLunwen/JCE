@@ -252,6 +252,34 @@ void jce_skinned_mesh_submit_wireframe_overlay(const JceSkinnedMesh *mesh,
     JCE_PROFILE_ZONE_END;
 }
 
+void jce_skinned_mesh_submit_pick_id(const JceSkinnedMesh *mesh,
+                                      const JceRenderer *r,
+                                      uint16_t view_id,
+                                      JceShaderHandle program,
+                                      bool double_sided)
+{
+    if (!mesh || !r || program.idx == UINT16_MAX)
+        return;
+    JCE_PROFILE_ZONE_N("SkinnedMesh::SubmitPickID");
+
+    bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
+
+    if (mesh->ibh.idx != UINT16_MAX)
+        bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
+
+    uint64_t state = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A |
+                     BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS |
+                     BGFX_STATE_MSAA;
+    if (!double_sided)
+        state |= BGFX_STATE_CULL_CW;
+    bgfx_set_state(state, 0);
+
+    bgfx_program_handle_t prog = { program.idx };
+    bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+
+    JCE_PROFILE_ZONE_END;
+}
+
 /* ================================================================== */
 /* Queries                                                             */
 /* ================================================================== */

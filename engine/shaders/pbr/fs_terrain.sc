@@ -29,7 +29,7 @@ uniform vec4 u_pointLights[16];
 //   [i*4+3] = outerConeCos, 0, 0, 0
 uniform vec4 u_spotLights[16];
 
-// x=numDir, y=numPoint, z=numSpot
+// x=numDir, y=numPoint, z=numSpot, w=shadow directional slot (index+1, 0=none)
 uniform vec4 u_lightCounts;
 
 // Texture samplers
@@ -244,7 +244,9 @@ void main()
 {
     // --- Shadow calculation ---
     float shadow = 1.0;
-    vec3 toLightDir = safe_normalize_vec3(-u_dirLights[0].xyz,
+    float shadowDirSlot = u_lightCounts.w;
+    int shadowDirIndex = int(clamp(shadowDirSlot - 1.0, 0.0, 1.0));
+    vec3 toLightDir = safe_normalize_vec3(-u_dirLights[shadowDirIndex * 2].xyz,
                                           vec3(0.0, 1.0, 0.0));
     vec3 baseNormal = normalize(v_normal);
 
@@ -253,7 +255,10 @@ void main()
         baseNormal = -baseNormal;
     }
 
-    if (u_csmSplits.x > 0.0)
+    bool shadowEnabled = (shadowDirSlot > 0.5) &&
+        ((u_csmSplits.x > 0.0) || (u_csmParams.x > 0.0));
+
+    if (shadowEnabled && u_csmSplits.x > 0.0)
     {
         float fragDepth = max(v_viewdepth, 0.0);
 
@@ -298,7 +303,7 @@ void main()
             }
         }
     }
-    else
+    else if (shadowEnabled)
     {
         // Legacy single shadow map fallback (PCF 3x3).
         // Normal-offset bias in world space before light-space projection.
@@ -424,7 +429,8 @@ void main()
         vec3 lightColor = u_dirLights[i * 2 + 1].xyz;
 
         vec3 radiance = lightColor * intensity;
-        Lo += cookTorranceBRDF(N, V, lightDir, F0, albedo, metallic, roughness) * radiance * shadow;
+        float lightShadow = (abs(float(i) - float(shadowDirIndex)) < 0.5) ? shadow : 1.0;
+        Lo += cookTorranceBRDF(N, V, lightDir, F0, albedo, metallic, roughness) * radiance * lightShadow;
     }
 
     // --- Point lights ---

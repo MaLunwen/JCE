@@ -13,6 +13,7 @@
 
 #include <jce/os/core/jce_defs.h>
 #include <jce/os/core/jce_math.h>
+#include <jce/renderer/jce_gfx_types.h>
 
 #include <stdint.h>
 
@@ -61,6 +62,19 @@ JCE_API void jce_model_submit_wireframe_overlay(const JceModel *model,
                                                 const jce_mat4 *transform,
                                                 const jce_mat4 *joint_matrices,
                                                 uint32_t num_joints);
+
+/* Submit every primitive to an object-ID picking pass.
+ * Caller must set the object-ID uniform before calling.  The function walks
+ * the same node hierarchy as jce_model_draw() and respects per-material
+ * double-sided culling. */
+JCE_API void jce_model_submit_pick_id(const JceModel *model,
+                                      const JceRenderer *r,
+                                      uint16_t view_id,
+                                      const jce_mat4 *transform,
+                                      const jce_mat4 *joint_matrices,
+                                      uint32_t num_joints,
+                                      JceShaderHandle static_program,
+                                      JceShaderHandle skinned_program);
 
 /* -- Skeleton & animation accessors -------------------------------- */
 

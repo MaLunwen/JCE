@@ -82,7 +82,7 @@ extern bool  s_gizmo_raw_dragging;
 extern float s_gizmo_raw_pos[3];
 extern float s_gizmo_raw_rot[3];
 extern float s_gizmo_raw_scale[3];
-extern bool  s_gizmo_history_batch_open;
+extern bool  s_gizmo_transaction_open;
 
 /* ── Functions from jce_scene_view_helpers.cpp ────────────────────── */
 

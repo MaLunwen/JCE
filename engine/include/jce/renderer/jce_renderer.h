@@ -248,6 +248,10 @@ typedef struct JceGpuStats {
    (out is still zero-initialized so callers can render placeholders). */
 JCE_API bool jce_renderer_get_gpu_stats(JceGpuStats *out);
 
+/* Monotonic bgfx frame index returned by the most recent bgfx_frame().
+ * Used by asynchronous GPU readbacks to know when their data is ready. */
+JCE_API uint32_t jce_renderer_get_frame_index(const JceRenderer *r);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_RENDERER_H */

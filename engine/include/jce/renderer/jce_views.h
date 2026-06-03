@@ -40,6 +40,12 @@
  * still in progress without view-ordering surprises. */
 #define JCE_VIEW_EDITOR_PREVIEW 60
 
+/* Hidden editor object-ID picking pass.  Separate FBO/readback target,
+ * after regular scene + preview views and before UI. */
+#define JCE_VIEW_EDITOR_PICK 70
+/* One-pixel GPU blit into a readback staging texture. */
+#define JCE_VIEW_EDITOR_PICK_READBACK 71
+
 /* ImGui editor overlay (renders before UI overlay so HUD sits on top). */
 #define JCE_VIEW_IMGUI       250
 

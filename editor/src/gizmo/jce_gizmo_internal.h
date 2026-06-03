@@ -18,6 +18,7 @@ JceGizmoAxis jce_gizmo_internal_hovered(void);
 bool         jce_gizmo_internal_dragging(void);
 JceGizmoAxis jce_gizmo_internal_drag_axis(void);
 void         jce_gizmo_internal_get_axes(float ax_x[3], float ax_y[3], float ax_z[3]);
+JceGizmoDimension jce_gizmo_internal_dimension(void);
 
 #ifdef __cplusplus
 }

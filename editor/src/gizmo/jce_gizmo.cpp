@@ -10,6 +10,7 @@
 #include "core/jce_editor_defaults.h"
 
 #include <jce/tools/jce_imgui.hpp>
+#include <math.h>
 #include <string.h>
 
 /* ── Internal state ────────────────────────────────────────────────── */
@@ -21,6 +22,7 @@ typedef struct {
     float        drag_prev_mouse[2]; /* previous mouse position */
     bool         initialized;
     float        axes[3][3];     /* current frame axis directions (local or world) */
+    JceGizmoDimension dimension;
 } JceGizmoState;
 
 static JceGizmoState s_gizmo;
@@ -51,12 +53,21 @@ extern "C" void jce_gizmo_internal_get_axes(float ax_x[3], float ax_y[3], float 
     memcpy(ax_z, s_gizmo.axes[2], 3 * sizeof(float));
 }
 
+extern "C" JceGizmoDimension jce_gizmo_internal_dimension(void)
+{
+    return s_gizmo.dimension;
+}
+
 /* Compute gizmo axis directions based on space and entity rotation. */
 static void compute_gizmo_axes(int gizmo_space, const float *rotation)
 {
     if (gizmo_space == 0 /* LOCAL */ && rotation) {
-        float rx = rotation[0] * JCE_DEG2RAD;
-        float ry = rotation[1] * JCE_DEG2RAD;
+        float rx = s_gizmo.dimension == JCE_GIZMO_DIMENSION_2D
+                 ? 0.0f
+                 : rotation[0] * JCE_DEG2RAD;
+        float ry = s_gizmo.dimension == JCE_GIZMO_DIMENSION_2D
+                 ? 0.0f
+                 : rotation[1] * JCE_DEG2RAD;
         float rz = rotation[2] * JCE_DEG2RAD;
 
         /* Build rotation via engine euler convention (YXZ — same order as
@@ -134,11 +145,24 @@ extern "C" void jce_gizmo_init(void)
 {
     memset(&s_gizmo, 0, sizeof(s_gizmo));
     s_gizmo.initialized = true;
+    s_gizmo.dimension = JCE_GIZMO_DIMENSION_3D;
 }
 
 extern "C" void jce_gizmo_shutdown(void)
 {
     memset(&s_gizmo, 0, sizeof(s_gizmo));
+}
+
+extern "C" void jce_gizmo_set_dimension(JceGizmoDimension dimension)
+{
+    s_gizmo.dimension = dimension == JCE_GIZMO_DIMENSION_2D
+                      ? JCE_GIZMO_DIMENSION_2D
+                      : JCE_GIZMO_DIMENSION_3D;
+}
+
+extern "C" JceGizmoDimension jce_gizmo_get_dimension(void)
+{
+    return s_gizmo.dimension;
 }
 
 /* ── Update ────────────────────────────────────────────────────────── */
@@ -206,9 +230,14 @@ extern "C" bool jce_gizmo_update(const JceGizmoCamera *cam,
                                       s_gizmo.drag_prev_mouse[0],
                                       s_gizmo.drag_prev_mouse[1],
                                       delta);
-                inout_scale[0] += delta[0];
-                inout_scale[1] += delta[1];
-                inout_scale[2] += delta[2];
+                for (int i = 0; i < 3; i++) {
+                    if (fabsf(delta[i]) <= 0.000001f)
+                        continue;
+                    float factor = 1.0f + delta[i];
+                    if (factor < 0.01f)
+                        factor = 0.01f;
+                    inout_scale[i] *= factor;
+                }
                 break;
         }
 
@@ -255,6 +284,7 @@ extern "C" void jce_gizmo_draw(struct ImDrawList *dl,
                                 const float *scale)
 {
     if (!s_gizmo.initialized) return;
+    (void)scale;
 
     /* Recompute axes for drawing (in case draw is called without update). */
     compute_gizmo_axes(gizmo_space, rotation);
@@ -276,6 +306,11 @@ extern "C" bool jce_gizmo_is_active(void)
 extern "C" JceGizmoAxis jce_gizmo_hovered_axis(void)
 {
     return s_gizmo.hovered_axis;
+}
+
+extern "C" void jce_gizmo_get_axes(float ax_x[3], float ax_y[3], float ax_z[3])
+{
+    jce_gizmo_internal_get_axes(ax_x, ax_y, ax_z);
 }
 
 extern "C" void jce_gizmo_cancel_interaction(void)
