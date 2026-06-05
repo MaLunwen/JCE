@@ -19,6 +19,7 @@
 #include "io/jce_editor_file_util.h"
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
+#include "ui/jce_editor_ui_state.h"
 
 #include <jce/tools/jce_imgui.hpp>
 #include "dialogs/jce_path_input.h"
@@ -42,6 +43,35 @@ extern "C" {
 #include <vector>
 
 namespace {
+
+int  g_request_tab = -1;
+int  g_current_tab = 0;
+bool g_tab_state_loaded = false;
+
+const char *k_tab_state_key = "panel.lightmap_bake.current_tab";
+
+void ensure_tab_state_loaded(void)
+{
+    if (g_tab_state_loaded)
+        return;
+    g_current_tab = jce_editor_ui_state_load_int(k_tab_state_key, 0, 0, 1);
+    g_request_tab = g_current_tab;
+    g_tab_state_loaded = true;
+}
+
+ImGuiTabItemFlags tab_flags(int idx)
+{
+    return (g_request_tab == idx) ? ImGuiTabItemFlags_SetSelected : 0;
+}
+
+void set_current_tab(int idx)
+{
+    if (idx < 0 || idx > 1 || g_current_tab == idx)
+        return;
+    g_current_tab = idx;
+    if (g_tab_state_loaded)
+        jce_editor_ui_state_save_int(k_tab_state_key, idx);
+}
 
 /* -------------------------------------------------------------------- */
 /* Minimal PNG (RGBA8) writer: stored deflate blocks + manual CRC/Adler */
@@ -818,19 +848,25 @@ void draw_lightmap_tab(void);
 
 void draw_content(void)
 {
+    ensure_tab_state_loaded();
     if (!ImGui::BeginTabBar("##lm_tabs")) return;
 
     if (ImGui::BeginTabItem(
-            jce_editor_i18n_or("lightmapBake.tab.lightmap", "Lightmap"))) {
+            jce_editor_i18n_or("lightmapBake.tab.lightmap", "Lightmap"),
+            nullptr, tab_flags(0))) {
+        set_current_tab(0);
         draw_lightmap_tab();
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem(
-            jce_editor_i18n_or("lightmapBake.tab.lightProbes", "Light Probes"))) {
+            jce_editor_i18n_or("lightmapBake.tab.lightProbes", "Light Probes"),
+            nullptr, tab_flags(1))) {
+        set_current_tab(1);
         draw_probe_tab();
         ImGui::EndTabItem();
     }
     ImGui::EndTabBar();
+    g_request_tab = -1;
 }
 
 void draw_lightmap_tab(void)

@@ -85,6 +85,45 @@ SAMPLER2D(s_cookie, 13);
 #endif
 SAMPLER2D(s_iesLut, 14);
 
+// P1 — Local (spot/point) shadow atlas (sampler stage 15). Each shadow-casting
+// spot renders a perspective depth tile into one atlas slot; u_spotShadowSlot[i]
+// gives spot i's slot (-1 = no shadow). Stage 15 is shared with terrain layer2,
+// but terrain uses fs_terrain.sc, so here 15 is unambiguously the shadow atlas.
+SAMPLER2D(s_localShadowMap, 15);
+uniform mat4 u_localShadowVP[4];   // per-slot light-view-proj
+uniform vec4 u_spotShadowSlot;     // lane i = atlas slot for spot i (-1 = none)
+uniform vec4 u_pointShadowSlot[2]; // 8 point lanes -> atlas slot (-1 = none)
+// u_localShadowParams: x = tiles per atlas side, y = 1/atlasSize,
+//                      z = depth bias, w = texel size (1/atlasSize)
+uniform vec4 u_localShadowParams;
+
+// Returns 1.0 (lit) when the light casts no shadow, the fragment is outside the
+// light frustum, or it is the nearest occluder; 0.0 when occluded.
+float sampleLocalShadow(int slotIndex, vec3 worldPos)
+{
+    if (slotIndex < 0) return 1.0;
+    vec4 clip = mul(u_localShadowVP[slotIndex], vec4(worldPos, 1.0));
+    if (clip.w <= 0.0) return 1.0;
+    vec3 ndc = clip.xyz / clip.w;
+    vec2 uv  = ndc.xy * 0.5 + vec2_splat(0.5);
+#if BGFX_SHADER_LANGUAGE_GLSL
+    uv.y = 1.0 - uv.y;
+    float curDepth = ndc.z * 0.5 + 0.5;
+#else
+    float curDepth = ndc.z;
+#endif
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 1.0;
+
+    float tiles  = max(u_localShadowParams.x, 1.0);
+    float tileUV = 1.0 / tiles;
+    float col = mod(float(slotIndex), tiles);
+    float row = floor(float(slotIndex) / tiles);
+    vec2 atlasUV = (vec2(col, row) + uv) * tileUV;
+
+    float shadowDepth = texture2D(s_localShadowMap, atlasUV).r;
+    return ((curDepth - u_localShadowParams.z) <= shadowDepth) ? 1.0 : 0.0;
+}
+
 // u_cookieParams.x = has_cookie_spot   (1.0 / 0.0)
 // u_cookieParams.y = cookie_strength   (0..1)
 // u_cookieParams.z = has_ies_spot      (1.0 / 0.0)
@@ -534,6 +573,15 @@ void main()
         attenuation *= attenuation;
 
         vec3 radiance = lightColor * intensity * attenuation;
+
+        // ── P1: local point shadow (slot in u_pointShadowSlot[i/4][i%4]) ──
+        vec4 _pslotV = (i < 4) ? u_pointShadowSlot[0] : u_pointShadowSlot[1];
+        int  _pl     = i - ((i < 4) ? 0 : 4);
+        float _pslotF = (_pl == 0) ? _pslotV.x :
+                        (_pl == 1) ? _pslotV.y :
+                        (_pl == 2) ? _pslotV.z : _pslotV.w;
+        radiance *= sampleLocalShadow(int(_pslotF), v_worldpos);
+
         Lo += cookTorranceBRDF(N, V, lightDir, F0, albedo, metallic, roughness) * radiance;
     }
 
@@ -613,6 +661,13 @@ void main()
             float ies = texture2D(s_iesLut, vec2(u, 0.5)).r;
             radiance *= ies;
         }
+
+        // ── P1: local spot shadow ──────────────────────────────────
+        // (select the slot without dynamic vec4 indexing for ES compat)
+        float _spotSlotF = (i == 0) ? u_spotShadowSlot.x :
+                           (i == 1) ? u_spotShadowSlot.y :
+                           (i == 2) ? u_spotShadowSlot.z : u_spotShadowSlot.w;
+        radiance *= sampleLocalShadow(int(_spotSlotF), v_worldpos);
 
         Lo += cookTorranceBRDF(N, V, lightDir, F0, albedo, metallic, roughness) * radiance;
     }

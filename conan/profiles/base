@@ -1,0 +1,8 @@
+# Shared desktop profile settings. Included by each desktop profile via include(base).
+# Only settings that do NOT depend on `compiler` belong here — `compiler.cppstd` must
+# be set in each profile next to its `compiler`. Holds build_type + the CMake generator.
+[settings]
+build_type=Release
+
+[conf]
+tools.cmake.cmaketoolchain:generator=Ninja

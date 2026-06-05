@@ -162,13 +162,14 @@ cmake --build build/desktop/windows-x64
 ./build/desktop/windows-x64/release/caged_kingdom.exe
 ``````
 
-Or: `./scripts/build-desktop.bat` (`--dist` for distribution build).
+Or use the standardized scripts (thin wrappers over `scripts/jce.py`): `./scripts/windows/build-editor.bat` (editor) or `./scripts/windows/build-project.bat caged_kingdom` (game, via the SDK). Add `--dist` (shorthand for `--variant dist`) for a distribution build.
 
 ## B. Editor
 
 ``````powershell
-./scripts/build-editor.bat           # release
-./scripts/build-editor.bat --dist    # distribution
+./scripts/windows/build-editor.bat                 # release
+./scripts/windows/build-editor.bat --dist          # distribution (== --variant dist)
+# (Linux/macOS: scripts/linux|macos/build-editor.sh, same flags)
 ``````
 
 Output: `build/desktop/windows-x64/release/jce_editor.exe`
@@ -203,7 +204,7 @@ java "-Djava.library.path=build/jni/desktop/caged_kingdom" -cp build/jni/desktop
 
 ``````powershell
 ./scripts/build-android.bat [ndk_path] [sdk_path] [arch] [--clean]
-./scripts/build-windows-arm64.bat [--clean] [--dist]
+./scripts/windows/build-editor.bat --arch arm64 [--dist] [--clean]   # Windows ARM64
 ./scripts/build-web.bat [emsdk_path] [--clean] [--dist]
 ``````
 

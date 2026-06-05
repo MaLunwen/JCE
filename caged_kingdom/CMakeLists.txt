@@ -11,10 +11,12 @@
 #   2. Standalone (SDK consumer mode):  configured directly via
 #                `cmake -S caged_kingdom -B build -G Ninja
 #                  -DJCE_DIR=<sdk>/lib/cmake/JCE`.
-#                Uses find_package(JCE) and a stub empty-PAK translation
-#                unit so the engine links cleanly.  Runtime asset loading
-#                will fail (no real PAK shipped) — this mode dogfoods
-#                the SDK link-surface only.
+#                Uses find_package(JCE).  When the SDK shipped the host
+#                tools (jce_cook/jce_pak, via JCE_ENABLE_SDK_INSTALL),
+#                jce_add_pak() cooks+packs the game's raw assets into a
+#                REAL embedded PAK — matching the in-tree pipeline.  If no
+#                packer shipped, it falls back to a stub empty-PAK TU so
+#                the engine still links (link-surface-only dogfood).
 
 # ------------------------------------------------------------------ #
 # Standalone branch                                                   #
@@ -38,9 +40,14 @@ if(NOT DEFINED JCE_BUILD_VARIANT)
 	target_link_libraries(CagedKingdom PRIVATE JCE::JCE)
 
 	# ---- Game asset PAK ------------------------------------------- #
-	# Use jce_target_embed_pak() from the SDK if jce_pak shipped AND
-	# the resource tree exists; otherwise emit a stub blob so the
-	# linker is satisfied (engine reports "no PAK" at boot).
+	# Prefer the SDK's turnkey jce_add_pak(): it cooks raw assets
+	# (PNG→RGBA8, WAV/OGG→PCM) via jce_cook when the SDK shipped it,
+	# then packs+embeds the cooked tree — matching the in-tree
+	# cook→pack→embed pipeline so a no-editor consumer gets a REAL PAK,
+	# not a raw/stub one.  jce_add_pak() resolves internally:
+	#   editor-prebuilt assets → cook (if jce_cook) → raw pack (+warn).
+	# Fall back to a stub blob only when no host packer shipped at all
+	# (link-surface-only dogfood), so the engine still links.
 	set(_ck_res "${CMAKE_CURRENT_SOURCE_DIR}/resources/assets")
 	set(_ck_ui  "${CMAKE_CURRENT_SOURCE_DIR}/ui")
 	set(_ck_dirs)
@@ -50,9 +57,20 @@ if(NOT DEFINED JCE_BUILD_VARIANT)
 	if(IS_DIRECTORY "${_ck_ui}")
 		list(APPEND _ck_dirs "${_ck_ui}")
 	endif()
-	if(JCE_PAK_EXECUTABLE AND _ck_dirs
-	   AND COMMAND jce_target_embed_pak)
-		jce_target_embed_pak(CagedKingdom
+
+	# Editor-driven builds feed pre-cooked assets via
+	# JCE_PROJECT_PREBUILT_ASSETS_*; jce_add_pak() consumes those without
+	# needing a host packer on PATH.
+	set(_ck_have_prebuilt OFF)
+	if((DEFINED JCE_PROJECT_PREBUILT_ASSETS_OBJ AND EXISTS "${JCE_PROJECT_PREBUILT_ASSETS_OBJ}") OR
+	   (DEFINED JCE_PROJECT_PREBUILT_ASSETS_ASM AND EXISTS "${JCE_PROJECT_PREBUILT_ASSETS_ASM}") OR
+	   (DEFINED JCE_PROJECT_PREBUILT_ASSETS_C   AND EXISTS "${JCE_PROJECT_PREBUILT_ASSETS_C}"))
+		set(_ck_have_prebuilt ON)
+	endif()
+
+	if(COMMAND jce_add_pak AND
+	   (_ck_have_prebuilt OR (JCE_PAK_EXECUTABLE AND _ck_dirs)))
+		jce_add_pak(CagedKingdom
 			RESOURCE_DIRS ${_ck_dirs})
 	else()
 		set(_stub "${CMAKE_CURRENT_BINARY_DIR}/jce_stub_pak.c")

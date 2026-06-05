@@ -101,6 +101,16 @@ JCE_API void JCE_CALL jce_skinned_mesh_submit_pick_id(
 JCE_API void JCE_CALL jce_skinned_mesh_set_bones(const jce_mat4 *joint_matrices,
                                                  uint32_t num_joints);
 
+/* Submit the mesh to a shadow/depth pass (depth-only state, front-face
+ * cull).  For skinned geometry the bone palette must already have been
+ * uploaded via jce_skinned_mesh_set_bones() and `program` must be the
+ * skinned shadow program; for static-PBR geometry set a single transform
+ * and pass the static shadow program. No-op if program is invalid. */
+JCE_API void JCE_CALL jce_skinned_mesh_submit_shadow(const JceSkinnedMesh *mesh,
+                                                     const JceRenderer *r,
+                                                     uint16_t view_id,
+                                                     JceShaderHandle program);
+
 /* Query whether this mesh has skinning data. */
 JCE_API bool     jce_skinned_mesh_is_skinned(const JceSkinnedMesh *mesh);
 JCE_API uint32_t jce_skinned_mesh_vertex_count(const JceSkinnedMesh *mesh);

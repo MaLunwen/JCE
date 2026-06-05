@@ -214,6 +214,31 @@ void jce_skinned_mesh_set_bones(const jce_mat4 *joint_matrices,
     bgfx_set_transform(joint_matrices->raw[0], (uint16_t)num_joints);
 }
 
+void jce_skinned_mesh_submit_shadow(const JceSkinnedMesh *mesh,
+                                    const JceRenderer *r, uint16_t view_id,
+                                    JceShaderHandle program)
+{
+    if (!mesh || !r || program.idx == UINT16_MAX) return;
+    JCE_PROFILE_ZONE_N("SkinnedMesh::SubmitShadow");
+    (void)view_id;
+
+    /* Caller must have uploaded the bone palette via
+     * jce_skinned_mesh_set_bones() (skinned program) or a single
+     * bgfx_set_transform() (static-PBR fallback) before this call. */
+    bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
+    if (mesh->ibh.idx != UINT16_MAX)
+        bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
+
+    /* Depth-only: write Z, cull front faces to reduce peter-panning —
+     * identical state to jce_mesh_submit_shadow() for the static path. */
+    bgfx_set_state(BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
+                 | BGFX_STATE_CULL_CW | BGFX_STATE_MSAA, 0);
+
+    bgfx_program_handle_t prog = { program.idx };
+    bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+    JCE_PROFILE_ZONE_END;
+}
+
 /* Wireframe overlay: line-topology submit using the per-mesh wf_ibh.
  * For skinned variants the caller must have uploaded the bone palette
  * via jce_skinned_mesh_set_bones() (or bgfx_set_transform for static

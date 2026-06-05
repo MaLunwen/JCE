@@ -221,15 +221,23 @@ static bool setup_scene_viewport(SceneViewCtx *ctx)
     }
 
     ImGui::SetCursorScreenPos(screen_pos);
-    ImGui::InvisibleButton("##SceneViewInput", avail);
+    ImGui::InvisibleButton("##SceneViewInput", avail,
+                           ImGuiButtonFlags_MouseButtonLeft |
+                           ImGuiButtonFlags_MouseButtonRight |
+                           ImGuiButtonFlags_MouseButtonMiddle);
     handle_scene_view_asset_drop(screen_pos, avail);  /* drop target must follow the button immediately */
-    bool viewport_hovered = ImGui::IsItemHovered();
-    (void)ImGui::IsItemActive();
+    bool viewport_hovered       = ImGui::IsItemHovered();
+    bool viewport_active        = ImGui::IsItemActive();
+    bool viewport_left_clicked  = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+    bool viewport_right_clicked = ImGui::IsItemClicked(ImGuiMouseButton_Right);
 
     ctx->avail            = avail;
     ctx->screen_pos       = screen_pos;
     ctx->dl               = dl;
     ctx->viewport_hovered = viewport_hovered;
+    ctx->viewport_active  = viewport_active;
+    ctx->viewport_left_clicked  = viewport_left_clicked;
+    ctx->viewport_right_clicked = viewport_right_clicked;
     return true;
 }
 
@@ -953,19 +961,10 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
 
 static void draw_scene_context_menu(const SceneViewCtx *ctx)
 {
-    {
-        ImVec2 mpos = ImGui::GetMousePos();
-        bool mouse_in_vp = (mpos.x >= ctx->screen_pos.x &&
-                            mpos.x <= ctx->screen_pos.x + ctx->avail.x &&
-                            mpos.y >= ctx->screen_pos.y &&
-                            mpos.y <= ctx->screen_pos.y + ctx->avail.y);
+    if (jce_scene_view_should_open_context_menu(ctx->viewport_right_clicked,
+                                                ImGui::GetIO().KeyAlt))
+        ImGui::OpenPopup("SceneViewContextMenu");
 
-        if (mouse_in_vp && ImGui::IsMouseClicked(ImGuiMouseButton_Right)
-            && !ImGui::GetIO().KeyAlt)
-        {
-            ImGui::OpenPopup("SceneViewContextMenu");
-        }
-    }
     if (ImGui::BeginPopup("SceneViewContextMenu")) {
         uint32_t focused = jce_state_get_focused();
         int sel_count = 0;
@@ -1213,7 +1212,8 @@ static void handle_scene_view_shortcuts(void)
             scene_view_frame_entities(frame_all_);
         }
 
-        if (jce_hotkey_pressed(JCE_HK_EDIT_DELETE)) {
+        if (jce_hotkey_pressed(JCE_HK_EDIT_DELETE)
+            || jce_hotkey_pressed(JCE_HK_EDIT_DELETE_ALT)) {
             int dk = 0;
             const uint32_t *dids = jce_state_get_selection(&dk);
             if (dk > 0) {
@@ -1333,6 +1333,13 @@ static void handle_marquee_selection(const SceneViewCtx *ctx,
 
 static bool s_gpu_pick_selection_pending = false;
 static bool s_gpu_pick_add_mode = false;
+
+static void cancel_deferred_scene_pick(void)
+{
+    s_sel_pending = false;
+    s_sel_click_pending = false;
+    s_gpu_pick_selection_pending = false;
+}
 
 static void apply_single_pick_selection(uint32_t best_id, bool add_mode)
 {
@@ -1572,16 +1579,25 @@ void jce_editor_panel_scene_view_content(void)
     draw_scene_context_menu(&ctx);
     handle_scene_camera_controls(ctx.viewport_hovered);
 
+    if (jce_scene_view_should_cancel_deferred_pick(
+            ImGui::IsMouseClicked(ImGuiMouseButton_Left),
+            ctx.viewport_left_clicked,
+            ctx.viewport_active))
+        cancel_deferred_scene_pick();
+
     /* ── Terrain brush (Phase 2-B.2) ─────────────────────────────
      *  Active only when the Terrain panel arms it. Steals LMB from
      *  selection so a click/drag inside the viewport raycasts onto
      *  the active terrain and applies the current brush at the
      *  hit point. Plain LMB only — Alt-LMB still orbits the camera. */
     bool brush_consumed = false;
-    if (ctx.viewport_hovered && jce_terrain_panel_brush_armed() &&
+    if (jce_scene_view_left_input_belongs_to_viewport(
+            ctx.viewport_left_clicked,
+            ctx.viewport_active,
+            ImGui::IsMouseDown(ImGuiMouseButton_Left)) &&
+        jce_terrain_panel_brush_armed() &&
         !ImGui::GetIO().KeyAlt &&
-        (ImGui::IsMouseClicked(ImGuiMouseButton_Left) ||
-         ImGui::IsMouseDown(ImGuiMouseButton_Left)))
+        !jce_gizmo_is_active())
     {
         float vmat[16], pmat[16], eye[3];
         if (jce_editor_scene_get_camera_matrices(vmat, pmat, eye,

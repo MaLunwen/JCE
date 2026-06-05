@@ -45,6 +45,7 @@ struct JcePostFXPipeline {
     bgfx_program_handle_t prog_vignette;
     bgfx_program_handle_t prog_chromatic;
     bgfx_program_handle_t prog_grayscale;
+    bgfx_program_handle_t prog_composite;  /* uber: combine+tonemap+chromatic+vignette+grayscale */
 
     /* Uniforms. */
     bgfx_uniform_handle_t u_texColor;
@@ -56,6 +57,8 @@ struct JcePostFXPipeline {
     bgfx_uniform_handle_t u_texelSize;
     bgfx_uniform_handle_t u_vignetteParams;
     bgfx_uniform_handle_t u_chromaticParams;
+    bgfx_uniform_handle_t u_compositeFlags;   /* x=bloom y=tonemap z=chromatic w=vignette */
+    bgfx_uniform_handle_t u_compositeFlags2;  /* x=grayscale */
 
     /* Full-screen quad vertex buffer. */
     bgfx_vertex_buffer_handle_t quad_vb;
@@ -192,6 +195,7 @@ JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
     p->prog_vignette.idx      = UINT16_MAX;
     p->prog_chromatic.idx     = UINT16_MAX;
     p->prog_grayscale.idx     = UINT16_MAX;
+    p->prog_composite.idx     = UINT16_MAX;
     reset_output_state(p);
     p->view_base = JCE_VIEW_POST_BASE;
 
@@ -219,6 +223,8 @@ JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
     p->u_texelSize      = bgfx_create_uniform("u_texelSize",      BGFX_UNIFORM_TYPE_VEC4, 1);
     p->u_vignetteParams = bgfx_create_uniform("u_vignetteParams", BGFX_UNIFORM_TYPE_VEC4, 1);
     p->u_chromaticParams= bgfx_create_uniform("u_chromaticParams",BGFX_UNIFORM_TYPE_VEC4, 1);
+    p->u_compositeFlags = bgfx_create_uniform("u_compositeFlags", BGFX_UNIFORM_TYPE_VEC4, 1);
+    p->u_compositeFlags2= bgfx_create_uniform("u_compositeFlags2",BGFX_UNIFORM_TYPE_VEC4, 1);
 
     LOG_SUCCESS(LOG_TAG, "post-fx pipeline created (%ux%u)", width, height);
     return p;
@@ -245,6 +251,8 @@ void jce_postfx_destroy(JcePostFXPipeline *pipeline)
     bgfx_destroy_uniform(pipeline->u_texelSize);
     bgfx_destroy_uniform(pipeline->u_vignetteParams);
     bgfx_destroy_uniform(pipeline->u_chromaticParams);
+    bgfx_destroy_uniform(pipeline->u_compositeFlags);
+    bgfx_destroy_uniform(pipeline->u_compositeFlags2);
 
     /* Destroy shader programs. */
     if (pipeline->prog_tonemap.idx       != UINT16_MAX) bgfx_destroy_program(pipeline->prog_tonemap);
@@ -255,6 +263,7 @@ void jce_postfx_destroy(JcePostFXPipeline *pipeline)
     if (pipeline->prog_vignette.idx      != UINT16_MAX) bgfx_destroy_program(pipeline->prog_vignette);
     if (pipeline->prog_chromatic.idx     != UINT16_MAX) bgfx_destroy_program(pipeline->prog_chromatic);
     if (pipeline->prog_grayscale.idx     != UINT16_MAX) bgfx_destroy_program(pipeline->prog_grayscale);
+    if (pipeline->prog_composite.idx     != UINT16_MAX) bgfx_destroy_program(pipeline->prog_composite);
 
     jce_allocator_t a = pipeline->alloc;
     a.free(pipeline, a.ctx);
@@ -342,6 +351,7 @@ bool jce_postfx_load_shaders(JcePostFXPipeline *pipeline,
     pipeline->prog_vignette      = load_postfx_prog(pak, "vignette");
     pipeline->prog_chromatic     = load_postfx_prog(pak, "chromatic");
     pipeline->prog_grayscale     = load_postfx_prog(pak, "grayscale");
+    pipeline->prog_composite     = load_postfx_prog(pak, "composite");
 
     /* Count how many loaded successfully. */
     int loaded = 0;
@@ -353,9 +363,10 @@ bool jce_postfx_load_shaders(JcePostFXPipeline *pipeline,
     if (pipeline->prog_vignette.idx      != UINT16_MAX) loaded++;
     if (pipeline->prog_chromatic.idx     != UINT16_MAX) loaded++;
     if (pipeline->prog_grayscale.idx     != UINT16_MAX) loaded++;
+    if (pipeline->prog_composite.idx     != UINT16_MAX) loaded++;
 
     pipeline->shaders_loaded = (loaded > 0);
-    LOG_INFO(LOG_TAG, "post-fx shaders loaded: %d/8", loaded);
+    LOG_INFO(LOG_TAG, "post-fx shaders loaded: %d/9", loaded);
     return pipeline->shaders_loaded;
 }
 
@@ -469,13 +480,48 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
             view_id++;
         }
 
-        /* Combine: scene + bloom → FBO ping. */
-        if (pipeline->prog_bloom_combine.idx != UINT16_MAX) {
+        /* Bloom is COMBINED in the uber composite pass below (fbo_tex[2]
+           holds the blurred bloom; the composite reads it at stage 1). */
+    }
+
+    /* ── 2. Uber composite ────────────────────────────────────────────
+     * Folds bloom-combine + tonemap + chromatic + vignette + grayscale into
+     * ONE fullscreen pass (each gated by a flag). Runs whenever any of those
+     * effects is on. FXAA (below) stays separate — it needs the LDR result. */
+    {
+        const bool c_bloom   = pipeline->enabled[JCE_POSTFX_BLOOM];
+        const bool c_tonemap = pipeline->enabled[JCE_POSTFX_TONEMAP];
+        const bool c_chroma  = pipeline->enabled[JCE_POSTFX_CHROMATIC];
+        const bool c_vig     = pipeline->enabled[JCE_POSTFX_VIGNETTE];
+        const bool c_gray    = pipeline->enabled[JCE_POSTFX_GRAYSCALE];
+        const bool any_comp  = c_bloom || c_tonemap || c_chroma || c_vig || c_gray;
+
+        if (any_comp && pipeline->prog_composite.idx != UINT16_MAX) {
+            float flags[4]   = { c_bloom ? 1.0f : 0.0f, c_tonemap ? 1.0f : 0.0f,
+                                 c_chroma ? 1.0f : 0.0f, c_vig ? 1.0f : 0.0f };
+            float flags2[4]  = { c_gray ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
+            float bloom_p[4] = { pipeline->params.bloom_threshold,
+                                 pipeline->params.bloom_intensity, 0.0f, 0.0f };
+            float tonemap_p[4] = { pipeline->params.exposure,
+                                   pipeline->params.gamma, 0.0f, 0.0f };
+            float chrom_p[4] = { pipeline->params.chromatic_strength, 0.0f, 0.0f, 0.0f };
+            float vig_p[4]   = { pipeline->params.vignette_intensity,
+                                 pipeline->params.vignette_smoothness, 0.0f, 0.0f };
+            bgfx_set_uniform(pipeline->u_compositeFlags,  flags,  1);
+            bgfx_set_uniform(pipeline->u_compositeFlags2, flags2, 1);
+            bgfx_set_uniform(pipeline->u_bloomParams,     bloom_p, 1);
+            bgfx_set_uniform(pipeline->u_tonemapParams,   tonemap_p, 1);
+            bgfx_set_uniform(pipeline->u_chromaticParams, chrom_p, 1);
+            bgfx_set_uniform(pipeline->u_vignetteParams,  vig_p, 1);
+
             POSTFX_SETUP_VIEW(view_id, pipeline->fbo[ping]);
-            bgfx_set_view_name(view_id, "PostFX/BloomCombine", INT32_MAX);
+            bgfx_set_view_name(view_id, "PostFX/Composite", INT32_MAX);
             bgfx_set_texture(0, pipeline->u_texColor, current_tex, UINT32_MAX);
-            bgfx_set_texture(1, pipeline->u_texBloom, pipeline->fbo_tex[2], UINT32_MAX);
-            draw_fullscreen(pipeline, view_id, pipeline->prog_bloom_combine);
+            /* stage 1 = blurred bloom (fbo_tex[2]) when bloom is on; otherwise
+               bind a valid handle that the shader's flag-gate won't sample. */
+            bgfx_set_texture(1, pipeline->u_texBloom,
+                             c_bloom ? pipeline->fbo_tex[2] : current_tex, UINT32_MAX);
+            draw_fullscreen(pipeline, view_id, pipeline->prog_composite);
             current_tex = pipeline->fbo_tex[ping];
             current_fb_index = ping;
             ping = 1 - ping;
@@ -483,28 +529,7 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
         }
     }
 
-    /* ── 2. Tonemap ───────────────────────────────────────────────── */
-    if (pipeline->enabled[JCE_POSTFX_TONEMAP] &&
-        pipeline->prog_tonemap.idx != UINT16_MAX)
-    {
-        float tonemap_p[4] = {
-            pipeline->params.exposure,
-            pipeline->params.gamma,
-            0.0f, 0.0f
-        };
-        bgfx_set_uniform(pipeline->u_tonemapParams, tonemap_p, 1);
-
-        POSTFX_SETUP_VIEW(view_id, pipeline->fbo[ping]);
-        bgfx_set_view_name(view_id, "PostFX/Tonemap", INT32_MAX);
-        bgfx_set_texture(0, pipeline->u_texColor, current_tex, UINT32_MAX);
-        draw_fullscreen(pipeline, view_id, pipeline->prog_tonemap);
-        current_tex = pipeline->fbo_tex[ping];
-        current_fb_index = ping;
-        ping = 1 - ping;
-        view_id++;
-    }
-
-    /* ── 3. FXAA ──────────────────────────────────────────────────── */
+    /* ── 3. FXAA (separate — edge AA on the composited LDR image) ────── */
     if (pipeline->enabled[JCE_POSTFX_FXAA] &&
         pipeline->prog_fxaa.idx != UINT16_MAX)
     {
@@ -520,58 +545,6 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
         bgfx_set_view_name(view_id, "PostFX/FXAA", INT32_MAX);
         bgfx_set_texture(0, pipeline->u_texColor, current_tex, UINT32_MAX);
         draw_fullscreen(pipeline, view_id, pipeline->prog_fxaa);
-        current_tex = pipeline->fbo_tex[ping];
-        current_fb_index = ping;
-        ping = 1 - ping;
-        view_id++;
-    }
-
-    /* ── 4. Chromatic aberration ──────────────────────────────────── */
-    if (pipeline->enabled[JCE_POSTFX_CHROMATIC] &&
-        pipeline->prog_chromatic.idx != UINT16_MAX)
-    {
-        float chrom_p[4] = { pipeline->params.chromatic_strength, 0.0f, 0.0f, 0.0f };
-        bgfx_set_uniform(pipeline->u_chromaticParams, chrom_p, 1);
-
-        POSTFX_SETUP_VIEW(view_id, pipeline->fbo[ping]);
-        bgfx_set_view_name(view_id, "PostFX/Chromatic", INT32_MAX);
-        bgfx_set_texture(0, pipeline->u_texColor, current_tex, UINT32_MAX);
-        draw_fullscreen(pipeline, view_id, pipeline->prog_chromatic);
-        current_tex = pipeline->fbo_tex[ping];
-        current_fb_index = ping;
-        ping = 1 - ping;
-        view_id++;
-    }
-
-    /* ── 5. Vignette ──────────────────────────────────────────────── */
-    if (pipeline->enabled[JCE_POSTFX_VIGNETTE] &&
-        pipeline->prog_vignette.idx != UINT16_MAX)
-    {
-        float vig_p[4] = {
-            pipeline->params.vignette_intensity,
-            pipeline->params.vignette_smoothness,
-            0.0f, 0.0f
-        };
-        bgfx_set_uniform(pipeline->u_vignetteParams, vig_p, 1);
-
-        POSTFX_SETUP_VIEW(view_id, pipeline->fbo[ping]);
-        bgfx_set_view_name(view_id, "PostFX/Vignette", INT32_MAX);
-        bgfx_set_texture(0, pipeline->u_texColor, current_tex, UINT32_MAX);
-        draw_fullscreen(pipeline, view_id, pipeline->prog_vignette);
-        current_tex = pipeline->fbo_tex[ping];
-        current_fb_index = ping;
-        ping = 1 - ping;
-        view_id++;
-    }
-
-    /* ── 6. Grayscale ─────────────────────────────────────────────── */
-    if (pipeline->enabled[JCE_POSTFX_GRAYSCALE] &&
-        pipeline->prog_grayscale.idx != UINT16_MAX)
-    {
-        POSTFX_SETUP_VIEW(view_id, pipeline->fbo[ping]);
-        bgfx_set_view_name(view_id, "PostFX/Grayscale", INT32_MAX);
-        bgfx_set_texture(0, pipeline->u_texColor, current_tex, UINT32_MAX);
-        draw_fullscreen(pipeline, view_id, pipeline->prog_grayscale);
         current_tex = pipeline->fbo_tex[ping];
         current_fb_index = ping;
         ping = 1 - ping;

@@ -48,6 +48,19 @@ void jce_model_draw(const JceModel *model,
                     const jce_mat4 *joint_matrices,
                     uint32_t num_joints);
 
+/* Draw all primitives into a shadow/depth pass (depth-only, no materials).
+ *
+ * Skinned primitives reuse the same world-space bone palette the color
+ * pass uploads, so an animated model casts a shadow that follows its
+ * skeleton.  Pass NULL/0 joints to rasterize the bind pose.
+ *
+ * view_id must be a shadow producer view (single map or a CSM cascade). */
+void jce_model_draw_shadow(const JceModel *model,
+                           const JceRenderer *r, uint16_t view_id,
+                           const jce_mat4 *transform,
+                           const jce_mat4 *joint_matrices,
+                           uint32_t num_joints);
+
 /* Submit a wireframe overlay of every primitive in the model, walking
  * the full node hierarchy. Used by editor tooling (selection outlines)
  * to draw the true geometric silhouette of skinned/static models that

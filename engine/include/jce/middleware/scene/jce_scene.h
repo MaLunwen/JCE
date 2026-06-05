@@ -87,6 +87,8 @@ typedef struct {
     jce_vec3 color;
     float    intensity;
     float    radius;
+    bool     casts_shadow;    /* P1 — opt-in local (atlas) shadow */
+    float    shadow_bias;     /* depth bias; 0 = engine default */
 } JcePointLight;
 
 typedef struct {
@@ -97,6 +99,8 @@ typedef struct {
     float    radius;
     float    inner_cone_cos;
     float    outer_cone_cos;
+    bool     casts_shadow;    /* P1 — opt-in local (atlas) shadow */
+    float    shadow_bias;     /* depth bias; 0 = engine default */
     /* P3-E.5 — Light cookies + IES profile. Optional, opt-in per light. */
     JceTexture cookie_texture;       /* JCE_TEXTURE_INVALID = no cookie */
     JceTexture ies_lut_texture;      /* JCE_TEXTURE_INVALID = no IES profile */
@@ -1172,6 +1176,12 @@ JCE_API JceEntity jce_scene_get_parent(const JceScene *s, JceEntity e);
 int       jce_scene_get_children(const JceScene *s, JceEntity parent,
                                  JceEntity *out, int max_out);
 JCE_API int       jce_scene_get_child_count(const JceScene *s, JceEntity parent);
+
+/* World transform = composition of the entity's local TRS up its parent chain
+ * (world = parent_world * local). A root entity returns its local matrix, so
+ * unparented/flat scenes are unchanged. Use this (not raw JceTransform) when a
+ * world-space matrix is needed for rendering, picking, or gizmos. */
+JCE_API jce_mat4  jce_scene_get_world_matrix(const JceScene *s, JceEntity e);
 
 /* Component access — Transform. */
 JCE_API void           jce_scene_set_transform(JceScene *s, JceEntity e, const JceTransform *t);

@@ -42,7 +42,9 @@ if "%DO_CLEAN%"=="1" (
 echo === Step 1: Resolve host jce_pak ===
 if not exist "%HOST_PAK%" (
     echo   Host jce_pak not found - building...
-    call "%~dp0build-host-tools.bat"
+    REM Call jce.py directly (not the build-host-tools shim) so this orchestrator
+    REM keeps its own single beep + ":q" footer instead of nesting a second one.
+    python "%~dp0jce.py" host-tools
     if errorlevel 1 goto :error
 )
 if not exist "%HOST_PAK%" (

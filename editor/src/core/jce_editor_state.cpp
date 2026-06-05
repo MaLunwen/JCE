@@ -702,8 +702,23 @@ void jce_state_reparent_entity(uint32_t id, uint32_t new_parent)
         check = (uint32_t)jce_scene_get_parent(s.scene, (JceEntity)check);
     }
 
+    /* Preserve the child's WORLD pose across the reparent: capture it before
+       changing the parent, then back-solve a new LOCAL transform relative to
+       the new parent so the object does not visually jump. */
+    jce_mat4 child_world = jce_scene_get_world_matrix(s.scene, (JceEntity)id);
+
     jce_scene_set_parent(s.scene, (JceEntity)id,
                          new_parent != 0 ? (JceEntity)new_parent : JCE_ENTITY_INVALID);
+
+    JceTransform *t = jce_scene_get_transform(s.scene, (JceEntity)id);
+    if (t) {
+        jce_mat4 parent_world = (new_parent != 0)
+            ? jce_scene_get_world_matrix(s.scene, (JceEntity)new_parent)
+            : jce_m4_identity();
+        jce_mat4 inv   = jce_m4_inverse(&parent_world);
+        jce_mat4 local = jce_m4_multiply(&inv, &child_world);
+        jce_m4_decompose(&local, &t->position, &t->rotation, &t->scale);
+    }
 }
 
 void jce_state_reorder_sibling(uint32_t entity_id, uint32_t ref_id,

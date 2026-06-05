@@ -7,6 +7,74 @@
   },
   "configurePresets": [
     {
+      "name": "_desktop-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "_windows-x64",
+      "hidden": true,
+      "inherits": "_desktop-base",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/windows-x64-conan/build/Release/generators/conan_toolchain.cmake"
+      }
+    },
+    {
+      "name": "_windows-arm64",
+      "hidden": true,
+      "inherits": "_desktop-base",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/windows-arm64-conan/build/Release/generators/conan_toolchain.cmake"
+      }
+    },
+    {
+      "name": "_windows-x86",
+      "hidden": true,
+      "inherits": "_desktop-base",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/windows-x86-conan/build/Release/generators/conan_toolchain.cmake"
+      }
+    },
+    {
+      "name": "_linux-x64",
+      "hidden": true,
+      "inherits": "_desktop-base",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/linux-x64-conan/build/Release/generators/conan_toolchain.cmake"
+      }
+    },
+    {
+      "name": "_linux-arm64",
+      "hidden": true,
+      "inherits": "_desktop-base",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/linux-arm64-conan/build/Release/generators/conan_toolchain.cmake"
+      }
+    },
+    {
+      "name": "_macos-x64",
+      "hidden": true,
+      "inherits": "_desktop-base",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/macos-x64-conan/build/Release/generators/conan_toolchain.cmake",
+        "CMAKE_OSX_ARCHITECTURES": "x86_64",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "10.15"
+      }
+    },
+    {
+      "name": "_macos-arm64",
+      "hidden": true,
+      "inherits": "_desktop-base",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/macos-arm64-conan/build/Release/generators/conan_toolchain.cmake",
+        "CMAKE_OSX_ARCHITECTURES": "arm64",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "11.0"
+      }
+    },
+    {
       "name": "host-release",
       "displayName": "Host Release (Ninja)",
       "description": "Host build using Conan toolchain",
@@ -21,35 +89,56 @@
     {
       "name": "windows-x64-release",
       "displayName": "Desktop Windows x64 Release",
-      "description": "Desktop native build with Conan toolchain",
-      "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build/desktop/windows-x64",
+      "inherits": "_windows-x64",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "JCE_ENABLE_CPPCHECK": "ON",
-        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/windows-x64-conan/build/Release/generators/conan_toolchain.cmake"
-      }
+        "CMAKE_BUILD_TYPE": "Release"
+      },
+      "binaryDir": "${sourceDir}/build/desktop/windows-x64"
     },
     {
       "name": "windows-x64-debug",
       "displayName": "Desktop Windows x64 Debug (full PDB, no inlining)",
       "description": "Debug build with full PDB, /MDd CRT, optimised for VS 2026 diagnostics",
-      "generator": "Ninja",
+      "inherits": "_desktop-base",
       "binaryDir": "${sourceDir}/build/desktop/windows-x64-debug",
-      "toolset": { "value": "v143", "strategy": "external" },
-      "architecture": { "value": "x64", "strategy": "external" },
+      "toolset": {
+        "value": "v143",
+        "strategy": "external"
+      },
+      "architecture": {
+        "value": "x64",
+        "strategy": "external"
+      },
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "JCE_ENABLE_CPPCHECK": "OFF",
         "JCE_BUILD_VARIANT": "debug",
-        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/windows-x64-debug-conan/build/Debug/generators/conan_toolchain.cmake",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/windows-x64-conan/build/Debug/generators/conan_toolchain.cmake",
         "CMAKE_C_FLAGS_DEBUG": "/MDd /Zi /Ob0 /Od /RTC1 /DDEBUG /D_DEBUG /FS",
         "CMAKE_CXX_FLAGS_DEBUG": "/MDd /Zi /Ob0 /Od /RTC1 /DDEBUG /D_DEBUG /FS",
         "CMAKE_EXE_LINKER_FLAGS_DEBUG": "/DEBUG:FULL /INCREMENTAL:NO",
         "CMAKE_SHARED_LINKER_FLAGS_DEBUG": "/DEBUG:FULL /INCREMENTAL:NO",
         "CMAKE_MODULE_LINKER_FLAGS_DEBUG": "/DEBUG:FULL /INCREMENTAL:NO"
+      }
+    },
+    {
+      "name": "windows-x64-release-sdk",
+      "displayName": "SDK Windows x64 (release)",
+      "inherits": "windows-x64-release",
+      "binaryDir": "${sourceDir}/build/desktop/windows-x64-sdk",
+      "installDir": "${sourceDir}/dist/sdk/win32-x86_64",
+      "cacheVariables": {
+        "JCE_ENABLE_SDK_INSTALL": "ON"
+      }
+    },
+    {
+      "name": "windows-x64-dist-sdk",
+      "displayName": "SDK Windows x64 (dist)",
+      "inherits": "windows-x64-release-sdk",
+      "binaryDir": "${sourceDir}/build/desktop/windows-x64-dist-sdk",
+      "installDir": "${sourceDir}/dist/sdk/win32-x86_64-dist",
+      "cacheVariables": {
+        "JCE_BUILD_VARIANT": "dist",
+        "JCE_ENABLE_PATENTED_CODECS": "OFF"
       }
     },
     {
@@ -86,25 +175,93 @@
     {
       "name": "windows-arm64-release",
       "displayName": "Desktop Windows ARM64 Release",
-      "description": "Desktop cross-compile build (Windows ARM64)",
-      "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build/desktop/windows-arm64",
+      "inherits": "_windows-arm64",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/windows-arm64-conan/build/Release/generators/conan_toolchain.cmake"
+        "CMAKE_BUILD_TYPE": "Release"
+      },
+      "binaryDir": "${sourceDir}/build/desktop/windows-arm64"
+    },
+    {
+      "name": "windows-arm64-debug",
+      "displayName": "Desktop Windows ARM64 Debug",
+      "inherits": "_desktop-base",
+      "binaryDir": "${sourceDir}/build/desktop/windows-arm64-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "JCE_BUILD_VARIANT": "debug",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/windows-arm64-conan/build/Debug/generators/conan_toolchain.cmake",
+        "CMAKE_C_FLAGS_DEBUG": "/MDd /Zi /Ob0 /Od /RTC1 /DDEBUG /D_DEBUG /FS",
+        "CMAKE_CXX_FLAGS_DEBUG": "/MDd /Zi /Ob0 /Od /RTC1 /DDEBUG /D_DEBUG /FS",
+        "CMAKE_EXE_LINKER_FLAGS_DEBUG": "/DEBUG:FULL /INCREMENTAL:NO",
+        "CMAKE_SHARED_LINKER_FLAGS_DEBUG": "/DEBUG:FULL /INCREMENTAL:NO",
+        "CMAKE_MODULE_LINKER_FLAGS_DEBUG": "/DEBUG:FULL /INCREMENTAL:NO"
+      }
+    },
+    {
+      "name": "windows-arm64-release-sdk",
+      "displayName": "SDK Windows ARM64 (release)",
+      "inherits": "windows-arm64-release",
+      "binaryDir": "${sourceDir}/build/desktop/windows-arm64-sdk",
+      "installDir": "${sourceDir}/dist/sdk/win32-aarch64",
+      "cacheVariables": {
+        "JCE_ENABLE_SDK_INSTALL": "ON"
+      }
+    },
+    {
+      "name": "windows-arm64-dist-sdk",
+      "displayName": "SDK Windows ARM64 (dist)",
+      "inherits": "windows-arm64-release-sdk",
+      "binaryDir": "${sourceDir}/build/desktop/windows-arm64-dist-sdk",
+      "installDir": "${sourceDir}/dist/sdk/win32-aarch64-dist",
+      "cacheVariables": {
+        "JCE_BUILD_VARIANT": "dist",
+        "JCE_ENABLE_PATENTED_CODECS": "OFF"
       }
     },
     {
       "name": "windows-x86-release",
       "displayName": "Desktop Windows x86 (32-bit) Release",
-      "description": "Desktop cross-compile build (Windows x86 / i686)",
-      "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build/desktop/windows-x86",
+      "inherits": "_windows-x86",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/windows-x86-conan/build/Release/generators/conan_toolchain.cmake"
+        "CMAKE_BUILD_TYPE": "Release"
+      },
+      "binaryDir": "${sourceDir}/build/desktop/windows-x86"
+    },
+    {
+      "name": "windows-x86-debug",
+      "displayName": "Desktop Windows x86 (32-bit) Debug",
+      "inherits": "_desktop-base",
+      "binaryDir": "${sourceDir}/build/desktop/windows-x86-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "JCE_BUILD_VARIANT": "debug",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/windows-x86-conan/build/Debug/generators/conan_toolchain.cmake",
+        "CMAKE_C_FLAGS_DEBUG": "/MDd /Zi /Ob0 /Od /RTC1 /DDEBUG /D_DEBUG /FS",
+        "CMAKE_CXX_FLAGS_DEBUG": "/MDd /Zi /Ob0 /Od /RTC1 /DDEBUG /D_DEBUG /FS",
+        "CMAKE_EXE_LINKER_FLAGS_DEBUG": "/DEBUG:FULL /INCREMENTAL:NO",
+        "CMAKE_SHARED_LINKER_FLAGS_DEBUG": "/DEBUG:FULL /INCREMENTAL:NO",
+        "CMAKE_MODULE_LINKER_FLAGS_DEBUG": "/DEBUG:FULL /INCREMENTAL:NO"
+      }
+    },
+    {
+      "name": "windows-x86-release-sdk",
+      "displayName": "SDK Windows x86 (release)",
+      "inherits": "windows-x86-release",
+      "binaryDir": "${sourceDir}/build/desktop/windows-x86-sdk",
+      "installDir": "${sourceDir}/dist/sdk/win32-i686",
+      "cacheVariables": {
+        "JCE_ENABLE_SDK_INSTALL": "ON"
+      }
+    },
+    {
+      "name": "windows-x86-dist-sdk",
+      "displayName": "SDK Windows x86 (dist)",
+      "inherits": "windows-x86-release-sdk",
+      "binaryDir": "${sourceDir}/build/desktop/windows-x86-dist-sdk",
+      "installDir": "${sourceDir}/dist/sdk/win32-i686-dist",
+      "cacheVariables": {
+        "JCE_BUILD_VARIANT": "dist",
+        "JCE_ENABLE_PATENTED_CODECS": "OFF"
       }
     },
     {
@@ -132,53 +289,169 @@
     {
       "name": "linux-x64-release",
       "displayName": "Desktop Linux x64 Release",
-      "description": "Linux x86_64 native build",
-      "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build/desktop/linux-x64",
+      "inherits": "_linux-x64",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/linux-x64-conan/build/Release/generators/conan_toolchain.cmake"
+        "CMAKE_BUILD_TYPE": "Release"
+      },
+      "binaryDir": "${sourceDir}/build/desktop/linux-x64"
+    },
+    {
+      "name": "linux-x64-debug",
+      "displayName": "Desktop Linux x64 Debug",
+      "inherits": "_desktop-base",
+      "binaryDir": "${sourceDir}/build/desktop/linux-x64-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "JCE_BUILD_VARIANT": "debug",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/linux-x64-conan/build/Debug/generators/conan_toolchain.cmake"
+      }
+    },
+    {
+      "name": "linux-x64-release-sdk",
+      "displayName": "SDK Linux x64 (release)",
+      "inherits": "linux-x64-release",
+      "binaryDir": "${sourceDir}/build/desktop/linux-x64-sdk",
+      "installDir": "${sourceDir}/dist/sdk/linux-x86_64",
+      "cacheVariables": {
+        "JCE_ENABLE_SDK_INSTALL": "ON"
+      }
+    },
+    {
+      "name": "linux-x64-dist-sdk",
+      "displayName": "SDK Linux x64 (dist)",
+      "inherits": "linux-x64-release-sdk",
+      "binaryDir": "${sourceDir}/build/desktop/linux-x64-dist-sdk",
+      "installDir": "${sourceDir}/dist/sdk/linux-x86_64-dist",
+      "cacheVariables": {
+        "JCE_BUILD_VARIANT": "dist",
+        "JCE_ENABLE_PATENTED_CODECS": "OFF"
       }
     },
     {
       "name": "linux-arm64-release",
       "displayName": "Desktop Linux ARM64 Release",
-      "description": "Linux aarch64 native build",
-      "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build/desktop/linux-arm64",
+      "inherits": "_linux-arm64",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/linux-arm64-conan/build/Release/generators/conan_toolchain.cmake"
+        "CMAKE_BUILD_TYPE": "Release"
+      },
+      "binaryDir": "${sourceDir}/build/desktop/linux-arm64"
+    },
+    {
+      "name": "linux-arm64-debug",
+      "displayName": "Desktop Linux ARM64 Debug",
+      "inherits": "_desktop-base",
+      "binaryDir": "${sourceDir}/build/desktop/linux-arm64-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "JCE_BUILD_VARIANT": "debug",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/linux-arm64-conan/build/Debug/generators/conan_toolchain.cmake"
+      }
+    },
+    {
+      "name": "linux-arm64-release-sdk",
+      "displayName": "SDK Linux ARM64 (release)",
+      "inherits": "linux-arm64-release",
+      "binaryDir": "${sourceDir}/build/desktop/linux-arm64-sdk",
+      "installDir": "${sourceDir}/dist/sdk/linux-aarch64",
+      "cacheVariables": {
+        "JCE_ENABLE_SDK_INSTALL": "ON"
+      }
+    },
+    {
+      "name": "linux-arm64-dist-sdk",
+      "displayName": "SDK Linux ARM64 (dist)",
+      "inherits": "linux-arm64-release-sdk",
+      "binaryDir": "${sourceDir}/build/desktop/linux-arm64-dist-sdk",
+      "installDir": "${sourceDir}/dist/sdk/linux-aarch64-dist",
+      "cacheVariables": {
+        "JCE_BUILD_VARIANT": "dist",
+        "JCE_ENABLE_PATENTED_CODECS": "OFF"
       }
     },
     {
       "name": "macos-x64-release",
       "displayName": "Desktop macOS x64 Release",
-      "description": "macOS Intel x86_64 native build",
-      "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build/desktop/macos-x64",
+      "inherits": "_macos-x64",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_BUILD_TYPE": "Release"
+      },
+      "binaryDir": "${sourceDir}/build/desktop/macos-x64"
+    },
+    {
+      "name": "macos-x64-debug",
+      "displayName": "Desktop macOS x64 Debug",
+      "inherits": "_desktop-base",
+      "binaryDir": "${sourceDir}/build/desktop/macos-x64-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "JCE_BUILD_VARIANT": "debug",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/macos-x64-conan/build/Debug/generators/conan_toolchain.cmake",
         "CMAKE_OSX_ARCHITECTURES": "x86_64",
-        "CMAKE_OSX_DEPLOYMENT_TARGET": "10.15",
-        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/macos-x64-conan/build/Release/generators/conan_toolchain.cmake"
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "10.15"
+      }
+    },
+    {
+      "name": "macos-x64-release-sdk",
+      "displayName": "SDK macOS x64 (release)",
+      "inherits": "macos-x64-release",
+      "binaryDir": "${sourceDir}/build/desktop/macos-x64-sdk",
+      "installDir": "${sourceDir}/dist/sdk/darwin-x86_64",
+      "cacheVariables": {
+        "JCE_ENABLE_SDK_INSTALL": "ON"
+      }
+    },
+    {
+      "name": "macos-x64-dist-sdk",
+      "displayName": "SDK macOS x64 (dist)",
+      "inherits": "macos-x64-release-sdk",
+      "binaryDir": "${sourceDir}/build/desktop/macos-x64-dist-sdk",
+      "installDir": "${sourceDir}/dist/sdk/darwin-x86_64-dist",
+      "cacheVariables": {
+        "JCE_BUILD_VARIANT": "dist",
+        "JCE_ENABLE_PATENTED_CODECS": "OFF"
       }
     },
     {
       "name": "macos-arm64-release",
       "displayName": "Desktop macOS ARM64 Release",
-      "description": "macOS Apple Silicon native build",
-      "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build/desktop/macos-arm64",
+      "inherits": "_macos-arm64",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_BUILD_TYPE": "Release"
+      },
+      "binaryDir": "${sourceDir}/build/desktop/macos-arm64"
+    },
+    {
+      "name": "macos-arm64-debug",
+      "displayName": "Desktop macOS ARM64 Debug",
+      "inherits": "_desktop-base",
+      "binaryDir": "${sourceDir}/build/desktop/macos-arm64-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "JCE_BUILD_VARIANT": "debug",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/macos-arm64-conan/build/Debug/generators/conan_toolchain.cmake",
         "CMAKE_OSX_ARCHITECTURES": "arm64",
-        "CMAKE_OSX_DEPLOYMENT_TARGET": "11.0",
-        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/desktop/macos-arm64-conan/build/Release/generators/conan_toolchain.cmake"
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "11.0"
+      }
+    },
+    {
+      "name": "macos-arm64-release-sdk",
+      "displayName": "SDK macOS ARM64 (release)",
+      "inherits": "macos-arm64-release",
+      "binaryDir": "${sourceDir}/build/desktop/macos-arm64-sdk",
+      "installDir": "${sourceDir}/dist/sdk/darwin-aarch64",
+      "cacheVariables": {
+        "JCE_ENABLE_SDK_INSTALL": "ON"
+      }
+    },
+    {
+      "name": "macos-arm64-dist-sdk",
+      "displayName": "SDK macOS ARM64 (dist)",
+      "inherits": "macos-arm64-release-sdk",
+      "binaryDir": "${sourceDir}/build/desktop/macos-arm64-dist-sdk",
+      "installDir": "${sourceDir}/dist/sdk/darwin-aarch64-dist",
+      "cacheVariables": {
+        "JCE_BUILD_VARIANT": "dist",
+        "JCE_ENABLE_PATENTED_CODECS": "OFF"
       }
     },
     {
@@ -190,6 +463,69 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/build/mobile/ios-arm64-conan/build/Release/generators/conan_toolchain.cmake"
+      }
+    },
+    {
+      "name": "windows-x64-dist",
+      "displayName": "Desktop windows-x64 Dist (royalty-free, non-SDK)",
+      "inherits": "windows-x64-release",
+      "cacheVariables": {
+        "JCE_BUILD_VARIANT": "dist",
+        "JCE_ENABLE_PATENTED_CODECS": "OFF"
+      }
+    },
+    {
+      "name": "windows-arm64-dist",
+      "displayName": "Desktop windows-arm64 Dist (royalty-free, non-SDK)",
+      "inherits": "windows-arm64-release",
+      "cacheVariables": {
+        "JCE_BUILD_VARIANT": "dist",
+        "JCE_ENABLE_PATENTED_CODECS": "OFF"
+      }
+    },
+    {
+      "name": "windows-x86-dist",
+      "displayName": "Desktop windows-x86 Dist (royalty-free, non-SDK)",
+      "inherits": "windows-x86-release",
+      "cacheVariables": {
+        "JCE_BUILD_VARIANT": "dist",
+        "JCE_ENABLE_PATENTED_CODECS": "OFF"
+      }
+    },
+    {
+      "name": "linux-x64-dist",
+      "displayName": "Desktop linux-x64 Dist (royalty-free, non-SDK)",
+      "inherits": "linux-x64-release",
+      "cacheVariables": {
+        "JCE_BUILD_VARIANT": "dist",
+        "JCE_ENABLE_PATENTED_CODECS": "OFF"
+      }
+    },
+    {
+      "name": "linux-arm64-dist",
+      "displayName": "Desktop linux-arm64 Dist (royalty-free, non-SDK)",
+      "inherits": "linux-arm64-release",
+      "cacheVariables": {
+        "JCE_BUILD_VARIANT": "dist",
+        "JCE_ENABLE_PATENTED_CODECS": "OFF"
+      }
+    },
+    {
+      "name": "macos-x64-dist",
+      "displayName": "Desktop macos-x64 Dist (royalty-free, non-SDK)",
+      "inherits": "macos-x64-release",
+      "cacheVariables": {
+        "JCE_BUILD_VARIANT": "dist",
+        "JCE_ENABLE_PATENTED_CODECS": "OFF"
+      }
+    },
+    {
+      "name": "macos-arm64-dist",
+      "displayName": "Desktop macos-arm64 Dist (royalty-free, non-SDK)",
+      "inherits": "macos-arm64-release",
+      "cacheVariables": {
+        "JCE_BUILD_VARIANT": "dist",
+        "JCE_ENABLE_PATENTED_CODECS": "OFF"
       }
     }
   ],
@@ -213,6 +549,16 @@
       "configuration": "Debug"
     },
     {
+      "name": "build-windows-x64-release-sdk",
+      "configurePreset": "windows-x64-release-sdk",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-windows-x64-dist-sdk",
+      "configurePreset": "windows-x64-dist-sdk",
+      "configuration": "Release"
+    },
+    {
       "name": "build-windows-x64-asan",
       "displayName": "Build Desktop Windows x64 ASan",
       "configurePreset": "windows-x64-asan",
@@ -228,6 +574,41 @@
       "name": "build-windows-arm64-release",
       "displayName": "Build Desktop Windows ARM64",
       "configurePreset": "windows-arm64-release",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-windows-arm64-debug",
+      "configurePreset": "windows-arm64-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "build-windows-arm64-release-sdk",
+      "configurePreset": "windows-arm64-release-sdk",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-windows-arm64-dist-sdk",
+      "configurePreset": "windows-arm64-dist-sdk",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-windows-x86-release",
+      "configurePreset": "windows-x86-release",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-windows-x86-debug",
+      "configurePreset": "windows-x86-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "build-windows-x86-release-sdk",
+      "configurePreset": "windows-x86-release-sdk",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-windows-x86-dist-sdk",
+      "configurePreset": "windows-x86-dist-sdk",
       "configuration": "Release"
     },
     {
@@ -249,9 +630,39 @@
       "configuration": "Release"
     },
     {
+      "name": "build-linux-x64-debug",
+      "configurePreset": "linux-x64-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "build-linux-x64-release-sdk",
+      "configurePreset": "linux-x64-release-sdk",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-linux-x64-dist-sdk",
+      "configurePreset": "linux-x64-dist-sdk",
+      "configuration": "Release"
+    },
+    {
       "name": "build-linux-arm64-release",
       "displayName": "Build Desktop Linux ARM64",
       "configurePreset": "linux-arm64-release",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-linux-arm64-debug",
+      "configurePreset": "linux-arm64-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "build-linux-arm64-release-sdk",
+      "configurePreset": "linux-arm64-release-sdk",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-linux-arm64-dist-sdk",
+      "configurePreset": "linux-arm64-dist-sdk",
       "configuration": "Release"
     },
     {
@@ -261,15 +672,80 @@
       "configuration": "Release"
     },
     {
+      "name": "build-macos-x64-debug",
+      "configurePreset": "macos-x64-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "build-macos-x64-release-sdk",
+      "configurePreset": "macos-x64-release-sdk",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-macos-x64-dist-sdk",
+      "configurePreset": "macos-x64-dist-sdk",
+      "configuration": "Release"
+    },
+    {
       "name": "build-macos-arm64-release",
       "displayName": "Build Desktop macOS ARM64",
       "configurePreset": "macos-arm64-release",
       "configuration": "Release"
     },
     {
+      "name": "build-macos-arm64-debug",
+      "configurePreset": "macos-arm64-debug",
+      "configuration": "Debug"
+    },
+    {
+      "name": "build-macos-arm64-release-sdk",
+      "configurePreset": "macos-arm64-release-sdk",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-macos-arm64-dist-sdk",
+      "configurePreset": "macos-arm64-dist-sdk",
+      "configuration": "Release"
+    },
+    {
       "name": "build-ios-arm64-release",
       "displayName": "Build Mobile iOS ARM64",
       "configurePreset": "ios-arm64-release",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-windows-x64-dist",
+      "configurePreset": "windows-x64-dist",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-windows-arm64-dist",
+      "configurePreset": "windows-arm64-dist",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-windows-x86-dist",
+      "configurePreset": "windows-x86-dist",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-linux-x64-dist",
+      "configurePreset": "linux-x64-dist",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-linux-arm64-dist",
+      "configurePreset": "linux-arm64-dist",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-macos-x64-dist",
+      "configurePreset": "macos-x64-dist",
+      "configuration": "Release"
+    },
+    {
+      "name": "build-macos-arm64-dist",
+      "configurePreset": "macos-arm64-dist",
       "configuration": "Release"
     }
   ]

@@ -12,7 +12,7 @@
  */
 
 #define ENABLE_VHACD_IMPLEMENTATION 1
-#include "third_party/vhacd/VHACD.h"
+#include "VHACD.h"
 
 extern "C" {
 #include <jce/middleware/physics/jce_collider_cook.h>

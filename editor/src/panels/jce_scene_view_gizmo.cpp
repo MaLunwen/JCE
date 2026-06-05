@@ -13,10 +13,11 @@ void handle_scene_selection_box(const SceneViewCtx *ctx)
     if (!has_valid_gizmo_target())
         clear_stale_gizmo_interaction_state();
 
-    if (ctx->viewport_hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)
-        && !ImGui::GetIO().KeyAlt
-        && !jce_gizmo_is_active()
-        && jce_gizmo_hovered_axis() == JCE_GIZMO_AXIS_NONE)
+    if (jce_scene_view_should_start_selection(
+            ctx->viewport_left_clicked,
+            ImGui::GetIO().KeyAlt,
+            jce_gizmo_is_active(),
+            jce_gizmo_hovered_axis() != JCE_GIZMO_AXIS_NONE))
     {
         s_is_selecting = true;
         s_sel_start    = ImGui::GetMousePos();

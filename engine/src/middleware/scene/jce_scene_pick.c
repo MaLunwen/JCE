@@ -348,15 +348,11 @@ static bool pick_build_model(JceScene *scene, JceEntity e, jce_mat4 *out_model)
 {
     if (!scene || !out_model)
         return false;
-    JceTransform *t = jce_scene_get_transform(scene, e);
-    if (!t)
+    if (!jce_scene_has_transform(scene, e))
         return false;
 
-    float sx = (t->scale.x != 0.0f) ? t->scale.x : 1.0f;
-    float sy = (t->scale.y != 0.0f) ? t->scale.y : 1.0f;
-    float sz = (t->scale.z != 0.0f) ? t->scale.z : 1.0f;
-    *out_model = jce_m4_from_trs(t->position, t->rotation,
-                                 jce_v3(sx, sy, sz));
+    /* Compose the full world matrix up the parent chain (roots → local). */
+    *out_model = jce_scene_get_world_matrix(scene, e);
     return true;
 }
 

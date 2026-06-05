@@ -12,6 +12,7 @@
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_state.h"
 #include "scene/jce_editor_scene_render.h"
+#include "jce_scene_view_input_policy.h"
 
 #include <jce/tools/jce_imgui.hpp>
 #include <jce/tools/jce_imgui_internal.h>
@@ -46,6 +47,9 @@ struct SceneViewCtx {
     ImVec2      screen_pos;
     ImDrawList *dl;
     bool        viewport_hovered;
+    bool        viewport_active;
+    bool        viewport_left_clicked;
+    bool        viewport_right_clicked;
 };
 
 /* ── Selection box state ─────────────────────────────────────────── */

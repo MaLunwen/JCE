@@ -24,6 +24,7 @@
 #include "ui/jce_editor_tip.h"
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
+#include "ui/jce_editor_ui_state.h"
 #include "io/jce_editor_file_util.h"
 
 #include <jce/tools/jce_imgui.hpp>
@@ -47,6 +48,29 @@ static JceAudioBusId  s_selected_bus     = JCE_AUDIO_BUS_MASTER;
 static char           s_rename_buf[64]   = {0};
 static JceAudioBusId  s_renaming_bus     = JCE_AUDIO_BUS_INVALID;
 static int            s_pending_focus_tab = -1; /* 0=mixer, 1=reverb, -1=none */
+static int            s_current_tab       = 0;
+static bool           s_tab_state_loaded  = false;
+
+static const char *k_audio_tab_state_key = "panel.audio_mixer.current_tab";
+
+static void ensure_tab_state_loaded(void)
+{
+    if (s_tab_state_loaded)
+        return;
+    s_current_tab =
+        jce_editor_ui_state_load_int(k_audio_tab_state_key, 0, 0, 1);
+    s_pending_focus_tab = s_current_tab;
+    s_tab_state_loaded = true;
+}
+
+static void set_current_tab(int idx)
+{
+    if (idx < 0 || idx > 1 || s_current_tab == idx)
+        return;
+    s_current_tab = idx;
+    if (s_tab_state_loaded)
+        jce_editor_ui_state_save_int(k_audio_tab_state_key, idx);
+}
 
 /* ── Persistence ────────────────────────────────────────────────────── */
 
@@ -428,6 +452,7 @@ extern "C" void jce_editor_panel_audio_mixer_content(void)
         return;
     }
 
+    ensure_tab_state_loaded();
     if (ImGui::BeginTabBar("##audio_mixer_tabs")) {
         ImGuiTabItemFlags mixer_flags = (s_pending_focus_tab == 0)
             ? ImGuiTabItemFlags_SetSelected : 0;
@@ -436,11 +461,13 @@ extern "C" void jce_editor_panel_audio_mixer_content(void)
         s_pending_focus_tab = -1;
         if (ImGui::BeginTabItem(jce_editor_i18n("audioMixer.tab.mixer"),
                                 nullptr, mixer_flags)) {
+            set_current_tab(0);
             draw_mixer_tab();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem(jce_editor_i18n("audioMixer.tab.reverb"),
                                 nullptr, reverb_flags)) {
+            set_current_tab(1);
             draw_reverb_zones_tab();
             ImGui::EndTabItem();
         }
@@ -451,6 +478,8 @@ extern "C" void jce_editor_panel_audio_mixer_content(void)
 extern "C" void jce_editor_audio_mixer_focus_reverb_tab(void)
 {
     s_pending_focus_tab = 1;
+    s_current_tab = 1;
+    jce_editor_ui_state_save_int(k_audio_tab_state_key, 1);
 }
 
 extern "C" void jce_editor_panel_audio_mixer(void)

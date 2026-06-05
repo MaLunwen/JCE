@@ -150,7 +150,8 @@ void jce_editor_panel_hierarchy_content(void)
                 if (jce_state_entity_exists(focused))
                     begin_rename_entity(focused, jce_state_entity_name(focused));
             }
-            if (jce_hotkey_pressed(JCE_HK_EDIT_DELETE)) {
+            if (jce_hotkey_pressed(JCE_HK_EDIT_DELETE)
+                || jce_hotkey_pressed(JCE_HK_EDIT_DELETE_ALT)) {
                 int sel_count = 0;
                 const uint32_t *sel = jce_state_get_selection(&sel_count);
                 if (sel_count > 1) {

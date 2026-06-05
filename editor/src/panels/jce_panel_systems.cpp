@@ -17,6 +17,7 @@
  */
 
 #include "ui/jce_editor_panels.h"
+#include "ui/jce_editor_ui_state.h"
 #include "core/jce_editor_i18n.h"
 
 #include <jce/tools/jce_imgui.hpp>
@@ -34,6 +35,34 @@ extern "C" {
 namespace {
 
 constexpr int kMaxFilter = 96;
+int  g_request_tab = -1;
+int  g_current_tab = 0;
+bool g_tab_state_loaded = false;
+
+const char *k_tab_state_key = "panel.systems.current_tab";
+
+void ensure_tab_state_loaded(void)
+{
+    if (g_tab_state_loaded)
+        return;
+    g_current_tab = jce_editor_ui_state_load_int(k_tab_state_key, 0, 0, 1);
+    g_request_tab = g_current_tab;
+    g_tab_state_loaded = true;
+}
+
+ImGuiTabItemFlags tab_flags(int idx)
+{
+    return (g_request_tab == idx) ? ImGuiTabItemFlags_SetSelected : 0;
+}
+
+void set_current_tab(int idx)
+{
+    if (idx < 0 || idx > 1 || g_current_tab == idx)
+        return;
+    g_current_tab = idx;
+    if (g_tab_state_loaded)
+        jce_editor_ui_state_save_int(k_tab_state_key, idx);
+}
 
 struct PanelState {
     float refresh_rate     = 0.5f;
@@ -292,21 +321,27 @@ void draw_ecs_tab(PanelState &st)
 extern "C" void jce_editor_panel_systems_content(void)
 {
     PanelState &st = state();
+    ensure_tab_state_loaded();
 
     draw_refresh_combo(st);
     ImGui::Separator();
 
     if (ImGui::BeginTabBar("##sys_tabs")) {
         if (ImGui::BeginTabItem(
-                jce_editor_i18n("panel.systems.tab.player_loop"))) {
+                jce_editor_i18n("panel.systems.tab.player_loop"),
+                nullptr, tab_flags(0))) {
+            set_current_tab(0);
             draw_player_loop_tab(st);
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem(
-                jce_editor_i18n("panel.systems.tab.ecs"))) {
+                jce_editor_i18n("panel.systems.tab.ecs"),
+                nullptr, tab_flags(1))) {
+            set_current_tab(1);
             draw_ecs_tab(st);
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
+        g_request_tab = -1;
     }
 }

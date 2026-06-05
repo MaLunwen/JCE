@@ -451,6 +451,39 @@ JceEntity jce_scene_get_parent(const JceScene *s, JceEntity e)
     return (JceEntity)p;
 }
 
+/* Local TRS matrix for one entity (scale-0 components default to 1). */
+static jce_mat4 scene_local_matrix(JceScene *s, JceEntity e)
+{
+    JceTransform *t = jce_scene_get_transform(s, e);
+    if (!t) return jce_m4_identity();
+    jce_vec3 sc = jce_v3(t->scale.x != 0.0f ? t->scale.x : 1.0f,
+                         t->scale.y != 0.0f ? t->scale.y : 1.0f,
+                         t->scale.z != 0.0f ? t->scale.z : 1.0f);
+    return jce_m4_from_trs(t->position, t->rotation, sc);
+}
+
+jce_mat4 jce_scene_get_world_matrix(const JceScene *s, JceEntity e)
+{
+    if (!s || e == JCE_ENTITY_INVALID) return jce_m4_identity();
+
+    JceScene *ms = (JceScene *)s; /* getters are non-const but read-only here */
+    jce_mat4 world = scene_local_matrix(ms, e);
+
+    /* Walk ancestors, composing world = parent_local * ... * local. A root
+       (no parent) skips the loop and returns its local matrix unchanged, so
+       flat scenes are bit-identical to the pre-hierarchy behaviour. The depth
+       bound guards against accidental cycles. */
+    JceEntity p = jce_scene_get_parent(s, e);
+    int depth = 0;
+    while (p != JCE_ENTITY_INVALID && p != e && depth < 32) {
+        jce_mat4 pl = scene_local_matrix(ms, p);
+        world = jce_m4_multiply(&pl, &world);
+        p = jce_scene_get_parent(s, p);
+        depth++;
+    }
+    return world;
+}
+
 int jce_scene_get_children(const JceScene *s, JceEntity parent,
                            JceEntity *out, int max_out)
 {

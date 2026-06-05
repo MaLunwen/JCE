@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 # ── MUST be set before project() ──
 set(CMAKE_SUPPRESS_REGENERATION TRUE)
 
-project(JCE VERSION 0.9.3 LANGUAGES C)
+project(JCE VERSION 0.9.4 LANGUAGES C)
 
 # CXX is needed for C++ dependencies (bgfx, assimp, imgui) and the editor.
 enable_language(CXX)
@@ -44,10 +44,33 @@ if(Git_FOUND)
 	unset(_git_rc)
 endif()
 
-# Build timestamp with timezone — captured at configure time and embedded into
-# version header so the editor About dialog can display a TZ-aware build time
-# instead of the per-TU __DATE__/__TIME__ macros (which lack timezone info).
-string(TIMESTAMP JCE_BUILD_TIMESTAMP_UTC "%Y-%m-%d %H:%M:%S UTC" UTC)
+# Build timestamp with timezone, embedded into the version header so the editor
+# About dialog shows a TZ-aware build time instead of the per-TU
+# __DATE__/__TIME__ macros (which lack timezone info).
+#
+# For REPRODUCIBLE builds this must NOT be the wall clock: the same commit has
+# to embed the same string on every machine/rebuild.  Derive it from the HEAD
+# commit's committer date (UTC).  Fall back to the wall clock only outside a git
+# checkout (release builds always come from git).  See also /Brepro below.
+set(JCE_BUILD_TIMESTAMP_UTC "")
+if(Git_FOUND)
+	execute_process(
+		COMMAND ${CMAKE_COMMAND} -E env TZ=UTC
+			${GIT_EXECUTABLE} show -s --format=%cd
+			"--date=format-local:%Y-%m-%d %H:%M:%S UTC" HEAD
+		WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+		OUTPUT_VARIABLE JCE_BUILD_TIMESTAMP_UTC
+		OUTPUT_STRIP_TRAILING_WHITESPACE
+		ERROR_QUIET
+		RESULT_VARIABLE _git_ts_rc)
+	if(NOT _git_ts_rc EQUAL 0)
+		set(JCE_BUILD_TIMESTAMP_UTC "")
+	endif()
+	unset(_git_ts_rc)
+endif()
+if(NOT JCE_BUILD_TIMESTAMP_UTC)
+	string(TIMESTAMP JCE_BUILD_TIMESTAMP_UTC "%Y-%m-%d %H:%M:%S UTC" UTC)
+endif()
 
 configure_file(
 	"${CMAKE_SOURCE_DIR}/engine/include/jce/jce_version.h.in"
@@ -197,6 +220,7 @@ find_package(PhysFS       REQUIRED)
 find_package(cJSON        REQUIRED)
 find_package(box2d        REQUIRED)
 find_package(Bullet       REQUIRED)
+find_package(v-hacd       REQUIRED)
 find_package(recastnavigation REQUIRED)
 find_package(enet         REQUIRED)
 find_package(protobuf     REQUIRED)
@@ -571,8 +595,15 @@ if(NOT CMAKE_CROSSCOMPILING AND
 		"${JCE_ENGINE_SRC_DIR}/resource/jce_asset_cooker.c"
 		"${JCE_ENGINE_SRC_DIR}/os/core/jce_filesystem_host.c"
 		"${JCE_ENGINE_SRC_DIR}/os/core/jce_memory.c")
+	# When the SDK install is enabled, jce_cook ships in <sdk>/bin/ so
+	# end-user projects can cook raw assets (textures/audio) without the
+	# editor or a JCE source tree.  Otherwise keep it out of the default
+	# build to save engine-developer build time — it still builds on
+	# demand for the in-tree cook commands via $<TARGET_FILE:jce_cook>.
+	if(NOT JCE_ENABLE_SDK_INSTALL)
+		set_target_properties(jce_cook PROPERTIES EXCLUDE_FROM_ALL ON)
+	endif()
 	set_target_properties(jce_cook PROPERTIES
-		EXCLUDE_FROM_ALL      ON
 		RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tools"
 		C_STANDARD            99
 		C_STANDARD_REQUIRED   YES
@@ -592,10 +623,39 @@ endif()
 
 
 # ------------------------------------------------------------------ #
+# Ship host tools with the SDK                                        #
+# ------------------------------------------------------------------ #
+# When JCE_ENABLE_SDK_INSTALL is ON, install the host cook/pack/wrap
+# tools into <sdk>/bin/ so a no-editor CMake/CLI consumer can run the
+# full raw-asset -> cooked -> PAK -> embed pipeline via jce_add_pak()
+# (cmake/JCESDKHelpers.cmake).  JCEConfig.cmake.in probes these and
+# exposes JCE_PAK_EXECUTABLE / JCE_COOK_EXECUTABLE / JCE_BIN2OBJ_EXECUTABLE.
+if(JCE_ENABLE_SDK_INSTALL AND NOT CMAKE_CROSSCOMPILING)
+	include(GNUInstallDirs)
+	set(_jce_sdk_tools "")
+	foreach(_tool jce_pak jce_cook jce_bin2obj)
+		if(TARGET ${_tool})
+			list(APPEND _jce_sdk_tools ${_tool})
+		endif()
+	endforeach()
+	if(_jce_sdk_tools)
+		install(TARGETS ${_jce_sdk_tools}
+			RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+	endif()
+endif()
+
+
+# ------------------------------------------------------------------ #
 # Asset cooking (optional — pre-decode textures & audio at build time)#
 # ------------------------------------------------------------------ #
 
 option(JCE_ENABLE_ASSET_COOKING "Pre-cook assets at build time (raw->.jceasset)" ON)
+
+# Caged Kingdom is the first-party SAMPLE GAME.  Default OFF: apps build
+# against the packaged SDK as real consumers (scripts/jce.py app) — the same
+# path external users take, and the only way the SDK contract is dogfooded.
+# Flip ON only for in-tree dev iteration on the sample itself.
+option(JCE_BUILD_INTREE_SAMPLE "Build the in-tree Caged Kingdom sample (dev only)" OFF)
 if(JCE_ENABLE_ASSET_COOKING AND NOT CMAKE_CROSSCOMPILING AND NOT TARGET jce_cook)
 	message(STATUS
 		"JCE asset cooking requested, but host cooker sources are not "
@@ -735,16 +795,32 @@ if(JCE_PLATFORM_WEB)
 	# Emscripten cannot compile 1.5 GB C arrays; use --preload-file instead.
 	set(_OBJ_FORMAT "none")
 elseif(MSVC)
-	if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|x86_64)$")
+	# Derive the embedded-PAK COFF machine type from the compiler's TARGET
+	# architecture, NOT CMAKE_SYSTEM_PROCESSOR.  For an x86 build on an x64 host
+	# (vcvarsall amd64_x86) Conan does not flag a cross-build, so it never sets
+	# CMAKE_SYSTEM_PROCESSOR and it falls back to the host value "AMD64" -- which
+	# would wrongly stamp the PAK object as x64 and break the editor link with
+	# LNK1112 (module machine type 'x64' conflicts with target 'x86').
+	# CMAKE_<LANG>_COMPILER_ARCHITECTURE_ID always reflects what cl.exe/link.exe
+	# actually emit (X86 / x64 / ARM64 / ARM) and matches the linker's /machine.
+	set(_MSVC_TARGET_ARCH "${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}")
+	if(NOT _MSVC_TARGET_ARCH)
+		set(_MSVC_TARGET_ARCH "${CMAKE_C_COMPILER_ARCHITECTURE_ID}")
+	endif()
+	string(TOLOWER "${_MSVC_TARGET_ARCH}" _MSVC_TARGET_ARCH)
+	if(_MSVC_TARGET_ARCH STREQUAL "x64")
 		set(_OBJ_ARCH "x64")
-	elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM64|aarch64)$")
+	elseif(_MSVC_TARGET_ARCH STREQUAL "arm64")
 		set(_OBJ_ARCH "arm64")
-	elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(X86|i[3-6]86)$")
+	elseif(_MSVC_TARGET_ARCH STREQUAL "x86")
 		set(_OBJ_ARCH "x86")
-	elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(ARM|armv7)")
+	elseif(_MSVC_TARGET_ARCH STREQUAL "arm")
 		set(_OBJ_ARCH "arm")
 	else()
-		message(FATAL_ERROR "Unsupported SYSTEM_PROCESSOR for COFF: ${CMAKE_SYSTEM_PROCESSOR}")
+		message(FATAL_ERROR
+			"Unsupported MSVC target architecture for COFF: "
+			"'${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}' "
+			"(CMAKE_SYSTEM_PROCESSOR='${CMAKE_SYSTEM_PROCESSOR}')")
 	endif()
 	set(_OBJ_FORMAT "coff")
 else()
@@ -979,12 +1055,59 @@ if(JCE_EMBED_ENGINE_SHADERS)
 endif()
 
 # ------------------------------------------------------------------ #
+# 32-bit Windows: large-address-aware by default                      #
+# ------------------------------------------------------------------ #
+# Without /LARGEADDRESSAWARE a 32-bit (WOW64) process is capped at 2 GB of
+# user address space.  Any JCE executable (editor, in-tree sample, host tools)
+# exhausts that under D3D12 driver reservations + embedded PAK + a large ImGui
+# CJK/Korean font atlas, so a big allocation returns NULL and the next memset
+# faults (0xC0000005 in VCRUNTIME140!memset).  Granting the full ~4 GB on a
+# 64-bit host fixes it.  64-bit targets are large-address-aware already, so the
+# guard keeps this to genuine 32-bit builds.  SDK-consumed game apps get the
+# same flag via JCE::JCE's INTERFACE_LINK_OPTIONS (see JCEConfig.cmake.in).
+if(MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 4)
+	string(APPEND CMAKE_EXE_LINKER_FLAGS " /LARGEADDRESSAWARE")
+endif()
+
+# ------------------------------------------------------------------ #
+# Reproducible builds                                                 #
+# ------------------------------------------------------------------ #
+# Goal: the same commit + same toolchain + same arch produces a byte-identical
+# binary (hence an identical jce_editor_sha256.txt) on every rebuild and every
+# machine.  (Different ARCHITECTURES still differ — that is expected; the
+# cross-arch identity is the version manifest, see tools/write_manifest.cmake.)
+# This removes the two big non-deterministic inputs the wall-clock timestamp
+# (handled above) does not cover:
+#   * PE TimeDateStamp / debug directory — MSVC stamps link time by default.
+#   * Absolute source paths leaking into the binary via __FILE__.
+if(MSVC)
+	# /Brepro: deterministic TimeDateStamp + debug dir (requires non-incremental
+	# linking, which Release already uses).  Release config covers the release
+	# AND dist variants (both build_type=Release); Debug is left incremental.
+	add_link_options("$<$<CONFIG:Release>:/Brepro>" "$<$<CONFIG:Release>:/INCREMENTAL:NO>")
+	# Trim the absolute repo prefix from __FILE__ so embedded paths are stable
+	# across machines/checkout locations.  Harmless no-op when the prefix is
+	# absent.  (/d1trimfile is the practical MSVC equivalent of -ffile-prefix-map.)
+	add_compile_options("/d1trimfile:${CMAKE_SOURCE_DIR}/")
+else()
+	# Clang/GCC: map the build path to a stable token for both __FILE__ and
+	# debug info, so binaries do not embed the absolute source/build paths.
+	add_compile_options(
+		"-ffile-prefix-map=${CMAKE_SOURCE_DIR}=."
+		"-fdebug-prefix-map=${CMAKE_SOURCE_DIR}=.")
+endif()
+
+# ------------------------------------------------------------------ #
 # Sub-modules                                                         #
 # ------------------------------------------------------------------ #
 
 add_subdirectory(engine)
 add_subdirectory(editor)
-add_subdirectory(caged_kingdom)
+# CK is downstream of the SDK: it builds as an SDK consumer (scripts/jce.py
+# app), not as a first-party in-tree target.  Gated ON only for dev iteration.
+if(JCE_BUILD_INTREE_SAMPLE)
+	add_subdirectory(caged_kingdom)
+endif()
 
 # After jce_renderer has been declared in engine/CMakeLists.txt, hook
 # in the generated embedded-shader C array (and exclude the stub TU).

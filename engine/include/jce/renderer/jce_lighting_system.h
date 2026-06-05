@@ -59,6 +59,8 @@ typedef struct {
     jce_vec3 color;           /* linear RGB */
     float    intensity;
     float    radius;          /* attenuation cutoff distance */
+    bool     casts_shadow;    /* P1 — enable local (atlas) shadow map */
+    float    shadow_bias;     /* depth bias; 0 = engine default */
 } JcePointLightDesc;
 
 typedef struct {
@@ -69,6 +71,8 @@ typedef struct {
     float    inner_cone_cos;  /* cos(inner half-angle), full intensity inside */
     float    outer_cone_cos;  /* cos(outer half-angle), zero intensity outside */
     float    radius;          /* attenuation cutoff */
+    bool     casts_shadow;    /* P1 — enable local (atlas) shadow map */
+    float    shadow_bias;     /* depth bias; 0 = engine default */
     /* P3-E.5 — Optional cookie + IES profile. */
     JceTexture cookie_texture; /* JCE_TEXTURE_INVALID = no cookie */
     JceTexture ies_lut_texture;/* JCE_TEXTURE_INVALID = no IES */

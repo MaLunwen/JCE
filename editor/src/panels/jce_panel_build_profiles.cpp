@@ -25,6 +25,7 @@
 #include "core/jce_editor_project.h"
 #include "dialogs/jce_path_input.h"
 #include "ui/jce_editor_panels.h"
+#include "ui/jce_editor_ui_state.h"
 
 #include <jce/tools/jce_imgui.hpp>
 extern "C" {
@@ -552,14 +553,45 @@ extern "C" void build_report_draw_content(void);
 
 static int g_request_tab = -1;
 static int g_current_tab = 0;  /* mirror of active TabItem for menu markers */
+static bool g_tab_state_loaded = false;
+
+static const char *k_tab_state_key = "panel.build_profiles.current_tab";
+
+static bool valid_tab(int idx)
+{
+    return idx >= 0 && idx <= 1;
+}
+
+static void ensure_tab_state_loaded(void)
+{
+    if (g_tab_state_loaded)
+        return;
+    g_current_tab = jce_editor_ui_state_load_int(k_tab_state_key, 0, 0, 1);
+    g_request_tab = g_current_tab;
+    g_tab_state_loaded = true;
+}
+
+static void set_current_tab(int idx)
+{
+    if (!valid_tab(idx) || g_current_tab == idx)
+        return;
+    g_current_tab = idx;
+    if (g_tab_state_loaded)
+        jce_editor_ui_state_save_int(k_tab_state_key, idx);
+}
 
 extern "C" void jce_panel_build_profiles_request_tab(int idx)
 {
+    if (!valid_tab(idx))
+        return;
     g_request_tab = idx;
+    g_current_tab = idx;
+    jce_editor_ui_state_save_int(k_tab_state_key, idx);
 }
 
 extern "C" int jce_panel_build_profiles_current_tab(void)
 {
+    ensure_tab_state_loaded();
     return g_current_tab;
 }
 
@@ -1265,6 +1297,7 @@ static void draw_profiles_tab(void)
 
 extern "C" void jce_editor_panel_build_profiles_content(void)
 {
+    ensure_tab_state_loaded();
     if (!ImGui::BeginTabBar("##bp_tabs"))
         return;
 
@@ -1279,12 +1312,12 @@ extern "C" void jce_editor_panel_build_profiles_content(void)
                   jce_editor_i18n("panel.build_report.title"));
 
     if (ImGui::BeginTabItem(prof_label, nullptr, prof_flags)) {
-        g_current_tab = 0;
+        set_current_tab(0);
         draw_profiles_tab();
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem(report_label, nullptr, report_flags)) {
-        g_current_tab = 1;
+        set_current_tab(1);
         build_report_draw_content();
         ImGui::EndTabItem();
     }

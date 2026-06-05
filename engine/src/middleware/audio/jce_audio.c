@@ -43,6 +43,7 @@ typedef struct {
     ma_sound        sound;    /* attached to the engine */
     bool            inited;
     int             sound_slot;
+    uint32_t        generation; /* bumped on teardown; packed into JceVoice to reject stale handles */
     /* Streaming voices: custom data source instead of ma_audio_buffer. */
     bool                  is_stream;
     ma_data_source_base   stream_ds;
@@ -100,6 +101,7 @@ static void uninit_voice(VoiceSlot *v)
     }
     v->inited = false;
     v->sound_slot = -1;
+    v->generation++;   /* invalidate any outstanding JceVoice handle to this slot */
 }
 
 void jce_audio_destroy(JceAudio *audio)
@@ -450,6 +452,27 @@ void jce_audio_unload(JceAudio *audio, JceSound snd)
 
 /* -- Playback ------------------------------------------------------- */
 
+/* JceVoice handle = (generation << 16) | (slot + 1). The +1 keeps a valid
+   handle non-zero (0 == JCE_VOICE_INVALID); the generation makes a handle to
+   a since-recycled slot resolve as stale instead of controlling a new sound. */
+static JceVoice pack_voice(JceAudio *audio, int slot)
+{
+    uint32_t gen = audio->voices[slot].generation & 0xFFFFu;
+    return (JceVoice)((gen << 16) | (((uint32_t)slot + 1u) & 0xFFFFu));
+}
+
+/* Decode + validate a handle to a live slot index, or -1 if stale/invalid. */
+static int resolve_voice(const JceAudio *audio, JceVoice voice)
+{
+    if (!audio || voice == JCE_VOICE_INVALID) return -1;
+    int idx = (int)((uint32_t)voice & 0xFFFFu) - 1;
+    uint32_t gen = ((uint32_t)voice >> 16) & 0xFFFFu;
+    if (idx < 0 || idx >= JCE_MAX_VOICES) return -1;
+    if (!audio->voices[idx].inited) return -1;
+    if ((audio->voices[idx].generation & 0xFFFFu) != gen) return -1;
+    return idx;
+}
+
 static int alloc_voice(JceAudio *audio)
 {
     /* First pass: find an unused slot. */
@@ -520,7 +543,7 @@ JceVoice jce_audio_play(JceAudio *audio, JceSound snd,
     v->inited = true;
     v->sound_slot = buf_slot;
     JCE_PROFILE_ZONE_END;
-    return (JceVoice)(vi + 1);
+    return pack_voice(audio, vi);
 }
 
 /* ── Streaming source ──────────────────────────────────────────── */
@@ -651,13 +674,13 @@ JceVoice jce_audio_play_stream(JceAudio *audio,
     v->inited     = true;
     v->sound_slot = -1;
     JCE_PROFILE_ZONE_END;
-    return (JceVoice)(vi + 1);
+    return pack_voice(audio, vi);
 }
 
 void jce_audio_stop(JceAudio *audio, JceVoice voice)
 {
     if (!audio || voice == JCE_VOICE_INVALID) return;
-    int idx = (int)voice - 1;
+    int idx = resolve_voice(audio, voice);
     if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return;
 
     uninit_voice(&audio->voices[idx]);
@@ -666,7 +689,7 @@ void jce_audio_stop(JceAudio *audio, JceVoice voice)
 void jce_audio_pause(JceAudio *audio, JceVoice voice)
 {
     if (!audio || voice == JCE_VOICE_INVALID) return;
-    int idx = (int)voice - 1;
+    int idx = resolve_voice(audio, voice);
     if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return;
 
     ma_sound_stop(&audio->voices[idx].sound);
@@ -675,7 +698,7 @@ void jce_audio_pause(JceAudio *audio, JceVoice voice)
 void jce_audio_resume(JceAudio *audio, JceVoice voice)
 {
     if (!audio || voice == JCE_VOICE_INVALID) return;
-    int idx = (int)voice - 1;
+    int idx = resolve_voice(audio, voice);
     if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return;
 
     if (!ma_sound_is_playing(&audio->voices[idx].sound))
@@ -685,7 +708,7 @@ void jce_audio_resume(JceAudio *audio, JceVoice voice)
 void jce_audio_set_volume(JceAudio *audio, JceVoice voice, float volume)
 {
     if (!audio || voice == JCE_VOICE_INVALID) return;
-    int idx = (int)voice - 1;
+    int idx = resolve_voice(audio, voice);
     if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return;
 
     ma_sound_set_volume(&audio->voices[idx].sound, volume);
@@ -694,7 +717,7 @@ void jce_audio_set_volume(JceAudio *audio, JceVoice voice, float volume)
 void jce_audio_set_pitch(JceAudio *audio, JceVoice voice, float pitch)
 {
     if (!audio || voice == JCE_VOICE_INVALID) return;
-    int idx = (int)voice - 1;
+    int idx = resolve_voice(audio, voice);
     if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return;
 
     ma_sound_set_pitch(&audio->voices[idx].sound, pitch);
@@ -703,7 +726,7 @@ void jce_audio_set_pitch(JceAudio *audio, JceVoice voice, float pitch)
 void jce_audio_set_looping(JceAudio *audio, JceVoice voice, bool loop)
 {
     if (!audio || voice == JCE_VOICE_INVALID) return;
-    int idx = (int)voice - 1;
+    int idx = resolve_voice(audio, voice);
     if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return;
 
     ma_sound_set_looping(&audio->voices[idx].sound, loop ? MA_TRUE : MA_FALSE);
@@ -712,7 +735,7 @@ void jce_audio_set_looping(JceAudio *audio, JceVoice voice, bool loop)
 bool jce_audio_is_playing(const JceAudio *audio, JceVoice voice)
 {
     if (!audio || voice == JCE_VOICE_INVALID) return false;
-    int idx = (int)voice - 1;
+    int idx = resolve_voice(audio, voice);
     if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return false;
 
     return ma_sound_is_playing(&audio->voices[idx].sound) != 0;
@@ -757,7 +780,7 @@ float jce_audio_get_duration(const JceAudio *audio, JceSound snd)
 float jce_audio_get_time(const JceAudio *audio, JceVoice voice)
 {
     if (!audio || voice == JCE_VOICE_INVALID) return 0.0f;
-    int idx = (int)voice - 1;
+    int idx = resolve_voice(audio, voice);
     if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return 0.0f;
     float cursor = 0.0f;
     ma_sound_get_cursor_in_seconds((ma_sound *)&audio->voices[idx].sound, &cursor);
@@ -767,7 +790,7 @@ float jce_audio_get_time(const JceAudio *audio, JceVoice voice)
 void jce_audio_seek(JceAudio *audio, JceVoice voice, float time_sec)
 {
     if (!audio || voice == JCE_VOICE_INVALID) return;
-    int idx = (int)voice - 1;
+    int idx = resolve_voice(audio, voice);
     if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return;
     int slot = audio->voices[idx].sound_slot;
     if (slot < 0 || slot >= JCE_MAX_SOUNDS) return;
@@ -823,7 +846,7 @@ void jce_audio_set_doppler_factor(JceAudio *audio, float factor)
 void jce_audio_voice_set_3d(JceAudio *audio, JceVoice voice, bool spatial)
 {
     if (!audio || voice == JCE_VOICE_INVALID) return;
-    int idx = (int)voice - 1;
+    int idx = resolve_voice(audio, voice);
     if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return;
     ma_sound_set_spatialization_enabled(&audio->voices[idx].sound,
                                          spatial ? MA_TRUE : MA_FALSE);
@@ -833,7 +856,7 @@ void jce_audio_voice_set_position(JceAudio *audio, JceVoice voice,
                                     float x, float y, float z)
 {
     if (!audio || voice == JCE_VOICE_INVALID) return;
-    int idx = (int)voice - 1;
+    int idx = resolve_voice(audio, voice);
     if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return;
     ma_sound_set_position(&audio->voices[idx].sound, x, y, z);
 }
@@ -842,7 +865,7 @@ void jce_audio_voice_set_velocity(JceAudio *audio, JceVoice voice,
                                     float vx, float vy, float vz)
 {
     if (!audio || voice == JCE_VOICE_INVALID) return;
-    int idx = (int)voice - 1;
+    int idx = resolve_voice(audio, voice);
     if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return;
     ma_sound_set_velocity(&audio->voices[idx].sound, vx, vy, vz);
 }
@@ -853,7 +876,7 @@ void jce_audio_voice_set_attenuation(JceAudio *audio, JceVoice voice,
                                        float rolloff)
 {
     if (!audio || voice == JCE_VOICE_INVALID) return;
-    int idx = (int)voice - 1;
+    int idx = resolve_voice(audio, voice);
     if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return;
 
     ma_attenuation_model ma_model = ma_attenuation_model_inverse;

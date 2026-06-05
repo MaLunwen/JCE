@@ -2,7 +2,7 @@
 
 This file lists the third-party libraries used by JCE and their respective
 licenses. Each section contains the library name, version, license type,
-project URL, and the full license text.
+project URL, and the license text.
 
 ---
 
@@ -145,9 +145,6 @@ SOFTWARE.
 - **Version**: 1.0
 - **License**: MIT
 - **URL**: https://github.com/zeux/meshoptimizer
-- **Usage**: Bundle-time vertex dedup + GPU cache reordering for
-  meshes coerced into glTF (`engine/src/resource/jce_bundle_mesh_convert.cpp`).
-  Not linked into runtime targets.
 
 ```
 Copyright (c) 2016-2024 Arseny Kapoulkine
@@ -325,7 +322,7 @@ SOFTWARE.
 
 ## minimp4
 
-- **Version**: master (commit 4575afb)
+- **Version**: 4575afb
 - **License**: CC0-1.0 (Public Domain Dedication)
 - **URL**: https://github.com/lieff/minimp4
 
@@ -658,7 +655,7 @@ redistribute it freely, subject to the following restrictions:
 
 ## V-HACD
 
-- **Version**: 4.x (single-header, vendored at `engine/src/middleware/physics/third_party/vhacd/VHACD.h`)
+- **Version**: 4.1.0
 - **License**: BSD 3-Clause
 - **URL**: https://github.com/kmammou/v-hacd
 
@@ -896,7 +893,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ## stb_image
 
-- **Version**: 2.30 (vendored header)
+- **Version**: 2.30
 - **License**: MIT OR Public Domain (Unlicense)
 - **URL**: https://github.com/nothings/stb
 
@@ -947,8 +944,7 @@ ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
-
-------
+---
 
 ## Opus (libopus)
 
@@ -1104,6 +1100,7 @@ for commercial redistribution.
 | AOSP libhevc       | H.265 / HEVC    | MPEG-LA HEVC + Access Advance + HEVC Advance |
 
 ---
+
 ## Fraunhofer FDK AAC (libfdk_aac)
 
 - **Version**: 2.0.3
@@ -1129,8 +1126,6 @@ limitations under the License.
 Full license and patent notices:
 https://github.com/mstorsjo/fdk-aac/blob/master/NOTICE
 ```
-
----
 
 ---
 
@@ -1168,11 +1163,9 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ---
 
----
-
 ## AOSP libhevc (Android Open Source Project)
 
-- **Version**: android-platform-15.0.0_r1 (vendored source)
+- **Version**: android-platform-15.0.0_r1
 - **License**: Apache-2.0
 - **URL**: https://android.googlesource.com/platform/external/libhevc/
 

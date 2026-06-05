@@ -1,3 +1,5 @@
+include(base)
+
 [settings]
 os=Windows
 arch=armv8
@@ -6,10 +8,8 @@ compiler.version=194
 compiler.cppstd=17
 compiler.runtime=dynamic
 compiler.runtime_type=Release
-build_type=Release
 
 [conf]
-tools.cmake.cmaketoolchain:generator=Ninja
 # Suppress /WX (treat-warnings-as-errors) when building Conan deps from source.
 # Some packages (e.g. ozz-animation) have ARM64-specific warnings that would
 # otherwise abort the build on MSVC ARM64 cross-compilation.

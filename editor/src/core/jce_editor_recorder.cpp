@@ -1,0 +1,226 @@
+/*
+ * jce_editor_recorder.cpp  F9 screen recorder (VP9 video + Opus system audio -> .mkv).
+ *
+ * Video: renderer capture sink (screenshot path) -> bounded queue.
+ * Audio: WASAPI loopback (system output) -> bounded queue.
+ * A worker thread drains both and feeds the encoder, which reorders by
+ * timestamp before muxing. Audio is Windows-only (loopback); on failure the
+ * recording is video-only.
+ */
+
+#include "core/jce_editor_recorder.h"
+
+extern "C" {
+#include <jce/renderer/jce_renderer.h>
+#include <jce/middleware/video/jce_webm_encoder.h>
+#include <jce/middleware/audio/jce_audio_loopback.h>
+#include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_thread.h>
+#include <jce/os/core/jce_timer.h>
+}
+
+#include <cstdlib>
+#include <cstring>
+#include <cstdio>
+
+#define LOG_TAG       "jce_editor_rec"
+#define VID_QUEUE_MAX 12
+#define AUD_QUEUE_MAX 96
+
+namespace {
+
+struct VidFrame { void *bgra; uint64_t ts_ms; VidFrame *next; };
+struct AudChunk { float *pcm; uint32_t frames; uint64_t ts_ms; AudChunk *next; };
+
+struct RecState {
+    bool         active;
+    JceRenderer *renderer;
+    char         path[512];
+
+    uint32_t     width, height, pitch;
+    int          yflip;
+    uint32_t     aud_ch;
+    bool         have_audio;
+
+    JceMutex    *mtx;
+    JceCondVar  *cond;
+    VidFrame    *vhead, *vtail;  uint32_t vdepth;
+    AudChunk    *ahead, *atail;  uint32_t adepth;
+    bool         worker_run;
+    JceThread   *worker;
+    uint64_t     start_ms;
+
+    uint32_t     vcaptured, vwritten, vdropped, adropped;
+};
+
+RecState g;
+
+uint64_t now_rel_ms() {
+    const uint64_t now = (uint64_t)jce_time_ticks_ms();
+    return now >= g.start_ms ? now - g.start_ms : 0;
+}
+
+/* ── Video capture sink (render thread) ───────────────────────────── */
+void rec_begin(void *ud, uint32_t w, uint32_t h, uint32_t pitch, int yflip) {
+    (void)ud; g.width = w; g.height = h; g.pitch = pitch; g.yflip = yflip;
+}
+void rec_frame(void *ud, const void *data, uint32_t size) {
+    (void)ud;
+    if (!data || !size) return;
+    jce_mutex_lock(g.mtx);
+    const bool full = g.vdepth >= VID_QUEUE_MAX;
+    if (full) g.vdropped++;
+    jce_mutex_unlock(g.mtx);
+    if (full) return;
+
+    VidFrame *f = (VidFrame *)malloc(sizeof(VidFrame));
+    if (!f) return;
+    f->bgra = malloc(size);
+    if (!f->bgra) { free(f); return; }
+    memcpy(f->bgra, data, size);
+    f->ts_ms = now_rel_ms();
+    f->next = nullptr;
+    jce_mutex_lock(g.mtx);
+    if (g.vtail) g.vtail->next = f; else g.vhead = f;
+    g.vtail = f; g.vdepth++; g.vcaptured++;
+    jce_cond_signal(g.cond);
+    jce_mutex_unlock(g.mtx);
+}
+void rec_end(void *ud) { (void)ud; }
+
+/* ── Audio loopback callback (audio thread) ───────────────────────── */
+void aud_cb(void *ud, const float *pcm, uint32_t frames, uint32_t rate, uint32_t ch) {
+    (void)ud; (void)rate;
+    if (!pcm || !frames) return;
+    jce_mutex_lock(g.mtx);
+    const bool full = g.adepth >= AUD_QUEUE_MAX;
+    if (full) g.adropped++;
+    jce_mutex_unlock(g.mtx);
+    if (full) return;
+
+    AudChunk *c = (AudChunk *)malloc(sizeof(AudChunk));
+    if (!c) return;
+    const size_t bytes = (size_t)frames * ch * sizeof(float);
+    c->pcm = (float *)malloc(bytes);
+    if (!c->pcm) { free(c); return; }
+    memcpy(c->pcm, pcm, bytes);
+    c->frames = frames; c->ts_ms = now_rel_ms(); c->next = nullptr;
+    jce_mutex_lock(g.mtx);
+    if (g.atail) g.atail->next = c; else g.ahead = c;
+    g.atail = c; g.adepth++;
+    jce_cond_signal(g.cond);
+    jce_mutex_unlock(g.mtx);
+}
+
+/* ── Worker thread — encode + mux ─────────────────────────────────── */
+void rec_worker(void *arg) {
+    (void)arg;
+    JceWebmEncoder *enc = nullptr;
+    for (;;) {
+        jce_mutex_lock(g.mtx);
+        while (g.worker_run && !g.vhead && !g.ahead)
+            jce_cond_wait(g.cond, g.mtx);
+        /* Detach BOTH whole queues so neither stream starves the other —
+           the encoder reorders by timestamp anyway. */
+        VidFrame *vlist = g.vhead; g.vhead = g.vtail = nullptr; g.vdepth = 0;
+        AudChunk *alist = g.ahead; g.ahead = g.atail = nullptr; g.adepth = 0;
+        const bool run = g.worker_run;
+        jce_mutex_unlock(g.mtx);
+
+        /* Video first (the first frame lazily creates the encoder). */
+        while (vlist) {
+            VidFrame *vf = vlist; vlist = vf->next;
+            if (!enc && g.width && g.height)
+                enc = jce_webm_encoder_create(g.path, g.width, g.height, 30, 8000,
+                                              g.have_audio ? 48000u : 0u,
+                                              g.have_audio ? g.aud_ch : 0u);
+            if (enc && jce_webm_encoder_push_bgra(enc, vf->bgra, g.pitch, g.yflip, vf->ts_ms))
+                g.vwritten++;
+            free(vf->bgra); free(vf);
+        }
+        /* Audio (encoder now exists if any video has been seen; drop the few
+           audio chunks that precede the very first video frame). */
+        while (alist) {
+            AudChunk *ac = alist; alist = ac->next;
+            if (enc) jce_webm_encoder_push_audio(enc, ac->pcm, ac->frames, ac->ts_ms);
+            else     g.adropped++;
+            free(ac->pcm); free(ac);
+        }
+
+        if (!run) {
+            jce_mutex_lock(g.mtx);
+            const bool empty = !g.vhead && !g.ahead;
+            jce_mutex_unlock(g.mtx);
+            if (empty) break;
+        }
+    }
+    if (enc) jce_webm_encoder_finish(enc);
+}
+
+} // namespace
+
+/* ── Public API — main thread ─────────────────────────────────────── */
+extern "C" bool jce_editor_recorder_start(JceRenderer *r, const char *out_path) {
+    if (g.active || !r || !out_path || !*out_path) return false;
+    memset(&g, 0, sizeof(g));
+    g.renderer = r;
+    snprintf(g.path, sizeof(g.path), "%s", out_path);
+
+    g.mtx = jce_mutex_create();
+    g.cond = jce_cond_create();
+    if (!g.mtx || !g.cond) {
+        if (g.mtx) jce_mutex_destroy(g.mtx);
+        if (g.cond) jce_cond_destroy(g.cond);
+        g.mtx = nullptr; g.cond = nullptr;
+        LOG_ERROR(LOG_TAG, "sync alloc failed");
+        return false;
+    }
+
+    g.worker_run = true;
+    g.start_ms = (uint64_t)jce_time_ticks_ms();
+    g.worker = jce_thread_create(rec_worker, nullptr, "jce_editor_rec");
+    if (!g.worker) {
+        jce_cond_destroy(g.cond); jce_mutex_destroy(g.mtx);
+        g.cond = nullptr; g.mtx = nullptr;
+        LOG_ERROR(LOG_TAG, "worker spawn failed");
+        return false;
+    }
+
+    /* Audio first (so the encoder is created with the right track count). */
+    g.aud_ch = 2;
+    g.have_audio = jce_audio_loopback_start(aud_cb, nullptr);
+    if (!g.have_audio)
+        LOG_WARN(LOG_TAG, "no system loopback — recording video only");
+
+    jce_renderer_set_capture_sink(rec_begin, rec_frame, rec_end, nullptr);
+    jce_renderer_set_backbuffer_capture(r, true);
+    g.active = true;
+    LOG_SUCCESS(LOG_TAG, "recording -> %s (audio=%d)", g.path, (int)g.have_audio);
+    return true;
+}
+
+extern "C" void jce_editor_recorder_stop(void) {
+    if (!g.active) return;
+
+    jce_renderer_set_backbuffer_capture(g.renderer, false);
+    jce_renderer_set_capture_sink(nullptr, nullptr, nullptr, nullptr);
+    if (g.have_audio) jce_audio_loopback_stop();
+
+    jce_mutex_lock(g.mtx);
+    g.worker_run = false;
+    jce_cond_signal(g.cond);
+    jce_mutex_unlock(g.mtx);
+    jce_thread_join(g.worker);
+
+    jce_cond_destroy(g.cond);
+    jce_mutex_destroy(g.mtx);
+    LOG_SUCCESS(LOG_TAG, "stopped: %u video (%u dropped), %u audio dropped -> %s",
+                g.vwritten, g.vdropped, g.adropped, g.path);
+
+    g.active = false;
+    g.worker = nullptr; g.mtx = nullptr; g.cond = nullptr;
+}
+
+extern "C" bool     jce_editor_recorder_is_active(void)   { return g.active; }
+extern "C" uint32_t jce_editor_recorder_frame_count(void) { return g.vwritten; }
+extern "C" uint32_t jce_editor_recorder_dropped(void)     { return g.vdropped; }

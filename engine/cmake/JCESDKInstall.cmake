@@ -323,11 +323,12 @@ function(jce_register_sdk_install)
 			ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}/$<CONFIG>")
 	endif()
 
-	# Host-side pack/wrap tools stay in the source tree for engine
-	# developers.  The distributable SDK intentionally omits them: the
-	# packaged editor generates PAK/BOM/bundle embed sources in-process
-	# before invoking CMake, so end-user projects only need headers,
-	# libs, CMake config, and shared engine resources.
+	# Host-side cook/pack/wrap tools (jce_cook / jce_pak / jce_bin2obj)
+	# are installed into <sdk>/bin/ from the root CMakeLists.txt when
+	# JCE_ENABLE_SDK_INSTALL is ON, so a no-editor CMake/CLI consumer can
+	# run the full raw → cooked → PAK → embed pipeline via jce_add_pak().
+	# The packaged editor still cooks/packs in-process and feeds
+	# JCE_PROJECT_PREBUILT_ASSETS_* for editor-driven builds.
 
 	# ---- Engine-side runtime resources that the engine *always* expects
 	# to find in the PAK at boot (HUD/settings RML, fallback fonts,

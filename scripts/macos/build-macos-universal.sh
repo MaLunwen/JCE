@@ -21,17 +21,19 @@ X64_BIN="build/desktop/macos-x64/$VARIANT/jce_editor"
 ARM64_BIN="build/desktop/macos-arm64/$VARIANT/jce_editor"
 
 # -- Step 1: Build x64 --
+# Call jce.py directly (not the build-editor shim) so this orchestrator keeps
+# its own single beep + ":q" footer instead of nesting one per sub-build.
 echo "================================================================"
 echo "  Building macOS x64..."
 echo "================================================================"
-bash "$SCRIPT_DIR/build-macos-x64.sh" $CLEAN_FLAG $DIST_FLAG
+python3 "$REPO_ROOT/scripts/jce.py" editor --arch x64 --variant "$VARIANT" $CLEAN_FLAG
 
 # -- Step 2: Build arm64 --
 echo ""
 echo "================================================================"
 echo "  Building macOS ARM64..."
 echo "================================================================"
-bash "$SCRIPT_DIR/build-macos-arm64.sh" $CLEAN_FLAG $DIST_FLAG
+python3 "$REPO_ROOT/scripts/jce.py" editor --arch arm64 --variant "$VARIANT" $CLEAN_FLAG
 
 # -- Step 3: Create Universal Binary --
 echo ""

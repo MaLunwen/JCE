@@ -9,7 +9,7 @@ patches run.  Packages whose own recipe patches touch cmake_minimum_required
 import os
 import re
 
-SKIP_PACKAGES = {"zeromq"}
+SKIP_PACKAGES = {"zeromq", "libsquish"}
 
 _PATTERN = re.compile(
     r'(?i)(cmake_minimum_required\s*\(\s*VERSION\s+)([\d]+(?:\.[\d]+)*)(\s*(?:\.[^\)]*)?)\)',
@@ -37,9 +37,16 @@ def _patch_cmakelists(path, conanfile):
             return m.group(1) + "3.5" + m.group(3) + ")"
         return m.group(0)
 
-    patched, count = _PATTERN.subn(_replace, content)
-    if count > 0:
-        with open(path, "w", encoding="utf-8") as f:
+    patched, _count = _PATTERN.subn(_replace, content)
+    # Only rewrite when the bump actually changed something.  re.subn reports a
+    # match even when _replace returns the text unchanged (e.g. a modern
+    # cmake_minimum_required that needs no bump), so guard on the real diff.
+    # newline="" disables Python's text-mode LF->CRLF translation on Windows,
+    # which would otherwise corrupt LF-only sources and break recipes whose
+    # own replace_in_file() patches expect exact "\n" line endings
+    # (e.g. behaviortree.cpp stripping "set(CMAKE_POSITION_INDEPENDENT_CODE ON)\n").
+    if patched != content:
+        with open(path, "w", encoding="utf-8", newline="") as f:
             f.write(patched)
         conanfile.output.info(
             f"[cmake_policy_fix] {os.path.basename(path)}: bumped cmake_minimum_required to 3.5"

@@ -18,6 +18,7 @@
 #include "core/jce_editor_state.h"
 #include "core/jce_editor_toast.h"
 #include "jce_editor_style.h"
+#include "jce_editor_ui_state.h"
 #include "viewers/jce_file_viewer.h"
 
 #include <ctype.h>
@@ -764,6 +765,37 @@ static struct {
     bool  initialized;
 } s_prefs;
 
+static int  s_prefs_tab = 0;
+static int  s_prefs_request_tab = -1;
+static bool s_prefs_tab_state_loaded = false;
+
+static const char *k_prefs_tab_state_key = "panel.preferences.current_tab";
+
+static void prefs_ensure_tab_state_loaded(void)
+{
+    if (s_prefs_tab_state_loaded)
+        return;
+
+    s_prefs_tab = jce_editor_ui_state_load_int(k_prefs_tab_state_key, 0, 0, 11);
+    s_prefs_request_tab = s_prefs_tab;
+    s_prefs_tab_state_loaded = true;
+}
+
+static ImGuiTabItemFlags prefs_tab_flags(int idx)
+{
+    return (s_prefs_request_tab == idx) ? ImGuiTabItemFlags_SetSelected : 0;
+}
+
+static void prefs_select_tab(int idx)
+{
+    if (idx < 0 || idx > 11 || s_prefs_tab == idx)
+        return;
+
+    s_prefs_tab = idx;
+    if (s_prefs_tab_state_loaded)
+        jce_editor_ui_state_save_int(k_prefs_tab_state_key, idx);
+}
+
 static void prefs_ensure_init(void)
 {
     if (s_prefs.initialized) return;
@@ -846,6 +878,7 @@ void jce_editor_panel_preferences(void)
     if (!*vis) return;
 
     prefs_ensure_init();
+    prefs_ensure_tab_state_loaded();
 
     char panel_title[256];
     snprintf(panel_title, sizeof(panel_title), "%s###Preferences",
@@ -857,7 +890,8 @@ void jce_editor_panel_preferences(void)
         if (ImGui::BeginTabBar("PrefTabs")) {
 
             snprintf(_lbl, sizeof(_lbl), "%s###pref_display", jce_editor_i18n("preferences.display.title"));
-            if (ImGui::BeginTabItem(_lbl)) {
+            if (ImGui::BeginTabItem(_lbl, nullptr, prefs_tab_flags(0))) {
+                prefs_select_tab(0);
                 snprintf(_lbl, sizeof(_lbl), "%s###winTitle", jce_editor_i18n("preferences.display.windowTitle"));
                 ImGui::InputText(_lbl, s_prefs.window_title, sizeof(s_prefs.window_title));
                 snprintf(_lbl, sizeof(_lbl), "%s###windowWidth", jce_editor_i18n("preferences.display.windowWidth"));
@@ -875,7 +909,8 @@ void jce_editor_panel_preferences(void)
             }
 
             snprintf(_lbl, sizeof(_lbl), "%s###pref_rendering", jce_editor_i18n("preferences.rendering.title"));
-            if (ImGui::BeginTabItem(_lbl)) {
+            if (ImGui::BeginTabItem(_lbl, nullptr, prefs_tab_flags(1))) {
+                prefs_select_tab(1);
                 ImGui::Text("%s: %s", jce_editor_i18n("preferences.rendering.backend"),
                             jce_renderer_get_backend_name(NULL));
                 const char *msaa[] = { "Off", "2x", "4x", "8x", "16x" };
@@ -890,7 +925,8 @@ void jce_editor_panel_preferences(void)
             }
 
             snprintf(_lbl, sizeof(_lbl), "%s###pref_audio", jce_editor_i18n("preferences.audio.title"));
-            if (ImGui::BeginTabItem(_lbl)) {
+            if (ImGui::BeginTabItem(_lbl, nullptr, prefs_tab_flags(2))) {
+                prefs_select_tab(2);
                 snprintf(_lbl, sizeof(_lbl), "%s###master", jce_editor_i18n("preferences.audio.masterVolume"));
                 ImGui::SliderFloat(_lbl, &s_prefs.master_vol, 0.0f, 1.0f);
                 snprintf(_lbl, sizeof(_lbl), "%s###music", jce_editor_i18n("preferences.audio.musicVolume"));
@@ -901,7 +937,8 @@ void jce_editor_panel_preferences(void)
             }
 
             snprintf(_lbl, sizeof(_lbl), "%s###pref_physics", jce_editor_i18n("preferences.physics.title"));
-            if (ImGui::BeginTabItem(_lbl)) {
+            if (ImGui::BeginTabItem(_lbl, nullptr, prefs_tab_flags(3))) {
+                prefs_select_tab(3);
                 snprintf(_lbl, sizeof(_lbl), "%s###substeps", jce_editor_i18n("preferences.physics.substeps"));
                 ImGui::SliderInt(_lbl, &s_prefs.physics_substeps,
                                  JCE_PREF_PHYSICS_SUBSTEP_MIN, JCE_PREF_PHYSICS_SUBSTEP_MAX);
@@ -911,7 +948,8 @@ void jce_editor_panel_preferences(void)
             }
 
             snprintf(_lbl, sizeof(_lbl), "%s###pref_quality", jce_editor_i18n("preferences.quality.title"));
-            if (ImGui::BeginTabItem(_lbl)) {
+            if (ImGui::BeginTabItem(_lbl, nullptr, prefs_tab_flags(4))) {
+                prefs_select_tab(4);
                 const char *presets[] = { "Low", "Medium", "High", "Ultra", "Custom" };
                 snprintf(_lbl, sizeof(_lbl), "%s###qpreset", jce_editor_i18n("preferences.quality.preset"));
                 if (ImGui::Combo(_lbl, &s_prefs.quality_preset, presets, 5)
@@ -956,7 +994,8 @@ void jce_editor_panel_preferences(void)
             }
 
             snprintf(_lbl, sizeof(_lbl), "%s###pref_time", jce_editor_i18n("preferences.time.title"));
-            if (ImGui::BeginTabItem(_lbl)) {
+            if (ImGui::BeginTabItem(_lbl, nullptr, prefs_tab_flags(5))) {
+                prefs_select_tab(5);
                 snprintf(_lbl, sizeof(_lbl), "%s###tscale", jce_editor_i18n("preferences.time.timeScale"));
                 ImGui::SliderFloat(_lbl, &s_prefs.time_scale, 0.0f, 4.0f);
                 snprintf(_lbl, sizeof(_lbl), "%s###fixed", jce_editor_i18n("preferences.time.fixedTimestep"));
@@ -973,7 +1012,8 @@ void jce_editor_panel_preferences(void)
             }
 
             snprintf(_lbl, sizeof(_lbl), "%s###pref_graphics", jce_editor_i18n("preferences.graphics.title"));
-            if (ImGui::BeginTabItem(_lbl)) {
+            if (ImGui::BeginTabItem(_lbl, nullptr, prefs_tab_flags(6))) {
+                prefs_select_tab(6);
                 const char *tiers[] = { "Tier 1 (Low)", "Tier 2 (Mid)", "Tier 3 (High)" };
                 if (s_prefs.gfx_tier < 0 || s_prefs.gfx_tier > 2) s_prefs.gfx_tier = 1;
                 snprintf(_lbl, sizeof(_lbl), "%s###gfxTier", jce_editor_i18n("preferences.graphics.tier"));
@@ -992,7 +1032,8 @@ void jce_editor_panel_preferences(void)
             }
 
             snprintf(_lbl, sizeof(_lbl), "%s###pref_tagslayers", jce_editor_i18n("preferences.tagsLayers.title"));
-            if (ImGui::BeginTabItem(_lbl)) {
+            if (ImGui::BeginTabItem(_lbl, nullptr, prefs_tab_flags(7))) {
+                prefs_select_tab(7);
                 ImGui::TextDisabled("%s", jce_editor_i18n("preferences.tagsLayers.help"));
                 snprintf(_lbl, sizeof(_lbl), "%s###tagsCSV", jce_editor_i18n("preferences.tagsLayers.tags"));
                 ImGui::InputTextMultiline(_lbl, s_prefs.tags_csv,
@@ -1008,7 +1049,8 @@ void jce_editor_panel_preferences(void)
             }
 
             snprintf(_lbl, sizeof(_lbl), "%s###pref_player", jce_editor_i18n("preferences.player.title"));
-            if (ImGui::BeginTabItem(_lbl)) {
+            if (ImGui::BeginTabItem(_lbl, nullptr, prefs_tab_flags(8))) {
+                prefs_select_tab(8);
                 snprintf(_lbl, sizeof(_lbl), "%s###plyCompany", jce_editor_i18n("preferences.player.company"));
                 ImGui::InputText(_lbl, s_prefs.player_company, sizeof(s_prefs.player_company));
                 snprintf(_lbl, sizeof(_lbl), "%s###plyProduct", jce_editor_i18n("preferences.player.product"));
@@ -1029,7 +1071,8 @@ void jce_editor_panel_preferences(void)
             }
 
             snprintf(_lbl, sizeof(_lbl), "%s###pref_editor", jce_editor_i18n("preferences.editorTab.title"));
-            if (ImGui::BeginTabItem(_lbl)) {
+            if (ImGui::BeginTabItem(_lbl, nullptr, prefs_tab_flags(9))) {
+                prefs_select_tab(9);
                 snprintf(_lbl, sizeof(_lbl), "%s###showGrid", jce_editor_i18n("preferences.editorTab.showGrid"));
                 ImGui::Checkbox(_lbl, &s_prefs.show_grid);
                 snprintf(_lbl, sizeof(_lbl), "%s###showGizmos", jce_editor_i18n("preferences.editorTab.showGizmos"));
@@ -1115,7 +1158,8 @@ void jce_editor_panel_preferences(void)
             }
 
             snprintf(_lbl, sizeof(_lbl), "%s###pref_paths", jce_editor_i18n("preferences.paths.title"));
-            if (ImGui::BeginTabItem(_lbl)) {
+            if (ImGui::BeginTabItem(_lbl, nullptr, prefs_tab_flags(10))) {
+                prefs_select_tab(10);
                 ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s",
                                    jce_editor_i18n("preferences.paths.projectPaths"));
                 ImGui::Spacing();
@@ -1133,7 +1177,9 @@ void jce_editor_panel_preferences(void)
             /* Fonts tab: user-supplied font overrides (e.g. system Ink Free /
              * KaiTi on Windows). Empty string -> use bundled OFL fallback.
              * Changes apply on next editor restart. */
-            if (ImGui::BeginTabItem(jce_editor_i18n_id("preferences.tab.fonts", "pref_fonts"))) {
+            if (ImGui::BeginTabItem(jce_editor_i18n_id("preferences.tab.fonts", "pref_fonts"),
+                                    nullptr, prefs_tab_flags(11))) {
+                prefs_select_tab(11);
                 ImGui::TextWrapped("%s", jce_editor_i18n("preferences.fonts.help"));
                 ImGui::Spacing();
                 ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s", jce_editor_i18n("preferences.fonts.latin"));
@@ -1152,6 +1198,7 @@ void jce_editor_panel_preferences(void)
             }
 
             ImGui::EndTabBar();
+            s_prefs_request_tab = -1;
         }
 
         ImGui::Separator();

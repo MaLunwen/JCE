@@ -45,17 +45,36 @@ else()
     set(_jce_os_str "${CMAKE_SYSTEM_NAME}")
 endif()
 
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|arm64|aarch64")
+# Target architecture.  On MSVC prefer the compiler's TARGET arch
+# (CMAKE_CXX_COMPILER_ARCHITECTURE_ID = X86/x64/ARM64) over
+# CMAKE_SYSTEM_PROCESSOR: Conan leaves the latter at the host value "AMD64" for
+# an x86 build, which would mislabel a 32-bit editor as x64 in the About dialog.
+set(_jce_arch_id "${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}")
+if(NOT _jce_arch_id)
+    set(_jce_arch_id "${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+string(TOLOWER "${_jce_arch_id}" _jce_arch_lc)
+if(_jce_arch_lc MATCHES "arm64|aarch64")
     set(_jce_arch_str "ARM64")
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64|x64")
+elseif(_jce_arch_lc MATCHES "x64|amd64|x86_64")
     set(_jce_arch_str "x64")
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86|i[3-6]86")
+elseif(_jce_arch_lc MATCHES "^(x86|i[3-6]86)$")
     set(_jce_arch_str "x86")
+elseif(_jce_arch_lc MATCHES "^arm")
+    set(_jce_arch_str "ARM")
 else()
-    set(_jce_arch_str "${CMAKE_SYSTEM_PROCESSOR}")
+    set(_jce_arch_str "${_jce_arch_id}")
 endif()
 
-set(_jce_platform_str "${_jce_os_str} ${_jce_arch_str}")
+# Bitness from pointer width (32-bit vs 64-bit).
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(_jce_bits_str "64-bit")
+else()
+    set(_jce_bits_str "32-bit")
+endif()
+
+# Platform row in the About dialog, e.g. "Windows x86 (32-bit)".
+set(_jce_platform_str "${_jce_os_str} ${_jce_arch_str} (${_jce_bits_str})")
 
 set(_jce_config_str "Unknown")
 if(CMAKE_BUILD_TYPE)
@@ -107,6 +126,9 @@ if(WIN32 AND JCE_BUILD_VARIANT STREQUAL "dist")
 	set_target_properties(JCE_Editor PROPERTIES WIN32_EXECUTABLE TRUE)
 endif()
 
+# NOTE: 32-bit Windows builds are linked /LARGEADDRESSAWARE via a project-wide
+# rule in the top-level CMakeLists.txt (see "large-address-aware by default").
+
 # ── Remove MSVC-generated .exp/.lib ──
 if(MSVC)
 	add_custom_command(TARGET JCE_Editor POST_BUILD
@@ -128,6 +150,9 @@ if(JCE_PLATFORM_LINUX)
 endif()
 
 # ── Dist SHA-256 hash ──
+# The dist binary's SHA-256 is the per-artifact integrity/identity record
+# (shown in the About dialog and copied by package-editor.bat).  Different
+# architectures have different binaries (different SHAs) by design.
 if(JCE_BUILD_VARIANT STREQUAL "dist")
 	add_custom_command(TARGET JCE_Editor POST_BUILD
 		COMMAND ${CMAKE_COMMAND}

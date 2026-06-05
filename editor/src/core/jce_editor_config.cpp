@@ -123,6 +123,48 @@ static int cjson_read_int(const JceJson *root, const char *key, int fallback) {
     return fallback;
 }
 
+static bool ui_state_key_valid(const char *key)
+{
+    if (!key || key[0] == '\0')
+        return false;
+    return strlen(key) < JCE_EDITOR_UI_STATE_KEY_MAX;
+}
+
+static int ui_int_state_find(const JceEditorConfig *cfg, const char *key)
+{
+    if (!cfg || !ui_state_key_valid(key))
+        return -1;
+    for (int i = 0; i < cfg->ui_int_state_count; i++) {
+        if (strcmp(cfg->ui_int_states[i].key, key) == 0)
+            return i;
+    }
+    return -1;
+}
+
+static void load_ui_int_state(JceEditorConfig *cfg, const JceJson *root)
+{
+    const JceJson *ui = jce_json_get(root, "ui_state_int");
+    if (!cfg || !jce_json_is_object(ui))
+        return;
+
+    cfg->ui_int_state_count = 0;
+    for (JceJson *it = jce_json_first_child(ui); it;
+         it = jce_json_next_sibling(it)) {
+        if (cfg->ui_int_state_count >= JCE_EDITOR_UI_INT_STATE_MAX)
+            break;
+
+        const char *key = jce_json_member_key(it);
+        if (!ui_state_key_valid(key) || !jce_json_is_number(it))
+            continue;
+
+        JceEditorUiIntState *slot =
+            &cfg->ui_int_states[cfg->ui_int_state_count++];
+        strncpy(slot->key, key, sizeof(slot->key) - 1);
+        slot->key[sizeof(slot->key) - 1] = '\0';
+        slot->value = (int)jce_json_number_value(it, 0.0);
+    }
+}
+
 /* --------------- load --------------- */
 
 bool jce_editor_config_load(JceEditorConfig *cfg) {
@@ -256,6 +298,8 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
         }
     }
 
+    load_ui_int_state(cfg, root);
+
     jce_json_free(root);
     /* Suppress repetitive logging: jce_editor_config_load() is called from
        ~30 sites during startup (panels, dialogs, state init, etc.) and each
@@ -348,6 +392,18 @@ bool jce_editor_config_save(const JceEditorConfig *cfg) {
             const char *val = (i < cfg->asset_favorite_count) ?
                               cfg->asset_favorites[i] : "";
             jce_json_set_string(root, key, val);
+        }
+    }
+
+    {
+        JceJson *ui = jce_json_object();
+        if (ui) {
+            for (int i = 0; i < cfg->ui_int_state_count; i++) {
+                const JceEditorUiIntState *slot = &cfg->ui_int_states[i];
+                if (ui_state_key_valid(slot->key))
+                    jce_json_set_int(ui, slot->key, slot->value);
+            }
+            jce_json_set_child(root, "ui_state_int", ui);
         }
     }
 
@@ -523,4 +579,50 @@ bool jce_editor_config_remove_favorite(JceEditorConfig *cfg, const char *path)
         }
     }
     return false;
+}
+
+bool jce_editor_config_get_ui_int(const JceEditorConfig *cfg,
+                                  const char *key,
+                                  int *out_value)
+{
+    int idx = ui_int_state_find(cfg, key);
+    if (idx < 0)
+        return false;
+    if (out_value)
+        *out_value = cfg->ui_int_states[idx].value;
+    return true;
+}
+
+int jce_editor_config_get_ui_int_or(const JceEditorConfig *cfg,
+                                    const char *key,
+                                    int fallback)
+{
+    int value = fallback;
+    if (jce_editor_config_get_ui_int(cfg, key, &value))
+        return value;
+    return fallback;
+}
+
+bool jce_editor_config_set_ui_int(JceEditorConfig *cfg,
+                                  const char *key,
+                                  int value)
+{
+    if (!cfg || !ui_state_key_valid(key))
+        return false;
+
+    int idx = ui_int_state_find(cfg, key);
+    if (idx >= 0) {
+        cfg->ui_int_states[idx].value = value;
+        return true;
+    }
+
+    if (cfg->ui_int_state_count >= JCE_EDITOR_UI_INT_STATE_MAX)
+        return false;
+
+    JceEditorUiIntState *slot =
+        &cfg->ui_int_states[cfg->ui_int_state_count++];
+    strncpy(slot->key, key, sizeof(slot->key) - 1);
+    slot->key[sizeof(slot->key) - 1] = '\0';
+    slot->value = value;
+    return true;
 }

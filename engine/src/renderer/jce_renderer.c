@@ -21,6 +21,7 @@
 
 #include <bgfx/c99/bgfx.h>
 #include <SDL3/SDL.h>
+#include <SDL3_image/SDL_image.h>   /* IMG_SavePNG for backbuffer screenshots */
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -375,18 +376,110 @@ static void jce_bgfx_cache_write(bgfx_callback_interface_t *_this, uint64_t _id,
     (void)_size;
 }
 
+/* Set while a bgfx_request_screen_shot() is in flight; cleared by the
+   screen_shot callback once the file is written (or fails). */
+static bool s_screenshot_pending = false;
+
+/* Continuous capture (video recording). BGFX_RESET_CAPTURE does not deliver
+   capture callbacks in this bgfx configuration, so recording instead drives
+   the proven bgfx_request_screen_shot path: while active, end_frame requests a
+   backbuffer shot each frame using the sentinel path below, and the screen_shot
+   callback routes those pixels to the capture sink instead of writing a file. */
+#define JCE_CAPTURE_SENTINEL "\x01__jce_capture__"
+static struct {
+    JceCaptureBeginFn begin;
+    JceCaptureFrameFn frame;
+    JceCaptureEndFn   end;
+    void             *ud;
+} s_capture_sink;
+static bool s_capture_active       = false;
+static bool s_capture_shot_pending = false;
+
 static void jce_bgfx_screen_shot(bgfx_callback_interface_t *_this, const char *_filePath,
                                  uint32_t _width, uint32_t _height, uint32_t _pitch,
                                  const void *_data, uint32_t _size, bool _yflip)
 {
     (void)_this;
-    (void)_filePath;
-    (void)_width;
-    (void)_height;
-    (void)_pitch;
-    (void)_data;
+
+    /* Recording frame: route pixels to the capture sink, write no file. */
+    if (_filePath && strcmp(_filePath, JCE_CAPTURE_SENTINEL) == 0) {
+        if (s_capture_active && _data && _width && _height) {
+            if (s_capture_sink.begin)
+                s_capture_sink.begin(s_capture_sink.ud, _width, _height, _pitch,
+                                     _yflip ? 1 : 0);
+            if (s_capture_sink.frame)
+                s_capture_sink.frame(s_capture_sink.ud, _data, _size);
+        }
+        s_capture_shot_pending = false;
+        return;
+    }
+
     (void)_size;
-    (void)_yflip;
+
+    bool ok = false;
+    if (_data && _filePath && _width && _height) {
+        /* bgfx delivers the backbuffer as BGRA8.  Wrap it (respecting the
+           row pitch), drop the undefined backbuffer alpha by converting to
+           RGB24, flip when the backend reports bottom-up data, then encode by
+           file extension (.png default, .bmp optional). */
+        SDL_Surface *src = SDL_CreateSurfaceFrom((int)_width, (int)_height,
+            SDL_PIXELFORMAT_BGRA32, (void *)(uintptr_t)_data, (int)_pitch);
+        if (src) {
+            SDL_Surface *rgb = SDL_ConvertSurface(src, SDL_PIXELFORMAT_RGB24);
+            SDL_DestroySurface(src);
+            if (rgb) {
+                if (_yflip)
+                    SDL_FlipSurface(rgb, SDL_FLIP_VERTICAL);
+                const char *ext = strrchr(_filePath, '.');
+                if (ext && SDL_strcasecmp(ext, ".bmp") == 0)
+                    ok = SDL_SaveBMP(rgb, _filePath);
+                else
+                    ok = IMG_SavePNG(rgb, _filePath);
+                SDL_DestroySurface(rgb);
+            }
+        }
+    }
+
+    if (ok)
+        LOG_SUCCESS(LOG_TAG, "screenshot saved: %s (%ux%u)", _filePath, _width, _height);
+    else
+        LOG_ERROR(LOG_TAG, "screenshot failed: %s (%s)",
+                  _filePath ? _filePath : "(null)", SDL_GetError());
+
+    s_screenshot_pending = false;
+}
+
+/* Request an async capture of the current frame's backbuffer to `path`.
+   The shot is taken at the next bgfx_frame() and written from the screen_shot
+   callback above.  Output format is chosen by `path`'s extension (.png by
+   default).  Returns false if a capture is already pending or `path` is bad. */
+bool jce_renderer_request_screenshot(const char *path)
+{
+    if (!path || !path[0])
+        return false;
+    if (s_screenshot_pending)
+        return false;
+    bgfx_frame_buffer_handle_t backbuffer = { UINT16_MAX }; /* invalid == backbuffer */
+    s_screenshot_pending = true;
+    bgfx_request_screen_shot(backbuffer, path);
+    return true;
+}
+
+bool jce_renderer_screenshot_pending(void)
+{
+    return s_screenshot_pending;
+}
+
+/* Register the capture sink (s_capture_sink is defined near the screenshot
+   callback, which feeds it). bgfx's BGFX_RESET_CAPTURE hooks below also forward
+   to it, but are inert in this config — the screenshot path drives recording. */
+void jce_renderer_set_capture_sink(JceCaptureBeginFn begin, JceCaptureFrameFn frame,
+                                   JceCaptureEndFn end, void *ud)
+{
+    s_capture_sink.begin = begin;
+    s_capture_sink.frame = frame;
+    s_capture_sink.end   = end;
+    s_capture_sink.ud    = ud;
 }
 
 static void jce_bgfx_capture_begin(bgfx_callback_interface_t *_this, uint32_t _width,
@@ -394,24 +487,24 @@ static void jce_bgfx_capture_begin(bgfx_callback_interface_t *_this, uint32_t _w
                                    bool _yflip)
 {
     (void)_this;
-    (void)_width;
-    (void)_height;
-    (void)_pitch;
     (void)_format;
-    (void)_yflip;
+    if (s_capture_sink.begin)
+        s_capture_sink.begin(s_capture_sink.ud, _width, _height, _pitch, _yflip ? 1 : 0);
 }
 
 static void jce_bgfx_capture_end(bgfx_callback_interface_t *_this)
 {
     (void)_this;
+    if (s_capture_sink.end)
+        s_capture_sink.end(s_capture_sink.ud);
 }
 
 static void jce_bgfx_capture_frame(bgfx_callback_interface_t *_this, const void *_data,
                                    uint32_t _size)
 {
     (void)_this;
-    (void)_data;
-    (void)_size;
+    if (s_capture_sink.frame)
+        s_capture_sink.frame(s_capture_sink.ud, _data, _size);
 }
 
 static const bgfx_callback_vtbl_t s_bgfx_callback_vtbl = {
@@ -1197,6 +1290,15 @@ void jce_renderer_end_frame(const JceRenderer *r)
     }
 #endif
 
+    /* Recording: request a backbuffer capture for this frame (one in flight;
+       the screen_shot callback routes it to the capture sink). Reuses the
+       proven screenshot path since BGFX_RESET_CAPTURE is inert here. */
+    if (s_capture_active && !s_capture_shot_pending && !s_screenshot_pending) {
+        bgfx_frame_buffer_handle_t bb = { UINT16_MAX };  /* backbuffer */
+        s_capture_shot_pending = true;
+        bgfx_request_screen_shot(bb, JCE_CAPTURE_SENTINEL);
+    }
+
     s_bgfx_frame_index = bgfx_frame(false);
 
     /* Surface allocator + renderer stats to Tracy each frame. */
@@ -1530,6 +1632,14 @@ void jce_renderer_set_vsync(JceRenderer *r, bool enabled)
 {
     const bgfx_stats_t *stats = bgfx_get_stats();
     jce_renderer_set_vsync_for_size(r, enabled, stats->width, stats->height);
+}
+
+void jce_renderer_set_backbuffer_capture(JceRenderer *r, bool enable)
+{
+    (void)r;   /* the screenshot-based path needs no device reset */
+    if (s_capture_active == enable) return;
+    s_capture_active       = enable;
+    s_capture_shot_pending = false;
 }
 
 /* -- Transform / texture binding (game-layer wrappers) ------------- */

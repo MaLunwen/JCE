@@ -584,7 +584,8 @@ static void handle_asset_keyboard_shortcuts(
             }
         }
 
-        if (has_sel && jce_hotkey_pressed(JCE_HK_EDIT_DELETE))
+        if (has_sel && (jce_hotkey_pressed(JCE_HK_EDIT_DELETE)
+            || jce_hotkey_pressed(JCE_HK_EDIT_DELETE_ALT)))
             collect_selected_from_view_for_deletion(view);
 
         if (has_sel && jce_hotkey_pressed(JCE_HK_EDIT_COPY))

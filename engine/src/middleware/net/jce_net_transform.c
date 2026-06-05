@@ -153,6 +153,18 @@ static void remove_entry_at(uint32_t i)
 static void ring_push(NtEntry *e, const JceNetTransformSnapshot *s)
 {
     uint32_t cap = JCE_NET_TRANSFORM_SNAPSHOT_HISTORY;
+
+    /* The snapshot channel is UNRELIABLE UDP, so datagrams may arrive
+       reordered or duplicated. ring_find_pair() assumes the ring is sorted
+       by ascending server_tick, so reject any snapshot that is not strictly
+       newer than the most recent one — otherwise a stale/dup insert corrupts
+       interpolation (rubber-banding). */
+    if (e->ring_count > 0) {
+        uint32_t newest = (e->ring_head + e->ring_count - 1u) % cap;
+        if (s->server_tick <= e->ring[newest].server_tick)
+            return;
+    }
+
     uint32_t idx;
     if (e->ring_count < cap) {
         idx = (e->ring_head + e->ring_count) % cap;

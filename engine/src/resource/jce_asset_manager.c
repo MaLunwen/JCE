@@ -595,70 +595,34 @@ uint32_t jce_asset_manager_update(JceAssetManager *mgr,
         ? (double)max_finalize_ms / 1000.0
         : 1e9; /* unlimited */
 
-    JceAsyncRequest *chain = jce_pool_drain(mgr->pool, 0);
     uint32_t count = 0;
 
-    while (chain) {
-        JceAsyncRequest *req = chain;
-        chain = req->next;
-        req->next = NULL;
-
-        /* Validate slot is still expecting this load. */
-        if (req->slot_index < mgr->max_assets) {
-            JceAssetSlot *slot = &mgr->slots[req->slot_index];
-
-            if (req->success) {
-                switch (req->type) {
-                case JCE_ASYNC_TEXTURE:
-                    finalize_texture(mgr, slot, req);
-                    break;
-                case JCE_ASYNC_AUDIO:
-                    finalize_audio(mgr, slot, req);
-                    break;
-                default:
-                    finalize_raw(mgr, slot, req);
-                    break;
-                }
-            } else {
-                JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
-                mgr->failed_loads++;
-                LOG_ERROR(LOG_TAG, "async load failed: %s", req->path);
-                fire_asset_error(mgr, slot, (uint16_t)req->slot_index,
-                                 JCE_ASSET_ERR_IO, "async pipeline failure");
-            }
-        }
-
-        jce_pool_free_request(req);
-        count++;
-
-        /* Check time budget. */
+    /* Finalize in small batches, re-checking the time budget between batches
+       and leaving any not-yet-drained requests in the pool's done-list for the
+       next frame. This actually honours max_finalize_ms — the old code drained
+       everything up front and a "finalize everything" fallback ignored the
+       budget, producing multi-ms load-burst hitches. */
+    const uint32_t kFinalizeBatch = 8;
+    for (;;) {
         if (max_finalize_ms > 0) {
-            uint64_t now = jce_time_perf_counter();
-            double elapsed = (double)(now - start) / (double)freq;
-            if (elapsed >= budget_sec) {
-                /* Put remaining back — they'll be drained next frame. */
-                /* (They're already in the done list from drain.) */
-                /* Actually, we already removed them. Re-finalize next frame
-                   by leaving them undrained — but we already drained all.
-                   For simplicity, continue: finalize is typically fast. */
-                break;
-            }
+            double elapsed = (double)(jce_time_perf_counter() - start) / (double)freq;
+            if (elapsed >= budget_sec)
+                break; /* remainder stays queued in the pool for next frame */
         }
-    }
 
-    /* If we broke out early, put remaining requests back. */
-    /* The remaining `chain` items are already drained but not finalized.
-       We need to push them back to done list for next frame. */
-    if (chain && mgr->pool) {
-        /* Re-push to done list by submitting as "already done". */
-        /* For simplicity in v1, just finalize everything. */
+        JceAsyncRequest *chain = jce_pool_drain(mgr->pool, kFinalizeBatch);
+        if (!chain)
+            break; /* nothing left to finalize this frame */
+
         while (chain) {
             JceAsyncRequest *req = chain;
             chain = req->next;
             req->next = NULL;
 
+            /* Validate slot is still expecting this load. */
             if (req->slot_index < mgr->max_assets) {
                 JceAssetSlot *slot = &mgr->slots[req->slot_index];
+
                 if (req->success) {
                     switch (req->type) {
                     case JCE_ASYNC_TEXTURE: finalize_texture(mgr, slot, req); break;
@@ -668,11 +632,12 @@ uint32_t jce_asset_manager_update(JceAssetManager *mgr,
                 } else {
                     JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_FAILED);
                     mgr->failed_loads++;
+                    LOG_ERROR(LOG_TAG, "async load failed: %s", req->path);
                     fire_asset_error(mgr, slot, (uint16_t)req->slot_index,
-                                     JCE_ASSET_ERR_IO,
-                                     "async pipeline failure (deferred drain)");
+                                     JCE_ASSET_ERR_IO, "async pipeline failure");
                 }
             }
+
             jce_pool_free_request(req);
             count++;
         }

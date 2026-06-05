@@ -13,6 +13,7 @@
  */
 
 #include "ui/jce_editor_panels.h"
+#include "ui/jce_editor_ui_state.h"
 #include "core/jce_editor_i18n.h"
 #include "core/jce_editor_state.h"
 #include "dialogs/jce_editor_dialogs_internal.h"
@@ -48,6 +49,35 @@ namespace {
 
 enum Tab { TAB_BROWSE = 0, TAB_BUILD = 1, TAB_OPEN = 2 };
 int g_pending_tab = -1;   /* set by shims; consumed on next render */
+int g_current_bundle_tab = TAB_BROWSE;
+bool g_bundle_tab_state_loaded = false;
+
+static const char *k_bundle_tab_state_key = "panel.bundle_browser.current_tab";
+
+bool valid_bundle_tab(int idx)
+{
+    return idx >= TAB_BROWSE && idx <= TAB_OPEN;
+}
+
+void ensure_bundle_tab_state_loaded(void)
+{
+    if (g_bundle_tab_state_loaded)
+        return;
+    g_current_bundle_tab =
+        jce_editor_ui_state_load_int(k_bundle_tab_state_key,
+                                     TAB_BROWSE, TAB_BROWSE, TAB_OPEN);
+    g_pending_tab = g_current_bundle_tab;
+    g_bundle_tab_state_loaded = true;
+}
+
+void set_bundle_tab(int idx)
+{
+    if (!valid_bundle_tab(idx) || g_current_bundle_tab == idx)
+        return;
+    g_current_bundle_tab = idx;
+    if (g_bundle_tab_state_loaded)
+        jce_editor_ui_state_save_int(k_bundle_tab_state_key, idx);
+}
 
 /* ════════════════════════════════════════════════════════════════
  * Tab 1 — Browse (catalog inspector)
@@ -1137,19 +1167,53 @@ extern "C" void package_manager_draw_content(void);
 /* Outer "Asset Pipeline" workbench tab request, set by sibling shims. */
 static int g_request_outer_tab = -1;
 static int g_current_outer_tab = 0;  /* mirror of active outer TabItem for menu markers */
+static bool g_outer_tab_state_loaded = false;
+
+static const char *k_outer_tab_state_key = "panel.asset_pipeline.current_tab";
+
+static bool valid_outer_tab(int idx)
+{
+    return idx >= 0 && idx <= 2;
+}
+
+static void ensure_outer_tab_state_loaded(void)
+{
+    if (g_outer_tab_state_loaded)
+        return;
+    g_current_outer_tab =
+        jce_editor_ui_state_load_int(k_outer_tab_state_key, 0, 0, 2);
+    g_request_outer_tab = g_current_outer_tab;
+    g_outer_tab_state_loaded = true;
+}
+
+static void set_outer_tab(int idx)
+{
+    if (!valid_outer_tab(idx) || g_current_outer_tab == idx)
+        return;
+    g_current_outer_tab = idx;
+    if (g_outer_tab_state_loaded)
+        jce_editor_ui_state_save_int(k_outer_tab_state_key, idx);
+}
 
 extern "C" void jce_panel_bundle_browser_request_tab(int idx)
 {
+    if (!valid_outer_tab(idx))
+        return;
     g_request_outer_tab = idx;
+    g_current_outer_tab = idx;
+    jce_editor_ui_state_save_int(k_outer_tab_state_key, idx);
 }
 
 extern "C" int jce_panel_bundle_browser_current_tab(void)
 {
+    ensure_outer_tab_state_loaded();
     return g_current_outer_tab;
 }
 
 static void draw_bundles_tab(void)
 {
+    ensure_bundle_tab_state_loaded();
+
     /* Always pump the build worker, even when not on the Build tab,
      * so completion / log lines surface immediately. */
     if (gb.log_mtx) drain_log_queue();
@@ -1162,16 +1226,19 @@ static void draw_bundles_tab(void)
 
         if (ImGui::BeginTabItem(jce_editor_i18n("panel.bundle_browser.tab.browse"),
                                 nullptr, tab_flag(TAB_BROWSE))) {
+            set_bundle_tab(TAB_BROWSE);
             draw_browse_tab();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem(jce_editor_i18n("panel.bundle_browser.tab.build"),
                                 nullptr, tab_flag(TAB_BUILD))) {
+            set_bundle_tab(TAB_BUILD);
             draw_build_tab();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem(jce_editor_i18n("panel.bundle_browser.tab.open"),
                                 nullptr, tab_flag(TAB_OPEN))) {
+            set_bundle_tab(TAB_OPEN);
             open_ns::draw_open_tab();
             ImGui::EndTabItem();
         }
@@ -1183,6 +1250,7 @@ static void draw_bundles_tab(void)
 
 extern "C" void jce_editor_panel_bundle_browser_content(void)
 {
+    ensure_outer_tab_state_loaded();
     if (!ImGui::BeginTabBar("##asset_pipeline_tabs"))
         return;
 
@@ -1201,17 +1269,17 @@ extern "C" void jce_editor_panel_bundle_browser_content(void)
                   jce_editor_i18n("packageManager.title"));
 
     if (ImGui::BeginTabItem(bun_label, nullptr, bun_flags)) {
-        g_current_outer_tab = 0;
+        set_outer_tab(0);
         draw_bundles_tab();
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem(imp_label, nullptr, imp_flags)) {
-        g_current_outer_tab = 1;
+        set_outer_tab(1);
         import_presets_draw_content();
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem(pkg_label, nullptr, pkg_flags)) {
-        g_current_outer_tab = 2;
+        set_outer_tab(2);
         package_manager_draw_content();
         ImGui::EndTabItem();
     }
@@ -1226,14 +1294,24 @@ extern "C" void jce_editor_panel_bundle_browser_show_build(void)
 {
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_BUNDLE_BROWSER);
     if (vis) *vis = true;
+    g_request_outer_tab = 0;
+    g_current_outer_tab = 0;
+    jce_editor_ui_state_save_int(k_outer_tab_state_key, 0);
     g_pending_tab = TAB_BUILD;
+    g_current_bundle_tab = TAB_BUILD;
+    jce_editor_ui_state_save_int(k_bundle_tab_state_key, TAB_BUILD);
 }
 
 extern "C" void jce_editor_panel_bundle_browser_show_open(void)
 {
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_BUNDLE_BROWSER);
     if (vis) *vis = true;
+    g_request_outer_tab = 0;
+    g_current_outer_tab = 0;
+    jce_editor_ui_state_save_int(k_outer_tab_state_key, 0);
     g_pending_tab = TAB_OPEN;
+    g_current_bundle_tab = TAB_OPEN;
+    jce_editor_ui_state_save_int(k_bundle_tab_state_key, TAB_OPEN);
 }
 
 extern "C" bool jce_editor_panel_bundle_browser_request_pack_scene(

@@ -343,4 +343,142 @@ function(jce_target_embed_bundle TARGET)
 endfunction()
 
 
+# ------------------------------------------------------------------ #
+# jce_add_pak(<target>                                                #
+#     RESOURCE_DIRS  <dir> [<dir>...]   # raw asset dirs to cook+pack #
+#     [PAK_FILE      <path>]                                          #
+#     [SYMBOL_PREFIX <symbol>]          # default: assets_pak_data    #
+#     [EXCLUDE_SEGMENTS <seg> [...]]                                  #
+#     [NO_ENGINE_RESOURCES]             # don't prepend SDK engine res#
+#     [NO_COOK]                         # pack raw, skip cooking      #
+#     [COOK_LEVEL <0-22>]               # per-asset zstd (default 0)  #
+#     [MAX_TEXTURE_SIZE <N>])           # default 2048                #
+#                                                                     #
+# Turnkey raw-asset → cooked → PAK → embed for SDK consumers that do  #
+# NOT go through the packaged editor.  Resolution order:             #
+#                                                                     #
+#   1. Editor prebuilt assets present (JCE_PROJECT_PREBUILT_ASSETS_*) #
+#      → delegate to jce_target_embed_pak() unchanged (already cooked)#
+#   2. JCE_COOK_EXECUTABLE available and not NO_COOK                  #
+#      → jce_cook each RESOURCE_DIR (+ engine resources) into one     #
+#        merged <target>_cooked tree, then pack+embed that tree.      #
+#   3. Otherwise → pack the raw dirs (jce_target_embed_pak) + warn.   #
+#                                                                     #
+# The cook step mirrors the in-tree pipeline (root CMakeLists cook →  #
+# pack → embed) so standalone builds match first-party output.       #
+# ------------------------------------------------------------------ #
 
+function(jce_add_pak TARGET)
+	if(NOT TARGET ${TARGET})
+		message(FATAL_ERROR "jce_add_pak: '${TARGET}' is not a target.")
+	endif()
+
+	set(_opts  NO_ENGINE_RESOURCES NO_COOK)
+	set(_one   PAK_FILE SYMBOL_PREFIX COOK_LEVEL MAX_TEXTURE_SIZE)
+	set(_multi RESOURCE_DIRS EXCLUDE_SEGMENTS)
+	cmake_parse_arguments(AP "${_opts}" "${_one}" "${_multi}" ${ARGN})
+
+	# ---- 1. Editor path: prebuilt assets already cooked + packed. --- #
+	if((DEFINED JCE_PROJECT_PREBUILT_ASSETS_OBJ AND EXISTS "${JCE_PROJECT_PREBUILT_ASSETS_OBJ}") OR
+	   (DEFINED JCE_PROJECT_PREBUILT_ASSETS_ASM AND EXISTS "${JCE_PROJECT_PREBUILT_ASSETS_ASM}") OR
+	   (DEFINED JCE_PROJECT_PREBUILT_ASSETS_C   AND EXISTS "${JCE_PROJECT_PREBUILT_ASSETS_C}"))
+		jce_target_embed_pak(${TARGET} ${ARGN})
+		return()
+	endif()
+
+	if(NOT AP_RESOURCE_DIRS)
+		message(FATAL_ERROR "jce_add_pak: RESOURCE_DIRS is required.")
+	endif()
+
+	# ---- 3. No cooker (or NO_COOK): pack raw, warn. ----------------- #
+	if(AP_NO_COOK OR NOT JCE_COOK_EXECUTABLE)
+		if(NOT AP_NO_COOK AND NOT JCE_COOK_EXECUTABLE)
+			message(WARNING
+				"jce_add_pak: JCE_COOK_EXECUTABLE not found; packing RAW "
+				"assets (textures/audio will NOT be pre-decoded).  Install "
+				"the SDK with JCE_ENABLE_SDK_INSTALL=ON to ship jce_cook.")
+		endif()
+		jce_target_embed_pak(${TARGET} ${ARGN})
+		return()
+	endif()
+
+	# ---- 2. Cook path: jce_cook each dir into one merged tree. ------ #
+	if(NOT DEFINED AP_COOK_LEVEL)
+		set(AP_COOK_LEVEL 0)
+	endif()
+	if(NOT DEFINED AP_MAX_TEXTURE_SIZE)
+		set(AP_MAX_TEXTURE_SIZE 2048)
+	endif()
+
+	# Resolve resource dirs to absolute; prepend the SDK engine resource
+	# trees (RML HUDs, fallback font, …) unless opted out, so they are
+	# cooked into the same tree (matches the in-tree pipeline).
+	set(_src_dirs "")
+	if(NOT AP_NO_ENGINE_RESOURCES)
+		if(DEFINED JCE_ENGINE_RESOURCES_DIR AND IS_DIRECTORY "${JCE_ENGINE_RESOURCES_DIR}")
+			list(APPEND _src_dirs "${JCE_ENGINE_RESOURCES_DIR}")
+		endif()
+		if(DEFINED JCE_ENGINE_UI_DIR AND IS_DIRECTORY "${JCE_ENGINE_UI_DIR}")
+			list(APPEND _src_dirs "${JCE_ENGINE_UI_DIR}")
+		endif()
+	endif()
+	foreach(_d IN LISTS AP_RESOURCE_DIRS)
+		if(NOT IS_ABSOLUTE "${_d}")
+			set(_d "${CMAKE_CURRENT_SOURCE_DIR}/${_d}")
+		endif()
+		list(APPEND _src_dirs "${_d}")
+	endforeach()
+
+	set(_cooked_dir "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}_cooked")
+	set(_cook_stamp "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}_cook.stamp")
+
+	# Track raw inputs so the cook re-runs when assets change.
+	set(_cook_inputs "")
+	foreach(_d IN LISTS _src_dirs)
+		file(GLOB_RECURSE _files CONFIGURE_DEPENDS "${_d}/*")
+		list(APPEND _cook_inputs ${_files})
+	endforeach()
+
+	# One jce_cook --batch per source dir, all merged into _cooked_dir.
+	set(_cook_cmds
+		COMMAND "${CMAKE_COMMAND}" -E rm -rf "${_cooked_dir}"
+		COMMAND "${CMAKE_COMMAND}" -E make_directory "${_cooked_dir}")
+	foreach(_d IN LISTS _src_dirs)
+		list(APPEND _cook_cmds
+			COMMAND "${JCE_COOK_EXECUTABLE}"
+				--batch "${_d}" "${_cooked_dir}"
+				--preserve-names
+				--level "${AP_COOK_LEVEL}"
+				--max-texture-size "${AP_MAX_TEXTURE_SIZE}")
+	endforeach()
+
+	add_custom_command(
+		OUTPUT  "${_cook_stamp}"
+		${_cook_cmds}
+		COMMAND "${CMAKE_COMMAND}" -E touch "${_cook_stamp}"
+		DEPENDS "${JCE_COOK_EXECUTABLE}" ${_cook_inputs}
+		COMMENT "Cooking assets for ${TARGET} → ${_cooked_dir}"
+		VERBATIM)
+	add_custom_target(${TARGET}_cook DEPENDS "${_cook_stamp}")
+
+	# Pack + embed the cooked tree.  NO_ENGINE_RESOURCES: the engine dirs
+	# were already cooked into _cooked_dir above (don't double-add raw).
+	set(_embed_args RESOURCE_DIRS "${_cooked_dir}" NO_ENGINE_RESOURCES)
+	if(AP_PAK_FILE)
+		list(APPEND _embed_args PAK_FILE "${AP_PAK_FILE}")
+	endif()
+	if(AP_SYMBOL_PREFIX)
+		list(APPEND _embed_args SYMBOL_PREFIX "${AP_SYMBOL_PREFIX}")
+	endif()
+	if(AP_EXCLUDE_SEGMENTS)
+		list(APPEND _embed_args EXCLUDE_SEGMENTS ${AP_EXCLUDE_SEGMENTS})
+	endif()
+	jce_target_embed_pak(${TARGET} ${_embed_args})
+
+	# The pak command reads _cooked_dir (a directory input, not a tracked
+	# file), so force cooking to finish first — mirrors the in-tree
+	# PackGameAssets ← CookGameAssets dependency.
+	if(TARGET ${TARGET}_pak)
+		add_dependencies(${TARGET}_pak ${TARGET}_cook)
+	endif()
+endfunction()

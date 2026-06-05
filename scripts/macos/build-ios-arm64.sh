@@ -57,7 +57,9 @@ fi
 echo "=== Step 1: Resolve host jce_pak ==="
 if [[ ! -f "$HOST_PAK" ]]; then
     echo "  Host jce_pak not found - building..."
-    bash "$REPO_ROOT/scripts/macos/build-host-tools.sh"
+    # Call jce.py directly (not the build-host-tools shim) so this orchestrator
+    # keeps its own single beep + ":q" footer instead of nesting a second one.
+    python3 "$REPO_ROOT/scripts/jce.py" host-tools
 fi
 if [[ ! -f "$HOST_PAK" ]]; then
     echo "ERROR: jce_pak still not found after host build"

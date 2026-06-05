@@ -124,6 +124,7 @@ struct JceBulletWorld {
     btAlignedObjectArray<btStridingMeshInterface *> **owned_meshes;
     uint32_t            capacity;
     uint32_t            count;
+    uint32_t            alloc_cursor;  /* rotating free-slot search hint → mass-spawn is O(1) amortized, not O(n^2) */
 
     /* Constraint pool. */
     btTypedConstraint **constraints;
@@ -241,6 +242,7 @@ JceBulletWorld *jce_bullet_create(jce_vec3 gravity, uint32_t max_bodies)
     /* Allocate body pool. */
     bw->capacity = max_bodies;
     bw->count    = 0;
+    bw->alloc_cursor = 0;
     bw->bodies   = static_cast<btRigidBody **>(
         JCE_CALLOC(max_bodies, sizeof(btRigidBody *)));
     bw->shapes   = static_cast<btCollisionShape **>(
@@ -450,12 +452,16 @@ uint32_t jce_bullet_body_create(JceBulletWorld *bw,
 {
     if (!bw) return UINT32_MAX;
 
-    /* Find a free slot. */
+    /* Find a free slot, scanning from a rotating cursor so a burst of creates
+       (mass-spawn) is O(n) total instead of O(n^2) re-scanning from 0. Freed
+       slots are still reused once the cursor wraps. */
     uint32_t idx = UINT32_MAX;
-    for (uint32_t i = 0; i < bw->capacity; ++i) {
+    for (uint32_t n = 0; n < bw->capacity; ++n) {
+        uint32_t i = (bw->alloc_cursor + n) % bw->capacity;
         if (!bw->alive[i]) { idx = i; break; }
     }
     if (idx == UINT32_MAX) return UINT32_MAX; /* pool exhausted */
+    bw->alloc_cursor = (idx + 1u) % bw->capacity;
 
     /* ---- Collision shape ---- */
     btCollisionShape *col_shape = nullptr;

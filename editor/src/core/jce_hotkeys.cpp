@@ -32,11 +32,13 @@ HotkeyEntry s_table[JCE_HK_COUNT] = {
     /* edit */
     { "edit.undo",                 "Edit / Undo",                 { ImGuiKey_Z, JCE_HKM_CTRL }, {} },
     { "edit.redo",                 "Edit / Redo",                 { ImGuiKey_Y, JCE_HKM_CTRL }, {} },
+    { "edit.redo_alt",             "Edit / Redo (Alt)",           { ImGuiKey_Z, (uint8_t)(JCE_HKM_CTRL | JCE_HKM_SHIFT) }, {} },
     { "edit.cut",                  "Edit / Cut",                  { ImGuiKey_X, JCE_HKM_CTRL }, {} },
     { "edit.copy",                 "Edit / Copy",                 { ImGuiKey_C, JCE_HKM_CTRL }, {} },
     { "edit.paste",                "Edit / Paste",                { ImGuiKey_V, JCE_HKM_CTRL }, {} },
     { "edit.duplicate",            "Edit / Duplicate",            { ImGuiKey_D, JCE_HKM_CTRL }, {} },
     { "edit.delete",               "Edit / Delete",               { ImGuiKey_Delete, JCE_HKM_NONE }, {} },
+    { "edit.delete_alt",           "Edit / Delete (Alt)",         { ImGuiKey_Backspace, JCE_HKM_NONE }, {} },
     { "edit.rename",               "Edit / Rename",               { ImGuiKey_F2, JCE_HKM_NONE }, {} },
     { "edit.select_all",           "Edit / Select All",           { ImGuiKey_A, JCE_HKM_CTRL }, {} },
     { "edit.find",                 "Edit / Find",                 { ImGuiKey_F, JCE_HKM_CTRL }, {} },
@@ -69,7 +71,11 @@ HotkeyEntry s_table[JCE_HK_COUNT] = {
     { "ui.command_palette",        "UI / Command Palette",        { ImGuiKey_P, JCE_HKM_CTRL }, {} },
     { "ui.find_in_hierarchy",      "UI / Find in Hierarchy",      { ImGuiKey_F, JCE_HKM_CTRL }, {} },
     { "ui.find_in_assets",         "UI / Find in Assets",         { ImGuiKey_F, (uint8_t)(JCE_HKM_CTRL | JCE_HKM_ALT) }, {} },
-    { "ui.toggle_fullscreen_view", "UI / Toggle Fullscreen Panel",{ ImGuiKey_F12, JCE_HKM_NONE }, {} },
+    { "ui.toggle_fullscreen_view", "UI / Toggle Fullscreen Panel",{ ImGuiKey_F11, JCE_HKM_NONE }, {} },
+    { "ui.screenshot",             "UI / Screenshot (PNG)",       { ImGuiKey_F12, JCE_HKM_NONE }, {} },
+    { "ui.record",                 "UI / Record toggle (frames)", { ImGuiKey_F9, JCE_HKM_NONE }, {} },
+    { "file.build_settings",       "File / Build Settings",       { ImGuiKey_B, JCE_HKM_CTRL }, {} },
+    { "file.pack_current_scene",   "File / Pack Current Scene",   { ImGuiKey_B, (uint8_t)(JCE_HKM_CTRL | JCE_HKM_SHIFT) }, {} },
 
     /* panel toggles */
     { "panel.console",             "Panel / Toggle Console",      { ImGuiKey_F4,  JCE_HKM_NONE }, {} },
@@ -116,6 +122,36 @@ const char *imgui_key_name(int key)
 }
 
 bool initialized = false;
+int consumed_frame = -1;
+ImGuiKeyChord consumed_chords[JCE_HK_COUNT] = {};
+int consumed_chord_count = 0;
+
+void reset_consumed_if_needed(void)
+{
+    int frame = ImGui::GetFrameCount();
+    if (frame == consumed_frame)
+        return;
+    consumed_frame = frame;
+    consumed_chord_count = 0;
+}
+
+bool chord_consumed(ImGuiKeyChord chord)
+{
+    reset_consumed_if_needed();
+    for (int i = 0; i < consumed_chord_count; i++)
+        if (consumed_chords[i] == chord)
+            return true;
+    return false;
+}
+
+void consume_chord(ImGuiKeyChord chord)
+{
+    reset_consumed_if_needed();
+    if (consumed_chord_count >= (int)(sizeof(consumed_chords) /
+                                      sizeof(consumed_chords[0])))
+        return;
+    consumed_chords[consumed_chord_count++] = chord;
+}
 
 } /* namespace */
 
@@ -201,7 +237,15 @@ extern "C" bool jce_hotkey_pressed(JceHotkeyId id)
     if (id < 0 || id >= JCE_HK_COUNT) return false;
     JceHotkeyChord c = s_table[id].cur;
     if (c.key <= 0) return false;
-    return ImGui::IsKeyChordPressed((ImGuiKeyChord)chord_imgui(c));
+    ImGuiKeyChord chord = (ImGuiKeyChord)chord_imgui(c);
+    if (chord_consumed(chord))
+        return false;
+    if (!ImGui::IsKeyPressed((ImGuiKey)c.key, false))
+        return false;
+    if (!ImGui::IsKeyChordPressed(chord))
+        return false;
+    consume_chord(chord);
+    return true;
 }
 
 extern "C" char *jce_hotkey_chord_label(JceHotkeyChord c, char *out, size_t n)

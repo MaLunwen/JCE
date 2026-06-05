@@ -924,6 +924,8 @@ static void parse_unified_light(JceScene *s, JceEntity e, const cJSON *c)
         pl.color.x = colorR; pl.color.y = colorG; pl.color.z = colorB;
         pl.intensity = intensity;
         pl.radius    = (float)j_num(c, "radius", 10.0);
+        pl.casts_shadow = casts_shadow;
+        pl.shadow_bias  = (float)j_num(c, "shadowBias", 0.0);
         jce_scene_set_point_light(s, e, &pl);
     } else if (ltype == 2) {
         JceSpotLight sl;
@@ -942,6 +944,8 @@ static void parse_unified_light(JceScene *s, JceEntity e, const cJSON *c)
         copy_str(sl.cookie_path, sizeof(sl.cookie_path), j_str(c, "cookiePath", ""));
         copy_str(sl.ies_path,    sizeof(sl.ies_path),    j_str(c, "iesPath", ""));
         sl.cookie_strength = (float)j_num(c, "cookieStrength", 0.0);
+        sl.casts_shadow = casts_shadow;
+        sl.shadow_bias  = (float)j_num(c, "shadowBias", 0.0);
         jce_scene_set_spot_light(s, e, &sl);
     } else {
         JceDirectionalLight dl;
@@ -2224,7 +2228,9 @@ static void ser_light_unified(JceScene *s, JceEntity e, cJSON *arr)
         cJSON_AddNumberToObject(o, "intensity", pl->intensity);
         cJSON_AddNumberToObject(o, "lightType", 1);
         cJSON_AddNumberToObject(o, "radius", pl->radius);
-        cJSON_AddBoolToObject(o, "castsShadow", false);
+        cJSON_AddBoolToObject(o, "castsShadow", pl->casts_shadow);
+        if (pl->shadow_bias != 0.0f)
+            cJSON_AddNumberToObject(o, "shadowBias", pl->shadow_bias);
         cJSON_AddItemToArray(arr, o);
         return;
     }
@@ -2245,7 +2251,9 @@ static void ser_light_unified(JceScene *s, JceEntity e, cJSON *arr)
         float outer_deg = acosf(sl->outer_cone_cos) * JCE_RAD2DEG;
         cJSON_AddNumberToObject(o, "innerConeDeg", inner_deg);
         cJSON_AddNumberToObject(o, "outerConeDeg", outer_deg);
-        cJSON_AddBoolToObject(o, "castsShadow", false);
+        cJSON_AddBoolToObject(o, "castsShadow", sl->casts_shadow);
+        if (sl->shadow_bias != 0.0f)
+            cJSON_AddNumberToObject(o, "shadowBias", sl->shadow_bias);
         /* P3-E.5 — emit cookie + IES paths only when set. */
         if (sl->cookie_path[0] != '\0')
             cJSON_AddStringToObject(o, "cookiePath", sl->cookie_path);

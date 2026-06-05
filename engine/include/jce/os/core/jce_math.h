@@ -461,6 +461,30 @@ JCE_INLINE jce_quat jce_m4_to_quat(const jce_mat4 *m)
     return jce_q_normalize(q);
 }
 
+/* Decompose an affine TRS matrix into translation, rotation and scale.
+ * Lossy for sheared matrices (non-uniform parent scale + child rotation),
+ * like Unity's decompose — the common case (uniform scale / no mixed
+ * rotation) round-trips exactly. Any out param may be NULL. */
+JCE_INLINE void jce_m4_decompose(const jce_mat4 *m, jce_vec3 *out_t,
+                                 jce_quat *out_r, jce_vec3 *out_s)
+{
+    const float sx = sqrtf(m->raw[0][0]*m->raw[0][0] + m->raw[0][1]*m->raw[0][1] + m->raw[0][2]*m->raw[0][2]);
+    const float sy = sqrtf(m->raw[1][0]*m->raw[1][0] + m->raw[1][1]*m->raw[1][1] + m->raw[1][2]*m->raw[1][2]);
+    const float sz = sqrtf(m->raw[2][0]*m->raw[2][0] + m->raw[2][1]*m->raw[2][1] + m->raw[2][2]*m->raw[2][2]);
+
+    if (out_t) *out_t = jce_v3(m->raw[3][0], m->raw[3][1], m->raw[3][2]);
+    if (out_s) *out_s = jce_v3(sx, sy, sz);
+    if (out_r) {
+        jce_mat4 r = *m;
+        if (sx > 1e-8f) { r.raw[0][0]/=sx; r.raw[0][1]/=sx; r.raw[0][2]/=sx; }
+        if (sy > 1e-8f) { r.raw[1][0]/=sy; r.raw[1][1]/=sy; r.raw[1][2]/=sy; }
+        if (sz > 1e-8f) { r.raw[2][0]/=sz; r.raw[2][1]/=sz; r.raw[2][2]/=sz; }
+        r.raw[0][3] = r.raw[1][3] = r.raw[2][3] = 0.0f;
+        r.raw[3][0] = r.raw[3][1] = r.raw[3][2] = 0.0f; r.raw[3][3] = 1.0f;
+        *out_r = jce_m4_to_quat(&r);
+    }
+}
+
 JCE_INLINE jce_quat jce_q_from_euler(float pitch, float yaw, float roll)
 {
     jce_quat qy = jce_q_from_axis_angle(jce_v3(0.0f, 1.0f, 0.0f), yaw);

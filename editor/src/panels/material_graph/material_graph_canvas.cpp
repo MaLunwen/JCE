@@ -205,10 +205,14 @@ void draw_canvas(void)
         ImGui::OpenPopup("canvas_ctx");
 
     /* Keyboard shortcuts (panel-focused). */
-    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)) {
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)
+        && !ImGui::GetIO().WantTextInput) {
         ImGuiIO &io = ImGui::GetIO();
         if (jce_hotkey_pressed(JCE_HK_EDIT_UNDO))      do_undo();
-        if (jce_hotkey_pressed(JCE_HK_EDIT_REDO))      do_redo();
+        if (jce_hotkey_pressed(JCE_HK_EDIT_REDO)
+            || jce_hotkey_pressed(JCE_HK_EDIT_REDO_ALT)) {
+            do_redo();
+        }
         if (jce_hotkey_pressed(JCE_HK_EDIT_COPY))      copy_selection();
         if (jce_hotkey_pressed(JCE_HK_EDIT_PASTE)) {
             ImVec2 mp    = io.MousePos;
@@ -216,7 +220,10 @@ void draw_canvas(void)
                                   mp.y - canvas_p0.y - s_g.scroll.y);
             paste_clipboard(local);
         }
-        if (jce_hotkey_pressed(JCE_HK_EDIT_DELETE)) delete_selected();
+        if (jce_hotkey_pressed(JCE_HK_EDIT_DELETE)
+            || jce_hotkey_pressed(JCE_HK_EDIT_DELETE_ALT)) {
+            delete_selected();
+        }
         /* Quick-add palette: Space over canvas. */
         if (canvas_hovered && ImGui::IsKeyPressed(ImGuiKey_Space) &&
             !io.KeyCtrl && !io.KeyAlt && !io.KeyShift) {
@@ -324,7 +331,8 @@ void draw_canvas(void)
                             !s_g.selected.empty())) delete_selected();
         ImGui::Separator();
         if (ImGui::MenuItem(jce_editor_i18n("materialGraph.menu.undo"), "Ctrl+Z", false, !s_undo.empty())) do_undo();
-        if (ImGui::MenuItem(jce_editor_i18n("materialGraph.menu.redo"), "Ctrl+Y", false, !s_redo.empty())) do_redo();
+        if (ImGui::MenuItem(jce_editor_i18n("materialGraph.menu.redo"),
+                            "Ctrl+Y / Ctrl+Shift+Z", false, !s_redo.empty())) do_redo();
         ImGui::EndPopup();
     }
 

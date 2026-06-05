@@ -20,6 +20,7 @@
 #include "io/jce_editor_file_util.h"
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
+#include "ui/jce_editor_ui_state.h"
 #include "ui/jce_theme_palette.h"
 
 #include <jce/tools/jce_imgui.hpp>
@@ -605,15 +606,46 @@ extern "C" void animation_rigging_draw_content(void);
 namespace {
 int g_request_tab = -1; /* 0=Editor 1=SM 2=Curves 3=Sequencer 4=Timeline 5=Rigging */
 int g_current_tab = 0;  /* mirror of currently active TabItem for menu markers */
+bool g_tab_state_loaded = false;
+
+static const char *k_tab_state_key = "panel.animation.current_tab";
+
+static bool valid_tab(int idx)
+{
+    return idx >= 0 && idx <= 5;
+}
+
+static void ensure_tab_state_loaded(void)
+{
+    if (g_tab_state_loaded)
+        return;
+    g_current_tab = jce_editor_ui_state_load_int(k_tab_state_key, 0, 0, 5);
+    g_request_tab = g_current_tab;
+    g_tab_state_loaded = true;
+}
+
+static void set_current_tab(int idx)
+{
+    if (!valid_tab(idx) || g_current_tab == idx)
+        return;
+    g_current_tab = idx;
+    if (g_tab_state_loaded)
+        jce_editor_ui_state_save_int(k_tab_state_key, idx);
+}
 } /* anonymous namespace */
 
 extern "C" void jce_panel_animation_editor_request_tab(int idx)
 {
+    if (!valid_tab(idx))
+        return;
     g_request_tab = idx;
+    g_current_tab = idx;
+    jce_editor_ui_state_save_int(k_tab_state_key, idx);
 }
 
 extern "C" int jce_panel_animation_editor_current_tab(void)
 {
+    ensure_tab_state_loaded();
     return g_current_tab;
 }
 
@@ -624,6 +656,7 @@ extern "C" void jce_editor_panel_animation_editor(void)
     char _wt[96];
     snprintf(_wt, sizeof(_wt), "%s###jce_anim_editor", jce_editor_i18n("animationEditor.title"));
     if (ImGui::Begin(_wt, vis, ImGuiWindowFlags_NoFocusOnAppearing)) {
+        ensure_tab_state_loaded();
         if (ImGui::BeginTabBar("##animation_tabs")) {
             ImGuiTabItemFlags f_ed  = (g_request_tab == 0) ? ImGuiTabItemFlags_SetSelected : 0;
             ImGuiTabItemFlags f_sm  = (g_request_tab == 1) ? ImGuiTabItemFlags_SetSelected : 0;
@@ -652,32 +685,32 @@ extern "C" void jce_editor_panel_animation_editor(void)
                      jce_editor_i18n("panel.animRig.title"));
 
             if (ImGui::BeginTabItem(ed_label, nullptr, f_ed)) {
-                g_current_tab = 0;
+                set_current_tab(0);
                 draw_editor_tab();
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem(sm_label, nullptr, f_sm)) {
-                g_current_tab = 1;
+                set_current_tab(1);
                 animator_sm_draw_content();
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem(cv_label, nullptr, f_cv)) {
-                g_current_tab = 2;
+                set_current_tab(2);
                 curve_editor_draw_content();
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem(sq_label, nullptr, f_sq)) {
-                g_current_tab = 3;
+                set_current_tab(3);
                 sequencer_draw_content();
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem(tl_label, nullptr, f_tl)) {
-                g_current_tab = 4;
+                set_current_tab(4);
                 timeline_draw_content();
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem(rg_label, nullptr, f_rg)) {
-                g_current_tab = 5;
+                set_current_tab(5);
                 animation_rigging_draw_content();
                 ImGui::EndTabItem();
             }

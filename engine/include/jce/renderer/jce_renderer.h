@@ -123,6 +123,34 @@ JCE_API void         jce_renderer_set_vsync(JceRenderer *r, bool enabled);
 JCE_API void JCE_CALL jce_renderer_set_vsync_for_size(JceRenderer *r, bool enabled,
                                                       uint32_t width, uint32_t height);
 
+/* -- Backbuffer screenshot ----------------------------------------- */
+
+/* Request an asynchronous capture of the current frame's backbuffer to `path`.
+ * The shot is taken at the next frame and written off the main flow; output
+ * format is chosen by the file extension (.png default, .bmp).  Returns false
+ * if a capture is already pending or `path` is invalid.  Prefer the
+ * application-layer jce_screenshot_save() wrapper. */
+JCE_API bool jce_renderer_request_screenshot(const char *path);
+JCE_API bool jce_renderer_screenshot_pending(void);
+
+/* -- Continuous backbuffer capture (video recording) -------------- */
+/* bgfx invokes the sink on the render thread, once per frame, while capture is
+ * enabled. `data` is the raw backbuffer (BGRA8, `pitch` bytes/row, `size`
+ * bytes total); `yflip` is 1 when the backend delivers bottom-up rows. */
+typedef void (*JceCaptureBeginFn)(void *ud, uint32_t width, uint32_t height,
+                                  uint32_t pitch, int yflip);
+typedef void (*JceCaptureFrameFn)(void *ud, const void *data, uint32_t size);
+typedef void (*JceCaptureEndFn)(void *ud);
+
+/* Register the capture sink (pass NULLs to clear). One global sink. */
+JCE_API void jce_renderer_set_capture_sink(JceCaptureBeginFn begin,
+                                           JceCaptureFrameFn frame,
+                                           JceCaptureEndFn end, void *ud);
+
+/* Enable/disable bgfx continuous backbuffer capture (BGFX_RESET_CAPTURE).
+ * Triggers a device reset; the registered sink then receives every frame. */
+JCE_API void jce_renderer_set_backbuffer_capture(JceRenderer *r, bool enable);
+
 /* -- Shader/uniform accessors (for 3D scene rendering) ------------- */
 
 #include <jce/renderer/jce_gfx_types.h>

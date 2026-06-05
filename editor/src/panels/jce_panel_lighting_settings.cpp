@@ -32,6 +32,7 @@
  */
 
 #include "ui/jce_editor_panels.h"
+#include "ui/jce_editor_ui_state.h"
 #include "core/jce_editor_i18n.h"
 #include "core/jce_editor_scene_rendering_defaults.h"
 #include "core/jce_editor_state.h"
@@ -791,9 +792,63 @@ namespace {
 int g_request_outer_tab = -1; /* 0=Lighting 1=PostFX 2=Lightmap 3=ReflectionProbes 4=Pipeline */
 int g_current_outer_tab = 0;  /* mirror of active outer TabItem for menu markers */
 int g_current_inner_tab = 0;  /* mirror of active inner tab inside Lighting (0=settings 1=tod 2=le) */
+bool g_outer_tab_state_loaded = false;
+bool g_inner_tab_state_loaded = false;
+
+static const char *k_outer_tab_state_key = "panel.rendering.current_tab";
+static const char *k_inner_tab_state_key = "panel.lighting.current_tab";
+
+static bool valid_outer_tab(int idx)
+{
+    return idx >= 0 && idx <= 4;
+}
+
+static bool valid_inner_tab(int idx)
+{
+    return idx >= 0 && idx <= 2;
+}
+
+static void ensure_outer_tab_state_loaded(void)
+{
+    if (g_outer_tab_state_loaded)
+        return;
+    g_current_outer_tab =
+        jce_editor_ui_state_load_int(k_outer_tab_state_key, 0, 0, 4);
+    g_request_outer_tab = g_current_outer_tab;
+    g_outer_tab_state_loaded = true;
+}
+
+static void ensure_inner_tab_state_loaded(void)
+{
+    if (g_inner_tab_state_loaded)
+        return;
+    g_current_inner_tab =
+        jce_editor_ui_state_load_int(k_inner_tab_state_key, 0, 0, 2);
+    g_pending_tab = g_current_inner_tab;
+    g_inner_tab_state_loaded = true;
+}
+
+static void set_outer_tab(int idx)
+{
+    if (!valid_outer_tab(idx) || g_current_outer_tab == idx)
+        return;
+    g_current_outer_tab = idx;
+    if (g_outer_tab_state_loaded)
+        jce_editor_ui_state_save_int(k_outer_tab_state_key, idx);
+}
+
+static void set_inner_tab(int idx)
+{
+    if (!valid_inner_tab(idx) || g_current_inner_tab == idx)
+        return;
+    g_current_inner_tab = idx;
+    if (g_inner_tab_state_loaded)
+        jce_editor_ui_state_save_int(k_inner_tab_state_key, idx);
+}
 
 static void draw_lighting_tab(void)
 {
+    ensure_inner_tab_state_loaded();
     if (ImGui::BeginTabBar("##lighting_tabs")) {
         ImGuiTabItemFlags f_set  = (g_pending_tab == 0)
             ? ImGuiTabItemFlags_SetSelected : 0;
@@ -804,19 +859,19 @@ static void draw_lighting_tab(void)
         g_pending_tab = -1;
         if (ImGui::BeginTabItem(jce_editor_i18n("panel.lighting.tab.settings"),
                                 nullptr, f_set)) {
-            g_current_inner_tab = 0;
+            set_inner_tab(0);
             lit_draw_settings_tab();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem(jce_editor_i18n("panel.lighting.tab.time_of_day"),
                                 nullptr, f_tod)) {
-            g_current_inner_tab = 1;
+            set_inner_tab(1);
             draw_time_of_day_tab();
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem(jce_editor_i18n("panel.lighting.tab.light_explorer"),
                                 nullptr, f_le)) {
-            g_current_inner_tab = 2;
+            set_inner_tab(2);
             draw_light_explorer_tab();
             ImGui::EndTabItem();
         }
@@ -828,21 +883,28 @@ static void draw_lighting_tab(void)
 
 extern "C" void jce_panel_lighting_settings_request_tab(int idx)
 {
+    if (!valid_outer_tab(idx))
+        return;
     g_request_outer_tab = idx;
+    g_current_outer_tab = idx;
+    jce_editor_ui_state_save_int(k_outer_tab_state_key, idx);
 }
 
 extern "C" int jce_panel_lighting_settings_current_tab(void)
 {
+    ensure_outer_tab_state_loaded();
     return g_current_outer_tab;
 }
 
 extern "C" int jce_panel_lighting_settings_current_inner_tab(void)
 {
+    ensure_inner_tab_state_loaded();
     return g_current_inner_tab;
 }
 
 extern "C" void jce_editor_panel_lighting_settings_content(void)
 {
+    ensure_outer_tab_state_loaded();
     if (!ImGui::BeginTabBar("##rendering_tabs"))
         return;
 
@@ -869,27 +931,27 @@ extern "C" void jce_editor_panel_lighting_settings_content(void)
                   jce_editor_i18n("panel.render_pipeline.title"));
 
     if (ImGui::BeginTabItem(lit_label, nullptr, f_lit)) {
-        g_current_outer_tab = 0;
+        set_outer_tab(0);
         draw_lighting_tab();
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem(pfx_label, nullptr, f_pfx)) {
-        g_current_outer_tab = 1;
+        set_outer_tab(1);
         jce_editor_panel_postfx_content();
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem(lm_label, nullptr, f_lm)) {
-        g_current_outer_tab = 2;
+        set_outer_tab(2);
         jce_editor_panel_lightmap_bake_content();
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem(rp_label, nullptr, f_rp)) {
-        g_current_outer_tab = 3;
+        set_outer_tab(3);
         jce_editor_panel_reflection_probes_content();
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem(pl_label, nullptr, f_pl)) {
-        g_current_outer_tab = 4;
+        set_outer_tab(4);
         jce_editor_panel_render_pipeline_content();
         ImGui::EndTabItem();
     }
@@ -901,11 +963,15 @@ extern "C" void jce_editor_panel_lighting_settings_content(void)
 extern "C" void jce_editor_lighting_settings_focus_tab_time_of_day(void)
 {
     g_pending_tab = 1;
+    g_current_inner_tab = 1;
+    jce_editor_ui_state_save_int(k_inner_tab_state_key, 1);
 }
 
 extern "C" void jce_editor_lighting_settings_focus_tab_light_explorer(void)
 {
     g_pending_tab = 2;
+    g_current_inner_tab = 2;
+    jce_editor_ui_state_save_int(k_inner_tab_state_key, 2);
 }
 
 /* ── Renderer-facing accessors ────────────────────────────────────── */

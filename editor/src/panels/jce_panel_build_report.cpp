@@ -15,6 +15,7 @@
  */
 
 #include "ui/jce_editor_panels.h"
+#include "ui/jce_editor_ui_state.h"
 #include "core/jce_editor_i18n.h"
 
 #include <jce/tools/jce_imgui.hpp>
@@ -79,6 +80,34 @@ struct State {
     int                        top_n           = 25;
 };
 State g_st;
+int  g_request_tab = -1;
+int  g_current_tab = 0;
+bool g_tab_state_loaded = false;
+
+const char *k_tab_state_key = "panel.build_report.current_tab";
+
+void ensure_tab_state_loaded(void)
+{
+    if (g_tab_state_loaded)
+        return;
+    g_current_tab = jce_editor_ui_state_load_int(k_tab_state_key, 0, 0, 4);
+    g_request_tab = g_current_tab;
+    g_tab_state_loaded = true;
+}
+
+ImGuiTabItemFlags tab_flags(int idx)
+{
+    return (g_request_tab == idx) ? ImGuiTabItemFlags_SetSelected : 0;
+}
+
+void set_current_tab(int idx)
+{
+    if (idx < 0 || idx > 4 || g_current_tab == idx)
+        return;
+    g_current_tab = idx;
+    if (g_tab_state_loaded)
+        jce_editor_ui_state_save_int(k_tab_state_key, idx);
+}
 
 const char *fmt_size(uint64_t b, char *out, size_t n)
 {
@@ -484,28 +513,40 @@ extern "C" void build_report_draw_content(void)
         return;
     }
 
+    ensure_tab_state_loaded();
     if (ImGui::BeginTabBar("##br_tabs")) {
-        if (ImGui::BeginTabItem(jce_editor_i18n("panel.build_report.tab.overview"))) {
+        if (ImGui::BeginTabItem(jce_editor_i18n("panel.build_report.tab.overview"),
+                                nullptr, tab_flags(0))) {
+            set_current_tab(0);
             draw_overview();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem(jce_editor_i18n("panel.build_report.tab.bundles"))) {
+        if (ImGui::BeginTabItem(jce_editor_i18n("panel.build_report.tab.bundles"),
+                                nullptr, tab_flags(1))) {
+            set_current_tab(1);
             draw_bundles();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem(jce_editor_i18n("panel.build_report.tab.entries"))) {
+        if (ImGui::BeginTabItem(jce_editor_i18n("panel.build_report.tab.entries"),
+                                nullptr, tab_flags(2))) {
+            set_current_tab(2);
             draw_entries();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem(jce_editor_i18n("panel.build_report.tab.duplicates"))) {
+        if (ImGui::BeginTabItem(jce_editor_i18n("panel.build_report.tab.duplicates"),
+                                nullptr, tab_flags(3))) {
+            set_current_tab(3);
             draw_duplicates();
             ImGui::EndTabItem();
         }
-        if (ImGui::BeginTabItem(jce_editor_i18n("panel.build_report.tab.top_n"))) {
+        if (ImGui::BeginTabItem(jce_editor_i18n("panel.build_report.tab.top_n"),
+                                nullptr, tab_flags(4))) {
+            set_current_tab(4);
             draw_top_n();
             ImGui::EndTabItem();
         }
         ImGui::EndTabBar();
+        g_request_tab = -1;
     }
 }
 

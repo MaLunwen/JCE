@@ -11,6 +11,7 @@
 #include <jce/renderer/jce_mesh.h>
 #include <jce/renderer/jce_pbr_material.h>
 #include <jce/renderer/jce_renderer.h>
+#include <jce/renderer/jce_skin_palette.h>
 #include <jce/renderer/jce_texture.h>
 
 #include "jce_model_internal.h"
@@ -199,10 +200,9 @@ void jce_model_draw(const JceModel *model,
                     /* Fully skinned: bone matrices provide per-vertex transform.
                        Pre-multiply by root so the VS outputs world-space positions. */
                     if (joint_matrices && num_joints > 0) {
-                        uint32_t nb = num_joints < 256 ? num_joints : 256;
                         jce_mat4 world_bones[256];
-                        for (uint32_t bi = 0; bi < nb; bi++)
-                            world_bones[bi] = jce_m4_multiply(root, &joint_matrices[bi]);
+                        uint32_t nb = jce_skin_build_world_palette(
+                            root, joint_matrices, num_joints, world_bones, 256);
                         jce_skinned_mesh_set_bones(world_bones, nb);
                     } else if (model->skeleton) {
                         /* No live animation: evaluate rest/bind pose from skeleton. */
@@ -242,6 +242,72 @@ void jce_model_draw(const JceModel *model,
     }
 }
 
+void jce_model_draw_shadow(const JceModel *model,
+                           const JceRenderer *r, uint16_t view_id,
+                           const jce_mat4 *transform,
+                           const jce_mat4 *joint_matrices,
+                           uint32_t num_joints)
+{
+    if (!model || !r) return;
+
+    /* Depth-only mirror of jce_model_draw: no materials are bound (the
+       shadow programs sample nothing), and skinned primitives reuse the
+       SAME world-space bone palette the color pass uploads, so the cast
+       silhouette deforms in lock-step with the lit mesh. */
+    const JceShaderHandle prog_skinned = jce_renderer_get_program_shadow_skinned(r);
+    const JceShaderHandle prog_static  = jce_renderer_get_program_shadow(r);
+
+    jce_mat4 identity = jce_m4_identity();
+    const jce_mat4 *root = transform ? transform : &identity;
+
+    for (uint32_t n = 0; n < model->num_nodes; n++) {
+        const JceModelNode *node = &model->nodes[n];
+        jce_mat4 world = jce_m4_multiply(root, &node->local_transform);
+
+        for (uint32_t p = 0; p < node->num_primitives; p++) {
+            const JceModelPrimitive *prim = &node->primitives[p];
+
+            if (prim->skinned_mesh) {
+                if (jce_skinned_mesh_is_skinned(prim->skinned_mesh)) {
+                    if (joint_matrices && num_joints > 0) {
+                        jce_mat4 world_bones[256];
+                        uint32_t nb = jce_skin_build_world_palette(
+                            root, joint_matrices, num_joints, world_bones, 256);
+                        jce_skinned_mesh_set_bones(world_bones, nb);
+                    } else if (model->skeleton) {
+                        /* No live animation: rasterize the rest/bind pose. */
+                        uint32_t num_j = jce_skeleton_joint_count(model->skeleton);
+                        if (num_j > 256) num_j = 256;
+                        jce_mat4 bind_pose[256];
+                        jce_skeleton_evaluate(model->skeleton, NULL, bind_pose, num_j);
+                        uint32_t nb = jce_skin_build_world_palette(
+                            root, bind_pose, num_j, bind_pose, num_j);
+                        jce_skinned_mesh_set_bones(bind_pose, nb);
+                    } else {
+                        bgfx_set_transform(world.raw[0], 1);
+                    }
+                    jce_skinned_mesh_submit_shadow(prim->skinned_mesh, r,
+                                                   view_id, prog_skinned);
+                } else {
+                    /* Static-PBR primitive (tangents, no joints): respect
+                       joint-parent attachment, depth via the static program
+                       (vs_shadow consumes only a_position). */
+                    jce_mat4 static_world = compute_static_node_world(
+                        model, node, root, &world, joint_matrices, num_joints);
+                    bgfx_set_transform(static_world.raw[0], 1);
+                    jce_skinned_mesh_submit_shadow(prim->skinned_mesh, r,
+                                                   view_id, prog_static);
+                }
+            } else if (prim->static_mesh) {
+                jce_mat4 static_world = compute_static_node_world(
+                    model, node, root, &world, joint_matrices, num_joints);
+                bgfx_set_transform(static_world.raw[0], 1);
+                jce_mesh_submit_shadow(prim->static_mesh, r, view_id);
+            }
+        }
+    }
+}
+
 /* ================================================================== */
 /* Wireframe overlay (selection / editor tooling)                      */
 /* ================================================================== */
@@ -268,10 +334,9 @@ void jce_model_submit_wireframe_overlay(const JceModel *model,
             if (prim->skinned_mesh) {
                 if (jce_skinned_mesh_is_skinned(prim->skinned_mesh)) {
                     if (joint_matrices && num_joints > 0) {
-                        uint32_t nb = num_joints < 256 ? num_joints : 256;
                         jce_mat4 world_bones[256];
-                        for (uint32_t bi = 0; bi < nb; bi++)
-                            world_bones[bi] = jce_m4_multiply(root, &joint_matrices[bi]);
+                        uint32_t nb = jce_skin_build_world_palette(
+                            root, joint_matrices, num_joints, world_bones, 256);
                         jce_skinned_mesh_set_bones(world_bones, nb);
                     } else if (model->skeleton) {
                         uint32_t num_j = jce_skeleton_joint_count(model->skeleton);
@@ -329,10 +394,9 @@ void jce_model_submit_pick_id(const JceModel *model,
             if (prim->skinned_mesh) {
                 if (jce_skinned_mesh_is_skinned(prim->skinned_mesh)) {
                     if (joint_matrices && num_joints > 0) {
-                        uint32_t nb = num_joints < 256 ? num_joints : 256;
                         jce_mat4 world_bones[256];
-                        for (uint32_t bi = 0; bi < nb; bi++)
-                            world_bones[bi] = jce_m4_multiply(root, &joint_matrices[bi]);
+                        uint32_t nb = jce_skin_build_world_palette(
+                            root, joint_matrices, num_joints, world_bones, 256);
                         jce_skinned_mesh_set_bones(world_bones, nb);
                     } else if (model->skeleton) {
                         uint32_t num_j = jce_skeleton_joint_count(model->skeleton);

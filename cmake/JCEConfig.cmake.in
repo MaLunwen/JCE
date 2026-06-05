@@ -54,6 +54,21 @@ if(EXISTS "${_jce_bin2obj_exe}")
 		CACHE FILEPATH "Path to the JCE bundle→obj wrapper (jce_bin2obj)." FORCE)
 endif()
 
+# ---- Optional host cooker (raw asset → .jceasset). ---------------- #
+# Ships with the SDK when built with JCE_ENABLE_SDK_INSTALL.  Lets
+# jce_add_pak() pre-decode textures (PNG→RGBA8) and audio (WAV/OGG→PCM)
+# before packing, so a no-editor consumer gets real cooked assets
+# instead of a raw/stub PAK.
+if(WIN32)
+	set(_jce_cook_exe "${_jce_bin_dir}/jce_cook.exe")
+else()
+	set(_jce_cook_exe "${_jce_bin_dir}/jce_cook")
+endif()
+if(EXISTS "${_jce_cook_exe}")
+	set(JCE_COOK_EXECUTABLE "${_jce_cook_exe}"
+		CACHE FILEPATH "Path to the JCE asset cooker (jce_cook)." FORCE)
+endif()
+
 set(_jce_core_release "${_jce_lib_dir}/Release/jce_engine_core@CMAKE_STATIC_LIBRARY_SUFFIX@")
 set(_jce_core_debug   "${_jce_lib_dir}/Debug/jce_engine_core@CMAKE_STATIC_LIBRARY_SUFFIX@")
 set(_jce_deps_release "${_jce_lib_dir}/Release/jce_engine_deps@CMAKE_STATIC_LIBRARY_SUFFIX@")
@@ -112,6 +127,16 @@ if(WIN32 AND MSVC)
 			"$<$<CONFIG:RelWithDebInfo>:/WHOLEARCHIVE:${_jce_core_release}>"
 			"$<$<CONFIG:MinSizeRel>:/WHOLEARCHIVE:${_jce_core_release}>"
 			"$<$<CONFIG:Debug>:/WHOLEARCHIVE:${_jce_core_debug}>")
+
+	# 32-bit consumers: link the game exe /LARGEADDRESSAWARE so the WOW64
+	# process gets the full ~4 GB on a 64-bit host instead of 2 GB.  The engine
+	# (D3D12 reservations + embedded PAK + ImGui font atlas) exhausts 2 GB and a
+	# failed allocation crashes in VCRUNTIME140!memset — same fix as the editor's
+	# own build.  Harmless on 64-bit (already large-address-aware).
+	if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+		set_property(TARGET JCE::JCE APPEND PROPERTY
+			INTERFACE_LINK_OPTIONS "/LARGEADDRESSAWARE")
+	endif()
 elseif(APPLE)
 	if(EXISTS "${_jce_core_release}")
 		set_property(TARGET JCE::JCE APPEND PROPERTY

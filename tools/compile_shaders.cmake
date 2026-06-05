@@ -141,7 +141,7 @@ function(jce_compile_shaders)
             vs_grid fs_grid
             vs_sky  fs_sky
             vs_imgui fs_imgui
-            vs_postfx fs_chromatic fs_grayscale fs_vignette fs_tonemap)
+            vs_postfx fs_chromatic fs_grayscale fs_vignette fs_tonemap fs_composite)
     endif()
 
     # Ensure output directory exists.

@@ -35,6 +35,13 @@ CMakeUserPresets.json
 bak/
 TODO/
 
+
+docs/
+halloween-test/
+
+sync_*.py
+
+
 agents.*
 tests/
 

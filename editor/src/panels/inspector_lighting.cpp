@@ -129,6 +129,14 @@ void draw_comp_light(JceScene *scene, JceEntity e, uint64_t flags)
         if (l->outer_cone_cos > l->inner_cone_cos)
             l->outer_cone_cos = l->inner_cone_cos;
 
+        /* P1 — local (atlas) spot shadow toggle + depth bias. */
+        if (ImGui::Checkbox(jce_editor_i18n_id("inspector.light.castsShadow", "CastsShadow"), &l->casts_shadow))
+            insp_undo_bool(&l->casts_shadow);
+        if (l->casts_shadow &&
+            ImGui::DragFloat(jce_editor_i18n_id("inspector.light.shadowBias", "ShadowBias"),
+                             &l->shadow_bias, 0.0005f, 0.0f, 0.05f))
+            insp_track_edit();
+
         /* P3-E.5 — Light cookie + IES profile (spot lights). */
         ImGui::Separator();
         ImGui::TextUnformatted(jce_editor_i18n("inspector.light.cookie"));
@@ -158,6 +166,17 @@ void draw_comp_light(JceScene *scene, JceEntity e, uint64_t flags)
             l->ies_lut_texture.idx = UINT16_MAX;
             insp_track_edit();
         }
+    }
+
+    if (light_type == 1) {
+        /* P1b — point lights cast a (downward-hemisphere) local shadow. */
+        JcePointLight *l = jce_scene_get_point_light(scene, e);
+        if (ImGui::Checkbox(jce_editor_i18n_id("inspector.light.castsShadow", "CastsShadow"), &l->casts_shadow))
+            insp_undo_bool(&l->casts_shadow);
+        if (l->casts_shadow &&
+            ImGui::DragFloat(jce_editor_i18n_id("inspector.light.shadowBias", "ShadowBias"),
+                             &l->shadow_bias, 0.0005f, 0.0f, 0.05f))
+            insp_track_edit();
     }
 
     if (light_type == 0) {

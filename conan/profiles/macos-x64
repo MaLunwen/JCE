@@ -1,3 +1,5 @@
+include(base)
+
 [settings]
 os=Macos
 os.version=10.15
@@ -6,10 +8,8 @@ compiler=apple-clang
 compiler.version=14
 compiler.libcxx=libc++
 compiler.cppstd=17
-build_type=Release
 
 [conf]
-tools.cmake.cmaketoolchain:generator=Ninja
 tools.cmake.cmaketoolchain:extra_variables={"CMAKE_POLICY_VERSION_MINIMUM": "3.5"}
 tools.build:cflags=["-mmacosx-version-min=10.15"]
 tools.build:cxxflags=["-mmacosx-version-min=10.15"]

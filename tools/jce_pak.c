@@ -408,10 +408,16 @@ static void generate_coff_obj(const uint8_t *pak_data, size_t pak_size,
     const uint64_t rdata_size = size_offset + (uint64_t)ptr_size;
     const uint64_t rdata_aligned = (rdata_size + 3u) & ~(uint64_t)3;
 
+    /* 32-bit x86 (i386) MSVC decorates cdecl C symbols with a leading '_';
+     * x64, ARM64 and 32-bit ARM (ARMNT) do not.  Match that decoration so the
+     * blob the C code references (e.g. assets_pak_data -> _assets_pak_data on
+     * x86) resolves at link time. */
+    const char *us = (machine == COFF_MACHINE_I386) ? "_" : "";
+
     char sym_data_buf[96];
     char sym_size_buf[112];
-    snprintf(sym_data_buf, sizeof(sym_data_buf), "%s", sym_prefix);
-    snprintf(sym_size_buf, sizeof(sym_size_buf), "%s_size", sym_prefix);
+    snprintf(sym_data_buf, sizeof(sym_data_buf), "%s%s", us, sym_prefix);
+    snprintf(sym_size_buf, sizeof(sym_size_buf), "%s%s_size", us, sym_prefix);
     const char *sym_data = sym_data_buf;
     const char *sym_size_name = sym_size_buf;
 

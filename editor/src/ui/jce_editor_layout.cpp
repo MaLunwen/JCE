@@ -35,7 +35,11 @@
 #include "core/jce_editor_config.h"
 extern "C" {
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_timer.h>
+#include <jce/application/jce_screenshot.h>
 }
+#include "scene/jce_editor_scene_render.h"   /* jce_editor_get_renderer */
+#include "core/jce_editor_recorder.h"        /* F9 VP9/WebM recorder */
 #include "core/jce_editor_toast.h"
 #include "core/jce_hotkeys.h"
 #include "core/jce_workspace.h"
@@ -158,8 +162,128 @@ static SaveSceneResult save_scene_or_open_save_as(void)
     return SAVE_SCENE_RESULT_OK;
 }
 
+static bool redo_hotkey_pressed(void)
+{
+    return jce_hotkey_pressed(JCE_HK_EDIT_REDO)
+        || jce_hotkey_pressed(JCE_HK_EDIT_REDO_ALT);
+}
+
+static bool delete_hotkey_pressed(void)
+{
+    return jce_hotkey_pressed(JCE_HK_EDIT_DELETE)
+        || jce_hotkey_pressed(JCE_HK_EDIT_DELETE_ALT);
+}
+
+static void select_all_scene_entities(void)
+{
+    int total = jce_state_get_entity_count();
+    bool first = true;
+    for (int i = 0; i < total; i++) {
+        uint32_t id = jce_state_get_entity_id_by_index(i);
+        if (id == 0 || !jce_state_entity_exists(id))
+            continue;
+        jce_state_select_entity(id, !first);
+        first = false;
+    }
+    if (!first)
+        jce_editor_inspector_request_sync();
+}
+
+static void copy_scene_selection(bool cut)
+{
+    int sel_count = 0;
+    const uint32_t *sel = jce_state_get_selection(&sel_count);
+    uint32_t focused = jce_state_get_focused();
+    if (sel_count > 0) {
+        jce_state_copy_entities(sel, sel_count, cut);
+    } else if (focused != 0) {
+        if (cut)
+            jce_state_copy_entities(&focused, 1, true);
+        else
+            jce_state_copy_entity(focused);
+    }
+}
+
+static void paste_scene_clipboard(void)
+{
+    uint32_t focused = jce_state_get_focused();
+    uint32_t parent = jce_state_entity_exists(focused) ? focused : 0;
+    uint32_t new_ids[JCE_MAX_SELECTED];
+    int n = jce_state_paste_entities(parent, new_ids, JCE_MAX_SELECTED);
+    if (n <= 0 && jce_state_has_copied()) {
+        uint32_t nid = jce_state_paste_entity(parent);
+        if (nid != 0) {
+            new_ids[0] = nid;
+            n = 1;
+        }
+    }
+    if (n > 0) {
+        jce_state_select_entity(new_ids[0], false);
+        for (int i = 1; i < n; i++)
+            jce_state_select_entity(new_ids[i], true);
+        jce_editor_inspector_request_sync();
+    }
+}
+
+static void duplicate_scene_selection(void)
+{
+    int sel_count = 0;
+    const uint32_t *sel = jce_state_get_selection(&sel_count);
+    uint32_t focused = jce_state_get_focused();
+    if (sel_count <= 0 && focused == 0)
+        return;
+
+    uint32_t src[JCE_MAX_SELECTED];
+    int n = sel_count > 0 ? sel_count : 1;
+    if (n > JCE_MAX_SELECTED)
+        n = JCE_MAX_SELECTED;
+    if (sel_count > 0) {
+        for (int i = 0; i < n; i++)
+            src[i] = sel[i];
+    } else {
+        src[0] = focused;
+    }
+
+    uint32_t dup_ids[JCE_MAX_SELECTED];
+    int dup_count = 0;
+    if (n > 1)
+        jce_state_begin_batch_edit();
+    for (int i = 0; i < n; i++) {
+        uint32_t dup = jce_state_duplicate_entity(src[i]);
+        if (dup != 0 && dup_count < JCE_MAX_SELECTED)
+            dup_ids[dup_count++] = dup;
+    }
+    if (n > 1)
+        jce_state_end_batch_edit();
+
+    if (dup_count > 0) {
+        jce_state_select_entity(dup_ids[0], false);
+        for (int i = 1; i < dup_count; i++)
+            jce_state_select_entity(dup_ids[i], true);
+        jce_editor_inspector_request_sync();
+    }
+}
+
+static void delete_scene_selection(void)
+{
+    int sel_count = 0;
+    const uint32_t *sel = jce_state_get_selection(&sel_count);
+    uint32_t focused = jce_state_get_focused();
+    if (sel_count > 0) {
+        uint32_t ids[JCE_MAX_SELECTED];
+        int n = sel_count < JCE_MAX_SELECTED ? sel_count : JCE_MAX_SELECTED;
+        for (int i = 0; i < n; i++)
+            ids[i] = sel[i];
+        jce_editor_inspector_request_delete_confirm_many(ids, n);
+    } else if (focused != 0) {
+        jce_editor_inspector_request_delete_confirm(focused);
+    }
+}
+
 static void cmd_toggle_demo_lod_(void);
 static void cmd_pack_current_scene_(void);
+static void cmd_screenshot_(void);
+static void cmd_record_toggle_(void);
 
 static void handle_global_edit_shortcuts(void)
 {
@@ -167,6 +291,18 @@ static void handle_global_edit_shortcuts(void)
     /* Fullscreen via central registry (default F11). */
     if (jce_hotkey_pressed(JCE_HK_UI_TOGGLE_FULLSCREEN_VIEW)) {
         jce_editor_toggle_fullscreen();
+        return;
+    }
+
+    /* Screenshot (F12): capture the whole editor window to a PNG. */
+    if (jce_hotkey_pressed(JCE_HK_UI_SCREENSHOT)) {
+        cmd_screenshot_();
+        return;
+    }
+
+    /* Record (F9): toggle continuous backbuffer capture (Phase 0: PNG frames). */
+    if (jce_hotkey_pressed(JCE_HK_UI_RECORD)) {
+        cmd_record_toggle_();
         return;
     }
 
@@ -178,6 +314,18 @@ static void handle_global_edit_shortcuts(void)
     if (should_block_editor_interaction())
         return;
 
+    if (jce_hotkey_pressed(JCE_HK_FILE_SAVE_AS)) {
+        s_show_save_as = true;
+        return;
+    }
+    if (jce_hotkey_pressed(JCE_HK_FILE_SAVE)) {
+        save_scene_or_open_save_as();
+        return;
+    }
+    if (jce_hotkey_pressed(JCE_HK_FILE_OPEN)) {
+        s_show_open_scene = true;
+        return;
+    }
     if (jce_hotkey_pressed(JCE_HK_FILE_NEW)) {
         (void)jce_editor_layout_run_new_scene_command();
         return;
@@ -188,9 +336,41 @@ static void handle_global_edit_shortcuts(void)
             jce_state_undo();
         return;
     }
-    if (jce_hotkey_pressed(JCE_HK_EDIT_REDO)) {
+    if (redo_hotkey_pressed()) {
         if (jce_state_can_redo())
             jce_state_redo();
+        return;
+    }
+
+    if (jce_hotkey_pressed(JCE_HK_EDIT_COPY)) {
+        copy_scene_selection(false);
+        return;
+    }
+    if (jce_hotkey_pressed(JCE_HK_EDIT_CUT)) {
+        copy_scene_selection(true);
+        return;
+    }
+    if (jce_hotkey_pressed(JCE_HK_EDIT_PASTE)) {
+        paste_scene_clipboard();
+        return;
+    }
+    if (jce_hotkey_pressed(JCE_HK_EDIT_DUPLICATE)) {
+        duplicate_scene_selection();
+        return;
+    }
+    if (delete_hotkey_pressed()) {
+        delete_scene_selection();
+        return;
+    }
+    if (jce_hotkey_pressed(JCE_HK_EDIT_SELECT_ALL)) {
+        select_all_scene_entities();
+        return;
+    }
+    if (jce_hotkey_pressed(JCE_HK_EDIT_FIND)
+        || jce_hotkey_pressed(JCE_HK_UI_FIND_IN_HIERARCHY)) {
+        bool *v = jce_editor_panel_visible_ptr(JCE_PANEL_SEARCH);
+        if (v) *v = true;
+        return;
     }
 
     /* Panel toggle hotkeys — flip Window-menu visibility flags. */
@@ -212,9 +392,9 @@ static void handle_global_edit_shortcuts(void)
         }
     }
 
-    if (ImGui::IsKeyPressed(ImGuiKey_F9, false)) {
-        cmd_toggle_demo_lod_();
-    }
+    /* F12 = screenshot (handled above via JCE_HK_UI_SCREENSHOT).  F9 is left
+       reserved for the upcoming screen-recording feature — do not bind editor
+       actions to it.  (Demo-LOD toggle stays reachable from the Debug menu.) */
 
     /* Workspace switching (Ctrl+F1..F7). Mapped 1:1 to the first seven
        workspaces (Default, Modeling, Rigging, Animation, FX, Rendering,
@@ -239,9 +419,13 @@ static void handle_global_edit_shortcuts(void)
         }
     }
 
-    /* Pack-current-scene shortcut (Ctrl+Shift+B). */
-    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_B)) {
+    if (jce_hotkey_pressed(JCE_HK_FILE_BUILD_SETTINGS)) {
+        s_show_build = true;
+        return;
+    }
+    if (jce_hotkey_pressed(JCE_HK_FILE_PACK_CURRENT_SCENE)) {
         cmd_pack_current_scene_();
+        return;
     }
 }
 
@@ -290,6 +474,60 @@ static void cmd_proj_settings_(void)     { s_show_proj_settings = true; }
 static void cmd_about_(void)             { s_show_about = true; }
 static void cmd_quit_(void)              { jce_editor_layout_request_quit(); }
 static void cmd_toggle_fullscreen_(void) { jce_editor_toggle_fullscreen(); }
+
+/* F12 — capture the editor window to .jce/screenshots/jce_screenshot_<ts>.png.
+ * The capture is deferred one frame and written by the renderer's bgfx
+ * screen_shot callback; the toast confirms the request + destination.
+ * Uses engine wrappers only (no platform-specific calls): the host-FS
+ * directory helper (mkdir -p) and the engine's local-time formatter, which
+ * hide the localtime_r/localtime_s fork. */
+static void cmd_screenshot_(void)
+{
+    jce_fs_host_create_directory(".jce/screenshots");
+
+    char stamp[32];
+    jce_time_format_local(jce_time_now_epoch_seconds(),
+                          "%Y-%m-%d_%H-%M-%S", stamp, sizeof(stamp));
+
+    char path[256];
+    snprintf(path, sizeof(path),
+             ".jce/screenshots/jce_screenshot_%s.png", stamp);
+
+    if (jce_screenshot_save(path, JCE_SCREENSHOT_PNG))
+        jce_toast_info("Screenshot: %s", path);
+    else
+        jce_toast_error("Screenshot failed (a capture is already in progress?)");
+}
+
+/* F9 — toggle screen recording to a VP9 .webm (backbuffer -> VP9 -> WebM on a
+ * worker thread). Audio (Opus) is a planned follow-up. */
+static void cmd_record_toggle_(void)
+{
+    if (jce_editor_recorder_is_active()) {
+        uint32_t frames  = jce_editor_recorder_frame_count();
+        uint32_t dropped = jce_editor_recorder_dropped();
+        jce_editor_recorder_stop();
+        jce_toast_info("Recording stopped: %u frames encoded (%u dropped)",
+                       frames, dropped);
+        return;
+    }
+
+    JceRenderer *r = jce_editor_get_renderer();
+    if (!r) { jce_toast_error("Record: renderer unavailable"); return; }
+
+    jce_fs_host_create_directory(".jce/recordings");
+
+    char stamp[32];
+    jce_time_format_local(jce_time_now_epoch_seconds(),
+                          "%Y-%m-%d_%H-%M-%S", stamp, sizeof(stamp));
+    char path[256];
+    snprintf(path, sizeof(path), ".jce/recordings/rec_%s.mkv", stamp);
+
+    if (jce_editor_recorder_start(r, path))
+        jce_toast_info("Recording -> %s (F9 to stop)", path);
+    else
+        jce_toast_error("Record start failed");
+}
 
 static void cmd_create_(const char *name) {
     uint32_t id = jce_state_create_entity(name, 0);
@@ -381,6 +619,7 @@ static const PaletteCmd s_palette_cmds[] = {
     { "view.right",          "View: Right",                 "View",      cmd_view_right_ },
     { "view.reset",          "Reset Camera",                "View",      cmd_view_reset_ },
     { "view.fullscreen",     "Toggle Fullscreen (F11)",     "View",      cmd_toggle_fullscreen_ },
+    { "view.screenshot",     "Take Screenshot (F12)",       "View",      cmd_screenshot_ },
     /* Layout */
     { "layout.default",      "Layout: Default",             "Layout",    cmd_layout_default_ },
     { "layout.wide",         "Layout: Wide",                "Layout",    cmd_layout_wide_ },
@@ -760,7 +999,8 @@ static void draw_menu_bar(void)
     if (ImGui::BeginMenu(jce_editor_i18n("menu.edit"))) {
         if (ImGui::MenuItem(jce_editor_i18n("menu.edit.undo"),  "Ctrl+Z", false, jce_state_can_undo()))
             jce_state_undo();
-        if (ImGui::MenuItem(jce_editor_i18n("menu.edit.redo"),  "Ctrl+Y", false, jce_state_can_redo()))
+        if (ImGui::MenuItem(jce_editor_i18n("menu.edit.redo"),
+                            "Ctrl+Y / Ctrl+Shift+Z", false, jce_state_can_redo()))
             jce_state_redo();
         ImGui::Separator();
         {
@@ -797,7 +1037,7 @@ static void draw_menu_bar(void)
                 jce_state_select_entity(d, false);
             }
         }
-        if (ImGui::MenuItem(jce_editor_i18n("menu.edit.delete"), "Del")) {
+        if (ImGui::MenuItem(jce_editor_i18n("menu.edit.delete"), "Del / Backspace")) {
             uint32_t f = jce_state_get_focused();
             if (f) jce_editor_inspector_request_delete_confirm(f);
         }
@@ -1207,7 +1447,7 @@ static void draw_menu_bar(void)
     /* ── Help ──────────────────────────────────────────────────────── */
     if (ImGui::BeginMenu(jce_editor_i18n("menu.debug"))) {
         if (ImGui::MenuItem(jce_editor_i18n("menu.debug.toggleDemoLod"),
-                            "F9", s_demo_lod_enabled)) {
+                            nullptr, s_demo_lod_enabled)) {
             cmd_toggle_demo_lod_();
         }
         ImGui::EndMenu();
@@ -2294,8 +2534,6 @@ void jce_editor_layout_draw(void)
     ImGui::Begin("DockSpace", nullptr, host_flags);
     ImGui::PopStyleVar(3);
 
-    handle_global_edit_shortcuts();
-
     /* Menu bar */
     draw_menu_bar();
 
@@ -2422,6 +2660,11 @@ void jce_editor_layout_draw(void)
 
     /* Draw all panel windows (dockable). */
     draw_panel_windows();
+
+    /* Panels get first refusal for context-specific editing shortcuts
+     * (Assets, Material Graph, Hierarchy). Anything unconsumed falls back
+     * to scene/entity commands here. */
+    handle_global_edit_shortcuts();
 
     /* Preferences (floating). */
     jce_editor_panel_default_pose("preferences");

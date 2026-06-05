@@ -238,12 +238,11 @@ endif()
 _jce_add_layer(jce_physics
 	DIRS      middleware/physics
 	LINK_PUBLIC  jce_core
-	LINK_PRIVATE box2d::box2d Bullet::Bullet
+	LINK_PRIVATE box2d::box2d Bullet::Bullet v-hacd::v-hacd
 	CXX)
 
-# VHACD is a heavy single-header library vendored under physics/third_party.
-# Silence its warnings on the one TU that pulls in its implementation, and
-# add the third_party search root so the include resolves.
+# VHACD is a heavy single-header library; silence its warnings on the one
+# TU that pulls in its implementation.
 set_source_files_properties(
 	"${CMAKE_CURRENT_SOURCE_DIR}/src/middleware/physics/jce_collider_cook.cpp"
 	PROPERTIES COMPILE_OPTIONS

@@ -13,6 +13,13 @@ extern "C" {
 #endif
 
 #define JCE_EDITOR_PANELS_MASK_UNSET  0xFFFFFFFFu
+#define JCE_EDITOR_UI_INT_STATE_MAX   64
+#define JCE_EDITOR_UI_STATE_KEY_MAX   64
+
+typedef struct {
+    char key[JCE_EDITOR_UI_STATE_KEY_MAX];
+    int  value;
+} JceEditorUiIntState;
 
 typedef struct {
     char language[8];          /* "en" or "zh_cn" */
@@ -98,6 +105,12 @@ typedef struct {
      * user's curated quick-access list survives editor restarts. */
     char asset_favorites[12][512];
     int  asset_favorite_count;
+
+    /* Generic editor-UI state for stable integer values such as active
+       workbench tabs, selected modes, and other per-user panel chrome.
+       Keys are stable ASCII identifiers like "panel.animation.current_tab". */
+    JceEditorUiIntState ui_int_states[JCE_EDITOR_UI_INT_STATE_MAX];
+    int                 ui_int_state_count;
 } JceEditorConfig;
 
 /* Load config from .jce/editor-config.json. Returns false if not found. */
@@ -121,6 +134,18 @@ void jce_editor_config_add_recent_scene(JceEditorConfig *cfg, const char *path);
 /* Asset Browser favourites helpers — dedupe-aware, max 12.  Idempotent. */
 bool jce_editor_config_add_favorite(JceEditorConfig *cfg, const char *path);
 bool jce_editor_config_remove_favorite(JceEditorConfig *cfg, const char *path);
+
+/* Generic UI integer state helpers.  Return false for NULL/empty/too-long
+   keys or when the fixed storage table is full. */
+bool jce_editor_config_get_ui_int(const JceEditorConfig *cfg,
+                                  const char *key,
+                                  int *out_value);
+int  jce_editor_config_get_ui_int_or(const JceEditorConfig *cfg,
+                                     const char *key,
+                                     int fallback);
+bool jce_editor_config_set_ui_int(JceEditorConfig *cfg,
+                                  const char *key,
+                                  int value);
 
 /* Cached input preference flags — kept in sync by load/save.
    Read directly by scene/particle viewport input handlers (avoids

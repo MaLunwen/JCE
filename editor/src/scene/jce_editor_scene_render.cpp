@@ -418,6 +418,11 @@ JceSceneRenderer *jce_editor_get_scene_renderer(void)
     return s_sr.scene_renderer;
 }
 
+JceRenderer *jce_editor_get_renderer(void)
+{
+    return s_sr.renderer;
+}
+
 JceWorldStreamer *jce_editor_get_world_streamer(void)
 {
     return s_sr.world_streamer;

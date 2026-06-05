@@ -144,6 +144,11 @@ void jce_editor_scene_reset_anim_timer(void);
 typedef struct JceSceneRenderer JceSceneRenderer;
 JceSceneRenderer *jce_editor_get_scene_renderer(void);
 
+/* Access the low-level engine renderer owned by the editor viewport (used by
+ * the F9 screen recorder to toggle backbuffer capture). */
+typedef struct JceRenderer JceRenderer;
+JceRenderer *jce_editor_get_renderer(void);
+
 /* Resolve a scene-relative or assetdb-relative asset path to an absolute
  * disk path the host filesystem can open.  Tries (in order): the input
  * as-is, assetdb root + input, and a 5-level walk-up from the current

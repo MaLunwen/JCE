@@ -22,6 +22,7 @@
 #include "core/jce_editor_toast.h"
 #include "scene/jce_editor_scene_render.h"
 #include "ui/jce_editor_panels.h"
+#include "ui/jce_editor_ui_state.h"
 #include "ui/jce_theme_palette.h"
 
 #include <jce/renderer/jce_lowlevel.h>
@@ -922,9 +923,36 @@ namespace {
 
 int g_request_tab = -1;
 int g_current_tab = 0;  /* mirror of active profiling TabItem for menu markers */
+bool g_tab_state_loaded = false;
+
+static const char *k_tab_state_key = "panel.profiler.current_tab";
+
+bool valid_tab(int idx)
+{
+    return idx >= 0 && idx <= 3;
+}
+
+void ensure_tab_state_loaded(void)
+{
+    if (g_tab_state_loaded)
+        return;
+    g_current_tab = jce_editor_ui_state_load_int(k_tab_state_key, 0, 0, 3);
+    g_request_tab = g_current_tab;
+    g_tab_state_loaded = true;
+}
+
+void set_current_tab(int idx)
+{
+    if (!valid_tab(idx) || g_current_tab == idx)
+        return;
+    g_current_tab = idx;
+    if (g_tab_state_loaded)
+        jce_editor_ui_state_save_int(k_tab_state_key, idx);
+}
 
 void draw_workbench(void)
 {
+    ensure_tab_state_loaded();
     if (!ImGui::BeginTabBar("##profiling_tabs"))
         return;
 
@@ -948,22 +976,22 @@ void draw_workbench(void)
                   jce_editor_i18n("frameDebugger.title"));
 
     if (ImGui::BeginTabItem(cpu_label, nullptr, cpu_flags)) {
-        g_current_tab = 0;
+        set_current_tab(0);
         draw_content();
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem(mem_label, nullptr, mem_flags)) {
-        g_current_tab = 1;
+        set_current_tab(1);
         jce_editor_panel_memory_profiler_content();
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem(ana_label, nullptr, ana_flags)) {
-        g_current_tab = 2;
+        set_current_tab(2);
         jce_editor_panel_profile_analyzer_content();
         ImGui::EndTabItem();
     }
     if (ImGui::BeginTabItem(fd_label, nullptr, fd_flags)) {
-        g_current_tab = 3;
+        set_current_tab(3);
         jce_editor_panel_frame_debugger_content();
         ImGui::EndTabItem();
     }
@@ -976,11 +1004,16 @@ void draw_workbench(void)
 
 extern "C" void jce_panel_profiler_request_tab(int idx)
 {
+    if (!valid_tab(idx))
+        return;
     g_request_tab = idx;
+    g_current_tab = idx;
+    jce_editor_ui_state_save_int(k_tab_state_key, idx);
 }
 
 extern "C" int jce_panel_profiler_current_tab(void)
 {
+    ensure_tab_state_loaded();
     return g_current_tab;
 }
 

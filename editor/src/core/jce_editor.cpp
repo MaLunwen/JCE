@@ -238,6 +238,7 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
     /* Ensure .jce config dir exists, then let ImGui persist layout/docking state there. */
     jce_editor_config_ensure_dir();
     io.IniFilename = ".jce/imgui.ini";
+    io.IniSavingRate = 1.0f;
 
     /* Clipboard. */
     io.SetClipboardTextFn = clipboard_set;
@@ -377,6 +378,12 @@ void jce_editor_shutdown(void)
             LOG_WARN(LOG_TAG, "jce_window_stop_text_input failed during shutdown");
         }
         s_editor.text_input_active = false;
+    }
+
+    if (ImGui::GetCurrentContext()) {
+        ImGuiIO &io = ImGui::GetIO();
+        if (io.IniFilename && io.IniFilename[0])
+            ImGui::SaveIniSettingsToDisk(io.IniFilename);
     }
 
     jce_gizmo_shutdown();

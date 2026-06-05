@@ -32,6 +32,8 @@
 #include <jce/renderer/jce_material.h>
 #include <jce/renderer/jce_mesh.h>
 #include <jce/renderer/jce_model.h>
+#include <jce/renderer/jce_skinned_mesh.h>
+#include <jce/renderer/jce_local_shadow.h>
 #include <jce/renderer/jce_pbr_material.h>
 #include <jce/renderer/jce_postfx.h>
 #include <jce/renderer/jce_render_queue.h>
@@ -46,6 +48,8 @@
 #include <jce/renderer/jce_texture.h>
 #include <jce/renderer/jce_views.h>
 #include <jce/renderer/jce_volume_profile.h>
+
+#include "jce_scene_renderer_view_order.h"
 
 #include <bgfx/c99/bgfx.h>
 #include <assert.h>
@@ -79,6 +83,18 @@ JCE_SASSERT(JCE_SCENE_LOD_MAX_LEVELS == JCE_LOD_MAX_LEVELS);
 #define CSM_FAR_HYST_REL       0.03f
 #define CSM_FAR_HYST_ABS       8.0f
 
+/* Local (spot/point) shadow atlas — P1. A square atlas packs up to
+ * JCE_MAX_LOCAL_SHADOWS perspective depth tiles in a NxN grid; each
+ * shadow-casting local light renders into one tile via its own bgfx view
+ * (view_id_base + 4 + slot). v1 wires SPOT lights; point lights TODO. */
+#define JCE_MAX_LOCAL_SHADOWS  4
+#define JCE_LOCAL_SHADOW_TILES 2   /* 2x2 grid -> 4 tiles */
+#define JCE_VIEW_LOCAL_SHADOW_OFFSET 4 /* base+4..base+8, free for base 0/3/80 */
+/* Point lights are omnidirectional; v1 approximates with a single wide-FOV
+ * perspective frustum aimed straight down (good for elevated point lights,
+ * weaker for ground-level ones). ~126deg. dual-paraboloid/cube is a future upgrade. */
+#define JCE_POINT_SHADOW_FOV   2.2f
+
 /* ── Internal struct ──────────────────────────────────────────────── */
 
 /* Per-frame material registry entry. Snapshot of everything the binder
@@ -106,6 +122,12 @@ typedef struct {
     float           speed;
     bool            paused;
     bool            used;
+    /* Per-frame world-bone palette, evaluated ONCE in sr_update_skinned_anims
+       before the shadow pass, then consumed by both the shadow pass and the
+       color pass so the cast shadow deforms in lock-step with the lit mesh.
+       count == 0 means "no live animation" (draw the bind pose). */
+    jce_mat4        skin_palette[JCE_MAX_BONES];
+    uint32_t        skin_palette_count;
 } SrModelCache;
 
 struct JceSceneRenderer {
@@ -177,6 +199,24 @@ struct JceSceneRenderer {
     float                      csm_filter_radius;
     JceCsmData                 last_csm;
     bool                       last_csm_valid;
+
+    /* Local (spot/point) shadow atlas — P1. */
+    bgfx_texture_handle_t      local_atlas_tex;
+    bgfx_frame_buffer_handle_t local_atlas_fbo;
+    bgfx_uniform_handle_t      u_local_shadow_map;    /* sampler stage 15 */
+    bgfx_uniform_handle_t      u_local_shadow_vp;     /* MAT4[JCE_MAX_LOCAL_SHADOWS] */
+    bgfx_uniform_handle_t      u_local_shadow_params; /* x=tiles/side y=1/atlas z=bias w=texel */
+    bgfx_uniform_handle_t      u_spot_shadow_slot;    /* VEC4: lane i = slot for spot i (-1=none) */
+    bgfx_uniform_handle_t      u_point_shadow_slot;   /* VEC4[2]: 8 point lanes (-1=none) */
+    bool                       local_atlas_valid;
+    /* Per-frame local-shadow state, filled by sr_draw_local_shadow_pass.
+       Spot + point lights share ONE atlas slot pool (max JCE_MAX_LOCAL_SHADOWS). */
+    jce_mat4                   frame_local_vp[JCE_MAX_LOCAL_SHADOWS];
+    float                      frame_spot_slot[JCE_MAX_SPOT_LIGHTS];   /* spot i -> slot or -1 */
+    float                      frame_point_slot[JCE_MAX_POINT_LIGHTS]; /* point j -> slot or -1 */
+    uint32_t                   frame_local_count;
+    float                      frame_local_bias;
+    bool                       frame_local_active;
 
     /* Per-frame culling stats (updated each render). */
     uint32_t                   stat_total_entities;
@@ -451,6 +491,99 @@ static SrModelCache *sr_get_model(JceSceneRenderer *sr, const char *path,
     return e;
 }
 
+/* Evaluate every skeletal-animator entity's pose ONCE per frame, BEFORE any
+ * render pass.  The resulting world-bone palette is cached on the model
+ * entry so the shadow pass (which the CPU records before the color pass) and
+ * the color pass both consume the identical pose — animation time is advanced
+ * exactly once, never per-pass.  This is the "skin once, draw many" rule and
+ * is the only ordering consistent with shadow producers preceding the color
+ * consumer view. */
+static void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
+                                    EntityList *list, float dt_sec)
+{
+    for (int i = 0; i < list->count; i++) {
+        JceEntity e = list->entities[i];
+        if (!entity_enabled(scene, e)) continue;
+        if (!jce_scene_has_skeletal_animator(scene, e)) continue;
+
+        JceSkeletalAnimatorComponent *sa = jce_scene_get_skeletal_animator(scene, e);
+        if (!sa || !sa->skeleton_path[0]) continue;
+
+        SrModelCache *mc = sr_get_model(sr, sa->skeleton_path, (uint32_t)e);
+        if (!mc || !mc->model) continue;
+
+        mc->skin_palette_count = 0;
+        if (!mc->player) continue;
+
+        int ac = sa->active_clip;
+        float sp = sa->speed > 0.0f ? sa->speed : 1.0f;
+        JceAnimClip *clip = NULL;
+        if (ac >= 0 && ac < (int)jce_model_anim_count(mc->model))
+            clip = jce_model_get_anim(mc->model, (uint32_t)ac);
+
+        bool comp_playing = sa->playing;
+        bool clip_changed = (mc->active_clip != ac);
+        bool loop_changed = (mc->loop != sa->loop);
+        bool speed_changed = fabsf(mc->speed - sp) > 0.0001f;
+        bool paused_changed = (mc->paused == comp_playing);
+
+        if (comp_playing && clip) {
+            if (!jce_anim_player_is_playing(mc->player)
+                || clip_changed || loop_changed) {
+                jce_anim_player_play(mc->player, clip, sa->loop, sp);
+            } else if (speed_changed || paused_changed) {
+                jce_anim_player_set_speed(mc->player, sp);
+            }
+            jce_anim_player_pause(mc->player, false);
+            jce_anim_player_set_speed(mc->player, sp);
+        } else {
+            if (clip && (clip_changed || loop_changed)) {
+                jce_anim_player_play(mc->player, clip, sa->loop, sp);
+                jce_anim_player_set_time(mc->player, 0.0f);
+            }
+            if (jce_anim_player_is_playing(mc->player))
+                jce_anim_player_pause(mc->player, true);
+        }
+
+        mc->active_clip = ac;
+        mc->loop = sa->loop;
+        mc->speed = sp;
+        mc->paused = !comp_playing;
+
+        mc->skin_palette_count = jce_anim_player_update(mc->player, dt_sec,
+                                                        mc->skin_palette,
+                                                        JCE_MAX_BONES);
+    }
+}
+
+/* If entity e is a skeletal-animator model, draw its skinned silhouette into
+ * the given shadow view using the palette cached by sr_update_skinned_anims,
+ * and return true so the caller skips the static-mesh shadow path (mirrors
+ * the color pass, which routes such entities through jce_model_draw and skips
+ * their MeshRenderer).  Returns false for non-skinned entities. */
+static bool sr_try_submit_skinned_shadow(JceSceneRenderer *sr, JceScene *scene,
+                                         JceEntity e, uint16_t view_id)
+{
+    if (!jce_scene_has_skeletal_animator(scene, e)) return false;
+    JceSkeletalAnimatorComponent *sa = jce_scene_get_skeletal_animator(scene, e);
+    if (!sa || !sa->skeleton_path[0]) return false;
+
+    SrModelCache *mc = sr_get_model(sr, sa->skeleton_path, (uint32_t)e);
+    if (!mc || !mc->model) return false;
+
+    JceTransform *t = jce_scene_get_transform(scene, e);
+    if (!t) return false;
+    float sx = (t->scale.x != 0.0f) ? t->scale.x : 1.0f;
+    float sy = (t->scale.y != 0.0f) ? t->scale.y : 1.0f;
+    float sz = (t->scale.z != 0.0f) ? t->scale.z : 1.0f;
+    jce_mat4 model = jce_m4_from_trs(t->position, t->rotation, jce_v3(sx, sy, sz));
+
+    jce_model_draw_shadow(mc->model, sr->renderer, view_id, &model,
+                          mc->skin_palette_count > 0 ? mc->skin_palette : NULL,
+                          mc->skin_palette_count);
+    return true;
+}
+
 /* ── Mesh resolution ──────────────────────────────────────────────── */
 
 static JceMesh *sr_resolve_mesh(JceSceneRenderer *sr, const JceMeshRenderer *mr)
@@ -480,13 +613,10 @@ static bool sr_build_entity_model(JceSceneRenderer *sr, JceScene *scene,
                                   JceMesh **out_mesh)
 {
     if (!scene || e == JCE_ENTITY_INVALID) return false;
-    JceTransform *t = jce_scene_get_transform(scene, e);
-    if (!t) return false;
+    if (!jce_scene_has_transform(scene, e)) return false;
 
-    float sx = (t->scale.x != 0.0f) ? t->scale.x : 1.0f;
-    float sy = (t->scale.y != 0.0f) ? t->scale.y : 1.0f;
-    float sz = (t->scale.z != 0.0f) ? t->scale.z : 1.0f;
-    *out_model = jce_m4_from_trs(t->position, t->rotation, jce_v3(sx, sy, sz));
+    /* Compose the full world matrix up the parent chain (roots → local). */
+    *out_model = jce_scene_get_world_matrix(scene, e);
 
     if (out_mesh) {
         *out_mesh = NULL;
@@ -717,9 +847,48 @@ static void sr_bind_shadow_uniforms_disabled(JceSceneRenderer *sr)
     sr_bind_shadow_params(sr, 0.0f);
 }
 
+/* P1 — bind the local (spot) shadow atlas + per-spot slot table. Bound for
+ * every material run alongside the directional shadow state; slots default to
+ * -1 (shader skips) when no spot casts a shadow. Stage 15 is shared with
+ * terrain's layer2 — terrain rebinds 15 after this, so terrain receives only
+ * directional shadows (fs_pbr.sc samples local shadows; fs_terrain.sc does not). */
+static void sr_bind_local_shadow_state(JceSceneRenderer *sr)
+{
+    if (!BGFX_HANDLE_IS_VALID(sr->u_local_shadow_map)) return;
+
+    bgfx_texture_handle_t tex = (sr->local_atlas_valid
+                                 && BGFX_HANDLE_IS_VALID(sr->local_atlas_tex))
+        ? sr->local_atlas_tex : sr->shadow_tex;
+    if (BGFX_HANDLE_IS_VALID(tex))
+        bgfx_set_texture(15, sr->u_local_shadow_map, tex, UINT32_MAX);
+
+    bgfx_set_uniform(sr->u_local_shadow_vp, sr->frame_local_vp[0].raw[0],
+                     JCE_MAX_LOCAL_SHADOWS);
+
+    float slots[4] = { -1.0f, -1.0f, -1.0f, -1.0f };
+    if (sr->frame_local_active) {
+        for (int i = 0; i < JCE_MAX_SPOT_LIGHTS && i < 4; i++)
+            slots[i] = sr->frame_spot_slot[i];
+    }
+    bgfx_set_uniform(sr->u_spot_shadow_slot, slots, 1);
+
+    float pslots[8];   /* 8 point lanes -> 2 vec4 */
+    for (int i = 0; i < JCE_MAX_POINT_LIGHTS && i < 8; i++)
+        pslots[i] = sr->frame_local_active ? sr->frame_point_slot[i] : -1.0f;
+    bgfx_set_uniform(sr->u_point_shadow_slot, pslots, 2);
+
+    float inv_atlas = sr->shadow_map_size > 0
+        ? 1.0f / (float)sr->shadow_map_size : 0.0f;
+    float params[4] = { (float)JCE_LOCAL_SHADOW_TILES, inv_atlas,
+                        sr->frame_local_bias, inv_atlas };
+    bgfx_set_uniform(sr->u_local_shadow_params, params, 1);
+}
+
 static void sr_bind_frame_shadow_state(JceSceneRenderer *sr)
 {
-    if (!sr || !sr->frame_shadow_active) {
+    if (!sr) return;
+    sr_bind_local_shadow_state(sr);
+    if (!sr->frame_shadow_active) {
         sr_bind_shadow_uniforms_disabled(sr);
         return;
     }
@@ -755,6 +924,26 @@ static void sr_bind_frame_shadow_state(JceSceneRenderer *sr)
     }
 
     sr_bind_shadow_uniforms_disabled(sr);
+}
+
+static void sr_apply_view_order(uint16_t view_id_base,
+                                const JceSceneRenderConfig *cfg,
+                                uint32_t csm_cascade_count)
+{
+    JceSceneRendererViewOrder order;
+    bool include_fog_views = cfg && cfg->fog_enabled;
+    uint8_t cascades = csm_cascade_count > JCE_CSM_MAX_CASCADES
+        ? JCE_CSM_MAX_CASCADES : (uint8_t)csm_cascade_count;
+
+    if (!jce_scene_renderer_view_order_build(
+            view_id_base,
+            cfg && cfg->draw_shadows,
+            cascades,
+            include_fog_views,
+            &order))
+        return;
+
+    bgfx_set_view_order(order.first, order.count, order.order);
 }
 
 /* ── Sky pass ─────────────────────────────────────────────────────── */
@@ -832,6 +1021,15 @@ static void sr_destroy_shadow_targets(JceSceneRenderer *sr)
         bgfx_destroy_texture(sr->shadow_tex);
         sr->shadow_tex.idx = UINT16_MAX;
     }
+    if (BGFX_HANDLE_IS_VALID(sr->local_atlas_fbo)) {
+        bgfx_destroy_frame_buffer(sr->local_atlas_fbo);
+        sr->local_atlas_fbo.idx = UINT16_MAX;
+    }
+    if (BGFX_HANDLE_IS_VALID(sr->local_atlas_tex)) {
+        bgfx_destroy_texture(sr->local_atlas_tex);
+        sr->local_atlas_tex.idx = UINT16_MAX;
+    }
+    sr->local_atlas_valid = false;
     for (uint32_t i = 0; i < JCE_CSM_MAX_CASCADES; i++) {
         if (BGFX_HANDLE_IS_VALID(sr->csm_fbo[i])) {
             bgfx_destroy_frame_buffer(sr->csm_fbo[i]);
@@ -880,6 +1078,18 @@ static void sr_create_shadow_targets(JceSceneRenderer *sr)
         if (!BGFX_HANDLE_IS_VALID(sr->csm_fbo[i]))
             sr->csm_valid = false;
     }
+
+    /* Local (spot/point) shadow atlas: one square depth texture, NxN tiles. */
+    sr->local_atlas_tex = bgfx_create_texture_2d(sz, sz, false, 1, depth_fmt,
+        BGFX_TEXTURE_RT
+        | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
+        | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT,
+        NULL);
+    memset(&at, 0, sizeof(at));
+    bgfx_attachment_init(&at, sr->local_atlas_tex, BGFX_ACCESS_WRITE,
+                         0, 1, 0, BGFX_RESOLVE_NONE);
+    sr->local_atlas_fbo = bgfx_create_frame_buffer_from_attachment(1, &at, false);
+    sr->local_atlas_valid = BGFX_HANDLE_IS_VALID(sr->local_atlas_fbo);
 }
 
 static void sr_ensure_shadow_map_size(JceSceneRenderer *sr, uint16_t size)
@@ -961,6 +1171,8 @@ static void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
             for (int i = 0; i < list->count; i++) {
                 JceEntity e = list->entities[i];
                 if (!entity_enabled(scene, e)) continue;
+                if (sr_try_submit_skinned_shadow(sr, scene, e, shadow_view_0))
+                    continue;
                 jce_mat4 model;
                 JceMesh *mesh = NULL;
                 if (!sr_build_entity_model(sr, scene, e, &model, &mesh)) continue;
@@ -988,6 +1200,8 @@ static void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
         for (int i = 0; i < list->count; i++) {
             JceEntity e = list->entities[i];
             if (!entity_enabled(scene, e)) continue;
+            if (sr_try_submit_skinned_shadow(sr, scene, e, shadow_view_0))
+                continue;
             jce_mat4 model;
             JceMesh *mesh = NULL;
             if (!sr_build_entity_model(sr, scene, e, &model, &mesh)) continue;
@@ -1099,6 +1313,8 @@ static void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
             for (int i = 0; i < list->count; i++) {
                 JceEntity e = list->entities[i];
                 if (!entity_enabled(scene, e)) continue;
+                if (sr_try_submit_skinned_shadow(sr, scene, e, cv))
+                    continue;
                 jce_mat4 model;
                 JceMesh *mesh = NULL;
                 if (!sr_build_entity_model(sr, scene, e, &model, &mesh)) continue;
@@ -1136,6 +1352,8 @@ static void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
             for (int i = 0; i < list->count; i++) {
                 JceEntity e = list->entities[i];
                 if (!entity_enabled(scene, e)) continue;
+                if (sr_try_submit_skinned_shadow(sr, scene, e, cv))
+                    continue;
                 jce_mat4 model;
                 JceMesh *mesh = NULL;
                 if (!sr_build_entity_model(sr, scene, e, &model, &mesh)) continue;
@@ -1147,6 +1365,139 @@ static void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
     }
 
     sr_bind_frame_shadow_state(sr);
+}
+
+/* Render one local-shadow tile: lazily clear the whole atlas once (D3D clears
+ * the full target, so per-tile clears would wipe earlier tiles), set up the
+ * tile's view (rect + light VP), and submit all casters (reusing the skinned +
+ * static depth helpers so animated casters deform their local shadows too).
+ * Stores the VP into frame_local_vp[slot]. */
+static void sr_local_shadow_render_tile(JceSceneRenderer *sr, JceScene *scene,
+                                        EntityList *list, uint16_t view_id_base,
+                                        const jce_mat4 *vp, uint32_t slot,
+                                        const float *ident, bool *cleared)
+{
+    uint16_t tx, ty, tsz;
+    if (!jce_local_shadow_atlas_tile(slot, sr->shadow_map_size,
+                                     JCE_LOCAL_SHADOW_TILES, &tx, &ty, &tsz))
+        return;
+
+    if (!*cleared) {
+        const uint16_t clear_view =
+            (uint16_t)(view_id_base + JCE_VIEW_LOCAL_SHADOW_OFFSET);
+        bgfx_set_view_rect(clear_view, 0, 0,
+                           sr->shadow_map_size, sr->shadow_map_size);
+        bgfx_set_view_frame_buffer(clear_view, sr->local_atlas_fbo);
+        bgfx_set_view_clear(clear_view, BGFX_CLEAR_DEPTH, 0, 1.0f, 0);
+        bgfx_set_view_transform(clear_view, ident, ident);
+        bgfx_touch(clear_view);
+        *cleared = true;
+    }
+
+    const uint16_t lv = (uint16_t)(view_id_base
+                          + JCE_VIEW_LOCAL_SHADOW_OFFSET + 1 + slot);
+    bgfx_set_view_rect(lv, tx, ty, tsz, tsz);
+    bgfx_set_view_frame_buffer(lv, sr->local_atlas_fbo);
+    bgfx_set_view_clear(lv, 0, 0, 1.0f, 0);   /* cleared once above */
+    bgfx_set_view_transform(lv, ident, vp->raw[0]);
+    bgfx_touch(lv);
+
+    for (int j = 0; j < list->count; j++) {
+        JceEntity ee = list->entities[j];
+        if (!entity_enabled(scene, ee)) continue;
+        if (sr_try_submit_skinned_shadow(sr, scene, ee, lv)) continue;
+        jce_mat4 model;
+        JceMesh *mesh = NULL;
+        if (!sr_build_entity_model(sr, scene, ee, &model, &mesh)) continue;
+        if (!mesh) continue;
+        bgfx_set_transform(model.raw[0], 1);
+        jce_mesh_submit_shadow(mesh, sr->renderer, lv);
+    }
+
+    sr->frame_local_vp[slot] = *vp;
+}
+
+/* P1 — local (spot + point) shadow producer pass. Renders up to
+ * JCE_MAX_LOCAL_SHADOWS shadow-casting SPOT and POINT lights as perspective
+ * depth tiles sharing ONE shadow atlas (1 full-atlas clear at view base+4 +
+ * one view per tile at base+5+slot). Spots use their cone FOV aimed along the
+ * spot direction; points use a single wide-FOV frustum aimed straight DOWN
+ * (v1 hemisphere approximation — good for elevated point lights). Spot/point
+ * index alignment with the shader's u_spotLights[]/u_pointLights[] is
+ * guaranteed by iterating `list` in the SAME order + caps as the light gather.
+ * Reuses the depth submit helpers, so animated casters deform their local
+ * shadows too (skinned path). */
+static void sr_draw_local_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
+                                      EntityList *list, uint16_t view_id_base)
+{
+    sr->frame_local_active = false;
+    sr->frame_local_count  = 0;
+    for (uint32_t i = 0; i < JCE_MAX_SPOT_LIGHTS; i++)
+        sr->frame_spot_slot[i] = -1.0f;
+    for (uint32_t i = 0; i < JCE_MAX_POINT_LIGHTS; i++)
+        sr->frame_point_slot[i] = -1.0f;
+
+    if (!sr->local_atlas_valid || !list) return;
+    if (jce_renderer_get_program_shadow(sr->renderer).idx == UINT16_MAX) return;
+
+    const bool homog = sr->homogeneous_depth;
+    float ident[16] = { 1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1 };
+    uint32_t slot    = 0;   /* shared spot+point atlas slot pool */
+    bool     cleared = false;
+
+    /* Spots — index aligns with u_spotLights[]. */
+    uint32_t spot_idx = 0;
+    for (int li = 0; li < list->count && slot < JCE_MAX_LOCAL_SHADOWS; li++) {
+        JceEntity e = list->entities[li];
+        if (!entity_enabled(scene, e)) continue;
+        if (!jce_scene_has_spot_light(scene, e)) continue;
+        JceSpotLight *sl = jce_scene_get_spot_light(scene, e);
+        if (!sl) continue;
+        const uint32_t my_spot = spot_idx++;
+        if (my_spot >= JCE_MAX_SPOT_LIGHTS) break;
+        if (!sl->casts_shadow) continue;
+
+        JceTransform *xf = jce_scene_get_transform(scene, e);
+        jce_vec3 pos    = xf ? xf->position : sl->position;
+        jce_vec3 dir    = sr_light_world_shine_direction(&sl->direction, xf);
+        float    radius = sl->radius > 0.0f ? sl->radius : 10.0f;
+        float    fov    = 2.0f * acosf(sl->outer_cone_cos);
+        jce_mat4 vp = jce_local_shadow_vp(pos, dir, fov,
+                                          0.05f * radius, radius, homog);
+        sr_local_shadow_render_tile(sr, scene, list, view_id_base,
+                                    &vp, slot, ident, &cleared);
+        sr->frame_spot_slot[my_spot] = (float)slot;
+        slot++;
+    }
+
+    /* Points — index aligns with u_pointLights[]; share the slot pool. v1 aims
+       a single wide-FOV frustum straight down (hemisphere approximation). */
+    uint32_t point_idx = 0;
+    for (int li = 0; li < list->count && slot < JCE_MAX_LOCAL_SHADOWS; li++) {
+        JceEntity e = list->entities[li];
+        if (!entity_enabled(scene, e)) continue;
+        if (!jce_scene_has_point_light(scene, e)) continue;
+        JcePointLight *pl = jce_scene_get_point_light(scene, e);
+        if (!pl) continue;
+        const uint32_t my_point = point_idx++;
+        if (my_point >= JCE_MAX_POINT_LIGHTS) break;
+        if (!pl->casts_shadow) continue;
+
+        JceTransform *xf = jce_scene_get_transform(scene, e);
+        jce_vec3 pos    = xf ? xf->position : pl->position;
+        float    radius = pl->radius > 0.0f ? pl->radius : 10.0f;
+        jce_mat4 vp = jce_local_shadow_vp(pos, jce_v3(0.0f, -1.0f, 0.0f),
+                                          JCE_POINT_SHADOW_FOV,
+                                          0.05f * radius, radius, homog);
+        sr_local_shadow_render_tile(sr, scene, list, view_id_base,
+                                    &vp, slot, ident, &cleared);
+        sr->frame_point_slot[my_point] = (float)slot;
+        slot++;
+    }
+
+    sr->frame_local_count  = slot;
+    sr->frame_local_active = slot > 0;
+    sr->frame_local_bias   = 0.0015f;   /* default depth bias; tune by eye */
 }
 
 /* ── Skybox scan ──────────────────────────────────────────────────── */
@@ -1371,6 +1722,10 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                              uint16_t view_id, float dt_sec,
                              const JceSceneRenderConfig *cfg)
 {
+    /* Animation is advanced in sr_update_skinned_anims (before the shadow
+       pass); the color pass only consumes the cached palette. */
+    (void)dt_sec;
+
     if (list->count == 0) return;
 
     /* Gather lights. */
@@ -1423,6 +1778,8 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                     pl.intensity = plc->intensity > 0.0f ? plc->intensity : 1.0f;
                     pl.radius    = plc->radius    > 0.0f ? plc->radius    : 10.0f;
                     pl.position  = xf ? xf->position : plc->position;
+                    pl.casts_shadow = plc->casts_shadow;
+                    pl.shadow_bias  = plc->shadow_bias;
                     jce_light_env_add_point_light(sr->light_env, &pl);
                     has_any_light = true;
                 }
@@ -1444,6 +1801,8 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                     sl.cookie_texture  = slc->cookie_texture;
                     sl.ies_lut_texture = slc->ies_lut_texture;
                     sl.cookie_strength = slc->cookie_strength;
+                    sl.casts_shadow = slc->casts_shadow;
+                    sl.shadow_bias  = slc->shadow_bias;
                     jce_light_env_add_spot_light(sr->light_env, &sl);
                     has_any_light = true;
                 }
@@ -1634,56 +1993,18 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
         }
 
         /* ── Skinned/animated path ───────────────────────────────── */
+        /* Pose was already advanced ONCE this frame by
+           sr_update_skinned_anims (before the shadow pass); here we only
+           consume the cached palette so the lit mesh and its cast shadow
+           share the exact same pose.  skin_palette_count == 0 => bind pose. */
         if (jce_scene_has_skeletal_animator(scene, e)) {
             JceSkeletalAnimatorComponent *sa = jce_scene_get_skeletal_animator(scene, e);
             if (sa && sa->skeleton_path[0]) {
                 SrModelCache *mc = sr_get_model(sr, sa->skeleton_path, (uint32_t)e);
                 if (mc && mc->model) {
-                    if (mc->player) {
-                        int ac = sa->active_clip;
-                        float sp = sa->speed > 0.0f ? sa->speed : 1.0f;
-                        JceAnimClip *clip = NULL;
-                        if (ac >= 0 && ac < (int)jce_model_anim_count(mc->model))
-                            clip = jce_model_get_anim(mc->model, (uint32_t)ac);
-
-                        bool comp_playing = sa->playing;
-                        bool clip_changed = (mc->active_clip != ac);
-                        bool loop_changed = (mc->loop != sa->loop);
-                        bool speed_changed = fabsf(mc->speed - sp) > 0.0001f;
-                        bool paused_changed = (mc->paused == comp_playing);
-
-                        if (comp_playing && clip) {
-                            if (!jce_anim_player_is_playing(mc->player)
-                                || clip_changed || loop_changed) {
-                                jce_anim_player_play(mc->player, clip, sa->loop, sp);
-                            } else if (speed_changed || paused_changed) {
-                                jce_anim_player_set_speed(mc->player, sp);
-                            }
-                            jce_anim_player_pause(mc->player, false);
-                            jce_anim_player_set_speed(mc->player, sp);
-                        } else {
-                            if (clip && (clip_changed || loop_changed)) {
-                                jce_anim_player_play(mc->player, clip, sa->loop, sp);
-                                jce_anim_player_set_time(mc->player, 0.0f);
-                            }
-                            if (jce_anim_player_is_playing(mc->player))
-                                jce_anim_player_pause(mc->player, true);
-                        }
-
-                        mc->active_clip = ac;
-                        mc->loop = sa->loop;
-                        mc->speed = sp;
-                        mc->paused = !comp_playing;
-
-                        jce_mat4 joints[64];
-                        uint32_t nj = jce_anim_player_update(mc->player,
-                                                             dt_sec, joints, 64);
-                        jce_model_draw(mc->model, sr->renderer, view_id, &model,
-                                       nj > 0 ? joints : NULL, nj);
-                    } else {
-                        jce_model_draw(mc->model, sr->renderer, view_id,
-                                       &model, NULL, 0);
-                    }
+                    jce_model_draw(mc->model, sr->renderer, view_id, &model,
+                                   mc->skin_palette_count > 0 ? mc->skin_palette : NULL,
+                                   mc->skin_palette_count);
                     continue;
                 }
             }
@@ -2268,6 +2589,13 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
     sr->shadow_fbo.idx      = UINT16_MAX;
     sr->u_shadowMap.idx     = UINT16_MAX;
     sr->u_shadowVP.idx      = UINT16_MAX;
+    sr->local_atlas_tex.idx       = UINT16_MAX;
+    sr->local_atlas_fbo.idx       = UINT16_MAX;
+    sr->u_local_shadow_map.idx    = UINT16_MAX;
+    sr->u_local_shadow_vp.idx     = UINT16_MAX;
+    sr->u_local_shadow_params.idx = UINT16_MAX;
+    sr->u_spot_shadow_slot.idx    = UINT16_MAX;
+    sr->u_point_shadow_slot.idx   = UINT16_MAX;
     sr->u_csm_vp.idx        = UINT16_MAX;
     sr->u_csm_splits.idx    = UINT16_MAX;
     sr->u_csm_params.idx    = UINT16_MAX;
@@ -2441,6 +2769,20 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
         LOG_INFO(LOG_TAG, "[init] csm_valid=%d", (int)sr->csm_valid);
     }
 
+    /* Local (spot/point) shadow atlas uniforms — P1. The atlas texture +
+       FBO are (re)created in sr_create_shadow_targets so they track the
+       shadow resolution; the uniforms live for the renderer's lifetime. */
+    sr->u_local_shadow_map = bgfx_create_uniform("s_localShadowMap",
+        BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    sr->u_local_shadow_vp = bgfx_create_uniform("u_localShadowVP",
+        BGFX_UNIFORM_TYPE_MAT4, JCE_MAX_LOCAL_SHADOWS);
+    sr->u_local_shadow_params = bgfx_create_uniform("u_localShadowParams",
+        BGFX_UNIFORM_TYPE_VEC4, 1);
+    sr->u_spot_shadow_slot = bgfx_create_uniform("u_spotShadowSlot",
+        BGFX_UNIFORM_TYPE_VEC4, 1);
+    sr->u_point_shadow_slot = bgfx_create_uniform("u_pointShadowSlot",
+        BGFX_UNIFORM_TYPE_VEC4, 2);   /* 8 point lanes */
+
     LOG_INFO(LOG_TAG, "[init] light env");
     /* Multi-light env. */
     sr->light_env = jce_light_env_create();
@@ -2580,6 +2922,11 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
     sr_destroy_shadow_targets(sr);
     if (BGFX_HANDLE_IS_VALID(sr->u_shadowMap)) bgfx_destroy_uniform(sr->u_shadowMap);
     if (BGFX_HANDLE_IS_VALID(sr->u_shadowVP))  bgfx_destroy_uniform(sr->u_shadowVP);
+    if (BGFX_HANDLE_IS_VALID(sr->u_local_shadow_map))    bgfx_destroy_uniform(sr->u_local_shadow_map);
+    if (BGFX_HANDLE_IS_VALID(sr->u_local_shadow_vp))     bgfx_destroy_uniform(sr->u_local_shadow_vp);
+    if (BGFX_HANDLE_IS_VALID(sr->u_local_shadow_params)) bgfx_destroy_uniform(sr->u_local_shadow_params);
+    if (BGFX_HANDLE_IS_VALID(sr->u_spot_shadow_slot))    bgfx_destroy_uniform(sr->u_spot_shadow_slot);
+    if (BGFX_HANDLE_IS_VALID(sr->u_point_shadow_slot))   bgfx_destroy_uniform(sr->u_point_shadow_slot);
 
     for (uint32_t i = 0; i < JCE_CSM_MAX_CASCADES; i++) {
         if (BGFX_HANDLE_IS_VALID(sr->u_csm_samplers[i]))
@@ -2654,6 +3001,8 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
         sr->csm_cascade_count =
             cascades < JCE_CSM_MAX_CASCADES ? cascades : JCE_CSM_MAX_CASCADES;
     }
+
+    sr_apply_view_order(view_id_base, cfg, sr->csm_cascade_count);
 
     /* Ensure wireframe is OFF before sky draws (sky's fullscreen quad must
      * render solid). The previous frame may have left it ON. Editor mode
@@ -2752,6 +3101,11 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
     if (cfg->on_after_sky)
         cfg->on_after_sky(view_id_base, sky_drawn, cfg->on_after_sky_ud);
 
+    /* Skinned animation: advance every skeletal pose ONCE here, before the
+       shadow pass records draws, caching each world-bone palette so the
+       shadow and color passes share the identical pose (no double-advance). */
+    sr_update_skinned_anims(sr, scene, &list, dt_sec);
+
     /* Shadow passes (do them BEFORE entity pass so PBR can sample). */
     if (cfg->draw_shadows) {
         /* Determine viewport from camera bounds — if absent, assume 16:9. */
@@ -2764,8 +3118,12 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
             split_lambda = scene_rendering ? scene_rendering->split_lambda : 0.5f;
         sr_draw_shadow_pass(sr, scene, camera, &list, view_id_base,
                             vp_w, vp_h, shadow_distance, split_lambda);
+        /* P1 — local (spot) shadow atlas producer, after the directional/CSM
+           pass and before the entity/color pass that samples it. */
+        sr_draw_local_shadow_pass(sr, scene, &list, view_id_base);
     } else {
         sr->shadow_use_csm = false; sr->last_csm_valid = false;
+        sr->frame_local_active = false;
     }
 
     /* Apply view-mode wireframe via the renderer. CRITICAL: this MUST come
