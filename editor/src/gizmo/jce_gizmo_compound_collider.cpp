@@ -32,6 +32,7 @@ extern "C" {
 
 #include <math.h>
 #include <stdint.h>
+#include <string.h>   /* memset / memcpy — not transitively included on GCC/libstdc++ */
 #include <string>
 #include <vector>
 #include <unordered_map>

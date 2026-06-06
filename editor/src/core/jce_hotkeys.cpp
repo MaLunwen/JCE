@@ -100,8 +100,8 @@ HotkeyEntry s_table[JCE_HK_COUNT] = {
 
 void hotkeys_path(char *out, size_t n)
 {
-    /* Sit alongside editor-config.json. */
-    std::snprintf(out, n, ".jce/hotkeys.json");
+    /* Sit alongside editor-config.json in the per-user config dir (~/.jce). */
+    jce_editor_dotjce_path("hotkeys.json", out, n);
 }
 
 int chord_imgui(JceHotkeyChord c)

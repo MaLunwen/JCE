@@ -5,8 +5,8 @@
  *   - Uses jce_process (SDL3-backed) to spawn shaderc.exe.  We never
  *     touch CreateProcess / popen / system() — keeps Windows / macOS /
  *     Linux behaviour identical and unit-testable.
- *   - Output .bin is written to a unique temp path under
- *     `<cwd>/.cache/shadergraph/`, then slurped back into memory and
+ *   - Output .bin is written to a unique temp path under the per-user
+ *     cache dir `~/.jce/cache/shadergraph/`, then slurped back into memory and
  *     the temp file is deleted.  bgfx_copy() in the engine helper
  *     duplicates the bytes again, so the editor may free its vector
  *     immediately after handing the blob to the renderer.
@@ -22,6 +22,8 @@
 #include <jce/os/core/jce_timer.h>
 #include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_renderer_caps.h>
+
+#include "core/jce_editor_config.h"   /* jce_editor_dotjce_path (~/.jce) */
 
 #include <cstdio>
 #include <cstdlib>
@@ -69,21 +71,24 @@ ProfileMap profile_for_backend(JceRendererBackend b)
 std::string make_temp_bin_path()
 {
     /* Editor UI thread only — no atomics needed. */
-    static uint32_t s_counter   = 0;
-    static bool     s_dir_ready = false;
+    static uint32_t s_counter = 0;
+    static char     s_dir[1024] = {0};
 
-    if (!s_dir_ready) {
-        jce_fs_host_create_directory(".cache/shadergraph");
-        s_dir_ready = true;
+    if (!s_dir[0]) {
+        /* Per-user cache dir (~/.jce/cache/shadergraph), deterministic and
+         * independent of CWD (a Finder/`open` double-click runs with
+         * CWD=$HOME, which scattered the cache around). */
+        jce_editor_dotjce_path("cache/shadergraph", s_dir, sizeof(s_dir));
+        jce_fs_host_create_directory(s_dir);
     }
 
     uint32_t n  = s_counter++;
     uint64_t ms = jce_time_ticks_ms();
 
-    char buf[256];
+    char buf[1100];
     std::snprintf(buf, sizeof(buf),
-                  ".cache/shadergraph/sg_%llu_%u.bin",
-                  (unsigned long long)ms, n);
+                  "%s/sg_%llu_%u.bin",
+                  s_dir, (unsigned long long)ms, n);
     return std::string(buf);
 }
 

@@ -12,6 +12,7 @@
 
 #include <jce/resource/jce_bundle_pack.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_str.h>
 #include <jce/resource/jce_archive_cook.h>
 
 #include "os/core/jce_memory.h"
@@ -1559,9 +1560,9 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                     size_t dn = strlen(dp);
                     if (dn < 4) continue;
 
-                    bool is_json = (dn >= 5 && _stricmp(dp + dn - 5, ".json") == 0);
-                    bool is_obj  = (dn >= 4 && _stricmp(dp + dn - 4, ".obj")  == 0);
-                    bool is_mtl  = (dn >= 4 && _stricmp(dp + dn - 4, ".mtl")  == 0);
+                    bool is_json = (dn >= 5 && jce_strcasecmp(dp + dn - 5, ".json") == 0);
+                    bool is_obj  = (dn >= 4 && jce_strcasecmp(dp + dn - 4, ".obj")  == 0);
+                    bool is_mtl  = (dn >= 4 && jce_strcasecmp(dp + dn - 4, ".mtl")  == 0);
                     if (!is_json && !is_obj && !is_mtl) continue;
 
                     size_t   child_sz  = 0;

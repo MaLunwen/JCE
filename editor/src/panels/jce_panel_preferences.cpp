@@ -88,7 +88,13 @@ bool             s_loaded = false;
 int              s_active_tab = 0;   /* 0=General, 1=Appearance, 2=Fonts,
                                         3=Viewport, 4=Input, 5=Paths, 6=Hotkeys */
 
-constexpr const char *PREFS_PATH = ".jce/prefs.json";
+/* Per-user config dir (~/.jce); see jce_editor_dotjce_path. */
+static const char *prefs_path(void) {
+    static char p[1024]; static bool init = false;
+    if (!init) { jce_editor_dotjce_path("prefs.json", p, sizeof(p)); init = true; }
+    return p;
+}
+#define PREFS_PATH prefs_path()
 
 int clamp_int(int v, int lo, int hi)
 {
@@ -206,9 +212,10 @@ void load_from_disk()
 
 void save_to_disk()
 {
-    /* Ensure the .jce directory exists (host_write_all also creates it
-     * but we keep this explicit for clarity). */
-    jce_fs_host_create_directory(".jce");
+    /* Ensure the per-user .jce directory (~/.jce) exists. */
+    char dir[1024];
+    jce_editor_dotjce_path(nullptr, dir, sizeof(dir));
+    jce_fs_host_create_directory(dir);
 
     JceJson *root = jce_json_object();
     if (!root) return;

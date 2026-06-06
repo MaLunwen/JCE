@@ -339,9 +339,6 @@ def conan_install(t: dict, config: str, env: dict) -> Path:
         return tc
     sync_conan_hooks()
     extra = ["-s", "build_type=Debug"] if config == "Debug" else []
-    # Pin the dependency graph for reproducible builds when a lockfile is present.
-    lock = ROOT / "conan.lock"
-    lock_flag = ["--lockfile", str(lock)] if lock.exists() else []
     # Point conan's own vcvars at the SAME VS we use (toolset 14.4x matching
     # msvc 194). Without this, conan may pick another VS line for from-source
     # dep builds (e.g. a 14.5x preview) → "vcvars_ver=14.4 toolset not found".
@@ -354,7 +351,7 @@ def conan_install(t: dict, config: str, env: dict) -> Path:
          "-pr:h", f"conan/profiles/{t['profile']}",
          "-pr:b", f"conan/profiles/{host_build_profile()}",
          "--output-folder", str(conan_dir(t)),
-         "--build=missing", *lock_flag, *vs_conf, *extra],
+         "--build=missing", *vs_conf, *extra],
         env=env, cwd=ROOT)
     if not tc.exists() and not DRY_RUN:
         die(f"conan toolchain not generated: {tc}")
@@ -385,14 +382,17 @@ def host_tool(name: str) -> Path:
 def ensure_host_tools(env: dict, tools=("jce_pak",)) -> dict[str, Path]:
     """Build host (native) tools into build/host/tools; return {name: path}.
 
-    Always builds with a NATIVE host (x64) MSVC env — NOT the caller's `env`,
+    Always builds with the NATIVE host target's env — NOT the caller's `env`,
     which on a cross build (e.g. arm64) targets the other arch and would give
     the host tools the wrong LIB/cl (LNK1104 'cannot open LIBCMT.lib').
     """
     need = [n for n in tools if not host_tool(n).exists()]
     if need:
         log(f"building host tools: {', '.join(need)}")
-        ht = dict(TARGETS[f"{HOST}-x64"]); ht["key"] = f"{HOST}-x64"; ht["cross"] = False
+        # Native host target. Use resolve_target (searches by host field) rather
+        # than the key f"{HOST}-x64": on macOS HOST=='darwin' but the TARGETS key
+        # is 'macos-x64', and the host may not even be x64 (Apple Silicon).
+        ht = resolve_target(None); ht["cross"] = False
         host_env = msvc_env(ht)   # native x64 env; caller `env` may be cross-arch
         host_conan = ROOT / "build" / "host-conan"
         tc = host_conan / "build" / "Release" / "generators" / "conan_toolchain.cmake"
@@ -562,7 +562,21 @@ def cmd_editor(args) -> None:
     preset = preset_name(t, kind)        # windows-x64-{release|debug|dist}
     bdir = preset_binary_dir(t, kind)
     conan_install(t, config, env)
-    overrides = []
+    # Pin the build variant on EVERY configure.  release & dist share one
+    # build dir (build/desktop/<stem>; exe lands in <stem>/<variant>) and the
+    # *-release presets do NOT set JCE_BUILD_VARIANT, so a prior dist/debug
+    # configure left it cached as 'dist' — making a later `--variant release`
+    # build silently emit into <stem>/dist/ and leave <stem>/release/ stale.
+    # An explicit -D always overrides the cached value.
+    overrides = [f"-DJCE_BUILD_VARIANT={args.variant}"]
+    # Same shared-build-dir hazard as JCE_BUILD_VARIANT (above): the *-dist
+    # preset caches JCE_ENABLE_PATENTED_CODECS=OFF, and the *-release presets
+    # rely on the option() default (ON), which CANNOT override an existing
+    # cache entry — so a release configure after a dist one in the same
+    # build/desktop/<stem> dir silently keeps patented codecs OFF.  Pin the
+    # variant-appropriate value on every configure (dist = OFF, else ON).
+    overrides.append(
+        f"-DJCE_ENABLE_PATENTED_CODECS={'OFF' if args.variant == 'dist' else 'ON'}")
     if t["cross"]:
         ht = ensure_host_tools(env, ("jce_pak",))
         overrides.append(f"-DJCE_PAK_EXECUTABLE={ht['jce_pak']}")
@@ -781,6 +795,94 @@ def cmd_lint(_args) -> None:
     run([sys.executable, str(ROOT / "scripts" / "lint" / "run_all.py")], cwd=ROOT)
 
 
+# ── Subcommand: checksums (aggregate dist artifacts into one SHA256SUMS) ────
+def _sha256(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _write_sha256sums(entries, out_file: Path) -> None:
+    """entries: list of (display_name, file_path).  Writes a GNU coreutils
+    `sha256sum -c`-compatible SHA256SUMS (one `<hash>  <name>` line each)."""
+    lines = []
+    for name, path in sorted(entries):
+        digest = _sha256(path)
+        lines.append(f"{digest}  {name}")
+        log(f"  {digest}  {name}")
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    if not DRY_RUN:
+        # Write bytes with explicit LF: a CRLF SHA256SUMS breaks `sha256sum -c`
+        # (the trailing \r gets glued onto each filename) on Linux/macOS.
+        out_file.write_bytes(("\n".join(lines) + "\n").encode("utf-8"))
+    log(f"wrote {out_file} ({len(entries)} artifact(s)) "
+        f"-- verify with: sha256sum -c {out_file.name}")
+
+
+def cmd_checksums(args) -> None:
+    """Aggregate dist editor binaries into one verifiable SHA256SUMS.
+
+    Cross-arch / cross-platform binaries are intentionally different (different
+    machine code / OS / toolchain), so this is NOT a single shared hash — it is
+    one file listing each artifact's own hash, the industry-standard release
+    verification model (`sha256sum -c SHA256SUMS`).
+
+    Default: collect THIS machine's per-arch dist editors into a staging dir
+    (arch-tagged names) and hash them.  --dir: hash an already-collected release
+    folder in place (use this to produce the global file after gathering every
+    platform's artifacts)."""
+    import glob as _glob
+    import shutil
+
+    # Mode 1 — hash a folder of already-collected (renamed) artifacts in place.
+    if args.dir:
+        base = Path(args.dir).resolve()
+        if not base.is_dir():
+            die(f"--dir not found: {base}")
+        entries = [(p.name, p) for p in sorted(base.iterdir())
+                   if p.is_file() and p.name != "SHA256SUMS"]
+        if not entries:
+            die(f"no files to hash in {base}")
+        _write_sha256sums(entries, base / "SHA256SUMS")
+        return
+
+    # Mode 2 (default) — collect this machine's dist editor binaries.
+    out_dir = Path(args.out).resolve() if args.out else (ROOT / "dist" / "release")
+    patterns = [
+        ROOT / "build" / "desktop" / "*" / "dist" / "jce_editor",
+        ROOT / "build" / "desktop" / "*" / "dist" / "jce_editor.exe",
+        ROOT / "build" / "desktop" / "macos-universal" / "jce_editor",
+    ]
+    found = []
+    for pat in patterns:
+        found += [Path(m) for m in _glob.glob(str(pat)) if Path(m).is_file()]
+    if not found:
+        die("no dist editor binaries under build/desktop/*/dist "
+            "(build with --dist first), or pass --dir <collected-folder>")
+
+    if not DRY_RUN:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    entries = []
+    seen = set()
+    for src in sorted(found):
+        # stem = the build/desktop/<stem> dir (e.g. windows-x64, macos-universal)
+        stem = src.parent.parent.name if src.parent.name == "dist" else src.parent.name
+        name = f"jce_editor-{stem}{src.suffix}"
+        if name in seen:
+            continue
+        seen.add(name)
+        dst = out_dir / name
+        if not DRY_RUN:
+            shutil.copy2(src, dst)
+        # Hash the source: byte-identical to the copy, and works under --dry-run
+        # (where the copy hasn't happened).
+        entries.append((name, src))
+    _write_sha256sums(entries, out_dir / "SHA256SUMS")
+
+
 # ── argparse ──────────────────────────────────────────────────────────────
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="jce.py", description="JCE unified build driver")
@@ -839,6 +941,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("targets", help="print the desktop target matrix")
     sp.set_defaults(func=cmd_targets)
+
+    sp = sub.add_parser("checksums",
+                        help="aggregate dist editor binaries into one verifiable SHA256SUMS")
+    sp.add_argument("--dir",
+                    help="hash all files in this already-collected release folder "
+                         "(writes <dir>/SHA256SUMS); use after gathering every "
+                         "platform's artifacts. Default: scan build/desktop/*/dist.")
+    sp.add_argument("--out",
+                    help="staging/output dir for default mode (default: dist/release)")
+    sp.set_defaults(func=cmd_checksums)
 
     # package: stage redistributable bundles (replaces package-*.bat)
     pkg = sub.add_parser("package", help="stage redistributable bundles (editor/game/sdk)")

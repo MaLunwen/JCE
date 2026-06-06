@@ -11,6 +11,7 @@
 extern "C" {
 #include <jce/os/core/jce_defs.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/platform/jce_host_paths.h>
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
 }
@@ -26,8 +27,41 @@ static void ensure_directory(const char *path) {
 #include "io/jce_editor_file_util.h"
 
 #define LOG_TAG       "editor_config"
-#define CONFIG_PATH   ".jce/editor-config.json"
-#define CONFIG_DIR    ".jce"
+
+/* Editor config (.jce) lives in the user's HOME directory: "~/.jce/<name>".
+ * Industry-standard per-user config location — stable across builds/installs
+ * and independent of the process CWD and the executable's location.  (The old
+ * CWD-relative ".jce" only landed in $HOME by accident on a Finder double-
+ * click; this makes it deterministic.)  $HOME via SDL (jce_host_get_user_
+ * folder); no platform #ifdef. */
+bool jce_editor_dotjce_path(const char *name, char *out, size_t cap) {
+    char home[1024];
+    bool ok = jce_host_get_user_folder(JCE_USER_FOLDER_HOME, home, sizeof(home));
+    if (ok) {
+        size_t hl = strlen(home);
+        while (hl > 0 && (home[hl - 1] == '/' || home[hl - 1] == '\\'))
+            home[--hl] = '\0';
+        if (name && *name) snprintf(out, cap, "%s/.jce/%s", home, name);
+        else               snprintf(out, cap, "%s/.jce", home);
+    } else {
+        if (name && *name) snprintf(out, cap, ".jce/%s", name);
+        else               snprintf(out, cap, ".jce");
+    }
+    return ok;
+}
+
+static const char *config_dir(void) {
+    static char d[1024]; static bool init = false;
+    if (!init) { jce_editor_dotjce_path(NULL, d, sizeof(d)); init = true; }
+    return d;
+}
+static const char *config_path(void) {
+    static char p[1024]; static bool init = false;
+    if (!init) { jce_editor_dotjce_path("editor-config.json", p, sizeof(p)); init = true; }
+    return p;
+}
+#define CONFIG_PATH   config_path()
+#define CONFIG_DIR    config_dir()
 
 /* Cached input preference flags. */
 bool jce_editor_pref_invert_scroll_zoom = false;

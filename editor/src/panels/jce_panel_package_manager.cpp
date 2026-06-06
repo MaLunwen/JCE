@@ -34,7 +34,15 @@ extern "C" {
 #include <jce/jce_version.h>
 }
 
-#define PACKAGES_PATH ".jce/packages.json"
+#include "core/jce_editor_config.h"   /* jce_editor_dotjce_path (~/.jce) */
+
+/* Per-user config dir (~/.jce); see jce_editor_dotjce_path. */
+static const char *packages_path(void) {
+    static char p[1024]; static bool init = false;
+    if (!init) { jce_editor_dotjce_path("packages.json", p, sizeof(p)); init = true; }
+    return p;
+}
+#define PACKAGES_PATH packages_path()
 
 struct PkgEntry {
     std::string name;

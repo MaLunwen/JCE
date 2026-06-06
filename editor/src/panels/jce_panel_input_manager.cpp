@@ -36,7 +36,15 @@ extern "C" {
 #include <jce/os/platform/jce_input_actions.h>
 }
 
-#define INPUT_PATH ".jce/input_actions.json"
+#include "core/jce_editor_config.h"   /* jce_editor_dotjce_path (~/.jce) */
+
+/* Per-user config dir (~/.jce); see jce_editor_dotjce_path. */
+static const char *input_path(void) {
+    static char p[1024]; static bool init = false;
+    if (!init) { jce_editor_dotjce_path("input_actions.json", p, sizeof(p)); init = true; }
+    return p;
+}
+#define INPUT_PATH input_path()
 
 struct EditBinding {
     int   type;       /* JceBindType enum value */

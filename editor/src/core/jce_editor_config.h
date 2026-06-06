@@ -7,6 +7,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -121,6 +122,14 @@ bool jce_editor_config_save(const JceEditorConfig *cfg);
 
 /* Ensure the .jce config directory exists (idempotent). */
 void jce_editor_config_ensure_dir(void);
+
+/* Build "<exe_dir>/.jce/<name>" (or "<exe_dir>/.jce" when name is NULL/empty)
+ * into `out`.  Anchored to the EXECUTABLE directory (the "launch directory",
+ * via jce_fs_host_get_base_path), NOT the process CWD: a Finder/`open`
+ * double-click runs with CWD=$HOME, so CWD-relative ".jce" dropped editor
+ * files into the home directory.  Returns false if the base path can't be
+ * resolved (out then falls back to a CWD-relative ".jce/<name>"). */
+bool jce_editor_dotjce_path(const char *name, char *out, size_t cap);
 
 /* Set defaults. */
 void jce_editor_config_defaults(JceEditorConfig *cfg);

@@ -235,9 +235,14 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.ConfigDragClickToInputText = true;  /* single-click on DragFloat enters text-input mode */
 
-    /* Ensure .jce config dir exists, then let ImGui persist layout/docking state there. */
+    /* Ensure .jce config dir exists, then let ImGui persist layout/docking
+     * state there.  Anchor imgui.ini to the executable's .jce (launch dir),
+     * NOT CWD ($HOME on a Finder double-click).  Static buffer: ImGui keeps
+     * the IniFilename pointer for the program lifetime. */
     jce_editor_config_ensure_dir();
-    io.IniFilename = ".jce/imgui.ini";
+    static char s_imgui_ini[1024];
+    jce_editor_dotjce_path("imgui.ini", s_imgui_ini, sizeof(s_imgui_ini));
+    io.IniFilename = s_imgui_ini;
     io.IniSavingRate = 1.0f;
 
     /* Clipboard. */

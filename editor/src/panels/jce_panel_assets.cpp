@@ -98,20 +98,17 @@ void ensure_assets_init(void)
 {
     if (s_assets.initialized) return;
 
-    /* Resolve the initial project root.  Priority:
+    /* Resolve the initial asset-browser root.  Priority:
      *   1. cfg.last_project (most recent open) if still valid
      *   2. cfg.recent_projects[0] if still valid
-     *   3. Launch CWD — preserves the shell-launch workflow where
-     *      running `build/.../release/jce_editor` from the project
-     *      root correctly auto-indexes the project.
-     * Filesystem roots (`/`, `X:\`) are never accepted.  Even when
-     * CWD is something massive like `$HOME` (Finder/`open` double-
-     * click on macOS), the rebuild walker enforces a hard file-count
-     * cap so the splash never blocks for an unbounded amount of
-     * time.  See jce_asset_path_index.cpp:kAutoIndexFileCap. */
-    char cwd_buf[1024]; cwd_buf[0] = '\0';
-    bool have_cwd = jce_fs_host_get_current_dir(cwd_buf, sizeof(cwd_buf));
-
+     *   3. The LAUNCH DIRECTORY = the executable's own folder
+     *      (jce_fs_host_get_base_path / SDL_GetBasePath), NOT the process
+     *      CWD.  A Finder/`open` double-click runs with CWD == $HOME (not
+     *      the .app dir); rooting the asset DB at $HOME recursively scanned
+     *      the whole home tree (jce_assetdb scan_dir is uncapped + O(N^2)
+     *      build_refs) and froze the editor on the loading frame.  The exe
+     *      directory is stable, bounded, and never $HOME regardless of how
+     *      the editor was launched.  Filesystem roots are still refused. */
     std::string resolved_root;
     {
         JceEditorConfig ecfg;
@@ -126,12 +123,15 @@ void ensure_assets_init(void)
             }
         }
     }
-    if (resolved_root.empty() && have_cwd &&
-        !is_filesystem_root(cwd_buf)) {
-        resolved_root = cwd_buf;
-    }
     if (resolved_root.empty()) {
-        resolved_root = ".";
+        char base_buf[1024];
+        if (jce_fs_host_get_base_path(base_buf, sizeof(base_buf))) {
+            size_t bl = std::strlen(base_buf);
+            while (bl > 0 && (base_buf[bl - 1] == '/' || base_buf[bl - 1] == '\\'))
+                base_buf[--bl] = '\0';
+            if (bl > 0 && !is_filesystem_root(base_buf))
+                resolved_root = base_buf;
+        }
     }
     s_assets.project_root = resolved_root;
     s_assets.current_path      = s_assets.project_root;
@@ -187,7 +187,15 @@ void ensure_assets_init(void)
 void refresh_entries(void)
 {
     s_assets.entries.clear();
-    
+
+    /* No project root mounted (no-project launch): nothing to list.
+     * Guards jce_fs_host_list_dir("") from logging a spurious
+     * "failed to read directory ''" error every refresh. */
+    if (s_assets.current_path.empty()) {
+        s_assets.needs_refresh = false;
+        return;
+    }
+
     struct ListCtx {
         std::vector<FileEntry> *entries;
         std::string current_path;

@@ -21,6 +21,9 @@ extern "C" {
 #include <jce/os/core/jce_alloc.h>
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/os/core/jce_str.h>
+#include <jce/os/core/jce_process.h>   /* fc-match (Linux fontconfig query) */
+#include <jce/os/core/jce_timer.h>
+#include <jce/os/core/jce_thread.h>
 }
 
 #define LOG_TAG "editor_style"
@@ -373,6 +376,14 @@ static bool find_system_font(const char *family, char *out, size_t out_size)
             }
         } else if (strcmp(plat, "Linux") == 0) {
             const char *dirs[] = {
+                /* CJK fonts on Debian/Ubuntu live in family SUBDIRS, not the
+                 * top level — list them so Noto CJK / WenQuanYi / Droid /
+                 * AR PL resolve (e.g. NotoSansCJK-Regular.ttc under noto/). */
+                "/usr/share/fonts/opentype/noto",
+                "/usr/share/fonts/truetype/noto",
+                "/usr/share/fonts/truetype/wqy",
+                "/usr/share/fonts/truetype/droid",
+                "/usr/share/fonts/truetype/arphic",
                 "/usr/share/fonts/truetype",
                 "/usr/share/fonts/opentype",
                 "/usr/share/fonts",
@@ -441,6 +452,65 @@ static bool find_system_font(const char *family, char *out, size_t out_size)
         }
     }
     return false;
+}
+
+/* Linux only: ask fontconfig (`fc-match`) for the best installed font for a
+   pattern — ":lang=ja", ":lang=ko", ":lang=zh-cn", or a family name.  This is
+   the native, distro/location/filename-independent way to pull a system font
+   for ANY language (no bundled font, no guessing paths).  Writes the resolved
+   absolute path to `out`.  Quiet no-op on non-Linux or if fc-match is absent. */
+static bool linux_fc_match(const char *pattern, char *out, size_t out_size)
+{
+    out[0] = '\0';
+    if (!pattern || !*pattern) return false;
+    if (jce_strcasecmp(jce_platform_name(), "Linux") != 0) return false;
+
+    /* fc-match -f %{file} "<pattern>"  — jce_process tokenises quote-aware
+       (no shell), so the quotes guard family names containing spaces. */
+    char args[256];
+    snprintf(args, sizeof(args), "-f %%{file} \"%s\"", pattern);
+
+    JceProcessConfig cfg{};
+    cfg.executable_path = "fc-match";      /* resolved via PATH */
+    cfg.arguments       = args;
+    cfg.capture_stdout  = true;
+    cfg.capture_stderr  = false;
+
+    JceProcess *p = jce_process_spawn(&cfg);
+    if (!p) return false;
+
+    char buf[1024];
+    size_t len = 0;
+    int exit_code = -1;
+    uint64_t t0 = jce_time_ticks_ms();
+    for (;;) {
+        if (len < sizeof(buf) - 1)
+            len += jce_process_read_stdout(p, buf + len, sizeof(buf) - 1 - len);
+        if (jce_process_poll_exit(p, &exit_code)) break;
+        if ((int64_t)(jce_time_ticks_ms() - t0) > 3000) {
+            jce_process_force_kill(p);
+            jce_process_destroy(p);
+            return false;
+        }
+        jce_thread_sleep_ms(2);
+    }
+    /* final drain */
+    while (len < sizeof(buf) - 1) {
+        size_t n = jce_process_read_stdout(p, buf + len, sizeof(buf) - 1 - len);
+        if (n == 0) break;
+        len += n;
+    }
+    jce_process_destroy(p);
+    buf[len] = '\0';
+    if (exit_code != 0) return false;
+
+    while (len > 0 && (buf[len-1]=='\n'||buf[len-1]=='\r'||buf[len-1]==' '||buf[len-1]=='\t'))
+        buf[--len] = '\0';
+    char *s = buf;
+    while (*s == ' ' || *s == '\t') s++;
+    if (!*s || !file_exists_readable(s)) return false;
+    jce_strlcpy(out, s, out_size);
+    return true;
 }
 
 /* Resolve final font path for a logical role.
@@ -678,17 +748,44 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
         "CJK", zh_override, "KaiTi",
         size_pixels, &merge_cfg, cjk_ranges);
     if (!cjk) {
+        /* Linux: ask fontconfig for a CJK-covering system font (Noto CJK
+           etc.).  Native, distro/location/filename independent — one font
+           covers zh + ja + ko, and cjk_ranges already include Korean. */
+        char fcpath[1024];
+        const char *cjk_patterns[] = { ":lang=zh-cn", ":lang=ja", ":lang=zh", NULL };
+        for (int i = 0; cjk_patterns[i] && !cjk; i++)
+            if (linux_fc_match(cjk_patterns[i], fcpath, sizeof(fcpath)))
+                cjk = load_font_with_fallback("CJK", fcpath, NULL,
+                                              size_pixels, &merge_cfg, cjk_ranges);
+    }
+    if (!cjk) {
         const char *cjk_fallbacks[] = {
-            "msyh",        /* Microsoft YaHei */
+            "msyh",        /* Microsoft YaHei (Windows) */
             "simhei",      /* SimHei */
             "simsun",      /* SimSun */
             "msjh",        /* JhengHei */
-            "PingFang",    /* macOS */
-            "STHeiti",     /* macOS */
-            "Hiragino",    /* macOS */
+            /* macOS — must be the EXACT system-font filename (probed as
+             * <name>.ttc/.ttf).  Bare "STHeiti"/"Hiragino" never matched:
+             * the real files are "STHeiti Medium.ttc" and the Japanese
+             * "ヒラギノ…W*.ttc" (non-ASCII), and PingFang.ttc is absent on
+             * some installs (e.g. Intel macOS) — which left zh/ja as tofu
+             * while Korean (AppleSDGothicNeo.ttc) resolved fine.  These
+             * names cover Simplified Chinese AND Japanese (Hiragino Sans GB
+             * / Arial Unicode include kana). */
+            "PingFang",          /* modern macOS (PingFang.ttc) */
+            "Hiragino Sans GB",  /* macOS — comprehensive CJK (zh + ja kana/kanji) */
+            "STHeiti Medium",    /* macOS — Chinese */
+            "STHeiti Light",
+            "Songti",            /* macOS — Chinese (Supplemental) */
+            "Arial Unicode",     /* universal CJK (zh+ja+ko) — guaranteed render */
             "wqy-microhei",/* Linux */
             "wqy-zenhei",
+            /* Linux Noto CJK ships as NotoSansCJK-Regular.ttc (one .ttc covers
+             * zh+ja+ko) under /usr/share/fonts/opentype/noto; the bare
+             * "NotoSansCJK" name never matched the -Regular suffix. */
+            "NotoSansCJK-Regular", "NotoSerifCJK-Regular",
             "NotoSansCJK", "NotoSans",
+            "DroidSansFallbackFull", "DroidSansFallback", /* fonts-droid-fallback */
             NULL };
         for (int i = 0; cjk_fallbacks[i] && !cjk; i++) {
             cjk = load_font_with_fallback(
@@ -725,10 +822,21 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
         "AppleGothic",
         "NotoSansCJK-KR",         /* Linux */
         "NotoSansKR",
+        "NotoSansCJK-Regular",    /* Linux unified Noto CJK — includes Hangul */
         "NanumGothic",
         "NanumMyeongjo",
         NULL };
-    for (int i = 0; korean_fallbacks[i]; i++) {
+    bool ko_ok = false;
+    {   /* Linux: fontconfig Korean system font first (native lookup). */
+        char fcpath[1024];
+        if (linux_fc_match(":lang=ko", fcpath, sizeof(fcpath))) {
+            ImFont *kf = load_font_with_fallback(
+                "Korean", fcpath, NULL,
+                size_pixels, &merge_cfg, korean_ranges, /*quiet_on_miss=*/true);
+            if (kf) ko_ok = true;
+        }
+    }
+    for (int i = 0; !ko_ok && korean_fallbacks[i]; i++) {
         ImFont *kf = load_font_with_fallback(
             "Korean", NULL, korean_fallbacks[i],
             size_pixels, &merge_cfg, korean_ranges,

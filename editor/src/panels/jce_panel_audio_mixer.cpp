@@ -39,8 +39,15 @@ extern "C" {
 }
 
 #include "core/jce_editor_state.h"
+#include "core/jce_editor_config.h"   /* jce_editor_dotjce_path (~/.jce) */
 
-#define MIXER_PATH ".jce/audio_mixer.json"
+/* Per-user config dir (~/.jce); see jce_editor_dotjce_path. */
+static const char *mixer_path(void) {
+    static char p[1024]; static bool init = false;
+    if (!init) { jce_editor_dotjce_path("audio_mixer.json", p, sizeof(p)); init = true; }
+    return p;
+}
+#define MIXER_PATH mixer_path()
 
 static JceAudioMixer *s_mixer            = nullptr;
 static bool           s_initialized      = false;

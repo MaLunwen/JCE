@@ -1095,6 +1095,31 @@ else()
 	add_compile_options(
 		"-ffile-prefix-map=${CMAKE_SOURCE_DIR}=."
 		"-fdebug-prefix-map=${CMAKE_SOURCE_DIR}=.")
+
+	# Size: GCC/Clang link the whole of every static lib by default, so the
+	# binary is far larger than the MSVC .exe (MSVC Release defaults to
+	# /OPT:REF + /OPT:ICF and puts debug in a separate .pdb).  Drop unused
+	# code/data to align — using each linker's own dead-strip facility.
+	if(APPLE)
+		# ld64: native atom-level dead-strip (≈ /OPT:REF; --gc-sections is a
+		# GNU-only flag and would error here).
+		add_link_options("$<$<CONFIG:Release>:-Wl,-dead_strip>")
+		if(JCE_BUILD_VARIANT STREQUAL "dist")
+			add_compile_options("$<$<CONFIG:Release>:-O2>")  # /O2-equivalent; -O3 only bloats
+		endif()
+	else()
+		# GNU ld: per-function/data sections + --gc-sections removes
+		# unreferenced functions (≈ /OPT:REF).  (ICF via gold was tried and
+		# reverted — it saved only ~0.4MB and added a linker dependency.)
+		add_compile_options("$<$<CONFIG:Release>:-ffunction-sections>"
+		                    "$<$<CONFIG:Release>:-fdata-sections>")
+		add_link_options("$<$<CONFIG:Release>:-Wl,--gc-sections>")
+		if(JCE_BUILD_VARIANT STREQUAL "dist")
+			# dist = shipping: strip symbols (like the MSVC .pdb split) + -O2.
+			add_link_options("$<$<CONFIG:Release>:-s>")
+			add_compile_options("$<$<CONFIG:Release>:-O2>")
+		endif()
+	endif()
 endif()
 
 # ------------------------------------------------------------------ #

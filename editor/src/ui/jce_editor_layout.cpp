@@ -483,15 +483,17 @@ static void cmd_toggle_fullscreen_(void) { jce_editor_toggle_fullscreen(); }
  * hide the localtime_r/localtime_s fork. */
 static void cmd_screenshot_(void)
 {
-    jce_fs_host_create_directory(".jce/screenshots");
+    char dir[1024];
+    jce_editor_dotjce_path("screenshots", dir, sizeof(dir));
+    jce_fs_host_create_directory(dir);
 
     char stamp[32];
     jce_time_format_local(jce_time_now_epoch_seconds(),
                           "%Y-%m-%d_%H-%M-%S", stamp, sizeof(stamp));
 
-    char path[256];
+    char path[1100];
     snprintf(path, sizeof(path),
-             ".jce/screenshots/jce_screenshot_%s.png", stamp);
+             "%s/jce_screenshot_%s.png", dir, stamp);
 
     if (jce_screenshot_save(path, JCE_SCREENSHOT_PNG))
         jce_toast_info("Screenshot: %s", path);
@@ -515,13 +517,15 @@ static void cmd_record_toggle_(void)
     JceRenderer *r = jce_editor_get_renderer();
     if (!r) { jce_toast_error("Record: renderer unavailable"); return; }
 
-    jce_fs_host_create_directory(".jce/recordings");
+    char dir[1024];
+    jce_editor_dotjce_path("recordings", dir, sizeof(dir));
+    jce_fs_host_create_directory(dir);
 
     char stamp[32];
     jce_time_format_local(jce_time_now_epoch_seconds(),
                           "%Y-%m-%d_%H-%M-%S", stamp, sizeof(stamp));
-    char path[256];
-    snprintf(path, sizeof(path), ".jce/recordings/rec_%s.mkv", stamp);
+    char path[1100];
+    snprintf(path, sizeof(path), "%s/rec_%s.mkv", dir, stamp);
 
     if (jce_editor_recorder_start(r, path))
         jce_toast_info("Recording -> %s (F9 to stop)", path);

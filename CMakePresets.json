@@ -11,7 +11,9 @@
       "hidden": true,
       "generator": "Ninja",
       "cacheVariables": {
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "JCE_BUILD_VARIANT": "release",
+        "JCE_ENABLE_PATENTED_CODECS": "ON"
       }
     },
     {
