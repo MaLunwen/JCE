@@ -38,8 +38,12 @@ typedef enum {
     JCE_POSTFX_VIGNETTE   = 3,   /* Edge darkening */
     JCE_POSTFX_CHROMATIC  = 4,   /* Chromatic aberration */
     JCE_POSTFX_GRAYSCALE  = 5,   /* Desaturation */
+    JCE_POSTFX_CUSTOM     = 6,   /* Client-supplied full-screen pass (data-driven; see below) */
     JCE_POSTFX_COUNT
 } JcePostFXType;
+
+/* Number of generic vec4 parameters available to the custom pass shader. */
+#define JCE_POSTFX_CUSTOM_PARAMS 8
 
 /* ================================================================== */
 /* Effect parameters                                                   */
@@ -101,6 +105,46 @@ JCE_API void jce_postfx_get_params(const JcePostFXPipeline *pipeline, JcePostFXP
 
 /* Return default parameter values. */
 JCE_API JcePostFXParams jce_postfx_default_params(void);
+
+/* ================================================================== */
+/* Custom pass (data-driven, engine is style-agnostic)                 */
+/* ================================================================== */
+/*
+ * The JCE_POSTFX_CUSTOM slot runs a client-supplied full-screen fragment
+ * shader as the final link of the chain.  The engine knows nothing about
+ * what the shader does — it simply binds a generic contract and submits a
+ * full-screen pass.  This lets an application add bespoke screen-space looks
+ * (NPR / stylize / scanlines / …) purely through data + an asset shader,
+ * without baking the effect into the engine.
+ *
+ * Shader contract (the fs the client names must declare):
+ *   SAMPLER2D(s_texColor, 0);          // current chain colour
+ *   SAMPLER2D(s_texDepth, 1);          // scene depth (valid iff u_postfxTime.y > 0.5)
+ *   uniform vec4 u_texelSize;          // (1/w, 1/h, w, h)
+ *   uniform vec4 u_postfxTime;         // x = elapsed seconds, y = has_depth (0/1)
+ *   uniform vec4 u_postfxParams[JCE_POSTFX_CUSTOM_PARAMS];  // meaning defined by the shader
+ */
+
+/* Select the custom-pass fragment shader by base name (loaded from the
+ * "postfx" shader set in the PAK passed to jce_postfx_load_shaders()).
+ * Pass NULL or "" to clear.  needs_depth requests the scene depth at stage 1.
+ * The program is (re)loaded lazily on the next apply() when the name changes. */
+JCE_API void jce_postfx_set_custom_shader(JcePostFXPipeline *pipeline,
+                                          const char *fs_name, bool needs_depth);
+
+/* Upload the generic vec4 parameter array consumed by the custom shader.
+ * `count` is the number of vec4s (clamped to JCE_POSTFX_CUSTOM_PARAMS);
+ * `vec4s` points to count*4 floats. */
+JCE_API void jce_postfx_set_custom_params(JcePostFXPipeline *pipeline,
+                                          const float *vec4s, int count);
+
+/* Read back the custom-pass configuration — used to mirror one pipeline's
+ * settings onto another (e.g. scene viewport → game viewport). */
+JCE_API void jce_postfx_get_custom_shader(const JcePostFXPipeline *pipeline,
+                                          char *out_name, int out_size,
+                                          bool *out_needs_depth);
+JCE_API int  jce_postfx_get_custom_params(const JcePostFXPipeline *pipeline,
+                                          float *out_vec4s, int max_count);
 
 /* ================================================================== */
 /* Rendering                                                           */

@@ -24,6 +24,7 @@
 
 #include <flecs.h>
 
+#include <math.h>
 #include <string.h>
 
 #define LOG_TAG "net.repl"
@@ -35,6 +36,7 @@
 #define JCE_REPL_PKT_SESSION     ((uint8_t)4)
 #define JCE_REPL_PKT_NET_TRANSFORM ((uint8_t)5)
 #define JCE_REPL_PKT_NET_TRANSFORM_V2 ((uint8_t)6)
+#define JCE_REPL_PKT_ACK         ((uint8_t)8)   /* client -> server tick ack */
 
 /* P3-D.4 transform replication seam — defined in jce_net_transform.c.
  * Declared here (not in any public header) so the dispatcher can route
@@ -61,6 +63,7 @@ typedef struct ObjectEntry {
 
 typedef struct CompEntry {
     char             *name;
+    uint16_t          name_len;   /* cached strlen(name), set at registration */
     uint32_t          version;
     uint64_t          flecs_component_id;
     uint32_t          size;
@@ -74,6 +77,42 @@ typedef struct EventListener {
     JceNetObjectEventFn fn;
     void               *user;
 } EventListener;
+
+/* ── Acked-baseline delta state (P1-networking-full) ──────────────────
+ *
+ * For each (object, component) pair the server caches the LAST PAYLOAD
+ * it sent so the next encode can diff against it and skip unchanged
+ * entries.  The baseline is keyed by net id + component index; we keep a
+ * flat array and linear-scan (object * comp counts are O(100)).  When a
+ * peer is at fault (joined late / acked nothing) the late-joiner burst
+ * resets the baseline by forcing a full send for that peer.
+ *
+ * NOTE: v1 used a single broadcast stream so a true PER-PEER baseline is
+ * not free.  We keep ONE authoritative baseline (the last broadcast) and
+ * track per-peer "needs full burst" + last-acked-tick separately; the
+ * common-case stream stays a single delta broadcast, and a freshly
+ * joined peer gets its own reliable full burst first. */
+#define JCE_REPL_BASELINE_PAYLOAD_MAX 256u
+
+typedef struct BaselineEntry {
+    JceNetObjectId id;
+    uint16_t       comp_index;
+    uint16_t       size;
+    bool           valid;
+    uint8_t        payload[JCE_REPL_BASELINE_PAYLOAD_MAX];
+} BaselineEntry;
+
+/* jce_session caps the roster at 64; mirror it here (we only need the
+ * count for the table, not the session public header). */
+#define JCE_REPL_PEER_CAP 64u
+
+typedef struct PeerState {
+    bool       used;
+    uint32_t   peer_idx;        /* JcePeerHandle.idx */
+    JceClientId client;
+    bool       needs_full_burst; /* late joiner — send baseline once    */
+    JceNetTick last_acked_tick;  /* most recent snapshot the peer acked  */
+} PeerState;
 
 typedef struct ReplState {
     bool             inited;
@@ -98,6 +137,15 @@ typedef struct ReplState {
     ecs_entity_t     net_obj_comp_id;  /* cached id for JceNetworkObjectComponent */
     EventListener    listeners[JCE_REPL_EVENT_LISTENER_CAP];
     uint32_t         next_listener_handle;
+
+    /* P1-networking-full — acked-baseline delta + interest + peers. */
+    BaselineEntry   *baselines;
+    uint32_t         baseline_count;
+    uint32_t         baseline_cap;
+    PeerState        peers[JCE_REPL_PEER_CAP];
+    float            interest_radius_sq;   /* 0 = disabled */
+    ecs_entity_t     transform_comp_id;    /* cached JceTransform id */
+    uint64_t         comp_entries_sent;    /* changed entries shipped */
 } ReplState;
 
 static ReplState g_repl;
@@ -147,6 +195,147 @@ static CompEntry *find_comp_by_name(const char *name)
     for (uint32_t i = 0; i < g_repl.comp_count; ++i)
         if (strcmp(g_repl.comps[i].name, name) == 0) return &g_repl.comps[i];
     return NULL;
+}
+
+/* P1-networking-full — index <-> component for u16 interning on the
+ * wire.  Registration order is deterministic on both peers (the engine
+ * registers replicated components in a fixed order at runtime bring-up),
+ * so an index is a stable, name-free key. */
+static CompEntry *find_comp_by_index(uint16_t idx)
+{
+    return idx < g_repl.comp_count ? &g_repl.comps[idx] : NULL;
+}
+
+/* Resolve a component's flecs id lazily from its registered name when the
+ * descriptor was registered with flecs_component_id == 0.  This lets L6
+ * callers (the runtime) register replicated scene components without
+ * pulling flecs into their TU — they pass name + size + write/read and we
+ * bind the flecs id from the attached world (mirrors the net-obj lookup). */
+static uint64_t comp_flecs_id(CompEntry *cd)
+{
+    if (cd->flecs_component_id || !cd->name || !g_repl.world)
+        return cd->flecs_component_id;
+    ecs_entity_t id = ecs_lookup(g_repl.world, cd->name);
+    if (id) cd->flecs_component_id = (uint64_t)id;
+    return cd->flecs_component_id;
+}
+
+/* ================================================================== */
+/* Internal helpers — baseline (acked delta) + peers + interest        */
+/* ================================================================== */
+
+static BaselineEntry *baseline_find(JceNetObjectId id, uint16_t comp_index)
+{
+    for (uint32_t i = 0; i < g_repl.baseline_count; ++i) {
+        BaselineEntry *b = &g_repl.baselines[i];
+        if (b->id == id && b->comp_index == comp_index) return b;
+    }
+    return NULL;
+}
+
+static BaselineEntry *baseline_get_or_push(JceNetObjectId id, uint16_t comp_index)
+{
+    BaselineEntry *b = baseline_find(id, comp_index);
+    if (b) return b;
+    if (g_repl.baseline_count == g_repl.baseline_cap) {
+        uint32_t nc = g_repl.baseline_cap ? g_repl.baseline_cap * 2u : 32u;
+        BaselineEntry *nb = (BaselineEntry *)JCE_REALLOC(
+            g_repl.baselines, sizeof(BaselineEntry) * nc);
+        if (!nb) return NULL;
+        g_repl.baselines    = nb;
+        g_repl.baseline_cap = nc;
+    }
+    b = &g_repl.baselines[g_repl.baseline_count++];
+    memset(b, 0, sizeof(*b));
+    b->id         = id;
+    b->comp_index = comp_index;
+    return b;
+}
+
+/* Drop every baseline row referencing `id` (object despawned). */
+static void baseline_drop_object(JceNetObjectId id)
+{
+    uint32_t w = 0;
+    for (uint32_t i = 0; i < g_repl.baseline_count; ++i) {
+        if (g_repl.baselines[i].id == id) continue;
+        if (w != i) g_repl.baselines[w] = g_repl.baselines[i];
+        ++w;
+    }
+    g_repl.baseline_count = w;
+}
+
+static PeerState *peer_find(uint32_t peer_idx)
+{
+    for (uint32_t i = 0; i < JCE_REPL_PEER_CAP; ++i)
+        if (g_repl.peers[i].used && g_repl.peers[i].peer_idx == peer_idx)
+            return &g_repl.peers[i];
+    return NULL;
+}
+
+static PeerState *peer_get_or_add(uint32_t peer_idx, JceClientId client)
+{
+    PeerState *p = peer_find(peer_idx);
+    if (p) { p->client = client; return p; }
+    for (uint32_t i = 0; i < JCE_REPL_PEER_CAP; ++i) {
+        if (!g_repl.peers[i].used) {
+            p = &g_repl.peers[i];
+            memset(p, 0, sizeof(*p));
+            p->used             = true;
+            p->peer_idx         = peer_idx;
+            p->client           = client;
+            p->needs_full_burst = true;   /* late joiner — burst first */
+            return p;
+        }
+    }
+    return NULL;
+}
+
+static ecs_entity_t transform_comp_id(void)
+{
+    if (g_repl.transform_comp_id || !g_repl.world)
+        return g_repl.transform_comp_id;
+    g_repl.transform_comp_id = ecs_lookup(g_repl.world, "JceTransform");
+    return g_repl.transform_comp_id;
+}
+
+/* Read an entity's local position (x,y,z) from its JceTransform.  We do
+ * NOT include jce_scene.h — the struct begins with `jce_vec3 position`
+ * (3 contiguous floats), which is all interest filtering needs. */
+static bool object_local_pos(const ObjectEntry *e, float out[3])
+{
+    if (!g_repl.world || !e || !e->entity) return false;
+    ecs_entity_t cid = transform_comp_id();
+    if (!cid) return false;
+    const void *p = ecs_get_id(g_repl.world, (ecs_entity_t)e->entity,
+                               (ecs_id_t)cid);
+    if (!p) return false;
+    memcpy(out, p, sizeof(float) * 3u);
+    return true;
+}
+
+/* Per-peer interest origin = position of the first object the peer's
+ * client owns (the player's avatar).  Returns false if the peer owns no
+ * positioned object (then we do NOT filter — everything is relevant). */
+static bool peer_interest_origin(JceClientId client, float out[3])
+{
+    for (uint32_t i = 0; i < g_repl.object_count; ++i) {
+        ObjectEntry *e = &g_repl.objects[i];
+        if (e->owner != client || e->pending_despawn) continue;
+        if (object_local_pos(e, out)) return true;
+    }
+    return false;
+}
+
+static bool object_relevant_to_origin(const ObjectEntry *e,
+                                      const float origin[3])
+{
+    if (g_repl.interest_radius_sq <= 0.0f) return true;
+    float p[3];
+    if (!object_local_pos(e, p)) return true;  /* no pos -> always send */
+    float dx = p[0] - origin[0];
+    float dy = p[1] - origin[1];
+    float dz = p[2] - origin[2];
+    return (dx * dx + dy * dy + dz * dz) <= g_repl.interest_radius_sq;
 }
 
 /* ================================================================== */
@@ -303,13 +492,15 @@ void jce_net_replication_shutdown(void)
     for (uint32_t i = 0; i < g_repl.comp_count; ++i)
         JCE_FREE(g_repl.comps[i].name);
     JCE_FREE(g_repl.comps);
+    JCE_FREE(g_repl.baselines);
     memset(&g_repl, 0, sizeof(g_repl));
 }
 
 void jce_net_replication_set_world(void *ecs_world)
 {
-    g_repl.world           = (ecs_world_t *)ecs_world;
-    g_repl.net_obj_comp_id = 0;  /* re-resolve lazily on next use */
+    g_repl.world             = (ecs_world_t *)ecs_world;
+    g_repl.net_obj_comp_id   = 0;  /* re-resolve lazily on next use */
+    g_repl.transform_comp_id = 0;  /* re-resolve lazily on next use */
 }
 
 void jce_net_replication_attach_host(JceNetHost *host) { g_repl.host = host; }
@@ -352,6 +543,37 @@ JceNetObjectId jce_net_object_spawn(const JceNetObjectDesc *desc)
     fire_event(JCE_NETOBJ_SPAWNED, e->id, e->owner);
 
     LOG_INFO(LOG_TAG, "spawn obj %u (owner=%u, entity=%llu)",
+             e->id, (unsigned)e->owner, (unsigned long long)e->entity);
+    return e->id;
+}
+
+JceNetObjectId jce_net_object_adopt(uint64_t entity, JceClientId owner,
+                                    uint16_t flags, const char *prefab_path)
+{
+    if (!g_repl.inited || !entity) return JCE_NET_OBJECT_INVALID;
+    if (g_repl.role != JCE_NET_ROLE_SERVER) {
+        LOG_WARN(LOG_TAG, "adopt() called on non-server role");
+        return JCE_NET_OBJECT_INVALID;
+    }
+
+    /* Already adopted?  Return the existing id (idempotent). */
+    JceNetObjectId existing = jce_net_object_from_entity(entity);
+    if (existing != JCE_NET_OBJECT_INVALID) return existing;
+
+    ObjectEntry *e = object_table_push();
+    if (!e) return JCE_NET_OBJECT_INVALID;
+
+    e->id            = g_repl.next_id++;
+    e->owner         = owner;
+    e->flags         = flags;
+    e->prefab_path   = strdup_jce(prefab_path);
+    e->pending_spawn = true;
+    e->entity        = entity;   /* bind the AUTHORED entity, do not ecs_new */
+
+    sync_net_obj_component(e);
+    fire_event(JCE_NETOBJ_SPAWNED, e->id, e->owner);
+
+    LOG_INFO(LOG_TAG, "adopt obj %u (owner=%u, entity=%llu)",
              e->id, (unsigned)e->owner, (unsigned long long)e->entity);
     return e->id;
 }
@@ -425,6 +647,7 @@ void jce_net_replication_register_component(const JceNetCompDesc *desc)
     CompEntry *e = &g_repl.comps[g_repl.comp_count++];
     memset(e, 0, sizeof(*e));
     e->name               = strdup_jce(desc->name);
+    e->name_len           = e->name ? (uint16_t)strlen(e->name) : 0;
     e->version            = desc->version;
     e->flecs_component_id = desc->flecs_component_id;
     e->size               = desc->size;
@@ -435,6 +658,22 @@ void jce_net_replication_register_component(const JceNetCompDesc *desc)
 }
 
 uint32_t jce_net_replication_component_count(void) { return g_repl.comp_count; }
+
+void jce_net_replication_set_interest_radius(float radius_m)
+{
+    g_repl.interest_radius_sq = (radius_m > 0.0f) ? radius_m * radius_m : 0.0f;
+}
+
+float jce_net_replication_get_interest_radius(void)
+{
+    float sq = g_repl.interest_radius_sq;
+    return sq > 0.0f ? (float)sqrt((double)sq) : 0.0f;
+}
+
+uint64_t jce_net_replication_comp_entries_sent(void)
+{
+    return g_repl.comp_entries_sent;
+}
 
 /* ================================================================== */
 /* Snapshot encode (server)                                            */
@@ -457,100 +696,227 @@ static uint8_t *scratch_get(uint32_t want)
     return g_scratch;
 }
 
-static void encode_and_broadcast(JceNetTick tick)
+/* Snapshot flags (header `flags` field). */
+#define JCE_REPL_SNAP_FLAG_FULL  ((uint16_t)0x0001u)  /* full-state burst */
+
+/* Serialise one entity's component into `scratch`; returns byte count or
+ * 0 (skip).  Shared by the delta broadcast + late-joiner burst. */
+static int comp_serialize(ObjectEntry *e, CompEntry *cd, uint8_t **out_scratch)
 {
-    WBuf w = { NULL, 0, 0, true };
+    uint64_t fid = comp_flecs_id(cd);
+    if (!cd->write || !fid) return 0;
+    const void *cptr = ecs_get_id(g_repl.world, (ecs_entity_t)e->entity,
+                                  (ecs_id_t)fid);
+    if (!cptr) return 0;
+    uint8_t *scratch = scratch_get(cd->size > 0 ? cd->size : 1024u);
+    if (!scratch) return 0;
+    int n = cd->write(scratch, cd->size ? cd->size : g_scratch_cap,
+                      cptr, cd->user);
+    if (n <= 0) return 0;
+    *out_scratch = scratch;
+    return n;
+}
 
-    /* Packet type prefix. */
-    w_u8(&w, JCE_REPL_PKT_SNAPSHOT);
-
-    /* Header. */
-    w_u32(&w, tick);
-    w_u32(&w, g_repl.last_tick_received);
-
-    /* Count spawns / despawns / comps. */
+/* Write the spawn + despawn blocks (common to delta + burst).  For a
+ * FULL burst `force_all_spawn` re-spawns EVERY live object regardless of
+ * the pending flag so a late joiner learns the whole world. */
+static void write_spawn_despawn(WBuf *w, bool force_all_spawn,
+                                uint16_t *out_spawn_n, uint16_t *out_desp_n)
+{
     uint16_t spawn_n = 0, desp_n = 0;
     for (uint32_t i = 0; i < g_repl.object_count; ++i) {
-        if (g_repl.objects[i].pending_spawn)   spawn_n++;
-        if (g_repl.objects[i].pending_despawn) desp_n++;
+        ObjectEntry *e = &g_repl.objects[i];
+        if (e->pending_despawn) { if (!force_all_spawn) desp_n++; continue; }
+        if (force_all_spawn || e->pending_spawn) spawn_n++;
     }
-    /* Full-state: every live object * every registered component. */
-    uint32_t live = 0;
-    for (uint32_t i = 0; i < g_repl.object_count; ++i)
-        if (!g_repl.objects[i].pending_despawn) live++;
-    uint32_t comp_total32 = live * g_repl.comp_count;
-    uint16_t comp_n = (comp_total32 > 0xFFFFu) ? 0xFFFFu : (uint16_t)comp_total32;
+    *out_spawn_n = spawn_n;
+    *out_desp_n = desp_n;
+}
 
-    w_u16(&w, spawn_n);
-    w_u16(&w, desp_n);
-    w_u16(&w, comp_n);
-    w_u16(&w, 0u); /* flags */
+/* Encode a snapshot for ONE recipient.  When `interest_origin` is non-
+ * NULL the per-tick component stream is interest-filtered against it.
+ * `full` forces a full-state burst (every object, every component,
+ * ignores baseline).  Returns the encoded WBuf (caller frees). */
+static void encode_snapshot_for(WBuf *w, JceNetTick tick, bool full,
+                                const float *interest_origin)
+{
+    w_u8 (w, JCE_REPL_PKT_SNAPSHOT);
+    w_u32(w, tick);
+    w_u32(w, g_repl.last_tick_received);
+
+    uint16_t spawn_n = 0, desp_n = 0;
+    write_spawn_despawn(w, full, &spawn_n, &desp_n);
+
+    /* comp_n is patched after we know how many entries we wrote. */
+    uint32_t comp_n_off = w->size;
+    w_u16(w, spawn_n);
+    w_u16(w, desp_n);
+    w_u16(w, 0u);  /* comp_n placeholder (offset comp_n_off + 4) */
+    w_u16(w, full ? JCE_REPL_SNAP_FLAG_FULL : 0u);
 
     /* Spawns. */
     for (uint32_t i = 0; i < g_repl.object_count; ++i) {
         ObjectEntry *e = &g_repl.objects[i];
-        if (!e->pending_spawn) continue;
-        w_u32(&w, e->id);
-        w_u16(&w, e->owner);
-        w_u16(&w, e->flags);
+        if (e->pending_despawn) continue;
+        if (!full && !e->pending_spawn) continue;
+        w_u32(w, e->id);
+        w_u16(w, e->owner);
+        w_u16(w, e->flags);
         uint16_t plen = e->prefab_path ? (uint16_t)strlen(e->prefab_path) : 0u;
-        w_u16(&w, plen);
-        if (plen) w_bytes(&w, e->prefab_path, plen);
+        w_u16(w, plen);
+        if (plen) w_bytes(w, e->prefab_path, plen);
     }
-    /* Despawns. */
-    for (uint32_t i = 0; i < g_repl.object_count; ++i) {
-        ObjectEntry *e = &g_repl.objects[i];
-        if (!e->pending_despawn) continue;
-        w_u32(&w, e->id);
-    }
-    /* Component deltas (full state in v1). */
-    if (comp_n > 0 && g_repl.world) {
-        uint16_t written = 0;
-        for (uint32_t i = 0; i < g_repl.object_count && written < comp_n; ++i) {
+    /* Despawns (never in a full burst — a burst describes a fresh world). */
+    if (!full) {
+        for (uint32_t i = 0; i < g_repl.object_count; ++i) {
             ObjectEntry *e = &g_repl.objects[i];
-            if (e->pending_despawn || !e->entity) continue;
-            for (uint32_t c = 0; c < g_repl.comp_count && written < comp_n; ++c) {
-                CompEntry *cd = &g_repl.comps[c];
-                if (!cd->write || !cd->flecs_component_id) continue;
-                const void *cptr = ecs_get_id(g_repl.world,
-                                              (ecs_entity_t)e->entity,
-                                              (ecs_id_t)cd->flecs_component_id);
-                if (!cptr) continue;
-                uint8_t *scratch = scratch_get(cd->size > 0 ? cd->size : 1024u);
-                if (!scratch) continue;
-                int n = cd->write(scratch,
-                                  cd->size ? cd->size : g_scratch_cap,
-                                  cptr, cd->user);
-                if (n <= 0) continue;
-                w_u32(&w, e->id);
-                uint16_t nlen = (uint16_t)strlen(cd->name);
-                w_u16(&w, nlen);
-                w_bytes(&w, cd->name, nlen);
-                w_u32(&w, cd->version);
-                w_u32(&w, (uint32_t)n);
-                w_bytes(&w, scratch, (uint32_t)n);
-                written++;
-            }
-        }
-        /* If we wrote fewer than declared (entity had no component),
-         * patch the header count.  Header layout (with type prefix):
-         *   type(1) + tick(4) + ack(4) + spawn(2) + desp(2) = 13;
-         * comp_n lives at offset 13. */
-        if (written != comp_n && w.ok && w.size >= 17) {
-            w.buf[13] = (uint8_t)( written        & 0xFFu);
-            w.buf[14] = (uint8_t)((written >> 8u) & 0xFFu);
+            if (!e->pending_despawn) continue;
+            w_u32(w, e->id);
         }
     }
 
-    if (w.ok && w.size > 0 && g_repl.host) {
-        /* P3-A.5: account snapshot packet against the NETWORK tag for
-         * its lifetime (alloc → broadcast → free below). */
-        jce_mem_profile_record_alloc(JCE_MEM_TAG_NETWORK, w.size);
-        jce_net_broadcast(g_repl.host, JCE_NET_REPL_CHANNEL,
-                          w.buf, w.size, JCE_NET_UNRELIABLE);
-        jce_mem_profile_record_free(JCE_MEM_TAG_NETWORK, w.size);
+    /* Component entries: delta (vs baseline) for the stream, or every
+     * component for a burst.  Interest filter drops far objects. */
+    uint16_t written = 0;
+    if (g_repl.world) {
+        for (uint32_t i = 0; i < g_repl.object_count; ++i) {
+            ObjectEntry *e = &g_repl.objects[i];
+            if (e->pending_despawn || !e->entity) continue;
+            if (interest_origin && !object_relevant_to_origin(e, interest_origin))
+                continue;
+            for (uint32_t c = 0; c < g_repl.comp_count; ++c) {
+                CompEntry *cd = &g_repl.comps[c];
+                uint8_t *scratch = NULL;
+                int n = comp_serialize(e, cd, &scratch);
+                if (n <= 0) continue;
+
+                if (!full) {
+                    /* Delta: skip if identical to the last broadcast and
+                     * update the baseline when changed. */
+                    BaselineEntry *b = baseline_get_or_push(e->id, (uint16_t)c);
+                    bool changed = true;
+                    if (b && b->valid && b->size == (uint16_t)n &&
+                        (uint32_t)n <= JCE_REPL_BASELINE_PAYLOAD_MAX &&
+                        memcmp(b->payload, scratch, (size_t)n) == 0) {
+                        changed = false;
+                    }
+                    if (!changed) continue;
+                    if (b && (uint32_t)n <= JCE_REPL_BASELINE_PAYLOAD_MAX) {
+                        memcpy(b->payload, scratch, (size_t)n);
+                        b->size  = (uint16_t)n;
+                        b->valid = true;
+                    }
+                }
+
+                w_u32(w, e->id);
+                w_u16(w, (uint16_t)c);     /* interned component index */
+                w_u32(w, cd->version);
+                w_u32(w, (uint32_t)n);
+                w_bytes(w, scratch, (uint32_t)n);
+                written++;
+                g_repl.comp_entries_sent++;
+            }
+        }
     }
-    JCE_FREE(w.buf);
+    /* Patch comp_n. */
+    if (w->ok && w->size >= comp_n_off + 4u) {
+        w->buf[comp_n_off + 4u] = (uint8_t)( written        & 0xFFu);
+        w->buf[comp_n_off + 5u] = (uint8_t)((written >> 8u) & 0xFFu);
+    }
+}
+
+/* Refresh the peer table from the session roster: add freshly-connected
+ * peers (flagged needs_full_burst) and drop ones that left. */
+struct PeerSweep { bool seen[JCE_REPL_PEER_CAP]; };
+
+static void peer_sweep_cb(JceClientId id, JcePeerHandle peer, void *user)
+{
+    struct PeerSweep *sw = (struct PeerSweep *)user;
+    PeerState *p = peer_get_or_add(peer.idx, id);
+    if (!p) return;
+    p->client = id;
+    for (uint32_t i = 0; i < JCE_REPL_PEER_CAP; ++i)
+        if (&g_repl.peers[i] == p) { sw->seen[i] = true; break; }
+}
+
+static void refresh_peers_from_session(void)
+{
+    if (!jce__session_owns_poll()) return;   /* no session -> no roster */
+    struct PeerSweep sw;
+    memset(&sw, 0, sizeof(sw));
+    jce__session_iter_remote_peers(peer_sweep_cb, &sw);
+    /* Drop peers that left the roster. */
+    for (uint32_t i = 0; i < JCE_REPL_PEER_CAP; ++i)
+        if (g_repl.peers[i].used && !sw.seen[i])
+            memset(&g_repl.peers[i], 0, sizeof(g_repl.peers[i]));
+}
+
+static void encode_and_broadcast(JceNetTick tick)
+{
+    if (!g_repl.host) return;
+
+    /* Bring the peer table in step with the live roster.  New peers get
+     * a one-shot reliable full burst before they join the delta stream;
+     * this is the late-joiner spawn sync. */
+    refresh_peers_from_session();
+
+    for (uint32_t i = 0; i < JCE_REPL_PEER_CAP; ++i) {
+        PeerState *p = &g_repl.peers[i];
+        if (!p->used || !p->needs_full_burst) continue;
+        WBuf w = { NULL, 0, 0, true };
+        encode_snapshot_for(&w, tick, /*full=*/true, /*interest=*/NULL);
+        if (w.ok && w.size > 0) {
+            JcePeerHandle ph = { p->peer_idx };
+            jce_mem_profile_record_alloc(JCE_MEM_TAG_NETWORK, w.size);
+            jce_net_send(g_repl.host, ph, JCE_NET_REPL_CHANNEL,
+                         w.buf, w.size, JCE_NET_RELIABLE);
+            jce_mem_profile_record_free(JCE_MEM_TAG_NETWORK, w.size);
+            LOG_INFO(LOG_TAG, "late-join burst -> client %u (peer %u, %u B)",
+                     (unsigned)p->client, (unsigned)p->peer_idx,
+                     (unsigned)w.size);
+        }
+        JCE_FREE(w.buf);
+        p->needs_full_burst = false;
+    }
+
+    /* Per-peer delta stream when interest management is on; otherwise a
+     * single shared delta broadcast (cheaper, identical to everyone).
+     * NOTE: with a shared broadcast the baseline is authoritative for the
+     * whole audience; with per-peer interest we still update ONE baseline
+     * (the union of what was sent) which can re-send an unchanged entry
+     * when it re-enters a peer's radius — acceptable + self-healing. */
+    if (g_repl.interest_radius_sq > 0.0f && jce__session_owns_poll()) {
+        uint32_t sent = 0;
+        for (uint32_t i = 0; i < JCE_REPL_PEER_CAP; ++i) {
+            PeerState *p = &g_repl.peers[i];
+            if (!p->used) continue;
+            float origin[3];
+            const float *use_origin =
+                peer_interest_origin(p->client, origin) ? origin : NULL;
+            WBuf w = { NULL, 0, 0, true };
+            encode_snapshot_for(&w, tick, /*full=*/false, use_origin);
+            if (w.ok && w.size > 0) {
+                JcePeerHandle ph = { p->peer_idx };
+                jce_mem_profile_record_alloc(JCE_MEM_TAG_NETWORK, w.size);
+                jce_net_send(g_repl.host, ph, JCE_NET_REPL_CHANNEL,
+                             w.buf, w.size, JCE_NET_UNRELIABLE);
+                jce_mem_profile_record_free(JCE_MEM_TAG_NETWORK, w.size);
+                sent++;
+            }
+            JCE_FREE(w.buf);
+        }
+        (void)sent;
+    } else {
+        WBuf w = { NULL, 0, 0, true };
+        encode_snapshot_for(&w, tick, /*full=*/false, /*interest=*/NULL);
+        if (w.ok && w.size > 0) {
+            jce_mem_profile_record_alloc(JCE_MEM_TAG_NETWORK, w.size);
+            jce_net_broadcast(g_repl.host, JCE_NET_REPL_CHANNEL,
+                              w.buf, w.size, JCE_NET_UNRELIABLE);
+            jce_mem_profile_record_free(JCE_MEM_TAG_NETWORK, w.size);
+        }
+        JCE_FREE(w.buf);
+    }
 }
 
 /* ================================================================== */
@@ -627,39 +993,72 @@ static void decode_snapshot(RBuf *r)
             break;
         }
     }
-    /* Component deltas. */
+    /* Component deltas.  v2 wire interns the component name to a u16
+     * index (registration order is identical on both peers). */
     for (uint16_t i = 0; i < comp_n; ++i) {
-        uint32_t id; uint16_t nlen; uint32_t ver, payload_sz;
-        char name[128];
+        uint32_t id; uint16_t comp_index; uint32_t ver, payload_sz;
         if (!r_u32(r, &id))         return;
-        if (!r_u16(r, &nlen))       return;
-        uint16_t ncopy = nlen < (uint16_t)(sizeof(name) - 1) ? nlen
-                                                             : (uint16_t)(sizeof(name) - 1);
-        if (nlen) {
-            if (!r_bytes(r, name, ncopy)) return;
-            if (nlen > ncopy) r->cursor += (uint32_t)(nlen - ncopy);
-        }
-        name[ncopy] = '\0';
+        if (!r_u16(r, &comp_index)) return;
         if (!r_u32(r, &ver))        return;
         if (!r_u32(r, &payload_sz)) return;
         if (r->cursor + payload_sz > r->size) return;
         const uint8_t *payload = r->buf + r->cursor;
         r->cursor += payload_sz;
 
-        CompEntry *cd = find_comp_by_name(name);
+        CompEntry *cd = find_comp_by_index(comp_index);
         ObjectEntry *e = find_object(id);
         if (!cd || !cd->read || !e || !g_repl.world || !e->entity) continue;
+        uint64_t fid = comp_flecs_id(cd);
+        if (!fid) continue;
         (void)ver; /* TODO: version negotiation */
 
         void *slot = ecs_ensure_id(g_repl.world,
                                    (ecs_entity_t)e->entity,
-                                   (ecs_id_t)cd->flecs_component_id,
+                                   (ecs_id_t)fid,
                                    (size_t)(cd->size ? cd->size : payload_sz));
         if (!slot) continue;
         if (cd->read(payload, payload_sz, slot, cd->user) <= 0) continue;
         ecs_modified_id(g_repl.world,
                         (ecs_entity_t)e->entity,
-                        (ecs_id_t)cd->flecs_component_id);
+                        (ecs_id_t)fid);
+    }
+
+    /* Ack the snapshot back to the server so it can bound its retransmit
+     * / baseline reset window.  The client has exactly one peer (the
+     * server), so a broadcast on the repl channel reaches it.  Skipped on
+     * a FULL burst is unnecessary — acking the burst tick is also useful. */
+    if (g_repl.role == JCE_NET_ROLE_CLIENT && g_repl.host) {
+        WBuf a = { NULL, 0, 0, true };
+        w_u8 (&a, JCE_REPL_PKT_ACK);
+        w_u32(&a, tick);
+        w_u16(&a, (uint16_t)g_repl.local_client_id);
+        w_u16(&a, 0u); /* reserved */
+        if (a.ok && a.size > 0)
+            jce_net_broadcast(g_repl.host, JCE_NET_REPL_CHANNEL,
+                              a.buf, a.size, JCE_NET_UNRELIABLE);
+        JCE_FREE(a.buf);
+    }
+}
+
+/* Ack decode (server).  Wire: tick u32, client u16, reserved u16.
+ * Records the most recent tick a client acknowledged so future work can
+ * cap retransmit windows / baseline staleness per peer. */
+static void decode_ack(RBuf *r)
+{
+    uint32_t acked_tick = 0;
+    uint16_t client = 0, reserved = 0;
+    if (!r_u32(r, &acked_tick)) return;
+    if (!r_u16(r, &client))     return;
+    if (!r_u16(r, &reserved))   return;
+    (void)reserved;
+    if (g_repl.role != JCE_NET_ROLE_SERVER) return;
+    for (uint32_t i = 0; i < JCE_REPL_PEER_CAP; ++i) {
+        PeerState *p = &g_repl.peers[i];
+        if (p->used && p->client == (JceClientId)client) {
+            if (acked_tick > p->last_acked_tick)
+                p->last_acked_tick = acked_tick;
+            break;
+        }
     }
 }
 
@@ -698,6 +1097,7 @@ void jce_net_replication_handle_packet(const void *data, uint32_t size)
     }
     switch (type) {
     case JCE_REPL_PKT_SNAPSHOT:  decode_snapshot(&r);     break;
+    case JCE_REPL_PKT_ACK:       decode_ack(&r);          break;
     case JCE_REPL_PKT_OWNER_CHG: decode_owner_change(&r); break;
     case JCE_REPL_PKT_RPC:
         /* Re-feed the full packet (incl. type byte) to the RPC
@@ -862,6 +1262,7 @@ void jce_net_replication_tick(JceNetTick tick)
             ObjectEntry *e = &g_repl.objects[i];
             e->pending_spawn = false;
             if (e->pending_despawn) {
+                baseline_drop_object(e->id);   /* don't carry stale deltas */
                 object_table_remove(i);
                 continue;
             }

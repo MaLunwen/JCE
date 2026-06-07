@@ -29,8 +29,18 @@
 #include <jce/resource/jce_bundle_format.h>
 #include <jce/resource/jce_bundle_deps.h>
 
+/* P0-build-bundles-cook: in-process asset cooking (textures/audio) and
+ * mesh→GLB conversion. These TUs are added to the jce_resource layer in
+ * engine/CMakeLists.txt so the packer can cook without a jce_cook subprocess. */
+#include "jce_asset_cooker.h"
+
 #include <cjson/cJSON.h>
 #include <xxhash.h>
+
+/* Mesh→GLB converter (jce_bundle_mesh_convert.cpp, same layer). */
+JCE_API int jce_bundle_convert_to_glb(const uint8_t *src, size_t src_sz,
+                                      const char *ext_hint,
+                                      uint8_t **out_buf, size_t *out_size);
 
 /* ================================================================== */
 /* Per-call context — lets static helpers reach the log/jmp without    */
@@ -536,6 +546,196 @@ static int can_read_asset(const char *vpath, const char *resource_root,
         return 0;
     JCE_FREE(raw);
     return 1;
+}
+
+/* ================================================================== */
+/* P0-build-bundles-cook: in-process asset cooking                     */
+/* ================================================================== */
+
+typedef enum {
+    COOK_CLASS_NONE = 0,
+    COOK_CLASS_TEXTURE,
+    COOK_CLASS_MODEL,
+    COOK_CLASS_AUDIO
+} CookClass;
+
+static CookClass classify_cook(const char *vpath)
+{
+    if (!vpath) return COOK_CLASS_NONE;
+    if (ends_with_ci(vpath, ".png")  || ends_with_ci(vpath, ".jpg") ||
+        ends_with_ci(vpath, ".jpeg") || ends_with_ci(vpath, ".tga") ||
+        ends_with_ci(vpath, ".bmp"))
+        return COOK_CLASS_TEXTURE;
+    if (ends_with_ci(vpath, ".obj")  || ends_with_ci(vpath, ".fbx") ||
+        ends_with_ci(vpath, ".dae")  || ends_with_ci(vpath, ".gltf") ||
+        ends_with_ci(vpath, ".glb"))
+        return COOK_CLASS_MODEL;
+    if (ends_with_ci(vpath, ".wav")  || ends_with_ci(vpath, ".ogg") ||
+        ends_with_ci(vpath, ".flac") || ends_with_ci(vpath, ".opus") ||
+        ends_with_ci(vpath, ".mp3"))
+        return COOK_CLASS_AUDIO;
+    return COOK_CLASS_NONE;
+}
+
+/* Map an import.json target_format string to a JCEASSET_TEXFMT_* value.
+ * Returns -1 for "auto"/unknown so the caller falls back to platform auto. */
+static int cook_parse_texfmt(const char *s)
+{
+    if (!s || !s[0]) return -1;
+    if (strcmp(s, "rgba8") == 0) return JCEASSET_TEXFMT_RGBA8;
+    if (strcmp(s, "bc1")   == 0) return JCEASSET_TEXFMT_BC1;
+    if (strcmp(s, "bc3")   == 0) return JCEASSET_TEXFMT_BC3;
+    if (strcmp(s, "bc5")   == 0) return JCEASSET_TEXFMT_BC5;
+    if (strcmp(s, "bc7")   == 0) return JCEASSET_TEXFMT_BC7;
+    if (strcmp(s, "astc")  == 0 || strcmp(s, "astc_4x4") == 0)
+        return JCEASSET_TEXFMT_ASTC_4x4;
+    return -1;
+}
+
+/* Tangent-space normal-map heuristic — mirror jce_asset_cooker.c so an
+ * unannotated normal map still gets BC5 (not BC3, which wrecks RG normals). */
+static int cook_path_is_normal_map(const char *path)
+{
+    if (!path) return 0;
+    char low[1024];
+    size_t n = 0;
+    for (; path[n] && n < sizeof(low) - 1; n++) {
+        char c = path[n];
+        low[n] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+    }
+    low[n] = '\0';
+    return (strstr(low, "normal") || strstr(low, "_nrm") ||
+            strstr(low, "_norm")  || strstr(low, "-normal")) ? 1 : 0;
+}
+
+/* Auto GPU format by target platform (matches jce_asset_cooker.c). */
+static int cook_auto_texfmt(const char *vpath, int target_platform)
+{
+    switch (target_platform) {
+    case JCE_COOK_PLATFORM_WINDOWS:
+    case JCE_COOK_PLATFORM_LINUX:
+    case JCE_COOK_PLATFORM_MACOS:
+        return cook_path_is_normal_map(vpath) ? JCEASSET_TEXFMT_BC5
+                                              : JCEASSET_TEXFMT_BC3;
+    case JCE_COOK_PLATFORM_ANDROID:
+    case JCE_COOK_PLATFORM_IOS:
+    case JCE_COOK_PLATFORM_WEB:
+        return JCEASSET_TEXFMT_ASTC_4x4;
+    default:
+        return JCEASSET_TEXFMT_RGBA8;
+    }
+}
+
+/* Read & parse a sibling "<vpath>.import.json" preset, if present. Returns a
+ * cJSON root the caller must cJSON_Delete, or NULL when absent/unparseable. */
+static cJSON *cook_read_import_json(const char *vpath,
+                                    const char *resource_root,
+                                    PackResolveFn resolve_fn,
+                                    void *resolve_user,
+                                    const ExternalMap *emap)
+{
+    char sp[1408];
+    snprintf(sp, sizeof(sp), "%s.import.json", vpath);
+    size_t sz = 0;
+    uint8_t *buf = read_asset(sp, resource_root, resolve_fn, resolve_user,
+                              emap, &sz);
+    if (!buf) return NULL;
+    cJSON *root = cJSON_ParseWithLength((const char *)buf, sz);
+    JCE_FREE(buf);
+    return root;
+}
+
+/* Cook one gathered asset.  On success frees `raw` and returns a freshly
+ * JCE_MALLOC'd cooked buffer (out_size set), keeping the original vpath
+ * (runtime loaders content-sniff).  On any non-cook / failure case returns
+ * `raw` unchanged so the asset still ships uncooked. */
+static uint8_t *cook_asset(const char *vpath, uint8_t *raw, size_t raw_size,
+                           const char *resource_root,
+                           PackResolveFn resolve_fn, void *resolve_user,
+                           const ExternalMap *emap, int target_platform,
+                           size_t *out_size)
+{
+    if (out_size) *out_size = raw_size;
+    if (!raw || raw_size == 0) return raw;
+
+    CookClass cls = classify_cook(vpath);
+    if (cls == COOK_CLASS_NONE) return raw;
+
+    cJSON *imp = cook_read_import_json(vpath, resource_root, resolve_fn,
+                                       resolve_user, emap);
+
+    if (cls == COOK_CLASS_TEXTURE) {
+        JceCookOptions opt = JCE_COOK_DEFAULT;
+        opt.platform         = (JceCookPlatform)target_platform;
+        opt.generate_mipmaps = true;
+        opt.texture_format   = cook_auto_texfmt(vpath, target_platform);
+        opt.max_texture_size = 0;
+        if (imp) {
+            const cJSON *tf = cJSON_GetObjectItemCaseSensitive(imp, "target_format");
+            const cJSON *gm = cJSON_GetObjectItemCaseSensitive(imp, "gen_mips");
+            const cJSON *ms = cJSON_GetObjectItemCaseSensitive(imp, "max_size");
+            if (cJSON_IsString(tf)) {
+                int f = cook_parse_texfmt(tf->valuestring);
+                if (f >= 0) opt.texture_format = f;   /* -1 => keep auto */
+            }
+            if (cJSON_IsBool(gm)) opt.generate_mipmaps = cJSON_IsTrue(gm);
+            if (cJSON_IsNumber(ms) && ms->valuedouble > 0)
+                opt.max_texture_size = (int)ms->valuedouble;
+        }
+        JceCookResult r = jce_cook_texture(raw, raw_size, &opt);
+        if (imp) cJSON_Delete(imp);
+        if (!r.success || !r.data) {
+            pack_log_warn("cook texture failed (%s): %s — shipping raw",
+                          vpath, r.error[0] ? r.error : "unknown");
+            jce_cook_result_free(&r);
+            return raw;
+        }
+        JCE_FREE(raw);
+        if (out_size) *out_size = r.size;
+        LOG("cooked texture %s (%zu -> %zu B)", vpath, raw_size, r.size);
+        return (uint8_t *)r.data;   /* JCE_MALLOC'd by the cooker */
+    }
+
+    if (cls == COOK_CLASS_AUDIO) {
+        JceCookOptions opt = JCE_COOK_DEFAULT;
+        opt.platform = (JceCookPlatform)target_platform;
+        JceCookResult r = jce_cook_audio(raw, raw_size, &opt);
+        if (imp) cJSON_Delete(imp);
+        if (!r.success || !r.data) {
+            pack_log_warn("cook audio failed (%s): %s — shipping raw",
+                          vpath, r.error[0] ? r.error : "unknown");
+            jce_cook_result_free(&r);
+            return raw;
+        }
+        JCE_FREE(raw);
+        if (out_size) *out_size = r.size;
+        LOG("cooked audio %s (%zu -> %zu B)", vpath, raw_size, r.size);
+        return (uint8_t *)r.data;
+    }
+
+    /* COOK_CLASS_MODEL — convert any Assimp-readable mesh to GLB (+meshopt).
+     * Already-GLB inputs are re-run through the converter so the meshopt
+     * dedup/vertex-cache pass still applies; if conversion fails we ship the
+     * source bytes verbatim (a .gltf/.glb still loads at runtime). */
+    if (imp) cJSON_Delete(imp);   /* model import.json (scale/normals) is
+                                     honoured by the editor importer, not the
+                                     bundle-time GLB converter; consult here
+                                     only to detect presence. */
+    {
+        const char *dot = strrchr(vpath, '.');
+        const char *ext_hint = dot ? dot + 1 : "";
+        uint8_t *glb = NULL;
+        size_t   glb_sz = 0;
+        if (jce_bundle_convert_to_glb(raw, raw_size, ext_hint, &glb, &glb_sz)
+            && glb && glb_sz > 0) {
+            JCE_FREE(raw);
+            if (out_size) *out_size = glb_sz;
+            LOG("cooked model %s (%zu -> %zu B GLB)", vpath, raw_size, glb_sz);
+            return glb;
+        }
+        pack_log_warn("convert-to-GLB failed (%s) — shipping raw", vpath);
+        return raw;
+    }
 }
 
 static int write_file(const char *path, const void *data, size_t size) {
@@ -1806,6 +2006,15 @@ static int run_build_impl(const JceBundlePackOptions *opts)
 
         XXH3_state_t *xs = XXH3_createState();
         XXH3_64bits_reset(xs);
+        /* P0-build-bundles-cook: fold the cook flag + target platform into
+         * the bundle input hash so toggling cooking or retargeting the
+         * platform invalidates the incremental-cache reuse. */
+        {
+            uint8_t cook_flag = opts->cook_assets ? 1u : 0u;
+            int     cook_plat = opts->target_platform;
+            XXH3_64bits_update(xs, &cook_flag, sizeof(cook_flag));
+            XXH3_64bits_update(xs, &cook_plat, sizeof(cook_plat));
+        }
         if (b->scene_path)
             XXH3_64bits_update(xs, b->scene_path, strlen(b->scene_path));
         /* Fold scene file content into the hash so editing only the
@@ -1843,6 +2052,21 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                     b->assets.items[i], b->id);
                 bundle_errors = 1;
                 had_errors = 1;
+            }
+            /* P0-build-bundles-cook: fold the sibling import.json so editing
+             * a preset (target_format/max_size/...) invalidates the cache. */
+            if (opts->cook_assets) {
+                char sp[1408];
+                snprintf(sp, sizeof(sp), "%s.import.json", b->assets.items[i]);
+                size_t isz = 0;
+                uint8_t *iraw = read_asset(sp, resource_root,
+                                           opts->resolve_fn, opts->resolve_user,
+                                           &emap, &isz);
+                if (iraw) {
+                    uint64_t ih = XXH3_64bits(iraw, isz);
+                    XXH3_64bits_update(xs, &ih, sizeof(ih));
+                    JCE_FREE(iraw);
+                }
             }
         }
         uint64_t input_hash = XXH3_64bits_digest(xs);
@@ -1987,9 +2211,18 @@ static int run_build_impl(const JceBundlePackOptions *opts)
             size_t rsz = 0;
             uint8_t *rraw = ext_rewrite_asset(b->assets.items[i], raw, sz,
                                               &emap, &rsz);
+            uint8_t *abuf = rraw ? rraw : raw;
+            size_t   asz  = rraw ? rsz : sz;
+            /* P0-build-bundles-cook: cook textures/audio/models in-process
+             * (BC/ASTC + meshopt-GLB). Failures fall back to raw bytes. */
+            if (opts->cook_assets)
+                abuf = cook_asset(b->assets.items[i], abuf, asz,
+                                  resource_root, opts->resolve_fn,
+                                  opts->resolve_user, &emap,
+                                  opts->target_platform, &asz);
             entries[actual].vpath    = pack_strdup(b->assets.items[i]);
-            entries[actual].raw      = rraw ? rraw : raw;
-            entries[actual].raw_size = rraw ? rsz : sz;
+            entries[actual].raw      = abuf;
+            entries[actual].raw_size = asz;
             actual++;
         }
 

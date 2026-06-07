@@ -28,6 +28,12 @@ class JCEConan(ConanFile):
     # legally neutral: it never silently enables AAC/H.264/H.265.
     default_options = {
         "bgfx/*:tools": True,
+        # Tracy in on-demand mode: it only collects/buffers profiling data
+        # while a Tracy server is actually connected. Without this, a build with
+        # JCE_ENABLE_PROFILING=ON buffers EVERY zone + alloc event in RAM forever
+        # when no profiler is attached — an unbounded leak (~20 MB/s in Play,
+        # reaching multiple GB over a session).
+        "tracy/*:on_demand": True,
     }
 
     def configure(self):

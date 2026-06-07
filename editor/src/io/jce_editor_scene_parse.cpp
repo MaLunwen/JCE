@@ -46,6 +46,14 @@ static void apply_entity_fields(uint32_t entity_id, const JceJson *obj)
     /* Engine parses all components and entity-level EditorMeta fields. */
     jce_scene_parse_entity_json(s.scene, e, obj);
 
+    /* Per-component disable bitmask (applied after the components exist). */
+    {
+        uint64_t disabled =
+            (uint64_t)jce_json_get_number(obj, "disabledComponents", 0.0);
+        if (disabled)
+            jce_scene_set_disabled_components(s.scene, e, disabled);
+    }
+
     /* Ensure every entity has a Transform. */
     if (!jce_scene_has_transform(s.scene, e)) {
         JceTransform t;
@@ -151,6 +159,10 @@ bool load_scene_from_parsed_root(const JceJson *root,
         return false;
     }
     (void)contract_minor;
+
+    /* Loading a scene during Play would swap the JceScene out from under a
+     * running runtime — stop it first. */
+    stop_play_before_scene_swap();
 
     /* Clear editor state and the ECS scene. */
     clear_scene_entities();

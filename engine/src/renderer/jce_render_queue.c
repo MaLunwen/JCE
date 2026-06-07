@@ -42,6 +42,7 @@ struct JceRenderQueue {
     JceRenderQueueStats last_stats;
     JceRqBindMaterialFn bind_material;
     void               *bind_material_user;
+    bool                no_batch;   /* transparent queues disable instancing */
 };
 
 /* ── Sort comparators ─────────────────────────────────────────────── */
@@ -127,6 +128,12 @@ void jce_rq_set_material_binder(JceRenderQueue *rq,
     if (!rq) return;
     rq->bind_material      = fn;
     rq->bind_material_user = user;
+}
+
+void jce_rq_set_no_batch(JceRenderQueue *rq, bool no_batch)
+{
+    if (!rq) return;
+    rq->no_batch = no_batch;
 }
 
 void jce_rq_destroy(JceRenderQueue *rq)
@@ -241,6 +248,15 @@ static uint32_t rq_depth_key(float d)
     return k;
 }
 
+/* Resolve the bgfx render state for an entry.  cmd.state==0 keeps the
+ * historical behaviour (opaque BGFX_STATE_DEFAULT: cull CW, depth test +
+ * write); a non-zero state carries the material's blend / cull / write
+ * flags assembled by the caller (e.g. alpha-blend transparent draws). */
+static uint64_t rq_resolve_state(const JceDrawCmd *c)
+{
+    return c->state ? c->state : BGFX_STATE_DEFAULT;
+}
+
 static void rq_submit_single(const JceRqEntry *e)
 {
     const JceDrawCmd *c = &e->cmd;
@@ -250,6 +266,7 @@ static void rq_submit_single(const JceRqEntry *e)
     bgfx_index_buffer_handle_t  ibh = { (uint16_t)c->mesh_ibh };
     bgfx_set_vertex_buffer(0, vbh, 0, UINT32_MAX);
     bgfx_set_index_buffer(ibh, 0, c->index_count);
+    bgfx_set_state(rq_resolve_state(c), 0);
 
     /* For n=1, prefer the non-instance program variant: avoids feeding a
      * 1-element instance buffer to a shader that declares per-instance
@@ -290,6 +307,7 @@ static void rq_submit_explicit_instanced(const JceRqEntry *e)
     bgfx_set_vertex_buffer(0, vbh, 0, UINT32_MAX);
     bgfx_set_index_buffer(ibh, 0, c->index_count);
     bgfx_set_instance_data_buffer(&idb, 0, e->inst_count);
+    bgfx_set_state(rq_resolve_state(c), 0);
 
     bgfx_program_handle_t prog = { c->program };
     bgfx_submit(c->view_id, prog, rq_depth_key(c->depth), BGFX_DISCARD_ALL);
@@ -317,6 +335,7 @@ static bool rq_submit_auto_batched(const JceRqEntry *entries,
     bgfx_set_vertex_buffer(0, vbh, 0, UINT32_MAX);
     bgfx_set_index_buffer(ibh, 0, c->index_count);
     bgfx_set_instance_data_buffer(&idb, 0, n);
+    bgfx_set_state(rq_resolve_state(c), 0);
 
     bgfx_program_handle_t prog = { c->program };
     bgfx_submit(c->view_id, prog, rq_depth_key(c->depth), BGFX_DISCARD_ALL);
@@ -337,7 +356,7 @@ void jce_rq_flush(JceRenderQueue *rq, const JceRenderer *renderer)
         const char *v = getenv("JCE_RQ_DISABLE_INSTANCING");
         s_disable_inst_env = (v && v[0] && v[0] != '0') ? 1 : 0;
     }
-    bool disable_instancing = s_disable_inst_env != 0;
+    bool disable_instancing = (s_disable_inst_env != 0) || rq->no_batch;
 
     JceRenderQueueStats st;
     memset(&st, 0, sizeof(st));

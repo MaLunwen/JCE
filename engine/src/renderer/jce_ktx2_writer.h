@@ -39,6 +39,17 @@ bool jce__ktx2_write_cubemap(const char    *path,
                               const uint8_t *faces,
                               uint32_t       bytes_per_pixel);
 
+/* Load a cubemap from a host-path KTX/DDS file into a bgfx cube texture.
+ *
+ *   path  host-path file (read via jce_fs_host_read_all)
+ *
+ * Returns the bgfx texture handle index (0..UINT16_MAX-1) on success, or
+ * UINT16_MAX (== bgfx invalid) on any failure (missing file, parse error,
+ * not a cubemap, GPU upload failure). The returned texture is owned by the
+ * caller and must be destroyed via the renderer's texture path. Used by the
+ * scene renderer to consume baked reflection-probe cubemaps. */
+uint16_t jce__ktx_load_cubemap(const char *path);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_KTX2_WRITER_H */

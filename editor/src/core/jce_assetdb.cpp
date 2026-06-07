@@ -78,7 +78,8 @@ JceAssetKind classify(const std::string &ext_in)
     if (e == ".lua" || e == ".js" || e == ".ts" || e == ".py"
         || e == ".c" || e == ".cpp" || e == ".h" || e == ".hpp")
         return JCE_ASSET_KIND_SCRIPT;
-    if (e == ".particle" || e == ".part") return JCE_ASSET_KIND_PARTICLE;
+    if (e == ".particle" || e == ".part"
+        || e == ".particles" || e == ".particles.json") return JCE_ASSET_KIND_PARTICLE;
     if (e == ".json" || e == ".yaml" || e == ".yml" || e == ".toml"
         || e == ".xml" || e == ".ini" || e == ".csv") return JCE_ASSET_KIND_DATA;
     return JCE_ASSET_KIND_UNKNOWN;

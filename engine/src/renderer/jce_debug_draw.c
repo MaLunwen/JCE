@@ -25,7 +25,12 @@ typedef struct {
     uint32_t abgr;
 } DebugVertex;
 
-#define MAX_DEBUG_LINES 8192
+/* Large enough to hold a full editor collider overlay: dense compound/trimesh
+ * wireframes for every prop (a graveyard scene is ~72k lines). 131072 lines =
+ * 262144 verts = 4 MB static + up to 4 MB transient/frame, comfortably under
+ * bgfx's 6 MB (393k-vert) default transient buffer. The flush clamps to what
+ * actually fits, so this never blacks out the whole overlay. */
+#define MAX_DEBUG_LINES 131072
 
 static DebugVertex s_verts[MAX_DEBUG_LINES * 2];
 static uint32_t    s_vert_count = 0;
@@ -38,7 +43,16 @@ static bgfx_vertex_layout_t s_layout;
 
 static void push_line(jce_vec3 from, jce_vec3 to, uint32_t abgr)
 {
-    if (s_vert_count + 2 > MAX_DEBUG_LINES * 2) return;
+    if (s_vert_count + 2 > MAX_DEBUG_LINES * 2) {
+        static bool s_warned = false;
+        if (!s_warned) {
+            s_warned = true;
+            jce_log_write(JCE_LOG_LEVEL_WARN, LOG_TAG, __FILE__, __LINE__,
+                "debug line buffer full (%d lines) — extra debug geometry "
+                "dropped this frame", MAX_DEBUG_LINES);
+        }
+        return;
+    }
 
     DebugVertex *a = &s_verts[s_vert_count++];
     a->x = from.x; a->y = from.y; a->z = from.z; a->abgr = abgr;
@@ -246,15 +260,19 @@ void jce_debug_draw_flush(uint16_t view_id, const JceRenderer *renderer)
         s_layout_ready = true;
     }
 
-    /* Allocate transient vertex buffer. */
+    /* Allocate transient vertex buffer. Draw as many whole lines as actually
+     * fit in the available transient memory rather than bailing on the whole
+     * batch — a partial overlay beats a blank one. */
     bgfx_transient_vertex_buffer_t tvb;
-    if (bgfx_get_avail_transient_vertex_buffer(s_vert_count, &s_layout) < s_vert_count)
-        goto done;
-    bgfx_alloc_transient_vertex_buffer(&tvb, s_vert_count, &s_layout);
+    uint32_t draw_count = s_vert_count;
+    uint32_t avail = bgfx_get_avail_transient_vertex_buffer(draw_count, &s_layout);
+    if (avail < draw_count) draw_count = avail & ~1u; /* whole lines only */
+    if (draw_count < 2) goto done;
+    bgfx_alloc_transient_vertex_buffer(&tvb, draw_count, &s_layout);
 
-    memcpy(tvb.data, s_verts, s_vert_count * sizeof(DebugVertex));
+    memcpy(tvb.data, s_verts, draw_count * sizeof(DebugVertex));
 
-    bgfx_set_transient_vertex_buffer(0, &tvb, 0, s_vert_count);
+    bgfx_set_transient_vertex_buffer(0, &tvb, 0, draw_count);
 
     /* Identity transform. */
     {

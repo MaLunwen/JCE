@@ -536,6 +536,61 @@ bool draw_fog(JceSceneRenderingSettings *rendering)
     return changed;
 }
 
+/* ── Weather + serialized Time-of-Day (P2-weather-decals-tod) ──────────
+ *
+ * Authors the scene-level JceSceneRenderingSettings weather + time-of-day
+ * fields.  Unlike the "Time of Day" preview tab below (editor-only state),
+ * these settings serialize with the scene and are driven every frame by the
+ * scene renderer (sr_drive_time_of_day / sr_drive_weather) in both the
+ * editor preview and the shipping runtime. */
+bool draw_weather_and_tod(JceSceneRenderingSettings *rendering)
+{
+    if (!ImGui::CollapsingHeader(
+            jce_editor_i18n("panel.lighting.section.weather"),
+            ImGuiTreeNodeFlags_DefaultOpen))
+        return false;
+
+    if (!rendering) {
+        ImGui::TextDisabled("%s", jce_editor_i18n("common.noScene"));
+        return false;
+    }
+
+    bool changed = false;
+
+    /* Serialized time-of-day. */
+    changed |= ImGui::Checkbox(jce_editor_i18n("panel.lighting.tod.enabled"),
+                               &rendering->tod_enabled);
+    ImGui::BeginDisabled(!rendering->tod_enabled);
+    changed |= ImGui::SliderFloat(jce_editor_i18n("panel.lighting.tod.hour"),
+                                  &rendering->tod_hour, 0.0f, 24.0f, "%.2f h");
+    changed |= ImGui::DragFloat(jce_editor_i18n("panel.lighting.tod.speed"),
+                                &rendering->tod_speed, 0.05f, 0.0f, 240.0f, "%.2f");
+    changed |= ImGui::DragFloat(jce_editor_i18n("panel.lighting.tod.latitude"),
+                                &rendering->tod_latitude, 0.5f, -90.0f, 90.0f, "%.1f");
+    changed |= ImGui::DragFloat(jce_editor_i18n("panel.lighting.tod.dawn"),
+                                &rendering->tod_dawn_hour, 0.05f, 0.0f, 24.0f, "%.2f");
+    changed |= ImGui::DragFloat(jce_editor_i18n("panel.lighting.tod.dusk"),
+                                &rendering->tod_dusk_hour, 0.05f, 0.0f, 24.0f, "%.2f");
+    ImGui::EndDisabled();
+
+    ImGui::Separator();
+
+    /* Weather. */
+    const char *wx_items[3] = {
+        jce_editor_i18n("panel.lighting.weather.clear"),
+        jce_editor_i18n("panel.lighting.weather.rain"),
+        jce_editor_i18n("panel.lighting.weather.snow"),
+    };
+    changed |= ImGui::Combo(jce_editor_i18n("panel.lighting.weather.type"),
+                            &rendering->weather_type, wx_items, 3);
+    ImGui::BeginDisabled(rendering->weather_type == 0);
+    changed |= ImGui::SliderFloat(jce_editor_i18n("panel.lighting.weather.intensity"),
+                                  &rendering->weather_intensity, 0.0f, 1.0f, "%.2f");
+    ImGui::EndDisabled();
+
+    return changed;
+}
+
 /* ── Time of Day tab (merged from jce_panel_time_of_day.cpp in P6-A.2) ─ */
 
 JceTimeOfDayConfig g_tod_cfg     = jce_time_of_day_default_config();
@@ -757,6 +812,7 @@ static void lit_draw_settings_tab(void)
     dirty |= draw_ibl();
     draw_scene_lights(scene, c);
     dirty |= draw_fog(rendering);
+    dirty |= draw_weather_and_tod(rendering);
 
     /* Cross-cut convenience: surface "Bake All Probes" here so users
      * don't have to open the Reflection Probes panel first. The actual

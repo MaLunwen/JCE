@@ -26,9 +26,10 @@ extern "C" {
 #include <jce/middleware/physics/jce_collider_cook.h>
 #include <jce/resource/jce_model_importer.h>
 #include <jce/os/core/jce_math.h>
+#include <jce/os/core/jce_log.h>
 }
 
-#include "../scene/jce_editor_scene_render.h"
+#include "scene/jce_editor_scene_render.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -59,7 +60,11 @@ const uint32_t kPalette[] = {
 };
 constexpr int kPaletteN = (int)(sizeof(kPalette) / sizeof(kPalette[0]));
 
-constexpr uint32_t kMaxTriSegs = 6000u; /* cap trimesh edge spam */
+/* Cap trimesh edge spam HARD: the overlay draws this for EVERY prop every
+ * frame, so 37 props at 6000 each blew past the debug-line buffer (~150k lines)
+ * and dropped late geometry. 800 still conveys the shape; full fitted detail is
+ * unnecessary for the overlay (select a prop for its exact shape). */
+constexpr uint32_t kMaxTriSegs = 2000u;
 
 std::unordered_map<std::string, std::vector<Seg>> s_cache;
 
@@ -173,11 +178,18 @@ void push_trimesh(std::vector<Seg> &out, const JceCookedChild *c, uint32_t col)
         push_hull_bounds(out, c, col);
         return;
     }
+    const uint32_t vc = c->vertex_count;
     uint32_t added = 0;
     for (uint32_t i = 0; i + 2 < c->index_count && added < kMaxTriSegs; i += 3) {
-        const float *a = &c->vertices[c->indices[i + 0] * 3u];
-        const float *b = &c->vertices[c->indices[i + 1] * 3u];
-        const float *d = &c->vertices[c->indices[i + 2] * 3u];
+        const uint32_t i0 = c->indices[i + 0];
+        const uint32_t i1 = c->indices[i + 1];
+        const uint32_t i2 = c->indices[i + 2];
+        /* Guard against out-of-range indices (corrupt cooked child) — an
+         * unchecked c->vertices[idx*3] read would ACCESS_VIOLATION. */
+        if (i0 >= vc || i1 >= vc || i2 >= vc) continue;
+        const float *a = &c->vertices[i0 * 3u];
+        const float *b = &c->vertices[i1 * 3u];
+        const float *d = &c->vertices[i2 * 3u];
         jce_vec3 va = v3(a[0], a[1], a[2]);
         jce_vec3 vb = v3(b[0], b[1], b[2]);
         jce_vec3 vd = v3(d[0], d[1], d[2]);
@@ -188,31 +200,38 @@ void push_trimesh(std::vector<Seg> &out, const JceCookedChild *c, uint32_t col)
     }
 }
 
-std::string make_key(const JceCompoundColliderComponent *cc)
+std::string make_key(const JceCompoundColliderComponent *cc, int detailed)
 {
     char buf[512];
-    snprintf(buf, sizeof(buf), "%s|%u|%u|%d|%d|%u|%u|%u",
+    snprintf(buf, sizeof(buf), "%s|%u|%u|%d|%d|%u|%u|%u|%d",
              cc->model_path, (unsigned)cc->mode, (unsigned)cc->split,
              cc->is_static ? 1 : 0, cc->detect_naming ? 1 : 0,
              cc->vhacd_resolution, cc->vhacd_max_hulls,
-             cc->vhacd_max_verts_per_hull);
+             cc->vhacd_max_verts_per_hull, detailed);
     return std::string(buf);
 }
 
-const std::vector<Seg> *get_or_build(const JceCompoundColliderComponent *cc)
+/* detailed=1 -> fitted triangle wireframe (Unity-style, for ONE selected prop);
+ * detailed=0 -> outer bounds box per child (cheap, for the all-props overlay so
+ * tens of thousands of trimesh lines don't get pushed every frame). */
+const std::vector<Seg> *get_or_build(const JceCompoundColliderComponent *cc,
+                                     int detailed)
 {
-    std::string key = make_key(cc);
+    std::string key = make_key(cc, detailed);
     auto it = s_cache.find(key);
     if (it != s_cache.end()) return &it->second;
 
     std::vector<Seg> segs;
 
     char host[1024];
+    host[0] = '\0';
     JceModelParts parts;
     memset(&parts, 0, sizeof(parts));
-    if (cc->model_path[0] &&
-        jce_editor_resolve_asset_path(cc->model_path, host, (int)sizeof(host)) &&
-        jce_model_importer_load_parts_file(host, &parts) && parts.count > 0) {
+    bool g_resolved = cc->model_path[0] &&
+        jce_editor_resolve_asset_path(cc->model_path, host, (int)sizeof(host));
+    bool g_loaded = g_resolved &&
+        jce_model_importer_load_parts_file(host, &parts);
+    if (g_loaded && parts.count > 0) {
 
         std::vector<JceColliderPart> in(parts.count);
         for (uint32_t i = 0; i < parts.count; ++i) {
@@ -244,15 +263,79 @@ const std::vector<Seg> *get_or_build(const JceCompoundColliderComponent *cc)
                 case JCE_SHAPE_SPHERE:        push_sphere(segs, ch, col);       break;
                 case JCE_SHAPE_CAPSULE:       push_capsule(segs, ch, col);      break;
                 case JCE_SHAPE_CONVEX_HULL:   push_hull_bounds(segs, ch, col);  break;
-                case JCE_SHAPE_TRIANGLE_MESH: push_trimesh(segs, ch, col);      break;
+                /* Detailed (selected): fitted triangle wireframe (Unity-style),
+                 * capped + index-bounds-checked. Non-detailed (overlay): outer
+                 * bounds box — keeps the all-props line load tiny + crash-safe. */
+                case JCE_SHAPE_TRIANGLE_MESH:
+                    if (detailed) push_trimesh(segs, ch, col);
+                    else          push_hull_bounds(segs, ch, col);
+                    break;
                 default:                      push_hull_bounds(segs, ch, col);  break;
                 }
             }
             jce_collider_cooked_free(&cooked);
         }
+
+        /* Fallback: the cook produced no drawable wireframe (e.g. a TRIANGLE
+         * MESH child whose vertices/indices are serialized to the .jcol blob
+         * but NOT retained in the in-memory cooked child — push_trimesh then
+         * sees null and draws nothing). Draw the model's bounding box from the
+         * loaded parts so a compound collider is never invisible in the overlay. */
+        if (segs.empty()) {
+            bool have = false;
+            float mn[3] = { 0, 0, 0 }, mx[3] = { 0, 0, 0 };
+            for (uint32_t pi = 0; pi < parts.count; ++pi) {
+                const float *vp = in[pi].vertices;
+                if (!vp) continue;
+                for (uint32_t vi = 0; vi < in[pi].vertex_count; ++vi) {
+                    const float *p = &vp[vi * 3u];
+                    if (!have) {
+                        mn[0]=mx[0]=p[0]; mn[1]=mx[1]=p[1]; mn[2]=mx[2]=p[2];
+                        have = true;
+                    } else {
+                        for (int k = 0; k < 3; ++k) {
+                            if (p[k] < mn[k]) mn[k] = p[k];
+                            if (p[k] > mx[k]) mx[k] = p[k];
+                        }
+                    }
+                }
+            }
+            if (have) {
+                jce_vec3 cr[8]; int n = 0;
+                for (int a = 0; a < 2; ++a)
+                for (int b = 0; b < 2; ++b)
+                for (int c2 = 0; c2 < 2; ++c2)
+                    cr[n++] = v3(a ? mx[0] : mn[0], b ? mx[1] : mn[1],
+                                 c2 ? mx[2] : mn[2]);
+                static const int e[12][2] = {
+                    {0,1},{0,2},{0,4},{1,3},{1,5},{2,3},
+                    {2,6},{3,7},{4,5},{4,6},{5,7},{6,7}
+                };
+                for (auto &pr : e)
+                    segs.push_back({ cr[pr[0]], cr[pr[1]], kPalette[0] });
+            }
+        }
+    }
+    /* One-shot diagnostic: pinpoint where a model fails (resolve/load/cook). */
+    {
+        static std::unordered_map<std::string, int> s_logged;
+        if (s_logged.find(key) == s_logged.end()) {
+            s_logged[key] = 1;
+            jce_log_write(JCE_LOG_LEVEL_INFO, "gizmo_cc", __FILE__, __LINE__,
+                "compound '%s' -> host '%s' resolved=%d loaded=%d parts=%u segs=%u",
+                cc->model_path, host, g_resolved ? 1 : 0, g_loaded ? 1 : 0,
+                (unsigned)parts.count, (unsigned)segs.size());
+        }
     }
     if (parts.parts) jce_model_importer_free_parts(&parts);
 
+    /* Don't cache an EMPTY result (model not yet on disk / transient load or
+     * cook miss): return a throwaway empty list and retry next frame, so a
+     * one-off miss doesn't permanently blank that model's overlay. */
+    if (segs.empty()) {
+        static const std::vector<Seg> kEmpty;
+        return &kEmpty;
+    }
     auto res = s_cache.emplace(std::move(key), std::move(segs));
     return &res.first->second;
 }
@@ -265,11 +348,12 @@ extern "C" void jce_gizmo_compound_collider_clear_cache(void)
 }
 
 extern "C" void jce_gizmo_compound_collider_draw_from_component(
-    JceScene *scene, JceEntity owner, const JceCompoundColliderComponent *cc)
+    JceScene *scene, JceEntity owner, const JceCompoundColliderComponent *cc,
+    unsigned int override_abgr, int detailed)
 {
     if (!scene || !cc) return;
 
-    const std::vector<Seg> *segs = get_or_build(cc);
+    const std::vector<Seg> *segs = get_or_build(cc, detailed);
     if (!segs || segs->empty()) return;
 
     JceTransform *t = jce_scene_get_transform(scene, owner);
@@ -283,5 +367,6 @@ extern "C" void jce_gizmo_compound_collider_draw_from_component(
     };
 
     for (const Seg &sg : *segs)
-        jce_debug_draw_line(xform(sg.a), xform(sg.b), sg.abgr);
+        jce_debug_draw_line(xform(sg.a), xform(sg.b),
+                            override_abgr ? override_abgr : sg.abgr);
 }

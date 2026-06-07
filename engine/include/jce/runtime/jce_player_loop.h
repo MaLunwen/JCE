@@ -1,8 +1,17 @@
 /*
  * jce_player_loop.h  Ordered, pluggable per-frame update phases (P3-B.1).
  *
- * Unity-parity: equivalent to UnityEngine.LowLevel.PlayerLoop.  Engine
- * subsystems and game code register callbacks against one of the 8
+ * Loosely modelled on UnityEngine.LowLevel.PlayerLoop, but it is an
+ * AUXILIARY hook system, not a full re-implementation: the engine's real
+ * per-frame work (renderer begin/submit, scene update, physics, input)
+ * still runs INLINE inside jce_engine_iterate / jce_runtime_step — it is
+ * NOT decomposed into registered phase callbacks.  These 8 phases are an
+ * ordered registration surface that fires ALONGSIDE that inline work, so
+ * subsystems and game code can hook deterministic points (current real
+ * consumers: coroutines and scene-async).  Do not assume registering a
+ * callback replaces or reorders the inline pipeline.
+ *
+ * Engine subsystems and game code register callbacks against one of the 8
  * canonical phases, each with a numeric priority (lower = earlier).
  * The application orchestrator (jce_engine_iterate) walks the phases in
  * order every frame and invokes the registered callbacks.

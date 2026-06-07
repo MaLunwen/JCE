@@ -188,11 +188,13 @@ JceRenderRecommendation jce_renderer_get_recommendation(void)
         rec.enable_pbr = true;
         rec.enable_bloom = false;
         rec.enable_fxaa = true;
-        /* Conservative defaults — mid-range integrated parts handle
-           SSAO + TAA but not SSR / volfog. */
+        /* Conservative defaults.  TAA + SSAO each need extra RGBA16F targets;
+           an integrated GPU that scored into MEDIUM (e.g. Intel HD) cannot
+           spare that on a 512MB shared-VRAM budget, so gate them on a discrete
+           GPU — mirrors the SSR gate in the HIGH tier above. */
         rec.enable_ssr            = false;
-        rec.enable_ssao           = true;
-        rec.enable_taa            = has_fp_fbo;
+        rec.enable_ssao           = has_discrete;
+        rec.enable_taa            = has_fp_fbo && has_discrete;
         rec.enable_volumetric_fog = false;
         rec.enable_gpu_particles  = has_compute;
         rec.max_texture_size = 2048;

@@ -343,7 +343,10 @@ extern "C" void jce_cloth_step_(float dt)
     JCE_PROFILE_ZONE_N("Cloth::Step");
     /* Clamp dt for stability on hitches. */
     if (dt > 1.0f / 30.0f) dt = 1.0f / 30.0f;
-    g_ctx.world->stepSimulation(dt, 1, 1.0f / 60.0f);
+    /* maxSubSteps=4 (matches the rigid world default) so cloth keeps real-time
+     * pace below 60 fps instead of running in slow motion; the dt clamp above
+     * bounds catch-up to avoid a spiral of death. */
+    g_ctx.world->stepSimulation(dt, 4, 1.0f / 60.0f);
 }
 
 extern "C" void jce_cloth_shutdown_(void)

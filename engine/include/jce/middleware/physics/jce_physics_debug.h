@@ -40,7 +40,8 @@ typedef struct JcePhysicsWorld JcePhysicsWorld;
 /* Debug-draw flags                                                    */
 /* ================================================================== */
 
-/* Bit flags — combinable.  Map 1:1 to btIDebugDraw debug-mode bits. */
+/* Bit flags — combinable.  Translated to btIDebugDraw debug-mode bits
+ * inside the Bullet bridge (the bit values do NOT line up 1:1). */
 typedef enum JcePhysicsDebugFlag {
     JCE_PHYS_DBG_NONE         = 0,
     JCE_PHYS_DBG_WIREFRAME    = 1u << 0,

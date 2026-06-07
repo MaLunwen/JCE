@@ -117,6 +117,12 @@ bool jce_json_has(const JceJson *obj, const char *key)
     return jce_json_get(obj, key) != NULL;
 }
 
+void jce_json_remove(JceJson *obj, const char *key)
+{
+    if (!obj || !key) return;
+    cJSON_DeleteItemFromObjectCaseSensitive(obj, key);
+}
+
 int jce_json_array_size(const JceJson *arr)
 {
     if (!cJSON_IsArray(arr)) return 0;

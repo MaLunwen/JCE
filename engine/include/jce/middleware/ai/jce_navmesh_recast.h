@@ -55,6 +55,14 @@ typedef struct {
 
 JCE_API void jce_recast_default_config(JceRecastConfig *out_cfg);
 
+/* Coarse stats exposed for the editor / profiler. */
+typedef struct {
+    int polygon_count;
+    int vertex_count;
+    int detail_triangle_count;
+    int build_time_ms;
+} JceRecastStats;
+
 /* ── Build / destroy ─────────────────────────────────────────────── *
  *
  * Build a navmesh from triangle soup.  Vertices are tightly-packed
@@ -69,6 +77,27 @@ JCE_API JceRecastNavMesh *jce_recast_build(const float    *vertices,
                                             const JceRecastConfig *cfg);
 
 JCE_API void jce_recast_destroy(JceRecastNavMesh *nm);
+
+/* ── Persistence (editor bake -> runtime load) ──────────────────── *
+ *
+ * jce_recast_build_to_file builds a navmesh from the same triangle
+ * soup as jce_recast_build and serialises the resulting single-tile
+ * Detour navmesh to `path` (a small JCE header + the raw dtNavMesh
+ * tile blob).  Optional `out_stats` receives the build stats.  Returns
+ * true on success.  This is the editor/cooker bake entry-point.
+ *
+ * jce_recast_load_file reads a file written by jce_recast_build_to_file
+ * and returns a ready-to-query JceRecastNavMesh (NULL on failure).
+ * This is the runtime load entry-point. */
+JCE_API bool jce_recast_build_to_file(const char     *path,
+                                      const float    *vertices,
+                                      uint32_t        vertex_count,
+                                      const uint32_t *indices,
+                                      uint32_t        triangle_count,
+                                      const JceRecastConfig *cfg,
+                                      JceRecastStats *out_stats);
+
+JCE_API JceRecastNavMesh *jce_recast_load_file(const char *path);
 
 /* ── Query API ───────────────────────────────────────────────────── *
  *
@@ -94,14 +123,6 @@ JCE_API int  jce_recast_path_fn(void *user,
 JCE_API bool jce_recast_snap_to_navmesh(const JceRecastNavMesh *nm,
                                          float wx, float wz,
                                          float *out_x, float *out_y, float *out_z);
-
-/* Coarse stats exposed for the editor / profiler. */
-typedef struct {
-    int polygon_count;
-    int vertex_count;
-    int detail_triangle_count;
-    int build_time_ms;
-} JceRecastStats;
 
 JCE_API void jce_recast_get_stats(const JceRecastNavMesh *nm,
                                     JceRecastStats *out_stats);

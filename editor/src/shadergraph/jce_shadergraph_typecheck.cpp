@@ -15,6 +15,7 @@
 
 #include "shadergraph/jce_shadergraph_typecheck.h"
 
+#include "shadergraph/jce_shadergraph_graph.h"
 #include "shadergraph/jce_shadergraph_registry.h"
 
 #include <cstdio>
@@ -24,13 +25,7 @@ namespace jce_sg {
 
 namespace {
 
-const Node *find_node_const(const Graph &g, int id)
-{
-    for (const Node &n : g.nodes) {
-        if (n.id == id) return &n;
-    }
-    return nullptr;
-}
+/* find_node now comes from jce_shadergraph_graph.h (const overload). */
 
 TypeDiag make_msg(int link, int node, const char *msg)
 {
@@ -81,8 +76,8 @@ TypeCheckResult typecheck(const Graph &g)
     for (size_t i = 0; i < g.links.size(); ++i) {
         const Link &l = g.links[i];
 
-        const Node *src = find_node_const(g, l.from_node);
-        const Node *dst = find_node_const(g, l.to_node);
+        const Node *src = find_node(g, l.from_node);
+        const Node *dst = find_node(g, l.to_node);
         if (!src || !dst) {
             TC_DIAG(r.errors, (int)i, -1,
                 "Link references missing node (link #%d).", (int)i);
@@ -137,7 +132,7 @@ TypeCheckResult typecheck(const Graph &g)
 
     /* Warn on unconnected Output inputs. */
     if (output_id >= 0) {
-        const Node *out = find_node_const(g, output_id);
+        const Node *out = find_node(g, output_id);
         if (out) {
             int n_out_socks = 0;
             const Socket *out_socks = sockets_for(out->type, &n_out_socks);

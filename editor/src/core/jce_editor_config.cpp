@@ -83,6 +83,9 @@ void jce_editor_config_defaults(JceEditorConfig *cfg) {
     cfg->recent_scene_count = 0;
     cfg->view_mode = 0;    /* JCE_VIEW_SHADED */
     cfg->show_grid = true;
+    cfg->gizmo_snap_translate = 0.5f;
+    cfg->gizmo_snap_rotate    = 15.0f;
+    cfg->gizmo_snap_scale     = 0.25f;
     cfg->asset_browser_view_mode = 0; /* ASSET_BROWSER_VIEW_GRID */
     cfg->asset_favorite_count = 0;
     /* asset_favorites left zero-initialised by the memset above. */
@@ -236,6 +239,12 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
         if (jce_json_is_bool(g))
             cfg->show_grid = jce_json_get_bool(root, "show_grid", cfg->show_grid);
     }
+    cfg->gizmo_snap_translate = (float)jce_json_get_number(
+        root, "gizmo_snap_translate", cfg->gizmo_snap_translate);
+    cfg->gizmo_snap_rotate = (float)jce_json_get_number(
+        root, "gizmo_snap_rotate", cfg->gizmo_snap_rotate);
+    cfg->gizmo_snap_scale = (float)jce_json_get_number(
+        root, "gizmo_snap_scale", cfg->gizmo_snap_scale);
     cfg->asset_browser_view_mode = cjson_read_int(root,
                                                   "asset_browser_view_mode",
                                                   cfg->asset_browser_view_mode);
@@ -377,6 +386,9 @@ bool jce_editor_config_save(const JceEditorConfig *cfg) {
     /* Scene view render settings. */
     jce_json_set_int (root, "view_mode",  cfg->view_mode);
     jce_json_set_bool(root, "show_grid",  cfg->show_grid);
+    jce_json_set_number(root, "gizmo_snap_translate", cfg->gizmo_snap_translate);
+    jce_json_set_number(root, "gizmo_snap_rotate",    cfg->gizmo_snap_rotate);
+    jce_json_set_number(root, "gizmo_snap_scale",     cfg->gizmo_snap_scale);
     jce_json_set_int (root, "asset_browser_view_mode",
                       cfg->asset_browser_view_mode);
     jce_json_set_int (root, "run_mode", cfg->run_mode);

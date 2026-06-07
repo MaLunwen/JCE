@@ -138,6 +138,17 @@ typedef struct JceNetObjectDesc {
 JCE_API JceNetObjectId JCE_CALL
 jce_net_object_spawn(const JceNetObjectDesc *desc);
 
+/* Server-side adopt.  Registers an EXISTING flecs entity (cast to u64)
+ * as a NetworkObject instead of creating a fresh one.  This is the
+ * entry the runtime uses to bridge authored scene entities carrying a
+ * JceNetworkObject component into the replication table: the scene owns
+ * the entity, replication only wraps it with a net id + ownership +
+ * spawn broadcast.  Re-adopting the same entity returns its existing id.
+ * Returns JCE_NET_OBJECT_INVALID on failure or non-server role. */
+JCE_API JceNetObjectId JCE_CALL
+jce_net_object_adopt(uint64_t entity, JceClientId owner,
+                     uint16_t flags, const char *prefab_path);
+
 /* Server-side despawn.  Removes the local entity and queues a despawn
  * broadcast on the next tick.  Silent no-op for unknown ids. */
 JCE_API void JCE_CALL jce_net_object_despawn(JceNetObjectId id);
@@ -269,6 +280,30 @@ jce_net_replication_register_component(const JceNetCompDesc *desc);
 
 /* Number of components currently registered (diagnostic). */
 JCE_API uint32_t JCE_CALL jce_net_replication_component_count(void);
+
+/* ================================================================== */
+/* Interest management (P1-networking-full)                            */
+/* ================================================================== */
+
+/* Server-side relevance radius (metres).  When > 0 the server only
+ * replicates an object's component state to a peer whose interest
+ * origin is within this radius of the object (squared-distance test).
+ * 0 disables the filter (replicate everything to everyone — the v1
+ * behaviour).  Spawn / despawn / ownership messages are NOT filtered;
+ * only the per-tick component delta stream is, so far objects still
+ * exist on every peer but stop streaming until they come back in
+ * range.  Default: 0 (off). */
+JCE_API void  JCE_CALL jce_net_replication_set_interest_radius(float radius_m);
+JCE_API float JCE_CALL jce_net_replication_get_interest_radius(void);
+
+/* ================================================================== */
+/* Bandwidth / delta diagnostics (P1-networking-full)                  */
+/* ================================================================== */
+
+/* Total component-entries sent across all snapshot encodes since init.
+ * With acked-baseline delta this counts only CHANGED entries, so it is
+ * a direct measure of how much the delta path saved versus full-state. */
+JCE_API uint64_t JCE_CALL jce_net_replication_comp_entries_sent(void);
 
 /* ================================================================== */
 /* Tick                                                                */

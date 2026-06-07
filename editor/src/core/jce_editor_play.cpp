@@ -16,14 +16,21 @@
 extern "C" {
 #include <jce/middleware/audio/jce_audio.h>
 #include <jce/middleware/physics/jce_physics.h>
+#include <jce/middleware/physics/jce_physics_layers.h>
+#include <jce/middleware/physics/jce_physics_debug.h>
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_scene_components_json.h>
+#include <jce/renderer/jce_scene_renderer.h>   /* set_anim_sm_active */
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_alloc.h>
 }
 
 #include "core/jce_assetdb.h"
+#include "core/jce_project_settings.h"
+#include "core/jce_editor_config.h"   /* jce_editor_dotjce_path (~/.jce) */
+
+#include <string>
 
 /* ── Play mode: runtime-driven ───────────────────────────────────── */
 
@@ -98,6 +105,20 @@ static uint32_t editor_play_audio_load(void * /*ud*/, JceAudio *audio,
     return snd;
 }
 
+/* ── Contact statistics (Physics Debugger) ───────────────────────── */
+
+static int s_active_contacts = 0;
+
+static void editor_contact_cb(const JceContactEvent *ev, void * /*ud*/)
+{
+    if (!ev) return;
+    if (ev->type == JCE_CONTACT_BEGIN)      ++s_active_contacts;
+    else if (ev->type == JCE_CONTACT_END && s_active_contacts > 0)
+        --s_active_contacts;
+}
+
+int jce_editor_play_get_active_contacts(void) { return s_active_contacts; }
+
 /* ── Play mode API ───────────────────────────────────────────────── */
 
 void jce_state_play(void)
@@ -112,6 +133,37 @@ void jce_state_play(void)
     if (!s_play_audio)
         LOG_WARN(LOG_TAG, "failed to create audio engine for play mode");
 
+    /* Project Settings → play session.  Pull the cached snapshot once and
+     * govern this run with it (Time fixed timestep, Physics gravity, Audio
+     * master mix).  RuntimeDesc has no audio field, so audio settings are
+     * applied directly to the engine we just created — before the runtime
+     * spawns its AudioSource voices below. */
+    const JceProjectSettings *ps = jce_project_settings_current();
+
+    if (s_play_audio && ps) {
+        if (ps->audio.disable_audio) {
+            jce_audio_set_master_volume(s_play_audio, 0.0f);
+        } else {
+            jce_audio_set_master_volume(s_play_audio, ps->audio.master_volume);
+            jce_audio_set_doppler_factor(s_play_audio, ps->audio.doppler_factor);
+        }
+    }
+
+    /* Bridge the project Layer Collision Matrix + layer names into the
+     * engine's process-wide physics matrix.  jce_physics_body_set_layer
+     * (applied per body at spawn inside jce_runtime_create below) reads
+     * this engine matrix, so the push must happen first. */
+    if (ps) {
+        for (uint32_t i = 0; i < JCE_PS_LAYER_COUNT; ++i) {
+            jce_physics_layer_set_name(i, ps->tags_layers.layers[i]);
+            for (uint32_t j = i; j < JCE_PS_LAYER_COUNT; ++j) {
+                bool collides =
+                    (ps->physics.layer_collision_matrix[i] >> j) & 1u;
+                jce_physics_set_layer_collides(i, j, collides);
+            }
+        }
+    }
+
     JceRuntimeDesc rd;
     memset(&rd, 0, sizeof(rd));
     rd.scene          = s.scene;
@@ -120,6 +172,51 @@ void jce_state_play(void)
     rd.enable_physics = true;
     rd.audio_load_fn  = editor_play_audio_load;
     rd.user_data      = NULL;
+    /* Govern the sim with Project Settings (Time / Physics).  Leave 0 for
+     * any field the project doesn't override — jce_runtime_create falls
+     * back to its own defaults (1/60 timestep, -9.81 gravity). */
+    if (ps) {
+        rd.fixed_timestep = ps->time.fixed_timestep;
+        rd.gravity_y      = ps->physics.gravity[1];
+    }
+    /* Seed the runtime mixer from the same audio_mixer.json the Audio Mixer
+     * panel writes (~/.jce), so Music/SFX/Voice slider edits drive Play-mode
+     * bus volumes.  Missing file => runtime falls back to default buses. */
+    static char s_mixer_cfg[1024];
+    if (jce_editor_dotjce_path("audio_mixer.json", s_mixer_cfg,
+                               sizeof(s_mixer_cfg)))
+        rd.mixer_config_path = s_mixer_cfg;
+    /* Navmesh: hand the runtime the .navmesh.bin baked by the NavMesh panel
+     * as a sibling of the current scene (same basename, .navmesh.bin).  The
+     * runtime loads it + stands up the nav-agent set; missing file disables
+     * navigation. */
+    static char s_navmesh_bin[1024];
+    const char *play_scene_path = jce_state_get_current_scene_path();
+    if (play_scene_path && play_scene_path[0]) {
+        std::string np = play_scene_path;
+        const char *sfxs[] = { ".scene.json", ".json" };
+        for (const char *sfx : sfxs) {
+            size_t sl = strlen(sfx);
+            if (np.size() >= sl && np.compare(np.size() - sl, sl, sfx) == 0) {
+                np.erase(np.size() - sl);
+                break;
+            }
+        }
+        np += ".navmesh.bin";
+        if (jce_fs_host_exists_file(np.c_str())) {
+            snprintf(s_navmesh_bin, sizeof(s_navmesh_bin), "%s", np.c_str());
+            rd.navmesh_path = s_navmesh_bin;
+        }
+    }
+    /* Save snapshots: write SavePoint checkpoints to "<project>/saves" — the
+     * same directory the Save Browser panel scans.  Missing project => leave
+     * empty (the runtime still registers the snapshot provider). */
+    static char s_saves_dir[1024];
+    const char *proj_root = jce_editor_assets_get_project();
+    if (proj_root && proj_root[0]) {
+        snprintf(s_saves_dir, sizeof(s_saves_dir), "%s/saves", proj_root);
+        rd.saves_dir = s_saves_dir;
+    }
     s_play_runtime    = jce_runtime_create(&rd);
     if (!s_play_runtime) {
         LOG_ERROR(LOG_TAG, "failed to create play runtime");
@@ -127,7 +224,15 @@ void jce_state_play(void)
         return;
     }
 
+    /* Subscribe to contact events so the Physics Debugger can show live
+     * active-contact counts (also activates engine manifold diffing). */
+    s_active_contacts = 0;
+    jce_runtime_set_contact_listener(s_play_runtime, editor_contact_cb, NULL);
+
     jce_editor_scene_reset_anim_timer();
+    /* Let bound animation state machines own active_clip while playing (in the
+     * editor they stay idle so manual clip preview keeps working). */
+    jce_scene_renderer_set_anim_sm_active(jce_editor_get_scene_renderer(), true);
     s.play_state = JCE_PLAY_PLAYING;
     LOG_INFO(LOG_TAG, "play mode started");
 }
@@ -151,6 +256,7 @@ void jce_state_stop(void)
 
     if (s_play_runtime) { jce_runtime_destroy(s_play_runtime); s_play_runtime = NULL; }
     if (s_play_audio)   { jce_audio_destroy(s_play_audio);     s_play_audio   = NULL; }
+    s_active_contacts = 0;
 
     if (s_play_snapshot_valid) {
         history_restore_snapshot(s_play_snapshot, "play-stop-restore");
@@ -160,10 +266,21 @@ void jce_state_stop(void)
 
     s.play_state = JCE_PLAY_STOPPED;
     jce_editor_scene_reset_anim_timer();
+    /* Back to editor preview: SM idle, manual clip selection previews again. */
+    jce_scene_renderer_set_anim_sm_active(jce_editor_get_scene_renderer(), false);
     LOG_INFO(LOG_TAG, "play mode stopped");
 }
 
 JcePlayState jce_state_get_play_state(void) { return s.play_state; }
+
+void stop_play_before_scene_swap(void)
+{
+    if (jce_state_get_play_state() != JCE_PLAY_STOPPED) {
+        LOG_INFO(LOG_TAG, "auto-stopping play mode before scene swap "
+                          "(new/open/load during Play)");
+        jce_state_stop();
+    }
+}
 
 void jce_state_step(float dt)
 {
@@ -212,11 +329,11 @@ JcePhysicsWorld *jce_editor_play_get_physics_world(void)
 struct ClipEntry {
     uint32_t    id;
     char        name[JCE_MAX_ENTITY_NAME];
-    JceTagColor tag_color;
-    char        tag[JCE_MAX_TAG_STRING];
-    bool        prefab_instance;
-    char        prefab_path[JCE_MAX_PREFAB_PATH];
-    std::string components_json;     /* serialized component array, may be empty */
+    /* Full subtree snapshot (entity tree node JSON: name/components/children).
+     * Captured via serialize_entity_tree_json() so copy/paste preserves the
+     * entire child hierarchy and every component type, not just a flat
+     * component array on a single entity. */
+    std::string tree_json;
 };
 
 #include <vector>
@@ -234,25 +351,21 @@ static bool clip_capture(uint32_t id, ClipEntry *out)
 {
     if (!jce_state_entity_exists(id)) return false;
     const char *name = jce_state_entity_name(id);
-    const char *tag  = jce_state_entity_tag(id);
-    const char *pp   = jce_state_entity_prefab_path(id);
     out->id = id;
     snprintf(out->name, sizeof(out->name), "%s", name ? name : "Entity");
-    out->tag_color = jce_state_entity_tag_color(id);
-    snprintf(out->tag, sizeof(out->tag), "%s", tag ? tag : "");
-    out->prefab_instance = jce_state_entity_is_prefab(id);
-    snprintf(out->prefab_path, sizeof(out->prefab_path), "%s", pp ? pp : "");
-    out->components_json.clear();
+    out->tree_json.clear();
 
     if (s.scene) {
-        JceJson *arr = jce_scene_serialize_entity_components(s.scene, (JceEntity)id);
-        if (arr) {
-            char *txt = jce_json_print(arr, false);
+        /* Serialize the full subtree (root + transitive children + every
+         * component type) — single source of truth for prefab/scene save. */
+        JceJson *node = serialize_entity_tree_json(id);
+        if (node) {
+            char *txt = jce_json_print(node, false);
             if (txt) {
-                out->components_json.assign(txt);
+                out->tree_json.assign(txt);
                 jce_json_free_string(txt);
             }
-            jce_json_free(arr);
+            jce_json_free(node);
         }
     }
     return true;
@@ -261,39 +374,23 @@ static bool clip_capture(uint32_t id, ClipEntry *out)
 static uint32_t clip_paste_one(const ClipEntry &e, uint32_t parent_id,
                                 const char *name_suffix)
 {
-    char paste_name[JCE_MAX_ENTITY_NAME];
-    snprintf(paste_name, sizeof(paste_name), "%s%s",
-             e.name, name_suffix ? name_suffix : "");
-    uint32_t new_id = jce_state_create_entity(paste_name, parent_id);
-    if (new_id == 0) return 0;
+    if (!s.scene || e.tree_json.empty()) return 0;
 
-    jce_state_set_entity_tag(new_id, e.tag);
-    jce_state_set_entity_tag_color(new_id, e.tag_color);
+    JceJson *node = jce_json_parse(e.tree_json.c_str(), e.tree_json.size());
+    if (!node) return 0;
 
-    if (e.prefab_instance && s.scene) {
-        JceEditorMeta *m = jce_scene_get_editor_meta(s.scene, (JceEntity)new_id);
-        if (m) {
-            m->prefab_instance = true;
-            snprintf(m->prefab_path, sizeof(m->prefab_path), "%s",
-                     e.prefab_path);
-        }
+    /* Apply the paste suffix to the root node's name before rebuilding. */
+    if (name_suffix && name_suffix[0] != '\0') {
+        const char *base = jce_json_get_string(node, "name", e.name);
+        char paste_name[JCE_MAX_ENTITY_NAME];
+        snprintf(paste_name, sizeof(paste_name), "%s%s",
+                 base ? base : e.name, name_suffix);
+        jce_json_set_string(node, "name", paste_name);
     }
 
-    if (s.scene && !e.components_json.empty()) {
-        JceJson *arr = jce_json_parse(e.components_json.c_str(),
-                                      e.components_json.size());
-        if (arr) {
-            JceJson *wrapper = jce_json_object();
-            if (wrapper) {
-                jce_json_set_child(wrapper, "components", arr);
-                jce_scene_parse_entity_json(s.scene,
-                                            (JceEntity)new_id, wrapper);
-                jce_json_free(wrapper); /* frees nested arr too */
-            } else {
-                jce_json_free(arr);
-            }
-        }
-    }
+    /* Rebuild the entire subtree (root + children + all components). */
+    uint32_t new_id = load_entity_tree_node(node, parent_id);
+    jce_json_free(node);
     return new_id;
 }
 
@@ -327,6 +424,27 @@ bool jce_state_has_copied(void)
     return !s_clip_entries.empty();
 }
 
+/* True if `id` has any ancestor that is itself present in the selection.
+ * Such an entity is already captured inside its ancestor's subtree, so
+ * capturing it again would paste a duplicate. */
+static bool clip_id_in_set(const uint32_t *ids, int count, uint32_t id)
+{
+    for (int i = 0; i < count; i++)
+        if (ids[i] == id) return true;
+    return false;
+}
+
+static bool clip_has_selected_ancestor(const uint32_t *ids, int count,
+                                        uint32_t id)
+{
+    uint32_t p = jce_state_entity_parent(id);
+    while (p != 0) {
+        if (clip_id_in_set(ids, count, p)) return true;
+        p = jce_state_entity_parent(p);
+    }
+    return false;
+}
+
 void jce_state_copy_entities(const uint32_t *ids, int count, bool cut)
 {
     s_clip_entries.clear();
@@ -335,6 +453,10 @@ void jce_state_copy_entities(const uint32_t *ids, int count, bool cut)
     if (!ids || count <= 0) return;
     s_clip_entries.reserve((size_t)count);
     for (int i = 0; i < count; i++) {
+        /* Skip entities already nested under another selected entity —
+         * subtree capture would otherwise duplicate them. */
+        if (clip_has_selected_ancestor(ids, count, ids[i]))
+            continue;
         ClipEntry e;
         if (clip_capture(ids[i], &e))
             s_clip_entries.push_back(e);

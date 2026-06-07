@@ -16,6 +16,7 @@
 #include <jce/renderer/jce_occlusion_culler.h>
 #include <jce/renderer/jce_postfx.h>
 #include <jce/renderer/jce_texture_types.h>
+#include <jce/renderer/jce_decals.h>
 #include <jce/middleware/world/jce_time_of_day.h>
 #include <jce/renderer/jce_volumetric_fog.h>
 
@@ -258,6 +259,12 @@ JCE_API void jce_scene_renderer_get_cull_stats(const JceSceneRenderer *sr,
 JCE_API void jce_scene_renderer_set_global_lod(JceSceneRenderer *sr,
                                                 const JceLodGroup *group);
 
+/* When active (Play), a bound animation state machine drives active_clip;
+ * when inactive (editor preview, the default), the SM stays idle so manual
+ * clip selection previews normally. The editor flips this on play start/stop. */
+JCE_API void jce_scene_renderer_set_anim_sm_active(JceSceneRenderer *sr,
+                                                   bool active);
+
 /* Access built-in primitive meshes the renderer creates internally:
  * 0=cube, 1=sphere, 2=plane, 3=capsule, 4=cylinder.
  * Returns NULL for invalid shape or if the renderer is not initialised.
@@ -282,6 +289,14 @@ struct JceModel;
  * second cache of their own (which would never advance). */
 JCE_API struct JceAnimPlayer *jce_scene_renderer_get_anim_player(
     JceSceneRenderer *sr, const char *skeleton_path);
+
+/* Live state-machine binding for an entity's skeletal animator (created once
+ * its sm_path is set). NULL until the SM has been bound. Gameplay/editor code
+ * drives transitions through it:
+ *   JceAnimSmBinding *b = jce_scene_renderer_get_anim_sm(sr, (uint32_t)e);
+ *   if (b) jce_anim_sm_binding_set_float(b, "Speed", v); */
+JCE_API struct JceAnimSmBinding *jce_scene_renderer_get_anim_sm(
+    JceSceneRenderer *sr, uint32_t entity);
 
 /* Look up the JceModel cached by the renderer for a given path. */
 JCE_API struct JceModel *jce_scene_renderer_get_model(
@@ -347,6 +362,20 @@ JCE_API const JceTimeOfDayState *jce_scene_renderer_get_time_of_day(
 JCE_API void jce_scene_renderer_set_ambient_override(JceSceneRenderer *sr,
                                                       const float       color_rgb[3],
                                                       float             intensity);
+
+/* Runtime decal stamping (P2-weather-decals-tod).
+ *
+ * Stamp a decal (bullet hole, blood splatter, scorch mark, footprint, …)
+ * onto a world surface.  The renderer owns a lazily-created decal pool that
+ * is updated + rendered every jce_scene_renderer_render() into the color
+ * view; spawned decals respect their JceDecalSpawn.lifetime_seconds (0 =
+ * persistent until evicted).  This is independent of authored
+ * JceDecalComponent projectors, which are rebuilt from the scene each frame.
+ *
+ * Returns true if the decal was stamped (false if the pool could not be
+ * created — e.g. the decal shaders are missing — or the spawn was invalid). */
+JCE_API bool jce_scene_renderer_spawn_decal(JceSceneRenderer    *sr,
+                                            const JceDecalSpawn *spawn);
 
 JCE_EXTERN_C_END
 

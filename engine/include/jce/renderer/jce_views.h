@@ -82,8 +82,8 @@ void jce_clear_freshly_created_fbo(unsigned short fb_idx,
  * so the new texture's GPU storage starts as solid black instead of
  * leftover uninitialised VRAM ("rainbow garbage"). bgfx releases the
  * memory once the upload is enqueued. */
-struct bgfx_memory;
-const struct bgfx_memory *jce_zero_init_mem(unsigned int size_bytes);
+struct bgfx_memory_s;
+const struct bgfx_memory_s *jce_zero_init_mem(unsigned int size_bytes);
 
 #ifdef __cplusplus
 }

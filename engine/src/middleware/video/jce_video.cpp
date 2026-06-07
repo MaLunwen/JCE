@@ -2918,10 +2918,12 @@ JceVideo jce_video_load_memory(const void *data, uint32_t size,
 #ifndef JCE_ENABLE_PATENTED_CODECS
                 LOG_WARN(LOG_TAG,
                     "patent-encumbered audio codec 'mp4a' (AAC) is disabled in "
+                    "this build (rebuild with -DJCE_ENABLE_PATENTED_CODECS=ON "
                     "to enable AAC playback). No audio will be decoded.");
                 set_audio_status(slot,
                     JCE_VIDEO_AUDIO_STATUS_DECODER_UNAVAILABLE,
-                    "AAC disabled (patent-encumbered; ");
+                    "AAC disabled (patent-encumbered; rebuild with "
+                    "-DJCE_ENABLE_PATENTED_CODECS=ON)");
 #else
                 /* ── Streaming AAC: ring-buffered, no full PCM blob ─ */
                 uint8_t *mp4_copy = (uint8_t *)JCE_MALLOC(size);

@@ -353,6 +353,15 @@ void draw_comp_reflection_probe(JceReflectionProbeComponent *r)
     static JceReflectionProbeBakeHandle s_active_handle = 0;
     static JceReflectionProbeComponent *s_active_target = nullptr;
 
+    /* These caches are keyed by raw component pointers, which dangle once a
+     * probe is deleted (there is no cleanup hook). Left unbounded they leak one
+     * ~32-byte node per distinct probe pointer ever inspected (a slow CRT-heap
+     * "void" trickle), and a reused address could return another probe's stale
+     * UI state. Cap the table and reset when it grows; both values are
+     * re-derived just below, so a reset only costs the transient combo
+     * selection after more than 64 distinct probes have been inspected. */
+    if (s_bake_size.size() > 64) { s_bake_size.clear(); s_bake_dynamic.clear(); }
+
     int  &size_idx     = s_bake_size[r];
     bool &include_dyn  = s_bake_dynamic[r];
     if (size_idx == 0 && r->resolution >= 128) {

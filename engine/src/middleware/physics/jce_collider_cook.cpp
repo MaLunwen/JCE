@@ -93,8 +93,20 @@ void bake_part(const JceColliderPart &part, Baked &b)
     }
     if (part.indices && part.index_count) {
         b.indices.reserve(b.indices.size() + part.index_count);
-        for (uint32_t i = 0; i < part.index_count; ++i)
-            b.indices.push_back(part.indices[i] + base);
+        /* Drop whole triangles that reference vertices outside this part —
+           a malformed model would otherwise bake an out-of-range index into
+           the cooked blob and OOB-read at instantiation. */
+        for (uint32_t i = 0; i + 2 < part.index_count; i += 3) {
+            uint32_t i0 = part.indices[i + 0];
+            uint32_t i1 = part.indices[i + 1];
+            uint32_t i2 = part.indices[i + 2];
+            if (i0 >= part.vertex_count || i1 >= part.vertex_count ||
+                i2 >= part.vertex_count)
+                continue;
+            b.indices.push_back(i0 + base);
+            b.indices.push_back(i1 + base);
+            b.indices.push_back(i2 + base);
+        }
     }
 }
 

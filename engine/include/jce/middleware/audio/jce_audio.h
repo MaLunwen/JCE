@@ -77,6 +77,8 @@ JCE_API void      jce_audio_pause(JceAudio *audio, JceVoice voice);
 JCE_API void      jce_audio_resume(JceAudio *audio, JceVoice voice);
 
 JCE_API void      jce_audio_set_volume(JceAudio *audio, JceVoice voice, float volume);
+/* Per-voice low-pass cutoff in Hz for occlusion muffling (22050 = bypass). */
+JCE_API void      jce_audio_set_lowpass(JceAudio *audio, JceVoice voice, float cutoff_hz);
 JCE_API void      jce_audio_set_pitch(JceAudio *audio, JceVoice voice, float pitch);
 JCE_API void      jce_audio_set_looping(JceAudio *audio, JceVoice voice, bool loop);
 JCE_API bool      jce_audio_is_playing(const JceAudio *audio, JceVoice voice);
@@ -103,6 +105,65 @@ JceVoice  jce_audio_play_stream(JceAudio *audio,
 
 JCE_API void      jce_audio_set_master_volume(JceAudio *audio, float volume);
 JCE_API void      jce_audio_stop_all(JceAudio *audio);
+
+/* -- Mixer buses ---------------------------------------------------- */
+
+/*
+ * Named mixer buses backed by ma_sound_group nodes.  Voices routed to a
+ * bus inherit that bus's gain, so the runtime can drive Music/SFX/Voice
+ * sliders (resolved from a JceAudioMixer) straight onto the live mix.
+ *
+ * The "Master" bus always exists implicitly (it is the engine endpoint —
+ * jce_audio_set_master_volume controls it).  Other buses are created by
+ * name; creating the same name twice returns the existing bus.  Buses are
+ * flat (one level under Master) on the audio side — the hierarchical
+ * solo/mute/parent math lives in jce_audio_mixer.h and is collapsed into a
+ * single resolved gain per bus that the caller pushes here each frame.
+ *
+ * Returns true on success.  All no-op safely when audio is disabled. */
+JCE_API bool      jce_audio_bus_create(JceAudio *audio, const char *name);
+
+/* Set the linear gain of a named bus (clamped >= 0).  No-op for unknown
+ * names; the implicit "Master" bus maps to the engine master volume. */
+JCE_API void      jce_audio_bus_set_volume(JceAudio *audio, const char *name,
+                                           float volume);
+
+/* Route a voice's output into the named bus.  Call after jce_audio_play.
+ * Unknown bus name or "Master" routes the voice straight to the endpoint.
+ * No-op on a stale/invalid voice. */
+JCE_API void      jce_audio_voice_set_bus(JceAudio *audio, JceVoice voice,
+                                          const char *bus_name);
+
+/* -- Global reverb (driven by reverb zones) ------------------------- */
+
+/*
+ * Generic reverb parameters consumed by the global reverb DSP node.  This
+ * mirrors jce_reverb_zones.h's JceReverbPreset field-for-field so the
+ * runtime can sample a blended zone preset and hand it straight here
+ * without coupling the audio device to the (engine-agnostic) zone module.
+ *
+ * wet_mix/dry_mix are 0..1 send levels; decay_seconds is the tail length;
+ * room_size (m) scales the pre-delay; damping/lowpass_hz roll off the wet
+ * high frequencies.  diffusion/density are accepted for completeness but
+ * are baked into the fixed comb/allpass network. */
+typedef struct {
+    float wet_mix;
+    float dry_mix;
+    float decay_seconds;
+    float room_size;
+    float damping;
+    float diffusion;
+    float density;
+    float pre_delay_ms;
+    float lowpass_hz;
+} JceAudioReverbParams;
+
+/* Apply the blended reverb preset to the global reverb node (created lazily
+ * on first call).  Bus output is routed through the reverb node so the wet
+ * tail is audible.  Passing wet_mix <= 0 leaves the dry signal untouched.
+ * No-op safely when audio is disabled. */
+JCE_API void      jce_audio_set_reverb(JceAudio *audio,
+                                       const JceAudioReverbParams *params);
 
 /* -- 3D positional audio -------------------------------------------- */
 

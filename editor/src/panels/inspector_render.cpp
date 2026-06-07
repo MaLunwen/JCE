@@ -165,6 +165,43 @@ void draw_comp_mesh_renderer(JceMeshRenderer *mr)
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("%s",
                 jce_editor_i18n("meshRenderer.material.openGraphHint"));
+
+        /* Assign this (graph) material to every other selected entity that
+         * has a MeshRenderer, then reload so any persisted custom shader
+         * takes effect.  Only meaningful with a multi-entity selection. */
+        int sel_count = 0;
+        const uint32_t *sel = jce_state_get_selection(&sel_count);
+        if (sel_count > 1) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton(jce_editor_i18n("meshRenderer.material.assignToSelection"))) {
+                JceScene *scene = jce_state_get_scene();
+                int assigned = 0;
+                if (scene) {
+                    jce_state_begin_batch_edit();
+                    for (int i = 0; i < sel_count; ++i) {
+                        uint32_t id = sel[i];
+                        if (!id) continue;
+                        JceEntity e = jce_state_to_ecs_entity(id);
+                        if (!jce_scene_has_mesh_renderer(scene, e)) continue;
+                        JceMeshRenderer *other = jce_scene_get_mesh_renderer(scene, e);
+                        if (!other || other == mr) continue;
+                        snprintf(other->material_path, sizeof(other->material_path),
+                                 "%s", mr->material_path);
+                        load_material_into_renderer(other);
+                        ++assigned;
+                    }
+                    jce_state_end_batch_edit();
+                }
+                jce_editor_console_log(
+                    "%s: %s -> %d %s",
+                    jce_editor_i18n("meshRenderer.material.assignToSelection"),
+                    mr->material_path, assigned,
+                    jce_editor_i18n("meshRenderer.material.assignedEntities"));
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s",
+                    jce_editor_i18n("meshRenderer.material.assignToSelectionHint"));
+        }
     }
 
     if (ImGui::TreeNodeEx(jce_editor_i18n("inspector.pbrMaterial"), ImGuiTreeNodeFlags_DefaultOpen)) {

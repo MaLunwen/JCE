@@ -31,6 +31,24 @@ typedef struct {
     uint32_t max_bodies;       /* default: 4096 */
     float    fixed_timestep;   /* default: 1/60 */
     int32_t  max_sub_steps;    /* default: 4 */
+
+    /* Solver / sleeping tunables.  All optional — a zero / negative value
+       leaves Bullet's stock default in place, reproducing prior behavior. */
+    int32_t  solver_iterations;        /* 0 = Bullet default (10) */
+    int32_t  split_impulse;            /* -1 = leave default; 0 = off; 1 = on */
+    float    deactivation_time;        /* seconds; 0 = leave default (2.0).
+                                          GLOBAL: sets Bullet's gDeactivationTime
+                                          for all bodies in the process. */
+    float    linear_sleep_threshold;   /* 0 = leave per-body default (0.8) */
+    float    angular_sleep_threshold;  /* 0 = leave per-body default (1.0) */
+
+    /* Opt-in multithreaded Bullet solver.  Only honoured when the engine
+       was compiled with JCE_PHYSICS_MT (which in turn needs Bullet built
+       with bt2_thread_locks=True / BT_THREADSAFE).  Ignored (single-thread
+       path used, with a one-time warning) on a stock single-threaded build.
+       Left OFF by default: the MT solver's island/constraint ordering is
+       non-deterministic and conflicts with the fixed-step determinism. */
+    bool     multithreaded;            /* default: false (single-threaded) */
 } JcePhysicsWorldDesc;
 
 JCE_API JcePhysicsWorld *jce_physics_create(const JcePhysicsWorldDesc *desc);
@@ -133,6 +151,8 @@ JCE_API void JCE_CALL jce_physics_body_get_transform(const JcePhysicsWorld *worl
 JCE_API void JCE_CALL jce_physics_body_set_transform(JcePhysicsWorld *world, JceBodyHandle body,
                                                      jce_vec3 pos, jce_quat rot);
 
+/* True for a movable (DYNAMIC) rigid body; false for static/kinematic/invalid. */
+JCE_API bool     jce_physics_body_is_dynamic(const JcePhysicsWorld *world, JceBodyHandle body);
 JCE_API jce_vec3 jce_physics_body_get_velocity(const JcePhysicsWorld *world, JceBodyHandle body);
 JCE_API void     jce_physics_body_set_velocity(JcePhysicsWorld *world, JceBodyHandle body, jce_vec3 vel);
 
@@ -146,6 +166,46 @@ JCE_API void     jce_physics_body_set_angular_velocity(JcePhysicsWorld *world, J
 JCE_API void jce_physics_body_apply_force(JcePhysicsWorld *world, JceBodyHandle body, jce_vec3 force);
 JCE_API void jce_physics_body_apply_impulse(JcePhysicsWorld *world, JceBodyHandle body, jce_vec3 impulse);
 JCE_API void jce_physics_body_apply_torque(JcePhysicsWorld *world, JceBodyHandle body, jce_vec3 torque);
+
+/* Apply a force / impulse at a world-space point (generates torque about
+ * the centre of mass).  Mirrors Unity's ForceMode.Force/Impulse with an
+ * application point — needed for explosions, thrusters, hit reactions. */
+JCE_API void JCE_CALL jce_physics_body_apply_force_at_point(JcePhysicsWorld *world,
+                                                            JceBodyHandle body,
+                                                            jce_vec3 force,
+                                                            jce_vec3 world_point);
+JCE_API void JCE_CALL jce_physics_body_apply_impulse_at_point(JcePhysicsWorld *world,
+                                                              JceBodyHandle body,
+                                                              jce_vec3 impulse,
+                                                              jce_vec3 world_point);
+
+/* ================================================================== */
+/* Per-body gravity & mass                                             */
+/* ================================================================== */
+
+/* Scale world gravity for a single body.  factor 1 = normal gravity,
+ * 0 = unaffected by gravity (floating platform / pickup), negative =
+ * inverted.  Unity's `useGravity=false` maps to factor 0; Godot's
+ * `gravity_scale` maps directly.  Must be applied after the body is in
+ * the world (body creation resets per-body gravity to the world value). */
+JCE_API void JCE_CALL jce_physics_body_set_gravity_factor(JcePhysicsWorld *world,
+                                                          JceBodyHandle body,
+                                                          float factor);
+
+/* Change a dynamic body's mass at runtime; recomputes the local inertia
+ * tensor from the current collision shape.  mass <= 0 makes the body
+ * effectively static (zero inverse mass). */
+JCE_API void JCE_CALL jce_physics_body_set_mass(JcePhysicsWorld *world,
+                                                JceBodyHandle body,
+                                                float mass);
+
+/* Set the collider's local scale at runtime (Unity-style — the collider
+ * follows the entity's Transform scale).  Recomputes the inertia tensor for
+ * dynamic bodies and refreshes the broadphase AABB.  `scale` is relative to
+ * the shape's authored size. */
+JCE_API void JCE_CALL jce_physics_body_set_scale(JcePhysicsWorld *world,
+                                                 JceBodyHandle body,
+                                                 jce_vec3 scale);
 
 /* ================================================================== */
 /* Ray casting                                                         */
@@ -162,6 +222,54 @@ typedef struct {
 JceRaycastResult jce_physics_raycast(const JcePhysicsWorld *world,
                                      jce_vec3 origin, jce_vec3 direction,
                                      float max_distance);
+
+/* ================================================================== */
+/* Filtered spatial queries                                            */
+/* ================================================================== */
+
+/* Query filter.  layer_mask: bit i selects physics layer i (0xFFFFFFFF =
+ * every layer).  hit_triggers: when false (default) sensor/trigger bodies
+ * are skipped.  Use jce_query_filter_default() for "everything, no triggers". */
+typedef struct {
+    uint32_t layer_mask;
+    bool     hit_triggers;
+} JceQueryFilter;
+
+static inline JceQueryFilter jce_query_filter_default(void)
+{
+    JceQueryFilter f;
+    f.layer_mask   = 0xFFFFFFFFu;
+    f.hit_triggers = false;
+    return f;
+}
+
+/* Closest-hit raycast honoring the layer mask + trigger skip. */
+JCE_API JceRaycastResult JCE_CALL jce_physics_raycast_filtered(
+        const JcePhysicsWorld *world, jce_vec3 origin, jce_vec3 direction,
+        float max_distance, JceQueryFilter filter);
+
+/* Multi-hit raycast.  Writes up to max_hits results (sorted near→far) into
+ * out_hits and returns the number written. */
+JCE_API uint32_t JCE_CALL jce_physics_raycast_all(
+        const JcePhysicsWorld *world, jce_vec3 origin, jce_vec3 direction,
+        float max_distance, JceQueryFilter filter,
+        JceRaycastResult *out_hits, uint32_t max_hits);
+
+/* Overlap tests: write up to max_bodies overlapping body handles into
+ * out_bodies and return the count. */
+JCE_API uint32_t JCE_CALL jce_physics_overlap_sphere(
+        const JcePhysicsWorld *world, jce_vec3 center, float radius,
+        JceQueryFilter filter, JceBodyHandle *out_bodies, uint32_t max_bodies);
+JCE_API uint32_t JCE_CALL jce_physics_overlap_box(
+        const JcePhysicsWorld *world, jce_vec3 center, jce_vec3 half_extents,
+        jce_quat rotation, JceQueryFilter filter,
+        JceBodyHandle *out_bodies, uint32_t max_bodies);
+
+/* Sweep a sphere of `radius` from origin along direction; returns the first
+ * hit (a thick raycast — for projectiles / character movement). */
+JCE_API JceRaycastResult JCE_CALL jce_physics_sweep_sphere(
+        const JcePhysicsWorld *world, jce_vec3 origin, float radius,
+        jce_vec3 direction, float max_distance, JceQueryFilter filter);
 
 /* ================================================================== */
 /* Continuous Collision Detection (CCD)  (P3-C.3)                      */
@@ -311,6 +419,10 @@ void jce_physics_character_jump(JcePhysicsWorld *world,
 void jce_physics_character_get_position(const JcePhysicsWorld *world,
                                          JceCharacterHandle ch,
                                          jce_vec3 *out_pos);
+/* Teleport the character to the given capsule-CENTER position. */
+void jce_physics_character_set_position(JcePhysicsWorld *world,
+                                         JceCharacterHandle ch,
+                                         jce_vec3 pos);
 bool jce_physics_character_is_grounded(const JcePhysicsWorld *world,
                                         JceCharacterHandle ch);
 

@@ -83,6 +83,14 @@ JCE_API void JCE_CALL jce_skeleton_evaluate(const JceSkeleton *skel,
  *   joint_global = skin_matrix[i] * inverse(jce_skeleton_get_inverse_bind(skel, i)) */
 JCE_API jce_mat4 jce_skeleton_get_inverse_bind(const JceSkeleton *skel, uint32_t joint_idx);
 
+/* Set the skeleton's root (armature) world transform: the world transform of
+ * the node ABOVE the root joints (e.g. the Z-up->Y-up rotation glTF assets like
+ * CesiumMan put on the armature node). It is pre-multiplied onto root joints
+ * during evaluation. Without it, skinned characters whose orientation lives on
+ * that armature node render rotated onto their face. Default: identity. */
+JCE_API void JCE_CALL jce_skeleton_set_root_transform(JceSkeleton *skel,
+                                                      const jce_mat4 *transform);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_SKELETON_H */

@@ -4,12 +4,15 @@
  * Multi-entity inspector view: shown whenever the editor's selection
  * contains > 1 entity.  Surfaces shared toggles (enable / tag color),
  * a bulk Transform editor, the selected-entities list, and a delete
- * button — then early-returns so the per-entity inspector body never
- * runs in multi mode.
+ * button.  The caller then FALLS THROUGH to draw the focused entity's
+ * per-component sections, broadcasting each per-field edit to the other
+ * selected peers (see jce_panel_inspector.cpp), so this view no longer
+ * suppresses the per-entity body.
  *
  * Carved out of jce_panel_inspector.cpp; entry point is
- * `insp_draw_multi_select_view(scene)` which returns true when it
- * rendered the multi view (the caller must then bail out).
+ * `insp_draw_multi_select_view(scene)`.  It returns true when it rendered
+ * the multi view — now informational only; the sole caller ignores the
+ * return value and always continues to the per-component sections.
  */
 
 #include "jce_panel_inspector_common.h"
@@ -40,18 +43,26 @@ bool insp_draw_multi_select_view(JceScene *scene)
     if (mixed) {
         ImGui::Text("%s", jce_editor_i18n("inspector.enabledMixed"));
         ImGui::SameLine();
-        if (ImGui::SmallButton(jce_editor_i18n("inspector.enableAll")))
+        if (ImGui::SmallButton(jce_editor_i18n("inspector.enableAll"))) {
+            jce_state_begin_batch_edit();
             for (int i = 0; i < sel_count; i++)
                 jce_state_set_entity_enabled(sel_ids[i], true);
+            jce_state_end_batch_edit();
+        }
         ImGui::SameLine();
-        if (ImGui::SmallButton(jce_editor_i18n("inspector.disableAll")))
+        if (ImGui::SmallButton(jce_editor_i18n("inspector.disableAll"))) {
+            jce_state_begin_batch_edit();
             for (int i = 0; i < sel_count; i++)
                 jce_state_set_entity_enabled(sel_ids[i], false);
+            jce_state_end_batch_edit();
+        }
     } else {
         snprintf(lbl, sizeof(lbl), "%s###multi_enabled", jce_editor_i18n("inspector.enabled"));
         if (ImGui::Checkbox(lbl, &chk)) {
+            jce_state_begin_batch_edit();
             for (int i = 0; i < sel_count; i++)
                 jce_state_set_entity_enabled(sel_ids[i], chk);
+            jce_state_end_batch_edit();
         }
     }
 
@@ -104,6 +115,8 @@ bool insp_draw_multi_select_view(JceScene *scene)
             ImGui::DragFloat3("##bulk_pos_delta", pos_delta, 0.1f);
             ImGui::SameLine();
             if (ImGui::Button(jce_editor_i18n_id("inspector.bulk.apply", "bulk_pos"))) {
+                /* One undo entry for the whole bulk apply. */
+                jce_state_begin_batch_edit();
                 for (int i = 0; i < sel_count; i++) {
                     JceEntity e = jce_state_to_ecs_entity(sel_ids[i]);
                     JceTransform *t = jce_scene_get_transform(scene, e);
@@ -113,6 +126,7 @@ bool insp_draw_multi_select_view(JceScene *scene)
                         t->position.z += pos_delta[2];
                     }
                 }
+                jce_state_end_batch_edit();
                 pos_delta[0] = pos_delta[1] = pos_delta[2] = 0.0f;
             }
 
@@ -120,6 +134,7 @@ bool insp_draw_multi_select_view(JceScene *scene)
             ImGui::DragFloat3("##bulk_rot_set", rot_set, 1.0f);
             ImGui::SameLine();
             if (ImGui::Button(jce_editor_i18n_id("inspector.bulk.apply", "bulk_rot"))) {
+                jce_state_begin_batch_edit();
                 for (int i = 0; i < sel_count; i++) {
                     JceEntity e = jce_state_to_ecs_entity(sel_ids[i]);
                     JceTransform *t = jce_scene_get_transform(scene, e);
@@ -128,6 +143,7 @@ bool insp_draw_multi_select_view(JceScene *scene)
                         jce_editor_set_cached_euler_deg(sel_ids[i], t->rotation, rot_set);
                     }
                 }
+                jce_state_end_batch_edit();
             }
 
             ImGui::TextDisabled("%s", jce_editor_i18n("inspector.bulk.scaleAbsolute"));
@@ -140,6 +156,7 @@ bool insp_draw_multi_select_view(JceScene *scene)
             }
             ImGui::SameLine();
             if (ImGui::Button(jce_editor_i18n_id("inspector.bulk.apply", "bulk_scl"))) {
+                jce_state_begin_batch_edit();
                 for (int i = 0; i < sel_count; i++) {
                     JceEntity e = jce_state_to_ecs_entity(sel_ids[i]);
                     JceTransform *t = jce_scene_get_transform(scene, e);
@@ -149,23 +166,28 @@ bool insp_draw_multi_select_view(JceScene *scene)
                         t->scale.z = scl_set[2];
                     }
                 }
+                jce_state_end_batch_edit();
             }
 
             ImGui::Separator();
             if (ImGui::Button(jce_editor_i18n_id("inspector.bulk.resetPos", "bulk_reset_pos"))) {
+                jce_state_begin_batch_edit();
                 for (int i = 0; i < sel_count; i++) {
                     JceEntity e = jce_state_to_ecs_entity(sel_ids[i]);
                     JceTransform *t = jce_scene_get_transform(scene, e);
                     if (t) { t->position.x = t->position.y = t->position.z = 0.0f; }
                 }
+                jce_state_end_batch_edit();
             }
             ImGui::SameLine();
             if (ImGui::Button(jce_editor_i18n_id("inspector.bulk.resetScale", "bulk_reset_scl"))) {
+                jce_state_begin_batch_edit();
                 for (int i = 0; i < sel_count; i++) {
                     JceEntity e = jce_state_to_ecs_entity(sel_ids[i]);
                     JceTransform *t = jce_scene_get_transform(scene, e);
                     if (t) { t->scale.x = t->scale.y = t->scale.z = 1.0f; }
                 }
+                jce_state_end_batch_edit();
             }
             ImGui::PopID();
         }

@@ -274,8 +274,15 @@ JceCookResult jce_cook_texture(const void *input, size_t input_size,
     uint32_t base_w = (uint32_t)surf->w;
     uint32_t base_h = (uint32_t)surf->h;
 
-    /* Always use RGBA8 format. */
-    int target_format = JCEASSET_TEXFMT_RGBA8;
+    /* Target GPU format. Block-compress (BC7/BC5/.../ASTC/ETC2) only when the
+       caller explicitly requests it via opts->texture_format; 0 == RGBA8 keeps
+       the default cook behavior unchanged. The RGBA8 mip pyramid is generated
+       first either way, then re-encoded below if a block format was requested. */
+    int target_format = opts ? opts->texture_format : JCEASSET_TEXFMT_RGBA8;
+    if (target_format != JCEASSET_TEXFMT_RGBA8 &&
+        !jce_tex_format_is_block(target_format)) {
+        target_format = JCEASSET_TEXFMT_RGBA8;
+    }
 
     /* Determine mip count. */
     uint32_t mip_count = 1;
@@ -352,10 +359,59 @@ JceCookResult jce_cook_texture(const void *input, size_t input_size,
 
     JCE_FREE(temp_mip);
 
+    /* Default output = the RGBA8 mip pyramid just generated. */
+    uint8_t  *final_data    = mip_data;
+    uint32_t *final_offsets = mip_offsets;
+    size_t    final_total   = mip_offset;
+    uint8_t  *enc_data      = NULL;   /* block-compressed buffer, if used */
+    uint32_t *enc_offsets   = NULL;
+
+    /* GPU block compression: re-encode each RGBA8 mip into the target block
+       format (BC7/BC5/.../ASTC/ETC2). On any failure fall back to RGBA8. */
+    if (jce_tex_format_is_block(target_format)) {
+        enc_offsets = (uint32_t *)JCE_MALLOC(mip_count * sizeof(uint32_t));
+        size_t enc_total = 0;
+        for (uint32_t m = 0; m < mip_count; m++) {
+            uint32_t mw, mh;
+            jce_tex_mip_dimensions(base_w, base_h, m, &mw, &mh);
+            enc_total += jce_tex_encoded_size(mw, mh, target_format);
+        }
+        enc_data = (uint8_t *)JCE_MALLOC(enc_total > 0 ? enc_total : 1);
+
+        bool enc_ok = (enc_offsets && enc_data && enc_total > 0);
+        size_t eo = 0;
+        for (uint32_t m = 0; enc_ok && m < mip_count; m++) {
+            uint32_t mw, mh;
+            jce_tex_mip_dimensions(base_w, base_h, m, &mw, &mh);
+            uint32_t es = jce_tex_encoded_size(mw, mh, target_format);
+            enc_offsets[m] = (uint32_t)eo;
+            if (!jce_tex_encode(mip_data + mip_offsets[m], mw, mh,
+                                target_format, /*normal_map=*/0,
+                                enc_data + eo, es)) {
+                enc_ok = false;
+            }
+            eo += es;
+        }
+
+        if (enc_ok) {
+            final_data    = enc_data;
+            final_offsets = enc_offsets;
+            final_total   = eo;
+        } else {
+            if (opts && opts->verbose)
+                printf("[cook] block encode failed; storing RGBA8\n");
+            JCE_FREE(enc_data);    enc_data = NULL;
+            JCE_FREE(enc_offsets); enc_offsets = NULL;
+            target_format = JCEASSET_TEXFMT_RGBA8;
+        }
+    }
+
     /* Build info chunk (extended with mip offsets). */
     size_t info_size = sizeof(JceAssetTexInfo) + mip_count * sizeof(uint32_t);
     uint8_t *info_buf = (uint8_t *)JCE_MALLOC(info_size);
     if (!info_buf) {
+        JCE_FREE(enc_data);
+        JCE_FREE(enc_offsets);
         JCE_FREE(mip_offsets);
         JCE_FREE(mip_data);
         SDL_DestroySurface(surf);
@@ -372,7 +428,8 @@ JceCookResult jce_cook_texture(const void *input, size_t input_size,
     info->_pad      = 0;
 
     /* Copy mip offsets after the info struct. */
-    memcpy(info_buf + sizeof(JceAssetTexInfo), mip_offsets, mip_count * sizeof(uint32_t));
+    memcpy(info_buf + sizeof(JceAssetTexInfo), final_offsets,
+           mip_count * sizeof(uint32_t));
 
     uint64_t source_hash = XXH3_64bits(input, input_size);
 
@@ -381,12 +438,14 @@ JceCookResult jce_cook_texture(const void *input, size_t input_size,
     chunks[0].raw_data   = info_buf;
     chunks[0].raw_size   = info_size;
     chunks[1].chunk_type = JCEASSET_CHUNK_TEX_PIXELS;
-    chunks[1].raw_data   = mip_data;
-    chunks[1].raw_size   = mip_offset;  /* Actual data size */
+    chunks[1].raw_data   = final_data;
+    chunks[1].raw_size   = final_total;
 
     result = build_asset(JCEASSET_TYPE_TEXTURE, source_hash, chunks, 2, opts);
 
     JCE_FREE(info_buf);
+    JCE_FREE(enc_data);
+    JCE_FREE(enc_offsets);
     JCE_FREE(mip_offsets);
     JCE_FREE(mip_data);
     SDL_DestroySurface(surf);
@@ -558,6 +617,41 @@ int jce_cook_detect_type(const char *path)
     return JCEASSET_TYPE_RAW;
 }
 
+/* Heuristic: does this texture path look like a tangent-space normal map?
+ * Normal maps must use BC5 (RG), not BC3 — BC3's chroma subsampling wrecks them. */
+static bool path_is_normal_map(const char *path)
+{
+    if (!path) return false;
+    char low[1024];
+    size_t n = 0;
+    for (; path[n] && n < sizeof(low) - 1; n++) {
+        char c = path[n];
+        low[n] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+    }
+    low[n] = '\0';
+    return strstr(low, "normal") || strstr(low, "_nrm") ||
+           strstr(low, "_norm")  || strstr(low, "-normal");
+}
+
+/* Auto-select a GPU texture format from the target platform (only when the
+ * caller didn't force one). Desktop -> BC (BC5 normals, BC3 colour);
+ * mobile/web -> ASTC. Platform AUTO keeps RGBA8 (uncompressed). */
+static int auto_texture_format(const char *path, JceCookPlatform plat)
+{
+    switch (plat) {
+    case JCE_COOK_PLATFORM_WINDOWS:
+    case JCE_COOK_PLATFORM_LINUX:
+    case JCE_COOK_PLATFORM_MACOS:
+        return path_is_normal_map(path) ? JCEASSET_TEXFMT_BC5 : JCEASSET_TEXFMT_BC3;
+    case JCE_COOK_PLATFORM_ANDROID:
+    case JCE_COOK_PLATFORM_IOS:
+    case JCE_COOK_PLATFORM_WEB:
+        return JCEASSET_TEXFMT_ASTC_4x4;
+    default:
+        return JCEASSET_TEXFMT_RGBA8;   /* AUTO -> uncompressed */
+    }
+}
+
 JceCookResult jce_cook_file(const char *input_path,
                             const JceCookOptions *opts)
 {
@@ -585,9 +679,21 @@ JceCookResult jce_cook_file(const char *input_path,
 
     /* Dispatch by type. */
     int type = jce_cook_detect_type(input_path);
+
+    /* Resolve auto texture format (by platform + normal-map name) when the
+       caller didn't force a specific format. cook_texture honors the result. */
+    JceCookOptions local;
+    const JceCookOptions *use_opts = opts;
+    if (type == JCEASSET_TYPE_TEXTURE && opts &&
+        opts->texture_format == JCEASSET_TEXFMT_RGBA8) {
+        local = *opts;
+        local.texture_format = auto_texture_format(input_path, opts->platform);
+        use_opts = &local;
+    }
+
     switch (type) {
     case JCEASSET_TYPE_TEXTURE:
-        result = jce_cook_texture(data, nread, opts);
+        result = jce_cook_texture(data, nread, use_opts);
         break;
     case JCEASSET_TYPE_SOUND:
         result = jce_cook_audio(data, nread, opts);

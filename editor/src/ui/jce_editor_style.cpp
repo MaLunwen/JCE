@@ -8,6 +8,7 @@
 
 #include "jce_editor_colors.h"
 #include "core/jce_editor_alloc.h"
+#include "core/jce_editor_i18n.h"   /* active locale → bake only its glyphs */
 #include <jce/ui/jce_imgui_renderer.h>
 
 #include <jce/tools/jce_imgui.hpp>
@@ -672,13 +673,28 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
        ("ChineseSimplifiedCommon") is also merged so user-typed scene
        names / asset names with common Chinese characters still render
        even if the string isn't in the i18n table. */
+    /* Bake only the ACTIVE locale's heavy glyph blocks (the small icon ranges
+       below are always added).  Baking the full Korean (~11k) + Chinese-common
+       (~1.5k) blocks unconditionally cost ~8-12MB of atlas on the 512MB
+       baseline even for an English session — standard practice is to load the
+       glyph set for the language actually in use.  This re-runs on locale
+       change (the function is called again from Project Settings → Save), so
+       switching to zh/ko/ja rebuilds the atlas with that language's glyphs. */
+    const char *active_loc = jce_editor_i18n_locale_code(jce_editor_i18n_get_locale());
+    const bool loc_is_ko = active_loc && strcmp(active_loc, "ko") == 0;
+
     ImFontGlyphRangesBuilder cjk_builder;
+    /* Chinese-common stays unconditional (covers user-typed Han in scene/asset
+       names), and the i18n scan below adds every codepoint the UI actually uses
+       — including each language's native name in the picker — so no language
+       renders as '?'. */
     cjk_builder.AddRanges(io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
-    /* Korean Hangul Syllables + Jamo — covers the entire ko.json domain
-       even if a particular CJK font happens to lack glyphs for an
-       infrequent character.  Cost: ~11k codepoints, ~50 ms one-time
-       atlas bake; negligible at startup. */
-    cjk_builder.AddRanges(io.Fonts->GetGlyphRangesKorean());
+    /* The full Korean block (~11k Hangul) is the single biggest font cost and
+       is only needed when the UI itself is Korean — gate it on the active
+       locale.  Korean text still renders in other locales via the scan (which
+       adds the exact Hangul used, e.g. the 한국어 picker label from ko.json). */
+    if (loc_is_ko)
+        cjk_builder.AddRanges(io.Fonts->GetGlyphRangesKorean());
     cjk_builder.AddRanges(cjk_extra_ranges);
 
     /* Scan i18n PAK files: for every UTF-8 codepoint encountered, mark

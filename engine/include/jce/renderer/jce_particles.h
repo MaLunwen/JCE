@@ -113,6 +113,51 @@ JCE_API void jce_particles_update(JceParticleSystem *sys, float dt);
 /* Return total alive particle count across all emitters. */
 JCE_API uint32_t jce_particles_alive_count(const JceParticleSystem *sys);
 
+/* ================================================================== */
+/* Read-back (for rendering / debug visualisation)                     */
+/* ================================================================== */
+
+/* A single alive particle, exposed read-only for renderers. */
+typedef struct {
+    jce_vec3 position;   /* world-space when emitter world_space, else local */
+    jce_vec4 color;      /* current interpolated RGBA */
+    float    size;       /* current interpolated billboard size */
+} JceParticleView;
+
+/* Visit every alive particle of one emitter (newest pool order).  The
+ * callback receives a stable snapshot per particle; do not retain the
+ * pointer past the call. */
+typedef void (*JceParticleVisitFn)(const JceParticleView *p, void *user_data);
+
+JCE_API void jce_particles_emitter_for_each(const JceParticleSystem *sys,
+                                            JceEmitterHandle emitter,
+                                            JceParticleVisitFn cb,
+                                            void *user_data);
+
+/* Per-emitter alive count (0 for invalid / dead emitter). */
+JCE_API uint32_t jce_particles_emitter_alive_count(const JceParticleSystem *sys,
+                                                   JceEmitterHandle emitter);
+
+/* True when the emitter slot is currently allocated (added, not removed). */
+JCE_API bool jce_particles_emitter_is_alive(const JceParticleSystem *sys,
+                                            JceEmitterHandle emitter);
+
+/* ================================================================== */
+/* Asset I/O                                                           */
+/* ================================================================== */
+
+/* Populate `out` with sane defaults (matches the editor authoring panel). */
+JCE_API void jce_particles_desc_default(JceParticleEmitterDesc *out);
+
+/* Load a `*.particles.json` emitter description from disk (host/VFS aware).
+ * `out` is filled with defaults first, then overlaid with file values, so a
+ * partial document still yields a usable emitter.  The optional `texture_out`
+ * receives the authored texture path (may be empty); pass NULL to ignore.
+ * Returns false on missing file / parse error (out is left at defaults). */
+JCE_API bool jce_particles_desc_load_json(const char *path,
+                                          JceParticleEmitterDesc *out,
+                                          char *texture_out, int texture_cap);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_PARTICLES_H */

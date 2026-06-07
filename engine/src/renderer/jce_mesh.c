@@ -270,6 +270,12 @@ void jce_mesh_submit_wireframe_overlay(const JceMesh *mesh, const JceRenderer *r
 
 void jce_mesh_submit_pbr(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id)
 {
+    jce_mesh_submit_pbr_state(mesh, r, view_id, BGFX_STATE_DEFAULT);
+}
+
+void jce_mesh_submit_pbr_state(const JceMesh *mesh, const JceRenderer *r,
+                               uint16_t view_id, uint64_t state)
+{
     if (!mesh || !r) return;
 
     bgfx_set_vertex_buffer(0, mesh->vbh, 0, mesh->num_verts);
@@ -277,7 +283,10 @@ void jce_mesh_submit_pbr(const JceMesh *mesh, const JceRenderer *r, uint16_t vie
     if (mesh->ibh.idx != UINT16_MAX)
         bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
 
-    bgfx_set_state(BGFX_STATE_DEFAULT, 0);
+    /* state==0 keeps the historical opaque behaviour.  A non-zero state
+     * carries the material's blend / cull (double_sided drops CULL_CW) /
+     * depth-write flags, built by jce_pbr_material_render_state(). */
+    bgfx_set_state(state ? state : BGFX_STATE_DEFAULT, 0);
 
     JceShaderHandle sh = jce_renderer_get_program_pbr(r);
     bgfx_program_handle_t prog = { sh.idx };
@@ -492,7 +501,6 @@ JceMesh *jce_mesh_create_plane_ex(float width, float depth,
 {
     if (subdivs == 0) subdivs = 1;
 
-    // cppcheck-suppress duplicateAssignExpression   ; intentional: plane has equal X and Z subdivisions
     uint32_t nx = subdivs + 1;
     uint32_t nz = subdivs + 1;
     uint32_t num_verts = nx * nz;

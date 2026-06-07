@@ -26,6 +26,7 @@ JCE_EXTERN_C_BEGIN
 /* Forward-declare subsystems so game headers need not pull them in. */
 typedef struct JceWindow       JceWindow;
 typedef struct JceInput        JceInput;
+typedef struct JceInputActions JceInputActions;
 typedef struct JceAudio        JceAudio;
 typedef struct JceRenderer     JceRenderer;
 typedef struct JcePakArchive      JcePakArchive;
@@ -39,6 +40,7 @@ typedef struct JceAssetManager JceAssetManager;
 typedef struct JceServices {
     JceWindow         *window;
     JceInput          *input;
+    JceInputActions   *actions;     /* action-map layer; may be NULL */
     JceAudio          *audio;
     JceRenderer       *renderer;
     JcePakArchive        *pak;

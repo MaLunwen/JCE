@@ -15,6 +15,7 @@
 #include <jce/renderer/jce_gfx_types.h>
 #include <jce/renderer/jce_texture_types.h>
 #include <jce/renderer/jce_volume_profile.h>
+#include <jce/middleware/video/jce_video_types.h>
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -120,7 +121,7 @@ typedef struct {
 
 /* ── Scene rendering environment ────────────────────────────────── */
 
-#define JCE_SCENE_RENDERING_POSTFX_COUNT 6
+#define JCE_SCENE_RENDERING_POSTFX_COUNT 7
 
 typedef enum {
     JCE_SCENE_FOG_NONE   = 0,
@@ -165,6 +166,34 @@ typedef struct {
     float vignette_intensity;
     float vignette_smoothness;
     float chromatic_strength;
+
+    /* Generic data-driven custom post pass (engine stays style-agnostic).
+     * postfx_enabled[6] toggles it; the named shader + params define the look
+     * (e.g. a client-supplied stylize / NPR shader). */
+    char  custom_post_shader[64];   /* "" = none */
+    bool  custom_post_needs_depth;
+    int   custom_post_param_count;  /* number of authored vec4s (<= 8) */
+    float custom_post_params[32];   /* 8 * vec4 (matches JCE_POSTFX_CUSTOM_PARAMS) */
+
+    /* ── Time-of-day (P2-weather-decals-tod) ──────────────────────────
+     * When tod_enabled, the scene renderer advances an internal hour-of-
+     * day clock seeded from tod_hour at tod_speed hours/second, evaluates
+     * jce_time_of_day_evaluate() and drives the sky / sun / ambient via
+     * jce_scene_renderer_set_time_of_day().  tod_speed == 0 freezes the
+     * clock at tod_hour (static lighting from a chosen moment). */
+    bool  tod_enabled;
+    float tod_hour;            /* start hour-of-day [0,24)                */
+    float tod_speed;           /* hours advanced per real second (0=frozen)*/
+    float tod_latitude;        /* sun-arc latitude in degrees (default 35)*/
+    float tod_dawn_hour;       /* sun crosses horizon ascending  (def 6)  */
+    float tod_dusk_hour;       /* sun crosses horizon descending (def 18) */
+
+    /* ── Weather (P2-weather-decals-tod) ──────────────────────────────
+     * weather_type maps to JceWeatherType (0=clear,1=rain,2=snow); the
+     * renderer lazily creates a JceWeatherSystem and renders a screen-
+     * space overlay scaled by weather_intensity [0,1]. */
+    int   weather_type;        /* JceWeatherType                          */
+    float weather_intensity;   /* 0..1                                    */
 } JceSceneRenderingSettings;
 
 /* ── Sprite renderer component ──────────────────────────────────── */
@@ -209,6 +238,24 @@ typedef struct {
     float speed;
     bool  loop;
     bool  playing;
+    /* Optional .anim_sm.json state machine. When non-empty it drives the
+       active clip every frame (parameter-driven transitions) instead of the
+       fixed active_clip. Empty = classic single-clip playback. */
+    char  sm_path[256];
+    /* Optional 1D blend tree over clip_names[], driven by blend_param (e.g.
+       movement speed). When enabled it takes precedence over sm_path and the
+       fixed clip: the two clips bracketing blend_param are cross-blended.
+       blend_thresholds[i] is the parameter value at which clip_names[i] is
+       fully weighted. */
+    bool  use_blend_tree;
+    float blend_param;
+    float blend_thresholds[8];
+    /* Opt-in convenience: when true, the engine auto-feeds the entity's planar
+       movement speed into the SM "Speed" param AND blend_param (during Play),
+       so a model "just works" as a locomotion character. Default false — the
+       engine then stays generic: blend_param / SM params are whatever game code
+       or the authored values set them to (the renderer only evaluates). */
+    bool  auto_speed;
 } JceSkeletalAnimatorComponent;
 
 /* ── Constraint component ───────────────────────────────────────── */
@@ -244,6 +291,15 @@ typedef struct {
     uint8_t  ccd_mode;           /* JceCcdMode enum value (0 = DISCRETE) */
     float    ccd_threshold;      /* metres/frame; 0 ⇒ engine default */
     float    ccd_sphere_radius;  /* metres; 0 ⇒ auto */
+    /* Per-body gravity: world gravity * gravity_scale (1 = normal). When
+     * use_gravity is false the body gets factor 0 regardless of scale. */
+    float    gravity_scale;      /* default 1.0 */
+    /* Collision layer 0..31, indexes the project Layer Collision Matrix
+     * (drives the broadphase group/mask filter at spawn). */
+    uint32_t physics_layer;
+    /* Optional .physmat.json overriding this body's friction/restitution.
+     * Empty ⇒ use the inline friction/restitution fields above. */
+    char     physmat_path[256];
 } JceRigidBodyComponent;
 
 typedef struct {
@@ -309,6 +365,8 @@ typedef struct {
     uint32_t vhacd_resolution;         /* 0 ⇒ library default                */
     uint32_t vhacd_max_hulls;          /* 0 ⇒ library default                */
     uint32_t vhacd_max_verts_per_hull; /* 0 ⇒ library default                */
+    /* Optional .physmat.json overriding friction/restitution above. */
+    char     physmat_path[256];
 } JceCompoundColliderComponent;
 
 /* Combined 2D collider (shape selector keeps bitfield budget tight). */
@@ -353,19 +411,66 @@ typedef struct {
     bool  play_on_awake;
 } JceAudioSourceComponent;
 
+/* ── Video player component (video-as-texture) ───────────────────────
+ *
+ * Decodes an MP4/WebM clip frame-by-frame into `output_tex` (RGBA8), which
+ * the scene renderer binds as the entity's mesh albedo (and which UI image
+ * sources may reference).  Persisted fields are clip_path / loop / autoplay;
+ * the runtime fields (video handle, GPU texture, dimensions, frame counter,
+ * playing/started flags) are populated by jce_scene_video_update() and never
+ * serialized.  jce_scene_video_update() advances exactly one clip frame per
+ * frame and uploads it via the same zero-copy ref path the editor file
+ * viewer uses. */
+typedef struct {
+    /* Persisted authoring fields. */
+    char     clip_path[256];
+    bool     loop;
+    bool     autoplay;     /* begin playback as soon as the clip opens */
+
+    /* Live transport / runtime state (NOT serialized). */
+    bool     playing;      /* current play/pause state */
+    bool     started;      /* clip has been opened at least once this run */
+
+    /* Engine-owned runtime handles (NOT serialized). The system clears
+     * these on scene load (memset to 0 via the JSON parser). */
+    JceVideo   video;         /* 0 == JCE_VIDEO_INVALID == not opened */
+    JceTexture output_tex;    /* { UINT16_MAX } when no frame yet */
+    int        tex_w;
+    int        tex_h;
+    uint64_t   uploaded_counter; /* last frame counter uploaded to output_tex */
+    uint64_t   opened_hash;      /* hash of clip_path the decoder was opened/attempted
+                                  * with; a mismatch (edit / reset / undo) makes the
+                                  * driver release & re-open. 0 == nothing attempted. */
+} JceVideoPlayerComponent;
+
 /* ── Script component ────────────────────────────────────────────── */
 
 typedef struct {
     char  script_path[256];
 } JceScriptComponent;
 
-/* ── Particle emitter component ─────────────────────────────────── */
-
+/* ── Particle emitter component ─────────────────────────────────────
+ *
+ * Persisted authoring fields are `asset_path` (a `*.particles.json`
+ * authored in the Particle Editor) plus the legacy quick-tune
+ * emit_rate / lifetime_min / lifetime_max used when no asset is set.
+ *
+ * The runtime fields (emitter handle into the scene's shared
+ * JceParticleSystem + load bookkeeping) are populated by
+ * jce_scene_particles_update() and are never serialized; the JSON loader
+ * memsets them to 0 on scene load so a fresh emitter is created on first
+ * tick. */
 typedef struct {
-    uint32_t emitter_handle_idx; /* JceEmitterHandle.idx */
-    float    emit_rate;
+    /* Persisted authoring fields. */
+    char     asset_path[256];    /* `*.particles.json` (empty = use legacy fields) */
+    float    emit_rate;          /* legacy quick-tune (used when asset_path empty) */
     float    lifetime_min;
     float    lifetime_max;
+
+    /* Engine-owned runtime state (NOT serialized; cleared on scene load). */
+    uint32_t emitter_handle_idx; /* JceEmitterHandle.idx; UINT32_MAX = none */
+    bool     loaded;             /* emitter created in the scene particle system */
+    uint64_t asset_epoch;        /* path-change marker so edits re-load the asset */
 } JceParticleEmitterComponent;
 
 /* Tag components (zero-size). */
@@ -420,9 +525,17 @@ JCE_API bool        jce_scene_tags_layers_save(const char *project_root);
 /* ── Behavior tree component ───────────────────────────────────── */
 
 typedef struct {
-    uint32_t tree_handle_idx;   /* JceBtTreeHandle.idx */
+    char     tree_path[256];    /* authored *.xml behavior-tree asset (host/pak path) */
+    uint32_t tree_handle_idx;   /* JceBtTreeHandle.idx (set by runtime on load) */
     uint32_t context_handle_idx;/* JceBtContext index (0 for default) */
+    float    tick_hz;           /* desired tick rate; <=0 = every gameplay frame */
     bool     active;
+    /* Perception sensing params, consumed by the runtime BT/perception binding
+     * (rt_spawn_gameplay).  A value <=0 means "use the engine default at spawn"
+     * so scenes authored before these fields existed keep the old behaviour. */
+    float    sight_range;       /* metres; <=0 ⇒ default 25 */
+    float    sight_half_angle;  /* radians; <=0 ⇒ default 60° (1.0472) */
+    float    hearing_range;     /* metres; <=0 ⇒ default 15 */
 } JceBehaviorTree;
 
 /* ── Editor metadata (stored on entities only in editor builds) ── */
@@ -854,6 +967,37 @@ typedef struct {
     bool  visible;
 } JceBillboardRendererComponent;
 
+/* ── UI: RectTransform (anchor/pivot/size of a UI element) ──────────
+ *
+ * Unity-shaped 2D layout primitive shared by every UI graphic
+ * (UIImage / UIText).  It is embedded in those components rather than
+ * being a standalone ECS component because the per-entity component
+ * flag bitmask (jce_scene_get_component_flags) is already fully
+ * allocated (bits 0..63 in use).  Coordinates are resolved against the
+ * parent's screen rect by the UI layout pass (jce_ui_canvas.*):
+ *
+ *   parent_rect  = canvas (root) or the parent UI element's rect
+ *   anchor_min/anchor_max ∈ [0,1] : fraction of the parent rect the
+ *      element's edges are pinned to.  min==max ⇒ fixed-size element
+ *      positioned by anchored_position + size_delta; min!=max ⇒ the
+ *      element stretches and size_delta becomes an inset (margin).
+ *   pivot ∈ [0,1] : the element's own reference point (0,0 = top-left,
+ *      0.5,0.5 = centre) that anchored_position offsets from.
+ *   anchored_position : pixel offset of the pivot from the anchor.
+ *   size_delta : when not stretching, the element's pixel size; when
+ *      stretching on an axis, the inset from each anchored edge.
+ *
+ * A zero-initialised RectTransform (all fields 0) is treated as a
+ * full-stretch rect (anchor 0..1, no inset) so legacy scenes authored
+ * before RectTransform existed still fill their parent canvas. */
+typedef struct {
+    float anchor_min[2];        /* {x,y} 0..1 (default 0,0) */
+    float anchor_max[2];        /* {x,y} 0..1 (default 1,1) */
+    float pivot[2];             /* {x,y} 0..1 (default 0.5,0.5) */
+    float anchored_position[2]; /* pixel offset of pivot from anchor */
+    float size_delta[2];        /* {w,h} px (fixed) or inset (stretch) */
+} JceRectTransform;
+
 /* ── UI: Canvas (root render target for 2D overlay) ────────────── */
 enum {
     JCE_CANVAS_OVERLAY     = 0, /* screen-space overlay */
@@ -907,6 +1051,10 @@ typedef struct {
     float fill_amount;        /* 0..1 (filled only) */
     bool  preserve_aspect;
     bool  raycast_target;
+    /* 9-slice borders in source-texture pixels (L,R,T,B); 0 ⇒ simple
+       quad even when image_type == JCE_UI_IMAGE_SLICED. */
+    float slice_border[4];
+    JceRectTransform rect;    /* layout (see JceRectTransform) */
 } JceUIImageComponent;
 
 /* ── UI: Text (font-rendered string) ───────────────────────────── */
@@ -928,6 +1076,7 @@ typedef struct {
     /* Runtime localization: when non-empty, jce_loc_t(locale_key)
        overrides `text` at display time; `text` acts as fallback. */
     char  locale_key[64];
+    JceRectTransform rect;    /* layout (see JceRectTransform) */
 } JceUITextComponent;
 
 /* ── UI: Button (clickable Image + state colors) ───────────────── */
@@ -1183,6 +1332,18 @@ JCE_API int       jce_scene_get_child_count(const JceScene *s, JceEntity parent)
  * world-space matrix is needed for rendering, picking, or gizmos. */
 JCE_API jce_mat4  jce_scene_get_world_matrix(const JceScene *s, JceEntity e);
 
+/* Invalidate the per-frame world-matrix cache that backs
+ * jce_scene_get_world_matrix. jce_scene_get_world_matrix memoizes each
+ * entity's composed world matrix for the current frame (so a parent shared
+ * by K children is composed once, not K times); this call begins a new
+ * frame, dropping every memoized entry. jce_scene_update calls it
+ * automatically each tick, and jce_scene_set_parent calls it on reparent;
+ * a host that mutates transforms and re-reads world matrices WITHOUT going
+ * through jce_scene_update first (e.g. an editor that only renders) should
+ * call this once at the top of its render frame to avoid reading a stale
+ * cached matrix. Cheap and idempotent. */
+JCE_API void      jce_scene_invalidate_world_cache(JceScene *s);
+
 /* Component access — Transform. */
 JCE_API void           jce_scene_set_transform(JceScene *s, JceEntity e, const JceTransform *t);
 JCE_API JceTransform  *jce_scene_get_transform(JceScene *s, JceEntity e);
@@ -1291,6 +1452,30 @@ JCE_API JceAudioSourceComponent      *jce_scene_get_audio_source(JceScene *s, Jc
 JCE_API bool                          jce_scene_has_audio_source(const JceScene *s, JceEntity e);
 JCE_API void                          jce_scene_remove_audio_source(JceScene *s, JceEntity e);
 
+/* Component access — VideoPlayer (video-as-texture). */
+JCE_API void                          jce_scene_set_video_player(JceScene *s, JceEntity e, const JceVideoPlayerComponent *c);
+JCE_API JceVideoPlayerComponent      *jce_scene_get_video_player(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_video_player(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_video_player(JceScene *s, JceEntity e);
+
+/* Per-frame video-as-texture driver.
+ *
+ * Iterates every entity holding a JceVideoPlayerComponent and, for those
+ * that are playing (or set to autoplay), opens the clip on first use,
+ * advances the decoder by `dt` seconds, and uploads the freshest decoded
+ * frame into the component's `output_tex`.  Call ONCE per frame.  Both the
+ * runtime (jce_runtime_step) and the editor (when not in play mode) drive
+ * this; the renderer only reads output_tex, so it stays idempotent across
+ * multiple render passes/viewports.
+ *
+ * `resolve_path`, when non-NULL, maps the asset-relative clip_path to a
+ * host-openable path (mirrors the scene renderer's resolve_path callback);
+ * pass NULL to open clip_path as-is. */
+typedef bool (*JceVideoResolvePathFn)(const char *in, char *out, int outsz, void *ud);
+JCE_API void jce_scene_video_update(JceScene *s, double dt,
+                                    JceVideoResolvePathFn resolve_path,
+                                    void *resolve_ud);
+
 /* Component access — Script. */
 JCE_API void                          jce_scene_set_script(JceScene *s, JceEntity e, const JceScriptComponent *c);
 JCE_API JceScriptComponent           *jce_scene_get_script(JceScene *s, JceEntity e);
@@ -1302,6 +1487,21 @@ JCE_API void                          jce_scene_set_particle_emitter(JceScene *s
 JCE_API JceParticleEmitterComponent  *jce_scene_get_particle_emitter(JceScene *s, JceEntity e);
 JCE_API bool                          jce_scene_has_particle_emitter(const JceScene *s, JceEntity e);
 JCE_API void                          jce_scene_remove_particle_emitter(JceScene *s, JceEntity e);
+
+/* Particle system tick (P2-particle-vfx-runtime).
+ *
+ * Drives every entity carrying a JceParticleEmitterComponent: lazily
+ * creates a scene-owned JceParticleSystem, loads each component's
+ * `*.particles.json` into a real emitter (falling back to the legacy
+ * quick-tune fields when no asset is set), keeps the emitter origin synced
+ * to the entity's world position, ticks the simulation, and submits alive
+ * particles as debug-draw billboards (the CPU particle backend has no
+ * dedicated GPU billboard pass yet).  Runs once per runtime step after
+ * jce_scene_update so it reads the freshest transforms. */
+JCE_API void jce_scene_particles_update(JceScene *s, float dt);
+
+/* Release the scene-owned particle system (called from jce_scene_destroy). */
+JCE_API void jce_scene_particles_shutdown(JceScene *s);
 
 /* Component access — BehaviorTree. */
 JCE_API void                          jce_scene_set_behavior_tree(JceScene *s, JceEntity e, const JceBehaviorTree *c);
@@ -1579,6 +1779,16 @@ JCE_API void                          jce_scene_remove_occlusion_portal(JceScene
 
 /* Component enumeration — returns bitmask of JceComponentFlag. */
 JCE_API uint64_t jce_scene_get_component_flags(const JceScene *s, JceEntity e);
+
+/* ── Per-component enable / disable (Unity-style) ──────────────────────
+ * Disabling a component PRESERVES its data; it just stops being processed by
+ * the systems (render / physics / animation / audio …) and persists in the
+ * scene file. `flag` is a single JCE_COMP_FLAG_* bit. Default = enabled. */
+JCE_API bool     jce_scene_component_enabled(const JceScene *s, JceEntity e, uint64_t flag);
+JCE_API void     jce_scene_set_component_enabled(JceScene *s, JceEntity e, uint64_t flag, bool enabled);
+/* Whole disabled-bitmask accessors (for serialization). */
+JCE_API uint64_t jce_scene_get_disabled_components(const JceScene *s, JceEntity e);
+JCE_API void     jce_scene_set_disabled_components(JceScene *s, JceEntity e, uint64_t disabled_mask);
 
 /* Iteration helpers for the editor. */
 typedef void (*JceEntityCallback)(JceScene *s, JceEntity e, void *user_data);

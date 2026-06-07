@@ -12,6 +12,7 @@ extern "C" {
 #endif
 
 #include <jce/middleware/ai/jce_bt.h>
+#include <jce/middleware/ai/jce_perception.h>
 
 
 

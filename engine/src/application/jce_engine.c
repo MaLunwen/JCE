@@ -34,7 +34,10 @@
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/resource/jce_bundle_loader.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_json.h>
+#include <jce/os/platform/jce_host_paths.h>
 #include <jce/os/platform/jce_input.h>
+#include <jce/os/platform/jce_input_actions.h>
 #include <jce/os/platform/jce_single_instance.h>
 #include <jce/os/platform/jce_window.h>
 #include <jce/os/platform/jce_window_modal_loop.h>
@@ -131,6 +134,95 @@ static void jce_select_config_path(char *out_path, size_t out_size)
     snprintf(out_path, out_size, "%s.config/jce.ini", base ? base : "");
 }
 
+/* QW-input-actions — locate the action-map authored by the editor.
+ * The editor's Input Manager panel writes `~/.jce/input_actions.json`
+ * (jce_editor_dotjce_path).  A shipped game may instead drop a
+ * project-relative `.jce/input_actions.json` next to its working dir.
+ * Prefer the CWD-relative copy (game ships its own), then the per-user
+ * one (editor authoring), so play-in-editor and standalone both work. */
+static void jce_select_input_actions_path(char *out_path, size_t out_size)
+{
+    out_path[0] = '\0';
+
+    const char *cwd_actions = ".jce/input_actions.json";
+    if (jce_path_exists(cwd_actions)) {
+        snprintf(out_path, out_size, "%s", cwd_actions);
+        return;
+    }
+
+    char home[512];
+    if (jce_host_get_user_folder(JCE_USER_FOLDER_HOME, home, sizeof(home))) {
+        size_t hl = strlen(home);
+        while (hl > 0 && (home[hl - 1] == '/' || home[hl - 1] == '\\'))
+            home[--hl] = '\0';
+        snprintf(out_path, out_size, "%s/.jce/input_actions.json", home);
+    }
+}
+
+/* Parse the editor's input_actions.json into a fresh JceInputActions.
+ * On any miss (no file / parse error / empty) returns NULL so the caller
+ * can fall back to jce_actions_bind_fps_defaults().  Shape:
+ *   { "actions": [ { "name": "...", "binds":
+ *       [ {"type":N,"code":N,"scale":F,"deadzone":F}, ... ] }, ... ] } */
+static JceInputActions *jce_load_input_actions(const char *path)
+{
+    if (!path || !path[0]) return NULL;
+
+    JceJson *root = jce_json_parse_file(path);
+    if (!root) return NULL;
+
+    JceJson *arr = jce_json_get(root, "actions");
+    if (!jce_json_is_array(arr)) {
+        jce_json_free(root);
+        return NULL;
+    }
+
+    JceInputActions *a = jce_actions_create();
+    if (!a) {
+        jce_json_free(root);
+        return NULL;
+    }
+
+    int registered = 0;
+    const int n = jce_json_array_size(arr);
+    for (int i = 0; i < n; ++i) {
+        JceJson *act = jce_json_array_at(arr, i);
+        if (!jce_json_is_object(act)) continue;
+
+        const char *name = jce_json_get_string(act, "name", NULL);
+        if (!name || !name[0]) continue;
+
+        int id = jce_action_register(a, name);
+        if (id < 0) continue;   /* duplicate / table full */
+        registered++;
+
+        JceJson *binds = jce_json_get(act, "binds");
+        if (!jce_json_is_array(binds)) continue;
+
+        const int bn = jce_json_array_size(binds);
+        for (int b = 0; b < bn; ++b) {
+            JceJson *bj = jce_json_array_at(binds, b);
+            if (!jce_json_is_object(bj)) continue;
+
+            JceBinding bind = {
+                .type     = (JceBindType)jce_json_get_int(bj, "type", JCE_BIND_KEY),
+                .code     = jce_json_get_int(bj, "code", 0),
+                .scale    = (float)jce_json_get_number(bj, "scale", 1.0),
+                .deadzone = (float)jce_json_get_number(bj, "deadzone", 0.15)
+            };
+            jce_action_bind(a, id, &bind);
+        }
+    }
+
+    jce_json_free(root);
+
+    if (registered == 0) {
+        jce_actions_destroy(a);
+        return NULL;
+    }
+    return a;
+}
+
 /* P3-B.3 — engine-internal lifecycle listener.  Bridges OS LOW_MEMORY
  * signals to the streaming pressure system so registered mip-streaming
  * / cache hooks fire even before our own budget tripped.  Other events
@@ -151,6 +243,7 @@ struct JceEngine {
     JceGpuCaps       gpu_caps;
     JceWindow       *window;
     JceInput        *input;
+    JceInputActions *actions;       /* action-map layer (QW-input-actions) */
     JceAudio        *audio;
     JceRenderer     *renderer;
     JcePakArchive      *pak;
@@ -387,10 +480,12 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         e->pak = NULL;
     }
 #endif
+#if !JCE_PLATFORM_WEB && !JCE_PLATFORM_ANDROID && !defined(JCE_BUILD_JNI)
     if (!e->pak && assets_pak_data_size > 1) {
         fatal_msg("Failed to open PAK archive");
         goto fail;
     }
+#endif
 
     /* Optional bundle catalog (opt-in via jce_engine_set_bundle_catalog_path). */
     if (g_bundle_catalog_path[0]) {
@@ -487,6 +582,29 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         goto fail;
     }
 
+    /* QW-input-actions — own the action-map layer in parallel with raw
+     * input.  Load the editor-authored bindings if present; otherwise
+     * seed the standard WASD/gamepad FPS defaults so games + the camera
+     * controller always have a usable action set.  Updated each frame in
+     * jce_engine_iterate; queried via jce_engine_get_actions / the
+     * JceServices.actions handle. */
+    {
+        char actions_path[512];
+        jce_select_input_actions_path(actions_path, sizeof(actions_path));
+        e->actions = jce_load_input_actions(actions_path);
+        if (e->actions) {
+            LOG_INFO(LOG_TAG, "input actions loaded from %s", actions_path);
+        } else {
+            e->actions = jce_actions_create();
+            if (e->actions) {
+                jce_actions_bind_fps_defaults(e->actions);
+                LOG_INFO(LOG_TAG, "input actions: using built-in FPS defaults");
+            } else {
+                LOG_WARN(LOG_TAG, "input actions init failed");
+            }
+        }
+    }
+
     e->audio = jce_audio_create();
     if (!e->audio)
         LOG_WARN(LOG_TAG, "audio init failed, continuing without sound");
@@ -526,6 +644,7 @@ JceEngine *jce_engine_create(int argc, char *argv[])
     e->svc = (JceServices){
         .window   = e->window,
         .input    = e->input,
+        .actions  = e->actions,
         .audio    = e->audio,
         .renderer = e->renderer,
         .pak      = e->pak,
@@ -993,12 +1112,23 @@ JceAppResult jce_engine_iterate(JceEngine *e)
     jce_player_loop_run_phase(JCE_PHASE_INITIALIZATION, dt);
     jce_player_loop_run_phase(JCE_PHASE_EARLY_UPDATE, dt);
 
+    /* QW-input-actions — evaluate the action map against the current
+     * input snapshot so FIXED_UPDATE / UPDATE consumers (games, camera
+     * controller) read fresh action values this frame.  Raw-input queries
+     * remain available in parallel; this only resurrects the action layer.
+     * prev_value bookkeeping (for jce_action_pressed/_released) advances
+     * once per call here, matching the once-per-frame edge contract. */
+    if (e->actions && e->input)
+        jce_actions_update(e->actions, e->input);
+
     /* ── PlayerLoop: FIXED_UPDATE (P3-B.2) ──────────────────────────
      * Glenn Fiedler accumulator: drives 0..N fixed steps per frame so
      * physics + future deterministic netcode see a stable cadence
      * regardless of render rate.  Spiral-of-death clamp lives inside
-     * jce_fixed_clock_advance.  Configurable via
-     * jce_engine_set_fixed_hz (default 50 Hz, Unity parity). */
+     * jce_fixed_clock_advance.  This is the SAME clock the per-runtime
+     * physics step adopts its cadence from (P1-fixed-clock-unify), so a
+     * jce_engine_set_fixed_hz() change reaches physics too.  Configurable
+     * via jce_engine_set_fixed_hz (default 60 Hz, == physics step). */
     {
         JceFixedClock *fc = jce_fixed_clock_default();
         const uint32_t steps = jce_fixed_clock_advance(fc, (double)dt);
@@ -1106,6 +1236,11 @@ void *jce_engine_get_bundle_catalog(JceEngine *e)
     return e ? e->bundle_catalog : NULL;
 }
 
+JceInputActions *jce_engine_get_actions(JceEngine *e)
+{
+    return e ? e->actions : NULL;
+}
+
 void jce_engine_destroy(JceEngine *e)
 {
     if (!e) return;
@@ -1143,6 +1278,7 @@ void jce_engine_destroy(JceEngine *e)
     }
     if (e->bundle_fs) { jce_fs_destroy(e->bundle_fs); e->bundle_fs = NULL; }
     if (e->pak)      jce_pak_close(e->pak);
+    if (e->actions)  jce_actions_destroy(e->actions);
     if (e->input)    jce_input_destroy(e->input);
     if (e->window)   jce_window_destroy(e->window);
     jce_single_instance_unlock();
@@ -1170,7 +1306,7 @@ void jce_engine_destroy(JceEngine *e)
 void jce_engine_set_fixed_hz(double hz)
 {
     JceFixedClock *fc = jce_fixed_clock_default();
-    const double fixed_dt = (hz > 0.0) ? (1.0 / hz) : (1.0 / 50.0);
+    const double fixed_dt = (hz > 0.0) ? (1.0 / hz) : (1.0 / 60.0);
     /* Preserve max_frame_dt + counters; only retune cadence. */
     fc->fixed_dt = fixed_dt;
     /* Drop a stale accumulator that no longer matches the new step. */

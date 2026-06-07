@@ -6,6 +6,7 @@
  */
 
 #include "jce_gizmo.h"
+#include "jce_gizmo_compound_collider.h"
 
 #include "core/jce_editor_defaults.h"
 
@@ -150,6 +151,9 @@ extern "C" void jce_gizmo_init(void)
 
 extern "C" void jce_gizmo_shutdown(void)
 {
+    /* Drop the compound-collider gizmo's cooked-wireframe cache so it
+     * doesn't leak across the session. */
+    jce_gizmo_compound_collider_clear_cache();
     memset(&s_gizmo, 0, sizeof(s_gizmo));
 }
 

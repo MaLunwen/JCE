@@ -6,6 +6,7 @@
  * for cache-friendly iteration.
  */
 
+#include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/renderer/jce_particles.h>
@@ -285,4 +286,108 @@ uint32_t jce_particles_alive_count(const JceParticleSystem *sys)
             total += sys->emitters[i].alive_count;
     }
     return total;
+}
+
+/* ── Read-back ─────────────────────────────────────────────────────── */
+
+uint32_t jce_particles_emitter_alive_count(const JceParticleSystem *sys,
+                                           JceEmitterHandle emitter)
+{
+    if (!sys || !jce_emitter_valid(emitter) || emitter.idx >= MAX_EMITTERS)
+        return 0;
+    const Emitter *em = &sys->emitters[emitter.idx];
+    return em->alive ? em->alive_count : 0;
+}
+
+bool jce_particles_emitter_is_alive(const JceParticleSystem *sys,
+                                    JceEmitterHandle emitter)
+{
+    if (!sys || !jce_emitter_valid(emitter) || emitter.idx >= MAX_EMITTERS)
+        return false;
+    return sys->emitters[emitter.idx].alive;
+}
+
+void jce_particles_emitter_for_each(const JceParticleSystem *sys,
+                                    JceEmitterHandle emitter,
+                                    JceParticleVisitFn cb, void *user_data)
+{
+    if (!sys || !cb || !jce_emitter_valid(emitter) || emitter.idx >= MAX_EMITTERS)
+        return;
+    const Emitter *em = &sys->emitters[emitter.idx];
+    if (!em->alive) return;
+    for (uint32_t i = 0; i < em->alive_count; i++) {
+        const Particle *p = &em->pool[i];
+        JceParticleView v;
+        v.position = p->position;
+        v.color    = p->color;
+        v.size     = p->size;
+        cb(&v, user_data);
+    }
+}
+
+/* ── Asset I/O ─────────────────────────────────────────────────────── */
+
+void jce_particles_desc_default(JceParticleEmitterDesc *out)
+{
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    out->max_particles = 1024;
+    out->emit_rate     = 50.0f;
+    out->lifetime_min  = 1.0f;
+    out->lifetime_max  = 2.0f;
+    out->velocity_min  = jce_v3(-0.5f, 1.0f, -0.5f);
+    out->velocity_max  = jce_v3( 0.5f, 2.0f,  0.5f);
+    out->gravity       = jce_v3( 0.0f, -1.0f, 0.0f);
+    out->size_start    = 0.1f;
+    out->size_end      = 0.0f;
+    out->color_start   = jce_v4(1.0f, 1.0f, 1.0f, 1.0f);
+    out->color_end     = jce_v4(1.0f, 1.0f, 1.0f, 0.0f);
+    out->texture       = JCE_INVALID_TEXTURE;
+    out->world_space   = false;
+}
+
+bool jce_particles_desc_load_json(const char *path, JceParticleEmitterDesc *out,
+                                  char *texture_out, int texture_cap)
+{
+    if (!out) return false;
+    jce_particles_desc_default(out);
+    if (texture_out && texture_cap > 0) texture_out[0] = '\0';
+    if (!path || !path[0]) return false;
+
+    JceJson *root = jce_json_parse_file(path);
+    if (!root) {
+        LOG_WARN(LOG_TAG, "particle asset not loadable: %s", path);
+        return false;
+    }
+
+    out->max_particles = (uint32_t)jce_json_get_int(root, "maxParticles",
+                                                    (int)out->max_particles);
+    out->emit_rate     = (float)jce_json_get_number(root, "emitRate",    out->emit_rate);
+    out->emit_burst    = (float)jce_json_get_number(root, "emitBurst",   out->emit_burst);
+    out->lifetime_min  = (float)jce_json_get_number(root, "lifetimeMin", out->lifetime_min);
+    out->lifetime_max  = (float)jce_json_get_number(root, "lifetimeMax", out->lifetime_max);
+    out->size_start    = (float)jce_json_get_number(root, "sizeStart",   out->size_start);
+    out->size_end      = (float)jce_json_get_number(root, "sizeEnd",     out->size_end);
+    out->world_space   = jce_json_get_bool(root, "worldSpace", out->world_space);
+    jce_json_get_floats(root, "velocityMin", &out->velocity_min.x, 3, &out->velocity_min.x);
+    jce_json_get_floats(root, "velocityMax", &out->velocity_max.x, 3, &out->velocity_max.x);
+    jce_json_get_floats(root, "gravity",     &out->gravity.x,      3, &out->gravity.x);
+    jce_json_get_floats(root, "colorStart",  &out->color_start.x,  4, &out->color_start.x);
+    jce_json_get_floats(root, "colorEnd",    &out->color_end.x,    4, &out->color_end.x);
+
+    if (texture_out && texture_cap > 0) {
+        const char *tex = jce_json_get_string(root, "texture", "");
+        if (tex && tex[0]) {
+            int n = (int)strlen(tex);
+            if (n >= texture_cap) n = texture_cap - 1;
+            memcpy(texture_out, tex, (size_t)n);
+            texture_out[n] = '\0';
+        }
+    }
+
+    if (out->lifetime_max < out->lifetime_min)
+        out->lifetime_max = out->lifetime_min;
+
+    jce_json_free(root);
+    return true;
 }

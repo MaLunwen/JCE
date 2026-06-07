@@ -11,6 +11,7 @@
 
 #include <jce/os/core/jce_defs.h>
 #include <jce/renderer/jce_texture_types.h>
+#include <jce/resource/jce_asset_format.h>  /* JceAssetTexInfo */
 
 JCE_EXTERN_C_BEGIN
 
@@ -33,6 +34,17 @@ JCE_API JceTexture jce_texture_load_from_surface(const void *surface, int sample
    Caller retains ownership of data. */
 JceTexture jce_texture_from_rgba(const void *data,
                                   uint32_t width, uint32_t height);
+
+/* Create a GPU texture from a cooked .jceasset pixel payload, honoring the
+   block-compressed format (BC1/BC3/BC5/BC7/ASTC4x4/ETC2A, default RGBA8) and
+   the mip chain recorded in `info`. `pixels` points at the full TEX_PIXELS
+   payload (all mips concatenated when info->mip_count > 1); `pixel_bytes` is
+   its size. Used by the async texture finalize path so it matches the
+   synchronous cooked loader. Caller retains ownership of `info`/`pixels`. */
+JCE_API JceTexture jce_texture_from_cooked(const JceAssetTexInfo *info,
+                                           const void *pixels,
+                                           size_t pixel_bytes,
+                                           int sampler_mode);
 
 /* Update an existing RGBA8 texture in-place.
    Returns false when the handle is invalid, dimensions mismatch, or upload fails. */

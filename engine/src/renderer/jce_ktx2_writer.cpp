@@ -23,6 +23,9 @@
 #include <bx/error.h>
 #include <bx/readerwriter.h>
 
+#include <bgfx/c99/bgfx.h>
+
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -132,4 +135,125 @@ extern "C" bool jce__ktx2_write_cubemap(const char    *path,
     LOG_INFO(JCE_KTX_TAG, "wrote %s (%lld bytes, %ux%u cube, %u mips)",
              path, (long long)w.size, face_size, face_size, mip_count);
     return true;
+}
+
+/* Minimal KTX1 reader for the single-mip RGBA8 cubemaps the bake worker
+ * emits via bimg::imageWriteKtx (above). We deliberately parse the
+ * container by hand rather than pulling in bimg's `imageParse`: the latter
+ * lives in the separate `bimg_decode` static lib which bundles its own
+ * `miniz`, colliding at link time with the engine's `zip` dependency
+ * (LNK2005 on the mz_ / tdefl_ / tinfl_ symbols). A hand-rolled KTX1
+ * parse keeps the reader free of that dependency.  KTX1 spec:
+ * www.khronos.org/registry/KTX/specs/1.0/ktxspec_v1.html
+ */
+extern "C" uint16_t jce__ktx_load_cubemap(const char *path)
+{
+    const uint16_t kInvalid = UINT16_MAX;
+    if (!path || !path[0]) return kInvalid;
+
+    uint64_t  bytes = 0;
+    uint8_t  *file  = (uint8_t *)jce_fs_host_read_all(path, &bytes);
+    if (!file || bytes < 64) {
+        if (file) jce_fs_buffer_free(file);
+        LOG_WARN(JCE_KTX_TAG, "cubemap read failed: %s", path);
+        return kInvalid;
+    }
+
+    static const uint8_t kKtx1Id[12] = {
+        0xAB, 0x4B, 0x54, 0x58, 0x20, 0x31,
+        0x31, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A
+    };
+    if (memcmp(file, kKtx1Id, sizeof(kKtx1Id)) != 0) {
+        LOG_WARN(JCE_KTX_TAG, "not a KTX1 cubemap: %s", path);
+        jce_fs_buffer_free(file);
+        return kInvalid;
+    }
+
+    /* Header is 13 uint32 after the 12-byte identifier (KTX1 spec order):
+     *   [0]=endianness            [1]=glType         [2]=glTypeSize
+     *   [3]=glFormat              [4]=glInternalFmt  [5]=glBaseInternalFmt
+     *   [6]=pixelWidth            [7]=pixelHeight    [8]=pixelDepth
+     *   [9]=numArrayElements      [10]=numberOfFaces [11]=numMipmapLevels
+     *   [12]=bytesOfKeyValueData
+     * The writer emits little-endian (endianness word == 0x04030201). */
+    const uint8_t *p = file + 12;
+    uint32_t hdr[13];
+    memcpy(hdr, p, sizeof(hdr));
+    p += sizeof(hdr);
+
+    const uint32_t endianness = hdr[0];
+    const uint32_t pixelWidth = hdr[6];
+    const uint32_t numFaces   = hdr[10];
+    const uint32_t numMips    = hdr[11] ? hdr[11] : 1u;
+    const uint32_t kvdBytes   = hdr[12];
+
+    if (endianness != 0x04030201u || pixelWidth == 0 || numFaces != 6) {
+        LOG_WARN(JCE_KTX_TAG, "unsupported KTX (endian=%08x w=%u faces=%u): %s",
+                 endianness, pixelWidth, numFaces, path);
+        jce_fs_buffer_free(file);
+        return kInvalid;
+    }
+
+    /* Skip key/value data block. */
+    if ((uint64_t)(p - file) + kvdBytes > bytes) {
+        LOG_WARN(JCE_KTX_TAG, "truncated KTX kvd: %s", path);
+        jce_fs_buffer_free(file);
+        return kInvalid;
+    }
+    p += kvdBytes;
+
+    /* Mip 0 only (the bake emits single-mip). Each level begins with a
+     * uint32 imageSize = bytes of ONE face. 6 faces follow, each padded to
+     * 4-byte (cubePadding). RGBA8 => 4 bpp. */
+    if ((uint64_t)(p - file) + 4u > bytes) {
+        jce_fs_buffer_free(file);
+        return kInvalid;
+    }
+    uint32_t faceBytes;
+    memcpy(&faceBytes, p, 4u);
+    p += 4u;
+
+    const uint32_t expect = pixelWidth * pixelWidth * 4u;
+    if (faceBytes != expect) {
+        LOG_WARN(JCE_KTX_TAG,
+                 "unexpected face size (%u, want RGBA8 %u): %s",
+                 faceBytes, expect, path);
+        jce_fs_buffer_free(file);
+        return kInvalid;
+    }
+
+    const uint32_t cubePad = (4u - (faceBytes & 3u)) & 3u; /* 0 for RGBA8 */
+    const uint64_t needed  = (uint64_t)(p - file)
+                           + (uint64_t)(faceBytes + cubePad) * 6u;
+    if (needed > bytes) {
+        LOG_WARN(JCE_KTX_TAG, "truncated KTX faces: %s", path);
+        jce_fs_buffer_free(file);
+        return kInvalid;
+    }
+
+    /* Pack the 6 faces contiguously (no padding) for bgfx_copy, which is
+     * the layout bgfx_create_texture_cube expects for a single-mip cube. */
+    const bgfx_memory_t *mem = bgfx_alloc(faceBytes * 6u);
+    if (!mem) { jce_fs_buffer_free(file); return kInvalid; }
+    for (uint32_t f = 0; f < 6u; ++f) {
+        memcpy(mem->data + (size_t)f * faceBytes, p, faceBytes);
+        p += faceBytes + cubePad;
+    }
+    jce_fs_buffer_free(file);
+
+    bgfx_texture_handle_t h = bgfx_create_texture_cube(
+        (uint16_t)pixelWidth,
+        false,                 /* hasMips (single-mip) */
+        1,                     /* numLayers */
+        BGFX_TEXTURE_FORMAT_RGBA8,
+        BGFX_TEXTURE_NONE | BGFX_SAMPLER_NONE,
+        mem);
+
+    if (!BGFX_HANDLE_IS_VALID(h)) {
+        LOG_WARN(JCE_KTX_TAG, "cubemap GPU upload failed: %s", path);
+        return kInvalid;
+    }
+    LOG_INFO(JCE_KTX_TAG, "loaded cubemap %s (%ux%u, %u mips)",
+             path, pixelWidth, pixelWidth, numMips);
+    return h.idx;
 }

@@ -31,17 +31,28 @@
 #include "core/jce_assetdb.h"
 extern "C" {
 #include <jce/os/core/jce_json.h>
+#include <jce/middleware/animation/jce_anim_sm.h>
 }
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace {
 
-enum ParamType { PT_FLOAT = 0, PT_INT = 1, PT_BOOL = 2, PT_TRIGGER = 3 };
+/* Param-type ids kept in lockstep with the engine's authoritative
+ * JceAnimSmParamType (jce_anim_sm.h): the on-disk "type" int crosses the
+ * editor-writes / engine-reads boundary, so bind to the engine enum instead
+ * of re-declaring the magic values (drift becomes a compile error). */
+enum ParamType {
+    PT_FLOAT   = JCE_ANIM_SM_PARAM_FLOAT,
+    PT_INT     = JCE_ANIM_SM_PARAM_INT,
+    PT_BOOL    = JCE_ANIM_SM_PARAM_BOOL,
+    PT_TRIGGER = JCE_ANIM_SM_PARAM_TRIGGER,
+};
 enum CondOp    { CO_GT = 0, CO_LT = 1, CO_EQ = 2, CO_NEQ = 3, CO_TRUE = 4, CO_FALSE = 5 };
 
 struct Param {
@@ -83,13 +94,25 @@ struct Editor {
     int   sel_state      = -1;
     int   sel_trans      = -1;
     int   dragging_state = -1;
+    bool  drag_snapshot_taken = false;
     ImVec2 drag_offset   = ImVec2(0, 0);
     int   adding_from    = -1;     /* >=0 means waiting to pick destination */
     ImVec2 pan           = ImVec2(0, 0);
     float zoom           = 1.0f;
     bool  initialised    = false;
     char  path[260]      = {0};
+
+    /* Local undo/redo: the state machine lives in this struct (not the
+     * scene ECS), so the editor's scene-snapshot undo does not cover it.
+     * Snapshots are the SM serialised to a compact JSON string.  An edit
+     * field that is dragged/typed continuously opens a single snapshot on
+     * activation (field_edit_open) and closes it on deactivation. */
+    std::vector<std::string> undo;
+    std::vector<std::string> redo;
+    bool  field_edit_open = false;
 };
+
+const size_t kSmUndoLimit = 64;
 
 Editor g;
 
@@ -119,8 +142,14 @@ const char *cond_op_name(int op)
 
 void seed_default(void)
 {
+    /* Seed starter content exactly once, and only when the editor is truly
+     * empty.  Gating on emptiness (not just the `initialised` flag) keeps a
+     * state machine that was loaded or authored before the first draw from
+     * being clobbered by the default Idle/Move seed. */
     if (g.initialised) return;
     g.initialised = true;
+    if (!g.states.empty() || !g.trans.empty() || !g.params.empty())
+        return;
     State idle;   std::strncpy(idle.name,  "Idle", sizeof(idle.name) - 1);
                   idle.pos = ImVec2(140, 140);
     State move;   std::strncpy(move.name,  "Move", sizeof(move.name) - 1);
@@ -280,6 +309,77 @@ void from_json(JceJson *root)
     g.sel_trans = -1;
 }
 
+/* ───── Local undo / redo ──────────────────────────────────────── */
+
+std::string snapshot_string(void)
+{
+    JceJson *root = to_json();
+    char *txt = jce_json_print(root, /*pretty=*/false);
+    std::string out = txt ? txt : "";
+    if (txt) jce_json_free_string(txt);
+    jce_json_free(root);
+    return out;
+}
+
+void apply_snapshot(const std::string &snap)
+{
+    if (snap.empty()) return;
+    JceJson *root = jce_json_parse(snap.c_str(), snap.size());
+    if (!root) return;
+    from_json(root);
+    jce_json_free(root);
+}
+
+/* Capture the current SM before a mutating edit.  Clears the redo
+ * stack (a fresh edit branch).  Skips a duplicate of the most recent
+ * snapshot so no-op interactions do not flood the history. */
+void push_undo(void)
+{
+    std::string snap = snapshot_string();
+    if (!g.undo.empty() && g.undo.back() == snap) return;
+    g.undo.push_back(std::move(snap));
+    if (g.undo.size() > kSmUndoLimit)
+        g.undo.erase(g.undo.begin());
+    g.redo.clear();
+}
+
+/* Open a single undo snapshot for a continuously-edited field (drag /
+ * text) on the frame the widget is activated; pair with field_track_end
+ * each frame so deactivation re-arms capture for the next field. */
+void field_track_begin(void)
+{
+    if (ImGui::IsItemActivated() && !g.field_edit_open) {
+        push_undo();
+        g.field_edit_open = true;
+    }
+}
+
+void field_track_end(void)
+{
+    if (g.field_edit_open && ImGui::IsItemDeactivated())
+        g.field_edit_open = false;
+}
+
+void sm_undo(void)
+{
+    if (g.undo.empty()) return;
+    g.redo.push_back(snapshot_string());
+    if (g.redo.size() > kSmUndoLimit) g.redo.erase(g.redo.begin());
+    std::string target = std::move(g.undo.back());
+    g.undo.pop_back();
+    apply_snapshot(target);
+}
+
+void sm_redo(void)
+{
+    if (g.redo.empty()) return;
+    g.undo.push_back(snapshot_string());
+    if (g.undo.size() > kSmUndoLimit) g.undo.erase(g.undo.begin());
+    std::string target = std::move(g.redo.back());
+    g.redo.pop_back();
+    apply_snapshot(target);
+}
+
 void save_to(const char *path)
 {
     if (ed_write_json_to_file(path, to_json()))
@@ -307,6 +407,9 @@ void load_from(const char *path)
     }
     from_json(root);
     jce_json_free(root);
+    g.undo.clear();
+    g.redo.clear();
+    g.field_edit_open = false;
     jce_editor_console_log("animator-sm loaded: %s (states=%d trans=%d)",
                            path, (int)g.states.size(), (int)g.trans.size());
 }
@@ -314,6 +417,7 @@ void load_from(const char *path)
 void delete_state(int idx)
 {
     if (idx < 0 || idx >= (int)g.states.size()) return;
+    push_undo();
     g.states.erase(g.states.begin() + idx);
     /* Remove or remap transitions. */
     for (int i = (int)g.trans.size() - 1; i >= 0; --i) {
@@ -334,6 +438,7 @@ void delete_state(int idx)
 void delete_param(int idx)
 {
     if (idx < 0 || idx >= (int)g.params.size()) return;
+    push_undo();
     g.params.erase(g.params.begin() + idx);
     for (auto &t : g.trans) {
         for (int i = (int)t.conds.size() - 1; i >= 0; --i) {
@@ -451,11 +556,16 @@ void draw_canvas(void)
             b.x -= d.x * pad; b.y -= d.y * pad;
         }
         draw_arrow(dl, a, b, col, sel ? 3.0f : 1.8f);
-        /* Pickable midpoint. */
-        ImVec2 mid = ImVec2((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f);
+        /* Pickable along the WHOLE line (distance to the segment), not just a
+         * tiny circle at the midpoint — that was nearly impossible to click. */
         if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-            float dx = mp.x - mid.x, dy = mp.y - mid.y;
-            if (dx * dx + dy * dy < 100.0f) {
+            float vx = b.x - a.x, vy = b.y - a.y;
+            float seg2 = vx * vx + vy * vy;
+            float tt = (seg2 > 1e-4f) ? ((mp.x - a.x) * vx + (mp.y - a.y) * vy) / seg2 : 0.0f;
+            if (tt < 0.0f) tt = 0.0f; else if (tt > 1.0f) tt = 1.0f;
+            float cx = a.x + tt * vx, cy = a.y + tt * vy;
+            float ddx = mp.x - cx, ddy = mp.y - cy;
+            if (ddx * ddx + ddy * ddy < 81.0f) {   /* within ~9 px of the line */
                 g.sel_trans = (int)i;
                 g.sel_state = -1;
             }
@@ -498,6 +608,7 @@ void draw_canvas(void)
     if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
         if (g.adding_from >= 0) {
             if (hover_state >= 0 && hover_state != g.adding_from) {
+                push_undo();
                 Transition t;
                 t.from = g.adding_from;
                 t.to   = hover_state;
@@ -510,6 +621,7 @@ void draw_canvas(void)
             g.sel_state = hover_state;
             g.sel_trans = -1;
             g.dragging_state = hover_state;
+            g.drag_snapshot_taken = false;
             ImVec2 ws = to_screen(origin, g.states[hover_state].pos);
             g.drag_offset = ImVec2(mp.x - ws.x, mp.y - ws.y);
         } else if (g.sel_trans < 0) {
@@ -520,7 +632,16 @@ void draw_canvas(void)
         if (g.dragging_state < (int)g.states.size()) {
             ImVec2 desired_screen = ImVec2(mp.x - g.drag_offset.x, mp.y - g.drag_offset.y);
             ImVec2 w = to_world(origin, desired_screen);
-            g.states[g.dragging_state].pos = w;
+            ImVec2 &cur = g.states[g.dragging_state].pos;
+            if (w.x != cur.x || w.y != cur.y) {
+                /* Snapshot once per drag, on the first frame the node
+                 * actually moves (a click-select alone makes no entry). */
+                if (!g.drag_snapshot_taken) {
+                    push_undo();
+                    g.drag_snapshot_taken = true;
+                }
+                cur = w;
+            }
         }
     }
     if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) g.dragging_state = -1;
@@ -536,6 +657,7 @@ void draw_canvas(void)
     }
     if (ImGui::BeginPopup("##sm_canvas_ctx")) {
         if (ImGui::MenuItem(jce_editor_i18n("animatorSM.menu.newState"))) {
+            push_undo();
             State s;
             std::snprintf(s.name, sizeof(s.name), "State%d", (int)g.states.size());
             s.pos = to_world(origin, mp);
@@ -549,7 +671,7 @@ void draw_canvas(void)
         if (g.sel_state >= 0 && g.sel_state < (int)g.states.size()) {
             ImGui::Text("%s", g.states[g.sel_state].name);
             ImGui::Separator();
-            if (ImGui::MenuItem(jce_editor_i18n("animatorSM.menu.makeDefault")))      g.default_state = g.sel_state;
+            if (ImGui::MenuItem(jce_editor_i18n("animatorSM.menu.makeDefault")))   { push_undo(); g.default_state = g.sel_state; }
             if (ImGui::MenuItem(jce_editor_i18n("animatorSM.menu.addTransition"))) g.adding_from = g.sel_state;
             ImGui::Separator();
             if (ImGui::MenuItem(jce_editor_i18n("animatorSM.menu.delete")))            delete_state(g.sel_state);
@@ -570,9 +692,11 @@ void draw_state_inspector(void)
     }
     State &s = g.states[g.sel_state];
     ImGui::InputText(jce_editor_i18n_id("animatorSM.field.name", "s"), s.name,      sizeof(s.name));
+    field_track_begin(); field_track_end();
     jce_draw_path_input_asset(jce_editor_i18n_id("animatorSM.field.clip", "s"), s.clip_path, sizeof(s.clip_path), JCE_ASSET_KIND_DATA);
     if (ImGui::BeginDragDropTarget()) {
         if (const ImGuiPayload *pl = ImGui::AcceptDragDropPayload(JCE_DND_ASSET_PATH)) {
+            push_undo();
             char rel[1024];
             const char *src = jce_editor_path_relative_or(rel, sizeof(rel), (const char *)pl->Data);
             std::strncpy(s.clip_path, src, sizeof(s.clip_path) - 1);
@@ -581,8 +705,11 @@ void draw_state_inspector(void)
         ImGui::EndDragDropTarget();
     }
     ImGui::DragFloat(jce_editor_i18n_id("animatorSM.field.speed", "s"), &s.speed, 0.01f, 0.0f, 8.0f);
+    field_track_begin(); field_track_end();
+    bool loop_before = s.looping;
     ImGui::Checkbox(jce_editor_i18n_id("animatorSM.field.loop", "s"),   &s.looping);
-    if (ImGui::Button(jce_editor_i18n("animatorSM.button.setDefault"))) g.default_state = g.sel_state;
+    if (s.looping != loop_before) { bool now = s.looping; s.looping = loop_before; push_undo(); s.looping = now; }
+    if (ImGui::Button(jce_editor_i18n("animatorSM.button.setDefault"))) { push_undo(); g.default_state = g.sel_state; }
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("animatorSM.button.addTransitionFromThis"))) g.adding_from = g.sel_state;
     ImGui::SameLine();
@@ -602,9 +729,14 @@ void draw_transition_inspector(void)
                      ? g.states[t.to].name   : "?";
     ImGui::Text("%s  →  %s", fn, tn);
     ImGui::DragFloat(jce_editor_i18n_id("animatorSM.field.duration", "t"), &t.duration, 0.01f, 0.0f, 5.0f);
+    field_track_begin(); field_track_end();
+    bool exit_before = t.has_exit;
     ImGui::Checkbox (jce_editor_i18n_id("animatorSM.field.hasExitTime", "t"), &t.has_exit);
-    if (t.has_exit)
+    if (t.has_exit != exit_before) { bool now = t.has_exit; t.has_exit = exit_before; push_undo(); t.has_exit = now; }
+    if (t.has_exit) {
         ImGui::DragFloat(jce_editor_i18n_id("animatorSM.field.exitTime", "t"), &t.exit_time, 0.01f, 0.0f, 1.0f);
+        field_track_begin(); field_track_end();
+    }
 
     ImGui::SeparatorText(jce_editor_i18n("animatorSM.section.conditions"));
     for (int i = 0; i < (int)t.conds.size(); ++i) {
@@ -616,7 +748,7 @@ void draw_transition_inspector(void)
         if (ImGui::BeginCombo("##p", p_label)) {
             for (int k = 0; k < (int)g.params.size(); ++k) {
                 bool sel = (k == c.param_idx);
-                if (ImGui::Selectable(g.params[k].name, sel)) c.param_idx = k;
+                if (ImGui::Selectable(g.params[k].name, sel)) { if (c.param_idx != k) { int now = k; int prev = c.param_idx; c.param_idx = prev; push_undo(); c.param_idx = now; } }
             }
             ImGui::EndCombo();
         }
@@ -624,16 +756,18 @@ void draw_transition_inspector(void)
         ImGui::SetNextItemWidth(60);
         if (ImGui::BeginCombo("##op", cond_op_name(c.op))) {
             for (int k = 0; k < 6; ++k)
-                if (ImGui::Selectable(cond_op_name(k), c.op == k)) c.op = k;
+                if (ImGui::Selectable(cond_op_name(k), c.op == k)) { if (c.op != k) { int now = k; int prev = c.op; c.op = prev; push_undo(); c.op = now; } }
             ImGui::EndCombo();
         }
         ImGui::SameLine();
         if (c.op != CO_TRUE && c.op != CO_FALSE) {
             ImGui::SetNextItemWidth(80);
             ImGui::DragFloat("##thr", &c.threshold, 0.01f);
+            field_track_begin(); field_track_end();
             ImGui::SameLine();
         }
         if (ImGui::SmallButton("X")) {
+            push_undo();
             t.conds.erase(t.conds.begin() + i);
             ImGui::PopID();
             break;
@@ -641,11 +775,13 @@ void draw_transition_inspector(void)
         ImGui::PopID();
     }
     if (ImGui::Button(jce_editor_i18n("animatorSM.button.addCondition"))) {
+        push_undo();
         Condition c;
         t.conds.push_back(c);
     }
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("animatorSM.button.deleteTransition"))) {
+        push_undo();
         g.trans.erase(g.trans.begin() + g.sel_trans);
         g.sel_trans = -1;
     }
@@ -667,19 +803,20 @@ void draw_param_table(void)
             ImGui::TableSetColumnIndex(0);
             ImGui::SetNextItemWidth(-FLT_MIN);
             ImGui::InputText("##nm", p.name, sizeof(p.name));
+            field_track_begin(); field_track_end();
             ImGui::TableSetColumnIndex(1);
             ImGui::SetNextItemWidth(-FLT_MIN);
             if (ImGui::BeginCombo("##ty", param_type_name(p.type))) {
                 for (int k = 0; k < 4; ++k)
-                    if (ImGui::Selectable(param_type_name(k), p.type == k)) p.type = k;
+                    if (ImGui::Selectable(param_type_name(k), p.type == k)) { if (p.type != k) { int now = k; int prev = p.type; p.type = prev; push_undo(); p.type = now; } }
                 ImGui::EndCombo();
             }
             ImGui::TableSetColumnIndex(2);
             ImGui::SetNextItemWidth(120);
-            if (p.type == PT_FLOAT)        ImGui::DragFloat("##d", &p.def_f, 0.01f);
-            else if (p.type == PT_INT)     ImGui::DragInt  ("##d", &p.def_i, 1);
+            if (p.type == PT_FLOAT)      { ImGui::DragFloat("##d", &p.def_f, 0.01f); field_track_begin(); field_track_end(); }
+            else if (p.type == PT_INT)   { ImGui::DragInt  ("##d", &p.def_i, 1);     field_track_begin(); field_track_end(); }
             else if (p.type == PT_BOOL) {
-                bool b = p.def_b != 0; if (ImGui::Checkbox("##d", &b)) p.def_b = b ? 1 : 0;
+                bool b = p.def_b != 0; if (ImGui::Checkbox("##d", &b)) { push_undo(); p.def_b = b ? 1 : 0; }
             } else                          ImGui::TextDisabled("%s", jce_editor_i18n("animatorSM.empty.trigger"));
             ImGui::SameLine();
             if (ImGui::SmallButton("X")) { delete_param(i); ImGui::PopID(); break; }
@@ -688,6 +825,7 @@ void draw_param_table(void)
         ImGui::EndTable();
     }
     if (ImGui::Button(jce_editor_i18n("animatorSM.button.addParam"))) {
+        push_undo();
         Param p;
         std::snprintf(p.name, sizeof(p.name), "param%d", (int)g.params.size());
         g.params.push_back(p);
@@ -706,6 +844,14 @@ void draw_toolbar(void)
         else jce_editor_console_log_level(JCE_CONSOLE_WARNING,
                                          "animator-sm: set Path before Load");
     }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(g.undo.empty());
+    if (ImGui::Button(jce_editor_i18n("animatorSM.button.undo"))) sm_undo();
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(g.redo.empty());
+    if (ImGui::Button(jce_editor_i18n("animatorSM.button.redo"))) sm_redo();
+    ImGui::EndDisabled();
     ImGui::SameLine();
     ImGui::SetNextItemWidth(380);
     jce_draw_path_input(jce_editor_i18n_id("animatorSM.field.path", "sm"), g.path, sizeof(g.path), JcePathKind::FileAbs);
@@ -744,6 +890,19 @@ void draw_content(void)
     ImGui::Separator();
     ImGui::TextUnformatted(jce_editor_i18n("animatorSM.section.parameters"));
     draw_param_table();
+
+    /* Ctrl+Z / Ctrl+(Shift+)Z / Ctrl+Y while the workbench is focused and no
+     * field is being edited (so it doesn't collide with text-field editing). */
+    if (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        !ImGui::IsAnyItemActive()) {
+        ImGuiIO &io = ImGui::GetIO();
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
+            if (io.KeyShift) sm_redo();
+            else             sm_undo();
+        } else if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y, false)) {
+            sm_redo();
+        }
+    }
 }
 
 } /* namespace */

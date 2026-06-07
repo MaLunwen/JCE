@@ -32,6 +32,7 @@ LINTS = [
     "check_project_build_layout.py",
     "i18n_audit.py",
     "i18n_hardcoded.py",
+    "check_i18n_dup_values.py",
 ]
 
 

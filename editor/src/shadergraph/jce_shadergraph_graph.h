@@ -19,6 +19,11 @@ Node *find_node(Graph &g, int id);
  * Writes into *out and returns true on hit. */
 bool find_link_into(const Graph &g, int to_node, int to_sock, Link *out);
 
+/* Const overloads — identical lookups against an immutable graph, used by the
+ * read-only codegen / typecheck passes (which previously kept private copies). */
+const Node *find_node(const Graph &g, int id);
+const Link *find_link_into(const Graph &g, int to_node, int to_sock);
+
 /* Pure model: add a node of type `t` at local position `pos`.
  * Caller is responsible for any undo snapshot. */
 Node *add_node(Graph &g, NodeType t, Vec2 pos);

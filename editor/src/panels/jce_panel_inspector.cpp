@@ -28,6 +28,10 @@ static void *comp_get_ptr_and_size(JceScene *scene, JceEntity e,
         *out_size = sizeof(JceCompoundColliderComponent);
         return jce_scene_get_compound_collider(scene, e);
     }
+    if (jce_editor_component_slot_is_video_player(flag)) {
+        *out_size = sizeof(JceVideoPlayerComponent);
+        return jce_scene_get_video_player(scene, e);
+    }
 
     switch (flag) {
     case JCE_COMP_FLAG_TRANSFORM:
@@ -306,6 +310,10 @@ static void comp_section_set_open(EditorEntitySidecar &sidecar,
 /* Returns true if the component's body should be drawn this frame.
  * Updates sidecar fold state.  Handles the "..." popup
  * with a Remove menu (disabled when not removable, e.g. Transform). */
+/* Set while a disabled component's body is being drawn dimmed (Alpha pushed in
+ * comp_section_begin, popped in comp_section_end). Sections are never nested. */
+static bool s_comp_section_dimmed = false;
+
 static bool comp_section_begin(uint32_t entity_id,
                                EditorEntitySidecar &sidecar,
                                uint64_t flag,
@@ -323,8 +331,26 @@ static bool comp_section_begin(uint32_t entity_id,
          reads as a distinct band over the dark window bg.
        - Light themes: defer to ImGuiCol_Header so the bar tracks the
          active palette (avoids a near-black strip on white). */
+    /* Per-component enable state (Transform is essential — always on). When
+     * disabled, dim the section so it clearly reads as inactive (grey). */
+    JceScene *_es = jce_state_get_scene();
+    JceEntity _ee = jce_state_to_ecs_entity(entity_id);
+    /* Only a single-bit JCE_COMP_FLAG_* can be toggled via the disabled bitmask.
+     * Skip Transform (essential) and editor-only synthetic slots (flag 0 or a
+     * multi-bit mask, e.g. video player / compound collider) so we never set the
+     * wrong bit. */
+    bool flag_toggleable = flag != 0 && flag != JCE_COMP_FLAG_TRANSFORM &&
+                           (flag & (flag - 1)) == 0;
+    bool comp_disabled = flag_toggleable &&
+                         !jce_scene_component_enabled(_es, _ee, flag);
+
     ImGui::PushStyleColor(ImGuiCol_Header, jce_theme::inspector_header_color());
+    if (comp_disabled)
+        ImGui::PushStyleColor(ImGuiCol_Text, jce_theme::text_secondary());
+    float hdr_x = ImGui::GetCursorPosX();
     bool open = ImGui::CollapsingHeader(display_name, tn_flags);
+    if (comp_disabled)
+        ImGui::PopStyleColor();
     comp_section_set_open(sidecar, flag, open);
 
     /* Drag-reorder: pressing & dragging a header begins a drag; while
@@ -348,6 +374,21 @@ static bool comp_section_begin(uint32_t entity_id,
     }
 
     float header_w = ImGui::GetContentRegionAvail().x;
+
+    /* Enable checkbox right after the component NAME (prominent), so it clearly
+     * reads as that component's on/off switch. Transform is always enabled. */
+    if (flag_toggleable) {
+        float cb_x = hdr_x + ImGui::GetTreeNodeToLabelSpacing()
+                   + ImGui::CalcTextSize(display_name).x + 12.0f;
+        if (cb_x > header_w - 46.0f) cb_x = header_w - 46.0f;
+        bool _en = !comp_disabled;
+        ImGui::SameLine(cb_x);
+        if (ImGui::Checkbox("##comp_enabled", &_en))
+            jce_scene_set_component_enabled(_es, _ee, flag, _en);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", jce_editor_i18n("inspector.toggleComponentTip"));
+    }
+
     ImGui::SameLine(header_w - 20);
     if (ImGui::SmallButton("..."))
         ImGui::OpenPopup("ComponentSettings");
@@ -445,6 +486,18 @@ static bool comp_section_begin(uint32_t entity_id,
                 } else if (jce_editor_component_slot_is_compound_collider(flag)) {
                     jce_editor_component_compound_default(
                         (JceCompoundColliderComponent *)_cptr);
+                } else if (jce_editor_component_slot_is_video_player(flag)) {
+                    /* Reset only the authoring fields; do NOT zero the live
+                     * decoder / texture handles here (that would orphan the GPU
+                     * texture + decoder).  Emptying clip_path makes
+                     * jce_scene_video_update() observe a clip_path/opened_hash
+                     * mismatch next tick and release them cleanly. */
+                    JceVideoPlayerComponent *vp =
+                        (JceVideoPlayerComponent *)_cptr;
+                    vp->clip_path[0] = '\0';
+                    vp->loop         = false;
+                    vp->autoplay     = true;
+                    vp->playing      = false;
                 } else {
                     memset(_cptr, 0, _csz);
                 }
@@ -495,11 +548,20 @@ static bool comp_section_begin(uint32_t entity_id,
         ImGui::EndPopup();
     }
 
+    /* Dim the component BODY while disabled (popped in comp_section_end). */
+    if (open && comp_disabled) {
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.55f);
+        s_comp_section_dimmed = true;
+    }
     return open;
 }
 
 static void comp_section_end(void)
 {
+    if (s_comp_section_dimmed) {
+        ImGui::PopStyleVar();        /* end the disabled-component dim */
+        s_comp_section_dimmed = false;
+    }
     ImGui::Spacing();
     ImGui::PopID();
 }
@@ -558,10 +620,16 @@ static void draw_one_component_section(uint32_t focused,
 
 /* ══════════════════════════════════════════════════════════════════════
  *  MULTI-OBJECT EDITING
- *  component flag, edits made through the focused entity's section are
- *  byte-mirrored onto the others. We restrict the broadcast to a
- *  whitelist of pure value-type components — string buffers and asset
- *  handles inside other components must be edited per-entity.
+ *  When >1 entities are selected, the focused entity's component sections
+ *  still render (the multi-select view no longer early-returns).  Edits
+ *  made through the focused entity's section are broadcast PER FIELD onto
+ *  the other selected entities of the same type: we snapshot the focused
+ *  component bytes before the draw, then after the draw copy ONLY the
+ *  contiguous byte ranges that actually changed (i.e. the field the user
+ *  just touched) — never a whole-struct memcpy, so fields that differ per
+ *  entity are left untouched.  We restrict the broadcast to a whitelist of
+ *  pure value-type components — string buffers and asset handles inside
+ *  other components must be edited per-entity.
  * ══════════════════════════════════════════════════════════════════════ */
 
 static bool multi_edit_supported(uint64_t flag)
@@ -606,8 +674,150 @@ static void *multi_get_comp_ptr(JceScene *scene, JceEntity e,
 #undef M
 }
 
-/* Wrap a single-component draw with a before/after byte diff and broadcast
- * the diff to every other selected entity that holds the same flag. */
+/* ── Multi-select per-field broadcast: field reflection ──────────────────
+ *
+ * Industry-standard multi-object editing (Unity/Unreal/Godot) applies the
+ * EDITED PROPERTY to every selected peer, leaving each peer's other properties
+ * intact.  A byte-level before/after diff cannot do this safely: a DragFloat
+ * nudge (e.g. 1.0 -> 1.5) changes only the low mantissa byte(s) of a float, so
+ * splicing just those bytes onto a peer holding a different value (say 9.0)
+ * produces garbage (-> 24.0), not the focused value.  Instead we map each
+ * changed byte to the WHOLE struct field that contains it and copy that field
+ * intact.
+ *
+ * The tables below list every editable member of each multi-edit component at
+ * scalar granularity — math vectors / float arrays expanded per-axis (Unity
+ * behaviour: nudging position.x broadcasts only x), and char[] strings copied
+ * whole (never spliced).  Any changed byte not covered by a listed field falls
+ * back to a 4-byte-aligned word copy, which is safe for 4-byte scalars (so an
+ * accidentally-unlisted numeric field still broadcasts correctly). */
+namespace {
+struct InspField { uint16_t off, size; };
+#define IF_F(T, m)         { (uint16_t)offsetof(T, m), (uint16_t)sizeof(((T*)0)->m) }
+#define IF_AX(T, m, i)     { (uint16_t)(offsetof(T, m) + (i) * (uint16_t)sizeof(float)), (uint16_t)sizeof(float) }
+#define IF_STR(T, m, i, n) { (uint16_t)(offsetof(T, m) + (i) * (n)), (uint16_t)(n) }
+
+static const InspField kF_transform[] = {
+    IF_AX(JceTransform, position, 0), IF_AX(JceTransform, position, 1), IF_AX(JceTransform, position, 2),
+    IF_AX(JceTransform, rotation, 0), IF_AX(JceTransform, rotation, 1), IF_AX(JceTransform, rotation, 2), IF_AX(JceTransform, rotation, 3),
+    IF_AX(JceTransform, scale, 0), IF_AX(JceTransform, scale, 1), IF_AX(JceTransform, scale, 2),
+};
+static const InspField kF_mesh_renderer[] = {
+    IF_F(JceMeshRenderer, model), IF_F(JceMeshRenderer, shader), IF_F(JceMeshRenderer, visible),
+    IF_F(JceMeshRenderer, mesh_path), IF_F(JceMeshRenderer, material_path), IF_F(JceMeshRenderer, mesh_shape),
+    IF_AX(JceMeshRenderer, base_color, 0), IF_AX(JceMeshRenderer, base_color, 1), IF_AX(JceMeshRenderer, base_color, 2), IF_AX(JceMeshRenderer, base_color, 3),
+    IF_F(JceMeshRenderer, metallic), IF_F(JceMeshRenderer, roughness),
+    IF_AX(JceMeshRenderer, emissive, 0), IF_AX(JceMeshRenderer, emissive, 1), IF_AX(JceMeshRenderer, emissive, 2),
+    IF_F(JceMeshRenderer, normal_scale), IF_F(JceMeshRenderer, ao_strength),
+    IF_F(JceMeshRenderer, alpha_mode), IF_F(JceMeshRenderer, alpha_cutoff), IF_F(JceMeshRenderer, double_sided),
+    IF_F(JceMeshRenderer, albedo_tex), IF_F(JceMeshRenderer, mr_tex), IF_F(JceMeshRenderer, normal_tex),
+    IF_F(JceMeshRenderer, ao_tex), IF_F(JceMeshRenderer, emissive_tex),
+};
+static const InspField kF_camera[] = {
+    IF_F(JceCameraComponent, fov_deg), IF_F(JceCameraComponent, near_plane), IF_F(JceCameraComponent, far_plane),
+    IF_F(JceCameraComponent, is_primary), IF_F(JceCameraComponent, ortho),
+    IF_F(JceCameraComponent, stack_index), IF_F(JceCameraComponent, clear_mode),
+};
+static const InspField kF_sprite_renderer[] = {
+    IF_F(JceSpriteRendererComponent, sprite_path),
+    IF_AX(JceSpriteRendererComponent, color, 0), IF_AX(JceSpriteRendererComponent, color, 1), IF_AX(JceSpriteRendererComponent, color, 2), IF_AX(JceSpriteRendererComponent, color, 3),
+    IF_F(JceSpriteRendererComponent, flip_x), IF_F(JceSpriteRendererComponent, flip_y), IF_F(JceSpriteRendererComponent, sorting_order),
+};
+static const InspField kF_skeletal[] = {
+    IF_F(JceSkeletalAnimatorComponent, skeleton_path),
+    IF_STR(JceSkeletalAnimatorComponent, clip_names, 0, 64), IF_STR(JceSkeletalAnimatorComponent, clip_names, 1, 64),
+    IF_STR(JceSkeletalAnimatorComponent, clip_names, 2, 64), IF_STR(JceSkeletalAnimatorComponent, clip_names, 3, 64),
+    IF_STR(JceSkeletalAnimatorComponent, clip_names, 4, 64), IF_STR(JceSkeletalAnimatorComponent, clip_names, 5, 64),
+    IF_STR(JceSkeletalAnimatorComponent, clip_names, 6, 64), IF_STR(JceSkeletalAnimatorComponent, clip_names, 7, 64),
+    IF_F(JceSkeletalAnimatorComponent, clip_count), IF_F(JceSkeletalAnimatorComponent, active_clip),
+    IF_F(JceSkeletalAnimatorComponent, speed), IF_F(JceSkeletalAnimatorComponent, loop), IF_F(JceSkeletalAnimatorComponent, playing),
+    IF_F(JceSkeletalAnimatorComponent, sm_path), IF_F(JceSkeletalAnimatorComponent, use_blend_tree), IF_F(JceSkeletalAnimatorComponent, blend_param),
+    IF_AX(JceSkeletalAnimatorComponent, blend_thresholds, 0), IF_AX(JceSkeletalAnimatorComponent, blend_thresholds, 1),
+    IF_AX(JceSkeletalAnimatorComponent, blend_thresholds, 2), IF_AX(JceSkeletalAnimatorComponent, blend_thresholds, 3),
+    IF_AX(JceSkeletalAnimatorComponent, blend_thresholds, 4), IF_AX(JceSkeletalAnimatorComponent, blend_thresholds, 5),
+    IF_AX(JceSkeletalAnimatorComponent, blend_thresholds, 6), IF_AX(JceSkeletalAnimatorComponent, blend_thresholds, 7),
+};
+static const InspField kF_constraint[] = {
+    IF_F(JceConstraintComponent, constraint_type), IF_F(JceConstraintComponent, target_entity),
+    IF_AX(JceConstraintComponent, pivot_a, 0), IF_AX(JceConstraintComponent, pivot_a, 1), IF_AX(JceConstraintComponent, pivot_a, 2),
+    IF_AX(JceConstraintComponent, pivot_b, 0), IF_AX(JceConstraintComponent, pivot_b, 1), IF_AX(JceConstraintComponent, pivot_b, 2),
+    IF_AX(JceConstraintComponent, axis, 0), IF_AX(JceConstraintComponent, axis, 1), IF_AX(JceConstraintComponent, axis, 2),
+    IF_F(JceConstraintComponent, lower_limit), IF_F(JceConstraintComponent, upper_limit), IF_F(JceConstraintComponent, disable_collision),
+};
+static const InspField kF_rigidbody[] = {
+    IF_F(JceRigidBodyComponent, body_handle_idx), IF_F(JceRigidBodyComponent, body_type), IF_F(JceRigidBodyComponent, shape_type),
+    IF_F(JceRigidBodyComponent, mass), IF_F(JceRigidBodyComponent, friction), IF_F(JceRigidBodyComponent, restitution),
+    IF_F(JceRigidBodyComponent, drag), IF_F(JceRigidBodyComponent, angular_drag),
+    IF_F(JceRigidBodyComponent, use_gravity), IF_F(JceRigidBodyComponent, is_kinematic),
+    IF_F(JceRigidBodyComponent, ccd_mode), IF_F(JceRigidBodyComponent, ccd_threshold), IF_F(JceRigidBodyComponent, ccd_sphere_radius),
+    IF_F(JceRigidBodyComponent, gravity_scale), IF_F(JceRigidBodyComponent, physics_layer), IF_F(JceRigidBodyComponent, physmat_path),
+};
+static const InspField kF_box[] = {
+    IF_AX(JceBoxColliderComponent, center, 0), IF_AX(JceBoxColliderComponent, center, 1), IF_AX(JceBoxColliderComponent, center, 2),
+    IF_AX(JceBoxColliderComponent, size, 0), IF_AX(JceBoxColliderComponent, size, 1), IF_AX(JceBoxColliderComponent, size, 2),
+    IF_F(JceBoxColliderComponent, is_trigger),
+};
+static const InspField kF_sphere[] = {
+    IF_AX(JceSphereColliderComponent, center, 0), IF_AX(JceSphereColliderComponent, center, 1), IF_AX(JceSphereColliderComponent, center, 2),
+    IF_F(JceSphereColliderComponent, radius), IF_F(JceSphereColliderComponent, is_trigger),
+};
+static const InspField kF_capsule[] = {
+    IF_AX(JceCapsuleColliderComponent, center, 0), IF_AX(JceCapsuleColliderComponent, center, 1), IF_AX(JceCapsuleColliderComponent, center, 2),
+    IF_F(JceCapsuleColliderComponent, radius), IF_F(JceCapsuleColliderComponent, height), IF_F(JceCapsuleColliderComponent, axis), IF_F(JceCapsuleColliderComponent, is_trigger),
+};
+static const InspField kF_mesh_collider[] = {
+    IF_F(JceMeshColliderComponent, mesh_path), IF_F(JceMeshColliderComponent, convex), IF_F(JceMeshColliderComponent, is_trigger),
+    IF_F(JceMeshColliderComponent, friction), IF_F(JceMeshColliderComponent, restitution),
+};
+static const InspField kF_compound[] = {
+    IF_F(JceCompoundColliderComponent, model_path), IF_F(JceCompoundColliderComponent, mode), IF_F(JceCompoundColliderComponent, split),
+    IF_F(JceCompoundColliderComponent, is_static), IF_F(JceCompoundColliderComponent, detect_naming), IF_F(JceCompoundColliderComponent, is_trigger),
+    IF_F(JceCompoundColliderComponent, friction), IF_F(JceCompoundColliderComponent, restitution),
+    IF_F(JceCompoundColliderComponent, vhacd_resolution), IF_F(JceCompoundColliderComponent, vhacd_max_hulls), IF_F(JceCompoundColliderComponent, vhacd_max_verts_per_hull),
+    IF_F(JceCompoundColliderComponent, physmat_path),
+};
+static const InspField kF_audio[] = {
+    IF_F(JceAudioSourceComponent, clip_path), IF_F(JceAudioSourceComponent, volume), IF_F(JceAudioSourceComponent, pitch),
+    IF_F(JceAudioSourceComponent, spatial_blend), IF_F(JceAudioSourceComponent, loop), IF_F(JceAudioSourceComponent, play_on_awake),
+};
+#undef IF_F
+#undef IF_AX
+#undef IF_STR
+
+/* Map a component slot/flag to its field table (NULL ⇒ use the 4-byte
+ * fallback for the whole changed region). */
+static const InspField *inspbcast_fields(uint64_t entry, int *count)
+{
+#define IF_RET(tbl) do { *count = (int)(sizeof(tbl) / sizeof((tbl)[0])); return (tbl); } while (0)
+    if (entry == JCE_COMP_FLAG_TRANSFORM)              IF_RET(kF_transform);
+    if (entry == JCE_COMP_FLAG_MESH_RENDERER)          IF_RET(kF_mesh_renderer);
+    if (entry == JCE_COMP_FLAG_CAMERA)                 IF_RET(kF_camera);
+    if (entry == JCE_COMP_FLAG_SPRITE_RENDERER)        IF_RET(kF_sprite_renderer);
+    if (entry == JCE_COMP_FLAG_SKELETAL_ANIMATOR)      IF_RET(kF_skeletal);
+    if (entry == JCE_COMP_FLAG_CONSTRAINT)             IF_RET(kF_constraint);
+    if (entry == JCE_COMP_FLAG_RIGIDBODY)              IF_RET(kF_rigidbody);
+    if (entry == JCE_COMP_FLAG_BOX_COLLIDER)           IF_RET(kF_box);
+    if (entry == JCE_COMP_FLAG_SPHERE_COLLIDER)        IF_RET(kF_sphere);
+    if (entry == JCE_COMP_FLAG_CAPSULE_COLLIDER)       IF_RET(kF_capsule);
+    if (entry == JCE_COMP_FLAG_MESH_COLLIDER)          IF_RET(kF_mesh_collider);
+    if (entry == JCE_EDITOR_COMP_SLOT_COMPOUND_COLLIDER) IF_RET(kF_compound);
+    if (entry == JCE_COMP_FLAG_AUDIO_SOURCE)           IF_RET(kF_audio);
+#undef IF_RET
+    *count = 0;
+    return nullptr;
+}
+} /* namespace */
+
+/* Wrap a single-component draw with a before/after byte diff and broadcast the
+ * EDITED FIELD(S) to every other selected entity that holds the same flag.
+ *
+ * The drawers mutate the focused entity's component in place, touching only the
+ * fields the user actually edited this frame.  We snapshot the component bytes
+ * before the draw and, afterwards, map each differing byte to the whole struct
+ * field that contains it (see the field tables above) and copy those fields —
+ * intact — onto the peers, leaving each peer's untouched fields (which may
+ * legitimately differ per entity) alone.  Copying whole fields (not raw byte
+ * runs) is what makes the broadcast value-correct for floats and strings. */
 static void draw_section_with_multi_broadcast(uint32_t focused,
                                               EditorEntitySidecar &sidecar,
                                               JceScene *scene,
@@ -631,11 +841,49 @@ static void draw_section_with_multi_broadcast(uint32_t focused,
     draw_one_component_section(focused, sidecar, scene, ecs_e, entry);
 
     if (!multi || !focused_ptr || comp_size == 0) return;
-    if (memcmp(focused_ptr, before.data(), comp_size) == 0) return;
 
-    /* Focused changed during this draw — broadcast the new bytes to peers. */
-    for (int i = 0; i < sel_count; ++i) {
-        uint32_t other = sel[i];
+    const uint8_t *after = (const uint8_t *)focused_ptr;
+    const uint8_t *prev  = before.data();
+    if (memcmp(after, prev, comp_size) == 0) return;
+
+    /* Resolve the changed bytes to whole struct fields.  For each listed field
+     * that has ANY differing byte, queue the WHOLE field as a copy span; then,
+     * for any differing byte not covered by the table, fall back to its
+     * 4-byte-aligned word (safe for plain scalars).  Copying whole fields — not
+     * raw byte runs — is what keeps peer values correct. */
+    struct Span { size_t off, len; };
+    std::vector<Span> spans;
+    std::vector<uint8_t> covered(comp_size, 0);
+
+    int fcount = 0;
+    const InspField *fields = inspbcast_fields(entry, &fcount);
+    for (int fi = 0; fi < fcount; ++fi) {
+        size_t off = fields[fi].off;
+        size_t end = off + fields[fi].size;
+        if (off >= comp_size) continue;
+        if (end > comp_size) end = comp_size;
+        bool changed = false;
+        for (size_t b = off; b < end; ++b) {
+            if (after[b] != prev[b]) changed = true;
+            covered[b] = 1;
+        }
+        if (changed) spans.push_back({ off, end - off });
+    }
+    /* Fallback: any differing byte the table did not cover. */
+    for (size_t b = 0; b < comp_size; ++b) {
+        if (after[b] == prev[b] || covered[b]) continue;
+        size_t ws = (b / 4) * 4;
+        size_t we = ws + 4;
+        if (we > comp_size) we = comp_size;
+        spans.push_back({ ws, we - ws });
+        for (size_t k = ws; k < we; ++k) covered[k] = 1;
+    }
+    if (spans.empty()) return;
+
+    /* Broadcast each edited field to every other selected peer of the same
+     * type, leaving the peers' untouched fields as-is. */
+    for (int k = 0; k < sel_count; ++k) {
+        uint32_t other = sel[k];
         if (other == focused) continue;
         JceEntity oe = jce_state_to_ecs_entity(other);
         if (!oe) continue;
@@ -644,8 +892,10 @@ static void draw_section_with_multi_broadcast(uint32_t focused,
             continue;
         size_t osize = 0;
         void *optr = multi_get_comp_ptr(scene, oe, entry, &osize);
-        if (optr && osize == comp_size)
-            memcpy(optr, focused_ptr, comp_size);
+        if (!optr || osize != comp_size) continue;
+        uint8_t *odst = (uint8_t *)optr;
+        for (const Span &sp : spans)
+            memcpy(odst + sp.off, after + sp.off, sp.len);
     }
 }
 
@@ -717,6 +967,14 @@ static void draw_one_component_section(uint32_t focused,
         if (comp_section_begin(focused, sidecar, flag, nm, removable))
             draw_comp_compound_collider(
                 jce_scene_get_compound_collider(scene, ecs_e));
+        comp_section_end();
+        return;
+    }
+
+    if (jce_editor_component_slot_is_video_player(flag)) {
+        if (comp_section_begin(focused, sidecar, flag, nm, removable))
+            draw_comp_video_player(
+                jce_scene_get_video_player(scene, ecs_e));
         comp_section_end();
         return;
     }
@@ -889,9 +1147,12 @@ void jce_editor_panel_inspector_content(void)
         }
     }
 
-    /* ── Multi-entity selection short-circuit ──────────────────────── */
-    if (insp_draw_multi_select_view(scene))
-        return;
+    /* ── Multi-entity selection: shared bulk controls ──────────────────
+     * Render the bulk toggles / transform editor / selected-entity list,
+     * then FALL THROUGH so the focused entity's per-component sections
+     * still draw below.  Edits made there are broadcast per-field to the
+     * other selected entities (draw_section_with_multi_broadcast). */
+    insp_draw_multi_select_view(scene);
 
     uint32_t focused = jce_state_get_focused();
     if (!focused || !jce_state_entity_exists(focused) || !scene) {
@@ -1123,6 +1384,13 @@ void jce_editor_panel_inspector_content(void)
             if (scene && ce) {
                 jce_state_begin_batch_edit();
                 jce_scene_remove_compound_collider(scene, ce);
+                jce_state_end_batch_edit();
+            }
+        } else if (jce_editor_component_slot_is_video_player(fl)) {
+            JceEntity ce = jce_state_to_ecs_entity(eid);
+            if (scene && ce) {
+                jce_state_begin_batch_edit();
+                jce_scene_remove_video_player(scene, ce);
                 jce_state_end_batch_edit();
             }
         } else {

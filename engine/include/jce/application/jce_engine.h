@@ -21,8 +21,9 @@ typedef enum JceAppResult {
     JCE_APP_FAILURE  = 2    /* Quit with error */
 } JceAppResult;
 
-typedef struct JceEngine  JceEngine;
-typedef struct JceAppDesc JceAppDesc;
+typedef struct JceEngine       JceEngine;
+typedef struct JceAppDesc      JceAppDesc;
+typedef struct JceInputActions JceInputActions;
 
 /* Register the application descriptor (IApp callbacks).
    Must be called before jce_engine_create().
@@ -64,9 +65,11 @@ JCE_API void JCE_CALL jce_engine_destroy(JceEngine *e);
 
 /* Configure the JCE_PHASE_FIXED_UPDATE rate driven by the default
  * fixed clock.  `hz` is in Hertz; the corresponding `fixed_dt` is
- * 1/hz.  Default: 50 Hz (Unity parity).  Pass <= 0 to restore the
- * default.  Safe to call at any time; the change takes effect on the
- * next jce_engine_iterate. */
+ * 1/hz.  Default: 60 Hz (== the runtime/physics step).  The per-runtime
+ * physics clock adopts this cadence each step, so this knob also governs
+ * physics (P1-fixed-clock-unify).  Pass <= 0 to restore the default.
+ * Safe to call at any time; the change takes effect on the next
+ * jce_engine_iterate / jce_runtime_step. */
 JCE_API void   JCE_CALL jce_engine_set_fixed_hz(double hz);
 
 /* Current FixedUpdate cadence in Hertz (1.0 / fixed_dt). */
@@ -83,6 +86,16 @@ JCE_API void JCE_CALL jce_engine_set_bundle_catalog_path(const char *path);
 /* Returns the active JceBundleCatalog* (opaque) or NULL.  Cast to
  * JceBundleCatalog* (declared in <jce/resource/jce_bundle_loader.h>). */
 JCE_API void *JCE_CALL jce_engine_get_bundle_catalog(JceEngine *e);
+
+/* ---- Action-map input (QW-input-actions) ----------------------- */
+
+/* Returns the engine-owned JceInputActions, or NULL.  The engine loads
+ * `.jce/input_actions.json` (editor-authored) at boot — falling back to
+ * the built-in FPS defaults — and calls jce_actions_update() each frame,
+ * so consumers can query logical actions (move_forward, jump, ...) via
+ * <jce/os/platform/jce_input_actions.h> instead of raw scancodes.  The
+ * same handle is also exposed through JceServices.actions. */
+JCE_API JceInputActions *JCE_CALL jce_engine_get_actions(JceEngine *e);
 
 JCE_EXTERN_C_END
 

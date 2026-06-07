@@ -47,6 +47,14 @@ JceJson *serialize_entity_tree_json(uint32_t entity_id)
 
     jce_json_set_string(node, "name", meta->name);
     jce_json_set_bool(node, "enabled", meta->enabled);
+    /* Per-component disable bitmask (Unity-style enable toggles). Only written
+     * when something is disabled. Bit count is well under 2^53 so double is
+     * exact. */
+    {
+        uint64_t disabled = jce_scene_get_disabled_components(s.scene, e);
+        if (disabled)
+            jce_json_set_number(node, "disabledComponents", (double)disabled);
+    }
     jce_json_set_number(node, "tagColor", (double)meta->tag_color);
     if (meta->tag[0] != '\0')
         jce_json_set_string(node, "tag", meta->tag);
@@ -504,6 +512,10 @@ bool jce_state_load_scene_file(const char *scene_path)
     if (!scene_path || scene_path[0] == '\0')
         return false;
 
+    /* Opening a scene during Play would swap the JceScene out from under a
+     * running runtime — tear the runtime down first. */
+    stop_play_before_scene_swap();
+
     /* Plain-file load: drop any bundle VFS override from a prior preview. */
     close_active_bundle_mount();
 
@@ -630,6 +642,10 @@ void close_active_bundle_mount()
 bool apply_scene_bytes(const char *display_path,
                        const char *bytes, size_t size)
 {
+    /* Loading a scene (bundle / memory) during Play would swap the
+     * JceScene out from under a running runtime — stop it first. */
+    stop_play_before_scene_swap();
+
     bool ok = false;
     {
         HistorySuspendScope suspend;

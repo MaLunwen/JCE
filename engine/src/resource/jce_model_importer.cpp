@@ -272,6 +272,27 @@ static bool build_parts(const aiScene *scene, JceModelParts *out)
     return true;
 }
 
+/* FBX is authored in centimeters.  Enabling aiProcess_GlobalScale makes Assimp
+ * apply the file's UnitScaleFactor so geometry arrives in meters, matching
+ * glTF/OBJ (which are already metric / unit-agnostic).  Verified empirically:
+ * the BagMan character FBX measures 209.94 raw -> 2.0994 with this flag, exactly
+ * the same character's GLB.  Do NOT also set AI_CONFIG_GLOBAL_SCALE_FACTOR_KEY:
+ * the FBX UnitScaleFactor is already 0.01, so an extra 0.01 shrinks 100x too
+ * much (209.94 -> 0.021).  `hint` may be a path, ".fbx" or "fbx" — only the
+ * trailing extension chars are tested. */
+static unsigned fbx_scale_flags(const char *hint)
+{
+    if (!hint) return 0;
+    size_t n = strlen(hint);
+    if (n < 3) return 0;
+    const char *t = hint + n - 3;
+    if ((t[0] == 'f' || t[0] == 'F') &&
+        (t[1] == 'b' || t[1] == 'B') &&
+        (t[2] == 'x' || t[2] == 'X'))
+        return aiProcess_GlobalScale;
+    return 0;
+}
+
 /* Postprocess flags shared by the part loaders: deliberately WITHOUT
  * aiProcess_PreTransformVertices so node separation survives. */
 static unsigned parts_postprocess_flags(void)
@@ -291,7 +312,7 @@ bool jce_model_importer_load_parts_memory(const void *data, size_t size,
 
     Assimp::Importer importer;
     const aiScene *scene = importer.ReadFileFromMemory(
-        data, size, parts_postprocess_flags(),
+        data, size, parts_postprocess_flags() | fbx_scale_flags(ext_hint),
         ext_hint ? ext_hint : "");
     if (!scene || !scene->mNumMeshes) {
         LOG_ERROR(LOG_TAG, "assimp parts load failed: %s",
@@ -319,11 +340,13 @@ bool jce_model_importer_load_parts_file(const char *file_path,
         const char *ext = "";
         const char *dot = strrchr(file_path, '.');
         if (dot) ext = dot;
-        scene = importer.ReadFileFromMemory(vbuf, (size_t)vsz,
-                                            parts_postprocess_flags(), ext);
+        scene = importer.ReadFileFromMemory(
+            vbuf, (size_t)vsz,
+            parts_postprocess_flags() | fbx_scale_flags(ext), ext);
     }
     if (!scene)
-        scene = importer.ReadFile(file_path, parts_postprocess_flags());
+        scene = importer.ReadFile(
+            file_path, parts_postprocess_flags() | fbx_scale_flags(file_path));
 
     bool ok = false;
     if (!scene || !scene->mNumMeshes) {
@@ -382,7 +405,8 @@ bool jce_model_importer_load_cpu_file(const char *file_path,
                 | aiProcess_GenSmoothNormals
                 | aiProcess_FlipUVs
                 | aiProcess_CalcTangentSpace
-                | aiProcess_PreTransformVertices,
+                | aiProcess_PreTransformVertices
+                | fbx_scale_flags(ext),
                 ext);
         }
     }
@@ -394,7 +418,8 @@ bool jce_model_importer_load_cpu_file(const char *file_path,
             | aiProcess_GenSmoothNormals
             | aiProcess_FlipUVs
             | aiProcess_CalcTangentSpace
-            | aiProcess_PreTransformVertices);
+            | aiProcess_PreTransformVertices
+            | fbx_scale_flags(file_path));
     }
 
     if (!scene || !scene->mNumMeshes) {
@@ -448,7 +473,8 @@ JceMesh *jce_model_importer_load_pak(const JcePakArchive *pak, const char *asset
         | aiProcess_GenSmoothNormals
         | aiProcess_FlipUVs
         | aiProcess_CalcTangentSpace
-        | aiProcess_PreTransformVertices,
+        | aiProcess_PreTransformVertices
+        | fbx_scale_flags(ext),
         ext);
 
     JCE_FREE(buf);
@@ -481,7 +507,8 @@ JceMesh *jce_model_importer_load_file(const char *file_path)
         | aiProcess_GenSmoothNormals
         | aiProcess_FlipUVs
         | aiProcess_CalcTangentSpace
-        | aiProcess_PreTransformVertices);
+        | aiProcess_PreTransformVertices
+        | fbx_scale_flags(file_path));
 
     if (!scene || !scene->mNumMeshes) {
         LOG_ERROR(LOG_TAG, "assimp file load failed: %s  %s",
@@ -951,6 +978,10 @@ bool jce_model_importer_inspect_memory(const void *data, size_t size,
         return false;
     }
     Assimp::Importer imp;
+    /* NOTE: no fbx_scale_flags here — INSPECT_FLAGS omits PreTransformVertices,
+     * so bounds are local-space and already ignore node transforms; adding
+     * GlobalScale would scale the local verts and skew the preview bounds
+     * further. Inspector bounds are approximate for node-transformed models. */
     const aiScene *scene = imp.ReadFileFromMemory(data, size, INSPECT_FLAGS,
                                                   ext_hint ? ext_hint : "");
     if (!scene || scene->mNumMeshes == 0) {
@@ -973,7 +1004,7 @@ bool jce_model_importer_inspect_file(const char *file_path,
         return false;
     }
     Assimp::Importer imp;
-    const aiScene *scene = imp.ReadFile(file_path, INSPECT_FLAGS);
+    const aiScene *scene = imp.ReadFile(file_path, INSPECT_FLAGS);  /* see note above */
     if (!scene || scene->mNumMeshes == 0) {
         const char *err = imp.GetErrorString();
         snprintf(out->error, sizeof(out->error),

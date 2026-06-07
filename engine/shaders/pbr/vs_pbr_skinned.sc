@@ -18,8 +18,13 @@ int decode_bone_index_clamped(float raw_index)
     if (idx < 0.0) {
         idx = 0.0;
     }
-    if (idx > 63.0) {
-        idx = 63.0;
+    // Clamp to the last valid u_model[] slot. BGFX_CONFIG_MAX_BONES is the
+    // shader-side palette size (set in tools/compile_shaders.cmake and mirrored
+    // by JCE_MAX_BONES); skeletons exceeding it are rejected at load time, so
+    // this clamp only guards against malformed joint indices.
+    float max_idx = float(BGFX_CONFIG_MAX_BONES - 1);
+    if (idx > max_idx) {
+        idx = max_idx;
     }
     return int(idx);
 }

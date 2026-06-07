@@ -91,50 +91,6 @@ static void draw_create_entities(uint32_t parent)
         create_entity_select("Light", parent, JCE_COMP_FLAG_DIR_LIGHT, 0);
 }
 
-/* ── Empty-area context menu ─────────────────────────────────────── */
-
-static void draw_empty_area_menu(void)
-{
-    draw_create_entities(0);
-
-    ImGui::Separator();
-    if (ImGui::MenuItem(jce_editor_i18n("menu.edit.paste"), "Ctrl+V", false,
-                        jce_state_has_copied())) {
-        uint32_t pasted_ids[JCE_MAX_SELECTED];
-        int pasted_n = jce_state_paste_entities(0, pasted_ids,
-                                                JCE_MAX_SELECTED);
-        if (pasted_n > 0) {
-            jce_state_select_entity(pasted_ids[0], false);
-            for (int i = 1; i < pasted_n; i++)
-                jce_state_select_entity(pasted_ids[i], true);
-            jce_editor_inspector_request_sync();
-            jce_editor_layout_request_focus_inspector();
-        }
-    }
-
-    ImGui::Separator();
-    if (ImGui::MenuItem(jce_editor_i18n("menu.edit.selectAll"), "Ctrl+A")) {
-        jce_state_clear_selection();
-        bool first = true;
-        int total = jce_state_get_entity_count();
-        for (int i = 0; i < total; i++) {
-            uint32_t sid = jce_state_get_entity_id_by_index(i);
-            if (sid == 0 || !jce_state_entity_exists(sid)) continue;
-            jce_state_select_entity(sid, !first);
-            first = false;
-        }
-        if (!first) {
-            s_hier.shift_anchor = jce_state_get_focused();
-            jce_editor_inspector_request_sync();
-        }
-    }
-    if (ImGui::MenuItem(jce_editor_i18n("hierarchy.deselectAll"), "Esc")) {
-        jce_state_clear_selection();
-        s_hier.shift_anchor = 0;
-        jce_editor_inspector_request_sync();
-    }
-}
-
 /* ── Tag color picker row ────────────────────────────────────────── */
 
 static void draw_tag_color_picker(uint32_t ctx_id)
@@ -172,159 +128,180 @@ static void draw_tag_color_picker(uint32_t ctx_id)
     ImGui::PopStyleVar();
 }
 
-/* ── Entity context menu ─────────────────────────────────────────── */
+/* ── Context Menu — one adaptive menu (entity ops appear only when an
+ *    entity is right-clicked; Create / Paste / Select-All appear once and
+ *    target the right-clicked entity as parent, or the root on empty space).
+ *    Replaces the former split entity-menu / empty-area-menu that duplicated
+ *    Create and Paste. ──────────────────────────────────────────────────── */
 
-static void draw_entity_menu(uint32_t ctx_id)
+void draw_hierarchy_context_menu(void)
 {
+    if (!ImGui::BeginPopup("HierarchyContextMenu"))
+        return;
+
+    uint32_t ctx_id    = s_hier.context_menu_id;
+    bool     on_entity = !s_hier.context_on_empty
+                         && (ctx_id != 0) && jce_state_entity_exists(ctx_id);
+    uint32_t target    = on_entity ? ctx_id : 0;   /* Create / Paste parent: entity (child) or root */
+
+    const char *ctx_name = "";
+    if (on_entity) {
+        ctx_name = jce_state_entity_name(ctx_id);
+        if (!ctx_name) ctx_name = "";
+    }
+
     int sel_count = 0;
     const uint32_t *sel = jce_state_get_selection(&sel_count);
     bool ctx_in_selection = false;
-    for (int si = 0; si < sel_count; si++) {
-        if (sel[si] == ctx_id) {
-            ctx_in_selection = true;
-            break;
-        }
-    }
-    bool multi_on_ctx = ctx_in_selection && sel_count > 1;
+    for (int si = 0; si < sel_count; si++)
+        if (sel[si] == ctx_id) { ctx_in_selection = true; break; }
+    bool multi_on_ctx = on_entity && ctx_in_selection && sel_count > 1;
 
-    const char *ctx_name = jce_state_entity_name(ctx_id);
-    if (!ctx_name) ctx_name = "";
-
-    ImGui::TextDisabled("%s", ctx_name);
-    ImGui::Separator();
-
-    if (ImGui::MenuItem(jce_editor_i18n("hierarchy.focus"), "F")) {
-        jce_state_select_entity(ctx_id, false);
-        s_hier.shift_anchor = ctx_id;
-        jce_editor_inspector_request_sync();
-        focus_entity_in_scene(ctx_id);
-    }
-
-    if (ImGui::MenuItem(jce_editor_i18n("hierarchy.rename"), "F2"))
-        begin_rename_entity(ctx_id, ctx_name);
-
-    /* Duplicate */
-    if (ImGui::MenuItem(jce_editor_i18n("hierarchy.duplicate"), "Ctrl+D")) {
-        uint32_t dup_ids[JCE_MAX_SELECTED];
-        int dup_count = 0;
-
-        if (multi_on_ctx) {
-            uint32_t src_ids[JCE_MAX_SELECTED];
-            int n = sel_count < JCE_MAX_SELECTED ? sel_count : JCE_MAX_SELECTED;
-            for (int si = 0; si < n; si++)
-                src_ids[si] = sel[si];
-
-            jce_state_begin_batch_edit();
-            for (int si = 0; si < n; si++) {
-                uint32_t dup = jce_state_duplicate_entity(src_ids[si]);
-                if (dup != 0 && dup_count < JCE_MAX_SELECTED)
-                    dup_ids[dup_count++] = dup;
-            }
-            jce_state_end_batch_edit();
-        } else {
-            uint32_t dup = jce_state_duplicate_entity(ctx_id);
-            if (dup != 0)
-                dup_ids[dup_count++] = dup;
-        }
-
-        if (dup_count > 0) {
-            jce_state_select_entity(dup_ids[0], false);
-            for (int di = 1; di < dup_count; di++)
-                jce_state_select_entity(dup_ids[di], true);
-            s_hier.shift_anchor = dup_ids[dup_count - 1];
-            jce_editor_inspector_request_sync();
-            jce_editor_layout_request_focus_inspector();
-        }
-    }
-
-    /* Create Child */
-    if (ImGui::BeginMenu(jce_editor_i18n("hierarchy.createChild"))) {
-        draw_create_entities(ctx_id);
-        ImGui::EndMenu();
-    }
-
-    /* Prefab */
-    ImGui::Separator();
-    if (ImGui::BeginMenu(jce_editor_i18n("hierarchy.prefab"))) {
-        if (ImGui::MenuItem(jce_editor_i18n("hierarchy.prefab.saveAs"))) {
-            char prefab_path[512];
-            build_default_prefab_path(ctx_name, prefab_path, sizeof(prefab_path));
-            if (jce_state_save_prefab(ctx_id, prefab_path)) {
-                jce_editor_console_log("Saved prefab: %s", prefab_path);
-                jce_editor_inspector_request_sync();
-            } else {
-                jce_editor_console_log_level(JCE_CONSOLE_WARNING,
-                    "Failed to save prefab: %s", prefab_path);
-            }
-        }
-
-        bool can_revert = jce_state_is_prefab_instance(ctx_id)
-            && jce_state_get_prefab_path(ctx_id) != NULL;
-        if (ImGui::MenuItem(jce_editor_i18n("hierarchy.prefab.revert"), NULL, false, can_revert)) {
-            if (jce_state_revert_prefab(ctx_id)) {
-                jce_editor_inspector_request_sync();
-            } else {
-                jce_editor_console_log_level(JCE_CONSOLE_WARNING,
-                    "Failed to revert prefab instance");
-            }
-        }
-
+    /* Entity header + transform ops (only when an entity was right-clicked). */
+    if (on_entity) {
+        ImGui::TextDisabled("%s", ctx_name);
         ImGui::Separator();
-        const char *parent_path = jce_state_get_prefab_path(ctx_id);
-        bool can_variant = (parent_path != NULL);
-        if (ImGui::MenuItem(jce_editor_i18n("hierarchy.menu.saveAsVariant"), NULL, false, can_variant)) {
-            char variant_path[512];
-            char variant_name[256];
-            snprintf(variant_name, sizeof(variant_name),
-                     "%s_Variant", ctx_name ? ctx_name : "Entity");
-            build_default_prefab_path(variant_name, variant_path, sizeof(variant_path));
-            if (jce_state_save_prefab_variant(ctx_id, variant_path, parent_path)) {
-                jce_editor_console_log("Saved prefab variant: %s (parent=%s)",
-                                       variant_path, parent_path);
-                jce_editor_inspector_request_sync();
+
+        if (ImGui::MenuItem(jce_editor_i18n("hierarchy.focus"), "F")) {
+            jce_state_select_entity(ctx_id, false);
+            s_hier.shift_anchor = ctx_id;
+            jce_editor_inspector_request_sync();
+            focus_entity_in_scene(ctx_id);
+        }
+        if (ImGui::MenuItem(jce_editor_i18n("hierarchy.rename"), "F2"))
+            begin_rename_entity(ctx_id, ctx_name);
+
+        if (ImGui::MenuItem(jce_editor_i18n("hierarchy.duplicate"), "Ctrl+D")) {
+            uint32_t dup_ids[JCE_MAX_SELECTED];
+            int dup_count = 0;
+            if (multi_on_ctx) {
+                uint32_t src_ids[JCE_MAX_SELECTED];
+                int n = sel_count < JCE_MAX_SELECTED ? sel_count : JCE_MAX_SELECTED;
+                for (int si = 0; si < n; si++) src_ids[si] = sel[si];
+                jce_state_begin_batch_edit();
+                for (int si = 0; si < n; si++) {
+                    uint32_t dup = jce_state_duplicate_entity(src_ids[si]);
+                    if (dup != 0 && dup_count < JCE_MAX_SELECTED)
+                        dup_ids[dup_count++] = dup;
+                }
+                jce_state_end_batch_edit();
             } else {
-                jce_editor_console_log_level(JCE_CONSOLE_WARNING,
-                    "Failed to save prefab variant: %s", variant_path);
+                uint32_t dup = jce_state_duplicate_entity(ctx_id);
+                if (dup != 0) dup_ids[dup_count++] = dup;
+            }
+            if (dup_count > 0) {
+                jce_state_select_entity(dup_ids[0], false);
+                for (int di = 1; di < dup_count; di++)
+                    jce_state_select_entity(dup_ids[di], true);
+                s_hier.shift_anchor = dup_ids[dup_count - 1];
+                jce_editor_inspector_request_sync();
+                jce_editor_layout_request_focus_inspector();
             }
         }
-        ImGui::EndMenu();
+        ImGui::Separator();
     }
 
-    /* Tag Color + Set Tag */
-    draw_tag_color_picker(ctx_id);
-
-    if (ImGui::BeginMenu(jce_editor_i18n("hierarchy.setTag"))) {
-        const char *tag_presets[] = {
-            "Untagged", "Player", "Enemy", "MainCamera",
-            "Environment", "UI", "Trigger", "Respawn"
-        };
-        const char *current_tag = jce_state_entity_tag(ctx_id);
-        if (!current_tag) current_tag = "";
-        for (int t = 0; t < 8; t++) {
-            bool current = (strcmp(current_tag, tag_presets[t]) == 0);
-            if (ImGui::MenuItem(tag_presets[t], NULL, current))
-                jce_state_set_entity_tag(ctx_id, tag_presets[t]);
+    /* Create — single entry point: a child of the entity, or root on empty. */
+    if (on_entity) {
+        if (ImGui::BeginMenu(jce_editor_i18n("hierarchy.createChild"))) {
+            draw_create_entities(ctx_id);
+            ImGui::EndMenu();
         }
-        ImGui::EndMenu();
+    } else {
+        draw_create_entities(0);
     }
 
-    /* Copy / Cut / Paste / Delete */
+    /* Entity-only: prefab + tagging. */
+    if (on_entity) {
+        ImGui::Separator();
+        if (ImGui::BeginMenu(jce_editor_i18n("hierarchy.prefab"))) {
+            if (ImGui::MenuItem(jce_editor_i18n("hierarchy.prefab.saveAs"))) {
+                char prefab_path[512];
+                build_default_prefab_path(ctx_name, prefab_path, sizeof(prefab_path));
+                if (jce_state_save_prefab(ctx_id, prefab_path)) {
+                    jce_editor_console_log("Saved prefab: %s", prefab_path);
+                    jce_editor_inspector_request_sync();
+                } else {
+                    jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+                        "Failed to save prefab: %s", prefab_path);
+                }
+            }
+
+            bool can_revert = jce_state_is_prefab_instance(ctx_id)
+                && jce_state_get_prefab_path(ctx_id) != NULL;
+            if (ImGui::MenuItem(jce_editor_i18n("hierarchy.prefab.revert"), NULL, false, can_revert)) {
+                if (jce_state_revert_prefab(ctx_id)) {
+                    jce_editor_inspector_request_sync();
+                } else {
+                    jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+                        "Failed to revert prefab instance");
+                }
+            }
+
+            ImGui::Separator();
+            const char *parent_path = jce_state_get_prefab_path(ctx_id);
+            bool can_variant = (parent_path != NULL);
+            if (ImGui::MenuItem(jce_editor_i18n("hierarchy.menu.saveAsVariant"), NULL, false, can_variant)) {
+                char variant_path[512];
+                char variant_name[256];
+                snprintf(variant_name, sizeof(variant_name),
+                         "%s_Variant", ctx_name ? ctx_name : "Entity");
+                build_default_prefab_path(variant_name, variant_path, sizeof(variant_path));
+                if (jce_state_save_prefab_variant(ctx_id, variant_path, parent_path)) {
+                    jce_editor_console_log("Saved prefab variant: %s (parent=%s)",
+                                           variant_path, parent_path);
+                    jce_editor_inspector_request_sync();
+                } else {
+                    jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+                        "Failed to save prefab variant: %s", variant_path);
+                }
+            }
+            ImGui::EndMenu();
+        }
+
+        draw_tag_color_picker(ctx_id);
+
+        if (ImGui::BeginMenu(jce_editor_i18n("hierarchy.setTag"))) {
+            /* Canonical tag values are stored on the entity (locale-
+               independent identifiers); the displayed label is localised via
+               the parallel key array. */
+            const char *tag_presets[] = {
+                "Untagged", "Player", "Enemy", "MainCamera",
+                "Environment", "UI", "Trigger", "Respawn"
+            };
+            static const char *tag_preset_keys[] = {
+                "hierarchy.tagPreset.untagged",    "hierarchy.tagPreset.player",
+                "hierarchy.tagPreset.enemy",       "hierarchy.tagPreset.mainCamera",
+                "hierarchy.tagPreset.environment", "hierarchy.tagPreset.ui",
+                "hierarchy.tagPreset.trigger",     "hierarchy.tagPreset.respawn"
+            };
+            const char *current_tag = jce_state_entity_tag(ctx_id);
+            if (!current_tag) current_tag = "";
+            for (int t = 0; t < 8; t++) {
+                bool current = (strcmp(current_tag, tag_presets[t]) == 0);
+                if (ImGui::MenuItem(jce_editor_i18n(tag_preset_keys[t]), NULL, current))
+                    jce_state_set_entity_tag(ctx_id, tag_presets[t]);
+            }
+            ImGui::EndMenu();
+        }
+    }
+
+    /* Clipboard — copy/cut are entity-only; paste appears once, contextual. */
     ImGui::Separator();
-    if (ImGui::MenuItem(jce_editor_i18n("menu.edit.copy"), "Ctrl+C")) {
-        if (multi_on_ctx)
-            jce_state_copy_entities(sel, sel_count, false);
-        else
-            jce_state_copy_entity(ctx_id);
+    if (on_entity) {
+        if (ImGui::MenuItem(jce_editor_i18n("menu.edit.copy"), "Ctrl+C")) {
+            if (multi_on_ctx) jce_state_copy_entities(sel, sel_count, false);
+            else              jce_state_copy_entity(ctx_id);
+        }
+        if (ImGui::MenuItem(jce_editor_i18n("menu.edit.cut"), "Ctrl+X")) {
+            if (multi_on_ctx) jce_state_copy_entities(sel, sel_count, true);
+            else              jce_state_copy_entities(&ctx_id, 1, true);
+        }
     }
-    if (ImGui::MenuItem(jce_editor_i18n("menu.edit.cut"), "Ctrl+X")) {
-        if (multi_on_ctx)
-            jce_state_copy_entities(sel, sel_count, true);
-        else
-            jce_state_copy_entities(&ctx_id, 1, true);
-    }
-    if (ImGui::MenuItem(jce_editor_i18n("menu.edit.paste"), "Ctrl+V", false, jce_state_has_copied())) {
+    if (ImGui::MenuItem(jce_editor_i18n("menu.edit.paste"), "Ctrl+V", false,
+                        jce_state_has_copied())) {
         uint32_t pasted_ids[JCE_MAX_SELECTED];
-        int pasted_n = jce_state_paste_entities(ctx_id, pasted_ids,
+        int pasted_n = jce_state_paste_entities(target, pasted_ids,
                                                 JCE_MAX_SELECTED);
         if (pasted_n > 0) {
             jce_state_select_entity(pasted_ids[0], false);
@@ -335,40 +312,50 @@ static void draw_entity_menu(uint32_t ctx_id)
         }
     }
 
+    /* Entity-only: delete. */
+    if (on_entity) {
+        ImGui::Separator();
+        ImGui::PushStyleColor(ImGuiCol_Text, JCE_COLOR_TEXT_ERROR);
+        const char *delete_label = multi_on_ctx
+            ? jce_editor_i18n("hierarchy.deleteSelected")
+            : jce_editor_i18n("hierarchy.delete");
+        if (ImGui::MenuItem(delete_label, jce_editor_i18n("shortcut.del"))) {
+            int selected_count = 0;
+            const uint32_t *selected_ids = jce_state_get_selection(&selected_count);
+            if (selected_count > 0) {
+                uint32_t ids[JCE_MAX_SELECTED];
+                int n = selected_count < JCE_MAX_SELECTED ? selected_count : JCE_MAX_SELECTED;
+                for (int si = 0; si < n; si++) ids[si] = selected_ids[si];
+                jce_editor_inspector_request_delete_confirm_many(ids, n);
+            } else {
+                jce_editor_inspector_request_delete_confirm(ctx_id);
+            }
+        }
+        ImGui::PopStyleColor();
+    }
+
+    /* Selection ops (always available). */
     ImGui::Separator();
-    ImGui::PushStyleColor(ImGuiCol_Text, JCE_COLOR_TEXT_ERROR);
-    const char *delete_label = multi_on_ctx
-        ? jce_editor_i18n("hierarchy.deleteSelected")
-        : jce_editor_i18n("hierarchy.delete");
-    if (ImGui::MenuItem(delete_label, jce_editor_i18n("shortcut.del"))) {
-        int selected_count = 0;
-        const uint32_t *selected_ids = jce_state_get_selection(&selected_count);
-        if (selected_count > 0) {
-            uint32_t ids[JCE_MAX_SELECTED];
-            int n = selected_count < JCE_MAX_SELECTED ? selected_count : JCE_MAX_SELECTED;
-            for (int si = 0; si < n; si++) ids[si] = selected_ids[si];
-            jce_editor_inspector_request_delete_confirm_many(ids, n);
-        } else {
-            jce_editor_inspector_request_delete_confirm(ctx_id);
+    if (ImGui::MenuItem(jce_editor_i18n("menu.edit.selectAll"), "Ctrl+A")) {
+        jce_state_clear_selection();
+        bool first = true;
+        int total = jce_state_get_entity_count();
+        for (int i = 0; i < total; i++) {
+            uint32_t sid = jce_state_get_entity_id_by_index(i);
+            if (sid == 0 || !jce_state_entity_exists(sid)) continue;
+            jce_state_select_entity(sid, !first);
+            first = false;
+        }
+        if (!first) {
+            s_hier.shift_anchor = jce_state_get_focused();
+            jce_editor_inspector_request_sync();
         }
     }
-    ImGui::PopStyleColor();
-}
-
-/* ── Context Menu (entry point) ─────────────────────────────────── */
-
-void draw_hierarchy_context_menu(void)
-{
-    if (!ImGui::BeginPopup("HierarchyContextMenu"))
-        return;
-
-    uint32_t ctx_id = s_hier.context_menu_id;
-    bool ctx_valid  = (ctx_id != 0) && jce_state_entity_exists(ctx_id);
-
-    if (s_hier.context_on_empty || !ctx_valid)
-        draw_empty_area_menu();
-    else
-        draw_entity_menu(ctx_id);
+    if (ImGui::MenuItem(jce_editor_i18n("hierarchy.deselectAll"), "Esc")) {
+        jce_state_clear_selection();
+        s_hier.shift_anchor = 0;
+        jce_editor_inspector_request_sync();
+    }
 
     ImGui::EndPopup();
 }

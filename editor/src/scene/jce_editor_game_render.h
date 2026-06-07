@@ -67,6 +67,13 @@ bool jce_editor_game_render_init(JceRenderer *renderer, struct JceWindow *window
 /* Tear down. Safe to call even if init failed. */
 void jce_editor_game_render_shutdown(void);
 
+/* Feed the ECS-UI (Canvas) graphic raycaster the pointer state for the next
+ * jce_editor_game_render_frame() call.  Coordinates are in panel/viewport-
+ * local pixels (top-left origin), matching the rendered size.  `valid` should
+ * be false when the cursor is outside the Game View (no hover/click). */
+void jce_editor_game_render_set_ui_pointer(float x, float y,
+                                           bool down, bool valid);
+
 /* Render one frame at the requested viewport size. The texture handle
  * returned by jce_editor_game_render_get_texture() is updated in-place. */
 void jce_editor_game_render_frame(uint32_t width, uint32_t height);

@@ -77,6 +77,115 @@ struct PanelState {
     bool preview_dirty = true;
 } s;
 
+/* ── Local undo for brush edits ────────────────────────────────────
+ *  Terrain heightmap/splat live in a standalone JceTerrain object, not
+ *  in the scene ECS, so the editor's scene-snapshot undo
+ *  (jce_state_begin_batch_edit) does not capture them.  Keep a small
+ *  panel-local stack of (heights + splat) snapshots instead.  Capture
+ *  is once-per-stroke: a continuous Scene-View drag snapshots only on
+ *  the first frame of the stroke (gated by `stroke_open`).            */
+struct TerrainSnapshot {
+    int w = 0, h = 0;
+    std::vector<float>    heights;
+    std::vector<uint32_t> splat;
+};
+
+const size_t kTerrainUndoLimit = 32;
+std::vector<TerrainSnapshot> s_undo;
+std::vector<TerrainSnapshot> s_redo;
+bool s_stroke_open = false;
+
+bool capture_snapshot(TerrainSnapshot *out)
+{
+    if (!s.terrain || !out) return false;
+    int w = jce_terrain_width(s.terrain);
+    int h = jce_terrain_height(s.terrain);
+    const float    *heights = jce_terrain_heights(s.terrain);
+    const uint32_t *splat   = jce_terrain_splat(s.terrain);
+    if (!heights) return false;
+    size_t n = (size_t)w * (size_t)h;
+    out->w = w; out->h = h;
+    out->heights.assign(heights, heights + n);
+    if (splat) out->splat.assign(splat, splat + n);
+    else       out->splat.clear();
+    return true;
+}
+
+void restore_snapshot(const TerrainSnapshot &snap)
+{
+    if (!s.terrain) return;
+    int w = jce_terrain_width(s.terrain);
+    int h = jce_terrain_height(s.terrain);
+    if (snap.w != w || snap.h != h) return; /* dims changed (new/load) — skip. */
+    size_t n = (size_t)w * (size_t)h;
+    float *heights = const_cast<float *>(jce_terrain_heights(s.terrain));
+    if (heights && snap.heights.size() == n)
+        std::memcpy(heights, snap.heights.data(), n * sizeof(float));
+    uint32_t *splat = const_cast<uint32_t *>(jce_terrain_splat(s.terrain));
+    if (splat && snap.splat.size() == n)
+        std::memcpy(splat, snap.splat.data(), n * sizeof(uint32_t));
+    s.preview_dirty = true;
+}
+
+/* Snapshot the current state into the undo stack before a mutating
+ * edit.  Clears the redo stack (new edit branch). */
+void push_undo(void)
+{
+    TerrainSnapshot snap;
+    if (!capture_snapshot(&snap)) return;
+    s_undo.push_back(std::move(snap));
+    if (s_undo.size() > kTerrainUndoLimit)
+        s_undo.erase(s_undo.begin());
+    s_redo.clear();
+}
+
+/* Begin a brush stroke: capture once until end_stroke() is called.
+ * Safe to call every frame of a continuous drag. */
+void begin_stroke(void)
+{
+    if (s_stroke_open) return;
+    push_undo();
+    s_stroke_open = true;
+}
+
+void end_stroke(void)
+{
+    s_stroke_open = false;
+}
+
+void clear_undo_history(void)
+{
+    s_undo.clear();
+    s_redo.clear();
+    s_stroke_open = false;
+}
+
+void terrain_undo(void)
+{
+    if (s_undo.empty() || !s.terrain) return;
+    TerrainSnapshot current;
+    if (!capture_snapshot(&current)) return;
+    TerrainSnapshot target = std::move(s_undo.back());
+    s_undo.pop_back();
+    restore_snapshot(target);
+    s_redo.push_back(std::move(current));
+    if (s_redo.size() > kTerrainUndoLimit)
+        s_redo.erase(s_redo.begin());
+}
+
+void terrain_redo(void)
+{
+    if (s_redo.empty() || !s.terrain) return;
+    TerrainSnapshot current;
+    if (!capture_snapshot(&current)) return;
+    TerrainSnapshot target = std::move(s_redo.back());
+    s_redo.pop_back();
+    restore_snapshot(target);
+    s_undo.push_back(std::move(current));
+    if (s_undo.size() > kTerrainUndoLimit)
+        s_undo.erase(s_undo.begin());
+}
+
 void rebuild_preview()
 {
     s.preview_dirty = false;
@@ -123,12 +232,14 @@ void draw_toolbar()
         ImGui::TableNextColumn();
         if (ImGui::Button(jce_editor_i18n("terrain.toolbar.new"), ImVec2(-1, 0))) {
             if (s.terrain) { jce_terrain_free(s.terrain); s.terrain = nullptr; }
+            clear_undo_history();
             ensure_terrain();
             s.status = jce_editor_i18n("terrain.status.created");
         }
         ImGui::TableNextColumn();
         if (ImGui::Button(jce_editor_i18n("terrain.toolbar.load"), ImVec2(-1, 0))) {
             if (s.terrain) { jce_terrain_free(s.terrain); s.terrain = nullptr; }
+            clear_undo_history();
             char resolved[1024];
             const char *load_path = s.io_path;
             if (jce_editor_resolve_asset_path(s.io_path, resolved, sizeof(resolved)))
@@ -167,6 +278,7 @@ void draw_toolbar()
         if (ImGui::Button(jce_editor_i18n("terrain.toolbar.close"), ImVec2(-1, 0))) {
             jce_terrain_free(s.terrain);
             s.terrain = nullptr;
+            clear_undo_history();
             s.preview_pixels.clear();
             s.preview_w = s.preview_h = 0;
             s.status = jce_editor_i18n("terrain.status.closed");
@@ -186,6 +298,7 @@ void draw_toolbar()
             const char *ext = strrchr(path, '.');
             if (ext && (strcmp(ext, ".json") == 0 || strstr(path, ".terrain."))) {
                 if (s.terrain) { jce_terrain_free(s.terrain); s.terrain = nullptr; }
+                clear_undo_history();
                 char resolved[1024];
                 const char *load_path = s.io_path;
                 if (jce_editor_resolve_asset_path(s.io_path, resolved, sizeof(resolved)))
@@ -237,6 +350,7 @@ void draw_brush_section()
 
         if (ImGui::Button(jce_editor_i18n("terrain.brush.stamp"), ImVec2(-1, 0))) {
             const float dt = 0.1f;
+            push_undo();
             if (s.tool == ToolMode::Sculpt) {
                 jce_terrain_sculpt_apply(s.terrain,
                                          (JceTerrainSculptMode)s.sculpt_mode,
@@ -251,12 +365,22 @@ void draw_brush_section()
         }
 
         if (ImGui::Button(jce_editor_i18n("terrain.brush.clear"), ImVec2(-1, 0))) {
+            push_undo();
             int w = jce_terrain_width(s.terrain);
             int h = jce_terrain_height(s.terrain);
             float *heights = const_cast<float *>(jce_terrain_heights(s.terrain));
             std::memset(heights, 0, (size_t)w * (size_t)h * sizeof(float));
             s.preview_dirty = true;
         }
+
+        ImGui::Separator();
+        ImGui::BeginDisabled(s_undo.empty());
+        if (ImGui::Button(jce_editor_i18n("terrain.brush.undo"))) terrain_undo();
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(s_redo.empty());
+        if (ImGui::Button(jce_editor_i18n("terrain.brush.redo"))) terrain_redo();
+        ImGui::EndDisabled();
     }
 }
 
@@ -340,6 +464,21 @@ extern "C" void jce_editor_panel_terrain(void)
     ImGui::Separator();
     draw_preview_section();
 
+    /* Ctrl+Z / Ctrl+(Shift+)Z / Ctrl+Y undo-redo for brush edits while the
+     * Terrain panel is focused.  Suppressed while a text field is active so
+     * it does not collide with the input box's own editing. */
+    if (s.terrain &&
+        ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) &&
+        !ImGui::IsAnyItemActive()) {
+        ImGuiIO &io = ImGui::GetIO();
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z, false)) {
+            if (io.KeyShift) terrain_redo();
+            else             terrain_undo();
+        } else if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y, false)) {
+            terrain_redo();
+        }
+    }
+
     if (!s.status.empty()) {
         ImGui::Separator();
         ImGui::TextColored(ImVec4(0.8f, 0.9f, 0.6f, 1.0f), "%s", s.status.c_str());
@@ -364,6 +503,10 @@ extern "C" struct JceTerrain *jce_terrain_panel_get_terrain(void)
 extern "C" void jce_terrain_panel_apply_brush_world(float wx, float wz, float dt)
 {
     if (!s.terrain) return;
+    /* One undo entry per drag: snapshot on the first applied frame of the
+     * stroke; jce_terrain_panel_end_brush_stroke() (called by the Scene
+     * View on mouse release) re-arms capture for the next stroke. */
+    begin_stroke();
     s.cursor_x = wx;
     s.cursor_z = wz;
     if (dt <= 0.0f) dt = 1.0f / 60.0f;
@@ -378,4 +521,11 @@ extern "C" void jce_terrain_panel_apply_brush_world(float wx, float wz, float dt
                                 s.brush_radius, s.brush_strength, dt);
     }
     s.preview_dirty = true;
+}
+
+/* Called by the Scene View when the brush LMB is released, ending the
+ * current drag so the next drag captures a fresh undo snapshot. */
+extern "C" void jce_terrain_panel_end_brush_stroke(void)
+{
+    end_stroke();
 }

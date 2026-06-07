@@ -39,6 +39,12 @@ typedef struct {
     int  view_mode;            /* JceSceneViewMode enum (0=Shaded,1=Wireframe,2=Textured) */
     bool show_grid;
 
+    /* Gizmo Ctrl-snap increments (persisted across sessions).  Defaults
+       0.5 units / 15 degrees / 0.25 ratio. */
+    float gizmo_snap_translate;
+    float gizmo_snap_rotate;
+    float gizmo_snap_scale;
+
     /* Asset Browser settings (persisted across sessions). */
     int  asset_browser_view_mode; /* AssetBrowserViewMode enum (0=Grid,1=Details) */
 

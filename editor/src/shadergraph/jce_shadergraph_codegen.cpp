@@ -19,6 +19,7 @@
 
 #include "shadergraph/jce_shadergraph_codegen.h"
 
+#include "shadergraph/jce_shadergraph_graph.h"
 #include "shadergraph/jce_shadergraph_registry.h"
 #include "shadergraph/jce_shadergraph_topo.h"
 #include "shadergraph/jce_shadergraph_typecheck.h"
@@ -38,21 +39,8 @@ constexpr const char *kHookEnd   = "/*JCE_END_MATERIAL*/";
 
 /* ---------- helpers ---------- */
 
-const Node *find_node_const(const Graph &g, int id)
-{
-    for (const Node &n : g.nodes) {
-        if (n.id == id) return &n;
-    }
-    return nullptr;
-}
-
-const Link *find_link_into(const Graph &g, int to_node, int to_sock)
-{
-    for (const Link &l : g.links) {
-        if (l.to_node == to_node && l.to_sock == to_sock) return &l;
-    }
-    return nullptr;
-}
+/* find_node / find_link_into now come from jce_shadergraph_graph.h
+ * (const overloads); the private copies were removed to deduplicate. */
 
 const char *glsl_type(DataType d)
 {
@@ -309,12 +297,12 @@ CodegenResult codegen(const Graph &g,
     std::string body;
     body.reserve(1024);
     for (int id : topo.order) {
-        const Node *n = find_node_const(g, id);
+        const Node *n = find_node(g, id);
         if (!n) continue;
         if (n->type == NT_OUTPUT) continue;
         emit_inner_node(g, *n, body);
     }
-    const Node *out_node = find_node_const(g, topo.output_id);
+    const Node *out_node = find_node(g, topo.output_id);
     if (!out_node) {
         push_diag(r.errors, -1, "codegen: Output node vanished after topo.");
         return r;

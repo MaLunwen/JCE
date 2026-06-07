@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 # ── MUST be set before project() ──
 set(CMAKE_SUPPRESS_REGENERATION TRUE)
 
-project(JCE VERSION 0.9.4 LANGUAGES C)
+project(JCE VERSION 0.9.7 LANGUAGES C)
 
 # CXX is needed for C++ dependencies (bgfx, assimp, imgui) and the editor.
 enable_language(CXX)
@@ -361,7 +361,7 @@ endif()
 # JCE_ENABLE_PATENTED_CODECS option (declared in engine/CMakeLists.txt,
 # default ON) records preference and is never mutated. JCE_PATENTED_CODECS_ENABLED
 # is the *effective* switch the build reads — derived from the option, then
-# forced OFF for dist. Switching variants does not lose the user's preference.
+# forced OFF for dist/Web. Switching variants does not lose the user's preference.
 set(JCE_PATENTED_CODECS_ENABLED ON)  # default; flipped below if needed
 if(DEFINED JCE_ENABLE_PATENTED_CODECS AND NOT JCE_ENABLE_PATENTED_CODECS)
 	set(JCE_PATENTED_CODECS_ENABLED OFF)
@@ -369,6 +369,12 @@ endif()
 if(JCE_BUILD_VARIANT STREQUAL "dist")
 	if(JCE_PATENTED_CODECS_ENABLED)
 		message(STATUS "JCE_BUILD_VARIANT=dist forces JCE_ENABLE_PATENTED_CODECS OFF (royalty-free redistribution).")
+	endif()
+	set(JCE_PATENTED_CODECS_ENABLED OFF)
+endif()
+if(JCE_PLATFORM_WEB)
+	if(JCE_PATENTED_CODECS_ENABLED)
+		message(STATUS "JCE_PLATFORM_WEB forces JCE_ENABLE_PATENTED_CODECS OFF (WASM uses royalty-free codecs only).")
 	endif()
 	set(JCE_PATENTED_CODECS_ENABLED OFF)
 endif()
@@ -460,6 +466,19 @@ jce_compile_shaders(
 	VARYING_DEF   "varying_postfx.def.sc"
 	OUTPUT_DIR    "${JCE_SHADER_OUTPUT_DIR}"
 	OUT_FILES_VAR COMPILED_POSTFX_SHADER_FILES)
+
+# Client/showcase "look" shaders — data-driven custom-post-pass content
+# (moebius/toon/painterly/lowpoly/pixel/psx/watercolor/comic), kept separate
+# from the engine's built-in postfx. They load by flat name (vs_postfx +
+# fs_<name>), so appending them onto the PostFX file list makes them ride
+# along in every pak aggregation without touching each one.
+jce_compile_shaders(
+	TARGET        CompileShadersLooks
+	SHADER_DIR    "${CMAKE_CURRENT_SOURCE_DIR}/engine/shaders/looks"
+	VARYING_DEF   "varying.def.sc"
+	OUTPUT_DIR    "${JCE_SHADER_OUTPUT_DIR}"
+	OUT_FILES_VAR COMPILED_LOOKS_SHADER_FILES)
+list(APPEND COMPILED_POSTFX_SHADER_FILES ${COMPILED_LOOKS_SHADER_FILES})
 
 jce_compile_shaders(
 	TARGET        CompileShadersParticles
@@ -591,10 +610,19 @@ if(NOT CMAKE_CROSSCOMPILING AND
 	add_executable(jce_cook
 		"${JCE_TOOLS_DIR}/jce_cook.c"
 		"${JCE_TOOLS_DIR}/jce_tex_compress.c"
+		"${JCE_TOOLS_DIR}/jce_tex_encode.cpp"
 		"${JCE_TOOLS_DIR}/miniaudio_impl_cook.c"
 		"${JCE_ENGINE_SRC_DIR}/resource/jce_asset_cooker.c"
 		"${JCE_ENGINE_SRC_DIR}/os/core/jce_filesystem_host.c"
-		"${JCE_ENGINE_SRC_DIR}/os/core/jce_memory.c")
+		"${JCE_ENGINE_SRC_DIR}/os/core/jce_memory.c"
+		# Offline collider cook (--collider): model import (assimp) +
+		# collider cook (VHACD) + the JCOL blob codec.  The asset TU is
+		# built with JCE_COLLIDER_ASSET_NO_PHYSICS so it brings only the
+		# serialize path (no Bullet/physics link).
+		"${JCE_ENGINE_SRC_DIR}/os/core/jce_alloc.c"
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_model_importer.cpp"
+		"${JCE_ENGINE_SRC_DIR}/middleware/physics/jce_collider_cook.cpp"
+		"${JCE_ENGINE_SRC_DIR}/middleware/physics/jce_collider_asset.c")
 	# When the SDK install is enabled, jce_cook ships in <sdk>/bin/ so
 	# end-user projects can cook raw assets (textures/audio) without the
 	# editor or a JCE source tree.  Otherwise keep it out of the default
@@ -617,7 +645,20 @@ if(NOT CMAKE_CROSSCOMPILING AND
 		miniaudio::miniaudio
 		mimalloc-static
 		zstd::libzstd_static
-		xxHash::xxhash)
+		xxHash::xxhash
+			bgfx::bimg_encode
+			bgfx::bimg
+			bgfx::bx
+		# Offline collider cook dependencies.
+		assimp::assimp
+		v-hacd::v-hacd)
+	# JCE_DIST: compile out the engine LOG_* macros pulled in by the
+	#   collider/model-import TUs so jce_cook needs no async log subsystem.
+	# JCE_COLLIDER_ASSET_NO_PHYSICS: omit jce_collider_instantiate() so the
+	#   blob codec links without the Bullet/physics chain.
+	target_compile_definitions(jce_cook PRIVATE
+		JCE_DIST
+		JCE_COLLIDER_ASSET_NO_PHYSICS)
 	jce_target_warnings(jce_cook)
 endif()
 
@@ -656,6 +697,7 @@ option(JCE_ENABLE_ASSET_COOKING "Pre-cook assets at build time (raw->.jceasset)"
 # path external users take, and the only way the SDK contract is dogfooded.
 # Flip ON only for in-tree dev iteration on the sample itself.
 option(JCE_BUILD_INTREE_SAMPLE "Build the in-tree Caged Kingdom sample (dev only)" OFF)
+option(JCE_BUILD_SCIENCE_LAB "Build the in-tree Science Lab dogfood project (dev/web only)" OFF)
 if(JCE_ENABLE_ASSET_COOKING AND NOT CMAKE_CROSSCOMPILING AND NOT TARGET jce_cook)
 	message(STATUS
 		"JCE asset cooking requested, but host cooker sources are not "
@@ -673,6 +715,11 @@ set(GAME_ICON_FILE      "${CMAKE_CURRENT_SOURCE_DIR}/caged_kingdom/resources/CK_
 set(GAME_ICON_STAGE_DIR "${CMAKE_CURRENT_BINARY_DIR}/_raw_game_icon")
 set(ENGINE_UI_DIR       "${CMAKE_CURRENT_SOURCE_DIR}/engine/ui")
 set(GAME_UI_DIR         "${CMAKE_CURRENT_SOURCE_DIR}/caged_kingdom/ui")
+
+if(JCE_BUILD_SCIENCE_LAB)
+	set(GAME_RESOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/science_lab/resources/assets")
+	set(GAME_UI_DIR       "${CMAKE_CURRENT_SOURCE_DIR}/science_lab/ui")
+endif()
 
 # THIRD_PARTY_LICENSES.md is sourced from the repo root and copied
 # directly into each PAK at build time. We do NOT mirror it into the
@@ -707,16 +754,16 @@ if(JCE_ENABLE_ASSET_COOKING AND NOT CMAKE_CROSSCOMPILING AND TARGET jce_cook)
 		COMMAND    "${CMAKE_COMMAND}" -E make_directory "${GAME_COOKED_DIR}"
 		COMMAND    $<TARGET_FILE:jce_cook>
 		           --batch "${ENGINE_RESOURCE_DIR}"  "${GAME_COOKED_DIR}"
-		           --preserve-names --level 0 --max-texture-size 2048
+		           --preserve-names --level 0 --max-texture-size 2048 --platform windows
 		COMMAND    $<TARGET_FILE:jce_cook>
 		           --batch "${ENGINE_UI_DIR}"        "${GAME_COOKED_DIR}"
-		           --preserve-names --level 0 --max-texture-size 2048
+		           --preserve-names --level 0 --max-texture-size 2048 --platform windows
 		COMMAND    $<TARGET_FILE:jce_cook>
 		           --batch "${GAME_RESOURCE_DIR}"    "${GAME_COOKED_DIR}"
-		           --preserve-names --level 0 --max-texture-size 2048
+		           --preserve-names --level 0 --max-texture-size 2048 --platform windows
 		COMMAND    $<TARGET_FILE:jce_cook>
 		           --batch "${GAME_UI_DIR}"          "${GAME_COOKED_DIR}"
-		           --preserve-names --level 0 --max-texture-size 2048
+		           --preserve-names --level 0 --max-texture-size 2048 --platform windows
 		COMMAND    "${CMAKE_COMMAND}" -E copy
 		           "${GAME_ICON_FILE}" "${GAME_COOKED_DIR}/CK_icon.png"
 		COMMAND    "${CMAKE_COMMAND}" -E copy
@@ -1133,6 +1180,9 @@ add_subdirectory(editor)
 if(JCE_BUILD_INTREE_SAMPLE)
 	add_subdirectory(caged_kingdom)
 endif()
+if(JCE_BUILD_SCIENCE_LAB)
+	add_subdirectory(science_lab)
+endif()
 
 # After jce_renderer has been declared in engine/CMakeLists.txt, hook
 # in the generated embedded-shader C array (and exclude the stub TU).
@@ -1256,7 +1306,9 @@ if(CLANG_FORMAT_EXECUTABLE)
 		"${CMAKE_SOURCE_DIR}/editor/src/*.cpp"
 		"${CMAKE_SOURCE_DIR}/editor/src/*.h"
 		"${CMAKE_SOURCE_DIR}/caged_kingdom/src/*.c"
-		"${CMAKE_SOURCE_DIR}/caged_kingdom/src/*.h")
+		"${CMAKE_SOURCE_DIR}/caged_kingdom/src/*.h"
+		"${CMAKE_SOURCE_DIR}/science_lab/src/*.c"
+		"${CMAKE_SOURCE_DIR}/science_lab/src/*.h")
 	list(FILTER _jce_fmt_files EXCLUDE REGEX "/third_party/")
 	list(FILTER _jce_fmt_files EXCLUDE REGEX "/internal/stb_image\\.h$")
 
@@ -1301,11 +1353,45 @@ if(JCE_ENABLE_CPPCHECK)
 			--suppress=missingIncludeSystem
 			--suppress=*:*/.conan2/*
 			--suppress=*:*/third_party/*
+			# ── Verified cppcheck false positives (2026-06 triage: 0 real bugs) ──
+			# Each was confirmed harmless by reading the code; suppressed in config
+			# (not inline) so the engine/editor sources stay untouched.
+			# Generated protobuf headers: PROTOBUF_VERSION version-guard #error fires
+			# because the conan runtime header is not on cppcheck's include path.
+			--suppress=*:*proto_gen/*
+			# Vendored third-party single-header (loop-invariant / early-return FPs).
+			--suppress=*:*stb_image.h
+			# Deliberate unsupported-platform #error in an #else arm; cppcheck does
+			# not define the JCE_PLATFORM_* selector macros.
+			--suppress=preprocessorErrorDirective:*jce_renderer_caps.c
+			# cJSON_ArrayForEach: external library macro cppcheck cannot expand, so it
+			# reports an unknown macro plus spurious null-derefs of the loop variable
+			# (the macro's own `elem != NULL` condition guarantees non-NULL in body).
+			--suppress=unknownMacro
+			--suppress=nullPointer:*jce_bundle_deps.c
+			--suppress=nullPointer:*jce_bundle_loader.c
+			# VFS reader returns its own heap buffer, not &local; cppcheck mis-tracks
+			# the out-size arg's address as the returned pointer.
+			--suppress=returnDanglingLifetime:*jce_filesystem_host.c
+			# Param renamed to avoid shadowing; positions/types match the header.
+			--suppress=funcArgOrderDifferent:*jce_game_hud.c
+			# sqrtf(sum of squares) is always >= 0; cppcheck reports the operand (-1),
+			# not its square.
+			--suppress=invalidFunctionArg:*jce_ibl.c
+			# put_bytes' `if (n)` guard is deliberate (NULL+0 memcpy is UB); the caller
+			# keeps n == 0 whenever the pointer is NULL.
+			--suppress=nullPointerRedundantCheck:*jce_session.c
+			# Fixed-size arrays filled for [0,count) and only [0,count) is read.
+			--suppress=uninitvar:*jce_scene_renderer.c
+			--suppress=uninitvar:*inspector_physics.cpp
+			# Harmless dead store (records which pak the asset came from).
+			--suppress=uselessAssignmentPtrArg:*jce_shaders.c
 			-i${CMAKE_SOURCE_DIR}/engine/src/middleware/audio/third_party
 			-i${CMAKE_SOURCE_DIR}/engine/src/middleware/video/third_party
 			--file-filter=${CMAKE_SOURCE_DIR}/engine/*
 			--file-filter=${CMAKE_SOURCE_DIR}/editor/*
 			--file-filter=${CMAKE_SOURCE_DIR}/caged_kingdom/*
+			--file-filter=${CMAKE_SOURCE_DIR}/science_lab/*
 			-j${_JCE_CPPCHECK_JOBS}
 			--std=c99)
 

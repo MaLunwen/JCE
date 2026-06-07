@@ -195,7 +195,15 @@ bool jce_collider_deserialize(const void        *bytes,
             ch->indices = (uint32_t *)jce_malloc((size_t)ibytes);
             if (!ch->indices) goto fail;
             for (uint32_t k = 0; k < ch->index_count; k++) {
-                ch->indices[k] = get_u32(p + off); off += 4;
+                uint32_t v = get_u32(p + off); off += 4;
+                /* Reject corrupt indices that point past the vertex buffer;
+                   leaving them in would OOB-read when the mesh is built. */
+                if (v >= ch->vertex_count) {
+                    LOG_ERROR(LOG_TAG,
+                              "collider blob index out of range");
+                    goto fail;
+                }
+                ch->indices[k] = v;
             }
         }
     }
@@ -215,6 +223,12 @@ fail:
 }
 
 /* ---- instantiate -------------------------------------------------- */
+
+/* The host cook tool (jce_cook --collider) compiles this TU only for the
+ * serialize/deserialize blob codec; it has no physics world and must not
+ * drag in the Bullet/physics link chain.  jce_collider_instantiate() is the
+ * sole physics-touching entry point, so it is omitted in that build. */
+#ifndef JCE_COLLIDER_ASSET_NO_PHYSICS
 
 JceBodyHandle jce_collider_instantiate(JcePhysicsWorld               *world,
                                        const JceCookedCollider       *c,
@@ -268,3 +282,5 @@ JceBodyHandle jce_collider_instantiate(JcePhysicsWorld               *world,
     jce_free(children);
     return body;
 }
+
+#endif /* !JCE_COLLIDER_ASSET_NO_PHYSICS */

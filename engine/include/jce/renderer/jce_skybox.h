@@ -59,6 +59,19 @@ void jce_skybox_render(const JceSkybox *sky, uint16_t view_id,
 JCE_API JceTexture jce_skybox_get_equirect_texture(const JceSkybox *sky);
 
 /*
+ * Get the decoded CPU-side equirectangular HDR pixels (RGBA32F, w*h*4 floats).
+ * Retained from load time so IBL convolution can run CPU-side without a GPU
+ * texture read-back. Returns NULL if pixels are not retained.
+ *
+ * @param sky    Skybox instance.
+ * @param out_w  Receives equirect width  (may be NULL).
+ * @param out_h  Receives equirect height (may be NULL).
+ */
+JCE_API const float *jce_skybox_get_equirect_pixels(const JceSkybox *sky,
+                                                    uint32_t *out_w,
+                                                    uint32_t *out_h);
+
+/*
  * Get the cubemap texture handle (6-face cubemap).
  * Returns JCE_TEXTURE_INVALID if not yet converted.
  */

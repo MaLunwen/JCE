@@ -64,6 +64,15 @@ void jce_text_draw_scaled(const JceRenderer *r, JceFont *font,
                           float x, float y, float scale,
                           const char *text, uint32_t color);
 
+/* View-targeted variant of jce_text_draw_scaled: submits glyph quads into
+   an explicit bgfx `view_id` instead of the fixed JCE_VIEW_UI overlay, so
+   off-screen UI passes can draw text into their own framebuffer's view.
+   Engine-internal (not part of the public consumer API). */
+void jce_text_draw_scaled_view(const JceRenderer *r, JceFont *font,
+                               uint16_t view_id,
+                               float x, float y, float scale,
+                               const char *text, uint32_t color);
+
 /* Get the line height in pixels (at native pt_size). */
 JCE_API int jce_font_line_height(const JceFont *font);
 

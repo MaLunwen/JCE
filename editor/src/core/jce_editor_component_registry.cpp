@@ -26,6 +26,7 @@ static const JceEditorComponentDescriptor kDescriptors[] = {
     { JCE_COMP_FLAG_SPHERE_COLLIDER,      JCE_COMP_FLAG_SPHERE_COLLIDER,      "Sphere Collider",       "comp.sphereCollider",       true,  true,  true  },
     { JCE_COMP_FLAG_CHARACTER_CONTROLLER, JCE_COMP_FLAG_CHARACTER_CONTROLLER, "Character Controller",  "comp.characterController", true,  true,  false },
     { JCE_COMP_FLAG_AUDIO_SOURCE,         JCE_COMP_FLAG_AUDIO_SOURCE,         "Audio Source",          "comp.audioSource",          true,  true,  true  },
+    { JCE_EDITOR_COMP_SLOT_VIDEO_PLAYER,  0,                                  "Video Player",          "comp.videoPlayer",          true,  true,  false },
     { JCE_COMP_FLAG_SCRIPT,               JCE_COMP_FLAG_SCRIPT,               "Script",                "comp.script",               true,  true,  false },
     { JCE_COMP_FLAG_SKYBOX,               JCE_COMP_FLAG_SKYBOX,               "Skybox",                "comp.skybox",               true,  true,  false },
     { JCE_COMP_FLAG_SPRITE_ANIMATOR,      JCE_COMP_FLAG_SPRITE_ANIMATOR,      "Sprite Animator",       "comp.spriteAnimator",       true,  true,  false },
@@ -89,6 +90,7 @@ static const JceEditorComponentSlot kDefaultOrder[] = {
     JCE_COMP_FLAG_SPHERE_COLLIDER,
     JCE_COMP_FLAG_CHARACTER_CONTROLLER,
     JCE_COMP_FLAG_AUDIO_SOURCE,
+    JCE_EDITOR_COMP_SLOT_VIDEO_PLAYER,
     JCE_COMP_FLAG_SCRIPT,
     JCE_COMP_FLAG_SKYBOX,
     JCE_COMP_FLAG_SPRITE_ANIMATOR,
@@ -205,6 +207,12 @@ bool jce_editor_component_slot_is_compound_collider(
     return slot == JCE_EDITOR_COMP_SLOT_COMPOUND_COLLIDER;
 }
 
+bool jce_editor_component_slot_is_video_player(
+    JceEditorComponentSlot slot)
+{
+    return slot == JCE_EDITOR_COMP_SLOT_VIDEO_PLAYER;
+}
+
 const char *jce_editor_component_display_name(JceEditorComponentSlot slot)
 {
     const JceEditorComponentDescriptor *d = jce_editor_component_find(slot);
@@ -226,6 +234,8 @@ bool jce_editor_component_slot_present(JceScene *scene,
         return (legacy_flags & JCE_EDITOR_COMPONENT_LIGHT_MASK) != 0;
     if (jce_editor_component_slot_is_compound_collider(slot))
         return scene && jce_scene_has_compound_collider(scene, entity);
+    if (jce_editor_component_slot_is_video_player(slot))
+        return scene && jce_scene_has_video_player(scene, entity);
     const JceEditorComponentDescriptor *d = jce_editor_component_find(slot);
     return d && d->legacy_flag != 0 && (legacy_flags & d->legacy_flag) != 0;
 }

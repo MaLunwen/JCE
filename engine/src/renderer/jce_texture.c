@@ -11,6 +11,7 @@
 #include <jce/renderer/jce_renderer_caps.h>
 #include <jce/renderer/jce_texture.h>
 #include <jce/resource/jce_asset_format.h>
+#include <jce/os/core/jce_str.h>
 
 #include "os/core/jce_memory.h"
 #include "resource/jce_asset_reader.h"
@@ -131,6 +132,25 @@ static SDL_Surface *ensure_rgba8(SDL_Surface *src)
     return converted;
 }
 
+/* Map a cooked JCEASSET_TEXFMT_* GPU format to its bgfx texture format.
+ * Block-compressed formats (BC/ASTC/ETC2) are uploaded as-is — the GPU
+ * samples them directly with no runtime decode. Anything unrecognized
+ * (including RGBA8/RGB8) falls back to RGBA8. Shared by the synchronous
+ * cooked loader and the async finalize path so both honor the cooked
+ * format identically. */
+static bgfx_texture_format_t texfmt_to_bgfx(uint32_t fmt)
+{
+    switch (fmt) {
+    case JCEASSET_TEXFMT_BC1:        return BGFX_TEXTURE_FORMAT_BC1;
+    case JCEASSET_TEXFMT_BC3:        return BGFX_TEXTURE_FORMAT_BC3;
+    case JCEASSET_TEXFMT_BC5:        return BGFX_TEXTURE_FORMAT_BC5;
+    case JCEASSET_TEXFMT_BC7:        return BGFX_TEXTURE_FORMAT_BC7;
+    case JCEASSET_TEXFMT_ASTC_4x4:   return BGFX_TEXTURE_FORMAT_ASTC4X4;
+    case JCEASSET_TEXFMT_ETC2_RGBA8: return BGFX_TEXTURE_FORMAT_ETC2A;
+    default:                         return BGFX_TEXTURE_FORMAT_RGBA8;
+    }
+}
+
 /* Map sampler mode to bgfx flags. */
 static uint64_t sampler_flags(int mode)
 {
@@ -223,11 +243,7 @@ static JceTexture jce_texture_load_ex_inner(const JcePakArchive *pak,
             };
             bool ok = false;
             for (int i = 0; exts[i] && !ok; ++i) {
-#ifdef _MSC_VER
-                if (_stricmp(dot, exts[i]) == 0) ok = true;
-#else
-                if (strcasecmp(dot, exts[i]) == 0) ok = true;
-#endif
+                if (jce_strcasecmp(dot, exts[i]) == 0) ok = true;
             }
             if (!ok) {
                 LOG_DEBUG(LOG_TAG, "skipping non-image asset: %s", asset_path);
@@ -313,9 +329,13 @@ static JceTexture jce_texture_load_ex_inner(const JcePakArchive *pak,
 
         bool has_mips = tex_info.mip_count > 1;
 
+        /* Map the cooked GPU format to bgfx (shared with the async finalize
+         * path). Block-compressed formats are uploaded as-is. */
+        bgfx_texture_format_t bgfx_fmt = texfmt_to_bgfx(tex_info.format);
+
         bgfx_texture_handle_t handle = bgfx_create_texture_2d(
             (uint16_t)tex_info.width, (uint16_t)tex_info.height,
-            has_mips, 1, BGFX_TEXTURE_FORMAT_RGBA8,
+            has_mips, 1, bgfx_fmt,
             BGFX_TEXTURE_NONE | sampler_flags(sampler_mode), mem);
 
         if (handle.idx == UINT16_MAX)
@@ -399,6 +419,41 @@ JceTexture jce_texture_from_rgba(const void *data,
                            (uint16_t)height,
                            mem,
                            (uint16_t)(width * 4u));
+
+    JceTexture tex;
+    tex.idx = handle.idx;
+    return tex;
+}
+
+JceTexture jce_texture_from_cooked(const JceAssetTexInfo *info,
+                                   const void *pixels, size_t pixel_bytes,
+                                   int sampler_mode)
+{
+    if (!info || !pixels || pixel_bytes == 0 ||
+        info->width == 0 || info->height == 0)
+        return JCE_TEXTURE_INVALID;
+
+    /* Block-compressed and multi-mip payloads are uploaded as a single
+     * memory blob: when has_mips is true, bgfx consumes the concatenated
+     * mip chain from `mem` itself (same convention as the synchronous
+     * cooked loader). This is what the async finalize path was missing —
+     * previously it forced RGBA8 and dropped mips, corrupting every
+     * BC/ASTC texture emitted by Build Bundles. */
+    bool has_mips = info->mip_count > 1;
+    bgfx_texture_format_t bgfx_fmt = texfmt_to_bgfx(info->format);
+
+    const bgfx_memory_t *mem = bgfx_alloc((uint32_t)pixel_bytes);
+    memcpy(mem->data, pixels, pixel_bytes);
+
+    bgfx_texture_handle_t handle = bgfx_create_texture_2d(
+        (uint16_t)info->width, (uint16_t)info->height,
+        has_mips, 1, bgfx_fmt,
+        BGFX_TEXTURE_NONE | sampler_flags(sampler_mode), mem);
+
+    if (handle.idx == UINT16_MAX)
+        return JCE_TEXTURE_INVALID;
+
+    registry_add(handle.idx, info->width, info->height);
 
     JceTexture tex;
     tex.idx = handle.idx;

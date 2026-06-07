@@ -27,7 +27,63 @@
 #include <string.h>
 
 #define JCE_MAX_SOUNDS  64
-#define JCE_MAX_VOICES  32
+#define JCE_MAX_VOICES  64
+#define JCE_MAX_BUSES   16
+#define JCE_BUS_NAME_MAX 32
+
+/* ── Freeverb (public-domain Schroeder reverb) ─────────────────────────
+ *
+ * Jezar's Freeverb topology: 8 parallel low-pass comb filters summed into
+ * 4 series all-pass filters per channel.  We vendor a compact, dependency-
+ * free implementation and wrap it as a custom miniaudio node so authored
+ * reverb zones drive a real DSP tail.  Tuning constants are the classic
+ * Freeverb values (scaled per sample rate).  Public domain — no license. */
+
+#define JCE_FV_NUM_COMBS    8
+#define JCE_FV_NUM_ALLPASS  4
+#define JCE_FV_MAX_CH       2
+
+/* Comb/all-pass delay lengths (in frames @ 44100 Hz), Freeverb defaults.
+ * The second channel adds a small stereo spread offset. */
+static const int g_fv_comb_len[JCE_FV_NUM_COMBS] =
+    { 1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617 };
+static const int g_fv_allpass_len[JCE_FV_NUM_ALLPASS] =
+    { 556, 441, 341, 225 };
+#define JCE_FV_STEREO_SPREAD 23
+
+typedef struct {
+    float *buf;
+    int    size;
+    int    pos;
+    float  feedback;
+    float  filterstore; /* one-pole LP state for damping */
+    float  damp1, damp2;
+} FvComb;
+
+typedef struct {
+    float *buf;
+    int    size;
+    int    pos;
+    float  feedback;
+} FvAllpass;
+
+typedef struct {
+    FvComb    comb[JCE_FV_MAX_CH][JCE_FV_NUM_COMBS];
+    FvAllpass allpass[JCE_FV_MAX_CH][JCE_FV_NUM_ALLPASS];
+    int       channels;
+    int       sample_rate;
+    float     wet;       /* wet output gain */
+    float     dry;       /* dry passthrough gain */
+    float     roomsize;  /* comb feedback (0..~0.98) */
+    float     damp;      /* comb LP damping (0..1) */
+    bool      allocated;
+} Freeverb;
+
+/* Custom miniaudio node embedding a Freeverb. */
+typedef struct {
+    ma_node_base base;
+    Freeverb     fv;
+} ReverbNode;
 
 /* Each sound owns a block of decoded PCM (s16) data. */
 typedef struct {
@@ -37,6 +93,13 @@ typedef struct {
     ma_uint32  sample_rate;
 } SoundSlot;
 
+/* A named output bus backed by a ma_sound_group node. */
+typedef struct {
+    bool           used;
+    char           name[JCE_BUS_NAME_MAX];
+    ma_sound_group group;     /* node: voices attach here, group -> reverb/endpoint */
+} BusSlot;
+
 /* Each voice is an independent playback instance. */
 typedef struct {
     ma_audio_buffer buffer;   /* owns a read cursor over the SoundSlot PCM */
@@ -44,6 +107,10 @@ typedef struct {
     bool            inited;
     int             sound_slot;
     uint32_t        generation; /* bumped on teardown; packed into JceVoice to reject stale handles */
+    uint64_t        play_seq;   /* allocation order, for oldest-voice stealing when the pool is full */
+    ma_lpf_node     lpf;        /* occlusion muffle filter, inserted sound→lpf→endpoint */
+    bool            lpf_ok;
+    float           lpf_cutoff; /* current cutoff Hz; avoids reinit churn when unchanged */
     /* Streaming voices: custom data source instead of ma_audio_buffer. */
     bool                  is_stream;
     ma_data_source_base   stream_ds;
@@ -52,6 +119,7 @@ typedef struct {
     ma_uint32             stream_channels;
     ma_uint32             stream_samplerate;
     ma_uint64             stream_cursor; /* frames pulled so far */
+    int                   bus;        /* index into JceAudio.buses, or -1 (direct) */
 } VoiceSlot;
 
 struct JceAudio {
@@ -62,7 +130,260 @@ struct JceAudio {
     bool        sound_used[JCE_MAX_SOUNDS];
 
     VoiceSlot   voices[JCE_MAX_VOICES];
+    uint64_t    play_counter;   /* monotonic; stamped into voice.play_seq on alloc */
+
+    /* Named mixer buses (flat under Master).  Group nodes route into the
+     * reverb node when present, otherwise to the engine endpoint. */
+    BusSlot     buses[JCE_MAX_BUSES];
+
+    /* Global reverb DSP (Freeverb).  Created lazily on first jce_audio_set_reverb
+     * with a positive wet mix.  When live, all bus groups attach to it and it
+     * feeds the endpoint; otherwise groups attach straight to the endpoint. */
+    ReverbNode  reverb;
+    bool        reverb_inited;
+    float       reverb_wet;      /* cached send level for dry/wet ramp */
 };
+
+/* ── Freeverb DSP ──────────────────────────────────────────────────── */
+
+static void fv_comb_set(FvComb *c, float feedback, float damp)
+{
+    c->feedback = feedback;
+    c->damp1    = damp;
+    c->damp2    = 1.0f - damp;
+}
+
+static inline float fv_comb_process(FvComb *c, float in)
+{
+    float out = c->buf[c->pos];
+    c->filterstore = out * c->damp2 + c->filterstore * c->damp1;
+    c->buf[c->pos] = in + c->filterstore * c->feedback;
+    if (++c->pos >= c->size) c->pos = 0;
+    return out;
+}
+
+static inline float fv_allpass_process(FvAllpass *a, float in)
+{
+    float bufout = a->buf[a->pos];
+    float out    = -in + bufout;
+    a->buf[a->pos] = in + bufout * a->feedback;
+    if (++a->pos >= a->size) a->pos = 0;
+    return out;
+}
+
+/* Allocate the comb/allpass delay lines for `channels` at `sample_rate`. */
+static bool fv_alloc(Freeverb *fv, int channels, int sample_rate)
+{
+    if (channels < 1) channels = 1;
+    if (channels > JCE_FV_MAX_CH) channels = JCE_FV_MAX_CH;
+    fv->channels    = channels;
+    fv->sample_rate = sample_rate > 0 ? sample_rate : 44100;
+    float sr_scale  = (float)fv->sample_rate / 44100.0f;
+
+    for (int ch = 0; ch < channels; ++ch) {
+        int spread = ch * JCE_FV_STEREO_SPREAD;
+        for (int i = 0; i < JCE_FV_NUM_COMBS; ++i) {
+            int len = (int)((float)(g_fv_comb_len[i] + spread) * sr_scale);
+            if (len < 1) len = 1;
+            FvComb *c = &fv->comb[ch][i];
+            c->buf = (float *)JCE_CALLOC((size_t)len, sizeof(float));
+            if (!c->buf) return false;
+            c->size = len; c->pos = 0; c->filterstore = 0.0f;
+        }
+        for (int i = 0; i < JCE_FV_NUM_ALLPASS; ++i) {
+            int len = (int)((float)(g_fv_allpass_len[i] + spread) * sr_scale);
+            if (len < 1) len = 1;
+            FvAllpass *a = &fv->allpass[ch][i];
+            a->buf = (float *)JCE_CALLOC((size_t)len, sizeof(float));
+            if (!a->buf) return false;
+            a->size = len; a->pos = 0; a->feedback = 0.5f;
+        }
+    }
+    fv->allocated = true;
+    return true;
+}
+
+static void fv_free(Freeverb *fv)
+{
+    for (int ch = 0; ch < JCE_FV_MAX_CH; ++ch) {
+        for (int i = 0; i < JCE_FV_NUM_COMBS; ++i) {
+            JCE_FREE(fv->comb[ch][i].buf);
+            fv->comb[ch][i].buf = NULL;
+        }
+        for (int i = 0; i < JCE_FV_NUM_ALLPASS; ++i) {
+            JCE_FREE(fv->allpass[ch][i].buf);
+            fv->allpass[ch][i].buf = NULL;
+        }
+    }
+    fv->allocated = false;
+}
+
+/* Push tuning (wet/dry/roomsize/damp) into the comb feedback coefficients. */
+static void fv_set_params(Freeverb *fv, float wet, float dry,
+                          float roomsize, float damp)
+{
+    if (wet < 0.0f) wet = 0.0f;
+    if (dry < 0.0f) dry = 0.0f;
+    if (roomsize < 0.0f) roomsize = 0.0f;
+    if (roomsize > 0.98f) roomsize = 0.98f;
+    if (damp < 0.0f) damp = 0.0f;
+    if (damp > 1.0f) damp = 1.0f;
+    fv->wet = wet; fv->dry = dry; fv->roomsize = roomsize; fv->damp = damp;
+    for (int ch = 0; ch < fv->channels; ++ch)
+        for (int i = 0; i < JCE_FV_NUM_COMBS; ++i)
+            fv_comb_set(&fv->comb[ch][i], roomsize, damp);
+}
+
+/* Process one channel's block in place: out = dry*in + wet*reverb(in). */
+static void fv_process_channel(Freeverb *fv, int ch,
+                               const float *in, float *out, ma_uint32 n)
+{
+    const float gain = 0.015f; /* Freeverb fixed input gain */
+    for (ma_uint32 s = 0; s < n; ++s) {
+        float x = in[s] * gain;
+        float acc = 0.0f;
+        for (int i = 0; i < JCE_FV_NUM_COMBS; ++i)
+            acc += fv_comb_process(&fv->comb[ch][i], x);
+        for (int i = 0; i < JCE_FV_NUM_ALLPASS; ++i)
+            acc = fv_allpass_process(&fv->allpass[ch][i], acc);
+        out[s] = in[s] * fv->dry + acc * fv->wet;
+    }
+}
+
+/* ── Custom ma_node wrapping Freeverb ──────────────────────────────── */
+
+static void reverb_node_process(ma_node *node,
+                                const float **frames_in, ma_uint32 *frame_count_in,
+                                float **frames_out, ma_uint32 *frame_count_out)
+{
+    ReverbNode *rn = (ReverbNode *)node;
+    Freeverb   *fv = &rn->fv;
+    ma_uint32   n  = *frame_count_out;
+    int         ch = fv->allocated ? fv->channels
+                   : (int)ma_node_get_output_channels(node, 0);
+
+    if (frame_count_in) {
+        ma_uint32 in_n = frame_count_in[0];
+        if (in_n < n) n = in_n;
+    }
+    if (!fv->allocated || ch < 1) {
+        /* Passthrough if not ready. */
+        if (n > 0 && ch >= 1)
+            memcpy(frames_out[0], frames_in[0],
+                   (size_t)n * (size_t)ch * sizeof(float));
+        *frame_count_out = n;
+        return;
+    }
+
+    /* Interleaved stereo (engine runs f32 interleaved per bus). De-interleave,
+     * run per channel, re-interleave. */
+    const float *in  = frames_in[0];
+    float       *out = frames_out[0];
+    static float scratch_in[JCE_FV_MAX_CH][4096];
+    static float scratch_out[JCE_FV_MAX_CH][4096];
+    ma_uint32 done = 0;
+    while (done < n) {
+        ma_uint32 blk = n - done;
+        if (blk > 4096) blk = 4096;
+        for (ma_uint32 s = 0; s < blk; ++s)
+            for (int c = 0; c < ch; ++c)
+                scratch_in[c][s] = in[(done + s) * ch + c];
+        for (int c = 0; c < ch; ++c)
+            fv_process_channel(fv, c, scratch_in[c], scratch_out[c], blk);
+        for (ma_uint32 s = 0; s < blk; ++s)
+            for (int c = 0; c < ch; ++c)
+                out[(done + s) * ch + c] = scratch_out[c][s];
+        done += blk;
+    }
+    *frame_count_out = n;
+}
+
+static ma_node_vtable g_reverb_vtable = {
+    reverb_node_process,
+    NULL,   /* onGetRequiredInputFrameCount */
+    1,      /* input bus count  */
+    1,      /* output bus count */
+    0       /* flags */
+};
+
+/* Create the global reverb node and re-route every live bus group through it.
+ * On any failure the groups keep their endpoint attachment (dry-only). */
+static bool audio_init_reverb(JceAudio *audio)
+{
+    if (audio->reverb_inited) return true;
+    ma_engine *e   = &audio->engine;
+    ma_uint32 chan = ma_engine_get_channels(e);
+    ma_uint32 sr   = ma_engine_get_sample_rate(e);
+
+    /* Freeverb handles mono/stereo only.  Surround endpoints stay dry. */
+    if (chan < 1 || chan > JCE_FV_MAX_CH) {
+        LOG_WARN("jce_audio", "reverb: %u-channel endpoint unsupported, staying dry", chan);
+        return false;
+    }
+
+    if (!fv_alloc(&audio->reverb.fv, (int)chan, (int)sr)) {
+        fv_free(&audio->reverb.fv);
+        LOG_WARN("jce_audio", "reverb: freeverb alloc failed");
+        return false;
+    }
+    fv_set_params(&audio->reverb.fv, 0.0f, 1.0f, 0.5f, 0.5f);
+
+    ma_node_config cfg = ma_node_config_init();
+    cfg.vtable          = &g_reverb_vtable;
+    cfg.pInputChannels  = &chan;
+    cfg.pOutputChannels = &chan;
+    if (ma_node_init(ma_engine_get_node_graph(e), &cfg, NULL,
+                     &audio->reverb.base) != MA_SUCCESS) {
+        fv_free(&audio->reverb.fv);
+        LOG_WARN("jce_audio", "reverb: ma_node_init failed");
+        return false;
+    }
+    if (ma_node_attach_output_bus(&audio->reverb.base, 0,
+                                  ma_engine_get_endpoint(e), 0) != MA_SUCCESS) {
+        ma_node_uninit(&audio->reverb.base, NULL);
+        fv_free(&audio->reverb.fv);
+        LOG_WARN("jce_audio", "reverb: attach to endpoint failed");
+        return false;
+    }
+    audio->reverb_inited = true;
+    audio->reverb_wet    = 0.0f;
+
+    /* Route any already-created bus groups through the reverb node. */
+    for (int i = 0; i < JCE_MAX_BUSES; ++i) {
+        if (audio->buses[i].used)
+            ma_node_attach_output_bus(&audio->buses[i].group, 0,
+                                      &audio->reverb.base, 0);
+    }
+    /* Re-route direct voices (no bus) that were attached to the endpoint
+     * before the reverb node existed, so the global tail covers them too. */
+    for (int i = 0; i < JCE_MAX_VOICES; ++i) {
+        VoiceSlot *v = &audio->voices[i];
+        if (!v->inited || v->bus >= 0) continue;
+        ma_node *src = v->lpf_ok ? (ma_node *)&v->lpf : (ma_node *)&v->sound;
+        ma_node_attach_output_bus(src, 0, &audio->reverb.base, 0);
+    }
+    LOG_SUCCESS("jce_audio", "reverb node (freeverb) initialized");
+    return true;
+}
+
+/* The node a bus group / direct sound should feed: the reverb node if live,
+ * otherwise the engine endpoint. */
+static ma_node *audio_output_node(JceAudio *audio)
+{
+    if (audio->reverb_inited) return (ma_node *)&audio->reverb.base;
+    return ma_engine_get_endpoint(&audio->engine);
+}
+
+/* Find a bus index by name (case-insensitive); -1 if none. */
+static int audio_find_bus(const JceAudio *audio, const char *name)
+{
+    if (!name || !name[0]) return -1;
+    for (int i = 0; i < JCE_MAX_BUSES; ++i)
+        if (audio->buses[i].used &&
+            SDL_strcasecmp(audio->buses[i].name, name) == 0)
+            return i;
+    return -1;
+}
 
 /* -- Lifecycle ------------------------------------------------------ */
 
@@ -80,8 +401,10 @@ JceAudio *jce_audio_create(void)
 
     audio->engine_inited = true;
 
-    for (int i = 0; i < JCE_MAX_VOICES; i++)
+    for (int i = 0; i < JCE_MAX_VOICES; i++) {
         audio->voices[i].sound_slot = -1;
+        audio->voices[i].bus        = -1;
+    }
 
     LOG_SUCCESS("jce_audio", "miniaudio engine initialized");
     return audio;
@@ -91,6 +414,10 @@ static void uninit_voice(VoiceSlot *v)
 {
     if (!v->inited) return;
     ma_sound_uninit(&v->sound);
+    if (v->lpf_ok) {
+        ma_lpf_node_uninit(&v->lpf, NULL);
+        v->lpf_ok = false;
+    }
     if (v->is_stream) {
         ma_data_source_uninit(&v->stream_ds);
         v->is_stream = false;
@@ -101,6 +428,7 @@ static void uninit_voice(VoiceSlot *v)
     }
     v->inited = false;
     v->sound_slot = -1;
+    v->bus = -1;
     v->generation++;   /* invalidate any outstanding JceVoice handle to this slot */
 }
 
@@ -111,6 +439,21 @@ void jce_audio_destroy(JceAudio *audio)
     /* Uninit all voices first (they reference engine). */
     for (int i = 0; i < JCE_MAX_VOICES; i++)
         uninit_voice(&audio->voices[i]);
+
+    /* Bus groups (nodes) — uninit before the reverb node/engine they feed. */
+    for (int i = 0; i < JCE_MAX_BUSES; i++) {
+        if (audio->buses[i].used) {
+            ma_sound_group_uninit(&audio->buses[i].group);
+            audio->buses[i].used = false;
+        }
+    }
+
+    /* Global reverb node + its delay lines. */
+    if (audio->reverb_inited) {
+        ma_node_uninit(&audio->reverb.base, NULL);
+        audio->reverb_inited = false;
+    }
+    fv_free(&audio->reverb.fv);
 
     /* Free all sound PCM data. */
     for (int i = 0; i < JCE_MAX_SOUNDS; i++) {
@@ -475,21 +818,80 @@ static int resolve_voice(const JceAudio *audio, JceVoice voice)
 
 static int alloc_voice(JceAudio *audio)
 {
-    /* First pass: find an unused slot. */
-    for (int i = 0; i < JCE_MAX_VOICES; i++) {
-        if (!audio->voices[i].inited)
-            return i;
-    }
+    int found = -1;
 
-    /* Second pass: reclaim a finished voice. */
-    for (int i = 0; i < JCE_MAX_VOICES; i++) {
-        if (!ma_sound_is_playing(&audio->voices[i].sound)) {
-            uninit_voice(&audio->voices[i]);
-            return i;
+    /* 1: an unused slot. */
+    for (int i = 0; i < JCE_MAX_VOICES && found < 0; i++)
+        if (!audio->voices[i].inited) found = i;
+
+    /* 2: reclaim a finished (no longer playing) voice. */
+    if (found < 0) {
+        for (int i = 0; i < JCE_MAX_VOICES && found < 0; i++) {
+            if (!ma_sound_is_playing(&audio->voices[i].sound)) {
+                uninit_voice(&audio->voices[i]);
+                found = i;
+            }
         }
     }
 
-    return -1;
+    /* 3: virtualization — the pool is full and everything is playing. Steal the
+       OLDEST one-shot voice rather than dropping the new sound; prefer non-
+       looping victims so we don't cut background music. */
+    if (found < 0) {
+        uint64_t oldest = UINT64_MAX;
+        for (int i = 0; i < JCE_MAX_VOICES; i++) {
+            if (audio->voices[i].inited
+                && !ma_sound_is_looping(&audio->voices[i].sound)
+                && audio->voices[i].play_seq < oldest) {
+                oldest = audio->voices[i].play_seq;
+                found = i;
+            }
+        }
+        if (found < 0) {                  /* all voices loop → steal the oldest */
+            oldest = UINT64_MAX;
+            for (int i = 0; i < JCE_MAX_VOICES; i++) {
+                if (audio->voices[i].inited && audio->voices[i].play_seq < oldest) {
+                    oldest = audio->voices[i].play_seq;
+                    found = i;
+                }
+            }
+        }
+        if (found >= 0) uninit_voice(&audio->voices[found]);
+    }
+
+    if (found >= 0)
+        audio->voices[found].play_seq = ++audio->play_counter;
+    return found;
+}
+
+/* The node a voice should feed into: its assigned bus group when routed,
+   otherwise the global output node (reverb if live, else endpoint). */
+static ma_node *voice_target_node(JceAudio *audio, const VoiceSlot *v)
+{
+    if (v->bus >= 0 && v->bus < JCE_MAX_BUSES && audio->buses[v->bus].used)
+        return (ma_node *)&audio->buses[v->bus].group;
+    return audio_output_node(audio);
+}
+
+/* Insert a per-voice low-pass node (sound → lpf → target) for occlusion
+   muffling, starting at bypass (22050 Hz). On ANY failure the sound keeps its
+   default endpoint attachment, so audio still plays (just without the muffle).
+   `target` is the voice's bus group or the global output node. */
+static void voice_attach_lpf(JceAudio *audio, VoiceSlot *v)
+{
+    ma_engine *e = &audio->engine;
+    ma_lpf_node_config cfg = ma_lpf_node_config_init(
+        ma_engine_get_channels(e), ma_engine_get_sample_rate(e), 22050.0, 2);
+    if (ma_lpf_node_init(ma_engine_get_node_graph(e), &cfg, NULL, &v->lpf) != MA_SUCCESS)
+        return;
+    ma_node *target = voice_target_node(audio, v);
+    if (ma_node_attach_output_bus(&v->lpf, 0, target, 0) != MA_SUCCESS
+        || ma_node_attach_output_bus(&v->sound, 0, &v->lpf, 0) != MA_SUCCESS) {
+        ma_lpf_node_uninit(&v->lpf, NULL);
+        return;
+    }
+    v->lpf_ok     = true;
+    v->lpf_cutoff = 22050.0f;
 }
 
 JceVoice jce_audio_play(JceAudio *audio, JceSound snd,
@@ -542,6 +944,7 @@ JceVoice jce_audio_play(JceAudio *audio, JceSound snd,
 
     v->inited = true;
     v->sound_slot = buf_slot;
+    voice_attach_lpf(audio, v);
     JCE_PROFILE_ZONE_END;
     return pack_voice(audio, vi);
 }
@@ -673,6 +1076,7 @@ JceVoice jce_audio_play_stream(JceAudio *audio,
 
     v->inited     = true;
     v->sound_slot = -1;
+    voice_attach_lpf(audio, v);
     JCE_PROFILE_ZONE_END;
     return pack_voice(audio, vi);
 }
@@ -684,6 +1088,25 @@ void jce_audio_stop(JceAudio *audio, JceVoice voice)
     if (idx < 0 || idx >= JCE_MAX_VOICES || !audio->voices[idx].inited) return;
 
     uninit_voice(&audio->voices[idx]);
+}
+
+/* Occlusion muffle: set the per-voice low-pass cutoff (22050 = bypass). No-op
+   if the voice has no lpf node. Skips reinit for sub-perceptual changes. */
+void jce_audio_set_lowpass(JceAudio *audio, JceVoice voice, float cutoff_hz)
+{
+    int idx = resolve_voice(audio, voice);
+    if (idx < 0) return;
+    VoiceSlot *v = &audio->voices[idx];
+    if (!v->lpf_ok) return;
+    if (cutoff_hz < 20.0f)    cutoff_hz = 20.0f;
+    if (cutoff_hz > 22050.0f) cutoff_hz = 22050.0f;
+    if (cutoff_hz > v->lpf_cutoff - 25.0f && cutoff_hz < v->lpf_cutoff + 25.0f)
+        return;
+    ma_lpf_config lcfg = ma_lpf_config_init(
+        ma_format_f32, ma_engine_get_channels(&audio->engine),
+        ma_engine_get_sample_rate(&audio->engine), (double)cutoff_hz, 2);
+    if (ma_lpf_node_reinit(&lcfg, &v->lpf) == MA_SUCCESS)
+        v->lpf_cutoff = cutoff_hz;
 }
 
 void jce_audio_pause(JceAudio *audio, JceVoice voice)
@@ -754,6 +1177,105 @@ void jce_audio_stop_all(JceAudio *audio)
     if (!audio) return;
     for (int i = 0; i < JCE_MAX_VOICES; i++)
         uninit_voice(&audio->voices[i]);
+}
+
+/* -- Mixer buses ---------------------------------------------------- */
+
+bool jce_audio_bus_create(JceAudio *audio, const char *name)
+{
+    if (!audio || !name || !name[0]) return false;
+    if (SDL_strcasecmp(name, "Master") == 0) return true; /* implicit endpoint */
+    if (audio_find_bus(audio, name) >= 0) return true;     /* already exists */
+
+    int slot = -1;
+    for (int i = 0; i < JCE_MAX_BUSES; i++)
+        if (!audio->buses[i].used) { slot = i; break; }
+    if (slot < 0) {
+        LOG_WARN("jce_audio", "bus pool exhausted (max %d)", JCE_MAX_BUSES);
+        return false;
+    }
+
+    BusSlot *b = &audio->buses[slot];
+    /* Group attaches to the engine endpoint by default; we re-route it to the
+     * reverb node when one is live so bus audio is reverberated. */
+    if (ma_sound_group_init(&audio->engine, 0, NULL, &b->group) != MA_SUCCESS) {
+        LOG_ERROR("jce_audio", "ma_sound_group_init failed for bus '%s'", name);
+        return false;
+    }
+    if (audio->reverb_inited)
+        ma_node_attach_output_bus(&b->group, 0, &audio->reverb.base, 0);
+    snprintf(b->name, sizeof(b->name), "%s", name);
+    b->used = true;
+    return true;
+}
+
+void jce_audio_bus_set_volume(JceAudio *audio, const char *name, float volume)
+{
+    if (!audio || !name) return;
+    if (volume < 0.0f) volume = 0.0f;
+    if (SDL_strcasecmp(name, "Master") == 0) {
+        ma_engine_set_volume(&audio->engine, volume);
+        return;
+    }
+    int idx = audio_find_bus(audio, name);
+    if (idx < 0) return;
+    ma_sound_group_set_volume(&audio->buses[idx].group, volume);
+}
+
+void jce_audio_voice_set_bus(JceAudio *audio, JceVoice voice,
+                             const char *bus_name)
+{
+    if (!audio || voice == JCE_VOICE_INVALID) return;
+    int idx = resolve_voice(audio, voice);
+    if (idx < 0) return;
+    VoiceSlot *v = &audio->voices[idx];
+
+    int bus = audio_find_bus(audio, bus_name);  /* -1 => direct/Master */
+    v->bus = bus;
+
+    /* Reattach the voice's output edge (lpf if present, else the sound) to the
+     * new target.  On failure the prior attachment stays, so audio keeps
+     * flowing (just on the old bus). */
+    ma_node *target = voice_target_node(audio, v);
+    ma_node *src    = v->lpf_ok ? (ma_node *)&v->lpf : (ma_node *)&v->sound;
+    ma_node_attach_output_bus(src, 0, target, 0);
+}
+
+/* -- Global reverb -------------------------------------------------- */
+
+void jce_audio_set_reverb(JceAudio *audio, const JceAudioReverbParams *params)
+{
+    if (!audio || !params) return;
+
+    float wet = params->wet_mix;
+    float dry = params->dry_mix;
+    if (wet < 0.0f) wet = 0.0f;
+
+    /* Lazily stand up the reverb node the first time a zone asks for wet > 0.
+     * Until then the mix stays fully dry with zero overhead. */
+    if (wet > 0.0001f && !audio->reverb_inited) {
+        if (!audio_init_reverb(audio)) return;  /* stays dry on failure */
+    }
+    if (!audio->reverb_inited) return;
+
+    /* Map the generic preset onto Freeverb tuning:
+     *   roomsize  <- decay_seconds (longer tail => higher comb feedback)
+     *   damp      <- damping, raised when lowpass_hz is low (dark rooms)   */
+    float decay    = params->decay_seconds;
+    float roomsize = decay <= 0.0f ? 0.5f
+                   : decay / (decay + 1.2f);          /* 0..~0.98 asymptote */
+    if (roomsize > 0.98f) roomsize = 0.98f;
+
+    float damp = params->damping;
+    if (params->lowpass_hz > 0.0f && params->lowpass_hz < 22050.0f) {
+        float lp = 1.0f - (params->lowpass_hz / 22050.0f);  /* darker => more */
+        if (lp > damp) damp = lp;
+    }
+    if (damp > 1.0f) damp = 1.0f;
+    if (dry > 1.0f) dry = 1.0f;
+
+    fv_set_params(&audio->reverb.fv, wet, dry, roomsize, damp);
+    audio->reverb_wet = wet;
 }
 
 JceSound jce_audio_load_memory(JceAudio *audio, const void *data,
@@ -923,6 +1445,11 @@ void jce_audio_set_volume(JceAudio *audio, JceVoice voice,
 {
     (void)audio; (void)voice; (void)volume;
 }
+void jce_audio_set_lowpass(JceAudio *audio, JceVoice voice,
+                           float cutoff_hz)
+{
+    (void)audio; (void)voice; (void)cutoff_hz;
+}
 void jce_audio_set_pitch(JceAudio *audio, JceVoice voice,
                          float pitch)
 {
@@ -941,6 +1468,18 @@ bool jce_audio_is_playing(const JceAudio *audio,
 }
 void jce_audio_set_master_volume(JceAudio *audio, float volume) { (void)audio; (void)volume; }
 void jce_audio_stop_all(JceAudio *audio) { (void)audio; }
+bool jce_audio_bus_create(JceAudio *audio, const char *name) {
+    (void)audio; (void)name; return false;
+}
+void jce_audio_bus_set_volume(JceAudio *audio, const char *name, float volume) {
+    (void)audio; (void)name; (void)volume;
+}
+void jce_audio_voice_set_bus(JceAudio *audio, JceVoice voice, const char *bus_name) {
+    (void)audio; (void)voice; (void)bus_name;
+}
+void jce_audio_set_reverb(JceAudio *audio, const JceAudioReverbParams *params) {
+    (void)audio; (void)params;
+}
 JceSound jce_audio_load_memory(JceAudio *audio, const void *data,
     uint32_t size, const char *hint_path) {
     (void)audio; (void)data; (void)size; (void)hint_path;

@@ -18,11 +18,11 @@
 extern "C" {
 #include <jce/renderer/jce_debug_draw.h>
 #include <jce/middleware/physics/jce_cloth.h>
-#include <jce/os/core/jce_alloc.h>
 #include <jce/os/core/jce_math.h>
 }
 
 #include <stdint.h>
+#include <vector>
 
 namespace {
 
@@ -60,14 +60,16 @@ extern "C" void jce_gizmo_cloth_draw_from_component(const JceClothComponent *cl)
 
     /* Pull live solver positions if the runtime cloth exists; otherwise
      * synthesise them from the authored corner grid so the gizmo is
-     * useful at edit time before play. */
-    float *flat = (float *)jce_malloc(n * 3u * sizeof(float));
-    jce_vec3 *pos = (jce_vec3 *)jce_malloc(n * sizeof(jce_vec3));
-    if (!flat || !pos) {
-        if (flat) jce_free(flat);
-        if (pos)  jce_free(pos);
-        return;
-    }
+     * useful at edit time before play.
+     *
+     * Gizmo drawing is main-thread only, so reuse static scratch buffers
+     * that grow on demand instead of malloc/free-ing twice every frame. */
+    static std::vector<float>    s_flat;
+    static std::vector<jce_vec3> s_pos;
+    if (s_flat.size() < (size_t)n * 3u) s_flat.resize((size_t)n * 3u);
+    if (s_pos.size()  < (size_t)n)      s_pos.resize((size_t)n);
+    float    *flat = s_flat.data();
+    jce_vec3 *pos  = s_pos.data();
 
     bool got_live = false;
     if (cl->handle != 0) {
@@ -80,7 +82,6 @@ extern "C" void jce_gizmo_cloth_draw_from_component(const JceClothComponent *cl)
             got_live = true;
         }
     }
-    jce_free(flat);
     if (!got_live) {
         for (uint32_t j = 0; j < rv; ++j) {
             float v = (rv > 1) ? (float)j / (float)(rv - 1) : 0.0f;
@@ -118,6 +119,4 @@ extern "C" void jce_gizmo_cloth_draw_from_component(const JceClothComponent *cl)
         jce_debug_draw_line(a, b, COL_PINNED);
         jce_debug_draw_line(c, d, COL_PINNED);
     }
-
-    jce_free(pos);
 }

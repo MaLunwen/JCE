@@ -26,7 +26,7 @@ void jce_clear_freshly_created_fbo(unsigned short fb_idx,
     (void)height;
 }
 
-const struct bgfx_memory *jce_zero_init_mem(unsigned int size_bytes)
+const struct bgfx_memory_s *jce_zero_init_mem(unsigned int size_bytes)
 {
     if (size_bytes == 0) return NULL;
     const bgfx_memory_t *mem = bgfx_alloc(size_bytes);

@@ -31,7 +31,22 @@ typedef struct JceRenderer    JceRenderer;
 /* ================================================================== */
 
 #define JCE_MAX_BONE_INFLUENCES 4
-#define JCE_MAX_BONES           64   /* bgfx u_model[] default capacity */
+
+/* GPU bone-palette ceiling. The skinned vertex shaders address bones through
+ * the bgfx u_model[] predefined-uniform array, whose size is fixed at compile
+ * time by BGFX_CONFIG_MAX_BONES (see tools/compile_shaders.cmake). This define
+ * MUST stay equal to that value: vs_pbr_skinned.sc / vs_shadow_skinned.sc clamp
+ * the joint index to JCE_MAX_BONES-1, and a skeleton exceeding it is rejected
+ * with a load-time LOG_ERROR in jce_skeleton_create() so artists see the cause
+ * instead of silently-collapsed bones.
+ *
+ * 128 is the practical ceiling for the uniform-array path: 128 mat4 = 512 vec4,
+ * which fits every real desktop GL / GLES3 / D3D11 / Metal / SPIR-V vertex
+ * uniform budget the engine targets. Going higher (256) would require a bone-
+ * matrix TEXTURE sampled via texelFetch, which the desktop glsl=120 profile
+ * cannot compile (texelFetch needs GLSL 1.30+) and which has no free sampler
+ * stage in the 16-stage fs_pbr fragment program. */
+#define JCE_MAX_BONES           128
 
 /* ================================================================== */
 /* Vertex formats                                                      */

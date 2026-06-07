@@ -431,6 +431,8 @@ struct BuildState {
     char shared_id    [128] {};
     int  shared_threshold = 2;
     int  zstd_level       = 3;
+    bool cook_assets      = true;   /* P0: cook textures/audio/models    */
+    int  target_platform  = 0;      /* 0=Win 1=Linux 2=mac 3=Android 4=iOS 5=Web */
 
     std::vector<std::string> scene_files;
     char scene_file_input[512] {};
@@ -455,6 +457,8 @@ struct BuildState {
     std::string single_bundle_id_owned;
     int  mode_owned = 0;
     bool auto_resource_root_owned = false;
+    bool cook_assets_owned = false;
+    int  target_platform_owned = 0;
 
     std::string last_status;
     std::vector<BundleSummary> summary;
@@ -580,6 +584,8 @@ void bundle_pack_worker_main(void * /*user*/)
                                 ? nullptr : gb.single_bundle_id_owned.c_str();
     opts.resolve_fn         = &editor_pack_resolve;
     opts.resolve_user       = nullptr;
+    opts.cook_assets        = gb.cook_assets_owned;
+    opts.target_platform    = gb.target_platform_owned;
 
     int rc = jce_bundle_pack_run(&opts, worker_log_sink, &gb);
     jce_atomic_i32_store(gb.last_exit, rc);
@@ -599,6 +605,8 @@ void start_build()
     gb.shared_id_owned     = gb.shared_id;
     gb.mode_owned                = gb.mode;
     gb.auto_resource_root_owned  = gb.auto_resource_root;
+    gb.cook_assets_owned         = gb.cook_assets;
+    gb.target_platform_owned     = gb.target_platform;
     gb.single_bundle_id_owned    = gb.single_bundle_id;
     gb.scene_files_owned         = gb.scene_files;
     gb.scene_file_ptrs_owned.clear();
@@ -666,6 +674,25 @@ void load_summary_from_catalog()
         }
     }
     jce_json_free(root);
+}
+
+/* P0-build-bundles-cook: cook toggle + target-platform selector, shared by
+ * the project and single-scene "Pack options" sections. */
+void draw_cook_options()
+{
+    ImGui::Checkbox(BL("field.cook_assets", "Cook assets (BC/ASTC + GLB)"),
+                    &gb.cook_assets);
+    if (gb.cook_assets) {
+        const char *plats =
+            "Windows (BC)\0Linux (BC)\0macOS (BC)\0Android (ASTC)\0"
+            "iOS (ASTC)\0Web (ASTC)\0";
+        ImGui::Combo(BL("field.target_platform", "Target platform"),
+                     &gb.target_platform, plats);
+        if (gb.target_platform < 0) gb.target_platform = 0;
+        ImGui::TextDisabled("%s", BL("hint.cook_assets",
+            "Textures -> GPU block format (.jceasset), models -> GLB+meshopt,\n"
+            "audio -> PCM. Reads <asset>.import.json presets."));
+    }
 }
 
 void draw_build_tab()
@@ -806,11 +833,13 @@ void draw_build_tab()
                          gb.shared_id, sizeof(gb.shared_id));
         ImGui::SliderInt(BL("field.zstd_level", "Zstd level"),
                          &gb.zstd_level, 1, 22);
+        draw_cook_options();
     } else if (is_single &&
                ImGui::CollapsingHeader(BL("section.options",
                                                   "Pack options"))) {
         ImGui::SliderInt(BL("field.zstd_level", "Zstd level"),
                          &gb.zstd_level, 1, 22);
+        draw_cook_options();
     }
 
     if (is_project) {

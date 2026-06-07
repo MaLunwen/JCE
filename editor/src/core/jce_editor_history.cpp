@@ -183,6 +183,16 @@ bool history_restore_snapshot(const EditorHistorySnapshot &snapshot,
 
 void jce_state_undo(void)
 {
+    /* Undo restores a snapshot via clear_scene_entities(), which destroys and
+     * recreates s.scene.  During Play the runtime holds that scene pointer, so
+     * swapping it out is a use-after-free.  Play is a transient sandbox (the
+     * pre-play snapshot is restored on Stop), so undo here is void anyway —
+     * mirror Unity and ignore scene undo while playing. */
+    if (jce_state_get_play_state() != JCE_PLAY_STOPPED) {
+        LOG_INFO(LOG_TAG, "undo: ignored during Play mode (stop play first)");
+        return;
+    }
+
     if (s_undo_history.empty()) {
         LOG_INFO(LOG_TAG, "undo: history empty");
         return;
@@ -213,6 +223,13 @@ void jce_state_undo(void)
 
 void jce_state_redo(void)
 {
+    /* See jce_state_undo — scene restore is unsafe while the runtime holds the
+     * scene pointer during Play. */
+    if (jce_state_get_play_state() != JCE_PLAY_STOPPED) {
+        LOG_INFO(LOG_TAG, "redo: ignored during Play mode (stop play first)");
+        return;
+    }
+
     if (s_redo_history.empty()) {
         LOG_INFO(LOG_TAG, "redo: history empty");
         return;

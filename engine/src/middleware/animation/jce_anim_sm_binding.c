@@ -7,7 +7,28 @@
 #include "os/core/jce_memory.h"
 
 #include <string.h>
+#include <ctype.h>
+#include <stdbool.h>
 #include <jce/os/core/jce_str.h>
+
+/* Robust clip-name match: case-insensitive and on the trailing path component
+ * of BOTH sides, so models that name a clip "Walk" / "walk" / ".../Walk.anim"
+ * all resolve the same. Guards against inconsistent casing/paths across models. */
+static const char *clip_basename(const char *s)
+{
+    const char *b = s;
+    for (const char *p = s; p && *p; ++p)
+        if (*p == '/' || *p == '\\') b = p + 1;
+    return b;
+}
+static bool clip_name_match(const char *a, const char *b)
+{
+    if (!a || !b) return false;
+    a = clip_basename(a); b = clip_basename(b);
+    for (; *a && *b; ++a, ++b)
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return false;
+    return *a == '\0' && *b == '\0';
+}
 
 struct JceAnimSmBinding {
     JceAnimSm    *sm;            /* owned */
@@ -108,19 +129,11 @@ int jce_anim_sm_binding_resolve_clip_index(const JceAnimSmBinding *b,
     const char *want = b->cached.clip_path;
     if (!want || !*want) return -1;
 
-    /* Compare basename-insensitive — most projects store the SM clip
-     * path as a full virtual path while the component holds short
-     * clip names.  We match the trailing path component. */
-    const char *want_base = want;
-    for (const char *p = want; *p; p++) {
-        if (*p == '/' || *p == '\\') want_base = p + 1;
-    }
-
+    /* Case-insensitive, basename-aware match (clip_name_match) so the SM's
+     * authored clip name resolves against the model's real clips regardless of
+     * casing or path differences. */
     for (int i = 0; i < count; i++) {
-        const char *cn = clip_names[i];
-        if (!cn) continue;
-        if (strcmp(cn, want)      == 0) return i;
-        if (strcmp(cn, want_base) == 0) return i;
+        if (clip_name_match(clip_names[i], want)) return i;
     }
     return -1;
 }

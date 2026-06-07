@@ -121,6 +121,33 @@ typedef struct JceBundlePackOptions {
     bool      (*resolve_fn)(const char *vpath, char *out_buf,
                             size_t out_size, void *user);
     void       *resolve_user;
+
+    /* ── Asset cooking (P0-build-bundles-cook) ─────────────────────────
+     *
+     * When `cook_assets` is true, the packer cooks each gathered asset
+     * before storing it in the bundle, instead of shipping the raw source:
+     *   - textures (.png/.jpg/.jpeg/.tga/.bmp) → cooked .jceasset (GPU
+     *     block format: BC on desktop, ASTC on mobile — see target_platform)
+     *   - models   (.obj/.fbx/.dae/.gltf/.glb) → binary glTF (.glb) with a
+     *     meshoptimizer dedup/vertex-cache pass
+     *   - audio    (.wav/.ogg/.flac/.opus/...) → cooked .jceasset PCM
+     * A sibling `<asset>.import.json` (written by the editor's Import
+     * Presets) is consulted for per-asset overrides (target_format,
+     * max_size, gen_mips, scale, gen_normals/tangents, flip_uv).
+     * The cooked bytes keep the SAME vpath; the runtime loaders content-
+     * sniff (texture/audio: .jceasset magic, mesh: cgltf GLB magic), so no
+     * reference rewriting is needed. Cook failures fall back to raw bytes
+     * (the asset still ships, just uncooked) and are logged as warnings.
+     *
+     * Default (zero-initialised) is false: behaviour is identical to before. */
+    bool        cook_assets;
+
+    /* Target platform for cook auto-format selection (texture BC vs ASTC).
+     * Values mirror JceCookPlatform in jce_asset_cooker.h:
+     *   0=Windows 1=Linux 2=macOS 3=Android 4=iOS 5=Web 6=Auto(RGBA8).
+     * Default (0) selects Windows/desktop BC. Only meaningful when
+     * cook_assets is true. */
+    int         target_platform;
 } JceBundlePackOptions;
 
 /* Build all bundles described by `opts`.  Returns 0 on success or a

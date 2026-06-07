@@ -48,6 +48,13 @@ int  s_history_transient_batch_depth = 0;
 
 EditorTransaction s_transaction;
 
+/* Gizmo Ctrl-snap increments — cached in memory, loaded from config on
+ * init, persisted on change.  Defaults match the historical hardcoded
+ * values (0.5 units / 15 deg / 0.25 ratio). */
+static float s_gizmo_snap_translate = 0.5f;
+static float s_gizmo_snap_rotate    = 15.0f;
+static float s_gizmo_snap_scale     = 0.25f;
+
 /* ── Internal helpers ─────────────────────────────────────────────── */
 
 static void erase_from_order(uint32_t id)
@@ -272,6 +279,9 @@ void jce_editor_state_init(void)
             else
                 s.view_mode = JCE_VIEW_SHADED;
             s.show_grid = ecfg.show_grid;
+            s_gizmo_snap_translate = ecfg.gizmo_snap_translate;
+            s_gizmo_snap_rotate    = ecfg.gizmo_snap_rotate;
+            s_gizmo_snap_scale     = ecfg.gizmo_snap_scale;
         } else {
             s.view_mode = JCE_VIEW_SHADED;
             s.show_grid = true;
@@ -306,6 +316,11 @@ void jce_editor_state_init(void)
 
 bool jce_state_new_default_scene(void)
 {
+    /* If Play is running it holds the current JceScene; recreating /
+     * clearing it here would be a use-after-free.  Tear the runtime down
+     * first. */
+    stop_play_before_scene_swap();
+
     if (!s.scene)
         s.scene = jce_scene_create();
     else
@@ -786,6 +801,24 @@ static void duplicate_components(JceEntity src, JceEntity dst)
         jce_scene_set_audio_source(s.scene, dst, jce_scene_get_audio_source(s.scene, src));
     if (jce_scene_has_script(s.scene, src))
         jce_scene_set_script(s.scene, dst, jce_scene_get_script(s.scene, src));
+    /* New this-sprint components carrying engine-owned runtime handles.
+     * VideoPlayer's flecs copy hook duplicates the authoring fields only and
+     * clears the duplicate's decoder/texture, so a plain set is safe.
+     * ParticleEmitter has NO copy hook (the scene uses mark-and-sweep), so
+     * ecs_set_ptr memcpys `loaded`/`emitter_handle_idx` verbatim — leaving the
+     * copy aliasing the source's live emitter (jce_scene_particles.c skips the
+     * rebuild while loaded && asset_epoch matches).  Reset the duplicate's
+     * runtime bookkeeping so it builds its OWN emitter on first tick. */
+    if (jce_scene_has_particle_emitter(s.scene, src)) {
+        jce_scene_set_particle_emitter(s.scene, dst, jce_scene_get_particle_emitter(s.scene, src));
+        if (JceParticleEmitterComponent *pe = jce_scene_get_particle_emitter(s.scene, dst)) {
+            pe->loaded             = false;
+            pe->emitter_handle_idx = UINT32_MAX;
+            pe->asset_epoch        = 0;
+        }
+    }
+    if (jce_scene_has_video_player(s.scene, src))
+        jce_scene_set_video_player(s.scene, dst, jce_scene_get_video_player(s.scene, src));
 }
 
 uint32_t jce_state_duplicate_entity(uint32_t id)
@@ -971,10 +1004,11 @@ void jce_state_add_component(uint32_t entity_id, uint64_t comp_flag)
         if (jce_scene_has_rigidbody(s.scene, e)) return;
         JceRigidBodyComponent c;
         memset(&c, 0, sizeof(c));
-        c.mass        = 1.0f;
-        c.friction    = 0.5f;
-        c.restitution = 0.0f;
-        c.use_gravity = true;
+        c.mass          = 1.0f;
+        c.friction      = 0.5f;
+        c.restitution   = 0.0f;
+        c.use_gravity   = true;
+        c.gravity_scale = 1.0f;
         jce_scene_set_rigidbody(s.scene, e, &c);
         break;
     }
@@ -1779,13 +1813,17 @@ JceGizmoSpace jce_state_get_gizmo_space(void)              { return s.gizmo_spac
 void          jce_state_set_gizmo_pivot(JceGizmoPivot p)   { s.gizmo_pivot = p; }
 JceGizmoPivot jce_state_get_gizmo_pivot(void)              { return s.gizmo_pivot; }
 
-/* Persist view_mode and show_grid to editor-config.json. */
+/* Persist view_mode, show_grid and gizmo snap increments to
+ * editor-config.json. */
 static void persist_render_settings(void)
 {
     JceEditorConfig ecfg;
     jce_editor_config_load(&ecfg);
     ecfg.view_mode = (int)s.view_mode;
     ecfg.show_grid = s.show_grid;
+    ecfg.gizmo_snap_translate = s_gizmo_snap_translate;
+    ecfg.gizmo_snap_rotate    = s_gizmo_snap_rotate;
+    ecfg.gizmo_snap_scale     = s_gizmo_snap_scale;
     jce_editor_config_save(&ecfg);
 }
 
@@ -1794,6 +1832,29 @@ JceSceneViewMode  jce_state_get_view_mode(void)                { return s.view_m
 
 bool  jce_state_get_show_grid(void)          { return s.show_grid; }
 void  jce_state_set_show_grid(bool show)     { s.show_grid = show; persist_render_settings(); }
+
+float jce_state_get_gizmo_snap_translate(void) { return s_gizmo_snap_translate; }
+float jce_state_get_gizmo_snap_rotate(void)    { return s_gizmo_snap_rotate; }
+float jce_state_get_gizmo_snap_scale(void)     { return s_gizmo_snap_scale; }
+
+void  jce_state_set_gizmo_snap_translate(float v)
+{
+    if (v < 0.001f) v = 0.001f;
+    s_gizmo_snap_translate = v;
+    persist_render_settings();
+}
+void  jce_state_set_gizmo_snap_rotate(float v)
+{
+    if (v < 0.001f) v = 0.001f;
+    s_gizmo_snap_rotate = v;
+    persist_render_settings();
+}
+void  jce_state_set_gizmo_snap_scale(float v)
+{
+    if (v < 0.001f) v = 0.001f;
+    s_gizmo_snap_scale = v;
+    persist_render_settings();
+}
 
 static bool s_show_physics_debug = false;
 bool  jce_state_get_show_physics_debug(void)  { return s_show_physics_debug; }

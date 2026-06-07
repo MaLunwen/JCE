@@ -168,6 +168,17 @@ static void draw_stats_tab(void)
         jce_editor_i18n("panel.network_stats.client_count"),
         (unsigned)jce_session_client_count());
 
+    /* Replication bridge diagnostics (P1-networking-full): how many net
+     * objects + transforms the runtime bridged, how many CHANGED component
+     * entries the acked-baseline delta has shipped, and the interest
+     * radius.  Surfaces that the editor Net* components are live-wired. */
+    ImGui::Text("%s: %u obj | %u xform | %llu deltas | %.0fm interest",
+        jce_editor_i18n("panel.network_stats.replication"),
+        (unsigned)jce_net_object_count(),
+        (unsigned)jce_net_transform_registered_count(),
+        (unsigned long long)jce_net_replication_comp_entries_sent(),
+        (double)jce_net_replication_get_interest_radius());
+
     ImGui::Separator();
 
     if (!ImGui::BeginTable("##netstats", 6,

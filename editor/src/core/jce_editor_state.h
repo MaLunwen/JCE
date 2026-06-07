@@ -163,6 +163,16 @@ JceGizmoSpace jce_state_get_gizmo_space(void);
 void          jce_state_set_gizmo_pivot(JceGizmoPivot pivot);
 JceGizmoPivot jce_state_get_gizmo_pivot(void);
 
+/* Gizmo Ctrl-snap increments (translate units / rotate degrees / scale
+ * ratio).  Read by the gizmo snap path; edited via the Scene View "Snap"
+ * popup.  Setters persist to .jce/editor-config.json. */
+float jce_state_get_gizmo_snap_translate(void);
+float jce_state_get_gizmo_snap_rotate(void);
+float jce_state_get_gizmo_snap_scale(void);
+void  jce_state_set_gizmo_snap_translate(float v);
+void  jce_state_set_gizmo_snap_rotate(float v);
+void  jce_state_set_gizmo_snap_scale(float v);
+
 /* Scene view */
 void              jce_state_set_view_mode(JceSceneViewMode mode);
 JceSceneViewMode  jce_state_get_view_mode(void);
@@ -246,6 +256,10 @@ bool jce_editor_play_get_player_position(float *out_x, float *out_y, float *out_
  * Editor-side debug-draw / contact-listener wiring uses this. */
 struct JcePhysicsWorld;
 struct JcePhysicsWorld *jce_editor_play_get_physics_world(void);
+
+/* Live count of active contact pairs during Play (BEGIN++/END--).  0 when
+ * not running.  Surfaced by the Physics Debugger. */
+int jce_editor_play_get_active_contacts(void);
 
 /* Undo/Redo history. */
 void  jce_state_undo(void);

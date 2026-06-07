@@ -29,6 +29,7 @@
 #include <jce/application/jce_runtime.h>
 #include <jce/middleware/audio/jce_audio.h>
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/middleware/scene/jce_ui_canvas.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
@@ -62,6 +63,7 @@ static JceProject       *s_project        = NULL;
 static JceScene         *s_scene          = NULL;
 static JceCamera        *s_camera         = NULL;
 static JceSceneRenderer *s_scene_renderer = NULL;
+static JceUICanvas      *s_ui_canvas      = NULL;
 static JceFileSystem    *s_bundle_fs      = NULL;
 static JceBundleFile   **s_bundle_files   = NULL;
 static int               s_bundle_count   = 0;
@@ -291,6 +293,15 @@ static bool app_init(const JceServices *svc, void *ud)
     if (!s_scene_renderer)
         LOG_WARN("app", "%s", "jce_scene_renderer_create failed — scene will not render");
 
+    /* ECS-UI (Canvas/UIImage/UIText/UIButton) overlay renderer.  Authored UI
+     * components in the scene render in the deployed game exactly as they
+     * preview in the editor game-view. */
+    if (svc && svc->renderer) {
+        s_ui_canvas = jce_ui_canvas_create(svc->renderer, s_engine_pak);
+        if (!s_ui_canvas)
+            LOG_WARN("app", "%s", "jce_ui_canvas_create failed — ECS-UI will not render");
+    }
+
     if (s_scene) {
         JceRuntimeDesc rd = (JceRuntimeDesc){0};
         rd.scene          = s_scene;
@@ -409,12 +420,25 @@ static void app_draw(const JceServices *svc, void *ud)
     JceSceneRenderConfig cfg = jce_scene_render_config_default();
     jce_scene_renderer_render(s_scene_renderer, s_scene, s_camera,
                               JCE_VIEW_MAIN_3D, s_last_dt, &cfg);
+
+    /* ECS-UI overlay on top of the 3D scene, into the backbuffer on the
+     * dedicated UI view.  Pointer is NULL: the deployed app grabs the cursor
+     * for FPS-look, so authored UI is presentational here (HUD / labels /
+     * backgrounds); interactive pointer feeding is a follow-up. */
+    if (s_ui_canvas && svc->window) {
+        uint32_t sw = 0, sh = 0;
+        jce_window_get_size(svc->window, &sw, &sh);
+        if (sw > 0 && sh > 0)
+            jce_ui_canvas_render(s_ui_canvas, s_scene, JCE_VIEW_UI, UINT16_MAX,
+                                 (float)sw, (float)sh, NULL, s_last_dt);
+    }
 }
 
 static void app_exit(void *ud)
 {
     (void)ud;
     if (s_runtime)        { jce_runtime_destroy(s_runtime);              s_runtime        = NULL; }
+    if (s_ui_canvas)      { jce_ui_canvas_destroy(s_ui_canvas);          s_ui_canvas      = NULL; }
     if (s_scene_renderer) { jce_scene_renderer_destroy(s_scene_renderer); s_scene_renderer = NULL; }
     /* Destroy cached meshes (owned here) before tearing the rest down. */
     for (int i = 0; i < s_mesh_cache_count; ++i) {

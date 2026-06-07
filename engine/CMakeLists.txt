@@ -284,6 +284,7 @@ _jce_add_layer(jce_scene
 	LINK_PUBLIC  jce_core
 	LINK_PRIVATE
 		jce_animation
+		jce_video
 		flecs::flecs_static
 		cjson::cjson
 		bgfx::bgfx
@@ -297,7 +298,12 @@ _jce_add_layer(jce_world
 
 _jce_add_layer(jce_save
 	DIRS      middleware/save
-	LINK_PUBLIC  jce_core)
+	LINK_PUBLIC  jce_core
+	# jce_save_providers.c serializes/rehydrates the scene through the shared
+	# component-JSON schema (jce_scene_save_json / jce_scene_load_json), so the
+	# save layer links the scene layer.  jce_scene is declared above and does
+	# not link jce_save, so there is no dependency cycle.
+	LINK_PRIVATE jce_scene)
 
 # ================================================================== #
 # L3 — Graphics + Render (depends on L0, L1, animation)              #
@@ -322,6 +328,12 @@ _jce_add_layer(jce_renderer
 # but consumes the renderer low-level API.  Declared here (after both
 # targets exist) to keep the link order valid.
 target_link_libraries(jce_scene PRIVATE jce_renderer)
+
+# P2-weather-decals-tod: jce_scene_renderer.c drives the weather overlay and
+# the time-of-day curve (both in middleware/world / jce_world) from authored
+# scene settings.  Late-bound link because jce_world is declared after the
+# jce_scene layer above.
+target_link_libraries(jce_scene PRIVATE jce_world)
 
 # P3-C.4 follow-up: jce_scene_update reconciles JceClothComponent against
 # the cloth runtime (create/destroy handles, update wind).  Late-bound
@@ -376,6 +388,25 @@ _jce_add_layer(jce_resource
 		assimp::assimp
 		meshoptimizer::meshoptimizer
 	CXX)
+
+# P0-build-bundles-cook: the in-process bundle packer (jce_bundle_pack.c,
+# already in this layer) cooks textures/audio at build time by calling
+# jce_cook_texture / jce_cook_audio. Those live in jce_asset_cooker.c —
+# excluded from the layer glob by _jce_add_layer (it's a host-tool TU that
+# pulls in jce_tex_compress / jce_tex_encode). Add them back here, together
+# with the bimg block encoder, so "Build Bundles" produces BC/ASTC textures
+# in-process (no jce_cook subprocess). This mirrors the existing precedent of
+# assimp/meshoptimizer being linked here purely for the build-time mesh→GLB
+# converter (jce_bundle_mesh_convert.cpp). These TUs only execute on the
+# editor/CLI pack path; the shipping runtime never calls them.
+target_sources(jce_resource PRIVATE
+	"${JCE_ENGINE_SRC_DIR}/resource/jce_asset_cooker.c"
+	"${JCE_TOOLS_DIR}/jce_tex_compress.c"
+	"${JCE_TOOLS_DIR}/jce_tex_encode.cpp")
+target_link_libraries(jce_resource PRIVATE
+	bgfx::bimg_encode
+	bgfx::bimg
+	bgfx::bx)
 
 # ================================================================== #
 # L5 — Application orchestrator                                       #

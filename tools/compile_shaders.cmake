@@ -194,8 +194,13 @@ function(jce_compile_shaders)
             endif()
 
             set(_out "${ARG_OUTPUT_DIR}/${_name}_${_suffix}.bin")
+            # Bone-palette ceiling for the skinned vertex shaders' u_model[]
+            # array. MUST stay equal to JCE_MAX_BONES in
+            # engine/include/jce/renderer/jce_skinned_mesh.h. 128 mat4 = 512
+            # vec4 fits every targeted vertex uniform budget; the skinned
+            # shaders clamp the joint index to BGFX_CONFIG_MAX_BONES-1.
             set(_shader_defines
-                --define "BGFX_CONFIG_MAX_BONES=64")
+                --define "BGFX_CONFIG_MAX_BONES=128")
 
             add_custom_command(
                 OUTPUT  "${_out}"

@@ -68,6 +68,11 @@ JCE_API bool JCE_CALL jce_json_is_bool(const JceJson *j);
 JceJson *jce_json_get(const JceJson *obj, const char *key);   /* case-sensitive */
 JCE_API bool JCE_CALL jce_json_has(const JceJson *obj, const char *key);
 
+/* Remove (and free) a member by key.  No-op when the key is absent.  Use
+ * before a jce_json_set_* call to replace a key without leaving a duplicate
+ * (the set helpers append rather than overwrite). */
+JCE_API void JCE_CALL jce_json_remove(JceJson *obj, const char *key);
+
 JCE_API int JCE_CALL jce_json_array_size(const JceJson *arr);
 JCE_API JceJson *jce_json_array_at(const JceJson *arr, int index);
 

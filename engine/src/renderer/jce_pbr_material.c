@@ -6,6 +6,7 @@
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/renderer/jce_pbr_material.h>
+#include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_texture_types.h>
 
 #include "jce_renderer_internal.h"
@@ -13,6 +14,7 @@
 
 #include <bgfx/c99/bgfx.h>
 #include <SDL3/SDL.h>
+#include <stdio.h>
 #include <string.h>
 
 #define LOG_TAG "jce_pbr_material"
@@ -119,6 +121,37 @@ uint16_t jce_pbr_material_effective_program(const JcePbrMaterial *mat,
     return default_program;
 }
 
+bool jce_pbr_material_is_transparent(const JcePbrMaterial *mat)
+{
+    return mat && mat->alpha_mode == JCE_ALPHA_BLEND;
+}
+
+uint64_t jce_pbr_material_render_state(const JcePbrMaterial *mat)
+{
+    /* Base: colour write + MSAA, always.  OPAQUE / MASK keep the default
+     * depth test + write + back-face cull.  BLEND enables standard
+     * src-alpha / inv-src-alpha blending and disables depth write so
+     * overlapping transparent surfaces composite correctly (they are
+     * already sorted back-to-front by the caller). */
+    uint64_t state = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                   | BGFX_STATE_DEPTH_TEST_LESS | BGFX_STATE_MSAA;
+
+    if (mat && mat->alpha_mode == JCE_ALPHA_BLEND) {
+        state |= BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_SRC_ALPHA,
+                                       BGFX_STATE_BLEND_INV_SRC_ALPHA);
+        /* No BGFX_STATE_WRITE_Z: transparent surfaces must not occlude
+         * each other in the depth buffer. */
+    } else {
+        state |= BGFX_STATE_WRITE_Z;
+    }
+
+    /* Double-sided materials skip back-face culling (default cull is CW). */
+    if (!mat || !mat->double_sided)
+        state |= BGFX_STATE_CULL_CW;
+
+    return state;
+}
+
 void jce_pbr_material_bind(const JcePbrMaterial *mat,
                             const JceRenderer *r, uint16_t view_id)
 {
@@ -211,6 +244,125 @@ static void safe_copy(char *dst, size_t dst_sz, const char *src)
     if (len >= dst_sz) len = dst_sz - 1;
     memcpy(dst, src, len);
     dst[len] = '\0';
+}
+
+/* Resolve a (possibly relative) sibling path against the directory of
+ * `base_path`.  Absolute paths and bare paths that already exist as given
+ * pass through unchanged.  Mirrors the texture-resolution logic in
+ * jce_scene_components_json.c so custom-shader .bin blobs load regardless
+ * of the runtime cwd. */
+static void resolve_sibling_path(const char *base_path, char *io,
+                                 size_t io_sz)
+{
+    if (!io[0]) return;
+    /* Absolute path or already-existing relative path: keep as-is. */
+    if (io[0] == '/' || io[0] == '\\' ||
+        (io[0] && io[1] == ':') || jce_fs_host_exists_file(io))
+        return;
+
+    const char *slash = strrchr(base_path, '/');
+    const char *bslash = strrchr(base_path, '\\');
+    if (bslash > slash) slash = bslash;
+    if (!slash) return;   /* base has no directory component */
+
+    size_t dir_len = (size_t)(slash - base_path) + 1;   /* keep trailing sep */
+    char joined[512];
+    if (dir_len >= sizeof(joined)) return;
+    memcpy(joined, base_path, dir_len);
+    snprintf(joined + dir_len, sizeof(joined) - dir_len, "%s", io);
+    if (jce_fs_host_exists_file(joined))
+        safe_copy(io, io_sz, joined);
+}
+
+/* Process-wide cache of graph-generated programs keyed by material path.
+ *
+ * jce_pbr_material_load_json has many callers (scene loader, thumbnails,
+ * inspector reload, material registry) that load a material, copy out what
+ * they need, then discard the JcePbrMaterial.  Creating a fresh bgfx program
+ * on every such load would leak.  Caching by material path makes the load
+ * idempotent: the first load links the program; subsequent loads (and every
+ * other caller) return the same handle.  The cache owns the programs and
+ * frees them in jce_pbr_material_shutdown(). */
+#define PBR_PROG_CACHE_MAX 64
+static struct {
+    char     mat_path[256];
+    char     vs_path[256];
+    char     fs_path[256];
+    uint16_t program;
+    bool     used;
+} s_prog_cache[PBR_PROG_CACHE_MAX];
+static int s_prog_cache_count = 0;
+
+/* Load + link a custom shader program from two compiled bgfx .bin blobs.
+ * Returns UINT16_MAX on any failure (missing files, bad blobs, renderer
+ * not ready).  Both paths are resolved relative to `mat_path` and the
+ * result is cached by (mat_path, vs, fs) so repeat loads never leak. */
+static uint16_t load_custom_program(const char *mat_path,
+                                    const char *vs_rel, const char *fs_rel)
+{
+    if (!vs_rel || !vs_rel[0] || !fs_rel || !fs_rel[0])
+        return UINT16_MAX;
+
+    /* Cache hit: same material + same blob paths → reuse the linked program. */
+    for (int i = 0; i < s_prog_cache_count; i++) {
+        if (s_prog_cache[i].used &&
+            strncmp(s_prog_cache[i].mat_path, mat_path,
+                    sizeof(s_prog_cache[i].mat_path)) == 0 &&
+            strncmp(s_prog_cache[i].vs_path, vs_rel,
+                    sizeof(s_prog_cache[i].vs_path)) == 0 &&
+            strncmp(s_prog_cache[i].fs_path, fs_rel,
+                    sizeof(s_prog_cache[i].fs_path)) == 0)
+            return s_prog_cache[i].program;
+    }
+
+    char vs_path[512], fs_path[512];
+    safe_copy(vs_path, sizeof(vs_path), vs_rel);
+    safe_copy(fs_path, sizeof(fs_path), fs_rel);
+    resolve_sibling_path(mat_path, vs_path, sizeof(vs_path));
+    resolve_sibling_path(mat_path, fs_path, sizeof(fs_path));
+
+    uint64_t vs_sz = 0, fs_sz = 0;
+    void *vs_blob = jce_fs_host_read_all(vs_path, &vs_sz);
+    void *fs_blob = jce_fs_host_read_all(fs_path, &fs_sz);
+    uint16_t prog = UINT16_MAX;
+    if (vs_blob && fs_blob && vs_sz > 0 && fs_sz > 0) {
+        JceShaderHandle h = jce_renderer_create_program_from_blobs(
+            vs_blob, (size_t)vs_sz, fs_blob, (size_t)fs_sz);
+        prog = h.idx;
+        if (prog == UINT16_MAX)
+            LOG_WARN(LOG_TAG, "custom program link failed: %s", mat_path);
+    } else {
+        LOG_WARN(LOG_TAG, "custom shader blob(s) missing for %s", mat_path);
+    }
+    jce_fs_buffer_free(vs_blob);
+    jce_fs_buffer_free(fs_blob);
+
+    /* Cache the result (including failures, so we don't retry a broken blob
+     * every frame).  When the table is full, fall through uncached. */
+    if (s_prog_cache_count < PBR_PROG_CACHE_MAX) {
+        int idx = s_prog_cache_count++;
+        safe_copy(s_prog_cache[idx].mat_path,
+                  sizeof(s_prog_cache[idx].mat_path), mat_path);
+        safe_copy(s_prog_cache[idx].vs_path,
+                  sizeof(s_prog_cache[idx].vs_path), vs_rel);
+        safe_copy(s_prog_cache[idx].fs_path,
+                  sizeof(s_prog_cache[idx].fs_path), fs_rel);
+        s_prog_cache[idx].program = prog;
+        s_prog_cache[idx].used    = true;
+    }
+    return prog;
+}
+
+void jce_pbr_material_shutdown(void)
+{
+    for (int i = 0; i < s_prog_cache_count; i++) {
+        if (s_prog_cache[i].used && s_prog_cache[i].program != UINT16_MAX) {
+            JceShaderHandle h = { s_prog_cache[i].program };
+            jce_renderer_destroy_program(h);
+        }
+        s_prog_cache[i].used = false;
+    }
+    s_prog_cache_count = 0;
 }
 
 /* ================================================================== */
@@ -317,6 +469,19 @@ bool jce_pbr_material_load_json(const char *path, JcePbrMaterial *out,
         else                                out->alpha_mode = JCE_ALPHA_OPAQUE;
     }
 
+    /* Shader Graph custom shader (compiled .bin blobs persisted by the
+     * editor's "Compile & Bind").  Optional — absent on plain materials. */
+    {
+        const char *vs_bin = json_string(props, "customProgramVs");
+        const char *fs_bin = json_string(props, "customProgramFs");
+        if ((!vs_bin || !fs_bin) && props != root) {
+            if (!vs_bin) vs_bin = json_string(root, "customProgramVs");
+            if (!fs_bin) fs_bin = json_string(root, "customProgramFs");
+        }
+        if (vs_bin && fs_bin)
+            out->custom_program = load_custom_program(path, vs_bin, fs_bin);
+    }
+
     jce_json_free(root);
     LOG_DEBUG(LOG_TAG, "loaded material: %s", path);
     return true;
@@ -366,6 +531,29 @@ bool jce_pbr_material_save_json(const char *path,
     if (mat->alpha_mode == JCE_ALPHA_BLEND) am_str = "BLEND";
     jce_json_set_string(root, "alphaMode", am_str);
 
+    /* Preserve an existing Shader Graph reference: callers that only edit
+     * PBR factors (inspector "Save Material", graph "Compile") rewrite the
+     * whole file, which would otherwise drop the graph-shader keys. */
+    if (jce_fs_host_exists_file(path)) {
+        uint64_t prev_sz = 0;
+        char *prev_buf = (char *)jce_fs_host_read_all(path, &prev_sz);
+        if (prev_buf) {
+            JceJson *prev = (prev_sz > 0 && prev_sz <= (1 << 20))
+                ? jce_json_parse(prev_buf, prev_sz) : NULL;
+            jce_fs_buffer_free(prev_buf);
+            if (prev) {
+                static const char *const keep[3] = {
+                    "shaderGraph", "customProgramVs", "customProgramFs"
+                };
+                for (int i = 0; i < 3; i++) {
+                    const char *v = jce_json_get_string(prev, keep[i], NULL);
+                    if (v && v[0]) jce_json_set_string(root, keep[i], v);
+                }
+                jce_json_free(prev);
+            }
+        }
+    }
+
     char *json_str = jce_json_print(root, true);
     jce_json_free(root);
     if (!json_str) return false;
@@ -379,5 +567,68 @@ bool jce_pbr_material_save_json(const char *path,
     }
 
     LOG_INFO(LOG_TAG, "saved material: %s", path);
+    return true;
+}
+
+/* ================================================================== */
+/* Shader Graph reference (read-modify-write)                          */
+/* ================================================================== */
+
+bool jce_pbr_material_set_graph_shader(const char *mat_path,
+                                       const char *graph_path,
+                                       const char *vs_bin_path,
+                                       const char *fs_bin_path)
+{
+    if (!mat_path || !mat_path[0]) return false;
+
+    /* Load existing material so every other field round-trips untouched.
+     * If the file does not exist yet, start from a default material so the
+     * graph reference can still be attached. */
+    JceJson *root = NULL;
+    if (jce_fs_host_exists_file(mat_path)) {
+        uint64_t sz = 0;
+        char *buf = (char *)jce_fs_host_read_all(mat_path, &sz);
+        if (buf) {
+            if (sz > 0 && sz <= (1 << 20))
+                root = jce_json_parse(buf, sz);
+            jce_fs_buffer_free(buf);
+        }
+    }
+    if (!root || !jce_json_is_object(root)) {
+        if (root) jce_json_free(root);
+        root = jce_json_object();
+        if (!root) return false;
+        jce_json_set_string(root, "type", "pbr");
+    }
+
+    /* Replace cleanly: set helpers append, so drop any prior copies first. */
+    jce_json_remove(root, "shaderGraph");
+    jce_json_remove(root, "customProgramVs");
+    jce_json_remove(root, "customProgramFs");
+
+    bool attach = (vs_bin_path && vs_bin_path[0]) ||
+                  (fs_bin_path && fs_bin_path[0]);
+    if (attach) {
+        if (graph_path && graph_path[0])
+            jce_json_set_string(root, "shaderGraph", graph_path);
+        if (vs_bin_path && vs_bin_path[0])
+            jce_json_set_string(root, "customProgramVs", vs_bin_path);
+        if (fs_bin_path && fs_bin_path[0])
+            jce_json_set_string(root, "customProgramFs", fs_bin_path);
+    }
+
+    char *json_str = jce_json_print(root, true);
+    jce_json_free(root);
+    if (!json_str) return false;
+
+    size_t len = strlen(json_str);
+    bool ok = jce_fs_host_write_all(mat_path, json_str, len);
+    jce_json_free_string(json_str);
+    if (!ok) {
+        LOG_WARN(LOG_TAG, "cannot write material file: %s", mat_path);
+        return false;
+    }
+    LOG_INFO(LOG_TAG, "%s graph shader -> %s",
+             attach ? "attached" : "detached", mat_path);
     return true;
 }

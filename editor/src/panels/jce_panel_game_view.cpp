@@ -20,6 +20,8 @@ extern "C" {
 #include <jce/renderer/jce_renderer_caps.h>
 #include <jce/runtime/jce_game_module.h>
 #include <jce/middleware/scene/jce_vcam_system.h>
+#include <jce/middleware/scene/jce_scene.h>
+#include <ctype.h>
 }
 
 #include <jce/tools/jce_imgui.hpp>
@@ -37,6 +39,7 @@ static int  s_aspect_idx  = 0;
 static bool s_show_stats  = false;
 static int  s_run_mode_idx = 0;
 static bool s_run_mode_loaded = false;
+static bool s_third_person = false;   /* play camera: false=first-person, true=behind-player */
 
 enum {
     JCE_GAME_VIEW_RUN_EDITOR_SIMULATION = 0,
@@ -308,6 +311,25 @@ void jce_editor_panel_game_view_content(void)
     uint32_t vh = (uint32_t)fmaxf(1.0f, view_size.y);
     if (vw < 16u) vw = 16u;
     if (vh < 16u) vh = 16u;
+
+    /* Feed the ECS-UI (Canvas) graphic raycaster the panel-local pointer,
+     * mapped from the displayed image rect into rendered (FBO) pixels.  Only
+     * valid while the cursor is over the viewport and we are NOT in FPS
+     * capture (where the cursor is pinned/hidden). */
+    {
+        const ImGuiIO &io = ImGui::GetIO();
+        bool fps = jce_editor_game_render_is_mouse_captured();
+        float lx = io.MousePos.x - region_start.x;
+        float ly = io.MousePos.y - region_start.y;
+        bool inside = !fps && view_size.x > 0 && view_size.y > 0 &&
+                      lx >= 0 && ly >= 0 &&
+                      lx < view_size.x && ly < view_size.y;
+        float ui_x = inside ? lx / view_size.x * (float)vw : 0.0f;
+        float ui_y = inside ? ly / view_size.y * (float)vh : 0.0f;
+        bool down = inside && ImGui::IsMouseDown(ImGuiMouseButton_Left);
+        jce_editor_game_render_set_ui_pointer(ui_x, ui_y, down, inside);
+    }
+
     jce_editor_game_render_frame(vw, vh);
 
     uint16_t tex_idx = jce_editor_game_render_get_texture();
@@ -390,6 +412,9 @@ void jce_editor_panel_game_view_content(void)
         jce_editor_game_render_set_mouse_capture(effective_capture);
 
         if (effective_capture) {
+            /* V toggles first/third-person follow camera (Play mode). */
+            if (play_active && ImGui::IsKeyPressed(ImGuiKey_V, false))
+                s_third_person = !s_third_person;
             /* Use SDL relative-motion accumulator (xrel/yrel) instead of
              * ImGui::IO::MouseDelta — the latter is always zero in
              * relative-mouse-mode because the absolute cursor is pinned. */
@@ -437,10 +462,19 @@ void jce_editor_panel_game_view_content(void)
                 if (wlen > 0.0001f) { wx /= wlen; wz /= wlen; }
 
                 bool jump = ImGui::IsKeyPressed(ImGuiKey_Space, false);
+                /* Hold Ctrl to SPRINT — raises the move speed so the locomotion
+                 * blend tree / SM crosses into the Run band. Normal move
+                 * ~4 m/s (Walk), sprint ~7 m/s (Run). */
+                float char_mult =
+                    (ImGui::IsKeyDown(ImGuiKey_LeftCtrl) ||
+                     ImGui::IsKeyDown(ImGuiKey_RightCtrl)) ? 1.8f : 1.0f;
                 jce_editor_play_set_player_input(wx * walk_speed,
                                                   wz * walk_speed,
                                                   jump,
-                                                  speed_mult);
+                                                  char_mult);
+                /* Facing + idle/walk/run clip are driven generically by the
+                 * engine runtime (rt_drive_character), so it also works in the
+                 * shipped game, not just here. */
             } else {
                 /* No CharacterController in scene → classic free-fly cam. */
                 float speed = 5.0f * speed_mult;
@@ -476,8 +510,19 @@ void jce_editor_panel_game_view_content(void)
         if (play_active) {
             float px, py, pz;
             if (jce_editor_play_get_player_position(&px, &py, &pz)) {
-                jce_vec3 eye = jce_v3(px, py + 1.6f, pz);
-                jce_camera_set_position(cam, eye);
+                if (s_third_person) {
+                    /* Orbit behind the player along the mouse-controlled
+                     * forward, looking at chest height (V toggles this). */
+                    jce_vec3 fwd = jce_camera_get_forward(cam);
+                    const float dist = 4.5f;
+                    jce_vec3 pivot = jce_v3(px, py + 1.5f, pz);
+                    jce_camera_set_position(cam,
+                        jce_v3(pivot.x - fwd.x * dist,
+                               pivot.y - fwd.y * dist + 0.4f,
+                               pivot.z - fwd.z * dist));
+                } else {
+                    jce_camera_set_position(cam, jce_v3(px, py + 1.6f, pz));
+                }
             }
         }
 

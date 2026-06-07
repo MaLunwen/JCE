@@ -48,7 +48,7 @@ JCE_EXTERN_C_BEGIN
 typedef struct JceFixedClock {
     double   accumulator;   /* unconsumed time, seconds (always < fixed_dt
                              * after a successful advance loop)        */
-    double   fixed_dt;      /* simulation step, seconds (e.g. 1.0/50.0) */
+    double   fixed_dt;      /* simulation step, seconds (e.g. 1.0/60.0) */
     double   max_frame_dt;  /* spiral-of-death cap, seconds (e.g. 0.25) */
     uint64_t tick_count;    /* monotonic count of executed fixed ticks  */
     double   fixed_time;    /* tick_count * fixed_dt (sim wall clock)   */
@@ -56,9 +56,9 @@ typedef struct JceFixedClock {
                              * last advance — renderer interp factor   */
 } JceFixedClock;
 
-/* Initialise in place.  `fixed_dt` <= 0 falls back to 1.0/50.0 (Unity
- * default).  `max_frame_dt` <= 0 falls back to 0.25 s.  Resets all
- * counters to zero. */
+/* Initialise in place.  `fixed_dt` <= 0 falls back to 1.0/60.0 (the
+ * engine-wide default that matches the physics step).  `max_frame_dt`
+ * <= 0 falls back to 0.25 s.  Resets all counters to zero. */
 JCE_API void JCE_CALL
 jce_fixed_clock_init(JceFixedClock *c, double fixed_dt, double max_frame_dt);
 
@@ -83,9 +83,14 @@ JCE_API double JCE_CALL
 jce_fixed_clock_alpha(const JceFixedClock *c);
 
 /* Process-global fixed clock used by jce_engine_iterate to drive
- * JCE_PHASE_FIXED_UPDATE.  Lazily initialised on first call with the
- * Unity-default 50 Hz / 0.25 s spiral cap.  Configure cadence via
- * jce_engine_set_fixed_hz() rather than mutating the struct directly. */
+ * JCE_PHASE_FIXED_UPDATE.  This is the SINGLE source of truth for the
+ * fixed cadence: the per-runtime physics clock (rt->clock) adopts this
+ * clock's fixed_dt every step so the two cannot desync, and the
+ * net-transform tick conversion reads it too.  Lazily initialised on
+ * first call with the engine-default 60 Hz / 0.25 s spiral cap.
+ * Configure cadence via jce_engine_set_fixed_hz() (or, for a specific
+ * runtime, JceRuntimeDesc.fixed_timestep, which also retunes this clock)
+ * rather than mutating the struct directly. */
 JCE_API JceFixedClock * JCE_CALL
 jce_fixed_clock_default(void);
 

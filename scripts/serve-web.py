@@ -5,14 +5,17 @@ SharedArrayBuffer (used by SDL3/Emscripten) requires:
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Embedder-Policy: require-corp
 
-Usage: python serve-web.py [port] [directory]
-  Defaults: port=8080, directory=build/web/wasm/{release|dist} (auto-detected)
+Usage:
+  python scripts/serve-web.py
+  python scripts/serve-web.py --entry science_lab.html --no-open
+  python scripts/serve-web.py 8080 build/web/wasm/release
 """
 
+import argparse
 import http.server
 import os
-import sys
 import socketserver
+import sys
 import threading
 import webbrowser
 
@@ -24,11 +27,20 @@ _MIME_OVERRIDES = {
 }
 
 
+def _normalise_entry(entry):
+    entry = (entry or "").strip().replace("\\", "/")
+    while entry.startswith("/"):
+        entry = entry[1:]
+    if not entry:
+        entry = "caged_kingdom.html"
+    return entry
+
+
 class COOPCOEPHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/":
             self.send_response(302)
-            self.send_header("Location", "/caged_kingdom.html")
+            self.send_header("Location", "/" + self.server.entry_file)
             self.end_headers()
             return
         super().do_GET()
@@ -52,6 +64,7 @@ class COOPCOEPHandler(http.server.SimpleHTTPRequestHandler):
 class _ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     """Handle each request in its own thread (browser loads many assets at once)."""
     daemon_threads = True
+    allow_reuse_address = True
 
 
 def _find_web_dir(repo_root):
@@ -62,9 +75,51 @@ def _find_web_dir(repo_root):
     return None
 
 
+def _pick_entry(directory, requested):
+    if requested:
+        entry = _normalise_entry(requested)
+        if not os.path.isfile(os.path.join(directory, entry)):
+            print(f"ERROR: Entry file not found: {os.path.join(directory, entry)}")
+            sys.exit(1)
+        return entry
+
+    for candidate in ("caged_kingdom.html", "science_lab.html"):
+        if os.path.isfile(os.path.join(directory, candidate)):
+            return candidate
+
+    html_files = sorted(
+        f for f in os.listdir(directory)
+        if f.lower().endswith(".html") and os.path.isfile(os.path.join(directory, f)))
+    if html_files:
+        return html_files[0]
+
+    print(f"ERROR: No .html entry found in {directory}")
+    sys.exit(1)
+
+
+def _parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description="Serve a JCE WASM build with COOP/COEP headers.")
+    parser.add_argument("legacy_port", nargs="?", type=int,
+                        help="legacy positional port")
+    parser.add_argument("legacy_directory", nargs="?",
+                        help="legacy positional web output directory")
+    parser.add_argument("--port", type=int, default=None,
+                        help="port to listen on (default: 8080)")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="host/interface to bind (default: 127.0.0.1)")
+    parser.add_argument("--dir", "--directory", dest="directory",
+                        help="web output directory")
+    parser.add_argument("--entry", help="HTML entry file to open/redirect to")
+    parser.add_argument("--no-open", action="store_true",
+                        help="do not open the default browser")
+    return parser.parse_args(argv)
+
+
 def main():
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
-    directory = sys.argv[2] if len(sys.argv) > 2 else None
+    args = _parse_args(sys.argv[1:])
+    port = args.port or args.legacy_port or 8080
+    directory = args.directory or args.legacy_directory
 
     if directory is None:
         repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -78,15 +133,22 @@ def main():
         print(f"ERROR: Directory not found: {directory}")
         sys.exit(1)
 
+    directory = os.path.abspath(directory)
+    entry = _pick_entry(directory, args.entry)
+
     os.chdir(directory)
-    server = _ThreadedHTTPServer(("", port), COOPCOEPHandler)
-    url = f"http://localhost:{port}"
+    server = _ThreadedHTTPServer((args.host, port), COOPCOEPHandler)
+    server.entry_file = entry
+    browser_host = "localhost" if args.host in ("", "0.0.0.0", "::") else args.host
+    url = f"http://{browser_host}:{port}/{entry}"
     print(f"Serving {directory}")
-    print(f"  {url}")
+    print(f"  entry: {entry}")
+    print(f"  url:   {url}")
     print(f"  COOP/COEP headers enabled (SharedArrayBuffer available)")
     print(f"  Press Ctrl+C to stop")
 
-    threading.Timer(0.4, lambda: webbrowser.open(url)).start()
+    if not args.no_open:
+        threading.Timer(0.4, lambda: webbrowser.open(url)).start()
 
     try:
         server.serve_forever()

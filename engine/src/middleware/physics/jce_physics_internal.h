@@ -29,7 +29,18 @@ typedef struct JceBulletWorld JceBulletWorld;
 /* World lifecycle                                                     */
 /* ================================================================== */
 
-JceBulletWorld *jce_bullet_create(jce_vec3 gravity, uint32_t max_bodies);
+/* Solver / sleeping tunables.  Sentinel values keep Bullet's stock
+   defaults: solver_iterations<=0, split_impulse<0, deactivation_time<=0,
+   linear/angular_sleep_threshold<=0 all mean "leave default".
+   `multithreaded` requests the parallel solver/dispatcher path; it is only
+   honoured when the back-end was compiled with JCE_PHYSICS_MT (otherwise it
+   logs once and falls back to the single-threaded world). */
+JceBulletWorld *jce_bullet_create(jce_vec3 gravity, uint32_t max_bodies,
+                                  int solver_iterations, int split_impulse,
+                                  float deactivation_time,
+                                  float linear_sleep_threshold,
+                                  float angular_sleep_threshold,
+                                  bool multithreaded);
 void            jce_bullet_destroy(JceBulletWorld *bw);
 
 /* ================================================================== */
@@ -54,6 +65,23 @@ uint32_t jce_bullet_body_create(JceBulletWorld *bw,
                                 bool is_trigger);
 
 void jce_bullet_body_destroy(JceBulletWorld *bw, uint32_t idx);
+
+/* ------------------------------------------------------------------ */
+/* Generation-counter handles (D-gen-handles)                          */
+/* ------------------------------------------------------------------ */
+
+/* Current generation counter for pool slot `idx`.  Bumped every time the
+ * slot is destroyed, so a handle minted from an older generation can be
+ * detected as stale.  Returns 0 for an out-of-range slot (the value a
+ * fresh, never-recycled slot also reports). */
+uint32_t jce_bullet_body_generation(JceBulletWorld *bw, uint32_t idx);
+
+/* Validate that slot `idx` is in range, alive, and still on generation
+ * `gen`.  This is the stale-handle guard: a handle whose generation no
+ * longer matches the slot's (because the slot was freed and reused) is
+ * rejected.  gen 0 against a never-recycled slot always matches, so bare
+ * pre-existing handles stay valid. */
+bool jce_bullet_body_alive_gen(JceBulletWorld *bw, uint32_t idx, uint32_t gen);
 
 /* ------------------------------------------------------------------ */
 /* Compound / mesh bodies                                              */
@@ -109,12 +137,27 @@ void jce_bullet_body_set_angular_velocity(JceBulletWorld *bw, uint32_t idx,
 /* Forces & impulses                                                   */
 /* ================================================================== */
 
+bool jce_bullet_body_is_dynamic(JceBulletWorld *bw, uint32_t idx);
 void jce_bullet_body_apply_force(JceBulletWorld *bw, uint32_t idx,
                                  jce_vec3 force);
 void jce_bullet_body_apply_impulse(JceBulletWorld *bw, uint32_t idx,
                                    jce_vec3 impulse);
 void jce_bullet_body_apply_torque(JceBulletWorld *bw, uint32_t idx,
                                   jce_vec3 torque);
+
+void jce_bullet_body_apply_force_at_point(JceBulletWorld *bw, uint32_t idx,
+                                          jce_vec3 force, jce_vec3 world_point);
+void jce_bullet_body_apply_impulse_at_point(JceBulletWorld *bw, uint32_t idx,
+                                            jce_vec3 impulse, jce_vec3 world_point);
+
+/* Per-body gravity (scales the world gravity vector) and runtime mass. */
+void jce_bullet_body_set_gravity_factor(JceBulletWorld *bw, uint32_t idx,
+                                        float factor);
+void jce_bullet_body_set_mass(JceBulletWorld *bw, uint32_t idx, float mass);
+
+/* Runtime collider scale: sets the shape's local scaling, recomputes inertia
+ * for dynamic bodies, and refreshes the broadphase AABB. */
+void jce_bullet_body_set_scale(JceBulletWorld *bw, uint32_t idx, jce_vec3 scale);
 
 /* ================================================================== */
 /* Ray casting                                                         */
@@ -130,6 +173,39 @@ typedef struct {
 
 JceBulletRayResult jce_bullet_raycast(JceBulletWorld *bw, jce_vec3 origin,
                                       jce_vec3 dir, float max_dist);
+
+/* ------------------------------------------------------------------ */
+/* Filtered spatial queries (layer_mask = bit i selects layer i;      */
+/* hit_triggers includes CF_NO_CONTACT_RESPONSE bodies).              */
+/* ------------------------------------------------------------------ */
+
+JceBulletRayResult jce_bullet_raycast_filtered(JceBulletWorld *bw,
+                                               jce_vec3 origin, jce_vec3 dir,
+                                               float max_dist,
+                                               uint32_t layer_mask,
+                                               bool hit_triggers);
+
+/* Multi-hit ray: fills out[] (sorted near→far), returns count written. */
+uint32_t jce_bullet_raycast_all(JceBulletWorld *bw,
+                                jce_vec3 origin, jce_vec3 dir, float max_dist,
+                                uint32_t layer_mask, bool hit_triggers,
+                                JceBulletRayResult *out, uint32_t max_hits);
+
+/* Overlap tests: fill out_idx[] with overlapping body indices, return count. */
+uint32_t jce_bullet_overlap_sphere(JceBulletWorld *bw, jce_vec3 center,
+                                   float radius, uint32_t layer_mask,
+                                   bool hit_triggers,
+                                   uint32_t *out_idx, uint32_t max);
+uint32_t jce_bullet_overlap_box(JceBulletWorld *bw, jce_vec3 center,
+                                jce_vec3 half_ext, jce_quat rot,
+                                uint32_t layer_mask, bool hit_triggers,
+                                uint32_t *out_idx, uint32_t max);
+
+/* Sphere sweep: closest hit along dir (a thick ray). */
+JceBulletRayResult jce_bullet_sweep_sphere(JceBulletWorld *bw, jce_vec3 origin,
+                                           float radius, jce_vec3 dir,
+                                           float max_dist, uint32_t layer_mask,
+                                           bool hit_triggers);
 
 /* ================================================================== */
 /* Contact callbacks                                                   */
@@ -283,6 +359,8 @@ void jce_bullet_character_move(JceBulletWorld *bw, uint32_t idx,
 void jce_bullet_character_jump(JceBulletWorld *bw, uint32_t idx);
 void jce_bullet_character_get_position(JceBulletWorld *bw, uint32_t idx,
                                         jce_vec3 *pos);
+void jce_bullet_character_set_position(JceBulletWorld *bw, uint32_t idx,
+                                        jce_vec3 pos);
 bool jce_bullet_character_is_grounded(JceBulletWorld *bw, uint32_t idx);
 
 /* ================================================================== */

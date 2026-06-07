@@ -279,6 +279,8 @@ if(JCE_PLATFORM_WEB)
 	# The runtime opens it with pak_open_file("/game_assets.pak").
 	target_link_options(CagedKingdom PRIVATE
 		"SHELL:--preload-file ${GAME_PAK_FILE}@/game_assets.pak")
+	set_property(TARGET CagedKingdom APPEND PROPERTY
+		LINK_DEPENDS "${GAME_PAK_FILE}")
 elseif(JCE_PLATFORM_ANDROID OR JCE_BUILD_JNI)
 	# Android: PAK shipped as APK asset, loaded at runtime via SDL_IOFromFile.
 	# JNI:     PAK shipped alongside the native lib in the fat JAR, extracted

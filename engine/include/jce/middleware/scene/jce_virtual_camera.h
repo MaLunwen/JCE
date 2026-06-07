@@ -1,16 +1,17 @@
 /*
- * jce_virtual_camera.h  Cinemachine-style virtual cameras (Sprint 4 #17).
+ * jce_virtual_camera.h  Cinemachine-style virtual-camera data types.
  *
  * A virtual camera describes a *desire* for the live (real) camera: a
  * position+target+fov, plus a follow target, optional offset, damping
- * and priority.  A small manager picks the highest-priority *active*
- * vcam, blends from the previous one over a configurable duration,
- * and writes the result into a plain output struct that the renderer
- * (or scene system) feeds into the actual view+proj matrices.
+ * and priority.  The live consumer is the ECS-driven resolver in
+ * <jce/middleware/scene/jce_vcam_system.h>, which picks the highest-priority
+ * active vcam, damps toward it, and writes a JceVcamOutput that the renderer
+ * feeds into the view+proj matrices.
  *
- * Out of scope here: noise, dolly tracks, group composer, collision.
- * Those can layer on top of jce_vcam_evaluate by post-processing the
- * output before assigning to the live camera.
+ * This header now carries only the shared value types (JceVcamTrackMode,
+ * JceVirtualCamera, JceVcamOutput).  The earlier standalone handle-based
+ * JceVcamManager API was removed in v0.9.4 — it duplicated the ECS path and
+ * had no callers; jce_vcam_system.h is the single live entry point.
  */
 
 #ifndef JCE_VIRTUAL_CAMERA_H
@@ -52,25 +53,6 @@ typedef struct {
     float target  [3];
     float fov_deg;
 } JceVcamOutput;
-
-typedef struct JceVcamManager JceVcamManager;
-
-JCE_API JceVcamManager *JCE_CALL jce_vcam_manager_create(void);
-JCE_API void            JCE_CALL jce_vcam_manager_destroy(JceVcamManager *m);
-
-JCE_API int  JCE_CALL jce_vcam_add(JceVcamManager *m, const JceVirtualCamera *cam);
-JCE_API void JCE_CALL jce_vcam_update(JceVcamManager *m, int handle, const JceVirtualCamera *cam);
-JCE_API void JCE_CALL jce_vcam_remove(JceVcamManager *m, int handle);
-JCE_API int  JCE_CALL jce_vcam_count (const JceVcamManager *m);
-
-JCE_API void JCE_CALL jce_vcam_set_blend_duration(JceVcamManager *m, float seconds);
-
-/* Advance the manager and produce the live camera output for this frame. */
-JCE_API void JCE_CALL jce_vcam_evaluate(JceVcamManager *m, float dt, JceVcamOutput *out);
-
-/* Introspection (for editor panel). */
-JCE_API const JceVirtualCamera *JCE_CALL jce_vcam_get(const JceVcamManager *m, int handle);
-JCE_API int                     JCE_CALL jce_vcam_active_handle(const JceVcamManager *m);
 
 JCE_EXTERN_C_END
 

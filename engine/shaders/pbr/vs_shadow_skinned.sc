@@ -18,8 +18,11 @@ int decode_bone_index_clamped(float raw_index)
     if (idx < 0.0) {
         idx = 0.0;
     }
-    if (idx > 63.0) {
-        idx = 63.0;
+    // Clamp to the last valid u_model[] slot (BGFX_CONFIG_MAX_BONES-1); kept in
+    // lock-step with vs_pbr_skinned.sc so the cast shadow deforms identically.
+    float max_idx = float(BGFX_CONFIG_MAX_BONES - 1);
+    if (idx > max_idx) {
+        idx = max_idx;
     }
     return int(idx);
 }

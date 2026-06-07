@@ -22,11 +22,48 @@ JCE_EXTERN_C_BEGIN
 /* Handle types                                                        */
 /* ================================================================== */
 
-/* Rigid body handle — index into internal pool. */
+/* Rigid body handle — index into internal pool.
+ *
+ * The 32-bit `idx` is partitioned into a low slot index and a high
+ * generation counter so a stale handle to a recycled slot can be
+ * detected (D-gen-handles).  The split is 20 bits slot (up to ~1M
+ * bodies) + 12 bits generation (4096 reuses before wrap).
+ *
+ * BACKWARD COMPATIBILITY: a bare slot index (generation 0) packs to
+ * itself, so handles minted before this scheme — and every code path
+ * that still treats `idx` as a raw slot — keep working unchanged.
+ * JCE_BODY_INVALID stays UINT32_MAX (all index + all gen bits set) and
+ * is filtered by jce_body_valid before any slot/gen extraction. */
+#define JCE_BODY_HANDLE_INDEX_BITS 20u
+#define JCE_BODY_HANDLE_INDEX_MASK ((1u << JCE_BODY_HANDLE_INDEX_BITS) - 1u)
+#define JCE_BODY_HANDLE_GEN_MASK   (0xFFFFFFFFu >> JCE_BODY_HANDLE_INDEX_BITS)
+
 typedef struct { uint32_t idx; } JceBodyHandle;
 #define JCE_BODY_INVALID ((JceBodyHandle){ UINT32_MAX })
 
 static inline bool jce_body_valid(JceBodyHandle h) { return h.idx != UINT32_MAX; }
+
+/* Pack a pool slot + generation into a handle.  Slot/gen are masked to
+ * their field widths; passing gen 0 yields a bare slot index. */
+static inline JceBodyHandle jce_body_handle_pack(uint32_t slot, uint32_t gen)
+{
+    JceBodyHandle h;
+    h.idx = (slot & JCE_BODY_HANDLE_INDEX_MASK) |
+            ((gen & JCE_BODY_HANDLE_GEN_MASK) << JCE_BODY_HANDLE_INDEX_BITS);
+    return h;
+}
+
+/* Extract the pool slot index from a handle (low bits). */
+static inline uint32_t jce_body_handle_slot(JceBodyHandle h)
+{
+    return h.idx & JCE_BODY_HANDLE_INDEX_MASK;
+}
+
+/* Extract the generation counter from a handle (high bits). */
+static inline uint32_t jce_body_handle_gen(JceBodyHandle h)
+{
+    return (h.idx >> JCE_BODY_HANDLE_INDEX_BITS) & JCE_BODY_HANDLE_GEN_MASK;
+}
 
 /* Collider / shape handle. */
 typedef struct { uint32_t idx; } JceColliderHandle;

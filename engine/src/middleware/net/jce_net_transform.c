@@ -99,7 +99,7 @@ static NtState g_nt;
 static double fixed_hz_now(void)
 {
     JceFixedClock *fc = jce_fixed_clock_default();
-    if (!fc || fc->fixed_dt <= 0.0) return 50.0;
+    if (!fc || fc->fixed_dt <= 0.0) return 60.0;  /* engine fixed default */
     return 1.0 / fc->fixed_dt;
 }
 

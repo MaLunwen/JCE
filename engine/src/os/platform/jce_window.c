@@ -136,7 +136,6 @@ void jce_window_get_native(const JceWindow *win, JceNativeWindow *out)
     if (!win || !out) return;
     memset(out, 0, sizeof(*out));
 
-    // cppcheck-suppress unreadVariable   ; props used in all #if platform branches below
     SDL_PropertiesID props = SDL_GetWindowProperties(win->sdl_win);
 
 #if defined(__ANDROID__)

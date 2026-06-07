@@ -14,6 +14,7 @@
 #include <jce/api.h>
 #include <jce/os/core/jce_alloc.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/renderer/jce_renderer_caps.h>   /* jce_renderer_get_tier (baseline gating) */
 #include <jce/resource/jce_scene_serial.h>
 
 #include <stdlib.h>
@@ -336,7 +337,6 @@ CkApp *ck_app_create(const JceServices *svc)
 #if JCE_PLATFORM_TOUCH
         is_touch_platform = true;
 #endif
-        // cppcheck-suppress knownConditionTrueFalse
         if (is_touch_platform) {
             app->touch_hud = jce_touch_hud_create( svc->renderer,
                                     svc->window, app->font_main);
@@ -757,25 +757,29 @@ static void update_3d_scene(CkApp *app, float dt_ms)
 
 static void draw_3d_scene(CkApp *app, float dt_sec)
 {
-    LOG_INFO("ck_draw", "begin_frame_3d");
+    LOG_TRACE("ck_draw", "begin_frame_3d");
     jce_renderer_begin_frame_3d(app->svc.renderer,
         app->svc.window, app->camera, JCE_VIEW_MAIN_3D);
 
-    LOG_INFO("ck_draw", "scene_renderer_render");
+    LOG_TRACE("ck_draw", "scene_renderer_render");
     JceSceneRenderConfig cfg = jce_scene_render_config_default();
+    /* Tier-gate expensive features for the 512MB / no-GPU baseline: skip the
+       multi-cascade shadow passes on LOW-tier (old integrated) GPUs.  LOW-tier
+       postfx is tonemap-only (single pass, cheap) so it stays enabled. */
+    cfg.draw_shadows = (jce_renderer_get_tier() >= JCE_GPU_TIER_MEDIUM);
     jce_scene_renderer_render(
         app->scene_renderer, app->scene, app->camera,
         JCE_VIEW_MAIN_3D, dt_sec, &cfg);
-    LOG_INFO("ck_draw", "scene_renderer_render done");
+    LOG_TRACE("ck_draw", "scene_renderer_render done");
 }
 
 /* -- 2D overlay ---------------------------------------------------- */
 
 static void draw_2d_overlay(CkApp *app)
 {
-    LOG_INFO("ck_draw", "touch_hud_draw start hud=%p", (void*)app->touch_hud);
+    LOG_TRACE("ck_draw", "touch_hud_draw start hud=%p", (void*)app->touch_hud);
     jce_touch_hud_draw(app->touch_hud);
-    LOG_INFO("ck_draw", "touch_hud_draw done");
+    LOG_TRACE("ck_draw", "touch_hud_draw done");
 }
 
 static int s_draw_frame_count = 0;
@@ -785,7 +789,7 @@ static void ck_app_draw(CkApp *app)
     if (!app) return;
 
     int fc = ++s_draw_frame_count;
-    LOG_INFO("ck_draw", "frame=%d start", fc);
+    LOG_TRACE("ck_draw", "frame=%d start", fc);
 
     if (jce_renderer_is_egl_hung()) {
         LOG_INFO("ck_draw", "frame=%d skipped (egl hung)", fc);
@@ -820,12 +824,12 @@ void ck_app_update(CkApp *app)
 {
     static int s_update_frame = 0;
     int uf = ++s_update_frame;
-    LOG_INFO("ck_update", "frame=%d start", uf);
+    LOG_TRACE("ck_update", "frame=%d start", uf);
 
     JCE_PROFILE_ZONE_N("CkApp::Update");
     if (!app) { JCE_PROFILE_ZONE_END; return; }
 
-    LOG_INFO("ck_update", "frame=%d timer", uf);
+    LOG_TRACE("ck_update", "frame=%d timer", uf);
     bool settings_open_before = jce_settings_is_open(app->engine_settings);
     jce_timer_tick(app->timer);
     float dt_ms = jce_timer_dt_ms(app->timer);
@@ -835,10 +839,10 @@ void ck_app_update(CkApp *app)
     record_frametime(app, dt_ms);
     update_sysinfo(app);
 
-    LOG_INFO("ck_update", "frame=%d input", uf);
+    LOG_TRACE("ck_update", "frame=%d input", uf);
     handle_input(app, dt_ms);
 
-    LOG_INFO("ck_update", "frame=%d hud", uf);
+    LOG_TRACE("ck_update", "frame=%d hud", uf);
     /* Update RmlUI element data BEFORE Update() so layout is correct. */
     if (jce_settings_is_open(app->engine_settings)) {
         if (app->debug_hud)
@@ -853,16 +857,16 @@ void ck_app_update(CkApp *app)
             update_debug_hud(app, dt_ms);
     }
 
-    LOG_INFO("ck_update", "frame=%d ui_process_input", uf);
+    LOG_TRACE("ck_update", "frame=%d ui_process_input", uf);
     /* Feed input to RmlUI, compute layout, then render. */
     if (app->ui) {
         if (jce_settings_is_open(app->engine_settings))
             jce_ui_process_pointer_input(app->ui, app->svc.input);
         else
             jce_ui_process_input(app->ui, app->svc.input);
-        LOG_INFO("ck_update", "frame=%d ui_update", uf);
+        LOG_TRACE("ck_update", "frame=%d ui_update", uf);
         jce_ui_update(app->ui, dt_sec);
-        LOG_INFO("ck_update", "frame=%d ui_update done", uf);
+        LOG_TRACE("ck_update", "frame=%d ui_update done", uf);
     }
 
     if (settings_open_before &&
@@ -871,14 +875,14 @@ void ck_app_update(CkApp *app)
         jce_debug_hud_show(app->engine_hud);
     }
 
-    LOG_INFO("ck_update", "frame=%d scene3d", uf);
+    LOG_TRACE("ck_update", "frame=%d scene3d", uf);
     if (!jce_settings_is_open(app->engine_settings) && !app->paused) {
         update_3d_scene(app, dt_ms);
         app->scene_render_dt_sec = dt_sec;
         app->scene_render_dt_fresh = true;
     }
 
-    LOG_INFO("ck_update", "frame=%d done", uf);
+    LOG_TRACE("ck_update", "frame=%d done", uf);
     JCE_PROFILE_ZONE_END;
 }
 

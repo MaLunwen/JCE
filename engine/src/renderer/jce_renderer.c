@@ -10,6 +10,7 @@
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/platform/jce_window.h>
 #include <jce/renderer/jce_camera.h>
+#include <jce/renderer/jce_pbr_material.h>
 #include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_renderer_caps.h>
 #include <jce/renderer/jce_shaders.h>
@@ -1128,6 +1129,10 @@ void jce_renderer_destroy(JceRenderer *r)
      * is bgfx-agnostic, but routing the call through renderer destroy
      * preserves the LIFO contract documented in jce_engine.c. */
     jce_text_shutdown();
+
+    /* Free graph-generated custom programs cached by jce_pbr_material_load_json
+     * while bgfx is still alive. */
+    jce_pbr_material_shutdown();
 
     bgfx_shutdown();
     JCE_FREE(r);

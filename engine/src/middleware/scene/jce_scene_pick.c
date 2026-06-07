@@ -592,6 +592,11 @@ bool jce_scene_pick_render(JceScenePickPass *pass,
     if (!pick_ensure_target(pass, width, height))
         return false;
 
+    /* Fresh world-matrix cache generation for the pick pass so picking reads
+       transforms as they are now (the pick pass may be invoked independently
+       of the main scene render that normally bumps the cache). */
+    jce_scene_invalidate_world_cache(scene);
+
     const float aspect = pass->height > 0
         ? (float)pass->width / (float)pass->height
         : 1.0f;

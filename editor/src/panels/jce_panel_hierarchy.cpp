@@ -103,7 +103,11 @@ void jce_editor_panel_hierarchy_content(void)
             jce_editor_inspector_request_sync();
         }
 
-        /* Right-click on empty space: context menu. */
+        /* Right-click on empty space: lean context menu (Create at root /
+           Paste / Select All) — industry-standard (Unity/Unreal/Godot all show
+           a menu here). The richer entity menu appears when an entity is
+           right-clicked; shared Create/Paste are intentional, not redundant
+           (they target root vs child). */
         if (ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByPopup)
             && ImGui::IsMouseClicked(ImGuiMouseButton_Right)
             && !s_hier.ctx_clicked_entity

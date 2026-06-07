@@ -19,11 +19,13 @@
 
 extern "C" {
 #include <jce/renderer/jce_pbr_material.h>
+#include <jce/renderer/jce_model.h>
 #include <jce/middleware/scene/jce_terrain.h>
 
 bool jce_terrain_panel_brush_armed(void);
 struct JceTerrain *jce_terrain_panel_get_terrain(void);
 void jce_terrain_panel_apply_brush_world(float wx, float wz, float dt);
+void jce_terrain_panel_end_brush_stroke(void);
 }
 
 #include <ctype.h>
@@ -66,6 +68,45 @@ static void draw_scene_view_toolbar(void)
         snprintf(_lbl, sizeof(_lbl), "%s###world", jce_editor_i18n("toolbar.global"));
         if (ImGui::RadioButton(_lbl, gs == JCE_GIZMO_WORLD))
             jce_state_set_gizmo_space(JCE_GIZMO_WORLD);
+    }
+
+    ImGui::SameLine();
+    ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
+    ImGui::SameLine();
+
+    /* Snap-increment settings (applied while Ctrl-dragging a gizmo). */
+    if (ImGui::Button(jce_editor_i18n("sceneView.snap.button")))
+        ImGui::OpenPopup("##SnapSettings");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", jce_editor_i18n("sceneView.snap.tooltip"));
+    if (ImGui::BeginPopup("##SnapSettings")) {
+        ImGui::TextUnformatted(jce_editor_i18n("sceneView.snap.title"));
+        ImGui::Separator();
+        ImGui::PushItemWidth(120.0f);
+
+        float snap_t = jce_state_get_gizmo_snap_translate();
+        if (ImGui::InputFloat(jce_editor_i18n("sceneView.snap.move"),
+                              &snap_t, 0.05f, 0.5f, "%.3f"))
+            jce_state_set_gizmo_snap_translate(snap_t);
+
+        float snap_r = jce_state_get_gizmo_snap_rotate();
+        if (ImGui::InputFloat(jce_editor_i18n("sceneView.snap.rotate"),
+                              &snap_r, 1.0f, 5.0f, "%.2f"))
+            jce_state_set_gizmo_snap_rotate(snap_r);
+
+        float snap_s = jce_state_get_gizmo_snap_scale();
+        if (ImGui::InputFloat(jce_editor_i18n("sceneView.snap.scale"),
+                              &snap_s, 0.05f, 0.25f, "%.3f"))
+            jce_state_set_gizmo_snap_scale(snap_s);
+
+        ImGui::PopItemWidth();
+        ImGui::Separator();
+        if (ImGui::Button(jce_editor_i18n("sceneView.snap.reset"))) {
+            jce_state_set_gizmo_snap_translate(0.5f);
+            jce_state_set_gizmo_snap_rotate(15.0f);
+            jce_state_set_gizmo_snap_scale(0.25f);
+        }
+        ImGui::EndPopup();
     }
 
     ImGui::SameLine();
@@ -933,6 +974,37 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
                             jce_editor_console_log_level(JCE_CONSOLE_INFO,
                                 "[drop-diag] new entity mesh_path='%s' exists=%d",
                                 mr->mesh_path, (int)jce_fs_host_exists_file(mr->mesh_path));
+
+                            /* A skinned/animated glTF would be stripped to a
+                             * static bind pose by the Mesh Renderer (Assimp +
+                             * PreTransformVertices drops skin/anim).  Probe via
+                             * the cgltf query loader; if it carries a skeleton
+                             * and clips, attach a Skeletal Animator (the path
+                             * that preserves skin+anim) and start playback so a
+                             * skinned character animates on drop. */
+                            JceModel *probe =
+                                jce_editor_scene_get_model(store_mesh2, id);
+                            if (probe && jce_model_get_skeleton(probe) &&
+                                jce_model_anim_count(probe) > 0) {
+                                jce_state_add_component(
+                                    id, JCE_COMP_FLAG_SKELETAL_ANIMATOR);
+                                JceSkeletalAnimatorComponent *sa =
+                                    jce_scene_get_skeletal_animator(
+                                        scene, (JceEntity)id);
+                                if (sa) {
+                                    snprintf(sa->skeleton_path,
+                                             sizeof(sa->skeleton_path),
+                                             "%s", store_mesh2);
+                                    sa->active_clip = 0;
+                                    sa->loop        = true;
+                                    sa->playing     = true;
+                                    jce_editor_console_log_level(
+                                        JCE_CONSOLE_INFO,
+                                        "Skinned glTF: auto-added Skeletal "
+                                        "Animator (%u clip(s)), playing",
+                                        (unsigned)jce_model_anim_count(probe));
+                                }
+                            }
                         }
                     }
 
@@ -1636,6 +1708,10 @@ void jce_editor_panel_scene_view_content(void)
             }
         }
     }
+    /* End the brush stroke when LMB is released so the next drag becomes a
+     * fresh undo entry (no-op if no stroke is in progress). */
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
+        jce_terrain_panel_end_brush_stroke();
 
     if (!brush_consumed)
         handle_scene_selection_box(&ctx);

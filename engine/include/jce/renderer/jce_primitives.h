@@ -54,6 +54,20 @@ void jce_draw_textured_rect(const JceRenderer *r,
                             JceTexture tex, uint32_t tint,
                             const float *uv);
 
+/* View-targeted variants of the rect draws.  Identical to the functions
+   above but submit into an explicit bgfx `view_id` instead of the fixed
+   JCE_VIEW_UI overlay, so off-screen UI passes (editor scene/game panels,
+   world-space canvases) can draw 2D into their own framebuffer's view.
+   The caller must have set that view's ortho transform + rect.  Engine-
+   internal (not part of the public consumer API). */
+void jce_draw_filled_rect_view(const JceRenderer *r, uint16_t view_id,
+                               float x, float y, float w, float h,
+                               uint32_t color);
+void jce_draw_textured_rect_view(const JceRenderer *r, uint16_t view_id,
+                                 float x, float y, float w, float h,
+                                 JceTexture tex, uint32_t tint,
+                                 const float *uv);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_PRIMITIVES_H */

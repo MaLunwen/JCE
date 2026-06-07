@@ -20,6 +20,8 @@ struct JceSkeleton {
     jce_vec3 *rest_s;        /* rest-pose scales */
     uint32_t  num_joints;
     JceOzzSkeleton *ozz_skel; /* ozz-animation bridge handle */
+    jce_mat4  root_transform;     /* armature world transform above root joints */
+    int       has_root_transform; /* 0 = identity (skip), 1 = apply to roots */
 };
 
 /* ================================================================== */
@@ -29,6 +31,22 @@ struct JceSkeleton {
 JceSkeleton *jce_skeleton_create(const JceJoint *joints, uint32_t num_joints)
 {
     if (!joints || num_joints == 0) return NULL;
+
+    /* The GPU skinning palette (u_model[] in vs_pbr_skinned.sc /
+     * vs_shadow_skinned.sc) addresses at most JCE_MAX_BONES joints. Beyond that
+     * the vertex shaders clamp the joint index to the last slot, so the surplus
+     * joints silently collapse onto bone JCE_MAX_BONES-1 and the mesh deforms
+     * wrong. Emit a clear load-time error so artists know to reduce/merge bones
+     * or split the rig, instead of debugging mystery deformation. */
+    if (num_joints > JCE_MAX_BONES) {
+        LOG_ERROR(LOG_TAG,
+                  "skeleton has %u joints but the GPU palette caps at %d "
+                  "(JCE_MAX_BONES); joints %d..%u will collapse onto bone %d "
+                  "and deform incorrectly — reduce the bone count or split the "
+                  "rig",
+                  num_joints, JCE_MAX_BONES, JCE_MAX_BONES, num_joints - 1,
+                  JCE_MAX_BONES - 1);
+    }
 
     JceSkeleton *skel = (JceSkeleton *)JCE_CALLOC(1, sizeof(*skel));
     if (!skel) return NULL;
@@ -91,6 +109,13 @@ void jce_skeleton_destroy(JceSkeleton *skel)
     JCE_FREE(skel);
 }
 
+void jce_skeleton_set_root_transform(JceSkeleton *skel, const jce_mat4 *transform)
+{
+    if (!skel || !transform) return;
+    skel->root_transform = *transform;
+    skel->has_root_transform = 1;
+}
+
 /* ================================================================== */
 /* Queries                                                             */
 /* ================================================================== */
@@ -145,6 +170,26 @@ void jce_skeleton_evaluate(const JceSkeleton *skel,
     uint32_t count = skel->num_joints < max_joints ? skel->num_joints : max_joints;
     const jce_mat4 *locals = local_transforms ? local_transforms : skel->rest_locals;
 
+    /* Fold the armature world transform into root joints so the whole hierarchy
+     * inherits it (e.g. CesiumMan's Z-up->Y-up rotation lives on the armature
+     * node above the root joint). Both eval paths treat a root joint's local as
+     * its global, so pre-multiplying root_transform here fixes both. Without it,
+     * skin matrices collapse to root_transform^-1 at bind pose and the character
+     * renders rotated onto its face. */
+    jce_mat4 *adjusted = NULL;
+    if (skel->has_root_transform) {
+        adjusted = (jce_mat4 *)JCE_MALLOC(count * sizeof(jce_mat4));
+        if (adjusted) {
+            for (uint32_t i = 0; i < count; i++) {
+                if (skel->joints[i].parent < 0)
+                    adjusted[i] = jce_m4_multiply(&skel->root_transform, &locals[i]);
+                else
+                    adjusted[i] = locals[i];
+            }
+            locals = adjusted;
+        }
+    }
+
     /* Delegate hierarchy traversal to the ozz bridge when available.
      * jce_ozz_skeleton_evaluate computes global (model-space) transforms
      * using ozz SIMD math; we then apply the inverse-bind matrices here. */
@@ -156,6 +201,7 @@ void jce_skeleton_evaluate(const JceSkeleton *skel,
         for (uint32_t i = 0; i < count; i++)
             out_matrices[i] = jce_m4_multiply(&out_matrices[i],
                                               &skel->joints[i].inverse_bind_matrix);
+        if (adjusted) JCE_FREE(adjusted);
         return;
     }
 
@@ -163,6 +209,7 @@ void jce_skeleton_evaluate(const JceSkeleton *skel,
     jce_mat4 *globals = (jce_mat4 *)JCE_MALLOC(count * sizeof(jce_mat4));
     if (!globals) {
         LOG_ERROR(LOG_TAG, "failed to allocate globals buffer for %u joints", count);
+        if (adjusted) JCE_FREE(adjusted);
         return;
     }
 
@@ -178,6 +225,7 @@ void jce_skeleton_evaluate(const JceSkeleton *skel,
         out_matrices[i] = jce_m4_multiply(&globals[i], &skel->joints[i].inverse_bind_matrix);
 
     JCE_FREE(globals);
+    if (adjusted) JCE_FREE(adjusted);
 }
 
 jce_mat4 jce_skeleton_get_inverse_bind(const JceSkeleton *skel, uint32_t joint_idx)

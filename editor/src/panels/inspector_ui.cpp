@@ -7,6 +7,22 @@
 #include "jce_panel_inspector_common.h"
 #include "ui/jce_editor_tip.h"
 
+/* Shared RectTransform editor: anchors / pivot / anchored position / size.
+ * Embedded in UIImage and UIText (RectTransform is not a standalone ECS
+ * component — see JceRectTransform in jce_scene.h). */
+static void draw_rect_transform(JceRectTransform *rt)
+{
+    if (!rt) return;
+    if (ImGui::CollapsingHeader(jce_editor_i18n_id("inspector.rt.header", "rt"),
+                                ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::DragFloat2(jce_editor_i18n_id("inspector.rt.anchorMin", "rt"), rt->anchor_min, 0.01f, 0.0f, 1.0f, "%.3f"); insp_track_edit();
+        ImGui::DragFloat2(jce_editor_i18n_id("inspector.rt.anchorMax", "rt"), rt->anchor_max, 0.01f, 0.0f, 1.0f, "%.3f"); insp_track_edit();
+        ImGui::DragFloat2(jce_editor_i18n_id("inspector.rt.pivot", "rt"), rt->pivot, 0.01f, 0.0f, 1.0f, "%.3f"); insp_track_edit();
+        ImGui::DragFloat2(jce_editor_i18n_id("inspector.rt.anchoredPos", "rt"), rt->anchored_position, 1.0f, -16384.0f, 16384.0f, "%.1f"); insp_track_edit();
+        ImGui::DragFloat2(jce_editor_i18n_id("inspector.rt.sizeDelta", "rt"), rt->size_delta, 1.0f, -16384.0f, 16384.0f, "%.1f"); insp_track_edit();
+    }
+}
+
 void draw_comp_canvas(JceCanvasComponent *cv)
 {
     if (!cv) return;
@@ -58,6 +74,10 @@ void draw_comp_ui_image(JceUIImageComponent *im)
     }
     if (ImGui::Checkbox(jce_editor_i18n_id("inspector.uim.preserveAspect", "uim"), &im->preserve_aspect)) insp_undo_bool(&im->preserve_aspect);
     if (ImGui::Checkbox(jce_editor_i18n_id("inspector.uim.raycastTarget", "uim"),  &im->raycast_target))  insp_undo_bool(&im->raycast_target);
+    if (im->image_type == JCE_UI_IMAGE_SLICED) {
+        ImGui::DragFloat4(jce_editor_i18n_id("inspector.uim.sliceBorder", "uim"), im->slice_border, 1.0f, 0.0f, 4096.0f, "%.0f"); insp_track_edit();
+    }
+    draw_rect_transform(&im->rect);
 }
 
 void draw_comp_ui_text(JceUITextComponent *tx)
@@ -82,6 +102,7 @@ void draw_comp_ui_text(JceUITextComponent *tx)
         if (ImGui::DragInt(jce_editor_i18n_id("inspector.uit.minSize", "uit"), &tx->min_size, 1.0f, 1, 512)) insp_track_edit();
         if (ImGui::DragInt(jce_editor_i18n_id("inspector.uit.maxSize", "uit"), &tx->max_size, 1.0f, 1, 512)) insp_track_edit();
     }
+    draw_rect_transform(&tx->rect);
 }
 
 void draw_comp_ui_button(JceUIButtonComponent *bt)

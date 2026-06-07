@@ -13,6 +13,7 @@
 #include "ui/jce_editor_panels.h"
 
 extern "C" {
+#include <jce/os/core/jce_filesystem.h>
 #include <jce/renderer/jce_pbr_material.h>
 #include <jce/renderer/jce_renderer.h>
 }
@@ -387,6 +388,47 @@ void compile_and_bind(void)
                cg.out_path.c_str(), (unsigned)prog.idx);
     jce_editor_console_log("material graph: compile & bind OK (%s)",
                            cg.out_path.c_str());
+
+    /* 6. Persist the compiled blobs next to the graph and record the
+     * Shader Graph reference in the sibling .mat.json so the engine can
+     * re-create this program at material load (no shaderc at runtime). */
+    char vs_bin[640], fs_bin[640];
+    std::snprintf(vs_bin, sizeof(vs_bin), "%s/vs_%s.bin", dir, base);
+    std::snprintf(fs_bin, sizeof(fs_bin), "%s/fs_%s.bin", dir, base);
+    bool wrote_vs = jce_fs_host_write_all(vs_bin, vs_r.blob.data(),
+                                          (uint64_t)vs_r.blob.size());
+    bool wrote_fs = jce_fs_host_write_all(fs_bin, fs_r.blob.data(),
+                                          (uint64_t)fs_r.blob.size());
+    if (!wrote_vs || !wrote_fs) {
+        log_append(true, "could not persist compiled .bin blobs "
+                         "(custom shader will not survive reload)");
+        return;
+    }
+
+    /* Derive sibling .mat.json: <stem>.matgraph.json -> <stem>.mat.json. */
+    char mat_json[640];
+    std::snprintf(mat_json, sizeof(mat_json), "%s", s_g.path);
+    jce_editor_path_strip_extension(mat_json);      /* drop .json */
+    char *dot2 = std::strrchr(mat_json, '.');
+    if (dot2 && std::strcmp(dot2, ".matgraph") == 0) *dot2 = '\0';
+    std::strncat(mat_json, ".mat.json",
+                 sizeof(mat_json) - std::strlen(mat_json) - 1);
+
+    /* Store paths relative to the material dir (bare filenames here, since
+     * the graph, blobs and .mat.json share one directory). */
+    char vs_rel[160], fs_rel[160], graph_rel[160];
+    std::snprintf(vs_rel, sizeof(vs_rel), "vs_%s.bin", base);
+    std::snprintf(fs_rel, sizeof(fs_rel), "fs_%s.bin", base);
+    std::snprintf(graph_rel, sizeof(graph_rel), "%s",
+                  jce_editor_path_basename_view(s_g.path));
+
+    if (jce_pbr_material_set_graph_shader(mat_json, graph_rel, vs_rel, fs_rel)) {
+        log_append(false, "graph shader persisted -> %s", mat_json);
+        jce_editor_console_log("material graph: graph shader saved to %s",
+                               mat_json);
+    } else {
+        log_append(true, "failed to write graph ref into %s", mat_json);
+    }
 }
 
 } /* namespace jce_mgp */

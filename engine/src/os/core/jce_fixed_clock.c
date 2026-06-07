@@ -11,7 +11,13 @@
 
 #define LOG_TAG "fixed_clock"
 
-#define JCE_FIXED_CLOCK_DEFAULT_DT       (1.0 / 50.0)  /* 50 Hz, Unity default */
+/* Single source of truth for the engine-wide fixed cadence.  60 Hz
+ * matches the runtime/physics default (JceRuntimeDesc.fixed_timestep =
+ * 1/60) so jce_fixed_clock_default(), the JCE_PHASE_FIXED_UPDATE phase,
+ * the net-transform tick conversion, and the per-runtime physics clock
+ * all advance on ONE cadence (P1-fixed-clock-unify).  Was 50 Hz, which
+ * silently desynced from the 60 Hz physics step. */
+#define JCE_FIXED_CLOCK_DEFAULT_DT       (1.0 / 60.0)  /* 60 Hz, == physics default */
 #define JCE_FIXED_CLOCK_DEFAULT_MAX_DT   (0.25)        /* 250 ms spiral guard  */
 /* Hard ceiling on ticks per advance call.  Without this a pathological
  * fixed_dt close to zero combined with the max_frame_dt clamp could

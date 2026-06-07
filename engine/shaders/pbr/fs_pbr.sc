@@ -65,6 +65,43 @@ SAMPLER2D(s_brdfLUT,      8);
 // u_iblParams.w = linear output flag (1=skip gamma, for tonemap pass)
 uniform vec4 u_iblParams;
 
+// ── Baked GI (P1-baked-gi-consume) ──────────────────────────────────
+// SH9 ambient irradiance: 9 RGB coefficients (xyz used, w padding) from
+// the nearest baked LightProbeGroup. Reconstructed per-fragment and added
+// to the diffuse ambient when u_giParams.x > 0.5.
+uniform vec4 u_sh9[9];
+// u_giParams.x = SH9 ambient enabled (0/1)
+// u_giParams.y = reflection-probe intensity (scales probe specular/diffuse)
+uniform vec4 u_giParams;
+
+// Reconstruct irradiance E(n) from the 9 SH coefficients. The CPU baker
+// (jce_lightmapper_bake_sh9) already folds the cosine-lobe / PI weighting
+// into the projection, so this is a direct dot with the SH basis at n.
+vec3 sh9_irradiance(vec3 n)
+{
+    float x = n.x, y = n.y, z = n.z;
+    float Y0 =  0.282095;
+    float Y1 =  0.488603 * y;
+    float Y2 =  0.488603 * z;
+    float Y3 =  0.488603 * x;
+    float Y4 =  1.092548 * x * y;
+    float Y5 =  1.092548 * y * z;
+    float Y6 =  0.315392 * (3.0 * z * z - 1.0);
+    float Y7 =  1.092548 * x * z;
+    float Y8 =  0.546274 * (x * x - y * y);
+
+    vec3 e = u_sh9[0].xyz * Y0
+           + u_sh9[1].xyz * Y1
+           + u_sh9[2].xyz * Y2
+           + u_sh9[3].xyz * Y3
+           + u_sh9[4].xyz * Y4
+           + u_sh9[5].xyz * Y5
+           + u_sh9[6].xyz * Y6
+           + u_sh9[7].xyz * Y7
+           + u_sh9[8].xyz * Y8;
+    return max(e, vec3_splat(0.0));
+}
+
 // CSM cascade samplers (stages 9-12)
 SAMPLER2D(s_csmShadow0, 9);
 SAMPLER2D(s_csmShadow1, 10);
@@ -672,7 +709,16 @@ void main()
         Lo += cookTorranceBRDF(N, V, lightDir, F0, albedo, metallic, roughness) * radiance;
     }
 
-    // --- Ambient (IBL or flat) ---
+    // --- Ambient (IBL/probe + SH9 baked GI, or flat) ---
+    // Baked GI consumption (P1-baked-gi-consume):
+    //   * Reflection probe: when a local probe is bound the engine forces
+    //     u_iblParams.x = 1 and overrides s_irradiance/s_prefilter with the
+    //     probe cubemaps, so the split-sum IBL path below transparently
+    //     samples the probe. u_giParams.y carries the probe intensity.
+    //   * SH9 ambient: when u_giParams.x > 0.5 the diffuse irradiance comes
+    //     from the light-probe SH9 reconstruction instead of the cubemap /
+    //     flat ambient (avoids double-counting diffuse).
+    bool sh9On = (u_giParams.x > 0.5);
     vec3 ambient;
     if (u_iblParams.x > 0.5)
     {
@@ -682,20 +728,36 @@ void main()
         vec3 kS_ibl = F_ibl;
         vec3 kD_ibl = (vec3_splat(1.0) - kS_ibl) * (1.0 - metallic);
 
-        // Diffuse: sample irradiance cubemap
-        vec3 irradiance = textureCube(s_irradiance, N).rgb;
+        // Diffuse: SH9 baked irradiance when available, else the bound
+        // irradiance cubemap (sky or reflection probe).
+        vec3 irradiance = sh9On ? sh9_irradiance(N)
+                                : textureCube(s_irradiance, N).rgb;
         vec3 diffuseIBL = kD_ibl * irradiance * albedo;
 
-        // Specular: sample prefiltered env + BRDF LUT
+        // Specular: sample prefiltered env + BRDF LUT (probe-aware via the
+        // engine-overridden s_prefilter binding), scaled by probe intensity.
         vec3 R = reflect(-V, N);
         float maxMipLevel = u_iblParams.y;
         float perceptual_roughness = sqrt(roughness);
         vec3 prefilteredColor = textureCubeLod(s_prefilter, R,
                                perceptual_roughness * maxMipLevel).rgb;
+        // u_giParams.y is the reflection-probe intensity; it defaults to 1
+        // when the engine binds it. bgfx zero-clears uniforms between draws,
+        // so a draw path that never set u_giParams reads 0 here — treat any
+        // non-positive value as 1.0 so the sky IBL is never accidentally
+        // zeroed out.
+        float probeScale = (u_giParams.y > 0.0) ? u_giParams.y : 1.0;
+        prefilteredColor *= probeScale;
         vec2 brdfSample = texture2D(s_brdfLUT, vec2(NdotV_a, roughness)).rg;
         vec3 specularIBL = prefilteredColor * (F_ibl * brdfSample.x + vec3_splat(brdfSample.y));
 
         ambient = (diffuseIBL + specularIBL) * ao;
+    }
+    else if (sh9On)
+    {
+        // No IBL/probe, but baked SH9 ambient is present: diffuse-only.
+        vec3 kD_sh = vec3_splat(1.0 - metallic);
+        ambient = kD_sh * sh9_irradiance(N) * albedo * ao;
     }
     else
     {

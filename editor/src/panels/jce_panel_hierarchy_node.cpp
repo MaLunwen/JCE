@@ -316,7 +316,11 @@ void draw_entity_node(uint32_t id)
        SameLine widgets (variant icon, eye toggle, rename input) would
        otherwise overwrite the "last item" used by IsItemClicked. */
     bool node_clicked_left   = ImGui::IsItemClicked(ImGuiMouseButton_Left);
-    bool node_clicked_right  = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+    /* AllowWhenBlockedByPopup so right-clicking another entity while the
+       context menu is already open re-targets the menu instead of just
+       closing it (default IsItemClicked is suppressed by the open popup). */
+    bool node_clicked_right  = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByPopup)
+                               && ImGui::IsMouseClicked(ImGuiMouseButton_Right);
     bool node_double_clicked = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)
                                && ImGui::IsItemHovered();
 

@@ -301,13 +301,21 @@ static void finalize_texture_inner(JceAssetManager *mgr, JceAssetSlot *slot,
     }
 
     JceTexture tex;
+    size_t gpu_bytes = 0; /* exact upload size for cooked; 0 = use w*h*4 fallback */
 
     if (req->is_cooked) {
-        /* Cooked path: decoded_data = [JceAssetTexInfo | RGBA8 pixels] */
+        /* Cooked path: decoded_data = [JceAssetTexInfo | TEX_PIXELS payload].
+         * Honor the cooked GPU format (BC/ASTC/ETC2) and mip chain — the old
+         * jce_texture_from_rgba() forced RGBA8 and dropped mips, corrupting
+         * every block-compressed texture emitted by Build Bundles. */
         JceAssetTexInfo *info = (JceAssetTexInfo *)req->decoded_data;
         const void *pixels = (const uint8_t *)req->decoded_data + sizeof(JceAssetTexInfo);
+        gpu_bytes = (req->decoded_size > sizeof(JceAssetTexInfo))
+                        ? req->decoded_size - sizeof(JceAssetTexInfo)
+                        : 0;
 
-        tex = jce_texture_from_rgba(pixels, info->width, info->height);
+        tex = jce_texture_from_cooked(info, pixels, gpu_bytes,
+                                      req->info.texture_sampler_mode);
         JCE_FREE(req->decoded_data);
         req->decoded_data = NULL;
     } else {
@@ -336,7 +344,9 @@ static void finalize_texture_inner(JceAssetManager *mgr, JceAssetSlot *slot,
     jce_texture_get_size(tex, &w, &h);
 
     slot->data = heap;
-    slot->memory_bytes = (size_t)w * h * 4;
+    /* Use the exact GPU payload size for cooked textures (block-compressed
+     * and multi-mip uploads are not w*h*4); fall back to RGBA8 estimate. */
+    slot->memory_bytes = gpu_bytes ? gpu_bytes : (size_t)w * h * 4;
     JCE_SLOT_STATE_SET(slot, JCE_ASSET_STATE_READY);
     jce_mem_profile_record_alloc(JCE_MEM_TAG_RESOURCE_TEXTURES, slot->memory_bytes);
     mgr->total_loaded++;

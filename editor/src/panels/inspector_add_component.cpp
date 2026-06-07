@@ -83,6 +83,23 @@ void add_component_slot(uint32_t focused, JceEditorComponentSlot slot)
         return;
     }
 
+    if (jce_editor_component_slot_is_video_player(slot)) {
+        JceScene *scene = jce_state_get_scene();
+        JceEntity ce = jce_state_to_ecs_entity(focused);
+        if (!scene || !ce || jce_scene_has_video_player(scene, ce))
+            return;
+        JceVideoPlayerComponent def;
+        memset(&def, 0, sizeof(def));
+        def.autoplay   = true;
+        /* JCE_TEXTURE_INVALID is a C compound literal (illegal in C++ → C4576);
+         * use the C++ braced-init equivalent. */
+        def.output_tex = JceTexture{ UINT16_MAX };
+        jce_state_begin_batch_edit();
+        jce_scene_set_video_player(scene, ce, &def);
+        jce_state_end_batch_edit();
+        return;
+    }
+
     if (!jce_editor_component_slot_is_compound_collider(slot))
         return;
 

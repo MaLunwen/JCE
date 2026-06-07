@@ -596,6 +596,10 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     draw_selection_outlines();
     if (jce_state_get_show_physics_debug()) {
         draw_physics_debug();
+        /* Selected compound collider's fitted wireframe is part of the collider
+         * overlay — only show it when that overlay is toggled on, so selecting
+         * an object with the overlay OFF shows just the selection outline. */
+        draw_compound_collider_gizmos();
     }
     if (jce_state_get_show_joint_gizmos()) {
         draw_joint_gizmos();
@@ -603,7 +607,6 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     if (jce_state_get_show_cloth_gizmos()) {
         draw_cloth_gizmos();
     }
-    draw_compound_collider_gizmos();
     draw_hover_highlight();
     draw_ghost_entity();
 
@@ -623,13 +626,14 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
 
         if (any_effect) {
             JceTextureHandle scene_color = { UINT16_MAX };
-            JceTextureHandle prev_pass = { UINT16_MAX };
+            JceTextureHandle scene_depth = { UINT16_MAX };
             scene_color.idx = jce_offscreen_target_get_color_texture(s_sr.bridge);
+            scene_depth.idx = jce_offscreen_target_get_depth_texture(s_sr.bridge);
 
             if (!jce_gfx_texture_valid(scene_color)) {
                 LOG_WARN(LOG_TAG, "post-fx skipped: invalid bridge color texture");
             } else {
-                jce_postfx_apply(postfx, scene_color, prev_pass);
+                jce_postfx_apply(postfx, scene_color, scene_depth);
 
                 JceTextureHandle out = jce_postfx_get_output(postfx);
                 if (jce_gfx_texture_valid(out))
@@ -768,6 +772,14 @@ JceAnimPlayer *jce_editor_scene_get_anim_player(const char *skeleton_path,
     }
     EdQueryCacheEntry *e = ed_query_cache_get(skeleton_path);
     return e ? e->player : nullptr;
+}
+
+JceAnimSmBinding *jce_editor_scene_get_anim_sm(uint32_t entity_id)
+{
+    if (s_sr.scene_renderer)
+        return (JceAnimSmBinding *)jce_scene_renderer_get_anim_sm(
+            s_sr.scene_renderer, entity_id);
+    return nullptr;
 }
 
 JceModel *jce_editor_scene_get_model(const char *skeleton_path,

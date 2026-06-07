@@ -136,9 +136,18 @@ typedef struct JceAssetTexInfo {
     uint32_t _pad;
 } JceAssetTexInfo;
 
-/* GPU texture formats for JceAssetTexInfo::format. */
+/* GPU texture formats for JceAssetTexInfo::format.
+ * Block-compressed formats store ceil(w/4)*ceil(h/4) blocks per mip; the GPU
+ * (bgfx) consumes them directly with no runtime decode. Desktop uses BC; mobile
+ * uses ASTC/ETC2. The runtime maps these to bgfx formats in jce_texture.c. */
 #define JCEASSET_TEXFMT_RGBA8       0   /* Uncompressed RGBA 8-bit          */
 #define JCEASSET_TEXFMT_RGB8        1   /* Uncompressed RGB 8-bit           */
+#define JCEASSET_TEXFMT_BC1         2   /* DXT1  — opaque RGB, 0.5 byte/px   */
+#define JCEASSET_TEXFMT_BC5         3   /* RG    — tangent-space normal maps */
+#define JCEASSET_TEXFMT_BC7         4   /* RGBA  — high-quality color, 1 b/px*/
+#define JCEASSET_TEXFMT_ASTC_4x4    5   /* mobile RGBA, 1 byte/px            */
+#define JCEASSET_TEXFMT_ETC2_RGBA8  6   /* mobile RGBA fallback             */
+#define JCEASSET_TEXFMT_BC3         7   /* DXT5 — RGBA color, 1 byte/px      */
 
 /* Platform target IDs for the jce_pak --platform flag. */
 #define JCEASSET_PLATFORM_DESKTOP   0

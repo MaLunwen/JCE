@@ -24,6 +24,7 @@
 #include <cgltf.h>
 #include <SDL3/SDL.h>
 #include <SDL3_image/SDL_image.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,6 +34,60 @@
 /* ================================================================== */
 /* Helpers                                                             */
 /* ================================================================== */
+
+typedef struct JceGltfPakFileCtx {
+    const JcePakArchive *pak;
+} JceGltfPakFileCtx;
+
+static cgltf_result jce_gltf_pak_file_read(
+    const cgltf_memory_options *memory_options,
+    const cgltf_file_options *file_options,
+    const char *path,
+    cgltf_size *size,
+    void **data)
+{
+    (void)memory_options;
+    if (!file_options || !file_options->user_data || !path || !size || !data)
+        return cgltf_result_io_error;
+
+    const JceGltfPakFileCtx *ctx =
+        (const JceGltfPakFileCtx *)file_options->user_data;
+    if (!ctx->pak)
+        return cgltf_result_io_error;
+
+    const JcePakAsset *asset = jce_pak_find(ctx->pak, path);
+    if (!asset) {
+        LOG_ERROR(LOG_TAG, "glTF external buffer not found in PAK: %s", path);
+        return cgltf_result_file_not_found;
+    }
+    if (asset->original_size > (uint64_t)SIZE_MAX)
+        return cgltf_result_out_of_memory;
+
+    size_t need = (size_t)asset->original_size;
+    void *buf = JCE_MALLOC(need);
+    if (!buf)
+        return cgltf_result_out_of_memory;
+
+    size_t got = jce_pak_decompress_ex(ctx->pak, asset, buf, need);
+    if (got != need) {
+        JCE_FREE(buf);
+        return cgltf_result_io_error;
+    }
+
+    *size = (cgltf_size)got;
+    *data = buf;
+    return cgltf_result_success;
+}
+
+static void jce_gltf_pak_file_release(
+    const cgltf_memory_options *memory_options,
+    const cgltf_file_options *file_options,
+    void *data)
+{
+    (void)memory_options;
+    (void)file_options;
+    JCE_FREE(data);
+}
 
 /* Resolve a texture URI relative to the model's directory in PAK. */
 static void resolve_path(const char *model_path, const char *uri,
@@ -457,6 +512,10 @@ static JceSkeleton *extract_skeleton(cgltf_data *data)
     JceJoint *joints = (JceJoint *)JCE_CALLOC(num_joints, sizeof(JceJoint));
     if (!joints) return NULL;
 
+    /* Node above the root joints (the armature). Carries any model-level
+     * orientation/scale that must be applied to the whole skeleton. */
+    const cgltf_node *armature_node = NULL;
+
     uint32_t ji;
     for (ji = 0; ji < num_joints; ++ji) {
         const cgltf_node *jnode = skin->joints[ji];
@@ -477,6 +536,7 @@ static JceSkeleton *extract_skeleton(cgltf_data *data)
         if (jnode->parent) {
             int pidx = find_joint_index(skin, jnode->parent);
             if (pidx >= 0) j->parent = (int16_t)pidx;
+            else if (!armature_node) armature_node = jnode->parent;
         }
 
         /* Inverse bind matrix. */
@@ -518,6 +578,16 @@ static JceSkeleton *extract_skeleton(cgltf_data *data)
 
     JceSkeleton *skel = jce_skeleton_create(joints, num_joints);
     JCE_FREE(joints);
+
+    /* Bake the armature's world transform so root joints inherit any model-level
+     * orientation/scale (e.g. CesiumMan's Z-up->Y-up rotation), mirroring what
+     * aiProcess_PreTransformVertices does for the static mesh path. */
+    if (skel && armature_node) {
+        jce_mat4 rootx;
+        cgltf_node_transform_world(armature_node, rootx.raw[0]);
+        jce_skeleton_set_root_transform(skel, &rootx);
+    }
+
     return skel;
 }
 
@@ -776,6 +846,11 @@ JceModel *jce_gltf_load(const JcePakArchive *pak, const char *asset_path)
     /* ---- Parse with cgltf ---- */
     cgltf_options options;
     memset(&options, 0, sizeof(options));
+    JceGltfPakFileCtx file_ctx = { pak };
+    options.file.read = jce_gltf_pak_file_read;
+    options.file.release = jce_gltf_pak_file_release;
+    options.file.user_data = &file_ctx;
+
     cgltf_data *data = NULL;
     cgltf_result result = cgltf_parse(&options, buf, (cgltf_size)n, &data);
     if (result != cgltf_result_success) {
@@ -784,8 +859,9 @@ JceModel *jce_gltf_load(const JcePakArchive *pak, const char *asset_path)
         return NULL;
     }
 
-    /* For GLB, binary data is inline; for glTF, this loads external buffers. */
-    result = cgltf_load_buffers(&options, data, NULL);
+    /* For GLB, binary data is inline; for glTF, cgltf resolves external
+     * buffers relative to asset_path and reads them through the PAK callback. */
+    result = cgltf_load_buffers(&options, data, asset_path);
     if (result != cgltf_result_success) {
         LOG_ERROR(LOG_TAG, "cgltf_load_buffers failed (%d): %s",
                   (int)result, asset_path);

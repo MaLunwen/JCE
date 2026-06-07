@@ -6,6 +6,8 @@
 
 #include "scene/jce_editor_game_render.h"
 #include "scene/jce_editor_scene_render.h"
+#include "scene/jce_editor_scene_asset_cache.h"  /* finalize() — GPU-upload async loads */
+#include "gizmo/jce_gizmo_compound_collider.h"   /* draw fitted compound colliders */
 #include "core/jce_editor_state.h"
 
 extern "C" {
@@ -23,6 +25,8 @@ extern "C" {
 #include <jce/renderer/jce_scene_renderer.h>
 #include <jce/renderer/jce_views.h>
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/middleware/scene/jce_ui_canvas.h>
+#include <jce/os/platform/jce_input.h>
 #include <jce/runtime/jce_game_module.h>
 extern void jce_game_module_set_active_scene(JceScene *scene);
 
@@ -55,6 +59,11 @@ struct GameRenderState {
     bool                   module_inited     = false;
     int                    last_play_state   = 0;  /* JcePlayState */
     JceServices            svc               = {};
+
+    /* ECS-UI (Canvas) renderer — draws Canvas/UIImage/UIText/UIButton on
+     * top of the game view and hit-tests the pointer. */
+    JceUICanvas           *ui_canvas         = nullptr;
+    JceUIPointer           ui_pointer        = {};
 };
 
 GameRenderState g;
@@ -113,6 +122,11 @@ bool jce_editor_game_render_init(JceRenderer *renderer, JceWindow *window,
     LOG_INFO(LOG_TAG, "[init] game view renderer ready (view id=%u)",
              (unsigned)GAME_VIEW_BASE);
 
+    /* ECS-UI Canvas renderer (Screen-Space Overlay over the game view). */
+    g.ui_canvas = jce_ui_canvas_create(renderer, pak);
+    if (!g.ui_canvas)
+        LOG_WARN(LOG_TAG, "[init] failed to create UI canvas renderer");
+
     /* Create a dedicated PostFX pipeline for the game view so it can
      * apply the same effects as the scene view without conflicting on
      * bgfx view IDs.  Uses view IDs starting at GAME_VIEW_BASE +
@@ -142,6 +156,7 @@ void jce_editor_game_render_shutdown(void)
         jce_window_set_mouse_grab(g.window, false);
         g.mouse_captured = false;
     }
+    if (g.ui_canvas) { jce_ui_canvas_destroy(g.ui_canvas); g.ui_canvas = nullptr; }
     if (g.bridge) { jce_offscreen_target_destroy(g.bridge); g.bridge = nullptr; }
     if (g.camera) { jce_camera_destroy(g.camera); g.camera = nullptr; }
     if (g.postfx) { jce_postfx_destroy(g.postfx); g.postfx = nullptr; }
@@ -166,6 +181,15 @@ bool jce_editor_game_render_set_mouse_capture(bool capture)
 bool jce_editor_game_render_is_mouse_captured(void)
 {
     return g.mouse_captured;
+}
+
+void jce_editor_game_render_set_ui_pointer(float x, float y,
+                                           bool down, bool valid)
+{
+    g.ui_pointer.x     = x;
+    g.ui_pointer.y     = y;
+    g.ui_pointer.down  = down;
+    g.ui_pointer.valid = valid;
 }
 
 void jce_editor_game_render_warp_cursor(int x, int y)
@@ -290,6 +314,13 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
         return;
     }
 
+    /* GPU-upload any completed async mesh/texture loads before the engine
+     * renderer queries them this frame. Previously only the Scene View did
+     * this (jce_editor_scene_render_frame), so a fresh launch with only the
+     * Game View visible showed missing meshes/textures until you clicked the
+     * Scene tab once. */
+    jce_editor_scene_asset_cache_finalize();
+
     /* Game view always uses the shipped "shaded" pipeline — no debug
      * wireframe overrides, all engine features (shadows, IBL, postfx)
      * enabled by default. */
@@ -363,19 +394,47 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
             jce_postfx_get_params(shared_pfx, &pfx_params);
             jce_postfx_set_params(g.postfx, &pfx_params);
 
+            /* Mirror the data-driven custom pass (shader name + params). */
+            char  cust_name[64]  = {0};
+            bool  cust_depth     = false;
+            float cust_params[JCE_POSTFX_CUSTOM_PARAMS * 4];
+            jce_postfx_get_custom_shader(shared_pfx, cust_name,
+                                         (int)sizeof(cust_name), &cust_depth);
+            int cust_count = jce_postfx_get_custom_params(
+                shared_pfx, cust_params, JCE_POSTFX_CUSTOM_PARAMS);
+            jce_postfx_set_custom_shader(g.postfx, cust_name, cust_depth);
+            jce_postfx_set_custom_params(g.postfx, cust_params, cust_count);
+
             if (any_effect) {
                 jce_postfx_resize(g.postfx, width, height);
                 JceTextureHandle game_color = { UINT16_MAX };
-                JceTextureHandle prev_pass  = { UINT16_MAX };
+                JceTextureHandle game_depth = { UINT16_MAX };
                 game_color.idx = jce_offscreen_target_get_color_texture(g.bridge);
+                game_depth.idx = jce_offscreen_target_get_depth_texture(g.bridge);
                 if (jce_gfx_texture_valid(game_color)) {
-                    jce_postfx_apply(g.postfx, game_color, prev_pass);
+                    jce_postfx_apply(g.postfx, game_color, game_depth);
                     JceTextureHandle out = jce_postfx_get_output(g.postfx);
                     if (jce_gfx_texture_valid(out))
                         g.postfx_output_tex = out.idx;
                 }
             }
         }
+    }
+
+    /* ── ECS-UI (Canvas) overlay ────────────────────────────────────
+     * Draw Canvas/UIImage/UIText/UIButton on top of the rendered game
+     * view, into the offscreen target's framebuffer.  Uses a dedicated
+     * view id (base+17) that sits after the scene color (base) and fog
+     * composite (base+16) but before the game-view PostFX range
+     * (base+JCE_VIEW_POST_BASE), so when PostFX is active the overlay is
+     * tone-mapped with the scene (a documented Overlay-mode limitation;
+     * an after-PostFX UI pass is future work). */
+    if (g.ui_canvas && scene) {
+        uint16_t ui_view = (uint16_t)(GAME_VIEW_BASE + 17);
+        uint16_t ui_fb   = jce_offscreen_target_get_frame_buffer(g.bridge);
+        const JceUIPointer *ptr = g.ui_pointer.valid ? &g.ui_pointer : nullptr;
+        jce_ui_canvas_render(g.ui_canvas, scene, ui_view, ui_fb,
+                             (float)width, (float)height, ptr, render_dt);
     }
 
     /* Physics debug wireframes (toggled via scene-view View menu). */
@@ -391,21 +450,58 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
             JceEntity e = (JceEntity)id;
             JceTransform *t = jce_scene_get_transform(scene, e);
             if (!t) continue;
-            jce_vec3 center = t->position;
             jce_quat q = t->rotation;
+            /* Honor each collider's size/center/radius (matches the physics +
+             * the scene-view overlay) — was a fixed 0.5*scale cube before. */
+            float sx = (t->scale.x != 0.0f) ? fabsf(t->scale.x) : 1.0f;
+            float sy = (t->scale.y != 0.0f) ? fabsf(t->scale.y) : 1.0f;
+            float sz = (t->scale.z != 0.0f) ? fabsf(t->scale.z) : 1.0f;
             if (jce_scene_has_box_collider(scene, e)) {
-                float sx = (t->scale.x > 0) ? t->scale.x : 1.0f;
-                float sy = (t->scale.y > 0) ? t->scale.y : 1.0f;
-                float sz = (t->scale.z > 0) ? t->scale.z : 1.0f;
-                jce_vec3 half = jce_v3(0.5f * sx, 0.5f * sy, 0.5f * sz);
-                jce_debug_draw_box(center, half, q, col_box);
+                JceBoxColliderComponent *bc = jce_scene_get_box_collider(scene, e);
+                jce_vec3 ofs = bc ? jce_v3(bc->center[0], bc->center[1], bc->center[2])
+                                  : jce_v3(0, 0, 0);
+                float bx = bc ? bc->size[0] : 1.0f, by = bc ? bc->size[1] : 1.0f,
+                      bz = bc ? bc->size[2] : 1.0f;
+                jce_vec3 half = jce_v3(0.5f * bx * sx, 0.5f * by * sy, 0.5f * bz * sz);
+                jce_vec3 c = jce_v3_add(t->position, jce_q_rotate(q,
+                                  jce_v3(ofs.x * sx, ofs.y * sy, ofs.z * sz)));
+                jce_debug_draw_box(c, half, q, col_box);
             }
             if (jce_scene_has_sphere_collider(scene, e)) {
-                float r = (t->scale.x > 0) ? t->scale.x * 0.5f : 0.5f;
-                jce_debug_draw_sphere(center, r, col_sphere);
+                JceSphereColliderComponent *sc = jce_scene_get_sphere_collider(scene, e);
+                jce_vec3 ofs = sc ? jce_v3(sc->center[0], sc->center[1], sc->center[2])
+                                  : jce_v3(0, 0, 0);
+                float r = ((sc && sc->radius > 0.0f) ? sc->radius : 0.5f)
+                          * fmaxf(sx, fmaxf(sy, sz));
+                jce_vec3 c = jce_v3_add(t->position, jce_q_rotate(q,
+                                  jce_v3(ofs.x * sx, ofs.y * sy, ofs.z * sz)));
+                jce_debug_draw_sphere(c, r, col_sphere);
+            }
+            if (jce_scene_has_capsule_collider(scene, e)) {
+                JceCapsuleColliderComponent *cc = jce_scene_get_capsule_collider(scene, e);
+                jce_vec3 ofs = cc ? jce_v3(cc->center[0], cc->center[1], cc->center[2])
+                                  : jce_v3(0, 0, 0);
+                float r = ((cc && cc->radius > 0.0f) ? cc->radius : 0.3f) * fmaxf(sx, sz);
+                float h = ((cc && cc->height > 0.0f) ? cc->height : 1.0f) * sy;
+                float hh = 0.5f * fmaxf(0.0f, h - 2.0f * r);
+                jce_vec3 c = jce_v3_add(t->position, jce_q_rotate(q,
+                                  jce_v3(ofs.x * sx, ofs.y * sy, ofs.z * sz)));
+                jce_debug_draw_capsule(c, r, hh, q, col_capsule);
             }
             if (jce_scene_has_character_controller(scene, e)) {
-                jce_debug_draw_capsule(center, 0.35f, 0.55f, q, col_capsule);
+                JceCharacterControllerComponent *cc =
+                    jce_scene_get_character_controller(scene, e);
+                float r = ((cc && cc->radius > 0.0f) ? cc->radius : 0.3f) * fmaxf(sx, sz);
+                float h = ((cc && cc->height > 0.0f) ? cc->height : 1.6f) * sy;
+                float hh = 0.5f * fmaxf(0.0f, h - 2.0f * r);
+                jce_vec3 cc_c = t->position; cc_c.y += hh + r;  /* feet -> capsule center */
+                jce_debug_draw_capsule(cc_c, r, hh, q, col_capsule);
+            }
+            if (jce_scene_has_compound_collider(scene, e)) {
+                JceCompoundColliderComponent *cpc =
+                    jce_scene_get_compound_collider(scene, e);
+                if (cpc) jce_gizmo_compound_collider_draw_from_component(
+                             scene, e, cpc, 0xFF00FF00u, 0);  /* overlay: bounds, green */
             }
         }
         jce_debug_draw_flush(base, g.renderer);

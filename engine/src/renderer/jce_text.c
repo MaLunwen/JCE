@@ -15,6 +15,7 @@
 #include <jce/renderer/jce_primitives.h>
 #include <jce/renderer/jce_text.h>
 #include <jce/renderer/jce_texture.h>
+#include <jce/renderer/jce_views.h>
 
 #include "jce_renderer_internal.h"
 #include "os/core/jce_memory.h"
@@ -400,6 +401,14 @@ void jce_text_draw_scaled(const JceRenderer *r, JceFont *font,
                           float x, float y, float scale,
                           const char *text, uint32_t color)
 {
+    jce_text_draw_scaled_view(r, font, JCE_VIEW_UI, x, y, scale, text, color);
+}
+
+void jce_text_draw_scaled_view(const JceRenderer *r, JceFont *font,
+                               uint16_t view_id,
+                               float x, float y, float scale,
+                               const char *text, uint32_t color)
+{
     if (!r || !font || !text || !font->hb_font) return;
     if (!jce_texture_valid(font->atlas)) return;
 
@@ -440,10 +449,10 @@ void jce_text_draw_scaled(const JceRenderer *r, JceFont *font,
             float gx = cx + x_offset + (float)g->bearing_x * scale;
             float gy = cy + y_offset + (float)(font->ascender - g->bearing_y) * scale;
             const float uv[4] = { g->u0, g->v0, g->u1, g->v1 };
-            jce_draw_textured_rect(r, gx, gy,
-                                   (float)g->w * scale,
-                                   (float)g->h * scale,
-                                   font->atlas, color, uv);
+            jce_draw_textured_rect_view(r, view_id, gx, gy,
+                                        (float)g->w * scale,
+                                        (float)g->h * scale,
+                                        font->atlas, color, uv);
         }
         cx += x_advance;
     }

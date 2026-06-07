@@ -320,9 +320,9 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
      * preventing the final value from drifting to the un-snapped raw
      * position. */
     if (ImGui::GetIO().KeyCtrl && (gizmo_dragging_before || gizmo_dragging_after)) {
-        const float snap_translate = 0.5f;
-        const float snap_angle     = 15.0f;
-        const float snap_scale     = 0.25f;
+        const float snap_translate = jce_state_get_gizmo_snap_translate();
+        const float snap_angle     = jce_state_get_gizmo_snap_rotate();
+        const float snap_scale     = jce_state_get_gizmo_snap_scale();
         switch (active_gm) {
             case JCE_GIZMO_TRANSLATE:
                 gizmo_pos[0] = roundf(gizmo_pos[0] / snap_translate) * snap_translate;

@@ -177,6 +177,7 @@ void draw_comp_tilemap_collider2d(JceTilemapCollider2DComponent *c);
 
 /* inspector_audio.cpp */
 void draw_comp_audio_source(JceAudioSourceComponent *as);
+void draw_comp_video_player(JceVideoPlayerComponent *vp);
 void draw_comp_audio_listener(JceAudioListenerComponent *l);
 void draw_comp_audio_reverb_zone(JceAudioReverbZoneComponent *r);
 void draw_comp_audio_occlusion(JceAudioOcclusionComponent *o);

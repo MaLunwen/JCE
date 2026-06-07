@@ -65,10 +65,12 @@ typedef struct JcePbrMaterial {
     /* Render state. */
     bool         double_sided;
 
-    /* Optional custom shader program (runtime-only, NOT serialized).
-     * Set by editor shader-graph "Compile & Bind" to override the
-     * default PBR program for this material.  UINT16_MAX = unset
-     * (caller picks default PBR program). */
+    /* Optional custom shader program.  The handle itself is runtime-only
+     * (never serialized), but jce_pbr_material_load_json will populate it
+     * automatically when the .mat.json declares "customProgramVs" /
+     * "customProgramFs" (compiled bgfx .bin blobs produced by the editor's
+     * Shader Graph "Compile & Bind").  UINT16_MAX = unset (caller picks the
+     * default PBR program; see jce_pbr_material_effective_program). */
     uint16_t     custom_program;
 } JcePbrMaterial;
 
@@ -85,6 +87,18 @@ JCE_API JcePbrMaterial jce_pbr_material_default(void);
 JCE_API void jce_pbr_material_bind(const JcePbrMaterial *mat,
                                     const JceRenderer *r, uint16_t view_id);
 
+/* Build the bgfx render state (write masks, depth test, cull, blend) for
+ * this material.  Honours alpha_mode (BLEND → src-alpha / inv-src-alpha
+ * blend with depth-write disabled) and double_sided (no back-face cull).
+ * Returns a value suitable for bgfx_set_state(); 0 is never returned for a
+ * valid material.  Used by the renderer so both the inline and render-queue
+ * draw paths apply identical transparency / culling state. */
+JCE_API uint64_t jce_pbr_material_render_state(const JcePbrMaterial *mat);
+
+/* True when this material renders in the transparent (alpha-blended) pass
+ * and therefore needs back-to-front sorting.  MASK/OPAQUE return false. */
+JCE_API bool jce_pbr_material_is_transparent(const JcePbrMaterial *mat);
+
 /* Resolve the effective shader program for this material.
  *   - returns mat->custom_program (wrapped) when set (!= UINT16_MAX)
  *   - otherwise returns `default_program` (typically program_pbr).
@@ -100,12 +114,20 @@ JCE_API uint16_t jce_pbr_material_effective_program(const JcePbrMaterial *mat,
  * calls. The scene renderer pushes this once per frame from its config. */
 JCE_API void jce_pbr_material_set_view_mode(int mode);
 
+/* Release the process-wide cache of graph-generated custom programs created
+ * lazily by jce_pbr_material_load_json.  Call once during renderer teardown
+ * (after the last frame, before bgfx_shutdown).  Safe to call when empty. */
+JCE_API void jce_pbr_material_shutdown(void);
+
 /* ================================================================== */
 /* Material file I/O (.mat.json)                                       */
 /* ================================================================== */
 
 /* Load PBR material parameters from a .mat.json file.
- * Texture paths are stored in the struct name fields (not loaded).
+ * Texture paths are returned via out_tex_paths (not bound to handles).
+ * When the file declares "customProgramVs" + "customProgramFs" (compiled
+ * bgfx .bin blobs), both are loaded and linked into out->custom_program so
+ * graph-generated shaders persisted by the editor render automatically.
  * Returns true on success. */
 bool jce_pbr_material_load_json(const char *path, JcePbrMaterial *out,
                                  char out_tex_paths[5][256]);
@@ -115,6 +137,23 @@ bool jce_pbr_material_load_json(const char *path, JcePbrMaterial *out,
 bool jce_pbr_material_save_json(const char *path,
                                  const JcePbrMaterial *mat,
                                  const char tex_paths[5][256]);
+
+/* Attach (or clear) a Shader Graph custom-shader reference on an existing
+ * .mat.json, preserving all other fields (read-modify-write).  Used by the
+ * editor's Material Graph "Compile & Bind" to persist graph-generated
+ * shaders so jce_pbr_material_load_json can re-create the program later.
+ *
+ *   graph_path  source .matgraph.json (reference only; may be NULL).
+ *   vs_bin_path compiled vertex .bin path.
+ *   fs_bin_path compiled fragment .bin path.
+ *
+ * Passing NULL/"" for vs_bin_path AND fs_bin_path removes the keys (detach).
+ * Paths are written verbatim; callers should store project-relative paths.
+ * Returns true on success. */
+JCE_API bool jce_pbr_material_set_graph_shader(const char *mat_path,
+                                               const char *graph_path,
+                                               const char *vs_bin_path,
+                                               const char *fs_bin_path);
 
 JCE_EXTERN_C_END
 

@@ -20,6 +20,7 @@
 
 extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/middleware/physics/jce_physics.h>
 #include <jce/middleware/physics/jce_physics_debug.h>
 #include <jce/renderer/jce_debug_draw.h>
 }
@@ -142,7 +143,16 @@ extern "C" void jce_editor_panel_physics_debugger_content(void)
     }
 
     if (ImGui::CollapsingHeader(jce_editor_i18n("physicsDebugger.runtimeStats"))) {
-        ImGui::TextDisabled("%s", jce_editor_i18n("physicsDebugger.activeContacts"));
+        JcePhysicsWorld *pw = jce_editor_play_get_physics_world();
+        if (pw) {
+            ImGui::Text("%s: %u", jce_editor_i18n("physicsDebugger.bodies"),
+                        jce_physics_body_count(pw));
+            ImGui::Text("%s: %d", jce_editor_i18n("physicsDebugger.activeContacts"),
+                        jce_editor_play_get_active_contacts());
+        } else {
+            ImGui::TextDisabled("%s", jce_editor_i18n("physicsDebugger.bodies"));
+            ImGui::TextDisabled("%s", jce_editor_i18n("physicsDebugger.activeContacts"));
+        }
         ImGui::TextDisabled("%s", jce_editor_i18n("physicsDebugger.sleepingBodies"));
         ImGui::TextDisabled("%s", jce_editor_i18n("physicsDebugger.queriesThisFrame"));
     }

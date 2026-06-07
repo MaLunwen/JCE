@@ -93,7 +93,6 @@ void jce_sysinfo_init(JceSysInfo *info)
 
 /* -- Dynamic info -------------------------------------------------- */
 
-// cppcheck-suppress constParameterPointer   ; info is written on _WIN32 / __linux__ / __APPLE__
 void jce_sysinfo_update(JceSysInfo *info)
 {
     /* -- Process RAM ---------------------------------------------- */

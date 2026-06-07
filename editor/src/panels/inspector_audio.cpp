@@ -25,6 +25,44 @@ void draw_comp_audio_source(JceAudioSourceComponent *as)
         insp_undo_bool(&as->play_on_awake);
 }
 
+void draw_comp_video_player(JceVideoPlayerComponent *vp)
+{
+    if (!vp) return;
+    char lbl[256];
+
+    jce_draw_path_input_asset(jce_editor_i18n("videoPlayer.clip"),
+                              vp->clip_path, sizeof vp->clip_path);
+    insp_track_edit();
+    accept_asset_drop(vp->clip_path, sizeof vp->clip_path);
+
+    snprintf(lbl, sizeof(lbl), "%s###vp_loop", jce_editor_i18n("videoPlayer.loop"));
+    if (ImGui::Checkbox(lbl, &vp->loop))
+        insp_undo_bool(&vp->loop);
+
+    snprintf(lbl, sizeof(lbl), "%s###vp_autoplay", jce_editor_i18n("videoPlayer.autoplay"));
+    if (ImGui::Checkbox(lbl, &vp->autoplay))
+        insp_undo_bool(&vp->autoplay);
+
+    /* Transport: a play/pause toggle on the live `playing` runtime field
+     * (not serialized).  jce_scene_video_update opens the clip on demand. */
+    snprintf(lbl, sizeof(lbl), "%s###vp_play",
+             vp->playing ? jce_editor_i18n("videoPlayer.pause")
+                         : jce_editor_i18n("videoPlayer.play"));
+    if (ImGui::Button(lbl))
+        vp->playing = !vp->playing;
+
+    /* Status: show the decoded resolution once a frame has landed. */
+    if (jce_texture_valid(vp->output_tex) && vp->tex_w > 0 && vp->tex_h > 0) {
+        ImGui::SameLine();
+        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%dx%d",
+                           vp->tex_w, vp->tex_h);
+    } else if (vp->playing) {
+        ImGui::SameLine();
+        ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY, "%s",
+                           jce_editor_i18n("videoPlayer.decoding"));
+    }
+}
+
 void draw_comp_audio_listener(JceAudioListenerComponent *l)
 {
     if (!l) return;

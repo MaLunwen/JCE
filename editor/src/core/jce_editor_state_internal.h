@@ -124,6 +124,19 @@ void update_scene_dir_from_path(const char *scene_path);
 void clear_scene_entities(void);
 void rebuild_entity_order_from_ecs(void);
 
+/* Auto-stop play mode before a scene swap (new / open / load).
+ *
+ * Creating a new scene or opening/loading a scene destroys and recreates
+ * the JceScene that a running runtime still references, which is a
+ * use-after-free during Play.  Call this at the START of every
+ * user-facing scene-swap entry point so the runtime is torn down first.
+ * Safe (no-op) when already stopped.  Defined in jce_editor_play.cpp.
+ *
+ * NOTE: do NOT call this from clear_scene_entities() itself or from the
+ * history/undo path — clear_scene_entities() is legitimately invoked
+ * during jce_state_stop()'s snapshot restore, when the runtime is gone. */
+void stop_play_before_scene_swap(void);
+
 /* ── History functions (defined in jce_editor_history.cpp) ─────────── */
 
 bool history_begin_edit(void);

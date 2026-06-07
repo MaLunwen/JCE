@@ -34,7 +34,22 @@ struct JceSkybox {
     uint32_t              equirect_w;
     uint32_t              equirect_h;
     uint32_t              cubemap_size;
+    float                *equirect_pixels; /* retained RGBA32F CPU pixels (for IBL) */
 };
+
+/* Retain a JCE_MALLOC'd copy of the decoded RGBA32F equirect pixels so the
+   IBL convolution can run CPU-side (bgfx textures cannot be read back).
+   Best-effort: failure to allocate just leaves equirect_pixels NULL. */
+static void skybox_retain_pixels(JceSkybox *sky, const float *pixels,
+                                 int w, int h)
+{
+    if (!sky || !pixels || w <= 0 || h <= 0) return;
+    size_t bytes = (size_t)w * (size_t)h * 4u * sizeof(float);
+    float *copy = (float *)JCE_MALLOC(bytes);
+    if (!copy) return;
+    memcpy(copy, pixels, bytes);
+    sky->equirect_pixels = copy;
+}
 
 /* ================================================================== */
 /* Capability check                                                    */
@@ -250,11 +265,13 @@ JceSkybox *jce_skybox_create_from_hdr_file(const char *path,
     sky->equirect_h = (uint32_t)h;
     sky->equirect_tex = upload_equirect_rgba16f(pixels, w, h);
     sky->cubemap_tex  = equirect_to_cubemap_cpu(pixels, w, h, sky->cubemap_size);
+    skybox_retain_pixels(sky, pixels, w, h);
     stbi_image_free(pixels);
 
     if (!BGFX_HANDLE_IS_VALID(sky->equirect_tex)) {
         if (BGFX_HANDLE_IS_VALID(sky->cubemap_tex))
             bgfx_destroy_texture(sky->cubemap_tex);
+        if (sky->equirect_pixels) JCE_FREE(sky->equirect_pixels);
         JCE_FREE(sky);
         return NULL;
     }
@@ -283,11 +300,13 @@ JceSkybox *jce_skybox_create_from_hdr_memory(const void *data, uint32_t data_siz
     sky->equirect_h = (uint32_t)h;
     sky->equirect_tex = upload_equirect_rgba16f(pixels, w, h);
     sky->cubemap_tex  = equirect_to_cubemap_cpu(pixels, w, h, sky->cubemap_size);
+    skybox_retain_pixels(sky, pixels, w, h);
     stbi_image_free(pixels);
 
     if (!BGFX_HANDLE_IS_VALID(sky->equirect_tex)) {
         if (BGFX_HANDLE_IS_VALID(sky->cubemap_tex))
             bgfx_destroy_texture(sky->cubemap_tex);
+        if (sky->equirect_pixels) JCE_FREE(sky->equirect_pixels);
         JCE_FREE(sky);
         return NULL;
     }
@@ -301,6 +320,7 @@ void jce_skybox_destroy(JceSkybox *sky)
         bgfx_destroy_texture(sky->equirect_tex);
     if (BGFX_HANDLE_IS_VALID(sky->cubemap_tex))
         bgfx_destroy_texture(sky->cubemap_tex);
+    if (sky->equirect_pixels) JCE_FREE(sky->equirect_pixels);
     JCE_FREE(sky);
 }
 
@@ -335,4 +355,17 @@ JceTexture jce_skybox_get_cubemap(const JceSkybox *sky)
 {
     if (!sky) return JCE_TEXTURE_INVALID;
     return (JceTexture){ sky->cubemap_tex.idx };
+}
+
+const float *jce_skybox_get_equirect_pixels(const JceSkybox *sky,
+                                            uint32_t *out_w, uint32_t *out_h)
+{
+    if (!sky || !sky->equirect_pixels) {
+        if (out_w) *out_w = 0;
+        if (out_h) *out_h = 0;
+        return NULL;
+    }
+    if (out_w) *out_w = sky->equirect_w;
+    if (out_h) *out_h = sky->equirect_h;
+    return sky->equirect_pixels;
 }

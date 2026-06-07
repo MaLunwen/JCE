@@ -16,6 +16,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 JCE_EXTERN_C_BEGIN
 
@@ -111,6 +112,46 @@ typedef struct JceMemStats {
  * `mi_process_info()`.  Cheap enough to call once per frame for HUDs.
  * Always populates `*out`; returns false only if `out` is NULL. */
 JCE_API bool jce_mem_stats(JceMemStats *out);
+
+/* ================================================================== */
+/* Debug allocation tracking (engine-side leak hunting)                */
+/* ================================================================== */
+
+/*
+ * In DEBUG builds (NDEBUG undefined) the default + aligned allocators record
+ * live bytes and allocation counts, bucketed by size class.  Engine memory
+ * goes through mimalloc (NOT the CRT heap), so a CRT leak dump and VS native
+ * heap snapshots miss it — a rising live-byte total here pinpoints an
+ * ENGINE-side leak and the size class it lives in.  Portable: plain native-word
+ * counters, no platform-specific libraries.  Compiled out in release (snapshot
+ * returns false, dump is a no-op), so zero overhead there.
+ *
+ * NOTE: counters are updated without locks, so values are APPROXIMATE under
+ * heavy concurrent allocation (asset worker threads) — fine for a leak TREND.
+ */
+#define JCE_ALLOC_TRACK_BUCKETS 28
+
+typedef struct JceAllocTrack {
+    uint64_t live_bytes;     /* currently-allocated bytes (alloc - free)        */
+    uint64_t live_count;     /* currently-live allocations                      */
+    uint64_t peak_bytes;     /* high-water mark of live_bytes                   */
+    uint64_t total_allocs;   /* cumulative alloc calls                          */
+    uint64_t total_frees;    /* cumulative free calls                           */
+    uint64_t bucket_bytes[JCE_ALLOC_TRACK_BUCKETS]; /* live bytes  per size class */
+    uint64_t bucket_count[JCE_ALLOC_TRACK_BUCKETS]; /* live allocs per size class */
+} JceAllocTrack;
+
+/* Bucket b covers sizes [16<<(b-1), 16<<b); bucket 0 covers [0,16). */
+JCE_API size_t jce_alloc_track_bucket_lo(int bucket);
+JCE_API size_t jce_alloc_track_bucket_hi(int bucket);
+
+/* Copy the current tracking snapshot to *out.  Returns false (and zeroes *out)
+ * when tracking is compiled out (release) or out is NULL. */
+JCE_API bool jce_alloc_track_snapshot(JceAllocTrack *out);
+
+/* Print the snapshot (totals + the largest size buckets) to stderr.
+ * No-op when tracking is compiled out. */
+JCE_API void jce_alloc_track_dump(void);
 
 JCE_EXTERN_C_END
 

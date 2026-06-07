@@ -11,9 +11,46 @@ void draw_comp_behavior_tree(JceBehaviorTree *bt)
     if (!bt) return;
     if (ImGui::Checkbox(jce_editor_i18n_id("inspector.bt.active", "bt"), &bt->active))
         insp_undo_bool(&bt->active);
-    ImGui::Text("%s: %u", jce_editor_i18n("inspector.bt.treeHandle"), (unsigned)bt->tree_handle_idx);
-    ImGui::Text("%s: %u", jce_editor_i18n("inspector.bt.contextHandle"), (unsigned)bt->context_handle_idx);
-    ImGui::TextDisabled(jce_editor_i18n("inspector.bt.editInBtEditor"));
+
+    /* Behavior-tree asset (BehaviorTree.CPP XML).  The runtime loads this
+     * file into its JceBtContext at Play and ticks it each gameplay frame. */
+    ImGui::TextUnformatted(jce_editor_i18n("inspector.bt.treePath"));
+    if (jce_draw_path_input_asset("##bt_tree", bt->tree_path,
+                                  sizeof(bt->tree_path), JCE_ASSET_KIND_DATA))
+        insp_track_edit();
+    accept_asset_drop(bt->tree_path, sizeof(bt->tree_path));
+    ImGui::SameLine();
+    if (ImGui::Button(jce_editor_i18n_id("inspector.bt.clearTree", "bt")))
+    { bt->tree_path[0] = '\0'; insp_track_edit(); }
+
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.bt.tickHz", "bt"),
+                     &bt->tick_hz, 0.5f, 0.0f, 240.0f, "%.1f");
+    insp_track_edit();
+    ImGui::TextDisabled("%s", jce_editor_i18n("inspector.bt.tickHzHint"));
+
+    /* Perception sensing params, read by the runtime perception pass each
+     * gameplay frame (0 ⇒ engine default).  The sight cone is authored in
+     * degrees and stored as a half-angle in radians. */
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.bt.sightRange", "bt"),
+                     &bt->sight_range, 0.5f, 0.0f, 200.0f, "%.1f m");
+    insp_track_edit();
+    {
+        float deg = bt->sight_half_angle * (180.0f / 3.14159265f);
+        if (deg <= 0.0f) deg = 60.0f;   /* effective default while unauthored */
+        if (ImGui::DragFloat(jce_editor_i18n_id("inspector.bt.sightAngle", "bt"),
+                             &deg, 0.5f, 1.0f, 180.0f, "%.0f deg")) {
+            bt->sight_half_angle = deg * (3.14159265f / 180.0f);
+            insp_track_edit();
+        }
+    }
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.bt.hearingRange", "bt"),
+                     &bt->hearing_range, 0.5f, 0.0f, 200.0f, "%.1f m");
+    insp_track_edit();
+
+    if (bt->tree_path[0] == '\0')
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "%s",
+                           jce_editor_i18n("inspector.bt.noTree"));
+    ImGui::TextDisabled("%s", jce_editor_i18n("inspector.bt.editInBtEditor"));
 }
 
 void draw_comp_spawn_manager(JceSpawnManagerComponent *m)
@@ -199,6 +236,25 @@ void draw_comp_terrain(JceTerrainComponent *tc)
 void draw_comp_particle_emitter(JceParticleEmitterComponent *pe)
 {
     if (!pe) return;
+
+    /* Authored asset (*.particles.json) drives the runtime emitter.  When
+     * set, the legacy quick-tune fields below are ignored at runtime. */
+    ImGui::TextUnformatted(jce_editor_i18n("inspector.pe.asset"));
+    if (jce_draw_path_input_asset("##pe_asset", pe->asset_path,
+                                  sizeof(pe->asset_path), JCE_ASSET_KIND_PARTICLE))
+        insp_track_edit();
+    accept_asset_drop(pe->asset_path, sizeof(pe->asset_path));
+    ImGui::SameLine();
+    if (ImGui::Button(jce_editor_i18n_id("inspector.pe.clearAsset", "pe")))
+    { pe->asset_path[0] = '\0'; insp_track_edit(); }
+
+    const bool has_asset = pe->asset_path[0] != '\0';
+    if (has_asset) {
+        ImGui::TextDisabled("%s", jce_editor_i18n("inspector.pe.assetDrives"));
+        ImGui::BeginDisabled();
+    } else {
+        ImGui::TextDisabled("%s", jce_editor_i18n("inspector.pe.legacyHint"));
+    }
     ImGui::DragFloat(jce_editor_i18n_id("inspector.pe.emitRate", "pe"), &pe->emit_rate, 0.5f, 0.0f, 10000.0f);
     insp_track_edit();
     ImGui::DragFloat(jce_editor_i18n_id("inspector.pe.lifetimeMin", "pe"), &pe->lifetime_min, 0.05f, 0.0f, 1000.0f);
@@ -206,6 +262,7 @@ void draw_comp_particle_emitter(JceParticleEmitterComponent *pe)
     ImGui::DragFloat(jce_editor_i18n_id("inspector.pe.lifetimeMax", "pe"), &pe->lifetime_max, 0.05f, 0.0f, 1000.0f);
     insp_track_edit();
     if (pe->lifetime_max < pe->lifetime_min) pe->lifetime_max = pe->lifetime_min;
+    if (has_asset) ImGui::EndDisabled();
     ImGui::TextDisabled(jce_editor_i18n("inspector.pe.useParticleSystemPanel"));
 }
 

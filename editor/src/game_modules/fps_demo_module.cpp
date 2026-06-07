@@ -68,6 +68,7 @@ bool fps_init(const JceServices *svc, void *ud)
     desc.max_bodies     = 256;
     desc.fixed_timestep = 1.0f / 60.0f;
     desc.max_sub_steps  = 4;
+    desc.split_impulse  = -1; /* leave Bullet default (ON) */
     s.world = jce_physics_create(&desc);
     if (!s.world) {
         LOG_WARN(LOG_TAG, "[init] physics world creation failed");

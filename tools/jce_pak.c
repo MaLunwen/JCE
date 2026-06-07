@@ -1176,7 +1176,6 @@ static int is_excluded_rel_path(const char *rel, const Args *args)
     return 0;
 }
 
-// cppcheck-suppress constParameter   ; argv comes from main() with non-const char**
 static Args parse_args(int argc, char *const argv[]) {
     Args a;
     memset(&a, 0, sizeof(a));

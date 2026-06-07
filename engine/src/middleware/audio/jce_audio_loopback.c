@@ -33,7 +33,7 @@ bool jce_audio_loopback_start(JceAudioLoopbackFn cb, void *ud)
 {
     if (g.active) return false;
 
-#if defined(_WIN32)
+#if JCE_PLATFORM_WINDOWS
     memset(&g, 0, sizeof(g));
     g.cb = cb; g.ud = ud;
     g.sample_rate = 48000;   /* Opus operates at 48 kHz */

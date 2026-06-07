@@ -41,7 +41,8 @@ static bgfx_texture_handle_t ibl_invalid_tex_handle(void)
 struct JceIblData {
     bgfx_texture_handle_t irradiance;   /* cubemap */
     bgfx_texture_handle_t prefilter;    /* cubemap with mips */
-    bgfx_texture_handle_t brdf_lut;     /* 2D */
+    bgfx_texture_handle_t brdf_lut;     /* 2D (unused: renderer shares one LUT) */
+    uint32_t              prefilter_mips; /* actual prefilter mip count */
 };
 
 /* ================================================================== */
@@ -451,7 +452,8 @@ static bgfx_texture_handle_t generate_irradiance(const float *equirect,
 
 static bgfx_texture_handle_t generate_prefilter(const float *equirect,
                                                  uint32_t ew, uint32_t eh,
-                                                 uint32_t face_size)
+                                                 uint32_t face_size,
+                                                 uint32_t *out_mips)
 {
     /* Number of mip levels. */
     uint32_t max_mip = 1;
@@ -460,6 +462,7 @@ static bgfx_texture_handle_t generate_prefilter(const float *equirect,
         while (s > 1) { s >>= 1; max_mip++; }
     }
     if (max_mip > 8) max_mip = 8;
+    if (out_mips) *out_mips = max_mip;
 
     /* Compute total memory needed for all mips of all 6 faces. */
     uint32_t total_half_words = 0;
@@ -595,8 +598,46 @@ JceIblData *jce_ibl_generate(JceTexture equirect_tex,
     (void)brdf_lut_size;
 
     LOG_WARN(LOG_TAG, "jce_ibl_generate() requires CPU pixel data; "
-             "use editor's IBL pipeline instead");
+             "use jce_ibl_generate_from_pixels() instead");
     return NULL;
+}
+
+JceIblData *jce_ibl_generate_from_pixels(const float *pixels,
+                                         uint32_t width, uint32_t height,
+                                         uint32_t irradiance_size,
+                                         uint32_t prefilter_size)
+{
+    if (!pixels || width == 0 || height == 0) {
+        LOG_WARN(LOG_TAG, "jce_ibl_generate_from_pixels: invalid pixel data");
+        return NULL;
+    }
+    if (irradiance_size == 0) irradiance_size = 32;
+    if (prefilter_size  == 0) prefilter_size  = 128;
+
+    JceIblData *ibl = (JceIblData *)JCE_CALLOC(1, sizeof(*ibl));
+    if (!ibl) return NULL;
+    ibl->irradiance = ibl_invalid_tex_handle();
+    ibl->prefilter  = ibl_invalid_tex_handle();
+    ibl->brdf_lut   = ibl_invalid_tex_handle();
+    ibl->prefilter_mips = 0;
+
+    LOG_INFO(LOG_TAG, "IBL generate: equirect %ux%u -> irradiance %u, "
+             "prefilter %u", width, height, irradiance_size, prefilter_size);
+
+    ibl->irradiance = generate_irradiance(pixels, width, height,
+                                          irradiance_size);
+    ibl->prefilter  = generate_prefilter(pixels, width, height,
+                                         prefilter_size,
+                                         &ibl->prefilter_mips);
+
+    if (!BGFX_HANDLE_IS_VALID(ibl->irradiance) ||
+        !BGFX_HANDLE_IS_VALID(ibl->prefilter)) {
+        LOG_WARN(LOG_TAG, "IBL generate failed (irradiance/prefilter upload)");
+        jce_ibl_destroy(ibl);
+        return NULL;
+    }
+
+    return ibl;
 }
 
 void jce_ibl_destroy(JceIblData *ibl)
@@ -627,4 +668,10 @@ JceTexture jce_ibl_get_brdf_lut(const JceIblData *ibl)
 {
     if (!ibl) return JCE_TEXTURE_INVALID;
     return (JceTexture){ ibl->brdf_lut.idx };
+}
+
+uint32_t jce_ibl_get_prefilter_mips(const JceIblData *ibl)
+{
+    if (!ibl) return 0;
+    return ibl->prefilter_mips;
 }

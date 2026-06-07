@@ -77,6 +77,14 @@ JCE_API JceMesh *jce_mesh_create_cylinder(float radius, float height);
    Caller must call jce_pbr_material_bind() and set transforms before this. */
 JCE_API void jce_mesh_submit_pbr(const JceMesh *mesh, const JceRenderer *r, uint16_t view_id);
 
+/* Variant of jce_mesh_submit_pbr that applies an explicit bgfx render state
+   (blend / cull / depth-write) instead of BGFX_STATE_DEFAULT.  Used by the
+   inline draw path to honour alpha-blend and double-sided materials.  Pass
+   state==0 to fall back to BGFX_STATE_DEFAULT.  Build the value with
+   jce_pbr_material_render_state(). */
+JCE_API void jce_mesh_submit_pbr_state(const JceMesh *mesh, const JceRenderer *r,
+                                       uint16_t view_id, uint64_t state);
+
 /* Variant of jce_mesh_submit_pbr that uses an explicit shader program
    handle instead of the renderer's default PBR program.  Used by the
    editor material-graph preview to render a sphere with a custom

@@ -16,6 +16,7 @@
 
 #include <jce/tools/jce_imgui.hpp>
 #include <cstdio>
+#include <cstring>
 
 extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
@@ -89,6 +90,13 @@ static void sync_to_pipeline(const JceSceneRenderingSettings *settings)
             settings->postfx_enabled[i];
         jce_postfx_enable(pfx, (JcePostFXType)i, enabled);
     }
+    /* Custom pass (data-driven; the engine is style-agnostic). */
+    if (settings) {
+        jce_postfx_set_custom_shader(pfx, settings->custom_post_shader,
+                                     settings->custom_post_needs_depth);
+        jce_postfx_set_custom_params(pfx, settings->custom_post_params,
+                                     settings->custom_post_param_count);
+    }
 }
 
 /* Disable all PostFX effects only when there is no active scene to mirror. */
@@ -99,6 +107,25 @@ static void disable_pipeline_only(void)
     for (int i = 0; i < JCE_POSTFX_COUNT; i++)
         jce_postfx_enable(pfx, (JcePostFXType)i, false);
 }
+
+/* ── Showcase "looks" on the generic custom pass ──────────────────────
+ * Editor-side PRESET data (shader name + depth + tuned params) so a one-click
+ * dropdown applies each look correctly. This is client/showcase content — the
+ * engine custom-pass remains entirely style-agnostic. Add a look = add a row
+ * (and the matching engine/shaders/postfx/fs_<name>.sc). */
+struct CustomLook { const char *name; bool depth; int count; float p[32]; };
+static const CustomLook kLooks[] = {
+    { "moebius",    true,  5, { 1.0f,0.22f,2.0f,1.2f,  4.0f,0.55f,0.35f,0.35f, 0.4f,0,0,0, 0.1f,0.09f,0.12f,0, 0.96f,0.92f,0.82f,0 } },
+    { "toon",       true,  7, { 1.0f,0.25f,1.5f,0.5f,  3.0f,0.08f,1.35f,1.12f, 0.4f,0.25f,0.25f,0, 0.78f,0.82f,1.0f,0, 1.0f,0.98f,0.9f,0, 0.05f,0.06f,0.09f,0, 1.0f,0.97f,0.85f,0 } },
+    { "painterly",  false, 2, { 3.0f,1.3f,1.08f,0.35f, 0.04f,0,0,0 } },
+    { "lowpoly",    true,  1, { 5.0f,3.0f,0.35f,1.12f } },
+    { "pixel",      false, 1, { 4.0f,6.0f,0.6f,0 } },
+    { "psx",        false, 1, { 3.0f,32.0f,0.7f,0.5f } },
+    { "watercolor", false, 2, { 2.0f,0.4f,0.06f,0.18f, 0.25f,0,0,0 } },
+    { "comic",      true,  2, { 1.0f,0.28f,5.0f,30.0f, 3.0f,1.35f,0.55f,0 } },
+    { "blueprint",  true,  4, { 1.0f,0.22f,22.0f,1.0f,  0.35f,0.45f,5.0f,0, 0.055f,0.16f,0.42f,0, 0.80f,0.90f,1.0f,0 } },
+};
+static const int kLookCount = (int)(sizeof(kLooks) / sizeof(kLooks[0]));
 
 /* ── Content ──────────────────────────────────────────────────────── */
 
@@ -193,6 +220,57 @@ void jce_editor_panel_postfx_content(void)
     }
     ImGui::PopStyleColor();
 
+    /* Custom pass — generic, data-driven. The engine knows nothing about what
+     * the shader does; this UI just edits a shader name + raw vec4 params.
+     * (Literal labels: i18n keys can be added once the i18n tables settle.) */
+    ImGui::PushStyleColor(ImGuiCol_Header, jce_theme::inspector_header_color());
+    if (ImGui::CollapsingHeader(jce_editor_i18n("postfx.customPass"))) {
+        snprintf(lbl, sizeof(lbl), "%s##custompass", jce_editor_i18n("postfx.enable"));
+        changed |= ImGui::Checkbox(lbl, &enabled[JCE_POSTFX_CUSTOM]);
+
+        /* One-click look picker — applies the look's name + tuned params live. */
+        int look_sel = -1;
+        for (int i = 0; i < kLookCount; i++)
+            if (strcmp(settings->custom_post_shader, kLooks[i].name) == 0) { look_sel = i; break; }
+        if (ImGui::BeginCombo(jce_editor_i18n("postfx.look"), look_sel >= 0 ? kLooks[look_sel].name : "(custom)")) {
+            for (int i = 0; i < kLookCount; i++) {
+                if (ImGui::Selectable(kLooks[i].name, i == look_sel)) {
+                    enabled[JCE_POSTFX_CUSTOM] = true;
+                    snprintf(settings->custom_post_shader,
+                             sizeof(settings->custom_post_shader), "%s", kLooks[i].name);
+                    settings->custom_post_needs_depth = kLooks[i].depth;
+                    settings->custom_post_param_count = kLooks[i].count;
+                    memcpy(settings->custom_post_params, kLooks[i].p,
+                           sizeof(settings->custom_post_params));
+                    changed = true;
+                }
+            }
+            ImGui::EndCombo();
+        }
+
+        ImGui::BeginDisabled(!enabled[JCE_POSTFX_CUSTOM]);
+        /* Commit the shader name on Enter to avoid reloading on every keystroke. */
+        if (ImGui::InputText(jce_editor_i18n("postfx.shaderLabel"), settings->custom_post_shader,
+                             sizeof(settings->custom_post_shader),
+                             ImGuiInputTextFlags_EnterReturnsTrue))
+            changed = true;
+        changed |= ImGui::Checkbox(jce_editor_i18n("postfx.needsDepth"), &settings->custom_post_needs_depth);
+        int pc = settings->custom_post_param_count;
+        if (ImGui::SliderInt(jce_editor_i18n("postfx.paramCount"), &pc, 0, JCE_POSTFX_CUSTOM_PARAMS)) {
+            settings->custom_post_param_count = pc;
+            changed = true;
+        }
+        for (int i = 0; i < settings->custom_post_param_count &&
+                        i < JCE_POSTFX_CUSTOM_PARAMS; i++) {
+            char plbl[32];
+            snprintf(plbl, sizeof(plbl), "Param %d", i);
+            changed |= ImGui::DragFloat4(plbl, &settings->custom_post_params[i * 4], 0.01f);
+        }
+        ImGui::TextDisabled("%s", jce_editor_i18n("postfx.paramHint"));
+        ImGui::EndDisabled();
+    }
+    ImGui::PopStyleColor();
+
     /* Push changes to the engine pipeline. */
     if (changed) {
         params_to_settings(settings, &params);
@@ -216,6 +294,9 @@ void jce_editor_panel_postfx_content(void)
         settings->vignette_intensity = defaults.vignette_intensity;
         settings->vignette_smoothness = defaults.vignette_smoothness;
         settings->chromatic_strength = defaults.chromatic_strength;
+        settings->custom_post_shader[0] = '\0';
+        settings->custom_post_needs_depth = defaults.custom_post_needs_depth;
+        settings->custom_post_param_count = defaults.custom_post_param_count;
         sync_to_pipeline(settings);
         jce_state_mark_scene_modified();
     }

@@ -54,6 +54,7 @@ typedef struct {
     jce_mat4 transform;       /* model matrix (single-instance / first instance) */
     float    depth;           /* camera-space Z for sorting */
     uint32_t material_key;    /* hash for material grouping */
+    uint64_t state;           /* bgfx render state (blend/cull/write); 0 → BGFX_STATE_DEFAULT */
 } JceDrawCmd;
 
 /* ================================================================== */
@@ -109,6 +110,12 @@ JCE_API void jce_rq_push_instanced(JceRenderQueue *rq, const JceDrawCmd *cmd,
 
 /* Sort queued commands by the given mode. */
 JCE_API void jce_rq_sort(JceRenderQueue *rq, JceSortMode mode);
+
+/* Disable auto-instancing/batching for this queue.  Transparent (back-to-
+ * front) queues MUST set this so adjacent same-material entries at different
+ * depths are not merged into one submit, which would break draw order and
+ * blend correctness.  Default (false) keeps opaque auto-instancing. */
+JCE_API void jce_rq_set_no_batch(JceRenderQueue *rq, bool no_batch);
 
 /* Submit all queued commands to bgfx and clear the queue.
  *

@@ -5,6 +5,8 @@
  */
 
 #include "jce_panel_inspector_common.h"
+#include <jce/middleware/animation/jce_anim_sm.h>
+#include <jce/middleware/animation/jce_anim_sm_binding.h>
 
 void draw_comp_animator(JceAnimatorComponent *anim)
 {
@@ -29,9 +31,72 @@ void draw_comp_skeletal_animator(JceSkeletalAnimatorComponent *skel)
 
     if (skel->speed <= 0.0f) skel->speed = 1.0f;
 
-    jce_draw_path_input_asset(jce_editor_i18n("inspector.skeleton"), skel->skeleton_path, 128, JCE_ASSET_KIND_DATA);
+    /* glTF/GLB are classified as MODEL assets — filter to MODEL so the Browse
+     * dialog actually lists them (DATA hid every .glb). Use the field's real
+     * size, not a hard-coded 128, so long relative paths aren't truncated. */
+    jce_draw_path_input_asset(jce_editor_i18n("inspector.skeleton"),
+                              skel->skeleton_path, sizeof(skel->skeleton_path),
+                              JCE_ASSET_KIND_MODEL);
     insp_track_edit();
-    accept_asset_drop(skel->skeleton_path, 128);
+    accept_asset_drop(skel->skeleton_path, sizeof(skel->skeleton_path));
+
+    /* Optional state machine (.anim_sm.json). When set it drives the active
+       clip via parameter transitions instead of the fixed Active Clip below. */
+    jce_draw_path_input_asset(jce_editor_i18n("inspector.anim.stateMachine"),
+                              skel->sm_path, sizeof(skel->sm_path),
+                              JCE_ASSET_KIND_DATA);
+    insp_track_edit();
+    accept_asset_drop(skel->sm_path, sizeof(skel->sm_path));
+    if (skel->sm_path[0]) {
+        ImGui::TextDisabled("%s", jce_editor_i18n("inspector.anim.smDrivesClip"));
+        uint32_t ent = jce_state_get_focused();
+        JceAnimSmBinding *smb = ent ? jce_editor_scene_get_anim_sm(ent) : nullptr;
+        if (smb) {
+            const JceAnimSmEval *ev = jce_anim_sm_binding_eval(smb);
+            if (ev && ev->state_name)
+                ImGui::Text(jce_editor_i18n("inspector.anim.stateFmt"), ev->state_name);
+            JceAnimSm *sm = jce_anim_sm_binding_runtime(smb);
+            int pc = sm ? jce_anim_sm_param_count(sm) : 0;
+            /* Live param controls — local cache (no SM getter), pushed to the
+               binding on edit; reset when the selected entity changes. */
+            static uint32_t s_ent = 0;
+            static float    s_f[32];
+            static int      s_i[32];
+            static bool     s_b[32];
+            if (ent != s_ent) {
+                s_ent = ent;
+                memset(s_f, 0, sizeof(s_f));
+                memset(s_i, 0, sizeof(s_i));
+                memset(s_b, 0, sizeof(s_b));
+            }
+            for (int i = 0; i < pc && i < 32; i++) {
+                const char *pn = jce_anim_sm_param_name(sm, i);
+                if (!pn || !*pn) continue;
+                ImGui::PushID(i);
+                switch (jce_anim_sm_param_type(sm, i)) {
+                case JCE_ANIM_SM_PARAM_FLOAT:
+                    if (ImGui::DragFloat(pn, &s_f[i], 0.01f))
+                        jce_anim_sm_binding_set_float(smb, pn, s_f[i]);
+                    break;
+                case JCE_ANIM_SM_PARAM_INT:
+                    if (ImGui::DragInt(pn, &s_i[i]))
+                        jce_anim_sm_binding_set_int(smb, pn, s_i[i]);
+                    break;
+                case JCE_ANIM_SM_PARAM_BOOL:
+                    if (ImGui::Checkbox(pn, &s_b[i]))
+                        jce_anim_sm_binding_set_bool(smb, pn, s_b[i]);
+                    break;
+                case JCE_ANIM_SM_PARAM_TRIGGER:
+                    if (ImGui::Button(pn))
+                        jce_anim_sm_binding_set_trigger(smb, pn);
+                    break;
+                }
+                ImGui::PopID();
+            }
+        } else {
+            ImGui::TextDisabled("%s", jce_editor_i18n("inspector.anim.stateRuntimeHint"));
+        }
+    }
 
     if (skel->skeleton_path[0] && skel->clip_count == 0) {
         JceModel *mdl = jce_editor_scene_get_model(skel->skeleton_path, 0);
@@ -72,6 +137,30 @@ void draw_comp_skeletal_animator(JceSkeletalAnimatorComponent *skel)
             clip_count);
         if (skel->active_clip != prev_clip)
             insp_undo_int(&skel->active_clip, prev_clip);
+    }
+
+    /* ── Blend tree (1D) ─ cross-blend clips by a scalar (e.g. speed) ── */
+    {
+        bool bt = skel->use_blend_tree;
+        if (ImGui::Checkbox(jce_editor_i18n("inspector.anim.blendTree1d"), &bt)) {
+            skel->use_blend_tree = bt;
+            insp_track_edit();
+        }
+        if (skel->use_blend_tree) {
+            ImGui::DragFloat(jce_editor_i18n("inspector.anim.blendParam"), &skel->blend_param, 0.01f);
+            if (ImGui::IsItemDeactivatedAfterEdit()) insp_track_edit();
+            if (clip_count > 0) {
+                ImGui::TextDisabled("%s", jce_editor_i18n("inspector.anim.thresholdHint"));
+                for (int i = 0; i < clip_count; i++) {
+                    ImGui::PushID(i);
+                    snprintf(lbl, sizeof(lbl), "%s##bt",
+                             skel->clip_names[i][0] ? skel->clip_names[i] : "clip");
+                    ImGui::DragFloat(lbl, &skel->blend_thresholds[i], 0.01f);
+                    if (ImGui::IsItemDeactivatedAfterEdit()) insp_track_edit();
+                    ImGui::PopID();
+                }
+            }
+        }
     }
 
     if (skel->skeleton_path[0]) {

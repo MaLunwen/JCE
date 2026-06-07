@@ -139,6 +139,14 @@ static JcePhysicsWorldDesc defaults(void)
     d.max_bodies     = 4096;
     d.fixed_timestep = 1.0f / 60.0f;
     d.max_sub_steps  = 4;
+    /* Solver / sleeping tunables: sentinels that leave Bullet defaults in
+       place.  split_impulse uses -1 ("leave default", which is ON); the
+       rest use 0 ("leave default"). */
+    d.solver_iterations       = 0;
+    d.split_impulse           = -1;
+    d.deactivation_time       = 0.0f;
+    d.linear_sleep_threshold  = 0.0f;
+    d.angular_sleep_threshold = 0.0f;
     return d;
 }
 
@@ -163,7 +171,12 @@ JcePhysicsWorld *jce_physics_create(const JcePhysicsWorldDesc *desc)
     JcePhysicsWorld *w = (JcePhysicsWorld *)JCE_CALLOC(1, sizeof(*w));
     if (!w) return NULL;
 
-    w->bullet = jce_bullet_create(cfg.gravity, cfg.max_bodies);
+    w->bullet = jce_bullet_create(cfg.gravity, cfg.max_bodies,
+                                  cfg.solver_iterations, cfg.split_impulse,
+                                  cfg.deactivation_time,
+                                  cfg.linear_sleep_threshold,
+                                  cfg.angular_sleep_threshold,
+                                  cfg.multithreaded);
     if (!w->bullet) {
         JCE_FREE(w);
         LOG_ERROR(LOG_TAG, "failed to create Bullet3 world");
@@ -275,8 +288,12 @@ static void emit_event(const JcePhysicsWorld *w,
 {
     if (w->listener_count == 0) return;
 
+    /* lo/hi are PACKED handles (the manifold userPointers).  body_entity[]
+     * is indexed by SLOT, so decode before indexing it. */
     uint32_t lo = (uint32_t)(p->key >> 32);
     uint32_t hi = (uint32_t)(p->key & 0xFFFFFFFFu);
+    uint32_t slot_lo = jce_body_handle_slot((JceBodyHandle){ lo });
+    uint32_t slot_hi = jce_body_handle_slot((JceBodyHandle){ hi });
 
     JceContactEvent ev;
     memset(&ev, 0, sizeof(ev));
@@ -291,10 +308,10 @@ static void emit_event(const JcePhysicsWorld *w,
     ev.depth     = p->depth;
     ev.is_trigger = p->is_trigger ? true : false;
     ev.type      = (JceContactEventTypeRaw)type;
-    ev.entity_a  = (lo < w->body_capacity && w->body_entity)
-                       ? w->body_entity[lo] : 0;
-    ev.entity_b  = (hi < w->body_capacity && w->body_entity)
-                       ? w->body_entity[hi] : 0;
+    ev.entity_a  = (slot_lo < w->body_capacity && w->body_entity)
+                       ? w->body_entity[slot_lo] : 0;
+    ev.entity_b  = (slot_hi < w->body_capacity && w->body_entity)
+                       ? w->body_entity[slot_hi] : 0;
 
     for (uint32_t i = 0; i < w->listener_count; ++i) {
         w->listeners[i].fn(&ev, w->listeners[i].ud);
@@ -420,14 +437,31 @@ JceBodyHandle jce_physics_body_create_compound(JcePhysicsWorld           *world,
 
     for (uint32_t i = 0; i < desc->child_count; ++i) {
         const JceColliderChild *s = &desc->children[i];
-        bc[i].shape        = (uint8_t)s->shape;
+        JceShapeType shape = (JceShapeType)s->shape;
+        /* A dynamic rigid body cannot use a concave triangle mesh — Bullet
+           computes zero inertia and asserts.  Auto-convert that child to a
+           convex hull (its vertices double as the hull point cloud). */
+        if (desc->type == JCE_BODY_DYNAMIC &&
+            shape == JCE_SHAPE_TRIANGLE_MESH) {
+            if (!s->vertices || s->vertex_count == 0) {
+                LOG_ERROR(LOG_TAG,
+                          "dynamic body has empty triangle-mesh child; rejecting");
+                jce_free(bc);
+                return JCE_BODY_INVALID;
+            }
+            LOG_WARN(LOG_TAG,
+                     "dynamic body cannot use a triangle-mesh child; "
+                     "converting to convex hull");
+            shape = JCE_SHAPE_CONVEX_HULL;
+        }
+        bc[i].shape        = (uint8_t)shape;
         bc[i].position     = s->position;
         bc[i].rotation     = s->rotation;
         bc[i].half_extents = s->half_extents;
         bc[i].vertices     = s->vertices;
         bc[i].vertex_count = s->vertex_count;
-        bc[i].indices      = s->indices;
-        bc[i].index_count  = s->index_count;
+        bc[i].indices      = (shape == JCE_SHAPE_CONVEX_HULL) ? NULL : s->indices;
+        bc[i].index_count  = (shape == JCE_SHAPE_CONVEX_HULL) ? 0u   : s->index_count;
     }
 
     uint32_t idx = jce_bullet_body_create_compound(
@@ -447,13 +481,25 @@ JceBodyHandle jce_physics_body_create_compound(JcePhysicsWorld           *world,
     return (JceBodyHandle){ idx };
 }
 
+/* Forward decl — defined with the CCD side-table further below.  Passing
+ * JCE_CCD_DISCRETE removes the slot's entry (DISCRETE = absent), which is
+ * exactly the clear we want when a body slot is freed and may be reused. */
+static void ccd_cache_set(const JcePhysicsWorld *world, uint32_t idx,
+                          JceCcdMode mode);
+
 void jce_physics_body_destroy(JcePhysicsWorld *world, JceBodyHandle body)
 {
     if (!world || !jce_body_valid(body)) return;
     jce_bullet_body_destroy(world->bullet, body.idx);
-    if (world->body_entity && body.idx < world->body_capacity) {
-        world->body_entity[body.idx] = 0;
+    /* body_entity[] is indexed by SLOT; decode the packed handle. */
+    uint32_t slot = jce_body_handle_slot(body);
+    if (world->body_entity && slot < world->body_capacity) {
+        world->body_entity[slot] = 0;
     }
+    /* Drop any stale CCD-mode cache entry so a reused slot does not
+       inherit the destroyed body's mode (keyed by the packed handle that
+       was used to set it). */
+    ccd_cache_set(world, body.idx, JCE_CCD_DISCRETE);
 }
 
 /* ── Body state queries ────────────────────────────────────────────── */
@@ -475,6 +521,13 @@ void jce_physics_body_set_transform(JcePhysicsWorld *world,
 {
     if (!world || !jce_body_valid(body)) return;
     jce_bullet_body_set_transform(world->bullet, body.idx, pos, rot);
+}
+
+bool jce_physics_body_is_dynamic(const JcePhysicsWorld *world,
+                                 JceBodyHandle body)
+{
+    if (!world || !jce_body_valid(body)) return false;
+    return jce_bullet_body_is_dynamic((JceBulletWorld *)world->bullet, body.idx);
 }
 
 jce_vec3 jce_physics_body_get_velocity(const JcePhysicsWorld *world,
@@ -534,6 +587,47 @@ void jce_physics_body_apply_torque(JcePhysicsWorld *world,
     jce_bullet_body_apply_torque(world->bullet, body.idx, torque);
 }
 
+void jce_physics_body_apply_force_at_point(JcePhysicsWorld *world,
+                                           JceBodyHandle body, jce_vec3 force,
+                                           jce_vec3 world_point)
+{
+    if (!world || !jce_body_valid(body)) return;
+    jce_bullet_body_apply_force_at_point(world->bullet, body.idx,
+                                         force, world_point);
+}
+
+void jce_physics_body_apply_impulse_at_point(JcePhysicsWorld *world,
+                                             JceBodyHandle body, jce_vec3 impulse,
+                                             jce_vec3 world_point)
+{
+    if (!world || !jce_body_valid(body)) return;
+    jce_bullet_body_apply_impulse_at_point(world->bullet, body.idx,
+                                           impulse, world_point);
+}
+
+/* ── Per-body gravity & mass ───────────────────────────────────────── */
+
+void jce_physics_body_set_gravity_factor(JcePhysicsWorld *world,
+                                         JceBodyHandle body, float factor)
+{
+    if (!world || !jce_body_valid(body)) return;
+    jce_bullet_body_set_gravity_factor(world->bullet, body.idx, factor);
+}
+
+void jce_physics_body_set_mass(JcePhysicsWorld *world,
+                               JceBodyHandle body, float mass)
+{
+    if (!world || !jce_body_valid(body)) return;
+    jce_bullet_body_set_mass(world->bullet, body.idx, mass);
+}
+
+void jce_physics_body_set_scale(JcePhysicsWorld *world,
+                                JceBodyHandle body, jce_vec3 scale)
+{
+    if (!world || !jce_body_valid(body)) return;
+    jce_bullet_body_set_scale(world->bullet, body.idx, scale);
+}
+
 /* ── Ray casting ───────────────────────────────────────────────────── */
 
 JceRaycastResult jce_physics_raycast(const JcePhysicsWorld *world,
@@ -556,6 +650,90 @@ JceRaycastResult jce_physics_raycast(const JcePhysicsWorld *world,
     result.body     = (JceBodyHandle){ br.body_idx };
 
     return result;
+}
+
+/* ── Filtered spatial queries ──────────────────────────────────────── */
+
+static JceRaycastResult rt_from_bullet_ray(JceBulletRayResult br)
+{
+    JceRaycastResult r;
+    r.hit      = br.hit;
+    r.point    = br.point;
+    r.normal   = br.normal;
+    r.distance = br.distance;
+    r.body     = (JceBodyHandle){ br.body_idx };
+    return r;
+}
+
+JceRaycastResult jce_physics_raycast_filtered(const JcePhysicsWorld *world,
+                                              jce_vec3 origin, jce_vec3 direction,
+                                              float max_distance,
+                                              JceQueryFilter filter)
+{
+    JceRaycastResult result;
+    memset(&result, 0, sizeof(result));
+    result.body = JCE_BODY_INVALID;
+    if (!world) return result;
+    return rt_from_bullet_ray(jce_bullet_raycast_filtered(
+        (JceBulletWorld *)world->bullet, origin, direction, max_distance,
+        filter.layer_mask, filter.hit_triggers));
+}
+
+uint32_t jce_physics_raycast_all(const JcePhysicsWorld *world,
+                                 jce_vec3 origin, jce_vec3 direction,
+                                 float max_distance, JceQueryFilter filter,
+                                 JceRaycastResult *out_hits, uint32_t max_hits)
+{
+    if (!world || !out_hits || max_hits == 0) return 0;
+
+    /* Stack scratch (no per-call heap alloc); cap at 64 hits per query. */
+    JceBulletRayResult tmp[64];
+    uint32_t cap = max_hits < 64u ? max_hits : 64u;
+    uint32_t n = jce_bullet_raycast_all((JceBulletWorld *)world->bullet,
+        origin, direction, max_distance, filter.layer_mask,
+        filter.hit_triggers, tmp, cap);
+    for (uint32_t i = 0; i < n; ++i)
+        out_hits[i] = rt_from_bullet_ray(tmp[i]);
+    return n;
+}
+
+uint32_t jce_physics_overlap_sphere(const JcePhysicsWorld *world,
+                                    jce_vec3 center, float radius,
+                                    JceQueryFilter filter,
+                                    JceBodyHandle *out_bodies,
+                                    uint32_t max_bodies)
+{
+    if (!world || !out_bodies || max_bodies == 0) return 0;
+    /* JceBodyHandle is a single uint32_t field, so its array aliases a
+     * uint32_t array element-for-element. */
+    return jce_bullet_overlap_sphere((JceBulletWorld *)world->bullet,
+        center, radius, filter.layer_mask, filter.hit_triggers,
+        (uint32_t *)out_bodies, max_bodies);
+}
+
+uint32_t jce_physics_overlap_box(const JcePhysicsWorld *world,
+                                 jce_vec3 center, jce_vec3 half_extents,
+                                 jce_quat rotation, JceQueryFilter filter,
+                                 JceBodyHandle *out_bodies, uint32_t max_bodies)
+{
+    if (!world || !out_bodies || max_bodies == 0) return 0;
+    return jce_bullet_overlap_box((JceBulletWorld *)world->bullet,
+        center, half_extents, rotation, filter.layer_mask,
+        filter.hit_triggers, (uint32_t *)out_bodies, max_bodies);
+}
+
+JceRaycastResult jce_physics_sweep_sphere(const JcePhysicsWorld *world,
+                                          jce_vec3 origin, float radius,
+                                          jce_vec3 direction, float max_distance,
+                                          JceQueryFilter filter)
+{
+    JceRaycastResult result;
+    memset(&result, 0, sizeof(result));
+    result.body = JCE_BODY_INVALID;
+    if (!world) return result;
+    return rt_from_bullet_ray(jce_bullet_sweep_sphere(
+        (JceBulletWorld *)world->bullet, origin, radius, direction,
+        max_distance, filter.layer_mask, filter.hit_triggers));
 }
 
 /* ── Contact callbacks ─────────────────────────────────────────────── */
@@ -845,6 +1023,15 @@ void jce_physics_character_get_position(const JcePhysicsWorld *world,
         (JceBulletWorld *)world->bullet, ch.idx, out_pos);
 }
 
+void jce_physics_character_set_position(JcePhysicsWorld *world,
+                                         JceCharacterHandle ch,
+                                         jce_vec3 pos)
+{
+    if (!world || !jce_character_valid(ch)) return;
+    jce_bullet_character_set_position(
+        (JceBulletWorld *)world->bullet, ch.idx, pos);
+}
+
 bool jce_physics_character_is_grounded(const JcePhysicsWorld *world,
                                         JceCharacterHandle ch)
 {
@@ -943,16 +1130,19 @@ void jce_physics_body_set_entity(JcePhysicsWorld *world,
                                  JceBodyHandle body, uint64_t entity)
 {
     if (!world || !jce_body_valid(body)) return;
-    if (body.idx >= world->body_capacity || !world->body_entity) return;
-    world->body_entity[body.idx] = entity;
+    /* body_entity[] is indexed by SLOT; decode the packed handle. */
+    uint32_t slot = jce_body_handle_slot(body);
+    if (slot >= world->body_capacity || !world->body_entity) return;
+    world->body_entity[slot] = entity;
 }
 
 uint64_t jce_physics_body_get_entity(const JcePhysicsWorld *world,
                                      JceBodyHandle body)
 {
     if (!world || !jce_body_valid(body)) return 0;
-    if (body.idx >= world->body_capacity || !world->body_entity) return 0;
-    return world->body_entity[body.idx];
+    uint32_t slot = jce_body_handle_slot(body);
+    if (slot >= world->body_capacity || !world->body_entity) return 0;
+    return world->body_entity[slot];
 }
 
 /* ── P3-C.5: contact listener subscription ─────────────────────────── */

@@ -9,6 +9,7 @@
  */
 
 #include "core/jce_editor_recorder.h"
+#include "core/jce_editor_alloc.h"
 
 extern "C" {
 #include <jce/renderer/jce_renderer.h>
@@ -73,10 +74,10 @@ void rec_frame(void *ud, const void *data, uint32_t size) {
     jce_mutex_unlock(g.mtx);
     if (full) return;
 
-    VidFrame *f = (VidFrame *)malloc(sizeof(VidFrame));
+    VidFrame *f = (VidFrame *)ED_MALLOC(sizeof(VidFrame));
     if (!f) return;
-    f->bgra = malloc(size);
-    if (!f->bgra) { free(f); return; }
+    f->bgra = ED_MALLOC(size);
+    if (!f->bgra) { ED_FREE(f); return; }
     memcpy(f->bgra, data, size);
     f->ts_ms = now_rel_ms();
     f->next = nullptr;
@@ -98,11 +99,11 @@ void aud_cb(void *ud, const float *pcm, uint32_t frames, uint32_t rate, uint32_t
     jce_mutex_unlock(g.mtx);
     if (full) return;
 
-    AudChunk *c = (AudChunk *)malloc(sizeof(AudChunk));
+    AudChunk *c = (AudChunk *)ED_MALLOC(sizeof(AudChunk));
     if (!c) return;
     const size_t bytes = (size_t)frames * ch * sizeof(float);
-    c->pcm = (float *)malloc(bytes);
-    if (!c->pcm) { free(c); return; }
+    c->pcm = (float *)ED_MALLOC(bytes);
+    if (!c->pcm) { ED_FREE(c); return; }
     memcpy(c->pcm, pcm, bytes);
     c->frames = frames; c->ts_ms = now_rel_ms(); c->next = nullptr;
     jce_mutex_lock(g.mtx);
@@ -112,10 +113,30 @@ void aud_cb(void *ud, const float *pcm, uint32_t frames, uint32_t rate, uint32_t
     jce_mutex_unlock(g.mtx);
 }
 
+/* Default keyframe-interval seed used only when the real capture rate cannot
+   be measured (e.g. a recording of a single frame). */
+#define REC_FALLBACK_FPS 30u
+
+/* Derive fps from the measured gap between the first two captured frames.
+   `fps` only seeds the encoder's keyframe interval, so a coarse integer
+   estimate (clamped to a sane range) is sufficient. */
+uint32_t measure_fps(uint64_t first_ts_ms, uint64_t second_ts_ms) {
+    if (second_ts_ms <= first_ts_ms) return REC_FALLBACK_FPS;
+    const uint64_t dt = second_ts_ms - first_ts_ms;
+    uint32_t fps = (uint32_t)((1000u + dt / 2u) / dt);  /* round(1000/dt) */
+    if (fps < 1u)   fps = 1u;
+    if (fps > 240u) fps = 240u;
+    return fps;
+}
+
 /* ── Worker thread — encode + mux ─────────────────────────────────── */
 void rec_worker(void *arg) {
     (void)arg;
     JceWebmEncoder *enc = nullptr;
+    /* The first captured frame is held back until a second frame arrives so we
+       can measure the real capture fps from the timestamp delta before the
+       encoder (which bakes fps into its keyframe interval) is created. */
+    VidFrame *pending = nullptr;
     for (;;) {
         jce_mutex_lock(g.mtx);
         while (g.worker_run && !g.vhead && !g.ahead)
@@ -127,16 +148,25 @@ void rec_worker(void *arg) {
         const bool run = g.worker_run;
         jce_mutex_unlock(g.mtx);
 
-        /* Video first (the first frame lazily creates the encoder). */
+        /* Video first (the first two frames lazily create the encoder once the
+           capture rate is known). */
         while (vlist) {
             VidFrame *vf = vlist; vlist = vf->next;
-            if (!enc && g.width && g.height)
-                enc = jce_webm_encoder_create(g.path, g.width, g.height, 30, 8000,
+            if (!enc && g.width && g.height) {
+                if (!pending) { pending = vf; continue; }  /* hold frame #1 */
+                /* Frame #2: measure fps, create encoder, flush both. */
+                const uint32_t fps = measure_fps(pending->ts_ms, vf->ts_ms);
+                enc = jce_webm_encoder_create(g.path, g.width, g.height, fps, 8000,
                                               g.have_audio ? 48000u : 0u,
                                               g.have_audio ? g.aud_ch : 0u);
+                if (enc && jce_webm_encoder_push_bgra(enc, pending->bgra, g.pitch,
+                                                      g.yflip, pending->ts_ms))
+                    g.vwritten++;
+                ED_FREE(pending->bgra); ED_FREE(pending); pending = nullptr;
+            }
             if (enc && jce_webm_encoder_push_bgra(enc, vf->bgra, g.pitch, g.yflip, vf->ts_ms))
                 g.vwritten++;
-            free(vf->bgra); free(vf);
+            ED_FREE(vf->bgra); ED_FREE(vf);
         }
         /* Audio (encoder now exists if any video has been seen; drop the few
            audio chunks that precede the very first video frame). */
@@ -144,7 +174,7 @@ void rec_worker(void *arg) {
             AudChunk *ac = alist; alist = ac->next;
             if (enc) jce_webm_encoder_push_audio(enc, ac->pcm, ac->frames, ac->ts_ms);
             else     g.adropped++;
-            free(ac->pcm); free(ac);
+            ED_FREE(ac->pcm); ED_FREE(ac);
         }
 
         if (!run) {
@@ -153,6 +183,19 @@ void rec_worker(void *arg) {
             jce_mutex_unlock(g.mtx);
             if (empty) break;
         }
+    }
+    /* A single-frame recording never produced a second timestamp to measure
+       from: emit the held frame at the fallback rate so it isn't lost. */
+    if (pending) {
+        if (!enc && g.width && g.height)
+            enc = jce_webm_encoder_create(g.path, g.width, g.height,
+                                          REC_FALLBACK_FPS, 8000,
+                                          g.have_audio ? 48000u : 0u,
+                                          g.have_audio ? g.aud_ch : 0u);
+        if (enc && jce_webm_encoder_push_bgra(enc, pending->bgra, g.pitch,
+                                              g.yflip, pending->ts_ms))
+            g.vwritten++;
+        ED_FREE(pending->bgra); ED_FREE(pending); pending = nullptr;
     }
     if (enc) jce_webm_encoder_finish(enc);
 }

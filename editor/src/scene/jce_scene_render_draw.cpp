@@ -13,12 +13,13 @@
 extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/physics/jce_physics_debug.h>
+#include <jce/os/core/jce_log.h>
 }
 
-#include "../core/jce_editor_state.h"
-#include "../gizmo/jce_gizmo_joint.h"
-#include "../gizmo/jce_gizmo_cloth.h"
-#include "../gizmo/jce_gizmo_compound_collider.h"
+#include "core/jce_editor_state.h"
+#include "gizmo/jce_gizmo_joint.h"
+#include "gizmo/jce_gizmo_cloth.h"
+#include "gizmo/jce_gizmo_compound_collider.h"
 
 /* ── Animation timer reset (kept for play.cpp compatibility) ─────── */
 
@@ -413,7 +414,11 @@ void draw_selection_outlines(void)
             float r = ((cc && cc->radius > 0.0f) ? cc->radius : 0.3f) * r_scale;
             float h = ((cc && cc->height > 0.0f) ? cc->height : 1.6f) * sy;
             float hh = 0.5f * fmaxf(0.0f, h - 2.0f * r);
-            jce_debug_draw_capsule(t->position, r, hh, t->rotation, col_outline);
+            /* The CharacterController entity Transform is the FEET; the capsule
+             * is centered half its height above that, so offset the draw up by
+             * (hh + r). Without this the capsule renders half-buried underground. */
+            jce_vec3 cap_c = t->position; cap_c.y += hh + r;
+            jce_debug_draw_capsule(cap_c, r, hh, t->rotation, col_outline);
             drew_shape = true;
         }
 
@@ -448,6 +453,17 @@ void draw_physics_debug(void)
     JceScene *scene = jce_state_get_scene();
     if (!scene) return;
 
+    int sel_n = 0;
+    const uint32_t *sel = jce_state_get_selection(&sel_n);
+
+    /* Range-cull the FITTED compound wireframe (Unity-style green mesh): only
+     * the nearest few props to the camera get the detailed trimesh; the rest
+     * get a cheap bounds box. Keeps it "real but not over-rendered" and bounds
+     * the per-frame line count well under the debug-draw buffer. */
+    jce_vec3 cam_pos = jce_camera_get_position(s_sr.camera);
+    const float detail_dist2 = 22.0f * 22.0f;
+    int detail_budget = 10;
+
     const uint32_t col_box     = 0xFF00FF00; /* green */
     const uint32_t col_sphere  = 0xFF00FFFF; /* cyan */
     const uint32_t col_capsule = 0xFFFFFF00; /* yellow */
@@ -457,28 +473,85 @@ void draw_physics_debug(void)
         if (id == 0 || !jce_state_entity_exists(id)) continue;
         if (!jce_state_entity_enabled(id)) continue;
 
+        /* Skip the SELECTED entity: the selection pass already outlines its
+         * collider (in orange). Drawing the green overlay on top of it fights
+         * the selection outline. Non-selected colliders still show below. */
+        bool is_selected = false;
+        for (int s = 0; s < sel_n; ++s) if (sel[s] == id) { is_selected = true; break; }
+        if (is_selected) continue;
+
         JceEntity e = (JceEntity)id;
         JceTransform *t = jce_scene_get_transform(scene, e);
         if (!t) continue;
 
-        jce_vec3 center = t->position;
         jce_quat q = t->rotation;
+        /* size/center/radius/height are interpreted in local entity space and
+         * scaled by the entity's TRS scale — matching how the physics body is
+         * built (jce_runtime.c) and the selection gizmo. Previously this drew a
+         * fixed 0.5*scale cube, so every collider looked like a unit cube. */
+        float sx = (t->scale.x != 0.0f) ? fabsf(t->scale.x) : 1.0f;
+        float sy = (t->scale.y != 0.0f) ? fabsf(t->scale.y) : 1.0f;
+        float sz = (t->scale.z != 0.0f) ? fabsf(t->scale.z) : 1.0f;
 
         if (jce_scene_has_box_collider(scene, e)) {
-            float sx = (t->scale.x > 0) ? t->scale.x : 1.0f;
-            float sy = (t->scale.y > 0) ? t->scale.y : 1.0f;
-            float sz = (t->scale.z > 0) ? t->scale.z : 1.0f;
-            jce_vec3 half = jce_v3(0.5f * sx, 0.5f * sy, 0.5f * sz);
-            jce_debug_draw_box(center, half, q, col_box);
+            JceBoxColliderComponent *bc = jce_scene_get_box_collider(scene, e);
+            jce_vec3 ofs = bc ? jce_v3(bc->center[0], bc->center[1], bc->center[2])
+                              : jce_v3(0, 0, 0);
+            float bx = bc ? bc->size[0] : 1.0f, by = bc ? bc->size[1] : 1.0f,
+                  bz = bc ? bc->size[2] : 1.0f;
+            jce_vec3 half = jce_v3(0.5f * bx * sx, 0.5f * by * sy, 0.5f * bz * sz);
+            jce_vec3 c = jce_v3_add(t->position, jce_q_rotate(q,
+                              jce_v3(ofs.x * sx, ofs.y * sy, ofs.z * sz)));
+            jce_debug_draw_box(c, half, q, col_box);
         }
         if (jce_scene_has_sphere_collider(scene, e)) {
-            float r = (t->scale.x > 0) ? t->scale.x * 0.5f : 0.5f;
-            jce_debug_draw_sphere(center, r, col_sphere);
+            JceSphereColliderComponent *sc = jce_scene_get_sphere_collider(scene, e);
+            jce_vec3 ofs = sc ? jce_v3(sc->center[0], sc->center[1], sc->center[2])
+                              : jce_v3(0, 0, 0);
+            float r = ((sc && sc->radius > 0.0f) ? sc->radius : 0.5f)
+                      * fmaxf(sx, fmaxf(sy, sz));
+            jce_vec3 c = jce_v3_add(t->position, jce_q_rotate(q,
+                              jce_v3(ofs.x * sx, ofs.y * sy, ofs.z * sz)));
+            jce_debug_draw_sphere(c, r, col_sphere);
+        }
+        if (jce_scene_has_capsule_collider(scene, e)) {
+            JceCapsuleColliderComponent *cc = jce_scene_get_capsule_collider(scene, e);
+            jce_vec3 ofs = cc ? jce_v3(cc->center[0], cc->center[1], cc->center[2])
+                              : jce_v3(0, 0, 0);
+            float r = ((cc && cc->radius > 0.0f) ? cc->radius : 0.3f) * fmaxf(sx, sz);
+            float h = ((cc && cc->height > 0.0f) ? cc->height : 1.0f) * sy;
+            float hh = 0.5f * fmaxf(0.0f, h - 2.0f * r);
+            jce_vec3 c = jce_v3_add(t->position, jce_q_rotate(q,
+                              jce_v3(ofs.x * sx, ofs.y * sy, ofs.z * sz)));
+            jce_debug_draw_capsule(c, r, hh, q, col_capsule);
         }
         if (jce_scene_has_character_controller(scene, e)) {
-            float radius = 0.3f;
-            float half_h = 0.6f;
-            jce_debug_draw_capsule(center, radius, half_h, q, col_capsule);
+            JceCharacterControllerComponent *cc =
+                jce_scene_get_character_controller(scene, e);
+            float r = ((cc && cc->radius > 0.0f) ? cc->radius : 0.3f) * fmaxf(sx, sz);
+            float h = ((cc && cc->height > 0.0f) ? cc->height : 1.6f) * sy;
+            float hh = 0.5f * fmaxf(0.0f, h - 2.0f * r);
+            jce_vec3 cc_c = t->position; cc_c.y += hh + r;  /* feet -> capsule center */
+            jce_debug_draw_capsule(cc_c, r, hh, q, col_capsule);
+            { static bool lg = false; if (!lg) { lg = true;
+                jce_log_write(JCE_LOG_LEVEL_INFO, "cc_cap", __FILE__, __LINE__,
+                    "CC capsule e=%u pos.y=%.3f cap_c.y=%.3f r=%.3f hh=%.3f",
+                    (unsigned)e, t->position.y, cc_c.y, r, hh); } }
+        }
+        /* Compound (cooked V-HACD/trimesh) colliders: draw the real fitted
+         * hulls/triangles so the overlay reflects EVERY collidable object, not
+         * just box/sphere/capsule primitives. Cook is cached per model path. */
+        if (jce_scene_has_compound_collider(scene, e)) {
+            JceCompoundColliderComponent *cpc =
+                jce_scene_get_compound_collider(scene, e);
+            if (cpc) {
+                jce_vec3 dd = jce_v3_sub(t->position, cam_pos);
+                float dist2 = dd.x * dd.x + dd.y * dd.y + dd.z * dd.z;
+                int detailed = (dist2 < detail_dist2 && detail_budget > 0) ? 1 : 0;
+                if (detailed) detail_budget--;
+                jce_gizmo_compound_collider_draw_from_component(
+                    scene, e, cpc, col_box, detailed);
+            }
         }
     }
 
@@ -583,7 +656,9 @@ void draw_compound_collider_gizmos(void)
             jce_scene_get_compound_collider(scene, e);
         if (!cc) continue;
 
-        jce_gizmo_compound_collider_draw_from_component(scene, e, cc);
+        /* Selected: fitted (detailed=1) wireframe in the selection colour
+         * (orange). Only ONE prop, so the trimesh line load is bounded. */
+        jce_gizmo_compound_collider_draw_from_component(scene, e, cc, 0xFF00BFFFu, 1);
         drew_any = true;
     }
 

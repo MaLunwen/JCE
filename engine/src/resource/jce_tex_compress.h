@@ -53,6 +53,22 @@ void jce_tex_mip_dimensions(uint32_t base_w, uint32_t base_h,
 void jce_tex_generate_mip(const uint8_t *src, uint32_t src_w, uint32_t src_h,
                           uint8_t *dst, uint32_t *dst_w, uint32_t *dst_h);
 
+/* ================================================================== */
+/* GPU block compression (implemented in jce_tex_encode.cpp via bimg)  */
+/* ================================================================== */
+
+/* Returns non-zero if jce_fmt (JCEASSET_TEXFMT_*) is a block-compressed GPU
+ * format this encoder supports (BC1/BC5/BC7/ASTC_4x4/ETC2_RGBA8). */
+int jce_tex_format_is_block(int jce_fmt);
+
+/* Bytes for one mip of (w,h) encoded to jce_fmt (block-rounded). 0 if unsupported. */
+uint32_t jce_tex_encoded_size(uint32_t w, uint32_t h, int jce_fmt);
+
+/* Encode an RGBA8 image (w*h*4 bytes) into dst (>= jce_tex_encoded_size).
+ * normal_map != 0 picks a normal-map quality preset. Returns 1 on success. */
+int jce_tex_encode(const uint8_t *rgba, uint32_t w, uint32_t h,
+                   int jce_fmt, int normal_map, void *dst, uint32_t dst_size);
+
 #ifdef __cplusplus
 }
 #endif

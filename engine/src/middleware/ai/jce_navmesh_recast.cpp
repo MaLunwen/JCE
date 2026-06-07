@@ -15,10 +15,12 @@
 
 #include <jce/middleware/ai/jce_navmesh_recast.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_filesystem.h>
 
 #include "os/core/jce_memory.h"
 
 #include <recastnavigation/Recast.h>
+#include <recastnavigation/DetourAlloc.h>
 #include <recastnavigation/DetourNavMesh.h>
 #include <recastnavigation/DetourNavMeshBuilder.h>
 #include <recastnavigation/DetourNavMeshQuery.h>
@@ -27,6 +29,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <new>
 
@@ -84,11 +87,19 @@ static void compute_aabb(const float *verts, uint32_t vcount,
     }
 }
 
-extern "C" JceRecastNavMesh *jce_recast_build(const float    *vertices,
-                                                uint32_t        vertex_count,
-                                                const uint32_t *indices,
-                                                uint32_t        triangle_count,
-                                                const JceRecastConfig *user_cfg)
+/* Run the full Recast voxelisation + Detour build pipeline on a
+ * triangle soup and return the raw, malloc'd dtNavMesh tile blob (via
+ * dtAlloc).  The caller owns the returned blob and must free it with
+ * dtFree (or hand it to dtNavMesh::init with DT_TILE_FREE_DATA).
+ * Returns nullptr on failure; on success *out_size / *out_stats are
+ * filled. */
+static unsigned char *recast_build_navdata(const float    *vertices,
+                                            uint32_t        vertex_count,
+                                            const uint32_t *indices,
+                                            uint32_t        triangle_count,
+                                            const JceRecastConfig *user_cfg,
+                                            int            *out_size,
+                                            JceRecastStats *out_stats)
 {
     if (!vertices || vertex_count < 3 || !indices || triangle_count == 0) {
         LOG_ERROR(LOG_TAG, "invalid input mesh");
@@ -268,13 +279,37 @@ extern "C" JceRecastNavMesh *jce_recast_build(const float    *vertices,
         return nullptr;
     }
 
-    JceRecastNavMesh *out = new (std::nothrow) JceRecastNavMesh();
-    if (!out) {
-        dtFree(nav_data);
-        rcFreePolyMeshDetail(dmesh);
-        rcFreePolyMesh(pmesh);
+    if (out_stats) {
+        out_stats->polygon_count         = pmesh->npolys;
+        out_stats->vertex_count          = pmesh->nverts;
+        out_stats->detail_triangle_count = dmesh->ntris;
+        auto t_end = std::chrono::steady_clock::now();
+        out_stats->build_time_ms = (int)std::chrono::duration_cast<
+            std::chrono::milliseconds>(t_end - t_start).count();
+    }
+
+    rcFreePolyMeshDetail(dmesh);
+    rcFreePolyMesh(pmesh);
+
+    if (out_size) *out_size = nav_data_size;
+    LOG_INFO(LOG_TAG, "built navmesh tile: %d polys, %d verts, %d bytes",
+                  pmesh->npolys, pmesh->nverts, nav_data_size);
+    return nav_data;
+}
+
+/* Wrap a raw dtNavMesh tile blob into a query-ready JceRecastNavMesh.
+ * Takes ownership of `nav_data` (frees it on failure); on success the
+ * dtNavMesh owns it via DT_TILE_FREE_DATA. */
+static JceRecastNavMesh *make_navmesh_from_data(unsigned char *nav_data,
+                                                int            nav_data_size)
+{
+    if (!nav_data || nav_data_size <= 0) {
+        if (nav_data) dtFree(nav_data);
         return nullptr;
     }
+
+    JceRecastNavMesh *out = new (std::nothrow) JceRecastNavMesh();
+    if (!out) { dtFree(nav_data); return nullptr; }
 
     out->nav = dtAllocNavMesh();
     if (!out->nav || dtStatusFailed(out->nav->init(nav_data, nav_data_size,
@@ -282,8 +317,6 @@ extern "C" JceRecastNavMesh *jce_recast_build(const float    *vertices,
         LOG_ERROR(LOG_TAG, "dtNavMesh::init failed");
         if (out->nav) dtFreeNavMesh(out->nav); else dtFree(nav_data);
         delete out;
-        rcFreePolyMeshDetail(dmesh);
-        rcFreePolyMesh(pmesh);
         return nullptr;
     }
 
@@ -293,29 +326,149 @@ extern "C" JceRecastNavMesh *jce_recast_build(const float    *vertices,
         if (out->query) dtFreeNavMeshQuery(out->query);
         dtFreeNavMesh(out->nav);
         delete out;
-        rcFreePolyMeshDetail(dmesh);
-        rcFreePolyMesh(pmesh);
         return nullptr;
     }
 
     out->filter.setIncludeFlags(0xffff);
     out->filter.setExcludeFlags(0);
 
-    out->stats.polygon_count         = pmesh->npolys;
-    out->stats.vertex_count          = pmesh->nverts;
-    out->stats.detail_triangle_count = dmesh->ntris;
+    /* Populate stats by summing tile headers — so a navmesh produced by
+     * jce_recast_load_file (no live build) still reports poly/vert counts. */
+    for (int i = 0; i < out->nav->getMaxTiles(); ++i) {
+        const dtMeshTile *tile = ((const dtNavMesh *)out->nav)->getTile(i);
+        if (tile && tile->header) {
+            out->stats.polygon_count         += tile->header->polyCount;
+            out->stats.vertex_count          += tile->header->vertCount;
+            out->stats.detail_triangle_count += tile->header->detailTriCount;
+        }
+    }
+    return out;
+}
 
-    rcFreePolyMeshDetail(dmesh);
-    rcFreePolyMesh(pmesh);
+extern "C" JceRecastNavMesh *jce_recast_build(const float    *vertices,
+                                                uint32_t        vertex_count,
+                                                const uint32_t *indices,
+                                                uint32_t        triangle_count,
+                                                const JceRecastConfig *user_cfg)
+{
+    JceRecastStats stats = {};
+    int nav_data_size = 0;
+    unsigned char *nav_data = recast_build_navdata(vertices, vertex_count,
+                                                   indices, triangle_count,
+                                                   user_cfg, &nav_data_size,
+                                                   &stats);
+    if (!nav_data) return nullptr;
 
-    auto t_end = std::chrono::steady_clock::now();
-    out->stats.build_time_ms = (int)std::chrono::duration_cast<
-        std::chrono::milliseconds>(t_end - t_start).count();
+    JceRecastNavMesh *out = make_navmesh_from_data(nav_data, nav_data_size);
+    if (!out) return nullptr;   /* nav_data already freed by helper */
+    out->stats = stats;
 
     LOG_INFO(LOG_TAG, "built navmesh: %d polys, %d verts, %d ms",
                   out->stats.polygon_count, out->stats.vertex_count,
                   out->stats.build_time_ms);
     return out;
+}
+
+/* On-disk format: 16-byte header + raw dtNavMesh tile blob.
+ *   u32 magic ('JNAV') | u32 version (1) | u32 tile_size | u32 reserved */
+#define JCE_RECAST_FILE_MAGIC   0x56414E4Au   /* 'J' 'N' 'A' 'V' (LE) */
+#define JCE_RECAST_FILE_VERSION 1u
+
+extern "C" bool jce_recast_build_to_file(const char     *path,
+                                          const float    *vertices,
+                                          uint32_t        vertex_count,
+                                          const uint32_t *indices,
+                                          uint32_t        triangle_count,
+                                          const JceRecastConfig *cfg,
+                                          JceRecastStats *out_stats)
+{
+    if (!path || !path[0]) {
+        LOG_ERROR(LOG_TAG, "build_to_file: empty path");
+        return false;
+    }
+
+    JceRecastStats stats = {};
+    int nav_data_size = 0;
+    unsigned char *nav_data = recast_build_navdata(vertices, vertex_count,
+                                                   indices, triangle_count,
+                                                   cfg, &nav_data_size, &stats);
+    if (!nav_data) return false;
+
+    uint32_t header[4] = {
+        JCE_RECAST_FILE_MAGIC, JCE_RECAST_FILE_VERSION,
+        (uint32_t)nav_data_size, 0u
+    };
+    /* Serialise header + nav blob into one buffer and write it through the
+       engine host-FS wrapper (portable, creates parent dirs) instead of raw
+       stdio, so navmesh I/O works on every platform backend. */
+    const size_t total = sizeof(header) + (size_t)nav_data_size;
+    unsigned char *blob = (unsigned char *)JCE_MALLOC(total);
+    if (!blob) {
+        LOG_ERROR(LOG_TAG, "build_to_file: OOM (%zu bytes) for '%s'", total, path);
+        dtFree(nav_data);
+        return false;
+    }
+    std::memcpy(blob, header, sizeof(header));
+    std::memcpy(blob + sizeof(header), nav_data, (size_t)nav_data_size);
+    dtFree(nav_data);
+
+    bool ok = jce_fs_host_write_all(path, blob, (uint64_t)total);
+    JCE_FREE(blob);
+
+    if (!ok) {
+        LOG_ERROR(LOG_TAG, "build_to_file: write failed '%s'", path);
+        return false;
+    }
+    if (out_stats) *out_stats = stats;
+    LOG_INFO(LOG_TAG, "wrote navmesh '%s' (%d bytes, %d polys)",
+                  path, nav_data_size, stats.polygon_count);
+    return true;
+}
+
+extern "C" JceRecastNavMesh *jce_recast_load_file(const char *path)
+{
+    if (!path || !path[0]) return nullptr;
+    /* Read the whole file through the engine host-FS wrapper (portable) and
+       parse the header in memory, replacing raw stdio. */
+    uint64_t file_size = 0;
+    unsigned char *blob =
+        (unsigned char *)jce_fs_host_read_all(path, &file_size);
+    if (!blob) {
+        LOG_WARN(LOG_TAG, "load_file: cannot read '%s'", path);
+        return nullptr;
+    }
+    uint32_t header[4] = { 0, 0, 0, 0 };
+    if (file_size < sizeof(header)) {
+        LOG_WARN(LOG_TAG, "load_file: bad header '%s'", path);
+        jce_fs_buffer_free(blob);
+        return nullptr;
+    }
+    std::memcpy(header, blob, sizeof(header));
+    if (header[0] != JCE_RECAST_FILE_MAGIC ||
+        header[1] != JCE_RECAST_FILE_VERSION ||
+        header[2] == 0) {
+        LOG_WARN(LOG_TAG, "load_file: bad header '%s'", path);
+        jce_fs_buffer_free(blob);
+        return nullptr;
+    }
+    int tile_size = (int)header[2];
+    if (file_size < sizeof(header) + (uint64_t)tile_size) {
+        LOG_WARN(LOG_TAG, "load_file: truncated '%s'", path);
+        jce_fs_buffer_free(blob);
+        return nullptr;
+    }
+    /* dtNavMesh::init takes ownership of a dtAlloc'd blob (DT_TILE_FREE_DATA). */
+    unsigned char *nav_data =
+        (unsigned char *)dtAlloc((size_t)tile_size, DT_ALLOC_PERM);
+    if (!nav_data) { jce_fs_buffer_free(blob); return nullptr; }
+    std::memcpy(nav_data, blob + sizeof(header), (size_t)tile_size);
+    jce_fs_buffer_free(blob);
+
+    JceRecastNavMesh *nm = make_navmesh_from_data(nav_data, tile_size);
+    if (nm) {
+        LOG_INFO(LOG_TAG, "loaded navmesh '%s' (%d bytes)", path, tile_size);
+    }
+    return nm;
 }
 
 extern "C" void jce_recast_destroy(JceRecastNavMesh *nm)

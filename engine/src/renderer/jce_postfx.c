@@ -8,6 +8,7 @@
 
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
+#include <jce/os/core/jce_timer.h>
 #include <jce/renderer/jce_postfx.h>
 #include <jce/renderer/jce_shaders.h>
 #include <jce/renderer/jce_views.h>
@@ -59,6 +60,18 @@ struct JcePostFXPipeline {
     bgfx_uniform_handle_t u_chromaticParams;
     bgfx_uniform_handle_t u_compositeFlags;   /* x=bloom y=tonemap z=chromatic w=vignette */
     bgfx_uniform_handle_t u_compositeFlags2;  /* x=grayscale */
+    bgfx_uniform_handle_t u_texDepth;         /* scene depth sampler (stage 1, custom pass) */
+    bgfx_uniform_handle_t u_postfxTime;       /* (elapsed_s, has_depth, 0, 0) — custom pass */
+    bgfx_uniform_handle_t u_postfxParams;     /* generic vec4[JCE_POSTFX_CUSTOM_PARAMS] */
+
+    /* Custom (client) pass — data-driven; the engine is style-agnostic. */
+    const JcePakArchive  *shader_pak;         /* retained from load_shaders for lazy custom load */
+    bgfx_program_handle_t prog_custom;        /* lazily (re)loaded when custom_name changes */
+    char  custom_name[64];                    /* requested custom fs base name ("" = none) */
+    char  custom_loaded[64];                  /* name currently compiled into prog_custom */
+    bool  custom_needs_depth;
+    int   custom_param_count;
+    float custom_params[JCE_POSTFX_CUSTOM_PARAMS * 4];
 
     /* Full-screen quad vertex buffer. */
     bgfx_vertex_buffer_handle_t quad_vb;
@@ -117,26 +130,51 @@ static const uint16_t s_quad_indices[6] = { 0, 2, 1, 1, 2, 3 };
 
 /* ── FBO helpers ───────────────────────────────────────────────────── */
 
+/* Allocate one full-res RGBA16F intermediate FBO (color texture + framebuffer).
+ * destroyTextures=true so destroying the FB also frees the attached texture —
+ * otherwise destroy_fbos() leaks handles, which during ImGui drag-resize
+ * exhausts bgfx's texture pool and yields recycled-handle AVs in the driver. */
+static void alloc_one_fbo(JcePostFXPipeline *p, int i)
+{
+    p->fbo_tex[i] = bgfx_create_texture_2d(
+        (uint16_t)p->width, (uint16_t)p->height, false, 1,
+        BGFX_TEXTURE_FORMAT_RGBA16F,
+        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
+        NULL);
+    bgfx_attachment_t at;
+    memset(&at, 0, sizeof(at));
+    bgfx_attachment_init(&at, p->fbo_tex[i], BGFX_ACCESS_WRITE, 0, 1, 0, BGFX_RESOLVE_NONE);
+    p->fbo[i] = bgfx_create_frame_buffer_from_attachment(1, &at, true);
+}
+
 static void create_fbos(JcePostFXPipeline *p)
 {
     if (p->fbos_valid) return;
-    for (int i = 0; i < POSTFX_MAX_FBOS; i++) {
-        p->fbo_tex[i] = bgfx_create_texture_2d(
-            (uint16_t)p->width, (uint16_t)p->height, false, 1,
-            BGFX_TEXTURE_FORMAT_RGBA16F,
-            BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
-            NULL);
-        bgfx_attachment_t at;
-        memset(&at, 0, sizeof(at));
-        bgfx_attachment_init(&at, p->fbo_tex[i], BGFX_ACCESS_WRITE, 0, 1, 0, BGFX_RESOLVE_NONE);
-        /* destroyTextures=true so destroying the FBO also frees the
-         * attached color texture. Otherwise destroy_fbos() leaks the
-         * texture handles, which during ImGui drag-resize quickly
-         * exhausts bgfx's texture pool and yields recycled-handle AVs
-         * deep inside the GPU driver. */
-        p->fbo[i] = bgfx_create_frame_buffer_from_attachment(1, &at, true);
-    }
+    /* Standard "allocate only what the enabled chain needs": create just the
+     * first composite target (FBO 0) up front.  The second ping-pong target
+     * (FBO 1) is allocated lazily by ensure_composite_fbo() only when the chain
+     * has a 2nd full-screen pass (FXAA / custom); the bloom buffers (2/3)
+     * lazily by ensure_bloom_fbos().  So a single-pass chain (tonemap-only — the
+     * LOW-tier case) uses ONE full-res RGBA16F target instead of four
+     * (~48MB saved at 1080p). */
+    alloc_one_fbo(p, 0);
     p->fbos_valid = true;
+}
+
+/* Lazily allocate a composite ping-pong target (FBO 0 or 1); no-op if present. */
+static void ensure_composite_fbo(JcePostFXPipeline *p, int i)
+{
+    if (p->fbo[i].idx != UINT16_MAX) return;
+    alloc_one_fbo(p, i);
+}
+
+/* Lazily allocate the bloom downsample/blur buffers (FBO 2/3); no-op once
+ * present.  Freed together with the composite pair in destroy_fbos(). */
+static void ensure_bloom_fbos(JcePostFXPipeline *p)
+{
+    if (p->fbo[2].idx != UINT16_MAX) return;
+    alloc_one_fbo(p, 2);
+    alloc_one_fbo(p, 3);
 }
 
 static void destroy_fbos(JcePostFXPipeline *p)
@@ -196,6 +234,12 @@ JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
     p->prog_chromatic.idx     = UINT16_MAX;
     p->prog_grayscale.idx     = UINT16_MAX;
     p->prog_composite.idx     = UINT16_MAX;
+    p->prog_custom.idx        = UINT16_MAX;
+    p->shader_pak             = NULL;
+    p->custom_name[0]         = '\0';
+    p->custom_loaded[0]       = '\0';
+    p->custom_needs_depth     = false;
+    p->custom_param_count     = 0;
     reset_output_state(p);
     p->view_base = JCE_VIEW_POST_BASE;
 
@@ -225,6 +269,10 @@ JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
     p->u_chromaticParams= bgfx_create_uniform("u_chromaticParams",BGFX_UNIFORM_TYPE_VEC4, 1);
     p->u_compositeFlags = bgfx_create_uniform("u_compositeFlags", BGFX_UNIFORM_TYPE_VEC4, 1);
     p->u_compositeFlags2= bgfx_create_uniform("u_compositeFlags2",BGFX_UNIFORM_TYPE_VEC4, 1);
+    p->u_texDepth       = bgfx_create_uniform("s_texDepth",       BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    p->u_postfxTime     = bgfx_create_uniform("u_postfxTime",     BGFX_UNIFORM_TYPE_VEC4, 1);
+    p->u_postfxParams   = bgfx_create_uniform("u_postfxParams",   BGFX_UNIFORM_TYPE_VEC4,
+                                              JCE_POSTFX_CUSTOM_PARAMS);
 
     LOG_SUCCESS(LOG_TAG, "post-fx pipeline created (%ux%u)", width, height);
     return p;
@@ -253,6 +301,9 @@ void jce_postfx_destroy(JcePostFXPipeline *pipeline)
     bgfx_destroy_uniform(pipeline->u_chromaticParams);
     bgfx_destroy_uniform(pipeline->u_compositeFlags);
     bgfx_destroy_uniform(pipeline->u_compositeFlags2);
+    bgfx_destroy_uniform(pipeline->u_texDepth);
+    bgfx_destroy_uniform(pipeline->u_postfxTime);
+    bgfx_destroy_uniform(pipeline->u_postfxParams);
 
     /* Destroy shader programs. */
     if (pipeline->prog_tonemap.idx       != UINT16_MAX) bgfx_destroy_program(pipeline->prog_tonemap);
@@ -264,6 +315,7 @@ void jce_postfx_destroy(JcePostFXPipeline *pipeline)
     if (pipeline->prog_chromatic.idx     != UINT16_MAX) bgfx_destroy_program(pipeline->prog_chromatic);
     if (pipeline->prog_grayscale.idx     != UINT16_MAX) bgfx_destroy_program(pipeline->prog_grayscale);
     if (pipeline->prog_composite.idx     != UINT16_MAX) bgfx_destroy_program(pipeline->prog_composite);
+    if (pipeline->prog_custom.idx        != UINT16_MAX) bgfx_destroy_program(pipeline->prog_custom);
 
     jce_allocator_t a = pipeline->alloc;
     a.free(pipeline, a.ctx);
@@ -316,6 +368,61 @@ void jce_postfx_get_params(const JcePostFXPipeline *pipeline,
     *out = pipeline->params;
 }
 
+/* ── Custom (client) pass ──────────────────────────────────────────── */
+
+void jce_postfx_set_custom_shader(JcePostFXPipeline *pipeline,
+                                  const char *fs_name, bool needs_depth)
+{
+    if (!pipeline) return;
+    pipeline->custom_needs_depth = needs_depth;
+    size_t i = 0;
+    if (fs_name) {
+        for (; fs_name[i] && i + 1 < sizeof(pipeline->custom_name); i++)
+            pipeline->custom_name[i] = fs_name[i];
+    }
+    pipeline->custom_name[i] = '\0';
+}
+
+void jce_postfx_set_custom_params(JcePostFXPipeline *pipeline,
+                                  const float *vec4s, int count)
+{
+    if (!pipeline) return;
+    if (count < 0) count = 0;
+    if (count > JCE_POSTFX_CUSTOM_PARAMS) count = JCE_POSTFX_CUSTOM_PARAMS;
+    pipeline->custom_param_count = count;
+    if (vec4s && count > 0)
+        memcpy(pipeline->custom_params, vec4s,
+               (size_t)count * 4u * sizeof(float));
+}
+
+void jce_postfx_get_custom_shader(const JcePostFXPipeline *pipeline,
+                                  char *out_name, int out_size,
+                                  bool *out_needs_depth)
+{
+    if (out_needs_depth)
+        *out_needs_depth = pipeline ? pipeline->custom_needs_depth : false;
+    if (out_name && out_size > 0) {
+        int i = 0;
+        if (pipeline) {
+            for (; pipeline->custom_name[i] && i + 1 < out_size; i++)
+                out_name[i] = pipeline->custom_name[i];
+        }
+        out_name[i] = '\0';
+    }
+}
+
+int jce_postfx_get_custom_params(const JcePostFXPipeline *pipeline,
+                                 float *out_vec4s, int max_count)
+{
+    if (!pipeline) return 0;
+    int count = pipeline->custom_param_count;
+    if (max_count < count) count = max_count;
+    if (out_vec4s && count > 0)
+        memcpy(out_vec4s, pipeline->custom_params,
+               (size_t)count * 4u * sizeof(float));
+    return count;
+}
+
 /* ── Load shaders ──────────────────────────────────────────────────── */
 
 /* Helper: load a postfx program (vs_postfx + fs_<effect>) and log on failure. */
@@ -342,6 +449,10 @@ bool jce_postfx_load_shaders(JcePostFXPipeline *pipeline,
         LOG_ERROR(LOG_TAG, "cannot load post-fx shaders: NULL PAK");
         return false;
     }
+
+    /* Retain the PAK so the custom pass can lazily resolve a client-named
+     * shader at apply() time. The shader PAK lives for the app's lifetime. */
+    pipeline->shader_pak = pak;
 
     pipeline->prog_tonemap       = load_postfx_prog(pak, "tonemap");
     pipeline->prog_bloom_extract = load_postfx_prog(pak, "bloom_extract");
@@ -388,7 +499,6 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
     reset_output_state(pipeline);
 
     if (!pipeline->shaders_loaded) return;
-    (void)scene_depth;
 
     if (!jce_gfx_texture_valid(scene_color)) {
         LOG_WARN(LOG_TAG, "post-fx skipped: invalid scene color texture");
@@ -402,10 +512,15 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
     }
     if (active == 0) return;
 
-    /* Ensure FBOs are created. */
+    /* Ensure FBOs are created.  Composite ping-pong pair (0/1) always; the
+       bloom buffers (2/3) only when bloom is enabled this frame — standard
+       "allocate only what the enabled chain needs" (saves ~33MB at 1080p on
+       the bloom-off LOW/MEDIUM-tier path). */
     if (!pipeline->fbos_valid)
         create_fbos(pipeline);
     if (!pipeline->fbos_valid) return;
+    if (pipeline->enabled[JCE_POSTFX_BLOOM])
+        ensure_bloom_fbos(pipeline);
 
     JCE_PROFILE_ZONE_N("PostFX::Apply");
 
@@ -514,6 +629,7 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
             bgfx_set_uniform(pipeline->u_chromaticParams, chrom_p, 1);
             bgfx_set_uniform(pipeline->u_vignetteParams,  vig_p, 1);
 
+            ensure_composite_fbo(pipeline, ping);
             POSTFX_SETUP_VIEW(view_id, pipeline->fbo[ping]);
             bgfx_set_view_name(view_id, "PostFX/Composite", INT32_MAX);
             bgfx_set_texture(0, pipeline->u_texColor, current_tex, UINT32_MAX);
@@ -541,6 +657,7 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
         };
         bgfx_set_uniform(pipeline->u_fxaaParams, fxaa_p, 1);
 
+        ensure_composite_fbo(pipeline, ping);
         POSTFX_SETUP_VIEW(view_id, pipeline->fbo[ping]);
         bgfx_set_view_name(view_id, "PostFX/FXAA", INT32_MAX);
         bgfx_set_texture(0, pipeline->u_texColor, current_tex, UINT32_MAX);
@@ -549,6 +666,59 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
         current_fb_index = ping;
         ping = 1 - ping;
         view_id++;
+    }
+
+    /* ── 4. Custom client pass (data-driven, runs last) ───────────────
+     * The engine is style-agnostic: it lazily loads the client-named shader,
+     * binds the generic contract (colour + optional depth + texel + time +
+     * param array) and submits one full-screen pass. */
+    if (pipeline->enabled[JCE_POSTFX_CUSTOM] && pipeline->custom_name[0] != '\0') {
+        /* (Re)load lazily when the requested shader name changes. */
+        if (strcmp(pipeline->custom_loaded, pipeline->custom_name) != 0) {
+            if (pipeline->prog_custom.idx != UINT16_MAX) {
+                bgfx_destroy_program(pipeline->prog_custom);
+                pipeline->prog_custom.idx = UINT16_MAX;
+            }
+            if (pipeline->shader_pak)
+                pipeline->prog_custom =
+                    load_postfx_prog(pipeline->shader_pak, pipeline->custom_name);
+            /* Remember the attempt (even on failure) so we don't retry every frame. */
+            size_t ci = 0;
+            for (; pipeline->custom_name[ci] &&
+                   ci + 1 < sizeof(pipeline->custom_loaded); ci++)
+                pipeline->custom_loaded[ci] = pipeline->custom_name[ci];
+            pipeline->custom_loaded[ci] = '\0';
+            LOG_INFO(LOG_TAG, "custom pass shader '%s' %s", pipeline->custom_name,
+                     (pipeline->prog_custom.idx != UINT16_MAX) ? "loaded" : "NOT FOUND");
+        }
+
+        if (pipeline->prog_custom.idx != UINT16_MAX) {
+            const bool has_depth =
+                pipeline->custom_needs_depth && jce_gfx_texture_valid(scene_depth);
+
+            float elapsed_s =
+                (float)((double)(jce_time_ticks_ms() % 100000000ull) * 0.001);
+            float tparams[4] = { elapsed_s, has_depth ? 1.0f : 0.0f, 0.0f, 0.0f };
+            bgfx_set_uniform(pipeline->u_postfxTime, tparams, 1);
+            bgfx_set_uniform(pipeline->u_postfxParams, pipeline->custom_params,
+                             JCE_POSTFX_CUSTOM_PARAMS);
+
+            ensure_composite_fbo(pipeline, ping);
+            POSTFX_SETUP_VIEW(view_id, pipeline->fbo[ping]);
+            bgfx_set_view_name(view_id, "PostFX/Custom", INT32_MAX);
+            bgfx_set_texture(0, pipeline->u_texColor, current_tex, UINT32_MAX);
+            /* Stage 1: real depth when requested+valid, else a harmless dummy
+             * (the shader gates on u_postfxTime.y so it won't sample it). */
+            bgfx_texture_handle_t depth_tex = {
+                has_depth ? scene_depth.idx : current_tex.idx
+            };
+            bgfx_set_texture(1, pipeline->u_texDepth, depth_tex, UINT32_MAX);
+            draw_fullscreen(pipeline, view_id, pipeline->prog_custom);
+            current_tex = pipeline->fbo_tex[ping];
+            current_fb_index = ping;
+            ping = 1 - ping;
+            view_id++;
+        }
     }
 
     #undef POSTFX_SETUP_VIEW

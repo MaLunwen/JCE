@@ -78,6 +78,12 @@ struct JceStreamingSystem {
     JceStreamingConfig config;
     ChunkRecord        chunks[MAX_CHUNKS];
     uint32_t           chunk_count;
+    /* Slot indices of currently-registered chunks. Kept in sync with the
+       chunks[].registered flags at (un)register so the per-frame update loop
+       iterates only live chunks, not the whole high-water-mark array (which
+       accumulates dead slots as chunks stream out over a session). */
+    uint32_t           active_idx[MAX_CHUNKS];
+    uint32_t           active_count;
     uint64_t           memory_used;
 
     /* LRU / budget bookkeeping. */
@@ -453,6 +459,7 @@ void jce_streaming_register_chunk(JceStreamingSystem *sys,
     ChunkRecord *c = &sys->chunks[sys->chunk_count++];
     memset(c, 0, sizeof(*c));
     c->registered = true;
+    sys->active_idx[sys->active_count++] = (uint32_t)(c - sys->chunks);
     c->chunk_id   = chunk->chunk_id;
     c->center     = chunk->center;
     c->radius     = chunk->radius;
@@ -496,6 +503,15 @@ void jce_streaming_unregister_chunk(JceStreamingSystem *sys,
     JCE_FREE(c->loaded_data);
     c->loaded_data = NULL;
     c->registered = false;
+
+    /* Remove this slot from the active list (swap-remove; order is irrelevant). */
+    uint32_t slot = (uint32_t)(c - sys->chunks);
+    for (uint32_t k = 0; k < sys->active_count; k++) {
+        if (sys->active_idx[k] == slot) {
+            sys->active_idx[k] = sys->active_idx[--sys->active_count];
+            break;
+        }
+    }
 }
 
 /* ── Per-frame update ─────────────────────────────────────────────── */
@@ -515,9 +531,9 @@ void jce_streaming_update(JceStreamingSystem *sys, jce_vec3 camera_pos)
     uint32_t loads_this_frame   = 0;
     uint32_t pending_count      = 0;
 
-    for (uint32_t i = 0; i < sys->chunk_count; i++) {
-        ChunkRecord *c = &sys->chunks[i];
-        if (!c->registered) continue;
+    for (uint32_t k = 0; k < sys->active_count; k++) {
+        ChunkRecord *c = &sys->chunks[sys->active_idx[k]];
+        if (!c->registered) continue;   /* defensive; active list should be live-only */
 
         float d2 = dist_sq(camera_pos, c->center);
 

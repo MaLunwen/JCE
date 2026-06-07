@@ -10,15 +10,52 @@
 
 extern "C" {
 #include <jce/os/core/jce_alloc.h>
+#include <jce/os/core/jce_log.h>
 }
 
 #include <btBulletDynamicsCommon.h>
+#include <BulletCollision/CollisionShapes/btShapeHull.h>
 #include <BulletCollision/CollisionDispatch/btGhostObject.h>
 #include <BulletDynamics/Character/btKinematicCharacterController.h>
 #include <BulletDynamics/Vehicle/btRaycastVehicle.h>
 
+/* --- Opt-in multithreaded solver path (default OFF) -----------------
+ *
+ * Define JCE_PHYSICS_MT to compile in the parallel Bullet pipeline
+ * (btDiscreteDynamicsWorldMt + btCollisionDispatcherMt +
+ * btConstraintSolverPoolMt driven by Bullet's built-in task scheduler).
+ *
+ * This ALSO requires Bullet to be built thread-safe
+ * (bt2_thread_locks=True in conanfile.py, which defines BT_THREADSAFE in
+ * the Bullet headers/lib).  Without that, the "Mt" classes link but their
+ * internal mutexes are no-ops and parallel stepping is unsafe — so we
+ * additionally gate the *real* MT pipeline on BT_THREADSAFE and otherwise
+ * keep the single-threaded world even when JCE_PHYSICS_MT is set.
+ *
+ * The MT path is intentionally left OFF by default: its island /
+ * constraint ordering is non-deterministic and conflicts with the
+ * fixed-timestep determinism the rest of the engine relies on. */
+#if defined(JCE_PHYSICS_MT)
+#  include <BulletCollision/CollisionDispatch/btCollisionDispatcherMt.h>
+#  include <BulletDynamics/Dynamics/btDiscreteDynamicsWorldMt.h>
+#  include <BulletDynamics/ConstraintSolver/btSequentialImpulseConstraintSolverMt.h>
+#  include <LinearMath/btThreads.h>
+#  if BT_THREADSAFE
+#    define JCE_PHYSICS_MT_ACTIVE 1
+#  else
+#    define JCE_PHYSICS_MT_ACTIVE 0
+#  endif
+#else
+#  define JCE_PHYSICS_MT_ACTIVE 0
+#endif
+
 #include <cstdint>
 #include <cstring>
+
+/* Max vertices kept for a plain CONVEX_HULL child.  Beyond this the hull
+   is reduced via btShapeHull so an un-decimated mesh cannot bloat the
+   dynamic solver. */
+#define JCE_HULL_MAX_VERTS 64u
 
 /* ================================================================== */
 /* Allocator integration                                               */
@@ -101,16 +138,62 @@ static inline jce_quat from_bt_q(const btQuaternion &q)
 }
 
 /* ================================================================== */
+/* Generation-packed handles (D-gen-handles → full handles)            */
+/*                                                                    */
+/* A handle is a uint32_t partitioned as [ gen | slot ] using the     */
+/* same field widths as JceBodyHandle (see jce_physics_types.h):       */
+/* low JCE_BODY_HANDLE_INDEX_BITS = pool slot, high bits = generation. */
+/* The public create funcs hand back encode(slot, generations[slot]);  */
+/* every accessor below treats its incoming uint32_t as a packed       */
+/* handle, splits out the slot, and rejects it unless the slot is in   */
+/* range, alive, and still on the handle's generation.  A bare slot    */
+/* index (gen 0) decodes to itself and matches a never-recycled slot,  */
+/* so pre-existing handles keep working.                               */
+/* ================================================================== */
+
+static inline uint32_t handle_encode(uint32_t slot, uint32_t gen)
+{
+    return jce_body_handle_pack(slot, gen).idx;
+}
+
+static inline uint32_t handle_slot(uint32_t handle)
+{
+    JceBodyHandle h; h.idx = handle;
+    return jce_body_handle_slot(h);
+}
+
+static inline uint32_t handle_gen(uint32_t handle)
+{
+    JceBodyHandle h; h.idx = handle;
+    return jce_body_handle_gen(h);
+}
+
+/* resolve_body() needs JceBulletWorld's layout — defined just after the
+   struct below. */
+static inline uint32_t resolve_body(JceBulletWorld *bw, uint32_t handle);
+
+/* ================================================================== */
 /* World definition                                                    */
 /* ================================================================== */
 
 struct JceBulletWorld {
-    /* Bullet pipeline objects (owned, deleted in reverse order). */
+    /* Bullet pipeline objects (owned, deleted in reverse order).
+     *
+     * Field static types are the common base classes so the same slots can
+     * hold either the single-threaded objects or, when JCE_PHYSICS_MT is
+     * compiled in and requested, their "Mt" subclasses:
+     *   dispatcher : btCollisionDispatcher  | btCollisionDispatcherMt
+     *   solver     : btSequentialImpulseConstraintSolver | btConstraintSolverPoolMt
+     *   world      : btDiscreteDynamicsWorld | btDiscreteDynamicsWorldMt
+     * All three subclasses derive from the base type stored here, and every
+     * method we call (stepSimulation, etc.) is virtual, so the rest of the
+     * back-end is identical regardless of the path taken at create time. */
     btDefaultCollisionConfiguration  *config;
     btCollisionDispatcher            *dispatcher;
     btDbvtBroadphase                 *broadphase;
-    btSequentialImpulseConstraintSolver *solver;
+    btConstraintSolver               *solver;
     btDiscreteDynamicsWorld          *world;
+    bool                              multithreaded;  /* true only on the MT path */
 
     /* Body / shape pool (parallel arrays). */
     btRigidBody      **bodies;
@@ -122,6 +205,10 @@ struct JceBulletWorld {
        btBvhTriangleMeshShape children (must outlive the shape). */
     btAlignedObjectArray<btCollisionShape *>        **owned_shapes;
     btAlignedObjectArray<btStridingMeshInterface *> **owned_meshes;
+    /* Per-slot generation counter (D-gen-handles).  Bumped on destroy so
+       a handle minted from an older generation can be detected as stale.
+       Starts at 0, so a bare slot index (gen 0) handle remains valid. */
+    uint32_t           *generations;
     uint32_t            capacity;
     uint32_t            count;
     uint32_t            alloc_cursor;  /* rotating free-slot search hint → mass-spawn is O(1) amortized, not O(n^2) */
@@ -131,14 +218,23 @@ struct JceBulletWorld {
     bool               *con_alive;
     uint32_t            con_capacity;
     uint32_t            con_count;
+    uint32_t            con_alloc_cursor;
 
-    /* Character controller pool. */
-    btKinematicCharacterController **characters;
-    btPairCachingGhostObject       **ghosts;
+    /* Character controller pool. Now a DYNAMIC rigid-body capsule (char_bodies)
+     * with locked rotation, velocity-driven horizontally — the solver resolves
+     * character↔crate↔crate↔floor together, so standing on (stacked) dynamic
+     * bodies is stable with no jitter. The legacy kinematic controller/ghost
+     * arrays are retired (kept NULL) so the rest of the pool bookkeeping and
+     * any stale references stay valid. */
+    btKinematicCharacterController **characters;   /* unused (legacy, NULL) */
+    btPairCachingGhostObject       **ghosts;       /* unused (legacy, NULL) */
+    btRigidBody                    **char_bodies;  /* the dynamic capsule */
+    float                           *char_jump;    /* per-character jump speed */
     btConvexShape                  **char_shapes;
     bool                            *char_alive;
     uint32_t                         char_capacity;
     uint32_t                         char_count;
+    uint32_t                         char_alloc_cursor;
 
     /* Vehicle controller pool (parallel arrays).  Each slot owns a
      * chassis btRigidBody, the box collision shape, the raycaster,
@@ -155,13 +251,32 @@ struct JceBulletWorld {
     float                          *vehicle_max_steer;
     uint32_t                        vehicle_capacity;
     uint32_t                        vehicle_count;
+    uint32_t                        vehicle_alloc_cursor;
 
     /* Contact callbacks forwarded to the C layer. */
     jce_bullet_contact_fn contact_begin_fn;
     void                 *contact_begin_ud;
     jce_bullet_contact_fn contact_end_fn;
     void                 *contact_end_ud;
+
+    /* Per-body sleeping thresholds applied at create time.  <= 0 means
+       "leave Bullet's per-body default" (linear 0.8, angular 1.0). */
+    float linear_sleep_threshold;
+    float angular_sleep_threshold;
 };
+
+/* Resolve a packed handle to a live pool slot, or UINT32_MAX if the
+   handle is stale / out of range / dead.  Centralises the slot+gen
+   validation every body accessor needs. */
+static inline uint32_t resolve_body(JceBulletWorld *bw, uint32_t handle)
+{
+    if (!bw) return UINT32_MAX;
+    uint32_t slot = handle_slot(handle);
+    if (slot >= bw->capacity || !bw->alive[slot]) return UINT32_MAX;
+    uint32_t cur = bw->generations ? bw->generations[slot] : 0u;
+    if (cur != handle_gen(handle)) return UINT32_MAX;
+    return slot;
+}
 
 /* ================================================================== */
 /* Post-tick contact dispatch                                          */
@@ -213,7 +328,29 @@ static void post_tick_callback(btDynamicsWorld *dyn_world, btScalar /*ts*/)
 /* Create / Destroy                                                    */
 /* ================================================================== */
 
-JceBulletWorld *jce_bullet_create(jce_vec3 gravity, uint32_t max_bodies)
+#if JCE_PHYSICS_MT_ACTIVE
+/* Install Bullet's built-in (Win32/pthreads) task scheduler exactly once
+   per process.  btSetTaskScheduler() is global and must be called before
+   any "Mt" class is used.  No enkiTS dependency: btCreateDefaultTaskScheduler
+   ships inside Bullet itself. */
+static void install_bullet_task_scheduler_once()
+{
+    static bool installed = false;
+    if (installed) return;
+    if (btGetTaskScheduler() == nullptr) {
+        btITaskScheduler *ts = btCreateDefaultTaskScheduler();
+        if (ts) btSetTaskScheduler(ts);
+    }
+    installed = true;
+}
+#endif /* JCE_PHYSICS_MT_ACTIVE */
+
+JceBulletWorld *jce_bullet_create(jce_vec3 gravity, uint32_t max_bodies,
+                                  int solver_iterations, int split_impulse,
+                                  float deactivation_time,
+                                  float linear_sleep_threshold,
+                                  float angular_sleep_threshold,
+                                  bool multithreaded)
 {
     install_bullet_allocator_once();
 
@@ -222,13 +359,67 @@ JceBulletWorld *jce_bullet_create(jce_vec3 gravity, uint32_t max_bodies)
     if (!bw) return nullptr;
 
     bw->config     = new btDefaultCollisionConfiguration();
-    bw->dispatcher = new btCollisionDispatcher(bw->config);
     bw->broadphase = new btDbvtBroadphase();
-    bw->solver     = new btSequentialImpulseConstraintSolver();
-    bw->world      = new btDiscreteDynamicsWorld(
-        bw->dispatcher, bw->broadphase, bw->solver, bw->config);
+
+#if JCE_PHYSICS_MT_ACTIVE
+    if (multithreaded) {
+        /* --- Parallel pipeline (opt-in, compiled in + thread-safe Bullet).
+           The dispatcher, the solver-pool, and the world are all "Mt"
+           subclasses; they slot into the same base-typed fields and the
+           rest of the back-end is unchanged. */
+        install_bullet_task_scheduler_once();
+        int num_solvers = btGetTaskScheduler()
+                              ? btGetTaskScheduler()->getNumThreads()
+                              : 1;
+        if (num_solvers < 1) num_solvers = 1;
+
+        auto *dispatcher_mt = new btCollisionDispatcherMt(bw->config);
+        auto *solver_pool   = new btConstraintSolverPoolMt(num_solvers);
+        /* Optional single MT solver for very large islands; pass NULL to
+           keep memory/complexity down (the pool handles per-island work). */
+        bw->dispatcher = dispatcher_mt;
+        bw->solver     = solver_pool;
+        bw->world      = new btDiscreteDynamicsWorldMt(
+            dispatcher_mt, bw->broadphase, solver_pool,
+            /*constraintSolverMt=*/nullptr, bw->config);
+        bw->multithreaded = true;
+        LOG_INFO("physics", "Bullet multithreaded solver active (%d worker solvers)",
+                 num_solvers);
+    } else
+#else
+    if (multithreaded) {
+        /* MT requested but not compiled / Bullet not thread-safe: fall back
+           to the single-threaded world (no behavioral change, just a note). */
+        LOG_WARN("physics",
+                 "multithreaded physics requested but JCE_PHYSICS_MT/BT_THREADSAFE "
+                 "not compiled in; using single-threaded solver");
+    }
+#endif /* JCE_PHYSICS_MT_ACTIVE */
+    {
+        /* --- Single-threaded pipeline (default, unchanged) --- */
+        bw->dispatcher = new btCollisionDispatcher(bw->config);
+        bw->solver     = new btSequentialImpulseConstraintSolver();
+        bw->world      = new btDiscreteDynamicsWorld(
+            bw->dispatcher, bw->broadphase, bw->solver, bw->config);
+        bw->multithreaded = false;
+    }
 
     bw->world->setGravity(to_bt(gravity));
+
+    /* --- Solver / sleeping tunables (sentinels keep Bullet defaults) --- */
+    btContactSolverInfo &si = bw->world->getSolverInfo();
+    if (solver_iterations > 0) si.m_numIterations = solver_iterations;
+    if (split_impulse >= 0)    si.m_splitImpulse  = (split_impulse != 0);
+
+    /* gDeactivationTime is a process-global btScalar in Bullet — there is
+       no per-world setting.  Documented as global in the public header. */
+    if (deactivation_time > 0.0f)
+        gDeactivationTime = static_cast<btScalar>(deactivation_time);
+
+    /* Sleep thresholds are per-body in Bullet; stash them so each body
+       created in this world picks them up at create time. */
+    bw->linear_sleep_threshold  = linear_sleep_threshold;
+    bw->angular_sleep_threshold = angular_sleep_threshold;
 
     /* Store back-pointer so the tick callback can reach JceBulletWorld. */
     bw->world->setWorldUserInfo(bw);
@@ -253,9 +444,12 @@ JceBulletWorld *jce_bullet_create(jce_vec3 gravity, uint32_t max_bodies)
         JCE_CALLOC(max_bodies, sizeof(void *)));
     bw->owned_meshes = static_cast<btAlignedObjectArray<btStridingMeshInterface *> **>(
         JCE_CALLOC(max_bodies, sizeof(void *)));
+    /* Generation counters start at 0 (JCE_CALLOC zero-fills). */
+    bw->generations = static_cast<uint32_t *>(
+        JCE_CALLOC(max_bodies, sizeof(uint32_t)));
 
     if (!bw->bodies || !bw->shapes || !bw->alive ||
-        !bw->owned_shapes || !bw->owned_meshes) {
+        !bw->owned_shapes || !bw->owned_meshes || !bw->generations) {
         jce_bullet_destroy(bw);
         return nullptr;
     }
@@ -264,6 +458,7 @@ JceBulletWorld *jce_bullet_create(jce_vec3 gravity, uint32_t max_bodies)
     bw->con_capacity = max_bodies / 2;
     if (bw->con_capacity < 64) bw->con_capacity = 64;
     bw->con_count = 0;
+    bw->con_alloc_cursor = 0;
     bw->constraints = static_cast<btTypedConstraint **>(
         JCE_CALLOC(bw->con_capacity, sizeof(btTypedConstraint *)));
     bw->con_alive = static_cast<bool *>(
@@ -272,10 +467,15 @@ JceBulletWorld *jce_bullet_create(jce_vec3 gravity, uint32_t max_bodies)
     /* Allocate character controller pool. */
     bw->char_capacity = 32;
     bw->char_count = 0;
+    bw->char_alloc_cursor = 0;
     bw->characters = static_cast<btKinematicCharacterController **>(
         JCE_CALLOC(bw->char_capacity, sizeof(btKinematicCharacterController *)));
     bw->ghosts = static_cast<btPairCachingGhostObject **>(
         JCE_CALLOC(bw->char_capacity, sizeof(btPairCachingGhostObject *)));
+    bw->char_bodies = static_cast<btRigidBody **>(
+        JCE_CALLOC(bw->char_capacity, sizeof(btRigidBody *)));
+    bw->char_jump = static_cast<float *>(
+        JCE_CALLOC(bw->char_capacity, sizeof(float)));
     bw->char_shapes = static_cast<btConvexShape **>(
         JCE_CALLOC(bw->char_capacity, sizeof(btConvexShape *)));
     bw->char_alive = static_cast<bool *>(
@@ -284,6 +484,7 @@ JceBulletWorld *jce_bullet_create(jce_vec3 gravity, uint32_t max_bodies)
     /* Allocate vehicle controller pool. */
     bw->vehicle_capacity = 16;
     bw->vehicle_count = 0;
+    bw->vehicle_alloc_cursor = 0;
     bw->vehicles = static_cast<btRaycastVehicle **>(
         JCE_CALLOC(bw->vehicle_capacity, sizeof(btRaycastVehicle *)));
     bw->vehicle_raycasters = static_cast<btDefaultVehicleRaycaster **>(
@@ -350,17 +551,13 @@ void jce_bullet_destroy(JceBulletWorld *bw)
         }
     }
 
-    /* Remove and delete all live character controllers. */
-    if (bw->characters && bw->ghosts && bw->char_shapes && bw->char_alive) {
+    /* Remove and delete all live characters (dynamic capsule rigid bodies). */
+    if (bw->char_bodies && bw->char_shapes && bw->char_alive) {
         for (uint32_t i = 0; i < bw->char_capacity; ++i) {
             if (!bw->char_alive[i]) continue;
-            if (bw->characters[i]) {
-                bw->world->removeAction(bw->characters[i]);
-                delete bw->characters[i];
-            }
-            if (bw->ghosts[i]) {
-                bw->world->removeCollisionObject(bw->ghosts[i]);
-                delete bw->ghosts[i];
+            if (bw->char_bodies[i]) {
+                bw->world->removeRigidBody(bw->char_bodies[i]);
+                delete bw->char_bodies[i];
             }
             delete bw->char_shapes[i];
             bw->char_alive[i] = false;
@@ -404,6 +601,8 @@ void jce_bullet_destroy(JceBulletWorld *bw)
 
     JCE_FREE(bw->char_alive);
     JCE_FREE(bw->char_shapes);
+    JCE_FREE(bw->char_jump);
+    JCE_FREE(bw->char_bodies);
     JCE_FREE(bw->ghosts);
     JCE_FREE(bw->characters);
     JCE_FREE(bw->vehicle_max_steer);
@@ -416,6 +615,7 @@ void jce_bullet_destroy(JceBulletWorld *bw)
     JCE_FREE(bw->vehicles);
     JCE_FREE(bw->con_alive);
     JCE_FREE(bw->constraints);
+    JCE_FREE(bw->generations);
     JCE_FREE(bw->alive);
     JCE_FREE(bw->owned_meshes);
     JCE_FREE(bw->owned_shapes);
@@ -440,6 +640,25 @@ void jce_bullet_step(JceBulletWorld *bw, float dt, float fixed_dt,
 /* ================================================================== */
 /* Body create / destroy                                               */
 /* ================================================================== */
+
+/* Apply the world's configured sleep thresholds to a freshly created
+   body.  A sentinel value <= 0 leaves Bullet's per-body default for that
+   axis (linear 0.8, angular 1.0), so an unset world reproduces prior
+   behavior exactly. */
+static void apply_sleep_thresholds(JceBulletWorld *bw, btRigidBody *body)
+{
+    if (!bw || !body) return;
+    if (bw->linear_sleep_threshold <= 0.0f &&
+        bw->angular_sleep_threshold <= 0.0f)
+        return;
+    btScalar lin = bw->linear_sleep_threshold > 0.0f
+                       ? static_cast<btScalar>(bw->linear_sleep_threshold)
+                       : body->getLinearSleepingThreshold();
+    btScalar ang = bw->angular_sleep_threshold > 0.0f
+                       ? static_cast<btScalar>(bw->angular_sleep_threshold)
+                       : body->getAngularSleepingThreshold();
+    body->setSleepingThresholds(lin, ang);
+}
 
 uint32_t jce_bullet_body_create(JceBulletWorld *bw,
                                 uint8_t type, uint8_t shape,
@@ -514,6 +733,10 @@ uint32_t jce_bullet_body_create(JceBulletWorld *bw,
 
     auto *body = new btRigidBody(ci);
 
+    /* Apply world-configured sleep thresholds (sentinel <=0 keeps the
+       body's existing Bullet default per axis). */
+    apply_sleep_thresholds(bw, body);
+
     /* Tag kinematic bodies so Bullet treats them correctly. */
     if (static_cast<JceBodyType>(type) == JCE_BODY_KINEMATIC) {
         body->setCollisionFlags(
@@ -529,9 +752,12 @@ uint32_t jce_bullet_body_create(JceBulletWorld *bw,
             btCollisionObject::CF_NO_CONTACT_RESPONSE);
     }
 
-    /* Store pool index in the user-pointer for contact-callback lookup. */
+    /* Store the PACKED handle (slot + current generation) in the
+       user-pointer so contact / raycast / overlap resolve back to a
+       handle the C layer can use directly. */
+    uint32_t handle = handle_encode(idx, bw->generations ? bw->generations[idx] : 0u);
     body->setUserPointer(reinterpret_cast<void *>(
-        static_cast<uintptr_t>(idx)));
+        static_cast<uintptr_t>(handle)));
 
     /* Add to world with collision group/mask. */
     bw->world->addRigidBody(body,
@@ -542,26 +768,47 @@ uint32_t jce_bullet_body_create(JceBulletWorld *bw,
     bw->alive[idx]  = true;
     bw->count++;
 
-    return idx;
+    return handle;
 }
 
 void jce_bullet_body_destroy(JceBulletWorld *bw, uint32_t idx)
 {
-    if (!bw || idx >= bw->capacity || !bw->alive[idx]) return;
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX) return;
 
-    btRigidBody *body = bw->bodies[idx];
+    btRigidBody *body = bw->bodies[slot];
     if (body) {
         bw->world->removeRigidBody(body);
         delete body->getMotionState();
         delete body;
     }
-    delete bw->shapes[idx];
-    free_body_aux(bw, idx);
+    delete bw->shapes[slot];
+    free_body_aux(bw, slot);
 
-    bw->bodies[idx] = nullptr;
-    bw->shapes[idx] = nullptr;
-    bw->alive[idx]  = false;
+    bw->bodies[slot] = nullptr;
+    bw->shapes[slot] = nullptr;
+    bw->alive[slot]  = false;
+    /* Bump the slot generation so any handle still holding the old gen is
+       rejected by resolve_body once this slot is reused. */
+    if (bw->generations) bw->generations[slot]++;
     bw->count--;
+}
+
+uint32_t jce_bullet_body_generation(JceBulletWorld *bw, uint32_t idx)
+{
+    uint32_t slot = handle_slot(idx);
+    if (!bw || slot >= bw->capacity || !bw->generations) return 0u;
+    return bw->generations[slot];
+}
+
+bool jce_bullet_body_alive_gen(JceBulletWorld *bw, uint32_t idx, uint32_t gen)
+{
+    uint32_t slot = handle_slot(idx);
+    if (!bw || slot >= bw->capacity || !bw->alive[slot]) return false;
+    /* generations may be NULL only on a half-constructed world; treat the
+       implied generation as 0 in that case so a gen-0 handle still passes. */
+    uint32_t cur = bw->generations ? bw->generations[slot] : 0u;
+    return cur == gen;
 }
 
 /* ================================================================== */
@@ -590,6 +837,22 @@ static btCollisionShape *build_child_shape(const JceBulletColliderChild *c,
             hull->addPoint(btVector3(p[0], p[1], p[2]), false);
         }
         hull->recalcLocalAabb();
+        /* Cap the hull vertex count so an un-simplified mesh dumped as a
+           point cloud cannot bloat the dynamic solver.  btShapeHull
+           recomputes a reduced hull (<= JCE_HULL_MAX_VERTS) from the
+           silhouette. */
+        if (c->vertex_count > JCE_HULL_MAX_VERTS) {
+            btShapeHull sh(hull);
+            sh.buildHull(hull->getMargin());
+            if (sh.numVertices() > 0) {
+                auto *reduced = new btConvexHullShape(
+                    reinterpret_cast<const btScalar *>(sh.getVertexPointer()),
+                    sh.numVertices(), sizeof(btVector3));
+                reduced->recalcLocalAabb();
+                delete hull;
+                hull = reduced;
+            }
+        }
         /* Light simplification keeps the dynamic solver fast on the
            512MB / single-core baseline without changing the silhouette. */
         hull->optimizeConvexHull();
@@ -599,14 +862,25 @@ static btCollisionShape *build_child_shape(const JceBulletColliderChild *c,
         if (!c->vertices || c->vertex_count == 0 ||
             !c->indices  || c->index_count < 3) return nullptr;
         auto *mesh = new btTriangleMesh();
+        uint32_t added = 0;
         for (uint32_t t = 0; t + 2 < c->index_count; t += 3) {
-            const float *a = &c->vertices[c->indices[t + 0] * 3];
-            const float *b = &c->vertices[c->indices[t + 1] * 3];
-            const float *d = &c->vertices[c->indices[t + 2] * 3];
+            uint32_t i0 = c->indices[t + 0];
+            uint32_t i1 = c->indices[t + 1];
+            uint32_t i2 = c->indices[t + 2];
+            /* Reject triangles referencing vertices outside the buffer —
+               a corrupt blob would otherwise OOB-read. */
+            if (i0 >= c->vertex_count || i1 >= c->vertex_count ||
+                i2 >= c->vertex_count)
+                continue;
+            const float *a = &c->vertices[i0 * 3];
+            const float *b = &c->vertices[i1 * 3];
+            const float *d = &c->vertices[i2 * 3];
             mesh->addTriangle(btVector3(a[0], a[1], a[2]),
                               btVector3(b[0], b[1], b[2]),
                               btVector3(d[0], d[1], d[2]), true);
+            ++added;
         }
+        if (added == 0) { delete mesh; return nullptr; }
         if (meshes) meshes->push_back(mesh);
         return new btBvhTriangleMeshShape(mesh, /*useQuantizedAabb=*/true);
     }
@@ -628,11 +902,16 @@ uint32_t jce_bullet_body_create_compound(JceBulletWorld *bw,
 {
     if (!bw || !children || child_count == 0) return UINT32_MAX;
 
+    /* Find a free slot from the rotating cursor (same scheme as the primitive
+       create path) so a burst of compound creates at scene load is O(n) total
+       instead of O(n^2) re-scanning from index 0. */
     uint32_t idx = UINT32_MAX;
-    for (uint32_t i = 0; i < bw->capacity; ++i) {
+    for (uint32_t n = 0; n < bw->capacity; ++n) {
+        uint32_t i = (bw->alloc_cursor + n) % bw->capacity;
         if (!bw->alive[i]) { idx = i; break; }
     }
     if (idx == UINT32_MAX) return UINT32_MAX;
+    bw->alloc_cursor = (idx + 1u) % bw->capacity;
 
     auto *meshes = new btAlignedObjectArray<btStridingMeshInterface *>();
     auto *owned  = new btAlignedObjectArray<btCollisionShape *>();
@@ -689,6 +968,9 @@ uint32_t jce_bullet_body_create_compound(JceBulletWorld *bw,
 
     auto *body = new btRigidBody(ci);
 
+    /* World-configured sleep thresholds (sentinel <=0 keeps default). */
+    apply_sleep_thresholds(bw, body);
+
     if (static_cast<JceBodyType>(type) == JCE_BODY_KINEMATIC) {
         body->setCollisionFlags(body->getCollisionFlags() |
                                 btCollisionObject::CF_KINEMATIC_OBJECT);
@@ -698,7 +980,8 @@ uint32_t jce_bullet_body_create_compound(JceBulletWorld *bw,
         body->setCollisionFlags(body->getCollisionFlags() |
                                 btCollisionObject::CF_NO_CONTACT_RESPONSE);
     }
-    body->setUserPointer(reinterpret_cast<void *>(static_cast<uintptr_t>(idx)));
+    uint32_t handle = handle_encode(idx, bw->generations ? bw->generations[idx] : 0u);
+    body->setUserPointer(reinterpret_cast<void *>(static_cast<uintptr_t>(handle)));
 
     bw->world->addRigidBody(body, static_cast<int>(col_group),
                             static_cast<int>(col_mask));
@@ -711,7 +994,7 @@ uint32_t jce_bullet_body_create_compound(JceBulletWorld *bw,
     if (meshes->size() > 0) bw->owned_meshes[idx] = meshes; else delete meshes;
     bw->count++;
 
-    return idx;
+    return handle;
 }
 
 /* ================================================================== */
@@ -721,10 +1004,11 @@ uint32_t jce_bullet_body_create_compound(JceBulletWorld *bw,
 void jce_bullet_body_get_transform(JceBulletWorld *bw, uint32_t idx,
                                    jce_vec3 *pos, jce_quat *rot)
 {
-    if (!bw || idx >= bw->capacity || !bw->alive[idx]) return;
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX) return;
 
     btTransform xf;
-    btRigidBody *body = bw->bodies[idx];
+    btRigidBody *body = bw->bodies[slot];
     if (body->getMotionState()) {
         body->getMotionState()->getWorldTransform(xf);
     } else {
@@ -738,17 +1022,44 @@ void jce_bullet_body_get_transform(JceBulletWorld *bw, uint32_t idx,
 void jce_bullet_body_set_transform(JceBulletWorld *bw, uint32_t idx,
                                    jce_vec3 pos, jce_quat rot)
 {
-    if (!bw || idx >= bw->capacity || !bw->alive[idx]) return;
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX) return;
 
     btTransform xf;
     xf.setOrigin(to_bt(pos));
     xf.setRotation(to_bt_q(rot));
 
-    btRigidBody *body = bw->bodies[idx];
+    btRigidBody *body = bw->bodies[slot];
     body->setWorldTransform(xf);
     if (body->getMotionState()) {
         body->getMotionState()->setWorldTransform(xf);
     }
+    /* Refresh the broadphase AABB so moved static/kinematic bodies collide
+     * at their new pose (dynamic bodies do this during the step anyway). */
+    if (bw->world) bw->world->updateSingleAabb(body);
+    body->activate();
+}
+
+void jce_bullet_body_set_scale(JceBulletWorld *bw, uint32_t idx, jce_vec3 scale)
+{
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX) return;
+    btRigidBody *body = bw->bodies[slot];
+    if (!body) return;
+    btCollisionShape *shape = body->getCollisionShape();
+    if (!shape) return;
+
+    shape->setLocalScaling(to_bt(scale));
+
+    /* Recompute inertia for dynamic bodies (invMass != 0 ⇒ mass > 0). */
+    if (body->getInvMass() != btScalar(0)) {
+        btScalar mass = btScalar(1.0) / body->getInvMass();
+        btVector3 inertia(0, 0, 0);
+        shape->calculateLocalInertia(mass, inertia);
+        body->setMassProps(mass, inertia);
+        body->updateInertiaTensor();
+    }
+    if (bw->world) bw->world->updateSingleAabb(body);
     body->activate();
 }
 
@@ -759,16 +1070,18 @@ void jce_bullet_body_set_transform(JceBulletWorld *bw, uint32_t idx,
 void jce_bullet_body_get_velocity(JceBulletWorld *bw, uint32_t idx,
                                   jce_vec3 *vel)
 {
-    if (!bw || idx >= bw->capacity || !bw->alive[idx] || !vel) return;
-    *vel = from_bt_v3(bw->bodies[idx]->getLinearVelocity());
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX || !vel) return;
+    *vel = from_bt_v3(bw->bodies[slot]->getLinearVelocity());
 }
 
 void jce_bullet_body_set_velocity(JceBulletWorld *bw, uint32_t idx,
                                   jce_vec3 vel)
 {
-    if (!bw || idx >= bw->capacity || !bw->alive[idx]) return;
-    bw->bodies[idx]->setLinearVelocity(to_bt(vel));
-    bw->bodies[idx]->activate();
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX) return;
+    bw->bodies[slot]->setLinearVelocity(to_bt(vel));
+    bw->bodies[slot]->activate();
 }
 
 /* ================================================================== */
@@ -778,44 +1091,109 @@ void jce_bullet_body_set_velocity(JceBulletWorld *bw, uint32_t idx,
 void jce_bullet_body_get_angular_velocity(JceBulletWorld *bw, uint32_t idx,
                                           jce_vec3 *vel)
 {
-    if (!bw || idx >= bw->capacity || !bw->alive[idx] || !vel) return;
-    *vel = from_bt_v3(bw->bodies[idx]->getAngularVelocity());
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX || !vel) return;
+    *vel = from_bt_v3(bw->bodies[slot]->getAngularVelocity());
 }
 
 void jce_bullet_body_set_angular_velocity(JceBulletWorld *bw, uint32_t idx,
                                           jce_vec3 vel)
 {
-    if (!bw || idx >= bw->capacity || !bw->alive[idx]) return;
-    bw->bodies[idx]->setAngularVelocity(to_bt(vel));
-    bw->bodies[idx]->activate();
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX) return;
+    bw->bodies[slot]->setAngularVelocity(to_bt(vel));
+    bw->bodies[slot]->activate();
 }
 
 /* ================================================================== */
 /* Forces & impulses                                                   */
 /* ================================================================== */
 
+bool jce_bullet_body_is_dynamic(JceBulletWorld *bw, uint32_t idx)
+{
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX) return false;
+    /* invMass != 0 ⇒ a movable (dynamic) rigid body; static/kinematic are 0. */
+    return bw->bodies[slot]->getInvMass() != btScalar(0);
+}
+
 void jce_bullet_body_apply_force(JceBulletWorld *bw, uint32_t idx,
                                  jce_vec3 force)
 {
-    if (!bw || idx >= bw->capacity || !bw->alive[idx]) return;
-    bw->bodies[idx]->applyCentralForce(to_bt(force));
-    bw->bodies[idx]->activate();
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX) return;
+    bw->bodies[slot]->applyCentralForce(to_bt(force));
+    bw->bodies[slot]->activate();
 }
 
 void jce_bullet_body_apply_impulse(JceBulletWorld *bw, uint32_t idx,
                                    jce_vec3 impulse)
 {
-    if (!bw || idx >= bw->capacity || !bw->alive[idx]) return;
-    bw->bodies[idx]->applyCentralImpulse(to_bt(impulse));
-    bw->bodies[idx]->activate();
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX) return;
+    bw->bodies[slot]->applyCentralImpulse(to_bt(impulse));
+    bw->bodies[slot]->activate();
 }
 
 void jce_bullet_body_apply_torque(JceBulletWorld *bw, uint32_t idx,
                                   jce_vec3 torque)
 {
-    if (!bw || idx >= bw->capacity || !bw->alive[idx]) return;
-    bw->bodies[idx]->applyTorque(to_bt(torque));
-    bw->bodies[idx]->activate();
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX) return;
+    bw->bodies[slot]->applyTorque(to_bt(torque));
+    bw->bodies[slot]->activate();
+}
+
+void jce_bullet_body_apply_force_at_point(JceBulletWorld *bw, uint32_t idx,
+                                          jce_vec3 force, jce_vec3 world_point)
+{
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX) return;
+    btRigidBody *body = bw->bodies[slot];
+    if (!body) return;
+    btVector3 rel = to_bt(world_point) - body->getCenterOfMassPosition();
+    body->applyForce(to_bt(force), rel);
+    body->activate();
+}
+
+void jce_bullet_body_apply_impulse_at_point(JceBulletWorld *bw, uint32_t idx,
+                                            jce_vec3 impulse, jce_vec3 world_point)
+{
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX) return;
+    btRigidBody *body = bw->bodies[slot];
+    if (!body) return;
+    btVector3 rel = to_bt(world_point) - body->getCenterOfMassPosition();
+    body->applyImpulse(to_bt(impulse), rel);
+    body->activate();
+}
+
+void jce_bullet_body_set_gravity_factor(JceBulletWorld *bw, uint32_t idx,
+                                        float factor)
+{
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX) return;
+    btRigidBody *body = bw->bodies[slot];
+    if (!body || !bw->world) return;
+    /* Per-body gravity = world gravity * factor.  addRigidBody() resets a
+     * body's gravity to the world value, so this must run post-create. */
+    body->setGravity(bw->world->getGravity() * static_cast<btScalar>(factor));
+    body->activate();
+}
+
+void jce_bullet_body_set_mass(JceBulletWorld *bw, uint32_t idx, float mass)
+{
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX) return;
+    btRigidBody *body = bw->bodies[slot];
+    if (!body) return;
+    btVector3 inertia(0, 0, 0);
+    if (mass > 0.0f && body->getCollisionShape())
+        body->getCollisionShape()->calculateLocalInertia(
+            static_cast<btScalar>(mass), inertia);
+    body->setMassProps(static_cast<btScalar>(mass), inertia);
+    body->updateInertiaTensor();
+    body->activate();
 }
 
 /* ================================================================== */
@@ -831,9 +1209,13 @@ JceBulletRayResult jce_bullet_raycast(JceBulletWorld *bw, jce_vec3 origin,
 
     if (!bw || !bw->world) return result;
 
+    /* Guard a zero-length direction / non-positive distance: normalizing a
+     * zero vector yields NaN and corrupts the broadphase query. */
+    btVector3 d = to_bt(dir);
+    if (max_dist <= 0.0f || d.length2() < SIMD_EPSILON) return result;
+
     btVector3 from = to_bt(origin);
-    btVector3 to   = from + to_bt(dir).normalized() *
-                     static_cast<btScalar>(max_dist);
+    btVector3 to   = from + d.normalized() * static_cast<btScalar>(max_dist);
 
     btCollisionWorld::ClosestRayResultCallback cb(from, to);
     bw->world->rayTest(from, to, cb);
@@ -853,6 +1235,264 @@ JceBulletRayResult jce_bullet_raycast(JceBulletWorld *bw, jce_vec3 origin,
             reinterpret_cast<uintptr_t>(hit_obj->getUserPointer()));
     }
 
+    return result;
+}
+
+/* ================================================================== */
+/* Filtered spatial queries                                            */
+/* ================================================================== */
+
+namespace {
+
+static uint32_t body_idx_of(const btCollisionObject *obj)
+{
+    if (!obj) return UINT32_MAX;
+    return static_cast<uint32_t>(
+        reinterpret_cast<uintptr_t>(obj->getUserPointer()));
+}
+
+static bool obj_is_trigger(const btCollisionObject *obj)
+{
+    return obj && (obj->getCollisionFlags() &
+                   btCollisionObject::CF_NO_CONTACT_RESPONSE);
+}
+
+/* layer_mask is applied as the query's filter mask (query group = all), so a
+ * body is hit when its group bit (1<<layer) is in layer_mask.  Triggers are
+ * rejected in needsCollision unless hit_triggers is set. */
+struct FilteredClosestRay : public btCollisionWorld::ClosestRayResultCallback {
+    bool skip_trig;
+    FilteredClosestRay(const btVector3 &f, const btVector3 &t,
+                       uint32_t layer_mask, bool hit_triggers)
+        : ClosestRayResultCallback(f, t), skip_trig(!hit_triggers)
+    {
+        m_collisionFilterGroup = -1;
+        m_collisionFilterMask  = static_cast<int>(layer_mask);
+    }
+    bool needsCollision(btBroadphaseProxy *proxy) const override
+    {
+        if (!ClosestRayResultCallback::needsCollision(proxy)) return false;
+        return !(skip_trig && obj_is_trigger(
+                     static_cast<btCollisionObject *>(proxy->m_clientObject)));
+    }
+};
+
+struct FilteredAllRay : public btCollisionWorld::AllHitsRayResultCallback {
+    bool skip_trig;
+    FilteredAllRay(const btVector3 &f, const btVector3 &t,
+                   uint32_t layer_mask, bool hit_triggers)
+        : AllHitsRayResultCallback(f, t), skip_trig(!hit_triggers)
+    {
+        m_collisionFilterGroup = -1;
+        m_collisionFilterMask  = static_cast<int>(layer_mask);
+    }
+    bool needsCollision(btBroadphaseProxy *proxy) const override
+    {
+        if (!AllHitsRayResultCallback::needsCollision(proxy)) return false;
+        return !(skip_trig && obj_is_trigger(
+                     static_cast<btCollisionObject *>(proxy->m_clientObject)));
+    }
+};
+
+struct FilteredClosestConvex : public btCollisionWorld::ClosestConvexResultCallback {
+    bool skip_trig;
+    FilteredClosestConvex(const btVector3 &f, const btVector3 &t,
+                          uint32_t layer_mask, bool hit_triggers)
+        : ClosestConvexResultCallback(f, t), skip_trig(!hit_triggers)
+    {
+        m_collisionFilterGroup = -1;
+        m_collisionFilterMask  = static_cast<int>(layer_mask);
+    }
+    bool needsCollision(btBroadphaseProxy *proxy) const override
+    {
+        if (!ClosestConvexResultCallback::needsCollision(proxy)) return false;
+        return !(skip_trig && obj_is_trigger(
+                     static_cast<btCollisionObject *>(proxy->m_clientObject)));
+    }
+};
+
+struct OverlapCollector : public btCollisionWorld::ContactResultCallback {
+    const btCollisionObject *probe = nullptr;
+    uint32_t *out = nullptr;
+    uint32_t  max = 0;
+    uint32_t  count = 0;
+    bool      skip_trig = true;
+    btScalar addSingleResult(btManifoldPoint & /*cp*/,
+                             const btCollisionObjectWrapper *a, int, int,
+                             const btCollisionObjectWrapper *b, int, int) override
+    {
+        const btCollisionObject *oa = a->getCollisionObject();
+        const btCollisionObject *ob = b->getCollisionObject();
+        const btCollisionObject *other = (oa == probe) ? ob : oa;
+        if (!other || (skip_trig && obj_is_trigger(other))) return 0;
+        uint32_t idx = body_idx_of(other);
+        if (idx == UINT32_MAX || count >= max) return 0;
+        for (uint32_t i = 0; i < count; ++i)
+            if (out[i] == idx) return 0;   /* dedup */
+        out[count++] = idx;
+        return 0;
+    }
+};
+
+} /* namespace */
+
+JceBulletRayResult jce_bullet_raycast_filtered(JceBulletWorld *bw,
+                                               jce_vec3 origin, jce_vec3 dir,
+                                               float max_dist,
+                                               uint32_t layer_mask,
+                                               bool hit_triggers)
+{
+    JceBulletRayResult result;
+    std::memset(&result, 0, sizeof(result));
+    result.body_idx = UINT32_MAX;
+    if (!bw || !bw->world) return result;
+
+    btVector3 d = to_bt(dir);
+    if (max_dist <= 0.0f || d.length2() < SIMD_EPSILON) return result;
+    btVector3 from = to_bt(origin);
+    btVector3 to   = from + d.normalized() * static_cast<btScalar>(max_dist);
+
+    FilteredClosestRay cb(from, to, layer_mask, hit_triggers);
+    bw->world->rayTest(from, to, cb);
+    if (!cb.hasHit()) return result;
+
+    result.hit      = true;
+    result.point    = from_bt_v3(cb.m_hitPointWorld);
+    result.normal   = from_bt_v3(cb.m_hitNormalWorld);
+    result.distance = static_cast<float>((cb.m_hitPointWorld - from).length());
+    result.body_idx = body_idx_of(cb.m_collisionObject);
+    return result;
+}
+
+uint32_t jce_bullet_raycast_all(JceBulletWorld *bw,
+                                jce_vec3 origin, jce_vec3 dir, float max_dist,
+                                uint32_t layer_mask, bool hit_triggers,
+                                JceBulletRayResult *out, uint32_t max_hits)
+{
+    if (!bw || !bw->world || !out || max_hits == 0) return 0;
+    btVector3 d = to_bt(dir);
+    if (max_dist <= 0.0f || d.length2() < SIMD_EPSILON) return 0;
+    btVector3 from = to_bt(origin);
+    btVector3 to   = from + d.normalized() * static_cast<btScalar>(max_dist);
+
+    FilteredAllRay cb(from, to, layer_mask, hit_triggers);
+    bw->world->rayTest(from, to, cb);
+    int n = cb.m_collisionObjects.size();
+    if (n == 0) return 0;
+
+    /* Emit the nearest max_hits hits in ascending fraction order without
+     * an auxiliary allocation (max_hits is small in practice). */
+    uint32_t written = 0;
+    float last_frac = -1.0f;
+    int   last_i    = -1;
+    while (written < max_hits) {
+        int   best      = -1;
+        float best_frac = 1e30f;
+        for (int i = 0; i < n; ++i) {
+            float f = cb.m_hitFractions[i];
+            if (f < last_frac) continue;
+            if (f == last_frac && i <= last_i) continue;
+            if (f < best_frac) { best_frac = f; best = i; }
+        }
+        if (best < 0) break;
+        out[written].hit      = true;
+        out[written].point    = from_bt_v3(cb.m_hitPointWorld[best]);
+        out[written].normal   = from_bt_v3(cb.m_hitNormalWorld[best]);
+        out[written].distance = static_cast<float>(
+            (cb.m_hitPointWorld[best] - from).length());
+        out[written].body_idx = body_idx_of(cb.m_collisionObjects[best]);
+        written++;
+        last_frac = best_frac;
+        last_i    = best;
+    }
+    return written;
+}
+
+uint32_t jce_bullet_overlap_sphere(JceBulletWorld *bw, jce_vec3 center,
+                                   float radius, uint32_t layer_mask,
+                                   bool hit_triggers,
+                                   uint32_t *out_idx, uint32_t max)
+{
+    if (!bw || !bw->world || !out_idx || max == 0 || radius <= 0.0f) return 0;
+    btSphereShape shape(static_cast<btScalar>(radius));
+    btCollisionObject probe;
+    probe.setCollisionShape(&shape);
+    btTransform xf;
+    xf.setIdentity();
+    xf.setOrigin(to_bt(center));
+    probe.setWorldTransform(xf);
+
+    OverlapCollector cb;
+    cb.probe = &probe;
+    cb.out = out_idx;
+    cb.max = max;
+    cb.skip_trig = !hit_triggers;
+    cb.m_collisionFilterGroup = -1;
+    cb.m_collisionFilterMask  = static_cast<int>(layer_mask);
+    bw->world->contactTest(&probe, cb);
+    return cb.count;
+}
+
+uint32_t jce_bullet_overlap_box(JceBulletWorld *bw, jce_vec3 center,
+                                jce_vec3 half_ext, jce_quat rot,
+                                uint32_t layer_mask, bool hit_triggers,
+                                uint32_t *out_idx, uint32_t max)
+{
+    if (!bw || !bw->world || !out_idx || max == 0) return 0;
+    btBoxShape shape(btVector3(static_cast<btScalar>(half_ext.x > 0 ? half_ext.x : 0.01f),
+                               static_cast<btScalar>(half_ext.y > 0 ? half_ext.y : 0.01f),
+                               static_cast<btScalar>(half_ext.z > 0 ? half_ext.z : 0.01f)));
+    btCollisionObject probe;
+    probe.setCollisionShape(&shape);
+    btTransform xf;
+    xf.setIdentity();
+    xf.setOrigin(to_bt(center));
+    xf.setRotation(btQuaternion(rot.x, rot.y, rot.z, rot.w));
+    probe.setWorldTransform(xf);
+
+    OverlapCollector cb;
+    cb.probe = &probe;
+    cb.out = out_idx;
+    cb.max = max;
+    cb.skip_trig = !hit_triggers;
+    cb.m_collisionFilterGroup = -1;
+    cb.m_collisionFilterMask  = static_cast<int>(layer_mask);
+    bw->world->contactTest(&probe, cb);
+    return cb.count;
+}
+
+JceBulletRayResult jce_bullet_sweep_sphere(JceBulletWorld *bw, jce_vec3 origin,
+                                           float radius, jce_vec3 dir,
+                                           float max_dist, uint32_t layer_mask,
+                                           bool hit_triggers)
+{
+    JceBulletRayResult result;
+    std::memset(&result, 0, sizeof(result));
+    result.body_idx = UINT32_MAX;
+    if (!bw || !bw->world || radius <= 0.0f) return result;
+
+    btVector3 d = to_bt(dir);
+    if (max_dist <= 0.0f || d.length2() < SIMD_EPSILON) return result;
+    btVector3 from_o = to_bt(origin);
+    btVector3 to_o   = from_o + d.normalized() * static_cast<btScalar>(max_dist);
+
+    btTransform from_xf;
+    from_xf.setIdentity();
+    from_xf.setOrigin(from_o);
+    btTransform to_xf;
+    to_xf.setIdentity();
+    to_xf.setOrigin(to_o);
+
+    btSphereShape shape(static_cast<btScalar>(radius));
+    FilteredClosestConvex cb(from_o, to_o, layer_mask, hit_triggers);
+    bw->world->convexSweepTest(&shape, from_xf, to_xf, cb);
+    if (!cb.hasHit()) return result;
+
+    result.hit      = true;
+    result.point    = from_bt_v3(cb.m_hitPointWorld);
+    result.normal   = from_bt_v3(cb.m_hitNormalWorld);
+    result.distance = static_cast<float>(cb.m_closestHitFraction) * max_dist;
+    result.body_idx = body_idx_of(cb.m_hitCollisionObject);
     return result;
 }
 
@@ -892,9 +1532,10 @@ uint32_t jce_bullet_body_count(JceBulletWorld *bw)
 void jce_bullet_body_set_collision_filter(JceBulletWorld *bw, uint32_t idx,
                                           uint32_t group, uint32_t mask)
 {
-    if (!bw || idx >= bw->capacity || !bw->alive[idx]) return;
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX) return;
 
-    btRigidBody *body = bw->bodies[idx];
+    btRigidBody *body = bw->bodies[slot];
     if (!body) return;
 
     /* Must remove and re-add to change filter group/mask. */
@@ -907,8 +1548,9 @@ void jce_bullet_body_set_collision_filter(JceBulletWorld *bw, uint32_t idx,
 void jce_bullet_body_set_material(JceBulletWorld *bw, uint32_t idx,
                                   float friction, float restitution)
 {
-    if (!bw || idx >= bw->capacity || !bw->alive[idx]) return;
-    btRigidBody *body = bw->bodies[idx];
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX) return;
+    btRigidBody *body = bw->bodies[slot];
     if (!body) return;
     body->setFriction(static_cast<btScalar>(friction));
     body->setRestitution(static_cast<btScalar>(restitution));
@@ -925,8 +1567,9 @@ void jce_bullet_body_set_material(JceBulletWorld *bw, uint32_t idx,
 
 float jce_bullet_body_compute_auto_swept_radius(JceBulletWorld *bw, uint32_t idx)
 {
-    if (!bw || idx >= bw->capacity || !bw->alive[idx]) return 0.0f;
-    btCollisionShape *shape = bw->shapes[idx];
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX) return 0.0f;
+    btCollisionShape *shape = bw->shapes[slot];
     if (!shape) return 0.0f;
 
     btTransform t;
@@ -949,8 +1592,9 @@ void jce_bullet_body_set_ccd(JceBulletWorld *bw, uint32_t idx,
                              float motion_threshold,
                              float swept_sphere_radius)
 {
-    if (!bw || idx >= bw->capacity || !bw->alive[idx]) return;
-    btRigidBody *body = bw->bodies[idx];
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX) return;
+    btRigidBody *body = bw->bodies[slot];
     if (!body) return;
 
     if (motion_threshold < 0.0f) motion_threshold = 0.0f;
@@ -966,16 +1610,18 @@ void jce_bullet_body_set_ccd(JceBulletWorld *bw, uint32_t idx,
 
 float jce_bullet_body_get_ccd_motion_threshold(JceBulletWorld *bw, uint32_t idx)
 {
-    if (!bw || idx >= bw->capacity || !bw->alive[idx]) return 0.0f;
-    btRigidBody *body = bw->bodies[idx];
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX) return 0.0f;
+    btRigidBody *body = bw->bodies[slot];
     if (!body) return 0.0f;
     return static_cast<float>(body->getCcdMotionThreshold());
 }
 
 float jce_bullet_body_get_ccd_swept_sphere_radius(JceBulletWorld *bw, uint32_t idx)
 {
-    if (!bw || idx >= bw->capacity || !bw->alive[idx]) return 0.0f;
-    btRigidBody *body = bw->bodies[idx];
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX) return 0.0f;
+    btRigidBody *body = bw->bodies[slot];
     if (!body) return 0.0f;
     return static_cast<float>(body->getCcdSweptSphereRadius());
 }
@@ -993,19 +1639,24 @@ uint32_t jce_bullet_constraint_create(JceBulletWorld *bw,
                                        bool disable_collision)
 {
     if (!bw) return UINT32_MAX;
-    if (body_a >= bw->capacity || !bw->alive[body_a]) return UINT32_MAX;
+    /* body_a / body_b arrive as packed handles — resolve to live slots. */
+    uint32_t slot_a = resolve_body(bw, body_a);
+    if (slot_a == UINT32_MAX) return UINT32_MAX;
 
-    /* Find a free constraint slot. */
+    /* Find a free constraint slot (rotating cursor → O(1) amortized bursts). */
     uint32_t idx = UINT32_MAX;
-    for (uint32_t i = 0; i < bw->con_capacity; ++i) {
+    for (uint32_t n = 0; n < bw->con_capacity; ++n) {
+        uint32_t i = (bw->con_alloc_cursor + n) % bw->con_capacity;
         if (!bw->con_alive[i]) { idx = i; break; }
     }
     if (idx == UINT32_MAX) return UINT32_MAX;
+    bw->con_alloc_cursor = (idx + 1u) % bw->con_capacity;
 
-    btRigidBody *rb_a = bw->bodies[body_a];
+    btRigidBody *rb_a = bw->bodies[slot_a];
     btRigidBody *rb_b = nullptr;
-    bool has_b = (body_b < bw->capacity && bw->alive[body_b]);
-    if (has_b) rb_b = bw->bodies[body_b];
+    uint32_t slot_b = resolve_body(bw, body_b);
+    bool has_b = (slot_b != UINT32_MAX);
+    if (has_b) rb_b = bw->bodies[slot_b];
 
     btTypedConstraint *con = nullptr;
 
@@ -1142,7 +1793,7 @@ void jce_bullet_constraint_set_limits(JceBulletWorld *bw, uint32_t idx,
 /* Joint introspection (P3-C.6)                                        */
 /* ================================================================== */
 
-/* Map a btRigidBody back to its pool index via the userPointer stash
+/* Map a btRigidBody back to its packed handle via the userPointer stash
  * set up at body_create time.  Returns UINT32_MAX when the body was
  * never tagged (e.g. the static "fixed body" Bullet uses internally
  * for world-anchored constraints). */
@@ -1152,9 +1803,8 @@ static uint32_t body_index_from_rb(const btRigidBody *rb)
     const void *up = rb->getUserPointer();
     if (!up) return UINT32_MAX;
     uintptr_t v = reinterpret_cast<uintptr_t>(up);
-    /* userPointer is "(idx)" — UINT32_MAX is a valid sentinel for
-     * "no real index", which collides with our return.  Bodies always
-     * fit in uint32_t so the cast below is lossless on real entries. */
+    /* userPointer stores the PACKED handle (slot + generation).  Returned
+     * verbatim so the C layer / editor receive a handle, not a bare slot. */
     return static_cast<uint32_t>(v);
 }
 
@@ -1163,9 +1813,11 @@ bool jce_bullet_joint_get_info_for_body(JceBulletWorld *bw,
                                         JceBulletJointInfo *out)
 {
     if (!bw || !out) return false;
-    if (body_idx >= bw->capacity || !bw->alive[body_idx]) return false;
+    /* body_idx arrives as a packed handle — resolve to a live slot. */
+    uint32_t slot = resolve_body(bw, body_idx);
+    if (slot == UINT32_MAX) return false;
 
-    btRigidBody *target = bw->bodies[body_idx];
+    btRigidBody *target = bw->bodies[slot];
     if (!target || !bw->constraints) return false;
 
     /* Locate the first constraint where either side is `target`. */
@@ -1281,46 +1933,59 @@ uint32_t jce_bullet_character_create(JceBulletWorld *bw,
 {
     if (!bw) return UINT32_MAX;
 
-    /* Find a free slot. */
+    /* Find a free slot (rotating cursor → O(1) amortized bursts). */
     uint32_t idx = UINT32_MAX;
-    for (uint32_t i = 0; i < bw->char_capacity; ++i) {
+    for (uint32_t n = 0; n < bw->char_capacity; ++n) {
+        uint32_t i = (bw->char_alloc_cursor + n) % bw->char_capacity;
         if (!bw->char_alive[i]) { idx = i; break; }
     }
     if (idx == UINT32_MAX) return UINT32_MAX;
+    bw->char_alloc_cursor = (idx + 1u) % bw->char_capacity;
 
     /* Capsule shape: total height = capsule_height + 2*radius. */
     float capsule_height = height - 2.0f * radius;
     if (capsule_height < 0.01f) capsule_height = 0.01f;
 
+    (void)step_height; (void)max_slope_rad; (void)gravity;
+
     auto *cap_shape = new btCapsuleShape(
         static_cast<btScalar>(radius),
         static_cast<btScalar>(capsule_height));
 
-    auto *ghost = new btPairCachingGhostObject();
+    /* DYNAMIC capsule rigid body. The solver resolves it together with whatever
+     * it rests on (floor, a crate, a stack of crates) so there is no kinematic-
+     * vs-dynamic fight → stacking is stable, no jitter. Rotation is fully locked
+     * so it never tips; horizontal motion is driven by setting velocity. A
+     * modest mass keeps the mass ratio to light crates solver-stable. */
+    btScalar mass = btScalar(10.0);
+    btVector3 inertia(0, 0, 0);
+    cap_shape->calculateLocalInertia(mass, inertia);
+
     btTransform start_xf;
     start_xf.setIdentity();
     start_xf.setOrigin(to_bt(pos));
-    ghost->setWorldTransform(start_xf);
-    ghost->setCollisionShape(cap_shape);
-    ghost->setCollisionFlags(btCollisionObject::CF_CHARACTER_OBJECT);
 
-    auto *controller = new btKinematicCharacterController(
-        ghost, cap_shape, static_cast<btScalar>(step_height));
+    btRigidBody::btRigidBodyConstructionInfo ci(mass, nullptr, cap_shape, inertia);
+    ci.m_startWorldTransform = start_xf;
+    ci.m_friction            = btScalar(0.0);  /* horizontal is velocity-driven */
+    ci.m_restitution         = btScalar(0.0);
+    auto *body = new btRigidBody(ci);
+    body->setAngularFactor(btVector3(0, 0, 0));   /* never tip / spin */
+    body->setActivationState(DISABLE_DEACTIVATION);
+    body->setCollisionFlags(body->getCollisionFlags() |
+                            btCollisionObject::CF_CHARACTER_OBJECT);
 
-    controller->setGravity(btVector3(0, -static_cast<btScalar>(gravity), 0));
-    controller->setJumpSpeed(static_cast<btScalar>(jump_speed));
-    controller->setMaxSlope(static_cast<btScalar>(max_slope_rad));
+    bw->world->addRigidBody(body,
+                            btBroadphaseProxy::CharacterFilter,
+                            btBroadphaseProxy::StaticFilter |
+                            btBroadphaseProxy::DefaultFilter);
 
-    bw->world->addCollisionObject(ghost,
-                                   btBroadphaseProxy::CharacterFilter,
-                                   btBroadphaseProxy::StaticFilter |
-                                   btBroadphaseProxy::DefaultFilter);
-    bw->world->addAction(controller);
-
-    bw->characters[idx] = controller;
-    bw->ghosts[idx] = ghost;
+    bw->characters[idx]  = nullptr;
+    bw->ghosts[idx]      = nullptr;
+    bw->char_bodies[idx] = body;
+    bw->char_jump[idx]   = jump_speed > 0.0f ? jump_speed : 5.0f;
     bw->char_shapes[idx] = cap_shape;
-    bw->char_alive[idx] = true;
+    bw->char_alive[idx]  = true;
     bw->char_count++;
 
     return idx;
@@ -1330,15 +1995,10 @@ void jce_bullet_character_destroy(JceBulletWorld *bw, uint32_t idx)
 {
     if (!bw || idx >= bw->char_capacity || !bw->char_alive[idx]) return;
 
-    if (bw->characters[idx]) {
-        bw->world->removeAction(bw->characters[idx]);
-        delete bw->characters[idx];
-        bw->characters[idx] = nullptr;
-    }
-    if (bw->ghosts[idx]) {
-        bw->world->removeCollisionObject(bw->ghosts[idx]);
-        delete bw->ghosts[idx];
-        bw->ghosts[idx] = nullptr;
+    if (bw->char_bodies[idx]) {
+        bw->world->removeRigidBody(bw->char_bodies[idx]);
+        delete bw->char_bodies[idx];
+        bw->char_bodies[idx] = nullptr;
     }
     delete bw->char_shapes[idx];
     bw->char_shapes[idx] = nullptr;
@@ -1346,32 +2006,75 @@ void jce_bullet_character_destroy(JceBulletWorld *bw, uint32_t idx)
     bw->char_count--;
 }
 
+/* `walk_dir` is the desired planar VELOCITY (m/s). Drive it directly for snappy
+ * control; the solver-owned vertical velocity (gravity / jump / resting) is
+ * preserved so the capsule falls, lands and rests naturally. */
 void jce_bullet_character_move(JceBulletWorld *bw, uint32_t idx,
                                 jce_vec3 walk_dir, float dt)
 {
+    (void)dt;
     if (!bw || idx >= bw->char_capacity || !bw->char_alive[idx]) return;
-    bw->characters[idx]->setWalkDirection(
-        to_bt(walk_dir) * static_cast<btScalar>(dt));
+    btRigidBody *b = bw->char_bodies[idx];
+    if (!b) return;
+    btVector3 v = b->getLinearVelocity();
+    v.setX(static_cast<btScalar>(walk_dir.x));
+    v.setZ(static_cast<btScalar>(walk_dir.z));
+    b->setLinearVelocity(v);
+    b->activate();
 }
 
 void jce_bullet_character_jump(JceBulletWorld *bw, uint32_t idx)
 {
     if (!bw || idx >= bw->char_capacity || !bw->char_alive[idx]) return;
-    bw->characters[idx]->jump();
+    if (!jce_bullet_character_is_grounded(bw, idx)) return;  /* no air jumps */
+    btRigidBody *b = bw->char_bodies[idx];
+    if (!b) return;
+    btVector3 v = b->getLinearVelocity();
+    v.setY(static_cast<btScalar>(bw->char_jump[idx]));
+    b->setLinearVelocity(v);
+    b->activate();
 }
 
 void jce_bullet_character_get_position(JceBulletWorld *bw, uint32_t idx,
                                         jce_vec3 *pos)
 {
     if (!bw || idx >= bw->char_capacity || !bw->char_alive[idx] || !pos) return;
-    btTransform xf = bw->ghosts[idx]->getWorldTransform();
-    *pos = from_bt_v3(xf.getOrigin());
+    if (!bw->char_bodies[idx]) return;
+    *pos = from_bt_v3(bw->char_bodies[idx]->getWorldTransform().getOrigin());
+}
+
+/* Teleport the capsule CENTER to `pos` (clears momentum). */
+void jce_bullet_character_set_position(JceBulletWorld *bw, uint32_t idx,
+                                        jce_vec3 pos)
+{
+    if (!bw || idx >= bw->char_capacity || !bw->char_alive[idx]) return;
+    btRigidBody *b = bw->char_bodies[idx];
+    if (!b) return;
+    btTransform xf = b->getWorldTransform();
+    xf.setOrigin(to_bt(pos));
+    b->setWorldTransform(xf);
+    b->setLinearVelocity(btVector3(0, 0, 0));
+    b->setInterpolationWorldTransform(xf);
+    b->setInterpolationLinearVelocity(btVector3(0, 0, 0));
+    b->activate();
 }
 
 bool jce_bullet_character_is_grounded(JceBulletWorld *bw, uint32_t idx)
 {
     if (!bw || idx >= bw->char_capacity || !bw->char_alive[idx]) return false;
-    return bw->characters[idx]->onGround();
+    btRigidBody *b = bw->char_bodies[idx];
+    if (!b) return false;
+    auto *cap = static_cast<btCapsuleShape *>(bw->char_shapes[idx]);
+    btScalar half = cap->getHalfHeight() + cap->getRadius();  /* centre→foot */
+    btVector3 c    = b->getWorldTransform().getOrigin();
+    btVector3 from = c;
+    btVector3 to   = c - btVector3(0, half + btScalar(0.20), 0);
+    btCollisionWorld::ClosestRayResultCallback cb(from, to);
+    cb.m_collisionFilterGroup = btBroadphaseProxy::CharacterFilter;
+    cb.m_collisionFilterMask  = btBroadphaseProxy::StaticFilter |
+                                btBroadphaseProxy::DefaultFilter;
+    bw->world->rayTest(from, to, cb);
+    return cb.hasHit() && cb.m_collisionObject != b;
 }
 
 /* ================================================================== */
@@ -1390,10 +2093,12 @@ uint32_t jce_bullet_vehicle_create(JceBulletWorld *bw,
     if (!bw) return UINT32_MAX;
 
     uint32_t idx = UINT32_MAX;
-    for (uint32_t i = 0; i < bw->vehicle_capacity; ++i) {
+    for (uint32_t n = 0; n < bw->vehicle_capacity; ++n) {
+        uint32_t i = (bw->vehicle_alloc_cursor + n) % bw->vehicle_capacity;
         if (!bw->vehicle_alive[i]) { idx = i; break; }
     }
     if (idx == UINT32_MAX) return UINT32_MAX;
+    bw->vehicle_alloc_cursor = (idx + 1u) % bw->vehicle_capacity;
 
     /* Chassis collision shape (box). */
     btCollisionShape *chassis_shape = new btBoxShape(to_bt(chassis_half_ext));
@@ -1563,8 +2268,9 @@ float jce_bullet_vehicle_get_speed(JceBulletWorld *bw, uint32_t idx)
 
 bool jce_bullet_body_is_trigger(JceBulletWorld *bw, uint32_t idx)
 {
-    if (!bw || idx >= bw->capacity || !bw->alive[idx]) return false;
-    const btRigidBody *body = bw->bodies[idx];
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX) return false;
+    const btRigidBody *body = bw->bodies[slot];
     if (!body) return false;
     return (body->getCollisionFlags() &
             btCollisionObject::CF_NO_CONTACT_RESPONSE) != 0;
@@ -1720,6 +2426,23 @@ static void release_drawer(JceBulletWorld *bw)
 
 } /* namespace */
 
+/* Translate JcePhysicsDebugFlag bits to Bullet's btIDebugDraw::DebugDrawModes.
+ * These do NOT line up 1:1: JCE CONTACTS(1<<2) would hit Bullet's
+ * DBG_DrawFeaturesText, CONSTRAINTS(1<<3) its DBG_DrawContactPoints, and
+ * NORMALS(1<<4) its DBG_NoDeactivation — the last silently disables sleeping
+ * on every body.  Map explicitly. */
+static int jce_to_bt_debug_mode(uint32_t flags)
+{
+    int m = 0;
+    if (flags & (1u << 0)) m |= btIDebugDraw::DBG_DrawWireframe;      /* WIREFRAME   */
+    if (flags & (1u << 1)) m |= btIDebugDraw::DBG_DrawAabb;           /* AABB        */
+    if (flags & (1u << 2)) m |= btIDebugDraw::DBG_DrawContactPoints;  /* CONTACTS    */
+    if (flags & (1u << 3)) m |= btIDebugDraw::DBG_DrawConstraints |
+                                btIDebugDraw::DBG_DrawConstraintLimits; /* CONSTRAINTS */
+    if (flags & (1u << 4)) m |= btIDebugDraw::DBG_DrawNormals;        /* NORMALS     */
+    return m;
+}
+
 void jce_bullet_debug_set_mode(JceBulletWorld *bw, uint32_t flags)
 {
     if (!bw || !bw->world) return;
@@ -1733,7 +2456,7 @@ void jce_bullet_debug_set_mode(JceBulletWorld *bw, uint32_t flags)
 
     JceBulletDebugDrawer *drawer = get_or_create_drawer(bw);
     if (!drawer) return;
-    drawer->setDebugMode(static_cast<int>(flags));
+    drawer->setDebugMode(jce_to_bt_debug_mode(flags));
     bw->world->setDebugDrawer(drawer);
 }
 
@@ -1767,8 +2490,9 @@ extern "C" void jce_bullet_debug_world_destroyed_(JceBulletWorld *bw)
 extern "C" void *jce_bullet_body_get_rigid_native_(JceBulletWorld *bw,
                                                    uint32_t idx)
 {
-    if (!bw || idx >= bw->capacity || !bw->alive[idx]) return nullptr;
-    return static_cast<void *>(bw->bodies[idx]);
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX) return nullptr;
+    return static_cast<void *>(bw->bodies[slot]);
 }
 
 namespace {

@@ -7,11 +7,16 @@
  * (compiled into the jce_application static library).
  */
 #include <jce/application/jce_main.h>
+#include <jce/os/core/jce_defs.h>   /* JCE_PLATFORM_WINDOWS */
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
+
+#if JCE_PLATFORM_WINDOWS && defined(_DEBUG)
+#include <crtdbg.h>   /* CRT-heap leak dump (debug builds only) */
+#endif
 
 extern "C" {
 #include <jce/application/jce_app_interface.h>
@@ -189,6 +194,18 @@ static void editor_app_update(float dt, void *ud)
     g_last_update_counter = now;
 
     jce_state_play_mode_tick(real_dt);
+
+    /* VideoPlayer-as-texture and ParticleEmitter previews in Scene View while
+     * editing.  In play mode the runtime (jce_runtime_step) drives these on the
+     * same scene, so only pump here when STOPPED to avoid double-advance. */
+    if (jce_state_get_play_state() == JCE_PLAY_STOPPED) {
+        JceScene *scene = jce_state_get_scene();
+        if (scene) {
+            jce_scene_video_update(scene, (double)real_dt, NULL, NULL);
+            jce_scene_particles_update(scene, real_dt);
+        }
+    }
+
     jce_run_manager_poll();
     /* Drive the cmake build subprocess every frame so save-hook
      * triggered repacks (which can run with no UI dialog open) still
@@ -200,6 +217,22 @@ static void editor_app_update(float dt, void *ud)
      * Must run on the main thread before ImGui consumes the affected
      * static buffers (issue #5). */
     jce_editor_dialogs_pump_pending();
+
+#ifndef NDEBUG
+    /* Debug-only: every few seconds, dump engine-side (mimalloc) live-byte
+     * totals + size buckets to stderr (→ VS Output).  CRT leak dumps and VS
+     * native heap snapshots can't see mimalloc memory, so a steadily rising
+     * "engine live" here means the leak is engine-side and shows its size
+     * class.  Compiled out in release. */
+    {
+        static float s_mem_dump_accum = 0.0f;
+        s_mem_dump_accum += real_dt;
+        if (s_mem_dump_accum >= 3.0f) {
+            s_mem_dump_accum = 0.0f;
+            jce_alloc_track_dump();
+        }
+    }
+#endif
 }
 
 static void editor_app_draw(const JceServices *svc, void *ud)
@@ -267,6 +300,17 @@ extern "C" bool jce_editor_reload_shaders(void)
 
 extern "C" JceAppDesc editor_app_get_desc(void)
 {
+#if JCE_PLATFORM_WINDOWS && defined(_DEBUG)
+    /* Debug-only leak diagnostics: at process exit, dump CRT-heap allocations
+     * that were never freed (editor C++ / STL / ImGui) to the VS Output window.
+     * NOTE: engine-side allocations go through mimalloc (jce_alloc), NOT the CRT
+     * heap, so they will NOT appear here — run with the env var
+     * MIMALLOC_SHOW_STATS=1 to see mimalloc's alloc/free totals on exit.
+     * Each leaked block prints its allocation number {N}; to get its call
+     * stack, on a later run set _crtBreakAlloc=N (or _CrtSetBreakAlloc(N)) so
+     * the debugger breaks at that allocation. */
+    _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
+#endif
     g_startup_t0 = jce_time_perf_counter();
     g_startup_reported = false;
 

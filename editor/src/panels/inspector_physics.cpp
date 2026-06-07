@@ -7,6 +7,7 @@
 
 #include "jce_panel_inspector_common.h"
 #include "ui/jce_editor_tip.h"
+#include "ui/jce_editor_dnd.h"
 
 void draw_comp_rigidbody(JceRigidBodyComponent *rb)
 {
@@ -26,6 +27,58 @@ void draw_comp_rigidbody(JceRigidBodyComponent *rb)
     snprintf(lbl, sizeof(lbl), "%s###rbIsKinematic", jce_editor_i18n("rigidbody.isKinematic"));
     if (ImGui::Checkbox(lbl, &rb->is_kinematic))
         insp_undo_bool(&rb->is_kinematic);
+
+    /* ── Per-body gravity scale (disabled when Use Gravity is off) ── */
+    snprintf(lbl, sizeof(lbl), "%s###rbGravScale",
+             jce_editor_i18n("rigidbody.gravityScale"));
+    ImGui::BeginDisabled(!rb->use_gravity);
+    ImGui::DragFloat(lbl, &rb->gravity_scale, 0.05f, -10.0f, 10.0f, "%.2f");
+    insp_track_edit();
+    ImGui::EndDisabled();
+
+    /* ── Friction / restitution (overridden when a material is set) ── */
+    ImGui::BeginDisabled(rb->physmat_path[0] != '\0');
+    snprintf(lbl, sizeof(lbl), "%s###rbFriction",
+             jce_editor_i18n("rigidbody.friction"));
+    ImGui::DragFloat(lbl, &rb->friction, 0.01f, 0.0f, 10.0f, "%.2f");
+    insp_track_edit();
+    snprintf(lbl, sizeof(lbl), "%s###rbRestitution",
+             jce_editor_i18n("rigidbody.restitution"));
+    ImGui::DragFloat(lbl, &rb->restitution, 0.01f, 0.0f, 1.0f, "%.2f");
+    insp_track_edit();
+    ImGui::EndDisabled();
+
+    /* ── Collision layer (indexes the project Layer Collision Matrix) ── */
+    {
+        const JceProjectSettings *ps = jce_project_settings_current();
+        const char *names[JCE_PS_LAYER_COUNT];
+        static char fb[JCE_PS_LAYER_COUNT][24];
+        for (int i = 0; i < JCE_PS_LAYER_COUNT; ++i) {
+            const char *nm = ps ? ps->tags_layers.layers[i] : "";
+            if (!nm || !nm[0]) {
+                snprintf(fb[i], sizeof fb[i], "Layer %d", i);
+                names[i] = fb[i];
+            } else {
+                names[i] = nm;
+            }
+        }
+        int layer = (int)rb->physics_layer;
+        if (layer < 0 || layer >= JCE_PS_LAYER_COUNT) layer = 0;
+        snprintf(lbl, sizeof(lbl), "%s###rbLayer",
+                 jce_editor_i18n("rigidbody.layer"));
+        if (ImGui::Combo(lbl, &layer, names, JCE_PS_LAYER_COUNT)) {
+            rb->physics_layer = (uint32_t)layer;
+            insp_track_edit();
+        }
+    }
+
+    /* ── Physics material override (.physmat.json) ── */
+    snprintf(lbl, sizeof(lbl), "%s###rbPhysMat",
+             jce_editor_i18n("rigidbody.physMaterial"));
+    jce_draw_path_input_asset(lbl, rb->physmat_path, sizeof rb->physmat_path,
+                              JCE_ASSET_KIND_DATA);
+    insp_track_edit();
+    accept_asset_drop(rb->physmat_path, sizeof rb->physmat_path);
 
     /* ── Continuous Collision Detection (P3-C.3) ─────────────────── */
     const char *ccd_items[4] = {
@@ -150,6 +203,14 @@ void draw_comp_compound_collider(JceCompoundColliderComponent *cc)
     ImGui::DragFloat(jce_editor_i18n_id("inspector.compcol.restitution", "compcol"),
                      &cc->restitution, 0.01f, 0.0f, 1.0f, "%.2f"); insp_track_edit();
 
+    /* Physics material override (.physmat.json) — friction/restitution above
+     * are ignored when a material is assigned. */
+    jce_draw_path_input_asset(jce_editor_i18n_id("inspector.compcol.physMaterial", "compcol"),
+                              cc->physmat_path, sizeof cc->physmat_path,
+                              JCE_ASSET_KIND_DATA);
+    insp_track_edit();
+    accept_asset_drop(cc->physmat_path, sizeof cc->physmat_path);
+
     /* VHACD tuning only matters for the convex-decomposition mode. */
     if (cc->mode == 5) {
         ImGui::SeparatorText(jce_editor_i18n("inspector.compcol.vhacd"));
@@ -192,6 +253,44 @@ void draw_comp_constraint(JceConstraintComponent *con)
     int prev_type = con->constraint_type;
     if (ImGui::Combo(jce_editor_i18n("constraint.type"), &con->constraint_type, constraint_types, 4))
         insp_undo_int(&con->constraint_type, prev_type);
+
+    /* Connected body — drag an entity from the Hierarchy here.  0 (empty)
+     * anchors the constraint to the world. */
+    {
+        JceScene *scene = jce_state_get_scene();
+        char tgt[160];
+        if (con->target_entity == 0) {
+            snprintf(tgt, sizeof tgt, "%s",
+                     jce_editor_i18n("constraint.worldAnchor"));
+        } else {
+            const char *nm = scene ? jce_scene_entity_name(
+                                 scene, (JceEntity)con->target_entity) : NULL;
+            if (nm && nm[0]) snprintf(tgt, sizeof tgt, "%s", nm);
+            else             snprintf(tgt, sizeof tgt, "Entity #%u",
+                                      con->target_entity);
+        }
+        ImGui::TextUnformatted(jce_editor_i18n("constraint.connectedBody"));
+        ImGui::SameLine();
+        ImGui::Button(tgt, ImVec2(-1.0f, 0.0f));
+        if (ImGui::BeginDragDropTarget()) {
+            if (const ImGuiPayload *pl =
+                    ImGui::AcceptDragDropPayload(JCE_DND_ENTITY)) {
+                uint32_t id = *(const uint32_t *)pl->Data;
+                if (id != (uint32_t)con->target_entity) {
+                    con->target_entity = id;
+                    insp_track_edit();
+                }
+            }
+            ImGui::EndDragDropTarget();
+        }
+        if (con->target_entity != 0) {
+            if (ImGui::SmallButton(jce_editor_i18n("constraint.clearTarget"))) {
+                con->target_entity = 0;
+                insp_track_edit();
+            }
+        }
+    }
+
     ImGui::DragFloat3(jce_editor_i18n("constraint.pivotA"), con->pivot_a, 0.1f);
     insp_track_edit();
     ImGui::DragFloat3(jce_editor_i18n("constraint.pivotB"), con->pivot_b, 0.1f);

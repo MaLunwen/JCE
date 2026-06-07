@@ -338,7 +338,11 @@ def conan_install(t: dict, config: str, env: dict) -> Path:
         log(f"conan toolchain present ({config}): {tc} (skip; --clean to force)")
         return tc
     sync_conan_hooks()
-    extra = ["-s", "build_type=Debug"] if config == "Debug" else []
+    # Debug: also force the DEBUG CRT runtime (/MDd) for deps so they match the
+    # editor's /MDd debug code (the shared profile pins runtime_type=Release,
+    # which makes a /MDd editor unlinkable against /MD deps — LNK2038).
+    extra = (["-s", "build_type=Debug", "-s", "compiler.runtime_type=Debug"]
+             if config == "Debug" else [])
     # Point conan's own vcvars at the SAME VS we use (toolset 14.4x matching
     # msvc 194). Without this, conan may pick another VS line for from-source
     # dep builds (e.g. a 14.5x preview) → "vcvars_ver=14.4 toolset not found".
@@ -781,14 +785,30 @@ def cmd_cook(args) -> None:
     if not cooker.exists():
         env = msvc_env(resolve_target(None))
         cooker = ensure_host_tools(env, ("jce_cook",))["jce_cook"]
-    src = project / "assets"
-    out = project / "resources" / "_cooked"
+    manifest = read_manifest(project)
+    src = project / (manifest.get("source_assets") or "assets")
+    out = project / (manifest.get("cooked_assets") or "resources/_cooked")
+    # Target platform drives GPU texture compression (desktop -> BC, mobile ->
+    # ASTC). Default to the host so a plain `cook` produces compressed textures.
+    plat = getattr(args, "platform", None) or resolve_target(None)["host"]
     run([str(cooker), "--batch", str(src), str(out),
-         "--preserve-names", "--level", "0", "--max-texture-size", "2048"], cwd=ROOT)
+         "--preserve-names", "--level", "0", "--max-texture-size", "2048",
+         "--platform", plat], cwd=ROOT)
 
 
-def cmd_serve(_args) -> None:
-    run([sys.executable, str(ROOT / "scripts" / "serve-web.py")], cwd=ROOT)
+def cmd_serve(args) -> None:
+    cmd = [sys.executable, str(ROOT / "scripts" / "serve-web.py")]
+    if args.port:
+        cmd += ["--port", str(args.port)]
+    if args.host:
+        cmd += ["--host", args.host]
+    if args.directory:
+        cmd += ["--dir", args.directory]
+    if args.entry:
+        cmd += ["--entry", args.entry]
+    if args.no_open:
+        cmd.append("--no-open")
+    run(cmd, cwd=ROOT)
 
 
 def cmd_lint(_args) -> None:
@@ -934,6 +954,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_cook)
 
     sp = sub.add_parser("serve", help="serve the web build")
+    sp.add_argument("--port", type=int, default=None)
+    sp.add_argument("--host", default=None)
+    sp.add_argument("--dir", "--directory", dest="directory", default=None)
+    sp.add_argument("--entry", default=None)
+    sp.add_argument("--no-open", action="store_true")
     sp.set_defaults(func=cmd_serve)
 
     sp = sub.add_parser("lint", help="run the lint suite")

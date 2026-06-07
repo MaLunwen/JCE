@@ -16,9 +16,9 @@ uint32_t jce_rgba(uint8_t r, uint8_t g, uint8_t b, uint8_t a)
          | ((uint32_t)g <<  8) |  (uint32_t)r;
 }
 
-void jce_draw_filled_rect(const JceRenderer *r,
-                          float x, float y, float w, float h,
-                          uint32_t color)
+void jce_draw_filled_rect_view(const JceRenderer *r, uint16_t view_id,
+                               float x, float y, float w, float h,
+                               uint32_t color)
 {
     const bgfx_vertex_layout_t *layout = jce_renderer_get_layout(r);
     bgfx_program_handle_t prog = jce_renderer_get_program(r);
@@ -44,7 +44,14 @@ void jce_draw_filled_rect(const JceRenderer *r,
     bgfx_set_transient_index_buffer(&tib, 0, 6);
     bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
                  | BGFX_STATE_BLEND_ALPHA, 0);
-    bgfx_submit(JCE_VIEW_UI, prog, 0, BGFX_DISCARD_ALL);
+    bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+}
+
+void jce_draw_filled_rect(const JceRenderer *r,
+                          float x, float y, float w, float h,
+                          uint32_t color)
+{
+    jce_draw_filled_rect_view(r, JCE_VIEW_UI, x, y, w, h, color);
 }
 
 void jce_draw_rect_outline(const JceRenderer *r,
@@ -144,10 +151,10 @@ void jce_draw_polyline(const JceRenderer *r,
     bgfx_submit(JCE_VIEW_UI, prog, 0, BGFX_DISCARD_ALL);
 }
 
-void jce_draw_textured_rect(const JceRenderer *r,
-                            float x, float y, float w, float h,
-                            JceTexture tex, uint32_t tint,
-                            const float *uv)
+void jce_draw_textured_rect_view(const JceRenderer *r, uint16_t view_id,
+                                 float x, float y, float w, float h,
+                                 JceTexture tex, uint32_t tint,
+                                 const float *uv)
 {
     const bgfx_vertex_layout_t *layout = jce_renderer_get_layout_textured(r);
     bgfx_program_handle_t prog = jce_renderer_get_program_textured(r);
@@ -182,5 +189,13 @@ void jce_draw_textured_rect(const JceRenderer *r,
     bgfx_set_texture(0, sampler, bgfx_tex, UINT32_MAX);
     bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
                  | BGFX_STATE_BLEND_ALPHA, 0);
-    bgfx_submit(JCE_VIEW_UI, prog, 0, BGFX_DISCARD_ALL);
+    bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+}
+
+void jce_draw_textured_rect(const JceRenderer *r,
+                            float x, float y, float w, float h,
+                            JceTexture tex, uint32_t tint,
+                            const float *uv)
+{
+    jce_draw_textured_rect_view(r, JCE_VIEW_UI, x, y, w, h, tex, tint, uv);
 }

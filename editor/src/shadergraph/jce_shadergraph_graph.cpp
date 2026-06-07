@@ -28,6 +28,20 @@ bool find_link_into(const Graph &g, int to_node, int to_sock, Link *out)
     return false;
 }
 
+const Node *find_node(const Graph &g, int id)
+{
+    for (const auto &n : g.nodes)
+        if (n.id == id) return &n;
+    return nullptr;
+}
+
+const Link *find_link_into(const Graph &g, int to_node, int to_sock)
+{
+    for (const auto &l : g.links)
+        if (l.to_node == to_node && l.to_sock == to_sock) return &l;
+    return nullptr;
+}
+
 Node *add_node(Graph &g, NodeType t, Vec2 pos)
 {
     Node n;

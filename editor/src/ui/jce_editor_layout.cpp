@@ -42,6 +42,7 @@ extern "C" {
 #include "core/jce_editor_recorder.h"        /* F9 VP9/WebM recorder */
 #include "core/jce_editor_toast.h"
 #include "core/jce_hotkeys.h"
+#include "scene/jce_editor_game_render.h"   /* jce_editor_game_render_is_mouse_captured */
 #include "core/jce_workspace.h"
 #include "panels/jce_panel_preferences.h"
 #include "scene/jce_editor_scene_render.h"
@@ -72,6 +73,84 @@ static bool s_show_welcome     = true;  /* shown at startup; auto-closes if a pr
 static int  s_unsaved_result   = 0;
 static bool s_quit_after_save_as = false;
 static bool s_quit_confirmed = false;
+
+/* ── Unsaved-changes gate ─────────────────────────────────────────────
+ * New Scene / Open Scene / Open Project / Open Recent all discard the
+ * current in-memory scene.  Each routes through request_gated_action(),
+ * which (when the scene is dirty) defers the action behind the SAME
+ * Save / Don't-Save / Cancel modal that quit already uses, and only
+ * runs the action once the user confirms (Save succeeded, or Don't Save).
+ *
+ * The dialog drives the shared s_show_unsaved / s_unsaved_result state
+ * machine; s_pending_action tells the post-dialog handler whether this
+ * was a quit (PGA_QUIT, keeps the existing save→save-as→quit deferral)
+ * or one of the scene-swap actions. */
+typedef enum {
+    PGA_NONE = 0,
+    PGA_QUIT,
+    PGA_NEW_SCENE,
+    PGA_OPEN_SCENE,
+    PGA_OPEN_PROJECT,
+    PGA_OPEN_RECENT_SCENE,
+    PGA_OPEN_RECENT_PROJECT,
+} PendingGatedAction;
+
+static PendingGatedAction s_pending_action = PGA_NONE;
+static char s_pending_path[1024] = {0};       /* payload for OPEN_RECENT_* */
+static bool s_run_pending_after_save = false;  /* Save chosen → run once saved */
+
+/* Perform the deferred scene-swap action.  Quit is handled separately by
+ * the existing quit state machine and never reaches here. */
+static void run_gated_action(PendingGatedAction act, const char *path)
+{
+    switch (act) {
+    case PGA_NEW_SCENE:
+        (void)jce_editor_layout_run_new_scene_command();
+        break;
+    case PGA_OPEN_SCENE:
+        s_show_open_scene = true;
+        break;
+    case PGA_OPEN_PROJECT:
+        s_show_open_project = true;
+        break;
+    case PGA_OPEN_RECENT_SCENE:
+        if (path && path[0])
+            (void)jce_state_load_scene_file(path);
+        break;
+    case PGA_OPEN_RECENT_PROJECT:
+        if (path && path[0])
+            jce_editor_dialog_open_project_set_path(path);
+        s_show_open_project = true;
+        break;
+    default:
+        break;
+    }
+}
+
+/* Gate a scene-discarding action behind the unsaved-changes modal.
+ * If the scene is clean (or a gate/modal is already in flight) the
+ * action runs immediately; otherwise it is stashed and the modal opens. */
+static void request_gated_action(PendingGatedAction act, const char *path = NULL)
+{
+    if (act == PGA_NONE) return;
+
+    /* A confirm flow (gate or quit) is already in progress — ignore the
+     * new request rather than stacking modals. */
+    if (s_show_unsaved || s_pending_action != PGA_NONE)
+        return;
+
+    if (!jce_state_is_scene_modified()) {
+        run_gated_action(act, path);
+        return;
+    }
+
+    s_pending_action = act;
+    s_pending_path[0] = '\0';
+    if (path && path[0])
+        snprintf(s_pending_path, sizeof(s_pending_path), "%s", path);
+    s_unsaved_result = 0;
+    s_show_unsaved   = true;
+}
 
 /* ── Docking state ────────────────────────────────────────────────── */
 
@@ -306,8 +385,18 @@ static void handle_global_edit_shortcuts(void)
         return;
     }
 
-    /* Avoid stealing shortcuts while typing in text fields. */
+    /* Avoid stealing shortcuts while typing in a text field. */
     if (io.WantTextInput)
+        return;
+
+    /* Suppress editor shortcuts ONLY while actively controlling a RUNNING game
+       in the Game View — i.e. play is live AND the Game View has grabbed input
+       (the user clicked in to drive it). Only then do in-game keys (Ctrl+A /
+       Ctrl+S / …) risk firing editor commands. In edit mode, and in every other
+       panel (Hierarchy Ctrl+A / Ctrl+Z, …), shortcuts work normally. The UI
+       keys above (F9/F11/F12) stay live so you can screenshot/record during play. */
+    if (jce_state_get_play_state() != JCE_PLAY_STOPPED &&
+        jce_editor_game_render_is_mouse_captured())
         return;
 
     /* Modal dialogs must block background state changes. */
@@ -323,11 +412,11 @@ static void handle_global_edit_shortcuts(void)
         return;
     }
     if (jce_hotkey_pressed(JCE_HK_FILE_OPEN)) {
-        s_show_open_scene = true;
+        request_gated_action(PGA_OPEN_SCENE);
         return;
     }
     if (jce_hotkey_pressed(JCE_HK_FILE_NEW)) {
-        (void)jce_editor_layout_run_new_scene_command();
+        request_gated_action(PGA_NEW_SCENE);
         return;
     }
 
@@ -450,18 +539,18 @@ static bool  s_palette_focus_query = false;
 /* Action helpers -- thin wrappers around existing code paths. */
 static void cmd_undo_(void)              { if (jce_state_can_undo()) jce_state_undo(); }
 static void cmd_redo_(void)              { if (jce_state_can_redo()) jce_state_redo(); }
-static void cmd_new_scene_(void)         { (void)jce_editor_layout_run_new_scene_command(); }
-static void cmd_open_scene_(void)        { s_show_open_scene = true; }
+static void cmd_new_scene_(void)         { request_gated_action(PGA_NEW_SCENE); }
+static void cmd_open_scene_(void)        { request_gated_action(PGA_OPEN_SCENE); }
 static void cmd_save_scene_(void)        { save_scene_or_open_save_as(); }
 static void cmd_save_scene_as_(void)     { s_show_save_as = true; }
 static void cmd_new_project_(void)       { s_show_new_project = true; }
-static void cmd_open_project_(void)      { s_show_open_project = true; }
+static void cmd_open_project_(void)      { request_gated_action(PGA_OPEN_PROJECT); }
 
 /* Public entry points for the Welcome screen. */
 extern "C" void jce_editor_layout_request_new_project(void)
     { s_show_new_project = true; }
 extern "C" void jce_editor_layout_request_open_project(void)
-    { s_show_open_project = true; }
+    { request_gated_action(PGA_OPEN_PROJECT); }
 static void cmd_build_settings_(void)    { s_show_build = true; }
 static void cmd_build_bundles_(void)     { s_show_bundles = true; }
 static void cmd_pack_current_scene_(void) {
@@ -857,9 +946,9 @@ static void draw_menu_bar(void)
     /* ── File ──────────────────────────────────────────────────────── */
     if (ImGui::BeginMenu(jce_editor_i18n("menu.file"))) {
         if (ImGui::MenuItem(jce_editor_i18n("menu.file.newScene"),    "Ctrl+N"))
-            (void)jce_editor_layout_run_new_scene_command();
+            request_gated_action(PGA_NEW_SCENE);
         if (ImGui::MenuItem(jce_editor_i18n("menu.file.openScene"),   "Ctrl+O"))
-            s_show_open_scene = true;
+            request_gated_action(PGA_OPEN_SCENE);
         /* Recent Scenes submenu — fed from JceEditorConfig.recent_scene_paths.
          * Missing files are grayed out (with a (missing) suffix) and clicking
          * them removes them from the list. */
@@ -882,9 +971,10 @@ static void draw_menu_bar(void)
                     }
                     if (!exists) ImGui::BeginDisabled(true);
                     if (ImGui::MenuItem(label)) {
-                        if (!jce_state_load_scene_file(p)) {
-                            remove_idx = i;
-                        }
+                        /* Gate the discard behind the unsaved-changes modal;
+                         * the path is copied into the pending-action buffer
+                         * so the deferred load is safe across frames. */
+                        request_gated_action(PGA_OPEN_RECENT_SCENE, p);
                     }
                     if (!exists) {
                         ImGui::EndDisabled();
@@ -932,8 +1022,7 @@ static void draw_menu_bar(void)
                     }
                     if (!exists) ImGui::BeginDisabled(true);
                     if (ImGui::MenuItem(label)) {
-                        jce_editor_dialog_open_project_set_path(p);
-                        s_show_open_project = true;
+                        request_gated_action(PGA_OPEN_RECENT_PROJECT, p);
                     }
                     if (!exists) {
                         ImGui::EndDisabled();
@@ -970,7 +1059,7 @@ static void draw_menu_bar(void)
         if (ImGui::MenuItem(jce_editor_i18n("menu.file.new")))
             s_show_new_project = true;
         if (ImGui::MenuItem(jce_editor_i18n("menu.file.open")))
-            s_show_open_project = true;
+            request_gated_action(PGA_OPEN_PROJECT);
         ImGui::Separator();
         if (ImGui::MenuItem(jce_editor_i18n("menu.file.buildSettings"), "Ctrl+B"))
             s_show_build = true;
@@ -2699,24 +2788,68 @@ void jce_editor_layout_draw(void)
     /* Toast overlay — draw last so it renders on top of everything. */
     jce_editor_toast_draw();
 
+    /* Unsaved-changes modal resolved → carry out the pending action.
+     * The SAME state machine serves quit and the scene-swap gate; which
+     * one is distinguished by s_pending_action.  result 1 = Save,
+     * 2 = Don't Save, 3 = Cancel. */
     if (!s_show_unsaved && s_unsaved_result != 0) {
+        bool is_quit  = (s_pending_action == PGA_QUIT);
+        bool confirmed = false;     /* proceed with the action now */
+        bool defer_after_save = false;  /* Save needs Save-As first */
+
         if (s_unsaved_result == 1) {
             SaveSceneResult save_result = save_scene_or_open_save_as();
             if (save_result == SAVE_SCENE_RESULT_OK)
-                s_quit_confirmed = true;
+                confirmed = true;
             else if (save_result == SAVE_SCENE_RESULT_NEEDS_PATH)
-                s_quit_after_save_as = true;
+                defer_after_save = true;
+            /* SAVE_SCENE_RESULT_FAILED: abort, keep the scene as-is. */
         } else if (s_unsaved_result == 2) {
-            s_quit_confirmed = true;
+            confirmed = true;       /* Don't Save → discard */
+        }
+        /* result == 3 (Cancel) or save failed: abort, do nothing. */
+
+        if (is_quit) {
+            if (confirmed)        s_quit_confirmed     = true;
+            if (defer_after_save) s_quit_after_save_as = true;
+        } else {
+            if (confirmed) {
+                run_gated_action(s_pending_action, s_pending_path);
+            } else if (defer_after_save) {
+                s_run_pending_after_save = true;
+            }
+        }
+
+        /* Clear the gate now unless we are deferring until Save-As resolves
+         * (in which case s_pending_action is needed by the follow-up block). */
+        if (!defer_after_save) {
+            s_pending_action = PGA_NONE;
+            s_pending_path[0] = '\0';
         }
         s_unsaved_result = 0;
     }
 
-    if (s_quit_after_save_as && !s_show_save_as) {
+    /* Save-As (chosen via the modal's "Save") has resolved — finish the
+     * deferred quit or gated action now that a scene path exists. */
+    if ((s_quit_after_save_as || s_run_pending_after_save) && !s_show_save_as) {
         const char *scene_path = jce_state_get_current_scene_path();
-        if (scene_path && scene_path[0] != '\0')
-            s_quit_confirmed = true;
-        s_quit_after_save_as = false;
+        bool saved = (scene_path && scene_path[0] != '\0');
+        if (s_quit_after_save_as) {
+            if (saved) s_quit_confirmed = true;
+            s_quit_after_save_as = false;
+            /* Whether the save resolved or the user backed out of Save-As,
+             * the quit gate is done — release it so later actions aren't
+             * blocked by a lingering PGA_QUIT. */
+            s_pending_action = PGA_NONE;
+            s_pending_path[0] = '\0';
+        }
+        if (s_run_pending_after_save) {
+            if (saved)
+                run_gated_action(s_pending_action, s_pending_path);
+            s_run_pending_after_save = false;
+            s_pending_action = PGA_NONE;
+            s_pending_path[0] = '\0';
+        }
     }
 
     /* Play Mode tint: pop styles + draw a thick orange outline around the
@@ -2776,6 +2909,7 @@ void jce_editor_layout_request_quit(void)
         return;
     }
 
+    s_pending_action = PGA_QUIT;
     s_unsaved_result = 0;
     s_show_unsaved   = true;
 }

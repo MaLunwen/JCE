@@ -13,8 +13,24 @@
 
 #define LOG_TAG "scene"
 
+/* Implemented in jce_scene_video.c — installs flecs lifecycle hooks
+ * (ctor/dtor/copy/move) on the VideoPlayer component so its decoder handle
+ * + GPU texture follow correct ownership across table moves, copies,
+ * removal, entity delete, and world fini.  VideoPlayer is the only scene
+ * component holding engine-side resources, so it is the only one needing
+ * hooks. */
+void jce_scene_video_install_hooks(ecs_world_t *world, ecs_entity_t comp_id);
+
+/* Defined in jce_scene_particles.c — releases the lazy particle system. */
+void jce_scene_particles_shutdown(JceScene *s);
+
 /* ── Component IDs (registered once per world) ─────────────────────── */
 
+/* Internal: per-entity bitmask of DISABLED components (Unity-style enable
+ * toggle). One JCE_COMP_FLAG_* bit each. Absent component ⇒ all enabled. */
+typedef struct { uint64_t disabled; } JceCompEnableState;
+
+static ECS_COMPONENT_DECLARE(JceCompEnableState);
 static ECS_COMPONENT_DECLARE(JceTransform);
 static ECS_COMPONENT_DECLARE(JceMeshRenderer);
 static ECS_COMPONENT_DECLARE(JceCameraComponent);
@@ -36,6 +52,7 @@ static ECS_COMPONENT_DECLARE(JceBoxColliderComponent);
 static ECS_COMPONENT_DECLARE(JceSphereColliderComponent);
 static ECS_COMPONENT_DECLARE(JceCharacterControllerComponent);
 static ECS_COMPONENT_DECLARE(JceAudioSourceComponent);
+static ECS_COMPONENT_DECLARE(JceVideoPlayerComponent);
 static ECS_COMPONENT_DECLARE(JceScriptComponent);
 static ECS_COMPONENT_DECLARE(JceEditorMeta);
 static ECS_COMPONENT_DECLARE(JceTerrainComponent);
@@ -82,13 +99,65 @@ static ECS_COMPONENT_DECLARE(JceLayerComponent);
 static ECS_COMPONENT_DECLARE(JceVolumeComponent);
 static ECS_COMPONENT_DECLARE(JceOcclusionPortalComponent);
 
+/* ── Internal world-matrix cache (side table) ──────────────────────────
+ *
+ * Per-entity memo of the composed world matrix (world = parent_world *
+ * local) plus the frame epoch it was computed for. This is deliberately a
+ * scene-owned open-addressing hash keyed by the flecs entity id, NOT a
+ * flecs component: jce_scene_get_world_matrix is called from inside live
+ * flecs query iterations (e.g. the runtime's rt_pick_primary_cam via
+ * jce_scene_each_entity), and adding a component to an entity mid-iteration
+ * would move it to a new table and corrupt the iterator. A side table has
+ * zero interaction with flecs table layout, so it is safe everywhere.
+ *
+ * The cache is never serialized, flagged, or otherwise observable — it is
+ * pure caching state. jce_scene_get_world_matrix recomputes an entity (and
+ * memoizes each ancestor it visits) only when the cached epoch differs from
+ * the scene's current world_epoch; jce_scene_invalidate_world_cache (called
+ * by jce_scene_update each tick, by the scene renderer / pick pass at the
+ * top of each render, and on reparent) bumps world_epoch and empties the
+ * table to start a fresh generation. Within one frame each entity's world
+ * matrix is therefore composed exactly once — a parent shared by K children
+ * is no longer recomposed K times — turning the old O(N*depth) per-frame
+ * rebuild into O(N). */
+typedef struct {
+    uint64_t key;     /* entity id; 0 = empty slot */
+    uint64_t epoch;   /* world_epoch this `world` was computed for */
+    jce_mat4 world;
+} JceWorldCacheSlot;
+
+typedef struct {
+    JceWorldCacheSlot *slots;
+    uint32_t           cap;       /* power of two; 0 until first use */
+    uint32_t           live;      /* occupied slots (current+stale entries) */
+} JceWorldCache;
+
 /* ── Scene struct ──────────────────────────────────────────────────── */
 
 struct JceScene {
     ecs_world_t *world;
     JceSceneRenderingSettings rendering_settings;
     bool has_rendering_settings;
+    ecs_query_t *cloth_query;   /* cached; created lazily in jce_scene_update */
+    ecs_query_t *each_query;    /* cached; created lazily in jce_scene_each_entity
+                                 * (leak fix: was ecs_query()+ecs_query_fini() on
+                                 * EVERY call, 4-5x/frame in Play → unbounded) */
+    uint64_t      world_epoch;  /* bumped per frame to invalidate the world-matrix cache */
+    JceWorldCache world_cache;  /* per-entity world matrix memo (side table) */
+    void         *particles;    /* JceParticleSystem* (lazy; owned by jce_scene_particles.c) */
 };
+
+/* Internal storage hooks for jce_scene_particles.c (same translation unit
+ * cannot see `struct JceScene`).  Kept off the public API surface. */
+void  *jce_scene_internal_particles_get(const JceScene *s)
+{
+    return s ? s->particles : NULL;
+}
+
+void jce_scene_internal_particles_set(JceScene *s, void *sys)
+{
+    if (s) s->particles = sys;
+}
 
 static void scene_rendering_settings_sanitize(JceSceneRenderingSettings *r)
 {
@@ -135,6 +204,25 @@ static void scene_rendering_settings_sanitize(JceSceneRenderingSettings *r)
         r->exposure = 0.0f;
     if (r->gamma <= 0.0f)
         r->gamma = 2.2f;
+
+    /* Time-of-day clamps (wrap hour into [0,24) without pulling in math.h;
+     * authored values are small so a bounded loop is fine). */
+    while (r->tod_hour >= 24.0f) r->tod_hour -= 24.0f;
+    while (r->tod_hour < 0.0f)   r->tod_hour += 24.0f;
+    if (r->tod_speed < 0.0f)
+        r->tod_speed = 0.0f;
+    if (r->tod_dawn_hour <= 0.0f && r->tod_dusk_hour <= 0.0f) {
+        r->tod_dawn_hour = 6.0f;
+        r->tod_dusk_hour = 18.0f;
+    }
+
+    /* Weather clamps. */
+    if (r->weather_type < 0 || r->weather_type > 2)
+        r->weather_type = 0;
+    if (r->weather_intensity < 0.0f)
+        r->weather_intensity = 0.0f;
+    if (r->weather_intensity > 1.0f)
+        r->weather_intensity = 1.0f;
 }
 
 JceSceneRenderingSettings jce_scene_rendering_settings_default(void)
@@ -173,6 +261,18 @@ JceSceneRenderingSettings jce_scene_rendering_settings_default(void)
     r.vignette_intensity = 0.3f;
     r.vignette_smoothness = 2.0f;
     r.chromatic_strength = 0.005f;
+
+    /* Time-of-day (off by default; renderer keeps its hardcoded sky). */
+    r.tod_enabled    = false;
+    r.tod_hour       = 12.0f;
+    r.tod_speed      = 0.0f;
+    r.tod_latitude   = 35.0f;
+    r.tod_dawn_hour  = 6.0f;
+    r.tod_dusk_hour  = 18.0f;
+
+    /* Weather (clear by default → overlay is a no-op). */
+    r.weather_type      = 0;     /* JCE_WEATHER_CLEAR */
+    r.weather_intensity = 0.0f;
     return r;
 }
 
@@ -228,8 +328,12 @@ JceScene *jce_scene_create(void)
     }
     s->rendering_settings = jce_scene_rendering_settings_default();
     s->has_rendering_settings = false;
+    /* Start at 1 so a freshly zeroed cache slot (epoch 0) is always seen as
+       stale on first access. world_cache stays zero-init until first use. */
+    s->world_epoch = 1;
 
     /* Register components. */
+    ECS_COMPONENT_DEFINE(s->world, JceCompEnableState);
     ECS_COMPONENT_DEFINE(s->world, JceTransform);
     ECS_COMPONENT_DEFINE(s->world, JceMeshRenderer);
     ECS_COMPONENT_DEFINE(s->world, JceCameraComponent);
@@ -251,6 +355,7 @@ JceScene *jce_scene_create(void)
     ECS_COMPONENT_DEFINE(s->world, JceSphereColliderComponent);
     ECS_COMPONENT_DEFINE(s->world, JceCharacterControllerComponent);
     ECS_COMPONENT_DEFINE(s->world, JceAudioSourceComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceVideoPlayerComponent);
     ECS_COMPONENT_DEFINE(s->world, JceScriptComponent);
     ECS_COMPONENT_DEFINE(s->world, JceEditorMeta);
     ECS_COMPONENT_DEFINE(s->world, JceTerrainComponent);
@@ -297,6 +402,11 @@ JceScene *jce_scene_create(void)
     ECS_COMPONENT_DEFINE(s->world, JceVolumeComponent);
     ECS_COMPONENT_DEFINE(s->world, JceOcclusionPortalComponent);
 
+    /* VideoPlayer owns a live decoder handle + a GPU texture; install
+     * lifecycle hooks so those resources follow correct ownership across
+     * table moves / copies / removal / entity delete / world fini. */
+    jce_scene_video_install_hooks(s->world, ecs_id(JceVideoPlayerComponent));
+
     LOG_SUCCESS(LOG_TAG, "scene created");
     return s;
 }
@@ -304,7 +414,11 @@ JceScene *jce_scene_create(void)
 void jce_scene_destroy(JceScene *s)
 {
     if (!s) return;
+    jce_scene_particles_shutdown(s);                    /* free lazy particle sys */
+    if (s->cloth_query) ecs_query_fini(s->cloth_query); /* before world fini */
+    if (s->each_query)  ecs_query_fini(s->each_query);  /* before world fini */
     if (s->world) ecs_fini(s->world);
+    if (s->world_cache.slots) JCE_FREE(s->world_cache.slots);
     JCE_FREE(s);
     LOG_INFO(LOG_TAG, "scene destroyed");
 }
@@ -375,6 +489,8 @@ int jce_scene_clear(JceScene *s)
     if (ids != stack_buf) JCE_FREE(ids);
 
     jce_scene_clear_rendering_settings(s);
+    /* Drop any cached world matrices for the now-deleted entities. */
+    jce_scene_invalidate_world_cache(s);
 
     LOG_INFO(LOG_TAG, "scene cleared (%d entities)", count);
     JCE_PROFILE_ZONE_END;
@@ -442,6 +558,11 @@ void jce_scene_set_parent(JceScene *s, JceEntity child, JceEntity parent)
         ecs_add_pair(s->world, (ecs_entity_t)child,
                      EcsChildOf, (ecs_entity_t)parent);
     }
+    /* Reparent changes the world matrix of `child` and its whole subtree.
+       Drop the cache so a same-frame re-read (e.g. the editor's reparent
+       back-solve that captures child world, reparents, then reads the new
+       parent's world) never returns a pre-reparent matrix. */
+    jce_scene_invalidate_world_cache(s);
 }
 
 JceEntity jce_scene_get_parent(const JceScene *s, JceEntity e)
@@ -462,26 +583,131 @@ static jce_mat4 scene_local_matrix(JceScene *s, JceEntity e)
     return jce_m4_from_trs(t->position, t->rotation, sc);
 }
 
+/* ── World-matrix cache side table (open addressing, linear probe) ──── */
+
+/* Splitmix64 finalizer — disperses flecs entity ids (which carry a
+   generation in the high bits) well for power-of-two masking. */
+static uint64_t scene_world_cache_hash(uint64_t x)
+{
+    x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27; x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    return x;
+}
+
+/* Look up `key` without mutating the table. Returns the slot if present
+   (key already stored), else NULL. Never grows, so the returned pointer is
+   only valid until the next scene_world_cache_put(). */
+static JceWorldCacheSlot *scene_world_cache_find(JceWorldCache *wc, uint64_t key)
+{
+    if (!wc->slots) return NULL;
+    uint32_t mask = wc->cap - 1;
+    uint32_t i = (uint32_t)(scene_world_cache_hash(key)) & mask;
+    while (wc->slots[i].key) {
+        if (wc->slots[i].key == key) return &wc->slots[i];
+        i = (i + 1) & mask;
+    }
+    return NULL;
+}
+
+/* Insert/overwrite the cached world matrix for `key` at the current epoch.
+   Grows + rehashes as needed (which invalidates any slot pointer obtained
+   before this call). Silently no-ops on allocation failure. */
+static void scene_world_cache_put(JceWorldCache *wc, uint64_t key,
+                                  const jce_mat4 *world, uint64_t epoch)
+{
+    /* Grow when load factor would exceed ~0.75 (or on first use). */
+    if (wc->cap == 0 || (wc->live + 1) * 4 >= wc->cap * 3) {
+        uint32_t new_cap = wc->cap ? wc->cap * 2 : 256;
+        JceWorldCacheSlot *ns =
+            (JceWorldCacheSlot *)JCE_CALLOC(new_cap, sizeof(*ns));
+        if (!ns) return;          /* OOM → skip caching this entity */
+        if (wc->slots) {
+            uint32_t nmask = new_cap - 1;
+            for (uint32_t i = 0; i < wc->cap; i++) {
+                uint64_t k = wc->slots[i].key;
+                if (!k) continue;
+                uint32_t j = (uint32_t)(scene_world_cache_hash(k)) & nmask;
+                while (ns[j].key) j = (j + 1) & nmask;
+                ns[j] = wc->slots[i];
+            }
+            JCE_FREE(wc->slots);
+        }
+        wc->slots = ns;
+        wc->cap   = new_cap;
+    }
+
+    uint32_t mask = wc->cap - 1;
+    uint32_t i = (uint32_t)(scene_world_cache_hash(key)) & mask;
+    while (wc->slots[i].key && wc->slots[i].key != key)
+        i = (i + 1) & mask;
+    if (!wc->slots[i].key) {
+        wc->slots[i].key = key;
+        wc->live++;
+    }
+    wc->slots[i].world = *world;
+    wc->slots[i].epoch = epoch;
+}
+
+/* Begin a new cache generation. Keeps the allocated table (avoids realloc
+   churn on static scenes) but empties it, which both invalidates last
+   frame's matrices and reclaims slots of since-destroyed entities so the
+   table cannot grow without bound. Cheap: one memset of `cap` slots, far
+   less than the O(N) world-matrix composition it guards. */
+void jce_scene_invalidate_world_cache(JceScene *s)
+{
+    if (!s) return;
+    s->world_epoch++;
+    if (s->world_cache.slots && s->world_cache.live) {
+        memset(s->world_cache.slots, 0,
+               (size_t)s->world_cache.cap * sizeof(JceWorldCacheSlot));
+        s->world_cache.live = 0;
+    }
+}
+
+/* Memoized world matrix for one entity within the current frame.
+ *
+ * world = parent_world * local. The parent's world matrix comes from the
+ * same memo (computed once, then cached on the parent), so a parent shared
+ * by K children is composed once per frame instead of K times — that is the
+ * O(N*depth) → O(N) win this cache exists for. A root (no parent) returns
+ * its local matrix unchanged, so flat scenes are bit-identical to the
+ * pre-cache behaviour. `depth` bounds accidental cycles (matches the prior
+ * 32-deep ancestor walk).
+ *
+ * Entries are tagged with ms->world_epoch; a slot whose epoch != the current
+ * epoch is treated as stale and recomputed, so the per-frame epoch bump in
+ * jce_scene_update invalidates the whole scene in O(1). The find/put split
+ * keeps the early-out lookup free of table growth; the put after the
+ * recursion is the only mutation, so no slot pointer is held across a
+ * potential rehash. */
+static jce_mat4 scene_world_matrix_memo(JceScene *ms, JceEntity e, int depth)
+{
+    jce_mat4 local = scene_local_matrix(ms, e);
+
+    JceEntity p = jce_scene_get_parent((const JceScene *)ms, e);
+    if (p == JCE_ENTITY_INVALID || p == e || depth >= 32)
+        return local;             /* root (or cycle/limit guard) */
+
+    /* Reuse this frame's cached world matrix if present and current. */
+    JceWorldCacheSlot *hit = scene_world_cache_find(&ms->world_cache, (uint64_t)e);
+    if (hit && hit->epoch == ms->world_epoch)
+        return hit->world;
+
+    jce_mat4 parent_world = scene_world_matrix_memo(ms, p, depth + 1);
+    jce_mat4 world = jce_m4_multiply(&parent_world, &local);
+
+    scene_world_cache_put(&ms->world_cache, (uint64_t)e, &world,
+                          ms->world_epoch);
+    return world;
+}
+
 jce_mat4 jce_scene_get_world_matrix(const JceScene *s, JceEntity e)
 {
     if (!s || e == JCE_ENTITY_INVALID) return jce_m4_identity();
 
     JceScene *ms = (JceScene *)s; /* getters are non-const but read-only here */
-    jce_mat4 world = scene_local_matrix(ms, e);
-
-    /* Walk ancestors, composing world = parent_local * ... * local. A root
-       (no parent) skips the loop and returns its local matrix unchanged, so
-       flat scenes are bit-identical to the pre-hierarchy behaviour. The depth
-       bound guards against accidental cycles. */
-    JceEntity p = jce_scene_get_parent(s, e);
-    int depth = 0;
-    while (p != JCE_ENTITY_INVALID && p != e && depth < 32) {
-        jce_mat4 pl = scene_local_matrix(ms, p);
-        world = jce_m4_multiply(&pl, &world);
-        p = jce_scene_get_parent(s, p);
-        depth++;
-    }
-    return world;
+    return scene_world_matrix_memo(ms, e, 0);
 }
 
 int jce_scene_get_children(const JceScene *s, JceEntity parent,
@@ -489,36 +715,26 @@ int jce_scene_get_children(const JceScene *s, JceEntity parent,
 {
     if (!s || parent == JCE_ENTITY_INVALID || !out || max_out <= 0) return 0;
 
-    ecs_query_t *q = ecs_query(s->world, {
-        .terms = {{ .id = ecs_pair(EcsChildOf, (ecs_entity_t)parent) }},
-    });
-
+    /* ecs_children() iterates (ChildOf, parent) directly without building and
+       destroying a transient query — this runs per visible hierarchy node
+       every editor frame. The loop still drains the iterator fully (flecs
+       requires it) even after the output buffer fills. */
     int count = 0;
-    ecs_iter_t it = ecs_query_iter(s->world, q);
-    while (ecs_query_next(&it)) {
+    ecs_iter_t it = ecs_children(s->world, (ecs_entity_t)parent);
+    while (ecs_children_next(&it)) {
         for (int i = 0; i < it.count && count < max_out; i++) {
             out[count++] = (JceEntity)it.entities[i];
         }
     }
-    ecs_query_fini(q);
     return count;
 }
 
 int jce_scene_get_child_count(const JceScene *s, JceEntity parent)
 {
     if (!s || parent == JCE_ENTITY_INVALID) return 0;
-
-    ecs_query_t *q = ecs_query(s->world, {
-        .terms = {{ .id = ecs_pair(EcsChildOf, (ecs_entity_t)parent) }},
-    });
-
-    int count = 0;
-    ecs_iter_t it = ecs_query_iter(s->world, q);
-    while (ecs_query_next(&it)) {
-        count += it.count;
-    }
-    ecs_query_fini(q);
-    return count;
+    /* Direct pair count — no per-call query alloc/iterate/fini. Called per
+       visible hierarchy node every editor frame. */
+    return (int)ecs_count_id(s->world, ecs_pair(EcsChildOf, (ecs_entity_t)parent));
 }
 
 /* ── Component setters / getters / has / remove (macro-generated) ─── */
@@ -567,6 +783,7 @@ JCE_COMP_IMPL(JceBoxColliderComponent,        box_collider)
 JCE_COMP_IMPL(JceSphereColliderComponent,     sphere_collider)
 JCE_COMP_IMPL(JceCharacterControllerComponent,character_controller)
 JCE_COMP_IMPL(JceAudioSourceComponent,        audio_source)
+JCE_COMP_IMPL(JceVideoPlayerComponent,        video_player)
 JCE_COMP_IMPL(JceScriptComponent,             script)
 JCE_COMP_IMPL(JceParticleEmitterComponent,    particle_emitter)
 JCE_COMP_IMPL(JceBehaviorTree,                behavior_tree)
@@ -618,6 +835,42 @@ JCE_COMP_IMPL(JceOcclusionPortalComponent,    occlusion_portal)
 #undef JCE_COMP_IMPL
 
 /* ── Component enumeration ─────────────────────────────────────────── */
+
+uint64_t jce_scene_get_disabled_components(const JceScene *s, JceEntity e)
+{
+    if (!s || e == JCE_ENTITY_INVALID) return 0;
+    ecs_entity_t ent = (ecs_entity_t)e;
+    if (!ecs_is_alive(s->world, ent)) return 0;
+    const JceCompEnableState *st = ecs_get(s->world, ent, JceCompEnableState);
+    return st ? st->disabled : 0;
+}
+
+void jce_scene_set_disabled_components(JceScene *s, JceEntity e, uint64_t mask)
+{
+    if (!s || e == JCE_ENTITY_INVALID) return;
+    ecs_entity_t ent = (ecs_entity_t)e;
+    if (!ecs_is_alive(s->world, ent)) return;
+    if (mask == 0) {
+        if (ecs_has(s->world, ent, JceCompEnableState))
+            ecs_remove(s->world, ent, JceCompEnableState);
+        return;
+    }
+    JceCompEnableState st = { mask };
+    ecs_set_ptr(s->world, ent, JceCompEnableState, &st);
+}
+
+bool jce_scene_component_enabled(const JceScene *s, JceEntity e, uint64_t flag)
+{
+    /* Default enabled: only an explicitly-set DISABLED bit turns it off. */
+    return (jce_scene_get_disabled_components(s, e) & flag) == 0;
+}
+
+void jce_scene_set_component_enabled(JceScene *s, JceEntity e, uint64_t flag, bool enabled)
+{
+    uint64_t m  = jce_scene_get_disabled_components(s, e);
+    uint64_t nm = enabled ? (m & ~flag) : (m | flag);
+    if (nm != m) jce_scene_set_disabled_components(s, e, nm);
+}
 
 uint64_t jce_scene_get_component_flags(const JceScene *s, JceEntity e)
 {
@@ -714,20 +967,25 @@ void jce_scene_each_entity(JceScene *s, JceEntityCallback cb, void *user_data)
 {
     if (!s || !cb) return;
 
-    IterCtx ctx = { s, cb, user_data };
+    /* Cache the query.  It was previously created with ecs_query() and torn
+     * down with ecs_query_fini() on EVERY call — and this runs 4-5x per frame
+     * during Play (video update, particles probe + each, viewer scan, audio-3D
+     * listener), so the per-query Flecs allocations accumulated unbounded
+     * (GB-scale over minutes of idle Play).  Mirrors the cloth_query pattern;
+     * freed in jce_scene_destroy. */
+    if (!s->each_query) {
+        s->each_query = ecs_query(s->world, {
+            .terms = {{ .id = ecs_id(JceTransform) }},
+        });
+        if (!s->each_query) return;
+    }
 
-    ecs_query_t *q = ecs_query(s->world, {
-        .terms = {{ .id = ecs_id(JceTransform) }},
-    });
-
-    ecs_iter_t it = ecs_query_iter(s->world, q);
+    ecs_iter_t it = ecs_query_iter(s->world, s->each_query);
     while (ecs_query_next(&it)) {
         for (int i = 0; i < it.count; i++) {
             cb(s, (JceEntity)it.entities[i], user_data);
         }
     }
-
-    ecs_query_fini(q);
 }
 
 void *jce_scene_get_world(JceScene *s)
@@ -739,6 +997,12 @@ void jce_scene_update(JceScene *s, float dt)
 {
     JCE_PROFILE_ZONE_N("Scene::Update");
     if (!s) { JCE_PROFILE_ZONE_END; return; }
+
+    /* New frame → invalidate last frame's world-matrix cache. Done before
+       ecs_progress so any system that reads world matrices this frame builds
+       a fresh, consistent cache against transforms as they are at read time. */
+    jce_scene_invalidate_world_cache(s);
+
     ecs_progress(s->world, dt);
 
     /* ── Cloth reconciliation (P3-C.4 follow-up) ─────────────────────
@@ -749,9 +1013,12 @@ void jce_scene_update(JceScene *s, float dt)
      * Wind updates on an already-existing handle are applied in-place to
      * avoid a full rebuild for cheap parameter tweaks. */
     {
-        ecs_query_t *q = ecs_query(s->world, {
-            .terms = {{ .id = ecs_id(JceClothComponent) }},
-        });
+        if (!s->cloth_query) {
+            s->cloth_query = ecs_query(s->world, {
+                .terms = {{ .id = ecs_id(JceClothComponent) }},
+            });
+        }
+        ecs_query_t *q = s->cloth_query;   /* cached; reused every frame */
         if (q) {
             ecs_iter_t it = ecs_query_iter(s->world, q);
             while (ecs_query_next(&it)) {
@@ -795,7 +1062,7 @@ void jce_scene_update(JceScene *s, float dt)
                     }
                 }
             }
-            ecs_query_fini(q);
+            /* q is cached (s->cloth_query) — freed in jce_scene_destroy. */
         }
     }
 

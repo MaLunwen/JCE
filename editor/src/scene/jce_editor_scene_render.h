@@ -168,6 +168,11 @@ typedef struct JceModel      JceModel;
 JceAnimPlayer *jce_editor_scene_get_anim_player(const char *skeleton_path,
                                                  uint32_t entity_id);
 
+typedef struct JceAnimSmBinding JceAnimSmBinding;
+/* Live state-machine binding for an entity's skeletal animator, or NULL until
+ * the SM has been bound (set sm_path + the scene rendered at least once). */
+JceAnimSmBinding *jce_editor_scene_get_anim_sm(uint32_t entity_id);
+
 /* Look up (or load) the cached model for the skeleton path.
  * Returns the model, or NULL if not available. */
 JceModel *jce_editor_scene_get_model(const char *skeleton_path,

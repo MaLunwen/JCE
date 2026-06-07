@@ -47,7 +47,6 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[])
     return s_engine ? SDL_APP_CONTINUE : SDL_APP_FAILURE;
 }
 
-/* cppcheck-suppress constParameterPointer ; SDL3 callback signature */
 SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event)
 {
     (void)appstate;

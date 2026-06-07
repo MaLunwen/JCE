@@ -21,8 +21,15 @@ extern "C" {
 
 #include <jce/middleware/scene/jce_scene.h>
 
+/* override_abgr: 0 = draw each child in its own palette colour; non-zero =
+ * force every segment to this ABGR colour (so the debug overlay can draw all
+ * compound colliders one colour, and the selection pass can draw the selected
+ * one in the selection colour instead of fighting it with palette green). */
+/* detailed: 1 = fitted triangle wireframe (use for ONE selected prop);
+ *           0 = outer bounds box per child (use for the all-props overlay). */
 void jce_gizmo_compound_collider_draw_from_component(
-    JceScene *scene, JceEntity owner, const JceCompoundColliderComponent *cc);
+    JceScene *scene, JceEntity owner, const JceCompoundColliderComponent *cc,
+    unsigned int override_abgr, int detailed);
 
 /* Drop cached wireframes (call when assets change / on shutdown). */
 void jce_gizmo_compound_collider_clear_cache(void);
