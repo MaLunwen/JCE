@@ -24,8 +24,13 @@
  * driver. Holding the retired FBO for a few frames lets every consumer
  * (ImGui draw list, render thread, driver) finish with the old handle
  * before its slot is recycled. */
-#define BRIDGE_RETIRE_DELAY 3
-#define BRIDGE_RETIRE_SLOTS 4
+/* Raised 3->8 / 4->8: on Vulkan the deeper swapchain pipelining meant a
+ * recycled texture idx could still be referenced by an in-flight ImGui draw
+ * list, showing up as the scene viewport flashing ANOTHER render target's
+ * content for a single frame ("object strobing"). Eight frames comfortably
+ * exceeds any backend's in-flight depth. */
+#define BRIDGE_RETIRE_DELAY 8
+#define BRIDGE_RETIRE_SLOTS 8
 
 typedef struct {
     bgfx_frame_buffer_handle_t fbo;
@@ -40,6 +45,7 @@ struct JceOffscreenTarget {
     bgfx_texture_handle_t target_color;
     uint32_t target_w;
     uint32_t target_h;
+    bgfx_texture_format_t color_format; /* RGBA16F (HDR) or RGBA8 fallback */
 
     RetiredTarget retired[BRIDGE_RETIRE_SLOTS];
 };
@@ -125,10 +131,24 @@ static bool bridge_ensure_target(JceOffscreenTarget *bridge,
      * driver references finish before its texture slots are reused. */
     retire_target(bridge);
 
+    /* HDR color target so smooth light-falloff gradients don't quantize into
+       concentric "ring" bands on the 8-bit path. Fall back to RGBA8 where
+       RGBA16F render targets are unsupported (ES2/WebGL1). The editor always
+       tonemaps the HDR bridge back to LDR for display (jce_editor_scene_render
+       force-enables the tonemap pass when the bridge is HDR). */
+    bgfx_texture_format_t color_fmt = BGFX_TEXTURE_FORMAT_RGBA16F;
+    const bgfx_caps_t *caps = bgfx_get_caps();
+    if (!caps || (caps->formats[BGFX_TEXTURE_FORMAT_RGBA16F]
+                  & BGFX_CAPS_FORMAT_TEXTURE_FRAMEBUFFER) == 0) {
+        color_fmt = BGFX_TEXTURE_FORMAT_RGBA8;
+        LOG_WARN(LOG_TAG, "RGBA16F render target unsupported; using RGBA8 "
+                          "(light-falloff banding may remain)");
+    }
+
     bgfx_texture_handle_t textures[2];
     textures[0] = bgfx_create_texture_2d(
         (uint16_t)width, (uint16_t)height, false, 1,
-        BGFX_TEXTURE_FORMAT_RGBA8,
+        color_fmt,
         BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
         NULL);
 
@@ -178,6 +198,7 @@ static bool bridge_ensure_target(JceOffscreenTarget *bridge,
 
     bridge->target_w = width;
     bridge->target_h = height;
+    bridge->color_format = color_fmt;
     return true;
 }
 
@@ -276,4 +297,9 @@ uint16_t jce_offscreen_target_get_frame_buffer(const JceOffscreenTarget *bridge)
     if (!bridge || !BGFX_HANDLE_IS_VALID(bridge->target_fbo))
         return UINT16_MAX;
     return bridge->target_fbo.idx;
+}
+
+bool jce_offscreen_target_is_hdr(const JceOffscreenTarget *bridge)
+{
+    return bridge && bridge->color_format == BGFX_TEXTURE_FORMAT_RGBA16F;
 }

@@ -637,7 +637,42 @@ JceRenderer *jce_renderer_create(JceWindow *win,
     if (gfx_debug)
         LOG_INFO(LOG_TAG, "JCE_GFX_DEBUG enabled (D3D12/Vulkan validation on)");
 
-    bgfx_renderer_type_t requested_type = map_backend(cfg->backend);
+    /* JCE_BACKEND=auto|d3d11|d3d12|vulkan|opengl|gles|metal|noop — overrides
+       the caller-selected backend (same diagnostic env family as
+       JCE_FORCE_FALLBACK above). Primary consumer: tools/render_parity.py,
+       which boots the SAME binary on several backends and pixel-compares
+       the output to catch backend-divergent shader/render behavior (the
+       class of bug where a raw mat3 ctor flipped TBN on GLSL only) without
+       touching any per-user config. */
+    int backend_choice = cfg->backend;
+    {
+        const char *bv = getenv("JCE_BACKEND");
+        if (bv && bv[0]) {
+            char   low[16];
+            size_t bi;
+            for (bi = 0; bi + 1 < sizeof(low) && bv[bi]; bi++)
+                low[bi] = (char)((bv[bi] >= 'A' && bv[bi] <= 'Z')
+                                 ? bv[bi] + ('a' - 'A') : bv[bi]);
+            low[bi] = '\0';
+            if      (strcmp(low, "auto")   == 0) backend_choice = JCE_BACKEND_AUTO;
+            else if (strcmp(low, "d3d11")  == 0) backend_choice = JCE_BACKEND_D3D11;
+            else if (strcmp(low, "d3d12")  == 0) backend_choice = JCE_BACKEND_D3D12;
+            else if (strcmp(low, "vulkan") == 0) backend_choice = JCE_BACKEND_VULKAN;
+            else if (strcmp(low, "opengl") == 0 || strcmp(low, "gl") == 0)
+                backend_choice = JCE_BACKEND_OPENGL;
+            else if (strcmp(low, "gles") == 0 || strcmp(low, "opengles") == 0)
+                backend_choice = JCE_BACKEND_OPENGLES;
+            else if (strcmp(low, "metal")  == 0) backend_choice = JCE_BACKEND_METAL;
+            else if (strcmp(low, "noop")   == 0) backend_choice = JCE_BACKEND_NOOP;
+            else
+                LOG_WARN(LOG_TAG, "JCE_BACKEND=%s not recognized — ignored", bv);
+            if (backend_choice != cfg->backend)
+                LOG_WARN(LOG_TAG,
+                    "DEBUG TOGGLE: JCE_BACKEND=%s -> backend override", bv);
+        }
+    }
+
+    bgfx_renderer_type_t requested_type = map_backend(backend_choice);
     const char *backend_name =
         requested_type == BGFX_RENDERER_TYPE_COUNT
             ? "auto"
@@ -1294,6 +1329,36 @@ void jce_renderer_end_frame(const JceRenderer *r)
         }
     }
 #endif
+
+    /* JCE_CAPTURE_FRAME=N + JCE_CAPTURE_PATH=file.png — one-shot automated
+       backbuffer capture once the bgfx frame index reaches N (env family of
+       JCE_NO_PICK / JCE_BACKEND). Lets tools/render_parity.py and headless
+       verification grab a deterministic frame without window focus, hotkeys
+       or per-user config. Parsed once; fires exactly once per process. */
+    {
+        static int  s_cap_frame = -2;        /* -2 = unparsed, -1 = disabled */
+        static char s_cap_path[512];
+        static bool s_cap_done = false;
+        if (s_cap_frame == -2) {
+            const char *fv = getenv("JCE_CAPTURE_FRAME");
+            const char *pv = getenv("JCE_CAPTURE_PATH");
+            if (fv && fv[0] && pv && pv[0]) {
+                s_cap_frame = atoi(fv);
+                if (s_cap_frame < 0) s_cap_frame = 0;
+                snprintf(s_cap_path, sizeof(s_cap_path), "%s", pv);
+                LOG_WARN(LOG_TAG,
+                    "DEBUG TOGGLE: JCE_CAPTURE_FRAME=%d -> %s",
+                    s_cap_frame, s_cap_path);
+            } else {
+                s_cap_frame = -1;
+            }
+        }
+        if (s_cap_frame >= 0 && !s_cap_done &&
+            s_bgfx_frame_index >= (uint32_t)s_cap_frame) {
+            if (jce_renderer_request_screenshot(s_cap_path))
+                s_cap_done = true;
+        }
+    }
 
     /* Recording: request a backbuffer capture for this frame (one in flight;
        the screen_shot callback routes it to the capture sink). Reuses the

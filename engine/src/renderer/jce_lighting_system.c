@@ -4,6 +4,7 @@
 
 #include <jce/os/core/jce_log.h>
 #include <jce/renderer/jce_lighting_system.h>
+#include <jce/renderer/jce_renderer.h>   /* jce_renderer_get_frame_index */
 #include <jce/renderer/jce_texture_types.h>
 
 #include "os/core/jce_memory.h"
@@ -28,6 +29,35 @@ struct JceLightEnv {
     uint32_t          num_spot;
 
     jce_vec3 camera_pos;
+
+    /* Packed-uniform cache. jce_light_env_apply() runs once per MATERIAL
+     * CHANGE through the scene renderer's bind callback (and per entity on
+     * its inline path) — not once per frame. Re-packing the light arrays,
+     * re-normalizing directions and rebuilding both cookie VP matrices on
+     * every call recomputed identical results dozens of times a frame: the
+     * env's contents only change through the setters (which set pack_dirty)
+     * or across frames (the scene renderer rebuilds the env each frame).
+     * So pack once per frame into these buffers and replay the cached bytes
+     * on every later apply. The UPLOADS are NOT cacheable: bgfx draw items
+     * record only the uniform updates issued since the last state-discarding
+     * submit and replay them in view-SORTED draw order, so every material
+     * run's first draw must carry the full light state in its own range. */
+    bool     pack_dirty;
+    bool     pack_valid;
+    uint32_t pack_frame;
+    bool     packed_has_dir_cookie; /* dir-cookie VP depends on camera_pos */
+    jce_vec3 packed_cam_pos;        /* camera the dir-cookie VP was built at */
+    float    packed_ambient[4];
+    float    packed_dir[JCE_MAX_DIR_LIGHTS * 2 * 4];
+    float    packed_point[JCE_MAX_POINT_LIGHTS * 2 * 4];
+    float    packed_spot[JCE_MAX_SPOT_LIGHTS * 4 * 4];
+    float    packed_counts[4];
+    float    packed_spot_vp[16];
+    float    packed_dir_vp[16];
+    float    packed_cookie_params[4];
+    float    packed_cookie_dir_params[4];
+    bgfx_texture_handle_t packed_cookie_tex;
+    bgfx_texture_handle_t packed_ies_tex;
 
     /* P3-E.5b — Multi-cookie atlas (per-env LRU bookkeeping).
      *
@@ -87,6 +117,13 @@ static bgfx_texture_handle_t s_white_1x1;        /* default 1x1 white bind */
 static bgfx_texture_handle_t s_cookie_atlas_array;  /* valid when s_cookie_array_supported */
 static bool                  s_cookie_array_supported = false;
 static bool s_light_uniforms_init = false;
+
+static float clamp01(float v)
+{
+    if (v < 0.0f) return 0.0f;
+    if (v > 1.0f) return 1.0f;
+    return v;
+}
 
 static void ensure_light_uniforms(void)
 {
@@ -195,12 +232,14 @@ void jce_light_env_set_ambient(JceLightEnv *env, jce_vec3 color, float intensity
     if (!env) return;
     env->ambient_color     = color;
     env->ambient_intensity = intensity;
+    env->pack_dirty        = true;
 }
 
 int jce_light_env_add_dir_light(JceLightEnv *env, const JceDirLightDesc *light)
 {
     if (!env || !light || env->num_dir >= JCE_MAX_DIR_LIGHTS) return -1;
     env->dir_lights[env->num_dir] = *light;
+    env->pack_dirty = true;
     return (int)env->num_dir++;
 }
 
@@ -208,6 +247,7 @@ int jce_light_env_add_point_light(JceLightEnv *env, const JcePointLightDesc *lig
 {
     if (!env || !light || env->num_point >= JCE_MAX_POINT_LIGHTS) return -1;
     env->point_lights[env->num_point] = *light;
+    env->pack_dirty = true;
     return (int)env->num_point++;
 }
 
@@ -215,6 +255,7 @@ int jce_light_env_add_spot_light(JceLightEnv *env, const JceSpotLightDesc *light
 {
     if (!env || !light || env->num_spot >= JCE_MAX_SPOT_LIGHTS) return -1;
     env->spot_lights[env->num_spot] = *light;
+    env->pack_dirty = true;
     return (int)env->num_spot++;
 }
 
@@ -224,6 +265,7 @@ void jce_light_env_clear(JceLightEnv *env)
     env->num_dir   = 0;
     env->num_point = 0;
     env->num_spot  = 0;
+    env->pack_dirty = true;
 }
 
 /* ================================================================== */
@@ -249,22 +291,19 @@ uint32_t jce_light_env_spot_count(const JceLightEnv *env)
 /* Apply (upload uniforms)                                             */
 /* ================================================================== */
 
-void jce_light_env_apply(const JceLightEnv *env, const JceRenderer *r)
+/* Rebuild the env's packed-uniform cache (see the cache comment in struct
+ * JceLightEnv). Runs once per frame — or immediately after a setter dirtied
+ * the env — instead of on every apply. Cookie LRU note: register_cookie
+ * touches each cookie's last_used stamp here, so a once-per-frame repack
+ * keeps the LRU exactly as fresh as the old per-apply behavior did. */
+static void light_env_repack(JceLightEnv *env)
 {
-    if (!env) return;
-    (void)r;
-
-    ensure_light_uniforms();
-
     /* Ambient: xyz = raw color, w = intensity.
        Shader computes: u_ambientColor.xyz * u_ambientColor.w * albedo * ao */
-    float ambient[4] = {
-        env->ambient_color.x,
-        env->ambient_color.y,
-        env->ambient_color.z,
-        env->ambient_intensity
-    };
-    bgfx_set_uniform(s_u_ambient_color, ambient, 1);
+    env->packed_ambient[0] = env->ambient_color.x;
+    env->packed_ambient[1] = env->ambient_color.y;
+    env->packed_ambient[2] = env->ambient_color.z;
+    env->packed_ambient[3] = env->ambient_intensity;
 
     /* Directional lights: 2 vec4s per light.
      * [i*2+0] = normalize(dir).xyz, intensity
@@ -274,45 +313,36 @@ void jce_light_env_apply(const JceLightEnv *env, const JceRenderer *r)
      * no cookie (white).  Used by the shader to pick the array layer
      * when sampler 13 is promoted to a 2D texture array; harmless on
      * the v1 single-bind path. */
-    {
-        float data[JCE_MAX_DIR_LIGHTS * 2 * 4];
-        memset(data, 0, sizeof(data));
-        JceLightEnv *mut_env = (JceLightEnv *)env; /* register_cookie mutates LRU */
-        for (uint32_t i = 0; i < env->num_dir; i++) {
-            const JceDirLightDesc *dl = &env->dir_lights[i];
-            jce_vec3 d = jce_v3_normalize(dl->direction);
-            uint32_t base = i * 8;
-            data[base + 0] = d.x;
-            data[base + 1] = d.y;
-            data[base + 2] = d.z;
-            data[base + 3] = dl->intensity;
-            data[base + 4] = dl->color.x;
-            data[base + 5] = dl->color.y;
-            data[base + 6] = dl->color.z;
-            data[base + 7] = (float)jce_light_env_register_cookie(mut_env, dl->cookie_texture);
-        }
-        bgfx_set_uniform(s_u_dir_lights, data, JCE_MAX_DIR_LIGHTS * 2);
+    memset(env->packed_dir, 0, sizeof(env->packed_dir));
+    for (uint32_t i = 0; i < env->num_dir; i++) {
+        const JceDirLightDesc *dl = &env->dir_lights[i];
+        jce_vec3 d = jce_v3_normalize(dl->direction);
+        float *data = env->packed_dir + i * 8;
+        data[0] = d.x;
+        data[1] = d.y;
+        data[2] = d.z;
+        data[3] = dl->intensity;
+        data[4] = dl->color.x;
+        data[5] = dl->color.y;
+        data[6] = dl->color.z;
+        data[7] = (float)jce_light_env_register_cookie(env, dl->cookie_texture);
     }
 
     /* Point lights: 2 vec4s per light.
      * [i*2+0] = pos.xyz, radius
      * [i*2+1] = color.xyz, intensity */
-    {
-        float data[JCE_MAX_POINT_LIGHTS * 2 * 4];
-        memset(data, 0, sizeof(data));
-        for (uint32_t i = 0; i < env->num_point; i++) {
-            const JcePointLightDesc *pl = &env->point_lights[i];
-            uint32_t base = i * 8;
-            data[base + 0] = pl->position.x;
-            data[base + 1] = pl->position.y;
-            data[base + 2] = pl->position.z;
-            data[base + 3] = pl->radius;
-            data[base + 4] = pl->color.x;
-            data[base + 5] = pl->color.y;
-            data[base + 6] = pl->color.z;
-            data[base + 7] = pl->intensity;
-        }
-        bgfx_set_uniform(s_u_point_lights, data, JCE_MAX_POINT_LIGHTS * 2);
+    memset(env->packed_point, 0, sizeof(env->packed_point));
+    for (uint32_t i = 0; i < env->num_point; i++) {
+        const JcePointLightDesc *pl = &env->point_lights[i];
+        float *data = env->packed_point + i * 8;
+        data[0] = pl->position.x;
+        data[1] = pl->position.y;
+        data[2] = pl->position.z;
+        data[3] = pl->radius;
+        data[4] = pl->color.x;
+        data[5] = pl->color.y;
+        data[6] = pl->color.z;
+        data[7] = pl->intensity;
     }
 
     /* Spot lights: 4 vec4s per light.
@@ -323,32 +353,27 @@ void jce_light_env_apply(const JceLightEnv *env, const JceRenderer *r)
      *
      * cookie_atlas_slot is the slice index into the cookie atlas; 0 =
      * no cookie (white).  Same meaning as the directional channel. */
-    {
-        float data[JCE_MAX_SPOT_LIGHTS * 4 * 4];
-        memset(data, 0, sizeof(data));
-        JceLightEnv *mut_env = (JceLightEnv *)env;
-        for (uint32_t i = 0; i < env->num_spot; i++) {
-            const JceSpotLightDesc *sl = &env->spot_lights[i];
-            jce_vec3 d = jce_v3_normalize(sl->direction);
-            uint32_t base = i * 16;
-            data[base + 0]  = sl->position.x;
-            data[base + 1]  = sl->position.y;
-            data[base + 2]  = sl->position.z;
-            data[base + 3]  = sl->radius;
-            data[base + 4]  = d.x;
-            data[base + 5]  = d.y;
-            data[base + 6]  = d.z;
-            data[base + 7]  = sl->intensity;
-            data[base + 8]  = sl->color.x;
-            data[base + 9]  = sl->color.y;
-            data[base + 10] = sl->color.z;
-            data[base + 11] = sl->inner_cone_cos;
-            data[base + 12] = sl->outer_cone_cos;
-            data[base + 13] = (float)jce_light_env_register_cookie(mut_env, sl->cookie_texture);
-            data[base + 14] = 0.0f;
-            data[base + 15] = 0.0f;
-        }
-        bgfx_set_uniform(s_u_spot_lights, data, JCE_MAX_SPOT_LIGHTS * 4);
+    memset(env->packed_spot, 0, sizeof(env->packed_spot));
+    for (uint32_t i = 0; i < env->num_spot; i++) {
+        const JceSpotLightDesc *sl = &env->spot_lights[i];
+        jce_vec3 d = jce_v3_normalize(sl->direction);
+        float *data = env->packed_spot + i * 16;
+        data[0]  = sl->position.x;
+        data[1]  = sl->position.y;
+        data[2]  = sl->position.z;
+        data[3]  = sl->radius;
+        data[4]  = d.x;
+        data[5]  = d.y;
+        data[6]  = d.z;
+        data[7]  = sl->intensity;
+        data[8]  = sl->color.x;
+        data[9]  = sl->color.y;
+        data[10] = sl->color.z;
+        data[11] = sl->inner_cone_cos;
+        data[12] = sl->outer_cone_cos;
+        data[13] = (float)jce_light_env_register_cookie(env, sl->cookie_texture);
+        data[14] = 0.0f;
+        data[15] = 0.0f;
     }
 
     float shadow_dir_slot = 0.0f;
@@ -360,17 +385,10 @@ void jce_light_env_apply(const JceLightEnv *env, const JceRenderer *r)
     }
 
     /* Light counts: x=numDir, y=numPoint, z=numSpot, w=shadow dir index+1. */
-    float counts[4] = {
-        (float)env->num_dir,
-        (float)env->num_point,
-        (float)env->num_spot,
-        shadow_dir_slot
-    };
-    bgfx_set_uniform(s_u_light_counts, counts, 1);
-
-    /* Camera position for PBR specular. */
-    float cam[4] = { env->camera_pos.x, env->camera_pos.y, env->camera_pos.z, 0.0f };
-    bgfx_set_uniform(s_u_camera_pos, cam, 1);
+    env->packed_counts[0] = (float)env->num_dir;
+    env->packed_counts[1] = (float)env->num_point;
+    env->packed_counts[2] = (float)env->num_spot;
+    env->packed_counts[3] = shadow_dir_slot;
 
     /* ──────────────────────────────────────────────────────────────
      * P3-E.5  — Cookie + IES profile (spot lights, single-bind v1)
@@ -408,8 +426,7 @@ void jce_light_env_apply(const JceLightEnv *env, const JceRenderer *r)
             if (cookie_spot < 0 && jce_texture_valid(sl->cookie_texture)) {
                 cookie_spot = (int)i;
                 cookie_tex.idx = sl->cookie_texture.idx;
-                cookie_strength_spot = (sl->cookie_strength > 0.0f) ? sl->cookie_strength : 1.0f;
-                if (cookie_strength_spot > 1.0f) cookie_strength_spot = 1.0f;
+                cookie_strength_spot = clamp01(sl->cookie_strength);
             }
             if (ies_spot < 0 && jce_texture_valid(sl->ies_lut_texture)) {
                 ies_spot = (int)i;
@@ -420,8 +437,7 @@ void jce_light_env_apply(const JceLightEnv *env, const JceRenderer *r)
             const JceDirLightDesc *dl = &env->dir_lights[i];
             if (cookie_dir < 0 && jce_texture_valid(dl->cookie_texture)) {
                 cookie_dir = (int)i;
-                cookie_strength_dir = (dl->cookie_strength > 0.0f) ? dl->cookie_strength : 1.0f;
-                if (cookie_strength_dir > 1.0f) cookie_strength_dir = 1.0f;
+                cookie_strength_dir = clamp01(dl->cookie_strength);
                 /* Spot cookie wins the single sampler slot. */
                 if (cookie_spot < 0) {
                     cookie_tex.idx = dl->cookie_texture.idx;
@@ -431,8 +447,8 @@ void jce_light_env_apply(const JceLightEnv *env, const JceRenderer *r)
 
         /* Spot cookie VP --------------------------------------------- */
         int driver_spot = (cookie_spot >= 0) ? cookie_spot : ies_spot;
-        float vp[16];
-        memset(vp, 0, sizeof(vp));
+        float *vp = env->packed_spot_vp;
+        memset(vp, 0, sizeof(env->packed_spot_vp));
         vp[0] = vp[5] = vp[10] = vp[15] = 1.0f;
 
         if (driver_spot >= 0 && (uint32_t)driver_spot < env->num_spot) {
@@ -452,9 +468,8 @@ void jce_light_env_apply(const JceLightEnv *env, const JceRenderer *r)
             jce_mat4 view = jce_m4_look_at(eye, center, up);
             jce_mat4 proj = jce_m4_perspective(fov, 1.0f, zn, zf, false);
             jce_mat4 vp4  = jce_m4_multiply(&proj, &view);
-            memcpy(vp, JCE_M4_PTR(vp4), sizeof(vp));
+            memcpy(vp, JCE_M4_PTR(vp4), sizeof(env->packed_spot_vp));
         }
-        bgfx_set_uniform(s_u_cookie_spot_vp, vp, 1);
 
         /* Directional cookie VP (P3-E.5b) --------------------------- */
         /* World-aligned ortho box centred on camera xz, viewed along
@@ -463,8 +478,8 @@ void jce_light_env_apply(const JceLightEnv *env, const JceRenderer *r)
          * coupling.  Slide-to-v2: re-use cascade 0's tight frustum
          * fit from jce_csm_compute when the lighting system gains
          * camera-frustum awareness. */
-        float dir_vp[16];
-        memset(dir_vp, 0, sizeof(dir_vp));
+        float *dir_vp = env->packed_dir_vp;
+        memset(dir_vp, 0, sizeof(env->packed_dir_vp));
         dir_vp[0] = dir_vp[5] = dir_vp[10] = dir_vp[15] = 1.0f;
 
         if (cookie_dir >= 0 && (uint32_t)cookie_dir < env->num_dir) {
@@ -481,32 +496,96 @@ void jce_light_env_apply(const JceLightEnv *env, const JceRenderer *r)
             jce_mat4 proj = jce_m4_ortho(-half, half, -half, half,
                                           0.1f, 200.0f, false);
             jce_mat4 vp4  = jce_m4_multiply(&proj, &view);
-            memcpy(dir_vp, JCE_M4_PTR(vp4), sizeof(dir_vp));
+            memcpy(dir_vp, JCE_M4_PTR(vp4), sizeof(env->packed_dir_vp));
         }
-        bgfx_set_uniform(s_u_cookie_dir_vp, dir_vp, 1);
 
         /* Param uniforms -------------------------------------------- */
-        float params[4] = {
-            (cookie_spot >= 0) ? 1.0f : 0.0f,
-            cookie_strength_spot,
-            (ies_spot    >= 0) ? 1.0f : 0.0f,
-            (cookie_spot >= 0) ? (float)cookie_spot : (float)ies_spot
-        };
-        bgfx_set_uniform(s_u_cookie_params, params, 1);
+        env->packed_cookie_params[0] = (cookie_spot >= 0) ? 1.0f : 0.0f;
+        env->packed_cookie_params[1] = cookie_strength_spot;
+        env->packed_cookie_params[2] = (ies_spot    >= 0) ? 1.0f : 0.0f;
+        env->packed_cookie_params[3] = (cookie_spot >= 0) ? (float)cookie_spot
+                                                          : (float)ies_spot;
 
-        float dir_params[4] = {
-            (cookie_dir >= 0) ? 1.0f : 0.0f,
-            cookie_strength_dir,
-            (cookie_dir >= 0) ? (float)cookie_dir : 0.0f,
-            0.0f
-        };
-        bgfx_set_uniform(s_u_cookie_dir_params, dir_params, 1);
+        env->packed_cookie_dir_params[0] = (cookie_dir >= 0) ? 1.0f : 0.0f;
+        env->packed_cookie_dir_params[1] = cookie_strength_dir;
+        env->packed_cookie_dir_params[2] = (cookie_dir >= 0) ? (float)cookie_dir
+                                                             : 0.0f;
+        env->packed_cookie_dir_params[3] = 0.0f;
 
-        bgfx_set_texture(13, s_s_cookie,
-                         s_cookie_array_supported ? s_cookie_atlas_array : cookie_tex,
-                         UINT32_MAX);
-        bgfx_set_texture(14, s_s_ies_lut, ies_tex,    UINT32_MAX);
+        env->packed_cookie_tex      = cookie_tex;
+        env->packed_ies_tex         = ies_tex;
+        env->packed_has_dir_cookie  = (cookie_dir >= 0);
+        env->packed_cam_pos         = env->camera_pos;
     }
+}
+
+void jce_light_env_apply(const JceLightEnv *env, const JceRenderer *r)
+{
+    if (!env) return;
+
+    /* The public API stays logically const: the pack cache and the cookie
+       LRU are internal mutable state (same precedent as the old in-place
+       register_cookie cast). */
+    JceLightEnv *mut = (JceLightEnv *)env;
+
+    ensure_light_uniforms();
+
+    uint32_t frame  = r ? jce_renderer_get_frame_index(r) : 0u;
+    bool     repack = mut->pack_dirty || !mut->pack_valid ||
+                      (r && mut->pack_frame != frame);
+
+    /* The dir-cookie VP is the only packed value derived from the camera;
+       set_camera_pos intentionally does not dirty the pack (it changes
+       every frame), so catch camera motion here. */
+    if (!repack && mut->packed_has_dir_cookie &&
+        (mut->packed_cam_pos.x != env->camera_pos.x ||
+         mut->packed_cam_pos.y != env->camera_pos.y ||
+         mut->packed_cam_pos.z != env->camera_pos.z))
+        repack = true;
+
+    if (repack) {
+        light_env_repack(mut);
+        mut->pack_dirty = false;
+        mut->pack_valid = true;
+        mut->pack_frame = frame;
+    }
+
+    /* Upload on EVERY apply — this is not cacheable: bgfx draw items record
+       only the uniform updates issued since the last state-discarding submit
+       and replay them in view-SORTED draw order, so each material run's
+       first draw must carry the full light state in its own update range
+       (skipping would leave draws inheriting another material's values).
+       The light arrays upload only their used lanes: the shader loops break
+       at u_lightCounts, lanes past the count are never read, so stale tail
+       data in backend shadow storage is harmless. */
+    bgfx_set_uniform(s_u_ambient_color, mut->packed_ambient, 1);
+    if (env->num_dir > 0)
+        bgfx_set_uniform(s_u_dir_lights, mut->packed_dir,
+                         (uint16_t)(env->num_dir * 2));
+    if (env->num_point > 0)
+        bgfx_set_uniform(s_u_point_lights, mut->packed_point,
+                         (uint16_t)(env->num_point * 2));
+    if (env->num_spot > 0)
+        bgfx_set_uniform(s_u_spot_lights, mut->packed_spot,
+                         (uint16_t)(env->num_spot * 4));
+    bgfx_set_uniform(s_u_light_counts, mut->packed_counts, 1);
+
+    /* Camera position for PBR specular — read live, not from the pack
+       (set_camera_pos does not dirty the pack). */
+    float cam[4] = { env->camera_pos.x, env->camera_pos.y,
+                     env->camera_pos.z, 0.0f };
+    bgfx_set_uniform(s_u_camera_pos, cam, 1);
+
+    bgfx_set_uniform(s_u_cookie_spot_vp,    mut->packed_spot_vp, 1);
+    bgfx_set_uniform(s_u_cookie_dir_vp,     mut->packed_dir_vp, 1);
+    bgfx_set_uniform(s_u_cookie_params,     mut->packed_cookie_params, 1);
+    bgfx_set_uniform(s_u_cookie_dir_params, mut->packed_cookie_dir_params, 1);
+
+    bgfx_set_texture(13, s_s_cookie,
+                     s_cookie_array_supported ? s_cookie_atlas_array
+                                              : mut->packed_cookie_tex,
+                     UINT32_MAX);
+    bgfx_set_texture(14, s_s_ies_lut, mut->packed_ies_tex, UINT32_MAX);
 }
 
 void jce_light_env_set_camera_pos(JceLightEnv *env, jce_vec3 pos)

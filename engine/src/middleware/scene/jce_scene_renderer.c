@@ -34,6 +34,8 @@
 #include <jce/renderer/jce_csm.h>
 #include <jce/renderer/jce_debug_draw.h>
 #include <jce/renderer/jce_ibl.h>
+#include <jce/os/core/jce_thread.h>   /* async IBL bake worker */
+#include <jce/os/core/jce_jobs.h>     /* data-parallel frustum cull */
 #include <jce/renderer/jce_particles.h>
 #include <jce/renderer/jce_lighting.h>
 #include <jce/renderer/jce_lighting_system.h>
@@ -91,9 +93,11 @@
 JCE_SASSERT(JCE_SCENE_LOD_MAX_LEVELS == JCE_LOD_MAX_LEVELS);
 
 #define SR_MODEL_CACHE_MAX     32
+#define SR_MODEL_MAX_INFLIGHT  3    /* concurrent async model decodes */
 #define SR_ANIM_INSTANCE_MAX   64   /* per-entity skinned-anim playback state */
 #define SR_SPRITE_ANIM_MAX     64   /* per-entity 2D sprite-animator playback state */
 #define SR_TEX_CACHE_MAX       512
+#define SR_TEX_MAX_INFLIGHT    6    /* concurrent async texture decodes */
 #define SR_MAX_ENTITIES        4096
 #define SR_MAT_CACHE_MAX       512
 #define SR_MAT_PROG_CACHE_MAX  64   /* per-path Shader Graph custom programs */
@@ -161,11 +165,20 @@ typedef struct {
 } SrMaterialEntry;
 
 /* Shared, per-PATH model (mesh/skeleton/materials/textures) — heavy, loaded
-   once and shared by every entity that references the same file. */
+   once and shared by every entity that references the same file.
+   Runtime (no editor callback) loads asynchronously: a cache miss kicks a
+   worker that decodes the glTF to a CPU intermediate (parse + vertex
+   extraction + image decode), and the render thread uploads it
+   (sr_model_poll). While pending, model stays NULL so callers skip the
+   entity until it's ready. */
 typedef struct {
     char            path[256];
     JceModel       *model;
     bool            used;
+    bool            failed;   /* load was attempted and failed; do not retry */
+    bool            pending;  /* async decode in flight */
+    JceThread      *thr;      /* decode worker */
+    struct SrModelJob *job;   /* worker job (owns done flag + cpu result) */
 } SrModelCache;
 
 /* Per-ENTITY skeletal-animation instance. The model above is shared by path;
@@ -296,6 +309,13 @@ struct JceSceneRenderer {
     bgfx_uniform_handle_t      u_csm_splits;
     bgfx_uniform_handle_t      u_csm_params;
     bgfx_uniform_handle_t      u_csm_bias_scales;
+    /* Shadow FILTER tier (x lane; see JceRenderPipelineDesc
+       .shadow_filter_quality). Frame-constant uniform branch in
+       fs_pbr/fs_terrain selecting 1-tap / 3x3 / full PCF — coherent for
+       every fragment of a draw, so the untaken side's texture fetches are
+       genuinely skipped on SM3+ hardware. */
+    bgfx_uniform_handle_t      u_shadow_quality;
+    float                      shadow_filter_tier; /* cached per frame */
     bool                       csm_valid;
     float                      csm_blend_ratio;
     float                      csm_normal_bias;
@@ -319,17 +339,30 @@ struct JceSceneRenderer {
     bgfx_uniform_handle_t      u_local_shadow_map;    /* sampler stage 15 */
     bgfx_uniform_handle_t      u_local_shadow_vp;     /* MAT4[JCE_MAX_LOCAL_SHADOWS] */
     bgfx_uniform_handle_t      u_local_shadow_params; /* x=tiles/side y=1/atlas z=bias w=texel */
+    bgfx_uniform_handle_t      u_local_shadow_bias;   /* VEC4: per-slot depth bias (lane=slot) */
     bgfx_uniform_handle_t      u_spot_shadow_slot;    /* VEC4: lane i = slot for spot i (-1=none) */
     bgfx_uniform_handle_t      u_point_shadow_slot;   /* VEC4[2]: 8 point lanes (-1=none) */
     bool                       local_atlas_valid;
     /* Per-frame local-shadow state, filled by sr_draw_local_shadow_pass.
        Spot + point lights share ONE atlas slot pool (max JCE_MAX_LOCAL_SHADOWS). */
     jce_mat4                   frame_local_vp[JCE_MAX_LOCAL_SHADOWS];
+    float                      frame_local_bias_slot[JCE_MAX_LOCAL_SHADOWS]; /* per-slot depth bias */
     float                      frame_spot_slot[JCE_MAX_SPOT_LIGHTS];   /* spot i -> slot or -1 */
     float                      frame_point_slot[JCE_MAX_POINT_LIGHTS]; /* point j -> slot or -1 */
     uint32_t                   frame_local_count;
     float                      frame_local_bias;
     bool                       frame_local_active;
+
+    /* Distance/importance light selection (Unity-style): the most important
+       point/spot lights for the current view. Both the light gather AND the
+       local-shadow producer skip lights not in these sets, so when a scene has
+       more lights than the cap the NEAREST/brightest are kept (not an arbitrary
+       ECS-order suffix), and the two passes stay index-aligned because they
+       apply the SAME membership filter while iterating `list` in order. */
+    JceEntity                  frame_sel_point[JCE_MAX_POINT_LIGHTS];
+    uint32_t                   frame_sel_point_n;
+    JceEntity                  frame_sel_spot[JCE_MAX_SPOT_LIGHTS];
+    uint32_t                   frame_sel_spot_n;
 
     /* Per-frame culling stats (updated each render). */
     uint32_t                   stat_total_entities;
@@ -341,6 +374,7 @@ struct JceSceneRenderer {
      * + re-insert each draw to amortise allocation overhead. */
     JceSpaceIndex             *cull_space;
     JceAABB                   *cull_aabbs;
+    struct SrCullPrep         *cull_prep;   /* Pass-A scratch for parallel cull */
     uint32_t                   cull_aabb_cap;
 
     /* Optional global LOD group. When non-NULL every entity with a
@@ -385,6 +419,15 @@ struct JceSceneRenderer {
     float                    skybox_exposure;
     float                    skybox_rotation;
     bool                     postfx_tonemap_active;
+    /* ── Async IBL bake ───────────────────────────────────────────────
+     * The irradiance+prefilter convolution runs on a worker thread so a
+     * cache-miss does not freeze the main thread for several seconds. The
+     * worker produces a CPU buffer; the main thread uploads it to GPU and
+     * swaps it in when ready (the scene renders with fallback ambient until
+     * then). See sr_scan_skybox. */
+    struct SrIblJob         *ibl_job;        /* in-flight job, NULL = none */
+    JceThread               *ibl_thread;     /* worker for ibl_job */
+    char                     ibl_job_hdr[256]; /* HDR the in-flight bake is for */
 
     /* ── Baked GI consumption (P1-baked-gi-consume) ───────────────────
      * Reflection probe: a baked .ktx cubemap (+ .irr.ktx sidecar) loaded
@@ -421,6 +464,7 @@ struct JceSceneRenderer {
 
     /* Model / animation cache. */
     SrModelCache             model_cache[SR_MODEL_CACHE_MAX];
+    int                      model_inflight;   /* concurrent async model decodes */
     SrAnimInstance           anim_inst[SR_ANIM_INSTANCE_MAX];
 
     /* Per-entity 2D sprite-animator playback state (sheet + player). Created
@@ -429,14 +473,25 @@ struct JceSceneRenderer {
     SrSpriteAnim             sprite_anim[SR_SPRITE_ANIM_MAX];
 
     /* Resolved-texture cache (path → JceTexture). Prevents per-frame
-     * bgfx texture leaks. Cleared at destroy. */
+     * bgfx texture leaks. Cleared at destroy.
+     *
+     * Runtime mode loads asynchronously: a cache miss kicks a worker that
+     * decodes the texture to CPU (PAK decompress + image decode), and the
+     * render thread uploads it (sr_tex_poll) once ready.  While pending,
+     * the entry's tex stays invalid so the draw falls back to white_tex —
+     * the texture pops in within a few frames instead of stalling the
+     * render thread on first sight. */
     struct {
-        char       path[256];
-        JceTexture tex;
-        bool       used;
-        bool       failed; /* tried, but loader returned invalid */
+        char            path[256];
+        JceTexture      tex;
+        bool            used;
+        bool            failed;  /* tried, but loader returned invalid */
+        bool            pending; /* async decode in flight */
+        JceThread      *thr;     /* decode worker */
+        struct SrTexJob *job;    /* worker job (owns done flag + result) */
     } tex_cache[SR_TEX_CACHE_MAX];
     int tex_cache_count;
+    int tex_inflight;            /* concurrent async decodes */
 
     /* Shader Graph custom-program lookup cache (material_path → program).
      * A .mat.json may declare a graph-generated shader (customProgramVs /
@@ -502,6 +557,14 @@ struct JceSceneRenderer {
     JceRenderQueue   *transparent_queue;
     SrMaterialEntry   mat_cache[SR_MAT_CACHE_MAX];
     uint32_t          mat_count;
+    /* 1-entry memo for sr_bind_material_cb's linear mat_cache search. The
+     * binder now runs once per SUBMIT (bind-per-submit, see jce_rq_flush),
+     * and consecutive submits overwhelmingly share a material after the
+     * queue's material-aware sort — the memo turns the common case into a
+     * single compare. Self-validating (the indexed entry's key is checked),
+     * so per-frame cache resets need no explicit invalidation. */
+    uint32_t          bind_memo_key;
+    uint32_t          bind_memo_idx;
     uint16_t          frame_view_id;
     JceScene         *frame_scene;
     float             frame_shadow_vp[16];
@@ -598,6 +661,48 @@ static bool entity_enabled(JceScene *scene, JceEntity e)
 
 /* ── Texture cache (resolved paths) ───────────────────────────────── */
 
+/* Async decode job: worker writes `result` + flips `done`; the render
+ * thread (sr_tex_poll) uploads `result` and frees the job. */
+struct SrTexJob {
+    const JcePakArchive *pak;
+    char                 path[256];
+    int                  sampler;
+    JceTextureCpu       *result;   /* worker → main */
+    JceAtomicI32        *done;     /* 0 working, 1 finished */
+};
+
+static void sr_tex_worker(void *arg)
+{
+    struct SrTexJob *j = (struct SrTexJob *)arg;
+    j->result = jce_texture_decode_cpu(j->pak, j->path, j->sampler);
+    jce_atomic_i32_store(j->done, 1);
+}
+
+/* RENDER thread, per-frame: upload any finished async texture decodes. */
+static void sr_tex_poll(JceSceneRenderer *sr)
+{
+    if (!sr || sr->tex_inflight == 0) return;
+    for (int i = 0; i < sr->tex_cache_count; i++) {
+        if (!sr->tex_cache[i].pending) continue;
+        struct SrTexJob *j = sr->tex_cache[i].job;
+        if (!j || jce_atomic_i32_load(j->done) == 0) continue;
+
+        if (sr->tex_cache[i].thr) {
+            jce_thread_join(sr->tex_cache[i].thr);
+            sr->tex_cache[i].thr = NULL;
+        }
+        /* Upload on this (render) thread; consumes j->result. */
+        JceTexture tex = jce_texture_upload_cpu(j->result);
+        sr->tex_cache[i].tex     = tex;
+        sr->tex_cache[i].failed  = !jce_texture_valid(tex);
+        sr->tex_cache[i].pending = false;
+        sr->tex_cache[i].job     = NULL;
+        jce_atomic_i32_destroy(j->done);
+        JCE_FREE(j);
+        if (sr->tex_inflight > 0) sr->tex_inflight--;
+    }
+}
+
 static JceTexture sr_resolve_texture2(JceSceneRenderer *sr,
                                        const char *material_path,
                                        const char *mesh_path);
@@ -636,23 +741,53 @@ static JceTexture sr_resolve_texture2(JceSceneRenderer *sr,
             strncmp(sr->tex_cache[i].path, path,
                     sizeof(sr->tex_cache[i].path)) == 0)
         {
+            /* Pending: tex is still invalid → caller falls back to white
+             * until sr_tex_poll() uploads the finished decode. */
             return sr->tex_cache[i].failed ? invalid : sr->tex_cache[i].tex;
         }
     }
 
-    JceTexture tex = invalid;
-    if (sr->pak) tex = jce_texture_load(sr->pak, path);
-    bool ok = jce_texture_valid(tex);
+    /* Cache miss.  Decode off the render thread (PAK decompress + image
+     * decode), upload later in sr_tex_poll().  Bounded concurrency keeps
+     * a scene full of first-seen textures from spawning a thread storm —
+     * over the cap we leave the path uncached so it retries next frame. */
+    if (!sr->pak ||
+        sr->tex_cache_count >= SR_TEX_CACHE_MAX ||
+        sr->tex_inflight >= SR_TEX_MAX_INFLIGHT)
+        return invalid;
 
-    if (sr->tex_cache_count < SR_TEX_CACHE_MAX) {
-        int idx = sr->tex_cache_count++;
-        snprintf(sr->tex_cache[idx].path, sizeof(sr->tex_cache[idx].path),
-                 "%s", path);
-        sr->tex_cache[idx].tex    = tex;
-        sr->tex_cache[idx].used   = true;
-        sr->tex_cache[idx].failed = !ok;
+    struct SrTexJob *j = (struct SrTexJob *)JCE_MALLOC(sizeof(*j));
+    if (!j) return invalid;
+    memset(j, 0, sizeof(*j));
+    j->pak     = sr->pak;
+    j->sampler = JCE_TEX_CLAMP;   /* matches the former jce_texture_load() */
+    snprintf(j->path, sizeof(j->path), "%s", path);
+    j->done = jce_atomic_i32_create(0);
+
+    int idx = sr->tex_cache_count++;
+    snprintf(sr->tex_cache[idx].path, sizeof(sr->tex_cache[idx].path),
+             "%s", path);
+    sr->tex_cache[idx].tex     = invalid;
+    sr->tex_cache[idx].used    = true;
+    sr->tex_cache[idx].failed  = false;
+    sr->tex_cache[idx].pending = true;
+    sr->tex_cache[idx].job     = j;
+    sr->tex_cache[idx].thr     = jce_thread_create(sr_tex_worker, j,
+                                                   "jce_sr_tex");
+    if (!sr->tex_cache[idx].thr) {
+        /* No worker thread: decode + upload inline this frame. */
+        sr_tex_worker(j);
+        JceTexture tex = jce_texture_upload_cpu(j->result);
+        sr->tex_cache[idx].tex     = tex;
+        sr->tex_cache[idx].failed  = !jce_texture_valid(tex);
+        sr->tex_cache[idx].pending = false;
+        sr->tex_cache[idx].job     = NULL;
+        jce_atomic_i32_destroy(j->done);
+        JCE_FREE(j);
+        return tex;
     }
-    return tex;
+    sr->tex_inflight++;
+    return invalid;   /* white this frame; pops in when the decode lands */
 }
 
 /* ── Shader Graph custom-program cache ─────────────────────────────── */
@@ -725,6 +860,47 @@ static bool sr_is_gltf_model_path(const char *path)
     return sr_ends_with_ci(path, ".gltf") || sr_ends_with_ci(path, ".glb");
 }
 
+/* Async glTF decode job: worker writes `cpu` + flips `done`; the render
+ * thread (sr_model_poll) uploads `cpu` to a JceModel and frees the job. */
+struct SrModelJob {
+    const JcePakArchive *pak;
+    char                 path[256];
+    JceModelCpu         *cpu;      /* worker → main */
+    JceAtomicI32        *done;     /* 0 working, 1 finished */
+};
+
+static void sr_model_worker(void *arg)
+{
+    struct SrModelJob *j = (struct SrModelJob *)arg;
+    j->cpu = jce_model_decode_gltf_cpu(j->pak, j->path);   /* no bgfx */
+    jce_atomic_i32_store(j->done, 1);
+}
+
+/* RENDER thread, per-frame: upload any finished async model decodes. */
+static void sr_model_poll(JceSceneRenderer *sr)
+{
+    if (!sr || sr->model_inflight == 0) return;
+    for (int i = 0; i < SR_MODEL_CACHE_MAX; i++) {
+        SrModelCache *e = &sr->model_cache[i];
+        if (!e->pending) continue;
+        struct SrModelJob *j = e->job;
+        if (!j || jce_atomic_i32_load(j->done) == 0) continue;
+
+        if (e->thr) { jce_thread_join(e->thr); e->thr = NULL; }
+
+        JceModel *model = jce_model_upload_gltf_cpu(j->cpu);  /* consumes cpu */
+        e->model   = model;
+        e->failed  = (model == NULL);
+        e->pending = false;
+        e->job     = NULL;
+        jce_atomic_i32_destroy(j->done);
+        JCE_FREE(j);
+        if (sr->model_inflight > 0) sr->model_inflight--;
+        if (!model)
+            LOG_WARN(LOG_TAG, "model cache: cannot load %s (will not retry)", e->path);
+    }
+}
+
 static SrModelCache *sr_get_model(JceSceneRenderer *sr, const char *path,
                                   uint32_t entity_id)
 {
@@ -734,28 +910,63 @@ static SrModelCache *sr_get_model(JceSceneRenderer *sr, const char *path,
     int free_slot = -1;
     for (int i = 0; i < SR_MODEL_CACHE_MAX; i++) {
         SrModelCache *e = &sr->model_cache[i];
-        if (e->used && strcmp(e->path, path) == 0)
-            return e;
+        if (e->used && strcmp(e->path, path) == 0) {
+            /* Pending: model is still NULL → callers skip until sr_model_poll
+             * uploads it.  Failed: never retry. */
+            return e->failed ? NULL : e;
+        }
         if (!e->used && free_slot < 0) free_slot = i;
     }
     if (free_slot < 0) return NULL;
 
-    JceModel *model = NULL;
+    /* Editor mode: the callback owns its own (async) asset cache — keep the
+     * synchronous handoff. */
     if (sr->has_cbs && sr->cbs.load_model) {
-        model = sr->cbs.load_model(path, sr->cbs.userdata);
-    } else {
-        model = jce_model_load_gltf(sr->pak, path);
+        JceModel *model = sr->cbs.load_model(path, sr->cbs.userdata);
+        SrModelCache *e = &sr->model_cache[free_slot];
+        snprintf(e->path, sizeof(e->path), "%s", path);
+        e->model  = model;
+        e->used   = true;
+        e->failed = (model == NULL);
+        if (!model)
+            LOG_WARN(LOG_TAG, "model cache: cannot load %s (will not retry)", path);
+        return model ? e : NULL;
     }
-    if (!model) {
-        LOG_WARN(LOG_TAG, "model cache: cannot load %s", path);
+
+    /* Runtime mode: decode off the render thread (parse + vertex extraction +
+     * image decode), upload later in sr_model_poll().  Bounded concurrency;
+     * over the cap we leave the path uncached so it retries next frame. */
+    if (!sr->pak || sr->model_inflight >= SR_MODEL_MAX_INFLIGHT)
         return NULL;
-    }
+
+    struct SrModelJob *j = (struct SrModelJob *)JCE_MALLOC(sizeof(*j));
+    if (!j) return NULL;
+    memset(j, 0, sizeof(*j));
+    j->pak = sr->pak;
+    snprintf(j->path, sizeof(j->path), "%s", path);
+    j->done = jce_atomic_i32_create(0);
 
     SrModelCache *e = &sr->model_cache[free_slot];
     snprintf(e->path, sizeof(e->path), "%s", path);
-    e->model = model;
-    e->used  = true;
-    return e;
+    e->model   = NULL;
+    e->used    = true;
+    e->failed  = false;
+    e->pending = true;
+    e->job     = j;
+    e->thr     = jce_thread_create(sr_model_worker, j, "jce_sr_model");
+    if (!e->thr) {
+        /* No worker thread: decode + upload inline this frame. */
+        sr_model_worker(j);
+        e->model   = jce_model_upload_gltf_cpu(j->cpu);
+        e->failed  = (e->model == NULL);
+        e->pending = false;
+        e->job     = NULL;
+        jce_atomic_i32_destroy(j->done);
+        JCE_FREE(j);
+        return e->model ? e : NULL;
+    }
+    sr->model_inflight++;
+    return NULL;   /* pending; entity skipped until the decode lands */
 }
 
 /* Find an existing per-entity animation instance (no creation). */
@@ -1103,9 +1314,51 @@ static float sr_compute_entity_speed(SrAnimInstance *ai, const JceTransform *tc,
  * exactly once, never per-pass.  This is the "skin once, draw many" rule and
  * is the only ordering consistent with shadow producers preceding the color
  * consumer view. */
+/* Deferred pose-sample request produced by the serial management pass and
+ * executed in parallel.  Each request targets a DISTINCT anim instance,
+ * whose player owns its working buffers — so concurrent sampling reads the
+ * shared skeleton/clips read-only and writes only its own palette. */
+typedef struct {
+    SrAnimInstance *ai;
+    int             mode;   /* 1 = single-clip, 2 = blend-tree */
+    /* single */
+    float              dt;
+    int                ac;  /* active clip, for frame events */
+    /* blend */
+    const JceAnimClip *clip_a, *clip_b;
+    float              ta, tb, wa, wb;
+} SrAnimSample;
+
+static void sr_anim_do_sample(SrAnimSample *r)
+{
+    SrAnimInstance *ai = r->ai;
+    if (r->mode == 2)
+        ai->skin_palette_count = jce_anim_player_blend(
+            ai->player, r->clip_a, r->ta, r->wa, r->clip_b, r->tb, r->wb,
+            ai->skin_palette, JCE_MAX_BONES);
+    else if (r->mode == 1)
+        ai->skin_palette_count = jce_anim_player_update(
+            ai->player, r->dt, ai->skin_palette, JCE_MAX_BONES);
+}
+
+/* Worker: sample requests [begin,end) (per-instance disjoint writes). */
+static void sr_anim_sample_range(int begin, int end, void *user)
+{
+    SrAnimSample *reqs = (SrAnimSample *)user;
+    for (int i = begin; i < end; i++)
+        sr_anim_do_sample(&reqs[i]);
+}
+
 static void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
                                     EntityList *list, float dt_sec)
 {
+    /* Pass 1 (this loop, serial): resolve models/instances, drive SM/blend
+     * lifecycle, select clips — all shared/lazy state.  The actual pose
+     * sampling is deferred into `reqs` and run in parallel afterwards
+     * (Pass 2), then frame events fire serially (Pass 3). */
+    SrAnimSample reqs[SR_ANIM_INSTANCE_MAX];
+    int req_count = 0;
+
     for (int i = 0; i < list->count; i++) {
         JceEntity e = list->entities[i];
         if (!entity_enabled(scene, e)) continue;
@@ -1227,10 +1480,13 @@ static void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
                 float db = bt.clip_b ? jce_anim_clip_duration(bt.clip_b) : 0.0f;
                 float ta = da > 0.0001f ? fmodf(ai->bt_time, da) : 0.0f;
                 float tb = db > 0.0001f ? fmodf(ai->bt_time, db) : 0.0f;
-                ai->skin_palette_count = jce_anim_player_blend(ai->player,
-                    bt.clip_a, ta, bt.weight_a,
-                    bt.clip_b, tb, bt.weight_b,
-                    ai->skin_palette, JCE_MAX_BONES);
+                /* Defer the blend sample to the parallel pass. */
+                SrAnimSample req = {0};
+                req.ai = ai; req.mode = 2;
+                req.clip_a = bt.clip_a; req.ta = ta; req.wa = bt.weight_a;
+                req.clip_b = bt.clip_b; req.tb = tb; req.wb = bt.weight_b;
+                if (req_count < SR_ANIM_INSTANCE_MAX) reqs[req_count++] = req;
+                else                                  sr_anim_do_sample(&req);
                 ai->active_clip = -1;   /* tree owns the pose this frame */
                 ai->loop   = sa->loop;
                 ai->speed  = sp;
@@ -1272,13 +1528,20 @@ static void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
         ai->speed = sp;
         ai->paused = !comp_playing;
 
-        ai->skin_palette_count = jce_anim_player_update(ai->player, dt_sec,
-                                                        ai->skin_palette,
-                                                        JCE_MAX_BONES);
-
-        /* Frame events: fire over (prev,cur] now that the player time has
-           advanced. SM-driven clip switches reset the baseline cleanly. */
-        sr_anim_events_advance(ai, ac);
+        /* Defer the single-clip sample (advances player time + writes the
+         * palette) to the parallel pass; frame events fire afterwards in
+         * Pass 3 (they read post-sample time and dispatch into game code,
+         * so they MUST stay on the main thread). */
+        {
+            SrAnimSample req = {0};
+            req.ai = ai; req.mode = 1; req.dt = dt_sec; req.ac = ac;
+            if (req_count < SR_ANIM_INSTANCE_MAX) {
+                reqs[req_count++] = req;
+            } else {
+                sr_anim_do_sample(&req);
+                sr_anim_events_advance(ai, ac);
+            }
+        }
 
         /* Two-bone IK (P1 #16): the analytic solver
            (jce_anim_ik_two_bone_solve) is ready to run here, after the pose
@@ -1289,6 +1552,23 @@ static void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
            component lands, resolve the three joint world positions from the
            palette, call the solver per chain (gated by LOD/cull), and write
            the corrected mid/end back into the palette. */
+    }
+
+    /* Pass 2: sample all deferred poses in parallel.  Each request targets a
+     * distinct instance whose player owns its scratch buffers, so this only
+     * reads shared skeletons/clips and writes per-instance palettes. */
+    if (req_count > 0) {
+        JceJobSystem *jobs = jce_jobs_default();
+        if (jobs && req_count >= 2)
+            jce_jobs_parallel_for(jobs, req_count, 1, sr_anim_sample_range, reqs);
+        else
+            sr_anim_sample_range(0, req_count, reqs);
+
+        /* Pass 3 (serial): fire frame events for single-clip samples — they
+         * read the post-sample player time and dispatch into game code. */
+        for (int i = 0; i < req_count; i++)
+            if (reqs[i].mode == 1)
+                sr_anim_events_advance(reqs[i].ai, reqs[i].ac);
     }
 }
 
@@ -1896,6 +2176,16 @@ static bool sr_try_submit_terrain_shadow(JceSceneRenderer *sr, JceScene *scene,
     return true;
 }
 
+/* Per-renderer "Cast Shadows" (Unity-style): an entity whose MeshRenderer has
+ * shadow_cast_off set is skipped by EVERY shadow producer pass (CSM/dir +
+ * local atlas). Entities without a MeshRenderer keep the default (cast on). */
+static bool sr_entity_casts_shadow(JceScene *scene, JceEntity e)
+{
+    if (!jce_scene_has_mesh_renderer(scene, e)) return true;
+    JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, e);
+    return !(mr && mr->shadow_cast_off);
+}
+
 /* ── Light direction helpers ──────────────────────────────────────── */
 
 static jce_vec3 sr_light_shine_direction(const jce_vec3 *comp_dir)
@@ -2001,11 +2291,19 @@ static void sr_fill_csm_bias_scales(const JceCsmData *csm, float out_scales[4])
     }
 }
 
+/* Cascade-blend ratio honoring the shadow filter tier: tier 0 forces the
+ * blend off, and the shader's existing `blend > 0.0001` guard then skips
+ * the entire second-cascade PCF block with zero shader changes. */
+static float sr_effective_csm_blend(const JceSceneRenderer *sr)
+{
+    return (sr->shadow_filter_tier < 0.5f) ? 0.0f : sr->csm_blend_ratio;
+}
+
 static void sr_bind_shadow_params(JceSceneRenderer *sr, float inv_map_size)
 {
     if (!sr) return;
     float disabled_splits[4] = { 0, 0, 0, 0 };
-    float params[4] = { inv_map_size, sr->csm_blend_ratio,
+    float params[4] = { inv_map_size, sr_effective_csm_blend(sr),
                         sr->csm_normal_bias, sr->csm_filter_radius };
     float bias_scales[4] = { 1, 1, 1, 1 };
     bgfx_set_uniform(sr->u_csm_splits, disabled_splits, 1);
@@ -2043,21 +2341,32 @@ static void sr_bind_local_shadow_state(JceSceneRenderer *sr)
     }
     bgfx_set_uniform(sr->u_spot_shadow_slot, slots, 1);
 
-    float pslots[8];   /* 8 point lanes -> 2 vec4 */
-    for (int i = 0; i < JCE_MAX_POINT_LIGHTS && i < 8; i++)
+    float pslots[16];   /* 16 point lanes -> 4 vec4 */
+    for (int i = 0; i < JCE_MAX_POINT_LIGHTS && i < 16; i++)
         pslots[i] = sr->frame_local_active ? sr->frame_point_slot[i] : -1.0f;
-    bgfx_set_uniform(sr->u_point_shadow_slot, pslots, 2);
+    bgfx_set_uniform(sr->u_point_shadow_slot, pslots, 4);
 
     float inv_atlas = sr->shadow_map_size > 0
         ? 1.0f / (float)sr->shadow_map_size : 0.0f;
     float params[4] = { (float)JCE_LOCAL_SHADOW_TILES, inv_atlas,
                         sr->frame_local_bias, inv_atlas };
     bgfx_set_uniform(sr->u_local_shadow_params, params, 1);
+
+    /* Per-slot depth bias (lane i = atlas slot i). 4 floats = one vec4. Lets each
+       shadow-casting light use its authored shadowBias instead of one global. */
+    if (BGFX_HANDLE_IS_VALID(sr->u_local_shadow_bias))
+        bgfx_set_uniform(sr->u_local_shadow_bias, sr->frame_local_bias_slot, 1);
 }
 
 static void sr_bind_frame_shadow_state(JceSceneRenderer *sr)
 {
     if (!sr) return;
+    /* Filter tier first — both the CSM and local-shadow shader paths
+       branch on it (frame-constant, fully coherent per draw). */
+    if (BGFX_HANDLE_IS_VALID(sr->u_shadow_quality)) {
+        float q[4] = { sr->shadow_filter_tier, 0.0f, 0.0f, 0.0f };
+        bgfx_set_uniform(sr->u_shadow_quality, q, 1);
+    }
     sr_bind_local_shadow_state(sr);
     if (!sr->frame_shadow_active) {
         sr_bind_shadow_uniforms_disabled(sr);
@@ -2073,7 +2382,7 @@ static void sr_bind_frame_shadow_state(JceSceneRenderer *sr)
         bgfx_set_uniform(sr->u_csm_splits, splits_v4, 1);
 
         float csm_params[4] = { sr->shadow_map_size > 0 ? 1.0f / (float)sr->shadow_map_size : 0.0f,
-            sr->csm_blend_ratio, sr->csm_normal_bias, sr->csm_filter_radius };
+            sr_effective_csm_blend(sr), sr->csm_normal_bias, sr->csm_filter_radius };
         bgfx_set_uniform(sr->u_csm_params, csm_params, 1);
 
         float bias_scales[4];
@@ -2461,6 +2770,7 @@ static void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
             for (int i = 0; i < list->count; i++) {
                 JceEntity e = list->entities[i];
                 if (!entity_enabled(scene, e)) continue;
+                if (!sr_entity_casts_shadow(scene, e)) continue;
                 if (sr_try_submit_skinned_shadow(sr, scene, e, shadow_view_0))
                     continue;
                 if (sr_try_submit_mesh_renderer_model_shadow(sr, scene, e, shadow_view_0))
@@ -2497,6 +2807,7 @@ static void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
         for (int i = 0; i < list->count; i++) {
             JceEntity e = list->entities[i];
             if (!entity_enabled(scene, e)) continue;
+            if (!sr_entity_casts_shadow(scene, e)) continue;
             if (sr_try_submit_skinned_shadow(sr, scene, e, shadow_view_0))
                 continue;
             if (sr_try_submit_mesh_renderer_model_shadow(sr, scene, e, shadow_view_0))
@@ -2649,6 +2960,7 @@ static void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
             for (int i = 0; i < list->count; i++) {
                 JceEntity e = list->entities[i];
                 if (!entity_enabled(scene, e)) continue;
+                if (!sr_entity_casts_shadow(scene, e)) continue;
                 if (sr_try_submit_skinned_shadow(sr, scene, e, cv))
                     continue;
                 if (sr_try_submit_mesh_renderer_model_shadow(sr, scene, e, cv))
@@ -2695,6 +3007,7 @@ static void sr_draw_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
             for (int i = 0; i < list->count; i++) {
                 JceEntity e = list->entities[i];
                 if (!entity_enabled(scene, e)) continue;
+                if (!sr_entity_casts_shadow(scene, e)) continue;
                 if (sr_try_submit_skinned_shadow(sr, scene, e, cv))
                     continue;
                 if (sr_try_submit_mesh_renderer_model_shadow(sr, scene, e, cv))
@@ -2752,6 +3065,7 @@ static void sr_local_shadow_render_tile(JceSceneRenderer *sr, JceScene *scene,
     for (int j = 0; j < list->count; j++) {
         JceEntity ee = list->entities[j];
         if (!entity_enabled(scene, ee)) continue;
+        if (!sr_entity_casts_shadow(scene, ee)) continue;
         if (sr_try_submit_skinned_shadow(sr, scene, ee, lv)) continue;
         if (sr_try_submit_mesh_renderer_model_shadow(sr, scene, ee, lv)) continue;
         if (sr_try_submit_terrain_shadow(sr, scene, ee, lv)) continue;
@@ -2764,6 +3078,90 @@ static void sr_local_shadow_render_tile(JceSceneRenderer *sr, JceScene *scene,
     }
 
     sr->frame_local_vp[slot] = *vp;
+}
+
+/* ── Distance/importance light selection (Unity-style culling) ──────────────
+ * Pick the most important point/spot lights for the view: importance =
+ * intensity / distance^2 to the camera (nearer + brighter wins). When a scene
+ * has more lights than the cap, the farthest/dimmest are dropped instead of an
+ * arbitrary ECS-order suffix. Stores the chosen ENTITY sets on sr; the gather
+ * and the shadow producer both skip non-selected lights (same filter, list
+ * order) so the shader light index stays aligned with the shadow slot. */
+typedef struct { JceEntity e; float score; } SrLightCand;
+
+static bool sr_light_selected(const JceEntity *arr, uint32_t n, JceEntity e)
+{
+    for (uint32_t i = 0; i < n; i++)
+        if (arr[i] == e) return true;
+    return false;
+}
+
+static void sr_select_lights(JceSceneRenderer *sr, JceScene *scene,
+                             EntityList *list, const JceCamera *camera)
+{
+    sr->frame_sel_point_n = 0;
+    sr->frame_sel_spot_n  = 0;
+    if (!scene || !list) return;
+
+    jce_vec3 cam = camera ? jce_camera_get_position(camera) : jce_v3(0, 0, 0);
+
+    enum { SR_LIGHT_CAND_MAX = 256 };
+    SrLightCand pc[SR_LIGHT_CAND_MAX]; uint32_t pn = 0;
+    SrLightCand sc[SR_LIGHT_CAND_MAX]; uint32_t sn = 0;
+
+    for (int li = 0; li < list->count; li++) {
+        JceEntity e = list->entities[li];
+        if (!entity_enabled(scene, e)) continue;
+        JceTransform *xf = jce_scene_get_transform(scene, e);
+        jce_vec3 p  = xf ? xf->position : jce_v3(0, 0, 0);
+        jce_vec3 d  = jce_v3_sub(p, cam);
+        float dist2 = jce_v3_dot(d, d);
+        if (dist2 < 0.01f) dist2 = 0.01f;
+
+        if (pn < SR_LIGHT_CAND_MAX
+            && jce_scene_has_point_light(scene, e)
+            && jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_POINT_LIGHT)) {
+            JcePointLight *pl = jce_scene_get_point_light(scene, e);
+            if (pl) {
+                float intensity = pl->intensity > 0.0f ? pl->intensity : 1.0f;
+                pc[pn].e = e; pc[pn].score = intensity / dist2; pn++;
+            }
+        }
+        if (sn < SR_LIGHT_CAND_MAX
+            && jce_scene_has_spot_light(scene, e)
+            && jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_SPOT_LIGHT)) {
+            JceSpotLight *sl = jce_scene_get_spot_light(scene, e);
+            if (sl) {
+                float intensity = sl->intensity > 0.0f ? sl->intensity : 1.0f;
+                sc[sn].e = e; sc[sn].score = intensity / dist2; sn++;
+            }
+        }
+    }
+
+    /* Partial selection sort: pull the top-N by score to the front and store
+       their entities as the membership set (order inside the set is irrelevant —
+       the gather/producer re-process them in list order). */
+    uint32_t pkeep = pn < (uint32_t)JCE_MAX_POINT_LIGHTS
+                     ? pn : (uint32_t)JCE_MAX_POINT_LIGHTS;
+    for (uint32_t i = 0; i < pkeep; i++) {
+        uint32_t best = i;
+        for (uint32_t j = i + 1; j < pn; j++)
+            if (pc[j].score > pc[best].score) best = j;
+        SrLightCand t = pc[i]; pc[i] = pc[best]; pc[best] = t;
+        sr->frame_sel_point[i] = pc[i].e;
+    }
+    sr->frame_sel_point_n = pkeep;
+
+    uint32_t skeep = sn < (uint32_t)JCE_MAX_SPOT_LIGHTS
+                     ? sn : (uint32_t)JCE_MAX_SPOT_LIGHTS;
+    for (uint32_t i = 0; i < skeep; i++) {
+        uint32_t best = i;
+        for (uint32_t j = i + 1; j < sn; j++)
+            if (sc[j].score > sc[best].score) best = j;
+        SrLightCand t = sc[i]; sc[i] = sc[best]; sc[best] = t;
+        sr->frame_sel_spot[i] = sc[i].e;
+    }
+    sr->frame_sel_spot_n = skeep;
 }
 
 /* P1 — local (spot + point) shadow producer pass. Renders up to
@@ -2785,6 +3183,8 @@ static void sr_draw_local_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
         sr->frame_spot_slot[i] = -1.0f;
     for (uint32_t i = 0; i < JCE_MAX_POINT_LIGHTS; i++)
         sr->frame_point_slot[i] = -1.0f;
+    for (uint32_t i = 0; i < JCE_MAX_LOCAL_SHADOWS; i++)
+        sr->frame_local_bias_slot[i] = 0.0015f;   /* per-slot default */
 
     if (!sr->local_atlas_valid || !list) return;
     if (jce_renderer_get_program_shadow(sr->renderer).idx == UINT16_MAX) return;
@@ -2800,6 +3200,15 @@ static void sr_draw_local_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
         JceEntity e = list->entities[li];
         if (!entity_enabled(scene, e)) continue;
         if (!jce_scene_has_spot_light(scene, e)) continue;
+        /* Match the light-gather filter EXACTLY (it skips component-disabled
+           lights, jce_scene_renderer.c gather loop) so my_spot stays aligned
+           with this light's index in u_spotLights[]; otherwise a disabled spot
+           component shifts every later spot's slot and shadows attach to the
+           WRONG light. */
+        if (!jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_SPOT_LIGHT))
+            continue;
+        if (!sr_light_selected(sr->frame_sel_spot, sr->frame_sel_spot_n, e))
+            continue;   /* distance-culled: not in the top-N for this view */
         JceSpotLight *sl = jce_scene_get_spot_light(scene, e);
         if (!sl) continue;
         const uint32_t my_spot = spot_idx++;
@@ -2815,6 +3224,8 @@ static void sr_draw_local_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
                                           0.05f * radius, radius, homog);
         sr_local_shadow_render_tile(sr, scene, list, view_id_base,
                                     &vp, slot, ident, &cleared);
+        sr->frame_local_bias_slot[slot] =
+            (sl->shadow_bias > 0.0f) ? sl->shadow_bias : 0.0015f;
         sr->frame_spot_slot[my_spot] = (float)slot;
         slot++;
     }
@@ -2826,6 +3237,12 @@ static void sr_draw_local_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
         JceEntity e = list->entities[li];
         if (!entity_enabled(scene, e)) continue;
         if (!jce_scene_has_point_light(scene, e)) continue;
+        /* Match the light-gather filter EXACTLY (skip component-disabled) so
+           my_point stays aligned with this light's index in u_pointLights[]. */
+        if (!jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_POINT_LIGHT))
+            continue;
+        if (!sr_light_selected(sr->frame_sel_point, sr->frame_sel_point_n, e))
+            continue;   /* distance-culled: not in the top-N for this view */
         JcePointLight *pl = jce_scene_get_point_light(scene, e);
         if (!pl) continue;
         const uint32_t my_point = point_idx++;
@@ -2840,6 +3257,8 @@ static void sr_draw_local_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
                                           0.05f * radius, radius, homog);
         sr_local_shadow_render_tile(sr, scene, list, view_id_base,
                                     &vp, slot, ident, &cleared);
+        sr->frame_local_bias_slot[slot] =
+            (pl->shadow_bias > 0.0f) ? pl->shadow_bias : 0.0015f;
         sr->frame_point_slot[my_point] = (float)slot;
         slot++;
     }
@@ -2851,11 +3270,101 @@ static void sr_draw_local_shadow_pass(JceSceneRenderer *sr, JceScene *scene,
 
 /* ── Skybox scan ──────────────────────────────────────────────────── */
 
+/* ── Async IBL bake ────────────────────────────────────────────────── */
+
+struct SrIblJob {
+    float         *pixels;  /* owned copy of equirect; freed by the worker */
+    uint32_t       w, h, irr, pf;
+    JceIblCpuData *result;  /* set by the worker before `done` is raised */
+    volatile int   done;    /* 0 = running, 1 = finished (publish barrier=join) */
+};
+
+static void sr_ibl_worker(void *arg)
+{
+    struct SrIblJob *j = (struct SrIblJob *)arg;
+    j->result = jce_ibl_bake_cpu(j->pixels, j->w, j->h, j->irr, j->pf);
+    JCE_FREE(j->pixels);
+    j->pixels = NULL;
+    j->done = 1;
+}
+
+/* MAIN thread: if the async bake finished, join it, upload to GPU and swap it
+ * in — unless it is now stale (the skybox changed since the bake started). */
+static void sr_ibl_poll(JceSceneRenderer *sr)
+{
+    if (!sr->ibl_job || !sr->ibl_job->done)
+        return;
+    if (sr->ibl_thread) {        /* join provides the memory barrier */
+        jce_thread_join(sr->ibl_thread);
+        sr->ibl_thread = NULL;
+    }
+    JceIblCpuData *res = sr->ibl_job->result;
+    bool stale = (strcmp(sr->ibl_job_hdr, sr->skybox_hdr_path) != 0);
+    JCE_FREE(sr->ibl_job);
+    sr->ibl_job = NULL;
+
+    if (!res) return;
+    if (stale) { jce_ibl_cpu_free(res); return; }
+
+    if (sr->ibl_data) { jce_ibl_destroy(sr->ibl_data); sr->ibl_data = NULL; }
+    sr->ibl_data = jce_ibl_upload_cpu(res);   /* MAIN-thread GPU upload */
+    if (sr->ibl_data)
+        LOG_INFO(LOG_TAG, "IBL ready (async): %s", sr->skybox_hdr_path);
+}
+
+/* Start an async IBL bake from the skybox's decoded equirect pixels. The pixels
+ * are copied so the worker is independent of the skybox lifetime. Falls back to
+ * a synchronous bake if the worker thread cannot be created. */
+static void sr_ibl_start_async(JceSceneRenderer *sr, const char *hdr_path)
+{
+    uint32_t eqw = 0, eqh = 0;
+    const float *eqpx = jce_skybox_get_equirect_pixels(sr->skybox, &eqw, &eqh);
+    if (!eqpx || eqw == 0 || eqh == 0)
+        return;
+
+    /* Keep to one in-flight job: if a previous bake is still running (rapid
+     * skybox swap), wait it out and discard its result. */
+    if (sr->ibl_thread) {
+        jce_thread_join(sr->ibl_thread);
+        sr->ibl_thread = NULL;
+    }
+    if (sr->ibl_job) {
+        if (sr->ibl_job->result) jce_ibl_cpu_free(sr->ibl_job->result);
+        JCE_FREE(sr->ibl_job);
+        sr->ibl_job = NULL;
+    }
+
+    size_t bytes = (size_t)eqw * (size_t)eqh * 4u * sizeof(float);
+    struct SrIblJob *job = (struct SrIblJob *)JCE_CALLOC(1, sizeof(*job));
+    float *copy = (float *)JCE_MALLOC(bytes);
+    if (!job || !copy) {
+        JCE_FREE(job);
+        JCE_FREE(copy);
+        sr->ibl_data = jce_ibl_generate_from_pixels(eqpx, eqw, eqh, 32, 128);
+        return;
+    }
+    memcpy(copy, eqpx, bytes);
+    job->pixels = copy;
+    job->w = eqw; job->h = eqh; job->irr = 32; job->pf = 128;
+
+    snprintf(sr->ibl_job_hdr, sizeof(sr->ibl_job_hdr), "%s", hdr_path);
+    sr->ibl_job = job;
+    sr->ibl_thread = jce_thread_create(sr_ibl_worker, job, "ibl_bake");
+    if (!sr->ibl_thread) {
+        /* No thread: run on this (main) thread, then finalize immediately. */
+        sr_ibl_worker(job);
+        sr_ibl_poll(sr);
+    }
+}
+
 static void sr_scan_skybox(JceSceneRenderer *sr, JceScene *scene, EntityList *list)
 {
     const char *hdr_path = NULL;
     float rotation = 0.0f;
     float exposure = 1.0f;
+
+    /* Pick up a finished async IBL bake (if any) before anything else. */
+    sr_ibl_poll(sr);
 
     for (int i = 0; i < list->count && !hdr_path; i++) {
         JceEntity e = list->entities[i];
@@ -2887,29 +3396,39 @@ static void sr_scan_skybox(JceSceneRenderer *sr, JceScene *scene, EntityList *li
                 JCE_FREE(hdr_buf);
             }
         }
-        if (!sr->skybox)
-            sr->skybox = jce_skybox_create_from_hdr_file(hdr_path, 512);
+        if (!sr->skybox) {
+            /* Not in the PAK: resolve to a host-openable path (editor / loose
+             * files) the same way meshes and terrain do, then load from disk.
+             * Without this the raw scene-relative path is opened relative to the
+             * editor CWD and fails ("failed to open HDR file"). */
+            char        resolved[1024];
+            const char *load_path = hdr_path;
+            if (sr->has_cbs && sr->cbs.resolve_path &&
+                sr->cbs.resolve_path(hdr_path, resolved, (int)sizeof(resolved),
+                                     sr->cbs.userdata)) {
+                load_path = resolved;
+            }
+            sr->skybox = jce_skybox_create_from_hdr_file(load_path, 512);
+        }
         if (sr->skybox) {
             snprintf(sr->skybox_hdr_path, sizeof(sr->skybox_hdr_path),
                      "%s", hdr_path);
             sr->skybox_active = true;
-            /* Resurrect runtime IBL: convolve the skybox's already-decoded
-             * CPU HDR pixels into irradiance + specular-prefilter cubemaps.
-             * bgfx GPU textures can't be read back, so we feed the CPU
-             * pixel buffer directly (the GPU-texture path returns NULL). */
-            uint32_t eqw = 0, eqh = 0;
-            const float *eqpx =
-                jce_skybox_get_equirect_pixels(sr->skybox, &eqw, &eqh);
-            if (eqpx && eqw > 0 && eqh > 0)
-                sr->ibl_data =
-                    jce_ibl_generate_from_pixels(eqpx, eqw, eqh, 32, 128);
-            if (sr->ibl_data)
-                LOG_INFO(LOG_TAG, "skybox loaded + IBL ready: %s", hdr_path);
-            else
-                LOG_INFO(LOG_TAG, "skybox loaded (no IBL): %s", hdr_path);
+            /* The sky is already visible; kick the IBL convolution onto a
+             * worker thread and swap the cubemaps in via sr_ibl_poll() when
+             * ready (fallback ambient until then). A cache hit finishes in ~1
+             * frame; a cold bake no longer freezes the main thread. */
+            sr_ibl_start_async(sr, hdr_path);
+            LOG_INFO(LOG_TAG, "skybox loaded (IBL baking async): %s", hdr_path);
         } else {
-            sr->skybox_hdr_path[0] = '\0';
+            /* Remember the FAILED path (do NOT clear it) so the load is not
+             * re-attempted — and re-logged — every frame. It is retried only
+             * if the scene's hdr_path actually changes. */
+            snprintf(sr->skybox_hdr_path, sizeof(sr->skybox_hdr_path),
+                     "%s", hdr_path);
             sr->skybox_active = false;
+            LOG_WARN(LOG_TAG, "skybox HDR load failed: %s (will not retry)",
+                     hdr_path);
         }
     } else if (!hdr_path && sr->skybox_active) {
         if (sr->ibl_data) { jce_ibl_destroy(sr->ibl_data); sr->ibl_data = NULL; }
@@ -2956,61 +3475,39 @@ static void sr_extract_frustum_planes(const jce_mat4 *m, jce_vec4 planes[6])
     #undef RC
 }
 
-/* Build a transient grid from the entity list and frustum-cull it.
- * Output: visible[i] = true if entity list->entities[i] passes culling.
- * Returns the visible entity count. */
-static uint32_t sr_compute_visible(JceSceneRenderer *sr,
-                                    JceScene *scene,
-                                    const EntityList *list,
-                                    const jce_vec4 planes[6],
-                                    bool *visible)
+/* Pass-A scratch: per-entity world matrix + local AABB resolved on the
+ * main thread, consumed by the parallel corner-transform pass.  `mode`
+ * 0 = keep (no transform/model — always visible, skip transform),
+ * 1 = transform the local AABB by `model`. */
+struct SrCullPrep {
+    jce_mat4 model;
+    float    lmn[3];
+    float    lmx[3];
+    uint8_t  mode;
+};
+
+/* Pass-B worker context (read-only inputs + disjoint per-index outputs). */
+typedef struct {
+    const struct SrCullPrep *prep;
+    JceAABB                 *aabbs;
+    bool                    *visible;
+} SrCullXformCtx;
+
+/* Transform entities [begin,end) local AABBs into world AABBs.  Writes
+ * only aabbs[i]/visible[i] for i in range → safe to run in parallel. */
+static void sr_cull_xform_range(int begin, int end, void *user)
 {
-    /* Grow persistent AABB array if needed. */
-    if (sr->cull_aabb_cap < (uint32_t)list->count) {
-        uint32_t new_cap = sr->cull_aabb_cap ? sr->cull_aabb_cap * 2u : 64u;
-        while (new_cap < (uint32_t)list->count) new_cap *= 2u;
-        JceAABB *grown = (JceAABB *)JCE_REALLOC(sr->cull_aabbs,
-                                                 new_cap * sizeof(JceAABB));
-        if (!grown) {
-            for (int i = 0; i < list->count; i++) visible[i] = true;
-            return (uint32_t)list->count;
-        }
-        sr->cull_aabbs    = grown;
-        sr->cull_aabb_cap = new_cap;
-    }
-    JceAABB *aabbs = sr->cull_aabbs;
-
-    /* World bounds derived from a quick scan — we want a snug grid. */
-    jce_vec3 wmin = { +FLT_MAX, +FLT_MAX, +FLT_MAX };
-    jce_vec3 wmax = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
-
-    for (int i = 0; i < list->count; i++) {
-        jce_mat4 model;
-        JceMesh *mesh = NULL;
-        if (!sr_build_entity_model(sr, scene, list->entities[i], &model, &mesh)) {
-            aabbs[i].min = aabbs[i].max = jce_v3(0, 0, 0);
-            visible[i] = true; /* keep entities without transform/model */
+    SrCullXformCtx *c = (SrCullXformCtx *)user;
+    for (int i = begin; i < end; i++) {
+        if (c->prep[i].mode == 0) {
+            c->aabbs[i].min = c->aabbs[i].max = jce_v3(0, 0, 0);
+            c->visible[i] = true;   /* no transform/model → always kept */
             continue;
         }
-
-        /* Local-space AABB. Fall back to a unit cube around the origin
-         * if no mesh resolved (terrain / future component types). */
         float lmn[3], lmx[3];
-        if (mesh) {
-            jce_mesh_get_aabb(mesh, lmn, lmx);
-        } else {
-            lmn[0] = lmn[1] = lmn[2] = -0.5f;
-            lmx[0] = lmx[1] = lmx[2] =  0.5f;
-        }
+        lmn[0] = c->prep[i].lmn[0]; lmn[1] = c->prep[i].lmn[1]; lmn[2] = c->prep[i].lmn[2];
+        lmx[0] = c->prep[i].lmx[0]; lmx[1] = c->prep[i].lmx[1]; lmx[2] = c->prep[i].lmx[2];
 
-        /* Degenerate AABB safeguard. */
-        if (lmx[0] - lmn[0] < 1e-4f && lmx[1] - lmn[1] < 1e-4f &&
-            lmx[2] - lmn[2] < 1e-4f) {
-            lmn[0] = lmn[1] = lmn[2] = -0.5f;
-            lmx[0] = lmx[1] = lmx[2] =  0.5f;
-        }
-
-        /* Transform 8 corners by world matrix and refit. */
         const jce_vec3 corners[8] = {
             { lmn[0], lmn[1], lmn[2] }, { lmx[0], lmn[1], lmn[2] },
             { lmn[0], lmx[1], lmn[2] }, { lmx[0], lmx[1], lmn[2] },
@@ -3019,23 +3516,108 @@ static uint32_t sr_compute_visible(JceSceneRenderer *sr,
         };
         jce_vec3 bmn = { +FLT_MAX, +FLT_MAX, +FLT_MAX };
         jce_vec3 bmx = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
-        for (int c = 0; c < 8; c++) {
-            const jce_vec4 cv = { corners[c].x, corners[c].y, corners[c].z, 1.0f };
-            const jce_vec4 wv = jce_m4_mul_v4(&model, cv);
+        for (int k = 0; k < 8; k++) {
+            const jce_vec4 cv = { corners[k].x, corners[k].y, corners[k].z, 1.0f };
+            const jce_vec4 wv = jce_m4_mul_v4(&c->prep[i].model, cv);
             const float wx = wv.x, wy = wv.y, wz = wv.z;
             if (wx < bmn.x) bmn.x = wx; if (wx > bmx.x) bmx.x = wx;
             if (wy < bmn.y) bmn.y = wy; if (wy > bmx.y) bmx.y = wy;
             if (wz < bmn.z) bmn.z = wz; if (wz > bmx.z) bmx.z = wz;
         }
-        aabbs[i].min = bmn;
-        aabbs[i].max = bmx;
+        c->aabbs[i].min = bmn;
+        c->aabbs[i].max = bmx;
+        c->visible[i]   = false;   /* flipped to true by the frustum query */
+    }
+}
+
+/* Build a transient grid from the entity list and frustum-cull it.
+ * Output: visible[i] = true if entity list->entities[i] passes culling.
+ * Returns the visible entity count.
+ *
+ * Three phases: (A) resolve each entity's world matrix + local AABB on
+ * the main thread — this touches the shared model/mesh/world-matrix
+ * caches and so cannot run concurrently; (B) transform the corners into
+ * world AABBs, fanned out across the shared job system (pure math,
+ * disjoint per-index writes); (C) reduce the world bounds + run the grid
+ * query serially. */
+static uint32_t sr_compute_visible(JceSceneRenderer *sr,
+                                    JceScene *scene,
+                                    const EntityList *list,
+                                    const jce_vec4 planes[6],
+                                    bool *visible)
+{
+    /* Grow persistent AABB + prep arrays if needed. */
+    if (sr->cull_aabb_cap < (uint32_t)list->count) {
+        uint32_t new_cap = sr->cull_aabb_cap ? sr->cull_aabb_cap * 2u : 64u;
+        while (new_cap < (uint32_t)list->count) new_cap *= 2u;
+        JceAABB *grown = (JceAABB *)JCE_REALLOC(sr->cull_aabbs,
+                                                 new_cap * sizeof(JceAABB));
+        struct SrCullPrep *gp = (struct SrCullPrep *)JCE_REALLOC(
+            sr->cull_prep, new_cap * sizeof(struct SrCullPrep));
+        if (!grown || !gp) {
+            if (grown) sr->cull_aabbs = grown;
+            if (gp)    sr->cull_prep  = gp;
+            for (int i = 0; i < list->count; i++) visible[i] = true;
+            return (uint32_t)list->count;
+        }
+        sr->cull_aabbs    = grown;
+        sr->cull_prep     = gp;
+        sr->cull_aabb_cap = new_cap;
+    }
+    JceAABB           *aabbs = sr->cull_aabbs;
+    struct SrCullPrep *prep  = sr->cull_prep;
+
+    /* Pass A (serial, main thread): resolve world matrix + local AABB.
+     * sr_build_entity_model / sr_resolve_mesh touch shared caches, so this
+     * must NOT be parallelised. */
+    for (int i = 0; i < list->count; i++) {
+        jce_mat4 model;
+        JceMesh *mesh = NULL;
+        if (!sr_build_entity_model(sr, scene, list->entities[i], &model, &mesh)) {
+            prep[i].mode = 0;   /* keep; transform pass skips it */
+            continue;
+        }
+
+        float lmn[3], lmx[3];
+        if (mesh) {
+            jce_mesh_get_aabb(mesh, lmn, lmx);
+        } else {
+            lmn[0] = lmn[1] = lmn[2] = -0.5f;
+            lmx[0] = lmx[1] = lmx[2] =  0.5f;
+        }
+        /* Degenerate AABB safeguard. */
+        if (lmx[0] - lmn[0] < 1e-4f && lmx[1] - lmn[1] < 1e-4f &&
+            lmx[2] - lmn[2] < 1e-4f) {
+            lmn[0] = lmn[1] = lmn[2] = -0.5f;
+            lmx[0] = lmx[1] = lmx[2] =  0.5f;
+        }
+        prep[i].model = model;
+        prep[i].lmn[0] = lmn[0]; prep[i].lmn[1] = lmn[1]; prep[i].lmn[2] = lmn[2];
+        prep[i].lmx[0] = lmx[0]; prep[i].lmx[1] = lmx[1]; prep[i].lmx[2] = lmx[2];
+        prep[i].mode = 1;
+    }
+
+    /* Pass B: transform corners → world AABBs.  Fan out when the entity
+     * count justifies the dispatch overhead; otherwise run inline. */
+    SrCullXformCtx xc = { prep, aabbs, visible };
+    JceJobSystem *jobs = jce_jobs_default();
+    if (jobs && list->count >= 256)
+        jce_jobs_parallel_for(jobs, list->count, 0, sr_cull_xform_range, &xc);
+    else
+        sr_cull_xform_range(0, list->count, &xc);
+
+    /* Pass C (serial): reduce world bounds over the computed AABBs. */
+    jce_vec3 wmin = { +FLT_MAX, +FLT_MAX, +FLT_MAX };
+    jce_vec3 wmax = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+    for (int i = 0; i < list->count; i++) {
+        if (prep[i].mode == 0) continue;   /* kept entity, no bounds */
+        const jce_vec3 bmn = aabbs[i].min, bmx = aabbs[i].max;
         if (bmn.x < wmin.x) wmin.x = bmn.x;
         if (bmn.y < wmin.y) wmin.y = bmn.y;
         if (bmn.z < wmin.z) wmin.z = bmn.z;
         if (bmx.x > wmax.x) wmax.x = bmx.x;
         if (bmx.y > wmax.y) wmax.y = bmx.y;
         if (bmx.z > wmax.z) wmax.z = bmx.z;
-        visible[i] = false;   /* will be flipped to true by the query below */
     }
 
     /* Pad to avoid degenerate dimensions. */
@@ -3299,15 +3881,23 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                     dl.intensity = dlc->intensity > 0.0f ? dlc->intensity : 1.0f; dl.casts_shadow = dlc->casts_shadow;
                     dl.direction =
                         sr_light_world_shine_direction(&dlc->direction, xf);
-                    /* P3-E.5 — propagate optional cookie. */
-                    dl.cookie_texture  = dlc->cookie_texture;
-                    dl.cookie_strength = dlc->cookie_strength;
+                    /* P3-E.5 — propagate optional cookie only when authored.
+                     * Legacy zero-initialized scene components may contain
+                     * texture handle 0, which is a valid bgfx handle index but
+                     * not an authored cookie. */
+                    dl.cookie_texture =
+                        (dlc->cookie_path[0] != '\0'
+                         && jce_texture_valid(dlc->cookie_texture))
+                        ? dlc->cookie_texture : JCE_TEXTURE_INVALID;
+                    dl.cookie_strength =
+                        (dlc->cookie_path[0] != '\0') ? dlc->cookie_strength : 0.0f;
                     jce_light_env_add_dir_light(sr->light_env, &dl);
                     has_any_light = true;
                 }
             }
             if (jce_scene_has_point_light(scene, e) &&
-                jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_POINT_LIGHT)) {
+                jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_POINT_LIGHT) &&
+                sr_light_selected(sr->frame_sel_point, sr->frame_sel_point_n, e)) {
                 JcePointLight *plc = jce_scene_get_point_light(scene, e);
                 if (plc) {
                     JcePointLightDesc pl;
@@ -3323,7 +3913,8 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                 }
             }
             if (jce_scene_has_spot_light(scene, e) &&
-                jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_SPOT_LIGHT)) {
+                jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_SPOT_LIGHT) &&
+                sr_light_selected(sr->frame_sel_spot, sr->frame_sel_spot_n, e)) {
                 JceSpotLight *slc = jce_scene_get_spot_light(scene, e);
                 if (slc) {
                     JceSpotLightDesc sl;
@@ -3336,10 +3927,19 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                     sl.position  = xf ? xf->position : slc->position;
                     sl.direction =
                         sr_light_world_shine_direction(&slc->direction, xf);
-                    /* P3-E.5 — propagate cookie + IES profile bindings. */
-                    sl.cookie_texture  = slc->cookie_texture;
-                    sl.ies_lut_texture = slc->ies_lut_texture;
-                    sl.cookie_strength = slc->cookie_strength;
+                    /* P3-E.5 — propagate cookie + IES only when authored.
+                     * This prevents default/legacy spot lights from sampling
+                     * arbitrary texture handle 0 as a projector. */
+                    sl.cookie_texture =
+                        (slc->cookie_path[0] != '\0'
+                         && jce_texture_valid(slc->cookie_texture))
+                        ? slc->cookie_texture : JCE_TEXTURE_INVALID;
+                    sl.ies_lut_texture =
+                        (slc->ies_path[0] != '\0'
+                         && jce_texture_valid(slc->ies_lut_texture))
+                        ? slc->ies_lut_texture : JCE_TEXTURE_INVALID;
+                    sl.cookie_strength =
+                        (slc->cookie_path[0] != '\0') ? slc->cookie_strength : 0.0f;
                     sl.casts_shadow = slc->casts_shadow;
                     sl.shadow_bias  = slc->shadow_bias;
                     jce_light_env_add_spot_light(sr->light_env, &sl);
@@ -3750,6 +4350,7 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
                 pbr.alpha_mode = (JceAlphaMode)mr_comp->alpha_mode;
                 pbr.alpha_cutoff = mr_comp->alpha_cutoff;
                 pbr.double_sided = mr_comp->double_sided;
+                pbr.receive_shadows_off = mr_comp->shadow_receive_off;
             }
 
             /* Always load all texture maps in editor + runtime. The
@@ -4036,6 +4637,8 @@ static uint32_t sr_compute_material_key(const JcePbrMaterial *pbr,
 static void sr_reset_material_cache(JceSceneRenderer *sr)
 {
     sr->mat_count = 0;
+    sr->bind_memo_key = 0;
+    sr->bind_memo_idx = 0;
 }
 
 /* Look up an existing entry by key, or append a new one. Returns the
@@ -4078,18 +4681,30 @@ static uint32_t sr_register_material(JceSceneRenderer *sr,
     return key;
 }
 
-/* Render-queue binder callback. Invoked once per material run during
- * jce_rq_flush. Re-binds all textures / uniforms that jce_mesh_submit_pbr
- * USED to bind inline before it was decomposed. Frame-level state
- * (shadow VP, IBL handles) lives on `sr` directly. */
+/* Render-queue binder callback. Invoked once per SUBMIT during
+ * jce_rq_flush (bind-per-submit — see the rationale in jce_rq_flush).
+ * Re-binds all textures / uniforms that jce_mesh_submit_pbr USED to bind
+ * inline before it was decomposed. Frame-level state (shadow VP, IBL
+ * handles) lives on `sr` directly. */
 static void sr_bind_material_cb(uint32_t material_key, void *user)
 {
     JceSceneRenderer *sr = (JceSceneRenderer *)user;
     if (!sr || material_key == 0u) return;
 
     SrMaterialEntry *e = NULL;
-    for (uint32_t i = 0; i < sr->mat_count; i++) {
-        if (sr->mat_cache[i].key == material_key) { e = &sr->mat_cache[i]; break; }
+    if (sr->bind_memo_key == material_key &&
+        sr->bind_memo_idx < sr->mat_count &&
+        sr->mat_cache[sr->bind_memo_idx].key == material_key) {
+        e = &sr->mat_cache[sr->bind_memo_idx];
+    } else {
+        for (uint32_t i = 0; i < sr->mat_count; i++) {
+            if (sr->mat_cache[i].key == material_key) {
+                e = &sr->mat_cache[i];
+                sr->bind_memo_key = material_key;
+                sr->bind_memo_idx = i;
+                break;
+            }
+        }
     }
     if (!e) return;
 
@@ -4097,11 +4712,14 @@ static void sr_bind_material_cb(uint32_t material_key, void *user)
     jce_pbr_material_bind(&e->pbr, sr->renderer, sr->frame_view_id);
 
     /* Lighting uniforms (u_dirLights / u_pointLights / u_spotLights /
-     * u_lightCounts / u_ambientColor / u_cameraPos). bgfx clears uniform
-     * state after every submit, so we MUST re-apply the light env per
-     * material run — otherwise only the first submitted entity in the
-     * frame samples real lights and everything after renders unlit
-     * (the symptom users report as "shaded looks identical to textured"). */
+     * u_lightCounts / u_ambientColor / u_cameraPos). Each bgfx draw item
+     * records only the uniform updates issued since the last
+     * state-discarding submit and replays them in view-SORTED draw order,
+     * so every submit must carry the full light state in its own update
+     * range — otherwise a draw inherits whatever the previously sorted
+     * draw set (the historic symptom: only the first submitted entity
+     * sampled real lights and everything after rendered unlit). The env
+     * packs once per frame; this call mostly replays cached bytes. */
     if (sr->light_env)
         jce_light_env_apply(sr->light_env, sr->renderer);
 
@@ -4256,12 +4874,14 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
     sr->u_local_shadow_map.idx    = UINT16_MAX;
     sr->u_local_shadow_vp.idx     = UINT16_MAX;
     sr->u_local_shadow_params.idx = UINT16_MAX;
+    sr->u_local_shadow_bias.idx   = UINT16_MAX;
     sr->u_spot_shadow_slot.idx    = UINT16_MAX;
     sr->u_point_shadow_slot.idx   = UINT16_MAX;
     sr->u_csm_vp.idx        = UINT16_MAX;
     sr->u_csm_splits.idx    = UINT16_MAX;
     sr->u_csm_params.idx    = UINT16_MAX;
     sr->u_csm_bias_scales.idx = UINT16_MAX;
+    sr->u_shadow_quality.idx  = UINT16_MAX;
     sr->brdf_lut.idx        = UINT16_MAX;
     sr->u_ibl_irradiance.idx = UINT16_MAX;
     sr->u_ibl_prefilter.idx  = UINT16_MAX;
@@ -4453,10 +5073,18 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
         BGFX_UNIFORM_TYPE_MAT4, JCE_MAX_LOCAL_SHADOWS);
     sr->u_local_shadow_params = bgfx_create_uniform("u_localShadowParams",
         BGFX_UNIFORM_TYPE_VEC4, 1);
+    sr->u_local_shadow_bias = bgfx_create_uniform("u_localShadowBias",
+        BGFX_UNIFORM_TYPE_VEC4, 1);   /* 4 lanes = per-slot bias for JCE_MAX_LOCAL_SHADOWS=4 */
     sr->u_spot_shadow_slot = bgfx_create_uniform("u_spotShadowSlot",
         BGFX_UNIFORM_TYPE_VEC4, 1);
     sr->u_point_shadow_slot = bgfx_create_uniform("u_pointShadowSlot",
-        BGFX_UNIFORM_TYPE_VEC4, 2);   /* 8 point lanes */
+        BGFX_UNIFORM_TYPE_VEC4, 4);   /* 16 point lanes */
+    /* Shadow filter tier — unconditional (gates local shadows even when
+       the CSM resource block above was skipped). Default tier matches the
+       full-quality shaders until the first frame caches the pipeline knob. */
+    sr->u_shadow_quality = bgfx_create_uniform("u_shadowQuality",
+        BGFX_UNIFORM_TYPE_VEC4, 1);
+    sr->shadow_filter_tier = 2.0f;
 
     LOG_INFO(LOG_TAG, "[init] light env");
     /* Multi-light env. */
@@ -4602,13 +5230,44 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
         s->used = false;
     }
 
-    /* Model cache. */
+    /* Model cache.  Join any in-flight async decode first and drop its CPU
+     * result (no GPU upload at teardown). */
     for (int i = 0; i < SR_MODEL_CACHE_MAX; i++) {
         SrModelCache *e = &sr->model_cache[i];
+        if (e->pending) {
+            if (e->thr) { jce_thread_join(e->thr); e->thr = NULL; }
+            if (e->job) {
+                jce_model_gltf_cpu_free(e->job->cpu);
+                if (e->job->done) jce_atomic_i32_destroy(e->job->done);
+                JCE_FREE(e->job);
+                e->job = NULL;
+            }
+            e->pending = false;
+        }
         if (!e->used) continue;
         if (e->model)  jce_model_destroy(e->model);
         e->used = false;
     }
+    sr->model_inflight = 0;
+
+    /* Async texture decodes still in flight: join the workers and drop
+     * their decoded results (no GPU upload at teardown). */
+    for (int i = 0; i < sr->tex_cache_count; i++) {
+        if (!sr->tex_cache[i].pending) continue;
+        if (sr->tex_cache[i].thr) {
+            jce_thread_join(sr->tex_cache[i].thr);
+            sr->tex_cache[i].thr = NULL;
+        }
+        struct SrTexJob *j = sr->tex_cache[i].job;
+        if (j) {
+            jce_texture_cpu_free(j->result);
+            if (j->done) jce_atomic_i32_destroy(j->done);
+            JCE_FREE(j);
+            sr->tex_cache[i].job = NULL;
+        }
+        sr->tex_cache[i].pending = false;
+    }
+    sr->tex_inflight = 0;
 
     /* Shader Graph custom-program cache: lookup-only.  The programs are
      * owned by the process-wide cache in jce_pbr_material.c (freed by
@@ -4653,6 +5312,7 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
     if (BGFX_HANDLE_IS_VALID(sr->u_local_shadow_map))    bgfx_destroy_uniform(sr->u_local_shadow_map);
     if (BGFX_HANDLE_IS_VALID(sr->u_local_shadow_vp))     bgfx_destroy_uniform(sr->u_local_shadow_vp);
     if (BGFX_HANDLE_IS_VALID(sr->u_local_shadow_params)) bgfx_destroy_uniform(sr->u_local_shadow_params);
+    if (BGFX_HANDLE_IS_VALID(sr->u_local_shadow_bias))   bgfx_destroy_uniform(sr->u_local_shadow_bias);
     if (BGFX_HANDLE_IS_VALID(sr->u_spot_shadow_slot))    bgfx_destroy_uniform(sr->u_spot_shadow_slot);
     if (BGFX_HANDLE_IS_VALID(sr->u_point_shadow_slot))   bgfx_destroy_uniform(sr->u_point_shadow_slot);
 
@@ -4664,8 +5324,17 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
     if (BGFX_HANDLE_IS_VALID(sr->u_csm_splits))     bgfx_destroy_uniform(sr->u_csm_splits);
     if (BGFX_HANDLE_IS_VALID(sr->u_csm_params))     bgfx_destroy_uniform(sr->u_csm_params);
     if (BGFX_HANDLE_IS_VALID(sr->u_csm_bias_scales))bgfx_destroy_uniform(sr->u_csm_bias_scales);
+    if (BGFX_HANDLE_IS_VALID(sr->u_shadow_quality)) bgfx_destroy_uniform(sr->u_shadow_quality);
 
     if (sr->light_env) jce_light_env_destroy(sr->light_env);
+    /* Join any in-flight async IBL bake before tearing down (the worker uses a
+     * private pixel copy, so the skybox below is safe to destroy regardless). */
+    if (sr->ibl_thread) { jce_thread_join(sr->ibl_thread); sr->ibl_thread = NULL; }
+    if (sr->ibl_job) {
+        if (sr->ibl_job->result) jce_ibl_cpu_free(sr->ibl_job->result);
+        JCE_FREE(sr->ibl_job);
+        sr->ibl_job = NULL;
+    }
     if (sr->ibl_data)  jce_ibl_destroy(sr->ibl_data);
     if (sr->skybox)    jce_skybox_destroy(sr->skybox);
     if (sr->vfog)      jce_volumetric_fog_destroy(sr->vfog);
@@ -4696,6 +5365,7 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
 
     if (sr->cull_space) jce_space_destroy(sr->cull_space);
     if (sr->cull_aabbs) JCE_FREE(sr->cull_aabbs);
+    if (sr->cull_prep)  JCE_FREE(sr->cull_prep);
     if (sr->render_queue) jce_rq_destroy(sr->render_queue);
     if (sr->transparent_queue) jce_rq_destroy(sr->transparent_queue);
 
@@ -4922,6 +5592,10 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
     if (!sr || !scene) return view_id_base;
     JCE_PROFILE_ZONE_N("SceneRenderer::Render");
 
+    /* Upload any textures / models whose async decode finished last frame. */
+    sr_tex_poll(sr);
+    sr_model_poll(sr);
+
     /* Start a fresh world-matrix cache generation for this render. The
        multiple sub-passes below (shadow producers + color + terrain) each
        read jce_scene_get_world_matrix; memoizing per render means a parent
@@ -5042,6 +5716,15 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
         sr->postfx_tonemap_active =
             jce_postfx_is_enabled(sr->postfx_pipeline, JCE_POSTFX_TONEMAP);
 
+    /* Shadow filter tier — read the render-pipeline quality knob once per
+       frame; sr_bind_frame_shadow_state uploads it with every material
+       bind. (jce_render_pipeline_get is a struct copy, not a lookup.) */
+    {
+        JceRenderPipelineDesc rp_desc;
+        jce_render_pipeline_get(&rp_desc);
+        sr->shadow_filter_tier = (float)rp_desc.shadow_filter_quality;
+    }
+
     /* Time-of-day driver (P2-weather-decals-tod): advance the day clock and
      * push the lighting snapshot into sr->tod_state BEFORE the sky + lighting
      * passes consume it.  No-op (and releases any override) when disabled. */
@@ -5087,6 +5770,11 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
     /* 2D sprite animation: advance every SpriteAnimator frame time ONCE here;
        the entity draw loop consumes the cached player's current frame. */
     sr_update_sprite_anims(sr, scene, &list, dt_sec);
+
+    /* Distance/importance light selection (Unity-style): choose the most
+       important point/spot lights for this view BEFORE the shadow producer and
+       the light gather, so both consume the SAME selected set (index-aligned). */
+    sr_select_lights(sr, scene, &list, camera);
 
     /* Shadow passes (do them BEFORE entity pass so PBR can sample). */
     if (cfg->draw_shadows) {

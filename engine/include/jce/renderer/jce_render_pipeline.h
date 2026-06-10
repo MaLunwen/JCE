@@ -51,6 +51,16 @@ typedef struct JceRenderPipelineDesc {
     /* Quality knobs */
     uint16_t shadow_resolution; /* 512 / 1024 / 2048 / 4096    */
     uint8_t  csm_cascade_count; /* 1..4                        */
+    /* Shadow FILTER cost tier (per-pixel tap count, not map size):
+     *   0 = 1 tap, cascade blend off  (local + CSM hard shadows)
+     *   1 = 3x3 PCF everywhere
+     *   2 = full (local 3x3, CSM rotated 5x5 + cascade blending)
+     * Worst case per pixel under 4 shadowed local lights drops from
+     * ~86 taps (tier 2) to ~5 (tier 0) — the dominant fragment cost
+     * on the 2008-2010 iGPU baseline. Consumed by the scene renderer
+     * via the u_shadowQuality uniform (frame-constant branch in
+     * fs_pbr/fs_terrain — no shader permutations). */
+    uint8_t  shadow_filter_quality;
     uint8_t  msaa_samples;      /* 1, 2, 4, 8                  */
     float    render_scale;      /* 0.25..2.0; 1.0 = native     */
     JceRpQuality post_quality;

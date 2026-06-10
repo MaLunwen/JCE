@@ -362,20 +362,29 @@ void jce_rq_flush(JceRenderQueue *rq, const JceRenderer *renderer)
     memset(&st, 0, sizeof(st));
     st.commands_in = rq->count;
 
-    bool     have_binder       = (rq->bind_material != NULL);
-    bool     bound_any         = false;
-    uint32_t last_material_key = 0;
+    bool have_binder = (rq->bind_material != NULL);
 
+    /* Material binds happen before EVERY submit, never skipped on an
+     * unchanged material_key. bgfx semantics make the skip unsound: each
+     * draw item records only the uniform updates issued since the last
+     * state-discarding submit and replays them in view-SORTED draw order,
+     * and BGFX_DISCARD_ALL clears texture bindings after every submit
+     * (D3D11 explicitly NULLs stale SRVs). A submit issued without its own
+     * preceding bind therefore goes out with an EMPTY uniform range —
+     * inheriting whatever the previously sorted draw set, which can belong
+     * to a different material — and with no textures. The old "skip when
+     * material_key unchanged" path hit exactly that: the same material on
+     * two different meshes sorts into two runs (vbh precedes material_key
+     * in cmp_for_instancing), so the second run's submit went out unbound.
+     * Batched runs still collapse to one submit and thus one bind; the
+     * binder itself is cheap (the scene renderer memoizes its material
+     * lookup and the light env packs once per frame). */
     uint32_t i = 0;
     while (i < rq->count) {
         JceRqEntry *e = &rq->entries[i];
 
-        if (have_binder &&
-            (!bound_any || e->cmd.material_key != last_material_key)) {
+        if (have_binder)
             rq->bind_material(e->cmd.material_key, rq->bind_material_user);
-            last_material_key = e->cmd.material_key;
-            bound_any = true;
-        }
 
         if (e->inst_data && !disable_instancing) {
             rq_submit_explicit_instanced(e);
@@ -405,6 +414,11 @@ void jce_rq_flush(JceRenderQueue *rq, const JceRenderer *renderer)
             st.instances_total += run;
         } else {
             for (uint32_t k = i; k < j; k++) {
+                /* Every single-submit needs its own bind (see above);
+                 * entry i was bound before the run scan. */
+                if (have_binder && k > i)
+                    rq->bind_material(rq->entries[k].cmd.material_key,
+                                      rq->bind_material_user);
                 rq_submit_single(&rq->entries[k]);
                 st.submits_out++;
             }

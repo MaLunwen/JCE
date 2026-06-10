@@ -48,6 +48,11 @@ typedef struct {
     int             alpha_mode;         /* 0=OPAQUE, 1=MASK, 2=BLEND */
     float           alpha_cutoff;
     bool            double_sided;
+    /* Per-renderer shadow flags (Unity-style). Stored INVERTED so that
+       zero-initialized components and legacy scenes default to the standard
+       behaviour: cast ON, receive ON. */
+    bool            shadow_cast_off;    /* true = this mesh casts no shadows */
+    bool            shadow_receive_off; /* true = this mesh ignores shadows  */
     char            albedo_tex[256];
     char            mr_tex[256];
     char            normal_tex[256];

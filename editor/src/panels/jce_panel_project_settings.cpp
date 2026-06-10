@@ -474,6 +474,24 @@ void draw_quality(void)
             }
         }
 
+        /* Shadow filter row (per-pixel PCF tap tier, not map size). */
+        {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextUnformatted(jce_editor_i18n_or(PS_KEY "shadowFilter", "Shadow Filter"));
+            static const char *k_filter_names[] = { "1-tap", "3x3", "5x5" };
+            for (int c = 1; c <= 4; ++c) {
+                ImGui::TableSetColumnIndex(c);
+                bool hi = (c - 1 == s_tier_idx);
+                if (hi) ImGui::PushStyleColor(ImGuiCol_Text,
+                    ImVec4(0.4f, 1.0f, 0.5f, 1.0f));
+                int q = (int)presets[c - 1].rp.shadow_filter_quality;
+                if (q < 0) q = 0; if (q > 2) q = 2;
+                ImGui::TextUnformatted(k_filter_names[q]);
+                if (hi) ImGui::PopStyleColor();
+            }
+        }
+
         /* Max lights row. */
         {
             ImGui::TableNextRow();

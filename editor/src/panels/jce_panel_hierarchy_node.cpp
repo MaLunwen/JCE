@@ -324,6 +324,50 @@ void draw_entity_node(uint32_t id)
     bool node_double_clicked = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)
                                && ImGui::IsItemHovered();
 
+    /* Drag-drop reparent MUST be issued HERE — right after the tree-node row,
+       BEFORE the SameLine widgets (variant diamond, eye toggle, rename input).
+       ImGui binds BeginDragDropSource/Target to the LAST submitted item; when
+       these blocks lived further down (after the eye InvisibleButton) they
+       silently attached to the eye button, so dragging the row did nothing and
+       no parent-child link was ever made. Same hazard the click capture above
+       guards against. */
+    if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
+        ImGui::SetDragDropPayload(JCE_DND_ENTITY, &id, sizeof(uint32_t));
+        if (jce_state_is_selected(id)) {
+            int sel_n = 0;
+            jce_state_get_selection(&sel_n);
+            if (sel_n > 1)
+                ImGui::Text("%s  (+%d)", name, sel_n - 1);
+            else
+                ImGui::Text("%s", name);
+        } else {
+            ImGui::Text("%s", name);
+        }
+        ImGui::EndDragDropSource();
+    }
+
+    if (ImGui::BeginDragDropTarget()) {
+        const ImGuiPayload *payload = ImGui::AcceptDragDropPayload(JCE_DND_ENTITY);
+        if (payload) {
+            uint32_t dragged_id = *(uint32_t *)payload->Data;
+            if (jce_state_is_selected(dragged_id)) {
+                int sel_n = 0;
+                const uint32_t *sel = jce_state_get_selection(&sel_n);
+                /* Copy out: reparenting may invalidate the pointer. */
+                uint32_t ids[256];
+                int n = sel_n < 256 ? sel_n : 256;
+                for (int i = 0; i < n; i++) ids[i] = sel[i];
+                for (int i = 0; i < n; i++) {
+                    if (ids[i] == id) continue;
+                    jce_state_reparent_entity(ids[i], id);
+                }
+            } else {
+                jce_state_reparent_entity(dragged_id, id);
+            }
+        }
+        ImGui::EndDragDropTarget();
+    }
+
     /* Variant indicator: cyan diamond drawn as a primitive so it never
        depends on whether the active font ships Geometric Shapes (KaiTi
        and many CJK fonts don't, which would render as '?'/tofu). */
@@ -485,43 +529,6 @@ void draw_entity_node(uint32_t id)
         s_hier.shift_anchor = id;
         jce_editor_inspector_request_sync();
         s_hier.want_ctx_popup = true;
-    }
-
-    if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
-        ImGui::SetDragDropPayload(JCE_DND_ENTITY, &id, sizeof(uint32_t));
-        if (jce_state_is_selected(id)) {
-            int sel_n = 0;
-            jce_state_get_selection(&sel_n);
-            if (sel_n > 1)
-                ImGui::Text("%s  (+%d)", name, sel_n - 1);
-            else
-                ImGui::Text("%s", name);
-        } else {
-            ImGui::Text("%s", name);
-        }
-        ImGui::EndDragDropSource();
-    }
-
-    if (ImGui::BeginDragDropTarget()) {
-        const ImGuiPayload *payload = ImGui::AcceptDragDropPayload(JCE_DND_ENTITY);
-        if (payload) {
-            uint32_t dragged_id = *(uint32_t *)payload->Data;
-            if (jce_state_is_selected(dragged_id)) {
-                int sel_n = 0;
-                const uint32_t *sel = jce_state_get_selection(&sel_n);
-                /* Copy out: reparenting may invalidate the pointer. */
-                uint32_t ids[256];
-                int n = sel_n < 256 ? sel_n : 256;
-                for (int i = 0; i < n; i++) ids[i] = sel[i];
-                for (int i = 0; i < n; i++) {
-                    if (ids[i] == id) continue;
-                    jce_state_reparent_entity(ids[i], id);
-                }
-            } else {
-                jce_state_reparent_entity(dragged_id, id);
-            }
-        }
-        ImGui::EndDragDropTarget();
     }
 
     /* ── Drop-between zone ───────────────────────────────────────── */

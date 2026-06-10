@@ -241,6 +241,22 @@ void draw_comp_mesh_renderer(JceMeshRenderer *mr)
         }
         if (ImGui::Checkbox(jce_editor_i18n("inspector.doubleSided"), &mr->double_sided))
             insp_undo_bool(&mr->double_sided);
+        /* Unity-style per-renderer shadow flags. Shown in POSITIVE sense; the
+         * component stores them inverted (zero-init / legacy = both ON). */
+        {
+            bool cast_on = !mr->shadow_cast_off;
+            if (ImGui::Checkbox(jce_editor_i18n_id("inspector.castShadows",
+                                                   "Cast Shadows"), &cast_on)) {
+                mr->shadow_cast_off = !cast_on;
+                insp_undo_bool(&mr->shadow_cast_off);
+            }
+            bool recv_on = !mr->shadow_receive_off;
+            if (ImGui::Checkbox(jce_editor_i18n_id("inspector.receiveShadows",
+                                                   "Receive Shadows"), &recv_on)) {
+                mr->shadow_receive_off = !recv_on;
+                insp_undo_bool(&mr->shadow_receive_off);
+            }
+        }
         ImGui::TreePop();
     }
 

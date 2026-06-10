@@ -110,6 +110,74 @@ void reset_pipeline()
     g_finish = FinishPlan{};
 }
 
+/* ---------------------------------------------------------------- *
+ * Worker-thread log redirect.                                       *
+ *                                                                   *
+ * prepare_project_generated_assets() and its helpers call           *
+ * log_line()/set_error() directly.  When that cook/pack runs on a   *
+ * background build thread, those calls would touch the editor       *
+ * console ring buffer and the ImGui toast path, neither of which is *
+ * thread-safe.  While a sink is installed on the calling thread we  *
+ * capture entries here and replay them on the main thread once the  *
+ * worker is joined (poll_asset_prep).                               *
+ * ---------------------------------------------------------------- */
+struct DeferredLogEntry {
+    JceConsoleLevel level;
+    std::string     text;
+};
+struct WorkerLogSink {
+    std::vector<DeferredLogEntry> entries;
+    std::string                   last_error;
+};
+thread_local WorkerLogSink *t_log_sink = nullptr;
+
+/* ---------------------------------------------------------------- *
+ * Background asset-prepare (cook/pack/embed) job.                    *
+ *                                                                   *
+ * prepare_project_generated_assets() is the heavy, UI-freezing step *
+ * of a project build (ZSTD archive cook + file writes + embed       *
+ * object generation).  It is moved onto a dedicated worker thread;  *
+ * the main thread polls `done` each frame and, on success, builds   *
+ * the cmake configure/compile queue and spawns it.  All inputs the  *
+ * cook needs and all context the post-cook pipeline construction    *
+ * needs are captured up-front so the worker touches no shared       *
+ * editor state besides its own job + log sink.                      *
+ * ---------------------------------------------------------------- */
+struct PendingProjectBuild {
+    bool active = false;
+
+    /* prepare_project_generated_assets inputs */
+    std::string project, sdk, cooked, bundles, variant, arch;
+    std::string intermediates_dir, reports_dir;
+
+    /* prepare_project_generated_assets outputs (filled by the worker) */
+    std::string out_assets_obj, out_assets_asm, out_assets_c;
+    std::string out_assets_bom, out_bundle_dir;
+
+    /* Context needed to build the cmake queue + finish plan on the main
+     * thread once the cook succeeds. */
+    std::string build_dir, output_dir, archive_dir, build_type, cmake_dir;
+    std::string target, label, exe_name, platform_tag;
+    bool        use_cmake_fresh = false;
+#if JCE_PLATFORM_WINDOWS
+    std::string vcvars, vc_arch, c_compiler;
+#endif
+    bool        want_package = false;
+    std::string package_out_dir, app_name, app_version;
+
+    /* Worker plumbing */
+    JceThread    *thread = nullptr;
+    JceAtomicI32 *done   = nullptr;   /* 0 running, 1 finished */
+    JceAtomicI32 *cancel = nullptr;   /* set by request_stop */
+    bool          ok     = false;
+    WorkerLogSink sink;
+};
+PendingProjectBuild g_pending;
+
+void poll_asset_prep();           /* main thread, per-frame */
+void asset_prep_shutdown();       /* main thread, on editor exit */
+bool asset_prep_active();         /* a cook/pack is in flight */
+
 /* Process-wide fallback working directory.  Used by spawn_tool() when
  * the caller does not supply one — i.e. legacy Configure / Build /
  * Repack paths.  Set by the Build Profiles panel after the user picks
@@ -125,6 +193,10 @@ ToolCache g_tools;
 
 void log_line(JceConsoleLevel level, const std::string &line)
 {
+    if (t_log_sink) {
+        t_log_sink->entries.push_back({level, line});
+        return;
+    }
     jce_editor_console_log_level(level, "%s", line.c_str());
 }
 
@@ -183,6 +255,11 @@ void release_process()
 
 void set_error(const std::string &msg)
 {
+    if (t_log_sink) {
+        t_log_sink->last_error = msg;
+        t_log_sink->entries.push_back({JCE_CONSOLE_ERROR, "[build] " + msg});
+        return;
+    }
     g_build.last_error = msg;
     log_line(JCE_CONSOLE_ERROR, "[build] " + msg);
 }
@@ -435,6 +512,7 @@ void jce_build_manager_init(void)
 
 void jce_build_manager_shutdown(void)
 {
+    asset_prep_shutdown();   /* join any in-flight cook/pack worker */
     if (g_build.process) {
         jce_process_force_kill(g_build.process);
         release_process();
@@ -444,6 +522,7 @@ void jce_build_manager_shutdown(void)
 
 void jce_build_manager_poll(void)
 {
+    poll_asset_prep();   /* advance a background cook/pack into compile */
     poll_state();
 }
 
@@ -538,7 +617,7 @@ bool jce_build_manager_run_script(const JceBuildScriptConfig *cfg)
         set_error("run_script: script_path is required");
         return false;
     }
-    if (g_build.process) {
+    if (g_build.process || asset_prep_active()) {
         set_error("run_script: a build is already running");
         return false;
     }
@@ -680,6 +759,16 @@ void jce_build_manager_set_default_working_dir(const char *dir)
 
 void jce_build_manager_request_stop(void)
 {
+    /* If the cook/pack worker is in flight there is no child process yet;
+     * flag the pending build so poll_asset_prep() aborts before the
+     * (heavy) compile is spawned.  The cook itself is a single call and
+     * cannot be interrupted mid-flight. */
+    if (g_pending.active && g_pending.cancel) {
+        jce_atomic_i32_store(g_pending.cancel, 1);
+        log_line(JCE_CONSOLE_INFO,
+                 "[build] stop requested; will abort after cook completes");
+        return;
+    }
     if (!g_build.process || g_build.state != JCE_BUILD_RUNNING) return;
     if (g_build.stopping) return;
     jce_process_request_stop(g_build.process);
@@ -690,7 +779,7 @@ void jce_build_manager_request_stop(void)
 
 bool jce_build_manager_is_running(void)
 {
-    return g_build.state == JCE_BUILD_RUNNING;
+    return g_build.state == JCE_BUILD_RUNNING || g_pending.active;
 }
 
 void jce_build_manager_get_status(JceBuildStatus *out)
@@ -1847,12 +1936,226 @@ bool project_cache_needs_reset(const std::string &cache_path,
     return false;
 }
 
+/* ---------------------------------------------------------------- *
+ * Background cook/pack worker + completion handling.                 *
+ * ---------------------------------------------------------------- */
+
+bool asset_prep_active() { return g_pending.active; }
+
+/* WORKER thread: run the whole cook/pack/embed.  All log/error output is
+ * captured into the job's sink (see t_log_sink) and replayed on the main
+ * thread by poll_asset_prep(). */
+void asset_prep_worker(void *arg)
+{
+    PendingProjectBuild *p = (PendingProjectBuild *)arg;
+    t_log_sink = &p->sink;
+    p->ok = prepare_project_generated_assets(
+        p->project, p->sdk, p->cooked, p->bundles, p->variant,
+        p->intermediates_dir, p->reports_dir, p->arch,
+        p->out_assets_obj, p->out_assets_asm, p->out_assets_c,
+        p->out_assets_bom, p->out_bundle_dir);
+    t_log_sink = nullptr;
+    jce_atomic_i32_store(p->done, 1);
+}
+
+/* MAIN thread: the cook succeeded — build the cmake configure/compile
+ * queue + finish plan from the captured context and spawn the first step.
+ * State stays RUNNING (set when the worker launched). */
+void finalize_project_build_pipeline(PendingProjectBuild &p)
+{
+    auto append_configure = [&](std::string &a) {
+        if (p.use_cmake_fresh)
+            a += " --fresh";
+        a += " -S " + qtok(p.project);
+        a += " -B " + qtok(p.build_dir);
+        a += " -G Ninja";
+        a += " -DCMAKE_BUILD_TYPE=" + p.build_type;
+        a += " -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=" + qtok(p.output_dir);
+        a += " -DCMAKE_LIBRARY_OUTPUT_DIRECTORY=" + qtok(p.output_dir);
+        a += " -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY=" + qtok(p.archive_dir);
+        a += " -DJCE_PROJECT_COOKED_ASSETS=" + qtok(p.cooked);
+        a += " -DJCE_PROJECT_BUNDLES=" + qtok(p.bundles);
+        a += " -U JCE_PROJECT_PREBUILT_ASSETS_OBJ";
+        a += " -U JCE_PROJECT_PREBUILT_ASSETS_ASM";
+        a += " -U JCE_PROJECT_PREBUILT_ASSETS_C";
+        if (!p.out_assets_obj.empty())
+            a += " -DJCE_PROJECT_PREBUILT_ASSETS_OBJ=" + qtok(p.out_assets_obj);
+        if (!p.out_assets_asm.empty())
+            a += " -DJCE_PROJECT_PREBUILT_ASSETS_ASM=" + qtok(p.out_assets_asm);
+        if (!p.out_assets_c.empty())
+            a += " -DJCE_PROJECT_PREBUILT_ASSETS_C=" + qtok(p.out_assets_c);
+        a += " -DJCE_PROJECT_PREBUILT_BUNDLE_DIR=" + qtok(p.out_bundle_dir);
+        a += " -DJCE_DIR=" + qtok(p.cmake_dir);
+    };
+
+#if JCE_PLATFORM_WINDOWS
+    /* The Windows SDK ships MSVC-built static libs, so force cl and
+     * activate the MSVC environment inline via Microsoft's own
+     * vcvarsall.bat.  Configure and build run in one cmd.exe /c chain so
+     * the env survives between them. */
+    std::string args = "/c ";
+    if (!p.vcvars.empty()) {
+        args += "call " + qtok(p.vcvars) + " " + p.vc_arch + " && ";
+    } else {
+        log_line(JCE_CONSOLE_WARNING,
+                 "[build] MSVC vcvarsall.bat not found; assuming cl.exe is "
+                 "already on PATH");
+    }
+    args += "cmake";
+    append_configure(args);
+    if (!p.c_compiler.empty())
+        args += " -DCMAKE_C_COMPILER=" + qtok(p.c_compiler);
+    else
+        args += " -DCMAKE_C_COMPILER=cl";
+    args += " && cmake --build " + qtok(p.build_dir) +
+            " --target " + qtok(p.target);
+
+    QueuedStep step;
+    step.stage = JCE_BUILD_STAGE_COMPILE;
+    step.exe   = "cmd.exe";
+    step.args  = args;
+    step.wd    = p.project;
+    step.label = p.label;
+    g_queue.push_back(step);
+#else
+    /* POSIX: two direct cmake invocations (configure, then build). */
+    {
+        QueuedStep configure;
+        configure.stage = JCE_BUILD_STAGE_CONFIGURE;
+        configure.exe   = "cmake";
+        std::string a;
+        append_configure(a);
+        configure.args  = a;
+        configure.wd    = p.project;
+        configure.label = p.label;
+        g_queue.push_back(configure);
+
+        QueuedStep compile;
+        compile.stage = JCE_BUILD_STAGE_COMPILE;
+        compile.exe   = "cmake";
+        compile.args  = "--build " + qtok(p.build_dir) +
+                        " --target " + qtok(p.target);
+        compile.wd    = p.project;
+        compile.label = p.label;
+        g_queue.push_back(compile);
+    }
+#endif
+
+    /* Finish plan: always verify the artifact; stage a package when an
+     * output directory was requested. */
+    g_finish.verify        = true;
+    g_finish.exe_name      = p.exe_name;
+    g_finish.artifact_a    = p.output_dir + PATH_SEP_CHR_LOCAL + p.exe_name;
+    g_finish.artifact_b    = p.build_dir + PATH_SEP_CHR_LOCAL + p.exe_name;
+    g_finish.asset_bom_src = p.out_assets_bom;
+
+    if (p.want_package) {
+        g_finish.stage      = true;
+        g_finish.out_dir    = p.package_out_dir;
+        g_finish.cooked_rel = p.cooked;
+        if (!p.cooked.empty())
+            g_finish.cooked_src = p.project + PATH_SEP_CHR_LOCAL +
+                                  join_norm_sep(p.cooked);
+
+        std::string vt;
+        vt += "name:     ";
+        vt += (!p.app_name.empty()) ? p.app_name : p.target;
+        vt += "\n";
+        if (!p.app_version.empty()) {
+            vt += "version:  "; vt += p.app_version; vt += "\n";
+        }
+        vt += "platform: "; vt += p.platform_tag; vt += "\n";
+        vt += "arch:     "; vt += p.arch;         vt += "\n";
+        vt += "variant:  "; vt += p.variant;      vt += "\n";
+        g_finish.version_text = vt;
+    }
+
+    log_line(JCE_CONSOLE_INFO,
+             "[build] native project build: " + p.target +
+             " (" + p.platform_tag + "/" + p.arch + "/" + p.variant +
+             ")  sdk=" + p.sdk);
+
+    /* Spawn the first queued step; poll_state() advances the rest. */
+    QueuedStep first = g_queue.front();
+    g_queue_pos = 1;
+    if (!spawn_tool(first.stage, first.exe.c_str(), first.label.c_str(),
+                    first.args.empty() ? nullptr : first.args.c_str(),
+                    first.wd.empty() ? nullptr : first.wd.c_str())) {
+        /* spawn_tool already set FAILED + last_error. */
+        reset_pipeline();
+    }
+}
+
+/* MAIN thread, per-frame: pick up a finished cook/pack and continue. */
+void poll_asset_prep()
+{
+    if (!g_pending.active) return;
+    if (!g_pending.done || jce_atomic_i32_load(g_pending.done) == 0)
+        return;   /* worker still running */
+
+    if (g_pending.thread) {
+        jce_thread_join(g_pending.thread);
+        g_pending.thread = nullptr;
+    }
+
+    /* Replay the worker's captured log/error lines now, on the thread
+     * where the console + toast path is safe. */
+    for (const DeferredLogEntry &e : g_pending.sink.entries)
+        jce_editor_console_log_level(e.level, "%s", e.text.c_str());
+    g_pending.sink.entries.clear();
+
+    const bool cancelled =
+        g_pending.cancel && jce_atomic_i32_load(g_pending.cancel) != 0;
+    const bool ok = g_pending.ok;
+    const std::string sink_error = g_pending.sink.last_error;
+
+    if (g_pending.done)   { jce_atomic_i32_destroy(g_pending.done);   g_pending.done = nullptr; }
+    if (g_pending.cancel) { jce_atomic_i32_destroy(g_pending.cancel); g_pending.cancel = nullptr; }
+
+    if (cancelled) {
+        g_pending.active   = false;
+        g_build.state      = JCE_BUILD_FAILED;
+        g_build.last_error = "build stopped before compile";
+        log_line(JCE_CONSOLE_WARNING,
+                 "[build] cook/pack finished; build stopped before compile");
+        reset_pipeline();
+        return;
+    }
+    if (!ok) {
+        g_pending.active   = false;
+        g_build.state      = JCE_BUILD_FAILED;
+        g_build.last_error = sink_error.empty()
+            ? std::string("asset cook/pack failed") : sink_error;
+        reset_pipeline();
+        return;
+    }
+
+    /* Success: build the cmake queue + spawn it (state stays RUNNING). */
+    g_pending.active = false;
+    finalize_project_build_pipeline(g_pending);
+}
+
+/* MAIN thread, on editor shutdown: join any in-flight worker so it does
+ * not write into freed state after teardown. */
+void asset_prep_shutdown()
+{
+    if (!g_pending.active) return;
+    if (g_pending.thread) {
+        jce_thread_join(g_pending.thread);
+        g_pending.thread = nullptr;
+    }
+    if (g_pending.done)   { jce_atomic_i32_destroy(g_pending.done);   g_pending.done = nullptr; }
+    if (g_pending.cancel) { jce_atomic_i32_destroy(g_pending.cancel); g_pending.cancel = nullptr; }
+    g_pending.sink.entries.clear();
+    g_pending.active = false;
+}
+
 } // namespace
 
 bool jce_build_manager_start_project_build(const JceBuildProjectConfig *cfg)
 {
     if (!cfg) { set_error("start_project_build: cfg is null"); return false; }
-    if (g_build.process) {
+    if (g_build.process || asset_prep_active()) {
         set_error("start_project_build: a build is already running");
         return false;
     }
@@ -1975,147 +2278,67 @@ bool jce_build_manager_start_project_build(const JceBuildProjectConfig *cfg)
     const std::string bundles = (cfg->bundles && cfg->bundles[0])
                                     ? std::string(cfg->bundles) : "";
 
-    std::string prebuilt_assets_obj;
-    std::string prebuilt_assets_asm;
-    std::string prebuilt_assets_c;
-    std::string prebuilt_assets_bom;
-    std::string prebuilt_bundle_dir;
-    if (!prepare_project_generated_assets(project, sdk, cooked, bundles,
-                                          variant, intermediates_dir,
-                                          reports_dir, arch,
-                                          prebuilt_assets_obj,
-                                          prebuilt_assets_asm,
-                                          prebuilt_assets_c,
-                                          prebuilt_assets_bom,
-                                          prebuilt_bundle_dir)) {
-        return false;
-    }
-
-    /* Shared configure flags (identical across platforms). */
-    auto append_configure = [&](std::string &a) {
-        if (use_cmake_fresh)
-            a += " --fresh";
-        a += " -S " + qtok(project);
-        a += " -B " + qtok(build_dir);
-        a += " -G Ninja";
-        a += " -DCMAKE_BUILD_TYPE=" + build_type;
-        a += " -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=" + qtok(output_dir);
-        a += " -DCMAKE_LIBRARY_OUTPUT_DIRECTORY=" + qtok(output_dir);
-        a += " -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY=" + qtok(archive_dir);
-        a += " -DJCE_PROJECT_COOKED_ASSETS=" + qtok(cooked);
-        a += " -DJCE_PROJECT_BUNDLES=" + qtok(bundles);
-        a += " -U JCE_PROJECT_PREBUILT_ASSETS_OBJ";
-        a += " -U JCE_PROJECT_PREBUILT_ASSETS_ASM";
-        a += " -U JCE_PROJECT_PREBUILT_ASSETS_C";
-        if (!prebuilt_assets_obj.empty())
-            a += " -DJCE_PROJECT_PREBUILT_ASSETS_OBJ=" + qtok(prebuilt_assets_obj);
-        if (!prebuilt_assets_asm.empty())
-            a += " -DJCE_PROJECT_PREBUILT_ASSETS_ASM=" + qtok(prebuilt_assets_asm);
-        if (!prebuilt_assets_c.empty())
-            a += " -DJCE_PROJECT_PREBUILT_ASSETS_C=" + qtok(prebuilt_assets_c);
-        a += " -DJCE_PROJECT_PREBUILT_BUNDLE_DIR=" + qtok(prebuilt_bundle_dir);
-        a += " -DJCE_DIR=" + qtok(cmake_dir);
-    };
-
+    /* The cook/pack/embed step (jce_archive_cook + file writes + embed
+     * object generation) is the slow, UI-freezing part of a build, so it
+     * runs on a worker thread.  Capture everything the cook needs AND
+     * everything the post-cook cmake pipeline construction needs, then
+     * launch the worker; poll_asset_prep() picks up the result on the
+     * main thread and spawns cmake/ninja. */
+    PendingProjectBuild &p = g_pending;
+    p = PendingProjectBuild{};   /* clears any stale fields/pointers */
+    p.project           = project;
+    p.sdk               = sdk;
+    p.cooked            = cooked;
+    p.bundles           = bundles;
+    p.variant           = variant;
+    p.arch              = arch;
+    p.intermediates_dir = intermediates_dir;
+    p.reports_dir       = reports_dir;
+    p.build_dir         = build_dir;
+    p.output_dir        = output_dir;
+    p.archive_dir       = archive_dir;
+    p.build_type        = build_type;
+    p.cmake_dir         = cmake_dir;
+    p.target            = target;
+    p.label             = label;
+    p.exe_name          = exe_name;
+    p.platform_tag      = platform_tag;
+    p.use_cmake_fresh   = use_cmake_fresh;
 #if JCE_PLATFORM_WINDOWS
-    /* The Windows SDK ships MSVC-built static libs, so force cl and
-     * activate the MSVC environment inline via Microsoft's own
-     * vcvarsall.bat (NOT a first-party script).  Both configure and
-     * build run in one cmd.exe /c chain so the env survives between
-     * them. */
-    std::string args = "/c ";
-    if (!vcvars.empty()) {
-        args += "call " + qtok(vcvars) + " " + vc_arch + " && ";
-    } else {
-        log_line(JCE_CONSOLE_WARNING,
-                 "[build] MSVC vcvarsall.bat not found; assuming cl.exe is "
-                 "already on PATH");
-    }
-    args += "cmake";
-    append_configure(args);
-    if (!c_compiler.empty())
-        args += " -DCMAKE_C_COMPILER=" + qtok(c_compiler);
-    else
-        args += " -DCMAKE_C_COMPILER=cl";
-    args += " && cmake --build " + qtok(build_dir) +
-            " --target " + qtok(target);
-
-    QueuedStep step;
-    step.stage = JCE_BUILD_STAGE_COMPILE;
-    step.exe   = "cmd.exe";
-    step.args  = args;
-    step.wd    = project;
-    step.label = label;
-    g_queue.push_back(step);
-#else
-    /* POSIX: two direct cmake invocations (configure, then build).
-     * cmake picks the default system compiler. */
-    {
-        QueuedStep configure;
-        configure.stage = JCE_BUILD_STAGE_CONFIGURE;
-        configure.exe   = "cmake";
-        std::string a;
-        append_configure(a);
-        /* Leading space from append_configure is harmless to split. */
-        configure.args  = a;
-        configure.wd    = project;
-        configure.label = label;
-        g_queue.push_back(configure);
-
-        QueuedStep compile;
-        compile.stage = JCE_BUILD_STAGE_COMPILE;
-        compile.exe   = "cmake";
-        compile.args  = "--build " + qtok(build_dir) +
-                        " --target " + qtok(target);
-        compile.wd    = project;
-        compile.label = label;
-        g_queue.push_back(compile);
-    }
+    p.vcvars     = vcvars;
+    p.vc_arch    = vc_arch;
+    p.c_compiler = c_compiler;
 #endif
+    p.want_package = (cfg->package_out_dir && cfg->package_out_dir[0]);
+    if (p.want_package)
+        p.package_out_dir = join_norm_sep(cfg->package_out_dir);
+    p.app_name    = (cfg->app_name && cfg->app_name[0]) ? cfg->app_name : "";
+    p.app_version = (cfg->app_version && cfg->app_version[0])
+                        ? cfg->app_version : "";
 
-    /* Finish plan: always verify the artifact; stage a package when an
-     * output directory was requested. */
-    g_finish.verify     = true;
-    g_finish.exe_name   = exe_name;
-    g_finish.artifact_a = output_dir + PATH_SEP_CHR_LOCAL + exe_name;
-    g_finish.artifact_b = build_dir + PATH_SEP_CHR_LOCAL + exe_name;
-    g_finish.asset_bom_src = prebuilt_assets_bom;
+    p.done   = jce_atomic_i32_create(0);
+    p.cancel = jce_atomic_i32_create(0);
+    p.active = true;
 
-    if (cfg->package_out_dir && cfg->package_out_dir[0]) {
-        g_finish.stage      = true;
-        g_finish.out_dir    = join_norm_sep(cfg->package_out_dir);
-        g_finish.cooked_rel = cooked;
-        if (!cooked.empty())
-            g_finish.cooked_src = project + PATH_SEP_CHR_LOCAL +
-                                  join_norm_sep(cooked);
-
-        std::string vt;
-        vt += "name:     ";
-        vt += (cfg->app_name && cfg->app_name[0]) ? cfg->app_name
-                                                  : target.c_str();
-        vt += "\n";
-        if (cfg->app_version && cfg->app_version[0]) {
-            vt += "version:  "; vt += cfg->app_version; vt += "\n";
-        }
-        vt += "platform: "; vt += platform_tag; vt += "\n";
-        vt += "arch:     "; vt += arch;         vt += "\n";
-        vt += "variant:  "; vt += variant;      vt += "\n";
-        g_finish.version_text = vt;
-    }
+    /* Flip status to RUNNING up-front so the UI shows progress and any
+     * re-entrant start_project_build / run_script call is refused while
+     * the cook is in flight. */
+    g_build.state     = JCE_BUILD_RUNNING;
+    g_build.stage     = JCE_BUILD_STAGE_PREPARE_ASSETS;
+    g_build.exit_code = 0;
+    g_build.preset    = label;
+    g_build.last_error.clear();
 
     log_line(JCE_CONSOLE_INFO,
-             "[build] native project build: " + target +
-             " (" + std::string(platform_tag) + "/" + arch + "/" + variant +
-             ")  sdk=" + sdk);
+             "[build] cooking + packing project assets in background…");
 
-    /* Spawn the first queued step; poll_state() advances the rest. */
-    QueuedStep first = g_queue.front();
-    g_queue_pos = 1;
-    if (!spawn_tool(first.stage, first.exe.c_str(), first.label.c_str(),
-                    first.args.empty() ? nullptr : first.args.c_str(),
-                    first.wd.empty() ? nullptr : first.wd.c_str())) {
-        reset_pipeline();
-        return false;
+    p.thread = jce_thread_create(asset_prep_worker, &p, "jce_build_cook");
+    if (!p.thread) {
+        /* No worker thread available: run the cook inline then drive the
+         * same completion path synchronously. */
+        asset_prep_worker(&p);
+        poll_asset_prep();
+        return g_build.state != JCE_BUILD_FAILED;
     }
     return true;
 }

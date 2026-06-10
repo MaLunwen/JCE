@@ -32,6 +32,47 @@
 #define LOG_TAG "jce_gltf"
 
 /* ================================================================== */
+/* CPU staging types (worker decode → main-thread upload)              */
+/* ================================================================== */
+
+/* One primitive's geometry as CPU arrays (no GPU buffers yet). */
+typedef struct {
+    int       kind;            /* 0 = static PBR (JcePbrVertex), 1 = skinned */
+    void     *verts;           /* owned: JcePbrVertex[] or JceSkinnedVertex[] */
+    uint32_t  num_verts;
+    uint32_t *indices;         /* owned, may be NULL */
+    uint32_t  num_indices;
+    uint32_t  material_index;
+} JceModelPrimCpu;
+
+typedef struct {
+    char             name[64];
+    jce_mat4         local_transform;
+    JceModelPrimCpu *prims;
+    uint32_t         num_prims;
+    int16_t          parent;
+    int32_t          joint_parent_index;
+    jce_mat4         joint_local_matrix;
+} JceModelNodeCpu;
+
+/* Material factors + decoded (not-yet-uploaded) texture maps. */
+typedef struct {
+    JcePbrMaterial base;       /* factors/alpha/flags; map handles INVALID */
+    JceTextureCpu *albedo;
+    JceTextureCpu *mr;
+    JceTextureCpu *normal;
+    JceTextureCpu *ao;
+    JceTextureCpu *emissive;
+} JceModelMatCpu;
+
+struct JceModelCpu {
+    JceModelNodeCpu *nodes;      uint32_t num_nodes;
+    JceModelMatCpu  *materials;  uint32_t num_materials;
+    JceSkeleton     *skeleton;   /* CPU-only, built on the worker */
+    JceAnimClip    **anim_clips; uint32_t num_anims;
+};
+
+/* ================================================================== */
 /* Helpers                                                             */
 /* ================================================================== */
 
@@ -118,13 +159,16 @@ static void resolve_path(const char *model_path, const char *uri,
     }
 }
 
-/* Load a texture from a glTF image (either URI or embedded buffer_view). */
-static JceTexture load_gltf_texture(const JcePakArchive *pak,
-                                     const char *model_path,
-                                     const cgltf_image *image,
-                                     cgltf_data *data)
+/* Decode a glTF image (URI or embedded buffer_view) to a CPU texture
+ * result — NO bgfx, so it is safe to run on a worker thread.  The caller
+ * uploads it later with jce_texture_upload_cpu (or frees it on cancel).
+ * Returns NULL when the image cannot be decoded. */
+static JceTextureCpu *load_gltf_texture_cpu(const JcePakArchive *pak,
+                                            const char *model_path,
+                                            const cgltf_image *image,
+                                            cgltf_data *data)
 {
-    if (!image) return JCE_TEXTURE_INVALID;
+    if (!image) return NULL;
 
     /* Case 1: embedded texture via buffer_view (common in GLB). */
     if (image->buffer_view) {
@@ -132,33 +176,11 @@ static JceTexture load_gltf_texture(const JcePakArchive *pak,
         if (bv->buffer && bv->buffer->data) {
             const uint8_t *img_data = (const uint8_t *)bv->buffer->data
                                       + bv->offset;
-            cgltf_size img_size = bv->size;
-
-            /* Decode with SDL3_image via IOStream. */
-            SDL_IOStream *io = SDL_IOFromConstMem(img_data, (size_t)img_size);
-            if (!io) return JCE_TEXTURE_INVALID;
-
-            SDL_Surface *surf = IMG_Load_IO(io, true);
-            if (!surf) {
+            JceTextureCpu *c = jce_texture_decode_cpu_mem(
+                img_data, (size_t)bv->size, JCE_TEX_WRAP);
+            if (!c)
                 LOG_ERROR(LOG_TAG, "failed to decode embedded texture");
-                return JCE_TEXTURE_INVALID;
-            }
-
-            /* Ensure RGBA32 so jce_texture_load_from_surface gets tightly
-               packed 4-byte pixels regardless of the source PNG colour mode. */
-            if (surf->format != SDL_PIXELFORMAT_RGBA32) {
-                SDL_Surface *conv = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA32);
-                SDL_DestroySurface(surf);
-                if (!conv) {
-                    LOG_ERROR(LOG_TAG, "surface convert failed: %s", SDL_GetError());
-                    return JCE_TEXTURE_INVALID;
-                }
-                surf = conv;
-            }
-
-            JceTexture tex = jce_texture_load_from_surface(surf, JCE_TEX_WRAP);
-            SDL_DestroySurface(surf);
-            return tex;
+            return c;
         }
     }
 
@@ -167,8 +189,8 @@ static JceTexture load_gltf_texture(const JcePakArchive *pak,
     if (image->uri) {
         char resolved[512];
         resolve_path(model_path, image->uri, resolved, sizeof(resolved));
-        JceTexture t = jce_texture_load_ex(pak, resolved, JCE_TEX_WRAP);
-        if (jce_texture_valid(t)) return t;
+        JceTextureCpu *c = jce_texture_decode_cpu(pak, resolved, JCE_TEX_WRAP);
+        if (c) return c;
 
         /* Disk fallback: build absolute path from model_path's directory. */
         char disk_path[1024];
@@ -188,43 +210,28 @@ static JceTexture load_gltf_texture(const JcePakArchive *pak,
             SDL_strlcpy(disk_path, image->uri, sizeof(disk_path));
         }
 
-        uint64_t img_size = 0;
-        void *img_buf = NULL;
         /* Disk fallback only when there is no PAK to serve from (i.e. editor
-         * / dev path).  In a deployed game the PAK overlay chain (engine PAK
-         * + mounted bundles) must contain every texture; reaching out to the
-         * host disk would silently break portability. */
+         * / dev path).  In a deployed game the PAK overlay chain must contain
+         * every texture; reaching out to host disk would break portability. */
         if (!pak) {
-            img_buf = jce_fs_host_read_all(disk_path, &img_size);
+            uint64_t img_size = 0;
+            void *img_buf = jce_fs_host_read_all(disk_path, &img_size);
+            if (img_buf && img_size > 0) {
+                JceTextureCpu *cc = jce_texture_decode_cpu_mem(
+                    img_buf, (size_t)img_size, JCE_TEX_WRAP);
+                JCE_FREE(img_buf);
+                return cc;
+            }
+            if (img_buf) JCE_FREE(img_buf);
         } else {
             LOG_WARN("gltf", "texture missing from pak (no host fallback in runtime): %s",
                      resolved);
         }
-        if (img_buf && img_size > 0) {
-            SDL_IOStream *io = SDL_IOFromConstMem(img_buf, img_size);
-            if (io) {
-                SDL_Surface *surf = IMG_Load_IO(io, true);
-                if (surf) {
-                    if (surf->format != SDL_PIXELFORMAT_RGBA32) {
-                        SDL_Surface *conv = SDL_ConvertSurface(surf, SDL_PIXELFORMAT_RGBA32);
-                        SDL_DestroySurface(surf);
-                        surf = conv;
-                    }
-                    if (surf) {
-                        JceTexture tex = jce_texture_load_from_surface(surf, JCE_TEX_WRAP);
-                        SDL_DestroySurface(surf);
-                        JCE_FREE(img_buf);
-                        return tex;
-                    }
-                }
-            }
-        }
-        if (img_buf) JCE_FREE(img_buf);
-        return JCE_TEXTURE_INVALID;
+        return NULL;
     }
 
     (void)data;
-    return JCE_TEXTURE_INVALID;
+    return NULL;
 }
 
 /* Find joint index in a skin's joints array for a given node. */
@@ -252,31 +259,35 @@ static uint32_t find_material_index(const cgltf_data *data,
 /* Extract PBR materials                                               */
 /* ================================================================== */
 
-static JcePbrMaterial *extract_materials(const JcePakArchive *pak,
-                                          const char *model_path,
-                                          cgltf_data *data,
-                                          uint32_t *out_count)
+/* Extract materials to CPU staging: factors + flags into `base` (with
+ * INVALID map handles), and each texture decoded to a JceTextureCpu for
+ * later GPU upload.  No bgfx — safe on a worker thread. */
+static JceModelMatCpu *extract_materials_cpu(const JcePakArchive *pak,
+                                             const char *model_path,
+                                             cgltf_data *data,
+                                             uint32_t *out_count)
 {
     *out_count = 0;
     if (data->materials_count == 0) {
         /* Create a single default material. */
-        JcePbrMaterial *mats = (JcePbrMaterial *)JCE_CALLOC(1, sizeof(JcePbrMaterial));
+        JceModelMatCpu *mats = (JceModelMatCpu *)JCE_CALLOC(1, sizeof(JceModelMatCpu));
         if (!mats) return NULL;
-        mats[0] = jce_pbr_material_default();
+        mats[0].base = jce_pbr_material_default();
         *out_count = 1;
         return mats;
     }
 
     uint32_t count = (uint32_t)data->materials_count;
-    JcePbrMaterial *mats = (JcePbrMaterial *)JCE_CALLOC(count, sizeof(JcePbrMaterial));
+    JceModelMatCpu *mats = (JceModelMatCpu *)JCE_CALLOC(count, sizeof(JceModelMatCpu));
     if (!mats) return NULL;
 
     uint32_t i;
     for (i = 0; i < count; ++i) {
         const cgltf_material *src = &data->materials[i];
-        JcePbrMaterial *dst = &mats[i];
+        JceModelMatCpu *m = &mats[i];
+        JcePbrMaterial *dst = &m->base;
 
-        /* Start with defaults. */
+        /* Start with defaults (map handles stay INVALID). */
         *dst = jce_pbr_material_default();
 
         /* PBR metallic-roughness factors. */
@@ -290,17 +301,14 @@ static JcePbrMaterial *extract_materials(const JcePakArchive *pak,
             dst->metallic_factor  = pbr->metallic_factor;
             dst->roughness_factor = pbr->roughness_factor;
 
-            /* Albedo texture. */
             if (pbr->base_color_texture.texture &&
                 pbr->base_color_texture.texture->image) {
-                dst->albedo_map = load_gltf_texture(
+                m->albedo = load_gltf_texture_cpu(
                     pak, model_path, pbr->base_color_texture.texture->image, data);
             }
-
-            /* Metallic-roughness texture. */
             if (pbr->metallic_roughness_texture.texture &&
                 pbr->metallic_roughness_texture.texture->image) {
-                dst->metallic_roughness_map = load_gltf_texture(
+                m->mr = load_gltf_texture_cpu(
                     pak, model_path,
                     pbr->metallic_roughness_texture.texture->image, data);
             }
@@ -309,7 +317,7 @@ static JcePbrMaterial *extract_materials(const JcePakArchive *pak,
         /* Normal map. */
         if (src->normal_texture.texture &&
             src->normal_texture.texture->image) {
-            dst->normal_map = load_gltf_texture(
+            m->normal = load_gltf_texture_cpu(
                 pak, model_path, src->normal_texture.texture->image, data);
             dst->normal_scale = src->normal_texture.scale;
             if (dst->normal_scale == 0.0f) dst->normal_scale = 1.0f;
@@ -318,7 +326,7 @@ static JcePbrMaterial *extract_materials(const JcePakArchive *pak,
         /* AO map. */
         if (src->occlusion_texture.texture &&
             src->occlusion_texture.texture->image) {
-            dst->ao_map = load_gltf_texture(
+            m->ao = load_gltf_texture_cpu(
                 pak, model_path, src->occlusion_texture.texture->image, data);
             dst->ao_strength = src->occlusion_texture.scale;
             if (dst->ao_strength == 0.0f) dst->ao_strength = 1.0f;
@@ -327,7 +335,7 @@ static JcePbrMaterial *extract_materials(const JcePakArchive *pak,
         /* Emissive. */
         if (src->emissive_texture.texture &&
             src->emissive_texture.texture->image) {
-            dst->emissive_map = load_gltf_texture(
+            m->emissive = load_gltf_texture_cpu(
                 pak, model_path, src->emissive_texture.texture->image, data);
         }
         dst->emissive_factor[0] = src->emissive_factor[0];
@@ -366,10 +374,12 @@ static const cgltf_accessor *find_attribute(const cgltf_primitive *prim,
     return NULL;
 }
 
-/* Build a mesh (static or skinned) from one glTF primitive. */
-static void build_primitive(const cgltf_primitive *prim,
-                             JceModelPrimitive *out,
-                             const cgltf_data *data)
+/* Extract one glTF primitive's geometry into CPU staging arrays (no GPU
+ * buffers; jce_gltf_upload_cpu creates them later).  Ownership of verts +
+ * indices transfers to `out`. */
+static void build_primitive_cpu(const cgltf_primitive *prim,
+                                JceModelPrimCpu *out,
+                                const cgltf_data *data)
 {
     const cgltf_accessor *a_pos    = find_attribute(prim, cgltf_attribute_type_position, 0);
     const cgltf_accessor *a_norm   = find_attribute(prim, cgltf_attribute_type_normal, 0);
@@ -438,63 +448,43 @@ static void build_primitive(const cgltf_primitive *prim,
             verts[vi].weights[3] = tmp[3];
         }
 
-        out->skinned_mesh = jce_skinned_mesh_create(verts, num_verts,
-                                                     indices, num_indices);
-        out->static_mesh = NULL;
-        JCE_FREE(verts);
+        out->kind        = 1;   /* skinned */
+        out->verts       = verts;
+        out->num_verts   = num_verts;
+        out->indices     = indices;
+        out->num_indices = num_indices;
+        return;   /* ownership of verts+indices transferred to `out` */
     }
+
     /* ---- Static PBR mesh (with tangent) ---- */
-    else if (a_tan) {
-        JcePbrVertex *verts = (JcePbrVertex *)JCE_CALLOC(
-            num_verts, sizeof(JcePbrVertex));
-        if (!verts) { JCE_FREE(indices); return; }
+    JcePbrVertex *verts = (JcePbrVertex *)JCE_CALLOC(num_verts, sizeof(JcePbrVertex));
+    if (!verts) { JCE_FREE(indices); return; }
 
-        uint32_t vi;
-        for (vi = 0; vi < num_verts; ++vi) {
-            cgltf_accessor_read_float(a_pos, vi, verts[vi].pos, 3);
+    uint32_t vi;
+    for (vi = 0; vi < num_verts; ++vi) {
+        cgltf_accessor_read_float(a_pos, vi, verts[vi].pos, 3);
 
-            if (a_norm) cgltf_accessor_read_float(a_norm, vi, verts[vi].normal, 3);
-            else { verts[vi].normal[0] = 0; verts[vi].normal[1] = 1; verts[vi].normal[2] = 0; }
+        if (a_norm) cgltf_accessor_read_float(a_norm, vi, verts[vi].normal, 3);
+        else { verts[vi].normal[0] = 0; verts[vi].normal[1] = 1; verts[vi].normal[2] = 0; }
 
-            if (a_uv) cgltf_accessor_read_float(a_uv, vi, verts[vi].uv, 2);
+        if (a_uv) cgltf_accessor_read_float(a_uv, vi, verts[vi].uv, 2);
 
+        if (a_tan) {
             cgltf_accessor_read_float(a_tan, vi, verts[vi].tangent, 4);
-        }
-
-        out->skinned_mesh = jce_pbr_mesh_create(verts, num_verts,
-                                                 indices, num_indices);
-        out->static_mesh = NULL;
-        JCE_FREE(verts);
-    }
-    /* ---- Static mesh (no tangent) — promote to PBR with default tangent ---- */
-    else {
-        JcePbrVertex *verts = (JcePbrVertex *)JCE_CALLOC(
-            num_verts, sizeof(JcePbrVertex));
-        if (!verts) { JCE_FREE(indices); return; }
-
-        uint32_t vi;
-        for (vi = 0; vi < num_verts; ++vi) {
-            cgltf_accessor_read_float(a_pos, vi, verts[vi].pos, 3);
-
-            if (a_norm) cgltf_accessor_read_float(a_norm, vi, verts[vi].normal, 3);
-            else { verts[vi].normal[0] = 0; verts[vi].normal[1] = 1; verts[vi].normal[2] = 0; }
-
-            if (a_uv) cgltf_accessor_read_float(a_uv, vi, verts[vi].uv, 2);
-
-            /* Default tangent: +X, handedness +1. */
+        } else {
+            /* No tangent in source → default +X, handedness +1. */
             verts[vi].tangent[0] = 1.0f;
             verts[vi].tangent[1] = 0.0f;
             verts[vi].tangent[2] = 0.0f;
             verts[vi].tangent[3] = 1.0f;
         }
-
-        out->skinned_mesh = jce_pbr_mesh_create(verts, num_verts,
-                                                  indices, num_indices);
-        out->static_mesh = NULL;
-        JCE_FREE(verts);
     }
 
-    JCE_FREE(indices);
+    out->kind        = 0;   /* static PBR */
+    out->verts       = verts;
+    out->num_verts   = num_verts;
+    out->indices     = indices;
+    out->num_indices = num_indices;
 }
 
 /* ================================================================== */
@@ -735,8 +725,8 @@ static JceAnimClip **extract_animations(cgltf_data *data, uint32_t *out_count)
 /* Extract nodes                                                       */
 /* ================================================================== */
 
-static JceModelNode *extract_nodes(cgltf_data *data,
-                                    uint32_t *out_count)
+static JceModelNodeCpu *extract_nodes_cpu(cgltf_data *data,
+                                          uint32_t *out_count)
 {
     /* Count nodes that have meshes. */
     uint32_t count = 0;
@@ -751,7 +741,7 @@ static JceModelNode *extract_nodes(cgltf_data *data,
         return NULL;
     }
 
-    JceModelNode *nodes = (JceModelNode *)JCE_CALLOC(count, sizeof(JceModelNode));
+    JceModelNodeCpu *nodes = (JceModelNodeCpu *)JCE_CALLOC(count, sizeof(JceModelNodeCpu));
     if (!nodes) { *out_count = 0; return NULL; }
 
     uint32_t idx = 0;
@@ -759,7 +749,7 @@ static JceModelNode *extract_nodes(cgltf_data *data,
         const cgltf_node *gnode = &data->nodes[ni];
         if (!gnode->mesh) continue;
 
-        JceModelNode *node = &nodes[idx];
+        JceModelNodeCpu *node = &nodes[idx];
 
         /* Name. */
         if (gnode->name) {
@@ -798,16 +788,16 @@ static JceModelNode *extract_nodes(cgltf_data *data,
         /* Parent index: -1 for now (flat list). */
         node->parent = -1;
 
-        /* Primitives. */
+        /* Primitives → CPU staging. */
         uint32_t num_prims = (uint32_t)gnode->mesh->primitives_count;
-        node->num_primitives = num_prims;
-        node->primitives = (JceModelPrimitive *)JCE_CALLOC(
-            num_prims, sizeof(JceModelPrimitive));
-        if (node->primitives) {
+        node->num_prims = num_prims;
+        node->prims = (JceModelPrimCpu *)JCE_CALLOC(
+            num_prims, sizeof(JceModelPrimCpu));
+        if (node->prims) {
             uint32_t pi;
             for (pi = 0; pi < num_prims; ++pi) {
-                build_primitive(&gnode->mesh->primitives[pi],
-                                &node->primitives[pi], data);
+                build_primitive_cpu(&gnode->mesh->primitives[pi],
+                                    &node->prims[pi], data);
             }
         }
 
@@ -819,10 +809,29 @@ static JceModelNode *extract_nodes(cgltf_data *data,
 }
 
 /* ================================================================== */
-/* Main entry point                                                    */
+/* CPU build (shared by PAK + memory decode)                           */
 /* ================================================================== */
 
-JceModel *jce_gltf_load(const JcePakArchive *pak, const char *asset_path)
+/* Build the CPU-only intermediate from a parsed+buffer-loaded cgltf_data.
+ * Touches no bgfx → safe on a worker thread. */
+static JceModelCpu *build_model_cpu(const JcePakArchive *pak,
+                                    const char *path, cgltf_data *data)
+{
+    JceModelCpu *cpu = (JceModelCpu *)JCE_CALLOC(1, sizeof(JceModelCpu));
+    if (!cpu) return NULL;
+
+    cpu->materials  = extract_materials_cpu(pak, path, data, &cpu->num_materials);
+    cpu->nodes      = extract_nodes_cpu(data, &cpu->num_nodes);
+    cpu->skeleton   = extract_skeleton(data);    /* CPU-only */
+    cpu->anim_clips = extract_animations(data, &cpu->num_anims); /* CPU-only */
+    return cpu;
+}
+
+/* ================================================================== */
+/* Worker: decode (no bgfx)                                            */
+/* ================================================================== */
+
+JceModelCpu *jce_gltf_decode_cpu(const JcePakArchive *pak, const char *asset_path)
 {
     if (!pak || !asset_path) return NULL;
 
@@ -870,55 +879,31 @@ JceModel *jce_gltf_load(const JcePakArchive *pak, const char *asset_path)
         return NULL;
     }
 
-    /* Safety: for GLB parsed from memory cgltf_load_buffers should have linked
-       buffers[0].data to data->bin.  Ensure it is set even if the size check
-       inside cgltf produced a silent mismatch so embedded textures can decode. */
+    /* Safety: ensure buffers[0].data links to data->bin even if cgltf's size
+       check produced a silent mismatch, so embedded textures can decode. */
     if (data->buffers_count > 0 && !data->buffers[0].data && data->bin) {
         data->buffers[0].data = (void *)data->bin;
         data->buffers[0].size = data->bin_size;
     }
 
-    /* ---- Build model ---- */
-    JceModel *model = (JceModel *)JCE_CALLOC(1, sizeof(JceModel));
-    if (!model) {
-        cgltf_free(data);
-        JCE_FREE(buf);
-        return NULL;
+    JceModelCpu *cpu = build_model_cpu(pak, asset_path, data);
+    if (cpu) {
+        LOG_DEBUG(LOG_TAG, "decoded %s: %u nodes, %u materials, %u anims%s",
+                  asset_path, cpu->num_nodes, cpu->num_materials,
+                  cpu->num_anims, cpu->skeleton ? " (skinned)" : "");
     }
-
-    /* Materials. */
-    model->materials = extract_materials(pak, asset_path, data,
-                                          &model->num_materials);
-
-    /* Nodes (meshes). */
-    model->nodes = extract_nodes(data, &model->num_nodes);
-
-    /* Skeleton. */
-    model->skeleton = extract_skeleton(data);
-
-    /* Animations. */
-    model->anim_clips = extract_animations(data, &model->num_anims);
-
-    LOG_DEBUG(LOG_TAG, "loaded %s: %u nodes, %u materials, %u anims%s",
-              asset_path, model->num_nodes, model->num_materials,
-              model->num_anims, model->skeleton ? " (skinned)" : "");
 
     cgltf_free(data);
     JCE_FREE(buf);
-    return model;
+    return cpu;
 }
 
-/* ================================================================== */
-/* Load from raw memory (no PAK required)                              */
-/* ================================================================== */
-
-JceModel *jce_gltf_load_memory(const void *file_data, uint32_t size,
-                               const char *name)
+JceModelCpu *jce_gltf_decode_cpu_memory(const void *file_data, uint32_t size,
+                                        const char *name)
 {
     if (!file_data || size == 0) return NULL;
     const char *tag = name ? name : "<memory>";
 
-    /* ---- Parse with cgltf ---- */
     cgltf_options options;
     memset(&options, 0, sizeof(options));
     cgltf_data *data = NULL;
@@ -929,7 +914,10 @@ JceModel *jce_gltf_load_memory(const void *file_data, uint32_t size,
         return NULL;
     }
 
-    result = cgltf_load_buffers(&options, data, NULL);
+    /* `name` is the resolved filesystem path when the caller has one (lets
+     * cgltf's default reader open a sibling external .bin); for embedded/.glb
+     * data it is just a tag and no external read happens. */
+    result = cgltf_load_buffers(&options, data, name);
     if (result != cgltf_result_success) {
         LOG_ERROR(LOG_TAG, "cgltf_load_buffers failed (%d): %s",
                   (int)result, tag);
@@ -942,24 +930,149 @@ JceModel *jce_gltf_load_memory(const void *file_data, uint32_t size,
         data->buffers[0].size = data->bin_size;
     }
 
-    /* ---- Build model ---- */
-    JceModel *model = (JceModel *)JCE_CALLOC(1, sizeof(JceModel));
-    if (!model) {
-        cgltf_free(data);
-        return NULL;
+    /* No PAK so textures resolve via embedded data / host disk fallback. */
+    JceModelCpu *cpu = build_model_cpu(NULL, tag, data);
+    if (cpu) {
+        LOG_DEBUG(LOG_TAG, "decoded %s (memory): %u nodes, %u materials, %u anims%s",
+                  tag, cpu->num_nodes, cpu->num_materials,
+                  cpu->num_anims, cpu->skeleton ? " (skinned)" : "");
     }
 
-    /* Materials – no PAK so pass NULL; embedded textures still decoded. */
-    model->materials = extract_materials(NULL, tag, data,
-                                          &model->num_materials);
-    model->nodes     = extract_nodes(data, &model->num_nodes);
-    model->skeleton  = extract_skeleton(data);
-    model->anim_clips = extract_animations(data, &model->num_anims);
-
-    LOG_DEBUG(LOG_TAG, "loaded %s (memory): %u nodes, %u materials, %u anims%s",
-              tag, model->num_nodes, model->num_materials,
-              model->num_anims, model->skeleton ? " (skinned)" : "");
-
     cgltf_free(data);
+    return cpu;
+}
+
+/* ================================================================== */
+/* Render thread: upload (bgfx) + free the CPU intermediate           */
+/* ================================================================== */
+
+JceModel *jce_gltf_upload_cpu(JceModelCpu *cpu)
+{
+    if (!cpu) return NULL;
+
+    JceModel *model = (JceModel *)JCE_CALLOC(1, sizeof(JceModel));
+    if (!model) { jce_gltf_model_cpu_free(cpu); return NULL; }
+
+    /* Materials: copy factors, upload each decoded map (consumes texcpu). */
+    if (cpu->num_materials > 0 && cpu->materials) {
+        model->materials = (JcePbrMaterial *)JCE_CALLOC(
+            cpu->num_materials, sizeof(JcePbrMaterial));
+        if (model->materials) {
+            model->num_materials = cpu->num_materials;
+            for (uint32_t i = 0; i < cpu->num_materials; ++i) {
+                JceModelMatCpu *mc = &cpu->materials[i];
+                JcePbrMaterial *dst = &model->materials[i];
+                *dst = mc->base;
+                if (mc->albedo)   { dst->albedo_map = jce_texture_upload_cpu(mc->albedo);   mc->albedo = NULL; }
+                if (mc->mr)       { dst->metallic_roughness_map = jce_texture_upload_cpu(mc->mr); mc->mr = NULL; }
+                if (mc->normal)   { dst->normal_map = jce_texture_upload_cpu(mc->normal);   mc->normal = NULL; }
+                if (mc->ao)       { dst->ao_map = jce_texture_upload_cpu(mc->ao);           mc->ao = NULL; }
+                if (mc->emissive) { dst->emissive_map = jce_texture_upload_cpu(mc->emissive); mc->emissive = NULL; }
+            }
+        }
+    }
+
+    /* Nodes: create GPU meshes from the CPU vertex/index arrays. */
+    if (cpu->num_nodes > 0 && cpu->nodes) {
+        model->nodes = (JceModelNode *)JCE_CALLOC(cpu->num_nodes, sizeof(JceModelNode));
+        if (model->nodes) {
+            model->num_nodes = cpu->num_nodes;
+            for (uint32_t n = 0; n < cpu->num_nodes; ++n) {
+                JceModelNodeCpu *src = &cpu->nodes[n];
+                JceModelNode    *dn  = &model->nodes[n];
+                memcpy(dn->name, src->name, sizeof(dn->name));
+                dn->local_transform    = src->local_transform;
+                dn->parent             = src->parent;
+                dn->joint_parent_index = src->joint_parent_index;
+                dn->joint_local_matrix = src->joint_local_matrix;
+                dn->num_primitives     = src->num_prims;
+                if (src->num_prims > 0) {
+                    dn->primitives = (JceModelPrimitive *)JCE_CALLOC(
+                        src->num_prims, sizeof(JceModelPrimitive));
+                    if (dn->primitives) {
+                        for (uint32_t p = 0; p < src->num_prims; ++p) {
+                            JceModelPrimCpu  *sp = &src->prims[p];
+                            JceModelPrimitive *dp = &dn->primitives[p];
+                            dp->material_index = sp->material_index;
+                            dp->static_mesh    = NULL;
+                            if (!sp->verts || sp->num_verts == 0) continue;
+                            if (sp->kind == 1)
+                                dp->skinned_mesh = jce_skinned_mesh_create(
+                                    (const JceSkinnedVertex *)sp->verts, sp->num_verts,
+                                    sp->indices, sp->num_indices);
+                            else
+                                dp->skinned_mesh = jce_pbr_mesh_create(
+                                    (const JcePbrVertex *)sp->verts, sp->num_verts,
+                                    sp->indices, sp->num_indices);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /* Skeleton + animations: transfer ownership (already CPU-built). */
+    model->skeleton   = cpu->skeleton;   cpu->skeleton = NULL;
+    model->anim_clips = cpu->anim_clips; cpu->anim_clips = NULL;
+    model->num_anims  = cpu->num_anims;  cpu->num_anims = 0;
+
+    /* Free the CPU intermediate (textures + skeleton/anims already moved out;
+     * jce_gltf_model_cpu_free is null-safe per remaining field). */
+    jce_gltf_model_cpu_free(cpu);
     return model;
+}
+
+void jce_gltf_model_cpu_free(JceModelCpu *cpu)
+{
+    if (!cpu) return;
+
+    if (cpu->nodes) {
+        for (uint32_t n = 0; n < cpu->num_nodes; ++n) {
+            JceModelNodeCpu *nd = &cpu->nodes[n];
+            if (nd->prims) {
+                for (uint32_t p = 0; p < nd->num_prims; ++p) {
+                    if (nd->prims[p].verts)   JCE_FREE(nd->prims[p].verts);
+                    if (nd->prims[p].indices) JCE_FREE(nd->prims[p].indices);
+                }
+                JCE_FREE(nd->prims);
+            }
+        }
+        JCE_FREE(cpu->nodes);
+    }
+
+    if (cpu->materials) {
+        for (uint32_t i = 0; i < cpu->num_materials; ++i) {
+            JceModelMatCpu *m = &cpu->materials[i];
+            jce_texture_cpu_free(m->albedo);
+            jce_texture_cpu_free(m->mr);
+            jce_texture_cpu_free(m->normal);
+            jce_texture_cpu_free(m->ao);
+            jce_texture_cpu_free(m->emissive);
+        }
+        JCE_FREE(cpu->materials);
+    }
+
+    if (cpu->skeleton) jce_skeleton_destroy(cpu->skeleton);
+    if (cpu->anim_clips) {
+        for (uint32_t i = 0; i < cpu->num_anims; ++i)
+            jce_anim_clip_destroy(cpu->anim_clips[i]);
+        JCE_FREE(cpu->anim_clips);
+    }
+
+    JCE_FREE(cpu);
+}
+
+/* ================================================================== */
+/* Sync wrappers (decode + upload)                                    */
+/* ================================================================== */
+
+JceModel *jce_gltf_load(const JcePakArchive *pak, const char *asset_path)
+{
+    return jce_gltf_upload_cpu(jce_gltf_decode_cpu(pak, asset_path));
+}
+
+JceModel *jce_gltf_load_memory(const void *file_data, uint32_t size,
+                               const char *name)
+{
+    return jce_gltf_upload_cpu(jce_gltf_decode_cpu_memory(file_data, size, name));
 }

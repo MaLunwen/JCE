@@ -765,6 +765,10 @@ static void parse_mesh_renderer(JceScene *s, JceEntity e, const cJSON *c)
     mr.alpha_mode       = (int)j_num(c, "alphaMode",   0);
     mr.alpha_cutoff     = (float)j_num(c, "alphaCutoff", 0.5);
     mr.double_sided     = j_bool(c, "doubleSided", false);
+    /* Unity-style per-renderer shadow flags; default ON (legacy scenes lack
+       the keys). Stored inverted in the component. */
+    mr.shadow_cast_off    = !j_bool(c, "castsShadow",    true);
+    mr.shadow_receive_off = !j_bool(c, "receivesShadow", true);
     copy_str(mr.albedo_tex,   sizeof(mr.albedo_tex),   j_str(c, "albedoTex",   ""));
     copy_str(mr.mr_tex,       sizeof(mr.mr_tex),       j_str(c, "mrTex",       ""));
     copy_str(mr.normal_tex,   sizeof(mr.normal_tex),   j_str(c, "normalTex",   ""));
@@ -906,6 +910,7 @@ static void parse_dir_light(JceScene *s, JceEntity e, const cJSON *c)
 {
     JceDirectionalLight dl;
     memset(&dl, 0, sizeof(dl));
+    dl.cookie_texture = JCE_TEXTURE_INVALID;
     dl.direction.x = (float)j_num(c, "dirX", 0.0);
     dl.direction.y = (float)j_num(c, "dirY", -1.0);
     dl.direction.z = (float)j_num(c, "dirZ", 0.0);
@@ -939,6 +944,8 @@ static void parse_spot_light(JceScene *s, JceEntity e, const cJSON *c)
 {
     JceSpotLight sl;
     memset(&sl, 0, sizeof(sl));
+    sl.cookie_texture = JCE_TEXTURE_INVALID;
+    sl.ies_lut_texture = JCE_TEXTURE_INVALID;
     sl.position.x = (float)j_num(c, "posX", 0.0);
     sl.position.y = (float)j_num(c, "posY", 0.0);
     sl.position.z = (float)j_num(c, "posZ", 0.0);
@@ -1055,6 +1062,16 @@ static void parse_editor_meta(JceScene *s, JceEntity e, const cJSON *c)
     m.layer = (int)j_num(c, "layer", 0);
     if (m.layer < 0 || m.layer > 31) m.layer = 0;
     jce_scene_set_editor_meta(s, e, &m);
+
+    /* P4-A.4 — mirror the EditorMeta tag into the engine ECS tag component
+     * so jce_scene_find_with_tag() can see it.  An explicit entity-level
+     * "tag" key was already mirrored before the components parse — keep it
+     * (entity-level wins over the EditorMeta block). */
+    if (m.tag[0] != '\0') {
+        const char *cur = jce_scene_get_entity_tag_name(s, e);
+        if (!cur || !*cur || strcmp(cur, "Untagged") == 0)
+            jce_scene_set_entity_tag_name(s, e, m.tag);
+    }
 }
 
 /* Unified "Light" component: dispatches to dir/point/spot based on lightType. */
@@ -1090,6 +1107,8 @@ static void parse_unified_light(JceScene *s, JceEntity e, const cJSON *c)
     } else if (ltype == 2) {
         JceSpotLight sl;
         memset(&sl, 0, sizeof(sl));
+        sl.cookie_texture = JCE_TEXTURE_INVALID;
+        sl.ies_lut_texture = JCE_TEXTURE_INVALID;
         sl.direction.x = dirX;
         sl.direction.y = dirY;
         sl.direction.z = dirZ;
@@ -1110,6 +1129,7 @@ static void parse_unified_light(JceScene *s, JceEntity e, const cJSON *c)
     } else {
         JceDirectionalLight dl;
         memset(&dl, 0, sizeof(dl));
+        dl.cookie_texture = JCE_TEXTURE_INVALID;
         dl.direction.x = dirX;
         dl.direction.y = dirY;
         dl.direction.z = dirZ;
@@ -2371,6 +2391,8 @@ static void ser_mesh_renderer(const JceMeshRenderer *mr, cJSON *arr)
     cJSON_AddNumberToObject(o, "alphaMode",   mr->alpha_mode);
     cJSON_AddNumberToObject(o, "alphaCutoff", mr->alpha_cutoff);
     cJSON_AddBoolToObject(o, "doubleSided", mr->double_sided);
+    cJSON_AddBoolToObject(o, "castsShadow",    !mr->shadow_cast_off);
+    cJSON_AddBoolToObject(o, "receivesShadow", !mr->shadow_receive_off);
     if (mr->albedo_tex[0])   cJSON_AddStringToObject(o, "albedoTex",   mr->albedo_tex);
     if (mr->mr_tex[0])       cJSON_AddStringToObject(o, "mrTex",       mr->mr_tex);
     if (mr->normal_tex[0])   cJSON_AddStringToObject(o, "normalTex",   mr->normal_tex);

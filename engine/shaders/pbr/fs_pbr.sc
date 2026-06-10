@@ -17,10 +17,10 @@ uniform vec4 u_ambientColor;    // xyz=ambient color, w=ambient intensity
 //   [i*2+1] = color.xyz, unused
 uniform vec4 u_dirLights[4];
 
-// Point lights: 2 vec4 per light, max 8 lights = 16 vec4
+// Point lights: 2 vec4 per light, max 16 lights = 32 vec4
 //   [i*2+0] = pos.xyz, radius
 //   [i*2+1] = color.xyz, intensity
-uniform vec4 u_pointLights[16];
+uniform vec4 u_pointLights[32];
 
 // Spot lights: 4 vec4 per light, max 4 lights = 16 vec4
 //   [i*4+0] = pos.xyz, radius
@@ -129,36 +129,106 @@ SAMPLER2D(s_iesLut, 14);
 SAMPLER2D(s_localShadowMap, 15);
 uniform mat4 u_localShadowVP[4];   // per-slot light-view-proj
 uniform vec4 u_spotShadowSlot;     // lane i = atlas slot for spot i (-1 = none)
-uniform vec4 u_pointShadowSlot[2]; // 8 point lanes -> atlas slot (-1 = none)
+uniform vec4 u_pointShadowSlot[4]; // 16 point lanes -> atlas slot (-1 = none)
 // u_localShadowParams: x = tiles per atlas side, y = 1/atlasSize,
-//                      z = depth bias, w = texel size (1/atlasSize)
+//                      z = depth bias (legacy global default), w = texel size
 uniform vec4 u_localShadowParams;
+// Per-slot depth bias: lane i = atlas slot i's authored shadowBias (4 slots).
+uniform vec4 u_localShadowBias;
+
+// Shadow FILTER quality tier (frame-constant; set by the scene renderer from
+// the render-pipeline asset's shadow_filter_quality knob):
+//   x < 0.5  ->  1 hard tap (local + CSM; cascade blend forced off CPU-side)
+//   x < 1.5  ->  3x3 PCF everywhere
+//   else     ->  full quality (local 3x3, CSM rotated 5x5 + cascade blend)
+// Frame-constant uniform branch: coherent for every fragment of every draw,
+// so the untaken side's texture fetches are genuinely skipped on SM3+.
+uniform vec4 u_shadowQuality;
 
 // Returns 1.0 (lit) when the light casts no shadow, the fragment is outside the
 // light frustum, or it is the nearest occluder; 0.0 when occluded.
-float sampleLocalShadow(int slotIndex, vec3 worldPos)
+float sampleLocalShadow(int slotIndex, vec3 worldPos, vec3 N,
+                        vec3 lightPos, float ndotl)
 {
     if (slotIndex < 0) return 1.0;
-    vec4 clip = mul(u_localShadowVP[slotIndex], vec4(worldPos, 1.0));
+
+    float tiles  = max(u_localShadowParams.x, 1.0);
+
+    // NORMAL-OFFSET bias — the real fix for the concentric "acne ring" moire a
+    // PERSPECTIVE local-shadow map produces on a flat receiver. Push the sampled
+    // position off the surface along the geometric normal by a few shadow texels'
+    // WORLD size. Under perspective the texel world size grows with distance to
+    // the light, so scale by that distance; widen further at grazing angles.
+    float distToLight = length(lightPos - worldPos);
+    float texelWorld  = distToLight * u_localShadowParams.y * tiles * 2.0;
+    float nOff = texelWorld * (1.5 + (1.0 - clamp(ndotl, 0.0, 1.0)) * 3.0);
+    vec3 sp = worldPos + N * nOff;
+
+    vec4 clip = mul(u_localShadowVP[slotIndex], vec4(sp, 1.0));
     if (clip.w <= 0.0) return 1.0;
     vec3 ndc = clip.xyz / clip.w;
     vec2 uv  = ndc.xy * 0.5 + vec2_splat(0.5);
-#if BGFX_SHADER_LANGUAGE_GLSL
+    // V-flip convention MUST match the CSM path (sample_csm_shadow): flip on
+    // D3D/Vulkan/Metal, NOT on GL. This was inverted, so on D3D the spot/point
+    // shadow sampled a vertically MIRRORED map — the point light's straight-down
+    // view has up=+Z, so its shadow appeared mirrored along world Z, and the
+    // spot's false occlusion cut its lit pool in half.
+#if !BGFX_SHADER_LANGUAGE_GLSL
     uv.y = 1.0 - uv.y;
+#endif
+#if BGFX_SHADER_LANGUAGE_GLSL
     float curDepth = ndc.z * 0.5 + 0.5;
 #else
     float curDepth = ndc.z;
 #endif
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return 1.0;
 
-    float tiles  = max(u_localShadowParams.x, 1.0);
     float tileUV = 1.0 / tiles;
     float col = mod(float(slotIndex), tiles);
     float row = floor(float(slotIndex) / tiles);
-    vec2 atlasUV = (vec2(col, row) + uv) * tileUV;
+#if BGFX_SHADER_LANGUAGE_GLSL
+    // GL FBO textures are bottom-left-origin: the tile bgfx places at view-rect
+    // row r physically sits at texture row (tiles-1-r). Flip the tile ROW here;
+    // the within-tile V correctly stays unflipped on GL (see uv.y above). On GL
+    // without this, every lookup hit the WRONG atlas tile: cleared-to-far areas
+    // (shadows had no effect) or a neighbour's depths (point pool falsely
+    // occluded on one side of world Z).
+    row = tiles - 1.0 - row;
+#endif
+    vec2 tileOrigin = vec2(col, row) * tileUV;
 
-    float shadowDepth = texture2D(s_localShadowMap, atlasUV).r;
-    return ((curDepth - u_localShadowParams.z) <= shadowDepth) ? 1.0 : 0.0;
+    // Small constant depth bias on top of the normal offset — per-slot, so each
+    // shadow-casting light's authored shadowBias applies (ES-safe selection).
+    float perSlotBias = (slotIndex == 0) ? u_localShadowBias.x :
+                        (slotIndex == 1) ? u_localShadowBias.y :
+                        (slotIndex == 2) ? u_localShadowBias.z : u_localShadowBias.w;
+    float bias = max(perSlotBias, 0.0005);
+
+    // 3x3 PCF, clamped inside this light's atlas tile so taps never bleed into
+    // a neighbouring light's tile (soft edges).
+    float texel = u_localShadowParams.y;       // 1 / atlasSize
+    float lo = texel * 0.5;
+    float hi = tileUV - texel * 0.5;
+    vec2  inTile = uv * tileUV;
+
+    // Tier 0: single hard tap. The normal-offset bias above is kept on every
+    // tier (ALU-only, it is the acne fix); only the 9-tap PCF is skipped.
+    if (u_shadowQuality.x < 0.5) {
+        vec2 t0 = clamp(inTile, vec2_splat(lo), vec2_splat(hi));
+        float d0 = texture2D(s_localShadowMap, tileOrigin + t0).r;
+        return ((curDepth - bias) <= d0) ? 1.0 : 0.0;
+    }
+
+    float sum = 0.0;
+    for (int oy = -1; oy <= 1; oy++) {
+        for (int ox = -1; ox <= 1; ox++) {
+            vec2 t = clamp(inTile + vec2(float(ox), float(oy)) * texel,
+                           vec2_splat(lo), vec2_splat(hi));
+            float d = texture2D(s_localShadowMap, tileOrigin + t).r;
+            sum += ((curDepth - bias) <= d) ? 1.0 : 0.0;
+        }
+    }
+    return sum * (1.0 / 9.0);
 }
 
 // u_cookieParams.x = has_cookie_spot   (1.0 / 0.0)
@@ -277,8 +347,36 @@ float sample_csm_shadow(int cascade,
 
     float filter_radius = max(u_csmParams.w, 0.5) * mix(1.0, 2.0, cascade_lerp);
 
-    // Rotate PCF kernel per-fragment using world-position hash to
-    // eliminate visible grid patterns while keeping temporally stable shadows.
+    // Shadow filter tier (see u_shadowQuality). GLSL-120 safety rule: a
+    // uniform branch selecting between CONSTANT-bound loops — never a
+    // variable loop bound, never `continue`.
+    // Tier 0: single hard tap; the bias math above stays (it is ALU-only
+    // and remains the acne defence), and the hash-rotation sin/cos is
+    // skipped along with the 25-tap kernel.
+    if (u_shadowQuality.x < 0.5)
+    {
+        float depth0 = csm_sample_depth(cascade, csm_uv);
+        return (csm_z - depth_bias > depth0) ? 0.0 : 1.0;
+    }
+
+    // Tier 1: unrotated 3x3 PCF (9 taps).
+    if (u_shadowQuality.x < 1.5)
+    {
+        float sum9 = 0.0;
+        for (int y = -1; y <= 1; y++)
+        {
+            for (int x = -1; x <= 1; x++)
+            {
+                vec2 offset = vec2(float(x), float(y)) * texel * filter_radius;
+                float depth = csm_sample_depth(cascade, csm_uv + offset);
+                sum9 += (csm_z - depth_bias > depth) ? 0.0 : 1.0;
+            }
+        }
+        return sum9 / 9.0;
+    }
+
+    // Tier 2 (full): rotate PCF kernel per-fragment using world-position hash
+    // to eliminate visible grid patterns while keeping temporally stable shadows.
     float angle = shadow_hash(world_pos) * 6.283185;
     float rot_c = cos(angle);
     float rot_s = sin(angle);
@@ -357,7 +455,8 @@ void main()
     }
 
     bool shadowEnabled = (shadowDirSlot > 0.5) &&
-        ((u_csmSplits.x > 0.0) || (u_csmParams.x > 0.0));
+        ((u_csmSplits.x > 0.0) || (u_csmParams.x > 0.0)) &&
+        (u_normalScale.w < 0.5);   /* per-renderer Receive Shadows off */
 
     if (shadowEnabled && u_csmSplits.x > 0.0)
     {
@@ -428,17 +527,27 @@ void main()
             shadowUV.y >= 0.0 && shadowUV.y <= 1.0 &&
             shadowZ >= 0.0 && shadowZ <= 1.0)
         {
-            vec2 texelSize = vec2_splat(max(u_csmParams.x, 1.0 / 2048.0));
-            float sum = 0.0;
-            for (int sy = -1; sy <= 1; sy++)
+            // Tier 0 (u_shadowQuality): single hard tap on the legacy
+            // single-map path too — same rule as sample_csm_shadow.
+            if (u_shadowQuality.x < 0.5)
             {
-                for (int sx = -1; sx <= 1; sx++)
-                {
-                    float depth = texture2D(s_shadowMap, shadowUV + vec2(float(sx), float(sy)) * texelSize).r;
-                    sum += (shadowZ - shadowBias > depth) ? 0.0 : 1.0;
-                }
+                float depth0 = texture2D(s_shadowMap, shadowUV).r;
+                shadow = (shadowZ - shadowBias > depth0) ? 0.0 : 1.0;
             }
-            shadow = sum / 9.0;
+            else
+            {
+                vec2 texelSize = vec2_splat(max(u_csmParams.x, 1.0 / 2048.0));
+                float sum = 0.0;
+                for (int sy = -1; sy <= 1; sy++)
+                {
+                    for (int sx = -1; sx <= 1; sx++)
+                    {
+                        float depth = texture2D(s_shadowMap, shadowUV + vec2(float(sx), float(sy)) * texelSize).r;
+                        sum += (shadowZ - shadowBias > depth) ? 0.0 : 1.0;
+                    }
+                }
+                shadow = sum / 9.0;
+            }
         }
     }
 
@@ -508,8 +617,18 @@ void main()
         vec3 tangentNormal = texture2D(s_normalMap, v_texcoord0).xyz * 2.0 - vec3_splat(1.0);
         tangentNormal.xy *= normalScale;
         tangentNormal = normalize(tangentNormal);
-        mat3 TBN = mat3(normalize(v_tangent), normalize(v_bitangent), N);
-        N = normalize(mul(tangentNormal, TBN));
+        // Tangent-space -> world: columns of the basis matrix are T/B/N and
+        // the tangent-space vector multiplies from the RIGHT. This MUST go
+        // through mtxFromCols + mul(mtx, vec): a raw `mat3(T,B,N)` ctor is
+        // row-major on HLSL but column-major on GLSL, so the previous
+        // `mul(tangentNormal, mat3(T,B,N))` applied the TRANSPOSED (inverse)
+        // basis on OpenGL — every normal-mapped surface got world->tangent
+        // instead of tangent->world normals there (ground normals pointed
+        // sideways, so every light pool was cut in half at the light's own
+        // axis: N.L flipped sign with the fragment's side). D3D was correct;
+        // this form is bit-identical to the old one on D3D and only fixes GL.
+        mat3 TBN = mtxFromCols(normalize(v_tangent), normalize(v_bitangent), N);
+        N = normalize(mul(TBN, tangentNormal));
     }
 
     // --- Metallic / Roughness ---
@@ -592,7 +711,7 @@ void main()
 
     // --- Point lights ---
     int numPointLights = int(u_lightCounts.y);
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < 16; i++)
     {
         if (i >= numPointLights) break;
 
@@ -612,12 +731,17 @@ void main()
         vec3 radiance = lightColor * intensity * attenuation;
 
         // ── P1: local point shadow (slot in u_pointShadowSlot[i/4][i%4]) ──
-        vec4 _pslotV = (i < 4) ? u_pointShadowSlot[0] : u_pointShadowSlot[1];
-        int  _pl     = i - ((i < 4) ? 0 : 4);
+        int  _grp    = i / 4;   // 0..3 for up to 16 point lights
+        vec4 _pslotV = (_grp == 0) ? u_pointShadowSlot[0] :
+                       (_grp == 1) ? u_pointShadowSlot[1] :
+                       (_grp == 2) ? u_pointShadowSlot[2] : u_pointShadowSlot[3];
+        int  _pl     = i - _grp * 4;
         float _pslotF = (_pl == 0) ? _pslotV.x :
                         (_pl == 1) ? _pslotV.y :
                         (_pl == 2) ? _pslotV.z : _pslotV.w;
-        radiance *= sampleLocalShadow(int(_pslotF), v_worldpos);
+        if (u_normalScale.w < 0.5)   /* per-renderer Receive Shadows */
+            radiance *= sampleLocalShadow(int(_pslotF), v_worldpos, N, lightPos,
+                                          max(dot(N, lightDir), 0.0));
 
         Lo += cookTorranceBRDF(N, V, lightDir, F0, albedo, metallic, roughness) * radiance;
     }
@@ -704,7 +828,9 @@ void main()
         float _spotSlotF = (i == 0) ? u_spotShadowSlot.x :
                            (i == 1) ? u_spotShadowSlot.y :
                            (i == 2) ? u_spotShadowSlot.z : u_spotShadowSlot.w;
-        radiance *= sampleLocalShadow(int(_spotSlotF), v_worldpos);
+        if (u_normalScale.w < 0.5)   /* per-renderer Receive Shadows */
+            radiance *= sampleLocalShadow(int(_spotSlotF), v_worldpos, N, lightPos,
+                                          max(dot(N, lightDir), 0.0));
 
         Lo += cookTorranceBRDF(N, V, lightDir, F0, albedo, metallic, roughness) * radiance;
     }
@@ -776,7 +902,21 @@ void main()
     // --- Gamma correction (linear -> sRGB) ---
     // When postfx tonemap is enabled, keep linear output for post-processing.
     if (u_iblParams.w < 0.5)
+    {
         color = pow(max(color, vec3_splat(0.0)), vec3_splat(1.0 / 2.2));
+
+        // --- Dither (break up 8-bit banding), LDR path ONLY ---
+        // With no tonemap pass following, this pass writes the final 8-bit
+        // image, so a smooth radial light-falloff gradient quantizes into
+        // concentric "ring" bands under point/spot lights; a ~1/255 ordered
+        // dither keyed on screen position hides the steps. On the HDR path
+        // (linear out to RGBA16F) dithering here is useless noise that ACES
+        // then distorts — fs_composite.sc dithers at the real final
+        // quantization point instead. Each path dithers exactly once.
+        float _dither = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233)))
+                              * 43758.5453);
+        color += vec3_splat((_dither - 0.5) / 255.0);
+    }
 
     // --- Output ---
     if (alphaMode == 2.0)

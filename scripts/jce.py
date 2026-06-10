@@ -36,6 +36,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -67,11 +68,18 @@ TARGETS = {
     "macos-arm64":   dict(host="darwin",  arch="aarch64", bits=64, eng_arch="arm64", profile="macos-arm64",   preset_stem="macos-arm64"),
 }
 
+# Web (Emscripten) is a cross target buildable from any host with emsdk.
+# Not part of the desktop matrix above (no native preset / MSVC env); _sdk_one
+# special-cases t["emscripten"] with an explicit -S/-B Ninja configure.
+TARGETS["wasm"] = dict(host=HOST, arch="wasm32", bits=32, eng_arch="wasm",
+                       profile="wasm", preset_stem="wasm", emscripten=True)
+
 # Accept short aliases on the CLI; normalise to GNU-triplet arch.
 ARCH_ALIAS = {
     "x64": "x86_64", "amd64": "x86_64", "x86_64": "x86_64",
     "x86": "i686",   "i686": "i686",
     "arm64": "aarch64", "aarch64": "aarch64", "arm64e": "aarch64",
+    "wasm": "wasm32", "wasm32": "wasm32", "web": "wasm32",
 }
 
 DRY_RUN = False
@@ -160,6 +168,9 @@ def resolve_target(arch_cli: str | None) -> dict:
 
 
 def conan_dir(t: dict) -> Path:
+    # Web (Emscripten) lives under build/web/ to match build-web.bat.
+    if t.get("emscripten"):
+        return ROOT / "build" / "web" / "wasm-conan"
     # One shared Conan output dir per target (matches the legacy .bat layout).
     return ROOT / "build" / "desktop" / f"{t['key']}-conan"
 
@@ -169,6 +180,8 @@ def toolchain_path(t: dict, config: str = "Release") -> Path:
 
 
 def sdk_install_dir(t: dict, variant: str) -> Path:
+    if t.get("emscripten"):
+        return ROOT / "dist" / "sdk" / ("wasm-dist" if variant == "dist" else "wasm")
     suffix = "-dist" if variant == "dist" else ""
     return ROOT / "dist" / "sdk" / f"{SDK_TAG[t['host']]}-{t['arch']}{suffix}"
 
@@ -334,6 +347,27 @@ def sync_conan_hooks() -> None:
 def conan_install(t: dict, config: str, env: dict) -> Path:
     """Ensure the conan toolchain for (target, config) exists; return its path."""
     tc = toolchain_path(t, config)
+    # Web (Emscripten): cross-compile profile + emcc/em++ toolchain (mirrors
+    # build-web.bat's conan invocation). Done before the desktop tc.exists()
+    # short-circuit so the wasm conan args never leak into a desktop install.
+    if t.get("emscripten"):
+        if tc.exists():
+            log(f"conan toolchain present (wasm/{config}): {tc} (skip; --clean to force)")
+            return tc
+        sync_conan_hooks()
+        em = emscripten_paths()
+        run(["conan", "install", ".",
+             "-pr:h", "conan/profiles/wasm",
+             "-pr:b", f"conan/profiles/{host_build_profile()}",
+             "-c", f"tools.cmake.cmaketoolchain:user_toolchain=['{em['toolchain']}']",
+             "-c", ("tools.build:compiler_executables="
+                    f"{{'c': '{em['cc']}', 'cpp': '{em['cxx']}'}}"),
+             "--output-folder", str(conan_dir(t)),
+             "--build=missing"],
+            env=env, cwd=ROOT)
+        if not tc.exists() and not DRY_RUN:
+            die(f"conan toolchain not generated: {tc}")
+        return tc
     if tc.exists():
         log(f"conan toolchain present ({config}): {tc} (skip; --clean to force)")
         return tc
@@ -376,6 +410,23 @@ def find_host_shaderc() -> Path | None:
         except Exception:
             pass
     return None
+
+
+def emscripten_paths() -> dict:
+    """Resolve the Emscripten toolchain + compiler wrappers (mirrors build-web.bat).
+
+    EMSDK comes from $EMSDK or the well-known checkout. All paths use forward
+    slashes so they survive conan's -c args and a CMake cache on Windows.
+    """
+    emsdk = os.environ.get("EMSDK") or "D:/Code/C_CPP/cross_platform/emsdk"
+    emsdk = str(Path(emsdk)).replace("\\", "/")
+    ext = ".bat" if HOST == "windows" else ""
+    em = f"{emsdk}/upstream/emscripten"
+    return dict(
+        toolchain=f"{em}/cmake/Modules/Platform/Emscripten.cmake",
+        cc=f"{em}/emcc{ext}",
+        cxx=f"{em}/em++{ext}",
+    )
 
 
 def host_tool(name: str) -> Path:
@@ -437,15 +488,22 @@ def cmd_host_tools(args) -> None:
 
 # ── Subcommand: sdk (Track A) ─────────────────────────────────────────────
 def _sdk_one(t: dict, variant: str, config: str, do_clean: bool) -> None:
+    is_wasm = t.get("emscripten", False)
     kind = "debug" if config == "Debug" else f"{variant}-sdk"   # release-sdk|dist-sdk
     preset  = preset_name(t, kind)
     bdir    = preset_binary_dir(t, kind)
     install = sdk_install_dir(t, variant)
+    if is_wasm:
+        # Web SDK lives under build/web (matches build-web.bat) and configures
+        # via explicit -S/-B Ninja, NOT a preset (there is no wasm preset).
+        bdir = ROOT / "build" / "web" / (
+            "wasm-dist-sdk" if variant == "dist" else "wasm-sdk")
     if config == "Debug":
         # Debug SDK is release-flavoured (no -dist-debug preset) and installs to
         # its own tree so it never clobbers the Release SDK at the same path.
         install = install.parent / f"{install.name}-debug"
-    env = msvc_env(t)
+    # MSVC env would inject the wrong toolchain into a wasm build; use a clean env.
+    env = dict(os.environ) if is_wasm else msvc_env(t)
 
     if do_clean:
         for d in (bdir, conan_dir(t)):
@@ -470,11 +528,26 @@ def _sdk_one(t: dict, variant: str, config: str, do_clean: bool) -> None:
     # (duplicate conan-release across targets). We use our own presets, so drop it.
     if not DRY_RUN:
         (ROOT / "CMakeUserPresets.json").unlink(missing_ok=True)
-    run(["cmake", "--preset", preset, *overrides], env=env, cwd=ROOT)
-    # Build by binary dir (configured by the preset above). Build presets are
-    # named "build-<preset>"; building by dir avoids that name dependency.
-    run(["cmake", "--build", str(bdir), "--target",
-         "jce_sdk_fat_lib", "jce_msvc_stl_shims", "-j", "8"], env=env, cwd=ROOT)
+    if is_wasm:
+        # No wasm preset: configure explicitly through the Emscripten toolchain.
+        tc = toolchain_path(t, config)
+        run(["cmake", "-S", str(ROOT), "-B", str(bdir), "-G", "Ninja",
+             f"-DCMAKE_TOOLCHAIN_FILE={tc}",
+             f"-DCMAKE_BUILD_TYPE={config}",
+             "-DJCE_ENABLE_SDK_INSTALL=ON",
+             f"-DCMAKE_INSTALL_PREFIX={install}",
+             "-DJCE_ENABLE_CPPCHECK=OFF",
+             f"-DJCE_BUILD_VARIANT={variant}",
+             *overrides], env=env, cwd=ROOT)
+        # emscripten has no MSVC STL shims; build only the fat lib.
+        run(["cmake", "--build", str(bdir), "--target",
+             "jce_sdk_fat_lib", "-j", "8"], env=env, cwd=ROOT)
+    else:
+        run(["cmake", "--preset", preset, *overrides], env=env, cwd=ROOT)
+        # Build by binary dir (configured by the preset above). Build presets are
+        # named "build-<preset>"; building by dir avoids that name dependency.
+        run(["cmake", "--build", str(bdir), "--target",
+             "jce_sdk_fat_lib", "jce_msvc_stl_shims", "-j", "8"], env=env, cwd=ROOT)
     # Host tools to ship with the SDK (tolerant on cross-arch trees).
     if not DRY_RUN:
         rc = subprocess.run(["cmake", "--build", str(bdir), "--target",
@@ -505,10 +578,11 @@ def _sdk_one(t: dict, variant: str, config: str, do_clean: bool) -> None:
                 log(f"WARN: host tool missing, SDK ships without {name}: {path}")
     # VERSION.txt — matches package-sdk.bat so consumers can identify the tree.
     if not DRY_RUN:
+        _host_tag = "wasm" if is_wasm else f"{SDK_TAG[t['host']]}-{t['arch']}"
         (install / "VERSION.txt").write_text(
             "JCE SDK build\n"
             f"commit:  {git_short_sha()}\n"
-            f"host:    {SDK_TAG[t['host']]}-{t['arch']}\n"
+            f"host:    {_host_tag}\n"
             f"variant: {variant}\n",
             encoding="utf-8")
     log(f"SDK ({variant}/{config}) -> {install}")
@@ -524,8 +598,9 @@ def cmd_sdk(args) -> None:
         _sdk_one(t, v, "Release", args.clean)
     # Debug SDK is release-flavoured only: there is no -dist-debug preset, and
     # `dist` is a royalty-free *ship* build. Build Debug once, for release, and
-    # only when a release SDK was requested.
-    if not args.no_debug and "release" in variants:
+    # only when a release SDK was requested.  Web ships Release-only (the wasm
+    # fat lib is Release; a Debug consumer maps to it via MAP_IMPORTED_CONFIG_DEBUG).
+    if not args.no_debug and "release" in variants and not t.get("emscripten"):
         _sdk_one(t, "release", "Debug", args.clean)
     log("sdk: done")
 
@@ -550,6 +625,123 @@ def _editor_asan(t: dict, env: dict) -> None:
          f"-DCMAKE_CXX_FLAGS_RELEASE={flags}"], env=env, cwd=ROOT)
     run(["cmake", "--build", str(bdir), "--target", "JCE_Editor"], env=env, cwd=ROOT)
     log(f"editor (asan) -> {bdir}/asan")
+
+
+def _git_short() -> str:
+    try:
+        r = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                           cwd=str(ROOT), capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _release_versions() -> list:
+    """Release version tokens from recent git commit messages, newest first
+    (e.g. ['v-0.9.8', 'v-0.9.6', ...]). A release commit's message starts with a
+    'v' followed by a version number — that is the project's tagging convention."""
+    try:
+        r = subprocess.run(["git", "log", "--format=%s", "-n", "80"],
+                           cwd=str(ROOT), capture_output=True, text=True, timeout=8)
+        if r.returncode != 0:
+            return []
+        out: list = []
+        for line in r.stdout.splitlines():
+            m = re.match(r"^(v[-\s]?\d+(?:\.\d+)*)", line.strip())
+            if m:
+                v = m.group(1).replace(" ", "-")
+                if v not in out:
+                    out.append(v)
+        return out
+    except Exception:
+        return []
+
+
+def attach_binsize_reports(t: dict, variant: str, bdir: Path) -> None:
+    """After an editor build, emit the binary-size composition report AND a diff
+    report on EVERY build. Two snapshots persist per target+variant under
+    <ROOT>/.binsize_history/ (gitignored, survive build-dir cleans):
+      <key>.last.*  the previous build's snapshot (updated every build)
+      <key>.base.*  the previous DISTINCT commit's snapshot (promoted from .last
+                    when the commit advances)
+    The diff is taken vs .base (previous commit) when available, else vs .last
+    (previous build) — so a diff report is always produced after the first build.
+    Non-fatal: any failure here is logged, never breaks the build."""
+    if DRY_RUN:
+        return
+    try:
+        script = ROOT / "tools" / "gen_binsize_report.py"
+        # The linker map is emitted under <build>/reports/ (see jce_emit_link_map
+        # in CMakeLists.txt), not next to the exe.
+        mp = bdir / "reports" / "JCE_Editor.map"
+        if not script.exists() or not mp.exists():
+            log("binsize: map/script missing — report skipped")
+            return
+        reports = bdir / "reports"
+        reports.mkdir(parents=True, exist_ok=True)
+        cur_html = reports / "binsize_report.html"
+        cur_json = reports / "binsize_report.json"
+        diff_html = reports / "binsize_diff.html"
+        commit = _git_short() or "local"
+        hist = ROOT / ".binsize_history"
+        hist.mkdir(exist_ok=True)
+        key = f"{t['key']}-{variant}"
+        last_json, last_commit_f = hist / f"{key}.last.json", hist / f"{key}.last.commit"
+
+        def _read(p: Path) -> str:
+            return p.read_text(encoding="utf-8").strip() if p.exists() else ""
+
+        # Migrate the older single-snapshot layout (<key>.json/.commit) -> .last.
+        old_json = hist / f"{key}.json"
+        if old_json.exists() and not last_json.exists():
+            shutil.move(str(old_json), str(last_json))
+            old_commit = hist / f"{key}.commit"
+            if old_commit.exists():
+                shutil.move(str(old_commit), str(last_commit_f))
+
+        last_commit = _read(last_commit_f)
+        # Diff baseline = the PREVIOUS RELEASE (by git commit message, e.g. the
+        # 'v-0.9.6' commit) so the diff shows real release-over-release deltas;
+        # fall back to the previous build's snapshot if that release wasn't built
+        # here yet.
+        vers = _release_versions()
+        cur_ver = vers[0] if vers else commit
+        prev_ver = next((v for v in vers[1:] if v != cur_ver), "")
+
+        def _vkey(v: str) -> str:
+            return f"{key}@" + re.sub(r"[^\w.\-]", "_", v)
+
+        prev_snap = (hist / f"{_vkey(prev_ver)}.json") if prev_ver else None
+        if prev_snap and prev_snap.exists():
+            diff_src, diff_label = prev_snap, prev_ver
+        elif last_json.exists():
+            diff_src, diff_label = last_json, (last_commit or "prev-build")
+        else:
+            diff_src, diff_label = None, ""
+
+        title = f"JCE editor {t['key']} {variant}"
+        cmd = [sys.executable, str(script), str(mp), str(cur_html),
+               "--json", str(cur_json), "--title", title, "--commit", cur_ver]
+        if diff_src:
+            cmd += ["--baseline", str(diff_src), "--base-commit", diff_label]
+        subprocess.run(cmd, cwd=str(ROOT))
+
+        if diff_src:
+            subprocess.run(
+                [sys.executable, str(script), "--diff", str(diff_src), str(cur_json),
+                 str(diff_html), "--title", f"{title}: {diff_label} -> {cur_ver}",
+                 "--base-commit", diff_label, "--commit", cur_ver], cwd=str(ROOT))
+            log(f"binsize: report + diff ({diff_label} -> {cur_ver}) -> {reports}")
+        else:
+            log(f"binsize: report -> {cur_html} (no prior release/build baseline yet)")
+
+        # Snapshot this build under its release version (for future diffs) + .last.
+        if cur_json.exists():
+            shutil.copy2(cur_json, hist / f"{_vkey(cur_ver)}.json")
+            shutil.copy2(cur_json, last_json)
+            last_commit_f.write_text(commit, encoding="utf-8")
+    except Exception as e:  # noqa: BLE001 — reports must never fail the build
+        log(f"binsize: report generation failed (non-fatal): {e}")
 
 
 def cmd_editor(args) -> None:
@@ -581,6 +773,8 @@ def cmd_editor(args) -> None:
     # variant-appropriate value on every configure (dist = OFF, else ON).
     overrides.append(
         f"-DJCE_ENABLE_PATENTED_CODECS={'OFF' if args.variant == 'dist' else 'ON'}")
+    # Emit a linker map so the build can attach a binary-composition report.
+    overrides.append("-DJCE_EMIT_LINK_MAP=ON")
     if t["cross"]:
         ht = ensure_host_tools(env, ("jce_pak",))
         overrides.append(f"-DJCE_PAK_EXECUTABLE={ht['jce_pak']}")
@@ -591,6 +785,17 @@ def cmd_editor(args) -> None:
         (ROOT / "CMakeUserPresets.json").unlink(missing_ok=True)
     run(["cmake", "--preset", preset, *overrides], env=env, cwd=ROOT)
     run(["cmake", "--build", str(bdir), "--target", "JCE_Editor"], env=env, cwd=ROOT)
+    attach_binsize_reports(t, args.variant, bdir)
+    # Run cppcheck for the x64 Windows RELEASE variant only — that is the only
+    # config where the target is created (see CMakeLists.txt). It is on-demand
+    # (no ALL), so invoke it explicitly here. Non-fatal; the target is absent for
+    # dist/debug/arm64/non-Windows and the run then reports "unavailable".
+    if not DRY_RUN and args.variant == "release":
+        rc = subprocess.run(["cmake", "--build", str(bdir), "--target", "cppcheck"],
+                            env=env, cwd=str(ROOT))
+        log(f"cppcheck report -> {bdir}\\reports\\cppcheck-report.txt"
+            if rc.returncode == 0
+            else "cppcheck skipped (not installed / target unavailable)")
     log(f"editor ({args.variant}) -> {bdir}")
 
 
@@ -633,7 +838,10 @@ def cmd_app(args) -> None:
     jce_cmake = sdk / "lib" / "cmake" / "JCE"
     if not (jce_cmake / "JCEConfig.cmake").exists():
         die(f"JCEConfig.cmake not under {jce_cmake}")
-    env = msvc_env(t)
+    # MSVC env would inject the wrong toolchain into a wasm consumer build;
+    # the SDK fat lib carries all deps, so a clean env + Emscripten.cmake is
+    # the whole toolchain story (mirrors _sdk_one).
+    env = dict(os.environ) if t.get("emscripten") else msvc_env(t)
     config = "Debug" if args.variant == "debug" else "Release"
     bdir = project / "build" / f"{t['host']}-{t['arch']}-{args.variant}"
     if args.clean and bdir.exists():
@@ -642,7 +850,9 @@ def cmd_app(args) -> None:
             shutil.rmtree(bdir, ignore_errors=True)
     cfg = ["cmake", "-S", str(project), "-B", str(bdir), "-G", "Ninja",
            f"-DCMAKE_BUILD_TYPE={config}", f"-DJCE_DIR={jce_cmake}"]
-    if HOST == "windows":
+    if t.get("emscripten"):
+        cfg.append(f"-DCMAKE_TOOLCHAIN_FILE={emscripten_paths()['toolchain']}")
+    elif HOST == "windows":
         cfg.append("-DCMAKE_C_COMPILER=cl")
     run(cfg, env=env, cwd=ROOT)
     if args.configure_only:
@@ -652,7 +862,12 @@ def cmd_app(args) -> None:
     # dir name; fall back to the dir name for manifest-less projects.
     target = args.target or manifest.get("target") or manifest.get("name") or project.name
     run(["cmake", "--build", str(bdir), "--target", target], env=env, cwd=ROOT)
-    exe = args.exe or manifest.get("exe") or ("caged_kingdom" + (".exe" if HOST == "windows" else ""))
+    if t.get("emscripten"):
+        # Web artifact is <name>.html (+ .js/.wasm/.data); the manifest "exe"
+        # field is the DESKTOP artifact name and does not apply here.
+        exe = args.exe or f"{manifest.get('name', project.name)}.html"
+    else:
+        exe = args.exe or manifest.get("exe") or ("caged_kingdom" + (".exe" if HOST == "windows" else ""))
     found = next((p for p in (bdir / exe, bdir / config / exe) if p.exists()), None)
     if not found and not DRY_RUN:
         die(f"build succeeded but artifact missing: {exe} (under {bdir})")

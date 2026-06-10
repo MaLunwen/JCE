@@ -17,10 +17,10 @@ uniform vec4 u_ambientColor;    // xyz=ambient color, w=ambient intensity
 //   [i*2+1] = color.xyz, unused
 uniform vec4 u_dirLights[4];
 
-// Point lights: 2 vec4 per light, max 8 lights = 16 vec4
+// Point lights: 2 vec4 per light, max 16 lights = 32 vec4
 //   [i*2+0] = pos.xyz, radius
 //   [i*2+1] = color.xyz, intensity
-uniform vec4 u_pointLights[16];
+uniform vec4 u_pointLights[32];
 
 // Spot lights: 4 vec4 per light, max 4 lights = 16 vec4
 //   [i*4+0] = pos.xyz, radius
@@ -55,6 +55,12 @@ uniform vec4 u_csmSplits;
 uniform vec4 u_csmParams;
 // Per-cascade bias scale (x..w for cascades 0..3)
 uniform vec4 u_csmBiasScales;
+
+// Shadow FILTER quality tier — same contract as fs_pbr.sc:
+//   x < 0.5 -> 1 hard tap, x < 1.5 -> 3x3 PCF, else rotated 5x5.
+// Frame-constant uniform branch set by the scene renderer from the
+// render-pipeline asset's shadow_filter_quality knob.
+uniform vec4 u_shadowQuality;
 
 // IBL samplers (stages 6-8)
 SAMPLERCUBE(s_irradiance, 6);
@@ -176,8 +182,34 @@ float sample_csm_shadow(int cascade,
 
     float filter_radius = max(u_csmParams.w, 0.5) * mix(1.0, 2.0, cascade_lerp);
 
-    // Rotate PCF kernel per-fragment using world-position hash to
-    // eliminate visible grid patterns while keeping temporally stable shadows.
+    // Shadow filter tier (see u_shadowQuality; mirrors fs_pbr.sc). GLSL-120
+    // safety rule: uniform branch selecting between CONSTANT-bound loops —
+    // never a variable loop bound, never `continue`.
+    // Tier 0: single hard tap (bias math above stays; hash rotation skipped).
+    if (u_shadowQuality.x < 0.5)
+    {
+        float depth0 = csm_sample_depth(cascade, csm_uv);
+        return (csm_z - depth_bias > depth0) ? 0.0 : 1.0;
+    }
+
+    // Tier 1: unrotated 3x3 PCF (9 taps).
+    if (u_shadowQuality.x < 1.5)
+    {
+        float sum9 = 0.0;
+        for (int y = -1; y <= 1; y++)
+        {
+            for (int x = -1; x <= 1; x++)
+            {
+                vec2 offset = vec2(float(x), float(y)) * texel * filter_radius;
+                float depth = csm_sample_depth(cascade, csm_uv + offset);
+                sum9 += (csm_z - depth_bias > depth) ? 0.0 : 1.0;
+            }
+        }
+        return sum9 / 9.0;
+    }
+
+    // Tier 2 (full): rotate PCF kernel per-fragment using world-position hash
+    // to eliminate visible grid patterns while keeping temporally stable shadows.
     float angle = shadow_hash(world_pos) * 6.283185;
     float rot_c = cos(angle);
     float rot_s = sin(angle);
@@ -327,17 +359,27 @@ void main()
             shadowUV.y >= 0.0 && shadowUV.y <= 1.0 &&
             shadowZ >= 0.0 && shadowZ <= 1.0)
         {
-            vec2 texelSize = vec2_splat(max(u_csmParams.x, 1.0 / 2048.0));
-            float sum = 0.0;
-            for (int sy = -1; sy <= 1; sy++)
+            // Tier 0 (u_shadowQuality): single hard tap on the legacy
+            // single-map path too — same rule as sample_csm_shadow.
+            if (u_shadowQuality.x < 0.5)
             {
-                for (int sx = -1; sx <= 1; sx++)
-                {
-                    float depth = texture2D(s_shadowMap, shadowUV + vec2(float(sx), float(sy)) * texelSize).r;
-                    sum += (shadowZ - shadowBias > depth) ? 0.0 : 1.0;
-                }
+                float depth0 = texture2D(s_shadowMap, shadowUV).r;
+                shadow = (shadowZ - shadowBias > depth0) ? 0.0 : 1.0;
             }
-            shadow = sum / 9.0;
+            else
+            {
+                vec2 texelSize = vec2_splat(max(u_csmParams.x, 1.0 / 2048.0));
+                float sum = 0.0;
+                for (int sy = -1; sy <= 1; sy++)
+                {
+                    for (int sx = -1; sx <= 1; sx++)
+                    {
+                        float depth = texture2D(s_shadowMap, shadowUV + vec2(float(sx), float(sy)) * texelSize).r;
+                        sum += (shadowZ - shadowBias > depth) ? 0.0 : 1.0;
+                    }
+                }
+                shadow = sum / 9.0;
+            }
         }
     }
 
@@ -435,7 +477,7 @@ void main()
 
     // --- Point lights ---
     int numPointLights = int(u_lightCounts.y);
-    for (int i = 0; i < 8; i++)
+    for (int i = 0; i < 16; i++)
     {
         if (i >= numPointLights) break;
 

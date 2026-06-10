@@ -157,6 +157,42 @@ function(jce_target_embed_pak TARGET)
 	set(_header_file   "${EP_PAK_FILE}.h")
 	set(_manifest_file "${EP_PAK_FILE}.manifest.json")
 
+	# Emscripten: do NOT embed the PAK as an object.  Pack it (obj-format
+	# defaults to "none" when --obj-file/--obj-format are omitted), preload it
+	# into the MEMFS via --preload-file, and link a 1-byte stub providing the
+	# assets_pak_data / _size externs the engine references unconditionally
+	# (JCE_PLATFORM_WEB is a CMake var, never a -D macro).
+	if(EMSCRIPTEN)
+		add_custom_command(
+			OUTPUT  "${EP_PAK_FILE}"
+			COMMAND "${JCE_PAK_EXECUTABLE}"
+				${_res_flags}
+				${_excl_flags}
+				--pak-file       "${EP_PAK_FILE}"
+				--header-file    "${_header_file}"
+				--manifest-file  "${_manifest_file}"
+				--symbol-prefix  "${EP_SYMBOL_PREFIX}"
+			DEPENDS "${JCE_PAK_EXECUTABLE}"
+			COMMENT "Packing ${TARGET} assets (wasm) -> ${EP_PAK_FILE}"
+			VERBATIM)
+
+		add_custom_target(${TARGET}_pak DEPENDS "${EP_PAK_FILE}")
+		add_dependencies(${TARGET} ${TARGET}_pak)
+
+		target_link_options(${TARGET} PRIVATE
+			"SHELL:--preload-file ${EP_PAK_FILE}@/game_assets.pak")
+		set_property(TARGET ${TARGET} APPEND PROPERTY LINK_DEPENDS "${EP_PAK_FILE}")
+
+		# 1-byte stub: the engine links against assets_pak_data / _size even on
+		# web (the real PAK is loaded from MEMFS at /game_assets.pak).
+		set(_wasm_stub "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}_wasm_pak_stub.c")
+		file(WRITE "${_wasm_stub}"
+			"const unsigned char ${EP_SYMBOL_PREFIX}[1] = {0};\n"
+			"const unsigned long ${EP_SYMBOL_PREFIX}_size = 0;\n")
+		target_sources(${TARGET} PRIVATE "${_wasm_stub}")
+		return()
+	endif()
+
 	# Pick a COFF arch flag for MSVC so the linker accepts it for x86/x64/arm64.
 	set(_obj_arch_flags)
 	if(MSVC)
@@ -352,7 +388,8 @@ endfunction()
 #     [NO_ENGINE_RESOURCES]             # don't prepend SDK engine res#
 #     [NO_COOK]                         # pack raw, skip cooking      #
 #     [COOK_LEVEL <0-22>]               # per-asset zstd (default 0)  #
-#     [MAX_TEXTURE_SIZE <N>])           # default 2048                #
+#     [MAX_TEXTURE_SIZE <N>]            # default 2048                #
+#     [COOK_PLATFORM <p>])              # jce_cook --platform         #
 #                                                                     #
 # Turnkey raw-asset → cooked → PAK → embed for SDK consumers that do  #
 # NOT go through the packaged editor.  Resolution order:             #
@@ -374,7 +411,7 @@ function(jce_add_pak TARGET)
 	endif()
 
 	set(_opts  NO_ENGINE_RESOURCES NO_COOK)
-	set(_one   PAK_FILE SYMBOL_PREFIX COOK_LEVEL MAX_TEXTURE_SIZE)
+	set(_one   PAK_FILE SYMBOL_PREFIX COOK_LEVEL MAX_TEXTURE_SIZE COOK_PLATFORM)
 	set(_multi RESOURCE_DIRS EXCLUDE_SEGMENTS)
 	cmake_parse_arguments(AP "${_opts}" "${_one}" "${_multi}" ${ARGN})
 
@@ -408,6 +445,10 @@ function(jce_add_pak TARGET)
 	endif()
 	if(NOT DEFINED AP_MAX_TEXTURE_SIZE)
 		set(AP_MAX_TEXTURE_SIZE 2048)
+	endif()
+	set(_cook_platform_args "")
+	if(DEFINED AP_COOK_PLATFORM)
+		set(_cook_platform_args --platform "${AP_COOK_PLATFORM}")
 	endif()
 
 	# Resolve resource dirs to absolute; prepend the SDK engine resource
@@ -449,7 +490,8 @@ function(jce_add_pak TARGET)
 				--batch "${_d}" "${_cooked_dir}"
 				--preserve-names
 				--level "${AP_COOK_LEVEL}"
-				--max-texture-size "${AP_MAX_TEXTURE_SIZE}")
+				--max-texture-size "${AP_MAX_TEXTURE_SIZE}"
+				${_cook_platform_args})
 	endforeach()
 
 	add_custom_command(

@@ -46,6 +46,46 @@ JCE_API JceTexture jce_texture_from_cooked(const JceAssetTexInfo *info,
                                            size_t pixel_bytes,
                                            int sampler_mode);
 
+/* ================================================================== */
+/* Worker-decode + render-thread-upload split                          */
+/* ================================================================== */
+/*
+ * jce_texture_load_ex() does PAK decompress + image decode + bgfx_create
+ * in one call — fine on the render thread, but the decode is the slow,
+ * variable-latency part and bgfx resource creation must stay on the
+ * render thread.  This pair splits the two so a worker can decode while
+ * the render thread only does the cheap GPU upload:
+ *
+ *   worker:        JceTextureCpu *c = jce_texture_decode_cpu(pak,path,mode);
+ *   render thread: JceTexture t = jce_texture_upload_cpu(c);   // consumes c
+ *
+ * decode_cpu touches no bgfx/GPU state (PAK decompress + SDL_image /
+ * cooked parse only), so it is safe to call from any thread.  upload_cpu
+ * does the bgfx_create on the calling thread and frees `c`.  On a cancel
+ * path, jce_texture_cpu_free() releases a decoded result without upload.
+ */
+typedef struct JceTextureCpu JceTextureCpu;
+
+/* Worker-safe: decode `asset_path` from `pak` to a CPU result.  Returns
+ * NULL on failure (asset missing, bad format, decode error). */
+JCE_API JceTextureCpu *jce_texture_decode_cpu(const JcePakArchive *pak,
+                                              const char *asset_path,
+                                              int sampler_mode);
+
+/* Worker-safe: decode an in-memory encoded image (PNG/JPG/… bytes, e.g. a
+ * glTF embedded buffer-view) to a CPU result.  Returns NULL on failure. */
+JCE_API JceTextureCpu *jce_texture_decode_cpu_mem(const void *encoded,
+                                                  size_t size,
+                                                  int sampler_mode);
+
+/* Render-thread: upload a decoded result to a GPU texture and free `c`
+ * (also frees `c` when it is NULL/failed).  Returns JCE_TEXTURE_INVALID
+ * on failure. */
+JCE_API JceTexture jce_texture_upload_cpu(JceTextureCpu *c);
+
+/* Free a decoded result without uploading (cancellation). */
+JCE_API void jce_texture_cpu_free(JceTextureCpu *c);
+
 /* Update an existing RGBA8 texture in-place.
    Returns false when the handle is invalid, dimensions mismatch, or upload fails. */
 bool       jce_texture_update_rgba(JceTexture tex, const void *data,

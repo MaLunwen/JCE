@@ -32,8 +32,24 @@ void jce_asset_path_index_clear(void);
  * Safe to call multiple times for several roots; entries accumulate.
  * Skips dot-prefixed directories, build/, .git/, node_modules/.
  * Returns number of files indexed in this call.
+ *
+ * Synchronous: blocks the caller for the whole walk (up to a 3 s / 50k
+ * file budget).  Prefer the async variant for startup / open-project so
+ * the UI never freezes.
  */
 int  jce_asset_path_index_rebuild(const char *root);
+
+/* Rebuild the index for `root` on a background worker (REPLACE, not
+ * additive).  The current index stays live and queryable until the new
+ * one is ready, at which point jce_asset_path_index_poll() swaps it in.
+ * If a rebuild is already running, the newest root is remembered and
+ * rebuilt when the current one finishes.  Returns 0 (work is deferred).
+ */
+int  jce_asset_path_index_rebuild_async(const char *root);
+
+/* Pump async rebuilds: call once per editor frame from the main thread.
+ * Swaps in any finished background index. */
+void jce_asset_path_index_poll(void);
 
 /* Look up `requested_path` (any form: basename, relative, broken
  * absolute) and write the best matching absolute path to out_buf.

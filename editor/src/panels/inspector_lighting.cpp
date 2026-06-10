@@ -83,6 +83,7 @@ void draw_comp_light(JceScene *scene, JceEntity e, uint64_t flags)
             l.color.x = color[0]; l.color.y = color[1]; l.color.z = color[2];
             l.intensity = intensity;
             l.casts_shadow = false;
+            l.cookie_texture.idx = UINT16_MAX;
             jce_scene_set_dir_light(scene, e, &l);
         } else if (new_type == 1) {
             JcePointLight l = {};
@@ -98,10 +99,107 @@ void draw_comp_light(JceScene *scene, JceEntity e, uint64_t flags)
             l.radius = 10.0f;
             l.inner_cone_cos = cosf(25.0f * JCE_DEG2RAD);
             l.outer_cone_cos = cosf(35.0f * JCE_DEG2RAD);
+            l.cookie_texture.idx = UINT16_MAX;
+            l.ies_lut_texture.idx = UINT16_MAX;
             jce_scene_set_spot_light(scene, e, &l);
         }
         jce_state_end_batch_edit();
         light_type = new_type;
+    }
+
+    /* Direction control for directional + spot lights — Win-3D-Viewer-style
+     * "Light Rotation": Azimuth (yaw around Y) + Elevation (height above the
+     * horizon), which is far more intuitive than a raw vector. The viewport
+     * arrow gizmo shows the resulting shine direction. Elevation 90 = straight
+     * down (sun overhead); 0 = horizontal. */
+    if (light_type == 0 || light_type == 2) {
+        /* Operate on the ACTUAL world shine direction = entity rotation * the
+           light's local direction field (what the renderer + viewport arrow
+           use). On edit we write the world direction into the field AND clear
+           the entity rotation, so dial / gizmo / lighting / shadow always agree.
+           (Before: the dial edited only the raw field, so a non-identity entity
+           rotation made the real light differ from the displayed angle — e.g.
+           "90 deg" in the inspector but a long low-angle shadow.) */
+        JceTransform *xf = jce_scene_get_transform(scene, e);
+        jce_quat rot = xf ? jce_q_normalize(xf->rotation) : jce_q_identity();
+        jce_vec3 cur = (light_type == 0)
+            ? jce_scene_get_dir_light(scene, e)->direction
+            : jce_scene_get_spot_light(scene, e)->direction;
+        cur = jce_v3_normalize(cur);
+        if (cur.x == 0.0f && cur.y == 0.0f && cur.z == 0.0f)
+            cur = jce_v3(0.0f, -1.0f, 0.0f);
+        cur = jce_v3_normalize(jce_q_rotate(rot, cur));   /* world shine dir */
+
+        const float RAD2DEG = 57.2957795f;
+        const float DEG2RAD = 0.0174532925f;
+        float ny = cur.y; if (ny < -1.0f) ny = -1.0f; if (ny > 1.0f) ny = 1.0f;
+        float elev_deg = asinf(-ny) * RAD2DEG;            /* 90 = straight down */
+        float azim_deg = atan2f(cur.x, cur.z) * RAD2DEG;
+
+        bool changed = false;
+        snprintf(lbl, sizeof(lbl), "%s###LightAzim",
+                 jce_editor_i18n_id("inspector.light.azimuth", "Azimuth"));
+        if (ImGui::DragFloat(lbl, &azim_deg, 1.0f, -360.0f, 360.0f, "%.0f deg"))
+            changed = true;
+        snprintf(lbl, sizeof(lbl), "%s###LightElev",
+                 jce_editor_i18n_id("inspector.light.elevation", "Elevation"));
+        if (ImGui::DragFloat(lbl, &elev_deg, 1.0f, -89.0f, 89.0f, "%.0f deg"))
+            changed = true;
+
+        /* 2D rotation dial (Win-3D-Viewer "Light Rotation" tray): drag the sun
+           handle anywhere inside the ring. Angle from centre = Azimuth; distance
+           from centre = Elevation (centre = straight down / overhead = 90, edge
+           = horizon = 0). The 2D mapping avoids the degenerate azimuth when the
+           light points straight down (the old "default 90 deg" problem). */
+        {
+            const float dial_r = 56.0f;
+            ImVec2 p0 = ImGui::GetCursorScreenPos();
+            ImVec2 c  = ImVec2(p0.x + dial_r + 8.0f, p0.y + dial_r + 8.0f);
+            ImGui::InvisibleButton("##lightDial",
+                                   ImVec2((dial_r + 8.0f) * 2.0f,
+                                          (dial_r + 8.0f) * 2.0f));
+            bool active = ImGui::IsItemActive();
+            ImDrawList *dl = ImGui::GetWindowDrawList();
+            dl->AddCircleFilled(c, dial_r, IM_COL32(70, 70, 70, 255), 48);
+            dl->AddCircle(c, dial_r, IM_COL32(80, 150, 235, 255), 56, 2.5f);
+            dl->AddCircleFilled(c, 3.0f, IM_COL32(190, 190, 190, 255), 10);
+            float rn = (90.0f - elev_deg) / 90.0f;
+            if (rn < 0.0f) rn = 0.0f;
+            if (rn > 1.0f) rn = 1.0f;
+            float a = azim_deg * DEG2RAD;
+            ImVec2 sun = ImVec2(c.x + sinf(a) * dial_r * rn,
+                                c.y - cosf(a) * dial_r * rn);
+            dl->AddLine(c, sun, IM_COL32(80, 150, 235, 150), 1.5f);
+            dl->AddCircleFilled(sun, 8.0f, IM_COL32(255, 210, 90, 255), 18);
+            if (active) {
+                ImVec2 m = ImGui::GetIO().MousePos;
+                float dx = m.x - c.x, dy = m.y - c.y;
+                float dist = sqrtf(dx * dx + dy * dy);
+                float rnn = dist / dial_r;
+                if (rnn > 1.0f) rnn = 1.0f;
+                azim_deg = atan2f(dx, -dy) * RAD2DEG;
+                elev_deg = 90.0f - rnn * 90.0f;
+                changed = true;
+            }
+        }
+
+        if (changed) {
+            float el = elev_deg * DEG2RAD;
+            float az = azim_deg * DEG2RAD;
+            float horiz = cosf(el);
+            jce_vec3 nd = jce_v3_normalize(
+                jce_v3(horiz * sinf(az), -sinf(el), horiz * cosf(az)));
+            /* Clear the entity rotation so the world shine == nd exactly (no
+               hidden rotation offset), then store nd as the direction field. */
+            if (xf) xf->rotation = jce_q_identity();
+            if (light_type == 0) jce_scene_get_dir_light(scene, e)->direction = nd;
+            else                 jce_scene_get_spot_light(scene, e)->direction = nd;
+        }
+        INSP_RESET_CTX("##rst_lightDir",
+            if (xf) xf->rotation = jce_q_identity();
+            if (light_type == 0) jce_scene_get_dir_light(scene, e)->direction = jce_v3(0.0f, -1.0f, 0.0f);
+            else                 jce_scene_get_spot_light(scene, e)->direction = jce_v3(0.0f, -1.0f, 0.0f); );
+        insp_track_edit();
     }
 
     if (light_type == 1 || light_type == 2) {

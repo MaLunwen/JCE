@@ -491,25 +491,25 @@ static bool has_ext(const char *path, const char *ext)
     return SDL_strcasecmp(path + plen - elen, ext) == 0;
 }
 
-/* Decode WAV or OGG from memory using miniaudio's built-in decoders.
-   Output is always s16 PCM. */
-static JceSound load_from_memory(JceAudio *audio, int slot,
-                                  const uint8_t *data, size_t size,
-                                  const char *path)
+/* Decode WAV/OGG/MP3/FLAC/M4A from memory to a standalone s16 PCM buffer.
+   Touches no JceAudio state → safe to call from any thread.  On success
+   *out_pcm is a JCE_MALLOC'd buffer the caller owns. */
+static bool decode_pcm_mem(const uint8_t *data, size_t size, const char *path,
+                           int16_t **out_pcm, ma_uint64 *out_frames,
+                           ma_uint32 *out_channels, ma_uint32 *out_rate)
 {
+    *out_pcm = NULL; *out_frames = 0; *out_channels = 0; *out_rate = 0;
+
     /* ── M4A / AAC-in-MP4 detection ─────────────────────────────── */
     if (jce_m4a_is_mp4_container(data, size)) {
         int16_t *pcm = NULL;
         uint32_t frames = 0, ch = 0, sr = 0;
         if (jce_m4a_decode_to_pcm(data, size, &pcm, &frames, &ch, &sr)) {
-            audio->sounds[slot].pcm_data    = pcm;
-            audio->sounds[slot].frame_count = (ma_uint64)frames;
-            audio->sounds[slot].channels    = ch;
-            audio->sounds[slot].sample_rate = sr;
-            audio->sound_used[slot]         = true;
-            LOG_DEBUG("jce_audio", "loaded M4A '%s' (%u Hz, %uch, %u frames)",
+            *out_pcm = pcm; *out_frames = (ma_uint64)frames;
+            *out_channels = ch; *out_rate = sr;
+            LOG_DEBUG("jce_audio", "decoded M4A '%s' (%u Hz, %uch, %u frames)",
                       path, sr, ch, frames);
-            return (JceSound)(slot + 1);
+            return true;
         }
         LOG_WARN("jce_audio", "M4A decode failed for '%s', trying miniaudio", path);
         /* Fall through to miniaudio as last resort. */
@@ -578,7 +578,7 @@ static JceSound load_from_memory(JceAudio *audio, int slot,
         LOG_ERROR("jce_audio",
             "decode failed for '%s' (ma_result=%d, size=%zu, header=[%s])",
             path, (int)res, size, hdr);
-        return JCE_SOUND_INVALID;
+        return false;
     }
 
     /* Get total frame count. */
@@ -587,15 +587,16 @@ static JceSound load_from_memory(JceAudio *audio, int slot,
 
     ma_uint32 channels = decoder.outputChannels;
     ma_uint32 rate     = decoder.outputSampleRate;
+    int16_t  *pcm      = NULL;
 
     if (total_frames == 0) {
         /* Unknown length (streaming format) — decode in chunks. */
         size_t alloc_frames = 1024 * 256;
         size_t used_frames  = 0;
-        int16_t *pcm = (int16_t *)JCE_MALLOC(alloc_frames * channels * sizeof(int16_t));
+        pcm = (int16_t *)JCE_MALLOC(alloc_frames * channels * sizeof(int16_t));
         if (!pcm) {
             ma_decoder_uninit(&decoder);
-            return JCE_SOUND_INVALID;
+            return false;
         }
 
         for (;;) {
@@ -606,7 +607,7 @@ static JceSound load_from_memory(JceAudio *audio, int slot,
                 if (!tmp) {
                     JCE_FREE(pcm);
                     ma_decoder_uninit(&decoder);
-                    return JCE_SOUND_INVALID;
+                    return false;
                 }
                 pcm = tmp;
             }
@@ -618,30 +619,46 @@ static JceSound load_from_memory(JceAudio *audio, int slot,
         }
 
         total_frames = (ma_uint64)used_frames;
-        audio->sounds[slot].pcm_data = pcm;
     } else {
         /* Known length — single allocation. */
-        void *pcm = JCE_MALLOC((size_t)(total_frames * channels * sizeof(int16_t)));
+        pcm = (int16_t *)JCE_MALLOC((size_t)(total_frames * channels * sizeof(int16_t)));
         if (!pcm) {
             ma_decoder_uninit(&decoder);
-            return JCE_SOUND_INVALID;
+            return false;
         }
 
         ma_uint64 frames_read = 0;
         ma_decoder_read_pcm_frames(&decoder, pcm, total_frames, &frames_read);
         total_frames = frames_read;
-        audio->sounds[slot].pcm_data = pcm;
     }
 
     ma_decoder_uninit(&decoder);
 
-    audio->sounds[slot].frame_count = total_frames;
+    *out_pcm      = pcm;
+    *out_frames   = total_frames;
+    *out_channels = channels;
+    *out_rate     = rate;
+    LOG_DEBUG("jce_audio", "decoded '%s' (%u Hz, %uch, %llu frames)",
+              path, rate, channels, (unsigned long long)total_frames);
+    return true;
+}
+
+/* Decode into an audio sound slot (registration on the owning thread). */
+static JceSound load_from_memory(JceAudio *audio, int slot,
+                                  const uint8_t *data, size_t size,
+                                  const char *path)
+{
+    int16_t  *pcm = NULL;
+    ma_uint64 frames = 0;
+    ma_uint32 channels = 0, rate = 0;
+    if (!decode_pcm_mem(data, size, path, &pcm, &frames, &channels, &rate))
+        return JCE_SOUND_INVALID;
+
+    audio->sounds[slot].pcm_data    = pcm;
+    audio->sounds[slot].frame_count = frames;
     audio->sounds[slot].channels    = channels;
     audio->sounds[slot].sample_rate = rate;
     audio->sound_used[slot]         = true;
-
-    LOG_DEBUG("jce_audio", "loaded '%s' (%u Hz, %uch, %llu frames)",
-              path, rate, channels, (unsigned long long)total_frames);
     return (JceSound)(slot + 1);
 }
 
@@ -774,6 +791,105 @@ JceSound jce_audio_load(JceAudio *audio, const JcePakArchive *pak, const char *p
     JceSound result = jce_audio_load_inner(audio, pak, path);
     JCE_PROFILE_ZONE_END;
     return result;
+}
+
+/* ── Worker-decode + main-thread-register split ───────────────────── */
+
+struct JceAudioCpu {
+    void    *pcm;          /* owned: s16 (or cooked-format) PCM bytes */
+    uint32_t pcm_bytes;
+    uint16_t channels;
+    uint32_t sample_rate;
+    uint16_t bits;         /* 8 or 16 */
+};
+
+JceAudioCpu *jce_audio_decode_cpu(const JcePakArchive *pak, const char *path)
+{
+    if (!pak || !path) return NULL;
+
+    const JcePakAsset *asset = jce_pak_find(pak, path);
+    if (!asset) {
+        LOG_ERROR("jce_audio", "asset '%s' not found in PAK", path);
+        return NULL;
+    }
+
+    void *raw = JCE_MALLOC((size_t)asset->original_size);
+    if (!raw) return NULL;
+    size_t decoded = jce_pak_decompress(asset, raw, (size_t)asset->original_size);
+    if (decoded == 0) {
+        LOG_ERROR("jce_audio", "decompress failed for '%s'", path);
+        JCE_FREE(raw);
+        return NULL;
+    }
+
+    JceAudioCpu *c = (JceAudioCpu *)JCE_CALLOC(1, sizeof(*c));
+    if (!c) { JCE_FREE(raw); return NULL; }
+
+    /* ── Cooked path: .jceasset AUDIO_INFO + AUDIO_PCM ── */
+    if (jce_asset_is_cooked(raw, decoded)) {
+        JceAssetView view;
+        if (!jce_asset_open(&view, raw, decoded)) { JCE_FREE(c); JCE_FREE(raw); return NULL; }
+
+        const JceAssetChunkEntry *info_c =
+            jce_asset_find_chunk(&view, JCEASSET_CHUNK_AUDIO_INFO);
+        const JceAssetChunkEntry *pcm_c =
+            jce_asset_find_chunk(&view, JCEASSET_CHUNK_AUDIO_PCM);
+        if (!info_c || !pcm_c) { JCE_FREE(c); JCE_FREE(raw); return NULL; }
+
+        JceAssetAudioInfo ainfo;
+        if (jce_asset_chunk_data(&view, info_c, &ainfo, sizeof(ainfo)) == 0) {
+            JCE_FREE(c); JCE_FREE(raw); return NULL;
+        }
+
+        uint32_t pcm_size = (uint32_t)pcm_c->original_size;
+        void *pcm_data = JCE_MALLOC(pcm_size);
+        if (!pcm_data) { JCE_FREE(c); JCE_FREE(raw); return NULL; }
+        if (jce_asset_chunk_data(&view, pcm_c, pcm_data, pcm_size) == 0) {
+            JCE_FREE(pcm_data); JCE_FREE(c); JCE_FREE(raw); return NULL;
+        }
+        JCE_FREE(raw);
+
+        c->pcm         = pcm_data;
+        c->pcm_bytes   = pcm_size;
+        c->channels    = ainfo.channels;
+        c->sample_rate = ainfo.sample_rate;
+        c->bits        = ainfo.bits_per_sample;
+        return c;
+    }
+
+    /* ── Raw path: OGG/WAV/MP3/… → miniaudio decode → s16 PCM ── */
+    int16_t  *pcm = NULL;
+    ma_uint64 frames = 0;
+    ma_uint32 ch = 0, sr = 0;
+    bool ok = decode_pcm_mem((const uint8_t *)raw, decoded, path,
+                             &pcm, &frames, &ch, &sr);
+    JCE_FREE(raw);
+    if (!ok) { JCE_FREE(c); return NULL; }
+
+    c->pcm         = pcm;
+    c->pcm_bytes   = (uint32_t)(frames * ch * sizeof(int16_t));
+    c->channels    = (uint16_t)ch;
+    c->sample_rate = sr;
+    c->bits        = 16;
+    return c;
+}
+
+JceSound jce_audio_upload_cpu(JceAudio *audio, JceAudioCpu *c)
+{
+    if (!c) return JCE_SOUND_INVALID;
+    JceSound s = JCE_SOUND_INVALID;
+    if (audio && c->pcm && c->pcm_bytes > 0)
+        s = jce_audio_load_pcm(audio, c->pcm, c->pcm_bytes,
+                               c->channels, c->sample_rate, c->bits);
+    jce_audio_cpu_free(c);
+    return s;
+}
+
+void jce_audio_cpu_free(JceAudioCpu *c)
+{
+    if (!c) return;
+    if (c->pcm) JCE_FREE(c->pcm);
+    JCE_FREE(c);
 }
 
 void jce_audio_unload(JceAudio *audio, JceSound snd)

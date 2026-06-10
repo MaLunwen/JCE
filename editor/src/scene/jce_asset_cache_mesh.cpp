@@ -289,8 +289,7 @@ bool resolve_mesh_file_path(const char *mesh_path, char *out_path,
     /* Recursive search across all scene + project roots so meshes resolve
      * Unity-style by basename anywhere under the project. */
     {
-        std::vector<std::string> roots;
-        collect_scene_roots(&roots);
+        const std::vector<std::string> &roots = collect_scene_roots();
         if (roots.empty())
             return false;
 

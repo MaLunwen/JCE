@@ -6,6 +6,7 @@
  */
 
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_jobs.h>      /* parallel mip downsample */
 #include <jce/os/core/jce_profiler.h>
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/renderer/jce_renderer_caps.h>
@@ -222,11 +223,23 @@ JceTexture jce_texture_load(const JcePakArchive *pak, const char *asset_path)
     return jce_texture_load_ex(pak, asset_path, JCE_TEX_CLAMP);
 }
 
-static JceTexture jce_texture_load_ex_inner(const JcePakArchive *pak,
-                                             const char *asset_path,
-                                             int sampler_mode)
+/* CPU-side decode result (see jce_texture.h).  Holds EITHER a cooked
+ * payload (is_cooked: info + concatenated mip pixels) OR a raw RGBA8
+ * SDL_Surface.  Owns its buffers; upload_cpu/cpu_free release them. */
+struct JceTextureCpu {
+    int             sampler_mode;
+    bool            is_cooked;
+    JceAssetTexInfo info;          /* cooked */
+    void           *pixels;        /* cooked: owned TEX_PIXELS payload */
+    size_t          pixel_bytes;
+    SDL_Surface    *surface;       /* raw: owned RGBA8 surface */
+};
+
+JceTextureCpu *jce_texture_decode_cpu(const JcePakArchive *pak,
+                                      const char *asset_path,
+                                      int sampler_mode)
 {
-    if (!pak || !asset_path) return JCE_TEXTURE_INVALID;
+    if (!pak || !asset_path) return NULL;
 
     /* Extension whitelist — silently reject obvious non-image assets.
      * Some scenes accidentally point texture fields at .obj / .glb /
@@ -247,7 +260,7 @@ static JceTexture jce_texture_load_ex_inner(const JcePakArchive *pak,
             }
             if (!ok) {
                 LOG_DEBUG(LOG_TAG, "skipping non-image asset: %s", asset_path);
-                return JCE_TEXTURE_INVALID;
+                return NULL;
             }
         }
     }
@@ -256,27 +269,27 @@ static JceTexture jce_texture_load_ex_inner(const JcePakArchive *pak,
     if (!asset) {
         /* LOG_DEBUG instead of ERROR — PAK may still be loading or resource deferred. */
         LOG_DEBUG(LOG_TAG, "not found in PAK (may retry): %s", asset_path);
-        return JCE_TEXTURE_INVALID;
+        return NULL;
     }
 
     /* Decompress from PAK. */
     void *buf = JCE_MALLOC((size_t)asset->original_size);
-    if (!buf) return JCE_TEXTURE_INVALID;
+    if (!buf) return NULL;
 
     size_t n = jce_pak_decompress(asset, buf, (size_t)asset->original_size);
     if (n == 0) {
         LOG_ERROR(LOG_TAG, "decompression failed: %s", asset_path);
         JCE_FREE(buf);
-        return JCE_TEXTURE_INVALID;
+        return NULL;
     }
 
-    /* ── Cooked path: .jceasset → RGBA8 ── */
+    /* ── Cooked path: .jceasset ── */
     if (jce_asset_is_cooked(buf, n)) {
         JceAssetView view;
         if (!jce_asset_open(&view, buf, n)) {
             LOG_ERROR(LOG_TAG, "bad .jceasset: %s", asset_path);
             JCE_FREE(buf);
-            return JCE_TEXTURE_INVALID;
+            return NULL;
         }
 
         const JceAssetChunkEntry *info_chunk =
@@ -287,77 +300,53 @@ static JceTexture jce_texture_load_ex_inner(const JcePakArchive *pak,
         if (!info_chunk || !pixel_chunk) {
             LOG_ERROR(LOG_TAG, "missing TEX_INFO or TEX_PIXELS: %s", asset_path);
             JCE_FREE(buf);
-            return JCE_TEXTURE_INVALID;
+            return NULL;
         }
 
         /* Read texture info (info chunk may include mip offsets after the struct). */
         void *info_buf = JCE_MALLOC((size_t)info_chunk->original_size);
-        if (!info_buf) { JCE_FREE(buf); return JCE_TEXTURE_INVALID; }
+        if (!info_buf) { JCE_FREE(buf); return NULL; }
 
         if (jce_asset_chunk_data(&view, info_chunk,
                                   info_buf, (size_t)info_chunk->original_size) == 0) {
             JCE_FREE(info_buf);
             JCE_FREE(buf);
-            return JCE_TEXTURE_INVALID;
+            return NULL;
         }
 
         JceAssetTexInfo tex_info;
         memcpy(&tex_info, info_buf, sizeof(tex_info));
         JCE_FREE(info_buf);
 
-        /* Read RGBA8 pixel data. */
-        void *tex_data = JCE_MALLOC((size_t)pixel_chunk->original_size);
-        if (!tex_data) { JCE_FREE(buf); return JCE_TEXTURE_INVALID; }
+        /* Read pixel data (RGBA8 or block-compressed mip chain). */
+        size_t pixel_bytes = (size_t)pixel_chunk->original_size;
+        void *tex_data = JCE_MALLOC(pixel_bytes);
+        if (!tex_data) { JCE_FREE(buf); return NULL; }
 
         if (jce_asset_chunk_data(&view, pixel_chunk,
-                                  tex_data,
-                                  (size_t)pixel_chunk->original_size) == 0) {
+                                  tex_data, pixel_bytes) == 0) {
             JCE_FREE(tex_data);
             JCE_FREE(buf);
-            return JCE_TEXTURE_INVALID;
+            return NULL;
         }
-
-        /* IMPORTANT: cache the size before freeing buf — pixel_chunk
-         * points into buf, so reading it after free is UB. */
-        size_t pixel_bytes = (size_t)pixel_chunk->original_size;
         JCE_FREE(buf); /* PAK buffer no longer needed */
 
-        /* Upload to bgfx as RGBA8. */
-        const bgfx_memory_t *mem = bgfx_alloc((uint32_t)pixel_bytes);
-        memcpy(mem->data, tex_data, pixel_bytes);
-        JCE_FREE(tex_data);
-
-        bool has_mips = tex_info.mip_count > 1;
-
-        /* Map the cooked GPU format to bgfx (shared with the async finalize
-         * path). Block-compressed formats are uploaded as-is. */
-        bgfx_texture_format_t bgfx_fmt = texfmt_to_bgfx(tex_info.format);
-
-        bgfx_texture_handle_t handle = bgfx_create_texture_2d(
-            (uint16_t)tex_info.width, (uint16_t)tex_info.height,
-            has_mips, 1, bgfx_fmt,
-            BGFX_TEXTURE_NONE | sampler_flags(sampler_mode), mem);
-
-        if (handle.idx == UINT16_MAX)
-            return JCE_TEXTURE_INVALID;
-
-        registry_add(handle.idx, tex_info.width, tex_info.height);
-        JceTexture tex;
-        tex.idx = handle.idx;
-
-        if (jce_texture_valid(tex)) {
-            LOG_DEBUG(LOG_TAG, "loaded (cooked) %s [%ux%u, %u mips]",
-                      asset_path, tex_info.width, tex_info.height,
-                      tex_info.mip_count);
-        }
-        return tex;
+        JceTextureCpu *c = JCE_MALLOC(sizeof(*c));
+        if (!c) { JCE_FREE(tex_data); return NULL; }
+        memset(c, 0, sizeof(*c));
+        c->sampler_mode = sampler_mode;
+        c->is_cooked    = true;
+        c->info         = tex_info;
+        c->pixels       = tex_data;
+        c->pixel_bytes  = pixel_bytes;
+        return c;
     }
 
     /* ── Raw path: PNG/JPG → SDL3_image → RGBA8 ── */
     SDL_IOStream *io = SDL_IOFromConstMem(buf, (size_t)asset->original_size);
     if (!io) {
         JCE_FREE(buf);
-        return JCE_TEXTURE_INVALID;
+        return NULL;
     }
 
     SDL_Surface *surf = IMG_Load_IO(io, true);  /* true = auto-close io */
@@ -366,25 +355,72 @@ static JceTexture jce_texture_load_ex_inner(const JcePakArchive *pak,
     if (!surf) {
         LOG_ERROR(LOG_TAG, "IMG_Load_IO failed for %s: %s",
                   asset_path, SDL_GetError());
-        return JCE_TEXTURE_INVALID;
+        return NULL;
     }
 
-    /* Convert to RGBA8 and upload. */
     surf = ensure_rgba8(surf);
-    JceTexture tex = texture_from_surface_ex(surf, sampler_mode);
-    SDL_DestroySurface(surf);
+    if (!surf) return NULL;
 
-    if (jce_texture_valid(tex))
-        LOG_DEBUG(LOG_TAG, "loaded %s", asset_path);
+    JceTextureCpu *c = JCE_MALLOC(sizeof(*c));
+    if (!c) { SDL_DestroySurface(surf); return NULL; }
+    memset(c, 0, sizeof(*c));
+    c->sampler_mode = sampler_mode;
+    c->is_cooked    = false;
+    c->surface      = surf;
+    return c;
+}
 
+JceTextureCpu *jce_texture_decode_cpu_mem(const void *encoded, size_t size,
+                                          int sampler_mode)
+{
+    if (!encoded || size == 0) return NULL;
+    SDL_IOStream *io = SDL_IOFromConstMem(encoded, size);
+    if (!io) return NULL;
+    SDL_Surface *surf = IMG_Load_IO(io, true);   /* true = auto-close io */
+    if (!surf) return NULL;
+    surf = ensure_rgba8(surf);
+    if (!surf) return NULL;
+
+    JceTextureCpu *c = JCE_MALLOC(sizeof(*c));
+    if (!c) { SDL_DestroySurface(surf); return NULL; }
+    memset(c, 0, sizeof(*c));
+    c->sampler_mode = sampler_mode;
+    c->is_cooked    = false;
+    c->surface      = surf;
+    return c;
+}
+
+JceTexture jce_texture_upload_cpu(JceTextureCpu *c)
+{
+    if (!c) return JCE_TEXTURE_INVALID;
+    JceTexture tex = JCE_TEXTURE_INVALID;
+    if (c->is_cooked) {
+        tex = jce_texture_from_cooked(&c->info, c->pixels, c->pixel_bytes,
+                                      c->sampler_mode);
+    } else if (c->surface) {
+        tex = texture_from_surface_ex(c->surface, c->sampler_mode);
+    }
+    jce_texture_cpu_free(c);
     return tex;
+}
+
+void jce_texture_cpu_free(JceTextureCpu *c)
+{
+    if (!c) return;
+    if (c->pixels)  JCE_FREE(c->pixels);
+    if (c->surface) SDL_DestroySurface(c->surface);
+    JCE_FREE(c);
 }
 
 JceTexture jce_texture_load_ex(const JcePakArchive *pak, const char *asset_path,
                                 int sampler_mode)
 {
     JCE_PROFILE_ZONE_N("Texture::Load");
-    JceTexture result = jce_texture_load_ex_inner(pak, asset_path, sampler_mode);
+    /* Synchronous = decode (worker-safe) + upload (this thread). */
+    JceTextureCpu *c = jce_texture_decode_cpu(pak, asset_path, sampler_mode);
+    JceTexture result = jce_texture_upload_cpu(c);   /* frees c */
+    if (jce_texture_valid(result))
+        LOG_DEBUG(LOG_TAG, "loaded %s", asset_path);
     JCE_PROFILE_ZONE_END;
     return result;
 }
@@ -633,80 +669,113 @@ static uint8_t *downsample_rgba8(const uint8_t *src, uint32_t sw, uint32_t sh,
     return dst;
 }
 
-/* Apply a target top_mip to the GPU resource using cached source pixels.
- * Returns true if the bgfx handle was recreated (idx unchanged), false
- * otherwise.  The registry entry is updated to reflect new dimensions
- * and resident_top_mip regardless of GPU outcome. */
-static bool apply_top_mip(TexEntry *e, uint8_t target_top_mip)
+/* Record a residency change with no CPU/GPU work (used when there is no
+ * cached source to downsample from). */
+static void mip_bookkeep_only(TexEntry *e, uint8_t target_top_mip)
 {
-    if (target_top_mip == e->resident_top_mip) return false;
-
-    /* Compute target dimensions. */
-    uint32_t tw = e->base_width;
-    uint32_t th = e->base_height;
+    uint32_t tw = e->base_width, th = e->base_height;
     for (uint8_t i = 0; i < target_top_mip; i++) {
         tw = tw > 1 ? tw >> 1 : 1;
         th = th > 1 ? th >> 1 : 1;
     }
+    e->resident_top_mip = target_top_mip;
+    e->width  = tw;
+    e->height = th;
+}
 
-    if (!e->has_source_pixels || !e->source_pixels) {
-        /* No cached source — record residency change without GPU work.
-         * (Texture was registered via streaming API but pixels were not
-         *  captured at load time.  v1 limitation.) */
-        e->resident_top_mip = target_top_mip;
-        e->width  = tw;
-        e->height = th;
-        return false;
-    }
+/* CPU half (worker-safe — NO bgfx): box-filter the cached mip-0 down to
+ * `target`.  On success *out_px is the buffer to upload (+ dims); *out_owned
+ * is true when it must be freed after upload (false only at target 0, where
+ * it aliases e->source_pixels).  Returns false if no source is cached. */
+static bool mip_downsample_cpu(const TexEntry *e, uint8_t target,
+                               uint8_t **out_px, uint32_t *out_w,
+                               uint32_t *out_h, bool *out_owned)
+{
+    if (!e->has_source_pixels || !e->source_pixels) return false;
 
-    /* Box-filter from mip 0 down to target. */
-    uint32_t cw = e->base_width;
-    uint32_t ch = e->base_height;
+    uint32_t cw = e->base_width, ch = e->base_height;
     uint8_t *cur = e->source_pixels;
-    bool cur_owned = false;
-    for (uint8_t i = 0; i < target_top_mip; i++) {
+    bool owned = false;
+    for (uint8_t i = 0; i < target; i++) {
         uint32_t nw, nh;
         uint8_t *next = downsample_rgba8(cur, cw, ch, &nw, &nh);
-        if (cur_owned) JCE_FREE(cur);
-        if (!next) {
-            e->resident_top_mip = target_top_mip;
-            e->width  = tw;
-            e->height = th;
-            return false;
-        }
-        cur = next;
-        cur_owned = true;
-        cw = nw;
-        ch = nh;
+        if (owned) JCE_FREE(cur);
+        if (!next) return false;
+        cur = next; owned = true; cw = nw; ch = nh;
     }
+    *out_px = cur; *out_w = cw; *out_h = ch; *out_owned = owned;
+    return true;
+}
 
-    /* Destroy old handle and recreate at new size. */
+/* GPU half (render thread): recreate the texture from downsampled pixels,
+ * freeing `px` when `owned`.  Updates the registry entry.  Returns true if
+ * the bgfx handle was recreated. */
+static bool mip_upload_gpu(TexEntry *e, uint8_t *px, uint32_t w, uint32_t h,
+                           uint8_t target, bool owned)
+{
     bgfx_texture_handle_t old_h; old_h.idx = e->idx;
     bgfx_destroy_texture(old_h);
 
-    const bgfx_memory_t *mem = bgfx_alloc(cw * ch * 4u);
-    memcpy(mem->data, cur, (size_t)cw * ch * 4u);
-    if (cur_owned) JCE_FREE(cur);
+    const bgfx_memory_t *mem = bgfx_alloc(w * h * 4u);
+    memcpy(mem->data, px, (size_t)w * h * 4u);
+    if (owned) JCE_FREE(px);
 
     bgfx_texture_handle_t nh = bgfx_create_texture_2d(
-        (uint16_t)cw, (uint16_t)ch,
+        (uint16_t)w, (uint16_t)h,
         false, 1, BGFX_TEXTURE_FORMAT_RGBA8,
         BGFX_TEXTURE_NONE | sampler_flags(e->sampler_mode),
         mem);
 
     if (nh.idx == UINT16_MAX) {
         LOG_WARN(LOG_TAG,
-            "mip drop reupload failed for tex idx=%u (%ux%u -> %ux%u)",
-            e->idx, e->base_width, e->base_height, cw, ch);
+            "mip drop reupload failed for tex idx=%u (-> %ux%u)",
+            e->idx, w, h);
         return false;
     }
 
     /* bgfx may hand back a different idx — reflect that in registry. */
     e->idx              = nh.idx;
-    e->width            = cw;
-    e->height           = ch;
-    e->resident_top_mip = target_top_mip;
+    e->width            = w;
+    e->height           = h;
+    e->resident_top_mip = target;
     return true;
+}
+
+/* Apply a target top_mip to the GPU resource using cached source pixels.
+ * Synchronous (downsample + upload on the calling thread).  Used by the
+ * per-texture streaming entry points. */
+static bool apply_top_mip(TexEntry *e, uint8_t target_top_mip)
+{
+    if (target_top_mip == e->resident_top_mip) return false;
+
+    uint8_t *px = NULL; uint32_t w = 0, h = 0; bool owned = false;
+    if (!mip_downsample_cpu(e, target_top_mip, &px, &w, &h, &owned)) {
+        mip_bookkeep_only(e, target_top_mip);
+        return false;
+    }
+    return mip_upload_gpu(e, px, w, h, target_top_mip, owned);
+}
+
+/* ── Parallel global-bias recompute ───────────────────────────────── */
+
+typedef struct {
+    TexEntry *e;
+    uint8_t   target;
+    uint8_t  *pixels;   /* downsampled (worker) */
+    uint32_t  w, h;
+    bool      owned;
+    bool      ok;
+} MipRecompute;
+
+/* Worker: downsample entries [begin,end) (pure CPU, disjoint writes). */
+static void mip_downsample_range(int begin, int end, void *user)
+{
+    MipRecompute *list = (MipRecompute *)user;
+    for (int i = begin; i < end; i++) {
+        MipRecompute *m = &list[i];
+        m->ok = mip_downsample_cpu(m->e, m->target,
+                                   &m->pixels, &m->w, &m->h, &m->owned);
+    }
 }
 
 /* Ensure a streaming-tracked entry has its CPU mip-0 cached so future
@@ -765,14 +834,55 @@ void jce_texture_set_global_mip_bias(int8_t bias)
     s_global_mip_bias     = clamp_bias(bias);
     s_global_mip_bias_set = true;
 
-    /* Apply to all streaming-tracked textures.  Untracked textures stay
-     * at full residency to preserve the current behaviour for code that
-     * never opted in. */
+    /* A global bias change can recompute many textures at once, and the
+     * box-filter downsample is the bulk of that work.  Build the change
+     * list, downsample the CPU pixels in parallel (no bgfx), then recreate
+     * the GPU textures serially on this (render) thread.  Untracked
+     * textures stay at full residency (preserves opt-in behaviour). */
+    MipRecompute *list =
+        (MipRecompute *)JCE_MALLOC((size_t)(s_count > 0 ? s_count : 1) *
+                                   sizeof(MipRecompute));
+    if (!list) {
+        /* OOM: fall back to the per-entry synchronous path. */
+        for (int i = 0; i < s_count; i++) {
+            TexEntry *e = &s_registry[i];
+            if (e->streaming_tracked) apply_top_mip(e, effective_top_mip(e));
+        }
+        return;
+    }
+
+    int n = 0;
     for (int i = 0; i < s_count; i++) {
         TexEntry *e = &s_registry[i];
         if (!e->streaming_tracked) continue;
-        apply_top_mip(e, effective_top_mip(e));
+        uint8_t target = effective_top_mip(e);
+        if (target == e->resident_top_mip) continue;
+        if (!e->has_source_pixels || !e->source_pixels) {
+            mip_bookkeep_only(e, target);   /* no pixels → no GPU/CPU work */
+            continue;
+        }
+        list[n].e = e; list[n].target = target;
+        list[n].pixels = NULL; list[n].ok = false;
+        n++;
     }
+    if (n == 0) { JCE_FREE(list); return; }
+
+    /* Pass A: parallel CPU downsample (worker-safe, disjoint per-index). */
+    JceJobSystem *jobs = jce_jobs_default();
+    if (jobs && n >= 4)
+        jce_jobs_parallel_for(jobs, n, 0, mip_downsample_range, list);
+    else
+        mip_downsample_range(0, n, list);
+
+    /* Pass B: serial GPU recreate on this (render) thread. */
+    for (int i = 0; i < n; i++) {
+        MipRecompute *m = &list[i];
+        if (m->ok)
+            mip_upload_gpu(m->e, m->pixels, m->w, m->h, m->target, m->owned);
+        else
+            mip_bookkeep_only(m->e, m->target);
+    }
+    JCE_FREE(list);
 }
 
 int8_t jce_texture_get_global_mip_bias(void)

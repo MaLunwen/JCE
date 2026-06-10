@@ -7,6 +7,8 @@
 
 #include "jce_memory.h"
 
+#include <SDL3/SDL_cpuinfo.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -225,4 +227,34 @@ jce_jobs_parallel_for(JceJobSystem *s, int count, int chunk,
     jce_jobs_group_wait(g);
     jce_jobs_group_destroy(g);
     JCE_FREE(chunks);
+}
+
+/* ---- Process-wide shared job system (main-thread lazy init) ---- */
+
+static JceJobSystem *g_default_jobs       = NULL;
+static int           g_default_jobs_tried = 0;
+
+JCE_API JceJobSystem *JCE_CALL
+jce_jobs_default(void)
+{
+    if (g_default_jobs || g_default_jobs_tried) return g_default_jobs;
+    g_default_jobs_tried = 1;   /* don't retry creation every frame */
+
+    int cores   = SDL_GetNumLogicalCPUCores();
+    int workers  = cores - 1;   /* leave a core for the main thread */
+    if (workers < 1) workers = 1;
+    if (workers > 8) workers = 8;   /* our per-frame loops saturate well under this */
+
+    g_default_jobs = jce_jobs_create(workers);
+    return g_default_jobs;
+}
+
+JCE_API void JCE_CALL
+jce_jobs_shutdown_default(void)
+{
+    if (g_default_jobs) {
+        jce_jobs_destroy(g_default_jobs);
+        g_default_jobs = NULL;
+    }
+    g_default_jobs_tried = 0;
 }

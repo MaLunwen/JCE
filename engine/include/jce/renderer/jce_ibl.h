@@ -65,6 +65,32 @@ JCE_API JceIblData *jce_ibl_generate_from_pixels(const float *pixels,
 JCE_API void jce_ibl_destroy(JceIblData *ibl);
 
 /*
+ * Asynchronous IBL: split the expensive CPU convolution from the GPU upload so
+ * the bake can run on a worker thread while the main thread stays responsive.
+ *
+ *   1. jce_ibl_bake_cpu()   — worker thread: cache-load OR CPU-convolve the
+ *                             irradiance + prefilter cubemaps into a CPU buffer.
+ *                             Touches NO bgfx state, so it is safe off-thread.
+ *   2. jce_ibl_upload_cpu() — MAIN/render thread: upload that CPU buffer to GPU
+ *                             cubemaps, returning a JceIblData. Consumes (frees)
+ *                             the JceIblCpuData on both success and failure.
+ *   jce_ibl_cpu_free()      — discard a CPU bake without uploading (stale bake).
+ *
+ * jce_ibl_generate_from_pixels() above is the synchronous convenience wrapper
+ * (bake_cpu + upload_cpu on the calling thread).
+ */
+typedef struct JceIblCpuData JceIblCpuData;
+
+JCE_API JceIblCpuData *jce_ibl_bake_cpu(const float *pixels,
+                                        uint32_t width, uint32_t height,
+                                        uint32_t irradiance_size,
+                                        uint32_t prefilter_size);
+
+JCE_API JceIblData *jce_ibl_upload_cpu(JceIblCpuData *cpu);
+
+JCE_API void jce_ibl_cpu_free(JceIblCpuData *cpu);
+
+/*
  * Number of mip levels in the prefiltered specular cubemap. The shader's
  * max prefilter mip level is (count - 1). Returns 0 for a NULL/invalid ibl.
  */

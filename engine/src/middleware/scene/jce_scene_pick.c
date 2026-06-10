@@ -6,6 +6,7 @@
 #include <jce/middleware/scene/jce_terrain.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
+#include <jce/os/core/jce_profiler.h>
 #include <jce/os/core/jce_str.h>
 #include <jce/renderer/jce_camera.h>
 #include <jce/renderer/jce_mesh.h>
@@ -59,7 +60,6 @@ struct JceScenePickPass {
     bgfx_texture_handle_t      readback_tex;
     uint32_t           width;
     uint32_t           height;
-    bool               rendered;
 
     bgfx_program_handle_t prog_mesh;
     bgfx_program_handle_t prog_pbr;
@@ -80,8 +80,11 @@ struct JceScenePickPass {
     uint32_t           ready_frame;
     uint32_t           request_x;
     uint32_t           request_y;
-    bool               pending;
+    bool               pending;      /* readback in flight (blit issued)      */
+    bool               want_render;  /* deferred click awaiting an ID render  */
+    bool               failed;       /* request dropped; poll resolves a miss */
     bool               warned_full;
+    bool               warned_model_full;
     bool               warned_caps;
     bool               warned_target_alloc;
 };
@@ -112,7 +115,6 @@ static void pick_invalidate_target(JceScenePickPass *pass)
     pass->depth.idx = UINT16_MAX;
     pass->width = 0;
     pass->height = 0;
-    pass->rendered = false;
 }
 
 static bool pick_ensure_target(JceScenePickPass *pass,
@@ -271,18 +273,24 @@ JceScenePickPass *jce_scene_pick_create(const JceScenePickDesc *desc)
     pass->prog_skinned.idx = UINT16_MAX;
     pass->u_pick_id.idx = UINT16_MAX;
 
+    /* Dedicated pick programs (engine/shaders/pbr/{vs_pick,vs_pick_skinned,
+     * fs_pick}.sc). They use an EMPTY varying interface so a single fs_pick
+     * links with both the static and skinned pick vertex shaders — bgfx
+     * requires the VS-output and FS-input varying sets to match exactly, which
+     * the old (vs_pbr + standard fs_pick_id) pairing could not satisfy. Static
+     * geometry uses prog_mesh; prog_pbr aliases it (model static parts); skinned
+     * parts use prog_skinned. */
     pass->prog_mesh = (bgfx_program_handle_t)
-        { shader_load_program_named(desc->pak, "mesh", "pick_id").idx };
-    pass->prog_pbr = (bgfx_program_handle_t)
-        { shader_load_program_named(desc->pak, "pbr", "pick_id").idx };
+        { shader_load_program_named(desc->pak, "pick", "pick").idx };
     pass->prog_skinned = (bgfx_program_handle_t)
-        { shader_load_program_named(desc->pak, "pbr_skinned", "pick_id").idx };
+        { shader_load_program_named(desc->pak, "pick_skinned", "pick").idx };
+    /* prog_pbr aliases prog_mesh (same static pick program) — NOT a second
+     * load, so it is not destroyed twice in jce_scene_pick_destroy. */
+    pass->prog_pbr = pass->prog_mesh;
     if (!BGFX_HANDLE_IS_VALID(pass->prog_mesh))
-        LOG_WARN(LOG_TAG, "mesh/pick_id shader unavailable");
-    if (!BGFX_HANDLE_IS_VALID(pass->prog_pbr))
-        LOG_WARN(LOG_TAG, "pbr/pick_id shader unavailable");
+        LOG_WARN(LOG_TAG, "pick/pick shader unavailable");
     if (!BGFX_HANDLE_IS_VALID(pass->prog_skinned))
-        LOG_WARN(LOG_TAG, "pbr_skinned/pick_id shader unavailable");
+        LOG_WARN(LOG_TAG, "pick_skinned/pick shader unavailable");
 
     pass->u_pick_id = bgfx_create_uniform("u_pickId",
                                           BGFX_UNIFORM_TYPE_VEC4,
@@ -308,8 +316,7 @@ void jce_scene_pick_destroy(JceScenePickPass *pass)
         bgfx_destroy_texture(pass->readback_tex);
     if (BGFX_HANDLE_IS_VALID(pass->prog_mesh))
         bgfx_destroy_program(pass->prog_mesh);
-    if (BGFX_HANDLE_IS_VALID(pass->prog_pbr))
-        bgfx_destroy_program(pass->prog_pbr);
+    /* prog_pbr aliases prog_mesh (see create) — do not destroy it twice. */
     if (BGFX_HANDLE_IS_VALID(pass->prog_skinned))
         bgfx_destroy_program(pass->prog_skinned);
     if (BGFX_HANDLE_IS_VALID(pass->u_pick_id))
@@ -497,9 +504,20 @@ static JceModel *pick_resolve_model(JceScenePickPass *pass,
     if (!pass || !path || !path[0])
         return NULL;
 
-    if (pass->has_cbs && pass->cbs.load_model)
-        return pass->cbs.load_model(path, pass->cbs.userdata);
-
+    /* Resolve through the bounded model_cache REGARDLESS of whether a load
+     * callback is installed. Returning pass->cbs.load_model() raw (the old
+     * behavior) leaked catastrophically: jce_scene_pick_render used to run
+     * every frame over all entities, so each skeletal-animator entity
+     * re-invoked the UNCACHED editor callback (ed_load_model_cb ->
+     * jce_model_load_gltf_memory) every frame, allocating a brand-new
+     * JceModel — its vertex buffers and material textures — that was never
+     * destroyed. That drove the bgfx texture/vertex-buffer handle pools
+     * toward their 4096 cap and the process commit past available VRAM,
+     * ending in an access violation. The render is on-demand now (once per
+     * click request), but the cache stays essential: without it every CLICK
+     * would still re-load and leak every skeletal model. The callback result
+     * is owned by this cache and freed exactly once in
+     * pick_destroy_model_cache, identical to the jce_model_load_gltf path. */
     int slot = -1;
     int free_slot = -1;
     for (int i = 0; i < PICK_MODEL_MAX; i++) {
@@ -519,9 +537,17 @@ static JceModel *pick_resolve_model(JceScenePickPass *pass,
         memset(entry, 0, sizeof(*entry));
         jce_strlcpy(entry->path, path, sizeof(entry->path));
         entry->used = true;
-        entry->model = jce_model_load_gltf(pass->pak, path);
+        if (pass->has_cbs && pass->cbs.load_model)
+            entry->model = pass->cbs.load_model(path, pass->cbs.userdata);
+        else
+            entry->model = jce_model_load_gltf(pass->pak, path);
         if (!entry->model)
             entry->failed = true;
+    } else if (slot < 0 && !pass->warned_model_full) {
+        LOG_WARN(LOG_TAG,
+                 "pick model cache full (%d slots); extra skeletal models "
+                 "are unpickable", PICK_MODEL_MAX);
+        pass->warned_model_full = true;
     }
 
     if (slot < 0)
@@ -589,8 +615,40 @@ bool jce_scene_pick_render(JceScenePickPass *pass,
     if (!BGFX_HANDLE_IS_VALID(pass->prog_mesh) ||
         !BGFX_HANDLE_IS_VALID(pass->u_pick_id))
         return false;
-    if (!pick_ensure_target(pass, width, height))
+
+    /* On-demand gate. A full-scene ID render is only ever observable through
+       the 1x1 readback of a click request, yet it costs a complete entity
+       traversal, a world-matrix cache invalidation + recompute, and a
+       full-resolution draw of every pickable mesh/terrain/skinned model —
+       per frame, on top of the main render. So render exactly once per
+       recorded request: callers keep invoking this every frame, and idle
+       frames exit here for the cost of a flag test. */
+    if (!pass->want_render)
         return false;
+
+    JCE_PROFILE_ZONE_N("ScenePick::Render");
+
+    if (!pick_ensure_target(pass, width, height) ||
+        !pick_ensure_readback_texture(pass)) {
+        /* This request cannot be serviced (caps/alloc failure). Drop it as a
+           miss so the caller's poll loop terminates instead of spinning. */
+        pass->want_render = false;
+        pass->failed = true;
+        JCE_PROFILE_ZONE_END;
+        return false;
+    }
+
+    if (pass->readback_size < 4u) {
+        uint8_t *grown = (uint8_t *)JCE_REALLOC(pass->readback, 4u);
+        if (!grown) {
+            pass->want_render = false;
+            pass->failed = true;
+            JCE_PROFILE_ZONE_END;
+            return false;
+        }
+        pass->readback = grown;
+        pass->readback_size = 4u;
+    }
 
     /* Fresh world-matrix cache generation for the pick pass so picking reads
        transforms as they are now (the pick pass may be invoked independently
@@ -681,50 +739,76 @@ bool jce_scene_pick_render(JceScenePickPass *pass,
                                 double_sided);
     }
 
-    pass->rendered = true;
+    /* Service the deferred request against THIS render. The blit on
+       readback_view_id (= view_id + 1) executes after the pick view within
+       the same bgfx frame, so the read pixel and the snapshotted ID map are
+       always consistent. Coordinates are clamped here because the viewport
+       may have resized between the click and this service frame. */
+    uint32_t rx = pass->request_x;
+    uint32_t ry = pass->request_y;
+    if (rx >= pass->width)  rx = pass->width - 1u;
+    if (ry >= pass->height) ry = pass->height - 1u;
+    pass->request_x = rx;
+    pass->request_y = ry;
+
+    memcpy(pass->pending_map, pass->current_map,
+           sizeof(pass->current_map[0]) * pass->current_count);
+    pass->pending_count = pass->current_count;
+
+    bgfx_blit(pass->readback_view_id,
+              pass->readback_tex, 0, 0, 0, 0,
+              pass->color, 0, (uint16_t)rx, (uint16_t)ry, 0,
+              1, 1, 1);
+    pass->ready_frame = bgfx_read_texture(pass->readback_tex,
+                                          pass->readback, 0);
+    pass->pending = true;
+    pass->want_render = false;
+
+    JCE_PROFILE_ZONE_END;
     return true;
 }
 
 bool jce_scene_pick_request(JceScenePickPass *pass, uint32_t x, uint32_t y)
 {
-    if (!pass || pass->pending || !pass->rendered)
+    if (!pass || pass->pending || pass->want_render)
         return false;
     if (!jce_scene_pick_supported())
         return false;
-    if (!BGFX_HANDLE_IS_VALID(pass->color) || x >= pass->width || y >= pass->height)
-        return false;
-    if (!pick_ensure_readback_texture(pass))
+    /* Without pick programs the request could never be serviced — refuse
+       here so the caller can fall back to CPU ray picking immediately. */
+    if (!BGFX_HANDLE_IS_VALID(pass->prog_mesh) ||
+        !BGFX_HANDLE_IS_VALID(pass->u_pick_id))
         return false;
 
-    size_t bytes = 4u;
-    if (pass->readback_size < bytes) {
-        uint8_t *grown = (uint8_t *)JCE_REALLOC(pass->readback, bytes);
-        if (!grown)
-            return false;
-        pass->readback = grown;
-        pass->readback_size = bytes;
-    }
-
-    memcpy(pass->pending_map, pass->current_map,
-           sizeof(pass->current_map[0]) * pass->current_count);
-    pass->pending_count = pass->current_count;
+    /* Deferred: only record the click. The next jce_scene_pick_render call
+       services it (ID render + blit + readback in one frame) — see the
+       on-demand gate there. Coordinates are validated at service time
+       against that frame's target extent, not here. */
     pass->request_x = x;
     pass->request_y = y;
-
-    bgfx_blit(pass->readback_view_id,
-              pass->readback_tex, 0, 0, 0, 0,
-              pass->color, 0, (uint16_t)x, (uint16_t)y, 0,
-              1, 1, 1);
-    pass->ready_frame = bgfx_read_texture(pass->readback_tex,
-                                          pass->readback, 0);
-    pass->pending = true;
+    pass->want_render = true;
     return true;
 }
 
 bool jce_scene_pick_poll(JceScenePickPass *pass,
                          JceScenePickResult *out_result)
 {
-    if (!pass || !pass->pending || !out_result)
+    if (!pass || !out_result)
+        return false;
+
+    /* A request that could not be serviced resolves as a miss (entity 0) so
+       the caller's pending state terminates instead of polling forever. */
+    if (pass->failed) {
+        pass->failed = false;
+        memset(out_result, 0, sizeof(*out_result));
+        out_result->x = pass->request_x;
+        out_result->y = pass->request_y;
+        out_result->frame_index =
+            jce_renderer_get_frame_index(pass->renderer);
+        return true;
+    }
+
+    if (!pass->pending)
         return false;
 
     uint32_t frame = jce_renderer_get_frame_index(pass->renderer);

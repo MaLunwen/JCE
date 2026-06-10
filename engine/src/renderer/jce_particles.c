@@ -7,6 +7,7 @@
  */
 
 #include <jce/os/core/jce_json.h>
+#include <jce/os/core/jce_jobs.h>      /* parallel emitter update */
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/renderer/jce_particles.h>
@@ -42,6 +43,7 @@ typedef struct {
     uint32_t                alive_count;
 
     float                   emit_accumulator;
+    uint32_t                rng_state;   /* per-emitter xorshift32 (parallel-safe) */
 } Emitter;
 
 /* ── System ────────────────────────────────────────────────────────── */
@@ -131,6 +133,11 @@ JceEmitterHandle jce_particles_emitter_add(JceParticleSystem *sys,
             memset(em->pool, 0, sizeof(Particle) * cap);
             em->desc.max_particles = cap;
 
+            /* Distinct per-emitter seed (never 0 — xorshift32 stalls on 0)
+             * so each emitter's randomness is independent → parallel-safe. */
+            em->rng_state = ((uint32_t)i + 1u) * 2654435761u ^ 0x9E3779B9u;
+            if (em->rng_state == 0u) em->rng_state = 0xDEADBEEFu;
+
             sys->emitter_count++;
             return (JceEmitterHandle){ i };
         }
@@ -208,7 +215,7 @@ void jce_particles_emitter_burst(JceParticleSystem *sys,
     if (!em->alive) return;
 
     for (uint32_t i = 0; i < count; i++) {
-        spawn_particle(em, &sys->rng_state);
+        spawn_particle(em, &em->rng_state);
     }
 }
 
@@ -265,13 +272,27 @@ static void update_emitter(Emitter *em, float dt, uint32_t *rng)
     }
 }
 
+/* Parallel emitter update.  Each emitter owns its pool + RNG, so emitters
+ * are independent and safe to step concurrently (disjoint writes). */
+typedef struct { Emitter *emitters; float dt; } PUpdateCtx;
+
+static void particles_update_range(int begin, int end, void *user)
+{
+    PUpdateCtx *c = (PUpdateCtx *)user;
+    for (int i = begin; i < end; i++)
+        update_emitter(&c->emitters[i], c->dt, &c->emitters[i].rng_state);
+}
+
 void jce_particles_update(JceParticleSystem *sys, float dt)
 {
     if (!sys) return;
     JCE_PROFILE_ZONE_N("Particles::Update");
-    for (uint32_t i = 0; i < MAX_EMITTERS; i++) {
-        update_emitter(&sys->emitters[i], dt, &sys->rng_state);
-    }
+    PUpdateCtx ctx = { sys->emitters, dt };
+    JceJobSystem *jobs = jce_jobs_default();
+    if (jobs)
+        jce_jobs_parallel_for(jobs, MAX_EMITTERS, 0, particles_update_range, &ctx);
+    else
+        particles_update_range(0, MAX_EMITTERS, &ctx);
     JCE_PROFILE_ZONE_END;
 }
 

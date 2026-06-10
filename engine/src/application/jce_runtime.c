@@ -55,6 +55,7 @@
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/os/core/jce_fixed_clock.h>
+#include <jce/os/core/jce_thread.h>   /* async audio-source decode */
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -161,6 +162,25 @@ struct BtEntry {
 	bool             active;
 };
 
+/* Worker args for an async audio-source decode.  Heap-allocated and owned
+ * by the worker for its full run, so it stays valid even if the pending
+ * array reallocates (slot pointers must NOT be handed to the worker). */
+typedef struct {
+	const JcePakArchive *pak;
+	char                 path[256];
+	JceAudioCpu         *cpu;    /* worker writes */
+	JceAtomicI32        *done;   /* 0 working, 1 finished */
+} RtAudioDecodeArgs;
+
+/* In-flight async decode of a play_on_awake audio source.  The worker
+ * decodes the clip to CPU PCM; jce_runtime_step uploads + plays it (the
+ * sound starts a frame or two late instead of stalling scene load). */
+typedef struct {
+	JceEntity          entity;
+	JceThread         *thr;
+	RtAudioDecodeArgs *args;   /* stable heap; holds done + cpu */
+} RtPendingAudio;
+
 struct JceRuntime {
 	JceScene        *scene;       /* not owned */
 	JcePakArchive   *pak;         /* not owned */
@@ -195,6 +215,11 @@ struct JceRuntime {
 	VoiceEntry      *voices;
 	int              voice_count;
 	int              voice_cap;
+
+	/* Pending async audio-source decodes (play_on_awake). */
+	RtPendingAudio  *pending_audio;
+	int              pending_audio_count;
+	int              pending_audio_cap;
 
 	/* Smoothed per-source occlusion state.  Created lazily on first 3D
 	 * audio update when both physics and spatial voices exist; keyed by
@@ -954,6 +979,140 @@ static void rt_spawn_body2d(JceRuntime *rt, JceScene *scene,
 	rt->body2d_count++;
 }
 
+/* Play a resolved sound for an audio source + track its voice.  Shared by
+ * the synchronous (callback) path and the async upload path. */
+static void rt_finish_audio_source(JceRuntime *rt, JceScene *scene,
+                                   JceEntity e, JceSound snd,
+                                   const JceAudioSourceComponent *as)
+{
+    if (snd == JCE_SOUND_INVALID || !as) return;
+
+    float vol   = as->volume > 0.0f ? as->volume : 1.0f;
+    float pitch = as->pitch  > 0.0f ? as->pitch  : 1.0f;
+    JceVoice v = jce_audio_play(rt->audio, snd, as->loop, vol, pitch);
+    bool spatial = (as->spatial_blend > 0.5f);
+    if (spatial) {
+        jce_audio_voice_set_3d(rt->audio, v, true);
+        jce_vec3 wp = rt_world_position(scene, e);
+        jce_audio_voice_set_position(rt->audio, v, wp.x, wp.y, wp.z);
+        jce_audio_voice_set_attenuation(rt->audio, v,
+                                        JCE_AUDIO_ATTEN_INVERSE,
+                                        1.0f, 25.0f, 1.0f);
+    } else {
+        jce_audio_voice_set_3d(rt->audio, v, false);
+    }
+    const char *bus = rt_bus_for_source(rt, as, spatial);
+    if (bus) jce_audio_voice_set_bus(rt->audio, v, bus);
+
+    if (rt->voice_count >= rt->voice_cap && !rt_grow_voices(rt))
+        return;
+    rt->voices[rt->voice_count].entity      = e;
+    rt->voices[rt->voice_count].sound       = snd;
+    rt->voices[rt->voice_count].voice       = v;
+    rt->voices[rt->voice_count].spatial     = spatial;
+    rt->voices[rt->voice_count].base_volume = vol;
+    rt->voices[rt->voice_count].bus[0]      = '\0';
+    if (bus) {
+        size_t bl = strlen(bus);
+        if (bl >= sizeof(rt->voices[rt->voice_count].bus))
+            bl = sizeof(rt->voices[rt->voice_count].bus) - 1;
+        memcpy(rt->voices[rt->voice_count].bus, bus, bl);
+        rt->voices[rt->voice_count].bus[bl] = '\0';
+    }
+    rt->voice_count++;
+}
+
+/* WORKER: decode a play_on_awake clip to CPU PCM (PAK + miniaudio). */
+static void rt_audio_decode_run(void *arg)
+{
+    RtAudioDecodeArgs *a = (RtAudioDecodeArgs *)arg;
+    a->cpu = jce_audio_decode_cpu(a->pak, a->path);
+    jce_atomic_i32_store(a->done, 1);
+}
+
+static bool rt_grow_pending_audio(JceRuntime *rt)
+{
+    int new_cap = rt->pending_audio_cap ? rt->pending_audio_cap * 2 : 8;
+    RtPendingAudio *grown = (RtPendingAudio *)jce_realloc(
+        rt->pending_audio, (size_t)new_cap * sizeof(RtPendingAudio));
+    if (!grown) return false;
+    rt->pending_audio     = grown;
+    rt->pending_audio_cap = new_cap;
+    return true;
+}
+
+/* Kick an async decode of `as->clip_path` for entity `e` (default loader
+ * path only).  The worker owns `args` (stable heap) for its full run; the
+ * pending slot only references it, so the slot array may realloc freely. */
+static void rt_spawn_audio_async(JceRuntime *rt, JceEntity e,
+                                 const JceAudioSourceComponent *as)
+{
+    if (rt->pending_audio_count >= rt->pending_audio_cap &&
+        !rt_grow_pending_audio(rt)) {
+        /* Out of queue memory — fall back to a synchronous load. */
+        JceSound snd = jce_audio_load(rt->audio, rt->pak, as->clip_path);
+        rt_finish_audio_source(rt, rt->scene, e, snd, as);
+        return;
+    }
+
+    RtAudioDecodeArgs *args = (RtAudioDecodeArgs *)jce_malloc(sizeof(*args));
+    if (!args) return;
+    args->pak = rt->pak;
+    snprintf(args->path, sizeof(args->path), "%s", as->clip_path);
+    args->cpu  = NULL;
+    args->done = jce_atomic_i32_create(0);
+
+    JceThread *thr = jce_thread_create(rt_audio_decode_run, args, "jce_rt_audio");
+    if (!thr) {
+        /* No worker thread: decode + play inline, then drop the job. */
+        rt_audio_decode_run(args);
+        JceSound snd = jce_audio_upload_cpu(rt->audio, args->cpu);
+        rt_finish_audio_source(rt, rt->scene, e, snd, as);
+        if (args->done) jce_atomic_i32_destroy(args->done);
+        jce_free(args);
+        return;
+    }
+
+    RtPendingAudio *p = &rt->pending_audio[rt->pending_audio_count++];
+    p->entity = e;
+    p->thr    = thr;
+    p->args   = args;
+}
+
+/* MAIN thread, per-frame: upload + play any finished async audio decodes. */
+static void rt_audio_poll(JceRuntime *rt)
+{
+    if (!rt || rt->pending_audio_count == 0) return;
+    int w = 0;
+    for (int i = 0; i < rt->pending_audio_count; ++i) {
+        RtPendingAudio *p = &rt->pending_audio[i];
+        if (!p->args || jce_atomic_i32_load(p->args->done) == 0) {
+            rt->pending_audio[w++] = *p;   /* keep (still running) */
+            continue;
+        }
+        if (p->thr) { jce_thread_join(p->thr); p->thr = NULL; }
+
+        /* Re-fetch the component at play time (the entity may have moved /
+         * been disabled in the 1-2 frames since spawn). */
+        JceAudioSourceComponent *as =
+            jce_scene_get_audio_source(rt->scene, p->entity);
+        if (as &&
+            jce_scene_component_enabled(rt->scene, p->entity,
+                                        JCE_COMP_FLAG_AUDIO_SOURCE)) {
+            JceSound snd = jce_audio_upload_cpu(rt->audio, p->args->cpu);
+            p->args->cpu = NULL;   /* consumed by upload */
+            rt_finish_audio_source(rt, rt->scene, p->entity, snd, as);
+        } else {
+            jce_audio_cpu_free(p->args->cpu);   /* source gone — drop it */
+            p->args->cpu = NULL;
+        }
+        jce_atomic_i32_destroy(p->args->done);
+        jce_free(p->args);
+        /* slot dropped (not copied to w) */
+    }
+    rt->pending_audio_count = w;
+}
+
 static void rt_spawn_entity(JceScene *scene, JceEntity e, void *ud)
 {
 	JceRuntime *rt = (JceRuntime *)ud;
@@ -1093,48 +1252,20 @@ try_audio:
 		JceAudioSourceComponent *as = jce_scene_get_audio_source(scene, e);
 		if (as && as->play_on_awake && as->clip_path[0] &&
 		    jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_AUDIO_SOURCE)) {
-			JceSound snd = rt->audio_load_fn
-			               ? rt->audio_load_fn(rt->user_data, rt->audio, as->clip_path)
-			               : jce_audio_load(rt->audio, rt->pak, as->clip_path);
-			if (snd != JCE_SOUND_INVALID) {
-				float vol   = as->volume > 0.0f ? as->volume : 1.0f;
-				float pitch = as->pitch  > 0.0f ? as->pitch  : 1.0f;
-				JceVoice v = jce_audio_play(rt->audio, snd, as->loop, vol, pitch);
-				bool spatial = (as->spatial_blend > 0.5f);
-				if (spatial) {
-					jce_audio_voice_set_3d(rt->audio, v, true);
-					jce_vec3 wp = rt_world_position(scene, e);
-					jce_audio_voice_set_position(rt->audio, v, wp.x, wp.y, wp.z);
-					jce_audio_voice_set_attenuation(rt->audio, v,
-					                                JCE_AUDIO_ATTEN_INVERSE,
-					                                1.0f, 25.0f, 1.0f);
-				} else {
-					jce_audio_voice_set_3d(rt->audio, v, false);
-				}
-				/* Route this voice to its mixer bus so the Music/SFX/
-				 * Voice sliders attenuate it (no-op if no bus matched). */
-				const char *bus = rt_bus_for_source(rt, as, spatial);
-				if (bus) jce_audio_voice_set_bus(rt->audio, v, bus);
-
-				if (rt->voice_count >= rt->voice_cap && !rt_grow_voices(rt))
-					return;
-				rt->voices[rt->voice_count].entity      = e;
-				rt->voices[rt->voice_count].sound       = snd;
-				rt->voices[rt->voice_count].voice       = v;
-				rt->voices[rt->voice_count].spatial     = spatial;
-				rt->voices[rt->voice_count].base_volume = vol;
-				rt->voices[rt->voice_count].bus[0]      = '\0';
-				if (bus) {
-					size_t bl = strlen(bus);
-					if (bl >= sizeof(rt->voices[rt->voice_count].bus))
-						bl = sizeof(rt->voices[rt->voice_count].bus) - 1;
-					memcpy(rt->voices[rt->voice_count].bus, bus, bl);
-					rt->voices[rt->voice_count].bus[bl] = '\0';
-				}
-				rt->voice_count++;
+			if (rt->audio_load_fn) {
+				/* Custom loader hook (editor): keep the synchronous handoff. */
+				JceSound snd = rt->audio_load_fn(rt->user_data, rt->audio,
+				                                 as->clip_path);
+				if (snd != JCE_SOUND_INVALID)
+					rt_finish_audio_source(rt, scene, e, snd, as);
+				else
+					jce_log_write(JCE_LOG_LEVEL_WARN, LOG_TAG, __FILE__, __LINE__,
+					              "audio_source: failed to load '%s'", as->clip_path);
 			} else {
-				jce_log_write(JCE_LOG_LEVEL_WARN, LOG_TAG, __FILE__, __LINE__,
-				              "audio_source: failed to load '%s'", as->clip_path);
+				/* Default PAK loader: decode off-thread so a scene full of
+				 * play_on_awake clips doesn't stall scene-load.  The sound
+				 * starts a frame or two late (rt_audio_poll plays it). */
+				rt_spawn_audio_async(rt, e, as);
 			}
 		}
 	}
@@ -2378,6 +2509,20 @@ JCE_API void JCE_CALL jce_runtime_destroy(JceRuntime *rt)
 {
 	if (!rt) return;
 
+	/* Join any in-flight async audio decodes and drop their results. */
+	for (int i = 0; i < rt->pending_audio_count; ++i) {
+		RtPendingAudio *p = &rt->pending_audio[i];
+		if (p->thr) jce_thread_join(p->thr);
+		if (p->args) {
+			jce_audio_cpu_free(p->args->cpu);
+			if (p->args->done) jce_atomic_i32_destroy(p->args->done);
+			jce_free(p->args);
+		}
+	}
+	jce_free(rt->pending_audio);
+	rt->pending_audio = NULL;
+	rt->pending_audio_count = rt->pending_audio_cap = 0;
+
 	if (rt->audio) {
 		for (int i = 0; i < rt->voice_count; ++i)
 			jce_audio_stop(rt->audio, rt->voices[i].voice);
@@ -2536,6 +2681,8 @@ JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 	/* Variable-rate gameplay bridge: trigger overlap, spawn density, weapon
 	 * timers.  Runs after scene_update so it reads the freshest transforms. */
 	rt_tick_gameplay(rt, dt);
+	/* Upload + play any play_on_awake clips whose async decode finished. */
+	rt_audio_poll(rt);
 	rt_update_audio_3d(rt);
 }
 

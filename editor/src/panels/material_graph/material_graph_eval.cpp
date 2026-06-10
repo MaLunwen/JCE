@@ -14,6 +14,7 @@
 
 extern "C" {
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_thread.h>
 #include <jce/renderer/jce_pbr_material.h>
 #include <jce/renderer/jce_renderer.h>
 }
@@ -21,6 +22,7 @@ extern "C" {
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 namespace jce_mgp {
 
@@ -303,8 +305,157 @@ void resolve_varying_def_path(char *out, size_t cap)
 
 } /* anonymous namespace */
 
+/* ──────────────────────────────────────────────────────────────────
+ * Async "Compile & Bind".
+ *
+ * The two shaderc.exe invocations are the slow part (subprocess spawn +
+ * drain + poll, up to 30 s each).  They run on a background worker; the
+ * fast codegen + path resolution stays on the UI thread, and the GPU
+ * program create + .bin/.mat.json persist run back on the main thread in
+ * shader_compile_poll() (GPU resource create is render-thread-only).
+ * ────────────────────────────────────────────────────────────────── */
+namespace {
+
+struct ShaderCompileJob {
+    /* inputs (main thread) */
+    std::string vs_path, var_path, include_dir, fs_sc_path;
+    /* persist context, snapshotted at launch (s_g.path may change) */
+    std::string dir, base, graph_path, cg_out_path;
+    /* outputs (worker) */
+    jce_sg::ShadercResult vs_r;
+    jce_sg::ShadercResult fs_r;
+    JceAtomicI32         *done = nullptr;   /* 0 running, 1 finished */
+};
+
+JceThread        *g_sc_worker = nullptr;
+ShaderCompileJob *g_sc_job    = nullptr;
+
+/* WORKER thread: run shaderc for vs then fs.  Only touches the job (and
+ * read-only renderer backend inside compile_sc) — no UI / GPU state. */
+void shader_compile_worker(void *arg)
+{
+    ShaderCompileJob *j = (ShaderCompileJob *)arg;
+    j->vs_r = jce_sg::compile_sc(j->vs_path, j->var_path, j->include_dir,
+                                 jce_sg::ShaderKind::Vertex);
+    if (j->vs_r.ok)
+        j->fs_r = jce_sg::compile_sc(j->fs_sc_path, j->var_path,
+                                     j->include_dir,
+                                     jce_sg::ShaderKind::Fragment);
+    jce_atomic_i32_store(j->done, 1);
+}
+
+/* MAIN thread: consume a finished compile — link the program, swap it in,
+ * persist the blobs + .mat.json.  Early-returns on any failure (callers
+ * free the job afterwards). */
+void shader_compile_finalize(ShaderCompileJob *j)
+{
+    if (!j->vs_r.ok) {
+        log_append(true, "vs compile failed:\n%s", j->vs_r.error.c_str());
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR, "shaderc vs failed");
+        return;
+    }
+    if (!j->fs_r.ok) {
+        log_append(true, "fs compile failed:\n%s", j->fs_r.error.c_str());
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR, "shaderc fs failed");
+        return;
+    }
+
+    /* Link into a bgfx program (render-thread-only — that's why this runs
+     * here and not on the worker). */
+    JceShaderHandle prog = jce_renderer_create_program_from_blobs(
+        j->vs_r.blob.data(), j->vs_r.blob.size(),
+        j->fs_r.blob.data(), j->fs_r.blob.size());
+    if (!jce_shader_valid(prog)) {
+        log_append(true, "bgfx_create_program failed (vs %zu B, fs %zu B)",
+                   j->vs_r.blob.size(), j->fs_r.blob.size());
+        return;
+    }
+
+    /* Swap in.  Destroy the previous program *after* installing the new
+     * one — bgfx defers actual destruction to end-of-frame so any
+     * in-flight draw remains valid. */
+    JceShaderHandle old = s_prev.custom_program;
+    s_prev.custom_program = prog;
+    if (jce_shader_valid(old))
+        jce_renderer_destroy_program(old);
+
+    log_append(false, "compile & bind OK -> %s (program idx=%u)",
+               j->cg_out_path.c_str(), (unsigned)prog.idx);
+    jce_editor_console_log("material graph: compile & bind OK (%s)",
+                           j->cg_out_path.c_str());
+
+    /* Persist the compiled blobs next to the graph and record the Shader
+     * Graph reference in the sibling .mat.json so the engine can
+     * re-create this program at material load (no shaderc at runtime). */
+    char vs_bin[640], fs_bin[640];
+    std::snprintf(vs_bin, sizeof(vs_bin), "%s/vs_%s.bin",
+                  j->dir.c_str(), j->base.c_str());
+    std::snprintf(fs_bin, sizeof(fs_bin), "%s/fs_%s.bin",
+                  j->dir.c_str(), j->base.c_str());
+    bool wrote_vs = jce_fs_host_write_all(vs_bin, j->vs_r.blob.data(),
+                                          (uint64_t)j->vs_r.blob.size());
+    bool wrote_fs = jce_fs_host_write_all(fs_bin, j->fs_r.blob.data(),
+                                          (uint64_t)j->fs_r.blob.size());
+    if (!wrote_vs || !wrote_fs) {
+        log_append(true, "could not persist compiled .bin blobs "
+                         "(custom shader will not survive reload)");
+        return;
+    }
+
+    /* Derive sibling .mat.json: <stem>.matgraph.json -> <stem>.mat.json. */
+    char mat_json[640];
+    std::snprintf(mat_json, sizeof(mat_json), "%s", j->graph_path.c_str());
+    jce_editor_path_strip_extension(mat_json);      /* drop .json */
+    char *dot2 = std::strrchr(mat_json, '.');
+    if (dot2 && std::strcmp(dot2, ".matgraph") == 0) *dot2 = '\0';
+    std::strncat(mat_json, ".mat.json",
+                 sizeof(mat_json) - std::strlen(mat_json) - 1);
+
+    /* Store paths relative to the material dir (bare filenames here, since
+     * the graph, blobs and .mat.json share one directory). */
+    char vs_rel[160], fs_rel[160], graph_rel[160];
+    std::snprintf(vs_rel, sizeof(vs_rel), "vs_%s.bin", j->base.c_str());
+    std::snprintf(fs_rel, sizeof(fs_rel), "fs_%s.bin", j->base.c_str());
+    std::snprintf(graph_rel, sizeof(graph_rel), "%s",
+                  jce_editor_path_basename_view(j->graph_path.c_str()));
+
+    if (jce_pbr_material_set_graph_shader(mat_json, graph_rel, vs_rel, fs_rel)) {
+        log_append(false, "graph shader persisted -> %s", mat_json);
+        jce_editor_console_log("material graph: graph shader saved to %s",
+                               mat_json);
+    } else {
+        log_append(true, "failed to write graph ref into %s", mat_json);
+    }
+}
+
+} /* anonymous namespace */
+
+bool shader_compile_running(void) { return g_sc_worker != nullptr; }
+
+/* MAIN thread, per-frame: pick up a finished background compile. */
+void shader_compile_poll(void)
+{
+    ShaderCompileJob *j = g_sc_job;
+    if (!j) return;
+    if (jce_atomic_i32_load(j->done) == 0) return;   /* still running */
+
+    if (g_sc_worker) { jce_thread_join(g_sc_worker); g_sc_worker = nullptr; }
+
+    shader_compile_finalize(j);
+
+    jce_atomic_i32_destroy(j->done);
+    delete j;
+    g_sc_job = nullptr;
+}
+
 void compile_and_bind(void)
 {
+    if (shader_compile_running()) {
+        jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+            "material graph: a shader compile is already running");
+        return;
+    }
+
     log_clear();
     if (!s_g.path[0]) {
         log_append(true, "Set graph file path first (Save / Load).");
@@ -347,87 +498,27 @@ void compile_and_bind(void)
     resolve_vs_pbr_path(vs_path, sizeof(vs_path));
     resolve_varying_def_path(var_path, sizeof(var_path));
 
-    /* 3. compile vs + fs (both must succeed for a linkable program). */
-    jce_sg::ShadercResult vs_r = jce_sg::compile_sc(
-        vs_path, var_path, include_dir, jce_sg::ShaderKind::Vertex);
-    if (!vs_r.ok) {
-        log_append(true, "vs compile failed:\n%s", vs_r.error.c_str());
-        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-            "shaderc vs failed");
-        return;
-    }
+    /* 3. hand the two shaderc invocations to a worker thread. */
+    ShaderCompileJob *j = new ShaderCompileJob();
+    j->vs_path     = vs_path;
+    j->var_path    = var_path;
+    j->include_dir = include_dir;
+    j->fs_sc_path  = cg.out_path;
+    j->cg_out_path = cg.out_path;
+    j->dir         = dir;
+    j->base        = base;
+    j->graph_path  = s_g.path;
+    j->done        = jce_atomic_i32_create(0);
+    g_sc_job = j;
 
-    jce_sg::ShadercResult fs_r = jce_sg::compile_sc(
-        cg.out_path, var_path, include_dir, jce_sg::ShaderKind::Fragment);
-    if (!fs_r.ok) {
-        log_append(true, "fs compile failed:\n%s", fs_r.error.c_str());
-        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-            "shaderc fs failed");
-        return;
-    }
+    log_append(false, "compiling shaders in background…");
+    jce_editor_console_log("material graph: compiling shaders in background…");
 
-    /* 4. link into a bgfx program. */
-    JceShaderHandle prog = jce_renderer_create_program_from_blobs(
-        vs_r.blob.data(), vs_r.blob.size(),
-        fs_r.blob.data(), fs_r.blob.size());
-    if (!jce_shader_valid(prog)) {
-        log_append(true, "bgfx_create_program failed (vs %zu B, fs %zu B)",
-                   vs_r.blob.size(), fs_r.blob.size());
-        return;
-    }
-
-    /* 5. swap in.  Destroy the previous program *after* installing the
-     * new one — bgfx defers actual destruction to end-of-frame so any
-     * in-flight draw remains valid. */
-    JceShaderHandle old = s_prev.custom_program;
-    s_prev.custom_program = prog;
-    if (jce_shader_valid(old))
-        jce_renderer_destroy_program(old);
-
-    log_append(false, "compile & bind OK -> %s (program idx=%u)",
-               cg.out_path.c_str(), (unsigned)prog.idx);
-    jce_editor_console_log("material graph: compile & bind OK (%s)",
-                           cg.out_path.c_str());
-
-    /* 6. Persist the compiled blobs next to the graph and record the
-     * Shader Graph reference in the sibling .mat.json so the engine can
-     * re-create this program at material load (no shaderc at runtime). */
-    char vs_bin[640], fs_bin[640];
-    std::snprintf(vs_bin, sizeof(vs_bin), "%s/vs_%s.bin", dir, base);
-    std::snprintf(fs_bin, sizeof(fs_bin), "%s/fs_%s.bin", dir, base);
-    bool wrote_vs = jce_fs_host_write_all(vs_bin, vs_r.blob.data(),
-                                          (uint64_t)vs_r.blob.size());
-    bool wrote_fs = jce_fs_host_write_all(fs_bin, fs_r.blob.data(),
-                                          (uint64_t)fs_r.blob.size());
-    if (!wrote_vs || !wrote_fs) {
-        log_append(true, "could not persist compiled .bin blobs "
-                         "(custom shader will not survive reload)");
-        return;
-    }
-
-    /* Derive sibling .mat.json: <stem>.matgraph.json -> <stem>.mat.json. */
-    char mat_json[640];
-    std::snprintf(mat_json, sizeof(mat_json), "%s", s_g.path);
-    jce_editor_path_strip_extension(mat_json);      /* drop .json */
-    char *dot2 = std::strrchr(mat_json, '.');
-    if (dot2 && std::strcmp(dot2, ".matgraph") == 0) *dot2 = '\0';
-    std::strncat(mat_json, ".mat.json",
-                 sizeof(mat_json) - std::strlen(mat_json) - 1);
-
-    /* Store paths relative to the material dir (bare filenames here, since
-     * the graph, blobs and .mat.json share one directory). */
-    char vs_rel[160], fs_rel[160], graph_rel[160];
-    std::snprintf(vs_rel, sizeof(vs_rel), "vs_%s.bin", base);
-    std::snprintf(fs_rel, sizeof(fs_rel), "fs_%s.bin", base);
-    std::snprintf(graph_rel, sizeof(graph_rel), "%s",
-                  jce_editor_path_basename_view(s_g.path));
-
-    if (jce_pbr_material_set_graph_shader(mat_json, graph_rel, vs_rel, fs_rel)) {
-        log_append(false, "graph shader persisted -> %s", mat_json);
-        jce_editor_console_log("material graph: graph shader saved to %s",
-                               mat_json);
-    } else {
-        log_append(true, "failed to write graph ref into %s", mat_json);
+    g_sc_worker = jce_thread_create(shader_compile_worker, j, "jce_sg_compile");
+    if (!g_sc_worker) {
+        /* No worker thread available: run inline then finalise now. */
+        shader_compile_worker(j);
+        shader_compile_poll();
     }
 }
 

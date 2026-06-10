@@ -276,7 +276,10 @@ bool material_take_completed_result(JceEditorMaterialExtractResult *out_result);
 std::string lower_copy(const std::string &s);
 std::string trim_copy(const std::string &s);
 bool        path_is_file(const char *path);
-void        collect_scene_roots(std::vector<std::string> *out);
+/* Returns the cached scene-root search list (rebuilt only when the scene
+ * dir / assetdb root / project root change) — read-only; do not retain
+ * the reference across a scene switch. */
+const std::vector<std::string> &collect_scene_roots(void);
 bool        find_file_by_name_recursive(const std::vector<std::string> &roots,
                                         const std::string &file_name,
                                         int max_depth,

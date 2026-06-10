@@ -710,6 +710,7 @@ static const InspField kF_mesh_renderer[] = {
     IF_AX(JceMeshRenderer, emissive, 0), IF_AX(JceMeshRenderer, emissive, 1), IF_AX(JceMeshRenderer, emissive, 2),
     IF_F(JceMeshRenderer, normal_scale), IF_F(JceMeshRenderer, ao_strength),
     IF_F(JceMeshRenderer, alpha_mode), IF_F(JceMeshRenderer, alpha_cutoff), IF_F(JceMeshRenderer, double_sided),
+    IF_F(JceMeshRenderer, shadow_cast_off), IF_F(JceMeshRenderer, shadow_receive_off),
     IF_F(JceMeshRenderer, albedo_tex), IF_F(JceMeshRenderer, mr_tex), IF_F(JceMeshRenderer, normal_tex),
     IF_F(JceMeshRenderer, ao_tex), IF_F(JceMeshRenderer, emissive_tex),
 };

@@ -15,6 +15,11 @@ file(GLOB_RECURSE EDITOR_SOURCES CONFIGURE_DEPENDS
 
 add_executable(JCE_Editor ${EDITOR_SOURCES})
 
+# Optional linker map for the binary-size report (tools/gen_binsize_report.py).
+if(COMMAND jce_emit_link_map)
+	jce_emit_link_map(JCE_Editor)
+endif()
+
 # Auto-normalize i18n JSON before each editor build (no-op when files
 # are already normalized).  See top-level CMakeLists.txt -> jce_i18n_auto.
 if(TARGET jce_i18n_auto)

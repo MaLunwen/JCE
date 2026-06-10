@@ -13,6 +13,7 @@
 #include <jce/os/core/jce_fixed_clock.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/os/core/jce_thread.h>
+#include <jce/os/core/jce_jobs.h>
 #include <jce/os/core/jce_timer.h>
 #include <jce/runtime/jce_player_loop.h>
 
@@ -1271,6 +1272,9 @@ void jce_engine_destroy(JceEngine *e)
      * bgfx_shutdown(), preserving the LIFO contract for any future
      * GPU-touching cleanup the text subsystem may grow. */
     if (e->renderer) jce_renderer_destroy(e->renderer);
+    /* Shared data-parallel job pool (frustum cull etc.) — joined after the
+     * renderer so no cull is in flight. */
+    jce_jobs_shutdown_default();
     if (e->audio)    jce_audio_destroy(e->audio);
     if (e->bundle_catalog) {
         jce_bundle_catalog_close((JceBundleCatalog *)e->bundle_catalog);

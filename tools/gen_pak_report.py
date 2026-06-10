@@ -1157,7 +1157,6 @@ def render_pie_svg(rows: List[Tuple[str, int, int, int]],
         y3 = cy + r_inner * math.sin(a2)
         x4 = cx + r_inner * math.cos(angle)
         y4 = cy + r_inner * math.sin(angle)
-        title = f"{key}: {fmt_bytes(raw)} ({frac * 100:.1f}%)"
         slice_attrs = (
             f'data-idx="{i}" data-key="{html.escape(key)}" '
             f'data-val="{html.escape(fmt_bytes(raw))}" data-pct="{frac * 100:.1f}"'
@@ -1169,8 +1168,7 @@ def render_pie_svg(rows: List[Tuple[str, int, int, int]],
             paths.append(
                 f'<circle class="slice" {slice_attrs} data-dx="0" data-dy="0" '
                 f'cx="{cx:.2f}" cy="{cy:.2f}" r="{r_outer:.2f}" '
-                f'fill="{_color(i)}" stroke="var(--svg-stroke)" stroke-width="1.5">'
-                f'<title>{html.escape(title)}</title></circle>'
+                f'fill="{_color(i)}" stroke="var(--svg-stroke)" stroke-width="1.5"/>'
                 f'<circle cx="{cx:.2f}" cy="{cy:.2f}" r="{r_inner:.2f}" fill="var(--surface)"/>'
             )
         else:
@@ -1184,8 +1182,7 @@ def render_pie_svg(rows: List[Tuple[str, int, int, int]],
             paths.append(
                 f'<path class="slice" {slice_attrs} '
                 f'data-dx="{dx:.2f}" data-dy="{dy:.2f}" '
-                f'd="{d}" fill="{_color(i)}" stroke="var(--svg-stroke)" stroke-width="1.5">'
-                f'<title>{html.escape(title)}</title></path>'
+                f'd="{d}" fill="{_color(i)}" stroke="var(--svg-stroke)" stroke-width="1.5"/>'
             )
         legend.append(
             f'<span class="lg-item" data-idx="{i}">'

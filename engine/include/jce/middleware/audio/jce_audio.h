@@ -43,6 +43,26 @@ JceSound  jce_audio_load_pcm(JceAudio *audio,
 /* Unload a previously loaded sound. */
 JCE_API void      jce_audio_unload(JceAudio *audio, JceSound snd);
 
+/* -- Worker-decode + main-thread-register split --------------------- *
+ *
+ * jce_audio_load() does PAK decompress + decode + sound registration in
+ * one call.  This pair separates the slow, variable-latency decode (which
+ * is safe on any thread) from the registration (which mutates the audio
+ * sound table and must stay on the thread that owns it — the main thread,
+ * same as jce_audio_load today):
+ *
+ *   worker:      JceAudioCpu *c = jce_audio_decode_cpu(pak, path);
+ *   main thread: JceSound     s = jce_audio_upload_cpu(audio, c);  // consumes c
+ *   cancel:      jce_audio_cpu_free(c);                            // no register
+ *
+ * decode_cpu touches no JceAudio state (PAK decompress + miniaudio decode
+ * to a standalone PCM buffer); upload_cpu registers the PCM via
+ * jce_audio_load_pcm and frees `c`. */
+typedef struct JceAudioCpu JceAudioCpu;
+JCE_API JceAudioCpu *jce_audio_decode_cpu(const JcePakArchive *pak, const char *path);
+JCE_API JceSound     jce_audio_upload_cpu(JceAudio *audio, JceAudioCpu *cpu);
+JCE_API void         jce_audio_cpu_free(JceAudioCpu *cpu);
+
 /* Load a sound from raw file bytes in memory (WAV/OGG/MP3).
    hint_path is used for format detection only; may be NULL. */
 JceSound  jce_audio_load_memory(JceAudio *audio, const void *data,

@@ -47,6 +47,24 @@ JCE_API void          JCE_CALL jce_jobs_parallel_for(JceJobSystem *sys,
                                                      JceParallelForFn fn,
                                                      void *user);
 
+/* ================================================================== */
+/* Process-wide shared job system                                      */
+/* ================================================================== */
+/*
+ * A single engine-owned pool for per-frame data-parallel work (frustum
+ * cull, particle/anim fan-out, etc.) so subsystems don't each spin up
+ * their own threads.  Lazily created on first call with a sensible
+ * worker count (CPU cores - 1, clamped).  MUST be called from the main
+ * thread (lazy init is not synchronised) — true for the frame
+ * update/render loop callers.  Returns NULL if creation fails, in which
+ * case callers fall back to a serial loop.
+ */
+JCE_API JceJobSystem *JCE_CALL jce_jobs_default(void);
+
+/* Destroy the shared job system (call once at engine shutdown).  Safe to
+ * call when it was never created. */
+JCE_API void          JCE_CALL jce_jobs_shutdown_default(void);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_JOBS_H */

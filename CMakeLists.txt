@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 # ── MUST be set before project() ──
 set(CMAKE_SUPPRESS_REGENERATION TRUE)
 
-project(JCE VERSION 0.9.7 LANGUAGES C)
+project(JCE VERSION 0.9.9 LANGUAGES C)
 
 # CXX is needed for C++ dependencies (bgfx, assimp, imgui) and the editor.
 enable_language(CXX)
@@ -697,7 +697,9 @@ option(JCE_ENABLE_ASSET_COOKING "Pre-cook assets at build time (raw->.jceasset)"
 # path external users take, and the only way the SDK contract is dogfooded.
 # Flip ON only for in-tree dev iteration on the sample itself.
 option(JCE_BUILD_INTREE_SAMPLE "Build the in-tree Caged Kingdom sample (dev only)" OFF)
-option(JCE_BUILD_SCIENCE_LAB "Build the in-tree Science Lab dogfood project (dev/web only)" OFF)
+# Science Lab is a fully engine-isolated SDK consumer: it builds ONLY via
+# standalone find_package(JCE) (see science_lab/CMakeLists.txt). It has no
+# in-tree build path — no option, no add_subdirectory, no shared game PAK.
 if(JCE_ENABLE_ASSET_COOKING AND NOT CMAKE_CROSSCOMPILING AND NOT TARGET jce_cook)
 	message(STATUS
 		"JCE asset cooking requested, but host cooker sources are not "
@@ -715,11 +717,6 @@ set(GAME_ICON_FILE      "${CMAKE_CURRENT_SOURCE_DIR}/caged_kingdom/resources/CK_
 set(GAME_ICON_STAGE_DIR "${CMAKE_CURRENT_BINARY_DIR}/_raw_game_icon")
 set(ENGINE_UI_DIR       "${CMAKE_CURRENT_SOURCE_DIR}/engine/ui")
 set(GAME_UI_DIR         "${CMAKE_CURRENT_SOURCE_DIR}/caged_kingdom/ui")
-
-if(JCE_BUILD_SCIENCE_LAB)
-	set(GAME_RESOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/science_lab/resources/assets")
-	set(GAME_UI_DIR       "${CMAKE_CURRENT_SOURCE_DIR}/science_lab/ui")
-endif()
 
 # THIRD_PARTY_LICENSES.md is sourced from the repo root and copied
 # directly into each PAK at build time. We do NOT mirror it into the
@@ -1170,6 +1167,28 @@ else()
 endif()
 
 # ------------------------------------------------------------------ #
+# Binary-size report: emit a linker map so tools/gen_binsize_report.py #
+# can attribute bytes per library/module. Opt-in (maps add link time   #
+# and clutter); OFF by default.                                        #
+# ------------------------------------------------------------------ #
+option(JCE_EMIT_LINK_MAP "Emit a linker .map under <build>/reports/ (for binsize report)" OFF)
+function(jce_emit_link_map tgt)
+	if(NOT JCE_EMIT_LINK_MAP)
+		return()
+	endif()
+	# Emit the linker map under <build>/reports/ (alongside the other generated
+	# reports) rather than next to the exe. The dir must exist before the link
+	# step writes into it, so create it now at configure time.
+	set(_map_dir "${CMAKE_BINARY_DIR}/reports")
+	file(MAKE_DIRECTORY "${_map_dir}")
+	if(MSVC)
+		target_link_options(${tgt} PRIVATE "/MAP:${_map_dir}/${tgt}.map")
+	else()
+		target_link_options(${tgt} PRIVATE "LINKER:-Map=${_map_dir}/${tgt}.map")
+	endif()
+endfunction()
+
+# ------------------------------------------------------------------ #
 # Sub-modules                                                         #
 # ------------------------------------------------------------------ #
 
@@ -1180,9 +1199,8 @@ add_subdirectory(editor)
 if(JCE_BUILD_INTREE_SAMPLE)
 	add_subdirectory(caged_kingdom)
 endif()
-if(JCE_BUILD_SCIENCE_LAB)
-	add_subdirectory(science_lab)
-endif()
+# science_lab is intentionally NOT add_subdirectory()'d: it is a standalone
+# find_package(JCE) consumer built out-of-tree (see science_lab/CMakeLists.txt).
 
 # After jce_renderer has been declared in engine/CMakeLists.txt, hook
 # in the generated embedded-shader C array (and exclude the stub TU).
@@ -1190,6 +1208,22 @@ if(JCE_EMBED_ENGINE_SHADERS AND TARGET jce_renderer)
 	target_sources(jce_renderer PRIVATE "${JCE_ENGSH_C_ARRAY}")
 	target_compile_definitions(jce_renderer PRIVATE JCE_ENGINE_SHADERS_EMBED=1)
 	add_dependencies(jce_renderer PackEngineShaders)
+endif()
+
+# Binary-size report target (needs JCE_Editor from add_subdirectory(editor)).
+if(Python3_FOUND AND JCE_EMIT_LINK_MAP)
+	set(_BINSIZE_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_binsize_report.py")
+	add_custom_target(binsize-report
+		COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_BINARY_DIR}/reports"
+		COMMAND ${Python3_EXECUTABLE} "${_BINSIZE_SCRIPT}"
+			"${CMAKE_BINARY_DIR}/reports/JCE_Editor.map"
+			"${CMAKE_BINARY_DIR}/reports/binsize_report.html"
+			--title "JCE Editor binary composition"
+			--json "${CMAKE_BINARY_DIR}/reports/binsize_report.json"
+		DEPENDS JCE_Editor
+		WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+		COMMENT "Generating binary-size report"
+		VERBATIM)
 endif()
 
 # ------------------------------------------------------------------ #
@@ -1306,9 +1340,7 @@ if(CLANG_FORMAT_EXECUTABLE)
 		"${CMAKE_SOURCE_DIR}/editor/src/*.cpp"
 		"${CMAKE_SOURCE_DIR}/editor/src/*.h"
 		"${CMAKE_SOURCE_DIR}/caged_kingdom/src/*.c"
-		"${CMAKE_SOURCE_DIR}/caged_kingdom/src/*.h"
-		"${CMAKE_SOURCE_DIR}/science_lab/src/*.c"
-		"${CMAKE_SOURCE_DIR}/science_lab/src/*.h")
+		"${CMAKE_SOURCE_DIR}/caged_kingdom/src/*.h")
 	list(FILTER _jce_fmt_files EXCLUDE REGEX "/third_party/")
 	list(FILTER _jce_fmt_files EXCLUDE REGEX "/internal/stb_image\\.h$")
 
@@ -1330,8 +1362,19 @@ endif()
 # Static analysis: cppcheck                                           #
 # ------------------------------------------------------------------ #
 
-option(JCE_ENABLE_CPPCHECK "Enable cppcheck target" ON)
-if(JCE_ENABLE_CPPCHECK)
+option(JCE_ENABLE_CPPCHECK "Enable cppcheck target (x64 Windows release only)" ON)
+# Static analysis is restricted to the x64 Windows *release* variant: it is a
+# source-level gate, not a per-arch/per-config build artifact, so creating it
+# for arm64 / 32-bit / non-Windows / dist / debug is pointless work. It is also
+# NOT part of the default build (the target has no ALL — see below), so it never
+# re-runs on an ordinary `cmake --build`; invoke it on demand with
+# `cmake --build <dir> --target cppcheck` (scripts/jce.py editor --variant
+# release does this automatically).
+if(JCE_ENABLE_CPPCHECK
+   AND WIN32
+   AND CMAKE_SIZEOF_VOID_P EQUAL 8
+   AND CMAKE_SYSTEM_PROCESSOR MATCHES "(AMD64|amd64|x86_64)"
+   AND JCE_BUILD_VARIANT STREQUAL "release")
 	find_program(CPPCHECK_EXECUTABLE NAMES cppcheck HINTS "D:/CMake/Cppcheck")
 	if(CPPCHECK_EXECUTABLE)
 		include(ProcessorCount)
@@ -1343,10 +1386,20 @@ if(JCE_ENABLE_CPPCHECK)
 		set(JCE_CPPCHECK_REPORT_DIR "${CMAKE_BINARY_DIR}/reports")
 		set(JCE_CPPCHECK_TEXT_REPORT "${JCE_CPPCHECK_REPORT_DIR}/cppcheck-report.txt")
 		set(JCE_CPPCHECK_XML_REPORT  "${JCE_CPPCHECK_REPORT_DIR}/cppcheck-report.xml")
+		# Incremental analysis: cppcheck caches per-translation-unit results here
+		# and on the next run re-checks ONLY the files that changed (and their
+		# dependents) — like a professional engine's static-analysis cache. The
+		# dir must exist before cppcheck runs and must persist across builds (it
+		# lives under the build dir, which is not wiped between builds). The three
+		# invocations below run sequentially and share this cache, so only the
+		# first does real work; the XML/quiet passes are cache hits.
+		set(JCE_CPPCHECK_CACHE_DIR "${JCE_CPPCHECK_REPORT_DIR}/cppcheck-cache")
+		file(MAKE_DIRECTORY "${JCE_CPPCHECK_CACHE_DIR}")
 
 		# Common flags shared by all three cppcheck invocations.
 		set(_CPPCHECK_COMMON_FLAGS
 			--project=${CMAKE_BINARY_DIR}/compile_commands.json
+			--cppcheck-build-dir=${JCE_CPPCHECK_CACHE_DIR}
 			--relative-paths=${CMAKE_SOURCE_DIR}
 			--enable=warning,style,performance,portability
 			--inconclusive --inline-suppr
@@ -1391,11 +1444,11 @@ if(JCE_ENABLE_CPPCHECK)
 			--file-filter=${CMAKE_SOURCE_DIR}/engine/*
 			--file-filter=${CMAKE_SOURCE_DIR}/editor/*
 			--file-filter=${CMAKE_SOURCE_DIR}/caged_kingdom/*
-			--file-filter=${CMAKE_SOURCE_DIR}/science_lab/*
 			-j${_JCE_CPPCHECK_JOBS}
 			--std=c99)
 
-		add_custom_target(cppcheck ALL
+		# No ALL: on-demand only (avoids re-running cppcheck on every build).
+		add_custom_target(cppcheck
 			COMMAND "${CMAKE_COMMAND}" -E make_directory "${JCE_CPPCHECK_REPORT_DIR}"
 			COMMAND "${CPPCHECK_EXECUTABLE}" ${_CPPCHECK_COMMON_FLAGS}
 				--template={file}:{line}:{severity}:{id}:{message}

@@ -619,6 +619,9 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
         0,
     };
 
+    /* Prefer Ink Free on ANY OS if installed (probed via find_system_font for
+       win/mac/linux); otherwise fall through to widely-installed system
+       sans-serifs, then ImGui's proggy bitmap. A user override path wins. */
     ImFont *font = load_font_with_fallback(
         "Latin", en_override, "InkFree",
         size_pixels, &cfg, latin_ranges);

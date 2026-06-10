@@ -64,6 +64,9 @@ typedef struct JcePbrMaterial {
 
     /* Render state. */
     bool         double_sided;
+    /* Per-renderer "Receive Shadows" off (Unity-style): when true the shader
+       skips ALL shadow sampling (CSM + local atlas) for this draw. */
+    bool         receive_shadows_off;
 
     /* Optional custom shader program.  The handle itself is runtime-only
      * (never serialized), but jce_pbr_material_load_json will populate it

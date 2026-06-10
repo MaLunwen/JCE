@@ -98,6 +98,39 @@ function(jce_compile_shaders)
 
     set(_varying "${ARG_SHADER_DIR}/${ARG_VARYING_DEF}")
 
+    # ── cross-backend portability lint ────────────────────────────
+    # tools/shader_lint.py bans constructs that COMPILE on every bgfx
+    # profile but mean different things per backend (raw multi-arg
+    # matrix constructors pack rows on HLSL / columns on GLSL; matrix
+    # '*' is component-wise on HLSL) — the class of bug where fs_pbr's
+    # mat3(T,B,N) TBN was transposed on OpenGL/WASM only and every
+    # light pool rendered cut in half. A finding fails the build BEFORE
+    # any shaderc invocation. Skipped with a warning when no Python is
+    # available (matches the shaderc-missing policy above).
+    set(_lint_stamp "")
+    find_program(JCE_SHADER_LINT_PYTHON NAMES python3 python py)
+    if(JCE_SHADER_LINT_PYTHON)
+        set(_lint_script "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/shader_lint.py")
+        file(GLOB _lint_inputs
+            "${ARG_SHADER_DIR}/*.sc"
+            "${ARG_SHADER_DIR}/*.sh")
+        set(_lint_stamp
+            "${CMAKE_BINARY_DIR}/shader_lint/${ARG_TARGET}.stamp")
+        file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/shader_lint")
+        add_custom_command(
+            OUTPUT  "${_lint_stamp}"
+            COMMAND "${JCE_SHADER_LINT_PYTHON}" "${_lint_script}"
+                    --quiet "${ARG_SHADER_DIR}"
+            COMMAND "${CMAKE_COMMAND}" -E touch "${_lint_stamp}"
+            DEPENDS ${_lint_inputs} "${_lint_script}"
+            COMMENT "ShaderLint: ${ARG_TARGET}"
+            VERBATIM)
+    else()
+        message(WARNING
+            "shader_lint skipped — no python interpreter found. "
+            "Cross-backend shader portability is NOT being checked.")
+    endif()
+
     # ── enumerate shader sources ──────────────────────────────────
     file(GLOB _sources
         "${ARG_SHADER_DIR}/vs_*.sc"
@@ -213,7 +246,7 @@ function(jce_compile_shaders)
                         --varyingdef "${_varying}"
                         -i "${BGFX_SHADER_INCLUDE_PATH}"
                         ${_shader_defines}
-                DEPENDS "${_src}" "${_varying}"
+                DEPENDS "${_src}" "${_varying}" ${_lint_stamp}
                 COMMENT "Shader: ${_name} (${_suffix})"
                 VERBATIM)
 

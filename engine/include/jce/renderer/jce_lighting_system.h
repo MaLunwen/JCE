@@ -31,7 +31,7 @@ typedef struct JceLightEnv JceLightEnv;
 /* ================================================================== */
 
 #define JCE_MAX_DIR_LIGHTS   2
-#define JCE_MAX_POINT_LIGHTS 8
+#define JCE_MAX_POINT_LIGHTS 16   /* raised from 8: scenes (e.g. graveyard) have >8 point lights; the extra were silently dropped -> "point light has no light" */
 #define JCE_MAX_SPOT_LIGHTS  4
 
 /* P3-E.5b — Multi-cookie atlas (texture array) capacity.

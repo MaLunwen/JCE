@@ -259,7 +259,80 @@ void draw_selection_outlines(void)
                 jce_scene_has_skeletal_animator(scene, e);
         }
 
-        /* --- Rendered mesh: keep the high-fidelity wireframe overlay. */
+        /* Light DIRECTION indicator — drawn for EVERY selected light here, up
+           front, so it stays visible even when the light entity also carries a
+           model/mesh (e.g. a lantern). Such an entity takes the wireframe-overlay
+           path below and `continue`s before the old per-shape light blocks, which
+           is why the cone / arrow vanished for lights with a model. This is now
+           the SINGLE place the light gizmo is drawn (the later light blocks were
+           removed). `has_visual_renderer` is NOT a sufficient guard because a
+           model can be detected by build_overlay_entity_model without being a
+           mesh-renderer/skeletal-animator, so we fire for any light. */
+        bool drew_light_early = false;
+        if (scene) {
+            JceTransform *lt = jce_scene_get_transform(scene, e);
+            if (lt) {
+                if (jce_scene_has_spot_light(scene, e)) {
+                    JceSpotLight *sl = jce_scene_get_spot_light(scene, e);
+                    if (sl) {
+                        jce_vec3 axis = jce_v3_normalize(sl->direction);
+                        if (axis.x == 0.0f && axis.y == 0.0f && axis.z == 0.0f)
+                            axis = jce_q_rotate(lt->rotation, jce_v3(0, 0, -1));
+                        float clen = (sl->radius > 0.0f) ? sl->radius : 1.0f;
+                        float cosA = (sl->outer_cone_cos > 0.0f)
+                                     ? sl->outer_cone_cos : 0.7071f;
+                        if (cosA > 0.9999f) cosA = 0.9999f;
+                        outline_draw_cone(lt->position, axis, clen,
+                                          acosf(cosA), col_outline);
+                    }
+                }
+                if (jce_scene_has_dir_light(scene, e)) {
+                    JceDirectionalLight *dl = jce_scene_get_dir_light(scene, e);
+                    if (dl) {
+                        jce_vec3 d = jce_v3_normalize(dl->direction);
+                        if (d.x == 0.0f && d.y == 0.0f && d.z == 0.0f)
+                            d = jce_v3(0.0f, -1.0f, 0.0f);
+                        d = jce_v3_normalize(jce_q_rotate(lt->rotation, d));
+                        const float dlen = 3.0f;
+                        jce_vec3 tip = jce_v3_add(lt->position,
+                                                  jce_v3_scale(d, dlen));
+                        jce_debug_draw_line(lt->position, tip, col_outline);
+                        jce_vec3 up    = (fabsf(d.y) > 0.95f) ? jce_v3(1, 0, 0)
+                                                              : jce_v3(0, 1, 0);
+                        jce_vec3 right = jce_v3_normalize(jce_v3_cross(d, up));
+                        jce_vec3 back  = jce_v3_scale(d, -0.5f);
+                        jce_debug_draw_line(tip,
+                            jce_v3_add(tip, jce_v3_add(back,
+                                jce_v3_scale(right,  0.3f))), col_outline);
+                        jce_debug_draw_line(tip,
+                            jce_v3_add(tip, jce_v3_add(back,
+                                jce_v3_scale(right, -0.3f))), col_outline);
+                    }
+                }
+                if (jce_scene_has_point_light(scene, e)) {
+                    JcePointLight *pl = jce_scene_get_point_light(scene, e);
+                    float r = (pl && pl->radius > 0.0f) ? pl->radius : 1.0f;
+                    jce_debug_draw_sphere(lt->position, r, col_outline);
+                }
+                drew_light_early = jce_scene_has_spot_light(scene, e)
+                                || jce_scene_has_dir_light(scene, e)
+                                || jce_scene_has_point_light(scene, e);
+            }
+        }
+        /* The early light gizmo must trigger the end-of-function debug-draw FLUSH
+           even when this entity then takes the wireframe-overlay `continue` path
+           below — that path skips the `drew_any_debug = true` at the loop end, so
+           without this the gizmo is accumulated into the buffer but never flushed
+           and disappears entirely (the regression that hid ALL light gizmos). */
+        if (drew_light_early) drew_any_debug = true;
+
+        /* --- Rendered mesh: keep the high-fidelity wireframe overlay.
+           NOTE: the per-iteration uniform/texture sets below are REQUIRED —
+           do NOT hoist them out of the loop. Every wireframe submit discards
+           all draw state (BGFX_DISCARD_ALL), and bgfx replays each draw's
+           recorded uniform range in view-SORTED order, so a submit without
+           its own preceding sets goes out with no texture bound and an empty
+           uniform range that inherits another draw's values. */
         jce_mat4 model;
         JceMesh *mesh = NULL;
         if (build_overlay_entity_model(id, &model, &mesh) && mesh) {
@@ -276,7 +349,7 @@ void draw_selection_outlines(void)
         JceTransform *t = jce_scene_get_transform(scene, e);
         if (!t) continue;
 
-        bool drew_shape = false;
+        bool drew_shape = drew_light_early;   /* light gizmo already drawn above */
 
         /* --- Skeletal-animated (skinned) model.
          *     Submit the true geometric wireframe of every primitive in
@@ -311,30 +384,9 @@ void draw_selection_outlines(void)
             continue;
         }
 
-        /* --- Point light → influence sphere. */
-        if (jce_scene_has_point_light(scene, e)) {
-            JcePointLight *pl = jce_scene_get_point_light(scene, e);
-            float r = (pl && pl->radius > 0.0f) ? pl->radius : 1.0f;
-            jce_debug_draw_sphere(t->position, r, col_outline);
-            drew_shape = true;
-        }
-
-        /* --- Spot light → real cone (apex, axis, length, opening). */
-        if (jce_scene_has_spot_light(scene, e)) {
-            JceSpotLight *sl = jce_scene_get_spot_light(scene, e);
-            if (sl) {
-                jce_vec3 axis = jce_v3_normalize(sl->direction);
-                if (axis.x == 0.0f && axis.y == 0.0f && axis.z == 0.0f)
-                    axis = jce_q_rotate(t->rotation, jce_v3(0, 0, -1));
-                float len   = (sl->radius > 0.0f) ? sl->radius : 1.0f;
-                float cosA  = (sl->outer_cone_cos > 0.0f)
-                              ? sl->outer_cone_cos : 0.7071f;
-                if (cosA > 0.9999f) cosA = 0.9999f;
-                outline_draw_cone(t->position, axis, len,
-                                  acosf(cosA), col_outline);
-            }
-            drew_shape = true;
-        }
+        /* (Point / spot / directional light gizmos are drawn earlier — see the
+           "Light DIRECTION indicator" block above — so they remain visible even
+           for lights that also carry a model/mesh.) */
 
         /* --- Camera → real view frustum. */
         if (jce_scene_has_camera(scene, e)) {
@@ -533,10 +585,6 @@ void draw_physics_debug(void)
             float hh = 0.5f * fmaxf(0.0f, h - 2.0f * r);
             jce_vec3 cc_c = t->position; cc_c.y += hh + r;  /* feet -> capsule center */
             jce_debug_draw_capsule(cc_c, r, hh, q, col_capsule);
-            { static bool lg = false; if (!lg) { lg = true;
-                jce_log_write(JCE_LOG_LEVEL_INFO, "cc_cap", __FILE__, __LINE__,
-                    "CC capsule e=%u pos.y=%.3f cap_c.y=%.3f r=%.3f hh=%.3f",
-                    (unsigned)e, t->position.y, cc_c.y, r, hh); } }
         }
         /* Compound (cooked V-HACD/trimesh) colliders: draw the real fitted
          * hulls/triangles so the overlay reflects EVERY collidable object, not

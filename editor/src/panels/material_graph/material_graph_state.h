@@ -170,8 +170,17 @@ void generate_shader(void);
  *   3. create_program_from_blobs — link into a bgfx program
  *   4. swap s_prev.custom_program (old one destroyed via bgfx defer)
  * All diagnostics land in s_log; on failure s_prev.custom_program
- * keeps its previous value (last-known-good fallback). */
+ * keeps its previous value (last-known-good fallback).
+ *
+ * Async: codegen + path resolution run on the calling (UI) thread, then
+ * the two shaderc.exe invocations run on a background worker so the UI
+ * never blocks (shaderc can take seconds, with a 30 s hard cap).  The
+ * GPU program create + .bin/.mat.json persist happen on the main thread
+ * in shader_compile_poll().  Call shader_compile_poll() every frame the
+ * panel is alive to pick up a finished compile. */
 void compile_and_bind(void);
+void shader_compile_poll(void);
+bool shader_compile_running(void);
 
 void delete_selected(void);
 void copy_selection(void);

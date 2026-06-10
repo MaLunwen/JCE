@@ -68,6 +68,7 @@ void jce_render_pipeline_preset_low(JceRenderPipelineDesc *out)
     out->enable_motion_blur    = false;
     out->shadow_resolution     = 512;
     out->csm_cascade_count     = 1;
+    out->shadow_filter_quality = 0;  /* 1-tap hard shadows */
     out->msaa_samples          = 1;
     out->render_scale          = 1.0f;
     out->post_quality          = JCE_RP_QUALITY_LOW;
@@ -90,6 +91,7 @@ void jce_render_pipeline_preset_mid(JceRenderPipelineDesc *out)
     out->enable_motion_blur    = false;
     out->shadow_resolution     = 1024;
     out->csm_cascade_count     = 2;
+    out->shadow_filter_quality = 1;  /* 3x3 PCF */
     out->msaa_samples          = 2;
     out->render_scale          = 1.0f;
     out->post_quality          = JCE_RP_QUALITY_MID;
@@ -112,6 +114,7 @@ void jce_render_pipeline_preset_high(JceRenderPipelineDesc *out)
     out->enable_motion_blur    = false;
     out->shadow_resolution     = 2048;
     out->csm_cascade_count     = 4;
+    out->shadow_filter_quality = 2;  /* full: local 3x3, CSM 5x5 + blend */
     out->msaa_samples          = 2;
     out->render_scale          = 1.0f;
     out->post_quality          = JCE_RP_QUALITY_HIGH;
@@ -134,6 +137,7 @@ void jce_render_pipeline_preset_ultra(JceRenderPipelineDesc *out)
     out->enable_motion_blur    = true;
     out->shadow_resolution     = 4096;
     out->csm_cascade_count     = 4;
+    out->shadow_filter_quality = 2;  /* full: local 3x3, CSM 5x5 + blend */
     out->msaa_samples          = 4;
     out->render_scale          = 1.0f;
     out->post_quality          = JCE_RP_QUALITY_ULTRA;
@@ -200,14 +204,15 @@ void jce_render_pipeline_apply(const JceRenderPipelineDesc *desc)
 
     LOG_INFO(LOG_TAG,
         "applied: csm=%d ssao=%d ssr=%d taa=%d bloom=%d volfog=%d "
-        "gpup=%d mblur=%d shadow=%u cascades=%u msaa=%u scale=%.2f "
-        "post=%s hdr=%d zpre=%d",
+        "gpup=%d mblur=%d shadow=%u cascades=%u sfilter=%u msaa=%u "
+        "scale=%.2f post=%s hdr=%d zpre=%d",
         (int)desc->enable_csm, (int)desc->enable_ssao,
         (int)desc->enable_ssr, (int)desc->enable_taa,
         (int)desc->enable_bloom, (int)desc->enable_volumetric_fog,
         (int)desc->enable_gpu_particles, (int)desc->enable_motion_blur,
         (unsigned)desc->shadow_resolution,
         (unsigned)desc->csm_cascade_count,
+        (unsigned)desc->shadow_filter_quality,
         (unsigned)desc->msaa_samples,
         (double)desc->render_scale,
         quality_to_str(desc->post_quality),
@@ -329,6 +334,12 @@ bool jce_render_pipeline_load(const char *host_path,
     if (cc > 4) cc = 4;
     out->csm_cascade_count = (uint8_t)cc;
 
+    int sfq = jce_json_get_int(root, "shadow_filter_quality",
+                               (int)out->shadow_filter_quality);
+    if (sfq < 0) sfq = 0;
+    if (sfq > 2) sfq = 2;
+    out->shadow_filter_quality = (uint8_t)sfq;
+
     int ms = jce_json_get_int(root, "msaa_samples",
                               (int)out->msaa_samples);
     if (ms != 1 && ms != 2 && ms != 4 && ms != 8) ms = 1;
@@ -372,6 +383,8 @@ bool jce_render_pipeline_save(const char *host_path,
 
     jce_json_set_int   (root, "shadow_resolution",  (int)desc->shadow_resolution);
     jce_json_set_int   (root, "csm_cascade_count",  (int)desc->csm_cascade_count);
+    jce_json_set_int   (root, "shadow_filter_quality",
+                        (int)desc->shadow_filter_quality);
     jce_json_set_int   (root, "msaa_samples",       (int)desc->msaa_samples);
     jce_json_set_number(root, "render_scale",       (double)desc->render_scale);
     jce_json_set_string(root, "post_quality",       quality_to_str(desc->post_quality));

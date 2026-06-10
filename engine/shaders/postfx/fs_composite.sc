@@ -81,5 +81,20 @@ void main()
         col = vec3_splat(g);
     }
 
+    /* Dither: break up 8-bit banding of smooth tonemapped gradients — when
+       this pass tonemaps it IS the final quantization point, so the
+       concentric light-falloff "ring" bands under spot/point lights are
+       removed here (the HDR scene target keeps the gradient smooth up to this
+       pass; the ~1/255 screen-space noise hides the last step). Gated on the
+       tonemap flag: bloom/vignette-only chains run on LDR input the PBR pass
+       already gamma-encoded AND dithered (fs_pbr.sc) — dithering again would
+       double the noise. Exactly one dither fires on every path. */
+    if (u_compositeFlags.y > 0.5)
+    {
+        float _cdither = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233)))
+                               * 43758.5453);
+        col += vec3_splat((_cdither - 0.5) / 255.0);
+    }
+
     gl_FragColor = vec4(col, 1.0);
 }

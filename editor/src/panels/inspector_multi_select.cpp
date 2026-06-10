@@ -198,6 +198,7 @@ bool insp_draw_multi_select_view(JceScene *scene)
     {
         uint32_t focused_id = jce_state_get_focused();
         uint32_t to_focus = 0;
+        uint32_t to_select = 0;
         uint32_t to_remove = 0;
         int max_show = sel_count < 20 ? sel_count : 20;
         for (int i = 0; i < max_show; i++) {
@@ -212,31 +213,56 @@ bool insp_draw_multi_select_view(JceScene *scene)
              * region and (b) intercept their clicks across the row. */
             const char *focus_lbl  = jce_editor_i18n_id("inspector.bulk.entity.focus", "focus");
             const char *remove_lbl = jce_editor_i18n_id("inspector.bulk.entity.remove", "remove");
-            ImGuiStyle &style = ImGui::GetStyle();
-            float btn_focus_w  = ImGui::CalcTextSize(focus_lbl).x  + style.FramePadding.x * 2.0f;
-            float btn_remove_w = ImGui::CalcTextSize(remove_lbl).x + style.FramePadding.x * 2.0f;
-            float reserved     = btn_focus_w + btn_remove_w + style.ItemSpacing.x * 2.0f;
-            float avail_w      = ImGui::GetContentRegionAvail().x;
-            float sel_w        = avail_w - reserved;
-            if (sel_w < 32.0f) sel_w = 32.0f;
 
-            /* Selectable: click to make this the focused entity within the multi-selection. */
-            ImGui::SetNextItemAllowOverlap();
-            if (ImGui::Selectable(nm, is_focused,
-                                  ImGuiSelectableFlags_AllowOverlap,
-                                  ImVec2(sel_w, 0.0f))) {
+            /* Single line: full-width name on the left; compact Focus / Remove
+             * ICON buttons RIGHT-ALIGNED on the same line. The icons are drawn as
+             * primitives (crosshair = focus, X = remove) so they stay tiny on a
+             * narrow inspector and never crowd/cover the name — with hover
+             * tooltips for clarity (wide text buttons squeezed names to ~2 chars). */
+            float ico    = ImGui::GetFrameHeight();
+            float btns_w = ico * 2.0f + ImGui::GetStyle().ItemSpacing.x;
+            float full_w = ImGui::GetContentRegionAvail().x;
+            float name_w = full_w - btns_w - ImGui::GetStyle().ItemSpacing.x;
+            if (name_w < 40.0f) name_w = 40.0f;
+
+            /* Name (click = preview this entity within the multi-selection). */
+            if (ImGui::Selectable(nm, is_focused, 0, ImVec2(name_w, 0.0f))) {
                 to_focus = id;
             }
+
+            /* Focus icon (crosshair) — drill into this entity: make it the SOLE
+             * selection so the Inspector enters its full single-entity panel and
+             * frame the camera on it. */
             ImGui::SameLine();
-            /* Frame camera on this entity. */
-            if (ImGui::SmallButton(focus_lbl)) {
-                jce_editor_scene_camera_focus_entity(id);
-                to_focus = id;
+            {
+                ImVec2 p = ImGui::GetCursorScreenPos();
+                if (ImGui::InvisibleButton("##focus", ImVec2(ico, ico)))
+                    to_select = id;
+                bool hov = ImGui::IsItemHovered();
+                ImDrawList *dl = ImGui::GetWindowDrawList();
+                ImVec2 cc = ImVec2(p.x + ico * 0.5f, p.y + ico * 0.5f);
+                ImU32 col = hov ? IM_COL32(255, 220, 120, 255)
+                                : IM_COL32(200, 200, 200, 255);
+                dl->AddCircle(cc, ico * 0.30f, col, 16, 1.5f);
+                dl->AddCircleFilled(cc, 1.5f, col, 8);
+                if (hov) ImGui::SetTooltip("%s", focus_lbl);
             }
+
+            /* Remove icon (X) — drop this entity from the selection. */
             ImGui::SameLine();
-            /* Remove from current selection. */
-            if (ImGui::SmallButton(remove_lbl)) {
-                to_remove = id;
+            {
+                ImVec2 p = ImGui::GetCursorScreenPos();
+                if (ImGui::InvisibleButton("##remove", ImVec2(ico, ico)))
+                    to_remove = id;
+                bool hov = ImGui::IsItemHovered();
+                ImDrawList *dl = ImGui::GetWindowDrawList();
+                ImU32 col = hov ? IM_COL32(255, 120, 120, 255)
+                                : IM_COL32(200, 200, 200, 255);
+                dl->AddLine(ImVec2(p.x + ico * 0.30f, p.y + ico * 0.30f),
+                            ImVec2(p.x + ico * 0.70f, p.y + ico * 0.70f), col, 1.8f);
+                dl->AddLine(ImVec2(p.x + ico * 0.70f, p.y + ico * 0.30f),
+                            ImVec2(p.x + ico * 0.30f, p.y + ico * 0.70f), col, 1.8f);
+                if (hov) ImGui::SetTooltip("%s", remove_lbl);
             }
             ImGui::PopID();
         }
@@ -244,12 +270,20 @@ bool insp_draw_multi_select_view(JceScene *scene)
             ImGui::Text("... %d %s", sel_count - 20, jce_editor_i18n("inspector.andMore"));
 
         if (to_remove) jce_state_deselect_entity(to_remove);
+        else if (to_select) {
+            /* Drill-in: collapse the multi-selection to this one entity so the
+             * Inspector enters its single-entity panel, and frame the camera.
+             * (Previously "focus" only moved the camera + retargeted the focused
+             * id, which left the bulk view up and read as "just camera
+             * tracking" instead of entering the object's inspector.) */
+            jce_state_select_entity(to_select, false);
+            jce_editor_scene_camera_focus_entity(to_select);
+        }
         else if (to_focus) {
-            /* Re-focus within multi-selection: just retarget the
-             * focused id; do NOT remove+re-add, which would shove the
-             * clicked entity to the tail of the selection array and
-             * make this very list visually "swap" the clicked row
-             * with the bottom row on every click. */
+            /* Row click = preview within the multi-selection: just retarget the
+             * focused id; do NOT remove+re-add, which would shove the clicked
+             * entity to the tail of the selection array and make this list
+             * visually "swap" the clicked row with the bottom row each click. */
             jce_state_set_focused(to_focus);
         }
     }

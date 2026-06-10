@@ -69,6 +69,23 @@ JceModel *jce_model_load_gltf_memory(const void *data, uint32_t size,
     return jce_gltf_load_memory(data, size, name);
 }
 
+/* Worker-decode + render-thread-upload split (delegates to the glTF loader). */
+JceModelCpu *jce_model_decode_gltf_cpu(const JcePakArchive *pak,
+                                       const char *asset_path)
+{
+    return jce_gltf_decode_cpu(pak, asset_path);
+}
+
+JceModel *jce_model_upload_gltf_cpu(JceModelCpu *cpu)
+{
+    return jce_gltf_upload_cpu(cpu);
+}
+
+void jce_model_gltf_cpu_free(JceModelCpu *cpu)
+{
+    jce_gltf_model_cpu_free(cpu);
+}
+
 /* ================================================================== */
 /* Destroy                                                             */
 /* ================================================================== */

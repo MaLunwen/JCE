@@ -49,6 +49,11 @@ JCE_API uint16_t jce_offscreen_target_get_view_id(const JceOffscreenTarget *brid
  * ordering and therefore cannot share the offscreen view-id). */
 JCE_API uint16_t jce_offscreen_target_get_frame_buffer(const JceOffscreenTarget *bridge);
 
+/* True when the color target is an HDR (RGBA16F) format. The editor uses this
+ * to keep the tonemap pass always-on (the HDR bridge must be tonemapped to LDR
+ * before display). False when the RGBA8 fallback was used. */
+JCE_API bool jce_offscreen_target_is_hdr(const JceOffscreenTarget *bridge);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_OFFSCREEN_TARGET_H */

@@ -54,8 +54,17 @@ static void draw_content(void)
     if (ImGui::Button(jce_editor_i18n("materialGraph.button.generateShader")))
         generate_shader();
     ImGui::SameLine();
-    if (ImGui::Button(jce_editor_i18n("materialGraph.button.compileShader")))
-        compile_and_bind();
+    {
+        const bool compiling = shader_compile_running();
+        if (compiling) ImGui::BeginDisabled();
+        if (ImGui::Button(jce_editor_i18n("materialGraph.button.compileShader")))
+            compile_and_bind();
+        if (compiling) {
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::TextDisabled("compiling…");
+        }
+    }
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("materialGraph.button.import"))) {
         if (s_g.path[0]) {
@@ -126,6 +135,10 @@ static void set_current_tab(int idx)
 
 void draw_workbench(void)
 {
+    /* Pick up a finished background shader compile regardless of which
+     * authoring tab is active. */
+    shader_compile_poll();
+
     ensure_tab_state_loaded();
     if (!ImGui::BeginTabBar("##graph_authoring_tabs"))
         return;

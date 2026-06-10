@@ -32,9 +32,8 @@ endif()
 # passes them through JCE_PROJECT_PREBUILT_* variables.  These probes
 # only support manual CMake consumers that deliberately add host tools
 # beside the SDK.
-if(WIN32)
-	set(_jce_pak_exe "${_jce_bin_dir}/jce_pak.exe")
-else()
+set(_jce_pak_exe "${_jce_bin_dir}/jce_pak.exe")
+if(NOT EXISTS "${_jce_pak_exe}")
 	set(_jce_pak_exe "${_jce_bin_dir}/jce_pak")
 endif()
 if(EXISTS "${_jce_pak_exe}")
@@ -44,9 +43,8 @@ endif()
 
 # ---- Optional host bundle wrapper (legacy/developer SDK extension). #
 # Editor-driven builds use JCE_PROJECT_PREBUILT_BUNDLE_DIR instead.
-if(WIN32)
-	set(_jce_bin2obj_exe "${_jce_bin_dir}/jce_bin2obj.exe")
-else()
+set(_jce_bin2obj_exe "${_jce_bin_dir}/jce_bin2obj.exe")
+if(NOT EXISTS "${_jce_bin2obj_exe}")
 	set(_jce_bin2obj_exe "${_jce_bin_dir}/jce_bin2obj")
 endif()
 if(EXISTS "${_jce_bin2obj_exe}")
@@ -59,9 +57,8 @@ endif()
 # jce_add_pak() pre-decode textures (PNG→RGBA8) and audio (WAV/OGG→PCM)
 # before packing, so a no-editor consumer gets real cooked assets
 # instead of a raw/stub PAK.
-if(WIN32)
-	set(_jce_cook_exe "${_jce_bin_dir}/jce_cook.exe")
-else()
+set(_jce_cook_exe "${_jce_bin_dir}/jce_cook.exe")
+if(NOT EXISTS "${_jce_cook_exe}")
 	set(_jce_cook_exe "${_jce_bin_dir}/jce_cook")
 endif()
 if(EXISTS "${_jce_cook_exe}")
@@ -110,6 +107,12 @@ if(EXISTS "${_jce_core_release}")
 		MAP_IMPORTED_CONFIG_MINSIZEREL     RELEASE)
 endif()
 
+# Emscripten ships a Release-only wasm fat lib; a Debug-config consumer
+# must still resolve to it (there is no Debug wasm archive).
+if(EMSCRIPTEN AND EXISTS "${_jce_core_release}")
+	set_target_properties(JCE::JCE PROPERTIES MAP_IMPORTED_CONFIG_DEBUG RELEASE)
+endif()
+
 # ---- Force-link the *core* fat lib only --------------------------- #
 # jce_engine_core bundles every first-party JCE TU, including ones the
 # user game never *explicitly* references (RmlUI binding, SDL_main,
@@ -136,6 +139,22 @@ if(WIN32 AND MSVC)
 	if(CMAKE_SIZEOF_VOID_P EQUAL 4)
 		set_property(TARGET JCE::JCE APPEND PROPERTY
 			INTERFACE_LINK_OPTIONS "/LARGEADDRESSAWARE")
+	endif()
+elseif(EMSCRIPTEN)
+	# Use CMake's portable LINKER: prefix, NOT a hand-written -Wl,.  emcc
+	# expands `-Wl,a,b,c` by splitting on commas, so the literal form
+	# `-Wl,--whole-archive,<lib>,-Wl,--no-whole-archive` forwards a stray
+	# `-Wl` token to wasm-ld ("unknown argument: -Wl").  `LINKER:a,b,c`
+	# becomes a single `-Wl,a,b,c` — one prefix, comma-separated sub-args.
+	if(EXISTS "${_jce_core_release}")
+		set_property(TARGET JCE::JCE APPEND PROPERTY
+			INTERFACE_LINK_OPTIONS
+				"$<$<NOT:$<CONFIG:Debug>>:LINKER:--whole-archive,${_jce_core_release},--no-whole-archive>")
+	endif()
+	if(EXISTS "${_jce_core_debug}")
+		set_property(TARGET JCE::JCE APPEND PROPERTY
+			INTERFACE_LINK_OPTIONS
+				"$<$<CONFIG:Debug>:LINKER:--whole-archive,${_jce_core_debug},--no-whole-archive>")
 	endif()
 elseif(APPLE)
 	if(EXISTS "${_jce_core_release}")
@@ -216,6 +235,16 @@ if(WIN32)
 				"but the SDK did not install it.")
 		endif()
 	endif()
+elseif(EMSCRIPTEN)
+	# libc++/libm/pthread are emcc built-ins; do NOT find_package(Threads)
+	# or link dl/m (pthread would force SharedArrayBuffer + COOP/COEP).
+	# The engine's WebGL2/GLES3 ABI link flags — every find_package consumer
+	# inherits these via JCE::JCE.
+	set_property(TARGET JCE::JCE APPEND PROPERTY
+		INTERFACE_LINK_OPTIONS
+			-sWASM=1 -sALLOW_MEMORY_GROWTH=1 -sMAX_WEBGL_VERSION=2
+			-sMIN_WEBGL_VERSION=2 -sFULL_ES3=1 -sSTACK_SIZE=1048576
+			-sMALLOC=emmalloc "$<$<CONFIG:Debug>:-sASSERTIONS=1>")
 elseif(APPLE)
 	set_property(TARGET JCE::JCE APPEND PROPERTY
 		INTERFACE_LINK_LIBRARIES

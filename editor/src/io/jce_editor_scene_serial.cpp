@@ -22,6 +22,7 @@ extern "C" {
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_path.h>
 #include <jce/os/core/jce_alloc.h>
+#include <jce/os/core/jce_thread.h>
 #include <jce/renderer/jce_model.h>
 #include <jce/renderer/jce_pbr_material.h>
 }
@@ -32,6 +33,8 @@ extern "C" {
 
 #include <cmath>
 #include <cstring>
+#include <string>
+#include <vector>
 
 /* ── Serialize entity tree to JSON (recursive, for prefabs) ────────── */
 
@@ -178,11 +181,23 @@ static bool is_gltf_extension(const char *path)
             strcmp(dot, ".GLTF") == 0 || strcmp(dot, ".GLB") == 0);
 }
 
-struct MeshValidCtx { int checked; int failed; const char *scene_dir; };
+/* ── Async post-save mesh-asset validation ────────────────────────────
+ *
+ * Verifying that every referenced glTF still loads through the engine's
+ * cgltf path means an open-read + full CPU parse per mesh — pure I/O +
+ * compute with no ECS / GPU touch.  That's exactly the work the engine's
+ * own async loader keeps OFF the main thread (jce_scene_async.c).  We
+ * snapshot the resolved mesh paths on the main thread (cheap ECS walk),
+ * then read+parse them on a worker; results go to the engine logger,
+ * which is thread-safe.  The round-trip validation stays synchronous
+ * because it instantiates a flecs scene (entity creation is main-thread
+ * only — same constraint the engine respects). */
+struct MeshGatherCtx { std::vector<std::string> abs; std::vector<std::string> rel;
+                       const char *scene_dir; };
 
-static void validate_mesh_cb(JceScene *sc, JceEntity e, void *ud)
+static void mesh_gather_cb(JceScene *sc, JceEntity e, void *ud)
 {
-    auto *ctx = static_cast<MeshValidCtx *>(ud);
+    auto *ctx = static_cast<MeshGatherCtx *>(ud);
 
     JceMeshRenderer *mr = jce_scene_get_mesh_renderer(sc, e);
     if (!mr || mr->mesh_path[0] == '\0') return;
@@ -194,43 +209,101 @@ static void validate_mesh_cb(JceScene *sc, JceEntity e, void *ud)
     } else {
         snprintf(abs_path, sizeof(abs_path), "%s", mr->mesh_path);
     }
+    ctx->abs.emplace_back(abs_path);
+    ctx->rel.emplace_back(mr->mesh_path);
+}
 
-    uint64_t file_size = 0;
-    void *data = jce_fs_host_read_all(abs_path, &file_size);
-    if (!data) return;
+struct MeshValidJob {
+    std::vector<std::string> abs;   /* resolved absolute paths */
+    std::vector<std::string> rel;   /* scene-relative, for logging */
+    int                      checked = 0;
+    int                      failed  = 0;
+    JceAtomicI32            *done    = nullptr;   /* 0 running, 1 finished */
+};
 
-    ctx->checked++;
-    JceModel *model = jce_model_load_gltf_memory(data, (uint32_t)file_size,
-                                                  mr->mesh_path);
-    jce_free(data);
+static JceThread    *g_mv_worker = nullptr;
+static MeshValidJob *g_mv_job    = nullptr;
 
-    if (!model) {
-        ctx->failed++;
-        LOG_WARN(LOG_TAG, "engine cgltf cannot load mesh '%s' — "
-                 "runtime may fail to display this model",
-                 mr->mesh_path);
-    } else {
-        jce_model_destroy(model);
+/* WORKER thread: read + cgltf-parse each mesh (no ECS / GPU). */
+static void mesh_valid_worker(void *arg)
+{
+    MeshValidJob *j = (MeshValidJob *)arg;
+    for (size_t i = 0; i < j->abs.size(); ++i) {
+        uint64_t file_size = 0;
+        void *data = jce_fs_host_read_all(j->abs[i].c_str(), &file_size);
+        if (!data) continue;
+        j->checked++;
+        /* Pass the resolved absolute path so the loader resolves any
+         * external .bin buffer from the asset's own directory. */
+        JceModel *model = jce_model_load_gltf_memory(
+            data, (uint32_t)file_size, j->abs[i].c_str());
+        jce_free(data);
+        if (!model) {
+            j->failed++;
+            LOG_WARN(LOG_TAG, "engine cgltf cannot load mesh '%s' — "
+                     "runtime may fail to display this model",
+                     j->rel[i].c_str());
+        } else {
+            jce_model_destroy(model);
+        }
     }
+    jce_atomic_i32_store(j->done, 1);
+}
+
+static void mesh_valid_finalize(void)
+{
+    MeshValidJob *j = g_mv_job;
+    if (!j) return;
+    if (g_mv_worker) { jce_thread_join(g_mv_worker); g_mv_worker = nullptr; }
+
+    if (j->checked > 0 && j->failed == 0) {
+        LOG_SUCCESS(LOG_TAG, "mesh asset validation passed: %d glTF "
+                    "files verified with engine cgltf", j->checked);
+    } else if (j->failed > 0) {
+        LOG_WARN(LOG_TAG, "mesh asset validation: %d/%d glTF files "
+                 "failed engine cgltf load", j->failed, j->checked);
+    }
+
+    if (j->done) jce_atomic_i32_destroy(j->done);
+    delete j;
+    g_mv_job = nullptr;
 }
 
 static void validate_mesh_assets(const char *scene_path)
 {
+    /* A prior validation still running: let it finish on its own (it
+     * covers a near-identical scene state); skip starting a second. */
+    if (g_mv_worker) return;
+
     char scene_dir[1024] = "";
     if (scene_path) {
         jce_path_parent(scene_dir, sizeof(scene_dir), scene_path);
     }
 
-    MeshValidCtx ctx = { 0, 0, scene_dir[0] ? scene_dir : NULL };
-    jce_scene_each_entity(s.scene, validate_mesh_cb, &ctx);
+    MeshGatherCtx gctx;
+    gctx.scene_dir = scene_dir[0] ? scene_dir : NULL;
+    jce_scene_each_entity(s.scene, mesh_gather_cb, &gctx);
+    if (gctx.abs.empty()) return;
 
-    if (ctx.checked > 0 && ctx.failed == 0) {
-        LOG_SUCCESS(LOG_TAG, "mesh asset validation passed: %d glTF "
-                    "files verified with engine cgltf", ctx.checked);
-    } else if (ctx.failed > 0) {
-        LOG_WARN(LOG_TAG, "mesh asset validation: %d/%d glTF files "
-                 "failed engine cgltf load", ctx.failed, ctx.checked);
+    MeshValidJob *j = new MeshValidJob();
+    j->abs  = std::move(gctx.abs);
+    j->rel  = std::move(gctx.rel);
+    j->done = jce_atomic_i32_create(0);
+    g_mv_job = j;
+
+    g_mv_worker = jce_thread_create(mesh_valid_worker, j, "jce_mesh_valid");
+    if (!g_mv_worker) {
+        /* No worker thread: run inline then finalise immediately. */
+        mesh_valid_worker(j);
+        mesh_valid_finalize();
     }
+}
+
+/* MAIN thread, per-frame: pick up a finished mesh validation. */
+extern "C" void jce_state_scene_serial_poll(void)
+{
+    if (g_mv_job && jce_atomic_i32_load(g_mv_job->done) != 0)
+        mesh_valid_finalize();
 }
 
 /* ── Post-load asset path repair (O(1) per path via asset index) ──── */

@@ -55,32 +55,54 @@ bool path_is_file(const char *path)
     return jce_fs_host_exists_file(path);
 }
 
-void collect_scene_roots(std::vector<std::string> *out)
+const std::vector<std::string> &collect_scene_roots(void)
 {
-    if (!out) return;
-    out->clear();
+    /* Cached: the root set only changes when the scene dir / assetdb root /
+       project root change, but the resolve fallbacks request it on every
+       cache miss — previously rebuilding ~10 heap-allocated strings per
+       call. Key over all three inputs; rebuilt only when one changes.
+       (Same single-threaded use as the rest of s_cache.) */
+    static std::vector<std::string> s_roots;
+    static std::string s_roots_key;
+
+    const char *adb_root = jce_assetdb_get_root();
+    const char *prj_root = jce_editor_assets_get_project();
+
+    std::string key;
+    key.reserve(256);
+    key.append(s_cache.scene_dir);
+    key.push_back('\n');
+    if (adb_root) key.append(adb_root);
+    key.push_back('\n');
+    if (prj_root) key.append(prj_root);
+
+    if (key == s_roots_key)
+        return s_roots;
+    s_roots_key.swap(key);
+    s_roots.clear();
+    s_roots.reserve(16);
 
     char parent_buf[512] = {0};
 
     if (s_cache.scene_dir[0] != '\0') {
-        out->push_back(std::string(s_cache.scene_dir));
+        s_roots.push_back(std::string(s_cache.scene_dir));
 
         if (jce_path_parent(parent_buf, sizeof(parent_buf), s_cache.scene_dir)) {
-            out->push_back(std::string(parent_buf));
+            s_roots.push_back(std::string(parent_buf));
         }
 
         char joined[512];
         const char *subdirs[] = { "Meshes", "Materials", "Textures", "materials", "textures", NULL };
         for (int i = 0; subdirs[i]; i++) {
             if (jce_path_join(joined, sizeof(joined), s_cache.scene_dir, subdirs[i])) {
-                out->push_back(std::string(joined));
+                s_roots.push_back(std::string(joined));
             }
         }
 
         if (parent_buf[0]) {
             for (int i = 0; subdirs[i]; i++) {
                 if (jce_path_join(joined, sizeof(joined), parent_buf, subdirs[i])) {
-                    out->push_back(std::string(joined));
+                    s_roots.push_back(std::string(joined));
                 }
             }
         }
@@ -92,14 +114,16 @@ void collect_scene_roots(std::vector<std::string> *out)
      * matches its current location on disk. */
     auto add_root = [&](const char *root) {
         if (!root || !root[0]) return;
-        for (const std::string &r : *out) {
+        for (const std::string &r : s_roots) {
             if (r == root) return;
         }
-        out->push_back(std::string(root));
+        s_roots.push_back(std::string(root));
     };
 
-    add_root(jce_assetdb_get_root());
-    add_root(jce_editor_assets_get_project());
+    add_root(adb_root);
+    add_root(prj_root);
+
+    return s_roots;
 }
 
 struct FindFileContext {
@@ -325,9 +349,8 @@ bool resolve_material_file_path(const char *material_path, char *out_mat, size_t
         }
     }
 
-    std::vector<std::string> roots;
-    collect_scene_roots(&roots);
-    
+    const std::vector<std::string> &roots = collect_scene_roots();
+
     for (const std::string &candidate : candidates) {
         if (jce_path_is_absolute(candidate.c_str()) && path_is_file(candidate.c_str())) {
             snprintf(out_mat, out_size, "%s", candidate.c_str());
@@ -417,8 +440,7 @@ static bool try_resolve_texture_from_material_json(const char *material_path,
             }
             
             if (!loaded) {
-                std::vector<std::string> roots;
-                collect_scene_roots(&roots);
+                const std::vector<std::string> &roots = collect_scene_roots();
                 for (const std::string &root_dir : roots) {
                     if (jce_path_join(joined, sizeof(joined), root_dir.c_str(), tex_ref.c_str())) {
                         if (try_resolve_texture_path(joined, out_path, out_size)) {
@@ -433,8 +455,7 @@ static bool try_resolve_texture_from_material_json(const char *material_path,
                 char basename[256];
                 if (jce_path_basename(basename, sizeof(basename), tex_ref.c_str())) {
                     char found[512];
-                    std::vector<std::string> roots;
-                    collect_scene_roots(&roots);
+                    const std::vector<std::string> &roots = collect_scene_roots();
                     if (find_file_by_name_recursive(roots, std::string(basename), 8, found, sizeof(found))) {
                         loaded = try_resolve_texture_path(found, out_path, out_size);
                     }
@@ -494,8 +515,7 @@ static bool try_resolve_texture_from_obj_mtl(const char *mesh_path, char *out_pa
         if (!path_is_file(mtl_path)) {
             char mtl_basename[256];
             if (jce_path_basename(mtl_basename, sizeof(mtl_basename), mtl_ref.c_str())) {
-                std::vector<std::string> roots;
-                collect_scene_roots(&roots);
+                const std::vector<std::string> &roots = collect_scene_roots();
                 if (!find_file_by_name_recursive(roots, std::string(mtl_basename),
                                                  8, mtl_path, sizeof(mtl_path))) {
                     continue;
@@ -540,8 +560,7 @@ static bool try_resolve_texture_from_obj_mtl(const char *mesh_path, char *out_pa
             char tex_basename[256];
             if (jce_path_basename(tex_basename, sizeof(tex_basename), tex_ref.c_str())) {
                 char found[512];
-                std::vector<std::string> roots;
-                collect_scene_roots(&roots);
+                const std::vector<std::string> &roots = collect_scene_roots();
                 if (find_file_by_name_recursive(roots, std::string(tex_basename),
                                                  8, found, sizeof(found))) {
                     if (try_resolve_texture_path(found, out_path, out_size))
@@ -577,8 +596,7 @@ bool resolve_texture_path_for_material(const char *material_path,
      * before falling through to material/MTL parsing. */
     if (material_path && material_path[0] != '\0'
         && looks_like_texture_asset_path(material_path)) {
-        std::vector<std::string> roots_for_tex;
-        collect_scene_roots(&roots_for_tex);
+        const std::vector<std::string> &roots_for_tex = collect_scene_roots();
         char joined[1024];
         for (const std::string &root : roots_for_tex) {
             if (jce_path_join(joined, sizeof(joined), root.c_str(), material_path)
@@ -637,8 +655,7 @@ bool resolve_texture_path_for_material(const char *material_path,
 
     /* Simplified fallback: scan Materials/ subdirs for .mat.json files */
     {
-        std::vector<std::string> roots;
-        collect_scene_roots(&roots);
+        const std::vector<std::string> &roots = collect_scene_roots();
         
         char mat_search[512];
         for (const std::string &root : roots) {

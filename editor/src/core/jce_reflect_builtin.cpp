@@ -45,6 +45,9 @@ static const JceDirectionalLight g_def_JceDirectionalLight = {
     /* color        */ {1.0f, 1.0f, 1.0f},
     /* intensity    */ 1.0f,
     /* casts_shadow */ true,
+    /* cookie       */ {UINT16_MAX},
+    /* cookie str   */ 0.0f,
+    /* cookie path  */ "",
 };
 JCE_REFLECT_BEGIN(JceDirectionalLight, "Directional Light")
     JCE_FIELD(JceDirectionalLight, direction,    JCE_FT_VEC3,    "Direction")

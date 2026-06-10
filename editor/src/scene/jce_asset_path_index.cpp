@@ -1,5 +1,12 @@
 /*
  * jce_asset_path_index.cpp  Implementation: project asset basename map.
+ *
+ * The recursive project walk can take seconds on large trees, so it also
+ * offers an async variant (jce_asset_path_index_rebuild_async): a worker
+ * thread builds a fresh index into a private set of maps, and the main
+ * thread swaps it into the live index in one move (jce_asset_path_index_poll).
+ * Lookups keep using the previous index until the swap, so the UI never
+ * blocks and never sees a half-populated table.
  */
 
 #include "jce_asset_path_index.h"
@@ -7,6 +14,7 @@
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_path.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/os/core/jce_thread.h>
 #include <jce/os/core/jce_timer.h>
 
 #include <algorithm>
@@ -22,10 +30,17 @@ namespace {
 
 struct PathSet { std::vector<std::string> paths; };
 
-std::unordered_map<std::string, PathSet> g_by_lower;
-std::unordered_map<std::string, PathSet> g_by_alphanum;
-std::unordered_map<std::string, PathSet> g_by_alphanum_stem_ext;
-size_t g_total = 0;
+/* One complete index.  The live copy is read on the main thread by
+ * lookups; an async rebuild builds a fresh one on a worker and the main
+ * thread move-assigns it over the live copy. */
+struct IndexMaps {
+    std::unordered_map<std::string, PathSet> by_lower;
+    std::unordered_map<std::string, PathSet> by_alphanum;
+    std::unordered_map<std::string, PathSet> by_alphanum_stem_ext;
+    size_t total = 0;
+};
+
+IndexMaps g_live;
 
 std::string lower_copy(const std::string &s)
 {
@@ -96,22 +111,27 @@ static const size_t kAutoIndexFileCap = 50000;
  * cap; covers cases where each callback is slow (e.g. SMB/sshfs). */
 static const uint64_t kAutoIndexTimeBudgetMs = 3000;
 
-static uint64_t g_walk_start_ms = 0;
-static bool     g_walk_budget_exceeded = false;
-
-bool walk_cb(const char *path, bool is_dir, void *user);
+/* Per-walk context, passed through jce_fs_host_walk's user pointer so the
+ * walk targets a specific IndexMaps (live for sync, private for async). */
+struct WalkCtx {
+    IndexMaps *maps;
+    uint64_t   start_ms;
+    bool       budget_exceeded;
+};
 
 bool walk_cb(const char *path, bool is_dir, void *user)
 {
-    (void)user;
+    WalkCtx  *wc = (WalkCtx *)user;
+    IndexMaps *m = wc->maps;
+
     /* Abort the entire walk once any cap is reached.  jce_fs_host_walk
      * treats a `false` return as STOP-WHOLE-WALK. */
-    if (g_total >= kAutoIndexFileCap) {
+    if (m->total >= kAutoIndexFileCap) {
         return false;
     }
-    if (g_walk_start_ms != 0 &&
-        (jce_time_ticks_ms() - g_walk_start_ms) > kAutoIndexTimeBudgetMs) {
-        g_walk_budget_exceeded = true;
+    if (wc->start_ms != 0 &&
+        (jce_time_ticks_ms() - wc->start_ms) > kAutoIndexTimeBudgetMs) {
+        wc->budget_exceeded = true;
         return false;
     }
     if (is_dir) {
@@ -143,17 +163,17 @@ bool walk_cb(const char *path, bool is_dir, void *user)
     if (!jce_path_basename(base, sizeof(base), path)) return true;
     std::string b(base);
 
-    g_by_lower[lower_copy(b)].paths.emplace_back(path);
+    m->by_lower[lower_copy(b)].paths.emplace_back(path);
 
     std::string stem, ext;
     split_stem_ext(b, &stem, &ext);
     if (!stem.empty()) {
         std::string aln_full = alphanum_lower(b);
-        if (!aln_full.empty()) g_by_alphanum[aln_full].paths.emplace_back(path);
+        if (!aln_full.empty()) m->by_alphanum[aln_full].paths.emplace_back(path);
 
         std::string aln_stem = alphanum_lower(stem);
         if (!aln_stem.empty() && !ext.empty()) {
-            g_by_alphanum_stem_ext[aln_stem + "|" + ext].paths.emplace_back(path);
+            m->by_alphanum_stem_ext[aln_stem + "|" + ext].paths.emplace_back(path);
 
             /* also index prefix-stripped form so requests without prefix
              * match disk files with prefix (SM_, T_, etc.) */
@@ -161,14 +181,14 @@ bool walk_cb(const char *path, bool is_dir, void *user)
             if (stripped != stem) {
                 std::string aln_stripped = alphanum_lower(stripped);
                 if (!aln_stripped.empty()) {
-                    g_by_alphanum_stem_ext[aln_stripped + "|" + ext]
+                    m->by_alphanum_stem_ext[aln_stripped + "|" + ext]
                         .paths.emplace_back(path);
                 }
             }
         }
     }
 
-    g_total++;
+    m->total++;
     return true;
 }
 
@@ -180,26 +200,16 @@ const std::string *pick_shortest(const PathSet *set)
     return best;
 }
 
-} /* anonymous */
-
-extern "C" {
-
-void jce_asset_path_index_clear(void)
-{
-    g_by_lower.clear();
-    g_by_alphanum.clear();
-    g_by_alphanum_stem_ext.clear();
-    g_total = 0;
-}
-
-int jce_asset_path_index_rebuild(const char *root)
+/* Walk `root` into `m` (additive).  Returns files added.  Thread-safe:
+ * touches only `m` + read-only OS calls, so a worker can call it on a
+ * private IndexMaps. */
+int index_walk_into(IndexMaps *m, const char *root)
 {
     if (!root || !*root) return 0;
     if (!jce_fs_host_exists_dir(root)) return 0;
     /* Refuse to walk a filesystem root.  Indexing the entire disk is
      * never the intended behavior and would block the caller (often
-     * the splash screen) for an unbounded amount of time.  Mirrors
-     * the guard in panels/jce_panel_assets.cpp:ensure_assets_init. */
+     * the splash screen) for an unbounded amount of time. */
     {
         const char *p = root;
         bool is_root = false;
@@ -213,30 +223,120 @@ int jce_asset_path_index_rebuild(const char *root)
             return 0;
         }
     }
-    size_t before = g_total;
-    g_walk_start_ms = jce_time_ticks_ms();
-    g_walk_budget_exceeded = false;
-    jce_fs_host_walk(root, walk_cb, nullptr);
-    g_walk_start_ms = 0;
-    int added = (int)(g_total - before);
-    if (g_total >= kAutoIndexFileCap) {
+    size_t before = m->total;
+    WalkCtx wc{ m, jce_time_ticks_ms(), false };
+    jce_fs_host_walk(root, walk_cb, &wc);
+    int added = (int)(m->total - before);
+    if (m->total >= kAutoIndexFileCap) {
         LOG_INFO(LOG_TAG, "indexed %d files under %s (total=%d, file cap %d hit)",
-                 added, root, (int)g_total, (int)kAutoIndexFileCap);
-    } else if (g_walk_budget_exceeded) {
+                 added, root, (int)m->total, (int)kAutoIndexFileCap);
+    } else if (wc.budget_exceeded) {
         LOG_INFO(LOG_TAG, "indexed %d files under %s (total=%d, %dms budget hit)",
-                 added, root, (int)g_total, (int)kAutoIndexTimeBudgetMs);
+                 added, root, (int)m->total, (int)kAutoIndexTimeBudgetMs);
     } else {
         LOG_INFO(LOG_TAG, "indexed %d files under %s (total=%d)",
-                 added, root, (int)g_total);
+                 added, root, (int)m->total);
     }
     return added;
+}
+
+/* ── Async rebuild plumbing ───────────────────────────────────────── */
+struct AsyncIndexJob {
+    std::string   root;
+    IndexMaps     maps;
+    JceAtomicI32 *done = nullptr;   /* 0 running, 1 finished */
+};
+
+JceThread     *g_aidx_worker      = nullptr;
+AsyncIndexJob *g_aidx_job         = nullptr;
+std::string    g_aidx_pending_root;   /* newest request while busy */
+
+void aidx_worker(void *arg)
+{
+    AsyncIndexJob *j = (AsyncIndexJob *)arg;
+    index_walk_into(&j->maps, j->root.c_str());   /* into private maps */
+    jce_atomic_i32_store(j->done, 1);
+}
+
+void aidx_finalize(void);   /* fwd */
+
+void aidx_start(const std::string &root)
+{
+    AsyncIndexJob *j = new AsyncIndexJob();
+    j->root = root;
+    j->done = jce_atomic_i32_create(0);
+    g_aidx_job = j;
+    g_aidx_worker = jce_thread_create(aidx_worker, j, "jce_asset_index");
+    if (!g_aidx_worker) {
+        /* No worker thread: build inline then finalise immediately. */
+        aidx_worker(j);
+        aidx_finalize();
+    }
+}
+
+void aidx_finalize(void)
+{
+    AsyncIndexJob *j = g_aidx_job;
+    if (!j) return;
+    if (g_aidx_worker) { jce_thread_join(g_aidx_worker); g_aidx_worker = nullptr; }
+    g_aidx_job = nullptr;
+
+    /* Swap the freshly-built index in (replaces the previous one). */
+    g_live = std::move(j->maps);
+    LOG_INFO(LOG_TAG, "async asset index ready: %d files under %s",
+             (int)g_live.total, j->root.c_str());
+
+    if (j->done) jce_atomic_i32_destroy(j->done);
+    delete j;
+
+    /* A newer request arrived mid-build → start it now. */
+    if (!g_aidx_pending_root.empty()) {
+        std::string next = g_aidx_pending_root;
+        g_aidx_pending_root.clear();
+        aidx_start(next);
+    }
+}
+
+} /* anonymous */
+
+extern "C" {
+
+void jce_asset_path_index_clear(void)
+{
+    g_live = IndexMaps{};
+}
+
+int jce_asset_path_index_rebuild(const char *root)
+{
+    /* Synchronous (additive) — kept for callers that need the index
+     * populated before they return. */
+    return index_walk_into(&g_live, root);
+}
+
+int jce_asset_path_index_rebuild_async(const char *root)
+{
+    if (!root || !*root) return 0;
+    if (g_aidx_worker) {
+        /* Busy: remember the newest root and rebuild after the current
+         * walk completes (avoids blocking to join here). */
+        g_aidx_pending_root = root;
+        return 0;
+    }
+    aidx_start(root);
+    return 0;
+}
+
+void jce_asset_path_index_poll(void)
+{
+    if (g_aidx_job && jce_atomic_i32_load(g_aidx_job->done) != 0)
+        aidx_finalize();
 }
 
 bool jce_asset_path_index_lookup(const char *requested_path,
                                  char *out_buf, int out_size)
 {
     if (!requested_path || !out_buf || out_size <= 0) return false;
-    if (g_total == 0) return false;
+    if (g_live.total == 0) return false;
 
     char base[256];
     if (!jce_path_basename(base, sizeof(base), requested_path)) {
@@ -247,8 +347,8 @@ bool jce_asset_path_index_lookup(const char *requested_path,
 
     /* 1. exact lower basename */
     {
-        auto it = g_by_lower.find(lower_copy(b));
-        if (it != g_by_lower.end()) {
+        auto it = g_live.by_lower.find(lower_copy(b));
+        if (it != g_live.by_lower.end()) {
             const std::string *p = pick_shortest(&it->second);
             if (p) { snprintf(out_buf, (size_t)out_size, "%s", p->c_str()); return true; }
         }
@@ -258,8 +358,8 @@ bool jce_asset_path_index_lookup(const char *requested_path,
     {
         std::string aln = alphanum_lower(b);
         if (!aln.empty()) {
-            auto it = g_by_alphanum.find(aln);
-            if (it != g_by_alphanum.end()) {
+            auto it = g_live.by_alphanum.find(aln);
+            if (it != g_live.by_alphanum.end()) {
                 const std::string *p = pick_shortest(&it->second);
                 if (p) { snprintf(out_buf, (size_t)out_size, "%s", p->c_str()); return true; }
             }
@@ -273,8 +373,8 @@ bool jce_asset_path_index_lookup(const char *requested_path,
         if (!stem.empty() && !ext.empty()) {
             std::string aln_stem = alphanum_lower(stem);
             if (!aln_stem.empty()) {
-                auto it = g_by_alphanum_stem_ext.find(aln_stem + "|" + ext);
-                if (it != g_by_alphanum_stem_ext.end()) {
+                auto it = g_live.by_alphanum_stem_ext.find(aln_stem + "|" + ext);
+                if (it != g_live.by_alphanum_stem_ext.end()) {
                     const std::string *p = pick_shortest(&it->second);
                     if (p) { snprintf(out_buf, (size_t)out_size, "%s", p->c_str()); return true; }
                 }
@@ -285,6 +385,6 @@ bool jce_asset_path_index_lookup(const char *requested_path,
     return false;
 }
 
-int jce_asset_path_index_size(void) { return (int)g_total; }
+int jce_asset_path_index_size(void) { return (int)g_live.total; }
 
 } /* extern "C" */

@@ -122,6 +122,11 @@ else()
 		RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/${JCE_BUILD_VARIANT}"
 		ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/${JCE_BUILD_VARIANT}")
 
+	# Optional linker map for the binary-size report (tools/gen_binsize_report.py).
+	if(COMMAND jce_emit_link_map)
+		jce_emit_link_map(CagedKingdom)
+	endif()
+
 	# Dist builds on Windows: GUI subsystem (no console window).
 	if(WIN32 AND JCE_BUILD_VARIANT STREQUAL "dist")
 		set_target_properties(CagedKingdom PROPERTIES WIN32_EXECUTABLE TRUE)

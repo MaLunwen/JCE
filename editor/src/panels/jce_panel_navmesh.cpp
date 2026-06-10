@@ -29,6 +29,7 @@
 #include "core/jce_assetdb.h"
 extern "C" {
 #include <jce/os/core/jce_json.h>
+#include <jce/os/core/jce_thread.h>
 #include <jce/api_scene.h>
 #include <jce/middleware/ai/jce_navmesh_recast.h>
 }
@@ -171,10 +172,85 @@ static void gather_entity(JceScene *scene, JceEntity e, void *ud)
     }
 }
 
-/* Real Recast bake: gather world triangles from the active scene and
- * serialise a Detour navmesh to the .navmesh.bin sidecar. */
+/* ── Async Recast bake ────────────────────────────────────────────────
+ * The Recast voxelisation/serialise (jce_recast_build_to_file) is 0.5-5s of
+ * pure CPU and must NOT run on the UI thread. Split: gather triangle soup on
+ * the main thread (reads the ECS scene — main-only), copy it into a job, run
+ * the build on a worker, then finalise on the main thread. Recast is one
+ * opaque call so "cancel" cannot interrupt it mid-build — it discards the
+ * result on completion; the editor stays responsive throughout. */
+struct NavBakeJob {
+    std::vector<float>    verts;
+    std::vector<uint32_t> indices;
+    JceRecastConfig       rc{};
+    char                  bin_path[300] = { 0 };
+    uint32_t              vcount = 0, tcount = 0;
+    JceRecastStats        stats = {};
+    bool                  ok = false;
+    JceAtomicI32         *done = nullptr;   /* 0 running, 1 finished */
+};
+
+static JceThread    *g_nav_worker = nullptr;
+static NavBakeJob   *g_nav_job    = nullptr;
+static JceAtomicI32 *g_nav_cancel = nullptr;
+
+static void nav_bake_worker(void *arg)
+{
+    NavBakeJob *j = (NavBakeJob *)arg;
+    j->ok = jce_recast_build_to_file(j->bin_path, j->verts.data(), j->vcount,
+                                     j->indices.data(), j->tcount,
+                                     &j->rc, &j->stats);
+    jce_atomic_i32_store(j->done, 1);
+}
+
+/* MAIN thread: join the finished bake, apply or discard its result. */
+static void nav_bake_finalize(void)
+{
+    NavBakeJob *j = g_nav_job;
+    if (!j) return;
+    if (g_nav_worker) { jce_thread_join(g_nav_worker); g_nav_worker = nullptr; }
+    bool cancelled = g_nav_cancel && jce_atomic_i32_load(g_nav_cancel) != 0;
+
+    if (cancelled) {
+        jce_editor_console_log("navmesh bake cancelled (result discarded)");
+    } else if (j->ok) {
+        s.result.stats        = j->stats;
+        s.result.in_vertices  = j->vcount;
+        s.result.in_triangles = j->tcount;
+        std::snprintf(s.result.out_path, sizeof(s.result.out_path), "%s",
+                      j->bin_path);
+        s.have_result = true;
+        jce_editor_console_log(
+            "navmesh baked: %u polys, %u verts, %d ms (from %u tris) -> %s",
+            (unsigned)j->stats.polygon_count, (unsigned)j->stats.vertex_count,
+            j->stats.build_time_ms, (unsigned)j->tcount, j->bin_path);
+    } else {
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+            "navmesh bake failed (Recast build/serialise error) -> %s",
+            j->bin_path);
+        s.have_result = false;
+    }
+
+    if (j->done) jce_atomic_i32_destroy(j->done);
+    delete j;
+    g_nav_job = nullptr;
+}
+
+/* MAIN thread, per-frame: pick up a finished bake. */
+static void nav_bake_poll(void)
+{
+    if (g_nav_job && jce_atomic_i32_load(g_nav_job->done) != 0)
+        nav_bake_finalize();
+}
+
+static bool nav_bake_running(void) { return g_nav_worker != nullptr; }
+
+/* Gather scene triangles (main thread) and kick the Recast build onto a
+ * worker. No-op if a bake is already in flight. */
 void bake_recast(void)
 {
+    if (nav_bake_running()) return;
+
     const BakeSettings &c = s.cfg;
     JceScene *scene = jce_state_get_scene();
     if (!scene) {
@@ -185,7 +261,7 @@ void bake_recast(void)
 
     GatherCtx g;
     g.scene = scene;
-    jce_scene_each_entity(scene, gather_entity, &g);
+    jce_scene_each_entity(scene, gather_entity, &g);   /* main: reads ECS */
 
     if (g.verts.size() < 9 || g.indices.size() < 3) {
         jce_editor_console_log_level(JCE_CONSOLE_ERROR,
@@ -194,42 +270,34 @@ void bake_recast(void)
         return;
     }
 
-    JceRecastConfig rc;
-    jce_recast_default_config(&rc);
-    rc.cell_size          = c.cell_size;
-    rc.cell_height        = c.cell_height;
-    rc.walkable_slope_deg = c.max_slope_deg;
-    rc.walkable_height    = c.agent_height;
-    rc.walkable_climb     = c.climb_step;
-    rc.walkable_radius    = c.agent_radius;
+    NavBakeJob *j = new NavBakeJob();
+    j->verts   = std::move(g.verts);
+    j->indices = std::move(g.indices);
+    jce_recast_default_config(&j->rc);
+    j->rc.cell_size          = c.cell_size;
+    j->rc.cell_height        = c.cell_height;
+    j->rc.walkable_slope_deg = c.max_slope_deg;
+    j->rc.walkable_height    = c.agent_height;
+    j->rc.walkable_climb     = c.climb_step;
+    j->rc.walkable_radius    = c.agent_radius;
+    derive_bin_path(s.path, j->bin_path, sizeof(j->bin_path));
+    j->vcount = (uint32_t)(j->verts.size() / 3);
+    j->tcount = (uint32_t)(j->indices.size() / 3);
+    j->done   = jce_atomic_i32_create(0);
 
-    char bin_path[300];
-    derive_bin_path(s.path, bin_path, sizeof(bin_path));
+    if (!g_nav_cancel) g_nav_cancel = jce_atomic_i32_create(0);
+    jce_atomic_i32_store(g_nav_cancel, 0);
+    g_nav_job = j;
 
-    JceRecastStats stats = {};
-    uint32_t vcount = (uint32_t)(g.verts.size() / 3);
-    uint32_t tcount = (uint32_t)(g.indices.size() / 3);
-    bool ok = jce_recast_build_to_file(bin_path,
-                                       g.verts.data(), vcount,
-                                       g.indices.data(), tcount,
-                                       &rc, &stats);
-    if (!ok) {
-        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-            "navmesh bake failed (Recast build/serialise error) -> %s",
-            bin_path);
-        s.have_result = false;
-        return;
+    g_nav_worker = jce_thread_create(nav_bake_worker, j, "jce_nav_bake");
+    if (!g_nav_worker) {
+        /* No worker thread available: run inline + finalise immediately. */
+        nav_bake_worker(j);
+        nav_bake_finalize();
+    } else {
+        jce_editor_console_log("navmesh bake started in background (%u tris)…",
+                               (unsigned)j->tcount);
     }
-
-    s.result.stats        = stats;
-    s.result.in_vertices  = vcount;
-    s.result.in_triangles = tcount;
-    std::snprintf(s.result.out_path, sizeof(s.result.out_path), "%s", bin_path);
-    s.have_result = true;
-    jce_editor_console_log(
-        "navmesh baked: %u polys, %u verts, %d ms (from %u tris) -> %s",
-        (unsigned)stats.polygon_count, (unsigned)stats.vertex_count,
-        stats.build_time_ms, (unsigned)tcount, bin_path);
 }
 
 JceJson *to_json(void)
@@ -312,7 +380,14 @@ void draw_settings(void)
 
 void draw_actions(void)
 {
-    if (ImGui::Button(jce_editor_i18n_id("navmesh.button.bake", "nav_bake"))) bake_recast();
+    if (nav_bake_running()) {
+        ImGui::TextUnformatted("Baking navmesh… (background)");
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel##nav_cancel") && g_nav_cancel)
+            jce_atomic_i32_store(g_nav_cancel, 1);
+    } else if (ImGui::Button(jce_editor_i18n_id("navmesh.button.bake", "nav_bake"))) {
+        bake_recast();
+    }
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n_id("navmesh.button.clear", "nav_clr"))) {
         s.have_result = false;
@@ -353,6 +428,7 @@ void draw_preview(void)
 
 void draw_content(void)
 {
+    nav_bake_poll();   /* pick up a finished background bake */
     if (ImGui::CollapsingHeader(jce_editor_i18n("navmesh.section.settings"), ImGuiTreeNodeFlags_DefaultOpen))
         draw_settings();
     ImGui::Separator();

@@ -109,6 +109,7 @@ JcePbrMaterial jce_pbr_material_default(void)
     mat.alpha_mode              = JCE_ALPHA_OPAQUE;
     mat.alpha_cutoff            = 0.5f;
     mat.double_sided            = false;
+    mat.receive_shadows_off     = false;   /* Unity default: receive ON */
     mat.custom_program          = UINT16_MAX;
     return mat;
 }
@@ -186,12 +187,13 @@ void jce_pbr_material_bind(const JcePbrMaterial *mat,
     /* u_normalScale: x=normalScale (x<0 => checker fallback),
      *                y=doubleSided flag,
      *                z=view_mode (0=shaded, 1=wireframe, 2=textured/unlit, 3=wf+tex)
+     *                w=receiveShadowsOff (1 = skip all shadow sampling)
      */
     float normal_scale[4] = {
         mat->normal_scale,
         mat->double_sided ? 1.0f : 0.0f,
         s_view_mode,
-        0.0f
+        mat->receive_shadows_off ? 1.0f : 0.0f
     };
     bgfx_set_uniform(s_u_normal_scale, normal_scale, 1);
 

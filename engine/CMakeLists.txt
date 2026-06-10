@@ -468,7 +468,12 @@ target_link_libraries(JCE INTERFACE
 
 # ── Platform-specific link options (on the facade) ──
 if(JCE_PLATFORM_WEB)
-	# Web: C-array embedding handled by caged_kingdom module
+	# Web: C-array embedding handled by caged_kingdom module.
+	# Emscripten ABI link flags on the facade so in-tree apps (and the
+	# find_package SDK, which mirrors these) get a working WebGL2/GLES3 link.
+	target_link_options(JCE INTERFACE
+		-sWASM=1 -sALLOW_MEMORY_GROWTH=1 -sMAX_WEBGL_VERSION=2 -sMIN_WEBGL_VERSION=2
+		-sFULL_ES3=1 -sSTACK_SIZE=1048576 -sMALLOC=emmalloc "$<$<CONFIG:Debug>:-sASSERTIONS=1>")
 elseif(JCE_PLATFORM_ANDROID)
 	target_link_libraries(JCE INTERFACE
 		EGL GLESv3 android log)

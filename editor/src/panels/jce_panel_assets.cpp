@@ -173,8 +173,7 @@ void ensure_assets_init(void)
      * indicate a fallback that hit no useful candidate. */
     if (!s_assets.project_root.empty() &&
         !is_filesystem_root(s_assets.project_root.c_str())) {
-        jce_asset_path_index_clear();
-        jce_asset_path_index_rebuild(s_assets.project_root.c_str());
+        jce_asset_path_index_rebuild_async(s_assets.project_root.c_str());
         /* Mirror the resolved root into the editor-wide asset DB so the
          * in-modal asset picker (and any other consumer that queries
          * jce_assetdb_*) sees the same content as this browser even
@@ -551,10 +550,10 @@ void jce_editor_assets_set_project(const char *path)
     /* Rebuild the project-wide asset path index so resolvers can do
      * O(1) basename lookups instead of recursive filesystem walks.
      * Mirrors Unity's import-time GUID/path table at a coarser
-     * granularity (basename only).  Rebuild is one-shot per project
-     * switch — fast even on large packs (~10k files). */
-    jce_asset_path_index_clear();
-    jce_asset_path_index_rebuild(normalized.c_str());
+     * granularity (basename only).  Runs on a background worker (REPLACE)
+     * so opening a project never freezes the UI; the old index stays
+     * queryable until the new one swaps in (jce_asset_path_index_poll). */
+    jce_asset_path_index_rebuild_async(normalized.c_str());
     jce_assetdb_set_root(normalized.c_str());
 }
 

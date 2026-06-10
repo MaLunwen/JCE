@@ -34,6 +34,18 @@ JCE_API JceModel *jce_model_load_gltf(const JcePakArchive *pak, const char *asse
 JceModel *jce_model_load_gltf_memory(const void *data, uint32_t size,
                                       const char *name);
 
+/* Worker-decode + render-thread-upload split (see jce_gltf_loader.h).
+ *   worker:        JceModelCpu *c = jce_model_decode_gltf_cpu(pak, path);
+ *   render thread: JceModel    *m = jce_model_upload_gltf_cpu(c);  // consumes c
+ *   cancel:        jce_model_gltf_cpu_free(c);                     // no upload
+ * decode_cpu does cgltf parse + CPU extraction + image decode (no bgfx);
+ * upload_cpu creates the GPU meshes + textures on the calling thread. */
+typedef struct JceModelCpu JceModelCpu;
+JCE_API JceModelCpu *jce_model_decode_gltf_cpu(const JcePakArchive *pak,
+                                               const char *asset_path);
+JCE_API JceModel    *jce_model_upload_gltf_cpu(JceModelCpu *cpu);
+JCE_API void         jce_model_gltf_cpu_free(JceModelCpu *cpu);
+
 /* Destroy a model and all owned GPU resources (meshes, textures, skeleton). */
 JCE_API void jce_model_destroy(JceModel *model);
 

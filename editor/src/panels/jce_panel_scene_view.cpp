@@ -652,6 +652,67 @@ static bool compute_ground_hit(ImVec2 screen_pos, ImVec2 avail, float out_pos[3]
     return true;
 }
 
+/* Raycast the camera ray against scene-entity AABBs and return the nearest
+ * world-space hit point — the real surface under the cursor — so a dropped model
+ * lands ON whatever is beneath the cursor (Unity-style) instead of always on
+ * Y=0. Falls back to the Y=0 ground plane when nothing is hit. (Uses the same
+ * transform-scale AABBs as pick_entity_at_mouse.) */
+static bool compute_surface_hit(ImVec2 screen_pos, ImVec2 avail, float out_pos[3])
+{
+    float view_mat[16], proj_mat[16], eye[3];
+    if (!jce_editor_scene_get_camera_matrices(view_mat, proj_mat, eye,
+                                              avail.x, avail.y))
+        return compute_ground_hit(screen_pos, avail, out_pos);
+
+    JceGizmoCamera cam;
+    memcpy(cam.view, view_mat, sizeof(float) * 16);
+    memcpy(cam.proj, proj_mat, sizeof(float) * 16);
+    memcpy(cam.eye,  eye,      sizeof(float) * 3);
+    cam.viewport_size[0]   = avail.x;
+    cam.viewport_size[1]   = avail.y;
+    cam.viewport_origin[0] = screen_pos.x;
+    cam.viewport_origin[1] = screen_pos.y;
+
+    ImVec2 mouse = ImGui::GetMousePos();
+    float ray_o[3], ray_d[3];
+    gm_screen_to_ray(&cam, mouse.x, mouse.y, ray_o, ray_d);
+
+    JceScene *scene = jce_state_get_scene();
+    int total = jce_state_get_entity_count();
+    float best_t = 1e30f;
+    bool  hit = false;
+    for (int pi = 0; pi < total; pi++) {
+        uint32_t pid = jce_state_get_entity_id_by_index(pi);
+        if (pid == 0 || !jce_state_entity_exists(pid)) continue;
+        if (!jce_state_entity_enabled(pid)) continue;
+        JceTransform *t = scene ? jce_scene_get_transform(scene, (JceEntity)pid) : NULL;
+        if (!t) continue;
+        float hx = fabsf(t->scale.x) * 0.5f; if (hx < 0.1f) hx = 0.1f;
+        float hy = fabsf(t->scale.y) * 0.5f; if (hy < 0.1f) hy = 0.1f;
+        float hz = fabsf(t->scale.z) * 0.5f; if (hz < 0.1f) hz = 0.1f;
+        jce_vec3 ro    = jce_v3(ray_o[0], ray_o[1], ray_o[2]);
+        jce_vec3 rd    = jce_v3(ray_d[0], ray_d[1], ray_d[2]);
+        jce_vec3 bminv = jce_v3(t->position.x - hx, t->position.y - hy,
+                                t->position.z - hz);
+        jce_vec3 bmaxv = jce_v3(t->position.x + hx, t->position.y + hy,
+                                t->position.z + hz);
+        float t_hit;
+        if (jce_ray_aabb_intersect(ro, rd, bminv, bmaxv, &t_hit)
+            && t_hit >= 0.0f && t_hit < best_t) {
+            best_t = t_hit;
+            hit = true;
+        }
+    }
+
+    if (hit) {
+        out_pos[0] = ray_o[0] + ray_d[0] * best_t;
+        out_pos[1] = ray_o[1] + ray_d[1] * best_t;
+        out_pos[2] = ray_o[2] + ray_d[2] * best_t;
+        return true;
+    }
+    return compute_ground_hit(screen_pos, avail, out_pos);
+}
+
 /* Frame the selection (or all entities) in the scene view by computing
  * an AABB from JceTransform positions/scales and asking the editor scene
  * camera to fit it. Shared by the F / Shift+F hotkeys and the toolbar. */
@@ -725,15 +786,27 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
         } else if (is_mesh_asset(asset_path)) {
             /* Mesh drag: ghost preview on ground plane, or highlight
              * entity if the cursor is over one (mesh-on-entity = replace). */
+            /* Default = create a new entity on the surface under the cursor;
+             * hold Alt to instead REPLACE the hovered mesh entity (preview
+             * switches to the entity hover-highlight only while Alt is down).
+             * The ghost uses the RELATIVE path — the same cache key the created
+             * entity will use — so the editor mesh cache is warmed during hover
+             * and the drop can bottom-align against the real mesh AABB. */
+            bool alt = ImGui::GetIO().KeyAlt;
             uint32_t hit_id = pick_entity_at_mouse(screen_pos, avail);
-            if (entity_accepts_mesh_material_drop(hit_id)) {
+            if (alt && entity_accepts_mesh_material_drop(hit_id)) {
                 jce_editor_scene_clear_ghost();
                 jce_editor_scene_set_hover_entity(hit_id);
             } else {
                 jce_editor_scene_clear_hover_entity();
                 float hit[3];
-                if (compute_ground_hit(screen_pos, avail, hit))
-                    jce_editor_scene_set_ghost(asset_path, hit[0], hit[1], hit[2]);
+                if (compute_surface_hit(screen_pos, avail, hit)) {
+                    char rel_ghost[1024];
+                    jce_editor_path_to_relative(rel_ghost, sizeof(rel_ghost),
+                                                 asset_path);
+                    const char *ghost_path = rel_ghost[0] ? rel_ghost : asset_path;
+                    jce_editor_scene_set_ghost(ghost_path, hit[0], hit[1], hit[2]);
+                }
             }
         } else if (is_texture_or_material_asset(asset_path)) {
             /* Texture / material drag: highlight entity under cursor. */
@@ -874,17 +947,21 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
                 }
             }
         }
-        /* ── Mesh dropped onto an existing entity ───────────────── */
+        /* ── Mesh dropped: default = create new; Alt = replace hovered mesh ─ */
         else if (is_mesh_asset(asset_path)) {
+            /* Unity-style: a model drop ALWAYS creates a new entity. Replacing
+             * an existing entity's mesh is opt-in via Alt, so dragging a model
+             * onto a big ground plane no longer "attaches"/overwrites it. */
             uint32_t hit_id = pick_entity_at_mouse(screen_pos, avail);
-            JceMeshRenderer *mesh_renderer_comp = find_mesh_renderer_component(hit_id);
+            JceMeshRenderer *mesh_renderer_comp =
+                ImGui::GetIO().KeyAlt ? find_mesh_renderer_component(hit_id) : NULL;
             if (mesh_renderer_comp) {
                 /* Replace the existing entity's mesh + extract material. */
                 char rel_mesh[1024];
                 jce_editor_path_to_relative(rel_mesh, sizeof(rel_mesh),
                                              asset_path);
                 const char *store_mesh = rel_mesh[0] ? rel_mesh : asset_path;
-                jce_state_begin_transient_edit();
+                jce_state_begin_batch_edit();
                 {
                     auto &mr = *mesh_renderer_comp;
                     snprintf(mr.mesh_path, sizeof(mr.mesh_path),
@@ -897,7 +974,7 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
                     mr.ao_tex[0] = '\0';
                     mr.emissive_tex[0] = '\0';
                 }
-                jce_state_end_transient_edit();
+                jce_state_end_batch_edit();
 
                 jce_editor_scene_asset_cache_queue_material_extract(
                     hit_id, asset_path, asset_path);
@@ -911,9 +988,10 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
                     "Replaced mesh on '%s' with '%s'",
                     ent_name ? ent_name : "?", asset_path);
             } else {
-                /* ── Mesh dropped on empty space: create new entity ─ */
+                /* ── No Alt (or empty space): create a NEW entity on the real
+                 *    surface under the cursor (Unity-style). ─ */
                 float drop_pos[3] = { 0.0f, 0.0f, 0.0f };
-                compute_ground_hit(screen_pos, avail, drop_pos);
+                compute_surface_hit(screen_pos, avail, drop_pos);
 
                 char name_buf[128];
                 const char *fname = jce_editor_path_basename_view(asset_path);
@@ -942,7 +1020,7 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
                     }
                 }
 
-                jce_state_begin_transient_edit();
+                jce_state_begin_batch_edit();
                 uint32_t id = create_default_scene_entity(name_buf, 0,
                                                           JCE_COMP_FLAG_MESH_RENDERER,
                                                           JCE_MESH_SHAPE_CUBE);
@@ -1008,6 +1086,23 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
                         }
                     }
 
+                    /* Bottom-align: lift the new entity so its mesh AABB rests
+                     * ON the surface (no half-sinking for centre-origin models).
+                     * The hover ghost warmed the editor mesh cache under the
+                     * same relative path, so the focus bounds here reflect the
+                     * real mesh AABB; if the mesh is not cached yet this falls
+                     * back to the unit-cube bounds (a small, harmless lift). */
+                    if (scene) {
+                        float fb_lo[3], fb_hi[3];
+                        if (jce_editor_scene_camera_get_entity_focus_bounds(
+                                id, fb_lo, fb_hi)) {
+                            JceTransform *t2 =
+                                jce_scene_get_transform(scene, (JceEntity)id);
+                            if (t2)
+                                t2->position.y += (drop_pos[1] - fb_lo[1]);
+                        }
+                    }
+
                     jce_editor_scene_asset_cache_queue_material_extract(
                         id, asset_path, asset_path);
 
@@ -1017,7 +1112,7 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
                     jce_editor_console_log(
                         "Dropped mesh '%s' into scene", name_buf);
                 }
-                jce_state_end_transient_edit();
+                jce_state_end_batch_edit();
             }
         }
         else {

@@ -916,16 +916,19 @@ void jce_state_add_component(uint32_t entity_id, uint64_t comp_flag)
     case JCE_COMP_FLAG_DIR_LIGHT: {
         if (jce_scene_has_dir_light(s.scene, e)) return;
         JceDirectionalLight l;
+        memset(&l, 0, sizeof(l));
         l.direction    = jce_v3(0.0f, -1.0f, 0.0f);
         l.color        = jce_v3(1.0f, 1.0f, 1.0f);
         l.intensity    = 1.0f;
         l.casts_shadow = true;
+        l.cookie_texture.idx = UINT16_MAX;
         jce_scene_set_dir_light(s.scene, e, &l);
         break;
     }
     case JCE_COMP_FLAG_POINT_LIGHT: {
         if (jce_scene_has_point_light(s.scene, e)) return;
         JcePointLight l;
+        memset(&l, 0, sizeof(l));
         l.position  = jce_v3(0.0f, 0.0f, 0.0f);
         l.color     = jce_v3(1.0f, 1.0f, 1.0f);
         l.intensity = 1.0f;
@@ -936,6 +939,7 @@ void jce_state_add_component(uint32_t entity_id, uint64_t comp_flag)
     case JCE_COMP_FLAG_SPOT_LIGHT: {
         if (jce_scene_has_spot_light(s.scene, e)) return;
         JceSpotLight l;
+        memset(&l, 0, sizeof(l));
         l.position       = jce_v3(0.0f, 0.0f, 0.0f);
         l.direction      = jce_v3(0.0f, -1.0f, 0.0f);
         l.color          = jce_v3(1.0f, 1.0f, 1.0f);
@@ -943,6 +947,8 @@ void jce_state_add_component(uint32_t entity_id, uint64_t comp_flag)
         l.radius         = 10.0f;
         l.inner_cone_cos = 0.95f;
         l.outer_cone_cos = 0.85f;
+        l.cookie_texture.idx = UINT16_MAX;
+        l.ies_lut_texture.idx = UINT16_MAX;
         jce_scene_set_spot_light(s.scene, e, &l);
         break;
     }

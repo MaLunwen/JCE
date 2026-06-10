@@ -62,6 +62,17 @@ typedef struct {
 /* Load a glTF/GLB model from PAK. Returns NULL on failure. */
 JceModel *jce_model_load_gltf(const JcePakArchive *pak, const char *asset_path);
 
+/* Worker-decode + render-thread-upload split (see jce_gltf_loader.h).
+ *   worker:        JceModelCpu *c = jce_model_decode_gltf_cpu(pak, path);
+ *   render thread: JceModel    *m = jce_model_upload_gltf_cpu(c);  // consumes c
+ *   cancel:        jce_model_gltf_cpu_free(c);                     // no upload
+ * decode_cpu does cgltf parse + CPU extraction + image decode (no bgfx);
+ * upload_cpu creates the GPU meshes + textures on the calling thread. */
+typedef struct JceModelCpu JceModelCpu;
+JceModelCpu *jce_model_decode_gltf_cpu(const JcePakArchive *pak, const char *asset_path);
+JceModel    *jce_model_upload_gltf_cpu(JceModelCpu *cpu);
+void         jce_model_gltf_cpu_free(JceModelCpu *cpu);
+
 /* Destroy a model and all owned resources (meshes, textures, skeleton, anims). */
 void jce_model_destroy(JceModel *model);
 

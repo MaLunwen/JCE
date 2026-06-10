@@ -226,6 +226,9 @@ bool              jce_state_load_scene_from_jbundle(const char *jbundle_path);
 bool              jce_state_load_scene_from_catalog(const char *catalog_path,
                                                     const char *bundle_id_or_scene);
 bool              jce_state_save_scene_file(const char *scene_path);
+/* Per-frame pump for background scene-serial jobs (async post-save mesh
+ * validation).  Call once per editor frame from the main loop. */
+void              jce_state_scene_serial_poll(void);
 const char       *jce_state_get_current_scene_path(void);
 bool              jce_state_is_scene_modified(void);
 void              jce_state_mark_scene_modified(void);

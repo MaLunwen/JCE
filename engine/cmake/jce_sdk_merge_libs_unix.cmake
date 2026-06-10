@@ -69,6 +69,57 @@ if(NOT _all_libs)
 endif()
 
 # --------------------------------------------------------------------------- #
+# Emscripten — emar MRI script (CREATE / ADDLIB / SAVE)                         #
+# emar (llvm-ar) DOES honour `-M` MRI scripts, contrary to an earlier note:    #
+# the prior failure was a path-format bug (MSYS `/c/...` instead of Windows    #
+# `C:/...`).  CMake passes forward-slash Windows paths (C:/…, D:/…), which     #
+# llvm-ar accepts.  ADDLIB copies *all* members of each input archive,         #
+# correctly preserving duplicate member basenames (flecs ships several         #
+# parser.c / util.c / visit_*.c across addon subdirs → multiple parser.c.o).   #
+# The earlier extract+`emar x` approach flat-extracted into one dir, so the    #
+# second parser.c.o overwrote the first on disk → its symbols (flecs_id_parse, #
+# flecs_script_insert_entity, …) silently vanished → consumer link failed.     #
+# llvm-ar writes the archive symbol index on SAVE, so no separate ranlib step  #
+# is required (an extra `emar s` is run below, non-fatal, as belt-and-braces). #
+# --------------------------------------------------------------------------- #
+if(JCE_SDK_EMSCRIPTEN STREQUAL "1")
+	file(REMOVE "${OUT_LIB}")
+	set(_mri_script "${_out_dir}/${_out_stem}.emar.mri")
+	set(_mri "CREATE ${OUT_LIB}\n")
+	foreach(_lib IN LISTS _all_libs)
+		if(NOT EXISTS "${_lib}")
+			message(WARNING "jce_sdk_merge (emar MRI): ADDLIB target missing: ${_lib}")
+		endif()
+		string(APPEND _mri "ADDLIB ${_lib}\n")
+	endforeach()
+	string(APPEND _mri "SAVE\nEND\n")
+	file(WRITE "${_mri_script}" "${_mri}")
+
+	execute_process(
+		COMMAND "${AR_EXE}" -M
+		INPUT_FILE "${_mri_script}"
+		RESULT_VARIABLE _rc
+		ERROR_VARIABLE  _err)
+	if(NOT _rc EQUAL 0)
+		message(FATAL_ERROR
+			"jce_sdk_merge (emar MRI): failed (rc=${_rc})\n"
+			"MRI script: ${_mri_script}\n${_err}")
+	endif()
+	if(NOT EXISTS "${OUT_LIB}")
+		message(FATAL_ERROR "jce_sdk_merge (emar MRI): no output produced: ${OUT_LIB}")
+	endif()
+
+	# Belt-and-braces: refresh the symbol index. Non-fatal — SAVE already
+	# wrote one, and llvm-ar's `-s` flag form varies by version.
+	execute_process(COMMAND "${AR_EXE}" -s "${OUT_LIB}" RESULT_VARIABLE _sr ERROR_VARIABLE _serr)
+	if(NOT _sr EQUAL 0)
+		message(STATUS "jce_sdk_merge (emar MRI): symbol-table refresh skipped (rc=${_sr}); SAVE index retained")
+	endif()
+	message(STATUS "jce_sdk_merge_libs_unix (emar MRI): ${OUT_LIB}")
+	return()
+endif()
+
+# --------------------------------------------------------------------------- #
 # macOS — libtool -static                                                      #
 # libtool is Apple's dedicated static-lib merge tool; it handles             #
 # deduplication and symbol table generation internally.                        #

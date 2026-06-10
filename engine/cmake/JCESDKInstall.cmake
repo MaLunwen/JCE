@@ -261,6 +261,39 @@ function(jce_register_sdk_install)
 				${_deps_extra_targets}
 			VERBATIM)
 
+	elseif(EMSCRIPTEN)
+		# Emscripten: emar (CMAKE_AR) extract + re-archive.  emar does not
+		# honour `-M` MRI scripts, so jce_sdk_merge_libs_unix.cmake takes an
+		# explicit extract+qc path when JCE_SDK_EMSCRIPTEN=1.
+		message(STATUS "JCE SDK: emscripten fat-lib merge (emar) branch")
+		set(_unix_driver "${CMAKE_CURRENT_SOURCE_DIR}/cmake/jce_sdk_merge_libs_unix.cmake")
+
+		add_custom_command(
+			OUTPUT  "${_fat_lib_core}"
+			COMMAND "${CMAKE_COMMAND}"
+				-DAR_EXE=${CMAKE_AR}
+				-DOUT_LIB=${_fat_lib_core}
+				-DRSP_IMPORTED=${_empty_rsp}
+				-DRSP_OWNED=${_owned_rsp}
+				-DJCE_SDK_APPLE=0
+				-DJCE_SDK_EMSCRIPTEN=1
+				-P "${_unix_driver}"
+			DEPENDS ${_jce_sdk_TARGETS} "${_empty_rsp}" "${_owned_rsp}" "${_unix_driver}"
+			VERBATIM)
+
+		add_custom_command(
+			OUTPUT  "${_fat_lib_deps}"
+			COMMAND "${CMAKE_COMMAND}"
+				-DAR_EXE=${CMAKE_AR}
+				-DOUT_LIB=${_fat_lib_deps}
+				-DRSP_IMPORTED=${_rsp_imported}
+				-DRSP_OWNED=${_deps_extra_rsp}
+				-DJCE_SDK_APPLE=0
+				-DJCE_SDK_EMSCRIPTEN=1
+				-P "${_unix_driver}"
+			DEPENDS "${_rsp_imported}" "${_deps_extra_rsp}" "${_unix_driver}"
+			VERBATIM)
+
 	elseif(APPLE OR UNIX)
 		# macOS: libtool -static.  Linux: ar MRI script.
 		# Both are handled by jce_sdk_merge_libs_unix.cmake.

@@ -33,10 +33,11 @@ typedef enum {
 } JceBuildState;
 
 typedef enum {
-    JCE_BUILD_STAGE_NONE          = 0,
-    JCE_BUILD_STAGE_CONFIGURE     = 1,
-    JCE_BUILD_STAGE_COMPILE       = 2,
-    JCE_BUILD_STAGE_CONAN_INSTALL = 3
+    JCE_BUILD_STAGE_NONE           = 0,
+    JCE_BUILD_STAGE_CONFIGURE      = 1,
+    JCE_BUILD_STAGE_COMPILE        = 2,
+    JCE_BUILD_STAGE_CONAN_INSTALL  = 3,
+    JCE_BUILD_STAGE_PREPARE_ASSETS = 4  /* background cook/pack/embed */
 } JceBuildStage;
 
 typedef struct {

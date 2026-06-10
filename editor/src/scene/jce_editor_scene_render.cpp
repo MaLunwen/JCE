@@ -547,6 +547,19 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         cfg.fog_rt_height = 0;
     }
 
+    /* HDR bridge → keep the tonemap pass always-on. This MUST be set BEFORE
+       jce_scene_renderer_render: the PBR shader's linear-output flag
+       (u_iblParams.w) is derived from "tonemap enabled" inside that call, so the
+       scene must emit LINEAR into the RGBA16F target; the always-on tonemap pass
+       below then maps that linear HDR back to LDR for display (otherwise the
+       viewport shows raw washed-out HDR, and smooth light falloff keeps banding
+       into rings). No-op on the RGBA8 fallback. */
+    if (s_sr.scene_renderer && jce_offscreen_target_is_hdr(s_sr.bridge)) {
+        JcePostFXPipeline *pf =
+            jce_scene_renderer_get_postfx(s_sr.scene_renderer);
+        if (pf) jce_postfx_enable(pf, JCE_POSTFX_TONEMAP, true);
+    }
+
     JceScene *scene = jce_state_get_scene();
     if (scene && s_sr.scene_renderer) {
         float amb_color[3];
@@ -558,6 +571,10 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
                                   scene_view_id(), dt_sec, &cfg);
     }
 
+    /* GPU pick pass — on-demand inside jce_scene_pick_render: it early-outs
+     * unless a click request is awaiting service, so this per-frame call
+     * costs a flag test on idle frames (the former every-frame full-scene
+     * ID render was the editor's single largest fixed frame cost). */
     if (scene && s_sr.pick_pass) {
         jce_scene_pick_render(s_sr.pick_pass, scene, s_sr.camera,
                               width, height);

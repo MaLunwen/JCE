@@ -1259,12 +1259,13 @@ static void draw_profiles_tab(void)
 
         ImGui::Separator();
 
-        const char *stage_names[] = { "idle", "configure", "compile", "conan install" };
+        const char *stage_names[] = { "idle", "configure", "compile",
+                                      "conan install", "cooking assets" };
         const char *state_names[] = { "idle", "running", "succeeded", "failed" };
         int s_idx = (int) st.state;
         int g_idx = (int) st.stage;
         if (s_idx < 0 || s_idx > 3) s_idx = 0;
-        if (g_idx < 0 || g_idx > 3) g_idx = 0;
+        if (g_idx < 0 || g_idx > 4) g_idx = 0;
 
         ImVec4 col = ImVec4(0.85f, 0.85f, 0.85f, 1.0f);
         if (st.state == JCE_BUILD_RUNNING)   col = ImVec4(1.0f, 0.85f, 0.2f, 1.0f);

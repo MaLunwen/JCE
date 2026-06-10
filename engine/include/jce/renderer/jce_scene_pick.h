@@ -40,16 +40,20 @@ JCE_API bool jce_scene_pick_supported(void);
 JCE_API JceScenePickPass *jce_scene_pick_create(const JceScenePickDesc *desc);
 JCE_API void              jce_scene_pick_destroy(JceScenePickPass *pass);
 
-/* Submit the hidden ID pass for this frame. */
+/* Submit the hidden ID pass. On-demand: a no-op unless a click request
+ * recorded by jce_scene_pick_request() is awaiting service, in which case it
+ * renders the ID buffer once and queues the async pixel readback in the same
+ * frame. Call it every frame; idle frames cost a flag test. */
 JCE_API bool jce_scene_pick_render(JceScenePickPass *pass,
                                    JceScene *scene,
                                    const JceCamera *camera,
                                    uint32_t width,
                                    uint32_t height);
 
-/* Queue an async readback for the most recently rendered ID buffer pixel.
- * Returns false when readback is unsupported, the pass has not rendered,
- * another request is still pending, or the coordinate is outside the target. */
+/* Record a pick request at pixel (x, y); the next jce_scene_pick_render()
+ * call services it. No prior render is required. Returns false when readback
+ * is unsupported, pick shaders are unavailable, or another request is still
+ * in flight. Out-of-range coordinates are clamped at service time. */
 JCE_API bool jce_scene_pick_request(JceScenePickPass *pass,
                                     uint32_t x,
                                     uint32_t y);

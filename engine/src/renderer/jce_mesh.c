@@ -163,6 +163,15 @@ JceMesh *jce_mesh_create(const JceMeshVertex *vertices, uint32_t num_verts,
     const bgfx_memory_t *vmem = bgfx_copy(vertices,
                                            num_verts * (uint32_t)sizeof(JceMeshVertex));
     m->vbh = bgfx_create_vertex_buffer(vmem, &m->layout, BGFX_BUFFER_NONE);
+    if (m->vbh.idx == UINT16_MAX) {
+        /* bgfx static vertex-buffer pool exhausted (or upload failed): fail the
+         * whole mesh instead of returning a zombie with an invalid vbh that
+         * would forever submit nothing. Degrades gracefully under handle
+         * pressure rather than feeding a broken handle into the draw list. */
+        LOG_WARN(LOG_TAG, "mesh: vertex buffer allocation failed");
+        JCE_FREE(m);
+        return NULL;
+    }
 
     /* Create index buffer (optional). */
     if (indices && num_indices > 0) {
