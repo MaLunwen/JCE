@@ -453,9 +453,8 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
             jce_quat q = t->rotation;
             /* Honor each collider's size/center/radius (matches the physics +
              * the scene-view overlay) — was a fixed 0.5*scale cube before. */
-            float sx = (t->scale.x != 0.0f) ? fabsf(t->scale.x) : 1.0f;
-            float sy = (t->scale.y != 0.0f) ? fabsf(t->scale.y) : 1.0f;
-            float sz = (t->scale.z != 0.0f) ? fabsf(t->scale.z) : 1.0f;
+            jce_vec3 sca = jce_v3_abs_safe_scale(t->scale);
+            float sx = sca.x, sy = sca.y, sz = sca.z;
             if (jce_scene_has_box_collider(scene, e)) {
                 JceBoxColliderComponent *bc = jce_scene_get_box_collider(scene, e);
                 jce_vec3 ofs = bc ? jce_v3(bc->center[0], bc->center[1], bc->center[2])
@@ -502,6 +501,12 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
                     jce_scene_get_compound_collider(scene, e);
                 if (cpc) jce_gizmo_compound_collider_draw_from_component(
                              scene, e, cpc, 0xFF00FF00u, 0);  /* overlay: bounds, green */
+            }
+            if (jce_scene_has_mesh_collider(scene, e)) {
+                JceMeshColliderComponent *msc =
+                    jce_scene_get_mesh_collider(scene, e);
+                if (msc) jce_gizmo_mesh_collider_draw_from_component(
+                             scene, e, msc, 0xFF00FF00u, 0);  /* overlay: bounds, green */
             }
         }
         jce_debug_draw_flush(base, g.renderer);

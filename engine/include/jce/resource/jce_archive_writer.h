@@ -43,7 +43,20 @@ typedef struct JceArchiveWriterConfig {
                                 * data_offset (one copy on disk). Encrypted  *
                                 * entries never dedup (per-path nonce makes   *
                                 * their ciphertext unique). Deterministic.    */
+    uint32_t encryption_salt;  /* per-archive nonce salt mixed into every    *
+                                * ChaCha20 nonce (bytes 8-11) and written to *
+                                * the header's nonce_salt32 field when any   *
+                                * entry is encrypted.  Derive it from a      *
+                                * stable label (bundle id / "project_assets")*
+                                * via jce_archive_salt_from_label() so the   *
+                                * same path in two different archives never  *
+                                * shares a keystream.  0 = legacy no-salt.   */
 } JceArchiveWriterConfig;
+
+/* Derive a deterministic 32-bit nonce salt from a human-readable label
+ * (e.g. the bundle id, or "project_assets" for the embedded PAK).  NULL or
+ * empty labels yield 0 (the legacy no-salt value). */
+JCE_API uint32_t jce_archive_salt_from_label(const char *label);
 
 /* Create a writer.  `cfg` may be NULL for all defaults.  Returns NULL on OOM. */
 JCE_API JceArchiveWriter *jce_archive_writer_create(const JceArchiveWriterConfig *cfg);

@@ -20,6 +20,7 @@ bool jce_scene_renderer_view_order_build(uint16_t view_id_base,
                                          bool include_shadow_views,
                                          uint8_t csm_cascade_count,
                                          bool include_fog_views,
+                                         bool include_gpu_particle_view,
                                          JceSceneRendererViewOrder *out);
 
 #endif /* JCE_SCENE_RENDERER_VIEW_ORDER_H */

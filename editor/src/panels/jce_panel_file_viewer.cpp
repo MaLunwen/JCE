@@ -151,6 +151,7 @@ static JceFileViewerType fv_detect_ext(const char *ext)
         || strcmp(ext, ".rs") == 0 || strcmp(ext, ".go") == 0
         || strcmp(ext, ".js") == 0 || strcmp(ext, ".ts") == 0
         || strcmp(ext, ".html") == 0 || strcmp(ext, ".css") == 0
+        || strcmp(ext, ".rml") == 0 || strcmp(ext, ".rcss") == 0
         || strcmp(ext, ".bat") == 0 || strcmp(ext, ".ps1") == 0
         || strcmp(ext, ".gradle") == 0 || strcmp(ext, ".kts") == 0
         || strcmp(ext, ".properties") == 0)

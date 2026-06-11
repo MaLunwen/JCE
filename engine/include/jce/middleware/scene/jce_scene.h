@@ -201,6 +201,41 @@ typedef struct {
     float weather_intensity;   /* 0..1                                    */
 } JceSceneRenderingSettings;
 
+/* ── Scene-level world-streaming settings ───────────────────────────
+ *
+ * Authoring-side description of the open-world streaming setup: the
+ * streamer config (mirrors JceWorldStreamConfig field-for-field, kept
+ * as plain ints/floats so this header stays free of streaming-layer
+ * includes) plus the explicit chunk registry.  Serialized with the
+ * scene as a top-level "streaming" object; consumed by the editor's
+ * preview streamer and the runtime's default_main world streamer via
+ * jce_world_streamer_register_from_scene_settings(). */
+
+/* MUST stay equal to MAX_WORLD_CHUNKS in jce_world_streamer.c — the
+ * streamer's roster pool refuses registration #257 onward, so allowing
+ * more authored chunks here would silently drop them at runtime. */
+#define JCE_SCENE_MAX_STREAM_CHUNKS 256
+
+typedef struct JceSceneStreamChunk {
+    uint32_t id;          /* unique chunk id (grid cell index etc.)   */
+    float    center[3];   /* world-space chunk centre                 */
+    float    radius;      /* spatial radius for the distance test     */
+    char     path[256];   /* project-relative scene-fragment JSON     */
+} JceSceneStreamChunk;
+
+typedef struct JceSceneStreamingSettings {
+    uint32_t version;
+    bool     enabled;          /* default false — streaming is opt-in  */
+    int      mode;             /* 0 = radial, 1 = rectangular          */
+    float    load_radius;      /* metres — start loading inside        */
+    float    unload_radius;    /* metres — unload beyond (>= load)     */
+    uint32_t max_pending;      /* max concurrent background loads      */
+    uint32_t budget_mb;        /* raw chunk-file byte budget, MiB      */
+    float    frame_budget_ms;  /* cooperative-mode per-frame budget    */
+    uint32_t chunk_count;
+    JceSceneStreamChunk chunks[JCE_SCENE_MAX_STREAM_CHUNKS];
+} JceSceneStreamingSettings;
+
 /* ── Sprite renderer component ──────────────────────────────────── */
 
 typedef struct {
@@ -261,6 +296,18 @@ typedef struct {
        engine then stays generic: blend_param / SM params are whatever game code
        or the authored values set them to (the renderer only evaluates). */
     bool  auto_speed;
+    /* ── Transient locomotion state (NEVER serialized) ─────────────────
+       Written each fixed tick by the runtime's character driver from live
+       physics, consumed by the renderer's SM/blend-tree driver when
+       auto_speed is set: Speed/blend_param get loco_speed (steadier than
+       the transform-derived estimate), plus the optional SM params
+       IsGrounded / VerticalVel / Jump (trigger; loco_jump is one-shot —
+       the consumer clears it). loco_valid marks the data live. */
+    bool  loco_valid;
+    bool  loco_grounded;
+    bool  loco_jump;
+    float loco_speed;
+    float loco_vert_vel;
 } JceSkeletalAnimatorComponent;
 
 /* ── Constraint component ───────────────────────────────────────── */
@@ -275,6 +322,33 @@ typedef struct {
     float    upper_limit;
     bool     disable_collision;
 } JceConstraintComponent;
+
+/* ── Animation-rigging IK constraints ────────────────────────────────
+ *
+ * Authored in the editor's Animation Rigging panel and consumed by the
+ * scene renderer after pose sampling (currently only kind==1 TwoBoneIK is
+ * solved; the other kinds round-trip through serialization but are inert).
+ *
+ * NOTE: there is NO JCE_COMP_FLAG bit for this component — the 64-bit
+ * flag field is full.  It is presence-gated (jce_scene_has_ik_constraints),
+ * exactly like VideoPlayer/NavAgent, for enumeration and serialization. */
+typedef struct {
+    int      kind;            /* 0=Aim 1=TwoBoneIK 2=MultiParent 3=Position 4=Rotation */
+    char     name[48];
+    float    weight;          /* 0..1 */
+    bool     enabled;
+    char     root_bone[64];
+    char     mid_bone[64];
+    char     end_bone[64];
+    uint32_t target_entity;   /* 0 = none */
+    uint32_t pole_entity;     /* 0 = use pole_offset */
+    float    pole_offset[3];  /* model-space offset from root when pole_entity==0 */
+} JceIkConstraint;
+
+typedef struct {
+    int             count;
+    JceIkConstraint constraints[16];
+} JceIkConstraintComponent;
 
 /* ── Physics components ──────────────────────────────────────────── */
 
@@ -403,6 +477,16 @@ typedef struct {
     float radius;
     float step_offset;
     float slope_limit;
+    /* Movement feel (0 = engine default, kept for scenes saved before
+       these fields existed). Speeds in m/s, accel in m/s^2, turn speed
+       in deg/s; sprint_mult scales move_speed while sprinting and
+       air_control scales accel while airborne (0..1). */
+    float move_speed;
+    float sprint_mult;
+    float jump_speed;
+    float accel;
+    float air_control;
+    float turn_speed_deg;
 } JceCharacterControllerComponent;
 
 /* ── Audio source component ──────────────────────────────────────── */
@@ -471,6 +555,8 @@ typedef struct {
     float    emit_rate;          /* legacy quick-tune (used when asset_path empty) */
     float    lifetime_min;
     float    lifetime_max;
+    bool     gpu;                /* request compute-driven simulation; silently
+                                  * falls back to CPU when unsupported */
 
     /* Engine-owned runtime state (NOT serialized; cleared on scene load). */
     uint32_t emitter_handle_idx; /* JceEmitterHandle.idx; UINT32_MAX = none */
@@ -1139,6 +1225,13 @@ typedef struct {
 
 /* ── P4-C.3: VFX graph + tilemap rendering/collider ──────────────── */
 
+/* RETIRED (v0.9.9 consolidation): the orphaned VFX Graph runtime duplicated
+ * the JceParticleSystem pipeline and was removed.  The scene JSON loader
+ * migrates legacy "VfxGraph" components one-way onto
+ * JceParticleEmitterComponent (graphPath -> asset_path); nothing sets,
+ * saves, or draws this component anymore.  The struct, accessors, and
+ * JCE_COMP_FLAG_VFX_GRAPH bit are kept only for source/ABI stability —
+ * do not wire new features to them. */
 typedef struct {
     char     graph_path[128];   /* asset path to .vfxgraph file */
     bool     play_on_awake;
@@ -1194,13 +1287,62 @@ typedef struct {
     bool             is_global;      /* true = always applies, no distance test */
 } JceVolumeComponent;
 
-/* ── Occlusion portal (P4-C — flag 63) ────────────────────────────── */
+/* ── Occlusion portal (P4-C — flag 63) ──────────────────────────────
+ *
+ * RESERVED for a future portal/cell occlusion culler.  This component
+ * is authored/serialized but NOT consumed by the current GPU-query
+ * occlusion culler (jce_occlusion_culler.c), which tests per-renderable
+ * bounding boxes and has no portal/cell concept.  The inspector shows
+ * an "unwired" badge for it until that culler lands. */
 
 typedef struct {
     jce_vec3 size;      /* portal extents (world-space box around the entity) */
     bool     open;      /* true = portal open; objects behind it are visible  */
     int32_t  portal_id; /* user-assigned ID for pairing portals               */
 } JceOcclusionPortalComponent;
+
+/* ── Nav-mesh agent (Detour crowd steering) ──────────────────────────
+ *
+ * NOTE: there is NO JCE_COMP_FLAG bit for this component — the 64-bit
+ * flag field is full.  It is presence-gated (jce_scene_has_nav_agent),
+ * exactly like VideoPlayer, for enumeration and serialization. */
+typedef struct {
+    float radius;            /* m; <=0 -> engine default 0.4 */
+    float height;            /* m; editor gizmo only */
+    float max_speed;         /* m/s; <=0 -> 3.0 */
+    float max_accel;         /* m/s^2; <=0 -> 12.0 */
+    float arrive_radius;     /* <=0 -> 1.5 */
+    float waypoint_radius;   /* <=0 -> 0.5 */
+    float target[3];         /* world destination; only XZ consumed */
+    uint64_t target_entity;  /* 0 = use target[]; else follow that entity */
+    bool  auto_repath;       /* re-issue set_destination when target moves */
+    bool  enabled;
+} JceNavAgentComponent;
+
+/* ── Sequence player (Sequencer .seq.json playback) ──────────────────
+ *
+ * Binds an authored sequencer asset to scene entities and drives it at
+ * runtime via jce_scene_sequencer_update() (jce_scene_sequencer.h).
+ *
+ * NOTE: there is NO JCE_COMP_FLAG bit for this component — the 64-bit
+ * flag field is full.  It is presence-gated (jce_scene_has_sequence_player),
+ * exactly like VideoPlayer/NavAgent/IkConstraints, for enumeration and
+ * serialization. */
+#define JCE_SEQ_PLAYER_MAX_BINDINGS 32
+typedef struct {
+    char     seq_path[256];
+    bool     play_on_awake;
+    bool     loop_override;     /* loop value used when override_loop */
+    bool     override_loop;     /* true = force loop_override over the asset's */
+    float    speed;             /* <=0 => 1.0 */
+    int      binding_count;
+    uint64_t bindings[JCE_SEQ_PLAYER_MAX_BINDINGS]; /* per-track entity refs */
+    /* runtime (not serialized; zeroed on load) */
+    void    *seq;               /* JceSeqPlayerRuntime* (jce_scene_sequencer.c) */
+    float    prev_time;
+    bool     started;
+    uint64_t opened_hash;       /* FNV-1a of seq_path the runtime opened with */
+} JceSequencePlayerComponent;
 
 /* ── Component type flags (bitmask for enumeration) ──────────────── */
 
@@ -1262,7 +1404,7 @@ typedef uint64_t JceComponentFlag;
 #define JCE_COMP_FLAG_NET_TRANSFORM        (UINT64_C(1) << 53)
 #define JCE_COMP_FLAG_NET_ANIMATOR         (UINT64_C(1) << 54)
 #define JCE_COMP_FLAG_NET_RIGIDBODY        (UINT64_C(1) << 55)
-#define JCE_COMP_FLAG_VFX_GRAPH            (UINT64_C(1) << 56)
+#define JCE_COMP_FLAG_VFX_GRAPH            (UINT64_C(1) << 56) /* RETIRED v0.9.9 — loader migrates to ParticleEmitter; bit kept reserved */
 #define JCE_COMP_FLAG_TILEMAP              (UINT64_C(1) << 57)
 #define JCE_COMP_FLAG_TILEMAP_COLLIDER_2D  (UINT64_C(1) << 58)
 #define JCE_COMP_FLAG_AVATAR               (UINT64_C(1) << 59)
@@ -1298,6 +1440,23 @@ JCE_API const JceSceneRenderingSettings *
 JCE_API JceSceneRenderingSettings *
                   jce_scene_get_rendering_settings_mut(JceScene *scene);
 JCE_API void      jce_scene_clear_rendering_settings(JceScene *scene);
+
+/* Scene-level world-streaming settings.  Same lifecycle contract as the
+ * rendering settings (has/set/get/get_mut/clear), but the ~70 KB block is
+ * heap-allocated lazily — scenes that never author streaming pay one
+ * pointer.  set() sanitizes (unload >= load, counts/paths clamped);
+ * get() returns NULL until authored; clear() frees the block. */
+JCE_API JceSceneStreamingSettings
+                  jce_scene_streaming_settings_default(void);
+JCE_API bool      jce_scene_has_streaming_settings(const JceScene *scene);
+JCE_API void      jce_scene_set_streaming_settings(
+                      JceScene *scene,
+                      const JceSceneStreamingSettings *settings);
+JCE_API const JceSceneStreamingSettings *
+                  jce_scene_get_streaming_settings(const JceScene *scene);
+JCE_API JceSceneStreamingSettings *
+                  jce_scene_get_streaming_settings_mut(JceScene *scene);
+JCE_API void      jce_scene_clear_streaming_settings(JceScene *scene);
 
 /*
  * Clear all user entities from the scene without destroying the scene object.
@@ -1728,6 +1887,7 @@ JCE_API JceNetRigidbodyComponent     *jce_scene_get_net_rigidbody(JceScene *s, J
 JCE_API bool                          jce_scene_has_net_rigidbody(const JceScene *s, JceEntity e);
 JCE_API void                          jce_scene_remove_net_rigidbody(JceScene *s, JceEntity e);
 
+/* RETIRED component (see JceVfxGraphComponent): accessors kept for ABI only. */
 JCE_API void                          jce_scene_set_vfx_graph(JceScene *s, JceEntity e, const JceVfxGraphComponent *c);
 JCE_API JceVfxGraphComponent         *jce_scene_get_vfx_graph(JceScene *s, JceEntity e);
 JCE_API bool                          jce_scene_has_vfx_graph(const JceScene *s, JceEntity e);
@@ -1781,6 +1941,28 @@ JCE_API void                          jce_scene_set_occlusion_portal(JceScene *s
 JCE_API JceOcclusionPortalComponent  *jce_scene_get_occlusion_portal(JceScene *s, JceEntity e);
 JCE_API bool                          jce_scene_has_occlusion_portal(const JceScene *s, JceEntity e);
 JCE_API void                          jce_scene_remove_occlusion_portal(JceScene *s, JceEntity e);
+
+/* ── Nav-mesh agent (presence-gated, no flag bit) ────────────────── */
+JCE_API void                          jce_scene_set_nav_agent(JceScene *s, JceEntity e, const JceNavAgentComponent *c);
+JCE_API JceNavAgentComponent         *jce_scene_get_nav_agent(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_nav_agent(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_nav_agent(JceScene *s, JceEntity e);
+
+/* ── Animation-rigging IK constraints (presence-gated, no flag bit) ──
+ * No JCE_COMP_FLAG bit — the 64-bit flag space is full; presence-gated
+ * like VideoPlayer/NavAgent. */
+JCE_API void                          jce_scene_set_ik_constraints(JceScene *s, JceEntity e, const JceIkConstraintComponent *c);
+JCE_API JceIkConstraintComponent     *jce_scene_get_ik_constraints(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_ik_constraints(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_ik_constraints(JceScene *s, JceEntity e);
+
+/* ── Sequence player (presence-gated, no flag bit) ───────────────────
+ * No JCE_COMP_FLAG bit — the 64-bit flag space is full; presence-gated
+ * like VideoPlayer/NavAgent/IkConstraints. */
+JCE_API void                          jce_scene_set_sequence_player(JceScene *s, JceEntity e, const JceSequencePlayerComponent *c);
+JCE_API JceSequencePlayerComponent   *jce_scene_get_sequence_player(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_sequence_player(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_sequence_player(JceScene *s, JceEntity e);
 
 /* Component enumeration — returns bitmask of JceComponentFlag. */
 JCE_API uint64_t jce_scene_get_component_flags(const JceScene *s, JceEntity e);

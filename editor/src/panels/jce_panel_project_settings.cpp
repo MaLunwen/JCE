@@ -18,10 +18,14 @@
 #include "core/jce_editor_i18n.h"
 #include "core/jce_editor_config.h"
 #include <jce/os/core/jce_log.h>
+#include <jce/middleware/ui/jce_localization.h>
+#include "core/jce_editor_game_l10n.h"
 #include "core/jce_editor_project.h"
 #include "core/jce_hotkeys.h"
+#include "core/jce_pak_key.h"
 #include "core/jce_project_settings.h"
 #include "dialogs/jce_path_input.h"
+#include "ui/jce_editor_tip.h"
 
 #include <jce/tools/jce_imgui.hpp>
 
@@ -36,6 +40,7 @@
 extern "C" {
 #include <jce/application/jce_project.h>
 #include <jce/os/core/jce_path.h>
+#include <jce/os/platform/jce_host_shell.h>
 #include <jce/renderer/jce_renderer_caps.h>
 #include <jce/renderer/jce_quality_preset.h>
 }
@@ -55,6 +60,7 @@ enum Tab {
     TAB_GRAPHICS,
     TAB_TIME,
     TAB_PLAYER,
+    TAB_PACKAGING,
     TAB_PRESET_MANAGER,
     TAB_AUDIO,
     TAB_EDITOR,
@@ -71,6 +77,11 @@ struct State {
     JceEditorConfig     cfg;
     int                 hk_recording_id = -1;
     char                hk_filter[64] = {0};
+
+    /* ── Game L10n grid (TAB_LOCALIZATION) ── */
+    char                loc_filter[64]    = {0};
+    char                loc_new_key[128]  = {0};
+    char                loc_new_locale[16]= {0};
 
     /* ── Active jce_project.json editable buffers (TAB_PROJECT) ── */
     char                jp_root_cached[1024] = {0};
@@ -109,6 +120,7 @@ const char *tab_i18n_key(int t)
         case TAB_GRAPHICS:       return "panel.project_settings.tab.graphics";
         case TAB_TIME:           return "panel.project_settings.tab.time";
         case TAB_PLAYER:         return "panel.project_settings.tab.player";
+        case TAB_PACKAGING:      return "panel.project_settings.tab.packaging";
         case TAB_PRESET_MANAGER: return "panel.project_settings.tab.preset_manager";
         case TAB_AUDIO:          return "panel.project_settings.tab.audio";
         case TAB_EDITOR:         return "panel.project_settings.tab.editor";
@@ -132,6 +144,7 @@ const char *tab_fallback(int t)
         case TAB_GRAPHICS:       return "Graphics";
         case TAB_TIME:           return "Time";
         case TAB_PLAYER:         return "Player";
+        case TAB_PACKAGING:      return "Packaging";
         case TAB_PRESET_MANAGER: return "Preset Manager";
         case TAB_AUDIO:          return "Audio";
         case TAB_EDITOR:         return "Editor";
@@ -163,25 +176,6 @@ void save_if_dirty(void)
         jce_project_settings_apply(&g_st.ps);
     if (ok_ps && ok_cfg)
         g_st.dirty = false;
-}
-
-void placeholder_note(const char *phase)
-{
-    char buf[128];
-    const char *fmt = jce_editor_i18n_or(
-        "panel.project_settings.placeholder_pending", "(wired in {0})");
-    /* Tiny manual {0} substitution — locale strings may move the token. */
-    const char *p = std::strstr(fmt, "{0}");
-    if (p) {
-        size_t a = (size_t)(p - fmt);
-        std::snprintf(buf, sizeof(buf), "%.*s%s%s",
-                      (int)a, fmt, phase, p + 3);
-    } else {
-        std::snprintf(buf, sizeof(buf), "%s %s", fmt, phase);
-    }
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.65f, 0.65f, 0.65f, 1.0f));
-    ImGui::TextDisabled("%s", buf);
-    ImGui::PopStyleColor();
 }
 
 /* ── Tab renderers ─────────────────────────────────────────────────── */
@@ -713,13 +707,153 @@ void draw_editor(void)
 
 void draw_localization(void)
 {
+    /* Editor-chrome locale (jce_editor_i18n) — read-only, shown for
+     * contrast with the GAME locale below.  Two separate systems. */
     JceLocale loc = jce_editor_i18n_get_locale();
     const char *loc_name = jce_editor_i18n_locale_code(loc);
     ImGui::TextUnformatted(jce_editor_i18n_or(PS_KEY "current_locale", "Current Locale (read-only):"));
     ImGui::SameLine();
     ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "%s", loc_name);
     ImGui::Spacing();
-    placeholder_note("P4-D.2");
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    /* ── Game string tables (<source_assets>/i18n/<locale>.json) ────── */
+    ImGui::TextUnformatted(jce_editor_i18n_or(PS_KEY "loc_game_header",
+                                              "Game String Tables"));
+    if (!jce_editor_gl10n_loaded()) {
+        ImGui::TextDisabled("%s", jce_editor_i18n_or(PS_KEY "loc_no_project",
+            "Open a project to edit its game string tables "
+            "(<source assets>/i18n/<locale>.json)."));
+        return;
+    }
+    ImGui::TextDisabled("%s", jce_editor_gl10n_dir());
+    ImGui::Spacing();
+
+    const int nloc = jce_editor_gl10n_locale_count();
+
+    /* Game-locale preview combo — drives the live jce_loc table so the
+     * game view / Play session re-resolve UIText locale keys instantly. */
+    {
+        const char *cur = jce_loc_get_locale();
+        if (!cur || !cur[0]) cur = "en";
+        ImGui::SetNextItemWidth(160.0f);
+        if (ImGui::BeginCombo(jce_editor_i18n_id(PS_KEY "loc_preview_locale",
+                                                 "loc_prev"), cur)) {
+            for (int i = 0; i < nloc; ++i) {
+                const char *code = jce_editor_gl10n_locale_code_at(i);
+                bool sel = (std::strcmp(code, cur) == 0);
+                if (ImGui::Selectable(code, sel))
+                    jce_loc_set_locale(code);
+                if (sel) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+    }
+
+    /* Filter + add-key + add-locale row. */
+    ImGui::SetNextItemWidth(200.0f);
+    ImGui::InputTextWithHint("##loc_filter",
+                             jce_editor_i18n_or(PS_KEY "loc_filter", "Filter"),
+                             g_st.loc_filter, sizeof(g_st.loc_filter));
+    ImGui::SameLine(0.0f, 24.0f);
+    ImGui::SetNextItemWidth(200.0f);
+    ImGui::InputTextWithHint("##loc_new_key", "ui.new_key",
+                             g_st.loc_new_key, sizeof(g_st.loc_new_key));
+    ImGui::SameLine();
+    if (ImGui::Button(jce_editor_i18n_id(PS_KEY "loc_add_key", "loc_addk"))) {
+        if (jce_editor_gl10n_add_key(g_st.loc_new_key))
+            g_st.loc_new_key[0] = '\0';
+    }
+    ImGui::SameLine(0.0f, 24.0f);
+    ImGui::SetNextItemWidth(70.0f);
+    ImGui::InputTextWithHint("##loc_new_locale", "zh_cn",
+                             g_st.loc_new_locale, sizeof(g_st.loc_new_locale));
+    ImGui::SameLine();
+    if (ImGui::Button(jce_editor_i18n_id(PS_KEY "loc_add_locale", "loc_addl"))) {
+        if (jce_editor_gl10n_add_locale(g_st.loc_new_locale))
+            g_st.loc_new_locale[0] = '\0';
+    }
+
+    if (nloc == 0) {
+        ImGui::TextDisabled("%s", jce_editor_i18n_or(PS_KEY "loc_no_locales",
+            "No locale files yet — add a locale to create "
+            "i18n/<code>.json."));
+        return;
+    }
+
+    /* ── Key × locale grid ───────────────────────────────────────────── */
+    char pending_delete[128] = {0};
+    if (ImGui::BeginTable("##loc_grid", 1 + nloc,
+                          ImGuiTableFlags_RowBg | ImGuiTableFlags_Borders |
+                          ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
+                          ImGuiTableFlags_SizingFixedFit,
+                          ImVec2(0, 340))) {
+        ImGui::TableSetupScrollFreeze(1, 1);
+        ImGui::TableSetupColumn(jce_editor_i18n_or(PS_KEY "loc_key_col", "Key"),
+                                ImGuiTableColumnFlags_WidthFixed, 220.0f);
+        for (int c = 0; c < nloc; ++c)
+            ImGui::TableSetupColumn(jce_editor_gl10n_locale_code_at(c),
+                                    ImGuiTableColumnFlags_WidthFixed, 220.0f);
+        ImGui::TableHeadersRow();
+
+        const int nkeys = jce_editor_gl10n_key_count();
+        for (int r = 0; r < nkeys; ++r) {
+            const char *key = jce_editor_gl10n_key_at(r);
+            if (g_st.loc_filter[0] && !std::strstr(key, g_st.loc_filter))
+                continue;
+            const bool prot = jce_editor_gl10n_key_protected(key);
+
+            ImGui::TableNextRow();
+            ImGui::PushID(key);
+            ImGui::TableSetColumnIndex(0);
+            if (prot) {
+                /* Locked: consumed by the engine's built-in pause/settings
+                 * menu (fixed jce_i18n enum) — deletable never. */
+                ImGui::TextDisabled("[L] %s", key);
+                jce_editor::help_tip(jce_editor_i18n_or(
+                    PS_KEY "loc_protected_tip",
+                    "Built-in key consumed by the engine pause/settings "
+                    "menu — cannot be deleted."));
+            } else {
+                ImGui::TextUnformatted(key);
+                if (ImGui::BeginPopupContextItem("##loc_key_ctx")) {
+                    if (ImGui::MenuItem(jce_editor_i18n_or(PS_KEY "loc_delete",
+                                                           "Delete")))
+                        std::snprintf(pending_delete, sizeof(pending_delete),
+                                      "%s", key);
+                    ImGui::EndPopup();
+                }
+            }
+
+            for (int c = 0; c < nloc; ++c) {
+                ImGui::TableSetColumnIndex(c + 1);
+                const char *code = jce_editor_gl10n_locale_code_at(c);
+                const char *v    = jce_editor_gl10n_get(code, key);
+                char buf[512];
+                std::snprintf(buf, sizeof(buf), "%s", v ? v : "");
+                ImGui::PushID(c);
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::InputText("##v", buf, sizeof(buf)))
+                    jce_editor_gl10n_set(code, key, buf);
+                ImGui::PopID();
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+    if (pending_delete[0])
+        jce_editor_gl10n_remove_key(pending_delete);
+
+    /* Save row. */
+    if (ImGui::Button(jce_editor_i18n_id(PS_KEY "loc_save", "loc_save")))
+        jce_editor_gl10n_save_all();
+    if (jce_editor_gl10n_dirty()) {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "%s",
+                           jce_editor_i18n_or(PS_KEY "loc_dirty",
+                                              "* unsaved string changes"));
+    }
 }
 
 void draw_project(void)
@@ -1283,6 +1417,155 @@ void draw_quality_levels(void)
     }
 }
 
+/* ── Packaging (asset encryption) ──────────────────────────────────── */
+
+void draw_packaging(void)
+{
+    JceProjectPackaging &pk = g_st.ps.packaging;
+    const char *proj = jce_editor_assets_get_project();
+    const std::string root = (proj && proj[0]) ? proj : "";
+
+    ImGui::TextWrapped("%s", jce_editor_i18n_or(
+        "projectSettings.packaging.hint",
+        "Encrypt the embedded asset PAK and bundle payloads (ChaCha20). "
+        "This deters casual extraction; the key ships inside the game "
+        "binary, so it is obfuscation, not secrecy."));
+    ImGui::Spacing();
+
+    if (ImGui::Checkbox(jce_editor_i18n_or(
+            "projectSettings.packaging.encryptAssets", "Encrypt assets"),
+            &pk.encrypt_assets)) {
+        mark_dirty();
+        /* First enable: generate the key on the spot so the user sees the
+         * fingerprint immediately. */
+        if (pk.encrypt_assets && !root.empty() && !jce_pak_key_exists(root)) {
+            std::string err;
+            if (!jce_pak_key_generate(root, false, &err))
+                jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                    "[pak_key] generate failed: %s", err.c_str());
+        }
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", jce_editor_i18n_or(
+            "projectSettings.packaging.encryptAssets.tip",
+            "Deters casual extraction; the key ships inside the game binary."));
+
+    ImGui::BeginDisabled(!pk.encrypt_assets);
+    if (ImGui::Checkbox(jce_editor_i18n_or(
+            "projectSettings.packaging.encryptDebug", "Also encrypt debug builds"),
+            &pk.encrypt_debug_builds))
+        mark_dirty();
+    ImGui::EndDisabled();
+
+    ImGui::Separator();
+    ImGui::TextUnformatted(jce_editor_i18n_or(
+        "projectSettings.packaging.keyStatus", "Encryption key"));
+
+    if (root.empty()) {
+        ImGui::TextDisabled("%s", jce_editor_i18n_or(
+            "projectSettings.packaging.noProject", "(no project open)"));
+        return;
+    }
+
+    uint64_t fp = 0;
+    const bool have_key = jce_pak_key_fingerprint_of(root, &fp);
+    if (have_key) {
+        char fphex[24];
+        std::snprintf(fphex, sizeof(fphex), "%08x",
+                      (unsigned)(fp >> 32));
+        ImGui::Text("%s: %s", jce_editor_i18n_or(
+            "projectSettings.packaging.fingerprint", "Key fingerprint"), fphex);
+        ImGui::SameLine();
+        ImGui::TextDisabled("(.jce/pak_key.hex)");
+    } else {
+        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "%s",
+            jce_editor_i18n_or("projectSettings.packaging.noKey",
+                               "No key generated yet"));
+    }
+
+    static char s_import_buf[1024] = {0};
+    static bool s_confirm_regen = false;
+
+    if (!have_key) {
+        if (ImGui::Button(jce_editor_i18n_or(
+                "projectSettings.packaging.generate", "Generate Key"))) {
+            std::string err;
+            if (!jce_pak_key_generate(root, false, &err))
+                jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                    "[pak_key] generate failed: %s", err.c_str());
+        }
+    } else {
+        if (ImGui::Button(jce_editor_i18n_or(
+                "projectSettings.packaging.regenerate", "Regenerate Key")))
+            s_confirm_regen = true;
+        ImGui::SameLine();
+        if (ImGui::Button(jce_editor_i18n_or(
+                "projectSettings.packaging.showInFolder", "Show in Folder")))
+            jce_host_reveal_path(jce_pak_key_path(root).c_str());
+    }
+
+    /* Regenerate confirmation: old encrypted archives become unreadable. */
+    if (s_confirm_regen)
+        ImGui::OpenPopup("###pak_key_regen");
+    char regen_title[160];
+    std::snprintf(regen_title, sizeof(regen_title), "%s###pak_key_regen",
+                  jce_editor_i18n_or("projectSettings.packaging.regenTitle",
+                                     "Regenerate encryption key?"));
+    if (ImGui::BeginPopupModal(regen_title, nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped("%s", jce_editor_i18n_or(
+            "projectSettings.packaging.regenWarn",
+            "Bundles and builds encrypted with the OLD key will become "
+            "unreadable. Rebuild all bundles after regenerating."));
+        ImGui::Spacing();
+        if (ImGui::Button(jce_editor_i18n_or(
+                "projectSettings.packaging.regenConfirm", "Regenerate"),
+                ImVec2(120, 0))) {
+            std::string err;
+            if (jce_pak_key_generate(root, true, &err))
+                jce_pak_key_install_process(root);
+            else
+                jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                    "[pak_key] regenerate failed: %s", err.c_str());
+            s_confirm_regen = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(jce_editor_i18n_or("dialog.cancel", "Cancel"),
+                          ImVec2(120, 0))) {
+            s_confirm_regen = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    ImGui::Spacing();
+    jce_draw_path_input_file(jce_editor_i18n_or(
+            "projectSettings.packaging.importPath", "Import key file"),
+        s_import_buf, sizeof(s_import_buf),
+        "Key (*.hex *.txt);;All Files (*.*)");
+    ImGui::SameLine();
+    ImGui::BeginDisabled(s_import_buf[0] == '\0');
+    if (ImGui::Button(jce_editor_i18n_or(
+            "projectSettings.packaging.import", "Import"))) {
+        std::string err;
+        if (jce_pak_key_import(root, s_import_buf, &err)) {
+            jce_pak_key_install_process(root);
+            s_import_buf[0] = '\0';
+        } else {
+            jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                "[pak_key] import failed: %s", err.c_str());
+        }
+    }
+    ImGui::EndDisabled();
+
+    ImGui::Spacing();
+    ImGui::TextDisabled("%s", jce_editor_i18n_or(
+        "projectSettings.packaging.honesty",
+        "Note: no integrity protection (MAC). Keep .jce/pak_key.hex out of "
+        "version control; losing it makes encrypted archives unreadable."));
+}
+
 void draw_tab_content(int t)
 {
     switch (t) {
@@ -1299,6 +1582,7 @@ void draw_tab_content(int t)
         case TAB_GRAPHICS:       draw_graphics();       break;
         case TAB_TIME:           draw_time();           break;
         case TAB_PLAYER:         draw_player();         break;
+        case TAB_PACKAGING:      draw_packaging();      break;
         case TAB_PRESET_MANAGER: draw_preset_manager(); break;
         case TAB_AUDIO:          draw_audio();          break;
         case TAB_EDITOR:         draw_editor();         break;

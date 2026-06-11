@@ -10,8 +10,10 @@
  *   - Frame-event dispatcher: holds a sorted list of (time, event_id,
  *     payload) tuples per clip; jce_anim_events_advance(prev_t, cur_t,
  *     callback, user) fires every event whose time falls in (prev_t,
- *     cur_t], handling looping and reverse playback.  The editor's
- *     animation editor saves these into the clip's .anim.json sidecar.
+ *     cur_t], handling looping and reverse playback.  Events are authored
+ *     by the editor's Animation Editor into the <skeleton>.anim.json
+ *     sidecar ({ "<clipName>": [ { time, name?, id?, f0?, f1?, i0? } ] })
+ *     that jce_scene_renderer.c lazily loads per SkeletalAnimator.
  */
 
 #ifndef JCE_ANIM_IK_H
@@ -51,6 +53,8 @@ typedef struct {
     uint32_t id;         /* user-defined event id (e.g. footstep, hitbox-on) */
     float    f0, f1;     /* small payload (avoid heap) */
     int      i0;
+    char     name[48];   /* optional label ("" = unnamed); numeric-only
+                            sidecar events leave this empty */
 } JceAnimEvent;
 
 typedef struct {

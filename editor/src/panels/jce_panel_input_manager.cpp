@@ -10,25 +10,24 @@
  * A binding is (type, code, scale, deadzone) — the same struct the
  * engine consumes via jce_action_bind().
  *
- * Default seed (first run, similar to jce_actions_bind_fps_defaults):
- *     move_forward, move_back, move_left, move_right,
- *     jump, sprint, look_x, look_y
+ * Default seed (first run) is copied from the engine's canonical table,
+ * jce_actions_bind_fps_defaults() — there is no editor-local copy.
+ * Persistence likewise goes through the engine (jce_actions_load_file /
+ * jce_actions_save_file), so the panel can never drift from the schema
+ * the runtime reads.
  *
- * No engine wiring: the editor doesn't own a JceInputActions today,
- * and binding it into play-mode requires the game side to opt in. The
- * panel exposes a "Save" button and surfaces the JSON path so the game
- * loader (or a future editor hook) can pick it up.
+ * Consumers: the engine boot-loads this JSON into JceServices.actions
+ * (jce_actions_load_file) for shipped games, and the editor's Play view
+ * queries the LIVE panel state through jce_editor_input_action_keys()
+ * below — so rebinds apply to play-in-editor without even saving.
  */
 
 #include "ui/jce_editor_colors.h"
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
-#include "io/jce_editor_file_util.h"
 
 #include <jce/tools/jce_imgui.hpp>
 #include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <string>
 #include <vector>
 
@@ -76,119 +75,77 @@ static const char *bind_type_label(int t)
     }
 }
 
-/* ── Persistence ────────────────────────────────────────────────────── */
+/* ── Persistence (backed by the engine's jce_input_actions API) ────── */
+
+/* Copy an engine action table into the panel's editing model. */
+static void copy_from_engine(const JceInputActions *a)
+{
+    s_actions.clear();
+    const int n = jce_actions_count(a);
+    for (int i = 0; i < n; ++i) {
+        const char *name = jce_action_name(a, i);
+        if (!name || !name[0]) continue;
+
+        EditAction ea;
+        ea.name = name;
+        const int bn = jce_action_bind_count(a, i);
+        for (int b = 0; b < bn; ++b) {
+            JceBinding bind;
+            if (!jce_action_bind_at(a, i, b, &bind)) continue;
+            EditBinding eb{ (int)bind.type, bind.code,
+                            bind.scale, bind.deadzone };
+            ea.binds.push_back(eb);
+        }
+        s_actions.push_back(std::move(ea));
+    }
+}
+
+/* Build an engine action table from the panel's editing model.
+ * Caller owns the returned table (jce_actions_destroy). */
+static JceInputActions *build_engine_table(void)
+{
+    JceInputActions *a = jce_actions_create();
+    if (!a) return nullptr;
+    for (const EditAction &ea : s_actions) {
+        int id = jce_action_register(a, ea.name.c_str());
+        if (id < 0) continue;   /* duplicate name / table full */
+        for (const EditBinding &eb : ea.binds) {
+            JceBinding b;
+            b.type     = (JceBindType)eb.type;
+            b.code     = eb.code;
+            b.scale    = eb.scale;
+            b.deadzone = eb.deadzone;
+            jce_action_bind(a, id, &b);
+        }
+    }
+    return a;
+}
 
 static void input_save(void)
 {
-    size_t cap = 256;
-    for (auto &a : s_actions) cap += a.name.size() + 64 + a.binds.size() * 80;
-    char *buf = (char *)ED_MALLOC(cap);
-    if (!buf) return;
-    size_t off = 0;
-    int    w   = std::snprintf(buf + off, cap - off, "{\n  \"actions\": [\n");
-    if (w < 0) { ED_FREE(buf); return; }
-    off += (size_t)w;
-    for (size_t i = 0; i < s_actions.size(); ++i) {
-        const EditAction &a = s_actions[i];
-        w = std::snprintf(buf + off, cap - off,
-            "    { \"name\": \"%s\", \"binds\": [", a.name.c_str());
-        if (w < 0 || (size_t)w >= cap - off) { ED_FREE(buf); return; }
-        off += (size_t)w;
-        for (size_t j = 0; j < a.binds.size(); ++j) {
-            const EditBinding &b = a.binds[j];
-            w = std::snprintf(buf + off, cap - off,
-                "%s{\"type\":%d,\"code\":%d,\"scale\":%.4f,\"deadzone\":%.4f}",
-                (j == 0 ? "" : ","),
-                b.type, b.code, (double)b.scale, (double)b.deadzone);
-            if (w < 0 || (size_t)w >= cap - off) { ED_FREE(buf); return; }
-            off += (size_t)w;
-        }
-        w = std::snprintf(buf + off, cap - off, "] }%s\n",
-                          (i + 1 < s_actions.size()) ? "," : "");
-        if (w < 0 || (size_t)w >= cap - off) { ED_FREE(buf); return; }
-        off += (size_t)w;
-    }
-    w = std::snprintf(buf + off, cap - off, "  ]\n}\n");
-    if (w < 0) { ED_FREE(buf); return; }
-    off += (size_t)w;
-    ed_write_file(INPUT_PATH, buf, off);
-    ED_FREE(buf);
+    JceInputActions *a = build_engine_table();
+    if (!a) return;
+    jce_actions_save_file(a, INPUT_PATH);
+    jce_actions_destroy(a);
 }
 
+/* Seed from the engine's canonical default table so the editor and the
+ * runtime fallback (jce_actions_bind_fps_defaults) can never diverge. */
 static void seed_default_actions(void)
 {
-    s_actions.clear();
-    static const struct { const char *name; int key; float scale; } K[] = {
-        { "move_forward", 26 /*W*/,  1.0f },  /* SDL scancodes */
-        { "move_back",    22 /*S*/,  1.0f },
-        { "move_left",     4 /*A*/,  1.0f },
-        { "move_right",    7 /*D*/,  1.0f },
-        { "jump",         44 /*Spc*/,1.0f },
-        { "sprint",      225 /*LShift*/,1.0f },
-        { "look_x",        0,        1.0f },  /* mapped via mouse axis */
-        { "look_y",        0,        1.0f },
-    };
-    for (auto &k : K) {
-        EditAction a;
-        a.name = k.name;
-        if (k.key != 0) {
-            EditBinding b{ JCE_BIND_KEY, k.key, k.scale, 0.15f };
-            a.binds.push_back(b);
-        }
-        s_actions.push_back(std::move(a));
-    }
+    JceInputActions *a = jce_actions_create();
+    if (!a) { s_actions.clear(); return; }
+    jce_actions_bind_fps_defaults(a);
+    copy_from_engine(a);
+    jce_actions_destroy(a);
 }
 
 static bool input_load(void)
 {
-    size_t len = 0;
-    char  *raw = (char *)ed_read_file(INPUT_PATH, &len);
-    if (!raw) return false;
-    if (len > (1 << 20)) { ED_FREE(raw); return false; }
-
-    s_actions.clear();
-
-    const char *p = raw;
-    while (p && *p) {
-        const char *name_key = std::strstr(p, "\"name\"");
-        if (!name_key) break;
-        const char *q1 = std::strchr(name_key + 6, '"');
-        const char *q2 = q1 ? std::strchr(q1 + 1, '"') : nullptr;
-        if (!q1 || !q2) break;
-
-        EditAction a;
-        a.name.assign(q1 + 1, q2 - q1 - 1);
-
-        const char *binds_key  = std::strstr(q2, "\"binds\"");
-        const char *next_action = std::strstr(q2 + 1, "\"name\"");
-        if (binds_key && (!next_action || binds_key < next_action)) {
-            const char *bp = binds_key;
-            const char *end = next_action ? next_action : (raw + len);
-            while (bp && bp < end) {
-                const char *t = std::strstr(bp, "\"type\"");
-                if (!t || t >= end) break;
-                int   ty = 0, cd = 0;
-                float sc = 1.0f, dz = 0.15f;
-                std::sscanf(t, "\"type\":%d", &ty);
-                const char *cc = std::strstr(t, "\"code\"");
-                if (cc && cc < end) std::sscanf(cc, "\"code\":%d", &cd);
-                const char *sk = std::strstr(t, "\"scale\"");
-                if (sk && sk < end) std::sscanf(sk, "\"scale\":%f", &sc);
-                const char *dk = std::strstr(t, "\"deadzone\"");
-                if (dk && dk < end) std::sscanf(dk, "\"deadzone\":%f", &dz);
-                EditBinding b{ ty, cd, sc, dz };
-                a.binds.push_back(b);
-                if (a.binds.size() >= JCE_ACTION_MAX_BINDS) break;
-                const char *adv = dk ? dk : (sk ? sk : (cc ? cc : t));
-                bp = adv + 1;
-            }
-        }
-        s_actions.push_back(std::move(a));
-        p = (binds_key && next_action) ? next_action : (q2 + 1);
-        if (s_actions.size() >= JCE_ACTION_MAX) break;
-    }
-
-    ED_FREE(raw);
+    JceInputActions *a = jce_actions_load_file(INPUT_PATH);
+    if (!a) return false;
+    copy_from_engine(a);
+    jce_actions_destroy(a);
     return true;
 }
 
@@ -200,6 +157,32 @@ static void ensure_init(void)
         seed_default_actions();
         input_save();
     }
+}
+
+/* ── Editor-Play action queries ─────────────────────────────────────── */
+
+/* The editor's Play loop reads input through ImGui, so authored KEY
+ * bindings (SDL scancodes) are translated via the shared
+ * jce_editor_scancode_to_imgui_key() table in jce_editor.cpp;
+ * mouse/gamepad bindings apply only in the shipped game, where the
+ * engine runtime evaluates them via JceInput. */
+extern "C" int jce_editor_input_action_keys(const char *name,
+                                            int *out_imgui_keys, int max)
+{
+    ensure_init();   /* the panel may never have been opened this session */
+    if (!name || !out_imgui_keys || max <= 0) return 0;
+    for (const EditAction &a : s_actions) {
+        if (a.name != name) continue;
+        int n = 0;
+        for (const EditBinding &b : a.binds) {
+            if (b.type != JCE_BIND_KEY) continue;
+            ImGuiKey k = (ImGuiKey)jce_editor_scancode_to_imgui_key(b.code);
+            if (k != ImGuiKey_None && n < max)
+                out_imgui_keys[n++] = (int)k;
+        }
+        return n;
+    }
+    return 0;
 }
 
 /* ── UI ─────────────────────────────────────────────────────────────── */

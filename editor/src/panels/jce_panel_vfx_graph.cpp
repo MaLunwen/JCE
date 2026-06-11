@@ -3,22 +3,28 @@
  *                          Sprint 3 #13 / 0.8.25
  *
  * A node-graph editor for composing particle effect chains, modeled
- * after Material Graph (Sprint 3 #11). Compiles to a .vfx.json sidecar
- * describing one main Emitter plus optional Sub-Emitter and Trail
- * branches. Engine runtime consumption is deferred; this panel produces
- * the authoring artifact that future runtime work will read.
+ * after Material Graph (Sprint 3 #11). The graph is a front-end for the
+ * standard particle pipeline: Export compiles it to a `*.particles.json`
+ * document (the canonical JceParticleEmitterDesc key set parsed by
+ * jce_particles_desc_load_json) that a Particle Emitter component
+ * consumes via its asset path.
+ *
+ * Consolidation v0.9.9: the panel previously compiled to an orphaned
+ * `*.vfx.json` schema read by a dead engine-side interpreter
+ * (jce_vfx_graph.c, zero callers). Both were removed; this panel now
+ * targets the one real runtime.
  *
  * Node types:
  *   - Output      : sink for one Emitter chain.
  *   - Emitter     : core spawn config (rate, lifetime, speed, size).
  *   - ColorRamp   : start/end RGBA over particle life.
  *   - Velocity    : direction + magnitude bias.
- *   - SubEmitter  : burst on death/birth.
- *   - Trail       : per-particle trail length + width.
+ *   - SubEmitter  : burst on death/birth   (lossy: dropped on export).
+ *   - Trail       : per-particle trail     (lossy: dropped on export).
  *
  * Interaction: drag bodies; right-click canvas to add nodes; right-click
- * a node to delete; output pin -> compatible input pin to link; Compile
- * button writes .vfx.json next to the loaded source.
+ * a node to delete; output pin -> compatible input pin to link; Export
+ * button writes .particles.json next to the loaded source.
  */
 
 #include "io/jce_editor_file_util.h"
@@ -33,6 +39,7 @@ extern "C" {
 #include <jce/os/core/jce_json.h>
 }
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -249,7 +256,22 @@ static void graph_load()
     jce_editor_console_log("[VFX Graph] loaded %s", p);
 }
 
-/* ── Compile to .vfx.json (flat description for runtime). ──────────── */
+/* ── Export to .particles.json (JceParticleEmitterDesc key set). ─────
+ *
+ * Consolidation v0.9.9: the graph compiles onto the canonical key set
+ * read by jce_particles_desc_load_json() — emitRate, lifetimeMin/Max,
+ * velocityMin/Max, gravity, sizeStart/End, colorStart/End, maxParticles
+ * — so the exported document plugs straight into a Particle Emitter
+ * component's asset path.  Mappings:
+ *   - Emitter.lifetime  -> lifetimeMin == lifetimeMax (single author).
+ *   - Emitter.size      -> sizeStart; sizeEnd = 0 (shrink to death).
+ *   - Velocity node     -> velocityMin == velocityMax =
+ *                          normalize(dir) * (Emitter.speed * mag);
+ *                          without the node, +Y * Emitter.speed.
+ *   - maxParticles      -> steady-state rate*lifetime + 25% headroom.
+ *   - SubEmitter, Trail -> NOT representable; dropped with a warning.
+ * Keys the graph does not author (gravity, emitBurst, worldSpace,
+ * texture) are omitted so the runtime loader's defaults apply. */
 
 static void graph_compile()
 {
@@ -263,51 +285,62 @@ static void graph_compile()
     if (!em || em->type != NT_EMITTER) { jce_editor_console_log_level(JCE_CONSOLE_ERROR, "[VFX Graph] invalid Emitter wiring"); return; }
 
     JceJson *root = jce_json_object();
-    jce_json_set_number(root, "rate",     em->rate);
-    jce_json_set_number(root, "lifetime", em->lifetime);
-    jce_json_set_number(root, "speed",    em->speed);
-    jce_json_set_number(root, "size",     em->size);
+    jce_json_set_number(root, "emitRate",    em->rate);
+    jce_json_set_number(root, "lifetimeMin", em->lifetime);
+    jce_json_set_number(root, "lifetimeMax", em->lifetime);
+    jce_json_set_number(root, "sizeStart",   em->size);
+    jce_json_set_number(root, "sizeEnd",     0.0);
+
+    /* Pool capacity: enough for the steady-state alive count plus headroom. */
+    int max_particles = (int)(em->rate * em->lifetime * 1.25f) + 1;
+    if (max_particles < 64) max_particles = 64;
+    jce_json_set_number(root, "maxParticles", max_particles);
+
+    /* Initial velocity (min == max: the graph has no spread author). */
+    float vel[3] = { 0.0f, em->speed, 0.0f };
+    int li_vel = find_input_link(em->id, 2);
+    if (li_vel >= 0) {
+        Node *v = find_node(s_g.links[li_vel].from_node);
+        if (v && v->type == NT_VELOCITY) {
+            float len = sqrtf(v->vel_dir[0] * v->vel_dir[0] +
+                              v->vel_dir[1] * v->vel_dir[1] +
+                              v->vel_dir[2] * v->vel_dir[2]);
+            if (len > 1e-6f) {
+                float k = (em->speed * v->vel_mag) / len;
+                vel[0] = v->vel_dir[0] * k;
+                vel[1] = v->vel_dir[1] * k;
+                vel[2] = v->vel_dir[2] * k;
+            } else {
+                jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+                    "[VFX Graph] Velocity direction is zero-length; exporting +Y default");
+            }
+        }
+    }
+    jce_json_set_float_array(root, "velocityMin", vel, 3);
+    jce_json_set_float_array(root, "velocityMax", vel, 3);
 
     int li_color = find_input_link(em->id, 1);
     if (li_color >= 0) {
         Node *c = find_node(s_g.links[li_color].from_node);
         if (c && c->type == NT_COLOR_RAMP) {
-            jce_json_set_float_array(root, "start_color", c->start_col, 4);
-            jce_json_set_float_array(root, "end_color",   c->end_col,   4);
+            jce_json_set_float_array(root, "colorStart", c->start_col, 4);
+            jce_json_set_float_array(root, "colorEnd",   c->end_col,   4);
         }
     }
-    int li_vel = find_input_link(em->id, 2);
-    if (li_vel >= 0) {
-        Node *v = find_node(s_g.links[li_vel].from_node);
-        if (v && v->type == NT_VELOCITY) {
-            jce_json_set_float_array(root, "vel_dir", v->vel_dir, 3);
-            jce_json_set_number(root, "vel_mag", v->vel_mag);
-        }
-    }
-    int li_sub = find_input_link(em->id, 3);
-    if (li_sub >= 0) {
-        Node *s = find_node(s_g.links[li_sub].from_node);
-        if (s && s->type == NT_SUB_EMITTER) {
-            JceJson *so = jce_json_object();
-            jce_json_set_number(so, "burst", s->sub_burst);
-            jce_json_set_string(so, "event", s->sub_event);
-            jce_json_set_child(root, "sub_emitter", so);
-        }
-    }
-    int li_trail = find_input_link(em->id, 4);
-    if (li_trail >= 0) {
-        Node *t = find_node(s_g.links[li_trail].from_node);
-        if (t && t->type == NT_TRAIL) {
-            JceJson *to = jce_json_object();
-            jce_json_set_number(to, "length", t->trail_len);
-            jce_json_set_number(to, "width",  t->trail_width);
-            jce_json_set_child(root, "trail", to);
-        }
-    }
-    char p[300]; snprintf(p, sizeof(p), "%s.vfx.json", s_g.path[0] ? s_g.path : "untitled");
+
+    /* Lossy branches: .particles.json cannot express these — warn, drop. */
+    if (find_input_link(em->id, 3) >= 0)
+        jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+            "[VFX Graph] SubEmitter node is not supported by .particles.json — dropped");
+    if (find_input_link(em->id, 4) >= 0)
+        jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+            "[VFX Graph] Trail node is not supported by .particles.json — dropped "
+            "(use a Trail Renderer component instead)");
+
+    char p[300]; snprintf(p, sizeof(p), "%s.particles.json", s_g.path[0] ? s_g.path : "untitled");
     ed_write_json_to_file(p, root);
     jce_json_free(root);
-    jce_editor_console_log("[VFX Graph] compiled -> %s", p);
+    jce_editor_console_log("[VFX Graph] exported -> %s (assign it to a Particle Emitter's asset path)", p);
 }
 
 /* ── Drawing ───────────────────────────────────────────────────────── */
@@ -447,7 +480,7 @@ extern "C" void jce_editor_panel_vfx_graph_content(void)
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("vfxGraph.load")))    graph_load();
     ImGui::SameLine();
-    if (ImGui::Button(jce_editor_i18n("vfxGraph.compile"))) graph_compile();
+    if (ImGui::Button(jce_editor_i18n("vfxGraph.export"))) graph_compile();
 
     ImGui::Separator();
     ImGui::Text("%s: %d %s   %s: %d %s   %s",

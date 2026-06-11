@@ -150,6 +150,8 @@ bool jce_archive_cook(const JceCookInput *inputs, size_t count,
     if (def.zstd_level == 0)     def.zstd_level = 19;
     if (def.alignment_log2 == 0) def.alignment_log2 = 4;
 
+    const bool encrypt = def.encrypt && def.encryption_key != NULL;
+
     JceArchiveWriterConfig wc = {0};
     wc.zstd_level     = def.zstd_level;
     wc.alignment_log2 = def.alignment_log2;
@@ -157,9 +159,13 @@ bool jce_archive_cook(const JceCookInput *inputs, size_t count,
     wc.emit_debug_paths = def.emit_debug_paths;
     wc.mmap_friendly  = def.mmap_friendly;
     wc.dedup_content  = def.dedup_content;
+    if (encrypt)
+        wc.encryption_salt = jce_archive_salt_from_label(def.encrypt_label);
 
     JceArchiveWriter *w = jce_archive_writer_create(&wc);
     if (!w) return false;
+    if (encrypt)
+        jce_archive_writer_set_encryption_key(w, def.encryption_key);
 
     ResClass *cls_of = NULL;
     if (count > 0) {
@@ -184,11 +190,17 @@ bool jce_archive_cook(const JceCookInput *inputs, size_t count,
     bool ok = true;
     for (size_t i = 0; i < count && ok; ++i) {
         int dict_id = cls_of ? class_dict[cls_of[i]] : -1;
-        ok = (dict_id >= 0)
-            ? jce_archive_writer_add_with_dict(w, inputs[i].vpath,
+        /* Encrypt EVERYTHING when requested (incl. manifests): the
+         * encrypted add path composes with dictionary compression —
+         * compress (optionally with dict) first, then encrypt (§9.2). */
+        ok = encrypt
+            ? jce_archive_writer_add_encrypted(w, inputs[i].vpath,
                                                inputs[i].data, inputs[i].size, dict_id)
-            : jce_archive_writer_add(w, inputs[i].vpath,
-                                     inputs[i].data, inputs[i].size);
+            : ((dict_id >= 0)
+                   ? jce_archive_writer_add_with_dict(w, inputs[i].vpath,
+                                                      inputs[i].data, inputs[i].size, dict_id)
+                   : jce_archive_writer_add(w, inputs[i].vpath,
+                                            inputs[i].data, inputs[i].size));
     }
 
     JCE_FREE(cls_of);

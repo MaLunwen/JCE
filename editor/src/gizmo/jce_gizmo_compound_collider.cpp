@@ -370,3 +370,26 @@ extern "C" void jce_gizmo_compound_collider_draw_from_component(
         jce_debug_draw_line(xform(sg.a), xform(sg.b),
                             override_abgr ? override_abgr : sg.abgr);
 }
+
+extern "C" void jce_gizmo_mesh_collider_draw_from_component(
+    JceScene *scene, JceEntity owner, const JceMeshColliderComponent *mc,
+    unsigned int override_abgr, int detailed)
+{
+    if (!scene || !mc || !mc->mesh_path[0]) return;
+
+    /* Mirror the runtime spawn (rt_try_spawn_mesh): one shape for the whole
+     * model — convex hull when convex is set, exact triangle mesh otherwise.
+     * is_static = !convex so TRIANGLE_MESH survives resolve_mode. */
+    JceCompoundColliderComponent cc;
+    memset(&cc, 0, sizeof(cc));
+    memcpy(cc.model_path, mc->mesh_path, sizeof(cc.model_path));
+    cc.mode        = (uint8_t)(mc->convex ? JCE_COLLIDER_MODE_CONVEX_HULL
+                                          : JCE_COLLIDER_MODE_TRIANGLE_MESH);
+    cc.split       = (uint8_t)JCE_COLLIDER_SPLIT_WHOLE;
+    cc.is_static   = !mc->convex;
+    cc.is_trigger  = mc->is_trigger;
+    cc.friction    = mc->friction;
+    cc.restitution = mc->restitution;
+    jce_gizmo_compound_collider_draw_from_component(scene, owner, &cc,
+                                                    override_abgr, detailed);
+}

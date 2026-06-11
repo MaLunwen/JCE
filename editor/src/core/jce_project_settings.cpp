@@ -185,6 +185,10 @@ void jce_project_settings_defaults(JceProjectSettings *s)
     s->rendering.ambient_color[1]    = 0.1f;
     s->rendering.ambient_color[2]    = 0.12f;
     s->rendering.ambient_intensity   = 1.0f;
+
+    /* Packaging */
+    s->packaging.encrypt_assets       = false;
+    s->packaging.encrypt_debug_builds = false;
 }
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
@@ -395,6 +399,14 @@ bool jce_project_settings_save(const JceProjectSettings *s)
         jce_json_set_float_array(o, "ambient_color",  s->rendering.ambient_color, 3);
         jce_json_set_number(o, "ambient_intensity",   s->rendering.ambient_intensity);
         jce_json_set_child(root, "rendering", o);
+    }
+
+    /* packaging */
+    {
+        JceJson *o = jce_json_object();
+        jce_json_set_bool(o, "encrypt_assets",       s->packaging.encrypt_assets);
+        jce_json_set_bool(o, "encrypt_debug_builds", s->packaging.encrypt_debug_builds);
+        jce_json_set_child(root, "packaging", o);
     }
 
     bool ok = jce_json_write_file(PS_PATH, root, true, true);
@@ -608,6 +620,11 @@ bool jce_project_settings_load(JceProjectSettings *out)
         out->rendering.fog_height_origin   = (float)jce_json_get_number(o, "fog_height_origin",   out->rendering.fog_height_origin);
         jce_json_get_floats(o, "ambient_color", out->rendering.ambient_color, 3, out->rendering.ambient_color);
         out->rendering.ambient_intensity   = (float)jce_json_get_number(o, "ambient_intensity",   out->rendering.ambient_intensity);
+    }
+
+    if (JceJson *o = child_obj_or_null(root, "packaging")) {
+        out->packaging.encrypt_assets       = jce_json_get_bool(o, "encrypt_assets",       out->packaging.encrypt_assets);
+        out->packaging.encrypt_debug_builds = jce_json_get_bool(o, "encrypt_debug_builds", out->packaging.encrypt_debug_builds);
     }
 
     jce_json_free(root);

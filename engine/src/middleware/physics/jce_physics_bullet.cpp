@@ -176,6 +176,21 @@ static inline uint32_t resolve_body(JceBulletWorld *bw, uint32_t handle);
 /* World definition                                                    */
 /* ================================================================== */
 
+/* Per-character movement-feel state (parallel to char_bodies). The
+ * grounded probe is refreshed once per move() and cached here so the
+ * same fixed tick's jump/animation queries don't re-raycast. */
+struct JceBulletCharFeel {
+    float     accel;          /* m/s^2 toward commanded velocity (ground) */
+    float     air_control;    /* 0..1 accel scale while airborne */
+    float     step_height;    /* max auto-step (m) */
+    float     max_slope_cos;  /* cos(max walkable slope) */
+    bool      grounded;       /* cached probe result: WALKABLE contact */
+    bool      touching;       /* raw probe contact (any steepness) */
+    bool      probe_valid;    /* probe ran at least once this session */
+    bool      jumping;        /* jump() fired; cleared on next grounded */
+    btVector3 ground_normal;
+};
+
 struct JceBulletWorld {
     /* Bullet pipeline objects (owned, deleted in reverse order).
      *
@@ -232,6 +247,7 @@ struct JceBulletWorld {
     float                           *char_jump;    /* per-character jump speed */
     btConvexShape                  **char_shapes;
     bool                            *char_alive;
+    JceBulletCharFeel               *char_feel;    /* movement-feel state */
     uint32_t                         char_capacity;
     uint32_t                         char_count;
     uint32_t                         char_alloc_cursor;
@@ -480,6 +496,8 @@ JceBulletWorld *jce_bullet_create(jce_vec3 gravity, uint32_t max_bodies,
         JCE_CALLOC(bw->char_capacity, sizeof(btConvexShape *)));
     bw->char_alive = static_cast<bool *>(
         JCE_CALLOC(bw->char_capacity, sizeof(bool)));
+    bw->char_feel = static_cast<JceBulletCharFeel *>(
+        JCE_CALLOC(bw->char_capacity, sizeof(JceBulletCharFeel)));
 
     /* Allocate vehicle controller pool. */
     bw->vehicle_capacity = 16;
@@ -599,6 +617,7 @@ void jce_bullet_destroy(JceBulletWorld *bw)
     delete bw->dispatcher;
     delete bw->config;
 
+    JCE_FREE(bw->char_feel);
     JCE_FREE(bw->char_alive);
     JCE_FREE(bw->char_shapes);
     JCE_FREE(bw->char_jump);
@@ -1929,7 +1948,8 @@ uint32_t jce_bullet_character_create(JceBulletWorld *bw,
                                       jce_vec3 pos, float radius,
                                       float height, float step_height,
                                       float max_slope_rad,
-                                      float gravity, float jump_speed)
+                                      float gravity, float jump_speed,
+                                      float accel, float air_control)
 {
     if (!bw) return UINT32_MAX;
 
@@ -1946,7 +1966,7 @@ uint32_t jce_bullet_character_create(JceBulletWorld *bw,
     float capsule_height = height - 2.0f * radius;
     if (capsule_height < 0.01f) capsule_height = 0.01f;
 
-    (void)step_height; (void)max_slope_rad; (void)gravity;
+    (void)gravity;  /* dynamic capsule falls under world gravity */
 
     auto *cap_shape = new btCapsuleShape(
         static_cast<btScalar>(radius),
@@ -1988,6 +2008,21 @@ uint32_t jce_bullet_character_create(JceBulletWorld *bw,
     bw->char_alive[idx]  = true;
     bw->char_count++;
 
+    JceBulletCharFeel *f = &bw->char_feel[idx];
+    f->accel       = accel > 0.0f ? accel : 40.0f;
+    f->air_control = (air_control > 0.0f) ? air_control : 0.35f;
+    if (f->air_control > 1.0f) f->air_control = 1.0f;
+    f->step_height = step_height > 0.0f ? step_height : 0.35f;
+    btScalar slope = max_slope_rad > 0.0f ? btScalar(max_slope_rad)
+                                          : btRadians(btScalar(50.0));
+    if (slope > btRadians(btScalar(89.0))) slope = btRadians(btScalar(89.0));
+    f->max_slope_cos = (float)btCos(slope);
+    f->grounded      = false;
+    f->touching      = false;
+    f->probe_valid   = false;
+    f->jumping       = false;
+    f->ground_normal = btVector3(0, 1, 0);
+
     return idx;
 }
 
@@ -2006,33 +2041,236 @@ void jce_bullet_character_destroy(JceBulletWorld *bw, uint32_t idx)
     bw->char_count--;
 }
 
-/* `walk_dir` is the desired planar VELOCITY (m/s). Drive it directly for snappy
- * control; the solver-owned vertical velocity (gravity / jump / resting) is
- * preserved so the capsule falls, lands and rests naturally. */
+/* Down-ray helper shared by the ground probe / snap / step-up.  Casts
+ * from `from` straight down `reach` metres against the character mask;
+ * fills hit point + normal.  Returns false on miss (or self-hit). */
+static bool char_ray_down(JceBulletWorld *bw, const btRigidBody *self,
+                          const btVector3 &from, btScalar reach,
+                          btVector3 *out_point, btVector3 *out_normal)
+{
+    btVector3 to = from - btVector3(0, reach, 0);
+    btCollisionWorld::ClosestRayResultCallback cb(from, to);
+    cb.m_collisionFilterGroup = btBroadphaseProxy::CharacterFilter;
+    cb.m_collisionFilterMask  = btBroadphaseProxy::StaticFilter |
+                                btBroadphaseProxy::DefaultFilter;
+    bw->world->rayTest(from, to, cb);
+    if (!cb.hasHit() || cb.m_collisionObject == self) return false;
+    if (out_point)  *out_point  = cb.m_hitPointWorld;
+    if (out_normal) *out_normal = cb.m_hitNormalWorld;
+    return true;
+}
+
+/* Refresh the cached grounded state + ground normal: a 5-ray fan
+ * (capsule axis + 4 compass points at 0.6 r) so standing on an edge or
+ * stair lip still reads as grounded; keeps the most upright normal. */
+static bool char_ground_probe(JceBulletWorld *bw, uint32_t idx)
+{
+    btRigidBody *b = bw->char_bodies[idx];
+    auto *cap = static_cast<btCapsuleShape *>(bw->char_shapes[idx]);
+    JceBulletCharFeel *f = &bw->char_feel[idx];
+    btScalar half = cap->getHalfHeight() + cap->getRadius();  /* centre→foot */
+    btScalar ring = cap->getRadius() * btScalar(0.6);
+    btVector3 c   = b->getWorldTransform().getOrigin();
+    btScalar reach = half + btScalar(0.20);
+
+    static const btScalar offs[5][2] = {
+        {0, 0}, {1, 0}, {-1, 0}, {0, 1}, {0, -1}
+    };
+    bool      hit_any = false;
+    btVector3 best_n(0, 1, 0);
+    btScalar  best_y = btScalar(-2.0);
+    for (int i = 0; i < 5; ++i) {
+        btVector3 from = c + btVector3(offs[i][0] * ring, 0, offs[i][1] * ring);
+        btVector3 n;
+        if (char_ray_down(bw, b, from, reach, nullptr, &n)) {
+            hit_any = true;
+            if (n.y() > best_y) { best_y = n.y(); best_n = n; }
+        }
+    }
+    bool grounded = hit_any;
+    /* Ascending from a jump the feet stay within probe reach for a tick
+     * or two — that must NOT read as grounded (it would re-arm coyote
+     * time and skip the variable-jump cut). */
+    if (f->jumping && b->getLinearVelocity().y() > btScalar(0.5))
+        grounded = false;
+    /* A face steeper than the slope limit supports no locomotion: report
+     * airborne so animation shows the slide and jumps can't pogo up it. */
+    if (grounded && best_n.y() < btScalar(f->max_slope_cos))
+        grounded = false;
+    f->grounded      = grounded;
+    f->touching      = hit_any;
+    f->probe_valid   = true;
+    f->ground_normal = hit_any ? best_n : btVector3(0, 1, 0);
+    return grounded;
+}
+
+/* `walk_dir` is the desired planar VELOCITY (m/s).  The horizontal
+ * velocity ACCELERATES toward it (accel on ground, accel*air_control
+ * airborne) for natural starts/stops; the solver-owned vertical velocity
+ * (gravity / jump / resting) is preserved.  Also handles, per fixed tick:
+ *   - ground probe refresh (cached for is_grounded queries),
+ *   - ground snap when walking down steps/slopes (kills the airborne arc),
+ *   - max-slope limit (the uphill velocity component is removed on
+ *     too-steep faces, so the capsule can't drive up them),
+ *   - step-up assist (low blocker ahead + clearance at step height →
+ *     teleport up the step, momentum preserved). */
 void jce_bullet_character_move(JceBulletWorld *bw, uint32_t idx,
                                 jce_vec3 walk_dir, float dt)
 {
-    (void)dt;
     if (!bw || idx >= bw->char_capacity || !bw->char_alive[idx]) return;
     btRigidBody *b = bw->char_bodies[idx];
     if (!b) return;
+    if (dt <= 0.0f) dt = 1.0f / 60.0f;
+
+    JceBulletCharFeel *f = &bw->char_feel[idx];
+    auto *cap = static_cast<btCapsuleShape *>(bw->char_shapes[idx]);
+    btScalar half   = cap->getHalfHeight() + cap->getRadius();
+    btScalar radius = cap->getRadius();
+
+    bool was_grounded = f->probe_valid && f->grounded;
+    char_ground_probe(bw, idx);
+
     btVector3 v = b->getLinearVelocity();
-    v.setX(static_cast<btScalar>(walk_dir.x));
-    v.setZ(static_cast<btScalar>(walk_dir.z));
+    if (f->grounded && v.y() <= btScalar(0.5)) f->jumping = false;
+
+    /* Ground snap: just walked off a step/slope crest (not a jump, not
+     * rising) and the ground is within step_height below the feet →
+     * glue the capsule back down instead of arcing off. */
+    if (was_grounded && !f->grounded && !f->jumping &&
+        v.y() <= btScalar(0.1)) {
+        btVector3 c = b->getWorldTransform().getOrigin();
+        btVector3 feet = c - btVector3(0, half, 0);
+        btVector3 hit, n;
+        if (char_ray_down(bw, b, feet, btScalar(f->step_height) + btScalar(0.05),
+                          &hit, &n) &&
+            n.y() >= btScalar(f->max_slope_cos)) {
+            btScalar drop = feet.y() - hit.y();
+            if (drop > btScalar(0.0)) {
+                btTransform xf = b->getWorldTransform();
+                xf.setOrigin(c - btVector3(0, drop - btScalar(0.01), 0));
+                b->setWorldTransform(xf);
+                b->setInterpolationWorldTransform(xf);
+                v.setY(0);
+                f->grounded      = true;
+                f->ground_normal = n;
+            }
+        }
+    }
+
+    /* Max-slope limit: in contact with a too-steep face — strip the uphill
+     * component of the commanded velocity (along/downhill still allowed),
+     * so a frictionless capsule cannot power up a cliff face.  Uses the
+     * raw `touching` contact (steep faces deliberately don't count as
+     * `grounded` for jumps/animation). */
+    btVector3 target(static_cast<btScalar>(walk_dir.x), 0,
+                     static_cast<btScalar>(walk_dir.z));
+    if (f->touching && f->ground_normal.y() < btScalar(f->max_slope_cos)) {
+        btVector3 uphill(-f->ground_normal.x(), 0, -f->ground_normal.z());
+        btScalar ul = uphill.length();
+        if (ul > btScalar(1e-4)) {
+            uphill /= ul;
+            btScalar into = target.dot(uphill);
+            if (into > btScalar(0.0)) target -= uphill * into;
+        }
+    }
+
+    /* Accelerate the horizontal velocity toward the target. */
+    btScalar rate   = btScalar(f->grounded ? f->accel
+                                           : f->accel * f->air_control);
+    btScalar max_dv = rate * btScalar(dt);
+    btVector3 dv(target.x() - v.x(), 0, target.z() - v.z());
+    btScalar  dl = dv.length();
+    if (dl > max_dv && dl > SIMD_EPSILON) dv *= max_dv / dl;
+    v.setX(v.x() + dv.x());
+    v.setZ(v.z() + dv.z());
     b->setLinearVelocity(v);
     b->activate();
+
+    /* Step-up assist: pushing into a low blocker while grounded. */
+    btVector3 dir = target;
+    btScalar  sp  = dir.length();
+    if (f->grounded && sp > btScalar(0.1)) {
+        dir /= sp;
+        btVector3 c    = b->getWorldTransform().getOrigin();
+        btScalar  feet = c.y() - half;
+        btScalar  step = btScalar(f->step_height);
+
+        auto fwd_hit = [&](btScalar lift_y, btScalar reach,
+                           btVector3 *n_out) -> bool {
+            btVector3 from(c.x(), feet + lift_y, c.z());
+            btVector3 to = from + dir * reach;
+            btCollisionWorld::ClosestRayResultCallback cb(from, to);
+            cb.m_collisionFilterGroup = btBroadphaseProxy::CharacterFilter;
+            cb.m_collisionFilterMask  = btBroadphaseProxy::StaticFilter |
+                                        btBroadphaseProxy::DefaultFilter;
+            bw->world->rayTest(from, to, cb);
+            if (!cb.hasHit() || cb.m_collisionObject == b) return false;
+            if (n_out) *n_out = cb.m_hitNormalWorld;
+            return true;
+        };
+
+        /* Blocked at ankle height by a RISER (a face too steep to walk —
+         * a walkable ramp ahead also intersects the ankle ray, but that is
+         * the slope/solver's job, not a step) and clear at step height? */
+        btVector3 ankle_n(0, 1, 0);
+        if (fwd_hit(btScalar(0.05), radius + btScalar(0.12), &ankle_n) &&
+            ankle_n.y() < btScalar(f->max_slope_cos) &&
+            !fwd_hit(step + btScalar(0.05), radius + btScalar(0.15), nullptr)) {
+            /* Find the step's top surface just past the blocker. */
+            btVector3 top_from = btVector3(c.x(), feet + step + btScalar(0.05),
+                                           c.z()) + dir * (radius + btScalar(0.15));
+            btVector3 hit, n;
+            if (char_ray_down(bw, b, top_from, step + btScalar(0.10), &hit, &n) &&
+                n.y() >= btScalar(f->max_slope_cos)) {
+                btScalar lift = hit.y() - feet;
+                if (lift > btScalar(0.02) && lift <= step + btScalar(0.01)) {
+                    /* Head clearance: test ABOVE the capsule top (a ray from
+                     * the center would lie inside our own volume and always
+                     * report clear). */
+                    btVector3 head_from = c + btVector3(0, half, 0);
+                    btVector3 head_to   = head_from +
+                                          btVector3(0, lift + btScalar(0.05), 0);
+                    btCollisionWorld::ClosestRayResultCallback hc(head_from, head_to);
+                    hc.m_collisionFilterGroup = btBroadphaseProxy::CharacterFilter;
+                    hc.m_collisionFilterMask  = btBroadphaseProxy::StaticFilter |
+                                                btBroadphaseProxy::DefaultFilter;
+                    bw->world->rayTest(head_from, head_to, hc);
+                    if (!hc.hasHit() || hc.m_collisionObject == b) {
+                        btTransform xf = b->getWorldTransform();
+                        xf.setOrigin(c + btVector3(0, lift + btScalar(0.02), 0)
+                                       + dir * btScalar(0.02));
+                        b->setWorldTransform(xf);
+                        b->setInterpolationWorldTransform(xf);
+                        btVector3 vv = b->getLinearVelocity();
+                        if (vv.y() < btScalar(0.0)) {
+                            vv.setY(0);
+                            b->setLinearVelocity(vv);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
-void jce_bullet_character_jump(JceBulletWorld *bw, uint32_t idx)
+/* Launch the jump.  Grounded/coyote gating is the RUNTIME's job (it has
+ * the timers); here we only refuse re-triggering mid-ascent.  Returns
+ * whether the jump actually fired so the caller doesn't consume buffers
+ * or pulse animation triggers on a refusal. */
+bool jce_bullet_character_jump(JceBulletWorld *bw, uint32_t idx)
 {
-    if (!bw || idx >= bw->char_capacity || !bw->char_alive[idx]) return;
-    if (!jce_bullet_character_is_grounded(bw, idx)) return;  /* no air jumps */
+    if (!bw || idx >= bw->char_capacity || !bw->char_alive[idx]) return false;
     btRigidBody *b = bw->char_bodies[idx];
-    if (!b) return;
+    if (!b) return false;
+    JceBulletCharFeel *f = &bw->char_feel[idx];
+    if (f->jumping) return false;   /* already mid-jump */
     btVector3 v = b->getLinearVelocity();
     v.setY(static_cast<btScalar>(bw->char_jump[idx]));
     b->setLinearVelocity(v);
     b->activate();
+    f->jumping  = true;
+    f->grounded = false;
+    return true;
 }
 
 void jce_bullet_character_get_position(JceBulletWorld *bw, uint32_t idx,
@@ -2057,24 +2295,46 @@ void jce_bullet_character_set_position(JceBulletWorld *bw, uint32_t idx,
     b->setInterpolationWorldTransform(xf);
     b->setInterpolationLinearVelocity(btVector3(0, 0, 0));
     b->activate();
+    /* Teleport invalidates the cached ground state and any in-flight jump. */
+    bw->char_feel[idx].probe_valid = false;
+    bw->char_feel[idx].jumping     = false;
 }
 
 bool jce_bullet_character_is_grounded(JceBulletWorld *bw, uint32_t idx)
 {
     if (!bw || idx >= bw->char_capacity || !bw->char_alive[idx]) return false;
+    if (!bw->char_bodies[idx]) return false;
+    JceBulletCharFeel *f = &bw->char_feel[idx];
+    /* move() refreshes the probe every fixed tick; fall back to a fresh
+     * probe only for queries before the first move (e.g. spawn frame). */
+    if (!f->probe_valid) return char_ground_probe(bw, idx);
+    return f->grounded;
+}
+
+void jce_bullet_character_get_velocity(JceBulletWorld *bw, uint32_t idx,
+                                        jce_vec3 *out_vel)
+{
+    if (!out_vel) return;
+    *out_vel = jce_v3(0.0f, 0.0f, 0.0f);
+    if (!bw || idx >= bw->char_capacity || !bw->char_alive[idx]) return;
     btRigidBody *b = bw->char_bodies[idx];
-    if (!b) return false;
-    auto *cap = static_cast<btCapsuleShape *>(bw->char_shapes[idx]);
-    btScalar half = cap->getHalfHeight() + cap->getRadius();  /* centre→foot */
-    btVector3 c    = b->getWorldTransform().getOrigin();
-    btVector3 from = c;
-    btVector3 to   = c - btVector3(0, half + btScalar(0.20), 0);
-    btCollisionWorld::ClosestRayResultCallback cb(from, to);
-    cb.m_collisionFilterGroup = btBroadphaseProxy::CharacterFilter;
-    cb.m_collisionFilterMask  = btBroadphaseProxy::StaticFilter |
-                                btBroadphaseProxy::DefaultFilter;
-    bw->world->rayTest(from, to, cb);
-    return cb.hasHit() && cb.m_collisionObject != b;
+    if (!b) return;
+    *out_vel = from_bt_v3(b->getLinearVelocity());
+}
+
+void jce_bullet_character_cut_jump(JceBulletWorld *bw, uint32_t idx,
+                                    float factor)
+{
+    if (!bw || idx >= bw->char_capacity || !bw->char_alive[idx]) return;
+    btRigidBody *b = bw->char_bodies[idx];
+    if (!b) return;
+    if (factor < 0.0f) factor = 0.0f;
+    if (factor > 1.0f) factor = 1.0f;
+    btVector3 v = b->getLinearVelocity();
+    if (v.y() > btScalar(0.0)) {
+        v.setY(v.y() * btScalar(factor));
+        b->setLinearVelocity(v);
+    }
 }
 
 /* ================================================================== */
@@ -2508,4 +2768,3 @@ extern "C" void jce_physics_set_default_bullet_world_(JceBulletWorld *bw)
 {
     g_default_bullet_world = bw;
 }
-

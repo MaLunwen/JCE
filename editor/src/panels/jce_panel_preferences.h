@@ -8,8 +8,8 @@
  * Persisted to ".jce/prefs.json" via jce_fs_host_* (see
  * jce_panel_preferences.cpp for the path resolution rationale).
  *
- * The "Hotkeys" sub-tab is a placeholder; the real editor is wired in
- * the sibling task P4-A.3.
+ * The "Hotkeys" sub-tab hosts the full rebinding editor (filter /
+ * capture / conflict detection / reset), wired in P4-A.3.
  */
 
 #ifndef JCE_PANEL_PREFERENCES_H

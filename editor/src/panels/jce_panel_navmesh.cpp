@@ -65,7 +65,6 @@ struct State {
     BakeSettings cfg;
     BakeResult   result;
     bool         have_result = false;
-    bool         show_overlay = true;
     char         path[260] = "untitled.navmesh.json";
 };
 
@@ -401,7 +400,11 @@ void draw_actions(void)
     ImGui::SetNextItemWidth(360);
     jce_draw_path_input(jce_editor_i18n_id("navmesh.field.path", "nav_path"), s.path, sizeof(s.path), JcePathKind::FileAbs);
     ImGui::SameLine();
-    ImGui::Checkbox(jce_editor_i18n_id("navmesh.field.showOverlay", "nav_overlay"), &s.show_overlay);
+    /* Proxy for the shared Scene-View show flag, so this checkbox and the
+     * Scene View flags menu drive the SAME navmesh overlay switch. */
+    bool overlay_on = jce_state_show_flag(JCE_SHOW_FLAG_NAVMESH);
+    if (ImGui::Checkbox(jce_editor_i18n_id("navmesh.field.showOverlay", "nav_overlay"), &overlay_on))
+        jce_state_set_show_flag(JCE_SHOW_FLAG_NAVMESH, overlay_on);
 }
 
 void draw_preview(void)

@@ -70,12 +70,21 @@ add_custom_command(TARGET @JCE_PROJECT_NAME@ POST_BUILD
             "${CMAKE_SOURCE_DIR}/jce_project.json"
             "$<TARGET_FILE_DIR:@JCE_PROJECT_NAME@>/jce_project.json"
     VERBATIM)
-if(IS_DIRECTORY "${_cooked}")
+
+# Loose cooked-asset staging is optional: when the project ships its assets
+# encrypted inside the embedded PAK, copying the plaintext cooked tree next
+# to the exe would defeat the encryption (the editor passes OFF for
+# encrypting builds).  Default ON preserves the historical layout.
+option(JCE_PROJECT_STAGE_LOOSE_ASSETS
+    "Copy the loose cooked asset tree next to the built executable" ON)
+if(JCE_PROJECT_STAGE_LOOSE_ASSETS AND IS_DIRECTORY "${_cooked}")
     add_custom_command(TARGET @JCE_PROJECT_NAME@ POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_directory
                 "${_cooked}"
                 "$<TARGET_FILE_DIR:@JCE_PROJECT_NAME@>/${JCE_PROJECT_COOKED_ASSETS}"
         VERBATIM)
+elseif(NOT JCE_PROJECT_STAGE_LOOSE_ASSETS)
+    message(STATUS "@JCE_PROJECT_NAME@: loose cooked-asset staging disabled (encrypted assets ship inside the PAK)")
 endif()
 
 # ── Embed project bundles directly into the exe ─────────────────

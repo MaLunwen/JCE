@@ -684,6 +684,39 @@ static void fourcc_str(uint32_t tag, char out[5]) {
     out[4] = 0;
 }
 
+/* ── Encryption key files (pak_key.hex: 64 hex chars = 32 bytes) ──── */
+
+static int hex_nibble_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Load a 32-byte key from a 64-hex-char file (whitespace tolerated).
+ * Exits with a diagnostic on failure — key mistakes must never silently
+ * produce a wrongly-encrypted or unverifiable archive. */
+static void load_key_file(const char *path, uint8_t out_key[32]) {
+    size_t sz = 0;
+    uint8_t *buf = read_file_bin(path, &sz);
+    int nibbles = 0;
+    for (size_t i = 0; i < sz; i++) {
+        char c = (char)buf[i];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
+        int v = hex_nibble_val(c);
+        if (v < 0 || nibbles >= 64) { nibbles = -1; break; }
+        if ((nibbles & 1) == 0) out_key[nibbles / 2] = (uint8_t)(v << 4);
+        else                    out_key[nibbles / 2] |= (uint8_t)v;
+        nibbles++;
+    }
+    free(buf);
+    if (nibbles != 64) {
+        fprintf(stderr, "[jce_pak] invalid key file (expected 64 hex chars): %s\n",
+                path);
+        exit(1);
+    }
+}
+
 /* Duplicate-content detection record (spec §6.3 wasted-space audit). Two
  * entries are treated as duplicates when they share both content_crc and
  * original_size, which makes a stray XXH32 collision astronomically unlikely. */
@@ -707,10 +740,12 @@ static int jpak_dup_cmp(const void *pa, const void *pb) {
  * quiet) and, when json_out is set, emit a machine-readable manifest
  * (schema jce.pakbom.v1) including every entry's hashes/sizes/compression.
  * When `verify` is set, every unencrypted entry is decompressed and checked
- * against its content_crc (a full integrity audit).  Duplicate content is
- * always detected (entries sharing crc + original_size).
- * Returns 0 on success, 1 on failure. */
-static int cmd_inspect(const char *path, const char *json_out, int quiet, int verify) {
+ * against its content_crc (a full integrity audit); pass `key` (32 bytes,
+ * from --key-file) to also decrypt + verify ENCRYPTED entries (NULL skips
+ * them).  Duplicate content is always detected (entries sharing crc +
+ * original_size).  Returns 0 on success, 1 on failure. */
+static int cmd_inspect(const char *path, const char *json_out, int quiet,
+                       int verify, const uint8_t *key) {
     /* Read only the 64-byte header (+ the small dictionary table) up front so
      * we never pull a potentially multi-gigabyte data region into RAM just to
      * list its contents.  Entries and debug paths are then served from an
@@ -777,6 +812,7 @@ static int cmd_inspect(const char *path, const char *json_out, int quiet, int ve
         free(dtbl);
         return 1;
     }
+    if (key) jce_archive_set_decryption_key(ar, key);
     int      header_ok = jce_archive_verify_header(ar);
     uint32_t n         = jce_archive_count(ar);
 
@@ -842,7 +878,7 @@ static int cmd_inspect(const char *path, const char *json_out, int quiet, int ve
                 const JceArchiveEntry *e = jce_archive_get(ar, i);
                 if (!e)
                     continue;
-                if (e->entry_flags & JARC_ENTRY_ENCRYPTED) {
+                if ((e->entry_flags & JARC_ENTRY_ENCRYPTED) && !key) {
                     skipped_cnt++; /* no key available during inspection */
                     continue;
                 }
@@ -1116,6 +1152,8 @@ typedef struct {
     char json_file[1024];    /* optional BOM JSON output path             */
     int  quiet;              /* suppress the console bill-of-materials     */
     int  verify;             /* inspect: deep CRC-verify every entry       */
+    char encrypt_key_file[1024]; /* pack: encrypt every entry with this key */
+    char key_file[1024];         /* inspect/verify: decrypt with this key   */
 } Args;
 
 static void usage(void) {
@@ -1134,10 +1172,18 @@ static void usage(void) {
             "              [--symbol-prefix <ident>]    C/COFF symbol base (default: assets_pak_data)\n"
             "              [--level         <1..22>]    ZSTD level (default: 3)\n"
             "              [--no-store-opt]             disable already-compressed bypass\n"
+            "              [--encrypt-key-file <key.hex>]  ChaCha20-encrypt EVERY entry with the\n"
+            "                                           32-byte key (64 hex chars, e.g. the\n"
+            "                                           project's .jce/pak_key.hex).  Deters\n"
+            "                                           casual extraction only — the key must\n"
+            "                                           ship with the game (no MAC).\n"
             "\n"
             "  Inspect mode (read an existing archive, emit a bill-of-materials):\n"
             "    jce_pak --inspect <archive.pak> [--json <out.json>] [--quiet] [--verify]\n"
+            "            [--key-file <key.hex>]\n"
             "  --verify decompresses every entry and checks its content CRC (deep audit).\n"
+            "  --key-file supplies the decryption key so ENCRYPTED entries verify too\n"
+            "  (otherwise they are skipped).\n"
             "  In pack mode, --json <out.json> also writes a BOM of the produced .pak.\n"
             "\n"
             "  --exclude-suffix skips any file whose path ends with the suffix\n"
@@ -1259,6 +1305,12 @@ static Args parse_args(int argc, char *const argv[]) {
             a.quiet = 1;
         } else if (strcmp(arg, "--verify") == 0) {
             a.verify = 1;
+        } else if (strcmp(arg, "--encrypt-key-file") == 0 && val) {
+            snprintf(a.encrypt_key_file, sizeof(a.encrypt_key_file), "%s", val);
+            ++i;
+        } else if (strcmp(arg, "--key-file") == 0 && val) {
+            snprintf(a.key_file, sizeof(a.key_file), "%s", val);
+            ++i;
         } else {
             fprintf(stderr, "[jce_pak] unknown argument: %s\n", arg);
             usage();
@@ -1300,9 +1352,18 @@ static Args parse_args(int argc, char *const argv[]) {
 int main(int argc, char *argv[]) {
     Args args = parse_args(argc, argv);
 
+    /* Optional decryption key for inspect/verify (and post-pack BOM). */
+    uint8_t  inspect_key[32];
+    const uint8_t *inspect_key_p = NULL;
+    if (args.key_file[0]) {
+        load_key_file(args.key_file, inspect_key);
+        inspect_key_p = inspect_key;
+    }
+
     /* Inspect mode: read an existing archive and emit a bill-of-materials. */
     if (args.inspect_file[0])
-        return cmd_inspect(args.inspect_file, args.json_file, args.quiet, args.verify);
+        return cmd_inspect(args.inspect_file, args.json_file, args.quiet,
+                           args.verify, inspect_key_p);
 
     printf("[jce_pak] target platform: %s\n", args.platform);
 
@@ -1382,6 +1443,19 @@ int main(int argc, char *argv[]) {
     cfg.use_dict         = true;  /* train JSON/TEXT/SHADER dictionaries  */
     cfg.dedup_content    = true;  /* coalesce byte-identical payloads      */
 
+    /* --encrypt-key-file: compress-then-ChaCha20 every entry; the label
+     * matches the engine's embedded-PAK convention so the same path in a
+     * bundle never shares a keystream with the PAK copy. */
+    uint8_t pack_key[32];
+    if (args.encrypt_key_file[0]) {
+        load_key_file(args.encrypt_key_file, pack_key);
+        cfg.encrypt        = true;
+        cfg.encryption_key = pack_key;
+        cfg.encrypt_label  = "project_assets";
+        printf("[jce_pak] payload encryption: ENABLED (deters casual "
+               "extraction; key ships with the game)\n");
+    }
+
     void    *pak_blob   = NULL;
     size_t   pak_size   = 0;
     uint16_t dict_count = 0;
@@ -1436,7 +1510,8 @@ int main(int argc, char *argv[]) {
 
     /* Optional bill-of-materials JSON for the just-produced archive. */
     if (args.json_file[0])
-        cmd_inspect(args.pak_file, args.json_file, 1, 0);
+        cmd_inspect(args.pak_file, args.json_file, 1, 0,
+                    args.encrypt_key_file[0] ? pack_key : inspect_key_p);
 
     /* COFF .obj */
     if (strcmp(args.obj_format, "coff") == 0 && args.obj_file[0]) {

@@ -30,6 +30,7 @@
 #include <jce/middleware/audio/jce_audio.h>
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_ui_canvas.h>
+#include <jce/middleware/scene/jce_vcam_system.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
@@ -45,6 +46,7 @@
 #include <jce/resource/jce_model_importer.h>
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/resource/jce_scene_serial.h>
+#include <jce/resource/jce_world_streamer.h>
 
 #include <math.h>
 #include <stdio.h>
@@ -72,6 +74,10 @@ static const JceServices*s_svc            = NULL;
 static JceRuntime       *s_runtime        = NULL;
 static float             s_last_dt        = 0.016f;
 static bool              s_jump_edge      = false;
+/* Open-world chunk streamer — created only when the startup scene's
+ * authored streaming settings are enabled (World Streaming panel). */
+static JceWorldStreamer *s_world_streamer = NULL;
+static JceFileSystem    *s_stream_fs      = NULL;   /* owned only when not bundle-backed */
 
 /* Runtime mesh cache (path → JceMesh*).
  *
@@ -205,6 +211,62 @@ static bool jce_default_load_startup_scene(const JceProject *proj)
     return true;
 }
 
+/* Build the world streamer from the startup scene's authored streaming
+ * settings.  FS source: when bundles are mounted, chunk fragments stream
+ * out of the bundle VFS (s_bundle_fs); otherwise a private fs mounting
+ * <exe_dir>/<cooked_assets> is created (same base the startup scene
+ * loaded from), so fragment paths stay project-relative either way. */
+static void jce_default_init_world_streaming(const JceProject *proj)
+{
+    if (!s_scene) return;
+
+    const JceSceneStreamingSettings *st =
+        jce_scene_get_streaming_settings(s_scene);
+    if (!st || !st->enabled || st->chunk_count == 0) return;
+
+    JceFileSystem *fs = s_bundle_fs;
+    if (!fs) {
+        char base[1024] = {0};
+        if (!jce_fs_host_get_base_path(base, sizeof(base))) {
+            LOG_WARN("app", "%s", "world streaming: no base path — disabled");
+            return;
+        }
+        const char *cooked = (proj && proj->cooked_assets && proj->cooked_assets[0])
+                             ? proj->cooked_assets : "resources/_cooked";
+        char root[1024];
+        int n = snprintf(root, sizeof(root), "%s%s", base, cooked);
+        if (n <= 0 || n >= (int)sizeof(root)) return;
+
+        s_stream_fs = jce_fs_create();
+        if (!s_stream_fs) return;
+        jce_fs_mount_dir(s_stream_fs, "", root);
+        fs = s_stream_fs;
+    }
+
+    JceWorldStreamConfig wsc = jce_world_stream_config_default();
+    wsc.mode            = (st->mode == 1) ? JCE_STREAM_RECTANGULAR
+                                          : JCE_STREAM_RADIAL;
+    wsc.load_radius     = st->load_radius;
+    wsc.unload_radius   = st->unload_radius;
+    wsc.max_pending     = st->max_pending;
+    wsc.budget_mb       = st->budget_mb;
+    wsc.frame_budget_ms = st->frame_budget_ms;
+    /* Cooperative mode: chunk apply spawns entities + GPU resources, which
+     * must happen on the main/render thread (no thread pool is passed). */
+    wsc.single_thread   = true;
+
+    s_world_streamer = jce_world_streamer_create(&wsc, s_scene, fs, NULL);
+    if (!s_world_streamer) {
+        LOG_WARN("app", "%s", "world streamer creation failed — streaming disabled");
+        if (s_stream_fs) { jce_fs_destroy(s_stream_fs); s_stream_fs = NULL; }
+        return;
+    }
+    jce_world_streamer_register_from_scene_settings(s_world_streamer, st);
+    LOG_INFO("app", "world streaming active (%u chunks, r=%.0f/%.0f)",
+             jce_world_streamer_chunk_count(s_world_streamer),
+             wsc.load_radius, wsc.unload_radius);
+}
+
 static JceMesh *s_default_load_mesh(const char *path, void *ud)
 {
     (void)ud;
@@ -289,6 +351,12 @@ static bool app_init(const JceServices *svc, void *ud)
         cbs.load_mesh = s_default_load_mesh;
         s_scene_renderer = jce_scene_renderer_create(
                                svc->renderer, s_engine_pak, &cbs);
+        /* A shipped game is always "playing": enable the animation
+         * state-machine / auto-locomotion driver that the editor only
+         * turns on during Play (otherwise authored .anim_sm.json bindings
+         * and auto_speed stay inert in deployed exes). */
+        if (s_scene_renderer)
+            jce_scene_renderer_set_anim_sm_active(s_scene_renderer, true);
     }
     if (!s_scene_renderer)
         LOG_WARN("app", "%s", "jce_scene_renderer_create failed — scene will not render");
@@ -308,10 +376,39 @@ static bool app_init(const JceServices *svc, void *ud)
         rd.pak            = s_engine_pak;
         rd.audio          = svc ? svc->audio : NULL;
         rd.enable_physics = true;
+
+        /* Game L10n: prefer the on-disk cooked tree's i18n dir
+         * (<exe_dir>/<cooked_assets>/i18n) so shipped games hot-load
+         * locale edits; bundle-embedded exes fall through to rd.pak's
+         * "i18n/<locale>.json" source inside jce_runtime_create.  The
+         * initial locale comes from jce.ini ([app] locale=zh_cn) when
+         * set; otherwise the runtime auto-detects from the OS. */
+        static char s_loc_dir[1024];
+        {
+            char base[1024] = {0};
+            if (jce_fs_host_get_base_path(base, sizeof(base))) {
+                const char *cooked =
+                    (s_project && s_project->cooked_assets &&
+                     s_project->cooked_assets[0])
+                    ? s_project->cooked_assets : "resources/_cooked";
+                int n = snprintf(s_loc_dir, sizeof(s_loc_dir),
+                                 "%s%s/i18n", base, cooked);
+                if (n > 0 && n < (int)sizeof(s_loc_dir) &&
+                    jce_fs_host_exists_dir(s_loc_dir))
+                    rd.locales_dir = s_loc_dir;
+            }
+        }
+        rd.locale = (svc && svc->config && svc->config->locale[0])
+                    ? svc->config->locale : NULL;
+
         s_runtime = jce_runtime_create(&rd);
         if (!s_runtime)
             LOG_WARN("app", "%s", "jce_runtime_create failed — physics/audio inactive");
     }
+
+    /* Open-world streaming (no-op unless the scene's streaming settings
+     * are enabled and carry registered chunks). */
+    jce_default_init_world_streaming(s_project);
 
     /* Unconditional cursor capture so FPS-look feels like editor Play. */
     if (svc && svc->window) {
@@ -321,19 +418,35 @@ static bool app_init(const JceServices *svc, void *ud)
     return true;
 }
 
+/* Editor-authored action map drives movement when the action exists;
+ * the raw scancode is the fallback so a missing/renamed action never
+ * strands the player. The engine already loads input_actions.json and
+ * updates the map every frame (QW-input-actions) — this is the consumer
+ * side that was historically missing. */
+static bool dm_act_down(const JceInput *in, const JceInputActions *acts,
+                        const char *name, int fallback_key)
+{
+    if (acts) {
+        int id = jce_action_find(acts, name);
+        if (id >= 0) return jce_action_down(acts, id);
+    }
+    return jce_input_key_down(in, fallback_key);
+}
+
 static void app_update(float dt, void *ud)
 {
     (void)ud;
     s_last_dt = dt;
     if (!s_svc || !s_svc->input) return;
     const JceInput *in = s_svc->input;
+    const JceInputActions *acts = s_svc->actions;
 
-    /* Editor's panel_game_view ships walk_speed=4.0; mirror it so the
-     * deployed exe responds at the same pace.  Movement is camera-
-     * relative (W = into-the-screen) just like the editor's Play view,
-     * so look direction defines move direction (FPS feel). */
+    /* Movement is camera-relative (W = into-the-screen) just like the
+     * editor's Play view, so look direction defines move direction.
+     * Only a unit DIRECTION plus button state is pushed — speeds and the
+     * jump arc come from the scene's CharacterController component, so
+     * the deployed exe and the editor share the same authored feel. */
     if (s_runtime) {
-        const float kWalkSpeed = 4.0f;
         JceRuntimeInput ri = (JceRuntimeInput){0};
 
         float fx = 0.0f, fz = 0.0f, rx = 0.0f, rz = 0.0f;
@@ -347,28 +460,55 @@ static void app_update(float dt, void *ud)
             if (rl > 0.0001f) { rx = right.x/rl; rz = right.z/rl; }
         }
         float wx = 0.0f, wz = 0.0f;
-        if (jce_input_key_down(in, JCE_KEY_W)) { wx += fx; wz += fz; }
-        if (jce_input_key_down(in, JCE_KEY_S)) { wx -= fx; wz -= fz; }
-        if (jce_input_key_down(in, JCE_KEY_D)) { wx += rx; wz += rz; }
-        if (jce_input_key_down(in, JCE_KEY_A)) { wx -= rx; wz -= rz; }
+        if (dm_act_down(in, acts, "move_forward", JCE_KEY_W)) { wx += fx; wz += fz; }
+        if (dm_act_down(in, acts, "move_back",    JCE_KEY_S)) { wx -= fx; wz -= fz; }
+        if (dm_act_down(in, acts, "move_right",   JCE_KEY_D)) { wx += rx; wz += rz; }
+        if (dm_act_down(in, acts, "move_left",    JCE_KEY_A)) { wx -= rx; wz -= rz; }
         float wlen = sqrtf(wx*wx + wz*wz);
         if (wlen > 0.0001f) { wx /= wlen; wz /= wlen; }
-        ri.walk_x = wx * kWalkSpeed;
-        ri.walk_z = wz * kWalkSpeed;
+        ri.walk_x = wx;
+        ri.walk_z = wz;
 
-        bool jump_now = jce_input_key_down(in, JCE_KEY_SPACE);
+        bool jump_now = dm_act_down(in, acts, "jump", JCE_KEY_SPACE);
         ri.jump_pressed = jump_now && !s_jump_edge;
+        ri.jump_held    = jump_now;
         s_jump_edge     = jump_now;
         ri.speed_mult   = 1.0f;
-        if (jce_input_key_down(in, JCE_KEY_LSHIFT) ||
-            jce_input_key_down(in, JCE_KEY_RSHIFT)) ri.speed_mult = 3.0f;
+        ri.sprint = dm_act_down(in, acts, "sprint", JCE_KEY_LSHIFT) ||
+                    jce_input_key_down(in, JCE_KEY_RSHIFT);
         if (jce_input_key_down(in, JCE_KEY_LCTRL)  ||
             jce_input_key_down(in, JCE_KEY_RCTRL))  ri.speed_mult = 0.25f;
         jce_runtime_set_input(s_runtime, &ri);
         jce_runtime_step(s_runtime, dt);
     }
 
+    /* Drive chunk streaming from the live camera position (cooperative
+     * mode: pending loads/applies run inside this call, on this thread). */
+    if (s_world_streamer && s_camera)
+        jce_world_streamer_update(s_world_streamer,
+                                  jce_camera_get_position(s_camera));
+
     if (!s_camera) return;
+
+    /* Cinemachine-style VCam override — parity with the editor game view
+     * (jce_panel_game_view.cpp does the same in Play mode): when the scene
+     * has any active VirtualCamera, its damped blended pose drives the live
+     * camera and wins over both mouse-look and the player-follow / free-fly
+     * logic below for this frame.  When no VCam is active, `vout` is left
+     * untouched and we fall through to the FPS controls. */
+    if (s_scene) {
+        JceVcamOutput vout;
+        bool has_vcam = false;
+        jce_vcam_system_evaluate(s_scene, dt, &vout, &has_vcam);
+        if (has_vcam) {
+            jce_camera_set_position(s_camera,
+                jce_v3(vout.position[0], vout.position[1], vout.position[2]));
+            jce_camera_look_at(s_camera,
+                jce_v3(vout.target[0], vout.target[1], vout.target[2]));
+            jce_camera_set_fov(s_camera, vout.fov_deg);
+            return;
+        }
+    }
 
     /* Always-on FPS look: cursor is grabbed in app_init so delta is
      * pure mouse motion.  Mirror editor panel_game_view convention:
@@ -437,6 +577,10 @@ static void app_draw(const JceServices *svc, void *ud)
 static void app_exit(void *ud)
 {
     (void)ud;
+    /* Streamer first: destroying it removes its streamed entities from
+     * s_scene and detaches from the fs before either is torn down. */
+    if (s_world_streamer) { jce_world_streamer_destroy(s_world_streamer);  s_world_streamer = NULL; }
+    if (s_stream_fs)      { jce_fs_destroy(s_stream_fs);                   s_stream_fs      = NULL; }
     if (s_runtime)        { jce_runtime_destroy(s_runtime);              s_runtime        = NULL; }
     if (s_ui_canvas)      { jce_ui_canvas_destroy(s_ui_canvas);          s_ui_canvas      = NULL; }
     if (s_scene_renderer) { jce_scene_renderer_destroy(s_scene_renderer); s_scene_renderer = NULL; }

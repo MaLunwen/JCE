@@ -173,6 +173,7 @@ static void draw_scene_view_toolbar(void)
                 { "sceneView.flag.worldAxis",     JCE_SHOW_FLAG_WORLD_AXIS     },
                 { "sceneView.flag.statsOverlay",  JCE_SHOW_FLAG_STATS_OVERLAY  },
                 { "sceneView.flag.navMesh",       JCE_SHOW_FLAG_NAVMESH        },
+                { "sceneView.flag.streaming",     JCE_SHOW_FLAG_STREAMING     },
             };
             for (auto &it : items) {
                 bool on = (f & it.bit) != 0;

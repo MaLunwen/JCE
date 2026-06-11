@@ -23,7 +23,10 @@
 #include "jce_scene_internal.h"
 
 #include <jce/renderer/jce_particles.h>
+#include <jce/renderer/jce_render_pipeline.h>
+#include <jce/renderer/jce_renderer_caps.h>
 #include <jce/os/core/jce_allocator.h>
+#include <jce/os/core/jce_hash.h>
 #include <jce/os/core/jce_log.h>
 
 #include <string.h>
@@ -33,29 +36,76 @@
 /* Mirror the engine particle system cap so the sweep set is the same size. */
 #define SP_MAX_EMITTERS 256
 
+/* ── GPU routing predicate (shared with jce_scene_renderer.c) ──────────
+ *
+ * Process-wide latch: flipped when a GPU particle system failed to come up
+ * (compute caps lied / shaders missing from the pak).  Once set, every
+ * emitter routes back to the CPU path for the rest of the process. */
+static bool s_gpu_particles_blocked = false;
+
+void jce_scene_internal_gpu_particles_set_blocked(void)
+{
+    if (!s_gpu_particles_blocked)
+        LOG_WARN(LOG_TAG, "GPU particle system unavailable "
+                 "(compute unsupported or shaders missing); "
+                 "all emitters fall back to CPU simulation");
+    s_gpu_particles_blocked = true;
+}
+
+bool jce_scene_internal_gpu_particles_blocked(void)
+{
+    return s_gpu_particles_blocked;
+}
+
+bool jce_scene_particle_emitter_uses_gpu(const JceParticleEmitterComponent *c)
+{
+    if (!c || !c->gpu) return false;
+    if (s_gpu_particles_blocked) return false;
+    if (!jce_render_pipeline_is_feature_enabled("gpu_particles")) return false;
+    /* jce_renderer_get_caps() is NULL-safe pre-bgfx-init (returns 0). */
+    if ((jce_renderer_get_caps() & JCE_CAP_COMPUTE) == 0) return false;
+    return true;
+}
+
 /* ── Asset-change marker ───────────────────────────────────────────────
  *
  * A cheap FNV-1a over asset_path + the legacy tuning fields lets us detect
  * authoring edits (path changed, or emit_rate/lifetime nudged in the
- * inspector when no asset is set) and rebuild the emitter only then. */
-static uint64_t sp_asset_epoch(const JceParticleEmitterComponent *c)
+ * inspector when no asset is set) and rebuild the emitter only then.  The
+ * gpu flag is folded in so toggling CPU↔GPU rebuilds on either side. */
+uint64_t jce_scene_particle_emitter_epoch(const JceParticleEmitterComponent *c)
 {
-    uint64_t h = 1469598103934665603ull;
-    const unsigned char *p = (const unsigned char *)c->asset_path;
-    for (int i = 0; i < (int)sizeof(c->asset_path) && p[i]; ++i) {
-        h ^= p[i];
-        h *= 1099511628211ull;
-    }
+    size_t len = 0;
+    while (len < sizeof(c->asset_path) && c->asset_path[len]) len++;
+    uint64_t h = jce_fnv1a64_append(JCE_FNV1A64_INIT, c->asset_path, len);
     if (c->asset_path[0] == '\0') {
         /* Legacy fields only matter when no asset drives the emitter. */
-        const unsigned char *f = (const unsigned char *)&c->emit_rate;
-        for (size_t i = 0; i < sizeof(float) * 3; ++i) {
-            h ^= f[i];
-            h *= 1099511628211ull;
-        }
+        h = jce_fnv1a64_append(h, &c->emit_rate, sizeof(float) * 3);
     }
+    const uint8_t tag = c->gpu ? 0x47u : 0x43u;   /* 'G' / 'C' */
+    h = jce_fnv1a64_append(h, &tag, sizeof(tag));
     if (h == 0) h = 1; /* reserve 0 for "never loaded" */
     return h;
+}
+
+/* ── Authored desc resolution (shared with the GPU driver) ───────────── */
+
+void jce_scene_particle_emitter_desc(const JceParticleEmitterComponent *c,
+                                     JceParticleEmitterDesc *out)
+{
+    if (!out) return;
+    if (c && c->asset_path[0]) {
+        jce_particles_desc_load_json(c->asset_path, out, NULL, 0);
+        return;
+    }
+    /* No asset: synthesize from the legacy quick-tune fields. */
+    jce_particles_desc_default(out);
+    if (!c) return;
+    if (c->emit_rate    > 0.0f) out->emit_rate    = c->emit_rate;
+    if (c->lifetime_min > 0.0f) out->lifetime_min = c->lifetime_min;
+    if (c->lifetime_max > 0.0f) out->lifetime_max = c->lifetime_max;
+    if (out->lifetime_max < out->lifetime_min)
+        out->lifetime_max = out->lifetime_min;
 }
 
 /* ── Per-frame context ─────────────────────────────────────────────── */
@@ -80,17 +130,7 @@ static void sp_build_emitter(SpCtx *ctx, JceParticleEmitterComponent *c)
     c->emitter_handle_idx = UINT32_MAX;
 
     JceParticleEmitterDesc desc;
-    if (c->asset_path[0]) {
-        jce_particles_desc_load_json(c->asset_path, &desc, NULL, 0);
-    } else {
-        /* No asset: synthesize from the legacy quick-tune fields. */
-        jce_particles_desc_default(&desc);
-        if (c->emit_rate    > 0.0f) desc.emit_rate    = c->emit_rate;
-        if (c->lifetime_min > 0.0f) desc.lifetime_min = c->lifetime_min;
-        if (c->lifetime_max > 0.0f) desc.lifetime_max = c->lifetime_max;
-        if (desc.lifetime_max < desc.lifetime_min)
-            desc.lifetime_max = desc.lifetime_min;
-    }
+    jce_scene_particle_emitter_desc(c, &desc);
 
     JceEmitterHandle h = jce_particles_emitter_add(ctx->sys, &desc);
     if (!jce_emitter_valid(h)) {
@@ -99,7 +139,7 @@ static void sp_build_emitter(SpCtx *ctx, JceParticleEmitterComponent *c)
     }
     c->emitter_handle_idx = h.idx;
     c->loaded             = true;
-    c->asset_epoch        = sp_asset_epoch(c);
+    c->asset_epoch        = jce_scene_particle_emitter_epoch(c);
     jce_particles_emitter_start(ctx->sys, h);
 }
 
@@ -112,8 +152,21 @@ static void sp_each(JceScene *s, JceEntity e, void *ud)
     if (!c) return;
     if (!jce_scene_component_enabled(s, e, JCE_COMP_FLAG_PARTICLE_EMITTER)) return;
 
+    /* GPU-routed this frame: the scene renderer owns the compute-driven
+     * system.  Drop any CPU emitter we previously built and do NOT mark it
+     * referenced — the sweep below reaps it. */
+    if (jce_scene_particle_emitter_uses_gpu(c)) {
+        if (c->loaded && c->emitter_handle_idx != UINT32_MAX) {
+            JceEmitterHandle old = { c->emitter_handle_idx };
+            jce_particles_emitter_remove(ctx->sys, old);
+        }
+        c->loaded             = false;
+        c->emitter_handle_idx = UINT32_MAX;
+        return;
+    }
+
     /* (Re)build when never loaded or when authoring data changed. */
-    uint64_t epoch = sp_asset_epoch(c);
+    uint64_t epoch = jce_scene_particle_emitter_epoch(c);
     if (!c->loaded || c->emitter_handle_idx == UINT32_MAX ||
         c->asset_epoch != epoch) {
         sp_build_emitter(ctx, c);

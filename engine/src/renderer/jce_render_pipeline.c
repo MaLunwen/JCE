@@ -198,9 +198,14 @@ void jce_render_pipeline_apply(const JceRenderPipelineDesc *desc)
      * renderer subsystems (jce_csm_set_enabled, jce_ssao_set_enabled,
      * jce_ssr_set_enabled, jce_taa_set_enabled, jce_postfx_enable
      * already exists for bloom, jce_volumetric_fog_set_enabled,
-     * jce_gpu_particles_set_enabled, motion_blur_set_enabled) wire
-     * them up here.  Today the render graph reads the cached
-     * descriptor via jce_render_pipeline_is_feature_enabled(). */
+     * motion_blur_set_enabled) wire them up here.  Today the render
+     * graph reads the cached descriptor via
+     * jce_render_pipeline_is_feature_enabled().
+     *
+     * gpu_particles needs no live toggle: the scene renderer consumes
+     * the flag per frame (sr_drive_gpu_particles re-checks it each
+     * render and sweeps its pools when it turns off), so the deferred
+     * toggle works for free. */
 
     LOG_INFO(LOG_TAG,
         "applied: csm=%d ssao=%d ssr=%d taa=%d bloom=%d volfog=%d "

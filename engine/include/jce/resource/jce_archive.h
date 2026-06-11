@@ -134,6 +134,16 @@ JCE_API size_t jce_archive_read(const JceArchive *ar, const JceArchiveEntry *ent
  * casual extraction since the key necessarily ships with the game. */
 JCE_API void jce_archive_set_decryption_key(JceArchive *ar, const uint8_t key[32]);
 
+/* Install a process-wide decryption key that is auto-applied to every archive
+ * opened afterwards whose header carries the ENCRYPTED flag — so the engine
+ * can install the shipped key once at boot and PAKs / bundle mounts opened
+ * later decrypt transparently.  NULL clears it.  The key is copied.  Archives
+ * already open are unaffected; a later per-archive set_decryption_key()
+ * overrides the inherited key for that archive.  Not synchronized: call
+ * during single-threaded startup (before any opens), mirroring the engine's
+ * other boot-time module globals. */
+JCE_API void jce_archive_set_process_key(const uint8_t key[32]);
+
 /* ── Dictionaries (spec §4.4 / §7) ───────────────────────────────────── */
 
 /* Number of shared compression dictionaries carried by the archive. */

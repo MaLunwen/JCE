@@ -49,6 +49,8 @@ typedef struct PickModelCache {
 struct JceScenePickPass {
     JceRenderer       *renderer;
     const JcePakArchive *pak;
+    JceSceneRenderer  *scene_renderer; /* optional, borrowed — see
+                                          pick_resolve_model */
     JceSceneRendererCallbacks cbs;
     bool               has_cbs;
 
@@ -257,6 +259,7 @@ JceScenePickPass *jce_scene_pick_create(const JceScenePickDesc *desc)
 
     pass->renderer = desc->renderer;
     pass->pak = desc->pak;
+    pass->scene_renderer = desc->scene_renderer;
     if (desc->callbacks) {
         pass->cbs = *desc->callbacks;
         pass->has_cbs = true;
@@ -504,7 +507,31 @@ static JceModel *pick_resolve_model(JceScenePickPass *pass,
     if (!pass || !path || !path[0])
         return NULL;
 
-    /* Resolve through the bounded model_cache REGARDLESS of whether a load
+    /* Borrow from the scene renderer first: it already holds one GPU copy of
+     * every skinned model the scene draws (SrModelCache), so loading our own
+     * duplicate — vertex buffers AND material textures the pick shader never
+     * samples — is pure waste.
+     *
+     * Lifetime contract of the borrow: SrModelCache has no eviction — entries
+     * are freed only in jce_scene_renderer_destroy() — and the sole consumer
+     * (editor) destroys the pick pass BEFORE the scene renderer
+     * (jce_editor_scene_render_shutdown), so a pointer borrowed here cannot
+     * dangle. The pass still must not HOLD it: the borrowed model is used for
+     * the current ID render only, re-resolved on every jce_scene_pick_render
+     * (once per click), and never inserted into model_cache — so
+     * pick_destroy_model_cache continues to free exclusively pick-owned
+     * loads. If the renderer cache is still async-pending (model NULL) or has
+     * no entry, fall through to the standalone path below. */
+    if (pass->scene_renderer) {
+        JceModel *borrowed = (JceModel *)jce_scene_renderer_get_model(
+            pass->scene_renderer, path);
+        if (borrowed)
+            return borrowed;
+    }
+
+    /* Standalone fallback (no scene renderer attached, or it has no entry
+     * for this path yet).
+     * Resolve through the bounded model_cache REGARDLESS of whether a load
      * callback is installed. Returning pass->cbs.load_model() raw (the old
      * behavior) leaked catastrophically: jce_scene_pick_render used to run
      * every frame over all entities, so each skeletal-animator entity

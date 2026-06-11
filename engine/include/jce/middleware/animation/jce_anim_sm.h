@@ -80,6 +80,8 @@ JCE_API void jce_anim_sm_eval(const JceAnimSm *sm, JceAnimSmEval *out);
 JCE_API int         jce_anim_sm_state_count(const JceAnimSm *sm);
 JCE_API const char *jce_anim_sm_state_name (const JceAnimSm *sm, int idx);
 JCE_API const char *jce_anim_sm_state_clip (const JceAnimSm *sm, int idx);
+JCE_API float       jce_anim_sm_state_speed(const JceAnimSm *sm, int idx);
+JCE_API bool        jce_anim_sm_state_loop (const JceAnimSm *sm, int idx);
 
 JCE_EXTERN_C_END
 

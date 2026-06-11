@@ -124,6 +124,13 @@ JCE_API bool jce_recast_snap_to_navmesh(const JceRecastNavMesh *nm,
                                          float wx, float wz,
                                          float *out_x, float *out_y, float *out_z);
 
+/* Debug visualisation: invoke `fn` once per polygon edge of every ground
+ * polygon in the navmesh (a/b are world-space endpoints; `boundary` is
+ * true for outer edges with no neighbouring polygon).  Returns the number
+ * of edges emitted. */
+typedef void (*JceRecastEdgeFn)(void *user, const float a[3], const float b[3], bool boundary);
+JCE_API int jce_recast_debug_edges(const JceRecastNavMesh *nm, JceRecastEdgeFn fn, void *user);
+
 JCE_API void jce_recast_get_stats(const JceRecastNavMesh *nm,
                                     JceRecastStats *out_stats);
 

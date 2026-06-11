@@ -258,6 +258,62 @@ JceBodyHandle jce_physics2d_body_create(JcePhysics2D *world,
     return (JceBodyHandle){ slot };
 }
 
+JceBodyHandle jce_physics2d_body_create_empty(JcePhysics2D *world,
+                                              jce_vec2 pos, float angle,
+                                              JceBodyType type)
+{
+    if (!world) return JCE_BODY_INVALID;
+
+    /* Find a free slot (mirrors jce_physics2d_body_create). */
+    uint32_t slot = UINT32_MAX;
+    for (uint32_t i = 0; i < world->capacity; i++) {
+        if (!world->slot_alive[i]) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == UINT32_MAX) {
+        LOG_ERROR(LOG_TAG, "2D body pool exhausted (%u)", world->capacity);
+        return JCE_BODY_INVALID;
+    }
+
+    b2BodyDef body_def = b2DefaultBodyDef();
+    body_def.type      = to_b2_body_type(type);
+    body_def.position  = to_b2(pos);
+    body_def.rotation  = b2MakeRot(angle);
+    /* Store pool index so raycast can recover the JceBodyHandle. */
+    body_def.userData  = (void *)(uintptr_t)slot;
+
+    b2BodyId body_id = b2CreateBody(world->world_id, &body_def);
+
+    world->body_ids[slot]   = body_id;
+    world->slot_alive[slot] = true;
+    world->count++;
+
+    return (JceBodyHandle){ slot };
+}
+
+bool jce_physics2d_body_add_box(JcePhysics2D *world, JceBodyHandle body,
+                                jce_vec2 center_local, jce_vec2 half_extents,
+                                float friction, float restitution, bool sensor)
+{
+    if (!world || !jce_body_valid(body) || body.idx >= world->capacity)
+        return false;
+    if (!world->slot_alive[body.idx]) return false;
+    if (half_extents.x <= 0.0f || half_extents.y <= 0.0f) return false;
+
+    b2ShapeDef shape_def = b2DefaultShapeDef();
+    shape_def.material.friction    = friction >= 0.0f ? friction : 0.0f;
+    shape_def.material.restitution = restitution >= 0.0f ? restitution : 0.0f;
+    shape_def.isSensor             = sensor;
+    shape_def.enableSensorEvents   = sensor;
+
+    b2Polygon box = b2MakeOffsetBox(half_extents.x, half_extents.y,
+                                    to_b2(center_local), b2MakeRot(0.0f));
+    b2CreatePolygonShape(world->body_ids[body.idx], &shape_def, &box);
+    return true;
+}
+
 void jce_physics2d_body_destroy(JcePhysics2D *world, JceBodyHandle body)
 {
     if (!world || !jce_body_valid(body)) return;

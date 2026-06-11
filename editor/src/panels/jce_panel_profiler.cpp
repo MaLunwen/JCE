@@ -780,6 +780,8 @@ void draw_content(void)
 
         ImGui::Spacing();
         ImGui::SeparatorText(jce_editor_i18n("profiler.section.worldStreaming"));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", jce_editor_i18n("profiler.tooltip.wsBudget"));
         if (ImGui::BeginTable("prof_ws", 2,
                               ImGuiTableFlags_SizingStretchProp |
                               ImGuiTableFlags_RowBg)) {
@@ -787,6 +789,26 @@ void draw_content(void)
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn(); ImGui::TextUnformatted(k);
                 ImGui::TableNextColumn(); ImGui::TextUnformatted(v);
+            };
+            /* Pressure-level row: OK green / SOFT yellow / HARD red. */
+            auto pressure_color = [](JceStreamingPressure p) -> ImVec4 {
+                switch (p) {
+                case JCE_STREAM_PRESSURE_HARD:
+                    return ImVec4(0.95f, 0.35f, 0.30f, 1.0f);
+                case JCE_STREAM_PRESSURE_SOFT:
+                    return ImVec4(0.95f, 0.85f, 0.30f, 1.0f);
+                case JCE_STREAM_PRESSURE_OK:
+                default:
+                    return ImVec4(0.35f, 0.90f, 0.35f, 1.0f);
+                }
+            };
+            auto row_pressure = [&pressure_color](const char *k,
+                                                  JceStreamingPressure p) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(k);
+                ImGui::TableNextColumn();
+                ImGui::TextColored(pressure_color(p), "%s",
+                                   jce_streaming_pressure_name(p));
             };
             char buf[96];
             if (!ws) {
@@ -798,6 +820,9 @@ void draw_content(void)
                 uint32_t total   = jce_world_streamer_chunk_count(ws);
                 uint64_t mem     = jce_world_streamer_memory_used(ws);
                 uint32_t ents    = jce_world_streamer_entity_count(ws);
+                uint32_t evicted = jce_world_streamer_evicted_count(ws);
+                uint32_t refused = jce_world_streamer_refused_loads(ws);
+                JceWorldStreamConfig cfg = jce_world_streamer_get_config(ws);
 
                 snprintf(buf, sizeof(buf), "%u / %u", loaded, total);
                 row(jce_editor_i18n("profiler.row.wsChunksLoaded"), buf);
@@ -808,6 +833,20 @@ void draw_content(void)
                 row(jce_editor_i18n("profiler.row.wsMemory"), buf);
                 snprintf(buf, sizeof(buf), "%u", ents);
                 row(jce_editor_i18n("profiler.row.wsEntities"), buf);
+
+                row_pressure(jce_editor_i18n("profiler.row.wsPressure"),
+                             jce_world_streamer_pressure(ws));
+                row_pressure(jce_editor_i18n("profiler.row.wsPressureHighWater"),
+                             jce_world_streamer_pressure_high_water(ws));
+
+                /* Budget counts raw chunk-file bytes (see section tooltip). */
+                snprintf(buf, sizeof(buf), "%.2f / %u MB",
+                         (double)mem / (1024.0 * 1024.0), cfg.budget_mb);
+                row(jce_editor_i18n("profiler.row.wsBudget"), buf);
+                snprintf(buf, sizeof(buf), "%u", evicted);
+                row(jce_editor_i18n("profiler.row.wsEvicted"), buf);
+                snprintf(buf, sizeof(buf), "%u", refused);
+                row(jce_editor_i18n("profiler.row.wsRefused"), buf);
             }
             ImGui::EndTable();
         }

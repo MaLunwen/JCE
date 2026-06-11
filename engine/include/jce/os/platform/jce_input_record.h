@@ -11,6 +11,13 @@
  *   _pad    : uint64            8 B   (reserved, must be 0)
  *   frames  : JceInputFrame[N]        (N derived from EOF)
  *
+ * Consumers: the engine app loop (jce_engine.c) drives this via the
+ * JCE_INPUT_RECORD=<file.jirc> / JCE_INPUT_REPLAY=<file.jirc> env vars
+ * (DEBUG TOGGLE family, alongside JCE_BACKEND / JCE_CAPTURE_FRAME) —
+ * works in the editor and in shipped games alike.  Record/replay ticks
+ * right before the action-map update each frame; the recorder is
+ * finalized on engine destroy.
+ *
  * Threading: not thread-safe.  Drive from the main loop.
  */
 

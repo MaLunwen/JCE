@@ -487,7 +487,20 @@ def cmd_host_tools(args) -> None:
 
 
 # ── Subcommand: sdk (Track A) ─────────────────────────────────────────────
-def _sdk_one(t: dict, variant: str, config: str, do_clean: bool) -> None:
+def _tool_runs(path: Path) -> bool:
+    """True when the tool binary at `path` EXECUTES on this host (exit code is
+    irrelevant — usage text returns nonzero). Catches wrong-arch / missing-DLL
+    breakage at SDK-producer time instead of consumer time."""
+    try:
+        subprocess.run([str(path), "--help"], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=30)
+        return True
+    except Exception:
+        return False
+
+
+def _sdk_one(t: dict, variant: str, config: str, do_clean: bool,
+             tolerate_missing_tools: bool = False) -> None:
     is_wasm = t.get("emscripten", False)
     kind = "debug" if config == "Debug" else f"{variant}-sdk"   # release-sdk|dist-sdk
     preset  = preset_name(t, kind)
@@ -548,25 +561,24 @@ def _sdk_one(t: dict, variant: str, config: str, do_clean: bool) -> None:
         # named "build-<preset>"; building by dir avoids that name dependency.
         run(["cmake", "--build", str(bdir), "--target",
              "jce_sdk_fat_lib", "jce_msvc_stl_shims", "-j", "8"], env=env, cwd=ROOT)
-    # Host tools to ship with the SDK (tolerant on cross-arch trees).
-    if not DRY_RUN:
-        rc = subprocess.run(["cmake", "--build", str(bdir), "--target",
-                             "jce_cook", "jce_pak", "jce_bin2obj", "-j", "8"],
-                            env=env, cwd=str(ROOT)).returncode
-        if rc != 0:
-            log("WARN: host tools not built (cross-arch?); SDK ships without "
-                "standalone cook/pack — see jce-sdk-host-tools-tension.")
-    else:
+    # Host tools to ship with the SDK. A turnkey SDK (jce_add_pak cooking real
+    # assets without the editor) REQUIRES jce_cook/jce_pak/jce_bin2obj, so a
+    # missing tool is a hard error by default; --tolerate-missing-tools
+    # restores the old WARN behavior and stamps the SDK as degraded.
+    tools_status = "ok"
+    if not (t["cross"] or is_wasm):
+        # Native tree: the three targets exist here — build them or die.
         run(["cmake", "--build", str(bdir), "--target",
              "jce_cook", "jce_pak", "jce_bin2obj", "-j", "8"], env=env, cwd=ROOT)
     run(["cmake", "--install", str(bdir)], env=env, cwd=ROOT)
-    # Cross-arch SDK: tools built in-tree are TARGET-arch and can't run on the
-    # build host. Ship the BUILD-HOST cook/pack tools so consumers still get a
-    # real (non-stub) PAK. (See jce-sdk-host-tools-tension.)
-    if t["cross"]:
-        log("cross SDK: copying build-host cook/pack tools into <sdk>/bin")
+    if t["cross"] or is_wasm:
+        # Cross-arch SDK: tools built in-tree would be TARGET-arch and can't
+        # run on the build host. Ship the BUILD-HOST tools under bin/host/ so
+        # consumers still get a real (non-stub) PAK; JCEConfig probes bin/
+        # then bin/host/. (See jce-sdk-host-tools-tension.)
+        log("cross SDK: copying build-host cook/pack tools into <sdk>/bin/host")
         ht = ensure_host_tools(env, ("jce_pak", "jce_cook", "jce_bin2obj"))
-        bindir = install / "bin"
+        bindir = install / "bin" / "host"
         if not DRY_RUN:
             bindir.mkdir(parents=True, exist_ok=True)
         for name, path in ht.items():
@@ -574,8 +586,23 @@ def _sdk_one(t: dict, variant: str, config: str, do_clean: bool) -> None:
                 log(f"copy host tool {path} -> {bindir}")
             elif Path(path).exists():
                 shutil.copy2(path, bindir / Path(path).name)
-            else:
+            elif tolerate_missing_tools:
+                tools_status = "MISSING (degraded SDK — jce_add_pak packs raw)"
                 log(f"WARN: host tool missing, SDK ships without {name}: {path}")
+            else:
+                die(f"host tool missing: {path} — the SDK would be unable to "
+                    "cook/pack assets. Pass --tolerate-missing-tools to ship "
+                    "a degraded SDK anyway.")
+    # Producer-side run check: every shipped tool must at least execute here.
+    if not DRY_RUN and tools_status == "ok":
+        for sub_dir in ("bin", os.path.join("bin", "host")):
+            tdir = install / sub_dir
+            if not tdir.is_dir():
+                continue
+            for tool in ("jce_cook", "jce_pak", "jce_bin2obj"):
+                cand = tdir / (tool + (".exe" if HOST == "windows" else ""))
+                if cand.exists() and not _tool_runs(cand):
+                    die(f"shipped host tool does not run on this host: {cand}")
     # VERSION.txt — matches package-sdk.bat so consumers can identify the tree.
     if not DRY_RUN:
         _host_tag = "wasm" if is_wasm else f"{SDK_TAG[t['host']]}-{t['arch']}"
@@ -583,7 +610,9 @@ def _sdk_one(t: dict, variant: str, config: str, do_clean: bool) -> None:
             "JCE SDK build\n"
             f"commit:  {git_short_sha()}\n"
             f"host:    {_host_tag}\n"
-            f"variant: {variant}\n",
+            f"variant: {variant}\n"
+            f"tools:   {tools_status}\n"
+            "note:    bin/ tools need the MSVC C++ Redistributable on Windows\n",
             encoding="utf-8")
     log(f"SDK ({variant}/{config}) -> {install}")
 
@@ -594,15 +623,118 @@ def cmd_sdk(args) -> None:
         die(f"target {t['key']} must be built on host '{t['host']}'.")
     variants = {"release": ["release"], "dist": ["dist"],
                 "both": ["release", "dist"]}[args.variant]
+    tolerate = getattr(args, "tolerate_missing_tools", False)
     for v in variants:
-        _sdk_one(t, v, "Release", args.clean)
+        _sdk_one(t, v, "Release", args.clean, tolerate)
     # Debug SDK is release-flavoured only: there is no -dist-debug preset, and
     # `dist` is a royalty-free *ship* build. Build Debug once, for release, and
     # only when a release SDK was requested.  Web ships Release-only (the wasm
     # fat lib is Release; a Debug consumer maps to it via MAP_IMPORTED_CONFIG_DEBUG).
     if not args.no_debug and "release" in variants and not t.get("emscripten"):
-        _sdk_one(t, "release", "Debug", args.clean)
+        _sdk_one(t, "release", "Debug", args.clean, tolerate)
+    # Gate: build + run the plain-C99 smoke consumer against each fresh SDK.
+    if getattr(args, "smoke", False):
+        for v in variants:
+            _smoke_one(t, sdk_install_dir(t, v), v)
     log("sdk: done")
+
+
+# ── Subcommand: smoke (C ABI gate against a built SDK) ────────────────────
+def _smoke_one(t: dict, sdk: Path, variant: str) -> None:
+    """Build tests/sdk_smoke OUT-OF-TREE against the SDK at `sdk`, verify the
+    cook→pack→embed artifacts offline, then (native arch only) run the
+    consumer headless and require its `JCE_SMOKE: OK` marker."""
+    jce_cmake = sdk / "lib" / "cmake" / "JCE"
+    if not DRY_RUN and not (jce_cmake / "JCEConfig.cmake").exists():
+        die(f"smoke: no JCEConfig.cmake under {jce_cmake} — build the SDK first.")
+
+    if not DRY_RUN:
+        # Tripwire: target binaries must never leak into the SDK bin/ again
+        # (the stale win32-aarch64 SDK shipped a caged_kingdom.exe once).
+        bin_dir = sdk / "bin"
+        leaked = list(bin_dir.glob("caged_kingdom*")) if bin_dir.is_dir() else []
+        if leaked:
+            die(f"smoke: sample executable leaked into the SDK: {leaked[0]}")
+        # Producer-side check: every shipped host tool must execute here.
+        ext = ".exe" if HOST == "windows" else ""
+        tool_found = False
+        for sub_dir in ("bin", os.path.join("bin", "host")):
+            for tool in ("jce_cook", "jce_pak", "jce_bin2obj"):
+                cand = sdk / sub_dir / f"{tool}{ext}"
+                if cand.exists():
+                    tool_found = True
+                    if not _tool_runs(cand):
+                        die(f"smoke: shipped tool does not run on this host: {cand}")
+        if not tool_found:
+            die(f"smoke: SDK at {sdk} ships no host tools (degraded SDK) — "
+                "nothing to gate.")
+
+    env = dict(os.environ) if t.get("emscripten") else msvc_env(t)
+    bdir = ROOT / "build" / "desktop" / f"sdk-smoke-{t['key']}-{variant}"
+    cfg = ["cmake", "-S", str(ROOT / "tests" / "sdk_smoke"), "-B", str(bdir),
+           "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
+           f"-DJCE_DIR={jce_cmake}"]
+    if HOST == "windows" and not t.get("emscripten"):
+        cfg += ["-DCMAKE_C_COMPILER=cl", "-DCMAKE_CXX_COMPILER=cl"]
+    run(cfg, env=env, cwd=ROOT)
+    run(["cmake", "--build", str(bdir)], env=env, cwd=ROOT)
+    if DRY_RUN:
+        return
+
+    # Offline artifact gates — these run even for SDKs whose target arch
+    # cannot execute on this host (cross/wasm).
+    cooked = bdir / "JceSdkSmoke_cooked" / "smoke.png"
+    if not cooked.exists():
+        die(f"smoke: cooked asset missing: {cooked}")
+    with open(cooked, "rb") as f:
+        magic = f.read(4)
+    if magic != b"JCEA":
+        die(f"smoke: {cooked} is not a cooked .jceasset (magic={magic!r}) — "
+            "the cook path produced raw bytes.")
+    pak = bdir / "JceSdkSmoke_assets.pak"
+    exe = bdir / ("jce_sdk_smoke.exe" if HOST == "windows" else "jce_sdk_smoke")
+    if not pak.exists():
+        die(f"smoke: pak missing: {pak}")
+    if not exe.exists():
+        die(f"smoke: exe missing: {exe}")
+    if exe.stat().st_size <= pak.stat().st_size:
+        die("smoke: exe is not larger than its pak — embed step suspect "
+            f"(exe={exe.stat().st_size} pak={pak.stat().st_size})")
+
+    if t["cross"] or t.get("emscripten"):
+        log("smoke: link + artifact gates passed (target arch not runnable "
+            "on this host; run gate skipped)")
+        return
+
+    # Run gate: headless boot (noop renderer), one frame, clean exit. The
+    # stdout marker is the primary signal — the engine's own error path
+    # decides the exit code when init fails.
+    renv = dict(env)
+    renv["JCE_BACKEND"] = "noop"
+    if HOST == "linux":
+        renv.setdefault("SDL_VIDEODRIVER", "dummy")
+    log(f"smoke: running {exe.name} (JCE_BACKEND=noop)")
+    try:
+        proc = subprocess.run([str(exe)], env=renv, cwd=str(bdir),
+                              capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        die("smoke: consumer hung (>120 s) — should_quit never fired?")
+    marker_ok = "JCE_SMOKE: OK" in (proc.stdout or "")
+    if not marker_ok or proc.returncode != 0:
+        sys.stderr.write(proc.stdout or "")
+        sys.stderr.write(proc.stderr or "")
+        die(f"smoke: FAILED (exit={proc.returncode}, "
+            f"marker={'yes' if marker_ok else 'MISSING'})")
+    for line in (proc.stdout or "").splitlines():
+        if "JCE_SMOKE:" in line:
+            log(line.strip())
+    log(f"smoke: PASS ({variant} SDK at {sdk})")
+
+
+def cmd_smoke(args) -> None:
+    t = resolve_target(args.arch)
+    sdk = Path(args.sdk).resolve() if args.sdk else sdk_install_dir(t, args.variant)
+    _smoke_one(t, sdk, args.variant)
 
 
 # ── Subcommand: editor (Track A first-party desktop app) ──────────────────
@@ -1141,7 +1273,22 @@ def build_parser() -> argparse.ArgumentParser:
     add_variant(sp, ["release", "dist", "both"], "both")
     sp.add_argument("--no-debug", action="store_true", help="skip the Debug SDK")
     sp.add_argument("--clean", action="store_true")
+    sp.add_argument("--smoke", action="store_true",
+                    help="after install, build + run the C99 smoke consumer "
+                         "against the fresh SDK (tests/sdk_smoke)")
+    sp.add_argument("--tolerate-missing-tools", action="store_true",
+                    help="ship a DEGRADED SDK without cook/pack host tools "
+                         "instead of failing (stamped in VERSION.txt)")
     sp.set_defaults(func=cmd_sdk)
+
+    sp = sub.add_parser("smoke",
+                        help="build + run the C99 SDK smoke consumer against "
+                             "an existing SDK (C ABI regression gate)")
+    add_arch(sp)
+    sp.add_argument("--sdk", help="SDK install dir "
+                                  "(default: dist/sdk/<host-arch tag>)")
+    sp.add_argument("--variant", choices=["release", "dist"], default="release")
+    sp.set_defaults(func=cmd_smoke)
 
     sp = sub.add_parser("app", help="build a project via the SDK (consumer)")
     sp.add_argument("project")

@@ -96,6 +96,56 @@ JCE_API void jce_bt_halt(JceBtContext *ctx, JceBtTreeHandle tree);
 /* Return the number of loaded trees. */
 JCE_API uint32_t jce_bt_tree_count(const JceBtContext *ctx);
 
+/* ================================================================== */
+/* Introspection (read-only visualizer support)                        */
+/* ================================================================== */
+
+typedef enum {
+    JCE_BT_NODE_UNDEFINED = 0,
+    JCE_BT_NODE_ACTION    = 1,
+    JCE_BT_NODE_CONDITION = 2,
+    JCE_BT_NODE_CONTROL   = 3,
+    JCE_BT_NODE_DECORATOR = 4,
+    JCE_BT_NODE_SUBTREE   = 5
+} JceBtNodeType;
+
+/* Superset of JceBtStatus: live node states include IDLE and SKIPPED. */
+typedef enum {
+    JCE_BT_NODE_IDLE    = 0,
+    JCE_BT_NODE_RUNNING = 1,
+    JCE_BT_NODE_SUCCESS = 2,
+    JCE_BT_NODE_FAILURE = 3,
+    JCE_BT_NODE_SKIPPED = 4
+} JceBtNodeStatus;
+
+typedef struct {
+    char            name[64];          /* XML instance name (falls back to registration ID) */
+    char            registration[64];  /* factory ID, e.g. "Sequence", "IsTargetVisible"    */
+    uint16_t        uid;               /* BT::TreeNode::UID(), stable while tree lives      */
+    uint16_t        depth;             /* 0 = root                                          */
+    int32_t         parent;            /* pre-order index of parent, -1 for root            */
+    JceBtNodeType   type;
+    JceBtNodeStatus status;            /* live status (IDLE after parent reset)             */
+    JceBtNodeStatus last_result;       /* last SUCCESS/FAILURE seen by observer (IDLE if observer off) */
+    uint32_t        transitions;       /* observer transition count excl. ->IDLE (0 if observer off)   */
+} JceBtNodeInfo;
+
+/* Pre-order node count of a loaded tree (0 on invalid ctx/handle). */
+JCE_API uint32_t JCE_CALL jce_bt_node_count(const JceBtContext *ctx, JceBtTreeHandle tree);
+
+/* Fill `out` for pre-order node `index`.  False on bad ctx/handle/index. */
+JCE_API bool JCE_CALL jce_bt_node_info(const JceBtContext *ctx, JceBtTreeHandle tree,
+                                       uint32_t index, JceBtNodeInfo *out);
+
+/* Attach/detach a status observer (BT::TreeObserver) recording last_result +
+ * transitions.  Idempotent; enable when a visualizer opens.  False on error. */
+JCE_API bool JCE_CALL jce_bt_set_observed(JceBtContext *ctx, JceBtTreeHandle tree, bool observed);
+
+/* Lenient load: unknown leaf node IDs are auto-registered as inert stub
+ * actions so structure can be inspected without ticking (editor edit-mode).
+ * Off by default; affects subsequent jce_bt_load_tree[_file] calls. */
+JCE_API void JCE_CALL jce_bt_set_lenient_load(JceBtContext *ctx, bool lenient);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_BT_H */

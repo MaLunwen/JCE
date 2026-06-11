@@ -105,6 +105,7 @@ JCE_EXTERN_C_BEGIN
 #define JCE_BUNDLE_KEY_ASSET_PATH    "path"
 #define JCE_BUNDLE_KEY_ASSET_SIZE    "size"
 #define JCE_BUNDLE_KEY_ASSET_HASH    "hash"
+#define JCE_BUNDLE_KEY_ENCRYPTED     "encrypted"    /* bool, payload ChaCha20-enc.   */
 
 /* ================================================================== */
 /* JSON keys (catalog)                                                 */

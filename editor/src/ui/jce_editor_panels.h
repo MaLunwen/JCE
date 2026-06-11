@@ -80,6 +80,10 @@ typedef enum {
     JCE_PANEL_ANIMATION_RIGGING,
     JCE_PANEL_RENDER_PIPELINE,
     JCE_PANEL_PROFILE_ANALYZER,
+    JCE_PANEL_BT_VISUALIZER,
+    /* APPEND ONLY before JCE_PANEL_COUNT — the visibility bitmap is
+     * serialized to disk by ordinal (see jce_editor_panels_init). */
+    JCE_PANEL_WORLD_STREAMING,
     JCE_PANEL_COUNT
 } JceEditorPanel;
 
@@ -123,7 +127,18 @@ void  jce_panel_animation_editor_request_tab(int idx);
 int   jce_panel_animation_editor_current_tab(void);
 void  jce_editor_panel_animator_sm(void);
 void  jce_editor_panel_sequencer(void);
+/* Restore any component values the Sequencer panel's live preview touched
+ * (idempotent / cheap when nothing is previewed).  Called before scene
+ * save/load and when the Sequencer tab loses visibility. */
+void  jce_panel_sequencer_preview_flush(void);
 void  jce_editor_panel_navmesh(void);
+/* World-streaming authoring: scene-level streamer config + chunk table +
+ * live preview toggle (spawns chunk entities into the hierarchy). */
+void  jce_editor_panel_world_streaming(void);
+/* Read-only Behavior Tree visualizer (live Play status / edit-mode
+ * structure preview via a lenient panel-owned JceBtContext). */
+void  jce_editor_panel_bt_visualizer(void);
+void  jce_editor_panel_bt_visualizer_content(void);
 void  jce_editor_panel_terrain(void);
 void  jce_editor_panel_preferences(void);
 void  jce_editor_panel_user_preferences(void);
@@ -160,10 +175,24 @@ void  jce_editor_panel_postfx_content(void);
 void  jce_editor_panel_postfx_tick(void);
 void  jce_editor_panel_audio_mixer_content(void);
 void  jce_editor_panel_input_manager_content(void);
+/* Resolve an Input Manager action's KEY bindings to ImGuiKey codes for
+ * play-in-editor (live panel state — unsaved rebinds included). Returns
+ * the number of keys written; 0 = action missing / no keyboard binds. */
+int   jce_editor_input_action_keys(const char *name, int *out_imgui_keys, int max);
+/* SDL scancode → ImGuiKey (JCE_KEY_* values are SDL scancodes).  The
+ * editor's single canonical translation table, implemented in
+ * jce_editor.cpp; returns the ImGuiKey enum value, or 0 (ImGuiKey_None)
+ * when the scancode is unmapped.  Do not add per-panel copies. */
+int   jce_editor_scancode_to_imgui_key(int scancode);
 void  jce_editor_panel_package_manager_content(void);
 void  jce_editor_panel_frame_debugger_content(void);
 void  jce_editor_panel_sprite_editor_content(void);
 void  jce_editor_panel_tile_palette_content(void);
+/* Open the Tile Palette on a specific map (+ optional sprites atlas):
+   sets the panel's paths, loads the map, and makes the panel visible.
+   Called by the Tilemap inspector's "Edit in Tile Palette" button. */
+void  jce_editor_panel_tile_palette_edit(const char *tilemap_path,
+                                         const char *sprites_path);
 void  jce_editor_panel_vfx_graph_content(void);
 void  jce_editor_panel_test_runner_content(void);
 void  jce_editor_panel_build_profiles_content(void);

@@ -126,6 +126,12 @@ JCE_API JcePakArchive *jce_pak_open_owned(void *data, size_t size);
 JCE_API void jce_pak_overlay_push(JcePakArchive *base, JcePakArchive *layer);
 JCE_API void jce_pak_overlay_remove(JcePakArchive *base, JcePakArchive *layer);
 
+/* Thin forwarder to jce_archive_set_decryption_key() for the wrapped v1
+ * archive: provide the 32-byte ChaCha20 key needed to decompress entries
+ * flagged ENCRYPTED.  Archives opened after jce_archive_set_process_key()
+ * inherit the process key automatically and don't need this. */
+JCE_API void jce_pak_set_decryption_key(JcePakArchive *pak, const uint8_t key[32]);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_PAK_LOADER_H */

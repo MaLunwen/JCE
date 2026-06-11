@@ -21,6 +21,7 @@ static const JceEditorComponentDescriptor kDescriptors[] = {
     { JCE_COMP_FLAG_SPRITE_RENDERER,      JCE_COMP_FLAG_SPRITE_RENDERER,      "Sprite Renderer",       "comp.spriteRenderer",       true,  true,  true  },
     { JCE_COMP_FLAG_ANIMATOR,             JCE_COMP_FLAG_ANIMATOR,             "Animator",              "comp.animator",             true,  true,  false },
     { JCE_COMP_FLAG_SKELETAL_ANIMATOR,    JCE_COMP_FLAG_SKELETAL_ANIMATOR,    "Skeletal Animator",     "comp.skeletalAnimator",     true,  true,  true  },
+    { JCE_EDITOR_COMP_SLOT_IK_CONSTRAINTS, 0,                                 "IK Constraints",        "comp.ikConstraints",        true,  true,  false },
     { JCE_COMP_FLAG_RIGIDBODY,            JCE_COMP_FLAG_RIGIDBODY,            "Rigidbody",             "comp.rigidbody",            true,  true,  true  },
     { JCE_COMP_FLAG_BOX_COLLIDER,         JCE_COMP_FLAG_BOX_COLLIDER,         "Box Collider",          "comp.boxCollider",          true,  true,  true  },
     { JCE_COMP_FLAG_SPHERE_COLLIDER,      JCE_COMP_FLAG_SPHERE_COLLIDER,      "Sphere Collider",       "comp.sphereCollider",       true,  true,  true  },
@@ -66,15 +67,19 @@ static const JceEditorComponentDescriptor kDescriptors[] = {
     { JCE_COMP_FLAG_UI_TEXT,              JCE_COMP_FLAG_UI_TEXT,              "UI Text",               "comp.uiText",               true,  true,  false },
     { JCE_COMP_FLAG_UI_BUTTON,            JCE_COMP_FLAG_UI_BUTTON,            "UI Button",             "comp.uiButton",             true,  true,  false },
     { JCE_COMP_FLAG_CLOTH,                JCE_COMP_FLAG_CLOTH,                "Cloth",                 "comp.cloth",                true,  true,  false },
+    { JCE_COMP_FLAG_NETWORK_OBJECT,       JCE_COMP_FLAG_NETWORK_OBJECT,       "Network Object",        "comp.networkObject",        true,  true,  false },
     { JCE_COMP_FLAG_NET_TRANSFORM,        JCE_COMP_FLAG_NET_TRANSFORM,        "Network Transform",     "comp.netTransform",         true,  true,  false },
     { JCE_COMP_FLAG_NET_ANIMATOR,         JCE_COMP_FLAG_NET_ANIMATOR,         "Network Animator",      "comp.netAnimator",          true,  true,  false },
     { JCE_COMP_FLAG_NET_RIGIDBODY,        JCE_COMP_FLAG_NET_RIGIDBODY,        "Network Rigidbody",     "comp.netRigidbody",         true,  true,  false },
-    { JCE_COMP_FLAG_VFX_GRAPH,            JCE_COMP_FLAG_VFX_GRAPH,            "VFX Graph",             "comp.vfxGraph",             true,  true,  false },
+    /* JCE_COMP_FLAG_VFX_GRAPH retired (v0.9.9): scene loads migrate it onto
+     * Particle Emitter; the VFX Graph panel now exports .particles.json. */
     { JCE_COMP_FLAG_TILEMAP,              JCE_COMP_FLAG_TILEMAP,              "Tilemap",               "comp.tilemap",              true,  true,  false },
     { JCE_COMP_FLAG_TILEMAP_COLLIDER_2D,  JCE_COMP_FLAG_TILEMAP_COLLIDER_2D,  "Tilemap Collider 2D",   "comp.tilemapCollider2d",    true,  true,  false },
     { JCE_COMP_FLAG_AVATAR,               JCE_COMP_FLAG_AVATAR,               "Avatar",                "comp.avatar",               true,  true,  false },
     { JCE_COMP_FLAG_VOLUME,               JCE_COMP_FLAG_VOLUME,               "Volume",                "comp.volume",               true,  true,  false },
     { JCE_COMP_FLAG_OCCLUSION_PORTAL,     JCE_COMP_FLAG_OCCLUSION_PORTAL,     "Occlusion Portal",      "comp.occlusionPortal",      true,  true,  false },
+    { JCE_EDITOR_COMP_SLOT_NAV_AGENT,     0,                                  "Nav Agent",             "comp.navAgent",             true,  true,  false },
+    { JCE_EDITOR_COMP_SLOT_SEQUENCE_PLAYER, 0,                                "Sequence Player",       "comp.sequencePlayer",       true,  true,  false },
 };
 
 static const JceEditorComponentSlot kDefaultOrder[] = {
@@ -85,6 +90,7 @@ static const JceEditorComponentSlot kDefaultOrder[] = {
     JCE_COMP_FLAG_SPRITE_RENDERER,
     JCE_COMP_FLAG_ANIMATOR,
     JCE_COMP_FLAG_SKELETAL_ANIMATOR,
+    JCE_EDITOR_COMP_SLOT_IK_CONSTRAINTS,
     JCE_COMP_FLAG_RIGIDBODY,
     JCE_COMP_FLAG_BOX_COLLIDER,
     JCE_COMP_FLAG_SPHERE_COLLIDER,
@@ -129,15 +135,17 @@ static const JceEditorComponentSlot kDefaultOrder[] = {
     JCE_COMP_FLAG_UI_TEXT,
     JCE_COMP_FLAG_UI_BUTTON,
     JCE_COMP_FLAG_CLOTH,
+    JCE_COMP_FLAG_NETWORK_OBJECT,
     JCE_COMP_FLAG_NET_TRANSFORM,
     JCE_COMP_FLAG_NET_ANIMATOR,
     JCE_COMP_FLAG_NET_RIGIDBODY,
-    JCE_COMP_FLAG_VFX_GRAPH,
     JCE_COMP_FLAG_TILEMAP,
     JCE_COMP_FLAG_TILEMAP_COLLIDER_2D,
     JCE_COMP_FLAG_AVATAR,
     JCE_COMP_FLAG_VOLUME,
     JCE_COMP_FLAG_OCCLUSION_PORTAL,
+    JCE_EDITOR_COMP_SLOT_NAV_AGENT,
+    JCE_EDITOR_COMP_SLOT_SEQUENCE_PLAYER,
 };
 /* clang-format on */
 
@@ -213,6 +221,24 @@ bool jce_editor_component_slot_is_video_player(
     return slot == JCE_EDITOR_COMP_SLOT_VIDEO_PLAYER;
 }
 
+bool jce_editor_component_slot_is_nav_agent(
+    JceEditorComponentSlot slot)
+{
+    return slot == JCE_EDITOR_COMP_SLOT_NAV_AGENT;
+}
+
+bool jce_editor_component_slot_is_ik_constraints(
+    JceEditorComponentSlot slot)
+{
+    return slot == JCE_EDITOR_COMP_SLOT_IK_CONSTRAINTS;
+}
+
+bool jce_editor_component_slot_is_sequence_player(
+    JceEditorComponentSlot slot)
+{
+    return slot == JCE_EDITOR_COMP_SLOT_SEQUENCE_PLAYER;
+}
+
 const char *jce_editor_component_display_name(JceEditorComponentSlot slot)
 {
     const JceEditorComponentDescriptor *d = jce_editor_component_find(slot);
@@ -236,6 +262,12 @@ bool jce_editor_component_slot_present(JceScene *scene,
         return scene && jce_scene_has_compound_collider(scene, entity);
     if (jce_editor_component_slot_is_video_player(slot))
         return scene && jce_scene_has_video_player(scene, entity);
+    if (jce_editor_component_slot_is_nav_agent(slot))
+        return scene && jce_scene_has_nav_agent(scene, entity);
+    if (jce_editor_component_slot_is_ik_constraints(slot))
+        return scene && jce_scene_has_ik_constraints(scene, entity);
+    if (jce_editor_component_slot_is_sequence_player(slot))
+        return scene && jce_scene_has_sequence_player(scene, entity);
     const JceEditorComponentDescriptor *d = jce_editor_component_find(slot);
     return d && d->legacy_flag != 0 && (legacy_flags & d->legacy_flag) != 0;
 }

@@ -46,13 +46,8 @@ void jce_scene_serial_set_base_dir(const char *dir)
     }
 }
 
-static bool sse_path_is_absolute(const char *p)
-{
-    if (!p || !*p) return false;
-    if (p[0] == '/' || p[0] == '\\') return true;
-    if (p[1] == ':' && (p[2] == '/' || p[2] == '\\')) return true; /* C:\ */
-    return false;
-}
+/* Absolute-path test: use the public jce_path_is_absolute() (jce_path.h is
+ * already included) — the previous local sse_ copy duplicated it. */
 
 static bool sse_file_exists(const char *p)
 {
@@ -287,7 +282,7 @@ static void resolve_tex_relative_to_material(const char *mat_path,
                                               size_t tex_path_sz)
 {
     if (!mat_path || !*mat_path || !tex_path || !*tex_path) return;
-    if (sse_path_is_absolute(tex_path) && sse_file_exists(tex_path)) return;
+    if (jce_path_is_absolute(tex_path) && sse_file_exists(tex_path)) return;
 
     char mat_dir[1024];
     snprintf(mat_dir, sizeof(mat_dir), "%s", mat_path);
@@ -541,11 +536,106 @@ static cJSON *ser_scene_rendering_settings(
     return root;
 }
 
+/* ── Scene-level world-streaming settings ("streaming" block) ──────── */
+
+static cJSON *ser_scene_streaming_settings(
+    const JceSceneStreamingSettings *st)
+{
+    if (!st) return NULL;
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return NULL;
+
+    cJSON_AddNumberToObject(root, "version", (double)st->version);
+    cJSON_AddBoolToObject(root, "enabled", st->enabled);
+    cJSON_AddNumberToObject(root, "mode", st->mode);
+    cJSON_AddNumberToObject(root, "loadRadius", st->load_radius);
+    cJSON_AddNumberToObject(root, "unloadRadius", st->unload_radius);
+    cJSON_AddNumberToObject(root, "maxPending", (double)st->max_pending);
+    cJSON_AddNumberToObject(root, "budgetMb", (double)st->budget_mb);
+    cJSON_AddNumberToObject(root, "frameBudgetMs", st->frame_budget_ms);
+
+    cJSON *chunks = cJSON_CreateArray();
+    if (chunks) {
+        uint32_t n = st->chunk_count;
+        if (n > JCE_SCENE_MAX_STREAM_CHUNKS)
+            n = JCE_SCENE_MAX_STREAM_CHUNKS;
+        for (uint32_t i = 0; i < n; i++) {
+            const JceSceneStreamChunk *c = &st->chunks[i];
+            cJSON *co = cJSON_CreateObject();
+            if (!co) continue;
+            cJSON_AddNumberToObject(co, "id", (double)c->id);
+            cJSON_AddItemToObject(co, "center", json_float3(c->center));
+            cJSON_AddNumberToObject(co, "radius", c->radius);
+            cJSON_AddStringToObject(co, "path", c->path);
+            cJSON_AddItemToArray(chunks, co);
+        }
+        cJSON_AddItemToObject(root, "chunks", chunks);
+    }
+    return root;
+}
+
 static const cJSON *scene_root_object(const cJSON *root)
 {
     if (!root || !cJSON_IsObject(root)) return NULL;
     const cJSON *scene_obj = cJSON_GetObjectItemCaseSensitive(root, "scene");
     return cJSON_IsObject(scene_obj) ? scene_obj : root;
+}
+
+static bool parse_scene_streaming_settings(JceScene *scene,
+                                           const cJSON *root)
+{
+    const cJSON *scene_obj = scene_root_object(root);
+    if (!scene_obj) return false;
+
+    const cJSON *src = cJSON_GetObjectItemCaseSensitive(scene_obj, "streaming");
+    if (!cJSON_IsObject(src))
+        return false;
+
+    /* ~70 KB with the full chunk table — keep it off the stack. */
+    JceSceneStreamingSettings *st = (JceSceneStreamingSettings *)
+        JCE_MALLOC(sizeof(*st));
+    if (!st) return false;
+    *st = jce_scene_streaming_settings_default();
+
+    st->version         = (uint32_t)j_num(src, "version", 1.0);
+    st->enabled         = j_bool(src, "enabled", st->enabled);
+    st->mode            = (int)j_num(src, "mode", st->mode);
+    st->load_radius     = (float)j_num(src, "loadRadius", st->load_radius);
+    st->unload_radius   = (float)j_num(src, "unloadRadius", st->unload_radius);
+    st->max_pending     = (uint32_t)j_num(src, "maxPending", st->max_pending);
+    st->budget_mb       = (uint32_t)j_num(src, "budgetMb", st->budget_mb);
+    st->frame_budget_ms =
+        (float)j_num(src, "frameBudgetMs", st->frame_budget_ms);
+
+    const cJSON *chunks = cJSON_GetObjectItemCaseSensitive(src, "chunks");
+    if (cJSON_IsArray(chunks)) {
+        int total = cJSON_GetArraySize(chunks);
+        if (total > JCE_SCENE_MAX_STREAM_CHUNKS) {
+            LOG_WARN(LOG_TAG,
+                     "scene streaming: %d chunks exceed the %d-chunk limit — "
+                     "extra entries dropped",
+                     total, JCE_SCENE_MAX_STREAM_CHUNKS);
+            total = JCE_SCENE_MAX_STREAM_CHUNKS;
+        }
+        uint32_t n = 0;
+        for (int i = 0; i < total; i++) {
+            const cJSON *co = cJSON_GetArrayItem(chunks, i);
+            if (!cJSON_IsObject(co)) continue;
+            JceSceneStreamChunk *c = &st->chunks[n];
+            memset(c, 0, sizeof(*c));
+            c->id     = (uint32_t)j_num(co, "id", 0.0);
+            j_float3(co, "center", c->center, c->center);
+            c->radius = (float)j_num(co, "radius", 0.0);
+            copy_str(c->path, sizeof(c->path), j_str(co, "path", ""));
+            n++;
+        }
+        st->chunk_count = n;
+    }
+
+    jce_scene_set_streaming_settings(scene, st);   /* copies + sanitizes */
+    JCE_FREE(st);
+    return true;
 }
 
 static bool parse_scene_rendering_settings(JceScene *scene,
@@ -784,7 +874,7 @@ static void parse_mesh_renderer(JceScene *s, JceEntity e, const cJSON *c)
         const char *try_paths[3] = { NULL, NULL, NULL };
         int n_try = 0;
 
-        if (sse_path_is_absolute(mr.material_path)) {
+        if (jce_path_is_absolute(mr.material_path)) {
             try_paths[n_try++] = mr.material_path;
         } else {
             if (s_scene_base_dir[0]) {
@@ -802,7 +892,7 @@ static void parse_mesh_renderer(JceScene *s, JceEntity e, const cJSON *c)
         /* Walk parent directories of the scene file to find the asset
          * root (Unity layout: scenes/ and Materials/ are siblings). */
         char parent_try[1280] = { 0 };
-        if (!resolved && s_scene_base_dir[0] && !sse_path_is_absolute(mr.material_path)) {
+        if (!resolved && s_scene_base_dir[0] && !jce_path_is_absolute(mr.material_path)) {
             char base[1024];
             snprintf(base, sizeof(base), "%s", s_scene_base_dir);
             for (int up = 0; up < 4 && !resolved; up++) {
@@ -1210,6 +1300,7 @@ static void parse_particle_emitter(JceScene *s, JceEntity e, const cJSON *c)
     pe.emit_rate     = (float)j_num(c, "emitRate", 10.0);
     pe.lifetime_min  = (float)j_num(c, "lifetimeMin", 1.0);
     pe.lifetime_max  = (float)j_num(c, "lifetimeMax", 2.0);
+    pe.gpu           = j_bool(c, "gpu", false);
     /* Runtime fields are NOT serialized; memset above already zeroed them.
      * emitter_handle_idx must read as "none" so the first tick rebuilds. */
     pe.emitter_handle_idx = UINT32_MAX;
@@ -1265,6 +1356,12 @@ static void parse_character_controller(JceScene *s, JceEntity e, const cJSON *c)
     cc.radius      = (float)j_num(c, "radius", 0.5);
     cc.step_offset = (float)j_num(c, "stepOffset", 0.3);
     cc.slope_limit = (float)j_num(c, "slopeLimit", 45.0);
+    cc.move_speed     = (float)j_num(c, "moveSpeed", 4.0);
+    cc.sprint_mult    = (float)j_num(c, "sprintMult", 1.8);
+    cc.jump_speed     = (float)j_num(c, "jumpSpeed", 5.0);
+    cc.accel          = (float)j_num(c, "accel", 40.0);
+    cc.air_control    = (float)j_num(c, "airControl", 0.35);
+    cc.turn_speed_deg = (float)j_num(c, "turnSpeed", 720.0);
     jce_scene_set_character_controller(s, e, &cc);
 }
 
@@ -1740,6 +1837,74 @@ static void parse_constant_force(JceScene *s, JceEntity e, const cJSON *c)
     jce_scene_set_constant_force(s, e, &f);
 }
 
+static void parse_nav_agent(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceNavAgentComponent n; memset(&n, 0, sizeof n);
+    n.radius          = (float)j_num(c, "radius", 0.5);
+    n.height          = (float)j_num(c, "height", 2.0);
+    n.max_speed       = (float)j_num(c, "maxSpeed", 3.5);
+    n.max_accel       = (float)j_num(c, "maxAccel", 8.0);
+    n.arrive_radius   = (float)j_num(c, "arriveRadius", 1.5);
+    n.waypoint_radius = (float)j_num(c, "waypointRadius", 0.5);
+    n.target[0] = (float)j_num(c, "targetX", 0.0);
+    n.target[1] = (float)j_num(c, "targetY", 0.0);
+    n.target[2] = (float)j_num(c, "targetZ", 0.0);
+    n.target_entity = (uint64_t)j_num(c, "targetEntity", 0.0);
+    n.auto_repath = j_bool(c, "autoRepath", true);
+    n.enabled     = j_bool(c, "enabled", true);
+    jce_scene_set_nav_agent(s, e, &n);
+}
+
+static void parse_sequence_player(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceSequencePlayerComponent sp; memset(&sp, 0, sizeof sp);
+    copy_str(sp.seq_path, sizeof(sp.seq_path), j_str(c, "seqPath", ""));
+    sp.play_on_awake = j_bool(c, "playOnAwake", false);
+    sp.loop_override = j_bool(c, "loopOverride", false);
+    sp.override_loop = j_bool(c, "overrideLoop", false);
+    sp.speed         = (float)j_num(c, "speed", 1.0);
+    const cJSON *arr = cJSON_GetObjectItemCaseSensitive(c, "bindings");
+    if (cJSON_IsArray(arr)) {
+        int n = cJSON_GetArraySize(arr);
+        if (n > JCE_SEQ_PLAYER_MAX_BINDINGS) n = JCE_SEQ_PLAYER_MAX_BINDINGS;
+        for (int i = 0; i < n; i++) {
+            const cJSON *it = cJSON_GetArrayItem(arr, i);
+            sp.bindings[sp.binding_count++] =
+                cJSON_IsNumber(it) ? (uint64_t)it->valuedouble : 0;
+        }
+    }
+    /* Runtime fields (seq/prev_time/started/opened_hash) stay zeroed. */
+    jce_scene_set_sequence_player(s, e, &sp);
+}
+
+static void parse_ik_constraints(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JceIkConstraintComponent ik; memset(&ik, 0, sizeof ik);
+    const cJSON *arr = cJSON_GetObjectItemCaseSensitive(c, "constraints");
+    if (cJSON_IsArray(arr)) {
+        int n = cJSON_GetArraySize(arr);
+        int cap = (int)(sizeof(ik.constraints) / sizeof(ik.constraints[0]));
+        for (int i = 0; i < n && ik.count < cap; i++) {
+            const cJSON *o = cJSON_GetArrayItem(arr, i);
+            if (!cJSON_IsObject(o)) continue;
+            JceIkConstraint *k = &ik.constraints[ik.count++];
+            k->kind    = (int)j_num(o, "kind", 0.0);
+            copy_str(k->name, sizeof(k->name), j_str(o, "name", ""));
+            k->weight  = (float)j_num(o, "weight", 1.0);
+            k->enabled = j_bool(o, "enabled", true);
+            copy_str(k->root_bone, sizeof(k->root_bone), j_str(o, "rootBone", ""));
+            copy_str(k->mid_bone,  sizeof(k->mid_bone),  j_str(o, "midBone", ""));
+            copy_str(k->end_bone,  sizeof(k->end_bone),  j_str(o, "endBone", ""));
+            k->target_entity  = (uint32_t)j_num(o, "targetEntity", 0.0);
+            k->pole_entity    = (uint32_t)j_num(o, "poleEntity", 0.0);
+            k->pole_offset[0] = (float)j_num(o, "poleOffsetX", 0.0);
+            k->pole_offset[1] = (float)j_num(o, "poleOffsetY", 0.0);
+            k->pole_offset[2] = (float)j_num(o, "poleOffsetZ", 0.0);
+        }
+    }
+    jce_scene_set_ik_constraints(s, e, &ik);
+}
+
 static void parse_configurable_joint(JceScene *s, JceEntity e, const cJSON *c)
 {
     JceConfigurableJointComponent j; memset(&j, 0, sizeof j);
@@ -2192,6 +2357,18 @@ static void parse_one_component(JceScene *s, JceEntity e, const cJSON *comp)
     if (strcmp(type, "ConstantForce") == 0 || strcmp(type, "constantForce") == 0) {
         parse_constant_force(s, e, props); return;
     }
+    /* Nav Agent. */
+    if (strcmp(type, "NavAgent") == 0 || strcmp(type, "navAgent") == 0) {
+        parse_nav_agent(s, e, props); return;
+    }
+    /* Animation-rigging IK constraints. */
+    if (strcmp(type, "IkConstraints") == 0 || strcmp(type, "ikConstraints") == 0) {
+        parse_ik_constraints(s, e, props); return;
+    }
+    /* Sequence Player. */
+    if (strcmp(type, "SequencePlayer") == 0 || strcmp(type, "sequencePlayer") == 0) {
+        parse_sequence_player(s, e, props); return;
+    }
     /* Configurable Joint. */
     if (strcmp(type, "ConfigurableJoint") == 0 || strcmp(type, "configurableJoint") == 0) {
         parse_configurable_joint(s, e, props); return;
@@ -2270,13 +2447,26 @@ static void parse_one_component(JceScene *s, JceEntity e, const cJSON *comp)
         return;
     }
     if (strcmp(type, "VfxGraph") == 0 || strcmp(type, "vfxGraph") == 0) {
-        JceVfxGraphComponent vc; memset(&vc, 0, sizeof vc);
-        copy_str(vc.graph_path, sizeof vc.graph_path, j_str(props, "graphPath", ""));
-        vc.play_on_awake   = j_bool(props, "playOnAwake", true);
-        vc.loop            = j_bool(props, "loop", true);
-        vc.rate_multiplier = (float)j_num(props, "rateMultiplier", 1.0);
-        vc.intensity       = (float)j_num(props, "intensity", 1.0);
-        jce_scene_set_vfx_graph(s, e, &vc);
+        /* One-way legacy migration (consolidation v0.9.9). The orphaned VFX
+         * Graph runtime was removed — its `*.vfx.json` key set always parsed
+         * identically to `*.particles.json`, so the authored graphPath maps
+         * straight onto a ParticleEmitterComponent asset path and the entity
+         * joins the standard particle pipeline. Legacy-only knobs
+         * (playOnAwake / loop / rateMultiplier / intensity) have no
+         * counterpart and are dropped. An explicitly authored ParticleEmitter
+         * on the same entity always wins; the component is never re-saved as
+         * VfxGraph. */
+        const char *gp = j_str(props, "graphPath", "");
+        if (gp[0] && !jce_scene_has_particle_emitter(s, e)) {
+            JceParticleEmitterComponent pe;
+            memset(&pe, 0, sizeof pe);
+            copy_str(pe.asset_path, sizeof pe.asset_path, gp);
+            pe.emit_rate          = 10.0f;   /* legacy quick-tune fallbacks */
+            pe.lifetime_min       = 1.0f;
+            pe.lifetime_max       = 2.0f;
+            pe.emitter_handle_idx = UINT32_MAX;
+            jce_scene_set_particle_emitter(s, e, &pe);
+        }
         return;
     }
     if (strcmp(type, "Tilemap") == 0 || strcmp(type, "tilemap") == 0) {
@@ -2589,6 +2779,7 @@ static void ser_particle_emitter(const JceParticleEmitterComponent *c, cJSON *ar
     cJSON_AddNumberToObject(o, "emitRate", c->emit_rate);
     cJSON_AddNumberToObject(o, "lifetimeMin", c->lifetime_min);
     cJSON_AddNumberToObject(o, "lifetimeMax", c->lifetime_max);
+    cJSON_AddBoolToObject(o, "gpu", c->gpu);
     cJSON_AddItemToArray(arr, o);
 }
 
@@ -2639,6 +2830,12 @@ static void ser_character_controller(const JceCharacterControllerComponent *c, c
     cJSON_AddNumberToObject(o, "radius", c->radius);
     cJSON_AddNumberToObject(o, "stepOffset", c->step_offset);
     cJSON_AddNumberToObject(o, "slopeLimit", c->slope_limit);
+    cJSON_AddNumberToObject(o, "moveSpeed", c->move_speed);
+    cJSON_AddNumberToObject(o, "sprintMult", c->sprint_mult);
+    cJSON_AddNumberToObject(o, "jumpSpeed", c->jump_speed);
+    cJSON_AddNumberToObject(o, "accel", c->accel);
+    cJSON_AddNumberToObject(o, "airControl", c->air_control);
+    cJSON_AddNumberToObject(o, "turnSpeed", c->turn_speed_deg);
     cJSON_AddItemToArray(arr, o);
 }
 
@@ -2794,6 +2991,8 @@ static void ser_mesh_collider(const JceMeshColliderComponent *c, cJSON *arr)
     cJSON_AddStringToObject(o, "meshPath", c->mesh_path);
     cJSON_AddBoolToObject  (o, "convex",    c->convex);
     cJSON_AddBoolToObject  (o, "isTrigger", c->is_trigger);
+    cJSON_AddNumberToObject(o, "friction",    c->friction);
+    cJSON_AddNumberToObject(o, "restitution", c->restitution);
     cJSON_AddItemToArray(arr, o);
 }
 
@@ -3114,6 +3313,73 @@ static void ser_constant_force(const JceConstantForceComponent *f, cJSON *arr)
     cJSON_AddNumberToObject(o, "relTorqueY", f->relative_torque[1]);
     cJSON_AddNumberToObject(o, "relTorqueZ", f->relative_torque[2]);
     cJSON_AddBoolToObject  (o, "enabled", f->enabled);
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_nav_agent(const JceNavAgentComponent *n, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "NavAgent");
+    cJSON_AddNumberToObject(o, "radius",         n->radius);
+    cJSON_AddNumberToObject(o, "height",         n->height);
+    cJSON_AddNumberToObject(o, "maxSpeed",       n->max_speed);
+    cJSON_AddNumberToObject(o, "maxAccel",       n->max_accel);
+    cJSON_AddNumberToObject(o, "arriveRadius",   n->arrive_radius);
+    cJSON_AddNumberToObject(o, "waypointRadius", n->waypoint_radius);
+    cJSON_AddNumberToObject(o, "targetX", n->target[0]);
+    cJSON_AddNumberToObject(o, "targetY", n->target[1]);
+    cJSON_AddNumberToObject(o, "targetZ", n->target[2]);
+    cJSON_AddNumberToObject(o, "targetEntity", (double)n->target_entity);
+    cJSON_AddBoolToObject  (o, "autoRepath", n->auto_repath);
+    cJSON_AddBoolToObject  (o, "enabled",    n->enabled);
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_sequence_player(const JceSequencePlayerComponent *sp, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "SequencePlayer");
+    cJSON_AddStringToObject(o, "seqPath", sp->seq_path);
+    cJSON_AddBoolToObject  (o, "playOnAwake",  sp->play_on_awake);
+    cJSON_AddBoolToObject  (o, "loopOverride", sp->loop_override);
+    cJSON_AddBoolToObject  (o, "overrideLoop", sp->override_loop);
+    cJSON_AddNumberToObject(o, "speed", sp->speed);
+    cJSON *list = cJSON_AddArrayToObject(o, "bindings");
+    int n = sp->binding_count;
+    if (n < 0) n = 0;
+    if (n > JCE_SEQ_PLAYER_MAX_BINDINGS) n = JCE_SEQ_PLAYER_MAX_BINDINGS;
+    for (int i = 0; i < n; i++)
+        cJSON_AddItemToArray(list, cJSON_CreateNumber((double)sp->bindings[i]));
+    /* Runtime fields (seq/prev_time/started/opened_hash) are NOT persisted. */
+    cJSON_AddItemToArray(arr, o);
+}
+
+static void ser_ik_constraints(const JceIkConstraintComponent *ik, cJSON *arr)
+{
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "type", "IkConstraints");
+    cJSON *list = cJSON_AddArrayToObject(o, "constraints");
+    int cap = (int)(sizeof(ik->constraints) / sizeof(ik->constraints[0]));
+    int n = ik->count;
+    if (n < 0)   n = 0;
+    if (n > cap) n = cap;
+    for (int i = 0; i < n; i++) {
+        const JceIkConstraint *k = &ik->constraints[i];
+        cJSON *co = cJSON_CreateObject();
+        cJSON_AddNumberToObject(co, "kind",   k->kind);
+        cJSON_AddStringToObject(co, "name",   k->name);
+        cJSON_AddNumberToObject(co, "weight", k->weight);
+        cJSON_AddBoolToObject  (co, "enabled", k->enabled);
+        cJSON_AddStringToObject(co, "rootBone", k->root_bone);
+        cJSON_AddStringToObject(co, "midBone",  k->mid_bone);
+        cJSON_AddStringToObject(co, "endBone",  k->end_bone);
+        cJSON_AddNumberToObject(co, "targetEntity", (double)k->target_entity);
+        cJSON_AddNumberToObject(co, "poleEntity",   (double)k->pole_entity);
+        cJSON_AddNumberToObject(co, "poleOffsetX",  k->pole_offset[0]);
+        cJSON_AddNumberToObject(co, "poleOffsetY",  k->pole_offset[1]);
+        cJSON_AddNumberToObject(co, "poleOffsetZ",  k->pole_offset[2]);
+        cJSON_AddItemToArray(list, co);
+    }
     cJSON_AddItemToArray(arr, o);
 }
 
@@ -3537,6 +3803,21 @@ static void ser_entity_components(JceScene *s, JceEntity e, cJSON *comps)
         JceVideoPlayerComponent *c = jce_scene_get_video_player(s, e);
         if (c) ser_video_player(c, comps);
     }
+    /* NavAgent likewise has no flag bit; gate on presence. */
+    if (jce_scene_has_nav_agent(s, e)) {
+        JceNavAgentComponent *c = jce_scene_get_nav_agent(s, e);
+        if (c) ser_nav_agent(c, comps);
+    }
+    /* IkConstraints likewise has no flag bit; gate on presence. */
+    if (jce_scene_has_ik_constraints(s, e)) {
+        JceIkConstraintComponent *c = jce_scene_get_ik_constraints(s, e);
+        if (c) ser_ik_constraints(c, comps);
+    }
+    /* SequencePlayer likewise has no flag bit; gate on presence. */
+    if (jce_scene_has_sequence_player(s, e)) {
+        JceSequencePlayerComponent *c = jce_scene_get_sequence_player(s, e);
+        if (c) ser_sequence_player(c, comps);
+    }
     if (f & JCE_COMP_FLAG_SCRIPT) {
         JceScriptComponent *c = jce_scene_get_script(s, e);
         if (c) ser_script(c, comps);
@@ -3722,21 +4003,9 @@ static void ser_entity_components(JceScene *s, JceEntity e, cJSON *comps)
             cJSON_AddItemToArray(comps, o);
         }
     }
-    if (f & JCE_COMP_FLAG_VFX_GRAPH) {
-        JceVfxGraphComponent *c = jce_scene_get_vfx_graph(s, e);
-        if (c) {
-            cJSON *o = cJSON_CreateObject();
-            cJSON_AddStringToObject(o, "type", "VfxGraph");
-            cJSON *p = cJSON_CreateObject();
-            cJSON_AddStringToObject(p, "graphPath",      c->graph_path);
-            cJSON_AddBoolToObject  (p, "playOnAwake",    c->play_on_awake);
-            cJSON_AddBoolToObject  (p, "loop",           c->loop);
-            cJSON_AddNumberToObject(p, "rateMultiplier", c->rate_multiplier);
-            cJSON_AddNumberToObject(p, "intensity",      c->intensity);
-            cJSON_AddItemToObject(o, "properties", p);
-            cJSON_AddItemToArray(comps, o);
-        }
-    }
+    /* VfxGraph is intentionally NOT saved: the component was retired in the
+     * v0.9.9 consolidation (the loader migrates legacy instances onto
+     * ParticleEmitter, so the flag can never be set by a load). */
     if (f & JCE_COMP_FLAG_TILEMAP) {
         JceTilemapComponent *c = jce_scene_get_tilemap(s, e);
         if (c) {
@@ -3871,6 +4140,16 @@ cJSON *jce_scene_save_json(const JceScene *scene)
                 cJSON_AddItemToObject(sobj, "rendering", r);
         }
 
+        /* World-streaming settings — sibling of the "rendering" block;
+         * only present when the scene actually authored them. */
+        const JceSceneStreamingSettings *streaming =
+            jce_scene_get_streaming_settings(scene);
+        if (streaming) {
+            cJSON *st = ser_scene_streaming_settings(streaming);
+            if (st)
+                cJSON_AddItemToObject(sobj, "streaming", st);
+        }
+
         SerCtx ctx;
         ctx.entities = entities;
         ctx.scene = (JceScene *)scene;
@@ -3977,6 +4256,12 @@ int jce_scene_load_json(JceScene *scene, const cJSON *root)
     if (!parse_scene_rendering_settings(scene, root) &&
         existing_entities == 0)
         jce_scene_clear_rendering_settings(scene);
+
+    /* Same presence gate for the streaming block: absent on a fresh load →
+     * clear; absent on an additive load → keep the main scene's settings. */
+    if (!parse_scene_streaming_settings(scene, root) &&
+        existing_entities == 0)
+        jce_scene_clear_streaming_settings(scene);
 
     int total = cJSON_GetArraySize(entities);
     if (total <= 0) return 0;
@@ -4106,6 +4391,65 @@ int jce_scene_load_json(JceScene *scene, const cJSON *root)
                     }
                 }
             }
+        }
+    }
+
+    /* Second pass (entity refs): IkConstraints carry target/pole ENTITY ids
+     * authored against the SOURCE scene's ids.  Patch them through the same
+     * src_id -> new_id mapping so the references survive reload / prefab
+     * instantiation.  Unresolvable refs are cleared (0 = none) instead of
+     * left dangling at an id that may now belong to an unrelated entity.
+     * Linear lookup is fine here: only entities that actually carry the
+     * component are visited, with at most 16 refs x2 each. */
+    for (int i = 0; i < loaded; i++) {
+        JceIkConstraintComponent *ik =
+            jce_scene_get_ik_constraints(scene, map[i].new_id);
+        if (!ik) continue;
+        int cap = (int)(sizeof(ik->constraints) / sizeof(ik->constraints[0]));
+        int cn = ik->count;
+        if (cn < 0)   cn = 0;
+        if (cn > cap) cn = cap;
+        for (int k = 0; k < cn; k++) {
+            uint32_t *refs[2] = { &ik->constraints[k].target_entity,
+                                  &ik->constraints[k].pole_entity };
+            for (int r = 0; r < 2; r++) {
+                uint32_t src = *refs[r];
+                if (src == 0) continue;
+                uint32_t resolved = 0;
+                for (int j = 0; j < loaded; j++) {
+                    if (map[j].src_id == (JceEntity)src) {
+                        resolved = (uint32_t)map[j].new_id;
+                        break;
+                    }
+                }
+                *refs[r] = resolved;
+            }
+        }
+    }
+
+    /* Second pass (entity refs): SequencePlayer bindings[] carry per-track
+     * entity ids authored against the SOURCE scene's ids.  Patch them
+     * through the same src_id -> new_id mapping (mirrors the IkConstraints
+     * pass above).  Unresolvable refs become 0 (= unbound; the runtime then
+     * falls back to the track's bindEntityName). */
+    for (int i = 0; i < loaded; i++) {
+        JceSequencePlayerComponent *sp =
+            jce_scene_get_sequence_player(scene, map[i].new_id);
+        if (!sp) continue;
+        int cn = sp->binding_count;
+        if (cn < 0) cn = 0;
+        if (cn > JCE_SEQ_PLAYER_MAX_BINDINGS) cn = JCE_SEQ_PLAYER_MAX_BINDINGS;
+        for (int k = 0; k < cn; k++) {
+            uint64_t src = sp->bindings[k];
+            if (src == 0) continue;
+            uint64_t resolved = 0;
+            for (int j = 0; j < loaded; j++) {
+                if (map[j].src_id == (JceEntity)src) {
+                    resolved = (uint64_t)map[j].new_id;
+                    break;
+                }
+            }
+            sp->bindings[k] = resolved;
         }
     }
 

@@ -16,6 +16,7 @@
 #include "ui/jce_editor_ui_state.h"
 #include "core/jce_editor_i18n.h"
 #include "core/jce_editor_state.h"
+#include "core/jce_pak_key.h"
 #include "dialogs/jce_editor_dialogs_internal.h"
 #include "dialogs/jce_path_input.h"
 
@@ -433,6 +434,7 @@ struct BuildState {
     int  zstd_level       = 3;
     bool cook_assets      = true;   /* P0: cook textures/audio/models    */
     int  target_platform  = 0;      /* 0=Win 1=Linux 2=mac 3=Android 4=iOS 5=Web */
+    bool encrypt          = false;  /* ChaCha20-encrypt bundle payloads  */
 
     std::vector<std::string> scene_files;
     char scene_file_input[512] {};
@@ -459,6 +461,8 @@ struct BuildState {
     bool auto_resource_root_owned = false;
     bool cook_assets_owned = false;
     int  target_platform_owned = 0;
+    bool    encrypt_owned = false;
+    uint8_t key_owned[32] = {0};    /* loaded on the main thread at start */
 
     std::string last_status;
     std::vector<BundleSummary> summary;
@@ -586,6 +590,8 @@ void bundle_pack_worker_main(void * /*user*/)
     opts.resolve_user       = nullptr;
     opts.cook_assets        = gb.cook_assets_owned;
     opts.target_platform    = gb.target_platform_owned;
+    opts.encrypt            = gb.encrypt_owned;
+    opts.encryption_key     = gb.encrypt_owned ? gb.key_owned : nullptr;
 
     int rc = jce_bundle_pack_run(&opts, worker_log_sink, &gb);
     jce_atomic_i32_store(gb.last_exit, rc);
@@ -596,6 +602,35 @@ void bundle_pack_worker_main(void * /*user*/)
 void start_build()
 {
     if (jce_atomic_i32_load(gb.running)) return;
+
+    /* Resolve the encryption key on the main thread before the worker
+     * spawns.  No key and no project -> refuse rather than silently pack
+     * plaintext. */
+    gb.encrypt_owned = gb.encrypt;
+    if (gb.encrypt) {
+        const char *proj = jce_editor_assets_get_project();
+        std::string root = (proj && proj[0]) ? proj
+                          : (s_current_project_root[0] ? s_current_project_root
+                                                       : "");
+        bool have = !root.empty() && jce_pak_key_load(root, gb.key_owned);
+        if (!have && !root.empty()) {
+            std::string err;
+            if (jce_pak_key_generate(root, false, &err) &&
+                jce_pak_key_load(root, gb.key_owned)) {
+                have = true;
+                jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+                    "[bundle] generated asset key: %s",
+                    jce_pak_key_path(root).c_str());
+            }
+        }
+        if (!have) {
+            gb.last_status = BL("status.no_key",
+                                "no encryption key (open a project first)");
+            jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                "[bundle] encryption requested but no key is available");
+            return;
+        }
+    }
 
     gb.project_root_owned  = gb.project_root;
     gb.scenes_dir_owned    = gb.scenes_dir;
@@ -692,6 +727,51 @@ void draw_cook_options()
         ImGui::TextDisabled("%s", BL("hint.cook_assets",
             "Textures -> GPU block format (.jceasset), models -> GLB+meshopt,\n"
             "audio -> PCM. Reads <asset>.import.json presets."));
+    }
+
+    /* ── Encryption (ChaCha20, keyed obfuscation) ───────────────────── */
+    if (ImGui::Checkbox(BL("field.encrypt", "Encrypt bundles"),
+                        &gb.encrypt)) {
+        /* First enable: generate the project key on the spot so the user
+         * sees the status flip to "key ready" immediately. */
+        const char *proj = jce_editor_assets_get_project();
+        std::string root = (proj && proj[0]) ? proj
+                          : (s_current_project_root[0] ? s_current_project_root
+                                                       : "");
+        if (gb.encrypt && !root.empty() && !jce_pak_key_exists(root)) {
+            std::string err;
+            if (!jce_pak_key_generate(root, false, &err))
+                jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                    "[bundle] key generate failed: %s", err.c_str());
+        }
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", BL("tooltip.encrypt",
+            "Deters casual extraction; the key ships inside the game binary."));
+    if (gb.encrypt) {
+        const char *proj = jce_editor_assets_get_project();
+        std::string root = (proj && proj[0]) ? proj
+                          : (s_current_project_root[0] ? s_current_project_root
+                                                       : "");
+        uint64_t fp = 0;
+        ImGui::SameLine();
+        if (!root.empty() && jce_pak_key_fingerprint_of(root, &fp)) {
+            char fphex[16];
+            snprintf(fphex, sizeof(fphex), "%08x", (unsigned)(fp >> 32));
+            ImGui::TextDisabled("%s %s",
+                                BL("status.key_ready", "key:"), fphex);
+        } else {
+            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "%s",
+                BL("status.key_missing", "no key"));
+            ImGui::SameLine();
+            if (ImGui::SmallButton(BL("btn.generate_key", "Generate")) &&
+                !root.empty()) {
+                std::string err;
+                if (!jce_pak_key_generate(root, false, &err))
+                    jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                        "[bundle] key generate failed: %s", err.c_str());
+            }
+        }
     }
 }
 

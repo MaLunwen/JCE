@@ -24,14 +24,24 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Platform branching below goes through the JCE_PLATFORM_* constants from
+ * jce_defs.h (charter: raw platform macros stay inside the OS layer). The
+ * emscripten header is the one exception that has no abstraction — it is
+ * only pulled in when the WEB platform constant says so. */
+#if JCE_PLATFORM_WEB
+#include <emscripten.h>
+#endif
+
 #include <jce/os/core/jce_config.h>
 #include <jce/application/jce_subsystem.h>
 #include <jce/middleware/audio/jce_audio.h>
 #include <jce/middleware/streaming/jce_streaming.h>
+#include <jce/middleware/ui/jce_localization.h>
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_crash_handler.h>
 #include <jce/os/core/jce_event.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/resource/jce_archive.h>
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/resource/jce_bundle_loader.h>
 #include <jce/os/core/jce_filesystem.h>
@@ -39,6 +49,7 @@
 #include <jce/os/platform/jce_host_paths.h>
 #include <jce/os/platform/jce_input.h>
 #include <jce/os/platform/jce_input_actions.h>
+#include <jce/os/platform/jce_input_record.h>
 #include <jce/os/platform/jce_single_instance.h>
 #include <jce/os/platform/jce_window.h>
 #include <jce/os/platform/jce_window_modal_loop.h>
@@ -160,69 +171,9 @@ static void jce_select_input_actions_path(char *out_path, size_t out_size)
     }
 }
 
-/* Parse the editor's input_actions.json into a fresh JceInputActions.
- * On any miss (no file / parse error / empty) returns NULL so the caller
- * can fall back to jce_actions_bind_fps_defaults().  Shape:
- *   { "actions": [ { "name": "...", "binds":
- *       [ {"type":N,"code":N,"scale":F,"deadzone":F}, ... ] }, ... ] } */
-static JceInputActions *jce_load_input_actions(const char *path)
-{
-    if (!path || !path[0]) return NULL;
-
-    JceJson *root = jce_json_parse_file(path);
-    if (!root) return NULL;
-
-    JceJson *arr = jce_json_get(root, "actions");
-    if (!jce_json_is_array(arr)) {
-        jce_json_free(root);
-        return NULL;
-    }
-
-    JceInputActions *a = jce_actions_create();
-    if (!a) {
-        jce_json_free(root);
-        return NULL;
-    }
-
-    int registered = 0;
-    const int n = jce_json_array_size(arr);
-    for (int i = 0; i < n; ++i) {
-        JceJson *act = jce_json_array_at(arr, i);
-        if (!jce_json_is_object(act)) continue;
-
-        const char *name = jce_json_get_string(act, "name", NULL);
-        if (!name || !name[0]) continue;
-
-        int id = jce_action_register(a, name);
-        if (id < 0) continue;   /* duplicate / table full */
-        registered++;
-
-        JceJson *binds = jce_json_get(act, "binds");
-        if (!jce_json_is_array(binds)) continue;
-
-        const int bn = jce_json_array_size(binds);
-        for (int b = 0; b < bn; ++b) {
-            JceJson *bj = jce_json_array_at(binds, b);
-            if (!jce_json_is_object(bj)) continue;
-
-            JceBinding bind = {
-                .type     = (JceBindType)jce_json_get_int(bj, "type", JCE_BIND_KEY),
-                .code     = jce_json_get_int(bj, "code", 0),
-                .scale    = (float)jce_json_get_number(bj, "scale", 1.0),
-                .deadzone = (float)jce_json_get_number(bj, "deadzone", 0.15)
-            };
-            jce_action_bind(a, id, &bind);
-        }
-    }
-
-    jce_json_free(root);
-
-    if (registered == 0) {
-        jce_actions_destroy(a);
-        return NULL;
-    }
-    return a;
-}
+/* input_actions.json loading lives in the input-actions module itself
+ * (jce_actions_load_file) so the editor's Play mode and other hosts can
+ * reuse it instead of duplicating the parser. */
 
 /* P3-B.3 — engine-internal lifecycle listener.  Bridges OS LOW_MEMORY
  * signals to the streaming pressure system so registered mip-streaming
@@ -263,6 +214,14 @@ struct JceEngine {
     SDL_IOStream                *kpi_asset_log;
     uint64_t                    kpi_asset_frame_index;
     uint32_t                    kpi_asset_frame_limit;
+
+    /* DEBUG TOGGLE: deterministic input record / replay (JIRC).
+     * Opened from JCE_INPUT_RECORD / JCE_INPUT_REPLAY env vars at create;
+     * ticked once per iterated frame right before the action map update;
+     * closed (and thereby flushed) in jce_engine_destroy.  At most one of
+     * the two is non-NULL (replay wins when both env vars are set). */
+    JceInputRecorder            *input_recorder;
+    JceInputRecorder            *input_replayer;
 
     /* Frame clock state for dt propagation. */
     uint64_t                    perf_freq;
@@ -394,27 +353,38 @@ JceEngine *jce_engine_create(int argc, char *argv[])
         return NULL;
     }
 
-    /* Force landscape on mobile / mobile-web. */
-#if defined(__ANDROID__)
+    /* Force landscape on mobile / mobile-web. JCE_PLATFORM_TOUCH covers
+       exactly the orientation-locked targets (Android + iOS + tvOS). */
+#if JCE_PLATFORM_TOUCH
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
-#elif defined(__APPLE__)
-  #include <TargetConditionals.h>
-  #if TARGET_OS_IOS || TARGET_OS_TV
-    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
-  #endif
 #endif
-#ifdef __EMSCRIPTEN__
-    #include <emscripten.h>
+#if JCE_PLATFORM_WEB
     EM_ASM({
         if (screen.orientation && screen.orientation.lock)
             screen.orientation.lock('landscape').catch(function(){});
     });
 #endif
 
+    /* Asset encryption: reconstruct the shipped decryption key from its two
+     * embedded XOR shares (key = share_a ^ share_b; see jce_embedded_assets.h)
+     * and install it process-wide BEFORE the first PAK open so every archive
+     * opened from here on — embedded PAK, file-loaded PAK (web/Android/JNI)
+     * and later bundle mounts — decrypts transparently.  When no key was
+     * embedded (present == 0) this is a no-op and plain assets work as
+     * before.  Obfuscation only: the key necessarily ships with the game. */
+    if (jce_embedded_pak_key_present) {
+        uint8_t pak_key[32];
+        for (int ki = 0; ki < 32; ++ki)
+            pak_key[ki] = (uint8_t)(jce_embedded_pak_key_shares[ki] ^
+                                    jce_embedded_pak_key_shares[32 + ki]);
+        jce_archive_set_process_key(pak_key);
+        memset(pak_key, 0, sizeof(pak_key)); /* scrub the stack copy */
+    }
+
     /* Open PAK archive. */
-#if defined(__EMSCRIPTEN__)
+#if JCE_PLATFORM_WEB
     e->pak = jce_pak_open_file("/game_assets.pak");
-#elif defined(__ANDROID__)
+#elif JCE_PLATFORM_ANDROID
     /* Android: load PAK from APK assets/ dir at runtime.
      * Embedding 290 MB in .rodata causes SEGV_ACCERR on Houdini
      * ARM64-to-x86_64 translator (WSA). */
@@ -592,7 +562,7 @@ JceEngine *jce_engine_create(int argc, char *argv[])
     {
         char actions_path[512];
         jce_select_input_actions_path(actions_path, sizeof(actions_path));
-        e->actions = jce_load_input_actions(actions_path);
+        e->actions = jce_actions_load_file(actions_path);
         if (e->actions) {
             LOG_INFO(LOG_TAG, "input actions loaded from %s", actions_path);
         } else {
@@ -603,6 +573,43 @@ JceEngine *jce_engine_create(int argc, char *argv[])
             } else {
                 LOG_WARN(LOG_TAG, "input actions init failed");
             }
+        }
+    }
+
+    /* DEBUG TOGGLE: JCE_INPUT_RECORD / JCE_INPUT_REPLAY — deterministic
+     * input record/replay to/from a .jirc file (same diagnostic env family
+     * as JCE_BACKEND / JCE_CAPTURE_FRAME).  Recording captures the exact
+     * JceInputFrame snapshot the game reads each frame; replay overrides
+     * live input from the file until EOF, then falls back to live input.
+     * Use for bug repros, regression runs, and demos.  Replay wins when
+     * both are set (recording a replay would only copy the file). */
+    {
+        const char *rec_path = SDL_getenv("JCE_INPUT_RECORD");
+        const char *rep_path = SDL_getenv("JCE_INPUT_REPLAY");
+        if (rep_path && rep_path[0]) {
+            e->input_replayer = jce_input_replay_open(rep_path);
+            if (e->input_replayer)
+                LOG_WARN(LOG_TAG,
+                    "DEBUG TOGGLE: JCE_INPUT_REPLAY=%s -> input replayed from file",
+                    rep_path);
+            else
+                LOG_WARN(LOG_TAG,
+                    "JCE_INPUT_REPLAY=%s could not be opened "
+                    "(missing file or header/version mismatch) — ignored",
+                    rep_path);
+            if (rec_path && rec_path[0])
+                LOG_WARN(LOG_TAG,
+                    "JCE_INPUT_RECORD ignored while JCE_INPUT_REPLAY is set");
+        } else if (rec_path && rec_path[0]) {
+            e->input_recorder = jce_input_record_open(rec_path);
+            if (e->input_recorder)
+                LOG_WARN(LOG_TAG,
+                    "DEBUG TOGGLE: JCE_INPUT_RECORD=%s -> input recorded to file",
+                    rec_path);
+            else
+                LOG_WARN(LOG_TAG,
+                    "JCE_INPUT_RECORD=%s could not be opened for writing — ignored",
+                    rec_path);
         }
     }
 
@@ -1113,6 +1120,32 @@ JceAppResult jce_engine_iterate(JceEngine *e)
     jce_player_loop_run_phase(JCE_PHASE_INITIALIZATION, dt);
     jce_player_loop_run_phase(JCE_PHASE_EARLY_UPDATE, dt);
 
+    /* DEBUG TOGGLE: input record / replay (JCE_INPUT_RECORD /
+     * JCE_INPUT_REPLAY, opened in jce_engine_create).  This sits right
+     * before the action-map update on purpose: replay injects the recorded
+     * snapshot BEFORE anything reads input this frame, so raw-input
+     * queries AND actions observe the replayed state; record captures the
+     * exact snapshot the game is about to read.  The END_OF_FRAME
+     * jce_input_update below rolls cur→prev as usual, so pressed/released
+     * edges reconstruct identically on replay.  At replay EOF: log once,
+     * close, and keep running on live input. */
+    if (e->input_replayer && e->input) {
+        if (!jce_input_replay_tick(e->input_replayer, e->input)) {
+            LOG_WARN(LOG_TAG,
+                "input replay finished after %llu frames — back to live input",
+                (unsigned long long)
+                    jce_input_record_frame_count(e->input_replayer));
+            jce_input_record_close(e->input_replayer);
+            e->input_replayer = NULL;
+        }
+    } else if (e->input_recorder && e->input) {
+        if (!jce_input_record_tick(e->input_recorder, e->input)) {
+            LOG_WARN(LOG_TAG, "input record write failed — recording stopped");
+            jce_input_record_close(e->input_recorder);
+            e->input_recorder = NULL;
+        }
+    }
+
     /* QW-input-actions — evaluate the action map against the current
      * input snapshot so FIXED_UPDATE / UPDATE consumers (games, camera
      * controller) read fresh action values this frame.  Raw-input queries
@@ -1281,15 +1314,50 @@ void jce_engine_destroy(JceEngine *e)
         e->bundle_catalog = NULL;
     }
     if (e->bundle_fs) { jce_fs_destroy(e->bundle_fs); e->bundle_fs = NULL; }
+    /* Game localization table is process-global (initialised lazily by
+     * jce_runtime_create / the editor); release it before the PAK it may
+     * borrow as a fallback source goes away. */
+    jce_loc_shutdown();
     if (e->pak)      jce_pak_close(e->pak);
+
+    /* Finalize input record / replay (JCE_INPUT_RECORD / JCE_INPUT_REPLAY).
+     * Closing the recorder flushes the .jirc to disk; do it before the
+     * input system it snapshots goes away. */
+    if (e->input_recorder) {
+        LOG_INFO(LOG_TAG, "input recording finalized (%llu frames)",
+            (unsigned long long)
+                jce_input_record_frame_count(e->input_recorder));
+        jce_input_record_close(e->input_recorder);
+        e->input_recorder = NULL;
+    }
+    if (e->input_replayer) {
+        jce_input_record_close(e->input_replayer);
+        e->input_replayer = NULL;
+    }
+
     if (e->actions)  jce_actions_destroy(e->actions);
     if (e->input)    jce_input_destroy(e->input);
     if (e->window)   jce_window_destroy(e->window);
     jce_single_instance_unlock();
     JCE_FREE(e);
 
-    /* SDL_Init pairs with SDL_Quit; perform it after every other subsystem
-     * is gone so OS resources owned by SDL are released last. */
+    /* The async log backend runs on an SDL thread and parks on SDL
+       mutex/condvar primitives — it MUST be shut down while SDL is still
+       alive. The previous order (SDL_Quit first, log shutdown last "so all
+       teardown messages are captured") made SDL_WaitThread join through a
+       dead SDL: the join silently failed, the ring was freed under the
+       still-running backend thread, and when that thread woke from its
+       100 ms flush timeout it dereferenced the freed ring — a 0xC0000005
+       during CRT exit. The editor usually won that 100 ms race; the SDK
+       smoke consumer (heavier atexit work from the whole-archive fat lib)
+       lost it deterministically. Later teardown messages are still
+       captured: jce_log_write falls back to synchronous stderr emission
+       once the ring is gone. */
+    jce_log_shutdown();
+
+    /* SDL_Init pairs with SDL_Quit; perform it after every other
+     * SDL-dependent subsystem is gone so OS resources owned by SDL are
+     * released last. */
     SDL_Quit();
 
     /* Restore default crash handlers after all subsystems are down. */
@@ -1299,10 +1367,6 @@ void jce_engine_destroy(JceEngine *e)
      * any teardown-time callbacks have already fired. */
     jce_player_loop_shutdown();
     jce_lifecycle_shutdown();
-
-    /* Flush and shut down the async log backend (last, so all
-       teardown messages are captured). */
-    jce_log_shutdown();
 }
 
 /* ---- FixedUpdate cadence (P3-B.2) ------------------------------ */

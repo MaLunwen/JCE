@@ -534,8 +534,15 @@ static void uc_draw_text(JceUICanvas *uc, uint16_t view_id, const UCRect *r,
                          float ui_scale)
 {
     /* L5: a non-empty locale_key overrides `text` at display time via the
-     * localization table; `text` is the fallback when no key is set. */
-    const char *str = (tx->locale_key[0]) ? jce_loc_t(tx->locale_key) : tx->text;
+     * localization table; `text` is the fallback when no key is set.
+     * jce_loc_t returns the key POINTER itself on a miss (documented
+     * signal) — fall back to the authored text then, so raw keys never
+     * flash before the locale tables are loaded. */
+    const char *str = tx->text;
+    if (tx->locale_key[0]) {
+        const char *loc = jce_loc_t(tx->locale_key);
+        str = (loc == tx->locale_key && tx->text[0]) ? tx->text : loc;
+    }
     if (!str || !str[0]) return;
 
     /* Split into lines for multi-line layout (L7). Tokenize a local copy so we

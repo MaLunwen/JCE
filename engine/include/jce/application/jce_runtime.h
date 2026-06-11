@@ -93,18 +93,42 @@ typedef struct {
 	 * NULL/"" disables SavePoint auto-save (the snapshot provider is still
 	 * registered, so a game can save/load through jce_runtime_save_registry). */
 	const char    *saves_dir;
+
+	/* Optional host directory containing game string tables as flat
+	 * <locale>.json files (e.g. "<exe_dir>/resources/_cooked/i18n").  When
+	 * set — or when `pak` is present, which enables the in-PAK
+	 * "i18n/<locale>.json" source — the runtime initialises the
+	 * process-global localization table (jce_loc_*) at create() and selects
+	 * `locale` (below), so authored UIText locale_key fields resolve in
+	 * shipped builds.  NULL/"" with pak==NULL leaves localization state
+	 * completely untouched (editor Play passes neither: the editor owns
+	 * jce_loc and its preview locale must survive Play sessions). */
+	const char    *locales_dir;
+
+	/* Initial locale tag for the localization init above, e.g. "en" /
+	 * "zh_cn".  NULL/"" = auto: the host OS preferred locale
+	 * (jce_host_preferred_locale), falling back to "en".  Ignored when
+	 * localization is not initialised (see locales_dir). */
+	const char    *locale;
 } JceRuntimeDesc;
 
 /* Player input applied to the scene's CharacterController each step.
- * walk_x / walk_z are in scene-space and typically clamped to [-1, +1].
- * speed_mult lets gameplay layer sprint/crouch on top.  jump_pressed
- * is edge-triggered — held inside the runtime until the next step()
- * consumes it via jce_physics_character_jump. */
+ * walk_x / walk_z are a scene-space DIRECTION clamped to unit length —
+ * the runtime scales it by the authored CharacterController move_speed
+ * (and sprint_mult while `sprint` is held), so movement feel lives in
+ * scene data, not in each caller.  speed_mult is an extra gameplay
+ * multiplier on top (crouch, slow zones; 0 → treated as 1).
+ * jump_pressed is edge-triggered — held inside the runtime until
+ * consumed (it feeds a short jump buffer, so slightly-early presses
+ * still jump on landing).  jump_held enables variable jump height:
+ * releasing it while ascending cuts the jump short. */
 typedef struct {
 	float walk_x;
 	float walk_z;
 	bool  jump_pressed;
 	float speed_mult;
+	bool  sprint;
+	bool  jump_held;
 } JceRuntimeInput;
 
 /* Snapshot the scene into physics/audio state.  Returns NULL on failure.
@@ -182,6 +206,12 @@ JCE_API JceSnapshotRegistry *JCE_CALL jce_runtime_save_registry(
  * jce_runtime_save_registry(rt) plus a mkdir -p of the parent directory. */
 JCE_API bool JCE_CALL jce_runtime_save_to_file(JceRuntime *rt, const char *path);
 
+/* Switch the active game locale at runtime (reloads the string table and
+ * fires jce_loc listeners; authored UIText keys re-resolve on the next
+ * frame).  Pass-through to jce_loc_set_locale — safe regardless of whether
+ * the runtime initialised localization.  No-op on NULL/empty input. */
+JCE_API void JCE_CALL jce_runtime_set_locale(JceRuntime *rt, const char *locale);
+
 /* ── Behavior trees + perception (P2-perception-bt-binding) ───────────
  *
  * The runtime owns one JceBtContext shared by every agent that authored a
@@ -203,6 +233,15 @@ JCE_API int JCE_CALL jce_runtime_bt_count(const JceRuntime *rt);
  * tree.  Valid only for the runtime's lifetime. */
 JCE_API JceBlackboard *JCE_CALL jce_runtime_bt_blackboard(const JceRuntime *rt,
                                                           uint64_t entity);
+
+/* The loaded behavior-tree handle index (JceBtTreeHandle.idx inside the
+ * runtime's jce_runtime_bt_context) for the agent whose entity id matches
+ * `entity`.  Out-param keeps this header free of jce_bt.h; rebuild the
+ * handle with (JceBtTreeHandle){ *out_tree_idx }.  Returns false when the
+ * entity has no successfully loaded tree.  Read-only tooling (the editor
+ * BT visualizer) polls node state through this. */
+JCE_API bool JCE_CALL jce_runtime_bt_tree(const JceRuntime *rt, uint64_t entity,
+                                          uint32_t *out_tree_idx);
 
 JCE_EXTERN_C_END
 #endif /* JCE_APPLICATION_RUNTIME_H */

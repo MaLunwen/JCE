@@ -30,6 +30,8 @@
 #include <stdlib.h>
 
 #define LOG_TAG             "world_streamer"
+/* MUST stay equal to JCE_SCENE_MAX_STREAM_CHUNKS in jce_scene.h — the
+ * scene's authored chunk table and this roster pool are sized as one. */
 #define MAX_WORLD_CHUNKS    256
 #define MAX_ENTITY_SLOTS    2048   /* per-chunk entity roster capacity */
 
@@ -86,6 +88,10 @@ typedef struct {
 struct JceWorldStreamer {
     JceStreamingSystem *ss;
     JceScene           *scene;
+
+    /* Copy of the creation config (the config has no setters — callers
+     * recreate the streamer to change it; this is what get_config returns). */
+    JceWorldStreamConfig config;
 
     ChunkRoster         rosters[MAX_WORLD_CHUNKS];
     uint32_t            roster_count;
@@ -189,7 +195,8 @@ JceWorldStreamer *jce_world_streamer_create(
     JceWorldStreamer *ws = (JceWorldStreamer *)JCE_CALLOC(1, sizeof(*ws));
     if (!ws) return NULL;
 
-    ws->scene = scene;
+    ws->scene  = scene;
+    ws->config = *config;
 
     JceStreamingConfig ssc;
     memset(&ssc, 0, sizeof(ssc));
@@ -266,6 +273,29 @@ void jce_world_streamer_register_chunk(JceWorldStreamer *ws,
     sc.radius     = radius;
     sc.asset_path = asset_path;
     jce_streaming_register_chunk(ws->ss, &sc);
+}
+
+void jce_world_streamer_register_from_scene_settings(
+    JceWorldStreamer                *ws,
+    const JceSceneStreamingSettings *settings)
+{
+    if (!ws || !settings) return;
+
+    uint32_t n = settings->chunk_count;
+    if (n > MAX_WORLD_CHUNKS) n = MAX_WORLD_CHUNKS;
+
+    uint32_t registered = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        const JceSceneStreamChunk *c = &settings->chunks[i];
+        if (c->path[0] == '\0') continue;     /* placeholder row — skip */
+        jce_vec3 center = jce_v3(c->center[0], c->center[1], c->center[2]);
+        jce_world_streamer_register_chunk(ws, c->id, center, c->radius,
+                                          c->path);
+        registered++;
+    }
+    if (registered)
+        LOG_INFO(LOG_TAG, "registered %u chunk(s) from scene settings",
+                 registered);
 }
 
 void jce_world_streamer_unregister_chunk(JceWorldStreamer *ws, uint32_t chunk_id)
@@ -372,4 +402,33 @@ uint32_t jce_world_streamer_chunk_count(const JceWorldStreamer *ws)
     for (uint32_t i = 0; i < ws->roster_count; ++i)
         if (ws->rosters[i].active) ++n;
     return n;
+}
+
+JceWorldStreamConfig jce_world_streamer_get_config(const JceWorldStreamer *ws)
+{
+    return ws ? ws->config : jce_world_stream_config_default();
+}
+
+JceStreamingPressure jce_world_streamer_pressure(const JceWorldStreamer *ws)
+{
+    return ws ? jce_streaming_get_pressure(ws->ss) : JCE_STREAM_PRESSURE_OK;
+}
+
+JceStreamingPressure jce_world_streamer_pressure_high_water(
+    const JceWorldStreamer *ws)
+{
+    return ws ? jce_streaming_pressure_high_water(ws->ss)
+              : JCE_STREAM_PRESSURE_OK;
+}
+
+uint32_t jce_world_streamer_refused_loads(const JceWorldStreamer *ws)
+{
+    return ws ? jce_streaming_refused_loads(ws->ss) : 0;
+}
+
+JceChunkState jce_world_streamer_chunk_state(const JceWorldStreamer *ws,
+                                             uint32_t chunk_id)
+{
+    return ws ? jce_streaming_chunk_state(ws->ss, chunk_id)
+              : JCE_CHUNK_UNLOADED;
 }

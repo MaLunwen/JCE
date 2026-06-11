@@ -17,6 +17,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 JCE_EXTERN_C_BEGIN
 
@@ -41,6 +42,7 @@ JCE_API int   jce_sequencer_fps     (const JceSequencer *seq);
 JCE_API bool  jce_sequencer_looping (const JceSequencer *seq);
 
 JCE_API void  jce_sequencer_set_playing(JceSequencer *seq, bool playing);
+JCE_API void  jce_sequencer_set_looping(JceSequencer *seq, bool looping);
 JCE_API void  jce_sequencer_set_time   (JceSequencer *seq, float t);
 JCE_API float jce_sequencer_get_time   (const JceSequencer *seq);
 
@@ -54,18 +56,26 @@ JCE_API const char       *jce_sequencer_track_name   (const JceSequencer *seq, i
 JCE_API const char       *jce_sequencer_track_binding(const JceSequencer *seq, int idx);
 JCE_API JceSeqTrackType   jce_sequencer_track_type   (const JceSequencer *seq, int idx);
 
+/* Structured binding accessors (P1-L integrator).  Authored as additive
+   keys (bindProp / bindEntity / bindEntityName) next to the legacy
+   free-form "binding" string; a legacy "<digits>/<prop>" binding is
+   fallback-parsed into these fields on load. */
+JCE_API const char *jce_sequencer_track_bind_prop_name  (const JceSequencer *seq, int idx);
+JCE_API uint64_t    jce_sequencer_track_bind_entity_hint(const JceSequencer *seq, int idx);
+JCE_API const char *jce_sequencer_track_bind_entity_name(const JceSequencer *seq, int idx);
+
 /* Evaluate a property track at a given time (linear interpolation). */
 JCE_API float jce_sequencer_track_eval_float(const JceSequencer *seq, int idx, float t);
 
 /* Evaluate a color track at a given time (linear in RGB). */
-void  jce_sequencer_track_eval_color(const JceSequencer *seq, int idx,
-                                     float t, float out_rgb[3]);
+JCE_API void  jce_sequencer_track_eval_color(const JceSequencer *seq, int idx,
+                                             float t, float out_rgb[3]);
 
 /* For event tracks, returns the count of event keys whose t lies in
    the half-open interval (t_prev, t_now].  Useful for firing during
    a frame-step from the previous frame's playhead. */
-int   jce_sequencer_track_events_in_range(const JceSequencer *seq, int idx,
-                                          float t_prev, float t_now);
+JCE_API int   jce_sequencer_track_events_in_range(const JceSequencer *seq, int idx,
+                                                  float t_prev, float t_now);
 
 JCE_EXTERN_C_END
 

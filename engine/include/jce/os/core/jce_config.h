@@ -42,6 +42,12 @@ typedef struct JceConfig {
     /* Logging */
     int         log_level;              /* default: JCE_LOG_LEVEL_INFO (2) */
     bool        log_colors;             /* default: true */
+
+    /* App */
+    char        locale[32];             /* default: "" = auto-detect from the
+                                         * host OS.  Lowercase "lang[_country]"
+                                         * tag, e.g. "zh_cn".
+                                         * INI: [app] locale = zh_cn */
 } JceConfig;
 
 /* Fill cfg with default values. */

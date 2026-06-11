@@ -94,7 +94,8 @@ static ImVec4 fv_code_keyword_color(const char *ext)
         || strcmp(ext, ".sc") == 0)
         return ImVec4(0.5f, 0.9f, 0.5f, 1.0f);
     if (strcmp(ext, ".json") == 0 || strcmp(ext, ".xml") == 0
-        || strcmp(ext, ".yaml") == 0 || strcmp(ext, ".yml") == 0)
+        || strcmp(ext, ".yaml") == 0 || strcmp(ext, ".yml") == 0
+        || strcmp(ext, ".rml") == 0)
         return ImVec4(0.9f, 0.9f, 0.4f, 1.0f);
     if (strcmp(ext, ".py") == 0 || strcmp(ext, ".lua") == 0)
         return ImVec4(0.9f, 0.5f, 0.9f, 1.0f);

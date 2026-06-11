@@ -128,6 +128,11 @@ static void apply(JceConfig *cfg, const char *section,
     else if (strcmp(full, "logging.level")  == 0) cfg->log_level  = parse_log_level(value);
     else if (strcmp(full, "logging.colors") == 0) cfg->log_colors = parse_bool(value);
 
+    /* App */
+    else if (strcmp(full, "app.locale") == 0) {
+        SDL_strlcpy(cfg->locale, value, sizeof(cfg->locale));
+    }
+
     else {
         LOG_WARN(LOG_TAG, "unknown config key: %s", full);
     }

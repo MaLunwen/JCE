@@ -186,7 +186,10 @@ void fps_update(float dt, void *ud)
     jce_vec3 walk = jce_v3(wx * speed, 0.0f, wz * speed);
     jce_physics_character_move(s.world, s.character, walk, dt);
 
-    if (captured && ImGui::IsKeyPressed(ImGuiKey_Space, false))
+    /* jump() no longer gates on ground contact (the scene runtime owns
+     * coyote-time/buffer forgiveness) — gate here to keep no-air-jumps. */
+    if (captured && ImGui::IsKeyPressed(ImGuiKey_Space, false) &&
+        jce_physics_character_is_grounded(s.world, s.character))
         jce_physics_character_jump(s.world, s.character);
 
     jce_physics_step(s.world, dt);

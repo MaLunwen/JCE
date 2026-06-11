@@ -12,6 +12,7 @@
 
 #include <jce/os/core/jce_filesystem.h>
 
+#include "jce_cook_policy.h"
 #include "jce_tex_compress.h"
 #include "os/core/jce_memory.h"
 
@@ -617,40 +618,9 @@ int jce_cook_detect_type(const char *path)
     return JCEASSET_TYPE_RAW;
 }
 
-/* Heuristic: does this texture path look like a tangent-space normal map?
- * Normal maps must use BC5 (RG), not BC3 — BC3's chroma subsampling wrecks them. */
-static bool path_is_normal_map(const char *path)
-{
-    if (!path) return false;
-    char low[1024];
-    size_t n = 0;
-    for (; path[n] && n < sizeof(low) - 1; n++) {
-        char c = path[n];
-        low[n] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
-    }
-    low[n] = '\0';
-    return strstr(low, "normal") || strstr(low, "_nrm") ||
-           strstr(low, "_norm")  || strstr(low, "-normal");
-}
-
-/* Auto-select a GPU texture format from the target platform (only when the
- * caller didn't force one). Desktop -> BC (BC5 normals, BC3 colour);
- * mobile/web -> ASTC. Platform AUTO keeps RGBA8 (uncompressed). */
-static int auto_texture_format(const char *path, JceCookPlatform plat)
-{
-    switch (plat) {
-    case JCE_COOK_PLATFORM_WINDOWS:
-    case JCE_COOK_PLATFORM_LINUX:
-    case JCE_COOK_PLATFORM_MACOS:
-        return path_is_normal_map(path) ? JCEASSET_TEXFMT_BC5 : JCEASSET_TEXFMT_BC3;
-    case JCE_COOK_PLATFORM_ANDROID:
-    case JCE_COOK_PLATFORM_IOS:
-    case JCE_COOK_PLATFORM_WEB:
-        return JCEASSET_TEXFMT_ASTC_4x4;
-    default:
-        return JCEASSET_TEXFMT_RGBA8;   /* AUTO -> uncompressed */
-    }
-}
+/* Texture-format policy (normal-map heuristic + per-platform auto format)
+ * lives in jce_cook_policy.h — shared with jce_bundle_pack.c so the two
+ * cook paths can never drift apart. */
 
 JceCookResult jce_cook_file(const char *input_path,
                             const JceCookOptions *opts)
@@ -687,7 +657,8 @@ JceCookResult jce_cook_file(const char *input_path,
     if (type == JCEASSET_TYPE_TEXTURE && opts &&
         opts->texture_format == JCEASSET_TEXFMT_RGBA8) {
         local = *opts;
-        local.texture_format = auto_texture_format(input_path, opts->platform);
+        local.texture_format =
+            jce_cook_auto_texture_format(input_path, opts->platform);
         use_opts = &local;
     }
 

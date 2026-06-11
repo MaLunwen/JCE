@@ -17,14 +17,17 @@
 #include <jce/middleware/animation/jce_anim_sm_binding.h>
 #include <jce/middleware/animation/jce_anim_blend_tree.h>
 #include <jce/middleware/animation/jce_anim_ik.h>
+#include <jce/middleware/animation/jce_skeleton.h>
 #include <jce/middleware/scene/jce_lod.h>
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/physics/jce_cloth.h>
 #include <jce/middleware/scene/jce_space_partition.h>
 #include <jce/middleware/scene/jce_terrain.h>
+#include <jce/middleware/scene/jce_tilemap.h>
 #include "os/core/jce_memory.h"
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_hash.h>
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
@@ -37,6 +40,7 @@
 #include <jce/os/core/jce_thread.h>   /* async IBL bake worker */
 #include <jce/os/core/jce_jobs.h>     /* data-parallel frustum cull */
 #include <jce/renderer/jce_particles.h>
+#include <jce/renderer/jce_gpu_particles.h>
 #include <jce/renderer/jce_lighting.h>
 #include <jce/renderer/jce_lighting_system.h>
 #include <jce/renderer/jce_material.h>
@@ -135,6 +139,15 @@ JCE_SASSERT(JCE_SCENE_LOD_MAX_LEVELS == JCE_LOD_MAX_LEVELS);
  * (textured) geometry rather than showing the background through the seam. */
 #define SR_TERRAIN_SKIRT_FRAC   0.04f
 
+/* Tilemap chunked draw (P5-tilemap).  Mirrors the terrain pattern: the map is
+ * baked into 32x32-cell chunks of textured quads (entity-local space, one
+ * static VB per non-empty chunk, ONE shared static IB for all of them) and
+ * drawn with per-chunk frustum culling.  No LOD — tile quads are already the
+ * cheapest representation. */
+#define SR_TILEMAP_SLOT_MAX     8
+#define SR_TILEMAP_CHUNK_DIM    32                 /* cells per chunk side  */
+#define SR_TILEMAP_CHUNK_QUADS  (SR_TILEMAP_CHUNK_DIM * SR_TILEMAP_CHUNK_DIM)
+
 /* Local (spot/point) shadow atlas — P1. A square atlas packs up to
  * JCE_MAX_LOCAL_SHADOWS perspective depth tiles in a NxN grid; each
  * shadow-casting local light renders into one tile via its own bgfx view
@@ -142,12 +155,36 @@ JCE_SASSERT(JCE_SCENE_LOD_MAX_LEVELS == JCE_LOD_MAX_LEVELS);
 #define JCE_MAX_LOCAL_SHADOWS  4
 #define JCE_LOCAL_SHADOW_TILES 2   /* 2x2 grid -> 4 tiles */
 #define JCE_VIEW_LOCAL_SHADOW_OFFSET 4 /* base+4..base+8, free for base 0/3/80 */
+/* GPU particle COMPUTE view (simulate + emit dispatches; no draws).  base+9
+ * is the last free slot below the shadow band; the view-order builder pushes
+ * it ahead of base+0 so dispatches execute before the draw that consumes the
+ * pool. One JceGpuParticleSystem per GPU-flagged emitter (size/color lerp
+ * comes from global uniforms per update call, so a pool cannot be shared). */
+#define JCE_VIEW_GPU_PARTICLE_OFFSET 9
+#define SR_GPU_PARTICLE_MAX          64
 /* Point lights are omnidirectional; v1 approximates with a single wide-FOV
  * perspective frustum aimed straight down (good for elevated point lights,
  * weaker for ground-level ones). ~126deg. dual-paraboloid/cube is a future upgrade. */
 #define JCE_POINT_SHADOW_FOV   2.2f
 
 /* ── Internal struct ──────────────────────────────────────────────── */
+
+/* Per-emitter GPU particle record (P3-E gpu-particles wiring).  One compute
+ * pool per GPU-flagged JceParticleEmitterComponent; created lazily when the
+ * routing predicate (jce_scene_particle_emitter_uses_gpu) first passes and
+ * reaped by mark-and-sweep when the entity vanishes / toggles back to CPU.
+ * The authored desc is cached so the .particles.json is not re-read per
+ * frame; `epoch` detects authoring edits (rebuild). */
+typedef struct {
+    JceEntity              entity;
+    JceGpuParticleSystem  *sys;
+    JceParticleEmitterDesc desc;        /* cached authored description */
+    float                  emit_accum;  /* fractional emit carry */
+    bool                   burst_done;  /* one-shot emit_burst fired */
+    uint64_t               epoch;       /* authoring-change marker */
+    bool                   referenced;  /* mark-and-sweep flag */
+    bool                   used;
+} SrGpuParticleRec;
 
 /* Per-frame material registry entry. Snapshot of everything the binder
  * needs to re-bind textures + uniforms when render-queue auto-batching
@@ -216,6 +253,15 @@ typedef struct {
     bool              sm_have_prev;
     float             sm_speed;     /* smoothed (EMA) so the SM doesn't flicker */
 
+    /* SM transition crossfade: elapsed time inside the active transition
+       (drives the to-clip's local time) + the transition index it belongs
+       to, so a new transition restarts the clock.  sm_seed_time hands the
+       blended to-clip time to the single-clip player when the transition
+       completes (-1 = nothing to seed). */
+    float             sm_trans_time;
+    int               sm_trans_idx;  /* -1 = not transitioning last frame */
+    float             sm_seed_time;
+
     /* Frame-event dispatch (P1 #16). Events are loaded once from a
        <skeleton_path>.anim.json sidecar (per-clip arrays) and fired by
        jce_anim_events_advance() over the (prev,cur] clip-time interval each
@@ -228,6 +274,10 @@ typedef struct {
     bool              ev_loaded;     /* sidecar load attempted (success or absent) */
     int               ev_clip;       /* clip the prev-time belongs to (-1 = none) */
     float             ev_prev_time;  /* clip time at the previous frame */
+
+    /* IK constraints: warn about unresolved bone names only once per
+       instance instead of spamming the log every frame. */
+    bool              ik_warned;
 } SrAnimInstance;
 
 /* Per-entity 2D sprite-animator playback state (P1 #16). */
@@ -546,6 +596,38 @@ struct JceSceneRenderer {
     bgfx_uniform_handle_t s_terrain_layer2;
     bgfx_uniform_handle_t s_terrain_layer3;
 
+    /* Tilemap cache (path -> JceTilemapAsset + tileset + chunked static VBs).
+     * Mirrors terrain_cache: loaded lazily on first draw, PAK-first, failed
+     * latch, per-chunk frustum culling.  Cells are baked into 32x32-cell
+     * chunks of textured quads in ENTITY-LOCAL space (1 cell = 1 unit, rows
+     * grow down: cell (c,r) spans [c,c+1] x [-(r+1),-r]); the component tint
+     * is baked into the vertex color (chunks rebuild when it changes).  Every
+     * chunk indexes ONE shared static IB (1024 quads). */
+    struct {
+        char             path[256];          /* .tilemap.json cache key      */
+        char             tileset_path[256];  /* resolved tileset key         */
+        JceTilemapAsset *map;
+        JceTilesetAsset *tileset;
+        bool             used;
+        bool             failed;
+        uint32_t         baked_abgr;         /* tint baked into the VBs      */
+        int              chunk_nx;           /* ceil(w/32)                   */
+        int              chunk_ny;           /* ceil(h/32)                   */
+        int              chunk_count;        /* chunk_nx * chunk_ny          */
+        bgfx_vertex_buffer_handle_t *chunk_vb;    /* [count]; invalid=empty  */
+        uint16_t        *chunk_quads;        /* [count] quads in each VB     */
+        jce_vec3        *chunk_min;          /* [count] local AABB min       */
+        jce_vec3        *chunk_max;          /* [count] local AABB max       */
+        bool             chunks_built;
+        bool             warned_bad_id;      /* id > rect_count (warn once)  */
+        bool             warned_iso;         /* orientation != 0 (warn once) */
+        bool             warned_src;         /* sourceW/H <= 0   (warn once) */
+    } tilemap_cache[SR_TILEMAP_SLOT_MAX];
+    bgfx_index_buffer_handle_t  tilemap_shared_ib;  /* 6144 u16 = 1024 quads */
+    bgfx_uniform_handle_t       tilemap_s_tex;      /* "s_texColor" sampler  */
+    bgfx_vertex_layout_t        tilemap_layout;     /* pos3f|color4u8|uv2f   */
+    bool                        tilemap_layout_ready;
+
     /* ── Render-queue integration (Phase 2 stub) ─────────────────────
      * material registry is per-frame; reset at each sr_render begin.
      * frame_view_id / frame_shadow_vp let the binder rebuild bindings
@@ -585,6 +667,15 @@ struct JceSceneRenderer {
     JceWeatherSystem *weather;
     JceDecalPool     *decals;          /* runtime-stamped (API) decals    */
     JceDecalPool     *decals_authored; /* rebuilt each frame from JceDecalComponent */
+
+    /* ── GPU particles (compute-driven; P3-E wiring) ──────────────────
+     * One pool per GPU-flagged emitter.  gpu_particle_frame guards the
+     * simulate/emit dispatch against the editor's multi-viewport double
+     * render: only the FIRST scene render of a bgfx frame dispatches; later
+     * renders in the same frame only re-submit the draw. */
+    SrGpuParticleRec  gpu_particles[SR_GPU_PARTICLE_MAX];
+    uint32_t          gpu_particle_frame;
+    bool              gpu_particle_frame_valid;
     /* Internal advancing hour-of-day; seeded from the scene's authored
      * tod_hour the first frame ToD is enabled, then advanced by tod_speed.
      * tod_clock_valid gates the seed so editing tod_hour while frozen still
@@ -1015,6 +1106,10 @@ static SrAnimInstance *sr_get_anim_instance(JceSceneRenderer *sr,
                     a->blend_tree = NULL;
                 }
                 a->bt_count = 0;
+                /* Any in-flight SM crossfade state belongs to the OLD
+                   model's clips — drop it. */
+                a->sm_trans_idx = -1;
+                a->sm_seed_time = -1.0f;
                 /* New model = new clip set: drop the event pool so the new
                    skeleton's sidecar is re-loaded against the new clips. */
                 sr_anim_events_reset(a);
@@ -1043,6 +1138,8 @@ static SrAnimInstance *sr_get_anim_instance(JceSceneRenderer *sr,
     a->speed       = 1.0f;
     a->paused      = true;
     a->used        = true;
+    a->sm_trans_idx = -1;
+    a->sm_seed_time = -1.0f;
     JceSkeleton *sk = jce_model_get_skeleton(model);
     if (sk && jce_model_anim_count(model) > 0)
         a->player = jce_anim_player_create(sk);
@@ -1163,8 +1260,13 @@ static void sr_anim_event_dispatch(const JceAnimEvent *ev, void *user)
 {
     uint32_t entity = (uint32_t)(uintptr_t)user;
     if (!ev) return;
-    LOG_DEBUG(LOG_TAG, "anim event: entity=%u id=%u t=%.3f f0=%.3f f1=%.3f i0=%d",
-              entity, ev->id, ev->time, ev->f0, ev->f1, ev->i0);
+    if (ev->name[0])
+        LOG_DEBUG(LOG_TAG, "anim event: entity=%u name=\"%s\" id=%u t=%.3f "
+                  "f0=%.3f f1=%.3f i0=%d",
+                  entity, ev->name, ev->id, ev->time, ev->f0, ev->f1, ev->i0);
+    else
+        LOG_DEBUG(LOG_TAG, "anim event: entity=%u id=%u t=%.3f f0=%.3f f1=%.3f i0=%d",
+                  entity, ev->id, ev->time, ev->f0, ev->f1, ev->i0);
 }
 
 static int sr_anim_event_cmp(const void *a, const void *b)
@@ -1175,8 +1277,10 @@ static int sr_anim_event_cmp(const void *a, const void *b)
 }
 
 /* Lazily load <skeleton_path>.anim.json once per instance. The sidecar maps
- * clip names to event arrays:
- *   { "Run": [ { "time": 0.25, "id": 1, "f0": 0, "f1": 0, "i0": 0 }, ... ] }
+ * clip names to event arrays (every field but "time" is optional; "name" is
+ * an optional string label authored by the editor's Animation Editor):
+ *   { "Run": [ { "time": 0.25, "name": "footstep", "id": 1,
+ *               "f0": 0, "f1": 0, "i0": 0 }, ... ] }
  * Each clip's events are stored contiguously in ev_pool and exposed as a
  * per-clip JceAnimEventTrack indexed by the model's clip index. Absent or
  * malformed sidecars leave zero tracks (events simply never fire). */
@@ -1231,6 +1335,11 @@ static void sr_anim_events_load(SrAnimInstance *ai, const char *skeleton_path,
             ev->f0   = (float)jce_json_get_number(it, "f0", 0.0);
             ev->f1   = (float)jce_json_get_number(it, "f1", 0.0);
             ev->i0   = jce_json_get_int(it, "i0", 0);
+            /* Optional string label; numeric-only files leave it empty
+             * (pool is calloc'd, so ev->name is already ""). */
+            const char *nm = jce_json_get_string(it, "name", NULL);
+            if (nm && nm[0])
+                snprintf(ev->name, sizeof(ev->name), "%s", nm);
             n++;
         }
         if (n > 0) {
@@ -1285,6 +1394,22 @@ static bool sr_clip_name_match(const char *a, const char *b)
     for (; *ba && *bb; ++ba, ++bb)
         if (sr_lc((unsigned char)*ba) != sr_lc((unsigned char)*bb)) return false;
     return *ba == '\0' && *bb == '\0';
+}
+
+/* Resolve an SM state's authored clip name to the model's JceAnimClip
+ * (case-insensitive basename match — the same rule the binding's clip
+ * resolver uses).  NULL when the state has no clip or the model lacks it. */
+static JceAnimClip *sr_sm_state_model_clip(const JceAnimSm *sm, int state,
+                                           JceModel *model)
+{
+    const char *want = jce_anim_sm_state_clip(sm, state);
+    if (!want || !want[0] || !model) return NULL;
+    int an = (int)jce_model_anim_count(model);
+    for (int i = 0; i < an; i++) {
+        JceAnimClip *c = jce_model_get_anim(model, (uint32_t)i);
+        if (sr_clip_name_match(jce_anim_clip_name(c), want)) return c;
+    }
+    return NULL;
 }
 
 /* Compute the entity's planar (XZ) movement speed from the frame-to-frame
@@ -1349,6 +1474,220 @@ static void sr_anim_sample_range(int begin, int end, void *user)
         sr_anim_do_sample(&reqs[i]);
 }
 
+/* ── Two-bone IK pass (consumes JceIkConstraintComponent) ───────────
+ *
+ * Runs SERIALLY at the end of sr_update_skinned_anims, after the parallel
+ * pose sample wrote each instance's skin palette and before the palette is
+ * consumed by the shadow/color passes. */
+
+/* Shortest-arc rotation taking direction `from` onto direction `to`. */
+static jce_quat sr_quat_from_to(jce_vec3 from, jce_vec3 to)
+{
+    jce_vec3 f = jce_v3_normalize(from);
+    jce_vec3 t = jce_v3_normalize(to);
+    float d = jce_v3_dot(f, t);
+    if (d >= 1.0f - 1e-6f) return jce_q_identity();
+    if (d <= -1.0f + 1e-6f) {
+        /* Anti-parallel: rotate 180° about any axis orthogonal to f. */
+        jce_vec3 axis = jce_v3_cross(f, jce_v3(1.0f, 0.0f, 0.0f));
+        if (jce_v3_len(axis) < 1e-6f)
+            axis = jce_v3_cross(f, jce_v3(0.0f, 1.0f, 0.0f));
+        return jce_q_from_axis_angle(axis, JCE_PI);
+    }
+    jce_vec3 c = jce_v3_cross(f, t);
+    return jce_q_normalize(jce_v4(c.x, c.y, c.z, 1.0f + d));
+}
+
+/* T(pivot) * R(q) * T(-pivot): rotate about a fixed point. */
+static jce_mat4 sr_rotate_about_point(jce_vec3 pivot, jce_quat q)
+{
+    jce_mat4 r  = jce_q_to_mat4(q);
+    jce_mat4 tn = jce_m4_translate(jce_v3_negate(pivot));
+    jce_mat4 tp = jce_m4_translate(pivot);
+    jce_mat4 m  = jce_m4_multiply(&r, &tn);
+    return jce_m4_multiply(&tp, &m);
+}
+
+static jce_vec3 sr_m4_translation(const jce_mat4 *m)
+{
+    return jce_v3(m->raw[3][0], m->raw[3][1], m->raw[3][2]);
+}
+
+/* Transform a world-space point into the rigged entity's MODEL space.
+ * `inv_model` is the inverse of the SAME sanitized TRS matrix the skinned
+ * draw uses (see sr_try_submit_skinned_shadow), NOT the hierarchical world
+ * matrix — the palette lives in that model space. */
+static jce_vec3 sr_world_to_model(const jce_mat4 *inv_model, jce_vec3 p)
+{
+    jce_vec4 r = jce_m4_mul_v4(inv_model, jce_v4(p.x, p.y, p.z, 1.0f));
+    return jce_v3(r.x, r.y, r.z);
+}
+
+static void sr_apply_ik_constraints(JceSceneRenderer *sr, JceScene *scene,
+                                    EntityList *list)
+{
+    for (int i = 0; i < list->count; i++) {
+        JceEntity e = list->entities[i];
+        if (!entity_enabled(scene, e)) continue;
+        if (!jce_scene_has_skeletal_animator(scene, e)) continue;
+        if (!jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_SKELETAL_ANIMATOR)) continue;
+        if (!jce_scene_has_ik_constraints(scene, e)) continue;
+
+        JceIkConstraintComponent *ik = jce_scene_get_ik_constraints(scene, e);
+        if (!ik || ik->count <= 0) continue;
+
+        JceSkeletalAnimatorComponent *sa = jce_scene_get_skeletal_animator(scene, e);
+        if (!sa || !sa->skeleton_path[0]) continue;
+
+        SrModelCache *mc = sr_get_model(sr, sa->skeleton_path, (uint32_t)e);
+        if (!mc || !mc->model) continue;
+
+        SrAnimInstance *ai = sr_find_anim_instance(sr, (uint32_t)e);
+        if (!ai || ai->skin_palette_count == 0) continue;
+
+        JceSkeleton *skel = jce_model_get_skeleton(mc->model);
+        if (!skel) continue;
+
+        JceTransform *t = jce_scene_get_transform(scene, e);
+        if (!t) continue;
+
+        /* Same sanitized-scale TRS the skinned shadow/color submit uses. */
+        jce_mat4 model_mtx = jce_m4_from_trs(t->position, t->rotation,
+                                             jce_v3_safe_scale(t->scale));
+        jce_mat4 inv_model = jce_m4_inverse(&model_mtx);
+
+        uint32_t nj = jce_skeleton_joint_count(skel);
+        if (nj > ai->skin_palette_count) nj = ai->skin_palette_count;
+        if (nj > JCE_MAX_BONES)          nj = JCE_MAX_BONES;
+        if (nj == 0) continue;
+
+        int cn = ik->count;
+        int cap = (int)(sizeof(ik->constraints) / sizeof(ik->constraints[0]));
+        if (cn > cap) cn = cap;
+
+        for (int ci = 0; ci < cn; ci++) {
+            const JceIkConstraint *c = &ik->constraints[ci];
+            /* Only kind==1 (TwoBoneIK) has a runtime solver today; Aim /
+             * MultiParent / Position / Rotation round-trip through the scene
+             * file but are explicitly skipped here until their solvers land. */
+            if (c->kind != 1) continue;
+            if (!c->enabled || c->weight <= 0.0f) continue;
+            if (c->target_entity == 0) continue;
+
+            int jr = jce_skeleton_find_joint(skel, c->root_bone);
+            int jm = jce_skeleton_find_joint(skel, c->mid_bone);
+            int je = jce_skeleton_find_joint(skel, c->end_bone);
+            if (jr < 0 || jm < 0 || je < 0 ||
+                jr >= (int)nj || jm >= (int)nj || je >= (int)nj) {
+                if (!ai->ik_warned) {
+                    LOG_WARN(LOG_TAG,
+                             "IK constraint '%s' on entity %u: unresolved "
+                             "bone(s) root='%s'(%d) mid='%s'(%d) end='%s'(%d) "
+                             "— constraint skipped",
+                             c->name, (uint32_t)e,
+                             c->root_bone, jr, c->mid_bone, jm,
+                             c->end_bone, je);
+                    ai->ik_warned = true;
+                }
+                continue;
+            }
+
+            /* Reconstruct current model-space joint globals from the palette:
+             * global[j] = palette[j] * inverse(inverse_bind[j]).  Recomputed
+             * per constraint so stacked constraints see each other's result. */
+            jce_mat4 globals[JCE_MAX_BONES];
+            for (uint32_t j = 0; j < nj; j++) {
+                jce_mat4 ib   = jce_skeleton_get_inverse_bind(skel, j);
+                jce_mat4 bind = jce_m4_inverse(&ib);
+                globals[j] = jce_m4_multiply(&ai->skin_palette[j], &bind);
+            }
+
+            jce_vec3 p0 = sr_m4_translation(&globals[jr]);   /* root */
+            jce_vec3 p1 = sr_m4_translation(&globals[jm]);   /* mid  */
+            jce_vec3 p2 = sr_m4_translation(&globals[je]);   /* end  */
+
+            /* Target / pole world positions → entity model space. */
+            jce_mat4 tw = jce_scene_get_world_matrix(scene,
+                                                     (JceEntity)c->target_entity);
+            jce_vec3 target = sr_world_to_model(&inv_model, sr_m4_translation(&tw));
+            jce_vec3 pole;
+            if (c->pole_entity != 0) {
+                jce_mat4 pw = jce_scene_get_world_matrix(scene,
+                                                         (JceEntity)c->pole_entity);
+                pole = sr_world_to_model(&inv_model, sr_m4_translation(&pw));
+            } else {
+                pole = jce_v3_add(p0, jce_v3(c->pole_offset[0],
+                                             c->pole_offset[1],
+                                             c->pole_offset[2]));
+            }
+
+            /* The solver lerps toward the IK pose by `weight` internally —
+             * pass it through and do NOT blend again on write-back. */
+            JceIkTwoBoneInput in;
+            in.root_pos[0] = p0.x; in.root_pos[1] = p0.y; in.root_pos[2] = p0.z;
+            in.mid_pos[0]  = p1.x; in.mid_pos[1]  = p1.y; in.mid_pos[2]  = p1.z;
+            in.end_pos[0]  = p2.x; in.end_pos[1]  = p2.y; in.end_pos[2]  = p2.z;
+            in.target[0] = target.x; in.target[1] = target.y; in.target[2] = target.z;
+            in.pole[0]   = pole.x;   in.pole[1]   = pole.y;   in.pole[2]   = pole.z;
+            in.weight    = c->weight > 1.0f ? 1.0f : c->weight;
+
+            JceIkTwoBoneOutput out;
+            jce_anim_ik_two_bone_solve(&in, &out);
+            jce_vec3 q1 = jce_v3(out.mid_pos[0], out.mid_pos[1], out.mid_pos[2]);
+            jce_vec3 q2 = jce_v3(out.end_pos[0], out.end_pos[1], out.end_pos[2]);
+
+            /* Write-back as delta rotations on the joint GLOBALS:
+             *  - root: shortest arc from old (mid-root) dir to new (mid'-root),
+             *    rotating about the root position;
+             *  - mid:  after the root rotation carried the old end to
+             *    R0*(p2-p1), shortest arc from that onto (end'-mid'),
+             *    rotating about the new mid position. */
+            jce_quat r0 = sr_quat_from_to(jce_v3_sub(p1, p0),
+                                          jce_v3_sub(q1, p0));
+            jce_vec3 end_dir_rot = jce_q_rotate(r0, jce_v3_sub(p2, p1));
+            jce_quat r1 = sr_quat_from_to(end_dir_rot, jce_v3_sub(q2, q1));
+
+            jce_mat4 rot_root = sr_rotate_about_point(p0, r0);
+            jce_mat4 rot_mid  = sr_rotate_about_point(q1, r1);
+
+            jce_mat4 new_globals[JCE_MAX_BONES];
+            bool     modified[JCE_MAX_BONES];
+            memcpy(new_globals, globals, sizeof(jce_mat4) * nj);
+            memset(modified, 0, sizeof(bool) * nj);
+
+            new_globals[jr] = jce_m4_multiply(&rot_root, &globals[jr]);
+            {
+                jce_mat4 tmp = jce_m4_multiply(&rot_root, &globals[jm]);
+                new_globals[jm] = jce_m4_multiply(&rot_mid, &tmp);
+            }
+            modified[jm] = true;
+
+            /* Propagate to ALL descendants of mid: joints are ordered with
+             * parents preceding children, so one forward pass recomputes each
+             * child global from its parent's new global while preserving the
+             * old parent-relative offset.  (root and mid keep their explicit
+             * new globals computed above.) */
+            for (uint32_t j = 0; j < nj; j++) {
+                if ((int)j == jr || (int)j == jm) continue;
+                int p = jce_skeleton_joint_parent(skel, j);
+                if (p < 0 || p >= (int)nj || !modified[p]) continue;
+                jce_mat4 inv_old_parent = jce_m4_inverse(&globals[p]);
+                jce_mat4 local = jce_m4_multiply(&inv_old_parent, &globals[j]);
+                new_globals[j] = jce_m4_multiply(&new_globals[p], &local);
+                modified[j] = true;
+            }
+
+            /* Re-derive the skin palette for the changed joints:
+             * palette[j] = global'[j] * inverse_bind[j]. */
+            for (uint32_t j = 0; j < nj; j++) {
+                if ((int)j != jr && !modified[j]) continue;
+                jce_mat4 ib = jce_skeleton_get_inverse_bind(skel, j);
+                ai->skin_palette[j] = jce_m4_multiply(&new_globals[j], &ib);
+            }
+        }
+    }
+}
+
 static void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
                                     EntityList *list, float dt_sec)
 {
@@ -1386,9 +1725,29 @@ static void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
          * blend_param are driven by game code or authored values; the renderer
          * only EVALUATES the SM/blend tree). Also gated to Play. */
         float move_speed = 0.0f;
-        if (sr->anim_sm_active && sa->auto_speed)
-            move_speed = sr_compute_entity_speed(
-                ai, jce_scene_get_transform(scene, e), dt_sec);
+        if (sr->anim_sm_active && sa->auto_speed) {
+            /* Prefer the live physics state written by the runtime's
+             * character driver (loco_valid) — steadier than the transform
+             * delta and immune to interpolation noise. */
+            move_speed = sa->loco_valid
+                       ? sa->loco_speed
+                       : sr_compute_entity_speed(
+                             ai, jce_scene_get_transform(scene, e), dt_sec);
+        }
+
+        /* Effective loop/speed for the single-clip path below; an active SM
+         * state overrides them with its authored values.  sm_handoff marks
+         * the frame an SM transition completed — only then may the pending
+         * sm_seed_time be applied to the freshly-played clip. */
+        bool  loop_eff = sa->loop;
+        float sm_speed_mul = 1.0f;
+        bool  sm_handoff = false;
+        /* Airborne per live physics: the 1D blend tree only models GROUND
+         * locomotion (speed-blended walk/run), so while airborne it yields
+         * to the SM / single-clip path — otherwise jumps keep showing the
+         * walk/run blend. */
+        bool  loco_airborne = sr->anim_sm_active && sa->auto_speed &&
+                              sa->loco_valid && !sa->loco_grounded;
 
         /* State-machine override: when an .anim_sm.json is bound, tick it and
            let it pick the active clip by name (parameter-driven transitions).
@@ -1397,8 +1756,21 @@ static void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
         if (sa->sm_path[0]) {
             if (!ai->sm_binding || strcmp(ai->sm_path, sa->sm_path) != 0) {
                 if (ai->sm_binding) jce_anim_sm_binding_destroy(ai->sm_binding);
-                ai->sm_binding = jce_anim_sm_binding_create(sa->sm_path);
+                /* Resolve scene-relative paths through the host callback
+                 * (same as terrain/HDR): the raw path would be opened
+                 * relative to the process CWD and fail in the editor. */
+                char        sm_res[1024];
+                const char *sm_load = sa->sm_path;
+                if (sr->has_cbs && sr->cbs.resolve_path &&
+                    sr->cbs.resolve_path(sa->sm_path, sm_res,
+                                         (int)sizeof(sm_res),
+                                         sr->cbs.userdata)) {
+                    sm_load = sm_res;
+                }
+                ai->sm_binding = jce_anim_sm_binding_create(sm_load);
                 snprintf(ai->sm_path, sizeof(ai->sm_path), "%s", sa->sm_path);
+                ai->sm_trans_idx = -1;
+                ai->sm_seed_time = -1.0f;
             }
             if (ai->sm_binding && sr->anim_sm_active) {
                 /* Only DRIVE the SM in Play; in the editor the binding stays
@@ -1406,8 +1778,26 @@ static void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
                  * auto-feeds "Speed" ONLY when auto_speed is set — otherwise the
                  * SM's params are whatever game code set (engine stays generic);
                  * tick still runs so those game-driven params take effect. */
-                if (sa->auto_speed)
-                    jce_anim_sm_binding_set_float(ai->sm_binding, "Speed", move_speed);
+                if (sa->auto_speed) {
+                    jce_anim_sm_binding_set_float(ai->sm_binding, "Speed",
+                                                  move_speed);
+                    /* Physics-backed locomotion params (each set_* is a no-op
+                     * when the SM doesn't declare the param, so plain Speed-
+                     * only SMs are unaffected).  loco_jump is one-shot. */
+                    if (sa->loco_valid) {
+                        jce_anim_sm_binding_set_bool(ai->sm_binding,
+                                                     "IsGrounded",
+                                                     sa->loco_grounded);
+                        jce_anim_sm_binding_set_float(ai->sm_binding,
+                                                      "VerticalVel",
+                                                      sa->loco_vert_vel);
+                        if (sa->loco_jump) {
+                            jce_anim_sm_binding_set_trigger(ai->sm_binding,
+                                                            "Jump");
+                            sa->loco_jump = false;
+                        }
+                    }
+                }
                 jce_anim_sm_binding_tick(ai->sm_binding, dt_sec);
                 int an = (int)jce_model_anim_count(mc->model);
                 if (an > 0) {
@@ -1420,20 +1810,81 @@ static void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
                         ai->sm_binding, names, an);
                     if (sm_clip >= 0) ac = sm_clip;
                 }
+
+                const JceAnimSmEval *ev = jce_anim_sm_binding_eval(ai->sm_binding);
+                JceAnimSm *smr = jce_anim_sm_binding_runtime(ai->sm_binding);
+                float comp_sp = sa->speed > 0.0f ? sa->speed : 1.0f;
+                if (ev && smr && ev->transition_index >= 0 &&
+                    (!sa->use_blend_tree || loco_airborne)) {
+                    /* Transition crossfade: sample the from/to state clips
+                       together, weighted by the transition blend, instead of
+                       the old hard clip switch at transition end. */
+                    if (ai->sm_trans_idx != ev->transition_index) {
+                        ai->sm_trans_idx  = ev->transition_index;
+                        ai->sm_trans_time = 0.0f;
+                    }
+                    ai->sm_trans_time += dt_sec;
+                    JceAnimClip *from_clip =
+                        sr_sm_state_model_clip(smr, ev->from_state, mc->model);
+                    JceAnimClip *to_clip =
+                        sr_sm_state_model_clip(smr, ev->to_state, mc->model);
+                    if (from_clip && to_clip) {
+                        float fsp = jce_anim_sm_state_speed(smr, ev->from_state) * comp_sp;
+                        float tsp = jce_anim_sm_state_speed(smr, ev->to_state) * comp_sp;
+                        bool  flp = jce_anim_sm_state_loop(smr, ev->from_state);
+                        bool  tlp = jce_anim_sm_state_loop(smr, ev->to_state);
+                        float fdur = jce_anim_clip_duration(from_clip);
+                        float tdur = jce_anim_clip_duration(to_clip);
+                        float ft = ev->state_time * fsp;
+                        float tt = ai->sm_trans_time * tsp;
+                        ft = (fdur > 0.0001f)
+                           ? (flp ? fmodf(ft, fdur) : (ft < fdur ? ft : fdur))
+                           : 0.0f;
+                        tt = (tdur > 0.0001f)
+                           ? (tlp ? fmodf(tt, tdur) : (tt < tdur ? tt : tdur))
+                           : 0.0f;
+                        SrAnimSample req = {0};
+                        req.ai = ai; req.mode = 2;
+                        req.clip_a = from_clip; req.ta = ft; req.wa = 1.0f - ev->blend;
+                        req.clip_b = to_clip;   req.tb = tt; req.wb = ev->blend;
+                        if (req_count < SR_ANIM_INSTANCE_MAX) reqs[req_count++] = req;
+                        else                                  sr_anim_do_sample(&req);
+                        /* Hand the to-clip's running time to the single-clip
+                           player on the completion frame (no pose pop). */
+                        ai->sm_seed_time = tt;
+                        ai->active_clip  = -1;   /* blend owns the pose */
+                        ai->loop   = tlp;
+                        ai->speed  = tsp;
+                        ai->paused = false;
+                        continue;   /* skip blend-tree + single-clip paths */
+                    }
+                } else if (ev && smr && ev->state_index >= 0) {
+                    /* Steady state: honor the SM state's speed/loop (the old
+                       path ignored both, so non-looping Jump_Start/Land
+                       states would loop forever). */
+                    if (ai->sm_trans_idx >= 0) sm_handoff = true;
+                    ai->sm_trans_idx = -1;
+                    sm_speed_mul = jce_anim_sm_state_speed(smr, ev->state_index);
+                    loop_eff     = jce_anim_sm_state_loop(smr, ev->state_index);
+                }
             }
         } else if (ai->sm_binding) {
             /* sm_path cleared at runtime — drop the stale binding. */
             jce_anim_sm_binding_destroy(ai->sm_binding);
             ai->sm_binding = NULL;
             ai->sm_path[0] = '\0';
+            ai->sm_trans_idx = -1;
+            ai->sm_seed_time = -1.0f;
         }
-        float sp = sa->speed > 0.0f ? sa->speed : 1.0f;
+        float sp = (sa->speed > 0.0f ? sa->speed : 1.0f) * sm_speed_mul;
 
         /* Blend-tree path: cross-blend the two clips bracketing blend_param.
-           Takes precedence over the SM / single-clip path. The 1D tree is
-           cached on the instance and rebuilt only when the clip set or the
-           thresholds change. */
-        if (sa->use_blend_tree) {
+           Takes precedence over the SM / single-clip path WHILE GROUNDED;
+           airborne falls through so jump/fall clips (SM-resolved, or name-
+           driven by the runtime) can play. The 1D tree is cached on the
+           instance and rebuilt only when the clip set or the thresholds
+           change. */
+        if (sa->use_blend_tree && !loco_airborne) {
             /* Opt-in locomotion: auto-drive the blend by movement speed only
              * when auto_speed is set (and in Play). Otherwise blend_param is
              * whatever game code / the author set it to — so the blend tree is
@@ -1491,6 +1942,8 @@ static void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
                 ai->loop   = sa->loop;
                 ai->speed  = sp;
                 ai->paused = false;
+                ai->sm_seed_time = -1.0f;   /* tree owns the pose; drop any
+                                               pending SM hand-off */
                 continue;               /* skip the single-clip path */
             }
         }
@@ -1501,14 +1954,32 @@ static void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
 
         bool comp_playing = sa->playing;
         bool clip_changed = (ai->active_clip != ac);
-        bool loop_changed = (ai->loop != sa->loop);
+        bool loop_changed = (ai->loop != loop_eff);
         bool speed_changed = fabsf(ai->speed - sp) > 0.0001f;
         bool paused_changed = (ai->paused == comp_playing);
 
         if (comp_playing && clip) {
-            if (!jce_anim_player_is_playing(ai->player)
+            /* A finished NON-LOOPING clip holds its last pose until the clip
+             * changes (e.g. an SM exit-time transition fires) — restarting it
+             * every frame would strobe the first pose forever. */
+            bool ended_hold = !loop_eff && !clip_changed && !loop_changed &&
+                              !jce_anim_player_is_playing(ai->player);
+            if (ended_hold) {
+                /* Re-pin the player at the clip END each held frame: a
+                 * stopped player's update() early-outs without writing a
+                 * pose, and an empty palette degrades to the BIND pose.
+                 * Events can't re-fire — the (prev,cur] interval at the
+                 * end is empty. */
+                jce_anim_player_play(ai->player, clip, false, sp);
+                jce_anim_player_set_time(ai->player,
+                                         jce_anim_clip_duration(clip));
+            } else if (!jce_anim_player_is_playing(ai->player)
                 || clip_changed || loop_changed) {
-                jce_anim_player_play(ai->player, clip, sa->loop, sp);
+                jce_anim_player_play(ai->player, clip, loop_eff, sp);
+                /* Continue from the SM crossfade's to-clip time on the
+                 * transition-completion frame instead of popping to 0. */
+                if (sm_handoff && ai->sm_seed_time >= 0.0f)
+                    jce_anim_player_set_time(ai->player, ai->sm_seed_time);
             } else if (speed_changed || paused_changed) {
                 jce_anim_player_set_speed(ai->player, sp);
             }
@@ -1516,15 +1987,16 @@ static void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
             jce_anim_player_set_speed(ai->player, sp);
         } else {
             if (clip && (clip_changed || loop_changed)) {
-                jce_anim_player_play(ai->player, clip, sa->loop, sp);
+                jce_anim_player_play(ai->player, clip, loop_eff, sp);
                 jce_anim_player_set_time(ai->player, 0.0f);
             }
             if (jce_anim_player_is_playing(ai->player))
                 jce_anim_player_pause(ai->player, true);
         }
+        ai->sm_seed_time = -1.0f;   /* consumed (or irrelevant) this frame */
 
         ai->active_clip = ac;
-        ai->loop = sa->loop;
+        ai->loop = loop_eff;
         ai->speed = sp;
         ai->paused = !comp_playing;
 
@@ -1543,15 +2015,11 @@ static void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
             }
         }
 
-        /* Two-bone IK (P1 #16): the analytic solver
-           (jce_anim_ik_two_bone_solve) is ready to run here, after the pose
-           is evaluated and before the palette is consumed by the shadow/color
-           passes. It is intentionally NOT invoked yet: there is no IK
-           rig-target authoring data (no JceIkConstraint component carrying the
-           root/mid/end joint indices, target entity and pole). Once that
-           component lands, resolve the three joint world positions from the
-           palette, call the solver per chain (gated by LOD/cull), and write
-           the corrected mid/end back into the palette. */
+        /* Two-bone IK runs in the dedicated serial pass at the end of this
+           function (sr_apply_ik_constraints): it must execute AFTER the
+           parallel pose sample (Pass 2) has written this instance's palette,
+           and it covers the inline-sample overflow path above as well because
+           it iterates the entity list, not the reqs array. */
     }
 
     /* Pass 2: sample all deferred poses in parallel.  Each request targets a
@@ -1570,6 +2038,10 @@ static void sr_update_skinned_anims(JceSceneRenderer *sr, JceScene *scene,
             if (reqs[i].mode == 1)
                 sr_anim_events_advance(reqs[i].ai, reqs[i].ac);
     }
+
+    /* Pass 4 (serial): apply authored IK constraints on top of the sampled
+     * palettes, before the shadow/color passes consume them. */
+    sr_apply_ik_constraints(sr, scene, list);
 }
 
 /* If entity e is a skeletal-animator model, draw its skinned silhouette into
@@ -1589,10 +2061,8 @@ static bool sr_try_submit_skinned_shadow(JceSceneRenderer *sr, JceScene *scene,
 
     JceTransform *t = jce_scene_get_transform(scene, e);
     if (!t) return false;
-    float sx = (t->scale.x != 0.0f) ? t->scale.x : 1.0f;
-    float sy = (t->scale.y != 0.0f) ? t->scale.y : 1.0f;
-    float sz = (t->scale.z != 0.0f) ? t->scale.z : 1.0f;
-    jce_mat4 model = jce_m4_from_trs(t->position, t->rotation, jce_v3(sx, sy, sz));
+    jce_mat4 model = jce_m4_from_trs(t->position, t->rotation,
+                                     jce_v3_safe_scale(t->scale));
 
     SrAnimInstance *ai = sr_find_anim_instance(sr, (uint32_t)e);
     const jce_mat4 *pal = (ai && ai->skin_palette_count > 0) ? ai->skin_palette : NULL;
@@ -2176,6 +2646,374 @@ static bool sr_try_submit_terrain_shadow(JceSceneRenderer *sr, JceScene *scene,
     return true;
 }
 
+/* ── Tilemap chunked draw (P5-tilemap) ────────────────────────────────
+ *
+ * Clones the terrain slot-cache pattern for .tilemap.json assets: the map +
+ * its tileset load lazily on first sight (PAK-first → cbs.resolve_path →
+ * loose file), the grid is baked into 32x32-cell chunks of textured quads in
+ * ENTITY-LOCAL space (1 cell = 1 unit; cell (c,r) spans [c,c+1] x
+ * [-(r+1),-r] — rows grow down, matching the Tile Palette), and each visible
+ * chunk submits one draw through the textured mesh program with the entity
+ * world matrix as the transform.  The component tint is baked into the
+ * vertex color, so chunks rebuild when it changes. */
+
+/* Same pos3f/color4u8/uv2f vertex family as the sprite batch. */
+typedef struct {
+    float    x, y, z;
+    uint32_t abgr;
+    float    u, v;
+} SrTilemapVertex;
+
+/* Lazily create the shared vertex layout, quad index buffer and sampler. */
+static void sr_tilemap_lazy_init(JceSceneRenderer *sr)
+{
+    if (!sr->tilemap_layout_ready) {
+        bgfx_vertex_layout_begin(&sr->tilemap_layout, bgfx_get_renderer_type());
+        bgfx_vertex_layout_add(&sr->tilemap_layout, BGFX_ATTRIB_POSITION, 3,
+                               BGFX_ATTRIB_TYPE_FLOAT, false, false);
+        bgfx_vertex_layout_add(&sr->tilemap_layout, BGFX_ATTRIB_COLOR0, 4,
+                               BGFX_ATTRIB_TYPE_UINT8, true, false);
+        bgfx_vertex_layout_add(&sr->tilemap_layout, BGFX_ATTRIB_TEXCOORD0, 2,
+                               BGFX_ATTRIB_TYPE_FLOAT, false, false);
+        bgfx_vertex_layout_end(&sr->tilemap_layout);
+        sr->tilemap_layout_ready = true;
+    }
+    if (!BGFX_HANDLE_IS_VALID(sr->tilemap_shared_ib)) {
+        /* ONE shared static IB: the 0,1,2 / 0,2,3 quad pattern x 1024 quads
+         * (6144 u16).  Every chunk VB indexes a prefix of it. */
+        const uint32_t n = SR_TILEMAP_CHUNK_QUADS * 6;
+        const bgfx_memory_t *mem = bgfx_alloc(n * (uint32_t)sizeof(uint16_t));
+        if (mem) {
+            uint16_t *ib = (uint16_t *)mem->data;
+            for (uint32_t q = 0; q < SR_TILEMAP_CHUNK_QUADS; q++) {
+                uint16_t vi = (uint16_t)(q * 4);
+                ib[q * 6 + 0] = vi;
+                ib[q * 6 + 1] = (uint16_t)(vi + 1);
+                ib[q * 6 + 2] = (uint16_t)(vi + 2);
+                ib[q * 6 + 3] = vi;
+                ib[q * 6 + 4] = (uint16_t)(vi + 2);
+                ib[q * 6 + 5] = (uint16_t)(vi + 3);
+            }
+            sr->tilemap_shared_ib = bgfx_create_index_buffer(mem, BGFX_BUFFER_NONE);
+        }
+    }
+    if (!BGFX_HANDLE_IS_VALID(sr->tilemap_s_tex))
+        sr->tilemap_s_tex = bgfx_create_uniform("s_texColor",
+                                                BGFX_UNIFORM_TYPE_SAMPLER, 1);
+}
+
+/* Free one cache slot: chunk VBs + metadata arrays + the CPU assets. */
+static void sr_tilemap_free_slot(JceSceneRenderer *sr, int i)
+{
+    if (i < 0 || i >= SR_TILEMAP_SLOT_MAX) return;
+    if (!sr->tilemap_cache[i].used) {
+        memset(&sr->tilemap_cache[i], 0, sizeof sr->tilemap_cache[i]);
+        return;
+    }
+    if (sr->tilemap_cache[i].chunk_vb) {
+        for (int c = 0; c < sr->tilemap_cache[i].chunk_count; c++) {
+            if (BGFX_HANDLE_IS_VALID(sr->tilemap_cache[i].chunk_vb[c]))
+                bgfx_destroy_vertex_buffer(sr->tilemap_cache[i].chunk_vb[c]);
+        }
+        JCE_FREE(sr->tilemap_cache[i].chunk_vb);
+    }
+    if (sr->tilemap_cache[i].chunk_quads) JCE_FREE(sr->tilemap_cache[i].chunk_quads);
+    if (sr->tilemap_cache[i].chunk_min)   JCE_FREE(sr->tilemap_cache[i].chunk_min);
+    if (sr->tilemap_cache[i].chunk_max)   JCE_FREE(sr->tilemap_cache[i].chunk_max);
+    if (sr->tilemap_cache[i].map)         jce_tilemap_unload(sr->tilemap_cache[i].map);
+    if (sr->tilemap_cache[i].tileset)     jce_tileset_unload(sr->tilemap_cache[i].tileset);
+    memset(&sr->tilemap_cache[i], 0, sizeof sr->tilemap_cache[i]);
+}
+
+/* Find (or lazily load) the tilemap cache slot for the component's
+ * tilemap_path, loading the map + its tileset and initialising the chunk
+ * grid metadata on first load.  Returns the slot index, or -1 on failure. */
+static int sr_tilemap_find_or_load_slot(JceSceneRenderer *sr,
+                                        const JceTilemapComponent *tmc)
+{
+    if (!sr || !tmc || !tmc->tilemap_path[0]) return -1;
+    const char *path = tmc->tilemap_path;
+
+    int slot = -1, free_slot = -1;
+    for (int i = 0; i < SR_TILEMAP_SLOT_MAX; i++) {
+        if (sr->tilemap_cache[i].used &&
+            strncmp(sr->tilemap_cache[i].path, path,
+                    sizeof sr->tilemap_cache[i].path) == 0) {
+            slot = i; break;
+        }
+        if (!sr->tilemap_cache[i].used && free_slot < 0) free_slot = i;
+    }
+    if (slot >= 0)
+        return sr->tilemap_cache[slot].failed ? -1 : slot;
+    if (free_slot < 0) return -1;
+
+    slot = free_slot;
+    memset(&sr->tilemap_cache[slot], 0, sizeof sr->tilemap_cache[slot]);
+    jce_strlcpy(sr->tilemap_cache[slot].path, path,
+                sizeof sr->tilemap_cache[slot].path);
+    sr->tilemap_cache[slot].used = true;
+
+    /* PAK-first (deployed bundles overlay sr->pak), then the host-resolved
+     * path (editor), then the raw path (loose files). */
+    JceTilemapAsset *map = jce_tilemap_load_from_pak(sr->pak, path);
+    char        resolved[1024];
+    const char *load_path = path;
+    if (!map) {
+        if (sr->has_cbs && sr->cbs.resolve_path &&
+            sr->cbs.resolve_path(path, resolved, (int)sizeof(resolved),
+                                 sr->cbs.userdata)) {
+            load_path = resolved;
+        }
+        map = jce_tilemap_load_file(load_path);
+    }
+    if (!map) {
+        sr->tilemap_cache[slot].failed = true;
+        LOG_WARN(LOG_TAG, "tilemap load failed: '%s' (from '%s')",
+                 load_path, path);
+        return -1;
+    }
+    sr->tilemap_cache[slot].map = map;
+
+    /* Tileset: the map's authored "sprites" key wins; the component's
+     * sprites_path is the fallback.  A missing tileset is tolerated — the
+     * map loads but renders nothing (every tile_uv lookup fails). */
+    const char *ts_path = jce_tilemap_sprites_path(map);
+    if (!ts_path || !ts_path[0]) ts_path = tmc->sprites_path;
+    if (ts_path && ts_path[0]) {
+        jce_strlcpy(sr->tilemap_cache[slot].tileset_path, ts_path,
+                    sizeof sr->tilemap_cache[slot].tileset_path);
+        JceTilesetAsset *ts = jce_tileset_load_from_pak(sr->pak, ts_path);
+        if (!ts) {
+            const char *ts_load = ts_path;
+            if (sr->has_cbs && sr->cbs.resolve_path &&
+                sr->cbs.resolve_path(ts_path, resolved, (int)sizeof(resolved),
+                                     sr->cbs.userdata)) {
+                ts_load = resolved;
+            }
+            ts = jce_tileset_load_file(ts_load);
+        }
+        if (!ts)
+            LOG_WARN(LOG_TAG, "tileset load failed: '%s' (tilemap '%s')",
+                     ts_path, path);
+        sr->tilemap_cache[slot].tileset = ts;
+    } else {
+        LOG_WARN(LOG_TAG, "tilemap '%s' has no tileset (sprites) path", path);
+    }
+
+    /* Chunk grid metadata (VBs are baked on first draw). */
+    uint32_t w = jce_tilemap_width(map);
+    uint32_t h = jce_tilemap_height(map);
+    int ncx = (int)((w + SR_TILEMAP_CHUNK_DIM - 1) / SR_TILEMAP_CHUNK_DIM);
+    int ncy = (int)((h + SR_TILEMAP_CHUNK_DIM - 1) / SR_TILEMAP_CHUNK_DIM);
+    int n   = ncx * ncy;
+    if (n > 0) {
+        sr->tilemap_cache[slot].chunk_vb = (bgfx_vertex_buffer_handle_t *)
+            JCE_MALLOC(sizeof(bgfx_vertex_buffer_handle_t) * (size_t)n);
+        sr->tilemap_cache[slot].chunk_quads =
+            (uint16_t *)JCE_CALLOC((size_t)n, sizeof(uint16_t));
+        sr->tilemap_cache[slot].chunk_min =
+            (jce_vec3 *)JCE_CALLOC((size_t)n, sizeof(jce_vec3));
+        sr->tilemap_cache[slot].chunk_max =
+            (jce_vec3 *)JCE_CALLOC((size_t)n, sizeof(jce_vec3));
+        if (!sr->tilemap_cache[slot].chunk_vb ||
+            !sr->tilemap_cache[slot].chunk_quads ||
+            !sr->tilemap_cache[slot].chunk_min ||
+            !sr->tilemap_cache[slot].chunk_max) {
+            sr->tilemap_cache[slot].chunk_count = 0;
+            sr->tilemap_cache[slot].failed = true;
+            return -1;   /* arrays freed by sr_tilemap_free_slot at destroy */
+        }
+        for (int c = 0; c < n; c++)
+            sr->tilemap_cache[slot].chunk_vb[c].idx = UINT16_MAX;
+    }
+    sr->tilemap_cache[slot].chunk_nx    = ncx;
+    sr->tilemap_cache[slot].chunk_ny    = ncy;
+    sr->tilemap_cache[slot].chunk_count = n;
+    return slot;
+}
+
+static uint32_t sr_tilemap_color_abgr(const float c[4])
+{
+    float r = c[0], g = c[1], b = c[2], a = c[3];
+    if (r < 0.0f) r = 0.0f; if (r > 1.0f) r = 1.0f;
+    if (g < 0.0f) g = 0.0f; if (g > 1.0f) g = 1.0f;
+    if (b < 0.0f) b = 0.0f; if (b > 1.0f) b = 1.0f;
+    if (a < 0.0f) a = 0.0f; if (a > 1.0f) a = 1.0f;
+    return ((uint32_t)(uint8_t)(a * 255.0f) << 24)
+         | ((uint32_t)(uint8_t)(b * 255.0f) << 16)
+         | ((uint32_t)(uint8_t)(g * 255.0f) << 8)
+         |  (uint32_t)(uint8_t)(r * 255.0f);
+}
+
+/* Bake (or re-bake when the tint changed) every chunk's static VB.  Empty
+ * cells are skipped; an all-empty chunk gets no VB at all. */
+static void sr_tilemap_build_chunks(JceSceneRenderer *sr, int slot, uint32_t abgr)
+{
+    if (slot < 0 || slot >= SR_TILEMAP_SLOT_MAX) return;
+    if (sr->tilemap_cache[slot].chunks_built &&
+        sr->tilemap_cache[slot].baked_abgr == abgr)
+        return;
+
+    sr_tilemap_lazy_init(sr);
+
+    JceTilemapAsset *map = sr->tilemap_cache[slot].map;
+    JceTilesetAsset *ts  = sr->tilemap_cache[slot].tileset;
+    if (!map || sr->tilemap_cache[slot].chunk_count <= 0) {
+        sr->tilemap_cache[slot].baked_abgr   = abgr;
+        sr->tilemap_cache[slot].chunks_built = true;
+        return;
+    }
+
+    SrTilemapVertex *verts = (SrTilemapVertex *)
+        JCE_MALLOC(sizeof(SrTilemapVertex) * SR_TILEMAP_CHUNK_QUADS * 4);
+    if (!verts) return;
+
+    uint32_t w = jce_tilemap_width(map);
+    uint32_t h = jce_tilemap_height(map);
+    int ncx = sr->tilemap_cache[slot].chunk_nx;
+    int ncy = sr->tilemap_cache[slot].chunk_ny;
+
+    for (int cy = 0; cy < ncy; cy++)
+    for (int cx = 0; cx < ncx; cx++) {
+        int idx = cy * ncx + cx;
+
+        /* Tint re-bake: drop the old VB. */
+        if (BGFX_HANDLE_IS_VALID(sr->tilemap_cache[slot].chunk_vb[idx])) {
+            bgfx_destroy_vertex_buffer(sr->tilemap_cache[slot].chunk_vb[idx]);
+            sr->tilemap_cache[slot].chunk_vb[idx].idx = UINT16_MAX;
+        }
+        sr->tilemap_cache[slot].chunk_quads[idx] = 0;
+
+        uint32_t col0 = (uint32_t)cx * SR_TILEMAP_CHUNK_DIM;
+        uint32_t row0 = (uint32_t)cy * SR_TILEMAP_CHUNK_DIM;
+        uint32_t col1 = col0 + SR_TILEMAP_CHUNK_DIM; if (col1 > w) col1 = w;
+        uint32_t row1 = row0 + SR_TILEMAP_CHUNK_DIM; if (row1 > h) row1 = h;
+
+        /* Chunk-extent local AABB (conservative: ignores empty cells). */
+        sr->tilemap_cache[slot].chunk_min[idx] =
+            jce_v3((float)col0, -(float)row1, 0.0f);
+        sr->tilemap_cache[slot].chunk_max[idx] =
+            jce_v3((float)col1, -(float)row0, 0.0f);
+
+        uint32_t quads = 0;
+        for (uint32_t row = row0; row < row1; row++)
+        for (uint32_t col = col0; col < col1; col++) {
+            uint32_t id = jce_tilemap_tile_at(map, col, row);
+            if (id == 0) continue;
+            float u0, v0, u1, v1;
+            if (!jce_tileset_tile_uv(ts, id, &u0, &v0, &u1, &v1)) {
+                /* Distinguish the two warn-once cases: out-of-range id vs
+                 * an unsized atlas (sourceW/H <= 0).  Either way the cell
+                 * renders as empty. */
+                if (ts && id > jce_tileset_rect_count(ts)) {
+                    if (!sr->tilemap_cache[slot].warned_bad_id) {
+                        LOG_WARN(LOG_TAG, "tilemap '%s': tile id %u exceeds "
+                                 "tileset rect count %u; treating as empty",
+                                 sr->tilemap_cache[slot].path, id,
+                                 jce_tileset_rect_count(ts));
+                        sr->tilemap_cache[slot].warned_bad_id = true;
+                    }
+                } else if (ts && !sr->tilemap_cache[slot].warned_src) {
+                    LOG_WARN(LOG_TAG, "tileset '%s': sourceW/H not set; "
+                             "tilemap '%s' renders nothing",
+                             sr->tilemap_cache[slot].tileset_path,
+                             sr->tilemap_cache[slot].path);
+                    sr->tilemap_cache[slot].warned_src = true;
+                }
+                continue;
+            }
+
+            float x0 = (float)col, x1 = (float)(col + 1);
+            float yt = -(float)row, yb = -(float)(row + 1);
+            SrTilemapVertex *q = &verts[quads * 4];
+            /* Matches the sprite batch quad: BL, BR, TR, TL with the
+             * texture's top row (v0) on the tile's top edge. */
+            q[0].x = x0; q[0].y = yb; q[0].z = 0.0f; q[0].abgr = abgr; q[0].u = u0; q[0].v = v1;
+            q[1].x = x1; q[1].y = yb; q[1].z = 0.0f; q[1].abgr = abgr; q[1].u = u1; q[1].v = v1;
+            q[2].x = x1; q[2].y = yt; q[2].z = 0.0f; q[2].abgr = abgr; q[2].u = u1; q[2].v = v0;
+            q[3].x = x0; q[3].y = yt; q[3].z = 0.0f; q[3].abgr = abgr; q[3].u = u0; q[3].v = v0;
+            quads++;
+        }
+
+        if (quads > 0) {
+            const bgfx_memory_t *mem = bgfx_copy(
+                verts, quads * 4 * (uint32_t)sizeof(SrTilemapVertex));
+            sr->tilemap_cache[slot].chunk_vb[idx] =
+                bgfx_create_vertex_buffer(mem, &sr->tilemap_layout,
+                                          BGFX_BUFFER_NONE);
+            sr->tilemap_cache[slot].chunk_quads[idx] = (uint16_t)quads;
+        }
+    }
+
+    JCE_FREE(verts);
+    sr->tilemap_cache[slot].baked_abgr   = abgr;
+    sr->tilemap_cache[slot].chunks_built = true;
+}
+
+/* Submit every visible chunk of one tilemap entity (per-chunk AABB-vs-frustum
+ * culling like terrain; the entity-level cull is bypassed by the caller). */
+static void sr_draw_tilemap_chunks(JceSceneRenderer *sr, int slot,
+                                   const JceCamera *camera, uint16_t view_id,
+                                   const jce_mat4 *model)
+{
+    if (!sr || slot < 0 || slot >= SR_TILEMAP_SLOT_MAX) return;
+    if (sr->tilemap_cache[slot].chunk_count <= 0) return;
+    if (!BGFX_HANDLE_IS_VALID(sr->tilemap_shared_ib)) return;
+
+    JceShaderHandle sh = jce_renderer_get_program_mesh(sr->renderer);
+    bgfx_program_handle_t prog;
+    prog.idx = sh.idx;
+    if (!BGFX_HANDLE_IS_VALID(prog)) return;
+
+    /* Atlas texture (async cache; white fallback while loading/missing). */
+    bgfx_texture_handle_t tex = sr->white_tex;
+    if (sr->tilemap_cache[slot].tileset) {
+        const char *img =
+            jce_tileset_image_path(sr->tilemap_cache[slot].tileset);
+        if (img && img[0]) {
+            JceTexture t = sr_resolve_texture(sr, img);
+            if (jce_texture_valid(t)) tex.idx = t.idx;
+        }
+    }
+
+    jce_vec4 planes[6];
+    bool have_planes = false;
+    if (camera) {
+        const jce_mat4 v  = jce_camera_view(camera);
+        const jce_mat4 p  = jce_camera_proj(camera, 16.0f / 9.0f,
+                                            sr->homogeneous_depth);
+        const jce_mat4 vp = jce_m4_multiply(&p, &v);
+        sr_extract_frustum_planes(&vp, planes);
+        have_planes = true;
+    }
+
+    const uint64_t state = BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                         | BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
+                         | BGFX_STATE_BLEND_ALPHA;
+
+    for (int c = 0; c < sr->tilemap_cache[slot].chunk_count; c++) {
+        uint16_t quads = sr->tilemap_cache[slot].chunk_quads[c];
+        if (quads == 0) continue;
+        bgfx_vertex_buffer_handle_t vb = sr->tilemap_cache[slot].chunk_vb[c];
+        if (!BGFX_HANDLE_IS_VALID(vb)) continue;
+
+        if (have_planes) {
+            jce_vec3 wmn, wmx;
+            sr_transform_aabb(model, sr->tilemap_cache[slot].chunk_min[c],
+                              sr->tilemap_cache[slot].chunk_max[c],
+                              &wmn, &wmx);
+            if (!sr_aabb_in_frustum(planes, wmn, wmx)) continue;
+        }
+
+        bgfx_set_transform(model->raw[0], 1);
+        bgfx_set_vertex_buffer(0, vb, 0, (uint32_t)quads * 4u);
+        bgfx_set_index_buffer(sr->tilemap_shared_ib, 0, (uint32_t)quads * 6u);
+        bgfx_set_texture(0, sr->tilemap_s_tex, tex, UINT32_MAX);
+        bgfx_set_state(state, 0);
+        bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+    }
+}
+
 /* Per-renderer "Cast Shadows" (Unity-style): an entity whose MeshRenderer has
  * shadow_cast_off set is skipped by EVERY shadow producer pass (CSM/dir +
  * local atlas). Entities without a MeshRenderer keep the default (cast on). */
@@ -2420,6 +3258,7 @@ static void sr_apply_view_order(uint16_t view_id_base,
             cfg && cfg->draw_shadows,
             cascades,
             include_fog_views,
+            jce_render_pipeline_is_feature_enabled("gpu_particles"),
             &order))
         return;
 
@@ -4127,6 +4966,35 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
             continue;  /* terrain fully handled (or skipped) */
         }
 
+        /* ── Tilemap path (P5-tilemap) ───────────────────────────────
+         * Drawn chunk-by-chunk with its OWN per-chunk frustum culling
+         * (the entity-level position+scale AABB is meaningless for a
+         * large grid whose origin may sit off-screen), so like terrain
+         * it bypasses the generic visibility check. */
+        if (cfg->draw_sprites && jce_scene_has_tilemap(scene, e) &&
+            jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_TILEMAP)) {
+            JceTilemapComponent *tmc = jce_scene_get_tilemap(scene, e);
+            if (tmc && tmc->visible && tmc->tilemap_path[0] &&
+                jce_scene_has_transform(scene, e)) {
+                int tslot = sr_tilemap_find_or_load_slot(sr, tmc);
+                if (tslot >= 0) {
+                    if (tmc->orientation != 0 &&
+                        !sr->tilemap_cache[tslot].warned_iso) {
+                        LOG_WARN(LOG_TAG, "tilemap '%s': isometric "
+                                 "orientation not implemented; rendering "
+                                 "orthogonal", tmc->tilemap_path);
+                        sr->tilemap_cache[tslot].warned_iso = true;
+                    }
+                    sr_tilemap_build_chunks(sr, tslot,
+                                            sr_tilemap_color_abgr(tmc->color));
+                    jce_mat4 tmodel = jce_scene_get_world_matrix(scene, e);
+                    sr_draw_tilemap_chunks(sr, tslot, camera, view_id,
+                                           &tmodel);
+                }
+                continue;  /* tilemap fully handled (or skipped) */
+            }
+        }
+
         if (!visible[i]) continue;
 
         jce_mat4 model;
@@ -4586,49 +5454,42 @@ static void sr_draw_entities(JceSceneRenderer *sr, JceScene *scene,
  * once jce_render_queue starts a new material run. Wired into the queue
  * in Phase 3. */
 
-static uint32_t sr_fnv1a_step(uint32_t h, const void *data, size_t n)
-{
-    const uint8_t *p = (const uint8_t *)data;
-    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
-    return h;
-}
-
 static uint32_t sr_compute_material_key(const JcePbrMaterial *pbr,
                                         bool is_terrain,
                                         int terrain_slot,
                                         const bgfx_texture_handle_t *terrain_layer_tex)
 {
-    uint32_t h = 2166136261u;
+    uint32_t h = JCE_FNV1A32_INIT;
     /* Texture handles (idx is enough — invalid = UINT16_MAX). */
-    h = sr_fnv1a_step(h, &pbr->albedo_map.idx,             sizeof(uint16_t));
-    h = sr_fnv1a_step(h, &pbr->metallic_roughness_map.idx, sizeof(uint16_t));
-    h = sr_fnv1a_step(h, &pbr->normal_map.idx,             sizeof(uint16_t));
-    h = sr_fnv1a_step(h, &pbr->ao_map.idx,                 sizeof(uint16_t));
-    h = sr_fnv1a_step(h, &pbr->emissive_map.idx,           sizeof(uint16_t));
+    h = jce_fnv1a32_append(h, &pbr->albedo_map.idx,             sizeof(uint16_t));
+    h = jce_fnv1a32_append(h, &pbr->metallic_roughness_map.idx, sizeof(uint16_t));
+    h = jce_fnv1a32_append(h, &pbr->normal_map.idx,             sizeof(uint16_t));
+    h = jce_fnv1a32_append(h, &pbr->ao_map.idx,                 sizeof(uint16_t));
+    h = jce_fnv1a32_append(h, &pbr->emissive_map.idx,           sizeof(uint16_t));
     /* Factors. */
-    h = sr_fnv1a_step(h, pbr->base_color_factor, sizeof(pbr->base_color_factor));
-    h = sr_fnv1a_step(h, &pbr->metallic_factor,  sizeof(float));
-    h = sr_fnv1a_step(h, &pbr->roughness_factor, sizeof(float));
-    h = sr_fnv1a_step(h, pbr->emissive_factor,   sizeof(pbr->emissive_factor));
-    h = sr_fnv1a_step(h, &pbr->normal_scale,     sizeof(float));
-    h = sr_fnv1a_step(h, &pbr->ao_strength,      sizeof(float));
+    h = jce_fnv1a32_append(h, pbr->base_color_factor, sizeof(pbr->base_color_factor));
+    h = jce_fnv1a32_append(h, &pbr->metallic_factor,  sizeof(float));
+    h = jce_fnv1a32_append(h, &pbr->roughness_factor, sizeof(float));
+    h = jce_fnv1a32_append(h, pbr->emissive_factor,   sizeof(pbr->emissive_factor));
+    h = jce_fnv1a32_append(h, &pbr->normal_scale,     sizeof(float));
+    h = jce_fnv1a32_append(h, &pbr->ao_strength,      sizeof(float));
     /* State. */
     uint32_t am = (uint32_t)pbr->alpha_mode;
-    h = sr_fnv1a_step(h, &am,                  sizeof(am));
-    h = sr_fnv1a_step(h, &pbr->alpha_cutoff,   sizeof(float));
+    h = jce_fnv1a32_append(h, &am,                  sizeof(am));
+    h = jce_fnv1a32_append(h, &pbr->alpha_cutoff,   sizeof(float));
     uint8_t ds = pbr->double_sided ? 1u : 0u;
-    h = sr_fnv1a_step(h, &ds,                  sizeof(ds));
+    h = jce_fnv1a32_append(h, &ds,                  sizeof(ds));
     /* Terrain pseudo-fields (slot ensures distinct splat/layer textures). */
     uint8_t it = is_terrain ? 1u : 0u;
-    h = sr_fnv1a_step(h, &it, sizeof(it));
+    h = jce_fnv1a32_append(h, &it, sizeof(it));
     int32_t ts = (int32_t)terrain_slot;
-    h = sr_fnv1a_step(h, &ts, sizeof(ts));
+    h = jce_fnv1a32_append(h, &ts, sizeof(ts));
     /* Terrain layer texture handles also folded in so two terrain entities
      * with the same slot but different runtime layer textures still split
      * into separate batches (rare today, but keeps key correctness). */
     if (terrain_layer_tex) {
         for (int li = 0; li < 4; li++)
-            h = sr_fnv1a_step(h, &terrain_layer_tex[li].idx, sizeof(uint16_t));
+            h = jce_fnv1a32_append(h, &terrain_layer_tex[li].idx, sizeof(uint16_t));
     }
     return h ? h : 1u;
 }
@@ -4891,6 +5752,8 @@ JceSceneRenderer *jce_scene_renderer_create(JceRenderer *renderer,
     sr->u_gi_params.idx      = UINT16_MAX;
     sr->gi_probe_spec.idx    = UINT16_MAX;
     sr->gi_probe_irr.idx     = UINT16_MAX;
+    sr->tilemap_shared_ib.idx = UINT16_MAX;
+    sr->tilemap_s_tex.idx     = UINT16_MAX;
     for (uint32_t i = 0; i < JCE_CSM_MAX_CASCADES; i++) {
         sr->csm_tex[i].idx = UINT16_MAX;
         sr->csm_fbo[i].idx = UINT16_MAX;
@@ -5290,6 +6153,14 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
             bgfx_destroy_texture(sr->terrain_cache[i].splat_tex);
         sr->terrain_cache[i].used = false;
     }
+    /* Tilemap cache (chunk VBs + CPU assets) + shared IB/sampler. */
+    for (int i = 0; i < SR_TILEMAP_SLOT_MAX; i++)
+        sr_tilemap_free_slot(sr, i);
+    if (BGFX_HANDLE_IS_VALID(sr->tilemap_shared_ib))
+        bgfx_destroy_index_buffer(sr->tilemap_shared_ib);
+    if (BGFX_HANDLE_IS_VALID(sr->tilemap_s_tex))
+        bgfx_destroy_uniform(sr->tilemap_s_tex);
+
     if (BGFX_HANDLE_IS_VALID(sr->u_terrain_params)) bgfx_destroy_uniform(sr->u_terrain_params);
     if (BGFX_HANDLE_IS_VALID(sr->s_terrain_splat))  bgfx_destroy_uniform(sr->s_terrain_splat);
     if (BGFX_HANDLE_IS_VALID(sr->s_terrain_layer1)) bgfx_destroy_uniform(sr->s_terrain_layer1);
@@ -5343,6 +6214,14 @@ void jce_scene_renderer_destroy(JceSceneRenderer *sr)
     if (sr->weather)         jce_weather_destroy(sr->weather);
     if (sr->decals)          jce_decals_destroy(sr->decals);
     if (sr->decals_authored) jce_decals_destroy(sr->decals_authored);
+
+    /* GPU particle pools (one per GPU-flagged emitter). */
+    for (int i = 0; i < SR_GPU_PARTICLE_MAX; i++) {
+        if (sr->gpu_particles[i].sys)
+            jce_gpu_particles_destroy(sr->gpu_particles[i].sys);
+        sr->gpu_particles[i].sys  = NULL;
+        sr->gpu_particles[i].used = false;
+    }
 
     if (BGFX_HANDLE_IS_VALID(sr->brdf_lut))         bgfx_destroy_texture(sr->brdf_lut);
     if (BGFX_HANDLE_IS_VALID(sr->u_ibl_irradiance)) bgfx_destroy_uniform(sr->u_ibl_irradiance);
@@ -5411,6 +6290,9 @@ static void sr_particle_each_entity(JceScene *s, JceEntity e, void *ud)
     JceParticleEmitterComponent *c = jce_scene_get_particle_emitter(s, e);
     if (!c || !c->loaded || c->emitter_handle_idx == UINT32_MAX) return;
     if (!jce_scene_component_enabled(s, e, JCE_COMP_FLAG_PARTICLE_EMITTER)) return;
+    /* GPU-routed emitters render through sr_drive_gpu_particles (instanced
+     * billboards), not the CPU debug-cross path. */
+    if (jce_scene_particle_emitter_uses_gpu(c)) return;
     JceEmitterHandle h = { c->emitter_handle_idx };
     jce_particles_emitter_for_each(ctx->sys, h, sr_particle_visit, NULL);
 }
@@ -5425,6 +6307,166 @@ static void sr_draw_particles(JceSceneRenderer *sr, JceScene *scene,
     SrParticleEachCtx ctx = { sys, scene };
     jce_scene_each_entity(scene, sr_particle_each_entity, &ctx);
     jce_debug_draw_flush(view_id, sr->renderer);
+}
+
+/* ── GPU particles (compute-driven; P3-E wiring) ──────────────────────
+ *
+ * Drives one JceGpuParticleSystem per GPU-flagged JceParticleEmitterComponent
+ * (routing predicate shared with jce_scene_particles.c, which suppresses the
+ * CPU emitter for the same component).  Per frame and per emitter: one
+ * simulate+emit dispatch on the dedicated compute view (base+9, ordered
+ * before the color view) and one instanced billboard draw into the color
+ * view at the same transparency position as the CPU debug draw.
+ *
+ * KNOWN semantic divergences from the CPU path (by design of the compute
+ * backend): always world-space, procedural soft-circle sprite (the authored
+ * texture and world_space=false are ignored), additive blend. */
+
+typedef struct {
+    JceSceneRenderer *sr;
+    uint16_t          compute_view;  /* base+9: dispatches only            */
+    uint16_t          color_view;    /* base+0: instanced billboard draw   */
+    float             dt;
+    bool              dispatch;      /* false on 2nd+ render of a bgfx frame */
+} SrGpuParticleCtx;
+
+static SrGpuParticleRec *sr_gpu_particle_find_or_add(JceSceneRenderer *sr,
+                                                     JceEntity e)
+{
+    SrGpuParticleRec *free_rec = NULL;
+    for (int i = 0; i < SR_GPU_PARTICLE_MAX; i++) {
+        SrGpuParticleRec *r = &sr->gpu_particles[i];
+        if (r->used && r->entity == e) return r;
+        if (!r->used && !free_rec) free_rec = r;
+    }
+    if (free_rec) {
+        memset(free_rec, 0, sizeof(*free_rec));
+        free_rec->entity = e;
+        free_rec->used   = true;
+    }
+    return free_rec;   /* NULL when the table is full (emitter skipped) */
+}
+
+static void sr_gpu_particle_each(JceScene *s, JceEntity e, void *ud)
+{
+    SrGpuParticleCtx *ctx = (SrGpuParticleCtx *)ud;
+    JceSceneRenderer *sr  = ctx->sr;
+
+    JceParticleEmitterComponent *c = jce_scene_get_particle_emitter(s, e);
+    if (!c) return;
+    if (!jce_scene_component_enabled(s, e, JCE_COMP_FLAG_PARTICLE_EMITTER)) return;
+    if (!jce_scene_particle_emitter_uses_gpu(c)) return;
+
+    SrGpuParticleRec *rec = sr_gpu_particle_find_or_add(sr, e);
+    if (!rec) return;
+
+    /* Authoring edits (asset path / quick-tune / gpu flag) rebuild the pool
+     * so a changed max_particles takes effect. */
+    uint64_t epoch = jce_scene_particle_emitter_epoch(c);
+    if (rec->sys && rec->epoch != epoch) {
+        jce_gpu_particles_destroy(rec->sys);
+        rec->sys        = NULL;
+        rec->emit_accum = 0.0f;
+        rec->burst_done = false;
+    }
+
+    if (!rec->sys) {
+        jce_scene_particle_emitter_desc(c, &rec->desc);
+        JceGpuParticleSystemDesc d;
+        d.max_particles = rec->desc.max_particles;
+        d.pak           = sr->pak;
+        rec->sys = jce_gpu_particles_create(&d, jce_allocator_default());
+        if (!rec->sys || !jce_gpu_particles_is_supported(rec->sys)) {
+            /* Caps lied or shaders missing: latch CPU-forever (logs once)
+             * and release the slot — sp_each re-grows a CPU emitter next
+             * scene tick because the predicate now fails. */
+            if (rec->sys) jce_gpu_particles_destroy(rec->sys);
+            memset(rec, 0, sizeof(*rec));
+            jce_scene_internal_gpu_particles_set_blocked();
+            return;
+        }
+        rec->epoch = epoch;
+    }
+
+    rec->referenced = true;
+
+    if (ctx->dispatch) {
+        const JceParticleEmitterDesc *d = &rec->desc;
+
+        /* Rate emission with fractional carry (+ the one-shot burst). */
+        rec->emit_accum += d->emit_rate * ctx->dt;
+        uint32_t n = (uint32_t)rec->emit_accum;
+        rec->emit_accum -= (float)n;
+        if (!rec->burst_done) {
+            if (d->emit_burst > 0.0f) n += (uint32_t)(d->emit_burst + 0.5f);
+            rec->burst_done = true;
+        }
+
+        jce_mat4 w = jce_scene_get_world_matrix(s, e);
+
+        JceGpuParticleEmitConfig cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.emit_count   = n;
+        cfg.origin       = jce_v3(w.raw[3][0], w.raw[3][1], w.raw[3][2]);
+        cfg.velocity_min = d->velocity_min;
+        cfg.velocity_max = d->velocity_max;
+        cfg.lifetime_min = d->lifetime_min;
+        cfg.lifetime_max = d->lifetime_max;
+        cfg.size_start   = d->size_start;
+        cfg.size_end     = d->size_end;
+        cfg.color_start  = d->color_start;
+        cfg.color_end    = d->color_end;
+        cfg.gravity      = d->gravity;
+        cfg.damping      = 0.0f;   /* no CPU-desc counterpart */
+
+        jce_gpu_particles_update(rec->sys, ctx->compute_view, ctx->dt, &cfg);
+    }
+
+    jce_gpu_particles_render(rec->sys, ctx->color_view);
+}
+
+static void sr_drive_gpu_particles(JceSceneRenderer *sr, JceScene *scene,
+                                   uint16_t view_id_base, float dt_sec)
+{
+    if (!sr || !scene) return;
+
+    /* Un-mark first so the sweep also runs when the feature toggles off
+     * (deferred pipeline toggle frees every pool next frame). */
+    for (int i = 0; i < SR_GPU_PARTICLE_MAX; i++)
+        sr->gpu_particles[i].referenced = false;
+
+    if (sr->pak && jce_render_pipeline_is_feature_enabled("gpu_particles")) {
+        /* Multi-viewport guard: the editor renders the scene more than once
+         * per bgfx frame (scene view + game view); simulate/emit only on the
+         * first render so dt is not applied twice. */
+        uint32_t fi = jce_renderer_get_frame_index(sr->renderer);
+        bool dispatch = !(sr->gpu_particle_frame_valid &&
+                          sr->gpu_particle_frame == fi);
+
+        if (dt_sec > 0.1f) dt_sec = 0.1f;   /* clamp long frames (CPU parity) */
+
+        SrGpuParticleCtx ctx;
+        ctx.sr           = sr;
+        ctx.compute_view = (uint16_t)(view_id_base + JCE_VIEW_GPU_PARTICLE_OFFSET);
+        ctx.color_view   = view_id_base;
+        ctx.dt           = dt_sec;
+        ctx.dispatch     = dispatch;
+        jce_scene_each_entity(scene, sr_gpu_particle_each, &ctx);
+
+        if (dispatch) {
+            sr->gpu_particle_frame       = fi;
+            sr->gpu_particle_frame_valid = true;
+        }
+    }
+
+    /* Sweep: records whose entity vanished, toggled back to CPU, or whose
+     * feature flag turned off are destroyed here. */
+    for (int i = 0; i < SR_GPU_PARTICLE_MAX; i++) {
+        SrGpuParticleRec *r = &sr->gpu_particles[i];
+        if (!r->used || r->referenced) continue;
+        if (r->sys) jce_gpu_particles_destroy(r->sys);
+        memset(r, 0, sizeof(*r));
+    }
 }
 
 /* ── Time-of-day / weather / decals (P2-weather-decals-tod) ───────────
@@ -5609,6 +6651,8 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
      * bgfx accepts repeat sets; names persist for the lifetime of the
      * view ID, so this is effectively cheap. */
     bgfx_set_view_name(view_id_base,                           "Scene/Color",        INT32_MAX);
+    bgfx_set_view_name((uint16_t)(view_id_base + JCE_VIEW_GPU_PARTICLE_OFFSET),
+                                                               "Scene/ParticleCS",   INT32_MAX);
     bgfx_set_view_name((uint16_t)(view_id_base + 10),          "Scene/ShadowSimple", INT32_MAX);
     for (uint16_t c = 0; c < JCE_CSM_MAX_CASCADES; ++c) {
         char nm[32];
@@ -5826,6 +6870,11 @@ uint16_t jce_scene_renderer_render(JceSceneRenderer *sr, JceScene *scene,
      * jce_scene_particles_update) as depth-tested debug billboards. */
     sr_draw_particles(sr, scene, view_id_base);
 
+    /* GPU-flagged emitters: compute simulate/emit on base+9 (ordered before
+     * the color view) + one instanced billboard draw per pool, at the same
+     * transparency position as the CPU particle pass above. */
+    sr_drive_gpu_particles(sr, scene, view_id_base, dt_sec);
+
     /* Decals (P2-weather-decals-tod): depth-tested projected quads from
      * authored JceDecalComponent projectors + runtime-stamped decals.  Drawn
      * after opaque geometry so they composite over the surfaces they hug. */
@@ -5976,6 +7025,20 @@ void jce_scene_renderer_invalidate_terrain(JceSceneRenderer *sr,
         if (BGFX_HANDLE_IS_VALID(sr->terrain_cache[i].splat_tex))
             bgfx_destroy_texture(sr->terrain_cache[i].splat_tex);
         memset(&sr->terrain_cache[i], 0, sizeof sr->terrain_cache[i]);
+    }
+}
+
+void jce_scene_renderer_invalidate_tilemap(JceSceneRenderer *sr,
+                                            const char *path)
+{
+    if (!sr) return;
+    for (int i = 0; i < SR_TILEMAP_SLOT_MAX; i++) {
+        if (!sr->tilemap_cache[i].used) continue;
+        if (path && *path &&
+            strncmp(sr->tilemap_cache[i].path, path,
+                    sizeof sr->tilemap_cache[i].path) != 0)
+            continue;
+        sr_tilemap_free_slot(sr, i);
     }
 }
 

@@ -77,6 +77,7 @@ void draw_comp_collider2d(JceCollider2DComponent *cd)
 
 void draw_comp_joint2d(JceJoint2DComponent *j)
 {
+    insp_unwired_badge();
     if (!j) return;
     static const char *kinds[] = { "Distance", "Hinge", "Spring" };
     int k = j->kind; if (k < 0 || k > 2) k = 0;

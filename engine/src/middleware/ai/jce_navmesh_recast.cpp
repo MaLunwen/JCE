@@ -556,6 +556,28 @@ extern "C" bool jce_recast_snap_to_navmesh(const JceRecastNavMesh *nm,
     return true;
 }
 
+extern "C" int jce_recast_debug_edges(const JceRecastNavMesh *nm,
+                                        JceRecastEdgeFn fn, void *user)
+{
+    if (!nm || !nm->nav || !fn) return 0;
+    int emitted = 0;
+    for (int t = 0; t < nm->nav->getMaxTiles(); ++t) {
+        const dtMeshTile *tile = ((const dtNavMesh *)nm->nav)->getTile(t);
+        if (!tile || !tile->header) continue;
+        for (int p = 0; p < tile->header->polyCount; ++p) {
+            const dtPoly *poly = &tile->polys[p];
+            if (poly->getType() != DT_POLYTYPE_GROUND) continue;
+            for (int j = 0; j < (int)poly->vertCount; ++j) {
+                const float *a = &tile->verts[poly->verts[j] * 3];
+                const float *b = &tile->verts[poly->verts[(j + 1) % poly->vertCount] * 3];
+                fn(user, a, b, poly->neis[j] == 0);
+                ++emitted;
+            }
+        }
+    }
+    return emitted;
+}
+
 extern "C" void jce_recast_get_stats(const JceRecastNavMesh *nm,
                                        JceRecastStats *out_stats)
 {

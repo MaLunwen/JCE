@@ -15,6 +15,8 @@
 
 #define SEQ_MAX_NAME 48
 #define SEQ_MAX_BIND 128
+#define SEQ_MAX_PROP 64
+#define SEQ_MAX_ENT_NAME 64
 
 typedef struct {
     float t;
@@ -27,6 +29,10 @@ typedef struct {
     char  binding[SEQ_MAX_BIND];
     int   type;
     float color[3];
+    /* Structured binding (additive next to the legacy `binding` string). */
+    char     bind_prop[SEQ_MAX_PROP];        /* canonical dotted prop name */
+    uint64_t bind_entity_hint;               /* authored entity id (hint)  */
+    char     bind_entity_name[SEQ_MAX_ENT_NAME]; /* name fallback          */
     SeqKey *keys;
     int     key_count;
 } SeqTrack;
@@ -58,6 +64,25 @@ static int key_cmp(const void *a, const void *b)
     return (ta < tb) ? -1 : (ta > tb ? 1 : 0);
 }
 
+/* Fallback-parse a legacy free-form binding string of the exact shape
+ * "<digits>/<prop>" (e.g. "42/transform.position.x") into the structured
+ * bind_entity_hint / bind_prop fields.  Any other string (asset paths,
+ * prose hints, empty) is rejected gracefully — the structured fields just
+ * stay empty and the track is unbound. */
+static void parse_legacy_binding(SeqTrack *t)
+{
+    const char *s = t->binding;
+    if (!s[0]) return;
+    const char *p = s;
+    while (*p >= '0' && *p <= '9') ++p;
+    if (p == s || *p != '/' || p[1] == '\0') return;  /* not "<digits>/..." */
+    uint64_t id = 0;
+    for (const char *d = s; d < p; ++d)
+        id = id * 10u + (uint64_t)(*d - '0');
+    t->bind_entity_hint = id;
+    copy_str(t->bind_prop, sizeof(t->bind_prop), p + 1);
+}
+
 static JceSequencer *load_root(JceJson *root)
 {
     JceSequencer *seq = JCE_NEW(JceSequencer);
@@ -80,6 +105,17 @@ static JceSequencer *load_root(JceJson *root)
             copy_str(t->binding, sizeof(t->binding),
                      jce_json_get_string(o, "binding", ""));
             t->type = jce_json_get_int(o, "type", JCE_SEQ_TRACK_PROPERTY);
+            /* Structured binding keys (additive; absent in legacy files). */
+            copy_str(t->bind_prop, sizeof(t->bind_prop),
+                     jce_json_get_string(o, "bindProp", ""));
+            t->bind_entity_hint =
+                (uint64_t)jce_json_get_number(o, "bindEntity", 0.0);
+            copy_str(t->bind_entity_name, sizeof(t->bind_entity_name),
+                     jce_json_get_string(o, "bindEntityName", ""));
+            /* Legacy "<digits>/<prop>" binding → structured fields, only
+             * when the additive keys did not already provide them. */
+            if (!t->bind_prop[0] && t->bind_entity_hint == 0)
+                parse_legacy_binding(t);
             t->color[0] = 1.0f; t->color[1] = 1.0f; t->color[2] = 1.0f;
             jce_json_get_floats(o, "color", t->color, 3, NULL);
             JceJson *karr = jce_json_get(o, "keys");
@@ -149,6 +185,9 @@ bool jce_sequencer_looping(const JceSequencer *seq)
 void jce_sequencer_set_playing(JceSequencer *seq, bool playing)
 { if (seq) seq->playing = playing; }
 
+void jce_sequencer_set_looping(JceSequencer *seq, bool looping)
+{ if (seq) seq->looping = looping; }
+
 void jce_sequencer_set_time(JceSequencer *seq, float t)
 {
     if (!seq) return;
@@ -189,6 +228,24 @@ const char *jce_sequencer_track_binding(const JceSequencer *seq, int idx)
 {
     if (!seq || idx < 0 || idx >= seq->track_count) return NULL;
     return seq->tracks[idx].binding;
+}
+
+const char *jce_sequencer_track_bind_prop_name(const JceSequencer *seq, int idx)
+{
+    if (!seq || idx < 0 || idx >= seq->track_count) return NULL;
+    return seq->tracks[idx].bind_prop;
+}
+
+uint64_t jce_sequencer_track_bind_entity_hint(const JceSequencer *seq, int idx)
+{
+    if (!seq || idx < 0 || idx >= seq->track_count) return 0;
+    return seq->tracks[idx].bind_entity_hint;
+}
+
+const char *jce_sequencer_track_bind_entity_name(const JceSequencer *seq, int idx)
+{
+    if (!seq || idx < 0 || idx >= seq->track_count) return NULL;
+    return seq->tracks[idx].bind_entity_name;
 }
 
 JceSeqTrackType jce_sequencer_track_type(const JceSequencer *seq, int idx)

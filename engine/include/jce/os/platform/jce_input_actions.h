@@ -57,6 +57,17 @@ typedef struct {
 JCE_API JceInputActions *jce_actions_create(void);
 JCE_API void             jce_actions_destroy(JceInputActions *a);
 
+/* Load an action map from an editor-authored JSON file (the Input Manager
+ * panel's input_actions.json — { "actions": [ { "name", "binds": [
+ * {"type","code","scale","deadzone"} ] } ] }).  Returns NULL on a missing
+ * / unparseable / empty file so the caller can fall back to
+ * jce_actions_bind_fps_defaults(). */
+JCE_API JceInputActions *jce_actions_load_file(const char *path);
+
+/* Save an action map to a JSON file in the exact schema
+ * jce_actions_load_file() reads.  Returns true on success. */
+JCE_API bool jce_actions_save_file(const JceInputActions *a, const char *path);
+
 /* ================================================================== */
 /* Action registration                                                 */
 /* ================================================================== */
@@ -68,14 +79,33 @@ JCE_API int  jce_action_register(JceInputActions *a, const char *name);
 
 /* Bind a physical input to an action. Up to JCE_ACTION_MAX_BINDS per action.
    Returns true on success. */
-bool jce_action_bind(JceInputActions *a, int action_id,
-                      const JceBinding *binding);
+JCE_API bool jce_action_bind(JceInputActions *a, int action_id,
+                             const JceBinding *binding);
 
 /* Unbind all bindings for an action. */
 JCE_API void jce_action_unbind_all(JceInputActions *a, int action_id);
 
 /* Look up action ID by name. Returns -1 if not found. */
 JCE_API int  jce_action_find(const JceInputActions *a, const char *name);
+
+/* ================================================================== */
+/* Enumeration (read accessors)                                        */
+/* ================================================================== */
+
+/* Number of registered actions (0 when a == NULL). */
+JCE_API int  jce_actions_count(const JceInputActions *a);
+
+/* Name of an action by ID. Returns NULL when out of range.  The pointer
+   stays valid until the table is destroyed. */
+JCE_API const char *jce_action_name(const JceInputActions *a, int action_id);
+
+/* Number of bindings on an action (0 when out of range). */
+JCE_API int  jce_action_bind_count(const JceInputActions *a, int action_id);
+
+/* Copy binding `bind_index` of an action into *out.
+   Returns false when out of range. */
+JCE_API bool jce_action_bind_at(const JceInputActions *a, int action_id,
+                                int bind_index, JceBinding *out);
 
 /* ================================================================== */
 /* Per-frame update                                                    */
@@ -105,9 +135,17 @@ JCE_API bool  jce_action_released(const JceInputActions *a, int action_id);
 /* Helper: register default FPS bindings                               */
 /* ================================================================== */
 
-/* Registers standard actions and binds WASD+mouse+gamepad defaults:
- *   "move_forward", "move_back", "move_left", "move_right",
- *   "move_up", "move_down", "sprint", "look_x", "look_y"
+/* Registers the engine's canonical default action table — the single
+ * source of truth shared by the runtime fallback and the editor's Input
+ * Manager seed:
+ *   "move_forward"  W   / left stick -Y    "move_back"  S
+ *   "move_left"     A                      "move_right" D / left stick +X
+ *   "jump"          SPACE / pad South (A)
+ *   "sprint"        LSHIFT / pad L3 (left-stick click)
+ *   "move_up", "move_down"   registered but UNBOUND (fly-style apps)
+ *   "look_x", "look_y"       right stick
+ * (Convention notes: sprint was LCTRL and SPACE was move_up before the
+ * table was unified with the editor's; "jump" is what gameplay consumes.)
  * Returns the first action ID (they are contiguous). */
 JCE_API int jce_actions_bind_fps_defaults(JceInputActions *a);
 

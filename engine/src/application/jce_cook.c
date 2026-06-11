@@ -16,6 +16,8 @@
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
 
+#include "jce_app_path.h"
+
 #include <stdio.h>
 #include <string.h>
 
@@ -35,37 +37,6 @@ static char *xstrdup(const char *s)
 
 static void xfree(void *p) { if (p) jce_free(p); }
 
-static void normalise_slashes(char *s)
-{
-	if (!s) return;
-	for (char *c = s; *c; ++c) if (*c == '\\') *c = '/';
-}
-
-static void strip_trailing_slash(char *s)
-{
-	if (!s) return;
-	size_t n = strlen(s);
-	while (n > 1 && (s[n - 1] == '/' || s[n - 1] == '\\')) s[--n] = '\0';
-}
-
-/* Allocate "<a>/<b>" with '/' normalisation.  Caller frees. */
-static char *path_join(const char *a, const char *b)
-{
-	if (!a || !b) return NULL;
-	size_t la = strlen(a), lb = strlen(b);
-	char  *out = (char *)jce_malloc(la + lb + 2);
-	if (!out) return NULL;
-	memcpy(out, a, la);
-	size_t off = la;
-	if (la > 0 && out[la - 1] != '/' && out[la - 1] != '\\') {
-		out[off++] = '/';
-	}
-	memcpy(out + off, b, lb);
-	out[off + lb] = '\0';
-	normalise_slashes(out);
-	return out;
-}
-
 /* Build an absolute path: if `rel` is absolute return a copy, else
  * "<project_root>/<rel>". */
 static char *abs_under(const char *project_root, const char *rel)
@@ -75,11 +46,11 @@ static char *abs_under(const char *project_root, const char *rel)
 	               (rel[0] && rel[1] == ':'));
 	if (is_abs) {
 		char *p = xstrdup(rel);
-		if (p) { normalise_slashes(p); strip_trailing_slash(p); }
+		if (p) { jce_app_normalise_slashes(p); jce_app_strip_trailing_slash(p); }
 		return p;
 	}
-	char *p = path_join(project_root, rel);
-	if (p) strip_trailing_slash(p);
+	char *p = jce_app_path_join(project_root, rel);
+	if (p) jce_app_strip_trailing_slash(p);
 	return p;
 }
 
@@ -138,7 +109,7 @@ static bool walk_cb(const char *abs_path, bool is_dir, void *user)
 	if (is_dir) {
 		/* Mirror the directory eagerly so the copy below always
 		 * has a parent to land in.  Cheap and idempotent. */
-		char *dst_dir = path_join(cx->dst_root, rel);
+		char *dst_dir = jce_app_path_join(cx->dst_root, rel);
 		if (dst_dir) {
 			if (!jce_fs_host_exists_dir(dst_dir)) {
 				if (!jce_fs_host_create_directory(dst_dir)) {
@@ -154,7 +125,7 @@ static bool walk_cb(const char *abs_path, bool is_dir, void *user)
 	/* File. */
 	if (cx->stats) cx->stats->total++;
 
-	char *dst = path_join(cx->dst_root, rel);
+	char *dst = jce_app_path_join(cx->dst_root, rel);
 	if (!dst) {
 		if (cx->stats) cx->stats->failed++;
 		return true;
@@ -245,8 +216,8 @@ bool JCE_CALL jce_cook_run_one(const JceProject *p, const char *rel_path)
 	char *src_root = NULL, *dst_root = NULL;
 	if (!resolve_roots(p, &src_root, &dst_root)) return false;
 
-	char *src = path_join(src_root, rel_path);
-	char *dst = path_join(dst_root, rel_path);
+	char *src = jce_app_path_join(src_root, rel_path);
+	char *dst = jce_app_path_join(dst_root, rel_path);
 	xfree(src_root); xfree(dst_root);
 	bool ok = false;
 	if (src && dst) {

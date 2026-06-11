@@ -32,6 +32,7 @@ bool jce_scene_renderer_view_order_build(uint16_t view_id_base,
                                          bool include_shadow_views,
                                          uint8_t csm_cascade_count,
                                          bool include_fog_views,
+                                         bool include_gpu_particle_view,
                                          JceSceneRendererViewOrder *out)
 {
     if (!out)
@@ -56,6 +57,11 @@ bool jce_scene_renderer_view_order_build(uint16_t view_id_base,
         if (fog_composite_view > max_view)
             max_view = fog_composite_view;
     }
+    if (include_gpu_particle_view) {
+        uint16_t gp_view = (uint16_t)(view_id_base + 9u);
+        if (gp_view > max_view)
+            max_view = gp_view;
+    }
 
     uint32_t range_count = (uint32_t)max_view - (uint32_t)view_id_base + 1u;
     if (range_count > JCE_SCENE_RENDERER_VIEW_ORDER_MAX)
@@ -78,6 +84,15 @@ bool jce_scene_renderer_view_order_build(uint16_t view_id_base,
             if (!order_push(out, v))
                 return false;
         }
+    }
+
+    /* GPU particle compute view (base+9): the simulate/emit dispatches must
+       execute before the color view that draws the pool, so it is pushed
+       ahead of base+0.  Sits within [base, max_view]; the dedup keeps
+       out->count == range_count. */
+    if (include_gpu_particle_view) {
+        if (!order_push(out, (uint16_t)(view_id_base + 9u)))
+            return false;
     }
 
     if (!order_push(out, view_id_base))

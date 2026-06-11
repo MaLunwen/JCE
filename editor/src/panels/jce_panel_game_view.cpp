@@ -21,6 +21,7 @@ extern "C" {
 #include <jce/runtime/jce_game_module.h>
 #include <jce/middleware/scene/jce_vcam_system.h>
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/middleware/physics/jce_physics.h>
 #include <ctype.h>
 }
 
@@ -40,6 +41,8 @@ static bool s_show_stats  = false;
 static int  s_run_mode_idx = 0;
 static bool s_run_mode_loaded = false;
 static bool s_third_person = false;   /* play camera: false=first-person, true=behind-player */
+static const float kTpBoomLen = 4.5f; /* third-person orbit distance */
+static float s_tp_dist = 4.5f;        /* smoothed boom length (collision-shortened) */
 
 enum {
     JCE_GAME_VIEW_RUN_EDITOR_SIMULATION = 0,
@@ -366,6 +369,12 @@ void jce_editor_panel_game_view_content(void)
     bool play_active = (play_state == JCE_PLAY_PLAYING ||
                         play_state == JCE_PLAY_PAUSED);
 
+    /* Re-arm the third-person boom on each Play start so a collision-
+     * shortened length from the previous session doesn't leak in. */
+    static bool s_tp_was_play = false;
+    if (play_active && !s_tp_was_play) s_tp_dist = kTpBoomLen;
+    s_tp_was_play = play_active;
+
     /* Cursor capture is now user-initiated only (click into the Game
        View → capture; ESC / ALT / Stop → release). Auto-capturing on
        the Play rising edge was Unity-ish for "instant game feel" but
@@ -452,26 +461,45 @@ void jce_editor_panel_game_view_content(void)
                 if (fl > 0.0001f) { fwd.x   /= fl; fwd.z   /= fl; }
                 if (rl > 0.0001f) { right.x /= rl; right.z /= rl; }
 
+                /* Input Manager actions drive movement (live panel state,
+                 * rebinds apply instantly); the hardcoded key is only the
+                 * fallback when an action is missing or has no key bind. */
+                auto act_down = [](const char *name, ImGuiKey fallback) {
+                    int keys[4];
+                    int n = jce_editor_input_action_keys(name, keys, 4);
+                    if (n <= 0) return ImGui::IsKeyDown(fallback);
+                    for (int i = 0; i < n; i++)
+                        if (ImGui::IsKeyDown((ImGuiKey)keys[i])) return true;
+                    return false;
+                };
+                auto act_pressed = [](const char *name, ImGuiKey fallback) {
+                    int keys[4];
+                    int n = jce_editor_input_action_keys(name, keys, 4);
+                    if (n <= 0) return ImGui::IsKeyPressed(fallback, false);
+                    for (int i = 0; i < n; i++)
+                        if (ImGui::IsKeyPressed((ImGuiKey)keys[i], false)) return true;
+                    return false;
+                };
+
                 float wx = 0.0f, wz = 0.0f;
-                const float walk_speed = 4.0f;
-                if (ImGui::IsKeyDown(ImGuiKey_W)) { wx += fwd.x;   wz += fwd.z;   }
-                if (ImGui::IsKeyDown(ImGuiKey_S)) { wx -= fwd.x;   wz -= fwd.z;   }
-                if (ImGui::IsKeyDown(ImGuiKey_D)) { wx += right.x; wz += right.z; }
-                if (ImGui::IsKeyDown(ImGuiKey_A)) { wx -= right.x; wz -= right.z; }
+                if (act_down("move_forward", ImGuiKey_W)) { wx += fwd.x;   wz += fwd.z;   }
+                if (act_down("move_back",    ImGuiKey_S)) { wx -= fwd.x;   wz -= fwd.z;   }
+                if (act_down("move_right",   ImGuiKey_D)) { wx += right.x; wz += right.z; }
+                if (act_down("move_left",    ImGuiKey_A)) { wx -= right.x; wz -= right.z; }
                 float wlen = sqrtf(wx*wx + wz*wz);
                 if (wlen > 0.0001f) { wx /= wlen; wz /= wlen; }
 
-                bool jump = ImGui::IsKeyPressed(ImGuiKey_Space, false);
-                /* Hold Ctrl to SPRINT — raises the move speed so the locomotion
-                 * blend tree / SM crosses into the Run band. Normal move
-                 * ~4 m/s (Walk), sprint ~7 m/s (Run). */
-                float char_mult =
-                    (ImGui::IsKeyDown(ImGuiKey_LeftCtrl) ||
-                     ImGui::IsKeyDown(ImGuiKey_RightCtrl)) ? 1.8f : 1.0f;
-                jce_editor_play_set_player_input(wx * walk_speed,
-                                                  wz * walk_speed,
-                                                  jump,
-                                                  char_mult);
+                bool jump      = act_pressed("jump", ImGuiKey_Space);
+                bool jump_held = act_down("jump", ImGuiKey_Space);
+                /* Hold sprint (Input Manager action; Ctrl fallback) — the
+                 * authored CharacterController sprint_mult raises the speed
+                 * so the locomotion blend tree / SM crosses into Run. */
+                bool sprint =
+                    act_down("sprint", ImGuiKey_LeftCtrl) ||
+                    ImGui::IsKeyDown(ImGuiKey_RightCtrl);
+                /* Unit direction only — move_speed/jump arc come from the
+                 * scene's CharacterController component. */
+                jce_editor_play_set_player_input(wx, wz, jump, jump_held, sprint);
                 /* Facing + idle/walk/run clip are driven generically by the
                  * engine runtime (rt_drive_character), so it also works in the
                  * shipped game, not just here. */
@@ -512,14 +540,34 @@ void jce_editor_panel_game_view_content(void)
             if (jce_editor_play_get_player_position(&px, &py, &pz)) {
                 if (s_third_person) {
                     /* Orbit behind the player along the mouse-controlled
-                     * forward, looking at chest height (V toggles this). */
+                     * forward, looking at chest height (V toggles this).
+                     * The boom collides with the world (sphere sweep against
+                     * the live Play physics) and its length is smoothed, so
+                     * the camera neither clips through walls nor pops. */
                     jce_vec3 fwd = jce_camera_get_forward(cam);
-                    const float dist = 4.5f;
                     jce_vec3 pivot = jce_v3(px, py + 1.5f, pz);
+                    jce_vec3 back  = jce_v3(-fwd.x, -fwd.y, -fwd.z);
+                    float target_dist = kTpBoomLen;
+                    if (JcePhysicsWorld *pw = jce_editor_play_get_physics_world()) {
+                        JceRaycastResult hit = jce_physics_sweep_sphere(
+                            pw, pivot, 0.25f, back, kTpBoomLen,
+                            jce_query_filter_default());
+                        /* Hits closer than the capsule radius are the player
+                         * itself (the pivot sits inside it) — ignore those. */
+                        if (hit.hit && hit.distance > 0.6f &&
+                            hit.distance < target_dist)
+                            target_dist = hit.distance;
+                    }
+                    /* Snap IN on collision (never clip), recover OUT smoothly. */
+                    if (target_dist < s_tp_dist) s_tp_dist = target_dist;
+                    else {
+                        float k = 1.0f - expf(-8.0f * (dt > 0 ? dt : 0.016f));
+                        s_tp_dist += (target_dist - s_tp_dist) * k;
+                    }
                     jce_camera_set_position(cam,
-                        jce_v3(pivot.x - fwd.x * dist,
-                               pivot.y - fwd.y * dist + 0.4f,
-                               pivot.z - fwd.z * dist));
+                        jce_v3(pivot.x + back.x * s_tp_dist,
+                               pivot.y + back.y * s_tp_dist + 0.4f,
+                               pivot.z + back.z * s_tp_dist));
                 } else {
                     jce_camera_set_position(cam, jce_v3(px, py + 1.6f, pz));
                 }

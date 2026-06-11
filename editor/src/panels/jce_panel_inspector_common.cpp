@@ -30,6 +30,20 @@ void insp_track_edit(void)
     }
 }
 
+/* Honesty badge for components the engine does not simulate yet: the data
+ * round-trips through the scene file but has no runtime effect, so warn at
+ * the top of the section instead of letting users author into the void
+ * (editor-coverage audit 2026-06-11). Remove the call when a component's
+ * runtime consumer lands. */
+void insp_unwired_badge(void)
+{
+    ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(230, 180, 60, 255));
+    ImGui::TextWrapped("%s", jce_editor_i18n("inspector.unwiredBadge"));
+    ImGui::PopStyleColor();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", jce_editor_i18n("inspector.unwiredBadge.tip"));
+}
+
 void insp_undo_bool(bool *value)
 {
     bool now = *value;

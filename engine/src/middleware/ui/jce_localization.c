@@ -3,15 +3,21 @@
  *
  * Open-addressing hash table (linear probe, capacity 4096) stores
  * interned UTF-8 key→value pairs loaded from a flat JSON object.
- * FNV-1a is used for fast string hashing.  All allocations go
- * through jce_alloc; file I/O uses jce_json_parse_file (host FS).
+ * Keys are hashed with the shared FNV-1a helper (jce_fnv1a32_str,
+ * <jce/os/core/jce_hash.h>).  All allocations go
+ * through jce_alloc; file I/O uses jce_json_parse_file (host FS)
+ * with an optional in-PAK fallback source (jce_loc_set_source_pak)
+ * for shipped/WASM builds.  PAK include from a middleware TU follows
+ * the jce_i18n.c precedent.
  */
 
 #include <jce/middleware/ui/jce_localization.h>
 
 #include <jce/os/core/jce_alloc.h>
+#include <jce/os/core/jce_hash.h>
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
+#include <jce/resource/jce_pak_loader.h>
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -35,6 +41,8 @@ typedef struct {
 static struct {
     char         locale[64];
     char         dir_prefix[320];
+    const JcePakArchive *pak;        /* borrowed; NULL = no PAK source */
+    char         pak_prefix[64];     /* in-PAK dir, e.g. "i18n" */
     LocEntry     table[LOC_CAP];
     JceLocChangedFn listeners[LOC_LISTENER_MAX];
     void           *listener_ud[LOC_LISTENER_MAX];
@@ -43,13 +51,6 @@ static struct {
 } g_loc;
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
-
-static uint32_t fnv1a(const char *s)
-{
-    uint32_t h = 2166136261u;
-    while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
-    return h;
-}
 
 static char *intern_str(const char *s)
 {
@@ -71,7 +72,7 @@ static void table_clear(void)
 
 static void table_insert(const char *k, const char *v)
 {
-    uint32_t base = fnv1a(k) & (LOC_CAP - 1);
+    uint32_t base = jce_fnv1a32_str(k) & (LOC_CAP - 1);
     for (int i = 0; i < LOC_CAP; ++i) {
         uint32_t  idx = (base + (uint32_t)i) & (LOC_CAP - 1);
         LocEntry *e   = &g_loc.table[idx];
@@ -91,7 +92,7 @@ static void table_insert(const char *k, const char *v)
 
 static const char *table_lookup(const char *k)
 {
-    uint32_t base = fnv1a(k) & (LOC_CAP - 1);
+    uint32_t base = jce_fnv1a32_str(k) & (LOC_CAP - 1);
     for (int i = 0; i < LOC_CAP; ++i) {
         uint32_t  idx = (base + (uint32_t)i) & (LOC_CAP - 1);
         LocEntry *e   = &g_loc.table[idx];
@@ -101,14 +102,49 @@ static const char *table_lookup(const char *k)
     return NULL;
 }
 
+/* PAK fallback: decompress "<pak_prefix>/<locale>.json" and parse it.
+ * Returns NULL when the source is unset, the asset is missing, or the
+ * JSON does not parse. */
+static JceJson *parse_locale_from_pak(const char *locale_name, char *path,
+                                      size_t path_cap)
+{
+    if (!g_loc.pak) return NULL;
+
+    if (g_loc.pak_prefix[0])
+        snprintf(path, path_cap, "%s/%s.json", g_loc.pak_prefix, locale_name);
+    else
+        snprintf(path, path_cap, "%s.json", locale_name);
+
+    const JcePakAsset *asset = jce_pak_find(g_loc.pak, path);
+    if (!asset) return NULL;
+
+    char *json = (char *)jce_malloc((size_t)asset->original_size + 1);
+    if (!json) return NULL;
+
+    size_t n = jce_pak_decompress(asset, json, (size_t)asset->original_size);
+    if (n == 0) { jce_free(json); return NULL; }
+    json[n] = '\0';
+
+    JceJson *root = jce_json_parse(json, 0);
+    jce_free(json);
+    return root;
+}
+
 static void load_locale_file(const char *locale_name)
 {
-    if (!g_loc.dir_prefix[0]) return;
+    if (!g_loc.dir_prefix[0] && !g_loc.pak) return;
 
-    char path[512];
-    snprintf(path, sizeof(path), "%s/%s.json", g_loc.dir_prefix, locale_name);
+    /* Host FS first (editor hot-edits win), then the PAK source. */
+    char path[512] = {0};
+    JceJson *root = NULL;
+    if (g_loc.dir_prefix[0]) {
+        snprintf(path, sizeof(path), "%s/%s.json",
+                 g_loc.dir_prefix, locale_name);
+        root = jce_json_parse_file(path);
+    }
+    if (!root)
+        root = parse_locale_from_pak(locale_name, path, sizeof(path));
 
-    JceJson *root = jce_json_parse_file(path);
     if (!root) {
         LOG_WARN(LOC_TAG, "could not load locale file: %s", path);
         return;
@@ -136,6 +172,8 @@ void jce_loc_init(const char *host_dir_prefix)
     memset(g_loc.listeners,      0, sizeof(g_loc.listeners));
     memset(g_loc.listener_ud,    0, sizeof(g_loc.listener_ud));
     g_loc.listener_count = 0;
+    g_loc.pak            = NULL;
+    g_loc.pak_prefix[0]  = '\0';
 
     if (host_dir_prefix && *host_dir_prefix)
         snprintf(g_loc.dir_prefix, sizeof(g_loc.dir_prefix),
@@ -149,7 +187,18 @@ void jce_loc_init(const char *host_dir_prefix)
 void jce_loc_shutdown(void)
 {
     table_clear();
-    memset(&g_loc, 0, sizeof(g_loc));
+    memset(&g_loc, 0, sizeof(g_loc));   /* also clears the PAK source */
+}
+
+void jce_loc_set_source_pak(const JcePakArchive *pak,
+                            const char *pak_dir_prefix)
+{
+    g_loc.pak = pak;
+    if (pak && pak_dir_prefix && *pak_dir_prefix)
+        snprintf(g_loc.pak_prefix, sizeof(g_loc.pak_prefix),
+                 "%s", pak_dir_prefix);
+    else
+        g_loc.pak_prefix[0] = '\0';
 }
 
 void jce_loc_set_locale(const char *locale_name)

@@ -24,10 +24,16 @@ void jce_archive_chacha20_xor(const uint8_t key[JCE_ARCHIVE_KEY_BYTES],
                               uint32_t counter,
                               const uint8_t *in, uint8_t *out, size_t len);
 
-/* Derive the per-entry nonce from its (archive-unique) path hash, so that no
- * two entries ever reuse a (key, nonce) pair while keeping builds
- * deterministic (spec §1.3 determinism + §9.2 stream-cipher safety). */
-void jce_archive_derive_nonce(uint64_t path_hash,
+/* Derive the per-entry nonce from its (archive-unique) path hash plus a
+ * per-archive 32-bit salt, so that no two entries ever reuse a (key, nonce)
+ * pair while keeping builds deterministic (spec §1.3 determinism + §9.2
+ * stream-cipher safety).  The salt (header nonce_salt32, derived from the
+ * archive's encrypt label — bundle id / "project_assets") additionally keeps
+ * the SAME path in two DIFFERENT archives from sharing a keystream under one
+ * key.  Note the residual risk: rebuilding the same label with the same key
+ * still reuses (key, nonce) across versions of one archive — acceptable for
+ * asset obfuscation, not for confidentiality. */
+void jce_archive_derive_nonce(uint64_t path_hash, uint32_t salt32,
                               uint8_t nonce[JCE_ARCHIVE_NONCE_BYTES]);
 
 #endif /* JCE_ARCHIVE_CRYPTO_H */

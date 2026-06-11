@@ -13,17 +13,27 @@
 
 #include <jce/os/core/jce_defs.h>
 
-#if !JCE_PLATFORM_WEB && !JCE_PLATFORM_ANDROID && !defined(JCE_BUILD_JNI)
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+#if !JCE_PLATFORM_WEB && !JCE_PLATFORM_ANDROID && !defined(JCE_BUILD_JNI)
 extern const unsigned char assets_pak_data[];
 extern const size_t        assets_pak_data_size;
+#endif /* !__EMSCRIPTEN__ && !__ANDROID__ && !JCE_BUILD_JNI */
+
+/* Embedded asset-decryption key, split into two XOR shares so the raw key
+ * never appears as one contiguous 32-byte constant in the binary
+ * (share_a = bytes [0,32), share_b = bytes [32,64); key = a ^ b).  Present
+ * on ALL platforms (the key also unlocks file-loaded PAKs / bundle mounts
+ * on web/Android/JNI).  Definitions come from either the editor-generated
+ * jce_generated/jce_pak_key.c, the SDK helper's zeroed stub, or the
+ * engine's own zeroed default TU (jce_pak_key_default.c) — exe-level
+ * objects override the library default by normal static-link resolution.
+ * This is keyed obfuscation, not secrecy: the key ships with the game. */
+extern const unsigned char jce_embedded_pak_key_shares[64];
+extern const int           jce_embedded_pak_key_present;
 
 #ifdef __cplusplus
 }
 #endif
-
-#endif /* !__EMSCRIPTEN__ && !__ANDROID__ && !JCE_BUILD_JNI */

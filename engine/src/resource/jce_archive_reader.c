@@ -39,6 +39,7 @@ struct JceArchive {
 
     uint32_t         flags;
     uint16_t         dict_count;
+    uint32_t         nonce_salt;   /* header nonce_salt32 (ex-RESERVED)   */
     uint64_t         index_offset;
     uint64_t         index_stored_size;
     uint64_t         data_content_hash;
@@ -55,6 +56,25 @@ struct JceArchive {
     uint8_t          dec_key[JCE_ARCHIVE_KEY_BYTES];
     int              has_key;    /* 1 once a decryption key has been set */
 };
+
+/* ── Process-wide decryption key ─────────────────────────────────────────
+ * Installed once at boot (before any PAK/bundle opens — precedent: the
+ * g_pak_path_override boot-time module global in jce_engine.c) and
+ * auto-applied to every archive whose header carries JARC_FLAG_ENCRYPTED.
+ * Per-archive jce_archive_set_decryption_key() still works and overrides.
+ * Not synchronized: set it during single-threaded startup. */
+static uint8_t g_process_key[JCE_ARCHIVE_KEY_BYTES];
+static int     g_has_process_key = 0;
+
+void jce_archive_set_process_key(const uint8_t key[32]) {
+    if (!key) {
+        memset(g_process_key, 0, sizeof(g_process_key));
+        g_has_process_key = 0;
+        return;
+    }
+    memcpy(g_process_key, key, JCE_ARCHIVE_KEY_BYTES);
+    g_has_process_key = 1;
+}
 
 /* Parse the dictionary table (immediately after the header) into a resident
  * array, validating that every dictionary's bytes lie within the blob.
@@ -188,6 +208,16 @@ static JceArchive *open_internal(const uint8_t *blob, size_t size, int owns) {
     ar->data_content_hash  = jarc_rd64(blob + JARC_OFF_DATA_CONTENT_HASH);
     ar->index_content_hash = jarc_rd64(blob + JARC_OFF_INDEX_CONTENT_HASH);
     ar->entry_count        = entry_count;
+    /* nonce_salt32 (ex-RESERVED, spec §4.2): meaningful iff ENCRYPTED. */
+    ar->nonce_salt         = (flags & JARC_FLAG_ENCRYPTED)
+                                 ? jarc_rd32(blob + JARC_OFF_NONCE_SALT32) : 0;
+
+    /* Auto-apply the process-wide key to encrypted archives so PAKs and
+     * bundle mounts opened after boot decrypt without per-call wiring. */
+    if ((flags & JARC_FLAG_ENCRYPTED) && g_has_process_key) {
+        memcpy(ar->dec_key, g_process_key, JCE_ARCHIVE_KEY_BYTES);
+        ar->has_key = 1;
+    }
 
     /* Materialize the (possibly compressed) index region. */
     const uint8_t *index_raw = NULL;
@@ -327,7 +357,7 @@ size_t jce_archive_read(const JceArchive *ar, const JceArchiveEntry *entry,
             decrypted = (uint8_t *)jce_malloc(entry->stored_size);
             if (!decrypted) return 0;
             uint8_t nonce[JCE_ARCHIVE_NONCE_BYTES];
-            jce_archive_derive_nonce(entry->path_hash, nonce);
+            jce_archive_derive_nonce(entry->path_hash, ar->nonce_salt, nonce);
             jce_archive_chacha20_xor(ar->dec_key, nonce, 1, src,
                                      decrypted, entry->stored_size);
             src = decrypted;

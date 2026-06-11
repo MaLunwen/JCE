@@ -184,6 +184,12 @@ bool              jce_state_get_show_joint_gizmos(void);
 void              jce_state_set_show_joint_gizmos(bool show);
 bool              jce_state_get_show_cloth_gizmos(void);
 void              jce_state_set_show_cloth_gizmos(bool show);
+/* World-streaming preview (session-local, default off): when on AND the
+ * scene's streaming settings are enabled, the editor runs a live preview
+ * streamer that spawns/destroys chunk entities in the hierarchy as the
+ * editor camera moves.  See jce_editor_scene_render_streaming_rebuild(). */
+bool              jce_state_get_streaming_preview(void);
+void              jce_state_set_streaming_preview(bool on);
 
 /* Show Flags (UE-style overlay toggles).  Bitmask, see JceShowFlag below.
  * Existing show_grid / show_physics_debug remain authoritative; the bitmask
@@ -198,6 +204,7 @@ typedef enum {
     JCE_SHOW_FLAG_WORLD_AXIS     = 1u <<  6,
     JCE_SHOW_FLAG_STATS_OVERLAY  = 1u <<  7,
     JCE_SHOW_FLAG_NAVMESH        = 1u <<  8,
+    JCE_SHOW_FLAG_STREAMING      = 1u <<  9,
 } JceShowFlag;
 
 uint32_t          jce_state_get_show_flags(void);
@@ -245,11 +252,13 @@ JcePlayState  jce_state_get_play_state(void);
 void          jce_state_play_mode_tick(float dt);
 
 /* Player-character input bridge (Game View panel → Play tick).
- * Push the desired walk direction (world-space horizontal) and modifiers
- * each frame the panel is captured + Play is active.  Ignored if no
- * scene entity has a CharacterController. */
+ * Push the desired walk DIRECTION (world-space horizontal, unit length)
+ * and button state each frame the panel is captured + Play is active —
+ * speeds come from the authored CharacterController component.  Ignored
+ * if no scene entity has a CharacterController. */
 void jce_editor_play_set_player_input(float walk_x, float walk_z,
-                                       bool jump_pressed, float speed_mult);
+                                       bool jump_pressed, bool jump_held,
+                                       bool sprint);
 
 /* Returns true and writes the player character's world position if a
  * character is alive; false otherwise. */
@@ -259,6 +268,12 @@ bool jce_editor_play_get_player_position(float *out_x, float *out_y, float *out_
  * Editor-side debug-draw / contact-listener wiring uses this. */
 struct JcePhysicsWorld;
 struct JcePhysicsWorld *jce_editor_play_get_physics_world(void);
+
+/* Returns the live play-session runtime during Play (or NULL when not
+ * running).  Read-only panel wiring (e.g. the BT Visualizer polling
+ * jce_runtime_bt_* accessors) uses this. */
+struct JceRuntime;
+struct JceRuntime *jce_editor_play_get_runtime(void);
 
 /* Live count of active contact pairs during Play (BEGIN++/END--).  0 when
  * not running.  Surfaced by the Physics Debugger. */

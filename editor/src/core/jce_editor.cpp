@@ -158,6 +158,16 @@ static ImGuiKey jce_key_to_imgui_key(JceKey sc)
     }
 }
 
+/* Shared scancode → ImGuiKey bridge.  JCE_KEY_* values ARE SDL scancodes
+ * (see jce_keys.h), so the complete table above doubles as the editor's
+ * single scancode translation map.  Panels that resolve authored
+ * scancode bindings (e.g. the Input Manager's play-in-editor queries)
+ * must call this instead of keeping their own table. */
+extern "C" int jce_editor_scancode_to_imgui_key(int scancode)
+{
+    return (int)jce_key_to_imgui_key((JceKey)scancode);
+}
+
 static void update_key_modifiers(uint16_t mods)
 {
     ImGuiIO &io = ImGui::GetIO();

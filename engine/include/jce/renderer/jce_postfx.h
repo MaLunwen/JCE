@@ -167,6 +167,14 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
    Returns JCE_TEXTURE_INVALID if no effects were active. */
 JCE_API JceTextureHandle jce_postfx_get_output(const JcePostFXPipeline *pipeline);
 
+/* Draw the chain's output texture to the BACKBUFFER as a fullscreen pass.
+ * The runtime presentation step for consumers that render their scene into
+ * an offscreen target and post-process it (the editor composites the output
+ * texture into its viewport instead and never calls this). No-op when
+ * apply() produced no output this frame. */
+JCE_API void jce_postfx_present(JcePostFXPipeline *pipeline,
+                                uint32_t width, uint32_t height);
+
 /* Returns the bgfx framebuffer handle (as raw uint16) currently holding the
  * postfx output texture, or UINT16_MAX if no apply has run.
  * Editors can submit overlay passes to this FBO so gizmos render *after*

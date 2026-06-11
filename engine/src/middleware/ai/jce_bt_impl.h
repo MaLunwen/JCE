@@ -28,6 +28,13 @@ JceBtStatus jce_bt_backend_tick(JceBtBackend *b, uint32_t tree_idx);
 void        jce_bt_backend_halt(JceBtBackend *b, uint32_t tree_idx);
 uint32_t    jce_bt_backend_tree_count(const JceBtBackend *b);
 
+/* Introspection (read-only visualizer support). */
+uint32_t jce_bt_backend_node_count(const JceBtBackend *b, uint32_t tree_idx);
+bool     jce_bt_backend_node_info(const JceBtBackend *b, uint32_t tree_idx,
+                                  uint32_t node_idx, JceBtNodeInfo *out);
+bool     jce_bt_backend_set_observed(JceBtBackend *b, uint32_t tree_idx, bool observed);
+void     jce_bt_backend_set_lenient(JceBtBackend *b, bool lenient);
+
 #ifdef __cplusplus
 }
 #endif

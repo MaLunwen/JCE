@@ -15,6 +15,7 @@
 #include "core/jce_editor_toast.h"
 #include "core/jce_editor_i18n.h"
 #include "core/jce_editor_scene_rendering_defaults.h"
+#include "scene/jce_editor_scene_render.h"
 #include "ui/jce_editor_panels.h"
 
 extern "C" {
@@ -497,6 +498,9 @@ static void normalize_entity_paths_cb(JceScene *sc, JceEntity e, void *ud)
     if (JceSkyboxComponent *sky = jce_scene_get_skybox(scene, e)) {
         rel_in_place(sky->hdr_path, sizeof(sky->hdr_path), base);
     }
+    if (JceSequencePlayerComponent *sp = jce_scene_get_sequence_player(scene, e)) {
+        rel_in_place(sp->seq_path, sizeof(sp->seq_path), base);
+    }
 }
 
 static void normalize_all_scene_paths_to_relative(const char *scene_path)
@@ -525,10 +529,23 @@ bool jce_state_save_scene_file(const char *scene_path)
     if (!scene_path || scene_path[0] == '\0')
         return false;
 
+    /* The Sequencer panel's live preview writes evaluated track values
+     * straight into scene components; restore the authored originals
+     * before serializing so previewed values never reach disk. */
+    jce_panel_sequencer_preview_flush();
+
+    /* SAVE SAFETY: the world-streaming preview spawns chunk entities
+     * directly into the live scene.  Destroy the streamer (which removes
+     * every streamed entity) BEFORE serializing so streamed chunk content
+     * never bakes into the main scene file; rebuild right after. */
+    jce_editor_scene_render_streaming_teardown();
+
     /* Convert all path fields to scene-relative before writing. */
     normalize_all_scene_paths_to_relative(scene_path);
 
-    if (!jce_scene_serial_save_file(s.scene, scene_path)) {
+    const bool save_ok = jce_scene_serial_save_file(s.scene, scene_path);
+    jce_editor_scene_render_streaming_rebuild();
+    if (!save_ok) {
         LOG_WARN(LOG_TAG, "scene save failed: %s", scene_path);
         return false;
     }
@@ -585,9 +602,17 @@ bool jce_state_load_scene_file(const char *scene_path)
     if (!scene_path || scene_path[0] == '\0')
         return false;
 
+    /* Restore any Sequencer live-preview values BEFORE the swap — after
+     * it the cached entity ids would point into the new scene. */
+    jce_panel_sequencer_preview_flush();
+
     /* Opening a scene during Play would swap the JceScene out from under a
      * running runtime — tear the runtime down first. */
     stop_play_before_scene_swap();
+
+    /* The streaming-preview streamer holds entity handles into the old
+     * scene — destroy it BEFORE the entities go away. */
+    jce_editor_scene_render_streaming_teardown();
 
     /* Plain-file load: drop any bundle VFS override from a prior preview. */
     close_active_bundle_mount();
@@ -633,6 +658,10 @@ bool jce_state_load_scene_file(const char *scene_path)
         s_transaction.label[0] = '\0';
         s_transaction.before.scene_json.clear();
         s_transaction.before.scene_path.clear();
+
+        /* Spin up the streaming preview for the freshly loaded scene
+         * (no-op unless the scene enables it AND the preview toggle is on). */
+        jce_editor_scene_render_streaming_rebuild();
     }
     return ok;
 }
@@ -719,6 +748,9 @@ bool apply_scene_bytes(const char *display_path,
      * JceScene out from under a running runtime — stop it first. */
     stop_play_before_scene_swap();
 
+    /* Streamer holds entity handles into the old scene — destroy first. */
+    jce_editor_scene_render_streaming_teardown();
+
     bool ok = false;
     {
         HistorySuspendScope suspend;
@@ -747,6 +779,10 @@ bool apply_scene_bytes(const char *display_path,
         s_transaction.label[0] = '\0';
         s_transaction.before.scene_json.clear();
         s_transaction.before.scene_path.clear();
+
+        /* Streaming preview for the freshly applied scene (no-op unless
+         * enabled + preview toggle on). */
+        jce_editor_scene_render_streaming_rebuild();
     }
     return ok;
 }

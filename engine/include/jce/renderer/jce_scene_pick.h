@@ -25,6 +25,12 @@ typedef struct JceScenePickDesc {
     JceRenderer                    *renderer;
     const JcePakArchive            *pak;
     const JceSceneRendererCallbacks *callbacks; /* optional, copied */
+    /* Optional, borrowed. When set, the pick pass resolves skinned models
+     * through this scene renderer's model cache first (per render, never
+     * held across frames) instead of loading a second GPU copy; its own
+     * cache remains as the standalone fallback. Must outlive the pick
+     * pass — destroy the pick pass BEFORE the scene renderer. */
+    JceSceneRenderer               *scene_renderer;
     uint16_t                        view_id;    /* 0 = JCE_VIEW_EDITOR_PICK */
 } JceScenePickDesc;
 

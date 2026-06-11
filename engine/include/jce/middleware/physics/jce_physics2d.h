@@ -73,6 +73,24 @@ typedef struct {
 JCE_API JceBodyHandle jce_physics2d_body_create(JcePhysics2D *world, const JceBody2DDesc *desc);
 JCE_API void          jce_physics2d_body_destroy(JcePhysics2D *world, JceBodyHandle body);
 
+/* Create a body with NO shapes attached.  Callers compose multi-shape
+ * bodies (e.g. tilemap colliders) by attaching boxes afterwards with
+ * jce_physics2d_body_add_box(). */
+JCE_API JceBodyHandle jce_physics2d_body_create_empty(JcePhysics2D *world,
+                                                      jce_vec2 pos, float angle,
+                                                      JceBodyType type);
+
+/* Attach one axis-aligned box shape (offset in body-local space) to an
+ * existing body.  `sensor` shapes detect overlaps without collision
+ * response.  Returns false on invalid world/body/extents. */
+JCE_API bool          jce_physics2d_body_add_box(JcePhysics2D *world,
+                                                 JceBodyHandle body,
+                                                 jce_vec2 center_local,
+                                                 jce_vec2 half_extents,
+                                                 float friction,
+                                                 float restitution,
+                                                 bool sensor);
+
 /* ================================================================== */
 /* 2D body state queries                                               */
 /* ================================================================== */

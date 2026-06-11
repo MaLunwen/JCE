@@ -191,6 +191,18 @@ typedef struct {
     float ambient_intensity;      /* default: 1.0 */
 } JceProjectRendering;
 
+/* ── Packaging ─────────────────────────────────────────────────────── */
+typedef struct {
+    /* Encrypt the embedded asset PAK (and suppress loose plaintext
+     * staging) for project builds.  Deters casual extraction only: the
+     * key ships inside the game binary and there is no MAC.  The key
+     * itself lives in <project>/.jce/pak_key.hex (git-ignored). */
+    bool  encrypt_assets;
+    /* Also encrypt debug-variant builds (default off so debug builds
+     * keep the loose, inspectable asset tree). */
+    bool  encrypt_debug_builds;
+} JceProjectPackaging;
+
 /* ── Aggregate ─────────────────────────────────────────────────────── */
 typedef struct {
     JceProjectAudio          audio;
@@ -205,6 +217,7 @@ typedef struct {
     JceProjectTagsAndLayers  tags_layers;
     JceProjectTime           time;
     JceProjectRendering      rendering;
+    JceProjectPackaging      packaging;
 } JceProjectSettings;
 
 /* ── Lifecycle ─────────────────────────────────────────────────────── */

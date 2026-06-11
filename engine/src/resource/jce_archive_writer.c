@@ -288,7 +288,7 @@ static bool writer_add_impl(JceArchiveWriter *w, const char *path,
      * keystream is keyed by the entry's unique path hash. */
     if (encrypt && stored_size > 0 && stored) {
         uint8_t nonce[JCE_ARCHIVE_NONCE_BYTES];
-        jce_archive_derive_nonce(hash, nonce);
+        jce_archive_derive_nonce(hash, w->cfg.encryption_salt, nonce);
         jce_archive_chacha20_xor(w->enc_key, nonce, 1, stored, stored, stored_size);
         w->any_encrypted = 1;
     }
@@ -321,6 +321,12 @@ void jce_archive_writer_set_encryption_key(JceArchiveWriter *w,
     if (!w || !key) return;
     memcpy(w->enc_key, key, JCE_ARCHIVE_KEY_BYTES);
     w->has_key = 1;
+}
+
+uint32_t jce_archive_salt_from_label(const char *label) {
+    if (!label || !label[0]) return 0;
+    uint64_t h = (uint64_t)XXH3_64bits(label, strlen(label));
+    return (uint32_t)(h ^ (h >> 32));
 }
 
 bool jce_archive_writer_add(JceArchiveWriter *w, const char *path,
@@ -689,7 +695,10 @@ bool jce_archive_writer_finish(JceArchiveWriter *w, void **out_buf, size_t *out_
     jarc_wr16(h + JARC_OFF_DICT_COUNT,           (uint16_t)w->dict_count);
     h[JARC_OFF_DEFAULT_COMPRESSION] = JARC_COMP_ZSTD;
     h[JARC_OFF_ALIGNMENT_LOG2]      = w->cfg.alignment_log2;
-    jarc_wr32(h + JARC_OFF_RESERVED, 0);
+    /* nonce_salt32 (ex-RESERVED): only meaningful when entries are
+     * encrypted; kept 0 otherwise for byte-compat with pre-salt archives. */
+    jarc_wr32(h + JARC_OFF_NONCE_SALT32,
+              w->any_encrypted ? w->cfg.encryption_salt : 0);
 
     *out_buf = buf.data;
     *out_size = buf.size;

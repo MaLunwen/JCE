@@ -427,6 +427,27 @@ JCE_INLINE jce_mat4 jce_m4_from_trs(jce_vec3 t, jce_quat r, jce_vec3 s)
     return out;
 }
 
+/* Sanitize a transform scale for TRS composition: zero components default to
+ * 1 so a degenerate authored scale cannot collapse the matrix. Sign is
+ * PRESERVED — mirrored (negative) scales stay mirrored. Use this flavor when
+ * feeding jce_m4_from_trs. */
+JCE_INLINE jce_vec3 jce_v3_safe_scale(jce_vec3 s)
+{
+    return jce_v3(s.x != 0.0f ? s.x : 1.0f,
+                  s.y != 0.0f ? s.y : 1.0f,
+                  s.z != 0.0f ? s.z : 1.0f);
+}
+
+/* Magnitude flavor of jce_v3_safe_scale: |component| with zeros defaulting to
+ * 1. For radius / half-extent / gizmo math that needs positive extents. NOT
+ * for TRS composition — it drops mirroring. */
+JCE_INLINE jce_vec3 jce_v3_abs_safe_scale(jce_vec3 s)
+{
+    return jce_v3(s.x != 0.0f ? fabsf(s.x) : 1.0f,
+                  s.y != 0.0f ? fabsf(s.y) : 1.0f,
+                  s.z != 0.0f ? fabsf(s.z) : 1.0f);
+}
+
 JCE_INLINE jce_quat jce_m4_to_quat(const jce_mat4 *m)
 {
     float m00 = m->raw[0][0], m11 = m->raw[1][1], m22 = m->raw[2][2];

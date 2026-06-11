@@ -161,6 +161,8 @@ static const PanelKeyRow kPanelKeys[] = {
     { JCE_PANEL_ANIMATION_RIGGING,   "window.animationRigging"       },
     { JCE_PANEL_RENDER_PIPELINE,     "panel.render_pipeline.title"   },
     { JCE_PANEL_PROFILE_ANALYZER,    "window.profileAnalyzer"        },
+    { JCE_PANEL_BT_VISUALIZER,       "window.btVisualizer"           },
+    { JCE_PANEL_WORLD_STREAMING,     "window.worldStreaming"         },
 };
 static constexpr int kPanelKeyCount =
     (int)(sizeof(kPanelKeys) / sizeof(kPanelKeys[0]));

@@ -16,7 +16,9 @@
 #include "jce_editor_dialogs_internal.h"
 #include "core/jce_assetdb.h"
 #include "ui/jce_editor_tip.h"
+#include "core/jce_editor_game_l10n.h"
 #include "core/jce_editor_project.h"
+#include "core/jce_pak_key.h"
 
 #include <vector>
 
@@ -31,6 +33,8 @@ void set_current_project_root(const char *path)
         s_current_project_root[0] = '\0';
         jce_assetdb_set_root("");
         jce_editor_project_set_root(nullptr);
+        jce_editor_gl10n_unload();
+        jce_pak_key_install_process("");  /* clear the process key */
         return;
     }
 
@@ -61,6 +65,22 @@ void set_current_project_root(const char *path)
     snprintf(s_current_project_root, sizeof(s_current_project_root), "%s", buf);
     jce_assetdb_set_root(s_current_project_root);
     jce_editor_project_set_root(s_current_project_root);
+
+    /* Install the project's asset-decryption key (if any) process-wide so
+     * encrypted PAKs / bundles of this project open transparently in the
+     * editor (Play mode, bundle preview, asset browser).  Clears any key
+     * left over from a previously opened project. */
+    jce_pak_key_install_process(s_current_project_root);
+
+    /* Game string tables: load <root>/<source_assets>/i18n/*.json into the
+     * L10n grid model and point jce_loc at it so UIText locale_key fields
+     * resolve in the game view / Play preview. */
+    {
+        const JceProject *jp = jce_editor_project_get();
+        const char *src = (jp && jp->source_assets && jp->source_assets[0])
+                          ? jp->source_assets : "assets";
+        jce_editor_gl10n_load(s_current_project_root, src);
+    }
 }
 
 bool is_valid_project_dir(const char *path)

@@ -352,16 +352,21 @@ uint32_t jce_bullet_character_create(JceBulletWorld *bw,
                                       jce_vec3 pos, float radius,
                                       float height, float step_height,
                                       float max_slope_rad,
-                                      float gravity, float jump_speed);
+                                      float gravity, float jump_speed,
+                                      float accel, float air_control);
 void jce_bullet_character_destroy(JceBulletWorld *bw, uint32_t idx);
 void jce_bullet_character_move(JceBulletWorld *bw, uint32_t idx,
                                 jce_vec3 walk_dir, float dt);
-void jce_bullet_character_jump(JceBulletWorld *bw, uint32_t idx);
+bool jce_bullet_character_jump(JceBulletWorld *bw, uint32_t idx);
 void jce_bullet_character_get_position(JceBulletWorld *bw, uint32_t idx,
                                         jce_vec3 *pos);
 void jce_bullet_character_set_position(JceBulletWorld *bw, uint32_t idx,
                                         jce_vec3 pos);
 bool jce_bullet_character_is_grounded(JceBulletWorld *bw, uint32_t idx);
+void jce_bullet_character_get_velocity(JceBulletWorld *bw, uint32_t idx,
+                                        jce_vec3 *out_vel);
+void jce_bullet_character_cut_jump(JceBulletWorld *bw, uint32_t idx,
+                                    float factor);
 
 /* ================================================================== */
 /* Vehicle controller                                                  */

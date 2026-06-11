@@ -278,6 +278,12 @@ JCE_API JceMesh *jce_scene_renderer_get_builtin_mesh(JceSceneRenderer *sr,
 JCE_API void jce_scene_renderer_invalidate_terrain(JceSceneRenderer *sr,
                                                     const char *path);
 
+/* Drop the cached tilemap (chunk meshes + map/tileset assets) for `path`
+ * (or all cached tilemaps if path is NULL/empty) so the next frame
+ * re-loads from disk. Tools (Tile Palette panel) call this after Save. */
+JCE_API void jce_scene_renderer_invalidate_tilemap(JceSceneRenderer *sr,
+                                                    const char *path);
+
 /* Forward decls for accessors below — full headers may not be in this TU. */
 struct JceAnimPlayer;
 struct JceModel;

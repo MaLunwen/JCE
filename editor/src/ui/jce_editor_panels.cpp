@@ -234,6 +234,8 @@ void jce_editor_panels_init(void)
     s_visible[JCE_PANEL_SYSTEMS]          = false;
     s_visible[JCE_PANEL_PROJECT_SETTINGS] = false;
     s_visible[JCE_PANEL_USER_PREFERENCES] = false;
+    s_visible[JCE_PANEL_BT_VISUALIZER]    = false;
+    s_visible[JCE_PANEL_WORLD_STREAMING]  = false;
 
     /* Console ring buffer. */
     memset(&s_console, 0, sizeof(s_console));
@@ -730,36 +732,6 @@ static struct {
     char  build_output_path[512];
     char  font_en_path[512];
     char  font_zh_path[512];
-    /* Quality */
-    int   quality_preset;
-    float lod_bias;
-    int   texture_quality_idx;
-    int   anisotropic_idx;
-    float shadow_distance;
-    int   max_pixel_lights;
-    bool  soft_particles;
-    bool  realtime_reflections;
-    /* Time */
-    float time_scale;
-    float fixed_dt;
-    float max_dt;
-    bool  pause_when_unfocused;
-    /* Graphics (tier render-pipeline knobs) */
-    int   gfx_tier;
-    bool  gfx_dynamic_resolution;
-    int   gfx_color_space_idx;       /* 0 = Linear, 1 = Gamma */
-    bool  gfx_async_compute;
-    /* Tags & Layers */
-    char  tags_csv[512];             /* comma-separated tag names */
-    char  layers_csv[512];           /* comma-separated layer names */
-    char  sorting_layers_csv[512];
-    /* Player */
-    char  player_company[128];
-    char  player_product[128];
-    char  player_version[32];
-    int   player_orientation_idx;    /* 0 = Auto, 1 = Portrait, 2 = Landscape */
-    bool  player_run_in_background;
-    bool  player_resizable_window;
     char  status_msg[128];
     float status_timer;
     bool  initialized;
@@ -814,34 +786,6 @@ static void prefs_ensure_init(void)
     s_prefs.show_gizmos        = true;
     s_prefs.gizmo_scale        = 1.0f;
     s_prefs.camera_sensitivity = 1.0f;
-    s_prefs.quality_preset       = 2;
-    s_prefs.lod_bias             = 1.0f;
-    s_prefs.texture_quality_idx  = 0;
-    s_prefs.anisotropic_idx      = 2;
-    s_prefs.shadow_distance      = 50.0f;
-    s_prefs.max_pixel_lights     = 4;
-    s_prefs.soft_particles       = true;
-    s_prefs.realtime_reflections = false;
-    s_prefs.time_scale           = 1.0f;
-    s_prefs.fixed_dt             = 0.02f;
-    s_prefs.max_dt               = 0.1f;
-    s_prefs.pause_when_unfocused = false;
-    s_prefs.gfx_tier               = 1;          /* Mid */
-    s_prefs.gfx_dynamic_resolution = false;
-    s_prefs.gfx_color_space_idx    = 0;          /* Linear */
-    s_prefs.gfx_async_compute      = false;
-    snprintf(s_prefs.tags_csv,           sizeof(s_prefs.tags_csv),
-             "Untagged,Player,Enemy,MainCamera,Respawn,Finish");
-    snprintf(s_prefs.layers_csv,         sizeof(s_prefs.layers_csv),
-             "Default,TransparentFX,Ignore Raycast,Water,UI");
-    snprintf(s_prefs.sorting_layers_csv, sizeof(s_prefs.sorting_layers_csv),
-             "Default");
-    snprintf(s_prefs.player_company, sizeof(s_prefs.player_company), "DefaultCompany");
-    snprintf(s_prefs.player_product, sizeof(s_prefs.player_product), "JCE Game");
-    snprintf(s_prefs.player_version, sizeof(s_prefs.player_version), "0.1.0");
-    s_prefs.player_orientation_idx   = 0;
-    s_prefs.player_run_in_background = false;
-    s_prefs.player_resizable_window  = true;
     snprintf(s_prefs.window_title, sizeof(s_prefs.window_title), "JCE Editor");
     snprintf(s_prefs.assets_path, sizeof(s_prefs.assets_path), "assets");
     snprintf(s_prefs.scenes_path, sizeof(s_prefs.scenes_path), "assets/scenes");
@@ -947,126 +891,62 @@ void jce_editor_panel_preferences(void)
                 ImGui::EndTabItem();
             }
 
+            /* Quality / Time / Graphics / Tags & Layers / Player below were
+             * dead UI (state never applied anywhere — explicit "not wired"
+             * markers).  The real, persisted versions live in the Project
+             * Settings panel, so each tab is now a one-line redirect. */
             snprintf(_lbl, sizeof(_lbl), "%s###pref_quality", jce_editor_i18n("preferences.quality.title"));
             if (ImGui::BeginTabItem(_lbl, nullptr, prefs_tab_flags(4))) {
                 prefs_select_tab(4);
-                const char *presets[] = { "Low", "Medium", "High", "Ultra", "Custom" };
-                snprintf(_lbl, sizeof(_lbl), "%s###qpreset", jce_editor_i18n("preferences.quality.preset"));
-                if (ImGui::Combo(_lbl, &s_prefs.quality_preset, presets, 5)
-                    && s_prefs.quality_preset != 4 /* Custom */) {
-                    /* Apply tier defaults so users can see the spread. */
-                    static const struct {
-                        float lod;  int tex; int aniso; float sdist;
-                        int   maxL; bool soft; bool refl;
-                    } P[4] = {
-                        { 2.0f, 3, 0, 15.0f, 2, false, false }, /* Low */
-                        { 1.5f, 1, 1, 30.0f, 3, true,  false }, /* Medium */
-                        { 1.0f, 0, 2, 50.0f, 4, true,  false }, /* High */
-                        { 0.5f, 0, 4, 80.0f, 8, true,  true  }, /* Ultra */
-                    };
-                    int qi = s_prefs.quality_preset;
-                    s_prefs.lod_bias             = P[qi].lod;
-                    s_prefs.texture_quality_idx  = P[qi].tex;
-                    s_prefs.anisotropic_idx      = P[qi].aniso;
-                    s_prefs.shadow_distance      = P[qi].sdist;
-                    s_prefs.max_pixel_lights     = P[qi].maxL;
-                    s_prefs.soft_particles       = P[qi].soft;
-                    s_prefs.realtime_reflections = P[qi].refl;
+                ImGui::TextWrapped("%s", jce_editor_i18n("preferences.movedToProjectSettings"));
+                if (ImGui::Button(jce_editor_i18n_id("preferences.openProjectSettings", "openPsQuality"))) {
+                    bool *ps = jce_editor_panel_visible_ptr(JCE_PANEL_PROJECT_SETTINGS);
+                    if (ps) *ps = true;
                 }
-                snprintf(_lbl, sizeof(_lbl), "%s###lodbias", jce_editor_i18n("preferences.quality.lodBias"));
-                ImGui::SliderFloat(_lbl, &s_prefs.lod_bias, 0.1f, 4.0f);
-                const char *texq[] = { "Full", "Half", "Quarter", "Eighth" };
-                snprintf(_lbl, sizeof(_lbl), "%s###texq", jce_editor_i18n("preferences.quality.textureQuality"));
-                ImGui::Combo(_lbl, &s_prefs.texture_quality_idx, texq, 4);
-                const char *aniso[] = { "Off", "2x", "4x", "8x", "16x" };
-                snprintf(_lbl, sizeof(_lbl), "%s###aniso", jce_editor_i18n("preferences.quality.anisotropic"));
-                ImGui::Combo(_lbl, &s_prefs.anisotropic_idx, aniso, 5);
-                snprintf(_lbl, sizeof(_lbl), "%s###sdist", jce_editor_i18n("preferences.quality.shadowDistance"));
-                ImGui::SliderFloat(_lbl, &s_prefs.shadow_distance, 1.0f, 500.0f);
-                snprintf(_lbl, sizeof(_lbl), "%s###maxlights", jce_editor_i18n("preferences.quality.maxPixelLights"));
-                ImGui::SliderInt(_lbl, &s_prefs.max_pixel_lights, 1, 16);
-                snprintf(_lbl, sizeof(_lbl), "%s###softp", jce_editor_i18n("preferences.quality.softParticles"));
-                ImGui::Checkbox(_lbl, &s_prefs.soft_particles);
-                snprintf(_lbl, sizeof(_lbl), "%s###rtrefl", jce_editor_i18n("preferences.quality.realtimeReflections"));
-                ImGui::Checkbox(_lbl, &s_prefs.realtime_reflections);
-                ImGui::TextDisabled("%s", jce_editor_i18n("preferences.quality.notWired"));
                 ImGui::EndTabItem();
             }
 
             snprintf(_lbl, sizeof(_lbl), "%s###pref_time", jce_editor_i18n("preferences.time.title"));
             if (ImGui::BeginTabItem(_lbl, nullptr, prefs_tab_flags(5))) {
                 prefs_select_tab(5);
-                snprintf(_lbl, sizeof(_lbl), "%s###tscale", jce_editor_i18n("preferences.time.timeScale"));
-                ImGui::SliderFloat(_lbl, &s_prefs.time_scale, 0.0f, 4.0f);
-                snprintf(_lbl, sizeof(_lbl), "%s###fixed", jce_editor_i18n("preferences.time.fixedTimestep"));
-                ImGui::SliderFloat(_lbl, &s_prefs.fixed_dt, 0.001f, 0.1f, "%.4f s");
-                snprintf(_lbl, sizeof(_lbl), "%s###maxdt", jce_editor_i18n("preferences.time.maxDeltaTime"));
-                ImGui::SliderFloat(_lbl, &s_prefs.max_dt, 0.01f, 1.0f, "%.3f s");
-                snprintf(_lbl, sizeof(_lbl), "%s###pwu", jce_editor_i18n("preferences.time.pauseWhenUnfocused"));
-                ImGui::Checkbox(_lbl, &s_prefs.pause_when_unfocused);
-                if (s_prefs.fixed_dt > 0.0f) {
-                    ImGui::TextDisabled("≈ %.1f Hz", 1.0 / (double)s_prefs.fixed_dt);
+                ImGui::TextWrapped("%s", jce_editor_i18n("preferences.movedToProjectSettings"));
+                if (ImGui::Button(jce_editor_i18n_id("preferences.openProjectSettings", "openPsTime"))) {
+                    bool *ps = jce_editor_panel_visible_ptr(JCE_PANEL_PROJECT_SETTINGS);
+                    if (ps) *ps = true;
                 }
-                ImGui::TextDisabled("%s", jce_editor_i18n("preferences.time.notWired"));
                 ImGui::EndTabItem();
             }
 
             snprintf(_lbl, sizeof(_lbl), "%s###pref_graphics", jce_editor_i18n("preferences.graphics.title"));
             if (ImGui::BeginTabItem(_lbl, nullptr, prefs_tab_flags(6))) {
                 prefs_select_tab(6);
-                const char *tiers[] = { "Tier 1 (Low)", "Tier 2 (Mid)", "Tier 3 (High)" };
-                if (s_prefs.gfx_tier < 0 || s_prefs.gfx_tier > 2) s_prefs.gfx_tier = 1;
-                snprintf(_lbl, sizeof(_lbl), "%s###gfxTier", jce_editor_i18n("preferences.graphics.tier"));
-                ImGui::Combo(_lbl, &s_prefs.gfx_tier, tiers, 3);
-                const char *cs[] = { "Linear", "Gamma" };
-                if (s_prefs.gfx_color_space_idx < 0 || s_prefs.gfx_color_space_idx > 1)
-                    s_prefs.gfx_color_space_idx = 0;
-                snprintf(_lbl, sizeof(_lbl), "%s###gfxCS", jce_editor_i18n("preferences.graphics.colorSpace"));
-                ImGui::Combo(_lbl, &s_prefs.gfx_color_space_idx, cs, 2);
-                snprintf(_lbl, sizeof(_lbl), "%s###gfxDR", jce_editor_i18n("preferences.graphics.dynamicResolution"));
-                ImGui::Checkbox(_lbl, &s_prefs.gfx_dynamic_resolution);
-                snprintf(_lbl, sizeof(_lbl), "%s###gfxAC", jce_editor_i18n("preferences.graphics.asyncCompute"));
-                ImGui::Checkbox(_lbl, &s_prefs.gfx_async_compute);
-                ImGui::TextDisabled("%s", jce_editor_i18n("preferences.graphics.notWired"));
+                ImGui::TextWrapped("%s", jce_editor_i18n("preferences.movedToProjectSettings"));
+                if (ImGui::Button(jce_editor_i18n_id("preferences.openProjectSettings", "openPsGraphics"))) {
+                    bool *ps = jce_editor_panel_visible_ptr(JCE_PANEL_PROJECT_SETTINGS);
+                    if (ps) *ps = true;
+                }
                 ImGui::EndTabItem();
             }
 
             snprintf(_lbl, sizeof(_lbl), "%s###pref_tagslayers", jce_editor_i18n("preferences.tagsLayers.title"));
             if (ImGui::BeginTabItem(_lbl, nullptr, prefs_tab_flags(7))) {
                 prefs_select_tab(7);
-                ImGui::TextDisabled("%s", jce_editor_i18n("preferences.tagsLayers.help"));
-                snprintf(_lbl, sizeof(_lbl), "%s###tagsCSV", jce_editor_i18n("preferences.tagsLayers.tags"));
-                ImGui::InputTextMultiline(_lbl, s_prefs.tags_csv,
-                    sizeof(s_prefs.tags_csv), ImVec2(-1, 60));
-                snprintf(_lbl, sizeof(_lbl), "%s###layersCSV", jce_editor_i18n("preferences.tagsLayers.layers"));
-                ImGui::InputTextMultiline(_lbl, s_prefs.layers_csv,
-                    sizeof(s_prefs.layers_csv), ImVec2(-1, 60));
-                snprintf(_lbl, sizeof(_lbl), "%s###sortLayCSV", jce_editor_i18n("preferences.tagsLayers.sortingLayers"));
-                ImGui::InputTextMultiline(_lbl, s_prefs.sorting_layers_csv,
-                    sizeof(s_prefs.sorting_layers_csv), ImVec2(-1, 40));
-                ImGui::TextDisabled("%s", jce_editor_i18n("preferences.tagsLayers.notWired"));
+                ImGui::TextWrapped("%s", jce_editor_i18n("preferences.movedToTagsLayers"));
+                if (ImGui::Button(jce_editor_i18n_id("preferences.openTagsLayers", "openTagsLayers"))) {
+                    bool *tl = jce_editor_panel_visible_ptr(JCE_PANEL_TAGS_LAYERS);
+                    if (tl) *tl = true;
+                }
                 ImGui::EndTabItem();
             }
 
             snprintf(_lbl, sizeof(_lbl), "%s###pref_player", jce_editor_i18n("preferences.player.title"));
             if (ImGui::BeginTabItem(_lbl, nullptr, prefs_tab_flags(8))) {
                 prefs_select_tab(8);
-                snprintf(_lbl, sizeof(_lbl), "%s###plyCompany", jce_editor_i18n("preferences.player.company"));
-                ImGui::InputText(_lbl, s_prefs.player_company, sizeof(s_prefs.player_company));
-                snprintf(_lbl, sizeof(_lbl), "%s###plyProduct", jce_editor_i18n("preferences.player.product"));
-                ImGui::InputText(_lbl, s_prefs.player_product, sizeof(s_prefs.player_product));
-                snprintf(_lbl, sizeof(_lbl), "%s###plyVer", jce_editor_i18n("preferences.player.version"));
-                ImGui::InputText(_lbl, s_prefs.player_version, sizeof(s_prefs.player_version));
-                const char *orients[] = { "Auto", "Portrait", "Landscape" };
-                if (s_prefs.player_orientation_idx < 0 || s_prefs.player_orientation_idx > 2)
-                    s_prefs.player_orientation_idx = 0;
-                snprintf(_lbl, sizeof(_lbl), "%s###plyOri", jce_editor_i18n("preferences.player.orientation"));
-                ImGui::Combo(_lbl, &s_prefs.player_orientation_idx, orients, 3);
-                snprintf(_lbl, sizeof(_lbl), "%s###plyBg", jce_editor_i18n("preferences.player.runInBackground"));
-                ImGui::Checkbox(_lbl, &s_prefs.player_run_in_background);
-                snprintf(_lbl, sizeof(_lbl), "%s###plyRz", jce_editor_i18n("preferences.player.resizableWindow"));
-                ImGui::Checkbox(_lbl, &s_prefs.player_resizable_window);
-                ImGui::TextDisabled("%s", jce_editor_i18n("preferences.player.notWired"));
+                ImGui::TextWrapped("%s", jce_editor_i18n("preferences.movedToProjectSettings"));
+                if (ImGui::Button(jce_editor_i18n_id("preferences.openProjectSettings", "openPsPlayer"))) {
+                    bool *ps = jce_editor_panel_visible_ptr(JCE_PANEL_PROJECT_SETTINGS);
+                    if (ps) *ps = true;
+                }
                 ImGui::EndTabItem();
             }
 

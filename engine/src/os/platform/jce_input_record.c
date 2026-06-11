@@ -103,6 +103,11 @@ bool jce_input_record_tick(JceInputRecorder *r, const JceInput *input)
     jce_input_capture(input, &f);
     if (SDL_WriteIO(r->io, &f, sizeof(f)) != sizeof(f)) { JCE_PROFILE_ZONE_END; return false; }
     r->frame_count++;
+    /* Bug-repro robustness: flush periodically so a crash mid-session
+     * (the very thing being recorded) still leaves a usable .jirc on
+     * disk instead of losing the tail in stdio buffers. */
+    if ((r->frame_count & 63u) == 0u)
+        SDL_FlushIO(r->io);
     JCE_PROFILE_ZONE_END;
     return true;
 }

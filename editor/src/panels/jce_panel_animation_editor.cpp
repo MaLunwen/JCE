@@ -1,24 +1,29 @@
 /*
- * jce_panel_animation_editor.cpp  Animation Clip Editor (Phase A).
+ * jce_panel_animation_editor.cpp  Animation Clip Editor (frame events).
  *
- * A standalone authoring panel for animation clips. Phase A scope:
+ * Authoring surface for the engine's animation frame-event sidecar — the
+ * <skeleton_path>.anim.json file that jce_scene_renderer.c lazily loads
+ * next to a SkeletalAnimator's skeleton asset:
  *
- *  - Clip { name, duration, fps, loop, tracks[] }
- *  - Track { name, color, type (event / float / vec3), events[] }
- *      Event { time, name }                 (type=event)
- *      Event { time, value (float|vec3) }   (type=float / vec3)
- *  - Add / remove / rename tracks; add / drag / delete events on a
- *    horizontal timeline; numeric inspector for the selected event.
- *  - Playback transport: Play / Pause / Stop with internal time cursor
- *    that loops or clamps based on clip.loop.
- *  - Save / Load to JSON via the engine JSON parser.
+ *   { "<clipName>": [ { "time": s, "name"?, "id"?, "f0"?, "f1"?,
+ *                       "i0"? }, ... ], ... }
  *
- *  No coupling to the engine animation runtime yet — this panel is the
- *  authoring surface; consumers can be wired in a later phase.
+ *  - One timeline lane per engine clip; the lane name must match the
+ *    model's clip name (case-sensitive) for its events to fire at runtime.
+ *  - Add / drag / delete events; inspector edits the optional string name
+ *    plus the engine payload (id, f0, f1, i0).
+ *  - Default save path derives "<skeleton>.anim.json" from the focused
+ *    entity's SkeletalAnimator, mirroring the engine's sidecar lookup; the
+ *    path field stays editable as Save-As.
+ *  - Legacy panel files ({name,duration,fps,loop,tracks:[...]}) are
+ *    detected by the "tracks" key and converted in-memory (event tracks →
+ *    named events on a lane named after the legacy clip; float/vec3 tracks
+ *    dropped — no engine consumer). Re-saving writes the engine schema.
  */
 
 #include "io/jce_editor_file_util.h"
 #include "core/jce_editor_i18n.h"
+#include "core/jce_editor_state.h"
 #include "ui/jce_editor_panels.h"
 #include "ui/jce_editor_ui_state.h"
 #include "ui/jce_theme_palette.h"
@@ -28,6 +33,7 @@
 #include "core/jce_assetdb.h"
 extern "C" {
 #include <jce/os/core/jce_json.h>
+#include <jce/middleware/scene/jce_scene.h>
 }
 
 #include <algorithm>
@@ -39,26 +45,30 @@ extern "C" {
 
 namespace {
 
-enum TrackType { TT_EVENT = 0, TT_FLOAT = 1, TT_VEC3 = 2 };
-
+/* One authored frame event. Mirrors the engine's JceAnimEvent
+ * (jce_anim_ik.h): optional string label + numeric id/payload. */
 struct Event {
     float time = 0.0f;
-    char  name[64] = {0};   /* TT_EVENT: trigger label */
-    float value[3] = {0,0,0};  /* TT_FLOAT uses [0]; TT_VEC3 uses xyz */
+    char  name[48] = {0};   /* optional label; "" = unnamed */
+    int   id = 0;           /* user-defined event id (e.g. footstep) */
+    float f0 = 0.0f;        /* small float payload */
+    float f1 = 0.0f;
+    int   i0 = 0;           /* small int payload */
 };
 
+/* One event lane = one engine clip. The lane name must match a clip name
+ * in the skeleton's model (case-sensitive) — the runtime looks the clip
+ * name up as a top-level key of the sidecar. */
 struct Track {
-    char       name[64] = "track";
-    int        type = TT_EVENT;
+    char       name[64] = "clip";
     float      color[3] = { 0.6f, 0.8f, 1.0f };
-    bool       collapsed = false;
     std::vector<Event> events;
 };
 
+/* The sidecar document. duration/loop are editor preview settings only —
+ * NOT serialized (the engine takes the real duration from the model). */
 struct Clip {
-    char       name[64] = "clip";
     float      duration = 5.0f;
-    float      fps = 30.0f;
     bool       loop = true;
     std::vector<Track> tracks;
 };
@@ -66,6 +76,8 @@ struct Clip {
 struct State {
     Clip   clip;
     char   path[260] = "animations/clip.anim.json";
+    bool   path_user_set = false; /* user typed/browsed → stop auto-derive */
+    char   warn[256] = {0};       /* one-time banner (legacy conversion) */
 
     /* View. */
     float  zoom_pps = 80.0f;   /* pixels per second */
@@ -92,29 +104,72 @@ State s;
 void clip_reset(Clip *c)
 {
     *c = Clip();
-    Track t1; std::snprintf(t1.name, sizeof(t1.name), "events");
-    t1.type = TT_EVENT;
-    Track t2; std::snprintf(t2.name, sizeof(t2.name), "speed");
-    t2.type = TT_FLOAT;  t2.color[0] = 1.0f; t2.color[1] = 0.6f; t2.color[2] = 0.4f;
-    Track t3; std::snprintf(t3.name, sizeof(t3.name), "position");
-    t3.type = TT_VEC3;   t3.color[0] = 0.5f; t3.color[1] = 1.0f; t3.color[2] = 0.6f;
-    c->tracks.push_back(t1);
-    c->tracks.push_back(t2);
-    c->tracks.push_back(t3);
 }
 
-const char *type_label(int t)
+/* Rotating lane palette (colors are an editor nicety; the engine schema
+ * carries no presentation data). */
+void lane_color(int idx, float out[3])
 {
-    switch (t) { case TT_EVENT: return "event";
-                 case TT_FLOAT: return "float";
-                 case TT_VEC3:  return "vec3";  default: return "?"; }
+    static const float pal[6][3] = {
+        { 0.55f, 0.78f, 1.00f }, { 1.00f, 0.62f, 0.42f },
+        { 0.55f, 1.00f, 0.62f }, { 0.95f, 0.80f, 0.40f },
+        { 0.80f, 0.60f, 1.00f }, { 0.45f, 0.90f, 0.90f },
+    };
+    const float *c = pal[((idx % 6) + 6) % 6];
+    out[0] = c[0]; out[1] = c[1]; out[2] = c[2];
 }
 
-int type_from_label(const char *s_)
+void sort_events(Track &t)
 {
-    if (s_ && std::strcmp(s_, "float") == 0) return TT_FLOAT;
-    if (s_ && std::strcmp(s_, "vec3")  == 0) return TT_VEC3;
-    return TT_EVENT;
+    std::sort(t.events.begin(), t.events.end(),
+              [](const Event &a, const Event &b){ return a.time < b.time; });
+}
+
+/* The focused entity's SkeletalAnimator, if any (shared by the default
+ * save-path derivation and "Clips From Selection"). */
+JceSkeletalAnimatorComponent *focused_skeletal_animator(void)
+{
+    uint32_t focused = jce_state_get_focused();
+    if (!focused) return nullptr;
+    JceScene *scene = jce_state_get_scene();
+    if (!scene || !jce_state_entity_exists(focused)) return nullptr;
+    return jce_scene_get_skeletal_animator(
+        scene, jce_state_to_ecs_entity(focused));
+}
+
+/* Default save path mirrors the engine's sidecar derivation
+ * (jce_scene_renderer.c: snprintf "%s.anim.json" onto skeleton_path) so a
+ * plain Save lands exactly where sr_anim_events_load will look. Stops as
+ * soon as the user edits the path field (Save-As). */
+void derive_default_path(void)
+{
+    if (s.path_user_set) return;
+    JceSkeletalAnimatorComponent *sk = focused_skeletal_animator();
+    if (!sk || !sk->skeleton_path[0]) return;
+    std::snprintf(s.path, sizeof(s.path), "%s.anim.json", sk->skeleton_path);
+}
+
+/* Add one event lane per clip on the focused entity's SkeletalAnimator,
+ * skipping lanes that already exist (names must match to fire). */
+void sync_clips_from_selection(void)
+{
+    JceSkeletalAnimatorComponent *sk = focused_skeletal_animator();
+    if (!sk) return;
+    int n = sk->clip_count;
+    if (n < 0) n = 0;
+    if (n > 8) n = 8;
+    for (int i = 0; i < n; ++i) {
+        const char *cn = sk->clip_names[i];
+        if (!cn[0]) continue;
+        bool exists = false;
+        for (auto &t : s.clip.tracks)
+            if (std::strcmp(t.name, cn) == 0) { exists = true; break; }
+        if (exists) continue;
+        Track t;
+        std::snprintf(t.name, sizeof(t.name), "%s", cn);
+        lane_color((int)s.clip.tracks.size(), t.color);
+        s.clip.tracks.push_back(t);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -124,33 +179,37 @@ int type_from_label(const char *s_)
 void save_clip(const char *path)
 {
     JceJson *root = jce_json_object();
-    jce_json_set_string(root, "name", s.clip.name);
-    jce_json_set_number(root, "duration", s.clip.duration);
-    jce_json_set_number(root, "fps", s.clip.fps);
-    jce_json_set_bool  (root, "loop", s.clip.loop);
-    JceJson *jt = jce_json_array();
+
+    /* "_meta": panel preview settings.  The runtime loader only queries the
+     * model's clip names as top-level keys, so this object is invisible to
+     * it (sr_anim_events_load ignores unknown keys). */
+    JceJson *meta = jce_json_object();
+    jce_json_set_number(meta, "duration", s.clip.duration);
+    jce_json_set_bool  (meta, "loop", s.clip.loop);
+    jce_json_set_child(root, "_meta", meta);
+
+    /* One top-level array per lane, keyed by clip name.  Optional event
+     * fields are omitted at their defaults to keep the sidecar minimal. */
     for (auto &t : s.clip.tracks) {
-        JceJson *jto = jce_json_object();
-        jce_json_set_string(jto, "name", t.name);
-        jce_json_set_string(jto, "type", type_label(t.type));
-        jce_json_set_float_array(jto, "color", t.color, 3);
+        if (jce_json_has(root, t.name)) {
+            jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+                "animation: duplicate lane '%s' skipped (clip names must be "
+                "unique)", t.name);
+            continue;
+        }
         JceJson *jev = jce_json_array();
         for (auto &e : t.events) {
             JceJson *jeo = jce_json_object();
             jce_json_set_number(jeo, "time", e.time);
-            if (t.type == TT_EVENT) {
-                jce_json_set_string(jeo, "name", e.name);
-            } else if (t.type == TT_FLOAT) {
-                jce_json_set_number(jeo, "value", e.value[0]);
-            } else {
-                jce_json_set_float_array(jeo, "value", e.value, 3);
-            }
+            if (e.name[0])     jce_json_set_string(jeo, "name", e.name);
+            if (e.id != 0)     jce_json_set_int   (jeo, "id",   e.id);
+            if (e.f0 != 0.0f)  jce_json_set_number(jeo, "f0",   e.f0);
+            if (e.f1 != 0.0f)  jce_json_set_number(jeo, "f1",   e.f1);
+            if (e.i0 != 0)     jce_json_set_int   (jeo, "i0",   e.i0);
             jce_json_array_push(jev, jeo);
         }
-        jce_json_set_child(jto, "events", jev);
-        jce_json_array_push(jt, jto);
+        jce_json_set_child(root, t.name, jev);
     }
-    jce_json_set_child(root, "tracks", jt);
     if (ed_write_json_to_file(path, root))
         jce_editor_console_log("animation: saved %s", path);
     else
@@ -175,51 +234,90 @@ void load_clip(const char *path)
         return;
     }
     Clip c;
-    const char *nm = jce_json_get_string(root, "name", "clip");
-    std::snprintf(c.name, sizeof(c.name), "%s", nm ? nm : "clip");
-    c.duration = (float)jce_json_get_number(root, "duration", 5.0);
-    c.fps      = (float)jce_json_get_number(root, "fps", 30.0);
-    c.loop     = jce_json_get_bool  (root, "loop", true);
-    JceJson *jt = jce_json_get(root, "tracks");
-    if (jt && jce_json_is_array(jt)) {
-        int n = jce_json_array_size(jt);
+    s.warn[0] = '\0';
+    int lane_idx = 0;
+
+    if (jce_json_has(root, "tracks")) {
+        /* Legacy panel schema: {name,duration,fps,loop,tracks:[...]}.
+         * Event tracks become lanes; float/vec3 tracks have no engine
+         * consumer and are dropped (counted for the banner). */
+        c.duration = (float)jce_json_get_number(root, "duration", 5.0);
+        c.loop     = jce_json_get_bool(root, "loop", true);
+        int dropped = 0;
+        JceJson *jt = jce_json_get(root, "tracks");
+        int n = jce_json_is_array(jt) ? jce_json_array_size(jt) : 0;
         for (int i = 0; i < n; ++i) {
             JceJson *jto = jce_json_array_at(jt, i);
             if (!jto) continue;
+            const char *ty = jce_json_get_string(jto, "type", "event");
+            if (ty && std::strcmp(ty, "event") != 0) { ++dropped; continue; }
             Track t;
-            const char *tn = jce_json_get_string(jto, "name", "track");
-            std::snprintf(t.name, sizeof(t.name), "%s", tn ? tn : "track");
-            t.type = type_from_label(jce_json_get_string(jto, "type", "event"));
-            jce_json_get_floats(jto, "color", t.color, 3, nullptr);
+            const char *tn = jce_json_get_string(jto, "name", "clip");
+            std::snprintf(t.name, sizeof(t.name), "%s", tn ? tn : "clip");
+            lane_color(lane_idx++, t.color);
             JceJson *jev = jce_json_get(jto, "events");
-            if (jev && jce_json_is_array(jev)) {
-                int en = jce_json_array_size(jev);
-                for (int j = 0; j < en; ++j) {
-                    JceJson *jeo = jce_json_array_at(jev, j);
-                    if (!jeo) continue;
-                    Event e;
-                    e.time = (float)jce_json_get_number(jeo, "time", 0.0);
-                    if (t.type == TT_EVENT) {
-                        const char *en_ = jce_json_get_string(jeo, "name", "");
-                        std::snprintf(e.name, sizeof(e.name), "%s",
-                                      en_ ? en_ : "");
-                    } else if (t.type == TT_FLOAT) {
-                        e.value[0] = (float)jce_json_get_number(jeo, "value", 0.0);
-                    } else {
-                        jce_json_get_floats(jeo, "value", e.value, 3, nullptr);
-                    }
-                    t.events.push_back(e);
-                }
+            int en = (jev && jce_json_is_array(jev))
+                         ? jce_json_array_size(jev) : 0;
+            for (int j = 0; j < en; ++j) {
+                JceJson *jeo = jce_json_array_at(jev, j);
+                if (!jeo) continue;
+                Event e;
+                e.time = (float)jce_json_get_number(jeo, "time", 0.0);
+                const char *en_ = jce_json_get_string(jeo, "name", "");
+                std::snprintf(e.name, sizeof(e.name), "%s", en_ ? en_ : "");
+                t.events.push_back(e);
             }
-            std::sort(t.events.begin(), t.events.end(),
-                      [](const Event &a, const Event &b){ return a.time < b.time; });
+            sort_events(t);
+            c.tracks.push_back(t);
+        }
+        std::snprintf(s.warn, sizeof(s.warn),
+            "Converted legacy clip format; %d non-event track(s) dropped — "
+            "re-saving writes the engine schema.", dropped);
+    } else {
+        /* Engine sidecar schema: every top-level array is one clip lane;
+         * the optional "_meta" object carries panel preview settings. */
+        JceJson *meta = jce_json_get(root, "_meta");
+        if (meta && jce_json_is_object(meta)) {
+            c.duration = (float)jce_json_get_number(meta, "duration", 5.0);
+            c.loop     = jce_json_get_bool(meta, "loop", true);
+        }
+        for (JceJson *it = jce_json_first_child(root); it;
+             it = jce_json_next_sibling(it)) {
+            const char *key = jce_json_member_key(it);
+            if (!key || !key[0]) continue;
+            if (std::strcmp(key, "_meta") == 0) continue;
+            if (!jce_json_is_array(it)) continue;
+            Track t;
+            std::snprintf(t.name, sizeof(t.name), "%s", key);
+            lane_color(lane_idx++, t.color);
+            int en = jce_json_array_size(it);
+            for (int j = 0; j < en; ++j) {
+                JceJson *jeo = jce_json_array_at(it, j);
+                if (!jeo) continue;
+                Event e;
+                e.time = (float)jce_json_get_number(jeo, "time", 0.0);
+                const char *nm = jce_json_get_string(jeo, "name", "");
+                std::snprintf(e.name, sizeof(e.name), "%s", nm ? nm : "");
+                e.id = jce_json_get_int(jeo, "id", 0);
+                e.f0 = (float)jce_json_get_number(jeo, "f0", 0.0);
+                e.f1 = (float)jce_json_get_number(jeo, "f1", 0.0);
+                e.i0 = jce_json_get_int(jeo, "i0", 0);
+                t.events.push_back(e);
+            }
+            sort_events(t);
             c.tracks.push_back(t);
         }
     }
     jce_json_free(root);
+
+    /* Grow the preview duration so every loaded event stays reachable. */
+    for (auto &t : c.tracks)
+        for (auto &e : t.events)
+            if (e.time > c.duration) c.duration = e.time;
+
     s.clip = c;
     s.cursor = 0.0f; s.sel_track = -1; s.sel_event = -1;
-    jce_editor_console_log("animation: loaded %s (%d tracks)",
+    jce_editor_console_log("animation: loaded %s (%d lanes)",
                            path, (int)s.clip.tracks.size());
 }
 
@@ -229,14 +327,21 @@ void load_clip(const char *path)
 
 void draw_toolbar(void)
 {
-    ImGui::InputText(jce_editor_i18n("animationEditor.field.clipName"), s.clip.name, sizeof(s.clip.name));
+    /* Keep the save path tracking the focused SkeletalAnimator's sidecar
+     * until the user edits the field (then it becomes Save-As). */
+    derive_default_path();
+
+    if (ImGui::Button(jce_editor_i18n("animationEditor.button.syncClips")))
+        sync_clips_from_selection();
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("animationEditor.button.new"))) {
         clip_reset(&s.clip);
         s.cursor = 0.0f; s.sel_track = -1; s.sel_event = -1;
+        s.warn[0] = '\0';
     }
 
-    jce_draw_path_input(jce_editor_i18n("animationEditor.field.file"), s.path, sizeof(s.path), JcePathKind::FileAbs);
+    if (jce_draw_path_input(jce_editor_i18n("animationEditor.field.file"), s.path, sizeof(s.path), JcePathKind::FileAbs))
+        s.path_user_set = true;
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("animationEditor.button.save")) && s.path[0]) save_clip(s.path);
     ImGui::SameLine();
@@ -244,9 +349,6 @@ void draw_toolbar(void)
 
     ImGui::SetNextItemWidth(120);
     ImGui::DragFloat(jce_editor_i18n("animationEditor.field.duration"), &s.clip.duration, 0.1f, 0.1f, 600.0f, "%.2f s");
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(80);
-    ImGui::DragFloat(jce_editor_i18n("animationEditor.field.fps"), &s.clip.fps, 0.5f, 1.0f, 240.0f, "%.0f");
     ImGui::SameLine();
     ImGui::Checkbox(jce_editor_i18n("animationEditor.field.loop"), &s.clip.loop);
     ImGui::SameLine();
@@ -265,6 +367,15 @@ void draw_toolbar(void)
     ImGui::SameLine();
     ImGui::SetNextItemWidth(140);
     ImGui::SliderFloat(jce_editor_i18n("animationEditor.field.zoom"), &s.zoom_pps, 10.0f, 400.0f, "%.0f");
+
+    /* One-time banner (legacy conversion notice). */
+    if (s.warn[0]) {
+        if (ImGui::SmallButton("x##ae_warn_dismiss")) s.warn[0] = '\0';
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f, 0.30f, 1.0f));
+        ImGui::TextWrapped("%s", s.warn);
+        ImGui::PopStyleColor();
+    }
 }
 
 float time_to_x(float t, float origin_x)
@@ -311,16 +422,15 @@ void draw_ruler(ImVec2 p0, float width, float origin_x)
                 jce_theme::playhead(), 2.0f);
 }
 
-bool event_value_inspector(Track &t, Event &e)
+/* Edits the engine event payload: optional label + id/f0/f1/i0. */
+bool event_value_inspector(Event &e)
 {
     bool changed = false;
-    if (t.type == TT_EVENT) {
-        if (ImGui::InputText(jce_editor_i18n("animationEditor.field.name"), e.name, sizeof(e.name))) changed = true;
-    } else if (t.type == TT_FLOAT) {
-        if (ImGui::DragFloat(jce_editor_i18n("animationEditor.field.value"), &e.value[0], 0.01f)) changed = true;
-    } else {
-        if (ImGui::DragFloat3(jce_editor_i18n("animationEditor.field.value"), e.value, 0.01f)) changed = true;
-    }
+    if (ImGui::InputText(jce_editor_i18n("animationEditor.field.eventName"), e.name, sizeof(e.name))) changed = true;
+    if (ImGui::DragInt(jce_editor_i18n("animationEditor.field.eventId"), &e.id, 0.1f)) changed = true;
+    if (ImGui::DragFloat(jce_editor_i18n("animationEditor.field.eventF0"), &e.f0, 0.01f)) changed = true;
+    if (ImGui::DragFloat(jce_editor_i18n("animationEditor.field.eventF1"), &e.f1, 0.01f)) changed = true;
+    if (ImGui::DragInt(jce_editor_i18n("animationEditor.field.eventI0"), &e.i0, 0.1f)) changed = true;
     if (ImGui::DragFloat(jce_editor_i18n("animationEditor.field.time"), &e.time, 0.01f, 0.0f, s.clip.duration, "%.3f s"))
         changed = true;
     return changed;
@@ -353,11 +463,10 @@ void draw_tracks(ImVec2 p0, float width, float origin_x)
             if (tt < 0) tt = 0;
             if (tt > s.clip.duration) tt = s.clip.duration;
             Event e; e.time = tt;
-            if (t.type == TT_EVENT) std::snprintf(e.name, sizeof(e.name),
-                                                  "evt_%d", (int)t.events.size());
+            std::snprintf(e.name, sizeof(e.name),
+                          "evt_%d", (int)t.events.size());
             t.events.push_back(e);
-            std::sort(t.events.begin(), t.events.end(),
-                      [](const Event &a, const Event &b){ return a.time < b.time; });
+            sort_events(t);
             s.sel_track = ti;
             /* Find the inserted index by scanning for matching time. */
             for (int k = 0; k < (int)t.events.size(); ++k)
@@ -381,13 +490,10 @@ void draw_tracks(ImVec2 p0, float width, float origin_x)
             ImVec2 a(ex, cy - 8), b(ex + 7, cy), c(ex, cy + 8), d(ex - 7, cy);
             dl->AddQuadFilled(a, b, c, d, col);
             dl->AddQuad(a, b, c, d, jce_theme::node_outline(), 1.0f);
-            /* Label */
+            /* Label: the optional name, else the numeric id. */
             char lbl[80];
-            if (t.type == TT_EVENT) std::snprintf(lbl, sizeof(lbl), "%s", e.name);
-            else if (t.type == TT_FLOAT)
-                std::snprintf(lbl, sizeof(lbl), "%.2f", e.value[0]);
-            else std::snprintf(lbl, sizeof(lbl), "(%.1f,%.1f,%.1f)",
-                               e.value[0], e.value[1], e.value[2]);
+            if (e.name[0]) std::snprintf(lbl, sizeof(lbl), "%s", e.name);
+            else           std::snprintf(lbl, sizeof(lbl), "#%d", e.id);
             dl->AddText(ImVec2(ex + 9, cy - 6), col, lbl);
 
             /* Hit-test for select / drag. */
@@ -463,8 +569,9 @@ void draw_track_list_panel(void)
     ImGui::BeginChild("##tracks_left", ImVec2(220, 0), true);
     if (ImGui::Button(jce_editor_i18n("animationEditor.button.addTrack"))) {
         Track t;
-        std::snprintf(t.name, sizeof(t.name), "track_%d",
+        std::snprintf(t.name, sizeof(t.name), "clip_%d",
                       (int)s.clip.tracks.size());
+        lane_color((int)s.clip.tracks.size(), t.color);
         s.clip.tracks.push_back(t);
     }
     ImGui::SameLine();
@@ -480,17 +587,13 @@ void draw_track_list_panel(void)
         Track &t = s.clip.tracks[i];
         ImGui::PushID(i);
         char lbl[96];
-        std::snprintf(lbl, sizeof(lbl), "[%s] %s", type_label(t.type), t.name);
+        std::snprintf(lbl, sizeof(lbl), "%s##lane", t.name);
         if (ImGui::Selectable(lbl, s.sel_track == i)) {
             s.sel_track = i; s.sel_event = -1;
         }
         if (ImGui::BeginPopupContextItem("trk_ctx")) {
             ImGui::SetNextItemWidth(140);
             ImGui::InputText(jce_editor_i18n("animationEditor.field.name"), t.name, sizeof(t.name));
-            int tt = t.type;
-            if (ImGui::Combo(jce_editor_i18n_id("animationEditor.field.type", "ae_t_type"), &tt, "event\0float\0vec3\0")) {
-                t.type = tt; t.events.clear();
-            }
             ImGui::ColorEdit3(jce_editor_i18n("animationEditor.field.color"), t.color, ImGuiColorEditFlags_NoInputs);
             ImGui::EndPopup();
         }
@@ -506,10 +609,10 @@ void draw_inspector_panel(void)
     ImGui::Separator();
     if (s.sel_track >= 0 && s.sel_track < (int)s.clip.tracks.size()) {
         Track &t = s.clip.tracks[s.sel_track];
-        ImGui::Text(jce_editor_i18n("animationEditor.label.track"), t.name, type_label(t.type));
+        ImGui::Text(jce_editor_i18n("animationEditor.label.track"), t.name);
         if (s.sel_event >= 0 && s.sel_event < (int)t.events.size()) {
             ImGui::Separator();
-            event_value_inspector(t, t.events[s.sel_event]);
+            event_value_inspector(t.events[s.sel_event]);
         } else {
             ImGui::TextDisabled("%s", jce_editor_i18n("animationEditor.empty.noEvent"));
         }
@@ -539,7 +642,6 @@ void tick_playback(void)
 
 static void draw_editor_tab(void)
 {
-    if (s.clip.tracks.empty()) clip_reset(&s.clip);
     tick_playback();
     draw_toolbar();
     ImGui::Separator();
@@ -652,7 +754,12 @@ extern "C" int jce_panel_animation_editor_current_tab(void)
 extern "C" void jce_editor_panel_animation_editor(void)
 {
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_ANIMATION_EDITOR);
-    if (!vis || !*vis) return;
+    if (!vis || !*vis) {
+        /* Workbench hidden → the Sequencer tab can no longer restore its
+         * live preview itself; flush it here (no-op when not previewing). */
+        jce_panel_sequencer_preview_flush();
+        return;
+    }
     char _wt[96];
     snprintf(_wt, sizeof(_wt), "%s###jce_anim_editor", jce_editor_i18n("animationEditor.title"));
     if (ImGui::Begin(_wt, vis, ImGuiWindowFlags_NoFocusOnAppearing)) {
@@ -717,6 +824,12 @@ extern "C" void jce_editor_panel_animation_editor(void)
             ImGui::EndTabBar();
             g_request_tab = -1;
         }
+        /* Sequencer tab deselected → restore its live scene preview. */
+        if (g_current_tab != 3)
+            jce_panel_sequencer_preview_flush();
+    } else {
+        /* Window collapsed → the Sequencer tab isn't drawn either. */
+        jce_panel_sequencer_preview_flush();
     }
     ImGui::End();
 }

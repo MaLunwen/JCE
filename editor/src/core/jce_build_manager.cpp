@@ -17,6 +17,8 @@
 #include "jce_build_manager.h"
 
 #include "jce_editor_project.h"
+#include "jce_pak_key.h"
+#include "jce_project_settings.h"
 #include "ui/jce_editor_panels.h"
 
 extern "C" {
@@ -100,6 +102,11 @@ struct FinishPlan {
     std::string cooked_rel;        /* relative, for the staged layout */
     std::string asset_bom_src;     /* generated project asset BOM */
     std::string version_text;      /* full VERSION.txt body */
+    bool        stage_loose = true;/* copy the loose cooked tree (OFF when   *
+                                    * the assets ship encrypted in the PAK)  */
+    std::string warn_loose_dir;    /* encrypting: if this dir exists post-   *
+                                    * build, an old template staged          *
+                                    * plaintext next to the exe — warn       */
 };
 FinishPlan g_finish;
 
@@ -149,10 +156,12 @@ struct PendingProjectBuild {
     /* prepare_project_generated_assets inputs */
     std::string project, sdk, cooked, bundles, variant, arch;
     std::string intermediates_dir, reports_dir;
+    bool        encrypt_assets = false;   /* packaging.encrypt_assets gate */
+    uint8_t     pak_key[32]    = {0};     /* loaded before the worker runs */
 
     /* prepare_project_generated_assets outputs (filled by the worker) */
     std::string out_assets_obj, out_assets_asm, out_assets_c;
-    std::string out_assets_bom, out_bundle_dir;
+    std::string out_assets_bom, out_bundle_dir, out_pak_key_c;
 
     /* Context needed to build the cmake queue + finish plan on the main
      * thread once the cook succeeds. */
@@ -376,6 +385,20 @@ void run_finish_plan()
         log_line(JCE_CONSOLE_INFO, "[build] artifact: " + exe);
     }
 
+    /* Plaintext side-channel check: when assets are encrypted, the project
+     * CMake is told not to stage the loose cooked tree next to the exe
+     * (JCE_PROJECT_STAGE_LOOSE_ASSETS=OFF).  An old project template that
+     * predates the option will have copied it anyway — we can't suppress
+     * that from here, so warn loudly. */
+    if (!g_finish.warn_loose_dir.empty() &&
+        jce_fs_host_exists_dir(g_finish.warn_loose_dir.c_str())) {
+        log_line(JCE_CONSOLE_WARNING,
+                 "[build] encrypted build still staged a loose plaintext "
+                 "asset tree (project CMakeLists predates "
+                 "JCE_PROJECT_STAGE_LOOSE_ASSETS?): " +
+                 g_finish.warn_loose_dir);
+    }
+
     if (!g_finish.stage)
         return;
 
@@ -402,8 +425,14 @@ void run_finish_plan()
     }
 
     /* Stage cooked assets so the packaged game has its PhysFS mount
-     * root alongside the exe (mirrors package-game.bat). */
-    if (!g_finish.cooked_rel.empty() && !g_finish.cooked_src.empty() &&
+     * root alongside the exe (mirrors package-game.bat).  Suppressed when
+     * the assets ship encrypted inside the embedded PAK — staging the
+     * plaintext tree would defeat the encryption. */
+    if (!g_finish.stage_loose) {
+        log_line(JCE_CONSOLE_INFO,
+                 "[build] package: loose cooked assets NOT staged "
+                 "(assets are encrypted inside the embedded PAK)");
+    } else if (!g_finish.cooked_rel.empty() && !g_finish.cooked_src.empty() &&
         jce_fs_host_exists_dir(g_finish.cooked_src.c_str())) {
         std::string cooked_dst = out + PATH_SEP_CHR_LOCAL + g_finish.cooked_rel;
         if (!jce_fs_host_copy_recursive(g_finish.cooked_src.c_str(),
@@ -1564,11 +1593,14 @@ bool prepare_project_generated_assets(const std::string &project,
                                       const std::string &generated_root,
                                       const std::string &reports_dir,
                                       const std::string &arch,
+                                      bool encrypt_assets,
+                                      const uint8_t pak_key[32],
                                       std::string &out_assets_obj,
                                       std::string &out_assets_asm,
                                       std::string &out_assets_c,
                                       std::string &out_bom,
-                                      std::string &out_bundle_dir)
+                                      std::string &out_bundle_dir,
+                                      std::string &out_pak_key_c)
 {
     const std::string gen_dir =
         generated_root + PATH_SEP_CHR_LOCAL + "jce_generated";
@@ -1639,6 +1671,15 @@ bool prepare_project_generated_assets(const std::string &project,
     cfg.compress_index = true;
     cfg.use_dict = true;
     cfg.dedup_content = true;
+    /* Packaging > Encrypt Assets: compress-then-ChaCha20 every entry of the
+     * embedded PAK ("project_assets" seeds the nonce salt).  NOTE this makes
+     * the build depend on .jce/pak_key.hex — deterministic rebuilds require
+     * the same key file. */
+    if (encrypt_assets && pak_key) {
+        cfg.encrypt        = true;
+        cfg.encryption_key = pak_key;
+        cfg.encrypt_label  = "project_assets";
+    }
 
     void *pak_blob = nullptr;
     size_t pak_size = 0;
@@ -1671,7 +1712,29 @@ bool prepare_project_generated_assets(const std::string &project,
              "[build] assets: packed " + std::to_string(items.size()) +
              " file(s) -> " + pak_path + "  bom=" + out_bom +
              "  zstd=" + std::to_string(cfg.zstd_level) +
-             (dict_count ? ("  dicts=" + std::to_string(dict_count)) : ""));
+             (dict_count ? ("  dicts=" + std::to_string(dict_count)) : "") +
+             (cfg.encrypt ? "  encrypted=yes" : ""));
+
+    /* Asset-key delivery: emit jce_generated/jce_pak_key.c with two XOR
+     * shares of the key (regenerated per build) so the runtime can
+     * reconstruct + install it before the first PAK open.  When not
+     * encrypting, remove any stale TU so an old key never ships. */
+    out_pak_key_c.clear();
+    {
+        const std::string key_c = gen_dir + PATH_SEP_CHR_LOCAL + "jce_pak_key.c";
+        if (encrypt_assets && pak_key) {
+            std::string kerr;
+            if (!jce_pak_key_write_shares_c(project, key_c, &kerr)) {
+                set_error("assets: " + kerr);
+                return false;
+            }
+            out_pak_key_c = key_c;
+            log_line(JCE_CONSOLE_INFO,
+                     "[build] assets: embedded key shares -> " + key_c);
+        } else {
+            jce_fs_host_remove_file(key_c.c_str());
+        }
+    }
 
     out_bundle_dir = gen_dir + PATH_SEP_CHR_LOCAL + "bundles";
     if (!jce_fs_host_create_directory(out_bundle_dir.c_str())) {
@@ -1952,8 +2015,9 @@ void asset_prep_worker(void *arg)
     p->ok = prepare_project_generated_assets(
         p->project, p->sdk, p->cooked, p->bundles, p->variant,
         p->intermediates_dir, p->reports_dir, p->arch,
+        p->encrypt_assets, p->encrypt_assets ? p->pak_key : nullptr,
         p->out_assets_obj, p->out_assets_asm, p->out_assets_c,
-        p->out_assets_bom, p->out_bundle_dir);
+        p->out_assets_bom, p->out_bundle_dir, p->out_pak_key_c);
     t_log_sink = nullptr;
     jce_atomic_i32_store(p->done, 1);
 }
@@ -1985,6 +2049,15 @@ void finalize_project_build_pipeline(PendingProjectBuild &p)
         if (!p.out_assets_c.empty())
             a += " -DJCE_PROJECT_PREBUILT_ASSETS_C=" + qtok(p.out_assets_c);
         a += " -DJCE_PROJECT_PREBUILT_BUNDLE_DIR=" + qtok(p.out_bundle_dir);
+        /* Asset-encryption wiring: the generated key-shares TU (when
+         * encrypting) and the loose-asset staging gate.  Both are pinned
+         * with -D/-U every configure — populated cache vars otherwise leak
+         * between variants (the build-dir contamination gotcha). */
+        a += " -U JCE_PROJECT_PREBUILT_PAK_KEY_C";
+        if (!p.out_pak_key_c.empty())
+            a += " -DJCE_PROJECT_PREBUILT_PAK_KEY_C=" + qtok(p.out_pak_key_c);
+        a += std::string(" -DJCE_PROJECT_STAGE_LOOSE_ASSETS=") +
+             (p.encrypt_assets ? "OFF" : "ON");
         a += " -DJCE_DIR=" + qtok(p.cmake_dir);
     };
 
@@ -2048,11 +2121,15 @@ void finalize_project_build_pipeline(PendingProjectBuild &p)
     g_finish.artifact_a    = p.output_dir + PATH_SEP_CHR_LOCAL + p.exe_name;
     g_finish.artifact_b    = p.build_dir + PATH_SEP_CHR_LOCAL + p.exe_name;
     g_finish.asset_bom_src = p.out_assets_bom;
+    if (p.encrypt_assets && !p.cooked.empty())
+        g_finish.warn_loose_dir = p.output_dir + PATH_SEP_CHR_LOCAL +
+                                  join_norm_sep(p.cooked);
 
     if (p.want_package) {
-        g_finish.stage      = true;
-        g_finish.out_dir    = p.package_out_dir;
-        g_finish.cooked_rel = p.cooked;
+        g_finish.stage       = true;
+        g_finish.out_dir     = p.package_out_dir;
+        g_finish.cooked_rel  = p.cooked;
+        g_finish.stage_loose = !p.encrypt_assets;
         if (!p.cooked.empty())
             g_finish.cooked_src = p.project + PATH_SEP_CHR_LOCAL +
                                   join_norm_sep(p.cooked);
@@ -2067,6 +2144,10 @@ void finalize_project_build_pipeline(PendingProjectBuild &p)
         vt += "platform: "; vt += p.platform_tag; vt += "\n";
         vt += "arch:     "; vt += p.arch;         vt += "\n";
         vt += "variant:  "; vt += p.variant;      vt += "\n";
+        if (p.encrypt_assets)
+            vt += "assets:   encrypted (deterministic rebuilds require the "
+                  "same .jce/pak_key.hex; key shares re-randomized per "
+                  "build)\n";
         g_finish.version_text = vt;
     }
 
@@ -2278,6 +2359,38 @@ bool jce_build_manager_start_project_build(const JceBuildProjectConfig *cfg)
     const std::string bundles = (cfg->bundles && cfg->bundles[0])
                                     ? std::string(cfg->bundles) : "";
 
+    /* Packaging > Encrypt Assets (Project Settings).  Debug variants stay
+     * plaintext unless encrypt_debug_builds is also set.  The key is loaded
+     * (or generated on first use — mirroring "generated on first enable")
+     * up-front on the main thread so the worker never touches the editor's
+     * key-management state. */
+    bool    encrypt_assets = false;
+    uint8_t pak_key[32] = {0};
+    {
+        JceProjectSettings ps_local;
+        const JceProjectSettings *ps = jce_project_settings_current();
+        if (!ps) { jce_project_settings_load(&ps_local); ps = &ps_local; }
+        if (ps->packaging.encrypt_assets &&
+            (variant != "debug" || ps->packaging.encrypt_debug_builds)) {
+            if (jce_pak_key_load(project, pak_key)) {
+                encrypt_assets = true;
+            } else {
+                std::string kerr;
+                if (jce_pak_key_generate(project, false, &kerr) &&
+                    jce_pak_key_load(project, pak_key)) {
+                    encrypt_assets = true;
+                    log_line(JCE_CONSOLE_WARNING,
+                             "[build] no asset key found — generated " +
+                             jce_pak_key_path(project));
+                } else {
+                    set_error("packaging: encrypt_assets is enabled but no "
+                              "key is available (" + kerr + ")");
+                    return false;
+                }
+            }
+        }
+    }
+
     /* The cook/pack/embed step (jce_archive_cook + file writes + embed
      * object generation) is the slow, UI-freezing part of a build, so it
      * runs on a worker thread.  Capture everything the cook needs AND
@@ -2294,6 +2407,10 @@ bool jce_build_manager_start_project_build(const JceBuildProjectConfig *cfg)
     p.arch              = arch;
     p.intermediates_dir = intermediates_dir;
     p.reports_dir       = reports_dir;
+    p.encrypt_assets    = encrypt_assets;
+    if (encrypt_assets)
+        memcpy(p.pak_key, pak_key, sizeof(p.pak_key));
+    memset(pak_key, 0, sizeof(pak_key));
     p.build_dir         = build_dir;
     p.output_dir        = output_dir;
     p.archive_dir       = archive_dir;

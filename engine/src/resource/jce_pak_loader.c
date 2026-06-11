@@ -208,6 +208,11 @@ void jce_pak_overlay_push(JcePakArchive *base, JcePakArchive *layer) {
     tail->overlay_next = layer;
 }
 
+void jce_pak_set_decryption_key(JcePakArchive *pak, const uint8_t key[32]) {
+    if (!pak || !pak->ar || !key) return;
+    jce_archive_set_decryption_key(pak->ar, key);
+}
+
 void jce_pak_overlay_remove(JcePakArchive *base, JcePakArchive *layer) {
     if (!base || !layer) return;
     JcePakArchive *prev = base;

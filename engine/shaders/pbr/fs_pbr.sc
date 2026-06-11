@@ -404,40 +404,8 @@ vec3 safe_normalize_vec3(vec3 value, vec3 fallback)
     return fallback;
 }
 
-float checker_cell(vec2 uv, float scale)
-{
-    vec2 cell = floor(uv * scale);
-    float parity = fract((cell.x + cell.y) * 0.5) * 2.0;
-    return parity;
-}
-
-vec3 triplanar_checker(vec3 local_pos)
-{
-    const vec3 magenta = vec3(1.0, 0.0, 1.0);
-    const vec3 black = vec3(0.0, 0.0, 0.0);
-    const float checker_scale = 3.0;
-
-    // Flat face normal in LOCAL space from screen-space derivatives of the
-    // local position. Invariant under the object's model transform, so the
-    // checker stays glued to the mesh when the entity moves or rotates.
-    vec3 local_n = cross(dFdx(local_pos), dFdy(local_pos));
-    float len2 = dot(local_n, local_n);
-    local_n = (len2 > 1e-12) ? local_n * inversesqrt(len2) : vec3(0.0, 1.0, 0.0);
-
-    vec3 weights = abs(local_n);
-    weights = max(weights, vec3_splat(1e-4));
-    weights = pow(weights, vec3_splat(4.0));
-    weights /= (weights.x + weights.y + weights.z);
-
-    vec3 sample_x = mix(magenta, black,
-                        checker_cell(local_pos.yz, checker_scale));
-    vec3 sample_y = mix(magenta, black,
-                        checker_cell(local_pos.xz, checker_scale));
-    vec3 sample_z = mix(magenta, black,
-                        checker_cell(local_pos.xy, checker_scale));
-
-    return sample_x * weights.x + sample_y * weights.y + sample_z * weights.z;
-}
+/* Missing-texture checker lives in pbr_common.sh (missing_texture_checker):
+   UV-space pattern with a dominant-axis local-space fallback. */
 
 void main()
 {
@@ -558,7 +526,7 @@ void main()
     bool useCheckerFallback = (u_normalScale.x < 0.0);
     if (useCheckerFallback)
     {
-        texColor = vec4(triplanar_checker(v_localpos), 1.0);
+        texColor = vec4(missing_texture_checker(v_localpos, v_texcoord0), 1.0);
     }
 
     vec3 albedo;
@@ -586,7 +554,7 @@ void main()
     //   3 WIREFRAME_TEXTURED  → same unlit-albedo branch (host overlays
     //                            the wireframe pass)
     // All view modes load textures; missing albedo is shown as the
-    // triplanar pink/black checker via useCheckerFallback above (never
+    // UV-space pink/black checker via useCheckerFallback above (never
     // a flat white loading surface).
     float viewMode = u_normalScale.z;
     if (viewMode > 1.5)

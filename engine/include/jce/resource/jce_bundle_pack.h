@@ -148,6 +148,18 @@ typedef struct JceBundlePackOptions {
      * Default (0) selects Windows/desktop BC. Only meaningful when
      * cook_assets is true. */
     int         target_platform;
+
+    /* ── Bundle encryption (spec §9.2) ─────────────────────────────────
+     * When `encrypt` is true and `encryption_key` points at 32 bytes,
+     * every entry of every produced .jbundle (including the embedded
+     * __bundle__/manifest.json) is compressed-then-ChaCha20-encrypted,
+     * with the bundle id as the nonce-salt label.  Runtime mounts decrypt
+     * transparently once jce_archive_set_process_key() has been called.
+     * This deters casual extraction only — there is no MAC and the key
+     * ships inside the game binary.  Toggling encryption or changing the
+     * key invalidates the incremental (.prev) cache. */
+    bool           encrypt;
+    const uint8_t *encryption_key;   /* 32 bytes, borrowed */
 } JceBundlePackOptions;
 
 /* Build all bundles described by `opts`.  Returns 0 on success or a

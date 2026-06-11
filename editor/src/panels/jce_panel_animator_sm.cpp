@@ -29,6 +29,7 @@
 #include <jce/tools/jce_imgui.hpp>
 #include "dialogs/jce_path_input.h"
 #include "core/jce_assetdb.h"
+#include "scene/jce_editor_scene_render.h"   /* jce_editor_resolve_asset_path */
 extern "C" {
 #include <jce/os/core/jce_json.h>
 #include <jce/middleware/animation/jce_anim_sm.h>
@@ -382,17 +383,32 @@ void sm_redo(void)
 
 void save_to(const char *path)
 {
-    if (ed_write_json_to_file(path, to_json()))
-        jce_editor_console_log("animator-sm saved: %s", path);
+    /* Scene-relative paths (e.g. "anim/foo.anim_sm.json"): write to the
+     * SAME file the engine reads (assetdb / scene-relative), not to the
+     * process CWD — otherwise Save lands in a surprise location while the
+     * authored asset stays stale (or worse, gets shadowed). */
+    char        resolved[1024];
+    const char *target = path;
+    if (jce_editor_resolve_asset_path(path, resolved, (int)sizeof(resolved)))
+        target = resolved;
+    if (ed_write_json_to_file(target, to_json()))
+        jce_editor_console_log("animator-sm saved: %s", target);
     else
         jce_editor_console_log_level(JCE_CONSOLE_ERROR,
-            "animator-sm save failed: %s", path);
+            "animator-sm save failed: %s", target);
 }
 
 void load_from(const char *path)
 {
     size_t sz = 0;
     char *buf = (char *)ed_read_file(path, &sz);
+    if (!buf) {
+        /* Retry through the asset-path resolver (assetdb root / scene
+         * walk-up) so scene-relative paths load like every other asset. */
+        char resolved[1024];
+        if (jce_editor_resolve_asset_path(path, resolved, (int)sizeof(resolved)))
+            buf = (char *)ed_read_file(resolved, &sz);
+    }
     if (!buf) {
         jce_editor_console_log_level(JCE_CONSOLE_ERROR,
             "animator-sm load failed: %s", path);

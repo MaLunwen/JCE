@@ -54,6 +54,10 @@ JCE_API uint32_t jce_skeleton_joint_count(const JceSkeleton *skel);
 /* Find a joint index by name. Returns -1 if not found. */
 JCE_API int jce_skeleton_find_joint(const JceSkeleton *skel, const char *name);
 
+/* Parent joint index of joint_idx, or -1 for roots / out-of-range.
+ * Joints are ordered so a parent always precedes its children. */
+JCE_API int jce_skeleton_joint_parent(const JceSkeleton *skel, uint32_t joint_idx);
+
 /* Get the rest-pose local transforms (array of [joint_count] mat4). */
 JCE_API const jce_mat4 *jce_skeleton_rest_pose(const JceSkeleton *skel);
 

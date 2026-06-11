@@ -47,6 +47,19 @@ typedef struct JceCookConfig {
     bool    use_dict;         /* train + use JSON/TEXT/SHADER dictionaries  */
     bool    dedup_content;    /* coalesce byte-identical payloads (one copy *
                                * on disk; entries share data_offset)        */
+
+    /* ── Optional payload encryption (spec §9.2) ─────────────────────────
+     * When `encrypt` is true and `encryption_key` is non-NULL, EVERY input
+     * (including any manifest entry) is compressed-then-ChaCha20-encrypted.
+     * `encrypt_label` (bundle id / "project_assets") seeds the per-archive
+     * nonce salt so the same path in two archives never shares a keystream;
+     * NULL/empty selects the legacy zero salt.  Encryption is keyed
+     * obfuscation, NOT tamper-proofing: there is no MAC, and the key ships
+     * inside the game binary.  Note: dedup_content is effectively disabled
+     * for encrypted entries (their per-path nonce makes ciphertext unique). */
+    bool           encrypt;
+    const uint8_t *encryption_key;  /* 32 bytes, borrowed                  */
+    const char    *encrypt_label;   /* nonce-salt label, borrowed          */
 } JceCookConfig;
 
 /* Build a JPAK v1 archive from `inputs` into a freshly jce_malloc'd buffer

@@ -22,6 +22,8 @@
 
 JCE_EXTERN_C_BEGIN
 
+typedef struct JcePakArchive JcePakArchive;
+
 /* Callback signature for locale-change notifications. */
 typedef void (*JceLocChangedFn)(const char *locale, void *userdata);
 
@@ -33,6 +35,17 @@ JCE_API void JCE_CALL jce_loc_init(const char *host_dir_prefix);
 
 /* Release all interned strings and reset state. */
 JCE_API void JCE_CALL jce_loc_shutdown(void);
+
+/* Register a PAK archive as a fallback locale source.  When set,
+   jce_loc_set_locale() first tries the host directory passed to
+   jce_loc_init() (editor hot-edits win), then falls back to
+   "<pak_dir_prefix>/<locale>.json" inside `pak` (e.g. "i18n/zh_cn.json").
+   This is the load path for shipped/WASM builds where locale files live
+   only inside the game PAK.  The archive is borrowed, never owned — it
+   must outlive the source registration.  Pass pak=NULL to clear; the
+   source is also cleared by jce_loc_init()/jce_loc_shutdown(). */
+JCE_API void JCE_CALL jce_loc_set_source_pak(const JcePakArchive *pak,
+                                             const char *pak_dir_prefix);
 
 /* Load the locale file for `locale_name` (e.g. "en", "zh_cn"),
    replace the current translation table, and fire all registered listeners. */

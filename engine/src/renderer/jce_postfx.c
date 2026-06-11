@@ -47,6 +47,7 @@ struct JcePostFXPipeline {
     bgfx_program_handle_t prog_chromatic;
     bgfx_program_handle_t prog_grayscale;
     bgfx_program_handle_t prog_composite;  /* uber: combine+tonemap+chromatic+vignette+grayscale */
+    bgfx_program_handle_t prog_present;    /* pass-through: output -> backbuffer (runtime path) */
 
     /* Uniforms. */
     bgfx_uniform_handle_t u_texColor;
@@ -234,6 +235,7 @@ JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
     p->prog_chromatic.idx     = UINT16_MAX;
     p->prog_grayscale.idx     = UINT16_MAX;
     p->prog_composite.idx     = UINT16_MAX;
+    p->prog_present.idx       = UINT16_MAX;
     p->prog_custom.idx        = UINT16_MAX;
     p->shader_pak             = NULL;
     p->custom_name[0]         = '\0';
@@ -315,6 +317,7 @@ void jce_postfx_destroy(JcePostFXPipeline *pipeline)
     if (pipeline->prog_chromatic.idx     != UINT16_MAX) bgfx_destroy_program(pipeline->prog_chromatic);
     if (pipeline->prog_grayscale.idx     != UINT16_MAX) bgfx_destroy_program(pipeline->prog_grayscale);
     if (pipeline->prog_composite.idx     != UINT16_MAX) bgfx_destroy_program(pipeline->prog_composite);
+    if (pipeline->prog_present.idx       != UINT16_MAX) bgfx_destroy_program(pipeline->prog_present);
     if (pipeline->prog_custom.idx        != UINT16_MAX) bgfx_destroy_program(pipeline->prog_custom);
 
     jce_allocator_t a = pipeline->alloc;
@@ -463,6 +466,7 @@ bool jce_postfx_load_shaders(JcePostFXPipeline *pipeline,
     pipeline->prog_chromatic     = load_postfx_prog(pak, "chromatic");
     pipeline->prog_grayscale     = load_postfx_prog(pak, "grayscale");
     pipeline->prog_composite     = load_postfx_prog(pak, "composite");
+    pipeline->prog_present       = load_postfx_prog(pak, "present");
 
     /* Count how many loaded successfully. */
     int loaded = 0;
@@ -742,6 +746,27 @@ JceTextureHandle jce_postfx_get_output(const JcePostFXPipeline *pipeline)
     if (pipeline)
         h.idx = pipeline->output_tex.idx;
     return h;
+}
+
+void jce_postfx_present(JcePostFXPipeline *pipeline,
+                        uint32_t width, uint32_t height)
+{
+    bgfx_frame_buffer_handle_t backbuffer = { UINT16_MAX };
+    uint16_t view_id;
+    if (!pipeline || pipeline->prog_present.idx == UINT16_MAX)
+        return;
+    if (pipeline->output_tex.idx == UINT16_MAX)
+        return;
+    /* One view past the chain's worst case (bloom 3 + composite + fxaa +
+     * custom = 6 views from view_base) so submission order is preserved. */
+    view_id = (uint16_t)(pipeline->view_base + 8);
+    bgfx_set_view_rect(view_id, 0, 0, (uint16_t)width, (uint16_t)height);
+    bgfx_set_view_frame_buffer(view_id, backbuffer);
+    bgfx_set_view_clear(view_id, BGFX_CLEAR_NONE, 0, 1.0f, 0);
+    bgfx_set_view_name(view_id, "PostFX/Present", INT32_MAX);
+    bgfx_set_texture(0, pipeline->u_texColor, pipeline->output_tex,
+                     UINT32_MAX);
+    draw_fullscreen(pipeline, view_id, pipeline->prog_present);
 }
 
 uint16_t jce_postfx_get_output_framebuffer(const JcePostFXPipeline *pipeline)

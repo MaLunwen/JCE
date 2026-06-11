@@ -13,6 +13,7 @@
 extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/physics/jce_physics_debug.h>
+#include <jce/middleware/ai/jce_navmesh_recast.h>
 #include <jce/os/core/jce_log.h>
 }
 
@@ -20,6 +21,9 @@ extern "C" {
 #include "gizmo/jce_gizmo_joint.h"
 #include "gizmo/jce_gizmo_cloth.h"
 #include "gizmo/jce_gizmo_compound_collider.h"
+
+#include <cstdio>
+#include <string>
 
 /* ── Animation timer reset (kept for play.cpp compatibility) ─────── */
 
@@ -217,6 +221,153 @@ static void outline_draw_frustum(jce_vec3 origin, jce_quat rot,
     jce_debug_draw_line(origin, nc, abgr);
 }
 
+/* ── 2D collider outline (Box2D body, XY plane) ───────────────────── */
+
+/* Rotate (px,py) by (cos=c, sin=s), translate to (cx,cy); z carried for
+ * display only — the 2D simulation has no Z. */
+static jce_vec3 collider2d_pt(float cx, float cy, float z,
+                              float c, float s, float px, float py)
+{
+    return jce_v3(cx + c * px - s * py, cy + s * px + c * py, z);
+}
+
+/* 4-edge box loop in the rotated 2D frame. */
+static void collider2d_box_loop(float cx, float cy, float z, float c, float s,
+                                float hx, float hy, uint32_t abgr)
+{
+    jce_vec3 p0 = collider2d_pt(cx, cy, z, c, s, -hx, -hy);
+    jce_vec3 p1 = collider2d_pt(cx, cy, z, c, s,  hx, -hy);
+    jce_vec3 p2 = collider2d_pt(cx, cy, z, c, s,  hx,  hy);
+    jce_vec3 p3 = collider2d_pt(cx, cy, z, c, s, -hx,  hy);
+    jce_debug_draw_line(p0, p1, abgr);
+    jce_debug_draw_line(p1, p2, abgr);
+    jce_debug_draw_line(p2, p3, abgr);
+    jce_debug_draw_line(p3, p0, abgr);
+}
+
+/* Draw a JceCollider2DComponent as line loops in the XY plane (the 2D
+ * world is XY).  Mirrors the RUNTIME interpretation exactly
+ * (jce_runtime.c rt_spawn_body2d): `offset` is added to the entity
+ * position UNrotated and UNscaled (the shape then rotates about that
+ * body origin by the transform's Z angle), box/edge extents scale by the
+ * entity's |XY| scale, the circle/capsule radius scales by max(|sx|,|sy|),
+ * and the capsule is always vertical (the runtime ignores
+ * capsule_direction).  Edge/polygon connect the AUTHORED points array
+ * when present; with no points they fall back to the shapes the runtime
+ * actually spawns (horizontal segment / bounding box). */
+static void draw_collider2d_outline(const JceTransform *t,
+                                    const JceCollider2DComponent *col,
+                                    uint32_t abgr_box, uint32_t abgr_circle,
+                                    uint32_t abgr_capsule)
+{
+    float sx = (t->scale.x != 0.0f) ? fabsf(t->scale.x) : 1.0f;
+    float sy = (t->scale.y != 0.0f) ? fabsf(t->scale.y) : 1.0f;
+    float smax = fmaxf(sx, sy);
+
+    /* Body origin = entity position + world-axis offset (NOT rotated,
+     * NOT scaled — matching rt_spawn_body2d). */
+    float cx = t->position.x + col->offset[0];
+    float cy = t->position.y + col->offset[1];
+    float z  = t->position.z;
+
+    /* Z-rotation angle recovered from the quaternion the same way the
+     * runtime seeds the Box2D body angle. */
+    jce_quat q = t->rotation;
+    float ang = atan2f(2.0f * (q.w * q.z + q.x * q.y),
+                       1.0f - 2.0f * (q.y * q.y + q.z * q.z));
+    float c = cosf(ang), s = sinf(ang);
+
+    switch (col->shape) {
+        case JCE_COLLIDER_2D_CIRCLE: {
+            float r = ((col->radius > 0.0f) ? col->radius : 0.5f) * smax;
+            const int seg = 24;
+            jce_vec3 prev = jce_v3(cx + r, cy, z);
+            for (int k = 1; k <= seg; k++) {
+                float a = (float)k * (6.2831853f / (float)seg);
+                jce_vec3 p = jce_v3(cx + cosf(a) * r, cy + sinf(a) * r, z);
+                jce_debug_draw_line(prev, p, abgr_circle);
+                prev = p;
+            }
+            break;
+        }
+        case JCE_COLLIDER_2D_CAPSULE: {
+            /* Vertical stadium: cap centers at (0,±hl), radius r. */
+            float r  = ((col->radius > 0.0f) ? col->radius : 0.25f) * smax;
+            float hl = 0.5f * ((col->size[1] > 0.0f) ? col->size[1] : 1.0f) * sy;
+            const int seg = 12;     /* per semicircle cap */
+            jce_vec3 prev = collider2d_pt(cx, cy, z, c, s, r, -hl);
+            /* Bottom cap: 0 → -π. */
+            for (int k = 1; k <= seg; k++) {
+                float a = -(float)k * (3.1415927f / (float)seg);
+                jce_vec3 p = collider2d_pt(cx, cy, z, c, s,
+                                           cosf(a) * r, -hl + sinf(a) * r);
+                jce_debug_draw_line(prev, p, abgr_capsule);
+                prev = p;
+            }
+            /* Left side up to the top-cap start. */
+            jce_vec3 tl = collider2d_pt(cx, cy, z, c, s, -r, hl);
+            jce_debug_draw_line(prev, tl, abgr_capsule);
+            prev = tl;
+            /* Top cap: π → 0. */
+            for (int k = 1; k <= seg; k++) {
+                float a = 3.1415927f - (float)k * (3.1415927f / (float)seg);
+                jce_vec3 p = collider2d_pt(cx, cy, z, c, s,
+                                           cosf(a) * r, hl + sinf(a) * r);
+                jce_debug_draw_line(prev, p, abgr_capsule);
+                prev = p;
+            }
+            /* Right side back down to the start. */
+            jce_debug_draw_line(prev,
+                collider2d_pt(cx, cy, z, c, s, r, -hl), abgr_capsule);
+            break;
+        }
+        case JCE_COLLIDER_2D_EDGE:
+        case JCE_COLLIDER_2D_POLYGON: {
+            int n = col->point_count;
+            if (n > JCE_COLLIDER_2D_MAX_POINTS) n = JCE_COLLIDER_2D_MAX_POINTS;
+            bool poly = (col->shape == JCE_COLLIDER_2D_POLYGON);
+            if (n >= 2) {
+                jce_vec3 first = collider2d_pt(cx, cy, z, c, s,
+                                               col->points[0][0] * sx,
+                                               col->points[0][1] * sy);
+                jce_vec3 prev = first;
+                for (int k = 1; k < n; k++) {
+                    jce_vec3 p = collider2d_pt(cx, cy, z, c, s,
+                                               col->points[k][0] * sx,
+                                               col->points[k][1] * sy);
+                    jce_debug_draw_line(prev, p, abgr_box);
+                    prev = p;
+                }
+                if (poly && n >= 3)   /* close the loop */
+                    jce_debug_draw_line(prev, first, abgr_box);
+            } else if (!poly) {
+                /* No points authored — the runtime spawns a horizontal
+                 * segment spanning size.x. */
+                float hx = 0.5f * ((col->size[0] > 0.0f) ? col->size[0] : 1.0f) * sx;
+                jce_debug_draw_line(collider2d_pt(cx, cy, z, c, s, -hx, 0.0f),
+                                    collider2d_pt(cx, cy, z, c, s,  hx, 0.0f),
+                                    abgr_box);
+            } else {
+                /* Degenerate polygon — the runtime falls back to the
+                 * collider's bounding box; draw that. */
+                collider2d_box_loop(cx, cy, z, c, s,
+                    0.5f * ((col->size[0] > 0.0f) ? col->size[0] : 1.0f) * sx,
+                    0.5f * ((col->size[1] > 0.0f) ? col->size[1] : 1.0f) * sy,
+                    abgr_box);
+            }
+            break;
+        }
+        case JCE_COLLIDER_2D_BOX:
+        default: {
+            collider2d_box_loop(cx, cy, z, c, s,
+                0.5f * ((col->size[0] > 0.0f) ? col->size[0] : 1.0f) * sx,
+                0.5f * ((col->size[1] > 0.0f) ? col->size[1] : 1.0f) * sy,
+                abgr_box);
+            break;
+        }
+    }
+}
+
 /* Draws a highlight on every selected entity:
  *   - With a static mesh        → wireframe overlay on the actual geometry.
  *   - Point/Spot light          → real influence sphere or cone.
@@ -401,6 +552,24 @@ void draw_selection_outlines(void)
             drew_shape = true;
         }
 
+        /* --- Virtual camera (Cinemachine-style) → short preview frustum at
+         *     the entity pose. The LIVE vcam pose may differ at runtime
+         *     (follow/look-at targets resolve in jce_vcam_system_evaluate);
+         *     the gizmo anchors at the selected entity so it tracks what the
+         *     user is manipulating. Magenta keeps it distinct from the real
+         *     camera frustum (amber col_outline above). */
+        if (jce_scene_has_virtual_camera(scene, e)) {
+            JceVirtualCameraComponent *vc =
+                jce_scene_get_virtual_camera(scene, e);
+            if (vc) {
+                const uint32_t col_vcam = 0xFFFF00FFu; /* ABGR magenta */
+                outline_draw_frustum(t->position, t->rotation,
+                                     (vc->fov_deg > 0.0f) ? vc->fov_deg : 60.0f,
+                                     0.1f, 3.0f, false, col_vcam);
+                drew_shape = true;
+            }
+        }
+
         /* --- Collider shapes (real geometry).  size/radius are
          *     interpreted in local entity space and scaled by the
          *     entity's TRS scale, matching Unity-style authoring. */
@@ -473,9 +642,242 @@ void draw_selection_outlines(void)
             jce_debug_draw_capsule(cap_c, r, hh, t->rotation, col_outline);
             drew_shape = true;
         }
+        /* Mesh collider: the real fitted wireframe comes from the dedicated
+         * gizmo pass (draw_compound_collider_gizmos) — just suppress the
+         * generic unit-box fallback for mesh-collider-only entities. */
+        if (jce_scene_has_mesh_collider(scene, e))
+            drew_shape = true;
+
+        /* --- 2D collider (Box2D body, XY plane). */
+        if (jce_scene_has_collider2d(scene, e)) {
+            JceCollider2DComponent *c2 = jce_scene_get_collider2d(scene, e);
+            if (c2) {
+                draw_collider2d_outline(t, c2, col_outline, col_outline,
+                                        col_outline);
+                drew_shape = true;
+            }
+        }
+
+        /* --- Trigger volume (gameplay region, not a collider).  Mirrors the
+         *     RUNTIME interpretation exactly (jce_runtime.c rt trigger sync):
+         *     center is a world-axis offset from the entity position — NOT
+         *     rotated by the entity and NOT scaled — and the OBB basis comes
+         *     from the component's own axes. Drawing anything else would lie
+         *     about where the trigger actually fires. */
+        if (jce_scene_has_trigger_volume(scene, e)) {
+            JceTriggerVolumeComponent *tv = jce_scene_get_trigger_volume(scene, e);
+            if (tv) {
+                jce_vec3 c = jce_v3(t->position.x + tv->center[0],
+                                    t->position.y + tv->center[1],
+                                    t->position.z + tv->center[2]);
+                if (tv->shape == JCE_TRIGGER_VOL_SPHERE) {
+                    float r = (tv->half_extents[0] > 0.0f)
+                            ? tv->half_extents[0] : 0.5f;
+                    jce_debug_draw_sphere(c, r, col_outline);
+                } else if (tv->shape == JCE_TRIGGER_VOL_OBB) {
+                    /* 12 edges from the component's own basis. */
+                    jce_vec3 ax = jce_v3(tv->axis_x[0], tv->axis_x[1], tv->axis_x[2]);
+                    jce_vec3 ay = jce_v3(tv->axis_y[0], tv->axis_y[1], tv->axis_y[2]);
+                    jce_vec3 az = jce_v3(tv->axis_z[0], tv->axis_z[1], tv->axis_z[2]);
+                    ax = jce_v3_scale(ax, tv->half_extents[0]);
+                    ay = jce_v3_scale(ay, tv->half_extents[1]);
+                    az = jce_v3_scale(az, tv->half_extents[2]);
+                    jce_vec3 corners[8];
+                    for (int ci = 0; ci < 8; ci++) {
+                        jce_vec3 p = c;
+                        p = jce_v3_add(p, jce_v3_scale(ax, (ci & 1) ? 1.0f : -1.0f));
+                        p = jce_v3_add(p, jce_v3_scale(ay, (ci & 2) ? 1.0f : -1.0f));
+                        p = jce_v3_add(p, jce_v3_scale(az, (ci & 4) ? 1.0f : -1.0f));
+                        corners[ci] = p;
+                    }
+                    static const int edges[12][2] = {
+                        {0,1},{2,3},{4,5},{6,7},   /* x edges */
+                        {0,2},{1,3},{4,6},{5,7},   /* y edges */
+                        {0,4},{1,5},{2,6},{3,7},   /* z edges */
+                    };
+                    for (int ei = 0; ei < 12; ei++)
+                        jce_debug_draw_line(corners[edges[ei][0]],
+                                            corners[edges[ei][1]], col_outline);
+                } else { /* AABB — axis-aligned, ignores entity rotation */
+                    jce_vec3 half = jce_v3(tv->half_extents[0],
+                                           tv->half_extents[1],
+                                           tv->half_extents[2]);
+                    jce_debug_draw_box(c, half, jce_q_identity(), col_outline);
+                }
+                drew_shape = true;
+            }
+        }
+
+        /* --- AI perception senses (BehaviorTree component).  Mirrors the
+         *     runtime perception binding (rt_spawn_gameplay): sight is a cone
+         *     along the entity's forward (-Z, same convention as the camera
+         *     frustum above), hearing is an omnidirectional radius around the
+         *     entity position.  sight_half_angle is stored in RADIANS (the
+         *     inspector converts from degrees on edit).  Values <=0 mean "use
+         *     the engine default at spawn", so only explicitly authored
+         *     ranges are drawn here. */
+        if (jce_scene_has_behavior_tree(scene, e)) {
+            JceBehaviorTree *bt = jce_scene_get_behavior_tree(scene, e);
+            if (bt) {
+                /* ABGR. Violet — deliberately distinct from the amber
+                 * col_outline used for colliders/lights and from the physics
+                 * debug palette; hearing is the same hue alpha-dimmed. */
+                const uint32_t col_sight   = 0xFFFF40C0u;
+                const uint32_t col_hearing = 0x66FF40C0u;
+                if (bt->sight_range > 0.0f) {
+                    jce_vec3 fwd = jce_q_rotate(t->rotation,
+                                                jce_v3(0.0f, 0.0f, -1.0f));
+                    float half = (bt->sight_half_angle > 0.0f)
+                               ? bt->sight_half_angle
+                               : 1.0472f;          /* engine default: 60° */
+                    if (half > 1.55f) half = 1.55f; /* keep tanf() sane */
+                    outline_draw_cone(t->position, fwd, bt->sight_range,
+                                      half, col_sight);
+                    drew_shape = true;
+                }
+                if (bt->hearing_range > 0.0f) {
+                    jce_debug_draw_sphere(t->position, bt->hearing_range,
+                                          col_hearing);
+                    drew_shape = true;
+                }
+            }
+        }
+
+        /* --- Rendering / audio volume gizmos.  Each mirrors its CONSUMER's
+         *     interpretation: the post-FX Volume box is AXIS-ALIGNED around
+         *     the entity position (jce_volume_system.c ignores rotation),
+         *     reflection-probe / light-probe offsets are world-axis and
+         *     unscaled (sr_gather_baked_gi), and the reverb zone is a sphere
+         *     at the entity position (rt_reverb_zone_collect).  All hues are
+         *     alpha-dimmed (0x66 precedent above) and mutually distinct. */
+        if (jce_scene_has_volume(scene, e)) {
+            JceVolumeComponent *vol = jce_scene_get_volume(scene, e);
+            /* Global volumes have no spatial bounds — nothing honest to
+             * draw, so let the generic fallback box mark the entity. */
+            if (vol && !vol->is_global) {
+                const uint32_t col_vol = 0x6680FF40u; /* spring green */
+                if (vol->shape == JCE_VOLUME_SHAPE_SPHERE) {
+                    float r = (vol->extents.x > 0.0f) ? vol->extents.x : 0.5f;
+                    jce_debug_draw_sphere(t->position, r, col_vol);
+                } else {
+                    jce_vec3 half = jce_v3(
+                        (vol->extents.x > 0.0f) ? vol->extents.x : 0.5f,
+                        (vol->extents.y > 0.0f) ? vol->extents.y : 0.5f,
+                        (vol->extents.z > 0.0f) ? vol->extents.z : 0.5f);
+                    jce_debug_draw_box(t->position, half, jce_q_identity(),
+                                       col_vol);
+                }
+                drew_shape = true;
+            }
+        }
+        if (jce_scene_has_reflection_probe(scene, e)) {
+            JceReflectionProbeComponent *rp =
+                jce_scene_get_reflection_probe(scene, e);
+            if (rp) {
+                const uint32_t col_rp = 0x66FFA040u; /* sky blue */
+                jce_vec3 pc = jce_v3(t->position.x + rp->box_offset[0],
+                                     t->position.y + rp->box_offset[1],
+                                     t->position.z + rp->box_offset[2]);
+                jce_vec3 half = jce_v3(
+                    (rp->box_size[0] > 0.0f) ? 0.5f * rp->box_size[0] : 0.5f,
+                    (rp->box_size[1] > 0.0f) ? 0.5f * rp->box_size[1] : 0.5f,
+                    (rp->box_size[2] > 0.0f) ? 0.5f * rp->box_size[2] : 0.5f);
+                jce_debug_draw_box(pc, half, jce_q_identity(), col_rp);
+                drew_shape = true;
+            }
+        }
+        if (jce_scene_has_audio_reverb_zone(scene, e)) {
+            JceAudioReverbZoneComponent *rz =
+                jce_scene_get_audio_reverb_zone(scene, e);
+            if (rz) {
+                /* Outer sphere = max_distance (blend-out edge), inner =
+                 * min_distance (full strength); defaults per the runtime. */
+                const uint32_t col_rz = 0x6620D0FFu; /* gold */
+                float maxd = (rz->max_distance > 0.0f) ? rz->max_distance
+                                                       : 10.0f;
+                float mind = (rz->min_distance > 0.0f) ? rz->min_distance
+                                                       : 0.0f;
+                if (mind > maxd) mind = maxd;
+                jce_debug_draw_sphere(t->position, maxd, col_rz);
+                if (mind > 0.0f)
+                    jce_debug_draw_sphere(t->position, mind, col_rz);
+                drew_shape = true;
+            }
+        }
+        /* --- Audio source hearing range.  Mirrors the runtime gate exactly
+         *     (rt_finish_audio_source, jce_runtime.c): a voice goes 3D only
+         *     when spatial_blend > 0.5, and the component has NO distance
+         *     fields — the runtime hardcodes INVERSE attenuation with
+         *     min 1 / max 25 / rolloff 1, so those constants ARE the truth.
+         *     Inner sphere = full-volume radius; dimmed outer sphere = the
+         *     distance clamp of the inverse falloff (gain stops decreasing
+         *     past it).  2D sources keep the generic fallback box.  Olive
+         *     keeps it in the reverb zone's warm family yet distinct. */
+        if (jce_scene_has_audio_source(scene, e)) {
+            JceAudioSourceComponent *as = jce_scene_get_audio_source(scene, e);
+            if (as && as->spatial_blend > 0.5f) {
+                const float min_d = 1.0f;   /* keep in sync with          */
+                const float max_d = 25.0f;  /* rt_finish_audio_source     */
+                const uint32_t col_as_min = 0xCC00C5CCu; /* olive */
+                const uint32_t col_as_max = 0x6600C5CCu; /* olive, dimmed */
+                jce_debug_draw_sphere(t->position, min_d, col_as_min);
+                jce_debug_draw_sphere(t->position, max_d, col_as_max);
+                drew_shape = true;
+            }
+        }
+        if (jce_scene_has_light_probe_group(scene, e)) {
+            JceLightProbeGroupComponent *lpg =
+                jce_scene_get_light_probe_group(scene, e);
+            if (lpg && lpg->probe_count > 0) {
+                const uint32_t col_lp = 0x66F0F0F0u; /* pale grey */
+                const float cr = 0.15f;   /* cross half-size */
+                int n = lpg->probe_count;
+                if (n > JCE_LIGHT_PROBE_MAX) n = JCE_LIGHT_PROBE_MAX;
+                for (int pi = 0; pi < n; pi++) {
+                    jce_vec3 p = jce_v3(t->position.x + lpg->positions[pi][0],
+                                        t->position.y + lpg->positions[pi][1],
+                                        t->position.z + lpg->positions[pi][2]);
+                    jce_debug_draw_line(jce_v3(p.x - cr, p.y, p.z),
+                                        jce_v3(p.x + cr, p.y, p.z), col_lp);
+                    jce_debug_draw_line(jce_v3(p.x, p.y - cr, p.z),
+                                        jce_v3(p.x, p.y + cr, p.z), col_lp);
+                    jce_debug_draw_line(jce_v3(p.x, p.y, p.z - cr),
+                                        jce_v3(p.x, p.y, p.z + cr), col_lp);
+                }
+                drew_shape = true;
+            }
+        }
+        if (jce_scene_has_decal(scene, e)) {
+            JceDecalComponent *dec = jce_scene_get_decal(scene, e);
+            if (dec) {
+                /* Projector box: width size[0] along local X, height size[1]
+                 * along local Z, projecting depth size[2] down local -Y; the
+                 * pivot is a world-axis offset of the box centre.  The stamp
+                 * lands on the box's far (-Y) face — matching
+                 * sr_decal_each_entity, defaults included. */
+                const uint32_t col_dc = 0x66B040FFu; /* pink */
+                float w = (dec->size[0] > 0.0f) ? dec->size[0] : 1.0f;
+                float h = (dec->size[1] > 0.0f) ? dec->size[1] : w;
+                float depth = (dec->size[2] > 0.0f) ? dec->size[2] : 1.0f;
+                jce_vec3 down = jce_q_rotate(t->rotation,
+                                             jce_v3(0.0f, -1.0f, 0.0f));
+                jce_vec3 bc2 = jce_v3(t->position.x + dec->pivot[0],
+                                      t->position.y + dec->pivot[1],
+                                      t->position.z + dec->pivot[2]);
+                jce_debug_draw_box(bc2,
+                                   jce_v3(0.5f * w, 0.5f * depth, 0.5f * h),
+                                   t->rotation, col_dc);
+                /* Projection-direction stub down to the stamp face. */
+                jce_vec3 face = jce_v3_add(bc2,
+                                           jce_v3_scale(down, 0.5f * depth));
+                jce_debug_draw_line(bc2, face, col_dc);
+                drew_shape = true;
+            }
+        }
 
         /* --- Generic fallback for transform-only entities (empties,
-         *     audio sources, particle emitters, prefab roots …). */
+         *     non-spatial audio sources, particle emitters, prefab
+         *     roots …). */
         if (!drew_shape) {
             float sx = (t->scale.x != 0.0f) ? fabsf(t->scale.x) : 1.0f;
             float sy = (t->scale.y != 0.0f) ? fabsf(t->scale.y) : 1.0f;
@@ -586,6 +988,14 @@ void draw_physics_debug(void)
             jce_vec3 cc_c = t->position; cc_c.y += hh + r;  /* feet -> capsule center */
             jce_debug_draw_capsule(cc_c, r, hh, q, col_capsule);
         }
+        /* 2D collider (Box2D body, XY plane): authored-shape outline with
+         * the same per-shape palette as the 3D primitives above. */
+        if (jce_scene_has_collider2d(scene, e)) {
+            JceCollider2DComponent *c2 = jce_scene_get_collider2d(scene, e);
+            if (c2)
+                draw_collider2d_outline(t, c2, col_box, col_sphere,
+                                        col_capsule);
+        }
         /* Compound (cooked V-HACD/trimesh) colliders: draw the real fitted
          * hulls/triangles so the overlay reflects EVERY collidable object, not
          * just box/sphere/capsule primitives. Cook is cached per model path. */
@@ -599,6 +1009,19 @@ void draw_physics_debug(void)
                 if (detailed) detail_budget--;
                 jce_gizmo_compound_collider_draw_from_component(
                     scene, e, cpc, col_box, detailed);
+            }
+        }
+        /* Mesh colliders: same fitted-wireframe overlay through the synthetic
+         * single-shape forwarder, same near/far detail LOD as compound. */
+        if (jce_scene_has_mesh_collider(scene, e)) {
+            JceMeshColliderComponent *msc = jce_scene_get_mesh_collider(scene, e);
+            if (msc) {
+                jce_vec3 dd = jce_v3_sub(t->position, cam_pos);
+                float dist2 = dd.x * dd.x + dd.y * dd.y + dd.z * dd.z;
+                int detailed = (dist2 < detail_dist2 && detail_budget > 0) ? 1 : 0;
+                if (detailed) detail_budget--;
+                jce_gizmo_mesh_collider_draw_from_component(
+                    scene, e, msc, col_box, detailed);
             }
         }
     }
@@ -679,6 +1102,138 @@ void draw_cloth_gizmos(void)
     if (drew_any) jce_debug_draw_flush(scene_view_id(), s_sr.renderer);
 }
 
+/* ── Navmesh overlay (P1-navmesh-chain) ──────────────────────────── */
+
+/* Edge sink for jce_recast_debug_edges: boundary edges draw bright,
+ * inner edges translucent; both lifted slightly above the surface so
+ * the lines never z-fight the walkable geometry. */
+static void navmesh_overlay_emit_edge(void *user, const float a[3],
+                                      const float b[3], bool boundary)
+{
+    (void)user;
+    const float lift = 0.05f;
+    uint32_t abgr = boundary ? 0xFF00A5FFu : 0x6600A5FFu; /* orange-ish */
+    jce_debug_draw_line(jce_v3(a[0], a[1] + lift, a[2]),
+                        jce_v3(b[0], b[1] + lift, b[2]), abgr);
+}
+
+/* Draw the baked navmesh (the "<scene>.navmesh.bin" sibling of the current
+ * scene — the same file Play mode hands the runtime) as a wireframe overlay.
+ * Gated on JCE_SHOW_FLAG_NAVMESH; the mesh is lazily loaded and cached per
+ * (path, mtime), so a re-bake from the NavMesh panel is picked up on the
+ * next draw and a missing/broken file is not retried every frame. */
+void draw_navmesh_overlay(void)
+{
+    static JceRecastNavMesh *s_nm = NULL;
+    static char    s_nm_path[1024] = { 0 };
+    static int64_t s_nm_mtime      = 0;
+
+    if (!jce_state_show_flag(JCE_SHOW_FLAG_NAVMESH)) return;
+
+    /* Derive "<scene path minus extension>.navmesh.bin" (same rule as
+     * jce_editor_play.cpp hands the runtime). */
+    const char *scene_path = jce_state_get_current_scene_path();
+    if (!scene_path || !scene_path[0]) return;
+    std::string np = scene_path;
+    const char *sfxs[] = { ".scene.json", ".json" };
+    for (const char *sfx : sfxs) {
+        size_t sl = strlen(sfx);
+        if (np.size() >= sl && np.compare(np.size() - sl, sl, sfx) == 0) {
+            np.erase(np.size() - sl);
+            break;
+        }
+    }
+    np += ".navmesh.bin";
+
+    int64_t mtime = 0;
+    if (!jce_fs_host_get_mtime(np.c_str(), &mtime)) mtime = 0;
+
+    /* (Re)load only when the path or mtime changed; a failed load leaves
+     * s_nm NULL for that (path, mtime) pair, so it is not retried per frame. */
+    if (np != s_nm_path || mtime != s_nm_mtime) {
+        if (s_nm) { jce_recast_destroy(s_nm); s_nm = NULL; }
+        snprintf(s_nm_path, sizeof(s_nm_path), "%s", np.c_str());
+        s_nm_mtime = mtime;
+        if (mtime != 0)
+            s_nm = jce_recast_load_file(np.c_str());
+    }
+    if (!s_nm) return;
+
+    if (jce_recast_debug_edges(s_nm, navmesh_overlay_emit_edge, NULL) > 0)
+        jce_debug_draw_flush(scene_view_id(), s_sr.renderer);
+}
+
+/* ── World-streaming overlay (P2-world-streaming) ─────────────────── */
+
+/* Horizontal (XZ-plane) debug circle helper for the streaming overlay. */
+static void streaming_overlay_circle(float cx, float cy, float cz,
+                                     float radius, uint32_t abgr)
+{
+    if (radius <= 0.0f) return;
+    const int SEGS = 48;
+    float px = cx + radius, pz = cz;
+    for (int i = 1; i <= SEGS; ++i) {
+        float a  = (float)i * (2.0f * JCE_PI / (float)SEGS);
+        float nx = cx + cosf(a) * radius;
+        float nz = cz + sinf(a) * radius;
+        jce_debug_draw_line(jce_v3(px, cy, pz), jce_v3(nx, cy, nz), abgr);
+        px = nx; pz = nz;
+    }
+}
+
+/* Draw the scene's authored streaming chunks (horizontal circle at each
+ * chunk's center/radius) plus the load/unload rings around the EDITOR
+ * camera.  Gated on JCE_SHOW_FLAG_STREAMING.  Colors (ABGR): when the
+ * preview streamer is live, each chunk reflects its live state — loaded
+ * green / loading yellow / unloaded gray (0x66-dimmed); without preview
+ * everything draws as dimmed gray authoring guides. */
+void draw_streaming_overlay(void)
+{
+    if (!jce_state_show_flag(JCE_SHOW_FLAG_STREAMING)) return;
+
+    JceScene *scene = jce_state_get_scene();
+    if (!scene) return;
+
+    const JceSceneStreamingSettings *st =
+        jce_scene_get_streaming_settings(scene);
+    if (!st) return;
+
+    JceWorldStreamer *ws = jce_state_get_streaming_preview()
+                         ? jce_editor_get_world_streamer() : NULL;
+
+    bool drew_any = false;
+
+    for (uint32_t i = 0; i < st->chunk_count; ++i) {
+        const JceSceneStreamChunk *c = &st->chunks[i];
+        uint32_t abgr = 0x66AAAAAAu;               /* unloaded: dim gray  */
+        if (ws) {
+            switch (jce_world_streamer_chunk_state(ws, c->id)) {
+            case JCE_CHUNK_LOADED:    abgr = 0xFF00FF00u; break; /* green  */
+            case JCE_CHUNK_LOADING:
+            case JCE_CHUNK_UNLOADING: abgr = 0xFF00FFFFu; break; /* yellow */
+            case JCE_CHUNK_UNLOADED:
+            default:                  abgr = 0x66AAAAAAu; break; /* gray   */
+            }
+        }
+        streaming_overlay_circle(c->center[0], c->center[1], c->center[2],
+                                 c->radius > 0.0f ? c->radius : 1.0f, abgr);
+        drew_any = true;
+    }
+
+    /* Load / unload radii around the editor camera — shows the authored
+     * ring pair the distance test uses (cyan = load, red = unload). */
+    if (s_sr.camera) {
+        jce_vec3 eye = jce_camera_get_position(s_sr.camera);
+        streaming_overlay_circle(eye.x, eye.y, eye.z, st->load_radius,
+                                 0xFFFFFF00u);     /* cyan */
+        streaming_overlay_circle(eye.x, eye.y, eye.z, st->unload_radius,
+                                 0xFF0000FFu);     /* red  */
+        drew_any = true;
+    }
+
+    if (drew_any) jce_debug_draw_flush(scene_view_id(), s_sr.renderer);
+}
+
 /* Draw per-object compound-collider wireframe for every selected entity
  * that owns a JceCompoundColliderComponent.  Selection-driven; the cooked
  * wireframe is cached inside the gizmo (model path + settings keyed). */
@@ -698,16 +1253,26 @@ void draw_compound_collider_gizmos(void)
         if (!jce_state_entity_enabled(id)) continue;
 
         JceEntity e = (JceEntity)id;
-        if (!jce_scene_has_compound_collider(scene, e)) continue;
-
-        JceCompoundColliderComponent *cc =
-            jce_scene_get_compound_collider(scene, e);
-        if (!cc) continue;
 
         /* Selected: fitted (detailed=1) wireframe in the selection colour
          * (orange). Only ONE prop, so the trimesh line load is bounded. */
-        jce_gizmo_compound_collider_draw_from_component(scene, e, cc, 0xFF00BFFFu, 1);
-        drew_any = true;
+        if (jce_scene_has_compound_collider(scene, e)) {
+            JceCompoundColliderComponent *cc =
+                jce_scene_get_compound_collider(scene, e);
+            if (cc) {
+                jce_gizmo_compound_collider_draw_from_component(
+                    scene, e, cc, 0xFF00BFFFu, 1);
+                drew_any = true;
+            }
+        }
+        if (jce_scene_has_mesh_collider(scene, e)) {
+            JceMeshColliderComponent *mc = jce_scene_get_mesh_collider(scene, e);
+            if (mc) {
+                jce_gizmo_mesh_collider_draw_from_component(
+                    scene, e, mc, 0xFF00BFFFu, 1);
+                drew_any = true;
+            }
+        }
     }
 
     if (drew_any) jce_debug_draw_flush(scene_view_id(), s_sr.renderer);

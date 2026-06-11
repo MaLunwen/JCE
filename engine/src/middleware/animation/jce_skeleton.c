@@ -135,6 +135,12 @@ int jce_skeleton_find_joint(const JceSkeleton *skel, const char *name)
     return -1;
 }
 
+int jce_skeleton_joint_parent(const JceSkeleton *skel, uint32_t joint_idx)
+{
+    if (!skel || joint_idx >= skel->num_joints) return -1;
+    return (int)skel->joints[joint_idx].parent;
+}
+
 const jce_mat4 *jce_skeleton_rest_pose(const JceSkeleton *skel)
 {
     return skel ? skel->rest_locals : NULL;

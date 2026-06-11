@@ -4,6 +4,37 @@
 
 #include "jce_panel_inspector_common.h"
 
+void draw_comp_network_object(JceNetworkObjectComponent *c)
+{
+    if (!c) return;
+
+    ImGui::PushItemWidth(-1);
+
+    /* net_id is server-assigned at spawn; show it read-only so designers
+     * can correlate live sessions, never author it. */
+    ImGui::TextDisabled("%s: %u%s",
+                        jce_editor_i18n("inspector.net_object.netId"),
+                        c->net_id,
+                        c->net_id == 0
+                            ? jce_editor_i18n("inspector.net_object.netIdUnspawned")
+                            : "");
+
+    int owner = (int)c->owner;
+    if (ImGui::DragInt(jce_editor_i18n("inspector.net_object.owner"),
+                       &owner, 1.0f, 0, 65535)) {
+        jce_state_begin_batch_edit();
+        c->owner = (uint16_t)owner;
+        jce_state_end_batch_edit();
+    }
+    insp_track_edit();
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", jce_editor_i18n("inspector.net_object.owner.tip"));
+
+    ImGui::TextDisabled("%s", jce_editor_i18n("inspector.net_object.gatekeeperNote"));
+
+    ImGui::PopItemWidth();
+}
+
 void draw_comp_net_transform(JceNetTransformComponent *c)
 {
     if (!c) return;
@@ -49,6 +80,7 @@ void draw_comp_net_transform(JceNetTransformComponent *c)
 
 void draw_comp_net_animator(JceNetAnimatorComponent *c)
 {
+    insp_unwired_badge();
     if (!c) return;
 
     ImGui::PushItemWidth(-1);
@@ -88,6 +120,7 @@ void draw_comp_net_animator(JceNetAnimatorComponent *c)
 
 void draw_comp_net_rigidbody(JceNetRigidbodyComponent *c)
 {
+    insp_unwired_badge();
     if (!c) return;
 
     ImGui::PushItemWidth(-1);

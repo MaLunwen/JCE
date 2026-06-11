@@ -348,6 +348,7 @@ void draw_comp_lod_group(JceLodGroupComponent *lg)
 
 void draw_comp_trail_renderer(JceTrailRendererComponent *t)
 {
+    insp_unwired_badge();
     if (!t) return;
     jce_draw_path_input_asset(jce_editor_i18n_id("inspector.trail.material", "trail"), t->material_path, sizeof t->material_path, JCE_ASSET_KIND_MATERIAL);
     insp_track_edit();
@@ -365,6 +366,7 @@ void draw_comp_trail_renderer(JceTrailRendererComponent *t)
 
 void draw_comp_line_renderer(JceLineRendererComponent *l)
 {
+    insp_unwired_badge();
     if (!l) return;
     jce_draw_path_input_asset(jce_editor_i18n_id("inspector.line.material", "line"), l->material_path, sizeof l->material_path, JCE_ASSET_KIND_MATERIAL);
     insp_track_edit();
@@ -410,6 +412,7 @@ void draw_comp_decal(JceDecalComponent *d)
 
 void draw_comp_billboard_renderer(JceBillboardRendererComponent *b)
 {
+    insp_unwired_badge();
     if (!b) return;
     jce_draw_path_input_asset(jce_editor_i18n_id("inspector.br.texturePath", "br"), b->texture_path, sizeof b->texture_path, JCE_ASSET_KIND_TEXTURE); insp_track_edit();
     static const char *modes[] = { "Full", "Y-Axis Only" };
@@ -481,6 +484,7 @@ void draw_comp_volume(JceVolumeComponent *v)
 
 void draw_comp_occlusion_portal(JceOcclusionPortalComponent *op)
 {
+    insp_unwired_badge();
     if (!op) return;
     float sz[3] = { op->size.x, op->size.y, op->size.z };
     if (ImGui::DragFloat3(jce_editor_i18n_id("inspector.op.size", "op"), sz, 0.05f, 0.0f, 10000.0f, "%.3f")) {

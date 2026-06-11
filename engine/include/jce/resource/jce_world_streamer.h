@@ -42,6 +42,7 @@ typedef struct JceWorldStreamer JceWorldStreamer;
 typedef struct JceScene         JceScene;
 typedef struct JceFileSystem    JceFileSystem;
 typedef struct JceThreadPool    JceThreadPool;
+typedef struct JceSceneStreamingSettings JceSceneStreamingSettings;
 
 /* ================================================================== */
 /* Configuration                                                       */
@@ -103,6 +104,14 @@ JCE_API void jce_world_streamer_register_chunk(JceWorldStreamer *ws,
 JCE_API void jce_world_streamer_unregister_chunk(JceWorldStreamer *ws,
                                                   uint32_t         chunk_id);
 
+/* Register every chunk authored in a scene's streaming settings
+ * (jce_scene_get_streaming_settings).  Entries with an empty path are
+ * skipped.  Convenience used by both the editor preview streamer and
+ * the runtime's default_main so the two stay in lockstep. */
+JCE_API void jce_world_streamer_register_from_scene_settings(
+    JceWorldStreamer                *ws,
+    const JceSceneStreamingSettings *settings);
+
 /* ================================================================== */
 /* Per-frame update                                                    */
 /* ================================================================== */
@@ -126,6 +135,22 @@ JCE_API uint32_t jce_world_streamer_entity_count(const JceWorldStreamer *ws);
 
 /* Total number of registered chunks. */
 JCE_API uint32_t jce_world_streamer_chunk_count(const JceWorldStreamer *ws);
+
+/* The config this streamer was created with (copied at create time —
+ * JceWorldStreamConfig has no setters; recreate the streamer to change
+ * it).  Returns the defaults for NULL. */
+JCE_API JceWorldStreamConfig jce_world_streamer_get_config(
+    const JceWorldStreamer *ws);
+
+/* Passthroughs to the wrapped JceStreamingSystem's pressure / refusal /
+ * per-chunk-state queries (the wrapped system itself is private). */
+JCE_API JceStreamingPressure jce_world_streamer_pressure(
+    const JceWorldStreamer *ws);
+JCE_API JceStreamingPressure jce_world_streamer_pressure_high_water(
+    const JceWorldStreamer *ws);
+JCE_API uint32_t jce_world_streamer_refused_loads(const JceWorldStreamer *ws);
+JCE_API JceChunkState jce_world_streamer_chunk_state(
+    const JceWorldStreamer *ws, uint32_t chunk_id);
 
 JCE_EXTERN_C_END
 

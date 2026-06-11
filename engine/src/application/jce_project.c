@@ -12,6 +12,8 @@
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
 
+#include "jce_app_path.h"
+
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>  /* getenv */
@@ -41,37 +43,9 @@ static void *xcalloc(size_t n, size_t sz)
 	return p;
 }
 
-static char *path_join(const char *a, const char *b)
-{
-	if (!a || !b) return NULL;
-	size_t la = strlen(a);
-	size_t lb = strlen(b);
-	int    need_sep = (la > 0 && a[la - 1] != '/' && a[la - 1] != '\\');
-	size_t n  = la + (size_t)need_sep + lb + 1;
-	char  *p  = (char *)jce_malloc(n);
-	if (!p) return NULL;
-	memcpy(p, a, la);
-	if (need_sep) p[la] = '/';
-	memcpy(p + la + (size_t)need_sep, b, lb + 1);
-	return p;
-}
-
-static void normalise_slashes(char *s)
-{
-	if (!s) return;
-	for (char *c = s; *c; ++c)
-		if (*c == '\\') *c = '/';
-}
-
-static void strip_trailing_slash(char *s)
-{
-	if (!s) return;
-	size_t n = strlen(s);
-	while (n > 1 && (s[n - 1] == '/' || s[n - 1] == '\\')) {
-		s[n - 1] = '\0';
-		--n;
-	}
-}
+/* Path helpers live in jce_app_path.h (shared with jce_cook.c — they were
+ * near-identical static copies; the shared join also normalises '\\' to
+ * '/', which every consumer here already tolerates). */
 
 /* ── find_root ──────────────────────────────────────────────────────── */
 
@@ -83,11 +57,11 @@ bool JCE_CALL jce_project_find_root(const char *start_dir, char *out_root, size_
 	size_t n = strlen(start_dir);
 	if (n >= sizeof cur) return false;
 	memcpy(cur, start_dir, n + 1);
-	normalise_slashes(cur);
-	strip_trailing_slash(cur);
+	jce_app_normalise_slashes(cur);
+	jce_app_strip_trailing_slash(cur);
 
 	for (;;) {
-		char *manifest = path_join(cur, JCE_PROJECT_FILENAME);
+		char *manifest = jce_app_path_join(cur, JCE_PROJECT_FILENAME);
 		bool  hit = manifest && jce_fs_host_exists_file(manifest);
 		xfree(manifest);
 		if (hit) {
@@ -112,7 +86,7 @@ bool JCE_CALL jce_project_is_engine_workspace(const char *dir)
 	char  buf[1024];
 	int   wrote = snprintf(buf, sizeof buf, "%s/engine/include/jce/api.h", dir);
 	if (wrote <= 0 || (size_t)wrote >= sizeof buf) return false;
-	normalise_slashes(buf);
+	jce_app_normalise_slashes(buf);
 	return jce_fs_host_exists_file(buf);
 }
 
@@ -169,8 +143,8 @@ JceProject *JCE_CALL jce_project_load(const char *project_root)
 	if (!p) return NULL;
 
 	p->project_root  = xstrdup(project_root);
-	normalise_slashes(p->project_root);
-	strip_trailing_slash(p->project_root);
+	jce_app_normalise_slashes(p->project_root);
+	jce_app_strip_trailing_slash(p->project_root);
 
 	/* Accept either a directory ("." / "C:/proj") or a direct path to
 	 * jce_project.json — split the filename off when the caller passes
@@ -200,7 +174,7 @@ JceProject *JCE_CALL jce_project_load(const char *project_root)
 			}
 		}
 	}
-	p->manifest_path = path_join(p->project_root, JCE_PROJECT_FILENAME);
+	p->manifest_path = jce_app_path_join(p->project_root, JCE_PROJECT_FILENAME);
 
 	if (!p->project_root || !p->manifest_path) goto fail;
 
@@ -268,9 +242,9 @@ JceProject *JCE_CALL jce_project_new(const char *project_root, const char *name)
 	if (!p) return NULL;
 
 	p->project_root  = xstrdup(project_root);
-	normalise_slashes(p->project_root);
-	strip_trailing_slash(p->project_root);
-	p->manifest_path = path_join(p->project_root, JCE_PROJECT_FILENAME);
+	jce_app_normalise_slashes(p->project_root);
+	jce_app_strip_trailing_slash(p->project_root);
+	p->manifest_path = jce_app_path_join(p->project_root, JCE_PROJECT_FILENAME);
 	p->schema_version           = JCE_PROJECT_SCHEMA_VERSION;
 	p->name                     = xstrdup(name);
 	p->version                  = xstrdup("0.1.0");
@@ -461,7 +435,7 @@ static bool tpl_root_for(const char *base, const char *suffix,
 	                  base[strlen(base) - 1] == '\\') ? "" : "/",
 	                 suffix);
 	if (n <= 0 || (size_t)n >= cap) return false;
-	normalise_slashes(out);
+	jce_app_normalise_slashes(out);
 	return jce_fs_host_exists_dir(out);
 }
 
@@ -475,7 +449,7 @@ static bool locate_template_root(char *out, size_t cap)
 		size_t n = strlen(envtpl);
 		if (n + 1 > cap) return false;
 		memcpy(out, envtpl, n + 1);
-		normalise_slashes(out);
+		jce_app_normalise_slashes(out);
 		return true;
 	}
 	const char *envsdk = getenv("JCE_SDK_DIR");
@@ -602,12 +576,12 @@ bool JCE_CALL jce_project_create_from_template(const char *project_dir,
 		return false;
 	}
 	memcpy(root, project_dir, rn + 1);
-	normalise_slashes(root);
-	strip_trailing_slash(root);
+	jce_app_normalise_slashes(root);
+	jce_app_strip_trailing_slash(root);
 
 	/* Refuse to overwrite an existing manifest. */
 	{
-		char *existing = path_join(root, JCE_PROJECT_FILENAME);
+		char *existing = jce_app_path_join(root, JCE_PROJECT_FILENAME);
 		bool hit = existing && jce_fs_host_exists_file(existing);
 		xfree(existing);
 		if (hit) {
@@ -692,7 +666,7 @@ static bool inc_root_for(const char *base, const char *suffix,
 	                  base[strlen(base) - 1] == '\\') ? "" : "/",
 	                 suffix);
 	if (n <= 0 || (size_t)n >= cap) return false;
-	normalise_slashes(out);
+	jce_app_normalise_slashes(out);
 	return jce_fs_host_exists_dir(out);
 }
 
@@ -706,7 +680,7 @@ static bool locate_sdk_include_root(char *out, size_t cap)
 		size_t n = strlen(envinc);
 		if (n + 1 > cap) return false;
 		memcpy(out, envinc, n + 1);
-		normalise_slashes(out);
+		jce_app_normalise_slashes(out);
 		return true;
 	}
 	const char *envsdk = getenv("JCE_SDK_DIR");
@@ -751,17 +725,17 @@ static bool write_project_main_c(const char *project_dir,
 		return false;
 	}
 	memcpy(root, project_dir, strlen(project_dir) + 1);
-	normalise_slashes(root);
-	strip_trailing_slash(root);
+	jce_app_normalise_slashes(root);
+	jce_app_strip_trailing_slash(root);
 
-	char *src_dir = path_join(root, "src");
+	char *src_dir = jce_app_path_join(root, "src");
 	if (!src_dir) { set_err(err_out, err_cap, "out of memory"); return false; }
 	if (!ensure_dir(src_dir)) {
 		xfree(src_dir);
 		set_err(err_out, err_cap, "failed to create src/ directory");
 		return false;
 	}
-	char *main_c = path_join(src_dir, "main.c");
+	char *main_c = jce_app_path_join(src_dir, "main.c");
 	xfree(src_dir);
 	if (!main_c) { set_err(err_out, err_cap, "out of memory"); return false; }
 

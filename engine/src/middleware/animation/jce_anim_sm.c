@@ -426,3 +426,15 @@ const char *jce_anim_sm_state_clip(const JceAnimSm *sm, int idx)
     if (!sm || idx < 0 || idx >= sm->state_count) return NULL;
     return sm->states[idx].clip_path;
 }
+
+float jce_anim_sm_state_speed(const JceAnimSm *sm, int idx)
+{
+    if (!sm || idx < 0 || idx >= sm->state_count) return 1.0f;
+    return sm->states[idx].speed > 0.0001f ? sm->states[idx].speed : 1.0f;
+}
+
+bool jce_anim_sm_state_loop(const JceAnimSm *sm, int idx)
+{
+    if (!sm || idx < 0 || idx >= sm->state_count) return true;
+    return sm->states[idx].looping;
+}

@@ -21,6 +21,11 @@
  * hooks. */
 void jce_scene_video_install_hooks(ecs_world_t *world, ecs_entity_t comp_id);
 
+/* Implemented in jce_scene_sequencer.c — same hook contract for the
+ * SequencePlayer component, whose runtime blob owns an open JceSequencer
+ * (freed on remove / entity delete / scene destroy via the dtor hook). */
+void jce_scene_sequencer_install_hooks(ecs_world_t *world, ecs_entity_t comp_id);
+
 /* Defined in jce_scene_particles.c — releases the lazy particle system. */
 void jce_scene_particles_shutdown(JceScene *s);
 
@@ -98,6 +103,9 @@ static ECS_COMPONENT_DECLARE(JceTagComponent);
 static ECS_COMPONENT_DECLARE(JceLayerComponent);
 static ECS_COMPONENT_DECLARE(JceVolumeComponent);
 static ECS_COMPONENT_DECLARE(JceOcclusionPortalComponent);
+static ECS_COMPONENT_DECLARE(JceNavAgentComponent);
+static ECS_COMPONENT_DECLARE(JceIkConstraintComponent);
+static ECS_COMPONENT_DECLARE(JceSequencePlayerComponent);
 
 /* ── Internal world-matrix cache (side table) ──────────────────────────
  *
@@ -138,6 +146,9 @@ struct JceScene {
     ecs_world_t *world;
     JceSceneRenderingSettings rendering_settings;
     bool has_rendering_settings;
+    /* Lazily heap-allocated (~70 KB with the full chunk table); NULL until
+       authored.  Presence of the pointer == "has streaming settings". */
+    JceSceneStreamingSettings *streaming_settings;
     ecs_query_t *cloth_query;   /* cached; created lazily in jce_scene_update */
     ecs_query_t *each_query;    /* cached; created lazily in jce_scene_each_entity
                                  * (leak fix: was ecs_query()+ecs_query_fini() on
@@ -314,6 +325,101 @@ void jce_scene_clear_rendering_settings(JceScene *s)
     s->has_rendering_settings = false;
 }
 
+/* ── Scene-level world-streaming settings ──────────────────────────── */
+
+static void scene_streaming_settings_sanitize(JceSceneStreamingSettings *st)
+{
+    if (!st) return;
+
+    st->version = 1u;
+
+    if (st->mode < 0 || st->mode > 1)
+        st->mode = 0;                       /* radial */
+
+    if (st->load_radius < 1.0f)
+        st->load_radius = 1.0f;
+    if (st->unload_radius < st->load_radius)
+        st->unload_radius = st->load_radius;
+
+    if (st->max_pending == 0)
+        st->max_pending = 1;
+    if (st->frame_budget_ms <= 0.0f)
+        st->frame_budget_ms = 2.0f;
+
+    if (st->chunk_count > JCE_SCENE_MAX_STREAM_CHUNKS)
+        st->chunk_count = JCE_SCENE_MAX_STREAM_CHUNKS;
+    for (uint32_t i = 0; i < st->chunk_count; ++i) {
+        JceSceneStreamChunk *c = &st->chunks[i];
+        if (c->radius < 0.0f)
+            c->radius = 0.0f;
+        c->path[sizeof(c->path) - 1] = '\0';
+    }
+}
+
+JceSceneStreamingSettings jce_scene_streaming_settings_default(void)
+{
+    JceSceneStreamingSettings st;
+    memset(&st, 0, sizeof(st));
+
+    st.version         = 1u;
+    st.enabled         = false;
+    st.mode            = 0;        /* radial */
+    /* Mirror jce_world_stream_config_default() so an authored-then-enabled
+       scene behaves like the streamer's own GTA-VC-scale defaults. */
+    st.load_radius     = 150.0f;
+    st.unload_radius   = 200.0f;
+    st.max_pending     = 4;
+    st.budget_mb       = 256;
+    st.frame_budget_ms = 2.0f;
+    st.chunk_count     = 0;
+    return st;
+}
+
+bool jce_scene_has_streaming_settings(const JceScene *s)
+{
+    return s && s->streaming_settings != NULL;
+}
+
+static JceSceneStreamingSettings *scene_streaming_settings_ensure(JceScene *s)
+{
+    if (!s) return NULL;
+    if (!s->streaming_settings) {
+        s->streaming_settings = (JceSceneStreamingSettings *)
+            JCE_MALLOC(sizeof(*s->streaming_settings));
+        if (!s->streaming_settings) return NULL;
+        *s->streaming_settings = jce_scene_streaming_settings_default();
+    }
+    return s->streaming_settings;
+}
+
+void jce_scene_set_streaming_settings(JceScene *s,
+                                      const JceSceneStreamingSettings *settings)
+{
+    if (!s || !settings) return;
+    JceSceneStreamingSettings *dst = scene_streaming_settings_ensure(s);
+    if (!dst) return;
+    *dst = *settings;
+    scene_streaming_settings_sanitize(dst);
+}
+
+const JceSceneStreamingSettings *jce_scene_get_streaming_settings(
+    const JceScene *s)
+{
+    return s ? s->streaming_settings : NULL;
+}
+
+JceSceneStreamingSettings *jce_scene_get_streaming_settings_mut(JceScene *s)
+{
+    return scene_streaming_settings_ensure(s);
+}
+
+void jce_scene_clear_streaming_settings(JceScene *s)
+{
+    if (!s || !s->streaming_settings) return;
+    JCE_FREE(s->streaming_settings);
+    s->streaming_settings = NULL;
+}
+
 /* ── Create / destroy ──────────────────────────────────────────────── */
 
 JceScene *jce_scene_create(void)
@@ -401,11 +507,19 @@ JceScene *jce_scene_create(void)
     ECS_COMPONENT_DEFINE(s->world, JceLayerComponent);
     ECS_COMPONENT_DEFINE(s->world, JceVolumeComponent);
     ECS_COMPONENT_DEFINE(s->world, JceOcclusionPortalComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceNavAgentComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceIkConstraintComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceSequencePlayerComponent);
 
     /* VideoPlayer owns a live decoder handle + a GPU texture; install
      * lifecycle hooks so those resources follow correct ownership across
      * table moves / copies / removal / entity delete / world fini. */
     jce_scene_video_install_hooks(s->world, ecs_id(JceVideoPlayerComponent));
+    /* SequencePlayer owns an open JceSequencer (runtime blob); same hook
+     * contract as VideoPlayer so the handle is freed on component remove,
+     * entity delete, and scene destroy (world fini). */
+    jce_scene_sequencer_install_hooks(s->world,
+                                      ecs_id(JceSequencePlayerComponent));
 
     LOG_SUCCESS(LOG_TAG, "scene created");
     return s;
@@ -419,6 +533,7 @@ void jce_scene_destroy(JceScene *s)
     if (s->each_query)  ecs_query_fini(s->each_query);  /* before world fini */
     if (s->world) ecs_fini(s->world);
     if (s->world_cache.slots) JCE_FREE(s->world_cache.slots);
+    jce_scene_clear_streaming_settings(s);   /* frees the lazy heap block */
     JCE_FREE(s);
     LOG_INFO(LOG_TAG, "scene destroyed");
 }
@@ -489,6 +604,7 @@ int jce_scene_clear(JceScene *s)
     if (ids != stack_buf) JCE_FREE(ids);
 
     jce_scene_clear_rendering_settings(s);
+    jce_scene_clear_streaming_settings(s);
     /* Drop any cached world matrices for the now-deleted entities. */
     jce_scene_invalidate_world_cache(s);
 
@@ -577,10 +693,8 @@ static jce_mat4 scene_local_matrix(JceScene *s, JceEntity e)
 {
     JceTransform *t = jce_scene_get_transform(s, e);
     if (!t) return jce_m4_identity();
-    jce_vec3 sc = jce_v3(t->scale.x != 0.0f ? t->scale.x : 1.0f,
-                         t->scale.y != 0.0f ? t->scale.y : 1.0f,
-                         t->scale.z != 0.0f ? t->scale.z : 1.0f);
-    return jce_m4_from_trs(t->position, t->rotation, sc);
+    return jce_m4_from_trs(t->position, t->rotation,
+                           jce_v3_safe_scale(t->scale));
 }
 
 /* ── World-matrix cache side table (open addressing, linear probe) ──── */
@@ -831,6 +945,9 @@ JCE_COMP_IMPL(JceTagComponent,                tag_component)
 JCE_COMP_IMPL(JceLayerComponent,              layer_component)
 JCE_COMP_IMPL(JceVolumeComponent,             volume)
 JCE_COMP_IMPL(JceOcclusionPortalComponent,    occlusion_portal)
+JCE_COMP_IMPL(JceNavAgentComponent,           nav_agent)
+JCE_COMP_IMPL(JceIkConstraintComponent,       ik_constraints)
+JCE_COMP_IMPL(JceSequencePlayerComponent,     sequence_player)
 
 #undef JCE_COMP_IMPL
 

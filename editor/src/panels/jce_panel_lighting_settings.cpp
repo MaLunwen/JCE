@@ -18,8 +18,11 @@
  *                            shadow toggle.
  *   3. Shadows (CSM)         Distance, cascade count, split lambda,
  *                            shadow-map resolution, soft filter.
- *   4. Image-Based Lighting  Convolve trigger, SH band readout,
- *                            specular mip count readout.
+ *   4. Image-Based Lighting  Skybox-driven auto-convolve status note,
+ *                            SH band readout, specular mip count readout.
+ *                            (Convolution itself is engine-driven: the
+ *                            scene renderer re-bakes asynchronously when
+ *                            the Skybox HDR path changes, disk-cached.)
  *   5. Lights in Scene       Quick-edit colour/intensity for every
  *                            Directional / Point / Spot light, with
  *                            ping-to-select.
@@ -67,7 +70,6 @@ enum SkyType { SKY_NONE = 0, SKY_PROCEDURAL = 1, SKY_HDRI = 2 };
 struct JceLightingSettings {
     /* Environment (in-session) */
     int   sky_type            = SKY_PROCEDURAL;
-    char  hdri_path[260]      = {0};
     float sky_intensity       = 1.0f;
     char  reflection_probe[260] = {0};
 
@@ -78,10 +80,9 @@ struct JceLightingSettings {
     float sun_pitch_deg       = -55.0f;
     bool  sun_cast_shadows    = true;
 
-    /* IBL (in-session) */
+    /* IBL (in-session readouts) */
     int   ibl_sh_bands        = 3;
     int   ibl_spec_mips       = 5;
-    bool  ibl_dirty           = false;
 };
 
 JceLightingSettings g_lit;
@@ -192,16 +193,6 @@ bool draw_environment(JceScene *scene, const LightCollect &c,
     };
     changed |= ImGui::Combo(jce_editor_i18n("panel.lighting.env.sky_type"),
                             &g_lit.sky_type, items, 3);
-
-    if (g_lit.sky_type == SKY_HDRI) {
-        ImGui::PushID("hdri");
-        if (ImGui::InputText(jce_editor_i18n("panel.lighting.env.hdri"),
-                             g_lit.hdri_path, sizeof(g_lit.hdri_path))) {
-            changed = true;
-            g_lit.ibl_dirty = true;
-        }
-        ImGui::PopID();
-    }
 
     changed |= ImGui::SliderFloat(
         jce_editor_i18n("panel.lighting.env.sky_intensity"),
@@ -355,27 +346,36 @@ bool draw_shadows(JceSceneRenderingSettings *rendering)
     return changed;
 }
 
-bool draw_ibl(void)
+/* Image-Based Lighting — informational only.  Convolution is driven by
+ * the engine: when the scene's Skybox HDR path changes, the scene
+ * renderer (sr_scan_skybox → sr_ibl_start_async) re-convolves on a
+ * worker thread with a disk bake-cache.  There is no public force-rebake
+ * hook, so this section surfaces the driving path and how to (re)trigger
+ * it instead of offering a button. */
+void draw_ibl(JceScene *scene, const LightCollect &c)
 {
     if (!ImGui::CollapsingHeader(
             jce_editor_i18n("panel.lighting.section.ibl"),
             ImGuiTreeNodeFlags_DefaultOpen))
-        return false;
+        return;
 
-    bool changed = false;
-    bool can_convolve = (g_lit.sky_type == SKY_HDRI &&
-                         g_lit.hdri_path[0] != '\0');
-    ImGui::BeginDisabled(!can_convolve);
-    if (ImGui::Button(jce_editor_i18n("panel.lighting.ibl.convolve"))) {
-        /* TODO: wire to jce_ibl_generate() once the HDRI is resolved to
-         * a JceTexture handle. For now mark cache fresh. */
-        g_lit.ibl_dirty = false;
-        changed = true;
-    }
-    ImGui::EndDisabled();
-    if (g_lit.ibl_dirty) {
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "*");
+    const JceSkyboxComponent *sky =
+        (scene && c.has_skybox)
+            ? jce_scene_get_skybox(scene, (JceEntity)c.skybox)
+            : nullptr;
+
+    if (sky && sky->hdr_path[0] != '\0') {
+        /* Read-only view of the path that actually drives IBL (edit it in
+         * the Environment section above or on the Skybox component). */
+        ImGui::LabelText(jce_editor_i18n("skybox.hdrPath"), "%s",
+                         sky->hdr_path);
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextDisabled("%s", jce_editor_i18n("lighting.ibl.autoNote"));
+        ImGui::PopTextWrapPos();
+    } else {
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextDisabled("%s", jce_editor_i18n("lighting.ibl.noSkybox"));
+        ImGui::PopTextWrapPos();
     }
 
     ImGui::Text("%s: L0..L%d (%d coeffs)",
@@ -385,7 +385,6 @@ bool draw_ibl(void)
     ImGui::Text("%s: %d",
                 jce_editor_i18n("panel.lighting.ibl.spec_mips"),
                 g_lit.ibl_spec_mips);
-    return changed;
 }
 
 void draw_scene_lights(JceScene *scene, const LightCollect &c)
@@ -809,7 +808,7 @@ static void lit_draw_settings_tab(void)
     dirty |= draw_environment(scene, c, rendering);
     dirty |= draw_directional_light(scene, c);
     dirty |= draw_shadows(rendering);
-    dirty |= draw_ibl();
+    draw_ibl(scene, c);
     draw_scene_lights(scene, c);
     dirty |= draw_fog(rendering);
     dirty |= draw_weather_and_tod(rendering);

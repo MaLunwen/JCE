@@ -237,40 +237,8 @@ vec3 safe_normalize_vec3(vec3 value, vec3 fallback)
     return fallback;
 }
 
-float checker_cell(vec2 uv, float scale)
-{
-    vec2 cell = floor(uv * scale);
-    float parity = fract((cell.x + cell.y) * 0.5) * 2.0;
-    return parity;
-}
-
-vec3 triplanar_checker(vec3 local_pos)
-{
-    const vec3 magenta = vec3(1.0, 0.0, 1.0);
-    const vec3 black = vec3(0.0, 0.0, 0.0);
-    const float checker_scale = 3.0;
-
-    // Flat face normal in LOCAL space from screen-space derivatives of the
-    // local position. Invariant under the object's model transform, so the
-    // checker stays glued to the mesh when the entity moves or rotates.
-    vec3 local_n = cross(dFdx(local_pos), dFdy(local_pos));
-    float len2 = dot(local_n, local_n);
-    local_n = (len2 > 1e-12) ? local_n * inversesqrt(len2) : vec3(0.0, 1.0, 0.0);
-
-    vec3 weights = abs(local_n);
-    weights = max(weights, vec3_splat(1e-4));
-    weights = pow(weights, vec3_splat(4.0));
-    weights /= (weights.x + weights.y + weights.z);
-
-    vec3 sample_x = mix(magenta, black,
-                        checker_cell(local_pos.yz, checker_scale));
-    vec3 sample_y = mix(magenta, black,
-                        checker_cell(local_pos.xz, checker_scale));
-    vec3 sample_z = mix(magenta, black,
-                        checker_cell(local_pos.xy, checker_scale));
-
-    return sample_x * weights.x + sample_y * weights.y + sample_z * weights.z;
-}
+/* The missing-texture checker now lives in pbr_common.sh
+   (missing_texture_checker) — the local copy here was never called. */
 
 void main()
 {

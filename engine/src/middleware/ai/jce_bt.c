@@ -96,3 +96,33 @@ uint32_t jce_bt_tree_count(const JceBtContext *ctx)
     if (!ctx) return 0;
     return jce_bt_backend_tree_count(ctx->backend);
 }
+
+/* ── Introspection (read-only visualizer support) ─────────────────── */
+
+JCE_API uint32_t JCE_CALL jce_bt_node_count(const JceBtContext *ctx,
+                                            JceBtTreeHandle tree)
+{
+    if (!ctx || !jce_bt_tree_valid(tree)) return 0;
+    return jce_bt_backend_node_count(ctx->backend, tree.idx);
+}
+
+JCE_API bool JCE_CALL jce_bt_node_info(const JceBtContext *ctx,
+                                       JceBtTreeHandle tree,
+                                       uint32_t index, JceBtNodeInfo *out)
+{
+    if (!ctx || !jce_bt_tree_valid(tree) || !out) return false;
+    return jce_bt_backend_node_info(ctx->backend, tree.idx, index, out);
+}
+
+JCE_API bool JCE_CALL jce_bt_set_observed(JceBtContext *ctx,
+                                          JceBtTreeHandle tree, bool observed)
+{
+    if (!ctx || !jce_bt_tree_valid(tree)) return false;
+    return jce_bt_backend_set_observed(ctx->backend, tree.idx, observed);
+}
+
+JCE_API void JCE_CALL jce_bt_set_lenient_load(JceBtContext *ctx, bool lenient)
+{
+    if (!ctx) return;
+    jce_bt_backend_set_lenient(ctx->backend, lenient);
+}

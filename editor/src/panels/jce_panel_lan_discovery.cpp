@@ -2,7 +2,10 @@
  * jce_panel_lan_discovery.cpp  LAN Discovery panel (P4-E.1).
  *
  * Lists LAN game servers discovered via jce_lan_discovery_client_*
- * (P3-D.5).  Provides Refresh (restart scan) and Join buttons.
+ * (P3-D.5).  Provides Refresh (restart scan) and Join buttons; Join
+ * starts a client session via jce_session_start_client (P3-D.6) and a
+ * status line surfaces the live session state with a Leave button
+ * (jce_session_shutdown).
  *
  * Panel is registered under Window menu alongside other network panels.
  */
@@ -30,6 +33,9 @@ namespace {
 
 struct State {
     bool scanning = false;
+    /* "name (ip:port)" of the server the user last joined from this
+     * panel; shown on the session status line.  Cleared on Leave. */
+    char join_target[96] = "";
 };
 
 State g_st;
@@ -47,6 +53,11 @@ void start_scan(void)
 
 extern "C" void jce_editor_panel_lan_discovery_content(void)
 {
+    /* The discovery client socket is caller-driven (jce_lan_discovery.h)
+     * and nothing else in the editor pumps it — drain RESPs here so the
+     * scan actually accumulates servers.  No-op while not scanning. */
+    jce_lan_discovery_client_tick();
+
     /* Update scanning state. */
     if (g_st.scanning && !jce_lan_discovery_client_is_scanning())
         g_st.scanning = false;
@@ -64,6 +75,45 @@ extern "C" void jce_editor_panel_lan_discovery_content(void)
     }
 
     ImGui::Separator();
+
+    /* Session status line (P3-D.6 session singleton — same query APIs the
+     * Network Stats tab uses).  One session at a time engine-wide, so a
+     * live session disables Join on every row and offers Leave instead.
+     *
+     * Note on pumping: jce_session_tick() is driven by jce_runtime_step()
+     * (engine/src/application/jce_runtime.c fixed loop), which the editor
+     * only steps in Play mode — a session joined here stays CONNECTING
+     * until Play starts.  Per the layering rules the editor does not pump
+     * the session itself. */
+    JceSessionMode  sess_mode = jce_session_mode();
+    JceSessionState sess_st   = jce_session_state();
+    bool session_shown  = (sess_mode != JCE_SESSION_MODE_NONE) &&
+                          (sess_st   != JCE_SESSION_STATE_STOPPED);
+    bool session_active = session_shown &&
+                          (sess_st != JCE_SESSION_STATE_FAILED);
+
+    if (session_shown) {
+        const char *mode_str =
+            (sess_mode == JCE_SESSION_MODE_HOST)             ? "Host"   :
+            (sess_mode == JCE_SESSION_MODE_DEDICATED_SERVER) ? "Server" :
+            (sess_mode == JCE_SESSION_MODE_CLIENT)           ? "Client" : "?";
+        if (g_st.join_target[0])
+            ImGui::Text("%s: %s %s | %s",
+                jce_editor_i18n("panel.lan_discovery.session"),
+                mode_str, g_st.join_target,
+                jce_session_state_to_string(sess_st));
+        else
+            ImGui::Text("%s: %s | %s",
+                jce_editor_i18n("panel.lan_discovery.session"),
+                mode_str, jce_session_state_to_string(sess_st));
+        ImGui::SameLine();
+        if (ImGui::SmallButton(jce_editor_i18n("panel.lan_discovery.leave"))) {
+            jce_session_shutdown();
+            g_st.join_target[0] = '\0';
+            LOG_INFO(LOG_TAG, "Session left via LAN Discovery panel");
+        }
+        ImGui::Separator();
+    }
 
     uint32_t count = jce_lan_discovery_client_server_count();
 
@@ -120,14 +170,49 @@ extern "C" void jce_editor_panel_lan_discovery_content(void)
                 ImGui::TextDisabled("%s", jce_editor_i18n("panel.lan_discovery.seen_old"));
 
             ImGui::TableSetColumnIndex(4);
-            if (ImGui::SmallButton(jce_editor_i18n("panel.lan_discovery.join"))) {
-                /* TODO: wire to jce_lan_discovery_enumerate once landed.
-                 * For now log to console so the panel ships meaningfully. */
-                LOG_INFO(LOG_TAG, "Join requested: %s @ %s",
-                         srv.server_name, srv.address_text);
-                jce_editor_console_log(
-                    "Join: %s (%s) — connect API not yet wired",
-                    srv.server_name, srv.address_text);
+            if (session_active) {
+                /* One session at a time — must Leave before re-joining. */
+                ImGui::BeginDisabled();
+                ImGui::SmallButton(jce_editor_i18n("panel.lan_discovery.join"));
+                ImGui::EndDisabled();
+            } else if (ImGui::SmallButton(jce_editor_i18n("panel.lan_discovery.join"))) {
+                /* address_text is the "ip:port" display string — strip the
+                 * port suffix; start_client wants a bare host plus the
+                 * advertised game_port. */
+                char host[64];
+                std::snprintf(host, sizeof host, "%s", srv.address_text);
+                if (char *colon = std::strrchr(host, ':'))
+                    *colon = '\0';
+
+                /* A timed-out connect leaves the session singleton in
+                 * FAILED (still inited) and start_client would reject the
+                 * retry with "already running" — clear it first. */
+                if (sess_st == JCE_SESSION_STATE_FAILED)
+                    jce_session_shutdown();
+
+                JceSessionStartClientDesc desc;
+                std::memset(&desc, 0, sizeof desc);
+                desc.host               = host;
+                desc.port               = (uint16_t)srv.game_port;
+                desc.connect_timeout_ms = 0; /* engine default (5000 ms) */
+                desc.player_name        = "Editor";
+
+                if (jce_session_start_client(&desc)) {
+                    std::snprintf(g_st.join_target, sizeof g_st.join_target,
+                                  "%s (%s)", srv.server_name, srv.address_text);
+                    LOG_INFO(LOG_TAG, "Join: connecting to %s @ %s",
+                             srv.server_name, srv.address_text);
+                    jce_editor_console_log("%s: %s (%s)",
+                        jce_editor_i18n("panel.lan_discovery.joining"),
+                        srv.server_name, srv.address_text);
+                } else {
+                    LOG_WARN(LOG_TAG, "Join failed: %s @ %s",
+                             srv.server_name, srv.address_text);
+                    jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                        "%s: %s (%s)",
+                        jce_editor_i18n("panel.lan_discovery.join_failed"),
+                        srv.server_name, srv.address_text);
+                }
             }
 
             ImGui::PopID();

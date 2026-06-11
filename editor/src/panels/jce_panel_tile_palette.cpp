@@ -25,8 +25,10 @@
 #include <jce/tools/jce_imgui.hpp>
 #include "dialogs/jce_path_input.h"
 #include "core/jce_assetdb.h"
+#include "scene/jce_editor_scene_render.h"
 extern "C" {
 #include <jce/os/core/jce_json.h>
+#include <jce/renderer/jce_scene_renderer.h>
 }
 
 #include <cstdio>
@@ -86,12 +88,25 @@ void save_map(void)
         jce_json_array_push(arr, n);
     }
     jce_json_set_child(root, "cells", arr);
-    if (ed_write_json_to_file(s.tilemap_path, root))
+    if (ed_write_json_to_file(s.tilemap_path, root)) {
         jce_editor_console_log("tilemap saved: %s (%dx%d)",
                                s.tilemap_path, s.map_w, s.map_h);
-    else
+        /* Force the Scene View renderer to re-load this tilemap so
+         * authoring edits are reflected immediately.  Invalidate by
+         * both the scene-relative key and the absolute path (mirrors
+         * the Terrain panel's post-save invalidation). */
+        JceSceneRenderer *sr = jce_editor_get_scene_renderer();
+        if (sr) {
+            jce_scene_renderer_invalidate_tilemap(sr, s.tilemap_path);
+            char resolved[1024];
+            if (jce_editor_resolve_asset_path(s.tilemap_path, resolved,
+                                              sizeof(resolved)))
+                jce_scene_renderer_invalidate_tilemap(sr, resolved);
+        }
+    } else {
         jce_editor_console_log_level(JCE_CONSOLE_ERROR,
             "tilemap save failed: %s", s.tilemap_path);
+    }
 }
 
 void load_map(void)
@@ -259,4 +274,21 @@ extern "C" void jce_editor_panel_tile_palette_content(void)
     ImGui::BeginChild("##tp_right", ImVec2(0, 0), false);
     draw_map_pane();
     ImGui::EndChild();
+}
+
+extern "C" void jce_editor_panel_tile_palette_edit(const char *tilemap_path,
+                                                   const char *sprites_path)
+{
+    if (tilemap_path && tilemap_path[0])
+        std::snprintf(s.tilemap_path, sizeof(s.tilemap_path), "%s",
+                      tilemap_path);
+    if (sprites_path && sprites_path[0])
+        std::snprintf(s.sprites_path, sizeof(s.sprites_path), "%s",
+                      sprites_path);
+    /* load_map() pulls the map's own "sprites" key + palette; when only
+       an atlas is known yet (new map), just refresh the palette. */
+    if (s.tilemap_path[0]) load_map();
+    else if (s.sprites_path[0]) load_palette_count();
+    bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_TILE_PALETTE);
+    if (vis) *vis = true;
 }

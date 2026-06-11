@@ -121,4 +121,57 @@ float sample_vsm(sampler2D vsm_target, vec2 uv, float t,
     return sample_vsm_reduce_bleed(p, bleed_reduction);
 }
 
+// ── Missing-texture checker (fragment-only: uses derivatives) ───────
+
+float checker_cell(vec2 uv, float scale)
+{
+    vec2 cell = floor(uv * scale);
+    return fract((cell.x + cell.y) * 0.5) * 2.0;
+}
+
+// Magenta/black checker with derivative-based minification fade: once a
+// cell shrinks below about a pixel the binary pattern aliases into
+// shimmer (a real checker TEXTURE relies on mipmaps for exactly this),
+// so fade to the pattern mean instead.
+vec3 checker_color(vec2 coord, float cells_per_unit)
+{
+    const vec3 magenta = vec3(1.0, 0.0, 1.0);
+    const vec3 black   = vec3(0.0, 0.0, 0.0);
+    const vec3 mean    = vec3(0.5, 0.0, 0.5);
+
+    vec2  duv = (abs(dFdx(coord)) + abs(dFdy(coord))) * cells_per_unit;
+    float px  = max(duv.x, duv.y);   /* checker cells crossed per pixel */
+    vec3  c   = mix(magenta, black, checker_cell(coord, cells_per_unit));
+    return mix(c, mean, smoothstep(0.5, 1.0, px));
+}
+
+// Missing-texture fallback — industry-standard look (Source/UE style):
+// the checker samples the mesh's OWN UV space, i.e. exactly where the
+// absent texture would have mapped, so it doubles as a UV-mapping debug
+// view and has NO projection seams by construction. Meshes without a
+// usable UV stream (constant UVs -> zero derivatives) fall back to a
+// LOCAL-space planar checker picked by the DOMINANT axis of the face
+// normal. The pick is a HARD select on purpose: the previous
+// implementation soft-blended three independent binary checkers by
+// pow(|n|,4) weights, and any surface not facing a major axis (spheres,
+// cylinders, rotated cubes) showed 30-70% mixes of disagreeing patterns
+// — muddy interference bands at every projection boundary. One pattern
+// per pixel keeps every cell crisp; axis transitions become thin clean
+// lines.
+vec3 missing_texture_checker(vec3 local_pos, vec2 uv)
+{
+    const float uv_cells    = 8.0;   /* cells per UV tile               */
+    const float local_cells = 3.0;   /* cells per local-space unit      */
+
+    vec2 duv = abs(dFdx(uv)) + abs(dFdy(uv));
+    if (duv.x + duv.y > 1e-7)
+        return checker_color(uv, uv_cells);
+
+    vec3 an = abs(cross(dFdx(local_pos), dFdy(local_pos)));
+    vec2 plane = (an.x >= an.y && an.x >= an.z) ? local_pos.yz
+               : (an.y >= an.z)                 ? local_pos.xz
+                                                : local_pos.xy;
+    return checker_color(plane, local_cells);
+}
+
 #endif // PBR_COMMON_SH

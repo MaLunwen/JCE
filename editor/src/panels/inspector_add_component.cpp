@@ -100,6 +100,56 @@ void add_component_slot(uint32_t focused, JceEditorComponentSlot slot)
         return;
     }
 
+    if (jce_editor_component_slot_is_nav_agent(slot)) {
+        JceScene *scene = jce_state_get_scene();
+        JceEntity ce = jce_state_to_ecs_entity(focused);
+        if (!scene || !ce || jce_scene_has_nav_agent(scene, ce))
+            return;
+        JceNavAgentComponent def;
+        memset(&def, 0, sizeof(def));
+        def.radius          = 0.5f;
+        def.height          = 2.0f;
+        def.max_speed       = 3.5f;
+        def.max_accel       = 8.0f;
+        def.arrive_radius   = 1.5f;
+        def.waypoint_radius = 0.5f;
+        def.auto_repath     = true;
+        def.enabled         = true;
+        jce_state_begin_batch_edit();
+        jce_scene_set_nav_agent(scene, ce, &def);
+        jce_state_end_batch_edit();
+        return;
+    }
+
+    if (jce_editor_component_slot_is_ik_constraints(slot)) {
+        JceScene *scene = jce_state_get_scene();
+        JceEntity ce = jce_state_to_ecs_entity(focused);
+        if (!scene || !ce || jce_scene_has_ik_constraints(scene, ce))
+            return;
+        JceIkConstraintComponent def;
+        memset(&def, 0, sizeof(def));
+        def.count = 0;   /* empty stack; author in the Rigging panel */
+        jce_state_begin_batch_edit();
+        jce_scene_set_ik_constraints(scene, ce, &def);
+        jce_state_end_batch_edit();
+        return;
+    }
+
+    if (jce_editor_component_slot_is_sequence_player(slot)) {
+        JceScene *scene = jce_state_get_scene();
+        JceEntity ce = jce_state_to_ecs_entity(focused);
+        if (!scene || !ce || jce_scene_has_sequence_player(scene, ce))
+            return;
+        JceSequencePlayerComponent def;
+        memset(&def, 0, sizeof(def));
+        def.speed         = 1.0f;
+        def.play_on_awake = true;
+        jce_state_begin_batch_edit();
+        jce_scene_set_sequence_player(scene, ce, &def);
+        jce_state_end_batch_edit();
+        return;
+    }
+
     if (!jce_editor_component_slot_is_compound_collider(slot))
         return;
 

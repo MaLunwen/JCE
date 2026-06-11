@@ -674,6 +674,8 @@ static void cmd_show_animator_sm_(void)       { cmd_toggle_panel_(JCE_PANEL_ANIM
 static void cmd_show_anim_rigging_(void)      { cmd_toggle_panel_(JCE_PANEL_ANIMATION_RIGGING); }
 static void cmd_show_sequencer_(void)         { cmd_toggle_panel_(JCE_PANEL_SEQUENCER); }
 static void cmd_show_navmesh_(void)           { cmd_toggle_panel_(JCE_PANEL_NAVMESH); }
+static void cmd_show_bt_visualizer_(void)     { cmd_toggle_panel_(JCE_PANEL_BT_VISUALIZER); }
+static void cmd_show_world_streaming_(void)   { cmd_toggle_panel_(JCE_PANEL_WORLD_STREAMING); }
 static void cmd_show_terrain_(void)           { cmd_toggle_panel_(JCE_PANEL_TERRAIN); }
 static void cmd_show_lightmap_(void)          { cmd_toggle_panel_(JCE_PANEL_LIGHTMAP_BAKE); }
 static void cmd_show_curve_(void)             { cmd_toggle_panel_(JCE_PANEL_CURVE_EDITOR); }
@@ -734,6 +736,8 @@ static const PaletteCmd s_palette_cmds[] = {
     { "window.animationRigging", "Toggle Window: Animation Rigging", "Window", cmd_show_anim_rigging_ },
     { "window.sequencer",    "Toggle Window: Sequencer",    "Window",    cmd_show_sequencer_ },
     { "window.navmesh",      "Toggle Window: NavMesh",      "Window",    cmd_show_navmesh_ },
+    { "window.btVisualizer", "Toggle Window: BT Visualizer","Window",    cmd_show_bt_visualizer_ },
+    { "window.worldStreaming","Toggle Window: World Streaming","Window", cmd_show_world_streaming_ },
     { "window.terrain",      "Toggle Window: Terrain",      "Window",    cmd_show_terrain_ },
     { "window.lightmap",     "Toggle Window: Lightmap Bake","Window",    cmd_show_lightmap_ },
     { "window.curve",        "Toggle Window: Curve Editor", "Window",    cmd_show_curve_ },
@@ -1360,6 +1364,8 @@ static void draw_menu_bar(void)
         if (ImGui::BeginMenu(jce_editor_i18n("window.group.world"))) {
             panel_toggle(jce_editor_i18n("window.terrain"), JCE_PANEL_TERRAIN, "###jce_terrain");
             panel_toggle(jce_editor_i18n("window.navmesh"), JCE_PANEL_NAVMESH, "###jce_navmesh");
+            panel_toggle(jce_editor_i18n("window.btVisualizer"), JCE_PANEL_BT_VISUALIZER, "###bt_visualizer");
+            panel_toggle(jce_editor_i18n("window.worldStreaming"), JCE_PANEL_WORLD_STREAMING, "###world_streaming");
             ImGui::EndMenu();
         }
 
@@ -2432,6 +2438,18 @@ static void draw_panel_windows(void)
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_NAVMESH)) {
         jce_editor_panel_default_pose("navmesh");
         jce_editor_panel_navmesh();
+    }
+
+    /* ── BT Visualizer ───────────────────────────────────────────── */
+    if (*jce_editor_panel_visible_ptr(JCE_PANEL_BT_VISUALIZER)) {
+        jce_editor_panel_default_pose("bt_visualizer");
+        jce_editor_panel_bt_visualizer();
+    }
+
+    /* ── World Streaming ─────────────────────────────────────────── */
+    if (*jce_editor_panel_visible_ptr(JCE_PANEL_WORLD_STREAMING)) {
+        jce_editor_panel_default_pose("world_streaming");
+        jce_editor_panel_world_streaming();
     }
 
     /* ── Terrain ─────────────────────────────────────────────────── */

@@ -405,6 +405,11 @@ typedef struct {
     float    max_slope_deg;    /* max walkable slope (degrees) */
     float    gravity;          /* character gravity (positive = downward) */
     float    jump_speed;       /* initial jump velocity */
+    /* Movement feel (0 = engine default). `accel` is the horizontal
+     * acceleration toward the commanded velocity (m/s^2); `air_control`
+     * scales it while airborne (0..1). */
+    float    accel;
+    float    air_control;
 } JceCharacterDesc;
 
 JceCharacterHandle jce_physics_character_create(JcePhysicsWorld *world,
@@ -414,7 +419,8 @@ JCE_API void JCE_CALL jce_physics_character_destroy(JcePhysicsWorld *world,
 void jce_physics_character_move(JcePhysicsWorld *world,
                                  JceCharacterHandle ch,
                                  jce_vec3 walk_dir, float dt);
-void jce_physics_character_jump(JcePhysicsWorld *world,
+/* Returns true when the jump fired (false while already mid-jump). */
+bool jce_physics_character_jump(JcePhysicsWorld *world,
                                  JceCharacterHandle ch);
 void jce_physics_character_get_position(const JcePhysicsWorld *world,
                                          JceCharacterHandle ch,
@@ -425,6 +431,15 @@ void jce_physics_character_set_position(JcePhysicsWorld *world,
                                          jce_vec3 pos);
 bool jce_physics_character_is_grounded(const JcePhysicsWorld *world,
                                         JceCharacterHandle ch);
+/* Live linear velocity of the capsule body (m/s). */
+void jce_physics_character_get_velocity(const JcePhysicsWorld *world,
+                                         JceCharacterHandle ch,
+                                         jce_vec3 *out_vel);
+/* Early jump release: scales any remaining upward velocity by `factor`
+ * (0..1) so short taps yield short hops.  No-op when not ascending. */
+void jce_physics_character_cut_jump(JcePhysicsWorld *world,
+                                     JceCharacterHandle ch,
+                                     float factor);
 
 /* ================================================================== */
 /* Vehicle controller (raycast wheels)                                 */

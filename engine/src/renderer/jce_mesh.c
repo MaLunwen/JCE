@@ -602,17 +602,24 @@ JceMesh *jce_mesh_create_sphere(float radius)
         }
     }
 
+    /* Winding: CCW seen from OUTSIDE (the engine-wide front-face
+       convention — matches jce_mesh_create_cube and glTF). phi grows
+       toward -screen-x on the camera-facing side, so the quad must be
+       emitted (a, a+1, b) / (a+1, b+1, b); the previous (a, b, a+1)
+       order was clockwise from outside — with the default CULL_CW
+       state the sphere rendered INSIDE-OUT (front faces culled,
+       interior visible) on every backend. */
     uint32_t ii = 0;
     for (uint32_t r = 0; r < rings; r++) {
         for (uint32_t s = 0; s < slices; s++) {
             uint32_t a = r * (slices + 1) + s;
             uint32_t b = a + slices + 1;
             indices[ii++] = a;
-            indices[ii++] = b;
-            indices[ii++] = a + 1;
             indices[ii++] = a + 1;
             indices[ii++] = b;
+            indices[ii++] = a + 1;
             indices[ii++] = b + 1;
+            indices[ii++] = b;
         }
     }
 
@@ -675,17 +682,21 @@ JceMesh *jce_mesh_create_capsule(float radius, float height)
         }
     }
 
+    /* Winding: CCW from outside — same fix/rationale as
+       jce_mesh_create_sphere above (the shared ring-grid pattern was
+       emitted clockwise, rendering the capsule inside-out under the
+       default CULL_CW state). */
     uint32_t ii = 0;
     for (uint32_t r = 0; r < rows; r++) {
         for (uint32_t s = 0; s < slices; s++) {
             uint32_t a = r * (slices + 1) + s;
             uint32_t b = a + slices + 1;
             indices[ii++] = a;
-            indices[ii++] = b;
-            indices[ii++] = a + 1;
             indices[ii++] = a + 1;
             indices[ii++] = b;
+            indices[ii++] = a + 1;
             indices[ii++] = b + 1;
+            indices[ii++] = b;
         }
     }
 
@@ -735,15 +746,17 @@ JceMesh *jce_mesh_create_cylinder(float radius, float height)
             vi++;
         }
     }
+    /* Winding: CCW from outside — same ring-grid fix as the sphere
+       (tube faces were clockwise → culled, inner wall showed). */
     for (uint32_t s = 0; s < slices; s++) {
         uint32_t a = s;
         uint32_t b = a + slices + 1;
         indices[ii++] = a;
-        indices[ii++] = b;
-        indices[ii++] = a + 1;
         indices[ii++] = a + 1;
         indices[ii++] = b;
+        indices[ii++] = a + 1;
         indices[ii++] = b + 1;
+        indices[ii++] = b;
     }
 
     /* Top cap. */
@@ -763,10 +776,14 @@ JceMesh *jce_mesh_create_cylinder(float radius, float height)
         verts[vi].uv[1] = 0.5f + 0.5f * sinf(phi);
         vi++;
     }
+    /* Top cap winding: rim runs +X->+Z with growing phi, so CCW seen
+       from ABOVE (+Y outward) is (center, rim+s+1, rim+s) — the old
+       order faced the cap normal DOWN into the tube (cap invisible
+       from above, its interior visible from below). */
     for (uint32_t s = 0; s < slices; s++) {
         indices[ii++] = top_center;
-        indices[ii++] = top_rim + s;
         indices[ii++] = top_rim + s + 1;
+        indices[ii++] = top_rim + s;
     }
 
     /* Bottom cap. */
@@ -786,10 +803,12 @@ JceMesh *jce_mesh_create_cylinder(float radius, float height)
         verts[vi].uv[1] = 0.5f + 0.5f * sinf(phi);
         vi++;
     }
+    /* Bottom cap: CCW seen from BELOW (-Y outward) is the mirror of
+       the top cap — (center, rim+s, rim+s+1). */
     for (uint32_t s = 0; s < slices; s++) {
         indices[ii++] = bot_center;
-        indices[ii++] = bot_rim + s + 1;
         indices[ii++] = bot_rim + s;
+        indices[ii++] = bot_rim + s + 1;
     }
 
     JceMesh *mesh = jce_mesh_create(verts, vi, indices, ii);

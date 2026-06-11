@@ -978,11 +978,13 @@ JceCharacterHandle jce_physics_character_create(JcePhysicsWorld *world,
     float step_height = desc->step_height > 0.0f ? desc->step_height : 0.35f;
     float radius = desc->radius > 0.0f ? desc->radius : 0.3f;
     float height = desc->height > 0.0f ? desc->height : 1.8f;
+    float accel = desc->accel > 0.0f ? desc->accel : 40.0f;
+    float air_control = desc->air_control > 0.0f ? desc->air_control : 0.35f;
 
     uint32_t idx = jce_bullet_character_create(
         world->bullet,
         desc->position, radius, height, step_height,
-        max_slope_rad, gravity, jump_speed);
+        max_slope_rad, gravity, jump_speed, accel, air_control);
 
     if (idx == UINT32_MAX) {
         LOG_ERROR(LOG_TAG, "character pool exhausted");
@@ -1007,11 +1009,11 @@ void jce_physics_character_move(JcePhysicsWorld *world,
     jce_bullet_character_move(world->bullet, ch.idx, walk_dir, dt);
 }
 
-void jce_physics_character_jump(JcePhysicsWorld *world,
+bool jce_physics_character_jump(JcePhysicsWorld *world,
                                  JceCharacterHandle ch)
 {
-    if (!world || !jce_character_valid(ch)) return;
-    jce_bullet_character_jump(world->bullet, ch.idx);
+    if (!world || !jce_character_valid(ch)) return false;
+    return jce_bullet_character_jump(world->bullet, ch.idx);
 }
 
 void jce_physics_character_get_position(const JcePhysicsWorld *world,
@@ -1038,6 +1040,24 @@ bool jce_physics_character_is_grounded(const JcePhysicsWorld *world,
     if (!world || !jce_character_valid(ch)) return false;
     return jce_bullet_character_is_grounded(
         (JceBulletWorld *)world->bullet, ch.idx);
+}
+
+void jce_physics_character_get_velocity(const JcePhysicsWorld *world,
+                                         JceCharacterHandle ch,
+                                         jce_vec3 *out_vel)
+{
+    if (out_vel) *out_vel = jce_v3(0.0f, 0.0f, 0.0f);
+    if (!world || !jce_character_valid(ch)) return;
+    jce_bullet_character_get_velocity(
+        (JceBulletWorld *)world->bullet, ch.idx, out_vel);
+}
+
+void jce_physics_character_cut_jump(JcePhysicsWorld *world,
+                                     JceCharacterHandle ch,
+                                     float factor)
+{
+    if (!world || !jce_character_valid(ch)) return;
+    jce_bullet_character_cut_jump(world->bullet, ch.idx, factor);
 }
 
 /* ── Vehicle controller ───────────────────────────────────────────── */

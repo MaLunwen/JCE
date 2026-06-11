@@ -6,6 +6,9 @@
 
 #include "jce_panel_inspector_common.h"
 #include "ui/jce_editor_tip.h"
+#include "core/jce_editor_game_l10n.h"
+
+#include <jce/middleware/ui/jce_localization.h>
 
 /* Shared RectTransform editor: anchors / pivot / anchored position / size.
  * Embedded in UIImage and UIText (RectTransform is not a standalone ECS
@@ -83,11 +86,46 @@ void draw_comp_ui_image(JceUIImageComponent *im)
 void draw_comp_ui_text(JceUITextComponent *tx)
 {
     if (!tx) return;
+    /* Locale key: free-type InputText + picker combo over the project's
+     * game string tables (jce_editor_gl10n), with a live resolved preview
+     * through the same jce_loc table the runtime uses. */
     ImGui::InputText(jce_editor_i18n_id("inspector.uit.localeKey", "uit_lk"), tx->locale_key, sizeof tx->locale_key); insp_track_edit();
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(ImGui::GetFrameHeight());
+    if (ImGui::BeginCombo("##uit_lk_pick", "", ImGuiComboFlags_NoPreview)) {
+        const int nkeys = jce_editor_gl10n_key_count();
+        if (nkeys == 0)
+            ImGui::TextDisabled("%s", jce_editor_i18n_or(
+                "inspector.uit.localeKey.none",
+                "No game string tables (Project Settings > Localization)."));
+        for (int i = 0; i < nkeys; ++i) {
+            const char *k = jce_editor_gl10n_key_at(i);
+            bool sel = (strcmp(k, tx->locale_key) == 0);
+            if (ImGui::Selectable(k, sel)) {
+                jce_state_begin_batch_edit();
+                snprintf(tx->locale_key, sizeof tx->locale_key, "%s", k);
+                jce_state_end_batch_edit();
+            }
+            if (sel) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    jce_editor::help_tip(jce_editor_i18n_or("inspector.uit.localeKey.pick",
+            "Pick a key from the project's game string tables."));
     ImGui::SameLine();
     ImGui::TextDisabled("(?)");
     jce_editor::help_tip_delayed(jce_editor_i18n_or("inspector.uit.localeKey.tip",
             "Locale key for runtime localization. When set, jce_loc_t(key) overrides the Text field at runtime."));
+    if (tx->locale_key[0]) {
+        /* Resolved preview: pointer-equality with the key signals a miss. */
+        const char *res = jce_loc_t(tx->locale_key);
+        if (res != tx->locale_key)
+            ImGui::TextDisabled("= %s", res);
+        else
+            ImGui::TextDisabled("%s", jce_editor_i18n_or(
+                "inspector.uit.localeKey.missing",
+                "(key not found in the active game locale)"));
+    }
     ImGui::InputTextMultiline(jce_editor_i18n_id("inspector.uit.text", "uit"), tx->text, sizeof tx->text, ImVec2(0, ImGui::GetTextLineHeight() * 4)); insp_track_edit();
     jce_draw_path_input_asset(jce_editor_i18n_id("inspector.uit.fontPath", "uit"), tx->font_path, sizeof tx->font_path, JCE_ASSET_KIND_DATA); insp_track_edit();
     ImGui::DragFloat(jce_editor_i18n_id("inspector.uit.fontSize", "uit"), &tx->font_size, 0.5f, 1.0f, 512.0f, "%.1f"); insp_track_edit();

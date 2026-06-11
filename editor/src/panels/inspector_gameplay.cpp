@@ -6,6 +6,11 @@
 
 #include "jce_panel_inspector_common.h"
 
+extern "C" {
+#include <jce/renderer/jce_renderer_caps.h>    /* compute caps gate (GPU particles) */
+#include <jce/renderer/jce_render_pipeline.h>  /* gpu_particles feature flag hint   */
+}
+
 void draw_comp_behavior_tree(JceBehaviorTree *bt)
 {
     if (!bt) return;
@@ -50,7 +55,13 @@ void draw_comp_behavior_tree(JceBehaviorTree *bt)
     if (bt->tree_path[0] == '\0')
         ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "%s",
                            jce_editor_i18n("inspector.bt.noTree"));
-    ImGui::TextDisabled("%s", jce_editor_i18n("inspector.bt.editInBtEditor"));
+
+    /* Read-only BT Visualizer panel: tree structure in edit mode, live
+     * node statuses during Play. */
+    if (ImGui::Button(jce_editor_i18n_id("inspector.bt.openInVisualizer", "bt"))) {
+        bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_BT_VISUALIZER);
+        if (vis) *vis = true;
+    }
 }
 
 void draw_comp_spawn_manager(JceSpawnManagerComponent *m)
@@ -263,12 +274,113 @@ void draw_comp_particle_emitter(JceParticleEmitterComponent *pe)
     insp_track_edit();
     if (pe->lifetime_max < pe->lifetime_min) pe->lifetime_max = pe->lifetime_min;
     if (has_asset) ImGui::EndDisabled();
+
+    /* GPU simulation request (persisted; silently falls back to CPU when
+     * unsupported).  The GPU path is always world-space with the procedural
+     * sprite — the authored texture / worldSpace=false stay CPU-only. */
+    const bool compute_ok =
+        (jce_renderer_get_caps() & JCE_CAP_COMPUTE) != 0;
+    if (!compute_ok) ImGui::BeginDisabled();
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.pe.gpu", "pe"), &pe->gpu))
+        insp_undo_bool(&pe->gpu);
+    if (!compute_ok) {
+        ImGui::EndDisabled();
+        ImGui::TextDisabled("%s", jce_editor_i18n("inspector.pe.gpuUnsupported"));
+    } else if (pe->gpu &&
+               !jce_render_pipeline_is_feature_enabled("gpu_particles")) {
+        /* The checkbox stays editable — it is a persisted request; only the
+         * pipeline gate is currently off. */
+        ImGui::TextDisabled("%s", jce_editor_i18n("inspector.pe.gpuPipelineOff"));
+    }
+
     ImGui::TextDisabled(jce_editor_i18n("inspector.pe.useParticleSystemPanel"));
 }
 
 void draw_comp_script(JceScriptComponent *scr)
 {
+    insp_unwired_badge();
     jce_draw_path_input_asset("##script_path", scr->script_path, 128, JCE_ASSET_KIND_SCRIPT);
     insp_track_edit();
     accept_asset_drop(scr->script_path, 128);
+}
+
+void draw_comp_nav_agent(JceNavAgentComponent *na)
+{
+    if (!na) return;
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.nav.enabled", "nav"), &na->enabled))
+        insp_undo_bool(&na->enabled);
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.nav.radius", "nav"),         &na->radius,          0.05f, 0.0f, 100.0f,  "%.2f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.nav.height", "nav"),         &na->height,          0.05f, 0.0f, 100.0f,  "%.2f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.nav.maxSpeed", "nav"),       &na->max_speed,       0.05f, 0.0f, 1000.0f, "%.2f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.nav.maxAccel", "nav"),       &na->max_accel,       0.05f, 0.0f, 1000.0f, "%.2f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.nav.arriveRadius", "nav"),   &na->arrive_radius,   0.05f, 0.0f, 100.0f,  "%.2f"); insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.nav.waypointRadius", "nav"), &na->waypoint_radius, 0.05f, 0.0f, 100.0f,  "%.2f"); insp_track_edit();
+    ImGui::Separator();
+    ImGui::DragFloat3(jce_editor_i18n_id("inspector.nav.target", "nav"), na->target, 0.1f);
+    insp_track_edit();
+    int target_ent = (int)na->target_entity;
+    if (ImGui::DragInt(jce_editor_i18n_id("inspector.nav.targetEntity", "nav"), &target_ent, 1.0f, 0, 1<<30)) {
+        na->target_entity = (uint64_t)(target_ent < 0 ? 0 : target_ent);
+        insp_track_edit();
+    }
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.nav.autoRepath", "nav"), &na->auto_repath))
+        insp_undo_bool(&na->auto_repath);
+}
+
+void draw_comp_sequence_player(JceSequencePlayerComponent *sp)
+{
+    if (!sp) return;
+
+    ImGui::TextUnformatted(jce_editor_i18n("inspector.seqplayer.path"));
+    if (jce_draw_path_input_asset("##seqplayer_path", sp->seq_path,
+                                  sizeof(sp->seq_path), JCE_ASSET_KIND_DATA))
+        insp_track_edit();
+    accept_asset_drop(sp->seq_path, sizeof(sp->seq_path));
+
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.seqplayer.playOnAwake", "seqp"),
+                        &sp->play_on_awake))
+        insp_undo_bool(&sp->play_on_awake);
+    if (ImGui::Checkbox(jce_editor_i18n_id("inspector.seqplayer.overrideLoop", "seqp"),
+                        &sp->override_loop))
+        insp_undo_bool(&sp->override_loop);
+    if (sp->override_loop) {
+        ImGui::SameLine();
+        if (ImGui::Checkbox(jce_editor_i18n_id("inspector.seqplayer.loopValue", "seqp"),
+                            &sp->loop_override))
+            insp_undo_bool(&sp->loop_override);
+    }
+    ImGui::DragFloat(jce_editor_i18n_id("inspector.seqplayer.speed", "seqp"),
+                     &sp->speed, 0.01f, 0.0f, 100.0f, "%.2f");
+    insp_track_edit();
+
+    /* Read-only bindings list (authored via the Sequencer panel's
+     * "Sync to Player"). */
+    ImGui::Separator();
+    ImGui::TextUnformatted(jce_editor_i18n("inspector.seqplayer.bindings"));
+    int n = sp->binding_count;
+    if (n < 0) n = 0;
+    if (n > JCE_SEQ_PLAYER_MAX_BINDINGS) n = JCE_SEQ_PLAYER_MAX_BINDINGS;
+    if (n == 0) {
+        ImGui::TextDisabled("%s", jce_editor_i18n("inspector.seqplayer.noBindings"));
+    } else {
+        JceScene *scene = jce_state_get_scene();
+        for (int i = 0; i < n; ++i) {
+            uint64_t id = sp->bindings[i];
+            if (id == 0) {
+                ImGui::TextDisabled("#%d: —", i);
+            } else {
+                const char *nm = scene
+                    ? jce_scene_entity_name(scene, (JceEntity)id) : NULL;
+                ImGui::TextDisabled("#%d: %s (%llu)", i,
+                                    (nm && nm[0]) ? nm : "?",
+                                    (unsigned long long)id);
+            }
+        }
+    }
+
+    if (ImGui::Button(jce_editor_i18n_id("inspector.seqplayer.openInSequencer", "seqp"))) {
+        bool *ae_vis = jce_editor_panel_visible_ptr(JCE_PANEL_ANIMATION_EDITOR);
+        if (ae_vis) *ae_vis = true;
+        jce_panel_animation_editor_request_tab(3);
+    }
 }

@@ -15,6 +15,7 @@
 #include <jce/os/core/jce_str.h>
 #include <jce/resource/jce_archive_cook.h>
 
+#include "jce_cook_policy.h"
 #include "os/core/jce_memory.h"
 
 #include <limits.h>
@@ -592,39 +593,9 @@ static int cook_parse_texfmt(const char *s)
     return -1;
 }
 
-/* Tangent-space normal-map heuristic — mirror jce_asset_cooker.c so an
- * unannotated normal map still gets BC5 (not BC3, which wrecks RG normals). */
-static int cook_path_is_normal_map(const char *path)
-{
-    if (!path) return 0;
-    char low[1024];
-    size_t n = 0;
-    for (; path[n] && n < sizeof(low) - 1; n++) {
-        char c = path[n];
-        low[n] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
-    }
-    low[n] = '\0';
-    return (strstr(low, "normal") || strstr(low, "_nrm") ||
-            strstr(low, "_norm")  || strstr(low, "-normal")) ? 1 : 0;
-}
-
-/* Auto GPU format by target platform (matches jce_asset_cooker.c). */
-static int cook_auto_texfmt(const char *vpath, int target_platform)
-{
-    switch (target_platform) {
-    case JCE_COOK_PLATFORM_WINDOWS:
-    case JCE_COOK_PLATFORM_LINUX:
-    case JCE_COOK_PLATFORM_MACOS:
-        return cook_path_is_normal_map(vpath) ? JCEASSET_TEXFMT_BC5
-                                              : JCEASSET_TEXFMT_BC3;
-    case JCE_COOK_PLATFORM_ANDROID:
-    case JCE_COOK_PLATFORM_IOS:
-    case JCE_COOK_PLATFORM_WEB:
-        return JCEASSET_TEXFMT_ASTC_4x4;
-    default:
-        return JCEASSET_TEXFMT_RGBA8;
-    }
-}
+/* Texture-format policy (normal-map heuristic + per-platform auto format)
+ * lives in jce_cook_policy.h — shared with jce_asset_cooker.c so the two
+ * cook paths can never drift apart. */
 
 /* Read & parse a sibling "<vpath>.import.json" preset, if present. Returns a
  * cJSON root the caller must cJSON_Delete, or NULL when absent/unparseable. */
@@ -668,7 +639,8 @@ static uint8_t *cook_asset(const char *vpath, uint8_t *raw, size_t raw_size,
         JceCookOptions opt = JCE_COOK_DEFAULT;
         opt.platform         = (JceCookPlatform)target_platform;
         opt.generate_mipmaps = true;
-        opt.texture_format   = cook_auto_texfmt(vpath, target_platform);
+        opt.texture_format   = jce_cook_auto_texture_format(vpath,
+                                                            target_platform);
         opt.max_texture_size = 0;
         if (imp) {
             const cJSON *tf = cJSON_GetObjectItemCaseSensitive(imp, "target_format");
@@ -976,7 +948,8 @@ typedef struct {
 } PakEntry;
 
 static uint8_t *build_jbundle(PakEntry *entries, size_t count, int zstd_level,
-                              size_t *out_size)
+                              bool encrypt, const uint8_t *encryption_key,
+                              const char *encrypt_label, size_t *out_size)
 {
     JceCookInput *inputs = (JceCookInput *)JCE_MALLOC(
         sizeof(JceCookInput) * (count ? count : 1));
@@ -997,6 +970,11 @@ static uint8_t *build_jbundle(PakEntry *entries, size_t count, int zstd_level,
     cfg.compress_index   = true;
     cfg.use_dict         = true;
     cfg.dedup_content    = true;
+    /* Encrypt EVERYTHING in the bundle (incl. __bundle__/manifest.json);
+     * the bundle id seeds the per-archive nonce salt. */
+    cfg.encrypt          = encrypt && encryption_key != NULL;
+    cfg.encryption_key   = encryption_key;
+    cfg.encrypt_label    = encrypt_label;
 
     void *blob = NULL;
     size_t blob_size = 0;
@@ -1040,7 +1018,7 @@ static cJSON *build_contract(const char *name, uint32_t major, uint32_t minor) {
 
 static char *build_manifest(const Bundle *b, const PakEntry *entries,
                             size_t entry_count, uint64_t content_hash,
-                            uint32_t version, size_t *out_len) {
+                            uint32_t version, bool encrypted, size_t *out_len) {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddItemToObject(root, JCE_BUNDLE_KEY_CONTRACT,
         build_contract(JCE_BUNDLE_MANIFEST_CONTRACT_NAME,
@@ -1052,6 +1030,7 @@ static char *build_manifest(const Bundle *b, const PakEntry *entries,
     cJSON_AddStringToObject(root, JCE_BUNDLE_KEY_CONTENT_HASH, hex);
     JCE_FREE(hex);
     cJSON_AddStringToObject(root, JCE_BUNDLE_KIND_KEY, b->kind);
+    cJSON_AddBoolToObject(root, JCE_BUNDLE_KEY_ENCRYPTED, encrypted);
     if (b->scene_path)
         cJSON_AddStringToObject(root, JCE_BUNDLE_KEY_SCENE_PATH, b->scene_path);
 
@@ -1115,6 +1094,7 @@ typedef struct {
     char *scene_path;
     char *content_hash;
     uint64_t size;
+    bool encrypted;
     StrVec deps;
     ReportEntryVec entries;
 } CatalogEntry;
@@ -1290,6 +1270,7 @@ static char *build_report_json(const CatalogVec *cat, size_t *out_len) {
         cJSON_AddStringToObject(bo, "file", e->file);
         cJSON_AddNumberToObject(bo, "size_bytes", (double)e->size);
         cJSON_AddNumberToObject(bo, "entry_count", (double)e->entries.n);
+        cJSON_AddBoolToObject(bo, "encrypted", e->encrypted);
         total_bytes += e->size;
 
         cJSON *deps = cJSON_AddArrayToObject(bo, "dependencies");
@@ -1305,6 +1286,7 @@ static char *build_report_json(const CatalogVec *cat, size_t *out_len) {
             cJSON_AddStringToObject(eo, "hash", re->hash ? re->hash : "");
             cJSON_AddStringToObject(eo, "type",
                 report_guess_type(re->path ? re->path : ""));
+            cJSON_AddBoolToObject(eo, "encrypted", e->encrypted);
             cJSON_AddItemToArray(ents, eo);
 
             if (re->hash && re->hash[0]) {
@@ -2015,6 +1997,18 @@ static int run_build_impl(const JceBundlePackOptions *opts)
             XXH3_64bits_update(xs, &cook_flag, sizeof(cook_flag));
             XXH3_64bits_update(xs, &cook_plat, sizeof(cook_plat));
         }
+        /* Encryption state busts the incremental cache: fold the encrypt
+         * flag and a key FINGERPRINT (never the key itself) into the input
+         * hash so toggling encryption — or rotating the key — rebuilds
+         * every bundle instead of reusing stale (differently-encrypted)
+         * .prev artifacts. */
+        {
+            uint8_t  enc_flag = (opts->encrypt && opts->encryption_key) ? 1u : 0u;
+            uint64_t key_fp   = enc_flag
+                ? (uint64_t)XXH3_64bits(opts->encryption_key, 32) : 0u;
+            XXH3_64bits_update(xs, &enc_flag, sizeof(enc_flag));
+            XXH3_64bits_update(xs, &key_fp, sizeof(key_fp));
+        }
         if (b->scene_path)
             XXH3_64bits_update(xs, b->scene_path, strlen(b->scene_path));
         /* Fold scene file content into the hash so editing only the
@@ -2136,6 +2130,9 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                         cJSON *sj = cJSON_ParseWithLength(
                             (const char *)sblob, ssz);
                         if (sj) {
+                            const cJSON *enc = cJSON_GetObjectItemCaseSensitive(
+                                sj, JCE_BUNDLE_KEY_ENCRYPTED);
+                            ce->encrypted = cJSON_IsTrue(enc);
                             const cJSON *assets = cJSON_GetObjectItemCaseSensitive(
                                 sj, JCE_BUNDLE_KEY_ASSETS);
                             if (cJSON_IsArray(assets)) {
@@ -2241,15 +2238,20 @@ static int run_build_impl(const JceBundlePackOptions *opts)
             entries[i].content_hash = XXH3_64bits(entries[i].raw,
                                                   entries[i].raw_size);
 
+        const bool enc_now = opts->encrypt && opts->encryption_key != NULL;
+
         size_t mlen = 0;
         char *mtext = build_manifest(b, entries + 1, actual - 1,
-                                     input_hash, catalog_version, &mlen);
+                                     input_hash, catalog_version, enc_now,
+                                     &mlen);
         entries[manifest_slot].vpath    = pack_strdup(JCE_BUNDLE_MANIFEST_VPATH);
         entries[manifest_slot].raw      = (uint8_t *)mtext;
         entries[manifest_slot].raw_size = mlen;
 
         size_t pak_size = 0;
-        uint8_t *pak = build_jbundle(entries, actual, zstd_level, &pak_size);
+        uint8_t *pak = build_jbundle(entries, actual, zstd_level,
+                                     enc_now, opts->encryption_key, b->id,
+                                     &pak_size);
 
         if (!write_file(out_path, pak, pak_size)) {
             ERR("cannot write %s", out_path);
@@ -2288,6 +2290,7 @@ static int run_build_impl(const JceBundlePackOptions *opts)
         if (b->scene_path) ce->scene_path = pack_strdup(b->scene_path);
         ce->content_hash = pack_strdup(prev_h_str);
         ce->size = pak_size;
+        ce->encrypted = enc_now;
         for (size_t d = 0; d < b->deps.n; ++d)
             sv_push(&ce->deps, b->deps.items[d]);
         /* Capture per-asset entries for the build report.  Skip the

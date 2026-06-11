@@ -21,6 +21,7 @@
 
 extern "C" {
 #include <jce/renderer/jce_render_pipeline.h>
+#include <jce/renderer/jce_renderer_caps.h>
 }
 
 /* ── Panel state ──────────────────────────────────────────────────── */
@@ -133,9 +134,22 @@ void jce_editor_panel_render_pipeline_content(void)
         changed |= ImGui::Checkbox(
             jce_editor_i18n("panel.render_pipeline.feature.volumetric_fog"),
             &s_rp.desc.enable_volumetric_fog);
-        changed |= ImGui::Checkbox(
-            jce_editor_i18n("panel.render_pipeline.feature.gpu_particles"),
-            &s_rp.desc.enable_gpu_particles);
+        {
+            /* GPU particles require compute shaders; grey out the toggle on
+             * devices without BGFX_CAPS_COMPUTE (the engine would no-op). */
+            const bool compute_ok =
+                (jce_renderer_get_caps() & JCE_CAP_COMPUTE) != 0;
+            if (!compute_ok) ImGui::BeginDisabled();
+            changed |= ImGui::Checkbox(
+                jce_editor_i18n("panel.render_pipeline.feature.gpu_particles"),
+                &s_rp.desc.enable_gpu_particles);
+            if (!compute_ok) {
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                    ImGui::SetTooltip("%s", jce_editor_i18n(
+                        "panel.render_pipeline.feature.gpu_particles.unsupported"));
+            }
+        }
         changed |= ImGui::Checkbox(
             jce_editor_i18n("panel.render_pipeline.feature.motion_blur"),
             &s_rp.desc.enable_motion_blur);

@@ -37,6 +37,8 @@
 #include <jce/middleware/physics/jce_collider_cook.h>
 #include <jce/middleware/physics/jce_collider_asset.h>
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/middleware/scene/jce_scene_sequencer.h>
+#include <jce/middleware/scene/jce_tilemap.h>
 #include <jce/middleware/world/jce_trigger_volume.h>
 #include <jce/middleware/world/jce_spawn_manager.h>
 #include <jce/middleware/world/jce_weapon.h>
@@ -49,6 +51,8 @@
 #include <jce/middleware/net/jce_session.h>
 #include <jce/middleware/net/jce_replication.h>
 #include <jce/middleware/net/jce_net_transform.h>
+#include <jce/middleware/ui/jce_localization.h>
+#include <jce/os/platform/jce_host_locale.h>
 #include <jce/resource/jce_model_importer.h>
 #include <jce/os/core/jce_alloc.h>
 #include <jce/os/core/jce_filesystem.h>
@@ -131,6 +135,16 @@ typedef struct {
 	uint64_t           rng;     /* per-weapon spread RNG */
 } WeaponEntry;
 
+/* Authored NavAgent mirrored into the runtime agent set (rt->nav_agents).
+ * has_dest/last_goal_* cache the destination last issued so auto_repath can
+ * re-issue set_destination only when the goal actually moves. */
+typedef struct {
+	JceEntity         entity;
+	JceNavAgentHandle handle;
+	bool              has_dest;
+	float             last_goal_x, last_goal_z;
+} NavAgentEntry;
+
 /* Authored SavePoint mirrored as a sphere trigger in rt->trigger_world.
  * When the player observer enters the volume the runtime writes a snapshot
  * to "<saves_dir>/<save_id>.jsnp" (P2-save-snapshot).  one_shot points fire
@@ -211,6 +225,18 @@ struct JceRuntime {
 	jce_vec3           char_cur_pos;    /* capsule center, current fixed tick */
 	jce_vec3           char_last_pos;   /* last feet pos written (edit detect) */
 	jce_quat           char_last_rot;
+	/* Movement feel, cached from the authored CharacterController at spawn. */
+	float              char_move_speed;     /* m/s */
+	float              char_sprint_mult;
+	float              char_turn_speed;     /* rad/s */
+	/* Control state: current visual yaw (smoothed toward move direction),
+	 * coyote-time / jump-buffer countdowns, and the previous jump_held for
+	 * the variable-height release edge. */
+	float              char_yaw;
+	bool               char_yaw_valid;
+	float              char_coyote_t;
+	float              char_jump_buf_t;
+	bool               char_jump_was_held;
 
 	VoiceEntry      *voices;
 	int              voice_count;
@@ -322,6 +348,10 @@ struct JceRuntime {
 	JceRecastNavMesh *nav_recast;     /* owned */
 	JceNavAgentSet   *nav_agents;     /* owned */
 
+	NavAgentEntry    *nav_entries;
+	int               nav_entry_count;
+	int               nav_entry_cap;
+
 	/* True once the runtime detected an already-running net session and is
 	 * pumping jce_session_tick() in the fixed loop. */
 	bool             net_session_driven;
@@ -425,6 +455,17 @@ static bool rt_grow_weapons(JceRuntime *rt)
 	if (!p) return false;
 	rt->weapons    = p;
 	rt->weapon_cap = new_cap;
+	return true;
+}
+
+static bool rt_grow_nav_entries(JceRuntime *rt)
+{
+	int new_cap = rt->nav_entry_cap ? rt->nav_entry_cap * 2 : 4;
+	NavAgentEntry *p = (NavAgentEntry *)jce_realloc(rt->nav_entries,
+	                                                (size_t)new_cap * sizeof(*p));
+	if (!p) return false;
+	rt->nav_entries   = p;
+	rt->nav_entry_cap = new_cap;
 	return true;
 }
 
@@ -742,26 +783,32 @@ static bool rt_try_load_cached_collider(JceRuntime *rt, const char *model_path,
 }
 
 /*
- * Try to materialise a per-object compound collider for entity `e`.
- * Loads the referenced model WITHOUT flattening its node hierarchy, cooks
- * each part into its own child shape, and instantiates the lot as a single
- * compound body — so a model holding N separated objects yields N child
- * colliders rather than one fat hull spanning the gaps between them.
+ * Cook + instantiate a body for entity `e` from a compound-collider
+ * description.  Shared by the real Compound Collider component and the
+ * Mesh Collider (which synthesises a single-shape description).
+ * `allow_blob_cache` gates the offline ".jcol" blob lookup — the blob is
+ * cooked with the compound's own settings (AUTO + static), so callers
+ * whose cook settings differ (e.g. a convex mesh collider) must skip it.
+ *
+ * Note: the entity's TRS scale is NOT baked into the cooked shapes
+ * (pre-existing jce_collider_instantiate behavior, kept for parity).
  *
  * Returns true if a body was spawned (caller then skips the regular
  * rigid-body path so the entity does not get a second body).
  */
-static bool rt_try_spawn_compound(JceRuntime *rt, JceScene *scene,
-                                  JceEntity e, const JceTransform *tf)
+static bool rt_spawn_cooked_body(JceRuntime *rt, JceScene *scene, JceEntity e,
+                                 const JceTransform *tf,
+                                 const JceCompoundColliderComponent *cc,
+                                 bool allow_blob_cache)
 {
-	JceCompoundColliderComponent *cc = jce_scene_get_compound_collider(scene, e);
 	if (!cc || cc->model_path[0] == '\0') return false;
 
 	/* Prefer a precomputed (offline-cooked) blob beside the model so we do
 	 * not re-cook colliders live at every scene load.  Fall through to the
 	 * live cook below on a cache miss. */
 	JceCookedCollider cooked;
-	bool have_cooked = rt_try_load_cached_collider(rt, cc->model_path, &cooked);
+	bool have_cooked = allow_blob_cache &&
+	                   rt_try_load_cached_collider(rt, cc->model_path, &cooked);
 
 	if (!have_cooked) {
 
@@ -860,6 +907,71 @@ static bool rt_try_spawn_compound(JceRuntime *rt, JceScene *scene,
 }
 
 /*
+ * Try to materialise a per-object compound collider for entity `e`.
+ * Loads the referenced model WITHOUT flattening its node hierarchy, cooks
+ * each part into its own child shape, and instantiates the lot as a single
+ * compound body — so a model holding N separated objects yields N child
+ * colliders rather than one fat hull spanning the gaps between them.
+ *
+ * Returns true if a body was spawned (caller then skips the regular
+ * rigid-body path so the entity does not get a second body).
+ */
+static bool rt_try_spawn_compound(JceRuntime *rt, JceScene *scene,
+                                  JceEntity e, const JceTransform *tf)
+{
+	JceCompoundColliderComponent *cc = jce_scene_get_compound_collider(scene, e);
+	if (!cc || cc->model_path[0] == '\0') return false;
+	return rt_spawn_cooked_body(rt, scene, e, tf, cc, true);
+}
+
+/*
+ * Try to materialise a Mesh Collider for entity `e` (Unity MeshCollider
+ * semantics: ONE shape cooked from the whole referenced mesh).  Reuses the
+ * compound cook/instantiate path via a synthetic single-shape description:
+ * exact triangle mesh for static bodies, convex hull when `convex` is set
+ * or the body is dynamic (Bullet triangle meshes are static-only).
+ *
+ * Returns true if a body was spawned (caller then skips the regular
+ * rigid-body path so the entity does not get a second body).
+ */
+static bool rt_try_spawn_mesh(JceRuntime *rt, JceScene *scene,
+                              JceEntity e, const JceTransform *tf)
+{
+	JceMeshColliderComponent *mc = jce_scene_get_mesh_collider(scene, e);
+	if (!mc || mc->mesh_path[0] == '\0') return false;
+	if (!jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_MESH_COLLIDER))
+		return false;
+
+	JceRigidBodyComponent *rb = jce_scene_get_rigidbody(scene, e);
+	bool dynamic = rb && !rb->is_kinematic && rb->mass > 0.0f;
+	bool convex  = mc->convex;
+	if (dynamic && !convex) {
+		LOG_WARN(LOG_TAG, "mesh collider on dynamic rigidbody requires convex; "
+		         "cooking convex hull instead (entity %llu, %s)",
+		         (unsigned long long)e, mc->mesh_path);
+		convex = true;
+	}
+
+	/* Synthetic compound description: one shape for the whole model. */
+	JceCompoundColliderComponent cc;
+	memset(&cc, 0, sizeof cc);
+	memcpy(cc.model_path, mc->mesh_path, sizeof cc.model_path);
+	cc.mode          = (uint8_t)(convex ? JCE_COLLIDER_MODE_CONVEX_HULL
+	                                    : JCE_COLLIDER_MODE_TRIANGLE_MESH);
+	cc.split         = (uint8_t)JCE_COLLIDER_SPLIT_WHOLE;
+	cc.is_static     = !dynamic;
+	cc.detect_naming = false;
+	cc.is_trigger    = mc->is_trigger;
+	cc.friction      = mc->friction;
+	cc.restitution   = mc->restitution;
+
+	/* The offline ".jcol" blob beside the model is cooked AUTO + static —
+	 * only shape-compatible with the static triangle-mesh case here. */
+	bool allow_blob_cache = !convex && !dynamic;
+	return rt_spawn_cooked_body(rt, scene, e, tf, &cc, allow_blob_cache);
+}
+
+/*
  * Spawn a 2D rigid body for entity `e` from its RigidBody2DComponent
  * (+ optional Collider2DComponent) into the Box2D world.  The simulation
  * runs in the XY plane: the entity's Transform x/y seed the body position,
@@ -904,8 +1016,10 @@ static void rt_spawn_body2d(JceRuntime *rt, JceScene *scene,
 		bd.type = JCE_BODY_STATIC;
 	else                                     bd.type = JCE_BODY_DYNAMIC;
 
-	float sx = tf->scale.x != 0.0f ? fabsf(tf->scale.x) : 1.0f;
-	float sy = tf->scale.y != 0.0f ? fabsf(tf->scale.y) : 1.0f;
+	/* 2D body: x/y projection of the abs-sanitized scale. */
+	jce_vec3 s2 = jce_v3_abs_safe_scale(tf->scale);
+	float sx = s2.x;
+	float sy = s2.y;
 	float smax = sx > sy ? sx : sy;
 
 	/* Shape + extents from the optional Collider2D; default to a unit box. */
@@ -977,6 +1091,109 @@ static void rt_spawn_body2d(JceRuntime *rt, JceScene *scene,
 	be->body   = body;
 	be->kind   = (uint8_t)bd.type;
 	rt->body2d_count++;
+}
+
+/*
+ * Spawn ONE static 2D body for entity `e` from its TilemapCollider2D +
+ * Tilemap components: the .tilemap.json's solid cells (any non-zero id)
+ * are greedy-merged into axis-aligned rectangles and attached as box
+ * shapes to a single static Box2D body, so a large map costs a handful
+ * of shapes instead of one per cell.
+ *
+ * Cell convention (mirrors the renderer): cell (col,row) spans entity-
+ * local [col,col+1] x [-(row+1),-row], scaled by the entity's XY scale.
+ *
+ * `used_by_composite` is intentionally ignored: the greedy merge above
+ * already IS the composite — there is no separate CompositeCollider2D
+ * component to defer shape ownership to.
+ */
+static void rt_spawn_tilemap_collider2d(JceRuntime *rt, JceScene *scene,
+                                        JceEntity e, const JceTransform *tf)
+{
+	JceTilemapCollider2DComponent *col =
+		jce_scene_get_tilemap_collider2d(scene, e);
+	JceTilemapComponent *tm = jce_scene_get_tilemap(scene, e);
+	if (!col || !tm || !tm->tilemap_path[0]) return;
+
+	/* The tilemap stays STATIC even when a dynamic RigidBody2D coexists
+	 * on the entity (moving tilemap colliders are out of scope). */
+	JceRigidBody2DComponent *rb = jce_scene_get_rigidbody2d(scene, e);
+	if (rb && jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_RIGIDBODY_2D) &&
+	    rb->body_type != JCE_BODY_STATIC && rb->body_type != JCE_BODY_KINEMATIC &&
+	    rb->mass > 0.0f)
+		LOG_WARN(LOG_TAG, "tilemap collider on entity %llu coexists with a "
+		         "DYNAMIC RigidBody2D; the tilemap body stays static",
+		         (unsigned long long)e);
+
+	/* PAK-first (deployed bundles), then the loose file (editor Play). */
+	JceTilemapAsset *map = rt->pak
+		? jce_tilemap_load_from_pak(rt->pak, tm->tilemap_path) : NULL;
+	if (!map) map = jce_tilemap_load_file(tm->tilemap_path);
+	if (!map) {
+		LOG_WARN(LOG_TAG, "tilemap collider: load failed '%s' (entity %llu)",
+		         tm->tilemap_path, (unsigned long long)e);
+		return;
+	}
+
+	JceTilemapSolidRect rects[JCE_TILEMAP_COL_MAX_RECTS];
+	uint32_t total = jce_tilemap_solid_rects(map, rects,
+	                                         JCE_TILEMAP_COL_MAX_RECTS);
+	uint32_t n = total;
+	if (n > JCE_TILEMAP_COL_MAX_RECTS) {
+		LOG_WARN(LOG_TAG, "tilemap collider '%s': %u merged rects exceed "
+		         "the %d cap; truncating", tm->tilemap_path, total,
+		         JCE_TILEMAP_COL_MAX_RECTS);
+		n = JCE_TILEMAP_COL_MAX_RECTS;
+	}
+	if (n == 0) {
+		jce_tilemap_unload(map);
+		return;
+	}
+
+	/* Same Z-angle quaternion recovery as rt_spawn_body2d. */
+	float angle;
+	{
+		jce_quat q = tf->rotation;
+		angle = atan2f(2.0f * (q.w * q.z + q.x * q.y),
+		               1.0f - 2.0f * (q.y * q.y + q.z * q.z));
+	}
+	jce_vec2 pos;
+	pos.x = tf->position.x + col->offset[0];
+	pos.y = tf->position.y + col->offset[1];
+
+	JceBodyHandle body = jce_physics2d_body_create_empty(rt->physics2d, pos,
+	                                                     angle, JCE_BODY_STATIC);
+	if (!jce_body_valid(body)) {
+		jce_tilemap_unload(map);
+		return;
+	}
+
+	jce_vec3 s2 = jce_v3_abs_safe_scale(tf->scale);
+	float friction    = (float)col->friction_x100 / 100.0f;
+	float restitution = (float)col->bounciness_x100 / 100.0f;
+
+	for (uint32_t i = 0; i < n; i++) {
+		jce_vec2 center, half;
+		center.x =  ((float)rects[i].x + (float)rects[i].w * 0.5f) * s2.x;
+		center.y = -((float)rects[i].y + (float)rects[i].h * 0.5f) * s2.y;
+		half.x   = (float)rects[i].w * 0.5f * s2.x;
+		half.y   = (float)rects[i].h * 0.5f * s2.y;
+		jce_physics2d_body_add_box(rt->physics2d, body, center, half,
+		                           friction, restitution, col->trigger);
+	}
+
+	/* Track like rt_spawn_body2d (static → no transform write-back). */
+	if (rt->body2d_count < rt->body2d_cap || rt_grow_bodies2d(rt)) {
+		Body2DEntry *be = &rt->bodies2d[rt->body2d_count];
+		be->entity = e;
+		be->body   = body;
+		be->kind   = (uint8_t)JCE_BODY_STATIC;
+		rt->body2d_count++;
+	}
+
+	LOG_INFO(LOG_TAG, "tilemap collider: %u box shapes for '%s' (entity %llu)",
+	         n, tm->tilemap_path, (unsigned long long)e);
+	jce_tilemap_unload(map);
 }
 
 /* Play a resolved sound for an audio source + track its voice.  Shared by
@@ -1133,7 +1350,9 @@ static void rt_spawn_entity(JceScene *scene, JceEntity e, void *ud)
 			cd.step_height   = cc->step_offset > 0.0f ? cc->step_offset : 0.35f;
 			cd.max_slope_deg = cc->slope_limit > 0.0f ? cc->slope_limit : 50.0f;
 			cd.gravity       = 9.81f;
-			cd.jump_speed    = 5.0f;
+			cd.jump_speed    = cc->jump_speed  > 0.0f ? cc->jump_speed  : 5.0f;
+			cd.accel         = cc->accel;        /* 0 → physics default */
+			cd.air_control   = cc->air_control;
 			/* The scene Transform is the FEET (feet-pivoted meshes), but the
 			 * Bullet capsule is centered on its origin — spawn the CENTER half
 			 * a height above the feet so it rests instead of sinking on frame 0. */
@@ -1146,6 +1365,14 @@ static void rt_spawn_entity(JceScene *scene, JceEntity e, void *ud)
 				rt->char_prev_pos         = cd.position;
 				rt->char_last_pos         = tf->position;  /* feet */
 				rt->char_last_rot         = tf->rotation;
+				rt->char_move_speed  = cc->move_speed  > 0.0f ? cc->move_speed  : 4.0f;
+				rt->char_sprint_mult = cc->sprint_mult > 0.0f ? cc->sprint_mult : 1.8f;
+				rt->char_turn_speed  = (cc->turn_speed_deg > 0.0f
+				                        ? cc->turn_speed_deg : 720.0f) * JCE_DEG2RAD;
+				rt->char_yaw_valid   = false;
+				rt->char_coyote_t    = 0.0f;
+				rt->char_jump_buf_t  = 0.0f;
+				rt->char_jump_was_held = false;
 			}
 			/* Character takes priority — skip rigid body for this entity. */
 			goto try_audio;
@@ -1153,7 +1380,16 @@ static void rt_spawn_entity(JceScene *scene, JceEntity e, void *ud)
 	}
 
 	/* ── Compound collider (per-object cooked) takes priority ── */
-	if (rt->physics && rt_try_spawn_compound(rt, scene, e, tf))
+	if (rt->physics && rt_try_spawn_compound(rt, scene, e, tf)) {
+		if (jce_scene_has_mesh_collider(scene, e))
+			LOG_WARN(LOG_TAG, "entity %llu has both Compound and Mesh "
+			         "colliders; compound wins, mesh collider ignored",
+			         (unsigned long long)e);
+		goto try_audio;
+	}
+
+	/* ── Mesh collider (single cooked hull / triangle mesh) ── */
+	if (rt->physics && rt_try_spawn_mesh(rt, scene, e, tf))
 		goto try_audio;
 
 	/* ── Rigid body ── */
@@ -1170,8 +1406,11 @@ static void rt_spawn_entity(JceScene *scene, JceEntity e, void *ud)
 			bd.friction        = rb->friction    > 0.0f ? rb->friction    : 0.5f;
 			bd.restitution     = rb->restitution;
 
-			JceBoxColliderComponent    *box = jce_scene_get_box_collider(scene, e);
-			JceSphereColliderComponent *sph = jce_scene_get_sphere_collider(scene, e);
+			JceBoxColliderComponent     *box = jce_scene_get_box_collider(scene, e);
+			JceSphereColliderComponent  *sph = jce_scene_get_sphere_collider(scene, e);
+			JceCapsuleColliderComponent *cap = jce_scene_get_capsule_collider(scene, e);
+			if (cap && !jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_CAPSULE_COLLIDER))
+				cap = NULL;
 			if (box) {
 				bd.shape = JCE_SHAPE_BOX;
 				bd.half_extents.x = 0.5f * box->size[0] * tf->scale.x;
@@ -1205,6 +1444,34 @@ static void rt_spawn_entity(JceScene *scene, JceEntity e, void *ud)
 					bd.position = jce_v3_add(bd.position, sofs);
 				}
 				bd.is_trigger = sph->is_trigger;
+			} else if (cap) {
+				/* Bullet capsules are Y-aligned: half_extents = (radius,
+				 * cylinder half-height, 0).  Mirror the editor collider
+				 * overlay (jce_scene_render_draw.cpp capsule block) so
+				 * draw == physics: radius scales by max(|sx|,|sz|), total
+				 * height by |sy|, hemispheres carved out of the authored
+				 * total height.  `axis` is intentionally ignored — the
+				 * overlay draws Y-aligned too, and JceBodyDesc has no
+				 * per-shape axis (only whole-body rotation). */
+				bd.shape = JCE_SHAPE_CAPSULE;
+				jce_vec3 cs = jce_v3_abs_safe_scale(tf->scale);
+				float cr_scale = cs.x > cs.z ? cs.x : cs.z;
+				float cr = (cap->radius > 0.0f ? cap->radius : 0.3f) * cr_scale;
+				float ch = (cap->height > 0.0f ? cap->height : 1.0f) * cs.y;
+				float chh = 0.5f * (ch - 2.0f * cr);
+				if (chh < 0.0f) chh = 0.0f;
+				bd.half_extents.x = cr;
+				bd.half_extents.y = chh;
+				/* Local center: scale by TRS scale, then rotate by TRS
+				 * rotation (same as the box/sphere branches above). */
+				{
+					jce_vec3 cofs = jce_v3(cap->center[0] * tf->scale.x,
+					                       cap->center[1] * tf->scale.y,
+					                       cap->center[2] * tf->scale.z);
+					cofs = jce_q_rotate(tf->rotation, cofs);
+					bd.position = jce_v3_add(bd.position, cofs);
+				}
+				bd.is_trigger = cap->is_trigger;
 			} else {
 				/* No collider authored — placeholder box from transform
 				 * scale so dropped objects still collide. */
@@ -1245,6 +1512,12 @@ static void rt_spawn_entity(JceScene *scene, JceEntity e, void *ud)
 	if (rt->physics2d &&
 	    jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_RIGIDBODY_2D))
 		rt_spawn_body2d(rt, scene, e, tf);
+
+	/* ── Tilemap 2D collider (one static body, greedy-merged boxes) ── */
+	if (rt->physics2d &&
+	    jce_scene_component_enabled(scene, e, JCE_COMP_FLAG_TILEMAP_COLLIDER_2D) &&
+	    jce_scene_has_tilemap(scene, e))
+		rt_spawn_tilemap_collider2d(rt, scene, e, tf);
 
 try_audio:
 	/* ── Audio source ── */
@@ -1459,6 +1732,48 @@ static void rt_spawn_gameplay(JceScene *scene, JceEntity e, void *ud)
 			         btc->tree_path, (unsigned long long)e);
 		}
 	}
+
+	/* ── Nav agent (P1-navmesh-chain) ──
+	 * Mirror an authored NavAgent into the runtime agent set (stood up by
+	 * rt_init_navmesh BEFORE this walk).  The component stays the authored
+	 * source of truth; the entry caches the engine handle plus the last goal
+	 * issued so rt_tick_gameplay can honour live edits and auto_repath. */
+	JceNavAgentComponent *nac = jce_scene_get_nav_agent(scene, e);
+	if (nac && nac->enabled && rt->nav_agents) {
+		if (rt->nav_entry_count < rt->nav_entry_cap || rt_grow_nav_entries(rt)) {
+			jce_vec3 wp = rt_world_position(scene, e);
+			JceNavAgentDesc d = {
+				.pos_x           = wp.x,
+				.pos_z           = wp.z,
+				.radius          = nac->radius          > 0.0f ? nac->radius          : 0.4f,
+				.max_speed       = nac->max_speed       > 0.0f ? nac->max_speed       : 3.0f,
+				.max_accel       = nac->max_accel       > 0.0f ? nac->max_accel       : 12.0f,
+				.arrive_radius   = nac->arrive_radius   > 0.0f ? nac->arrive_radius   : 1.5f,
+				.waypoint_radius = nac->waypoint_radius > 0.0f ? nac->waypoint_radius : 0.5f,
+			};
+			JceNavAgentHandle h = jce_nav_agent_add(rt->nav_agents, &d);
+			if (jce_nav_agent_valid(h)) {
+				NavAgentEntry *ne = &rt->nav_entries[rt->nav_entry_count];
+				ne->entity = e;
+				ne->handle = h;
+				/* Initial destination: a referenced target entity's world
+				 * position when set, otherwise the authored target point. */
+				float gx, gz;
+				if (nac->target_entity != 0) {
+					jce_vec3 tp = rt_world_position(scene,
+					                                (JceEntity)nac->target_entity);
+					gx = tp.x; gz = tp.z;
+				} else {
+					gx = nac->target[0]; gz = nac->target[2];
+				}
+				ne->has_dest    = jce_nav_agent_set_destination(rt->nav_agents,
+				                                                h, gx, gz);
+				ne->last_goal_x = gx;
+				ne->last_goal_z = gz;
+				rt->nav_entry_count++;
+			}
+		}
+	}
 }
 
 /* ── Networking bridge (P1-networking-full) ──────────────────────────
@@ -1605,40 +1920,107 @@ static void rt_drive_character(JceRuntime *rt, float dt)
 	if (!rt->physics || !jce_character_valid(rt->character)) return;
 	if (dt <= 0.0f) dt = 1.0f / 60.0f;
 
-	float    m  = rt->input.speed_mult > 0.0f ? rt->input.speed_mult : 1.0f;
-	jce_vec3 walk = jce_v3(rt->input.walk_x * m, 0.0f, rt->input.walk_z * m);
+	/* Direction (clamped to unit length) × authored speed: movement feel
+	 * comes from the CharacterController component, not the caller.
+	 * speed_mult stays an extra gameplay multiplier (crouch, slow zones). */
+	float dx = rt->input.walk_x, dz = rt->input.walk_z;
+	float dl = sqrtf(dx * dx + dz * dz);
+	if (dl > 1.0f) { dx /= dl; dz /= dl; dl = 1.0f; }
+	float m = rt->input.speed_mult > 0.0f ? rt->input.speed_mult : 1.0f;
+	if (rt->input.sprint) m *= rt->char_sprint_mult;
+	float    speed = rt->char_move_speed * m;
+	jce_vec3 walk  = jce_v3(dx * speed, 0.0f, dz * speed);
 	jce_physics_character_move(rt->physics, rt->character, walk, dt);
 
+	/* Jump with buffering + coyote time: a press up to JUMP_BUFFER s early
+	 * still fires on landing, and stepping off a ledge keeps a JUMP_COYOTE
+	 * grace window — both standard platformer forgiveness mechanics. */
+	const float JUMP_BUFFER = 0.12f, JUMP_COYOTE = 0.12f;
+	bool grounded = jce_physics_character_is_grounded(rt->physics, rt->character);
+	rt->char_coyote_t = grounded ? JUMP_COYOTE : rt->char_coyote_t - dt;
 	if (rt->input.jump_pressed) {
-		if (jce_physics_character_is_grounded(rt->physics, rt->character))
-			jce_physics_character_jump(rt->physics, rt->character);
+		rt->char_jump_buf_t    = JUMP_BUFFER;
 		rt->input.jump_pressed = false;
+	} else if (rt->char_jump_buf_t > 0.0f) {
+		rt->char_jump_buf_t -= dt;
 	}
+	bool jumped = false;
+	if (rt->char_jump_buf_t > 0.0f && (grounded || rt->char_coyote_t > 0.0f)) {
+		/* Only consume the buffer / pulse the anim trigger when the jump
+		 * actually fired (the physics layer refuses mid-ascent repeats). */
+		if (jce_physics_character_jump(rt->physics, rt->character)) {
+			rt->char_jump_buf_t = 0.0f;
+			rt->char_coyote_t   = 0.0f;
+			jumped = true;
+		}
+	}
+	/* Variable jump height: releasing jump while ascending cuts the rest
+	 * of the rise, so taps hop and holds clear the full arc. */
+	if (rt->char_jump_was_held && !rt->input.jump_held && !grounded)
+		jce_physics_character_cut_jump(rt->physics, rt->character, 0.45f);
+	rt->char_jump_was_held = rt->input.jump_held;
 
 	/* Generic locomotion (engine-level, so it works in Play AND shipped):
-	 * turn the character to face its move direction and pick the idle/walk/run
-	 * clip by name on any character that carries a SkeletalAnimator. */
+	 * turn the character toward its move direction and feed the live
+	 * physics state to whatever animation driver the entity carries. */
 	if (rt->scene && rt->character_entity != 0) {
-		float wx = rt->input.walk_x, wz = rt->input.walk_z;
-		float wl = sqrtf(wx * wx + wz * wz);
 		JceTransform *tf = jce_scene_get_transform(rt->scene, rt->character_entity);
-		if (tf && wl > 0.0001f) {
+		jce_vec3 vel = jce_v3(0.0f, 0.0f, 0.0f);
+		jce_physics_character_get_velocity(rt->physics, rt->character, &vel);
+		float plan_speed = sqrtf(vel.x * vel.x + vel.z * vel.z);
+
+		/* Smooth shortest-arc turn at the authored turn speed (the old
+		 * instant snap reads as robotic with a real model). */
+		if (tf && dl > 0.0001f) {
+			if (!rt->char_yaw_valid) {
+				jce_vec3 fwd = jce_q_rotate(tf->rotation, jce_v3(0.0f, 0.0f, 1.0f));
+				rt->char_yaw       = atan2f(fwd.x, fwd.z);
+				rt->char_yaw_valid = true;
+			}
+			float target = atan2f(dx, dz);
+			float diff   = target - rt->char_yaw;
+			while (diff >  JCE_PI) diff -= 2.0f * JCE_PI;
+			while (diff < -JCE_PI) diff += 2.0f * JCE_PI;
+			float max_turn = rt->char_turn_speed * dt;
+			if (diff >  max_turn) diff =  max_turn;
+			if (diff < -max_turn) diff = -max_turn;
+			rt->char_yaw += diff;
 			tf->rotation = jce_q_from_axis_angle(jce_v3(0.0f, 1.0f, 0.0f),
-			                                     atan2f(wx, wz));
+			                                     rt->char_yaw);
 			rt->char_last_rot = tf->rotation;  /* our own yaw, not a gizmo edit */
 		}
 		if (jce_scene_has_skeletal_animator(rt->scene, rt->character_entity)) {
 			JceSkeletalAnimatorComponent *sa =
 				jce_scene_get_skeletal_animator(rt->scene, rt->character_entity);
+			/* Live locomotion state for the renderer's SM / blend-tree
+			 * driver (consumed when auto_speed is set): physics velocity is
+			 * steadier than the transform-derived estimate, and grounded /
+			 * vertical-velocity / jump unlock Jump+Fall+Land SM states. */
+			sa->loco_valid    = true;
+			sa->loco_grounded = grounded;
+			sa->loco_speed    = plan_speed;
+			sa->loco_vert_vel = vel.y;
+			if (jumped) sa->loco_jump = true;   /* one-shot, consumer clears */
 			/* If an animation state machine is bound it OWNS active_clip
 			 * (driven by the engine "Speed" param in the renderer). Setting
 			 * the clip by name here too would fight the SM every frame and
 			 * make it flicker — only name-drive when there is no SM. */
 			if (!sa->sm_path[0]) {
-				const char *want = (wl <= 0.0001f) ? "idle"
-				                 : (m > 1.5f)       ? "run" : "walk";
-				int idx = rt_clip_by_name(sa, want);
-				if (idx < 0 && wl > 0.0001f) idx = rt_clip_by_name(sa, "walk");
+				int idx = -1;
+				if (!grounded && rt->char_coyote_t <= 0.0f) {
+					/* Airborne: prefer a jump/fall clip when the model has
+					 * one; otherwise keep the current ground clip. */
+					idx = rt_clip_by_name(sa, vel.y > 0.5f ? "jump" : "fall");
+					if (idx < 0) idx = rt_clip_by_name(sa, "jump");
+				} else {
+					const char *want =
+					    (plan_speed <= 0.15f) ? "idle"
+					  : (plan_speed > rt->char_move_speed * 1.15f) ? "run"
+					                                               : "walk";
+					idx = rt_clip_by_name(sa, want);
+					if (idx < 0 && plan_speed > 0.15f)
+						idx = rt_clip_by_name(sa, "walk");
+				}
 				if (idx >= 0) sa->active_clip = idx;
 			}
 			sa->playing = true;
@@ -2058,11 +2440,11 @@ static void rt_build_reverb_zones(JceRuntime *rt)
  * resolve through jce_recast_find_path.  No-op when no path is supplied
  * or it fails to load.
  *
- * NOTE: the scene has no authored NavAgent component yet (deferred by
- * the master-bridge item), so the agent set starts empty.  The load ->
- * query chain is still proven here by a snap+find_path self-test that is
- * logged; once a NavAgent scene component lands, populate the set in
- * rt_spawn_gameplay and the existing rt_tick_gameplay tick drives it. */
+ * Runs BEFORE the rt_spawn_gameplay walk so authored NavAgent components
+ * can register into the set as they are visited; rt_tick_gameplay then
+ * syncs/steps the agents and writes positions back to the transforms.
+ * The load -> query chain is also proven by a snap+find_path self-test
+ * logged at create. */
 static void rt_init_navmesh(JceRuntime *rt, const char *navmesh_path)
 {
 	if (!navmesh_path || !navmesh_path[0]) return;
@@ -2273,12 +2655,83 @@ static void rt_tick_gameplay(JceRuntime *rt, float dt)
 		}
 	}
 
-	/* Nav-agents: advance every agent along its path (seek/arrive).  Paths
-	 * are resolved through the Recast backend (jce_recast_path_fn) set at
-	 * create().  The set is empty until a NavAgent scene component is
-	 * authored, so this is a cheap no-op for navmesh-less scenes. */
-	if (rt->nav_agents && jce_nav_agent_set_count(rt->nav_agents) > 0)
+	/* Nav-agents: sync authored components into the set, advance every agent
+	 * along its path (seek/arrive through the Recast backend set at create()),
+	 * then write the steered positions back to the entity transforms.  Empty
+	 * set / navmesh-less scenes stay a cheap no-op. */
+	if (rt->nav_agents && rt->nav_entry_count > 0 && rt->scene) {
+		/* Pre-update sync: re-read each component every tick (flecs table
+		 * moves invalidate cached component pointers); honour live enabled
+		 * flips and re-issue the destination when auto_repath sees the goal
+		 * move by more than the waypoint radius. */
+		for (int i = 0; i < rt->nav_entry_count; ++i) {
+			NavAgentEntry *ne = &rt->nav_entries[i];
+			JceNavAgentComponent *nac = jce_scene_get_nav_agent(rt->scene,
+			                                                    ne->entity);
+			if (!nac) continue;
+			if (!nac->enabled) {
+				if (ne->has_dest) {
+					jce_nav_agent_stop(rt->nav_agents, ne->handle);
+					ne->has_dest = false;
+				}
+				continue;
+			}
+			float gx, gz;
+			if (nac->target_entity != 0) {
+				jce_vec3 tp = rt_world_position(rt->scene,
+				                                (JceEntity)nac->target_entity);
+				gx = tp.x; gz = tp.z;
+			} else {
+				gx = nac->target[0]; gz = nac->target[2];
+			}
+			float wr = nac->waypoint_radius > 0.0f ? nac->waypoint_radius : 0.5f;
+			float dx = gx - ne->last_goal_x;
+			float dz = gz - ne->last_goal_z;
+			bool  moved = (dx * dx + dz * dz) > wr * wr;
+			if (!ne->has_dest || (nac->auto_repath && moved)) {
+				ne->has_dest    = jce_nav_agent_set_destination(rt->nav_agents,
+				                                                ne->handle,
+				                                                gx, gz);
+				ne->last_goal_x = gx;
+				ne->last_goal_z = gz;
+			}
+		}
+
 		jce_nav_agent_set_update(rt->nav_agents, dt);
+
+		/* Write-back: steered XZ into the entity transform; Y snaps to the
+		 * navmesh surface when a polygon is near, else it is preserved.
+		 * Entities driven by a dynamic rigid body are skipped — the physics
+		 * write-back (rt_sync_transforms) owns their transform. */
+		for (int i = 0; i < rt->nav_entry_count; ++i) {
+			NavAgentEntry *ne = &rt->nav_entries[i];
+			JceNavAgentComponent *nac = jce_scene_get_nav_agent(rt->scene,
+			                                                    ne->entity);
+			if (!nac || !nac->enabled) continue;
+			bool body_driven = false;
+			for (int j = 0; j < rt->body_count; ++j) {
+				if (rt->bodies[j].entity == ne->entity &&
+				    rt->bodies[j].kind != (uint8_t)JCE_BODY_STATIC) {
+					body_driven = true;
+					break;
+				}
+			}
+			if (body_driven) continue;
+			JceTransform *tc = jce_scene_get_transform(rt->scene, ne->entity);
+			if (!tc) continue;
+			float x, z;
+			jce_nav_agent_get_position(rt->nav_agents, ne->handle, &x, &z);
+			tc->position.x = x;
+			tc->position.z = z;
+			float sx, sy, sz;
+			if (rt->nav_recast &&
+			    jce_recast_snap_to_navmesh(rt->nav_recast, x, z, &sx, &sy, &sz))
+				tc->position.y = sy;
+		}
+	} else if (rt->nav_agents && jce_nav_agent_set_count(rt->nav_agents) > 0) {
+		/* Agents added directly through the API (no scene entries). */
+		jce_nav_agent_set_update(rt->nav_agents, dt);
+	}
 
 	/* Behavior trees (P2-perception-bt-binding): for every agent that loaded
 	 * a tree, run a perception pass (sight-cone + LOS raycast + hearing) for
@@ -2429,6 +2882,27 @@ JCE_API JceRuntime *JCE_CALL jce_runtime_create(const JceRuntimeDesc *desc)
 		                     (double)fixed_dt * (double)RT_MAX_FIXED_STEPS);
 	}
 
+	/* Game-content localization (L10n): initialise the process-global
+	 * jce_loc table ONLY when the caller hands us a source — a host dir of
+	 * <locale>.json files and/or a PAK carrying "i18n/<locale>.json".
+	 * Editor Play passes neither (pak=NULL, locales_dir=NULL), so the
+	 * editor-owned jce_loc state (preview locale) is left untouched. */
+	{
+		bool has_loc_dir = desc->locales_dir && desc->locales_dir[0];
+		if (has_loc_dir || desc->pak) {
+			jce_loc_init(has_loc_dir ? desc->locales_dir : NULL);
+			if (desc->pak)
+				jce_loc_set_source_pak(desc->pak, "i18n");
+			char auto_tag[32];
+			const char *tag = (desc->locale && desc->locale[0])
+			                  ? desc->locale : NULL;
+			if (!tag &&
+			    jce_host_preferred_locale(auto_tag, sizeof auto_tag))
+				tag = auto_tag;
+			jce_loc_set_locale(tag ? tag : "en");
+		}
+	}
+
 	/* Audio mixer: stand up the bus tree (from audio_mixer.json or default)
 	 * and mirror it onto the audio device BEFORE the spawn walk so each
 	 * AudioSource voice can be routed to its bus as it is created. */
@@ -2442,15 +2916,16 @@ JCE_API JceRuntime *JCE_CALL jce_runtime_create(const JceRuntimeDesc *desc)
 	if (rt->physics)
 		jce_scene_each_entity(rt->scene, rt_spawn_joint, rt);
 
+	/* Navigation: load the editor-baked navmesh + stand up the agent set
+	 * BEFORE the gameplay walk so NavAgent components can register into it. */
+	rt_init_navmesh(rt, desc->navmesh_path);
+
 	/* Third pass: gameplay subsystems (triggers / spawners / weapons). */
 	jce_scene_each_entity(rt->scene, rt_spawn_gameplay, rt);
 
 	/* Reverb zones: build the zone set from AudioReverbZone components now
 	 * that transforms are finalized.  Driven each frame in rt_update_audio_3d. */
 	rt_build_reverb_zones(rt);
-
-	/* Navigation: load the editor-baked navmesh + stand up the agent set. */
-	rt_init_navmesh(rt, desc->navmesh_path);
 
 	/* Behavior-tree action context (master-bridge: instantiate so games can
 	 * register actions + load trees against a runtime-owned context).  Trees
@@ -2508,6 +2983,11 @@ JCE_API JceRuntime *JCE_CALL jce_runtime_create(const JceRuntimeDesc *desc)
 JCE_API void JCE_CALL jce_runtime_destroy(JceRuntime *rt)
 {
 	if (!rt) return;
+
+	/* NOTE: jce_loc_shutdown is deliberately NOT called here.  The
+	 * localization table is process-global and outlives any one runtime
+	 * (the editor's preview locale must survive Play sessions; final
+	 * cleanup happens at engine teardown). */
 
 	/* Join any in-flight async audio decodes and drop their results. */
 	for (int i = 0; i < rt->pending_audio_count; ++i) {
@@ -2575,6 +3055,7 @@ JCE_API void JCE_CALL jce_runtime_destroy(JceRuntime *rt)
 		jce_snapshot_registry_destroy(rt->save_registry);
 
 	/* ── Navigation (P1-navmesh-chain) ── */
+	jce_free(rt->nav_entries);
 	if (rt->nav_agents)
 		jce_nav_agent_set_destroy(rt->nav_agents);
 	if (rt->nav_recast)
@@ -2666,6 +3147,13 @@ JCE_API void JCE_CALL jce_runtime_step(JceRuntime *rt, float dt)
 	 * gameplay/audio bridge below.  No-op without a live session. */
 	if (rt->net_bridged && jce_session_mode() != JCE_SESSION_MODE_NONE)
 		jce_net_transform_render_step((double)rt->clock.alpha);
+	/* SequencePlayer: advance every playing .seq.json and apply evaluated
+	 * track values to the bound entities' components.  Runs after
+	 * scene_update (freshest transforms) and before video/particles so
+	 * downstream systems see sequenced values this frame.  Runtime-only:
+	 * the editor previews through the Sequencer panel instead. */
+	if (rt->scene)
+		jce_scene_sequencer_update(rt->scene, dt);
 	/* VideoPlayer-as-texture: advance every playing clip one frame and
 	 * upload it into its component texture (the scene renderer binds it as
 	 * mesh albedo).  Runs once per runtime step; the editor drives the same
@@ -2722,6 +3210,8 @@ JCE_API void JCE_CALL jce_runtime_set_input(JceRuntime *rt,
 	rt->input.walk_z      = in->walk_z;
 	if (in->jump_pressed) rt->input.jump_pressed = true;   /* sticky */
 	rt->input.speed_mult  = in->speed_mult > 0.0f ? in->speed_mult : 1.0f;
+	rt->input.sprint      = in->sprint;
+	rt->input.jump_held   = in->jump_held;
 }
 
 JCE_API bool JCE_CALL jce_runtime_get_player_position(const JceRuntime *rt,
@@ -2797,6 +3287,20 @@ JCE_API JceBlackboard *JCE_CALL jce_runtime_bt_blackboard(const JceRuntime *rt,
 	return NULL;
 }
 
+JCE_API bool JCE_CALL jce_runtime_bt_tree(const JceRuntime *rt, uint64_t entity,
+                                          uint32_t *out_tree_idx)
+{
+	if (!rt || !out_tree_idx) return false;
+	for (int i = 0; i < rt->bt_count; ++i) {
+		if ((uint64_t)rt->bts[i].entity == entity &&
+		    jce_bt_tree_valid(rt->bts[i].tree)) {
+			*out_tree_idx = rt->bts[i].tree.idx;
+			return true;
+		}
+	}
+	return false;
+}
+
 JCE_API bool JCE_CALL jce_runtime_save_to_file(JceRuntime *rt, const char *path)
 {
 	if (!rt || !rt->save_registry || !path || !path[0]) return false;
@@ -2816,4 +3320,11 @@ JCE_API bool JCE_CALL jce_runtime_save_to_file(JceRuntime *rt, const char *path)
 		}
 	}
 	return jce_snapshot_save_to_file(rt->save_registry, path);
+}
+
+JCE_API void JCE_CALL jce_runtime_set_locale(JceRuntime *rt, const char *locale)
+{
+	(void)rt; /* jce_loc is process-global; rt kept for API symmetry */
+	if (!locale || !locale[0]) return;
+	jce_loc_set_locale(locale);
 }

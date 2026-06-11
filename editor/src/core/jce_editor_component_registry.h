@@ -21,6 +21,9 @@ typedef uint64_t JceEditorComponentSlot;
 #define JCE_EDITOR_COMP_SLOT_LIGHT_GROUP        UINT64_MAX
 #define JCE_EDITOR_COMP_SLOT_COMPOUND_COLLIDER (UINT64_MAX - UINT64_C(1))
 #define JCE_EDITOR_COMP_SLOT_VIDEO_PLAYER      (UINT64_MAX - UINT64_C(2))
+#define JCE_EDITOR_COMP_SLOT_NAV_AGENT         (UINT64_MAX - UINT64_C(3))
+#define JCE_EDITOR_COMP_SLOT_IK_CONSTRAINTS    (UINT64_MAX - UINT64_C(4))
+#define JCE_EDITOR_COMP_SLOT_SEQUENCE_PLAYER   (UINT64_MAX - UINT64_C(5))
 
 #define JCE_EDITOR_COMPONENT_LIGHT_MASK \
     (JCE_COMP_FLAG_DIR_LIGHT | JCE_COMP_FLAG_POINT_LIGHT | JCE_COMP_FLAG_SPOT_LIGHT)
@@ -50,6 +53,12 @@ bool jce_editor_component_slot_is_light_group(JceEditorComponentSlot slot);
 bool jce_editor_component_slot_is_compound_collider(
     JceEditorComponentSlot slot);
 bool jce_editor_component_slot_is_video_player(
+    JceEditorComponentSlot slot);
+bool jce_editor_component_slot_is_nav_agent(
+    JceEditorComponentSlot slot);
+bool jce_editor_component_slot_is_ik_constraints(
+    JceEditorComponentSlot slot);
+bool jce_editor_component_slot_is_sequence_player(
     JceEditorComponentSlot slot);
 
 const char *jce_editor_component_display_name(JceEditorComponentSlot slot);

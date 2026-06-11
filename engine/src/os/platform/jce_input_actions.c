@@ -4,6 +4,7 @@
 
 #include <jce/os/platform/jce_input.h>
 #include <jce/os/platform/jce_input_actions.h>
+#include <jce/os/core/jce_json.h>
 
 #include "os/core/jce_memory.h"
 
@@ -181,9 +182,54 @@ bool jce_action_released(const JceInputActions *a, int action_id)
 }
 
 /* ================================================================== */
+/* Enumeration (read accessors for tools / the editor Input Manager)   */
+/* ================================================================== */
+
+int jce_actions_count(const JceInputActions *a)
+{
+    return a ? a->count : 0;
+}
+
+const char *jce_action_name(const JceInputActions *a, int action_id)
+{
+    if (!a || action_id < 0 || action_id >= a->count) return NULL;
+    return a->actions[action_id].name;
+}
+
+int jce_action_bind_count(const JceInputActions *a, int action_id)
+{
+    if (!a || action_id < 0 || action_id >= a->count) return 0;
+    return a->actions[action_id].bind_count;
+}
+
+bool jce_action_bind_at(const JceInputActions *a, int action_id,
+                        int bind_index, JceBinding *out)
+{
+    if (!a || !out) return false;
+    if (action_id < 0 || action_id >= a->count) return false;
+    const ActionEntry *e = &a->actions[action_id];
+    if (bind_index < 0 || bind_index >= e->bind_count) return false;
+    *out = e->binds[bind_index];
+    return true;
+}
+
+/* ================================================================== */
 /* Default FPS bindings                                                */
 /* ================================================================== */
 
+/*
+ * Canonical default action table — the SINGLE source of truth shared by
+ * the runtime fallback (jce_default_main) and the editor's Input Manager
+ * seed (which copies this table instead of keeping its own).
+ *
+ * Convention changes (deliberate, consolidation of two divergent tables):
+ *   - "sprint" moved LCTRL -> LSHIFT (matches the editor seed and the
+ *     dm_act_down("sprint", JCE_KEY_LSHIFT) fallback in default_main).
+ *   - SPACE moved "move_up" -> "jump" (gameplay consumes "jump":
+ *     default_main and the editor Game view both read it).
+ *   - "move_up"/"move_down" stay registered for fly-style apps but ship
+ *     UNBOUND by default.
+ */
 int jce_actions_bind_fps_defaults(JceInputActions *a)
 {
     if (!a) return -1;
@@ -194,28 +240,137 @@ int jce_actions_bind_fps_defaults(JceInputActions *a)
     int back  = jce_action_register(a, "move_back");
     int left  = jce_action_register(a, "move_left");
     int right = jce_action_register(a, "move_right");
+    int jump  = jce_action_register(a, "jump");
+    int sprint= jce_action_register(a, "sprint");
     int up    = jce_action_register(a, "move_up");
     int down  = jce_action_register(a, "move_down");
-    int sprint= jce_action_register(a, "sprint");
     int lx    = jce_action_register(a, "look_x");
     int ly    = jce_action_register(a, "look_y");
 
-    /* Keyboard WASD. */
+    /* Keyboard: WASD + Space jump + LShift sprint. */
     jce_action_bind(a, fwd,   &(JceBinding){ JCE_BIND_KEY, SDL_SCANCODE_W, 1.0f, 0 });
     jce_action_bind(a, back,  &(JceBinding){ JCE_BIND_KEY, SDL_SCANCODE_S, 1.0f, 0 });
     jce_action_bind(a, left,  &(JceBinding){ JCE_BIND_KEY, SDL_SCANCODE_A, 1.0f, 0 });
     jce_action_bind(a, right, &(JceBinding){ JCE_BIND_KEY, SDL_SCANCODE_D, 1.0f, 0 });
-    jce_action_bind(a, up,    &(JceBinding){ JCE_BIND_KEY, SDL_SCANCODE_SPACE, 1.0f, 0 });
-    jce_action_bind(a, down,  &(JceBinding){ JCE_BIND_KEY, SDL_SCANCODE_LSHIFT, 1.0f, 0 });
-    jce_action_bind(a, sprint,&(JceBinding){ JCE_BIND_KEY, SDL_SCANCODE_LCTRL, 1.0f, 0 });
+    jce_action_bind(a, jump,  &(JceBinding){ JCE_BIND_KEY, SDL_SCANCODE_SPACE, 1.0f, 0 });
+    jce_action_bind(a, sprint,&(JceBinding){ JCE_BIND_KEY, SDL_SCANCODE_LSHIFT, 1.0f, 0 });
 
-    /* Gamepad: left stick = move, right stick = look. */
+    /* Gamepad: left stick = move, right stick = look,
+     * South (A) = jump, L3 (left-stick click) = sprint. */
     jce_action_bind(a, fwd,   &(JceBinding){ JCE_BIND_GAMEPAD_AXIS, SDL_GAMEPAD_AXIS_LEFTY,  -1.0f, 0.15f });
     jce_action_bind(a, right, &(JceBinding){ JCE_BIND_GAMEPAD_AXIS, SDL_GAMEPAD_AXIS_LEFTX,   1.0f, 0.15f });
+    jce_action_bind(a, jump,  &(JceBinding){ JCE_BIND_GAMEPAD_BTN,  SDL_GAMEPAD_BUTTON_SOUTH,      1.0f, 0 });
+    jce_action_bind(a, sprint,&(JceBinding){ JCE_BIND_GAMEPAD_BTN,  SDL_GAMEPAD_BUTTON_LEFT_STICK, 1.0f, 0 });
     jce_action_bind(a, lx,    &(JceBinding){ JCE_BIND_GAMEPAD_AXIS, SDL_GAMEPAD_AXIS_RIGHTX,  1.0f, 0.15f });
     jce_action_bind(a, ly,    &(JceBinding){ JCE_BIND_GAMEPAD_AXIS, SDL_GAMEPAD_AXIS_RIGHTY, -1.0f, 0.15f });
 
-    (void)back; (void)left; (void)down; (void)lx; (void)ly;
+    (void)up; (void)down;   /* registered, deliberately unbound */
 
     return first;
+}
+
+/* ── JSON action-map loading (editor-authored input_actions.json) ──── */
+
+JceInputActions *jce_actions_load_file(const char *path)
+{
+    if (!path || !path[0]) return NULL;
+
+    JceJson *root = jce_json_parse_file(path);
+    if (!root) return NULL;
+
+    JceJson *arr = jce_json_get(root, "actions");
+    if (!jce_json_is_array(arr)) {
+        jce_json_free(root);
+        return NULL;
+    }
+
+    JceInputActions *a = jce_actions_create();
+    if (!a) {
+        jce_json_free(root);
+        return NULL;
+    }
+
+    int registered = 0;
+    const int n = jce_json_array_size(arr);
+    for (int i = 0; i < n; ++i) {
+        JceJson *act = jce_json_array_at(arr, i);
+        if (!jce_json_is_object(act)) continue;
+
+        const char *name = jce_json_get_string(act, "name", NULL);
+        if (!name || !name[0]) continue;
+
+        int id = jce_action_register(a, name);
+        if (id < 0) continue;   /* duplicate / table full */
+        registered++;
+
+        JceJson *binds = jce_json_get(act, "binds");
+        if (!jce_json_is_array(binds)) continue;
+
+        const int bn = jce_json_array_size(binds);
+        for (int b = 0; b < bn; ++b) {
+            JceJson *bj = jce_json_array_at(binds, b);
+            if (!jce_json_is_object(bj)) continue;
+
+            JceBinding bind = {
+                .type     = (JceBindType)jce_json_get_int(bj, "type", JCE_BIND_KEY),
+                .code     = jce_json_get_int(bj, "code", 0),
+                .scale    = (float)jce_json_get_number(bj, "scale", 1.0),
+                .deadzone = (float)jce_json_get_number(bj, "deadzone", 0.15)
+            };
+            jce_action_bind(a, id, &bind);
+        }
+    }
+
+    jce_json_free(root);
+
+    if (registered == 0) {
+        jce_actions_destroy(a);
+        return NULL;
+    }
+    return a;
+}
+
+/* ── JSON action-map saving (same schema jce_actions_load_file reads) ── */
+
+bool jce_actions_save_file(const JceInputActions *a, const char *path)
+{
+    if (!a || !path || !path[0]) return false;
+
+    JceJson *root = jce_json_object();
+    if (!root) return false;
+
+    JceJson *arr = jce_json_array();
+    if (!arr) {
+        jce_json_free(root);
+        return false;
+    }
+    jce_json_set_child(root, "actions", arr);
+
+    for (int i = 0; i < a->count; ++i) {
+        const ActionEntry *e = &a->actions[i];
+
+        JceJson *act = jce_json_object();
+        if (!act) continue;
+        jce_json_set_string(act, "name", e->name);
+
+        JceJson *binds = jce_json_array();
+        if (binds) {
+            for (int b = 0; b < e->bind_count; ++b) {
+                const JceBinding *bd = &e->binds[b];
+                JceJson *bj = jce_json_object();
+                if (!bj) continue;
+                jce_json_set_int(bj, "type", (int)bd->type);
+                jce_json_set_int(bj, "code", bd->code);
+                jce_json_set_number(bj, "scale", (double)bd->scale);
+                jce_json_set_number(bj, "deadzone", (double)bd->deadzone);
+                jce_json_array_push(binds, bj);
+            }
+            jce_json_set_child(act, "binds", binds);
+        }
+        jce_json_array_push(arr, act);
+    }
+
+    /* take_ownership=true: root is freed regardless of write success. */
+    return jce_json_write_file(path, root, /*pretty=*/true,
+                               /*take_ownership=*/true);
 }

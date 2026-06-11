@@ -48,6 +48,9 @@ void draw_comp_tilemap(JceTilemapComponent *t)
 
     ImGui::ColorEdit4(jce_editor_i18n("inspector.tilemap.color"), t->color);
     insp_track_edit();
+
+    if (ImGui::Button(jce_editor_i18n("inspector.tilemap.edit")))
+        jce_editor_panel_tile_palette_edit(t->tilemap_path, t->sprites_path);
 }
 
 void draw_comp_tilemap_collider2d(JceTilemapCollider2DComponent *c)

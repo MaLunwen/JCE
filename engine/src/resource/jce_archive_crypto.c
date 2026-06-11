@@ -75,9 +75,10 @@ void jce_archive_chacha20_xor(const uint8_t key[JCE_ARCHIVE_KEY_BYTES],
     }
 }
 
-void jce_archive_derive_nonce(uint64_t path_hash,
+void jce_archive_derive_nonce(uint64_t path_hash, uint32_t salt32,
                               uint8_t nonce[JCE_ARCHIVE_NONCE_BYTES]) {
-    /* Low 64 bits = path hash (unique per entry), high 32 bits = 0. */
+    /* Low 64 bits = path hash (unique per entry), high 32 bits = the
+     * per-archive salt (header nonce_salt32; 0 for legacy archives). */
     for (int i = 0; i < 8; ++i) nonce[i] = (uint8_t)(path_hash >> (i * 8));
-    nonce[8] = nonce[9] = nonce[10] = nonce[11] = 0;
+    for (int i = 0; i < 4; ++i) nonce[8 + i] = (uint8_t)(salt32 >> (i * 8));
 }

@@ -27,9 +27,11 @@
 #include <jce/os/core/jce_str.h>
 #include <jce/middleware/physics/jce_cloth.h>
 
-/* Forward-declare only the one function we need from scene_render,
+/* Forward-declare only the functions we need from scene_render,
    avoiding a full include that creates a cpp-level circular dependency. */
 extern "C" void jce_editor_scene_set_scene_dir(const char *dir);
+extern "C" void jce_editor_scene_render_streaming_teardown(void);
+extern "C" void jce_editor_scene_render_streaming_rebuild(void);
 
 /* ── Global State Definitions ─────────────────────────────────────── */
 
@@ -321,6 +323,10 @@ bool jce_state_new_default_scene(void)
      * first. */
     stop_play_before_scene_swap();
 
+    /* The streaming-preview streamer holds entity handles into the old
+     * scene — destroy it BEFORE the entities go away. */
+    jce_editor_scene_render_streaming_teardown();
+
     if (!s.scene)
         s.scene = jce_scene_create();
     else
@@ -352,6 +358,10 @@ bool jce_state_new_default_scene(void)
     s_transaction.label[0] = '\0';
     s_transaction.before.scene_json.clear();
     s_transaction.before.scene_path.clear();
+
+    /* New scene has no streaming settings — this is effectively a teardown
+     * no-op, but keeps the swap contract uniform across all loaders. */
+    jce_editor_scene_render_streaming_rebuild();
 
     LOG_INFO(LOG_TAG, "new default scene created (%d entities)",
              (int)g_entity_order.size());
@@ -819,6 +829,15 @@ static void duplicate_components(JceEntity src, JceEntity dst)
     }
     if (jce_scene_has_video_player(s.scene, src))
         jce_scene_set_video_player(s.scene, dst, jce_scene_get_video_player(s.scene, src));
+    if (jce_scene_has_nav_agent(s.scene, src))
+        jce_scene_set_nav_agent(s.scene, dst, jce_scene_get_nav_agent(s.scene, src));
+    if (jce_scene_has_ik_constraints(s.scene, src))
+        jce_scene_set_ik_constraints(s.scene, dst, jce_scene_get_ik_constraints(s.scene, src));
+    /* SequencePlayer's flecs copy hook (jce_scene_sequencer.c) duplicates
+     * the authoring fields only and clears the duplicate's runtime handle,
+     * so a plain set is safe — same contract as VideoPlayer. */
+    if (jce_scene_has_sequence_player(s.scene, src))
+        jce_scene_set_sequence_player(s.scene, dst, jce_scene_get_sequence_player(s.scene, src));
 }
 
 uint32_t jce_state_duplicate_entity(uint32_t id)
@@ -866,6 +885,16 @@ uint32_t jce_state_duplicate_entity(uint32_t id)
 }
 
 /* ── Component management ────────────────────────────────────────── */
+
+/* Replication keys on NetworkObject (rt_spawn_net skips entities without
+ * it), so adding any Net* component auto-adds the gatekeeper too —
+ * otherwise the authored Net* data is silently inert at runtime. */
+static void ensure_network_object(JceEntity e)
+{
+    if (!s.scene || jce_scene_has_network_object(s.scene, e)) return;
+    JceNetworkObjectComponent no; memset(&no, 0, sizeof no);
+    jce_scene_set_network_object(s.scene, e, &no);
+}
 
 void jce_state_add_component(uint32_t entity_id, uint64_t comp_flag)
 {
@@ -1037,10 +1066,17 @@ void jce_state_add_component(uint32_t entity_id, uint64_t comp_flag)
     case JCE_COMP_FLAG_CHARACTER_CONTROLLER: {
         if (jce_scene_has_character_controller(s.scene, e)) return;
         JceCharacterControllerComponent c;
+        memset(&c, 0, sizeof(c));
         c.height      = 2.0f;
         c.radius      = 0.3f;
         c.step_offset = 0.35f;
         c.slope_limit = 45.0f;
+        c.move_speed     = 4.0f;
+        c.sprint_mult    = 1.8f;
+        c.jump_speed     = 5.0f;
+        c.accel          = 40.0f;
+        c.air_control    = 0.35f;
+        c.turn_speed_deg = 720.0f;
         jce_scene_set_character_controller(s.scene, e, &c);
         break;
     }
@@ -1396,6 +1432,13 @@ void jce_state_add_component(uint32_t entity_id, uint64_t comp_flag)
         jce_scene_set_cloth(s.scene, e, &c);
         break;
     }
+    case JCE_COMP_FLAG_NETWORK_OBJECT: {
+        if (jce_scene_has_network_object(s.scene, e)) return;
+        JceNetworkObjectComponent c; memset(&c, 0, sizeof c);
+        c.owner = 0; /* server-owned by default */
+        jce_scene_set_network_object(s.scene, e, &c);
+        break;
+    }
     case JCE_COMP_FLAG_NET_TRANSFORM: {
         if (jce_scene_has_net_transform(s.scene, e)) return;
         JceNetTransformComponent c; memset(&c, 0, sizeof c);
@@ -1404,6 +1447,7 @@ void jce_state_add_component(uint32_t entity_id, uint64_t comp_flag)
         c.tolerance      = 0.5f;
         c.authority_mode = 0;
         jce_scene_set_net_transform(s.scene, e, &c);
+        ensure_network_object(e);
         break;
     }
     case JCE_COMP_FLAG_NET_ANIMATOR: {
@@ -1413,6 +1457,7 @@ void jce_state_add_component(uint32_t entity_id, uint64_t comp_flag)
         c.interp_ms      = 100;
         c.authority_mode = 0;
         jce_scene_set_net_animator(s.scene, e, &c);
+        ensure_network_object(e);
         break;
     }
     case JCE_COMP_FLAG_NET_RIGIDBODY: {
@@ -1423,18 +1468,11 @@ void jce_state_add_component(uint32_t entity_id, uint64_t comp_flag)
         c.tolerance      = 0.5f;
         c.authority_mode = 0;
         jce_scene_set_net_rigidbody(s.scene, e, &c);
+        ensure_network_object(e);
         break;
     }
-    case JCE_COMP_FLAG_VFX_GRAPH: {
-        if (jce_scene_has_vfx_graph(s.scene, e)) return;
-        JceVfxGraphComponent c; memset(&c, 0, sizeof c);
-        c.play_on_awake   = true;
-        c.loop            = true;
-        c.rate_multiplier = 1.0f;
-        c.intensity       = 1.0f;
-        jce_scene_set_vfx_graph(s.scene, e, &c);
-        break;
-    }
+    /* JCE_COMP_FLAG_VFX_GRAPH retired (v0.9.9): not addable; legacy scene
+     * data migrates onto Particle Emitter at load. */
     case JCE_COMP_FLAG_TILEMAP: {
         if (jce_scene_has_tilemap(s.scene, e)) return;
         JceTilemapComponent c; memset(&c, 0, sizeof c);
@@ -1645,10 +1683,10 @@ void jce_state_remove_component(uint32_t entity_id, uint64_t comp_flag)
         jce_scene_remove_cloth(s.scene, e);
         break;
     }
+    case JCE_COMP_FLAG_NETWORK_OBJECT:       jce_scene_remove_network_object(s.scene, e); break;
     case JCE_COMP_FLAG_NET_TRANSFORM:        jce_scene_remove_net_transform(s.scene, e); break;
     case JCE_COMP_FLAG_NET_ANIMATOR:         jce_scene_remove_net_animator(s.scene, e); break;
     case JCE_COMP_FLAG_NET_RIGIDBODY:        jce_scene_remove_net_rigidbody(s.scene, e); break;
-    case JCE_COMP_FLAG_VFX_GRAPH:            jce_scene_remove_vfx_graph(s.scene, e); break;
     case JCE_COMP_FLAG_TILEMAP:              jce_scene_remove_tilemap(s.scene, e); break;
     case JCE_COMP_FLAG_TILEMAP_COLLIDER_2D:  jce_scene_remove_tilemap_collider2d(s.scene, e); break;
     case JCE_COMP_FLAG_AVATAR:               jce_scene_remove_avatar(s.scene, e); break;
@@ -1719,10 +1757,10 @@ const char *jce_comp_flag_display_name(uint64_t comp_flag)
     case JCE_COMP_FLAG_UI_TEXT:              return "UI Text";
     case JCE_COMP_FLAG_UI_BUTTON:            return "UI Button";
     case JCE_COMP_FLAG_CLOTH:                return "Cloth";
+    case JCE_COMP_FLAG_NETWORK_OBJECT:       return "Network Object";
     case JCE_COMP_FLAG_NET_TRANSFORM:        return "Network Transform";
     case JCE_COMP_FLAG_NET_ANIMATOR:         return "Network Animator";
     case JCE_COMP_FLAG_NET_RIGIDBODY:        return "Network Rigidbody";
-    case JCE_COMP_FLAG_VFX_GRAPH:            return "VFX Graph";
     case JCE_COMP_FLAG_TILEMAP:              return "Tilemap";
     case JCE_COMP_FLAG_TILEMAP_COLLIDER_2D:  return "Tilemap Collider 2D";
     case JCE_COMP_FLAG_AVATAR:               return "Avatar";
@@ -1795,7 +1833,6 @@ const char *jce_comp_flag_i18n_key(uint64_t comp_flag)
     case JCE_COMP_FLAG_NET_TRANSFORM:        return "comp.netTransform";
     case JCE_COMP_FLAG_NET_ANIMATOR:         return "comp.netAnimator";
     case JCE_COMP_FLAG_NET_RIGIDBODY:        return "comp.netRigidbody";
-    case JCE_COMP_FLAG_VFX_GRAPH:            return "comp.vfxGraph";
     case JCE_COMP_FLAG_TILEMAP:              return "comp.tilemap";
     case JCE_COMP_FLAG_TILEMAP_COLLIDER_2D:  return "comp.tilemapCollider2d";
     case JCE_COMP_FLAG_AVATAR:               return "comp.avatar";
@@ -1873,6 +1910,12 @@ void  jce_state_set_show_joint_gizmos(bool v) { s_show_joint_gizmos = v; }
 static bool s_show_cloth_gizmos = true;
 bool  jce_state_get_show_cloth_gizmos(void)   { return s_show_cloth_gizmos; }
 void  jce_state_set_show_cloth_gizmos(bool v) { s_show_cloth_gizmos = v; }
+
+/* World-streaming preview (session-local; never persisted — a freshly
+ * opened editor must not mutate the hierarchy until the user opts in). */
+static bool s_streaming_preview = false;
+bool  jce_state_get_streaming_preview(void)   { return s_streaming_preview; }
+void  jce_state_set_streaming_preview(bool v) { s_streaming_preview = v; }
 
 /* Show flags bitmask. Defaults: gizmos + light icons + camera icons +
  * skybox + world axis on; rest off. */

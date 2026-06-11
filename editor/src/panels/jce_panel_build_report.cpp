@@ -50,6 +50,7 @@ struct BundleRow {
     uint64_t                size_bytes  = 0;
     uint32_t                entry_count = 0;
     uint32_t                dep_count   = 0;
+    bool                    encrypted   = false;
     std::vector<EntryRow>   entries;
 };
 
@@ -214,6 +215,7 @@ void refresh()
             br.size_bytes   = (uint64_t)jce_json_get_number(b, "size_bytes", 0.0);
             br.entry_count  = (uint32_t)jce_json_get_number(b, "entry_count", 0.0);
             br.dep_count    = (uint32_t)jce_json_get_number(b, "dep_count", 0.0);
+            br.encrypted    = jce_json_get_bool(b, "encrypted", false);
             const JceJson *entries = jce_json_get(b, "entries");
             if (jce_json_is_array(entries)) {
                 int en = jce_json_array_size(entries);
@@ -308,13 +310,21 @@ void draw_overview()
         ImGui::TableSetColumnIndex(1);
         ImGui::Text("%d", (int)g_st.duplicates.size());
 
+        int enc_count = 0;
+        for (const auto &b : g_st.bundles)
+            if (b.encrypted) ++enc_count;
+        ImGui::TableNextRow(); ImGui::TableSetColumnIndex(0);
+        ImGui::TextUnformatted(jce_editor_i18n("panel.build_report.overview.encrypted_bundles"));
+        ImGui::TableSetColumnIndex(1);
+        ImGui::Text("%d / %d", enc_count, (int)g_st.bundles.size());
+
         ImGui::EndTable();
     }
 }
 
 void draw_bundles()
 {
-    if (ImGui::BeginTable("##br_bundles", 5,
+    if (ImGui::BeginTable("##br_bundles", 6,
             ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
             ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
         ImGui::TableSetupColumn(jce_editor_i18n("panel.build_report.col.name"),
@@ -325,6 +335,8 @@ void draw_bundles()
                                 ImGuiTableColumnFlags_WidthFixed, 80);
         ImGui::TableSetupColumn(jce_editor_i18n("panel.build_report.col.dep_count"),
                                 ImGuiTableColumnFlags_WidthFixed, 70);
+        ImGui::TableSetupColumn(jce_editor_i18n("panel.build_report.col.encrypted"),
+                                ImGuiTableColumnFlags_WidthFixed, 80);
         ImGui::TableSetupColumn(jce_editor_i18n("panel.build_report.col.hash"),
                                 ImGuiTableColumnFlags_WidthFixed, 160);
         ImGui::TableHeadersRow();
@@ -339,6 +351,12 @@ void draw_bundles()
             ImGui::TableSetColumnIndex(2); ImGui::Text("%u", br.entry_count);
             ImGui::TableSetColumnIndex(3); ImGui::Text("%u", br.dep_count);
             ImGui::TableSetColumnIndex(4);
+            if (br.encrypted)
+                ImGui::TextUnformatted(
+                    jce_editor_i18n("panel.build_report.encrypted_yes"));
+            else
+                ImGui::TextDisabled("-");
+            ImGui::TableSetColumnIndex(5);
             ImGui::TextUnformatted(br.hash.empty() ? "-" : br.hash.c_str());
         }
         ImGui::EndTable();

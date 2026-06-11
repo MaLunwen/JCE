@@ -18,6 +18,7 @@
 #include <jce/middleware/video/jce_video.h>
 #include <jce/renderer/jce_texture.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_hash.h>
 #include <jce/os/core/jce_log.h>
 
 #include <flecs.h>
@@ -49,16 +50,6 @@ static void sv_clear_runtime(JceVideoPlayerComponent *c)
     c->uploaded_counter = 0;
     c->started          = false;
     c->opened_hash      = 0;
-}
-
-/* FNV-1a over the authored clip path: lets the driver notice an in-place
- * clip_path change (inspector edit / Reset Component / undo-redo) without the
- * editor having to bump a counter. */
-static uint64_t sv_path_hash(const char *p)
-{
-    uint64_t h = 1469598103934665603ULL;        /* FNV-1a 64-bit offset basis */
-    for (; *p; ++p) { h ^= (uint8_t)*p; h *= 1099511628211ULL; }
-    return h;
 }
 
 static void sv_release_one(JceVideoPlayerComponent *c)
@@ -188,7 +179,10 @@ static void sv_ensure_open(JceVideoPlayerComponent *c, const SvCtx *ctx)
      * which re-enables one fresh attempt. */
     if (c->started) return;
 
-    const uint64_t want = sv_path_hash(c->clip_path);
+    /* FNV-1a over the authored clip path (jce_hash.h): lets the driver notice
+     * an in-place clip_path change (inspector edit / Reset Component /
+     * undo-redo) without the editor having to bump a counter. */
+    const uint64_t want = jce_fnv1a64_str(c->clip_path);
 
     char        resolved[1024];
     const char *path = c->clip_path;
@@ -233,7 +227,7 @@ static void sv_each(JceScene *s, JceEntity e, void *ud)
      * frame.  sv_release_one() clears `started`/`opened_hash`, re-enabling one
      * open attempt in sv_ensure_open() below. */
     {
-        const uint64_t want = c->clip_path[0] ? sv_path_hash(c->clip_path) : 0;
+        const uint64_t want = c->clip_path[0] ? jce_fnv1a64_str(c->clip_path) : 0;
         if (c->started && want != c->opened_hash)
             sv_release_one(c);
     }

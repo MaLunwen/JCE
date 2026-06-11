@@ -27,43 +27,35 @@ if(EXISTS "${_jce_share_dir}/THIRD_PARTY_LICENSES.md")
 	set(JCE_THIRD_PARTY_LICENSES_FILE "${_jce_share_dir}/THIRD_PARTY_LICENSES.md")
 endif()
 
-# ---- Optional host packer (legacy/developer SDK extension). -------- #
-# The packaged editor generates PAK/BOM/embed sources in-process and
-# passes them through JCE_PROJECT_PREBUILT_* variables.  These probes
-# only support manual CMake consumers that deliberately add host tools
-# beside the SDK.
-set(_jce_pak_exe "${_jce_bin_dir}/jce_pak.exe")
-if(NOT EXISTS "${_jce_pak_exe}")
-	set(_jce_pak_exe "${_jce_bin_dir}/jce_pak")
-endif()
-if(EXISTS "${_jce_pak_exe}")
-	set(JCE_PAK_EXECUTABLE "${_jce_pak_exe}"
-		CACHE FILEPATH "Path to the JCE asset packer (jce_pak)." FORCE)
-endif()
+# ---- Host tools (jce_pak / jce_bin2obj / jce_cook). ---------------- #
+# Native SDKs ship them in bin/; cross-compiled SDKs ship BUILD-HOST
+# binaries in bin/host/ (they run on the machine that builds the game,
+# not on the target).  find_program appends the host suffix (.exe)
+# automatically and — unlike the previous EXISTS+CACHE FORCE probes —
+# never clobbers a user-provided -DJCE_*_EXECUTABLE override.
+# jce_add_pak() uses jce_cook+jce_pak+jce_bin2obj to cook+pack+embed
+# real assets without the editor; the packaged editor instead passes
+# prebuilt artifacts through JCE_PROJECT_PREBUILT_* variables.
+foreach(_jce_tool_pair "PAK;jce_pak" "BIN2OBJ;jce_bin2obj" "COOK;jce_cook")
+	list(GET _jce_tool_pair 0 _jce_tool_up)
+	list(GET _jce_tool_pair 1 _jce_tool_name)
+	find_program(JCE_${_jce_tool_up}_EXECUTABLE
+		NAMES ${_jce_tool_name}
+		HINTS "${_jce_bin_dir}" "${_jce_bin_dir}/host"
+		NO_DEFAULT_PATH
+		DOC "Path to the JCE host tool ${_jce_tool_name}.")
+endforeach()
+unset(_jce_tool_pair)
+unset(_jce_tool_up)
+unset(_jce_tool_name)
 
-# ---- Optional host bundle wrapper (legacy/developer SDK extension). #
-# Editor-driven builds use JCE_PROJECT_PREBUILT_BUNDLE_DIR instead.
-set(_jce_bin2obj_exe "${_jce_bin_dir}/jce_bin2obj.exe")
-if(NOT EXISTS "${_jce_bin2obj_exe}")
-	set(_jce_bin2obj_exe "${_jce_bin_dir}/jce_bin2obj")
-endif()
-if(EXISTS "${_jce_bin2obj_exe}")
-	set(JCE_BIN2OBJ_EXECUTABLE "${_jce_bin2obj_exe}"
-		CACHE FILEPATH "Path to the JCE bundle→obj wrapper (jce_bin2obj)." FORCE)
-endif()
-
-# ---- Optional host cooker (raw asset → .jceasset). ---------------- #
-# Ships with the SDK when built with JCE_ENABLE_SDK_INSTALL.  Lets
-# jce_add_pak() pre-decode textures (PNG→RGBA8) and audio (WAV/OGG→PCM)
-# before packing, so a no-editor consumer gets real cooked assets
-# instead of a raw/stub PAK.
-set(_jce_cook_exe "${_jce_bin_dir}/jce_cook.exe")
-if(NOT EXISTS "${_jce_cook_exe}")
-	set(_jce_cook_exe "${_jce_bin_dir}/jce_cook")
-endif()
-if(EXISTS "${_jce_cook_exe}")
-	set(JCE_COOK_EXECUTABLE "${_jce_cook_exe}"
-		CACHE FILEPATH "Path to the JCE asset cooker (jce_cook)." FORCE)
+# All three found -> jce_add_pak() can cook+pack+embed turnkey. A cross
+# SDK consumed on a DIFFERENT OS than it was built on will not find the
+# tools (wrong host binaries) and jce_add_pak() degrades to raw packing
+# with a warning.
+set(JCE_HOST_TOOLS_FOUND FALSE)
+if(JCE_COOK_EXECUTABLE AND JCE_PAK_EXECUTABLE AND JCE_BIN2OBJ_EXECUTABLE)
+	set(JCE_HOST_TOOLS_FOUND TRUE)
 endif()
 
 set(_jce_core_release "${_jce_lib_dir}/Release/jce_engine_core@CMAKE_STATIC_LIBRARY_SUFFIX@")
@@ -244,7 +236,11 @@ elseif(EMSCRIPTEN)
 		INTERFACE_LINK_OPTIONS
 			-sWASM=1 -sALLOW_MEMORY_GROWTH=1 -sMAX_WEBGL_VERSION=2
 			-sMIN_WEBGL_VERSION=2 -sFULL_ES3=1 -sSTACK_SIZE=1048576
-			-sMALLOC=emmalloc "$<$<CONFIG:Debug>:-sASSERTIONS=1>")
+			-sMALLOC=emmalloc -lwebsocket.js
+			"$<$<CONFIG:Debug>:-sASSERTIONS=1>")
+	# -lwebsocket.js: jce_net_web.c (engine networking) uses the
+	# emscripten_websocket_* JS API; the JS library must be linked into
+	# every consumer or wasm-ld reports undefined symbols.
 elseif(APPLE)
 	set_property(TARGET JCE::JCE APPEND PROPERTY
 		INTERFACE_LINK_LIBRARIES

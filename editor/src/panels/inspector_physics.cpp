@@ -245,6 +245,21 @@ void draw_comp_character_controller(JceCharacterControllerComponent *cc)
     insp_track_edit();
     ImGui::DragFloat(jce_editor_i18n("inspector.slopeLimit"), &cc->slope_limit, 1.0f, 0.0f, 90.0f);
     insp_track_edit();
+    ImGui::SeparatorText(jce_editor_i18n("inspector.cc.feel"));
+    ImGui::DragFloat(jce_editor_i18n("inspector.cc.moveSpeed"), &cc->move_speed, 0.05f, 0.1f, 50.0f);
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n("inspector.cc.sprintMult"), &cc->sprint_mult, 0.05f, 1.0f, 5.0f);
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n("inspector.cc.jumpSpeed"), &cc->jump_speed, 0.05f, 0.5f, 30.0f);
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n("inspector.cc.accel"), &cc->accel, 0.5f, 1.0f, 200.0f);
+    insp_track_edit();
+    /* Min 0.01: the engine treats <=0 as "use default" (zero-init safety
+     * for code-side descs), so an authored 0.0 would silently become 0.35. */
+    ImGui::DragFloat(jce_editor_i18n("inspector.cc.airControl"), &cc->air_control, 0.01f, 0.01f, 1.0f);
+    insp_track_edit();
+    ImGui::DragFloat(jce_editor_i18n("inspector.cc.turnSpeed"), &cc->turn_speed_deg, 5.0f, 30.0f, 1800.0f);
+    insp_track_edit();
 }
 
 void draw_comp_constraint(JceConstraintComponent *con)
@@ -309,6 +324,7 @@ void draw_comp_constraint(JceConstraintComponent *con)
 
 void draw_comp_wheel_collider(JceWheelColliderComponent *w)
 {
+    insp_unwired_badge();
     if (!w) return;
     ImGui::DragFloat(jce_editor_i18n_id("inspector.wc.radius", "wc"),               &w->radius,                0.01f, 0.01f, 100.0f,   "%.3f"); insp_track_edit();
     ImGui::DragFloat(jce_editor_i18n_id("inspector.wc.suspensionDistance", "wc"),  &w->suspension_distance,   0.01f, 0.0f, 10.0f,     "%.3f"); insp_track_edit();
@@ -326,6 +342,7 @@ void draw_comp_wheel_collider(JceWheelColliderComponent *w)
 
 void draw_comp_constant_force(JceConstantForceComponent *cf)
 {
+    insp_unwired_badge();
     if (!cf) return;
     if (ImGui::Checkbox(jce_editor_i18n_id("inspector.cf.enabled", "cf"), &cf->enabled)) insp_undo_bool(&cf->enabled);
     ImGui::DragFloat3(jce_editor_i18n_id("inspector.cf.force", "cf"),          cf->force,           0.1f, -1.0e6f, 1.0e6f, "%.3f"); insp_track_edit();
@@ -336,6 +353,7 @@ void draw_comp_constant_force(JceConstantForceComponent *cf)
 
 void draw_comp_configurable_joint(JceConfigurableJointComponent *cj)
 {
+    insp_unwired_badge();
     if (!cj) return;
     int connected = (int)cj->connected_body;
     if (ImGui::DragInt(jce_editor_i18n_id("inspector.cjj.connectedBody", "cjj"), &connected, 1.0f, 0, 1<<30)) {

@@ -9,11 +9,15 @@
  *               that bulk-generates rects with auto-incremented names.
  *
  * The panel stores everything in JSON; a future runtime loader can
- * consume it via jce_sprite.c.  Currently no live texture preview —
- * rects are visualised on a checker-board canvas with the source
- * image dimensions, so the user can author offsets without needing
- * the engine to upload the texture.  Clicking "Open in Viewer"
- * defers to jce_file_viewer_open() if the user wants pixel preview.
+ * consume it via jce_sprite.c.  The canvas shows a LIVE preview of the
+ * source texture (same decode→upload pipeline as the file viewer:
+ * ed_read_file + jce_image_decode + jce_texture_from_rgba) with the
+ * slice rects overlaid in image-pixel space; a checker-board backdrop
+ * stays visible under transparent texels.  While a texture is loaded
+ * its true dimensions drive the slice math (the W/H fields lock); the
+ * manual W/H fields remain editable when no texture is available so
+ * offsets can still be authored blind.  Clicking "Open in Viewer"
+ * defers to jce_file_viewer_open() for the full pan/zoom inspector.
  */
 
 #include "core/jce_editor_i18n.h"
@@ -24,8 +28,11 @@
 #include <jce/tools/jce_imgui.hpp>
 #include "dialogs/jce_path_input.h"
 #include "core/jce_assetdb.h"
+#include "scene/jce_editor_scene_render.h"   /* jce_editor_resolve_asset_path */
 extern "C" {
 #include <jce/os/core/jce_json.h>
+#include <jce/renderer/jce_texture.h>
+#include <jce/resource/jce_image_decode.h>
 }
 
 #include <cstdio>
@@ -55,6 +62,15 @@ struct State {
     int  new_x = 0, new_y = 0, new_w = 64, new_h = 64;
     std::vector<Rect> rects;
     int  selected = -1;
+    /* Live texture preview, lazily (re)loaded when source_path changes.
+     * tex_loaded_path caches the last attempt (success OR failure) so a
+     * bad path doesn't re-decode + log-spam every frame. */
+    /* NOTE: JCE_TEXTURE_INVALID is a C compound literal (illegal in
+     * C++ → C4576), so spell out the invalid idx instead. */
+    JceTexture tex = { UINT16_MAX };
+    int  tex_w = 0, tex_h = 0;
+    char tex_loaded_path[260] = {0};
+    bool tex_failed = false;
 };
 
 State s;
@@ -143,8 +159,67 @@ void load_json(void)
                            s.sprites_path, (int)s.rects.size());
 }
 
+/* (Re)load the preview texture whenever the authored source path changes.
+ * Reuses the file-viewer image pipeline (ed_read_file → jce_image_decode →
+ * jce_texture_from_rgba) and the editor's asset-path resolver, so anything
+ * the image viewer can show, this canvas can slice.  The result — success
+ * or failure — is cached against the path so nothing is retried per frame. */
+void refresh_texture(void)
+{
+    if (std::strcmp(s.tex_loaded_path, s.source_path) == 0) return;
+
+    if (jce_texture_valid(s.tex)) jce_texture_destroy(s.tex);
+    s.tex.idx = UINT16_MAX;
+    s.tex_w = s.tex_h = 0;
+    s.tex_failed = false;
+    std::snprintf(s.tex_loaded_path, sizeof(s.tex_loaded_path), "%s",
+                  s.source_path);
+    if (!s.source_path[0]) return;
+
+    /* source_path is a project-relative VFS path (AssetVfs picker);
+     * map it to a host-openable path first, fall back to as-is. */
+    char host[1024];
+    const char *path = s.source_path;
+    if (jce_editor_resolve_asset_path(s.source_path, host, (int)sizeof(host)))
+        path = host;
+
+    size_t sz = 0;
+    void *buf = ed_read_file(path, &sz);
+    if (!buf || sz == 0) {
+        /* No console error here: the user may be TYPING the path, which
+         * retriggers this once per keystroke.  The canvas hint
+         * (spriteEditor.previewFailed) already shows the failure. */
+        if (buf) ED_FREE(buf);
+        s.tex_failed = true;
+        return;
+    }
+    JceImage img;
+    bool ok = jce_image_decode(buf, sz, &img);
+    ED_FREE(buf);
+    if (!ok) {
+        s.tex_failed = true;
+        jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+            "sprite editor: image decode failed: %s", s.source_path);
+        return;
+    }
+    s.tex = jce_texture_from_rgba(img.pixels, img.width, img.height);
+    if (jce_texture_valid(s.tex)) {
+        s.tex_w = (int)img.width;
+        s.tex_h = (int)img.height;
+        /* The decoded image is the authority on dimensions — sync the
+         * slice math so rects map 1:1 onto the displayed pixels. */
+        s.source_w = s.tex_w;
+        s.source_h = s.tex_h;
+    } else {
+        s.tex_failed = true;
+    }
+    jce_image_free(&img);
+}
+
 void draw_canvas(void)
 {
+    refresh_texture();
+
     ImVec2 avail = ImGui::GetContentRegionAvail();
     if (avail.y < 200.0f) avail.y = 200.0f;
     ImVec2 p0 = ImGui::GetCursorScreenPos();
@@ -163,7 +238,8 @@ void draw_canvas(void)
                         p0.y + (avail.y - img_h) * 0.5f);
     ImVec2 ip1 = ImVec2(ip0.x + img_w, ip0.y + img_h);
 
-    /* Checkered backdrop for the image region. */
+    /* Checkered backdrop for the image region (stays visible under the
+     * transparent texels of the preview texture). */
     const float cell = 16.0f;
     for (float y = 0; y < img_h; y += cell) {
         for (float x = 0; x < img_w; x += cell) {
@@ -174,6 +250,22 @@ void draw_canvas(void)
                       ip0.y + std::min(y + cell, img_h));
             dl->AddRectFilled(q0, q1, c);
         }
+    }
+
+    /* The texture itself.  source_w/h are synced to the decoded size on
+     * load, so ip0..ip1 maps the image 1:1 — rects below land exactly on
+     * the pixels they describe.  Same ImTextureID binding convention as
+     * fv_render_zoomable (bgfx handle idx). */
+    if (jce_texture_valid(s.tex)) {
+        dl->AddImage((ImTextureID)(uintptr_t)s.tex.idx, ip0, ip1);
+    } else {
+        const char *hint = jce_editor_i18n(
+            s.tex_failed ? "spriteEditor.previewFailed"
+                         : "spriteEditor.noTexture");
+        ImVec2 ts = ImGui::CalcTextSize(hint);
+        dl->AddText(ImVec2(p0.x + (avail.x - ts.x) * 0.5f,
+                           p0.y + (avail.y - ts.y) * 0.5f),
+                    IM_COL32(200, 200, 200, 180), hint);
     }
     dl->AddRect(ip0, ip1, jce_theme::node_outline());
 
@@ -216,8 +308,13 @@ void draw_left_pane(void)
     if (ImGui::SmallButton(jce_editor_i18n("spriteEditor.openInViewer")) && s.source_path[0])
         jce_file_viewer_open(s.source_path);
 
+    /* While a texture is loaded its decoded size is the authority (the
+     * canvas maps rects onto real pixels) — lock the manual fields so the
+     * slice math can't silently diverge from the displayed image. */
+    ImGui::BeginDisabled(jce_texture_valid(s.tex));
     ImGui::InputInt(jce_editor_i18n("spriteEditor.sourceW"), &s.source_w);
     ImGui::InputInt(jce_editor_i18n("spriteEditor.sourceH"), &s.source_h);
+    ImGui::EndDisabled();
 
     ImGui::Separator();
     ImGui::TextUnformatted(jce_editor_i18n("spriteEditor.gridSlice"));

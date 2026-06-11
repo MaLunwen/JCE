@@ -31,6 +31,16 @@ void jce_gizmo_compound_collider_draw_from_component(
     JceScene *scene, JceEntity owner, const JceCompoundColliderComponent *cc,
     unsigned int override_abgr, int detailed);
 
+/* Mesh-collider overlay: thin forwarder that wraps the MeshCollider in a
+ * synthetic single-shape compound description (convex hull / triangle mesh
+ * by mc->convex, whole-model split — mirrors the runtime spawn) and draws
+ * it through the compound path above. Shares the same wireframe cache;
+ * the key includes the cook settings, so mesh entries never collide with
+ * compound entries for the same model. */
+void jce_gizmo_mesh_collider_draw_from_component(
+    JceScene *scene, JceEntity owner, const JceMeshColliderComponent *mc,
+    unsigned int override_abgr, int detailed);
+
 /* Drop cached wireframes (call when assets change / on shutdown). */
 void jce_gizmo_compound_collider_clear_cache(void);
 

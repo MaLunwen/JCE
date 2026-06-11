@@ -160,6 +160,18 @@ bool jce_editor_resolve_asset_path(const char *in, char *out, int outsz);
 typedef struct JceWorldStreamer JceWorldStreamer;
 JceWorldStreamer *jce_editor_get_world_streamer(void);
 
+/* Destroy the preview streamer (and with it every streamed chunk entity in
+ * the live scene).  Idempotent.  Called before scene save/swap so streamed
+ * content never bakes into the main scene file. */
+void jce_editor_scene_render_streaming_teardown(void);
+
+/* Recreate the preview streamer from the current scene's streaming
+ * settings.  Tears down any existing streamer first; creates a new one
+ * only when the scene has streaming enabled AND the session preview
+ * toggle (jce_state_get/set_streaming_preview) is on.  Call after every
+ * scene swap and after the World Streaming panel edits settings. */
+void jce_editor_scene_render_streaming_rebuild(void);
+
 typedef struct JceAnimPlayer JceAnimPlayer;
 typedef struct JceModel      JceModel;
 

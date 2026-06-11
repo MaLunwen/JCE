@@ -104,6 +104,7 @@ extern InspDrag          s_drag;
 /* ── Common helpers — defined in jce_panel_inspector_common.cpp ───── */
 
 void insp_track_edit(void);
+void insp_unwired_badge(void);
 void insp_undo_bool(bool *value);
 void insp_undo_int(int *value, int prev);
 void draw_vec3_control(const char *label, float *values,
@@ -155,6 +156,7 @@ void draw_comp_configurable_joint(JceConfigurableJointComponent *cj);
 void draw_comp_cloth(JceClothComponent *cl);
 
 /* inspector_network.cpp */
+void draw_comp_network_object(JceNetworkObjectComponent *c);
 void draw_comp_net_transform(JceNetTransformComponent *c);
 void draw_comp_net_animator(JceNetAnimatorComponent *c);
 void draw_comp_net_rigidbody(JceNetRigidbodyComponent *c);
@@ -169,9 +171,9 @@ void draw_comp_animator(JceAnimatorComponent *anim);
 void draw_comp_skeletal_animator(JceSkeletalAnimatorComponent *skel);
 void draw_comp_sprite_animator(JceSpriteAnimatorComponent *sa);
 void draw_comp_avatar(JceAvatarComponent *a);
+void draw_comp_ik_constraints(JceIkConstraintComponent *ik);
 
-/* inspector_vfx_tilemap.cpp */
-void draw_comp_vfx_graph(JceVfxGraphComponent *v);
+/* inspector_tilemap.cpp */
 void draw_comp_tilemap(JceTilemapComponent *t);
 void draw_comp_tilemap_collider2d(JceTilemapCollider2DComponent *c);
 
@@ -191,6 +193,8 @@ void draw_comp_trigger_volume(JceTriggerVolumeComponent *tv);
 void draw_comp_terrain(JceTerrainComponent *tc);
 void draw_comp_particle_emitter(JceParticleEmitterComponent *pe);
 void draw_comp_script(JceScriptComponent *scr);
+void draw_comp_nav_agent(JceNavAgentComponent *na);
+void draw_comp_sequence_player(JceSequencePlayerComponent *sp);
 
 /* inspector_ui.cpp */
 void draw_comp_canvas(JceCanvasComponent *cv);

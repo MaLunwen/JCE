@@ -293,6 +293,10 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
     pick_desc.renderer  = renderer;
     pick_desc.pak       = pak;
     pick_desc.callbacks = &cbs;
+    /* Pick borrows skinned models from the scene renderer's cache (no second
+     * GPU copy); shutdown order (pick pass before scene renderer) upholds the
+     * borrow contract documented in pick_resolve_model. */
+    pick_desc.scene_renderer = s_sr.scene_renderer;
     pick_desc.view_id   = (uint16_t)JCE_VIEW_EDITOR_PICK;
     s_sr.pick_pass = jce_scene_pick_create(&pick_desc);
     if (!s_sr.pick_pass)
@@ -316,31 +320,10 @@ bool jce_editor_scene_render_init(JceRenderer *renderer,
             LOG_WARN(LOG_TAG, "occlusion culler creation failed (culling disabled)");
     }
 
-    /* World streamer: cooperative mode (no background threads) so bgfx
-       handles are always created on the render/main thread. */
-    {
-        JceScene *scene = jce_state_get_scene();
-        if (scene) {
-            JceFileSystem *fs = jce_fs_create();
-            if (fs) {
-                /* Mount the current working directory so chunks can be
-                   addressed by relative path (e.g. "chunks/c0.jscene"). */
-                jce_fs_mount_dir(fs, "", ".");
-
-                JceWorldStreamConfig wsc = jce_world_stream_config_default();
-                wsc.single_thread = true; /* editor: cooperative, main-thread only */
-
-                JceWorldStreamer *ws = jce_world_streamer_create(&wsc, scene, fs, NULL);
-                if (ws) {
-                    s_sr.world_streamer = ws;
-                    s_sr.stream_fs      = fs;
-                } else {
-                    jce_fs_destroy(fs);
-                    LOG_WARN(LOG_TAG, "world streamer creation failed (streaming disabled)");
-                }
-            }
-        }
-    }
+    /* World streamer: built from the scene's authored streaming settings
+       (World Streaming panel) — created only when the scene enables
+       streaming AND the session preview toggle is on. */
+    jce_editor_scene_render_streaming_rebuild();
 
     s_sr.initialized = true;
     LOG_INFO(LOG_TAG, "editor scene renderer initialized (engine-backed)");
@@ -426,6 +409,86 @@ JceRenderer *jce_editor_get_renderer(void)
 JceWorldStreamer *jce_editor_get_world_streamer(void)
 {
     return s_sr.world_streamer;
+}
+
+/* ── World-streaming preview lifecycle ────────────────────────────── */
+
+void jce_editor_scene_render_streaming_teardown(void)
+{
+    /* Destroying the streamer also destroys every chunk entity it spawned
+       into the live scene — this is the save-safety mechanism that keeps
+       streamed content out of the serialized main scene. */
+    if (s_sr.world_streamer) {
+        jce_world_streamer_destroy(s_sr.world_streamer);
+        s_sr.world_streamer = NULL;
+    }
+    if (s_sr.stream_fs) {
+        jce_fs_destroy(s_sr.stream_fs);
+        s_sr.stream_fs = NULL;
+    }
+}
+
+void jce_editor_scene_render_streaming_rebuild(void)
+{
+    jce_editor_scene_render_streaming_teardown();
+
+    JceScene *scene = jce_state_get_scene();
+    if (!scene) return;
+
+    /* Session preview toggle (off by default): authoring the chunk table
+       must not mutate the hierarchy until the user opts in. */
+    if (!jce_state_get_streaming_preview()) return;
+
+    const JceSceneStreamingSettings *st =
+        jce_scene_get_streaming_settings(scene);
+    if (!st || !st->enabled) return;
+
+    JceFileSystem *fs = jce_fs_create();
+    if (!fs) return;
+
+    /* Mount the PROJECT ROOT so chunk fragment paths resolve project-
+       relative — the same base every other serialized asset path uses
+       (see normalize_all_scene_paths_to_relative).  The old code mounted
+       "." (the editor's cwd), which only worked when the editor happened
+       to be launched from the project directory.  Fallback chain: project
+       root → current scene file's directory → cwd. */
+    char base[1024] = { 0 };
+    {
+        const char *project = jce_editor_assets_get_project();
+        if (project && project[0]) {
+            snprintf(base, sizeof(base), "%s", project);
+        } else {
+            const char *sp = jce_state_get_current_scene_path();
+            if (sp && sp[0]) {
+                snprintf(base, sizeof(base), "%s", sp);
+                jce_editor_path_trim_to_parent(base);
+            }
+        }
+    }
+    jce_fs_mount_dir(fs, "", base[0] ? base : ".");
+
+    JceWorldStreamConfig wsc = jce_world_stream_config_default();
+    wsc.mode            = (st->mode == 1) ? JCE_STREAM_RECTANGULAR
+                                          : JCE_STREAM_RADIAL;
+    wsc.load_radius     = st->load_radius;
+    wsc.unload_radius   = st->unload_radius;
+    wsc.max_pending     = st->max_pending;
+    wsc.budget_mb       = st->budget_mb;
+    wsc.frame_budget_ms = st->frame_budget_ms;
+    wsc.single_thread   = true; /* editor: cooperative, main-thread only */
+
+    JceWorldStreamer *ws = jce_world_streamer_create(&wsc, scene, fs, NULL);
+    if (!ws) {
+        jce_fs_destroy(fs);
+        LOG_WARN(LOG_TAG, "world streamer creation failed (preview disabled)");
+        return;
+    }
+    jce_world_streamer_register_from_scene_settings(ws, st);
+
+    s_sr.world_streamer = ws;
+    s_sr.stream_fs      = fs;
+    LOG_INFO(LOG_TAG, "world-streaming preview active (%u chunks, root=%s)",
+             jce_world_streamer_chunk_count(ws), base[0] ? base : ".");
 }
 
 /* ── Per-frame ────────────────────────────────────────────────────── */
@@ -624,6 +687,8 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     if (jce_state_get_show_cloth_gizmos()) {
         draw_cloth_gizmos();
     }
+    draw_navmesh_overlay();
+    draw_streaming_overlay();
     draw_hover_highlight();
     draw_ghost_entity();
 

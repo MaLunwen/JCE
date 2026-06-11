@@ -6,7 +6,7 @@
  *
  *   General      autosave interval, startup behaviour, recent count
  *   Appearance   theme, font size, UI scale
- *   Hotkeys      placeholder — wired in P4-A.3
+ *   Hotkeys      rebinding editor (filter / capture / reset, P4-A.3)
  *
  * Persistence
  * -----------

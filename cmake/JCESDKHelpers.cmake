@@ -27,14 +27,53 @@
 
 include_guard(GLOBAL)
 
+# ------------------------------------------------------------------ #
+# _jce_embed_pak_key(<target>)                                        #
+#                                                                     #
+# Links the embedded asset-decryption key TU into <target>.  Editor-  #
+# driven builds pass the generated source through                     #
+# JCE_PROJECT_PREBUILT_PAK_KEY_C (jce_generated/jce_pak_key.c, two    #
+# XOR shares regenerated per build).  When absent, a zeroed stub is   #
+# linked instead — the exact assets_pak_data stub pattern — so the    #
+# engine's jce_embedded_pak_key_present extern always resolves from   #
+# an exe-level object and unencrypted projects behave unchanged.      #
+# Idempotent per target.                                              #
+# ------------------------------------------------------------------ #
+function(_jce_embed_pak_key TARGET)
+	get_target_property(_done ${TARGET} JCE_PAK_KEY_LINKED)
+	if(_done)
+		return()
+	endif()
+	set_target_properties(${TARGET} PROPERTIES JCE_PAK_KEY_LINKED TRUE)
+
+	if(DEFINED JCE_PROJECT_PREBUILT_PAK_KEY_C AND
+	   EXISTS "${JCE_PROJECT_PREBUILT_PAK_KEY_C}")
+		set_source_files_properties("${JCE_PROJECT_PREBUILT_PAK_KEY_C}"
+			PROPERTIES GENERATED TRUE)
+		target_sources(${TARGET} PRIVATE "${JCE_PROJECT_PREBUILT_PAK_KEY_C}")
+		return()
+	endif()
+
+	set(_key_stub "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}_pak_key_stub.c")
+	file(WRITE "${_key_stub}"
+		"/* Auto-generated: no asset encryption key for this build. */\n"
+		"const unsigned char jce_embedded_pak_key_shares[64] = {0};\n"
+		"const int           jce_embedded_pak_key_present    = 0;\n")
+	target_sources(${TARGET} PRIVATE "${_key_stub}")
+endfunction()
+
 function(jce_target_embed_pak TARGET)
 	if(NOT TARGET ${TARGET})
 		message(FATAL_ERROR "jce_target_embed_pak: '${TARGET}' is not a target.")
 	endif()
 
+	# Always resolve the embedded asset-key externs (generated TU or stub),
+	# regardless of which assets path below is taken.
+	_jce_embed_pak_key(${TARGET})
+
 	set(_opts NO_ENGINE_RESOURCES)
 	set(_one  PAK_FILE SYMBOL_PREFIX)
-	set(_multi RESOURCE_DIRS EXCLUDE_SEGMENTS)
+	set(_multi RESOURCE_DIRS EXCLUDE_SEGMENTS EXTRA_DEPENDS)
 	cmake_parse_arguments(EP "${_opts}" "${_one}" "${_multi}" ${ARGN})
 
 	if(NOT EP_SYMBOL_PREFIX)
@@ -130,19 +169,37 @@ function(jce_target_embed_pak TARGET)
 		set(EP_PAK_FILE "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}_assets.pak")
 	endif()
 
-	# Per-dir CLI flags.
+	# Per-dir CLI flags (+ resolved dir list for the file-level deps below).
 	set(_res_flags)
+	set(_res_dirs_abs)
 	foreach(_d IN LISTS EP_RESOURCE_DIRS)
 		if(NOT IS_ABSOLUTE "${_d}")
 			set(_d "${CMAKE_CURRENT_SOURCE_DIR}/${_d}")
 		endif()
 		list(APPEND _res_flags --resource-dir "${_d}")
+		list(APPEND _res_dirs_abs "${_d}")
 	endforeach()
 
 	set(_excl_flags)
 	foreach(_s IN LISTS EP_EXCLUDE_SEGMENTS)
 		list(APPEND _excl_flags --exclude-segment "${_s}")
 	endforeach()
+
+	# Repack when any packed FILE changes — not just when the packer exe
+	# does. Without these deps an edited texture re-cooked by jce_add_pak()
+	# (or an edited raw resource) never dirtied the .pak: the only recorded
+	# dependency was JCE_PAK_EXECUTABLE, so Ninja happily reused a stale
+	# pak/obj and the exe shipped old assets. The in-tree pipeline lists
+	# every asset file in DEPENDS for exactly this reason. EXTRA_DEPENDS
+	# lets callers add ordering files (jce_add_pak passes its cook stamp).
+	set(_pak_deps)
+	foreach(_d IN LISTS _res_dirs_abs)
+		file(GLOB_RECURSE _dir_files CONFIGURE_DEPENDS "${_d}/*")
+		list(APPEND _pak_deps ${_dir_files})
+	endforeach()
+	if(EP_EXTRA_DEPENDS)
+		list(APPEND _pak_deps ${EP_EXTRA_DEPENDS})
+	endif()
 
 	# MSVC: COFF .obj that we link directly.  Other compilers: a .S
 	# wrapper using `.incbin` that target_sources() will compile.
@@ -172,7 +229,7 @@ function(jce_target_embed_pak TARGET)
 				--header-file    "${_header_file}"
 				--manifest-file  "${_manifest_file}"
 				--symbol-prefix  "${EP_SYMBOL_PREFIX}"
-			DEPENDS "${JCE_PAK_EXECUTABLE}"
+			DEPENDS "${JCE_PAK_EXECUTABLE}" ${_pak_deps}
 			COMMENT "Packing ${TARGET} assets (wasm) -> ${EP_PAK_FILE}"
 			VERBATIM)
 
@@ -219,7 +276,7 @@ function(jce_target_embed_pak TARGET)
 			--obj-format     "${_obj_format}"
 			--symbol-prefix  "${EP_SYMBOL_PREFIX}"
 			${_obj_arch_flags}
-		DEPENDS "${JCE_PAK_EXECUTABLE}"
+		DEPENDS "${JCE_PAK_EXECUTABLE}" ${_pak_deps}
 		COMMENT "Packing assets for ${TARGET} -> ${EP_PAK_FILE}"
 		VERBATIM)
 
@@ -412,7 +469,7 @@ function(jce_add_pak TARGET)
 
 	set(_opts  NO_ENGINE_RESOURCES NO_COOK)
 	set(_one   PAK_FILE SYMBOL_PREFIX COOK_LEVEL MAX_TEXTURE_SIZE COOK_PLATFORM)
-	set(_multi RESOURCE_DIRS EXCLUDE_SEGMENTS)
+	set(_multi RESOURCE_DIRS EXCLUDE_SEGMENTS EXTRA_COOK_ARGS)
 	cmake_parse_arguments(AP "${_opts}" "${_one}" "${_multi}" ${ARGN})
 
 	# ---- 1. Editor path: prebuilt assets already cooked + packed. --- #
@@ -491,7 +548,8 @@ function(jce_add_pak TARGET)
 				--preserve-names
 				--level "${AP_COOK_LEVEL}"
 				--max-texture-size "${AP_MAX_TEXTURE_SIZE}"
-				${_cook_platform_args})
+				${_cook_platform_args}
+				${AP_EXTRA_COOK_ARGS})
 	endforeach()
 
 	add_custom_command(
@@ -505,7 +563,12 @@ function(jce_add_pak TARGET)
 
 	# Pack + embed the cooked tree.  NO_ENGINE_RESOURCES: the engine dirs
 	# were already cooked into _cooked_dir above (don't double-add raw).
-	set(_embed_args RESOURCE_DIRS "${_cooked_dir}" NO_ENGINE_RESOURCES)
+	# EXTRA_DEPENDS carries the cook stamp into the pak command's DEPENDS:
+	# add_dependencies() below only ORDERS the two targets — without a real
+	# file-level edge a re-cook never dirtied the .pak and the exe shipped
+	# stale assets.
+	set(_embed_args RESOURCE_DIRS "${_cooked_dir}" NO_ENGINE_RESOURCES
+	                EXTRA_DEPENDS "${_cook_stamp}")
 	if(AP_PAK_FILE)
 		list(APPEND _embed_args PAK_FILE "${AP_PAK_FILE}")
 	endif()

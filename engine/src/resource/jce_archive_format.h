@@ -57,7 +57,13 @@
 #define JARC_OFF_DICT_COUNT          56u  /* u16 */
 #define JARC_OFF_DEFAULT_COMPRESSION 58u  /* u8  */
 #define JARC_OFF_ALIGNMENT_LOG2      59u  /* u8  */
-#define JARC_OFF_RESERVED            60u  /* u32 */
+/* The former RESERVED u32 now carries nonce_salt32: the per-archive salt
+ * mixed into every ChaCha20 nonce (bytes 8-11).  Meaningful iff
+ * JARC_FLAG_ENCRYPTED is set; written as 0 otherwise, which keeps the field
+ * byte-compatible with pre-salt archives (whose readers also derived a
+ * zero-salt nonce). */
+#define JARC_OFF_RESERVED            60u  /* u32: nonce_salt32 (see above) */
+#define JARC_OFF_NONCE_SALT32        JARC_OFF_RESERVED
 
 /* -- Dictionary table entry field offsets (spec §4.4) --------------- */
 

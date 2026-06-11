@@ -10,6 +10,7 @@
 
 void draw_comp_animator(JceAnimatorComponent *anim)
 {
+    insp_unwired_badge();
     if (anim->speed <= 0.0f) anim->speed = 1.0f;
 
     ImGui::InputText(jce_editor_i18n("timeline.clip"), anim->clip_name, 64);
@@ -144,6 +145,17 @@ void draw_comp_skeletal_animator(JceSkeletalAnimatorComponent *skel)
         bool bt = skel->use_blend_tree;
         if (ImGui::Checkbox(jce_editor_i18n("inspector.anim.blendTree1d"), &bt)) {
             skel->use_blend_tree = bt;
+            /* First enable with unauthored thresholds (all zero): seed an
+             * ascending spread so the 1D tree has valid brackets instead of
+             * degenerate all-equal thresholds (random clip pairs/weights). */
+            if (bt) {
+                bool all_zero = true;
+                for (int i = 0; i < clip_count && i < 8; i++)
+                    if (skel->blend_thresholds[i] != 0.0f) all_zero = false;
+                if (all_zero)
+                    for (int i = 1; i < clip_count && i < 8; i++)
+                        skel->blend_thresholds[i] = 2.0f * (float)i;
+            }
             insp_track_edit();
         }
         if (skel->use_blend_tree) {
@@ -211,6 +223,7 @@ void draw_comp_sprite_animator(JceSpriteAnimatorComponent *sa)
 
 void draw_comp_avatar(JceAvatarComponent *a)
 {
+    insp_unwired_badge();
     jce_draw_path_input_asset(jce_editor_i18n("inspector.avatar.path"), a->avatar_path, 128, JCE_ASSET_KIND_DATA);
     insp_track_edit();
     accept_asset_drop(a->avatar_path, 128);
@@ -228,4 +241,17 @@ void draw_comp_avatar(JceAvatarComponent *a)
         insp_undo_bool(&a->apply_root_motion);
     if (ImGui::Checkbox(jce_editor_i18n("inspector.avatar.humanRig"), &a->human_rig))
         insp_undo_bool(&a->human_rig);
+}
+
+/* IK Constraints: minimal card — the full constraint stack is authored in
+ * the Animation Rigging tab of the Animation Editor workbench. */
+void draw_comp_ik_constraints(JceIkConstraintComponent *ik)
+{
+    if (!ik) return;
+    ImGui::Text("%s: %d", jce_editor_i18n("inspector.ik.count"), ik->count);
+    if (ImGui::Button(jce_editor_i18n("inspector.ik.openRigging"))) {
+        bool *ae_vis = jce_editor_panel_visible_ptr(JCE_PANEL_ANIMATION_EDITOR);
+        if (ae_vis) *ae_vis = true;
+        jce_panel_animation_editor_request_tab(5);
+    }
 }

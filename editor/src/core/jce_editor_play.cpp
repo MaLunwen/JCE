@@ -297,14 +297,17 @@ void jce_state_play_mode_tick(float dt)
 /* ── External hooks (game view / scene render) ──────────────────── */
 
 void jce_editor_play_set_player_input(float walk_x, float walk_z,
-                                      bool jump_pressed, float speed_mult)
+                                      bool jump_pressed, bool jump_held,
+                                      bool sprint)
 {
     if (!s_play_runtime) return;
-    JceRuntimeInput in;
+    JceRuntimeInput in = {};
     in.walk_x       = walk_x;
     in.walk_z       = walk_z;
     in.jump_pressed = jump_pressed;
-    in.speed_mult   = speed_mult > 0.0f ? speed_mult : 1.0f;
+    in.jump_held    = jump_held;
+    in.sprint       = sprint;
+    in.speed_mult   = 1.0f;   /* sprint scaling is authored on the component */
     jce_runtime_set_input(s_play_runtime, &in);
 }
 
@@ -322,6 +325,11 @@ bool jce_editor_play_get_player_position(float *out_x, float *out_y, float *out_
 JcePhysicsWorld *jce_editor_play_get_physics_world(void)
 {
     return s_play_runtime ? jce_runtime_physics(s_play_runtime) : NULL;
+}
+
+JceRuntime *jce_editor_play_get_runtime(void)
+{
+    return s_play_runtime;
 }
 
 /* ── Entity Clipboard ────────────────────────────────────────────── */

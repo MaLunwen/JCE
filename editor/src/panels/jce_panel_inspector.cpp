@@ -32,6 +32,18 @@ static void *comp_get_ptr_and_size(JceScene *scene, JceEntity e,
         *out_size = sizeof(JceVideoPlayerComponent);
         return jce_scene_get_video_player(scene, e);
     }
+    if (jce_editor_component_slot_is_nav_agent(flag)) {
+        *out_size = sizeof(JceNavAgentComponent);
+        return jce_scene_get_nav_agent(scene, e);
+    }
+    if (jce_editor_component_slot_is_ik_constraints(flag)) {
+        *out_size = sizeof(JceIkConstraintComponent);
+        return jce_scene_get_ik_constraints(scene, e);
+    }
+    if (jce_editor_component_slot_is_sequence_player(flag)) {
+        *out_size = sizeof(JceSequencePlayerComponent);
+        return jce_scene_get_sequence_player(scene, e);
+    }
 
     switch (flag) {
     case JCE_COMP_FLAG_TRANSFORM:
@@ -151,6 +163,9 @@ static void *comp_get_ptr_and_size(JceScene *scene, JceEntity e,
     case JCE_COMP_FLAG_CLOTH:
         *out_size = sizeof(JceClothComponent);
         return jce_scene_get_cloth(scene, e);
+    case JCE_COMP_FLAG_NETWORK_OBJECT:
+        *out_size = sizeof(JceNetworkObjectComponent);
+        return jce_scene_get_network_object(scene, e);
     case JCE_COMP_FLAG_NET_TRANSFORM:
         *out_size = sizeof(JceNetTransformComponent);
         return jce_scene_get_net_transform(scene, e);
@@ -160,9 +175,6 @@ static void *comp_get_ptr_and_size(JceScene *scene, JceEntity e,
     case JCE_COMP_FLAG_NET_RIGIDBODY:
         *out_size = sizeof(JceNetRigidbodyComponent);
         return jce_scene_get_net_rigidbody(scene, e);
-    case JCE_COMP_FLAG_VFX_GRAPH:
-        *out_size = sizeof(JceVfxGraphComponent);
-        return jce_scene_get_vfx_graph(scene, e);
     case JCE_COMP_FLAG_TILEMAP:
         *out_size = sizeof(JceTilemapComponent);
         return jce_scene_get_tilemap(scene, e);
@@ -980,6 +992,30 @@ static void draw_one_component_section(uint32_t focused,
         return;
     }
 
+    if (jce_editor_component_slot_is_nav_agent(flag)) {
+        if (comp_section_begin(focused, sidecar, flag, nm, removable))
+            draw_comp_nav_agent(
+                jce_scene_get_nav_agent(scene, ecs_e));
+        comp_section_end();
+        return;
+    }
+
+    if (jce_editor_component_slot_is_ik_constraints(flag)) {
+        if (comp_section_begin(focused, sidecar, flag, nm, removable))
+            draw_comp_ik_constraints(
+                jce_scene_get_ik_constraints(scene, ecs_e));
+        comp_section_end();
+        return;
+    }
+
+    if (jce_editor_component_slot_is_sequence_player(flag)) {
+        if (comp_section_begin(focused, sidecar, flag, nm, removable))
+            draw_comp_sequence_player(
+                jce_scene_get_sequence_player(scene, ecs_e));
+        comp_section_end();
+        return;
+    }
+
 #define JCE_DRAW(F, EXPR)                                                  \
     case F:                                                                \
         if (comp_section_begin(focused, sidecar, F, nm, removable)) EXPR;  \
@@ -1083,14 +1119,14 @@ static void draw_one_component_section(uint32_t focused,
                  draw_comp_ui_button(jce_scene_get_ui_button(scene, ecs_e)));
         JCE_DRAW(JCE_COMP_FLAG_CLOTH,
                  draw_comp_cloth(jce_scene_get_cloth(scene, ecs_e)));
+        JCE_DRAW(JCE_COMP_FLAG_NETWORK_OBJECT,
+                 draw_comp_network_object(jce_scene_get_network_object(scene, ecs_e)));
         JCE_DRAW(JCE_COMP_FLAG_NET_TRANSFORM,
                  draw_comp_net_transform(jce_scene_get_net_transform(scene, ecs_e)));
         JCE_DRAW(JCE_COMP_FLAG_NET_ANIMATOR,
                  draw_comp_net_animator(jce_scene_get_net_animator(scene, ecs_e)));
         JCE_DRAW(JCE_COMP_FLAG_NET_RIGIDBODY,
                  draw_comp_net_rigidbody(jce_scene_get_net_rigidbody(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_VFX_GRAPH,
-                 draw_comp_vfx_graph(jce_scene_get_vfx_graph(scene, ecs_e)));
         JCE_DRAW(JCE_COMP_FLAG_TILEMAP,
                  draw_comp_tilemap(jce_scene_get_tilemap(scene, ecs_e)));
         JCE_DRAW(JCE_COMP_FLAG_TILEMAP_COLLIDER_2D,
@@ -1392,6 +1428,27 @@ void jce_editor_panel_inspector_content(void)
             if (scene && ce) {
                 jce_state_begin_batch_edit();
                 jce_scene_remove_video_player(scene, ce);
+                jce_state_end_batch_edit();
+            }
+        } else if (jce_editor_component_slot_is_nav_agent(fl)) {
+            JceEntity ce = jce_state_to_ecs_entity(eid);
+            if (scene && ce) {
+                jce_state_begin_batch_edit();
+                jce_scene_remove_nav_agent(scene, ce);
+                jce_state_end_batch_edit();
+            }
+        } else if (jce_editor_component_slot_is_ik_constraints(fl)) {
+            JceEntity ce = jce_state_to_ecs_entity(eid);
+            if (scene && ce) {
+                jce_state_begin_batch_edit();
+                jce_scene_remove_ik_constraints(scene, ce);
+                jce_state_end_batch_edit();
+            }
+        } else if (jce_editor_component_slot_is_sequence_player(fl)) {
+            JceEntity ce = jce_state_to_ecs_entity(eid);
+            if (scene && ce) {
+                jce_state_begin_batch_edit();
+                jce_scene_remove_sequence_player(scene, ce);
                 jce_state_end_batch_edit();
             }
         } else {
