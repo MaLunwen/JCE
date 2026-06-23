@@ -21,6 +21,7 @@
 
 extern "C" {
 #include <jce/middleware/physics/jce_cloth.h>
+#include <jce/middleware/physics/jce_softbody.h>
 #include <jce/os/core/jce_alloc.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
@@ -49,6 +50,13 @@ struct ClothSlot {
     bool        alive;
 };
 
+/* Static collision proxy: a zero-mass btRigidBody added to the SHARED soft
+ * world so pressure soft bodies can rest / bounce on it (e.g. the ground). */
+struct StaticProxy {
+    btRigidBody      *body;
+    btCollisionShape *shape;
+};
+
 struct SoftCtx {
     btSoftBodyRigidBodyCollisionConfiguration *config;
     btCollisionDispatcher                     *dispatcher;
@@ -60,6 +68,11 @@ struct SoftCtx {
     ClothSlot *slots;
     uint32_t   slot_capacity;
     uint32_t   slot_count;
+
+    /* Static rigid proxies for soft bodies to collide with (soft-body slice). */
+    StaticProxy *statics;
+    uint32_t     static_capacity;
+    uint32_t     static_count;
 };
 
 static SoftCtx  g_ctx          = {};
@@ -336,7 +349,12 @@ extern "C" bool jce_cloth_anchor_to_body(JceClothHandle cloth,
     return true;
 }
 
-extern "C" void jce_cloth_step_(float dt)
+namespace {
+
+/* Shared world-step body used by BOTH jce_cloth_step_ and jce_softbody_step_
+ * (cloth and soft bodies live in the same secondary soft world).  Behaviour is
+ * byte-identical to the original jce_cloth_step_ so cloth stepping is unchanged. */
+static void soft_world_step(float dt)
 {
     if (!g_initialised || !g_sim_enabled || g_ctx.slot_count == 0) return;
     if (dt <= 0.0f) return;
@@ -347,6 +365,13 @@ extern "C" void jce_cloth_step_(float dt)
      * pace below 60 fps instead of running in slow motion; the dt clamp above
      * bounds catch-up to avoid a spiral of death. */
     g_ctx.world->stepSimulation(dt, 4, 1.0f / 60.0f);
+}
+
+} /* namespace */
+
+extern "C" void jce_cloth_step_(float dt)
+{
+    soft_world_step(dt);
 }
 
 extern "C" void jce_cloth_shutdown_(void)
@@ -362,6 +387,13 @@ extern "C" void jce_cloth_shutdown_(void)
         }
         JCE_FREE(g_ctx.slots);
     }
+    /* CRITICAL: free the static rigid proxies (soft-body slice) BEFORE deleting
+     * the world below, otherwise the world would be gone when we removeRigidBody.
+     * Frees the list itself too; the memset at the end resets the fields. */
+    jce_softbody_clear_statics();
+    if (g_ctx.statics) {
+        JCE_FREE(g_ctx.statics);
+    }
     delete g_ctx.world;
     delete g_ctx.solver;
     delete g_ctx.broadphase;
@@ -371,4 +403,207 @@ extern "C" void jce_cloth_shutdown_(void)
     g_total_nodes = 0;
     g_initialised = false;
     LOG_INFO(LOG_TAG, "soft-body world destroyed");
+}
+
+/* ================================================================== */
+/* Volumetric / pressure soft body (shares the cloth soft world)      */
+/* ================================================================== */
+
+namespace {
+
+constexpr uint32_t STATIC_INITIAL_CAPACITY = 8;
+
+/* Ensure room for one more static proxy.  Grows 2x (or seeds the list). */
+static bool ensure_static_capacity(void)
+{
+    if (g_ctx.static_count < g_ctx.static_capacity) return true;
+    uint32_t new_cap = g_ctx.static_capacity ? g_ctx.static_capacity * 2u
+                                             : STATIC_INITIAL_CAPACITY;
+    StaticProxy *p = static_cast<StaticProxy *>(
+        JCE_REALLOC(g_ctx.statics, new_cap * sizeof(StaticProxy)));
+    if (!p) return false;
+    memset(&p[g_ctx.static_capacity], 0,
+           (new_cap - g_ctx.static_capacity) * sizeof(StaticProxy));
+    g_ctx.statics         = p;
+    g_ctx.static_capacity = new_cap;
+    return true;
+}
+
+} /* namespace */
+
+extern "C" void jce_softbody_set_simulation_enabled(bool enabled)
+{
+    /* Same global gate the cloth uses — one shared soft world. */
+    jce_cloth_set_simulation_enabled(enabled);
+}
+
+extern "C" bool jce_softbody_is_simulation_enabled(void)
+{
+    return g_sim_enabled;
+}
+
+extern "C" void jce_softbody_step_(float dt)
+{
+    /* Same world step the cloth uses — one shared soft world. */
+    soft_world_step(dt);
+}
+
+extern "C" uint32_t jce_softbody_add_static_box(jce_vec3 center,
+                                                jce_vec3 half_extents)
+{
+    if (!ensure_world()) return UINT32_MAX;
+    if (!ensure_static_capacity()) return UINT32_MAX;
+
+    btBoxShape *shape = new btBoxShape(
+        btVector3(half_extents.x, half_extents.y, half_extents.z));
+
+    btTransform xf;
+    xf.setIdentity();
+    xf.setOrigin(to_bt(center));
+    /* Zero mass + no inertia = static collision object. */
+    btDefaultMotionState *ms = new btDefaultMotionState(xf);
+    btRigidBody::btRigidBodyConstructionInfo ci(
+        0.0f, ms, shape, btVector3(0, 0, 0));
+    btRigidBody *rb = new btRigidBody(ci);
+    rb->setFriction(1.0f);
+    g_ctx.world->addRigidBody(rb);
+
+    uint32_t id = g_ctx.static_count;
+    g_ctx.statics[id].body  = rb;
+    g_ctx.statics[id].shape = shape;
+    ++g_ctx.static_count;
+    return id;
+}
+
+extern "C" void jce_softbody_clear_statics(void)
+{
+    if (!g_initialised || !g_ctx.statics) return;
+    for (uint32_t i = 0; i < g_ctx.static_count; ++i) {
+        StaticProxy *sp = &g_ctx.statics[i];
+        if (sp->body) {
+            if (g_ctx.world) g_ctx.world->removeRigidBody(sp->body);
+            delete sp->body->getMotionState();
+            delete sp->body;
+        }
+        delete sp->shape;
+        sp->body  = nullptr;
+        sp->shape = nullptr;
+    }
+    g_ctx.static_count = 0;
+}
+
+extern "C" JceSoftBodyHandle jce_softbody_create_ellipsoid(
+    const JceSoftBodyDesc *desc)
+{
+    if (!desc) return JCE_SOFTBODY_INVALID;
+    if (!ensure_world()) return JCE_SOFTBODY_INVALID;
+
+    int res = desc->resolution > 3 ? desc->resolution : 64;
+
+    uint32_t slot = find_free_slot();
+    if (slot == UINT32_MAX) {
+        LOG_ERROR(LOG_TAG, "softbody_create: cannot allocate slot");
+        return JCE_SOFTBODY_INVALID;
+    }
+
+    /* CreateEllipsoid builds a CLOSED soft body (a sealed shell). */
+    btSoftBody *sb = btSoftBodyHelpers::CreateEllipsoid(
+        g_ctx.info,
+        to_bt(desc->center),
+        btVector3(desc->radius.x, desc->radius.y, desc->radius.z),
+        res);
+    if (!sb) {
+        LOG_ERROR(LOG_TAG, "btSoftBodyHelpers::CreateEllipsoid failed");
+        return JCE_SOFTBODY_INVALID;
+    }
+
+    /* Material stiffness (per the first material the helper created). */
+    btSoftBody::Material *mat = sb->m_materials[0];
+    mat->m_kLST = desc->stiffness_linear;
+    mat->m_kVST = desc->stiffness_volume;
+
+    /* Pressure (kPR > 0) is what makes it a squishy resisting volume. */
+    sb->m_cfg.kPR = desc->pressure;
+    sb->m_cfg.kDP = desc->damping;
+    sb->m_cfg.kDF = desc->friction;
+
+    /* Collide against rigid bodies via the signed-distance field so the body
+     * rests / bounces on the static box proxies (and any rigid in this world). */
+    sb->m_cfg.collisions |= btSoftBody::fCollision::SDF_RS;
+
+    /* Optional cluster self-collision (cluster-vs-cluster + cluster-vs-rigid). */
+    if (desc->self_collision) {
+        sb->m_cfg.collisions |= btSoftBody::fCollision::CL_SS;
+        sb->m_cfg.collisions |= btSoftBody::fCollision::CL_RS;
+        sb->generateClusters(16);
+    }
+
+    sb->setTotalMass(desc->mass > 0.0f ? desc->mass : 1.0f, /*fromfaces=*/true);
+
+    g_ctx.world->addSoftBody(sb);
+
+    int node_count_i = sb->m_nodes.size();
+    g_ctx.slots[slot].body  = sb;
+    g_ctx.slots[slot].nodes = (uint32_t)node_count_i;
+    g_ctx.slots[slot].alive = true;
+    ++g_ctx.slot_count;
+    g_total_nodes += (uint32_t)node_count_i;
+
+    return make_handle(slot);
+}
+
+extern "C" void jce_softbody_destroy(JceSoftBodyHandle h)
+{
+    /* Shared slot pool with cloth — same teardown path. */
+    jce_cloth_destroy((JceClothHandle)h);
+}
+
+extern "C" uint32_t jce_softbody_node_count(JceSoftBodyHandle h)
+{
+    return jce_cloth_node_count((JceClothHandle)h);
+}
+
+extern "C" bool jce_softbody_get_positions(JceSoftBodyHandle h,
+                                           float *out_xyz,
+                                           uint32_t out_capacity_floats)
+{
+    return jce_cloth_get_positions((JceClothHandle)h, out_xyz,
+                                   out_capacity_floats);
+}
+
+extern "C" bool jce_softbody_get_center(JceSoftBodyHandle h,
+                                        jce_vec3 *out_center)
+{
+    if (!handle_valid((JceClothHandle)h) || !out_center) return false;
+    btSoftBody *sb = g_ctx.slots[handle_to_idx((JceClothHandle)h)].body;
+    if (!sb) return false;
+    int n = sb->m_nodes.size();
+    if (n <= 0) return false;
+    btVector3 sum(0, 0, 0);
+    for (int i = 0; i < n; ++i) sum += sb->m_nodes[i].m_x;
+    btScalar inv = btScalar(1) / btScalar(n);
+    out_center->x = sum.x() * inv;
+    out_center->y = sum.y() * inv;
+    out_center->z = sum.z() * inv;
+    return true;
+}
+
+extern "C" bool jce_softbody_get_aabb(JceSoftBodyHandle h,
+                                      jce_vec3 *out_min,
+                                      jce_vec3 *out_max)
+{
+    if (!handle_valid((JceClothHandle)h) || !out_min || !out_max) return false;
+    btSoftBody *sb = g_ctx.slots[handle_to_idx((JceClothHandle)h)].body;
+    if (!sb) return false;
+    int n = sb->m_nodes.size();
+    if (n <= 0) return false;
+    btVector3 mn = sb->m_nodes[0].m_x;
+    btVector3 mx = mn;
+    for (int i = 1; i < n; ++i) {
+        mn.setMin(sb->m_nodes[i].m_x);
+        mx.setMax(sb->m_nodes[i].m_x);
+    }
+    out_min->x = mn.x(); out_min->y = mn.y(); out_min->z = mn.z();
+    out_max->x = mx.x(); out_max->y = mx.y(); out_max->z = mx.z();
+    return true;
 }

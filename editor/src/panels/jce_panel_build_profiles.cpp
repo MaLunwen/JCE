@@ -23,6 +23,7 @@
 #include "core/jce_run_manager.h"
 #include "core/jce_editor_config.h"
 #include "core/jce_editor_project.h"
+#include "dialogs/jce_editor_dialogs.h"
 #include "dialogs/jce_path_input.h"
 #include "ui/jce_editor_panels.h"
 #include "ui/jce_editor_ui_state.h"
@@ -33,7 +34,6 @@ extern "C" {
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_str.h>
-#include <jce/os/platform/jce_host_dialog.h>
 }
 
 #include <cstdio>
@@ -106,11 +106,12 @@ static struct {
      * then JCE_SDK_DIR; Build/Pack also accept this unsaved buffer so the
      * user can fix a missing SDK and immediately retry. */
     char                 sdk_input[512] = {0};
-    /* Async file-picker plumbing.  Dialog callback runs on the UI
-     * thread (per jce_host_dialog contract), so a plain int is enough
-     * — no <atomic> needed. */
-    char                 pick_buf[512]   = {0};
-    int                  pick_state      = 0; /* 0=idle 1=ready 2=cancelled */
+    /* Async file-picker plumbing.  The public dialog wrapper marshals the
+     * SDL worker-thread callback onto the editor main thread before these
+     * flags/buffers are touched. */
+    char                 pick_buf[512] = {0};
+    bool                 pick_ready = false;
+    bool                 pick_cancelled = false;
     /* Script-delegated build options (▶ Build Project). */
     bool                 use_clean   = false;
     bool                 use_dist    = false; /* Windows --dist variant */
@@ -273,20 +274,6 @@ static void save_root_to_config(void)
     snprintf(cfg.build_project_root, sizeof(cfg.build_project_root), "%s",
              s_bp.project_root);
     jce_editor_config_save(&cfg);
-}
-
-/* SDL dialog callback (runs on UI thread per jce_host_dialog docs).
- * Just stash the path + flip the state flag; the panel polls it. */
-static void on_pick_presets_cb(void *user, JceDialogResult result,
-                               const char *path)
-{
-    (void)user;
-    if (result == JCE_DIALOG_OK && path && path[0]) {
-        snprintf(s_bp.pick_buf, sizeof(s_bp.pick_buf), "%s", path);
-        s_bp.pick_state = 1;
-    } else {
-        s_bp.pick_state = 2;
-    }
 }
 
 /* Given a path (file or directory), normalize into project_root.
@@ -600,12 +587,12 @@ static void draw_project_root_strip(void)
     load_root_from_config_once();
 
     /* Pump the async picker if it has settled. */
-    int st = s_bp.pick_state;
-    if (st == 1) {
+    if (s_bp.pick_ready) {
         apply_picked_path(s_bp.pick_buf);
-        s_bp.pick_state = 0;
-    } else if (st == 2) {
-        s_bp.pick_state = 0;
+        s_bp.pick_ready = false;
+        s_bp.pick_cancelled = false;
+    } else if (s_bp.pick_cancelled) {
+        s_bp.pick_cancelled = false;
     }
 
     ImGui::TextDisabled("%s:",
@@ -620,12 +607,15 @@ static void draw_project_root_strip(void)
     }
     ImGui::SameLine();
     if (ImGui::Button(jce_editor_i18n("buildProfiles.projectRoot.browse"))) {
-        s_bp.pick_state = 0;
-        jce_host_dialog_pick_file(
+        s_bp.pick_buf[0] = '\0';
+        s_bp.pick_ready = false;
+        s_bp.pick_cancelled = false;
+        open_file_dialog_async(
             jce_editor_i18n("buildProfiles.projectRoot.title"),
             s_bp.project_root[0] ? s_bp.project_root : nullptr,
             "Project files (jce_project.json CMakePresets.json CMakeLists.txt);;All Files (*.*)",
-            on_pick_presets_cb, nullptr);
+            s_bp.pick_buf, sizeof(s_bp.pick_buf),
+            &s_bp.pick_ready, &s_bp.pick_cancelled);
     }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("%s",
@@ -640,14 +630,13 @@ static void draw_project_root_strip(void)
 
 static void draw_tool_status_strip(void)
 {
-    /* Lazy first probe so the panel opens snappy; user can re-probe. */
-    if (!s_bp.tools_probed) {
-        jce_build_manager_check_tools(&s_bp.tools);
-        s_bp.tools_probed = true;
-    }
-
     const ImVec4 ok_col   = ImVec4(0.4f, 1.0f, 0.4f, 1.0f);
     const ImVec4 bad_col  = ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
+
+    auto check_tools = []() {
+        jce_build_manager_check_tools(&s_bp.tools);
+        s_bp.tools_probed = true;
+    };
 
     auto badge = [&](const char *name, bool ok, const char *version) {
         ImGui::TextColored(ok ? ok_col : bad_col, "%s %s",
@@ -659,11 +648,26 @@ static void draw_tool_status_strip(void)
 
     ImGui::TextDisabled("%s:", jce_editor_i18n("buildProfiles.tools"));
     ImGui::SameLine();
-    badge("cmake", s_bp.tools.cmake_ok, s_bp.tools.cmake_version);
-    badge("conan", s_bp.tools.conan_ok, s_bp.tools.conan_version);
-    badge("ninja", s_bp.tools.ninja_ok, s_bp.tools.ninja_version);
+    if (s_bp.tools_probed) {
+        badge("cmake", s_bp.tools.cmake_ok, s_bp.tools.cmake_version);
+        badge("conan", s_bp.tools.conan_ok, s_bp.tools.conan_version);
+        badge("ninja", s_bp.tools.ninja_ok, s_bp.tools.ninja_version);
+    } else {
+        ImGui::TextDisabled("%s",
+            jce_editor_i18n("buildProfiles.tools.notChecked"));
+        ImGui::SameLine();
+    }
     if (ImGui::SmallButton(jce_editor_i18n("buildProfiles.tools.recheck")))
+        check_tools();
+}
+
+static bool ensure_tools_checked(void)
+{
+    if (!s_bp.tools_probed) {
         jce_build_manager_check_tools(&s_bp.tools);
+        s_bp.tools_probed = true;
+    }
+    return s_bp.tools.cmake_ok && s_bp.tools.ninja_ok && s_bp.tools.conan_ok;
 }
 
 static void draw_profiles_tab(void)
@@ -1019,8 +1023,9 @@ static void draw_profiles_tab(void)
         }
 
         bool script_disabled = running ||
-            !s_bp.tools.cmake_ok || !s_bp.tools.ninja_ok ||
-            !s_bp.tools.conan_ok;
+            (s_bp.tools_probed &&
+             (!s_bp.tools.cmake_ok || !s_bp.tools.ninja_ok ||
+              !s_bp.tools.conan_ok));
 
         /* ── Play state machine driver ──
          * Watches cook_manager / build_manager / run_manager and
@@ -1037,7 +1042,7 @@ static void draw_profiles_tab(void)
                     s_bp.play_stage = decltype(s_bp)::PLAY_BUILDING;
                 } else if (cs.state == JCE_COOK_FAILED) {
                     snprintf(s_bp.play_fail_msg, sizeof s_bp.play_fail_msg,
-                             "Cook failed: %s", cs.last_error);
+                             jce_editor_i18n("buildProfiles.play.cookFailed"), cs.last_error);
                     s_bp.play_stage = decltype(s_bp)::PLAY_FAILED;
                 }
                 break;
@@ -1046,7 +1051,7 @@ static void draw_profiles_tab(void)
                     s_bp.play_stage = decltype(s_bp)::PLAY_LAUNCH_READY;
                 } else if (st.state == JCE_BUILD_FAILED) {
                     snprintf(s_bp.play_fail_msg, sizeof s_bp.play_fail_msg,
-                             "Build failed: %s", st.last_error);
+                             jce_editor_i18n("buildProfiles.play.buildFailed"), st.last_error);
                     s_bp.play_stage = decltype(s_bp)::PLAY_FAILED;
                 }
                 break;
@@ -1067,12 +1072,12 @@ static void draw_profiles_tab(void)
                         s_bp.play_stage = decltype(s_bp)::PLAY_RUNNING;
                     } else {
                         snprintf(s_bp.play_fail_msg, sizeof s_bp.play_fail_msg,
-                                 "Failed to launch %s", rc.executable_path);
+                                 jce_editor_i18n("buildProfiles.play.launchFailed"), rc.executable_path);
                         s_bp.play_stage = decltype(s_bp)::PLAY_FAILED;
                     }
                 } else {
                     snprintf(s_bp.play_fail_msg, sizeof s_bp.play_fail_msg,
-                             "No game_executable_path configured");
+                             "%s", jce_editor_i18n("buildProfiles.play.noExePath"));
                     s_bp.play_stage = decltype(s_bp)::PLAY_FAILED;
                 }
                 break;
@@ -1097,6 +1102,12 @@ static void draw_profiles_tab(void)
         if (play_disabled) ImGui::BeginDisabled();
         if (ImGui::Button(jce_editor_i18n("buildProfiles.play"))) {
             s_bp.play_fail_msg[0] = '\0';
+            if (!ensure_tools_checked()) {
+                snprintf(s_bp.play_fail_msg, sizeof s_bp.play_fail_msg,
+                         "%s",
+                         jce_editor_i18n("buildProfiles.tools.missing"));
+                s_bp.play_stage = decltype(s_bp)::PLAY_FAILED;
+            } else {
             /* Choose project root: explicit override > current project. */
             const JceProject *jp_local = jce_editor_project_get();
             const char *root = s_bp.project_root[0]
@@ -1108,13 +1119,14 @@ static void draw_profiles_tab(void)
                     s_bp.play_stage = decltype(s_bp)::PLAY_COOKING;
                 } else {
                     snprintf(s_bp.play_fail_msg, sizeof s_bp.play_fail_msg,
-                             "Failed to start cook");
+                             "%s", jce_editor_i18n("buildProfiles.play.cookStartFailed"));
                     s_bp.play_stage = decltype(s_bp)::PLAY_FAILED;
                 }
             } else {
                 /* Skip cook stage — straight to build. */
                 start_build_via_script();
                 s_bp.play_stage = decltype(s_bp)::PLAY_BUILDING;
+            }
             }
         }
         if (play_disabled) ImGui::EndDisabled();
@@ -1140,8 +1152,10 @@ static void draw_profiles_tab(void)
                                s_bp.play_fail_msg);
 
         if (script_disabled) ImGui::BeginDisabled();
-        if (ImGui::Button(jce_editor_i18n("buildProfiles.buildNow")))
-            start_build_via_script();
+        if (ImGui::Button(jce_editor_i18n("buildProfiles.buildNow"))) {
+            if (ensure_tools_checked())
+                start_build_via_script();
+        }
         if (script_disabled) ImGui::EndDisabled();
         if (script_disabled && ImGui::IsItemHovered()) {
             ImGui::SetTooltip("%s",
@@ -1168,13 +1182,22 @@ static void draw_profiles_tab(void)
             const char *root = s_bp.project_root[0]
                                    ? s_bp.project_root
                                    : (jp_pack ? jp_pack->project_root : "");
-            const bool can_pack = (root && *root) && !running;
+            const bool can_pack = (root && *root) && !running &&
+                                  (!s_bp.tools_probed ||
+                                   (s_bp.tools.cmake_ok &&
+                                    s_bp.tools.ninja_ok &&
+                                    s_bp.tools.conan_ok));
             if (!can_pack) ImGui::BeginDisabled();
             if (ImGui::Button(jce_editor_i18n("buildProfiles.pack"))) {
                 /* Native package staging: build + verify + copy exe and
                  * cooked assets into build/<plat>-<arch>/dist/<package>.
                  * Replaces scripts/package-game.bat so the editor ships
                  * without first-party scripts. */
+                if (!ensure_tools_checked()) {
+                    jce_editor_console_log_level(JCE_CONSOLE_ERROR,
+                        "[pack] %s",
+                        jce_editor_i18n("buildProfiles.tools.missing"));
+                } else {
                 const JceProject *jpk = jp_pack;
                 const char *sdk = resolve_project_sdk(jpk);
                 if (!sdk || !sdk[0]) {
@@ -1248,6 +1271,7 @@ static void draw_profiles_tab(void)
                         jce_editor_console_log_level(JCE_CONSOLE_ERROR,
                             "[pack] failed to start native package");
                     }
+                }
                 }
             }
             if (!can_pack) ImGui::EndDisabled();

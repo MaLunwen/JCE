@@ -26,6 +26,7 @@
 #define JCE_SAVE_PROVIDERS_H
 
 #include <jce/middleware/save/jce_snapshot.h>
+#include <jce/middleware/save/jce_save_migration.h>
 #include <jce/os/core/jce_defs.h>
 #include <stdbool.h>
 
@@ -44,6 +45,27 @@ typedef struct JceScene JceScene;
  */
 JCE_API bool jce_save_register_scene_provider(JceSnapshotRegistry *reg,
                                               JceScene            *scene);
+
+/*
+ * Same as above but wires a migration registry the scene read path consults
+ * to upgrade older saves to the current "scene_ecs" schema before loading
+ * them.  Pass the registry you populated with jce_save_migration_register()
+ * for section id "scene_ecs".  `migrations` may be NULL (then an older save
+ * with no built-in path is refused, as before).  Re-registering (e.g. on a
+ * scene reload) re-points the existing provider context in place without
+ * leaking.  `scene` and `migrations` must outlive any save/load on `reg`.
+ */
+JCE_API bool jce_save_register_scene_provider_ex(JceSnapshotRegistry      *reg,
+                                                 JceScene                 *scene,
+                                                 JceSaveMigrationRegistry *migrations);
+
+/*
+ * Remove the "scene_ecs" provider from `reg` and free the heap context the
+ * register helpers allocated for it.  Call before destroying `reg` when you
+ * used the register helpers (jce_snapshot_registry_destroy alone does not
+ * know about the provider context).  No-op on NULL.
+ */
+JCE_API void jce_save_unregister_scene_provider(JceSnapshotRegistry *reg);
 
 JCE_EXTERN_C_END
 #endif /* JCE_SAVE_PROVIDERS_H */

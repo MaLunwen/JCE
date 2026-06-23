@@ -91,6 +91,21 @@ JCE_API int   jce_terrain_chunk_count_z(const JceTerrain *t);
 JCE_API const float    *jce_terrain_heights(const JceTerrain *t);
 JCE_API const uint32_t *jce_terrain_splat  (const JceTerrain *t);
 
+/* -- Physics collision mesh ------------------------------------- */
+
+/* Allocate a triangle-soup collision mesh from the height grid (vertex
+ * Y = grid * max_height, matching the renderer; X/Z span [0, world_size]).
+ * On success writes heap arrays the caller frees with jce_free:
+ *   *out_verts   : xyz triplets, *out_vcount points  (vcount = W*H)
+ *   *out_indices : 3 per triangle, *out_icount       (icount = (W-1)*(H-1)*6)
+ * Returns false (allocating nothing) for a degenerate terrain or OOM.
+ * Used by the runtime to spawn a static terrain collider. */
+JCE_API bool jce_terrain_build_collision_mesh(const JceTerrain *t,
+                                              float    **out_verts,
+                                              uint32_t  *out_vcount,
+                                              uint32_t **out_indices,
+                                              uint32_t  *out_icount);
+
 /* -- Sampling --------------------------------------------------- */
 
 /* Bilinearly samples the heightmap at world XZ; returns 0 outside. */
@@ -142,6 +157,49 @@ void jce_terrain_splat_paint(JceTerrain *t, int layer,
                              float wx, float wz,
                              float radius_world, float strength,
                              float dt);
+
+/* -- Heightmap image import / export --------------------------- */
+
+/* Import a 16-bit grayscale heightmap from an in-memory buffer into the
+ * terrain's normalized height grid.  Each source sample is mapped
+ * grid = src/65535.0 (so 0 -> base_y, 65535 -> base_y + max_height).
+ *
+ * If (src_w, src_h) differ from the terrain grid (W, H) the source is
+ * resampled with bilinear interpolation; matching dims copy 1:1.  The
+ * splat map is left untouched.
+ *
+ * Returns false (leaving the grid unchanged) for a NULL/degenerate
+ * terrain, a NULL source, or non-positive source dimensions. */
+JCE_API bool JCE_CALL jce_terrain_import_heightmap_r16(JceTerrain *t,
+                                                       const uint16_t *src,
+                                                       int src_w, int src_h);
+
+/* Export the normalized height grid back to a caller-allocated 16-bit
+ * grayscale buffer of exactly width*height samples (row-major, matching
+ * jce_terrain_width / jce_terrain_height).  Each sample is the height
+ * grid quantized to 0..65535 (round-to-nearest).  Round-trips a buffer
+ * produced from jce_terrain_import_heightmap_r16 to within quantization
+ * error (+/- 1 LSB).
+ *
+ * `cap` is the destination capacity in uint16_t samples; it must be at
+ * least width*height.  Returns false on NULL / too-small buffer. */
+JCE_API bool JCE_CALL jce_terrain_export_heightmap_r16(const JceTerrain *t,
+                                                       uint16_t *dst,
+                                                       size_t cap);
+
+/* Import a heightmap from a host-path image file into the terrain grid.
+ * The file is decoded with stb_image (PNG / JPG / BMP / TGA / PSD / ...):
+ * 16-bit PNGs keep full precision, 8-bit sources are promoted to the
+ * 0..65535 range (sample*257).  Only the first (red/luminance) channel
+ * is read.  As a fallback, a file that stb_image cannot decode is
+ * treated as a headerless RAW grayscale heightmap whose dimensions are
+ * inferred from the byte count: width*height*2 bytes => 16-bit (R16),
+ * width*height bytes => 8-bit (R8); any other size is rejected.
+ *
+ * Resampling and the grid mapping match jce_terrain_import_heightmap_r16.
+ * Returns false on missing/undecodable file or degenerate terrain. */
+JCE_API bool JCE_CALL jce_terrain_import_heightmap_file(JceTerrain *t,
+                                                        const char *path);
 
 JCE_EXTERN_C_END
 

@@ -21,6 +21,7 @@ extern "C" {
 typedef struct JceRenderer JceRenderer;
 typedef struct JceCamera   JceCamera;
 typedef struct JcePakArchive JcePakArchive;
+typedef struct JceRuntime  JceRuntime;
 struct JceWindow;
 
 /* Set / clear the FPS-style relative-mouse capture on the editor window.
@@ -55,6 +56,14 @@ void jce_editor_game_render_push_mouse_delta(float xrel, float yrel);
  * drive yaw/pitch instead of relying on ImGui::IO::MouseDelta. */
 void jce_editor_game_render_consume_mouse_delta(float *dx, float *dy);
 
+/* Captured mouse-button state, fed by the editor event pump while the Game
+ * View holds FPS capture (when ImGui no longer receives mouse buttons).  The
+ * Game View reads this for gameplay clicks (e.g. melee on left-mouse) instead
+ * of ImGui::IsKeyDown(ImGuiKey_MouseLeft), which sticks during capture.
+ * btn: 0=left, 1=right, 2=middle, 3=x1, 4=x2. */
+void jce_editor_game_render_push_mouse_button(int btn, bool down);
+bool jce_editor_game_render_mouse_button(int btn);
+
 /* Initialise the embedded game viewport renderer.
  * Must be called AFTER jce_editor_scene_render_init() so the engine
  * scene renderer is already available. The window is used for the
@@ -73,6 +82,33 @@ void jce_editor_game_render_shutdown(void);
  * be false when the cursor is outside the Game View (no hover/click). */
 void jce_editor_game_render_set_ui_pointer(float x, float y,
                                            bool down, bool valid);
+
+/* Hand the game renderer the live Play-mode runtime (NULL to detach on stop).
+ * While set, canvas UI events drained after the overlay render are dispatched to
+ * its gameplay script VM, so in-editor Play exercises UIButton on_click / widget
+ * on_value_changed / InputField on_submit (not just visual feedback).  Called by
+ * jce_editor_play.cpp on Play start / stop. */
+void jce_editor_game_render_set_play_runtime(JceRuntime *rt);
+
+/* Forward a UTF-8 text-input chunk / an editing key into the focused ECS-UI
+ * InputField (single-line text entry).  The Game View panel sources these from
+ * ImGui's per-frame character queue + key state — its natural event source,
+ * mirroring how the pointer above is fed — only while the panel is hovered /
+ * focused in Play.  Both are fire-and-forget: a no-op when no field is focused,
+ * and they never consume events the rest of the editor needs.  OS text input
+ * is started/stopped automatically inside jce_editor_game_render_frame() as
+ * InputField focus changes. */
+void jce_editor_game_render_text_input(const char *utf8);
+void jce_editor_game_render_key_edit(int scancode, unsigned short mod);
+
+/* Forward a mouse-wheel delta into the ECS-UI ScrollView under the pointer
+ * (dy = +up, dx = +right; ImGui's io.MouseWheel / io.MouseWheelH).  The Game
+ * View panel sources these from ImGui's IO — its natural event source, the same
+ * place the pointer is fed — only while hovered in Play.  Fire-and-forget: a
+ * no-op when no scroll view is hovered, and it does NOT consume the wheel (ImGui
+ * still sees it).  Apply after the per-frame render so the canvas has resolved
+ * this frame's hovered scroll view. */
+void jce_editor_game_render_scroll(float dx, float dy);
 
 /* Render one frame at the requested viewport size. The texture handle
  * returned by jce_editor_game_render_get_texture() is updated in-place. */

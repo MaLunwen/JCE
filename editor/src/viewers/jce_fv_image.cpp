@@ -11,6 +11,7 @@
 
 #include "jce_fv_common.h"
 #include "ui/jce_theme_palette.h"
+#include "core/jce_editor_config.h"
 
 /* ══════════════════════════════════════════════════════════════════════
  *  RENDER
@@ -20,8 +21,14 @@ void fv_render_image(FvTab *tab)
 {
     /* ── Toolbar ─────────────────────────────────────────────────── */
     {
+        /* Open in the user's configured external image editor
+           (Preferences > External Tools); empty falls back to revealing the
+           file in the OS file manager. */
         if (ImGui::Button(jce_editor_i18n("viewer.openExternal"))) {
-            jce_host_reveal_path(tab->path);
+            JceEditorConfig cfg;
+            jce_editor_config_load(&cfg);
+            if (!jce_host_open_in_editor(cfg.external_image_editor, tab->path))
+                jce_host_reveal_path(tab->path);
         }
         ImGui::SameLine();
         ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,

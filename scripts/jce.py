@@ -1008,7 +1008,7 @@ def cmd_app(args) -> None:
 
 # ── Subcommand: package (stage redistributable bundles) ───────────────────
 _EDITOR_BUNDLE_README = """\
-JCE Editor bundle (win32-{arch}, {variant})
+JCE Editor bundle ({platform}-{arch}, {variant})
 =================================================
 
 Contents:
@@ -1027,6 +1027,11 @@ environment variable). Keep jce_editor.exe and sdk/ together.
 """
 
 
+def _host_exe(base: str) -> str:
+    """Executable filename for the build HOST — '.exe' only on Windows."""
+    return base + ".exe" if HOST == "windows" else base
+
+
 def cmd_package_editor(args) -> None:
     """Stage a redistributable editor bundle (exe + sdk/ + VERSION + README)
     into dist/editor/<tag>-<arch>[-dist].  Replaces package-editor.bat."""
@@ -1036,7 +1041,7 @@ def cmd_package_editor(args) -> None:
     variant = args.variant                       # release | dist
     suffix  = "-dist" if variant == "dist" else ""
     src     = preset_binary_dir(t, "dist" if variant == "dist" else "release") / variant
-    editor_exe = src / "jce_editor.exe"
+    editor_exe = src / _host_exe("jce_editor")
     sdk_dir = sdk_install_dir(t, variant)
     out = (Path(args.out).resolve() if args.out
            else ROOT / "dist" / "editor" / f"{SDK_TAG[t['host']]}-{t['arch']}{suffix}")
@@ -1069,7 +1074,8 @@ def cmd_package_editor(args) -> None:
             f"platform: {SDK_TAG[t['host']]}\narch:     {t['arch']}\n"
             f"variant:  {variant}\ncommit:   {git_short_sha()}\n", encoding="utf-8")
         (out / "README.txt").write_text(
-            _EDITOR_BUNDLE_README.format(arch=t["arch"], variant=variant), encoding="utf-8")
+            _EDITOR_BUNDLE_README.format(platform=SDK_TAG[t["host"]],
+                                         arch=t["arch"], variant=variant), encoding="utf-8")
     log(f"package editor: {out}")
 
 
@@ -1093,8 +1099,8 @@ def cmd_package_game(args) -> None:
 
     bdir   = project / "build" / f"{t['host']}-{t['arch']}-{variant}"
     config = "Debug" if variant == "debug" else "Release"
-    exe    = args.exe or manifest.get("exe") or f"{name}.exe"
-    if not exe.endswith(".exe"):
+    exe    = args.exe or manifest.get("exe") or _host_exe(name)
+    if HOST == "windows" and not exe.lower().endswith(".exe"):
         exe += ".exe"
     built = next((p for p in (bdir / exe, bdir / config / exe) if p.exists()), None)
     if not DRY_RUN and not built:
@@ -1111,13 +1117,24 @@ def cmd_package_game(args) -> None:
         shutil.copy2(built, out / built.name)
         for dll in built.parent.glob("*.dll"):
             shutil.copy2(dll, out / dll.name)
-        cooked_rel = (manifest.get("cooked_assets") or "resources/_cooked")
-        cooked_src = project / cooked_rel.replace("/", os.sep)
-        if cooked_src.is_dir():
-            shutil.copytree(cooked_src, out / cooked_rel.replace("/", os.sep),
-                            dirs_exist_ok=True)
+        # Single-exe by default: the game embeds its PAK into the executable
+        # (jce_add_pak) and the runtime mounts only that blob, so the loose
+        # cooked tree beside the exe is redundant and would leak plaintext
+        # assets.  --with-loose (or manifest "stage_loose": true) re-stages it
+        # for dev / projects that genuinely load loose assets.
+        stage_loose = bool(getattr(args, "with_loose", False)) or \
+                      bool(manifest.get("stage_loose", False))
+        if stage_loose:
+            cooked_rel = (manifest.get("cooked_assets") or "resources/_cooked")
+            cooked_src = project / cooked_rel.replace("/", os.sep)
+            if cooked_src.is_dir():
+                shutil.copytree(cooked_src, out / cooked_rel.replace("/", os.sep),
+                                dirs_exist_ok=True)
+            else:
+                log(f"WARN: cooked assets dir missing: {cooked_src} (game ships without assets)")
         else:
-            log(f"WARN: cooked assets dir missing: {cooked_src} (game ships without assets)")
+            log("single-file: loose cooked tree NOT staged (assets embedded in "
+                "exe; pass --with-loose for dev / non-embedded projects)")
         (out / "VERSION.txt").write_text(
             f"name:     {name}\nversion:  {version}\n"
             f"platform: {SDK_TAG[t['host']]}\narch:     {t['arch']}\n"
@@ -1362,6 +1379,9 @@ def build_parser() -> argparse.ArgumentParser:
     pg.add_argument("--version", help="bundle version (default: manifest 'version')")
     pg.add_argument("--out", help="override output dir")
     pg.add_argument("--clean", action="store_true")
+    pg.add_argument("--with-loose", action="store_true",
+                    help="also stage the loose cooked tree beside the exe "
+                         "(default: single-file, assets embedded in the exe)")
     pg.set_defaults(func=cmd_package_game)
 
     ps = pkg_sub.add_parser("sdk", help="build + install the SDK (alias of `sdk`)")

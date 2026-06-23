@@ -5,6 +5,8 @@
 #include "jce_panel_hierarchy_internal.h"
 #include "ui/jce_editor_dnd.h"
 
+#include <algorithm>   /* std::sort — O(n log n) root sort at full-load */
+
 extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
 }
@@ -209,15 +211,12 @@ void sort_entity_ids(uint32_t *ids, int count)
     if (!ids || count <= 1 || s_hier.sort_mode == 0)
         return;
 
-    for (int i = 1; i < count; i++) {
-        uint32_t key = ids[i];
-        int j = i - 1;
-        while (j >= 0 && compare_entities_for_sort(ids[j], key) > 0) {
-            ids[j + 1] = ids[j];
-            j--;
-        }
-        ids[j + 1] = key;
-    }
+    /* O(n log n) — was insertion sort, which is O(n^2) and blows up on the
+     * thousands of roots a full-loaded world produces.  compare_entities_for_sort
+     * is a strict-weak comparator (name/type with id tiebreak). */
+    std::sort(ids, ids + count, [](uint32_t a, uint32_t b) {
+        return compare_entities_for_sort(a, b) < 0;
+    });
 }
 
 bool entity_matches_search_recursive(uint32_t entity_id, const char *filter)
@@ -246,20 +245,83 @@ void focus_entity_in_scene(uint32_t id)
     jce_editor_layout_request_focus_inspector();
 }
 
-/* ── Entity tree node ────────────────────────────────────────────── */
+/* ── Flatten (build the clipped row list) ────────────────────────── */
 
-void draw_entity_node(uint32_t id)
+/* Is this node currently displayed expanded?  Reads ImGui's persisted
+ * per-node open state (the same bit the TreeNodeEx arrow toggles), falling
+ * back to a default of "open" while a search is active or the node lies on the
+ * reveal path — mirroring the DefaultOpen / SetNextItemOpen behaviour the row
+ * renderer applies, so the flattened structure stays in sync with what the
+ * tree nodes draw. */
+static bool hierarchy_node_is_open(uint32_t id)
+{
+    int default_open =
+        (s_hier.search_buf[0] || node_in_reveal_path(id)) ? 1 : 0;
+    ImGuiStorage *storage = ImGui::GetStateStorage();
+    ImGuiID node_imgui_id = ImGui::GetID((void *)(intptr_t)id);
+    return storage->GetInt(node_imgui_id, default_open) != 0;
+}
+
+static void hierarchy_flatten_recurse(uint32_t id, int depth)
 {
     if (id == 0 || !jce_state_entity_exists(id)) return;
 
-    if (s_hier.search_buf[0] && !entity_matches_search_recursive(id, s_hier.search_buf))
+    /* Same search filter the per-row renderer used to apply: hide a node (and
+     * its whole subtree) when neither it nor any descendant matches. */
+    if (s_hier.search_buf[0]
+        && !entity_matches_search_recursive(id, s_hier.search_buf))
         return;
 
+    /* Same tag filter: a tag-excluded node skips itself and its subtree. */
     JceTagColor tag_color = jce_state_entity_tag_color(id);
     if (s_hier.tag_filter > 0 && (int)tag_color != s_hier.tag_filter)
         return;
 
+    if (s_hier.flat_count >= HIERARCHY_MAX_DISPLAY)
+        return;
+
+    /* Record into both the flat row list and the full display order (used by
+     * shift-range select and alpha-jump — must reflect EVERY visible row, not
+     * just the clipper-visible subset). */
+    s_hier.flat[s_hier.flat_count].id    = id;
+    s_hier.flat[s_hier.flat_count].depth = depth;
+    s_hier.flat_count++;
     record_display_order(id);
+
+    int child_count = jce_state_entity_child_count(id);
+    if (child_count > 0 && hierarchy_node_is_open(id)) {
+        uint32_t child_ids[JCE_MAX_CHILDREN];
+        int n = jce_state_entity_children(id, child_ids, JCE_MAX_CHILDREN);
+        sort_entity_ids(child_ids, n);
+        for (int i = 0; i < n; i++)
+            hierarchy_flatten_recurse(child_ids[i], depth + 1);
+    }
+}
+
+void jce_hierarchy_flatten(const uint32_t *root_ids, int root_count)
+{
+    s_hier.flat_count    = 0;
+    s_hier.display_count = 0;
+    for (int i = 0; i < root_count; i++)
+        hierarchy_flatten_recurse(root_ids[i], 0);
+}
+
+/* ── Entity tree row (single, clipper-friendly) ──────────────────── */
+
+void draw_entity_row(uint32_t id, int depth)
+{
+    if (id == 0 || !jce_state_entity_exists(id)) return;
+
+    /* Search / tag filtering and display-order recording already happened in
+     * jce_hierarchy_flatten(); the row renderer just draws. */
+
+    /* Manual indent: the flatten pass owns the tree structure, so each row
+     * indents itself by depth (Indent here, matching Unindent at the tail). */
+    float indent_w = depth * ImGui::GetTreeNodeToLabelSpacing();
+    if (indent_w > 0.0f)
+        ImGui::Indent(indent_w);
+
+    JceTagColor tag_color = jce_state_entity_tag_color(id);
 
     int  child_count  = jce_state_entity_child_count(id);
     bool is_leaf      = (child_count == 0);
@@ -270,10 +332,15 @@ void draw_entity_node(uint32_t id)
     const char *name  = jce_state_entity_name(id);
     if (!name) name = "";
 
+    /* NoTreePushOnOpen on EVERY node (leaf and non-leaf): the flatten pass
+     * handles children, so TreeNodeEx must never push a tree level here.  The
+     * arrow still toggles the persisted open bit, which the next frame's
+     * flatten reads (a 1-frame expand lag is acceptable). */
     ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow |
                                 ImGuiTreeNodeFlags_SpanAvailWidth |
-                                ImGuiTreeNodeFlags_AllowOverlap;
-    if (is_leaf)     flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+                                ImGuiTreeNodeFlags_AllowOverlap |
+                                ImGuiTreeNodeFlags_NoTreePushOnOpen;
+    if (is_leaf)     flags |= ImGuiTreeNodeFlags_Leaf;
     if (is_selected) flags |= ImGuiTreeNodeFlags_Selected;
     if (s_hier.search_buf[0]) flags |= ImGuiTreeNodeFlags_DefaultOpen;
 
@@ -307,8 +374,11 @@ void draw_entity_node(uint32_t id)
 
     if (is_prefab)
         ImGui::PushStyleColor(ImGuiCol_Text, JCE_COLOR_HIER_PREFAB);
-    bool node_open = ImGui::TreeNodeEx((void *)(intptr_t)id, flags,
-                                        "%s", is_renaming ? "" : name);
+    /* With NoTreePushOnOpen the return value (open?) is unused — the flatten
+     * pass reads the persisted open bit directly, and there is no tree level
+     * to pop.  The call still draws the arrow + toggles that bit. */
+    ImGui::TreeNodeEx((void *)(intptr_t)id, flags,
+                      "%s", is_renaming ? "" : name);
     if (is_prefab)
         ImGui::PopStyleColor();
 
@@ -572,13 +642,8 @@ void draw_entity_node(uint32_t id)
     if (!enabled)
         ImGui::PopStyleVar();
 
-    if (node_open && !is_leaf) {
-        uint32_t child_ids[JCE_MAX_CHILDREN];
-        int n = jce_state_entity_children(id, child_ids, JCE_MAX_CHILDREN);
-        sort_entity_ids(child_ids, n);
-
-        for (int i = 0; i < n; i++)
-            draw_entity_node(child_ids[i]);
-        ImGui::TreePop();
-    }
+    /* Match the manual indent applied at the top.  Children are emitted as
+     * their own flattened rows (with their own depth), not recursed here. */
+    if (indent_w > 0.0f)
+        ImGui::Unindent(indent_w);
 }

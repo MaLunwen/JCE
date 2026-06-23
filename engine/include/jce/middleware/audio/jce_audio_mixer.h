@@ -85,6 +85,170 @@ JCE_API uint32_t       jce_audio_mixer_list_buses(const JceAudioMixer *m,
 JCE_API const char    *jce_audio_mixer_get_name(const JceAudioMixer *m, JceAudioBusId bus);
 JCE_API JceAudioBusId  jce_audio_mixer_get_parent(const JceAudioMixer *m, JceAudioBusId bus);
 
+/* ================================================================== *
+ *  FEATURE 5.2 — aux send/return, sidechain ducking, snapshots.       *
+ * ================================================================== */
+
+/* -- Aux send / return ---------------------------------------------- *
+ *
+ * Besides the single parent edge (which carries the whole bus signal up the
+ * tree), a bus may have any number of *aux sends*: a parallel tap that routes
+ * a configurable fraction of its post-fader signal into another bus (typically
+ * a dedicated "return" bus that hosts a reverb/delay insert chain).  This is
+ * the classic console send/return wiring — e.g. SFX and Music each send 30 %
+ * and 10 % into a shared "Reverb" return.
+ *
+ * The send is multiplicative: the signal arriving at the destination is the
+ * *resolved* (mute/solo/ancestor-folded) volume of the source bus times the
+ * send fraction.  jce_audio_mixer_resolve_send() returns exactly that scalar,
+ * so a host/node-graph multiplies it onto a parallel copy of the source. */
+
+/* Maximum aux sends a single bus may originate. */
+#define JCE_AUDIO_MAX_SENDS 8
+
+/* Create or update an aux send from `src` to `dest` carrying `amount`
+ * (0..1, clamped) of the source's post-fader signal.  Setting `amount` to 0
+ * leaves the send registered but silent; use remove_send to drop it.  A bus
+ * may not send to itself.  Returns true on success. */
+JCE_API bool           jce_audio_mixer_set_send(JceAudioMixer *m,
+                                                JceAudioBusId  src,
+                                                JceAudioBusId  dest,
+                                                float          amount);
+/* Current send amount from `src` to `dest` (0 if no such send). */
+JCE_API float          jce_audio_mixer_get_send(const JceAudioMixer *m,
+                                                JceAudioBusId src, JceAudioBusId dest);
+/* Drop the send from `src` to `dest`.  Returns true if one existed. */
+JCE_API bool           jce_audio_mixer_remove_send(JceAudioMixer *m,
+                                                   JceAudioBusId src, JceAudioBusId dest);
+/* Number of aux sends originating from `src`. */
+JCE_API uint32_t       jce_audio_mixer_send_count(const JceAudioMixer *m, JceAudioBusId src);
+
+/* Effective gain delivered from `src` into `dest` along the aux send:
+ *   resolve_volume(src) * send_amount.
+ * Returns 0 if there is no send or either bus is muted/solo-suppressed. */
+JCE_API float          jce_audio_mixer_resolve_send(const JceAudioMixer *m,
+                                                    JceAudioBusId src, JceAudioBusId dest);
+
+/* -- Sidechain ducking ---------------------------------------------- *
+ *
+ * A *sidechain* makes one bus (the "target", e.g. Music) automatically duck
+ * when another bus (the "key", e.g. Voice/Dialogue) is loud.  An envelope
+ * follower tracks the key's level; a downward compressor curve converts that
+ * to a gain-reduction multiplier applied on top of the target's resolved
+ * volume.  This is the standard "music ducks under dialogue" effect.
+ *
+ * The follower is advanced deterministically by the host/audio thread by
+ * feeding it the key bus's current peak level once per processing block via
+ * jce_audio_mixer_duck_advance(); the resulting reduction is then read back
+ * with jce_audio_mixer_duck_gain() (or folded into resolve_volume_ducked()).
+ * The exact same envelope+curve math runs in the live miniaudio node, so it
+ * can be driven offline over a synthetic key envelope in a unit test. */
+
+typedef struct {
+    JceAudioBusId key;          /* bus whose level drives the duck            */
+    float threshold_db;         /* key level above which ducking starts       */
+    float ratio;                /* >1 : amount of reduction per dB over thr.  */
+    float attack_ms;            /* how fast the duck clamps down              */
+    float release_ms;           /* how fast it recovers                       */
+    float max_attenuation_db;   /* floor on reduction (e.g. -24 dB), <=0      */
+} JceAudioDuckParams;
+
+/* Sensible defaults: -30 dB threshold, 8:1, 10 ms attack, 250 ms release,
+ * -24 dB max attenuation; key = INVALID (caller fills it in). */
+JCE_API JceAudioDuckParams jce_audio_duck_default_params(void);
+
+/* Install / replace the sidechain on `target` driven by `params.key`.
+ * `sample_rate` sizes the attack/release coefficients for the block rate used
+ * with duck_advance (pass the audio device rate, e.g. 48000).  Passing a NULL
+ * or key==INVALID params clears the sidechain.  Returns true on success. */
+JCE_API bool           jce_audio_mixer_set_sidechain(JceAudioMixer *m,
+                                                     JceAudioBusId target,
+                                                     const JceAudioDuckParams *params,
+                                                     uint32_t sample_rate);
+/* Remove the sidechain on `target`.  Returns true if one existed. */
+JCE_API bool           jce_audio_mixer_clear_sidechain(JceAudioMixer *m, JceAudioBusId target);
+/* True if `target` has a sidechain installed. */
+JCE_API bool           jce_audio_mixer_has_sidechain(const JceAudioMixer *m, JceAudioBusId target);
+/* Read back the duck params currently installed on `target` into `*out`.
+ * Returns true if `target` has a sidechain (out filled), false otherwise
+ * (out left untouched).  Lets a tool/editor serialize the sidechain config. */
+JCE_API bool           jce_audio_mixer_get_sidechain(const JceAudioMixer *m,
+                                                     JceAudioBusId target,
+                                                     JceAudioDuckParams *out);
+
+/* Advance every installed sidechain by one block of `frames` samples,
+ * pulling each key bus's peak level via `key_peak(key_bus, user)` (linear
+ * 0..1).  This evolves the envelope follower deterministically: rising key
+ * level pulls the duck gain down (toward max_attenuation), falling key level
+ * lets it recover toward unity.  `frames` is the block length the coefficients
+ * were sized against (typically one mix callback). */
+typedef float (*JceAudioKeyPeakFn)(JceAudioBusId key_bus, void *user);
+JCE_API void           jce_audio_mixer_duck_advance(JceAudioMixer *m,
+                                                    uint32_t frames,
+                                                    JceAudioKeyPeakFn key_peak,
+                                                    void *user);
+
+/* Current duck gain multiplier (0..1) on `target` from its sidechain
+ * (1.0 = no ducking / no sidechain). */
+JCE_API float          jce_audio_mixer_duck_gain(const JceAudioMixer *m, JceAudioBusId target);
+
+/* resolve_volume(target) with the sidechain duck gain folded in. */
+JCE_API float          jce_audio_mixer_resolve_volume_ducked(const JceAudioMixer *m,
+                                                             JceAudioBusId target);
+
+/* -- Mixer snapshots ------------------------------------------------ *
+ *
+ * A *snapshot* captures a named set of per-bus volumes (e.g. "Combat",
+ * "Stealth", "Paused").  Applying a snapshot with a fade time crossfades the
+ * live bus volumes from their current values to the snapshot's target over
+ * `fade_seconds`, linearly per bus.  The crossfade is advanced by the host
+ * once per frame via jce_audio_mixer_update(dt); a fade of 0 snaps instantly. */
+
+#define JCE_AUDIO_MAX_SNAPSHOTS   16
+#define JCE_AUDIO_SNAPSHOT_NAME   32
+
+/* Create (or replace) a snapshot named `name` capturing the *current* volume
+ * of every live bus.  Returns true on success (false if the table is full). */
+JCE_API bool           jce_audio_mixer_capture_snapshot(JceAudioMixer *m, const char *name);
+/* Set the stored target volume for `bus` within snapshot `name` explicitly
+ * (creating the snapshot if needed).  Lets a game author a snapshot without
+ * first dialling the live mixer to it. */
+JCE_API bool           jce_audio_mixer_snapshot_set_volume(JceAudioMixer *m,
+                                                           const char *name,
+                                                           JceAudioBusId bus,
+                                                           float volume);
+/* Read back a snapshot's stored target volume for `bus` (NaN-free; returns a
+ * negative value if the snapshot or bus entry does not exist). */
+JCE_API float          jce_audio_mixer_snapshot_get_volume(const JceAudioMixer *m,
+                                                           const char *name,
+                                                           JceAudioBusId bus);
+JCE_API bool           jce_audio_mixer_remove_snapshot(JceAudioMixer *m, const char *name);
+JCE_API uint32_t       jce_audio_mixer_snapshot_count(const JceAudioMixer *m);
+/* Enumerate stored snapshots by dense index 0..snapshot_count-1, copying the
+ * snapshot's name into `out` (NUL-terminated, truncated to `cap`).  Returns
+ * true if `index` named a live snapshot.  The order is stable for a given
+ * mixer state but is not otherwise guaranteed; iterate by count.  Lets a
+ * tool/editor enumerate snapshot names for serialization. */
+JCE_API bool           jce_audio_mixer_snapshot_name(const JceAudioMixer *m,
+                                                     uint32_t index,
+                                                     char *out, uint32_t cap);
+
+/* Begin crossfading the live bus volumes toward snapshot `name` over
+ * `fade_seconds` (0 = snap instantly).  Returns false if the snapshot is
+ * unknown.  The fade is driven by jce_audio_mixer_update(). */
+JCE_API bool           jce_audio_mixer_apply_snapshot(JceAudioMixer *m,
+                                                      const char *name,
+                                                      float fade_seconds);
+/* True while a snapshot crossfade is in progress. */
+JCE_API bool           jce_audio_mixer_snapshot_fading(const JceAudioMixer *m);
+/* 0..1 progress of the active crossfade (1.0 when none / finished). */
+JCE_API float          jce_audio_mixer_snapshot_progress(const JceAudioMixer *m);
+
+/* Advance any in-flight snapshot crossfade by `dt` seconds, writing the
+ * interpolated volumes into the live buses.  When the fade completes the live
+ * volumes equal the target snapshot exactly.  Safe to call every frame. */
+JCE_API void           jce_audio_mixer_update(JceAudioMixer *m, float dt_seconds);
+
 #ifdef __cplusplus
 }
 #endif

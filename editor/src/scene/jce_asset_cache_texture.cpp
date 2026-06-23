@@ -70,6 +70,26 @@ void clear_texture_cache(void)
 
 /* ── Texture RGBA decoding ──────────────────────────────────────── */
 
+/* Decode the base mip of a cooked .jceasset texture to RGBA8 via the engine
+ * (block-compressed data is CPU-decoded there).  The runtime uploads cooked
+ * block data straight to the GPU, but this editor cache is RGBA8-based, so
+ * when previewing a scene loaded from a bundle/PAK we decode here.  Returns
+ * false for non-cooked / malformed input so the caller falls back to raw. */
+static bool decode_cooked_texture_rgba(const void *buf, size_t size,
+                                       std::vector<uint8_t> *out_rgba,
+                                       uint32_t *out_w, uint32_t *out_h)
+{
+    uint8_t *rgba = nullptr;
+    uint32_t w = 0, h = 0;
+    if (!jce_texture_decode_cooked_rgba8(buf, size, &rgba, &w, &h) || !rgba)
+        return false;
+    out_rgba->assign(rgba, rgba + (size_t)w * (size_t)h * 4u);
+    jce_free(rgba);
+    *out_w = w;
+    *out_h = h;
+    return true;
+}
+
 bool decode_texture_rgba_path(const char *path,
                               std::vector<uint8_t> *out_rgba,
                               uint32_t *out_w,
@@ -85,6 +105,16 @@ bool decode_texture_rgba_path(const char *path,
     size_t img_size = 0;
     void *img_buf = ed_read_file(path, &img_size);
     if (!img_buf) return false;
+
+    /* Cooked .jceasset (e.g. a bundle/PAK preview): the engine CPU-decodes
+     * the block data.  Raw PNG/JPG returns false there and falls through to
+     * jce_image_decode below. */
+    if (decode_cooked_texture_rgba(img_buf, img_size, out_rgba, out_w, out_h)) {
+        ED_FREE(img_buf);
+        LOG_DEBUG(LOG_TAG, "decoded cooked texture: %s (%ux%u)",
+                  path, *out_w, *out_h);
+        return true;
+    }
 
     JceImage img;
     bool ok = jce_image_decode(img_buf, img_size, &img);

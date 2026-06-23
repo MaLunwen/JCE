@@ -248,9 +248,13 @@ const std::vector<Seg> *get_or_build(const JceCompoundColliderComponent *cc,
         cfg.split         = (JceColliderSplitMode)cc->split;
         cfg.is_static     = cc->is_static;
         cfg.detect_naming = cc->detect_naming;
-        cfg.vhacd_resolution         = cc->vhacd_resolution;
-        cfg.vhacd_max_hulls          = cc->vhacd_max_hulls;
-        cfg.vhacd_max_verts_per_hull = cc->vhacd_max_verts_per_hull;
+        /* 0 means "use the cook default" — only override when authored non-zero,
+         * matching the runtime spawn (jce_runtime.c).  Without this guard a
+         * convex-decomposition (V-HACD) compound authored with 0 params cooked
+         * to nothing in the overlay while the runtime cooked it fine. */
+        if (cc->vhacd_resolution)         cfg.vhacd_resolution = cc->vhacd_resolution;
+        if (cc->vhacd_max_hulls)          cfg.vhacd_max_hulls = cc->vhacd_max_hulls;
+        if (cc->vhacd_max_verts_per_hull) cfg.vhacd_max_verts_per_hull = cc->vhacd_max_verts_per_hull;
 
         JceCookedCollider cooked;
         memset(&cooked, 0, sizeof(cooked));

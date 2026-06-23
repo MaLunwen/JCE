@@ -3,9 +3,11 @@
  */
 
 #include <jce/middleware/scene/jce_scene.h>
+#include <stdio.h>   /* snprintf (entity-name uniquify) */
 #include <jce/middleware/physics/jce_cloth.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
+#include "jce_component_registry_internal.h"
 #include "os/core/jce_memory.h"
 
 #include <flecs.h>
@@ -33,10 +35,15 @@ void jce_scene_particles_shutdown(JceScene *s);
 
 /* Internal: per-entity bitmask of DISABLED components (Unity-style enable
  * toggle). One JCE_COMP_FLAG_* bit each. Absent component ⇒ all enabled. */
-typedef struct { uint64_t disabled; } JceCompEnableState;
+/* Per-entity per-component DISABLED bits, keyed by dense comp_id from
+ * the component registry (jce_component_registry.h) — NOT by the legacy
+ * 64-bit JCE_COMP_FLAG_* space, which is full.  4×64 words cover
+ * JCE_COMP_MAX rows.  Absent component == everything enabled. */
+typedef struct { uint64_t disabled[4]; } JceCompEnableState;
 
 static ECS_COMPONENT_DECLARE(JceCompEnableState);
 static ECS_COMPONENT_DECLARE(JceTransform);
+static ECS_COMPONENT_DECLARE(JcePivotComponent);
 static ECS_COMPONENT_DECLARE(JceMeshRenderer);
 static ECS_COMPONENT_DECLARE(JceCameraComponent);
 static ECS_COMPONENT_DECLARE(JceDirectionalLight);
@@ -57,10 +64,14 @@ static ECS_COMPONENT_DECLARE(JceBoxColliderComponent);
 static ECS_COMPONENT_DECLARE(JceSphereColliderComponent);
 static ECS_COMPONENT_DECLARE(JceCharacterControllerComponent);
 static ECS_COMPONENT_DECLARE(JceAudioSourceComponent);
+static ECS_COMPONENT_DECLARE(JceMusicTrackComponent);
 static ECS_COMPONENT_DECLARE(JceVideoPlayerComponent);
 static ECS_COMPONENT_DECLARE(JceScriptComponent);
 static ECS_COMPONENT_DECLARE(JceEditorMeta);
 static ECS_COMPONENT_DECLARE(JceTerrainComponent);
+static ECS_COMPONENT_DECLARE(JceVegetationScatterComponent);
+static ECS_COMPONENT_DECLARE(JceWaterComponent);
+static ECS_COMPONENT_DECLARE(JceBuoyancyComponent);
 static ECS_COMPONENT_DECLARE(JceLodGroupComponent);
 static ECS_COMPONENT_DECLARE(JceVirtualCameraComponent);
 static ECS_COMPONENT_DECLARE(JceTriggerVolumeComponent);
@@ -90,6 +101,12 @@ static ECS_COMPONENT_DECLARE(JceLayoutGroupComponent);
 static ECS_COMPONENT_DECLARE(JceUIImageComponent);
 static ECS_COMPONENT_DECLARE(JceUITextComponent);
 static ECS_COMPONENT_DECLARE(JceUIButtonComponent);
+static ECS_COMPONENT_DECLARE(JceUISliderComponent);
+static ECS_COMPONENT_DECLARE(JceUIToggleComponent);
+static ECS_COMPONENT_DECLARE(JceUIInputFieldComponent);
+static ECS_COMPONENT_DECLARE(JceUIScrollViewComponent);
+static ECS_COMPONENT_DECLARE(JceUIProgressBarComponent);
+static ECS_COMPONENT_DECLARE(JceUIDropdownComponent);
 static ECS_COMPONENT_DECLARE(JceNetworkObjectComponent);
 static ECS_COMPONENT_DECLARE(JceClothComponent);
 static ECS_COMPONENT_DECLARE(JceNetTransformComponent);
@@ -105,7 +122,18 @@ static ECS_COMPONENT_DECLARE(JceVolumeComponent);
 static ECS_COMPONENT_DECLARE(JceOcclusionPortalComponent);
 static ECS_COMPONENT_DECLARE(JceNavAgentComponent);
 static ECS_COMPONENT_DECLARE(JceIkConstraintComponent);
+static ECS_COMPONENT_DECLARE(JceFootIkComponent);
+static ECS_COMPONENT_DECLARE(JceFullBodyIkComponent);
 static ECS_COMPONENT_DECLARE(JceSequencePlayerComponent);
+static ECS_COMPONENT_DECLARE(JceMorphWeightsComponent);
+static ECS_COMPONENT_DECLARE(JceNetworkVariableComponent);
+static ECS_COMPONENT_DECLARE(JceGameplayAbilitySystemComponent);
+static ECS_COMPONENT_DECLARE(JceRagdollComponent);
+static ECS_COMPONENT_DECLARE(JceRagdollPoseRelay);
+static ECS_COMPONENT_DECLARE(JceAnimCmdRelay);
+static ECS_COMPONENT_DECLARE(JceFractureComponent);
+static ECS_COMPONENT_DECLARE(JceVehicleComponent);
+static ECS_COMPONENT_DECLARE(JceSoftBodyComponent);
 
 /* ── Internal world-matrix cache (side table) ──────────────────────────
  *
@@ -234,6 +262,14 @@ static void scene_rendering_settings_sanitize(JceSceneRenderingSettings *r)
         r->weather_intensity = 0.0f;
     if (r->weather_intensity > 1.0f)
         r->weather_intensity = 1.0f;
+
+    /* Sky clamps (analytic Preetham). */
+    if (r->sky_mode < 0 || r->sky_mode > 2)
+        r->sky_mode = 0;
+    if (r->sky_turbidity < 1.0f)
+        r->sky_turbidity = 1.0f;
+    if (r->sky_turbidity > 10.0f)
+        r->sky_turbidity = 10.0f;
 }
 
 JceSceneRenderingSettings jce_scene_rendering_settings_default(void)
@@ -284,6 +320,23 @@ JceSceneRenderingSettings jce_scene_rendering_settings_default(void)
     /* Weather (clear by default → overlay is a no-op). */
     r.weather_type      = 0;     /* JCE_WEATHER_CLEAR */
     r.weather_intensity = 0.0f;
+
+    /* Sky (gradient by default → existing sky path unchanged). */
+    r.sky_mode      = JCE_SCENE_SKY_GRADIENT;
+    r.sky_turbidity = 2.5f;      /* clear temperate day (Preetham default) */
+
+    /* Floating origin (off by default → runtime never rebases → byte-id). */
+    r.floating_origin_enabled   = false;
+    r.floating_origin_threshold = 4096.0f;
+
+    /* SSAO (off by default → no depth pre-pass / SSAO pass → byte-identical). */
+    r.ssao_enabled   = false;
+    r.ssao_intensity = 1.5f;
+    r.ssao_radius    = 1.0f;
+    /* SSR (off by default → byte-identical). */
+    r.ssr_enabled      = false;
+    r.ssr_intensity    = 0.6f;
+    r.ssr_max_distance = 8.0f;
     return r;
 }
 
@@ -427,6 +480,11 @@ JceScene *jce_scene_create(void)
     JceScene *s = (JceScene *)JCE_CALLOC(1, sizeof(*s));
     if (!s) return NULL;
 
+    /* Populate the dense component-type registry exactly once per
+     * process (idempotent) — serializer, editor surfaces and the
+     * id-based enable state all key off it. */
+    jce_scene_components_register_all();
+
     s->world = ecs_init();
     if (!s->world) {
         JCE_FREE(s);
@@ -441,6 +499,7 @@ JceScene *jce_scene_create(void)
     /* Register components. */
     ECS_COMPONENT_DEFINE(s->world, JceCompEnableState);
     ECS_COMPONENT_DEFINE(s->world, JceTransform);
+    ECS_COMPONENT_DEFINE(s->world, JcePivotComponent);
     ECS_COMPONENT_DEFINE(s->world, JceMeshRenderer);
     ECS_COMPONENT_DEFINE(s->world, JceCameraComponent);
     ECS_COMPONENT_DEFINE(s->world, JceDirectionalLight);
@@ -461,10 +520,14 @@ JceScene *jce_scene_create(void)
     ECS_COMPONENT_DEFINE(s->world, JceSphereColliderComponent);
     ECS_COMPONENT_DEFINE(s->world, JceCharacterControllerComponent);
     ECS_COMPONENT_DEFINE(s->world, JceAudioSourceComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceMusicTrackComponent);
     ECS_COMPONENT_DEFINE(s->world, JceVideoPlayerComponent);
     ECS_COMPONENT_DEFINE(s->world, JceScriptComponent);
     ECS_COMPONENT_DEFINE(s->world, JceEditorMeta);
     ECS_COMPONENT_DEFINE(s->world, JceTerrainComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceVegetationScatterComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceWaterComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceBuoyancyComponent);
     ECS_COMPONENT_DEFINE(s->world, JceLodGroupComponent);
     ECS_COMPONENT_DEFINE(s->world, JceVirtualCameraComponent);
     ECS_COMPONENT_DEFINE(s->world, JceTriggerVolumeComponent);
@@ -494,6 +557,12 @@ JceScene *jce_scene_create(void)
     ECS_COMPONENT_DEFINE(s->world, JceUIImageComponent);
     ECS_COMPONENT_DEFINE(s->world, JceUITextComponent);
     ECS_COMPONENT_DEFINE(s->world, JceUIButtonComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceUISliderComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceUIToggleComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceUIInputFieldComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceUIScrollViewComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceUIProgressBarComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceUIDropdownComponent);
     ECS_COMPONENT_DEFINE(s->world, JceNetworkObjectComponent);
     ECS_COMPONENT_DEFINE(s->world, JceClothComponent);
     ECS_COMPONENT_DEFINE(s->world, JceNetTransformComponent);
@@ -509,7 +578,21 @@ JceScene *jce_scene_create(void)
     ECS_COMPONENT_DEFINE(s->world, JceOcclusionPortalComponent);
     ECS_COMPONENT_DEFINE(s->world, JceNavAgentComponent);
     ECS_COMPONENT_DEFINE(s->world, JceIkConstraintComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceFootIkComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceFullBodyIkComponent);
     ECS_COMPONENT_DEFINE(s->world, JceSequencePlayerComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceMorphWeightsComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceNetworkVariableComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceGameplayAbilitySystemComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceRagdollComponent);
+    /* Ragdoll pose relay: TRANSIENT runtime pose hand-off (runtime writes,
+     * renderer reads).  Registered so it can be attached at Play, but it is
+     * explicitly NOT serialized (it is rebuilt every physics step). */
+    ECS_COMPONENT_DEFINE(s->world, JceRagdollPoseRelay);
+    ECS_COMPONENT_DEFINE(s->world, JceAnimCmdRelay);   /* script->renderer anim relay (transient) */
+    ECS_COMPONENT_DEFINE(s->world, JceFractureComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceVehicleComponent);
+    ECS_COMPONENT_DEFINE(s->world, JceSoftBodyComponent);
 
     /* VideoPlayer owns a live decoder handle + a GPU texture; install
      * lifecycle hooks so those resources follow correct ownership across
@@ -620,8 +703,20 @@ JceEntity jce_scene_create_entity(JceScene *s, const char *name)
     if (!s) return JCE_ENTITY_INVALID;
 
     ecs_entity_t e = ecs_new(s->world);
-    if (name && name[0])
-        ecs_set_name(s->world, e, name);
+    if (name && name[0]) {
+        /* flecs's name index is unique per scope, so ecs_set_name on a name
+         * already taken in this (root) scope ABORTS the process.  Spawning the
+         * same prefab repeatedly collides (e.g. many "Ped" from a SpawnManager),
+         * and loading a scene with duplicate-named entities would too — so
+         * uniquify by appending the entity id when the name is already in use. */
+        if (ecs_lookup(s->world, name) != 0) {
+            char unique[256];
+            snprintf(unique, sizeof unique, "%s_%llu", name, (unsigned long long)e);
+            ecs_set_name(s->world, e, unique);
+        } else {
+            ecs_set_name(s->world, e, name);
+        }
+    }
 
     /* Default transform. */
     JceTransform t;
@@ -693,8 +788,22 @@ static jce_mat4 scene_local_matrix(JceScene *s, JceEntity e)
 {
     JceTransform *t = jce_scene_get_transform(s, e);
     if (!t) return jce_m4_identity();
-    return jce_m4_from_trs(t->position, t->rotation,
-                           jce_v3_safe_scale(t->scale));
+    jce_mat4 local = jce_m4_from_trs(t->position, t->rotation,
+                                     jce_v3_safe_scale(t->scale));
+
+    JcePivotComponent *p = jce_scene_get_pivot(s, e);
+    if (p) {   /* honour the per-component disable (only pay the lookup when a pivot exists) */
+        static int s_pivot_cid = -2;
+        if (s_pivot_cid == -2) s_pivot_cid = jce_component_find("Pivot");
+        if (s_pivot_cid >= 0 && !jce_scene_comp_enabled(s, e, s_pivot_cid)) p = NULL;
+    }
+    if (p && (p->local_position.x != 0.0f ||
+              p->local_position.y != 0.0f ||
+              p->local_position.z != 0.0f)) {
+        jce_mat4 pivot = jce_m4_translate(jce_v3_negate(p->local_position));
+        local = jce_m4_multiply(&local, &pivot);
+    }
+    return local;
 }
 
 /* ── World-matrix cache side table (open addressing, linear probe) ──── */
@@ -779,6 +888,50 @@ void jce_scene_invalidate_world_cache(JceScene *s)
     }
 }
 
+/* Floating-origin rebase: shift the LOCAL position of every ROOT entity (no
+ * parent) that has a JceTransform by `shift`, then invalidate the world cache
+ * once.  Children are parent-relative, so shifting only roots moves their whole
+ * subtrees by exactly `shift` while preserving all relative geometry — a child
+ * is never double-shifted.  An all-zero shift (or NULL scene) is a no-op and
+ * does NOT bump the world epoch, so a quiescent floating-origin pass adds zero
+ * cache churn.  Implemented with the same JceTransform query jce_scene_each_
+ * entity uses; positions are mutated in place (no add/remove of components), so
+ * iterating the live query mid-shift is table-stable. */
+static void jce_scene_apply_world_shift_impl(JceScene *s, jce_vec3 shift)
+{
+    if (!s->each_query) {
+        s->each_query = ecs_query(s->world, {
+            .terms = {{ .id = ecs_id(JceTransform) }},
+        });
+        if (!s->each_query) return;
+    }
+
+    ecs_iter_t it = ecs_query_iter(s->world, s->each_query);
+    while (ecs_query_next(&it)) {
+        JceTransform *xf = ecs_field(&it, JceTransform, 0);
+        for (int i = 0; i < it.count; i++) {
+            /* Roots only — a child's local position is parent-relative and
+             * already follows when its (shifted) parent moves. */
+            if (ecs_get_parent(s->world, it.entities[i]) != 0)
+                continue;
+            xf[i].position.x += shift.x;
+            xf[i].position.y += shift.y;
+            xf[i].position.z += shift.z;
+        }
+    }
+
+    jce_scene_invalidate_world_cache(s);
+}
+
+void jce_scene_apply_world_shift(JceScene *s, const float shift[3])
+{
+    if (!s || !shift) return;
+    jce_vec3 sh = jce_v3(shift[0], shift[1], shift[2]);
+    if (sh.x == 0.0f && sh.y == 0.0f && sh.z == 0.0f)
+        return;                          /* zero shift = no-op, no cache churn */
+    jce_scene_apply_world_shift_impl(s, sh);
+}
+
 /* Memoized world matrix for one entity within the current frame.
  *
  * world = parent_world * local. The parent's world matrix comes from the
@@ -824,6 +977,111 @@ jce_mat4 jce_scene_get_world_matrix(const JceScene *s, JceEntity e)
     return scene_world_matrix_memo(ms, e, 0);
 }
 
+static jce_vec3 scene_transform_point(const jce_mat4 *m, jce_vec3 p)
+{
+    jce_vec4 v = jce_m4_mul_v4(m, jce_v4(p.x, p.y, p.z, 1.0f));
+    if (v.w != 0.0f && v.w != 1.0f) {
+        float inv_w = 1.0f / v.w;
+        return jce_v3(v.x * inv_w, v.y * inv_w, v.z * inv_w);
+    }
+    return jce_v3(v.x, v.y, v.z);
+}
+
+static jce_vec3 scene_transform_vector(const jce_mat4 *m, jce_vec3 v)
+{
+    jce_vec4 r = jce_m4_mul_v4(m, jce_v4(v.x, v.y, v.z, 0.0f));
+    return jce_v3(r.x, r.y, r.z);
+}
+
+jce_vec3 jce_scene_get_pivot_world_position(const JceScene *s, JceEntity e)
+{
+    if (!s || e == JCE_ENTITY_INVALID)
+        return jce_v3(0.0f, 0.0f, 0.0f);
+
+    JceScene *ms = (JceScene *)s;
+    JceTransform *t = jce_scene_get_transform(ms, e);
+    if (!t)
+        return jce_v3(0.0f, 0.0f, 0.0f);
+
+    JceEntity parent = jce_scene_get_parent(s, e);
+    if (parent == JCE_ENTITY_INVALID || parent == e)
+        return t->position;
+
+    jce_mat4 parent_world = jce_scene_get_world_matrix(s, parent);
+    return scene_transform_point(&parent_world, t->position);
+}
+
+void jce_scene_set_pivot_local_position_preserve_model(
+    JceScene *s, JceEntity e, jce_vec3 local_position)
+{
+    if (!s || e == JCE_ENTITY_INVALID) return;
+
+    JceTransform *cur_t = jce_scene_get_transform(s, e);
+    if (!cur_t) return;
+
+    JceTransform next_t = *cur_t;
+    JcePivotComponent next_p;
+    JcePivotComponent *cur_p = jce_scene_get_pivot(s, e);
+    if (cur_p) {
+        next_p = *cur_p;
+    } else {
+        memset(&next_p, 0, sizeof(next_p));
+        next_p.local_rotation = jce_q_identity();
+    }
+
+    jce_vec3 delta = jce_v3_sub(local_position, next_p.local_position);
+    jce_mat4 rs = jce_m4_from_trs(jce_v3(0.0f, 0.0f, 0.0f),
+                                  next_t.rotation,
+                                  jce_v3_safe_scale(next_t.scale));
+    jce_vec3 world_delta = scene_transform_vector(&rs, delta);
+    next_t.position = jce_v3_add(next_t.position, world_delta);
+    next_p.local_position = local_position;
+
+    jce_scene_set_transform(s, e, &next_t);
+    jce_scene_set_pivot(s, e, &next_p);
+}
+
+void jce_scene_set_pivot_world_position_preserve_model(
+    JceScene *s, JceEntity e, jce_vec3 world_position)
+{
+    if (!s || e == JCE_ENTITY_INVALID) return;
+
+    JceTransform *cur_t = jce_scene_get_transform(s, e);
+    if (!cur_t) return;
+
+    jce_scene_invalidate_world_cache(s);
+    jce_mat4 old_world = jce_scene_get_world_matrix(s, e);
+    jce_mat4 inv_old_world = jce_m4_inverse(&old_world);
+    jce_vec3 new_local_pivot =
+        scene_transform_point(&inv_old_world, world_position);
+
+    jce_vec3 new_parent_space_position = world_position;
+    JceEntity parent = jce_scene_get_parent((const JceScene *)s, e);
+    if (parent != JCE_ENTITY_INVALID && parent != e) {
+        jce_mat4 parent_world =
+            jce_scene_get_world_matrix((const JceScene *)s, parent);
+        jce_mat4 inv_parent = jce_m4_inverse(&parent_world);
+        new_parent_space_position =
+            scene_transform_point(&inv_parent, world_position);
+    }
+
+    JceTransform next_t = *cur_t;
+    JcePivotComponent next_p;
+    JcePivotComponent *cur_p = jce_scene_get_pivot(s, e);
+    if (cur_p) {
+        next_p = *cur_p;
+    } else {
+        memset(&next_p, 0, sizeof(next_p));
+        next_p.local_rotation = jce_q_identity();
+    }
+
+    next_t.position = new_parent_space_position;
+    next_p.local_position = new_local_pivot;
+
+    jce_scene_set_transform(s, e, &next_t);
+    jce_scene_set_pivot(s, e, &next_p);
+}
+
 int jce_scene_get_children(const JceScene *s, JceEntity parent,
                            JceEntity *out, int max_out)
 {
@@ -853,33 +1111,92 @@ int jce_scene_get_child_count(const JceScene *s, JceEntity parent)
 
 /* ── Component setters / getters / has / remove (macro-generated) ─── */
 
+/* Resolve a generation-stripped bare index (high 32 bits zero — e.g. an id the
+ * editor truncated from uint64 JceEntity to uint32, losing the flecs
+ * generation) back to the LIVE entity with its current generation.  After a
+ * world-streamed chunk unloads and reloads, the recycled index returns with a
+ * higher generation; without this, the editor's gen-0 handle no longer matches
+ * the live entity (ecs_is_alive false) and selection/has-component fail.  Ids
+ * that already carry a generation (high bits set) pass through unchanged, so
+ * engine-internal callers are byte-identical to before. */
+static ecs_entity_t jce_scene_resolve_entity(const JceScene *s, JceEntity e)
+{
+    if (!s || e == 0) return 0;
+    if ((uint32_t)e == (ecs_entity_t)e)            /* high bits zero => bare index */
+        return ecs_get_alive(s->world, (ecs_entity_t)e);
+    return (ecs_entity_t)e;
+}
+
 #define JCE_COMP_IMPL(TYPE, NAME)                                       \
 void jce_scene_set_##NAME(JceScene *s, JceEntity e, const TYPE *v)      \
 {                                                                       \
     if (!s || !v) return;                                               \
-    ecs_set_ptr(s->world, (ecs_entity_t)e, TYPE, v);                    \
+    ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
+    if (!re) return;                                                     \
+    ecs_set_ptr(s->world, re, TYPE, v);                                 \
 }                                                                       \
                                                                         \
 TYPE *jce_scene_get_##NAME(JceScene *s, JceEntity e)                    \
 {                                                                       \
     if (!s) return NULL;                                                \
-    return (TYPE *)ecs_get_mut(s->world, (ecs_entity_t)e, TYPE);        \
+    ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
+    if (!re || !ecs_is_alive(s->world, re)) return NULL;               \
+    return (TYPE *)ecs_get_mut(s->world, re, TYPE);                    \
 }                                                                       \
                                                                         \
 bool jce_scene_has_##NAME(const JceScene *s, JceEntity e)               \
 {                                                                       \
     if (!s) return false;                                               \
-    if (!ecs_is_alive(s->world, (ecs_entity_t)e)) return false;         \
-    return ecs_has(s->world, (ecs_entity_t)e, TYPE);                    \
+    ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
+    if (!re || !ecs_is_alive(s->world, re)) return false;              \
+    return ecs_has(s->world, re, TYPE);                                \
 }                                                                       \
                                                                         \
 void jce_scene_remove_##NAME(JceScene *s, JceEntity e)                  \
 {                                                                       \
     if (!s) return;                                                     \
-    ecs_remove(s->world, (ecs_entity_t)e, TYPE);                        \
+    ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
+    if (!re) return;                                                     \
+    ecs_remove(s->world, re, TYPE);                                    \
 }
 
-JCE_COMP_IMPL(JceTransform,                   transform)
+#define JCE_COMP_IMPL_WORLD(TYPE, NAME)                                 \
+void jce_scene_set_##NAME(JceScene *s, JceEntity e, const TYPE *v)      \
+{                                                                       \
+    if (!s || !v) return;                                               \
+    ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
+    if (!re) return;                                                     \
+    ecs_set_ptr(s->world, re, TYPE, v);                                 \
+    jce_scene_invalidate_world_cache(s);                                \
+}                                                                       \
+                                                                        \
+TYPE *jce_scene_get_##NAME(JceScene *s, JceEntity e)                    \
+{                                                                       \
+    if (!s) return NULL;                                                \
+    ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
+    if (!re || !ecs_is_alive(s->world, re)) return NULL;               \
+    return (TYPE *)ecs_get_mut(s->world, re, TYPE);                    \
+}                                                                       \
+                                                                        \
+bool jce_scene_has_##NAME(const JceScene *s, JceEntity e)               \
+{                                                                       \
+    if (!s) return false;                                               \
+    ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
+    if (!re || !ecs_is_alive(s->world, re)) return false;              \
+    return ecs_has(s->world, re, TYPE);                                \
+}                                                                       \
+                                                                        \
+void jce_scene_remove_##NAME(JceScene *s, JceEntity e)                  \
+{                                                                       \
+    if (!s) return;                                                     \
+    ecs_entity_t re = jce_scene_resolve_entity(s, e);                   \
+    if (!re) return;                                                     \
+    ecs_remove(s->world, re, TYPE);                                    \
+    jce_scene_invalidate_world_cache(s);                                \
+}
+
+JCE_COMP_IMPL_WORLD(JceTransform,          transform)
+JCE_COMP_IMPL_WORLD(JcePivotComponent,     pivot)
 JCE_COMP_IMPL(JceMeshRenderer,                mesh_renderer)
 JCE_COMP_IMPL(JceCameraComponent,             camera)
 JCE_COMP_IMPL(JceDirectionalLight,            dir_light)
@@ -897,12 +1214,16 @@ JCE_COMP_IMPL(JceBoxColliderComponent,        box_collider)
 JCE_COMP_IMPL(JceSphereColliderComponent,     sphere_collider)
 JCE_COMP_IMPL(JceCharacterControllerComponent,character_controller)
 JCE_COMP_IMPL(JceAudioSourceComponent,        audio_source)
+JCE_COMP_IMPL(JceMusicTrackComponent,         music_track)
 JCE_COMP_IMPL(JceVideoPlayerComponent,        video_player)
 JCE_COMP_IMPL(JceScriptComponent,             script)
 JCE_COMP_IMPL(JceParticleEmitterComponent,    particle_emitter)
 JCE_COMP_IMPL(JceBehaviorTree,                behavior_tree)
 JCE_COMP_IMPL(JceEditorMeta,                  editor_meta)
 JCE_COMP_IMPL(JceTerrainComponent,            terrain)
+JCE_COMP_IMPL(JceVegetationScatterComponent,  vegetation_scatter)
+JCE_COMP_IMPL(JceWaterComponent,              water)
+JCE_COMP_IMPL(JceBuoyancyComponent,           buoyancy)
 JCE_COMP_IMPL(JceLodGroupComponent,           lod_group)
 JCE_COMP_IMPL(JceVirtualCameraComponent,      virtual_camera)
 JCE_COMP_IMPL(JceTriggerVolumeComponent,      trigger_volume)
@@ -932,6 +1253,12 @@ JCE_COMP_IMPL(JceLayoutGroupComponent,        layout_group)
 JCE_COMP_IMPL(JceUIImageComponent,            ui_image)
 JCE_COMP_IMPL(JceUITextComponent,             ui_text)
 JCE_COMP_IMPL(JceUIButtonComponent,           ui_button)
+JCE_COMP_IMPL(JceUISliderComponent,           ui_slider)
+JCE_COMP_IMPL(JceUIToggleComponent,           ui_toggle)
+JCE_COMP_IMPL(JceUIInputFieldComponent,       ui_input_field)
+JCE_COMP_IMPL(JceUIScrollViewComponent,       ui_scroll_view)
+JCE_COMP_IMPL(JceUIProgressBarComponent,      ui_progress_bar)
+JCE_COMP_IMPL(JceUIDropdownComponent,         ui_dropdown)
 JCE_COMP_IMPL(JceNetworkObjectComponent,      network_object)
 JCE_COMP_IMPL(JceClothComponent,              cloth)
 JCE_COMP_IMPL(JceNetTransformComponent,       net_transform)
@@ -947,46 +1274,204 @@ JCE_COMP_IMPL(JceVolumeComponent,             volume)
 JCE_COMP_IMPL(JceOcclusionPortalComponent,    occlusion_portal)
 JCE_COMP_IMPL(JceNavAgentComponent,           nav_agent)
 JCE_COMP_IMPL(JceIkConstraintComponent,       ik_constraints)
+JCE_COMP_IMPL(JceFootIkComponent,             foot_ik)
+JCE_COMP_IMPL(JceFullBodyIkComponent,         full_body_ik)
 JCE_COMP_IMPL(JceSequencePlayerComponent,     sequence_player)
+JCE_COMP_IMPL(JceMorphWeightsComponent,       morph_weights)
+JCE_COMP_IMPL(JceNetworkVariableComponent,    network_variable)
+JCE_COMP_IMPL(JceGameplayAbilitySystemComponent, gas)
+JCE_COMP_IMPL(JceRagdollComponent,            ragdoll)
+JCE_COMP_IMPL(JceFractureComponent,           fracture)
+JCE_COMP_IMPL(JceVehicleComponent,            vehicle)
+JCE_COMP_IMPL(JceSoftBodyComponent,           soft_body)
 
+#undef JCE_COMP_IMPL_WORLD
 #undef JCE_COMP_IMPL
+
+/* ── Ragdoll pose relay (TRANSIENT) — custom accessors ──────────────────
+ * Not generated by JCE_COMP_IMPL because the public getter copies the pose
+ * into a caller buffer (out-params) rather than returning the component, and
+ * the setter clamps `count` to JCE_MAX_BONES.  The relay is registered as a
+ * flecs component (set/get via ecs) but is NEVER serialized — the component
+ * JSON registry has no entry for it, so scene save/load skips it. */
+void jce_scene_set_ragdoll_pose(JceScene *s, JceEntity e,
+                                const jce_mat4 *locals, uint32_t count)
+{
+    if (!s || !locals) return;
+    if (!ecs_is_alive(s->world, (ecs_entity_t)e)) return;
+    if (count > (uint32_t)JCE_MAX_BONES) count = (uint32_t)JCE_MAX_BONES;
+
+    JceRagdollPoseRelay *r =
+        (JceRagdollPoseRelay *)ecs_get_mut(s->world, (ecs_entity_t)e,
+                                           JceRagdollPoseRelay);
+    if (!r) {
+        JceRagdollPoseRelay seed;
+        memset(&seed, 0, sizeof seed);
+        ecs_set_ptr(s->world, (ecs_entity_t)e, JceRagdollPoseRelay, &seed);
+        r = (JceRagdollPoseRelay *)ecs_get_mut(s->world, (ecs_entity_t)e,
+                                               JceRagdollPoseRelay);
+        if (!r) return;
+    }
+    if (count) memcpy(r->locals, locals, (size_t)count * sizeof(jce_mat4));
+    r->count = count;
+    r->valid = true;
+}
+
+bool jce_scene_get_ragdoll_pose(const JceScene *s, JceEntity e,
+                                jce_mat4 *out_locals, uint32_t *out_count)
+{
+    if (out_count) *out_count = 0;
+    if (!s || !out_locals) return false;
+    if (!ecs_is_alive(s->world, (ecs_entity_t)e)) return false;
+    const JceRagdollPoseRelay *r =
+        (const JceRagdollPoseRelay *)ecs_get(s->world, (ecs_entity_t)e,
+                                             JceRagdollPoseRelay);
+    if (!r || !r->valid) return false;
+    uint32_t n = r->count;
+    if (n > (uint32_t)JCE_MAX_BONES) n = (uint32_t)JCE_MAX_BONES;
+    if (n) memcpy(out_locals, r->locals, (size_t)n * sizeof(jce_mat4));
+    if (out_count) *out_count = n;
+    return true;
+}
+
+bool jce_scene_has_ragdoll_pose(const JceScene *s, JceEntity e)
+{
+    if (!s) return false;
+    if (!ecs_is_alive(s->world, (ecs_entity_t)e)) return false;
+    if (!ecs_has(s->world, (ecs_entity_t)e, JceRagdollPoseRelay)) return false;
+    const JceRagdollPoseRelay *r =
+        (const JceRagdollPoseRelay *)ecs_get(s->world, (ecs_entity_t)e,
+                                             JceRagdollPoseRelay);
+    return r && r->valid;
+}
+
+/* ── Animation SM command relay (script -> renderer, transient) ─────── */
+
+void jce_scene_anim_push_param(JceScene *s, JceEntity e,
+                               const JceAnimParamCmd *cmd)
+{
+    if (!s || !cmd) return;
+    if (!ecs_is_alive(s->world, (ecs_entity_t)e)) return;
+    JceAnimCmdRelay *r =
+        (JceAnimCmdRelay *)ecs_get_mut(s->world, (ecs_entity_t)e, JceAnimCmdRelay);
+    if (!r) {
+        JceAnimCmdRelay seed;
+        memset(&seed, 0, sizeof seed);
+        ecs_set_ptr(s->world, (ecs_entity_t)e, JceAnimCmdRelay, &seed);
+        r = (JceAnimCmdRelay *)ecs_get_mut(s->world, (ecs_entity_t)e, JceAnimCmdRelay);
+        if (!r) return;
+    }
+    if (r->count >= (uint32_t)JCE_ANIM_CMD_RELAY_MAX) return;   /* cap: drop overflow */
+    r->cmds[r->count++] = *cmd;
+}
+
+uint32_t jce_scene_anim_take_params(JceScene *s, JceEntity e,
+                                    JceAnimParamCmd *out, uint32_t max)
+{
+    if (!s) return 0;
+    if (!ecs_is_alive(s->world, (ecs_entity_t)e)) return 0;
+    if (!ecs_has(s->world, (ecs_entity_t)e, JceAnimCmdRelay)) return 0;
+    JceAnimCmdRelay *r =
+        (JceAnimCmdRelay *)ecs_get_mut(s->world, (ecs_entity_t)e, JceAnimCmdRelay);
+    if (!r || r->count == 0) return 0;
+    uint32_t n = r->count;
+    if (out && max) {
+        if (n > max) n = max;
+        memcpy(out, r->cmds, (size_t)n * sizeof(JceAnimParamCmd));
+    } else {
+        n = 0;
+    }
+    r->count = 0;   /* drain: clear after read */
+    return n;
+}
 
 /* ── Component enumeration ─────────────────────────────────────────── */
 
+/* ── Id-keyed enable state (component registry) ───────────────────── */
+
+bool jce_scene_comp_enabled(const JceScene *s, JceEntity e, int comp_id)
+{
+    if (!s || e == JCE_ENTITY_INVALID) return false;
+    if (comp_id < 0 || comp_id >= JCE_COMP_MAX) return true;
+    ecs_entity_t ent = (ecs_entity_t)e;
+    if (!ecs_is_alive(s->world, ent)) return false;
+    const JceCompEnableState *st = ecs_get(s->world, ent, JceCompEnableState);
+    if (!st) return true;   /* default enabled */
+    return (st->disabled[comp_id >> 6] & (UINT64_C(1) << (comp_id & 63))) == 0;
+}
+
+void jce_scene_set_comp_enabled(JceScene *s, JceEntity e, int comp_id,
+                                bool enabled)
+{
+    if (!s || e == JCE_ENTITY_INVALID) return;
+    if (comp_id < 0 || comp_id >= JCE_COMP_MAX) return;
+    ecs_entity_t ent = (ecs_entity_t)e;
+    if (!ecs_is_alive(s->world, ent)) return;
+
+    JceCompEnableState st = {{0}};
+    const JceCompEnableState *cur = ecs_get(s->world, ent, JceCompEnableState);
+    if (cur) st = *cur;
+
+    if (enabled)
+        st.disabled[comp_id >> 6] &= ~(UINT64_C(1) << (comp_id & 63));
+    else
+        st.disabled[comp_id >> 6] |=  (UINT64_C(1) << (comp_id & 63));
+
+    if ((st.disabled[0] | st.disabled[1] | st.disabled[2] | st.disabled[3]) == 0) {
+        if (ecs_has(s->world, ent, JceCompEnableState))
+            ecs_remove(s->world, ent, JceCompEnableState);
+        return;
+    }
+    ecs_set_ptr(s->world, ent, JceCompEnableState, &st);
+}
+
+/* ── Legacy 64-bit mask shims (flag-keyed callers keep working) ───── */
+
+/* Rebuild the legacy 64-bit DISABLED mask from the id-keyed store: only
+ * rows that carry a legacy flag can be expressed in it. */
 uint64_t jce_scene_get_disabled_components(const JceScene *s, JceEntity e)
 {
     if (!s || e == JCE_ENTITY_INVALID) return 0;
     ecs_entity_t ent = (ecs_entity_t)e;
     if (!ecs_is_alive(s->world, ent)) return 0;
     const JceCompEnableState *st = ecs_get(s->world, ent, JceCompEnableState);
-    return st ? st->disabled : 0;
+    if (!st) return 0;
+
+    uint64_t mask = 0;
+    const int n = jce_component_count();
+    for (int id = 0; id < n; id++) {
+        if ((st->disabled[id >> 6] & (UINT64_C(1) << (id & 63))) == 0) continue;
+        mask |= jce_component_legacy_flag(id);
+    }
+    return mask;
 }
 
+/* Apply a legacy mask: sets/clears the bits of every flag-carrying row.
+ * Id-keyed disabled state for post-64 components is preserved. */
 void jce_scene_set_disabled_components(JceScene *s, JceEntity e, uint64_t mask)
 {
     if (!s || e == JCE_ENTITY_INVALID) return;
-    ecs_entity_t ent = (ecs_entity_t)e;
-    if (!ecs_is_alive(s->world, ent)) return;
-    if (mask == 0) {
-        if (ecs_has(s->world, ent, JceCompEnableState))
-            ecs_remove(s->world, ent, JceCompEnableState);
-        return;
+    const int n = jce_component_count();
+    for (int id = 0; id < n; id++) {
+        uint64_t flag = jce_component_legacy_flag(id);
+        if (!flag) continue;
+        jce_scene_set_comp_enabled(s, e, id, (mask & flag) == 0);
     }
-    JceCompEnableState st = { mask };
-    ecs_set_ptr(s->world, ent, JceCompEnableState, &st);
 }
 
 bool jce_scene_component_enabled(const JceScene *s, JceEntity e, uint64_t flag)
 {
-    /* Default enabled: only an explicitly-set DISABLED bit turns it off. */
-    return (jce_scene_get_disabled_components(s, e) & flag) == 0;
+    /* Default enabled: unknown/retired flags read as enabled. */
+    int id = jce_component_from_legacy_flag(flag);
+    if (id == JCE_COMP_ID_INVALID) return true;
+    return jce_scene_comp_enabled(s, e, id);
 }
 
 void jce_scene_set_component_enabled(JceScene *s, JceEntity e, uint64_t flag, bool enabled)
 {
-    uint64_t m  = jce_scene_get_disabled_components(s, e);
-    uint64_t nm = enabled ? (m & ~flag) : (m | flag);
-    if (nm != m) jce_scene_set_disabled_components(s, e, nm);
+    int id = jce_component_from_legacy_flag(flag);
+    if (id == JCE_COMP_ID_INVALID) return;
+    jce_scene_set_comp_enabled(s, e, id, enabled);
 }
 
 uint64_t jce_scene_get_component_flags(const JceScene *s, JceEntity e)
@@ -1172,6 +1657,13 @@ void jce_scene_update(JceScene *s, float dt)
                         d.wind_velocity    = cc->wind_velocity;
                         cc->handle = (uint32_t)jce_cloth_create(&d);
                         cc->dirty  = false;
+                        /* Authoring a cloth is an explicit opt-in: force the
+                         * soft-body sim ON so the patch actually steps, mirroring
+                         * rt_try_spawn_softbody.  Without this it stays at the
+                         * render-tier default (OFF on LOW/MID) and the authored
+                         * cloth sits frozen — the reported "首次运行全部静止" bug. */
+                        if (cc->handle != 0)
+                            jce_cloth_set_simulation_enabled(true);
                     } else {
                         jce_cloth_set_wind((JceClothHandle)cc->handle,
                                            cc->wind_velocity,

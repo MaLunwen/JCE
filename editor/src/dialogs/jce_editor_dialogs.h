@@ -9,6 +9,7 @@
 #define JCE_EDITOR_DIALOGS_H
 
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -64,6 +65,28 @@ void jce_editor_dialog_preferences(bool *p_open);
    thread-safe queue populated by SDL's worker-thread folder/file picker
    callbacks and applies the results safely (no data race with ImGui). */
 void jce_editor_dialogs_pump_pending(void);
+
+/* Async host file/folder dialogs. Results are marshalled back to the main
+   thread by jce_editor_dialogs_pump_pending() before output buffers/flags are
+   written. Output buffers must remain valid until completion. */
+void pick_folder_dialog_async(const char *title,
+                              const char *default_path,
+                              char *primary_out, size_t primary_size,
+                              char *secondary_out, size_t secondary_size,
+                              bool *ready_flag,
+                              bool *cancelled_flag);
+void save_file_dialog_async(const char *title,
+                            const char *default_path,
+                            const char *filters,
+                            char *primary_out, size_t primary_size,
+                            bool *ready_flag,
+                            bool *cancelled_flag);
+void open_file_dialog_async(const char *title,
+                            const char *default_path,
+                            const char *filters,
+                            char *primary_out, size_t primary_size,
+                            bool *ready_flag,
+                            bool *cancelled_flag);
 
 #ifdef __cplusplus
 }

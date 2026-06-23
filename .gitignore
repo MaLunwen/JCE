@@ -45,6 +45,7 @@ sync_*.py
 agents.*
 tests/
 science_lab/
+street_demo/
 
 
 # Android APK build
@@ -58,3 +59,7 @@ scripts/android/app/src/main/res/*
 
 build_standalone/
 dist/
+
+# Local diagnostic captures (KPI csv/png)
+diag/
+*.log

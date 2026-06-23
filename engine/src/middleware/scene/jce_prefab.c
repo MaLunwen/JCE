@@ -36,7 +36,8 @@ bool jce_prefab_save_subtree(const JceScene *scene, JceEntity root,
     if (!json) return false;
 
     size_t len = strlen(json);
-    bool ok = jce_fs_host_write_all(path, json, len);
+    /* Atomic: a crash mid-write must never truncate or empty the prefab. */
+    bool ok = jce_fs_host_write_all_atomic(path, json, len);
     jce_json_free_string(json);
 
     if (!ok) {

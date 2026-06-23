@@ -10,10 +10,6 @@
 
 #include "ui/jce_editor_panels.h"
 
-#include <jce/tools/jce_imgui.hpp>
-
-extern "C" void jce_editor_audio_mixer_focus_reverb_tab(void);
-
 extern "C" void jce_editor_panel_reverb_zones_content(void)
 {
     bool *self = jce_editor_panel_visible_ptr(JCE_PANEL_REVERB_ZONES);
@@ -21,5 +17,5 @@ extern "C" void jce_editor_panel_reverb_zones_content(void)
     if (host) *host = true;
     if (self) *self = false;
     jce_editor_audio_mixer_focus_reverb_tab();
-    ImGui::SetWindowFocus("###audio_mixer");
+    jce_editor_panel_request_focus("###audio_mixer");
 }

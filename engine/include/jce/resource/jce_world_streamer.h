@@ -29,7 +29,7 @@
 #ifndef JCE_WORLD_STREAMER_H
 #define JCE_WORLD_STREAMER_H
 
-#include <jce/middleware/streaming/jce_streaming.h>
+#include <jce/resource/jce_streaming.h>
 #include <jce/os/core/jce_defs.h>
 #include <jce/os/core/jce_math.h>
 
@@ -111,6 +111,43 @@ JCE_API void jce_world_streamer_unregister_chunk(JceWorldStreamer *ws,
 JCE_API void jce_world_streamer_register_from_scene_settings(
     JceWorldStreamer                *ws,
     const JceSceneStreamingSettings *settings);
+
+/* ================================================================== */
+/* Entity spawn/despawn notifications (editor hierarchy integration)    */
+/* ================================================================== */
+
+/* Invoked on the main thread when the streamer spawns the entities of a
+ * freshly-loaded chunk (on_spawn) and just BEFORE it destroys a chunk's
+ * entities on unload (on_despawn), so the entity ids are still valid in the
+ * despawn callback.  `entity_ids` are JceEntity values (uint64_t); `count` is
+ * the number for that chunk.  The editor registers these to mirror streamed
+ * entities into its hierarchy/selection so they are first-class objects; the
+ * standalone runtime sets none (NULL = no-op).  Cheap: fired per chunk
+ * load/unload, never per frame. */
+typedef void (*JceWorldStreamerEntityCb)(const uint64_t *entity_ids,
+                                         uint32_t count, void *user);
+
+JCE_API void jce_world_streamer_set_entity_callbacks(
+    JceWorldStreamer         *ws,
+    JceWorldStreamerEntityCb  on_spawn,
+    JceWorldStreamerEntityCb  on_despawn,
+    void                     *user);
+
+/* Invoked on the main thread when a CHUNK becomes resident (loaded == true,
+ * fired just after its entities are spawned) and when it is evicted
+ * (loaded == false, fired as the chunk's entities are removed).  Unlike the
+ * per-entity callbacks above this carries the chunk id, so a caller can map a
+ * chunk to its own per-chunk resource (e.g. an HLOD far-skyline proxy that
+ * must be hidden while the detailed chunk is resident and shown once it
+ * unloads) without reverse-mapping entity ids.  Cheap: fired per chunk
+ * load/unload, never per frame.  NULL = no-op (the runtime sets none). */
+typedef void (*JceWorldStreamerChunkCb)(uint32_t chunk_id, bool loaded,
+                                        void *user);
+
+JCE_API void jce_world_streamer_set_chunk_callback(
+    JceWorldStreamer        *ws,
+    JceWorldStreamerChunkCb  on_chunk_state,
+    void                    *user);
 
 /* ================================================================== */
 /* Per-frame update                                                    */

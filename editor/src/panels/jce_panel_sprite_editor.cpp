@@ -257,7 +257,7 @@ void draw_canvas(void)
      * the pixels they describe.  Same ImTextureID binding convention as
      * fv_render_zoomable (bgfx handle idx). */
     if (jce_texture_valid(s.tex)) {
-        dl->AddImage((ImTextureID)(uintptr_t)s.tex.idx, ip0, ip1);
+        dl->AddImage((ImTextureID)(uintptr_t)((uint32_t)s.tex.idx + 1u), ip0, ip1);
     } else {
         const char *hint = jce_editor_i18n(
             s.tex_failed ? "spriteEditor.previewFailed"

@@ -19,10 +19,25 @@
 extern "C" {
 #endif
 
+typedef enum JceEditorStartupBehavior {
+    JCE_EDITOR_STARTUP_LAST = 0,
+    JCE_EDITOR_STARTUP_EMPTY,
+    JCE_EDITOR_STARTUP_PICKER,
+    JCE_EDITOR_STARTUP_COUNT
+} JceEditorStartupBehavior;
+
 /* Load prefs.json and apply theme / font / UI scale to the live ImGui
  * context.  Safe to call before the panel has ever been opened; called
  * once from jce_editor_init() right after the panel system is up. */
 void jce_editor_prefs_load_and_apply(void);
+
+/* User-scoped startup behaviour from .jce/prefs.json. */
+JceEditorStartupBehavior jce_editor_prefs_startup_behavior(void);
+void jce_editor_prefs_set_startup_behavior(JceEditorStartupBehavior behavior);
+
+/* Autosave interval in seconds (0 = disabled), driven by the General tab.
+ * Polled by the editor main loop to drive a real autosave timer. */
+int jce_editor_prefs_autosave_interval_sec(void);
 
 #ifdef __cplusplus
 }

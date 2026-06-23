@@ -8,7 +8,12 @@
 #include "ui/jce_editor_panels.h"
 #include "jce_asset_path_index.h"
 
+extern "C" {
+#include <jce/os/core/jce_timer.h>   /* jce_time_ticks_ms — stall guard */
+}
+
 #include <cstring>
+#include <unordered_map>
 
 
 /* ── String utilities ───────────────────────────────────────────── */
@@ -140,7 +145,81 @@ struct FindFileContext {
     char *prefix_out_buf;
     size_t prefix_out_size;
     bool found;
+    /* Stall guard: a fallback walk gives up at this wall-clock tick so a
+     * missing asset can never freeze the main thread (checked every 64
+     * entries to keep the per-file cost negligible). */
+    uint64_t deadline_ms;
+    uint32_t entries_seen;
+    bool     timed_out;
 };
+
+/* ── Missing-asset stall guard ─────────────────────────────────────
+ * A reference to an asset that does NOT exist anywhere misses the O(1)
+ * index and used to fall into a full recursive project walk — on the
+ * MAIN thread, once per missing reference, again on every retry.  A
+ * scene with a handful of dead references could freeze the editor for
+ * minutes on open.  Three guards:
+ *   1. negative cache — a name that failed to resolve is not searched
+ *      again until the asset index CHANGES (new files indexed) or the
+ *      TTL passes;
+ *   2. per-walk deadline — one fallback walk gives up after 50 ms;
+ *   3. burst throttle — at most 3 fallback walks per 100 ms window;
+ *      excess requests fail fast and are absorbed by guard 1.
+ * Successful lookups are unaffected (index fast path answers first). */
+#define RESOLVE_MISS_TTL_MS    30000   /* retry a miss after 30 s ... */
+#define RESOLVE_WALK_BUDGET_MS 50      /* ... with a bounded walk     */
+#define RESOLVE_WALK_WINDOW_MS 100
+#define RESOLVE_WALKS_PER_WINDOW 3
+
+struct ResolveMiss {
+    uint64_t when_ms;     /* tick of the failed walk */
+    uint32_t index_gen;   /* asset-index generation at that time */
+};
+static std::unordered_map<std::string, ResolveMiss> s_resolve_misses;
+
+static bool resolve_miss_cached(const std::string &key_lower)
+{
+    auto it = s_resolve_misses.find(key_lower);
+    if (it == s_resolve_misses.end()) return false;
+    if (it->second.index_gen != jce_asset_path_index_generation() ||
+        jce_time_ticks_ms() - it->second.when_ms > RESOLVE_MISS_TTL_MS) {
+        s_resolve_misses.erase(it);   /* expired — allow one fresh walk */
+        return false;
+    }
+    return true;
+}
+
+static void resolve_miss_remember(const std::string &key_lower)
+{
+    /* Hard cap so a pathological scene cannot grow the map unbounded. */
+    if (s_resolve_misses.size() > 4096) s_resolve_misses.clear();
+    s_resolve_misses[key_lower] = { jce_time_ticks_ms(),
+                                    jce_asset_path_index_generation() };
+}
+
+/* Drop the negative path-resolution cache.  The miss key is the asset BASENAME
+ * (lowercased), so a missing "tree.glb" in the previous scene would otherwise
+ * block resolving a "tree.glb" that DOES exist in the next scene for up to the
+ * 30 s TTL.  Editors call this on scene-switch so the new scene resolves fresh. */
+extern "C" void jce_editor_scene_asset_cache_clear_resolve_misses(void)
+{
+    s_resolve_misses.clear();
+}
+
+/* Burst throttle: token window shared by all fallback walks. */
+static bool resolve_walk_token_take(void)
+{
+    static uint64_t window_start = 0;
+    static int      walks_in_window = 0;
+    uint64_t now = jce_time_ticks_ms();
+    if (now - window_start > RESOLVE_WALK_WINDOW_MS) {
+        window_start = now;
+        walks_in_window = 0;
+    }
+    if (walks_in_window >= RESOLVE_WALKS_PER_WINDOW) return false;
+    walks_in_window++;
+    return true;
+}
 
 /* Normalize a filename to alphanumeric-lowercase only.  This lets us
  * match against Unity-imported assets whose names differ only in case
@@ -207,7 +286,12 @@ static bool find_file_walker(const char *path, bool is_dir, void *user)
 {
     FindFileContext *ctx = (FindFileContext*)user;
     if (ctx->found) return false; /* stop early */
-    
+    if (((++ctx->entries_seen) & 63u) == 0 &&
+        jce_time_ticks_ms() >= ctx->deadline_ms) {
+        ctx->timed_out = true;    /* stall guard: give up, never freeze */
+        return false;
+    }
+
     if (is_dir) {
         /* Track depth - note: this is simplified, real depth tracking would need path parsing */
         return true; /* continue */
@@ -266,6 +350,17 @@ bool find_file_by_name_recursive(const std::vector<std::string> &roots,
     if (jce_asset_path_index_lookup(file_name.c_str(), out, (int)out_size))
         return true;
 
+    /* Stall guards for the MISSING-asset case (index just missed): a
+     * known-missing name fails instantly; bursts of new misses (typical
+     * on opening a scene full of dead references) are throttled so the
+     * main thread keeps pumping frames instead of freezing. */
+    const std::string miss_key = lower_copy(file_name);
+    if (resolve_miss_cached(miss_key)) return false;
+    if (!resolve_walk_token_take()) {
+        resolve_miss_remember(miss_key);
+        return false;
+    }
+
     char loose_buf[512] = {0};
     char prefix_buf[512] = {0};
     std::string stem, ext_lower;
@@ -285,6 +380,9 @@ bool find_file_by_name_recursive(const std::vector<std::string> &roots,
     ctx.prefix_out_buf = prefix_buf;
     ctx.prefix_out_size = sizeof(prefix_buf);
     ctx.found = false;
+    ctx.deadline_ms = jce_time_ticks_ms() + RESOLVE_WALK_BUDGET_MS;
+    ctx.entries_seen = 0;
+    ctx.timed_out = false;
 
     for (const std::string &root : roots) {
         if (!jce_fs_host_exists_dir(root.c_str())) continue;
@@ -302,6 +400,14 @@ bool find_file_by_name_recursive(const std::vector<std::string> &roots,
         return true;
     }
 
+    /* Genuine miss (or budget exhausted): remember it so this name does
+     * not trigger another walk until the index changes / TTL expires. */
+    resolve_miss_remember(miss_key);
+    if (ctx.timed_out) {
+        LOG_WARN(LOG_TAG, "asset search for '%s' hit the %d ms stall "
+                 "guard — treated as missing (re-checked when the asset "
+                 "index updates)", file_name.c_str(), RESOLVE_WALK_BUDGET_MS);
+    }
     return false;
 }
 

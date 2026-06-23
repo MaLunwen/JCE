@@ -113,11 +113,11 @@ extern "C" void jce_editor_panel_reflection_probes_content(void)
     if (ImGui::BeginTable("##rp_tbl", 6,
             ImGuiTableFlags_Borders | ImGuiTableFlags_Resizable |
             ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
-        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Mode", ImGuiTableColumnFlags_WidthFixed, 100);
-        ImGui::TableSetupColumn("Res", ImGuiTableColumnFlags_WidthFixed, 80);
-        ImGui::TableSetupColumn("Intensity", ImGuiTableColumnFlags_WidthFixed, 90);
-        ImGui::TableSetupColumn("HDR", ImGuiTableColumnFlags_WidthFixed, 50);
+        ImGui::TableSetupColumn(jce_editor_i18n("reflectionProbes.col.name"), ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn(jce_editor_i18n("reflectionProbes.col.mode"), ImGuiTableColumnFlags_WidthFixed, 100);
+        ImGui::TableSetupColumn(jce_editor_i18n("reflectionProbes.col.res"), ImGuiTableColumnFlags_WidthFixed, 80);
+        ImGui::TableSetupColumn(jce_editor_i18n("reflectionProbes.col.intensity"), ImGuiTableColumnFlags_WidthFixed, 90);
+        ImGui::TableSetupColumn(jce_editor_i18n("reflectionProbes.col.hdr"), ImGuiTableColumnFlags_WidthFixed, 50);
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 90);
         ImGui::TableHeadersRow();
 

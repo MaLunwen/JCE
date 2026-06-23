@@ -21,13 +21,27 @@ typedef struct {
     char       name[32];
     JceBinding binds[JCE_ACTION_MAX_BINDS];
     int        bind_count;
-    float      value;           /* this frame */
+    float      value;           /* this frame (scalar/magnitude) */
     float      prev_value;      /* last frame */
+    float      value_x;         /* this frame, X of composite 2D vector */
+    float      value_y;         /* this frame, Y of composite 2D vector */
 } ActionEntry;
+
+typedef struct {
+    char     name[JCE_SCHEME_NAME_MAX];
+    unsigned device_mask;       /* OR of JCE_DEVICE_BIT(group) */
+} SchemeEntry;
 
 struct JceInputActions {
     ActionEntry actions[JCE_ACTION_MAX];
     int         count;
+
+    /* Control schemes.  scheme_count == 0 => legacy "all bindings active". */
+    SchemeEntry schemes[JCE_SCHEME_MAX];
+    int         scheme_count;
+    int         active_scheme;  /* -1 when no schemes defined            */
+    bool        auto_switch;    /* last-used-device auto switching        */
+    int         last_device;    /* JceInputDeviceGroup of most recent in */
 };
 
 /* ================================================================== */
@@ -40,6 +54,11 @@ JceInputActions *jce_actions_create(void)
     if (!a) return NULL;
     a->count = 0;
     memset(a->actions, 0, sizeof(a->actions));
+    memset(a->schemes, 0, sizeof(a->schemes));
+    a->scheme_count  = 0;
+    a->active_scheme = -1;
+    a->auto_switch   = true;
+    a->last_device   = JCE_DEVICE_NONE;
     return a;
 }
 
@@ -68,6 +87,8 @@ int jce_action_register(JceInputActions *a, const char *name)
     e->bind_count = 0;
     e->value      = 0;
     e->prev_value = 0;
+    e->value_x    = 0;
+    e->value_y    = 0;
     return id;
 }
 
@@ -101,9 +122,95 @@ int jce_action_find(const JceInputActions *a, const char *name)
 }
 
 /* ================================================================== */
+/* Control schemes                                                     */
+/* ================================================================== */
+
+int jce_action_scheme_register(JceInputActions *a, const char *name,
+                               unsigned device_mask)
+{
+    if (!a || !name || !name[0]) return -1;
+    if (a->scheme_count >= JCE_SCHEME_MAX) return -1;
+
+    /* Reject duplicate names. */
+    for (int i = 0; i < a->scheme_count; i++) {
+        if (strcmp(a->schemes[i].name, name) == 0)
+            return -1;
+    }
+
+    int id = a->scheme_count++;
+    SchemeEntry *s = &a->schemes[id];
+    snprintf(s->name, sizeof(s->name), "%s", name);
+    s->device_mask = device_mask;
+
+    /* The first scheme defined becomes the active one (transitions the map
+     * out of the legacy "all bindings active" mode). */
+    if (a->active_scheme < 0)
+        a->active_scheme = id;
+
+    return id;
+}
+
+int jce_action_scheme_count(const JceInputActions *a)
+{
+    return a ? a->scheme_count : 0;
+}
+
+int jce_action_scheme_find(const JceInputActions *a, const char *name)
+{
+    if (!a || !name) return -1;
+    for (int i = 0; i < a->scheme_count; i++) {
+        if (strcmp(a->schemes[i].name, name) == 0)
+            return i;
+    }
+    return -1;
+}
+
+const char *jce_action_scheme_name(const JceInputActions *a, int scheme_id)
+{
+    if (!a || scheme_id < 0 || scheme_id >= a->scheme_count) return NULL;
+    return a->schemes[scheme_id].name;
+}
+
+unsigned jce_action_scheme_mask(const JceInputActions *a, int scheme_id)
+{
+    if (!a || scheme_id < 0 || scheme_id >= a->scheme_count) return 0;
+    return a->schemes[scheme_id].device_mask;
+}
+
+int jce_action_scheme_active(const JceInputActions *a)
+{
+    return a ? a->active_scheme : -1;
+}
+
+bool jce_action_scheme_set_active(JceInputActions *a, int scheme_id)
+{
+    if (!a || scheme_id < 0 || scheme_id >= a->scheme_count) return false;
+    a->active_scheme = scheme_id;
+    a->auto_switch   = false;   /* manual selection pins the scheme */
+    return true;
+}
+
+void jce_action_scheme_set_auto(JceInputActions *a, bool enabled)
+{
+    if (!a) return;
+    a->auto_switch = enabled;
+}
+
+bool jce_action_scheme_auto(const JceInputActions *a)
+{
+    return a ? a->auto_switch : false;
+}
+
+int jce_action_last_device(const JceInputActions *a)
+{
+    return a ? a->last_device : JCE_DEVICE_NONE;
+}
+
+/* ================================================================== */
 /* Per-frame update                                                    */
 /* ================================================================== */
 
+/* Scalar contribution of a single non-composite binding. */
 static float evaluate_binding(const JceBinding *b, const JceInput *input)
 {
     switch (b->type) {
@@ -126,24 +233,208 @@ static float evaluate_binding(const JceBinding *b, const JceInput *input)
         float remapped = (fabsf(v) - dz) / (1.0f - dz);
         return sign * remapped * b->scale;
     }
+
+    case JCE_BIND_COMPOSITE:
+        /* Composites resolve into (x,y) via evaluate_composite(); they make
+         * no scalar contribution to the flat sum. */
+        return 0;
     }
     return 0;
+}
+
+/* (x,y) contribution of a single composite binding.  Raw (un-normalized):
+ * a 2D WASD composite with up+right held yields (+1,+1).  The result is
+ * pre-scaled by b->scale so callers can invert/amplify axes per-binding. */
+static void evaluate_composite(const JceBinding *b, const JceInput *input,
+                               float *out_x, float *out_y)
+{
+    float x = 0.0f, y = 0.0f;
+    /* Use b->scale directly: the JSON loader defaults it to 1.0 when the key
+     * is absent, so a legitimately-authored scale of 0 must be honored (it
+     * silences the binding) rather than coerced back to 1.0. */
+    float scale = b->scale;
+
+    /* X axis: positive (right / pos) minus negative (left / neg). */
+    if (b->comp_pos && jce_input_key_down(input, (SDL_Scancode)b->comp_pos))
+        x += 1.0f;
+    if (b->comp_neg && jce_input_key_down(input, (SDL_Scancode)b->comp_neg))
+        x -= 1.0f;
+
+    /* Y axis (2D only): up minus down.  For a 1D axis comp_up/comp_down are 0. */
+    if (b->comp_up && jce_input_key_down(input, (SDL_Scancode)b->comp_up))
+        y += 1.0f;
+    if (b->comp_down && jce_input_key_down(input, (SDL_Scancode)b->comp_down))
+        y -= 1.0f;
+
+    *out_x = x * scale;
+    *out_y = y * scale;
+}
+
+/* Scan the input frame for any activity per device group, returning a bitmask
+ * of JCE_DEVICE_BIT(group) for groups that produced fresh input this frame.
+ * This is independent of the action map so auto-switch reacts even to inputs
+ * not currently bound. */
+static unsigned scan_active_device_groups(const JceInput *input)
+{
+    unsigned mask = 0;
+
+    /* Keyboard / mouse. */
+    for (int sc = 0; sc < JCE_KEY_COUNT; ++sc) {
+        if (jce_input_key_down(input, (SDL_Scancode)sc)) {
+            mask |= JCE_DEVICE_BIT(JCE_DEVICE_KBM);
+            break;
+        }
+    }
+    if (!(mask & JCE_DEVICE_BIT(JCE_DEVICE_KBM))) {
+        for (int mb = 1; mb <= 5; ++mb) {
+            if (jce_input_mouse_button(input, mb)) {
+                mask |= JCE_DEVICE_BIT(JCE_DEVICE_KBM);
+                break;
+            }
+        }
+    }
+
+    /* Gamepad: any button on pad 0, or any axis past a nominal deadzone. */
+    for (int bn = 0; bn < JCE_GAMEPAD_BUTTON_COUNT; ++bn) {
+        if (jce_input_gamepad_button(input, 0, bn)) {
+            mask |= JCE_DEVICE_BIT(JCE_DEVICE_GAMEPAD);
+            break;
+        }
+    }
+    if (!(mask & JCE_DEVICE_BIT(JCE_DEVICE_GAMEPAD))) {
+        for (int ax = 0; ax < JCE_GAMEPAD_AXIS_COUNT; ++ax) {
+            if (fabsf(jce_input_gamepad_axis(input, 0, ax)) >= 0.5f) {
+                mask |= JCE_DEVICE_BIT(JCE_DEVICE_GAMEPAD);
+                break;
+            }
+        }
+    }
+
+    /* Touch. */
+    if (jce_input_touch_count(input) > 0)
+        mask |= JCE_DEVICE_BIT(JCE_DEVICE_TOUCH);
+
+    return mask;
+}
+
+/* Decide whether a binding resolves under the current active scheme.  With no
+ * schemes defined every binding resolves (legacy behavior).  Otherwise a
+ * binding resolves when it is device-agnostic (JCE_DEVICE_NONE) or its device
+ * group is contained in the active scheme's device mask. */
+static int binding_in_active_scheme(const JceInputActions *a,
+                                    const JceBinding *b)
+{
+    if (a->scheme_count == 0) return 1;           /* legacy: all active */
+    if (b->device_group == JCE_DEVICE_NONE) return 1;
+    if (a->active_scheme < 0) return 0;
+    unsigned m = a->schemes[a->active_scheme].device_mask;
+    return (m & JCE_DEVICE_BIT(b->device_group)) != 0;
+}
+
+/* Auto last-used-device switching.  When enabled and schemes are defined,
+ * switch the active scheme to whichever scheme owns a device group that
+ * produced fresh input this frame.  Preference order: keep the current scheme
+ * if it still has activity (avoids thrashing when both devices are touched),
+ * else pick the first scheme that owns a freshly-active group. */
+static void apply_auto_switch(JceInputActions *a, unsigned active_groups)
+{
+    if (a->scheme_count == 0) return;
+
+    /* Record the last device that produced input regardless of auto state, so
+     * games can read jce_action_last_device() for button prompts. */
+    for (int g = JCE_DEVICE_GROUP_COUNT - 1; g > JCE_DEVICE_NONE; --g) {
+        if (active_groups & JCE_DEVICE_BIT(g)) {
+            a->last_device = g;
+            break;
+        }
+    }
+
+    if (!a->auto_switch || active_groups == 0) return;
+
+    /* If the currently-active scheme still has fresh input, keep it. */
+    if (a->active_scheme >= 0) {
+        unsigned m = a->schemes[a->active_scheme].device_mask;
+        if (m & active_groups) return;
+    }
+
+    /* Otherwise switch to the first scheme owning a freshly-active group. */
+    for (int s = 0; s < a->scheme_count; ++s) {
+        if (a->schemes[s].device_mask & active_groups) {
+            a->active_scheme = s;
+            return;
+        }
+    }
 }
 
 void jce_actions_update(JceInputActions *a, const JceInput *input)
 {
     if (!a || !input) return;
 
+    /* Resolve last-used device + auto scheme switch BEFORE evaluating values,
+     * so this frame's input is read through the freshly-selected scheme. */
+    unsigned active_groups = scan_active_device_groups(input);
+    if (a->scheme_count == 0) {
+        /* Still track the last device even without schemes (button prompts). */
+        for (int g = JCE_DEVICE_GROUP_COUNT - 1; g > JCE_DEVICE_NONE; --g) {
+            if (active_groups & JCE_DEVICE_BIT(g)) { a->last_device = g; break; }
+        }
+    } else {
+        apply_auto_switch(a, active_groups);
+    }
+
     for (int i = 0; i < a->count; i++) {
         ActionEntry *e = &a->actions[i];
         e->prev_value = e->value;
 
-        /* Accumulate all bindings (allows e.g. W + left-stick both). */
+        /* Accumulate scalar bindings (allows e.g. W + left-stick both) and
+         * composite (x,y) bindings into a single resolved vector. */
         float total = 0;
-        for (int b = 0; b < e->bind_count; b++)
-            total += evaluate_binding(&e->binds[b], input);
+        float vx = 0, vy = 0;
+        int   has_composite = 0;
+        int   has_vector_2d = 0;   /* any composite DECLARED as 2D vector */
 
-        /* Clamp to -1..1. */
+        for (int b = 0; b < e->bind_count; b++) {
+            const JceBinding *bd = &e->binds[b];
+            /* Control-scheme gate: only resolve bindings that belong to the
+             * active scheme (or are device-agnostic).  No-op when no schemes
+             * are defined. */
+            if (!binding_in_active_scheme(a, bd))
+                continue;
+            if (bd->type == JCE_BIND_COMPOSITE) {
+                float cx = 0, cy = 0;
+                evaluate_composite(bd, input, &cx, &cy);
+                vx += cx;
+                vy += cy;
+                has_composite = 1;
+                if (bd->code == JCE_COMPOSITE_VECTOR_2D)
+                    has_vector_2d = 1;
+            } else {
+                total += evaluate_binding(bd, input);
+            }
+        }
+
+        if (has_composite) {
+            /* Raw (un-normalized) per-axis sum is exposed via value2.
+             * The scalar `value` keeps composite actions working with
+             * jce_action_down()/pressed().  Classify by the binding's
+             * DECLARED kind (not by whether vy happens to be 0 this frame):
+             *   - 2D vector -> vector magnitude (always >= 0), so a LEFT-only
+             *     press yields +1 magnitude, never a negative scalar.
+             *   - 1D axis   -> signed vx so left/right keeps its sign.
+             * Scalar bindings on the same action still add into `total`. */
+            e->value_x = vx;
+            e->value_y = vy;
+
+            if (has_vector_2d)
+                total += sqrtf(vx * vx + vy * vy);/* 2D: magnitude     */
+            else
+                total += vx;                      /* 1D axis: keep sign */
+        } else {
+            e->value_x = total;
+            e->value_y = 0.0f;
+        }
+
+        /* Clamp scalar to -1..1. */
         if (total > 1.0f)  total = 1.0f;
         if (total < -1.0f) total = -1.0f;
 
@@ -159,6 +450,20 @@ float jce_action_value(const JceInputActions *a, int action_id)
 {
     if (!a || action_id < 0 || action_id >= a->count) return 0;
     return a->actions[action_id].value;
+}
+
+void jce_action_value2(const JceInputActions *a, int action_id,
+                       JceActionVec2 *out)
+{
+    if (!out) return;
+    if (!a || action_id < 0 || action_id >= a->count) {
+        out->x = 0.0f;
+        out->y = 0.0f;
+        return;
+    }
+    const ActionEntry *e = &a->actions[action_id];
+    out->x = e->value_x;
+    out->y = e->value_y;
 }
 
 bool jce_action_pressed(const JceInputActions *a, int action_id)
@@ -315,10 +620,38 @@ JceInputActions *jce_actions_load_file(const char *path)
                 .type     = (JceBindType)jce_json_get_int(bj, "type", JCE_BIND_KEY),
                 .code     = jce_json_get_int(bj, "code", 0),
                 .scale    = (float)jce_json_get_number(bj, "scale", 1.0),
-                .deadzone = (float)jce_json_get_number(bj, "deadzone", 0.15)
+                .deadzone = (float)jce_json_get_number(bj, "deadzone", 0.15),
+                /* Composite sub-keys (absent / 0 for scalar binds — backward
+                 * compatible: `code` carries the JceCompositeKind for these). */
+                .comp_pos  = jce_json_get_int(bj, "comp_pos",  0),
+                .comp_neg  = jce_json_get_int(bj, "comp_neg",  0),
+                .comp_up   = jce_json_get_int(bj, "comp_up",   0),
+                .comp_down = jce_json_get_int(bj, "comp_down", 0),
+                /* Control-scheme device tag (absent / 0 == JCE_DEVICE_NONE:
+                 * device-agnostic, identical to a pre-scheme action map). */
+                .device_group = jce_json_get_int(bj, "device_group", 0)
             };
             jce_action_bind(a, id, &bind);
         }
+    }
+
+    /* Optional control schemes:  "schemes": [ { "name", "device_mask" } ].
+     * Absent => legacy "all bindings active" map (scheme_count stays 0). */
+    JceJson *schemes = jce_json_get(root, "schemes");
+    if (jce_json_is_array(schemes)) {
+        const int sn = jce_json_array_size(schemes);
+        for (int s = 0; s < sn; ++s) {
+            JceJson *sj = jce_json_array_at(schemes, s);
+            if (!jce_json_is_object(sj)) continue;
+            const char *sname = jce_json_get_string(sj, "name", NULL);
+            if (!sname || !sname[0]) continue;
+            unsigned mask = (unsigned)jce_json_get_int(sj, "device_mask", 0);
+            jce_action_scheme_register(a, sname, mask);
+        }
+        /* Honor an explicit active scheme selection if present. */
+        int act = jce_json_get_int(root, "active_scheme", -1);
+        if (act >= 0)
+            jce_action_scheme_set_active(a, act);
     }
 
     jce_json_free(root);
@@ -363,11 +696,42 @@ bool jce_actions_save_file(const JceInputActions *a, const char *path)
                 jce_json_set_int(bj, "code", bd->code);
                 jce_json_set_number(bj, "scale", (double)bd->scale);
                 jce_json_set_number(bj, "deadzone", (double)bd->deadzone);
+                /* Emit composite sub-keys only for composite binds so scalar
+                 * output stays byte-for-byte compatible with the old schema. */
+                if (bd->type == JCE_BIND_COMPOSITE) {
+                    jce_json_set_int(bj, "comp_pos",  bd->comp_pos);
+                    jce_json_set_int(bj, "comp_neg",  bd->comp_neg);
+                    jce_json_set_int(bj, "comp_up",   bd->comp_up);
+                    jce_json_set_int(bj, "comp_down", bd->comp_down);
+                }
+                /* Emit the control-scheme tag only when it is non-default so a
+                 * scheme-free map stays byte-for-byte compatible. */
+                if (bd->device_group != JCE_DEVICE_NONE)
+                    jce_json_set_int(bj, "device_group", bd->device_group);
                 jce_json_array_push(binds, bj);
             }
             jce_json_set_child(act, "binds", binds);
         }
         jce_json_array_push(arr, act);
+    }
+
+    /* Emit control schemes only when defined so a scheme-free map stays
+     * byte-for-byte compatible with the old schema. */
+    if (a->scheme_count > 0) {
+        JceJson *sarr = jce_json_array();
+        if (sarr) {
+            for (int s = 0; s < a->scheme_count; ++s) {
+                const SchemeEntry *se = &a->schemes[s];
+                JceJson *sj = jce_json_object();
+                if (!sj) continue;
+                jce_json_set_string(sj, "name", se->name);
+                jce_json_set_int(sj, "device_mask", (int)se->device_mask);
+                jce_json_array_push(sarr, sj);
+            }
+            jce_json_set_child(root, "schemes", sarr);
+        }
+        if (a->active_scheme >= 0)
+            jce_json_set_int(root, "active_scheme", a->active_scheme);
     }
 
     /* take_ownership=true: root is freed regardless of write success. */

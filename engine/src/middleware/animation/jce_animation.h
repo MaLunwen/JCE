@@ -71,6 +71,10 @@ void         jce_anim_clip_destroy(JceAnimClip *clip);
 const char  *jce_anim_clip_name(const JceAnimClip *clip);
 float        jce_anim_clip_duration(const JceAnimClip *clip);
 
+/* Number of TRS channels in the clip (0 if NULL).  Used by importers / tests to
+ * verify a clip carries joint tracks. */
+uint32_t     jce_anim_clip_channel_count(const JceAnimClip *clip);
+
 /* Sample the clip at a given time, writing per-joint local transforms.
  * out_locals: array of [num_joints] mat4 (typically skeleton joint count).
  * Joints not affected by this clip are left unchanged;
@@ -108,6 +112,85 @@ bool  jce_anim_player_is_playing(const JceAnimPlayer *p);
 uint32_t jce_anim_player_update(JceAnimPlayer *p, float dt,
                                   jce_mat4 *out_joint_matrices,
                                   uint32_t max_joints);
+
+/* ================================================================== */
+/* Additive / layered blending (FEATURE 3.3)                           */
+/* ------------------------------------------------------------------ */
+/* Mirror of the PUBLIC animation header's layered-blend API so the
+ * implementation TU and src-side consumers (renderer) can use them without
+ * including the public header (whose forward-declared typedefs would collide
+ * in C99).  See the public header for full documentation. */
+
+typedef struct JceAvatarMask JceAvatarMask;
+
+typedef enum {
+    JCE_ANIM_LAYER_ADDITIVE = 0,
+    JCE_ANIM_LAYER_OVERRIDE = 1
+} JceAnimLayerMode;
+
+typedef struct {
+    const JceAnimClip   *clip;
+    float                time;
+    float                weight;
+    JceAnimLayerMode     mode;
+    const JceAvatarMask *mask;
+    const JceAnimClip   *ref_clip;
+    float                ref_time;
+} JceAnimLayer;
+
+JCE_API uint32_t JCE_CALL jce_anim_player_blend_additive(
+    JceAnimPlayer       *p,
+    const JceAnimClip   *base_clip,  float base_time,
+    const JceAnimClip   *add_clip,   float add_time,
+    const JceAnimClip   *ref_clip,   float ref_time,
+    const JceAvatarMask *mask,       float weight,
+    jce_mat4            *out_joint_matrices,
+    uint32_t             max_joints);
+
+JCE_API uint32_t JCE_CALL jce_anim_player_blend_layers(
+    JceAnimPlayer      *p,
+    const JceAnimClip  *base_clip, float base_time,
+    const JceAnimLayer *layers,    uint32_t num_layers,
+    jce_mat4           *out_joint_matrices,
+    uint32_t            max_joints);
+
+/* ================================================================== */
+/* Root motion (FEATURE 3.2)                                           */
+/* ------------------------------------------------------------------ */
+/* These mirror the declarations in the PUBLIC animation header
+ * (<jce/middleware/animation/jce_animation.h>) so the implementation TU and
+ * src-side consumers can use them without including the public header (whose
+ * forward-declared typedefs would collide in C99).  See the public header for
+ * the full documentation comments. */
+
+typedef struct {
+    jce_vec3 translation;   /* root-joint local-space translation delta   */
+    float    yaw_delta;     /* root-joint Y-axis (yaw) rotation delta, rad */
+    bool     valid;         /* false when clip/skeleton/root were invalid  */
+} JceAnimRootDelta;
+
+typedef enum {
+    JCE_ROOT_MOTION_NONE     = 0,
+    JCE_ROOT_MOTION_RECENTER = 1 << 0,
+    JCE_ROOT_MOTION_YAW      = 1 << 1
+} JceAnimRootMotionFlags;
+
+JCE_API JceAnimRootDelta JCE_CALL jce_anim_extract_root_delta(
+    const JceAnimClip  *clip,
+    const JceSkeleton  *skel,
+    uint32_t            root_joint,
+    float               prev_time,
+    float               cur_time,
+    bool                loop,
+    uint32_t            flags,
+    jce_mat4           *out_pose,
+    uint32_t            out_pose_joints);
+
+JCE_API void JCE_CALL jce_anim_player_set_root_motion(JceAnimPlayer *p,
+                                                      bool enabled,
+                                                      uint32_t root_joint);
+
+JCE_API JceAnimRootDelta JCE_CALL jce_anim_player_consume_root_motion(JceAnimPlayer *p);
 
 #ifdef __cplusplus
 }

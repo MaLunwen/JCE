@@ -133,8 +133,9 @@ static void fv_parse_model_assimp(FvTab *tab, ModelViewState *ms)
                                                hint, false, &info);
     }
     if (!ok) {
-        snprintf(ms->load_error, sizeof(ms->load_error),
-                 "%s", info.error[0] ? info.error : "model load failed");
+        snprintf(ms->load_error, sizeof(ms->load_error), "%s",
+                 info.error[0] ? info.error
+                               : jce_editor_i18n("viewer.model.loadFailed"));
         jce_model_importer_free_inspect(&info);
         return;
     }
@@ -170,8 +171,9 @@ static void fv_parse_model_assimp(FvTab *tab, ModelViewState *ms)
                                                 hint, true, &wire);
     }
     if (!wok) {
-        snprintf(ms->load_error, sizeof(ms->load_error),
-                 "%s", wire.error[0] ? wire.error : "wireframe load failed");
+        snprintf(ms->load_error, sizeof(ms->load_error), "%s",
+                 wire.error[0] ? wire.error
+                               : jce_editor_i18n("viewer.model.wireframeFailed"));
         jce_model_importer_free_inspect(&wire);
         return;
     }

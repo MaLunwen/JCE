@@ -75,6 +75,38 @@ JCE_API void jce_anim_sm_update(JceAnimSm *sm, float dt);
 /* Snapshot the current evaluation. */
 JCE_API void jce_anim_sm_eval(const JceAnimSm *sm, JceAnimSmEval *out);
 
+/* -- State-change polling (state-enter/exit gameplay events) ------ *
+ *
+ * Pure, allocation-free helper that detects when the SM's active state
+ * index has changed since the last poll.  The caller owns the previous-
+ * state cursor in `*prev_state_io`:
+ *
+ *   - Compares the SM's current active state index (the same index
+ *     jce_anim_sm_eval reports as state_index) against *prev_state_io.
+ *   - On a CHANGE: writes the old value into *out_from (may be the seed
+ *     sentinel on the first poll), the new index into *out_to, advances
+ *     *prev_state_io to the new index, and returns true.
+ *   - On NO change (or NULL sm / NULL prev_state_io): returns false and
+ *     touches nothing (out params untouched).
+ *
+ * Seed convention: callers MUST seed *prev_state_io to a SENTINEL that
+ * can never equal a real state index (recommended: INT_MIN, or any
+ * value < -1) before the FIRST poll.  This makes the first poll report a
+ * change INTO the initial state (out_from = the sentinel, out_to =
+ * initial state index), so gameplay receives an on_state_enter for the
+ * start state — which is what game code almost always wants.  Re-seed the
+ * sentinel whenever the SM instance rebinds/resets so the initial enter
+ * re-fires.  (Seed to -1 instead if you specifically do NOT want the
+ * initial state-enter to fire — then the first poll only fires once the
+ * state leaves the -1 "no active state" value.)
+ *
+ * out_from / out_to may be NULL (the corresponding value is just not
+ * written).  Finite/NULL-safe; reads only jce_anim_sm internals. */
+JCE_API bool JCE_CALL jce_anim_sm_poll_state_change(const JceAnimSm *sm,
+                                                    int *prev_state_io,
+                                                    int *out_from,
+                                                    int *out_to);
+
 /* -- Introspection ------------------------------------------------ */
 
 JCE_API int         jce_anim_sm_state_count(const JceAnimSm *sm);

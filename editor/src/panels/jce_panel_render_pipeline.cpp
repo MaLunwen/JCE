@@ -22,6 +22,7 @@
 extern "C" {
 #include <jce/renderer/jce_render_pipeline.h>
 #include <jce/renderer/jce_renderer_caps.h>
+#include <jce/renderer/jce_texture.h>
 }
 
 /* ── Panel state ──────────────────────────────────────────────────── */
@@ -61,9 +62,9 @@ void jce_editor_panel_render_pipeline_content(void)
         if (ImGui::Button(jce_editor_i18n("panel.render_pipeline.asset.save"))) {
             if (jce_render_pipeline_save(s_rp.asset_path, &s_rp.desc)) {
                 snprintf(s_rp.status_msg, sizeof(s_rp.status_msg),
-                         "Saved: %s", s_rp.asset_path);
+                         jce_editor_i18n("panel.render_pipeline.status.saved"), s_rp.asset_path);
             } else {
-                snprintf(s_rp.status_msg, sizeof(s_rp.status_msg), "Save failed.");
+                snprintf(s_rp.status_msg, sizeof(s_rp.status_msg), "%s", jce_editor_i18n("panel.render_pipeline.status.saveFailed"));
             }
         }
         if (ImGui::Button(jce_editor_i18n("panel.render_pipeline.asset.load"))) {
@@ -72,9 +73,9 @@ void jce_editor_panel_render_pipeline_content(void)
                 s_rp.desc = loaded;
                 jce_render_pipeline_apply(&s_rp.desc);
                 snprintf(s_rp.status_msg, sizeof(s_rp.status_msg),
-                         "Loaded: %s", s_rp.asset_path);
+                         jce_editor_i18n("panel.render_pipeline.status.loaded"), s_rp.asset_path);
             } else {
-                snprintf(s_rp.status_msg, sizeof(s_rp.status_msg), "Load failed.");
+                snprintf(s_rp.status_msg, sizeof(s_rp.status_msg), "%s", jce_editor_i18n("panel.render_pipeline.status.loadFailed"));
             }
         }
         if (s_rp.status_msg[0])
@@ -179,6 +180,25 @@ void jce_editor_panel_render_pipeline_content(void)
         ImGui::TextUnformatted(
             jce_editor_i18n("panel.render_pipeline.quality.shadow_resolution"));
 
+        /* Global texture LOD bias — the "editor quality slider" the texture
+         * module anticipates (jce_texture.h).  LIVE control, not part of the
+         * .rp.json asset: applies immediately via the mip-streaming system
+         * (+1 = drop the top mip everywhere).  The low-memory pressure
+         * bridge writes the same global bias on pressure TRANSITIONS, so a
+         * manual value can be overridden when memory pressure changes. */
+        {
+            int bias = (int)jce_texture_get_global_mip_bias();
+            ImGui::SetNextItemWidth(110.0f);
+            if (ImGui::SliderInt(
+                    jce_editor_i18n("panel.render_pipeline.quality.tex_lod_bias"),
+                    &bias, 0, 3)) {
+                jce_texture_set_global_mip_bias((int8_t)bias);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", jce_editor_i18n(
+                    "panel.render_pipeline.quality.tex_lod_bias.tip"));
+        }
+
         /* CSM cascade count 1–4. */
         int cascades = (int)s_rp.desc.csm_cascade_count;
         ImGui::SetNextItemWidth(110.0f);
@@ -191,7 +211,7 @@ void jce_editor_panel_render_pipeline_content(void)
 
         /* MSAA samples. */
         static const int   kMsVals[]   = {1, 2, 4, 8};
-        static const char *kMsLabels[] = {"Off", "2x", "4x", "8x"};
+        const char *kMsLabels[] = {jce_editor_i18n("panel.render_pipeline.msaa.off"), "2x", "4x", "8x"};
         int cur_ms = 0;
         for (int i = 0; i < 4; i++) {
             if ((int)s_rp.desc.msaa_samples == kMsVals[i]) { cur_ms = i; break; }
@@ -211,7 +231,7 @@ void jce_editor_panel_render_pipeline_content(void)
             &s_rp.desc.render_scale, 0.25f, 2.0f, "%.2f");
 
         /* Post quality dropdown. */
-        static const char *kPqLabels[] = {"Low", "Mid", "High", "Ultra"};
+        const char *kPqLabels[] = {jce_editor_i18n("panel.render_pipeline.preset.low"), jce_editor_i18n("panel.render_pipeline.preset.mid"), jce_editor_i18n("panel.render_pipeline.preset.high"), jce_editor_i18n("panel.render_pipeline.preset.ultra")};
         int cur_pq = (int)s_rp.desc.post_quality;
         ImGui::SetNextItemWidth(110.0f);
         snprintf(lbl, sizeof(lbl), "##rp_post_quality");

@@ -527,7 +527,7 @@ void draw_selected_inspector(void)
     ImGui::DragFloat(jce_editor_i18n_id("curveEditor.field.value",   "ce_v"),   &k.v, 0.01f);
     ImGui::DragFloat(jce_editor_i18n_id("curveEditor.field.tanIn",   "ce_ti"),  &k.tan_in,  0.05f);
     ImGui::DragFloat(jce_editor_i18n_id("curveEditor.field.tanOut",  "ce_to"),  &k.tan_out, 0.05f);
-    const char *modes[] = { "Linear", "Cubic", "Constant" };
+    const char *modes[] = { jce_editor_i18n("curveEditor.interp.linear"), jce_editor_i18n("curveEditor.interp.cubic"), jce_editor_i18n("curveEditor.interp.constant") };
     int mi = k.interp;
     if (ImGui::Combo(jce_editor_i18n_id("curveEditor.field.interpOut", "ce_iout"), &mi, modes, IM_ARRAYSIZE(modes)))
         k.interp = mi;
@@ -565,10 +565,10 @@ void draw_channel_panel(void)
 
     if (ImGui::BeginTable("##chans", 4,
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
-        ImGui::TableSetupColumn("Active", ImGuiTableColumnFlags_WidthFixed, 50.0f);
-        ImGui::TableSetupColumn("Vis",    ImGuiTableColumnFlags_WidthFixed, 38.0f);
-        ImGui::TableSetupColumn("Color",  ImGuiTableColumnFlags_WidthFixed, 70.0f);
-        ImGui::TableSetupColumn("Name");
+        ImGui::TableSetupColumn(jce_editor_i18n("curveEditor.col.active"), ImGuiTableColumnFlags_WidthFixed, 50.0f);
+        ImGui::TableSetupColumn(jce_editor_i18n("curveEditor.col.vis"),    ImGuiTableColumnFlags_WidthFixed, 38.0f);
+        ImGui::TableSetupColumn(jce_editor_i18n("curveEditor.col.color"),  ImGuiTableColumnFlags_WidthFixed, 70.0f);
+        ImGui::TableSetupColumn(jce_editor_i18n("curveEditor.col.name"));
         ImGui::TableHeadersRow();
         for (int i = 0; i < (int)s.channels.size(); ++i) {
             Channel &ch = s.channels[i];

@@ -9,6 +9,7 @@
 
 
 #include <jce/middleware/audio/jce_audio_types.h>
+#include <jce/middleware/audio/jce_audio_dsp.h>
 #include <jce/os/core/jce_defs.h>
 
 #include <stdbool.h>
@@ -153,6 +154,49 @@ JCE_API void      jce_audio_bus_set_volume(JceAudio *audio, const char *name,
  * No-op on a stale/invalid voice. */
 JCE_API void      jce_audio_voice_set_bus(JceAudio *audio, JceVoice voice,
                                           const char *bus_name);
+
+/* -- Insert-effect DSP chains (FEATURE 5.1) ------------------------- */
+
+/*
+ * Ordered DSP "insert" effects (EQ / compressor / limiter / delay; see
+ * jce_audio_dsp.h) attachable to a mixer bus or a single voice.  Each effect
+ * is appended to the target's chain and runs in order on the signal flowing
+ * from the source into the bus/endpoint, via a custom node spliced into the
+ * miniaudio node graph (source → [inserts] → bus group / reverb / endpoint).
+ *
+ * The chain is lazily created on the first add; while empty the original
+ * routing (and the reverb/lowpass behavior) is left completely unchanged, so
+ * a target with no inserts has zero added cost.
+ *
+ * The same JceAudioDspChain math runs offline over a known PCM buffer, which
+ * is how the effects are unit-tested with no audio device.
+ *
+ * Returns the new effect's index (>=0) on success, or -1 on failure (unknown
+ * bus/voice, chain full, audio disabled). */
+JCE_API int  jce_audio_bus_add_effect(JceAudio *audio, const char *bus_name,
+                                      const JceAudioEffectDesc *desc);
+JCE_API int  jce_audio_voice_add_effect(JceAudio *audio, JceVoice voice,
+                                        const JceAudioEffectDesc *desc);
+
+/* Reconfigure the insert at `index` on a bus/voice chain.  Returns true on
+ * success. */
+JCE_API bool jce_audio_bus_set_effect(JceAudio *audio, const char *bus_name,
+                                      uint32_t index,
+                                      const JceAudioEffectDesc *desc);
+JCE_API bool jce_audio_voice_set_effect(JceAudio *audio, JceVoice voice,
+                                        uint32_t index,
+                                        const JceAudioEffectDesc *desc);
+
+/* Remove the insert at `index`.  Returns true if one was removed. */
+JCE_API bool jce_audio_bus_remove_effect(JceAudio *audio, const char *bus_name,
+                                         uint32_t index);
+JCE_API bool jce_audio_voice_remove_effect(JceAudio *audio, JceVoice voice,
+                                           uint32_t index);
+
+/* Number of inserts currently on a bus/voice (0 if none / unknown). */
+JCE_API uint32_t jce_audio_bus_effect_count(JceAudio *audio,
+                                            const char *bus_name);
+JCE_API uint32_t jce_audio_voice_effect_count(JceAudio *audio, JceVoice voice);
 
 /* -- Global reverb (driven by reverb zones) ------------------------- */
 

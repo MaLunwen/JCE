@@ -59,6 +59,83 @@ JCE_API void JCE_CALL jce_bt_register_action(JceBtContext *ctx, const char *name
                                              jce_bt_action_fn fn, void *userdata);
 
 /* ================================================================== */
+/* Bundled deterministic node library                                  */
+/* ================================================================== */
+/*
+ * A set of genuinely useful, game-agnostic ACTION + DECORATOR nodes that
+ * operate on a JceBlackboard (the perception/working memory in
+ * jce_perception.h) plus an optional nav-move hook.  Unlike the
+ * jce_bt_action_fn actions above, these are STATEFUL and PARAMETERIZED via
+ * XML ports, and time is supplied as a deterministic per-tick `dt` rather
+ * than wall-clock — so trees that use them tick reproducibly.  This is the
+ * "richer bundled library" the roadmap calls for; the existing four
+ * perception conditions stay registered separately by the runtime.
+ *
+ * Nodes registered by jce_bt_register_library():
+ *
+ *   <Wait sec="1.5"/>                  ACTION (stateful leaf)
+ *       RUNNING until `sec` seconds of accumulated `dt` elapse, then SUCCESS.
+ *       Restarts its timer each time it is (re)entered from IDLE.
+ *
+ *   <SetValue key="foo" value="bar"/>               ACTION (instant)
+ *   <SetValue key="n"   value="3"/>                 (numbers parse to int/float)
+ *   <SetValue key="ok"  value="true"/>              (true/false parse to bool)
+ *       Writes a typed value into the JceBlackboard and returns SUCCESS.
+ *       (Named SetValue — not SetBlackboard — because BehaviorTree.CPP ships
+ *       its own "SetBlackboard" that targets its INTERNAL blackboard.)
+ *
+ *   <ClearValue key="foo"/>            ACTION (instant)
+ *       Removes a key (or clears ALL keys when `key` is empty/omitted);
+ *       always SUCCESS.
+ *
+ *   <BlackboardCheck key="foo" value="bar"/>        CONDITION
+ *       SUCCESS when the blackboard key equals `value` (string/number/bool
+ *       compared by lexical form); FAILURE otherwise or when absent.
+ *
+ *   <Cooldown sec="2.0"> <child/> </Cooldown>       DECORATOR (stateful)
+ *       Ticks its child only when at least `sec` seconds of `dt` have passed
+ *       since the child last COMPLETED (SUCCESS or FAILURE).  While gated it
+ *       returns FAILURE without ticking the child; a RUNNING child is passed
+ *       through.  The first entry is never gated.
+ *
+ *   <MoveToTarget speed="3.0"/>        ACTION (stateful leaf)
+ *       Reads target.position (falling back to target.last_known_position)
+ *       from the blackboard and drives the agent via the env's move hook:
+ *       RUNNING while travelling, SUCCESS on arrival, FAILURE with no goal
+ *       or no hook.  (Needs a runtime nav-agent; pure on the blackboard side.)
+ *
+ * NOTE: Repeat(num_cycles) and RetryUntilSuccessful(num_attempts) are already
+ * provided by the BehaviorTree.CPP backend and need no registration here.
+ *
+ * Idempotent; safe to call once per context after jce_bt_create().
+ */
+JCE_API void JCE_CALL jce_bt_register_library(JceBtContext *ctx);
+
+/*
+ * Per-tick environment the bundled library reads.  Set it (cheaply, by value)
+ * before each jce_bt_tick so the nodes see the agent's blackboard and the dt
+ * to advance their timers.  `bb` is required for the blackboard nodes; `dt`
+ * drives Wait/Cooldown; the move hook backs MoveToTarget.
+ */
+typedef struct JceBlackboard JceBlackboard;   /* fwd (defined in jce_perception.h) */
+
+/* MoveToTarget hook: drive the agent toward (gx,gy,gz).  Return JCE_BT_RUNNING
+ * while travelling, JCE_BT_SUCCESS on arrival, JCE_BT_FAILURE when unreachable.
+ * NULL hook makes MoveToTarget return FAILURE. */
+typedef JceBtStatus (*jce_bt_move_fn)(float gx, float gy, float gz, void *userdata);
+
+typedef struct {
+    JceBlackboard *bb;            /* working blackboard the nodes read/write */
+    float          dt;            /* seconds advanced this tick (deterministic) */
+    jce_bt_move_fn move_to;       /* nav-move hook for MoveToTarget (may be NULL) */
+    void          *move_userdata; /* passed to move_to */
+} JceBtTickEnv;
+
+/* Install the per-tick environment for the bundled library.  Copy by value;
+ * pass NULL to clear.  No-op on NULL ctx. */
+JCE_API void JCE_CALL jce_bt_set_env(JceBtContext *ctx, const JceBtTickEnv *env);
+
+/* ================================================================== */
 /* Tree management                                                     */
 /* ================================================================== */
 

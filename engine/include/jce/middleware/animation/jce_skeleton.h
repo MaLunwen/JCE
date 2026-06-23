@@ -54,6 +54,11 @@ JCE_API uint32_t jce_skeleton_joint_count(const JceSkeleton *skel);
 /* Find a joint index by name. Returns -1 if not found. */
 JCE_API int jce_skeleton_find_joint(const JceSkeleton *skel, const char *name);
 
+/* Return the name of joint `index` (interned in the skeleton), or NULL if the
+ * skeleton is NULL or the index is out of range. The returned pointer is owned
+ * by the skeleton and valid until it is destroyed. */
+JCE_API const char *jce_skeleton_joint_name(const JceSkeleton *skel, uint32_t index);
+
 /* Parent joint index of joint_idx, or -1 for roots / out-of-range.
  * Joints are ordered so a parent always precedes its children. */
 JCE_API int jce_skeleton_joint_parent(const JceSkeleton *skel, uint32_t joint_idx);

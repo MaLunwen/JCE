@@ -13,6 +13,7 @@
 #include "viewers/jce_file_viewer.h"
 
 #include <jce/tools/jce_imgui.hpp>
+#include <jce/os/core/jce_console.h>   /* cvar + command registry */
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
@@ -81,7 +82,8 @@ static void execute_console_command(const char *cmd)
         s_ui.selected.clear();
         s_ui.anchor = -1;
     } else if (strncmp(cmd, "help", 4) == 0) {
-        jce_editor_console_log("Commands: clear, help, echo <msg>, play, stop, pause");
+        jce_editor_console_log("Commands: clear, help, echo <msg>, play, stop, pause, list");
+        jce_editor_console_log("cvars: type a name to read, 'name value' to set ('list' shows all)");
     } else if (strncmp(cmd, "echo ", 5) == 0) {
         jce_editor_console_log("%s", cmd + 5);
     } else if (strcmp(cmd, "play") == 0) {
@@ -90,10 +92,23 @@ static void execute_console_command(const char *cmd)
         jce_state_stop();
     } else if (strcmp(cmd, "pause") == 0) {
         jce_state_pause();
+    } else if (jce_console_exec(cmd)) {
+        /* Handled by the registered cvar/command registry (jce_console):
+         * "<cvar>" echoes, "<cvar> <value>" sets, "<command> args" dispatches,
+         * "list" enumerates everything.  Output routes to the console log via
+         * the sink installed in ensure_init(). */
     } else {
         jce_editor_console_log_level(JCE_CONSOLE_WARNING,
-            "unknown command: %s (try 'help')", cmd);
+            "unknown command: %s (try 'help' or 'list')", cmd);
     }
+}
+
+/* Route jce_console output (cvar echoes, command results, 'list') into the
+ * editor console log so it shows in this same panel. */
+static void console_sink(const char *text, void *user)
+{
+    (void)user;
+    jce_editor_console_log("%s", text ? text : "");
 }
 
 static void ensure_init(void)
@@ -101,6 +116,7 @@ static void ensure_init(void)
     if (s_ui.initialized) return;
     s_ui = ConsoleUiState{};
     s_ui.initialized = true;
+    jce_console_set_output(console_sink, nullptr);
 }
 
 static void copy_selection_to_clipboard(void)

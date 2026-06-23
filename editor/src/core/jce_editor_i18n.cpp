@@ -35,8 +35,11 @@ extern "C" {
 #define LOG_TAG       "i18n"
 #define MAX_STRINGS   16384
 #define MAX_KEY_LEN   128
-#define MAX_VALUE_LEN 512
-#define MAX_EXPAND_LEN 1024
+#define MAX_VALUE_LEN 1024   /* was 512; multibyte (Cyrillic ~1.8B/char) +
+                                longer locales (de/ru) overflowed 512 on the
+                                longest guide prose (~408 src chars). 1024 B
+                                clears the worst case (~755 B for ru). */
+#define MAX_EXPAND_LEN 2048
 #define MAX_EXPAND_DEPTH 6
 #define EXPAND_RING_SIZE 8
 #define MAX_CODE_LEN  16

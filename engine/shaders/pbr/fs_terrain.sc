@@ -166,7 +166,8 @@ float sample_csm_shadow(int cascade,
         csm_uv.y < 0.0 || csm_uv.y > 1.0 ||
         csm_z < 0.0 || csm_z > 1.0)
     {
-        return 1.0;
+        // Sentinel "not covered" — caller falls through to a wider cascade.
+        return -1.0;
     }
 
     float inv_map_size = max(u_csmParams.x, 1.0 / 2048.0);
@@ -267,9 +268,17 @@ void main()
         else if (fragDepth < u_csmSplits.y)  cascade = 1;
         else if (fragDepth < u_csmSplits.z)  cascade = 2;
 
+        int sel_cascade = cascade;
         shadow = sample_csm_shadow(cascade, v_worldpos, baseNormal, toLightDir);
 
-        if (cascade < 3)
+        // Cascade FALLTHROUGH (see fs_pbr_body.sh): a depth-bucketed fragment can
+        // fall outside its cascade's light-space square; step to wider cascades
+        // so it is never wrongly left fully lit (triangular bright wedges).
+        if (shadow < 0.0 && cascade < 3) { cascade = cascade + 1; shadow = sample_csm_shadow(cascade, v_worldpos, baseNormal, toLightDir); }
+        if (shadow < 0.0 && cascade < 3) { cascade = cascade + 1; shadow = sample_csm_shadow(cascade, v_worldpos, baseNormal, toLightDir); }
+        if (shadow < 0.0 && cascade < 3) { cascade = cascade + 1; shadow = sample_csm_shadow(cascade, v_worldpos, baseNormal, toLightDir); }
+
+        if (shadow >= 0.0 && cascade == sel_cascade && cascade < 3)
         {
             float split_start = 0.0;
             float split_end = u_csmSplits.x;
@@ -298,9 +307,20 @@ void main()
                                                           v_worldpos,
                                                           baseNormal,
                                                           toLightDir);
-                    shadow = mix(shadow, next_shadow, blend);
+                    if (next_shadow >= 0.0)
+                        shadow = mix(shadow, next_shadow, blend);
                 }
             }
+        }
+
+        // Beyond all cascades: lit.  Then soft shadow-distance fade (u_csmSplits.w
+        // = shadow far) so the shadow edge is a gradient, not a hard boundary.
+        if (shadow < 0.0) shadow = 1.0;
+        float shadow_far = u_csmSplits.w;
+        if (shadow_far > 0.0)
+        {
+            float fade = smoothstep(shadow_far * 0.85, shadow_far, fragDepth);
+            shadow = mix(shadow, 1.0, fade);
         }
     }
     else if (shadowEnabled)

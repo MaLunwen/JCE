@@ -366,7 +366,8 @@ JceAssetHandle jce_asset_acquire(JceAssetManager *mgr,
         }
 
         jce_pool_submit(mgr->pool, asset_type_to_async(type),
-                        idx, asset_path, mgr->pak, mgr->fs, &info);
+                        idx, slot->generation, asset_path,
+                        mgr->pak, mgr->fs, &info);
     }
 
     return handle;
@@ -619,8 +620,14 @@ uint32_t jce_asset_manager_update(JceAssetManager *mgr,
             chain = req->next;
             req->next = NULL;
 
-            /* Validate slot is still expecting this load. */
-            if (req->slot_index < mgr->max_assets) {
+            /* Validate the slot is still expecting THIS load: a release +
+             * reacquire while the load was in flight bumps the generation, so
+             * finalizing would stomp an unrelated newly-acquired slot.  On a
+             * mismatch we drop the result; jce_pool_free_request below frees
+             * the decoded payload (finalizers null it, so a skip leaves it
+             * non-NULL and it is reclaimed there). */
+            if (req->slot_index < mgr->max_assets &&
+                mgr->slots[req->slot_index].generation == req->generation) {
                 JceAssetSlot *slot = &mgr->slots[req->slot_index];
 
                 if (req->success) {

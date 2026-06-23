@@ -9,12 +9,13 @@
 
 /* ── Shared mutable state ─────────────────────────────────────────── */
 
-InspCompClipboard s_comp_clipboard = { 0, {0}, 0 };
+InspCompClipboard s_comp_clipboard = { JCE_COMP_ID_INVALID, {0}, 0 };
 bool              s_insp_batch_open = false;
-InspPendingRemove s_pending_remove  = { 0, 0, false };
+InspPendingRemove s_pending_remove  = { 0, JCE_COMP_ID_INVALID, false };
 char              s_preset_save_buf[64] = { 0 };
-InspPendingMove   s_pending_move    = { 0, 0, 0, 0, false };
-InspDrag          s_drag            = { 0, 0, 0, false };
+InspPendingMove   s_pending_move    = { 0, JCE_COMP_ID_INVALID, 0, false };
+InspDrag          s_drag            = { 0, JCE_COMP_ID_INVALID,
+                                        JCE_COMP_ID_INVALID, false };
 
 /* ── Undo tracking helpers ─────────────────────────────────────────── */
 
@@ -183,16 +184,23 @@ void accept_mesh_drop_with_material(JceMeshRenderer *mr)
             if (is_mesh_ext(path)) {
                 JceEditorMaterialInfo mat = {};
                 if (jce_editor_model_extract_material(path, &mat)) {
+                    /* Importer texture paths are CWD-relative — store the
+                     * canonical project-relative form (see store_asset_ref). */
                     if (mat.albedo_tex[0])
-                        snprintf(mr->albedo_tex, sizeof(mr->albedo_tex), "%s", mat.albedo_tex);
+                        jce_editor_path_store_asset_ref(mr->albedo_tex,
+                            sizeof(mr->albedo_tex), mat.albedo_tex);
                     if (mat.mr_tex[0])
-                        snprintf(mr->mr_tex, sizeof(mr->mr_tex), "%s", mat.mr_tex);
+                        jce_editor_path_store_asset_ref(mr->mr_tex,
+                            sizeof(mr->mr_tex), mat.mr_tex);
                     if (mat.normal_tex[0])
-                        snprintf(mr->normal_tex, sizeof(mr->normal_tex), "%s", mat.normal_tex);
+                        jce_editor_path_store_asset_ref(mr->normal_tex,
+                            sizeof(mr->normal_tex), mat.normal_tex);
                     if (mat.ao_tex[0])
-                        snprintf(mr->ao_tex, sizeof(mr->ao_tex), "%s", mat.ao_tex);
+                        jce_editor_path_store_asset_ref(mr->ao_tex,
+                            sizeof(mr->ao_tex), mat.ao_tex);
                     if (mat.emissive_tex[0])
-                        snprintf(mr->emissive_tex, sizeof(mr->emissive_tex), "%s", mat.emissive_tex);
+                        jce_editor_path_store_asset_ref(mr->emissive_tex,
+                            sizeof(mr->emissive_tex), mat.emissive_tex);
 
                     mr->base_color[0] = mat.base_color[0];
                     mr->base_color[1] = mat.base_color[1];

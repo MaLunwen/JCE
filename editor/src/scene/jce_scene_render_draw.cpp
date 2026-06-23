@@ -12,6 +12,7 @@
 
 extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/middleware/scene/jce_sequencer.h>
 #include <jce/middleware/physics/jce_physics_debug.h>
 #include <jce/middleware/ai/jce_navmesh_recast.h>
 #include <jce/os/core/jce_log.h>
@@ -21,8 +22,10 @@ extern "C" {
 #include "gizmo/jce_gizmo_joint.h"
 #include "gizmo/jce_gizmo_cloth.h"
 #include "gizmo/jce_gizmo_compound_collider.h"
+#include "jce_editor_scene_render.h"   /* jce_editor_resolve_asset_path */
 
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 /* ── Animation timer reset (kept for play.cpp compatibility) ─────── */
@@ -45,14 +48,12 @@ static bool build_overlay_entity_model(uint32_t entity_id,
     if (!scene || entity_id == 0) return false;
     JceEntity e = (JceEntity)entity_id;
 
-    JceTransform *t = jce_scene_get_transform(scene, e);
-    if (!t) return false;
+    if (!jce_scene_has_transform(scene, e)) return false;
 
-    float sx = (t->scale.x != 0.0f) ? t->scale.x : 1.0f;
-    float sy = (t->scale.y != 0.0f) ? t->scale.y : 1.0f;
-    float sz = (t->scale.z != 0.0f) ? t->scale.z : 1.0f;
-    *out_model = jce_m4_from_trs(t->position, t->rotation,
-                                  jce_v3(sx, sy, sz));
+    /* Same composition the engine draw uses (hierarchical, pivot-aware
+     * world matrix) so selection outlines stay glued to the mesh when the
+     * entity is parented or carries an edited pivot. */
+    *out_model = jce_scene_get_world_matrix(scene, e);
 
     if (out_mesh) {
         *out_mesh = NULL;
@@ -61,7 +62,8 @@ static bool build_overlay_entity_model(uint32_t entity_id,
             if (mr) {
                 if (mr->mesh_path[0] != '\0') {
                     float wp[3] = {
-                        t->position.x, t->position.y, t->position.z
+                        out_model->raw[3][0], out_model->raw[3][1],
+                        out_model->raw[3][2]
                     };
                     *out_mesh = get_cached_mesh(mr->mesh_path, wp);
                 }
@@ -221,6 +223,48 @@ static void outline_draw_frustum(jce_vec3 origin, jce_quat rot,
     jce_debug_draw_line(origin, nc, abgr);
 }
 
+/* Frustum aimed from `origin` toward `target` — for virtual cameras whose pose
+ * is RESOLVED from look-at / follow targets (jce_vcam_system resolve_pose), not
+ * the entity transform.  Also strokes the sight line origin->target so the aim
+ * is unambiguous. */
+static void outline_draw_frustum_lookat(jce_vec3 origin, jce_vec3 target,
+                                        float fov_deg, float near_z, float far_z,
+                                        uint32_t abgr)
+{
+    if (near_z <= 0.0f) near_z = 0.1f;
+    if (far_z  <= near_z) far_z = near_z + 1.0f;
+    jce_vec3 fwd = jce_v3_sub(target, origin);
+    float l2 = fwd.x * fwd.x + fwd.y * fwd.y + fwd.z * fwd.z;
+    fwd = (l2 < 1e-8f) ? jce_v3(0.0f, 0.0f, -1.0f)
+                       : jce_v3_scale(fwd, 1.0f / sqrtf(l2));
+    jce_vec3 up0   = (fabsf(fwd.y) > 0.95f) ? jce_v3(0, 0, 1) : jce_v3(0, 1, 0);
+    jce_vec3 right = jce_v3_normalize(jce_v3_cross(fwd, up0));
+    jce_vec3 up    = jce_v3_normalize(jce_v3_cross(right, fwd));
+
+    const float aspect = 16.0f / 9.0f;
+    float t  = tanf(fov_deg * 0.5f * 3.1415927f / 180.0f);
+    float hn = near_z * t, wn = hn * aspect;
+    float hf = far_z  * t, wf = hf * aspect;
+    jce_vec3 nc = jce_v3_add(origin, jce_v3_scale(fwd, near_z));
+    jce_vec3 fc = jce_v3_add(origin, jce_v3_scale(fwd, far_z));
+    jce_vec3 ntl = jce_v3_add(nc, jce_v3_add(jce_v3_scale(up,  hn), jce_v3_scale(right, -wn)));
+    jce_vec3 ntr = jce_v3_add(nc, jce_v3_add(jce_v3_scale(up,  hn), jce_v3_scale(right,  wn)));
+    jce_vec3 nbl = jce_v3_add(nc, jce_v3_add(jce_v3_scale(up, -hn), jce_v3_scale(right, -wn)));
+    jce_vec3 nbr = jce_v3_add(nc, jce_v3_add(jce_v3_scale(up, -hn), jce_v3_scale(right,  wn)));
+    jce_vec3 ftl = jce_v3_add(fc, jce_v3_add(jce_v3_scale(up,  hf), jce_v3_scale(right, -wf)));
+    jce_vec3 ftr = jce_v3_add(fc, jce_v3_add(jce_v3_scale(up,  hf), jce_v3_scale(right,  wf)));
+    jce_vec3 fbl = jce_v3_add(fc, jce_v3_add(jce_v3_scale(up, -hf), jce_v3_scale(right, -wf)));
+    jce_vec3 fbr = jce_v3_add(fc, jce_v3_add(jce_v3_scale(up, -hf), jce_v3_scale(right,  wf)));
+    jce_debug_draw_line(ntl, ntr, abgr); jce_debug_draw_line(ntr, nbr, abgr);
+    jce_debug_draw_line(nbr, nbl, abgr); jce_debug_draw_line(nbl, ntl, abgr);
+    jce_debug_draw_line(ftl, ftr, abgr); jce_debug_draw_line(ftr, fbr, abgr);
+    jce_debug_draw_line(fbr, fbl, abgr); jce_debug_draw_line(fbl, ftl, abgr);
+    jce_debug_draw_line(ntl, ftl, abgr); jce_debug_draw_line(ntr, ftr, abgr);
+    jce_debug_draw_line(nbl, fbl, abgr); jce_debug_draw_line(nbr, fbr, abgr);
+    /* Sight line to the look-at point (dimmer). */
+    jce_debug_draw_line(origin, target, (abgr & 0x00FFFFFFu) | 0x60000000u);
+}
+
 /* ── 2D collider outline (Box2D body, XY plane) ───────────────────── */
 
 /* Rotate (px,py) by (cos=c, sin=s), translate to (cx,cy); z carried for
@@ -260,8 +304,8 @@ static void draw_collider2d_outline(const JceTransform *t,
                                     uint32_t abgr_box, uint32_t abgr_circle,
                                     uint32_t abgr_capsule)
 {
-    float sx = (t->scale.x != 0.0f) ? fabsf(t->scale.x) : 1.0f;
-    float sy = (t->scale.y != 0.0f) ? fabsf(t->scale.y) : 1.0f;
+    jce_vec3 ss = jce_v3_abs_safe_scale(t->scale);
+    float sx = ss.x, sy = ss.y;
     float smax = fmaxf(sx, sy);
 
     /* Body origin = entity position + world-axis offset (NOT rotated,
@@ -379,6 +423,154 @@ static void draw_collider2d_outline(const JceTransform *t,
  *
  * Goal: selection feedback that visually matches each entity's actual
  * shape — not just static meshes. */
+/* ── Cinematic dolly-path gizmo (Sequencer rail in the viewport) ──────────
+ *
+ * Standard-engine feedback (Unreal Sequencer rail / Unity Cinemachine dolly
+ * track): when a SequencePlayer entity is selected, draw the camera path its
+ * sequence animates — sample the bound entity's POSITION property tracks over
+ * the whole duration and stroke a polyline, with a cross marker at each key.
+ * The path is the absolute world track (POSITION props are absolute), so it
+ * matches exactly what the runtime drives at Play. */
+
+struct SeqFindCtx { const char *want; jce_vec3 pos; bool found; };
+static void seq_find_pos_cb(JceScene *s, JceEntity e, void *ud)
+{
+    SeqFindCtx *c = (SeqFindCtx *)ud;
+    if (c->found) return;
+    JceEditorMeta *m = jce_scene_get_editor_meta(s, e);
+    if (m && m->name[0] && std::strcmp(m->name, c->want) == 0) {
+        JceTransform *t = jce_scene_get_transform(s, e);
+        if (t) { c->pos = t->position; c->found = true; }
+    }
+}
+
+/* Cache the parsed sequence by resolved path; reload only when the path
+ * changes (the gizmo overlay runs every frame while an entity is selected). */
+static JceSequencer *seq_path_cache_get(const char *seq_path)
+{
+    static std::string  s_path;
+    static JceSequencer *s_seq = nullptr;
+    char resolved[1024];
+    const char *p = seq_path;
+    if (jce_editor_resolve_asset_path(seq_path, resolved, (int)sizeof resolved))
+        p = resolved;
+    if (s_seq && s_path == p) return s_seq;
+    if (s_seq) { jce_sequencer_free(s_seq); s_seq = nullptr; }
+    s_seq  = jce_sequencer_load_file(p);
+    s_path = p;
+    return s_seq;
+}
+
+static void draw_sequence_camera_path(JceScene *scene, const char *seq_path)
+{
+    JceSequencer *seq = seq_path_cache_get(seq_path);
+    if (!seq) return;
+    float dur = jce_sequencer_duration(seq);
+    if (dur <= 0.0f) dur = 1.0f;
+    const int n = jce_sequencer_track_count(seq);
+
+    /* Group POS x/y/z property tracks by bound entity name (one path each). */
+    struct PathGroup { char ent[96]; int tx, ty, tz; };
+    PathGroup groups[8];
+    int gcount = 0;
+    for (int i = 0; i < n; i++) {
+        if (jce_sequencer_track_type(seq, i) != JCE_SEQ_TRACK_PROPERTY) continue;
+        const char *prop = jce_sequencer_track_bind_prop_name(seq, i);
+        const char *ent  = jce_sequencer_track_bind_entity_name(seq, i);
+        if (!ent || !ent[0] || !prop || !prop[0]) continue;
+        int axis = (std::strcmp(prop, "transform.position.x") == 0) ? 0
+                 : (std::strcmp(prop, "transform.position.y") == 0) ? 1
+                 : (std::strcmp(prop, "transform.position.z") == 0) ? 2 : -1;
+        if (axis < 0) continue;
+        PathGroup *g = nullptr;
+        for (int k = 0; k < gcount; k++)
+            if (std::strcmp(groups[k].ent, ent) == 0) { g = &groups[k]; break; }
+        if (!g && gcount < (int)(sizeof groups / sizeof groups[0])) {
+            g = &groups[gcount++];
+            std::snprintf(g->ent, sizeof g->ent, "%s", ent);
+            g->tx = g->ty = g->tz = -1;
+        }
+        if (!g) continue;
+        if      (axis == 0) g->tx = i;
+        else if (axis == 1) g->ty = i;
+        else                g->tz = i;
+    }
+
+    const uint32_t col_path = 0xFF18C0FF;   /* ABGR: warm amber rail        */
+    const uint32_t col_key  = 0xFFFFFFFF;   /* white keyframe crosses       */
+    for (int k = 0; k < gcount; k++) {
+        PathGroup &g = groups[k];
+        if (g.tx < 0 && g.ty < 0 && g.tz < 0) continue;
+        /* Base position for any non-animated axis = the rig's current pose. */
+        jce_vec3 base = jce_v3(0.0f, 0.0f, 0.0f);
+        SeqFindCtx fc = { g.ent, jce_v3(0,0,0), false };
+        jce_scene_each_entity(scene, seq_find_pos_cb, &fc);
+        if (fc.found) base = fc.pos;
+
+        /* LIVE position marker (green box) at the rig's current transform.  The
+         * Sequencer panel's scrub/play preview writes that transform, so this
+         * box rides the rail in real time as the playhead moves — the "live
+         * motion" feedback on top of the static path. */
+        if (fc.found) {
+            const float mr = 0.26f;
+            jce_debug_draw_box(base, jce_v3(mr, mr, mr), jce_q_identity(),
+                               0xFFFFFF00 /* ABGR cyan — live playhead position */);
+        }
+
+        const int STEPS = 64;
+        jce_vec3 prev = base, p0 = base, pN = base;
+        for (int s2 = 0; s2 <= STEPS; s2++) {
+            float t = dur * (float)s2 / (float)STEPS;
+            jce_vec3 cur = base;
+            if (g.tx >= 0) cur.x = jce_sequencer_track_eval_float(seq, g.tx, t);
+            if (g.ty >= 0) cur.y = jce_sequencer_track_eval_float(seq, g.ty, t);
+            if (g.tz >= 0) cur.z = jce_sequencer_track_eval_float(seq, g.tz, t);
+            if (s2 == 0) p0 = cur;
+            pN = cur;
+            if (s2 > 0) {
+                jce_debug_draw_line(prev, cur, col_path);
+                /* A few travel-direction arrowheads (kept sparse — refined, not
+                 * busy). */
+                if (s2 % 16 == 0) {
+                    jce_vec3 d = jce_v3_sub(cur, prev);
+                    float dl = sqrtf(d.x * d.x + d.y * d.y + d.z * d.z);
+                    if (dl > 1e-4f) {
+                        d = jce_v3_scale(d, 1.0f / dl);
+                        jce_vec3 up   = (fabsf(d.y) > 0.95f) ? jce_v3(1, 0, 0)
+                                                            : jce_v3(0, 1, 0);
+                        jce_vec3 side = jce_v3_normalize(jce_v3_cross(d, up));
+                        const float ah = 0.22f;
+                        jce_vec3 back = jce_v3_scale(d, -ah);
+                        jce_debug_draw_line(cur,
+                            jce_v3_add(cur, jce_v3_add(back, jce_v3_scale(side,  ah * 0.6f))), col_path);
+                        jce_debug_draw_line(cur,
+                            jce_v3_add(cur, jce_v3_add(back, jce_v3_scale(side, -ah * 0.6f))), col_path);
+                    }
+                }
+            }
+            prev = cur;
+        }
+        /* Endpoint markers: green = start (t=0), red = end (t=dur) — direction
+         * of the shot at a glance. */
+        jce_debug_draw_box(p0, jce_v3(0.16f, 0.16f, 0.16f), jce_q_identity(), 0xFF22FF22);
+        jce_debug_draw_box(pN, jce_v3(0.16f, 0.16f, 0.16f), jce_q_identity(), 0xFF2222FF);
+        /* Keyframe crosses (use whichever axis track exists for the times). */
+        int kt = g.tx >= 0 ? g.tx : (g.ty >= 0 ? g.ty : g.tz);
+        int kc = jce_sequencer_track_key_count(seq, kt);
+        for (int j = 0; j < kc; j++) {
+            float tk = jce_sequencer_track_key_time(seq, kt, j);
+            jce_vec3 p = base;
+            if (g.tx >= 0) p.x = jce_sequencer_track_eval_float(seq, g.tx, tk);
+            if (g.ty >= 0) p.y = jce_sequencer_track_eval_float(seq, g.ty, tk);
+            if (g.tz >= 0) p.z = jce_sequencer_track_eval_float(seq, g.tz, tk);
+            const float r = 0.18f;
+            jce_debug_draw_line(jce_v3(p.x - r, p.y, p.z), jce_v3(p.x + r, p.y, p.z), col_key);
+            jce_debug_draw_line(jce_v3(p.x, p.y - r, p.z), jce_v3(p.x, p.y + r, p.z), col_key);
+            jce_debug_draw_line(jce_v3(p.x, p.y, p.z - r), jce_v3(p.x, p.y, p.z + r), col_key);
+        }
+    }
+}
+
 void draw_selection_outlines(void)
 {
     int sel_count = 0;
@@ -403,6 +595,17 @@ void draw_selection_outlines(void)
         if (!jce_state_entity_enabled(id)) continue;
 
         JceEntity e = (JceEntity)id;
+
+        /* Cinematic dolly rail: a selected SequencePlayer draws its camera
+         * path in the viewport (standard-engine Sequencer feedback).  Done up
+         * front so it shows even though the Cutscene entity carries no mesh and
+         * would otherwise take an early path below. */
+        if (scene && jce_scene_has_sequence_player(scene, e)) {
+            JceSequencePlayerComponent *sp = jce_scene_get_sequence_player(scene, e);
+            if (sp && sp->seq_path[0])
+                draw_sequence_camera_path(scene, sp->seq_path);
+        }
+
         bool has_visual_renderer = false;
         if (scene) {
             has_visual_renderer =
@@ -426,9 +629,14 @@ void draw_selection_outlines(void)
                 if (jce_scene_has_spot_light(scene, e)) {
                     JceSpotLight *sl = jce_scene_get_spot_light(scene, e);
                     if (sl) {
-                        jce_vec3 axis = jce_v3_normalize(sl->direction);
-                        if (axis.x == 0.0f && axis.y == 0.0f && axis.z == 0.0f)
-                            axis = jce_q_rotate(lt->rotation, jce_v3(0, 0, -1));
+                        /* Match the renderer (sr_light_world_shine_direction):
+                         * the component direction is rotated by the entity
+                         * transform, so the cone follows the light when rotated
+                         * (was drawing the RAW component dir = static/fake). */
+                        jce_vec3 d = jce_v3_normalize(sl->direction);
+                        if (d.x == 0.0f && d.y == 0.0f && d.z == 0.0f)
+                            d = jce_v3(0.0f, 0.0f, -1.0f);
+                        jce_vec3 axis = jce_v3_normalize(jce_q_rotate(lt->rotation, d));
                         float clen = (sl->radius > 0.0f) ? sl->radius : 1.0f;
                         float cosA = (sl->outer_cone_cos > 0.0f)
                                      ? sl->outer_cone_cos : 0.7071f;
@@ -514,11 +722,10 @@ void draw_selection_outlines(void)
                 ? jce_editor_scene_get_model(sa->skeleton_path, id)
                 : NULL;
             if (mdl) {
-                float sx = (t->scale.x != 0.0f) ? t->scale.x : 1.0f;
-                float sy = (t->scale.y != 0.0f) ? t->scale.y : 1.0f;
-                float sz = (t->scale.z != 0.0f) ? t->scale.z : 1.0f;
-                jce_mat4 world = jce_m4_from_trs(t->position, t->rotation,
-                                                  jce_v3(sx, sy, sz));
+                /* Same composition the engine skinned draw uses (the
+                 * hierarchical, pivot-aware world matrix) so the overlay
+                 * stays glued to the rendered mesh. */
+                jce_mat4 world = jce_scene_get_world_matrix(scene, e);
                 jce_uniform_set(s_sr.u_light_dir,   flat_dir,   1);
                 jce_uniform_set(s_sr.u_light_color, flat_color, 1);
                 jce_set_texture(0, uh, s_sr.white_tex, JCE_SAMPLER_INHERIT);
@@ -563,9 +770,41 @@ void draw_selection_outlines(void)
                 jce_scene_get_virtual_camera(scene, e);
             if (vc) {
                 const uint32_t col_vcam = 0xFFFF00FFu; /* ABGR magenta */
-                outline_draw_frustum(t->position, t->rotation,
+                /* RESOLVED pose (mirrors jce_vcam_system resolve_pose): a vcam's
+                 * actual view comes from its static position/look-at OR its
+                 * follow / look-at TARGET entities — not the entity transform.
+                 * Anchoring the frustum at the transform was the static/fake
+                 * camera gizmo (esp. for FOLLOW_LOOK rigs like the dolly cam). */
+                jce_vec3 pos = jce_v3(vc->position[0], vc->position[1], vc->position[2]);
+                jce_vec3 tgt = jce_v3(vc->look_at[0],  vc->look_at[1],  vc->look_at[2]);
+                if ((vc->track_mode == JCE_VCAM_COMP_TRACK_FOLLOW ||
+                     vc->track_mode == JCE_VCAM_COMP_TRACK_FOLLOW_LOOK) &&
+                    jce_state_entity_alive((uint32_t)vc->follow_target)) {
+                    JceTransform *ft = jce_scene_get_transform(scene, (JceEntity)vc->follow_target);
+                    if (ft) pos = jce_v3(ft->position.x + vc->follow_offset[0],
+                                         ft->position.y + vc->follow_offset[1],
+                                         ft->position.z + vc->follow_offset[2]);
+                }
+                if ((vc->track_mode == JCE_VCAM_COMP_TRACK_LOOK_AT ||
+                     vc->track_mode == JCE_VCAM_COMP_TRACK_FOLLOW_LOOK) &&
+                    jce_state_entity_alive((uint32_t)vc->look_at_target)) {
+                    JceTransform *lkt = jce_scene_get_transform(scene, (JceEntity)vc->look_at_target);
+                    if (lkt) tgt = lkt->position;
+                }
+                /* Unconfigured static vcam (no authored pos/look-at) → fall back
+                 * to the entity transform so a fresh vcam still shows something. */
+                bool zero_pos = (pos.x == 0.0f && pos.y == 0.0f && pos.z == 0.0f);
+                bool zero_tgt = (tgt.x == 0.0f && tgt.y == 0.0f && tgt.z == 0.0f);
+                if (vc->track_mode == JCE_VCAM_COMP_TRACK_NONE && zero_pos && zero_tgt) {
+                    pos = t->position;
+                    tgt = jce_v3_add(pos, jce_q_rotate(t->rotation, jce_v3(0, 0, -1)));
+                }
+                outline_draw_frustum_lookat(pos, tgt,
                                      (vc->fov_deg > 0.0f) ? vc->fov_deg : 60.0f,
-                                     0.1f, 3.0f, false, col_vcam);
+                                     0.1f, 3.5f, col_vcam);
+                /* Mark the resolved camera position. */
+                jce_debug_draw_box(pos, jce_v3(0.12f, 0.12f, 0.12f),
+                                   jce_q_identity(), col_vcam);
                 drew_shape = true;
             }
         }
@@ -578,9 +817,8 @@ void draw_selection_outlines(void)
             jce_vec3 ofs = bc
                 ? jce_v3(bc->center[0], bc->center[1], bc->center[2])
                 : jce_v3(0, 0, 0);
-            float sx = (t->scale.x != 0.0f) ? fabsf(t->scale.x) : 1.0f;
-            float sy = (t->scale.y != 0.0f) ? fabsf(t->scale.y) : 1.0f;
-            float sz = (t->scale.z != 0.0f) ? fabsf(t->scale.z) : 1.0f;
+            jce_vec3 ss = jce_v3_abs_safe_scale(t->scale);
+            float sx = ss.x, sy = ss.y, sz = ss.z;
             float bx = bc ? bc->size[0] : 1.0f;
             float by = bc ? bc->size[1] : 1.0f;
             float bz = bc ? bc->size[2] : 1.0f;
@@ -596,9 +834,8 @@ void draw_selection_outlines(void)
             jce_vec3 ofs = sc
                 ? jce_v3(sc->center[0], sc->center[1], sc->center[2])
                 : jce_v3(0, 0, 0);
-            float sx = (t->scale.x != 0.0f) ? fabsf(t->scale.x) : 1.0f;
-            float sy = (t->scale.y != 0.0f) ? fabsf(t->scale.y) : 1.0f;
-            float sz = (t->scale.z != 0.0f) ? fabsf(t->scale.z) : 1.0f;
+            jce_vec3 ss = jce_v3_abs_safe_scale(t->scale);
+            float sx = ss.x, sy = ss.y, sz = ss.z;
             float smax = fmaxf(sx, fmaxf(sy, sz));
             float r = ((sc && sc->radius > 0.0f) ? sc->radius : 0.5f) * smax;
             jce_vec3 c = jce_v3_add(t->position,
@@ -612,9 +849,8 @@ void draw_selection_outlines(void)
             jce_vec3 ofs = cc
                 ? jce_v3(cc->center[0], cc->center[1], cc->center[2])
                 : jce_v3(0, 0, 0);
-            float sx = (t->scale.x != 0.0f) ? fabsf(t->scale.x) : 1.0f;
-            float sy = (t->scale.y != 0.0f) ? fabsf(t->scale.y) : 1.0f;
-            float sz = (t->scale.z != 0.0f) ? fabsf(t->scale.z) : 1.0f;
+            jce_vec3 ss = jce_v3_abs_safe_scale(t->scale);
+            float sx = ss.x, sy = ss.y, sz = ss.z;
             float r_scale = fmaxf(sx, sz);
             float r = ((cc && cc->radius > 0.0f) ? cc->radius : 0.3f) * r_scale;
             float h = ((cc && cc->height > 0.0f) ? cc->height : 1.0f) * sy;
@@ -628,9 +864,8 @@ void draw_selection_outlines(void)
         if (jce_scene_has_character_controller(scene, e)) {
             JceCharacterControllerComponent *cc =
                 jce_scene_get_character_controller(scene, e);
-            float sx = (t->scale.x != 0.0f) ? fabsf(t->scale.x) : 1.0f;
-            float sy = (t->scale.y != 0.0f) ? fabsf(t->scale.y) : 1.0f;
-            float sz = (t->scale.z != 0.0f) ? fabsf(t->scale.z) : 1.0f;
+            jce_vec3 ss = jce_v3_abs_safe_scale(t->scale);
+            float sx = ss.x, sy = ss.y, sz = ss.z;
             float r_scale = fmaxf(sx, sz);
             float r = ((cc && cc->radius > 0.0f) ? cc->radius : 0.3f) * r_scale;
             float h = ((cc && cc->height > 0.0f) ? cc->height : 1.6f) * sy;
@@ -879,9 +1114,8 @@ void draw_selection_outlines(void)
          *     non-spatial audio sources, particle emitters, prefab
          *     roots …). */
         if (!drew_shape) {
-            float sx = (t->scale.x != 0.0f) ? fabsf(t->scale.x) : 1.0f;
-            float sy = (t->scale.y != 0.0f) ? fabsf(t->scale.y) : 1.0f;
-            float sz = (t->scale.z != 0.0f) ? fabsf(t->scale.z) : 1.0f;
+            jce_vec3 ss = jce_v3_abs_safe_scale(t->scale);
+            float sx = ss.x, sy = ss.y, sz = ss.z;
             jce_vec3 half = jce_v3(0.5f * sx, 0.5f * sy, 0.5f * sz);
             jce_debug_draw_box(t->position, half, t->rotation, col_outline);
         }
@@ -943,9 +1177,8 @@ void draw_physics_debug(void)
          * scaled by the entity's TRS scale — matching how the physics body is
          * built (jce_runtime.c) and the selection gizmo. Previously this drew a
          * fixed 0.5*scale cube, so every collider looked like a unit cube. */
-        float sx = (t->scale.x != 0.0f) ? fabsf(t->scale.x) : 1.0f;
-        float sy = (t->scale.y != 0.0f) ? fabsf(t->scale.y) : 1.0f;
-        float sz = (t->scale.z != 0.0f) ? fabsf(t->scale.z) : 1.0f;
+        jce_vec3 ss = jce_v3_abs_safe_scale(t->scale);
+        float sx = ss.x, sy = ss.y, sz = ss.z;
 
         if (jce_scene_has_box_collider(scene, e)) {
             JceBoxColliderComponent *bc = jce_scene_get_box_collider(scene, e);

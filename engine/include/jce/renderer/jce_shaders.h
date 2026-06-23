@@ -52,6 +52,12 @@ typedef struct JceShaderSet {
     JceShaderHandle pbr;              /* static PBR */
     JceShaderHandle pbr_inst;         /* static PBR — GPU-instanced variant */
     JceShaderHandle pbr_skinned;      /* skinned PBR */
+    /* Forward+ clustered fragment variant (fs_pbr_fwdplus): same vertex
+     * shaders, IES dropped + clustered point/spot loop.  Selected only when
+     * the r.forwardplus cvar is on; default off keeps the non-variant pbr*. */
+    JceShaderHandle pbr_fwdplus;          /* static PBR — Forward+ fragment */
+    JceShaderHandle pbr_inst_fwdplus;     /* instanced PBR — Forward+ fragment */
+    JceShaderHandle pbr_skinned_fwdplus;  /* skinned PBR — Forward+ fragment */
     JceShaderHandle shadow;           /* shadow depth */
     JceShaderHandle shadow_inst;      /* shadow depth — GPU-instanced variant */
     JceShaderHandle shadow_skinned;   /* skinned shadow */
@@ -70,6 +76,17 @@ JCE_API JceShaderSet jce_shaders_load_all(const JcePakArchive *pak);
  * action to demonstrate end-to-end hot-reload from disk. */
 JCE_API JceShaderSet jce_shaders_load_all_fs(const char *dev_dir,
                                              const JcePakArchive *pak);
+
+/* The engine-embedded shader PAK (baked into jce_renderer when
+ * JCE_EMBED_ENGINE_SHADERS is ON), or NULL when no embedded pak is present.
+ *
+ * Engine subsystems that load their own shaders directly from a
+ * caller-supplied scene/game PAK (e.g. decals, GPU particles) MUST fall back
+ * to this when the scene PAK lacks the shader — otherwise they break on every
+ * build that bakes the engine shaders out of the scene PAK (the editor ships
+ * editor_assets.pak with zero shaders).  Mirrors the fallback in the standard
+ * shader loader (load_single).  Cached; safe to call after bgfx init. */
+JCE_API const JcePakArchive *jce_shaders_embedded_engine_pak(void);
 
 JCE_EXTERN_C_END
 

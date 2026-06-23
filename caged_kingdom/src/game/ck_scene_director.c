@@ -247,7 +247,7 @@ CkSceneDirector *ck_scene_director_create(JceRenderer *renderer, JcePakArchive *
             LOG_INFO(LOG_TAG,
                 "dev-mode: loose assets mounted from '%s' (overrides PAK)",
                 dev_dir);
-            jce_material_registry_init();
+            jce_material_registry_init(dev_dir);
             jce_material_registry_set_reload_cb(on_material_reloaded, dir);
         }
     }

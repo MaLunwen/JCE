@@ -412,6 +412,25 @@ void jce_anim_sm_eval(const JceAnimSm *sm, JceAnimSmEval *out)
     }
 }
 
+bool jce_anim_sm_poll_state_change(const JceAnimSm *sm, int *prev_state_io,
+                                   int *out_from, int *out_to)
+{
+    if (!sm || !prev_state_io) return false;
+
+    /* The "active state" reported here matches jce_anim_sm_eval's
+       state_index exactly: the current state when it is a valid index,
+       otherwise -1 (no active state). */
+    int cur = (sm->current_state >= 0 && sm->current_state < sm->state_count)
+            ? sm->current_state : -1;
+
+    if (cur == *prev_state_io) return false;
+
+    if (out_from) *out_from = *prev_state_io;
+    if (out_to)   *out_to   = cur;
+    *prev_state_io = cur;
+    return true;
+}
+
 int jce_anim_sm_state_count(const JceAnimSm *sm)
 { return sm ? sm->state_count : 0; }
 

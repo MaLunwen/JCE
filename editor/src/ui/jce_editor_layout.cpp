@@ -28,8 +28,10 @@
 #include "core/jce_editor.h"
 #include "jce_editor_colors.h"
 #include "jce_editor_layout_scene_commands.h"
+#include "jce_editor_welcome_policy.h"
 #include "core/jce_editor_defaults.h"
 #include "core/jce_editor_i18n.h"
+#include "core/jce_editor_project.h"
 #include "jce_editor_panels.h"
 #include "core/jce_editor_state.h"
 #include "core/jce_editor_config.h"
@@ -69,10 +71,52 @@ static bool s_show_build       = false;
 static bool s_show_bundles     = false;
 static bool s_show_proj_settings = false;
 static bool s_show_preferences = false;
-static bool s_show_welcome     = true;  /* shown at startup; auto-closes if a project is already loaded */
+static bool s_show_welcome     = false;
+static bool s_welcome_startup_resolved = false;
 static int  s_unsaved_result   = 0;
 static bool s_quit_after_save_as = false;
 static bool s_quit_confirmed = false;
+
+/* Deferred dock-tab focus shared by menu commands and dialog shims.
+ * We select the dock tab directly instead of calling SetWindowFocus()
+ * from inside a menu popup, which would close the Window menu before the
+ * user can toggle/focus more panels. */
+static char s_pending_dock_tab[128] = {0};
+static int  s_pending_dock_tab_ttl = 0;
+
+extern "C" void jce_editor_panel_request_focus(const char *stable_window_id)
+{
+    if (!stable_window_id || !stable_window_id[0])
+        return;
+    snprintf(s_pending_dock_tab, sizeof(s_pending_dock_tab), "%s",
+             stable_window_id);
+    s_pending_dock_tab_ttl = 30;
+}
+
+static void pump_pending_panel_focus(void)
+{
+    if (!s_pending_dock_tab[0])
+        return;
+
+    ImGuiWindow *w = ImGui::FindWindowByName(s_pending_dock_tab);
+    bool done = false;
+    if (w && w->DockNode && w->DockNode->TabBar) {
+        ImGuiID tab_id = w->TabId ? w->TabId : w->ID;
+        w->DockNode->TabBar->NextSelectedTabId = tab_id;
+        done = true;
+    }
+    if (--s_pending_dock_tab_ttl <= 0 && !done) {
+        /* Fallback for floating windows: traditional focus after the
+         * menu interaction has had several frames to complete. */
+        if (w)
+            ImGui::SetWindowFocus(s_pending_dock_tab);
+        done = true;
+    }
+    if (done) {
+        s_pending_dock_tab[0] = '\0';
+        s_pending_dock_tab_ttl = 0;
+    }
+}
 
 /* ── Unsaved-changes gate ─────────────────────────────────────────────
  * New Scene / Open Scene / Open Project / Open Recent all discard the
@@ -181,6 +225,36 @@ static bool should_block_editor_interaction(void)
         || s_show_build || should_draw_dialog_dimmer();
 }
 
+static bool has_known_startup_project(void)
+{
+    JceEditorConfig cfg;
+    if (!jce_editor_config_load(&cfg))
+        return false;
+
+    if (cfg.last_project[0] != '\0')
+        return true;
+    for (int i = 0; i < cfg.recent_count; i++) {
+        if (cfg.recent_projects[i][0] != '\0')
+            return true;
+    }
+    return false;
+}
+
+static void resolve_startup_welcome_once(void)
+{
+    if (s_welcome_startup_resolved)
+        return;
+    s_welcome_startup_resolved = true;
+
+    const JceProject *project = jce_editor_project_get();
+    bool has_project = project && project->project_root
+                    && project->project_root[0] != '\0';
+    s_show_welcome = jce_editor_welcome_should_open_on_startup(
+        jce_editor_prefs_startup_behavior(),
+        has_project,
+        has_known_startup_project());
+}
+
 static void draw_dialog_dimmer(void)
 {
     const ImGuiViewport *vp = ImGui::GetMainViewport();
@@ -214,6 +288,70 @@ static void draw_dialog_dimmer(void)
     ImGui::PopStyleVar(3);
 }
 
+/* Full-viewport "Loading scene…" overlay shown while a frame-sliced scene
+ * open is in flight.  It dims the editor and absorbs all input (an invisible
+ * button covering the viewport) so the user cannot operate on a scene that is
+ * still being populated, then draws a centered label + progress bar. */
+static void draw_scene_loading_overlay(void)
+{
+    const ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->Pos);
+    ImGui::SetNextWindowSize(vp->Size);
+    ImGui::SetNextWindowViewport(vp->ID);
+
+    ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoDocking |
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoBringToFrontOnFocus;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg,
+        ImGui::GetStyleColorVec4(ImGuiCol_ModalWindowDimBg));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0, 0, 0, 0));
+
+    ImGui::Begin("##SceneLoadingOverlay", NULL, flags);
+    /* Absorb all mouse input so panels behind cannot be clicked. */
+    ImGui::InvisibleButton("##scene_loading_block", vp->Size);
+
+    const float       progress = jce_state_scene_load_progress();
+    const char       *label    = jce_editor_i18n("scene.loading");
+    if (!label || !label[0]) label = "Loading scene\xE2\x80\xA6"; /* fallback */
+
+    const float bar_w = ImClamp(vp->Size.x * 0.35f, 200.0f, 520.0f);
+    char pct[16];
+    snprintf(pct, sizeof(pct), "%d%%", (int)(progress * 100.0f + 0.5f));
+
+    ImVec2 label_sz = ImGui::CalcTextSize(label);
+    float  cx = vp->Pos.x + vp->Size.x * 0.5f;
+    float  cy = vp->Pos.y + vp->Size.y * 0.5f;
+
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    ImU32 text_col = ImGui::GetColorU32(ImGuiCol_Text);
+    dl->AddText(ImVec2(cx - label_sz.x * 0.5f, cy - 36.0f), text_col, label);
+
+    /* Manual progress bar (draw-list based so it doesn't depend on cursor
+     * layout inside a zero-padding window). */
+    ImVec2 bar_a(cx - bar_w * 0.5f, cy - 4.0f);
+    ImVec2 bar_b(cx + bar_w * 0.5f, cy + 16.0f);
+    dl->AddRectFilled(bar_a, bar_b, ImGui::GetColorU32(ImGuiCol_FrameBg), 4.0f);
+    ImVec2 fill_b(bar_a.x + (bar_b.x - bar_a.x) * progress, bar_b.y);
+    dl->AddRectFilled(bar_a, fill_b,
+                      ImGui::GetColorU32(ImGuiCol_PlotHistogram), 4.0f);
+    ImVec2 pct_sz = ImGui::CalcTextSize(pct);
+    dl->AddText(ImVec2(cx - pct_sz.x * 0.5f, cy + 22.0f), text_col, pct);
+
+    ImGui::End();
+
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(3);
+}
+
 typedef enum {
     SAVE_SCENE_RESULT_FAILED = 0,
     SAVE_SCENE_RESULT_OK,
@@ -237,7 +375,7 @@ static SaveSceneResult save_scene_or_open_save_as(void)
     }
 
     jce_editor_console_log("Saved scene: %s", scene_path);
-    jce_toast_success("Saved scene: %s", scene_path);
+    jce_toast_success(jce_editor_i18n("toast.sceneSaved"), scene_path);
     return SAVE_SCENE_RESULT_OK;
 }
 
@@ -585,9 +723,9 @@ static void cmd_screenshot_(void)
              "%s/jce_screenshot_%s.png", dir, stamp);
 
     if (jce_screenshot_save(path, JCE_SCREENSHOT_PNG))
-        jce_toast_info("Screenshot: %s", path);
+        jce_toast_info(jce_editor_i18n("toast.screenshot"), path);
     else
-        jce_toast_error("Screenshot failed (a capture is already in progress?)");
+        jce_toast_error("%s", jce_editor_i18n("toast.screenshotFailed"));
 }
 
 /* F9 — toggle screen recording to a VP9 .webm (backbuffer -> VP9 -> WebM on a
@@ -598,13 +736,13 @@ static void cmd_record_toggle_(void)
         uint32_t frames  = jce_editor_recorder_frame_count();
         uint32_t dropped = jce_editor_recorder_dropped();
         jce_editor_recorder_stop();
-        jce_toast_info("Recording stopped: %u frames encoded (%u dropped)",
+        jce_toast_info(jce_editor_i18n("toast.recordingStopped"),
                        frames, dropped);
         return;
     }
 
     JceRenderer *r = jce_editor_get_renderer();
-    if (!r) { jce_toast_error("Record: renderer unavailable"); return; }
+    if (!r) { jce_toast_error("%s", jce_editor_i18n("toast.recordNoRenderer")); return; }
 
     char dir[1024];
     jce_editor_dotjce_path("recordings", dir, sizeof(dir));
@@ -617,9 +755,9 @@ static void cmd_record_toggle_(void)
     snprintf(path, sizeof(path), "%s/rec_%s.mkv", dir, stamp);
 
     if (jce_editor_recorder_start(r, path))
-        jce_toast_info("Recording -> %s (F9 to stop)", path);
+        jce_toast_info(jce_editor_i18n("toast.recordingStarted"), path);
     else
-        jce_toast_error("Record start failed");
+        jce_toast_error("%s", jce_editor_i18n("toast.recordStartFailed"));
 }
 
 static void cmd_create_(const char *name) {
@@ -748,6 +886,23 @@ static const PaletteCmd s_palette_cmds[] = {
 };
 enum { PALETTE_CMD_COUNT = (int)(sizeof s_palette_cmds / sizeof s_palette_cmds[0]) };
 
+/* Translated label / category for a palette command.  Keys derive from
+ * the stable command id ("palette.cmd.<id>") and category
+ * ("palette.cat.<category>"); the English table literals stay as the
+ * fallback so unknown ids degrade gracefully. */
+static const char *palette_cmd_label_(const PaletteCmd &c)
+{
+    char key[96];
+    snprintf(key, sizeof key, "palette.cmd.%s", c.id);
+    return jce_editor_i18n_or(key, c.label);
+}
+static const char *palette_cmd_category_(const PaletteCmd &c)
+{
+    char key[64];
+    snprintf(key, sizeof key, "palette.cat.%s", c.category);
+    return jce_editor_i18n_or(key, c.category);
+}
+
 /* Lower-case substring match: returns true iff every char of `q` appears
  * in `hay` in order (subsequence match, like VS Code command palette). */
 static bool palette_match(const char *hay, const char *q) {
@@ -818,9 +973,9 @@ static void draw_command_palette(void)
     int  filt_n = 0;
     for (int i = 0; i < PALETTE_CMD_COUNT; i++) {
         const PaletteCmd &c = s_palette_cmds[i];
-        if (palette_match(c.label, s_palette_query)
+        if (palette_match(palette_cmd_label_(c), s_palette_query)
             || palette_match(c.id, s_palette_query)
-            || palette_match(c.category, s_palette_query))
+            || palette_match(palette_cmd_category_(c), s_palette_query))
         {
             filt_idx[filt_n++] = i;
         }
@@ -840,7 +995,8 @@ static void draw_command_palette(void)
             int ci = filt_idx[row];
             const PaletteCmd &c = s_palette_cmds[ci];
             char buf[256];
-            snprintf(buf, sizeof buf, "%-32s  [%s]", c.label, c.category);
+            snprintf(buf, sizeof buf, "%-32s  [%s]",
+                     palette_cmd_label_(c), palette_cmd_category_(c));
             bool selected = (row == s_palette_sel);
             if (ImGui::Selectable(buf, selected)) {
                 s_palette_sel = row;
@@ -901,29 +1057,9 @@ static void draw_menu_bar(void)
      * to the dockspace; we retry up to 30 frames. A floating (un-docked)
      * panel has no tab bar so we fall back to SetWindowFocus once the TTL
      * expires — at that point the menu has likely been dismissed anyway. */
-    static const char *s_pending_dock_tab = NULL;
-    static int         s_pending_dock_tab_ttl = 0;
-    if (s_pending_dock_tab) {
-        ImGuiWindow *w = ImGui::FindWindowByName(s_pending_dock_tab);
-        bool done = false;
-        if (w && w->DockNode && w->DockNode->TabBar) {
-            ImGuiID tab_id = w->TabId ? w->TabId : w->ID;
-            w->DockNode->TabBar->NextSelectedTabId = tab_id;
-            done = true;
-        }
-        if (--s_pending_dock_tab_ttl <= 0 && !done) {
-            /* Fallback for floating windows: traditional focus. */
-            if (w) ImGui::SetWindowFocus(s_pending_dock_tab);
-            done = true;
-        }
-        if (done) {
-            s_pending_dock_tab = NULL;
-            s_pending_dock_tab_ttl = 0;
-        }
-    }
+    pump_pending_panel_focus();
     auto focus_dock_tab = [](const char *name) {
-        s_pending_dock_tab = name;
-        s_pending_dock_tab_ttl = 30;
+        jce_editor_panel_request_focus(name);
     };
 
 #define JCE_OPEN_WB(host_enum, host_id, req_fn, idx)                       \
@@ -1085,6 +1221,7 @@ static void draw_menu_bar(void)
                             "Ctrl+Shift+P")) {
             bool *v = jce_editor_panel_visible_ptr(JCE_PANEL_PROJECT_SETTINGS);
             if (v) *v = true;
+            jce_editor_panel_request_focus("###project_settings");
         }
         ImGui::Separator();
         if (ImGui::MenuItem(jce_editor_i18n("menu.file.exit"), "Alt+F4"))
@@ -1210,7 +1347,7 @@ static void draw_menu_bar(void)
             const bool clicked = ImGui::MenuItem(label, accel, vis);
             if (clicked && vis && *vis) focus_dock_tab(window_id);
         };
-        /* P8-A: Window menu re-organised around the 7 Workbenches +
+        /* P8-A: Window menu re-organised around the 8 Workbenches +
          * primary panels. */
 
         /* Core panels (real, not shims) */
@@ -1356,6 +1493,32 @@ static void draw_menu_bar(void)
                 if (ImGui::MenuItem(jce_editor_i18n("window.buildReport"), NULL, bp_tab == 1)) JCE_OPEN_WB(JCE_PANEL_BUILD_PROFILES, "###build_profiles", jce_panel_build_profiles_request_tab, 1);
                 ImGui::Unindent(indent_w);
             }
+            ImGui::Separator();
+
+            /* W8 Audio */
+            if (host_item(jce_editor_i18n("audioMixer.title"),
+                          JCE_PANEL_AUDIO_MIXER, "###audio_mixer")) {
+                ImGui::TextDisabled("%s", jce_editor_i18n("window.workbench.audio.tools"));
+                ImGui::Indent(indent_w);
+                const int audio_tab = jce_editor_audio_mixer_current_tab();
+                if (ImGui::MenuItem(jce_editor_i18n("audioMixer.tab.mixer"),
+                                    NULL, audio_tab == 0)) {
+                    bool *_v = jce_editor_panel_visible_ptr(JCE_PANEL_AUDIO_MIXER);
+                    if (_v) *_v = true;
+                    jce_editor_audio_mixer_focus_mixer_tab();
+                    focus_dock_tab("###audio_mixer");
+                }
+                if (ImGui::MenuItem(jce_editor_i18n("window.reverbZones"),
+                                    NULL, audio_tab == 2)) {
+                    bool *_v = jce_editor_panel_visible_ptr(JCE_PANEL_AUDIO_MIXER);
+                    bool *_rv = jce_editor_panel_visible_ptr(JCE_PANEL_REVERB_ZONES);
+                    if (_v) *_v = true;
+                    if (_rv) *_rv = false;
+                    jce_editor_audio_mixer_focus_reverb_tab();
+                    focus_dock_tab("###audio_mixer");
+                }
+                ImGui::Unindent(indent_w);
+            }
 
             ImGui::EndMenu();
         }
@@ -1371,18 +1534,17 @@ static void draw_menu_bar(void)
 
         /* Authoring tools — non-Workbench standalones */
         if (ImGui::BeginMenu(jce_editor_i18n("window.group.tools"))) {
-            panel_toggle(jce_editor_i18n("audioMixer.title"),    JCE_PANEL_AUDIO_MIXER,    "###audio_mixer");
             panel_toggle(jce_editor_i18n("inputManager.title"),  JCE_PANEL_INPUT_MANAGER,  "###input_manager");
             panel_toggle(jce_editor_i18n("spriteEditor.title"),  JCE_PANEL_SPRITE_EDITOR,  "###sprite_editor");
             panel_toggle(jce_editor_i18n("tilePalette.title"),   JCE_PANEL_TILE_PALETTE,   "###tile_palette");
             panel_toggle(jce_editor_i18n("window.vcamManager"),  JCE_PANEL_VCAM_MANAGER,   "###vcam_manager");
-            panel_toggle(jce_editor_i18n("window.reverbZones"),  JCE_PANEL_REVERB_ZONES,   "###reverb_zones");
             panel_toggle(jce_editor_i18n("window.saveBrowser"),  JCE_PANEL_SAVE_BROWSER,   "###save_browser");
             panel_toggle(jce_editor_i18n("testRunner.title"),    JCE_PANEL_TEST_RUNNER,    "###test_runner");
             panel_toggle(jce_editor_i18n("window.systems"),      JCE_PANEL_SYSTEMS,        "###systems");
             panel_toggle(jce_editor_i18n("window.versionControl"), JCE_PANEL_VERSION_CONTROL, "###version_control");
             ImGui::Separator();
             panel_toggle(jce_editor_i18n("window.search"), JCE_PANEL_SEARCH, "###search", "Ctrl+K");
+            panel_toggle(jce_editor_i18n("window.userGuide"), JCE_PANEL_USER_GUIDE, "###user_guide");
             /* Project Settings is a modal (P8-C). It lives under Edit and
              * File menus; not exposed as a dockable Window entry. */
             ImGui::EndMenu();
@@ -1553,6 +1715,12 @@ static void draw_menu_bar(void)
     }
 
     if (ImGui::BeginMenu(jce_editor_i18n("menu.help"))) {
+        if (ImGui::MenuItem(jce_editor_i18n("menu.help.welcome")))
+            s_show_welcome = true;
+        if (ImGui::MenuItem(jce_editor_i18n("menu.help.guide"))) {
+            *jce_editor_panel_visible_ptr(JCE_PANEL_USER_GUIDE) = true;
+            jce_editor_panel_request_focus("###user_guide");
+        }
         if (ImGui::MenuItem(jce_editor_i18n("menu.help.about")))
             s_show_about = true;
         ImGui::EndMenu();
@@ -1613,17 +1781,19 @@ static void dock_extension_panels(ImGuiID left_id,
      * memory_profiler, frame_debugger, package_manager, build_report,
      * shader_graph, lan_discovery, render_pipeline, lightmap_bake) have no
      * top-level window of their own — activating them redirects to a workbench
-     * host's tab — so we deliberately omit them. We dock the 7 workbench hosts
+     * host's tab — so we deliberately omit them. We dock the 8 workbench hosts
      * and every remaining standalone panel instead. */
 
     /* ── Right column: scene-wide settings, lighting, terrain, navmesh ── */
     ImGui::DockBuilderDockWindow("###lighting_settings",  right_id); /* Rendering workbench */
     ImGui::DockBuilderDockWindow("###vcam_manager",       right_id);
-    ImGui::DockBuilderDockWindow("###reverb_zones",       right_id);
     ImGui::DockBuilderDockWindow("###physics_debugger",   right_id);
     ImGui::DockBuilderDockWindow("###tags_layers",        right_id);
+    ImGui::DockBuilderDockWindow("###physics_layers",     right_id);
     ImGui::DockBuilderDockWindow("###jce_navmesh",        right_id);
     ImGui::DockBuilderDockWindow("###jce_terrain",        right_id);
+    ImGui::DockBuilderDockWindow("###bt_visualizer",      right_id);
+    ImGui::DockBuilderDockWindow("###world_streaming",    right_id);
 
     /* ── Bottom strip: profilers, builders, testing, audio, IO, browsers ── */
     ImGui::DockBuilderDockWindow("###profiler",       bottom_id); /* Profiling workbench */
@@ -1636,12 +1806,15 @@ static void dock_extension_panels(ImGuiID left_id,
     ImGui::DockBuilderDockWindow("###version_control",    bottom_id);
     ImGui::DockBuilderDockWindow("###jce_anim_editor",    bottom_id); /* Animation workbench */
     ImGui::DockBuilderDockWindow("###search",             bottom_id);
+    ImGui::DockBuilderDockWindow("###tile_palette",       bottom_id);
 
     /* ── Center: authoring canvases that share space with Scene/Game ── */
     ImGui::DockBuilderDockWindow("###jce_material_graph", center_id); /* Graphs workbench    */
     ImGui::DockBuilderDockWindow("###bundle_browser",     center_id); /* Asset Pipeline wb   */
     ImGui::DockBuilderDockWindow("###network_stats",      center_id); /* Network workbench   */
     ImGui::DockBuilderDockWindow("###sprite_editor",      center_id);
+    ImGui::DockBuilderDockWindow("###project_settings",   center_id);
+    ImGui::DockBuilderDockWindow("###user_guide",         center_id);
 
     (void)left_id;
 }
@@ -1934,7 +2107,6 @@ static void setup_cinematic_docking_layout(ImGuiID dockspace_id)
     ImGui::DockBuilderDockWindow("Scene###scene_view",         center_id);
     ImGui::DockBuilderDockWindow("Game###game_view",           center_id);
     ImGui::DockBuilderDockWindow("VCam Manager###vcam_manager",right_id);
-    ImGui::DockBuilderDockWindow("Time of Day###time_of_day",  right_id);
     ImGui::DockBuilderDockWindow("Inspector###inspector",      right_id);
     /* Bottom: timeline + curve editor + sequencer cluster for cinematic editing. */
     ImGui::DockBuilderDockWindow("Timeline###timeline",        bottom_id);
@@ -2032,11 +2204,67 @@ static void apply_layout_preset(ImGuiID dockspace_id, int preset)
  *  PANEL WINDOWS
  * ══════════════════════════════════════════════════════════════════════ */
 
+/* Buddy table for the first-open dock fallback below: a panel with no
+ * saved layout docks as a tab next to its most natural sibling instead
+ * of opening as a floating centered window.  Entries are ###id suffixes;
+ * each buddy list ends with a panel that is open in practically every
+ * session (Inspector / Console) so the lookup almost never misses.
+ * Panels NOT listed fall through to the generic Console→Inspector chain
+ * — i.e. the default for any future panel is "docked", never "floating".
+ * (Layout RESETS place everything explicitly via dock_extension_panels;
+ * this fallback covers sessions whose imgui.ini predates a new panel.) */
+typedef struct {
+    const char *id;          /* "###window_id" */
+    const char *buddies[3];  /* tried in order; NULL-terminated */
+} JcePoseBuddy;
+
+static const JcePoseBuddy k_pose_buddies[] = {
+    { "###bt_visualizer",    { "###jce_navmesh", "###inspector",  NULL } },
+    { "###world_streaming",  { "###jce_navmesh", "###inspector",  NULL } },
+    { "###tile_palette",     { "###assets",      "###console",    NULL } },
+    { "###physics_layers",   { "###tags_layers", "###inspector",  NULL } },
+    { "###project_settings", { "###scene_view",  "###inspector",  NULL } },
+    { "###user_guide",       { "###scene_view",  "###inspector",  NULL } },
+};
+
+/* Find the dock node of the first buddy window that exists and is
+ * docked.  FindWindowByName only sees windows created this session, so
+ * the chains end in always-open panels. */
+static ImGuiID pose_buddy_dock_id(const char *imgui_window_name)
+{
+    const char *id = strstr(imgui_window_name, "###");
+    if (!id) return 0;
+
+    const char *generic[3] = { "###console", "###inspector", NULL };
+    const char *const *buddies = generic;
+    for (size_t i = 0; i < sizeof(k_pose_buddies) / sizeof(k_pose_buddies[0]); i++) {
+        if (strcmp(k_pose_buddies[i].id, id) == 0) {
+            buddies = k_pose_buddies[i].buddies;
+            break;
+        }
+    }
+    for (int b = 0; b < 3 && buddies[b]; b++) {
+        ImGuiWindow *w = ImGui::FindWindowByName(buddies[b]);
+        if (w && w->DockId != 0) return w->DockId;
+    }
+    return 0;
+}
+
 extern "C" void jce_editor_panel_default_pose(const char *imgui_window_name)
 {
     if (!imgui_window_name) return;
     ImGuiViewport *vp = ImGui::GetMainViewport();
     if (!vp) return;
+
+    /* First choice: dock beside a buddy (FirstUseEver — never disturbs a
+     * window the user has already placed). */
+    ImGuiID dock = pose_buddy_dock_id(imgui_window_name);
+    if (dock != 0) {
+        ImGui::SetNextWindowDockID(dock, ImGuiCond_FirstUseEver);
+        return;
+    }
+
+    /* Last resort (no buddy window alive yet): centered float. */
     ImVec2 size(vp->WorkSize.x * 0.6f, vp->WorkSize.y * 0.6f);
     ImVec2 center(vp->WorkPos.x + vp->WorkSize.x * 0.5f,
                   vp->WorkPos.y + vp->WorkSize.y * 0.5f);
@@ -2153,6 +2381,14 @@ static void draw_panel_windows(void)
     /* ── Lighting ─────────────────────────────────────────────────── */
     /* (Merged into JCE_PANEL_LIGHTING_SETTINGS — see below.) */
 
+    /* ── Reverb Zones (merged into Audio Mixer) ───────────────────── */
+    if (*jce_editor_panel_visible_ptr(JCE_PANEL_REVERB_ZONES)) {
+        /* Route legacy visibility to Audio Mixer before the host draws,
+         * so Window > Reverb Zones lands on the Reverb tab this frame
+         * without flashing a dead "Reverb Zones" window. */
+        jce_editor_panel_reverb_zones_content();
+    }
+
     /* ── Audio Mixer ──────────────────────────────────────────────── */
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_AUDIO_MIXER)) {
         snprintf(lbl, sizeof(lbl), "%s###audio_mixer",
@@ -2244,18 +2480,17 @@ static void draw_panel_windows(void)
         jce_editor_panel_memory_profiler();
     }
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_PHYSICS_DEBUGGER)) {
-        snprintf(lbl, sizeof(lbl), "Physics Debugger###physics_debugger");
+        snprintf(lbl, sizeof(lbl), "%s###physics_debugger",
+                 jce_editor_i18n("window.physicsDebugger"));
         jce_editor_panel_default_pose(lbl);
         if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_PHYSICS_DEBUGGER), ImGuiWindowFlags_NoFocusOnAppearing))
             jce_editor_panel_physics_debugger_content();
         ImGui::End();
     }
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_LIGHT_EXPLORER)) {
-        snprintf(lbl, sizeof(lbl), "Light Explorer###light_explorer");
-        jce_editor_panel_default_pose(lbl);
-        if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_LIGHT_EXPLORER), ImGuiWindowFlags_NoFocusOnAppearing))
-            jce_editor_panel_light_explorer_content();
-        ImGui::End();
+        /* Legacy shim: route to the Lighting Settings workbench tab. */
+        jce_editor_panel_light_explorer_content();
+        jce_editor_panel_request_focus("###lighting_settings");
     }
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_REFLECTION_PROBES)) {
         /* Redirects to the Lighting Settings workbench's Reflection Probes tab. */
@@ -2266,45 +2501,47 @@ static void draw_panel_windows(void)
         jce_editor_panel_shader_graph();
     }
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_SEARCH)) {
-        snprintf(lbl, sizeof(lbl), "Search###search");
+        snprintf(lbl, sizeof(lbl), "%s###search", jce_editor_i18n("window.search"));
         jce_editor_panel_default_pose(lbl);
         if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_SEARCH), ImGuiWindowFlags_NoFocusOnAppearing))
             jce_editor_panel_search_content();
         ImGui::End();
     }
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_VERSION_CONTROL)) {
-        snprintf(lbl, sizeof(lbl), "Version Control###version_control");
+        snprintf(lbl, sizeof(lbl), "%s###version_control",
+                 jce_editor_i18n("window.versionControl"));
         jce_editor_panel_default_pose(lbl);
         if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_VERSION_CONTROL), ImGuiWindowFlags_NoFocusOnAppearing))
             jce_editor_panel_version_control_content();
         ImGui::End();
     }
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_TIME_OF_DAY)) {
-        snprintf(lbl, sizeof(lbl), "Time of Day###time_of_day");
-        jce_editor_panel_default_pose(lbl);
-        if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_TIME_OF_DAY), ImGuiWindowFlags_NoFocusOnAppearing))
-            jce_editor_panel_time_of_day_content();
-        ImGui::End();
+        /* Legacy shim: route to the Lighting Settings workbench tab. */
+        jce_editor_panel_time_of_day_content();
+        jce_editor_panel_request_focus("###lighting_settings");
     }
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_VCAM_MANAGER)) {
-        snprintf(lbl, sizeof(lbl), "VCam Manager###vcam_manager");
+        snprintf(lbl, sizeof(lbl), "%s###vcam_manager",
+                 jce_editor_i18n("window.vcamManager"));
         jce_editor_panel_default_pose(lbl);
         if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_VCAM_MANAGER), ImGuiWindowFlags_NoFocusOnAppearing))
             jce_editor_panel_vcam_manager_content();
         ImGui::End();
     }
-    if (*jce_editor_panel_visible_ptr(JCE_PANEL_REVERB_ZONES)) {
-        snprintf(lbl, sizeof(lbl), "Reverb Zones###reverb_zones");
-        jce_editor_panel_default_pose(lbl);
-        if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_REVERB_ZONES), ImGuiWindowFlags_NoFocusOnAppearing))
-            jce_editor_panel_reverb_zones_content();
-        ImGui::End();
-    }
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_SAVE_BROWSER)) {
-        snprintf(lbl, sizeof(lbl), "Save Browser###save_browser");
+        snprintf(lbl, sizeof(lbl), "%s###save_browser",
+                 jce_editor_i18n("window.saveBrowser"));
         jce_editor_panel_default_pose(lbl);
         if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_SAVE_BROWSER), ImGuiWindowFlags_NoFocusOnAppearing))
             jce_editor_panel_save_browser_content();
+        ImGui::End();
+    }
+    if (*jce_editor_panel_visible_ptr(JCE_PANEL_USER_GUIDE)) {
+        snprintf(lbl, sizeof(lbl), "%s###user_guide",
+                 jce_editor_i18n("window.userGuide"));
+        jce_editor_panel_default_pose(lbl);
+        if (ImGui::Begin(lbl, jce_editor_panel_visible_ptr(JCE_PANEL_USER_GUIDE), ImGuiWindowFlags_NoFocusOnAppearing))
+            jce_editor_panel_user_guide_content();
         ImGui::End();
     }
     if (*jce_editor_panel_visible_ptr(JCE_PANEL_BUNDLE_BROWSER)) {
@@ -2596,6 +2833,8 @@ static void draw_status_bar(void)
 
 void jce_editor_layout_draw(void)
 {
+    resolve_startup_welcome_once();
+
     /* Play Mode tint: push orange title-bar/border colors so every panel
        (DockSpace, child windows, dialogs) clearly signals we're playing. */
     JcePlayState _play = jce_state_get_play_state();
@@ -2777,9 +3016,8 @@ void jce_editor_layout_draw(void)
      * to scene/entity commands here. */
     handle_global_edit_shortcuts();
 
-    /* Preferences (floating). */
-    jce_editor_panel_default_pose("preferences");
-    jce_editor_panel_preferences();
+    /* Preferences (modal popup; the retired dockable JCE_PANEL_PREFERENCES
+     * panel was removed — JCE_PANEL_USER_PREFERENCES is the single one). */
     jce_editor_panel_default_pose("user_preferences");
     jce_editor_panel_user_preferences();
 
@@ -2805,6 +3043,12 @@ void jce_editor_layout_draw(void)
 
     /* Toast overlay — draw last so it renders on top of everything. */
     jce_editor_toast_draw();
+
+    /* Frame-sliced scene load in progress: dim + gate the whole editor so the
+     * user cannot operate on a scene that is still being created.  Drawn after
+     * everything else so it sits on top of all panels and dialogs. */
+    if (jce_state_is_scene_loading())
+        draw_scene_loading_overlay();
 
     /* Unsaved-changes modal resolved → carry out the pending action.
      * The SAME state machine serves quit and the scene-swap gate; which

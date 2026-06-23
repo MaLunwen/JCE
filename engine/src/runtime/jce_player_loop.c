@@ -141,28 +141,75 @@ jce_player_loop_unregister(JcePlayerLoopHandle h)
     }
 }
 
+/* Phase-local lookup by id.  Ids are globally unique and never reused, so a
+ * captured id matches at most the one slot it was taken from (or nothing, if
+ * that slot was unregistered). */
+static PhaseSlot *find_slot_in_phase(PhaseList *p, uint32_t id)
+{
+    for (uint32_t i = 0u; i < p->count; ++i)
+        if (p->items[i].id == id) return &p->items[i];
+    return NULL;
+}
+
 void JCE_CALL
 jce_player_loop_run_phase(JcePlayerLoopPhase phase, float dt)
 {
     if ((unsigned)phase >= (unsigned)JCE_PHASE_COUNT) return;
 
     PhaseList *p = &s_phases[phase];
-    /* Snapshot count up front: a callback that registers another
-     * callback for the same phase must not fire this frame. */
     const uint32_t n = p->count;
+    if (n == 0u) return;
+
+    /* Dispatch by IDENTITY, not by position.  A callback may register or
+     * unregister a same-phase slot mid-loop, which memmoves the dense array;
+     * iterating by index would then skip a shifted-in sibling or re-run a
+     * shifted-up slot (audit Round-3 P2).  We snapshot the ids present at
+     * entry and run each by id-lookup, which yields exactly-once dispatch:
+     *   - ids registered during this call are absent from the snapshot, so
+     *     they do not fire this frame (the documented contract); and
+     *   - ids unregistered during this call are no longer found, so they do
+     *     not fire.
+     * last_ms is written back via the same id, so a mid-loop insert can never
+     * misattribute a duration to the wrong slot. */
+    uint32_t  ids_stack[64];
+    uint32_t *ids = ids_stack;
+    bool      ids_heap = false;
+    if (n > (uint32_t)(sizeof(ids_stack) / sizeof(ids_stack[0]))) {
+        uint32_t *h = (uint32_t *)JCE_AREALLOC(s_alloc, NULL,
+                                               (size_t)n * sizeof(uint32_t));
+        if (h) { ids = h; ids_heap = true; }
+    }
+    /* When the heap snapshot fails (OOM) we cap to the stack buffer; better to
+     * dispatch the first 64 than to crash. */
+    const uint32_t cap = ids_heap
+        ? n
+        : (n < (uint32_t)(sizeof(ids_stack) / sizeof(ids_stack[0]))
+               ? n
+               : (uint32_t)(sizeof(ids_stack) / sizeof(ids_stack[0])));
+    for (uint32_t i = 0u; i < cap; ++i)
+        ids[i] = p->items[i].id;
+
     const uint64_t freq = jce_time_perf_freq();
-    for (uint32_t i = 0u; i < n; ++i) {
-        PhaseSlot *s = &p->items[i];
-        if (!s->fn || !s->enabled) continue;
+    for (uint32_t k = 0u; k < cap; ++k) {
+        PhaseSlot *s = find_slot_in_phase(p, ids[k]);
+        if (!s || !s->fn || !s->enabled) continue;   /* unregistered/disabled */
+        const JcePlayerLoopFn fn   = s->fn;
+        void *const           user = s->user;
         /* Single timestamp diff per call: cheap enough to keep
          * unconditionally compiled in (baseline target: ~30 ns / call). */
         const uint64_t t0 = jce_time_perf_counter();
-        s->fn(dt, s->user);
+        fn(dt, user);
         const uint64_t t1 = jce_time_perf_counter();
-        s->last_ms = (freq > 0u)
-            ? ((double)(t1 - t0) * 1000.0 / (double)freq)
-            : 0.0;
+        /* Re-find by id: fn() may have realloc'd/memmoved the array. */
+        s = find_slot_in_phase(p, ids[k]);
+        if (s) {
+            s->last_ms = (freq > 0u)
+                ? ((double)(t1 - t0) * 1000.0 / (double)freq)
+                : 0.0;
+        }
     }
+
+    if (ids_heap) JCE_AFREE(s_alloc, ids);
 }
 
 uint32_t JCE_CALL

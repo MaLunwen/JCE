@@ -17,7 +17,6 @@
 
 #include <jce/renderer/jce_material_registry.h>
 
-#include <jce/application/jce_args.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
 
@@ -60,10 +59,15 @@ static void build_host_path(const char *vfs_path,
              s.dev_dir, has_trail ? "" : "/", vfs_path);
 }
 
-bool jce_material_registry_init(void)
+bool jce_material_registry_init(const char *dev_assets_dir)
 {
+    /* The dev-assets directory is supplied by the caller (the game/app layer,
+     * which owns jce_args) — the renderer no longer reaches UP into the
+     * application layer for it.  NULL/empty => registry inactive (no hot-reload,
+     * e.g. shipped builds). */
     memset(&s, 0, sizeof(s));
-    if (jce_args_get_dev_assets(s.dev_dir, sizeof(s.dev_dir))) {
+    if (dev_assets_dir && dev_assets_dir[0]) {
+        snprintf(s.dev_dir, sizeof(s.dev_dir), "%s", dev_assets_dir);
         s.active = true;
         LOG_INFO(LOG_TAG, "hot-reload registry active (dev='%s')",
                  s.dev_dir);

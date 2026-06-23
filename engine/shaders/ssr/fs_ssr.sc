@@ -38,7 +38,12 @@ float linearize(float d, float n, float f)
 
 vec3 reconstruct_world(vec2 uv, float d)
 {
-	vec4 ndc = vec4(uv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);
+#if BGFX_SHADER_LANGUAGE_GLSL
+	float ndc_z = d * 2.0 - 1.0;   /* GL: depth-buffer NDC z is [-1,1] */
+#else
+	float ndc_z = d;               /* D3D/Vulkan/Metal/WebGPU: NDC z is [0,1] */
+#endif
+	vec4 ndc = vec4(uv * 2.0 - 1.0, ndc_z, 1.0);
 	vec4 wp = mul(u_invViewProj, ndc);
 	return wp.xyz / wp.w;
 }
@@ -64,7 +69,12 @@ void main()
 		vec4 vp = mul(u_view, vec4(wp, 1.0));
 		vec3 view_pos = vp.xyz;
 
-		vec3 nworld = normalize(texture2D(s_normal, uv).xyz * 2.0 - 1.0);
+		/* Real world-space normal + roughness from the G-buffer
+		 * (rgb = normal*0.5+0.5, a = roughness).  Cleared pixels (sky/skinned)
+		 * have roughness 1 => the (1-roughness) factor below kills reflection. */
+		vec4 nr = texture2D(s_normal, uv);
+		float roughness = nr.w;
+		vec3 nworld = normalize(nr.xyz * 2.0 - 1.0);
 		vec3 view_n = normalize(mul(u_view, vec4(nworld, 0.0)).xyz);
 		vec3 view_dir = normalize(view_pos);
 		vec3 view_r = reflect(view_dir, view_n);
@@ -99,8 +109,14 @@ void main()
 			}
 		}
 
-		hit_color.rgb *= intensity * fade;
-		hit_color.a   *= fade;
+		/* Fresnel (Schlick, dielectric F0=0.1 floor) × roughness gate: grazing
+		 * reflections strengthen, head-on weaken, and matte (high-roughness)
+		 * surfaces stop reflecting — physically plausible per-material SSR. */
+		float cosTheta = clamp(dot(-view_dir, view_n), 0.0, 1.0);
+		float fres = 0.1 + 0.9 * pow(1.0 - cosTheta, 4.0);
+		float refl = fres * (1.0 - roughness);
+		hit_color.rgb *= intensity * fade * refl;
+		hit_color.a   *= fade * refl;
 		gl_FragColor = hit_color;
 	}
 }

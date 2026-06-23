@@ -13,6 +13,8 @@
 #include <jce/resource/jce_bundle_pack.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_str.h>
+#include <jce/os/core/jce_jobs.h>
+#include <jce/os/core/jce_thread.h>
 #include <jce/resource/jce_archive_cook.h>
 
 #include "jce_cook_policy.h"
@@ -57,19 +59,29 @@ typedef struct PackCtx {
 } PackCtx;
 
 /* Thread-local so concurrent jce_bundle_pack_run() calls (e.g. CLI on
- * one thread, editor on another) cannot stomp each other.  We fall
- * back to a plain static if the compiler does not support TLS — that's
- * still safe for the only realistic concurrency case (one worker per
- * editor instance + an optional CLI in a separate process). */
-#if defined(_MSC_VER)
-#  define PACK_TLS __declspec(thread)
-#elif defined(__GNUC__) || defined(__clang__)
-#  define PACK_TLS __thread
-#else
-#  define PACK_TLS
-#endif
+ * one thread, editor on another) cannot stomp each other.  Backed by
+ * jce_tls_* (SDL3) instead of a per-toolchain TLS keyword, so there is
+ * no silent data-race fallback on compilers without native TLS. */
+static JceTLS *g_pack_tls = NULL;
 
-static PACK_TLS PackCtx *g_ctx = NULL;
+static PackCtx *pack_ctx_get(void)
+{
+    return g_pack_tls ? (PackCtx *)jce_tls_get(g_pack_tls) : NULL;
+}
+
+static void pack_ctx_set(PackCtx *c)
+{
+    if (!g_pack_tls) g_pack_tls = jce_tls_create(NULL);
+    jce_tls_set(g_pack_tls, c);
+}
+
+/* Non-NULL only for the duration of the phase-2 parallel cook.  The active VFS
+ * (PhysFS) is not reentrant, and cook_asset re-enters read_asset()->
+ * jce_fs_read_all on worker threads for sibling .import.json sidecars, so this
+ * serialises VFS reads across the cook workers + the driver's cooperative drain
+ * (audit Round-3 P1).  It is a process-global shared by all packer instances,
+ * which is safe: only one parallel cook runs at a time per process. */
+static JceMutex *s_vfs_read_mutex = NULL;
 
 static void pack_emit(JceBundlePackLogLevel level, const char *fmt, va_list ap)
 {
@@ -80,9 +92,10 @@ static void pack_emit(JceBundlePackLogLevel level, const char *fmt, va_list ap)
     while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) {
         buf[--n] = '\0';
     }
-    if (g_ctx && g_ctx->log_fn) {
-        if (g_ctx->quiet && level == JCE_BUNDLE_PACK_LOG_INFO) return;
-        g_ctx->log_fn(level, buf, g_ctx->log_user);
+    PackCtx *ctx = pack_ctx_get();
+    if (ctx && ctx->log_fn) {
+        if (ctx->quiet && level == JCE_BUNDLE_PACK_LOG_INFO) return;
+        ctx->log_fn(level, buf, ctx->log_user);
     }
 }
 
@@ -120,9 +133,10 @@ static void pack_log_ok(const char *fmt, ...)
 static void die(const char *m)
 {
     pack_log_err("%s", m);
-    if (g_ctx) {
-        g_ctx->error_code = -1;
-        longjmp(g_ctx->jmp, 1);
+    PackCtx *ctx = pack_ctx_get();
+    if (ctx) {
+        ctx->error_code = -1;
+        longjmp(ctx->jmp, 1);
     }
     /* Should never reach here; abort just in case. */
     abort();
@@ -303,7 +317,39 @@ static const char *ext_register(ExternalMap *m, const char *abs)
     }
     ExternalEntry *e = &m->items[m->n++];
     e->abs = pack_strdup(abs);
-    e->vpath = ext_make_vpath(abs);
+    /* Convention sidecars ("<model>.jcol", "<skeleton>.anim.json") must
+     * keep their "<base><suffix>" relationship after virtualisation, or
+     * the runtime's suffix-derived lookups would miss: when the base
+     * asset is already registered, reuse its vpath + suffix instead of
+     * minting a fresh (differently-hashed) name.  Bases are always
+     * registered before their sidecars (scene scan stages models first;
+     * the virtualisation walk preserves insertion order). */
+    e->vpath = NULL;
+    {
+        static const char *const kSidecars[] = { ".jcol", ".anim.json", NULL };
+        size_t alen = strlen(abs);
+        for (size_t si = 0; kSidecars[si] && !e->vpath; ++si) {
+            size_t slen = strlen(kSidecars[si]);
+            if (alen <= slen || !ends_with_ci(abs, kSidecars[si]))
+                continue;
+            char base[1280];
+            if (alen - slen >= sizeof(base))
+                continue;
+            memcpy(base, abs, alen - slen);
+            base[alen - slen] = '\0';
+            const char *bvp = ext_lookup_vpath(m, base);
+            if (!bvp)
+                continue;
+            size_t need = strlen(bvp) + slen + 1;
+            char *out = (char *)JCE_MALLOC(need);
+            if (!out)
+                die("oom");
+            snprintf(out, need, "%s%s", bvp, kSidecars[si]);
+            e->vpath = out;
+        }
+    }
+    if (!e->vpath)
+        e->vpath = ext_make_vpath(abs);
     return e->vpath;
 }
 
@@ -510,7 +556,12 @@ static uint8_t *read_asset(const char *vpath, const char *resource_root,
     JceFileSystem *fs = jce_fs_get_active();
     if (fs) {
         uint64_t vsz = 0;
+        /* Serialise the non-reentrant VFS read when a parallel cook is in
+         * flight (s_vfs_read_mutex non-NULL); a no-op on the single-threaded
+         * driver path (audit Round-3 P1). */
+        if (s_vfs_read_mutex) jce_mutex_lock(s_vfs_read_mutex);
         void *vbuf = jce_fs_read_all(fs, vpath, &vsz);
+        if (s_vfs_read_mutex) jce_mutex_unlock(s_vfs_read_mutex);
         if (vbuf) {
             uint8_t *copy = (uint8_t *)JCE_MALLOC((size_t)vsz ? (size_t)vsz : 1);
             if (copy) {
@@ -616,6 +667,13 @@ static cJSON *cook_read_import_json(const char *vpath,
     return root;
 }
 
+/* Per-job cook outcome, written on the worker and replayed by the driver —
+ * workers must never touch the thread-local log sink (audit Round-3 P2). */
+typedef struct {
+    bool failed;       /* a cook was attempted but failed → shipped raw      */
+    char err[96];      /* short failure detail for the driver-side warning   */
+} CookStatus;
+
 /* Cook one gathered asset.  On success frees `raw` and returns a freshly
  * JCE_MALLOC'd cooked buffer (out_size set), keeping the original vpath
  * (runtime loaders content-sniff).  On any non-cook / failure case returns
@@ -624,9 +682,10 @@ static uint8_t *cook_asset(const char *vpath, uint8_t *raw, size_t raw_size,
                            const char *resource_root,
                            PackResolveFn resolve_fn, void *resolve_user,
                            const ExternalMap *emap, int target_platform,
-                           size_t *out_size)
+                           size_t *out_size, CookStatus *st)
 {
     if (out_size) *out_size = raw_size;
+    if (st) { st->failed = false; st->err[0] = '\0'; }
     if (!raw || raw_size == 0) return raw;
 
     CookClass cls = classify_cook(vpath);
@@ -642,10 +701,15 @@ static uint8_t *cook_asset(const char *vpath, uint8_t *raw, size_t raw_size,
         opt.texture_format   = jce_cook_auto_texture_format(vpath,
                                                             target_platform);
         opt.max_texture_size = 0;
+        /* Build-bundles iteration favours speed: range-fit block encode is
+         * ~5-7x faster than the cluster-fit default at a modest quality cost.
+         * An .import.json "quality" overrides per texture for hero/UI art. */
+        opt.encode_quality   = JCE_COOK_ENCODE_FAST;
         if (imp) {
             const cJSON *tf = cJSON_GetObjectItemCaseSensitive(imp, "target_format");
             const cJSON *gm = cJSON_GetObjectItemCaseSensitive(imp, "gen_mips");
             const cJSON *ms = cJSON_GetObjectItemCaseSensitive(imp, "max_size");
+            const cJSON *q  = cJSON_GetObjectItemCaseSensitive(imp, "quality");
             if (cJSON_IsString(tf)) {
                 int f = cook_parse_texfmt(tf->valuestring);
                 if (f >= 0) opt.texture_format = f;   /* -1 => keep auto */
@@ -653,18 +717,27 @@ static uint8_t *cook_asset(const char *vpath, uint8_t *raw, size_t raw_size,
             if (cJSON_IsBool(gm)) opt.generate_mipmaps = cJSON_IsTrue(gm);
             if (cJSON_IsNumber(ms) && ms->valuedouble > 0)
                 opt.max_texture_size = (int)ms->valuedouble;
+            if (cJSON_IsString(q)) {
+                if (jce_strcasecmp(q->valuestring, "fast") == 0)
+                    opt.encode_quality = JCE_COOK_ENCODE_FAST;
+                else if (jce_strcasecmp(q->valuestring, "high") == 0 ||
+                         jce_strcasecmp(q->valuestring, "default") == 0)
+                    opt.encode_quality = JCE_COOK_ENCODE_DEFAULT;
+                else if (jce_strcasecmp(q->valuestring, "highest") == 0)
+                    opt.encode_quality = JCE_COOK_ENCODE_HIGHEST;
+            }
         }
         JceCookResult r = jce_cook_texture(raw, raw_size, &opt);
         if (imp) cJSON_Delete(imp);
         if (!r.success || !r.data) {
-            pack_log_warn("cook texture failed (%s): %s — shipping raw",
-                          vpath, r.error[0] ? r.error : "unknown");
+            if (st) { st->failed = true;
+                snprintf(st->err, sizeof(st->err), "%s",
+                         r.error[0] ? r.error : "unknown"); }
             jce_cook_result_free(&r);
             return raw;
         }
         JCE_FREE(raw);
         if (out_size) *out_size = r.size;
-        LOG("cooked texture %s (%zu -> %zu B)", vpath, raw_size, r.size);
         return (uint8_t *)r.data;   /* JCE_MALLOC'd by the cooker */
     }
 
@@ -674,14 +747,14 @@ static uint8_t *cook_asset(const char *vpath, uint8_t *raw, size_t raw_size,
         JceCookResult r = jce_cook_audio(raw, raw_size, &opt);
         if (imp) cJSON_Delete(imp);
         if (!r.success || !r.data) {
-            pack_log_warn("cook audio failed (%s): %s — shipping raw",
-                          vpath, r.error[0] ? r.error : "unknown");
+            if (st) { st->failed = true;
+                snprintf(st->err, sizeof(st->err), "%s",
+                         r.error[0] ? r.error : "unknown"); }
             jce_cook_result_free(&r);
             return raw;
         }
         JCE_FREE(raw);
         if (out_size) *out_size = r.size;
-        LOG("cooked audio %s (%zu -> %zu B)", vpath, raw_size, r.size);
         return (uint8_t *)r.data;
     }
 
@@ -702,11 +775,58 @@ static uint8_t *cook_asset(const char *vpath, uint8_t *raw, size_t raw_size,
             && glb && glb_sz > 0) {
             JCE_FREE(raw);
             if (out_size) *out_size = glb_sz;
-            LOG("cooked model %s (%zu -> %zu B GLB)", vpath, raw_size, glb_sz);
             return glb;
         }
-        pack_log_warn("convert-to-GLB failed (%s) — shipping raw", vpath);
+        if (st) { st->failed = true;
+            snprintf(st->err, sizeof(st->err), "convert-to-GLB failed"); }
         return raw;
+    }
+}
+
+/* ── Parallel asset cook ──────────────────────────────────────────────
+ *
+ * cook_asset is the slow part of a build (BC block-encode = seconds per 2K
+ * texture; Assimp+meshopt for large models), and each asset cooks fully
+ * independently, so the per-bundle asset loop fans out onto the shared job
+ * pool.  Safety (see the per-field reasoning in the loop below):
+ *   - emap and resolve_fn/user are READ-ONLY during cooking — shared, no lock.
+ *   - each job writes only its own CookJob slot — no shared counter.
+ *   - workers NEVER call die()/longjmp or pack_log: g_ctx is thread-local and
+ *     belongs to the driver thread, and the editor's log sink is not
+ *     thread-safe.  read_asset / ext_rewrite_asset (longjmp on OOM) and
+ *     pack_strdup run on the driver BEFORE dispatch; cook_asset itself only
+ *     returns NULL/raw on failure (never longjmps), and its internal LOG/warn
+ *     lines are intentionally dropped on workers and reconstructed by the
+ *     driver from job metadata after the group completes (deterministic order).
+ * The lone non-reentrant encoder path (NVTT BC7/BC6H process-global flags) is
+ * serialised inside jce_tex_encode; the default BC3/BC5/ASTC policy never hits
+ * it, so the common case stays fully parallel. */
+typedef struct {
+    size_t      slot;       /* entries[] index this asset writes              */
+    const char *vpath;      /* borrowed (b->assets.items[i])                  */
+    uint8_t    *buf;        /* in: rewritten raw; out: cooked (worker writes)  */
+    size_t      in_size;    /* original size (for the reconstructed log line)  */
+    size_t      out_size;   /* cooked size (worker writes)                     */
+    CookStatus  status;     /* worker-written outcome, driver-replayed        */
+} CookJob;
+
+typedef struct {
+    CookJob          *jobs;
+    const char       *resource_root;
+    PackResolveFn     resolve_fn;
+    void             *resolve_user;
+    const ExternalMap *emap;
+    int               target_platform;
+} CookCtx;
+
+static void cook_jobs_range(int begin, int end, void *user)
+{
+    CookCtx *c = (CookCtx *)user;
+    for (int k = begin; k < end; ++k) {
+        CookJob *j = &c->jobs[k];
+        j->buf = cook_asset(j->vpath, j->buf, j->in_size, c->resource_root,
+                            c->resolve_fn, c->resolve_user, c->emap,
+                            c->target_platform, &j->out_size, &j->status);
     }
 }
 
@@ -859,6 +979,82 @@ static void bundle_add_asset(Bundle *b, const char *path) {
 static void bundle_add_dep(Bundle *b, const char *dep) {
     if (strcmp(b->id, dep) == 0) return;
     if (!sv_contains(&b->deps, dep)) sv_push(&b->deps, dep);
+}
+
+/* ================================================================== */
+/* Per-scene dependency staging                                        */
+/* ================================================================== */
+
+/* Shared state for pushing a discovered asset into BOTH the per-scene
+ * dep list (which doubles as the recursion's visited set) and the
+ * global asset→bundle association map. */
+typedef struct DepStage {
+    JceBundleDepList *deps;
+    AssetMap         *am;
+    const char       *scene_id;
+} DepStage;
+
+/* Push `vpath` if not already present.  Returns true when newly
+ * inserted (used as the fixed-point "grew" signal by the descriptor
+ * recursion). */
+static bool stage_push_dep(DepStage *st, const char *vpath,
+                           const char *bundle_tag)
+{
+    if (!vpath || !vpath[0]) return false;
+    JceBundleDepList *deps = st->deps;
+    for (uint32_t e = 0; e < deps->count; ++e) {
+        if (deps->items[e].path &&
+            strcmp(deps->items[e].path, vpath) == 0)
+            return false;
+    }
+    if (deps->count + 1 > deps->capacity) {
+        uint32_t nc = deps->capacity ? deps->capacity * 2 : 16;
+        JceBundleDep *g = (JceBundleDep *)JCE_REALLOC(
+            deps->items, nc * sizeof(*g));
+        if (!g) return false;
+        deps->items    = g;
+        deps->capacity = nc;
+    }
+    JceBundleDep *nd = &deps->items[deps->count++];
+    nd->path   = pack_strdup(vpath);
+    nd->bundle = bundle_tag ? pack_strdup(bundle_tag) : NULL;
+
+    AssetRef *r = am_get_or_create(st->am, vpath);
+    if (!sv_contains(&r->refs, st->scene_id))
+        sv_push(&r->refs, st->scene_id);
+    if (bundle_tag && !r->override)
+        r->override = pack_strdup(bundle_tag);
+    return true;
+}
+
+/* Game-content localization: jce_loc_set_source_pak() expects locale
+ * tables addressed as "i18n/<locale>.json" inside the mounted pak, so
+ * any "i18n/" directory under the source-assets root ships wholesale.
+ * Collected once per build, then staged into every scene's dep list —
+ * the shared-bundle threshold automatically promotes the tables into
+ * the shared bundle when more than one scene ships. */
+typedef struct I18nWalkCtx {
+    StrVec *out;
+    size_t  dir_len; /* strlen of the host i18n dir prefix */
+} I18nWalkCtx;
+
+static bool walk_i18n_cb(const char *path, bool is_dir, void *user)
+{
+    I18nWalkCtx *c = (I18nWalkCtx *)user;
+    if (is_dir || !path || !user)
+        return true;
+    if (!ends_with_ci(path, ".json"))
+        return true;
+    const char *rel = path + c->dir_len;
+    while (*rel == '/' || *rel == '\\') ++rel;
+    if (!*rel)
+        return true;
+    char vpath[1280];
+    snprintf(vpath, sizeof(vpath), "i18n/%s", rel);
+    normalise_sep(vpath);
+    if (!sv_contains(c->out, vpath))
+        sv_push(c->out, vpath);
+    return true;
 }
 
 /* ================================================================== */
@@ -1647,6 +1843,20 @@ static int run_build_impl(const JceBundlePackOptions *opts)
         LOG("no scenes; emitting empty catalog");
     }
 
+    /* Source-asset localization tables (packed by convention). */
+    StrVec i18n_files = {0};
+    {
+        char i18n_dir[1100];
+        snprintf(i18n_dir, sizeof(i18n_dir), "%s/i18n", resource_root);
+        if (jce_fs_host_exists_dir(i18n_dir)) {
+            I18nWalkCtx ic = { &i18n_files, strlen(i18n_dir) };
+            (void)jce_fs_host_walk(i18n_dir, walk_i18n_cb, &ic);
+            if (i18n_files.n)
+                LOG("localization: packing %zu i18n table(s) from %s",
+                    i18n_files.n, i18n_dir);
+        }
+    }
+
     StrVec   scene_ids = {0};
     AssetMap am        = {0};
 
@@ -1677,15 +1887,21 @@ static int run_build_impl(const JceBundlePackOptions *opts)
         }
 
         /* Depth-1..N recursion: a scene's first-level deps are usually
-         * descriptors (materials / prefabs / OBJ meshes) that themselves
-         * reference further assets.  Without this expansion the bundle
-         * would ship the .mat.json but not the .png it names, or the
-         * .obj but not the .mtl/.jpg the OBJ wires up via `mtllib` and
-         * `map_*`.  We expand iteratively up to a small depth cap so
-         * cycles can't run away.
+         * descriptors (materials / prefabs / OBJ meshes / world-streaming
+         * scene fragments) that themselves reference further assets.
+         * Without this expansion the bundle would ship the .mat.json but
+         * not the .png it names, the .obj but not the .mtl/.jpg the OBJ
+         * wires up via `mtllib` and `map_*`, or a streaming chunk's
+         * .scene.json fragment but none of the meshes/textures the
+         * fragment spawns.  We expand iteratively up to a small depth cap
+         * so cycles can't run away; the per-scene dep list doubles as the
+         * visited set (stage_push_dep dedups, so a fragment cycle simply
+         * stops growing).
          *
          * Three descriptor formats handled:
-         *   - *.json   → cJSON walk via jce_bundle_deps_scan
+         *   - *.json   → cJSON walk via jce_bundle_deps_scan (covers
+         *                .scene.json streaming fragments, incl. their own
+         *                nested "streaming" chunk tables)
          *   - *.obj    → parse `mtllib …` lines, push referenced MTLs
          *   - *.mtl    → parse `map_*` / `bump` / `disp` / `decal` / `refl`
          *                lines, push the texture paths
@@ -1694,43 +1910,9 @@ static int run_build_impl(const JceBundlePackOptions *opts)
          * names them — we resolve them against that file's directory so
          * the bundle stores vpaths the runtime VFS can actually open. */
         {
-            const int kMaxDepth = 6;
+            const int kMaxDepth = 8;
             size_t    start_idx = 0;
-
-            /* Helper: push a vpath into `deps` if not already present.
-             * Returns true if it was newly inserted. */
-            #define PUSH_DEP_IF_NEW(VPATH, BUNDLE_TAG)                       \
-                do {                                                         \
-                    const char *_vp = (VPATH);                               \
-                    if (!_vp || !_vp[0]) break;                              \
-                    bool _dup = false;                                       \
-                    for (uint32_t _e = 0; _e < deps.count; ++_e) {           \
-                        if (deps.items[_e].path &&                           \
-                            strcmp(deps.items[_e].path, _vp) == 0) {         \
-                            _dup = true; break;                              \
-                        }                                                    \
-                    }                                                        \
-                    if (!_dup) {                                             \
-                        if (deps.count + 1 > deps.capacity) {                \
-                            uint32_t _nc = deps.capacity ? deps.capacity*2 : 16; \
-                            JceBundleDep *_g = (JceBundleDep *)JCE_REALLOC(      \
-                                deps.items, _nc * sizeof(*_g));              \
-                            if (!_g) break;                                  \
-                            deps.items    = _g;                              \
-                            deps.capacity = _nc;                             \
-                        }                                                    \
-                        JceBundleDep *_nd = &deps.items[deps.count++];       \
-                        _nd->path   = pack_strdup(_vp);                      \
-                        _nd->bundle = (BUNDLE_TAG)                           \
-                                      ? pack_strdup(BUNDLE_TAG) : NULL;      \
-                        AssetRef *_r = am_get_or_create(&am, _vp);           \
-                        if (!sv_contains(&_r->refs, id_now))                 \
-                            sv_push(&_r->refs, id_now);                      \
-                        if ((BUNDLE_TAG) && !_r->override)                   \
-                            _r->override = pack_strdup(BUNDLE_TAG);          \
-                        grew = true;                                         \
-                    }                                                        \
-                } while (0)
+            DepStage  st = { &deps, &am, id_now };
 
             for (int depth = 0; depth < kMaxDepth; ++depth) {
                 uint32_t expand_until = deps.count;
@@ -1771,8 +1953,46 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                                                            child_sz, &sub);
                         if (parsed) {
                             for (uint32_t s = 0; s < sub.count; ++s) {
-                                PUSH_DEP_IF_NEW(sub.items[s].path,
-                                                sub.items[s].bundle);
+                                const char *sp = sub.items[s].path;
+                                if (!sp || !sp[0]) continue;
+                                /* Loaders resolve a descriptor's relative
+                                 * refs against the descriptor's own dir
+                                 * (.mat.json textures, .tilemap.json
+                                 * tilesets …), while authors equally write
+                                 * resource-root-relative paths.  Stage
+                                 * whichever candidates actually resolve; if
+                                 * neither does, stage the verbatim ref so
+                                 * the missing-asset error names what the
+                                 * descriptor asked for.  The archive's
+                                 * canonical normalisation (jce_archive_
+                                 * path.c) hashes "<dir>/../x" and "x"
+                                 * identically, so runtime lookups succeed
+                                 * for either spelling. */
+                                bool staged = false;
+                                if (base_dir[0] && !pack_is_abs_path(sp)) {
+                                    char joined[1536];
+                                    snprintf(joined, sizeof(joined),
+                                             "%s/%s", base_dir, sp);
+                                    if (strcmp(joined, sp) != 0 &&
+                                        can_read_asset(joined, resource_root,
+                                                       opts->resolve_fn,
+                                                       opts->resolve_user,
+                                                       NULL)) {
+                                        grew = stage_push_dep(&st, joined,
+                                                  sub.items[s].bundle) || grew;
+                                        staged = true;
+                                    }
+                                }
+                                if (can_read_asset(sp, resource_root,
+                                                   opts->resolve_fn,
+                                                   opts->resolve_user, NULL)) {
+                                    grew = stage_push_dep(&st, sp,
+                                              sub.items[s].bundle) || grew;
+                                    staged = true;
+                                }
+                                if (!staged)
+                                    grew = stage_push_dep(&st, sp,
+                                              sub.items[s].bundle) || grew;
                             }
                         }
                         jce_bundle_deps_free(&sub);
@@ -1873,7 +2093,8 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                                                         opts->resolve_fn,
                                                         opts->resolve_user,
                                                         NULL)) {
-                                         PUSH_DEP_IF_NEW(joined, NULL);
+                                         grew = stage_push_dep(&st, joined,
+                                                               NULL) || grew;
                                      } else {
                                          pack_log_warn(
                                              "optional OBJ material library missing: %s (referenced by %s)",
@@ -1896,7 +2117,7 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                                 } else {
                                     snprintf(joined, sizeof(joined), "%s", norm);
                                 }
-                                PUSH_DEP_IF_NEW(joined, NULL);
+                                grew = stage_push_dep(&st, joined, NULL) || grew;
                             }
                         }
                     }
@@ -1906,7 +2127,92 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                 if (!grew) break;
             }
 
-            #undef PUSH_DEP_IF_NEW
+            /* ── Convention sidecars ────────────────────────────────
+             * Files referenced by NAMING CONVENTION rather than by a
+             * JSON key.  All existence-gated so a missing optional
+             * sidecar can never fail the bundle:
+             *   <model>.anim.json   frame-event tables consumed by the
+             *                       scene renderer (sr_anim_events_load)
+             *   <model>.jcol        cooked collider blob consumed by the
+             *                       runtime (rt_spawn_cooked_body)
+             *   <scene>.navmesh.bin editor-baked navmesh, same basename
+             *                       as the scene file.
+             * (.terrain.json → .terrain.bin is handled inside the deps
+             * scanner itself since that pair is never optional; a
+             * texture's .import.json is cook-time-only input and is
+             * baked into the cooked bytes, so it never ships.) */
+            {
+                uint32_t snap = deps.count;
+                char side[1408];
+                for (uint32_t k = 0; k < snap; ++k) {
+                    const char *dp = deps.items[k].path;
+                    if (!dp || !dp[0]) continue;
+                    if (classify_cook(dp) != COOK_CLASS_MODEL) continue;
+                    snprintf(side, sizeof(side), "%s.anim.json", dp);
+                    if (can_read_asset(side, resource_root, opts->resolve_fn,
+                                       opts->resolve_user, NULL))
+                        (void)stage_push_dep(&st, side, NULL);
+                    snprintf(side, sizeof(side), "%s.jcol", dp);
+                    if (can_read_asset(side, resource_root, opts->resolve_fn,
+                                       opts->resolve_user, NULL))
+                        (void)stage_push_dep(&st, side, NULL);
+
+                    /* GLB/glTF/FBX embedded-texture sidecars the model
+                     * importer extracts next to the model as
+                     * <model_stem>_tex<N>.png/.tga (write_embedded_texture).
+                     * They are collected indirectly when a path lands in a
+                     * MeshRenderer albedoTex, but a textured model referenced
+                     * only by meshPath/modelPath (LOD level, collider mesh,
+                     * prefab, bulk-imported scene) leaves them orphaned and
+                     * the model ships without its textures.  Harvest them by
+                     * the same naming convention, existence-gated, indices
+                     * contiguous from 0 (stop at the first wholly-missing
+                     * index). */
+                    {
+                        char stem[1280];
+                        snprintf(stem, sizeof(stem), "%s", dp);
+                        char *sdot   = strrchr(stem, '.');
+                        char *sslash = strrchr(stem, '/');
+                        if (sdot && (!sslash || sdot > sslash)) *sdot = '\0';
+                        for (int ti = 0; ti < 32; ++ti) {
+                            int found = 0;
+                            snprintf(side, sizeof(side), "%s_tex%d.png", stem, ti);
+                            if (can_read_asset(side, resource_root, opts->resolve_fn,
+                                               opts->resolve_user, NULL)) {
+                                (void)stage_push_dep(&st, side, NULL); found = 1;
+                            }
+                            snprintf(side, sizeof(side), "%s_tex%d.tga", stem, ti);
+                            if (can_read_asset(side, resource_root, opts->resolve_fn,
+                                               opts->resolve_user, NULL)) {
+                                (void)stage_push_dep(&st, side, NULL); found = 1;
+                            }
+                            if (!found) break;
+                        }
+                    }
+                }
+
+                char *svp = make_scene_vpath(scene_paths.items[i],
+                                             resource_root);
+                if (svp) {
+                    size_t ext = scene_suffix_len(svp);
+                    size_t sl  = strlen(svp);
+                    if (ext && sl > ext &&
+                        sl - ext + sizeof(".navmesh.bin") < sizeof(side)) {
+                        memcpy(side, svp, sl - ext);
+                        memcpy(side + (sl - ext), ".navmesh.bin",
+                               sizeof(".navmesh.bin"));
+                        if (can_read_asset(side, resource_root,
+                                           opts->resolve_fn,
+                                           opts->resolve_user, NULL))
+                            (void)stage_push_dep(&st, side, NULL);
+                    }
+                    JCE_FREE(svp);
+                }
+            }
+
+            /* ── Localization tables (i18n/<locale>.json) ──────────── */
+            for (size_t li = 0; li < i18n_files.n; ++li)
+                (void)stage_push_dep(&st, i18n_files.items[li], NULL);
         }
 
         jce_bundle_deps_free(&deps);
@@ -2193,6 +2499,17 @@ static int run_build_impl(const JceBundlePackOptions *opts)
             }
         }
 
+        /* Phase 1 (driver, serial): read + rewrite + pre-assign output slots.
+         * These touch the per-thread longjmp/log machinery (read_asset ERR,
+         * ext_rewrite_asset die-on-OOM, pack_strdup die) so they must NOT run
+         * on the worker pool.  Cookable assets are queued; the slot's raw ptr
+         * doubles as the cook input (cook_asset frees it and returns the cooked
+         * buffer, which phase 3 stores back). */
+        CookJob *cook_jobs = (CookJob *)JCE_CALLOC(b->assets.n > 0 ? b->assets.n : 1,
+                                                   sizeof(CookJob));
+        if (!cook_jobs) die("oom");
+        size_t njobs = 0;
+
         for (size_t i = 0; i < b->assets.n; ++i) {
             size_t sz = 0;
             uint8_t *raw = read_asset(b->assets.items[i], resource_root,
@@ -2210,17 +2527,21 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                                               &emap, &rsz);
             uint8_t *abuf = rraw ? rraw : raw;
             size_t   asz  = rraw ? rsz : sz;
-            /* P0-build-bundles-cook: cook textures/audio/models in-process
-             * (BC/ASTC + meshopt-GLB). Failures fall back to raw bytes. */
-            if (opts->cook_assets)
-                abuf = cook_asset(b->assets.items[i], abuf, asz,
-                                  resource_root, opts->resolve_fn,
-                                  opts->resolve_user, &emap,
-                                  opts->target_platform, &asz);
-            entries[actual].vpath    = pack_strdup(b->assets.items[i]);
-            entries[actual].raw      = abuf;
-            entries[actual].raw_size = asz;
-            actual++;
+
+            size_t slot = actual++;
+            entries[slot].vpath    = pack_strdup(b->assets.items[i]);
+            entries[slot].raw      = abuf;   /* provisional; cook overwrites */
+            entries[slot].raw_size = asz;
+
+            if (opts->cook_assets &&
+                classify_cook(b->assets.items[i]) != COOK_CLASS_NONE) {
+                cook_jobs[njobs].slot     = slot;
+                cook_jobs[njobs].vpath    = b->assets.items[i];
+                cook_jobs[njobs].buf      = abuf;
+                cook_jobs[njobs].in_size  = asz;
+                cook_jobs[njobs].out_size = asz;
+                njobs++;
+            }
         }
 
         if (bundle_errors) {
@@ -2228,11 +2549,71 @@ static int run_build_impl(const JceBundlePackOptions *opts)
                 JCE_FREE(entries[i].vpath);
                 JCE_FREE(entries[i].raw);
             }
+            JCE_FREE(cook_jobs);
             JCE_FREE(entries);
             (void)jce_fs_host_remove_file(out_path);
             (void)jce_fs_host_remove_file(sidecar_path);
             continue;
         }
+
+        /* Phase 2 (workers, parallel): cook each queued asset.  emap +
+         * resolve_fn/user are read-only here; each job writes only its own
+         * CookJob; cook_asset never longjmps; its logs are reconstructed
+         * below. */
+        if (njobs > 0) {
+            CookCtx cctx;
+            cctx.jobs            = cook_jobs;
+            cctx.resource_root   = resource_root;
+            cctx.resolve_fn      = opts->resolve_fn;
+            cctx.resolve_user    = opts->resolve_user;
+            cctx.emap            = &emap;
+            cctx.target_platform = opts->target_platform;
+
+            /* The active VFS is not thread-safe; cook_asset re-enters
+             * read_asset()->jce_fs_read_all on workers, so guard VFS reads for
+             * the lifetime of the parallel cook (audit Round-3 P1).  NULL on
+             * OOM degrades to the prior (racy) behaviour rather than crashing. */
+            s_vfs_read_mutex = jce_mutex_create();
+
+            JceJobSystem *jobs_sys = jce_jobs_default();
+            if (jobs_sys && njobs >= 2)
+                jce_jobs_parallel_for(jobs_sys, (int)njobs, 1,
+                                      cook_jobs_range, &cctx);
+            else
+                cook_jobs_range(0, (int)njobs, &cctx);
+
+            if (s_vfs_read_mutex) {
+                jce_mutex_destroy(s_vfs_read_mutex);
+                s_vfs_read_mutex = NULL;
+            }
+
+            /* Phase 3 (driver, serial): store cooked buffers + replay logs in
+             * asset order so the editor's non-thread-safe log sink is touched
+             * only from this thread and output stays deterministic. */
+            for (size_t k = 0; k < njobs; ++k) {
+                CookJob *j = &cook_jobs[k];
+                entries[j->slot].raw      = j->buf;
+                entries[j->slot].raw_size = j->out_size;
+                CookClass cls = classify_cook(j->vpath);
+                const char *kind = (cls == COOK_CLASS_TEXTURE) ? "texture"
+                                 : (cls == COOK_CLASS_AUDIO)   ? "audio"
+                                 : "model";
+                /* Replay the worker's outcome here on the driver, in asset
+                 * order: warnings are otherwise lost on worker threads (g_ctx
+                 * is thread-local) and successes would double-log when a job
+                 * ran on the driver via the cooperative drain (audit Round-3
+                 * P2). */
+                if (j->status.failed) {
+                    pack_log_warn("cook %s failed (%s): %s — shipping raw",
+                                  kind, j->vpath,
+                                  j->status.err[0] ? j->status.err : "unknown");
+                } else if (j->out_size != j->in_size) {
+                    LOG("cooked %s %s (%zu -> %zu B)", kind, j->vpath,
+                        j->in_size, j->out_size);
+                }
+            }
+        }
+        JCE_FREE(cook_jobs);
 
         for (size_t i = 1; i < actual; ++i)
             entries[i].content_hash = XXH3_64bits(entries[i].raw,
@@ -2367,6 +2748,7 @@ static int run_build_impl(const JceBundlePackOptions *opts)
 
     sv_free(&scene_paths);
     sv_free(&scene_ids);
+    sv_free(&i18n_files);
     am_free(&am);
     bv_free(&bundles);
     cv_free(&catalog);
@@ -2389,15 +2771,15 @@ JCE_API int jce_bundle_pack_run(const JceBundlePackOptions *opts,
     ctx.log_fn   = log_fn;
     ctx.log_user = log_user;
     ctx.quiet    = opts->quiet;
-    PackCtx *prev = g_ctx;
-    g_ctx = &ctx;
+    PackCtx *prev = pack_ctx_get();
+    pack_ctx_set(&ctx);
     int rc;
     if (setjmp(ctx.jmp) == 0) {
         rc = run_build_impl(opts);
     } else {
         rc = ctx.error_code ? ctx.error_code : -1;
     }
-    g_ctx = prev;
+    pack_ctx_set(prev);
     return rc;
 }
 
@@ -2412,14 +2794,14 @@ JCE_API int jce_bundle_pack_diff(const char *old_catalog_path,
     memset(&ctx, 0, sizeof(ctx));
     ctx.log_fn   = log_fn;
     ctx.log_user = log_user;
-    PackCtx *prev = g_ctx;
-    g_ctx = &ctx;
+    PackCtx *prev = pack_ctx_get();
+    pack_ctx_set(&ctx);
     int rc;
     if (setjmp(ctx.jmp) == 0) {
         rc = run_diff_impl(old_catalog_path, new_catalog_path, out_diff_path);
     } else {
         rc = ctx.error_code ? ctx.error_code : -1;
     }
-    g_ctx = prev;
+    pack_ctx_set(prev);
     return rc;
 }

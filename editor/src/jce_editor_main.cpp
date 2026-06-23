@@ -194,6 +194,12 @@ static void editor_app_update(float dt, void *ud)
     }
     g_last_update_counter = now;
 
+    /* Drive a frame-sliced scene open (large-scene startup / open).  While
+     * this is in flight the layout draws a modal "Loading…" overlay that
+     * gates interaction, so the rest of the per-frame work below is safe to
+     * run against a scene that is still being populated. */
+    jce_state_scene_load_poll();
+
     jce_state_play_mode_tick(real_dt);
 
     /* VideoPlayer-as-texture and ParticleEmitter previews in Scene View while
@@ -245,6 +251,13 @@ static void editor_app_draw(const JceServices *svc, void *ud)
      * (jce_editor_scene_render_frame) so it renders to the FBO at the
      * panel's actual size; ImGui then displays the texture. */
     maybe_log_startup_kpi();
+    /* Advance the shared renderer's per-frame generation ONCE here, before the
+     * Scene + Game viewport panels each render through it.  This lets the
+     * skinned-animation sample + previous-frame TAA palette be produced once
+     * (first viewport) and reused by the second, instead of being advanced
+     * twice and clobbered to zero per-bone motion (which made animated
+     * characters ghost in TAA). */
+    jce_scene_renderer_begin_velocity_frame(jce_editor_get_scene_renderer());
     jce_editor_update(svc->window);
 }
 

@@ -250,6 +250,9 @@ struct AsyncIndexJob {
 JceThread     *g_aidx_worker      = nullptr;
 AsyncIndexJob *g_aidx_job         = nullptr;
 std::string    g_aidx_pending_root;   /* newest request while busy */
+uint32_t       g_aidx_generation = 0; /* bumped on every index change;
+                                         consumed by the resolver's
+                                         negative cache (stall guard) */
 
 void aidx_worker(void *arg)
 {
@@ -283,6 +286,7 @@ void aidx_finalize(void)
 
     /* Swap the freshly-built index in (replaces the previous one). */
     g_live = std::move(j->maps);
+    g_aidx_generation++;   /* invalidates negative resolve caches */
     LOG_INFO(LOG_TAG, "async asset index ready: %d files under %s",
              (int)g_live.total, j->root.c_str());
 
@@ -304,13 +308,21 @@ extern "C" {
 void jce_asset_path_index_clear(void)
 {
     g_live = IndexMaps{};
+    g_aidx_generation++;
 }
 
 int jce_asset_path_index_rebuild(const char *root)
 {
     /* Synchronous (additive) — kept for callers that need the index
      * populated before they return. */
-    return index_walk_into(&g_live, root);
+    int n = index_walk_into(&g_live, root);
+    g_aidx_generation++;
+    return n;
+}
+
+uint32_t jce_asset_path_index_generation(void)
+{
+    return g_aidx_generation;
 }
 
 int jce_asset_path_index_rebuild_async(const char *root)

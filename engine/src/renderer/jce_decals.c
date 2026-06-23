@@ -14,6 +14,7 @@
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/renderer/jce_decals.h>
+#include <jce/renderer/jce_shaders.h>   /* jce_shaders_embedded_engine_pak fallback */
 
 #include "os/core/jce_memory.h"
 
@@ -74,7 +75,18 @@ static bgfx_shader_handle_t decal_load_shader(const JcePakArchive *pak,
     char path[256];
     snprintf(path, sizeof(path), "shaders/%s_%s.bin", name, sfx);
 
-    const JcePakAsset *asset = jce_pak_find(pak, path);
+    /* The scene/editor PAK rarely carries engine shaders (the editor ships
+     * editor_assets.pak with zero shaders; engine shaders are baked into
+     * jce_renderer).  Mirror load_single(): try the caller pak, then fall
+     * back to the embedded engine-shader pak. */
+    const JcePakAsset *asset = pak ? jce_pak_find(pak, path) : NULL;
+    if (!asset) {
+        const JcePakArchive *fb = jce_shaders_embedded_engine_pak();
+        if (fb && fb != pak) {
+            asset = jce_pak_find(fb, path);
+            if (asset) pak = fb;
+        }
+    }
     if (!asset) {
         LOG_ERROR(LOG_TAG, "shader not found in pak: %s", path);
         return invalid;

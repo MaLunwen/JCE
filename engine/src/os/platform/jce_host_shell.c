@@ -222,6 +222,15 @@ bool jce_host_open_in_text_editor(const char *path)
     return SDL_OpenURL(url);
 }
 
+bool jce_host_open_in_editor(const char *editor, const char *path)
+{
+    if (s_path_is_empty(editor) || s_path_is_empty(path)) return false;
+    /* SDL applies per-arg quoting, so an editor path or file path with
+       spaces is passed through intact as a single argv element. */
+    const char *argv[] = { editor, path, NULL };
+    return s_spawn_detached(argv);
+}
+
 bool jce_host_open_terminal(const char *cwd)
 {
     const char *target = (cwd && cwd[0]) ? cwd : ".";

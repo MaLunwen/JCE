@@ -17,6 +17,8 @@ extern "C" {
 
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
+#include <mutex>
 
 static bimg::TextureFormat::Enum map_fmt(int jce_fmt)
 {
@@ -36,6 +38,27 @@ extern "C" int jce_tex_format_is_block(int jce_fmt)
     return map_fmt(jce_fmt) != bimg::TextureFormat::Unknown;
 }
 
+/* Decode one mip (block-compressed BC/ASTC/ETC, or already-RGBA8) into
+ * RGBA8.  `dst` must hold w*h*4 bytes.  Used by the editor to PREVIEW
+ * cooked .jceasset textures on the CPU: the runtime uploads cooked block
+ * data straight to the GPU (jce_texture_from_cooked), but the editor's
+ * texture cache is RGBA8-based, so it CPU-decodes the base mip here.
+ * Returns 1 on success. */
+extern "C" int jce_tex_decode_to_rgba8(const void *src, uint32_t w, uint32_t h,
+                                       int jce_fmt, void *dst)
+{
+    if (!src || !dst || w == 0 || h == 0) return 0;
+    if (jce_fmt == JCEASSET_TEXFMT_RGBA8) {
+        memcpy(dst, src, (size_t)w * (size_t)h * 4u);
+        return 1;
+    }
+    bimg::TextureFormat::Enum f = map_fmt(jce_fmt);
+    if (f == bimg::TextureFormat::Unknown) return 0;
+    static bx::DefaultAllocator s_alloc;
+    bimg::imageDecodeToRgba8(&s_alloc, dst, src, w, h, w * 4u, f);
+    return 1;
+}
+
 /* Size in bytes of one mip of (w,h) encoded to jce_fmt (block-rounded). */
 extern "C" uint32_t jce_tex_encoded_size(uint32_t w, uint32_t h, int jce_fmt)
 {
@@ -45,11 +68,37 @@ extern "C" uint32_t jce_tex_encoded_size(uint32_t w, uint32_t h, int jce_fmt)
                               false, false, (uint16_t)1, f);
 }
 
+/* Map a generic cook quality (0=default, 1=fast, 2=highest) to the bimg
+ * preset, in the colour or normal-map family.  Fast == squish range-fit,
+ * which is several times quicker than the cluster-fit default at a modest
+ * quality cost — the dominant lever for texture-cook wall time. */
+static bimg::Quality::Enum pick_quality(int quality, int normal_map)
+{
+    if (normal_map) {
+        switch (quality) {
+        case 1:  return bimg::Quality::NormalMapFastest;
+        case 2:  return bimg::Quality::NormalMapHighest;
+        default: return bimg::Quality::NormalMapDefault;
+        }
+    }
+    switch (quality) {
+    case 1:  return bimg::Quality::Fastest;
+    case 2:  return bimg::Quality::Highest;
+    default: return bimg::Quality::Default;
+    }
+}
+
 /* Encode an RGBA8 image into dst (must be >= jce_tex_encoded_size).
  * normal_map != 0 selects a normal-map-aware quality preset (for BC5).
- * Returns 1 on success, 0 on failure. */
+ * quality: 0=default, 1=fast, 2=highest.  Returns 1 on success, 0 on failure.
+ *
+ * Thread-safety: the squish (BC1/BC3/BC5), ASTC, and ETC paths are fully
+ * re-entrant (the shared s_alloc forwards to the thread-safe CRT allocator,
+ * and each call uses only stack/dst buffers).  The BC7/BC6H nvtt path is
+ * NOT — it writes process-global AVPCL/ZOH flags — so callers that fan
+ * cooking across threads must serialise BC7/BC6H (see jce_bundle_pack). */
 extern "C" int jce_tex_encode(const uint8_t *rgba, uint32_t w, uint32_t h,
-                              int jce_fmt, int normal_map,
+                              int jce_fmt, int normal_map, int quality,
                               void *dst, uint32_t dst_size)
 {
     bimg::TextureFormat::Enum f = map_fmt(jce_fmt);
@@ -61,11 +110,16 @@ extern "C" int jce_tex_encode(const uint8_t *rgba, uint32_t w, uint32_t h,
 
     static bx::DefaultAllocator s_alloc;
     bx::Error err;
-    bimg::Quality::Enum q = normal_map ? bimg::Quality::NormalMapDefault
-                                       : bimg::Quality::Default;
+    bimg::Quality::Enum q = pick_quality(quality, normal_map);
     if (f == bimg::TextureFormat::BC7 || f == bimg::TextureFormat::BC6H) {
         /* imageEncodeFromRgba8 stubs out BC6H/BC7. The real encoder is nvtt,
-         * reached via imageEncode (RGBA8 -> RGBA32F -> nvtt::compressBC7). */
+         * reached via imageEncode (RGBA8 -> RGBA32F -> nvtt::compressBC7).
+         * nvtt writes process-global AVPCL/ZOH compression flags, so concurrent
+         * BC7/BC6H encodes corrupt each other — serialise this path under a
+         * process-wide lock.  squish (BC1/3/5) / ASTC below are reentrant and
+         * stay lock-free, so the default policy is unaffected. */
+        static std::mutex s_nvtt_mutex;
+        std::lock_guard<std::mutex> lk(s_nvtt_mutex);
         bimg::imageEncode(&s_alloc, dst, rgba, bimg::TextureFormat::RGBA8,
                           w, h, 1, f, q, &err);
     } else {

@@ -4,7 +4,9 @@
  * Unifies PAK archive reads and loose-file reads behind a single API.
  * Supports mount points: each prefix maps to a backend (PAK or directory).
  *
- * Layer: Utilities (Layer 0 — depends on pak_loader).
+ * Layer: os/core (L2).  PAK reads go through a provider registered by the
+ * resource layer (jce_fs_set_pak_provider) so this layer never depends UP on
+ * the resource tier — PAK archive/asset handles are treated opaquely here.
  */
 
 #ifndef JCE_FILESYSTEM_H
@@ -24,6 +26,30 @@ typedef struct JcePakArchive    JcePakArchive;
 
 /* Opaque file handle for streaming reads. */
 typedef struct JceFile JceFile;
+
+/* -- PAK read provider (dependency inversion) ----------------------- */
+
+/* The os/core VFS must read mounted PAK archives WITHOUT depending up on the
+ * resource layer (jce_pak_loader lives in L3 resource).  The resource layer
+ * therefore registers concrete read functions here at boot — before any PAK is
+ * mounted or read.  Archive + asset handles are opaque to os/core. */
+typedef struct JceFsPakProvider {
+    /* Look up `path` in `pak`; returns an opaque asset handle, or NULL. */
+    const void *(JCE_CALL *find)(const JcePakArchive *pak, const char *path);
+    /* Decompressed (original) byte size of an asset handle. */
+    uint64_t    (JCE_CALL *asset_size)(const void *asset);
+    /* Decompress `asset` into `buf` (>= asset_size); returns bytes written. */
+    size_t      (JCE_CALL *decompress)(const void *asset, void *buf,
+                                       size_t buf_size);
+} JceFsPakProvider;
+
+/* Install the PAK read provider (call once at engine boot, before any mount).
+ * `provider` must outlive all filesystem use (a static is typical). */
+JCE_API void JCE_CALL jce_fs_set_pak_provider(const JceFsPakProvider *provider);
+
+/* The installed provider, or NULL if none (PAK reads then fail gracefully).
+ * Other os/core consumers that read PAKs directly (e.g. i18n) use this. */
+JCE_API const JceFsPakProvider *JCE_CALL jce_fs_get_pak_provider(void);
 
 /* -- Lifecycle ------------------------------------------------------ */
 
@@ -193,6 +219,15 @@ JCE_API void *jce_fs_host_read_all(const char *path, uint64_t *out_size);
    Creates parent directories that do not exist.  Returns true on
    success. */
 JCE_API bool JCE_CALL jce_fs_host_write_all(const char *path,
+                           const void *data, uint64_t size);
+
+/* Atomically write an entire buffer to a host-path file: writes to a sibling
+   temp file then renames it over the destination, so an interrupted write
+   (crash / power loss / full disk) can never leave a truncated or empty file.
+   Replaces any existing file.  Creates parent directories.  Returns true on
+   success.  Use this for editable user data (scenes, prefabs, project
+   settings); jce_fs_host_write_all suffices for regenerable build outputs. */
+JCE_API bool JCE_CALL jce_fs_host_write_all_atomic(const char *path,
                            const void *data, uint64_t size);
 
 /* Append a buffer to the end of a host-path file (creating it if missing).

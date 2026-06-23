@@ -51,30 +51,35 @@ extern "C" {
 
 /* ── Named struct types for shared mutable state ──────────────────── */
 
+/* Component copy/paste buffer — keyed by the dense engine comp_id (the
+ * registry struct_size is the authoritative byte count).  8192 covers the
+ * largest component (LightProbeGroup ≈ 7.7 KB, IkConstraints ≈ 4.3 KB);
+ * the copy menu item stays disabled for anything larger. */
 struct InspCompClipboard {
-    uint64_t flag;
-    char     data[4096];
+    int      comp_id;
+    char     data[8192];
     size_t   data_size;
 };
 
+/* Deferred section actions — all keyed by the dense engine comp_id
+ * (JCE_COMP_ID_INVALID = unset; 0 is a valid id, Transform). */
 struct InspPendingRemove {
     uint32_t entity_id;
-    uint64_t flag;
+    int      comp_id;
     bool     pending;
 };
 
 struct InspPendingMove {
     uint32_t entity_id;
-    uint64_t src_flag;
+    int      src_comp;
     int      dir;
-    size_t   target_index;
     bool     pending;
 };
 
 struct InspDrag {
     uint32_t entity_id;
-    uint64_t src_flag;
-    uint64_t hover_flag;
+    int      src_comp;
+    int      hover_comp;
     bool     active;
 };
 
@@ -112,24 +117,25 @@ void draw_vec3_control(const char *label, float *values,
 void accept_asset_drop(char *buf, size_t buf_size);
 void accept_mesh_drop_with_material(JceMeshRenderer *mr);
 
-/* ── load_material_into_renderer — defined in inspector_render.cpp ── */
+/* ── load_material_into_renderer — defined in jce_panel_inspector_render.cpp ── */
 /* Forward-declared here because jce_editor_inspector_reload_material
  * (public C API in the dispatcher) calls it. */
 void load_material_into_renderer(JceMeshRenderer *mr);
 
 /* ── Per-domain drawer declarations ───────────────────────────────── */
 
-/* inspector_transform.cpp */
+/* jce_panel_inspector_transform.cpp */
 void draw_comp_transform(uint32_t entity_id, JceTransform *t);
+void draw_comp_pivot(JceScene *scene, JceEntity e, JcePivotComponent *p);
 
-/* inspector_lighting.cpp */
+/* jce_panel_inspector_lighting.cpp */
 void draw_comp_light(JceScene *scene, JceEntity e, uint64_t flags);
 void draw_comp_camera(JceCameraComponent *cam);
 void draw_comp_virtual_camera(JceVirtualCameraComponent *vc);
 void draw_comp_reflection_probe(JceReflectionProbeComponent *r);
 void draw_comp_light_probe_group(JceLightProbeGroupComponent *g);
 
-/* inspector_render.cpp */
+/* jce_panel_inspector_render.cpp */
 void draw_comp_mesh_renderer(JceMeshRenderer *mr);
 void draw_comp_sprite_renderer(JceSpriteRendererComponent *sr);
 void draw_comp_skybox(JceSkyboxComponent *sky);
@@ -141,7 +147,7 @@ void draw_comp_lod_group(JceLodGroupComponent *lg);
 void draw_comp_volume(JceVolumeComponent *v);
 void draw_comp_occlusion_portal(JceOcclusionPortalComponent *op);
 
-/* inspector_physics.cpp */
+/* jce_panel_inspector_physics.cpp */
 void draw_comp_rigidbody(JceRigidBodyComponent *rb);
 void draw_comp_box_collider(JceBoxColliderComponent *bc);
 void draw_comp_sphere_collider(JceSphereColliderComponent *sc);
@@ -151,63 +157,83 @@ void draw_comp_compound_collider(JceCompoundColliderComponent *cc);
 void draw_comp_character_controller(JceCharacterControllerComponent *cc);
 void draw_comp_constraint(JceConstraintComponent *con);
 void draw_comp_wheel_collider(JceWheelColliderComponent *w);
+void draw_comp_vehicle(JceVehicleComponent *v);
+void draw_comp_soft_body(JceSoftBodyComponent *sb);
+void draw_comp_fracture(JceFractureComponent *fr);
 void draw_comp_constant_force(JceConstantForceComponent *cf);
 void draw_comp_configurable_joint(JceConfigurableJointComponent *cj);
 void draw_comp_cloth(JceClothComponent *cl);
 
-/* inspector_network.cpp */
+/* jce_panel_inspector_network.cpp */
 void draw_comp_network_object(JceNetworkObjectComponent *c);
 void draw_comp_net_transform(JceNetTransformComponent *c);
 void draw_comp_net_animator(JceNetAnimatorComponent *c);
 void draw_comp_net_rigidbody(JceNetRigidbodyComponent *c);
+void draw_comp_network_variable(JceNetworkVariableComponent *c);
 
-/* inspector_physics2d.cpp */
+/* jce_panel_inspector_physics2d.cpp */
 void draw_comp_rigidbody2d(JceRigidBody2DComponent *rb);
 void draw_comp_collider2d(JceCollider2DComponent *cd);
 void draw_comp_joint2d(JceJoint2DComponent *j);
 
-/* inspector_animation.cpp */
+/* jce_panel_inspector_animation.cpp */
 void draw_comp_animator(JceAnimatorComponent *anim);
 void draw_comp_skeletal_animator(JceSkeletalAnimatorComponent *skel);
 void draw_comp_sprite_animator(JceSpriteAnimatorComponent *sa);
 void draw_comp_avatar(JceAvatarComponent *a);
 void draw_comp_ik_constraints(JceIkConstraintComponent *ik);
+void draw_comp_foot_ik(JceFootIkComponent *f);
+void draw_comp_full_body_ik(JceFullBodyIkComponent *f);
+void draw_comp_ragdoll(JceRagdollComponent *r);
+void draw_comp_morph_weights(JceScene *scene, JceEntity e,
+                             JceMorphWeightsComponent *mw);
 
-/* inspector_tilemap.cpp */
+/* jce_panel_inspector_tilemap.cpp */
 void draw_comp_tilemap(JceTilemapComponent *t);
 void draw_comp_tilemap_collider2d(JceTilemapCollider2DComponent *c);
 
-/* inspector_audio.cpp */
+/* jce_panel_inspector_audio.cpp */
 void draw_comp_audio_source(JceAudioSourceComponent *as);
+void draw_comp_music_track(JceMusicTrackComponent *m);
 void draw_comp_video_player(JceVideoPlayerComponent *vp);
 void draw_comp_audio_listener(JceAudioListenerComponent *l);
 void draw_comp_audio_reverb_zone(JceAudioReverbZoneComponent *r);
 void draw_comp_audio_occlusion(JceAudioOcclusionComponent *o);
 
-/* inspector_gameplay.cpp */
+/* jce_panel_inspector_gameplay.cpp */
 void draw_comp_behavior_tree(JceBehaviorTree *bt);
 void draw_comp_spawn_manager(JceSpawnManagerComponent *m);
 void draw_comp_weapon(JceWeaponComponent *w);
 void draw_comp_save_point(JceSavePointComponent *sp);
 void draw_comp_trigger_volume(JceTriggerVolumeComponent *tv);
 void draw_comp_terrain(JceTerrainComponent *tc);
+void draw_comp_vegetation_scatter(JceVegetationScatterComponent *vs);
+void draw_comp_water(JceWaterComponent *w);
+void draw_comp_buoyancy(JceBuoyancyComponent *b);
 void draw_comp_particle_emitter(JceParticleEmitterComponent *pe);
 void draw_comp_script(JceScriptComponent *scr);
 void draw_comp_nav_agent(JceNavAgentComponent *na);
 void draw_comp_sequence_player(JceSequencePlayerComponent *sp);
+void draw_comp_gas(JceGameplayAbilitySystemComponent *gas);
 
-/* inspector_ui.cpp */
+/* jce_panel_inspector_ui.cpp */
 void draw_comp_canvas(JceCanvasComponent *cv);
 void draw_comp_canvas_group(JceCanvasGroupComponent *cg);
 void draw_comp_layout_group(JceLayoutGroupComponent *lg);
 void draw_comp_ui_image(JceUIImageComponent *im);
 void draw_comp_ui_text(JceUITextComponent *tx);
 void draw_comp_ui_button(JceUIButtonComponent *bt);
+void draw_comp_ui_slider(JceUISliderComponent *sl);
+void draw_comp_ui_toggle(JceUIToggleComponent *tg);
+void draw_comp_ui_input_field(JceUIInputFieldComponent *f);
+void draw_comp_ui_scroll_view(JceUIScrollViewComponent *sv);
+void draw_comp_ui_progress_bar(JceUIProgressBarComponent *p);
+void draw_comp_ui_dropdown(JceUIDropdownComponent *d);
 
-/* inspector_multi_select.cpp */
+/* jce_panel_inspector_multi_select.cpp */
 bool insp_draw_multi_select_view(JceScene *scene);
 
-/* inspector_add_component.cpp */
+/* jce_panel_inspector_add_component.cpp */
 void insp_add_component_button_and_popup(uint32_t focused, uint64_t flags);
 
 /* Composite light mask, shared between the dispatcher and Add Component. */

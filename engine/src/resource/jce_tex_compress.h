@@ -61,13 +61,32 @@ void jce_tex_generate_mip(const uint8_t *src, uint32_t src_w, uint32_t src_h,
  * format this encoder supports (BC1/BC5/BC7/ASTC_4x4/ETC2_RGBA8). */
 int jce_tex_format_is_block(int jce_fmt);
 
+/* Decode one mip (block-compressed or already-RGBA8) to RGBA8.
+ * `dst` must hold w*h*4 bytes.  For previewing cooked textures on the CPU
+ * where a GPU block upload is not wanted.  Returns 1 on success. */
+int jce_tex_decode_to_rgba8(const void *src, uint32_t w, uint32_t h,
+                            int jce_fmt, void *dst);
+
 /* Bytes for one mip of (w,h) encoded to jce_fmt (block-rounded). 0 if unsupported. */
 uint32_t jce_tex_encoded_size(uint32_t w, uint32_t h, int jce_fmt);
 
+/* Total bytes a cooked pixel chunk must hold: the sum of jce_tex_encoded_size
+ * over `mip_count` mip levels of (w,h) in jce_fmt.  Returns 0 if the format is
+ * unsupported, dimensions are zero, mip_count exceeds the natural chain length
+ * (a malformed file), or the total would overflow 32 bits.  The cooked-texture
+ * loader uses this to reject a pixel chunk shorter than its declared
+ * dimensions/format/mips imply (otherwise the CPU decode and bgfx upload read
+ * past the buffer). */
+uint32_t jce_tex_cooked_pixel_size(uint32_t w, uint32_t h, int jce_fmt,
+                                   uint32_t mip_count);
+
 /* Encode an RGBA8 image (w*h*4 bytes) into dst (>= jce_tex_encoded_size).
- * normal_map != 0 picks a normal-map quality preset. Returns 1 on success. */
+ * normal_map != 0 picks a normal-map quality preset.
+ * quality: 0 = default (cluster-fit), 1 = fast (range-fit, ~5-7x quicker),
+ *          2 = highest (iterative cluster-fit).  Returns 1 on success. */
 int jce_tex_encode(const uint8_t *rgba, uint32_t w, uint32_t h,
-                   int jce_fmt, int normal_map, void *dst, uint32_t dst_size);
+                   int jce_fmt, int normal_map, int quality,
+                   void *dst, uint32_t dst_size);
 
 #ifdef __cplusplus
 }

@@ -5,23 +5,7 @@
  * supplements with backwards-compat parsing on top of these primitives.
  */
 
-#include <jce/middleware/scene/jce_scene.h>
-#include <jce/middleware/scene/jce_scene_components_json.h>
-#include <jce/os/core/jce_log.h>
-#include <jce/os/core/jce_str.h>
-#include <jce/os/core/jce_path.h>
-#include <jce/os/core/jce_math.h>
-#include <jce/renderer/jce_pbr_material.h>
-#include <jce/resource/jce_scene_contract.h>
-
-#include "os/core/jce_memory.h"
-
-#include <cjson/cJSON.h>
-#include <math.h>
-#include <SDL3/SDL_filesystem.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include "jce_scene_components_internal.h"
 
 #define LOG_TAG "scene_serial"
 
@@ -309,135 +293,6 @@ static void resolve_tex_relative_to_material(const char *mat_path,
     }
 }
 
-/* ── Local Euler ↔ Quaternion helpers (degrees) ───────────────────── */
-
-static void q_to_euler_deg(jce_quat q, float out[3])
-{
-    jce_vec3 e = jce_q_to_euler(q);
-    out[0] = e.x * JCE_RAD2DEG;
-    out[1] = e.y * JCE_RAD2DEG;
-    out[2] = e.z * JCE_RAD2DEG;
-}
-
-static jce_quat q_from_euler_deg(float x_deg, float y_deg, float z_deg)
-{
-    return jce_q_from_euler(x_deg * JCE_DEG2RAD,
-                            y_deg * JCE_DEG2RAD,
-                            z_deg * JCE_DEG2RAD);
-}
-
-/* ── JSON helpers ─────────────────────────────────────────────────── */
-
-static double j_num(const cJSON *o, const char *k, double def)
-{
-    const cJSON *it = cJSON_GetObjectItemCaseSensitive(o, k);
-    if (cJSON_IsNumber(it)) return it->valuedouble;
-    return def;
-}
-
-static double j_num2(const cJSON *o, const char *k1, const char *k2, double def)
-{
-    const cJSON *it = cJSON_GetObjectItemCaseSensitive(o, k1);
-    if (cJSON_IsNumber(it)) return it->valuedouble;
-    it = cJSON_GetObjectItemCaseSensitive(o, k2);
-    if (cJSON_IsNumber(it)) return it->valuedouble;
-    return def;
-}
-
-static bool j_bool(const cJSON *o, const char *k, bool def)
-{
-    const cJSON *it = cJSON_GetObjectItemCaseSensitive(o, k);
-    if (cJSON_IsBool(it)) return cJSON_IsTrue(it);
-    if (cJSON_IsNumber(it)) return it->valuedouble != 0.0;
-    return def;
-}
-
-static void j_float3(const cJSON *o, const char *k, float out[3],
-                     const float def[3])
-{
-    if (!out) return;
-    if (def) {
-        out[0] = def[0];
-        out[1] = def[1];
-        out[2] = def[2];
-    }
-    const cJSON *it = cJSON_GetObjectItemCaseSensitive(o, k);
-    if (!cJSON_IsArray(it) || cJSON_GetArraySize(it) < 3)
-        return;
-    const cJSON *x = cJSON_GetArrayItem(it, 0);
-    const cJSON *y = cJSON_GetArrayItem(it, 1);
-    const cJSON *z = cJSON_GetArrayItem(it, 2);
-    if (cJSON_IsNumber(x)) out[0] = (float)x->valuedouble;
-    if (cJSON_IsNumber(y)) out[1] = (float)y->valuedouble;
-    if (cJSON_IsNumber(z)) out[2] = (float)z->valuedouble;
-}
-
-static const char *j_str(const cJSON *o, const char *k, const char *def)
-{
-    const cJSON *it = cJSON_GetObjectItemCaseSensitive(o, k);
-    if (cJSON_IsString(it) && it->valuestring) return it->valuestring;
-    return def;
-}
-
-/* Pointer-form variants: extract from a pre-fetched cJSON item so a field is
-   looked up once (presence + value) instead of twice. Identical coercion. */
-static double j_num_it(const cJSON *it, double def)
-{
-    return cJSON_IsNumber(it) ? it->valuedouble : def;
-}
-static bool j_bool_it(const cJSON *it, bool def)
-{
-    if (cJSON_IsBool(it))   return cJSON_IsTrue(it);
-    if (cJSON_IsNumber(it)) return it->valuedouble != 0.0;
-    return def;
-}
-static const char *j_str_it(const cJSON *it, const char *def)
-{
-    if (cJSON_IsString(it) && it->valuestring) return it->valuestring;
-    return def;
-}
-
-static const char *j_str_any(const cJSON *o, const char *const *keys, int n)
-{
-    for (int i = 0; i < n; i++) {
-        const cJSON *it = cJSON_GetObjectItemCaseSensitive(o, keys[i]);
-        if (cJSON_IsString(it) && it->valuestring) return it->valuestring;
-    }
-    return NULL;
-}
-
-static void copy_str(char *dst, size_t cap, const char *src)
-{
-    if (!dst || cap == 0) return;
-    if (!src) { dst[0] = '\0'; return; }
-    size_t n = strlen(src);
-    if (n >= cap) n = cap - 1;
-    memcpy(dst, src, n);
-    dst[n] = '\0';
-}
-
-static int streq_ci(const char *a, const char *b)
-{
-    if (!a || !b) return 0;
-    while (*a && *b) {
-        char ca = *a, cb = *b;
-        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca + ('a' - 'A'));
-        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb + ('a' - 'A'));
-        if (ca != cb) return 0;
-        a++; b++;
-    }
-    return *a == '\0' && *b == '\0';
-}
-
-static cJSON *json_float3(const float v[3])
-{
-    cJSON *a = cJSON_CreateArray();
-    if (!a) return NULL;
-    cJSON_AddItemToArray(a, cJSON_CreateNumber(v ? v[0] : 0.0f));
-    cJSON_AddItemToArray(a, cJSON_CreateNumber(v ? v[1] : 0.0f));
-    cJSON_AddItemToArray(a, cJSON_CreateNumber(v ? v[2] : 0.0f));
-    return a;
-}
 
 static cJSON *ser_scene_rendering_settings(
     const JceSceneRenderingSettings *r)
@@ -509,6 +364,14 @@ static cJSON *ser_scene_rendering_settings(
         cJSON_AddItemToObject(postfx, "customPostParams", cparr);
     }
 
+    /* Screen-space AO (off by default). */
+    cJSON_AddBoolToObject(postfx, "ssao", r->ssao_enabled);
+    cJSON_AddNumberToObject(postfx, "ssaoIntensity", r->ssao_intensity);
+    cJSON_AddNumberToObject(postfx, "ssaoRadius", r->ssao_radius);
+    cJSON_AddBoolToObject(postfx, "ssr", r->ssr_enabled);
+    cJSON_AddNumberToObject(postfx, "ssrIntensity", r->ssr_intensity);
+    cJSON_AddNumberToObject(postfx, "ssrMaxDistance", r->ssr_max_distance);
+
     cJSON_AddItemToObject(root, "postfx", postfx);
 
     /* ── Environment: time-of-day + weather (P2-weather-decals-tod) ──── */
@@ -529,6 +392,20 @@ static cJSON *ser_scene_rendering_settings(
             cJSON_AddNumberToObject(weather, "type", r->weather_type);
             cJSON_AddNumberToObject(weather, "intensity", r->weather_intensity);
             cJSON_AddItemToObject(env, "weather", weather);
+        }
+        cJSON *sky = cJSON_CreateObject();
+        if (sky) {
+            cJSON_AddNumberToObject(sky, "mode", r->sky_mode);
+            cJSON_AddNumberToObject(sky, "turbidity", r->sky_turbidity);
+            cJSON_AddItemToObject(env, "sky", sky);
+        }
+        /* Floating origin (opt-in; absent → disabled, old scenes byte-id). */
+        cJSON *fo = cJSON_CreateObject();
+        if (fo) {
+            cJSON_AddBoolToObject(fo, "enabled", r->floating_origin_enabled);
+            cJSON_AddNumberToObject(fo, "threshold",
+                                    r->floating_origin_threshold);
+            cJSON_AddItemToObject(env, "floatingOrigin", fo);
         }
         cJSON_AddItemToObject(root, "environment", env);
     }
@@ -716,6 +593,14 @@ static bool parse_scene_rendering_settings(JceScene *scene,
         r.chromatic_strength =
             (float)j_num(postfx, "chromaticStrength", r.chromatic_strength);
 
+        /* Screen-space AO (off by default; missing keys keep defaults). */
+        r.ssao_enabled   = j_bool(postfx, "ssao", r.ssao_enabled);
+        r.ssao_intensity = (float)j_num(postfx, "ssaoIntensity", r.ssao_intensity);
+        r.ssao_radius    = (float)j_num(postfx, "ssaoRadius", r.ssao_radius);
+        r.ssr_enabled      = j_bool(postfx, "ssr", r.ssr_enabled);
+        r.ssr_intensity    = (float)j_num(postfx, "ssrIntensity", r.ssr_intensity);
+        r.ssr_max_distance = (float)j_num(postfx, "ssrMaxDistance", r.ssr_max_distance);
+
         /* Generic custom post pass (engine style-agnostic). */
         r.postfx_enabled[6] = j_bool(postfx, "custom", r.postfx_enabled[6]);
         const cJSON *cshader =
@@ -761,6 +646,20 @@ static bool parse_scene_rendering_settings(JceScene *scene,
             r.weather_intensity =
                 (float)j_num(weather, "intensity", r.weather_intensity);
         }
+        /* Sky (analytic Preetham; absent key → default GRADIENT, no change). */
+        const cJSON *sky = cJSON_GetObjectItemCaseSensitive(env, "sky");
+        if (cJSON_IsObject(sky)) {
+            r.sky_mode      = (int)j_num(sky, "mode", r.sky_mode);
+            r.sky_turbidity = (float)j_num(sky, "turbidity", r.sky_turbidity);
+        }
+        /* Floating origin (opt-in; absent key → disabled default, no change). */
+        const cJSON *fo = cJSON_GetObjectItemCaseSensitive(env, "floatingOrigin");
+        if (cJSON_IsObject(fo)) {
+            r.floating_origin_enabled =
+                j_bool(fo, "enabled", r.floating_origin_enabled);
+            r.floating_origin_threshold =
+                (float)j_num(fo, "threshold", r.floating_origin_threshold);
+        }
     }
 
     jce_scene_set_rendering_settings(scene, &r);
@@ -793,6 +692,29 @@ static void parse_transform(JceScene *s, JceEntity e, const cJSON *c)
                      (float)j_num2(c, "scaleY", "scale_y", 1.0),
                      (float)j_num2(c, "scaleZ", "scale_z", 1.0));
     jce_scene_set_transform(s, e, &t);
+}
+
+static void parse_pivot(JceScene *s, JceEntity e, const cJSON *c)
+{
+    JcePivotComponent p;
+    memset(&p, 0, sizeof(p));
+    p.local_position =
+        jce_v3((float)j_num2(c, "localX", "local_x", 0.0),
+               (float)j_num2(c, "localY", "local_y", 0.0),
+               (float)j_num2(c, "localZ", "local_z", 0.0));
+
+    float rx = (float)j_num2(c, "rotX", "rot_x", 0.0);
+    float ry = (float)j_num2(c, "rotY", "rot_y", 0.0);
+    float rz = (float)j_num2(c, "rotZ", "rot_z", 0.0);
+    const cJSON *rw = cJSON_GetObjectItemCaseSensitive(c, "rotW");
+    if (!rw) rw = cJSON_GetObjectItemCaseSensitive(c, "rot_w");
+    if (cJSON_IsNumber(rw)) {
+        p.local_rotation =
+            jce_q_normalize(jce_v4(rx, ry, rz, (float)rw->valuedouble));
+    } else {
+        p.local_rotation = q_from_euler_deg(rx, ry, rz);
+    }
+    jce_scene_set_pivot(s, e, &p);
 }
 
 /* Material-backfill cache: active only during a full jce_scene_load_json so a
@@ -996,148 +918,12 @@ static void parse_camera(JceScene *s, JceEntity e, const cJSON *c)
     jce_scene_set_camera(s, e, &cc);
 }
 
-static void parse_dir_light(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceDirectionalLight dl;
-    memset(&dl, 0, sizeof(dl));
-    dl.cookie_texture = JCE_TEXTURE_INVALID;
-    dl.direction.x = (float)j_num(c, "dirX", 0.0);
-    dl.direction.y = (float)j_num(c, "dirY", -1.0);
-    dl.direction.z = (float)j_num(c, "dirZ", 0.0);
-    dl.color.x = (float)j_num(c, "colorR", 1.0);
-    dl.color.y = (float)j_num(c, "colorG", 1.0);
-    dl.color.z = (float)j_num(c, "colorB", 1.0);
-    dl.intensity = (float)j_num(c, "intensity", 1.0);
-    dl.casts_shadow = j_bool(c, "castsShadow", false);
-    /* P3-E.5 — optional cookie projection. */
-    copy_str(dl.cookie_path, sizeof(dl.cookie_path), j_str(c, "cookiePath", ""));
-    dl.cookie_strength = (float)j_num(c, "cookieStrength", 0.0);
-    jce_scene_set_dir_light(s, e, &dl);
-}
 
-static void parse_point_light(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JcePointLight pl;
-    memset(&pl, 0, sizeof(pl));
-    pl.position.x = (float)j_num(c, "posX", 0.0);
-    pl.position.y = (float)j_num(c, "posY", 0.0);
-    pl.position.z = (float)j_num(c, "posZ", 0.0);
-    pl.color.x = (float)j_num(c, "colorR", 1.0);
-    pl.color.y = (float)j_num(c, "colorG", 1.0);
-    pl.color.z = (float)j_num(c, "colorB", 1.0);
-    pl.intensity = (float)j_num(c, "intensity", 1.0);
-    pl.radius    = (float)j_num(c, "radius", 10.0);
-    jce_scene_set_point_light(s, e, &pl);
-}
 
-static void parse_spot_light(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceSpotLight sl;
-    memset(&sl, 0, sizeof(sl));
-    sl.cookie_texture = JCE_TEXTURE_INVALID;
-    sl.ies_lut_texture = JCE_TEXTURE_INVALID;
-    sl.position.x = (float)j_num(c, "posX", 0.0);
-    sl.position.y = (float)j_num(c, "posY", 0.0);
-    sl.position.z = (float)j_num(c, "posZ", 0.0);
-    sl.direction.x = (float)j_num(c, "dirX", 0.0);
-    sl.direction.y = (float)j_num(c, "dirY", -1.0);
-    sl.direction.z = (float)j_num(c, "dirZ", 0.0);
-    sl.color.x = (float)j_num(c, "colorR", 1.0);
-    sl.color.y = (float)j_num(c, "colorG", 1.0);
-    sl.color.z = (float)j_num(c, "colorB", 1.0);
-    sl.intensity = (float)j_num(c, "intensity", 1.0);
-    sl.radius    = (float)j_num(c, "radius", 10.0);
-    float inner_deg = (float)j_num(c, "innerConeDeg", 30.0);
-    float outer_deg = (float)j_num(c, "outerConeDeg", 45.0);
-    sl.inner_cone_cos = cosf(inner_deg * JCE_DEG2RAD);
-    sl.outer_cone_cos = cosf(outer_deg * JCE_DEG2RAD);
-    /* P3-E.5 — cookie + IES profile (optional, additive). */
-    copy_str(sl.cookie_path, sizeof(sl.cookie_path), j_str(c, "cookiePath", ""));
-    copy_str(sl.ies_path,    sizeof(sl.ies_path),    j_str(c, "iesPath", ""));
-    sl.cookie_strength = (float)j_num(c, "cookieStrength", 0.0);
-    jce_scene_set_spot_light(s, e, &sl);
-}
 
-static void parse_skybox(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceSkyboxComponent sky;
-    memset(&sky, 0, sizeof(sky));
-    copy_str(sky.hdr_path, sizeof(sky.hdr_path), j_str(c, "hdrPath", ""));
-    sky.rotation   = (float)j_num(c, "rotation", 0.0);
-    sky.exposure   = (float)j_num(c, "exposure", 1.0);
-    sky.use_as_ibl = j_bool(c, "useAsIbl", true);
-    jce_scene_set_skybox(s, e, &sky);
-}
 
-static void parse_sprite_renderer(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceSpriteRendererComponent sp;
-    memset(&sp, 0, sizeof(sp));
-    copy_str(sp.sprite_path, sizeof(sp.sprite_path), j_str(c, "spritePath", ""));
-    sp.color[0] = (float)j_num(c, "colorR", 1.0);
-    sp.color[1] = (float)j_num(c, "colorG", 1.0);
-    sp.color[2] = (float)j_num(c, "colorB", 1.0);
-    sp.color[3] = (float)j_num(c, "colorA", 1.0);
-    sp.flip_x   = j_bool(c, "flipX", false);
-    sp.flip_y   = j_bool(c, "flipY", false);
-    sp.sorting_order = (int)j_num(c, "sortingOrder", 0);
-    jce_scene_set_sprite_renderer(s, e, &sp);
-}
 
-static void parse_sprite_animator(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceSpriteAnimatorComponent sa;
-    memset(&sa, 0, sizeof(sa));
-    copy_str(sa.sheet_path,    sizeof(sa.sheet_path),    j_str(c, "sheetPath", ""));
-    copy_str(sa.atlas_path,    sizeof(sa.atlas_path),    j_str(c, "atlasPath", ""));
-    sa.frame_width  = (int)j_num(c, "frameWidth",  0);
-    sa.frame_height = (int)j_num(c, "frameHeight", 0);
-    copy_str(sa.current_anim, sizeof(sa.current_anim), j_str(c, "currentAnim", ""));
-    sa.speed   = (float)j_num(c, "speed", 1.0);
-    sa.loop    = j_bool(c, "loop", true);
-    sa.playing = j_bool(c, "playing", false);
-    jce_scene_set_sprite_animator(s, e, &sa);
-}
 
-static void parse_skeletal_animator(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceSkeletalAnimatorComponent sk;
-    memset(&sk, 0, sizeof(sk));
-    copy_str(sk.skeleton_path, sizeof(sk.skeleton_path), j_str(c, "skeletonPath", ""));
-    copy_str(sk.sm_path, sizeof(sk.sm_path), j_str(c, "stateMachine", ""));
-    sk.use_blend_tree = j_bool(c, "useBlendTree", false);
-    sk.blend_param    = (float)j_num(c, "blendParam", 0.0);
-    sk.auto_speed     = j_bool(c, "autoSpeed", false);
-    {
-        const cJSON *bts = cJSON_GetObjectItemCaseSensitive(c, "blendThresholds");
-        if (cJSON_IsArray(bts)) {
-            int bn = cJSON_GetArraySize(bts);
-            if (bn > 8) bn = 8;
-            for (int i = 0; i < bn; i++) {
-                const cJSON *it = cJSON_GetArrayItem(bts, i);
-                if (cJSON_IsNumber(it))
-                    sk.blend_thresholds[i] = (float)it->valuedouble;
-            }
-        }
-    }
-    sk.speed       = (float)j_num(c, "speed", 1.0);
-    sk.loop        = j_bool(c, "loop", true);
-    sk.playing     = j_bool(c, "playing", false);
-    sk.active_clip = (int)j_num(c, "activeClip", -1);
-
-    const cJSON *clips = cJSON_GetObjectItemCaseSensitive(c, "clipNames");
-    if (cJSON_IsArray(clips)) {
-        int n = cJSON_GetArraySize(clips);
-        if (n > 8) n = 8;
-        sk.clip_count = n;
-        for (int i = 0; i < n; i++) {
-            const cJSON *it = cJSON_GetArrayItem(clips, i);
-            if (cJSON_IsString(it))
-                copy_str(sk.clip_names[i], sizeof(sk.clip_names[i]), it->valuestring);
-        }
-    }
-    jce_scene_set_skeletal_animator(s, e, &sk);
-}
 
 static void parse_editor_meta(JceScene *s, JceEntity e, const cJSON *c)
 {
@@ -1164,127 +950,9 @@ static void parse_editor_meta(JceScene *s, JceEntity e, const cJSON *c)
     }
 }
 
-/* Unified "Light" component: dispatches to dir/point/spot based on lightType. */
-static void parse_unified_light(JceScene *s, JceEntity e, const cJSON *c)
-{
-    float colorR = (float)j_num2(c, "colorR", "color_r", 1.0);
-    float colorG = (float)j_num2(c, "colorG", "color_g", 1.0);
-    float colorB = (float)j_num2(c, "colorB", "color_b", 1.0);
-    float intensity = (float)j_num(c, "intensity", 1.0);
-    bool  casts_shadow = j_bool(c, "castsShadow", false);
-    float dirX = (float)j_num2(c, "dirX", "dir_x", 0.0);
-    float dirY = (float)j_num2(c, "dirY", "dir_y", -1.0);
-    float dirZ = (float)j_num2(c, "dirZ", "dir_z", 0.0);
 
-    int ltype = 0;
-    const cJSON *lt = cJSON_GetObjectItemCaseSensitive(c, "lightType");
-    if (!lt) lt = cJSON_GetObjectItemCaseSensitive(c, "type");
-    if (cJSON_IsNumber(lt)) ltype = lt->valueint;
-    else if (cJSON_IsString(lt) && lt->valuestring) {
-        if (streq_ci(lt->valuestring, "point")) ltype = 1;
-        else if (streq_ci(lt->valuestring, "spot")) ltype = 2;
-    }
 
-    if (ltype == 1) {
-        JcePointLight pl;
-        memset(&pl, 0, sizeof(pl));
-        pl.color.x = colorR; pl.color.y = colorG; pl.color.z = colorB;
-        pl.intensity = intensity;
-        pl.radius    = (float)j_num(c, "radius", 10.0);
-        pl.casts_shadow = casts_shadow;
-        pl.shadow_bias  = (float)j_num(c, "shadowBias", 0.0);
-        jce_scene_set_point_light(s, e, &pl);
-    } else if (ltype == 2) {
-        JceSpotLight sl;
-        memset(&sl, 0, sizeof(sl));
-        sl.cookie_texture = JCE_TEXTURE_INVALID;
-        sl.ies_lut_texture = JCE_TEXTURE_INVALID;
-        sl.direction.x = dirX;
-        sl.direction.y = dirY;
-        sl.direction.z = dirZ;
-        sl.color.x = colorR; sl.color.y = colorG; sl.color.z = colorB;
-        sl.intensity = intensity;
-        sl.radius    = (float)j_num(c, "radius", 10.0);
-        float inner_deg = (float)j_num2(c, "innerConeDeg", "inner_cone_deg", 25.0);
-        float outer_deg = (float)j_num2(c, "outerConeDeg", "outer_cone_deg", 35.0);
-        sl.inner_cone_cos = cosf(inner_deg * JCE_DEG2RAD);
-        sl.outer_cone_cos = cosf(outer_deg * JCE_DEG2RAD);
-        /* P3-E.5 — cookie + IES profile (additive). */
-        copy_str(sl.cookie_path, sizeof(sl.cookie_path), j_str(c, "cookiePath", ""));
-        copy_str(sl.ies_path,    sizeof(sl.ies_path),    j_str(c, "iesPath", ""));
-        sl.cookie_strength = (float)j_num(c, "cookieStrength", 0.0);
-        sl.casts_shadow = casts_shadow;
-        sl.shadow_bias  = (float)j_num(c, "shadowBias", 0.0);
-        jce_scene_set_spot_light(s, e, &sl);
-    } else {
-        JceDirectionalLight dl;
-        memset(&dl, 0, sizeof(dl));
-        dl.cookie_texture = JCE_TEXTURE_INVALID;
-        dl.direction.x = dirX;
-        dl.direction.y = dirY;
-        dl.direction.z = dirZ;
-        dl.color.x = colorR; dl.color.y = colorG; dl.color.z = colorB;
-        dl.intensity    = intensity;
-        dl.casts_shadow = casts_shadow;
-        /* P3-E.5 — directional cookie (data-side scaffold). */
-        copy_str(dl.cookie_path, sizeof(dl.cookie_path), j_str(c, "cookiePath", ""));
-        dl.cookie_strength = (float)j_num(c, "cookieStrength", 0.0);
-        jce_scene_set_dir_light(s, e, &dl);
-    }
-}
 
-static void parse_animator(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceAnimatorComponent a;
-    memset(&a, 0, sizeof(a));
-    copy_str(a.clip_name, sizeof(a.clip_name), j_str(c, "clipName", ""));
-    a.speed   = (float)j_num(c, "speed", 1.0);
-    a.loop    = j_bool(c, "loop", false);
-    a.playing = j_bool(c, "playing", false);
-    jce_scene_set_animator(s, e, &a);
-}
-
-static void parse_rigidbody(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceRigidBodyComponent rb;
-    memset(&rb, 0, sizeof(rb));
-    rb.mass         = (float)j_num(c, "mass", 1.0);
-    rb.drag         = (float)j_num(c, "drag", 0.0);
-    rb.angular_drag = (float)j_num(c, "angularDrag", 0.05);
-    rb.use_gravity  = j_bool(c, "useGravity", true);
-    rb.is_kinematic = j_bool(c, "isKinematic", false);
-    /* CCD (P3-C.3) — DISCRETE if absent for backwards compatibility. */
-    {
-        int mode = (int)j_num(c, "ccdMode", 0.0);
-        if (mode < 0) mode = 0;
-        if (mode > 3) mode = 3;
-        rb.ccd_mode = (uint8_t)mode;
-    }
-    rb.ccd_threshold     = (float)j_num(c, "ccdThreshold", 0.0);
-    rb.ccd_sphere_radius = (float)j_num(c, "ccdSphereRadius", 0.0);
-    /* Friction / restitution (default 0.5 / 0.0 — matches the spawn-time
-     * fallback so legacy scenes without these keys behave identically). */
-    rb.friction      = (float)j_num(c, "friction", 0.5);
-    rb.restitution   = (float)j_num(c, "restitution", 0.0);
-    rb.gravity_scale = (float)j_num(c, "gravityScale", 1.0);
-    rb.physics_layer = (uint32_t)j_num(c, "physicsLayer", 0.0);
-    copy_str(rb.physmat_path, sizeof(rb.physmat_path),
-             j_str(c, "physMaterial", ""));
-    jce_scene_set_rigidbody(s, e, &rb);
-}
-
-static void parse_rigidbody2d(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceRigidBody2DComponent rb;
-    memset(&rb, 0, sizeof(rb));
-    rb.body_type      = (uint8_t)(int)j_num(c, "bodyType", 0.0);
-    rb.shape_type     = (uint8_t)(int)j_num(c, "shapeType", 0.0);
-    rb.mass           = (float)j_num(c, "mass", 1.0);
-    rb.friction       = (float)j_num(c, "friction", 0.4);
-    rb.restitution    = (float)j_num(c, "restitution", 0.0);
-    rb.fixed_rotation = j_bool(c, "fixedRotation", false);
-    jce_scene_set_rigidbody2d(s, e, &rb);
-}
 
 static void parse_particle_emitter(JceScene *s, JceEntity e, const cJSON *c)
 {
@@ -1309,74 +977,10 @@ static void parse_particle_emitter(JceScene *s, JceEntity e, const cJSON *c)
     jce_scene_set_particle_emitter(s, e, &pe);
 }
 
-static void parse_behavior_tree(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceBehaviorTree bt;
-    memset(&bt, 0, sizeof(bt));
-    copy_str(bt.tree_path, sizeof(bt.tree_path), j_str(c, "treePath", ""));
-    bt.tick_hz = (float)j_num(c, "tickHz", 0.0);
-    bt.active = j_bool(c, "active", true);
-    bt.sight_range      = (float)j_num(c, "sightRange", 0.0);
-    bt.sight_half_angle = (float)j_num(c, "sightHalfAngle", 0.0);
-    bt.hearing_range    = (float)j_num(c, "hearingRange", 0.0);
-    jce_scene_set_behavior_tree(s, e, &bt);
-}
 
-static void parse_box_collider(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceBoxColliderComponent bc;
-    memset(&bc, 0, sizeof(bc));
-    bc.center[0] = (float)j_num(c, "centerX", 0.0);
-    bc.center[1] = (float)j_num(c, "centerY", 0.0);
-    bc.center[2] = (float)j_num(c, "centerZ", 0.0);
-    bc.size[0]   = (float)j_num(c, "sizeX", 1.0);
-    bc.size[1]   = (float)j_num(c, "sizeY", 1.0);
-    bc.size[2]   = (float)j_num(c, "sizeZ", 1.0);
-    bc.is_trigger = j_bool(c, "isTrigger", false);
-    jce_scene_set_box_collider(s, e, &bc);
-}
 
-static void parse_sphere_collider(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceSphereColliderComponent sc2;
-    memset(&sc2, 0, sizeof(sc2));
-    sc2.center[0] = (float)j_num(c, "centerX", 0.0);
-    sc2.center[1] = (float)j_num(c, "centerY", 0.0);
-    sc2.center[2] = (float)j_num(c, "centerZ", 0.0);
-    sc2.radius     = (float)j_num(c, "radius", 0.5);
-    sc2.is_trigger = j_bool(c, "isTrigger", false);
-    jce_scene_set_sphere_collider(s, e, &sc2);
-}
 
-static void parse_character_controller(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceCharacterControllerComponent cc;
-    memset(&cc, 0, sizeof(cc));
-    cc.height      = (float)j_num(c, "height", 2.0);
-    cc.radius      = (float)j_num(c, "radius", 0.5);
-    cc.step_offset = (float)j_num(c, "stepOffset", 0.3);
-    cc.slope_limit = (float)j_num(c, "slopeLimit", 45.0);
-    cc.move_speed     = (float)j_num(c, "moveSpeed", 4.0);
-    cc.sprint_mult    = (float)j_num(c, "sprintMult", 1.8);
-    cc.jump_speed     = (float)j_num(c, "jumpSpeed", 5.0);
-    cc.accel          = (float)j_num(c, "accel", 40.0);
-    cc.air_control    = (float)j_num(c, "airControl", 0.35);
-    cc.turn_speed_deg = (float)j_num(c, "turnSpeed", 720.0);
-    jce_scene_set_character_controller(s, e, &cc);
-}
 
-static void parse_audio_source(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceAudioSourceComponent as;
-    memset(&as, 0, sizeof(as));
-    copy_str(as.clip_path, sizeof(as.clip_path), j_str(c, "clipPath", ""));
-    as.volume        = (float)j_num(c, "volume", 1.0);
-    as.pitch         = (float)j_num(c, "pitch", 1.0);
-    as.spatial_blend  = (float)j_num(c, "spatialBlend", 0.0);
-    as.loop          = j_bool(c, "loop", false);
-    as.play_on_awake = j_bool(c, "playOnAwake", true);
-    jce_scene_set_audio_source(s, e, &as);
-}
 
 static void parse_video_player(JceScene *s, JceEntity e, const cJSON *c)
 {
@@ -1391,780 +995,132 @@ static void parse_video_player(JceScene *s, JceEntity e, const cJSON *c)
     jce_scene_set_video_player(s, e, &vp);
 }
 
-static void parse_script(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceScriptComponent sc2;
-    memset(&sc2, 0, sizeof(sc2));
-    copy_str(sc2.script_path, sizeof(sc2.script_path), j_str(c, "scriptPath", ""));
-    jce_scene_set_script(s, e, &sc2);
-}
 
-static void parse_terrain(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceTerrainComponent tc;
-    memset(&tc, 0, sizeof(tc));
-    copy_str(tc.terrain_path, sizeof(tc.terrain_path),
-             j_str(c, "terrainPath", ""));
-    const char *keys[4] = { "layerAlbedoPath0", "layerAlbedoPath1",
-                            "layerAlbedoPath2", "layerAlbedoPath3" };
-    for (int i = 0; i < 4; ++i)
-        copy_str(tc.layer_albedo_path[i], sizeof(tc.layer_albedo_path[i]),
-                 j_str(c, keys[i], ""));
-    tc.tile_scale     = (float)j_num(c, "tileScale", 10.0);
-    tc.tint[0]        = (float)j_num(c, "tintR", 1.0);
-    tc.tint[1]        = (float)j_num(c, "tintG", 1.0);
-    tc.tint[2]        = (float)j_num(c, "tintB", 1.0);
-    tc.visible        = j_bool(c, "visible", true);
-    tc.splat_enabled  = j_bool(c, "splatEnabled", true);
-    jce_scene_set_terrain(s, e, &tc);
-}
 
-static void parse_lod_group(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceLodGroupComponent lg;
-    memset(&lg, 0, sizeof(lg));
-    lg.level_count = (int)j_num(c, "levelCount", 0);
-    if (lg.level_count < 0) lg.level_count = 0;
-    if (lg.level_count > JCE_LOD_COMP_MAX_LEVELS) lg.level_count = JCE_LOD_COMP_MAX_LEVELS;
-    lg.hysteresis        = (float)j_num(c, "hysteresis", 0.05);
-    lg.cull_when_too_far = j_bool(c, "cullWhenTooFar", false);
-    char key[32];
-    for (int i = 0; i < JCE_LOD_COMP_MAX_LEVELS; ++i) {
-        snprintf(key, sizeof(key), "distance%d", i);
-        lg.distances[i] = (float)j_num(c, key, 0.0);
-        snprintf(key, sizeof(key), "meshPath%d", i);
-        copy_str(lg.level_mesh_paths[i], sizeof(lg.level_mesh_paths[i]), j_str(c, key, ""));
-    }
-    jce_scene_set_lod_group(s, e, &lg);
-}
 
-static void parse_virtual_camera(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceVirtualCameraComponent v;
-    memset(&v, 0, sizeof(v));
-    copy_str(v.vcam_name, sizeof(v.vcam_name), j_str(c, "name", "VCam"));
-    v.priority   = (int32_t)j_num(c, "priority", 0);
-    v.active     = j_bool(c, "active", true);
-    v.track_mode = (int)j_num(c, "trackMode", 0);
-    v.position[0] = (float)j_num(c, "posX", 0.0);
-    v.position[1] = (float)j_num(c, "posY", 0.0);
-    v.position[2] = (float)j_num(c, "posZ", 0.0);
-    v.look_at[0]  = (float)j_num(c, "lookX", 0.0);
-    v.look_at[1]  = (float)j_num(c, "lookY", 0.0);
-    v.look_at[2]  = (float)j_num(c, "lookZ", 0.0);
-    v.fov_deg     = (float)j_num(c, "fov", 60.0);
-    v.follow_offset[0] = (float)j_num(c, "offX", 0.0);
-    v.follow_offset[1] = (float)j_num(c, "offY", 0.0);
-    v.follow_offset[2] = (float)j_num(c, "offZ", 0.0);
-    v.damping     = (float)j_num(c, "damping", 0.5);
-    v.follow_target  = (uint64_t)j_num(c, "followTarget", 0.0);
-    v.look_at_target = (uint64_t)j_num(c, "lookAtTarget", 0.0);
-    jce_scene_set_virtual_camera(s, e, &v);
-}
 
-static void parse_trigger_volume(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceTriggerVolumeComponent t;
-    memset(&t, 0, sizeof(t));
-    t.shape           = (int)j_num(c, "shape", 0);
-    t.center[0]       = (float)j_num(c, "cx", 0.0);
-    t.center[1]       = (float)j_num(c, "cy", 0.0);
-    t.center[2]       = (float)j_num(c, "cz", 0.0);
-    t.half_extents[0] = (float)j_num(c, "hx", 0.5);
-    t.half_extents[1] = (float)j_num(c, "hy", 0.5);
-    t.half_extents[2] = (float)j_num(c, "hz", 0.5);
-    t.axis_x[0] = (float)j_num(c, "axX", 1.0); t.axis_y[1] = (float)j_num(c, "ayY", 1.0); t.axis_z[2] = (float)j_num(c, "azZ", 1.0);
-    t.axis_x[1] = (float)j_num(c, "axY", 0.0); t.axis_x[2] = (float)j_num(c, "axZ", 0.0);
-    t.axis_y[0] = (float)j_num(c, "ayX", 0.0); t.axis_y[2] = (float)j_num(c, "ayZ", 0.0);
-    t.axis_z[0] = (float)j_num(c, "azX", 0.0); t.axis_z[1] = (float)j_num(c, "azY", 0.0);
-    t.enabled   = j_bool(c, "enabled", true);
-    t.fire_stay = j_bool(c, "fireStay", false);
-    copy_str(t.tag, sizeof(t.tag), j_str(c, "tag", ""));
-    jce_scene_set_trigger_volume(s, e, &t);
-}
 
-static void parse_capsule_collider(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceCapsuleColliderComponent cc;
-    memset(&cc, 0, sizeof(cc));
-    cc.center[0] = (float)j_num(c, "cx", 0.0);
-    cc.center[1] = (float)j_num(c, "cy", 0.0);
-    cc.center[2] = (float)j_num(c, "cz", 0.0);
-    cc.radius    = (float)j_num(c, "radius", 0.5);
-    cc.height    = (float)j_num(c, "height", 2.0);
-    cc.axis      = (int)  j_num(c, "axis", 1);
-    cc.is_trigger= j_bool(c, "isTrigger", false);
-    jce_scene_set_capsule_collider(s, e, &cc);
-}
 
-static void parse_mesh_collider(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceMeshColliderComponent mc;
-    memset(&mc, 0, sizeof(mc));
-    copy_str(mc.mesh_path, sizeof(mc.mesh_path), j_str(c, "meshPath", ""));
-    mc.convex      = j_bool(c, "convex", false);
-    mc.is_trigger  = j_bool(c, "isTrigger", false);
-    mc.friction    = (float)j_num(c, "friction", 0.5);
-    mc.restitution = (float)j_num(c, "restitution", 0.0);
-    jce_scene_set_mesh_collider(s, e, &mc);
-}
 
-static void parse_compound_collider(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceCompoundColliderComponent cc;
-    memset(&cc, 0, sizeof(cc));
-    copy_str(cc.model_path, sizeof(cc.model_path), j_str(c, "modelPath", ""));
-    cc.mode          = (uint8_t)j_num(c, "mode", 0);
-    cc.split         = (uint8_t)j_num(c, "split", 0);
-    cc.is_static     = j_bool(c, "isStatic", true);
-    cc.detect_naming = j_bool(c, "detectNaming", true);
-    cc.is_trigger    = j_bool(c, "isTrigger", false);
-    cc.friction      = (float)j_num(c, "friction", 0.5);
-    cc.restitution   = (float)j_num(c, "restitution", 0.0);
-    cc.vhacd_resolution         = (uint32_t)j_num(c, "vhacdResolution", 0);
-    cc.vhacd_max_hulls          = (uint32_t)j_num(c, "vhacdMaxHulls", 0);
-    cc.vhacd_max_verts_per_hull = (uint32_t)j_num(c, "vhacdMaxVertsPerHull", 0);
-    copy_str(cc.physmat_path, sizeof(cc.physmat_path),
-             j_str(c, "physMaterial", ""));
-    jce_scene_set_compound_collider(s, e, &cc);
-}
 
-static void parse_collider2d(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceCollider2DComponent cd;
-    memset(&cd, 0, sizeof(cd));
-    cd.shape             = (int)j_num(c, "shape", 0);
-    cd.offset[0]         = (float)j_num(c, "offX", 0.0);
-    cd.offset[1]         = (float)j_num(c, "offY", 0.0);
-    cd.size[0]           = (float)j_num(c, "sizeX", 1.0);
-    cd.size[1]           = (float)j_num(c, "sizeY", 1.0);
-    cd.radius            = (float)j_num(c, "radius", 0.5);
-    cd.capsule_direction = (int)j_num(c, "capsuleDir", 0);
-    cd.is_trigger        = j_bool(c, "isTrigger", false);
-    cd.friction          = (float)j_num(c, "friction", 0.4);
-    cd.restitution       = (float)j_num(c, "restitution", 0.0);
-    int n = (int)j_num(c, "pointCount", 0);
-    if (n < 0) n = 0;
-    if (n > JCE_COLLIDER_2D_MAX_POINTS) n = JCE_COLLIDER_2D_MAX_POINTS;
-    cd.point_count = n;
-    char key[24];
-    for (int i = 0; i < n; ++i) {
-        snprintf(key, sizeof(key), "px%d", i);
-        cd.points[i][0] = (float)j_num(c, key, 0.0);
-        snprintf(key, sizeof(key), "py%d", i);
-        cd.points[i][1] = (float)j_num(c, key, 0.0);
-    }
-    jce_scene_set_collider2d(s, e, &cd);
-}
 
-static void parse_trail_renderer(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceTrailRendererComponent t;
-    memset(&t, 0, sizeof(t));
-    const char *mp = j_str(c, "materialPath", "");
-    snprintf(t.material_path, sizeof(t.material_path), "%s", mp ? mp : "");
-    t.time                = (float)j_num(c, "time", 1.0);
-    t.min_vertex_distance = (float)j_num(c, "minVertexDistance", 0.1);
-    t.width_start         = (float)j_num(c, "widthStart", 0.1);
-    t.width_end           = (float)j_num(c, "widthEnd", 0.0);
-    t.color_start[0]      = (float)j_num(c, "colorStartR", 1.0);
-    t.color_start[1]      = (float)j_num(c, "colorStartG", 1.0);
-    t.color_start[2]      = (float)j_num(c, "colorStartB", 1.0);
-    t.color_start[3]      = (float)j_num(c, "colorStartA", 1.0);
-    t.color_end[0]        = (float)j_num(c, "colorEndR", 1.0);
-    t.color_end[1]        = (float)j_num(c, "colorEndG", 1.0);
-    t.color_end[2]        = (float)j_num(c, "colorEndB", 1.0);
-    t.color_end[3]        = (float)j_num(c, "colorEndA", 0.0);
-    t.emitting            = j_bool(c, "emitting", true);
-    t.autodestruct        = j_bool(c, "autodestruct", false);
-    int n = (int)j_num(c, "pointCount", 0);
-    if (n < 0) n = 0;
-    if (n > JCE_TRAIL_MAX_POINTS) n = JCE_TRAIL_MAX_POINTS;
-    t.point_count = n;
-    char key[24];
-    for (int i = 0; i < n; ++i) {
-        snprintf(key, sizeof(key), "px%d", i); t.points[i][0] = (float)j_num(c, key, 0.0);
-        snprintf(key, sizeof(key), "py%d", i); t.points[i][1] = (float)j_num(c, key, 0.0);
-        snprintf(key, sizeof(key), "pz%d", i); t.points[i][2] = (float)j_num(c, key, 0.0);
-    }
-    jce_scene_set_trail_renderer(s, e, &t);
-}
 
-static void parse_line_renderer(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceLineRendererComponent l;
-    memset(&l, 0, sizeof(l));
-    const char *mp = j_str(c, "materialPath", "");
-    snprintf(l.material_path, sizeof(l.material_path), "%s", mp ? mp : "");
-    l.width_start    = (float)j_num(c, "widthStart", 0.1);
-    l.width_end      = (float)j_num(c, "widthEnd",   0.1);
-    l.color_start[0] = (float)j_num(c, "colorStartR", 1.0);
-    l.color_start[1] = (float)j_num(c, "colorStartG", 1.0);
-    l.color_start[2] = (float)j_num(c, "colorStartB", 1.0);
-    l.color_start[3] = (float)j_num(c, "colorStartA", 1.0);
-    l.color_end[0]   = (float)j_num(c, "colorEndR", 1.0);
-    l.color_end[1]   = (float)j_num(c, "colorEndG", 1.0);
-    l.color_end[2]   = (float)j_num(c, "colorEndB", 1.0);
-    l.color_end[3]   = (float)j_num(c, "colorEndA", 1.0);
-    l.use_world_space = j_bool(c, "useWorldSpace", true);
-    l.loop            = j_bool(c, "loop", false);
-    int n = (int)j_num(c, "positionCount", 0);
-    if (n < 0) n = 0;
-    if (n > JCE_LINE_MAX_POINTS) n = JCE_LINE_MAX_POINTS;
-    l.position_count = n;
-    char key[24];
-    for (int i = 0; i < n; ++i) {
-        snprintf(key, sizeof(key), "px%d", i); l.positions[i][0] = (float)j_num(c, key, 0.0);
-        snprintf(key, sizeof(key), "py%d", i); l.positions[i][1] = (float)j_num(c, key, 0.0);
-        snprintf(key, sizeof(key), "pz%d", i); l.positions[i][2] = (float)j_num(c, key, 0.0);
-    }
-    jce_scene_set_line_renderer(s, e, &l);
-}
 
-static void parse_reflection_probe(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceReflectionProbeComponent r;
-    memset(&r, 0, sizeof(r));
-    r.mode           = (int)j_num(c, "mode", 0);
-    r.resolution     = (int)j_num(c, "resolution", 128);
-    r.intensity      = (float)j_num(c, "intensity", 1.0);
-    r.blend_distance = (float)j_num(c, "blendDistance", 0.0);
-    r.box_size[0]    = (float)j_num(c, "boxSizeX", 10.0);
-    r.box_size[1]    = (float)j_num(c, "boxSizeY", 10.0);
-    r.box_size[2]    = (float)j_num(c, "boxSizeZ", 10.0);
-    r.box_offset[0]  = (float)j_num(c, "boxOffX", 0.0);
-    r.box_offset[1]  = (float)j_num(c, "boxOffY", 0.0);
-    r.box_offset[2]  = (float)j_num(c, "boxOffZ", 0.0);
-    r.near_clip      = (float)j_num(c, "nearClip", 0.3);
-    r.far_clip       = (float)j_num(c, "farClip", 1000.0);
-    const char *hp = j_str(c, "hdrPath", "");
-    snprintf(r.custom_hdr_path, sizeof(r.custom_hdr_path), "%s", hp ? hp : "");
-    const char *bp = j_str(c, "bakedCubemapPath", "");
-    snprintf(r.baked_cubemap_path, sizeof(r.baked_cubemap_path), "%s", bp ? bp : "");
-    r.box_projection = j_bool(c, "boxProjection", true);
-    r.hdr            = j_bool(c, "hdr", true);
-    jce_scene_set_reflection_probe(s, e, &r);
-}
 
-static void parse_decal(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceDecalComponent d;
-    memset(&d, 0, sizeof(d));
-    const char *mp = j_str(c, "materialPath", "");
-    snprintf(d.material_path, sizeof(d.material_path), "%s", mp ? mp : "");
-    d.size[0]  = (float)j_num(c, "sizeX", 1.0);
-    d.size[1]  = (float)j_num(c, "sizeY", 1.0);
-    d.size[2]  = (float)j_num(c, "sizeZ", 1.0);
-    d.pivot[0] = (float)j_num(c, "pivotX", 0.0);
-    d.pivot[1] = (float)j_num(c, "pivotY", 0.0);
-    d.pivot[2] = (float)j_num(c, "pivotZ", 0.0);
-    d.color[0] = (float)j_num(c, "colorR", 1.0);
-    d.color[1] = (float)j_num(c, "colorG", 1.0);
-    d.color[2] = (float)j_num(c, "colorB", 1.0);
-    d.color[3] = (float)j_num(c, "colorA", 1.0);
-    d.opacity       = (float)j_num(c, "opacity", 1.0);
-    d.draw_distance = (float)j_num(c, "drawDistance", 1000.0);
-    d.fade_factor   = (float)j_num(c, "fadeFactor", 1.0);
-    d.layer_mask    = (int)j_num(c, "layerMask", -1);
-    jce_scene_set_decal(s, e, &d);
-}
 
-static void parse_light_probe_group(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceLightProbeGroupComponent g;
-    memset(&g, 0, sizeof(g));
-    int n = (int)j_num(c, "probeCount", 0);
-    if (n < 0) n = 0;
-    if (n > JCE_LIGHT_PROBE_MAX) n = JCE_LIGHT_PROBE_MAX;
-    g.probe_count = n;
-    g.dering = j_bool(c, "dering", false);
-    char key[24];
-    for (int i = 0; i < n; ++i) {
-        snprintf(key, sizeof(key), "px%d", i); g.positions[i][0] = (float)j_num(c, key, 0.0);
-        snprintf(key, sizeof(key), "py%d", i); g.positions[i][1] = (float)j_num(c, key, 0.0);
-        snprintf(key, sizeof(key), "pz%d", i); g.positions[i][2] = (float)j_num(c, key, 0.0);
-    }
-    jce_scene_set_light_probe_group(s, e, &g);
-}
 
-static void parse_audio_listener(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceAudioListenerComponent l;
-    memset(&l, 0, sizeof(l));
-    l.volume         = (float)j_num(c, "volume", 1.0);
-    l.paused         = j_bool(c, "paused", false);
-    l.spatialize     = j_bool(c, "spatialize", true);
-    l.doppler_factor = (float)j_num(c, "dopplerFactor", 1.0);
-    jce_scene_set_audio_listener(s, e, &l);
-}
 
-static void parse_audio_reverb_zone(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceAudioReverbZoneComponent r;
-    memset(&r, 0, sizeof(r));
-    r.preset            = (int)j_num(c, "preset", 0);
-    r.min_distance      = (float)j_num(c, "minDistance", 10.0);
-    r.max_distance      = (float)j_num(c, "maxDistance", 15.0);
-    r.room              = (float)j_num(c, "room", -1000.0);
-    r.room_hf           = (float)j_num(c, "roomHF", -100.0);
-    r.decay_time        = (float)j_num(c, "decayTime", 1.49);
-    r.decay_hf_ratio    = (float)j_num(c, "decayHFRatio", 0.83);
-    r.reflections       = (float)j_num(c, "reflections", -2602.0);
-    r.reflections_delay = (float)j_num(c, "reflectionsDelay", 0.007);
-    r.reverb            = (float)j_num(c, "reverb", 200.0);
-    r.reverb_delay      = (float)j_num(c, "reverbDelay", 0.011);
-    r.hf_reference      = (float)j_num(c, "hfReference", 5000.0);
-    r.diffusion         = (float)j_num(c, "diffusion", 100.0);
-    r.density           = (float)j_num(c, "density", 100.0);
-    jce_scene_set_audio_reverb_zone(s, e, &r);
-}
 
-static void parse_audio_occlusion(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceAudioOcclusionComponent o;
-    memset(&o, 0, sizeof(o));
-    o.radius            = (float)j_num(c, "radius", 5.0);
-    o.attenuation_db    = (float)j_num(c, "attenuationDb", -12.0);
-    o.lowpass_cutoff_hz = (float)j_num(c, "lowpassCutoffHz", 1000.0);
-    o.layer_mask        = (int)j_num(c, "layerMask", -1);
-    o.affects_reverb    = j_bool(c, "affectsReverb", true);
-    jce_scene_set_audio_occlusion(s, e, &o);
-}
 
-static void parse_spawn_manager(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceSpawnManagerComponent m;
-    memset(&m, 0, sizeof(m));
-    m.enabled          = (int)j_num(c, "enabled", 1);
-    m.max_peds         = (int)j_num(c, "maxPeds", 32);
-    m.max_vehicles     = (int)j_num(c, "maxVehicles", 16);
-    m.min_spawn_radius = (float)j_num(c, "minSpawnRadius", 30.0);
-    m.max_spawn_radius = (float)j_num(c, "maxSpawnRadius", 120.0);
-    m.despawn_pad      = (float)j_num(c, "despawnPad", 30.0);
-    m.spawn_interval   = (float)j_num(c, "spawnInterval", 0.5);
-    int pn = (int)j_num(c, "pedArchetypeCount", 0);
-    int vn = (int)j_num(c, "vehicleArchetypeCount", 0);
-    if (pn < 0) pn = 0; if (pn > 8) pn = 8;
-    if (vn < 0) vn = 0; if (vn > 8) vn = 8;
-    m.ped_archetype_count = pn;
-    m.vehicle_archetype_count = vn;
-    char key[24];
-    for (int i = 0; i < pn; ++i) {
-        snprintf(key, sizeof(key), "pa%d", i);
-        m.ped_archetypes[i] = (uint32_t)j_num(c, key, 0.0);
-    }
-    for (int i = 0; i < vn; ++i) {
-        snprintf(key, sizeof(key), "va%d", i);
-        m.vehicle_archetypes[i] = (uint32_t)j_num(c, key, 0.0);
-    }
-    m.rng_seed = (uint64_t)j_num(c, "rngSeed", 0.0);
-    jce_scene_set_spawn_manager(s, e, &m);
-}
 
-static void parse_weapon(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceWeaponComponent w;
-    memset(&w, 0, sizeof(w));
-    copy_str(w.name, sizeof(w.name), j_str(c, "name", "Weapon"));
-    w.kind             = (int)j_num(c, "kind", 0);
-    w.damage           = (float)j_num(c, "damage", 10.0);
-    w.range            = (float)j_num(c, "range", 100.0);
-    w.rpm              = (float)j_num(c, "rpm", 600.0);
-    w.clip_size        = (int)j_num(c, "clipSize", 30);
-    w.reserve_max      = (int)j_num(c, "reserveMax", 120);
-    w.reload_seconds   = (float)j_num(c, "reloadSeconds", 2.0);
-    w.spread_deg       = (float)j_num(c, "spreadDeg", 0.5);
-    w.recoil_per_shot  = (float)j_num(c, "recoilPerShot", 0.5);
-    w.recoil_recovery  = (float)j_num(c, "recoilRecovery", 8.0);
-    w.pellets          = (int)j_num(c, "pellets", 1);
-    w.projectile_speed = (float)j_num(c, "projectileSpeed", 200.0);
-    w.full_auto        = j_bool(c, "fullAuto", false);
-    jce_scene_set_weapon(s, e, &w);
-}
 
-static void parse_save_point(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceSavePointComponent sp;
-    memset(&sp, 0, sizeof(sp));
-    copy_str(sp.save_id,      sizeof(sp.save_id),      j_str(c, "saveId", ""));
-    copy_str(sp.display_name, sizeof(sp.display_name), j_str(c, "displayName", ""));
-    sp.kind             = (int)j_num(c, "kind", 0);
-    sp.radius           = (float)j_num(c, "radius", 1.5);
-    sp.slot             = (int)j_num(c, "slot", -1);
-    sp.one_shot         = j_bool(c, "oneShot", false);
-    sp.require_interact = j_bool(c, "requireInteract", true);
-    jce_scene_set_save_point(s, e, &sp);
-}
+
+
+
 
 /* ── P2 add-on parsers (Wheel/ConstantForce/Joints/Billboard/UI) ── */
 
-static void parse_wheel_collider(JceScene *s, JceEntity e, const cJSON *c)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/* ── Inline parse branches factored for registry dispatch ─────────── */
+
+
+
+
+
+/* One-way legacy migration (consolidation v0.9.9). The orphaned VFX
+ * Graph runtime was removed — its `*.vfx.json` key set always parsed
+ * identically to `*.particles.json`, so the authored graphPath maps
+ * straight onto a ParticleEmitterComponent asset path and the entity
+ * joins the standard particle pipeline. Legacy-only knobs
+ * (playOnAwake / loop / rateMultiplier / intensity) have no
+ * counterpart and are dropped. An explicitly authored ParticleEmitter
+ * on the same entity always wins; the component is never re-saved as
+ * VfxGraph (its registry row has serialize == NULL). */
+static void parse_vfx_graph_migrate(JceScene *s, JceEntity e, const cJSON *props)
 {
-    JceWheelColliderComponent w; memset(&w, 0, sizeof w);
-    w.radius                = (float)j_num(c, "radius", 0.5);
-    w.suspension_distance   = (float)j_num(c, "suspensionDistance", 0.3);
-    w.suspension_spring     = (float)j_num(c, "suspensionSpring", 35000.0);
-    w.suspension_damper     = (float)j_num(c, "suspensionDamper", 4500.0);
-    w.suspension_target_pos = (float)j_num(c, "suspensionTargetPos", 0.5);
-    w.mass                  = (float)j_num(c, "mass", 20.0);
-    w.forward_friction      = (float)j_num(c, "forwardFriction", 1.0);
-    w.sideways_friction     = (float)j_num(c, "sidewaysFriction", 1.0);
-    w.center[0] = (float)j_num(c, "centerX", 0.0);
-    w.center[1] = (float)j_num(c, "centerY", 0.0);
-    w.center[2] = (float)j_num(c, "centerZ", 0.0);
-    w.motor_torque    = (float)j_num(c, "motorTorque", 0.0);
-    w.brake_torque    = (float)j_num(c, "brakeTorque", 0.0);
-    w.steer_angle_deg = (float)j_num(c, "steerAngleDeg", 0.0);
-    jce_scene_set_wheel_collider(s, e, &w);
+    const char *gp = j_str(props, "graphPath", "");
+    if (gp[0] && !jce_scene_has_particle_emitter(s, e)) {
+        JceParticleEmitterComponent pe;
+        memset(&pe, 0, sizeof pe);
+        copy_str(pe.asset_path, sizeof pe.asset_path, gp);
+        pe.emit_rate          = 10.0f;   /* legacy quick-tune fallbacks */
+        pe.lifetime_min       = 1.0f;
+        pe.lifetime_max       = 2.0f;
+        pe.emitter_handle_idx = UINT32_MAX;
+        jce_scene_set_particle_emitter(s, e, &pe);
+    }
 }
 
-static void parse_constant_force(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceConstantForceComponent f; memset(&f, 0, sizeof f);
-    f.force[0] = (float)j_num(c, "forceX", 0.0);
-    f.force[1] = (float)j_num(c, "forceY", 0.0);
-    f.force[2] = (float)j_num(c, "forceZ", 0.0);
-    f.relative_force[0] = (float)j_num(c, "relForceX", 0.0);
-    f.relative_force[1] = (float)j_num(c, "relForceY", 0.0);
-    f.relative_force[2] = (float)j_num(c, "relForceZ", 0.0);
-    f.torque[0] = (float)j_num(c, "torqueX", 0.0);
-    f.torque[1] = (float)j_num(c, "torqueY", 0.0);
-    f.torque[2] = (float)j_num(c, "torqueZ", 0.0);
-    f.relative_torque[0] = (float)j_num(c, "relTorqueX", 0.0);
-    f.relative_torque[1] = (float)j_num(c, "relTorqueY", 0.0);
-    f.relative_torque[2] = (float)j_num(c, "relTorqueZ", 0.0);
-    f.enabled = j_bool(c, "enabled", true);
-    jce_scene_set_constant_force(s, e, &f);
-}
 
-static void parse_nav_agent(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceNavAgentComponent n; memset(&n, 0, sizeof n);
-    n.radius          = (float)j_num(c, "radius", 0.5);
-    n.height          = (float)j_num(c, "height", 2.0);
-    n.max_speed       = (float)j_num(c, "maxSpeed", 3.5);
-    n.max_accel       = (float)j_num(c, "maxAccel", 8.0);
-    n.arrive_radius   = (float)j_num(c, "arriveRadius", 1.5);
-    n.waypoint_radius = (float)j_num(c, "waypointRadius", 0.5);
-    n.target[0] = (float)j_num(c, "targetX", 0.0);
-    n.target[1] = (float)j_num(c, "targetY", 0.0);
-    n.target[2] = (float)j_num(c, "targetZ", 0.0);
-    n.target_entity = (uint64_t)j_num(c, "targetEntity", 0.0);
-    n.auto_repath = j_bool(c, "autoRepath", true);
-    n.enabled     = j_bool(c, "enabled", true);
-    jce_scene_set_nav_agent(s, e, &n);
-}
 
-static void parse_sequence_player(JceScene *s, JceEntity e, const cJSON *c)
+
+
+
+/* Per-component enable toggles persisted at entity level.  Current
+ * write format is a JSON array of canonical component names; legacy
+ * scenes stored a 64-bit JCE_COMP_FLAG_* DISABLED mask as a number —
+ * accept both. */
+static void parse_disabled_components(JceScene *s, JceEntity e,
+                                      const cJSON *entity_obj)
 {
-    JceSequencePlayerComponent sp; memset(&sp, 0, sizeof sp);
-    copy_str(sp.seq_path, sizeof(sp.seq_path), j_str(c, "seqPath", ""));
-    sp.play_on_awake = j_bool(c, "playOnAwake", false);
-    sp.loop_override = j_bool(c, "loopOverride", false);
-    sp.override_loop = j_bool(c, "overrideLoop", false);
-    sp.speed         = (float)j_num(c, "speed", 1.0);
-    const cJSON *arr = cJSON_GetObjectItemCaseSensitive(c, "bindings");
-    if (cJSON_IsArray(arr)) {
-        int n = cJSON_GetArraySize(arr);
-        if (n > JCE_SEQ_PLAYER_MAX_BINDINGS) n = JCE_SEQ_PLAYER_MAX_BINDINGS;
-        for (int i = 0; i < n; i++) {
-            const cJSON *it = cJSON_GetArrayItem(arr, i);
-            sp.bindings[sp.binding_count++] =
-                cJSON_IsNumber(it) ? (uint64_t)it->valuedouble : 0;
+    const cJSON *it =
+        cJSON_GetObjectItemCaseSensitive(entity_obj, "disabledComponents");
+    if (!it) return;
+
+    if (cJSON_IsNumber(it)) {
+        /* Legacy numeric mask: one bit per pre-registry component. */
+        uint64_t mask = (uint64_t)it->valuedouble;
+        for (int b = 0; b < 64 && mask != 0; b++) {
+            uint64_t bit = UINT64_C(1) << b;
+            if (!(mask & bit)) continue;
+            mask &= ~bit;
+            int id = jce_component_from_legacy_flag(bit);
+            if (id != JCE_COMP_ID_INVALID)
+                jce_scene_set_comp_enabled(s, e, id, false);
+        }
+        return;
+    }
+    if (cJSON_IsArray(it)) {
+        const cJSON *n = NULL;
+        cJSON_ArrayForEach(n, it) {
+            if (!cJSON_IsString(n) || !n->valuestring) continue;
+            int id = jce_component_find(n->valuestring);
+            if (id != JCE_COMP_ID_INVALID)
+                jce_scene_set_comp_enabled(s, e, id, false);
         }
     }
-    /* Runtime fields (seq/prev_time/started/opened_hash) stay zeroed. */
-    jce_scene_set_sequence_player(s, e, &sp);
-}
-
-static void parse_ik_constraints(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceIkConstraintComponent ik; memset(&ik, 0, sizeof ik);
-    const cJSON *arr = cJSON_GetObjectItemCaseSensitive(c, "constraints");
-    if (cJSON_IsArray(arr)) {
-        int n = cJSON_GetArraySize(arr);
-        int cap = (int)(sizeof(ik.constraints) / sizeof(ik.constraints[0]));
-        for (int i = 0; i < n && ik.count < cap; i++) {
-            const cJSON *o = cJSON_GetArrayItem(arr, i);
-            if (!cJSON_IsObject(o)) continue;
-            JceIkConstraint *k = &ik.constraints[ik.count++];
-            k->kind    = (int)j_num(o, "kind", 0.0);
-            copy_str(k->name, sizeof(k->name), j_str(o, "name", ""));
-            k->weight  = (float)j_num(o, "weight", 1.0);
-            k->enabled = j_bool(o, "enabled", true);
-            copy_str(k->root_bone, sizeof(k->root_bone), j_str(o, "rootBone", ""));
-            copy_str(k->mid_bone,  sizeof(k->mid_bone),  j_str(o, "midBone", ""));
-            copy_str(k->end_bone,  sizeof(k->end_bone),  j_str(o, "endBone", ""));
-            k->target_entity  = (uint32_t)j_num(o, "targetEntity", 0.0);
-            k->pole_entity    = (uint32_t)j_num(o, "poleEntity", 0.0);
-            k->pole_offset[0] = (float)j_num(o, "poleOffsetX", 0.0);
-            k->pole_offset[1] = (float)j_num(o, "poleOffsetY", 0.0);
-            k->pole_offset[2] = (float)j_num(o, "poleOffsetZ", 0.0);
-        }
-    }
-    jce_scene_set_ik_constraints(s, e, &ik);
-}
-
-static void parse_configurable_joint(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceConfigurableJointComponent j; memset(&j, 0, sizeof j);
-    j.connected_body = (uint64_t)j_num(c, "connectedBody", 0.0);
-    j.anchor[0] = (float)j_num(c, "anchorX", 0.0);
-    j.anchor[1] = (float)j_num(c, "anchorY", 0.0);
-    j.anchor[2] = (float)j_num(c, "anchorZ", 0.0);
-    j.connected_anchor[0] = (float)j_num(c, "connAnchorX", 0.0);
-    j.connected_anchor[1] = (float)j_num(c, "connAnchorY", 0.0);
-    j.connected_anchor[2] = (float)j_num(c, "connAnchorZ", 0.0);
-    j.x_motion = (int)j_num(c, "xMotion", 0);
-    j.y_motion = (int)j_num(c, "yMotion", 0);
-    j.z_motion = (int)j_num(c, "zMotion", 0);
-    j.x_rotation = (int)j_num(c, "xRotation", 0);
-    j.y_rotation = (int)j_num(c, "yRotation", 0);
-    j.z_rotation = (int)j_num(c, "zRotation", 0);
-    j.linear_limit         = (float)j_num(c, "linearLimit", 0.0);
-    j.angular_x_limit_deg  = (float)j_num(c, "angXLimit", 0.0);
-    j.angular_y_limit_deg  = (float)j_num(c, "angYLimit", 0.0);
-    j.angular_z_limit_deg  = (float)j_num(c, "angZLimit", 0.0);
-    j.break_force  = (float)j_num(c, "breakForce", 1e30);
-    j.break_torque = (float)j_num(c, "breakTorque", 1e30);
-    j.enable_collision = j_bool(c, "enableCollision", false);
-    jce_scene_set_configurable_joint(s, e, &j);
-}
-
-static void parse_cloth(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceClothComponent cl; memset(&cl, 0, sizeof cl);
-    cl.corner_00 = jce_v3((float)j_num(c, "c00X", 0.0), (float)j_num(c, "c00Y", 0.0), (float)j_num(c, "c00Z", 0.0));
-    cl.corner_10 = jce_v3((float)j_num(c, "c10X", 1.0), (float)j_num(c, "c10Y", 0.0), (float)j_num(c, "c10Z", 0.0));
-    cl.corner_01 = jce_v3((float)j_num(c, "c01X", 0.0), (float)j_num(c, "c01Y", 0.0), (float)j_num(c, "c01Z", 1.0));
-    cl.corner_11 = jce_v3((float)j_num(c, "c11X", 1.0), (float)j_num(c, "c11Y", 0.0), (float)j_num(c, "c11Z", 1.0));
-    cl.res_u = (uint32_t)j_num(c, "resU", 8);
-    cl.res_v = (uint32_t)j_num(c, "resV", 8);
-    if (cl.res_u < 2) cl.res_u = 2;
-    if (cl.res_v < 2) cl.res_v = 2;
-    cl.mass_total        = (float)j_num(c, "mass", 1.0);
-    cl.stiffness_linear  = (float)j_num(c, "stiffLin", 0.5);
-    cl.stiffness_angular = (float)j_num(c, "stiffAng", 0.5);
-    cl.damping           = (float)j_num(c, "damping", 0.02);
-    cl.iterations        = (uint32_t)j_num(c, "iters", 4);
-    cl.self_collision    = j_bool(c, "selfColl", false);
-    cl.wind_enabled      = j_bool(c, "windOn", false);
-    cl.wind_velocity     = jce_v3((float)j_num(c, "windX", 0.0),
-                                  (float)j_num(c, "windY", 0.0),
-                                  (float)j_num(c, "windZ", 0.0));
-    const cJSON *pin = cJSON_GetObjectItemCaseSensitive(c, "pinned");
-    if (cJSON_IsArray(pin)) {
-        int n = cJSON_GetArraySize(pin);
-        if (n > (int)JCE_CLOTH_MAX_PINNED) n = (int)JCE_CLOTH_MAX_PINNED;
-        for (int i = 0; i < n; ++i) {
-            const cJSON *it = cJSON_GetArrayItem(pin, i);
-            if (cJSON_IsNumber(it))
-                cl.pinned_indices[cl.pinned_count++] = (uint32_t)it->valuedouble;
-        }
-    }
-    cl.handle = 0;
-    cl.dirty  = true;
-    jce_scene_set_cloth(s, e, &cl);
-}
-
-static void parse_joint2d(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceJoint2DComponent j; memset(&j, 0, sizeof j);
-    j.kind = (int)j_num(c, "kind", 0);
-    j.connected_body = (uint64_t)j_num(c, "connectedBody", 0.0);
-    j.anchor[0] = (float)j_num(c, "anchorX", 0.0);
-    j.anchor[1] = (float)j_num(c, "anchorY", 0.0);
-    j.connected_anchor[0] = (float)j_num(c, "connAnchorX", 0.0);
-    j.connected_anchor[1] = (float)j_num(c, "connAnchorY", 0.0);
-    j.distance      = (float)j_num(c, "distance", 1.0);
-    j.frequency     = (float)j_num(c, "frequency", 1.0);
-    j.damping_ratio = (float)j_num(c, "dampingRatio", 0.5);
-    j.use_motor          = j_bool(c, "useMotor", false);
-    j.motor_speed_deg_s  = (float)j_num(c, "motorSpeed", 0.0);
-    j.motor_max_torque   = (float)j_num(c, "motorMaxTorque", 10000.0);
-    j.use_limits         = j_bool(c, "useLimits", false);
-    j.lower_angle_deg    = (float)j_num(c, "lowerAngle", -90.0);
-    j.upper_angle_deg    = (float)j_num(c, "upperAngle",  90.0);
-    j.break_force  = (float)j_num(c, "breakForce", 1e30);
-    j.break_torque = (float)j_num(c, "breakTorque", 1e30);
-    j.enable_collision = j_bool(c, "enableCollision", false);
-    j.auto_configure_distance = j_bool(c, "autoConfigureDistance", true);
-    jce_scene_set_joint2d(s, e, &j);
-}
-
-static void parse_billboard_renderer(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceBillboardRendererComponent b; memset(&b, 0, sizeof b);
-    copy_str(b.texture_path, sizeof b.texture_path, j_str(c, "texturePath", ""));
-    b.mode = (int)j_num(c, "mode", 0);
-    b.size[0] = (float)j_num(c, "sizeX", 1.0);
-    b.size[1] = (float)j_num(c, "sizeY", 1.0);
-    b.color[0] = (float)j_num(c, "colorR", 1.0);
-    b.color[1] = (float)j_num(c, "colorG", 1.0);
-    b.color[2] = (float)j_num(c, "colorB", 1.0);
-    b.color[3] = (float)j_num(c, "colorA", 1.0);
-    b.visible = j_bool(c, "visible", true);
-    jce_scene_set_billboard_renderer(s, e, &b);
-}
-
-static void parse_canvas(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceCanvasComponent v; memset(&v, 0, sizeof v);
-    v.render_mode = (int)j_num(c, "renderMode", 0);
-    v.sort_order  = (int)j_num(c, "sortOrder", 0);
-    v.reference_resolution[0] = (float)j_num(c, "refResX", 1920.0);
-    v.reference_resolution[1] = (float)j_num(c, "refResY", 1080.0);
-    v.scale_factor = (float)j_num(c, "scaleFactor", 1.0);
-    v.pixel_perfect = j_bool(c, "pixelPerfect", false);
-    jce_scene_set_canvas(s, e, &v);
-}
-
-static void parse_canvas_group(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceCanvasGroupComponent g; memset(&g, 0, sizeof g);
-    g.alpha = (float)j_num(c, "alpha", 1.0);
-    g.interactable = j_bool(c, "interactable", true);
-    g.blocks_raycasts = j_bool(c, "blocksRaycasts", true);
-    g.ignore_parent_groups = j_bool(c, "ignoreParentGroups", false);
-    jce_scene_set_canvas_group(s, e, &g);
-}
-
-static void parse_layout_group(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceLayoutGroupComponent l; memset(&l, 0, sizeof l);
-    l.layout_kind = (int)j_num(c, "layoutKind", 0);
-    l.padding[0] = (float)j_num(c, "padL", 0.0);
-    l.padding[1] = (float)j_num(c, "padR", 0.0);
-    l.padding[2] = (float)j_num(c, "padT", 0.0);
-    l.padding[3] = (float)j_num(c, "padB", 0.0);
-    l.spacing[0] = (float)j_num(c, "spacingX", 0.0);
-    l.spacing[1] = (float)j_num(c, "spacingY", 0.0);
-    l.cell_size[0] = (float)j_num(c, "cellW", 100.0);
-    l.cell_size[1] = (float)j_num(c, "cellH", 100.0);
-    l.child_alignment = (int)j_num(c, "childAlignment", 0);
-    l.control_child_size_w = j_bool(c, "controlChildW", false);
-    l.control_child_size_h = j_bool(c, "controlChildH", false);
-    l.reverse_arrangement  = j_bool(c, "reverseArrangement", false);
-    jce_scene_set_layout_group(s, e, &l);
-}
-
-/* Shared RectTransform (anchor/pivot/sizeDelta/anchoredPos) parse/serialize.
- * Defaults match a full-stretch rect when the keys are absent so scenes
- * authored before RectTransform existed still fill their parent. */
-static void parse_rect_transform(JceRectTransform *rt, const cJSON *c)
-{
-    rt->anchor_min[0] = (float)j_num(c, "anchorMinX", 0.0);
-    rt->anchor_min[1] = (float)j_num(c, "anchorMinY", 0.0);
-    rt->anchor_max[0] = (float)j_num(c, "anchorMaxX", 1.0);
-    rt->anchor_max[1] = (float)j_num(c, "anchorMaxY", 1.0);
-    rt->pivot[0]      = (float)j_num(c, "pivotX", 0.5);
-    rt->pivot[1]      = (float)j_num(c, "pivotY", 0.5);
-    rt->anchored_position[0] = (float)j_num(c, "anchoredX", 0.0);
-    rt->anchored_position[1] = (float)j_num(c, "anchoredY", 0.0);
-    rt->size_delta[0] = (float)j_num(c, "sizeW", 0.0);
-    rt->size_delta[1] = (float)j_num(c, "sizeH", 0.0);
-}
-
-static void ser_rect_transform(const JceRectTransform *rt, cJSON *o)
-{
-    cJSON_AddNumberToObject(o, "anchorMinX", rt->anchor_min[0]);
-    cJSON_AddNumberToObject(o, "anchorMinY", rt->anchor_min[1]);
-    cJSON_AddNumberToObject(o, "anchorMaxX", rt->anchor_max[0]);
-    cJSON_AddNumberToObject(o, "anchorMaxY", rt->anchor_max[1]);
-    cJSON_AddNumberToObject(o, "pivotX", rt->pivot[0]);
-    cJSON_AddNumberToObject(o, "pivotY", rt->pivot[1]);
-    cJSON_AddNumberToObject(o, "anchoredX", rt->anchored_position[0]);
-    cJSON_AddNumberToObject(o, "anchoredY", rt->anchored_position[1]);
-    cJSON_AddNumberToObject(o, "sizeW", rt->size_delta[0]);
-    cJSON_AddNumberToObject(o, "sizeH", rt->size_delta[1]);
-}
-
-static void parse_ui_image(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceUIImageComponent i; memset(&i, 0, sizeof i);
-    copy_str(i.sprite_path, sizeof i.sprite_path, j_str(c, "spritePath", ""));
-    i.image_type = (int)j_num(c, "imageType", 0);
-    i.color[0] = (float)j_num(c, "colorR", 1.0);
-    i.color[1] = (float)j_num(c, "colorG", 1.0);
-    i.color[2] = (float)j_num(c, "colorB", 1.0);
-    i.color[3] = (float)j_num(c, "colorA", 1.0);
-    i.fill_amount = (float)j_num(c, "fillAmount", 1.0);
-    i.preserve_aspect = j_bool(c, "preserveAspect", false);
-    i.raycast_target  = j_bool(c, "raycastTarget", true);
-    i.slice_border[0] = (float)j_num(c, "sliceL", 0.0);
-    i.slice_border[1] = (float)j_num(c, "sliceR", 0.0);
-    i.slice_border[2] = (float)j_num(c, "sliceT", 0.0);
-    i.slice_border[3] = (float)j_num(c, "sliceB", 0.0);
-    parse_rect_transform(&i.rect, c);
-    jce_scene_set_ui_image(s, e, &i);
-}
-
-static void parse_ui_text(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceUITextComponent t; memset(&t, 0, sizeof t);
-    copy_str(t.text,      sizeof t.text,      j_str(c, "text", ""));
-    copy_str(t.font_path, sizeof t.font_path, j_str(c, "fontPath", ""));
-    t.font_size  = (float)j_num(c, "fontSize", 14.0);
-    t.alignment  = (int)j_num(c, "alignment", 0);
-    t.color[0] = (float)j_num(c, "colorR", 1.0);
-    t.color[1] = (float)j_num(c, "colorG", 1.0);
-    t.color[2] = (float)j_num(c, "colorB", 1.0);
-    t.color[3] = (float)j_num(c, "colorA", 1.0);
-    t.line_spacing = (float)j_num(c, "lineSpacing", 1.0);
-    t.rich_text    = j_bool(c, "richText", false);
-    t.best_fit     = j_bool(c, "bestFit", false);
-    t.min_size = (int)j_num(c, "minSize", 10);
-    t.max_size = (int)j_num(c, "maxSize", 40);
-    copy_str(t.locale_key, sizeof t.locale_key, j_str(c, "localeKey", ""));
-    parse_rect_transform(&t.rect, c);
-    jce_scene_set_ui_text(s, e, &t);
-}
-
-static void parse_ui_button(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceUIButtonComponent b; memset(&b, 0, sizeof b);
-    b.interactable = j_bool(c, "interactable", true);
-    b.normal_color[0]      = (float)j_num(c, "normalR", 1.0);
-    b.normal_color[1]      = (float)j_num(c, "normalG", 1.0);
-    b.normal_color[2]      = (float)j_num(c, "normalB", 1.0);
-    b.normal_color[3]      = (float)j_num(c, "normalA", 1.0);
-    b.highlighted_color[0] = (float)j_num(c, "highlightR", 0.95);
-    b.highlighted_color[1] = (float)j_num(c, "highlightG", 0.95);
-    b.highlighted_color[2] = (float)j_num(c, "highlightB", 0.95);
-    b.highlighted_color[3] = (float)j_num(c, "highlightA", 1.0);
-    b.pressed_color[0]     = (float)j_num(c, "pressedR", 0.78);
-    b.pressed_color[1]     = (float)j_num(c, "pressedG", 0.78);
-    b.pressed_color[2]     = (float)j_num(c, "pressedB", 0.78);
-    b.pressed_color[3]     = (float)j_num(c, "pressedA", 1.0);
-    b.disabled_color[0]    = (float)j_num(c, "disabledR", 0.5);
-    b.disabled_color[1]    = (float)j_num(c, "disabledG", 0.5);
-    b.disabled_color[2]    = (float)j_num(c, "disabledB", 0.5);
-    b.disabled_color[3]    = (float)j_num(c, "disabledA", 1.0);
-    b.fade_duration = (float)j_num(c, "fadeDuration", 0.1);
-    copy_str(b.on_click_handler, sizeof b.on_click_handler,
-              j_str(c, "onClickHandler", ""));
-    jce_scene_set_ui_button(s, e, &b);
-}
-
-static void parse_constraint(JceScene *s, JceEntity e, const cJSON *c)
-{
-    JceConstraintComponent cn;
-    memset(&cn, 0, sizeof(cn));
-    cn.constraint_type  = (int)j_num(c, "constraintType", 0);
-    cn.target_entity    = (uint32_t)j_num(c, "targetEntity", 0);
-    cn.pivot_a[0] = (float)j_num(c, "pivotAx", 0.0);
-    cn.pivot_a[1] = (float)j_num(c, "pivotAy", 0.0);
-    cn.pivot_a[2] = (float)j_num(c, "pivotAz", 0.0);
-    cn.pivot_b[0] = (float)j_num(c, "pivotBx", 0.0);
-    cn.pivot_b[1] = (float)j_num(c, "pivotBy", 0.0);
-    cn.pivot_b[2] = (float)j_num(c, "pivotBz", 0.0);
-    cn.axis[0]    = (float)j_num(c, "axisX", 0.0);
-    cn.axis[1]    = (float)j_num(c, "axisY", 1.0);
-    cn.axis[2]    = (float)j_num(c, "axisZ", 0.0);
-    cn.lower_limit = (float)j_num(c, "lowerLimit", 0.0);
-    cn.upper_limit = (float)j_num(c, "upperLimit", 0.0);
-    cn.disable_collision = j_bool(c, "disableCollision", false);
-    jce_scene_set_constraint(s, e, &cn);
 }
 
 static void parse_one_component(JceScene *s, JceEntity e, const cJSON *comp)
@@ -2179,363 +1135,13 @@ static void parse_one_component(JceScene *s, JceEntity e, const cJSON *comp)
     const cJSON *props = cJSON_GetObjectItemCaseSensitive(comp, "properties");
     if (!cJSON_IsObject(props)) props = comp;
 
-    /* Transform. */
-    if (strcmp(type, "Transform") == 0 || strcmp(type, "transform") == 0) {
-        parse_transform(s, e, props); return;
-    }
-    /* Mesh renderer. */
-    if (strcmp(type, "MeshRenderer") == 0 || strcmp(type, "meshRenderer") == 0
-        || strcmp(type, "Mesh Renderer") == 0 || strcmp(type, "mesh_renderer") == 0) {
-        parse_mesh_renderer(s, e, props); return;
-    }
-    /* Camera. */
-    if (strcmp(type, "Camera") == 0 || strcmp(type, "camera") == 0) {
-        parse_camera(s, e, props); return;
-    }
-    /* Separate light types. */
-    if (strcmp(type, "DirectionalLight") == 0) { parse_dir_light(s, e, props); return; }
-    if (strcmp(type, "PointLight") == 0)       { parse_point_light(s, e, props); return; }
-    if (strcmp(type, "SpotLight") == 0)        { parse_spot_light(s, e, props); return; }
-    /* Unified Light. */
-    if (strcmp(type, "Light") == 0 || strcmp(type, "light") == 0) {
-        parse_unified_light(s, e, props); return;
-    }
-    /* Skybox. */
-    if (strcmp(type, "Skybox") == 0 || strcmp(type, "skybox") == 0) {
-        parse_skybox(s, e, props); return;
-    }
-    /* Sprite renderer. */
-    if (strcmp(type, "SpriteRenderer") == 0 || strcmp(type, "spriteRenderer") == 0
-        || strcmp(type, "Sprite Renderer") == 0 || strcmp(type, "sprite_renderer") == 0) {
-        parse_sprite_renderer(s, e, props); return;
-    }
-    /* Sprite animator. */
-    if (strcmp(type, "SpriteAnimator") == 0 || strcmp(type, "spriteAnimator") == 0
-        || strcmp(type, "Sprite Animator") == 0) {
-        parse_sprite_animator(s, e, props); return;
-    }
-    /* Animator (non-skeletal). */
-    if (strcmp(type, "Animator") == 0 || strcmp(type, "animator") == 0) {
-        parse_animator(s, e, props); return;
-    }
-    /* Skeletal animator. */
-    if (strcmp(type, "SkeletalAnimator") == 0 || strcmp(type, "Skeletal Animator") == 0) {
-        parse_skeletal_animator(s, e, props); return;
-    }
-    /* Editor meta. */
-    if (strcmp(type, "EditorMeta") == 0) {
-        parse_editor_meta(s, e, props); return;
-    }
-    /* Rigidbody. */
-    if (strcmp(type, "Rigidbody") == 0 || strcmp(type, "rigidbody") == 0) {
-        parse_rigidbody(s, e, props); return;
-    }
-    /* Rigidbody2D. */
-    if (strcmp(type, "Rigidbody2D") == 0 || strcmp(type, "rigidbody2d") == 0
-        || strcmp(type, "Rigidbody 2D") == 0) {
-        parse_rigidbody2d(s, e, props); return;
-    }
-    /* Particle emitter. */
-    if (strcmp(type, "ParticleEmitter") == 0 || strcmp(type, "particleEmitter") == 0
-        || strcmp(type, "Particle Emitter") == 0) {
-        parse_particle_emitter(s, e, props); return;
-    }
-    /* Behavior tree. */
-    if (strcmp(type, "BehaviorTree") == 0 || strcmp(type, "behaviorTree") == 0
-        || strcmp(type, "Behavior Tree") == 0 || strcmp(type, "BehaviourTree") == 0) {
-        parse_behavior_tree(s, e, props); return;
-    }
-    /* Box collider. */
-    if (strcmp(type, "BoxCollider") == 0 || strcmp(type, "Box Collider") == 0) {
-        parse_box_collider(s, e, props); return;
-    }
-    /* Sphere collider. */
-    if (strcmp(type, "SphereCollider") == 0 || strcmp(type, "Sphere Collider") == 0) {
-        parse_sphere_collider(s, e, props); return;
-    }
-    /* Character controller. */
-    if (strcmp(type, "CharacterController") == 0 || strcmp(type, "Character Controller") == 0) {
-        parse_character_controller(s, e, props); return;
-    }
-    /* Audio source. */
-    if (strcmp(type, "AudioSource") == 0 || strcmp(type, "Audio Source") == 0) {
-        parse_audio_source(s, e, props); return;
-    }
-    /* Video player (video-as-texture). */
-    if (strcmp(type, "VideoPlayer") == 0 || strcmp(type, "Video Player") == 0) {
-        parse_video_player(s, e, props); return;
-    }
-    /* Script. */
-    if (strcmp(type, "Script") == 0 || strcmp(type, "script") == 0) {
-        parse_script(s, e, props); return;
-    }
-    /* Constraint. */
-    if (strcmp(type, "Constraint") == 0 || strcmp(type, "constraint") == 0) {
-        parse_constraint(s, e, props); return;
-    }
-    /* Terrain. */
-    if (strcmp(type, "Terrain") == 0 || strcmp(type, "terrain") == 0) {
-        parse_terrain(s, e, props); return;
-    }
-    /* LOD Group. */
-    if (strcmp(type, "LODGroup") == 0 || strcmp(type, "lodGroup") == 0) {
-        parse_lod_group(s, e, props); return;
-    }
-    /* Virtual Camera. */
-    if (strcmp(type, "VirtualCamera") == 0 || strcmp(type, "virtualCamera") == 0) {
-        parse_virtual_camera(s, e, props); return;
-    }
-    /* Trigger Volume. */
-    if (strcmp(type, "TriggerVolume") == 0 || strcmp(type, "triggerVolume") == 0) {
-        parse_trigger_volume(s, e, props); return;
-    }
-    /* Capsule Collider (3D). */
-    if (strcmp(type, "CapsuleCollider") == 0 || strcmp(type, "capsuleCollider") == 0) {
-        parse_capsule_collider(s, e, props); return;
-    }
-    /* Mesh Collider (3D). */
-    if (strcmp(type, "MeshCollider") == 0 || strcmp(type, "meshCollider") == 0) {
-        parse_mesh_collider(s, e, props); return;
-    }
-    /* Compound Collider (per-object cooked). */
-    if (strcmp(type, "CompoundCollider") == 0 || strcmp(type, "compoundCollider") == 0) {
-        parse_compound_collider(s, e, props); return;
-    }
-    /* Collider 2D (combined). */
-    if (strcmp(type, "Collider2D") == 0 || strcmp(type, "collider2D") == 0) {
-        parse_collider2d(s, e, props); return;
-    }
-    /* Trail Renderer. */
-    if (strcmp(type, "TrailRenderer") == 0 || strcmp(type, "trailRenderer") == 0) {
-        parse_trail_renderer(s, e, props); return;
-    }
-    /* Line Renderer. */
-    if (strcmp(type, "LineRenderer") == 0 || strcmp(type, "lineRenderer") == 0) {
-        parse_line_renderer(s, e, props); return;
-    }
-    /* Reflection Probe. */
-    if (strcmp(type, "ReflectionProbe") == 0 || strcmp(type, "reflectionProbe") == 0) {
-        parse_reflection_probe(s, e, props); return;
-    }
-    /* Decal Projector. */
-    if (strcmp(type, "Decal") == 0 || strcmp(type, "decal") == 0) {
-        parse_decal(s, e, props); return;
-    }
-    /* Light Probe Group. */
-    if (strcmp(type, "LightProbeGroup") == 0 || strcmp(type, "lightProbeGroup") == 0) {
-        parse_light_probe_group(s, e, props); return;
-    }
-    /* Audio Listener. */
-    if (strcmp(type, "AudioListener") == 0 || strcmp(type, "audioListener") == 0) {
-        parse_audio_listener(s, e, props); return;
-    }
-    /* Audio Reverb Zone. */
-    if (strcmp(type, "AudioReverbZone") == 0 || strcmp(type, "audioReverbZone") == 0) {
-        parse_audio_reverb_zone(s, e, props); return;
-    }
-    /* Audio Occlusion. */
-    if (strcmp(type, "AudioOcclusion") == 0 || strcmp(type, "audioOcclusion") == 0) {
-        parse_audio_occlusion(s, e, props); return;
-    }
-    /* Spawn Manager. */
-    if (strcmp(type, "SpawnManager") == 0 || strcmp(type, "spawnManager") == 0) {
-        parse_spawn_manager(s, e, props); return;
-    }
-    /* Weapon. */
-    if (strcmp(type, "Weapon") == 0 || strcmp(type, "weapon") == 0) {
-        parse_weapon(s, e, props); return;
-    }
-    /* Save Point. */
-    if (strcmp(type, "SavePoint") == 0 || strcmp(type, "savePoint") == 0) {
-        parse_save_point(s, e, props); return;
-    }
-    /* Wheel Collider. */
-    if (strcmp(type, "WheelCollider") == 0 || strcmp(type, "wheelCollider") == 0) {
-        parse_wheel_collider(s, e, props); return;
-    }
-    /* Constant Force. */
-    if (strcmp(type, "ConstantForce") == 0 || strcmp(type, "constantForce") == 0) {
-        parse_constant_force(s, e, props); return;
-    }
-    /* Nav Agent. */
-    if (strcmp(type, "NavAgent") == 0 || strcmp(type, "navAgent") == 0) {
-        parse_nav_agent(s, e, props); return;
-    }
-    /* Animation-rigging IK constraints. */
-    if (strcmp(type, "IkConstraints") == 0 || strcmp(type, "ikConstraints") == 0) {
-        parse_ik_constraints(s, e, props); return;
-    }
-    /* Sequence Player. */
-    if (strcmp(type, "SequencePlayer") == 0 || strcmp(type, "sequencePlayer") == 0) {
-        parse_sequence_player(s, e, props); return;
-    }
-    /* Configurable Joint. */
-    if (strcmp(type, "ConfigurableJoint") == 0 || strcmp(type, "configurableJoint") == 0) {
-        parse_configurable_joint(s, e, props); return;
-    }
-    /* Cloth (P3-C.4 follow-up). */
-    if (strcmp(type, "Cloth") == 0 || strcmp(type, "cloth") == 0) {
-        parse_cloth(s, e, props); return;
-    }
-    /* Joint 2D. */
-    if (strcmp(type, "Joint2D") == 0 || strcmp(type, "joint2D") == 0) {
-        parse_joint2d(s, e, props); return;
-    }
-    /* Billboard Renderer. */
-    if (strcmp(type, "BillboardRenderer") == 0 || strcmp(type, "billboardRenderer") == 0) {
-        parse_billboard_renderer(s, e, props); return;
-    }
-    /* UI Canvas. */
-    if (strcmp(type, "Canvas") == 0 || strcmp(type, "canvas") == 0) {
-        parse_canvas(s, e, props); return;
-    }
-    /* UI Canvas Group. */
-    if (strcmp(type, "CanvasGroup") == 0 || strcmp(type, "canvasGroup") == 0) {
-        parse_canvas_group(s, e, props); return;
-    }
-    /* UI Layout Group. */
-    if (strcmp(type, "LayoutGroup") == 0 || strcmp(type, "layoutGroup") == 0) {
-        parse_layout_group(s, e, props); return;
-    }
-    /* UI Image. */
-    if (strcmp(type, "UIImage") == 0 || strcmp(type, "uiImage") == 0) {
-        parse_ui_image(s, e, props); return;
-    }
-    /* UI Text. */
-    if (strcmp(type, "UIText") == 0 || strcmp(type, "uiText") == 0) {
-        parse_ui_text(s, e, props); return;
-    }
-    /* UI Button. */
-    if (strcmp(type, "UIButton") == 0 || strcmp(type, "uiButton") == 0) {
-        parse_ui_button(s, e, props); return;
-    }
-    /* Network Object (P3-D.3). */
-    if (strcmp(type, "NetworkObject") == 0 || strcmp(type, "networkObject") == 0) {
-        JceNetworkObjectComponent n; memset(&n, 0, sizeof n);
-        n.net_id   = (uint32_t)j_num(props, "netId",  0);
-        n.owner    = (uint16_t)j_num(props, "owner",  0);
-        n.flags    = (uint16_t)j_num(props, "flags",  0);
-        n.is_owner = j_bool(props, "isOwner", false);
-        jce_scene_set_network_object(s, e, &n);
-        return;
-    }
-    /* Network ECS components (P4-C.1). */
-    if (strcmp(type, "NetworkTransform") == 0 || strcmp(type, "networkTransform") == 0) {
-        JceNetTransformComponent nc; memset(&nc, 0, sizeof nc);
-        nc.sync_rate_hz   = (uint8_t) j_num(props, "syncRateHz",   0);
-        nc.interp_ms      = (uint16_t)j_num(props, "interpMs",     0);
-        nc.tolerance      = (float)   j_num(props, "tolerance",    0);
-        nc.authority_mode = (uint8_t) j_num(props, "authorityMode",0);
-        jce_scene_set_net_transform(s, e, &nc);
-        return;
-    }
-    if (strcmp(type, "NetworkAnimator") == 0 || strcmp(type, "networkAnimator") == 0) {
-        JceNetAnimatorComponent nc; memset(&nc, 0, sizeof nc);
-        nc.sync_rate_hz   = (uint8_t) j_num(props, "syncRateHz",   0);
-        nc.interp_ms      = (uint16_t)j_num(props, "interpMs",     0);
-        nc.authority_mode = (uint8_t) j_num(props, "authorityMode",0);
-        jce_scene_set_net_animator(s, e, &nc);
-        return;
-    }
-    if (strcmp(type, "NetworkRigidbody") == 0 || strcmp(type, "networkRigidbody") == 0) {
-        JceNetRigidbodyComponent nc; memset(&nc, 0, sizeof nc);
-        nc.sync_rate_hz   = (uint8_t) j_num(props, "syncRateHz",   0);
-        nc.interp_ms      = (uint16_t)j_num(props, "interpMs",     0);
-        nc.tolerance      = (float)   j_num(props, "tolerance",    0);
-        nc.authority_mode = (uint8_t) j_num(props, "authorityMode",0);
-        jce_scene_set_net_rigidbody(s, e, &nc);
-        return;
-    }
-    if (strcmp(type, "VfxGraph") == 0 || strcmp(type, "vfxGraph") == 0) {
-        /* One-way legacy migration (consolidation v0.9.9). The orphaned VFX
-         * Graph runtime was removed — its `*.vfx.json` key set always parsed
-         * identically to `*.particles.json`, so the authored graphPath maps
-         * straight onto a ParticleEmitterComponent asset path and the entity
-         * joins the standard particle pipeline. Legacy-only knobs
-         * (playOnAwake / loop / rateMultiplier / intensity) have no
-         * counterpart and are dropped. An explicitly authored ParticleEmitter
-         * on the same entity always wins; the component is never re-saved as
-         * VfxGraph. */
-        const char *gp = j_str(props, "graphPath", "");
-        if (gp[0] && !jce_scene_has_particle_emitter(s, e)) {
-            JceParticleEmitterComponent pe;
-            memset(&pe, 0, sizeof pe);
-            copy_str(pe.asset_path, sizeof pe.asset_path, gp);
-            pe.emit_rate          = 10.0f;   /* legacy quick-tune fallbacks */
-            pe.lifetime_min       = 1.0f;
-            pe.lifetime_max       = 2.0f;
-            pe.emitter_handle_idx = UINT32_MAX;
-            jce_scene_set_particle_emitter(s, e, &pe);
-        }
-        return;
-    }
-    if (strcmp(type, "Tilemap") == 0 || strcmp(type, "tilemap") == 0) {
-        JceTilemapComponent tc; memset(&tc, 0, sizeof tc);
-        copy_str(tc.tilemap_path, sizeof tc.tilemap_path, j_str(props, "tilemapPath", ""));
-        copy_str(tc.sprites_path, sizeof tc.sprites_path, j_str(props, "spritesPath", ""));
-        tc.cell_size_px = (uint16_t)j_num(props, "cellSizePx", 16);
-        tc.sort_order   = (uint16_t)j_num(props, "sortOrder", 0);
-        tc.orientation  = (uint8_t) j_num(props, "orientation", 0);
-        tc.visible      = j_bool(props, "visible", true);
-        tc.color[0]     = (float)j_num(props, "colorR", 1.0);
-        tc.color[1]     = (float)j_num(props, "colorG", 1.0);
-        tc.color[2]     = (float)j_num(props, "colorB", 1.0);
-        tc.color[3]     = (float)j_num(props, "colorA", 1.0);
-        jce_scene_set_tilemap(s, e, &tc);
-        return;
-    }
-    if (strcmp(type, "TilemapCollider2D") == 0 || strcmp(type, "tilemapCollider2D") == 0) {
-        JceTilemapCollider2DComponent cc; memset(&cc, 0, sizeof cc);
-        cc.used_by_composite = j_bool(props, "usedByComposite", false);
-        cc.trigger           = j_bool(props, "trigger", false);
-        cc.offset[0]         = (float)j_num(props, "offsetX", 0);
-        cc.offset[1]         = (float)j_num(props, "offsetY", 0);
-        cc.friction_x100     = (uint16_t)j_num(props, "frictionX100", 40);
-        cc.bounciness_x100   = (uint16_t)j_num(props, "bouncinessX100", 0);
-        jce_scene_set_tilemap_collider2d(s, e, &cc);
-        return;
-    }
-    if (strcmp(type, "Avatar") == 0 || strcmp(type, "avatar") == 0) {
-        JceAvatarComponent cc; memset(&cc, 0, sizeof cc);
-        copy_str(cc.avatar_path,         sizeof cc.avatar_path,         j_str(props, "avatarPath",         ""));
-        copy_str(cc.mask_path,           sizeof cc.mask_path,           j_str(props, "maskPath",           ""));
-        copy_str(cc.override_controller, sizeof cc.override_controller, j_str(props, "overrideController", ""));
-        cc.apply_root_motion = j_bool(props, "applyRootMotion", false);
-        cc.human_rig         = j_bool(props, "humanRig",        true);
-        jce_scene_set_avatar(s, e, &cc);
-        return;
-    }
-    if (strcmp(type, "Volume") == 0 || strcmp(type, "volume") == 0) {
-        JceVolumeComponent vc; memset(&vc, 0, sizeof vc);
-        vc.shape          = (JceVolumeShape)(int)j_num(props, "shape",         0);
-        vc.extents.x      = (float)j_num(props, "extentsX",     1.0);
-        vc.extents.y      = (float)j_num(props, "extentsY",     1.0);
-        vc.extents.z      = (float)j_num(props, "extentsZ",     1.0);
-        vc.blend_distance = (float)j_num(props, "blendDistance", 1.0);
-        vc.weight         = (float)j_num(props, "weight",        1.0);
-        vc.is_global      = j_bool(props, "isGlobal", false);
-        vc.profile.enabled_mask = (uint16_t)(int)j_num(props, "profileMask", 0);
-        vc.profile.values.exposure            = (float)j_num(props, "exposure",           1.0);
-        vc.profile.values.gamma               = (float)j_num(props, "gamma",              2.2);
-        vc.profile.values.bloom_threshold     = (float)j_num(props, "bloomThreshold",     1.0);
-        vc.profile.values.bloom_intensity     = (float)j_num(props, "bloomIntensity",     0.5);
-        vc.profile.values.fxaa_span_max       = (float)j_num(props, "fxaaSpanMax",        8.0);
-        vc.profile.values.fxaa_reduce_min     = (float)j_num(props, "fxaaReduceMin",      1.0 / 128.0);
-        vc.profile.values.fxaa_reduce_mul     = (float)j_num(props, "fxaaReduceMul",      1.0 / 8.0);
-        vc.profile.values.vignette_intensity  = (float)j_num(props, "vignetteIntensity",  0.3);
-        vc.profile.values.vignette_smoothness = (float)j_num(props, "vignetteSmoothness", 2.0);
-        vc.profile.values.chromatic_strength  = (float)j_num(props, "chromaticStrength",  0.005);
-        jce_scene_set_volume(s, e, &vc);
-        return;
-    }
-    if (strcmp(type, "OcclusionPortal") == 0 || strcmp(type, "occlusionPortal") == 0) {
-        JceOcclusionPortalComponent op; memset(&op, 0, sizeof op);
-        op.size.x   = (float)j_num(props, "sizeX",    1.0);
-        op.size.y   = (float)j_num(props, "sizeY",    2.0);
-        op.size.z   = (float)j_num(props, "sizeZ",    0.1);
-        op.open     = j_bool(props, "open", true);
-        op.portal_id = (int32_t)j_num(props, "portalId", 0);
-        jce_scene_set_occlusion_portal(s, e, &op);
+    /* Registry dispatch — canonical names + alias spellings live in the
+     * component registry rows (see jce_scene_components_register_all).
+     * Unknown types are ignored, exactly like the old strcmp chain. */
+    int id = jce_component_find(type);
+    if (id >= 0) {
+        const JceComponentDesc *d = jce_component_desc(id);
+        if (d->parse) d->parse(s, e, props);
         return;
     }
 }
@@ -2560,36 +1166,20 @@ static void ser_transform(const JceTransform *t, cJSON *arr)
     cJSON_AddItemToArray(arr, o);
 }
 
-static void ser_mesh_renderer(const JceMeshRenderer *mr, cJSON *arr)
+static void ser_pivot(const JcePivotComponent *p, cJSON *arr)
 {
     cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "MeshRenderer");
-    cJSON_AddStringToObject(o, "meshPath", mr->mesh_path);
-    cJSON_AddStringToObject(o, "materialPath", mr->material_path);
-    cJSON_AddNumberToObject(o, "meshShape", mr->mesh_shape);
-    cJSON_AddNumberToObject(o, "baseColorR", mr->base_color[0]);
-    cJSON_AddNumberToObject(o, "baseColorG", mr->base_color[1]);
-    cJSON_AddNumberToObject(o, "baseColorB", mr->base_color[2]);
-    cJSON_AddNumberToObject(o, "baseColorA", mr->base_color[3]);
-    cJSON_AddNumberToObject(o, "metallic",  mr->metallic);
-    cJSON_AddNumberToObject(o, "roughness", mr->roughness);
-    cJSON_AddNumberToObject(o, "emissiveR", mr->emissive[0]);
-    cJSON_AddNumberToObject(o, "emissiveG", mr->emissive[1]);
-    cJSON_AddNumberToObject(o, "emissiveB", mr->emissive[2]);
-    cJSON_AddNumberToObject(o, "normalScale", mr->normal_scale);
-    cJSON_AddNumberToObject(o, "aoStrength",  mr->ao_strength);
-    cJSON_AddNumberToObject(o, "alphaMode",   mr->alpha_mode);
-    cJSON_AddNumberToObject(o, "alphaCutoff", mr->alpha_cutoff);
-    cJSON_AddBoolToObject(o, "doubleSided", mr->double_sided);
-    cJSON_AddBoolToObject(o, "castsShadow",    !mr->shadow_cast_off);
-    cJSON_AddBoolToObject(o, "receivesShadow", !mr->shadow_receive_off);
-    if (mr->albedo_tex[0])   cJSON_AddStringToObject(o, "albedoTex",   mr->albedo_tex);
-    if (mr->mr_tex[0])       cJSON_AddStringToObject(o, "mrTex",       mr->mr_tex);
-    if (mr->normal_tex[0])   cJSON_AddStringToObject(o, "normalTex",   mr->normal_tex);
-    if (mr->ao_tex[0])       cJSON_AddStringToObject(o, "aoTex",       mr->ao_tex);
-    if (mr->emissive_tex[0]) cJSON_AddStringToObject(o, "emissiveTex", mr->emissive_tex);
+    cJSON_AddStringToObject(o, "type", "Pivot");
+    cJSON_AddNumberToObject(o, "localX", p->local_position.x);
+    cJSON_AddNumberToObject(o, "localY", p->local_position.y);
+    cJSON_AddNumberToObject(o, "localZ", p->local_position.z);
+    cJSON_AddNumberToObject(o, "rotX", p->local_rotation.x);
+    cJSON_AddNumberToObject(o, "rotY", p->local_rotation.y);
+    cJSON_AddNumberToObject(o, "rotZ", p->local_rotation.z);
+    cJSON_AddNumberToObject(o, "rotW", p->local_rotation.w);
     cJSON_AddItemToArray(arr, o);
 }
+
 
 static void ser_camera(const JceCameraComponent *c, cJSON *arr)
 {
@@ -2607,168 +1197,11 @@ static void ser_camera(const JceCameraComponent *c, cJSON *arr)
     cJSON_AddItemToArray(arr, o);
 }
 
-static void ser_volume(const JceVolumeComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "Volume");
-    cJSON *p = cJSON_CreateObject();
-    cJSON_AddNumberToObject(p, "shape",              (double)c->shape);
-    cJSON_AddNumberToObject(p, "extentsX",           c->extents.x);
-    cJSON_AddNumberToObject(p, "extentsY",           c->extents.y);
-    cJSON_AddNumberToObject(p, "extentsZ",           c->extents.z);
-    cJSON_AddNumberToObject(p, "blendDistance",      c->blend_distance);
-    cJSON_AddNumberToObject(p, "weight",             c->weight);
-    cJSON_AddBoolToObject  (p, "isGlobal",           c->is_global);
-    cJSON_AddNumberToObject(p, "profileMask",        (double)c->profile.enabled_mask);
-    cJSON_AddNumberToObject(p, "exposure",           c->profile.values.exposure);
-    cJSON_AddNumberToObject(p, "gamma",              c->profile.values.gamma);
-    cJSON_AddNumberToObject(p, "bloomThreshold",     c->profile.values.bloom_threshold);
-    cJSON_AddNumberToObject(p, "bloomIntensity",     c->profile.values.bloom_intensity);
-    cJSON_AddNumberToObject(p, "fxaaSpanMax",        c->profile.values.fxaa_span_max);
-    cJSON_AddNumberToObject(p, "fxaaReduceMin",      c->profile.values.fxaa_reduce_min);
-    cJSON_AddNumberToObject(p, "fxaaReduceMul",      c->profile.values.fxaa_reduce_mul);
-    cJSON_AddNumberToObject(p, "vignetteIntensity",  c->profile.values.vignette_intensity);
-    cJSON_AddNumberToObject(p, "vignetteSmoothness", c->profile.values.vignette_smoothness);
-    cJSON_AddNumberToObject(p, "chromaticStrength",  c->profile.values.chromatic_strength);
-    cJSON_AddItemToObject(o, "properties", p);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_occlusion_portal(const JceOcclusionPortalComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "OcclusionPortal");
-    cJSON *p = cJSON_CreateObject();
-    cJSON_AddNumberToObject(p, "sizeX",    c->size.x);
-    cJSON_AddNumberToObject(p, "sizeY",    c->size.y);
-    cJSON_AddNumberToObject(p, "sizeZ",    c->size.z);
-    cJSON_AddBoolToObject  (p, "open",     c->open);
-    cJSON_AddNumberToObject(p, "portalId", (double)c->portal_id);
-    cJSON_AddItemToObject(o, "properties", p);
-    cJSON_AddItemToArray(arr, o);
-}
 
-/* Unified light serialization: always emits "Light" with lightType sub-field. */
-static void ser_light_unified(JceScene *s, JceEntity e, cJSON *arr)
-{
-    JceDirectionalLight *dl = jce_scene_get_dir_light(s, e);
-    if (dl) {
-        cJSON *o = cJSON_CreateObject();
-        cJSON_AddStringToObject(o, "type", "Light");
-        cJSON_AddNumberToObject(o, "colorR", dl->color.x);
-        cJSON_AddNumberToObject(o, "colorG", dl->color.y);
-        cJSON_AddNumberToObject(o, "colorB", dl->color.z);
-        cJSON_AddNumberToObject(o, "intensity", dl->intensity);
-        cJSON_AddNumberToObject(o, "lightType", 0);
-        cJSON_AddNumberToObject(o, "dirX", dl->direction.x);
-        cJSON_AddNumberToObject(o, "dirY", dl->direction.y);
-        cJSON_AddNumberToObject(o, "dirZ", dl->direction.z);
-        cJSON_AddBoolToObject(o, "castsShadow", dl->casts_shadow);
-        /* P3-E.5 — emit cookie fields only when set (omit-on-default). */
-        if (dl->cookie_path[0] != '\0')
-            cJSON_AddStringToObject(o, "cookiePath", dl->cookie_path);
-        if (dl->cookie_strength > 0.0f)
-            cJSON_AddNumberToObject(o, "cookieStrength", dl->cookie_strength);
-        cJSON_AddItemToArray(arr, o);
-        return;
-    }
-    JcePointLight *pl = jce_scene_get_point_light(s, e);
-    if (pl) {
-        cJSON *o = cJSON_CreateObject();
-        cJSON_AddStringToObject(o, "type", "Light");
-        cJSON_AddNumberToObject(o, "colorR", pl->color.x);
-        cJSON_AddNumberToObject(o, "colorG", pl->color.y);
-        cJSON_AddNumberToObject(o, "colorB", pl->color.z);
-        cJSON_AddNumberToObject(o, "intensity", pl->intensity);
-        cJSON_AddNumberToObject(o, "lightType", 1);
-        cJSON_AddNumberToObject(o, "radius", pl->radius);
-        cJSON_AddBoolToObject(o, "castsShadow", pl->casts_shadow);
-        if (pl->shadow_bias != 0.0f)
-            cJSON_AddNumberToObject(o, "shadowBias", pl->shadow_bias);
-        cJSON_AddItemToArray(arr, o);
-        return;
-    }
-    JceSpotLight *sl = jce_scene_get_spot_light(s, e);
-    if (sl) {
-        cJSON *o = cJSON_CreateObject();
-        cJSON_AddStringToObject(o, "type", "Light");
-        cJSON_AddNumberToObject(o, "colorR", sl->color.x);
-        cJSON_AddNumberToObject(o, "colorG", sl->color.y);
-        cJSON_AddNumberToObject(o, "colorB", sl->color.z);
-        cJSON_AddNumberToObject(o, "intensity", sl->intensity);
-        cJSON_AddNumberToObject(o, "lightType", 2);
-        cJSON_AddNumberToObject(o, "radius", sl->radius);
-        cJSON_AddNumberToObject(o, "dirX", sl->direction.x);
-        cJSON_AddNumberToObject(o, "dirY", sl->direction.y);
-        cJSON_AddNumberToObject(o, "dirZ", sl->direction.z);
-        float inner_deg = acosf(sl->inner_cone_cos) * JCE_RAD2DEG;
-        float outer_deg = acosf(sl->outer_cone_cos) * JCE_RAD2DEG;
-        cJSON_AddNumberToObject(o, "innerConeDeg", inner_deg);
-        cJSON_AddNumberToObject(o, "outerConeDeg", outer_deg);
-        cJSON_AddBoolToObject(o, "castsShadow", sl->casts_shadow);
-        if (sl->shadow_bias != 0.0f)
-            cJSON_AddNumberToObject(o, "shadowBias", sl->shadow_bias);
-        /* P3-E.5 — emit cookie + IES paths only when set. */
-        if (sl->cookie_path[0] != '\0')
-            cJSON_AddStringToObject(o, "cookiePath", sl->cookie_path);
-        if (sl->ies_path[0] != '\0')
-            cJSON_AddStringToObject(o, "iesPath", sl->ies_path);
-        if (sl->cookie_strength > 0.0f)
-            cJSON_AddNumberToObject(o, "cookieStrength", sl->cookie_strength);
-        cJSON_AddItemToArray(arr, o);
-    }
-}
 
-static void ser_animator(const JceAnimatorComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "Animator");
-    cJSON_AddStringToObject(o, "clipName", c->clip_name);
-    cJSON_AddNumberToObject(o, "speed", c->speed);
-    cJSON_AddBoolToObject(o, "loop", c->loop);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_rigidbody(const JceRigidBodyComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "Rigidbody");
-    cJSON_AddNumberToObject(o, "mass", c->mass);
-    cJSON_AddNumberToObject(o, "drag", c->drag);
-    cJSON_AddNumberToObject(o, "angularDrag", c->angular_drag);
-    cJSON_AddBoolToObject(o, "useGravity", c->use_gravity);
-    cJSON_AddBoolToObject(o, "isKinematic", c->is_kinematic);
-    cJSON_AddNumberToObject(o, "friction", c->friction);
-    cJSON_AddNumberToObject(o, "restitution", c->restitution);
-    /* CCD (P3-C.3) — only emit when non-default to keep diffs small. */
-    if (c->ccd_mode != 0)
-        cJSON_AddNumberToObject(o, "ccdMode", (double)c->ccd_mode);
-    if (c->ccd_threshold > 0.0f)
-        cJSON_AddNumberToObject(o, "ccdThreshold", c->ccd_threshold);
-    if (c->ccd_sphere_radius > 0.0f)
-        cJSON_AddNumberToObject(o, "ccdSphereRadius", c->ccd_sphere_radius);
-    /* Per-body gravity / layer / material — emit only when non-default. */
-    if (c->gravity_scale != 1.0f)
-        cJSON_AddNumberToObject(o, "gravityScale", c->gravity_scale);
-    if (c->physics_layer != 0)
-        cJSON_AddNumberToObject(o, "physicsLayer", (double)c->physics_layer);
-    if (c->physmat_path[0])
-        cJSON_AddStringToObject(o, "physMaterial", c->physmat_path);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_rigidbody2d(const JceRigidBody2DComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "Rigidbody2D");
-    cJSON_AddNumberToObject(o, "bodyType", (double)c->body_type);
-    cJSON_AddNumberToObject(o, "shapeType", (double)c->shape_type);
-    cJSON_AddNumberToObject(o, "mass", c->mass);
-    cJSON_AddNumberToObject(o, "friction", c->friction);
-    cJSON_AddNumberToObject(o, "restitution", c->restitution);
-    cJSON_AddBoolToObject(o, "fixedRotation", c->fixed_rotation);
-    cJSON_AddItemToArray(arr, o);
-}
 
 static void ser_particle_emitter(const JceParticleEmitterComponent *c, cJSON *arr)
 {
@@ -2783,74 +1216,10 @@ static void ser_particle_emitter(const JceParticleEmitterComponent *c, cJSON *ar
     cJSON_AddItemToArray(arr, o);
 }
 
-static void ser_behavior_tree(const JceBehaviorTree *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "BehaviorTree");
-    cJSON_AddStringToObject(o, "treePath", c->tree_path);
-    cJSON_AddNumberToObject(o, "tickHz", c->tick_hz);
-    cJSON_AddBoolToObject(o, "active", c->active);
-    cJSON_AddNumberToObject(o, "sightRange", c->sight_range);
-    cJSON_AddNumberToObject(o, "sightHalfAngle", c->sight_half_angle);
-    cJSON_AddNumberToObject(o, "hearingRange", c->hearing_range);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_box_collider(const JceBoxColliderComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "BoxCollider");
-    cJSON_AddNumberToObject(o, "centerX", c->center[0]);
-    cJSON_AddNumberToObject(o, "centerY", c->center[1]);
-    cJSON_AddNumberToObject(o, "centerZ", c->center[2]);
-    cJSON_AddNumberToObject(o, "sizeX", c->size[0]);
-    cJSON_AddNumberToObject(o, "sizeY", c->size[1]);
-    cJSON_AddNumberToObject(o, "sizeZ", c->size[2]);
-    cJSON_AddBoolToObject(o, "isTrigger", c->is_trigger);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_sphere_collider(const JceSphereColliderComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "SphereCollider");
-    cJSON_AddNumberToObject(o, "centerX", c->center[0]);
-    cJSON_AddNumberToObject(o, "centerY", c->center[1]);
-    cJSON_AddNumberToObject(o, "centerZ", c->center[2]);
-    cJSON_AddNumberToObject(o, "radius", c->radius);
-    cJSON_AddBoolToObject(o, "isTrigger", c->is_trigger);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_character_controller(const JceCharacterControllerComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "CharacterController");
-    cJSON_AddNumberToObject(o, "height", c->height);
-    cJSON_AddNumberToObject(o, "radius", c->radius);
-    cJSON_AddNumberToObject(o, "stepOffset", c->step_offset);
-    cJSON_AddNumberToObject(o, "slopeLimit", c->slope_limit);
-    cJSON_AddNumberToObject(o, "moveSpeed", c->move_speed);
-    cJSON_AddNumberToObject(o, "sprintMult", c->sprint_mult);
-    cJSON_AddNumberToObject(o, "jumpSpeed", c->jump_speed);
-    cJSON_AddNumberToObject(o, "accel", c->accel);
-    cJSON_AddNumberToObject(o, "airControl", c->air_control);
-    cJSON_AddNumberToObject(o, "turnSpeed", c->turn_speed_deg);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_audio_source(const JceAudioSourceComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "AudioSource");
-    cJSON_AddStringToObject(o, "clipPath", c->clip_path);
-    cJSON_AddNumberToObject(o, "volume", c->volume);
-    cJSON_AddNumberToObject(o, "pitch", c->pitch);
-    cJSON_AddNumberToObject(o, "spatialBlend", c->spatial_blend);
-    cJSON_AddBoolToObject(o, "loop", c->loop);
-    cJSON_AddBoolToObject(o, "playOnAwake", c->play_on_awake);
-    cJSON_AddItemToArray(arr, o);
-}
 
 static void ser_video_player(const JceVideoPlayerComponent *c, cJSON *arr)
 {
@@ -2862,821 +1231,65 @@ static void ser_video_player(const JceVideoPlayerComponent *c, cJSON *arr)
     cJSON_AddItemToArray(arr, o);
 }
 
-static void ser_script(const JceScriptComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "Script");
-    cJSON_AddStringToObject(o, "scriptPath", c->script_path);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_constraint(const JceConstraintComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "Constraint");
-    cJSON_AddNumberToObject(o, "constraintType", c->constraint_type);
-    cJSON_AddNumberToObject(o, "targetEntity", (double)c->target_entity);
-    cJSON_AddNumberToObject(o, "pivotAx", c->pivot_a[0]);
-    cJSON_AddNumberToObject(o, "pivotAy", c->pivot_a[1]);
-    cJSON_AddNumberToObject(o, "pivotAz", c->pivot_a[2]);
-    cJSON_AddNumberToObject(o, "pivotBx", c->pivot_b[0]);
-    cJSON_AddNumberToObject(o, "pivotBy", c->pivot_b[1]);
-    cJSON_AddNumberToObject(o, "pivotBz", c->pivot_b[2]);
-    cJSON_AddNumberToObject(o, "axisX", c->axis[0]);
-    cJSON_AddNumberToObject(o, "axisY", c->axis[1]);
-    cJSON_AddNumberToObject(o, "axisZ", c->axis[2]);
-    cJSON_AddNumberToObject(o, "lowerLimit", c->lower_limit);
-    cJSON_AddNumberToObject(o, "upperLimit", c->upper_limit);
-    cJSON_AddBoolToObject(o, "disableCollision", c->disable_collision);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_terrain(const JceTerrainComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "Terrain");
-    cJSON_AddStringToObject(o, "terrainPath", c->terrain_path);
-    cJSON_AddStringToObject(o, "layerAlbedoPath0", c->layer_albedo_path[0]);
-    cJSON_AddStringToObject(o, "layerAlbedoPath1", c->layer_albedo_path[1]);
-    cJSON_AddStringToObject(o, "layerAlbedoPath2", c->layer_albedo_path[2]);
-    cJSON_AddStringToObject(o, "layerAlbedoPath3", c->layer_albedo_path[3]);
-    cJSON_AddNumberToObject(o, "tileScale", c->tile_scale);
-    cJSON_AddNumberToObject(o, "tintR", c->tint[0]);
-    cJSON_AddNumberToObject(o, "tintG", c->tint[1]);
-    cJSON_AddNumberToObject(o, "tintB", c->tint[2]);
-    cJSON_AddBoolToObject(o, "visible", c->visible);
-    cJSON_AddBoolToObject(o, "splatEnabled", c->splat_enabled);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_lod_group(const JceLodGroupComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "LODGroup");
-    cJSON_AddNumberToObject(o, "levelCount", c->level_count);
-    cJSON_AddNumberToObject(o, "hysteresis", c->hysteresis);
-    cJSON_AddBoolToObject  (o, "cullWhenTooFar", c->cull_when_too_far);
-    char key[32];
-    for (int i = 0; i < JCE_LOD_COMP_MAX_LEVELS; ++i) {
-        snprintf(key, sizeof(key), "distance%d", i);
-        cJSON_AddNumberToObject(o, key, c->distances[i]);
-        snprintf(key, sizeof(key), "meshPath%d", i);
-        cJSON_AddStringToObject(o, key, c->level_mesh_paths[i]);
-    }
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_virtual_camera(const JceVirtualCameraComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "VirtualCamera");
-    cJSON_AddStringToObject(o, "name", c->vcam_name);
-    cJSON_AddNumberToObject(o, "priority", c->priority);
-    cJSON_AddBoolToObject  (o, "active", c->active);
-    cJSON_AddNumberToObject(o, "trackMode", c->track_mode);
-    cJSON_AddNumberToObject(o, "posX", c->position[0]);
-    cJSON_AddNumberToObject(o, "posY", c->position[1]);
-    cJSON_AddNumberToObject(o, "posZ", c->position[2]);
-    cJSON_AddNumberToObject(o, "lookX", c->look_at[0]);
-    cJSON_AddNumberToObject(o, "lookY", c->look_at[1]);
-    cJSON_AddNumberToObject(o, "lookZ", c->look_at[2]);
-    cJSON_AddNumberToObject(o, "fov", c->fov_deg);
-    cJSON_AddNumberToObject(o, "offX", c->follow_offset[0]);
-    cJSON_AddNumberToObject(o, "offY", c->follow_offset[1]);
-    cJSON_AddNumberToObject(o, "offZ", c->follow_offset[2]);
-    cJSON_AddNumberToObject(o, "damping", c->damping);
-    cJSON_AddNumberToObject(o, "followTarget",  (double)c->follow_target);
-    cJSON_AddNumberToObject(o, "lookAtTarget", (double)c->look_at_target);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_trigger_volume(const JceTriggerVolumeComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "TriggerVolume");
-    cJSON_AddNumberToObject(o, "shape", c->shape);
-    cJSON_AddNumberToObject(o, "cx", c->center[0]);
-    cJSON_AddNumberToObject(o, "cy", c->center[1]);
-    cJSON_AddNumberToObject(o, "cz", c->center[2]);
-    cJSON_AddNumberToObject(o, "hx", c->half_extents[0]);
-    cJSON_AddNumberToObject(o, "hy", c->half_extents[1]);
-    cJSON_AddNumberToObject(o, "hz", c->half_extents[2]);
-    cJSON_AddNumberToObject(o, "axX", c->axis_x[0]); cJSON_AddNumberToObject(o, "axY", c->axis_x[1]); cJSON_AddNumberToObject(o, "axZ", c->axis_x[2]);
-    cJSON_AddNumberToObject(o, "ayX", c->axis_y[0]); cJSON_AddNumberToObject(o, "ayY", c->axis_y[1]); cJSON_AddNumberToObject(o, "ayZ", c->axis_y[2]);
-    cJSON_AddNumberToObject(o, "azX", c->axis_z[0]); cJSON_AddNumberToObject(o, "azY", c->axis_z[1]); cJSON_AddNumberToObject(o, "azZ", c->axis_z[2]);
-    cJSON_AddBoolToObject  (o, "enabled",   c->enabled);
-    cJSON_AddBoolToObject  (o, "fireStay",  c->fire_stay);
-    cJSON_AddStringToObject(o, "tag",       c->tag);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_capsule_collider(const JceCapsuleColliderComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "CapsuleCollider");
-    cJSON_AddNumberToObject(o, "cx", c->center[0]);
-    cJSON_AddNumberToObject(o, "cy", c->center[1]);
-    cJSON_AddNumberToObject(o, "cz", c->center[2]);
-    cJSON_AddNumberToObject(o, "radius", c->radius);
-    cJSON_AddNumberToObject(o, "height", c->height);
-    cJSON_AddNumberToObject(o, "axis",   c->axis);
-    cJSON_AddBoolToObject  (o, "isTrigger", c->is_trigger);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_mesh_collider(const JceMeshColliderComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "MeshCollider");
-    cJSON_AddStringToObject(o, "meshPath", c->mesh_path);
-    cJSON_AddBoolToObject  (o, "convex",    c->convex);
-    cJSON_AddBoolToObject  (o, "isTrigger", c->is_trigger);
-    cJSON_AddNumberToObject(o, "friction",    c->friction);
-    cJSON_AddNumberToObject(o, "restitution", c->restitution);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_compound_collider(const JceCompoundColliderComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "CompoundCollider");
-    cJSON_AddStringToObject(o, "modelPath", c->model_path);
-    cJSON_AddNumberToObject(o, "mode",  c->mode);
-    cJSON_AddNumberToObject(o, "split", c->split);
-    cJSON_AddBoolToObject  (o, "isStatic",     c->is_static);
-    cJSON_AddBoolToObject  (o, "detectNaming", c->detect_naming);
-    cJSON_AddBoolToObject  (o, "isTrigger",    c->is_trigger);
-    cJSON_AddNumberToObject(o, "friction",    c->friction);
-    cJSON_AddNumberToObject(o, "restitution", c->restitution);
-    cJSON_AddNumberToObject(o, "vhacdResolution",      c->vhacd_resolution);
-    cJSON_AddNumberToObject(o, "vhacdMaxHulls",        c->vhacd_max_hulls);
-    cJSON_AddNumberToObject(o, "vhacdMaxVertsPerHull", c->vhacd_max_verts_per_hull);
-    if (c->physmat_path[0])
-        cJSON_AddStringToObject(o, "physMaterial", c->physmat_path);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_collider2d(const JceCollider2DComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "Collider2D");
-    cJSON_AddNumberToObject(o, "shape",      c->shape);
-    cJSON_AddNumberToObject(o, "offX",       c->offset[0]);
-    cJSON_AddNumberToObject(o, "offY",       c->offset[1]);
-    cJSON_AddNumberToObject(o, "sizeX",      c->size[0]);
-    cJSON_AddNumberToObject(o, "sizeY",      c->size[1]);
-    cJSON_AddNumberToObject(o, "radius",     c->radius);
-    cJSON_AddNumberToObject(o, "capsuleDir", c->capsule_direction);
-    cJSON_AddBoolToObject  (o, "isTrigger",  c->is_trigger);
-    cJSON_AddNumberToObject(o, "friction",   c->friction);
-    cJSON_AddNumberToObject(o, "restitution",c->restitution);
-    int n = c->point_count;
-    if (n < 0) n = 0; if (n > JCE_COLLIDER_2D_MAX_POINTS) n = JCE_COLLIDER_2D_MAX_POINTS;
-    cJSON_AddNumberToObject(o, "pointCount", n);
-    char key[24];
-    for (int i = 0; i < n; ++i) {
-        snprintf(key, sizeof(key), "px%d", i);
-        cJSON_AddNumberToObject(o, key, c->points[i][0]);
-        snprintf(key, sizeof(key), "py%d", i);
-        cJSON_AddNumberToObject(o, key, c->points[i][1]);
-    }
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_trail_renderer(const JceTrailRendererComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "TrailRenderer");
-    cJSON_AddStringToObject(o, "materialPath", c->material_path);
-    cJSON_AddNumberToObject(o, "time", c->time);
-    cJSON_AddNumberToObject(o, "minVertexDistance", c->min_vertex_distance);
-    cJSON_AddNumberToObject(o, "widthStart", c->width_start);
-    cJSON_AddNumberToObject(o, "widthEnd",   c->width_end);
-    cJSON_AddNumberToObject(o, "colorStartR", c->color_start[0]);
-    cJSON_AddNumberToObject(o, "colorStartG", c->color_start[1]);
-    cJSON_AddNumberToObject(o, "colorStartB", c->color_start[2]);
-    cJSON_AddNumberToObject(o, "colorStartA", c->color_start[3]);
-    cJSON_AddNumberToObject(o, "colorEndR", c->color_end[0]);
-    cJSON_AddNumberToObject(o, "colorEndG", c->color_end[1]);
-    cJSON_AddNumberToObject(o, "colorEndB", c->color_end[2]);
-    cJSON_AddNumberToObject(o, "colorEndA", c->color_end[3]);
-    cJSON_AddBoolToObject  (o, "emitting", c->emitting);
-    cJSON_AddBoolToObject  (o, "autodestruct", c->autodestruct);
-    int n = c->point_count;
-    if (n < 0) n = 0; if (n > JCE_TRAIL_MAX_POINTS) n = JCE_TRAIL_MAX_POINTS;
-    cJSON_AddNumberToObject(o, "pointCount", n);
-    char key[24];
-    for (int i = 0; i < n; ++i) {
-        snprintf(key, sizeof(key), "px%d", i); cJSON_AddNumberToObject(o, key, c->points[i][0]);
-        snprintf(key, sizeof(key), "py%d", i); cJSON_AddNumberToObject(o, key, c->points[i][1]);
-        snprintf(key, sizeof(key), "pz%d", i); cJSON_AddNumberToObject(o, key, c->points[i][2]);
-    }
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_line_renderer(const JceLineRendererComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "LineRenderer");
-    cJSON_AddStringToObject(o, "materialPath", c->material_path);
-    cJSON_AddNumberToObject(o, "widthStart", c->width_start);
-    cJSON_AddNumberToObject(o, "widthEnd",   c->width_end);
-    cJSON_AddNumberToObject(o, "colorStartR", c->color_start[0]);
-    cJSON_AddNumberToObject(o, "colorStartG", c->color_start[1]);
-    cJSON_AddNumberToObject(o, "colorStartB", c->color_start[2]);
-    cJSON_AddNumberToObject(o, "colorStartA", c->color_start[3]);
-    cJSON_AddNumberToObject(o, "colorEndR", c->color_end[0]);
-    cJSON_AddNumberToObject(o, "colorEndG", c->color_end[1]);
-    cJSON_AddNumberToObject(o, "colorEndB", c->color_end[2]);
-    cJSON_AddNumberToObject(o, "colorEndA", c->color_end[3]);
-    cJSON_AddBoolToObject  (o, "useWorldSpace", c->use_world_space);
-    cJSON_AddBoolToObject  (o, "loop", c->loop);
-    int n = c->position_count;
-    if (n < 0) n = 0; if (n > JCE_LINE_MAX_POINTS) n = JCE_LINE_MAX_POINTS;
-    cJSON_AddNumberToObject(o, "positionCount", n);
-    char key[24];
-    for (int i = 0; i < n; ++i) {
-        snprintf(key, sizeof(key), "px%d", i); cJSON_AddNumberToObject(o, key, c->positions[i][0]);
-        snprintf(key, sizeof(key), "py%d", i); cJSON_AddNumberToObject(o, key, c->positions[i][1]);
-        snprintf(key, sizeof(key), "pz%d", i); cJSON_AddNumberToObject(o, key, c->positions[i][2]);
-    }
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_reflection_probe(const JceReflectionProbeComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "ReflectionProbe");
-    cJSON_AddNumberToObject(o, "mode", c->mode);
-    cJSON_AddNumberToObject(o, "resolution", c->resolution);
-    cJSON_AddNumberToObject(o, "intensity", c->intensity);
-    cJSON_AddNumberToObject(o, "blendDistance", c->blend_distance);
-    cJSON_AddNumberToObject(o, "boxSizeX", c->box_size[0]);
-    cJSON_AddNumberToObject(o, "boxSizeY", c->box_size[1]);
-    cJSON_AddNumberToObject(o, "boxSizeZ", c->box_size[2]);
-    cJSON_AddNumberToObject(o, "boxOffX",  c->box_offset[0]);
-    cJSON_AddNumberToObject(o, "boxOffY",  c->box_offset[1]);
-    cJSON_AddNumberToObject(o, "boxOffZ",  c->box_offset[2]);
-    cJSON_AddNumberToObject(o, "nearClip", c->near_clip);
-    cJSON_AddNumberToObject(o, "farClip",  c->far_clip);
-    cJSON_AddStringToObject(o, "hdrPath",  c->custom_hdr_path);
-    cJSON_AddStringToObject(o, "bakedCubemapPath", c->baked_cubemap_path);
-    cJSON_AddBoolToObject  (o, "boxProjection", c->box_projection);
-    cJSON_AddBoolToObject  (o, "hdr", c->hdr);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_decal(const JceDecalComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "Decal");
-    cJSON_AddStringToObject(o, "materialPath", c->material_path);
-    cJSON_AddNumberToObject(o, "sizeX", c->size[0]);
-    cJSON_AddNumberToObject(o, "sizeY", c->size[1]);
-    cJSON_AddNumberToObject(o, "sizeZ", c->size[2]);
-    cJSON_AddNumberToObject(o, "pivotX", c->pivot[0]);
-    cJSON_AddNumberToObject(o, "pivotY", c->pivot[1]);
-    cJSON_AddNumberToObject(o, "pivotZ", c->pivot[2]);
-    cJSON_AddNumberToObject(o, "colorR", c->color[0]);
-    cJSON_AddNumberToObject(o, "colorG", c->color[1]);
-    cJSON_AddNumberToObject(o, "colorB", c->color[2]);
-    cJSON_AddNumberToObject(o, "colorA", c->color[3]);
-    cJSON_AddNumberToObject(o, "opacity", c->opacity);
-    cJSON_AddNumberToObject(o, "drawDistance", c->draw_distance);
-    cJSON_AddNumberToObject(o, "fadeFactor",   c->fade_factor);
-    cJSON_AddNumberToObject(o, "layerMask",    c->layer_mask);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_light_probe_group(const JceLightProbeGroupComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "LightProbeGroup");
-    int n = c->probe_count;
-    if (n < 0) n = 0; if (n > JCE_LIGHT_PROBE_MAX) n = JCE_LIGHT_PROBE_MAX;
-    cJSON_AddNumberToObject(o, "probeCount", n);
-    cJSON_AddBoolToObject  (o, "dering", c->dering);
-    char key[24];
-    for (int i = 0; i < n; ++i) {
-        snprintf(key, sizeof(key), "px%d", i); cJSON_AddNumberToObject(o, key, c->positions[i][0]);
-        snprintf(key, sizeof(key), "py%d", i); cJSON_AddNumberToObject(o, key, c->positions[i][1]);
-        snprintf(key, sizeof(key), "pz%d", i); cJSON_AddNumberToObject(o, key, c->positions[i][2]);
-    }
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_audio_listener(const JceAudioListenerComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "AudioListener");
-    cJSON_AddNumberToObject(o, "volume", c->volume);
-    cJSON_AddBoolToObject  (o, "paused", c->paused);
-    cJSON_AddBoolToObject  (o, "spatialize", c->spatialize);
-    cJSON_AddNumberToObject(o, "dopplerFactor", c->doppler_factor);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_audio_reverb_zone(const JceAudioReverbZoneComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "AudioReverbZone");
-    cJSON_AddNumberToObject(o, "preset",            c->preset);
-    cJSON_AddNumberToObject(o, "minDistance",       c->min_distance);
-    cJSON_AddNumberToObject(o, "maxDistance",       c->max_distance);
-    cJSON_AddNumberToObject(o, "room",              c->room);
-    cJSON_AddNumberToObject(o, "roomHF",            c->room_hf);
-    cJSON_AddNumberToObject(o, "decayTime",         c->decay_time);
-    cJSON_AddNumberToObject(o, "decayHFRatio",      c->decay_hf_ratio);
-    cJSON_AddNumberToObject(o, "reflections",       c->reflections);
-    cJSON_AddNumberToObject(o, "reflectionsDelay",  c->reflections_delay);
-    cJSON_AddNumberToObject(o, "reverb",            c->reverb);
-    cJSON_AddNumberToObject(o, "reverbDelay",       c->reverb_delay);
-    cJSON_AddNumberToObject(o, "hfReference",       c->hf_reference);
-    cJSON_AddNumberToObject(o, "diffusion",         c->diffusion);
-    cJSON_AddNumberToObject(o, "density",           c->density);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_audio_occlusion(const JceAudioOcclusionComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "AudioOcclusion");
-    cJSON_AddNumberToObject(o, "radius",          c->radius);
-    cJSON_AddNumberToObject(o, "attenuationDb",   c->attenuation_db);
-    cJSON_AddNumberToObject(o, "lowpassCutoffHz", c->lowpass_cutoff_hz);
-    cJSON_AddNumberToObject(o, "layerMask",       c->layer_mask);
-    cJSON_AddBoolToObject  (o, "affectsReverb",   c->affects_reverb);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_spawn_manager(const JceSpawnManagerComponent *m, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "SpawnManager");
-    cJSON_AddNumberToObject(o, "enabled",         m->enabled);
-    cJSON_AddNumberToObject(o, "maxPeds",         m->max_peds);
-    cJSON_AddNumberToObject(o, "maxVehicles",     m->max_vehicles);
-    cJSON_AddNumberToObject(o, "minSpawnRadius",  m->min_spawn_radius);
-    cJSON_AddNumberToObject(o, "maxSpawnRadius",  m->max_spawn_radius);
-    cJSON_AddNumberToObject(o, "despawnPad",      m->despawn_pad);
-    cJSON_AddNumberToObject(o, "spawnInterval",   m->spawn_interval);
-    int pn = m->ped_archetype_count, vn = m->vehicle_archetype_count;
-    if (pn < 0) pn = 0; if (pn > 8) pn = 8;
-    if (vn < 0) vn = 0; if (vn > 8) vn = 8;
-    cJSON_AddNumberToObject(o, "pedArchetypeCount",     pn);
-    cJSON_AddNumberToObject(o, "vehicleArchetypeCount", vn);
-    char key[24];
-    for (int i = 0; i < pn; ++i) {
-        snprintf(key, sizeof(key), "pa%d", i);
-        cJSON_AddNumberToObject(o, key, (double)m->ped_archetypes[i]);
-    }
-    for (int i = 0; i < vn; ++i) {
-        snprintf(key, sizeof(key), "va%d", i);
-        cJSON_AddNumberToObject(o, key, (double)m->vehicle_archetypes[i]);
-    }
-    cJSON_AddNumberToObject(o, "rngSeed", (double)m->rng_seed);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_weapon(const JceWeaponComponent *w, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "Weapon");
-    cJSON_AddStringToObject(o, "name",            w->name);
-    cJSON_AddNumberToObject(o, "kind",            w->kind);
-    cJSON_AddNumberToObject(o, "damage",          w->damage);
-    cJSON_AddNumberToObject(o, "range",           w->range);
-    cJSON_AddNumberToObject(o, "rpm",             w->rpm);
-    cJSON_AddNumberToObject(o, "clipSize",        w->clip_size);
-    cJSON_AddNumberToObject(o, "reserveMax",      w->reserve_max);
-    cJSON_AddNumberToObject(o, "reloadSeconds",   w->reload_seconds);
-    cJSON_AddNumberToObject(o, "spreadDeg",       w->spread_deg);
-    cJSON_AddNumberToObject(o, "recoilPerShot",   w->recoil_per_shot);
-    cJSON_AddNumberToObject(o, "recoilRecovery",  w->recoil_recovery);
-    cJSON_AddNumberToObject(o, "pellets",         w->pellets);
-    cJSON_AddNumberToObject(o, "projectileSpeed", w->projectile_speed);
-    cJSON_AddBoolToObject  (o, "fullAuto",        w->full_auto);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_save_point(const JceSavePointComponent *s, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "SavePoint");
-    cJSON_AddStringToObject(o, "saveId",          s->save_id);
-    cJSON_AddStringToObject(o, "displayName",     s->display_name);
-    cJSON_AddNumberToObject(o, "kind",            s->kind);
-    cJSON_AddNumberToObject(o, "radius",          s->radius);
-    cJSON_AddNumberToObject(o, "slot",            s->slot);
-    cJSON_AddBoolToObject  (o, "oneShot",         s->one_shot);
-    cJSON_AddBoolToObject  (o, "requireInteract", s->require_interact);
-    cJSON_AddItemToArray(arr, o);
-}
+
+
+
 
 /* ── P2 add-on serializers ──────────────────────────────────────── */
 
-static void ser_wheel_collider(const JceWheelColliderComponent *w, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "WheelCollider");
-    cJSON_AddNumberToObject(o, "radius", w->radius);
-    cJSON_AddNumberToObject(o, "suspensionDistance",  w->suspension_distance);
-    cJSON_AddNumberToObject(o, "suspensionSpring",    w->suspension_spring);
-    cJSON_AddNumberToObject(o, "suspensionDamper",    w->suspension_damper);
-    cJSON_AddNumberToObject(o, "suspensionTargetPos", w->suspension_target_pos);
-    cJSON_AddNumberToObject(o, "mass",                w->mass);
-    cJSON_AddNumberToObject(o, "forwardFriction",     w->forward_friction);
-    cJSON_AddNumberToObject(o, "sidewaysFriction",    w->sideways_friction);
-    cJSON_AddNumberToObject(o, "centerX", w->center[0]);
-    cJSON_AddNumberToObject(o, "centerY", w->center[1]);
-    cJSON_AddNumberToObject(o, "centerZ", w->center[2]);
-    cJSON_AddNumberToObject(o, "motorTorque",   w->motor_torque);
-    cJSON_AddNumberToObject(o, "brakeTorque",   w->brake_torque);
-    cJSON_AddNumberToObject(o, "steerAngleDeg", w->steer_angle_deg);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_constant_force(const JceConstantForceComponent *f, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "ConstantForce");
-    cJSON_AddNumberToObject(o, "forceX", f->force[0]);
-    cJSON_AddNumberToObject(o, "forceY", f->force[1]);
-    cJSON_AddNumberToObject(o, "forceZ", f->force[2]);
-    cJSON_AddNumberToObject(o, "relForceX", f->relative_force[0]);
-    cJSON_AddNumberToObject(o, "relForceY", f->relative_force[1]);
-    cJSON_AddNumberToObject(o, "relForceZ", f->relative_force[2]);
-    cJSON_AddNumberToObject(o, "torqueX", f->torque[0]);
-    cJSON_AddNumberToObject(o, "torqueY", f->torque[1]);
-    cJSON_AddNumberToObject(o, "torqueZ", f->torque[2]);
-    cJSON_AddNumberToObject(o, "relTorqueX", f->relative_torque[0]);
-    cJSON_AddNumberToObject(o, "relTorqueY", f->relative_torque[1]);
-    cJSON_AddNumberToObject(o, "relTorqueZ", f->relative_torque[2]);
-    cJSON_AddBoolToObject  (o, "enabled", f->enabled);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_nav_agent(const JceNavAgentComponent *n, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "NavAgent");
-    cJSON_AddNumberToObject(o, "radius",         n->radius);
-    cJSON_AddNumberToObject(o, "height",         n->height);
-    cJSON_AddNumberToObject(o, "maxSpeed",       n->max_speed);
-    cJSON_AddNumberToObject(o, "maxAccel",       n->max_accel);
-    cJSON_AddNumberToObject(o, "arriveRadius",   n->arrive_radius);
-    cJSON_AddNumberToObject(o, "waypointRadius", n->waypoint_radius);
-    cJSON_AddNumberToObject(o, "targetX", n->target[0]);
-    cJSON_AddNumberToObject(o, "targetY", n->target[1]);
-    cJSON_AddNumberToObject(o, "targetZ", n->target[2]);
-    cJSON_AddNumberToObject(o, "targetEntity", (double)n->target_entity);
-    cJSON_AddBoolToObject  (o, "autoRepath", n->auto_repath);
-    cJSON_AddBoolToObject  (o, "enabled",    n->enabled);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_sequence_player(const JceSequencePlayerComponent *sp, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "SequencePlayer");
-    cJSON_AddStringToObject(o, "seqPath", sp->seq_path);
-    cJSON_AddBoolToObject  (o, "playOnAwake",  sp->play_on_awake);
-    cJSON_AddBoolToObject  (o, "loopOverride", sp->loop_override);
-    cJSON_AddBoolToObject  (o, "overrideLoop", sp->override_loop);
-    cJSON_AddNumberToObject(o, "speed", sp->speed);
-    cJSON *list = cJSON_AddArrayToObject(o, "bindings");
-    int n = sp->binding_count;
-    if (n < 0) n = 0;
-    if (n > JCE_SEQ_PLAYER_MAX_BINDINGS) n = JCE_SEQ_PLAYER_MAX_BINDINGS;
-    for (int i = 0; i < n; i++)
-        cJSON_AddItemToArray(list, cJSON_CreateNumber((double)sp->bindings[i]));
-    /* Runtime fields (seq/prev_time/started/opened_hash) are NOT persisted. */
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_ik_constraints(const JceIkConstraintComponent *ik, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "IkConstraints");
-    cJSON *list = cJSON_AddArrayToObject(o, "constraints");
-    int cap = (int)(sizeof(ik->constraints) / sizeof(ik->constraints[0]));
-    int n = ik->count;
-    if (n < 0)   n = 0;
-    if (n > cap) n = cap;
-    for (int i = 0; i < n; i++) {
-        const JceIkConstraint *k = &ik->constraints[i];
-        cJSON *co = cJSON_CreateObject();
-        cJSON_AddNumberToObject(co, "kind",   k->kind);
-        cJSON_AddStringToObject(co, "name",   k->name);
-        cJSON_AddNumberToObject(co, "weight", k->weight);
-        cJSON_AddBoolToObject  (co, "enabled", k->enabled);
-        cJSON_AddStringToObject(co, "rootBone", k->root_bone);
-        cJSON_AddStringToObject(co, "midBone",  k->mid_bone);
-        cJSON_AddStringToObject(co, "endBone",  k->end_bone);
-        cJSON_AddNumberToObject(co, "targetEntity", (double)k->target_entity);
-        cJSON_AddNumberToObject(co, "poleEntity",   (double)k->pole_entity);
-        cJSON_AddNumberToObject(co, "poleOffsetX",  k->pole_offset[0]);
-        cJSON_AddNumberToObject(co, "poleOffsetY",  k->pole_offset[1]);
-        cJSON_AddNumberToObject(co, "poleOffsetZ",  k->pole_offset[2]);
-        cJSON_AddItemToArray(list, co);
-    }
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_configurable_joint(const JceConfigurableJointComponent *j, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "ConfigurableJoint");
-    cJSON_AddNumberToObject(o, "connectedBody", (double)j->connected_body);
-    cJSON_AddNumberToObject(o, "anchorX", j->anchor[0]);
-    cJSON_AddNumberToObject(o, "anchorY", j->anchor[1]);
-    cJSON_AddNumberToObject(o, "anchorZ", j->anchor[2]);
-    cJSON_AddNumberToObject(o, "connAnchorX", j->connected_anchor[0]);
-    cJSON_AddNumberToObject(o, "connAnchorY", j->connected_anchor[1]);
-    cJSON_AddNumberToObject(o, "connAnchorZ", j->connected_anchor[2]);
-    cJSON_AddNumberToObject(o, "xMotion", j->x_motion);
-    cJSON_AddNumberToObject(o, "yMotion", j->y_motion);
-    cJSON_AddNumberToObject(o, "zMotion", j->z_motion);
-    cJSON_AddNumberToObject(o, "xRotation", j->x_rotation);
-    cJSON_AddNumberToObject(o, "yRotation", j->y_rotation);
-    cJSON_AddNumberToObject(o, "zRotation", j->z_rotation);
-    cJSON_AddNumberToObject(o, "linearLimit", j->linear_limit);
-    cJSON_AddNumberToObject(o, "angXLimit",   j->angular_x_limit_deg);
-    cJSON_AddNumberToObject(o, "angYLimit",   j->angular_y_limit_deg);
-    cJSON_AddNumberToObject(o, "angZLimit",   j->angular_z_limit_deg);
-    cJSON_AddNumberToObject(o, "breakForce",  j->break_force);
-    cJSON_AddNumberToObject(o, "breakTorque", j->break_torque);
-    cJSON_AddBoolToObject  (o, "enableCollision", j->enable_collision);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_cloth(const JceClothComponent *cl, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "Cloth");
-    cJSON_AddNumberToObject(o, "c00X", cl->corner_00.x);
-    cJSON_AddNumberToObject(o, "c00Y", cl->corner_00.y);
-    cJSON_AddNumberToObject(o, "c00Z", cl->corner_00.z);
-    cJSON_AddNumberToObject(o, "c10X", cl->corner_10.x);
-    cJSON_AddNumberToObject(o, "c10Y", cl->corner_10.y);
-    cJSON_AddNumberToObject(o, "c10Z", cl->corner_10.z);
-    cJSON_AddNumberToObject(o, "c01X", cl->corner_01.x);
-    cJSON_AddNumberToObject(o, "c01Y", cl->corner_01.y);
-    cJSON_AddNumberToObject(o, "c01Z", cl->corner_01.z);
-    cJSON_AddNumberToObject(o, "c11X", cl->corner_11.x);
-    cJSON_AddNumberToObject(o, "c11Y", cl->corner_11.y);
-    cJSON_AddNumberToObject(o, "c11Z", cl->corner_11.z);
-    cJSON_AddNumberToObject(o, "resU",     cl->res_u);
-    cJSON_AddNumberToObject(o, "resV",     cl->res_v);
-    cJSON_AddNumberToObject(o, "mass",     cl->mass_total);
-    cJSON_AddNumberToObject(o, "stiffLin", cl->stiffness_linear);
-    cJSON_AddNumberToObject(o, "stiffAng", cl->stiffness_angular);
-    cJSON_AddNumberToObject(o, "damping",  cl->damping);
-    cJSON_AddNumberToObject(o, "iters",    cl->iterations);
-    cJSON_AddBoolToObject  (o, "selfColl", cl->self_collision);
-    cJSON_AddBoolToObject  (o, "windOn",   cl->wind_enabled);
-    cJSON_AddNumberToObject(o, "windX",    cl->wind_velocity.x);
-    cJSON_AddNumberToObject(o, "windY",    cl->wind_velocity.y);
-    cJSON_AddNumberToObject(o, "windZ",    cl->wind_velocity.z);
-    cJSON *pin = cJSON_CreateArray();
-    uint32_t pc = cl->pinned_count;
-    if (pc > JCE_CLOTH_MAX_PINNED) pc = JCE_CLOTH_MAX_PINNED;
-    for (uint32_t i = 0; i < pc; ++i)
-        cJSON_AddItemToArray(pin, cJSON_CreateNumber((double)cl->pinned_indices[i]));
-    cJSON_AddItemToObject(o, "pinned", pin);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_joint2d(const JceJoint2DComponent *j, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "Joint2D");
-    cJSON_AddNumberToObject(o, "kind", j->kind);
-    cJSON_AddNumberToObject(o, "connectedBody", (double)j->connected_body);
-    cJSON_AddNumberToObject(o, "anchorX", j->anchor[0]);
-    cJSON_AddNumberToObject(o, "anchorY", j->anchor[1]);
-    cJSON_AddNumberToObject(o, "connAnchorX", j->connected_anchor[0]);
-    cJSON_AddNumberToObject(o, "connAnchorY", j->connected_anchor[1]);
-    cJSON_AddNumberToObject(o, "distance",     j->distance);
-    cJSON_AddNumberToObject(o, "frequency",    j->frequency);
-    cJSON_AddNumberToObject(o, "dampingRatio", j->damping_ratio);
-    cJSON_AddBoolToObject  (o, "useMotor",        j->use_motor);
-    cJSON_AddNumberToObject(o, "motorSpeed",      j->motor_speed_deg_s);
-    cJSON_AddNumberToObject(o, "motorMaxTorque",  j->motor_max_torque);
-    cJSON_AddBoolToObject  (o, "useLimits",       j->use_limits);
-    cJSON_AddNumberToObject(o, "lowerAngle",      j->lower_angle_deg);
-    cJSON_AddNumberToObject(o, "upperAngle",      j->upper_angle_deg);
-    cJSON_AddNumberToObject(o, "breakForce",  j->break_force);
-    cJSON_AddNumberToObject(o, "breakTorque", j->break_torque);
-    cJSON_AddBoolToObject  (o, "enableCollision",       j->enable_collision);
-    cJSON_AddBoolToObject  (o, "autoConfigureDistance", j->auto_configure_distance);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_billboard_renderer(const JceBillboardRendererComponent *b, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "BillboardRenderer");
-    cJSON_AddStringToObject(o, "texturePath", b->texture_path);
-    cJSON_AddNumberToObject(o, "mode", b->mode);
-    cJSON_AddNumberToObject(o, "sizeX", b->size[0]);
-    cJSON_AddNumberToObject(o, "sizeY", b->size[1]);
-    cJSON_AddNumberToObject(o, "colorR", b->color[0]);
-    cJSON_AddNumberToObject(o, "colorG", b->color[1]);
-    cJSON_AddNumberToObject(o, "colorB", b->color[2]);
-    cJSON_AddNumberToObject(o, "colorA", b->color[3]);
-    cJSON_AddBoolToObject  (o, "visible", b->visible);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_canvas(const JceCanvasComponent *v, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "Canvas");
-    cJSON_AddNumberToObject(o, "renderMode", v->render_mode);
-    cJSON_AddNumberToObject(o, "sortOrder",  v->sort_order);
-    cJSON_AddNumberToObject(o, "refResX", v->reference_resolution[0]);
-    cJSON_AddNumberToObject(o, "refResY", v->reference_resolution[1]);
-    cJSON_AddNumberToObject(o, "scaleFactor", v->scale_factor);
-    cJSON_AddBoolToObject  (o, "pixelPerfect", v->pixel_perfect);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_canvas_group(const JceCanvasGroupComponent *g, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "CanvasGroup");
-    cJSON_AddNumberToObject(o, "alpha", g->alpha);
-    cJSON_AddBoolToObject  (o, "interactable", g->interactable);
-    cJSON_AddBoolToObject  (o, "blocksRaycasts", g->blocks_raycasts);
-    cJSON_AddBoolToObject  (o, "ignoreParentGroups", g->ignore_parent_groups);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_layout_group(const JceLayoutGroupComponent *l, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "LayoutGroup");
-    cJSON_AddNumberToObject(o, "layoutKind", l->layout_kind);
-    cJSON_AddNumberToObject(o, "padL", l->padding[0]);
-    cJSON_AddNumberToObject(o, "padR", l->padding[1]);
-    cJSON_AddNumberToObject(o, "padT", l->padding[2]);
-    cJSON_AddNumberToObject(o, "padB", l->padding[3]);
-    cJSON_AddNumberToObject(o, "spacingX", l->spacing[0]);
-    cJSON_AddNumberToObject(o, "spacingY", l->spacing[1]);
-    cJSON_AddNumberToObject(o, "cellW", l->cell_size[0]);
-    cJSON_AddNumberToObject(o, "cellH", l->cell_size[1]);
-    cJSON_AddNumberToObject(o, "childAlignment", l->child_alignment);
-    cJSON_AddBoolToObject  (o, "controlChildW", l->control_child_size_w);
-    cJSON_AddBoolToObject  (o, "controlChildH", l->control_child_size_h);
-    cJSON_AddBoolToObject  (o, "reverseArrangement", l->reverse_arrangement);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_ui_image(const JceUIImageComponent *i, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "UIImage");
-    cJSON_AddStringToObject(o, "spritePath", i->sprite_path);
-    cJSON_AddNumberToObject(o, "imageType", i->image_type);
-    cJSON_AddNumberToObject(o, "colorR", i->color[0]);
-    cJSON_AddNumberToObject(o, "colorG", i->color[1]);
-    cJSON_AddNumberToObject(o, "colorB", i->color[2]);
-    cJSON_AddNumberToObject(o, "colorA", i->color[3]);
-    cJSON_AddNumberToObject(o, "fillAmount", i->fill_amount);
-    cJSON_AddBoolToObject  (o, "preserveAspect", i->preserve_aspect);
-    cJSON_AddBoolToObject  (o, "raycastTarget",  i->raycast_target);
-    cJSON_AddNumberToObject(o, "sliceL", i->slice_border[0]);
-    cJSON_AddNumberToObject(o, "sliceR", i->slice_border[1]);
-    cJSON_AddNumberToObject(o, "sliceT", i->slice_border[2]);
-    cJSON_AddNumberToObject(o, "sliceB", i->slice_border[3]);
-    ser_rect_transform(&i->rect, o);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_ui_text(const JceUITextComponent *t, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "UIText");
-    cJSON_AddStringToObject(o, "text", t->text);
-    cJSON_AddStringToObject(o, "fontPath", t->font_path);
-    cJSON_AddNumberToObject(o, "fontSize", t->font_size);
-    cJSON_AddNumberToObject(o, "alignment", t->alignment);
-    cJSON_AddNumberToObject(o, "colorR", t->color[0]);
-    cJSON_AddNumberToObject(o, "colorG", t->color[1]);
-    cJSON_AddNumberToObject(o, "colorB", t->color[2]);
-    cJSON_AddNumberToObject(o, "colorA", t->color[3]);
-    cJSON_AddNumberToObject(o, "lineSpacing", t->line_spacing);
-    cJSON_AddBoolToObject  (o, "richText", t->rich_text);
-    cJSON_AddBoolToObject  (o, "bestFit",  t->best_fit);
-    cJSON_AddNumberToObject(o, "minSize", t->min_size);
-    cJSON_AddNumberToObject(o, "maxSize", t->max_size);
-    cJSON_AddStringToObject(o, "localeKey", t->locale_key);
-    ser_rect_transform(&t->rect, o);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_ui_button(const JceUIButtonComponent *b, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "UIButton");
-    cJSON_AddBoolToObject  (o, "interactable", b->interactable);
-    cJSON_AddNumberToObject(o, "normalR", b->normal_color[0]);
-    cJSON_AddNumberToObject(o, "normalG", b->normal_color[1]);
-    cJSON_AddNumberToObject(o, "normalB", b->normal_color[2]);
-    cJSON_AddNumberToObject(o, "normalA", b->normal_color[3]);
-    cJSON_AddNumberToObject(o, "highlightR", b->highlighted_color[0]);
-    cJSON_AddNumberToObject(o, "highlightG", b->highlighted_color[1]);
-    cJSON_AddNumberToObject(o, "highlightB", b->highlighted_color[2]);
-    cJSON_AddNumberToObject(o, "highlightA", b->highlighted_color[3]);
-    cJSON_AddNumberToObject(o, "pressedR", b->pressed_color[0]);
-    cJSON_AddNumberToObject(o, "pressedG", b->pressed_color[1]);
-    cJSON_AddNumberToObject(o, "pressedB", b->pressed_color[2]);
-    cJSON_AddNumberToObject(o, "pressedA", b->pressed_color[3]);
-    cJSON_AddNumberToObject(o, "disabledR", b->disabled_color[0]);
-    cJSON_AddNumberToObject(o, "disabledG", b->disabled_color[1]);
-    cJSON_AddNumberToObject(o, "disabledB", b->disabled_color[2]);
-    cJSON_AddNumberToObject(o, "disabledA", b->disabled_color[3]);
-    cJSON_AddNumberToObject(o, "fadeDuration", b->fade_duration);
-    cJSON_AddStringToObject(o, "onClickHandler", b->on_click_handler);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_skybox(const JceSkyboxComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "Skybox");
-    cJSON_AddStringToObject(o, "hdrPath", c->hdr_path);
-    cJSON_AddNumberToObject(o, "rotation", c->rotation);
-    cJSON_AddNumberToObject(o, "exposure", c->exposure);
-    cJSON_AddBoolToObject(o, "useAsIbl", c->use_as_ibl);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_sprite_renderer(const JceSpriteRendererComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "SpriteRenderer");
-    cJSON_AddStringToObject(o, "spritePath", c->sprite_path);
-    cJSON_AddNumberToObject(o, "colorR", c->color[0]);
-    cJSON_AddNumberToObject(o, "colorG", c->color[1]);
-    cJSON_AddNumberToObject(o, "colorB", c->color[2]);
-    cJSON_AddNumberToObject(o, "colorA", c->color[3]);
-    cJSON_AddBoolToObject(o, "flipX", c->flip_x);
-    cJSON_AddBoolToObject(o, "flipY", c->flip_y);
-    cJSON_AddNumberToObject(o, "sortingOrder", c->sorting_order);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_sprite_animator(const JceSpriteAnimatorComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "SpriteAnimator");
-    cJSON_AddStringToObject(o, "sheetPath", c->sheet_path);
-    cJSON_AddStringToObject(o, "atlasPath", c->atlas_path);
-    cJSON_AddNumberToObject(o, "frameWidth", c->frame_width);
-    cJSON_AddNumberToObject(o, "frameHeight", c->frame_height);
-    cJSON_AddStringToObject(o, "currentAnim", c->current_anim);
-    cJSON_AddNumberToObject(o, "speed", c->speed);
-    cJSON_AddBoolToObject(o, "loop", c->loop);
-    cJSON_AddBoolToObject(o, "playing", c->playing);
-    cJSON_AddItemToArray(arr, o);
-}
 
-static void ser_skeletal_animator(const JceSkeletalAnimatorComponent *c, cJSON *arr)
-{
-    cJSON *o = cJSON_CreateObject();
-    cJSON_AddStringToObject(o, "type", "SkeletalAnimator");
-    cJSON_AddStringToObject(o, "skeletonPath", c->skeleton_path);
-    if (c->sm_path[0])
-        cJSON_AddStringToObject(o, "stateMachine", c->sm_path);
-    if (c->use_blend_tree) {
-        cJSON_AddBoolToObject(o, "useBlendTree", true);
-        cJSON_AddNumberToObject(o, "blendParam", c->blend_param);
-        cJSON *bts = cJSON_CreateArray();
-        for (int i = 0; i < 8; i++)
-            cJSON_AddItemToArray(bts, cJSON_CreateNumber(c->blend_thresholds[i]));
-        cJSON_AddItemToObject(o, "blendThresholds", bts);
-    }
-    if (c->auto_speed) cJSON_AddBoolToObject(o, "autoSpeed", true);
-    cJSON_AddNumberToObject(o, "speed", c->speed);
-    cJSON_AddBoolToObject(o, "loop", c->loop);
-    cJSON_AddBoolToObject(o, "playing", c->playing);
-    cJSON_AddNumberToObject(o, "activeClip", c->active_clip);
-    /* Defensive clamp: clip_count must be in [0, ARRAY_LEN]. Garbage
-     * here would walk into adjacent memory and crash cJSON_strdup. */
-    int cc = c->clip_count;
-    if (cc < 0) cc = 0;
-    if (cc > (int)(sizeof(c->clip_names) / sizeof(c->clip_names[0])))
-        cc = (int)(sizeof(c->clip_names) / sizeof(c->clip_names[0]));
-    if (cc > 0) {
-        cJSON *clips = cJSON_CreateArray();
-        for (int i = 0; i < cc; i++)
-            cJSON_AddItemToArray(clips, cJSON_CreateString(c->clip_names[i]));
-        cJSON_AddItemToObject(o, "clipNames", clips);
-    }
-    cJSON_AddItemToArray(arr, o);
-}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 static void ser_editor_meta(const JceEditorMeta *m, cJSON *arr)
 {
@@ -3715,6 +1328,126 @@ typedef struct {
     JceScene    *scene;
 } SerCtx;
 
+/* ── Uniform serialize wrappers (component-registry rows) ──────────
+ *
+ * One wrapper per serializing registry row, all sharing the uniform
+ * JceCompSerFn signature: fetch + null-check + call the existing
+ * ser_* with its original arguments.  Bodies are the old hard-coded
+ * chain entries, moved verbatim. */
+
+static void serw_transform(JceScene *s, JceEntity e, cJSON *arr)
+{
+    JceTransform *t = jce_scene_get_transform(s, e);
+    if (t) ser_transform(t, arr);
+}
+
+static void serw_pivot(JceScene *s, JceEntity e, cJSON *arr)
+{
+    JcePivotComponent *p = jce_scene_get_pivot(s, e);
+    if (p) ser_pivot(p, arr);
+}
+
+
+static void serw_camera(JceScene *s, JceEntity e, cJSON *arr)
+{
+    JceCameraComponent *c = jce_scene_get_camera(s, e);
+    if (c) ser_camera(c, arr);
+}
+
+
+
+
+
+
+
+
+
+static void serw_particle_emitter(JceScene *s, JceEntity e, cJSON *arr)
+{
+    JceParticleEmitterComponent *c = jce_scene_get_particle_emitter(s, e);
+    if (c) ser_particle_emitter(c, arr);
+}
+
+
+
+
+
+
+static void serw_video_player(JceScene *s, JceEntity e, cJSON *arr)
+{
+    JceVideoPlayerComponent *c = jce_scene_get_video_player(s, e);
+    if (c) ser_video_player(c, arr);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+static void serw_editor_meta(JceScene *s, JceEntity e, cJSON *arr)
+{
+    JceEditorMeta *m = jce_scene_get_editor_meta(s, e);
+    if (m) ser_editor_meta(m, arr);
+}
+
 /* Single source of truth for the per-component emit chain.
  *
  * Appends every present component of entity `e` to the `comps` array.
@@ -3726,348 +1459,17 @@ static void ser_entity_components(JceScene *s, JceEntity e, cJSON *comps)
 {
     if (!s || !comps) return;
 
-    uint64_t f = jce_scene_get_component_flags(s, e);
-
-    if (f & JCE_COMP_FLAG_TRANSFORM) {
-        JceTransform *t = jce_scene_get_transform(s, e);
-        if (t) ser_transform(t, comps);
-    }
-    if (f & JCE_COMP_FLAG_MESH_RENDERER) {
-        JceMeshRenderer *mr = jce_scene_get_mesh_renderer(s, e);
-        if (mr) ser_mesh_renderer(mr, comps);
-    }
-    if (f & JCE_COMP_FLAG_CAMERA) {
-        JceCameraComponent *c = jce_scene_get_camera(s, e);
-        if (c) ser_camera(c, comps);
-    }
-    /* Use unified Light format for all light types. */
-    if (f & (JCE_COMP_FLAG_DIR_LIGHT | JCE_COMP_FLAG_POINT_LIGHT |
-             JCE_COMP_FLAG_SPOT_LIGHT)) {
-        ser_light_unified(s, e, comps);
-    }
-    if (f & JCE_COMP_FLAG_SKYBOX) {
-        JceSkyboxComponent *c = jce_scene_get_skybox(s, e);
-        if (c) ser_skybox(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_SPRITE_RENDERER) {
-        JceSpriteRendererComponent *c = jce_scene_get_sprite_renderer(s, e);
-        if (c) ser_sprite_renderer(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_SPRITE_ANIMATOR) {
-        JceSpriteAnimatorComponent *c = jce_scene_get_sprite_animator(s, e);
-        if (c) ser_sprite_animator(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_ANIMATOR) {
-        JceAnimatorComponent *c = jce_scene_get_animator(s, e);
-        if (c) ser_animator(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_SKELETAL_ANIMATOR) {
-        JceSkeletalAnimatorComponent *c = jce_scene_get_skeletal_animator(s, e);
-        if (c) ser_skeletal_animator(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_RIGIDBODY) {
-        JceRigidBodyComponent *c = jce_scene_get_rigidbody(s, e);
-        if (c) ser_rigidbody(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_RIGIDBODY_2D) {
-        JceRigidBody2DComponent *c = jce_scene_get_rigidbody2d(s, e);
-        if (c) ser_rigidbody2d(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_PARTICLE_EMITTER) {
-        JceParticleEmitterComponent *c = jce_scene_get_particle_emitter(s, e);
-        if (c) ser_particle_emitter(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_BEHAVIOR_TREE) {
-        JceBehaviorTree *c = jce_scene_get_behavior_tree(s, e);
-        if (c) ser_behavior_tree(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_BOX_COLLIDER) {
-        JceBoxColliderComponent *c = jce_scene_get_box_collider(s, e);
-        if (c) ser_box_collider(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_SPHERE_COLLIDER) {
-        JceSphereColliderComponent *c = jce_scene_get_sphere_collider(s, e);
-        if (c) ser_sphere_collider(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_CHARACTER_CONTROLLER) {
-        JceCharacterControllerComponent *c = jce_scene_get_character_controller(s, e);
-        if (c) ser_character_controller(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_AUDIO_SOURCE) {
-        JceAudioSourceComponent *c = jce_scene_get_audio_source(s, e);
-        if (c) ser_audio_source(c, comps);
-    }
-    /* VideoPlayer has no JCE_COMP_FLAG_* bit (the 64-bit field is full);
-     * gate on presence like CompoundCollider. */
-    if (jce_scene_has_video_player(s, e)) {
-        JceVideoPlayerComponent *c = jce_scene_get_video_player(s, e);
-        if (c) ser_video_player(c, comps);
-    }
-    /* NavAgent likewise has no flag bit; gate on presence. */
-    if (jce_scene_has_nav_agent(s, e)) {
-        JceNavAgentComponent *c = jce_scene_get_nav_agent(s, e);
-        if (c) ser_nav_agent(c, comps);
-    }
-    /* IkConstraints likewise has no flag bit; gate on presence. */
-    if (jce_scene_has_ik_constraints(s, e)) {
-        JceIkConstraintComponent *c = jce_scene_get_ik_constraints(s, e);
-        if (c) ser_ik_constraints(c, comps);
-    }
-    /* SequencePlayer likewise has no flag bit; gate on presence. */
-    if (jce_scene_has_sequence_player(s, e)) {
-        JceSequencePlayerComponent *c = jce_scene_get_sequence_player(s, e);
-        if (c) ser_sequence_player(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_SCRIPT) {
-        JceScriptComponent *c = jce_scene_get_script(s, e);
-        if (c) ser_script(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_CONSTRAINT) {
-        JceConstraintComponent *c = jce_scene_get_constraint(s, e);
-        if (c) ser_constraint(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_TERRAIN) {
-        JceTerrainComponent *c = jce_scene_get_terrain(s, e);
-        if (c) ser_terrain(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_LOD_GROUP) {
-        JceLodGroupComponent *c = jce_scene_get_lod_group(s, e);
-        if (c) ser_lod_group(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_VIRTUAL_CAMERA) {
-        JceVirtualCameraComponent *c = jce_scene_get_virtual_camera(s, e);
-        if (c) ser_virtual_camera(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_TRIGGER_VOLUME) {
-        JceTriggerVolumeComponent *c = jce_scene_get_trigger_volume(s, e);
-        if (c) ser_trigger_volume(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_CAPSULE_COLLIDER) {
-        JceCapsuleColliderComponent *c = jce_scene_get_capsule_collider(s, e);
-        if (c) ser_capsule_collider(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_MESH_COLLIDER) {
-        JceMeshColliderComponent *c = jce_scene_get_mesh_collider(s, e);
-        if (c) ser_mesh_collider(c, comps);
-    }
-    if (jce_scene_has_compound_collider(s, e)) {
-        JceCompoundColliderComponent *c = jce_scene_get_compound_collider(s, e);
-        if (c) ser_compound_collider(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_COLLIDER_2D) {
-        JceCollider2DComponent *c = jce_scene_get_collider2d(s, e);
-        if (c) ser_collider2d(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_TRAIL_RENDERER) {
-        JceTrailRendererComponent *c = jce_scene_get_trail_renderer(s, e);
-        if (c) ser_trail_renderer(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_LINE_RENDERER) {
-        JceLineRendererComponent *c = jce_scene_get_line_renderer(s, e);
-        if (c) ser_line_renderer(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_REFLECTION_PROBE) {
-        JceReflectionProbeComponent *c = jce_scene_get_reflection_probe(s, e);
-        if (c) ser_reflection_probe(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_DECAL) {
-        JceDecalComponent *c = jce_scene_get_decal(s, e);
-        if (c) ser_decal(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_LIGHT_PROBE_GROUP) {
-        JceLightProbeGroupComponent *c = jce_scene_get_light_probe_group(s, e);
-        if (c) ser_light_probe_group(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_AUDIO_LISTENER) {
-        JceAudioListenerComponent *c = jce_scene_get_audio_listener(s, e);
-        if (c) ser_audio_listener(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_AUDIO_REVERB_ZONE) {
-        JceAudioReverbZoneComponent *c = jce_scene_get_audio_reverb_zone(s, e);
-        if (c) ser_audio_reverb_zone(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_AUDIO_OCCLUSION) {
-        JceAudioOcclusionComponent *c = jce_scene_get_audio_occlusion(s, e);
-        if (c) ser_audio_occlusion(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_SPAWN_MANAGER) {
-        JceSpawnManagerComponent *c = jce_scene_get_spawn_manager(s, e);
-        if (c) ser_spawn_manager(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_WEAPON) {
-        JceWeaponComponent *c = jce_scene_get_weapon(s, e);
-        if (c) ser_weapon(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_SAVE_POINT) {
-        JceSavePointComponent *c = jce_scene_get_save_point(s, e);
-        if (c) ser_save_point(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_WHEEL_COLLIDER) {
-        JceWheelColliderComponent *c = jce_scene_get_wheel_collider(s, e);
-        if (c) ser_wheel_collider(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_CONSTANT_FORCE) {
-        JceConstantForceComponent *c = jce_scene_get_constant_force(s, e);
-        if (c) ser_constant_force(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_CONFIGURABLE_JOINT) {
-        JceConfigurableJointComponent *c = jce_scene_get_configurable_joint(s, e);
-        if (c) ser_configurable_joint(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_CLOTH) {
-        JceClothComponent *c = jce_scene_get_cloth(s, e);
-        if (c) ser_cloth(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_JOINT_2D) {
-        JceJoint2DComponent *c = jce_scene_get_joint2d(s, e);
-        if (c) ser_joint2d(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_BILLBOARD_RENDERER) {
-        JceBillboardRendererComponent *c = jce_scene_get_billboard_renderer(s, e);
-        if (c) ser_billboard_renderer(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_CANVAS) {
-        JceCanvasComponent *c = jce_scene_get_canvas(s, e);
-        if (c) ser_canvas(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_CANVAS_GROUP) {
-        JceCanvasGroupComponent *c = jce_scene_get_canvas_group(s, e);
-        if (c) ser_canvas_group(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_LAYOUT_GROUP) {
-        JceLayoutGroupComponent *c = jce_scene_get_layout_group(s, e);
-        if (c) ser_layout_group(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_UI_IMAGE) {
-        JceUIImageComponent *c = jce_scene_get_ui_image(s, e);
-        if (c) ser_ui_image(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_UI_TEXT) {
-        JceUITextComponent *c = jce_scene_get_ui_text(s, e);
-        if (c) ser_ui_text(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_UI_BUTTON) {
-        JceUIButtonComponent *c = jce_scene_get_ui_button(s, e);
-        if (c) ser_ui_button(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_NETWORK_OBJECT) {
-        JceNetworkObjectComponent *n = jce_scene_get_network_object(s, e);
-        if (n) {
-            cJSON *o = cJSON_CreateObject();
-            cJSON_AddStringToObject(o, "type",    "NetworkObject");
-            cJSON_AddNumberToObject(o, "netId",   n->net_id);
-            cJSON_AddNumberToObject(o, "owner",   n->owner);
-            cJSON_AddNumberToObject(o, "flags",   n->flags);
-            cJSON_AddBoolToObject  (o, "isOwner", n->is_owner);
-            cJSON_AddItemToArray(comps, o);
-        }
-    }
-    if (f & JCE_COMP_FLAG_NET_TRANSFORM) {
-        JceNetTransformComponent *c = jce_scene_get_net_transform(s, e);
-        if (c) {
-            cJSON *o = cJSON_CreateObject();
-            cJSON_AddStringToObject(o, "type", "NetworkTransform");
-            cJSON *p = cJSON_CreateObject();
-            cJSON_AddNumberToObject(p, "syncRateHz",    c->sync_rate_hz);
-            cJSON_AddNumberToObject(p, "interpMs",      c->interp_ms);
-            cJSON_AddNumberToObject(p, "tolerance",     c->tolerance);
-            cJSON_AddNumberToObject(p, "authorityMode", c->authority_mode);
-            cJSON_AddItemToObject(o, "properties", p);
-            cJSON_AddItemToArray(comps, o);
-        }
-    }
-    if (f & JCE_COMP_FLAG_NET_ANIMATOR) {
-        JceNetAnimatorComponent *c = jce_scene_get_net_animator(s, e);
-        if (c) {
-            cJSON *o = cJSON_CreateObject();
-            cJSON_AddStringToObject(o, "type", "NetworkAnimator");
-            cJSON *p = cJSON_CreateObject();
-            cJSON_AddNumberToObject(p, "syncRateHz",    c->sync_rate_hz);
-            cJSON_AddNumberToObject(p, "interpMs",      c->interp_ms);
-            cJSON_AddNumberToObject(p, "authorityMode", c->authority_mode);
-            cJSON_AddItemToObject(o, "properties", p);
-            cJSON_AddItemToArray(comps, o);
-        }
-    }
-    if (f & JCE_COMP_FLAG_NET_RIGIDBODY) {
-        JceNetRigidbodyComponent *c = jce_scene_get_net_rigidbody(s, e);
-        if (c) {
-            cJSON *o = cJSON_CreateObject();
-            cJSON_AddStringToObject(o, "type", "NetworkRigidbody");
-            cJSON *p = cJSON_CreateObject();
-            cJSON_AddNumberToObject(p, "syncRateHz",    c->sync_rate_hz);
-            cJSON_AddNumberToObject(p, "interpMs",      c->interp_ms);
-            cJSON_AddNumberToObject(p, "tolerance",     c->tolerance);
-            cJSON_AddNumberToObject(p, "authorityMode", c->authority_mode);
-            cJSON_AddItemToObject(o, "properties", p);
-            cJSON_AddItemToArray(comps, o);
-        }
-    }
-    /* VfxGraph is intentionally NOT saved: the component was retired in the
-     * v0.9.9 consolidation (the loader migrates legacy instances onto
-     * ParticleEmitter, so the flag can never be set by a load). */
-    if (f & JCE_COMP_FLAG_TILEMAP) {
-        JceTilemapComponent *c = jce_scene_get_tilemap(s, e);
-        if (c) {
-            cJSON *o = cJSON_CreateObject();
-            cJSON_AddStringToObject(o, "type", "Tilemap");
-            cJSON *p = cJSON_CreateObject();
-            cJSON_AddStringToObject(p, "tilemapPath", c->tilemap_path);
-            cJSON_AddStringToObject(p, "spritesPath", c->sprites_path);
-            cJSON_AddNumberToObject(p, "cellSizePx",  c->cell_size_px);
-            cJSON_AddNumberToObject(p, "sortOrder",   c->sort_order);
-            cJSON_AddNumberToObject(p, "orientation", c->orientation);
-            cJSON_AddBoolToObject  (p, "visible",     c->visible);
-            cJSON_AddNumberToObject(p, "colorR",      c->color[0]);
-            cJSON_AddNumberToObject(p, "colorG",      c->color[1]);
-            cJSON_AddNumberToObject(p, "colorB",      c->color[2]);
-            cJSON_AddNumberToObject(p, "colorA",      c->color[3]);
-            cJSON_AddItemToObject(o, "properties", p);
-            cJSON_AddItemToArray(comps, o);
-        }
-    }
-    if (f & JCE_COMP_FLAG_TILEMAP_COLLIDER_2D) {
-        JceTilemapCollider2DComponent *c = jce_scene_get_tilemap_collider2d(s, e);
-        if (c) {
-            cJSON *o = cJSON_CreateObject();
-            cJSON_AddStringToObject(o, "type", "TilemapCollider2D");
-            cJSON *p = cJSON_CreateObject();
-            cJSON_AddBoolToObject  (p, "usedByComposite", c->used_by_composite);
-            cJSON_AddBoolToObject  (p, "trigger",         c->trigger);
-            cJSON_AddNumberToObject(p, "offsetX",         c->offset[0]);
-            cJSON_AddNumberToObject(p, "offsetY",         c->offset[1]);
-            cJSON_AddNumberToObject(p, "frictionX100",    c->friction_x100);
-            cJSON_AddNumberToObject(p, "bouncinessX100",  c->bounciness_x100);
-            cJSON_AddItemToObject(o, "properties", p);
-            cJSON_AddItemToArray(comps, o);
-        }
-    }
-    if (f & JCE_COMP_FLAG_AVATAR) {
-        JceAvatarComponent *c = jce_scene_get_avatar(s, e);
-        if (c) {
-            cJSON *o = cJSON_CreateObject();
-            cJSON_AddStringToObject(o, "type", "Avatar");
-            cJSON *p = cJSON_CreateObject();
-            cJSON_AddStringToObject(p, "avatarPath",         c->avatar_path);
-            cJSON_AddStringToObject(p, "maskPath",           c->mask_path);
-            cJSON_AddStringToObject(p, "overrideController", c->override_controller);
-            cJSON_AddBoolToObject  (p, "applyRootMotion",    c->apply_root_motion);
-            cJSON_AddBoolToObject  (p, "humanRig",           c->human_rig);
-            cJSON_AddItemToObject(o, "properties", p);
-            cJSON_AddItemToArray(comps, o);
-        }
-    }
-    if (f & JCE_COMP_FLAG_VOLUME) {
-        JceVolumeComponent *c = jce_scene_get_volume(s, e);
-        if (c) ser_volume(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_OCCLUSION_PORTAL) {
-        JceOcclusionPortalComponent *c = jce_scene_get_occlusion_portal(s, e);
-        if (c) ser_occlusion_portal(c, comps);
-    }
-    if (f & JCE_COMP_FLAG_EDITOR_META) {
-        JceEditorMeta *m = jce_scene_get_editor_meta(s, e);
-        if (m) ser_editor_meta(m, comps);
+    /* Registry-driven: rows were registered in the legacy chain order
+     * (Transform first), so the emitted component order — and thus the
+     * saved-file diff — matches the old hard-coded chain.  Rows with
+     * serialize == NULL (DirectionalLight/PointLight/SpotLight fold
+     * into the unified "Light" row, Tag/Layer are entity-level fields,
+     * the retired VfxGraph never re-saves) are skipped by design. */
+    const int n = jce_component_count();
+    for (int id = 0; id < n; id++) {
+        const JceComponentDesc *d = jce_component_desc(id);
+        if (!d->serialize || !d->has(s, e)) continue;
+        d->serialize(s, e, comps);
     }
 }
 
@@ -4094,6 +1496,23 @@ static void ser_entity_cb(JceScene *s, JceEntity e, void *ud)
             uint8_t lyr = jce_scene_get_entity_layer(s, e);
             if (lyr != 0)
                 cJSON_AddNumberToObject(eobj, "layer", (double)lyr);
+        }
+    }
+
+    /* Per-component enable toggles — written as an array of canonical
+     * component names currently disabled.  Replaces the legacy numeric
+     * JCE_COMP_FLAG_* mask (the 64-bit space is exhausted); the loader
+     * accepts both forms.  Omitted entirely when nothing is disabled. */
+    {
+        cJSON *dis = NULL;
+        const int n = jce_component_count();
+        for (int id = 0; id < n; id++) {
+            if (jce_scene_comp_enabled(s, e, id)) continue;
+            if (!dis)
+                dis = cJSON_AddArrayToObject(eobj, "disabledComponents");
+            if (!dis) break;
+            cJSON_AddItemToArray(dis,
+                cJSON_CreateString(jce_component_name(id)));
         }
     }
 
@@ -4240,115 +1659,92 @@ static void count_existing_entity_cb(JceScene *scene, JceEntity e, void *ud)
         (*count)++;
 }
 
-int jce_scene_load_json(JceScene *scene, const cJSON *root)
+/* Create one entity from its JSON object and parse its components/meta into
+ * map[*loaded] (the first-pass body, extracted so the one-shot and streaming
+ * loaders run byte-identical work).  Advances *loaded on success. */
+static void load_one_entity(JceScene *scene, const cJSON *eobj,
+                            EntityRemap *map, int *loaded)
 {
-    if (!scene || !root) return -1;
+    if (!cJSON_IsObject(eobj)) return;
 
-    const cJSON *entities = resolve_entities(root);
-    if (!entities) {
-        LOG_WARN(LOG_TAG, "scene JSON has no 'entities' array");
-        return -1;
-    }
+    const cJSON *name_item = cJSON_GetObjectItemCaseSensitive(eobj, "name");
+    const char *name = (cJSON_IsString(name_item) && name_item->valuestring)
+                     ? name_item->valuestring
+                     : "";
+    JceEntity new_e = jce_scene_create_entity(
+        scene,
+        is_legacy_unnamed_entity_name(name) ? NULL : name);
+    if (new_e == JCE_ENTITY_INVALID) return;
 
-    uint32_t existing_entities = 0;
-    jce_scene_each_entity(scene, count_existing_entity_cb,
-                          &existing_entities);
-    if (!parse_scene_rendering_settings(scene, root) &&
-        existing_entities == 0)
-        jce_scene_clear_rendering_settings(scene);
+    int idx = *loaded;
+    map[idx].src_id = (JceEntity)j_num(eobj, "id", 0.0);
+    map[idx].new_id = new_e;
+    /* Accept both "parent_id" and "parentId". */
+    map[idx].parent_src = (JceEntity)j_num2(eobj, "parent_id", "parentId", 0.0);
+    (*loaded)++;
 
-    /* Same presence gate for the streaming block: absent on a fresh load →
-     * clear; absent on an additive load → keep the main scene's settings. */
-    if (!parse_scene_streaming_settings(scene, root) &&
-        existing_entities == 0)
-        jce_scene_clear_streaming_settings(scene);
-
-    int total = cJSON_GetArraySize(entities);
-    if (total <= 0) return 0;
-
-    /* Pre-allocate remap table to resolve parent_id references after creation. */
-    EntityRemap *map = (EntityRemap *)JCE_CALLOC((size_t)total, sizeof(EntityRemap));
-    if (!map) return -1;
-
-    int loaded = 0;
-    matcache_begin();   /* dedup shared .mat.json reads across this scene load */
-
-    /* First pass: create entities and parse components. */
-    for (int i = 0; i < total; i++) {
-        const cJSON *eobj = cJSON_GetArrayItem(entities, i);
-        if (!cJSON_IsObject(eobj)) continue;
-
-        const cJSON *name_item = cJSON_GetObjectItemCaseSensitive(eobj, "name");
-        const char *name = (cJSON_IsString(name_item) && name_item->valuestring)
-                         ? name_item->valuestring
-                         : "";
-        JceEntity new_e = jce_scene_create_entity(
-            scene,
-            is_legacy_unnamed_entity_name(name) ? NULL : name);
-        if (new_e == JCE_ENTITY_INVALID) continue;
-
-        map[loaded].src_id = (JceEntity)j_num(eobj, "id", 0.0);
-        map[loaded].new_id = new_e;
-        /* Accept both "parent_id" and "parentId". */
-        map[loaded].parent_src = (JceEntity)j_num2(eobj, "parent_id", "parentId", 0.0);
-        loaded++;
-
-        /* Apply entity-level EditorMeta fields (enabled, tag, tagColor, etc.).
-         * Always create EditorMeta with the entity name so the editor can see
-         * hand-authored scenes that omit these optional fields. */
-        {
-            const cJSON *it_enabled = cJSON_GetObjectItemCaseSensitive(eobj, "enabled");
-            const cJSON *it_tag     = cJSON_GetObjectItemCaseSensitive(eobj, "tag");
-            const cJSON *it_tc      = cJSON_GetObjectItemCaseSensitive(eobj, "tagColor");
-            const cJSON *it_pi      = cJSON_GetObjectItemCaseSensitive(eobj, "prefabInstance");
-            const cJSON *it_pp      = cJSON_GetObjectItemCaseSensitive(eobj, "prefabPath");
-            const cJSON *it_layer   = cJSON_GetObjectItemCaseSensitive(eobj, "layer");
-            JceEditorMeta *m = jce_scene_get_editor_meta(scene, new_e);
-            if (!m) {
-                JceEditorMeta fresh;
-                memset(&fresh, 0, sizeof(fresh));
-                copy_str(fresh.name, sizeof(fresh.name),
-                         is_legacy_unnamed_entity_name(name) ? "Entity" : name);
-                fresh.enabled = true;
-                jce_scene_set_editor_meta(scene, new_e, &fresh);
-                m = jce_scene_get_editor_meta(scene, new_e);
-            }
-            if (m) {
-                if (it_enabled) m->enabled = j_bool_it(it_enabled, true);
-                if (it_tag) copy_str(m->tag, sizeof(m->tag), j_str_it(it_tag, ""));
-                if (it_tc) m->tag_color = (uint8_t)j_num_it(it_tc, 0);
-                if (it_pi) m->prefab_instance = j_bool_it(it_pi, false);
-                if (it_pp) copy_str(m->prefab_path, sizeof(m->prefab_path),
-                                    j_str_it(it_pp, ""));
-            }
-            /* P4-A.4 — mirror tag/layer into engine ECS components. */
-            if (it_tag) {
-                const char *tn = j_str_it(it_tag, "");
-                if (tn && *tn)
-                    jce_scene_set_entity_tag_name(scene, new_e, tn);
-            }
-            if (it_layer) {
-                int lyr = (int)j_num_it(it_layer, 0);
-                if (lyr < 0) lyr = 0;
-                if (lyr > 31) lyr = 31;
-                jce_scene_set_entity_layer(scene, new_e, (uint8_t)lyr);
-            }
+    /* Apply entity-level EditorMeta fields (enabled, tag, tagColor, etc.).
+     * Always create EditorMeta with the entity name so the editor can see
+     * hand-authored scenes that omit these optional fields. */
+    {
+        const cJSON *it_enabled = cJSON_GetObjectItemCaseSensitive(eobj, "enabled");
+        const cJSON *it_tag     = cJSON_GetObjectItemCaseSensitive(eobj, "tag");
+        const cJSON *it_tc      = cJSON_GetObjectItemCaseSensitive(eobj, "tagColor");
+        const cJSON *it_pi      = cJSON_GetObjectItemCaseSensitive(eobj, "prefabInstance");
+        const cJSON *it_pp      = cJSON_GetObjectItemCaseSensitive(eobj, "prefabPath");
+        const cJSON *it_layer   = cJSON_GetObjectItemCaseSensitive(eobj, "layer");
+        JceEditorMeta *m = jce_scene_get_editor_meta(scene, new_e);
+        if (!m) {
+            JceEditorMeta fresh;
+            memset(&fresh, 0, sizeof(fresh));
+            copy_str(fresh.name, sizeof(fresh.name),
+                     is_legacy_unnamed_entity_name(name) ? "Entity" : name);
+            fresh.enabled = true;
+            jce_scene_set_editor_meta(scene, new_e, &fresh);
+            m = jce_scene_get_editor_meta(scene, new_e);
         }
-
-        const cJSON *comps = cJSON_GetObjectItemCaseSensitive(eobj, "components");
-        if (!comps) comps = cJSON_GetObjectItemCaseSensitive(eobj, "component");
-        if (cJSON_IsArray(comps)) {
-            int cn = cJSON_GetArraySize(comps);
-            for (int k = 0; k < cn; k++) {
-                const cJSON *c = cJSON_GetArrayItem(comps, k);
-                if (cJSON_IsObject(c))
-                    parse_one_component(scene, new_e, c);
-            }
+        if (m) {
+            if (it_enabled) m->enabled = j_bool_it(it_enabled, true);
+            if (it_tag) copy_str(m->tag, sizeof(m->tag), j_str_it(it_tag, ""));
+            if (it_tc) m->tag_color = (uint8_t)j_num_it(it_tc, 0);
+            if (it_pi) m->prefab_instance = j_bool_it(it_pi, false);
+            if (it_pp) copy_str(m->prefab_path, sizeof(m->prefab_path),
+                                j_str_it(it_pp, ""));
+        }
+        /* P4-A.4 — mirror tag/layer into engine ECS components. */
+        if (it_tag) {
+            const char *tn = j_str_it(it_tag, "");
+            if (tn && *tn)
+                jce_scene_set_entity_tag_name(scene, new_e, tn);
+        }
+        if (it_layer) {
+            int lyr = (int)j_num_it(it_layer, 0);
+            if (lyr < 0) lyr = 0;
+            if (lyr > 31) lyr = 31;
+            jce_scene_set_entity_layer(scene, new_e, (uint8_t)lyr);
         }
     }
 
-    /* Second pass: fix up parent references via a src_id -> new_id hash, instead
-       of an O(n^2) nested scan (matters once scenes reach hundreds of entities).
+    const cJSON *comps = cJSON_GetObjectItemCaseSensitive(eobj, "components");
+    if (!comps) comps = cJSON_GetObjectItemCaseSensitive(eobj, "component");
+    if (cJSON_IsArray(comps)) {
+        for (const cJSON *c = comps->child; c; c = c->next) {
+            if (cJSON_IsObject(c))
+                parse_one_component(scene, new_e, c);
+        }
+    }
+
+    /* Per-component enable toggles (canonical-name array, or the
+     * legacy numeric mask) — applied after the components exist. */
+    parse_disabled_components(scene, new_e, eobj);
+}
+
+/* Second-pass parent + cross-entity reference fixups over the [0,loaded)
+ * remap table (extracted so the one-shot and streaming loaders share it). */
+static void load_fixup_refs(JceScene *scene, EntityRemap *map, int loaded)
+{
+    /* Fix up parent references via a src_id -> new_id hash, instead of an
+       O(n^2) nested scan (matters once scenes reach hundreds of entities).
        src_id 0 = "no id" and parent_src 0 = "no parent", so 0 is a safe empty
        slot — those entities are never valid parent targets. */
     {
@@ -4394,13 +1790,13 @@ int jce_scene_load_json(JceScene *scene, const cJSON *root)
         }
     }
 
-    /* Second pass (entity refs): IkConstraints carry target/pole ENTITY ids
-     * authored against the SOURCE scene's ids.  Patch them through the same
-     * src_id -> new_id mapping so the references survive reload / prefab
-     * instantiation.  Unresolvable refs are cleared (0 = none) instead of
-     * left dangling at an id that may now belong to an unrelated entity.
-     * Linear lookup is fine here: only entities that actually carry the
-     * component are visited, with at most 16 refs x2 each. */
+    /* Entity refs: IkConstraints carry target/pole ENTITY ids authored against
+     * the SOURCE scene's ids.  Patch them through the same src_id -> new_id
+     * mapping so the references survive reload / prefab instantiation.
+     * Unresolvable refs are cleared (0 = none) instead of left dangling at an
+     * id that may now belong to an unrelated entity.  Linear lookup is fine
+     * here: only entities that actually carry the component are visited, with
+     * at most 16 refs x2 each. */
     for (int i = 0; i < loaded; i++) {
         JceIkConstraintComponent *ik =
             jce_scene_get_ik_constraints(scene, map[i].new_id);
@@ -4427,11 +1823,11 @@ int jce_scene_load_json(JceScene *scene, const cJSON *root)
         }
     }
 
-    /* Second pass (entity refs): SequencePlayer bindings[] carry per-track
-     * entity ids authored against the SOURCE scene's ids.  Patch them
-     * through the same src_id -> new_id mapping (mirrors the IkConstraints
-     * pass above).  Unresolvable refs become 0 (= unbound; the runtime then
-     * falls back to the track's bindEntityName). */
+    /* Entity refs: SequencePlayer bindings[] carry per-track entity ids
+     * authored against the SOURCE scene's ids.  Patch them through the same
+     * src_id -> new_id mapping (mirrors the IkConstraints pass above).
+     * Unresolvable refs become 0 (= unbound; the runtime then falls back to
+     * the track's bindEntityName). */
     for (int i = 0; i < loaded; i++) {
         JceSequencePlayerComponent *sp =
             jce_scene_get_sequence_player(scene, map[i].new_id);
@@ -4453,9 +1849,206 @@ int jce_scene_load_json(JceScene *scene, const cJSON *root)
         }
     }
 
+    /* Entity refs: single-ref cross-entity fields on Constraint, VirtualCamera
+     * (follow/look-at), ConfigurableJoint, Joint2D, and NavAgent are authored
+     * against SOURCE ids; patch them through the same map so they survive
+     * reload / prefab instantiation (mirrors the IkConstraints / SequencePlayer
+     * passes).  Unresolvable refs clear to 0 (= none/world). */
+    for (int i = 0; i < loaded; i++) {
+        JceEntity e = map[i].new_id;
+
+        /* uint64 refs share one resolve loop. */
+        uint64_t *refs64[5];
+        int n64 = 0;
+        JceVirtualCameraComponent *vc = jce_scene_get_virtual_camera(scene, e);
+        if (vc) { refs64[n64++] = &vc->follow_target;
+                  refs64[n64++] = &vc->look_at_target; }
+        JceConfigurableJointComponent *cj = jce_scene_get_configurable_joint(scene, e);
+        if (cj) refs64[n64++] = &cj->connected_body;
+        JceJoint2DComponent *j2 = jce_scene_get_joint2d(scene, e);
+        if (j2) refs64[n64++] = &j2->connected_body;
+        JceNavAgentComponent *na = jce_scene_get_nav_agent(scene, e);
+        if (na) refs64[n64++] = &na->target_entity;
+        for (int r = 0; r < n64; r++) {
+            uint64_t src = *refs64[r];
+            if (src == 0) continue;
+            uint64_t resolved = 0;
+            for (int j = 0; j < loaded; j++)
+                if (map[j].src_id == (JceEntity)src) {
+                    resolved = (uint64_t)map[j].new_id; break;
+                }
+            *refs64[r] = resolved;
+        }
+
+        /* Constraint.target_entity is uint32. */
+        JceConstraintComponent *cn = jce_scene_get_constraint(scene, e);
+        if (cn && cn->target_entity != 0) {
+            uint32_t src = cn->target_entity, resolved = 0;
+            for (int j = 0; j < loaded; j++)
+                if (map[j].src_id == (JceEntity)src) {
+                    resolved = (uint32_t)map[j].new_id; break;
+                }
+            cn->target_entity = resolved;
+        }
+    }
+}
+
+/* ── Incremental scene load (frame-sliced) ────────────────────────────
+ *
+ * The streaming loader IS the one-shot loader, split at the per-entity
+ * boundary: begin() does the scene-level settings + cursor/remap setup and
+ * opens the material cache; step() runs load_one_entity() for the next chunk
+ * of entities; finalize() runs load_fixup_refs(), closes the material cache,
+ * and frees the stream.  jce_scene_load_json() below is begin + step(all) +
+ * finalize, so both paths produce a byte-identical scene. */
+struct JceSceneLoadStream {
+    JceScene    *scene;
+    const cJSON *entities;   /* borrowed from the caller's root */
+    const cJSON *cursor;     /* next entity object to process   */
+    EntityRemap *map;        /* total-sized remap table         */
+    int          total;      /* number of array elements        */
+    int          seen;       /* array elements visited (incl. skipped) */
+    int          loaded;     /* entities actually created       */
+};
+
+JceSceneLoadStream *jce_scene_load_stream_begin(JceScene *scene,
+                                                const cJSON *root,
+                                                int *out_total)
+{
+    if (out_total) *out_total = 0;
+    if (!scene || !root) return NULL;
+
+    const cJSON *entities = resolve_entities(root);
+    if (!entities) {
+        LOG_WARN(LOG_TAG, "scene JSON has no 'entities' array");
+        return NULL;
+    }
+
+    uint32_t existing_entities = 0;
+    jce_scene_each_entity(scene, count_existing_entity_cb,
+                          &existing_entities);
+    if (!parse_scene_rendering_settings(scene, root) &&
+        existing_entities == 0)
+        jce_scene_clear_rendering_settings(scene);
+
+    /* Same presence gate for the streaming block: absent on a fresh load →
+     * clear; absent on an additive load → keep the main scene's settings. */
+    if (!parse_scene_streaming_settings(scene, root) &&
+        existing_entities == 0)
+        jce_scene_clear_streaming_settings(scene);
+
+    int total = cJSON_GetArraySize(entities);
+    if (total < 0) total = 0;
+
+    JceSceneLoadStream *st =
+        (JceSceneLoadStream *)JCE_CALLOC(1, sizeof(JceSceneLoadStream));
+    if (!st) return NULL;
+    st->scene    = scene;
+    st->entities = entities;
+    st->cursor   = entities->child;
+    st->total    = total;
+    st->seen     = 0;
+    st->loaded   = 0;
+    /* Remap table sized to the total; tolerate an empty array (no entities). */
+    if (total > 0) {
+        st->map = (EntityRemap *)JCE_CALLOC((size_t)total, sizeof(EntityRemap));
+        if (!st->map) { JCE_FREE(st); return NULL; }
+    }
+
+    matcache_begin();   /* dedup shared .mat.json reads across this scene load */
+
+    if (out_total) *out_total = total;
+    return st;
+}
+
+int jce_scene_load_stream_step(JceSceneLoadStream *st, int max_entities)
+{
+    if (!st) return 0;
+    int budget = (max_entities > 0) ? max_entities : st->total;
+    int done_this_call = 0;
+    while (st->cursor && (max_entities <= 0 || done_this_call < budget)) {
+        const cJSON *eobj = st->cursor;
+        st->cursor = st->cursor->next;
+        st->seen++;
+        if (st->map)
+            load_one_entity(st->scene, eobj, st->map, &st->loaded);
+        done_this_call++;
+    }
+    return st->loaded;
+}
+
+bool jce_scene_load_stream_done(const JceSceneLoadStream *st)
+{
+    return !st || st->cursor == NULL;
+}
+
+int jce_scene_load_stream_processed(const JceSceneLoadStream *st)
+{
+    return st ? st->seen : 0;
+}
+
+int jce_scene_load_stream_total(const JceSceneLoadStream *st)
+{
+    return st ? st->total : 0;
+}
+
+uint32_t jce_scene_load_stream_new_entities(const JceSceneLoadStream *st,
+                                            JceEntity *out_ids, uint32_t cap)
+{
+    /* The remap table already records every entity created so far in
+     * map[0..loaded), map[i].new_id, in creation order.  Copy that roster
+     * into the caller's buffer so a streaming host gets its per-chunk entity
+     * list in O(new) instead of an O(N^2) whole-scene snapshot diff.  Pass
+     * out_ids=NULL (or a too-small cap) to query the count first, then call
+     * again with a buffer of at least the returned size.  Valid until
+     * finalize() frees the stream.
+     *
+     * EntityRemap is { src_id, new_id, parent_src } — not a flat JceEntity
+     * array — so we copy new_id per element rather than hand back a view. */
+    uint32_t n = (st && st->loaded > 0 && st->map) ? (uint32_t)st->loaded : 0;
+    if (out_ids && cap > 0) {
+        uint32_t m = (n < cap) ? n : cap;
+        for (uint32_t i = 0; i < m; ++i) out_ids[i] = st->map[i].new_id;
+    }
+    return n;
+}
+
+int jce_scene_load_stream_finalize(JceSceneLoadStream *st)
+{
+    if (!st) return -1;
+    /* Drain any entities not yet stepped so finalize is always safe to call. */
+    while (st->cursor) {
+        const cJSON *eobj = st->cursor;
+        st->cursor = st->cursor->next;
+        st->seen++;
+        if (st->map)
+            load_one_entity(st->scene, eobj, st->map, &st->loaded);
+    }
+    if (st->map)
+        load_fixup_refs(st->scene, st->map, st->loaded);
     matcache_end();
-    JCE_FREE(map);
+    int loaded = st->loaded;
+    JCE_FREE(st->map);
+    JCE_FREE(st);
     return loaded;
+}
+
+int jce_scene_load_json(JceScene *scene, const cJSON *root)
+{
+    if (!scene || !root) return -1;
+
+    int total = 0;
+    JceSceneLoadStream *st = jce_scene_load_stream_begin(scene, root, &total);
+    if (!st) {
+        /* begin() returns NULL for: bad args / no entity array (→ -1) or an
+         * OOM on the remap table (→ -1, the original map-alloc-fail contract).
+         * A valid-but-empty entity array still yields a stream, so reaching
+         * here always means a hard failure. */
+        return -1;
+    }
+
+    jce_scene_load_stream_step(st, /*all=*/0);
+    return jce_scene_load_stream_finalize(st);
 }
 
 void jce_scene_parse_entity_json(JceScene *scene, JceEntity e,
@@ -4519,6 +2112,10 @@ void jce_scene_parse_entity_json(JceScene *scene, JceEntity e,
                 parse_one_component(scene, e, c);
         }
     }
+
+    /* Per-component enable toggles (canonical-name array, or the legacy
+     * numeric mask) — applied after the components exist. */
+    parse_disabled_components(scene, e, entity_obj);
 }
 
 cJSON *jce_scene_serialize_entity_components(JceScene *scene, JceEntity e)
@@ -4536,3 +2133,710 @@ cJSON *jce_scene_serialize_entity_components(JceScene *scene, JceEntity e)
     return arr;
 }
 
+/* ── Component registry registration (the single site) ─────────────
+ *
+ * Every engine component gets a registry row: canonical JSON "type"
+ * name, accepted alias spellings (from the old parse_one_component
+ * strcmp chain), the legacy JCE_COMP_FLAG_* bit (0 for post-64 rows),
+ * presence/removal accessors, and the parse/serialize hooks driven by
+ * parse_one_component() / ser_entity_components(). */
+
+/* has/remove adapters for the synthetic unified-"Light" row: the JSON
+ * format stores ONE "Light" object while the ECS keeps three distinct
+ * light components.  DirectionalLight/PointLight/SpotLight also keep
+ * their own rows (serialize == NULL) so their legacy flag bits and
+ * per-type enable toggles stay addressable. */
+static bool reg_has_light_any(const JceScene *s, JceEntity e)
+{
+    return jce_scene_has_dir_light(s, e)
+        || jce_scene_has_point_light(s, e)
+        || jce_scene_has_spot_light(s, e);
+}
+
+static void reg_remove_light_any(JceScene *s, JceEntity e)
+{
+    if (jce_scene_has_dir_light(s, e))   jce_scene_remove_dir_light(s, e);
+    if (jce_scene_has_point_light(s, e)) jce_scene_remove_point_light(s, e);
+    if (jce_scene_has_spot_light(s, e))  jce_scene_remove_spot_light(s, e);
+}
+
+/* Type-erased get/set adapters over the public per-type accessors.
+ * jce_scene_get_x returns T* and jce_scene_set_x takes const T*; the
+ * registry stores void*-shaped signatures, so generate strictly-
+ * conforming thin wrapper functions (casting the function pointers
+ * themselves would be undefined behavior, even though the pointer
+ * representations match on every supported ABI). */
+#define REG_ACCESSORS(SUFFIX, T)                                            \
+    static void *reg_get_##SUFFIX(JceScene *s, JceEntity e)                 \
+    {                                                                       \
+        return (void *)jce_scene_get_##SUFFIX(s, e);                        \
+    }                                                                       \
+    static void reg_set_##SUFFIX(JceScene *s, JceEntity e, const void *d)   \
+    {                                                                       \
+        jce_scene_set_##SUFFIX(s, e, (const T *)d);                         \
+    }
+
+REG_ACCESSORS(transform, JceTransform)
+REG_ACCESSORS(pivot, JcePivotComponent)
+REG_ACCESSORS(mesh_renderer, JceMeshRenderer)
+REG_ACCESSORS(camera, JceCameraComponent)
+REG_ACCESSORS(dir_light, JceDirectionalLight)
+REG_ACCESSORS(point_light, JcePointLight)
+REG_ACCESSORS(spot_light, JceSpotLight)
+REG_ACCESSORS(skybox, JceSkyboxComponent)
+REG_ACCESSORS(sprite_renderer, JceSpriteRendererComponent)
+REG_ACCESSORS(sprite_animator, JceSpriteAnimatorComponent)
+REG_ACCESSORS(animator, JceAnimatorComponent)
+REG_ACCESSORS(skeletal_animator, JceSkeletalAnimatorComponent)
+REG_ACCESSORS(rigidbody, JceRigidBodyComponent)
+REG_ACCESSORS(rigidbody2d, JceRigidBody2DComponent)
+REG_ACCESSORS(particle_emitter, JceParticleEmitterComponent)
+REG_ACCESSORS(behavior_tree, JceBehaviorTree)
+REG_ACCESSORS(box_collider, JceBoxColliderComponent)
+REG_ACCESSORS(sphere_collider, JceSphereColliderComponent)
+REG_ACCESSORS(character_controller, JceCharacterControllerComponent)
+REG_ACCESSORS(audio_source, JceAudioSourceComponent)
+REG_ACCESSORS(music_track, JceMusicTrackComponent)
+REG_ACCESSORS(video_player, JceVideoPlayerComponent)
+REG_ACCESSORS(nav_agent, JceNavAgentComponent)
+REG_ACCESSORS(ik_constraints, JceIkConstraintComponent)
+REG_ACCESSORS(foot_ik, JceFootIkComponent)
+REG_ACCESSORS(full_body_ik, JceFullBodyIkComponent)
+REG_ACCESSORS(sequence_player, JceSequencePlayerComponent)
+REG_ACCESSORS(morph_weights, JceMorphWeightsComponent)
+REG_ACCESSORS(ragdoll, JceRagdollComponent)
+REG_ACCESSORS(fracture, JceFractureComponent)
+REG_ACCESSORS(vehicle, JceVehicleComponent)
+REG_ACCESSORS(soft_body, JceSoftBodyComponent)
+REG_ACCESSORS(network_variable, JceNetworkVariableComponent)
+REG_ACCESSORS(gas, JceGameplayAbilitySystemComponent)
+REG_ACCESSORS(script, JceScriptComponent)
+REG_ACCESSORS(constraint, JceConstraintComponent)
+REG_ACCESSORS(terrain, JceTerrainComponent)
+REG_ACCESSORS(vegetation_scatter, JceVegetationScatterComponent)
+REG_ACCESSORS(water, JceWaterComponent)
+REG_ACCESSORS(buoyancy, JceBuoyancyComponent)
+REG_ACCESSORS(lod_group, JceLodGroupComponent)
+REG_ACCESSORS(virtual_camera, JceVirtualCameraComponent)
+REG_ACCESSORS(trigger_volume, JceTriggerVolumeComponent)
+REG_ACCESSORS(capsule_collider, JceCapsuleColliderComponent)
+REG_ACCESSORS(mesh_collider, JceMeshColliderComponent)
+REG_ACCESSORS(compound_collider, JceCompoundColliderComponent)
+REG_ACCESSORS(collider2d, JceCollider2DComponent)
+REG_ACCESSORS(trail_renderer, JceTrailRendererComponent)
+REG_ACCESSORS(line_renderer, JceLineRendererComponent)
+REG_ACCESSORS(reflection_probe, JceReflectionProbeComponent)
+REG_ACCESSORS(decal, JceDecalComponent)
+REG_ACCESSORS(light_probe_group, JceLightProbeGroupComponent)
+REG_ACCESSORS(audio_listener, JceAudioListenerComponent)
+REG_ACCESSORS(audio_reverb_zone, JceAudioReverbZoneComponent)
+REG_ACCESSORS(audio_occlusion, JceAudioOcclusionComponent)
+REG_ACCESSORS(spawn_manager, JceSpawnManagerComponent)
+REG_ACCESSORS(weapon, JceWeaponComponent)
+REG_ACCESSORS(save_point, JceSavePointComponent)
+REG_ACCESSORS(wheel_collider, JceWheelColliderComponent)
+REG_ACCESSORS(constant_force, JceConstantForceComponent)
+REG_ACCESSORS(configurable_joint, JceConfigurableJointComponent)
+REG_ACCESSORS(cloth, JceClothComponent)
+REG_ACCESSORS(joint2d, JceJoint2DComponent)
+REG_ACCESSORS(billboard_renderer, JceBillboardRendererComponent)
+REG_ACCESSORS(canvas, JceCanvasComponent)
+REG_ACCESSORS(canvas_group, JceCanvasGroupComponent)
+REG_ACCESSORS(layout_group, JceLayoutGroupComponent)
+REG_ACCESSORS(ui_image, JceUIImageComponent)
+REG_ACCESSORS(ui_text, JceUITextComponent)
+REG_ACCESSORS(ui_button, JceUIButtonComponent)
+REG_ACCESSORS(ui_slider, JceUISliderComponent)
+REG_ACCESSORS(ui_toggle, JceUIToggleComponent)
+REG_ACCESSORS(ui_input_field, JceUIInputFieldComponent)
+REG_ACCESSORS(ui_scroll_view, JceUIScrollViewComponent)
+REG_ACCESSORS(ui_progress_bar, JceUIProgressBarComponent)
+REG_ACCESSORS(ui_dropdown, JceUIDropdownComponent)
+REG_ACCESSORS(network_object, JceNetworkObjectComponent)
+REG_ACCESSORS(net_transform, JceNetTransformComponent)
+REG_ACCESSORS(net_animator, JceNetAnimatorComponent)
+REG_ACCESSORS(net_rigidbody, JceNetRigidbodyComponent)
+REG_ACCESSORS(tilemap, JceTilemapComponent)
+REG_ACCESSORS(tilemap_collider2d, JceTilemapCollider2DComponent)
+REG_ACCESSORS(avatar, JceAvatarComponent)
+REG_ACCESSORS(volume, JceVolumeComponent)
+REG_ACCESSORS(occlusion_portal, JceOcclusionPortalComponent)
+REG_ACCESSORS(editor_meta, JceEditorMeta)
+
+#undef REG_ACCESSORS
+
+void jce_scene_components_register_all(void)
+{
+    static bool done = false;
+    if (done) return;
+    done = true;
+
+    /* Registration order == the old serializer-chain order (Transform
+     * first): ser_entity_components() walks rows in id order, so this
+     * keeps saved-scene output byte-identical to the legacy chain. */
+#define REG(NAME, A0, A1, A2, FLAG, HAS, REMOVE, PARSE, SER,                \
+            GET, SET, SIZE)                                                 \
+    do {                                                                    \
+        JceComponentDesc reg_d = {                                          \
+            NAME, { A0, A1, A2, NULL }, FLAG, HAS, REMOVE, PARSE, SER,      \
+            GET, SET, (uint32_t)(SIZE)                                      \
+        };                                                                  \
+        jce_component_register(&reg_d);                                     \
+    } while (0)
+
+    REG("Transform", "transform", NULL, NULL,
+        JCE_COMP_FLAG_TRANSFORM,
+        jce_scene_has_transform, jce_scene_remove_transform,
+        parse_transform, serw_transform,
+        reg_get_transform, reg_set_transform, sizeof(JceTransform));
+
+    REG("Pivot", "pivot", "ObjectPivot", "object_pivot",
+        0,
+        jce_scene_has_pivot, jce_scene_remove_pivot,
+        parse_pivot, serw_pivot,
+        reg_get_pivot, reg_set_pivot, sizeof(JcePivotComponent));
+
+    REG("MeshRenderer", "meshRenderer", "Mesh Renderer", "mesh_renderer",
+        JCE_COMP_FLAG_MESH_RENDERER,
+        jce_scene_has_mesh_renderer, jce_scene_remove_mesh_renderer,
+        parse_mesh_renderer, serw_mesh_renderer,
+        reg_get_mesh_renderer, reg_set_mesh_renderer, sizeof(JceMeshRenderer));
+
+    REG("Camera", "camera", NULL, NULL,
+        JCE_COMP_FLAG_CAMERA,
+        jce_scene_has_camera, jce_scene_remove_camera,
+        parse_camera, serw_camera,
+        reg_get_camera, reg_set_camera, sizeof(JceCameraComponent));
+
+    /* Unified "Light" row: serializes ONCE for any light component.
+     * The three concrete rows below keep their legacy flag bits but
+     * serialize NULL (they fold into the unified row). */
+    REG("Light", "light", NULL, NULL,
+        0,
+        reg_has_light_any, reg_remove_light_any,
+        parse_unified_light, serw_light_unified,
+        NULL, NULL, 0);
+
+    REG("DirectionalLight", NULL, NULL, NULL,
+        JCE_COMP_FLAG_DIR_LIGHT,
+        jce_scene_has_dir_light, jce_scene_remove_dir_light,
+        parse_dir_light, NULL,
+        reg_get_dir_light, reg_set_dir_light, sizeof(JceDirectionalLight));
+
+    REG("PointLight", NULL, NULL, NULL,
+        JCE_COMP_FLAG_POINT_LIGHT,
+        jce_scene_has_point_light, jce_scene_remove_point_light,
+        parse_point_light, NULL,
+        reg_get_point_light, reg_set_point_light, sizeof(JcePointLight));
+
+    REG("SpotLight", NULL, NULL, NULL,
+        JCE_COMP_FLAG_SPOT_LIGHT,
+        jce_scene_has_spot_light, jce_scene_remove_spot_light,
+        parse_spot_light, NULL,
+        reg_get_spot_light, reg_set_spot_light, sizeof(JceSpotLight));
+
+    REG("Skybox", "skybox", NULL, NULL,
+        JCE_COMP_FLAG_SKYBOX,
+        jce_scene_has_skybox, jce_scene_remove_skybox,
+        parse_skybox, serw_skybox,
+        reg_get_skybox, reg_set_skybox, sizeof(JceSkyboxComponent));
+
+    REG("SpriteRenderer", "spriteRenderer", "Sprite Renderer", "sprite_renderer",
+        JCE_COMP_FLAG_SPRITE_RENDERER,
+        jce_scene_has_sprite_renderer, jce_scene_remove_sprite_renderer,
+        parse_sprite_renderer, serw_sprite_renderer,
+        reg_get_sprite_renderer, reg_set_sprite_renderer, sizeof(JceSpriteRendererComponent));
+
+    REG("SpriteAnimator", "spriteAnimator", "Sprite Animator", NULL,
+        JCE_COMP_FLAG_SPRITE_ANIMATOR,
+        jce_scene_has_sprite_animator, jce_scene_remove_sprite_animator,
+        parse_sprite_animator, serw_sprite_animator,
+        reg_get_sprite_animator, reg_set_sprite_animator, sizeof(JceSpriteAnimatorComponent));
+
+    REG("Animator", "animator", NULL, NULL,
+        JCE_COMP_FLAG_ANIMATOR,
+        jce_scene_has_animator, jce_scene_remove_animator,
+        parse_animator, serw_animator,
+        reg_get_animator, reg_set_animator, sizeof(JceAnimatorComponent));
+
+    REG("SkeletalAnimator", "Skeletal Animator", NULL, NULL,
+        JCE_COMP_FLAG_SKELETAL_ANIMATOR,
+        jce_scene_has_skeletal_animator, jce_scene_remove_skeletal_animator,
+        parse_skeletal_animator, serw_skeletal_animator,
+        reg_get_skeletal_animator, reg_set_skeletal_animator, sizeof(JceSkeletalAnimatorComponent));
+
+    REG("Rigidbody", "rigidbody", NULL, NULL,
+        JCE_COMP_FLAG_RIGIDBODY,
+        jce_scene_has_rigidbody, jce_scene_remove_rigidbody,
+        parse_rigidbody, serw_rigidbody,
+        reg_get_rigidbody, reg_set_rigidbody, sizeof(JceRigidBodyComponent));
+
+    REG("Rigidbody2D", "rigidbody2d", "Rigidbody 2D", NULL,
+        JCE_COMP_FLAG_RIGIDBODY_2D,
+        jce_scene_has_rigidbody2d, jce_scene_remove_rigidbody2d,
+        parse_rigidbody2d, serw_rigidbody2d,
+        reg_get_rigidbody2d, reg_set_rigidbody2d, sizeof(JceRigidBody2DComponent));
+
+    REG("ParticleEmitter", "particleEmitter", "Particle Emitter", NULL,
+        JCE_COMP_FLAG_PARTICLE_EMITTER,
+        jce_scene_has_particle_emitter, jce_scene_remove_particle_emitter,
+        parse_particle_emitter, serw_particle_emitter,
+        reg_get_particle_emitter, reg_set_particle_emitter, sizeof(JceParticleEmitterComponent));
+
+    REG("BehaviorTree", "behaviorTree", "Behavior Tree", "BehaviourTree",
+        JCE_COMP_FLAG_BEHAVIOR_TREE,
+        jce_scene_has_behavior_tree, jce_scene_remove_behavior_tree,
+        parse_behavior_tree, serw_behavior_tree,
+        reg_get_behavior_tree, reg_set_behavior_tree, sizeof(JceBehaviorTree));
+
+    REG("BoxCollider", "Box Collider", NULL, NULL,
+        JCE_COMP_FLAG_BOX_COLLIDER,
+        jce_scene_has_box_collider, jce_scene_remove_box_collider,
+        parse_box_collider, serw_box_collider,
+        reg_get_box_collider, reg_set_box_collider, sizeof(JceBoxColliderComponent));
+
+    REG("SphereCollider", "Sphere Collider", NULL, NULL,
+        JCE_COMP_FLAG_SPHERE_COLLIDER,
+        jce_scene_has_sphere_collider, jce_scene_remove_sphere_collider,
+        parse_sphere_collider, serw_sphere_collider,
+        reg_get_sphere_collider, reg_set_sphere_collider, sizeof(JceSphereColliderComponent));
+
+    REG("CharacterController", "Character Controller", NULL, NULL,
+        JCE_COMP_FLAG_CHARACTER_CONTROLLER,
+        jce_scene_has_character_controller, jce_scene_remove_character_controller,
+        parse_character_controller, serw_character_controller,
+        reg_get_character_controller, reg_set_character_controller, sizeof(JceCharacterControllerComponent));
+
+    REG("AudioSource", "Audio Source", NULL, NULL,
+        JCE_COMP_FLAG_AUDIO_SOURCE,
+        jce_scene_has_audio_source, jce_scene_remove_audio_source,
+        parse_audio_source, serw_audio_source,
+        reg_get_audio_source, reg_set_audio_source, sizeof(JceAudioSourceComponent));
+
+    /* Post-64 rows (no legacy flag bit): id/name addressing only. */
+    REG("MusicTrack", "Music Track", NULL, NULL,
+        0,
+        jce_scene_has_music_track, jce_scene_remove_music_track,
+        parse_music_track, serw_music_track,
+        reg_get_music_track, reg_set_music_track, sizeof(JceMusicTrackComponent));
+
+    REG("VideoPlayer", "Video Player", NULL, NULL,
+        0,
+        jce_scene_has_video_player, jce_scene_remove_video_player,
+        parse_video_player, serw_video_player,
+        reg_get_video_player, reg_set_video_player, sizeof(JceVideoPlayerComponent));
+
+    REG("NavAgent", "navAgent", NULL, NULL,
+        0,
+        jce_scene_has_nav_agent, jce_scene_remove_nav_agent,
+        parse_nav_agent, serw_nav_agent,
+        reg_get_nav_agent, reg_set_nav_agent, sizeof(JceNavAgentComponent));
+
+    REG("IkConstraints", "ikConstraints", NULL, NULL,
+        0,
+        jce_scene_has_ik_constraints, jce_scene_remove_ik_constraints,
+        parse_ik_constraints, serw_ik_constraints,
+        reg_get_ik_constraints, reg_set_ik_constraints, sizeof(JceIkConstraintComponent));
+
+    REG("FootIk", "footIk", NULL, NULL,
+        0,
+        jce_scene_has_foot_ik, jce_scene_remove_foot_ik,
+        parse_foot_ik, serw_foot_ik,
+        reg_get_foot_ik, reg_set_foot_ik, sizeof(JceFootIkComponent));
+
+    REG("FullBodyIk", "fullBodyIk", NULL, NULL,
+        0,
+        jce_scene_has_full_body_ik, jce_scene_remove_full_body_ik,
+        parse_full_body_ik, serw_full_body_ik,
+        reg_get_full_body_ik, reg_set_full_body_ik, sizeof(JceFullBodyIkComponent));
+
+    REG("SequencePlayer", "sequencePlayer", NULL, NULL,
+        0,
+        jce_scene_has_sequence_player, jce_scene_remove_sequence_player,
+        parse_sequence_player, serw_sequence_player,
+        reg_get_sequence_player, reg_set_sequence_player, sizeof(JceSequencePlayerComponent));
+
+    REG("MorphWeights", "morphWeights", "Morph Weights", "morph_weights",
+        0,
+        jce_scene_has_morph_weights, jce_scene_remove_morph_weights,
+        parse_morph_weights, serw_morph_weights,
+        reg_get_morph_weights, reg_set_morph_weights, sizeof(JceMorphWeightsComponent));
+
+    REG("Ragdoll", "ragdoll", "Ragdoll", "ragdoll",
+        0,
+        jce_scene_has_ragdoll, jce_scene_remove_ragdoll,
+        parse_ragdoll, serw_ragdoll,
+        reg_get_ragdoll, reg_set_ragdoll, sizeof(JceRagdollComponent));
+
+    REG("Fracture", "fracture", "Fracture", "fracture",
+        0,
+        jce_scene_has_fracture, jce_scene_remove_fracture,
+        parse_fracture, serw_fracture,
+        reg_get_fracture, reg_set_fracture, sizeof(JceFractureComponent));
+
+    REG("Vehicle", "vehicle", "Vehicle", "vehicle",
+        0,
+        jce_scene_has_vehicle, jce_scene_remove_vehicle,
+        parse_vehicle, serw_vehicle,
+        reg_get_vehicle, reg_set_vehicle, sizeof(JceVehicleComponent));
+
+    REG("SoftBody", "softBody", "Soft Body", "soft_body",
+        0,
+        jce_scene_has_soft_body, jce_scene_remove_soft_body,
+        parse_soft_body, serw_soft_body,
+        reg_get_soft_body, reg_set_soft_body, sizeof(JceSoftBodyComponent));
+
+    REG("NetworkVariable", "networkVariable", "Network Variable", "network_variable",
+        0,
+        jce_scene_has_network_variable, jce_scene_remove_network_variable,
+        parse_network_variable, serw_network_variable,
+        reg_get_network_variable, reg_set_network_variable, sizeof(JceNetworkVariableComponent));
+
+    REG("GameplayAbilitySystem", "gameplayAbilitySystem", "Gameplay Ability System", "gas",
+        0,
+        jce_scene_has_gas, jce_scene_remove_gas,
+        parse_gas, serw_gas,
+        reg_get_gas, reg_set_gas, sizeof(JceGameplayAbilitySystemComponent));
+
+    REG("Script", "script", NULL, NULL,
+        JCE_COMP_FLAG_SCRIPT,
+        jce_scene_has_script, jce_scene_remove_script,
+        parse_script, serw_script,
+        reg_get_script, reg_set_script, sizeof(JceScriptComponent));
+
+    REG("Constraint", "constraint", NULL, NULL,
+        JCE_COMP_FLAG_CONSTRAINT,
+        jce_scene_has_constraint, jce_scene_remove_constraint,
+        parse_constraint, serw_constraint,
+        reg_get_constraint, reg_set_constraint, sizeof(JceConstraintComponent));
+
+    REG("Terrain", "terrain", NULL, NULL,
+        JCE_COMP_FLAG_TERRAIN,
+        jce_scene_has_terrain, jce_scene_remove_terrain,
+        parse_terrain, serw_terrain,
+        reg_get_terrain, reg_set_terrain, sizeof(JceTerrainComponent));
+
+    REG("VegetationScatter", "vegetationScatter", "Vegetation Scatter", "vegetation_scatter",
+        0,
+        jce_scene_has_vegetation_scatter, jce_scene_remove_vegetation_scatter,
+        parse_vegetation_scatter, serw_vegetation_scatter,
+        reg_get_vegetation_scatter, reg_set_vegetation_scatter,
+        sizeof(JceVegetationScatterComponent));
+
+    /* Post-64 row (no legacy flag bit): id/name addressing only. */
+    REG("Water", "water", NULL, NULL,
+        0,
+        jce_scene_has_water, jce_scene_remove_water,
+        parse_water, serw_water,
+        reg_get_water, reg_set_water,
+        sizeof(JceWaterComponent));
+
+    /* Post-64 row (no legacy flag bit): id/name addressing only. */
+    REG("Buoyancy", "buoyancy", NULL, NULL,
+        0,
+        jce_scene_has_buoyancy, jce_scene_remove_buoyancy,
+        parse_buoyancy, serw_buoyancy,
+        reg_get_buoyancy, reg_set_buoyancy,
+        sizeof(JceBuoyancyComponent));
+
+    REG("LODGroup", "lodGroup", NULL, NULL,
+        JCE_COMP_FLAG_LOD_GROUP,
+        jce_scene_has_lod_group, jce_scene_remove_lod_group,
+        parse_lod_group, serw_lod_group,
+        reg_get_lod_group, reg_set_lod_group, sizeof(JceLodGroupComponent));
+
+    REG("VirtualCamera", "virtualCamera", NULL, NULL,
+        JCE_COMP_FLAG_VIRTUAL_CAMERA,
+        jce_scene_has_virtual_camera, jce_scene_remove_virtual_camera,
+        parse_virtual_camera, serw_virtual_camera,
+        reg_get_virtual_camera, reg_set_virtual_camera, sizeof(JceVirtualCameraComponent));
+
+    REG("TriggerVolume", "triggerVolume", NULL, NULL,
+        JCE_COMP_FLAG_TRIGGER_VOLUME,
+        jce_scene_has_trigger_volume, jce_scene_remove_trigger_volume,
+        parse_trigger_volume, serw_trigger_volume,
+        reg_get_trigger_volume, reg_set_trigger_volume, sizeof(JceTriggerVolumeComponent));
+
+    REG("CapsuleCollider", "capsuleCollider", NULL, NULL,
+        JCE_COMP_FLAG_CAPSULE_COLLIDER,
+        jce_scene_has_capsule_collider, jce_scene_remove_capsule_collider,
+        parse_capsule_collider, serw_capsule_collider,
+        reg_get_capsule_collider, reg_set_capsule_collider, sizeof(JceCapsuleColliderComponent));
+
+    REG("MeshCollider", "meshCollider", NULL, NULL,
+        JCE_COMP_FLAG_MESH_COLLIDER,
+        jce_scene_has_mesh_collider, jce_scene_remove_mesh_collider,
+        parse_mesh_collider, serw_mesh_collider,
+        reg_get_mesh_collider, reg_set_mesh_collider, sizeof(JceMeshColliderComponent));
+
+    REG("CompoundCollider", "compoundCollider", NULL, NULL,
+        0,
+        jce_scene_has_compound_collider, jce_scene_remove_compound_collider,
+        parse_compound_collider, serw_compound_collider,
+        reg_get_compound_collider, reg_set_compound_collider, sizeof(JceCompoundColliderComponent));
+
+    REG("Collider2D", "collider2D", NULL, NULL,
+        JCE_COMP_FLAG_COLLIDER_2D,
+        jce_scene_has_collider2d, jce_scene_remove_collider2d,
+        parse_collider2d, serw_collider2d,
+        reg_get_collider2d, reg_set_collider2d, sizeof(JceCollider2DComponent));
+
+    REG("TrailRenderer", "trailRenderer", NULL, NULL,
+        JCE_COMP_FLAG_TRAIL_RENDERER,
+        jce_scene_has_trail_renderer, jce_scene_remove_trail_renderer,
+        parse_trail_renderer, serw_trail_renderer,
+        reg_get_trail_renderer, reg_set_trail_renderer, sizeof(JceTrailRendererComponent));
+
+    REG("LineRenderer", "lineRenderer", NULL, NULL,
+        JCE_COMP_FLAG_LINE_RENDERER,
+        jce_scene_has_line_renderer, jce_scene_remove_line_renderer,
+        parse_line_renderer, serw_line_renderer,
+        reg_get_line_renderer, reg_set_line_renderer, sizeof(JceLineRendererComponent));
+
+    REG("ReflectionProbe", "reflectionProbe", NULL, NULL,
+        JCE_COMP_FLAG_REFLECTION_PROBE,
+        jce_scene_has_reflection_probe, jce_scene_remove_reflection_probe,
+        parse_reflection_probe, serw_reflection_probe,
+        reg_get_reflection_probe, reg_set_reflection_probe, sizeof(JceReflectionProbeComponent));
+
+    REG("Decal", "decal", NULL, NULL,
+        JCE_COMP_FLAG_DECAL,
+        jce_scene_has_decal, jce_scene_remove_decal,
+        parse_decal, serw_decal,
+        reg_get_decal, reg_set_decal, sizeof(JceDecalComponent));
+
+    REG("LightProbeGroup", "lightProbeGroup", NULL, NULL,
+        JCE_COMP_FLAG_LIGHT_PROBE_GROUP,
+        jce_scene_has_light_probe_group, jce_scene_remove_light_probe_group,
+        parse_light_probe_group, serw_light_probe_group,
+        reg_get_light_probe_group, reg_set_light_probe_group, sizeof(JceLightProbeGroupComponent));
+
+    REG("AudioListener", "audioListener", NULL, NULL,
+        JCE_COMP_FLAG_AUDIO_LISTENER,
+        jce_scene_has_audio_listener, jce_scene_remove_audio_listener,
+        parse_audio_listener, serw_audio_listener,
+        reg_get_audio_listener, reg_set_audio_listener, sizeof(JceAudioListenerComponent));
+
+    REG("AudioReverbZone", "audioReverbZone", NULL, NULL,
+        JCE_COMP_FLAG_AUDIO_REVERB_ZONE,
+        jce_scene_has_audio_reverb_zone, jce_scene_remove_audio_reverb_zone,
+        parse_audio_reverb_zone, serw_audio_reverb_zone,
+        reg_get_audio_reverb_zone, reg_set_audio_reverb_zone, sizeof(JceAudioReverbZoneComponent));
+
+    REG("AudioOcclusion", "audioOcclusion", NULL, NULL,
+        JCE_COMP_FLAG_AUDIO_OCCLUSION,
+        jce_scene_has_audio_occlusion, jce_scene_remove_audio_occlusion,
+        parse_audio_occlusion, serw_audio_occlusion,
+        reg_get_audio_occlusion, reg_set_audio_occlusion, sizeof(JceAudioOcclusionComponent));
+
+    REG("SpawnManager", "spawnManager", NULL, NULL,
+        JCE_COMP_FLAG_SPAWN_MANAGER,
+        jce_scene_has_spawn_manager, jce_scene_remove_spawn_manager,
+        parse_spawn_manager, serw_spawn_manager,
+        reg_get_spawn_manager, reg_set_spawn_manager, sizeof(JceSpawnManagerComponent));
+
+    REG("Weapon", "weapon", NULL, NULL,
+        JCE_COMP_FLAG_WEAPON,
+        jce_scene_has_weapon, jce_scene_remove_weapon,
+        parse_weapon, serw_weapon,
+        reg_get_weapon, reg_set_weapon, sizeof(JceWeaponComponent));
+
+    REG("SavePoint", "savePoint", NULL, NULL,
+        JCE_COMP_FLAG_SAVE_POINT,
+        jce_scene_has_save_point, jce_scene_remove_save_point,
+        parse_save_point, serw_save_point,
+        reg_get_save_point, reg_set_save_point, sizeof(JceSavePointComponent));
+
+    REG("WheelCollider", "wheelCollider", NULL, NULL,
+        JCE_COMP_FLAG_WHEEL_COLLIDER,
+        jce_scene_has_wheel_collider, jce_scene_remove_wheel_collider,
+        parse_wheel_collider, serw_wheel_collider,
+        reg_get_wheel_collider, reg_set_wheel_collider, sizeof(JceWheelColliderComponent));
+
+    REG("ConstantForce", "constantForce", NULL, NULL,
+        JCE_COMP_FLAG_CONSTANT_FORCE,
+        jce_scene_has_constant_force, jce_scene_remove_constant_force,
+        parse_constant_force, serw_constant_force,
+        reg_get_constant_force, reg_set_constant_force, sizeof(JceConstantForceComponent));
+
+    REG("ConfigurableJoint", "configurableJoint", NULL, NULL,
+        JCE_COMP_FLAG_CONFIGURABLE_JOINT,
+        jce_scene_has_configurable_joint, jce_scene_remove_configurable_joint,
+        parse_configurable_joint, serw_configurable_joint,
+        reg_get_configurable_joint, reg_set_configurable_joint, sizeof(JceConfigurableJointComponent));
+
+    REG("Cloth", "cloth", NULL, NULL,
+        JCE_COMP_FLAG_CLOTH,
+        jce_scene_has_cloth, jce_scene_remove_cloth,
+        parse_cloth, serw_cloth,
+        reg_get_cloth, reg_set_cloth, sizeof(JceClothComponent));
+
+    REG("Joint2D", "joint2D", NULL, NULL,
+        JCE_COMP_FLAG_JOINT_2D,
+        jce_scene_has_joint2d, jce_scene_remove_joint2d,
+        parse_joint2d, serw_joint2d,
+        reg_get_joint2d, reg_set_joint2d, sizeof(JceJoint2DComponent));
+
+    REG("BillboardRenderer", "billboardRenderer", NULL, NULL,
+        JCE_COMP_FLAG_BILLBOARD_RENDERER,
+        jce_scene_has_billboard_renderer, jce_scene_remove_billboard_renderer,
+        parse_billboard_renderer, serw_billboard_renderer,
+        reg_get_billboard_renderer, reg_set_billboard_renderer, sizeof(JceBillboardRendererComponent));
+
+    REG("Canvas", "canvas", NULL, NULL,
+        JCE_COMP_FLAG_CANVAS,
+        jce_scene_has_canvas, jce_scene_remove_canvas,
+        parse_canvas, serw_canvas,
+        reg_get_canvas, reg_set_canvas, sizeof(JceCanvasComponent));
+
+    REG("CanvasGroup", "canvasGroup", NULL, NULL,
+        JCE_COMP_FLAG_CANVAS_GROUP,
+        jce_scene_has_canvas_group, jce_scene_remove_canvas_group,
+        parse_canvas_group, serw_canvas_group,
+        reg_get_canvas_group, reg_set_canvas_group, sizeof(JceCanvasGroupComponent));
+
+    REG("LayoutGroup", "layoutGroup", NULL, NULL,
+        JCE_COMP_FLAG_LAYOUT_GROUP,
+        jce_scene_has_layout_group, jce_scene_remove_layout_group,
+        parse_layout_group, serw_layout_group,
+        reg_get_layout_group, reg_set_layout_group, sizeof(JceLayoutGroupComponent));
+
+    REG("UIImage", "uiImage", NULL, NULL,
+        JCE_COMP_FLAG_UI_IMAGE,
+        jce_scene_has_ui_image, jce_scene_remove_ui_image,
+        parse_ui_image, serw_ui_image,
+        reg_get_ui_image, reg_set_ui_image, sizeof(JceUIImageComponent));
+
+    REG("UIText", "uiText", NULL, NULL,
+        JCE_COMP_FLAG_UI_TEXT,
+        jce_scene_has_ui_text, jce_scene_remove_ui_text,
+        parse_ui_text, serw_ui_text,
+        reg_get_ui_text, reg_set_ui_text, sizeof(JceUITextComponent));
+
+    REG("UIButton", "uiButton", NULL, NULL,
+        JCE_COMP_FLAG_UI_BUTTON,
+        jce_scene_has_ui_button, jce_scene_remove_ui_button,
+        parse_ui_button, serw_ui_button,
+        reg_get_ui_button, reg_set_ui_button, sizeof(JceUIButtonComponent));
+
+    /* Post-64 (presence-gated, no legacy flag bit) — mirror Vehicle/SoftBody. */
+    REG("UISlider", "uiSlider", "UI Slider", "ui_slider",
+        0,
+        jce_scene_has_ui_slider, jce_scene_remove_ui_slider,
+        parse_ui_slider, serw_ui_slider,
+        reg_get_ui_slider, reg_set_ui_slider, sizeof(JceUISliderComponent));
+
+    REG("UIToggle", "uiToggle", "UI Toggle", "ui_toggle",
+        0,
+        jce_scene_has_ui_toggle, jce_scene_remove_ui_toggle,
+        parse_ui_toggle, serw_ui_toggle,
+        reg_get_ui_toggle, reg_set_ui_toggle, sizeof(JceUIToggleComponent));
+
+    REG("UIInputField", "uiInputField", "UI Input Field", "ui_input_field",
+        0,
+        jce_scene_has_ui_input_field, jce_scene_remove_ui_input_field,
+        parse_ui_input_field, serw_ui_input_field,
+        reg_get_ui_input_field, reg_set_ui_input_field, sizeof(JceUIInputFieldComponent));
+
+    REG("UIScrollView", "uiScrollView", "UI Scroll View", "ui_scroll_view",
+        0,
+        jce_scene_has_ui_scroll_view, jce_scene_remove_ui_scroll_view,
+        parse_ui_scroll_view, serw_ui_scroll_view,
+        reg_get_ui_scroll_view, reg_set_ui_scroll_view, sizeof(JceUIScrollViewComponent));
+
+    REG("UIProgressBar", "uiProgressBar", "UI Progress Bar", "ui_progress_bar",
+        0,
+        jce_scene_has_ui_progress_bar, jce_scene_remove_ui_progress_bar,
+        parse_ui_progress_bar, serw_ui_progress_bar,
+        reg_get_ui_progress_bar, reg_set_ui_progress_bar, sizeof(JceUIProgressBarComponent));
+
+    REG("UIDropdown", "uiDropdown", "UI Dropdown", "ui_dropdown",
+        0,
+        jce_scene_has_ui_dropdown, jce_scene_remove_ui_dropdown,
+        parse_ui_dropdown, serw_ui_dropdown,
+        reg_get_ui_dropdown, reg_set_ui_dropdown, sizeof(JceUIDropdownComponent));
+
+    REG("NetworkObject", "networkObject", NULL, NULL,
+        JCE_COMP_FLAG_NETWORK_OBJECT,
+        jce_scene_has_network_object, jce_scene_remove_network_object,
+        parse_network_object, serw_network_object,
+        reg_get_network_object, reg_set_network_object, sizeof(JceNetworkObjectComponent));
+
+    REG("NetworkTransform", "networkTransform", NULL, NULL,
+        JCE_COMP_FLAG_NET_TRANSFORM,
+        jce_scene_has_net_transform, jce_scene_remove_net_transform,
+        parse_net_transform, serw_net_transform,
+        reg_get_net_transform, reg_set_net_transform, sizeof(JceNetTransformComponent));
+
+    REG("NetworkAnimator", "networkAnimator", NULL, NULL,
+        JCE_COMP_FLAG_NET_ANIMATOR,
+        jce_scene_has_net_animator, jce_scene_remove_net_animator,
+        parse_net_animator, serw_net_animator,
+        reg_get_net_animator, reg_set_net_animator, sizeof(JceNetAnimatorComponent));
+
+    REG("NetworkRigidbody", "networkRigidbody", NULL, NULL,
+        JCE_COMP_FLAG_NET_RIGIDBODY,
+        jce_scene_has_net_rigidbody, jce_scene_remove_net_rigidbody,
+        parse_net_rigidbody, serw_net_rigidbody,
+        reg_get_net_rigidbody, reg_set_net_rigidbody, sizeof(JceNetRigidbodyComponent));
+
+    /* RETIRED v0.9.9 — parse migrates graphPath onto ParticleEmitter;
+     * never re-saved (serialize == NULL). */
+    REG("VfxGraph", "vfxGraph", NULL, NULL,
+        JCE_COMP_FLAG_VFX_GRAPH,
+        jce_scene_has_vfx_graph, jce_scene_remove_vfx_graph,
+        parse_vfx_graph_migrate, NULL,
+        NULL, NULL, 0);
+
+    REG("Tilemap", "tilemap", NULL, NULL,
+        JCE_COMP_FLAG_TILEMAP,
+        jce_scene_has_tilemap, jce_scene_remove_tilemap,
+        parse_tilemap, serw_tilemap,
+        reg_get_tilemap, reg_set_tilemap, sizeof(JceTilemapComponent));
+
+    REG("TilemapCollider2D", "tilemapCollider2D", NULL, NULL,
+        JCE_COMP_FLAG_TILEMAP_COLLIDER_2D,
+        jce_scene_has_tilemap_collider2d, jce_scene_remove_tilemap_collider2d,
+        parse_tilemap_collider2d, serw_tilemap_collider2d,
+        reg_get_tilemap_collider2d, reg_set_tilemap_collider2d, sizeof(JceTilemapCollider2DComponent));
+
+    REG("Avatar", "avatar", NULL, NULL,
+        JCE_COMP_FLAG_AVATAR,
+        jce_scene_has_avatar, jce_scene_remove_avatar,
+        parse_avatar, serw_avatar,
+        reg_get_avatar, reg_set_avatar, sizeof(JceAvatarComponent));
+
+    REG("Volume", "volume", NULL, NULL,
+        JCE_COMP_FLAG_VOLUME,
+        jce_scene_has_volume, jce_scene_remove_volume,
+        parse_volume, serw_volume,
+        reg_get_volume, reg_set_volume, sizeof(JceVolumeComponent));
+
+    REG("OcclusionPortal", "occlusionPortal", NULL, NULL,
+        JCE_COMP_FLAG_OCCLUSION_PORTAL,
+        jce_scene_has_occlusion_portal, jce_scene_remove_occlusion_portal,
+        parse_occlusion_portal, serw_occlusion_portal,
+        reg_get_occlusion_portal, reg_set_occlusion_portal, sizeof(JceOcclusionPortalComponent));
+
+    REG("EditorMeta", NULL, NULL, NULL,
+        JCE_COMP_FLAG_EDITOR_META,
+        jce_scene_has_editor_meta, jce_scene_remove_editor_meta,
+        parse_editor_meta, serw_editor_meta,
+        reg_get_editor_meta, reg_set_editor_meta, sizeof(JceEditorMeta));
+
+    /* Tag/Layer serialize at entity level (ser_entity_cb), not in the
+     * components array — rows exist for presence/enable/flags only. */
+    REG("Tag", NULL, NULL, NULL,
+        JCE_COMP_FLAG_TAG,
+        jce_scene_has_tag_component, jce_scene_remove_tag_component,
+        NULL, NULL,
+        NULL, NULL, 0);
+
+    REG("Layer", NULL, NULL, NULL,
+        JCE_COMP_FLAG_LAYER,
+        jce_scene_has_layer_component, jce_scene_remove_layer_component,
+        NULL, NULL,
+        NULL, NULL, 0);
+
+#undef REG
+}

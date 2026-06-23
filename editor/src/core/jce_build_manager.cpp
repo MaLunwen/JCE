@@ -19,6 +19,8 @@
 #include "jce_editor_project.h"
 #include "jce_pak_key.h"
 #include "jce_project_settings.h"
+#include <jce/middleware/physics/jce_physics_layers.h>  /* layer matrix export (Top 4) */
+#include <jce/renderer/jce_render_settings.h>            /* quality export (Top 5) */
 #include "ui/jce_editor_panels.h"
 
 extern "C" {
@@ -422,6 +424,63 @@ void run_finish_plan()
         g_build.state = JCE_BUILD_FAILED;
         set_error("package: failed to copy exe to " + dst_exe);
         return;
+    }
+
+    /* Top 4 — export the project's authored physics layer collision matrix into
+     * the cooked tree so the shipped game's app_init loads the SAME collision
+     * filtering editor Play uses.  ps is the authoritative source: editor Play
+     * (jce_editor_play.cpp) and this build both drive the engine matrix from it,
+     * so the standalone physics-layers panel's file is already overridden by
+     * Play.  Written before the cooked-tree staging below so the copy picks it
+     * up.  NOTE: loose-tree only — an encrypted/embedded-PAK package
+     * (stage_loose=false) does not carry it yet (needs a PAK-aware matrix
+     * loader; tracked as follow-up). */
+    if (!g_finish.cooked_src.empty() &&
+        jce_fs_host_exists_dir(g_finish.cooked_src.c_str())) {
+        JceProjectSettings ps_local;
+        const JceProjectSettings *ps = jce_project_settings_current();
+        if (!ps) { jce_project_settings_load(&ps_local); ps = &ps_local; }
+        for (uint32_t i = 0; i < JCE_PS_LAYER_COUNT; ++i) {
+            jce_physics_layer_set_name(i, ps->tags_layers.layers[i]);
+            for (uint32_t j = i; j < JCE_PS_LAYER_COUNT; ++j)
+                jce_physics_set_layer_collides(
+                    i, j, (ps->physics.layer_collision_matrix[i] >> j) & 1u);
+        }
+        std::string lp = g_finish.cooked_src + PATH_SEP_CHR_LOCAL +
+                         "physics_layers.json";
+        if (jce_physics_layer_matrix_save_json(lp.c_str()))
+            log_line(JCE_CONSOLE_INFO, "[build] physics layer matrix -> " + lp);
+        else
+            log_line(JCE_CONSOLE_WARNING,
+                     "[build] failed to write physics layer matrix: " + lp);
+
+        /* Top 5 — export the active quality level's render settings so the
+         * shipped game's app_init applies the authored shadow tier + lod bias
+         * (per-scene JceSceneRenderingSettings still override at render time). */
+        JceRenderSettings rs = jce_render_settings_default();
+        int ql = ps->quality.current_level;
+        if (ql < 0) ql = 0;
+        if (ql >= JCE_PS_MAX_QUALITY_LEVELS) ql = JCE_PS_MAX_QUALITY_LEVELS - 1;
+        const JceProjectQualityLevel *lvl = &ps->quality.levels[ql];
+        rs.shadow_quality = lvl->shadow_quality;
+        {
+            static const int kShadowRes[4] = { 512, 1024, 2048, 4096 };
+            int sr = lvl->shadow_resolution;
+            if (sr < 0) sr = 0; if (sr > 3) sr = 3;
+            rs.shadow_map_size = kShadowRes[sr];
+        }
+        rs.shadow_cascades = lvl->shadow_cascades;
+        rs.shadow_distance = lvl->shadow_distance;
+        rs.lod_bias        = lvl->lod_bias;
+        rs.vsync           = lvl->vsync_count > 0 ? 1 : 0;
+        rs.msaa            = ps->graphics.default_msaa;   /* 0/2/4/8 (Graphics block) */
+        std::string rp = g_finish.cooked_src + PATH_SEP_CHR_LOCAL +
+                         "render_settings.json";
+        if (jce_render_settings_save_json(rp.c_str(), &rs))
+            log_line(JCE_CONSOLE_INFO, "[build] render settings -> " + rp);
+        else
+            log_line(JCE_CONSOLE_WARNING,
+                     "[build] failed to write render settings: " + rp);
     }
 
     /* Stage cooked assets so the packaged game has its PhysFS mount
@@ -2129,7 +2188,12 @@ void finalize_project_build_pipeline(PendingProjectBuild &p)
         g_finish.stage       = true;
         g_finish.out_dir     = p.package_out_dir;
         g_finish.cooked_rel  = p.cooked;
-        g_finish.stage_loose = !p.encrypt_assets;
+        /* Single self-contained exe by default (desktop): the project build
+         * always embeds its PAK into the executable, and the runtime mounts
+         * only that embedded blob — so the loose cooked tree beside the exe is
+         * redundant (and, unencrypted, leaks plaintext assets).  Never stage
+         * it on desktop; web/android use their own external-asset path. */
+        g_finish.stage_loose = false;
         if (!p.cooked.empty())
             g_finish.cooked_src = p.project + PATH_SEP_CHR_LOCAL +
                                   join_norm_sep(p.cooked);

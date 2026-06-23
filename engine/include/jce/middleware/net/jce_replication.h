@@ -322,6 +322,23 @@ JCE_API void JCE_CALL jce_net_replication_tick(JceNetTick tick);
 JCE_API void JCE_CALL
 jce_net_replication_handle_packet(const void *data, uint32_t size);
 
+/* Encode a snapshot into a freshly-allocated buffer using the SAME encoder
+ * the broadcast path runs — no JceNetHost required.  This is the transport-
+ * free seam for headless tools and tests: drive the REAL delta / baseline /
+ * full-burst encoder, then feed the exact bytes to
+ * jce_net_replication_handle_packet().  Returns the encoded byte count (0
+ * on failure); on success *out_buf points to a heap buffer the caller MUST
+ * release with jce_net_replication_free_buffer().  `full` forces a full-
+ * state burst (every object + component, baseline ignored); otherwise the
+ * result is a delta versus the live baseline AND advances that baseline
+ * exactly as a real broadcast would. */
+JCE_API uint32_t JCE_CALL
+jce_net_replication_encode_snapshot(JceNetTick tick, bool full,
+                                    void **out_buf);
+
+/* Release a buffer returned by jce_net_replication_encode_snapshot(). */
+JCE_API void JCE_CALL jce_net_replication_free_buffer(void *buf);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_REPLICATION_H */

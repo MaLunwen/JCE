@@ -15,6 +15,7 @@
  */
 
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/middleware/scene/jce_component_registry.h>  /* per-component disable gate */
 #include <jce/middleware/video/jce_video.h>
 #include <jce/renderer/jce_texture.h>
 #include <jce/os/core/jce_filesystem.h>
@@ -220,6 +221,9 @@ static void sv_each(JceScene *s, JceEntity e, void *ud)
     SvCtx *ctx = (SvCtx *)ud;
     JceVideoPlayerComponent *c = jce_scene_get_video_player(s, e);
     if (!c) return;
+    { static int s_vp_cid = -2;
+      if (s_vp_cid == -2) s_vp_cid = jce_component_find("VideoPlayer");
+      if (s_vp_cid >= 0 && !jce_scene_comp_enabled(s, e, s_vp_cid)) return; }
 
     /* Reconcile an in-place clip_path change (inspector edit / Reset Component
      * / undo-redo) even while stopped: drop the stale decoder + texture so the

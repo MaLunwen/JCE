@@ -20,6 +20,7 @@
 #define JCE_ASSET_PATH_INDEX_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -59,6 +60,12 @@ bool jce_asset_path_index_lookup(const char *requested_path,
 
 /* Diagnostic: number of indexed files. */
 int  jce_asset_path_index_size(void);
+
+/* Monotonic change counter: bumped whenever the index contents change
+ * (async swap, sync rebuild, clear).  The asset resolver's negative
+ * cache keys its entries on this, so "asset is missing" verdicts expire
+ * the moment new files become visible. */
+uint32_t jce_asset_path_index_generation(void);
 
 #ifdef __cplusplus
 }

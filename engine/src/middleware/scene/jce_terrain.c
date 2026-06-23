@@ -7,9 +7,21 @@
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/resource/jce_pak_loader.h>
+#include <jce/os/core/jce_alloc.h>
 
 #include "os/core/jce_memory.h"
 
+/* stb_image is implemented (with all built-in codecs) in
+ * renderer/jce_stb_image_impl.c; jce_scene links jce_renderer privately so
+ * those symbols resolve at final link.  We only need the declarations here,
+ * matching the impl translation unit's STBI_NO_STDIO contract.  stb's loaders
+ * allocate with plain malloc/free (the impl does not override STBI_MALLOC), so
+ * buffers returned by stbi_load_* must be released with stbi_image_free — NOT
+ * the engine allocator. */
+#define STBI_NO_STDIO
+#include "renderer/internal/stb_image.h"
+
+#include <limits.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -66,6 +78,58 @@ static float sample_h_norm(const JceTerrain *t, float wx, float wz)
 }
 
 /* ───── Lifecycle ────────────────────────────────────────────── */
+
+/* Triangle-soup collision mesh from the height grid (public API; used by the
+ * runtime to spawn a static terrain collider).  Heap arrays are jce_malloc'd —
+ * the caller frees them with jce_free. */
+bool jce_terrain_build_collision_mesh(const JceTerrain *t,
+                                      float    **out_verts,
+                                      uint32_t  *out_vcount,
+                                      uint32_t **out_indices,
+                                      uint32_t  *out_icount)
+{
+    if (out_verts)   *out_verts   = NULL;
+    if (out_vcount)  *out_vcount  = 0;
+    if (out_indices) *out_indices = NULL;
+    if (out_icount)  *out_icount  = 0;
+    if (!t || !out_verts || !out_vcount || !out_indices || !out_icount)
+        return false;
+
+    const int W = t->w, H = t->h;
+    if (W < 2 || H < 2 || !t->heights) return false;
+
+    const uint32_t vcount = (uint32_t)W * (uint32_t)H;
+    const uint32_t tris   = (uint32_t)(W - 1) * (uint32_t)(H - 1) * 2u;
+    const uint32_t icount = tris * 3u;
+    float    *verts = (float *)jce_malloc((size_t)vcount * 3u * sizeof(float));
+    uint32_t *idx   = (uint32_t *)jce_malloc((size_t)icount * sizeof(uint32_t));
+    if (!verts || !idx) { jce_free(verts); jce_free(idx); return false; }
+
+    const float inv_w = 1.0f / (float)(W - 1);
+    const float inv_h = 1.0f / (float)(H - 1);
+    for (int j = 0; j < H; ++j) {
+        for (int i = 0; i < W; ++i) {
+            const uint32_t vi = (uint32_t)(j * W + i);
+            verts[vi * 3u + 0u] = (float)i * inv_w * t->world_size_x;
+            verts[vi * 3u + 1u] = t->heights[vi] * t->max_height;
+            verts[vi * 3u + 2u] = (float)j * inv_h * t->world_size_z;
+        }
+    }
+    uint32_t k = 0;
+    for (int j = 0; j < H - 1; ++j) {
+        for (int i = 0; i < W - 1; ++i) {
+            const uint32_t v00 = (uint32_t)(j * W + i);
+            const uint32_t v10 = v00 + 1u;
+            const uint32_t v01 = v00 + (uint32_t)W;
+            const uint32_t v11 = v01 + 1u;
+            idx[k++] = v00; idx[k++] = v01; idx[k++] = v11;
+            idx[k++] = v00; idx[k++] = v11; idx[k++] = v10;
+        }
+    }
+    *out_verts   = verts;  *out_vcount = vcount;
+    *out_indices = idx;    *out_icount = icount;
+    return true;
+}
 
 JceTerrain *jce_terrain_create(int width, int height,
                                float world_size_x, float world_size_z,
@@ -681,4 +745,169 @@ void jce_terrain_splat_paint(JceTerrain *t, int layer,
             t->splat[idx] = out;
         }
     }
+}
+
+/* ───── Heightmap image import / export ──────────────────────── */
+
+/* Bilinearly sample a normalized-0..1 source grid at fractional coords.
+ * `src` is row-major src_w*src_h; coords are clamped to the grid edges. */
+static float resample_bilinear(const float *src, int src_w, int src_h,
+                               float fx, float fz)
+{
+    if (fx < 0.0f) fx = 0.0f;
+    if (fz < 0.0f) fz = 0.0f;
+    if (fx > (float)(src_w - 1)) fx = (float)(src_w - 1);
+    if (fz > (float)(src_h - 1)) fz = (float)(src_h - 1);
+    int x0 = (int)floorf(fx), z0 = (int)floorf(fz);
+    int x1 = clampi(x0 + 1, 0, src_w - 1);
+    int z1 = clampi(z0 + 1, 0, src_h - 1);
+    float u = fx - (float)x0;
+    float v = fz - (float)z0;
+    float h00 = src[(size_t)z0 * (size_t)src_w + x0];
+    float h10 = src[(size_t)z0 * (size_t)src_w + x1];
+    float h01 = src[(size_t)z1 * (size_t)src_w + x0];
+    float h11 = src[(size_t)z1 * (size_t)src_w + x1];
+    float a = h00 * (1.0f - u) + h10 * u;
+    float b = h01 * (1.0f - u) + h11 * u;
+    return a * (1.0f - v) + b * v;
+}
+
+/* Core import: take a normalized-0..1 source grid (heap, src_w*src_h),
+ * resample (or copy) into the terrain's height grid.  Does not free `src`. */
+static bool import_norm_grid(JceTerrain *t, const float *src,
+                             int src_w, int src_h)
+{
+    if (!t || !t->heights || !src || src_w < 1 || src_h < 1) return false;
+    const int W = t->w, H = t->h;
+    if (W < 1 || H < 1) return false;
+
+    if (src_w == W && src_h == H) {
+        memcpy(t->heights, src, (size_t)W * (size_t)H * sizeof(float));
+        return true;
+    }
+    /* Resample: map terrain vertex (i,j) to source space.  With a single
+     * source/dest column or row the scale is 0 (degenerate axis), so guard
+     * the divisor. */
+    float sx = (W > 1) ? (float)(src_w - 1) / (float)(W - 1) : 0.0f;
+    float sz = (H > 1) ? (float)(src_h - 1) / (float)(H - 1) : 0.0f;
+    for (int j = 0; j < H; ++j) {
+        float fz = (float)j * sz;
+        for (int i = 0; i < W; ++i) {
+            float fx = (float)i * sx;
+            t->heights[(size_t)j * (size_t)W + i] =
+                clampf(resample_bilinear(src, src_w, src_h, fx, fz), 0.0f, 1.0f);
+        }
+    }
+    return true;
+}
+
+bool jce_terrain_import_heightmap_r16(JceTerrain *t,
+                                      const uint16_t *src,
+                                      int src_w, int src_h)
+{
+    if (!t || !t->heights || !src || src_w < 1 || src_h < 1) return false;
+
+    size_t n = (size_t)src_w * (size_t)src_h;
+    float *norm = (float *)JCE_MALLOC(n * sizeof(float));
+    if (!norm) {
+        LOG_WARN("terrain", "OOM importing %dx%d r16 heightmap", src_w, src_h);
+        return false;
+    }
+    for (size_t i = 0; i < n; ++i)
+        norm[i] = (float)src[i] / 65535.0f;
+
+    bool ok = import_norm_grid(t, norm, src_w, src_h);
+    JCE_FREE(norm);
+    return ok;
+}
+
+bool jce_terrain_export_heightmap_r16(const JceTerrain *t,
+                                      uint16_t *dst, size_t cap)
+{
+    if (!t || !t->heights || !dst) return false;
+    size_t n = (size_t)t->w * (size_t)t->h;
+    if (cap < n) return false;
+    for (size_t i = 0; i < n; ++i) {
+        float v = clampf(t->heights[i], 0.0f, 1.0f);
+        /* Round-to-nearest into 0..65535 so import->export round-trips. */
+        long q = (long)(v * 65535.0f + 0.5f);
+        if (q < 0) q = 0;
+        if (q > 65535) q = 65535;
+        dst[i] = (uint16_t)q;
+    }
+    return true;
+}
+
+bool jce_terrain_import_heightmap_file(JceTerrain *t, const char *path)
+{
+    if (!t || !t->heights || !path || !*path) return false;
+
+    uint64_t got = 0;
+    uint8_t *file = (uint8_t *)jce_fs_host_read_all(path, &got);
+    if (!file || got == 0) {
+        if (file) jce_fs_buffer_free(file);
+        LOG_WARN("terrain", "heightmap file unreadable: %s", path);
+        return false;
+    }
+
+    bool ok = false;
+
+    /* Try a real image codec first (PNG/JPG/BMP/TGA/PSD/...).  stb takes the
+     * buffer length as an int, so a file larger than INT_MAX cannot go through
+     * the codec path safely (the cast would wrap negative / truncate); skip
+     * straight to the headerless RAW / warn branch in that case. */
+    int w = 0, h = 0, comp = 0;
+    /* 16-bit load promotes 8-bit sources to the full 0..65535 range. */
+    stbi_us *px16 = (got > (uint64_t)INT_MAX)
+                  ? NULL
+                  : stbi_load_16_from_memory((const stbi_uc *)file, (int)got,
+                                             &w, &h, &comp, /*req_comp=*/1);
+    if (px16 && w > 0 && h > 0) {
+        size_t n = (size_t)w * (size_t)h;
+        float *norm = (float *)JCE_MALLOC(n * sizeof(float));
+        if (norm) {
+            for (size_t i = 0; i < n; ++i)
+                norm[i] = (float)px16[i] / 65535.0f;
+            ok = import_norm_grid(t, norm, w, h);
+            JCE_FREE(norm);
+        } else {
+            LOG_WARN("terrain", "OOM decoding heightmap image: %s", path);
+        }
+        stbi_image_free(px16);
+    } else {
+        if (px16) stbi_image_free(px16);
+        /* Fallback: headerless RAW grayscale.  Infer bit depth + square or
+         * grid-matching dims from the byte count. */
+        size_t W = (size_t)t->w, H = (size_t)t->h;
+        size_t grid = W * H;
+        if (grid > 0 && (size_t)got == grid * 2u) {
+            /* 16-bit RAW matching the terrain grid (little-endian). */
+            float *norm = (float *)JCE_MALLOC(grid * sizeof(float));
+            if (norm) {
+                for (size_t i = 0; i < grid; ++i) {
+                    uint16_t s = (uint16_t)(file[i * 2u]
+                               | ((uint16_t)file[i * 2u + 1u] << 8));
+                    norm[i] = (float)s / 65535.0f;
+                }
+                ok = import_norm_grid(t, norm, t->w, t->h);
+                JCE_FREE(norm);
+            }
+        } else if (grid > 0 && (size_t)got == grid) {
+            /* 8-bit RAW matching the terrain grid. */
+            float *norm = (float *)JCE_MALLOC(grid * sizeof(float));
+            if (norm) {
+                for (size_t i = 0; i < grid; ++i)
+                    norm[i] = (float)file[i] / 255.0f;
+                ok = import_norm_grid(t, norm, t->w, t->h);
+                JCE_FREE(norm);
+            }
+        } else {
+            LOG_WARN("terrain",
+                     "heightmap not an image and RAW size %llu != grid %dx%d",
+                     (unsigned long long)got, t->w, t->h);
+        }
+    }
+
+    jce_fs_buffer_free(file);
+    return ok;
 }

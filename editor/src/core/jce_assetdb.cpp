@@ -17,6 +17,7 @@
 
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_path.h>
+#include <jce/os/core/jce_timer.h>
 
 #include <algorithm>
 #include <cctype>
@@ -41,6 +42,11 @@ struct DB {
     /* asset_path -> referencing file paths */
     std::unordered_map<std::string, std::vector<std::string>> refs;
     bool initialized = false;
+    /* The reverse-ref ("Used By") index is an O(N^2) substring scan that is
+     * UI-only.  It is built LAZILY on the first jce_assetdb_find_references()
+     * call rather than synchronously on root-set, to keep it off the
+     * time-to-first-frame path (it dominated editor startup). */
+    bool refs_built = false;
 };
 
 DB &db(void)
@@ -93,21 +99,50 @@ bool is_reference_bearing(JceAssetKind k)
         || k == JCE_ASSET_KIND_DATA;
 }
 
+/* Hard ceiling + wall-clock budget so launching the editor in a huge tree
+ * (or a project root that contains a massive build/cache dir) can't block
+ * startup for many seconds.  Mirrors jce_asset_path_index.cpp. */
+static const size_t   kAssetDbFileCap      = 50000;
+static const uint64_t kAssetDbTimeBudgetMs = 3000;
+
 void scan_dir(const std::string &root)
 {
     DB &d = db();
-    
+
     struct WalkCtx {
         DB *db;
         std::string root;
+        uint64_t start_ms;
     } ctx;
     ctx.db = &d;
     ctx.root = root;
-    
+    ctx.start_ms = jce_time_ticks_ms();
+
     auto cb = [](const char *path, bool is_dir, void *ud) -> bool {
-        if (is_dir) return true;
-        
         WalkCtx *c = static_cast<WalkCtx*>(ud);
+
+        /* jce_fs_host_walk treats a `false` return as STOP-WHOLE-WALK (not
+         * skip-subtree), so caps abort the walk and dir-skips are done as a
+         * per-file path-segment check below. */
+        if (c->db->entries.size() >= kAssetDbFileCap) return false;
+        if (c->start_ms != 0 &&
+            (jce_time_ticks_ms() - c->start_ms) > kAssetDbTimeBudgetMs)
+            return false;
+        if (is_dir) return true;
+
+        /* Skip files inside obvious build/cache/VCS/system dirs — they hold
+         * no authorable source assets and otherwise bloat the scan + the
+         * O(N^2) reverse-ref build. */
+        static const char *const skip_segments[] = {
+            "/build/", "\\build\\", "/dist/", "\\dist\\",
+            "/.git/", "\\.git\\", "/node_modules/", "\\node_modules\\",
+            "/CMakeFiles/", "\\CMakeFiles\\", "/.vs/", "\\.vs\\",
+            "/.jce/cache/", "\\.jce\\cache\\",
+        };
+        for (const char *seg : skip_segments) {
+            if (std::strstr(path, seg)) return true;
+        }
+
         std::string spath = path;
         std::string path_norm = norm(spath);
         
@@ -211,6 +246,7 @@ void jce_assetdb_set_root(const char *project_root)
     d.entries.clear();
     d.path_to_idx.clear();
     d.refs.clear();
+    d.refs_built = false;
     d.initialized = false;
     if (!d.project_root.empty()) jce_assetdb_rescan();
 }
@@ -221,15 +257,18 @@ void jce_assetdb_rescan(void)
     d.entries.clear();
     d.path_to_idx.clear();
     d.refs.clear();
+    d.refs_built = false;
     if (d.project_root.empty()) { d.initialized = true; return; }
 
-    if (!jce_fs_host_exists_dir(d.project_root.c_str())) { 
-        d.initialized = true; 
-        return; 
+    if (!jce_fs_host_exists_dir(d.project_root.c_str())) {
+        d.initialized = true;
+        return;
     }
 
     scan_dir(d.project_root);
-    build_refs();
+    /* build_refs() is deferred: it is an O(N^2) UI-only "Used By" scan and
+     * built lazily on the first jce_assetdb_find_references() call so it no
+     * longer blocks editor startup / project-switch. */
     d.initialized = true;
 }
 
@@ -293,6 +332,12 @@ int jce_assetdb_find_references(const char *asset_path,
 {
     if (!asset_path) return 0;
     DB &d = db();
+    /* Lazily build the reverse-ref index on first use (deferred off the
+     * startup / project-switch path; see DB::refs_built). */
+    if (!d.refs_built) {
+        build_refs();
+        d.refs_built = true;
+    }
     std::string key = norm(asset_path);
     auto it = d.refs.find(key);
     if (it == d.refs.end()) return 0;

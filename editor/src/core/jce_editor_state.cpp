@@ -23,9 +23,11 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_set>
 
 #include <jce/os/core/jce_str.h>
 #include <jce/middleware/physics/jce_cloth.h>
+#include <jce/resource/jce_world_streamer.h>
 
 /* Forward-declare only the functions we need from scene_render,
    avoiding a full include that creates a cpp-level circular dependency. */
@@ -247,7 +249,7 @@ static void build_demo_scene(void)
 
 /* ── Init / Shutdown ─────────────────────────────────────────────── */
 
-void jce_editor_state_init(void)
+void jce_editor_state_init(bool with_demo_scene)
 {
     memset(&s, 0, sizeof(s));
     g_entity_order.clear();
@@ -295,7 +297,7 @@ void jce_editor_state_init(void)
         LOG_ERROR(LOG_TAG, "failed to create engine scene");
     }
 
-    {
+    if (with_demo_scene) {
         /* Note: clear_scene_entities() is intentionally NOT called here.
            It would destroy the scene we just created and recreate it,
            plus clear containers/selection that are already empty after
@@ -308,12 +310,14 @@ void jce_editor_state_init(void)
         s_suppress_add_component_log = true;
         build_demo_scene();
         s_suppress_add_component_log = false;
-        jce_editor_scene_ensure_rendering_settings(s.scene);
     }
+    /* Always ensure the scene has render settings (empty or demo). */
+    jce_editor_scene_ensure_rendering_settings(s.scene);
 
     s.initialized = true;
-    LOG_INFO(LOG_TAG, "editor state initialized (%d demo entities)",
-             (int)g_entity_order.size());
+    LOG_INFO(LOG_TAG, "editor state initialized (%d entities%s)",
+             (int)g_entity_order.size(),
+             with_demo_scene ? ", demo" : ", empty — restoring scene");
 }
 
 bool jce_state_new_default_scene(void)
@@ -488,6 +492,201 @@ bool jce_state_entity_exists(uint32_t id)
     return jce_scene_has_editor_meta(s.scene, (JceEntity)id);
 }
 
+/* SAFE liveness check: pure membership test against the editor's known-entity
+ * list (no ECS getter), so it never faults on a stale/foreign id — unlike
+ * casting an arbitrary id to a flecs handle and calling ecs_get_id on it. */
+bool jce_state_entity_alive(uint32_t id)
+{
+    if (id == 0) return false;
+    for (uint32_t e : g_entity_order)
+        if (e == id) return true;
+    return false;
+}
+
+/* Resolve an entity by its display name (EditorMeta name) to a LIVE editor id,
+ * or 0 if none.  Iterates only known-live entities, so it is crash-safe and the
+ * returned id is always alive — the robust way to bind by name (scene-file ids
+ * are NOT the editor's live ids). */
+uint32_t jce_state_find_by_name(const char *name)
+{
+    if (!name || !name[0] || !s.scene) return 0;
+    for (uint32_t id : g_entity_order) {
+        const char *nm = jce_state_entity_name(id);
+        if (nm && std::strcmp(nm, name) == 0) return id;
+    }
+    return 0;
+}
+
+/* Drop entities the RUNTIME destroyed (jce.destroy during Play) from the
+ * editor's mirror list + selection.  Without this the hierarchy iterates a
+ * stale id and calls ecs_get_parent on a dead flecs handle -> ACCESS_VIOLATION.
+ * Uses jce_scene_has_editor_meta (an ecs_has query — safe on a non-alive id,
+ * unlike the ecs_get_parent that crashed). Call once per frame during Play. */
+void jce_state_prune_dead(void)
+{
+    if (!s.scene) return;
+    for (size_t i = 0; i < g_entity_order.size(); ) {
+        uint32_t id = g_entity_order[i];
+        if (id != 0 && jce_scene_has_editor_meta(s.scene, (JceEntity)id)) {
+            ++i;                              /* still alive */
+        } else {
+            jce_state_deselect_entity(id);   /* drop from selection/focus too */
+            g_entity_order.erase(g_entity_order.begin() + (long)i);
+        }
+    }
+    /* Also drop any SELECTED entity that is no longer alive even if it was never
+     * in g_entity_order — e.g. a STREAMED chunk entity the user picked in the
+     * viewport whose chunk then unloaded.  Without this the gizmo / inspector
+     * would dereference a dead id and crash.  Backwards because deselect shifts. */
+    for (int i = (int)s.selected_count - 1; i >= 0; --i) {
+        uint32_t id = s.selected[i];
+        if (id == 0 || !jce_scene_has_editor_meta(s.scene, (JceEntity)id))
+            jce_state_deselect_entity(id);
+    }
+}
+
+/* ── World-streaming hierarchy integration ───────────────────────────
+ * Mirror streamed chunk entities into the editor's g_entity_order so they are
+ * first-class: listed in the Hierarchy panel and selectable like any object.
+ * The world streamer fires these (per chunk load/unload, main thread) — the
+ * spawn callback appends the chunk's freshly-spawned ids; the despawn callback
+ * removes them (and clears any selection) before they are destroyed. */
+static void streamer_spawn_cb(const uint64_t *ids, uint32_t count, void *user)
+{
+    (void)user;
+    g_entity_order.reserve(g_entity_order.size() + count);
+    for (uint32_t i = 0; i < count; i++)
+        if (ids[i]) g_entity_order.push_back((uint32_t)ids[i]);
+}
+
+static void streamer_despawn_cb(const uint64_t *ids, uint32_t count, void *user)
+{
+    (void)user;
+    if (count == 0) return;
+    std::unordered_set<uint32_t> dead;
+    dead.reserve(count * 2u);
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t e = (uint32_t)ids[i];
+        dead.insert(e);
+        jce_state_deselect_entity(e);   /* drop selection before the id dies */
+    }
+    g_entity_order.erase(
+        std::remove_if(g_entity_order.begin(), g_entity_order.end(),
+                       [&](uint32_t e) { return dead.find(e) != dead.end(); }),
+        g_entity_order.end());
+}
+
+/* Install the spawn/despawn hierarchy hooks on a streamer (editor preview +
+ * Play call this after creating their streamer; the runtime never does). */
+void jce_state_attach_streamer_hierarchy(JceWorldStreamer *ws)
+{
+    if (!ws) return;
+    jce_world_streamer_set_entity_callbacks(ws, streamer_spawn_cb,
+                                            streamer_despawn_cb, NULL);
+}
+
+/* ── HLOD far-skyline proxy coordination ─────────────────────────────
+ * The streaming radial city ships a cheap per-chunk box "massing" proxy
+ * (entity HLOD_<gx>_<gz>, baked by build/gen_hlod.py into the MASTER scene so
+ * it is always resident).  These proxies render the whole skyline as grey
+ * blocks; when a chunk's *detailed* buildings stream in we HIDE its proxy
+ * (disable the MeshRenderer component) so the real geometry shows, and we SHOW
+ * it again the moment the chunk unloads — so the far view is never empty
+ * beyond the resident window.  The chunk-level streamer callback carries the
+ * chunk id; we map id -> proxy entity once at attach time from the scene's
+ * streaming chunk table (chunk path "scenes/chunks/cell_<gx>_<gz>.scene.json"
+ * -> proxy name "HLOD_<gx>_<gz>").  No reverse entity-id mapping needed. */
+static std::unordered_map<uint32_t, uint32_t> g_hlod_proxy_by_chunk; /* chunk id -> proxy entity id */
+
+/* Parse "<dir>/cell_<gx>_<gz>.scene.json" -> the proxy name "HLOD_<gx>_<gz>".
+ * Returns false if the path is not a chunk fragment of that form. */
+static bool hlod_proxy_name_from_chunk_path(const char *path,
+                                            char *out, size_t out_sz)
+{
+    if (!path || !out || out_sz == 0) return false;
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    if (strncmp(base, "cell_", 5) != 0) return false;
+    const char *coords = base + 5;
+    /* Strip a trailing ".scene.json" (or any extension) so only "<gx>_<gz>"
+     * remains; the two integers can each be negative. */
+    char buf[64];
+    size_t n = 0;
+    for (const char *p = coords; *p && *p != '.' && n + 1 < sizeof(buf); ++p)
+        buf[n++] = *p;
+    buf[n] = '\0';
+    int gx = 0, gz = 0;
+    if (sscanf(buf, "%d_%d", &gx, &gz) != 2) return false;
+    snprintf(out, out_sz, "HLOD_%d_%d", gx, gz);
+    return true;
+}
+
+static void hlod_set_proxy_visible(uint32_t proxy_id, bool visible)
+{
+    if (!s.scene || proxy_id == 0) return;
+    if (!jce_scene_has_editor_meta(s.scene, (JceEntity)proxy_id)) return; /* dead */
+    /* Toggle the MeshRenderer component: the scene renderer skips drawing a
+     * mesh whose MeshRenderer is disabled (both scene-view and game-view share
+     * that path), and the data persists either way. */
+    jce_scene_set_component_enabled(s.scene, (JceEntity)proxy_id,
+                                    JCE_COMP_FLAG_MESH_RENDERER, visible);
+}
+
+/* Streamer chunk-state hook: chunk resident -> hide its proxy; chunk gone ->
+ * show it.  Fired per chunk load/unload on the main thread (never per frame). */
+static void hlod_chunk_state_cb(uint32_t chunk_id, bool loaded, void *user)
+{
+    (void)user;
+    auto it = g_hlod_proxy_by_chunk.find(chunk_id);
+    if (it == g_hlod_proxy_by_chunk.end()) return;   /* no proxy for this chunk */
+    hlod_set_proxy_visible(it->second, /*visible=*/!loaded);
+}
+
+/* Reset every known proxy to VISIBLE — the baseline before any chunk is
+ * resident.  Called at attach (in case a prior session left some hidden) and
+ * on teardown (so the master scene's proxies are all shown again). */
+static void hlod_show_all_proxies(void)
+{
+    for (auto &kv : g_hlod_proxy_by_chunk)
+        hlod_set_proxy_visible(kv.second, true);
+}
+
+/* Build the chunk-id -> proxy-entity map from the scene's streaming table and
+ * install the chunk-state callback so streamed chunks toggle their HLOD proxy.
+ * Safe no-op when no HLOD proxies were baked (map ends up empty). */
+void jce_state_attach_streamer_hlod(JceWorldStreamer *ws)
+{
+    if (!ws || !s.scene) return;
+    g_hlod_proxy_by_chunk.clear();
+
+    const JceSceneStreamingSettings *st =
+        jce_scene_get_streaming_settings(s.scene);
+    if (st) {
+        for (uint32_t i = 0; i < st->chunk_count; ++i) {
+            const JceSceneStreamChunk *c = &st->chunks[i];
+            if (c->path[0] == '\0') continue;
+            char proxy_name[64];
+            if (!hlod_proxy_name_from_chunk_path(c->path, proxy_name,
+                                                 sizeof proxy_name))
+                continue;
+            uint32_t pid = jce_state_find_by_name(proxy_name);
+            if (pid) g_hlod_proxy_by_chunk[c->id] = pid;
+        }
+    }
+
+    /* Baseline: all proxies visible (resident chunks will hide theirs on load). */
+    hlod_show_all_proxies();
+    jce_world_streamer_set_chunk_callback(ws, hlod_chunk_state_cb, NULL);
+}
+
+/* Re-show every proxy and forget the map (call when a streamer is torn down so
+ * the always-resident master proxies don't stay hidden after streaming ends). */
+void jce_state_detach_streamer_hlod(void)
+{
+    hlod_show_all_proxies();
+    g_hlod_proxy_by_chunk.clear();
+}
+
 /* ── Entity property queries (read-through to ECS) ───────────────── */
 
 const char *jce_state_entity_name(uint32_t id)
@@ -582,6 +781,18 @@ uint32_t jce_state_get_root_id(int index)
         }
     }
     return 0;
+}
+
+int jce_state_get_roots(uint32_t *out, int max)
+{
+    if (!s.scene || !out || max <= 0) return 0;
+    int n = 0;
+    for (uint32_t id : g_entity_order) {
+        if (n >= max) break;
+        if (jce_scene_get_parent(s.scene, (JceEntity)id) == JCE_ENTITY_INVALID)
+            out[n++] = id;
+    }
+    return n;
 }
 
 /* ── Entity CRUD ─────────────────────────────────────────────────── */
@@ -773,71 +984,39 @@ void jce_state_reorder_sibling(uint32_t entity_id, uint32_t ref_id,
 
 static void duplicate_components(JceEntity src, JceEntity dst)
 {
-    if (jce_scene_has_transform(s.scene, src))
-        jce_scene_set_transform(s.scene, dst, jce_scene_get_transform(s.scene, src));
-    if (jce_scene_has_mesh_renderer(s.scene, src))
-        jce_scene_set_mesh_renderer(s.scene, dst, jce_scene_get_mesh_renderer(s.scene, src));
-    if (jce_scene_has_compound_collider(s.scene, src))
-        jce_scene_set_compound_collider(s.scene, dst, jce_scene_get_compound_collider(s.scene, src));
-    if (jce_scene_has_camera(s.scene, src))
-        jce_scene_set_camera(s.scene, dst, jce_scene_get_camera(s.scene, src));
-    if (jce_scene_has_dir_light(s.scene, src))
-        jce_scene_set_dir_light(s.scene, dst, jce_scene_get_dir_light(s.scene, src));
-    if (jce_scene_has_point_light(s.scene, src))
-        jce_scene_set_point_light(s.scene, dst, jce_scene_get_point_light(s.scene, src));
-    if (jce_scene_has_spot_light(s.scene, src))
-        jce_scene_set_spot_light(s.scene, dst, jce_scene_get_spot_light(s.scene, src));
-    if (jce_scene_has_skybox(s.scene, src))
-        jce_scene_set_skybox(s.scene, dst, jce_scene_get_skybox(s.scene, src));
-    if (jce_scene_has_sprite_renderer(s.scene, src))
-        jce_scene_set_sprite_renderer(s.scene, dst, jce_scene_get_sprite_renderer(s.scene, src));
-    if (jce_scene_has_sprite_animator(s.scene, src))
-        jce_scene_set_sprite_animator(s.scene, dst, jce_scene_get_sprite_animator(s.scene, src));
-    if (jce_scene_has_animator(s.scene, src))
-        jce_scene_set_animator(s.scene, dst, jce_scene_get_animator(s.scene, src));
-    if (jce_scene_has_skeletal_animator(s.scene, src))
-        jce_scene_set_skeletal_animator(s.scene, dst, jce_scene_get_skeletal_animator(s.scene, src));
-    if (jce_scene_has_constraint(s.scene, src))
-        jce_scene_set_constraint(s.scene, dst, jce_scene_get_constraint(s.scene, src));
-    if (jce_scene_has_rigidbody(s.scene, src))
-        jce_scene_set_rigidbody(s.scene, dst, jce_scene_get_rigidbody(s.scene, src));
-    if (jce_scene_has_box_collider(s.scene, src))
-        jce_scene_set_box_collider(s.scene, dst, jce_scene_get_box_collider(s.scene, src));
-    if (jce_scene_has_sphere_collider(s.scene, src))
-        jce_scene_set_sphere_collider(s.scene, dst, jce_scene_get_sphere_collider(s.scene, src));
-    if (jce_scene_has_character_controller(s.scene, src))
-        jce_scene_set_character_controller(s.scene, dst, jce_scene_get_character_controller(s.scene, src));
-    if (jce_scene_has_audio_source(s.scene, src))
-        jce_scene_set_audio_source(s.scene, dst, jce_scene_get_audio_source(s.scene, src));
-    if (jce_scene_has_script(s.scene, src))
-        jce_scene_set_script(s.scene, dst, jce_scene_get_script(s.scene, src));
-    /* New this-sprint components carrying engine-owned runtime handles.
-     * VideoPlayer's flecs copy hook duplicates the authoring fields only and
-     * clears the duplicate's decoder/texture, so a plain set is safe.
-     * ParticleEmitter has NO copy hook (the scene uses mark-and-sweep), so
-     * ecs_set_ptr memcpys `loaded`/`emitter_handle_idx` verbatim — leaving the
-     * copy aliasing the source's live emitter (jce_scene_particles.c skips the
-     * rebuild while loaded && asset_epoch matches).  Reset the duplicate's
-     * runtime bookkeeping so it builds its OWN emitter on first tick. */
-    if (jce_scene_has_particle_emitter(s.scene, src)) {
-        jce_scene_set_particle_emitter(s.scene, dst, jce_scene_get_particle_emitter(s.scene, src));
-        if (JceParticleEmitterComponent *pe = jce_scene_get_particle_emitter(s.scene, dst)) {
-            pe->loaded             = false;
-            pe->emitter_handle_idx = UINT32_MAX;
-            pe->asset_epoch        = 0;
-        }
+    jce_editor_component_defaults_ensure_registered();
+
+    /* Generic registry-driven deep copy: every editor descriptor row whose
+     * engine row exposes get/set is copied (descriptor-table order keeps
+     * Transform first, exactly like the old explicit chain).
+     *
+     * Runtime-handle notes (preserved from the old explicit chain):
+     *  - VideoPlayer / SequencePlayer: their flecs copy hooks duplicate the
+     *    authoring fields only and clear the duplicate's runtime handles, so
+     *    a plain set is safe.
+     *  - ParticleEmitter / Cloth have NO such hook — their registered
+     *    dup_fixup resets the duplicate's runtime bookkeeping so it builds
+     *    its OWN emitter/cloth on first tick.
+     *  - EditorMeta is skipped: jce_state_duplicate_entity() already set the
+     *    "(Copy)" name and copies the meta extras itself. */
+    std::vector<uint8_t> tmp;
+    int n = jce_editor_component_descriptor_count();
+    for (int i = 0; i < n; i++) {
+        const JceEditorComponentDescriptor *d =
+            jce_editor_component_descriptor_at(i);
+        if (!d || d->slot == JCE_COMP_FLAG_EDITOR_META) continue;
+        int cid = d->comp_id;
+        if (cid == JCE_COMP_ID_INVALID) continue;
+        if (!jce_scene_has_comp(s.scene, src, cid)) continue;
+        uint32_t sz = 0;
+        void *p = jce_scene_get_comp(s.scene, src, cid, &sz);
+        if (!p || sz == 0) continue;   /* row without raw accessor (Light group) */
+        /* Snapshot before the set: adding a component to dst can move flecs
+         * table rows, which may invalidate the src pointer mid-copy. */
+        tmp.assign((const uint8_t *)p, (const uint8_t *)p + sz);
+        if (!jce_scene_set_comp(s.scene, dst, cid, tmp.data())) continue;
+        if (d->dup_fixup) d->dup_fixup(s.scene, dst);
     }
-    if (jce_scene_has_video_player(s.scene, src))
-        jce_scene_set_video_player(s.scene, dst, jce_scene_get_video_player(s.scene, src));
-    if (jce_scene_has_nav_agent(s.scene, src))
-        jce_scene_set_nav_agent(s.scene, dst, jce_scene_get_nav_agent(s.scene, src));
-    if (jce_scene_has_ik_constraints(s.scene, src))
-        jce_scene_set_ik_constraints(s.scene, dst, jce_scene_get_ik_constraints(s.scene, src));
-    /* SequencePlayer's flecs copy hook (jce_scene_sequencer.c) duplicates
-     * the authoring fields only and clears the duplicate's runtime handle,
-     * so a plain set is safe — same contract as VideoPlayer. */
-    if (jce_scene_has_sequence_player(s.scene, src))
-        jce_scene_set_sequence_player(s.scene, dst, jce_scene_get_sequence_player(s.scene, src));
 }
 
 uint32_t jce_state_duplicate_entity(uint32_t id)
@@ -886,815 +1065,69 @@ uint32_t jce_state_duplicate_entity(uint32_t id)
 
 /* ── Component management ────────────────────────────────────────── */
 
-/* Replication keys on NetworkObject (rt_spawn_net skips entities without
- * it), so adding any Net* component auto-adds the gatekeeper too —
- * otherwise the authored Net* data is silently inert at runtime. */
-static void ensure_network_object(JceEntity e)
+void jce_state_add_component_id(uint32_t entity_id, int comp_id)
 {
-    if (!s.scene || jce_scene_has_network_object(s.scene, e)) return;
-    JceNetworkObjectComponent no; memset(&no, 0, sizeof no);
-    jce_scene_set_network_object(s.scene, e, &no);
+    HistoryEditScope edit_scope;
+
+    if (!s.scene || entity_id == 0) return;
+    JceEntity e = (JceEntity)entity_id;
+
+    /* Registry route: dense comp_id -> descriptor row -> registered
+     * default-init.  The per-component default bodies (and the Net*
+     * ensure-NetworkObject hooks) live in
+     * jce_editor_component_defaults.cpp. */
+    jce_editor_component_defaults_ensure_registered();
+    const JceEditorComponentDescriptor *desc =
+        jce_editor_component_find_by_id(comp_id);
+    if (!desc || !desc->add_default) return;
+    if (jce_scene_has_comp(s.scene, e, comp_id)) return;
+
+    desc->add_default(s.scene, e);
+
+    if (!s_suppress_add_component_log) {
+        LOG_INFO(LOG_TAG, "add component %s to entity %u",
+                 desc->display_name, entity_id);
+    }
 }
 
 void jce_state_add_component(uint32_t entity_id, uint64_t comp_flag)
 {
-    HistoryEditScope edit_scope;
-
-    if (!s.scene || entity_id == 0) return;
-    JceEntity e = (JceEntity)entity_id;
-
-    switch (comp_flag) {
-    case JCE_COMP_FLAG_TRANSFORM: {
-        if (jce_scene_has_transform(s.scene, e)) return;
-        JceTransform t;
-        t.position = jce_v3(0.0f, 0.0f, 0.0f);
-        t.rotation = jce_q_identity();
-        t.scale    = jce_v3(1.0f, 1.0f, 1.0f);
-        jce_scene_set_transform(s.scene, e, &t);
-        break;
-    }
-    case JCE_COMP_FLAG_MESH_RENDERER: {
-        if (jce_scene_has_mesh_renderer(s.scene, e)) return;
-        JceMeshRenderer mr;
-        memset(&mr, 0, sizeof(mr));
-        mr.visible        = true;
-        mr.base_color[0]  = 1.0f;
-        mr.base_color[1]  = 1.0f;
-        mr.base_color[2]  = 1.0f;
-        mr.base_color[3]  = 1.0f;
-        mr.metallic       = 0.0f;
-        mr.roughness      = 0.5f;
-        mr.normal_scale   = 1.0f;
-        mr.ao_strength    = 1.0f;
-        mr.alpha_cutoff   = 0.5f;
-        jce_scene_set_mesh_renderer(s.scene, e, &mr);
-        break;
-    }
-    case JCE_COMP_FLAG_CAMERA: {
-        if (jce_scene_has_camera(s.scene, e)) return;
-        JceCameraComponent c;
-        memset(&c, 0, sizeof(c));
-        c.fov_deg    = 60.0f;
-        c.near_plane = 0.1f;
-        c.far_plane  = 1000.0f;
-        c.is_primary = false;
-        c.ortho      = false;
-        jce_scene_set_camera(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_DIR_LIGHT: {
-        if (jce_scene_has_dir_light(s.scene, e)) return;
-        JceDirectionalLight l;
-        memset(&l, 0, sizeof(l));
-        l.direction    = jce_v3(0.0f, -1.0f, 0.0f);
-        l.color        = jce_v3(1.0f, 1.0f, 1.0f);
-        l.intensity    = 1.0f;
-        l.casts_shadow = true;
-        l.cookie_texture.idx = UINT16_MAX;
-        jce_scene_set_dir_light(s.scene, e, &l);
-        break;
-    }
-    case JCE_COMP_FLAG_POINT_LIGHT: {
-        if (jce_scene_has_point_light(s.scene, e)) return;
-        JcePointLight l;
-        memset(&l, 0, sizeof(l));
-        l.position  = jce_v3(0.0f, 0.0f, 0.0f);
-        l.color     = jce_v3(1.0f, 1.0f, 1.0f);
-        l.intensity = 1.0f;
-        l.radius    = 10.0f;
-        jce_scene_set_point_light(s.scene, e, &l);
-        break;
-    }
-    case JCE_COMP_FLAG_SPOT_LIGHT: {
-        if (jce_scene_has_spot_light(s.scene, e)) return;
-        JceSpotLight l;
-        memset(&l, 0, sizeof(l));
-        l.position       = jce_v3(0.0f, 0.0f, 0.0f);
-        l.direction      = jce_v3(0.0f, -1.0f, 0.0f);
-        l.color          = jce_v3(1.0f, 1.0f, 1.0f);
-        l.intensity      = 1.0f;
-        l.radius         = 10.0f;
-        l.inner_cone_cos = 0.95f;
-        l.outer_cone_cos = 0.85f;
-        l.cookie_texture.idx = UINT16_MAX;
-        l.ies_lut_texture.idx = UINT16_MAX;
-        jce_scene_set_spot_light(s.scene, e, &l);
-        break;
-    }
-    case JCE_COMP_FLAG_SKYBOX: {
-        if (jce_scene_has_skybox(s.scene, e)) return;
-        JceSkyboxComponent c;
-        memset(&c, 0, sizeof(c));
-        c.exposure   = 1.0f;
-        c.use_as_ibl = true;
-        jce_scene_set_skybox(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_SPRITE_RENDERER: {
-        if (jce_scene_has_sprite_renderer(s.scene, e)) return;
-        JceSpriteRendererComponent c;
-        memset(&c, 0, sizeof(c));
-        c.color[0] = 1.0f; c.color[1] = 1.0f;
-        c.color[2] = 1.0f; c.color[3] = 1.0f;
-        jce_scene_set_sprite_renderer(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_SPRITE_ANIMATOR: {
-        if (jce_scene_has_sprite_animator(s.scene, e)) return;
-        JceSpriteAnimatorComponent c;
-        memset(&c, 0, sizeof(c));
-        c.frame_width  = 64;
-        c.frame_height = 64;
-        c.speed        = 1.0f;
-        c.loop         = true;
-        jce_scene_set_sprite_animator(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_ANIMATOR: {
-        if (jce_scene_has_animator(s.scene, e)) return;
-        JceAnimatorComponent c;
-        memset(&c, 0, sizeof(c));
-        c.speed = 1.0f;
-        c.loop  = true;
-        jce_scene_set_animator(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_SKELETAL_ANIMATOR: {
-        if (jce_scene_has_skeletal_animator(s.scene, e)) return;
-        JceSkeletalAnimatorComponent c;
-        memset(&c, 0, sizeof(c));
-        c.speed = 1.0f;
-        c.loop  = true;
-        jce_scene_set_skeletal_animator(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_CONSTRAINT: {
-        if (jce_scene_has_constraint(s.scene, e)) return;
-        JceConstraintComponent c;
-        memset(&c, 0, sizeof(c));
-        jce_scene_set_constraint(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_RIGIDBODY: {
-        if (jce_scene_has_rigidbody(s.scene, e)) return;
-        JceRigidBodyComponent c;
-        memset(&c, 0, sizeof(c));
-        c.mass          = 1.0f;
-        c.friction      = 0.5f;
-        c.restitution   = 0.0f;
-        c.use_gravity   = true;
-        c.gravity_scale = 1.0f;
-        jce_scene_set_rigidbody(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_BOX_COLLIDER: {
-        if (jce_scene_has_box_collider(s.scene, e)) return;
-        JceBoxColliderComponent c;
-        memset(&c, 0, sizeof(c));
-        c.size[0] = 1.0f; c.size[1] = 1.0f; c.size[2] = 1.0f;
-        jce_scene_set_box_collider(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_SPHERE_COLLIDER: {
-        if (jce_scene_has_sphere_collider(s.scene, e)) return;
-        JceSphereColliderComponent c;
-        memset(&c, 0, sizeof(c));
-        c.radius = 0.5f;
-        jce_scene_set_sphere_collider(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_CHARACTER_CONTROLLER: {
-        if (jce_scene_has_character_controller(s.scene, e)) return;
-        JceCharacterControllerComponent c;
-        memset(&c, 0, sizeof(c));
-        c.height      = 2.0f;
-        c.radius      = 0.3f;
-        c.step_offset = 0.35f;
-        c.slope_limit = 45.0f;
-        c.move_speed     = 4.0f;
-        c.sprint_mult    = 1.8f;
-        c.jump_speed     = 5.0f;
-        c.accel          = 40.0f;
-        c.air_control    = 0.35f;
-        c.turn_speed_deg = 720.0f;
-        jce_scene_set_character_controller(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_AUDIO_SOURCE: {
-        if (jce_scene_has_audio_source(s.scene, e)) return;
-        JceAudioSourceComponent c;
-        memset(&c, 0, sizeof(c));
-        c.volume = 1.0f;
-        c.pitch  = 1.0f;
-        jce_scene_set_audio_source(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_SCRIPT: {
-        if (jce_scene_has_script(s.scene, e)) return;
-        JceScriptComponent c;
-        memset(&c, 0, sizeof(c));
-        jce_scene_set_script(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_TERRAIN: {
-        if (jce_scene_has_terrain(s.scene, e)) return;
-        JceTerrainComponent c;
-        memset(&c, 0, sizeof(c));
-        c.tint[0] = c.tint[1] = c.tint[2] = 1.0f;
-        c.visible = true;
-        c.tile_scale = 10.0f;
-        c.splat_enabled = true;
-        jce_scene_set_terrain(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_RIGIDBODY_2D: {
-        if (jce_scene_has_rigidbody2d(s.scene, e)) return;
-        JceRigidBody2DComponent c;
-        memset(&c, 0, sizeof(c));
-        c.mass = 1.0f;
-        c.friction = 0.5f;
-        c.restitution = 0.0f;
-        c.fixed_rotation = false;
-        jce_scene_set_rigidbody2d(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_PARTICLE_EMITTER: {
-        if (jce_scene_has_particle_emitter(s.scene, e)) return;
-        JceParticleEmitterComponent c;
-        memset(&c, 0, sizeof(c));
-        c.emit_rate    = 10.0f;
-        c.lifetime_min = 1.0f;
-        c.lifetime_max = 2.0f;
-        jce_scene_set_particle_emitter(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_BEHAVIOR_TREE: {
-        if (jce_scene_has_behavior_tree(s.scene, e)) return;
-        JceBehaviorTree c;
-        memset(&c, 0, sizeof(c));
-        c.active = true;
-        jce_scene_set_behavior_tree(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_LOD_GROUP: {
-        if (jce_scene_has_lod_group(s.scene, e)) return;
-        JceLodGroupComponent c;
-        memset(&c, 0, sizeof(c));
-        c.level_count = 3;
-        c.distances[0] = 15.0f;
-        c.distances[1] = 50.0f;
-        c.distances[2] = 150.0f;
-        c.hysteresis = 0.05f;
-        c.cull_when_too_far = true;
-        jce_scene_set_lod_group(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_VIRTUAL_CAMERA: {
-        if (jce_scene_has_virtual_camera(s.scene, e)) return;
-        JceVirtualCameraComponent c;
-        memset(&c, 0, sizeof(c));
-        snprintf(c.vcam_name, sizeof(c.vcam_name), "VCam");
-        c.priority   = 10;
-        c.active     = true;
-        c.track_mode = 0;
-        c.fov_deg    = 60.0f;
-        c.damping    = 0.5f;
-        jce_scene_set_virtual_camera(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_TRIGGER_VOLUME: {
-        if (jce_scene_has_trigger_volume(s.scene, e)) return;
-        JceTriggerVolumeComponent c;
-        memset(&c, 0, sizeof(c));
-        c.shape = 0; /* AABB */
-        c.half_extents[0] = c.half_extents[1] = c.half_extents[2] = 0.5f;
-        c.axis_x[0] = 1.0f; c.axis_y[1] = 1.0f; c.axis_z[2] = 1.0f;
-        c.enabled = true;
-        c.fire_stay = false;
-        jce_scene_set_trigger_volume(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_CAPSULE_COLLIDER: {
-        if (jce_scene_has_capsule_collider(s.scene, e)) return;
-        JceCapsuleColliderComponent c;
-        memset(&c, 0, sizeof(c));
-        c.radius = 0.5f;
-        c.height = 2.0f;
-        c.axis   = 1; /* Y */
-        jce_scene_set_capsule_collider(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_MESH_COLLIDER: {
-        if (jce_scene_has_mesh_collider(s.scene, e)) return;
-        JceMeshColliderComponent c;
-        memset(&c, 0, sizeof(c));
-        c.friction    = 0.5f;
-        c.restitution = 0.0f;
-        jce_scene_set_mesh_collider(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_COLLIDER_2D: {
-        if (jce_scene_has_collider2d(s.scene, e)) return;
-        JceCollider2DComponent c;
-        memset(&c, 0, sizeof(c));
-        c.shape = 0; /* Box */
-        c.size[0] = c.size[1] = 1.0f;
-        c.radius  = 0.5f;
-        c.friction    = 0.4f;
-        c.restitution = 0.0f;
-        jce_scene_set_collider2d(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_TRAIL_RENDERER: {
-        if (jce_scene_has_trail_renderer(s.scene, e)) return;
-        JceTrailRendererComponent c;
-        memset(&c, 0, sizeof(c));
-        c.time = 1.0f;
-        c.min_vertex_distance = 0.1f;
-        c.width_start = 0.1f;
-        c.width_end   = 0.0f;
-        c.color_start[0] = c.color_start[1] = c.color_start[2] = c.color_start[3] = 1.0f;
-        c.color_end[0]   = c.color_end[1]   = c.color_end[2]   = 1.0f;
-        c.color_end[3]   = 0.0f;
-        c.emitting = true;
-        jce_scene_set_trail_renderer(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_LINE_RENDERER: {
-        if (jce_scene_has_line_renderer(s.scene, e)) return;
-        JceLineRendererComponent c;
-        memset(&c, 0, sizeof(c));
-        c.position_count = 2;
-        c.positions[1][0] = 1.0f; /* default 2-point line along +X */
-        c.width_start = 0.1f;
-        c.width_end   = 0.1f;
-        c.color_start[0] = c.color_start[1] = c.color_start[2] = c.color_start[3] = 1.0f;
-        c.color_end[0]   = c.color_end[1]   = c.color_end[2]   = c.color_end[3]   = 1.0f;
-        c.use_world_space = true;
-        jce_scene_set_line_renderer(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_REFLECTION_PROBE: {
-        if (jce_scene_has_reflection_probe(s.scene, e)) return;
-        JceReflectionProbeComponent c;
-        memset(&c, 0, sizeof(c));
-        c.mode = 0; /* Baked */
-        c.resolution = 128;
-        c.intensity = 1.0f;
-        c.box_size[0] = c.box_size[1] = c.box_size[2] = 10.0f;
-        c.near_clip = 0.3f;
-        c.far_clip  = 1000.0f;
-        c.box_projection = true;
-        c.hdr = true;
-        jce_scene_set_reflection_probe(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_DECAL: {
-        if (jce_scene_has_decal(s.scene, e)) return;
-        JceDecalComponent c;
-        memset(&c, 0, sizeof(c));
-        c.size[0] = c.size[1] = c.size[2] = 1.0f;
-        c.color[0] = c.color[1] = c.color[2] = c.color[3] = 1.0f;
-        c.opacity = 1.0f;
-        c.draw_distance = 1000.0f;
-        c.fade_factor = 1.0f;
-        c.layer_mask = -1;
-        jce_scene_set_decal(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_LIGHT_PROBE_GROUP: {
-        if (jce_scene_has_light_probe_group(s.scene, e)) return;
-        JceLightProbeGroupComponent c;
-        memset(&c, 0, sizeof(c));
-        /* Default: 8 corners of a unit cube. */
-        c.probe_count = 8;
-        for (int i = 0; i < 8; ++i) {
-            c.positions[i][0] = (i & 1) ? 1.0f : -1.0f;
-            c.positions[i][1] = (i & 2) ? 1.0f : -1.0f;
-            c.positions[i][2] = (i & 4) ? 1.0f : -1.0f;
-        }
-        jce_scene_set_light_probe_group(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_AUDIO_LISTENER: {
-        if (jce_scene_has_audio_listener(s.scene, e)) return;
-        JceAudioListenerComponent c;
-        memset(&c, 0, sizeof(c));
-        c.volume = 1.0f;
-        c.spatialize = true;
-        c.doppler_factor = 1.0f;
-        jce_scene_set_audio_listener(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_AUDIO_REVERB_ZONE: {
-        if (jce_scene_has_audio_reverb_zone(s.scene, e)) return;
-        JceAudioReverbZoneComponent c;
-        memset(&c, 0, sizeof(c));
-        c.preset = JCE_REVERB_ZONE_PRESET_GENERIC;
-        c.min_distance = 10.0f;
-        c.max_distance = 15.0f;
-        c.room = -1000.0f;
-        c.room_hf = -100.0f;
-        c.decay_time = 1.49f;
-        c.decay_hf_ratio = 0.83f;
-        c.reflections = -2602.0f;
-        c.reflections_delay = 0.007f;
-        c.reverb = 200.0f;
-        c.reverb_delay = 0.011f;
-        c.hf_reference = 5000.0f;
-        c.diffusion = 100.0f;
-        c.density = 100.0f;
-        jce_scene_set_audio_reverb_zone(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_AUDIO_OCCLUSION: {
-        if (jce_scene_has_audio_occlusion(s.scene, e)) return;
-        JceAudioOcclusionComponent c;
-        memset(&c, 0, sizeof(c));
-        c.radius = 5.0f;
-        c.attenuation_db = -12.0f;
-        c.lowpass_cutoff_hz = 1000.0f;
-        c.layer_mask = -1;
-        c.affects_reverb = true;
-        jce_scene_set_audio_occlusion(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_SPAWN_MANAGER: {
-        if (jce_scene_has_spawn_manager(s.scene, e)) return;
-        JceSpawnManagerComponent c;
-        memset(&c, 0, sizeof(c));
-        c.enabled = 1;
-        c.max_peds = 32;
-        c.max_vehicles = 16;
-        c.min_spawn_radius = 30.0f;
-        c.max_spawn_radius = 120.0f;
-        c.despawn_pad = 30.0f;
-        c.spawn_interval = 0.5f;
-        jce_scene_set_spawn_manager(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_WEAPON: {
-        if (jce_scene_has_weapon(s.scene, e)) return;
-        JceWeaponComponent c;
-        memset(&c, 0, sizeof(c));
-        snprintf(c.name, sizeof(c.name), "%s", "Weapon");
-        c.kind = JCE_WEAPON_COMP_HITSCAN;
-        c.damage = 10.0f;
-        c.range = 100.0f;
-        c.rpm = 600.0f;
-        c.clip_size = 30;
-        c.reserve_max = 120;
-        c.reload_seconds = 2.0f;
-        c.spread_deg = 0.5f;
-        c.recoil_per_shot = 0.5f;
-        c.recoil_recovery = 8.0f;
-        c.pellets = 1;
-        c.projectile_speed = 200.0f;
-        c.full_auto = false;
-        jce_scene_set_weapon(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_SAVE_POINT: {
-        if (jce_scene_has_save_point(s.scene, e)) return;
-        JceSavePointComponent c;
-        memset(&c, 0, sizeof(c));
-        snprintf(c.save_id,      sizeof(c.save_id),      "%s", "save_point");
-        snprintf(c.display_name, sizeof(c.display_name), "%s", "Save Point");
-        c.kind = JCE_SAVE_POINT_MANUAL;
-        c.radius = 1.5f;
-        c.slot = -1;
-        c.one_shot = false;
-        c.require_interact = true;
-        jce_scene_set_save_point(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_WHEEL_COLLIDER: {
-        if (jce_scene_has_wheel_collider(s.scene, e)) return;
-        JceWheelColliderComponent c;
-        memset(&c, 0, sizeof(c));
-        c.radius = 0.5f;
-        c.suspension_distance = 0.3f;
-        c.suspension_spring = 35000.0f;
-        c.suspension_damper = 4500.0f;
-        c.suspension_target_pos = 0.5f;
-        c.mass = 20.0f;
-        c.forward_friction = 1.0f;
-        c.sideways_friction = 1.0f;
-        jce_scene_set_wheel_collider(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_CONSTANT_FORCE: {
-        if (jce_scene_has_constant_force(s.scene, e)) return;
-        JceConstantForceComponent c;
-        memset(&c, 0, sizeof(c));
-        c.enabled = true;
-        jce_scene_set_constant_force(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_CONFIGURABLE_JOINT: {
-        if (jce_scene_has_configurable_joint(s.scene, e)) return;
-        JceConfigurableJointComponent c;
-        memset(&c, 0, sizeof(c));
-        c.x_motion = c.y_motion = c.z_motion = JCE_CFG_JOINT_LOCKED;
-        c.x_rotation = c.y_rotation = c.z_rotation = JCE_CFG_JOINT_FREE;
-        c.linear_limit = 0.0f;
-        c.angular_x_limit_deg = 45.0f;
-        c.angular_y_limit_deg = 45.0f;
-        c.angular_z_limit_deg = 45.0f;
-        c.break_force = 3.4e38f;
-        c.break_torque = 3.4e38f;
-        c.enable_collision = false;
-        jce_scene_set_configurable_joint(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_CLOTH: {
-        if (jce_scene_has_cloth(s.scene, e)) return;
-        JceClothComponent c;
-        memset(&c, 0, sizeof(c));
-        /* 1x1 m horizontal patch as a sensible default. */
-        c.corner_00 = jce_v3(0.0f, 0.0f, 0.0f);
-        c.corner_10 = jce_v3(1.0f, 0.0f, 0.0f);
-        c.corner_01 = jce_v3(0.0f, 0.0f, 1.0f);
-        c.corner_11 = jce_v3(1.0f, 0.0f, 1.0f);
-        c.res_u = 8;
-        c.res_v = 8;
-        c.mass_total = 1.0f;
-        c.stiffness_linear  = 0.5f;
-        c.stiffness_angular = 0.5f;
-        c.damping    = 0.02f;
-        c.iterations = 4;
-        c.self_collision = false;
-        c.wind_enabled   = false;
-        c.wind_velocity  = jce_v3(0.0f, 0.0f, 0.0f);
-        c.pinned_count   = 0;
-        c.handle = 0;
-        c.dirty  = true;
-        jce_scene_set_cloth(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_NETWORK_OBJECT: {
-        if (jce_scene_has_network_object(s.scene, e)) return;
-        JceNetworkObjectComponent c; memset(&c, 0, sizeof c);
-        c.owner = 0; /* server-owned by default */
-        jce_scene_set_network_object(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_NET_TRANSFORM: {
-        if (jce_scene_has_net_transform(s.scene, e)) return;
-        JceNetTransformComponent c; memset(&c, 0, sizeof c);
-        c.sync_rate_hz   = 20;
-        c.interp_ms      = 100;
-        c.tolerance      = 0.5f;
-        c.authority_mode = 0;
-        jce_scene_set_net_transform(s.scene, e, &c);
-        ensure_network_object(e);
-        break;
-    }
-    case JCE_COMP_FLAG_NET_ANIMATOR: {
-        if (jce_scene_has_net_animator(s.scene, e)) return;
-        JceNetAnimatorComponent c; memset(&c, 0, sizeof c);
-        c.sync_rate_hz   = 20;
-        c.interp_ms      = 100;
-        c.authority_mode = 0;
-        jce_scene_set_net_animator(s.scene, e, &c);
-        ensure_network_object(e);
-        break;
-    }
-    case JCE_COMP_FLAG_NET_RIGIDBODY: {
-        if (jce_scene_has_net_rigidbody(s.scene, e)) return;
-        JceNetRigidbodyComponent c; memset(&c, 0, sizeof c);
-        c.sync_rate_hz   = 20;
-        c.interp_ms      = 100;
-        c.tolerance      = 0.5f;
-        c.authority_mode = 0;
-        jce_scene_set_net_rigidbody(s.scene, e, &c);
-        ensure_network_object(e);
-        break;
-    }
-    /* JCE_COMP_FLAG_VFX_GRAPH retired (v0.9.9): not addable; legacy scene
-     * data migrates onto Particle Emitter at load. */
-    case JCE_COMP_FLAG_TILEMAP: {
-        if (jce_scene_has_tilemap(s.scene, e)) return;
-        JceTilemapComponent c; memset(&c, 0, sizeof c);
-        c.cell_size_px = 16;
-        c.sort_order   = 0;
-        c.orientation  = 0;
-        c.visible      = true;
-        c.color[0] = c.color[1] = c.color[2] = c.color[3] = 1.0f;
-        jce_scene_set_tilemap(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_TILEMAP_COLLIDER_2D: {
-        if (jce_scene_has_tilemap_collider2d(s.scene, e)) return;
-        JceTilemapCollider2DComponent c; memset(&c, 0, sizeof c);
-        c.friction_x100   = 40;
-        c.bounciness_x100 = 0;
-        jce_scene_set_tilemap_collider2d(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_AVATAR: {
-        if (jce_scene_has_avatar(s.scene, e)) return;
-        JceAvatarComponent c; memset(&c, 0, sizeof c);
-        c.human_rig = true;
-        jce_scene_set_avatar(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_JOINT_2D: {
-        if (jce_scene_has_joint2d(s.scene, e)) return;
-        JceJoint2DComponent c;
-        memset(&c, 0, sizeof(c));
-        c.kind = JCE_JOINT_2D_DISTANCE;
-        c.distance = 1.0f;
-        c.frequency = 5.0f;
-        c.damping_ratio = 0.7f;
-        c.motor_speed_deg_s = 90.0f;
-        c.motor_max_torque = 10000.0f;
-        c.lower_angle_deg = -90.0f;
-        c.upper_angle_deg =  90.0f;
-        c.break_force = 3.4e38f;
-        c.break_torque = 3.4e38f;
-        c.auto_configure_distance = true;
-        jce_scene_set_joint2d(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_BILLBOARD_RENDERER: {
-        if (jce_scene_has_billboard_renderer(s.scene, e)) return;
-        JceBillboardRendererComponent c;
-        memset(&c, 0, sizeof(c));
-        c.mode = JCE_BILLBOARD_FULL;
-        c.size[0] = 1.0f; c.size[1] = 1.0f;
-        c.color[0] = c.color[1] = c.color[2] = c.color[3] = 1.0f;
-        c.visible = true;
-        jce_scene_set_billboard_renderer(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_CANVAS: {
-        if (jce_scene_has_canvas(s.scene, e)) return;
-        JceCanvasComponent c;
-        memset(&c, 0, sizeof(c));
-        c.render_mode = JCE_CANVAS_OVERLAY;
-        c.sort_order = 0;
-        c.reference_resolution[0] = 1920.0f;
-        c.reference_resolution[1] = 1080.0f;
-        c.scale_factor = 1.0f;
-        c.pixel_perfect = false;
-        jce_scene_set_canvas(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_CANVAS_GROUP: {
-        if (jce_scene_has_canvas_group(s.scene, e)) return;
-        JceCanvasGroupComponent c;
-        memset(&c, 0, sizeof(c));
-        c.alpha = 1.0f;
-        c.interactable = true;
-        c.blocks_raycasts = true;
-        c.ignore_parent_groups = false;
-        jce_scene_set_canvas_group(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_LAYOUT_GROUP: {
-        if (jce_scene_has_layout_group(s.scene, e)) return;
-        JceLayoutGroupComponent c;
-        memset(&c, 0, sizeof(c));
-        c.layout_kind = JCE_LAYOUT_VERTICAL;
-        c.spacing[0] = c.spacing[1] = 4.0f;
-        c.cell_size[0] = c.cell_size[1] = 64.0f;
-        c.child_alignment = 0;
-        c.control_child_size_w = true;
-        c.control_child_size_h = false;
-        jce_scene_set_layout_group(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_UI_IMAGE: {
-        if (jce_scene_has_ui_image(s.scene, e)) return;
-        JceUIImageComponent c;
-        memset(&c, 0, sizeof(c));
-        c.image_type = JCE_UI_IMAGE_SIMPLE;
-        c.color[0] = c.color[1] = c.color[2] = c.color[3] = 1.0f;
-        c.fill_amount = 1.0f;
-        c.preserve_aspect = false;
-        c.raycast_target = true;
-        jce_scene_set_ui_image(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_UI_TEXT: {
-        if (jce_scene_has_ui_text(s.scene, e)) return;
-        JceUITextComponent c;
-        memset(&c, 0, sizeof(c));
-        snprintf(c.text, sizeof(c.text), "%s", "New Text");
-        c.font_size = 14.0f;
-        c.alignment = JCE_UI_TEXT_ALIGN_LEFT;
-        c.color[0] = c.color[1] = c.color[2] = c.color[3] = 1.0f;
-        c.line_spacing = 1.0f;
-        c.min_size = 10;
-        c.max_size = 40;
-        jce_scene_set_ui_text(s.scene, e, &c);
-        break;
-    }
-    case JCE_COMP_FLAG_UI_BUTTON: {
-        if (jce_scene_has_ui_button(s.scene, e)) return;
-        JceUIButtonComponent c;
-        memset(&c, 0, sizeof(c));
-        c.interactable = true;
-        c.normal_color[0] = c.normal_color[1] = c.normal_color[2] = c.normal_color[3] = 1.0f;
-        c.highlighted_color[0] = 0.96f; c.highlighted_color[1] = 0.96f; c.highlighted_color[2] = 0.96f; c.highlighted_color[3] = 1.0f;
-        c.pressed_color[0] = 0.78f; c.pressed_color[1] = 0.78f; c.pressed_color[2] = 0.78f; c.pressed_color[3] = 1.0f;
-        c.disabled_color[0] = 0.78f; c.disabled_color[1] = 0.78f; c.disabled_color[2] = 0.78f; c.disabled_color[3] = 0.50f;
-        c.fade_duration = 0.1f;
-        jce_scene_set_ui_button(s.scene, e, &c);
-        break;
-    }
-    default:
-        return;
-    }
-
-    if (!s_suppress_add_component_log) {
-        LOG_INFO(LOG_TAG, "add component %s to entity %u",
-                 jce_comp_flag_display_name(comp_flag), entity_id);
-    }
+    /* Legacy-flag entry point (hierarchy/scene-view shortcuts still hold
+     * JCE_COMP_FLAG_* values); resolves to the dense-id path. */
+    const JceEditorComponentDescriptor *desc =
+        jce_editor_component_find(comp_flag);
+    if (!desc) return;
+    jce_state_add_component_id(entity_id, desc->comp_id);
 }
 
-void jce_state_remove_component(uint32_t entity_id, uint64_t comp_flag)
+void jce_state_remove_component_id(uint32_t entity_id, int comp_id)
 {
     HistoryEditScope edit_scope;
 
     if (!s.scene || entity_id == 0) return;
     JceEntity e = (JceEntity)entity_id;
 
-    switch (comp_flag) {
-    case JCE_COMP_FLAG_TRANSFORM:            jce_scene_remove_transform(s.scene, e); break;
-    case JCE_COMP_FLAG_MESH_RENDERER:        jce_scene_remove_mesh_renderer(s.scene, e); break;
-    case JCE_COMP_FLAG_CAMERA:               jce_scene_remove_camera(s.scene, e); break;
-    case JCE_COMP_FLAG_DIR_LIGHT:            jce_scene_remove_dir_light(s.scene, e); break;
-    case JCE_COMP_FLAG_POINT_LIGHT:          jce_scene_remove_point_light(s.scene, e); break;
-    case JCE_COMP_FLAG_SPOT_LIGHT:           jce_scene_remove_spot_light(s.scene, e); break;
-    case JCE_COMP_FLAG_SKYBOX:               jce_scene_remove_skybox(s.scene, e); break;
-    case JCE_COMP_FLAG_SPRITE_RENDERER:      jce_scene_remove_sprite_renderer(s.scene, e); break;
-    case JCE_COMP_FLAG_SPRITE_ANIMATOR:      jce_scene_remove_sprite_animator(s.scene, e); break;
-    case JCE_COMP_FLAG_ANIMATOR:             jce_scene_remove_animator(s.scene, e); break;
-    case JCE_COMP_FLAG_SKELETAL_ANIMATOR:    jce_scene_remove_skeletal_animator(s.scene, e); break;
-    case JCE_COMP_FLAG_CONSTRAINT:           jce_scene_remove_constraint(s.scene, e); break;
-    case JCE_COMP_FLAG_RIGIDBODY:            jce_scene_remove_rigidbody(s.scene, e); break;
-    case JCE_COMP_FLAG_BOX_COLLIDER:         jce_scene_remove_box_collider(s.scene, e); break;
-    case JCE_COMP_FLAG_SPHERE_COLLIDER:      jce_scene_remove_sphere_collider(s.scene, e); break;
-    case JCE_COMP_FLAG_CHARACTER_CONTROLLER: jce_scene_remove_character_controller(s.scene, e); break;
-    case JCE_COMP_FLAG_AUDIO_SOURCE:         jce_scene_remove_audio_source(s.scene, e); break;
-    case JCE_COMP_FLAG_SCRIPT:               jce_scene_remove_script(s.scene, e); break;
-    case JCE_COMP_FLAG_TERRAIN:              jce_scene_remove_terrain(s.scene, e); break;
-    case JCE_COMP_FLAG_RIGIDBODY_2D:         jce_scene_remove_rigidbody2d(s.scene, e); break;
-    case JCE_COMP_FLAG_PARTICLE_EMITTER:     jce_scene_remove_particle_emitter(s.scene, e); break;
-    case JCE_COMP_FLAG_BEHAVIOR_TREE:        jce_scene_remove_behavior_tree(s.scene, e); break;
-    case JCE_COMP_FLAG_LOD_GROUP:            jce_scene_remove_lod_group(s.scene, e); break;
-    case JCE_COMP_FLAG_VIRTUAL_CAMERA:       jce_scene_remove_virtual_camera(s.scene, e); break;
-    case JCE_COMP_FLAG_TRIGGER_VOLUME:       jce_scene_remove_trigger_volume(s.scene, e); break;
-    case JCE_COMP_FLAG_CAPSULE_COLLIDER:     jce_scene_remove_capsule_collider(s.scene, e); break;
-    case JCE_COMP_FLAG_MESH_COLLIDER:        jce_scene_remove_mesh_collider(s.scene, e); break;
-    case JCE_COMP_FLAG_COLLIDER_2D:          jce_scene_remove_collider2d(s.scene, e); break;
-    case JCE_COMP_FLAG_TRAIL_RENDERER:       jce_scene_remove_trail_renderer(s.scene, e); break;
-    case JCE_COMP_FLAG_LINE_RENDERER:        jce_scene_remove_line_renderer(s.scene, e); break;
-    case JCE_COMP_FLAG_REFLECTION_PROBE:     jce_scene_remove_reflection_probe(s.scene, e); break;
-    case JCE_COMP_FLAG_DECAL:                jce_scene_remove_decal(s.scene, e); break;
-    case JCE_COMP_FLAG_LIGHT_PROBE_GROUP:    jce_scene_remove_light_probe_group(s.scene, e); break;
-    case JCE_COMP_FLAG_AUDIO_LISTENER:       jce_scene_remove_audio_listener(s.scene, e); break;
-    case JCE_COMP_FLAG_AUDIO_REVERB_ZONE:    jce_scene_remove_audio_reverb_zone(s.scene, e); break;
-    case JCE_COMP_FLAG_AUDIO_OCCLUSION:      jce_scene_remove_audio_occlusion(s.scene, e); break;
-    case JCE_COMP_FLAG_SPAWN_MANAGER:        jce_scene_remove_spawn_manager(s.scene, e); break;
-    case JCE_COMP_FLAG_WEAPON:               jce_scene_remove_weapon(s.scene, e); break;
-    case JCE_COMP_FLAG_SAVE_POINT:           jce_scene_remove_save_point(s.scene, e); break;
-    case JCE_COMP_FLAG_WHEEL_COLLIDER:       jce_scene_remove_wheel_collider(s.scene, e); break;
-    case JCE_COMP_FLAG_CONSTANT_FORCE:       jce_scene_remove_constant_force(s.scene, e); break;
-    case JCE_COMP_FLAG_CONFIGURABLE_JOINT:   jce_scene_remove_configurable_joint(s.scene, e); break;
-    case JCE_COMP_FLAG_JOINT_2D:             jce_scene_remove_joint2d(s.scene, e); break;
-    case JCE_COMP_FLAG_BILLBOARD_RENDERER:   jce_scene_remove_billboard_renderer(s.scene, e); break;
-    case JCE_COMP_FLAG_CANVAS:               jce_scene_remove_canvas(s.scene, e); break;
-    case JCE_COMP_FLAG_CANVAS_GROUP:         jce_scene_remove_canvas_group(s.scene, e); break;
-    case JCE_COMP_FLAG_LAYOUT_GROUP:         jce_scene_remove_layout_group(s.scene, e); break;
-    case JCE_COMP_FLAG_UI_IMAGE:             jce_scene_remove_ui_image(s.scene, e); break;
-    case JCE_COMP_FLAG_UI_TEXT:              jce_scene_remove_ui_text(s.scene, e); break;
-    case JCE_COMP_FLAG_UI_BUTTON:            jce_scene_remove_ui_button(s.scene, e); break;
-    case JCE_COMP_FLAG_CLOTH: {
-        /* Destroy the runtime cloth handle (if any) before dropping
-         * the component so the cloth runtime doesn't leak. */
-        JceClothComponent *cc = jce_scene_get_cloth(s.scene, e);
-        if (cc && cc->handle != 0) {
-            jce_cloth_destroy((JceClothHandle)cc->handle);
-            cc->handle = 0;
-        }
-        jce_scene_remove_cloth(s.scene, e);
-        break;
-    }
-    case JCE_COMP_FLAG_NETWORK_OBJECT:       jce_scene_remove_network_object(s.scene, e); break;
-    case JCE_COMP_FLAG_NET_TRANSFORM:        jce_scene_remove_net_transform(s.scene, e); break;
-    case JCE_COMP_FLAG_NET_ANIMATOR:         jce_scene_remove_net_animator(s.scene, e); break;
-    case JCE_COMP_FLAG_NET_RIGIDBODY:        jce_scene_remove_net_rigidbody(s.scene, e); break;
-    case JCE_COMP_FLAG_TILEMAP:              jce_scene_remove_tilemap(s.scene, e); break;
-    case JCE_COMP_FLAG_TILEMAP_COLLIDER_2D:  jce_scene_remove_tilemap_collider2d(s.scene, e); break;
-    case JCE_COMP_FLAG_AVATAR:               jce_scene_remove_avatar(s.scene, e); break;
-    default: return;
-    }
+    /* Registry route: dense comp_id -> descriptor row.  Per-row
+     * pre_remove hooks carry the runtime cleanup that used to be
+     * special-cased here (Cloth destroys its live cloth handle). */
+    jce_editor_component_defaults_ensure_registered();
+    const JceEditorComponentDescriptor *desc =
+        jce_editor_component_find_by_id(comp_id);
+    if (!desc || desc->comp_id == JCE_COMP_ID_INVALID) return;
+
+    if (desc->pre_remove) desc->pre_remove(s.scene, e);
+    jce_scene_remove_comp(s.scene, e, desc->comp_id);
 
     LOG_INFO(LOG_TAG, "remove component %s from entity %u",
-             jce_comp_flag_display_name(comp_flag), entity_id);
+             desc->display_name, entity_id);
+}
+
+void jce_state_remove_component(uint32_t entity_id, uint64_t comp_flag)
+{
+    const JceEditorComponentDescriptor *desc =
+        jce_editor_component_find(comp_flag);
+    if (!desc) return;
+    jce_state_remove_component_id(entity_id, desc->comp_id);
 }
 
 const char *jce_comp_flag_display_name(uint64_t comp_flag)
@@ -1855,6 +1288,8 @@ JceGizmoSpace jce_state_get_gizmo_space(void)              { return s.gizmo_spac
 
 void          jce_state_set_gizmo_pivot(JceGizmoPivot p)   { s.gizmo_pivot = p; }
 JceGizmoPivot jce_state_get_gizmo_pivot(void)              { return s.gizmo_pivot; }
+void          jce_state_set_pivot_edit_mode(bool enabled)  { s.pivot_edit_mode = enabled; }
+bool          jce_state_get_pivot_edit_mode(void)          { return s.pivot_edit_mode; }
 
 /* Persist view_mode, show_grid and gizmo snap increments to
  * editor-config.json. */

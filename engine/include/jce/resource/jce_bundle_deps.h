@@ -9,7 +9,28 @@
  * "audioPath"/"clipPath", "fontPath", "hdrPath", "spritePath",
  * "scriptPath", "skeletonPath", "atlasPath", "sheetPath",
  * "terrainPath", "layerAlbedoPath0..3", "meshPath0..N", "prefabPath",
- * "animationPath").  Empty strings are ignored.
+ * "animationPath", "albedoTex"/"mrTex"/"normalTex"/"aoTex"/"emissiveTex",
+ * "cookiePath"/"iesPath", "physMaterial", "modelPath",
+ * "assetPath"/"particlePath", "treePath", "stateMachine", "seqPath",
+ * "avatarPath"/"maskPath"/"overrideController",
+ * "tilemapPath"/"spritesPath", "bakedCubemapPath", and the .mat.json
+ * texture-map keys re-scanned by the packer's descriptor recursion:
+ * "albedoMap"/"baseColorMap"/"diffuseMap"/"mainTexture",
+ * "metallicRoughnessMap"/"metallicMap", "normalMap",
+ * "aoMap"/"occlusionMap", "emissiveMap"/"emissionMap").
+ * Empty strings are ignored.
+ *
+ * In addition, the scene-level world-streaming block
+ *   "streaming": { ..., "chunks": [ {"id","center","radius","path"} ] }
+ * is handled contextually: every chunks[i].path (a scene-fragment
+ * .scene.json streamed at runtime through the bundle VFS) is collected
+ * as a dependency.  The generic key "path" is only honoured inside a
+ * "streaming" object's chunk table — never globally.  Three more
+ * generic descriptor keys are recognised structurally (signature
+ * sibling fields must be present): a particle descriptor's "texture"
+ * (sibling "emitRate"/"lifetimeMin"/"maxParticles"/"sizeStart"), a
+ * .tilemap.json's "sprites" (sibling "cells" or "w"+"h"), and a
+ * .sprites.json tileset's "source" (sibling "rects").
  *
  * Per-asset/per-component override tags ("bundle": "force-shared" |
  * "force-local" | "<custom>") are also collected so the packer can honor

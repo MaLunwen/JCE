@@ -19,6 +19,7 @@
 
 #include "os/core/jce_memory.h"
 #include "resource/jce_asset_reader.h"
+#include "middleware/audio/jce_pcm_convert.h"
 
 #include <miniaudio.h>
 #include <SDL3/SDL.h>
@@ -85,6 +86,20 @@ typedef struct {
     Freeverb     fv;
 } ReverbNode;
 
+/* ── Insert-effect DSP node (FEATURE 5.1) ───────────────────────────────
+ *
+ * A custom ma_node that runs an ordered JceAudioDspChain (EQ / compressor /
+ * limiter / delay — implemented in jce_audio_dsp.c) on the f32 interleaved
+ * signal passing through it.  One node may be spliced into a bus group's
+ * output edge or a voice's output edge so the inserts process exactly the
+ * signal flowing to the bus/endpoint.  The DSP math is device-independent and
+ * unit-tested offline; here we just feed it the live node-graph buffer. */
+typedef struct {
+    ma_node_base      base;
+    JceAudioDspChain *chain;   /* owned; NULL = passthrough */
+    bool              inited;
+} DspNode;
+
 /* Each sound owns a block of decoded PCM (s16) data. */
 typedef struct {
     void      *pcm_data;      /* JCE_MALLOC'd, s16 PCM */
@@ -98,6 +113,7 @@ typedef struct {
     bool           used;
     char           name[JCE_BUS_NAME_MAX];
     ma_sound_group group;     /* node: voices attach here, group -> reverb/endpoint */
+    DspNode        dsp;       /* insert chain spliced group -> dsp -> reverb/endpoint */
 } BusSlot;
 
 /* Each voice is an independent playback instance. */
@@ -111,6 +127,7 @@ typedef struct {
     ma_lpf_node     lpf;        /* occlusion muffle filter, inserted sound→lpf→endpoint */
     bool            lpf_ok;
     float           lpf_cutoff; /* current cutoff Hz; avoids reinit churn when unchanged */
+    DspNode         dsp;        /* insert chain spliced (sound/lpf)→dsp→target */
     /* Streaming voices: custom data source instead of ma_audio_buffer. */
     bool                  is_stream;
     ma_data_source_base   stream_ds;
@@ -306,6 +323,42 @@ static ma_node_vtable g_reverb_vtable = {
     0       /* flags */
 };
 
+/* ── Custom ma_node wrapping a JceAudioDspChain (insert effects) ──────── */
+
+static void dsp_node_process(ma_node *node,
+                             const float **frames_in, ma_uint32 *frame_count_in,
+                             float **frames_out, ma_uint32 *frame_count_out)
+{
+    DspNode  *dn = (DspNode *)node;
+    ma_uint32 n  = *frame_count_out;
+    int       ch = (int)ma_node_get_output_channels(node, 0);
+
+    if (frame_count_in) {
+        ma_uint32 in_n = frame_count_in[0];
+        if (in_n < n) n = in_n;
+    }
+    if (n == 0 || ch < 1) { *frame_count_out = n; return; }
+
+    /* Copy input → output, then run the chain in place on the output. The
+     * chain is a no-op when empty, so this is just a memcpy in that case. */
+    memcpy(frames_out[0], frames_in[0],
+           (size_t)n * (size_t)ch * sizeof(float));
+    if (dn->chain)
+        jce_audio_dsp_chain_process(dn->chain, frames_out[0], n);
+    *frame_count_out = n;
+}
+
+static ma_node_vtable g_dsp_vtable = {
+    dsp_node_process,
+    NULL,   /* onGetRequiredInputFrameCount */
+    1,      /* input bus count  */
+    1,      /* output bus count */
+    0       /* flags */
+};
+
+/* Forward decl: defined below near the voice routing helpers. */
+static ma_node *voice_output_src(const VoiceSlot *v);
+
 /* Create the global reverb node and re-route every live bus group through it.
  * On any failure the groups keep their endpoint attachment (dry-only). */
 static bool audio_init_reverb(JceAudio *audio)
@@ -348,18 +401,23 @@ static bool audio_init_reverb(JceAudio *audio)
     audio->reverb_inited = true;
     audio->reverb_wet    = 0.0f;
 
-    /* Route any already-created bus groups through the reverb node. */
+    /* Route any already-created bus groups through the reverb node.  When a
+     * bus has insert effects, its terminal node is the dsp node, not the
+     * group, so reattach that edge instead. */
     for (int i = 0; i < JCE_MAX_BUSES; ++i) {
-        if (audio->buses[i].used)
-            ma_node_attach_output_bus(&audio->buses[i].group, 0,
-                                      &audio->reverb.base, 0);
+        if (audio->buses[i].used) {
+            ma_node *src = audio->buses[i].dsp.inited
+                         ? (ma_node *)&audio->buses[i].dsp.base
+                         : (ma_node *)&audio->buses[i].group;
+            ma_node_attach_output_bus(src, 0, &audio->reverb.base, 0);
+        }
     }
     /* Re-route direct voices (no bus) that were attached to the endpoint
      * before the reverb node existed, so the global tail covers them too. */
     for (int i = 0; i < JCE_MAX_VOICES; ++i) {
         VoiceSlot *v = &audio->voices[i];
         if (!v->inited || v->bus >= 0) continue;
-        ma_node *src = v->lpf_ok ? (ma_node *)&v->lpf : (ma_node *)&v->sound;
+        ma_node *src = voice_output_src(v);
         ma_node_attach_output_bus(src, 0, &audio->reverb.base, 0);
     }
     LOG_SUCCESS("jce_audio", "reverb node (freeverb) initialized");
@@ -383,6 +441,63 @@ static int audio_find_bus(const JceAudio *audio, const char *name)
             SDL_strcasecmp(audio->buses[i].name, name) == 0)
             return i;
     return -1;
+}
+
+/* ── Insert-effect node lifecycle ──────────────────────────────────────
+ *
+ * A DspNode is created lazily the first time an effect is added to a bus or a
+ * voice.  Standing it up splices it onto `src`'s output edge so the signal
+ * flows  src → dsp → target  instead of  src → target.  On any failure the
+ * existing edge is left intact (effects silently no-op) so audio still flows.
+ */
+static bool dsp_node_ensure(JceAudio *audio, DspNode *dn,
+                            ma_node *src, ma_node *target)
+{
+    if (dn->inited) return true;
+    ma_engine *e   = &audio->engine;
+    ma_uint32 chan = ma_engine_get_channels(e);
+    ma_uint32 sr   = ma_engine_get_sample_rate(e);
+
+    dn->chain = jce_audio_dsp_chain_create(chan, sr);
+    if (!dn->chain) {
+        LOG_WARN("jce_audio", "insert: dsp chain alloc failed");
+        return false;
+    }
+
+    ma_node_config cfg = ma_node_config_init();
+    cfg.vtable          = &g_dsp_vtable;
+    cfg.pInputChannels  = &chan;
+    cfg.pOutputChannels = &chan;
+    if (ma_node_init(ma_engine_get_node_graph(e), &cfg, NULL,
+                     &dn->base) != MA_SUCCESS) {
+        jce_audio_dsp_chain_destroy(dn->chain);
+        dn->chain = NULL;
+        LOG_WARN("jce_audio", "insert: ma_node_init failed");
+        return false;
+    }
+    /* Splice: src → dsp → target. */
+    if (ma_node_attach_output_bus(&dn->base, 0, target, 0) != MA_SUCCESS
+        || ma_node_attach_output_bus(src, 0, &dn->base, 0) != MA_SUCCESS) {
+        ma_node_uninit(&dn->base, NULL);
+        jce_audio_dsp_chain_destroy(dn->chain);
+        dn->chain = NULL;
+        LOG_WARN("jce_audio", "insert: splice failed");
+        return false;
+    }
+    dn->inited = true;
+    return true;
+}
+
+static void dsp_node_uninit(DspNode *dn)
+{
+    if (dn->inited) {
+        ma_node_uninit(&dn->base, NULL);
+        dn->inited = false;
+    }
+    if (dn->chain) {
+        jce_audio_dsp_chain_destroy(dn->chain);
+        dn->chain = NULL;
+    }
 }
 
 /* -- Lifecycle ------------------------------------------------------ */
@@ -414,6 +529,8 @@ static void uninit_voice(VoiceSlot *v)
 {
     if (!v->inited) return;
     ma_sound_uninit(&v->sound);
+    /* Insert chain node sits downstream of sound/lpf — uninit it first. */
+    dsp_node_uninit(&v->dsp);
     if (v->lpf_ok) {
         ma_lpf_node_uninit(&v->lpf, NULL);
         v->lpf_ok = false;
@@ -440,9 +557,11 @@ void jce_audio_destroy(JceAudio *audio)
     for (int i = 0; i < JCE_MAX_VOICES; i++)
         uninit_voice(&audio->voices[i]);
 
-    /* Bus groups (nodes) — uninit before the reverb node/engine they feed. */
+    /* Bus groups (nodes) — uninit before the reverb node/engine they feed.
+     * A bus insert node is downstream of its group, so uninit it first. */
     for (int i = 0; i < JCE_MAX_BUSES; i++) {
         if (audio->buses[i].used) {
+            dsp_node_uninit(&audio->buses[i].dsp);
             ma_sound_group_uninit(&audio->buses[i].group);
             audio->buses[i].used = false;
         }
@@ -667,7 +786,8 @@ JceSound jce_audio_load_pcm(JceAudio *audio,
                              uint16_t channels, uint32_t sample_rate,
                              uint16_t bits_per_sample)
 {
-    if (!audio || !pcm_data || pcm_size == 0) return JCE_SOUND_INVALID;
+    if (!audio || !pcm_data || pcm_size == 0 || channels == 0)
+        return JCE_SOUND_INVALID;
 
     int slot = alloc_buffer_slot(audio);
     if (slot < 0) return JCE_SOUND_INVALID;
@@ -677,15 +797,19 @@ JceSound jce_audio_load_pcm(JceAudio *audio,
     void *pcm_copy;
 
     if (bits_per_sample == 8) {
-        frame_count = pcm_size / channels;
-        size_t out_size = (size_t)(frame_count * channels * sizeof(int16_t));
-        pcm_copy = JCE_MALLOC(out_size);
+        /* Whole frames only — the allocation size and the conversion loop
+         * MUST use the same sample count, or a clip whose byte count is not a
+         * multiple of the channel count overflows the heap (audit R2F8). */
+        size_t n_samples = jce_pcm_u8_to_s16_samples(pcm_size, channels);
+        if (n_samples == 0) return JCE_SOUND_INVALID;
+        frame_count = (ma_uint64)(n_samples / channels);
+        pcm_copy = JCE_MALLOC(n_samples * sizeof(int16_t));
         if (!pcm_copy) return JCE_SOUND_INVALID;
 
         /* Convert u8 → s16. */
         const uint8_t *src = (const uint8_t *)pcm_data;
         int16_t *dst = (int16_t *)pcm_copy;
-        for (uint32_t i = 0; i < pcm_size; i++)
+        for (size_t i = 0; i < n_samples; i++)
             dst[i] = (int16_t)((src[i] - 128) * 256);
     } else if (bits_per_sample == 16) {
         frame_count = pcm_size / (channels * 2);
@@ -978,6 +1102,16 @@ static int alloc_voice(JceAudio *audio)
     if (found >= 0)
         audio->voices[found].play_seq = ++audio->play_counter;
     return found;
+}
+
+/* The last node in a voice's local chain — the edge that feeds the bus/global
+   output.  When inserts are present the dsp node is terminal; otherwise the
+   lpf (if any), else the sound itself. */
+static ma_node *voice_output_src(const VoiceSlot *v)
+{
+    if (v->dsp.inited) return (ma_node *)&v->dsp.base;
+    if (v->lpf_ok)     return (ma_node *)&v->lpf;
+    return (ma_node *)&v->sound;
 }
 
 /* The node a voice should feed into: its assigned bus group when routed,
@@ -1349,12 +1483,111 @@ void jce_audio_voice_set_bus(JceAudio *audio, JceVoice voice,
     int bus = audio_find_bus(audio, bus_name);  /* -1 => direct/Master */
     v->bus = bus;
 
-    /* Reattach the voice's output edge (lpf if present, else the sound) to the
-     * new target.  On failure the prior attachment stays, so audio keeps
-     * flowing (just on the old bus). */
+    /* Reattach the voice's terminal output edge (dsp/lpf/sound) to the new
+     * target.  On failure the prior attachment stays, so audio keeps flowing
+     * (just on the old bus). */
     ma_node *target = voice_target_node(audio, v);
-    ma_node *src    = v->lpf_ok ? (ma_node *)&v->lpf : (ma_node *)&v->sound;
+    ma_node *src    = voice_output_src(v);
     ma_node_attach_output_bus(src, 0, target, 0);
+}
+
+/* -- Insert-effect DSP chains (FEATURE 5.1) ------------------------- */
+
+/* Ensure a bus's insert node exists (splicing group → dsp → output) and
+ * return its chain, or NULL on failure. */
+static JceAudioDspChain *bus_chain_ensure(JceAudio *audio, const char *bus_name)
+{
+    int idx = audio_find_bus(audio, bus_name);
+    if (idx < 0) return NULL;
+    BusSlot *b = &audio->buses[idx];
+    if (!dsp_node_ensure(audio, &b->dsp,
+                         (ma_node *)&b->group, audio_output_node(audio)))
+        return NULL;
+    return b->dsp.chain;
+}
+
+/* Ensure a voice's insert node exists (splicing lpf/sound → dsp → target) and
+ * return its chain, or NULL on failure. */
+static JceAudioDspChain *voice_chain_ensure(JceAudio *audio, JceVoice voice)
+{
+    int idx = resolve_voice(audio, voice);
+    if (idx < 0) return NULL;
+    VoiceSlot *v = &audio->voices[idx];
+    /* Upstream of the (to-be) dsp node: the lpf if present, else the sound. */
+    ma_node *upstream = v->lpf_ok ? (ma_node *)&v->lpf : (ma_node *)&v->sound;
+    if (!dsp_node_ensure(audio, &v->dsp, upstream, voice_target_node(audio, v)))
+        return NULL;
+    return v->dsp.chain;
+}
+
+int jce_audio_bus_add_effect(JceAudio *audio, const char *bus_name,
+                             const JceAudioEffectDesc *desc)
+{
+    if (!audio || !desc) return -1;
+    JceAudioDspChain *chain = bus_chain_ensure(audio, bus_name);
+    if (!chain) return -1;
+    return jce_audio_dsp_chain_add(chain, desc);
+}
+
+int jce_audio_voice_add_effect(JceAudio *audio, JceVoice voice,
+                               const JceAudioEffectDesc *desc)
+{
+    if (!audio || !desc) return -1;
+    JceAudioDspChain *chain = voice_chain_ensure(audio, voice);
+    if (!chain) return -1;
+    return jce_audio_dsp_chain_add(chain, desc);
+}
+
+bool jce_audio_bus_set_effect(JceAudio *audio, const char *bus_name,
+                              uint32_t index, const JceAudioEffectDesc *desc)
+{
+    if (!audio || !desc) return false;
+    int idx = audio_find_bus(audio, bus_name);
+    if (idx < 0 || !audio->buses[idx].dsp.inited) return false;
+    return jce_audio_dsp_chain_set(audio->buses[idx].dsp.chain, index, desc);
+}
+
+bool jce_audio_voice_set_effect(JceAudio *audio, JceVoice voice,
+                                uint32_t index, const JceAudioEffectDesc *desc)
+{
+    if (!audio || !desc) return false;
+    int idx = resolve_voice(audio, voice);
+    if (idx < 0 || !audio->voices[idx].dsp.inited) return false;
+    return jce_audio_dsp_chain_set(audio->voices[idx].dsp.chain, index, desc);
+}
+
+bool jce_audio_bus_remove_effect(JceAudio *audio, const char *bus_name,
+                                 uint32_t index)
+{
+    if (!audio) return false;
+    int idx = audio_find_bus(audio, bus_name);
+    if (idx < 0 || !audio->buses[idx].dsp.inited) return false;
+    return jce_audio_dsp_chain_remove(audio->buses[idx].dsp.chain, index);
+}
+
+bool jce_audio_voice_remove_effect(JceAudio *audio, JceVoice voice,
+                                   uint32_t index)
+{
+    if (!audio) return false;
+    int idx = resolve_voice(audio, voice);
+    if (idx < 0 || !audio->voices[idx].dsp.inited) return false;
+    return jce_audio_dsp_chain_remove(audio->voices[idx].dsp.chain, index);
+}
+
+uint32_t jce_audio_bus_effect_count(JceAudio *audio, const char *bus_name)
+{
+    if (!audio) return 0;
+    int idx = audio_find_bus(audio, bus_name);
+    if (idx < 0 || !audio->buses[idx].dsp.inited) return 0;
+    return jce_audio_dsp_chain_count(audio->buses[idx].dsp.chain);
+}
+
+uint32_t jce_audio_voice_effect_count(JceAudio *audio, JceVoice voice)
+{
+    if (!audio) return 0;
+    int idx = resolve_voice(audio, voice);
+    if (idx < 0 || !audio->voices[idx].dsp.inited) return 0;
+    return jce_audio_dsp_chain_count(audio->voices[idx].dsp.chain);
 }
 
 /* -- Global reverb -------------------------------------------------- */
@@ -1592,6 +1825,36 @@ void jce_audio_bus_set_volume(JceAudio *audio, const char *name, float volume) {
 }
 void jce_audio_voice_set_bus(JceAudio *audio, JceVoice voice, const char *bus_name) {
     (void)audio; (void)voice; (void)bus_name;
+}
+int jce_audio_bus_add_effect(JceAudio *audio, const char *bus_name,
+                             const JceAudioEffectDesc *desc) {
+    (void)audio; (void)bus_name; (void)desc; return -1;
+}
+int jce_audio_voice_add_effect(JceAudio *audio, JceVoice voice,
+                               const JceAudioEffectDesc *desc) {
+    (void)audio; (void)voice; (void)desc; return -1;
+}
+bool jce_audio_bus_set_effect(JceAudio *audio, const char *bus_name,
+                              uint32_t index, const JceAudioEffectDesc *desc) {
+    (void)audio; (void)bus_name; (void)index; (void)desc; return false;
+}
+bool jce_audio_voice_set_effect(JceAudio *audio, JceVoice voice,
+                                uint32_t index, const JceAudioEffectDesc *desc) {
+    (void)audio; (void)voice; (void)index; (void)desc; return false;
+}
+bool jce_audio_bus_remove_effect(JceAudio *audio, const char *bus_name,
+                                 uint32_t index) {
+    (void)audio; (void)bus_name; (void)index; return false;
+}
+bool jce_audio_voice_remove_effect(JceAudio *audio, JceVoice voice,
+                                   uint32_t index) {
+    (void)audio; (void)voice; (void)index; return false;
+}
+uint32_t jce_audio_bus_effect_count(JceAudio *audio, const char *bus_name) {
+    (void)audio; (void)bus_name; return 0;
+}
+uint32_t jce_audio_voice_effect_count(JceAudio *audio, JceVoice voice) {
+    (void)audio; (void)voice; return 0;
 }
 void jce_audio_set_reverb(JceAudio *audio, const JceAudioReverbParams *params) {
     (void)audio; (void)params;

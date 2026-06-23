@@ -84,6 +84,7 @@ typedef enum {
     /* APPEND ONLY before JCE_PANEL_COUNT — the visibility bitmap is
      * serialized to disk by ordinal (see jce_editor_panels_init). */
     JCE_PANEL_WORLD_STREAMING,
+    JCE_PANEL_USER_GUIDE,
     JCE_PANEL_COUNT
 } JceEditorPanel;
 
@@ -93,6 +94,11 @@ void  jce_editor_panels_shutdown(void);
 
 /* Visibility toggle (returns pointer for ImGui::MenuItem binding). */
 bool *jce_editor_panel_visible_ptr(JceEditorPanel panel);
+
+/* Queue a dock-tab focus/bring-to-front request for a stable ImGui ID
+ * such as "###console". Applied at frame boundary so menu popups can
+ * remain open while Window menu entries focus panels. */
+void  jce_editor_panel_request_focus(const char *stable_window_id);
 
 /* Persist current visibility mask to editor-config if changed since last
    call. Cheap (no-op when stable). Call once per frame from the main UI
@@ -123,6 +129,10 @@ void  jce_editor_panel_input_manager(void);
 void  jce_editor_panel_curve_editor(void);
 void  jce_editor_panel_animation_editor(void);
 void  jce_panel_animation_editor_request_tab(int idx);
+/* Load a (project-relative) .seq.json into the Sequencer panel — used by the
+ * inspector's "Open in Sequencer" so selecting an entity binds the panel to its
+ * SequencePlayer's sequence. */
+void  jce_panel_sequencer_load_path(const char *path);
 /* 0=Editor 1=StateMachine 2=Curves 3=Sequencer 4=Timeline 5=Rigging */
 int   jce_panel_animation_editor_current_tab(void);
 void  jce_editor_panel_animator_sm(void);
@@ -140,7 +150,10 @@ void  jce_editor_panel_world_streaming(void);
 void  jce_editor_panel_bt_visualizer(void);
 void  jce_editor_panel_bt_visualizer_content(void);
 void  jce_editor_panel_terrain(void);
-void  jce_editor_panel_preferences(void);
+/* jce_editor_panel_preferences (legacy dockable Preferences) retired;
+ * JCE_PANEL_USER_PREFERENCES (modal) is the single Preferences surface.
+ * The enum ordinal JCE_PANEL_PREFERENCES stays frozen for the serialized
+ * visibility bitmap. */
 void  jce_editor_panel_user_preferences(void);
 void  jce_editor_panel_package_manager(void);
 void  jce_editor_panel_frame_debugger(void);
@@ -174,11 +187,21 @@ void  jce_editor_panel_postfx_content(void);
  * every frame regardless of panel visibility. */
 void  jce_editor_panel_postfx_tick(void);
 void  jce_editor_panel_audio_mixer_content(void);
+void  jce_editor_audio_mixer_focus_mixer_tab(void);
+void  jce_editor_audio_mixer_focus_reverb_tab(void);
+int   jce_editor_audio_mixer_current_tab(void);
 void  jce_editor_panel_input_manager_content(void);
 /* Resolve an Input Manager action's KEY bindings to ImGuiKey codes for
  * play-in-editor (live panel state — unsaved rebinds included). Returns
  * the number of keys written; 0 = action missing / no keyboard binds. */
 int   jce_editor_input_action_keys(const char *name, int *out_imgui_keys, int max);
+/* Top 6: synthesize the authored action map into a LIVE engine JceInputActions
+ * from current ImGui key state each call, so editor-Play scripts read the same
+ * data-driven actions (jce.is_action_down / get_axis) a shipped game does.
+ * Keyboard + key-composite binds only (mouse/gamepad resolve in the shipped
+ * game).  Returns a borrowed pointer owned by the Input Manager panel. */
+struct JceInputActions;
+const struct JceInputActions *jce_editor_input_actions_live(void);
 /* SDL scancode → ImGuiKey (JCE_KEY_* values are SDL scancodes).  The
  * editor's single canonical translation table, implemented in
  * jce_editor.cpp; returns the ImGuiKey enum value, or 0 (ImGuiKey_None)
@@ -186,6 +209,10 @@ int   jce_editor_input_action_keys(const char *name, int *out_imgui_keys, int ma
 int   jce_editor_scancode_to_imgui_key(int scancode);
 void  jce_editor_panel_package_manager_content(void);
 void  jce_editor_panel_frame_debugger_content(void);
+/* Shared per-view GPU/CPU table (single implementation in the Profiling
+ * workbench; self-refreshes when the CPU tab's sampler didn't run this
+ * frame).  Used by the CPU tab and the Frame Debugger tab. */
+void  jce_panel_profiler_draw_view_table(void);
 void  jce_editor_panel_sprite_editor_content(void);
 void  jce_editor_panel_tile_palette_content(void);
 /* Open the Tile Palette on a specific map (+ optional sprites atlas):
@@ -212,6 +239,9 @@ void  jce_editor_panel_time_of_day_content(void);
 void  jce_editor_panel_vcam_manager_content(void);
 void  jce_editor_panel_reverb_zones_content(void);
 void  jce_editor_panel_save_browser_content(void);
+void  jce_editor_panel_user_guide_content(void);
+/* Deep-link: select a guide chapter by index before focusing the panel. */
+void  jce_editor_panel_user_guide_select_chapter(int chapter_index);
 void  jce_editor_panel_bundle_browser_content(void);
 void  jce_panel_bundle_browser_request_tab(int idx);
 int   jce_panel_bundle_browser_current_tab(void);
@@ -253,9 +283,11 @@ void  jce_editor_about_dialog(bool *p_open);
 /* File viewer: open a file for preview. */
 void  jce_file_viewer_open(const char *path);
 
-/* Asset browser: set the project root directory. */
+/* Asset browser: set the real project root directory.
+ * Clears any temporary browser-only simulated root. */
 void  jce_editor_assets_set_project(const char *path);
-/* Asset browser: returns the current project root (never NULL; may be ""). */
+/* Asset browser: returns the real project root (never NULL; may be "").
+ * Browser-only simulated roots do not change this value. */
 const char *jce_editor_assets_get_project(void);
 /* Asset browser: returns true while the delete confirmation dialog is open. */
 bool  jce_editor_assets_delete_dialog_open(void);
@@ -270,6 +302,13 @@ bool  jce_editor_assets_delete_dialog_open(void);
  */
 void jce_editor_path_to_relative(char *out, size_t out_size,
                                  const char *abs_or_rel_path);
+/* Canonicalize a path for storage in a component/scene field: anchors
+ * CWD-relative inputs (e.g. the model importer's extracted embedded-
+ * texture files) to an absolute path, then converts to the canonical
+ * PROJECT-relative form.  Paths outside the project keep their absolute
+ * form (the bundle packer virtualises those). */
+void jce_editor_path_store_asset_ref(char *out, size_t out_size,
+                                     const char *path);
 /* Same as above but uses a caller-supplied base directory.  Useful when
  * the natural anchor is the scene file's directory rather than project root.
  */
@@ -318,12 +357,6 @@ bool  jce_editor_inspector_delete_dialog_open(void);
 
 /* Inspector delete dialog: call each frame from top-level layout. */
 void  jce_editor_inspector_delete_dialog(void);
-
-/* Returns pointer + size of an entity's component struct for the given flag,
- * or NULL if the entity doesn't have it. Used by component clipboard,
- * preset I/O, and multi-edit broadcast. Pointer is owned by the scene. */
-void *jce_inspector_comp_blob(struct JceScene *scene, uint64_t e,
-                              uint64_t flag, size_t *out_size);
 
 /* Preference getters (for scene view / gizmo integration). */
 bool  jce_editor_prefs_show_gizmos(void);

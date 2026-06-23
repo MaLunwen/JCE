@@ -16,19 +16,23 @@
 #include "core/jce_editor_i18n.h"
 #include "core/jce_editor_scene_rendering_defaults.h"
 #include "scene/jce_editor_scene_render.h"
+#include "scene/jce_editor_scene_asset_cache.h"
 #include "ui/jce_editor_panels.h"
 
 extern "C" {
 #include <jce/middleware/scene/jce_scene_components_json.h>
+#include <jce/middleware/scene/jce_component_registry.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_path.h>
 #include <jce/os/core/jce_alloc.h>
 #include <jce/os/core/jce_thread.h>
+#include <jce/os/core/jce_timer.h>
 #include <jce/renderer/jce_model.h>
 #include <jce/renderer/jce_pbr_material.h>
 }
 
 #include "scene/jce_asset_path_index.h"
+#include "io/jce_editor_prefab_override.h"
 
 
 
@@ -37,9 +41,148 @@ extern "C" {
 #include <string>
 #include <vector>
 
-/* ── Serialize entity tree to JSON (recursive, for prefabs) ────────── */
+#include <jce/os/core/jce_str.h>
+#include "core/jce_editor_project.h"
+
+/* Project-root switch (dialogs/jce_dialog_project.cpp) — reloads the
+ * manifest, asset DB root, PAK key, and game string tables. */
+void set_current_project_root(const char *path);
+
+/* ── Project-root follow on scene open ─────────────────────────────
+ *
+ * Opening a scene IS opening its project.  Without this, the project
+ * root stays at whatever was opened last (often a different project
+ * from recents) and every root-based mechanism silently degrades:
+ * path relativization falls back to absolute paths, the model
+ * importer's extracted textures stay CWD-relative, and the bundle
+ * packer treats the project's own assets as "external".  Walk up from
+ * the scene file to the owning jce_project.json and follow it. */
+static void follow_scene_project_root(const char *scene_path)
+{
+    char dir[512];
+    if (!jce_path_parent(dir, sizeof(dir), scene_path) || !dir[0])
+        return;
+
+    for (int up = 0; up < 8 && dir[0]; ++up) {
+        char manifest[600];
+        snprintf(manifest, sizeof(manifest), "%s/jce_project.json", dir);
+        if (jce_fs_host_exists_file(manifest)) {
+            char norm[512];
+            if (!jce_path_normalize(norm, sizeof(norm), dir))
+                snprintf(norm, sizeof(norm), "%s", dir);
+            for (char *q = norm; *q; ++q) if (*q == '\\') *q = '/';
+
+            /* Switch manifest-driven subsystems only on a real change. */
+            extern char s_current_project_root[512];
+            if (jce_strcasecmp(s_current_project_root, norm) != 0) {
+                LOG_INFO(LOG_TAG,
+                         "scene belongs to project '%s' — following as "
+                         "current project root", norm);
+                set_current_project_root(norm);
+            }
+
+            /* The canonical asset base (what saved refs are relative to)
+             * is <project>/<source_assets>, not the project dir itself. */
+            const JceProject *jp = jce_editor_project_get();
+            const char *src = (jp && jp->source_assets && jp->source_assets[0])
+                              ? jp->source_assets : "assets";
+            char assets_base[700];
+            snprintf(assets_base, sizeof(assets_base), "%s/%s", norm, src);
+            if (!jce_fs_host_exists_dir(assets_base))
+                snprintf(assets_base, sizeof(assets_base), "%s", norm);
+            const char *cur = jce_editor_assets_get_project();
+            if (!cur || jce_strcasecmp(cur, assets_base) != 0)
+                jce_editor_assets_set_project(assets_base);
+            return;
+        }
+        char parent[512];
+        if (!jce_path_parent(parent, sizeof(parent), dir) ||
+            strcmp(parent, dir) == 0)
+            return;
+        snprintf(dir, sizeof(dir), "%s", parent);
+    }
+}
+
+/* ── Prefab source instantiation (scratch scene, for override diff) ────
+ *
+ * Load a prefab .prefab.json into a private throwaway scene and parse its
+ * root node's components onto a single scratch entity.  Returns that
+ * entity (the caller diffs the live instance against it, then destroys the
+ * scratch scene).  Children are NOT instantiated — per-component override
+ * tracking is root-level for the MVP.  Returns 0 on any failure (caller
+ * then falls back to the legacy full snapshot — backward compatible). */
+struct PrefabSource {
+    JceScene *scene = nullptr;
+    JceEntity root  = 0;
+};
+
+static bool load_prefab_source(const char *prefab_path, PrefabSource *out)
+{
+    if (!prefab_path || !prefab_path[0] || !out) return false;
+
+    JceJson *root_json = jce_json_parse_file(prefab_path);
+    if (!root_json) return false;
+
+    const JceJson *node = find_prefab_root_node(root_json);
+    if (!node) { jce_json_free(root_json); return false; }
+
+    JceScene *scratch = jce_scene_create();
+    if (!scratch) { jce_json_free(root_json); return false; }
+
+    JceEntity e = jce_scene_create_entity(scratch, "prefab_source");
+    if (e == 0) {
+        jce_scene_destroy(scratch);
+        jce_json_free(root_json);
+        return false;
+    }
+    /* Overlay the source's components onto the scratch entity through the
+     * engine's per-component parsers (same path the live instantiation
+     * uses), so the byte layout matches the live instance exactly. */
+    jce_scene_parse_entity_json(scratch, e, node);
+    jce_json_free(root_json);
+
+    out->scene = scratch;
+    out->root  = e;
+    return true;
+}
+
+static void free_prefab_source(PrefabSource *src)
+{
+    if (src && src->scene) {
+        jce_scene_destroy(src->scene);
+        src->scene = nullptr;
+        src->root  = 0;
+    }
+}
+
+/* ── Serialize entity tree to JSON (recursive, for prefabs) ──────────
+ *
+ * `emit_overrides`: when true AND the entity is a prefab instance whose
+ * source .prefab.json loads, emit the additive Unity/Godot override form
+ * (an "overrides":[componentNames] array + ONLY the differing components)
+ * instead of the full component snapshot.  When false (prefab-FILE save,
+ * clipboard copy) or the source cannot be loaded, the legacy full snapshot
+ * is written — so existing callers and legacy files are byte-unchanged. */
+static JceJson *serialize_entity_tree_json_ex(uint32_t entity_id,
+                                              bool emit_overrides);
 
 JceJson *serialize_entity_tree_json(uint32_t entity_id)
+{
+    /* Default callers (prefab-file save, copy/paste clipboard) keep the
+     * full-snapshot behaviour — only an explicit override-aware caller
+     * opts into the diff form. */
+    return serialize_entity_tree_json_ex(entity_id, false);
+}
+
+/* Override-aware scene serializer: embeds prefab instances as override
+ * diffs.  Used by the tree-format scene writer + the override test. */
+JceJson *serialize_entity_tree_json_overrides(uint32_t entity_id)
+{
+    return serialize_entity_tree_json_ex(entity_id, true);
+}
+
+static JceJson *serialize_entity_tree_json_ex(uint32_t entity_id,
+                                              bool emit_overrides)
 {
     if (!s.scene || entity_id == 0) return NULL;
     JceEntity e = (JceEntity)entity_id;
@@ -51,13 +194,25 @@ JceJson *serialize_entity_tree_json(uint32_t entity_id)
 
     jce_json_set_string(node, "name", meta->name);
     jce_json_set_bool(node, "enabled", meta->enabled);
-    /* Per-component disable bitmask (Unity-style enable toggles). Only written
-     * when something is disabled. Bit count is well under 2^53 so double is
-     * exact. */
+    /* Per-component enable toggles — written as a canonical-NAME array so every
+     * registered component round-trips, including post-64 rows whose legacy
+     * flag is 0 (Pivot / unified Light / VideoPlayer / NavAgent / IkConstraints
+     * / SequencePlayer / CompoundCollider).  The old numeric mask silently
+     * dropped those, so a disabled such component came back ENABLED through
+     * prefab / copy-paste / Play-snapshot round-trips (audit Round-3 P2-A).
+     * This matches the engine's main-scene writer; parse_disabled_components
+     * (invoked via jce_scene_parse_entity_json on load) accepts both this array
+     * and the legacy number. */
     {
-        uint64_t disabled = jce_scene_get_disabled_components(s.scene, e);
-        if (disabled)
-            jce_json_set_number(node, "disabledComponents", (double)disabled);
+        JceJson *dis = NULL;
+        const int ncomp = jce_component_count();
+        for (int id = 0; id < ncomp; id++) {
+            if (jce_scene_comp_enabled(s.scene, e, id)) continue;
+            if (!dis) dis = jce_json_array();
+            if (!dis) break;
+            jce_json_array_push_string(dis, jce_component_name(id));
+        }
+        if (dis) jce_json_set_child(node, "disabledComponents", dis);
     }
     jce_json_set_number(node, "tagColor", (double)meta->tag_color);
     if (meta->tag[0] != '\0')
@@ -68,8 +223,25 @@ JceJson *serialize_entity_tree_json(uint32_t entity_id)
             jce_json_set_string(node, "prefabPath", meta->prefab_path);
     }
 
-    /* Delegate component serialization to the engine. */
-    {
+    /* Component serialization.
+     *
+     * Override path: a prefab INSTANCE with a loadable source emits the
+     * additive "overrides":[...] array + ONLY the components that differ
+     * byte-wise from the source (Transform is diffed like any other row).
+     * Everything else (regular entities, instances whose source is
+     * missing, prefab-FILE saves, clipboard copies) falls through to the
+     * legacy FULL snapshot — keeping old scenes/files byte-identical. */
+    bool wrote_overrides = false;
+    if (emit_overrides && meta->prefab_instance && meta->prefab_path[0]) {
+        PrefabSource src;
+        if (load_prefab_source(meta->prefab_path, &src)) {
+            wrote_overrides = jce_prefab_override::write_override_node(
+                node, s.scene, e, src.scene, src.root);
+            free_prefab_source(&src);
+        }
+    }
+    if (!wrote_overrides) {
+        /* Delegate full component serialization to the engine. */
         JceJson *comps = jce_scene_serialize_entity_components(s.scene, e);
         if (comps)
             jce_json_set_child(node, "components", comps);
@@ -82,12 +254,21 @@ JceJson *serialize_entity_tree_json(uint32_t entity_id)
     }
     jce_json_set_child(node, "children", children);
 
-    JceEntity child_buf[JCE_MAX_CHILDREN];
-    int cn = jce_scene_get_children(s.scene, e, child_buf, JCE_MAX_CHILDREN);
-    for (int i = 0; i < cn; i++) {
-        JceJson *child = serialize_entity_tree_json((uint32_t)child_buf[i]);
-        if (child)
-            jce_json_array_push(children, child);
+    /* In override mode an instance root's children come ENTIRELY from the
+     * source on load (instantiate_prefab rebuilds the subtree), so we do
+     * NOT re-serialize them — that would duplicate them on reload.  The
+     * override MVP is root-level; per-child overrides are a follow-up.
+     * Regular entities (and the full-snapshot path) recurse as before. */
+    if (!wrote_overrides) {
+        JceEntity child_buf[JCE_MAX_CHILDREN];
+        int cn = jce_scene_get_children(s.scene, e, child_buf,
+                                        JCE_MAX_CHILDREN);
+        for (int i = 0; i < cn; i++) {
+            JceJson *child = serialize_entity_tree_json_ex(
+                (uint32_t)child_buf[i], emit_overrides);
+            if (child)
+                jce_json_array_push(children, child);
+        }
     }
 
     return node;
@@ -623,22 +804,43 @@ bool jce_state_load_scene_file(const char *scene_path)
 
         clear_scene_entities();
 
+        /* Scene-switch cache reset: the renderer/pick model caches and the
+         * negative resolve-miss cache survive a scene swap and cache load
+         * FAILURES, so a model that failed (or whose basename collided with a
+         * missing asset) under the previous scene would never reload without an
+         * editor restart.  Drop them so the new scene resolves + loads fresh —
+         * this is what makes switching scenes behave like a fresh start. */
+        jce_editor_scene_render_invalidate_model_caches();
+        jce_editor_scene_asset_cache_clear_resolve_misses();
+
         ok = jce_scene_serial_load_file(s.scene, scene_path);
         if (ok) {
             jce_editor_scene_ensure_rendering_settings(s.scene);
             rebuild_entity_order_from_ecs();
             update_scene_dir_from_path(scene_path);
             set_current_scene_path_internal(scene_path);
+            follow_scene_project_root(scene_path);
             repair_scene_asset_paths();
-            /* Persist as last-opened scene for next editor launch. */
+            /* Persist as last-opened scene for next editor launch.  Skip the
+             * write when nothing actually changed — on the startup
+             * auto-restore the scene is already last_scene_path AND already
+             * at the front of the recents, so re-serializing both config
+             * files would be a pure redundant disk hit on the
+             * time-to-first-frame path. */
             {
                 JceEditorConfig _ecfg;
                 if (jce_editor_config_load(&_ecfg)) {
+                    const bool path_changed =
+                        strcmp(_ecfg.last_scene_path, scene_path) != 0;
+                    const bool was_front =
+                        _ecfg.recent_scene_count > 0 &&
+                        strcmp(_ecfg.recent_scene_paths[0], scene_path) == 0;
                     snprintf(_ecfg.last_scene_path,
                              sizeof(_ecfg.last_scene_path),
                              "%s", scene_path);
                     jce_editor_config_add_recent_scene(&_ecfg, scene_path);
-                    jce_editor_config_save(&_ecfg);
+                    if (path_changed || !was_front)
+                        jce_editor_config_save(&_ecfg);
                 }
             }
             LOG_INFO(LOG_TAG, "scene loaded from %s (%d entities)",
@@ -659,11 +861,293 @@ bool jce_state_load_scene_file(const char *scene_path)
         s_transaction.before.scene_json.clear();
         s_transaction.before.scene_path.clear();
 
-        /* Spin up the streaming preview for the freshly loaded scene
-         * (no-op unless the scene enables it AND the preview toggle is on). */
-        jce_editor_scene_render_streaming_rebuild();
+        /* Show the streamed world in the editor scene view for streaming scenes
+         * (auto-enables preview so the editor matches Play instead of looking
+         * empty); user can toggle it off in the World Streaming panel. */
+        jce_editor_scene_render_streaming_autostart();
     }
     return ok;
+}
+
+/* ── Frame-sliced (non-blocking) scene-file open ─────────────────────
+ *
+ * For very large scenes (street_demo: ~17.5k entities, 20 MB) the
+ * synchronous open above creates every entity in one call and blocks the
+ * editor's first frame.  This path parses the JSON up front (the smaller
+ * half of the cost) then drives the engine's incremental loader
+ * (jce_scene_load_stream_*) a chunk of entities per editor frame, keeping
+ * the frame loop alive.  Editor interaction is gated by a modal overlay
+ * (jce_editor_layout.cpp) until the load reaches DONE, so nothing ever
+ * operates on a half-built scene.  The post-load finalize is the SAME set
+ * of steps the synchronous path runs.
+ *
+ * Threshold: scenes with <= the cutoff load synchronously so the common
+ * case (small scenes) stays instant with no overlay flicker. */
+extern "C" {
+#include <jce/resource/jce_scene_contract.h>
+}
+
+namespace {
+
+constexpr int   kAsyncEntityThreshold = 2000;  /* below this: load sync   */
+constexpr int   kEntitiesPerSlice     = 128;   /* batch between budget checks */
+
+struct DeferredSceneLoad {
+    bool                active     = false;
+    JceJson            *root       = nullptr;  /* owned until finalize     */
+    JceSceneLoadStream *stream     = nullptr;  /* engine stream handle     */
+    int                 total      = 0;
+    std::string         scene_path;
+};
+DeferredSceneLoad g_dsl;
+
+/* Run the editor-side finalize steps that follow a successful engine load —
+ * identical to the tail of jce_state_load_scene_file().  Called once the
+ * incremental create pass + engine ref-fixups have completed. */
+void finalize_deferred_scene_load()
+{
+    const std::string path = g_dsl.scene_path;
+
+    {
+        HistorySuspendScope suspend;
+
+        jce_editor_scene_ensure_rendering_settings(s.scene);
+        rebuild_entity_order_from_ecs();
+        update_scene_dir_from_path(path.c_str());
+        set_current_scene_path_internal(path.c_str());
+        follow_scene_project_root(path.c_str());
+        repair_scene_asset_paths();
+
+        /* Persist as last-opened scene for next editor launch (mirrors the
+         * synchronous path; the redundant-write guard is kept). */
+        {
+            JceEditorConfig _ecfg;
+            if (jce_editor_config_load(&_ecfg)) {
+                const bool path_changed =
+                    strcmp(_ecfg.last_scene_path, path.c_str()) != 0;
+                const bool was_front =
+                    _ecfg.recent_scene_count > 0 &&
+                    strcmp(_ecfg.recent_scene_paths[0], path.c_str()) == 0;
+                snprintf(_ecfg.last_scene_path,
+                         sizeof(_ecfg.last_scene_path), "%s", path.c_str());
+                jce_editor_config_add_recent_scene(&_ecfg, path.c_str());
+                if (path_changed || !was_front)
+                    jce_editor_config_save(&_ecfg);
+            }
+        }
+        LOG_INFO(LOG_TAG, "scene loaded from %s (%d entities)",
+                 path.c_str(), (int)g_entity_order.size());
+    }
+
+    s_undo_history.clear();
+    s_redo_history.clear();
+    s.scene_modified = false;
+    s_history_edit_nesting = 0;
+    s_history_outer_edit_pushed_snapshot = false;
+    s_history_manual_batch_depth = 0;
+    s_transaction.active = false;
+    s_transaction.label[0] = '\0';
+    s_transaction.before.scene_json.clear();
+    s_transaction.before.scene_path.clear();
+
+    jce_editor_scene_render_streaming_autostart();
+}
+
+/* Tear down + reset the deferred-load record. */
+void clear_deferred_scene_load()
+{
+    if (g_dsl.stream) {
+        /* Should already be finalized by callers; guard against leaks if a
+         * caller bails mid-stream. */
+        (void)jce_scene_load_stream_finalize(g_dsl.stream);
+        g_dsl.stream = nullptr;
+    }
+    if (g_dsl.root) {
+        jce_json_free(g_dsl.root);
+        g_dsl.root = nullptr;
+    }
+    g_dsl.active = false;
+    g_dsl.total  = 0;
+    g_dsl.scene_path.clear();
+}
+
+} /* anonymous namespace */
+
+bool jce_state_load_scene_file_async(const char *scene_path)
+{
+    if (!scene_path || scene_path[0] == '\0')
+        return false;
+
+    /* If a previous async load is somehow still in flight, finish it
+     * synchronously before swapping — never overlap two loads. */
+    if (g_dsl.active) {
+        if (g_dsl.stream) {
+            jce_scene_load_stream_step(g_dsl.stream, /*all=*/0);
+            jce_scene_load_stream_finalize(g_dsl.stream);
+            g_dsl.stream = nullptr;
+            finalize_deferred_scene_load();
+        }
+        clear_deferred_scene_load();
+    }
+
+    /* Same pre-swap teardown as the synchronous path. */
+    jce_panel_sequencer_preview_flush();
+    stop_play_before_scene_swap();
+    jce_editor_scene_render_streaming_teardown();
+
+    /* Inform the engine parser of the scene's base directory so sibling
+     * material backfill resolves (jce_scene_serial_load_file does this; we
+     * bypass it, so set it ourselves). */
+    {
+        const char *sep = strrchr(scene_path, '/');
+        const char *bs  = strrchr(scene_path, '\\');
+        if (bs > sep) sep = bs;
+        if (sep) {
+            char dir[1024];
+            size_t L = (size_t)(sep - scene_path);
+            if (L >= sizeof(dir)) L = sizeof(dir) - 1;
+            memcpy(dir, scene_path, L);
+            dir[L] = '\0';
+            jce_scene_serial_set_base_dir(dir);
+        } else {
+            jce_scene_serial_set_base_dir(nullptr);
+        }
+    }
+
+    /* Parse the file (read + cJSON) before touching the live scene, so a
+     * read/parse failure leaves the current scene intact. */
+    JceJson *root = jce_json_parse_file(scene_path);
+    if (!root) {
+        LOG_WARN(LOG_TAG, "scene load failed (parse): %s", scene_path);
+        return false;
+    }
+
+    /* Contract gate (mirrors jce_scene_serial_load). */
+    int cmaj = (int)JCE_SCENE_CONTRACT_MAJOR;
+    int cmin = (int)JCE_SCENE_CONTRACT_MINOR;
+    parse_scene_contract_version(root, &cmaj, &cmin);
+    if (!jce_scene_contract_major_compatible((uint32_t)cmaj)) {
+        LOG_WARN(LOG_TAG,
+                 "scene load failed: unsupported contract major %d (expected %u)",
+                 cmaj, (unsigned)JCE_SCENE_CONTRACT_MAJOR);
+        jce_json_free(root);
+        return false;
+    }
+
+    /* Parse succeeded — now it is safe to drop the old scene. */
+    {
+        HistorySuspendScope suspend;
+        clear_scene_entities();
+    }
+
+    /* Follow the NEW scene's asset-resolve base + project root BEFORE creating
+     * its entities, so their mesh/material refs resolve against this scene's
+     * roots.  The synchronous load paths already do this; this (async/frame-
+     * sliced) path bypassed jce_scene_serial_load_file and was missing them, so
+     * switching scenes with the editor kept open left the asset-cache scene_dir
+     * + project root pointing at the PREVIOUS scene → the new scene's models
+     * failed to resolve ("模型无法加载") until an editor restart. */
+    update_scene_dir_from_path(scene_path);
+    follow_scene_project_root(scene_path);
+
+    /* Scene-switch cache reset (same rationale as the sync path): drop the
+     * renderer/pick model caches + the negative resolve-miss cache so stale
+     * failed-load flags from the previous scene cannot block the new scene's
+     * models.  Without this, switching scenes with the editor open left models
+     * failing to load until a restart. */
+    jce_editor_scene_render_invalidate_model_caches();
+    jce_editor_scene_asset_cache_clear_resolve_misses();
+
+    /* Begin the incremental load on the now-empty scene. */
+    int total = 0;
+    JceSceneLoadStream *stream =
+        jce_scene_load_stream_begin(s.scene, root, &total);
+    if (!stream) {
+        /* Empty/invalid entity array, or OOM.  Treat like an empty scene:
+         * finalize editor state against whatever exists (nothing) so the
+         * editor is in a clean, consistent state rather than half-torn. */
+        jce_json_free(root);
+        g_dsl.scene_path = scene_path;
+        finalize_deferred_scene_load();
+        clear_deferred_scene_load();
+        LOG_WARN(LOG_TAG, "scene load: no entity data in %s", scene_path);
+        return true;
+    }
+
+    /* Small scenes: finish in one shot (identical timing to the sync path)
+     * so we never show a loading overlay for trivial loads. */
+    if (total <= kAsyncEntityThreshold) {
+        jce_scene_load_stream_step(stream, /*all=*/0);
+        jce_scene_load_stream_finalize(stream);
+        jce_json_free(root);
+        g_dsl.scene_path = scene_path;
+        finalize_deferred_scene_load();
+        clear_deferred_scene_load();
+        return true;
+    }
+
+    /* Large scene: defer the create across frames. */
+    g_dsl.active     = true;
+    g_dsl.root       = root;   /* keep alive until finalize */
+    g_dsl.stream     = stream;
+    g_dsl.total      = total;
+    g_dsl.scene_path = scene_path;
+    LOG_INFO(LOG_TAG, "scene open (deferred): %s — %d entities, time-sliced",
+             scene_path, total);
+    return true;
+}
+
+void jce_state_scene_load_poll(void)
+{
+    if (!g_dsl.active || !g_dsl.stream)
+        return;
+
+    /* Time-sliced entity creation.  We step small batches until a per-frame
+     * wall-clock budget is spent rather than a fixed entity count: the first
+     * batches pay the cold-cache cost (first read+parse of each unique mesh /
+     * .mat.json), which a pure count budget cannot bound — a single 1500-entity
+     * slice that happens to touch every unique material stalled the frame it
+     * landed on.  A time budget caps any single frame's load cost and spreads
+     * the rest across the next few frames, while the "Loading scene…" overlay
+     * stays responsive.  Mirrors jce_world_streamer_update()'s apply budget and
+     * honours the engine async doctrine (frame-slice; never block the main loop
+     * on variable-latency disk work). */
+    const uint64_t freq      = jce_time_perf_freq();
+    const uint64_t t0        = jce_time_perf_counter();
+    const double   budget_ms = 4.0;
+    for (;;) {
+        jce_scene_load_stream_step(g_dsl.stream, kEntitiesPerSlice);
+        if (jce_scene_load_stream_done(g_dsl.stream))
+            break;
+        const double elapsed_ms =
+            freq ? (double)(jce_time_perf_counter() - t0) / (double)freq * 1000.0
+                 : budget_ms;
+        if (elapsed_ms >= budget_ms)
+            break;   /* resume next frame */
+    }
+
+    if (jce_scene_load_stream_done(g_dsl.stream)) {
+        jce_scene_load_stream_finalize(g_dsl.stream);
+        g_dsl.stream = nullptr;
+        finalize_deferred_scene_load();
+        clear_deferred_scene_load();
+    }
+}
+
+bool jce_state_is_scene_loading(void)
+{
+    return g_dsl.active;
+}
+
+float jce_state_scene_load_progress(void)
+{
+    if (!g_dsl.active || g_dsl.total <= 0)
+        return 0.0f;
+    int processed = jce_scene_load_stream_processed(g_dsl.stream);
+    float p = (float)processed / (float)g_dsl.total;
+    if (p < 0.0f) p = 0.0f;
+    if (p > 1.0f) p = 1.0f;
+    return p;
 }
 
 extern "C" {
@@ -780,9 +1264,9 @@ bool apply_scene_bytes(const char *display_path,
         s_transaction.before.scene_json.clear();
         s_transaction.before.scene_path.clear();
 
-        /* Streaming preview for the freshly applied scene (no-op unless
-         * enabled + preview toggle on). */
-        jce_editor_scene_render_streaming_rebuild();
+        /* Show the streamed world in the editor scene view for streaming scenes
+         * (auto-enables preview so the editor matches Play). */
+        jce_editor_scene_render_streaming_autostart();
     }
     return ok;
 }

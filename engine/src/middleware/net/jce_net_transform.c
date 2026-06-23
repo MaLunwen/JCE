@@ -68,9 +68,17 @@ typedef struct NtEntry {
 
     /* Owned-side: most recent authoritative snapshot we have NOT yet
      * reconciled against the locally-predicted pose.  Consumed in
-     * render_step. */
+     * render_step (built-in snap path) OR popped by the runtime via
+     * jce_net_transform_get_pending_auth (runtime-predicted path). */
     bool                    pending_correction;
     JceNetTransformSnapshot pending_snapshot;
+
+    /* Runtime-prediction coexistence: when true the APPLICATION-layer runtime
+     * owns this owned object's transform (rollback/replay), so render_step
+     * SKIPS its built-in snap-correction and the runtime instead pops the
+     * authoritative snapshot via jce_net_transform_get_pending_auth.  The net
+     * layer has no other knowledge of prediction. */
+    bool                    runtime_predicted;
 } NtEntry;
 
 typedef struct NtState {
@@ -103,12 +111,6 @@ static double fixed_hz_now(void)
     return 1.0 / fc->fixed_dt;
 }
 
-static uint32_t fixed_tick_now(void)
-{
-    JceFixedClock *fc = jce_fixed_clock_default();
-    if (!fc) return 0u;
-    return (uint32_t)fc->tick_count;
-}
 
 static void config_defaults(JceNetTransformConfig *c)
 {
@@ -620,7 +622,58 @@ void jce_net_transform_unregister(JceNetObjectId id)
     }
 }
 
-void jce_net_transform_fixed_step(void)
+/* ── Runtime-prediction coexistence ─────────────────────────────────── */
+
+/* Resolve a scene entity to its registered NtEntry.  The public seams below
+ * are entity-keyed (the runtime works in entity ids); the table is id-keyed,
+ * so map entity -> JceNetObjectId via replication first.  NULL if the entity
+ * has no spawned net object or its transform was never registered. */
+static NtEntry *find_entry_by_entity(uint64_t entity)
+{
+    if (!g_nt.inited || entity == 0u) return NULL;
+    JceNetObjectId id = jce_net_object_from_entity(entity);
+    if (id == JCE_NET_OBJECT_INVALID) return NULL;
+    return find_entry(id);
+}
+
+void jce_net_transform_set_predicted(uint64_t entity, bool predicted)
+{
+    NtEntry *e = find_entry_by_entity(entity);
+    if (!e) return;   /* silent no-op for an unregistered id */
+    e->runtime_predicted = predicted;
+}
+
+bool jce_net_transform_get_pending_auth(uint64_t  entity,
+                                        uint32_t *out_tick,
+                                        float     out_pos[3],
+                                        float     out_rot[4])
+{
+    if (!out_tick) return false;
+    NtEntry *e = find_entry_by_entity(entity);
+    if (!e || !e->pending_correction) return false;
+
+    const JceNetTransformSnapshot *s = &e->pending_snapshot;
+    *out_tick = s->server_tick;
+    if (out_pos) {
+        out_pos[0] = s->position.x;
+        out_pos[1] = s->position.y;
+        out_pos[2] = s->position.z;
+    }
+    if (out_rot) {
+        out_rot[0] = s->rotation.x;
+        out_rot[1] = s->rotation.y;
+        out_rot[2] = s->rotation.z;
+        out_rot[3] = s->rotation.w;
+    }
+    e->pending_correction = false;   /* consumed */
+    return true;
+}
+
+/* `tick` is the caller's fixed-step tick (the runtime passes its own
+ * rt->clock tick so editor Play and the shipped binary share one timeline;
+ * audit F82).  Previously this read the global fixed clock directly, which is
+ * never advanced under editor Play. */
+void jce_net_transform_fixed_step(uint32_t tick)
 {
     if (!g_nt.inited || g_nt.count == 0u) return;
 
@@ -629,7 +682,6 @@ void jce_net_transform_fixed_step(void)
      * to interpolate.  Owned-path render_step still works. */
     if (role == JCE_NET_ROLE_NONE) return;
 
-    uint32_t tick = fixed_tick_now();
     encode_and_broadcast(tick, role);
 }
 
@@ -652,6 +704,13 @@ void jce_net_transform_render_step(double interp_alpha)
         if (owner_local && e->cfg.authority == JCE_NET_AUTH_SERVER &&
             role == JCE_NET_ROLE_CLIENT)
         {
+            /* Runtime-predicted objects: the application layer owns the
+             * transform (rollback/replay) and pops the authoritative snapshot
+             * itself via jce_net_transform_get_pending_auth — do NOT apply our
+             * built-in snap here (it would fight the reconciled pose).  Leave
+             * pending_correction set so the runtime can consume it. */
+            if (e->runtime_predicted) continue;
+
             if (e->pending_correction) {
                 jce_vec3 cur_pos = { 0 };
                 jce_quat cur_rot = jce_q_identity();

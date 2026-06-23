@@ -121,6 +121,30 @@ bool jce_editor_resolve_asset_path(const char *in, char *out, int outsz)
     return false;
 }
 
+/* World-streaming FS base: the directory chunk fragment paths
+ * ("scenes/chunks/cell_*.scene.json") resolve against — the source ASSET ROOT,
+ * i.e. the current scene file's grandparent (<root>/scenes/x.scene.json ->
+ * <root>), the SAME base meshPath uses.  SHARED by both the scene-view preview
+ * streamer and the editor-Play streamer so chunks resolve IDENTICALLY in both
+ * viewports (prevents scene-view vs game-view divergence — the project root,
+ * which jce_editor_assets_get_project() may return, is one level too high).
+ * Falls back to the followed project root if the scene path is unknown. */
+bool jce_editor_streaming_fs_base(char *out, int out_size)
+{
+    if (!out || out_size <= 0) return false;
+    out[0] = '\0';
+    const char *sp = jce_state_get_current_scene_path();
+    if (sp && sp[0]) {
+        snprintf(out, (size_t)out_size, "%s", sp);
+        jce_editor_path_trim_to_parent(out);   /* -> <root>/scenes      */
+        jce_editor_path_trim_to_parent(out);   /* -> <root> (asset root) */
+        if (out[0]) return true;
+    }
+    const char *proj = jce_editor_assets_get_project();
+    if (proj && proj[0]) { snprintf(out, (size_t)out_size, "%s", proj); return true; }
+    return false;
+}
+
 /* ── Asset cache callbacks for the engine scene renderer ──────────── */
 
 static JceMesh *ed_load_mesh_cb(const char *path, void *ud)
@@ -151,6 +175,33 @@ static JceModel *ed_load_model_cb(const char *path, void *ud)
     JceModel *m = jce_model_load_gltf_memory(buf, (uint32_t)fsize, load_path);
     ED_FREE(buf);
     return m;
+}
+
+bool jce_editor_probe_model_rig(const char *asset_path,
+                                bool *out_has_skin, bool *out_has_anim)
+{
+    if (out_has_skin) *out_has_skin = false;
+    if (out_has_anim) *out_has_anim = false;
+    if (!asset_path || asset_path[0] == '\0') return false;
+
+    char resolved[512];
+    const char *load_path = asset_path;
+    if (jce_editor_scene_asset_cache_resolve_mesh_path(
+            asset_path, resolved, (int)sizeof(resolved))) {
+        load_path = resolved;
+    }
+
+    /* Reading the bytes is pure (cached) I/O; the probe parses only the
+     * glTF header — no geometry, buffers, images, or clip player.  GLB
+     * needs the full file present (cgltf validates the declared length),
+     * so we read it whole but never build the model. */
+    size_t fsize = 0;
+    void *buf = ed_read_file(load_path, &fsize);
+    if (!buf) return false;
+    bool ok = jce_model_probe_rig_memory(buf, (uint32_t)fsize,
+                                         out_has_skin, out_has_anim);
+    ED_FREE(buf);
+    return ok;
 }
 
 static JceTexture ed_load_texture_cb(const char *material_path,
@@ -421,11 +472,29 @@ void jce_editor_scene_render_streaming_teardown(void)
     if (s_sr.world_streamer) {
         jce_world_streamer_destroy(s_sr.world_streamer);
         s_sr.world_streamer = NULL;
+        /* Re-show all HLOD proxies so the master skyline is whole again once
+         * the preview streamer is gone (no chunk is resident to hide them). */
+        jce_state_detach_streamer_hlod();
     }
     if (s_sr.stream_fs) {
         jce_fs_destroy(s_sr.stream_fs);
         s_sr.stream_fs = NULL;
     }
+}
+
+void jce_editor_scene_render_invalidate_model_caches(void)
+{
+    /* Scene-switch cache reset: the renderer's model cache never evicts and
+     * caches load FAILURES, and the pick pass keeps its own model cache — both
+     * survive a scene swap, so a model that failed (or a name that collided
+     * with a missing asset) under the previous scene would never reload until
+     * an editor restart.  Dropping them here makes switching scenes behave like
+     * a fresh start.  The editor mesh/texture caches + resolve-miss cache are
+     * cleared separately by the scene loader. */
+    if (s_sr.scene_renderer)
+        jce_scene_renderer_invalidate_model_cache(s_sr.scene_renderer);
+    if (s_sr.pick_pass)
+        jce_scene_pick_invalidate_model_cache(s_sr.pick_pass);
 }
 
 void jce_editor_scene_render_streaming_rebuild(void)
@@ -446,26 +515,17 @@ void jce_editor_scene_render_streaming_rebuild(void)
     JceFileSystem *fs = jce_fs_create();
     if (!fs) return;
 
-    /* Mount the PROJECT ROOT so chunk fragment paths resolve project-
-       relative — the same base every other serialized asset path uses
-       (see normalize_all_scene_paths_to_relative).  The old code mounted
-       "." (the editor's cwd), which only worked when the editor happened
-       to be launched from the project directory.  Fallback chain: project
-       root → current scene file's directory → cwd. */
+    /* Mount the source ASSET ROOT so chunk fragment paths resolve the same as
+       meshPath.  SHARED with the editor-Play streamer via
+       jce_editor_streaming_fs_base() so the scene-view preview and the game-view
+       Play stream byte-identical content (no viewport divergence). */
     char base[1024] = { 0 };
-    {
-        const char *project = jce_editor_assets_get_project();
-        if (project && project[0]) {
-            snprintf(base, sizeof(base), "%s", project);
-        } else {
-            const char *sp = jce_state_get_current_scene_path();
-            if (sp && sp[0]) {
-                snprintf(base, sizeof(base), "%s", sp);
-                jce_editor_path_trim_to_parent(base);
-            }
-        }
+    if (!jce_editor_streaming_fs_base(base, sizeof(base))) {
+        jce_fs_destroy(fs);
+        LOG_WARN(LOG_TAG, "world-streaming preview: no asset root resolved");
+        return;
     }
-    jce_fs_mount_dir(fs, "", base[0] ? base : ".");
+    jce_fs_mount_dir(fs, "", base);
 
     JceWorldStreamConfig wsc = jce_world_stream_config_default();
     wsc.mode            = (st->mode == 1) ? JCE_STREAM_RECTANGULAR
@@ -487,8 +547,29 @@ void jce_editor_scene_render_streaming_rebuild(void)
 
     s_sr.world_streamer = ws;
     s_sr.stream_fs      = fs;
+    /* Mirror streamed chunk entities into the editor hierarchy/selection so
+     * they are first-class (listed in the Hierarchy panel, selectable). */
+    jce_state_attach_streamer_hierarchy(ws);
+    /* Toggle the always-resident HLOD far-skyline proxies as chunks (un)load so
+     * the scene-view far skyline isn't empty beyond the resident window. */
+    jce_state_attach_streamer_hlod(ws);
     LOG_INFO(LOG_TAG, "world-streaming preview active (%u chunks, root=%s)",
              jce_world_streamer_chunk_count(ws), base[0] ? base : ".");
+}
+
+/* On scene load: auto-enable the streaming preview for streaming-enabled scenes
+ * so the EDITOR scene view shows the streamed world too — matching what Play
+ * shows — instead of looking empty until you press Play.  The user can still
+ * toggle it off via the World Streaming panel.  Then (re)build the streamer. */
+void jce_editor_scene_render_streaming_autostart(void)
+{
+    JceScene *scene = jce_state_get_scene();
+    if (scene) {
+        const JceSceneStreamingSettings *st = jce_scene_get_streaming_settings(scene);
+        if (st && st->enabled && st->chunk_count > 0)
+            jce_state_set_streaming_preview(true);
+    }
+    jce_editor_scene_render_streaming_rebuild();
 }
 
 /* ── Per-frame ────────────────────────────────────────────────────── */
@@ -520,6 +601,26 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     jce_mat4 proj = jce_camera_proj(s_sr.camera, aspect, s_sr.homogeneous_depth);
     memcpy(s_sr.cached_view, view.raw[0], sizeof(s_sr.cached_view));
     memcpy(s_sr.cached_proj, proj.raw[0], sizeof(s_sr.cached_proj));
+
+    /* TAA (r.taa, default OFF): when active, sub-pixel-jitter the colour
+       pass's projection and arm the engine PostFX pipeline's TAA resolve.
+       When OFF this returns false and leaves color_proj == proj, so the
+       prepare/render path is byte-identical to the legacy FXAA path. The
+       clean (un-jittered) view+proj are kept for the postfx reproject and
+       for end_frame's history record. */
+    jce_mat4 color_proj = proj;
+    bool taa_on = false;
+    if (s_sr.scene_renderer) {
+        taa_on = jce_scene_renderer_taa_begin_frame(s_sr.scene_renderer,
+                                                    width, height,
+                                                    &view, &proj, &color_proj);
+        /* STANDARD per-object motion vectors: when TAA is on, ask the renderer
+         * to write a per-object/per-bone velocity buffer in its depth pre-pass
+         * (gated => zero cost when TAA is off).  jce_scene_renderer_render then
+         * binds it into the scene PostFX TAA resolve automatically, so moving /
+         * skinned characters stop ghosting. */
+        jce_scene_renderer_set_taa_velocity_enabled(s_sr.scene_renderer, taa_on);
+    }
     {
         jce_vec3 eye = jce_camera_get_position(s_sr.camera);
         s_sr.cached_eye[0] = eye.x;
@@ -540,7 +641,7 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
             width,
             height,
             view.raw[0],
-            proj.raw[0],
+            color_proj.raw[0],   /* jittered when r.taa on; == proj when off */
             clear_color,
             "EditorScene")) {
         return;
@@ -590,6 +691,7 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
     cfg.frustum_culling = true;
     cfg.viewport_width = width;
     cfg.viewport_height = height;
+    cfg.viewport_id = 1;   /* Scene viewport slot (Game = 0): own TAA prev camera */
 
     /* Two-pass GPU-query occlusion culling. Falls back to always-visible
      * when hardware queries are unsupported (ES2/WebGL1). */
@@ -610,6 +712,26 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
         cfg.fog_rt_height = 0;
     }
 
+    /* SSR: the renderer reflects the bridge's lit color RT (gated on the
+     * scene's ssr_enabled).  SSR's ray-march view renders after the color
+     * pass, so it samples the current frame's clean (pre-composite) color. */
+    cfg.ssr_color_tex_handle =
+        jce_offscreen_target_get_color_texture(s_sr.bridge);
+
+    /* Focus-bounded entity collection ("draw distance"): only entities within
+     * cull_radius (horizontal) of the orbit target are collected, so every
+     * downstream renderer pass (cull cache, shadow casters, depth/velocity
+     * prepass, color pass) becomes O(near) instead of O(all entities).  This
+     * is what keeps a full-loaded big world (e.g. 17k entities) playable in
+     * Scene View.  Focus = the orbit target (the point the user is looking at;
+     * stable under orbit/zoom and at ground level — same point used to drive
+     * world streaming below). */
+    cfg.cull_focus_enabled = true;
+    cfg.cull_focus_x = s_sr.orbit_target.x;
+    cfg.cull_focus_y = s_sr.orbit_target.y;
+    cfg.cull_focus_z = s_sr.orbit_target.z;
+    cfg.cull_radius  = 900.0f;
+
     /* HDR bridge → keep the tonemap pass always-on. This MUST be set BEFORE
        jce_scene_renderer_render: the PBR shader's linear-output flag
        (u_iblParams.w) is derived from "tonemap enabled" inside that call, so the
@@ -617,10 +739,20 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
        below then maps that linear HDR back to LDR for display (otherwise the
        viewport shows raw washed-out HDR, and smooth light falloff keeps banding
        into rings). No-op on the RGBA8 fallback. */
-    if (s_sr.scene_renderer && jce_offscreen_target_is_hdr(s_sr.bridge)) {
+    if (s_sr.scene_renderer) {
         JcePostFXPipeline *pf =
             jce_scene_renderer_get_postfx(s_sr.scene_renderer);
-        if (pf) jce_postfx_enable(pf, JCE_POSTFX_TONEMAP, true);
+        if (pf) {
+            /* Relocate the scene postfx above the scene view's effect range
+             * (scene base + JCE_VIEW_POST_BASE) so SSAO (base+2/+3) and SSR
+             * (base+17/+18) coexist below it.  Default is the absolute
+             * JCE_VIEW_POST_BASE, which == base+17 for the scene base (3) and
+             * would collide with SSR. */
+            jce_postfx_set_view_base(pf,
+                (uint16_t)(scene_view_id() + JCE_VIEW_POST_BASE));
+            if (jce_offscreen_target_is_hdr(s_sr.bridge))
+                jce_postfx_enable(pf, JCE_POSTFX_TONEMAP, true);
+        }
     }
 
     JceScene *scene = jce_state_get_scene();
@@ -655,11 +787,38 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
                                          fog_composite_view, dst_fb);
     }
 
+    /* Composite SSR reflections into the bridge color RT (after the scene +
+     * fog, before overlays).  No-op unless SSR was active this frame.  Uses
+     * scene base+3 (> the SSR ray-march at base+2 and the color pass). */
+    if (s_sr.scene_renderer) {
+        /* base+19 (after the base+18 ray-march); the postfx was relocated to
+         * base+JCE_VIEW_POST_BASE so base+18/+19 stay free below it. */
+        uint16_t ssr_composite_view = (uint16_t)(scene_view_id() + 19);
+        uint16_t dst_fb = jce_offscreen_target_get_frame_buffer(s_sr.bridge);
+        jce_scene_renderer_composite_ssr(s_sr.scene_renderer,
+                                         ssr_composite_view, dst_fb);
+    }
+
     /* Tick the world streamer each frame so pending chunk loads are applied
        to the scene synchronously on the main/render thread. */
     if (s_sr.world_streamer) {
-        jce_vec3 cam_pos = jce_camera_get_position(s_sr.camera);
-        jce_world_streamer_update(s_sr.world_streamer, cam_pos);
+        /* Stream around the camera's FOCUS POINT (orbit target), NOT the camera
+         * position.  The editor orbit camera sweeps large arcs and rises high
+         * above ground during orbit/zoom; streaming off its position made
+         * chunks load/unload on every navigation (visible flicker) and emptied
+         * the world entirely when zoomed out (loaded->0).  The orbit target is
+         * the point the user is looking at — stable under orbit + zoom (only a
+         * pan moves it) and at ground level (so the 3D distance test isn't
+         * inflated by camera height).  Result: the focused area stays resident
+         * (no flicker) and its streamed objects stay selectable; panning to a
+         * new area streams it in.  Play uses the player position (see
+         * jce_editor_play.cpp) so gameplay streaming is unaffected. */
+        jce_vec3 focus = s_sr.orbit_target;
+        jce_world_streamer_update(s_sr.world_streamer, focus);
+        /* If preview-streaming just unloaded a chunk the user had a streamed
+         * object selected from, drop the now-dead id so the gizmo/inspector
+         * never touch it (mirrors the Play-tick prune). */
+        jce_state_prune_dead();
     }
 
     /* ── 0.5.7 ordering: scene → overlays → PostFX ─────────────────────
@@ -706,7 +865,12 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
 
         jce_postfx_resize(postfx, width, height);
 
-        if (any_effect) {
+        /* Run the post-fx chain when any effect is on OR TAA is active: the TAA
+         * RESOLVE lives inside jce_postfx_apply and must run every frame TAA
+         * jitters the projection, otherwise the jittered (un-resolved) frame is
+         * shown directly → the whole image shimmers/crawls.  jce_postfx_apply
+         * already handles the TAA-only case (its resolve becomes the output). */
+        if (any_effect || taa_on) {
             JceTextureHandle scene_color = { UINT16_MAX };
             JceTextureHandle scene_depth = { UINT16_MAX };
             scene_color.idx = jce_offscreen_target_get_color_texture(s_sr.bridge);
@@ -723,6 +887,13 @@ void jce_editor_scene_render_frame(uint32_t width, uint32_t height)
             }
         }
     }
+
+    /* TAA end-of-frame: record the UN-JITTERED camera for next frame's
+       reproject and DISABLE TAA on the shared pipeline so it never leaks into
+       the pick / preview / thumbnail postfx invocations.  Self-no-ops when
+       r.taa is OFF (byte-identical). */
+    if (s_sr.scene_renderer)
+        jce_scene_renderer_taa_end_frame(s_sr.scene_renderer, &view, &proj);
 }
 
 /* ── Accessors ────────────────────────────────────────────────────── */
@@ -760,6 +931,31 @@ bool jce_editor_scene_pick_poll(uint32_t *out_entity_id)
         return false;
 
     *out_entity_id = (uint32_t)result.entity;
+    return true;
+}
+
+bool jce_editor_scene_pick_request_rect(uint32_t x0, uint32_t y0,
+                                        uint32_t x1, uint32_t y1)
+{
+    if (!s_sr.pick_pass)
+        return false;
+    return jce_scene_pick_request_rect(s_sr.pick_pass, x0, y0, x1, y1);
+}
+
+bool jce_editor_scene_pick_poll_rect(uint32_t *out_ids, uint32_t max_ids,
+                                     uint32_t *out_count)
+{
+    if (!s_sr.pick_pass || !out_count)
+        return false;
+    static JceEntity s_tmp[4096];                 /* main-thread only */
+    uint32_t cap = max_ids < 4096u ? max_ids : 4096u;
+    uint32_t n = 0;
+    if (!jce_scene_pick_poll_rect(s_sr.pick_pass, s_tmp, cap, &n))
+        return false;
+    if (out_ids)
+        for (uint32_t i = 0; i < n && i < max_ids; i++)
+            out_ids[i] = (uint32_t)s_tmp[i];
+    *out_count = n;
     return true;
 }
 

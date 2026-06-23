@@ -25,6 +25,7 @@
 extern "C" {
 #include <jce/middleware/scene/jce_terrain.h>
 #include <jce/renderer/jce_scene_renderer.h>
+#include <jce/os/core/jce_filesystem.h>
 }
 
 #include <algorithm>
@@ -62,6 +63,9 @@ struct PanelState {
 
     /* IO. */
     char     io_path[512] = "scenes/terrain.terrain.json";
+
+    /* Heightmap image / RAW import + r16 export path. */
+    char     heightmap_path[512] = "scenes/heightmap.png";
 
     /* Last status line. */
     std::string status;
@@ -325,6 +329,68 @@ void draw_create_section()
     }
 }
 
+void draw_heightmap_io_section()
+{
+    if (!s.terrain) return;
+    if (ImGui::CollapsingHeader(jce_editor_i18n("terrain.heightmap.header"),
+                                ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::TextDisabled("%s", jce_editor_i18n("terrain.heightmap.note"));
+        jce_draw_path_input(jce_editor_i18n("terrain.heightmap.path"),
+                            s.heightmap_path, sizeof(s.heightmap_path),
+                            JcePathKind::FileAbs);
+
+        if (ImGui::Button(jce_editor_i18n("terrain.heightmap.import"), ImVec2(-1, 0))) {
+            char resolved[1024];
+            const char *load_path = s.heightmap_path;
+            if (jce_editor_resolve_asset_path(s.heightmap_path, resolved, sizeof(resolved)))
+                load_path = resolved;
+            /* Import mutates the height grid: snapshot first so it is undoable. */
+            push_undo();
+            bool ok = jce_terrain_import_heightmap_file(s.terrain, load_path);
+            if (ok) {
+                s.preview_dirty = true;
+                /* Force the Scene View renderer to re-load this terrain so the
+                 * imported relief shows up immediately (matches the Save path). */
+                JceSceneRenderer *sr = jce_editor_get_scene_renderer();
+                if (sr) {
+                    jce_scene_renderer_invalidate_terrain(sr, s.io_path);
+                    char tr[1024];
+                    if (jce_editor_resolve_asset_path(s.io_path, tr, sizeof(tr)))
+                        jce_scene_renderer_invalidate_terrain(sr, tr);
+                }
+            } else {
+                /* Import failed: drop the undo snapshot we just pushed. */
+                if (!s_undo.empty()) s_undo.pop_back();
+            }
+            s.status = ok
+                ? std::string(jce_editor_i18n("terrain.heightmap.imported")) + load_path
+                : std::string(jce_editor_i18n("terrain.heightmap.importFailed")) + load_path;
+        }
+
+        if (ImGui::Button(jce_editor_i18n("terrain.heightmap.export"), ImVec2(-1, 0))) {
+            char resolved[1024];
+            const char *save_path = s.heightmap_path;
+            if (jce_editor_resolve_asset_path(s.heightmap_path, resolved, sizeof(resolved)))
+                save_path = resolved;
+            int w = jce_terrain_width(s.terrain);
+            int h = jce_terrain_height(s.terrain);
+            size_t n = (size_t)w * (size_t)h;
+            bool ok = false;
+            if (n > 0) {
+                std::vector<uint16_t> r16(n);
+                if (jce_terrain_export_heightmap_r16(s.terrain, r16.data(), r16.size())) {
+                    ok = jce_fs_host_write_all(save_path, r16.data(),
+                                               (uint64_t)(n * sizeof(uint16_t)));
+                }
+            }
+            s.status = ok
+                ? std::string(jce_editor_i18n("terrain.heightmap.exported")) + save_path
+                : std::string(jce_editor_i18n("terrain.heightmap.exportFailed")) + save_path;
+        }
+        ImGui::TextDisabled("%s", jce_editor_i18n("terrain.heightmap.exportNote"));
+    }
+}
+
 void draw_brush_section()
 {
     if (!s.terrain) {
@@ -457,6 +523,8 @@ extern "C" void jce_editor_panel_terrain(void)
     draw_toolbar();
     ImGui::Separator();
     draw_create_section();
+    ImGui::Separator();
+    draw_heightmap_io_section();
     ImGui::Separator();
     draw_brush_section();
     ImGui::Separator();

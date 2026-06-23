@@ -57,13 +57,13 @@ static void refresh()
     s_error.clear();
 
     const char *root = jce_editor_assets_get_project();
-    if (!root || !*root) { s_error = "No project open."; s_loaded = true; return; }
+    if (!root || !*root) { s_error = jce_editor_i18n("versionControl.noProject"); s_loaded = true; return; }
 
     const char *br_args[] = { "rev-parse", "--abbrev-ref", "HEAD", nullptr };
     std::string br = run_git(root, br_args);
     while (!br.empty() && (br.back() == '\n' || br.back() == '\r')) br.pop_back();
     if (br.find("not a git") != std::string::npos || br.find("fatal") != std::string::npos) {
-        s_error = br.empty() ? "Not a git repo." : br;
+        s_error = br.empty() ? jce_editor_i18n("versionControl.notRepo") : br;
         s_loaded = true;
         return;
     }

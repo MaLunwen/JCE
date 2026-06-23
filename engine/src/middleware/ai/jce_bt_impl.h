@@ -22,6 +22,11 @@ void          jce_bt_backend_destroy(JceBtBackend *b);
 void jce_bt_backend_register_action(JceBtBackend *b, const char *name,
                                     jce_bt_action_fn fn, void *userdata);
 
+/* Bundled deterministic node library (Wait / Cooldown / SetBlackboard /
+ * ClearBlackboard / BlackboardCheck / MoveToTarget). */
+void jce_bt_backend_register_library(JceBtBackend *b);
+void jce_bt_backend_set_env(JceBtBackend *b, const JceBtTickEnv *env);
+
 uint32_t    jce_bt_backend_load_tree(JceBtBackend *b, const char *xml, uint32_t len);
 uint32_t    jce_bt_backend_load_tree_file(JceBtBackend *b, const char *path);
 JceBtStatus jce_bt_backend_tick(JceBtBackend *b, uint32_t tree_idx);

@@ -130,7 +130,7 @@ jce_net_transform_unregister(JceNetObjectId id);
  *     net_id they don't own and aren't authoritative for).
  */
 JCE_API void JCE_CALL
-jce_net_transform_fixed_step(void);
+jce_net_transform_fixed_step(uint32_t tick);
 
 /* Render-step hook.  Call each visual frame (UPDATE / PRE_RENDER).
  *   - Non-owned, non-authoritative objects: write the interpolated
@@ -146,6 +146,37 @@ jce_net_transform_fixed_step(void);
  */
 JCE_API void JCE_CALL
 jce_net_transform_render_step(double interp_alpha);
+
+/* ── Runtime-prediction coexistence (client-prediction wiring) ────────
+ *
+ * These two seams let the APPLICATION-layer runtime own client-side
+ * prediction (rollback/replay via jce_net_prediction) for an entity it is
+ * predicting, WITHOUT this net layer gaining any knowledge of prediction.
+ * The net layer only learns "this owned object's transform is driven by the
+ * runtime now (skip my snap-correction)" and "hand me the latest unconsumed
+ * authoritative snapshot for it".  All prediction composition stays above L4.
+ */
+
+/* Mark / unmark an owned object as runtime-predicted.  While `predicted` is
+ * true, jce_net_transform_render_step SKIPS its built-in owned-object snap-
+ * correction for that object (the runtime applies the reconciled pose itself).
+ * Non-predicted owned objects keep today's snap behaviour exactly.  Silent
+ * no-op for an unregistered id (register the transform first). */
+JCE_API void JCE_CALL
+jce_net_transform_set_predicted(uint64_t entity, bool predicted);
+
+/* Pop the latest UNCONSUMED authoritative snapshot for `entity` (the most
+ * recent inbound server snapshot stashed for an owned/predicted object).  On
+ * success copies its server_tick / position / rotation into the out params,
+ * marks it consumed, and returns true.  Returns false when there is no pending
+ * snapshot (or unknown id / NULL out-tick).  out_pos / out_rot may be NULL if
+ * only one component is wanted.  This exposes exactly what the runtime needs to
+ * call jce_prediction_reconcile, without the net layer knowing about it. */
+JCE_API bool JCE_CALL
+jce_net_transform_get_pending_auth(uint64_t  entity,
+                                   uint32_t *out_tick,
+                                   float     out_pos[3],
+                                   float     out_rot[4]);
 
 /* ── Stats / diagnostics ─────────────────────────────────────────── */
 

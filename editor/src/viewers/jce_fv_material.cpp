@@ -295,7 +295,7 @@ void fv_render_material(FvTab *tab)
             /* Thumbnail + label */
             if (has_path && jce_texture_valid(ms->thumbs[ti].handle)) {
                 ImGui::Image(
-                    (ImTextureID)(uintptr_t)ms->thumbs[ti].handle.idx,
+                    (ImTextureID)(uintptr_t)((uint32_t)ms->thumbs[ti].handle.idx + 1u),
                     ImVec2(thumb_sz, thumb_sz));
                 ImGui::SameLine();
             }

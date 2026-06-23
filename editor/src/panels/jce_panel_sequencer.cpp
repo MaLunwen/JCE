@@ -28,12 +28,14 @@
 #include "ui/jce_editor_panels.h"
 #include "ui/jce_theme_palette.h"
 #include "core/jce_editor_state.h"
+#include "scene/jce_editor_scene_render.h"   /* jce_editor_resolve_asset_path */
 
 #include <jce/tools/jce_imgui.hpp>
 #include "dialogs/jce_path_input.h"
 #include "core/jce_assetdb.h"
 extern "C" {
 #include <jce/os/core/jce_json.h>
+#include <jce/os/core/jce_easing.h>
 #include <jce/middleware/scene/jce_scene_sequencer.h>
 #include <jce/middleware/scene/jce_sequencer.h>
 }
@@ -46,12 +48,19 @@ extern "C" {
 
 namespace {
 
-enum TrackType { TT_PROPERTY = 0, TT_EVENT = 1, TT_COLOR = 2 };
+/* Mirrors JceSeqTrackType so the serialized "type" int round-trips through the
+ * engine loader (PROPERTY=0, EVENT=1, COLOR=2, CAMERA_CUT=3). */
+enum TrackType { TT_PROPERTY = 0, TT_EVENT = 1, TT_COLOR = 2, TT_CAMERA_CUT = 3 };
 
 struct Key {
     float t   = 0.0f;
     float v   = 0.0f;
     float rgb[3] = { 1.0f, 1.0f, 1.0f };
+    int   ease   = JCE_EASE_LINEAR;   /* JceEaseType; LINEAR default */
+    /* EVENT / CAMERA-CUT payload (ignored by property/color eval).  `name` is
+     * the script handler for an EVENT key; `entity` is the cut target id. */
+    char     name[48] = {0};
+    uint32_t entity   = 0;
 };
 
 struct Track {
@@ -60,6 +69,8 @@ struct Track {
     float color[3] = { 0.6f, 0.85f, 1.0f };
     char  binding[128] = {0};   /* legacy free-form binding (round-trip only) */
     uint32_t bind_entity = 0;   /* scene entity (Hierarchy drop), 0 = unbound */
+    char  bind_entity_name[96] = {0}; /* robust name binding (scene-file ids are
+                                       * NOT live editor ids — resolve by name)  */
     int      bind_prop   = 0;   /* JceSeqPropId, JCE_SEQ_PROP_NONE = unbound  */
     std::vector<Key> keys;
 };
@@ -80,6 +91,7 @@ struct Editor {
     int   fps      = 30;
     float playhead = 0.0f;
     bool  playing  = false;
+    bool  scrubbing = false;   /* dragging the ruler → smooth (un-snapped) seek */
     bool  looping  = true;
     int   sel_track = -1;
     int   sel_key   = -1;
@@ -103,12 +115,17 @@ void mark_dirty(void) { s.preview_dirty = true; }
 const char *track_type_name(int t)
 {
     switch (t) {
-        case TT_PROPERTY: return "Property";
-        case TT_EVENT:    return "Event";
-        case TT_COLOR:    return "Color";
+        case TT_PROPERTY:   return jce_editor_i18n("sequencer.trackType.property");
+        case TT_EVENT:      return jce_editor_i18n("sequencer.trackType.event");
+        case TT_COLOR:      return jce_editor_i18n("sequencer.trackType.color");
+        case TT_CAMERA_CUT: return jce_editor_i18n_or("sequencer.trackType.cameraCut",
+                                                      "Camera Cut");
     }
     return "?";
 }
+
+/* Number of selectable track types in the inspector type combo. */
+static const int kTrackTypeCount = 4;
 
 void seed_default(void)
 {
@@ -139,6 +156,24 @@ void sort_keys(Track &t)
               [](const Key &a, const Key &b) { return a.t < b.t; });
 }
 
+/* Read a key's "ease" field: a numeric ordinal wins; otherwise match the
+ * jce_ease_name() id string (case-sensitive canonical form, e.g. "QuadInOut").
+ * Unknown / absent → LINEAR (matching the engine loader's default). */
+int ease_from_json(JceJson *ko)
+{
+    double num = jce_json_get_number(ko, "ease", -1.0);
+    if (num >= 0.0) {
+        int iv = (int)num;
+        if (iv >= 0 && iv < JCE_EASE_COUNT) return iv;
+        return JCE_EASE_LINEAR;
+    }
+    const char *s = jce_json_get_string(ko, "ease", "");
+    if (!s || !s[0]) return JCE_EASE_LINEAR;
+    for (int i = 0; i < JCE_EASE_COUNT; ++i)
+        if (std::strcmp(s, jce_ease_name((JceEaseType)i)) == 0) return i;
+    return JCE_EASE_LINEAR;
+}
+
 JceJson *to_json(void)
 {
     JceScene *scene = jce_state_get_scene();
@@ -165,13 +200,15 @@ JceJson *to_json(void)
         jce_json_set_string(o, "bindProp", prop_name);
         jce_json_set_number(o, "bindEntity", (double)t.bind_entity);
         {
-            const char *enm = "";
-            if (t.bind_entity != 0 && scene) {
-                const char *nm = jce_scene_entity_registered_name(
-                    scene, jce_state_to_ecs_entity(t.bind_entity));
+            /* Persist a NAME binding (robust across reloads — scene-file ids are
+             * not live editor ids).  Prefer the live entity's display name;
+             * fall back to the previously-loaded name so it round-trips. */
+            const char *enm = t.bind_entity_name;
+            if (jce_state_entity_alive(t.bind_entity)) {
+                const char *nm = jce_state_entity_name(t.bind_entity);
                 if (nm && nm[0]) enm = nm;
             }
-            jce_json_set_string(o, "bindEntityName", enm);
+            jce_json_set_string(o, "bindEntityName", enm ? enm : "");
         }
         jce_json_set_float_array(o, "color", t.color, 3);
         JceJson *karr = jce_json_array();
@@ -180,6 +217,15 @@ JceJson *to_json(void)
             jce_json_set_number(ko, "t", k.t);
             jce_json_set_number(ko, "v", k.v);
             jce_json_set_float_array(ko, "rgb", (float *)k.rgb, 3);
+            /* Per-key easing as the canonical jce_ease_name() id (the engine
+             * loader also accepts a numeric ordinal; the string is portable). */
+            jce_json_set_string(ko, "ease",
+                                jce_ease_name((JceEaseType)k.ease));
+            /* EVENT / CAMERA-CUT payload: handler name + target entity id.
+             * Always written so the values round-trip; ignored by the engine's
+             * property/color eval, consumed only for event/camera-cut tracks. */
+            jce_json_set_string(ko, "name", k.name);
+            jce_json_set_number(ko, "entity", (double)k.entity);
             jce_json_array_push(karr, ko);
         }
         jce_json_set_child(o, "keys", karr);
@@ -213,6 +259,19 @@ void from_json(JceJson *root)
                 jce_json_get_string(o, "bindProp", ""));
             t.bind_entity =
                 (uint32_t)jce_json_get_number(o, "bindEntity", 0.0);
+            {
+                const char *ben = jce_json_get_string(o, "bindEntityName", "");
+                std::strncpy(t.bind_entity_name, ben ? ben : "",
+                             sizeof(t.bind_entity_name) - 1);
+                /* A saved bindEntity is a SCENE-FILE id, which is NOT the live
+                 * editor id after a reload — re-resolve by name to the live id.
+                 * This is what makes preview bind to the real entity (and is the
+                 * only crash-safe id to hand a scene getter). */
+                if (t.bind_entity_name[0] && !jce_state_entity_alive(t.bind_entity)) {
+                    uint32_t live = jce_state_find_by_name(t.bind_entity_name);
+                    if (live) t.bind_entity = live;
+                }
+            }
             if (t.bind_entity == 0 && t.bind_prop == JCE_SEQ_PROP_NONE &&
                 t.binding[0]) {
                 const char *p = t.binding;
@@ -228,7 +287,11 @@ void from_json(JceJson *root)
                     }
                 }
             }
-            jce_json_get_floats(o, "color", t.color, 3, nullptr);
+            /* Only override the (light-blue) default when the file actually
+             * carries a color — otherwise color-less tracks came back BLACK
+             * (curve/keys invisible on the dark lane). */
+            if (jce_json_get(o, "color"))
+                jce_json_get_floats(o, "color", t.color, 3, nullptr);
             JceJson *karr = jce_json_get(o, "keys");
             if (karr && jce_json_is_array(karr)) {
                 int kn = jce_json_array_size(karr);
@@ -239,6 +302,13 @@ void from_json(JceJson *root)
                     k.t = (float)jce_json_get_number(ko, "t", 0.0);
                     k.v = (float)jce_json_get_number(ko, "v", 0.0);
                     jce_json_get_floats(ko, "rgb", k.rgb, 3, nullptr);
+                    /* Per-key easing: accept the jce_ease_name() id string OR a
+                     * numeric ordinal; unknown / absent → LINEAR. */
+                    k.ease = ease_from_json(ko);
+                    /* EVENT / CAMERA-CUT payload. */
+                    const char *kn = jce_json_get_string(ko, "name", "");
+                    std::strncpy(k.name, kn ? kn : "", sizeof(k.name) - 1);
+                    k.entity = (uint32_t)jce_json_get_number(ko, "entity", 0.0);
                     t.keys.push_back(k);
                 }
             }
@@ -357,8 +427,13 @@ void preview_apply(float t)
     if (en < n) n = en;
     for (int i = 0; i < n; ++i) {
         Track &tr = s.tracks[i];
-        if (tr.type == TT_EVENT) continue;
+        /* EVENT / CAMERA-CUT tracks carry no previewable property value. */
+        if (tr.type == TT_EVENT || tr.type == TT_CAMERA_CUT) continue;
         if (tr.bind_entity == 0 || tr.bind_prop == JCE_SEQ_PROP_NONE) continue;
+        /* CRASH GUARD: never hand a non-live id to a scene getter (raw cast +
+         * ecs_get_id on a dead handle = AV).  A stale/foreign bind id is simply
+         * skipped instead of crashing the editor. */
+        if (!jce_state_entity_alive(tr.bind_entity)) continue;
         const JceSeqPropId prop = (JceSeqPropId)tr.bind_prop;
         JceEntity e = jce_state_to_ecs_entity(tr.bind_entity);
         if (!jce_seq_prop_supported(scene, e, prop)) continue;
@@ -520,51 +595,71 @@ void draw_lane(ImDrawList *dl, int track_idx, ImVec2 origin, float width, float 
                 ImVec2(origin.x + width, origin.y + height),
                 jce_theme::separator());
 
-    /* For property tracks draw a polyline. */
-    if (t.type == TT_PROPERTY && t.keys.size() >= 2) {
-        float vmin = t.keys[0].v, vmax = t.keys[0].v;
+    const bool is_prop = (t.type == TT_PROPERTY);
+
+    /* Value range (property tracks) → map keys onto a curve filling the lane. */
+    float vmin = 0.0f, vspan = 1.0f;
+    if (is_prop && !t.keys.empty()) {
+        float vmax = t.keys[0].v; vmin = t.keys[0].v;
         for (auto &k : t.keys) { vmin = std::min(vmin, k.v); vmax = std::max(vmax, k.v); }
-        float vspan = (vmax - vmin); if (vspan < 0.001f) vspan = 1.0f;
-        ImVec2 prev;
-        bool have_prev = false;
+        vspan = (vmax - vmin); if (vspan < 0.001f) vspan = 1.0f;
+    }
+    const float pad = 9.0f;                         /* vertical inset */
+    auto val_y = [&](float v) {
+        float yr = (v - vmin) / vspan;              /* 0..1 (low..high) */
+        return origin.y + height - pad - yr * (height - 2.0f * pad);
+    };
+
+    /* Property curve: faint zero-ish guideline + the value polyline. */
+    if (is_prop && t.keys.size() >= 2) {
+        ImVec2 prev; bool have_prev = false;
         for (auto &k : t.keys) {
             float x = t_to_x(k.t, origin.x, width);
-            float yr = (k.v - vmin) / vspan;
-            float y = origin.y + height - 6 - yr * (height - 12);
+            float y = val_y(k.v);
             if (have_prev)
                 dl->AddLine(prev, ImVec2(x, y),
-                            ImColor(t.color[0], t.color[1], t.color[2], 1.0f), 1.5f);
+                            ImColor(t.color[0], t.color[1], t.color[2], 1.0f), 2.2f);
             prev = ImVec2(x, y);
             have_prev = true;
         }
     }
 
-    /* Keys. */
+    /* Keys — diamonds sit ON the value curve for property tracks (so the keys
+     * align with the polyline), centred for event/cut/color tracks.  Diamonds
+     * scale a little with lane height so taller lanes read clearly. */
+    const float ks = (height >= 56.0f) ? 8.0f : 6.5f;
     for (int i = 0; i < (int)t.keys.size(); ++i) {
         Key &k = t.keys[i];
         float x = t_to_x(k.t, origin.x, width);
-        float y = origin.y + height * 0.5f;
+        float y = is_prop ? val_y(k.v) : origin.y + height * 0.5f;
         bool sel = (track_idx == s.sel_track && i == s.sel_key);
         ImU32 fill = (t.type == TT_COLOR)
                      ? ImColor(k.rgb[0], k.rgb[1], k.rgb[2], 1.0f)
                      : ImColor(t.color[0], t.color[1], t.color[2], 1.0f);
         ImU32 border = sel ? jce_theme::selection_outline()
                            : jce_theme::node_outline();
-        if (t.type == TT_EVENT) {
-            ImVec2 p0(x - 5, y - 6), p1(x + 5, y - 6),
-                   p2(x + 5, y + 6), p3(x - 5, y + 6);
+        float thick = sel ? 2.5f : 1.5f;
+        if (t.type == TT_EVENT || t.type == TT_CAMERA_CUT) {
+            /* Event/cut: a full-height tick line + a square at centre, so a
+             * single key is obvious across the whole lane. */
+            dl->AddLine(ImVec2(x, origin.y + 3), ImVec2(x, origin.y + height - 3),
+                        (fill & 0x00FFFFFFu) | 0x55000000u, 1.5f);
+            ImVec2 p0(x - ks, y - ks), p1(x + ks, y - ks),
+                   p2(x + ks, y + ks), p3(x - ks, y + ks);
             dl->AddQuadFilled(p0, p1, p2, p3, fill);
-            dl->AddQuad      (p0, p1, p2, p3, border);
+            dl->AddQuad      (p0, p1, p2, p3, border, thick);
         } else {
-            ImVec2 a(x, y - 6), b(x + 6, y), c(x, y + 6), d(x - 6, y);
+            ImVec2 a(x, y - ks), b(x + ks, y), c(x, y + ks), d(x - ks, y);
             dl->AddQuadFilled(a, b, c, d, fill);
-            dl->AddQuad      (a, b, c, d, border);
+            dl->AddQuad      (a, b, c, d, border, thick);
         }
     }
 }
 
 void draw_timeline(void)
 {
+    /* Fills its parent child (##seq_top), which draw_content sizes to the natural
+     * track height — so the track-detail inspector below gets the rest. */
     ImGui::BeginChild("##seq_timeline", ImVec2(0, 0), true,
                       ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 
@@ -572,7 +667,11 @@ void draw_timeline(void)
     ImVec2 avail  = ImGui::GetContentRegionAvail();
     float header_w = 180.0f;
     float ruler_h  = 22.0f;
-    float lane_h   = 28.0f;
+    int   ntrk     = (int)s.tracks.size();
+    /* Lanes fill this (already-bounded) child; readable, never overflow it. */
+    float lane_h = (ntrk > 0) ? ((avail.y - ruler_h - 6.0f) / (float)ntrk) : 56.0f;
+    if (lane_h > 96.0f) lane_h = 96.0f;
+    if (lane_h < 18.0f) lane_h = 18.0f;
     float track_area_x = origin.x + header_w;
     float track_area_w = avail.x - header_w;
     if (track_area_w < 50.0f) track_area_w = 50.0f;
@@ -618,12 +717,13 @@ void draw_timeline(void)
                 s.sel_key   = -1;
             }
         }
-        /* Ruler click → set playhead. */
+        /* Ruler click → begin a SMOOTH (un-snapped) scrub. */
         else if (mp.y < origin.y + ruler_h && mp.x > track_area_x) {
             float t = x_to_t(mp.x, track_area_x, track_area_w);
             if (t < 0) t = 0;
             if (t > s.duration) t = s.duration;
-            s.playhead = snap_t(t);
+            s.playhead  = t;          /* no snap — continuous seek */
+            s.scrubbing = true;
             preview_apply(s.playhead);
         }
         /* Lane click → select / hit-test key, or insert new key. */
@@ -658,6 +758,18 @@ void draw_timeline(void)
             }
         }
     }
+
+    /* Smooth scrub: hold + drag anywhere to seek continuously (no frame snap),
+     * applying the live preview each frame so the scene follows the playhead. */
+    if (s.scrubbing && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        float t = x_to_t(mp.x, track_area_x, track_area_w);
+        if (t < 0) t = 0;
+        if (t > s.duration) t = s.duration;
+        s.playhead = t;
+        preview_apply(s.playhead);
+    }
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
+        s.scrubbing = false;
 
     /* Drag selected key. */
     if (s.drag_key >= 0 && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
@@ -715,7 +827,7 @@ void draw_inspector(void)
     Track &t = s.tracks[s.sel_track];
     ImGui::InputText(jce_editor_i18n_id("sequencer.field.name", "seq_t_name"), t.name, sizeof(t.name));
     if (ImGui::BeginCombo(jce_editor_i18n_id("sequencer.field.type", "seq_t_type"), track_type_name(t.type))) {
-        for (int k = 0; k < 3; ++k)
+        for (int k = 0; k < kTrackTypeCount; ++k)
             if (ImGui::Selectable(track_type_name(k), t.type == k) && t.type != k) {
                 t.type = k;
                 mark_dirty();
@@ -725,8 +837,10 @@ void draw_inspector(void)
 
     /* ── Structured binding: entity drop + property combo ──────────
      * (Panel state, NOT scene state — no batch-edit wrap; the undoable
-     * write happens in Sync to Player.) */
-    if (t.type == TT_EVENT) {
+     * write happens in Sync to Player.)
+     * EVENT and CAMERA-CUT tracks bind no property/entity here — their target
+     * is authored per-key (name / entity fields in the key table below). */
+    if (t.type == TT_EVENT || t.type == TT_CAMERA_CUT) {
         ImGui::TextDisabled("%s", jce_editor_i18n("sequencer.empty.event"));
     } else {
         JceScene *scene = jce_state_get_scene();
@@ -737,9 +851,11 @@ void draw_inspector(void)
                 std::snprintf(tgt, sizeof tgt, "%s",
                               jce_editor_i18n("sequencer.label.propNone"));
             } else {
-                const char *nm = scene
-                    ? jce_scene_entity_name(scene,
-                          jce_state_to_ecs_entity(t.bind_entity)) : NULL;
+                /* Show the editor DISPLAY name (EditorMeta) — matches the
+                 * hierarchy.  The scene "registered name" is often empty (we
+                 * bind by name), which showed a useless "(unnamed)". */
+                const char *nm = jce_state_entity_alive(t.bind_entity)
+                                 ? jce_state_entity_name(t.bind_entity) : NULL;
                 if (nm && nm[0]) std::snprintf(tgt, sizeof tgt, "%s", nm);
                 else std::snprintf(tgt, sizeof tgt, "Entity #%u", t.bind_entity);
             }
@@ -847,13 +963,81 @@ void draw_inspector(void)
                 ImGui::SetNextItemWidth(-FLT_MIN);
                 if (ImGui::DragFloat("##kv", &k.v, 0.01f))
                     mark_dirty();
+                /* Per-key easing (interpolation INTO this key from the
+                 * previous one).  Authored value serialized as "ease". */
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::BeginCombo("##kease",
+                        jce_ease_name((JceEaseType)k.ease))) {
+                    for (int e = 0; e < JCE_EASE_COUNT; ++e) {
+                        bool sel = (k.ease == e);
+                        if (ImGui::Selectable(jce_ease_name((JceEaseType)e), sel)
+                            && !sel) {
+                            k.ease = e;
+                            mark_dirty();
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
             } else if (t.type == TT_COLOR) {
                 if (ImGui::ColorEdit3("##krgb", k.rgb,
                                       ImGuiColorEditFlags_NoInputs |
                                       ImGuiColorEditFlags_NoLabel))
                     mark_dirty();
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::BeginCombo("##kease",
+                        jce_ease_name((JceEaseType)k.ease))) {
+                    for (int e = 0; e < JCE_EASE_COUNT; ++e) {
+                        bool sel = (k.ease == e);
+                        if (ImGui::Selectable(jce_ease_name((JceEaseType)e), sel)
+                            && !sel) {
+                            k.ease = e;
+                            mark_dirty();
+                        }
+                    }
+                    ImGui::EndCombo();
+                }
             } else {
-                ImGui::TextDisabled("%s", jce_editor_i18n("sequencer.empty.event"));
+                /* EVENT / CAMERA-CUT: author the handler / event name, and (for
+                 * camera-cut) the target entity id via a Hierarchy drop. */
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::InputTextWithHint("##kname",
+                        jce_editor_i18n("sequencer.field.keyName"),
+                        k.name, sizeof(k.name)))
+                    mark_dirty();
+                if (t.type == TT_CAMERA_CUT) {
+                    JceScene *scene = jce_state_get_scene();
+                    char tgt[160];
+                    if (k.entity == 0) {
+                        std::snprintf(tgt, sizeof tgt, "%s",
+                            jce_editor_i18n("sequencer.label.propNone"));
+                    } else {
+                        const char *nm = scene
+                            ? jce_scene_entity_name(scene,
+                                  jce_state_to_ecs_entity(k.entity)) : NULL;
+                        if (nm && nm[0]) std::snprintf(tgt, sizeof tgt, "%s", nm);
+                        else std::snprintf(tgt, sizeof tgt, "Entity #%u",
+                                           k.entity);
+                    }
+                    char btn[192];
+                    std::snprintf(btn, sizeof btn, "%s###kcut", tgt);
+                    ImGui::Button(btn, ImVec2(-FLT_MIN, 0.0f));
+                    if (ImGui::BeginDragDropTarget()) {
+                        if (const ImGuiPayload *pl =
+                                ImGui::AcceptDragDropPayload(JCE_DND_ENTITY)) {
+                            uint32_t id = *(const uint32_t *)pl->Data;
+                            if (id != k.entity) { k.entity = id; mark_dirty(); }
+                        }
+                        ImGui::EndDragDropTarget();
+                    }
+                    if (k.entity != 0) {
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("X###kcut_clr")) {
+                            k.entity = 0;
+                            mark_dirty();
+                        }
+                    }
+                }
             }
             ImGui::TableSetColumnIndex(3);
             if (ImGui::SmallButton("X")) {
@@ -892,6 +1076,15 @@ void draw_track_list(void)
         s.tracks.push_back(t);
         mark_dirty();
     }
+    ImGui::SameLine();
+    if (ImGui::Button(jce_editor_i18n_or("sequencer.button.addCameraCutTrack",
+                                         "+ Camera Cut"))) {
+        Track t;
+        std::snprintf(t.name, sizeof(t.name), "Cut%d", (int)s.tracks.size());
+        t.type = TT_CAMERA_CUT;
+        s.tracks.push_back(t);
+        mark_dirty();
+    }
 }
 
 void tick_playback(void)
@@ -919,9 +1112,18 @@ void draw_content(void)
     draw_track_list();
     ImGui::Separator();
 
+    /* Split the remaining panel between the TIMELINE (top) and the track-detail
+     * INSPECTOR (bottom).  The timeline takes only its NATURAL track height
+     * (readable ~46px lanes), capped at half the panel — so the inspector below
+     * always gets at least the other half (the dense Name/Type/Bind/Property +
+     * key-table content used to be starved by a fixed 66% timeline). */
     float h = ImGui::GetContentRegionAvail().y;
-    float top = h * 0.66f;
-    if (top < 200.0f) top = 200.0f;
+    int   ntrk = (int)s.tracks.size();
+    float natural = 22.0f + (float)(ntrk > 0 ? ntrk : 1) * 46.0f + 10.0f;
+    float top = natural;
+    if (top > h * 0.5f) top = h * 0.5f;        /* never more than half to tracks */
+    if (top < 110.0f)   top = 110.0f;
+    if (top > h - 130.0f && h > 240.0f) top = h - 130.0f;  /* keep room below */
 
     ImGui::BeginChild("##seq_top", ImVec2(0, top), false);
     draw_timeline();
@@ -949,6 +1151,25 @@ extern "C" void sequencer_draw_content(void)
 extern "C" void jce_panel_sequencer_preview_flush(void)
 {
     preview_restore();
+}
+
+/* Load a SequencePlayer's project-relative .seq.json into the panel (resolving
+ * to an absolute host path first).  Lets "Open in Sequencer" on a selected
+ * entity bind the panel to THAT entity's sequence — select → operate.  Track
+ * bindings re-resolve by name on load (from_json), so they hit live editor ids. */
+extern "C" void jce_panel_sequencer_load_path(const char *path)
+{
+    if (!path || !path[0]) return;
+    preview_restore();                  /* undo any in-progress preview writes */
+    char resolved[1024];
+    const char *p = path;
+    if (jce_editor_resolve_asset_path(path, resolved, (int)sizeof resolved))
+        p = resolved;
+    std::snprintf(s.path, sizeof s.path, "%s", p);
+    load_from(p);
+    s.playhead = 0.0f;
+    s.playing  = false;
+    mark_dirty();
 }
 
 extern "C" void jce_editor_panel_sequencer(void)

@@ -41,11 +41,19 @@ typedef struct {
 } JceProjectAudio;
 
 /* ── Editor ────────────────────────────────────────────────────────── */
+/* Auto-save is intentionally absent here: it is a per-user editor
+ * preference (Preferences > General, prefs.json) that never travels with
+ * the project, matching Unity/Unreal where auto-save lives in editor
+ * preferences rather than project settings. */
 typedef struct {
-    bool  auto_save_enabled;
-    int   auto_save_interval_sec;
     int   default_behavior_mode;  /* 0 = 3D, 1 = 2D */
     int   version_control_mode;   /* 0 = Hidden Meta, 1 = Visible Meta */
+    /* DEPRECATED / migration-only: external editor paths moved to per-user
+     * preferences (JceEditorConfig.external_script_editor /
+     * external_image_editor, editor-preferences.json) — machine paths must
+     * not travel via version control.  Still LOADED from legacy
+     * project-settings.json as a one-time copy-forward source; no longer
+     * written or shown in the UI. */
     char  external_script_editor[JCE_PS_PATH_LEN];
     char  external_image_editor [JCE_PS_PATH_LEN];
 } JceProjectEditor;

@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#include <jce/middleware/streaming/jce_streaming.h>
+#include <jce/resource/jce_streaming.h>
 #include <jce/resource/jce_world_streamer.h>
 
 

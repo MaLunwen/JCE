@@ -546,6 +546,48 @@ static void crash_sigaction_handler(int sig, siginfo_t *info, void *ucontext)
 
 #ifdef _WIN32
 
+/* Write a full minidump (.dmp) next to the text crash log so the garbled
+ * runtime backtrace (nearest-public-symbol only — DbgHelp line info often
+ * fails to load at crash time) can be opened in WinDbg / Visual Studio with
+ * jce_editor.pdb for the REAL call stack, locals and all threads. Returns the
+ * path on success (static buffer) or NULL. */
+static const char *write_minidump(EXCEPTION_POINTERS *ep)
+{
+    time_t now_t = time(NULL);
+    struct tm *now_tm = localtime(&now_t);
+    if (!now_tm) return NULL;
+
+    jce_fs_host_create_directory(".jce");
+    jce_fs_host_create_directory(".jce/crashes");
+
+    static char dmp_path[512];
+    snprintf(dmp_path, sizeof(dmp_path),
+             ".jce/crashes/crash-%04d%02d%02d-%02d%02d%02d.dmp",
+             now_tm->tm_year + 1900, now_tm->tm_mon + 1, now_tm->tm_mday,
+             now_tm->tm_hour, now_tm->tm_min, now_tm->tm_sec);
+
+    HANDLE f = CreateFileA(dmp_path, GENERIC_WRITE, 0, NULL,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return NULL;
+
+    MINIDUMP_EXCEPTION_INFORMATION mei;
+    mei.ThreadId          = GetCurrentThreadId();
+    mei.ExceptionPointers = ep;
+    mei.ClientPointers    = FALSE;
+
+    /* Data segments + thread info + handles = enough to fully symbolicate the
+     * faulting thread and inspect cross-thread state, without a huge full dump. */
+    MINIDUMP_TYPE type = (MINIDUMP_TYPE)(MiniDumpWithDataSegs |
+                                         MiniDumpWithThreadInfo |
+                                         MiniDumpWithHandleData |
+                                         MiniDumpWithIndirectlyReferencedMemory);
+
+    BOOL ok = MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(),
+                                f, type, &mei, NULL, NULL);
+    CloseHandle(f);
+    return ok ? dmp_path : NULL;
+}
+
 static LONG WINAPI windows_exception_handler(EXCEPTION_POINTERS *ep)
 {
     const char *exc_name = "Unknown exception";
@@ -651,6 +693,13 @@ static LONG WINAPI windows_exception_handler(EXCEPTION_POINTERS *ep)
 
     /* Write crash dump to disk. */
     const char *dump_path = write_crash_dump(dump_msg);
+
+    /* Also write a binary minidump for full offline symbolication (the runtime
+     * backtrace above is nearest-public-symbol only). */
+    const char *mdmp_path = write_minidump(ep);
+    if (mdmp_path)
+        LOG_ERROR(LOG_TAG, "minidump written: %s (open with jce_editor.pdb)",
+                  mdmp_path);
 
     char box_msg[1200];
     if (dump_path) {

@@ -24,6 +24,7 @@
 #include "ui/jce_editor_style.h"
 #include "jce_project_settings.h"
 #include <jce/ui/jce_imgui_renderer.h>
+#include <jce/application/jce_screenshot.h>
 #include "jce_build_manager.h"
 #include "jce_cook_manager.h"
 #include "jce_run_manager.h"
@@ -34,6 +35,7 @@ extern "C" void jce_reflect_register_builtin(void);
 extern "C" void jce_hotkeys_init(void);
 extern "C" void jce_workspace_init(void);
 extern "C" void jce_editor_prefs_load_and_apply(void);
+extern "C" int  jce_editor_prefs_autosave_interval_sec(void);
 
 #include <jce/tools/jce_imgui.hpp>
 #include <stdio.h>
@@ -67,6 +69,9 @@ static struct {
     char        frame_kpi_path[1024];
     uint32_t    frame_kpi_index;
     uint32_t    frame_kpi_limit;
+    bool        frame_kpi_shot_done; /* JCE_KPI_SHOT one-shot guard */
+
+    float       autosave_accum;   /* seconds since last autosave tick */
 } s_editor;
 
 /* ── Key mapping (JCE → ImGui) ─────────────────────────────────────── */
@@ -309,8 +314,14 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
     /* i18n. */
     jce_editor_i18n_init(pak);
 
-    /* Initialize editor state and panels. */
-    jce_editor_state_init();
+    /* Initialize editor state and panels.  If a valid last scene will be
+     * restored just below, skip building the throwaway demo scene (it would
+     * be destroyed milliseconds later) — keeps that churn off the
+     * time-to-first-frame path. */
+    const bool will_restore =
+        have_ecfg && ecfg.last_scene_path[0] != '\0' &&
+        jce_fs_host_exists_file(ecfg.last_scene_path);
+    jce_editor_state_init(/*with_demo_scene=*/!will_restore);
     jce_editor_panels_init();
     jce_run_manager_init();
     jce_build_manager_init();
@@ -349,9 +360,11 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
     s_editor.last_time   = jce_time_perf_counter();
     s_editor.window      = window;
     s_editor.text_input_active = false;
+    s_editor.autosave_accum = 0.0f;
     s_editor.frame_kpi_path[0] = '\0';
     s_editor.frame_kpi_index = 0;
     s_editor.frame_kpi_limit = 0;
+    s_editor.frame_kpi_shot_done = false;
 
     const char *frame_kpi_path = getenv("JCE_KPI_FRAME_LOG");
     if (frame_kpi_path && frame_kpi_path[0]) {
@@ -374,11 +387,18 @@ bool jce_editor_init(const JcePakArchive *pak, JceWindow *window)
     s_editor.active      = true;
     s_editor.initialized = true;
 
-    /* Auto-restore last opened scene. */
-    if (have_ecfg
-        && ecfg.last_scene_path[0] != '\0'
-        && jce_fs_host_exists_file(ecfg.last_scene_path)) {
-        (void)jce_state_load_scene_file(ecfg.last_scene_path);
+    /* Auto-restore last opened scene.  We skipped the demo scene above when
+     * will_restore was true; if the restore unexpectedly fails, fall back to
+     * the default scene so the editor never opens to a blank state.
+     *
+     * Use the frame-sliced opener so a very large scene (e.g. street_demo's
+     * ~17.5k-entity world) does NOT block the editor's first frame: it parses
+     * up front, then creates entities in chunks across the first frames while
+     * a "Loading scene…" overlay keeps the window responsive.  Small scenes
+     * complete synchronously inside this call (no overlay). */
+    if (will_restore) {
+        if (!jce_state_load_scene_file_async(ecfg.last_scene_path))
+            jce_state_new_default_scene();
     }
 
     return true;
@@ -477,7 +497,6 @@ bool jce_editor_process_event(const JceEvent *event)
 
     case JCE_EVENT_MOUSE_BUTTON_DOWN:
     case JCE_EVENT_MOUSE_BUTTON_UP: {
-        if (game_capture) break; /* clicks belong to the game while captured */
         int btn = -1;
         switch (event->button.button) {
         case JCE_MOUSE_BUTTON_LEFT:   btn = 0; break;
@@ -487,9 +506,18 @@ bool jce_editor_process_event(const JceEvent *event)
         case JCE_MOUSE_BUTTON_X2:     btn = 4; break;
         default: break;
         }
+        const bool down = (event->type == JCE_EVENT_MOUSE_BUTTON_DOWN);
+        if (game_capture) {
+            /* Clicks belong to the GAME while captured: don't drive ImGui (its
+             * cursor is the off-screen sentinel) — but TRACK the button so the
+             * Game View's gameplay input (e.g. melee on left-mouse) sees real
+             * down/up.  Forwarding to ImGui here would leave its MouseLeft
+             * stuck down (the capture-acquire click's release is swallowed). */
+            if (btn >= 0) jce_editor_game_render_push_mouse_button(btn, down);
+            break;
+        }
         if (btn >= 0)
-            io.AddMouseButtonEvent(btn,
-                event->type == JCE_EVENT_MOUSE_BUTTON_DOWN);
+            io.AddMouseButtonEvent(btn, down);
         break;
     }
 
@@ -540,6 +568,28 @@ void jce_editor_update(JceWindow *window)
     io.DeltaTime = dt;
     s_editor.last_time = now;
 
+    /* Autosave: a real timer driven by Preferences > General > autosave.
+     * Only when not in Play (don't bake play-time mutations into the file)
+     * and the active scene is dirty + has a path.  The interval accumulates
+     * regardless so a save fires every N seconds of edit-mode wall time. */
+    {
+        const int interval = jce_editor_prefs_autosave_interval_sec();
+        if (interval > 0 &&
+            jce_state_get_play_state() == JCE_PLAY_STOPPED) {
+            s_editor.autosave_accum += dt;
+            if (s_editor.autosave_accum >= (float)interval) {
+                s_editor.autosave_accum = 0.0f;
+                const char *sp = jce_state_get_current_scene_path();
+                if (sp && sp[0] && jce_state_is_scene_modified()) {
+                    if (jce_state_save_scene_file(sp))
+                        LOG_INFO(LOG_TAG, "autosaved scene %s", sp);
+                }
+            }
+        } else {
+            s_editor.autosave_accum = 0.0f;
+        }
+    }
+
     if (s_editor.frame_kpi_path[0]) {
         if (s_editor.frame_kpi_limit == 0 ||
             s_editor.frame_kpi_index < s_editor.frame_kpi_limit) {
@@ -550,7 +600,24 @@ void jce_editor_update(JceWindow *window)
             if (kpi_len > 0)
                 jce_fs_host_append(s_editor.frame_kpi_path, kpi_line, (size_t)kpi_len);
             s_editor.frame_kpi_index++;
+        } else if (!s_editor.frame_kpi_shot_done) {
+            /* Frame limit reached: optional one-shot autonomous screenshot
+             * (visual regression / SSAO verification).  Captured at this
+             * frame's bgfx submit; the editor keeps running so the async
+             * screenshot callback has frames to write the PNG. */
+            const char *shot = getenv("JCE_KPI_SHOT");
+            if (shot && shot[0])
+                jce_screenshot_save(shot, JCE_SCREENSHOT_PNG);
+            s_editor.frame_kpi_shot_done = true;
         }
+    }
+
+    /* Autonomous Play for gameplay verification (JCE_KPI_AUTOPLAY): enter Play
+     * once the scene has settled (frame 30) so a later JCE_KPI_SHOT captures
+     * live gameplay (scripts running, AI, HUD updating). */
+    if (s_editor.frame_kpi_index == 30 && getenv("JCE_KPI_AUTOPLAY") &&
+        jce_state_get_play_state() == JCE_PLAY_STOPPED) {
+        jce_state_play();
     }
 
     /* Setup bgfx view. */

@@ -16,6 +16,7 @@
 #include "core/jce_editor_config.h"
 #include "ui/jce_editor_panels.h"
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_alloc.h>   /* jce_free for the import GLB buffer */
 
 extern "C" {
 #include <jce/renderer/jce_pbr_material.h>
@@ -50,6 +51,11 @@ static void draw_scene_view_toolbar(void)
     if (ImGui::RadioButton("S", gm == JCE_GIZMO_SCALE))
         jce_state_set_gizmo_mode(JCE_GIZMO_SCALE);
     jce_editor::help_tip(jce_editor_i18n("sceneView.tooltip.scale"));
+    ImGui::SameLine();
+    bool pivot_edit = jce_state_get_pivot_edit_mode();
+    if (ImGui::RadioButton("D", pivot_edit))
+        jce_state_set_pivot_edit_mode(!pivot_edit);
+    jce_editor::help_tip(jce_editor_i18n("sceneView.tooltip.pivotEdit"));
 
     ImGui::SameLine();
     ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
@@ -250,10 +256,10 @@ static bool setup_scene_viewport(SceneViewCtx *ctx)
     if (tex_idx != UINT16_MAX) {
         const bool origin_bl = jce_renderer_origin_bottom_left();
         if (origin_bl) {
-            ImGui::Image((ImTextureID)(uintptr_t)tex_idx, avail,
+            ImGui::Image((ImTextureID)(uintptr_t)((uint32_t)tex_idx + 1u), avail,
                          ImVec2(0.0f, uv_v1), ImVec2(uv_u1, 0.0f));
         } else {
-            ImGui::Image((ImTextureID)(uintptr_t)tex_idx, avail,
+            ImGui::Image((ImTextureID)(uintptr_t)((uint32_t)tex_idx + 1u), avail,
                          ImVec2(0.0f, 0.0f), ImVec2(uv_u1, uv_v1));
         }
     } else {
@@ -316,6 +322,61 @@ static bool is_mesh_asset(const char *path)
             return true;
     }
     return false;
+}
+
+/* Forward decl of the engine bundle mesh converter (jce_bundle_mesh_convert.cpp,
+ * linked into the editor via the jce_resource layer). */
+extern "C" int jce_bundle_convert_to_glb(const uint8_t *src, size_t src_sz,
+                                         const char *ext_hint,
+                                         uint8_t **out_buf, size_t *out_size);
+
+/* Inc 2a — convert-on-import: a model dragged into the scene is normalised to a
+ * sibling ".glb" so the project stays single-format (the runtime mesh loader is
+ * cgltf-only; a raw .obj would render in-editor via assimp but silently fail at
+ * runtime).  Already-glTF inputs pass through; an existing sibling .glb is
+ * reused; conversion failure falls back to the original path (the editor's
+ * assimp preview still renders it).  Returns a pointer into `out` (the .glb
+ * path) or the original `asset_path`. */
+static const char *import_ensure_glb(const char *asset_path, char *out, size_t cap)
+{
+    if (!asset_path || !asset_path[0]) return asset_path;
+    char ext[16];
+    copy_ext_lower(asset_path, ext, sizeof(ext));
+    if (ext[0] == '\0' || strcmp(ext, ".glb") == 0 || strcmp(ext, ".gltf") == 0)
+        return asset_path;                 /* already glTF / no extension */
+
+    const char *dot = strrchr(asset_path, '.');
+    size_t stem = dot ? (size_t)(dot - asset_path) : strlen(asset_path);
+    if (stem + 5 > cap) return asset_path;
+    memcpy(out, asset_path, stem);
+    memcpy(out + stem, ".glb", 5);         /* incl NUL */
+
+    if (jce_fs_host_exists_file(out))
+        return out;                        /* converted on a previous drop */
+
+    uint64_t in_sz = 0;
+    void    *in_buf = jce_fs_host_read_all(asset_path, &in_sz);
+    if (!in_buf || in_sz == 0) {
+        if (in_buf) jce_fs_buffer_free(in_buf);
+        return asset_path;
+    }
+    uint8_t *glb = NULL;
+    size_t   glb_sz = 0;
+    int ok = jce_bundle_convert_to_glb((const uint8_t *)in_buf, (size_t)in_sz,
+                                       dot ? dot + 1 : "", &glb, &glb_sz);
+    jce_fs_buffer_free(in_buf);
+    if (!ok || !glb || glb_sz == 0) {
+        if (glb) jce_free(glb);
+        jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+            "Import: GLB conversion failed for '%s' (using source)", asset_path);
+        return asset_path;
+    }
+    bool wrote = jce_fs_host_write_all(out, glb, glb_sz);
+    jce_free(glb);
+    if (!wrote) return asset_path;
+    jce_editor_console_log_level(JCE_CONSOLE_INFO,
+        "Import: converted model to glTF -> %s", out);
+    return out;
 }
 
 /* Returns true if the extension matches a supported texture/material format. */
@@ -492,17 +553,26 @@ static void apply_extracted_material_to_mesh_renderer(
 {
     if (!mesh_renderer_comp || !material) return;
 
+    /* The importer reports extracted-texture files CWD-relative; convert
+     * to the canonical project-relative form before storing, or the saved
+     * scene carries references no resolver (or the bundle packer) can
+     * anchor once the editor runs from a different directory. */
     auto &mr = *mesh_renderer_comp;
     if (material->albedo_tex[0])
-        snprintf(mr.albedo_tex, sizeof(mr.albedo_tex), "%s", material->albedo_tex);
+        jce_editor_path_store_asset_ref(mr.albedo_tex, sizeof(mr.albedo_tex),
+                                        material->albedo_tex);
     if (material->mr_tex[0])
-        snprintf(mr.mr_tex, sizeof(mr.mr_tex), "%s", material->mr_tex);
+        jce_editor_path_store_asset_ref(mr.mr_tex, sizeof(mr.mr_tex),
+                                        material->mr_tex);
     if (material->normal_tex[0])
-        snprintf(mr.normal_tex, sizeof(mr.normal_tex), "%s", material->normal_tex);
+        jce_editor_path_store_asset_ref(mr.normal_tex, sizeof(mr.normal_tex),
+                                        material->normal_tex);
     if (material->ao_tex[0])
-        snprintf(mr.ao_tex, sizeof(mr.ao_tex), "%s", material->ao_tex);
+        jce_editor_path_store_asset_ref(mr.ao_tex, sizeof(mr.ao_tex),
+                                        material->ao_tex);
     if (material->emissive_tex[0])
-        snprintf(mr.emissive_tex, sizeof(mr.emissive_tex), "%s", material->emissive_tex);
+        jce_editor_path_store_asset_ref(mr.emissive_tex, sizeof(mr.emissive_tex),
+                                        material->emissive_tex);
 
     mr.base_color[0] = material->base_color[0];
     mr.base_color[1] = material->base_color[1];
@@ -752,9 +822,26 @@ static void scene_view_frame_entities(bool all)
             uint32_t f_ent = jce_state_get_focused();
             if (f_ent != 0) accumulate(f_ent);
         } else {
-            for (int i = 0; i < sel_n; i++)
-                if (sel[i] != 0 && jce_state_entity_exists(sel[i]))
-                    accumulate(sel[i]);
+            /* Standard-engine "Frame Selected" (Unity/Unreal/Blender): union the
+             * selected entities' bounds, but EXCLUDE terrain when any non-terrain
+             * entity is also selected — a terrain/ground entity's huge bounds
+             * would otherwise dominate the union and fling the camera far out
+             * (the reported "terrain + a house selected → focus is useless"
+             * case). If ONLY terrain is selected, it is framed normally. */
+            bool any_non_terrain = false;
+            for (int i = 0; i < sel_n; i++) {
+                if (sel[i] != 0 && jce_state_entity_exists(sel[i]) &&
+                    !jce_scene_has_terrain(scene, (JceEntity)sel[i])) {
+                    any_non_terrain = true;
+                    break;
+                }
+            }
+            for (int i = 0; i < sel_n; i++) {
+                if (sel[i] == 0 || !jce_state_entity_exists(sel[i])) continue;
+                if (any_non_terrain &&
+                    jce_scene_has_terrain(scene, (JceEntity)sel[i])) continue;
+                accumulate(sel[i]);
+            }
         }
     }
 
@@ -958,10 +1045,13 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
                 ImGui::GetIO().KeyAlt ? find_mesh_renderer_component(hit_id) : NULL;
             if (mesh_renderer_comp) {
                 /* Replace the existing entity's mesh + extract material. */
+                char glb_buf[1024];
+                const char *src_mesh = import_ensure_glb(asset_path, glb_buf,
+                                                         sizeof(glb_buf));
                 char rel_mesh[1024];
                 jce_editor_path_to_relative(rel_mesh, sizeof(rel_mesh),
-                                             asset_path);
-                const char *store_mesh = rel_mesh[0] ? rel_mesh : asset_path;
+                                             src_mesh);
+                const char *store_mesh = rel_mesh[0] ? rel_mesh : src_mesh;
                 jce_state_begin_batch_edit();
                 {
                     auto &mr = *mesh_renderer_comp;
@@ -1036,11 +1126,14 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
                         }
                         JceMeshRenderer *mr = jce_scene_get_mesh_renderer(scene, (JceEntity)id);
                         if (mr) {
+                            char glb_buf2[1024];
+                            const char *src_mesh2 = import_ensure_glb(asset_path,
+                                                        glb_buf2, sizeof(glb_buf2));
                             char rel_mesh2[1024];
                             jce_editor_path_to_relative(rel_mesh2, sizeof(rel_mesh2),
-                                                         asset_path);
+                                                         src_mesh2);
                             const char *store_mesh2 = rel_mesh2[0]
-                                                       ? rel_mesh2 : asset_path;
+                                                       ? rel_mesh2 : src_mesh2;
                             snprintf(mr->mesh_path, sizeof(mr->mesh_path),
                                      "%s", store_mesh2);
                             mr->mesh_shape = 0;
@@ -1056,15 +1149,19 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
 
                             /* A skinned/animated glTF would be stripped to a
                              * static bind pose by the Mesh Renderer (Assimp +
-                             * PreTransformVertices drops skin/anim).  Probe via
-                             * the cgltf query loader; if it carries a skeleton
-                             * and clips, attach a Skeletal Animator (the path
-                             * that preserves skin+anim) and start playback so a
-                             * skinned character animates on drop. */
-                            JceModel *probe =
-                                jce_editor_scene_get_model(store_mesh2, id);
-                            if (probe && jce_model_get_skeleton(probe) &&
-                                jce_model_anim_count(probe) > 0) {
+                             * PreTransformVertices drops skin/anim).  Detect a
+                             * rig with a HEADER-ONLY cgltf probe — never a full
+                             * model load — so dropping a heavy character (lots
+                             * of clips) doesn't block the main thread building
+                             * geometry + a clip player just to answer "skinned?".
+                             * If it carries a skin and clips, attach a Skeletal
+                             * Animator (the path that preserves skin+anim) and
+                             * start playback; the actual model loads async via
+                             * the normal render path. */
+                            bool has_skin = false, has_anim = false;
+                            jce_editor_probe_model_rig(store_mesh2,
+                                                       &has_skin, &has_anim);
+                            if (has_skin && has_anim) {
                                 jce_state_add_component(
                                     id, JCE_COMP_FLAG_SKELETAL_ANIMATOR);
                                 JceSkeletalAnimatorComponent *sa =
@@ -1080,8 +1177,7 @@ static void handle_scene_view_asset_drop(ImVec2 screen_pos, ImVec2 avail){
                                     jce_editor_console_log_level(
                                         JCE_CONSOLE_INFO,
                                         "Skinned glTF: auto-added Skeletal "
-                                        "Animator (%u clip(s)), playing",
-                                        (unsigned)jce_model_anim_count(probe));
+                                        "Animator, playing");
                                 }
                             }
                         }
@@ -1280,6 +1376,9 @@ static void draw_scene_context_menu(const SceneViewCtx *ctx)
                     jce_state_set_gizmo_mode(JCE_GIZMO_ROTATE);
                 if (ImGui::MenuItem(jce_editor_i18n("toolbar.scale"), "R", menu_gm == JCE_GIZMO_SCALE))
                     jce_state_set_gizmo_mode(JCE_GIZMO_SCALE);
+                bool pivot_edit = jce_state_get_pivot_edit_mode();
+                if (ImGui::MenuItem(jce_editor_i18n("sceneView.pivotEdit"), "D", pivot_edit))
+                    jce_state_set_pivot_edit_mode(!pivot_edit);
                 ImGui::EndMenu();
             }
         }
@@ -1373,6 +1472,10 @@ static void handle_scene_view_shortcuts(void)
         if (jce_hotkey_pressed(JCE_HK_GIZMO_TRANSLATE)) jce_state_set_gizmo_mode(JCE_GIZMO_TRANSLATE);
         if (jce_hotkey_pressed(JCE_HK_GIZMO_ROTATE))    jce_state_set_gizmo_mode(JCE_GIZMO_ROTATE);
         if (jce_hotkey_pressed(JCE_HK_GIZMO_SCALE))     jce_state_set_gizmo_mode(JCE_GIZMO_SCALE);
+        if (jce_hotkey_pressed(JCE_HK_GIZMO_PIVOT_EDIT)
+            || ImGui::IsKeyPressed(ImGuiKey_Insert, false)) {
+            jce_state_set_pivot_edit_mode(!jce_state_get_pivot_edit_mode());
+        }
 
         const bool frame_sel  = jce_hotkey_pressed(JCE_HK_VIEW_FRAME_SELECTED);
         const bool frame_all_ = jce_hotkey_pressed(JCE_HK_VIEW_FRAME_ALL);
@@ -1421,82 +1524,53 @@ static void handle_scene_view_shortcuts(void)
 
 /* ── Overlays + picking helpers ──────────────────────────────────── */
 
-/* Hit-test entities vs. the finished marquee rectangle. */
+/* Marquee (box) selection goes through the GPU pick buffer: render the object-ID
+ * buffer and read back the WHOLE drag rectangle, then select every unique entity
+ * in it.  Pixel-accurate for any geometry — including streamed glTF chunk
+ * objects — exactly like single-click picking.  (The CPU transform-scale AABB
+ * test this replaced was wrong for glTF models, whose real world bounds are
+ * scale × mesh-AABB, not a unit cube, so streamed objects couldn't be boxed.)
+ * Async: requested on drag-finish here, polled on later frames in
+ * handle_ray_pick. */
+static bool s_gpu_marquee_pending = false;
+static bool s_gpu_marquee_add     = false;
+
 static void handle_marquee_selection(const SceneViewCtx *ctx,
                                      const float *view_mat,
                                      const float *proj_mat)
 {
+    (void)view_mat; (void)proj_mat;
     if (!s_sel_pending) return;
     s_sel_pending = false;
+    if (!ctx || !jce_editor_scene_pick_supported()) return;
 
-    bool hit_any = false;
-    bool add_mode = ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift;
-    if (!add_mode) jce_state_clear_selection();
+    /* Map the screen-space marquee rect to pick-buffer pixels (same mapping as
+     * the single-click path in request_gpu_pick_for_click). */
+    const uint32_t rt_w = (uint32_t)fmaxf(16.0f, floorf(ctx->avail.x));
+    const uint32_t rt_h = (uint32_t)fmaxf(16.0f, floorf(ctx->avail.y));
+    const float ax = ctx->avail.x > 1.0f ? ctx->avail.x : 1.0f;
+    const float ay = ctx->avail.y > 1.0f ? ctx->avail.y : 1.0f;
+    auto to_px = [&](float sx, float sy, uint32_t &ox, uint32_t &oy) {
+        float lx = sx - ctx->screen_pos.x, ly = sy - ctx->screen_pos.y;
+        if (lx < 0.0f) lx = 0.0f;
+        if (ly < 0.0f) ly = 0.0f;
+        if (lx > ax - 1.0f) lx = ax - 1.0f;
+        if (ly > ay - 1.0f) ly = ay - 1.0f;
+        uint32_t px = (uint32_t)floorf(lx * (float)rt_w / ax);
+        uint32_t py = (uint32_t)floorf(ly * (float)rt_h / ay);
+        if (px >= rt_w) px = rt_w - 1u;
+        if (py >= rt_h) py = rt_h - 1u;
+        if (jce_renderer_origin_bottom_left()) py = rt_h - 1u - py;
+        ox = px; oy = py;
+    };
+    uint32_t x0, y0, x1, y1;
+    to_px(s_sel_rect_min.x, s_sel_rect_min.y, x0, y0);
+    to_px(s_sel_rect_max.x, s_sel_rect_max.y, x1, y1);
 
-    JceScene *scene = jce_state_get_scene();
-    int total = jce_state_get_entity_count();
-    for (int mi = 0; mi < total; mi++) {
-        uint32_t meid = jce_state_get_entity_id_by_index(mi);
-        if (meid == 0 || !jce_state_entity_exists(meid)) continue;
-        if (!jce_state_entity_enabled(meid)) continue;
-
-        JceTransform *t = scene ? jce_scene_get_transform(scene, (JceEntity)meid) : NULL;
-        if (!t) continue;
-        float mwp[3] = { t->position.x, t->position.y, t->position.z };
-        float mws[3] = { t->scale.x,    t->scale.y,    t->scale.z    };
-
-        float hx = fabsf(mws[0]) * 0.5f;
-        float hy = fabsf(mws[1]) * 0.5f;
-        float hz = fabsf(mws[2]) * 0.5f;
-        if (hx < 0.1f) hx = 0.1f;
-        if (hy < 0.1f) hy = 0.1f;
-        if (hz < 0.1f) hz = 0.1f;
-
-        static const float corners[8][3] = {
-            {-1,-1,-1}, { 1,-1,-1}, {-1, 1,-1}, { 1, 1,-1},
-            {-1,-1, 1}, { 1,-1, 1}, {-1, 1, 1}, { 1, 1, 1},
-        };
-
-        float bb_min_x =  1e30f, bb_min_y =  1e30f;
-        float bb_max_x = -1e30f, bb_max_y = -1e30f;
-        int projected = 0;
-
-        for (int ci = 0; ci < 8; ci++) {
-            float wx = mwp[0] + corners[ci][0] * hx;
-            float wy = mwp[1] + corners[ci][1] * hy;
-            float wz = mwp[2] + corners[ci][2] * hz;
-
-            float mvx = view_mat[0]*wx + view_mat[4]*wy + view_mat[8] *wz + view_mat[12];
-            float mvy = view_mat[1]*wx + view_mat[5]*wy + view_mat[9] *wz + view_mat[13];
-            float mvz = view_mat[2]*wx + view_mat[6]*wy + view_mat[10]*wz + view_mat[14];
-            float mvw = view_mat[3]*wx + view_mat[7]*wy + view_mat[11]*wz + view_mat[15];
-
-            float mcx = proj_mat[0]*mvx + proj_mat[4]*mvy + proj_mat[8] *mvz + proj_mat[12]*mvw;
-            float mcy = proj_mat[1]*mvx + proj_mat[5]*mvy + proj_mat[9] *mvz + proj_mat[13]*mvw;
-            float mcw = proj_mat[3]*mvx + proj_mat[7]*mvy + proj_mat[11]*mvz + proj_mat[15]*mvw;
-            if (mcw <= 0.0f) continue;
-
-            float msx = ctx->screen_pos.x + (mcx / mcw + 1.0f) * 0.5f * ctx->avail.x;
-            float msy = ctx->screen_pos.y + (1.0f - mcy / mcw) * 0.5f * ctx->avail.y;
-            if (msx < bb_min_x) bb_min_x = msx;
-            if (msx > bb_max_x) bb_max_x = msx;
-            if (msy < bb_min_y) bb_min_y = msy;
-            if (msy > bb_max_y) bb_max_y = msy;
-            projected++;
-        }
-
-        if (projected <= 0) continue;
-
-        if (bb_max_x >= s_sel_rect_min.x && bb_min_x <= s_sel_rect_max.x &&
-            bb_max_y >= s_sel_rect_min.y && bb_min_y <= s_sel_rect_max.y)
-        {
-            hit_any = true;
-            jce_state_select_entity(meid, true);
-        }
+    if (jce_editor_scene_pick_request_rect(x0, y0, x1, y1)) {
+        s_gpu_marquee_pending = true;
+        s_gpu_marquee_add = ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeyShift;
     }
-    jce_editor_inspector_request_sync();
-    if (hit_any)
-        jce_editor_layout_request_focus_inspector();
 }
 
 static bool s_gpu_pick_selection_pending = false;
@@ -1507,6 +1581,7 @@ static void cancel_deferred_scene_pick(void)
     s_sel_pending = false;
     s_sel_click_pending = false;
     s_gpu_pick_selection_pending = false;
+    s_gpu_marquee_pending = false;
 }
 
 static void apply_single_pick_selection(uint32_t best_id, bool add_mode)
@@ -1561,6 +1636,21 @@ static void handle_ray_pick(const SceneViewCtx *ctx,
                             const float *proj_mat,
                             const float *eye)
 {
+    /* Poll a pending GPU marquee (box) selection — fills with every unique
+     * entity inside the dragged rectangle (streamed objects included). */
+    if (s_gpu_marquee_pending) {
+        static uint32_t marq_ids[4096];
+        uint32_t mn = 0;
+        if (jce_editor_scene_pick_poll_rect(marq_ids, 4096u, &mn)) {
+            if (!s_gpu_marquee_add) jce_state_clear_selection();
+            for (uint32_t i = 0; i < mn; i++)
+                if (marq_ids[i]) jce_state_select_entity(marq_ids[i], true);
+            jce_editor_inspector_request_sync();
+            if (mn > 0) jce_editor_layout_request_focus_inspector();
+            s_gpu_marquee_pending = false;
+        }
+    }
+
     if (s_gpu_pick_selection_pending) {
         uint32_t gpu_hit = 0;
         if (jce_editor_scene_pick_poll(&gpu_hit)) {

@@ -316,9 +316,37 @@ JceCookResult jce_cook_texture(const void *input, size_t input_size,
         return result;
     }
 
-    /* Generate each mip level. */
-    uint8_t *current_mip = (uint8_t *)surf->pixels;
-    uint8_t *temp_mip = NULL;
+    /* Generate each mip level into the contiguous mip_data pyramid.
+     *
+     * Mip generation reads the PREVIOUS level as its source while writing
+     * the next, so a single realloc'd scratch buffer is unsafe: a realloc
+     * that relocates frees the old block while `current_mip` still points
+     * at it, and jce_tex_generate_mip then reads freed memory.  In release
+     * builds the shrinking realloc usually stays in place, so the bug only
+     * fired intermittently (and the crash surfaced INSIDE generate_mip,
+     * masking the real cause here).  Ping-pong between two fixed buffers
+     * sized to the largest sub-base level (mip 1); every later level is
+     * smaller, so capacity never grows and `current_mip` always refers to
+     * the buffer NOT being written this step. */
+    uint8_t *current_mip = (uint8_t *)surf->pixels;   /* level 0 = source */
+    uint8_t *scratch[2] = { NULL, NULL };
+    int scratch_idx = 0;
+    if (mip_count > 1) {
+        uint32_t m1w, m1h;
+        jce_tex_mip_dimensions(base_w, base_h, 1, &m1w, &m1h);
+        size_t scratch_cap = (size_t)m1w * m1h * 4;
+        scratch[0] = (uint8_t *)JCE_MALLOC(scratch_cap);
+        scratch[1] = (uint8_t *)JCE_MALLOC(scratch_cap);
+        if (!scratch[0] || !scratch[1]) {
+            JCE_FREE(scratch[0]);
+            JCE_FREE(scratch[1]);
+            JCE_FREE(mip_offsets);
+            JCE_FREE(mip_data);
+            SDL_DestroySurface(surf);
+            snprintf(result.error, sizeof(result.error), "mip allocation failed");
+            return result;
+        }
+    }
     uint32_t current_w = base_w, current_h = base_h;
     size_t mip_offset = 0;
 
@@ -333,32 +361,18 @@ JceCookResult jce_cook_texture(const void *input, size_t input_size,
         /* Generate next mip level if needed. */
         if (m + 1 < mip_count) {
             uint32_t next_w, next_h;
-            jce_tex_mip_dimensions(base_w, base_h, m + 1, &next_w, &next_h);
-
-            size_t next_size = (size_t)next_w * next_h * 4;
-            if (!temp_mip) {
-                temp_mip = (uint8_t *)JCE_MALLOC(next_size);
-            } else {
-                temp_mip = (uint8_t *)JCE_REALLOC(temp_mip, next_size);
-            }
-
-            if (!temp_mip) {
-                JCE_FREE(mip_offsets);
-                JCE_FREE(mip_data);
-                SDL_DestroySurface(surf);
-                snprintf(result.error, sizeof(result.error), "mip allocation failed");
-                return result;
-            }
-
+            uint8_t *dst = scratch[scratch_idx];
             jce_tex_generate_mip(current_mip, current_w, current_h,
-                                 temp_mip, &next_w, &next_h);
-            current_mip = temp_mip;
+                                 dst, &next_w, &next_h);
+            current_mip = dst;
+            scratch_idx ^= 1;   /* next level writes the other buffer */
             current_w = next_w;
             current_h = next_h;
         }
     }
 
-    JCE_FREE(temp_mip);
+    JCE_FREE(scratch[0]);
+    JCE_FREE(scratch[1]);
 
     /* Default output = the RGBA8 mip pyramid just generated. */
     uint8_t  *final_data    = mip_data;
@@ -386,8 +400,13 @@ JceCookResult jce_cook_texture(const void *input, size_t input_size,
             jce_tex_mip_dimensions(base_w, base_h, m, &mw, &mh);
             uint32_t es = jce_tex_encoded_size(mw, mh, target_format);
             enc_offsets[m] = (uint32_t)eo;
+            /* BC5 IS the normal-map format; pick the matching quality family
+             * so range-fit is applied per-channel (degrades normals far less
+             * than range-fit chroma). */
+            int is_normal = (target_format == JCEASSET_TEXFMT_BC5);
+            int quality   = opts ? opts->encode_quality : 0;
             if (!jce_tex_encode(mip_data + mip_offsets[m], mw, mh,
-                                target_format, /*normal_map=*/0,
+                                target_format, is_normal, quality,
                                 enc_data + eo, es)) {
                 enc_ok = false;
             }

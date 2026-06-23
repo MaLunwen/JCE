@@ -25,7 +25,14 @@ extern const char  *s_tag_names[];
 
 /* ── Hierarchy state ──────────────────────────────────────────────── */
 
-#define HIERARCHY_MAX_DISPLAY 4096
+/* Cap on the number of rows the hierarchy will flatten/display in a single
+ * frame.  Raised well above the former 4096 because the panel now renders via
+ * ImGuiListClipper (flatten-then-clip): only the ~visible rows are submitted
+ * to ImGui each frame, so the per-frame render cost is independent of this
+ * count and we can afford to expose the whole tree.  display_order[] and
+ * flat[] are sized to this cap; both live in the single static HierarchyState
+ * instance (not on the stack). */
+#define HIERARCHY_MAX_DISPLAY 32768
 
 struct HierarchyState {
     char     search_buf[128];
@@ -43,6 +50,17 @@ struct HierarchyState {
 
     uint32_t display_order[HIERARCHY_MAX_DISPLAY];
     int      display_count;
+
+    /* Flattened visible-tree row list, rebuilt every frame by
+     * jce_hierarchy_flatten().  Parallel to display_order (same ids/order)
+     * but also carries the per-row indent depth so draw_entity_row() can
+     * indent manually (the clipper renders rows out of recursion context). */
+    struct {
+        uint32_t id;
+        int      depth;
+    }        flat[HIERARCHY_MAX_DISPLAY];
+    int      flat_count;
+
     uint32_t shift_anchor;
     uint32_t last_focus_seen;
     uint32_t reveal_target;
@@ -71,7 +89,17 @@ void focus_entity_in_scene(uint32_t id);
 
 /* ── Functions from jce_panel_hierarchy_node.cpp ──────────────────── */
 
-void draw_entity_node(uint32_t entity_id);
+/* Walk the entity tree in display order (roots already gathered+sorted by the
+ * caller, passed in here), honouring the persisted ImGui open-state, the search
+ * filter and the tag filter, and populate s_hier.flat[] / s_hier.flat_count and
+ * s_hier.display_order[] / s_hier.display_count with the FULL flattened visible
+ * row list.  Must run before clipping. */
+void jce_hierarchy_flatten(const uint32_t *root_ids, int root_count);
+
+/* Render a single hierarchy row (one entity) at the given indent depth.  Does
+ * NOT recurse into children and never pushes an ImGui tree level — the flatten
+ * pass owns the tree structure.  Called per visible row by the clipper. */
+void draw_entity_row(uint32_t entity_id, int depth);
 
 /* ── Functions from jce_panel_hierarchy_menu.cpp ──────────────────── */
 

@@ -75,23 +75,50 @@ void jce_editor_panel_hierarchy_content(void)
     }
 
     {
-        s_hier.display_count = 0;
         s_hier.ctx_clicked_entity = false;
 
-        uint32_t root_ids[HIERARCHY_MAX_DISPLAY];
-        int root_total = jce_state_get_root_count();
-        int root_count = 0;
-
-        for (int i = 0; i < root_total && root_count < HIERARCHY_MAX_DISPLAY; i++) {
-            uint32_t rid = jce_state_get_root_id(i);
-            if (rid != 0 && jce_state_entity_exists(rid))
-                root_ids[root_count++] = rid;
-        }
+        /* Gather + sort roots (display_order/flat are filled by the flatten).
+         * O(n) single pass — the old get_root_count + per-index get_root_id loop
+         * was O(n^2) (each get_root_id rescans g_entity_order), which became
+         * catastrophic once the clipper let the display cap grow to 32768. */
+        static uint32_t root_ids[HIERARCHY_MAX_DISPLAY];
+        int root_count = jce_state_get_roots(root_ids, HIERARCHY_MAX_DISPLAY);
 
         sort_entity_ids(root_ids, root_count);
 
-        for (int i = 0; i < root_count; i++)
-            draw_entity_node(root_ids[i]);
+        /* Flatten the visible tree (full list → display_order + flat) then
+         * render only the clipper-visible rows.  This is the perf fix: a
+         * full-loaded scene flattens thousands of rows but submits ~30. */
+        jce_hierarchy_flatten(root_ids, root_count);
+
+        ImGuiListClipper clip;
+        clip.Begin(s_hier.flat_count);
+
+        /* Reveal: the target row may be clipped out, so force it (and the
+         * single visible row immediately after, to leave headroom for
+         * SetScrollHereY centering) to be submitted this frame.  Its body's
+         * SetScrollHereY then fires and clears reveal_pending.  The flatten
+         * already forced the reveal-path ancestors open via
+         * node_in_reveal_path(), so the target is present in flat[]. */
+        if (s_hier.reveal_pending && s_hier.reveal_target != 0) {
+            int reveal_idx = -1;
+            for (int i = 0; i < s_hier.flat_count; i++) {
+                if (s_hier.flat[i].id == s_hier.reveal_target) {
+                    reveal_idx = i;
+                    break;
+                }
+            }
+            if (reveal_idx >= 0)
+                clip.IncludeItemByIndex(reveal_idx);
+            else
+                s_hier.reveal_pending = false; /* not visible; nothing to scroll to */
+        }
+
+        while (clip.Step()) {
+            for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++)
+                draw_entity_row(s_hier.flat[i].id, s_hier.flat[i].depth);
+        }
+        clip.End();
 
         /* Left-click on empty space: clear selection. */
         if (ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByPopup)
@@ -154,8 +181,13 @@ void jce_editor_panel_hierarchy_content(void)
                 if (jce_state_entity_exists(focused))
                     begin_rename_entity(focused, jce_state_entity_name(focused));
             }
-            if (jce_hotkey_pressed(JCE_HK_EDIT_DELETE)
-                || jce_hotkey_pressed(JCE_HK_EDIT_DELETE_ALT)) {
+            /* Never treat Delete/Backspace as "delete entity" while a rename
+             * (or any text field) is active — Backspace must edit the name, not
+             * destroy the entity.  jce_hotkey_pressed() consumes the chord, so
+             * short-circuit BEFORE calling it so the InputText still gets the key. */
+            if (s_hier.renaming_id == 0 && !ImGui::GetIO().WantTextInput &&
+                (jce_hotkey_pressed(JCE_HK_EDIT_DELETE)
+                 || jce_hotkey_pressed(JCE_HK_EDIT_DELETE_ALT))) {
                 int sel_count = 0;
                 const uint32_t *sel = jce_state_get_selection(&sel_count);
                 if (sel_count > 1) {

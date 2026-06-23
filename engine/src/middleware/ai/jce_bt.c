@@ -31,6 +31,7 @@ JceBtContext *jce_bt_create(void)
     ctx->backend = jce_bt_backend_create();
     if (!ctx->backend) {
         JCE_FREE(ctx);
+        return NULL;   /* was missing: fell through returning freed memory */
     }
 
     LOG_SUCCESS(LOG_TAG, "behavior tree context created");
@@ -52,6 +53,20 @@ void jce_bt_register_action(JceBtContext *ctx, const char *name,
 {
     if (!ctx || !name || !fn) return;
     jce_bt_backend_register_action(ctx->backend, name, fn, userdata);
+}
+
+/* ── Bundled deterministic node library ───────────────────────────── */
+
+JCE_API void JCE_CALL jce_bt_register_library(JceBtContext *ctx)
+{
+    if (!ctx) return;
+    jce_bt_backend_register_library(ctx->backend);
+}
+
+JCE_API void JCE_CALL jce_bt_set_env(JceBtContext *ctx, const JceBtTickEnv *env)
+{
+    if (!ctx) return;
+    jce_bt_backend_set_env(ctx->backend, env);
 }
 
 /* ── Tree loading ─────────────────────────────────────────────────── */

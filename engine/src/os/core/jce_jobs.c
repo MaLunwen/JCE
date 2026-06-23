@@ -67,7 +67,16 @@ static void worker_main(void *arg)
         jce_mutex_unlock(s->mu);
 
         run_one(&it);
+        /* The done-broadcast MUST be made under the queue mutex.  A waiter
+         * in jce_jobs_group_wait() checks pending, locks the mutex, finds
+         * the queue empty, and only then enters cond_wait.  An unlocked
+         * broadcast can fire inside that window (after the empty-queue
+         * check, before the wait) and is lost forever — with the queue
+         * drained no further broadcast ever comes, deadlocking the waiter.
+         * Holding the mutex orders this signal after the waiter is parked. */
+        jce_mutex_lock(s->mu);
         jce_cond_broadcast(s->cv_done);
+        jce_mutex_unlock(s->mu);
     }
 }
 
@@ -122,7 +131,10 @@ static void enqueue(JceJobSystem *s, JceJobFn fn, void *user, JceJobGroup *g)
         jce_mutex_unlock(s->mu);
         JceJobItem it = { fn, user, g };
         run_one(&it);
+        /* Locked broadcast — see worker_main for the lost-wakeup race. */
+        jce_mutex_lock(s->mu);
         jce_cond_broadcast(s->cv_done);
+        jce_mutex_unlock(s->mu);
         return;
     }
     s->queue[s->tail].fn    = fn;
@@ -181,6 +193,19 @@ jce_jobs_group_wait(JceJobGroup *g)
         jce_mutex_lock(s->mu);
         got = try_pop_locked(s, &it);
         if (!got) {
+            /* Re-check the predicate UNDER the mutex before parking: the
+             * last job may have decremented pending and broadcast in the
+             * gap between the unlocked pending check above and acquiring
+             * this mutex.  The locked broadcast (see worker_main) orders
+             * signals against PARKED waiters, but cannot reach a waiter
+             * that has not entered the wait yet — only this re-check can.
+             * If pending is still >0 here, the owing job has not yet
+             * decremented it, so its later locked broadcast must follow
+             * our cond_wait and the wakeup cannot be lost. */
+            if (jce_atomic_i32_load(g->pending) <= 0) {
+                jce_mutex_unlock(s->mu);
+                return;
+            }
             /* Block until something finishes, then re-check pending. */
             jce_cond_wait(s->cv_done, s->mu);
         }
@@ -188,7 +213,10 @@ jce_jobs_group_wait(JceJobGroup *g)
 
         if (got) {
             run_one(&it);
+            /* Locked broadcast — see worker_main for the lost-wakeup race. */
+            jce_mutex_lock(s->mu);
             jce_cond_broadcast(s->cv_done);
+            jce_mutex_unlock(s->mu);
         }
     }
 }

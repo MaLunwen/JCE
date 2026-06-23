@@ -33,6 +33,11 @@ void jce_editor_scene_asset_cache_shutdown(void);
 void jce_editor_scene_asset_cache_finalize(void);
 void jce_editor_scene_asset_cache_set_scene_dir(const char *dir);
 
+/* Drop the negative path-resolution cache (keyed by lowercased basename).
+ * Call on scene-switch so a missing asset name in the previous scene does
+ * not block the same name resolving in the next scene for the 30 s TTL. */
+void jce_editor_scene_asset_cache_clear_resolve_misses(void);
+
 JceMesh *jce_editor_scene_asset_cache_get_mesh(const char *mesh_path,
                                                const float *world_pos);
 JceTexture jce_editor_scene_asset_cache_get_texture(const char *material_path,

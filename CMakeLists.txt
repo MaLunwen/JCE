@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 # ── MUST be set before project() ──
 set(CMAKE_SUPPRESS_REGENERATION TRUE)
 
-project(JCE VERSION 0.9.10 LANGUAGES C)
+project(JCE VERSION 0.9.16 LANGUAGES C)
 
 # CXX is needed for C++ dependencies (bgfx, assimp, imgui) and the editor.
 enable_language(CXX)
@@ -224,6 +224,7 @@ find_package(v-hacd       REQUIRED)
 find_package(recastnavigation REQUIRED)
 find_package(enet         REQUIRED)
 find_package(protobuf     REQUIRED)
+find_package(lua          REQUIRED)
 
 # ── Patent-free codecs (preferred path) ──────────────────────────────
 # Audio:
@@ -609,6 +610,7 @@ if(NOT CMAKE_CROSSCOMPILING AND
    EXISTS "${JCE_TOOLS_DIR}/miniaudio_impl_cook.c")
 	add_executable(jce_cook
 		"${JCE_TOOLS_DIR}/jce_cook.c"
+		"${JCE_TOOLS_DIR}/jce_cook_catalog.c"
 		"${JCE_TOOLS_DIR}/jce_tex_compress.c"
 		"${JCE_TOOLS_DIR}/jce_tex_encode.cpp"
 		"${JCE_TOOLS_DIR}/miniaudio_impl_cook.c"
@@ -622,7 +624,12 @@ if(NOT CMAKE_CROSSCOMPILING AND
 		"${JCE_ENGINE_SRC_DIR}/os/core/jce_alloc.c"
 		"${JCE_ENGINE_SRC_DIR}/resource/jce_model_importer.cpp"
 		"${JCE_ENGINE_SRC_DIR}/middleware/physics/jce_collider_cook.cpp"
-		"${JCE_ENGINE_SRC_DIR}/middleware/physics/jce_collider_asset.c")
+		"${JCE_ENGINE_SRC_DIR}/middleware/physics/jce_collider_asset.c"
+		# Offline model→GLB conversion (--convert-model): the same assimp+meshopt
+		# coercion the bundle packer uses, so every deployment path can normalise
+		# .obj/.fbx/.dae to a single runtime mesh format (binary glTF).
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_bundle_mesh_convert.cpp"
+		"${JCE_ENGINE_SRC_DIR}/resource/jce_mesh_lod_cook.c")
 	# When the SDK install is enabled, jce_cook ships in <sdk>/bin/ so
 	# end-user projects can cook raw assets (textures/audio) without the
 	# editor or a JCE source tree.  Otherwise keep it out of the default
@@ -651,14 +658,22 @@ if(NOT CMAKE_CROSSCOMPILING AND
 			bgfx::bx
 		# Offline collider cook dependencies.
 		assimp::assimp
-		v-hacd::v-hacd)
+		v-hacd::v-hacd
+		# Offline model→GLB conversion (--convert-model) needs the meshopt
+		# dedup/simplify core that jce_bundle_mesh_convert.cpp drives.
+		meshoptimizer::meshoptimizer)
 	# JCE_DIST: compile out the engine LOG_* macros pulled in by the
 	#   collider/model-import TUs so jce_cook needs no async log subsystem.
 	# JCE_COLLIDER_ASSET_NO_PHYSICS: omit jce_collider_instantiate() so the
 	#   blob codec links without the Bullet/physics chain.
+	# JCE_MODEL_IMPORTER_COOK_ONLY: compile out the skinned/animated FBX import
+	#   path in jce_model_importer.cpp (it references jce_renderer + jce_animation
+	#   symbols this lean cook tool does not link); only the static part-
+	#   extraction path the --collider cook needs is kept.
 	target_compile_definitions(jce_cook PRIVATE
 		JCE_DIST
-		JCE_COLLIDER_ASSET_NO_PHYSICS)
+		JCE_COLLIDER_ASSET_NO_PHYSICS
+		JCE_MODEL_IMPORTER_COOK_ONLY)
 	jce_target_warnings(jce_cook)
 endif()
 

@@ -87,6 +87,22 @@ static void set_transform_for_id(JceScene *scene, uint32_t id,
     jce_scene_set_transform(scene, (JceEntity)id, value);
 }
 
+static JcePivotComponent *ensure_pivot_for_id(JceScene *scene, uint32_t id)
+{
+    if (!scene || id == 0 || !jce_state_entity_exists(id))
+        return NULL;
+    JceEntity e = (JceEntity)id;
+    JcePivotComponent *p = jce_scene_get_pivot(scene, e);
+    if (p)
+        return p;
+
+    JcePivotComponent def;
+    memset(&def, 0, sizeof(def));
+    def.local_rotation = jce_q_identity();
+    jce_scene_set_pivot(scene, e, &def);
+    return jce_scene_get_pivot(scene, e);
+}
+
 static void normalize_euler_deg(float rot[3])
 {
     for (int a = 0; a < 3; a++) {
@@ -148,6 +164,14 @@ static void scale_relative_on_axes(float out[3],
  * authoritative euler for the focused entity, only re-decomposing from
  * the quaternion when the transform was modified externally (inspector,
  * undo, scene reload, focus change). */
+
+/* Composed-frame euler continuity for the Maya-style custom manipulator
+ * axes (entity ⊗ pivot orientation).  Kept separate from the shared euler
+ * cache above on purpose: that one must keep holding ENTITY eulers — the
+ * inspector reads it to display Transform rotation. */
+static uint32_t s_axes_euler_id = 0;
+static jce_quat s_axes_euler_q;
+static float    s_axes_euler_deg[3];
 
 /* ── Gizmo overlay (translate/rotate/scale) ──────────────────────── */
 
@@ -215,14 +239,70 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
     int sel_count = 0;
     const uint32_t *sel_ids = jce_state_get_selection(&sel_count);
     bool multi_select = sel_count > 1;
+    bool pivot_edit = jce_state_get_pivot_edit_mode();
+    if (pivot_edit)
+        multi_select = false;
+    JcePivotComponent *pivot = pivot_edit
+                             ? ensure_pivot_for_id(scene, focused)
+                             : NULL;
+    if (pivot_edit && !pivot)
+        return;
+
+    /* Maya-style custom manipulator axes: a pivot orientation authored in
+     * pivot-edit mode (D + rotate) re-orients the single-select manipulator
+     * without touching the entity's stored TRS.  The gizmo then works in
+     * the COMPOSED frame (entity ⊗ pivot) and the write-back peels the
+     * pivot back off.  Scale is exempt: TRS scale applies on entity axes
+     * only, and the manipulator must not show axes the operation won't
+     * follow. */
+    jce_quat axes_q = jce_q_identity();
+    bool axes_composed = false;
+    if (!pivot_edit && sel_count <= 1 && !jce_state_get_2d_mode() &&
+        jce_state_get_gizmo_mode() != JCE_GIZMO_SCALE) {
+        JcePivotComponent *pv = jce_scene_get_pivot(scene, (JceEntity)focused);
+        if (pv) {
+            jce_quat q = jce_q_normalize(pv->local_rotation);
+            if (fabsf(q.w) < 0.999999f) {   /* non-identity orientation */
+                axes_q = q;
+                axes_composed = true;
+            }
+        }
+    }
 
     /* Read focused transform into euler-degree working copies. */
     float gizmo_pos[3] = {
         xform->position.x, xform->position.y, xform->position.z
     };
     float gizmo_rot[3];
-    if (!jce_editor_get_cached_euler_deg(focused, xform->rotation, gizmo_rot))
+    if (pivot_edit) {
+        jce_vec3 pivot_world =
+            jce_scene_get_pivot_world_position(scene, (JceEntity)focused);
+        gizmo_pos[0] = pivot_world.x;
+        gizmo_pos[1] = pivot_world.y;
+        gizmo_pos[2] = pivot_world.z;
+        if (pivot->local_rotation.x == 0.0f &&
+            pivot->local_rotation.y == 0.0f &&
+            pivot->local_rotation.z == 0.0f &&
+            pivot->local_rotation.w == 0.0f) {
+            pivot->local_rotation = jce_q_identity();
+        }
+        editor_q_to_euler_deg(pivot->local_rotation, gizmo_rot);
+    } else if (axes_composed) {
+        bool cached = s_axes_euler_id == focused &&
+                      s_axes_euler_q.x == xform->rotation.x &&
+                      s_axes_euler_q.y == xform->rotation.y &&
+                      s_axes_euler_q.z == xform->rotation.z &&
+                      s_axes_euler_q.w == xform->rotation.w;
+        if (cached) {
+            memcpy(gizmo_rot, s_axes_euler_deg, sizeof(gizmo_rot));
+        } else {
+            editor_q_to_euler_deg(
+                jce_q_normalize(jce_q_multiply(xform->rotation, axes_q)),
+                gizmo_rot);
+        }
+    } else if (!jce_editor_get_cached_euler_deg(focused, xform->rotation, gizmo_rot)) {
         editor_q_to_euler_deg(xform->rotation, gizmo_rot);
+    }
     float gizmo_scale[3] = {
         xform->scale.x, xform->scale.y, xform->scale.z
     };
@@ -271,6 +351,8 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
     }
 
     JceGizmoMode active_gm = jce_state_get_gizmo_mode();
+    if (pivot_edit && active_gm == JCE_GIZMO_SCALE)
+        active_gm = JCE_GIZMO_TRANSLATE;
     bool s_view_2d = jce_state_get_2d_mode();
     jce_gizmo_set_dimension(s_view_2d
         ? JCE_GIZMO_DIMENSION_2D
@@ -299,7 +381,9 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
     bool gizmo_drag_started = !gizmo_dragging_before && gizmo_dragging_after;
     bool gizmo_drag_ended   = gizmo_dragging_before && !gizmo_dragging_after;
     if (gizmo_drag_started && !s_gizmo_transaction_open)
-        s_gizmo_transaction_open = jce_state_begin_transaction("gizmo-transform");
+        s_gizmo_transaction_open =
+            jce_state_begin_transaction(pivot_edit ? "gizmo-pivot"
+                                                   : "gizmo-transform");
 
     if (gizmo_dragging_after) {
         s_gizmo_raw_dragging = true;
@@ -363,12 +447,23 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
         gizmo_changed = (fabsf(dpos[0]) > eps || fabsf(dpos[1]) > eps || fabsf(dpos[2]) > eps);
     } else if (active_gm == JCE_GIZMO_ROTATE) {
         gizmo_changed = (fabsf(drot[0]) > eps || fabsf(drot[1]) > eps || fabsf(drot[2]) > eps);
-    } else if (active_gm == JCE_GIZMO_SCALE) {
+    } else if (!pivot_edit && active_gm == JCE_GIZMO_SCALE) {
         gizmo_changed = (fabsf(dscale[0]) > eps || fabsf(dscale[1]) > eps || fabsf(dscale[2]) > eps);
     }
 
     if (gizmo_changed) {
-        if (multi_select) {
+        if (pivot_edit) {
+            if (active_gm == JCE_GIZMO_TRANSLATE) {
+                jce_scene_set_pivot_world_position_preserve_model(
+                    scene, (JceEntity)focused,
+                    jce_v3(gizmo_pos[0], gizmo_pos[1], gizmo_pos[2]));
+            } else if (active_gm == JCE_GIZMO_ROTATE) {
+                JcePivotComponent next = *pivot;
+                normalize_euler_deg(gizmo_rot);
+                next.local_rotation = editor_q_from_euler_deg(gizmo_rot);
+                jce_scene_set_pivot(scene, (JceEntity)focused, &next);
+            }
+        } else if (multi_select) {
             float ax_x[3], ax_y[3], ax_z[3];
             jce_gizmo_get_axes(ax_x, ax_y, ax_z);
 
@@ -453,8 +548,25 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
             next.position.z = gizmo_pos[2];
 
             normalize_euler_deg(gizmo_rot);
-            next.rotation = editor_q_from_euler_deg(gizmo_rot);
-            jce_editor_set_cached_euler_deg(focused, next.rotation, gizmo_rot);
+            if (axes_composed) {
+                jce_quat q_disp = editor_q_from_euler_deg(gizmo_rot);
+                jce_quat inv_axes =
+                    jce_v4(-axes_q.x, -axes_q.y, -axes_q.z, axes_q.w);
+                next.rotation =
+                    jce_q_normalize(jce_q_multiply(q_disp, inv_axes));
+                /* Composed-frame euler continuity (gimbal-safe drags). */
+                s_axes_euler_id = focused;
+                s_axes_euler_q  = next.rotation;
+                memcpy(s_axes_euler_deg, gizmo_rot, sizeof(s_axes_euler_deg));
+                /* Shared cache keeps ENTITY eulers — the inspector reads
+                 * it for the Transform rotation fields. */
+                float ent_rot[3];
+                editor_q_to_euler_deg(next.rotation, ent_rot);
+                jce_editor_set_cached_euler_deg(focused, next.rotation, ent_rot);
+            } else {
+                next.rotation = editor_q_from_euler_deg(gizmo_rot);
+                jce_editor_set_cached_euler_deg(focused, next.rotation, gizmo_rot);
+            }
 
             next.scale.x = clamp_transform_scale(gizmo_scale[0]);
             next.scale.y = clamp_transform_scale(gizmo_scale[1]);
@@ -471,10 +583,45 @@ void update_and_draw_scene_gizmo(const SceneViewCtx *ctx)
     }
 
     jce_gizmo_draw(ctx->dl, &gcam,
-                   (int)jce_state_get_gizmo_mode(),
+                   (int)active_gm,
                    (int)jce_state_get_gizmo_space(),
                    scale_factor,
                    gizmo_pos,
                    gizmo_rot,
                    gizmo_scale);
+
+    /* Pivot-edit visualization (Maya-style): a distinct crosshair marker
+     * at the pivot plus a dim tether to the model origin, so the offset
+     * being edited reads at a glance and the mode is unmistakable.
+     * gizmo_pos already tracks the live (mid-drag) pivot position. */
+    if (pivot_edit) {
+        const ImU32 col_marker = IM_COL32(255, 210, 60, 255);
+        const ImU32 col_tether = IM_COL32(255, 210, 60, 110);
+        float wp[3] = { gizmo_pos[0], gizmo_pos[1], gizmo_pos[2] };
+        float scr[2];
+        bool pivot_on_screen = gm_world_to_screen(&gcam, wp, scr);
+        if (pivot_on_screen) {
+            ImVec2 c(scr[0], scr[1]);
+            const float r = 6.0f;
+            ctx->dl->AddCircle(c, r, col_marker, 0, 2.0f);
+            ctx->dl->AddLine(ImVec2(c.x - r * 1.8f, c.y),
+                             ImVec2(c.x - r * 0.6f, c.y), col_marker, 2.0f);
+            ctx->dl->AddLine(ImVec2(c.x + r * 0.6f, c.y),
+                             ImVec2(c.x + r * 1.8f, c.y), col_marker, 2.0f);
+            ctx->dl->AddLine(ImVec2(c.x, c.y - r * 1.8f),
+                             ImVec2(c.x, c.y - r * 0.6f), col_marker, 2.0f);
+            ctx->dl->AddLine(ImVec2(c.x, c.y + r * 0.6f),
+                             ImVec2(c.x, c.y + r * 1.8f), col_marker, 2.0f);
+        }
+        /* Model origin = world matrix applied to the local origin (the
+         * world matrix already folds in T(-pivot)). */
+        jce_mat4 wm = jce_scene_get_world_matrix(scene, (JceEntity)focused);
+        float mo[3] = { wm.raw[3][0], wm.raw[3][1], wm.raw[3][2] };
+        float scr2[2];
+        if (pivot_on_screen && gm_world_to_screen(&gcam, mo, scr2)) {
+            ctx->dl->AddLine(ImVec2(scr[0], scr[1]), ImVec2(scr2[0], scr2[1]),
+                             col_tether, 1.5f);
+            ctx->dl->AddCircleFilled(ImVec2(scr2[0], scr2[1]), 3.0f, col_tether);
+        }
+    }
 }

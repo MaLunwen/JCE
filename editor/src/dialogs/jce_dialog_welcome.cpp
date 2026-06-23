@@ -18,6 +18,7 @@
 #include "jce_editor_dialogs_internal.h"
 #include "core/jce_editor_project.h"
 #include "core/jce_editor_config.h"
+#include "panels/jce_panel_preferences.h"
 
 #include <string.h>
 
@@ -198,7 +199,30 @@ void jce_editor_dialog_welcome(bool *p_open)
     }
     ImGui::EndChild();
 
+    bool show_on_startup =
+        jce_editor_prefs_startup_behavior() == JCE_EDITOR_STARTUP_PICKER;
+    if (ImGui::Checkbox(jce_editor_i18n("welcome.showOnStartup"),
+                        &show_on_startup)) {
+        jce_editor_prefs_set_startup_behavior(
+            show_on_startup ? JCE_EDITOR_STARTUP_PICKER
+                            : JCE_EDITOR_STARTUP_EMPTY);
+    }
+    ImGui::SameLine();
     ImGui::TextDisabled("%s", jce_editor_i18n("welcome.hint"));
+
+    /* Official user guide — right-aligned in the footer; opens the guide
+     * panel (and closes the welcome screen so the reader lands in it). */
+    {
+        const char *guide_lbl = jce_editor_i18n("menu.help.guide");
+        float w = ImGui::CalcTextSize(guide_lbl).x
+                + ImGui::GetStyle().FramePadding.x * 2.0f;
+        ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - w);
+        if (ImGui::Button(guide_lbl)) {
+            *jce_editor_panel_visible_ptr(JCE_PANEL_USER_GUIDE) = true;
+            jce_editor_panel_request_focus("###user_guide");
+            *p_open = false;
+        }
+    }
 
     ImGui::End();
 }

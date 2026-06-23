@@ -16,6 +16,7 @@
 
 #include "os/core/jce_memory.h"
 #include "resource/jce_asset_reader.h"
+#include "resource/jce_tex_compress.h"
 
 #include <bgfx/c99/bgfx.h>
 #include <SDL3/SDL.h>
@@ -390,6 +391,72 @@ JceTextureCpu *jce_texture_decode_cpu_mem(const void *encoded, size_t size,
     return c;
 }
 
+bool jce_texture_decode_cooked_rgba8(const void *encoded, size_t size,
+                                     uint8_t **out_rgba8,
+                                     uint32_t *out_w, uint32_t *out_h)
+{
+    if (out_rgba8) *out_rgba8 = NULL;
+    if (!encoded || size == 0 || !out_rgba8 || !out_w || !out_h)
+        return false;
+    if (!jce_asset_is_cooked(encoded, size))
+        return false;
+
+    JceAssetView view;
+    if (!jce_asset_open(&view, encoded, size))
+        return false;
+    const JceAssetChunkEntry *info_c =
+        jce_asset_find_chunk(&view, JCEASSET_CHUNK_TEX_INFO);
+    const JceAssetChunkEntry *pix_c =
+        jce_asset_find_chunk(&view, JCEASSET_CHUNK_TEX_PIXELS);
+    if (!info_c || !pix_c)
+        return false;
+
+    JceAssetTexInfo info;
+    if (jce_asset_chunk_data(&view, info_c, &info, sizeof(info)) < sizeof(info))
+        return false;
+    if (info.width == 0 || info.height == 0)
+        return false;
+
+    size_t pix_bytes = (size_t)pix_c->original_size;
+    void *pixels = JCE_MALLOC(pix_bytes);
+    if (!pixels)
+        return false;
+    size_t pix_copied = jce_asset_chunk_data(&view, pix_c, pixels, pix_bytes);
+    if (pix_copied == 0) {
+        JCE_FREE(pixels);
+        return false;
+    }
+
+    /* Reject a pixel chunk too small for the declared base mip: the decode
+     * below reads width*height blocks, so a short chunk reads OOB.  Validate
+     * against the bytes ACTUALLY produced (decompressed size, or the clamped
+     * raw copy) rather than the declared original_size — a chunk that claims a
+     * large original_size but supplies fewer real bytes would otherwise decode
+     * the base mip from uninitialized heap (audit Round-3 P3). */
+    uint32_t base_need = jce_tex_cooked_pixel_size(info.width, info.height,
+                                                   (int)info.format, 1);
+    if (base_need == 0 || pix_copied < base_need) {
+        JCE_FREE(pixels);
+        return false;
+    }
+
+    size_t rgba_bytes = (size_t)info.width * (size_t)info.height * 4u;
+    uint8_t *rgba = (uint8_t *)JCE_MALLOC(rgba_bytes);
+    if (!rgba) { JCE_FREE(pixels); return false; }
+
+    /* The base mip is at offset 0 of the pixel chunk; jce_tex_decode_to_rgba8
+     * reads only that mip's blocks. */
+    int ok = jce_tex_decode_to_rgba8(pixels, info.width, info.height,
+                                     (int)info.format, rgba);
+    JCE_FREE(pixels);
+    if (!ok) { JCE_FREE(rgba); return false; }
+
+    *out_rgba8 = rgba;
+    *out_w = info.width;
+    *out_h = info.height;
+    return true;
+}
+
 JceTexture jce_texture_upload_cpu(JceTextureCpu *c)
 {
     if (!c) return JCE_TEXTURE_INVALID;
@@ -467,6 +534,15 @@ JceTexture jce_texture_from_cooked(const JceAssetTexInfo *info,
 {
     if (!info || !pixels || pixel_bytes == 0 ||
         info->width == 0 || info->height == 0)
+        return JCE_TEXTURE_INVALID;
+
+    /* Reject a pixel chunk too small for the declared dimensions/format/mips:
+     * bgfx_create_texture_2d reads the implied size from `mem`, so a short
+     * chunk causes an OOB read during upload (audit R2-texture-trust-wh). */
+    uint32_t need = jce_tex_cooked_pixel_size(info->width, info->height,
+                                              (int)info->format,
+                                              info->mip_count);
+    if (need == 0 || pixel_bytes < need)
         return JCE_TEXTURE_INVALID;
 
     /* Block-compressed and multi-mip payloads are uploaded as a single
@@ -669,20 +745,6 @@ static uint8_t *downsample_rgba8(const uint8_t *src, uint32_t sw, uint32_t sh,
     return dst;
 }
 
-/* Record a residency change with no CPU/GPU work (used when there is no
- * cached source to downsample from). */
-static void mip_bookkeep_only(TexEntry *e, uint8_t target_top_mip)
-{
-    uint32_t tw = e->base_width, th = e->base_height;
-    for (uint8_t i = 0; i < target_top_mip; i++) {
-        tw = tw > 1 ? tw >> 1 : 1;
-        th = th > 1 ? th >> 1 : 1;
-    }
-    e->resident_top_mip = target_top_mip;
-    e->width  = tw;
-    e->height = th;
-}
-
 /* CPU half (worker-safe — NO bgfx): box-filter the cached mip-0 down to
  * `target`.  On success *out_px is the buffer to upload (+ dims); *out_owned
  * is true when it must be freed after upload (false only at target 0, where
@@ -750,7 +812,12 @@ static bool apply_top_mip(TexEntry *e, uint8_t target_top_mip)
 
     uint8_t *px = NULL; uint32_t w = 0, h = 0; bool owned = false;
     if (!mip_downsample_cpu(e, target_top_mip, &px, &w, &h, &owned)) {
-        mip_bookkeep_only(e, target_top_mip);
+        /* No CPU mip-0 source retained → we cannot actually shrink the GPU
+         * texture, so we must NOT pretend we did.  The request stays recorded
+         * as intent (desired_top_mip / per_texture_bias are already set by the
+         * caller); resident_top_mip, width and height keep reflecting the real
+         * GPU state.  Honest demotion engages for source-backed textures only
+         * (audit F29: never report a VRAM shrink that did not happen). */
         return false;
     }
     return mip_upload_gpu(e, px, w, h, target_top_mip, owned);
@@ -858,7 +925,8 @@ void jce_texture_set_global_mip_bias(int8_t bias)
         uint8_t target = effective_top_mip(e);
         if (target == e->resident_top_mip) continue;
         if (!e->has_source_pixels || !e->source_pixels) {
-            mip_bookkeep_only(e, target);   /* no pixels → no GPU/CPU work */
+            /* No retained source → cannot demote; leave residency truthful
+             * (audit F29: never report a GPU shrink that did not happen). */
             continue;
         }
         list[n].e = e; list[n].target = target;
@@ -879,8 +947,8 @@ void jce_texture_set_global_mip_bias(int8_t bias)
         MipRecompute *m = &list[i];
         if (m->ok)
             mip_upload_gpu(m->e, m->pixels, m->w, m->h, m->target, m->owned);
-        else
-            mip_bookkeep_only(m->e, m->target);
+        /* else: downsample failed → GPU untouched; keep residency truthful
+         * (audit F29). */
     }
     JCE_FREE(list);
 }

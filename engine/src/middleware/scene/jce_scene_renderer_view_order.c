@@ -33,6 +33,7 @@ bool jce_scene_renderer_view_order_build(uint16_t view_id_base,
                                          uint8_t csm_cascade_count,
                                          bool include_fog_views,
                                          bool include_gpu_particle_view,
+                                         bool include_gpu_cull_view,
                                          JceSceneRendererViewOrder *out)
 {
     if (!out)
@@ -57,7 +58,13 @@ bool jce_scene_renderer_view_order_build(uint16_t view_id_base,
         if (fog_composite_view > max_view)
             max_view = fog_composite_view;
     }
-    if (include_gpu_particle_view) {
+    /* The GPU-driven cull dispatch (roadmap #18) shares the pre-color compute
+       band slot base+9 with the GPU particle compute view — both are dispatches
+       (no draws) that must execute before the color view consumes their output.
+       Sharing one slot keeps the view range compact; ordering among dispatches
+       on the same view is submission order, and the two write disjoint
+       buffers. */
+    if (include_gpu_particle_view || include_gpu_cull_view) {
         uint16_t gp_view = (uint16_t)(view_id_base + 9u);
         if (gp_view > max_view)
             max_view = gp_view;
@@ -90,7 +97,7 @@ bool jce_scene_renderer_view_order_build(uint16_t view_id_base,
        execute before the color view that draws the pool, so it is pushed
        ahead of base+0.  Sits within [base, max_view]; the dedup keeps
        out->count == range_count. */
-    if (include_gpu_particle_view) {
+    if (include_gpu_particle_view || include_gpu_cull_view) {
         if (!order_push(out, (uint16_t)(view_id_base + 9u)))
             return false;
     }

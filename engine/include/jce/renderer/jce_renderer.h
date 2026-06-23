@@ -122,6 +122,10 @@ JCE_API bool         jce_renderer_get_vsync(const JceRenderer *r);
 JCE_API void         jce_renderer_set_vsync(JceRenderer *r, bool enabled);
 JCE_API void JCE_CALL jce_renderer_set_vsync_for_size(JceRenderer *r, bool enabled,
                                                       uint32_t width, uint32_t height);
+/* Set MSAA level (0/1=off, else snapped to 2/4/8/16) — toggles the swapchain
+ * reset flags + resets the GPU, so a shipped game can apply the authored
+ * Project Settings > Graphics MSAA at runtime (from render_settings.json). */
+JCE_API void         jce_renderer_set_msaa(JceRenderer *r, int samples);
 
 /* -- Backbuffer screenshot ----------------------------------------- */
 
@@ -166,6 +170,19 @@ JCE_API JceShaderHandle  jce_renderer_get_program_mesh(const JceRenderer *r);
 JCE_API JceShaderHandle  jce_renderer_get_program_pbr(const JceRenderer *r);
 JCE_API JceShaderHandle  jce_renderer_get_program_pbr_inst(const JceRenderer *r);
 JCE_API JceShaderHandle  jce_renderer_get_program_pbr_skinned(const JceRenderer *r);
+/* Forward+ clustered fragment variants (fs_pbr_fwdplus).  Return an INVALID
+ * handle when the variant program failed to load (e.g. an older pak) so the
+ * caller falls back to the non-variant program. */
+JCE_API JceShaderHandle  jce_renderer_get_program_pbr_fwdplus(const JceRenderer *r);
+JCE_API JceShaderHandle  jce_renderer_get_program_pbr_inst_fwdplus(const JceRenderer *r);
+JCE_API JceShaderHandle  jce_renderer_get_program_pbr_skinned_fwdplus(const JceRenderer *r);
+/* When active, the pbr/pbr_inst/pbr_skinned getters above return the Forward+
+ * fragment variant (if it loaded), so every existing PBR submit path picks it
+ * up.  Set per-frame by the scene renderer from the r.forwardplus cvar.  The
+ * caller MUST also bind the cluster texture per submit (jce_forwardplus_bind)
+ * so the variant has its froxel data.  Default false => non-variant programs. */
+JCE_API void jce_renderer_set_forwardplus_program_active(JceRenderer *r, bool active);
+JCE_API bool jce_renderer_get_forwardplus_program_active(const JceRenderer *r);
 JCE_API JceShaderHandle  jce_renderer_get_program_shadow(const JceRenderer *r);
 JCE_API JceShaderHandle  jce_renderer_get_program_shadow_inst(const JceRenderer *r);
 JCE_API JceShaderHandle  jce_renderer_get_program_shadow_skinned(const JceRenderer *r);

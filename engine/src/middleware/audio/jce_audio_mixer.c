@@ -8,12 +8,29 @@
 
 #include "os/core/jce_memory.h"
 
+#include <math.h>
 #include <string.h>
 #include <jce/os/core/jce_str.h>
 
 #define LOG_TAG       "mixer"
 #define MAX_BUSES     128
 #define MAX_NAME      32
+
+/* One aux send originating from a bus (FEATURE 5.2). */
+typedef struct {
+    JceAudioBusId dest;     /* 0 = empty slot */
+    float         amount;   /* 0..1 fraction of post-fader signal */
+} BusSend;
+
+/* Per-bus sidechain ducking state (FEATURE 5.2).  Installed on the *target*
+ * bus; `key` names the bus whose envelope drives the reduction. */
+typedef struct {
+    bool          active;
+    JceAudioDuckParams p;
+    uint32_t      sample_rate;   /* device rate the coefficients assume      */
+    float         env;           /* tracked key envelope (linear)           */
+    float         gain;          /* current duck multiplier (0..1)          */
+} Sidechain;
 
 typedef struct Bus {
     bool          alive;
@@ -22,7 +39,17 @@ typedef struct Bus {
     float         volume;
     bool          muted;
     bool          solo;
+    BusSend       sends[JCE_AUDIO_MAX_SENDS];
+    Sidechain     duck;
 } Bus;
+
+/* A named mixer snapshot: a target volume per bus id (FEATURE 5.2). */
+typedef struct {
+    bool  used;
+    char  name[JCE_AUDIO_SNAPSHOT_NAME];
+    bool  has[MAX_BUSES];          /* whether this snapshot stores a value */
+    float volume[MAX_BUSES];       /* target volume per bus id             */
+} Snapshot;
 
 /* Open-addressed hash for voice -> bus mapping. */
 typedef struct VoiceMap {
@@ -37,6 +64,17 @@ struct JceAudioMixer {
     VoiceMap *voices;
     uint32_t  voices_cap;            /* power of two */
     uint32_t  voices_size;
+
+    /* FEATURE 5.2 — snapshots + active crossfade. */
+    Snapshot  snapshots[JCE_AUDIO_MAX_SNAPSHOTS];
+    uint32_t  snapshot_count;
+    bool      fade_active;
+    float     fade_duration;         /* total fade length (s); 0 => instant   */
+    float     fade_elapsed;          /* seconds into the fade                  */
+    int       fade_target;           /* index into snapshots[] being applied   */
+    float     fade_from[MAX_BUSES];  /* volume per bus at fade start           */
+    float     fade_to[MAX_BUSES];    /* target volume per bus                  */
+    bool      fade_has[MAX_BUSES];   /* whether this bus participates          */
 };
 
 static uint32_t hash_u64(uint64_t x)
@@ -84,6 +122,7 @@ JceAudioBusId jce_audio_mixer_add_bus(JceAudioMixer *m, JceAudioBusId parent,
         return JCE_AUDIO_BUS_INVALID;
     for (uint16_t i = 2; i < MAX_BUSES; ++i) {
         if (!m->buses[i].alive) {
+            memset(&m->buses[i], 0, sizeof(m->buses[i]));
             m->buses[i].alive  = true;
             m->buses[i].parent = parent;
             jce_strlcpy(m->buses[i].name, name, MAX_NAME);
@@ -113,6 +152,20 @@ bool jce_audio_mixer_remove_bus(JceAudioMixer *m, JceAudioBusId bus)
     /* Drop voice assignments to this bus. */
     for (uint32_t i = 0; i < m->voices_cap; ++i)
         if (m->voices[i].bus == bus) { m->voices[i].voice_id = 0; m->voices[i].bus = JCE_AUDIO_BUS_INVALID; m->voices_size--; }
+    /* Drop dangling aux sends that point at the removed bus, and any
+     * sidechain whose key was the removed bus (FEATURE 5.2). */
+    for (uint16_t i = 1; i < MAX_BUSES; ++i) {
+        if (!m->buses[i].alive) continue;
+        for (int s = 0; s < JCE_AUDIO_MAX_SENDS; ++s)
+            if (m->buses[i].sends[s].dest == bus) {
+                m->buses[i].sends[s].dest   = JCE_AUDIO_BUS_INVALID;
+                m->buses[i].sends[s].amount = 0.0f;
+            }
+        if (m->buses[i].duck.active && m->buses[i].duck.p.key == bus) {
+            memset(&m->buses[i].duck, 0, sizeof(m->buses[i].duck));
+            m->buses[i].duck.gain = 1.0f;
+        }
+    }
     return true;
 }
 
@@ -273,3 +326,373 @@ const char *jce_audio_mixer_get_name(const JceAudioMixer *m, JceAudioBusId b)
 
 JceAudioBusId jce_audio_mixer_get_parent(const JceAudioMixer *m, JceAudioBusId b)
 { return bus_valid(m, b) ? m->buses[b].parent : JCE_AUDIO_BUS_INVALID; }
+
+/* ================================================================== *
+ *  FEATURE 5.2 — aux send/return, sidechain ducking, snapshots.       *
+ * ================================================================== */
+
+static inline float clamp01(float v)
+{
+    if (v < 0.0f) return 0.0f;
+    if (v > 1.0f) return 1.0f;
+    return v;
+}
+
+static inline float db_to_lin(float db)   { return (float)pow(10.0, (double)db / 20.0); }
+static inline float lin_to_db(float lin)
+{
+    if (lin < 1.0e-9f) lin = 1.0e-9f;
+    return (float)(20.0 * log10((double)lin));
+}
+
+/* ---------------- Aux send / return ---------------- */
+
+static BusSend *send_find(Bus *b, JceAudioBusId dest, bool insert)
+{
+    BusSend *empty = NULL;
+    for (int i = 0; i < JCE_AUDIO_MAX_SENDS; ++i) {
+        if (b->sends[i].dest == dest && dest != JCE_AUDIO_BUS_INVALID)
+            return &b->sends[i];
+        if (!empty && b->sends[i].dest == JCE_AUDIO_BUS_INVALID)
+            empty = &b->sends[i];
+    }
+    return insert ? empty : NULL;
+}
+
+bool jce_audio_mixer_set_send(JceAudioMixer *m, JceAudioBusId src,
+                              JceAudioBusId dest, float amount)
+{
+    if (!bus_valid(m, src) || !bus_valid(m, dest) || src == dest) return false;
+    BusSend *s = send_find(&m->buses[src], dest, true);
+    if (!s) return false;                 /* send slots exhausted */
+    s->dest   = dest;
+    s->amount = clamp01(amount);
+    return true;
+}
+
+float jce_audio_mixer_get_send(const JceAudioMixer *m, JceAudioBusId src,
+                               JceAudioBusId dest)
+{
+    if (!bus_valid(m, src) || dest == JCE_AUDIO_BUS_INVALID) return 0.0f;
+    const Bus *b = &m->buses[src];
+    for (int i = 0; i < JCE_AUDIO_MAX_SENDS; ++i)
+        if (b->sends[i].dest == dest) return b->sends[i].amount;
+    return 0.0f;
+}
+
+bool jce_audio_mixer_remove_send(JceAudioMixer *m, JceAudioBusId src,
+                                 JceAudioBusId dest)
+{
+    if (!bus_valid(m, src) || dest == JCE_AUDIO_BUS_INVALID) return false;
+    Bus *b = &m->buses[src];
+    for (int i = 0; i < JCE_AUDIO_MAX_SENDS; ++i)
+        if (b->sends[i].dest == dest) {
+            b->sends[i].dest   = JCE_AUDIO_BUS_INVALID;
+            b->sends[i].amount = 0.0f;
+            return true;
+        }
+    return false;
+}
+
+uint32_t jce_audio_mixer_send_count(const JceAudioMixer *m, JceAudioBusId src)
+{
+    if (!bus_valid(m, src)) return 0;
+    uint32_t n = 0;
+    const Bus *b = &m->buses[src];
+    for (int i = 0; i < JCE_AUDIO_MAX_SENDS; ++i)
+        if (b->sends[i].dest != JCE_AUDIO_BUS_INVALID) n++;
+    return n;
+}
+
+float jce_audio_mixer_resolve_send(const JceAudioMixer *m, JceAudioBusId src,
+                                   JceAudioBusId dest)
+{
+    if (!bus_valid(m, src) || !bus_valid(m, dest)) return 0.0f;
+    float amount = jce_audio_mixer_get_send(m, src, dest);
+    if (amount <= 0.0f) return 0.0f;
+    /* The send carries the source's post-fader (mute/solo-folded) signal. */
+    float src_gain = jce_audio_mixer_resolve_volume(m, src);
+    return src_gain * amount;
+}
+
+/* ---------------- Sidechain ducking ---------------- */
+
+JceAudioDuckParams jce_audio_duck_default_params(void)
+{
+    JceAudioDuckParams p;
+    p.key                = JCE_AUDIO_BUS_INVALID;
+    p.threshold_db       = -30.0f;
+    p.ratio              = 8.0f;
+    p.attack_ms          = 10.0f;
+    p.release_ms         = 250.0f;
+    p.max_attenuation_db = -24.0f;
+    return p;
+}
+
+/* Coefficient for an attack/release time constant evaluated once per *block*
+ * of `frames` samples at `sr` Hz.  (block_seconds = frames / sr.) */
+static float duck_coef(float time_ms, uint32_t frames, uint32_t sr)
+{
+    double fs = sr > 0 ? (double)sr : 48000.0;
+    double t  = (double)(time_ms < 0.0f ? 0.0f : time_ms) / 1000.0;
+    if (t <= 0.0) return 0.0f;                 /* instantaneous */
+    double block_s = (double)(frames ? frames : 1) / fs;
+    return (float)exp(-block_s / t);
+}
+
+bool jce_audio_mixer_set_sidechain(JceAudioMixer *m, JceAudioBusId target,
+                                   const JceAudioDuckParams *params, uint32_t sr)
+{
+    if (!bus_valid(m, target)) return false;
+    Sidechain *sc = &m->buses[target].duck;
+    if (!params || params->key == JCE_AUDIO_BUS_INVALID) {
+        memset(sc, 0, sizeof(*sc));
+        sc->gain = 1.0f;
+        return true;
+    }
+    sc->active      = true;
+    sc->p           = *params;
+    sc->sample_rate = sr ? sr : 48000u;
+    if (sc->p.ratio < 1.0f) sc->p.ratio = 1.0f;
+    if (sc->p.max_attenuation_db > 0.0f) sc->p.max_attenuation_db = 0.0f;
+    sc->env  = 0.0f;
+    sc->gain = 1.0f;
+    return true;
+}
+
+bool jce_audio_mixer_clear_sidechain(JceAudioMixer *m, JceAudioBusId target)
+{
+    if (!bus_valid(m, target)) return false;
+    if (!m->buses[target].duck.active) return false;
+    memset(&m->buses[target].duck, 0, sizeof(m->buses[target].duck));
+    m->buses[target].duck.gain = 1.0f;
+    return true;
+}
+
+bool jce_audio_mixer_has_sidechain(const JceAudioMixer *m, JceAudioBusId target)
+{ return bus_valid(m, target) && m->buses[target].duck.active; }
+
+bool jce_audio_mixer_get_sidechain(const JceAudioMixer *m, JceAudioBusId target,
+                                   JceAudioDuckParams *out)
+{
+    if (!bus_valid(m, target) || !out) return false;
+    const Sidechain *sc = &m->buses[target].duck;
+    if (!sc->active) return false;
+    *out = sc->p;
+    return true;
+}
+
+void jce_audio_mixer_duck_advance(JceAudioMixer *m, uint32_t frames,
+                                  JceAudioKeyPeakFn key_peak, void *user)
+{
+    if (!m || !key_peak || frames == 0) return;
+    for (uint16_t i = 1; i < MAX_BUSES; ++i) {
+        if (!m->buses[i].alive) continue;
+        Sidechain *sc = &m->buses[i].duck;
+        if (!sc->active) continue;
+
+        /* Sample the key bus's level for this block.  Fold its resolved
+         * (mute/solo) gain in so a muted key cannot duck the target. */
+        float key_peak_lin = key_peak(sc->p.key, user);
+        if (key_peak_lin < 0.0f) key_peak_lin = 0.0f;
+        if (bus_valid(m, sc->p.key))
+            key_peak_lin *= jce_audio_mixer_resolve_volume(m, sc->p.key);
+
+        /* Re-derive coefficients for this block length (so a test driving the
+         * follower one sample / one block at a time is exact). */
+        uint32_t sr = sc->sample_rate ? sc->sample_rate : 48000u;
+        float atk = duck_coef(sc->p.attack_ms,  frames, sr);
+        float rel = duck_coef(sc->p.release_ms, frames, sr);
+
+        /* Envelope follower on the key level.  The follower attacks when the
+         * key gets louder and releases when it falls. */
+        float coef = key_peak_lin > sc->env ? atk : rel;
+        sc->env = coef * (sc->env - key_peak_lin) + key_peak_lin;
+
+        /* Downward compressor curve: how many dB of reduction the current key
+         * envelope demands. */
+        float env_db = lin_to_db(sc->env);
+        float over   = env_db - sc->p.threshold_db;
+        float gr_db  = 0.0f;                  /* gain reduction, <= 0 */
+        if (over > 0.0f)
+            gr_db = -(over - over / sc->p.ratio);  /* = -over*(1 - 1/ratio) */
+        if (gr_db < sc->p.max_attenuation_db)
+            gr_db = sc->p.max_attenuation_db;     /* floor the reduction */
+
+        sc->gain = db_to_lin(gr_db);
+    }
+}
+
+float jce_audio_mixer_duck_gain(const JceAudioMixer *m, JceAudioBusId target)
+{
+    if (!bus_valid(m, target)) return 1.0f;
+    const Sidechain *sc = &m->buses[target].duck;
+    return sc->active ? sc->gain : 1.0f;
+}
+
+float jce_audio_mixer_resolve_volume_ducked(const JceAudioMixer *m,
+                                            JceAudioBusId target)
+{
+    return jce_audio_mixer_resolve_volume(m, target)
+         * jce_audio_mixer_duck_gain(m, target);
+}
+
+/* ---------------- Mixer snapshots ---------------- */
+
+static int snapshot_find(const JceAudioMixer *m, const char *name)
+{
+    if (!name) return -1;
+    for (int i = 0; i < JCE_AUDIO_MAX_SNAPSHOTS; ++i)
+        if (m->snapshots[i].used &&
+            strncmp(m->snapshots[i].name, name, JCE_AUDIO_SNAPSHOT_NAME) == 0)
+            return i;
+    return -1;
+}
+
+static int snapshot_alloc(JceAudioMixer *m, const char *name)
+{
+    int idx = snapshot_find(m, name);
+    if (idx >= 0) return idx;
+    for (int i = 0; i < JCE_AUDIO_MAX_SNAPSHOTS; ++i)
+        if (!m->snapshots[i].used) {
+            memset(&m->snapshots[i], 0, sizeof(m->snapshots[i]));
+            m->snapshots[i].used = true;
+            jce_strlcpy(m->snapshots[i].name, name, JCE_AUDIO_SNAPSHOT_NAME);
+            m->snapshot_count++;
+            return i;
+        }
+    return -1;
+}
+
+bool jce_audio_mixer_capture_snapshot(JceAudioMixer *m, const char *name)
+{
+    if (!m || !name || !name[0]) return false;
+    int idx = snapshot_alloc(m, name);
+    if (idx < 0) return false;
+    Snapshot *s = &m->snapshots[idx];
+    for (uint16_t i = 1; i < MAX_BUSES; ++i) {
+        if (m->buses[i].alive) {
+            s->has[i]    = true;
+            s->volume[i] = m->buses[i].volume;
+        } else {
+            s->has[i] = false;
+        }
+    }
+    return true;
+}
+
+bool jce_audio_mixer_snapshot_set_volume(JceAudioMixer *m, const char *name,
+                                         JceAudioBusId bus, float volume)
+{
+    if (!m || !name || !name[0] || bus == JCE_AUDIO_BUS_INVALID || bus >= MAX_BUSES)
+        return false;
+    int idx = snapshot_alloc(m, name);
+    if (idx < 0) return false;
+    m->snapshots[idx].has[bus]    = true;
+    m->snapshots[idx].volume[bus] = volume < 0.0f ? 0.0f : volume;
+    return true;
+}
+
+float jce_audio_mixer_snapshot_get_volume(const JceAudioMixer *m,
+                                          const char *name, JceAudioBusId bus)
+{
+    if (!m || bus == JCE_AUDIO_BUS_INVALID || bus >= MAX_BUSES) return -1.0f;
+    int idx = snapshot_find(m, name);
+    if (idx < 0 || !m->snapshots[idx].has[bus]) return -1.0f;
+    return m->snapshots[idx].volume[bus];
+}
+
+bool jce_audio_mixer_remove_snapshot(JceAudioMixer *m, const char *name)
+{
+    if (!m) return false;
+    int idx = snapshot_find(m, name);
+    if (idx < 0) return false;
+    /* Cancel an in-flight fade that targets this snapshot. */
+    if (m->fade_active && m->fade_target == idx) m->fade_active = false;
+    memset(&m->snapshots[idx], 0, sizeof(m->snapshots[idx]));
+    if (m->snapshot_count > 0) m->snapshot_count--;
+    return true;
+}
+
+uint32_t jce_audio_mixer_snapshot_count(const JceAudioMixer *m)
+{ return m ? m->snapshot_count : 0u; }
+
+bool jce_audio_mixer_snapshot_name(const JceAudioMixer *m, uint32_t index,
+                                   char *out, uint32_t cap)
+{
+    if (!m || !out || cap == 0) return false;
+    uint32_t seen = 0;
+    for (int i = 0; i < JCE_AUDIO_MAX_SNAPSHOTS; ++i) {
+        if (!m->snapshots[i].used) continue;
+        if (seen == index) {
+            jce_strlcpy(out, m->snapshots[i].name, cap);
+            return true;
+        }
+        ++seen;
+    }
+    return false;
+}
+
+bool jce_audio_mixer_apply_snapshot(JceAudioMixer *m, const char *name,
+                                    float fade_seconds)
+{
+    if (!m) return false;
+    int idx = snapshot_find(m, name);
+    if (idx < 0) return false;
+    const Snapshot *s = &m->snapshots[idx];
+
+    /* Snapshot the from/to endpoints for every bus that the snapshot covers
+     * and that is currently alive. */
+    for (uint16_t i = 1; i < MAX_BUSES; ++i) {
+        bool participate = m->buses[i].alive && s->has[i];
+        m->fade_has[i] = participate;
+        if (participate) {
+            m->fade_from[i] = m->buses[i].volume;
+            m->fade_to[i]   = s->volume[i];
+        }
+    }
+
+    if (fade_seconds <= 0.0f) {
+        /* Instant: write targets straight away, no active fade. */
+        for (uint16_t i = 1; i < MAX_BUSES; ++i)
+            if (m->fade_has[i]) m->buses[i].volume = m->fade_to[i];
+        m->fade_active = false;
+        return true;
+    }
+
+    m->fade_target   = idx;
+    m->fade_duration = fade_seconds;
+    m->fade_elapsed  = 0.0f;
+    m->fade_active   = true;
+    return true;
+}
+
+bool jce_audio_mixer_snapshot_fading(const JceAudioMixer *m)
+{ return m && m->fade_active; }
+
+float jce_audio_mixer_snapshot_progress(const JceAudioMixer *m)
+{
+    if (!m || !m->fade_active || m->fade_duration <= 0.0f) return 1.0f;
+    float t = m->fade_elapsed / m->fade_duration;
+    return clamp01(t);
+}
+
+void jce_audio_mixer_update(JceAudioMixer *m, float dt)
+{
+    if (!m || !m->fade_active) return;
+    if (dt < 0.0f) dt = 0.0f;
+    m->fade_elapsed += dt;
+
+    float t = m->fade_duration > 0.0f ? m->fade_elapsed / m->fade_duration : 1.0f;
+    bool done = t >= 1.0f;
+    if (done) t = 1.0f;
+
+    for (uint16_t i = 1; i < MAX_BUSES; ++i) {
+        if (!m->fade_has[i] || !m->buses[i].alive) continue;
+        /* Linear crossfade A -> B; lands exactly on B when t == 1. */
+        m->buses[i].volume = done
+            ? m->fade_to[i]
+            : m->fade_from[i] + (m->fade_to[i] - m->fade_from[i]) * t;
+    }
+    if (done) m->fade_active = false;
+}

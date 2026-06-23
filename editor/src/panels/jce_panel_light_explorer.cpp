@@ -11,8 +11,6 @@
 
 #include "ui/jce_editor_panels.h"
 
-#include <jce/tools/jce_imgui.hpp>
-
 extern "C" void jce_editor_lighting_settings_focus_tab_light_explorer(void);
 
 extern "C" void jce_editor_panel_light_explorer_content(void)
@@ -22,5 +20,5 @@ extern "C" void jce_editor_panel_light_explorer_content(void)
     if (host) *host = true;
     if (self) *self = false;
     jce_editor_lighting_settings_focus_tab_light_explorer();
-    ImGui::SetWindowFocus("###lighting_settings");
+    jce_editor_panel_request_focus("###lighting_settings");
 }

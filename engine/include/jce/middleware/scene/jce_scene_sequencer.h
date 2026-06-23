@@ -83,6 +83,43 @@ JCE_API void jce_seq_prop_apply_color(JceScene *s, JceEntity e,
  * previews through the Sequencer panel instead). */
 JCE_API void jce_scene_sequencer_update(JceScene *s, float dt);
 
+/* ── Event + camera-cut dispatch (FEATURE 8.4) ───────────────────────
+ *
+ * EVENT-track keys carry an authored handler name; CAMERA-CUT keys carry a
+ * target camera/vcam entity.  When a key is crossed during
+ * jce_scene_sequencer_update the integrator dispatches it: events through the
+ * registered handler sink (the runtime routes this to jce_script_call_named so
+ * a .seq EVENT key fires a Lua function), and camera-cuts through the
+ * active-camera seam (the integrator raises the target vcam's priority so the
+ * vcam system makes it the live camera; an optional sink also observes it). */
+
+/* Invoked once per fired EVENT key.  `handler` is the key's authored name
+ * (may be ""), `entity` its authored target id (0 if none), `time` the key
+ * time.  Set by the runtime; cleared with a NULL fn. */
+typedef void (*JceSeqEventHandlerFn)(const char *handler, uint64_t entity,
+                                     float time, void *user);
+JCE_API void jce_scene_sequencer_set_event_handler(JceSeqEventHandlerFn fn,
+                                                   void *user);
+
+/* Invoked once per crossed CAMERA-CUT key, AFTER the integrator has applied
+ * the cut to the scene (raised the target vcam priority).  Lets the runtime
+ * observe the active-camera change.  Optional; set by the runtime. */
+typedef void (*JceSeqCameraCutFn)(JceScene *s, JceEntity target, float time,
+                                  void *user);
+JCE_API void jce_scene_sequencer_set_camera_cut_handler(JceSeqCameraCutFn fn,
+                                                        void *user);
+
+/* Resolve a SequencePlayer's authored (project-relative) .seq.json path to a
+ * loadable host path before the integrator opens it.  Needed because the editor
+ * runs with a CWD that is NOT the project root, so the raw relative path would
+ * miss the file.  Returns true and fills `buf` on success.  Optional; when
+ * unset (e.g. a shipped build whose CWD already is the asset root) the raw path
+ * is used as-is.  Set by the runtime (mirrors JceRuntimeDesc.resolve_path_fn). */
+typedef bool (*JceSeqResolvePathFn)(void *user, const char *path,
+                                    char *buf, int cap);
+JCE_API void jce_scene_sequencer_set_resolve_fn(JceSeqResolvePathFn fn,
+                                                void *user);
+
 JCE_EXTERN_C_END
 
 #endif /* JCE_SCENE_SEQUENCER_H */

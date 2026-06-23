@@ -41,6 +41,11 @@ typedef struct {
 
 /* Create a UI canvas renderer.
  *   renderer : engine renderer (low-level 2D draw path; texture binding).
+ *              May be NULL for a HEADLESS canvas: layout + the graphic
+ *              raycaster + the UIButton click state machine all still run
+ *              (so jce_ui_canvas_last_clicked works), but every GPU draw is
+ *              skipped.  Use this to drive click dispatch without a live bgfx
+ *              context (gameplay polling / unit tests).
  *   pak      : PAK archive used to load fonts (e.g. "fonts/JCE.ttf") and
  *              sprite textures referenced by UIImage. May be NULL (text and
  *              sprites then fall back to solid quads).
@@ -83,6 +88,75 @@ JCE_API void jce_ui_canvas_render(JceUICanvas        *uc,
  * released over the same button) during the most recent render call, or 0 if
  * none.  Lets gameplay/editor poll button clicks without a callback. */
 JCE_API uint64_t jce_ui_canvas_last_clicked(const JceUICanvas *uc);
+
+/* Entity id of the interactive widget (UISlider / UIToggle / UIDropdown) whose
+ * value the canvas CHANGED during the most recent render call, or 0 if none —
+ * a slider drag that moved the value, a toggle flip, or a dropdown selection.
+ * Like last_clicked it is set during render and cleared at the start of the
+ * next render (read it after rendering, once per frame).  The caller looks up
+ * the widget's authored on_value_changed handler and fires it through the
+ * script VM (jce_runtime_dispatch_ui_value_changed). */
+JCE_API uint64_t jce_ui_canvas_last_value_changed(const JceUICanvas *uc);
+
+/* Entity id of the UIInputField whose `text` the canvas EDITED (insert/delete)
+ * since the last call, or 0 if none.  Unlike last_value_changed this is set by
+ * jce_ui_canvas_text_input / jce_ui_canvas_key_edit (which run OUTSIDE the
+ * render call), so it is CLEARED ON READ rather than at render start — call it
+ * exactly once per frame.  Drives a UIInputField's on_value_changed handler. */
+JCE_API uint64_t jce_ui_canvas_last_text_changed(JceUICanvas *uc);
+
+/* ── InputField (single-line text-entry) focus + edit channel ──────────
+ *
+ * The canvas tracks a single focused InputField entity (set by a pointer
+ * click over the field's rect during render — see jce_ui_canvas_render) and a
+ * byte caret index into that field's `text`.  The two delivery functions below
+ * feed keyboard / text events the caller already receives from its window
+ * event stream into the focused field; both are no-ops when nothing is focused
+ * and never consume events the rest of the app needs (fire-and-forget).  All
+ * focus / edit / caret logic runs on a HEADLESS canvas (renderer == NULL) so
+ * gameplay polling and unit tests can drive it without a live bgfx context. */
+
+/* Deliver UTF-8 text (e.g. JceTextInputEvent.text) to the focused field:
+ * insert at the caret, honouring char_limit, the content_type filter and
+ * read_only.  No-op if no field is focused. */
+JCE_API void     jce_ui_canvas_text_input(JceUICanvas *uc, const char *utf8);
+
+/* Deliver an editing key (JCE_KEY_*) to the focused field:
+ *   BACKSPACE       delete the byte(s) before the caret
+ *   DELETE          delete the byte(s) at the caret
+ *   LEFT / RIGHT    move the caret one step
+ *   HOME / END      caret to start / end
+ *   RETURN/KP_ENTER commit  → jce_ui_canvas_last_submitted == entity
+ *   ESCAPE          defocus (jce_ui_canvas_focused_input → 0)
+ * `mod` is the JCE_KMOD_* bitset (reserved; unused for v1).  No-op if no field
+ * is focused. */
+JCE_API void     jce_ui_canvas_key_edit(JceUICanvas *uc, int scancode, uint16_t mod);
+
+/* Entity id of the currently focused InputField, or 0 if none.  The CALLER
+ * uses this (on a focus-state change) to start / stop OS text input. */
+JCE_API uint64_t jce_ui_canvas_focused_input(const JceUICanvas *uc);
+
+/* Entity whose InputField was submitted (RETURN/KP_ENTER) since the last call,
+ * or 0 otherwise.  Set by jce_ui_canvas_key_edit (which runs OUTSIDE the render
+ * call), so it is CLEARED ON READ — call it exactly once per frame.  Drives a
+ * UIInputField's on_submit handler (jce_runtime_dispatch_ui_submit). */
+JCE_API uint64_t jce_ui_canvas_last_submitted(JceUICanvas *uc);
+
+/* ── ScrollView wheel/scroll channel ───────────────────────────────────
+ *
+ * Deliver a wheel/scroll delta (the caller feeds JCE_EVENT_MOUSE_WHEEL:
+ * `dy` is +up, `dx` is +right) to the UIScrollView currently under the
+ * pointer (the hovered scroll view tracked during the most recent render's
+ * raycast pass).  Applies dy*scroll_sensitivity to the vertical axis and
+ * dx*scroll_sensitivity to the horizontal axis, honouring the per-axis
+ * enables + interactable, then clamps each axis to
+ * [0, max(0, content_size - viewport_size)] and writes the result back into
+ * jce_scene_get_ui_scroll_view(scene,e)->scroll_position.  No-op if no scroll
+ * view is hovered.  Runs fully on a HEADLESS canvas (renderer == NULL) so
+ * gameplay polling and unit tests can drive the scroll math without a live
+ * bgfx context; fire-and-forget (never consumes wheel events other systems
+ * need). */
+JCE_API void     jce_ui_canvas_scroll(JceUICanvas *uc, float dx, float dy);
 
 JCE_EXTERN_C_END
 

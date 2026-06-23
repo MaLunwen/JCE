@@ -25,6 +25,15 @@ JCE_REFLECT_BEGIN(JceTransform, "Transform")
     JCE_FIELD(JceTransform, scale,    JCE_FT_VEC3, "Scale")
 JCE_REFLECT_END_DEFAULTS(JceTransform, "Transform", &g_def_JceTransform)
 
+static const JcePivotComponent g_def_JcePivotComponent = {
+    /* local_position */ {0.0f, 0.0f, 0.0f},
+    /* local_rotation */ {0.0f, 0.0f, 0.0f, 1.0f},
+};
+JCE_REFLECT_BEGIN(JcePivotComponent, "Pivot")
+    JCE_FIELD(JcePivotComponent, local_position, JCE_FT_VEC3, "Local Position")
+    JCE_FIELD(JcePivotComponent, local_rotation, JCE_FT_QUAT, "Orientation")
+JCE_REFLECT_END_DEFAULTS(JcePivotComponent, "Pivot", &g_def_JcePivotComponent)
+
 static const JceCameraComponent g_def_JceCameraComponent = {
     /* fov_deg    */ 60.0f,
     /* near_plane */ 0.1f,
@@ -74,6 +83,7 @@ JCE_REFLECT_END_DEFAULTS(JcePointLight, "Point Light", &g_def_JcePointLight)
 extern "C" void jce_reflect_register_builtin(void)
 {
     jce_reflect_register(&g_jce_type_JceTransform);
+    jce_reflect_register(&g_jce_type_JcePivotComponent);
     jce_reflect_register(&g_jce_type_JceCameraComponent);
     jce_reflect_register(&g_jce_type_JceDirectionalLight);
     jce_reflect_register(&g_jce_type_JcePointLight);

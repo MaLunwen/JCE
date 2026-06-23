@@ -12,6 +12,7 @@
 
 extern "C" {
 #include <jce/os/core/jce_allocator.h>
+#include <jce/os/core/jce_console.h>  /* r.taa cvar query for game-view TAA */
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/os/core/jce_timer.h>
@@ -23,11 +24,13 @@ extern "C" {
 #include <jce/renderer/jce_postfx.h>
 #include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_scene_renderer.h>
+#include <jce/renderer/jce_taa.h>
 #include <jce/renderer/jce_views.h>
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_ui_canvas.h>
 #include <jce/os/platform/jce_input.h>
 #include <jce/runtime/jce_game_module.h>
+#include <jce/application/jce_runtime.h>  /* UI widget → script dispatch in Play */
 extern void jce_game_module_set_active_scene(JceScene *scene);
 
 /* Lighting panel accessors — defined in jce_panel_lighting_settings.cpp */
@@ -54,6 +57,14 @@ struct GameRenderState {
     JcePostFXPipeline     *postfx            = nullptr;  /* game-view own pipeline */
     uint16_t               postfx_output_tex = UINT16_MAX;
 
+    /* TAA (game view): own jitter/history state so the first-person view also
+     * benefits from temporal AA with per-object motion-vector de-ghosting.
+     * Mirrors the scene-view TAA driver but against g.postfx. */
+    JceTaaState            taa_state         = {};
+    jce_mat4               taa_prev_view     = {};
+    jce_mat4               taa_prev_proj     = {};
+    bool                   taa_prev_valid    = false;
+
     /* Active game module + lifecycle bookkeeping. */
     const JceGameModule   *module            = nullptr;
     bool                   module_inited     = false;
@@ -64,6 +75,15 @@ struct GameRenderState {
      * top of the game view and hit-tests the pointer. */
     JceUICanvas           *ui_canvas         = nullptr;
     JceUIPointer           ui_pointer        = {};
+    /* OS text-input enable mirror: true while an InputField is focused so we
+     * only toggle jce_window_start/stop_text_input on a focus-state change. */
+    bool                   ui_text_input_on  = false;
+    /* The live Play-mode runtime (set by jce_editor_game_render_set_play_runtime
+     * while Play is active, NULL in edit mode).  When set, drained canvas UI
+     * events are dispatched to its gameplay script VM — exactly like the shipped
+     * default-main app loop — so in-editor Play exercises UI on_click /
+     * on_value_changed / on_submit handlers, not just visual feedback. */
+    JceRuntime            *play_runtime      = nullptr;
 };
 
 GameRenderState g;
@@ -166,6 +186,16 @@ void jce_editor_game_render_shutdown(void)
     g.initialized = false;
 }
 
+/* Captured mouse-button bitmask (bit per button: 0=left,1=right,2=mid,...).
+ * Tracked while the Game View holds FPS capture, because the editor's ImGui
+ * event pump intentionally STOPS forwarding mouse buttons to ImGui during
+ * capture ("clicks belong to the game", jce_editor.cpp).  Reading ImGui's
+ * button state during Play would therefore stick: the button-up that ends the
+ * capture-acquiring click arrives AFTER capture engaged and is swallowed, so
+ * ImGui's MouseLeft stays down forever.  The game-view player-input gather
+ * reads THIS (fed the up/down even during capture) instead of ImGui. */
+static uint32_t s_captured_mouse_buttons = 0;
+
 bool jce_editor_game_render_set_mouse_capture(bool capture)
 {
     if (!g.window) { g.mouse_captured = false; return false; }
@@ -175,6 +205,7 @@ bool jce_editor_game_render_set_mouse_capture(bool capture)
      * relative-mouse mode is loosened by the OS during focus transitions. */
     jce_window_set_mouse_grab(g.window, capture);
     g.mouse_captured = capture;
+    if (!capture) s_captured_mouse_buttons = 0;  /* never strand a held button across toggles */
     return g.mouse_captured;
 }
 
@@ -190,6 +221,38 @@ void jce_editor_game_render_set_ui_pointer(float x, float y,
     g.ui_pointer.y     = y;
     g.ui_pointer.down  = down;
     g.ui_pointer.valid = valid;
+}
+
+/* Hand the game renderer the live Play-mode runtime (or NULL to detach on
+ * stop).  While set, canvas UI events drained after the overlay render are
+ * dispatched to its gameplay script VM (UIButton on_click / widget
+ * on_value_changed / InputField on_submit).  Called by jce_editor_play.cpp. */
+void jce_editor_game_render_set_play_runtime(JceRuntime *rt)
+{
+    g.play_runtime = rt;
+}
+
+/* Forward a UTF-8 text-input chunk into the focused ECS-UI InputField.  The
+ * Game View panel sources these from ImGui's per-frame character queue (its
+ * natural event source, exactly like the pointer above) only while the panel
+ * is hovered/focused in Play.  Fire-and-forget: a no-op when no field is
+ * focused, and it never consumes events the rest of the editor needs. */
+void jce_editor_game_render_text_input(const char *utf8)
+{
+    if (g.ui_canvas) jce_ui_canvas_text_input(g.ui_canvas, utf8);
+}
+
+/* Forward an editing key (JCE_KEY_*) into the focused InputField. */
+void jce_editor_game_render_key_edit(int scancode, unsigned short mod)
+{
+    if (g.ui_canvas) jce_ui_canvas_key_edit(g.ui_canvas, scancode, (uint16_t)mod);
+}
+
+/* Forward a mouse-wheel delta into the ECS-UI ScrollView under the pointer.
+ * Fire-and-forget (no-op when no scroll view is hovered). */
+void jce_editor_game_render_scroll(float dx, float dy)
+{
+    if (g.ui_canvas) jce_ui_canvas_scroll(g.ui_canvas, dx, dy);
 }
 
 void jce_editor_game_render_warp_cursor(int x, int y)
@@ -223,6 +286,22 @@ void jce_editor_game_render_consume_mouse_delta(float *dx, float *dy)
     if (dy) *dy = s_mouse_dy_accum;
     s_mouse_dx_accum = 0.0f;
     s_mouse_dy_accum = 0.0f;
+}
+
+/* Captured mouse-button state (set from the editor event pump while the Game
+ * View holds FPS capture; see s_captured_mouse_buttons).  btn: 0=left, 1=right,
+ * 2=middle, 3=x1, 4=x2 (mirrors the ImGui button indices). */
+void jce_editor_game_render_push_mouse_button(int btn, bool down)
+{
+    if (btn < 0 || btn > 31) return;
+    if (down) s_captured_mouse_buttons |=  (1u << btn);
+    else      s_captured_mouse_buttons &= ~(1u << btn);
+}
+
+bool jce_editor_game_render_mouse_button(int btn)
+{
+    if (btn < 0 || btn > 31) return false;
+    return (s_captured_mouse_buttons & (1u << btn)) != 0;
 }
 
 JceCamera *jce_editor_game_render_get_camera(void)
@@ -306,9 +385,37 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
     jce_mat4 view = jce_camera_view(g.camera);
     jce_mat4 proj = jce_camera_proj(g.camera, aspect, g.homogeneous_depth);
 
+    /* ── TAA (game view) ──────────────────────────────────────────────
+     * When r.taa is on, sub-pixel-jitter THIS view's colour-pass projection and
+     * arm g.postfx's TAA resolve against per-object motion vectors produced by
+     * the shared scene renderer's velocity pre-pass.  Jitter only the colour
+     * pass; the motion vectors use the CLEAN (un-jittered) matrices. */
+    static const JceCvar *s_cv_taa = jce_cvar_find("r.taa");
+    bool game_taa_on = s_cv_taa ? jce_cvar_get_bool(s_cv_taa) : false;
+    jce_mat4 color_proj = proj;
+    if (game_taa_on && g.postfx) {
+        jce_taa_advance(&g.taa_state, width, height);
+        jce_taa_apply_jitter(&color_proj, g.taa_state.current_jitter);
+
+        jce_mat4 view_proj = jce_m4_multiply(&proj, &view);
+        jce_mat4 inv_vp    = jce_m4_inverse(&view_proj);
+        jce_mat4 prev_vp   = g.taa_prev_valid
+            ? jce_m4_multiply(&g.taa_prev_proj, &g.taa_prev_view)
+            : view_proj;
+        jce_postfx_set_taa_matrices(g.postfx, &inv_vp, &prev_vp);
+        jce_postfx_set_taa(g.postfx, true, 0.9f, 1.0f, 1.0f);
+        /* Request the shared renderer write a per-object/per-bone velocity
+         * buffer this frame (the game view is the sole renderer when the Scene
+         * tab is hidden; when both are visible the scene path's prev-state is
+         * shared, a documented v1 limitation). */
+        jce_scene_renderer_set_taa_velocity_enabled(engine_sr, true);
+    } else if (g.postfx) {
+        jce_postfx_set_taa(g.postfx, false, 0.9f, 1.0f, 1.0f);
+    }
+
     if (!jce_offscreen_target_prepare(
             g.bridge, width, height,
-            view.raw[0], proj.raw[0],
+            view.raw[0], color_proj.raw[0],   /* jittered when game TAA on */
             0x202028FFu,
             "EditorGame")) {
         return;
@@ -326,6 +433,19 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
      * enabled by default. */
     JceSceneRenderConfig cfg = jce_scene_render_config_default();
     cfg.view_mode = JCE_SCENE_VIEW_SHADED;
+
+    /* The SSAO/SSR offscreen targets and the screen-space AO sampling UV must
+     * match the ACTUAL panel resolution.  The scene viewport sets these
+     * (jce_editor_scene_render.cpp), but the game viewport previously left them
+     * 0, so the SSAO target + u_ssaoParams texel size defaulted to 1920x1080
+     * while the colour pass rendered at the real panel size — the PBR shader
+     * then sampled AO at misregistered UVs (gl_FragCoord * 1/1920,1/1080),
+     * producing a scaled/offset, 1-frame-late grey AO smear that trails moving
+     * skinned characters (the "透明果冻状" jelly ghost).  Sizing them to the
+     * panel fixes the misregistration. */
+    cfg.viewport_width  = width;
+    cfg.viewport_height = height;
+    cfg.viewport_id     = 0;   /* Game viewport slot (Scene = 1): own TAA prev camera */
 
     /* The editor's Game View is meant to preview "what the player
      * would see", so always draw the skybox / sprites and never inject
@@ -358,6 +478,23 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
         cfg.fog_rt_height = 0;
     }
 
+    /* SSR: reflect the bridge's lit color RT (gated on the scene's ssr_enabled). */
+    cfg.ssr_color_tex_handle = jce_offscreen_target_get_color_texture(g.bridge);
+
+    /* Focus-bounded entity collection ("draw distance"): only entities within
+     * cull_radius (horizontal) of the play camera are collected, so every
+     * downstream renderer pass becomes O(near) instead of O(all entities) —
+     * what keeps a full-loaded big world playable in the Game View / Play.
+     * Focus = the play (free-fly/FPS) camera position. */
+    {
+        jce_vec3 cam_pos = jce_camera_get_position(g.camera);
+        cfg.cull_focus_enabled = true;
+        cfg.cull_focus_x = cam_pos.x;
+        cfg.cull_focus_y = cam_pos.y;
+        cfg.cull_focus_z = cam_pos.z;
+        cfg.cull_radius  = 900.0f;
+    }
+
     uint16_t base = jce_offscreen_target_get_view_id(g.bridge);
     /* Pass real dt only while actually PLAYING — paused/stopped states
      * should freeze animation, matching Unity's Game View semantics. */
@@ -370,6 +507,15 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
         uint16_t fog_composite_view = (uint16_t)(base + 16);
         uint16_t dst_fb = jce_offscreen_target_get_frame_buffer(g.bridge);
         jce_scene_renderer_composite_fog(engine_sr, fog_composite_view, dst_fb);
+    }
+
+    /* Composite SSR reflections (no-op unless SSR was active this frame).
+     * base+19 (after the base+18 ray-march); free between the game UI (base+17)
+     * and postfx (base+20). */
+    {
+        uint16_t ssr_composite_view = (uint16_t)(base + 19);
+        uint16_t dst_fb = jce_offscreen_target_get_frame_buffer(g.bridge);
+        jce_scene_renderer_composite_ssr(engine_sr, ssr_composite_view, dst_fb);
     }
 
     /* ── PostFX ─────────────────────────────────────────────────────
@@ -405,7 +551,18 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
             jce_postfx_set_custom_shader(g.postfx, cust_name, cust_depth);
             jce_postfx_set_custom_params(g.postfx, cust_params, cust_count);
 
-            if (any_effect) {
+            /* TAA (game view): bind the shared renderer's per-object velocity
+             * buffer as the motion source so animated/skinned geometry stops
+             * ghosting, then ensure the chain runs even if TAA is the only
+             * effect (TAA is not a JCE_POSTFX_COUNT effect, so any_effect may be
+             * false). */
+            if (game_taa_on) {
+                JceTextureHandle vt = { UINT16_MAX };
+                vt.idx = jce_scene_renderer_get_velocity_texture(engine_sr);
+                jce_postfx_set_taa_motion_tex(g.postfx, vt);
+            }
+
+            if (any_effect || game_taa_on) {
                 jce_postfx_resize(g.postfx, width, height);
                 JceTextureHandle game_color = { UINT16_MAX };
                 JceTextureHandle game_depth = { UINT16_MAX };
@@ -435,6 +592,41 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
         const JceUIPointer *ptr = g.ui_pointer.valid ? &g.ui_pointer : nullptr;
         jce_ui_canvas_render(g.ui_canvas, scene, ui_view, ui_fb,
                              (float)width, (float)height, ptr, render_dt);
+
+        /* OS text-input follows InputField focus: start SDL text input only
+         * when a field becomes focused, stop it when focus clears.  Toggle on
+         * the edge so we don't spam the platform layer every frame. */
+        if (g.window) {
+            bool want = jce_ui_canvas_focused_input(g.ui_canvas) != 0;
+            if (want != g.ui_text_input_on) {
+                if (want) jce_window_start_text_input(g.window);
+                else      jce_window_stop_text_input(g.window);
+                g.ui_text_input_on = want;
+            }
+        }
+
+        /* In-editor Play: drain the canvas UI events recorded this frame and
+         * fire each widget's authored handler through the Play runtime's script
+         * VM — the same drain the shipped default-main app loop performs, so
+         * Play-testing exercises real UI gameplay (button clicks, slider/toggle/
+         * dropdown value changes, input-field edits + submit), not just visuals.
+         * No-op in edit mode (play_runtime NULL). */
+        if (g.play_runtime) {
+            uint64_t clicked = jce_ui_canvas_last_clicked(g.ui_canvas);
+            if (clicked) {
+                JceUIButtonComponent *bt =
+                    jce_scene_get_ui_button(scene, (JceEntity)clicked);
+                if (bt)
+                    jce_runtime_dispatch_ui_click(g.play_runtime, clicked,
+                                                  bt->on_click_handler);
+            }
+            uint64_t vc = jce_ui_canvas_last_value_changed(g.ui_canvas);
+            if (vc) jce_runtime_dispatch_ui_value_changed(g.play_runtime, vc);
+            uint64_t tc = jce_ui_canvas_last_text_changed(g.ui_canvas);
+            if (tc) jce_runtime_dispatch_ui_text_changed(g.play_runtime, tc);
+            uint64_t sub = jce_ui_canvas_last_submitted(g.ui_canvas);
+            if (sub) jce_runtime_dispatch_ui_submit(g.play_runtime, sub);
+        }
     }
 
     /* Physics debug wireframes (toggled via scene-view View menu). */
@@ -511,6 +703,22 @@ void jce_editor_game_render_frame(uint32_t width, uint32_t height)
         }
         jce_debug_draw_flush(base, g.renderer);
     }
+
+    /* TAA end-of-frame (game view): stash the UN-JITTERED camera for next
+     * frame's reproject and disable TAA on g.postfx so it never leaks into a
+     * later apply.  Mirrors jce_scene_renderer_taa_end_frame. */
+    if (game_taa_on) {
+        g.taa_prev_view  = view;
+        g.taa_prev_proj  = proj;
+        g.taa_prev_valid = true;
+    } else {
+        g.taa_prev_valid = false;
+    }
+    if (g.postfx)
+        jce_postfx_set_taa(g.postfx, false, 0.9f, 1.0f, 1.0f);
+    /* Clear the shared renderer's velocity request so it isn't reused by a
+     * later scene/pick render this frame. */
+    jce_scene_renderer_set_taa_velocity_enabled(engine_sr, false);
 }
 
 void jce_editor_game_render_set_module(const JceGameModule *mod)

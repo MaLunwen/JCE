@@ -30,7 +30,12 @@ float linearize(float d, float n, float f)
 
 vec3 reconstruct_world(vec2 uv, float d)
 {
-	vec4 ndc = vec4(uv * 2.0 - 1.0, d * 2.0 - 1.0, 1.0);
+#if BGFX_SHADER_LANGUAGE_GLSL
+	float ndc_z = d * 2.0 - 1.0;   /* GL: depth-buffer NDC z is [-1,1] */
+#else
+	float ndc_z = d;               /* D3D/Vulkan/Metal/WebGPU: NDC z is [0,1] */
+#endif
+	vec4 ndc = vec4(uv * 2.0 - 1.0, ndc_z, 1.0);
 	vec4 wp = mul(u_invViewProj, ndc);
 	return wp.xyz / wp.w;
 }

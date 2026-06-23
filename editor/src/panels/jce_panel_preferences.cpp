@@ -2,20 +2,32 @@
  * jce_panel_preferences.cpp  User-level Preferences panel (P4-A.2).
  *
  * Unity-style two-pane layout (vertical tab list on the left, page
- * content on the right) for user-scoped editor settings:
+ * content on the right) for user-scoped editor settings.  Tabs:
  *
- *   General      autosave interval, startup behaviour, recent count
- *   Appearance   theme, font size, UI scale
- *   Hotkeys      rebinding editor (filter / capture / reset, P4-A.3)
+ *   General      autosave interval, startup behaviour, recent_max
+ *   Appearance   language, theme, font size, UI scale, renderer
+ *   Fonts        Latin / CJK font-file overrides
+ *   Viewport     show grid, show gizmos, gizmo scale, view/asset modes
+ *   Input        scroll/drag inversion, touchpad
+ *   Paths        build output, auto-repack, dev mode
+ *   Toolchains   per-kind tool path overrides
+ *   Hotkeys      rebinding editor (filter / capture / reset)
  *
  * Persistence
  * -----------
- * Settings are mirrored to "<cwd>/.jce/prefs.json" using cJSON via
- * <jce/os/core/jce_json.h> and the editor's existing host-path file
- * helpers.  The engine does not currently expose an "OS user pref dir"
- * accessor (no SDL_GetPrefPath wrapper in api_core.h), and the rest of
- * the editor — hotkeys.json, editor-config.json — already follows the
- * ".jce/<file>.json" convention next to the project.  We stay
+ * This panel writes TWO user-scoped stores under ".jce/":
+ *   prefs.json          — autosave / startup / recent_max / toolchains
+ *   editor-config.json  — appearance / fonts / viewport / input / paths
+ *                         (the canonical JceEditorConfig, mirrored in s_cfg)
+ * plus hotkeys.json via the hotkey registry.  s_cfg is re-synced from disk
+ * on every panel OPEN so an external edit between sessions is not clobbered
+ * by a whole-struct save.  The live gizmo-display accessors
+ * (jce_editor_prefs_show_gizmos / _gizmo_scale) read s_cfg, so those prefs
+ * now persist across restarts (they previously lived only in a retired
+ * panel's in-memory struct and were lost every launch).
+ *
+ * The engine does not expose an "OS user pref dir" accessor, and the rest
+ * of the editor already uses the ".jce/<file>.json" convention, so we stay
  * consistent with that until a dedicated user-dir helper lands.
  *
  * Theme / font / UI scale are applied to the live ImGui context the
@@ -28,6 +40,8 @@
 #include "ui/jce_editor_style.h"
 #include "core/jce_editor_i18n.h"
 #include "core/jce_editor_config.h"
+#include "core/jce_editor_defaults.h"
+#include "core/jce_editor_state.h"
 #include "core/jce_hotkeys.h"
 #include "dialogs/jce_path_input.h"
 
@@ -60,13 +74,6 @@ enum AutosaveInterval {
     AUTOSAVE_COUNT
 };
 
-enum StartupBehavior {
-    STARTUP_LAST = 0,
-    STARTUP_EMPTY,
-    STARTUP_PICKER,
-    STARTUP_COUNT
-};
-
 /* Theme indices map 1:1 to the canonical jce_editor_apply_theme() values
  * (JCE_THEME_DARK=0, JCE_THEME_LIGHT=1, JCE_THEME_SSMS=2). The on-disk
  * label "Blue" maps to JCE_THEME_SSMS — kept for legacy compatibility
@@ -74,7 +81,7 @@ enum StartupBehavior {
 struct UserPrefs {
     /* Truly new fields persisted to .jce/prefs.json. */
     int   autosave        = AUTOSAVE_5MIN;
-    int   startup         = STARTUP_LAST;
+    int   startup         = JCE_EDITOR_STARTUP_LAST;
     int   recent_max      = 10;
 };
 
@@ -192,7 +199,7 @@ void load_from_disk()
     s_prefs.autosave   = clamp_int(jce_json_get_int(root, "autosave",   s_prefs.autosave),
                                    0, AUTOSAVE_COUNT - 1);
     s_prefs.startup    = clamp_int(jce_json_get_int(root, "startup",    s_prefs.startup),
-                                   0, STARTUP_COUNT - 1);
+                                   0, JCE_EDITOR_STARTUP_COUNT - 1);
     s_prefs.recent_max = clamp_int(jce_json_get_int(root, "recent_max", s_prefs.recent_max),
                                    1, 20);
 
@@ -249,6 +256,9 @@ void ensure_loaded()
     load_from_disk();
     if (!jce_editor_config_load(&s_cfg))
         jce_editor_config_defaults(&s_cfg);
+    /* Push the user's recent-list cap into the config layer so add_recent
+     * honors it from startup (previously recent_max was inert). */
+    jce_editor_config_set_recent_cap(s_prefs.recent_max);
     s_loaded = true;
 }
 
@@ -268,9 +278,9 @@ const char *autosave_label(int v)
 const char *startup_label(int v)
 {
     switch (v) {
-    case STARTUP_LAST:   return jce_editor_i18n("panel.preferences.startup.last");
-    case STARTUP_EMPTY:  return jce_editor_i18n("panel.preferences.startup.empty");
-    case STARTUP_PICKER: return jce_editor_i18n("panel.preferences.startup.picker");
+    case JCE_EDITOR_STARTUP_LAST:   return jce_editor_i18n("panel.preferences.startup.last");
+    case JCE_EDITOR_STARTUP_EMPTY:  return jce_editor_i18n("panel.preferences.startup.empty");
+    case JCE_EDITOR_STARTUP_PICKER: return jce_editor_i18n("panel.preferences.startup.picker");
     default:             return "?";
     }
 }
@@ -308,10 +318,19 @@ void draw_tab_general()
     dirty |= combo_enum(jce_editor_i18n("panel.preferences.autosave_interval"),
                         &s_prefs.autosave, AUTOSAVE_COUNT, autosave_label);
     dirty |= combo_enum(jce_editor_i18n("panel.preferences.startup"),
-                        &s_prefs.startup, STARTUP_COUNT, startup_label);
+                        &s_prefs.startup, JCE_EDITOR_STARTUP_COUNT, startup_label);
     if (ImGui::SliderInt(jce_editor_i18n("panel.preferences.recent_max"),
                          &s_prefs.recent_max, 1, 20)) {
         s_prefs.recent_max = clamp_int(s_prefs.recent_max, 1, 20);
+        /* Apply the new cap immediately: bound future adds and trim the
+         * already-stored lists so the change is observable now, not only
+         * after entries age out. */
+        jce_editor_config_set_recent_cap(s_prefs.recent_max);
+        int cap = s_prefs.recent_max < 10 ? s_prefs.recent_max : 10;
+        bool cfg_trimmed = false;
+        if (s_cfg.recent_count > cap)       { s_cfg.recent_count = cap;       cfg_trimmed = true; }
+        if (s_cfg.recent_scene_count > cap) { s_cfg.recent_scene_count = cap; cfg_trimmed = true; }
+        if (cfg_trimmed) jce_editor_config_save(&s_cfg);
         dirty = true;
     }
     if (dirty) save_to_disk();
@@ -513,10 +532,27 @@ void draw_tab_viewport()
     bool cfg_dirty = false;
 
     if (ImGui::Checkbox(jce_editor_i18n("preferences.editor.showGrid"),
-                        &s_cfg.show_grid))
+                        &s_cfg.show_grid)) {
+        /* Keep the live scene state in sync so the change is visible
+         * immediately instead of only after the next config reload. */
+        jce_state_set_show_grid(s_cfg.show_grid);
         cfg_dirty = true;
+    }
 
-    const char *view_modes[] = { "Shaded", "Wireframe", "Textured" };
+    if (ImGui::Checkbox(jce_editor_i18n("preferences.editorTab.showGizmos"),
+                        &s_cfg.show_gizmos))
+        cfg_dirty = true;
+    if (ImGui::SliderFloat(jce_editor_i18n("preferences.editorTab.gizmoScale"),
+                           &s_cfg.gizmo_scale,
+                           JCE_PREF_GIZMO_SCALE_MIN, JCE_PREF_GIZMO_SCALE_MAX)) {
+        if (s_cfg.gizmo_scale < JCE_PREF_GIZMO_SCALE_MIN)
+            s_cfg.gizmo_scale = JCE_PREF_GIZMO_SCALE_MIN;
+        if (s_cfg.gizmo_scale > JCE_PREF_GIZMO_SCALE_MAX)
+            s_cfg.gizmo_scale = JCE_PREF_GIZMO_SCALE_MAX;
+        cfg_dirty = true;
+    }
+
+    const char *view_modes[] = { jce_editor_i18n("panel.preferences.viewMode.shaded"), jce_editor_i18n("panel.preferences.viewMode.wireframe"), jce_editor_i18n("panel.preferences.viewMode.textured") };
     int vm = s_cfg.view_mode;
     if (vm < 0 || vm > 2) vm = 0;
     if (ImGui::Combo(jce_editor_i18n("preferences.editor.viewMode"),
@@ -525,7 +561,7 @@ void draw_tab_viewport()
         cfg_dirty = true;
     }
 
-    const char *asset_view[] = { "Grid", "Details" };
+    const char *asset_view[] = { jce_editor_i18n("panel.preferences.assetView.grid"), jce_editor_i18n("panel.preferences.assetView.details") };
     int av = s_cfg.asset_browser_view_mode;
     if (av < 0 || av > 1) av = 0;
     if (ImGui::Combo(jce_editor_i18n("preferences.editor.assetView"),
@@ -595,7 +631,44 @@ void draw_tab_paths()
     ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "%s",
                        jce_editor_i18n("preferences.run.devModeHint"));
 
-    if (cfg_dirty) jce_editor_config_save(&s_cfg);
+    /* External tools (per-user, per-machine) — Unity's Preferences >
+       External Tools.  Used by the code / image viewers' "open externally"
+       actions; empty falls back to the OS default handler. */
+    ImGui::Spacing();
+    ImGui::SeparatorText(jce_editor_i18n("preferences.externalTools.group"));
+    if (jce_draw_path_input(jce_editor_i18n("preferences.externalTools.scriptEditor"),
+                            s_cfg.external_script_editor,
+                            sizeof(s_cfg.external_script_editor),
+                            JcePathKind::FileAbs))
+        cfg_dirty = true;
+    if (jce_draw_path_input(jce_editor_i18n("preferences.externalTools.imageEditor"),
+                            s_cfg.external_image_editor,
+                            sizeof(s_cfg.external_image_editor),
+                            JcePathKind::FileAbs))
+        cfg_dirty = true;
+    ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "%s",
+                       jce_editor_i18n("preferences.externalTools.hint"));
+
+    /* Reload-before-save (defense-in-depth): the Paths tab also authors
+       build/run SESSION fields (build_output_path) shared with the Project
+       Settings panel.  Re-read disk and overlay only the fields THIS tab
+       owns, so a save here never reverts a sibling field another surface
+       changed while this panel was open.  s_cfg stays the live mirror
+       (gizmo accessors read it) so we sync it to what we wrote. */
+    if (cfg_dirty) {
+        JceEditorConfig disk;
+        jce_editor_config_load(&disk);
+        snprintf(disk.build_output_path, sizeof(disk.build_output_path), "%s",
+                 s_cfg.build_output_path);
+        disk.auto_repack_on_save = s_cfg.auto_repack_on_save;
+        disk.run_dev_mode        = s_cfg.run_dev_mode;
+        snprintf(disk.external_script_editor, sizeof(disk.external_script_editor),
+                 "%s", s_cfg.external_script_editor);
+        snprintf(disk.external_image_editor, sizeof(disk.external_image_editor),
+                 "%s", s_cfg.external_image_editor);
+        jce_editor_config_save(&disk);
+        s_cfg = disk;
+    }
 }
 
 void draw_tab_toolchains()
@@ -623,10 +696,10 @@ void draw_tab_toolchains()
 
     if (!ImGui::BeginTable("##tc_table", 4, tflags))
         return;
-    ImGui::TableSetupColumn("Tool",     ImGuiTableColumnFlags_WidthStretch, 0.18f);
-    ImGui::TableSetupColumn("Status",   ImGuiTableColumnFlags_WidthStretch, 0.10f);
-    ImGui::TableSetupColumn("Version",  ImGuiTableColumnFlags_WidthStretch, 0.15f);
-    ImGui::TableSetupColumn("Path / override",
+    ImGui::TableSetupColumn(jce_editor_i18n("panel.preferences.tools.col.tool"),     ImGuiTableColumnFlags_WidthStretch, 0.18f);
+    ImGui::TableSetupColumn(jce_editor_i18n("panel.preferences.tools.col.status"),   ImGuiTableColumnFlags_WidthStretch, 0.10f);
+    ImGui::TableSetupColumn(jce_editor_i18n("panel.preferences.tools.col.version"),  ImGuiTableColumnFlags_WidthStretch, 0.15f);
+    ImGui::TableSetupColumn(jce_editor_i18n("panel.preferences.tools.col.pathOverride"),
                                         ImGuiTableColumnFlags_WidthStretch, 0.57f);
     ImGui::TableHeadersRow();
 
@@ -860,6 +933,60 @@ extern "C" void jce_editor_prefs_load_and_apply(void)
     apply_all();
 }
 
+/* Gizmo display prefs — live, per-frame accessors for the scene-view
+ * renderer.  Backed by editor-config (s_cfg), so they now persist across
+ * sessions (previously a retired panel's in-memory struct lost them on
+ * every restart).  ensure_loaded() lazily mirrors disk on first use. */
+extern "C" bool jce_editor_prefs_show_gizmos(void)
+{
+    ensure_loaded();
+    return s_cfg.show_gizmos;
+}
+
+extern "C" float jce_editor_prefs_gizmo_scale(void)
+{
+    ensure_loaded();
+    float s = s_cfg.gizmo_scale;
+    if (s < JCE_PREF_GIZMO_SCALE_MIN) s = JCE_PREF_GIZMO_SCALE_MIN;
+    if (s > JCE_PREF_GIZMO_SCALE_MAX) s = JCE_PREF_GIZMO_SCALE_MAX;
+    return s;
+}
+
+/* Autosave interval in seconds (0 = disabled), from the General tab's
+ * AutosaveInterval enum in prefs.json.  The editor main loop polls this to
+ * drive a real autosave timer (previously the setting persisted but nothing
+ * consumed it). */
+extern "C" int jce_editor_prefs_autosave_interval_sec(void)
+{
+    ensure_loaded();
+    switch (s_prefs.autosave) {
+    case AUTOSAVE_1MIN:  return 60;
+    case AUTOSAVE_5MIN:  return 300;
+    case AUTOSAVE_15MIN: return 900;
+    case AUTOSAVE_OFF:
+    default:             return 0;
+    }
+}
+
+extern "C" JceEditorStartupBehavior jce_editor_prefs_startup_behavior(void)
+{
+    ensure_loaded();
+    return (JceEditorStartupBehavior)clamp_int(s_prefs.startup,
+                                               0,
+                                               JCE_EDITOR_STARTUP_COUNT - 1);
+}
+
+extern "C" void jce_editor_prefs_set_startup_behavior(
+    JceEditorStartupBehavior behavior)
+{
+    ensure_loaded();
+    int next = clamp_int((int)behavior, 0, JCE_EDITOR_STARTUP_COUNT - 1);
+    if (s_prefs.startup == next)
+        return;
+    s_prefs.startup = next;
+    save_to_disk();
+}
+
 extern "C" void jce_editor_panel_user_preferences(void)
 {
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_USER_PREFERENCES);
@@ -873,6 +1000,13 @@ extern "C" void jce_editor_panel_user_preferences(void)
     if (*vis) {
         s_modal_open = true;
         *vis = false;
+        /* Re-sync the editor-config mirror from disk on every OPEN, not just
+         * the first ever load: other subsystems (scene-view toolbar, asset
+         * browser, theme apply) write editor-config between panel sessions,
+         * and the long-lived s_cfg would otherwise re-save STALE values and
+         * silently revert those external changes (whole-struct save). */
+        s_loaded = false;
+        ensure_loaded();
         ImGui::OpenPopup("###UserPreferences");
     }
     if (!s_modal_open) return;

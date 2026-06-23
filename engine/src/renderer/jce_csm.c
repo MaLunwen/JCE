@@ -68,7 +68,9 @@ void jce_csm_compute(JceCsmData *out,
                      const jce_vec3 *light_dir,
                      bool homogeneous_depth,
                      uint16_t shadow_map_size,
-                     float split_lambda)
+                     float split_lambda,
+                     const jce_vec3 *caster_aabb_min,
+                     const jce_vec3 *caster_aabb_max)
 {
     if (!out || !camera_view || !light_dir) return;
     JCE_PROFILE_ZONE_N("CSM::Compute");
@@ -85,6 +87,15 @@ void jce_csm_compute(JceCsmData *out,
     jce_mat4 inv_view = jce_m4_inverse(camera_view);
 
     jce_vec3 ld = jce_v3_normalize(*light_dir);
+
+    /* The near-plane extension toward the sun (so tall casters between the
+     * cascade sphere and the sun are captured instead of clipped) is computed
+     * PER CASCADE below, from casters clamped to that cascade's local footprint.
+     * Computing it once over the WHOLE scene caster AABB made a single distant
+     * caster (e.g. the always-resident HLOD city skyline ~1.5 km away) drive
+     * near_extend to its cap on every cascade, ballooning the ortho depth range
+     * to ~1 km and collapsing shadow-depth precision. */
+    bool have_caster_extent = (caster_aabb_min && caster_aabb_max);
 
     for (uint32_t c = 0; c < cascade_count; c++) {
         float zn = out->splits[c];
@@ -142,15 +153,65 @@ void jce_csm_compute(JceCsmData *out,
                                 jce_v3_scale(ld, cz));
         }
 
-        jce_vec3 light_pos  = jce_v3_add(center, jce_v3_scale(ld, radius));
+        /* Publish the world-space cascade sphere so the shadow pass can cull
+         * casters outside this cascade's coverage (identical numbers to the
+         * ortho fit below => the cull volume matches the rendered volume). */
+        out->center[c] = center;
+        out->radius[c] = radius;
+
+        /* Extend the light camera back toward the sun so its near plane clears
+         * the tallest caster between this cascade and the sun (else tall casters
+         * are clipped and their shadows truncate).  KEY: only casters whose
+         * shadow actually lands in THIS cascade should drive the extension, so
+         * clamp the caster bounds to this cascade's local HORIZONTAL (XZ)
+         * footprint — keeping full height — before projecting onto the light
+         * axis.  Projecting the whole-scene AABB instead let one distant caster
+         * (the always-resident HLOD skyline ~1.5 km away) pin near_extend to its
+         * cap on every cascade, blowing the ortho depth range out to ~1 km and
+         * collapsing depth precision (acne → huge biases → peter-panning +
+         * washed-out shadows).  Full height is kept so tall LOCAL buildings are
+         * still captured = no truncation regression.  Anchored to world-space
+         * bounds => still camera-independent. */
+        float cz_center = jce_v3_dot(center, ld);
+        float near_extend = 0.0f;
+        if (have_caster_extent) {
+            const float K = 2.0f; /* footprint slack for the tilted light axis */
+            float fx0 = center.x - radius * K, fx1 = center.x + radius * K;
+            float fz0 = center.z - radius * K, fz1 = center.z + radius * K;
+            jce_vec3 lo = *caster_aabb_min, hi = *caster_aabb_max;
+            if (lo.x < fx0) lo.x = fx0;
+            if (hi.x > fx1) hi.x = fx1;
+            if (lo.z < fz0) lo.z = fz0;
+            if (hi.z > fz1) hi.z = fz1;
+            if (lo.x <= hi.x && lo.z <= hi.z) { /* footprint overlaps casters */
+                float cmp = -3.4e38f;
+                for (int ci = 0; ci < 8; ci++) {
+                    jce_vec3 cr = jce_v3((ci & 1) ? hi.x : lo.x,
+                                         (ci & 2) ? hi.y : lo.y,
+                                         (ci & 4) ? hi.z : lo.z);
+                    float p = jce_v3_dot(cr, ld);
+                    if (p > cmp) cmp = p;
+                }
+                near_extend = cmp - (cz_center + radius);
+                if (near_extend < 0.0f) near_extend = 0.0f;
+            }
+            float cap = radius * 16.0f; /* backstop only; rarely hit now */
+            if (near_extend > cap) near_extend = cap;
+        }
+
+        jce_vec3 light_pos  = jce_v3_add(center,
+                                         jce_v3_scale(ld, radius + near_extend));
         jce_mat4 light_view = jce_m4_look_at(light_pos, center, up_ws);
 
         /* Ortho projection around bounding sphere with Z padding for
-         * world-space normal-offset bias applied in the fragment shader. */
+         * world-space normal-offset bias applied in the fragment shader.  The
+         * far plane extends by near_extend too so the receiver slab (cascade
+         * sphere) stays fully inside [near,far]. */
         float z_pad = radius * 0.05f;
         jce_mat4 light_proj = jce_m4_ortho(-radius, radius,
                                             -radius, radius,
-                                            -z_pad, radius * 2.0f + z_pad,
+                                            -z_pad,
+                                            radius * 2.0f + near_extend + z_pad,
                                             homogeneous_depth);
 
         out->vp[c] = jce_m4_multiply(&light_proj, &light_view);

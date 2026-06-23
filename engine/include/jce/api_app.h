@@ -13,6 +13,7 @@ extern "C" {
 #endif
 
 #include <jce/application/jce_app_interface.h>
+#include <jce/application/jce_args.h>
 #include <jce/application/jce_camera_controller.h>
 #include <jce/os/core/jce_config.h>
 #include <jce/application/jce_engine.h>

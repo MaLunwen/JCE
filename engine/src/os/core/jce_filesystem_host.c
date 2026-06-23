@@ -449,6 +449,33 @@ bool jce_fs_host_write_all(const char *path, const void *data, uint64_t size)
     return ok;
 }
 
+bool jce_fs_host_write_all_atomic(const char *path, const void *data, uint64_t size)
+{
+    if (s_empty(path) || (size && !data)) return false;
+
+    /* Sibling temp in the same directory so the rename stays on one volume
+     * (a cross-volume rename is not atomic and may fail). */
+    size_t plen = strlen(path);
+    char *tmp = (char *)JCE_MALLOC(plen + 5);   /* ".tmp" + NUL */
+    if (!tmp) return false;
+    memcpy(tmp, path, plen);
+    memcpy(tmp + plen, ".tmp", 5);
+
+    bool ok = jce_fs_host_write_all(tmp, data, size);
+    if (ok) {
+        ok = jce_fs_host_rename(tmp, path);
+        if (!ok) {
+            /* Platforms whose rename will not replace an existing destination:
+             * remove it and retry.  The data stays safe in tmp throughout. */
+            SDL_RemovePath(path);
+            ok = jce_fs_host_rename(tmp, path);
+        }
+    }
+    if (!ok) SDL_RemovePath(tmp);   /* never leave a stray temp behind */
+    JCE_FREE(tmp);
+    return ok;
+}
+
 bool jce_fs_host_append(const char *path, const void *data, uint64_t size)
 {
     if (s_empty(path) || (size && !data)) return false;

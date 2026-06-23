@@ -307,7 +307,7 @@ void fv_render_audio(FvTab *tab)
     AudioState *st = ensure_loaded(tab);
     if (!st) {
         ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1),
-                           "Failed to load audio: %s", tab->display_name);
+                           jce_editor_i18n("viewer.audio.loadFailed"), tab->display_name);
         return;
     }
 

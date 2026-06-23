@@ -186,6 +186,13 @@ void jce_snapshot_unregister(JceSnapshotRegistry *r, const char *id)
     r->count--;
 }
 
+void *jce_snapshot_get_user(JceSnapshotRegistry *r, const char *id)
+{
+    if (!r || !id) return NULL;
+    int idx = find_provider(r, id);
+    return idx >= 0 ? r->items[idx].user : NULL;
+}
+
 /* ================================================================== */
 /* Save / load                                                         */
 /* ================================================================== */

@@ -128,6 +128,51 @@ JceRaycast2DResult jce_physics2d_raycast(const JcePhysics2D *world,
                                          float max_distance);
 
 /* ================================================================== */
+/* 2D joints (Distance / Hinge / Spring)                               */
+/* ================================================================== */
+
+/* Joint kinds (mirrors JCE_JOINT_2D_* in jce_scene.h, but the engine
+ * physics layer stays scene-agnostic so it carries its own enum). */
+typedef enum {
+    JCE_PHYSICS2D_JOINT_DISTANCE = 0, /* rigid distance (fixed length)  */
+    JCE_PHYSICS2D_JOINT_HINGE    = 1, /* revolute (motor + angle limit) */
+    JCE_PHYSICS2D_JOINT_SPRING   = 2  /* distance joint with a spring   */
+} JcePhysics2DJointKind;
+
+/* One 2D joint between two bodies.  body_b INVALID anchors body_a to the
+ * world (an implicit static ground body the joint owns).  Anchors are in
+ * each body's LOCAL space.  Angles are radians; frequency is Hz.  Distance
+ * is the rest length for DISTANCE/SPRING. */
+typedef struct {
+    int           kind;             /* JcePhysics2DJointKind             */
+    JceBodyHandle body_a;
+    JceBodyHandle body_b;           /* JCE_BODY_INVALID => world anchor  */
+    jce_vec2      anchor_a;         /* local anchor on body_a            */
+    jce_vec2      anchor_b;         /* local anchor on body_b / world    */
+    float         distance;         /* DISTANCE/SPRING rest length       */
+    float         frequency_hz;     /* SPRING stiffness (Hz)             */
+    float         damping_ratio;    /* SPRING damping (non-dimensional)  */
+    bool          use_motor;        /* HINGE                             */
+    float         motor_speed_rad_s;/* HINGE                             */
+    float         motor_max_torque; /* HINGE (N·m)                       */
+    bool          use_limits;       /* HINGE                             */
+    float         lower_angle_rad;  /* HINGE limit                       */
+    float         upper_angle_rad;  /* HINGE limit                       */
+} JcePhysics2DJointDesc;
+
+/* Create a 2D joint.  Returns JCE_CONSTRAINT_INVALID on failure (NULL
+ * world/desc, invalid body_a, or joint-pool exhaustion).  The handle maps
+ * back to the b2JointId so it can be torn down with jce_physics2d_joint_
+ * destroy; the world also auto-destroys all joints on jce_physics2d_destroy. */
+JCE_API JceConstraintHandle JCE_CALL jce_physics2d_joint_create(JcePhysics2D *world,
+                                                                const JcePhysics2DJointDesc *desc);
+
+/* Destroy a 2D joint created above.  Safe on INVALID / already-freed
+ * handles (idempotent no-op). */
+JCE_API void JCE_CALL jce_physics2d_joint_destroy(JcePhysics2D *world,
+                                                  JceConstraintHandle joint);
+
+/* ================================================================== */
 /* Debug                                                               */
 /* ================================================================== */
 

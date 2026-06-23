@@ -15,7 +15,10 @@
 #include <jce/renderer/jce_gfx_types.h>
 #include <jce/renderer/jce_texture_types.h>
 #include <jce/renderer/jce_volume_profile.h>
+#include <jce/renderer/jce_skinned_mesh.h>      /* JCE_MAX_BONES (ragdoll pose relay) */
 #include <jce/middleware/video/jce_video_types.h>
+#include <jce/middleware/scene/jce_water.h>
+#include <jce/middleware/animation/jce_morph.h>  /* JCE_MORPH_MAX_WEIGHTS */
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -29,6 +32,16 @@ typedef struct {
     jce_quat rotation;
     jce_vec3 scale;
 } JceTransform;
+
+typedef struct {
+    /* Mesh-local point used as the object's transform pivot. Zero preserves
+     * legacy Transform-only scenes. */
+    jce_vec3 local_position;
+    /* Optional editor manipulator orientation, stored with the scene so Maya-
+     * style custom pivot axes survive reloads. Runtime model composition uses
+     * local_position; rotation is consumed by editor tooling. */
+    jce_quat local_rotation;
+} JcePivotComponent;
 
 typedef struct {
     JceModelHandle  model;
@@ -141,6 +154,18 @@ typedef enum {
     JCE_SCENE_SOFT_SHADOW_VSM = 2,
 } JceSceneSoftShadowMode;
 
+/* Sky-rendering mode for the scene's sky pass.
+ *   GRADIENT = the legacy 3-colour procedural gradient (default; also the
+ *              target the time-of-day driver overrides each frame).
+ *   EQUIRECT = an HDR equirectangular skybox (the existing skybox path).
+ *   PREETHAM = the analytic Preetham daylight model (jce_sky.h).  Uses the
+ *              ToD sun direction when time-of-day is active. */
+typedef enum {
+    JCE_SCENE_SKY_GRADIENT = 0,
+    JCE_SCENE_SKY_EQUIRECT = 1,
+    JCE_SCENE_SKY_PREETHAM = 2,
+} JceSceneSkyMode;
+
 typedef struct {
     uint32_t version;
 
@@ -199,6 +224,44 @@ typedef struct {
      * space overlay scaled by weather_intensity [0,1]. */
     int   weather_type;        /* JceWeatherType                          */
     float weather_intensity;   /* 0..1                                    */
+
+    /* ── Sky (analytic Preetham, additive) ────────────────────────────
+     * sky_mode selects the sky pass: GRADIENT (0, default — unchanged
+     * legacy behaviour), EQUIRECT (1, the existing HDR skybox path) or
+     * PREETHAM (2, the analytic daylight model in jce_sky.h).  When
+     * PREETHAM is selected the renderer evaluates jce_sky_evaluate() with
+     * the ToD sun direction (or a default high sun) and sky_turbidity.
+     * Absent in older scenes → defaults to GRADIENT (no visual change). */
+    int   sky_mode;            /* JceSceneSkyMode (0 = gradient)          */
+    float sky_turbidity;       /* Preetham haze, ~2-3 clear; clamp [1,10] */
+
+    /* ── Floating origin (large-world precision; opt-in, default OFF) ───
+     * When floating_origin_enabled, the runtime periodically re-bases the
+     * world so the camera returns toward (0,0,0), keeping float32 transforms
+     * precise across very large maps (see jce_world_origin.h).  A rebase
+     * fires when |camera_local| exceeds floating_origin_threshold metres and
+     * atomically shifts entities + camera + physics bodies by the same delta,
+     * so it is visually transparent.  Absent in older scenes → disabled →
+     * the frame path is byte-identical to before this feature. */
+    bool  floating_origin_enabled;
+    float floating_origin_threshold;   /* metres; default 4096 */
+
+    /* Screen-space ambient occlusion (SSAO).  Off by default; absent in older
+     * scenes -> disabled -> byte-identical frame path.  When enabled the
+     * renderer runs a camera depth pre-pass + SSAO and modulates ONLY the
+     * ambient term.  (Reuses the material-AO sampler stage, so an authored AO
+     * map is replaced by SSAO while enabled - combining both is a future
+     * ORM-pack refinement.) */
+    bool  ssao_enabled;
+    float ssao_intensity;   /* default 1.5 */
+    float ssao_radius;      /* world units; default 1.0 */
+
+    /* Screen-space reflections.  Reflects the lit color buffer along surface
+     * normals (reconstructed from the SSAO depth pre-pass).  Composited
+     * additively over the scene color by the SSR pass's own coverage/fade. */
+    bool  ssr_enabled;
+    float ssr_intensity;     /* reflection strength, default 0.6 */
+    float ssr_max_distance;  /* ray-march world distance, default 8.0 */
 } JceSceneRenderingSettings;
 
 /* ── Scene-level world-streaming settings ───────────────────────────
@@ -272,6 +335,14 @@ typedef struct {
 
 typedef struct {
     char  skeleton_path[256];
+    /* Optional RETARGET source skeleton. When non-empty AND different from
+       skeleton_path, the active clip is treated as authored for THIS (source)
+       skeleton: the renderer samples it against the source rig, transfers the
+       pose onto this entity's (dst) skeleton via the name-based bind-relative
+       retargeter (jce_anim_retarget_*), then evaluates the dst skeleton. Empty
+       (the default) ⇒ no retargeting ⇒ legacy single-skeleton path, byte-
+       identical. */
+    char  retarget_source_skeleton[256];
     char  clip_names[8][64];
     int   clip_count;
     int   active_clip;
@@ -290,6 +361,17 @@ typedef struct {
     bool  use_blend_tree;
     float blend_param;
     float blend_thresholds[8];
+    /* Blend-tree dimensionality (matches JceAnimBlendTreeMode but kept as a
+       plain int so this header has no animation dependency):
+         0 = 1D (scalar blend_param over blend_thresholds[] — the classic path)
+         1 = 2D Freeform Cartesian   (gradient band in (x,y))
+         2 = 2D Freeform Directional (gradient band in (angle,magnitude))
+       In 2D modes the sample positions are (blend_thresholds[i], blend_pos_y[i])
+       and the query point is (blend_param, blend_param_y). Only valid when
+       use_blend_tree is set. */
+    int   blend_mode;
+    float blend_param_y;
+    float blend_pos_y[8];
     /* Opt-in convenience: when true, the engine auto-feeds the entity's planar
        movement speed into the SM "Speed" param AND blend_param (during Play),
        so a model "just works" as a locomotion character. Default false — the
@@ -308,6 +390,19 @@ typedef struct {
     bool  loco_jump;
     float loco_speed;
     float loco_vert_vel;
+    /* ── Root motion delta (FEATURE 3.2 — transient, NEVER serialized) ──
+       Produced each frame by the renderer's pose evaluator (which owns the
+       clip + playhead + skeleton) when the entity's JceAvatarComponent has
+       apply_root_motion=true: the root joint's local-space translation step
+       and yaw step extracted by jce_anim_extract_root_delta over this frame's
+       (prev,cur] playhead window (loop-wrap aware), with the root translation
+       stripped from the rendered pose so the mesh stays put.  The runtime's
+       character/transform step consumes rm_dx/rm_dy/rm_dz (rotated by the
+       entity orientation) + rm_dyaw, then clears rm_valid.  rm_valid marks the
+       data live for exactly one consumer read. */
+    bool  rm_valid;
+    float rm_dx, rm_dy, rm_dz;   /* root local-space translation delta */
+    float rm_dyaw;               /* root yaw delta, radians            */
 } JceSkeletalAnimatorComponent;
 
 /* ── Constraint component ───────────────────────────────────────── */
@@ -326,14 +421,19 @@ typedef struct {
 /* ── Animation-rigging IK constraints ────────────────────────────────
  *
  * Authored in the editor's Animation Rigging panel and consumed by the
- * scene renderer after pose sampling (currently only kind==1 TwoBoneIK is
- * solved; the other kinds round-trip through serialization but are inert).
+ * scene renderer after pose sampling.  ALL kinds are solved: 0=Aim,
+ * 1=TwoBoneIK, 5=CCD, 6=FABRIK (chain/aim solvers) and the single-target
+ * parent constraints MultiParent(2)/Position(3)/Rotation(4) — these drive the
+ * root bone toward the single target_entity (Position blends translation,
+ * Rotation blends orientation, MultiParent both), in the rigged entity's
+ * model space, then propagate to descendants.
  *
  * NOTE: there is NO JCE_COMP_FLAG bit for this component — the 64-bit
  * flag field is full.  It is presence-gated (jce_scene_has_ik_constraints),
  * exactly like VideoPlayer/NavAgent, for enumeration and serialization. */
 typedef struct {
-    int      kind;            /* 0=Aim 1=TwoBoneIK 2=MultiParent 3=Position 4=Rotation */
+    int      kind;            /* 0=Aim 1=TwoBoneIK 2=MultiParent 3=Position
+                                4=Rotation 5=CCD 6=FABRIK */
     char     name[48];
     float    weight;          /* 0..1 */
     bool     enabled;
@@ -350,6 +450,62 @@ typedef struct {
     JceIkConstraint constraints[16];
 } JceIkConstraintComponent;
 
+/* ── Foot IK (ground-adaptive foot placement) ────────────────────────
+ *
+ * Authored on a skeletal-animator entity; consumed by the scene renderer
+ * (sr_apply_foot_ik) after pose sampling + the rigging IK pass.  Each frame
+ * the renderer reads the sampled foot world positions, raycasts DOWN under
+ * each foot via the runtime ground-query hook, and bends the legs (two-bone
+ * solver) so the feet plant on the ground while the hips drop to the lowest
+ * foot.  Bone-name fields are looked up in the animator's skeleton; an empty
+ * ankle name disables that leg.  When no ground-query hook is installed (the
+ * default in tools / before Play) the renderer pass is a NO-OP, so authoring
+ * this component never changes the rendered pose until a runtime wires ground
+ * queries in.
+ *
+ * NOTE: there is NO JCE_COMP_FLAG bit — the 64-bit flag space is full.  It is
+ * presence-gated (jce_scene_has_foot_ik), like IkConstraints / NavAgent. */
+typedef struct {
+    bool     enabled;
+    char     pelvis_bone[48];     /* hips/pelvis bone (empty => no hip drop) */
+    char     hip_bone  [2][48];   /* [0]=left [1]=right upper-leg root       */
+    char     knee_bone [2][48];   /* mid joint per leg                       */
+    char     ankle_bone[2][48];   /* end effector per leg (empty => leg off) */
+    float    max_step_height;     /* clamp pelvis drop + foot raise (m)      */
+    float    foot_offset;         /* lift ankle above the sole (m)           */
+    float    cast_up;             /* ray starts this far above the ankle (m) */
+    float    cast_down;           /* ray length below the ankle (m)          */
+    bool     rotate_to_normal;    /* aim the foot bone to the ground normal  */
+    float    blend;               /* 0..1 overall IK weight                  */
+    uint32_t reserved;
+} JceFootIkComponent;
+
+/* ── Full-Body IK (coordinated multi-effector solve) ─────────────────────
+ *
+ * Authored on a skeletal-animator entity; consumed by the scene renderer
+ * (sr_apply_full_body_ik) after pose sampling + the rigging/foot IK passes.
+ * Each effector pulls a named bone toward a WORLD target; the FBBIK solver
+ * (jce_anim_fbbik, FABRIK-on-tree) reaches all targets at once while keeping
+ * bone lengths rigid — moving a hand propagates through the arm into the shared
+ * spine, unlike the single-chain IkConstraints.  Targets are world positions a
+ * script / gameplay sets (jce.* or directly); an empty bone name disables a
+ * slot.  Like FootIk / IkConstraints there is NO JCE_COMP_FLAG bit (flag space
+ * full) — it is presence-gated (jce_scene_has_full_body_ik).  POD only. */
+typedef struct {
+    char     bone[64];            /* effector joint bone name (empty => off) */
+    jce_vec3 target;              /* WORLD-space target position             */
+    float    weight;             /* 0..1 per-effector pull                   */
+} JceFullBodyIkEffector;
+
+typedef struct {
+    bool     enabled;
+    int      effector_count;      /* 0..8 active effectors                   */
+    JceFullBodyIkEffector effectors[8];
+    int      iterations;          /* solver iterations (<=0 => 10)           */
+    float    blend;               /* 0..1 overall IK weight (lerp from anim) */
+    uint32_t reserved;
+} JceFullBodyIkComponent;
+
 /* ── Physics components ──────────────────────────────────────────── */
 
 typedef struct {
@@ -364,6 +520,10 @@ typedef struct {
     float    angular_drag;       /* angular damping */
     bool     use_gravity;
     bool     is_kinematic;
+    /* Lock all 3 angular axes so a DYNAMIC body never tips/rolls but still
+     * collides linearly (Unity RigidbodyConstraints.FreezeRotation / Godot
+     * lock_rotation).  Applied post-create via setAngularFactor(0). */
+    bool     freeze_rotation;
     /* Continuous Collision Detection (P3-C.3).  Defaults to DISCRETE.
      * ccd_sphere_radius == 0 ⇒ auto-derive from collision-shape AABB
      * when CCD is enabled. */
@@ -499,6 +659,21 @@ typedef struct {
     bool  loop;
     bool  play_on_awake;
 } JceAudioSourceComponent;
+
+/* ── Music track component (adaptive / interactive music director) ────
+ *
+ * Authoring shim for the jce_music director: identifies a music config /
+ * asset (track_path) and the initial director state.  When play_on_awake
+ * is set, the runtime builds a JceMusicDirector for this track on scene
+ * spawn (one director per runtime), seeded with bpm / initial_intensity.
+ * Kept deliberately simple — full layer/segment authoring lives in the
+ * track config the runtime expands via jce_music_track_desc_default. */
+typedef struct {
+    char  track_path[256];     /* music config / asset id                */
+    bool  play_on_awake;       /* build the director on scene spawn      */
+    float initial_intensity;   /* starting intensity (clamped 0..1)      */
+    int   bpm;                 /* tempo in beats-per-minute (> 0)        */
+} JceMusicTrackComponent;
 
 /* ── Video player component (video-as-texture) ───────────────────────
  *
@@ -656,6 +831,82 @@ typedef struct {
     bool  visible;
     bool  splat_enabled;            /* false -> render layer0 only       */
 } JceTerrainComponent;
+
+/* ── Vegetation Scatter (foliage / grass / trees, P0 roadmap 2.2) ──
+ * Deterministically scatters instances of `mesh_path` over the terrain
+ * heightfield within an `area` rectangle centered on the entity, drawn with
+ * GPU instancing.  Scatter math lives in jce_foliage.h; the renderer caches
+ * the instance buffer and rebuilds it only when a parameter changes. */
+typedef struct {
+    char     mesh_path[256];     /* instanced mesh (.glb/.obj/model)              */
+    char     albedo_path[256];   /* optional albedo override ("" = mesh material) */
+    float    density;            /* instances per square world unit (>0)          */
+    uint32_t seed;               /* deterministic scatter seed                    */
+    float    area_x;             /* scatter rectangle X size (world units)        */
+    float    area_z;             /* scatter rectangle Z size                      */
+    float    max_slope_deg;      /* skip terrain steeper than this (>=90 = off)   */
+    float    scale_min;          /* per-instance uniform scale range (min<=max)   */
+    float    scale_max;
+    float    tint[3];            /* multiplied into instance base color           */
+    bool     align_to_normal;    /* orient up-axis to terrain normal (else upright) */
+    bool     cast_shadow;        /* submit instances to the shadow pass           */
+    bool     visible;
+} JceVegetationScatterComponent;
+
+/* ── Water (Gerstner surface, P0 roadmap 2.3) ─────────────────────
+ * A flat `size_x` × `size_z` water plane centered on the entity whose surface
+ * is displaced by up to JCE_WATER_COMP_MAX_WAVES Gerstner/sine waves (see
+ * jce_water.h for the exact equation).  The CPU model (jce_water_sample_*) is
+ * the source of truth the renderer's water vertex shader mirrors; shading uses
+ * the shallow/deep color gradient, transparency, and sun specular below. */
+#define JCE_WATER_COMP_MAX_WAVES 4
+
+/* Surface synthesis model.  GERSTNER (default, value 0) is the analytic
+ * sum-of-sines model in jce_water.h — byte-identical to every prior scene.  FFT
+ * (value 1) replaces it with a Tessendorf statistical ocean (jce_water_fft.h):
+ * the renderer maintains a per-entity CPU FFT patch + a dynamic displacement
+ * texture sampled in the water vertex shader.  Absent in old scenes => GERSTNER,
+ * so loading is byte-identical. */
+typedef enum {
+    JCE_WATER_MODE_GERSTNER = 0,
+    JCE_WATER_MODE_FFT      = 1
+} JceWaterMode;
+
+typedef struct {
+    float        size_x;          /* plane size on X (world units)            */
+    float        size_z;          /* plane size on Z (world units)            */
+    int          wave_count;      /* active waves [0..JCE_WATER_COMP_MAX_WAVES]*/
+    JceWaterWave waves[JCE_WATER_COMP_MAX_WAVES];
+    float        base_height;     /* still-water plane Y (entity-local)       */
+    float        color_shallow[3];/* color at grazing / shallow depth         */
+    float        color_deep[3];   /* color at steep / deep view               */
+    float        transparency;    /* 0 = opaque, 1 = fully transparent        */
+    float        sun_specular;    /* sun highlight intensity                  */
+    bool         visible;
+
+    /* ── FFT ocean (Tessendorf) — additive; inert unless water_mode==FFT ──
+     * Defaults give a plausible open-ocean patch; GERSTNER (the default mode)
+     * ignores all of these, so old scenes round-trip byte-identically. */
+    int          water_mode;      /* JceWaterMode (0 GERSTNER default, 1 FFT)  */
+    float        fft_patch_size;  /* tiling patch world side length (>0)       */
+    float        fft_wind_speed;  /* wind speed m/s -> dominant wavelength     */
+    float        fft_wind_dir_x;  /* wind direction (normalized in the core)   */
+    float        fft_wind_dir_z;
+    float        fft_amplitude;   /* Phillips energy scale (wave height)       */
+    int          fft_resolution;  /* FFT grid N; clamped to a power-of-2 [32,256] */
+} JceWaterComponent;
+
+/* ── Buoyancy (floats a dynamic body on the active water surface, gap 2.3) ─
+ * Mass-independent vertical buoyancy + drag applied per fixed physics tick by
+ * the runtime.  The entity must ALSO have a dynamic RigidBody + a collider; the
+ * runtime samples the first enabled JceWaterComponent in the scene (like
+ * foliage finds terrain), computes submersion depth at the body's XZ, and feeds
+ * jce_water_buoyancy_force().  See jce_water.h for the exact force equation. */
+typedef struct {
+    float buoyancy_strength;  /* upward force per metre of submersion (>0)     */
+    float drag;               /* vertical linear drag while submerged (>=0)    */
+    bool  enabled;            /* false ⇒ runtime skips this body (zero force)  */
+} JceBuoyancyComponent;
 
 /* ── LOD Group (per-entity multi-mesh distance switch) ─────────── */
 
@@ -885,6 +1136,10 @@ typedef struct {
     uint32_t ped_archetypes[8];
     uint32_t vehicle_archetypes[8];
     uint64_t rng_seed;                     /* 0 → default */
+    /* Prefab instantiated for each spawned ped (project-relative path, resolved
+     * through the runtime asset resolver).  Empty ⇒ the manager runs its
+     * distance logic but spawns nothing (the previous inert behaviour). */
+    char     ped_prefab_path[128];
 } JceSpawnManagerComponent;
 
 /* Weapon — scene-attached weapon archetype (Unity-style item config).
@@ -1181,6 +1436,144 @@ typedef struct {
     char  on_click_handler[128]; /* script handler name (placeholder) */
 } JceUIButtonComponent;
 
+/* ── UI: Slider (draggable value track + handle) ───────────────────
+ *
+ * A draggable value widget.  The canvas hit-tests the resolved rect and,
+ * while the pointer is held, maps the pointer position along `direction`
+ * to a value in [min_value,max_value], WRITING IT BACK into `value`
+ * (Unity model: the widget is the source of truth).  Unlike UIButton this
+ * component embeds its OWN RectTransform so a slider needs no sibling
+ * UIImage to be laid out / raycast.  POD only. */
+typedef struct {
+    float value;            /* current value (canvas writes this back) */
+    float min_value;
+    float max_value;
+    int   direction;        /* 0=L→R, 1=R→L, 2=B→T, 3=T→B */
+    bool  interactable;
+    bool  whole_numbers;    /* round value to the nearest integer */
+    float bg_color[4];      /* track background quad */
+    float fill_color[4];    /* filled portion quad */
+    float handle_color[4];  /* handle quad */
+    float handle_size;      /* handle px size; 0 ⇒ default ~20 */
+    char  handle_sprite[256];
+    char  fill_sprite[256];
+    char  on_value_changed[128]; /* script handler name (placeholder) */
+    JceRectTransform rect;  /* layout (see JceRectTransform) */
+} JceUISliderComponent;
+
+/* ── UI: Toggle (clickable on/off with checkmark) ──────────────────
+ *
+ * A click toggles `is_on`; the canvas flips it in place (Unity model:
+ * the widget is the source of truth).  Embeds its OWN RectTransform.
+ * POD only. */
+typedef struct {
+    bool  is_on;            /* current state (canvas writes this back) */
+    bool  interactable;
+    float bg_color[4];      /* background quad */
+    float checkmark_color[4]; /* checkmark quad, drawn only when is_on */
+    char  bg_sprite[256];
+    char  checkmark_sprite[256];
+    char  on_value_changed[128]; /* script handler name (placeholder) */
+    JceRectTransform rect;  /* layout (see JceRectTransform) */
+} JceUIToggleComponent;
+
+/* ── UI: InputField (single-line text entry) ───────────────────────
+ *
+ * A focusable single-line text-entry widget (forms, name entry, search,
+ * chat).  The component's `text` field is the SOURCE OF TRUTH (Unity
+ * model): the canvas writes every edit (insert / delete / caret motion)
+ * back into it in place, exactly like UISlider.value / UIToggle.is_on.
+ * Embeds its OWN RectTransform so it needs no sibling UIImage to be laid
+ * out / raycast.  POD only (no renderer / bgfx types). */
+typedef struct {
+    char  text[256];           /* current value (canvas writes this back) */
+    char  placeholder[128];    /* shown (greyed) when text empty & unfocused */
+    int   content_type;        /* 0=any 1=integer 2=decimal 3=alphanumeric */
+    int   char_limit;          /* max chars; 0 ⇒ buffer cap (255) */
+    bool  is_password;         /* render as '*' (value stored in clear) */
+    bool  read_only;           /* focusable but text input is ignored */
+    bool  interactable;        /* false ⇒ cannot be focused */
+    float bg_color[4];         /* background quad */
+    float text_color[4];       /* entered-text colour */
+    float placeholder_color[4];/* placeholder colour */
+    float caret_color[4];      /* blinking caret quad */
+    float font_size;           /* px; 0 ⇒ default ~16 */
+    char  font_path[256];
+    char  on_submit[128];        /* script handler name (RETURN; placeholder) */
+    char  on_value_changed[128]; /* script handler name (edit; placeholder) */
+    JceRectTransform rect;     /* layout (see JceRectTransform) */
+} JceUIInputFieldComponent;
+
+/* ── UI: ScrollView (clipped, scrollable content viewport) ─────────
+ *
+ * A CONTAINER widget: its descendants are OFFSET by -scroll_position and
+ * CLIPPED to the viewport (the ScrollView's own resolved rect) so content
+ * larger than the rect (lists, inventories, chat logs) can scroll.  The
+ * canvas tracks the scroll-view under the pointer and applies wheel deltas
+ * to `scroll_position`, clamping each axis to [0, max(0, content-viewport)]
+ * and WRITING IT BACK in place (Unity model: the widget is the source of
+ * truth, exactly like UISlider.value / UIInputField.text).  Embeds its OWN
+ * RectTransform so it needs no sibling UIImage to be laid out / raycast.
+ * POD only (no renderer / bgfx types). */
+typedef struct {
+    float content_size[2];     /* px extent of scrollable content; 0 ⇒ treat as viewport size (no scroll) */
+    float scroll_position[2];  /* current px offset (canvas writes back); clamped [0, max(0,content-viewport)] */
+    bool  horizontal;          /* enable horizontal scroll axis */
+    bool  vertical;            /* enable vertical scroll axis */
+    float scroll_sensitivity;  /* px per wheel notch; 0 ⇒ default ~30 */
+    bool  show_scrollbar;      /* draw scrollbar track + thumb */
+    float scrollbar_thickness; /* px; 0 ⇒ default ~8 */
+    float bg_color[4];         /* viewport background quad */
+    float scrollbar_color[4];  /* scrollbar thumb quad */
+    float scrollbar_bg_color[4];/* scrollbar track quad */
+    bool  interactable;        /* false ⇒ wheel/drag ignored */
+    JceRectTransform rect;     /* layout (see JceRectTransform) */
+} JceUIScrollViewComponent;
+
+/* ── UI: ProgressBar (read-only fill bar) ──────────────────────────
+ *
+ * A purely visual fill widget (loading/health/XP bars).  Unlike UISlider it
+ * is NOT interactive: the canvas only DRAWS it (bg quad + a fill quad sized
+ * by clamp((value-min)/(max-min)) along `direction`) and never hit-tests or
+ * mutates it — `value` is driven entirely by gameplay/script.  Embeds its OWN
+ * RectTransform so it needs no sibling UIImage to be laid out.  POD only. */
+typedef struct {
+    float value;            /* current fill value (read-only; gameplay sets) */
+    float min_value;
+    float max_value;
+    int   direction;        /* 0=L→R, 1=R→L, 2=B→T, 3=T→B */
+    float bg_color[4];      /* track background quad */
+    float fill_color[4];    /* filled portion quad */
+    char  fill_sprite[256]; /* optional sprite for the fill quad */
+    JceRectTransform rect;  /* layout (see JceRectTransform) */
+} JceUIProgressBarComponent;
+
+/* ── UI: Dropdown (expandable option selector) ─────────────────────
+ *
+ * A click on the collapsed main rect toggles `expanded`; while expanded a
+ * click on an option row sets `selected_index` and collapses, and a click
+ * OUTSIDE collapses without changing selection.  The canvas writes both
+ * `selected_index` and `expanded` back into the component in place (Unity
+ * source-of-truth model, exactly like UISlider.value / UIToggle.is_on).
+ * Embeds its OWN RectTransform so it needs no sibling UIImage.  POD only. */
+typedef struct {
+    char  options[8][64];     /* option labels (up to JCE_UI_DROPDOWN_MAX_OPTIONS) */
+    int   option_count;       /* number of valid options (0..8) */
+    int   selected_index;     /* current selection (canvas writes this back) */
+    bool  expanded;           /* popup open state (canvas writes this back) */
+    bool  interactable;       /* false ⇒ clicks ignored (cannot expand) */
+    float bg_color[4];        /* collapsed main-rect background quad */
+    float text_color[4];      /* selected/option label colour */
+    float popup_color[4];     /* expanded option-list background quad */
+    float highlight_color[4]; /* hovered/selected option-row highlight quad */
+    float font_size;          /* px; 0 ⇒ default ~16 */
+    char  font_path[256];
+    char  on_value_changed[128]; /* script handler name (placeholder) */
+    JceRectTransform rect;    /* layout (see JceRectTransform) */
+} JceUIDropdownComponent;
+
+enum { JCE_UI_DROPDOWN_MAX_OPTIONS = 8 };
+
 /* ── Network object component (P3-D.3) ────────────────────────────
  *
  * Tags an entity as networked. `net_id` and `owner` mirror
@@ -1263,12 +1656,31 @@ typedef struct {
  * mask. The runtime evaluator lands in P5; today this only stores authoring
  * intent so scenes round-trip and the inspector can show the configuration.
  */
+/* One additive/override animation layer authored on the Avatar (FEATURE 3.3).
+ * Composed on top of the SkeletalAnimator's base pose by the scene renderer
+ * via jce_anim_player_blend_layers: each layer samples `clip` (looked up by
+ * name in the model), optionally masked by `mask_path` (.mask asset), scaled
+ * by `weight`, and composited per `mode`. */
+typedef struct {
+    char  clip[64];                   /* clip name in the rigged model */
+    char  mask_path[128];             /* optional .mask asset (empty = all bones) */
+    float weight;                     /* 0..1 layer weight */
+    int   mode;                       /* 0 = additive, 1 = masked override
+                                         (matches JceAnimLayerMode) */
+} JceAvatarLayer;
+
+#define JCE_AVATAR_MAX_LAYERS 4
+
 typedef struct {
     char     avatar_path[128];        /* .avatar asset */
     char     mask_path  [128];        /* optional .mask asset */
     char     override_controller[128];/* optional anim override controller */
     bool     apply_root_motion;
     bool     human_rig;               /* false = generic */
+    /* Additive/override layer stack (FEATURE 3.3). layer_count layers are
+       composited over the SkeletalAnimator's base pose during Play. */
+    int            layer_count;
+    JceAvatarLayer layers[JCE_AVATAR_MAX_LAYERS];
 } JceAvatarComponent;
 
 /* ── Volume component (P4-C — post-FX blending volumes, flag 62) ── */
@@ -1343,6 +1755,247 @@ typedef struct {
     bool     started;
     uint64_t opened_hash;       /* FNV-1a of seq_path the runtime opened with */
 } JceSequencePlayerComponent;
+
+/* ── Morph weights (per-instance blendshape authoring, FEATURE 3.1) ──
+ *
+ * Closes the morph last-mile: a designer pins STATIC per-instance morph-target
+ * weights on a skinned/morph-target entity (e.g. a permanent "smile" 0.7).
+ * `weights[i]` is target i's authored weight; a bit set in `override_mask`
+ * means that target's authored value OVERRIDES any animation-track value
+ * (so a designer can pin a blendshape to exactly 0.0).  The scene renderer
+ * combines these with the clip-driven track weights via
+ * jce_morph_resolve_weights before jce_morph_apply.
+ *
+ * `count` is how many sliders the inspector exposed (== the model's morph
+ * target count, clamped); it bounds resolution/serialization.  There is NO
+ * JCE_COMP_FLAG bit — the 64-bit flag field is full; presence-gated like
+ * VideoPlayer/NavAgent/SequencePlayer. No component present -> the renderer
+ * morph path is byte-identical to today (track-only / inert). */
+typedef struct {
+    int      count;                          /* authored target count (0..MAX) */
+    uint32_t override_mask;                   /* bit t set => weights[t] overrides track */
+    float    weights[JCE_MORPH_MAX_WEIGHTS]; /* per-target static weight 0..1   */
+} JceMorphWeightsComponent;
+
+/* ── Network variable authoring (FEATURE 7.2 last-mile) ──────────────
+ *
+ * Closes the networking authoring gap: typed NetworkVariables already exist
+ * as ENGINE flecs components (JceNetVarF32/I32) replicated on the snapshot
+ * substrate (authority gate, OnValueChanged, delta/baseline/late-joiner) —
+ * but a DESIGNER could not, in the editor, mark an entity as carrying a
+ * replicated variable.  This authorable scene component is that mark: it
+ * records WHICH typed variable an entity carries, under WHICH authority,
+ * with an initial value.  At Play the runtime net bridge reads it and
+ * registers the matching typed NetVar for replication via the public net
+ * API (jce_net_var_f32_set / jce_net_var_i32_set under the authored
+ * authority).  There is NO JCE_COMP_FLAG bit — the 64-bit flag field is
+ * full; presence-gated like VideoPlayer/NavAgent/SequencePlayer/MorphWeights.
+ * No component present -> the runtime net path is byte-identical to today. */
+typedef enum {
+    JCE_NETVAR_AUTHOR_TYPE_F32  = 0,   /* replicated 32-bit float       */
+    JCE_NETVAR_AUTHOR_TYPE_I32  = 1,   /* replicated 32-bit signed int  */
+    JCE_NETVAR_AUTHOR_TYPE_BOOL = 2    /* replicated bool (wire: i32 0/1) */
+} JceNetVarAuthorType;
+
+typedef enum {
+    JCE_NETVAR_AUTHOR_AUTH_SERVER = 0, /* server is authoritative        */
+    JCE_NETVAR_AUTHOR_AUTH_CLIENT = 1, /* any owning client may write    */
+    JCE_NETVAR_AUTHOR_AUTH_OWNER  = 2  /* only the owner client may write */
+} JceNetVarAuthorAuthority;
+
+typedef struct {
+    char    var_name[64];   /* designer label for the replicated variable     */
+    uint8_t var_type;       /* JceNetVarAuthorType (F32 / I32 / Bool)         */
+    uint8_t authority;      /* JceNetVarAuthorAuthority (Server/Client/Owner) */
+    float   initial_value;  /* covers F32 directly; I32 via round, Bool via !=0 */
+} JceNetworkVariableComponent;
+
+/* ── Gameplay Ability System authoring (consumption last-mile) ───────
+ *
+ * Closes the GAS authoring gap: the GAS CORE (engine/middleware/world
+ * jce_gas.h — attributes/effects/abilities, deterministic, headless) is done
+ * and tested, but a DESIGNER could not, in the editor, mark an entity as
+ * carrying an ability system, and a SCRIPT could not act on a live one.  This
+ * authorable scene component is the SETUP: it records the entity's attribute
+ * table (name/base/min/max) and ability table (name/id/cost-attr/cost/cooldown)
+ * — the serializable definition, NOT the transient runtime active-effects /
+ * cooldown state.  At Play the runtime (rt_spawn_gameplay) reads it, inits a
+ * live per-entity JceGameplayAbilitySystem from these tables, ticks it each
+ * frame (jce_gas_tick), and exposes it to scripts (jce.gas_activate /
+ * jce.gas_get / jce.gas_apply) via jce_runtime_entity_gas.
+ *
+ * The capacities here are deliberately SMALLER than (and independent of) the
+ * GAS core caps so that scene bytes stay stable regardless of any later core
+ * cap change; the runtime clamps when copying into the live system.  There is
+ * NO JCE_COMP_FLAG bit — the 64-bit flag field is full; presence-gated like
+ * VideoPlayer/NavAgent/SequencePlayer/MorphWeights/NetworkVariable.  No
+ * component present -> the runtime gameplay path is byte-identical to today. */
+#define JCE_GAS_AUTHOR_MAX_ATTRIBUTES 16
+#define JCE_GAS_AUTHOR_MAX_ABILITIES  16
+#define JCE_GAS_AUTHOR_NAME_LEN       64
+
+typedef struct {
+    char  name[JCE_GAS_AUTHOR_NAME_LEN]; /* attribute label (e.g. "Health")    */
+    float base;                          /* persistent stored value            */
+    float min;                           /* clamp floor                        */
+    float max;                           /* clamp ceiling                      */
+} JceGasAttributeAuthor;
+
+typedef struct {
+    char     name[JCE_GAS_AUTHOR_NAME_LEN]; /* ability label                   */
+    uint32_t id;                            /* caller identity (script handle)  */
+    int32_t  cost_attr_idx;                 /* -1 = free; else attribute index  */
+    float    cost_magnitude;                /* deducted from base on activate   */
+    float    cooldown_seconds;              /* re-activation gate               */
+} JceGasAbilityAuthor;
+
+typedef struct {
+    int32_t               attribute_count;  /* 0..JCE_GAS_AUTHOR_MAX_ATTRIBUTES */
+    JceGasAttributeAuthor attributes[JCE_GAS_AUTHOR_MAX_ATTRIBUTES];
+    int32_t               ability_count;    /* 0..JCE_GAS_AUTHOR_MAX_ABILITIES  */
+    JceGasAbilityAuthor   abilities[JCE_GAS_AUTHOR_MAX_ABILITIES];
+} JceGameplayAbilitySystemComponent;
+
+/* ── Ragdoll authoring (skeleton-driven physics, scene-pass last-mile) ──
+ *
+ * Closes the ragdoll authoring gap: the ragdoll CORE (engine/src/middleware/
+ * animation jce_ragdoll.{h,c} — a per-bone dynamic body chain built from a
+ * skeleton's bind pose, stepped in a JcePhysicsWorld, with an
+ * animation<->physics blend weight) is done and unit-tested, but a DESIGNER
+ * could not mark a skeletal-animator entity as carrying a ragdoll.  This
+ * authorable scene component is that mark + its tuning.
+ *
+ * At Play the runtime (rt_spawn_gameplay) reads it, loads the entity's
+ * SkeletalAnimator skeleton, builds a live JceRagdoll in rt->physics, drives
+ * the bodies toward the source pose BEFORE jce_physics_step (sync_from) and
+ * publishes the resolved per-bone LOCAL pose back into the SHARED scene via the
+ * transient JceRagdollPoseRelay AFTER the step (sync_to).  The scene renderer
+ * reads ONLY that relay and feeds it through jce_skeleton_evaluate into the skin
+ * palette — it never touches physics, keeping the scene layer physics-agnostic.
+ *
+ *   blend_weight = 1 : full animation drive (bodies track the source pose).
+ *   blend_weight = 0 : full physics (the body chain collapses — death blend).
+ *
+ * There is NO JCE_COMP_FLAG bit — the 64-bit flag field is full; presence-gated
+ * like VideoPlayer/NavAgent/SequencePlayer/MorphWeights/NetworkVariable/GAS.
+ * No component present -> the runtime + renderer paths are byte-identical to
+ * today (zero ragdolls -> the hot loop is unchanged). */
+typedef struct {
+    bool     enable;        /* designer toggle (runtime spawns only if true)   */
+    float    blend_weight;  /* 1 = animation, 0 = physics; live-editable        */
+    float    radius;        /* per-bone capsule radius (metres)                 */
+    float    height_scale;  /* scales each capsule length vs the bind segment   */
+    uint32_t reserved[4];   /* forward-compat padding (serialized as zeros)     */
+} JceRagdollComponent;
+
+/* ── Ragdoll pose relay (TRANSIENT runtime pose hand-off, NOT serialized) ──
+ *
+ * The runtime publishes the ragdoll's resolved per-bone LOCAL transforms here
+ * each step; the scene renderer reads them and evaluates them into the skin
+ * palette.  It carries ONLY public math (jce_mat4) + POD — NO physics types —
+ * so BOTH the application layer (runtime) and the scene layer (renderer) compile
+ * against it without a layer-up dependency.  It is registered as a flecs
+ * component but is explicitly EXCLUDED from scene serialization (it is runtime-
+ * only state that is rebuilt every frame). */
+typedef struct {
+    jce_mat4 locals[JCE_MAX_BONES]; /* per-joint LOCAL transforms (sync_to_pose) */
+    uint32_t count;                 /* number of valid joints in locals[]        */
+    bool     valid;                 /* true once the runtime has published a pose */
+} JceRagdollPoseRelay;
+
+/* ── Fracture / destruction authoring (Voronoi shatter, opt-in) ──────
+ *
+ * Marks an entity as FRACTURABLE: when it breaks, its intact rigid body is
+ * destroyed and replaced by `fragment_count` dynamic CONVEX_HULL fragment
+ * bodies produced by a deterministic Voronoi box-shatter of the entity's AABB
+ * (engine/middleware/physics jce_fracture.{h,c}).  The fragments inherit the
+ * parent body's velocity (plus a small outward impulse) and get
+ * mass = density * cell_volume.
+ *
+ * The break is triggered explicitly via jce_runtime_fracture_entity() (and may
+ * be auto-triggered from a hard contact in a follow-up — see runtime).  The
+ * body-swap is performed POST-step (deferred), never mid-step, so Bullet's
+ * solver is never mutated mid-solve.
+ *
+ * `enabled` is the GATE: default OFF.  No component (or enabled == false) ->
+ * the runtime fracture path is never entered and the frame is byte-identical to
+ * today.  There is NO JCE_COMP_FLAG bit — the 64-bit flag field is full;
+ * presence-gated like Ragdoll/GAS/MorphWeights. */
+typedef struct {
+    bool     enabled;        /* designer toggle (default OFF -> inert)          */
+    int      fragment_count; /* Voronoi seeds == fragment count (default 8)     */
+    float    break_impulse;  /* contact impulse / rel-velocity break threshold  */
+    float    density;        /* fragment mass = density * cell volume (kg/m^3)  */
+    uint32_t seed;           /* deterministic shatter seed (default 12345)      */
+    uint32_t reserved[3];    /* forward-compat padding (serialized as zeros)    */
+} JceFractureComponent;
+
+/* ── Vehicle chassis authoring (btRaycastVehicle, opt-in) ────────────
+ *
+ * Marks an entity as the CHASSIS of a raycast vehicle.  When enabled, the
+ * runtime (rt_try_spawn_vehicle) creates a single dynamic chassis rigid body
+ * via the engine vehicle API (jce_physics_vehicle_*) and attaches wheels: one
+ * per child entity carrying a JceWheelColliderComponent, or — when the chassis
+ * has no wheel-collider children — four default wheels synthesized at the
+ * chassis corners so a bare vehicle entity still drives.  The chassis box,
+ * mass and drive forces below override the engine defaults.
+ *
+ * `enabled` is the GATE: default OFF.  No component (or enabled == false) ->
+ * the entity spawns as a normal rigid body and the frame is byte-identical to
+ * today.  Like Fracture/Ragdoll this is presence-gated — there is NO
+ * JCE_COMP_FLAG bit (the 64-bit flag field is full).
+ *
+ * POD only: no physics types leak into this scene header. */
+enum {
+    JCE_VEHICLE_DRIVE_RWD = 0,   /* rear-wheel drive (default)      */
+    JCE_VEHICLE_DRIVE_FWD = 1,   /* front-wheel drive               */
+    JCE_VEHICLE_DRIVE_AWD = 2,   /* all-wheel drive                 */
+};
+enum {
+    JCE_VEHICLE_INPUT_SCRIPT = 0, /* driven by script/host API only */
+    JCE_VEHICLE_INPUT_PLAYER = 1, /* auto-mapped from player input  */
+};
+typedef struct {
+    bool     enabled;                /* designer toggle (default OFF -> inert)   */
+    float    chassis_half_extents[3];/* (0,0,0) = derive from BoxCollider/default*/
+    float    chassis_mass;           /* kg; <=0 -> default 1500                  */
+    float    max_engine_force;       /* N;  <=0 -> default 4000                  */
+    float    max_brake_force;        /* N per wheel; <=0 -> default 100          */
+    float    max_steering_deg;       /* deg; <=0 -> default 30                   */
+    int      drive_mode;             /* JCE_VEHICLE_DRIVE_* (default RWD)        */
+    int      input_mode;             /* JCE_VEHICLE_INPUT_* (default PLAYER)     */
+    uint32_t reserved;               /* forward-compat padding (=0)              */
+} JceVehicleComponent;
+
+/* ── Volumetric / pressure soft-body authoring (presence-gated, opt-in) ──
+ *
+ * Marks an entity as a CLOSED-volume "squishy" soft body (a pressurised
+ * ellipsoid shell that compresses on impact and rebounds), complementing the
+ * surface Cloth component.  When enabled, the runtime (rt_try_spawn_softbody)
+ * creates the body in the shared secondary soft world via the public soft-body
+ * API (jce_softbody_*) at the entity transform, mirrors the scene's static box
+ * colliders into that world so the body can rest on the ground, and writes the
+ * body's centroid back to the entity Transform each step.
+ *
+ * `enabled` is the GATE: default OFF.  No component (or enabled == false) ->
+ * the entity spawns as a normal rigid body and the frame is byte-identical to
+ * today.  Like Vehicle/Fracture/Ragdoll this is presence-gated — there is NO
+ * JCE_COMP_FLAG bit (the 64-bit flag field is full).
+ *
+ * POD only: no physics types leak into this scene header. */
+typedef struct {
+    bool     enabled;          /* designer toggle (default OFF -> inert)        */
+    float    radius[3];        /* per-axis ellipsoid radii (default 0.5 each)   */
+    float    mass;             /* kg; <=0 -> default 1                          */
+    float    pressure;         /* kPR; >0 resists volume loss (squish)          */
+    float    stiffness_linear; /* 0..1 (Bullet kLST)                            */
+    float    stiffness_volume; /* 0..1 (Bullet kVST)                            */
+    float    damping;          /* 0..1 (Bullet kDP)                             */
+    float    friction;         /* 0..1 (Bullet kDF)                             */
+    int      resolution;       /* node density (e.g. 64..256); default 96       */
+    bool     self_collision;   /* expensive cluster self-collision; off = cheap */
+    uint32_t reserved;         /* forward-compat padding (=0)                   */
+} JceSoftBodyComponent;
 
 /* ── Component type flags (bitmask for enumeration) ──────────────── */
 
@@ -1508,11 +2161,37 @@ JCE_API jce_mat4  jce_scene_get_world_matrix(const JceScene *s, JceEntity e);
  * cached matrix. Cheap and idempotent. */
 JCE_API void      jce_scene_invalidate_world_cache(JceScene *s);
 
+/* Floating-origin rebase: add `shift` (metres, float[3]) to the LOCAL position
+ * of every ROOT entity (one with no parent) that carries a JceTransform, then
+ * invalidate the world-matrix cache once.  Children are parent-relative and
+ * MUST NOT be shifted — they follow automatically through the hierarchy, which
+ * preserves all relative geometry (a parent and child shift together by exactly
+ * `shift`).  This is the scene-side primitive the runtime's floating-origin
+ * rebase drives (see jce_world_origin.h); it is pure transform mutation and can
+ * be exercised headlessly.  NULL scene or an all-zero shift is a no-op (it does
+ * not even bump the world epoch, so it cannot churn the cache). */
+JCE_API void      jce_scene_apply_world_shift(JceScene *s, const float shift[3]);
+
 /* Component access — Transform. */
 JCE_API void           jce_scene_set_transform(JceScene *s, JceEntity e, const JceTransform *t);
 JCE_API JceTransform  *jce_scene_get_transform(JceScene *s, JceEntity e);
 JCE_API bool           jce_scene_has_transform(const JceScene *s, JceEntity e);
 JCE_API void           jce_scene_remove_transform(JceScene *s, JceEntity e);
+
+/* Component access — Pivot. */
+JCE_API void               jce_scene_set_pivot(JceScene *s, JceEntity e, const JcePivotComponent *p);
+JCE_API JcePivotComponent *jce_scene_get_pivot(JceScene *s, JceEntity e);
+JCE_API bool               jce_scene_has_pivot(const JceScene *s, JceEntity e);
+JCE_API void               jce_scene_remove_pivot(JceScene *s, JceEntity e);
+
+/* Maya-style pivot editing helpers. These move only the pivot while keeping
+ * the rendered model matrix unchanged, so geometry does not jump when the
+ * editor enters pivot-edit mode and the user drags the handle. */
+JCE_API jce_vec3 jce_scene_get_pivot_world_position(const JceScene *s, JceEntity e);
+JCE_API void     jce_scene_set_pivot_world_position_preserve_model(
+    JceScene *s, JceEntity e, jce_vec3 world_position);
+JCE_API void     jce_scene_set_pivot_local_position_preserve_model(
+    JceScene *s, JceEntity e, jce_vec3 local_position);
 
 /* Component access — MeshRenderer. */
 JCE_API void               jce_scene_set_mesh_renderer(JceScene *s, JceEntity e, const JceMeshRenderer *mr);
@@ -1616,6 +2295,12 @@ JCE_API JceAudioSourceComponent      *jce_scene_get_audio_source(JceScene *s, Jc
 JCE_API bool                          jce_scene_has_audio_source(const JceScene *s, JceEntity e);
 JCE_API void                          jce_scene_remove_audio_source(JceScene *s, JceEntity e);
 
+/* Component access — MusicTrack (adaptive music director shim). */
+JCE_API void                          jce_scene_set_music_track(JceScene *s, JceEntity e, const JceMusicTrackComponent *c);
+JCE_API JceMusicTrackComponent       *jce_scene_get_music_track(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_music_track(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_music_track(JceScene *s, JceEntity e);
+
 /* Component access — VideoPlayer (video-as-texture). */
 JCE_API void                          jce_scene_set_video_player(JceScene *s, JceEntity e, const JceVideoPlayerComponent *c);
 JCE_API JceVideoPlayerComponent      *jce_scene_get_video_player(JceScene *s, JceEntity e);
@@ -1664,6 +2349,27 @@ JCE_API void                          jce_scene_remove_particle_emitter(JceScene
  * jce_scene_update so it reads the freshest transforms. */
 JCE_API void jce_scene_particles_update(JceScene *s, float dt);
 
+/* Per-entity particle control (gameplay scripting last-mile).
+ *
+ * Drive the live emitter backing entity `e`'s JceParticleEmitterComponent
+ * WITHOUT exposing the renderer particle types: the scene maps the entity to
+ * its emitter handle inside the scene-owned JceParticleSystem and forwards to
+ * jce_particles_emitter_{burst,start,stop}.  These are the seam scripts reach
+ * through jce.particle_burst / jce.particle_set_emitting.
+ *
+ * Tolerant by design (all return void, no crash):
+ *   - No-op when `s` is NULL, the entity has no JceParticleEmitterComponent, the
+ *     emitter has not been built yet (the scene builds it on the next
+ *     jce_scene_particles_update tick), or the component is GPU-routed (the
+ *     CPU emitter handle is absent in that case).
+ *
+ * jce_scene_particle_burst : fire a one-shot burst of `count` particles (count
+ *                            <= 0 is a no-op).
+ * jce_scene_particle_set_emitting : start (`on`) continuous emission, or stop
+ *                            it (!on) — stopping lets live particles age out. */
+JCE_API void jce_scene_particle_burst(JceScene *s, JceEntity e, int count);
+JCE_API void jce_scene_particle_set_emitting(JceScene *s, JceEntity e, bool on);
+
 /* Release the scene-owned particle system (called from jce_scene_destroy). */
 JCE_API void jce_scene_particles_shutdown(JceScene *s);
 
@@ -1684,6 +2390,24 @@ JCE_API void                          jce_scene_set_terrain(JceScene *s, JceEnti
 JCE_API JceTerrainComponent          *jce_scene_get_terrain(JceScene *s, JceEntity e);
 JCE_API bool                          jce_scene_has_terrain(const JceScene *s, JceEntity e);
 JCE_API void                          jce_scene_remove_terrain(JceScene *s, JceEntity e);
+
+/* Component access — Vegetation Scatter (foliage / grass / trees). */
+JCE_API void                          jce_scene_set_vegetation_scatter(JceScene *s, JceEntity e, const JceVegetationScatterComponent *c);
+JCE_API JceVegetationScatterComponent *jce_scene_get_vegetation_scatter(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_vegetation_scatter(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_vegetation_scatter(JceScene *s, JceEntity e);
+
+/* Component access — Water (Gerstner surface). */
+JCE_API void                          jce_scene_set_water(JceScene *s, JceEntity e, const JceWaterComponent *c);
+JCE_API JceWaterComponent            *jce_scene_get_water(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_water(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_water(JceScene *s, JceEntity e);
+
+/* Component access — Buoyancy (floats a dynamic body on the water surface). */
+JCE_API void                          jce_scene_set_buoyancy(JceScene *s, JceEntity e, const JceBuoyancyComponent *c);
+JCE_API JceBuoyancyComponent         *jce_scene_get_buoyancy(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_buoyancy(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_buoyancy(JceScene *s, JceEntity e);
 
 /* Component access — LOD Group. */
 JCE_API void                          jce_scene_set_lod_group(JceScene *s, JceEntity e, const JceLodGroupComponent *c);
@@ -1859,6 +2583,48 @@ JCE_API JceUIButtonComponent         *jce_scene_get_ui_button(JceScene *s, JceEn
 JCE_API bool                          jce_scene_has_ui_button(const JceScene *s, JceEntity e);
 JCE_API void                          jce_scene_remove_ui_button(JceScene *s, JceEntity e);
 
+/* Component access — UI Slider.  get returns a MUTABLE pointer: the canvas
+ * writes the dragged value back into `value`. */
+JCE_API void                          jce_scene_set_ui_slider(JceScene *s, JceEntity e, const JceUISliderComponent *c);
+JCE_API JceUISliderComponent         *jce_scene_get_ui_slider(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_ui_slider(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_ui_slider(JceScene *s, JceEntity e);
+
+/* Component access — UI Toggle.  get returns a MUTABLE pointer: the canvas
+ * flips `is_on` on click. */
+JCE_API void                          jce_scene_set_ui_toggle(JceScene *s, JceEntity e, const JceUIToggleComponent *c);
+JCE_API JceUIToggleComponent         *jce_scene_get_ui_toggle(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_ui_toggle(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_ui_toggle(JceScene *s, JceEntity e);
+
+/* Component access — UI InputField.  get returns a MUTABLE pointer: the
+ * canvas writes edits (insert / delete / caret) back into `text`. */
+JCE_API void                          jce_scene_set_ui_input_field(JceScene *s, JceEntity e, const JceUIInputFieldComponent *c);
+JCE_API JceUIInputFieldComponent     *jce_scene_get_ui_input_field(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_ui_input_field(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_ui_input_field(JceScene *s, JceEntity e);
+
+/* Component access — UI ScrollView.  get returns a MUTABLE pointer: the
+ * canvas writes the scrolled offset back into `scroll_position`. */
+JCE_API void                          jce_scene_set_ui_scroll_view(JceScene *s, JceEntity e, const JceUIScrollViewComponent *c);
+JCE_API JceUIScrollViewComponent     *jce_scene_get_ui_scroll_view(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_ui_scroll_view(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_ui_scroll_view(JceScene *s, JceEntity e);
+
+/* Component access — UI ProgressBar.  Read-only at runtime: the canvas only
+ * draws it, never mutates it (gameplay/script writes `value`). */
+JCE_API void                          jce_scene_set_ui_progress_bar(JceScene *s, JceEntity e, const JceUIProgressBarComponent *c);
+JCE_API JceUIProgressBarComponent    *jce_scene_get_ui_progress_bar(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_ui_progress_bar(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_ui_progress_bar(JceScene *s, JceEntity e);
+
+/* Component access — UI Dropdown.  get returns a MUTABLE pointer: the canvas
+ * writes `selected_index` and `expanded` back on click. */
+JCE_API void                          jce_scene_set_ui_dropdown(JceScene *s, JceEntity e, const JceUIDropdownComponent *c);
+JCE_API JceUIDropdownComponent       *jce_scene_get_ui_dropdown(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_ui_dropdown(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_ui_dropdown(JceScene *s, JceEntity e);
+
 /* ── Network object (P3-D.3) ─────────────────────────────────────── */
 JCE_API void                          jce_scene_set_network_object(JceScene *s, JceEntity e, const JceNetworkObjectComponent *c);
 JCE_API JceNetworkObjectComponent    *jce_scene_get_network_object(JceScene *s, JceEntity e);
@@ -1956,6 +2722,18 @@ JCE_API JceIkConstraintComponent     *jce_scene_get_ik_constraints(JceScene *s, 
 JCE_API bool                          jce_scene_has_ik_constraints(const JceScene *s, JceEntity e);
 JCE_API void                          jce_scene_remove_ik_constraints(JceScene *s, JceEntity e);
 
+/* ── Foot IK (presence-gated, no flag bit) ───────────────────────────
+ * No JCE_COMP_FLAG bit — the 64-bit flag space is full; presence-gated
+ * like IkConstraints/NavAgent. */
+JCE_API void                          jce_scene_set_foot_ik(JceScene *s, JceEntity e, const JceFootIkComponent *c);
+JCE_API JceFootIkComponent           *jce_scene_get_foot_ik(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_foot_ik(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_foot_ik(JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_set_full_body_ik(JceScene *s, JceEntity e, const JceFullBodyIkComponent *c);
+JCE_API JceFullBodyIkComponent       *jce_scene_get_full_body_ik(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_full_body_ik(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_full_body_ik(JceScene *s, JceEntity e);
+
 /* ── Sequence player (presence-gated, no flag bit) ───────────────────
  * No JCE_COMP_FLAG bit — the 64-bit flag space is full; presence-gated
  * like VideoPlayer/NavAgent/IkConstraints. */
@@ -1963,6 +2741,119 @@ JCE_API void                          jce_scene_set_sequence_player(JceScene *s,
 JCE_API JceSequencePlayerComponent   *jce_scene_get_sequence_player(JceScene *s, JceEntity e);
 JCE_API bool                          jce_scene_has_sequence_player(const JceScene *s, JceEntity e);
 JCE_API void                          jce_scene_remove_sequence_player(JceScene *s, JceEntity e);
+
+/* ── Morph weights (presence-gated, no flag bit) ─────────────────────
+ * Per-instance static blendshape weights; presence-gated like
+ * VideoPlayer/NavAgent/SequencePlayer (the 64-bit flag space is full). */
+JCE_API void                          jce_scene_set_morph_weights(JceScene *s, JceEntity e, const JceMorphWeightsComponent *c);
+JCE_API JceMorphWeightsComponent     *jce_scene_get_morph_weights(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_morph_weights(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_morph_weights(JceScene *s, JceEntity e);
+
+/* ── Network variable authoring (FEATURE 7.2, presence-gated, no flag) ──
+ * Designer-authored mark that an entity carries a replicated typed
+ * variable; the runtime net bridge registers the matching typed NetVar at
+ * Play.  Presence-gated like MorphWeights (the 64-bit flag space is full). */
+JCE_API void                          jce_scene_set_network_variable(JceScene *s, JceEntity e, const JceNetworkVariableComponent *c);
+JCE_API JceNetworkVariableComponent  *jce_scene_get_network_variable(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_network_variable(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_network_variable(JceScene *s, JceEntity e);
+
+/* ── Gameplay Ability System authoring (presence-gated, no flag) ──────
+ * Designer-authored attribute + ability tables; the runtime inits a live
+ * JceGameplayAbilitySystem from them at Play (rt_spawn_gameplay) and exposes
+ * it to scripts via jce_runtime_entity_gas.  Presence-gated like
+ * MorphWeights/NetworkVariable (the 64-bit flag space is full). */
+JCE_API void                               jce_scene_set_gas(JceScene *s, JceEntity e, const JceGameplayAbilitySystemComponent *c);
+JCE_API JceGameplayAbilitySystemComponent *jce_scene_get_gas(JceScene *s, JceEntity e);
+JCE_API bool                               jce_scene_has_gas(const JceScene *s, JceEntity e);
+JCE_API void                               jce_scene_remove_gas(JceScene *s, JceEntity e);
+
+/* ── Ragdoll authoring (presence-gated, no flag) ─────────────────────
+ * Designer-authored ragdoll mark + tuning; the runtime builds a live
+ * JceRagdoll from it at Play (rt_spawn_gameplay) and publishes its pose
+ * through the relay below.  Presence-gated like MorphWeights/GAS (the 64-bit
+ * flag space is full). */
+JCE_API void                          jce_scene_set_ragdoll(JceScene *s, JceEntity e, const JceRagdollComponent *c);
+JCE_API JceRagdollComponent          *jce_scene_get_ragdoll(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_ragdoll(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_ragdoll(JceScene *s, JceEntity e);
+
+/* ── Fracture / destruction authoring (presence-gated, no flag) ──────
+ * Designer-authored "this entity shatters" mark + tuning; the runtime swaps
+ * the intact body for Voronoi fragment bodies on break (jce_runtime_fracture_
+ * entity).  Default disabled -> the runtime fracture path is never entered.
+ * Presence-gated like Ragdoll/GAS/MorphWeights (the 64-bit flag space is full). */
+JCE_API void                          jce_scene_set_fracture(JceScene *s, JceEntity e, const JceFractureComponent *c);
+JCE_API JceFractureComponent         *jce_scene_get_fracture(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_fracture(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_fracture(JceScene *s, JceEntity e);
+
+/* ── Vehicle chassis authoring (presence-gated, no flag) ─────────────
+ * Designer-authored "this entity is a raycast-vehicle chassis" mark + tuning;
+ * the runtime (rt_try_spawn_vehicle) builds the chassis body + wheels via the
+ * engine vehicle API.  Default disabled -> the entity spawns as a normal rigid
+ * body.  Presence-gated like Ragdoll/Fracture/GAS (the 64-bit flag space is full). */
+JCE_API void                          jce_scene_set_vehicle(JceScene *s, JceEntity e, const JceVehicleComponent *c);
+JCE_API JceVehicleComponent          *jce_scene_get_vehicle(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_vehicle(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_vehicle(JceScene *s, JceEntity e);
+
+/* ── Volumetric / pressure soft-body authoring (presence-gated, no flag) ──
+ * Designer-authored "this entity is a squishy pressure soft body" mark + tuning;
+ * the runtime (rt_try_spawn_softbody) builds the body in the shared soft world.
+ * Default disabled -> the entity spawns as a normal rigid body.  Presence-gated
+ * like Vehicle/Fracture/Ragdoll (the 64-bit flag space is full). */
+JCE_API void                          jce_scene_set_soft_body(JceScene *s, JceEntity e, const JceSoftBodyComponent *c);
+JCE_API JceSoftBodyComponent         *jce_scene_get_soft_body(JceScene *s, JceEntity e);
+JCE_API bool                          jce_scene_has_soft_body(const JceScene *s, JceEntity e);
+JCE_API void                          jce_scene_remove_soft_body(JceScene *s, JceEntity e);
+
+/* ── Ragdoll pose relay (TRANSIENT, NOT serialized) ──────────────────
+ * The runtime publishes the ragdoll's resolved per-bone LOCAL pose here each
+ * physics step; the scene renderer reads it and evaluates it into the skin
+ * palette.  Carries only jce_mat4 (public math), so it crosses no layer
+ * boundary in either direction.  Excluded from scene save/load. */
+JCE_API void jce_scene_set_ragdoll_pose(JceScene *s, JceEntity e,
+                                        const jce_mat4 *locals, uint32_t count);
+/* Copies the relay pose into out_locals (which must hold >= JCE_MAX_BONES) and
+ * writes the joint count to *out_count.  Returns false if the entity has no
+ * relay.  out_count may be NULL. */
+JCE_API bool jce_scene_get_ragdoll_pose(const JceScene *s, JceEntity e,
+                                        jce_mat4 *out_locals, uint32_t *out_count);
+JCE_API bool jce_scene_has_ragdoll_pose(const JceScene *s, JceEntity e);
+
+/* ── Animation state-machine command relay (TRANSIENT, NOT serialized) ─
+ * Scripts drive the animation SM via jce.anim_set_float/bool/int/trigger; the
+ * runtime pushes those commands here and the scene renderer drains them each
+ * frame into the entity's SrAnimInstance->sm_binding.  This decouples the
+ * runtime (which has no renderer handle) from the renderer (which owns the
+ * anim instance) — the same relay pattern as the ragdoll pose.  Excluded from
+ * scene save/load. */
+typedef enum {
+    JCE_ANIM_PARAM_FLOAT   = 0,
+    JCE_ANIM_PARAM_INT     = 1,
+    JCE_ANIM_PARAM_BOOL    = 2,
+    JCE_ANIM_PARAM_TRIGGER = 3,   /* one-shot; `value` ignored */
+} JceAnimParamType;
+typedef struct {
+    int   type;        /* JceAnimParamType */
+    char  name[48];    /* SM parameter name */
+    float value;       /* float; int via cast; bool != 0; ignored for trigger */
+} JceAnimParamCmd;
+#define JCE_ANIM_CMD_RELAY_MAX 16
+typedef struct {
+    JceAnimParamCmd cmds[JCE_ANIM_CMD_RELAY_MAX];
+    uint32_t        count;
+} JceAnimCmdRelay;
+/* Queue one SM-parameter command for `e` (appended; silently dropped past the
+ * per-frame cap). */
+JCE_API void     jce_scene_anim_push_param(JceScene *s, JceEntity e,
+                                           const JceAnimParamCmd *cmd);
+/* Copy out + CLEAR the entity's pending commands (renderer drains each frame).
+ * Returns the count written (<= max). */
+JCE_API uint32_t jce_scene_anim_take_params(JceScene *s, JceEntity e,
+                                            JceAnimParamCmd *out, uint32_t max);
 
 /* Component enumeration — returns bitmask of JceComponentFlag. */
 JCE_API uint64_t jce_scene_get_component_flags(const JceScene *s, JceEntity e);

@@ -304,93 +304,103 @@ static void draw_camera_helper_lines(ImDrawList *dl,
 static void draw_light_helper_lines(ImDrawList *dl,
                                     const JceGizmoCamera *cam,
                                     const JceTransform *xform,
+                                    JceScene *scene, JceEntity e,
                                     int light_type,
                                     bool selected)
 {
     if (!dl || !cam || !xform) return;
 
     float pos[3] = { xform->position.x, xform->position.y, xform->position.z };
-    float forward[3], right[3], up[3];
-    build_helper_basis(xform, forward, right, up);
-
     ImU32 line_col = selected ? IM_COL32(255, 255, 255, 180)
                               : IM_COL32(255, 214, 92, 150);
     ImVec2 pos_s;
     if (!project_helper_point(cam, pos, &pos_s))
         return;
 
-    if (light_type == 0) {
-        /* Directional: 3 parallel arrows along the entity forward axis. */
-        for (int i = -1; i <= 1; i++) {
-            float offset = (float)i * 0.45f;
-            float start[3] = {
-                pos[0] + right[0] * offset,
-                pos[1] + right[1] * offset,
-                pos[2] + right[2] * offset
-            };
-            float end[3] = {
-                start[0] + forward[0] * 2.2f,
-                start[1] + forward[1] * 2.2f,
-                start[2] + forward[2] * 2.2f
-            };
-            ImVec2 a, b;
-            if (project_helper_point(cam, start, &a) && project_helper_point(cam, end, &b)) {
-                dl->AddLine(a, b, line_col, 1.7f);
-                ImVec2 dir(b.x - a.x, b.y - a.y);
-                float len = sqrtf(dir.x * dir.x + dir.y * dir.y);
-                if (len > 1.0f) {
-                    dir.x /= len; dir.y /= len;
-                    ImVec2 n(-dir.y, dir.x);
-                    ImVec2 tip1(b.x - dir.x * 7.0f + n.x * 3.0f,
-                                b.y - dir.y * 7.0f + n.y * 3.0f);
-                    ImVec2 tip2(b.x - dir.x * 7.0f - n.x * 3.0f,
-                                b.y - dir.y * 7.0f - n.y * 3.0f);
-                    dl->AddLine(b, tip1, line_col, 1.7f);
-                    dl->AddLine(b, tip2, line_col, 1.7f);
+    /* WORLD shine direction = the light component's own direction rotated by the
+     * entity (matches the renderer sr_light_world_shine_direction).  The old code
+     * used the entity forward axis, which ignored the light's direction field =
+     * static/fake.  Icon-sized lengths keep the always-on indicator uncluttered;
+     * the detailed, data-accurate gizmo is drawn on selection elsewhere. */
+    jce_quat q = jce_q_normalize(xform->rotation);
+
+    if (light_type == 0 || light_type == 2) {
+        jce_vec3 cdir, fb;
+        float length;
+        if (light_type == 0) {
+            JceDirectionalLight *L = scene ? jce_scene_get_dir_light(scene, e) : NULL;
+            cdir = L ? L->direction : jce_v3(0.0f, -1.0f, 0.0f);
+            fb = jce_v3(0.0f, -1.0f, 0.0f); length = 2.2f;
+        } else {
+            JceSpotLight *L = scene ? jce_scene_get_spot_light(scene, e) : NULL;
+            cdir = L ? L->direction : jce_v3(0.0f, 0.0f, -1.0f);
+            fb = jce_v3(0.0f, 0.0f, -1.0f); length = 2.4f;
+        }
+        float l2 = cdir.x * cdir.x + cdir.y * cdir.y + cdir.z * cdir.z;
+        jce_vec3 d  = jce_v3_normalize(jce_q_rotate(q, (l2 < 1e-8f) ? fb : cdir));
+        jce_vec3 u0 = (fabsf(d.y) > 0.95f) ? jce_v3(1, 0, 0) : jce_v3(0, 1, 0);
+        jce_vec3 rt = jce_v3_normalize(jce_v3_cross(d, u0));
+        jce_vec3 uv = jce_v3_normalize(jce_v3_cross(rt, d));
+
+        if (light_type == 0) {
+            /* Directional: 3 parallel arrows along the SHINE direction. */
+            for (int i = -1; i <= 1; i++) {
+                float o = (float)i * 0.45f;
+                float start[3] = { pos[0] + rt.x * o, pos[1] + rt.y * o, pos[2] + rt.z * o };
+                float end[3]   = { start[0] + d.x * length, start[1] + d.y * length,
+                                   start[2] + d.z * length };
+                ImVec2 a, b;
+                if (project_helper_point(cam, start, &a) && project_helper_point(cam, end, &b)) {
+                    dl->AddLine(a, b, line_col, 1.7f);
+                    ImVec2 di(b.x - a.x, b.y - a.y);
+                    float ln = sqrtf(di.x * di.x + di.y * di.y);
+                    if (ln > 1.0f) {
+                        di.x /= ln; di.y /= ln;
+                        ImVec2 n(-di.y, di.x);
+                        dl->AddLine(b, ImVec2(b.x - di.x * 7.0f + n.x * 3.0f,
+                                              b.y - di.y * 7.0f + n.y * 3.0f), line_col, 1.7f);
+                        dl->AddLine(b, ImVec2(b.x - di.x * 7.0f - n.x * 3.0f,
+                                              b.y - di.y * 7.0f - n.y * 3.0f), line_col, 1.7f);
+                    }
                 }
             }
-        }
-    } else if (light_type == 1) {
-        /* Point: 6-axis spider ("sphere" outline). */
-        float axes[6][3] = {
-            { 1, 0, 0 }, { -1, 0, 0 },
-            { 0, 1, 0 }, { 0, -1, 0 },
-            { 0, 0, 1 }, { 0, 0, -1 }
-        };
-        for (int i = 0; i < 6; i++) {
-            float end[3] = {
-                pos[0] + axes[i][0] * 0.9f,
-                pos[1] + axes[i][1] * 0.9f,
-                pos[2] + axes[i][2] * 0.9f
-            };
-            ImVec2 e;
-            if (project_helper_point(cam, end, &e))
-                dl->AddLine(pos_s, e, line_col, 1.4f);
+        } else {
+            /* Spot: cone along the SHINE direction; half-angle from the outer
+             * cone cosine (real data), at an icon-sized length. */
+            float cosA = 0.7071f;
+            JceSpotLight *L = scene ? jce_scene_get_spot_light(scene, e) : NULL;
+            if (L && L->outer_cone_cos > 0.0f && L->outer_cone_cos < 0.9999f)
+                cosA = L->outer_cone_cos;
+            float r = tanf(acosf(cosA)) * length;
+            if (r < 0.05f) r = 0.05f;
+            float bc[3] = { pos[0] + d.x * length, pos[1] + d.y * length, pos[2] + d.z * length };
+            float corners[4][3];
+            for (int i = 0; i < 4; i++) {
+                float sx = (i == 0 || i == 3) ? -1.0f : 1.0f;
+                float sy = (i < 2) ? -1.0f : 1.0f;
+                corners[i][0] = bc[0] + rt.x * r * sx + uv.x * r * sy;
+                corners[i][1] = bc[1] + rt.y * r * sx + uv.y * r * sy;
+                corners[i][2] = bc[2] + rt.z * r * sx + uv.z * r * sy;
+            }
+            ImVec2 cs[4]; int pj = 0;
+            for (int i = 0; i < 4; i++) pj += project_helper_point(cam, corners[i], &cs[i]) ? 1 : 0;
+            if (pj == 4)
+                for (int i = 0; i < 4; i++) {
+                    dl->AddLine(pos_s, cs[i], line_col, 1.5f);
+                    dl->AddLine(cs[i], cs[(i + 1) % 4], line_col, 1.5f);
+                }
         }
     } else {
-        /* Spot: cone projecting along forward. */
-        float base_center[3] = {
-            pos[0] + forward[0] * 2.4f,
-            pos[1] + forward[1] * 2.4f,
-            pos[2] + forward[2] * 2.4f
-        };
-        float corners[4][3];
-        for (int i = 0; i < 4; i++) {
-            float sx = (i == 0 || i == 3) ? -1.0f : 1.0f;
-            float sy = (i < 2) ? -1.0f : 1.0f;
-            corners[i][0] = base_center[0] + right[0] * 0.9f * sx + up[0] * 0.6f * sy;
-            corners[i][1] = base_center[1] + right[1] * 0.9f * sx + up[1] * 0.6f * sy;
-            corners[i][2] = base_center[2] + right[2] * 0.9f * sx + up[2] * 0.6f * sy;
-        }
-        ImVec2 corner_s[4];
-        int projected = 0;
-        for (int i = 0; i < 4; i++)
-            projected += project_helper_point(cam, corners[i], &corner_s[i]) ? 1 : 0;
-        if (projected == 4) {
-            for (int i = 0; i < 4; i++) {
-                dl->AddLine(pos_s, corner_s[i], line_col, 1.5f);
-                dl->AddLine(corner_s[i], corner_s[(i + 1) % 4], line_col, 1.5f);
-            }
+        /* Point: 6-axis spider icon (omnidirectional; range sphere shows on
+         * selection in the 3D gizmo). */
+        float axes[6][3] = { {1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1} };
+        for (int i = 0; i < 6; i++) {
+            float end[3] = { pos[0] + axes[i][0] * 0.9f,
+                             pos[1] + axes[i][1] * 0.9f,
+                             pos[2] + axes[i][2] * 0.9f };
+            ImVec2 ep;
+            if (project_helper_point(cam, end, &ep))
+                dl->AddLine(pos_s, ep, line_col, 1.4f);
         }
     }
 }
@@ -445,12 +455,16 @@ void draw_scene_helper_icons(ImDrawList *dl, const JceGizmoCamera *cam)
         else if (has_point) light_type = 1;
         else if (has_spot)  light_type = 2;
 
-        if (has_camera) {
+        /* Always-on helper LINES (direction / frustum) only when NOT selected:
+         * a selected light/camera gets the detailed, data-accurate 3D gizmo from
+         * draw_selection_outlines, so drawing both would double up (bloat). The
+         * 2D icons below stay always-on. */
+        if (has_camera && !selected) {
             JceCameraComponent *camera = jce_scene_get_camera(scene, e);
             draw_camera_helper_lines(dl, cam, xform, camera, selected);
         }
-        if (light_type >= 0)
-            draw_light_helper_lines(dl, cam, xform, light_type, selected);
+        if (light_type >= 0 && !selected)
+            draw_light_helper_lines(dl, cam, xform, scene, e, light_type, selected);
 
         if (skip_icon) {
             continue;

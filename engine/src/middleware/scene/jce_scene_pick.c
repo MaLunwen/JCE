@@ -4,6 +4,7 @@
 
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_terrain.h>
+#include <jce/os/core/jce_frustum.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/os/core/jce_profiler.h>
@@ -85,6 +86,19 @@ struct JceScenePickPass {
     bool               pending;      /* readback in flight (blit issued)      */
     bool               want_render;  /* deferred click awaiting an ID render  */
     bool               failed;       /* request dropped; poll resolves a miss */
+
+    /* GPU rectangle (marquee) selection: read back a whole pixel rectangle of
+     * the ID buffer and decode every unique entity in it.  Pixel-accurate for
+     * any geometry (incl. streamed glTF models) — unlike a CPU AABB test. */
+    bool               want_rect;    /* a rect request awaits an ID render    */
+    bool               rect_pending; /* rect readback in flight               */
+    bool               rect_failed;  /* rect request dropped -> poll resolves */
+    uint32_t           rect_x0, rect_y0, rect_x1, rect_y1;
+    uint32_t           rect_ready_frame;
+    bgfx_texture_handle_t rect_readback_tex;
+    uint32_t           rect_rb_w, rect_rb_h;     /* current rect tex size      */
+    uint8_t           *rect_readback;
+    size_t             rect_readback_size;
     bool               warned_full;
     bool               warned_model_full;
     bool               warned_caps;
@@ -221,6 +235,43 @@ static bool pick_ensure_readback_texture(JceScenePickPass *pass)
     return true;
 }
 
+/* Ensure a w*h RGBA8 read-back texture + CPU buffer for rectangle (marquee)
+ * selection.  Recreated when the requested size changes. */
+static bool pick_ensure_rect_readback(JceScenePickPass *pass,
+                                      uint32_t w, uint32_t h)
+{
+    if (!pass || w == 0 || h == 0)
+        return false;
+    if (!(BGFX_HANDLE_IS_VALID(pass->rect_readback_tex) &&
+          pass->rect_rb_w == w && pass->rect_rb_h == h)) {
+        if (BGFX_HANDLE_IS_VALID(pass->rect_readback_tex))
+            bgfx_destroy_texture(pass->rect_readback_tex);
+        pass->rect_readback_tex = bgfx_create_texture_2d(
+            (uint16_t)w, (uint16_t)h, false, 1,
+            BGFX_TEXTURE_FORMAT_RGBA8,
+            BGFX_TEXTURE_BLIT_DST | BGFX_TEXTURE_READ_BACK |
+            BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT |
+            BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP,
+            NULL);
+        if (!BGFX_HANDLE_IS_VALID(pass->rect_readback_tex)) {
+            LOG_WARN(LOG_TAG, "failed to allocate %ux%u pick rect readback texture", w, h);
+            pass->rect_rb_w = pass->rect_rb_h = 0;
+            return false;
+        }
+        pass->rect_rb_w = w;
+        pass->rect_rb_h = h;
+    }
+    size_t need = (size_t)w * (size_t)h * 4u;
+    if (pass->rect_readback_size < need) {
+        uint8_t *grown = (uint8_t *)JCE_REALLOC(pass->rect_readback, need);
+        if (!grown)
+            return false;
+        pass->rect_readback = grown;
+        pass->rect_readback_size = need;
+    }
+    return true;
+}
+
 static void pick_destroy_terrain_cache(JceScenePickPass *pass)
 {
     if (!pass)
@@ -247,6 +298,15 @@ static void pick_destroy_model_cache(JceScenePickPass *pass)
     }
 }
 
+void jce_scene_pick_invalidate_model_cache(JceScenePickPass *pass)
+{
+    /* Drop the pick pass's standalone (owned) model cache so stale failed/path
+     * flags from the previous scene don't block re-resolution after a scene
+     * switch.  Borrowed scene-renderer models are never stored here (they are
+     * re-resolved per render), so this only frees pick-owned copies. */
+    pick_destroy_model_cache(pass);
+}
+
 JceScenePickPass *jce_scene_pick_create(const JceScenePickDesc *desc)
 {
     if (!desc || !desc->renderer)
@@ -271,6 +331,7 @@ JceScenePickPass *jce_scene_pick_create(const JceScenePickDesc *desc)
     pass->color.idx = UINT16_MAX;
     pass->depth.idx = UINT16_MAX;
     pass->readback_tex.idx = UINT16_MAX;
+    pass->rect_readback_tex.idx = UINT16_MAX;
     pass->prog_mesh.idx = UINT16_MAX;
     pass->prog_pbr.idx = UINT16_MAX;
     pass->prog_skinned.idx = UINT16_MAX;
@@ -317,6 +378,8 @@ void jce_scene_pick_destroy(JceScenePickPass *pass)
     pick_invalidate_target(pass);
     if (BGFX_HANDLE_IS_VALID(pass->readback_tex))
         bgfx_destroy_texture(pass->readback_tex);
+    if (BGFX_HANDLE_IS_VALID(pass->rect_readback_tex))
+        bgfx_destroy_texture(pass->rect_readback_tex);
     if (BGFX_HANDLE_IS_VALID(pass->prog_mesh))
         bgfx_destroy_program(pass->prog_mesh);
     /* prog_pbr aliases prog_mesh (see create) — do not destroy it twice. */
@@ -332,6 +395,8 @@ void jce_scene_pick_destroy(JceScenePickPass *pass)
     pick_destroy_model_cache(pass);
     if (pass->readback)
         JCE_FREE(pass->readback);
+    if (pass->rect_readback)
+        JCE_FREE(pass->rect_readback);
     JCE_FREE(pass);
 }
 
@@ -631,6 +696,46 @@ static bool pick_register_entity(JceScenePickPass *pass, JceEntity e,
     return true;
 }
 
+/* ── Frustum culling for the pick pass ───────────────────────────────
+ * The pick pass renders EVERY resident entity into the ID buffer.  With world
+ * streaming keeping ~1000+ chunk entities resident, that adds a second
+ * full-scene render on top of the scene/shadow(×cascades)/SSAO/velocity passes,
+ * and the combined per-draw uniform writes overflow bgfx's fixed Vulkan uniform
+ * scratch buffer (crash signature: ScratchBufferVK::write AV in end_frame).
+ * A click can only ever hit an on-screen object, so cull entities whose world
+ * AABB is outside the camera frustum — the standard editor behaviour, which
+ * bounds the pick's per-frame submissions to the visible set.  Same logic as
+ * the scene renderer's culls; off-screen-only so it never drops a pickable. */
+/* Thin forwarders onto the shared jce_frustum.h (one canonical impl). */
+static void pick_extract_frustum_planes(const jce_mat4 *m, jce_vec4 planes[6])
+{
+    jce_frustum_extract_planes(m, planes);
+}
+
+static void pick_transform_aabb(const jce_mat4 *m, jce_vec3 lmn, jce_vec3 lmx,
+                                jce_vec3 *omn, jce_vec3 *omx)
+{
+    jce_transform_aabb(m, lmn, lmx, omn, omx);
+}
+
+static bool pick_aabb_in_frustum(const jce_vec4 planes[6], jce_vec3 mn, jce_vec3 mx)
+{
+    return jce_aabb_in_frustum(planes, mn, mx);
+}
+
+/* True => entity's world AABB is fully outside the frustum (skip it). Never
+ * culls when bounds are unknown (have==false) so unknown-bounds entities stay
+ * pickable. */
+static bool pick_culled(const jce_vec4 planes[6], bool have, const jce_mat4 *model,
+                        const float lmn[3], const float lmx[3])
+{
+    if (!have) return false;
+    jce_vec3 wmn, wmx;
+    pick_transform_aabb(model, jce_v3(lmn[0],lmn[1],lmn[2]),
+                        jce_v3(lmx[0],lmx[1],lmx[2]), &wmn, &wmx);
+    return !pick_aabb_in_frustum(planes, wmn, wmx);
+}
+
 bool jce_scene_pick_render(JceScenePickPass *pass,
                            JceScene *scene,
                            const JceCamera *camera,
@@ -707,6 +812,15 @@ bool jce_scene_pick_render(JceScenePickPass *pass,
     pass->current_count = 0;
     pass->warned_full = false;
 
+    /* Camera frustum (same view+proj as the ID render) — bound the pick to the
+     * on-screen set so the per-frame uniform writes don't overflow bgfx's VK
+     * scratch buffer when streaming keeps thousands of entities resident. */
+    jce_vec4 cull_planes[6];
+    {
+        jce_mat4 vp = jce_m4_multiply(&proj, &view);
+        pick_extract_frustum_planes(&vp, cull_planes);
+    }
+
     PickEntityList list;
     memset(&list, 0, sizeof(list));
     jce_scene_each_entity(scene, pick_collect_entity, &list);
@@ -728,6 +842,10 @@ bool jce_scene_pick_render(JceScenePickPass *pass,
                 JceModel *model_asset =
                     pick_resolve_model(pass, sa->skeleton_path);
                 if (model_asset) {
+                    float clmn[3], clmx[3];
+                    if (jce_model_get_aabb(model_asset, clmn, clmx) &&
+                        pick_culled(cull_planes, true, &model, clmn, clmx))
+                        continue;   /* off-screen — not pickable */
                     float color[4];
                     if (!pick_register_entity(pass, e, color))
                         continue;
@@ -746,6 +864,13 @@ bool jce_scene_pick_render(JceScenePickPass *pass,
         JceMesh *mesh = pick_resolve_entity_mesh(pass, scene, e);
         if (!mesh)
             continue;
+
+        {
+            float clmn[3], clmx[3];
+            jce_mesh_get_aabb(mesh, clmn, clmx);
+            if (pick_culled(cull_planes, true, &model, clmn, clmx))
+                continue;   /* off-screen — not pickable */
+        }
 
         bool double_sided = false;
         if (jce_scene_has_mesh_renderer(scene, e)) {
@@ -768,19 +893,52 @@ bool jce_scene_pick_render(JceScenePickPass *pass,
 
     /* Service the deferred request against THIS render. The blit on
        readback_view_id (= view_id + 1) executes after the pick view within
-       the same bgfx frame, so the read pixel and the snapshotted ID map are
+       the same bgfx frame, so the read pixels and the snapshotted ID map are
        always consistent. Coordinates are clamped here because the viewport
        may have resized between the click and this service frame. */
+    memcpy(pass->pending_map, pass->current_map,
+           sizeof(pass->current_map[0]) * pass->current_count);
+    pass->pending_count = pass->current_count;
+
+    if (pass->want_rect) {
+        /* Rectangle (marquee) readback: blit the requested pixel rect of the ID
+           buffer into a rect-sized read-back texture and queue the async read. */
+        uint32_t x0 = pass->rect_x0, y0 = pass->rect_y0;
+        uint32_t x1 = pass->rect_x1, y1 = pass->rect_y1;
+        if (x0 > x1) { uint32_t t = x0; x0 = x1; x1 = t; }
+        if (y0 > y1) { uint32_t t = y0; y0 = y1; y1 = t; }
+        if (x1 >= pass->width)  x1 = pass->width  - 1u;
+        if (y1 >= pass->height) y1 = pass->height - 1u;
+        if (x0 > x1) x0 = x1;
+        if (y0 > y1) y0 = y1;
+        uint32_t w = x1 - x0 + 1u, h = y1 - y0 + 1u;
+        if (w > 4096u) w = 4096u;
+        if (h > 4096u) h = 4096u;
+        if (pick_ensure_rect_readback(pass, w, h)) {
+            pass->rect_x0 = x0; pass->rect_y0 = y0;
+            pass->rect_x1 = x0 + w - 1u; pass->rect_y1 = y0 + h - 1u;
+            bgfx_blit(pass->readback_view_id,
+                      pass->rect_readback_tex, 0, 0, 0, 0,
+                      pass->color, 0, (uint16_t)x0, (uint16_t)y0, 0,
+                      (uint16_t)w, (uint16_t)h, 1);
+            pass->rect_ready_frame =
+                bgfx_read_texture(pass->rect_readback_tex, pass->rect_readback, 0);
+            pass->rect_pending = true;
+        } else {
+            pass->rect_failed = true;
+        }
+        pass->want_rect = false;
+        pass->want_render = false;
+        JCE_PROFILE_ZONE_END;
+        return true;
+    }
+
     uint32_t rx = pass->request_x;
     uint32_t ry = pass->request_y;
     if (rx >= pass->width)  rx = pass->width - 1u;
     if (ry >= pass->height) ry = pass->height - 1u;
     pass->request_x = rx;
     pass->request_y = ry;
-
-    memcpy(pass->pending_map, pass->current_map,
-           sizeof(pass->current_map[0]) * pass->current_count);
-    pass->pending_count = pass->current_count;
 
     bgfx_blit(pass->readback_view_id,
               pass->readback_tex, 0, 0, 0, 0,
@@ -856,5 +1014,65 @@ bool jce_scene_pick_poll(JceScenePickPass *pass,
 
     pass->pending = false;
     *out_result = result;
+    return true;
+}
+
+bool jce_scene_pick_request_rect(JceScenePickPass *pass,
+                                 uint32_t x0, uint32_t y0,
+                                 uint32_t x1, uint32_t y1)
+{
+    if (!pass || pass->pending || pass->want_render ||
+        pass->rect_pending || pass->want_rect)
+        return false;
+    if (!jce_scene_pick_supported())
+        return false;
+    if (!BGFX_HANDLE_IS_VALID(pass->prog_mesh) ||
+        !BGFX_HANDLE_IS_VALID(pass->u_pick_id))
+        return false;
+
+    pass->rect_x0 = x0; pass->rect_y0 = y0;
+    pass->rect_x1 = x1; pass->rect_y1 = y1;
+    pass->want_rect   = true;
+    pass->want_render = true;   /* drives the on-demand ID render */
+    return true;
+}
+
+bool jce_scene_pick_poll_rect(JceScenePickPass *pass,
+                              JceEntity *out_ids, uint32_t max_ids,
+                              uint32_t *out_count)
+{
+    if (!pass || !out_count)
+        return false;
+    *out_count = 0;
+
+    if (pass->rect_failed) {          /* dropped request resolves as empty */
+        pass->rect_failed = false;
+        return true;
+    }
+    if (!pass->rect_pending)
+        return false;
+    uint32_t frame = jce_renderer_get_frame_index(pass->renderer);
+    if (frame < pass->rect_ready_frame)
+        return false;
+
+    const uint32_t w = pass->rect_x1 - pass->rect_x0 + 1u;
+    const uint32_t h = pass->rect_y1 - pass->rect_y0 + 1u;
+    const size_t   px = (size_t)w * (size_t)h;
+    if (pass->rect_readback && pass->rect_readback_size >= px * 4u &&
+        out_ids && max_ids > 0) {
+        /* Decode every pixel's key once; dedupe via a key-seen bitset
+           (keys are 1..pending_count <= PICK_MAX_IDS). */
+        static unsigned char seen[PICK_MAX_IDS + 1];
+        memset(seen, 0, (size_t)pass->pending_count + 1u);
+        for (size_t i = 0; i < px && *out_count < max_ids; i++) {
+            uint64_t key = jce_scene_pick_decode_rgba(pass->rect_readback + i * 4u);
+            if (key > 0 && key <= pass->pending_count && !seen[key]) {
+                seen[key] = 1u;
+                out_ids[(*out_count)++] = pass->pending_map[key - 1u];
+            }
+        }
+    }
+
+    pass->rect_pending = false;
     return true;
 }

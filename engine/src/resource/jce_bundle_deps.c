@@ -34,6 +34,30 @@ static const char *const kAssetKeys[] = {
     "animationPath",   "animation_path",
     "layerAlbedoPath0","layerAlbedoPath1",
     "layerAlbedoPath2","layerAlbedoPath3",
+    /* MeshRenderer per-entity texture overrides (ser_mesh_renderer). */
+    "albedoTex",       "mrTex",            "normalTex",
+    "aoTex",           "emissiveTex",
+    /* Light cookies / IES profiles (ser_light_unified). */
+    "cookiePath",      "iesPath",
+    /* Physics: Rigidbody / CompoundCollider material + cooked model. */
+    "physMaterial",    "modelPath",
+    /* ParticleEmitter authored asset (parse accepts both spellings). */
+    "assetPath",       "particlePath",
+    /* AI / animation / cinematics descriptors. */
+    "treePath",        "stateMachine",     "seqPath",
+    "avatarPath",      "maskPath",         "overrideController",
+    /* 2D tilemaps (ser Tilemap component). */
+    "tilemapPath",     "spritesPath",
+    /* ReflectionProbe baked cubemap (hdrPath already covers custom). */
+    "bakedCubemapPath",
+    /* Nested-descriptor keys: .mat.json texture maps (primary keys +
+     * loader-accepted aliases — see jce_pbr_material_load_json and the
+     * editor's try_resolve_texture_from_material_json).  These appear
+     * inside material files which the packer re-scans recursively. */
+    "albedoMap",       "baseColorMap",     "diffuseMap",
+    "mainTexture",     "metallicRoughnessMap", "metallicMap",
+    "normalMap",       "aoMap",            "occlusionMap",
+    "emissiveMap",     "emissionMap",
     NULL
 };
 
@@ -158,12 +182,84 @@ static const char *sibling_bundle_tag(const cJSON *parent_obj)
     return NULL;
 }
 
+/* World-streaming block: the scene-level
+ *   "streaming": { "enabled", …, "chunks": [ {"id","center","radius","path"} ] }
+ * object references scene-fragment files (.scene.json) through the
+ * generic key "path", which is far too common to add to kAssetKeys.
+ * Harvest it contextually instead: whenever a "streaming" object with a
+ * "chunks" array is met, every chunks[i].path is a dependency.  The
+ * fragments themselves end in .json, so the packer's bounded descriptor
+ * recursion (jce_bundle_pack.c) re-scans them for their own assets —
+ * including nested streaming blocks.  Harvested regardless of "enabled"
+ * so a scene that toggles streaming on at runtime still ships its
+ * fragments. */
+static void harvest_streaming_chunks(const cJSON *streaming_obj,
+                                     JceBundleDepList *out)
+{
+    const cJSON *chunks =
+        cJSON_GetObjectItemCaseSensitive(streaming_obj, "chunks");
+    if (!chunks || !cJSON_IsArray(chunks)) return;
+
+    const cJSON *co = NULL;
+    cJSON_ArrayForEach(co, chunks) {
+        if (!cJSON_IsObject(co)) continue;
+        const cJSON *p = cJSON_GetObjectItemCaseSensitive(co, "path");
+        if (p && cJSON_IsString(p) && p->valuestring && p->valuestring[0])
+            list_push(out, p->valuestring, sibling_bundle_tag(co));
+    }
+}
+
+/* Contextual nested-descriptor keys.  Some asset descriptors use JSON
+ * keys far too generic to harvest globally ("texture", "sprites",
+ * "source").  Recognise them structurally — only when the surrounding
+ * object also carries the descriptor's signature fields — so a stray
+ * "source" string elsewhere in a scene can never be mistaken for an
+ * asset path.  Kept in sync with the runtime loaders:
+ *   - .particles.json  → jce_particles.c     ("texture" + emitter tuning)
+ *   - .tilemap.json    → jce_tilemap.c       ("sprites" + "w"/"h"/"cells")
+ *   - .sprites.json    → jce_tilemap.c       ("source"  + "rects")          */
+static int obj_has(const cJSON *o, const char *key)
+{
+    return cJSON_GetObjectItemCaseSensitive(o, key) != NULL;
+}
+
+static void harvest_descriptor_keys(const cJSON *obj, JceBundleDepList *out)
+{
+    const cJSON *it;
+
+    /* Particle-emitter descriptor: "texture". */
+    it = cJSON_GetObjectItemCaseSensitive(obj, "texture");
+    if (it && cJSON_IsString(it) && it->valuestring && it->valuestring[0] &&
+        (obj_has(obj, "emitRate") || obj_has(obj, "lifetimeMin") ||
+         obj_has(obj, "maxParticles") || obj_has(obj, "sizeStart")))
+    {
+        list_push(out, it->valuestring, sibling_bundle_tag(obj));
+    }
+
+    /* Tilemap descriptor: "sprites" → .sprites.json tileset. */
+    it = cJSON_GetObjectItemCaseSensitive(obj, "sprites");
+    if (it && cJSON_IsString(it) && it->valuestring && it->valuestring[0] &&
+        (obj_has(obj, "cells") || (obj_has(obj, "w") && obj_has(obj, "h"))))
+    {
+        list_push(out, it->valuestring, sibling_bundle_tag(obj));
+    }
+
+    /* Tileset descriptor: "source" → atlas image. */
+    it = cJSON_GetObjectItemCaseSensitive(obj, "source");
+    if (it && cJSON_IsString(it) && it->valuestring && it->valuestring[0] &&
+        obj_has(obj, "rects"))
+    {
+        list_push(out, it->valuestring, sibling_bundle_tag(obj));
+    }
+}
+
 static void walk(const cJSON *node, const cJSON *parent_obj,
                  JceBundleDepList *out)
 {
     if (!node) return;
 
     if (cJSON_IsObject(node)) {
+        harvest_descriptor_keys(node, out);
         const cJSON *child = NULL;
         cJSON_ArrayForEach(child, node) {
             const char *key = child->string;
@@ -172,6 +268,11 @@ static void walk(const cJSON *node, const cJSON *parent_obj,
                 jce_bundle_deps_is_asset_key(key))
             {
                 list_push(out, child->valuestring, sibling_bundle_tag(node));
+            }
+            if (key && cJSON_IsObject(child) &&
+                strcmp(key, "streaming") == 0)
+            {
+                harvest_streaming_chunks(child, out);
             }
             walk(child, node, out);
         }

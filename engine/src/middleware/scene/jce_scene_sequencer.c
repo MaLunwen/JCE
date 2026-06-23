@@ -18,6 +18,7 @@
  */
 
 #include <jce/middleware/scene/jce_scene_sequencer.h>
+#include <jce/middleware/scene/jce_component_registry.h>  /* per-component disable gate */
 #include <jce/middleware/scene/jce_sequencer.h>
 #include <jce/os/core/jce_hash.h>
 #include <jce/os/core/jce_log.h>
@@ -26,9 +27,42 @@
 #include "os/core/jce_memory.h"
 
 #include <flecs.h>
+#include <stdint.h>
 #include <string.h>
 
 #define LOG_TAG "scene_seq"
+
+/* ── Event / camera-cut dispatch sinks (FEATURE 8.4) ─────────────────
+ *
+ * Process-global, mirroring the single-game-camera assumption the rest of the
+ * scene runtime makes (jce_vcam_system trauma is global too).  The runtime
+ * registers these once; jce_scene_sequencer_update routes crossed EVENT /
+ * CAMERA-CUT keys through them. */
+
+static JceSeqEventHandlerFn g_event_handler = NULL;
+static void               *g_event_user    = NULL;
+static JceSeqCameraCutFn    g_cut_handler   = NULL;
+static void               *g_cut_user      = NULL;
+static JceSeqResolvePathFn  g_resolve_fn    = NULL;
+static void               *g_resolve_user  = NULL;
+
+void jce_scene_sequencer_set_event_handler(JceSeqEventHandlerFn fn, void *user)
+{
+    g_event_handler = fn;
+    g_event_user    = user;
+}
+
+void jce_scene_sequencer_set_resolve_fn(JceSeqResolvePathFn fn, void *user)
+{
+    g_resolve_fn   = fn;
+    g_resolve_user = user;
+}
+
+void jce_scene_sequencer_set_camera_cut_handler(JceSeqCameraCutFn fn, void *user)
+{
+    g_cut_handler = fn;
+    g_cut_user    = user;
+}
 
 /* ── Canonical property catalogue ────────────────────────────────── */
 
@@ -459,9 +493,18 @@ static void sq_ensure_open(JceScene *s, JceSequencePlayerComponent *c)
     c->started     = true;
     c->opened_hash = want;
 
-    JceSequencer *seq = jce_sequencer_load_file(c->seq_path);
+    /* Resolve the project-relative path to a loadable host path (the editor's
+     * CWD is not the project root).  Mirrors the script/terrain/tilemap loaders
+     * in jce_runtime.c; no-op when no resolver is set (shipped build). */
+    const char *load_path = c->seq_path;
+    char rbuf[1024];
+    if (g_resolve_fn &&
+        g_resolve_fn(g_resolve_user, c->seq_path, rbuf, (int)sizeof rbuf))
+        load_path = rbuf;
+
+    JceSequencer *seq = jce_sequencer_load_file(load_path);
     if (!seq) {
-        LOG_WARN(LOG_TAG, "sequence not loadable: %s", c->seq_path);
+        LOG_WARN(LOG_TAG, "sequence not loadable: %s", load_path);
         return;
     }
 
@@ -509,11 +552,154 @@ static JceEntity sq_track_target(const JceSequencePlayerComponent *c,
     return (JceEntity)jce_sequencer_track_bind_entity_hint(rt->seq, i);
 }
 
+/* ── Camera-cut: make `target` the live camera ───────────────────────
+ *
+ * Active-camera seam: raise the target vcam's priority above every other vcam
+ * in the scene and mark it active, so the next jce_vcam_system_evaluate (driven
+ * by the Game View / runtime camera step) picks it as the live camera.  No-op
+ * when target has no virtual-camera component (a plain camera entity has no
+ * priority seam — the cut sink still observes it so the runtime can decide). */
+
+typedef struct {
+    JceEntity   found;
+    int32_t     max_priority;
+} SqVcamScanCtx;
+
+static void sq_vcam_scan_cb(JceScene *s, JceEntity e, void *ud)
+{
+    SqVcamScanCtx *ctx = (SqVcamScanCtx *)ud;
+    JceVirtualCameraComponent *v = jce_scene_get_virtual_camera(s, e);
+    if (v && v->priority > ctx->max_priority) ctx->max_priority = v->priority;
+}
+
+/* ── Cut-camera restore registry ─────────────────────────────────────
+ * A CAMERA_CUT key raises a vcam's priority + activates it (sq_apply_camera_cut
+ * below).  To hand the camera back to the gameplay/player camera when the
+ * cutscene stops, we remember each cut vcam's PRE-cut (priority, active) and
+ * restore it when the driving SequencePlayer is disabled or a non-looping
+ * sequence finishes — otherwise the cut vcam would win the resolver forever. */
+#define SQ_CUT_SAVE_MAX 32
+typedef struct {
+    JceScene *scene;
+    JceEntity vcam;
+    int32_t   saved_priority;
+    bool      saved_active;
+} SqCutSave;
+static SqCutSave g_cut_saved[SQ_CUT_SAVE_MAX];
+static int       g_cut_saved_n = 0;
+
+static void sq_cut_remember(JceScene *s, JceEntity vcam,
+                            int32_t saved_priority, bool saved_active)
+{
+    for (int i = 0; i < g_cut_saved_n; ++i)
+        if (g_cut_saved[i].scene == s && g_cut_saved[i].vcam == vcam)
+            return;  /* first cut wins — keep the ORIGINAL pre-cut state */
+    if (g_cut_saved_n < SQ_CUT_SAVE_MAX) {
+        g_cut_saved[g_cut_saved_n].scene          = s;
+        g_cut_saved[g_cut_saved_n].vcam           = vcam;
+        g_cut_saved[g_cut_saved_n].saved_priority = saved_priority;
+        g_cut_saved[g_cut_saved_n].saved_active   = saved_active;
+        ++g_cut_saved_n;
+    }
+}
+
+/* Restore every vcam this scene's cuts touched (and drop them from the list) so
+ * jce_vcam_system_evaluate falls back to the gameplay/player camera.  Idempotent
+ * (a second call with no pending entries is a no-op). */
+static void sq_cut_restore_scene(JceScene *s)
+{
+    int w = 0;
+    for (int i = 0; i < g_cut_saved_n; ++i) {
+        if (g_cut_saved[i].scene == s) {
+            JceVirtualCameraComponent *v =
+                jce_scene_get_virtual_camera(s, g_cut_saved[i].vcam);
+            if (v) {
+                v->priority = g_cut_saved[i].saved_priority;
+                v->active   = g_cut_saved[i].saved_active;
+            }
+        } else {
+            g_cut_saved[w++] = g_cut_saved[i];  /* keep other scenes' entries */
+        }
+    }
+    g_cut_saved_n = w;
+}
+
+static void sq_apply_camera_cut(JceScene *s, JceEntity target)
+{
+    if (!s || target == JCE_ENTITY_INVALID) return;
+    JceVirtualCameraComponent *tv = jce_scene_get_virtual_camera(s, target);
+    if (!tv) return;   /* not a vcam — nothing to prioritise */
+
+    /* Remember the pre-cut state once so the gameplay camera can be restored. */
+    sq_cut_remember(s, target, tv->priority, tv->active);
+
+    SqVcamScanCtx ctx = { JCE_ENTITY_INVALID, INT32_MIN };
+    jce_scene_each_entity(s, sq_vcam_scan_cb, &ctx);
+    /* Strictly above the current max so this vcam wins the resolver's pick. */
+    int32_t top = (ctx.max_priority == INT32_MIN) ? 0 : ctx.max_priority;
+    if (tv->priority <= top) {
+        tv->priority = (top < INT32_MAX) ? top + 1 : INT32_MAX;
+    }
+    tv->active = true;
+}
+
+/* ── Per-track event/camera-cut dispatch ─────────────────────────────
+ *
+ * Passed as userdata to jce_sequencer_track_fire_events_in_range; one struct
+ * per track per step.  The sink is the REAL dispatch path: EVENT keys → the
+ * registered handler (→ jce_script_call_named in the runtime), CAMERA-CUT keys
+ * → the active-camera seam + optional observer. */
+
+typedef struct {
+    JceScene  *scene;
+    JceEntity  cut_target;   /* track-level fallback target for camera-cut */
+    bool       is_cut;
+} SqDispatchCtx;
+
+static void sq_event_sink(const char *name, float time, uint64_t entity,
+                          void *user)
+{
+    SqDispatchCtx *ctx = (SqDispatchCtx *)user;
+    if (!ctx) return;
+
+    if (ctx->is_cut) {
+        /* CAMERA-CUT target resolution mirrors the track-binding contract so a
+         * multi-cut track survives a scene reload (entity ids are recycled):
+         *   1. the track-level resolved target (ctx->cut_target) when valid —
+         *      this is sq_track_target(), which already prefers the REMAPPED
+         *      scene-file binding (c->bindings[i]) over the name-resolved entity
+         *      over the raw authored hint;
+         *   2. otherwise the per-key authored entity id, which (like the track
+         *      hint) is only valid within the authoring session — used raw as a
+         *      last resort so an unbound cut track still works in-session. */
+        JceEntity target = (ctx->cut_target != JCE_ENTITY_INVALID)
+                               ? ctx->cut_target
+                               : (JceEntity)entity;
+        sq_apply_camera_cut(ctx->scene, target);
+        if (g_cut_handler)
+            g_cut_handler(ctx->scene, target, time, g_cut_user);
+        return;
+    }
+
+    /* EVENT: route the authored handler name to the registered sink (the
+     * runtime forwards it to jce_script_call_named so a Lua fn fires). */
+    if (g_event_handler)
+        g_event_handler(name, entity, time, g_event_user);
+}
+
 static void sq_each(JceScene *s, JceEntity e, void *ud)
 {
     float dt = *(const float *)ud;
     JceSequencePlayerComponent *c = jce_scene_get_sequence_player(s, e);
     if (!c) return;
+    { static int s_sp_cid = -2;
+      if (s_sp_cid == -2) s_sp_cid = jce_component_find("SequencePlayer");
+      if (s_sp_cid >= 0 && !jce_scene_comp_enabled(s, e, s_sp_cid)) {
+          /* Disabled (e.g. mission_zone.lua stops the cutscene) → hand the
+           * camera back to the gameplay/player camera. No-op until a cut ran. */
+          sq_cut_restore_scene(s);
+          return;
+      } }
 
     /* Reconcile an in-place seq_path change (inspector edit / Reset
      * Component / undo-redo): drop the stale sequencer so the driver
@@ -541,17 +727,30 @@ static void sq_each(JceScene *s, JceEntity e, void *ud)
     for (int i = 0; i < n; ++i) {
         const JceSeqTrackType type = jce_sequencer_track_type(seq, i);
 
-        if (type == JCE_SEQ_TRACK_EVENT) {
-            /* Loop wrap splits the scan: (prev, duration] + (0, now]. */
+        if (type == JCE_SEQ_TRACK_EVENT ||
+            type == JCE_SEQ_TRACK_CAMERA_CUT) {
+            /* Real dispatch path (replaces the LOG_DEBUG-only count): fire each
+             * crossed key through the sink — EVENT keys → script handler,
+             * CAMERA-CUT keys → active-camera seam. */
+            SqDispatchCtx dc;
+            dc.scene      = s;
+            dc.is_cut     = (type == JCE_SEQ_TRACK_CAMERA_CUT);
+            dc.cut_target = dc.is_cut ? sq_track_target(c, rt, i)
+                                      : JCE_ENTITY_INVALID;
             int fired;
+            /* Loop wrap splits the scan: (prev, duration] + (0, now]. */
             if (now < prev)
-                fired = jce_sequencer_track_events_in_range(seq, i, prev, duration)
-                      + jce_sequencer_track_events_in_range(seq, i, 0.0f, now);
+                fired = jce_sequencer_track_fire_events_in_range(
+                            seq, i, prev, duration, sq_event_sink, &dc)
+                      + jce_sequencer_track_fire_events_in_range(
+                            seq, i, 0.0f, now, sq_event_sink, &dc);
             else
-                fired = jce_sequencer_track_events_in_range(seq, i, prev, now);
+                fired = jce_sequencer_track_fire_events_in_range(
+                            seq, i, prev, now, sq_event_sink, &dc);
             if (fired > 0)
-                LOG_DEBUG(LOG_TAG, "sequence '%s' track %d fired %d event(s)",
-                          c->seq_path, i, fired);
+                LOG_DEBUG(LOG_TAG, "sequence '%s' track %d fired %d %s(s)",
+                          c->seq_path, i, fired,
+                          dc.is_cut ? "camera-cut" : "event");
             continue;
         }
 
@@ -575,6 +774,12 @@ static void sq_each(JceScene *s, JceEntity e, void *ud)
             jce_seq_prop_apply_float(s, target, prop, v);
         }
     }
+
+    /* A non-looping sequence that has reached and stalled at its end (now clamped
+     * to duration, no longer advancing) releases its cut camera back to gameplay.
+     * A looping sequence wraps (now < prev, now < duration) and never trips this. */
+    if (duration > 0.0f && now >= duration && now <= prev)
+        sq_cut_restore_scene(s);
 
     c->prev_time = now;
 }

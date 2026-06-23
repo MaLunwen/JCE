@@ -22,6 +22,7 @@
 #include <vector>
 
 extern "C" {
+#include <jce/os/core/jce_alloc.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>

@@ -20,7 +20,10 @@
 #include <jce/resource/jce_world_streamer.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
+#include <jce/os/core/jce_timer.h>
+#include <jce/os/core/jce_json.h>
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/middleware/scene/jce_scene_components_json.h>
 #include <jce/renderer/jce_texture.h>
 
 #include "os/core/jce_memory.h"
@@ -34,6 +37,29 @@
  * scene's authored chunk table and this roster pool are sized as one. */
 #define MAX_WORLD_CHUNKS    256
 #define MAX_ENTITY_SLOTS    2048   /* per-chunk entity roster capacity */
+
+/* Conservative per-spawned-entity residency estimate (ECS components +
+ * transform + a share of per-entity asset/runtime overhead).  Used to report
+ * a chunk's true memory footprint to the streaming budget — the raw chunk
+ * JSON is tiny vs. what it spawns, so a JSON-byte budget never triggers
+ * LRU/pressure (audit F3).  A heuristic, not exact; the point is that the
+ * accounted size scales with residency rather than source bytes. */
+#define JCE_WS_BYTES_PER_ENTITY  8192u
+
+/* Per-frame chunk-APPLY budget (entity spawning happens on the main/render
+ * thread, so it cannot be offloaded — only spread).  We spawn entities a
+ * slice at a time and stop once we have either spawned this many entities or
+ * spent the configured wall-clock budget on apply work this frame, whichever
+ * comes first.  Reading the chunk bytes is already bounded separately by the
+ * streaming I/O layer's frame_budget_ms (jce_streaming_update). */
+#define JCE_WS_APPLY_ENTITIES_PER_SLICE  64
+
+static double ws_now_ms(void)
+{
+    uint64_t freq = jce_time_perf_freq();
+    if (!freq) return 0.0;
+    return (double)jce_time_perf_counter() / (double)freq * 1000.0;
+}
 
 /* P3-A.2 — streaming pressure → texture mip-bias bridge.
  *
@@ -77,6 +103,16 @@ typedef struct {
     size_t        pending_size;
     bool          pending_ok;
 
+    /* In-flight time-sliced apply (main thread only).  When a chunk's bytes
+     * arrive we parse the JSON once (apply_root) and open a streaming load
+     * (apply_stream); jce_world_streamer_update() then spawns a few entities
+     * per frame under a wall-clock budget and finalizes when drained.  This
+     * spreads the per-chunk spawn cost across frames instead of stalling the
+     * frame that the chunk happened to finish loading on. */
+    JceJson            *apply_root;   /* owned parsed JSON, freed at finalize */
+    JceSceneLoadStream *apply_stream; /* borrows apply_root + the scene        */
+    size_t              apply_size;   /* source byte count for residency calc  */
+
     /* Entities spawned by this chunk (dynamic, owned by us). */
     JceEntity *entities;
     uint32_t   entity_count;
@@ -98,9 +134,22 @@ struct JceWorldStreamer {
 
     /* Aggregate stats (updated each apply). */
     uint32_t            total_entities;
+
+    /* Editor hierarchy-integration callbacks (optional; NULL in the runtime). */
+    JceWorldStreamerEntityCb on_spawn;
+    JceWorldStreamerEntityCb on_despawn;
+    void                    *entity_cb_user;
+
+    /* Per-chunk load/unload callback (optional; NULL in the runtime).  Carries
+     * the chunk id so a caller can toggle a per-chunk resource such as an HLOD
+     * proxy.  Separate user pointer from the entity callbacks above. */
+    JceWorldStreamerChunkCb  on_chunk_state;
+    void                    *chunk_cb_user;
 };
 
 /* ── Roster helpers ──────────────────────────────────────────────── */
+
+static void roster_abort_apply(JceWorldStreamer *ws, ChunkRoster *r);
 
 static ChunkRoster *find_roster(JceWorldStreamer *ws, uint32_t id)
 {
@@ -134,6 +183,11 @@ static ChunkRoster *alloc_roster(JceWorldStreamer *ws, uint32_t id)
 
 static void roster_free_entities(JceWorldStreamer *ws, ChunkRoster *r)
 {
+    /* Notify the editor BEFORE destroying, while the ids are still valid, so it
+     * can pull these entities out of its hierarchy/selection mirror. */
+    if (ws->on_despawn && r->entity_count)
+        ws->on_despawn(r->entities, r->entity_count, ws->entity_cb_user);
+
     for (uint32_t i = 0; i < r->entity_count; ++i)
         jce_scene_destroy_entity(ws->scene, r->entities[i]);
     ws->total_entities -= r->entity_count;
@@ -166,6 +220,9 @@ static void on_chunk_loaded(uint32_t chunk_id, void *data, size_t size,
     memcpy(buf, data, size);
     ((char *)buf)[size] = '\0';
 
+    /* Drop any earlier staged bytes not yet consumed (defensive: avoids a
+     * leak if a second load completes before update() promoted the first). */
+    JCE_FREE(r->pending_data);
     r->pending_data = buf;
     r->pending_size = size;
     r->pending_ok   = true;
@@ -178,6 +235,14 @@ static void on_chunk_unloaded(uint32_t chunk_id, void *user_data)
     ChunkRoster      *r  = find_roster(ws, chunk_id);
     if (!r) return;
 
+    /* Tell the caller this chunk is going away (e.g. show its HLOD proxy) BEFORE
+     * the detailed entities are destroyed, so there is never a visible gap. */
+    if (ws->on_chunk_state)
+        ws->on_chunk_state(chunk_id, false, ws->chunk_cb_user);
+
+    /* If this chunk was still being applied across frames, abort that first
+     * (destroys the partial entities) so it cannot finalize after unload. */
+    roster_abort_apply(ws, r);
     roster_free_entities(ws, r);
     LOG_INFO(LOG_TAG, "chunk %u unloaded (entities removed)", chunk_id);
 }
@@ -233,6 +298,28 @@ JceWorldStreamer *jce_world_streamer_create(
     return ws;
 }
 
+void jce_world_streamer_set_entity_callbacks(
+    JceWorldStreamer         *ws,
+    JceWorldStreamerEntityCb  on_spawn,
+    JceWorldStreamerEntityCb  on_despawn,
+    void                     *user)
+{
+    if (!ws) return;
+    ws->on_spawn       = on_spawn;
+    ws->on_despawn     = on_despawn;
+    ws->entity_cb_user = user;
+}
+
+void jce_world_streamer_set_chunk_callback(
+    JceWorldStreamer        *ws,
+    JceWorldStreamerChunkCb  on_chunk_state,
+    void                    *user)
+{
+    if (!ws) return;
+    ws->on_chunk_state = on_chunk_state;
+    ws->chunk_cb_user  = user;
+}
+
 void jce_world_streamer_destroy(JceWorldStreamer *ws)
 {
     if (!ws) return;
@@ -241,13 +328,12 @@ void jce_world_streamer_destroy(JceWorldStreamer *ws)
     for (uint32_t i = 0; i < ws->roster_count; ++i) {
         ChunkRoster *r = &ws->rosters[i];
         if (!r->active) continue;
+        roster_abort_apply(ws, r);
         roster_free_entities(ws, r);
 
         /* Free any pending staging buffer. */
-        if (SDL_GetAtomicInt(&r->pending_apply)) {
-            JCE_FREE(r->pending_data);
-            r->pending_data = NULL;
-        }
+        JCE_FREE(r->pending_data);
+        r->pending_data = NULL;
     }
 
     jce_streaming_destroy(ws->ss);
@@ -304,12 +390,11 @@ void jce_world_streamer_unregister_chunk(JceWorldStreamer *ws, uint32_t chunk_id
 
     ChunkRoster *r = find_roster(ws, chunk_id);
     if (r) {
+        roster_abort_apply(ws, r);
         roster_free_entities(ws, r);
 
-        if (SDL_GetAtomicInt(&r->pending_apply)) {
-            JCE_FREE(r->pending_data);
-            r->pending_data = NULL;
-        }
+        JCE_FREE(r->pending_data);
+        r->pending_data = NULL;
         r->active = false;
     }
 
@@ -317,6 +402,77 @@ void jce_world_streamer_unregister_chunk(JceWorldStreamer *ws, uint32_t chunk_id
 }
 
 /* ── Per-frame update ────────────────────────────────────────────── */
+
+/* Abandon an in-flight apply stream (chunk unregistered/unloaded mid-apply).
+ * finalize() is always safe to call and runs ref-fixups over whatever was
+ * created so far; we then destroy those partial entities since the chunk is
+ * going away, so nothing leaks into the live scene. */
+static void roster_abort_apply(JceWorldStreamer *ws, ChunkRoster *r)
+{
+    if (r->apply_stream) {
+        /* Capture the partial roster (O(new)) before finalize frees the map. */
+        uint32_t   n  = jce_scene_load_stream_new_entities(r->apply_stream, NULL, 0);
+        JceEntity *ids = NULL;
+        if (n) {
+            ids = (JceEntity *)JCE_MALLOC((size_t)n * sizeof(JceEntity));
+            if (ids)
+                n = jce_scene_load_stream_new_entities(r->apply_stream, ids, n);
+            else
+                n = 0;
+        }
+        (void)jce_scene_load_stream_finalize(r->apply_stream);
+        r->apply_stream = NULL;
+        for (uint32_t i = 0; i < n; ++i)
+            jce_scene_destroy_entity(ws->scene, ids[i]);
+        JCE_FREE(ids);
+    }
+    if (r->apply_root) { jce_json_free(r->apply_root); r->apply_root = NULL; }
+    r->apply_size = 0;
+}
+
+/* Finish an in-flight apply: run ref fixups, capture the per-chunk entity
+ * roster in O(new) from the stream's remap table, fire callbacks, account
+ * residency.  Returns true if a chunk was finalized. */
+static void roster_finalize_apply(JceWorldStreamer *ws, ChunkRoster *r)
+{
+    JceSceneLoadStream *st = r->apply_stream;
+
+    /* Pull the created-entity roster straight from the stream (O(new)),
+     * before finalize() frees the remap table. */
+    uint32_t new_count = jce_scene_load_stream_new_entities(st, NULL, 0);
+    JceEntity *new_ents = NULL;
+    if (new_count) {
+        new_ents = (JceEntity *)JCE_MALLOC((size_t)new_count * sizeof(JceEntity));
+        if (new_ents)
+            new_count = jce_scene_load_stream_new_entities(st, new_ents, new_count);
+        else
+            new_count = 0;
+    }
+
+    (void)jce_scene_load_stream_finalize(st);   /* runs parent/ref fixups */
+    r->apply_stream = NULL;
+    if (r->apply_root) { jce_json_free(r->apply_root); r->apply_root = NULL; }
+
+    r->entities     = new_ents;
+    r->entity_count = new_count;
+    r->entity_cap   = new_count;
+    ws->total_entities += new_count;
+
+    if (ws->on_spawn && new_count)
+        ws->on_spawn(new_ents, new_count, ws->entity_cb_user);
+
+    if (ws->on_chunk_state)
+        ws->on_chunk_state(r->chunk_id, true, ws->chunk_cb_user);
+
+    jce_streaming_set_chunk_residency(
+        ws->ss, r->chunk_id,
+        (uint64_t)r->apply_size +
+            (uint64_t)new_count * JCE_WS_BYTES_PER_ENTITY);
+
+    LOG_INFO(LOG_TAG, "chunk %u applied: %u entities spawned",
+             r->chunk_id, new_count);
+    r->apply_size = 0;
+}
 
 void jce_world_streamer_update(JceWorldStreamer *ws, jce_vec3 camera_pos)
 {
@@ -326,44 +482,83 @@ void jce_world_streamer_update(JceWorldStreamer *ws, jce_vec3 camera_pos)
     /* Drive I/O loads/unloads. */
     jce_streaming_update(ws->ss, camera_pos);
 
-    /* Apply any chunks whose background load completed. */
+    /* Chunk APPLY (JSON parse + entity spawn) runs on the main/render thread
+     * and cannot be offloaded, only spread.  Spawn at most a few entities per
+     * frame and stop once a wall-clock budget is spent, so a chunk that just
+     * finished loading no longer stalls the frame it landed on.  Reuse the
+     * I/O frame_budget_ms; fall back to a small default if unset. */
+    const double budget_ms = (ws->config.frame_budget_ms > 0.0f)
+                                 ? (double)ws->config.frame_budget_ms
+                                 : 2.0;
+    const double start_ms  = ws_now_ms();
+    bool finalized_one     = false;   /* keep GPU-resource bursts to ≤1/frame */
+
     for (uint32_t i = 0; i < ws->roster_count; ++i) {
         ChunkRoster *r = &ws->rosters[i];
         if (!r->active) continue;
-        if (!SDL_CompareAndSwapAtomicInt(&r->pending_apply, 1, 0)) continue;
 
-        if (!r->pending_ok || !r->pending_data) {
-            JCE_FREE(r->pending_data);
+        /* 1. Promote a freshly-loaded chunk's bytes into an in-flight apply
+         *    stream: parse the JSON once, open the time-sliced loader.  Only
+         *    when this roster isn't already mid-apply. */
+        if (!r->apply_stream &&
+            SDL_CompareAndSwapAtomicInt(&r->pending_apply, 1, 0)) {
+
+            void  *data = r->pending_data;
+            size_t size = r->pending_size;
             r->pending_data = NULL;
-            continue;
+
+            if (!r->pending_ok || !data) {
+                JCE_FREE(data);
+            } else {
+                /* Remove stale entities from a previous load (hot-reload). */
+                roster_free_entities(ws, r);
+
+                JceJson *root = jce_json_parse((const char *)data, size);
+                JCE_FREE(data);
+                if (!root) {
+                    LOG_ERROR(LOG_TAG, "chunk %u: JSON parse failed", r->chunk_id);
+                } else {
+                    JceSceneLoadStream *st =
+                        jce_scene_load_stream_begin(ws->scene, root, NULL);
+                    if (!st) {
+                        jce_json_free(root);
+                        LOG_ERROR(LOG_TAG,
+                                  "chunk %u: scene stream begin failed",
+                                  r->chunk_id);
+                    } else {
+                        r->apply_root   = root;
+                        r->apply_stream = st;
+                        r->apply_size   = size;
+                    }
+                }
+            }
         }
 
-        /* Remove stale entities from a previous load (hot-reload). */
-        roster_free_entities(ws, r);
+        /* 2. Drive an in-flight apply a slice at a time under the budget.
+         *    Finalize at most one chunk per frame to cap the GPU-resource
+         *    burst that the spawn + ref-fixup pass triggers. */
+        if (r->apply_stream) {
+            while (!jce_scene_load_stream_done(r->apply_stream)) {
+                jce_scene_load_stream_step(r->apply_stream,
+                                           JCE_WS_APPLY_ENTITIES_PER_SLICE);
+                if (ws_now_ms() - start_ms >= budget_ms)
+                    break;   /* resume this chunk next frame */
+            }
 
-        /* Spawn new entities from the chunk JSON. */
-        JceEntity *new_ents  = NULL;
-        uint32_t   new_count = 0;
-        bool ok = jce_scene_serial_load_additive(ws->scene,
-                                                  (const char *)r->pending_data,
-                                                  r->pending_size,
-                                                  &new_ents, &new_count);
-
-        JCE_FREE(r->pending_data);
-        r->pending_data = NULL;
-
-        if (!ok) {
-            LOG_ERROR(LOG_TAG, "chunk %u: scene deserialise failed", r->chunk_id);
-            continue;
+            if (jce_scene_load_stream_done(r->apply_stream)) {
+                if (finalized_one) {
+                    /* Hold the completed first pass; finalize next frame so we
+                     * never run two finalize fixup+spawn bursts in one frame. */
+                } else {
+                    roster_finalize_apply(ws, r);
+                    finalized_one = true;
+                }
+            }
         }
 
-        r->entities     = new_ents;
-        r->entity_count = new_count;
-        r->entity_cap   = new_count;
-        ws->total_entities += new_count;
-
-        LOG_INFO(LOG_TAG, "chunk %u applied: %u entities spawned",
-                 r->chunk_id, new_count);
+        /* Out of budget — leave remaining chunks for the next frame. */
+        if (ws_now_ms() - start_ms >= budget_ms)
+            break;
     }
     JCE_PROFILE_ZONE_END;
 }

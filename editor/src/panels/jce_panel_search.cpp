@@ -127,7 +127,6 @@ static const PanelKeyRow kPanelKeys[] = {
     { JCE_PANEL_SEQUENCER,           "window.sequencer"              },
     { JCE_PANEL_NAVMESH,             "window.navmesh"                },
     { JCE_PANEL_TERRAIN,             "window.terrain"                },
-    { JCE_PANEL_PREFERENCES,         "panel.preferences.title"       },
     { JCE_PANEL_PACKAGE_MANAGER,     "packageManager.title"          },
     { JCE_PANEL_FRAME_DEBUGGER,      "frameDebugger.title"           },
     { JCE_PANEL_SPRITE_EDITOR,       "spriteEditor.title"            },
@@ -163,6 +162,7 @@ static const PanelKeyRow kPanelKeys[] = {
     { JCE_PANEL_PROFILE_ANALYZER,    "window.profileAnalyzer"        },
     { JCE_PANEL_BT_VISUALIZER,       "window.btVisualizer"           },
     { JCE_PANEL_WORLD_STREAMING,     "window.worldStreaming"         },
+    { JCE_PANEL_USER_GUIDE,          "window.userGuide"              },
 };
 static constexpr int kPanelKeyCount =
     (int)(sizeof(kPanelKeys) / sizeof(kPanelKeys[0]));

@@ -47,7 +47,11 @@ enum AssetBrowserViewMode {
 
 struct AssetBrowserState {
     std::string current_path;
+    /* Real project root followed from Open Project / recent project. */
+    std::string followed_project_root;
+    /* Effective browser root. May be a temporary simulated root. */
     std::string project_root;
+    bool project_root_simulated;
     std::vector<FileEntry> entries;
     std::set<int> selected_set;
     int last_clicked_idx;
@@ -96,6 +100,9 @@ std::string normalized_path_string(const std::string &p);
 void        ensure_assets_init(void);
 void        refresh_entries(void);
 void        navigate_asset_directory(const std::string &path, bool clear_search);
+bool        asset_browser_can_use_root(const std::string &path);
+bool        set_asset_browser_simulated_root(const std::string &path);
+bool        restore_asset_browser_project_root(void);
 void        collect_search_results(const std::string &query);
 
 ImVec4      asset_color_for_ext(const std::string &ext, bool is_dir);

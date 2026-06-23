@@ -78,7 +78,7 @@ void fv_render_zoomable(const FvZoomable *p)
         dl->PushClipRect(origin,
                          ImVec2(origin.x + avail.x, origin.y + avail.y),
                          true);
-        dl->AddImage((ImTextureID)(uintptr_t)p->tex.idx,
+        dl->AddImage((ImTextureID)(uintptr_t)((uint32_t)p->tex.idx + 1u),
                      img_pos,
                      ImVec2(img_pos.x + disp_w, img_pos.y + disp_h));
         dl->PopClipRect();

@@ -83,6 +83,11 @@ class JCEConan(ConanFile):
         self.requires("ozz-animation/0.14.1")
         self.requires("behaviortree.cpp/4.9.0")
 
+        # Gameplay scripting VM (Phase 0 keystone). Plain Lua 5.4 (not LuaJIT)
+        # for full cross-platform/arch portability — wasm, iOS (no-JIT) and
+        # arm targets need an interpreter, not a JIT.
+        self.requires("lua/5.4.8")
+
         self.requires("physfs/3.2.0")
         self.requires("zstd/1.5.7")
         self.requires("xxhash/0.8.3")

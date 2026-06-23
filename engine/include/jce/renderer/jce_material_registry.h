@@ -7,7 +7,8 @@
  * unconditionally.
  *
  * Lifecycle (typical):
- *   jce_material_registry_init();                 // engine boot
+ *   jce_material_registry_init(dev_dir);          // dev_dir from the app
+ *                                                 // layer (jce_args), or NULL
  *   jce_material_registry_set_reload_cb(cb, ud);  // game wires its
  *                                                 // own "patch all
  *                                                 // MeshRenderers
@@ -24,8 +25,9 @@
  *
  * Thread model: single-threaded.  Call from the main thread only.
  *
- * Layer: L3 renderer (depends on jce_pbr_material + jce_filesystem
- * + jce_args).
+ * Layer: L3 renderer (depends on jce_pbr_material + jce_filesystem).
+ * The dev-assets dir is passed IN by the caller (app/game layer owns jce_args)
+ * so this L3 module never reaches up into the application layer.
  */
 
 #ifndef JCE_MATERIAL_REGISTRY_H
@@ -52,9 +54,10 @@ typedef void (*JceMaterialReloadFn)(const char *vfs_path,
                                     const char tex_paths[5][256],
                                     void *user);
 
-/* Initialise. Safe to call when dev mode is off (becomes a no-op
- * tracker).  Returns true even in no-op mode. */
-JCE_API bool JCE_CALL jce_material_registry_init(void);
+/* Initialise with the dev-assets directory (typically
+ * jce_args_get_dev_assets() from the app/game layer).  Pass NULL or "" to run
+ * as a no-op tracker (shipping builds).  Returns true even in no-op mode. */
+JCE_API bool JCE_CALL jce_material_registry_init(const char *dev_assets_dir);
 
 /* Release internal state. */
 JCE_API void JCE_CALL jce_material_registry_shutdown(void);

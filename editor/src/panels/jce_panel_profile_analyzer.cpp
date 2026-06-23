@@ -208,10 +208,10 @@ void draw_spike_table(void)
                           ImVec2(0, 120.0f))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("#",        ImGuiTableColumnFlags_WidthFixed, 40.0f);
-        ImGui::TableSetupColumn("Frame ms", ImGuiTableColumnFlags_WidthFixed, 70.0f);
-        ImGui::TableSetupColumn("CPU ms",   ImGuiTableColumnFlags_WidthFixed, 70.0f);
-        ImGui::TableSetupColumn("GPU ms",   ImGuiTableColumnFlags_WidthFixed, 70.0f);
-        ImGui::TableSetupColumn("Wait ms",  ImGuiTableColumnFlags_WidthFixed, 70.0f);
+        ImGui::TableSetupColumn(jce_editor_i18n("profileAnalyzer.col.frameMs"), ImGuiTableColumnFlags_WidthFixed, 70.0f);
+        ImGui::TableSetupColumn(jce_editor_i18n("profileAnalyzer.col.cpuMs"),   ImGuiTableColumnFlags_WidthFixed, 70.0f);
+        ImGui::TableSetupColumn(jce_editor_i18n("profileAnalyzer.col.gpuMs"),   ImGuiTableColumnFlags_WidthFixed, 70.0f);
+        ImGui::TableSetupColumn(jce_editor_i18n("profileAnalyzer.col.waitMs"),  ImGuiTableColumnFlags_WidthFixed, 70.0f);
         ImGui::TableHeadersRow();
 
         for (int i = 0; i < s.filled; ++i) {

@@ -5,9 +5,10 @@
  * SDL_ShowSaveFileDialog so editor/game code never includes Win32
  * <shlobj.h> / Cocoa NSOpenPanel / GTK FileChooser directly.
  *
- * THREADING: callbacks fire on the SDL event-pumping thread (typically
- * the main thread on desktop).  Treat the callback as "called later from
- * the UI thread"; do NOT block waiting for it.
+ * THREADING: callback thread is backend-defined.  Some SDL3 desktop
+ * backends invoke it from a native dialog worker thread, so consumers must
+ * marshal results to their owning thread before touching UI, config, ECS, or
+ * other non-thread-safe state.  Do NOT block waiting for it.
  *
  * Layer: Platform (Layer 1 — depends on jce_core, uses SDL3 internally).
  */

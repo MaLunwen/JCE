@@ -261,6 +261,15 @@ _jce_add_layer(jce_ai
 	            flecs::flecs_static
 	CXX)
 
+# Gameplay scripting VM (Phase 0 keystone). Generic Lua host: depends ONLY on
+# lua + core. Scene/ECS access is provided by the runtime via a JceScriptHost
+# callback bridge (mirrors how jce_ai's BT actions are registered by the
+# runtime) so this layer never depends upward on scene.
+_jce_add_layer(jce_script
+	DIRS      middleware/script
+	LINK_PUBLIC  jce_core
+	LINK_PRIVATE lua::lua)
+
 _jce_add_layer(jce_net
 	DIRS      middleware/net
 	LINK_PUBLIC  jce_core
@@ -294,7 +303,10 @@ _jce_add_layer(jce_scene
 _jce_add_layer(jce_world
 	DIRS      middleware/world
 	LINK_PUBLIC  jce_core
-	LINK_PRIVATE flecs::flecs_static bgfx::bgfx)
+	# GAS attribute replication (jce_gas_replication.c) registers a packed
+	# replica component with the net snapshot substrate.  jce_net links only
+	# jce_core (no jce_world), so this private edge introduces no cycle.
+	LINK_PRIVATE flecs::flecs_static bgfx::bgfx jce_net)
 
 _jce_add_layer(jce_save
 	DIRS      middleware/save
@@ -397,8 +409,15 @@ _jce_add_layer(jce_resource
 # with the bimg block encoder, so "Build Bundles" produces BC/ASTC textures
 # in-process (no jce_cook subprocess). This mirrors the existing precedent of
 # assimp/meshoptimizer being linked here purely for the build-time mesh→GLB
-# converter (jce_bundle_mesh_convert.cpp). These TUs only execute on the
-# editor/CLI pack path; the shipping runtime never calls them.
+# converter (jce_bundle_mesh_convert.cpp).
+#
+# NOTE (audit Round-3 P3-E): the shipping runtime ALSO reaches a subset of
+# these symbols — jce_texture_from_cooked() / jce_texture_decode_cooked_rgba8()
+# in jce_renderer call jce_tex_cooked_pixel_size() (size validation) and
+# jce_tex_decode_to_rgba8() to load cooked textures at runtime. They resolve in
+# the monolithic editor/SDK link; a *standalone* jce_renderer link would need
+# these symbols too. A future cleanup may relocate the pure-C sizing helper into
+# the renderer layer to restore strict layering.
 target_sources(jce_resource PRIVATE
 	"${JCE_ENGINE_SRC_DIR}/resource/jce_asset_cooker.c"
 	"${JCE_TOOLS_DIR}/jce_tex_compress.c"
@@ -424,6 +443,7 @@ _jce_add_layer(jce_application
 		jce_physics
 		jce_resource
 		jce_scene
+		jce_script
 	LINK_PRIVATE
 		bgfx::bgfx)
 
@@ -461,6 +481,7 @@ target_link_libraries(JCE INTERFACE
 	jce_world
 	jce_save
 	jce_scene
+	jce_script
 	jce_renderer
 	jce_ui
 	jce_resource

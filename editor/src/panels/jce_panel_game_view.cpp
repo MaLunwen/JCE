@@ -8,13 +8,13 @@
 #include "ui/jce_editor_panels.h"
 #include "core/jce_editor_state.h"
 #include "core/jce_run_manager.h"
+#include "dialogs/jce_editor_dialogs.h"
 #include "scene/jce_editor_game_render.h"
 
 extern "C" {
 #include <jce/os/core/jce_defs.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_path.h>
-#include <jce/os/platform/jce_host_dialog.h>
 #include <jce/renderer/jce_camera.h>
 #include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_renderer_caps.h>
@@ -22,6 +22,8 @@ extern "C" {
 #include <jce/middleware/scene/jce_vcam_system.h>
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/physics/jce_physics.h>
+#include <jce/os/platform/jce_keys.h>
+#include <jce/os/platform/jce_window_event.h>  /* JCE_KMOD_* */
 #include <ctype.h>
 }
 
@@ -43,6 +45,8 @@ static bool s_run_mode_loaded = false;
 static bool s_third_person = false;   /* play camera: false=first-person, true=behind-player */
 static const float kTpBoomLen = 4.5f; /* third-person orbit distance */
 static float s_tp_dist = 4.5f;        /* smoothed boom length (collision-shortened) */
+static char s_pending_game_exe_path[512] = {0};
+static bool s_pending_game_exe_ready = false;
 
 enum {
     JCE_GAME_VIEW_RUN_EDITOR_SIMULATION = 0,
@@ -86,15 +90,98 @@ static void start_external_game(void)
     jce_run_manager_start(&run_cfg);
 }
 
+static void apply_pending_game_exe_pick(void)
+{
+    if (!s_pending_game_exe_ready) {
+        return;
+    }
+
+    s_pending_game_exe_ready = false;
+    if (s_pending_game_exe_path[0] == '\0')
+        return;
+
+    JceEditorConfig c;
+    jce_editor_config_load(&c);
+    snprintf(c.game_executable_path,
+             sizeof(c.game_executable_path), "%s",
+             s_pending_game_exe_path);
+    jce_path_parent(c.game_working_directory,
+                    sizeof(c.game_working_directory),
+                    s_pending_game_exe_path);
+    jce_editor_config_save(&c);
+    s_pending_game_exe_path[0] = '\0';
+}
+
+/* Encode one Unicode codepoint as UTF-8 into `out` (>= 5 bytes); returns the
+ * byte count (0 for control chars we drop). */
+static int encode_utf8(unsigned cp, char out[5])
+{
+    if (cp < 0x20u || cp == 0x7Fu) { out[0] = '\0'; return 0; } /* control */
+    if (cp < 0x80u) {
+        out[0] = (char)cp; out[1] = '\0'; return 1;
+    } else if (cp < 0x800u) {
+        out[0] = (char)(0xC0u | (cp >> 6));
+        out[1] = (char)(0x80u | (cp & 0x3Fu));
+        out[2] = '\0'; return 2;
+    } else if (cp < 0x10000u) {
+        out[0] = (char)(0xE0u | (cp >> 12));
+        out[1] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+        out[2] = (char)(0x80u | (cp & 0x3Fu));
+        out[3] = '\0'; return 3;
+    }
+    out[0] = (char)(0xF0u | (cp >> 18));
+    out[1] = (char)(0x80u | ((cp >> 12) & 0x3Fu));
+    out[2] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+    out[3] = (char)(0x80u | (cp & 0x3Fu));
+    out[4] = '\0'; return 4;
+}
+
+/* Forward this frame's ImGui character queue + editing keys into the focused
+ * ECS-UI InputField.  ImGui's IO is the Game View panel's natural event source
+ * (the same place the pointer is sourced from), so this is correct-by-
+ * construction: it does NOT swallow the events — ImGui still processes them —
+ * and the canvas API is a no-op when no field is focused. */
+static void forward_text_input_to_canvas(void)
+{
+    ImGuiIO &io = ImGui::GetIO();
+    /* Text characters (already filtered to printable by ImGui). */
+    for (int i = 0; i < io.InputQueueCharacters.Size; ++i) {
+        char u8[5];
+        if (encode_utf8((unsigned)io.InputQueueCharacters[i], u8) > 0)
+            jce_editor_game_render_text_input(u8);
+    }
+    /* Editing keys.  Map ImGuiKey → JCE scancode for the keys the canvas
+     * InputField understands. */
+    unsigned short mod = 0;
+    if (io.KeyShift) mod |= JCE_KMOD_SHIFT;
+    if (io.KeyCtrl)  mod |= JCE_KMOD_CTRL;
+    if (io.KeyAlt)   mod |= JCE_KMOD_ALT;
+    struct { ImGuiKey ik; int jk; } map[] = {
+        { ImGuiKey_Backspace,   JCE_KEY_BACKSPACE },
+        { ImGuiKey_Delete,      JCE_KEY_DELETE    },
+        { ImGuiKey_LeftArrow,   JCE_KEY_LEFT      },
+        { ImGuiKey_RightArrow,  JCE_KEY_RIGHT     },
+        { ImGuiKey_Home,        JCE_KEY_HOME      },
+        { ImGuiKey_End,         JCE_KEY_END       },
+        { ImGuiKey_Enter,       JCE_KEY_RETURN    },
+        { ImGuiKey_KeypadEnter, JCE_KEY_KP_ENTER  },
+        { ImGuiKey_Escape,      JCE_KEY_ESCAPE    },
+    };
+    for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); ++i)
+        if (ImGui::IsKeyPressed(map[i].ik, /*repeat*/true))
+            jce_editor_game_render_key_edit(map[i].jk, mod);
+}
+
 /* ── Content (embeddable in tabs) ─────────────────────────────────── */
 
 void jce_editor_panel_game_view_content(void)
 {
     ensure_run_mode_loaded();
     jce_run_manager_poll();
+    apply_pending_game_exe_pick();
 
     /* Toolbar row */
-    const char *aspects[] = { "Free", "16:9", "16:10", "4:3", "21:9", "1:1" };
+    const char *aspects[] = { jce_editor_i18n("gameView.aspect.free"), "16:9", "16:10", "4:3", "21:9", "1:1" };
     ImGui::PushItemWidth(80);
     ImGui::Combo("##aspect", &s_aspect_idx, aspects, 6);
     ImGui::PopItemWidth();
@@ -165,7 +252,7 @@ void jce_editor_panel_game_view_content(void)
     ImGui::TextUnformatted("|");
     ImGui::SameLine();
 
-    const char *run_modes[] = { "Editor Simulation", "External Game" };
+    const char *run_modes[] = { jce_editor_i18n("gameView.runMode.editorSim"), jce_editor_i18n("gameView.runMode.externalGame") };
     bool external_running = jce_run_manager_is_running();
     ImGui::PushItemWidth(150);
     if (external_running) ImGui::BeginDisabled();
@@ -209,25 +296,19 @@ void jce_editor_panel_game_view_content(void)
             if (ImGui::SmallButton(">")) start_external_game();
             ImGui::SameLine();
             if (ImGui::SmallButton("...##pickExe")) {
-                jce_host_dialog_pick_file(
+                s_pending_game_exe_path[0] = '\0';
+                s_pending_game_exe_ready = false;
+                open_file_dialog_async(
                     jce_editor_i18n("gameView.selectGameExe"), nullptr,
 #if JCE_PLATFORM_WINDOWS
-                    "Executables (*.exe);;All Files (*.*)",
+                    jce_editor_i18n_or("fileDialog.filter.executables",
+                         "Executables (*.exe);;All Files (*.*)"),
 #else
-                    "All Files (*)",
+                    jce_editor_i18n_or("fileDialog.filter.allFilesUnix", "All Files (*)"),
 #endif
-                    [](void *, JceDialogResult result, const char *path) {
-                        if (result != JCE_DIALOG_OK || !path) return;
-                        JceEditorConfig c;
-                        jce_editor_config_load(&c);
-                        snprintf(c.game_executable_path,
-                                 sizeof(c.game_executable_path), "%s", path);
-                        jce_path_parent(c.game_working_directory,
-                                        sizeof(c.game_working_directory),
-                                        path);
-                        jce_editor_config_save(&c);
-                    },
-                    nullptr);
+                    s_pending_game_exe_path, sizeof(s_pending_game_exe_path),
+                    &s_pending_game_exe_ready,
+                    NULL);
             }
             if (ImGui::IsItemHovered()) {
                 JceEditorConfig c;
@@ -331,13 +412,23 @@ void jce_editor_panel_game_view_content(void)
         float ui_y = inside ? ly / view_size.y * (float)vh : 0.0f;
         bool down = inside && ImGui::IsMouseDown(ImGuiMouseButton_Left);
         jce_editor_game_render_set_ui_pointer(ui_x, ui_y, down, inside);
+
+        /* Forward keyboard / text into the focused ECS-UI InputField while the
+         * Game View is hovered (and not in FPS capture) during Play.  The
+         * canvas API is fire-and-forget (no-op when nothing focused) and does
+         * not consume the events — ImGui still sees them. */
+        JcePlayState ui_ps = jce_state_get_play_state();
+        if (inside && ui_ps == JCE_PLAY_PLAYING)
+            forward_text_input_to_canvas();
     }
 
     jce_editor_game_render_frame(vw, vh);
 
     uint16_t tex_idx = jce_editor_game_render_get_texture();
     if (tex_idx != UINT16_MAX) {
-        ImTextureID tid = (ImTextureID)(uintptr_t)tex_idx;
+        /* +1: encode bgfx idx so a valid idx 0 != ImTextureID_Invalid(0)
+         * (audit Round-3 P2-B; the imgui_renderer backend decodes -1). */
+        ImTextureID tid = (ImTextureID)(uintptr_t)((uint32_t)tex_idx + 1u);
         ImVec2 uv0(0.0f, 0.0f), uv1(1.0f, 1.0f);
         if (jce_renderer_origin_bottom_left()) {
             uv0 = ImVec2(0.0f, 1.0f);
@@ -369,6 +460,21 @@ void jce_editor_panel_game_view_content(void)
     bool play_active = (play_state == JCE_PLAY_PLAYING ||
                         play_state == JCE_PLAY_PAUSED);
 
+    /* ── ScrollView wheel channel ───────────────────────────────────────
+     * Forward ImGui's mouse-wheel (vertical io.MouseWheel = +up, horizontal
+     * io.MouseWheelH = +right) into the ECS-UI ScrollView under the pointer.
+     * Runs after the per-frame render (jce_editor_game_render_frame above), so
+     * the canvas has resolved this frame's hovered scroll view, and only while
+     * the Game View Image is hovered + not FPS-captured during Play.  Fire-and-
+     * forget: a no-op when no scroll view is hovered, and it does NOT consume
+     * the wheel — ImGui still sees it. */
+    if (play_state == JCE_PLAY_PLAYING && hovered &&
+        !jce_editor_game_render_is_mouse_captured()) {
+        ImGuiIO &io_w = ImGui::GetIO();
+        if (io_w.MouseWheel != 0.0f || io_w.MouseWheelH != 0.0f)
+            jce_editor_game_render_scroll(io_w.MouseWheelH, io_w.MouseWheel);
+    }
+
     /* Re-arm the third-person boom on each Play start so a collision-
      * shortened length from the previous session doesn't leak in. */
     static bool s_tp_was_play = false;
@@ -391,6 +497,12 @@ void jce_editor_panel_game_view_content(void)
         s_prev_play_state != JCE_PLAY_STOPPED) {
         s_user_wants_capture = false;
     }
+    /* Play rising edge (STOPPED -> PLAYING): orient the game-view camera to the
+     * player's forward once (after the first player-snap below) so the user
+     * starts looking where the character faces — e.g. at enemies ahead. */
+    static bool s_orient_to_player_forward = false;
+    if (play_state != JCE_PLAY_STOPPED && s_prev_play_state == JCE_PLAY_STOPPED)
+        s_orient_to_player_forward = true;
     s_prev_play_state = play_state;
 
     if (cam) {
@@ -421,6 +533,12 @@ void jce_editor_panel_game_view_content(void)
         jce_editor_game_render_set_mouse_capture(effective_capture);
 
         if (effective_capture) {
+            /* Top 6: feed the live editor action map into the Play runtime so
+             * gameplay scripts can read authored actions by name (jce.is_action_
+             * down / get_axis) in editor Play, like a shipped game.  Once per
+             * captured frame, before the player-input gather + runtime step. */
+            if (play_active)
+                jce_editor_play_set_actions(jce_editor_input_actions_live());
             /* V toggles first/third-person follow camera (Play mode). */
             if (play_active && ImGui::IsKeyPressed(ImGuiKey_V, false))
                 s_third_person = !s_third_person;
@@ -497,9 +615,22 @@ void jce_editor_panel_game_view_content(void)
                 bool sprint =
                     act_down("sprint", ImGuiKey_LeftCtrl) ||
                     ImGui::IsKeyDown(ImGuiKey_RightCtrl);
+                /* Melee/attack — fed as HELD (not edge): the player input is
+                 * gathered here but consumed by the runtime step on the next
+                 * tick, so a 1-frame edge would be missed.  The script's own
+                 * cooldown gates the swing rate.  (J action; left-mouse too.)
+                 *
+                 * Left-mouse comes from the captured-button tracker, NOT
+                 * ImGui::IsKeyDown(ImGuiKey_MouseLeft): during FPS capture the
+                 * editor stops forwarding mouse buttons to ImGui, so ImGui's
+                 * MouseLeft sticks DOWN forever (the capture-acquire click's
+                 * release is swallowed) — which froze attack_pressed true and
+                 * let the Lua rising-edge fire exactly once per Play session. */
+                bool attack = act_down("attack", ImGuiKey_J) ||
+                              jce_editor_game_render_mouse_button(0);
                 /* Unit direction only — move_speed/jump arc come from the
                  * scene's CharacterController component. */
-                jce_editor_play_set_player_input(wx, wz, jump, jump_held, sprint);
+                jce_editor_play_set_player_input(wx, wz, jump, jump_held, sprint, attack);
                 /* Facing + idle/walk/run clip are driven generically by the
                  * engine runtime (rt_drive_character), so it also works in the
                  * shipped game, not just here. */
@@ -564,12 +695,30 @@ void jce_editor_panel_game_view_content(void)
                         float k = 1.0f - expf(-8.0f * (dt > 0 ? dt : 0.016f));
                         s_tp_dist += (target_dist - s_tp_dist) * k;
                     }
+                    float shk[3] = {0.0f, 0.0f, 0.0f};
+                    jce_vcam_system_get_shake_offset(shk);
                     jce_camera_set_position(cam,
-                        jce_v3(pivot.x + back.x * s_tp_dist,
-                               pivot.y + back.y * s_tp_dist + 0.4f,
-                               pivot.z + back.z * s_tp_dist));
+                        jce_v3(pivot.x + back.x * s_tp_dist + shk[0],
+                               pivot.y + back.y * s_tp_dist + 0.4f + shk[1],
+                               pivot.z + back.z * s_tp_dist + shk[2]));
                 } else {
-                    jce_camera_set_position(cam, jce_v3(px, py + 1.6f, pz));
+                    float shk[3] = {0.0f, 0.0f, 0.0f};
+                    jce_vcam_system_get_shake_offset(shk);
+                    jce_camera_set_position(cam,
+                        jce_v3(px + shk[0], py + 1.6f + shk[1], pz + shk[2]));
+                }
+                /* One-shot on Play start: aim the camera down the player's
+                 * forward so the view begins facing where the character does
+                 * (e.g. at the enemies ahead).  General default framing; a
+                 * Play-start VCam (evaluated below) still overrides this. */
+                if (s_orient_to_player_forward) {
+                    float fx, fy, fz;
+                    if (jce_editor_play_get_player_forward(&fx, &fy, &fz)) {
+                        jce_camera_look_at(cam,
+                            jce_v3(px + fx * 10.0f, py + 1.6f + fy * 10.0f,
+                                   pz + fz * 10.0f));
+                        s_orient_to_player_forward = false;
+                    }
                 }
             }
         }
@@ -602,17 +751,15 @@ void jce_editor_panel_game_view_content(void)
     if (jce_editor_game_render_is_mouse_captured()) {
         dl->AddText(ImVec2(image_min.x + 6.0f, image_min.y + 4.0f),
                     IM_COL32(80, 220, 120, 230),
-                    "[FPS] WASD move | Space up | Shift down | Ctrl x5  "
-                    "(hold ALT to free cursor, ESC to exit)");
+                    jce_editor_i18n("gameView.hud.flyCaptured"));
     } else if (s_user_wants_capture) {
         dl->AddText(ImVec2(image_min.x + 6.0f, image_min.y + 4.0f),
                     IM_COL32(255, 220, 120, 230),
-                    "[ALT held - cursor free]  release ALT to re-capture");
+                    jce_editor_i18n("gameView.hud.altFree"));
     } else if (hovered) {
         dl->AddText(ImVec2(image_min.x + 6.0f, image_min.y + 4.0f),
                     IM_COL32(220, 220, 220, 200),
-                    "Click to enter FPS fly-cam (WASD/Space/Shift, "
-                    "Ctrl=boost, ALT=free, ESC=exit)");
+                    jce_editor_i18n("gameView.hud.clickToFly"));
     }
 
     if (s_show_stats) {

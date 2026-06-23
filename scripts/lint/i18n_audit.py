@@ -7,10 +7,10 @@ and the audit picks it up.
 Rules:
     * ``en.json`` is the source of truth — every key used in the editor
       C/C++ sources must exist in EN.
-    * ``zh_cn.json`` must be a 1:1 superset/match of EN (full coverage).
-    * Other locales (ko, ja, de, …) are best-effort: missing keys fall
-      back to EN at runtime; extra keys not present in EN are flagged
-      as typo/orphan candidates (FAIL).
+    * EVERY shipped locale (zh_cn, ko, ja, de, …) must be a 1:1 match of
+      EN — full coverage. Missing keys FAIL (no silent EN-fallback drift);
+      extra keys not present in EN FAIL as typo/orphan candidates. A new
+      EN key is therefore a release gate until all locales carry it.
     * The reserved ``_meta.*`` namespace (e.g. ``_meta.nativeName``) is
       ignored by the coverage checks — it carries metadata, not strings
       used by jce_editor_i18n() lookups.
@@ -71,17 +71,22 @@ if 'zh_cn' in locales:
     if len(extra_zh) > 80: print(' ...', len(extra_zh) - 80, 'more')
     if miss_zh or extra_en or extra_zh: failed = True
 
-# Best-effort locales: must be subset of EN (no orphan / typo keys).
+# Every shipped locale must be a 1:1 match of EN: missing keys FAIL
+# (no silent EN-fallback drift), orphan/typo keys FAIL.
 for code, table in sorted(locales.items()):
     if code in ('en', 'zh_cn'): continue
     data = {k: v for k, v in table.items() if not is_meta(k)}
     data_keys = set(data.keys())
     orphans = sorted(data_keys - en_keys)
+    missing = sorted(en_keys - data_keys)
     covered = len(data_keys & en_keys)
     print(f'{code}-extra (typo/orphan, FAIL):', len(orphans))
     for k in orphans: print(f'  {code.upper()}-ORPHAN', k)
+    print(f'{code}-missing (FAIL):', len(missing))
+    for k in missing[:80]: print(f'  {code.upper()}-MISS', k)
+    if len(missing) > 80: print(' ...', len(missing) - 80, 'more')
     pct = 100.0 * covered / max(1, len(en))
     print(f'{code} coverage: {covered}/{len(en)} ({pct:.1f}%)')
-    if orphans: failed = True
+    if orphans or missing: failed = True
 
 sys.exit(1 if failed else 0)

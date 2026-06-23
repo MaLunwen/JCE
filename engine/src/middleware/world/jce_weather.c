@@ -12,6 +12,7 @@
 #include <jce/os/core/jce_log.h>
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/os/core/jce_profiler.h>
+#include <jce/renderer/jce_shaders.h>   /* jce_shaders_embedded_engine_pak fallback */
 #include <jce/middleware/world/jce_weather.h>
 
 #include "os/core/jce_memory.h"
@@ -58,7 +59,14 @@ static bgfx_shader_handle_t weather_load_shader(const JcePakArchive *pak,
     bgfx_shader_handle_t invalid = { UINT16_MAX };
     char path[256];
     snprintf(path, sizeof(path), "shaders/%s_%s.bin", name, sfx);
-    const JcePakAsset *asset = jce_pak_find(pak, path);
+    /* Engine shaders are baked into jce_renderer's embedded pak, not the scene/
+     * editor pak (which ships zero shaders).  Try the caller pak, then fall back
+     * to the embedded engine-shader pak (mirrors load_single / decals). */
+    const JcePakAsset *asset = pak ? jce_pak_find(pak, path) : NULL;
+    if (!asset) {
+        const JcePakArchive *fb = jce_shaders_embedded_engine_pak();
+        if (fb && fb != pak) { asset = jce_pak_find(fb, path); if (asset) pak = fb; }
+    }
     if (!asset) { LOG_ERROR(LOG_TAG, "shader not found: %s", path); return invalid; }
     void *buf = JCE_MALLOC((size_t)asset->original_size);
     if (!buf) return invalid;

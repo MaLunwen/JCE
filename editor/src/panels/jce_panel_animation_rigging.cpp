@@ -35,6 +35,8 @@ enum RigConstraintKind {
     RIG_KIND_MULTI_PARENT  = 2,
     RIG_KIND_POSITION      = 3,
     RIG_KIND_ROTATION      = 4,
+    RIG_KIND_CCD           = 5,  /* n-bone cyclic-coordinate-descent chain */
+    RIG_KIND_FABRIK        = 6,  /* forward-and-backward-reaching chain */
     RIG_KIND_COUNT
 };
 
@@ -67,6 +69,8 @@ const char *kind_label(int kind)
     case RIG_KIND_MULTI_PARENT: return jce_editor_i18n("panel.animRig.kindMultiParent");
     case RIG_KIND_POSITION:     return jce_editor_i18n("panel.animRig.kindPosition");
     case RIG_KIND_ROTATION:     return jce_editor_i18n("panel.animRig.kindRotation");
+    case RIG_KIND_CCD:          return jce_editor_i18n("panel.animRig.kindCcd");
+    case RIG_KIND_FABRIK:       return jce_editor_i18n("panel.animRig.kindFabrik");
     default:                    return "?";
     }
 }

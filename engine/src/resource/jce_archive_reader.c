@@ -16,6 +16,7 @@
 
 #include "resource/jce_archive_format.h"
 #include "resource/jce_archive_crypto.h"
+#include "resource/jce_read_bounds.h"
 
 #include <string.h>
 
@@ -66,6 +67,9 @@ struct JceArchive {
 static uint8_t g_process_key[JCE_ARCHIVE_KEY_BYTES];
 static int     g_has_process_key = 0;
 
+/* Opt-in integrity gate (default off): see jce_archive_set_verify_on_open. */
+static int     g_verify_on_open = 0;
+
 void jce_archive_set_process_key(const uint8_t key[32]) {
     if (!key) {
         memset(g_process_key, 0, sizeof(g_process_key));
@@ -74,6 +78,10 @@ void jce_archive_set_process_key(const uint8_t key[32]) {
     }
     memcpy(g_process_key, key, JCE_ARCHIVE_KEY_BYTES);
     g_has_process_key = 1;
+}
+
+void jce_archive_set_verify_on_open(int enable) {
+    g_verify_on_open = enable ? 1 : 0;
 }
 
 /* Parse the dictionary table (immediately after the header) into a resident
@@ -93,7 +101,7 @@ static int decode_dict_table(JceArchive *ar) {
         o->offset = jarc_rd64(d + JARC_DOFF_DATA_OFFSET);
         o->size   = jarc_rd32(d + JARC_DOFF_SIZE);
         o->tag    = jarc_rd32(d + JARC_DOFF_TAG);
-        if (o->offset + o->size > ar->blob_size) {
+        if (!jce_region_in_bounds(o->offset, o->size, ar->blob_size)) {
             LOG_WARN(JARC_TAG, "reject: dictionary %u out of bounds", (unsigned)i);
             return 0;
         }
@@ -124,7 +132,7 @@ static int decode_index(JceArchive *ar, const uint8_t *rec, uint32_t count) {
         }
         prev_hash = o->path_hash;
 
-        if (o->data_offset + o->stored_size > ar->blob_size) {
+        if (!jce_region_in_bounds(o->data_offset, o->stored_size, ar->blob_size)) {
             LOG_WARN(JARC_TAG, "reject: entry %u out of bounds", (unsigned)i);
             return 0;
         }
@@ -137,7 +145,7 @@ static int decode_index(JceArchive *ar, const uint8_t *rec, uint32_t count) {
  * that the runtime never depends on for correctness). */
 static void parse_debug_paths(JceArchive *ar) {
     size_t off = (size_t)(ar->index_offset + ar->index_stored_size);
-    if (off + 4 > ar->blob_size) return;
+    if (!jce_region_in_bounds(off, 4, ar->blob_size)) return;
 
     uint32_t count = jarc_rd32(ar->blob + off);
     off += 4;
@@ -148,10 +156,10 @@ static void parse_debug_paths(JceArchive *ar) {
     for (uint32_t i = 0; i < count; i++) paths[i] = NULL;
 
     for (uint32_t i = 0; i < count; i++) {
-        if (off + 2 > ar->blob_size) goto fail;
+        if (!jce_region_in_bounds(off, 2, ar->blob_size)) goto fail;
         uint16_t len = jarc_rd16(ar->blob + off);
         off += 2;
-        if (off + len > ar->blob_size) goto fail;
+        if (!jce_region_in_bounds(off, len, ar->blob_size)) goto fail;
         char *s = (char *)jce_malloc((size_t)len + 1);
         if (!s) goto fail;
         memcpy(s, ar->blob + off, len);
@@ -192,7 +200,7 @@ static JceArchive *open_internal(const uint8_t *blob, size_t size, int owns) {
                               (uint64_t)dict_count * JARC_DICT_ENTRY_SIZE;
     if (dict_table_end > size) return NULL;
     if (index_offset < dict_table_end || index_offset > size) return NULL;
-    if (index_offset + index_stored_size > size) return NULL;
+    if (!jce_region_in_bounds(index_offset, index_stored_size, size)) return NULL;
     if (index_orig_size != (uint64_t)entry_count * JARC_INDEX_ENTRY_SIZE) return NULL;
 
     JceArchive *ar = (JceArchive *)jce_malloc(sizeof(JceArchive));
@@ -254,6 +262,15 @@ static JceArchive *open_internal(const uint8_t *blob, size_t size, int owns) {
 
     ar->dctx = ZSTD_createDCtx();
     if (!ar->dctx) goto fail;
+
+    /* Opt-in integrity gate (default off): reject tampered/corrupted blobs
+     * before any consumer reads them. */
+    if (g_verify_on_open && !jce_archive_verify_header(ar)) {
+        LOG_WARN(JARC_TAG, "reject: content-hash verification failed");
+        ZSTD_freeDCtx(ar->dctx);
+        ar->dctx = NULL;
+        goto fail;
+    }
 
     return ar;
 
@@ -341,7 +358,7 @@ size_t jce_archive_read(const JceArchive *ar, const JceArchiveEntry *entry,
                         void *buf, size_t buf_size) {
     if (!ar || !entry || !buf) return 0;
     if (buf_size < entry->original_size) return 0;
-    if (entry->data_offset + entry->stored_size > ar->blob_size) return 0;
+    if (!jce_region_in_bounds(entry->data_offset, entry->stored_size, ar->blob_size)) return 0;
 
     const uint8_t *src = ar->blob + entry->data_offset;
     uint8_t *decrypted = NULL;
@@ -422,7 +439,7 @@ int jce_archive_map_entry(const JceArchive *ar, const JceArchiveEntry *entry,
     /* Only uncompressed, unencrypted bytes are directly usable in place. */
     if (entry->compression != JARC_COMP_NONE) return 0;
     if (entry->entry_flags & JARC_ENTRY_ENCRYPTED) return 0;
-    if (entry->data_offset + entry->original_size > ar->blob_size) return 0;
+    if (!jce_region_in_bounds(entry->data_offset, entry->original_size, ar->blob_size)) return 0;
     *ptr  = ar->blob + entry->data_offset;
     *size = entry->original_size;
     return 1;

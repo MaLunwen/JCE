@@ -78,6 +78,17 @@ JCE_API JceTextureCpu *jce_texture_decode_cpu_mem(const void *encoded,
                                                   size_t size,
                                                   int sampler_mode);
 
+/* Decode the BASE MIP of a cooked .jceasset texture (block-compressed or
+ * RGBA8) to a freshly-allocated RGBA8 buffer.  For consumers that want CPU
+ * RGBA8 rather than a GPU block upload — e.g. the editor previewing a scene
+ * loaded from a bundle/PAK, whose texture cache is RGBA8-based.  On success
+ * *out_rgba8 points at a jce_malloc'd buffer the caller must jce_free.
+ * Returns false (and leaves *out_rgba8 NULL) for non-cooked / malformed
+ * input, so callers can fall back to a raw image decode. */
+JCE_API bool jce_texture_decode_cooked_rgba8(const void *encoded, size_t size,
+                                             uint8_t **out_rgba8,
+                                             uint32_t *out_w, uint32_t *out_h);
+
 /* Render-thread: upload a decoded result to a GPU texture and free `c`
  * (also frees `c` when it is NULL/failed).  Returns JCE_TEXTURE_INVALID
  * on failure. */
@@ -106,17 +117,43 @@ JCE_API void       jce_texture_destroy(JceTexture tex);
 /* Runtime mip streaming (P3-A.2)                                      */
 /* ================================================================== */
 /*
- * Per-texture mip bias.  0 = full quality, +1 = drop top mip, +2 = drop
- * two top mips, etc.  Negative values are clamped to 0.
+ * CONTRACT (read before relying on this for memory reclaim).
  *
- * The final bias actually applied on the GPU is the maximum of:
+ * These calls express a *desired* mip residency.  The effective top-mip is
+ * the maximum of:
  *   - the global bias       (jce_texture_set_global_mip_bias),
  *   - the per-texture bias  (jce_texture_set_mip_bias),
+ *   - the requested floor   (jce_texture_request_mip_residency),
  *   - the caps floor        (derived from jce_renderer_get_tier(); see
  *                            engine/src/renderer/jce_texture.c for the
- *                            Low/Mid/High → floor matrix).
+ *                            Low/Mid/High → floor matrix),
+ * clamped so the smallest 4x4 mip-tail is always resident.
  *
- * The smallest 4x4 mip-tail is always considered resident.
+ * Whether the desire is *physically realised* depends on having a CPU copy
+ * of the texture's mip-0 to re-upload from:
+ *
+ *   - Source-backed textures (a retained RGBA8 mip-0): an effective top-mip
+ *     change destroys and recreates the GPU texture at the smaller size, so
+ *     VRAM is genuinely reclaimed and jce_texture_get_size /
+ *     jce_texture_get_resident_top_mip report the new, smaller resident level.
+ *
+ *   - Default textures (NO retained copy): to honour the low-memory baseline
+ *     (single-core, 512 MB, no discrete GPU) the engine does NOT keep a
+ *     redundant CPU mirror of every texture.  For these, a bias/residency
+ *     request is recorded as intent but the resident GPU texture is left
+ *     unchanged — and crucially the queries keep reporting the TRUE resident
+ *     level/size.  They never claim a shrink that did not happen (audit F29;
+ *     the previous build silently advanced the reported size while leaving the
+ *     GPU at full resolution, corrupting size-derived math and the streaming
+ *     memory accounting).
+ *
+ * Roadmap: full streaming for default textures will arrive with an asset
+ * format that stores the explicit mip chain on disk, so high mips can be
+ * streamed in/out from the PAK on demand instead of from a RAM mirror —
+ * keeping the reclaim path zero-extra-RAM, as the baseline requires.
+ *
+ * Per-texture mip bias.  0 = full quality, +1 = drop top mip, +2 = drop two
+ * top mips, etc.  Negative values are clamped to 0.
  */
 JCE_API void   jce_texture_set_mip_bias(JceTextureId tex, int8_t bias);
 JCE_API int8_t jce_texture_get_mip_bias(JceTextureId tex);
@@ -124,7 +161,8 @@ JCE_API int8_t jce_texture_get_mip_bias(JceTextureId tex);
 /*
  * Request a given top-mip residency (e.g. top_mip = 0 to upload the full
  * chain).  Honored on the next streaming tick; may be denied / clamped
- * upward under HARD streaming pressure or by the caps floor.
+ * upward under HARD streaming pressure or by the caps floor.  See the
+ * CONTRACT note above: only source-backed textures are physically resized.
  */
 JCE_API void    jce_texture_request_mip_residency(JceTextureId tex, uint8_t top_mip);
 JCE_API uint8_t jce_texture_get_resident_top_mip(JceTextureId tex);
@@ -133,7 +171,8 @@ JCE_API uint8_t jce_texture_get_resident_top_mip(JceTextureId tex);
  * Global mip bias.  Added on top of per-texture bias and the caps floor.
  * Driven automatically by the streaming pressure hook
  * (OK -> 0, SOFT -> 1, HARD -> 2) but also callable directly by tools
- * (editor quality slider, headless tests, etc.).
+ * (editor quality slider, headless tests, etc.).  Affects source-backed
+ * textures immediately; a truthful no-op for the rest (see CONTRACT above).
  */
 JCE_API void   jce_texture_set_global_mip_bias(int8_t bias);
 JCE_API int8_t jce_texture_get_global_mip_bias(void);

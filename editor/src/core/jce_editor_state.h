@@ -94,7 +94,12 @@ typedef enum {
 
 /* ── Editor State API ──────────────────────────────────────────────── */
 
-void  jce_editor_state_init(void);
+/* Initialize editor state.  When `with_demo_scene` is true, populates the
+ * default 13-entity demo scene; pass false at startup when a last scene
+ * will be restored immediately, to skip building (and instantly
+ * destroying) the throwaway demo — saves that work off the
+ * time-to-first-frame path. */
+void  jce_editor_state_init(bool with_demo_scene);
 void  jce_editor_state_shutdown(void);
 
 /* Selection */
@@ -112,6 +117,21 @@ const uint32_t *jce_state_get_selection(int *out_count);
 int               jce_state_get_entity_count(void);
 uint32_t          jce_state_get_entity_id_by_index(int index);
 bool              jce_state_entity_exists(uint32_t id);
+bool              jce_state_entity_alive(uint32_t id);          /* crash-safe liveness (list test) */
+uint32_t          jce_state_find_by_name(const char *name);    /* name -> LIVE editor id, 0 if none */
+void              jce_state_prune_dead(void);                   /* drop runtime-destroyed entities from the mirror list */
+/* Install spawn/despawn hooks so world-streamed chunk entities are mirrored
+ * into g_entity_order (Hierarchy panel + selection).  Editor preview + Play
+ * call this on their streamer after creating it. */
+struct JceWorldStreamer;
+void              jce_state_attach_streamer_hierarchy(struct JceWorldStreamer *ws);
+/* Install the HLOD far-skyline coordination: map each streaming chunk to its
+ * always-resident HLOD_<gx>_<gz> proxy (baked by build/gen_hlod.py) and hide
+ * the proxy while the chunk is resident / show it when it unloads.  No-op when
+ * no proxies were baked.  Call after creating the streamer (preview + Play). */
+void              jce_state_attach_streamer_hlod(struct JceWorldStreamer *ws);
+/* Re-show all proxies and clear the map; call when the streamer is torn down. */
+void              jce_state_detach_streamer_hlod(void);
 uint32_t          jce_state_create_entity(const char *name, uint32_t parent_id);
 void              jce_state_delete_entity(uint32_t id);
 void              jce_state_rename_entity(uint32_t id, const char *name);
@@ -137,7 +157,11 @@ const char       *jce_state_entity_prefab_path(uint32_t id);
 JceEntity         jce_state_to_ecs_entity(uint32_t id);
 uint32_t          jce_state_from_ecs_entity(JceEntity e);
 
-/* Component management (thin wrappers — uses JceComponentFlag from jce_scene.h). */
+/* Component management.  The dense comp_id variants (component registry,
+   jce_component_registry.h) are the canonical path; the flag variants are
+   thin legacy wrappers for call sites that still hold JCE_COMP_FLAG_*. */
+void              jce_state_add_component_id(uint32_t entity_id, int comp_id);
+void              jce_state_remove_component_id(uint32_t entity_id, int comp_id);
 void              jce_state_add_component(uint32_t entity_id, uint64_t comp_flag);
 void              jce_state_remove_component(uint32_t entity_id, uint64_t comp_flag);
 const char       *jce_comp_flag_display_name(uint64_t comp_flag);
@@ -150,6 +174,11 @@ const char       *jce_comp_flag_i18n_key(uint64_t comp_flag);
 /* Root entity enumeration. */
 int               jce_state_get_root_count(void);
 uint32_t          jce_state_get_root_id(int index);
+/* O(n) single-pass: collect all root ids (parent==INVALID) into out (up to
+ * max), in g_entity_order order.  Use this instead of the get_root_count +
+ * per-index get_root_id loop, which is O(n^2) and catastrophic at full-load
+ * (thousands of roots x an O(n) scan each). */
+int               jce_state_get_roots(uint32_t *out, int max);
 
 /* Edit mode */
 void          jce_state_set_edit_mode(JceEditMode mode);
@@ -162,6 +191,8 @@ void          jce_state_set_gizmo_space(JceGizmoSpace space);
 JceGizmoSpace jce_state_get_gizmo_space(void);
 void          jce_state_set_gizmo_pivot(JceGizmoPivot pivot);
 JceGizmoPivot jce_state_get_gizmo_pivot(void);
+void          jce_state_set_pivot_edit_mode(bool enabled);
+bool          jce_state_get_pivot_edit_mode(void);
 
 /* Gizmo Ctrl-snap increments (translate units / rotate degrees / scale
  * ratio).  Read by the gizmo snap path; edited via the Scene View "Snap"
@@ -219,6 +250,26 @@ void              jce_state_set_live_preview(bool on);
 /* Scene loading */
 bool              jce_state_new_default_scene(void);
 bool              jce_state_load_scene_file(const char *scene_path);
+
+/* Frame-sliced (non-blocking) scene-file open.  For large scenes (entity
+ * count over an internal threshold) this parses the file, then creates the
+ * entities in chunks across subsequent jce_state_scene_load_poll() calls so
+ * the editor's frame loop stays alive and a "Loading…" overlay can show
+ * progress.  Small scenes load synchronously (identical to
+ * jce_state_load_scene_file) and report not-loading immediately.
+ * Returns true if the open started (or completed synchronously), false on a
+ * read/parse failure (in which case the previous scene is left intact). */
+bool              jce_state_load_scene_file_async(const char *scene_path);
+/* Drive a pending async scene load — call once per editor frame.  No-op when
+ * nothing is loading.  Runs the post-load finalize (hierarchy mirror, camera,
+ * recents, streaming autostart) only when the create pass is fully done. */
+void              jce_state_scene_load_poll(void);
+/* True while an async scene load is mid-flight (entities still being created).
+ * Editor interaction should be gated (via a modal overlay) while true so
+ * nothing operates on a half-built scene. */
+bool              jce_state_is_scene_loading(void);
+/* 0..1 progress of the in-flight async load (0 when none). */
+float             jce_state_scene_load_progress(void);
 /* Load a scene from a standalone .jbundle (single-file mode product).
  * Mounts the bundle internally, reads the scene JSON through the VFS,
  * and applies it as the current scene.  The bundle stays mounted (so
@@ -258,11 +309,12 @@ void          jce_state_play_mode_tick(float dt);
  * if no scene entity has a CharacterController. */
 void jce_editor_play_set_player_input(float walk_x, float walk_z,
                                        bool jump_pressed, bool jump_held,
-                                       bool sprint);
+                                       bool sprint, bool attack);
 
 /* Returns true and writes the player character's world position if a
  * character is alive; false otherwise. */
 bool jce_editor_play_get_player_position(float *out_x, float *out_y, float *out_z);
+bool jce_editor_play_get_player_forward(float *out_x, float *out_y, float *out_z);
 
 /* Returns the live physics world during Play (or NULL if not running).
  * Editor-side debug-draw / contact-listener wiring uses this. */
@@ -274,6 +326,13 @@ struct JcePhysicsWorld *jce_editor_play_get_physics_world(void);
  * jce_runtime_bt_* accessors) uses this. */
 struct JceRuntime;
 struct JceRuntime *jce_editor_play_get_runtime(void);
+
+/* Top 6: bind the live editor action map into the Play runtime each frame so
+ * gameplay scripts can read authored actions by name (jce.is_action_down /
+ * get_axis) in editor Play, exactly like a shipped game.  No-op when not in
+ * Play.  Pass the result of jce_editor_input_actions_live(). */
+struct JceInputActions;
+void jce_editor_play_set_actions(const struct JceInputActions *actions);
 
 /* Live count of active contact pairs during Play (BEGIN++/END--).  0 when
  * not running.  Surfaced by the Physics Debugger. */
@@ -303,8 +362,38 @@ bool  jce_state_transaction_active(void);
 bool     jce_state_save_prefab(uint32_t entity_id, const char *prefab_path);
 uint32_t jce_state_instantiate_prefab(const char *prefab_path, uint32_t parent_id);
 bool     jce_state_revert_prefab(uint32_t entity_id);
+/* Push this instance's edits back to its source .prefab.json (Phase 0.3). */
+bool     jce_state_apply_prefab(uint32_t entity_id);
 bool     jce_state_is_prefab_instance(uint32_t entity_id);
 const char *jce_state_get_prefab_path(uint32_t entity_id);
+
+/* Per-COMPONENT prefab override ops (Unity/Godot-style).  Apply pushes one
+ * component (canonical engine name, e.g. "Transform") from the instance
+ * back to its source .prefab.json and updates every sibling instance that
+ * was not overriding that component; Revert copies the component from the
+ * source back onto the instance (dropping the override).  Both are atomic
+ * (one undo entry).  is_*_overridden answers the inspector indicator. */
+bool     jce_state_apply_prefab_component(uint32_t entity_id,
+                                          const char *comp_name);
+bool     jce_state_revert_prefab_component(uint32_t entity_id,
+                                           const char *comp_name);
+bool     jce_state_is_prefab_component_overridden(uint32_t entity_id,
+                                                  const char *comp_name);
+/* Batch: fill names[][64] with all overridden component names; returns the
+ * count or -1 when not an instance / source unavailable.  Cheaper than the
+ * per-component query for the inspector's per-frame indicator set. */
+int      jce_state_get_prefab_overrides(uint32_t entity_id,
+                                        char names[][64], int max_names);
+
+/* Per-FIELD detail for the inspector override badge tooltip: fill
+ * fields[][64] with the serialized field KEYS of `comp_name` that diverge
+ * from the source prefab (e.g. "posX","metallic").  Returns the count, 0
+ * when the component is overridden as a WHOLE (no per-field localisation,
+ * e.g. the unified "Light"), or -1 when not an instance / source missing.
+ * Lighter than a full save — used only for the hovered component header. */
+int      jce_state_get_prefab_field_overrides(uint32_t entity_id,
+                                              const char *comp_name,
+                                              char fields[][64], int max_fields);
 
 /* Prefab Variant (P1 #10).  Saves a snapshot annotated with `$variantOf`
  * pointing at the parent prefab.  In v0.7.12 the loader treats the

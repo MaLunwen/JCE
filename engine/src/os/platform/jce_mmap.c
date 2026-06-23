@@ -34,16 +34,46 @@ struct JceMmap {
 #endif
 };
 
+#if defined(_WIN32)
+/* JCE paths are UTF-8 throughout; the ...A Win32 file APIs interpret the
+ * system ANSI codepage and fail on non-ASCII paths.  Convert to UTF-16 and
+ * use the ...W APIs (mirrors the in-tree stb_image wide-open path). */
+static wchar_t *utf8_to_wide(const char *utf8) {
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
+    if (wlen <= 0) return NULL;
+    wchar_t *w = (wchar_t *)jce_malloc((size_t)wlen * sizeof(wchar_t));
+    if (!w) return NULL;
+    if (MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w, wlen) <= 0) {
+        jce_free(w);
+        return NULL;
+    }
+    return w;
+}
+
+/* Reject a 64-bit file size that does not fit size_t (32-bit targets cannot
+ * address a >4 GB whole-file map/read; audit R2F23). */
+static int size_fits(LONGLONG qp, size_t *out) {
+    if (qp < 0) return 0;
+    if ((unsigned long long)qp > (unsigned long long)SIZE_MAX) return 0;
+    *out = (size_t)qp;
+    return 1;
+}
+#endif
+
 /* Read the whole file into a jce_malloc'd buffer (mapping fallback / tiny
  * files).  Returns 1 on success, filling *out / *out_size. */
 static int read_whole_file(const char *path, void **out, size_t *out_size) {
 #if defined(_WIN32)
-    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+    wchar_t *wpath = utf8_to_wide(path);
+    if (!wpath) return 0;
+    HANDLE f = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ, NULL,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    jce_free(wpath);
     if (f == INVALID_HANDLE_VALUE) return 0;
     LARGE_INTEGER li;
     if (!GetFileSizeEx(f, &li) || li.QuadPart < 0) { CloseHandle(f); return 0; }
-    size_t sz = (size_t)li.QuadPart;
+    size_t sz;
+    if (!size_fits(li.QuadPart, &sz)) { CloseHandle(f); return 0; }
     uint8_t *buf = (uint8_t *)jce_malloc(sz ? sz : 1);
     if (!buf) { CloseHandle(f); return 0; }
     size_t done = 0;
@@ -86,17 +116,23 @@ JceMmap *jce_mmap_open(const char *path) {
     memset(m, 0, sizeof(*m));
 
 #if defined(_WIN32)
-    m->file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL,
-                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    wchar_t *wpath = utf8_to_wide(path);
+    m->file = wpath
+        ? CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ, NULL,
+                      OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL)
+        : INVALID_HANDLE_VALUE;
+    if (wpath) jce_free(wpath);
     if (m->file != INVALID_HANDLE_VALUE) {
         LARGE_INTEGER li;
-        if (GetFileSizeEx(m->file, &li) && li.QuadPart > 0) {
-            m->mapping = CreateFileMappingA(m->file, NULL, PAGE_READONLY, 0, 0, NULL);
+        size_t fsz = 0;
+        if (GetFileSizeEx(m->file, &li) && li.QuadPart > 0 &&
+            size_fits(li.QuadPart, &fsz)) {
+            m->mapping = CreateFileMappingW(m->file, NULL, PAGE_READONLY, 0, 0, NULL);
             if (m->mapping) {
                 void *view = MapViewOfFile(m->mapping, FILE_MAP_READ, 0, 0, 0);
                 if (view) {
                     m->data = view;
-                    m->size = (size_t)li.QuadPart;
+                    m->size = fsz;
                     m->is_mapped = true;
                     return m;
                 }

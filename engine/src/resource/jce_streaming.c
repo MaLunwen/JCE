@@ -15,7 +15,7 @@
  *       JceThreadPool.  Main thread polls for completion.
  */
 
-#include <jce/middleware/streaming/jce_streaming.h>
+#include <jce/resource/jce_streaming.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_profiler.h>
@@ -445,18 +445,27 @@ void jce_streaming_register_chunk(JceStreamingSystem *sys,
 {
     if (!sys || !chunk) return;
 
-    if (sys->chunk_count >= MAX_CHUNKS) {
-        LOG_ERROR(LOG_TAG, "chunk limit reached (%u)", MAX_CHUNKS);
-        return;
-    }
-
     /* Check for duplicates. */
     if (find_chunk(sys, chunk->chunk_id)) {
         LOG_WARN(LOG_TAG, "chunk %u already registered", chunk->chunk_id);
         return;
     }
 
-    ChunkRecord *c = &sys->chunks[sys->chunk_count++];
+    /* Reuse a slot freed by a previous unregister before growing — otherwise
+     * chunk_count only ever increases and a long session that streams chunks
+     * in and out exhausts MAX_CHUNKS on CUMULATIVE (not concurrent)
+     * registrations (audit F68). */
+    ChunkRecord *c = NULL;
+    for (uint32_t i = 0; i < sys->chunk_count; i++) {
+        if (!sys->chunks[i].registered) { c = &sys->chunks[i]; break; }
+    }
+    if (!c) {
+        if (sys->chunk_count >= MAX_CHUNKS) {
+            LOG_ERROR(LOG_TAG, "chunk limit reached (%u concurrent)", MAX_CHUNKS);
+            return;
+        }
+        c = &sys->chunks[sys->chunk_count++];
+    }
     memset(c, 0, sizeof(*c));
     c->registered = true;
     sys->active_idx[sys->active_count++] = (uint32_t)(c - sys->chunks);
@@ -512,6 +521,23 @@ void jce_streaming_unregister_chunk(JceStreamingSystem *sys,
             break;
         }
     }
+}
+
+void jce_streaming_set_chunk_residency(JceStreamingSystem *sys,
+                                       uint32_t chunk_id, uint64_t bytes)
+{
+    if (!sys) return;
+    ChunkRecord *c = find_chunk(sys, chunk_id);
+    if (!c || c->state != JCE_CHUNK_LOADED) return;
+
+    /* Swap the raw-payload estimate for the consumer's real residency so the
+     * budget reflects what is actually resident, not the tiny source bytes
+     * (audit F3).  LRU + pressure re-evaluate on the next update tick. */
+    if (bytes >= c->estimated_size)
+        sys->memory_used += (bytes - c->estimated_size);
+    else
+        sys->memory_used -= (c->estimated_size - bytes);
+    c->estimated_size = bytes;
 }
 
 /* ── Per-frame update ─────────────────────────────────────────────── */

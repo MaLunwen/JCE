@@ -13,11 +13,12 @@
 
 #include "jce_yuv_convert.h"
 
+#include <jce/os/core/jce_defs.h>   /* canonical JCE_ARCH_* (no raw arch macros) */
 #include <string.h>
 
 /* ── SSE2 fast path (32-bit intermediates via madd) ──────────────── */
 
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#if JCE_ARCH_X64 || JCE_ARCH_X86
 #define JCE_YUV_HAS_SSE2 1
 #include <emmintrin.h>
 
@@ -150,7 +151,7 @@ static void yuv420_to_rgba_sse2(const uint8_t *y_plane, int y_stride,
 
 /* ── NEON fast path (32-bit intermediates via vmull) ─────────────── */
 
-#if defined(__aarch64__) || defined(_M_ARM64)
+#if JCE_ARCH_ARM64
 #define JCE_YUV_HAS_NEON 1
 #include <arm_neon.h>
 

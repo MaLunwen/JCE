@@ -3,6 +3,7 @@
  */
 
 #include <jce/middleware/scene/jce_sequencer.h>
+#include <jce/os/core/jce_easing.h>
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
 
@@ -17,11 +18,15 @@
 #define SEQ_MAX_BIND 128
 #define SEQ_MAX_PROP 64
 #define SEQ_MAX_ENT_NAME 64
+#define SEQ_MAX_KEY_NAME 48
 
 typedef struct {
-    float t;
-    float v;
-    float rgb[3];
+    float       t;
+    float       v;
+    float       rgb[3];
+    JceEaseType ease;               /* per-key easing (LINEAR = backward-compat) */
+    char        name[SEQ_MAX_KEY_NAME]; /* EVENT handler / CAMERA-CUT label      */
+    uint64_t    entity;             /* EVENT/CAMERA-CUT target entity (0 = none)  */
 } SeqKey;
 
 typedef struct {
@@ -55,6 +60,71 @@ static void copy_str(char *dst, size_t cap, const char *src)
     if (n >= cap) n = cap - 1;
     memcpy(dst, src, n);
     dst[n] = 0;
+}
+
+/* Map an authored "ease" value (string id like "easeInOutQuad"/"QuadInOut",
+ * or a raw int matching JceEaseType) onto a JceEaseType.  Unknown / absent →
+ * LINEAR, which is the historical (backward-compatible) behaviour. */
+static JceEaseType parse_ease(JceJson *ko)
+{
+    /* Numeric form: "ease": 3  (a JceEaseType ordinal). */
+    double num = jce_json_get_number(ko, "ease", -1.0);
+    if (num >= 0.0) {
+        int iv = (int)num;
+        if (iv >= 0 && iv < JCE_EASE_COUNT) return (JceEaseType)iv;
+        return JCE_EASE_LINEAR;
+    }
+    /* String form.  Accept the canonical jce_ease_name() ids ("QuadInOut")
+     * AND the common "easeInOutQuad" authoring spelling, case-insensitively,
+     * ignoring '_' and '-' separators. */
+    const char *s = jce_json_get_string(ko, "ease", "");
+    if (!s || !s[0]) return JCE_EASE_LINEAR;
+
+    char norm[32];
+    size_t n = 0;
+    for (const char *p = s; *p && n + 1 < sizeof(norm); ++p) {
+        char c = *p;
+        if (c == '_' || c == '-' || c == ' ') continue;
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        norm[n++] = c;
+    }
+    norm[n] = '\0';
+    /* Drop a leading "ease" prefix so "easeInOutQuad" → "inoutquad". */
+    const char *body = norm;
+    if (strncmp(body, "ease", 4) == 0) body += 4;
+
+    for (int i = 0; i < JCE_EASE_COUNT; ++i) {
+        const char *cn = jce_ease_name((JceEaseType)i); /* e.g. "QuadInOut" */
+        char cnorm[32];
+        size_t m = 0;
+        for (const char *p = cn; *p && m + 1 < sizeof(cnorm); ++p) {
+            char c = *p;
+            if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+            cnorm[m++] = c;
+        }
+        cnorm[m] = '\0';
+        if (strcmp(body, cnorm) == 0) return (JceEaseType)i; /* "quadinout" */
+        /* Also match the swapped "inoutquad" spelling: split family/direction.
+         * Canonical is <family><direction> (e.g. quad + inout); the authoring
+         * spelling is <direction><family> (inout + quad). */
+        const char *dirs[] = { "inout", "in", "out" };
+        for (int d = 0; d < 3; ++d) {
+            size_t dl = strlen(dirs[d]);
+            size_t cl = strlen(cnorm);
+            if (cl > dl && strcmp(cnorm + (cl - dl), dirs[d]) == 0) {
+                /* cnorm = family + dir ; build dir + family and compare. */
+                char swapped[32];
+                size_t fam = cl - dl;
+                if (dl + fam + 1 <= sizeof(swapped)) {
+                    memcpy(swapped, dirs[d], dl);
+                    memcpy(swapped + dl, cnorm, fam);
+                    swapped[dl + fam] = '\0';
+                    if (strcmp(body, swapped) == 0) return (JceEaseType)i;
+                }
+            }
+        }
+    }
+    return JCE_EASE_LINEAR;
 }
 
 static int key_cmp(const void *a, const void *b)
@@ -130,6 +200,17 @@ static JceSequencer *load_root(JceJson *root)
                     k->v = (float)jce_json_get_number(ko, "v", 0.0);
                     k->rgb[0] = 1.0f; k->rgb[1] = 1.0f; k->rgb[2] = 1.0f;
                     jce_json_get_floats(ko, "rgb", k->rgb, 3, NULL);
+                    /* Per-key easing (FEATURE 8.4); absent → LINEAR. */
+                    k->ease = parse_ease(ko);
+                    /* EVENT / CAMERA-CUT payload (ignored by property/color
+                     * eval).  "name" doubles as the script handler for an EVENT
+                     * key; "entity" (a.k.a. "camera") is the cut target. */
+                    copy_str(k->name, sizeof(k->name),
+                             jce_json_get_string(ko, "name", ""));
+                    k->entity = (uint64_t)jce_json_get_number(ko, "entity", 0.0);
+                    if (k->entity == 0)
+                        k->entity =
+                            (uint64_t)jce_json_get_number(ko, "camera", 0.0);
                 }
                 if (t->key_count > 1)
                     qsort(t->keys, t->key_count, sizeof(SeqKey), key_cmp);
@@ -282,6 +363,9 @@ float jce_sequencer_track_eval_float(const JceSequencer *seq, int idx, float ti)
     int lo, hi; float u;
     find_bracket(t, ti, &lo, &hi, &u);
     if (lo < 0) return 0.0f;
+    /* Per-key easing: remap the bracket fraction through the segment's
+     * starting-key ease before the lerp (LINEAR → identity = unchanged). */
+    u = jce_ease(t->keys[lo].ease, u);
     return t->keys[lo].v * (1.0f - u) + t->keys[hi].v * u;
 }
 
@@ -296,6 +380,7 @@ void jce_sequencer_track_eval_color(const JceSequencer *seq, int idx,
     int lo, hi; float u;
     find_bracket(t, ti, &lo, &hi, &u);
     if (lo < 0) return;
+    u = jce_ease(t->keys[lo].ease, u);  /* per-key easing (FEATURE 8.4) */
     for (int c = 0; c < 3; ++c)
         out_rgb[c] = t->keys[lo].rgb[c] * (1.0f - u) + t->keys[hi].rgb[c] * u;
 }
@@ -305,12 +390,71 @@ int jce_sequencer_track_events_in_range(const JceSequencer *seq, int idx,
 {
     if (!seq || idx < 0 || idx >= seq->track_count) return 0;
     const SeqTrack *t = &seq->tracks[idx];
-    if (t->type != JCE_SEQ_TRACK_EVENT) return 0;
+    if (t->type != JCE_SEQ_TRACK_EVENT &&
+        t->type != JCE_SEQ_TRACK_CAMERA_CUT) return 0;
     int n = 0;
     /* (t_prev, t_now] half-open. */
     for (int i = 0; i < t->key_count; ++i) {
         float tk = t->keys[i].t;
         if (tk > t_prev && tk <= t_now) ++n;
+    }
+    return n;
+}
+
+int jce_sequencer_track_key_count(const JceSequencer *seq, int idx)
+{
+    if (!seq || idx < 0 || idx >= seq->track_count) return 0;
+    return seq->tracks[idx].key_count;
+}
+
+float jce_sequencer_track_key_time(const JceSequencer *seq, int idx, int k)
+{
+    if (!seq || idx < 0 || idx >= seq->track_count) return 0.0f;
+    const SeqTrack *t = &seq->tracks[idx];
+    if (k < 0 || k >= t->key_count) return 0.0f;
+    return t->keys[k].t;
+}
+
+const char *jce_sequencer_track_key_name(const JceSequencer *seq, int idx, int k)
+{
+    if (!seq || idx < 0 || idx >= seq->track_count) return "";
+    const SeqTrack *t = &seq->tracks[idx];
+    if (k < 0 || k >= t->key_count) return "";
+    return t->keys[k].name;
+}
+
+uint64_t jce_sequencer_track_key_entity(const JceSequencer *seq, int idx, int k)
+{
+    if (!seq || idx < 0 || idx >= seq->track_count) return 0;
+    const SeqTrack *t = &seq->tracks[idx];
+    if (k < 0 || k >= t->key_count) return 0;
+    return t->keys[k].entity;
+}
+
+JceEaseType jce_sequencer_track_key_ease(const JceSequencer *seq, int idx, int k)
+{
+    if (!seq || idx < 0 || idx >= seq->track_count) return JCE_EASE_LINEAR;
+    const SeqTrack *t = &seq->tracks[idx];
+    if (k < 0 || k >= t->key_count) return JCE_EASE_LINEAR;
+    return t->keys[k].ease;
+}
+
+int jce_sequencer_track_fire_events_in_range(const JceSequencer *seq, int idx,
+                                             float t_prev, float t_now,
+                                             JceSeqEventSink sink, void *user)
+{
+    if (!seq || !sink || idx < 0 || idx >= seq->track_count) return 0;
+    const SeqTrack *t = &seq->tracks[idx];
+    if (t->type != JCE_SEQ_TRACK_EVENT &&
+        t->type != JCE_SEQ_TRACK_CAMERA_CUT) return 0;
+    int n = 0;
+    /* Keys are time-sorted, so iterating in order fires in time order. */
+    for (int i = 0; i < t->key_count; ++i) {
+        const SeqKey *k = &t->keys[i];
+        if (k->t > t_prev && k->t <= t_now) {
+            sink(k->name, k->t, k->entity, user);
+            ++n;
+        }
     }
     return n;
 }

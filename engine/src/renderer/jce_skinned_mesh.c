@@ -10,6 +10,7 @@
 #include "renderer/jce_renderer_internal.h"
 
 #include <bgfx/c99/bgfx.h>
+#include <stddef.h>
 #include <string.h>
 
 #define LOG_TAG "jce_skinned_mesh"
@@ -23,6 +24,16 @@ struct JceSkinnedMesh {
     uint32_t num_indices;
     uint32_t num_wf_indices;
     bool     is_skinned;  /* true = JceSkinnedVertex, false = JcePbrVertex */
+
+    /* Morph deform support (FEATURE 3.1, opt-in via retain_cpu).  When
+     * non-NULL, holds an undeformed CPU copy of the source vertex array
+     * (num_verts * stride bytes) so a per-instance morph can produce a
+     * deformed copy without touching the shared static VB.  NULL (the default)
+     * = zero extra RAM, byte-identical legacy behavior. */
+    void    *base_cpu;     /* owned; NULL unless retain_cpu requested */
+    uint32_t stride;       /* byte stride of the retained vertex format */
+    uint32_t pos_offset;   /* byte offset of POSITION float[3] */
+    uint32_t normal_offset;/* byte offset of NORMAL float[3] */
 };
 
 /* ================================================================== */
@@ -67,7 +78,8 @@ static void init_skinned_layout(bgfx_vertex_layout_t *layout)
 
 JceSkinnedMesh *jce_skinned_mesh_create(
     const JceSkinnedVertex *vertices, uint32_t num_verts,
-    const uint32_t *indices, uint32_t num_indices)
+    const uint32_t *indices, uint32_t num_indices,
+    bool retain_cpu)
 {
     if (!vertices || num_verts == 0) return NULL;
 
@@ -79,6 +91,20 @@ JceSkinnedMesh *jce_skinned_mesh_create(
     m->num_indices = num_indices;
     m->is_skinned  = true;
 
+    /* Morph deform: optionally retain an undeformed CPU copy of the source
+     * verts (FEATURE 3.1).  Gated to morph-bearing prims by the caller, so the
+     * default path allocates nothing.  pos@0 / normal@12 match the layout. */
+    if (retain_cpu) {
+        uint32_t bytes = num_verts * (uint32_t)sizeof(JceSkinnedVertex);
+        m->base_cpu = JCE_MALLOC(bytes);
+        if (m->base_cpu) {
+            memcpy(m->base_cpu, vertices, bytes);
+            m->stride        = (uint32_t)sizeof(JceSkinnedVertex);
+            m->pos_offset    = (uint32_t)offsetof(JceSkinnedVertex, pos);
+            m->normal_offset = (uint32_t)offsetof(JceSkinnedVertex, normal);
+        }
+    }
+
     const bgfx_memory_t *vmem = bgfx_copy(vertices,
                                            num_verts * (uint32_t)sizeof(JceSkinnedVertex));
     m->vbh = bgfx_create_vertex_buffer(vmem, &m->layout, BGFX_BUFFER_NONE);
@@ -88,6 +114,7 @@ JceSkinnedMesh *jce_skinned_mesh_create(
          * would forever submit nothing. Degrades gracefully under handle
          * pressure rather than feeding a broken handle into the draw list. */
         LOG_WARN(LOG_TAG, "skinned mesh: vertex buffer allocation failed");
+        if (m->base_cpu) JCE_FREE(m->base_cpu);
         JCE_FREE(m);
         return NULL;
     }
@@ -127,7 +154,8 @@ JceSkinnedMesh *jce_skinned_mesh_create(
 
 JceSkinnedMesh *jce_pbr_mesh_create(
     const JcePbrVertex *vertices, uint32_t num_verts,
-    const uint32_t *indices, uint32_t num_indices)
+    const uint32_t *indices, uint32_t num_indices,
+    bool retain_cpu)
 {
     if (!vertices || num_verts == 0) return NULL;
 
@@ -139,6 +167,20 @@ JceSkinnedMesh *jce_pbr_mesh_create(
     m->num_indices = num_indices;
     m->is_skinned  = false;
 
+    /* Morph deform: optionally retain an undeformed CPU copy (FEATURE 3.1).
+     * JcePbrVertex has the same pos@0 / normal@12 offsets as the skinned
+     * vertex, but a different (smaller) stride. */
+    if (retain_cpu) {
+        uint32_t bytes = num_verts * (uint32_t)sizeof(JcePbrVertex);
+        m->base_cpu = JCE_MALLOC(bytes);
+        if (m->base_cpu) {
+            memcpy(m->base_cpu, vertices, bytes);
+            m->stride        = (uint32_t)sizeof(JcePbrVertex);
+            m->pos_offset    = (uint32_t)offsetof(JcePbrVertex, pos);
+            m->normal_offset = (uint32_t)offsetof(JcePbrVertex, normal);
+        }
+    }
+
     const bgfx_memory_t *vmem = bgfx_copy(vertices,
                                            num_verts * (uint32_t)sizeof(JcePbrVertex));
     m->vbh = bgfx_create_vertex_buffer(vmem, &m->layout, BGFX_BUFFER_NONE);
@@ -146,6 +188,7 @@ JceSkinnedMesh *jce_pbr_mesh_create(
         /* See jce_skinned_mesh_create: fail cleanly on pool exhaustion rather
          * than return a zombie mesh with an invalid vertex buffer. */
         LOG_WARN(LOG_TAG, "PBR mesh: vertex buffer allocation failed");
+        if (m->base_cpu) JCE_FREE(m->base_cpu);
         JCE_FREE(m);
         return NULL;
     }
@@ -192,6 +235,8 @@ void jce_skinned_mesh_destroy(JceSkinnedMesh *mesh)
         bgfx_destroy_index_buffer(mesh->ibh);
     if (mesh->wf_ibh.idx != UINT16_MAX)
         bgfx_destroy_index_buffer(mesh->wf_ibh);
+    if (mesh->base_cpu)
+        JCE_FREE(mesh->base_cpu);   /* retained morph base (NULL unless retained) */
     JCE_FREE(mesh);
 }
 
@@ -223,6 +268,39 @@ void jce_skinned_mesh_submit(const JceSkinnedMesh *mesh,
     JCE_PROFILE_ZONE_END;
 }
 
+/* Morph color submit: byte-identical to jce_skinned_mesh_submit except the
+ * vertex source is the per-instance dynamic VB (dyn_vb_idx).  Caller (the
+ * model draw) submits the program afterward, exactly as for the static path. */
+void jce_skinned_mesh_submit_morphed(const JceSkinnedMesh *mesh,
+                                     const JceRenderer *r, uint16_t view_id,
+                                     uint16_t dyn_vb_idx)
+{
+    if (!mesh) return;
+    if (dyn_vb_idx == UINT16_MAX) {
+        /* No live morph VB -> literal fall-through to the static submit. */
+        jce_skinned_mesh_submit(mesh, r, view_id);
+        return;
+    }
+    JCE_PROFILE_ZONE_N("SkinnedMesh::SubmitMorphed");
+    (void)view_id;
+
+    bgfx_dynamic_vertex_buffer_handle_t dvb = { dyn_vb_idx };
+    bgfx_set_dynamic_vertex_buffer(0, dvb, 0, mesh->num_verts);
+
+    if (r && jce_renderer_get_wireframe(r) && mesh->wf_ibh.idx != UINT16_MAX) {
+        bgfx_set_index_buffer(mesh->wf_ibh, 0, mesh->num_wf_indices);
+        bgfx_set_state(BGFX_STATE_WRITE_RGB | BGFX_STATE_WRITE_A
+                     | BGFX_STATE_WRITE_Z   | BGFX_STATE_DEPTH_TEST_LESS
+                     | BGFX_STATE_MSAA      | BGFX_STATE_PT_LINES, 0);
+    } else {
+        if (mesh->ibh.idx != UINT16_MAX)
+            bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
+        bgfx_set_state(BGFX_STATE_DEFAULT, 0);
+    }
+    /* Caller submits the program (matches jce_skinned_mesh_submit contract). */
+    JCE_PROFILE_ZONE_END;
+}
+
 void jce_skinned_mesh_set_bones(const jce_mat4 *joint_matrices,
                                  uint32_t num_joints)
 {
@@ -247,6 +325,37 @@ void jce_skinned_mesh_submit_shadow(const JceSkinnedMesh *mesh,
 
     /* Depth-only: write Z, cull front faces to reduce peter-panning —
      * identical state to jce_mesh_submit_shadow() for the static path. */
+    bgfx_set_state(BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
+                 | BGFX_STATE_CULL_CW | BGFX_STATE_MSAA, 0);
+
+    bgfx_program_handle_t prog = { program.idx };
+    bgfx_submit(view_id, prog, 0, BGFX_DISCARD_ALL);
+    JCE_PROFILE_ZONE_END;
+}
+
+/* Morph shadow submit: mirror of jce_skinned_mesh_submit_shadow that binds the
+ * per-instance dynamic VB so the cast silhouette matches the morphed mesh.
+ * UINT16_MAX => fall through to the static shadow submit. */
+void jce_skinned_mesh_submit_shadow_morphed(const JceSkinnedMesh *mesh,
+                                            const JceRenderer *r, uint16_t view_id,
+                                            JceShaderHandle program,
+                                            uint16_t dyn_vb_idx)
+{
+    if (!mesh || !r || program.idx == UINT16_MAX) return;
+    if (dyn_vb_idx == UINT16_MAX) {
+        jce_skinned_mesh_submit_shadow(mesh, r, view_id, program);
+        return;
+    }
+    JCE_PROFILE_ZONE_N("SkinnedMesh::SubmitShadowMorphed");
+    (void)view_id;
+
+    /* Caller must have uploaded the bone palette (skinned program) or a single
+     * bgfx_set_transform() (static-PBR fallback) before this call. */
+    bgfx_dynamic_vertex_buffer_handle_t dvb = { dyn_vb_idx };
+    bgfx_set_dynamic_vertex_buffer(0, dvb, 0, mesh->num_verts);
+    if (mesh->ibh.idx != UINT16_MAX)
+        bgfx_set_index_buffer(mesh->ibh, 0, mesh->num_indices);
+
     bgfx_set_state(BGFX_STATE_WRITE_Z | BGFX_STATE_DEPTH_TEST_LESS
                  | BGFX_STATE_CULL_CW | BGFX_STATE_MSAA, 0);
 
@@ -338,4 +447,36 @@ uint32_t jce_skinned_mesh_vertex_count(const JceSkinnedMesh *mesh)
 uint32_t jce_skinned_mesh_index_count(const JceSkinnedMesh *mesh)
 {
     return mesh ? mesh->num_indices : 0;
+}
+
+/* ================================================================== */
+/* Morph deform accessors (FEATURE 3.1)                                */
+/* ================================================================== */
+
+const void *jce_skinned_mesh_base_verts(const JceSkinnedMesh *mesh)
+{
+    return mesh ? mesh->base_cpu : NULL;
+}
+
+uint32_t jce_skinned_mesh_stride(const JceSkinnedMesh *mesh)
+{
+    return mesh ? mesh->stride : 0;
+}
+
+uint32_t jce_skinned_mesh_pos_offset(const JceSkinnedMesh *mesh)
+{
+    return mesh ? mesh->pos_offset : 0;
+}
+
+uint32_t jce_skinned_mesh_normal_offset(const JceSkinnedMesh *mesh)
+{
+    return mesh ? mesh->normal_offset : 0;
+}
+
+const void *jce_skinned_mesh_layout(const JceSkinnedMesh *mesh)
+{
+    /* Only meaningful when a CPU copy was retained (caller uses the layout to
+     * create the matching dynamic VB); return NULL otherwise to mirror the
+     * other morph accessors' "not retained" contract. */
+    return (mesh && mesh->base_cpu) ? &mesh->layout : NULL;
 }

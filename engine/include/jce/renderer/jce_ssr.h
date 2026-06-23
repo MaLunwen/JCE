@@ -87,6 +87,11 @@ JCE_API void           jce_ssr_render(JceSsr *s,
 
 JCE_API uint16_t       jce_ssr_get_result_texture(const JceSsr *s);
 
+/* Blend the reflection RT over a destination color framebuffer (premultiplied
+ * "over").  view_id must be > the SSR ray-march view so the RT is filled. */
+JCE_API void           jce_ssr_composite(JceSsr *s, uint16_t view_id,
+                                         uint16_t dst_fb_idx);
+
 #ifdef __cplusplus
 }
 #endif

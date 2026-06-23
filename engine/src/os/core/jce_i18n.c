@@ -7,9 +7,9 @@
  */
 
 #include <jce/os/core/jce_i18n.h>
+#include <jce/os/core/jce_filesystem.h>   /* PAK reads via the registered provider */
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_log.h>
-#include <jce/resource/jce_pak_loader.h>
 
 #include "jce_memory.h"
 
@@ -81,16 +81,20 @@ static void parse_json(const char *json_text, JceLang lang)
 
 static void load_lang(const JcePakArchive *pak, JceLang lang)
 {
-    const JcePakAsset *asset = jce_pak_find(pak, s_lang_assets[lang]);
+    const JceFsPakProvider *prov = jce_fs_get_pak_provider();
+    if (!prov || !prov->find) return;
+
+    const void *asset = prov->find(pak, s_lang_assets[lang]);
     if (!asset) {
         LOG_WARN(LOG_TAG, "missing translation: %s", s_lang_assets[lang]);
         return;
     }
 
-    char *json = (char *)JCE_MALLOC((size_t)asset->original_size + 1);
+    uint64_t orig = prov->asset_size(asset);
+    char *json = (char *)JCE_MALLOC((size_t)orig + 1);
     if (!json) return;
 
-    size_t n = jce_pak_decompress(asset, json, (size_t)asset->original_size);
+    size_t n = prov->decompress(asset, json, (size_t)orig);
     if (n == 0) { JCE_FREE(json); return; }
     json[n] = '\0';
 

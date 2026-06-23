@@ -138,6 +138,14 @@ static void unref_pic(JceAv1Decoder *dec) {
     }
 }
 
+/* The downstream YUV->RGBA path is 8-bit 4:2:0 only (mirrors the VP8/VP9
+ * decoders).  10-bit / 4:4:4 / 4:2:2 AV1 fed to it as if it were I420 renders
+ * garbage, so reject it cleanly instead (audit F75). */
+static bool av1_pic_supported(const JceAv1Decoder *dec)
+{
+    return dec->pic.p.layout == DAV1D_PIXEL_LAYOUT_I420 && dec->pic.p.bpc == 8;
+}
+
 bool jce_av1_decode_next(JceAv1Decoder *dec,
                          const uint8_t **out_y, ptrdiff_t *out_y_stride,
                          const uint8_t **out_u, ptrdiff_t *out_uv_stride,
@@ -152,6 +160,13 @@ bool jce_av1_decode_next(JceAv1Decoder *dec,
         int gp = dav1d_get_picture(dec->ctx, &dec->pic);
         if (gp == 0) {
             dec->pic_valid = true;
+            if (!av1_pic_supported(dec)) {
+                LOG_WARN(LOG_TAG, "unsupported AV1 pixel format "
+                         "(layout=%d bpc=%d); only 8-bit 4:2:0 supported",
+                         (int)dec->pic.p.layout, (int)dec->pic.p.bpc);
+                unref_pic(dec);
+                return false;
+            }
             if (out_y)         *out_y         = (const uint8_t *)dec->pic.data[0];
             if (out_u)         *out_u         = (const uint8_t *)dec->pic.data[1];
             if (out_v)         *out_v         = (const uint8_t *)dec->pic.data[2];
@@ -271,6 +286,13 @@ bool jce_av1_decode_packet(JceAv1Decoder *dec,
         return false;
     }
     dec->pic_valid = true;
+    if (!av1_pic_supported(dec)) {
+        LOG_WARN(LOG_TAG, "unsupported AV1 pixel format "
+                 "(layout=%d bpc=%d); only 8-bit 4:2:0 supported",
+                 (int)dec->pic.p.layout, (int)dec->pic.p.bpc);
+        unref_pic(dec);
+        return false;
+    }
     if (out_y)         *out_y         = (const uint8_t *)dec->pic.data[0];
     if (out_u)         *out_u         = (const uint8_t *)dec->pic.data[1];
     if (out_v)         *out_v         = (const uint8_t *)dec->pic.data[2];

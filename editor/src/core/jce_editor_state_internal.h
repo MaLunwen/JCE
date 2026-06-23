@@ -55,6 +55,7 @@ struct EditorInternalState {
     JcePlayState     play_state;
     bool             show_grid;
     bool             is_2d_mode;
+    bool             pivot_edit_mode;
     bool             live_preview;
     bool             scene_modified;
 
@@ -74,16 +75,19 @@ extern std::vector<uint32_t> g_entity_order;
 
 /* ── Editor per-entity sidecar (UI-only state) ────────────────────── */
 struct EditorEntitySidecar {
-    uint64_t expanded_flags = 0xFFFFFFFFFFFFFFFFull; /* Inspector fold state bitmask */
-    /* Non-flag editor component slots cannot live in expanded_flags because
-       they are not single-bit masks. Empty means every synthetic slot is open. */
-    std::vector<uint64_t> collapsed_component_slots;
-    /* Inspector display order of components (one slot per visible component).
-       Empty until first inspector pass; entries are component slots, which
-       are usually JCE_COMP_FLAG_* values but may be editor-only synthetic
-       slots. Reordered via popup Move Up/Down or drag-and-drop on header.
-       Missing slots fall back to default order. */
-    std::vector<uint64_t> component_order;
+    /* Inspector fold state — one bit per dense engine comp_id
+       (jce_component_registry.h), default all-expanded.  4×64 bits covers
+       JCE_COMP_MAX (256) registered component types, so EVERY component
+       (including the post-64 rows that had no flag bit) persists its
+       collapsed state.  Runtime-only: rebuilt per scene session, never
+       serialized (matches the old single-word mask). */
+    uint64_t expanded[4] = { ~0ull, ~0ull, ~0ull, ~0ull };
+    /* Inspector display order of components (one dense engine comp_id per
+       visible component; the light group uses the unified "Light" row id).
+       Empty until first inspector pass.  Reordered via popup Move Up/Down
+       or drag-and-drop on header.  Missing ids fall back to default order.
+       Runtime-only: captured into undo snapshots, never written to disk. */
+    std::vector<int> component_order;
 };
 extern std::unordered_map<uint32_t, EditorEntitySidecar> g_entity_sidecar;
 
@@ -92,11 +96,11 @@ extern std::unordered_map<uint32_t, EditorEntitySidecar> g_entity_sidecar;
 struct EditorHistorySnapshot {
     std::string scene_json;
     std::string scene_path;
-    /* Per-entity Inspector component display order. Captured alongside
-       the scene so undo/redo of Move Up/Move Down/drag-reorder restores
-       the prior layout. Sidecar fold-state is intentionally NOT undoable
-       (matches Unity behaviour). */
-    std::unordered_map<uint32_t, std::vector<uint64_t>> component_orders;
+    /* Per-entity Inspector component display order (dense comp_ids).
+       Captured alongside the scene so undo/redo of Move Up/Move Down/
+       drag-reorder restores the prior layout. Sidecar fold-state is
+       intentionally NOT undoable (matches Unity behaviour). */
+    std::unordered_map<uint32_t, std::vector<int>> component_orders;
 };
 
 extern std::vector<EditorHistorySnapshot> s_undo_history;
@@ -159,6 +163,10 @@ bool     load_scene_from_parsed_root(const JceJson *root,
 /* ── Scene serial functions (defined in jce_editor_scene_serial.cpp) ─ */
 
 JceJson       *serialize_entity_tree_json(uint32_t entity_id);
+/* Override-aware variant: prefab instances are embedded as additive
+ * "overrides" diffs vs their source .prefab.json (per-component, byte
+ * diff).  serialize_entity_tree_json keeps the legacy full snapshot. */
+JceJson       *serialize_entity_tree_json_overrides(uint32_t entity_id);
 JceJson       *build_scene_json_root(void);
 JceJson       *build_prefab_json_root(uint32_t entity_id);
 const JceJson *find_prefab_root_node(const JceJson *root);

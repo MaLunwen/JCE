@@ -6,9 +6,17 @@
  * to [0,1] in RG (xy = current → previous).  Consumed by fs_taa.sc.
  *
  * Inputs:
- *   s_texDepth     : current frame's depth buffer (linear or non-linear)
- *   u_invViewProj  : inverse current view-projection (bgfx built-in)
+ *   s_texDepth        : current frame's depth buffer (linear or non-linear)
+ *   u_jceInvViewProj  : inverse current view-projection (we provide)
  *   u_jcePrevViewProj : previous frame's view-projection (we provide)
+ *
+ * NOTE: the bgfx built-in u_invViewProj is NOT usable here — vs_postfx.sc
+ * multiplies the fullscreen quad by u_modelViewProj, so the postfx views
+ * cannot call bgfx_set_view_transform without corrupting the fullscreen
+ * geometry.  We therefore supply BOTH camera matrices as explicit custom
+ * uniforms (u_jceInvViewProj = inverse of the UN-jittered scene view*proj),
+ * and the postfx views leave u_modelViewProj at identity like every other
+ * postfx pass.
  *
  * The delta is stored as `mv = (cur_ndc - prev_ndc) * 0.5 + 0.5`, so a
  * zero motion vector decodes to (0.5, 0.5) — clean centre of the [0,1]
@@ -20,8 +28,9 @@ $input v_texcoord0
 #include <bgfx_shader.sh>
 
 SAMPLER2D(s_texDepth, 0);
-/* u_invViewProj is provided by bgfx_shader.sh.  Only the previous
- * frame's matrix needs declaring (with a non-conflicting name). */
+/* Both camera matrices are supplied explicitly (non-conflicting names) so
+ * the postfx fullscreen path never needs bgfx_set_view_transform. */
+uniform mat4 u_jceInvViewProj;
 uniform mat4 u_jcePrevViewProj;
 
 void main()
@@ -43,7 +52,7 @@ void main()
     ndc.y = -ndc.y;
 #endif
 
-    vec4 wp = mul(u_invViewProj, ndc);
+    vec4 wp = mul(u_jceInvViewProj, ndc);
     wp /= wp.w;
 
     /* Project into the previous frame. */

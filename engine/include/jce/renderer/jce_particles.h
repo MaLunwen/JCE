@@ -19,6 +19,7 @@
 
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_defs.h>
+#include <jce/os/core/jce_easing.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/renderer/jce_gfx_types.h>
 
@@ -28,10 +29,38 @@
 JCE_EXTERN_C_BEGIN
 
 /* ================================================================== */
+/* Particle events & sub-emitters (FEATURE 8.2)                        */
+/* ================================================================== */
+
+/* What happened to a particle when an event fires. */
+typedef enum {
+    JCE_PARTICLE_EVENT_BIRTH     = 0,  /* a particle was just spawned */
+    JCE_PARTICLE_EVENT_DEATH     = 1,  /* a particle reached its lifetime */
+    JCE_PARTICLE_EVENT_COLLISION = 2   /* a particle's collision flag tripped */
+} JceParticleEventType;
+
+/* Snapshot of one particle event handed to a sink.  All fields are valid
+ * for every event type; do not retain the pointer past the callback. */
+typedef struct {
+    JceParticleEventType type;       /* what happened */
+    jce_vec3             position;    /* particle position at the event */
+    jce_vec3             velocity;    /* particle velocity at the event */
+} JceParticleEvent;
+
+/* Per-emitter event sink.  Invoked synchronously from the simulation step
+ * (jce_particles_update) on the same thread that stepped the emitter; keep
+ * it short and re-entrancy-free.  Set via jce_particles_emitter_set_sink. */
+typedef void (*JceParticleEventFn)(const JceParticleEvent *ev, void *user_data);
+
+/* Hard caps that bound sub-emitter spawn chains so a recursive / cyclic
+ * sub-emitter graph can never produce a spawn storm. */
+#define JCE_PARTICLE_SUBEMITTER_MAX_DEPTH 4u   /* parent->child chain depth */
+
+/* ================================================================== */
 /* Emitter configuration                                               */
 /* ================================================================== */
 
-typedef struct {
+typedef struct JceParticleEmitterDesc {
     /* -- Spawn ---------------------------------------------------- */
     uint32_t max_particles;       /* pool capacity (default: 1024) */
     float    emit_rate;           /* particles per second */
@@ -56,11 +85,65 @@ typedef struct {
     jce_vec4 color_start;         /* RGBA at birth (default: white) */
     jce_vec4 color_end;           /* RGBA at death (default: transparent) */
 
+    /* -- Per-property lifetime curves (FEATURE 8.3) --------------- *
+     * Each curve shapes how a property travels from its start value to
+     * its end value across a particle's normalised age t in [0,1].  The
+     * default (JCE_EASE_LINEAR == 0) reproduces the legacy pure-linear
+     * interpolation byte-for-byte, so a zero-initialised desc — or any
+     * desc that never sets these — behaves exactly as before.
+     *
+     *   value(t) = start + (end - start) * jce_ease(curve, t)
+     *
+     * velocity_curve additionally scales the integrated velocity by a
+     * curve over age (1.0 at t=0 by convention) so emitters can ramp
+     * particle motion in / out without touching gravity. */
+    JceEaseType size_curve;       /* size_start -> size_end shaping (default LINEAR) */
+    JceEaseType color_curve;      /* color_start -> color_end shaping (default LINEAR) */
+    JceEaseType velocity_curve;   /* velocity-scale-over-age shaping (default LINEAR) */
+    float       velocity_scale_start; /* multiplier at birth  (default 1.0) */
+    float       velocity_scale_end;   /* multiplier at death  (default 1.0) */
+
     /* -- Texture -------------------------------------------------- */
     JceTextureHandle texture;     /* billboard texture (INVALID = white) */
 
+    /* -- Flipbook / texture-sheet animation (FEATURE 8.3) --------- *
+     * Treat `texture` as an atlas of flipbook_rows x flipbook_cols equal
+     * cells played over a particle's life.  When flipbook_rows and
+     * flipbook_cols are both >= 1 and their product > 1 the system
+     * advances a frame index by age and exposes the active cell's UV
+     * sub-rect on JceParticleView (uv_offset / uv_scale).  Leave the
+     * counts at 0 (the default) to disable flipbook entirely: the view
+     * then reports the full [0,0]-[1,1] rect and is byte-identical to
+     * today.
+     *
+     * Frame selection:
+     *   - flipbook_fps > 0  : frame = floor(age * fps), time-driven.
+     *   - flipbook_fps == 0 : the whole sheet plays exactly once over the
+     *                         particle lifetime (frames-over-life).
+     * flipbook_loop controls out-of-range frames: true wraps (modulo),
+     * false clamps to the last frame. */
+    uint32_t flipbook_rows;       /* atlas rows    (0 = no flipbook) */
+    uint32_t flipbook_cols;       /* atlas columns (0 = no flipbook) */
+    float    flipbook_fps;        /* frames/sec (0 = play once over life) */
+    bool     flipbook_loop;       /* true = wrap frames, false = clamp */
+
     /* -- World / local space -------------------------------------- */
     bool     world_space;         /* true = particles ignore emitter movement */
+
+    /* -- Sub-emitters (FEATURE 8.2) -------------------------------- *
+     * A child emitter description spawned at a parent particle's
+     * position.  `sub_emitter` is borrowed (the caller owns the memory
+     * and must keep it alive for the parent emitter's lifetime); leave
+     * it NULL for the common no-sub-emitter case — such emitters stay
+     * byte-for-byte identical to the legacy behaviour.
+     *
+     * On a triggering event the child spawns N particles at the parent
+     * particle's position, inheriting nothing else (it uses its own
+     * desc's velocity / lifetime / colour, etc.).  Depth is bounded by
+     * JCE_PARTICLE_SUBEMITTER_MAX_DEPTH to prevent recursion storms. */
+    const struct JceParticleEmitterDesc *sub_emitter; /* borrowed child desc (NULL = none) */
+    uint32_t sub_spawn_on_birth;  /* child particles spawned per parent birth (0 = none) */
+    uint32_t sub_spawn_on_death;  /* child particles spawned per parent death (0 = none) */
 } JceParticleEmitterDesc;
 
 /* ================================================================== */
@@ -104,6 +187,28 @@ void jce_particles_emitter_burst(JceParticleSystem *sys,
                                  JceEmitterHandle emitter, uint32_t count);
 
 /* ================================================================== */
+/* Particle events (FEATURE 8.2)                                       */
+/* ================================================================== */
+
+/* Register (or clear, with cb=NULL) the event sink for one emitter.  The
+ * sink is invoked from jce_particles_update for every particle BIRTH /
+ * DEATH (and COLLISION when the collision flag is raised — see
+ * jce_particles_emitter_flag_collision).  user_data is passed through
+ * unmodified.  Returns nothing; a no-sink emitter behaves exactly as before. */
+JCE_API void jce_particles_emitter_set_sink(JceParticleSystem *sys,
+                                            JceEmitterHandle emitter,
+                                            JceParticleEventFn cb,
+                                            void *user_data);
+
+/* Mark the alive particle at index `particle_idx` (pool order, as visited by
+ * jce_particles_emitter_for_each) as collided.  On the next update step the
+ * particle is killed, fires a COLLISION event (not a DEATH event), and runs
+ * the parent's on-death sub-emitter spawn.  No-op for invalid args. */
+JCE_API void jce_particles_emitter_flag_collision(JceParticleSystem *sys,
+                                                  JceEmitterHandle emitter,
+                                                  uint32_t particle_idx);
+
+/* ================================================================== */
 /* Per-frame update & render                                           */
 /* ================================================================== */
 
@@ -122,6 +227,15 @@ typedef struct {
     jce_vec3 position;   /* world-space when emitter world_space, else local */
     jce_vec4 color;      /* current interpolated RGBA */
     float    size;       /* current interpolated billboard size */
+
+    /* Flipbook UV sub-rect (FEATURE 8.3).  The renderer remaps a quad's
+     * [0,1] texcoords into this rect: uv' = uv_offset + uv * uv_scale.
+     * With no flipbook configured this is the identity rect
+     * (offset = {0,0}, scale = {1,1}), so existing renderers are
+     * unaffected. */
+    jce_vec2 uv_offset;  /* top-left UV of the active flipbook cell */
+    jce_vec2 uv_scale;   /* per-axis UV extent of one cell (1/cols, 1/rows) */
+    uint32_t frame;      /* active flipbook frame index (0 when disabled) */
 } JceParticleView;
 
 /* Visit every alive particle of one emitter (newest pool order).  The
@@ -157,6 +271,15 @@ JCE_API void jce_particles_desc_default(JceParticleEmitterDesc *out);
 JCE_API bool jce_particles_desc_load_json(const char *path,
                                           JceParticleEmitterDesc *out,
                                           char *texture_out, int texture_cap);
+
+/* Release any loader-owned heap data attached to a desc by
+ * jce_particles_desc_load_json — currently the nested sub-emitter child desc
+ * (FEATURE 8.2).  Safe to call on any desc: it frees out->sub_emitter only
+ * when non-NULL and resets the pointer, so a desc filled by
+ * jce_particles_desc_default (sub_emitter == NULL) is a no-op.  Call after the
+ * desc has been consumed by jce_particles_emitter_add (which deep-copies the
+ * child synchronously).  Does NOT free `out` itself. */
+JCE_API void jce_particles_desc_free(JceParticleEmitterDesc *out);
 
 JCE_EXTERN_C_END
 

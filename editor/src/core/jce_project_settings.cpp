@@ -22,8 +22,36 @@ extern "C" {
 }
 
 #define LOG_TAG     "project_settings"
-#define PS_PATH     ".jce/project-settings.json"
-#define PS_DIR      ".jce"
+
+/* Project settings are PROJECT-scoped and belong under the OPEN project's
+ * root (<root>/.jce/project-settings.json), the same explicit-root pattern
+ * jce_pak_key.cpp uses — NOT the process CWD.  The editor never chdir's, so
+ * a bare CWD-relative ".jce/..." only landed in the project root by luck
+ * (it usually does, because the editor is launched from the project dir,
+ * which is why the absolute path resolves to the SAME existing file today).
+ * When no project is open (e.g. the init pre-warm), we fall back to the
+ * CWD-relative location so behaviour is unchanged in that window. */
+static const char *ps_dir(void) {
+    extern char s_current_project_root[512]; /* dialog_project.cpp */
+    static char d[1024];
+    if (s_current_project_root[0])
+        snprintf(d, sizeof(d), "%s/.jce", s_current_project_root);
+    else
+        snprintf(d, sizeof(d), ".jce");
+    return d;
+}
+static const char *ps_path(void) {
+    extern char s_current_project_root[512]; /* dialog_project.cpp */
+    static char p[1024];
+    if (s_current_project_root[0])
+        snprintf(p, sizeof(p), "%s/.jce/project-settings.json",
+                 s_current_project_root);
+    else
+        snprintf(p, sizeof(p), ".jce/project-settings.json");
+    return p;
+}
+#define PS_PATH     ps_path()
+#define PS_DIR      ps_dir()
 
 /* ── Cached snapshot ──────────────────────────────────────────────── */
 
@@ -58,9 +86,7 @@ void jce_project_settings_defaults(JceProjectSettings *s)
     s->audio.sample_rate           = 48000;
     s->audio.pause_on_focus_loss   = true;
 
-    /* Editor */
-    s->editor.auto_save_enabled       = true;
-    s->editor.auto_save_interval_sec  = 300;
+    /* Editor (auto-save is a user preference — see prefs.json / Preferences) */
     s->editor.default_behavior_mode   = 0;   /* 3D */
     s->editor.version_control_mode    = 1;   /* Visible Meta */
 
@@ -226,12 +252,13 @@ bool jce_project_settings_save(const JceProjectSettings *s)
     /* editor */
     {
         JceJson *o = jce_json_object();
-        jce_json_set_bool  (o, "auto_save_enabled",      s->editor.auto_save_enabled);
-        jce_json_set_int   (o, "auto_save_interval_sec", s->editor.auto_save_interval_sec);
         jce_json_set_int   (o, "default_behavior_mode",  s->editor.default_behavior_mode);
         jce_json_set_int   (o, "version_control_mode",   s->editor.version_control_mode);
-        jce_json_set_string(o, "external_script_editor", s->editor.external_script_editor);
-        jce_json_set_string(o, "external_image_editor",  s->editor.external_image_editor);
+        /* external_script_editor / external_image_editor are no longer
+         * written here: they migrated to per-user preferences
+         * (JceEditorConfig / editor-preferences.json), matching Unity's
+         * External Tools.  The load below still READS any legacy value as a
+         * one-time copy-forward source (see set_current_project_root). */
         jce_json_set_child (root, "editor", o);
     }
     /* graphics */
@@ -441,8 +468,6 @@ bool jce_project_settings_load(JceProjectSettings *out)
         out->audio.disable_audio        = jce_json_get_bool(o, "disable_audio", out->audio.disable_audio);
     }
     if (JceJson *o = child_obj_or_null(root, "editor")) {
-        out->editor.auto_save_enabled      = jce_json_get_bool(o, "auto_save_enabled", out->editor.auto_save_enabled);
-        out->editor.auto_save_interval_sec = jce_json_get_int (o, "auto_save_interval_sec", out->editor.auto_save_interval_sec);
         out->editor.default_behavior_mode  = jce_json_get_int (o, "default_behavior_mode", out->editor.default_behavior_mode);
         out->editor.version_control_mode   = jce_json_get_int (o, "version_control_mode", out->editor.version_control_mode);
         read_str(o, "external_script_editor", out->editor.external_script_editor, JCE_PS_PATH_LEN);

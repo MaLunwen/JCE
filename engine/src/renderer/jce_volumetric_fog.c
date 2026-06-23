@@ -10,6 +10,7 @@
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/renderer/jce_views.h>
+#include <jce/renderer/jce_shaders.h>   /* jce_shaders_embedded_engine_pak fallback */
 #include <jce/renderer/jce_volumetric_fog.h>
 
 #include "os/core/jce_memory.h"
@@ -68,7 +69,13 @@ static bgfx_shader_handle_t vf_load_shader(const JcePakArchive *pak,
     bgfx_shader_handle_t invalid = { UINT16_MAX };
     char path[256];
     snprintf(path, sizeof(path), "shaders/%s_%s.bin", name, sfx);
-    const JcePakAsset *a = jce_pak_find(pak, path);
+    /* Engine shaders live in jce_renderer's embedded pak, not the scene/editor
+     * pak.  Try the caller pak, then fall back to the embedded engine pak. */
+    const JcePakAsset *a = pak ? jce_pak_find(pak, path) : NULL;
+    if (!a) {
+        const JcePakArchive *fb = jce_shaders_embedded_engine_pak();
+        if (fb && fb != pak) { a = jce_pak_find(fb, path); if (a) pak = fb; }
+    }
     if (!a) { LOG_ERROR(LOG_TAG, "shader not in pak: %s", path); return invalid; }
     void *buf = JCE_MALLOC((size_t)a->original_size);
     if (!buf) return invalid;

@@ -8,7 +8,7 @@
  * moved here).
  *
  * Per-component (Light / Sun / Probe) inspection still lives in
- * `inspector_lighting.cpp` — this panel is strictly scene-level.
+ * `jce_panel_inspector_lighting.cpp` — this panel is strictly scene-level.
  *
  * Sections (collapsing headers, all default-open):
  *   1. Environment           Sky type / HDRI / sky+ambient intensity /
@@ -23,10 +23,7 @@
  *                            (Convolution itself is engine-driven: the
  *                            scene renderer re-bakes asynchronously when
  *                            the Skybox HDR path changes, disk-cached.)
- *   5. Lights in Scene       Quick-edit colour/intensity for every
- *                            Directional / Point / Spot light, with
- *                            ping-to-select.
- *   6. Fog                   Unity-style mode picker (None/Linear/
+ *   5. Fog                   Unity-style mode picker (None/Linear/
  *                            Exp/Exp²) feeding the volumetric-fog
  *                            renderer params (height-falloff aware).
  *
@@ -40,7 +37,6 @@
 #include "core/jce_editor_scene_rendering_defaults.h"
 #include "core/jce_editor_state.h"
 #include "dialogs/jce_path_input.h"
-#include "scene/jce_editor_scene_render.h"
 
 #include <jce/tools/jce_imgui.hpp>
 
@@ -53,7 +49,6 @@ extern "C" {
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/world/jce_time_of_day.h>
 #include <jce/os/core/jce_math.h>
-#include <jce/renderer/jce_scene_renderer.h>
 #include <jce/renderer/jce_volumetric_fog.h>
 }
 
@@ -205,6 +200,26 @@ bool draw_environment(JceScene *scene, const LightCollect &c,
             &rendering->ambient_intensity, 0.0f, 4.0f, "%.2f");
         changed |= ImGui::ColorEdit3(jce_editor_i18n("lighting.ambientColor"),
                                      rendering->ambient_color);
+
+        /* ── Sky pass (gradient / equirect / analytic Preetham) ──────── */
+        const char *sky_modes[3] = {
+            jce_editor_i18n("panel.lighting.env.sky_mode.gradient"),
+            jce_editor_i18n("panel.lighting.env.sky_mode.equirect"),
+            jce_editor_i18n("panel.lighting.env.sky_mode.preetham"),
+        };
+        int sky_mode = rendering->sky_mode;
+        if (sky_mode < JCE_SCENE_SKY_GRADIENT) sky_mode = JCE_SCENE_SKY_GRADIENT;
+        if (sky_mode > JCE_SCENE_SKY_PREETHAM) sky_mode = JCE_SCENE_SKY_PREETHAM;
+        if (ImGui::Combo(jce_editor_i18n("panel.lighting.env.sky_mode"),
+                         &sky_mode, sky_modes, 3)) {
+            rendering->sky_mode = sky_mode;
+            changed = true;
+        }
+        if (rendering->sky_mode == JCE_SCENE_SKY_PREETHAM) {
+            changed |= ImGui::DragFloat(
+                jce_editor_i18n("panel.lighting.env.turbidity"),
+                &rendering->sky_turbidity, 0.05f, 1.0f, 10.0f, "%.2f");
+        }
     }
     ImGui::EndDisabled();
 
@@ -240,6 +255,27 @@ bool draw_environment(JceScene *scene, const LightCollect &c,
     } else {
         ImGui::TextDisabled("%s", jce_editor_i18n("lighting.noSkybox"));
     }
+
+    /* ── Floating origin (large-world float32 precision; opt-in) ──────── */
+    ImGui::Spacing();
+    ImGui::SeparatorText(jce_editor_i18n("panel.lighting.env.floating_origin"));
+    ImGui::BeginDisabled(!rendering);
+    if (rendering) {
+        if (ImGui::Checkbox(
+                jce_editor_i18n("panel.lighting.env.floating_origin.enabled"),
+                &rendering->floating_origin_enabled))
+            changed = true;
+        ImGui::BeginDisabled(!rendering->floating_origin_enabled);
+        changed |= ImGui::DragFloat(
+            jce_editor_i18n("panel.lighting.env.floating_origin.threshold"),
+            &rendering->floating_origin_threshold, 16.0f, 256.0f, 65536.0f,
+            "%.0f m");
+        ImGui::EndDisabled();
+        ImGui::TextDisabled("%s",
+            jce_editor_i18n("panel.lighting.env.floating_origin.hint"));
+    }
+    ImGui::EndDisabled();
+
     return changed;
 }
 
@@ -271,9 +307,16 @@ bool draw_directional_light(JceScene *scene, const LightCollect &c)
 
     ImGui::TextDisabled("%s",
         jce_editor_i18n("panel.lighting.sun.direction"));
+    JceTransform *xf = (scene && c.n_dir > 0)
+        ? jce_scene_get_transform(scene, (JceEntity)c.dir[0])
+        : nullptr;
+    jce_vec3 world_dir = light->direction;
+    if (xf)
+        world_dir = jce_q_rotate(jce_q_normalize(xf->rotation), world_dir);
+    world_dir = jce_v3_normalize(world_dir);
     float yaw_deg = 0.0f;
     float pitch_deg = -55.0f;
-    direction_to_angles(light->direction, &yaw_deg, &pitch_deg);
+    direction_to_angles(world_dir, &yaw_deg, &pitch_deg);
     bool yaw_changed = ImGui::SliderFloat(
         jce_editor_i18n("panel.lighting.sun.yaw"),
         &yaw_deg, -180.0f, 180.0f, "%.1f\xc2\xb0");
@@ -281,6 +324,8 @@ bool draw_directional_light(JceScene *scene, const LightCollect &c)
         jce_editor_i18n("panel.lighting.sun.pitch"),
         &pitch_deg, -90.0f, 90.0f, "%.1f\xc2\xb0");
     if (yaw_changed || pitch_changed) {
+        if (xf)
+            xf->rotation = jce_q_identity();
         light->direction = angles_to_direction(yaw_deg, pitch_deg);
         changed = true;
     }
@@ -387,100 +432,6 @@ void draw_ibl(JceScene *scene, const LightCollect &c)
                 g_lit.ibl_spec_mips);
 }
 
-void draw_scene_lights(JceScene *scene, const LightCollect &c)
-{
-    if (!ImGui::CollapsingHeader(
-            jce_editor_i18n("lighting.section.lights"),
-            ImGuiTreeNodeFlags_DefaultOpen))
-        return;
-    if (!scene) {
-        ImGui::TextDisabled("(none)");
-        return;
-    }
-
-    char lbl[160];
-    /* Directional */
-    std::snprintf(lbl, sizeof(lbl), "%s (%d)",
-                  jce_editor_i18n("lighting.directional"), c.n_dir);
-    if (ImGui::TreeNodeEx(lbl, ImGuiTreeNodeFlags_DefaultOpen)) {
-        for (int i = 0; i < c.n_dir; i++) {
-            uint32_t id = c.dir[i];
-            ImGui::PushID((int)id);
-            JceDirectionalLight *l = jce_scene_get_dir_light(scene, (JceEntity)id);
-            const char *name = jce_scene_entity_name(scene, (JceEntity)id);
-            if (ImGui::SmallButton("\xe2\x86\x92")) ping_entity(id);
-            ImGui::SameLine();
-            ImGui::Text("%s", name ? name : jce_editor_i18n("lighting.fallback.light"));
-            if (l) {
-                float col[3] = { l->color.x, l->color.y, l->color.z };
-                if (ImGui::ColorEdit3("##col", col)) {
-                    l->color.x = col[0]; l->color.y = col[1]; l->color.z = col[2];
-                }
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(80);
-                ImGui::DragFloat("##i", &l->intensity, 0.05f, 0.0f, 100.0f);
-            }
-            ImGui::PopID();
-        }
-        if (c.n_dir == 0) ImGui::TextDisabled("(none)");
-        ImGui::TreePop();
-    }
-
-    /* Point */
-    std::snprintf(lbl, sizeof(lbl), "%s (%d)",
-                  jce_editor_i18n("lighting.point"), c.n_point);
-    if (ImGui::TreeNodeEx(lbl)) {
-        for (int i = 0; i < c.n_point; i++) {
-            uint32_t id = c.point[i];
-            ImGui::PushID((int)id + 0x10000);
-            JcePointLight *l = jce_scene_get_point_light(scene, (JceEntity)id);
-            const char *name = jce_scene_entity_name(scene, (JceEntity)id);
-            if (ImGui::SmallButton("\xe2\x86\x92")) ping_entity(id);
-            ImGui::SameLine();
-            ImGui::Text("%s", name ? name : jce_editor_i18n("lighting.fallback.light"));
-            if (l) {
-                float col[3] = { l->color.x, l->color.y, l->color.z };
-                if (ImGui::ColorEdit3("##col", col)) {
-                    l->color.x = col[0]; l->color.y = col[1]; l->color.z = col[2];
-                }
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(80);
-                ImGui::DragFloat("##i", &l->intensity, 0.05f, 0.0f, 100.0f);
-            }
-            ImGui::PopID();
-        }
-        if (c.n_point == 0) ImGui::TextDisabled("(none)");
-        ImGui::TreePop();
-    }
-
-    /* Spot */
-    std::snprintf(lbl, sizeof(lbl), "%s (%d)",
-                  jce_editor_i18n("lighting.spot"), c.n_spot);
-    if (ImGui::TreeNodeEx(lbl)) {
-        for (int i = 0; i < c.n_spot; i++) {
-            uint32_t id = c.spot[i];
-            ImGui::PushID((int)id + 0x20000);
-            JceSpotLight *l = jce_scene_get_spot_light(scene, (JceEntity)id);
-            const char *name = jce_scene_entity_name(scene, (JceEntity)id);
-            if (ImGui::SmallButton("\xe2\x86\x92")) ping_entity(id);
-            ImGui::SameLine();
-            ImGui::Text("%s", name ? name : jce_editor_i18n("lighting.fallback.light"));
-            if (l) {
-                float col[3] = { l->color.x, l->color.y, l->color.z };
-                if (ImGui::ColorEdit3("##col", col)) {
-                    l->color.x = col[0]; l->color.y = col[1]; l->color.z = col[2];
-                }
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(80);
-                ImGui::DragFloat("##i", &l->intensity, 0.05f, 0.0f, 100.0f);
-            }
-            ImGui::PopID();
-        }
-        if (c.n_spot == 0) ImGui::TextDisabled("(none)");
-        ImGui::TreePop();
-    }
-}
-
 bool draw_fog(JceSceneRenderingSettings *rendering)
 {
     if (!ImGui::CollapsingHeader(
@@ -535,13 +486,14 @@ bool draw_fog(JceSceneRenderingSettings *rendering)
     return changed;
 }
 
+bool advance_time_of_day(JceSceneRenderingSettings *rendering);
+
 /* ── Weather + serialized Time-of-Day (P2-weather-decals-tod) ──────────
  *
  * Authors the scene-level JceSceneRenderingSettings weather + time-of-day
- * fields.  Unlike the "Time of Day" preview tab below (editor-only state),
- * these settings serialize with the scene and are driven every frame by the
- * scene renderer (sr_drive_time_of_day / sr_drive_weather) in both the
- * editor preview and the shipping runtime. */
+ * fields.  These settings serialize with the scene and are driven every
+ * frame by the scene renderer (sr_drive_time_of_day / sr_drive_weather)
+ * in both the editor preview and the shipping runtime. */
 bool draw_weather_and_tod(JceSceneRenderingSettings *rendering)
 {
     if (!ImGui::CollapsingHeader(
@@ -554,14 +506,16 @@ bool draw_weather_and_tod(JceSceneRenderingSettings *rendering)
         return false;
     }
 
-    bool changed = false;
+    bool changed = advance_time_of_day(rendering);
 
     /* Serialized time-of-day. */
     changed |= ImGui::Checkbox(jce_editor_i18n("panel.lighting.tod.enabled"),
                                &rendering->tod_enabled);
     ImGui::BeginDisabled(!rendering->tod_enabled);
+    ImGui::BeginDisabled(rendering->tod_speed > 0.0f);
     changed |= ImGui::SliderFloat(jce_editor_i18n("panel.lighting.tod.hour"),
                                   &rendering->tod_hour, 0.0f, 24.0f, "%.2f h");
+    ImGui::EndDisabled();
     changed |= ImGui::DragFloat(jce_editor_i18n("panel.lighting.tod.speed"),
                                 &rendering->tod_speed, 0.05f, 0.0f, 240.0f, "%.2f");
     changed |= ImGui::DragFloat(jce_editor_i18n("panel.lighting.tod.latitude"),
@@ -590,46 +544,45 @@ bool draw_weather_and_tod(JceSceneRenderingSettings *rendering)
     return changed;
 }
 
-/* ── Time of Day tab (merged from jce_panel_time_of_day.cpp in P6-A.2) ─ */
+bool advance_time_of_day(JceSceneRenderingSettings *rendering)
+{
+    if (!rendering || !rendering->tod_enabled || rendering->tod_speed <= 0.0f)
+        return false;
 
-JceTimeOfDayConfig g_tod_cfg     = jce_time_of_day_default_config();
-float              g_tod_hour    = 12.0f;
-bool               g_tod_auto    = false;
-bool               g_tod_advance = false;
-float              g_tod_rate    = 0.5f; /* hours per second */
-double             g_tod_last_t  = 0.0;
+    float dt = ImGui::GetIO().DeltaTime;
+    if (dt <= 0.0f)
+        return false;
+    if (dt > 0.25f)
+        dt = 0.25f;
+
+    rendering->tod_hour += rendering->tod_speed * dt;
+    while (rendering->tod_hour >= 24.0f)
+        rendering->tod_hour -= 24.0f;
+    while (rendering->tod_hour < 0.0f)
+        rendering->tod_hour += 24.0f;
+    return true;
+}
+
+/* ── Time of Day tab (merged from jce_panel_time_of_day.cpp in P6-A.2) ─ */
 
 void draw_time_of_day_tab(void)
 {
-    double now = ImGui::GetTime();
-    if (g_tod_advance && g_tod_last_t > 0.0) {
-        g_tod_hour += (float)(now - g_tod_last_t) * g_tod_rate;
-        while (g_tod_hour >= 24.0f) g_tod_hour -= 24.0f;
-        while (g_tod_hour <  0.0f)  g_tod_hour += 24.0f;
-    }
-    g_tod_last_t = now;
-
-    ImGui::SliderFloat(jce_editor_i18n("timeOfDay.hourOfDay"),
-                       &g_tod_hour, 0.0f, 24.0f, "%.2f h");
-    ImGui::Checkbox(jce_editor_i18n("timeOfDay.autoAdvance"), &g_tod_advance);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(120);
-    ImGui::DragFloat(jce_editor_i18n("timeOfDay.rate"),
-                     &g_tod_rate, 0.05f, 0.0f, 24.0f, "%.2f");
-
-    ImGui::Separator();
-    if (ImGui::CollapsingHeader(jce_editor_i18n("timeOfDay.configuration"),
-                                ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::DragFloat(jce_editor_i18n("timeOfDay.dawnHour"),
-                         &g_tod_cfg.dawn_hour,        0.05f, 0.0f, 24.0f, "%.2f");
-        ImGui::DragFloat(jce_editor_i18n("timeOfDay.duskHour"),
-                         &g_tod_cfg.dusk_hour,        0.05f, 0.0f, 24.0f, "%.2f");
-        ImGui::DragFloat(jce_editor_i18n("timeOfDay.latitude"),
-                         &g_tod_cfg.latitude_degrees, 0.5f, -90.0f, 90.0f, "%.1f");
+    JceScene *scene = jce_state_get_scene();
+    JceSceneRenderingSettings *rendering =
+        scene_rendering_settings_mut(scene);
+    if (!rendering) {
+        ImGui::TextDisabled("%s", jce_editor_i18n("common.noScene"));
+        return;
     }
 
+    bool changed = draw_weather_and_tod(rendering);
+
+    JceTimeOfDayConfig cfg = jce_time_of_day_default_config();
+    cfg.dawn_hour        = rendering->tod_dawn_hour;
+    cfg.dusk_hour        = rendering->tod_dusk_hour;
+    cfg.latitude_degrees = rendering->tod_latitude;
     JceTimeOfDayState st;
-    jce_time_of_day_evaluate(&g_tod_cfg, g_tod_hour, &st);
+    jce_time_of_day_evaluate(&cfg, rendering->tod_hour, &st);
 
     ImGui::Separator();
     ImGui::Text("%s   : %+.2f %+.2f %+.2f", jce_editor_i18n("timeOfDay.sunDir"),
@@ -648,15 +601,8 @@ void draw_time_of_day_tab(void)
                 st.exposure,
                 st.is_night ? jce_editor_i18n("timeOfDay.night") : "");
 
-    ImGui::Separator();
-    ImGui::Checkbox(jce_editor_i18n("timeOfDay.autoApplyFrame"), &g_tod_auto);
-    ImGui::SameLine();
-    bool apply = ImGui::Button(jce_editor_i18n("timeOfDay.applyNow"));
-
-    if (apply || g_tod_auto) {
-        JceSceneRenderer *sr = jce_editor_get_scene_renderer();
-        if (sr) jce_scene_renderer_set_time_of_day(sr, &st);
-    }
+    if (changed)
+        jce_state_mark_scene_modified();
 }
 
 /* ── Tab focus state (set by sibling shims) ───────────────────────── */
@@ -717,8 +663,11 @@ void draw_light_explorer_tab(void)
 
     static int filter_type = -1; /* -1 all */
     ImGui::SetNextItemWidth(150);
+    static const char *const kLeTypeKeys[] = {
+        "lightExplorer.type.all", "lightExplorer.type.directional",
+        "lightExplorer.type.point", "lightExplorer.type.spot" };
     ImGui::Combo(jce_editor_i18n("lightExplorer.typeFilter"), &filter_type,
-                 "All\0Directional\0Point\0Spot\0");
+                 jce_editor_i18n_combo(kLeTypeKeys, 4));
 
     std::vector<LE_Row> rows;
     rows.reserve(64);
@@ -730,16 +679,16 @@ void draw_light_explorer_tab(void)
     if (ImGui::BeginTable("##le_tbl", 7,
             ImGuiTableFlags_Borders | ImGuiTableFlags_Resizable |
             ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
-        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 80);
-        ImGui::TableSetupColumn("Color", ImGuiTableColumnFlags_WidthFixed, 60);
-        ImGui::TableSetupColumn("Intensity", ImGuiTableColumnFlags_WidthFixed, 80);
-        ImGui::TableSetupColumn("Shadows", ImGuiTableColumnFlags_WidthFixed, 70);
-        ImGui::TableSetupColumn("Enabled", ImGuiTableColumnFlags_WidthFixed, 70);
+        ImGui::TableSetupColumn(jce_editor_i18n("panel.lighting.col.name"), ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn(jce_editor_i18n("panel.lighting.col.type"), ImGuiTableColumnFlags_WidthFixed, 80);
+        ImGui::TableSetupColumn(jce_editor_i18n("panel.lighting.col.color"), ImGuiTableColumnFlags_WidthFixed, 60);
+        ImGui::TableSetupColumn(jce_editor_i18n("panel.lighting.col.intensity"), ImGuiTableColumnFlags_WidthFixed, 80);
+        ImGui::TableSetupColumn(jce_editor_i18n("panel.lighting.col.shadows"), ImGuiTableColumnFlags_WidthFixed, 70);
+        ImGui::TableSetupColumn(jce_editor_i18n("panel.lighting.col.enabled"), ImGuiTableColumnFlags_WidthFixed, 70);
         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 50);
         ImGui::TableHeadersRow();
 
-        const char *type_names[] = {"Dir", "Point", "Spot"};
+        const char *type_names[] = { jce_editor_i18n("lightExplorer.type.dir"), jce_editor_i18n("lightExplorer.type.point"), jce_editor_i18n("lightExplorer.type.spot") };
         for (auto &r : rows) {
             if (filter_type >= 0 && r.type != filter_type) continue;
             ImGui::TableNextRow();
@@ -809,9 +758,7 @@ static void lit_draw_settings_tab(void)
     dirty |= draw_directional_light(scene, c);
     dirty |= draw_shadows(rendering);
     draw_ibl(scene, c);
-    draw_scene_lights(scene, c);
     dirty |= draw_fog(rendering);
-    dirty |= draw_weather_and_tod(rendering);
 
     /* Cross-cut convenience: surface "Bake All Probes" here so users
      * don't have to open the Reflection Probes panel first. The actual
@@ -1043,6 +990,16 @@ extern "C" void jce_editor_lighting_settings_get_sun(
     JceDirectionalLight *light = first_directional_light(scene, c);
 
     if (light) {
+        jce_vec3 world_dir = light->direction;
+        if (scene && c.n_dir > 0) {
+            JceTransform *xf =
+                jce_scene_get_transform(scene, (JceEntity)c.dir[0]);
+            if (xf) {
+                world_dir =
+                    jce_q_rotate(jce_q_normalize(xf->rotation), world_dir);
+            }
+        }
+        world_dir = jce_v3_normalize(world_dir);
         if (out_color_rgb) {
             out_color_rgb[0] = light->color.x;
             out_color_rgb[1] = light->color.y;
@@ -1050,9 +1007,9 @@ extern "C" void jce_editor_lighting_settings_get_sun(
         }
         if (out_intensity) *out_intensity = light->intensity;
         if (out_dir_xyz) {
-            out_dir_xyz[0] = light->direction.x;
-            out_dir_xyz[1] = light->direction.y;
-            out_dir_xyz[2] = light->direction.z;
+            out_dir_xyz[0] = world_dir.x;
+            out_dir_xyz[1] = world_dir.y;
+            out_dir_xyz[2] = world_dir.z;
         }
         if (out_cast_shadows)
             *out_cast_shadows = light->casts_shadow ? 1 : 0;

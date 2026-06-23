@@ -614,6 +614,13 @@ void jce_physics_body_set_gravity_factor(JcePhysicsWorld *world,
     jce_bullet_body_set_gravity_factor(world->bullet, body.idx, factor);
 }
 
+void jce_physics_body_set_angular_factor(JcePhysicsWorld *world,
+                                         JceBodyHandle body, jce_vec3 factor)
+{
+    if (!world || !jce_body_valid(body)) return;
+    jce_bullet_body_set_angular_factor(world->bullet, body.idx, factor);
+}
+
 void jce_physics_body_set_mass(JcePhysicsWorld *world,
                                JceBodyHandle body, float mass)
 {
@@ -957,6 +964,45 @@ void jce_physics_constraint_set_limits(JcePhysicsWorld *world,
 {
     if (!world || !jce_constraint_valid(con)) return;
     jce_bullet_constraint_set_limits(world->bullet, con.idx, lower, upper);
+}
+
+JceConstraintHandle jce_physics_configurable_joint_create(
+        JcePhysicsWorld *world, const JceConfigurableJointDesc *desc)
+{
+    if (!world || !desc) return JCE_CONSTRAINT_INVALID;
+
+    /* Angular limits arrive in degrees from the authoring component; the Bullet
+     * shim wants radians (matching the rest of the engine's deg->rad seams). */
+    float ang_rad[3];
+    ang_rad[0] = desc->angular_limit_deg[0] * JCE_DEG2RAD;
+    ang_rad[1] = desc->angular_limit_deg[1] * JCE_DEG2RAD;
+    ang_rad[2] = desc->angular_limit_deg[2] * JCE_DEG2RAD;
+
+    uint32_t idx = jce_bullet_configurable_joint_create(
+        world->bullet,
+        desc->body_a.idx,
+        desc->body_b.idx,
+        desc->anchor_a, desc->anchor_b,
+        desc->lin_motion, desc->ang_motion,
+        desc->linear_limit, ang_rad,
+        desc->disable_collision);
+
+    if (idx == UINT32_MAX) {
+        LOG_ERROR(LOG_TAG, "configurable-joint constraint pool exhausted");
+        return JCE_CONSTRAINT_INVALID;
+    }
+
+    return (JceConstraintHandle){ idx };
+}
+
+float jce_physics_constraint_applied_impulse(const JcePhysicsWorld *world,
+                                              JceConstraintHandle con)
+{
+    if (!world || !jce_constraint_valid(con)) return 0.0f;
+    /* world->bullet is logically const here — the query reads m_appliedImpulse
+     * without mutating the world; cast away const for the C bridge signature. */
+    return jce_bullet_constraint_applied_impulse(
+        ((JcePhysicsWorld *)world)->bullet, con.idx);
 }
 
 /* Internal accessor used by jce_physics_joint_query.c (P3-C.6). */

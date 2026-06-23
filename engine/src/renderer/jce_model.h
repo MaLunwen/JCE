@@ -11,9 +11,17 @@
 #ifndef JCE_MODEL_H
 #define JCE_MODEL_H
 
+#include <jce/middleware/animation/jce_morph.h>
 #include <jce/middleware/animation/jce_skeleton.h>
 #include <jce/os/core/jce_math.h>
 #include <jce/renderer/jce_pbr_material.h>
+/* Pull the PUBLIC model API in so the narrow morph-walk accessors
+ * (jce_model_node_count / _node_prim_count / _prim_vertex_count /
+ * _prim_morph) and the morph-aware draw entrypoints
+ * (jce_model_draw_morphed / _shadow) have a SINGLE source of truth and can
+ * never drift in signature from the internal callers.  This header then only
+ * ADDS the struct-typed internal-only accessors below. */
+#include <jce/renderer/jce_model.h>
 
 #include "middleware/animation/jce_animation.h"
 
@@ -23,11 +31,11 @@
 extern "C" {
 #endif
 
+/* JceModel / JceRenderer / JcePakArchive / JceSkinnedMesh / JceSkeleton /
+ * JceAnimClip are already typedef'd by the public <jce/renderer/jce_model.h>
+ * included above (single declaration — no C99 duplicate-typedef).  Only JceMesh
+ * is internal-renderer-only and declared here. */
 typedef struct JceMesh         JceMesh;
-typedef struct JceSkinnedMesh  JceSkinnedMesh;
-typedef struct JceRenderer     JceRenderer;
-typedef struct JcePakArchive      JcePakArchive;
-typedef struct JceModel        JceModel;
 
 /* ================================================================== */
 /* Model primitive (one draw call unit)                                */
@@ -37,6 +45,7 @@ typedef struct {
     JceMesh        *static_mesh;     /* non-NULL for static geometry */
     JceSkinnedMesh *skinned_mesh;    /* non-NULL for skinned geometry */
     uint32_t        material_index;  /* index into model's material array */
+    JceMorphData   *morph;           /* morph-target deltas (FEATURE 3.1), or NULL */
 } JceModelPrimitive;
 
 /* ================================================================== */
@@ -56,52 +65,32 @@ typedef struct {
 } JceModelNode;
 
 /* ================================================================== */
-/* Model API                                                           */
+/* Model API (internal-only additions)                                 */
 /* ================================================================== */
+/*
+ * The model-loading, lifetime, draw, narrow morph-walk, and morph-aware draw
+ * entrypoints are all declared in the PUBLIC <jce/renderer/jce_model.h> pulled
+ * in above (single source of truth — no signature drift).  This header ADDS
+ * ONLY the struct-typed accessors that intentionally remain internal because
+ * they expose the JceModelNode / JcePbrMaterial layouts defined here.
+ */
 
-/* Load a glTF/GLB model from PAK. Returns NULL on failure. */
-JceModel *jce_model_load_gltf(const JcePakArchive *pak, const char *asset_path);
-
-/* Worker-decode + render-thread-upload split (see jce_gltf_loader.h).
- *   worker:        JceModelCpu *c = jce_model_decode_gltf_cpu(pak, path);
- *   render thread: JceModel    *m = jce_model_upload_gltf_cpu(c);  // consumes c
- *   cancel:        jce_model_gltf_cpu_free(c);                     // no upload
- * decode_cpu does cgltf parse + CPU extraction + image decode (no bgfx);
- * upload_cpu creates the GPU meshes + textures on the calling thread. */
-typedef struct JceModelCpu JceModelCpu;
-JceModelCpu *jce_model_decode_gltf_cpu(const JcePakArchive *pak, const char *asset_path);
-JceModel    *jce_model_upload_gltf_cpu(JceModelCpu *cpu);
-void         jce_model_gltf_cpu_free(JceModelCpu *cpu);
-
-/* Destroy a model and all owned resources (meshes, textures, skeleton, anims). */
-void jce_model_destroy(JceModel *model);
-
-/* -- Accessors ------------------------------------------------------ */
-
-uint32_t              jce_model_node_count(const JceModel *model);
+/* Get a node / material by index (returns the internal struct — internal use
+ * only; external callers walk the model via the narrow public accessors). */
 const JceModelNode   *jce_model_get_node(const JceModel *model, uint32_t index);
 
 uint32_t              jce_model_material_count(const JceModel *model);
 const JcePbrMaterial *jce_model_get_material(const JceModel *model, uint32_t index);
 
-/* Skeleton (NULL if model has no skinning). */
-JceSkeleton          *jce_model_get_skeleton(const JceModel *model);
+/* Number of imported morph-weight animation tracks. */
+uint32_t jce_model_morph_anim_count(const JceModel *model);
 
-/* Animation clips. */
-uint32_t              jce_model_anim_count(const JceModel *model);
-JceAnimClip          *jce_model_get_anim(const JceModel *model, uint32_t index);
-
-/* -- Rendering ------------------------------------------------------ */
-
-/* Draw all primitives with their PBR materials.
- * transform:       model-to-world matrix (for static meshes).
- * joint_matrices:  bone palette (for skinned meshes), or NULL.
- * num_joints:      number of matrices in joint_matrices. */
-void jce_model_draw(const JceModel *model,
-                     const JceRenderer *r, uint16_t view_id,
-                     const jce_mat4 *transform,
-                     const jce_mat4 *joint_matrices,
-                     uint32_t num_joints);
+/* Get a morph-weight track and the node/animation it drives (out args may be
+ * NULL).  Returns NULL if index is out of range.  Sample with
+ * jce_morph_weight_track_sample to drive a node's per-instance weights. */
+const JceMorphWeightTrack *jce_model_morph_anim_track(
+    const JceModel *model, uint32_t index,
+    uint32_t *out_anim_index, uint32_t *out_node_index);
 
 #ifdef __cplusplus
 }

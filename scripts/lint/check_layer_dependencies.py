@@ -50,6 +50,17 @@ ALLOW = {
      "middleware/animation/jce_skeleton.h"),
     ("engine/src/renderer/jce_model.h",
      "middleware/animation/jce_skeleton.h"),
+    # Mesh loaders also construct morph targets / read compressed-anim types
+    # inline — same sanctioned inline-load exception as the clip/skeleton
+    # includes above (tracked for the future jce_gltf_anim_loader.c split).
+    ("engine/src/renderer/jce_gltf_loader.c",
+     "middleware/animation/jce_morph.h"),
+    ("engine/src/renderer/jce_gltf_loader.c",
+     "middleware/animation/jce_anim_compress.h"),
+    ("engine/src/renderer/jce_model.h",
+     "middleware/animation/jce_morph.h"),
+    ("engine/src/renderer/jce_model_internal.h",
+     "middleware/animation/jce_morph.h"),
     # JNI bridge is a platform shim that intentionally bridges to the
     # application API to dispatch lifecycle events from Android.
     ("engine/src/os/platform/jce_jni_bridge.c",
@@ -62,13 +73,13 @@ ALLOW = {
 # Each rule: (source-tree-prefix, banned-include-substring, reason)
 RULES: list[tuple[str, re.Pattern[str], str]] = [
     ("engine/src/renderer/",
-     re.compile(r"#include\s*[<\"](?:jce/)?middleware/([^\">]+)[>\"]"),
-     "renderer must not include middleware (P2 layer rule)"),
+     re.compile(r"#include\s*[<\"](?:jce/)?(?:middleware|application)/([^\">]+)[>\"]"),
+     "renderer must not include middleware/application (layer rule)"),
     ("engine/src/middleware/",
      re.compile(r"#include\s*[<\"](?:jce/)?application/([^\">]+)[>\"]"),
      "middleware must not include application"),
     ("engine/src/os/",
-     re.compile(r"#include\s*[<\"](?:jce/)?(renderer|middleware|application)/([^\">]+)[>\"]"),
+     re.compile(r"#include\s*[<\"](?:jce/)?(renderer|middleware|application|resource)/([^\">]+)[>\"]"),
      "os layer must not include higher tiers"),
 ]
 

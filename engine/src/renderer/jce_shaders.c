@@ -56,6 +56,13 @@ static const JcePakArchive *embedded_pak(void)
     return cached;
 }
 
+/* Public accessor so other engine subsystems (decals, GPU particles) can use
+ * the same embedded-engine-shader fallback as load_single(). */
+const JcePakArchive *jce_shaders_embedded_engine_pak(void)
+{
+    return embedded_pak();
+}
+
 /* Map bgfx renderer type to the file suffix produced by shaderc. */
 static const char *shader_suffix(bgfx_renderer_type_t type)
 {
@@ -253,6 +260,13 @@ JceShaderSet jce_shaders_load_all(const JcePakArchive *pak)
     /* Skinned variants share the fragment shader with their non-skinned
        counterpart: vs_pbr_skinned + fs_pbr, vs_shadow_skinned + fs_shadow. */
     set.pbr_skinned    = load_program_named(pak, "pbr_skinned",    "pbr");
+    /* Forward+ fragment variant (vs_pbr* + fs_pbr_fwdplus).  Same vertex
+     * shaders; only the fragment program differs.  Optional: a pak built
+     * before the variant existed simply won't have the bins → the handle stays
+     * invalid and the renderer falls back to the non-variant program. */
+    set.pbr_fwdplus         = load_program_named(pak, "pbr",         "pbr_fwdplus");
+    set.pbr_inst_fwdplus    = load_program_named(pak, "pbr_inst",    "pbr_fwdplus");
+    set.pbr_skinned_fwdplus = load_program_named(pak, "pbr_skinned", "pbr_fwdplus");
     set.shadow         = shader_load_program(pak, "shadow");
     /* Instanced shadow variant: vs_shadow_inst + fs_shadow (fragment unchanged). */
     set.shadow_inst    = load_program_named(pak, "shadow_inst",    "shadow");
@@ -273,6 +287,8 @@ JceShaderSet jce_shaders_load_all(const JcePakArchive *pak)
         LOG_WARN(LOG_TAG, "'pbr_inst' shader unavailable (GPU instancing disabled)");
     if (!jce_shader_valid(set.pbr_skinned))
         LOG_WARN(LOG_TAG, "'pbr_skinned' shader unavailable");
+    if (!jce_shader_valid(set.pbr_fwdplus))
+        LOG_WARN(LOG_TAG, "'pbr_fwdplus' shader unavailable (Forward+ disabled)");
     if (!jce_shader_valid(set.shadow))
         LOG_WARN(LOG_TAG, "'shadow' shader unavailable");
     if (!jce_shader_valid(set.shadow_inst))
@@ -316,6 +332,9 @@ JceShaderSet jce_shaders_load_all_fs(const char *dev_dir,
     set.pbr            = load_overlay(dev_dir, pak, "pbr",            "pbr");
     set.pbr_inst       = load_overlay(dev_dir, pak, "pbr_inst",       "pbr");
     set.pbr_skinned    = load_overlay(dev_dir, pak, "pbr_skinned",    "pbr");
+    set.pbr_fwdplus         = load_overlay(dev_dir, pak, "pbr",         "pbr_fwdplus");
+    set.pbr_inst_fwdplus    = load_overlay(dev_dir, pak, "pbr_inst",    "pbr_fwdplus");
+    set.pbr_skinned_fwdplus = load_overlay(dev_dir, pak, "pbr_skinned", "pbr_fwdplus");
     set.shadow         = load_overlay(dev_dir, pak, "shadow",         "shadow");
     set.shadow_inst    = load_overlay(dev_dir, pak, "shadow_inst",    "shadow");
     set.shadow_skinned = load_overlay(dev_dir, pak, "shadow_skinned", "shadow");

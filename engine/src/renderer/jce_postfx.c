@@ -48,6 +48,8 @@ struct JcePostFXPipeline {
     bgfx_program_handle_t prog_grayscale;
     bgfx_program_handle_t prog_composite;  /* uber: combine+tonemap+chromatic+vignette+grayscale */
     bgfx_program_handle_t prog_present;    /* pass-through: output -> backbuffer (runtime path) */
+    bgfx_program_handle_t prog_motion_vec; /* TAA: depth -> NDC motion delta (RG) */
+    bgfx_program_handle_t prog_taa;        /* TAA: resolve current + history -> output */
 
     /* Uniforms. */
     bgfx_uniform_handle_t u_texColor;
@@ -64,6 +66,13 @@ struct JcePostFXPipeline {
     bgfx_uniform_handle_t u_texDepth;         /* scene depth sampler (stage 1, custom pass) */
     bgfx_uniform_handle_t u_postfxTime;       /* (elapsed_s, has_depth, 0, 0) — custom pass */
     bgfx_uniform_handle_t u_postfxParams;     /* generic vec4[JCE_POSTFX_CUSTOM_PARAMS] */
+
+    /* TAA uniforms + samplers. */
+    bgfx_uniform_handle_t u_taaParams;        /* (feedback, luma_clamp, motion_clamp, 0) */
+    bgfx_uniform_handle_t u_taaInvViewProj;   /* inverse UN-jittered scene view*proj (s_texDepth recon) */
+    bgfx_uniform_handle_t u_taaPrevViewProj;  /* previous frame UN-jittered view*proj */
+    bgfx_uniform_handle_t u_texHistory;       /* TAA history sampler (stage 1, resolve) */
+    bgfx_uniform_handle_t u_texMotion;        /* TAA motion sampler  (stage 2, resolve) */
 
     /* Custom (client) pass — data-driven; the engine is style-agnostic. */
     const JcePakArchive  *shader_pak;         /* retained from load_shaders for lazy custom load */
@@ -83,6 +92,30 @@ struct JcePostFXPipeline {
     bgfx_texture_handle_t      output_tex;
     bgfx_frame_buffer_handle_t output_fb;
     int                        output_ping;   /* index into fbo[] */
+
+    /* ── TAA state (opt-in; nothing allocated until first enabled apply) ──
+     * The history buffer is PERSISTENT across frames (it must survive the
+     * ping-pong chain) and full-res HDR (RGBA16F) to match the scene colour.
+     * The motion buffer is regenerated every TAA frame.  Both are sized to
+     * the apply target and reallocated on resize (history_valid resets then,
+     * so the first post-resize resolve treats history as empty → ~current). */
+    bool                       taa_enabled;       /* requested by the renderer */
+    float                      taa_params[4];     /* feedback, luma_clamp, motion_clamp, 0 */
+    bool                       taa_have_matrices; /* matrices pushed this frame */
+    float                      taa_inv_view_proj[16];
+    float                      taa_prev_view_proj[16];
+    bgfx_texture_handle_t      taa_history_tex;
+    bgfx_frame_buffer_handle_t taa_history_fb;
+    bgfx_texture_handle_t      taa_motion_tex;
+    bgfx_frame_buffer_handle_t taa_motion_fb;
+    bool                       taa_fbos_valid;    /* history/motion allocated */
+    bool                       history_valid;     /* a resolve has written history */
+    /* EXTERNAL per-object motion-vector texture supplied by the renderer for the
+     * frame about to be resolved (the scene renderer's velocity G-buffer).  When
+     * valid the TAA pass SKIPS its internal camera-only motion-vec pass and binds
+     * THIS texture as s_texMotion instead — so animated/skinned geometry stops
+     * ghosting.  Reset to invalid every apply() (one-shot per frame). */
+    bgfx_texture_handle_t      taa_ext_motion_tex;
 };
 
 static void reset_output_state(JcePostFXPipeline *pipeline)
@@ -191,6 +224,60 @@ static void destroy_fbos(JcePostFXPipeline *p)
     p->fbos_valid = false;
 }
 
+/* ── TAA persistent FBO helpers ─────────────────────────────────────── */
+
+/* Allocate the persistent TAA history (RGBA16F, HDR like the scene colour)
+ * and motion (RGBA16F; RG would suffice but RGBA16F matches the existing
+ * FBO format helper and is universally RT-able) framebuffers at the current
+ * pipeline size.  History is the previous resolve; the resolve reprojects
+ * into it, so it must NOT participate in the ping-pong chain. */
+static void create_taa_fbos(JcePostFXPipeline *p)
+{
+    if (p->taa_fbos_valid) return;
+
+    p->taa_history_tex = bgfx_create_texture_2d(
+        (uint16_t)p->width, (uint16_t)p->height, false, 1,
+        BGFX_TEXTURE_FORMAT_RGBA16F,
+        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL);
+    {
+        bgfx_attachment_t at;
+        memset(&at, 0, sizeof(at));
+        bgfx_attachment_init(&at, p->taa_history_tex, BGFX_ACCESS_WRITE,
+                             0, 1, 0, BGFX_RESOLVE_NONE);
+        p->taa_history_fb = bgfx_create_frame_buffer_from_attachment(1, &at, true);
+    }
+
+    p->taa_motion_tex = bgfx_create_texture_2d(
+        (uint16_t)p->width, (uint16_t)p->height, false, 1,
+        BGFX_TEXTURE_FORMAT_RGBA16F,
+        BGFX_TEXTURE_RT | BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP, NULL);
+    {
+        bgfx_attachment_t at;
+        memset(&at, 0, sizeof(at));
+        bgfx_attachment_init(&at, p->taa_motion_tex, BGFX_ACCESS_WRITE,
+                             0, 1, 0, BGFX_RESOLVE_NONE);
+        p->taa_motion_fb = bgfx_create_frame_buffer_from_attachment(1, &at, true);
+    }
+
+    p->taa_fbos_valid = true;
+    p->history_valid  = false;  /* fresh buffers → no usable history yet */
+}
+
+static void destroy_taa_fbos(JcePostFXPipeline *p)
+{
+    if (!p->taa_fbos_valid) return;
+    if (p->taa_history_fb.idx != UINT16_MAX)
+        bgfx_destroy_frame_buffer(p->taa_history_fb);
+    if (p->taa_motion_fb.idx != UINT16_MAX)
+        bgfx_destroy_frame_buffer(p->taa_motion_fb);
+    p->taa_history_fb.idx  = UINT16_MAX;
+    p->taa_motion_fb.idx   = UINT16_MAX;
+    p->taa_history_tex.idx = UINT16_MAX;  /* owned by the FBs */
+    p->taa_motion_tex.idx  = UINT16_MAX;
+    p->taa_fbos_valid = false;
+    p->history_valid  = false;
+}
+
 /* ── Full-screen quad draw ─────────────────────────────────────────── */
 
 static void draw_fullscreen(JcePostFXPipeline *p, uint16_t view_id,
@@ -235,9 +322,26 @@ JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
     p->prog_chromatic.idx     = UINT16_MAX;
     p->prog_grayscale.idx     = UINT16_MAX;
     p->prog_composite.idx     = UINT16_MAX;
-    p->prog_present.idx       = UINT16_MAX;
+    p->prog_present.idx        = UINT16_MAX;
+    p->prog_motion_vec.idx    = UINT16_MAX;
+    p->prog_taa.idx           = UINT16_MAX;
     p->prog_custom.idx        = UINT16_MAX;
     p->shader_pak             = NULL;
+
+    /* TAA: nothing allocated until the renderer first enables it. */
+    p->taa_enabled       = false;
+    p->taa_have_matrices = false;
+    p->taa_fbos_valid    = false;
+    p->history_valid     = false;
+    p->taa_history_tex.idx = UINT16_MAX;
+    p->taa_history_fb.idx  = UINT16_MAX;
+    p->taa_motion_tex.idx  = UINT16_MAX;
+    p->taa_motion_fb.idx   = UINT16_MAX;
+    p->taa_ext_motion_tex.idx = UINT16_MAX;
+    p->taa_params[0] = 0.9f;   /* feedback */
+    p->taa_params[1] = 1.0f;   /* luma_clamp */
+    p->taa_params[2] = 1.0f;   /* motion_clamp */
+    p->taa_params[3] = 0.0f;
     p->custom_name[0]         = '\0';
     p->custom_loaded[0]       = '\0';
     p->custom_needs_depth     = false;
@@ -276,6 +380,16 @@ JcePostFXPipeline *jce_postfx_create(jce_allocator_t alloc,
     p->u_postfxParams   = bgfx_create_uniform("u_postfxParams",   BGFX_UNIFORM_TYPE_VEC4,
                                               JCE_POSTFX_CUSTOM_PARAMS);
 
+    /* TAA uniforms/samplers (created unconditionally — cheap; the passes
+     * that consume them only run when TAA is enabled). The sampler names
+     * match fs_taa.sc (s_texColor/s_texHistory/s_texMotion) and
+     * fs_motion_vec.sc (s_texDepth + u_jceInvViewProj/u_jcePrevViewProj). */
+    p->u_taaParams       = bgfx_create_uniform("u_taaParams",        BGFX_UNIFORM_TYPE_VEC4, 1);
+    p->u_taaInvViewProj  = bgfx_create_uniform("u_jceInvViewProj",   BGFX_UNIFORM_TYPE_MAT4, 1);
+    p->u_taaPrevViewProj = bgfx_create_uniform("u_jcePrevViewProj",  BGFX_UNIFORM_TYPE_MAT4, 1);
+    p->u_texHistory      = bgfx_create_uniform("s_texHistory",       BGFX_UNIFORM_TYPE_SAMPLER, 1);
+    p->u_texMotion       = bgfx_create_uniform("s_texMotion",        BGFX_UNIFORM_TYPE_SAMPLER, 1);
+
     LOG_SUCCESS(LOG_TAG, "post-fx pipeline created (%ux%u)", width, height);
     return p;
 }
@@ -285,6 +399,7 @@ void jce_postfx_destroy(JcePostFXPipeline *pipeline)
     if (!pipeline) return;
 
     destroy_fbos(pipeline);
+    destroy_taa_fbos(pipeline);
 
     if (pipeline->quad_vb.idx != UINT16_MAX)
         bgfx_destroy_vertex_buffer(pipeline->quad_vb);
@@ -306,6 +421,11 @@ void jce_postfx_destroy(JcePostFXPipeline *pipeline)
     bgfx_destroy_uniform(pipeline->u_texDepth);
     bgfx_destroy_uniform(pipeline->u_postfxTime);
     bgfx_destroy_uniform(pipeline->u_postfxParams);
+    bgfx_destroy_uniform(pipeline->u_taaParams);
+    bgfx_destroy_uniform(pipeline->u_taaInvViewProj);
+    bgfx_destroy_uniform(pipeline->u_taaPrevViewProj);
+    bgfx_destroy_uniform(pipeline->u_texHistory);
+    bgfx_destroy_uniform(pipeline->u_texMotion);
 
     /* Destroy shader programs. */
     if (pipeline->prog_tonemap.idx       != UINT16_MAX) bgfx_destroy_program(pipeline->prog_tonemap);
@@ -318,6 +438,8 @@ void jce_postfx_destroy(JcePostFXPipeline *pipeline)
     if (pipeline->prog_grayscale.idx     != UINT16_MAX) bgfx_destroy_program(pipeline->prog_grayscale);
     if (pipeline->prog_composite.idx     != UINT16_MAX) bgfx_destroy_program(pipeline->prog_composite);
     if (pipeline->prog_present.idx       != UINT16_MAX) bgfx_destroy_program(pipeline->prog_present);
+    if (pipeline->prog_motion_vec.idx    != UINT16_MAX) bgfx_destroy_program(pipeline->prog_motion_vec);
+    if (pipeline->prog_taa.idx           != UINT16_MAX) bgfx_destroy_program(pipeline->prog_taa);
     if (pipeline->prog_custom.idx        != UINT16_MAX) bgfx_destroy_program(pipeline->prog_custom);
 
     jce_allocator_t a = pipeline->alloc;
@@ -337,6 +459,10 @@ void jce_postfx_resize(JcePostFXPipeline *pipeline,
 
     /* Recreate FBOs at new resolution. */
     destroy_fbos(pipeline);
+    /* TAA history/motion are also size-locked — free them so the next enabled
+     * apply lazily reallocates at the new size; history_valid resets so the
+     * first post-resize resolve treats the (empty) history as invalid. */
+    destroy_taa_fbos(pipeline);
     reset_output_state(pipeline);
 
     LOG_DEBUG(LOG_TAG, "post-fx resized to %ux%u", width, height);
@@ -369,6 +495,42 @@ void jce_postfx_get_params(const JcePostFXPipeline *pipeline,
 {
     if (!pipeline || !out) return;
     *out = pipeline->params;
+}
+
+/* ── TAA configuration ─────────────────────────────────────────────── */
+
+void jce_postfx_set_taa(JcePostFXPipeline *pipeline, bool enabled,
+                        float feedback, float luma_clamp, float motion_clamp)
+{
+    if (!pipeline) return;
+    pipeline->taa_enabled    = enabled;
+    pipeline->taa_params[0]  = feedback;
+    pipeline->taa_params[1]  = luma_clamp;
+    pipeline->taa_params[2]  = motion_clamp;
+    pipeline->taa_params[3]  = 0.0f;
+}
+
+void jce_postfx_set_taa_matrices(JcePostFXPipeline *pipeline,
+                                 const jce_mat4 *scene_inv_view_proj,
+                                 const jce_mat4 *prev_view_proj)
+{
+    if (!pipeline) return;
+    if (!scene_inv_view_proj || !prev_view_proj) {
+        pipeline->taa_have_matrices = false;
+        return;
+    }
+    memcpy(pipeline->taa_inv_view_proj,  JCE_M4_PTR(*scene_inv_view_proj),
+           sizeof(pipeline->taa_inv_view_proj));
+    memcpy(pipeline->taa_prev_view_proj, JCE_M4_PTR(*prev_view_proj),
+           sizeof(pipeline->taa_prev_view_proj));
+    pipeline->taa_have_matrices = true;
+}
+
+void jce_postfx_set_taa_motion_tex(JcePostFXPipeline *pipeline,
+                                   JceTextureHandle tex)
+{
+    if (!pipeline) return;
+    pipeline->taa_ext_motion_tex.idx = tex.idx;
 }
 
 /* ── Custom (client) pass ──────────────────────────────────────────── */
@@ -467,6 +629,9 @@ bool jce_postfx_load_shaders(JcePostFXPipeline *pipeline,
     pipeline->prog_grayscale     = load_postfx_prog(pak, "grayscale");
     pipeline->prog_composite     = load_postfx_prog(pak, "composite");
     pipeline->prog_present       = load_postfx_prog(pak, "present");
+    /* TAA pair (optional; absence just means r.taa is a no-op on this build). */
+    pipeline->prog_motion_vec    = load_postfx_prog(pak, "motion_vec");
+    pipeline->prog_taa           = load_postfx_prog(pak, "taa");
 
     /* Count how many loaded successfully. */
     int loaded = 0;
@@ -509,12 +674,30 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
         return;
     }
 
+    /* TAA runs iff requested AND the resolve program is loaded.  Motion comes
+       from EITHER the renderer's external velocity buffer (per-object motion;
+       needs no depth or camera matrices here) OR the internal camera-only
+       reprojection pass (which needs prog_motion_vec + matrices + depth).  With
+       neither motion source available we silently skip TAA (the rest of the
+       chain is unaffected). */
+    const bool have_ext_motion = (pipeline->taa_ext_motion_tex.idx != UINT16_MAX);
+    const bool have_cam_motion =
+        pipeline->prog_motion_vec.idx != UINT16_MAX &&
+        pipeline->taa_have_matrices &&
+        jce_gfx_texture_valid(scene_depth);
+    const bool taa_run =
+        pipeline->taa_enabled &&
+        pipeline->prog_taa.idx != UINT16_MAX &&
+        (have_ext_motion || have_cam_motion);
+
     /* Count active effects. */
     int active = 0;
     for (int i = 0; i < JCE_POSTFX_COUNT; i++) {
         if (pipeline->enabled[i]) active++;
     }
-    if (active == 0) return;
+    /* TAA alone (no other effect) still needs the chain to run so its resolve
+       becomes the pipeline output. */
+    if (active == 0 && !taa_run) return;
 
     /* Ensure FBOs are created.  Composite ping-pong pair (0/1) always; the
        bloom buffers (2/3) only when bloom is enabled this frame — standard
@@ -525,6 +708,12 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
     if (!pipeline->fbos_valid) return;
     if (pipeline->enabled[JCE_POSTFX_BLOOM])
         ensure_bloom_fbos(pipeline);
+    /* TAA history/motion are lazily allocated ONLY when TAA actually runs —
+       a TAA-off frame never touches them, keeping the chain byte-identical. */
+    if (taa_run) {
+        create_taa_fbos(pipeline);
+        if (!pipeline->taa_fbos_valid) return;
+    }
 
     JCE_PROFILE_ZONE_N("PostFX::Apply");
 
@@ -539,7 +728,10 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
 
     /* Track current input texture. Start with the scene color. */
     bgfx_texture_handle_t current_tex = { scene_color.idx };
-    uint16_t view_id = pipeline->view_base;
+    /* Reserve the first 3 view IDs of the post block for TAA (motion +
+       resolve + history-copy) when it runs, so they order BEFORE the chain
+       (bgfx renders views in ascending ID order). */
+    uint16_t view_id = (uint16_t)(pipeline->view_base + (taa_run ? 3 : 0));
     int ping = 0; /* ping-pong FBO index (0 or 1) */
     int current_fb_index = -1;
 
@@ -560,6 +752,77 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
     } while (0)
 
 #define POSTFX_LABEL(vid, name) bgfx_set_view_name((vid), (name), INT32_MAX)
+
+    /* ── 0. TAA (runs FIRST; resolves the jittered scene against history) ──
+     * Three sub-passes on the reserved view_base+0..+2 block:
+     *   (a) motion-vec : reconstruct world pos from depth, project through the
+     *       previous camera, write NDC motion delta (RG) into the motion FBO.
+     *   (b) resolve    : blend current colour with reprojected, neighbourhood-
+     *       clamped history into a ping-pong target → becomes the chain input.
+     *   (c) history-copy: copy the resolve into the persistent history FBO so
+     *       next frame reprojects against it. */
+    if (taa_run) {
+        const uint16_t v_motion  = (uint16_t)(pipeline->view_base + 0);
+        const uint16_t v_resolve = (uint16_t)(pipeline->view_base + 1);
+        const uint16_t v_copy    = (uint16_t)(pipeline->view_base + 2);
+
+        /* (a) motion-vec pass: depth → motion FBO.  STANDARD per-object motion:
+         * when the renderer supplied an EXTERNAL velocity buffer (its geometry-
+         * pass velocity G-buffer, written with the SAME encoding as
+         * fs_motion_vec.sc), we SKIP this camera-only full-screen pass entirely
+         * and bind that texture as s_texMotion in the resolve below — so moving
+         * /animated/skinned geometry reprojects correctly instead of ghosting.
+         * Without an external buffer we run the legacy camera-only pass so the
+         * camera-reprojection fallback still works. */
+        const bool use_ext_motion =
+            (pipeline->taa_ext_motion_tex.idx != UINT16_MAX);
+        bgfx_texture_handle_t motion_tex = use_ext_motion
+            ? pipeline->taa_ext_motion_tex
+            : pipeline->taa_motion_tex;
+        if (!use_ext_motion) {
+            /* We supply BOTH camera matrices as explicit uniforms (the postfx
+             * fullscreen path can't use bgfx_set_view_transform without
+             * corrupting vs_postfx's quad), so the view leaves u_modelViewProj
+             * at identity like every other pass. */
+            bgfx_set_uniform(pipeline->u_taaInvViewProj,  pipeline->taa_inv_view_proj,  1);
+            bgfx_set_uniform(pipeline->u_taaPrevViewProj, pipeline->taa_prev_view_proj, 1);
+            bgfx_texture_handle_t depth_tex = { scene_depth.idx };
+            POSTFX_SETUP_VIEW(v_motion, pipeline->taa_motion_fb);
+            bgfx_set_view_name(v_motion, "PostFX/TAA_Motion", INT32_MAX);
+            bgfx_set_texture(0, pipeline->u_texDepth, depth_tex, UINT32_MAX);
+            draw_fullscreen(pipeline, v_motion, pipeline->prog_motion_vec);
+        }
+
+        /* (b) resolve pass: current colour + history + motion → fbo[ping].
+         * On the first frame (history_valid false) the history buffer is empty;
+         * fs_taa's on-screen test + a large/zero motion keeps the output ≈
+         * current, so no garbage history leaks in.  We still bind a valid
+         * history handle (the buffer exists) to satisfy the sampler. */
+        bgfx_set_uniform(pipeline->u_taaParams, pipeline->taa_params, 1);
+        ensure_composite_fbo(pipeline, ping);
+        POSTFX_SETUP_VIEW(v_resolve, pipeline->fbo[ping]);
+        bgfx_set_view_name(v_resolve, "PostFX/TAA_Resolve", INT32_MAX);
+        bgfx_set_texture(0, pipeline->u_texColor,   current_tex,             UINT32_MAX);
+        bgfx_set_texture(1, pipeline->u_texHistory, pipeline->taa_history_tex, UINT32_MAX);
+        bgfx_set_texture(2, pipeline->u_texMotion,  motion_tex,              UINT32_MAX);
+        draw_fullscreen(pipeline, v_resolve, pipeline->prog_taa);
+
+        bgfx_texture_handle_t resolved = pipeline->fbo_tex[ping];
+
+        /* (c) copy resolve → history (pass-through fullscreen) for next frame. */
+        if (pipeline->prog_present.idx != UINT16_MAX) {
+            POSTFX_SETUP_VIEW(v_copy, pipeline->taa_history_fb);
+            bgfx_set_view_name(v_copy, "PostFX/TAA_HistoryCopy", INT32_MAX);
+            bgfx_set_texture(0, pipeline->u_texColor, resolved, UINT32_MAX);
+            draw_fullscreen(pipeline, v_copy, pipeline->prog_present);
+        }
+
+        /* Resolved colour feeds the remaining chain; advance the ping-pong. */
+        current_tex = resolved;
+        current_fb_index = ping;
+        ping = 1 - ping;
+        pipeline->history_valid = true;
+    }
 
     /* ── 1. Bloom ─────────────────────────────────────────────────── */
     if (pipeline->enabled[JCE_POSTFX_BLOOM] &&
@@ -735,6 +998,11 @@ void jce_postfx_apply(JcePostFXPipeline *pipeline,
         pipeline->output_ping = current_fb_index;
     }
 
+    /* External motion vectors are one-shot per frame: clear so a later apply()
+       on this pipeline (pick / preview / thumbnail) does not reuse a stale
+       velocity buffer. */
+    pipeline->taa_ext_motion_tex.idx = UINT16_MAX;
+
     LOG_TRACE(LOG_TAG, "post-fx apply: %d effects active, %d views used",
               active, view_id - JCE_VIEW_POST_BASE);
     JCE_PROFILE_ZONE_END;
@@ -757,9 +1025,11 @@ void jce_postfx_present(JcePostFXPipeline *pipeline,
         return;
     if (pipeline->output_tex.idx == UINT16_MAX)
         return;
-    /* One view past the chain's worst case (bloom 3 + composite + fxaa +
-     * custom = 6 views from view_base) so submission order is preserved. */
-    view_id = (uint16_t)(pipeline->view_base + 8);
+    /* One view past the chain's worst case so submission order is preserved.
+     * Worst case = TAA (3 views: motion/resolve/history-copy from view_base)
+     * + bloom 3 + composite + fxaa + custom (6 views from view_base+3) =
+     * ends at view_base+9, so +12 stays clear and below JCE_VIEW_EDITOR_OVERLAY. */
+    view_id = (uint16_t)(pipeline->view_base + 12);
     bgfx_set_view_rect(view_id, 0, 0, (uint16_t)width, (uint16_t)height);
     bgfx_set_view_frame_buffer(view_id, backbuffer);
     bgfx_set_view_clear(view_id, BGFX_CLEAR_NONE, 0, 1.0f, 0);

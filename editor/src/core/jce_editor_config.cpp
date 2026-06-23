@@ -55,12 +55,30 @@ static const char *config_dir(void) {
     if (!init) { jce_editor_dotjce_path(NULL, d, sizeof(d)); init = true; }
     return d;
 }
+/* Legacy single-file store (pre-split).  Still READ on load as the
+ * lowest-precedence source so existing configs migrate forward; never
+ * written again after the split. */
 static const char *config_path(void) {
     static char p[1024]; static bool init = false;
     if (!init) { jce_editor_dotjce_path("editor-config.json", p, sizeof(p)); init = true; }
     return p;
 }
+/* Industry-standard split (Unity EditorPrefs vs Library/, Unreal Config
+ * vs Saved/): per-user PREFERENCES vs machine-local SESSION/last-state.
+ * Both live beside the legacy file under the same ~/.jce anchor. */
+static const char *prefs_path(void) {
+    static char p[1024]; static bool init = false;
+    if (!init) { jce_editor_dotjce_path("editor-preferences.json", p, sizeof(p)); init = true; }
+    return p;
+}
+static const char *session_path(void) {
+    static char p[1024]; static bool init = false;
+    if (!init) { jce_editor_dotjce_path("editor-session.json", p, sizeof(p)); init = true; }
+    return p;
+}
 #define CONFIG_PATH   config_path()
+#define PREFS_PATH    prefs_path()
+#define SESSION_PATH  session_path()
 #define CONFIG_DIR    config_dir()
 
 /* Cached input preference flags. */
@@ -76,7 +94,19 @@ void jce_editor_config_defaults(JceEditorConfig *cfg) {
     cfg->font_size = 24;
     cfg->ui_scale  = 1.0f;
     strncpy(cfg->theme, "Dark", sizeof(cfg->theme) - 1);
+    /* Editor default backend.  On Windows, AUTO resolves to D3D12 first
+     * (best frame throughput) but D3D12's driver cold-start adds ~0.6-1.0s
+     * to editor launch; an EDITOR favours iteration latency, so default to
+     * D3D11 (device+swapchain create is far cheaper) — matching Unity's
+     * Windows editor default.  D3D12/Vulkan remain one click away in
+     * Preferences, and the runtime/game/dist backend chain is untouched
+     * (jce_renderer_caps.c stays D3D12-first).  Only affects FRESH configs;
+     * an existing saved `renderer` value is preserved on load. */
+#if JCE_PLATFORM_WINDOWS
+    strncpy(cfg->renderer, "D3D11", sizeof(cfg->renderer) - 1);
+#else
     strncpy(cfg->renderer, "Auto", sizeof(cfg->renderer) - 1);
+#endif
     cfg->last_project[0] = '\0';
     cfg->last_scene_path[0] = '\0';
     cfg->recent_count = 0;
@@ -86,6 +116,8 @@ void jce_editor_config_defaults(JceEditorConfig *cfg) {
     cfg->gizmo_snap_translate = 0.5f;
     cfg->gizmo_snap_rotate    = 15.0f;
     cfg->gizmo_snap_scale     = 0.25f;
+    cfg->show_gizmos          = true;
+    cfg->gizmo_scale          = 1.0f;
     cfg->asset_browser_view_mode = 0; /* ASSET_BROWSER_VIEW_GRID */
     cfg->asset_favorite_count = 0;
     /* asset_favorites left zero-initialised by the memset above. */
@@ -127,6 +159,8 @@ void jce_editor_config_defaults(JceEditorConfig *cfg) {
             sizeof(cfg->build_output_path) - 1);
     cfg->font_en_path[0] = '\0';
     cfg->font_zh_path[0] = '\0';
+    cfg->external_script_editor[0] = '\0';
+    cfg->external_image_editor[0]  = '\0';
     cfg->invert_scroll_zoom = false;
     cfg->invert_drag_y      = false;
     cfg->touchpad_h_invert  = true;
@@ -202,25 +236,33 @@ static void load_ui_int_state(JceEditorConfig *cfg, const JceJson *root)
     }
 }
 
-/* --------------- load --------------- */
+/* ---------- categorized key I/O (preferences vs session) ----------
+ *
+ * editor-config.json was one flat file mixing two industry-standard
+ * categories: per-user PREFERENCES (theme/fonts/input/gizmo display — like
+ * Unity's EditorPrefs / Unreal's EditorPreferences) and SESSION/last-state
+ * (recent lists, window-visibility mask, last scene, build/run machine
+ * paths — like Unity's Library/ or Unreal's Saved/).  These now persist to
+ * two files (editor-preferences.json + editor-session.json) so the
+ * categories are visible and independently resettable, while keeping ONE
+ * in-memory JceEditorConfig and the same load/save API for the ~30 call
+ * sites.  apply_*_keys read one category from a JSON root (missing keys
+ * keep the current/default value); write_*_keys emit one category. */
 
-bool jce_editor_config_load(JceEditorConfig *cfg) {
-    jce_editor_config_defaults(cfg);
+#define JCE_EDITOR_CONFIG_SCHEMA 1
 
+/* Read + parse a config file into a JceJson tree (caller frees via
+ * jce_json_free).  Returns NULL when the file is absent or unparseable. */
+static JceJson *read_config_json(const char *path) {
     size_t len = 0;
-    char *buf = (char *)ed_read_file(CONFIG_PATH, &len);
-    if (!buf) {
-        LOG_WARN(LOG_TAG, "Config file not found: %s", CONFIG_PATH);
-        return false;
-    }
-
+    char *buf = (char *)ed_read_file(path, &len);
+    if (!buf) return NULL;
     JceJson *root = jce_json_parse(buf, len);
     ED_FREE(buf);
-    if (!root) {
-        LOG_ERROR(LOG_TAG, "Config JSON parse error");
-        return false;
-    }
+    return root;
+}
 
+static void apply_pref_keys(JceEditorConfig *cfg, const JceJson *root) {
     cjson_read_str(root, "language", cfg->language, sizeof(cfg->language));
     cfg->font_size = cjson_read_int(root, "font_size", cfg->font_size);
     cfg->ui_scale  = (float)jce_json_get_number(root, "ui_scale", cfg->ui_scale);
@@ -228,27 +270,58 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
     if (cfg->ui_scale > 3.0f) cfg->ui_scale = 3.0f;
     cjson_read_str(root, "theme",    cfg->theme,    sizeof(cfg->theme));
     cjson_read_str(root, "renderer", cfg->renderer, sizeof(cfg->renderer));
-    cjson_read_str(root, "last_project", cfg->last_project, sizeof(cfg->last_project));
-    cjson_read_str(root, "last_scene_path",
-                   cfg->last_scene_path, sizeof(cfg->last_scene_path));
-
-    /* Scene view render settings. */
-    cfg->view_mode = cjson_read_int(root, "view_mode", cfg->view_mode);
-    {
-        const JceJson *g = jce_json_get(root, "show_grid");
-        if (jce_json_is_bool(g))
-            cfg->show_grid = jce_json_get_bool(root, "show_grid", cfg->show_grid);
-    }
     cfg->gizmo_snap_translate = (float)jce_json_get_number(
         root, "gizmo_snap_translate", cfg->gizmo_snap_translate);
     cfg->gizmo_snap_rotate = (float)jce_json_get_number(
         root, "gizmo_snap_rotate", cfg->gizmo_snap_rotate);
     cfg->gizmo_snap_scale = (float)jce_json_get_number(
         root, "gizmo_snap_scale", cfg->gizmo_snap_scale);
+    {
+        const JceJson *sg = jce_json_get(root, "show_gizmos");
+        if (sg)
+            cfg->show_gizmos = jce_json_get_bool(root, "show_gizmos",
+                                                 cfg->show_gizmos);
+    }
+    cfg->gizmo_scale = (float)jce_json_get_number(
+        root, "gizmo_scale", cfg->gizmo_scale);
     cfg->asset_browser_view_mode = cjson_read_int(root,
                                                   "asset_browser_view_mode",
                                                   cfg->asset_browser_view_mode);
+    cjson_read_str(root, "font_en_path",
+                   cfg->font_en_path, sizeof(cfg->font_en_path));
+    cjson_read_str(root, "font_zh_path",
+                   cfg->font_zh_path, sizeof(cfg->font_zh_path));
+    cjson_read_str(root, "external_script_editor",
+                   cfg->external_script_editor, sizeof(cfg->external_script_editor));
+    cjson_read_str(root, "external_image_editor",
+                   cfg->external_image_editor, sizeof(cfg->external_image_editor));
+    cfg->invert_scroll_zoom = jce_json_get_bool(root, "invert_scroll_zoom",
+                                                cfg->invert_scroll_zoom);
+    cfg->invert_drag_y      = jce_json_get_bool(root, "invert_drag_y",
+                                                cfg->invert_drag_y);
+    cfg->touchpad_h_invert  = jce_json_get_bool(root, "touchpad_h_invert",
+                                                cfg->touchpad_h_invert);
+    cfg->auto_repack_on_save = jce_json_get_bool(root, "auto_repack_on_save",
+                                                 cfg->auto_repack_on_save);
+    cfg->run_dev_mode = jce_json_get_bool(root, "run_dev_mode",
+                                          cfg->run_dev_mode);
+}
 
+static void apply_session_keys(JceEditorConfig *cfg, const JceJson *root) {
+    cjson_read_str(root, "last_project", cfg->last_project, sizeof(cfg->last_project));
+    cjson_read_str(root, "last_scene_path",
+                   cfg->last_scene_path, sizeof(cfg->last_scene_path));
+
+    /* Scene view render settings (transient last-state). */
+    cfg->view_mode = cjson_read_int(root, "view_mode", cfg->view_mode);
+    {
+        const JceJson *g = jce_json_get(root, "show_grid");
+        if (jce_json_is_bool(g))
+            cfg->show_grid = jce_json_get_bool(root, "show_grid", cfg->show_grid);
+    }
+
+    /* Build/run profile: machine-local (absolute exe/output paths, per-dev
+     * iteration toggles) — kept user-local, NOT version-controlled. */
     cfg->run_mode = cjson_read_int(root, "run_mode", cfg->run_mode);
     cjson_read_str(root, "game_executable_path",
                    cfg->game_executable_path, sizeof(cfg->game_executable_path));
@@ -262,20 +335,7 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
                    cfg->build_preset, sizeof(cfg->build_preset));
     cjson_read_str(root, "build_output_path",
                    cfg->build_output_path, sizeof(cfg->build_output_path));
-    cjson_read_str(root, "font_en_path",
-                   cfg->font_en_path, sizeof(cfg->font_en_path));
-    cjson_read_str(root, "font_zh_path",
-                   cfg->font_zh_path, sizeof(cfg->font_zh_path));
-    cfg->invert_scroll_zoom = jce_json_get_bool(root, "invert_scroll_zoom",
-                                                cfg->invert_scroll_zoom);
-    cfg->invert_drag_y      = jce_json_get_bool(root, "invert_drag_y",
-                                                cfg->invert_drag_y);
-    cfg->touchpad_h_invert  = jce_json_get_bool(root, "touchpad_h_invert",
-                                                cfg->touchpad_h_invert);
-    cfg->auto_repack_on_save = jce_json_get_bool(root, "auto_repack_on_save",
-                                                 cfg->auto_repack_on_save);
-    cfg->run_dev_mode = jce_json_get_bool(root, "run_dev_mode",
-                                          cfg->run_dev_mode);
+
     cfg->panels_visible_mask = (uint32_t)jce_json_get_int(
         root, "panels_visible_mask", (int)cfg->panels_visible_mask);
     cfg->panels_visible_mask_hi = (uint32_t)jce_json_get_int(
@@ -284,9 +344,6 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
                    cfg->workspace_id, sizeof(cfg->workspace_id));
     cjson_read_str(root, "build_project_root",
                    cfg->build_project_root, sizeof(cfg->build_project_root));
-    jce_editor_pref_invert_scroll_zoom = cfg->invert_scroll_zoom;
-    jce_editor_pref_invert_drag_y      = cfg->invert_drag_y;
-    jce_editor_pref_touchpad_h_invert  = cfg->touchpad_h_invert;
 
     /* recent_0 .. recent_9 */
     cfg->recent_count = 0;
@@ -342,8 +399,41 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
     }
 
     load_ui_int_state(cfg, root);
+}
 
-    jce_json_free(root);
+/* --------------- load --------------- */
+
+bool jce_editor_config_load(JceEditorConfig *cfg) {
+    jce_editor_config_defaults(cfg);
+
+    /* Precedence: new category files win; the legacy single file fills any
+     * category whose new file is absent (one-time forward migration with no
+     * data loss).  Each category is applied from exactly ONE source. */
+    JceJson *pj = read_config_json(PREFS_PATH);
+    JceJson *sj = read_config_json(SESSION_PATH);
+    JceJson *lj = (!pj || !sj) ? read_config_json(CONFIG_PATH) : NULL;
+
+    if (pj)      apply_pref_keys(cfg, pj);
+    else if (lj) apply_pref_keys(cfg, lj);
+
+    if (sj)      apply_session_keys(cfg, sj);
+    else if (lj) apply_session_keys(cfg, lj);
+
+    /* Cached input-pref globals (read every frame by viewport handlers). */
+    jce_editor_pref_invert_scroll_zoom = cfg->invert_scroll_zoom;
+    jce_editor_pref_invert_drag_y      = cfg->invert_drag_y;
+    jce_editor_pref_touchpad_h_invert  = cfg->touchpad_h_invert;
+
+    const bool found = (pj || sj || lj);
+    if (pj) jce_json_free(pj);
+    if (sj) jce_json_free(sj);
+    if (lj) jce_json_free(lj);
+
+    if (!found) {
+        LOG_WARN(LOG_TAG, "No editor config found (prefs/session/legacy); using defaults");
+        return false;
+    }
+
     /* Suppress repetitive logging: jce_editor_config_load() is called from
        ~30 sites during startup (panels, dialogs, state init, etc.) and each
        call would otherwise spam an identical line. Log only when the
@@ -368,29 +458,39 @@ bool jce_editor_config_load(JceEditorConfig *cfg) {
 
 /* --------------- save --------------- */
 
-bool jce_editor_config_save(const JceEditorConfig *cfg) {
-    /* Ensure .jce directory exists */
-    ensure_directory(CONFIG_DIR);
-
-    JceJson *root = jce_json_object();
-    if (!root) return false;
-
+static void write_pref_keys(JceJson *root, const JceEditorConfig *cfg) {
     jce_json_set_string(root, "language",     cfg->language);
     jce_json_set_int   (root, "font_size",    cfg->font_size);
     jce_json_set_number(root, "ui_scale",     cfg->ui_scale);
     jce_json_set_string(root, "theme",        cfg->theme);
     jce_json_set_string(root, "renderer",     cfg->renderer);
+    jce_json_set_number(root, "gizmo_snap_translate", cfg->gizmo_snap_translate);
+    jce_json_set_number(root, "gizmo_snap_rotate",    cfg->gizmo_snap_rotate);
+    jce_json_set_number(root, "gizmo_snap_scale",     cfg->gizmo_snap_scale);
+    jce_json_set_bool  (root, "show_gizmos",          cfg->show_gizmos);
+    jce_json_set_number(root, "gizmo_scale",          cfg->gizmo_scale);
+    jce_json_set_int (root, "asset_browser_view_mode",
+                      cfg->asset_browser_view_mode);
+    jce_json_set_string(root, "font_en_path", cfg->font_en_path);
+    jce_json_set_string(root, "font_zh_path", cfg->font_zh_path);
+    jce_json_set_string(root, "external_script_editor", cfg->external_script_editor);
+    jce_json_set_string(root, "external_image_editor",  cfg->external_image_editor);
+    jce_json_set_bool(root, "invert_scroll_zoom", cfg->invert_scroll_zoom);
+    jce_json_set_bool(root, "invert_drag_y",      cfg->invert_drag_y);
+    jce_json_set_bool(root, "touchpad_h_invert",  cfg->touchpad_h_invert);
+    jce_json_set_bool(root, "auto_repack_on_save", cfg->auto_repack_on_save);
+    jce_json_set_bool(root, "run_dev_mode",        cfg->run_dev_mode);
+}
+
+static void write_session_keys(JceJson *root, const JceEditorConfig *cfg) {
     jce_json_set_string(root, "last_project", cfg->last_project);
     jce_json_set_string(root, "last_scene_path", cfg->last_scene_path);
 
     /* Scene view render settings. */
     jce_json_set_int (root, "view_mode",  cfg->view_mode);
     jce_json_set_bool(root, "show_grid",  cfg->show_grid);
-    jce_json_set_number(root, "gizmo_snap_translate", cfg->gizmo_snap_translate);
-    jce_json_set_number(root, "gizmo_snap_rotate",    cfg->gizmo_snap_rotate);
-    jce_json_set_number(root, "gizmo_snap_scale",     cfg->gizmo_snap_scale);
-    jce_json_set_int (root, "asset_browser_view_mode",
-                      cfg->asset_browser_view_mode);
+
+    /* Build/run profile (machine-local). */
     jce_json_set_int (root, "run_mode", cfg->run_mode);
     jce_json_set_string(root, "game_executable_path",
                         cfg->game_executable_path);
@@ -401,20 +501,11 @@ bool jce_editor_config_save(const JceEditorConfig *cfg) {
                         cfg->build_configure_preset);
     jce_json_set_string(root, "build_preset", cfg->build_preset);
     jce_json_set_string(root, "build_output_path", cfg->build_output_path);
-    jce_json_set_string(root, "font_en_path", cfg->font_en_path);
-    jce_json_set_string(root, "font_zh_path", cfg->font_zh_path);
-    jce_json_set_bool(root, "invert_scroll_zoom", cfg->invert_scroll_zoom);
-    jce_json_set_bool(root, "invert_drag_y",      cfg->invert_drag_y);
-    jce_json_set_bool(root, "touchpad_h_invert",  cfg->touchpad_h_invert);
-    jce_json_set_bool(root, "auto_repack_on_save", cfg->auto_repack_on_save);
-    jce_json_set_bool(root, "run_dev_mode",        cfg->run_dev_mode);
+
     jce_json_set_int (root, "panels_visible_mask", (int)cfg->panels_visible_mask);
     jce_json_set_int (root, "panels_visible_mask_hi", (int)cfg->panels_visible_mask_hi);
     jce_json_set_string(root, "workspace_id", cfg->workspace_id);
     jce_json_set_string(root, "build_project_root", cfg->build_project_root);
-    jce_editor_pref_invert_scroll_zoom = cfg->invert_scroll_zoom;
-    jce_editor_pref_invert_drag_y      = cfg->invert_drag_y;
-    jce_editor_pref_touchpad_h_invert  = cfg->touchpad_h_invert;
 
     for (int i = 0; i < 10; i++) {
         char key[16];
@@ -428,7 +519,6 @@ bool jce_editor_config_save(const JceEditorConfig *cfg) {
         const char *val = (i < cfg->recent_scene_count) ? cfg->recent_scene_paths[i] : "";
         jce_json_set_string(root, key, val);
     }
-
     {
         int cap = (int)(sizeof(cfg->asset_favorites) /
                         sizeof(cfg->asset_favorites[0]));
@@ -440,7 +530,6 @@ bool jce_editor_config_save(const JceEditorConfig *cfg) {
             jce_json_set_string(root, key, val);
         }
     }
-
     {
         JceJson *ui = jce_json_object();
         if (ui) {
@@ -452,14 +541,46 @@ bool jce_editor_config_save(const JceEditorConfig *cfg) {
             jce_json_set_child(root, "ui_state_int", ui);
         }
     }
+}
 
-    if (!ed_write_json_to_file(CONFIG_PATH, root)) {
-        LOG_ERROR(LOG_TAG, "Failed to write config: %s", CONFIG_PATH);
-        return false;
+bool jce_editor_config_save(const JceEditorConfig *cfg) {
+    /* Ensure .jce directory exists */
+    ensure_directory(CONFIG_DIR);
+
+    /* Keep the cached input-pref globals in sync (read every frame). */
+    jce_editor_pref_invert_scroll_zoom = cfg->invert_scroll_zoom;
+    jce_editor_pref_invert_drag_y      = cfg->invert_drag_y;
+    jce_editor_pref_touchpad_h_invert  = cfg->touchpad_h_invert;
+
+    bool ok = true;
+
+    /* Preferences (per-user). */
+    {
+        JceJson *root = jce_json_object();
+        if (!root) return false;
+        jce_json_set_int(root, "_schema", JCE_EDITOR_CONFIG_SCHEMA);
+        write_pref_keys(root, cfg);
+        if (!ed_write_json_to_file(PREFS_PATH, root)) {
+            LOG_ERROR(LOG_TAG, "Failed to write preferences: %s", PREFS_PATH);
+            ok = false;
+        }
     }
 
-    LOG_INFO(LOG_TAG, "Config saved to %s", CONFIG_PATH);
-    return true;
+    /* Session / last-state (machine-local). */
+    {
+        JceJson *root = jce_json_object();
+        if (!root) return false;
+        jce_json_set_int(root, "_schema", JCE_EDITOR_CONFIG_SCHEMA);
+        write_session_keys(root, cfg);
+        if (!ed_write_json_to_file(SESSION_PATH, root)) {
+            LOG_ERROR(LOG_TAG, "Failed to write session: %s", SESSION_PATH);
+            ok = false;
+        }
+    }
+
+    if (ok)
+        LOG_INFO(LOG_TAG, "Config saved (%s + %s)", PREFS_PATH, SESSION_PATH);
+    return ok;
 }
 
 void jce_editor_config_ensure_dir(void) {
@@ -468,8 +589,21 @@ void jce_editor_config_ensure_dir(void) {
 
 /* --------------- add recent --------------- */
 
+/* Max remembered recent entries (Preferences > General > recent_max).
+ * Defaults to the array bound (10); the preferences panel pushes the user's
+ * value so the persisted recent_max actually bounds the lists instead of
+ * being inert.  Clamped to [1,10] (the array capacity). */
+static int s_recent_cap = 10;
+
+void jce_editor_config_set_recent_cap(int n) {
+    if (n < 1)  n = 1;
+    if (n > 10) n = 10;
+    s_recent_cap = n;
+}
+
 void jce_editor_config_add_recent(JceEditorConfig *cfg, const char *path) {
     if (!path || path[0] == '\0') return;
+    const int cap = s_recent_cap;
 
     /* Remove duplicate if it already exists */
     int dup_idx = -1;
@@ -488,14 +622,14 @@ void jce_editor_config_add_recent(JceEditorConfig *cfg, const char *path) {
             cfg->recent_projects[i][sizeof(cfg->recent_projects[i]) - 1] = '\0';
         }
     } else {
-        /* Shift everything down, drop last if full */
-        int count = cfg->recent_count < 10 ? cfg->recent_count : 9;
+        /* Shift everything down, drop last if at the cap */
+        int count = cfg->recent_count < cap ? cfg->recent_count : (cap - 1);
         for (int i = count; i > 0; i--) {
             strncpy(cfg->recent_projects[i], cfg->recent_projects[i - 1],
                     sizeof(cfg->recent_projects[i]) - 1);
             cfg->recent_projects[i][sizeof(cfg->recent_projects[i]) - 1] = '\0';
         }
-        if (cfg->recent_count < 10)
+        if (cfg->recent_count < cap)
             cfg->recent_count++;
     }
 
@@ -506,6 +640,7 @@ void jce_editor_config_add_recent(JceEditorConfig *cfg, const char *path) {
 
 void jce_editor_config_add_recent_scene(JceEditorConfig *cfg, const char *path) {
     if (!cfg || !path || path[0] == '\0') return;
+    const int cap = s_recent_cap;
 
     /* Filter: only accept .scene.json files (post A1-A6 unification). */
     size_t plen = strlen(path);
@@ -547,13 +682,13 @@ void jce_editor_config_add_recent_scene(JceEditorConfig *cfg, const char *path) 
             cfg->recent_scene_paths[i][sizeof(cfg->recent_scene_paths[i]) - 1] = '\0';
         }
     } else {
-        int count = cfg->recent_scene_count < 10 ? cfg->recent_scene_count : 9;
+        int count = cfg->recent_scene_count < cap ? cfg->recent_scene_count : (cap - 1);
         for (int i = count; i > 0; i--) {
             strncpy(cfg->recent_scene_paths[i], cfg->recent_scene_paths[i - 1],
                     sizeof(cfg->recent_scene_paths[i]) - 1);
             cfg->recent_scene_paths[i][sizeof(cfg->recent_scene_paths[i]) - 1] = '\0';
         }
-        if (cfg->recent_scene_count < 10)
+        if (cfg->recent_scene_count < cap)
             cfg->recent_scene_count++;
     }
 

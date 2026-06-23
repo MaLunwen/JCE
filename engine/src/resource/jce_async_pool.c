@@ -481,6 +481,7 @@ void jce_pool_destroy(JceAsyncPool *pool)
 JceAsyncRequest *jce_pool_submit(JceAsyncPool *pool,
                                  JceAsyncRequestType type,
                                  uint16_t slot_index,
+                                 uint16_t generation,
                                  const char *path,
                                  JcePakArchive *pak,
                                  JceFileSystem *fs,
@@ -493,6 +494,7 @@ JceAsyncRequest *jce_pool_submit(JceAsyncPool *pool,
 
     req->type       = type;
     req->slot_index = slot_index;
+    req->generation = generation;
     req->pak        = pak;
     req->fs         = fs;
     snprintf(req->path, sizeof(req->path), "%s", path);

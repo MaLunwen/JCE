@@ -22,6 +22,7 @@
  */
 
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/middleware/scene/jce_component_registry.h>  /* per-component disable gate */
 #include <jce/middleware/scene/jce_ui_canvas.h>
 #include <jce/middleware/ui/jce_localization.h>
 #include <jce/os/core/jce_i18n.h>
@@ -29,6 +30,7 @@
 #include <jce/os/core/jce_math.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/os/core/jce_str.h>
+#include <jce/os/platform/jce_keys.h>
 #include <jce/renderer/jce_primitives.h>
 #include <jce/renderer/jce_text.h>
 #include <jce/renderer/jce_texture.h>
@@ -65,12 +67,25 @@ typedef struct {
     JceTexture tex;
 } UCTexSlot;
 
-/* Per-button interaction state, persisted across frames. */
+/* Per-widget interaction state, persisted across frames.  Shared by the
+ * UIButton click state machine and the UISlider/UIToggle machines:
+ *   - button : fade/state/press_inside (Unity ColorTint transition)
+ *   - slider : drag_active (a drag that began over the handle keeps tracking
+ *              even if the pointer slips slightly off the rect, mirroring the
+ *              button press_inside latch)
+ *   - toggle : press_inside (same press-inside → release-over click latch as
+ *              the button) */
 typedef struct {
     uint64_t entity;       /* 0 = free slot */
-    float    fade;         /* 0..1 toward target tint */
-    int      state;        /* 0 normal, 1 hover, 2 pressed */
-    bool     press_inside; /* press began over this button */
+    float    fade;         /* 0..1 toward target tint (button) */
+    int      state;        /* 0 normal, 1 hover, 2 pressed (button) */
+    bool     press_inside; /* press began over this widget (button/toggle) */
+    bool     drag_active;  /* slider drag in flight */
+    /* Dropdown press latch: the target the press began over —
+     *   -1 = none, -2 = the collapsed main rect, >=0 = an expanded option row.
+     * A click commits only when the release lands over the SAME target
+     * (press-inside → release-over, mirroring the button/toggle latch). */
+    int      dd_press;
 } UCButtonState;
 
 struct JceUICanvas {
@@ -86,6 +101,21 @@ struct JceUICanvas {
     UCButtonState buttons[UC_MAX_BUTTONS];
 
     uint64_t      last_clicked;
+    uint64_t      last_value_changed;  /* slider/toggle/dropdown value changed this render */
+    uint64_t      last_text_changed;   /* inputfield text edited (clear-on-read)           */
+
+    /* InputField focus + edit state (single focused field at a time). */
+    uint64_t      focused_input;   /* focused InputField entity, 0 = none  */
+    int           caret;           /* byte caret index into its `text`     */
+    uint64_t      last_submitted;  /* set on RETURN, cleared each render    */
+    float         caret_blink;     /* 0..1 blink phase (driven by dt)       */
+    JceScene     *edit_scene;      /* scene last rendered (text/key target) */
+
+    /* ScrollView wheel channel: the scroll view under the pointer during the
+     * most recent render (raycast pass), plus its resolved viewport rect so
+     * jce_ui_canvas_scroll can clamp without re-laying-out.  0 = none. */
+    uint64_t      hovered_scroll;      /* hovered UIScrollView entity, 0 = none */
+    UCRect        hovered_scroll_rect; /* its resolved viewport rect (px)       */
 };
 
 /* ── Resource caches ───────────────────────────────────────────────── */
@@ -153,8 +183,9 @@ static UCButtonState *uc_button_state(JceUICanvas *uc, uint64_t e)
     }
     if (free_slot) {
         memset(free_slot, 0, sizeof *free_slot);
-        free_slot->entity = e;
-        free_slot->fade   = 1.0f;
+        free_slot->entity   = e;
+        free_slot->fade     = 1.0f;
+        free_slot->dd_press = -1;  /* no dropdown press latched */
         return free_slot;
     }
     return NULL;
@@ -241,19 +272,39 @@ static UCRect uc_resolve_rect(const UCRect *parent, const JceRectTransform *rt,
     return r;
 }
 
-/* Read whichever UI graphic RectTransform an entity carries. */
+/* Read whichever UI graphic RectTransform an entity carries.  Image/Text
+ * come first (a slider/toggle may also carry a background UIImage authored
+ * separately); Slider/Toggle each embed their own RectTransform so they can
+ * be laid out / raycast without a sibling UIImage. */
 static const JceRectTransform *uc_entity_rect(JceScene *s, JceEntity e)
 {
     JceUIImageComponent *im = jce_scene_get_ui_image(s, e);
     if (im) return &im->rect;
     JceUITextComponent *tx = jce_scene_get_ui_text(s, e);
     if (tx) return &tx->rect;
+    JceUISliderComponent *sl = jce_scene_get_ui_slider(s, e);
+    if (sl) return &sl->rect;
+    JceUIToggleComponent *tg = jce_scene_get_ui_toggle(s, e);
+    if (tg) return &tg->rect;
+    JceUIInputFieldComponent *inf = jce_scene_get_ui_input_field(s, e);
+    if (inf) return &inf->rect;
+    JceUIScrollViewComponent *sv = jce_scene_get_ui_scroll_view(s, e);
+    if (sv) return &sv->rect;
+    JceUIProgressBarComponent *pb = jce_scene_get_ui_progress_bar(s, e);
+    if (pb) return &pb->rect;
+    JceUIDropdownComponent *dd = jce_scene_get_ui_dropdown(s, e);
+    if (dd) return &dd->rect;
     return NULL;
 }
 
 static bool uc_is_ui_element(JceScene *s, JceEntity e)
 {
-    return jce_scene_has_ui_image(s, e) || jce_scene_has_ui_text(s, e);
+    return jce_scene_has_ui_image(s, e) || jce_scene_has_ui_text(s, e) ||
+           jce_scene_has_ui_slider(s, e) || jce_scene_has_ui_toggle(s, e) ||
+           jce_scene_has_ui_input_field(s, e) ||
+           jce_scene_has_ui_scroll_view(s, e) ||
+           jce_scene_has_ui_progress_bar(s, e) ||
+           jce_scene_has_ui_dropdown(s, e);
 }
 
 /* ── Raycast accumulation ──────────────────────────────────────────── */
@@ -277,6 +328,10 @@ typedef struct {
     /* draw order accumulation for raycast top-most resolution */
     UCHit        hits[UC_MAX_BUTTONS];
     int          hit_count;
+    /* Pointer snapshot for the render pass (dropdown popup hover highlight).
+     * Interaction proper still runs in uc_update_*; this is draw-only. */
+    float        ptr_x, ptr_y;
+    bool         ptr_valid;
 } UCFrame;
 
 /* ── 9-slice / image draw ──────────────────────────────────────────── */
@@ -625,6 +680,463 @@ static void uc_draw_text(JceUICanvas *uc, uint16_t view_id, const UCRect *r,
     }
 }
 
+/* ── Slider / Toggle value mapping ──────────────────────────────────── */
+
+/* Normalized value position (0..1) of the slider along its main axis. */
+static float uc_slider_norm(const JceUISliderComponent *sl)
+{
+    float span = sl->max_value - sl->min_value;
+    if (span <= 0.0f) return 0.0f;
+    float t = (sl->value - sl->min_value) / span;
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    return t;
+}
+
+/* Map a pointer position to a normalized t (0..1) along the slider's main
+ * axis, honouring `direction`.  Shared by the headless interaction path. */
+static float uc_slider_pointer_t(const JceUISliderComponent *sl, const UCRect *r,
+                                 float px, float py)
+{
+    float t;
+    switch (sl->direction) {
+        case 1: /* R→L */
+            t = (r->w > 0.0f) ? (px - r->x) / r->w : 0.0f;
+            t = 1.0f - t;
+            break;
+        case 2: /* B→T (screen y grows downward, so bottom = larger y) */
+            t = (r->h > 0.0f) ? (py - r->y) / r->h : 0.0f;
+            t = 1.0f - t;
+            break;
+        case 3: /* T→B */
+            t = (r->h > 0.0f) ? (py - r->y) / r->h : 0.0f;
+            break;
+        case 0: /* L→R */
+        default:
+            t = (r->w > 0.0f) ? (px - r->x) / r->w : 0.0f;
+            break;
+    }
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    return t;
+}
+
+/* ── Slider / Toggle draw (PASS 3) ──────────────────────────────────── */
+
+static void uc_draw_quad(JceUICanvas *uc, uint16_t view_id, float x, float y,
+                         float w, float h, const char *sprite,
+                         const float rgba[4], float alpha_mul)
+{
+    if (w <= 0.0f || h <= 0.0f) return;
+    uint32_t tint = uc_color(rgba, alpha_mul);
+    JceTexture tex = uc_get_texture(uc, sprite);
+    if (jce_texture_valid(tex))
+        jce_draw_textured_rect_view(uc->renderer, view_id, x, y, w, h, tex, tint, NULL);
+    else
+        jce_draw_filled_rect_view(uc->renderer, view_id, x, y, w, h, tint);
+}
+
+static void uc_draw_slider(JceUICanvas *uc, uint16_t view_id, const UCRect *r,
+                           const JceUISliderComponent *sl, float alpha_mul,
+                           float ui_scale)
+{
+    float t = uc_slider_norm(sl);
+
+    /* Background track. */
+    uc_draw_quad(uc, view_id, r->x, r->y, r->w, r->h, NULL, sl->bg_color, alpha_mul);
+
+    /* Fill: a sub-rect from the "start" edge to the value position. */
+    float fx = r->x, fy = r->y, fw = r->w, fh = r->h;
+    switch (sl->direction) {
+        case 1: /* R→L: fill the right portion */
+            fw = r->w * t; fx = r->x + r->w - fw; break;
+        case 2: /* B→T: fill the bottom portion */
+            fh = r->h * t; fy = r->y + r->h - fh; break;
+        case 3: /* T→B: fill the top portion */
+            fh = r->h * t; break;
+        case 0: /* L→R: fill the left portion */
+        default:
+            fw = r->w * t; break;
+    }
+    uc_draw_quad(uc, view_id, fx, fy, fw, fh, sl->fill_sprite, sl->fill_color, alpha_mul);
+
+    /* Handle: a square centred at the value position along the main axis. */
+    float hs = (sl->handle_size > 0.0f ? sl->handle_size : 20.0f) * ui_scale;
+    float hx, hy, hw, hh;
+    bool vertical = (sl->direction == 2 || sl->direction == 3);
+    if (vertical) {
+        hw = r->w; hh = hs;
+        hx = r->x;
+        /* t runs along the value axis; convert to a screen-y centre. */
+        float cy = (sl->direction == 3) ? (r->y + r->h * t)
+                                        : (r->y + r->h * (1.0f - t));
+        hy = cy - hh * 0.5f;
+    } else {
+        hw = hs; hh = r->h;
+        hy = r->y;
+        float cx = (sl->direction == 1) ? (r->x + r->w * (1.0f - t))
+                                        : (r->x + r->w * t);
+        hx = cx - hw * 0.5f;
+    }
+    uc_draw_quad(uc, view_id, hx, hy, hw, hh, sl->handle_sprite, sl->handle_color, alpha_mul);
+}
+
+static void uc_draw_toggle(JceUICanvas *uc, uint16_t view_id, const UCRect *r,
+                           const JceUIToggleComponent *tg, float alpha_mul)
+{
+    /* Background box. */
+    uc_draw_quad(uc, view_id, r->x, r->y, r->w, r->h, tg->bg_sprite, tg->bg_color, alpha_mul);
+    /* Checkmark: drawn only when on, inset slightly inside the box. */
+    if (tg->is_on) {
+        float inset_x = r->w * 0.2f, inset_y = r->h * 0.2f;
+        uc_draw_quad(uc, view_id, r->x + inset_x, r->y + inset_y,
+                     r->w - inset_x * 2.0f, r->h - inset_y * 2.0f,
+                     tg->checkmark_sprite, tg->checkmark_color, alpha_mul);
+    }
+}
+
+/* ── ProgressBar draw (PASS 3) ──────────────────────────────────────── */
+
+/* Normalized fill position (0..1) of the progress bar along its main axis. */
+static float uc_progress_norm(const JceUIProgressBarComponent *p)
+{
+    float span = p->max_value - p->min_value;
+    if (span <= 0.0f) return 0.0f;
+    float t = (p->value - p->min_value) / span;
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    return t;
+}
+
+/* Read-only fill bar: bg quad + a fill sub-rect from the "start" edge to the
+ * value position along `direction` (reusing the slider fill-quad math; no
+ * handle, no raycast).  Renderer-gated by the caller. */
+static void uc_draw_progress_bar(JceUICanvas *uc, uint16_t view_id, const UCRect *r,
+                                 const JceUIProgressBarComponent *p, float alpha_mul)
+{
+    float t = uc_progress_norm(p);
+
+    /* Background track. */
+    uc_draw_quad(uc, view_id, r->x, r->y, r->w, r->h, NULL, p->bg_color, alpha_mul);
+
+    /* Fill: a sub-rect from the start edge to the value position. */
+    float fx = r->x, fy = r->y, fw = r->w, fh = r->h;
+    switch (p->direction) {
+        case 1: /* R→L: fill the right portion */
+            fw = r->w * t; fx = r->x + r->w - fw; break;
+        case 2: /* B→T: fill the bottom portion */
+            fh = r->h * t; fy = r->y + r->h - fh; break;
+        case 3: /* T→B: fill the top portion */
+            fh = r->h * t; break;
+        case 0: /* L→R: fill the left portion */
+        default:
+            fw = r->w * t; break;
+    }
+    uc_draw_quad(uc, view_id, fx, fy, fw, fh, p->fill_sprite, p->fill_color, alpha_mul);
+}
+
+/* ── Dropdown geometry + draw (PASS 3) ──────────────────────────────── */
+
+/* Number of valid options, clamped to the fixed POD capacity. */
+static int uc_dd_option_count(const JceUIDropdownComponent *d)
+{
+    int oc = d->option_count;
+    if (oc < 0) oc = 0;
+    if (oc > JCE_UI_DROPDOWN_MAX_OPTIONS) oc = JCE_UI_DROPDOWN_MAX_OPTIONS;
+    return oc;
+}
+
+/* Rect of expanded option row `i` (0-based): one main-rect height tall, stacked
+ * directly below the dropdown's main rect.  Shared by draw + the headless
+ * raycast path so the popup geometry is single-sourced. */
+static UCRect uc_dd_row_rect(const UCRect *main, int i)
+{
+    UCRect r;
+    r.x = main->x;
+    r.w = main->w;
+    r.h = main->h;
+    r.y = main->y + main->h * (float)(i + 1);
+    return r;
+}
+
+/* Draw a single centred-left, vertically-centred text line inside `r`. */
+static void uc_dd_draw_label(JceUICanvas *uc, uint16_t view_id, const UCRect *r,
+                             JceFont *font, const char *str, const float col[4],
+                             float alpha_mul, float ui_scale)
+{
+    if (!font || !str || !str[0]) return;
+    const float pad = 4.0f * ui_scale;
+    float lh = (float)jce_font_line_height(font);
+    float ty = r->y + (r->h - lh) * 0.5f;
+    if (ty < r->y) ty = r->y;
+    jce_text_draw_scaled_view(uc->renderer, font, view_id, r->x + pad, ty, 1.0f,
+                              str, uc_color(col, alpha_mul));
+}
+
+/* Draw the collapsed dropdown (bg + selected label + arrow).  The expanded
+ * popup is drawn separately (uc_draw_dropdown_popup) AFTER the dropdown's own
+ * row so it sits on top in the "drawn last" z-order.  Renderer-gated. */
+static void uc_draw_dropdown(JceUICanvas *uc, uint16_t view_id, const UCRect *r,
+                             const JceUIDropdownComponent *d, float alpha_mul,
+                             float ui_scale)
+{
+    /* Collapsed background. */
+    uc_draw_quad(uc, view_id, r->x, r->y, r->w, r->h, NULL, d->bg_color, alpha_mul);
+
+    int px = (int)((d->font_size > 0.0f ? d->font_size : 16.0f) * ui_scale);
+    if (px < 1) px = 1;
+    JceFont *font = uc_get_font(uc, d->font_path, px);
+
+    /* Selected label. */
+    int oc = uc_dd_option_count(d);
+    int sel = d->selected_index;
+    if (sel < 0) sel = 0;
+    if (oc > 0 && sel < oc)
+        uc_dd_draw_label(uc, view_id, r, font, d->options[sel], d->text_color,
+                         alpha_mul, ui_scale);
+
+    /* Arrow glyph: a small square at the right edge (a real triangle glyph is a
+     * followup; the quad reads as the expand affordance for v1). */
+    float a = r->h * 0.3f;
+    if (a > 0.0f) {
+        float ax = r->x + r->w - a - 4.0f * ui_scale;
+        float ay = r->y + (r->h - a) * 0.5f;
+        uc_draw_quad(uc, view_id, ax, ay, a, a, NULL, d->text_color, alpha_mul);
+    }
+}
+
+/* Draw the expanded option-list popup below the main rect (popup bg per row +
+ * each option's label, highlighting the hovered/selected row).  Drawn AFTER
+ * the dropdown's own row so it overlays sibling UI in the same canvas (a true
+ * global overlay above ALL UI is a followup — inline-last for v1).  Renderer-
+ * gated by the caller. */
+static void uc_draw_dropdown_popup(JceUICanvas *uc, uint16_t view_id, const UCRect *r,
+                                   const JceUIDropdownComponent *d, float alpha_mul,
+                                   float ui_scale, float ptr_x, float ptr_y,
+                                   bool ptr_valid)
+{
+    int oc = uc_dd_option_count(d);
+    if (oc <= 0) return;
+
+    int px = (int)((d->font_size > 0.0f ? d->font_size : 16.0f) * ui_scale);
+    if (px < 1) px = 1;
+    JceFont *font = uc_get_font(uc, d->font_path, px);
+
+    for (int i = 0; i < oc; i++) {
+        UCRect row = uc_dd_row_rect(r, i);
+        /* Row background: highlight the selected row or the row the pointer is
+         * over; otherwise the popup background colour. */
+        bool over = ptr_valid &&
+                    ptr_x >= row.x && ptr_x < row.x + row.w &&
+                    ptr_y >= row.y && ptr_y < row.y + row.h;
+        const float *bg = (over || i == d->selected_index) ? d->highlight_color
+                                                           : d->popup_color;
+        uc_draw_quad(uc, view_id, row.x, row.y, row.w, row.h, NULL, bg, alpha_mul);
+        uc_dd_draw_label(uc, view_id, &row, font, d->options[i], d->text_color,
+                         alpha_mul, ui_scale);
+    }
+}
+
+/* ── InputField content-type filter + caret edit helpers ────────────── */
+
+/* Does codepoint-ish byte `ch` pass the InputField's content_type filter?
+ * Operates byte-wise; multibyte UTF-8 lead/continuation bytes (>= 0x80) are
+ * accepted only by content_type 0 (any) so filtered types stay ASCII-clean. */
+static bool uc_if_accepts(int content_type, char ch, const char *text, int caret)
+{
+    unsigned char u = (unsigned char)ch;
+    switch (content_type) {
+        case 1: /* integer: digits + a single leading '-' */
+            if (ch >= '0' && ch <= '9') return true;
+            if (ch == '-') return caret == 0 && text[0] != '-';
+            return false;
+        case 2: /* decimal: digits + a single leading '-' + a single '.' */
+            if (ch >= '0' && ch <= '9') return true;
+            if (ch == '-') return caret == 0 && text[0] != '-';
+            if (ch == '.') return strchr(text, '.') == NULL;
+            return false;
+        case 3: /* alphanumeric: [A-Za-z0-9] */
+            return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                   (ch >= '0' && ch <= '9');
+        case 0: /* any printable (and any UTF-8 byte) */
+        default:
+            return u >= 0x20 || u >= 0x80;   /* reject ASCII control bytes */
+    }
+}
+
+/* Effective char (byte) cap: char_limit when >0, else the buffer cap. */
+static int uc_if_cap(const JceUIInputFieldComponent *f)
+{
+    int buf_cap = (int)sizeof(f->text) - 1;   /* 255 */
+    if (f->char_limit > 0 && f->char_limit < buf_cap) return f->char_limit;
+    return buf_cap;
+}
+
+/* Draw the InputField: bg quad + (text | placeholder) + caret when focused. */
+static void uc_draw_input_field(JceUICanvas *uc, uint16_t view_id, const UCRect *r,
+                                const JceUIInputFieldComponent *f, float alpha_mul,
+                                float ui_scale, bool focused, float blink)
+{
+    /* Background box. */
+    uc_draw_quad(uc, view_id, r->x, r->y, r->w, r->h, NULL, f->bg_color, alpha_mul);
+
+    int px = (int)((f->font_size > 0.0f ? f->font_size : 16.0f) * ui_scale);
+    if (px < 1) px = 1;
+    JceFont *font = uc_get_font(uc, f->font_path, px);
+
+    bool empty = (f->text[0] == '\0');
+    /* Build the display string: password → '*' run; else the value (or the
+     * placeholder when empty & not focused). */
+    char disp[256];
+    const float *col;
+    if (empty && !focused) {
+        jce_strlcpy(disp, f->placeholder, sizeof disp);
+        col = f->placeholder_color;
+    } else if (f->is_password) {
+        int n = 0;
+        for (const char *p = f->text; *p && n < (int)sizeof(disp) - 1; ++p) disp[n++] = '*';
+        disp[n] = '\0';
+        col = f->text_color;
+    } else {
+        jce_strlcpy(disp, f->text, sizeof disp);
+        col = f->text_color;
+    }
+
+    const float pad = 4.0f * ui_scale;     /* left text inset */
+    float ty = r->y;
+    if (font) {
+        float lh = (float)jce_font_line_height(font);
+        ty = r->y + (r->h - lh) * 0.5f;    /* vertically centre the single line */
+        if (ty < r->y) ty = r->y;
+    }
+    if (font && disp[0])
+        jce_text_draw_scaled_view(uc->renderer, font, view_id, r->x + pad, ty, 1.0f,
+                                  disp, uc_color(col, alpha_mul));
+
+    /* Caret: measure the text up to the byte caret to find its x, blink on/off. */
+    if (focused && blink >= 0.5f) {
+        float cx = r->x + pad;
+        if (font) {
+            char pre[256];
+            int caret = uc->caret;
+            int textlen = (int)strlen(f->text);
+            if (caret > textlen) caret = textlen;
+            if (caret < 0) caret = 0;
+            if (f->is_password) {
+                /* caret advances over '*' glyphs, one per stored byte. */
+                int n = caret < (int)sizeof(pre) - 1 ? caret : (int)sizeof(pre) - 1;
+                for (int i = 0; i < n; ++i) pre[i] = '*';
+                pre[n] = '\0';
+            } else {
+                int n = caret < (int)sizeof(pre) - 1 ? caret : (int)sizeof(pre) - 1;
+                memcpy(pre, f->text, (size_t)n);
+                pre[n] = '\0';
+            }
+            float w = 0.0f, h = 0.0f;
+            jce_text_measure(font, pre, &w, &h);
+            cx += w;
+        }
+        float cw = 1.0f * ui_scale; if (cw < 1.0f) cw = 1.0f;
+        float ch = (font ? (float)jce_font_line_height(font) : r->h * 0.7f);
+        float cy = r->y + (r->h - ch) * 0.5f;
+        if (cy < r->y) cy = r->y;
+        uc_draw_quad(uc, view_id, cx, cy, cw, ch, NULL, f->caret_color, alpha_mul);
+    }
+}
+
+/* ── ScrollView: clamp math + draw (PASS 3) ─────────────────────────── */
+
+/* Maximum scroll offset on each axis for a scroll view whose viewport rect is
+ * `r`: max(0, content_size - viewport_size), but only on enabled axes (a
+ * disabled axis has no scroll range).  Runs headless (pure math). */
+static void uc_scroll_max(const JceUIScrollViewComponent *sv, const UCRect *r,
+                          float *out_max_x, float *out_max_y)
+{
+    float cw = sv->content_size[0], chh = sv->content_size[1];
+    /* content_size 0 ⇒ treat as viewport (no scroll on that axis). */
+    if (cw <= 0.0f) cw = r->w;
+    if (chh <= 0.0f) chh = r->h;
+    float mx = sv->horizontal ? (cw - r->w) : 0.0f;
+    float my = sv->vertical   ? (chh - r->h) : 0.0f;
+    if (mx < 0.0f) mx = 0.0f;
+    if (my < 0.0f) my = 0.0f;
+    *out_max_x = mx;
+    *out_max_y = my;
+}
+
+/* Clamp the live scroll_position in place to [0, scroll_max] on each axis.
+ * Always run (even when wheel does nothing) so an authored/restored offset that
+ * exceeds the current viewport is corrected.  Pure math → headless-safe. */
+static void uc_scroll_clamp(JceUIScrollViewComponent *sv, const UCRect *r)
+{
+    float mx, my;
+    uc_scroll_max(sv, r, &mx, &my);
+    if (sv->scroll_position[0] < 0.0f) sv->scroll_position[0] = 0.0f;
+    if (sv->scroll_position[0] > mx)   sv->scroll_position[0] = mx;
+    if (sv->scroll_position[1] < 0.0f) sv->scroll_position[1] = 0.0f;
+    if (sv->scroll_position[1] > my)   sv->scroll_position[1] = my;
+}
+
+/* Draw the scroll view's viewport background + (optional) scrollbars.  The
+ * scrollbars sit ON TOP of the (already-clipped) content: a track along the
+ * right edge (vertical) / bottom edge (horizontal) plus a proportional thumb.
+ * Renderer-gated by the caller (only invoked when uc->renderer != NULL). */
+static void uc_draw_scroll_view(JceUICanvas *uc, uint16_t view_id, const UCRect *r,
+                                const JceUIScrollViewComponent *sv, float alpha_mul)
+{
+    /* Viewport background. */
+    uc_draw_quad(uc, view_id, r->x, r->y, r->w, r->h, NULL, sv->bg_color, alpha_mul);
+}
+
+/* Draw the scrollbar track + thumb for one scroll view (after its descendants
+ * + scissor reset, so the bars are never clipped).  Renderer-gated by caller. */
+static void uc_draw_scrollbars(JceUICanvas *uc, uint16_t view_id, const UCRect *r,
+                               const JceUIScrollViewComponent *sv, float alpha_mul,
+                               float ui_scale)
+{
+    if (!sv->show_scrollbar) return;
+    float mx, my;
+    uc_scroll_max(sv, r, &mx, &my);
+    float thick = (sv->scrollbar_thickness > 0.0f ? sv->scrollbar_thickness : 8.0f) * ui_scale;
+
+    float cw = sv->content_size[0] > 0.0f ? sv->content_size[0] : r->w;
+    float chh = sv->content_size[1] > 0.0f ? sv->content_size[1] : r->h;
+
+    /* Vertical scrollbar (right edge) when content overflows vertically. */
+    if (sv->vertical && my > 0.0f && chh > 0.0f) {
+        float track_x = r->x + r->w - thick;
+        float track_y = r->y;
+        float track_h = r->h;
+        uc_draw_quad(uc, view_id, track_x, track_y, thick, track_h, NULL,
+                     sv->scrollbar_bg_color, alpha_mul);
+        float thumb_h = track_h * (r->h / chh);
+        if (thumb_h < 8.0f) thumb_h = 8.0f;
+        if (thumb_h > track_h) thumb_h = track_h;
+        float frac = (my > 0.0f) ? (sv->scroll_position[1] / my) : 0.0f;
+        if (frac < 0.0f) frac = 0.0f; if (frac > 1.0f) frac = 1.0f;
+        float thumb_y = track_y + frac * (track_h - thumb_h);
+        uc_draw_quad(uc, view_id, track_x, thumb_y, thick, thumb_h, NULL,
+                     sv->scrollbar_color, alpha_mul);
+    }
+
+    /* Horizontal scrollbar (bottom edge) when content overflows horizontally. */
+    if (sv->horizontal && mx > 0.0f && cw > 0.0f) {
+        float track_x = r->x;
+        float track_y = r->y + r->h - thick;
+        float track_w = r->w;
+        uc_draw_quad(uc, view_id, track_x, track_y, track_w, thick, NULL,
+                     sv->scrollbar_bg_color, alpha_mul);
+        float thumb_w = track_w * (r->w / cw);
+        if (thumb_w < 8.0f) thumb_w = 8.0f;
+        if (thumb_w > track_w) thumb_w = track_w;
+        float frac = (mx > 0.0f) ? (sv->scroll_position[0] / mx) : 0.0f;
+        if (frac < 0.0f) frac = 0.0f; if (frac > 1.0f) frac = 1.0f;
+        float thumb_x = track_x + frac * (track_w - thumb_w);
+        uc_draw_quad(uc, view_id, thumb_x, track_y, thumb_w, thick, NULL,
+                     sv->scrollbar_color, alpha_mul);
+    }
+}
+
 /* ── LayoutGroup arrangement ───────────────────────────────────────── */
 
 /* Apply a LayoutGroup on `parent` to its UI children, overriding the
@@ -778,15 +1290,89 @@ static void uc_layout_draw(UCFrame *fr, JceEntity node, const UCRect *node_rect,
      * also covers a Canvas entity that itself carries a UIImage (full-screen
      * background) — its node_rect is the whole canvas. */
     {
+        /* Per-component disable: nullify any disabled UI component at fetch so
+         * it is skipped for DRAW *and* excluded from the raycast hit list below
+         * (which is what uc_update_buttons / uc_update_widgets iterate) — one
+         * gate covers visuals + interaction.  Flag widgets use the flag shim;
+         * presence-gated ones resolve a cached comp_id. */
         JceUIImageComponent *im = jce_scene_get_ui_image(s, node);
-        if (im) uc_draw_image(uc, fr->view_id, node_rect, im, alpha, fr->ui_scale);
+        if (im && !jce_scene_component_enabled(s, node, JCE_COMP_FLAG_UI_IMAGE)) im = NULL;
+        if (im && uc->renderer)
+            uc_draw_image(uc, fr->view_id, node_rect, im, alpha, fr->ui_scale);
+
+        /* Slider / Toggle: draw their own quads (PASS 3).  Each is a
+         * graphic in its own right and embeds its own RectTransform, so it
+         * is laid out + drawn here next to UIImage. */
+        JceUISliderComponent *sl = jce_scene_get_ui_slider(s, node);
+        { static int cid = -2; if (cid == -2) cid = jce_component_find("UISlider");
+          if (sl && cid >= 0 && !jce_scene_comp_enabled(s, node, cid)) sl = NULL; }
+        if (sl && uc->renderer)
+            uc_draw_slider(uc, fr->view_id, node_rect, sl, alpha, fr->ui_scale);
+        JceUIToggleComponent *tg = jce_scene_get_ui_toggle(s, node);
+        { static int cid = -2; if (cid == -2) cid = jce_component_find("UIToggle");
+          if (tg && cid >= 0 && !jce_scene_comp_enabled(s, node, cid)) tg = NULL; }
+        if (tg && uc->renderer)
+            uc_draw_toggle(uc, fr->view_id, node_rect, tg, alpha);
+
+        /* InputField: bg + (text|placeholder) + caret.  Each embeds its own
+         * RectTransform so it is laid out + drawn here next to UIImage. */
+        JceUIInputFieldComponent *inf = jce_scene_get_ui_input_field(s, node);
+        { static int cid = -2; if (cid == -2) cid = jce_component_find("UIInputField");
+          if (inf && cid >= 0 && !jce_scene_comp_enabled(s, node, cid)) inf = NULL; }
+        if (inf && uc->renderer)
+            uc_draw_input_field(uc, fr->view_id, node_rect, inf, alpha,
+                                fr->ui_scale, uc->focused_input == (uint64_t)node,
+                                uc->caret_blink);
+
+        /* ScrollView: a CONTAINER.  Clamp its live offset to the current
+         * viewport (headless-safe), draw its viewport background here; its
+         * descendants are offset + clipped in the children block below, and the
+         * scrollbars are drawn there after the scissor reset.  The clamp runs
+         * even on a headless canvas so a restored offset that exceeds the
+         * viewport is corrected and so jce_ui_canvas_scroll sees a valid base. */
+        JceUIScrollViewComponent *sv = jce_scene_get_ui_scroll_view(s, node);
+        { static int cid = -2; if (cid == -2) cid = jce_component_find("UIScrollView");
+          if (sv && cid >= 0 && !jce_scene_comp_enabled(s, node, cid)) sv = NULL; }
+        if (sv) {
+            uc_scroll_clamp(sv, node_rect);
+            if (uc->renderer)
+                uc_draw_scroll_view(uc, fr->view_id, node_rect, sv, alpha);
+        }
+
+        /* ProgressBar: read-only fill bar.  Drawn here next to UIImage; NOT a
+         * raycast target (purely visual — gameplay drives `value`). */
+        JceUIProgressBarComponent *pb = jce_scene_get_ui_progress_bar(s, node);
+        { static int cid = -2; if (cid == -2) cid = jce_component_find("UIProgressBar");
+          if (pb && cid >= 0 && !jce_scene_comp_enabled(s, node, cid)) pb = NULL; }
+        if (pb && uc->renderer)
+            uc_draw_progress_bar(uc, fr->view_id, node_rect, pb, alpha);
+
+        /* Dropdown: collapsed row here; the expanded popup is drawn AFTER it
+         * (still this node, before children) so it overlays sibling UI in the
+         * "drawn last → on top" z-order.  Each embeds its own RectTransform. */
+        JceUIDropdownComponent *dd = jce_scene_get_ui_dropdown(s, node);
+        { static int cid = -2; if (cid == -2) cid = jce_component_find("UIDropdown");
+          if (dd && cid >= 0 && !jce_scene_comp_enabled(s, node, cid)) dd = NULL; }
+        if (dd && uc->renderer) {
+            uc_draw_dropdown(uc, fr->view_id, node_rect, dd, alpha, fr->ui_scale);
+            if (dd->expanded)
+                uc_draw_dropdown_popup(uc, fr->view_id, node_rect, dd, alpha,
+                                       fr->ui_scale, fr->ptr_x, fr->ptr_y,
+                                       fr->ptr_valid);
+        }
 
         /* Record raycast hit for interactive elements — but only while the
          * inherited CanvasGroup chain blocks raycasts (else the pointer passes
          * through).  The inherited `interactable` rides along so a button under
-         * a non-interactable group is driven to its disabled state. */
+         * a non-interactable group is driven to its disabled state.  Sliders,
+         * toggles, input fields, scroll views and dropdowns are raycast-
+         * interactive by nature (no raycast_target opt-in) so they join the
+         * same top-most hit list.  ProgressBar is purely visual (not recorded). */
         JceUIButtonComponent *bt = jce_scene_get_ui_button(s, node);
-        bool ray = (im && im->raycast_target) || (bt != NULL);
+        if (bt && !jce_scene_component_enabled(s, node, JCE_COMP_FLAG_UI_BUTTON)) bt = NULL;
+        bool ray = (im && im->raycast_target) || (bt != NULL) ||
+                   (sl != NULL) || (tg != NULL) || (inf != NULL) || (sv != NULL) ||
+                   (dd != NULL);
         if (ray && blocks && fr->hit_count < UC_MAX_BUTTONS) {
             fr->hits[fr->hit_count].entity       = node;
             fr->hits[fr->hit_count].rect         = *node_rect;
@@ -796,7 +1382,9 @@ static void uc_layout_draw(UCFrame *fr, JceEntity node, const UCRect *node_rect,
         }
 
         JceUITextComponent *tx = jce_scene_get_ui_text(s, node);
-        if (tx) uc_draw_text(uc, fr->view_id, node_rect, tx, alpha, fr->ui_scale);
+        if (tx && !jce_scene_component_enabled(s, node, JCE_COMP_FLAG_UI_TEXT)) tx = NULL;
+        if (tx && uc->renderer)
+            uc_draw_text(uc, fr->view_id, node_rect, tx, alpha, fr->ui_scale);
     }
 
     /* Children. */
@@ -823,11 +1411,56 @@ static void uc_layout_draw(UCFrame *fr, JceEntity node, const UCRect *node_rect,
 
     /* LayoutGroup on this node overrides child positions. */
     JceLayoutGroupComponent *lg = jce_scene_get_layout_group(s, node);
+    if (lg && !jce_scene_component_enabled(s, node, JCE_COMP_FLAG_LAYOUT_GROUP)) lg = NULL;
     if (lg && ui_n > 0)
         uc_apply_layout_group(s, node_rect, lg, ui_kids, ui_n, kid_rects, fr->ui_scale);
 
+    /* ScrollView container: OFFSET every descendant by -scroll_position (so the
+     * content scrolls under a fixed viewport) and CLIP them to the viewport.
+     * The offset is applied AFTER any LayoutGroup packing (the list is packed in
+     * viewport space, then the whole packed block scrolls).  The clip uses a
+     * view-level bgfx scissor (applies to every primitive submitted to this view
+     * regardless of the per-draw BGFX_DISCARD_ALL) which is RESET after the
+     * subtree so it never clips later unrelated UI draws.  All offset math runs
+     * headless; only the scissor + scrollbar draws are renderer-gated. */
+    JceUIScrollViewComponent *sv2 = jce_scene_get_ui_scroll_view(s, node);
+    bool clipped = false;
+    if (sv2) {
+        float ox = sv2->scroll_position[0];
+        float oy = sv2->scroll_position[1];
+        if (ox != 0.0f || oy != 0.0f) {
+            for (int i = 0; i < ui_n; i++) {
+                kid_rects[i].x -= ox;
+                kid_rects[i].y -= oy;
+            }
+        }
+        if (uc->renderer) {
+            /* Clamp the scissor box to the framebuffer (>=0) before casting to
+             * the unsigned bgfx coordinate type. */
+            float cx = node_rect->x, cy = node_rect->y;
+            float cw = node_rect->w, chh = node_rect->h;
+            if (cx < 0.0f) { cw += cx; cx = 0.0f; }
+            if (cy < 0.0f) { chh += cy; cy = 0.0f; }
+            if (cw < 0.0f) cw = 0.0f;
+            if (chh < 0.0f) chh = 0.0f;
+            bgfx_set_view_scissor(fr->view_id, (uint16_t)cx, (uint16_t)cy,
+                                  (uint16_t)cw, (uint16_t)chh);
+            clipped = true;
+        }
+    }
+
     for (int i = 0; i < ui_n; i++)
         uc_layout_draw(fr, ui_kids[i], &kid_rects[i], alpha, blocks, inter, depth + 1);
+
+    if (sv2) {
+        if (clipped) {
+            /* Reset the view scissor to the full view (0,0,0,0 ⇒ no scissor) so
+             * subsequent unrelated UI draws are NOT clipped, then draw the
+             * scrollbars on top of the (now clipped) content. */
+            bgfx_set_view_scissor(fr->view_id, 0, 0, 0, 0);
+            uc_draw_scrollbars(uc, fr->view_id, node_rect, sv2, alpha, fr->ui_scale);
+        }
+    }
 }
 
 /* ── Button raycast + state machine ────────────────────────────────── */
@@ -856,10 +1489,18 @@ static void uc_update_buttons(UCFrame *fr, const JceUIPointer *ptr, float dt)
         }
     }
 
-    /* Reap stale button states (entities no longer present). */
+    /* Reap stale widget states (entities that are no longer any interactive
+     * widget).  The shared state cache is keyed by entity and used by buttons,
+     * sliders AND toggles (uc_update_widgets runs next), so only reap a slot
+     * once its entity carries none of them. */
     for (int i = 0; i < UC_MAX_BUTTONS; i++) {
-        if (uc->buttons[i].entity &&
-            !jce_scene_has_ui_button(s, (JceEntity)uc->buttons[i].entity))
+        uint64_t e = uc->buttons[i].entity;
+        if (e &&
+            !jce_scene_has_ui_button(s, (JceEntity)e) &&
+            !jce_scene_has_ui_slider(s, (JceEntity)e) &&
+            !jce_scene_has_ui_toggle(s, (JceEntity)e) &&
+            !jce_scene_has_ui_input_field(s, (JceEntity)e) &&
+            !jce_scene_has_ui_dropdown(s, (JceEntity)e))
             uc->buttons[i].entity = 0;
     }
 
@@ -907,8 +1548,9 @@ static void uc_update_buttons(UCFrame *fr, const JceUIPointer *ptr, float dt)
         /* Overdraw the button's UIImage rect with the current state colour.
          * The base image was already drawn this frame with its authored
          * colour; blending authored→state by `fade` makes the transition
-         * visible (Unity ColorTint transition). */
-        JceUIImageComponent *im = jce_scene_get_ui_image(s, e);
+         * visible (Unity ColorTint transition).  Skipped on a headless canvas
+         * — the click state machine above still ran. */
+        JceUIImageComponent *im = uc->renderer ? jce_scene_get_ui_image(s, e) : NULL;
         if (im) {
             const float *col = bt->normal_color;
             if (st->state == 1) col = bt->highlighted_color;
@@ -928,6 +1570,252 @@ static void uc_update_buttons(UCFrame *fr, const JceUIPointer *ptr, float dt)
                                           fr->hits[i].rect.x, fr->hits[i].rect.y,
                                           fr->hits[i].rect.w, fr->hits[i].rect.h,
                                           tint);
+        }
+    }
+}
+
+/* ── Slider / Toggle interaction state machine ──────────────────────── */
+
+/* Drives UISlider drag and UIToggle click, mirroring uc_update_buttons:
+ *   - top-most hit under the pointer is the hovered widget;
+ *   - a TOGGLE flips its is_on on a press-inside → release-over (same latch
+ *     the button uses), recorded in the shared press_inside flag;
+ *   - a SLIDER tracks a drag_active latch: a press that begins over it (or a
+ *     hold that is over it) sets drag_active and maps the pointer to a value,
+ *     writing it back into the scene component (Unity source-of-truth model);
+ *     releasing the pointer clears drag_active.
+ * The value/state mutation runs on a HEADLESS canvas too (renderer NULL) — only
+ * the draw calls above are gated on uc->renderer, exactly like buttons. */
+static void uc_update_widgets(UCFrame *fr, const JceUIPointer *ptr, float dt)
+{
+    (void)dt;
+    JceUICanvas *uc = fr->uc;
+    JceScene *s = fr->scene;
+
+    /* Top-most hit = last recorded (drawn last → on top). */
+    JceEntity hovered = 0;
+    if (ptr && ptr->valid) {
+        for (int i = fr->hit_count - 1; i >= 0; i--) {
+            if (fr->hits[i].alpha <= 0.001f) continue;
+            if (uc_point_in(&fr->hits[i].rect, ptr->x, ptr->y)) {
+                hovered = fr->hits[i].entity;
+                break;
+            }
+        }
+    }
+
+    /* Hovered ScrollView for the wheel channel: the TOP-MOST scroll view whose
+     * viewport contains the pointer.  This is resolved SEPARATELY from `hovered`
+     * (which is the absolute top-most interactive widget) because a child widget
+     * inside the list — e.g. a button — is drawn on top of the scroll view, yet
+     * the wheel should still scroll the enclosing view.  Stored with its
+     * resolved viewport rect so jce_ui_canvas_scroll can clamp without a
+     * re-layout. */
+    uc->hovered_scroll = 0;
+    if (ptr && ptr->valid) {
+        for (int i = fr->hit_count - 1; i >= 0; i--) {
+            if (fr->hits[i].alpha <= 0.001f) continue;
+            if (!jce_scene_has_ui_scroll_view(s, fr->hits[i].entity)) continue;
+            if (uc_point_in(&fr->hits[i].rect, ptr->x, ptr->y)) {
+                uc->hovered_scroll      = (uint64_t)fr->hits[i].entity;
+                uc->hovered_scroll_rect = fr->hits[i].rect;
+                break;
+            }
+        }
+    }
+
+    /* Reap stale states (entities that are no longer slider/toggle/button/
+     * input-field/dropdown). */
+    for (int i = 0; i < UC_MAX_BUTTONS; i++) {
+        uint64_t e = uc->buttons[i].entity;
+        if (e &&
+            !jce_scene_has_ui_button(s, (JceEntity)e) &&
+            !jce_scene_has_ui_slider(s, (JceEntity)e) &&
+            !jce_scene_has_ui_toggle(s, (JceEntity)e) &&
+            !jce_scene_has_ui_input_field(s, (JceEntity)e) &&
+            !jce_scene_has_ui_dropdown(s, (JceEntity)e))
+            uc->buttons[i].entity = 0;
+    }
+
+    /* ── InputField focus management ──────────────────────────────────
+     * A pointer press that begins this frame: if it lands on an interactable
+     * InputField (the top-most hit), focus it on release-over (press-inside →
+     * release-over latch, mirroring the button click).  A press that lands on
+     * NO input field clears focus (clicking empty space / another widget).
+     * Runs headless (renderer NULL) — only the draws above are gated. */
+    if (uc->focused_input &&
+        !jce_scene_has_ui_input_field(s, (JceEntity)uc->focused_input)) {
+        uc->focused_input = 0;   /* focused field was deleted */
+        uc->caret = 0;
+    }
+    if (ptr && ptr->valid) {
+        bool press_began = ptr->down;
+        /* Track press/release on the focus latch via the shared state of the
+         * hovered input field (reuse press_inside).  We detect a click on a
+         * field, or a click that hit no field at all. */
+        bool hovered_is_field = hovered &&
+            jce_scene_has_ui_input_field(s, (JceEntity)hovered);
+        if (!press_began) {
+            /* Release frame: resolve any pending focus press. */
+            for (int i = 0; i < fr->hit_count; i++) {
+                JceEntity e = fr->hits[i].entity;
+                if (!jce_scene_has_ui_input_field(s, e)) continue;
+                UCButtonState *st = uc_button_state(uc, (uint64_t)e);
+                if (!st) continue;
+                JceUIInputFieldComponent *inf = jce_scene_get_ui_input_field(s, e);
+                if (st->press_inside) {
+                    if (hovered == e && inf && inf->interactable &&
+                        fr->hits[i].interactable) {
+                        if (uc->focused_input != (uint64_t)e) {
+                            uc->focused_input = (uint64_t)e;
+                            uc->caret = (int)strlen(inf->text); /* caret to end */
+                            uc->caret_blink = 1.0f;             /* show caret */
+                        }
+                    }
+                    st->press_inside = false;
+                }
+            }
+        } else {
+            /* Press frame: latch press_inside on the hovered field; if the
+             * press hit no field, clear focus immediately. */
+            if (hovered_is_field) {
+                UCButtonState *st = uc_button_state(uc, (uint64_t)hovered);
+                if (st) st->press_inside = true;
+            } else {
+                uc->focused_input = 0;
+                uc->caret = 0;
+            }
+        }
+    }
+
+    /* ── Dropdown expand / select / outside-collapse ──────────────────
+     * A press over the collapsed main rect toggles `expanded` on release-over
+     * (press-inside → release-over latch).  While expanded, the option rows
+     * (drawn below the main rect, not raycast-recorded) are ALSO click targets:
+     * a click on row i sets selected_index=i and collapses; a click OUTSIDE the
+     * main rect AND all popup rows collapses without changing selection
+     * (mirroring the InputField defocus-on-outside-click pattern).  All
+     * writeback goes through the MUTABLE jce_scene_get_ui_dropdown pointer
+     * (Unity source-of-truth model) and runs fully headless. */
+    if (ptr && ptr->valid) {
+        for (int i = 0; i < fr->hit_count; i++) {
+            JceEntity e = fr->hits[i].entity;
+            JceUIDropdownComponent *dd = jce_scene_get_ui_dropdown(s, e);
+            if (!dd) continue;
+            UCButtonState *st = uc_button_state(uc, (uint64_t)e);
+            if (!st) continue;
+
+            const UCRect *mr = &fr->hits[i].rect;
+            bool inter = dd->interactable && fr->hits[i].interactable;
+            int  oc = uc_dd_option_count(dd);
+
+            /* Resolve which click target the pointer is over this frame:
+             *   -2 = collapsed main rect, >=0 = an (expanded) option row,
+             *   -1 = neither (outside). */
+            int target = -1;
+            if (uc_point_in(mr, ptr->x, ptr->y)) {
+                target = -2;
+            } else if (dd->expanded) {
+                for (int r = 0; r < oc; r++) {
+                    UCRect row = uc_dd_row_rect(mr, r);
+                    if (uc_point_in(&row, ptr->x, ptr->y)) { target = r; break; }
+                }
+            }
+
+            if (!inter) {
+                /* Non-interactable: never expands; an already-open popup still
+                 * collapses on an outside press so it can't get stuck open. */
+                st->dd_press = -1;
+                if (ptr->down && dd->expanded && target == -1)
+                    dd->expanded = false;
+                continue;
+            }
+
+            if (ptr->down) {
+                /* Press frame: latch the target; an outside press collapses an
+                 * open popup immediately (click-away). */
+                if (st->dd_press == -1) {  /* only latch on the press edge */
+                    st->dd_press = target;
+                    if (target == -1 && dd->expanded)
+                        dd->expanded = false;
+                }
+            } else {
+                /* Release frame: commit only if release-over the SAME target. */
+                int pressed = st->dd_press;
+                st->dd_press = -1;
+                if (pressed == -2 && target == -2) {
+                    dd->expanded = !dd->expanded;       /* toggle the popup */
+                } else if (pressed >= 0 && pressed == target && pressed < oc) {
+                    if (dd->selected_index != pressed)
+                        uc->last_value_changed = (uint64_t)e;  /* on_value_changed */
+                    dd->selected_index = pressed;       /* pick the option */
+                    dd->expanded = false;               /* and collapse */
+                }
+            }
+        }
+    } else {
+        /* Pointer gone (cursor left the viewport): drop any in-flight dropdown
+         * press so it cannot resume as a stale click next frame. */
+        for (int i = 0; i < fr->hit_count; i++) {
+            JceUIDropdownComponent *dd = jce_scene_get_ui_dropdown(s, fr->hits[i].entity);
+            if (!dd) continue;
+            UCButtonState *st = uc_button_state(uc, (uint64_t)fr->hits[i].entity);
+            if (st) st->dd_press = -1;
+        }
+    }
+
+    for (int i = 0; i < fr->hit_count; i++) {
+        JceEntity e = fr->hits[i].entity;
+        bool over = (hovered == e);
+
+        /* ── Toggle ──────────────────────────────────────────────── */
+        JceUIToggleComponent *tg = jce_scene_get_ui_toggle(s, e);
+        if (tg) {
+            UCButtonState *st = uc_button_state(uc, (uint64_t)e);
+            if (!st) continue;
+            if (!ptr || !ptr->valid) st->press_inside = false;
+            if (!tg->interactable || !fr->hits[i].interactable) {
+                st->press_inside = false;
+            } else {
+                if (ptr && ptr->down && over && !st->press_inside)
+                    st->press_inside = true;
+                if (st->press_inside && ptr && !ptr->down) {
+                    if (over) {
+                        tg->is_on = !tg->is_on;         /* click flips */
+                        uc->last_value_changed = (uint64_t)e;  /* on_value_changed */
+                    }
+                    st->press_inside = false;
+                }
+            }
+            continue;
+        }
+
+        /* ── Slider ──────────────────────────────────────────────── */
+        JceUISliderComponent *sl = jce_scene_get_ui_slider(s, e);
+        if (sl) {
+            UCButtonState *st = uc_button_state(uc, (uint64_t)e);
+            if (!st) continue;
+            if (!ptr || !ptr->valid || !ptr->down) {
+                st->drag_active = false; /* release ends the drag */
+                continue;
+            }
+            if (!sl->interactable || !fr->hits[i].interactable) {
+                st->drag_active = false;
+                continue;
+            }
+            /* Begin a drag when the press is over this slider; keep tracking
+             * once active even if the pointer slips slightly off the rect. */
+            if (over) st->drag_active = true;
+            if (st->drag_active) {
+                float t = uc_slider_pointer_t(sl, &fr->hits[i].rect, ptr->x, ptr->y);
+                float v = sl->min_value + (sl->max_value - sl->min_value) * t;
+                if (sl->whole_numbers) v = floorf(v + 0.5f);
+                if (v != sl->value) {
+                    sl->value = v;
+                    uc->last_value_changed = (uint64_t)e;  /* on_value_changed */
+                }
+            }
+            continue;
         }
     }
 }
@@ -966,7 +1854,9 @@ static void uc_sort_canvases(JceScene *s, UCCanvasList *cl)
 
 JceUICanvas *jce_ui_canvas_create(JceRenderer *renderer, const JcePakArchive *pak)
 {
-    if (!renderer) return NULL;
+    /* renderer may be NULL: a headless canvas runs the full layout + raycast +
+     * UIButton click state machine but skips every GPU draw, so gameplay/tests
+     * can drive click dispatch without a live bgfx context. */
     JceUICanvas *uc = (JceUICanvas *)JCE_CALLOC(1, sizeof(*uc));
     if (!uc) return NULL;
     uc->renderer = renderer;
@@ -992,11 +1882,16 @@ void jce_ui_canvas_render(JceUICanvas *uc, JceScene *scene, uint16_t view_id,
     if (!uc || !scene || screen_w <= 0 || screen_h <= 0) return;
     JCE_PROFILE_ZONE_N("UICanvas::Render");
 
+    /* Remember the scene so the (canvas-only) text/key delivery functions can
+     * resolve the focused field's component this frame. */
+    uc->edit_scene = scene;
+
     /* Configure the UI view: bind framebuffer (panel FBO or backbuffer),
      * set the rect, and a top-left-origin orthographic projection in logical
      * pixels — matching JCE_VIEW_UI so UI coords are screen pixels.  The view
-     * does NOT clear (it overlays the rendered scene). */
-    {
+     * does NOT clear (it overlays the rendered scene).  Skipped on a headless
+     * canvas (no renderer ⇒ no bgfx context to touch). */
+    if (uc->renderer) {
         const bgfx_caps_t *caps = bgfx_get_caps();
         bgfx_frame_buffer_handle_t fb = { fb_idx };
         bgfx_set_view_frame_buffer(view_id, fb);
@@ -1018,12 +1913,29 @@ void jce_ui_canvas_render(JceUICanvas *uc, JceScene *scene, uint16_t view_id,
     UCFrame fr;
     fr.uc = uc; fr.scene = scene; fr.view_id = view_id;
     fr.hit_count = 0;
+    fr.ptr_x = pointer ? pointer->x : 0.0f;
+    fr.ptr_y = pointer ? pointer->y : 0.0f;
+    fr.ptr_valid = pointer && pointer->valid;
     uc->last_clicked = 0;
+    uc->last_value_changed = 0;
+    /* NOTE: last_submitted / last_text_changed are set OUTSIDE render (in
+     * key_edit / text_input) and are cleared on read, so they are NOT reset
+     * here — doing so would wipe a submit/edit delivered before this render. */
+
+    /* Caret blink: ~1.6 Hz square wave driven by dt (only meaningful when a
+     * field is focused; harmless otherwise).  Phase >= 0.5 ⇒ caret visible. */
+    {
+        float dt = dt_sec > 0 ? dt_sec : 0.0f;
+        uc->caret_blink += dt * 1.6f;
+        if (uc->caret_blink >= 1.0f) uc->caret_blink -= floorf(uc->caret_blink);
+    }
 
     for (int i = 0; i < canvases.count; i++) {
         JceEntity canvas = canvases.list[i];
         JceCanvasComponent *cv = jce_scene_get_canvas(scene, canvas);
         if (!cv) continue;
+        /* Disabled Canvas: skip layout/draw + its whole subtree. */
+        if (!jce_scene_component_enabled(scene, canvas, JCE_COMP_FLAG_CANVAS)) continue;
         /* Screen-Space Overlay is the supported render mode.  World/Camera
          * canvases are laid out as overlays for now (documented partial).
          * CanvasScaler ("scale with screen size"): RectTransform anchors give
@@ -1043,6 +1955,7 @@ void jce_ui_canvas_render(JceUICanvas *uc, JceScene *scene, uint16_t view_id,
     }
 
     uc_update_buttons(&fr, pointer, dt_sec > 0 ? dt_sec : 0.0f);
+    uc_update_widgets(&fr, pointer, dt_sec > 0 ? dt_sec : 0.0f);
 
     JCE_PROFILE_ZONE_END;
 }
@@ -1050,4 +1963,163 @@ void jce_ui_canvas_render(JceUICanvas *uc, JceScene *scene, uint16_t view_id,
 uint64_t jce_ui_canvas_last_clicked(const JceUICanvas *uc)
 {
     return uc ? uc->last_clicked : 0;
+}
+
+uint64_t jce_ui_canvas_last_value_changed(const JceUICanvas *uc)
+{
+    return uc ? uc->last_value_changed : 0;
+}
+
+uint64_t jce_ui_canvas_last_text_changed(JceUICanvas *uc)
+{
+    if (!uc) return 0;
+    uint64_t e = uc->last_text_changed;   /* cleared on read (set outside render) */
+    uc->last_text_changed = 0;
+    return e;
+}
+
+/* ── InputField focus + edit channel ────────────────────────────────────
+ *
+ * The two delivery functions take only the canvas (mirroring the
+ * fire-and-forget last_clicked/last_submitted API), so the canvas must know
+ * WHICH scene holds the focused field.  jce_ui_canvas_render() stashes the
+ * scene it last rendered in `uc->edit_scene`; that is the scene the focus was
+ * established against, and the same one the caller feeds events for in the same
+ * frame.  This is the single write-back point into the scene component (Unity
+ * source-of-truth model, exactly like slider/toggle). */
+
+void jce_ui_canvas_text_input(JceUICanvas *uc, const char *utf8)
+{
+    if (!uc || !uc->focused_input || !utf8 || !utf8[0] || !uc->edit_scene) return;
+    JceUIInputFieldComponent *f =
+        jce_scene_get_ui_input_field(uc->edit_scene, (JceEntity)uc->focused_input);
+    if (!f) { uc->focused_input = 0; return; }
+    /* Focused field disabled mid-edit -> ignore input (focus persists across frames). */
+    { static int cid = -2; if (cid == -2) cid = jce_component_find("UIInputField");
+      if (cid >= 0 && !jce_scene_comp_enabled(uc->edit_scene, (JceEntity)uc->focused_input, cid)) return; }
+    if (f->read_only) return;
+
+    int cap = uc_if_cap(f);
+    int len = (int)strlen(f->text);
+    int caret = uc->caret;
+    if (caret < 0) caret = 0;
+    if (caret > len) caret = len;
+
+    for (const char *p = utf8; *p; ++p) {
+        if (*p == '\n' || *p == '\r' || *p == '\t') continue; /* single-line */
+        if (!uc_if_accepts(f->content_type, *p, f->text, caret)) continue;
+        if (len >= cap) break;                       /* char_limit / buffer cap */
+        /* Insert one byte at the caret: shift the tail right by 1. */
+        memmove(f->text + caret + 1, f->text + caret, (size_t)(len - caret + 1));
+        f->text[caret] = *p;
+        ++caret; ++len;
+        uc->last_text_changed = uc->focused_input;     /* on_value_changed */
+    }
+    f->text[len] = '\0';
+    uc->caret = caret;
+    uc->caret_blink = 1.0f;                            /* re-show caret on edit */
+}
+
+void jce_ui_canvas_key_edit(JceUICanvas *uc, int scancode, uint16_t mod)
+{
+    (void)mod;
+    if (!uc || !uc->focused_input || !uc->edit_scene) return;
+    JceUIInputFieldComponent *f =
+        jce_scene_get_ui_input_field(uc->edit_scene, (JceEntity)uc->focused_input);
+    if (!f) { uc->focused_input = 0; return; }
+    /* Focused field disabled mid-edit -> ignore key (focus persists across frames). */
+    { static int cid = -2; if (cid == -2) cid = jce_component_find("UIInputField");
+      if (cid >= 0 && !jce_scene_comp_enabled(uc->edit_scene, (JceEntity)uc->focused_input, cid)) return; }
+
+    int len = (int)strlen(f->text);
+    int caret = uc->caret;
+    if (caret < 0) caret = 0;
+    if (caret > len) caret = len;
+
+    switch (scancode) {
+        case JCE_KEY_BACKSPACE:
+            if (!f->read_only && caret > 0) {
+                memmove(f->text + caret - 1, f->text + caret, (size_t)(len - caret + 1));
+                --caret;
+                uc->last_text_changed = uc->focused_input;  /* on_value_changed */
+            }
+            break;
+        case JCE_KEY_DELETE:
+            if (!f->read_only && caret < len) {
+                memmove(f->text + caret, f->text + caret + 1, (size_t)(len - caret));
+                uc->last_text_changed = uc->focused_input;  /* on_value_changed */
+            }
+            break;
+        case JCE_KEY_LEFT:
+            if (caret > 0) --caret;
+            break;
+        case JCE_KEY_RIGHT:
+            if (caret < len) ++caret;
+            break;
+        case JCE_KEY_HOME:
+            caret = 0;
+            break;
+        case JCE_KEY_END:
+            caret = len;
+            break;
+        case JCE_KEY_RETURN:
+        case JCE_KEY_KP_ENTER:
+            uc->last_submitted = uc->focused_input;   /* commit; keep focus */
+            break;
+        case JCE_KEY_ESCAPE:
+            uc->focused_input = 0;                     /* defocus */
+            caret = 0;
+            break;
+        default:
+            break;
+    }
+    uc->caret = caret;
+    uc->caret_blink = 1.0f;
+}
+
+uint64_t jce_ui_canvas_focused_input(const JceUICanvas *uc)
+{
+    return uc ? uc->focused_input : 0;
+}
+
+uint64_t jce_ui_canvas_last_submitted(JceUICanvas *uc)
+{
+    if (!uc) return 0;
+    uint64_t e = uc->last_submitted;      /* cleared on read (set outside render) */
+    uc->last_submitted = 0;
+    return e;
+}
+
+/* ── ScrollView wheel channel ────────────────────────────────────────────
+ *
+ * Applies a wheel delta to the scroll view under the pointer (tracked during
+ * the most recent render's raycast pass, see uc_update_widgets).  Convention:
+ * `dy` is +up (the JCE_EVENT_MOUSE_WHEEL sign); content scrolls UP when the
+ * wheel rolls up, i.e. the offset DECREASES, so we apply -dy.  `dx` is +right;
+ * scrolling right reveals content further right, increasing the offset, so we
+ * apply +dx.  Per-axis enables + interactable are honoured, then each axis is
+ * clamped to [0, max(0, content - viewport)] and the result written back into
+ * the component's scroll_position (the single write-back, Unity source-of-truth
+ * model, exactly like slider/toggle/input-field).  Runs fully headless — the
+ * hovered scroll view + its viewport rect are cached from the last render. */
+void jce_ui_canvas_scroll(JceUICanvas *uc, float dx, float dy)
+{
+    if (!uc || !uc->hovered_scroll || !uc->edit_scene) return;
+    /* Hovered scroll view disabled -> ignore wheel (hover persists from last render). */
+    { static int cid = -2; if (cid == -2) cid = jce_component_find("UIScrollView");
+      if (cid >= 0 && !jce_scene_comp_enabled(uc->edit_scene, (JceEntity)uc->hovered_scroll, cid)) return; }
+    if (dx == 0.0f && dy == 0.0f) return;
+
+    JceUIScrollViewComponent *sv =
+        jce_scene_get_ui_scroll_view(uc->edit_scene, (JceEntity)uc->hovered_scroll);
+    if (!sv) { uc->hovered_scroll = 0; return; }
+    if (!sv->interactable) return;
+
+    float sens = (sv->scroll_sensitivity > 0.0f) ? sv->scroll_sensitivity : 30.0f;
+
+    /* Wheel up (dy>0) scrolls content up ⇒ offset decreases. */
+    if (sv->vertical)   sv->scroll_position[1] -= dy * sens;
+    if (sv->horizontal) sv->scroll_position[0] += dx * sens;
+
+    uc_scroll_clamp(sv, &uc->hovered_scroll_rect);
 }

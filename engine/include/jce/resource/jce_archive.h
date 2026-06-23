@@ -171,6 +171,14 @@ JCE_API int jce_archive_map_entry(const JceArchive *ar, const JceArchiveEntry *e
  * header.  Returns 1 if both match, 0 otherwise. */
 JCE_API int jce_archive_verify_header(const JceArchive *ar);
 
+/* Opt-in integrity gate: when enabled, jce_archive_open[_file]() runs
+ * jce_archive_verify_header() after parsing and returns NULL for any archive
+ * whose data/index content hashes do not match.  Default OFF — the whole-blob
+ * hash has a real cost on the low-end baseline and not every consumer needs
+ * open-time tamper/corruption detection.  Not synchronized: set during
+ * single-threaded startup, mirroring jce_archive_set_process_key(). */
+JCE_API void jce_archive_set_verify_on_open(int enable);
+
 /* Verify decompressed `buf` (size bytes) against entry->content_crc (XXH32).
  * Returns 1 on match (or when no CRC was recorded), 0 on mismatch. */
 JCE_API int jce_archive_verify_entry(const JceArchiveEntry *entry,

@@ -63,6 +63,9 @@ typedef struct JceAsyncRequest {
     /* --- Input (read-only after submission) --- */
     JceAsyncRequestType type;
     uint16_t            slot_index;    /* target slot in asset manager */
+    uint16_t            generation;    /* slot generation captured at submit;
+                                        * finalize is skipped if the slot was
+                                        * released + reacquired (gen changed) */
     char                path[256];     /* virtual asset path */
     JcePakArchive         *pak;
     JceFileSystem      *fs;
@@ -102,6 +105,7 @@ void jce_pool_destroy(JceAsyncPool *pool);
 JceAsyncRequest *jce_pool_submit(JceAsyncPool *pool,
                                  JceAsyncRequestType type,
                                  uint16_t slot_index,
+                                 uint16_t generation,
                                  const char *path,
                                  JcePakArchive *pak,
                                  JceFileSystem *fs,

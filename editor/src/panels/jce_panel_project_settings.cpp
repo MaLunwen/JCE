@@ -170,7 +170,35 @@ void save_if_dirty(void)
 {
     if (!g_st.dirty) return;
     bool ok_ps  = jce_project_settings_save(&g_st.ps);
-    bool ok_cfg = jce_editor_config_save(&g_st.cfg);
+
+    /* Reload-before-save (defense-in-depth against the whole-struct-from-
+     * snapshot clobber): pull the current on-disk editor-config and overlay
+     * ONLY the build/run + project fields this panel authors, so a save here
+     * never reverts a sibling field (run_mode set in Game View, exe path
+     * auto-updated by Build Profiles, prefs toggled in Preferences) changed
+     * since this panel was opened.  Keep this list in sync with
+     * draw_build / draw_run / draw_project. */
+    JceEditorConfig disk;
+    if (!jce_editor_config_load(&disk)) disk = g_st.cfg;
+    snprintf(disk.build_configure_preset, sizeof(disk.build_configure_preset),
+             "%s", g_st.cfg.build_configure_preset);
+    snprintf(disk.build_preset, sizeof(disk.build_preset),
+             "%s", g_st.cfg.build_preset);
+    snprintf(disk.build_output_path, sizeof(disk.build_output_path),
+             "%s", g_st.cfg.build_output_path);
+    snprintf(disk.game_target_name, sizeof(disk.game_target_name),
+             "%s", g_st.cfg.game_target_name);
+    disk.run_mode = g_st.cfg.run_mode;
+    snprintf(disk.game_executable_path, sizeof(disk.game_executable_path),
+             "%s", g_st.cfg.game_executable_path);
+    snprintf(disk.game_working_directory, sizeof(disk.game_working_directory),
+             "%s", g_st.cfg.game_working_directory);
+    snprintf(disk.last_project, sizeof(disk.last_project),
+             "%s", g_st.cfg.last_project);
+    disk.recent_count = g_st.cfg.recent_count;  /* draw_project only clears */
+    bool ok_cfg = jce_editor_config_save(&disk);
+    g_st.cfg = disk;   /* keep the snapshot consistent with what we wrote */
+
     jce_hotkeys_save();
     if (ok_ps)
         jce_project_settings_apply(&g_st.ps);
@@ -368,7 +396,12 @@ void draw_tags_layers(void)
 
 void draw_quality(void)
 {
-    static const char *k_tier_names[] = { "Low", "Medium", "High", "Ultra" };
+    const char *k_tier_names[] = {
+        jce_editor_i18n_or(PS_KEY "tier.low",    "Low"),
+        jce_editor_i18n_or(PS_KEY "tier.medium", "Medium"),
+        jce_editor_i18n_or(PS_KEY "tier.high",   "High"),
+        jce_editor_i18n_or(PS_KEY "tier.ultra",  "Ultra"),
+    };
     static const JceQualityTier k_tiers[] = {
         JCE_QUALITY_LOW, JCE_QUALITY_MED, JCE_QUALITY_HIGH, JCE_QUALITY_ULTRA
     };
@@ -395,10 +428,10 @@ void draw_quality(void)
         ImGui::TableSetupColumn(
             jce_editor_i18n_or(PS_KEY "quality.col.feature", "Feature"),
             ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Low",    ImGuiTableColumnFlags_WidthFixed, 56.0f);
-        ImGui::TableSetupColumn("Medium", ImGuiTableColumnFlags_WidthFixed, 56.0f);
-        ImGui::TableSetupColumn("High",   ImGuiTableColumnFlags_WidthFixed, 56.0f);
-        ImGui::TableSetupColumn("Ultra",  ImGuiTableColumnFlags_WidthFixed, 56.0f);
+        ImGui::TableSetupColumn(k_tier_names[0], ImGuiTableColumnFlags_WidthFixed, 56.0f);
+        ImGui::TableSetupColumn(k_tier_names[1], ImGuiTableColumnFlags_WidthFixed, 56.0f);
+        ImGui::TableSetupColumn(k_tier_names[2], ImGuiTableColumnFlags_WidthFixed, 56.0f);
+        ImGui::TableSetupColumn(k_tier_names[3], ImGuiTableColumnFlags_WidthFixed, 56.0f);
         ImGui::TableHeadersRow();
 
         JceQualityPreset presets[4];
@@ -422,31 +455,31 @@ void draw_quality(void)
             }
         };
 
-        bool_row("Shadows (CSM)",
+        bool_row(jce_editor_i18n_or(PS_KEY "feature.csm", "Shadows (CSM)"),
             presets[0].rp.enable_csm, presets[1].rp.enable_csm,
             presets[2].rp.enable_csm, presets[3].rp.enable_csm);
-        bool_row("SSAO",
+        bool_row(jce_editor_i18n_or(PS_KEY "feature.ssao", "SSAO"),
             presets[0].rp.enable_ssao, presets[1].rp.enable_ssao,
             presets[2].rp.enable_ssao, presets[3].rp.enable_ssao);
-        bool_row("SSR",
+        bool_row(jce_editor_i18n_or(PS_KEY "feature.ssr", "SSR"),
             presets[0].rp.enable_ssr, presets[1].rp.enable_ssr,
             presets[2].rp.enable_ssr, presets[3].rp.enable_ssr);
-        bool_row("TAA",
+        bool_row(jce_editor_i18n_or(PS_KEY "feature.taa", "TAA"),
             presets[0].rp.enable_taa, presets[1].rp.enable_taa,
             presets[2].rp.enable_taa, presets[3].rp.enable_taa);
-        bool_row("Bloom",
+        bool_row(jce_editor_i18n_or(PS_KEY "feature.bloom", "Bloom"),
             presets[0].rp.enable_bloom, presets[1].rp.enable_bloom,
             presets[2].rp.enable_bloom, presets[3].rp.enable_bloom);
-        bool_row("Volumetric Fog",
+        bool_row(jce_editor_i18n_or(PS_KEY "feature.volumetricFog", "Volumetric Fog"),
             presets[0].rp.enable_volumetric_fog, presets[1].rp.enable_volumetric_fog,
             presets[2].rp.enable_volumetric_fog, presets[3].rp.enable_volumetric_fog);
-        bool_row("GPU Particles",
+        bool_row(jce_editor_i18n_or(PS_KEY "feature.gpuParticles", "GPU Particles"),
             presets[0].rp.enable_gpu_particles, presets[1].rp.enable_gpu_particles,
             presets[2].rp.enable_gpu_particles, presets[3].rp.enable_gpu_particles);
-        bool_row("Motion Blur",
+        bool_row(jce_editor_i18n_or(PS_KEY "feature.motionBlur", "Motion Blur"),
             presets[0].rp.enable_motion_blur, presets[1].rp.enable_motion_blur,
             presets[2].rp.enable_motion_blur, presets[3].rp.enable_motion_blur);
-        bool_row("Cloth Sim",
+        bool_row(jce_editor_i18n_or(PS_KEY "feature.clothSim", "Cloth Sim"),
             presets[0].rp.enable_cloth, presets[1].rp.enable_cloth,
             presets[2].rp.enable_cloth, presets[3].rp.enable_cloth);
 
@@ -675,12 +708,14 @@ void draw_audio(void)
 void draw_editor(void)
 {
     JceProjectEditor &e = g_st.ps.editor;
-    if (ImGui::Checkbox(jce_editor_i18n_id(PS_KEY "auto_save_enabled", "auto_save_enabled"),
-                        &e.auto_save_enabled))
-        mark_dirty();
-    if (ImGui::DragInt(jce_editor_i18n_id(PS_KEY "auto_save_interval", "auto_save_interval"),
-                       &e.auto_save_interval_sec, 1.0f, 5, 3600))
-        mark_dirty();
+    /* Auto-save is a per-user editor preference (it never travels with the
+     * project), configured in Preferences > General and driven by
+     * jce_editor_prefs_autosave_interval_sec().  Previously duplicated here
+     * as an inert control; redirect users to the single source of truth. */
+    ImGui::TextDisabled("%s", jce_editor_i18n_or(
+        "projectSettings.editorPrefs.autoSaveMovedHint",
+        "Auto-save interval is configured in Preferences > General."));
+    ImGui::Separator();
     const char *behaviour[] = { "3D", "2D" };
     int bm = e.default_behavior_mode ? 1 : 0;
     if (ImGui::Combo(jce_editor_i18n_id(PS_KEY "behavior_mode", "behavior_mode"),
@@ -696,13 +731,12 @@ void draw_editor(void)
                      &vcm, vc, IM_ARRAYSIZE(vc))) {
         e.version_control_mode = vcm; mark_dirty();
     }
+    /* External script/image editors moved to per-user Preferences >
+     * External Tools (machine paths must not travel with the project). */
     ImGui::Separator();
-    if (ImGui::InputText(jce_editor_i18n("projectSettings.editorPrefs.externalScriptEditor"),
-                         e.external_script_editor, JCE_PS_PATH_LEN))
-        mark_dirty();
-    if (ImGui::InputText(jce_editor_i18n("projectSettings.editorPrefs.externalImageEditor"),
-                         e.external_image_editor, JCE_PS_PATH_LEN))
-        mark_dirty();
+    ImGui::TextDisabled("%s", jce_editor_i18n_or(
+        "projectSettings.editorPrefs.externalToolsMovedHint",
+        "External script/image editors are configured in Preferences > External Tools."));
 }
 
 void draw_localization(void)
@@ -1085,8 +1119,11 @@ void draw_project(void)
                       cur ? cur->name         : nullptr,
                       err, sizeof err);
         std::snprintf(s_main_msg, sizeof s_main_msg, "%s",
-                      ok ? "Reset OK — rebuild to apply." :
-                           (err[0] ? err : "Reset failed."));
+                      ok ? jce_editor_i18n_or("projectSettings.project.resetOk",
+                                "Reset OK — rebuild to apply.") :
+                           (err[0] ? err :
+                            jce_editor_i18n_or("projectSettings.project.resetFailed",
+                                 "Reset failed.")));
         jce_log_write(ok ? JCE_LOG_LEVEL_INFO : JCE_LOG_LEVEL_ERROR,
                       "project_settings", __FILE__, __LINE__,
                       "reset main.c: %s", s_main_msg);
@@ -1100,8 +1137,11 @@ void draw_project(void)
                       cur ? cur->name         : nullptr,
                       err, sizeof err);
         std::snprintf(s_main_msg, sizeof s_main_msg, "%s",
-                      ok ? "Ejected — main.c now owned by this project." :
-                           (err[0] ? err : "Eject failed."));
+                      ok ? jce_editor_i18n_or("projectSettings.project.ejectOk",
+                                "Ejected — main.c now owned by this project.") :
+                           (err[0] ? err :
+                            jce_editor_i18n_or("projectSettings.project.ejectFailed",
+                                 "Eject failed.")));
         jce_log_write(ok ? JCE_LOG_LEVEL_INFO : JCE_LOG_LEVEL_ERROR,
                       "project_settings", __FILE__, __LINE__,
                       "eject main.c: %s", s_main_msg);
@@ -1155,9 +1195,10 @@ void draw_run(void)
             g_st.cfg.game_executable_path,
             sizeof(g_st.cfg.game_executable_path),
 #if JCE_PLATFORM_WINDOWS
-            "Executables (*.exe);;All Files (*.*)"
+            jce_editor_i18n_or("fileDialog.filter.executables",
+                 "Executables (*.exe);;All Files (*.*)")
 #else
-            "All Files (*.*)"
+            jce_editor_i18n_or("fileDialog.filter.allFiles", "All Files (*.*)")
 #endif
             ))
         mark_dirty();
@@ -1356,7 +1397,12 @@ void draw_quality_levels(void)
                                      lv->name, JCE_PS_NAME_LEN)) mark_dirty();
                 if (ImGui::SliderInt(jce_editor_i18n("projectSettings.quality.pixelLightCount"),
                                      &lv->pixel_light_count, 0, 16)) mark_dirty();
-                const char *tx[] = { "Full", "Half", "Quarter", "Eighth" };
+                const char *tx[] = {
+                    jce_editor_i18n_or(PS_KEY "texq.full",    "Full"),
+                    jce_editor_i18n_or(PS_KEY "texq.half",    "Half"),
+                    jce_editor_i18n_or(PS_KEY "texq.quarter", "Quarter"),
+                    jce_editor_i18n_or(PS_KEY "texq.eighth",  "Eighth"),
+                };
                 if (ImGui::Combo(jce_editor_i18n("projectSettings.quality.textureQuality"),
                                  &lv->texture_quality, tx, 4)) mark_dirty();
                 const char *aniso[] = {
@@ -1366,7 +1412,7 @@ void draw_quality_levels(void)
                 };
                 if (ImGui::Combo(jce_editor_i18n("projectSettings.quality.anisotropic"),
                                  &lv->anisotropic, aniso, 3)) mark_dirty();
-                const char *aa[] = { "Off", "2x", "4x", "8x" };
+                const char *aa[] = { jce_editor_i18n_or(PS_KEY "msaa.off", "Off"), "2x", "4x", "8x" };
                 int aa_i = (lv->anti_aliasing <= 0) ? 0 :
                            (lv->anti_aliasing == 2) ? 1 :
                            (lv->anti_aliasing == 4) ? 2 : 3;
@@ -1379,10 +1425,19 @@ void draw_quality_levels(void)
                                     &lv->soft_particles)) mark_dirty();
                 if (ImGui::Checkbox(jce_editor_i18n("projectSettings.quality.realtimeReflectionProbes"),
                                     &lv->realtime_reflection_probes)) mark_dirty();
-                const char *sq[] = { "Disable", "Hard Only", "Hard + Soft" };
+                const char *sq[] = {
+                    jce_editor_i18n_or(PS_KEY "shadowq.disable",  "Disable"),
+                    jce_editor_i18n_or(PS_KEY "shadowq.hardOnly", "Hard Only"),
+                    jce_editor_i18n_or(PS_KEY "shadowq.hardSoft", "Hard + Soft"),
+                };
                 if (ImGui::Combo(jce_editor_i18n("projectSettings.quality.shadowQuality"),
                                  &lv->shadow_quality, sq, 3)) mark_dirty();
-                const char *sr[] = { "Low", "Medium", "High", "Very High" };
+                const char *sr[] = {
+                    jce_editor_i18n_or(PS_KEY "tier.low",    "Low"),
+                    jce_editor_i18n_or(PS_KEY "tier.medium", "Medium"),
+                    jce_editor_i18n_or(PS_KEY "tier.high",   "High"),
+                    jce_editor_i18n_or(PS_KEY "shadowres.veryHigh", "Very High"),
+                };
                 if (ImGui::Combo(jce_editor_i18n("projectSettings.quality.shadowResolution"),
                                  &lv->shadow_resolution, sr, 4)) mark_dirty();
                 if (ImGui::DragFloat(jce_editor_i18n("projectSettings.quality.shadowDistance"),
@@ -1395,7 +1450,11 @@ void draw_quality_levels(void)
                     const int v[] = { 1, 2, 4 };
                     lv->shadow_cascades = v[sc_i]; mark_dirty();
                 }
-                const char *vs[] = { "Off", "Every VBlank", "Every 2nd VBlank" };
+                const char *vs[] = {
+                    jce_editor_i18n_or(PS_KEY "msaa.off", "Off"),
+                    jce_editor_i18n_or(PS_KEY "vsync.everyVblank", "Every VBlank"),
+                    jce_editor_i18n_or(PS_KEY "vsync.every2nd",    "Every 2nd VBlank"),
+                };
                 if (ImGui::Combo(jce_editor_i18n("projectSettings.quality.vsync"),
                                  &lv->vsync_count, vs, 3)) mark_dirty();
                 if (ImGui::DragInt(jce_editor_i18n("projectSettings.quality.targetFramerate"),
@@ -1543,7 +1602,7 @@ void draw_packaging(void)
     jce_draw_path_input_file(jce_editor_i18n_or(
             "projectSettings.packaging.importPath", "Import key file"),
         s_import_buf, sizeof(s_import_buf),
-        "Key (*.hex *.txt);;All Files (*.*)");
+        jce_editor_i18n_or("fileDialog.filter.keyFile", "Key (*.hex *.txt);;All Files (*.*)"));
     ImGui::SameLine();
     ImGui::BeginDisabled(s_import_buf[0] == '\0');
     if (ImGui::Button(jce_editor_i18n_or(
@@ -1677,6 +1736,13 @@ extern "C" void jce_editor_panel_project_settings(void)
     if (*vis) {
         s_modal_open = true;
         *vis = false;
+        /* Re-sync the cached project-settings + editor-config snapshots from
+         * disk on EVERY open (mirrors the Preferences panel), so g_st.cfg is
+         * never a session-stale snapshot whose whole-struct save would revert
+         * run_mode / exe path / prefs changed by other surfaces since the
+         * first open.  This is the primary fix for the build/run clobber. */
+        g_st.loaded = false;
+        ensure_loaded();
         ImGui::OpenPopup("###project_settings");
     }
     if (!s_modal_open) return;

@@ -192,6 +192,13 @@ JCE_API void JCE_CALL jce_physics_body_set_gravity_factor(JcePhysicsWorld *world
                                                           JceBodyHandle body,
                                                           float factor);
 
+/* Per-axis angular factor.  (0,0,0) locks all rotation (Unity FreezeRotation /
+ * Godot lock_rotation) so a dynamic body never tips/rolls yet still collides
+ * linearly; (1,1,1) = free.  Apply after the body is in the world. */
+JCE_API void JCE_CALL jce_physics_body_set_angular_factor(JcePhysicsWorld *world,
+                                                          JceBodyHandle body,
+                                                          jce_vec3 factor);
+
 /* Change a dynamic body's mass at runtime; recomputes the local inertia
  * tensor from the current collision shape.  mass <= 0 makes the body
  * effectively static (zero inverse mass). */
@@ -392,6 +399,39 @@ JCE_API void JCE_CALL jce_physics_constraint_destroy(JcePhysicsWorld *world,
 JCE_API void JCE_CALL jce_physics_constraint_set_limits(JcePhysicsWorld *world,
                                                         JceConstraintHandle con,
                                                         float lower, float upper);
+
+/* ── Configurable joint (Unity-style per-axis 6DOF + break) ────────────
+ *
+ * A generic 6-DOF joint with INDEPENDENT motion authoring per linear and
+ * angular axis (Locked / Limited / Free), on top of which the runtime layers
+ * a break-force monitor.  Distinct from JceConstraintDesc's single-limit-pair
+ * 6DOF: here every axis carries its own constraint state, which Unity's
+ * ConfigurableJoint exposes and the simple typed constraints do not.
+ *
+ * Built on a btGeneric6DofConstraint and stored in the SAME constraint
+ * registry as jce_physics_constraint_create, so the returned handle is
+ * destroyed via jce_physics_constraint_destroy and queried via
+ * jce_physics_constraint_applied_impulse. */
+typedef struct {
+    JceBodyHandle body_a;
+    JceBodyHandle body_b;          /* JCE_BODY_INVALID = world anchor */
+    jce_vec3      anchor_a;        /* local anchor on body A */
+    jce_vec3      anchor_b;        /* local anchor on body B (or world) */
+    int           lin_motion[3];   /* X,Y,Z: 0=locked 1=limited 2=free */
+    int           ang_motion[3];   /* X,Y,Z: 0=locked 1=limited 2=free */
+    float         linear_limit;        /* symmetric ±metres on limited linear axes */
+    float         angular_limit_deg[3];/* symmetric ±deg per limited angular axis */
+    bool          disable_collision;   /* disable collision between A and B */
+} JceConfigurableJointDesc;
+
+JCE_API JceConstraintHandle JCE_CALL jce_physics_configurable_joint_create(
+        JcePhysicsWorld *world, const JceConfigurableJointDesc *desc);
+
+/* Last-step applied-impulse magnitude (N·s) of a live constraint, or 0 for an
+ * invalid handle.  Used by the runtime break-force monitor: an applied IMPULSE
+ * is compared against (break_FORCE * fixed_dt) since impulse = force * dt. */
+JCE_API float JCE_CALL jce_physics_constraint_applied_impulse(
+        const JcePhysicsWorld *world, JceConstraintHandle con);
 
 /* ================================================================== */
 /* Character controller                                                */

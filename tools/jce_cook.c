@@ -19,6 +19,7 @@
 #include <jce/resource/jce_asset_format.h>
 
 #include "resource/jce_asset_cooker.h"
+#include "jce_cook_catalog.h"   /* per-asset incremental cook cache */
 
 /* Offline collider cook (--collider): turns a model's compound collider into
  * a precomputed JCOL blob so the runtime can load it instead of re-cooking
@@ -27,8 +28,11 @@
 #include <jce/middleware/physics/jce_collider_cook.h>
 #include <jce/middleware/physics/jce_collider_asset.h>
 #include <jce/os/core/jce_filesystem.h>
+#include <jce/os/core/jce_alloc.h>   /* jce_free for the GLB convert buffer */
 #include <jce/renderer/jce_mesh.h>
 #include <jce/resource/jce_pak_loader.h>
+
+#include <xxhash.h>
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -110,7 +114,13 @@ typedef struct {
     bool           preserve_names;
     int            cooked;
     int            failed;
-    int            skipped;
+    int            skipped;     /* raw passthrough copies */
+    int            unchanged;   /* skipped via incremental content cache */
+    /* Per-asset incremental cache: when present, a cooked asset whose source
+       bytes + import sidecar + option-salt fingerprint are unchanged since
+       the last cook is skipped entirely.  NULL disables it (e.g. --dry-run). */
+    JceCookCatalog *catalog;
+    uint64_t        cache_salt; /* fingerprint of the cook options */
 } BatchContext;
 
 /* Copy a file byte-for-byte (for types that must stay raw).
@@ -140,11 +150,64 @@ static bool should_cook(const char *full_path, int type)
     return false;
 }
 
+/* Case-insensitive extension match (ext_lower includes the dot, lowercase). */
+static bool ext_iequals(const char *path, const char *ext_lower)
+{
+    const char *dot = strrchr(path, '.');
+    if (!dot) return false;
+    if (strlen(dot) != strlen(ext_lower)) return false;
+    for (size_t i = 0; dot[i]; ++i) {
+        char c = dot[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        if (c != ext_lower[i]) return false;
+    }
+    return true;
+}
+
+/* Authoring-only mesh source formats the glTF-only runtime cannot load.  They
+   are excluded from the cooked tree / PAK entirely (models are normalised to
+   .glb at import/migration via `jce_cook --convert-model`); shipping the raw
+   source alongside the converted .glb otherwise doubled the embedded PAK. */
+static bool is_authoring_mesh_source(const char *path)
+{
+    static const char *const raw[] = {
+        ".obj", ".fbx", ".dae", ".3ds", ".ply", ".stl", ".blend",
+        ".mtl", ".usd", ".usdc", ".usdz", NULL
+    };
+    for (int i = 0; raw[i]; ++i)
+        if (ext_iequals(path, raw[i])) return true;
+    return false;   /* .glb / .gltf are the runtime format — keep */
+}
+
 static void cook_single(BatchContext *ctx, const char *full_path,
                          const char *relative)
 {
     int type = jce_cook_detect_type(full_path);
     bool do_cook = should_cook(full_path, type);
+
+    /* Authoring mesh sources never ship (runtime is glTF-only).  Warn when a
+       mesh source has no converted .glb sibling, so the model is not silently
+       absent at runtime. */
+    if (is_authoring_mesh_source(full_path)) {
+        if (!ext_iequals(full_path, ".mtl")) {
+            const char *dot = strrchr(full_path, '.');
+            size_t      stem = dot ? (size_t)(dot - full_path) : 0;
+            char        glb[1024];
+            if (stem && stem + 5 < sizeof glb) {
+                memcpy(glb, full_path, stem);
+                memcpy(glb + stem, ".glb", 5);
+                if (!jce_fs_host_exists_file(glb))
+                    fprintf(stderr, "[jce_cook] WARN: %s has no .glb sibling; "
+                            "model will be absent at runtime "
+                            "(run jce_cook --convert-model)\n", relative);
+            }
+        }
+        if (ctx->opts.verbose)
+            printf("[skip-source] %s (authoring mesh; runtime loads .glb)\n",
+                   relative);
+        ctx->skipped++;
+        return;
+    }
 
     if (ctx->opts.verbose)
         printf("[%s] %s%s\n", type_name(type), relative,
@@ -164,12 +227,42 @@ static void cook_single(BatchContext *ctx, const char *full_path,
                          ctx->output_dir, relative);
     }
 
+    /* Incremental cache: skip assets whose source content (+ import sidecar
+       + option salt) is unchanged since the last cook AND whose output is
+       still on disk.  A deleted output forces a recook even on a cache hit. */
+    uint64_t content_hash = 0;
+    bool     have_hash    = false;
+    if (ctx->catalog) {
+        bool ok = false;
+        content_hash = jce_cook_hash_file(full_path, ctx->cache_salt,
+                                          NULL, NULL, &ok);
+        have_hash = ok;
+        if (ok &&
+            jce_cook_entry_is_up_to_date(ctx->catalog, relative, content_hash) &&
+            jce_fs_host_exists_file(out_path)) {
+            if (ctx->opts.verbose)
+                printf("  (unchanged) %s\n", relative);
+            /* Cache hit takes an early return without record(): still mark the
+               entry live so the per-run sweep does not prune it as stale. */
+            jce_cook_catalog_mark_seen(ctx->catalog, relative);
+            ctx->unchanged++;
+            return;
+        }
+    }
+
     ensure_parent_dir(out_path);
 
     if (!do_cook) {
         /* Passthrough: copy original file unmodified. */
         if (copy_file_raw(full_path, out_path)) {
             ctx->skipped++;
+            if (ctx->catalog && have_hash) {
+                uint64_t sz = 0; int64_t mt = 0;
+                (void)jce_fs_host_get_size(full_path, &sz);
+                (void)jce_fs_host_get_mtime(full_path, &mt);
+                (void)jce_cook_catalog_record(ctx->catalog, relative,
+                                              content_hash, sz, mt);
+            }
         } else {
             fprintf(stderr, "FAIL copy: %s\n", relative);
             ctx->failed++;
@@ -188,6 +281,13 @@ static void cook_single(BatchContext *ctx, const char *full_path,
         if (ctx->opts.verbose)
             printf("  -> %s (%zu bytes)\n", out_path, result.size);
         ctx->cooked++;
+        if (ctx->catalog && have_hash) {
+            uint64_t sz = 0; int64_t mt = 0;
+            (void)jce_fs_host_get_size(full_path, &sz);
+            (void)jce_fs_host_get_mtime(full_path, &mt);
+            (void)jce_cook_catalog_record(ctx->catalog, relative,
+                                          content_hash, sz, mt);
+        }
     } else {
         fprintf(stderr, "FAIL write: %s\n", out_path);
         ctx->failed++;
@@ -371,6 +471,72 @@ static int cook_collider(const char *model_path, const char *out_path,
 }
 
 /* ================================================================== */
+/* Model -> GLB conversion (--convert-model)                          */
+/* ================================================================== */
+
+/* Forward decl of the engine bundle converter (jce_bundle_mesh_convert.cpp,
+   compiled into this tool).  Coerces any assimp-readable mesh (OBJ/FBX/DAE/…)
+   into a self-contained binary glTF (.glb) so every deployment path can
+   normalise to a single runtime mesh format and the runtime mounts only the
+   cgltf loader (never the source format). */
+extern int jce_bundle_convert_to_glb(const uint8_t *src, size_t src_sz,
+                                     const char *ext_hint,
+                                     uint8_t **out_buf, size_t *out_size);
+
+/* Convert one model file to GLB.  Default output replaces the source
+   extension with ".glb" (so "models/foo.obj" -> "models/foo.glb"). */
+static int convert_model_to_glb(const char *in_path, const char *out_path,
+                                bool verbose)
+{
+    uint64_t in_size = 0;
+    void    *in_buf  = jce_fs_host_read_all(in_path, &in_size);
+    if (!in_buf || in_size == 0) {
+        fprintf(stderr, "Error: cannot read model %s\n", in_path);
+        if (in_buf) jce_fs_buffer_free(in_buf);
+        return 1;
+    }
+
+    const char *dot      = strrchr(in_path, '.');
+    const char *ext_hint = dot ? dot + 1 : "";
+
+    uint8_t *glb    = NULL;
+    size_t   glb_sz = 0;
+    int ok = jce_bundle_convert_to_glb((const uint8_t *)in_buf, (size_t)in_size,
+                                       ext_hint, &glb, &glb_sz);
+    jce_fs_buffer_free(in_buf);
+    if (!ok || !glb || glb_sz == 0) {
+        fprintf(stderr, "Error: GLB conversion failed for %s\n", in_path);
+        if (glb) jce_free(glb);
+        return 1;
+    }
+
+    /* Default output: sibling with the extension swapped to ".glb". */
+    char default_out[1024];
+    if (!out_path) {
+        size_t stem = dot ? (size_t)(dot - in_path) : strlen(in_path);
+        if (stem > sizeof default_out - 6) stem = sizeof default_out - 6;
+        memcpy(default_out, in_path, stem);
+        memcpy(default_out + stem, ".glb", 5);   /* incl NUL */
+        out_path = default_out;
+    }
+
+    ensure_parent_dir(out_path);
+    bool wrote = jce_fs_host_write_all(out_path, glb, glb_sz);
+    jce_free(glb);
+    if (!wrote) {
+        fprintf(stderr, "Error: failed to write %s\n", out_path);
+        return 1;
+    }
+
+    if (verbose)
+        printf("Converted model: %s -> %s (%zu bytes GLB)\n",
+               in_path, out_path, glb_sz);
+    else
+        printf("OK: %s (%zu bytes)\n", out_path, glb_sz);
+    return 0;
+}
+
+/* ================================================================== */
 /* Main                                                                */
 /* ================================================================== */
 
@@ -391,13 +557,17 @@ static void print_usage(void)
     printf("  jce_cook <input> <output> [options]\n");
     printf("  jce_cook --batch <input_dir> <output_dir> [options]\n");
     printf("  jce_cook --collider <model> [--out <file.jcol>] [--verbose]\n");
+    printf("  jce_cook --convert-model <model> [--out <file.glb>] [--verbose]\n");
     printf("\n");
     printf("Options:\n");
     printf("  --collider <model>       Offline-cook a compound collider blob\n");
-    printf("  --out <file.jcol>        Collider output path (default <model>.jcol)\n");
+    printf("  --convert-model <model>  Convert OBJ/FBX/DAE/... to binary glTF (.glb)\n");
+    printf("  --out <file>             Output path (collider: default <model>.jcol;\n");
+    printf("                           convert-model: default <model>.glb)\n");
     printf("  --level <0-22>           ZSTD compression level (default: 3)\n");
     printf("  --mipmaps                Generate full mipmap chain\n");
     printf("  --max-texture-size <N>   Cap texture dimensions\n");
+    printf("  --quality <q>            Block-encode quality: fast|default|highest (default: default)\n");
     printf("  --texfmt <fmt>           GPU compress: bc7|bc5|bc3|bc1|astc|etc2 (default: host auto)\n");
     printf("  --platform <p>           Auto-pick GPU format: windows|linux|macos|android|ios|web (default: host)\n");
     printf("  --rgba8 / --uncompressed Keep textures uncompressed RGBA8 (UI / data textures)\n");
@@ -405,6 +575,8 @@ static void print_usage(void)
     printf("  --batch                  Process directory recursively\n");
     printf("  --dry-run                Preview without writing\n");
     printf("  --preserve-names         Keep original extension (don't add .jceasset)\n");
+    printf("  --no-incremental         Disable the per-asset content-hash skip cache (--batch)\n");
+    printf("  --catalog <file>         Incremental-cache catalog path (default <out>/.jce_cook_catalog)\n");
 }
 
 int main(int argc, char **argv)
@@ -420,15 +592,20 @@ int main(int argc, char **argv)
     bool preserve_names = false;
     bool mipmaps        = false;
     bool collider       = false;          /* --collider model cook mode */
+    bool convert_model  = false;          /* --convert-model mesh→glb mode */
     int  level          = 3;
     int  max_tex_size   = 0;
     int  tex_fmt        = JCEASSET_TEXFMT_RGBA8;  /* --texfmt; RGBA8 lets platform auto-pick */
     int  platform       = JCE_COOK_HOST_PLATFORM; /* --platform; default host (compress by default) */
+    int  enc_quality    = JCE_COOK_ENCODE_DEFAULT;/* --quality fast|default|highest */
     bool uncompressed   = false;                  /* --rgba8/--uncompressed opt-out */
+    bool no_incremental = false;                  /* --no-incremental opt-out */
     const char *input   = NULL;
     const char *output  = NULL;
     const char *collider_model = NULL;    /* --collider <model> */
-    const char *collider_out   = NULL;    /* --out <file.jcol> */
+    const char *convert_in     = NULL;    /* --convert-model <model> */
+    const char *collider_out   = NULL;    /* --out <file> (collider/convert) */
+    const char *catalog_path   = NULL;    /* --catalog <file> override */
 
     /* Parse arguments. */
     for (int i = 1; i < argc; i++) {
@@ -437,6 +614,9 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "--collider") == 0 && i + 1 < argc) {
             collider = true;
             collider_model = argv[++i];
+        } else if (strcmp(argv[i], "--convert-model") == 0 && i + 1 < argc) {
+            convert_model = true;
+            convert_in = argv[++i];
         } else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
             collider_out = argv[++i];
         } else if (strcmp(argv[i], "--verbose") == 0) {
@@ -450,10 +630,19 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "--rgba8") == 0 ||
                    strcmp(argv[i], "--uncompressed") == 0) {
             uncompressed = true;
+        } else if (strcmp(argv[i], "--no-incremental") == 0) {
+            no_incremental = true;
+        } else if (strcmp(argv[i], "--catalog") == 0 && i + 1 < argc) {
+            catalog_path = argv[++i];
         } else if (strcmp(argv[i], "--level") == 0 && i + 1 < argc) {
             level = atoi(argv[++i]);
             if (level < 0) level = 0;
             if (level > 22) level = 22;
+        } else if (strcmp(argv[i], "--quality") == 0 && i + 1 < argc) {
+            const char *q = argv[++i];
+            if      (strcmp(q, "fast")    == 0) enc_quality = JCE_COOK_ENCODE_FAST;
+            else if (strcmp(q, "highest") == 0) enc_quality = JCE_COOK_ENCODE_HIGHEST;
+            else                                enc_quality = JCE_COOK_ENCODE_DEFAULT;
         } else if (strcmp(argv[i], "--max-texture-size") == 0 && i + 1 < argc) {
             max_tex_size = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--texfmt") == 0 && i + 1 < argc) {
@@ -469,7 +658,7 @@ int main(int argc, char **argv)
             const char *p = argv[++i];
             if      (strcmp(p, "windows") == 0 || strcmp(p, "desktop") == 0) platform = JCE_COOK_PLATFORM_WINDOWS;
             else if (strcmp(p, "linux")   == 0) platform = JCE_COOK_PLATFORM_LINUX;
-            else if (strcmp(p, "macos")   == 0 || strcmp(p, "mac") == 0) platform = JCE_COOK_PLATFORM_MACOS;
+            else if (strcmp(p, "macos")   == 0 || strcmp(p, "mac") == 0 || strcmp(p, "darwin") == 0) platform = JCE_COOK_PLATFORM_MACOS;
             else if (strcmp(p, "android") == 0 || strcmp(p, "mobile") == 0) platform = JCE_COOK_PLATFORM_ANDROID;
             else if (strcmp(p, "ios")     == 0) platform = JCE_COOK_PLATFORM_IOS;
             else if (strcmp(p, "web")     == 0) platform = JCE_COOK_PLATFORM_WEB;
@@ -488,6 +677,15 @@ int main(int argc, char **argv)
             return 1;
         }
         return cook_collider(collider_model, collider_out, verbose);
+    }
+
+    /* Offline model→GLB conversion is likewise self-contained. */
+    if (convert_model) {
+        if (!convert_in) {
+            fprintf(stderr, "Error: --convert-model requires a model path\n");
+            return 1;
+        }
+        return convert_model_to_glb(convert_in, collider_out, verbose);
     }
 
     if (!input || !output) {
@@ -510,6 +708,7 @@ int main(int argc, char **argv)
     opts.generate_mipmaps  = mipmaps;
     opts.texture_format    = tex_fmt;
     opts.platform          = (JceCookPlatform)platform;
+    opts.encode_quality    = enc_quality;
 
     if (tex_fmt == JCEASSET_TEXFMT_BC7)
         fprintf(stderr, "[jce_cook] WARNING: BC7 uses the nvtt encoder and is "
@@ -524,13 +723,102 @@ int main(int argc, char **argv)
         ctx.dry_run        = dry_run;
         ctx.preserve_names = preserve_names;
 
+        /* Incremental cache: the cook-option fingerprint (salt) is folded
+           into every per-asset hash so retargeting the platform, changing the
+           texture format / quality / mip flag / size cap, the ZSTD compression
+           level, or toggling preserve-names invalidates the cache without a
+           manual clean.
+           Disabled for --dry-run (nothing is written) and --no-incremental. */
+        JceCookCatalog catalog;
+        char           catalog_buf[1280];
+        bool           use_cache = !dry_run && !no_incremental;
+        if (use_cache) {
+            if (catalog_path) {
+                snprintf(catalog_buf, sizeof(catalog_buf), "%s", catalog_path);
+            } else {
+                snprintf(catalog_buf, sizeof(catalog_buf),
+                         "%s/.jce_cook_catalog", output);
+            }
+            {
+                XXH3_state_t *ss = XXH3_createState();
+                if (!ss) {
+                    /* Allocation failure: disable the cache rather than deref a
+                       NULL state (every asset re-cooks this run — correct, just
+                       slower). */
+                    fprintf(stderr, "[jce_cook] WARNING: XXH3_createState "
+                            "failed; incremental cache disabled this run\n");
+                    use_cache = false;
+                } else {
+                    XXH3_64bits_reset(ss);
+                    int pf = (int)opts.platform;
+                    int tf = opts.texture_format;
+                    int eq = opts.encode_quality;
+                    int mc = opts.max_texture_size;
+                    int cl = opts.compression_level;
+                    uint8_t mm = opts.generate_mipmaps ? 1u : 0u;
+                    uint8_t pn = preserve_names ? 1u : 0u;
+                    XXH3_64bits_update(ss, &pf, sizeof(pf));
+                    XXH3_64bits_update(ss, &tf, sizeof(tf));
+                    XXH3_64bits_update(ss, &eq, sizeof(eq));
+                    XXH3_64bits_update(ss, &mc, sizeof(mc));
+                    XXH3_64bits_update(ss, &cl, sizeof(cl));
+                    XXH3_64bits_update(ss, &mm, sizeof(mm));
+                    XXH3_64bits_update(ss, &pn, sizeof(pn));
+                    ctx.cache_salt = (uint64_t)XXH3_64bits_digest(ss);
+                    XXH3_freeState(ss);
+                }
+            }
+            if (use_cache) {
+                (void)jce_cook_catalog_load(&catalog, catalog_buf);
+                /* Start a fresh liveness epoch: every recorded asset that is
+                   still walked this run re-marks itself seen; entries whose
+                   source vanished stay unseen and are swept below. */
+                jce_cook_catalog_begin_epoch(&catalog);
+                ctx.catalog = &catalog;
+            }
+        }
+
         printf("Cooking assets: %s -> %s (level %d)%s\n",
                input, output, level, dry_run ? " [dry-run]" : "");
 
         batch_recurse(&ctx, input, "");
 
-        printf("\nDone: %d cooked, %d failed, %d skipped\n",
-               ctx.cooked, ctx.failed, ctx.skipped);
+        if (use_cache) {
+            /* Per-run stale GC: drop catalog entries whose source was deleted
+               or moved since the last cook, and delete their now-orphan
+               .jceasset outputs so the cooked tree mirrors the source tree.
+               Done before save so orphan records never accumulate. */
+            for (size_t i = 0; i < catalog.count; ++i) {
+                if (catalog.entries[i].seen || !catalog.entries[i].path)
+                    continue;
+                char orphan_out[1024];
+                if (preserve_names) {
+                    snprintf(orphan_out, sizeof(orphan_out), "%s/%s",
+                             output, catalog.entries[i].path);
+                } else {
+                    make_output_path(orphan_out, sizeof(orphan_out),
+                                     output, catalog.entries[i].path);
+                }
+                if (jce_fs_host_exists_file(orphan_out)) {
+                    (void)jce_fs_host_remove_file(orphan_out);
+                    if (verbose)
+                        printf("  (removed orphan) %s\n", orphan_out);
+                }
+            }
+            size_t pruned = jce_cook_catalog_sweep_unseen(&catalog);
+            if (pruned && verbose)
+                printf("Pruned %zu stale catalog entr%s\n",
+                       pruned, pruned == 1 ? "y" : "ies");
+
+            if (!jce_cook_catalog_save(&catalog, catalog_buf))
+                fprintf(stderr, "[jce_cook] WARNING: failed to write cache "
+                        "catalog %s (next cook will reprocess everything)\n",
+                        catalog_buf);
+            jce_cook_catalog_free(&catalog);
+        }
+
+        printf("\nDone: %d cooked, %d failed, %d skipped, %d unchanged\n",
+               ctx.cooked, ctx.failed, ctx.skipped, ctx.unchanged);
         return ctx.failed > 0 ? 1 : 0;
     } else {
         if (verbose)

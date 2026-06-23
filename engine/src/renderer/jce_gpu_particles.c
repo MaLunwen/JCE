@@ -20,6 +20,7 @@
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/os/core/jce_profiler.h>
 #include <jce/renderer/jce_gpu_particles.h>
+#include <jce/renderer/jce_shaders.h>   /* jce_shaders_embedded_engine_pak fallback */
 
 #include "os/core/jce_memory.h"
 
@@ -94,7 +95,17 @@ static bgfx_shader_handle_t load_shader(const JcePakArchive *pak,
     char path[256];
     snprintf(path, sizeof(path), "shaders/%s_%s.bin", name, sfx);
 
-    const JcePakAsset *asset = jce_pak_find(pak, path);
+    /* Engine shaders are usually baked into jce_renderer (not in the scene
+     * PAK).  Try the caller pak, then fall back to the embedded engine pak —
+     * same fallback the standard shader loader uses. */
+    const JcePakAsset *asset = pak ? jce_pak_find(pak, path) : NULL;
+    if (!asset) {
+        const JcePakArchive *fb = jce_shaders_embedded_engine_pak();
+        if (fb && fb != pak) {
+            asset = jce_pak_find(fb, path);
+            if (asset) pak = fb;
+        }
+    }
     if (!asset) {
         LOG_ERROR(LOG_TAG, "shader not found in pak: %s", path);
         return invalid;

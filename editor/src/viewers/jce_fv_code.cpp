@@ -8,6 +8,7 @@
 #include "io/jce_editor_file_util.h"
 #include "jce_fv_common.h"
 #include "core/jce_hotkeys.h"
+#include "core/jce_editor_config.h"
 
 #include <algorithm>
 #include <string>
@@ -358,10 +359,15 @@ void fv_render_code(FvTab *tab)
             }
         }
 
-        /* Open in VS Code */
+        /* Open in the user's configured external script editor
+           (Preferences > External Tools); empty falls back to VS Code /
+           the OS default handler. */
         ImGui::SameLine();
         if (ImGui::Button(jce_editor_i18n("viewer.code.openInEditor"))) {
-            jce_host_open_in_text_editor(tab->path);
+            JceEditorConfig cfg;
+            jce_editor_config_load(&cfg);
+            if (!jce_host_open_in_editor(cfg.external_script_editor, tab->path))
+                jce_host_open_in_text_editor(tab->path);
         }
 
         /* File info (right side) */
@@ -370,11 +376,11 @@ void fv_render_code(FvTab *tab)
         ImGui::SameLine();
         if (tab->file_size >= 1024)
             ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
-                "  %.1f KB  %d bytes", (double)tab->file_size / 1024.0,
-                src_len);
+                jce_editor_i18n_or("viewer.code.sizeKb", "  %.1f KB  %d bytes"),
+                (double)tab->file_size / 1024.0, src_len);
         else
             ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
-                "  %ld bytes", tab->file_size);
+                jce_editor_i18n_or("viewer.code.sizeBytes", "  %ld bytes"), tab->file_size);
         if (tab->modified) {
             ImGui::SameLine();
             ImGui::TextColored(JCE_COLOR_TEXT_WARNING, "%s", jce_editor_i18n("codeViewer.modified"));

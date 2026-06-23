@@ -58,6 +58,9 @@ JCE_API void           JCE_CALL jce_blackboard_destroy(JceBlackboard *bb);
 /* Drop every key (keeps the allocation for reuse). */
 JCE_API void JCE_CALL jce_blackboard_clear(JceBlackboard *bb);
 
+/* Remove a single key.  Returns true if the key was present and removed. */
+JCE_API bool JCE_CALL jce_blackboard_remove(JceBlackboard *bb, const char *key);
+
 /* Setters — create the key if absent, overwrite (and retype) if present. */
 JCE_API void JCE_CALL jce_blackboard_set_bool  (JceBlackboard *bb, const char *key, bool v);
 JCE_API void JCE_CALL jce_blackboard_set_int   (JceBlackboard *bb, const char *key, int v);

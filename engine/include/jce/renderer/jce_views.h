@@ -30,6 +30,12 @@
 /* Reserved range for post-processing (Phase 4). */
 #define JCE_VIEW_POST_BASE   20
 
+/* Standalone runtime (drop-in main) offscreen scene target, used when the
+ * authored scene postfx chain is active.  Its own sub-passes are base-relative
+ * (shadow base+10..+13, fog base+16 -> 40..46); the postfx pipeline is re-based
+ * to 100 (jce_postfx_set_view_base) so the two ranges never collide. */
+#define JCE_VIEW_RUNTIME_GAME 30
+
 /* Editor gizmo / grid / selection overlay — drawn AFTER PostFX so it
  * doesn't get tone-mapped or bloomed. Targets the postfx output FBO. */
 #define JCE_VIEW_EDITOR_OVERLAY 50

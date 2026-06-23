@@ -4,6 +4,7 @@
 
 #include <jce/middleware/scene/jce_vcam_system.h>
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/os/core/jce_camera_shake.h>
 
 #include <math.h>
 #include <string.h>
@@ -17,11 +18,56 @@ typedef struct {
 
 static VcamState s_state = { 0, { {0,0,0}, {0,0,0}, 60.0f } };
 
+/* Trauma-based camera shake (gap 6.5): the orphaned jce_camera_shake model is
+ * now wired into the single live camera resolver.  Gameplay adds trauma via
+ * jce_vcam_system_add_trauma (e.g. on a hit / explosion, ultimately surfaced as
+ * jce.shake_camera(amount) in Lua); evaluate() advances it by dt and adds the
+ * bounded offset to the resolved pose so an active vcam visibly shakes and
+ * decays back to zero.  Lazily initialised so the defaults are applied exactly
+ * once even before the first reset(). */
+static JceCameraShake s_shake;
+static int            s_shake_inited = 0;
+
+static void vcam_shake_ensure_init(void)
+{
+    if (!s_shake_inited) {
+        /* decay ~1.5/s (a hard hit settles in well under a second),
+         * 18 Hz oscillation, fixed seed for deterministic playback. */
+        jce_camera_shake_init(&s_shake, 1.5f, 18.0f, 0xC0FFEEu);
+        s_shake_inited = 1;
+    }
+}
+
 JCE_API void JCE_CALL
 jce_vcam_system_reset(void)
 {
     s_state.initialised = 0;
     s_state.cur.fov_deg = 60.0f;
+
+    /* Re-seed the shake to its sane defaults (clears any residual trauma so a
+     * fresh scene/Play session starts perfectly still). */
+    jce_camera_shake_init(&s_shake, 1.5f, 18.0f, 0xC0FFEEu);
+    s_shake_inited = 1;
+}
+
+JCE_API void JCE_CALL
+jce_vcam_system_add_trauma(float amount)
+{
+    vcam_shake_ensure_init();
+    jce_camera_shake_add_trauma(&s_shake, amount);
+}
+
+JCE_API bool JCE_CALL
+jce_vcam_system_get_shake_offset(float out_pos[3])
+{
+    vcam_shake_ensure_init();
+    if (out_pos) { out_pos[0] = out_pos[1] = out_pos[2] = 0.0f; }
+    if (!jce_camera_shake_active(&s_shake)) return false;
+    /* READ-ONLY: the clock is advanced once per frame by jce_vcam_system_evaluate
+     * (called every Play frame by the game view), so we only read the offset
+     * here — never jce_camera_shake_update — to avoid double-advancing. */
+    if (out_pos) jce_camera_shake_offset(&s_shake, out_pos, NULL);
+    return true;
 }
 
 /* Per-iteration scratch — using static ok since the callback is run
@@ -39,6 +85,7 @@ static void pick_cb(JceScene *s, JceEntity e, void *user)
     if (!jce_scene_has_virtual_camera(s, e)) return;
     JceVirtualCameraComponent *vc = jce_scene_get_virtual_camera(s, e);
     if (!vc || !vc->active) return;
+    if (!jce_scene_component_enabled(s, e, JCE_COMP_FLAG_VIRTUAL_CAMERA)) return;
     if (ctx->have_winner && vc->priority <= ctx->best_priority) return;
     ctx->have_winner   = 1;
     ctx->best_priority = vc->priority;
@@ -94,6 +141,15 @@ jce_vcam_system_evaluate(JceScene      *scene,
     if (out_has_active) *out_has_active = false;
     if (!scene || !out) return;
 
+    /* Always advance the shake clock so trauma decays even while NO vcam is
+     * active.  Otherwise trauma added with no live camera (the header documents
+     * a no-op in that state) would be retained and fire at full strength the
+     * moment a camera becomes active later.  The decay is cheap and trauma 0 is
+     * a no-op, so this is safe to run unconditionally. */
+    vcam_shake_ensure_init();
+    if (dt > 0.0f)
+        jce_camera_shake_update(&s_shake, dt);
+
     PickCtx ctx = { scene, 0, 0, {{0}} };
     jce_scene_each_entity(scene, pick_cb, &ctx);
     if (!ctx.have_winner) {
@@ -129,5 +185,21 @@ jce_vcam_system_evaluate(JceScene      *scene,
     }
 
     *out = s_state.cur;
+
+    /* Trauma shake (gap 6.5): ADD the bounded offset onto the resolved pose.
+     * The shake clock was already advanced above (so trauma decays even with no
+     * active vcam).  jce_camera_shake_offset is exactly zero at trauma 0 and
+     * bounded by the configured max amplitude, so a settled camera is untouched
+     * and an active one shakes within a known envelope.  We apply the
+     * positional offset to out->position (JceVcamOutput carries no rotation
+     * channel); the computed euler is currently unused. */
+    if (jce_camera_shake_active(&s_shake)) {
+        float shake_pos[3];
+        jce_camera_shake_offset(&s_shake, shake_pos, NULL);
+        out->position[0] += shake_pos[0];
+        out->position[1] += shake_pos[1];
+        out->position[2] += shake_pos[2];
+    }
+
     if (out_has_active) *out_has_active = true;
 }

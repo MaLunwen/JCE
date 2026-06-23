@@ -19,6 +19,8 @@
 #include "core/jce_editor_game_l10n.h"
 #include "core/jce_editor_project.h"
 #include "core/jce_pak_key.h"
+#include "core/jce_project_settings.h"
+#include "core/jce_editor_config.h"
 
 #include <vector>
 
@@ -80,6 +82,39 @@ void set_current_project_root(const char *path)
         const char *src = (jp && jp->source_assets && jp->source_assets[0])
                           ? jp->source_assets : "assets";
         jce_editor_gl10n_load(s_current_project_root, src);
+    }
+
+    /* Reload project settings for the newly opened root and write through
+     * to live engine subsystems.  jce_project_settings_load now resolves
+     * <root>/.jce/project-settings.json (see jce_project_settings.cpp), so
+     * switching projects in-session picks up the right file instead of
+     * keeping the previously opened project's cached settings. */
+    {
+        JceProjectSettings ps;
+        jce_project_settings_load(&ps);   /* caches into the module snapshot */
+        jce_project_settings_apply(&ps);
+
+        /* One-time forward-migration of the legacy PROJECT-scoped external
+         * editor paths into per-user Preferences > External Tools (they used
+         * to live in project-settings.json).  Adopt only when the user has
+         * no preference set yet, so a value entered in Preferences is never
+         * overwritten.  After this, the project copy stops being written. */
+        if (ps.editor.external_script_editor[0] || ps.editor.external_image_editor[0]) {
+            JceEditorConfig cfg;
+            jce_editor_config_load(&cfg);
+            bool changed = false;
+            if (!cfg.external_script_editor[0] && ps.editor.external_script_editor[0]) {
+                snprintf(cfg.external_script_editor, sizeof(cfg.external_script_editor),
+                         "%s", ps.editor.external_script_editor);
+                changed = true;
+            }
+            if (!cfg.external_image_editor[0] && ps.editor.external_image_editor[0]) {
+                snprintf(cfg.external_image_editor, sizeof(cfg.external_image_editor),
+                         "%s", ps.editor.external_image_editor);
+                changed = true;
+            }
+            if (changed) jce_editor_config_save(&cfg);
+        }
     }
 }
 
@@ -823,8 +858,9 @@ void jce_editor_dialog_open_project(bool *p_open)
     snprintf(_lbl, sizeof(_lbl), "%s###op_browse",
              jce_editor_i18n("openProject.browse"));
     if (ImGui::Button(_lbl, ImVec2(80, 0))) {
-        /* Async dispatch.  Flags are written from the SDL UI thread when
-           the dialog returns; we observe them in subsequent frames. */
+        /* Async dispatch.  Flags are written by the shared main-thread
+           pump when the native dialog returns; we observe them in
+           subsequent frames. */
         s_open_project.pick_ready     = false;
         s_open_project.pick_cancelled = false;
         pick_folder_dialog_async(jce_editor_i18n("openProject.selectFolder"),

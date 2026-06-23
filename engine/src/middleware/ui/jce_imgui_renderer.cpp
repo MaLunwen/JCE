@@ -24,7 +24,6 @@ extern "C" {
 
 static struct {
     bgfx_program_handle_t  program;
-    bgfx_texture_handle_t  font_texture;
     bgfx_uniform_handle_t  tex_uniform;
     bgfx_vertex_layout_t   vertex_layout;
     uint8_t                view_id;
@@ -33,27 +32,98 @@ static struct {
 
 /* Ortho projection now delegates to engine API (jce_m4_ortho). */
 
-/* ── Font atlas ────────────────────────────────────────────────────── */
+/* ── Dynamic textures (ImGui 1.92 RendererHasTextures) ──────────────────
+ * ImGui 1.92 owns the font atlas as one or more ImTextureData objects and
+ * rasterizes glyphs ON DEMAND (no upfront full-atlas bake).  Each frame the
+ * backend services create/update/destroy requests carried in
+ * ImDrawData::Textures.  This removes the ~hundreds-of-ms startup cost of
+ * baking every CJK/Korean glyph that the editor might never draw — they are
+ * now rasterized only when first displayed.  The bgfx texture handle index
+ * is stored verbatim in ImTextureData::TexID (same encoding the editor uses
+ * for app textures via ImGui::Image), so the draw loop binding is unchanged. */
 
-static void create_font_texture(void)
+/* ImGui 1.92 stores a bgfx texture handle idx in ImTextureID, but
+ * ImTextureID_Invalid == 0 collides with the perfectly valid bgfx idx 0
+ * (first allocated handle).  Encode every idx as (idx+1) and decode (id-1) so
+ * 0 stays reserved for "no texture" — otherwise a font atlas / app texture
+ * landing on idx 0 would leak (never freed), corrupt bgfx handle 0 on update,
+ * or trip ImGui's GetTexID assert (audit Round-3 P2-B).  Editor ImGui::Image()
+ * producers apply the same +1 at their end. */
+static inline ImTextureID imtex_from_bgfx(uint16_t idx)
 {
-    ImGuiIO &io = ImGui::GetIO();
-    unsigned char *pixels;
-    int width, height;
-    io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+    return (ImTextureID)(uintptr_t)((uint32_t)idx + 1u);
+}
+static inline uint16_t imtex_to_bgfx(ImTextureID id)
+{
+    return id == ImTextureID_Invalid ? (uint16_t)UINT16_MAX
+                                     : (uint16_t)((uintptr_t)id - 1u);
+}
 
-    const bgfx_memory_t *mem =
-        bgfx_copy(pixels, (uint32_t)(width * height * 4));
+static void destroy_imgui_texture(ImTextureData *tex)
+{
+    bgfx_texture_handle_t h;
+    h.idx = imtex_to_bgfx(tex->GetTexID());
+    if (h.idx != UINT16_MAX)
+        bgfx_destroy_texture(h);
+    tex->SetTexID(ImTextureID_Invalid);
+    tex->SetStatus(ImTextureStatus_Destroyed);
+}
 
-    s_ctx.font_texture = bgfx_create_texture_2d(
-        (uint16_t)width, (uint16_t)height,
-        false, 1,
-        BGFX_TEXTURE_FORMAT_RGBA8,
-        BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT |
-        BGFX_SAMPLER_MIP_POINT,
-        mem);
-
-    io.Fonts->SetTexID((ImTextureID)(uintptr_t)s_ctx.font_texture.idx);
+static void update_imgui_texture(ImTextureData *tex)
+{
+    if (tex->Status == ImTextureStatus_WantCreate) {
+        /* Re-create path (e.g. the atlas grew to fit more on-demand glyphs):
+           free the previous GPU texture first. */
+        if (tex->GetTexID() != ImTextureID_Invalid) {
+            bgfx_texture_handle_t old;
+            old.idx = imtex_to_bgfx(tex->GetTexID());
+            if (old.idx != UINT16_MAX) bgfx_destroy_texture(old);
+            tex->SetTexID(ImTextureID_Invalid);
+        }
+        /* Create the atlas texture MUTABLE (_mem == NULL): a bgfx texture
+           created WITH _mem is IMMUTABLE and cannot be updated, which would
+           leave every glyph rasterized AFTER this first upload (on-demand
+           WantUpdates: menus, dialogs, newly shown text) blank.  Create empty,
+           then upload the full current contents via an update.  ImGui's
+           default font format is RGBA32 → bgfx RGBA8. */
+        bgfx_texture_handle_t h = bgfx_create_texture_2d(
+            (uint16_t)tex->Width, (uint16_t)tex->Height,
+            false, 1,
+            BGFX_TEXTURE_FORMAT_RGBA8,
+            BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT |
+            BGFX_SAMPLER_MIP_POINT,
+            NULL);
+        const bgfx_memory_t *mem =
+            bgfx_copy(tex->GetPixels(), (uint32_t)tex->GetSizeInBytes());
+        bgfx_update_texture_2d(h, 0, 0, 0, 0,
+            (uint16_t)tex->Width, (uint16_t)tex->Height, mem, UINT16_MAX);
+        tex->SetTexID(imtex_from_bgfx(h.idx));
+        tex->SetStatus(ImTextureStatus_OK);
+    } else if (tex->Status == ImTextureStatus_WantUpdates) {
+        /* Re-upload the bounding box of all queued sub-rect updates (glyphs
+         * newly rasterized this frame).  Pack the rect's rows tightly into a
+         * bgfx buffer (the source Pixels are full-atlas-width strided). */
+        bgfx_texture_handle_t h;
+        h.idx = imtex_to_bgfx(tex->GetTexID());
+        const ImTextureRect &r = tex->UpdateRect;
+        if (h.idx != UINT16_MAX && r.w > 0 && r.h > 0) {
+            const uint32_t bpp   = (uint32_t)tex->BytesPerPixel;
+            const uint32_t pitch = (uint32_t)r.w * bpp;
+            const bgfx_memory_t *mem = bgfx_alloc(pitch * (uint32_t)r.h);
+            for (int row = 0; row < r.h; ++row) {
+                memcpy(mem->data + (uint32_t)row * pitch,
+                       tex->GetPixelsAt(r.x, r.y + row),
+                       pitch);
+            }
+            bgfx_update_texture_2d(h, 0, 0,
+                (uint16_t)r.x, (uint16_t)r.y,
+                (uint16_t)r.w, (uint16_t)r.h, mem, UINT16_MAX);
+        }
+        tex->SetStatus(ImTextureStatus_OK);
+    } else if (tex->Status == ImTextureStatus_WantDestroy &&
+               tex->UnusedFrames > 0) {
+        destroy_imgui_texture(tex);
+    }
 }
 
 /* ── Public API ────────────────────────────────────────────────────── */
@@ -89,12 +159,15 @@ bool jce_imgui_renderer_init(const JcePakArchive *pak, uint8_t view_id)
         BGFX_ATTRIB_TYPE_UINT8, true, false);
     bgfx_vertex_layout_end(&s_ctx.vertex_layout);
 
-    /* Create default font atlas texture. */
-    create_font_texture();
-
-    /* Tell ImGui we can handle per-draw VtxOffset (needed for
-       reordered draw commands such as modal dim overlays). */
+    /* Tell ImGui we can handle per-draw VtxOffset (reordered draw commands
+       such as modal dim overlays) AND dynamic textures (ImGui 1.92 creates,
+       updates and destroys the font atlas on demand via ImDrawData::Textures
+       — no upfront full-atlas bake; glyphs rasterize when first drawn).
+       With RendererHasTextures set, the font texture is created lazily on
+       the first frame's update_imgui_texture(), so there is no
+       create_font_texture() call here anymore. */
     ImGui::GetIO().BackendFlags |= ImGuiBackendFlags_RendererHasVtxOffset;
+    ImGui::GetIO().BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
 
     s_ctx.initialized = true;
     LOG_SUCCESS(LOG_TAG, "initialized (view %u)", view_id);
@@ -105,15 +178,22 @@ void jce_imgui_renderer_shutdown(void)
 {
     if (!s_ctx.initialized) return;
 
-    if (s_ctx.font_texture.idx != UINT16_MAX)
-        bgfx_destroy_texture(s_ctx.font_texture);
+    /* Destroy any GPU textures ImGui created (font atlas + any others on its
+       texture list).  Guarded on a live context. */
+    if (ImGui::GetCurrentContext() != NULL) {
+        ImGuiPlatformIO &pio = ImGui::GetPlatformIO();
+        for (ImTextureData *tex : pio.Textures) {
+            if (tex && tex->GetTexID() != ImTextureID_Invalid)
+                destroy_imgui_texture(tex);
+        }
+    }
+
     if (s_ctx.tex_uniform.idx != UINT16_MAX)
         bgfx_destroy_uniform(s_ctx.tex_uniform);
     if (s_ctx.program.idx != UINT16_MAX)
         bgfx_destroy_program(s_ctx.program);
 
     memset(&s_ctx, 0, sizeof(s_ctx));
-    s_ctx.font_texture.idx = UINT16_MAX;
     s_ctx.tex_uniform.idx  = UINT16_MAX;
     s_ctx.program.idx      = UINT16_MAX;
     s_ctx.initialized      = false;
@@ -145,7 +225,21 @@ void jce_imgui_renderer_draw(void)
     if (!s_ctx.initialized) return;
 
     ImDrawData *draw_data = ImGui::GetDrawData();
-    if (!draw_data || draw_data->TotalVtxCount == 0)
+    if (!draw_data)
+        return;
+
+    /* Service ImGui 1.92 dynamic-texture requests (create/update/destroy)
+       BEFORE submitting draw commands that reference them — the font atlas
+       grows here as new glyphs are rasterized on demand.  Must run even when
+       there are no vertices yet (the very first frame creates the atlas). */
+    if (draw_data->Textures != NULL) {
+        for (ImTextureData *tex : *draw_data->Textures) {
+            if (tex->Status != ImTextureStatus_OK)
+                update_imgui_texture(tex);
+        }
+    }
+
+    if (draw_data->TotalVtxCount == 0)
         return;
 
     for (int n = 0; n < draw_data->CmdListsCount; n++) {
@@ -204,7 +298,7 @@ void jce_imgui_renderer_draw(void)
 
             /* Bind texture. */
             bgfx_texture_handle_t tex;
-            tex.idx = (uint16_t)(uintptr_t)pcmd->GetTexID();
+            tex.idx = imtex_to_bgfx(pcmd->GetTexID());
             bgfx_set_texture(
                 0, s_ctx.tex_uniform, tex, UINT32_MAX);
 
@@ -236,11 +330,10 @@ void jce_imgui_renderer_draw(void)
 
 void jce_imgui_renderer_rebuild_fonts(void)
 {
-    if (!s_ctx.initialized) return;
-
-    if (s_ctx.font_texture.idx != UINT16_MAX) {
-        bgfx_destroy_texture(s_ctx.font_texture);
-        s_ctx.font_texture.idx = UINT16_MAX;
-    }
-    create_font_texture();
+    /* No-op under ImGui 1.92 dynamic textures: changing the atlas (Clear +
+       AddFont in jce_editor_load_fonts) automatically marks the old font
+       ImTextureData WantDestroy and the new one WantCreate, which the next
+       frame's update_imgui_texture() services.  Kept for API compatibility
+       with callers (e.g. font/locale changes). */
+    (void)s_ctx;
 }

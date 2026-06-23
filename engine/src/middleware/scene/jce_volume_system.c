@@ -20,6 +20,7 @@
  */
 
 #include <jce/middleware/scene/jce_scene.h>
+#include <jce/middleware/scene/jce_component_registry.h>  /* per-component disable gate */
 #include <jce/os/core/jce_math.h>
 #include <jce/renderer/jce_postfx.h>
 
@@ -119,6 +120,9 @@ static void volume_entity_cb(JceScene *s, JceEntity e, void *ud)
 
     const JceVolumeComponent *vol = jce_scene_get_volume(s, e);
     if (!vol) return;
+    { static int s_vol_cid = -2;
+      if (s_vol_cid == -2) s_vol_cid = jce_component_find("Volume");
+      if (s_vol_cid >= 0 && !jce_scene_comp_enabled(s, e, s_vol_cid)) return; }
 
     float t;
 

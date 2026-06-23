@@ -8,6 +8,7 @@
 #include <jce/os/core/jce_thread.h>
 #include <jce/os/core/jce_timer.h>
 #include <jce/os/core/jce_allocator.h>
+#include <jce/os/platform/jce_library.h>
 #include <jce/os/platform/jce_window.h>
 #include <jce/renderer/jce_camera.h>
 #include <jce/renderer/jce_pbr_material.h>
@@ -129,10 +130,9 @@ bool jce_renderer_is_egl_hung(void)
 bool jce_renderer_is_egl_hung(void) { return false; }
 #endif /* JCE_PLATFORM_ANDROID */
 #if JCE_PLATFORM_WINDOWS
-/* Windows backend probe uses SDL_LoadObject for vulkan/d3d DLL presence —
- * keeps <windows.h> out of engine sources. */
+/* Backend probe uses jce_library_exists (SDL_LoadObject) for vulkan/d3d
+ * library presence — keeps <windows.h> and <dlfcn.h> out of engine sources. */
 #else
-#include <dlfcn.h>
 #include <setjmp.h>
 #include <signal.h>
 #if JCE_PLATFORM_ANDROID
@@ -154,6 +154,14 @@ struct JceRenderer {
     bgfx_program_handle_t program_pbr;
     bgfx_program_handle_t program_pbr_inst;     /* GPU-instanced PBR */
     bgfx_program_handle_t program_pbr_skinned;
+    /* Forward+ clustered fragment variants (fs_pbr_fwdplus). */
+    bgfx_program_handle_t program_pbr_fwdplus;
+    bgfx_program_handle_t program_pbr_inst_fwdplus;
+    bgfx_program_handle_t program_pbr_skinned_fwdplus;
+    /* When true, jce_renderer_get_program_pbr* return the fwdplus variant
+     * (if it loaded).  Set per-frame by the scene renderer from the
+     * r.forwardplus cvar; default false => unchanged non-variant programs. */
+    bool                  forwardplus_program_active;
     bgfx_program_handle_t program_shadow;
     bgfx_program_handle_t program_shadow_inst;     /* GPU-instanced shadow */
     bgfx_program_handle_t program_shadow_skinned;
@@ -176,23 +184,17 @@ static bool s_dbg_text_enabled = false;
  * ─────────────────────────────────────────────────────────────────*/
 #if JCE_PLATFORM_WINDOWS
 
-static bool s_win32_probe_dll(const char *dll)
-{
-    SDL_SharedObject *h = SDL_LoadObject(dll);
-    if (!h) return false;
-    SDL_UnloadObject(h);
-    return true;
-}
-
 static bool backend_probe(bgfx_renderer_type_t type)
 {
     switch (type) {
     case BGFX_RENDERER_TYPE_VULKAN:
-        return s_win32_probe_dll("vulkan-1.dll");
+        /* Loader must export its entry point, not merely map — a stub
+         * vulkan-1.dll without a real ICD behind it is reported unusable. */
+        return jce_library_has_symbol("vulkan-1.dll", "vkGetInstanceProcAddr");
     case BGFX_RENDERER_TYPE_DIRECT3D12:
-        return s_win32_probe_dll("d3d12.dll");
+        return jce_library_exists("d3d12.dll");
     case BGFX_RENDERER_TYPE_DIRECT3D11:
-        return s_win32_probe_dll("d3d11.dll");
+        return jce_library_exists("d3d11.dll");
     default:
         return true;
     }
@@ -230,50 +232,44 @@ static bool s_probe_vulkan(void)
     }
 #endif
 
-    /* Try to load the Vulkan loader and exercise the very first API call.
-     * If the library is absent or the call crashes (e.g. WSA/Houdini on
-     * Android), we catch the signal here and return false so the fallback
-     * chain can continue to the next backend (OpenGL ES, OpenGL, …). */
+    /* Probe the Vulkan loader via the os/platform library wrapper
+     * (SDL_LoadObject/SDL_LoadFunction under the hood — no raw dlopen/dlsym).
+     * We require the loader to export vkGetInstanceProcAddr, not merely map,
+     * so a stub/forwarder library is skipped to the next backend.  We keep
+     * the SIGSEGV-trap scaffold around the load so a crash inside a broken
+     * loader (e.g. WSA/Houdini on Android) is caught here on the clean
+     * main-thread stack rather than later in bgfx's render thread. */
 #if JCE_PLATFORM_APPLE
-    void *lib = dlopen("libMoltenVK.dylib",      RTLD_NOW | RTLD_LOCAL);
-    if (!lib) lib = dlopen("libvulkan.1.dylib",  RTLD_NOW | RTLD_LOCAL);
-    if (!lib) lib = dlopen("@rpath/libvulkan.1.dylib", RTLD_NOW | RTLD_LOCAL);
+    static const char *const kVkLibs[] = {
+        "libMoltenVK.dylib", "libvulkan.1.dylib", "@rpath/libvulkan.1.dylib", NULL
+    };
 #else
-    void *lib = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
-    if (!lib) lib = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+    static const char *const kVkLibs[] = { "libvulkan.so.1", "libvulkan.so", NULL };
 #endif
-    if (!lib) {
-        LOG_INFO(LOG_TAG, "Vulkan probe: library not found, skipping");
-        return false;
-    }
-
-    typedef int32_t (*PFN_vkEnumInstExt)(const char *, uint32_t *, void *);
-    PFN_vkEnumInstExt fn =
-        (PFN_vkEnumInstExt)dlsym(lib, "vkEnumerateInstanceExtensionProperties");
 
     bool ok = false;
-    if (fn) {
-        struct sigaction sa, old_sa;
-        memset(&sa, 0, sizeof(sa));
-        sa.sa_sigaction = s_probe_sigsegv;
-        sa.sa_flags     = SA_SIGINFO;
-        sigemptyset(&sa.sa_mask);
-        sigaction(SIGSEGV, &sa, &old_sa);
+    struct sigaction sa, old_sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = s_probe_sigsegv;
+    sa.sa_flags     = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &old_sa);
 
-        if (sigsetjmp(s_probe_jmp, 1) == 0) {
-            uint32_t count = 0;
-            ok = (fn(NULL, &count, NULL) == 0); /* VK_SUCCESS == 0 */
-        } else {
-            LOG_WARN(LOG_TAG,
-                "Vulkan probe: vkEnumerateInstanceExtensionProperties crashed "
-                "— driver not usable on this device");
+    if (sigsetjmp(s_probe_jmp, 1) == 0) {
+        for (size_t i = 0; kVkLibs[i]; ++i) {
+            if (jce_library_has_symbol(kVkLibs[i], "vkGetInstanceProcAddr")) { ok = true; break; }
         }
-
-        sigaction(SIGSEGV, &old_sa, NULL);
+    } else {
+        LOG_WARN(LOG_TAG,
+            "Vulkan probe: Vulkan loader crashed on load "
+            "— driver not usable on this device");
+        ok = false;
     }
 
-    dlclose(lib);
+    sigaction(SIGSEGV, &old_sa, NULL);
+
     if (ok) LOG_INFO(LOG_TAG, "Vulkan probe: OK");
+    else    LOG_INFO(LOG_TAG, "Vulkan probe: library not found, skipping");
     return ok;
 }
 
@@ -841,6 +837,9 @@ JceRenderer *jce_renderer_create(JceWindow *win,
     r->program_pbr.idx          = UINT16_MAX;
     r->program_pbr_inst.idx     = UINT16_MAX;
     r->program_pbr_skinned.idx  = UINT16_MAX;
+    r->program_pbr_fwdplus.idx         = UINT16_MAX;
+    r->program_pbr_inst_fwdplus.idx    = UINT16_MAX;
+    r->program_pbr_skinned_fwdplus.idx = UINT16_MAX;
     r->program_shadow.idx       = UINT16_MAX;
     r->program_shadow_inst.idx  = UINT16_MAX;
     r->program_shadow_skinned.idx = UINT16_MAX;
@@ -881,6 +880,9 @@ void jce_renderer_set_shaders(JceRenderer *r,
     r->program_pbr = (bgfx_program_handle_t){ shaders->pbr.idx };
     r->program_pbr_inst = (bgfx_program_handle_t){ shaders->pbr_inst.idx };
     r->program_pbr_skinned = (bgfx_program_handle_t){ shaders->pbr_skinned.idx };
+    r->program_pbr_fwdplus = (bgfx_program_handle_t){ shaders->pbr_fwdplus.idx };
+    r->program_pbr_inst_fwdplus = (bgfx_program_handle_t){ shaders->pbr_inst_fwdplus.idx };
+    r->program_pbr_skinned_fwdplus = (bgfx_program_handle_t){ shaders->pbr_skinned_fwdplus.idx };
     r->program_shadow = (bgfx_program_handle_t){ shaders->shadow.idx };
     r->program_shadow_inst = (bgfx_program_handle_t){ shaders->shadow_inst.idx };
     r->program_shadow_skinned = (bgfx_program_handle_t){ shaders->shadow_skinned.idx };
@@ -902,6 +904,8 @@ bool jce_renderer_reload_shaders_fs(JceRenderer        *r,
     bgfx_program_handle_t old[] = {
         r->program, r->program_textured, r->program_mesh,
         r->program_pbr, r->program_pbr_inst, r->program_pbr_skinned,
+        r->program_pbr_fwdplus, r->program_pbr_inst_fwdplus,
+        r->program_pbr_skinned_fwdplus,
         r->program_shadow, r->program_shadow_inst, r->program_shadow_skinned,
         r->program_terrain,
     };
@@ -913,6 +917,8 @@ bool jce_renderer_reload_shaders_fs(JceRenderer        *r,
         bgfx_program_handle_t parts[] = {
             { ns.color.idx }, { ns.textured.idx }, { ns.mesh.idx },
             { ns.pbr.idx }, { ns.pbr_inst.idx }, { ns.pbr_skinned.idx },
+            { ns.pbr_fwdplus.idx }, { ns.pbr_inst_fwdplus.idx },
+            { ns.pbr_skinned_fwdplus.idx },
             { ns.shadow.idx }, { ns.shadow_inst.idx }, { ns.shadow_skinned.idx },
             { ns.terrain.idx },
         };
@@ -1146,6 +1152,12 @@ void jce_renderer_destroy(JceRenderer *r)
         bgfx_destroy_program(r->program_pbr_inst);
     if (r->program_pbr_skinned.idx != UINT16_MAX)
         bgfx_destroy_program(r->program_pbr_skinned);
+    if (r->program_pbr_fwdplus.idx != UINT16_MAX)
+        bgfx_destroy_program(r->program_pbr_fwdplus);
+    if (r->program_pbr_inst_fwdplus.idx != UINT16_MAX)
+        bgfx_destroy_program(r->program_pbr_inst_fwdplus);
+    if (r->program_pbr_skinned_fwdplus.idx != UINT16_MAX)
+        bgfx_destroy_program(r->program_pbr_skinned_fwdplus);
     if (r->program_shadow.idx != UINT16_MAX)
         bgfx_destroy_program(r->program_shadow);
     if (r->program_shadow_inst.idx != UINT16_MAX)
@@ -1517,6 +1529,9 @@ JceShaderHandle jce_renderer_get_program_pbr(const JceRenderer *r)
 {
     JceShaderHandle invalid = JCE_INVALID_SHADER;
     if (!r) return invalid;
+    if (r->forwardplus_program_active &&
+        r->program_pbr_fwdplus.idx != UINT16_MAX)
+        return (JceShaderHandle){ r->program_pbr_fwdplus.idx };
     return (JceShaderHandle){ r->program_pbr.idx };
 }
 
@@ -1564,6 +1579,9 @@ JceShaderHandle jce_renderer_get_program_pbr_inst(const JceRenderer *r)
 {
     JceShaderHandle invalid = JCE_INVALID_SHADER;
     if (!r) return invalid;
+    if (r->forwardplus_program_active &&
+        r->program_pbr_inst_fwdplus.idx != UINT16_MAX)
+        return (JceShaderHandle){ r->program_pbr_inst_fwdplus.idx };
     return (JceShaderHandle){ r->program_pbr_inst.idx };
 }
 
@@ -1571,7 +1589,41 @@ JceShaderHandle jce_renderer_get_program_pbr_skinned(const JceRenderer *r)
 {
     JceShaderHandle invalid = JCE_INVALID_SHADER;
     if (!r) return invalid;
+    if (r->forwardplus_program_active &&
+        r->program_pbr_skinned_fwdplus.idx != UINT16_MAX)
+        return (JceShaderHandle){ r->program_pbr_skinned_fwdplus.idx };
     return (JceShaderHandle){ r->program_pbr_skinned.idx };
+}
+
+void jce_renderer_set_forwardplus_program_active(JceRenderer *r, bool active)
+{
+    if (r) r->forwardplus_program_active = active;
+}
+
+bool jce_renderer_get_forwardplus_program_active(const JceRenderer *r)
+{
+    return r ? r->forwardplus_program_active : false;
+}
+
+JceShaderHandle jce_renderer_get_program_pbr_fwdplus(const JceRenderer *r)
+{
+    JceShaderHandle invalid = JCE_INVALID_SHADER;
+    if (!r) return invalid;
+    return (JceShaderHandle){ r->program_pbr_fwdplus.idx };
+}
+
+JceShaderHandle jce_renderer_get_program_pbr_inst_fwdplus(const JceRenderer *r)
+{
+    JceShaderHandle invalid = JCE_INVALID_SHADER;
+    if (!r) return invalid;
+    return (JceShaderHandle){ r->program_pbr_inst_fwdplus.idx };
+}
+
+JceShaderHandle jce_renderer_get_program_pbr_skinned_fwdplus(const JceRenderer *r)
+{
+    JceShaderHandle invalid = JCE_INVALID_SHADER;
+    if (!r) return invalid;
+    return (JceShaderHandle){ r->program_pbr_skinned_fwdplus.idx };
 }
 
 JceShaderHandle jce_renderer_get_program_shadow(const JceRenderer *r)
@@ -1702,6 +1754,28 @@ void jce_renderer_set_vsync(JceRenderer *r, bool enabled)
 {
     const bgfx_stats_t *stats = bgfx_get_stats();
     jce_renderer_set_vsync_for_size(r, enabled, stats->width, stats->height);
+}
+
+/* Multisample anti-aliasing.  `samples` 0/1 = off, else snapped to 2/4/8/16.
+ * Toggles the MSAA field of the swapchain reset flags + triggers a GPU reset —
+ * the same mechanism as vsync, so a shipped game can honor the authored
+ * Project Settings > Graphics MSAA level (applied from render_settings.json). */
+void jce_renderer_set_msaa(JceRenderer *r, int samples)
+{
+    if (!r || r->is_fallback) return;
+    uint32_t msaa = BGFX_RESET_NONE;
+    if      (samples >= 16) msaa = BGFX_RESET_MSAA_X16;
+    else if (samples >= 8)  msaa = BGFX_RESET_MSAA_X8;
+    else if (samples >= 4)  msaa = BGFX_RESET_MSAA_X4;
+    else if (samples >= 2)  msaa = BGFX_RESET_MSAA_X2;
+    /* The MSAA level is a multi-bit field; clear it before OR-ing the new one. */
+    const uint32_t msaa_mask = BGFX_RESET_MSAA_X2 | BGFX_RESET_MSAA_X4 |
+                               BGFX_RESET_MSAA_X8 | BGFX_RESET_MSAA_X16;
+    uint32_t want = (r->reset_flags & ~msaa_mask) | msaa;
+    if (want == r->reset_flags) return;
+    r->reset_flags = want;
+    const bgfx_stats_t *stats = bgfx_get_stats();
+    bgfx_reset(stats->width, stats->height, r->reset_flags, BGFX_TEXTURE_FORMAT_COUNT);
 }
 
 void jce_renderer_set_backbuffer_capture(JceRenderer *r, bool enable)

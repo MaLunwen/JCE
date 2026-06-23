@@ -30,13 +30,14 @@ include_guard(GLOBAL)
 # ------------------------------------------------------------------ #
 # _jce_embed_pak_key(<target>)                                        #
 #                                                                     #
-# Links the embedded asset-decryption key TU into <target>.  Editor-  #
-# driven builds pass the generated source through                     #
+# Links the embedded asset-decryption key TU into <target> when the   #
+# editor-driven build provides one through                            #
 # JCE_PROJECT_PREBUILT_PAK_KEY_C (jce_generated/jce_pak_key.c, two    #
-# XOR shares regenerated per build).  When absent, a zeroed stub is   #
-# linked instead — the exact assets_pak_data stub pattern — so the    #
-# engine's jce_embedded_pak_key_present extern always resolves from   #
-# an exe-level object and unencrypted projects behave unchanged.      #
+# XOR shares regenerated per build).  No stub is linked otherwise:    #
+# the engine library carries WEAK zeroed defaults                     #
+# (jce_pak_key_default.c), which the strong generated TU overrides    #
+# cleanly even under /WHOLEARCHIVE — a per-target stub here would     #
+# itself collide with the whole-archived library member (LNK2005).    #
 # Idempotent per target.                                              #
 # ------------------------------------------------------------------ #
 function(_jce_embed_pak_key TARGET)
@@ -51,15 +52,7 @@ function(_jce_embed_pak_key TARGET)
 		set_source_files_properties("${JCE_PROJECT_PREBUILT_PAK_KEY_C}"
 			PROPERTIES GENERATED TRUE)
 		target_sources(${TARGET} PRIVATE "${JCE_PROJECT_PREBUILT_PAK_KEY_C}")
-		return()
 	endif()
-
-	set(_key_stub "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}_pak_key_stub.c")
-	file(WRITE "${_key_stub}"
-		"/* Auto-generated: no asset encryption key for this build. */\n"
-		"const unsigned char jce_embedded_pak_key_shares[64] = {0};\n"
-		"const int           jce_embedded_pak_key_present    = 0;\n")
-	target_sources(${TARGET} PRIVATE "${_key_stub}")
 endfunction()
 
 function(jce_target_embed_pak TARGET)

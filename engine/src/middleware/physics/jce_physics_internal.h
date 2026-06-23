@@ -153,6 +153,8 @@ void jce_bullet_body_apply_impulse_at_point(JceBulletWorld *bw, uint32_t idx,
 /* Per-body gravity (scales the world gravity vector) and runtime mass. */
 void jce_bullet_body_set_gravity_factor(JceBulletWorld *bw, uint32_t idx,
                                         float factor);
+void jce_bullet_body_set_angular_factor(JceBulletWorld *bw, uint32_t idx,
+                                        jce_vec3 factor);
 void jce_bullet_body_set_mass(JceBulletWorld *bw, uint32_t idx, float mass);
 
 /* Runtime collider scale: sets the shape's local scaling, recomputes inertia
@@ -314,6 +316,25 @@ uint32_t jce_bullet_constraint_create(JceBulletWorld *bw,
 void jce_bullet_constraint_destroy(JceBulletWorld *bw, uint32_t idx);
 void jce_bullet_constraint_set_limits(JceBulletWorld *bw, uint32_t idx,
                                        float lower, float upper);
+
+/* Configurable joint (Unity-style per-axis 6DOF).  Stored in the SAME
+ * constraint registry as jce_bullet_constraint_create; the returned slot is
+ * destroyed via jce_bullet_constraint_destroy.  lin_motion/ang_motion entries
+ * are 0=locked 1=limited 2=free; limits are symmetric (±linear_limit metres,
+ * ±angular_limit_rad[axis] radians). */
+uint32_t jce_bullet_configurable_joint_create(JceBulletWorld *bw,
+                                               uint32_t body_a, uint32_t body_b,
+                                               jce_vec3 anchor_a,
+                                               jce_vec3 anchor_b,
+                                               const int lin_motion[3],
+                                               const int ang_motion[3],
+                                               float linear_limit,
+                                               const float angular_limit_rad[3],
+                                               bool disable_collision);
+
+/* Last-step applied-impulse magnitude of constraint slot `idx`, or 0 when the
+ * slot is dead/invalid. */
+float jce_bullet_constraint_applied_impulse(JceBulletWorld *bw, uint32_t idx);
 
 /* ================================================================== */
 /* Joint introspection (P3-C.6 — editor gizmo)                         */

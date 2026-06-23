@@ -60,6 +60,48 @@ JCE_API bool jce_model_importer_load_cpu_file(const char          *file_path,
                                               JceModelCpuMeshData *out);
 JCE_API void jce_model_importer_free_cpu(JceModelCpuMeshData *data);
 
+/* ─── Skinned / animated model import (FBX, DAE, …) ────────────────
+ *
+ * The loaders above flatten the node hierarchy (aiProcess_PreTransformVertices)
+ * and emit a STATIC mesh only — they discard bones, skin weights, and
+ * animations.  These entry points instead extract a full skeletal model
+ * (skeleton + skinned vertices + animation clips) into the SAME JceModel the
+ * glTF runtime loader produces, so the renderer / animation system consume it
+ * unchanged.  Detection is automatic: a scene with no bones falls back to a
+ * static single-node model, so a non-skinned FBX/OBJ still loads.
+ *
+ * Two API levels mirror the glTF worker/render-thread split:
+ *   - _decode_skinned_* run the assimp parse + CPU extraction (no GPU / bgfx) and
+ *     return an opaque JceModelCpu intermediate.  Safe on a worker thread (or in
+ *     a headless unit test).  Inspect it via the engine-internal jce_gltf_cpu_*
+ *     accessors, then upload it on the render thread with jce_model_upload_gltf_cpu
+ *     (declared in <jce/renderer/jce_model.h>), which CONSUMES it.  Release an
+ *     un-uploaded result with jce_model_gltf_cpu_free.
+ *   - _load_skinned_* are sync convenience wrappers that decode + upload in one
+ *     call and return a ready JceModel*; they MUST be called on the render thread
+ *     (they create bgfx GPU buffers).  Return NULL on failure.
+ *
+ * The existing static loaders are unchanged. */
+/* These opaque types are also forward-declared by <jce/renderer/jce_model.h>.
+ * Independent guards (matching that header's) so a TU including both does not
+ * hit a duplicate-typedef diagnostic under strict C99. */
+#ifndef JCE_MODEL_FWD_DECLARED
+#define JCE_MODEL_FWD_DECLARED
+typedef struct JceModel    JceModel;
+#endif
+#ifndef JCE_MODELCPU_FWD_DECLARED
+#define JCE_MODELCPU_FWD_DECLARED
+typedef struct JceModelCpu JceModelCpu;
+#endif
+
+JCE_API JceModelCpu *jce_model_importer_decode_skinned_pak(const JcePakArchive *pak,
+                                                           const char *asset_path);
+JCE_API JceModelCpu *jce_model_importer_decode_skinned_file(const char *file_path);
+
+JCE_API JceModel *jce_model_importer_load_skinned_pak(const JcePakArchive *pak,
+                                                      const char *asset_path);
+JCE_API JceModel *jce_model_importer_load_skinned_file(const char *file_path);
+
 /* ─── Per-part extraction (collider cooking) ──────────────────────
  * Unlike the loaders above, this does NOT flatten the node hierarchy.
  * Each scene node that carries geometry becomes one part, named by the

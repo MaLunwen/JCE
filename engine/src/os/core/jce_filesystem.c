@@ -11,7 +11,6 @@
 
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
-#include <jce/resource/jce_pak_loader.h>
 
 #include "jce_memory.h"
 
@@ -19,6 +18,20 @@
 #include <string.h>
 
 #define LOG_TAG "jce_fs"
+
+/* PAK read provider, registered by the resource layer at boot (dependency
+ * inversion — os/core no longer includes resource/jce_pak_loader.h). */
+static const JceFsPakProvider *s_pak_provider = NULL;
+
+void JCE_CALL jce_fs_set_pak_provider(const JceFsPakProvider *provider)
+{
+    s_pak_provider = provider;
+}
+
+const JceFsPakProvider *JCE_CALL jce_fs_get_pak_provider(void)
+{
+    return s_pak_provider;
+}
 
 /* ================================================================== */
 /* Internal types                                                      */
@@ -236,24 +249,26 @@ static JceFile *try_open_physfs(const char *vpath)
 static JceFile *try_open_pak(const JceFileSystem *fs, const char *vpath)
 {
     if (!fs || fs->pak_count == 0) return NULL;
+    const JceFsPakProvider *prov = s_pak_provider;
+    if (!prov || !prov->find) return NULL;   /* no resource provider installed */
 
     for (uint32_t i = 0; i < fs->pak_count; ++i) {
         JcePakArchive *p = fs->paks[i].pak;
         if (!p) continue;
 
-        const JcePakAsset *asset = jce_pak_find(p, vpath);
+        const void *asset = prov->find(p, vpath);
         if (!asset) continue;
 
-        if (asset->original_size > (uint64_t)SIZE_MAX) {
+        uint64_t orig = prov->asset_size(asset);
+        if (orig > (uint64_t)SIZE_MAX) {
             LOG_ERROR(LOG_TAG, "asset too large for address space: %s", vpath);
             return NULL;
         }
 
-        void *buf = JCE_MALLOC((size_t)asset->original_size);
+        void *buf = JCE_MALLOC((size_t)orig);
         if (!buf) return NULL;
 
-        size_t decompressed = jce_pak_decompress(asset, buf,
-                                                 asset->original_size);
+        size_t decompressed = prov->decompress(asset, buf, (size_t)orig);
         if (decompressed == 0) {
             JCE_FREE(buf);
             continue; /* try next pak — corrupt entry shouldn't kill lookup */
@@ -360,11 +375,14 @@ bool jce_fs_exists(const JceFileSystem *fs, const char *virtual_path)
     if (PHYSFS_exists(virtual_path))
         return true;
 
-    /* Check every mounted PAK. */
-    for (uint32_t i = 0; i < fs->pak_count; ++i) {
-        if (fs->paks[i].pak &&
-            jce_pak_find(fs->paks[i].pak, virtual_path) != NULL)
-            return true;
+    /* Check every mounted PAK (via the registered provider). */
+    const JceFsPakProvider *prov = s_pak_provider;
+    if (prov && prov->find) {
+        for (uint32_t i = 0; i < fs->pak_count; ++i) {
+            if (fs->paks[i].pak &&
+                prov->find(fs->paks[i].pak, virtual_path) != NULL)
+                return true;
+        }
     }
     return false;
 }

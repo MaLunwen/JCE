@@ -12,8 +12,10 @@
 extern "C" {
 #endif
 
+#include <jce/os/core/jce_alloc.h>
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_crash_handler.h>
+#include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_defs.h>
 #include <jce/os/core/jce_event.h>
 #include <jce/os/core/jce_filesystem.h>

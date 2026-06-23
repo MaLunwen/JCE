@@ -629,6 +629,15 @@ void draw_asset_item_context_menu(const std::vector<FileEntry> &display_entries)
             }
         }
 
+        if (cfe && cfe->is_dir) {
+            ImGui::Separator();
+            if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.setAsProjectRoot"),
+                                NULL, false,
+                                asset_browser_can_use_root(cfe->path))) {
+                set_asset_browser_simulated_root(cfe->path);
+            }
+        }
+
         /* Scene-only: "Set as Startup Scene" writes the relative path
          * (from <project_root>/<source_assets>/) into jce_project.json
          * so the runtime template auto-loads it on boot. */
@@ -902,6 +911,15 @@ void draw_asset_empty_area_menu(void)
         ImGui::Separator();
         if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.refresh"))) {
             s_assets.needs_refresh = true;
+        }
+        if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.setAsProjectRoot"),
+                            NULL, false,
+                            asset_browser_can_use_root(s_assets.current_path))) {
+            set_asset_browser_simulated_root(s_assets.current_path);
+        }
+        if (s_assets.project_root_simulated &&
+            ImGui::MenuItem(jce_editor_i18n("assetBrowser.restoreProjectRoot"))) {
+            restore_asset_browser_project_root();
         }
         if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInExplorer"))) {
             jce_host_reveal_path(s_assets.current_path.c_str());

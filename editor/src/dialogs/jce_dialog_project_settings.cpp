@@ -14,5 +14,6 @@ extern "C" void jce_editor_dialog_project_settings(bool *p_open)
     if (!p_open || !*p_open) return;
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_PROJECT_SETTINGS);
     if (vis) *vis = true;
+    jce_editor_panel_request_focus("###project_settings");
     *p_open = false;
 }

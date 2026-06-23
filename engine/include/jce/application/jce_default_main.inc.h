@@ -28,6 +28,7 @@
 #include <jce/application/jce_project.h>
 #include <jce/application/jce_runtime.h>
 #include <jce/middleware/audio/jce_audio.h>
+#include <jce/middleware/physics/jce_physics_layers.h>  /* layer matrix load (Top 4) */
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_ui_canvas.h>
 #include <jce/middleware/scene/jce_vcam_system.h>
@@ -37,10 +38,15 @@
 #include <jce/os/platform/jce_input.h>
 #include <jce/os/platform/jce_keys.h>
 #include <jce/os/platform/jce_window.h>
+#include <jce/os/platform/jce_window_event.h>  /* JCE_MOUSE_BUTTON_LEFT */
 #include <jce/renderer/jce_camera.h>
+#include <jce/renderer/jce_lowlevel.h>        /* jce_gfx_caps (homogeneous depth) */
 #include <jce/renderer/jce_mesh.h>
+#include <jce/renderer/jce_offscreen_target.h> /* offscreen scene target (postfx, Top 1) */
+#include <jce/renderer/jce_render_settings.h>  /* project quality settings (Top 5) */
 #include <jce/renderer/jce_renderer.h>
 #include <jce/renderer/jce_scene_renderer.h>
+#include <jce/renderer/jce_texture.h>          /* global mip bias (lod, Top 5) */
 #include <jce/renderer/jce_views.h>
 #include <jce/resource/jce_bundle_loader.h>
 #include <jce/resource/jce_model_importer.h>
@@ -65,7 +71,17 @@ static JceProject       *s_project        = NULL;
 static JceScene         *s_scene          = NULL;
 static JceCamera        *s_camera         = NULL;
 static JceSceneRenderer *s_scene_renderer = NULL;
+/* Offscreen scene target for the authored postfx chain (Top 1).  Created lazily
+ * on the first frame a scene has any active postfx effect; NULL until then so
+ * scenes without postfx stay on the zero-overhead direct-to-backbuffer path. */
+static JceOffscreenTarget *s_post_target  = NULL;
 static JceUICanvas      *s_ui_canvas      = NULL;
+/* Project-wide quality settings (Top 5): loaded once in app_init from the
+ * cooked render_settings.json (build-exported from Project Settings > Quality),
+ * folded into the scene render config as the project DEFAULT.  Per-scene
+ * JceSceneRenderingSettings still override inside the renderer. */
+static JceRenderSettings s_render_settings;
+static bool              s_render_settings_loaded = false;
 static JceFileSystem    *s_bundle_fs      = NULL;
 static JceBundleFile   **s_bundle_files   = NULL;
 static int               s_bundle_count   = 0;
@@ -74,6 +90,12 @@ static const JceServices*s_svc            = NULL;
 static JceRuntime       *s_runtime        = NULL;
 static float             s_last_dt        = 0.016f;
 static bool              s_jump_edge      = false;
+/* FPS-look cursor capture.  Captured (relative mouse + grab) ⇒ mouse drives
+ * camera look and authored UI is presentational.  Tab toggles capture off so
+ * the cursor is freed and in-game UIButtons become clickable (FEATURE 4.1):
+ * while uncaptured we feed a real pointer into the canvas and dispatch clicks
+ * to the gameplay script VM.  Starts captured to preserve the FPS feel. */
+static bool              s_cursor_captured = true;
 /* Open-world chunk streamer — created only when the startup scene's
  * authored streaming settings are enabled (World Streaming panel). */
 static JceWorldStreamer *s_world_streamer = NULL;
@@ -300,6 +322,40 @@ static JceMesh *s_default_load_mesh(const char *path, void *ud)
     return mesh;
 }
 
+/* Renderer anim-event hook → runtime script dispatch (P1 anim-events).  The
+ * scene renderer fires this for every authored animation frame event in the
+ * (prev,cur] clip-time window; we forward it to the firing entity's gameplay
+ * script (on_anim_event) through the runtime.  `user` is the JceRuntime*. */
+static void s_default_anim_event_cb(uint64_t entity, const JceAnimEvent *ev,
+                                    void *user)
+{
+    jce_runtime_dispatch_anim_event((JceRuntime *)user, entity, ev);
+}
+
+/* Renderer anim-state hook → runtime script dispatch (state-enter/exit).  The
+ * scene renderer fires this once whenever a bound animation state machine's
+ * active state changes; we forward it to the entity's gameplay script
+ * (on_state_exit / on_state_enter) through the runtime.  `user` is the
+ * JceRuntime*. */
+static void s_default_anim_state_cb(uint64_t entity, const char *from_state,
+                                    const char *to_state, void *user)
+{
+    jce_runtime_dispatch_anim_state((JceRuntime *)user, entity,
+                                    from_state, to_state);
+}
+
+/* Renderer ground-query hook → runtime physics raycast (Foot IK).  The scene
+ * renderer calls this per foot to find the ground under the ankle. */
+static bool s_default_ground_query_cb(uint64_t entity, const float origin[3],
+                                      const float dir[3], float max_dist,
+                                      float *out_hit_y, float out_normal[3],
+                                      void *user)
+{
+    (void)entity;
+    return jce_runtime_ground_raycast((JceRuntime *)user, origin, dir, max_dist,
+                                      out_hit_y, out_normal);
+}
+
 static bool app_init(const JceServices *svc, void *ud)
 {
     (void)ud;
@@ -370,6 +426,59 @@ static bool app_init(const JceServices *svc, void *ud)
             LOG_WARN("app", "%s", "jce_ui_canvas_create failed — ECS-UI will not render");
     }
 
+    /* Physics layer collision matrix (Top 4 — last-mile parity with editor
+     * Play): load the project's authored matrix BEFORE jce_runtime_create so
+     * bodies spawn with the correct (group,mask) collision filter, exactly like
+     * the editor pushes it before its own runtime create.  The build exports it
+     * into the cooked tree as `physics_layers.json` (jce.physlayers.v1); absent
+     * ⇒ engine default (all layers collide).  Host-fs only (loose cooked tree —
+     * the default stage_loose package layout). */
+    {
+        char base[1024] = {0};
+        if (jce_fs_host_get_base_path(base, sizeof(base))) {
+            const char *cooked = (s_project && s_project->cooked_assets &&
+                                  s_project->cooked_assets[0])
+                                 ? s_project->cooked_assets : "resources/_cooked";
+            char lpath[1024];
+            int n = snprintf(lpath, sizeof(lpath), "%s%s/physics_layers.json",
+                             base, cooked);
+            if (n > 0 && n < (int)sizeof(lpath) &&
+                jce_physics_layer_matrix_load_json(lpath))
+                LOG_INFO("app", "physics layer matrix loaded: %s", lpath);
+        }
+    }
+
+    /* Project-wide quality settings (Top 5): load the build-exported
+     * render_settings.json from the cooked tree.  lod_bias applies globally
+     * now; the shadow tier folds into the scene render config each frame via
+     * s_default_scene_cfg().  Missing file ⇒ engine defaults. */
+    {
+        char base[1024] = {0};
+        if (jce_fs_host_get_base_path(base, sizeof(base))) {
+            const char *cooked = (s_project && s_project->cooked_assets &&
+                                  s_project->cooked_assets[0])
+                                 ? s_project->cooked_assets : "resources/_cooked";
+            char rpath[1024];
+            int n = snprintf(rpath, sizeof(rpath), "%s%s/render_settings.json",
+                             base, cooked);
+            if (n > 0 && n < (int)sizeof(rpath) &&
+                jce_render_settings_load_json(rpath, &s_render_settings)) {
+                s_render_settings_loaded = true;
+                jce_texture_set_global_mip_bias((int8_t)s_render_settings.lod_bias);
+                /* Window-period graphics: vsync + MSAA are swapchain reset
+                 * flags, applied here via a GPU reset (the renderer is already
+                 * created).  HDR is handled by the pipeline's internal HDR
+                 * offscreen target + tonemap, not a backbuffer flag. */
+                if (svc && svc->renderer) {
+                    jce_renderer_set_vsync(svc->renderer, s_render_settings.vsync != 0);
+                    jce_renderer_set_msaa(svc->renderer, s_render_settings.msaa);
+                }
+                LOG_INFO("app", "render settings loaded: %s (vsync=%d msaa=%d)",
+                         rpath, s_render_settings.vsync, s_render_settings.msaa);
+            }
+        }
+    }
+
     if (s_scene) {
         JceRuntimeDesc rd = (JceRuntimeDesc){0};
         rd.scene          = s_scene;
@@ -404,6 +513,28 @@ static bool app_init(const JceServices *svc, void *ud)
         s_runtime = jce_runtime_create(&rd);
         if (!s_runtime)
             LOG_WARN("app", "%s", "jce_runtime_create failed — physics/audio inactive");
+
+        /* Route animation frame events into the gameplay script VM: the scene
+         * renderer (which advances the event tracks) now forwards each fired
+         * event to the firing entity's on_anim_event script handler via the
+         * runtime.  Both handles exist here; harmless if either is NULL. */
+        if (s_scene_renderer && s_runtime)
+            jce_scene_renderer_set_anim_event_fn(s_scene_renderer,
+                                                 s_default_anim_event_cb,
+                                                 s_runtime);
+        /* Route animation state-machine state changes into the script VM so
+         * authored on_state_enter / on_state_exit handlers fire (mirrors the
+         * frame-event wiring above). */
+        if (s_scene_renderer && s_runtime)
+            jce_scene_renderer_set_anim_state_fn(s_scene_renderer,
+                                                 s_default_anim_state_cb,
+                                                 s_runtime);
+        /* Foot IK: install the renderer's ground-query hook to the runtime's
+         * physics raycast so authored FootIk components adapt feet to terrain. */
+        if (s_scene_renderer && s_runtime)
+            jce_scene_renderer_set_ground_query_fn(s_scene_renderer,
+                                                   s_default_ground_query_cb,
+                                                   s_runtime);
     }
 
     /* Open-world streaming (no-op unless the scene's streaming settings
@@ -441,6 +572,17 @@ static void app_update(float dt, void *ud)
     const JceInput *in = s_svc->input;
     const JceInputActions *acts = s_svc->actions;
 
+    /* Tab toggles FPS-look cursor capture.  Uncaptured ⇒ a free OS cursor the
+     * player can click in-game UI with (FEATURE 4.1); captured ⇒ classic
+     * mouse-look.  Apply the window mode change on the edge only. */
+    if (jce_input_key_pressed(in, JCE_KEY_TAB)) {
+        s_cursor_captured = !s_cursor_captured;
+        if (s_svc->window) {
+            jce_window_set_relative_mouse_mode(s_svc->window, s_cursor_captured);
+            jce_window_set_mouse_grab        (s_svc->window, s_cursor_captured);
+        }
+    }
+
     /* Movement is camera-relative (W = into-the-screen) just like the
      * editor's Play view, so look direction defines move direction.
      * Only a unit DIRECTION plus button state is pushed — speeds and the
@@ -476,9 +618,14 @@ static void app_update(float dt, void *ud)
         ri.speed_mult   = 1.0f;
         ri.sprint = dm_act_down(in, acts, "sprint", JCE_KEY_LSHIFT) ||
                     jce_input_key_down(in, JCE_KEY_RSHIFT);
+        ri.attack_pressed = dm_act_down(in, acts, "attack", JCE_KEY_J);
         if (jce_input_key_down(in, JCE_KEY_LCTRL)  ||
             jce_input_key_down(in, JCE_KEY_RCTRL))  ri.speed_mult = 0.25f;
         jce_runtime_set_input(s_runtime, &ri);
+        /* Bind the live action map so gameplay scripts can read authored verbs
+         * and axes by name (jce.is_action_down / get_axis), beyond the fixed
+         * walk/jump/sprint/attack fields above. */
+        jce_runtime_set_actions(s_runtime, acts);
         jce_runtime_step(s_runtime, dt);
     }
 
@@ -510,11 +657,13 @@ static void app_update(float dt, void *ud)
         }
     }
 
-    /* Always-on FPS look: cursor is grabbed in app_init so delta is
+    /* FPS look while the cursor is captured: cursor is grabbed so delta is
      * pure mouse motion.  Mirror editor panel_game_view convention:
      *  - +dx → look right
-     *  - -dy → look up (mouse-up = look-up; standard non-inverted) */
-    {
+     *  - -dy → look up (mouse-up = look-up; standard non-inverted)
+     * While uncaptured (Tab) the mouse is a free UI cursor and must not
+     * steer the camera. */
+    if (s_cursor_captured) {
         float dx = 0.0f, dy = 0.0f;
         jce_input_mouse_delta(in, &dx, &dy);
         if (dx != 0.0f || dy != 0.0f) {
@@ -550,27 +699,203 @@ static void app_update(float dt, void *ud)
     }
 }
 
+/* Build the scene render config from defaults, folding in the project-wide
+ * quality settings (Top 5) as the DEFAULT.  Per-scene JceSceneRenderingSettings
+ * still override these inside jce_scene_renderer_render. */
+static JceSceneRenderConfig s_default_scene_cfg(void)
+{
+    JceSceneRenderConfig c = jce_scene_render_config_default();
+    if (s_render_settings_loaded) {
+        if (s_render_settings.shadow_quality <= 0)    c.draw_shadows    = false;
+        if (s_render_settings.shadow_map_size > 0)    c.shadow_map_size = (uint16_t)s_render_settings.shadow_map_size;
+        if (s_render_settings.shadow_cascades > 0)    c.csm_cascades    = (uint8_t)s_render_settings.shadow_cascades;
+        if (s_render_settings.shadow_distance > 0.0f) c.shadow_distance = s_render_settings.shadow_distance;
+    }
+    return c;
+}
+
 static void app_draw(const JceServices *svc, void *ud)
 {
     (void)ud;
     if (!svc || !svc->renderer || !s_scene_renderer || !s_scene || !s_camera)
         return;
-    jce_renderer_begin_frame_3d(svc->renderer, svc->window,
-                                s_camera, JCE_VIEW_MAIN_3D);
-    JceSceneRenderConfig cfg = jce_scene_render_config_default();
-    jce_scene_renderer_render(s_scene_renderer, s_scene, s_camera,
-                              JCE_VIEW_MAIN_3D, s_last_dt, &cfg);
+
+    /* Scene render (Top 1 — shipped postfx parity with the editor game view).
+     * When the scene authors any post-processing effect, render into an
+     * offscreen HDR target and run the engine's OWN postfx pipeline (the same
+     * one jce_scene_renderer_render configures from JceSceneRenderingSettings),
+     * then present to the backbuffer.  Otherwise — the common case — keep the
+     * zero-overhead direct-to-backbuffer path.  Any failure in the postfx path
+     * falls through to the direct path so the window is never black. */
+    bool present_done = false;
+    uint32_t sw = 0, sh = 0;
+    if (svc->window) jce_window_get_size(svc->window, &sw, &sh);
+    JcePostFXPipeline *pfx = jce_scene_renderer_get_postfx(s_scene_renderer);
+    if (pfx && sw > 0 && sh > 0) {
+        if (!s_post_target) {
+            s_post_target = jce_offscreen_target_create(svc->renderer,
+                                                        JCE_VIEW_RUNTIME_GAME);
+            /* Re-base the post views high so present (base+12) never collides
+             * with the offscreen target's shadow/fog sub-views (30..46).  Safe
+             * in a shipped exe: no editor preview/pick shares the pipeline. */
+            if (s_post_target) jce_postfx_set_view_base(pfx, 100);
+        }
+        if (s_post_target) {
+            float aspect = (float)sw / (float)sh;
+            jce_mat4 view = jce_camera_view(s_camera);
+            jce_mat4 proj = jce_camera_proj(s_camera, aspect,
+                                            jce_gfx_caps().homogeneous_depth);
+            /* HDR target: force tone mapping so the PBR linear output maps to
+             * display range (else washed out).  No-op on the RGBA8 fallback. */
+            if (jce_offscreen_target_is_hdr(s_post_target))
+                jce_postfx_enable(pfx, JCE_POSTFX_TONEMAP, true);
+            if (jce_offscreen_target_prepare(s_post_target, sw, sh,
+                                             view.raw[0], proj.raw[0],
+                                             0x000000FFu, "RuntimeScene")) {
+                JceSceneRenderConfig pcfg = s_default_scene_cfg();
+                uint16_t base = jce_offscreen_target_get_view_id(s_post_target);
+                jce_scene_renderer_render(s_scene_renderer, s_scene, s_camera,
+                                          base, s_last_dt, &pcfg);
+                bool any_effect = false;
+                for (int i = 0; i < JCE_POSTFX_COUNT; ++i)
+                    if (jce_postfx_is_enabled(pfx, (JcePostFXType)i)) {
+                        any_effect = true; break;
+                    }
+                if (any_effect) {
+                    jce_postfx_resize(pfx, sw, sh);
+                    JceTextureHandle color = {
+                        jce_offscreen_target_get_color_texture(s_post_target) };
+                    JceTextureHandle depth = {
+                        jce_offscreen_target_get_depth_texture(s_post_target) };
+                    if (jce_gfx_texture_valid(color)) {
+                        jce_postfx_apply(pfx, color, depth);
+                        if (jce_gfx_texture_valid(jce_postfx_get_output(pfx))) {
+                            jce_postfx_present(pfx, sw, sh);
+                            present_done = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (!present_done) {
+        jce_renderer_begin_frame_3d(svc->renderer, svc->window,
+                                    s_camera, JCE_VIEW_MAIN_3D);
+        JceSceneRenderConfig cfg = s_default_scene_cfg();
+        jce_scene_renderer_render(s_scene_renderer, s_scene, s_camera,
+                                  JCE_VIEW_MAIN_3D, s_last_dt, &cfg);
+    }
 
     /* ECS-UI overlay on top of the 3D scene, into the backbuffer on the
-     * dedicated UI view.  Pointer is NULL: the deployed app grabs the cursor
-     * for FPS-look, so authored UI is presentational here (HUD / labels /
-     * backgrounds); interactive pointer feeding is a follow-up. */
+     * dedicated UI view (FEATURE 4.1).  While the cursor is captured for
+     * FPS-look the OS pointer is pinned/hidden, so authored UI is purely
+     * presentational (HUD / labels / backgrounds) and we feed NULL.  When the
+     * player frees the cursor (Tab → !s_cursor_captured) we build a real
+     * JceUIPointer from the input system — exactly like the editor Game View's
+     * pointer (jce_panel_game_view.cpp) — so authored UIButtons hover / press /
+     * click.  A click is then drained from the canvas and dispatched to the
+     * gameplay script VM through the runtime, making shipped in-game buttons
+     * actually do something. */
     if (s_ui_canvas && svc->window) {
         uint32_t sw = 0, sh = 0;
         jce_window_get_size(svc->window, &sw, &sh);
-        if (sw > 0 && sh > 0)
+        if (sw > 0 && sh > 0) {
+            JceUIPointer ptr;
+            const JceUIPointer *ptr_arg = NULL;
+            if (!s_cursor_captured && svc->input) {
+                float mx = 0.0f, my = 0.0f;
+                jce_input_mouse_pos(svc->input, &mx, &my);
+                ptr.x     = mx;
+                ptr.y     = my;
+                ptr.down  = jce_input_mouse_button(svc->input,
+                                                   JCE_MOUSE_BUTTON_LEFT);
+                ptr.valid = true;
+                ptr_arg   = &ptr;
+            }
+            /* ── InputField text/edit channel (single-line text entry) ──
+             * Forward editing keys to the focused ECS-UI InputField using the
+             * polling input API (these scancodes are pollable), then toggle OS
+             * text input as focus changes.  We feed keys BEFORE the render so
+             * they apply to the focus established last frame, and the render
+             * below re-evaluates focus from this frame's pointer.
+             *
+             * NOTE: the polling JceInput API exposes no UTF-8 character stream
+             * (only key state), so the *character* channel below is a clearly
+             * marked hook: when this drop-in main is replaced with a project
+             * main.c that registers a JceAppDesc.on_event callback, route
+             *   JCE_EVENT_TEXT_INPUT  → jce_ui_canvas_text_input(s_ui_canvas, ev.text.text)
+             *   JCE_EVENT_KEY_DOWN     → jce_ui_canvas_key_edit(s_ui_canvas, ev.key.scancode, ev.key.mod)
+             *   JCE_EVENT_MOUSE_WHEEL  → jce_ui_canvas_scroll(s_ui_canvas, ev.wheel.x, ev.wheel.y)
+             * (the reference wiring).  Starting OS text input here means SDL is
+             * already emitting those text events for that future callback.
+             * See deviations/followups. */
+            if (svc->input && jce_ui_canvas_focused_input(s_ui_canvas)) {
+                static const struct { int key; } s_edit_keys[] = {
+                    { JCE_KEY_BACKSPACE }, { JCE_KEY_DELETE },
+                    { JCE_KEY_LEFT }, { JCE_KEY_RIGHT },
+                    { JCE_KEY_HOME }, { JCE_KEY_END },
+                    { JCE_KEY_RETURN }, { JCE_KEY_KP_ENTER },
+                    { JCE_KEY_ESCAPE },
+                };
+                for (size_t i = 0; i < sizeof(s_edit_keys)/sizeof(s_edit_keys[0]); ++i)
+                    if (jce_input_key_pressed(svc->input, s_edit_keys[i].key))
+                        jce_ui_canvas_key_edit(s_ui_canvas, s_edit_keys[i].key, 0);
+            }
+
             jce_ui_canvas_render(s_ui_canvas, s_scene, JCE_VIEW_UI, UINT16_MAX,
-                                 (float)sw, (float)sh, NULL, s_last_dt);
+                                 (float)sw, (float)sh, ptr_arg, s_last_dt);
+
+            /* ── ScrollView wheel channel ──────────────────────────────
+             * Feed the (vertical) mouse wheel to the scroll view under the
+             * pointer, AFTER the render so the canvas has resolved this frame's
+             * hovered scroll view.  The polling JceInput exposes only a vertical
+             * wheel (+y = up), matching jce_ui_canvas_scroll's dy convention; a
+             * project main.c with an on_event callback can additionally forward
+             * ev.wheel.x for horizontal scrolling (see reference wiring above).
+             * Fire-and-forget: a no-op when no scroll view is hovered. */
+            if (ptr_arg && svc->input) {
+                float wheel = jce_input_mouse_wheel(svc->input);
+                if (wheel != 0.0f)
+                    jce_ui_canvas_scroll(s_ui_canvas, 0.0f, wheel);
+            }
+
+            /* OS text-input follows InputField focus (toggle on the edge so we
+             * don't spam the platform layer). */
+            {
+                static bool s_text_input_on = false;
+                bool want = jce_ui_canvas_focused_input(s_ui_canvas) != 0;
+                if (want != s_text_input_on) {
+                    if (want) jce_window_start_text_input(svc->window);
+                    else      jce_window_stop_text_input(svc->window);
+                    s_text_input_on = want;
+                }
+            }
+
+            /* Drain the click the canvas state machine recorded this frame
+             * (set only on the release frame, over the same button) and fire
+             * the button's authored on_click_handler through the script VM.
+             * No-op when nothing was clicked / no handler / no runtime. */
+            if (ptr_arg && s_runtime && s_scene) {
+                uint64_t clicked = jce_ui_canvas_last_clicked(s_ui_canvas);
+                if (clicked) {
+                    JceUIButtonComponent *bt =
+                        jce_scene_get_ui_button(s_scene, (JceEntity)clicked);
+                    if (bt)
+                        jce_runtime_dispatch_ui_click(s_runtime, clicked,
+                                                      bt->on_click_handler);
+                }
+                /* Slider drag / toggle flip / dropdown select → on_value_changed;
+                 * InputField edits → on_value_changed; RETURN → on_submit.  The
+                 * runtime resolves the widget on its own scene and fires the
+                 * authored handler; each is a clean no-op when none authored. */
+                uint64_t vc = jce_ui_canvas_last_value_changed(s_ui_canvas);
+                if (vc) jce_runtime_dispatch_ui_value_changed(s_runtime, vc);
+                uint64_t tc = jce_ui_canvas_last_text_changed(s_ui_canvas);
+                if (tc) jce_runtime_dispatch_ui_text_changed(s_runtime, tc);
+                uint64_t sub = jce_ui_canvas_last_submitted(s_ui_canvas);
+                if (sub) jce_runtime_dispatch_ui_submit(s_runtime, sub);
+            }
+        }
     }
 }
 
@@ -583,6 +908,8 @@ static void app_exit(void *ud)
     if (s_stream_fs)      { jce_fs_destroy(s_stream_fs);                   s_stream_fs      = NULL; }
     if (s_runtime)        { jce_runtime_destroy(s_runtime);              s_runtime        = NULL; }
     if (s_ui_canvas)      { jce_ui_canvas_destroy(s_ui_canvas);          s_ui_canvas      = NULL; }
+    /* Offscreen postfx target borrows the renderer — destroy before it. */
+    if (s_post_target)    { jce_offscreen_target_destroy(s_post_target);  s_post_target    = NULL; }
     if (s_scene_renderer) { jce_scene_renderer_destroy(s_scene_renderer); s_scene_renderer = NULL; }
     /* Destroy cached meshes (owned here) before tearing the rest down. */
     for (int i = 0; i < s_mesh_cache_count; ++i) {

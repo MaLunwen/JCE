@@ -193,7 +193,7 @@ static VideoState *ensure_loaded(FvTab *tab)
     if (!tab->content || tab->content_len <= 0) {
         st->load_failed = true;
         snprintf(st->fail_reason, sizeof(st->fail_reason),
-                 "empty file (%d bytes)", tab->content_len);
+                 jce_editor_i18n("viewer.video.emptyFile"), tab->content_len);
         return st;
     }
 
@@ -548,7 +548,7 @@ void fv_render_video(FvTab *tab)
     VideoState *st = ensure_loaded(tab);
     if (!st) {
         ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1),
-            "Failed to allocate video state for %s", tab->display_name);
+            jce_editor_i18n("viewer.video.allocFailed"), tab->display_name);
         return;
     }
 
@@ -740,7 +740,7 @@ void fv_render_video(FvTab *tab)
         }
         ImGui::SameLine();
         ImGui::TextColored(JCE_COLOR_TEXT_SECONDARY,
-            "wheel=zoom  drag=pan  dbl-click=Fit/1:1");
+            "%s", jce_editor_i18n("viewer.video.zoomHint"));
 
         FvZoomable zp{};
         zp.tex         = st->gpu_tex;
@@ -763,7 +763,7 @@ void fv_render_video(FvTab *tab)
                     ImVec2(origin.x + avail.x, origin.y + avail.y),
                     IM_COL32(60, 60, 80, 255));
 
-        const char *msg = "Decoding...";
+        const char *msg = jce_editor_i18n("viewer.video.decoding");
         char patent_msg[192];
         if (has_video) {
             if (st->info.metadata_only) {
@@ -772,15 +772,15 @@ void fv_render_video(FvTab *tab)
                 bool is_h265  = (strcmp(vc, "hvc1") == 0 || strcmp(vc, "hev1") == 0);
                 if (is_h264 || is_h265) {
                     snprintf(patent_msg, sizeof(patent_msg),
-                        "%s is patent-encumbered and disabled in this build.\n",
+                        jce_editor_i18n("viewer.video.patentDisabled"),
                         is_h264 ? "H.264 / AVC" : "H.265 / HEVC");
                     msg = patent_msg;
                 } else {
-                    msg = "Container parsed, but runtime decoder backend is unavailable.";
+                    msg = jce_editor_i18n("viewer.video.noDecoder");
                 }
             }
         } else {
-            msg = st->load_failed ? st->fail_reason : "No frame available";
+            msg = st->load_failed ? st->fail_reason : jce_editor_i18n("viewer.video.noFrame");
         }
         ImVec2 tsz = ImGui::CalcTextSize(msg);
         dl->AddText(ImVec2(origin.x + (avail.x - tsz.x) * 0.5f,

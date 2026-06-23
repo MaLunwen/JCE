@@ -4,6 +4,8 @@
 
 #include <jce/middleware/animation/jce_anim_ik.h>
 
+#include <jce/os/core/jce_math.h>   /* jce_q_slerp (shortest-arc), jce_quat */
+
 #include <math.h>
 #include <string.h>
 
@@ -41,6 +43,20 @@ jce_anim_ik_two_bone_solve(const JceIkTwoBoneInput *in, JceIkTwoBoneOutput *out)
     float at[3]; v3_sub(at, in->target, in->root_pos);
     float D = v3_len(at);
     int reached = 1;
+
+    /* Degenerate geometry guard: a zero-length first/second bone (root==mid or
+     * mid==end) or a target coincident with the root makes the law-of-cosines
+     * denominator (2*L1*D) zero → NaN/Inf.  Reachable now that kind==1 can
+     * dispatch arbitrary joint triples.  Leave the input joints untouched. */
+    if (L1 < 1e-8f || L2 < 1e-8f || D < 1e-8f) {
+        out->mid_pos[0] = in->mid_pos[0];
+        out->mid_pos[1] = in->mid_pos[1];
+        out->mid_pos[2] = in->mid_pos[2];
+        out->end_pos[0] = in->end_pos[0];
+        out->end_pos[1] = in->end_pos[1];
+        out->end_pos[2] = in->end_pos[2];
+        return 0;
+    }
 
     /* Clamp: if target out of reach -> straight line. */
     if (D > L1 + L2 - 1e-5f) {
@@ -105,6 +121,258 @@ jce_anim_ik_two_bone_solve(const JceIkTwoBoneInput *in, JceIkTwoBoneOutput *out)
     v3_lerp(out->mid_pos, in->mid_pos, solved_mid, w);
     v3_lerp(out->end_pos, in->end_pos, solved_end, w);
     return reached;
+}
+
+/* ────────── Aim solver ────────── */
+
+JCE_API int JCE_CALL
+jce_anim_ik_aim_solve(const JceIkAimInput *in, float out_forward[3])
+{
+    if (!in || !out_forward) return 0;
+
+    /* Current forward (normalised). */
+    float fwd[3] = { in->forward[0], in->forward[1], in->forward[2] };
+    if (v3_len(fwd) < 1e-8f) {
+        out_forward[0] = out_forward[1] = out_forward[2] = 0.0f;
+        return 0;
+    }
+    v3_norm(fwd);
+
+    /* Desired aim direction: pivot → target. */
+    float aim[3]; v3_sub(aim, in->target, in->pivot);
+    if (v3_len(aim) < 1e-6f) {
+        /* Target coincides with the pivot: nothing to aim at. */
+        out_forward[0] = fwd[0]; out_forward[1] = fwd[1]; out_forward[2] = fwd[2];
+        return 0;
+    }
+    v3_norm(aim);
+
+    /* NOTE: this solver returns a blended aim DIRECTION only — no twist/roll is
+     * resolved, so the caller's `up` vector is intentionally not consulted here.
+     * (A previous version built a right/up orthonormal basis from `up`, but it
+     * was never used and is omitted to keep the result honest.) */
+
+    /* Blend between the input forward and the aim direction by weight, then
+     * renormalise (slerp-ish via normalised lerp is adequate for an aim axis). */
+    float w = in->weight; if (w < 0) w = 0; if (w > 1) w = 1;
+    float res[3];
+    v3_lerp(res, fwd, aim, w);
+    if (v3_len(res) < 1e-6f) {
+        /* fwd and aim antiparallel at w≈0.5 → fall back to the aim. */
+        res[0]=aim[0]; res[1]=aim[1]; res[2]=aim[2];
+    }
+    v3_norm(res);
+    out_forward[0]=res[0]; out_forward[1]=res[1]; out_forward[2]=res[2];
+    return 1;
+}
+
+/* ────────── N-bone chain solvers ────────── */
+
+/* Cyclic Coordinate Descent: iterate from the tip-most movable joint back to
+ * the root, rotating each joint so the end effector swings toward the target.
+ * Pure geometry over the joint-position array; bone lengths are implied by the
+ * input spacing and preserved because each step is a pure rotation about a
+ * joint about-point. */
+JCE_API int JCE_CALL
+jce_anim_ik_ccd_solve(float *joints, int count, const float target[3],
+                      int max_iters, float tolerance)
+{
+    if (!joints || count < 2 || !target) return 0;
+    if (max_iters <= 0) max_iters = 16;
+    float tol = (tolerance > 0.0f) ? tolerance : 1e-3f;
+
+    int end = count - 1;
+    int iters = 0;
+    for (int it = 0; it < max_iters; ++it) {
+        float *ep = &joints[end * 3];
+        float to_end[3]; v3_sub(to_end, ep, target);
+        if (v3_len(to_end) <= tol) break;
+        ++iters;
+
+        /* From the joint just below the end effector down to the root. */
+        for (int j = end - 1; j >= 0; --j) {
+            float *jp = &joints[j * 3];
+            float *cur_end = &joints[end * 3];
+
+            float to_cur[3]; v3_sub(to_cur, cur_end, jp);
+            float to_tgt[3]; v3_sub(to_tgt, target,  jp);
+            float lc = v3_len(to_cur), lt = v3_len(to_tgt);
+            if (lc < 1e-8f || lt < 1e-8f) continue;
+            v3_norm(to_cur); v3_norm(to_tgt);
+
+            float cosA = v3_dot(to_cur, to_tgt);
+            if (cosA > 1.0f) cosA = 1.0f; else if (cosA < -1.0f) cosA = -1.0f;
+            if (cosA > 0.9999999f) continue;          /* already aligned */
+            float angle = acosf(cosA);
+
+            float axis[3]; v3_cross(axis, to_cur, to_tgt);
+            if (v3_len(axis) < 1e-8f) {
+                /* 180° flip: pick an arbitrary perpendicular axis. */
+                float up[3] = {0,1,0};
+                v3_cross(axis, to_cur, up);
+                if (v3_len(axis) < 1e-8f) {
+                    float rx[3] = {1,0,0};
+                    v3_cross(axis, to_cur, rx);
+                }
+            }
+            v3_norm(axis);
+
+            /* Rotate every joint from j+1..end about `axis` through `angle`,
+             * pivoting at jp (Rodrigues' rotation). */
+            float c = cosf(angle), s = sinf(angle);
+            for (int k = j + 1; k <= end; ++k) {
+                float *kp = &joints[k * 3];
+                float v[3]; v3_sub(v, kp, jp);
+                float kxv[3]; v3_cross(kxv, axis, v);
+                float kdv = v3_dot(axis, v);
+                /* v_rot = v*c + (axis×v)*s + axis*(axis·v)*(1-c) */
+                float r[3];
+                r[0] = v[0]*c + kxv[0]*s + axis[0]*kdv*(1.0f-c);
+                r[1] = v[1]*c + kxv[1]*s + axis[1]*kdv*(1.0f-c);
+                r[2] = v[2]*c + kxv[2]*s + axis[2]*kdv*(1.0f-c);
+                kp[0] = jp[0] + r[0];
+                kp[1] = jp[1] + r[1];
+                kp[2] = jp[2] + r[2];
+            }
+        }
+    }
+    return iters;
+}
+
+/* Forward And Backward Reaching Inverse Kinematics. */
+JCE_API int JCE_CALL
+jce_anim_ik_fabrik_solve(float *joints, int count, const float target[3],
+                         int max_iters, float tolerance)
+{
+    if (!joints || count < 2 || !target) return 0;
+    if (count > JCE_IK_FABRIK_MAX) count = JCE_IK_FABRIK_MAX;
+    if (max_iters <= 0) max_iters = 16;
+    float tol = (tolerance > 0.0f) ? tolerance : 1e-3f;
+
+    int n = count;
+    int end = n - 1;
+
+    /* Capture original bone lengths and the immutable root position. */
+    float len[JCE_IK_FABRIK_MAX];
+    float total = 0.0f;
+    for (int i = 0; i < end; ++i) {
+        float d[3]; v3_sub(d, &joints[(i+1)*3], &joints[i*3]);
+        len[i] = v3_len(d);
+        total += len[i];
+    }
+    float root[3] = { joints[0], joints[1], joints[2] };
+
+    /* Unreachable: stretch straight toward the target, clamped at max reach. */
+    float to_t[3]; v3_sub(to_t, target, root);
+    float dist = v3_len(to_t);
+    if (dist > total) {
+        float dir[3] = { to_t[0], to_t[1], to_t[2] };
+        v3_norm(dir);
+        float acc = 0.0f;
+        for (int i = 0; i < end; ++i) {
+            acc += len[i];
+            joints[(i+1)*3+0] = root[0] + dir[0]*acc;
+            joints[(i+1)*3+1] = root[1] + dir[1]*acc;
+            joints[(i+1)*3+2] = root[2] + dir[2]*acc;
+        }
+        joints[0]=root[0]; joints[1]=root[1]; joints[2]=root[2];
+        return 1;
+    }
+
+    int iters = 0;
+    for (int it = 0; it < max_iters; ++it) {
+        float *ep = &joints[end * 3];
+        float te[3]; v3_sub(te, ep, target);
+        if (v3_len(te) <= tol) break;
+        ++iters;
+
+        /* ── Backward reach: set end to target, pull each joint toward it. */
+        joints[end*3+0] = target[0];
+        joints[end*3+1] = target[1];
+        joints[end*3+2] = target[2];
+        for (int i = end - 1; i >= 0; --i) {
+            float *pi  = &joints[i*3];
+            float *pi1 = &joints[(i+1)*3];
+            float d[3]; v3_sub(d, pi, pi1);
+            float dl = v3_len(d);
+            float r = (dl > 1e-8f) ? (len[i] / dl) : 0.0f;
+            float np[3];
+            v3_lerp(np, pi1, pi, r); /* pi1 + (pi-pi1)*r */
+            pi[0]=np[0]; pi[1]=np[1]; pi[2]=np[2];
+        }
+
+        /* ── Forward reach: pin root back, push each joint outward. */
+        joints[0]=root[0]; joints[1]=root[1]; joints[2]=root[2];
+        for (int i = 0; i < end; ++i) {
+            float *pi  = &joints[i*3];
+            float *pi1 = &joints[(i+1)*3];
+            float d[3]; v3_sub(d, pi1, pi);
+            float dl = v3_len(d);
+            float r = (dl > 1e-8f) ? (len[i] / dl) : 0.0f;
+            float np[3];
+            v3_lerp(np, pi, pi1, r); /* pi + (pi1-pi)*r */
+            pi1[0]=np[0]; pi1[1]=np[1]; pi1[2]=np[2];
+        }
+    }
+    return iters;
+}
+
+/* ────────── Single-target constraint solvers ────────── */
+
+/* clamp01 with a non-finite guard (NaN/Inf weight → 0, i.e. keep current). */
+static float clamp01_finite(float w)
+{
+    if (!(w == w)) return 0.0f;          /* NaN */
+    if (w < 0.0f) return 0.0f;
+    if (w > 1.0f) return 1.0f;
+    return w;
+}
+
+JCE_API void JCE_CALL
+jce_anim_ik_position_solve(const float cur_pos[3], const float target_pos[3],
+                           float weight, float out_pos[3])
+{
+    if (!out_pos) return;
+    if (!cur_pos) {
+        /* No current position to blend from: snap to target (or zero). */
+        if (target_pos) { out_pos[0]=target_pos[0]; out_pos[1]=target_pos[1]; out_pos[2]=target_pos[2]; }
+        else            { out_pos[0]=out_pos[1]=out_pos[2]=0.0f; }
+        return;
+    }
+    if (!target_pos) {
+        out_pos[0]=cur_pos[0]; out_pos[1]=cur_pos[1]; out_pos[2]=cur_pos[2];
+        return;
+    }
+    float w = clamp01_finite(weight);
+    out_pos[0] = cur_pos[0] + (target_pos[0] - cur_pos[0]) * w;
+    out_pos[1] = cur_pos[1] + (target_pos[1] - cur_pos[1]) * w;
+    out_pos[2] = cur_pos[2] + (target_pos[2] - cur_pos[2]) * w;
+}
+
+/* Normalise a quaternion; a zero-length / non-finite quat falls back to
+ * identity so downstream slerp never sees a degenerate input. */
+static jce_quat q_sanitize(const float q4[4])
+{
+    if (!q4) return jce_q_identity();
+    float x=q4[0], y=q4[1], z=q4[2], w=q4[3];
+    float len2 = x*x + y*y + z*z + w*w;
+    if (!(len2 == len2) || len2 < 1e-12f)   /* NaN or ~zero */
+        return jce_q_identity();
+    return jce_q_normalize(jce_v4(x, y, z, w));
+}
+
+JCE_API void JCE_CALL
+jce_anim_ik_rotation_solve(const float cur_quat[4], const float target_quat[4],
+                           float weight, float out_quat[4])
+{
+    if (!out_quat) return;
+    jce_quat a = q_sanitize(cur_quat);
+    jce_quat b = q_sanitize(target_quat);
+    float w = clamp01_finite(weight);
+    /* jce_q_slerp picks the shortest arc (negates b when a·b < 0) and degrades
+     * to a normalised lerp for nearly-parallel quats; result is unit length. */
+    jce_quat r = jce_q_normalize(jce_q_slerp(a, b, w));
+    out_quat[0]=r.x; out_quat[1]=r.y; out_quat[2]=r.z; out_quat[3]=r.w;
 }
 
 /* ────────── Event dispatch ────────── */

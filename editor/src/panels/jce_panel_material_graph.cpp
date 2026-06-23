@@ -7,15 +7,15 @@
  * panel entry point.
  *
  *   panels/material_graph/material_graph_state.{h,cpp}  shared state
- *   panels/material_graph/material_graph_eval.cpp        compile to .mat.json
- *   panels/material_graph/material_graph_edit.cpp        delete/copy/paste
- *   panels/material_graph/material_graph_canvas.cpp      node + canvas drawing
- *   panels/material_graph/material_graph_preview.cpp     preview sphere + log
+ *   panels/material_graph/jce_material_graph_eval.cpp        compile to .mat.json
+ *   panels/material_graph/jce_material_graph_edit.cpp        delete/copy/paste
+ *   panels/material_graph/jce_material_graph_canvas.cpp      node + canvas drawing
+ *   panels/material_graph/jce_material_graph_preview.cpp     preview sphere + log
  *
  * Public ABI is unchanged.
  */
 
-#include "panels/material_graph/material_graph_state.h"
+#include "panels/material_graph/jce_material_graph_state.h"
 
 #include "core/jce_editor_i18n.h"
 #include "dialogs/jce_path_input.h"

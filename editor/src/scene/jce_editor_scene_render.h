@@ -40,8 +40,10 @@ void jce_editor_scene_render_shutdown(void);
 void jce_editor_scene_render_frame(uint32_t width, uint32_t height);
 
 /* Get the bgfx texture handle index of the FBO color attachment.
- * Returns UINT16_MAX if not yet initialized. Use with ImGui::Image():
- *   ImGui::Image((ImTextureID)(uintptr_t)handle, size); */
+ * Returns UINT16_MAX if not yet initialized. Use with ImGui::Image(),
+ * encoding the handle as (idx + 1) so a valid idx 0 is not mistaken for
+ * ImTextureID_Invalid(0) — the imgui_renderer backend decodes -1 (audit P2-B):
+ *   ImGui::Image((ImTextureID)(uintptr_t)((uint32_t)handle + 1u), size); */
 uint16_t jce_editor_scene_render_get_texture(void);
 
 /* GPU object-ID picking for the Scene View.  Coordinates are render-target
@@ -51,6 +53,13 @@ uint16_t jce_editor_scene_render_get_texture(void);
 bool jce_editor_scene_pick_supported(void);
 bool jce_editor_scene_pick_request(uint32_t x, uint32_t y);
 bool jce_editor_scene_pick_poll(uint32_t *out_entity_id);
+/* GPU rectangle (marquee) selection: pixel-accurate for any geometry incl.
+ * streamed glTF models.  request() with pick-buffer pixel coords; poll_rect()
+ * fills out_ids with up to max_ids UNIQUE entity ids + *out_count when ready. */
+bool jce_editor_scene_pick_request_rect(uint32_t x0, uint32_t y0,
+                                        uint32_t x1, uint32_t y1);
+bool jce_editor_scene_pick_poll_rect(uint32_t *out_ids, uint32_t max_ids,
+                                     uint32_t *out_count);
 
 /* Get the editor camera (for gizmo projection, etc.). */
 JceCamera *jce_editor_scene_get_camera(void);
@@ -155,6 +164,11 @@ JceRenderer *jce_editor_get_renderer(void);
  * scene file's directory.  Returns true and fills `out` on success. */
 bool jce_editor_resolve_asset_path(const char *in, char *out, int outsz);
 
+/* World-streaming FS base (source asset root = scene file's grandparent).
+ * Shared by the scene-view preview streamer AND the editor-Play streamer so
+ * chunk fragments resolve identically in both viewports (no divergence). */
+bool jce_editor_streaming_fs_base(char *out, int out_size);
+
 /* Access the world streamer (open-world chunk I/O + scene entity lifecycle).
  * Returns NULL if not initialized (e.g. before first frame). */
 typedef struct JceWorldStreamer JceWorldStreamer;
@@ -165,12 +179,24 @@ JceWorldStreamer *jce_editor_get_world_streamer(void);
  * content never bakes into the main scene file. */
 void jce_editor_scene_render_streaming_teardown(void);
 
+/* Drop the renderer + pick model caches (neither evicts; both cache load
+ * failures) so a scene switch reloads all models fresh — fixes models that
+ * fail to load after switching scenes without restarting the editor.  Call
+ * on every scene swap, after clear_scene_entities() and before loading the
+ * new scene's entities. */
+void jce_editor_scene_render_invalidate_model_caches(void);
+
 /* Recreate the preview streamer from the current scene's streaming
  * settings.  Tears down any existing streamer first; creates a new one
  * only when the scene has streaming enabled AND the session preview
  * toggle (jce_state_get/set_streaming_preview) is on.  Call after every
  * scene swap and after the World Streaming panel edits settings. */
 void jce_editor_scene_render_streaming_rebuild(void);
+
+/* Call after a scene load: auto-enables the streaming preview for streaming-
+ * enabled scenes (so the editor scene view shows the streamed world, matching
+ * Play) then rebuilds.  The user can still toggle preview off afterwards. */
+void jce_editor_scene_render_streaming_autostart(void);
 
 typedef struct JceAnimPlayer JceAnimPlayer;
 typedef struct JceModel      JceModel;
@@ -189,6 +215,17 @@ JceAnimSmBinding *jce_editor_scene_get_anim_sm(uint32_t entity_id);
  * Returns the model, or NULL if not available. */
 JceModel *jce_editor_scene_get_model(const char *skeleton_path,
                                      uint32_t entity_id);
+
+/* Lightweight rig probe for a glTF/GLB asset path: resolves the path,
+ * reads the file, and cgltf-parses only its header to report whether it
+ * carries a skin and/or animation clips.  Does NOT build geometry, decode
+ * images, or create an animation player — so the editor's asset-drop path
+ * can decide "skinned?" without the heavy synchronous full-model load (an
+ * 8 K-vertex / 45-clip character is microseconds of parse vs building the
+ * whole model + clip player on the main thread).  Returns false if the
+ * path can't be resolved/read/parsed (caller should treat as static). */
+bool jce_editor_probe_model_rig(const char *asset_path,
+                                bool *out_has_skin, bool *out_has_anim);
 
 #ifdef __cplusplus
 }

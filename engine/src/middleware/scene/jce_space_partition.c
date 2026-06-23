@@ -17,6 +17,7 @@
 
 #include <jce/middleware/scene/jce_space_partition.h>
 
+#include <jce/os/core/jce_frustum.h>
 #include <jce/os/core/jce_log.h>
 #include "os/core/jce_memory.h"
 
@@ -157,18 +158,11 @@ static bool jce__aabb_overlap(JceAABB a, JceAABB b)
              a.max.z < b.min.z || a.min.z > b.max.z);
 }
 
-/* Plane: dot(plane.xyz, p) + plane.w >= 0 means inside the half-space.
- * Test by evaluating the AABB's "p-vertex" (most positive towards normal). */
+/* Forwarder onto the shared jce_frustum.h positive-vertex test (one canonical
+ * impl); adapts the JceAABB struct to the {min,max} vec3 pair. */
 static bool jce__aabb_inside_frustum(JceAABB b, const jce_vec4 planes[6])
 {
-    for (int i = 0; i < 6; i++) {
-        const jce_vec4 p = planes[i];
-        const float px = (p.x >= 0.0f) ? b.max.x : b.min.x;
-        const float py = (p.y >= 0.0f) ? b.max.y : b.min.y;
-        const float pz = (p.z >= 0.0f) ? b.max.z : b.min.z;
-        if (p.x * px + p.y * py + p.z * pz + p.w < 0.0f) return false;
-    }
-    return true;
+    return jce_aabb_in_frustum(planes, b.min, b.max);
 }
 
 static bool jce__sphere_aabb(jce_vec3 c, float r, JceAABB b)

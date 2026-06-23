@@ -34,7 +34,8 @@ bool sanitize_recent_projects(JceEditorConfig *cfg);
 
 /* Async folder picker.
    - Dispatches a host file dialog and writes the result later from the
-     SDL UI thread.  The function returns immediately.
+     dialog callback via the shared main-thread pump.  The function returns
+     immediately.
    - On success the picked path is copied into `primary_out` (and into
      `secondary_out` if non-NULL); `*ready_flag` (if non-NULL) is set
      to true so the caller can react on its next frame.

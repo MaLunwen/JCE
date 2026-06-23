@@ -380,9 +380,9 @@ void draw_settings(void)
 void draw_actions(void)
 {
     if (nav_bake_running()) {
-        ImGui::TextUnformatted("Baking navmesh… (background)");
+        ImGui::TextUnformatted(jce_editor_i18n("navmesh.status.baking"));
         ImGui::SameLine();
-        if (ImGui::Button("Cancel##nav_cancel") && g_nav_cancel)
+        if (ImGui::Button(jce_editor_i18n_id("navmesh.button.cancel", "nav_cancel")) && g_nav_cancel)
             jce_atomic_i32_store(g_nav_cancel, 1);
     } else if (ImGui::Button(jce_editor_i18n_id("navmesh.button.bake", "nav_bake"))) {
         bake_recast();

@@ -75,7 +75,20 @@ typedef struct JceCookOptions {
 
     /* Force power-of-two dimensions (pad if needed). Default: false. */
     bool force_power_of_two;
+
+    /* Block-encode quality / speed tradeoff for BC/ASTC textures:
+       0 = DEFAULT (squish cluster-fit — best quality, slowest; the cost
+                    behind multi-second 2K texture cooks),
+       1 = FAST    (squish range-fit — ~5-7x faster, modest quality drop;
+                    the build-bundles default so iteration stays snappy),
+       2 = HIGHEST (iterative cluster-fit — slowest, for a final ship pass).
+       0 keeps the historical behaviour, so existing callers are unaffected. */
+    int encode_quality;
 } JceCookOptions;
+
+#define JCE_COOK_ENCODE_DEFAULT 0
+#define JCE_COOK_ENCODE_FAST    1
+#define JCE_COOK_ENCODE_HIGHEST 2
 
 #define JCE_COOK_DEFAULT                                                                           \
     ((JceCookOptions){.compression_level = 3, .platform = JCE_COOK_PLATFORM_AUTO})

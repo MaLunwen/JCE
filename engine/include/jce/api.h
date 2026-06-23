@@ -58,6 +58,9 @@ extern "C" {
 /* ── Layer 5: Scene ──────────────────────────────────────────────── */
 #include <jce/api_scene.h>
 
+/* ── Layer 5: World subsystems (ECS world, spawn, weather, ToD, …) ─ */
+#include <jce/api_world.h>
+
 /* ── Layer 5: Runtime (PlayerLoop, game-module bridge) ───────────── */
 #include <jce/api_runtime.h>
 
@@ -68,6 +71,7 @@ extern "C" {
 #include <jce/api_ai.h>
 #include <jce/api_net.h>
 #include <jce/api_physics.h>
+#include <jce/api_script.h>
 #include <jce/api_ui.h>
 
 

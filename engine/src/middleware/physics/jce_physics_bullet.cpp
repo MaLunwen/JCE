@@ -172,6 +172,15 @@ static inline uint32_t handle_gen(uint32_t handle)
    struct below. */
 static inline uint32_t resolve_body(JceBulletWorld *bw, uint32_t handle);
 
+/* btCollisionObject user-INDEX sentinel marking a raycast-vehicle CHASSIS.  A
+ * chassis is created by the vehicle API (not jce_bullet_body_create), so its
+ * user-POINTER is NOT a generation-packed body handle — feeding it to the
+ * contact dispatch (which decodes user-pointers as body handles) aliases a real
+ * body slot and, once that slot is recycled by a spawn, resolves to a dead body
+ * and crashes.  The contact dispatch skips objects carrying this tag.  Default
+ * btCollisionObject user-index is -1, so normal bodies never match it. */
+#define JCE_BULLET_VEHICLE_CHASSIS_USERINDEX 0x5645  /* 'VE' */
+
 /* ================================================================== */
 /* World definition                                                    */
 /* ================================================================== */
@@ -319,6 +328,13 @@ static void post_tick_callback(btDynamicsWorld *dyn_world, btScalar /*ts*/)
            stores the pool index set during body creation. */
         const btCollisionObject *obj_a = manifold->getBody0();
         const btCollisionObject *obj_b = manifold->getBody1();
+
+        /* Skip vehicle chassis: their user-pointer is a vehicle index, not a
+           packed body handle, so decoding it would alias / stale-resolve a real
+           body slot (crash after a spawn recycles that slot). */
+        if (obj_a->getUserIndex() == JCE_BULLET_VEHICLE_CHASSIS_USERINDEX ||
+            obj_b->getUserIndex() == JCE_BULLET_VEHICLE_CHASSIS_USERINDEX)
+            continue;
 
         uint32_t idx_a = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(
             obj_a->getUserPointer()));
@@ -797,6 +813,24 @@ void jce_bullet_body_destroy(JceBulletWorld *bw, uint32_t idx)
 
     btRigidBody *body = bw->bodies[slot];
     if (body) {
+        /* Destroy any constraints that reference this body BEFORE deleting it —
+         * a live btTypedConstraint holds btRigidBody& to both ends, so leaving
+         * one behind makes the next solver step dereference freed memory
+         * (audit F41).  Mirrors jce_bullet_constraint_destroy's cleanup. */
+        if (bw->constraints && bw->con_alive) {
+            for (uint32_t i = 0; i < bw->con_capacity; ++i) {
+                if (!bw->con_alive[i] || !bw->constraints[i]) continue;
+                btTypedConstraint *con = bw->constraints[i];
+                if (&con->getRigidBodyA() == body ||
+                    &con->getRigidBodyB() == body) {
+                    bw->world->removeConstraint(con);
+                    delete con;
+                    bw->constraints[i] = nullptr;
+                    bw->con_alive[i]   = false;
+                    bw->con_count--;
+                }
+            }
+        }
         bw->world->removeRigidBody(body);
         delete body->getMotionState();
         delete body;
@@ -1197,6 +1231,21 @@ void jce_bullet_body_set_gravity_factor(JceBulletWorld *bw, uint32_t idx,
     /* Per-body gravity = world gravity * factor.  addRigidBody() resets a
      * body's gravity to the world value, so this must run post-create. */
     body->setGravity(bw->world->getGravity() * static_cast<btScalar>(factor));
+    body->activate();
+}
+
+/* Per-axis angular factor.  (0,0,0) locks all rotation so a dynamic body never
+ * tips/rolls but still collides linearly (Unity FreezeRotation); (1,1,1) frees
+ * it.  Must run post-create (addRigidBody does not reset it, but the component
+ * default is applied here for symmetry with gravity). */
+void jce_bullet_body_set_angular_factor(JceBulletWorld *bw, uint32_t idx,
+                                        jce_vec3 factor)
+{
+    uint32_t slot = resolve_body(bw, idx);
+    if (slot == UINT32_MAX) return;
+    btRigidBody *body = bw->bodies[slot];
+    if (!body) return;
+    body->setAngularFactor(to_bt(factor));
     body->activate();
 }
 
@@ -1808,6 +1857,114 @@ void jce_bullet_constraint_set_limits(JceBulletWorld *bw, uint32_t idx,
     }
 }
 
+/* ── Configurable joint (Unity-style per-axis 6DOF) ──────────────────
+ *
+ * A btGeneric6DofConstraint with INDEPENDENT per-axis limits, mapped from the
+ * authored Locked/Limited/Free motion of each linear + angular axis.  Built and
+ * registered exactly like jce_bullet_constraint_create's type-3 path (same free-
+ * slot search, same registry arrays, same addConstraint flag) so the returned
+ * slot is destroyed by jce_bullet_constraint_destroy and queried by
+ * jce_bullet_constraint_applied_impulse — no parallel registry.
+ *
+ * btGeneric6DofConstraint axis indices (verified against the type-3 usage above
+ * and getAngular/LinearLimit accessors in the introspection block): 0,1,2 =
+ * linear X/Y/Z; 3,4,5 = angular X/Y/Z.  Per-axis setLimit(axis, lo, hi):
+ *   LOCKED  -> setLimit(axis, 0, 0)            (lo == hi  -> axis is locked)
+ *   FREE    -> setLimit(axis, 1, 0)            (lo  > hi  -> axis is free)
+ *   LIMITED -> setLimit(axis, -L, +L)          (symmetric bound) */
+static void cfg_apply_axis(btGeneric6DofConstraint *dof, int axis,
+                           int motion, btScalar limit)
+{
+    switch (motion) {
+    case 2: /* JCE_CFG_JOINT_FREE   */ dof->setLimit(axis, btScalar(1), btScalar(0)); break;
+    case 1: /*   JCE_CFG_JOINT_LOCKED */
+    default:                           dof->setLimit(axis, btScalar(0), btScalar(0)); break;
+    }
+}
+
+uint32_t jce_bullet_configurable_joint_create(JceBulletWorld *bw,
+                                              uint32_t body_a, uint32_t body_b,
+                                              jce_vec3 anchor_a,
+                                              jce_vec3 anchor_b,
+                                              const int lin_motion[3],
+                                              const int ang_motion[3],
+                                              float linear_limit,
+                                              const float angular_limit_rad[3],
+                                              bool disable_collision)
+{
+    if (!bw) return UINT32_MAX;
+    uint32_t slot_a = resolve_body(bw, body_a);
+    if (slot_a == UINT32_MAX) return UINT32_MAX;
+
+    /* Free constraint slot (same rotating cursor as the typed-constraint path). */
+    uint32_t idx = UINT32_MAX;
+    for (uint32_t n = 0; n < bw->con_capacity; ++n) {
+        uint32_t i = (bw->con_alloc_cursor + n) % bw->con_capacity;
+        if (!bw->con_alive[i]) { idx = i; break; }
+    }
+    if (idx == UINT32_MAX) return UINT32_MAX;
+    bw->con_alloc_cursor = (idx + 1u) % bw->con_capacity;
+
+    btRigidBody *rb_a = bw->bodies[slot_a];
+    btRigidBody *rb_b = nullptr;
+    uint32_t slot_b = resolve_body(bw, body_b);
+    bool has_b = (slot_b != UINT32_MAX);
+    if (has_b) rb_b = bw->bodies[slot_b];
+
+    /* Frames: identity basis + the anchor as origin on A.  For body B we
+     * AUTO-CONFIGURE the connected frame to the world position of frame_a at
+     * spawn (Unity autoConfigureConnectedAnchor default) so a LOCKED axis HOLDS
+     * the bodies' current relative pose instead of collapsing them to anchor
+     * coincidence.  (anchor_b is the auto-configured value; an explicit
+     * rest-offset connected_anchor is a follow-up.) */
+    btTransform frame_a, frame_b;
+    frame_a.setIdentity();
+    frame_a.setOrigin(to_bt(anchor_a));
+    frame_b.setIdentity();
+    frame_b.setOrigin(to_bt(anchor_b));
+    if (has_b && rb_b) {
+        btTransform world_anchor = rb_a->getCenterOfMassTransform() * frame_a;
+        frame_b = rb_b->getCenterOfMassTransform().inverse() * world_anchor;
+    }
+
+    btGeneric6DofConstraint *dof = nullptr;
+    if (has_b && rb_b) {
+        dof = new btGeneric6DofConstraint(*rb_a, *rb_b, frame_a, frame_b, true);
+    } else {
+        /* World-anchored: single-body ctor, useLinearReferenceFrameA = true
+         * (Bullet substitutes its static fixed body for side B). */
+        dof = new btGeneric6DofConstraint(*rb_a, frame_a, true);
+    }
+    if (!dof) return UINT32_MAX;
+
+    btScalar lin = btScalar(linear_limit);
+    for (int a = 0; a < 3; ++a)
+        cfg_apply_axis(dof, a, lin_motion ? lin_motion[a] : 0, lin);
+    for (int a = 0; a < 3; ++a) {
+        btScalar al = angular_limit_rad ? btScalar(angular_limit_rad[a]) : btScalar(0);
+        cfg_apply_axis(dof, 3 + a, ang_motion ? ang_motion[a] : 0, al);
+    }
+
+    bw->world->addConstraint(dof, disable_collision);
+    bw->constraints[idx] = dof;
+    bw->con_alive[idx]   = true;
+    bw->con_count++;
+
+    return idx;
+}
+
+float jce_bullet_constraint_applied_impulse(JceBulletWorld *bw, uint32_t idx)
+{
+    if (!bw || idx >= bw->con_capacity || !bw->con_alive[idx]) return 0.0f;
+    btTypedConstraint *con = bw->constraints[idx];
+    if (!con) return 0.0f;
+    /* btTypedConstraint accumulates m_appliedImpulse each solver step while the
+     * constraint is in the world; getAppliedImpulse() returns its magnitude.
+     * btFabs comes from Bullet's btScalar.h (always included via
+     * btBulletDynamicsCommon.h) so no extra <cmath> dependency is needed. */
+    return static_cast<float>(btFabs(con->getAppliedImpulse()));
+}
+
 /* ================================================================== */
 /* Joint introspection (P3-C.6)                                        */
 /* ================================================================== */
@@ -2376,6 +2533,9 @@ uint32_t jce_bullet_vehicle_create(JceBulletWorld *bw,
     /* Chassis must never sleep — wheels rely on continuous integration. */
     chassis->setActivationState(DISABLE_DEACTIVATION);
     chassis->setUserPointer(reinterpret_cast<void *>(static_cast<uintptr_t>(idx)));
+    /* Mark as a vehicle chassis so the contact dispatch skips it (its
+     * user-pointer is a vehicle index, NOT a packed body handle). */
+    chassis->setUserIndex(JCE_BULLET_VEHICLE_CHASSIS_USERINDEX);
     bw->world->addRigidBody(chassis,
         static_cast<int>(col_group), static_cast<int>(col_mask));
 
@@ -2560,6 +2720,12 @@ void jce_bullet_enumerate_pairs(JceBulletWorld *bw,
         const btCollisionObject *obj_a = manifold->getBody0();
         const btCollisionObject *obj_b = manifold->getBody1();
         if (!obj_a || !obj_b) continue;
+
+        /* Skip vehicle chassis (user-pointer is a vehicle index, not a body
+           handle) — decoding it aliases / stale-resolves a real body slot. */
+        if (obj_a->getUserIndex() == JCE_BULLET_VEHICLE_CHASSIS_USERINDEX ||
+            obj_b->getUserIndex() == JCE_BULLET_VEHICLE_CHASSIS_USERINDEX)
+            continue;
 
         /* Pick the deepest (most negative distance) active contact. */
         int  best   = -1;

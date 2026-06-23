@@ -83,6 +83,7 @@ struct ProfilerState {
         uint32_t draws;
     };
     std::vector<ViewRow> view_rows;
+    int view_rows_frame = -1;   /* ImGui frame the snapshot was taken on */
     int      sort_col   = 2;   /* 0=id 1=name 2=gpu 3=cpu 4=draws */
     bool     sort_desc  = true;
 };
@@ -93,6 +94,27 @@ template <typename T>
 void push_ring(T *ring, T v)
 {
     ring[s_prof.head] = v;
+}
+
+/* Rebuild the per-view row snapshot from a fresh stats capture.  Shared
+ * by the CPU tab's sampler and the Frame Debugger tab (whose own copy of
+ * this table was removed — single implementation, see
+ * jce_panel_profiler_draw_view_table). */
+void refill_view_rows(const JceFrameStats *st)
+{
+    s_prof.view_rows.clear();
+    s_prof.view_rows.reserve(st->view_stats_count);
+    for (int i = 0; i < st->view_stats_count; ++i) {
+        const JceViewStats *v = &st->view_stats[i];
+        ProfilerState::ViewRow r;
+        r.id = v->view_id;
+        std::snprintf(r.name, sizeof(r.name), "%s", v->name);
+        r.cpu_ms = (float)((double)(v->cpu_time_end - v->cpu_time_begin) * 1000.0 / (double)s_prof.cpu_freq);
+        r.gpu_ms = (float)((double)(v->gpu_time_end - v->gpu_time_begin) * 1000.0 / (double)s_prof.gpu_freq);
+        r.draws  = 0; /* per-view draw count not in this stats struct */
+        s_prof.view_rows.push_back(r);
+    }
+    s_prof.view_rows_frame = ImGui::GetFrameCount();
 }
 
 void push_sample(float dt_ms)
@@ -135,18 +157,7 @@ void push_sample(float dt_ms)
         vram_mb = (float)((double)vram / (1024.0 * 1024.0));
 
         /* View rows snapshot (rebuilt each frame, then sorted on demand) */
-        s_prof.view_rows.clear();
-        s_prof.view_rows.reserve(st->view_stats_count);
-        for (int i = 0; i < st->view_stats_count; ++i) {
-            const JceViewStats *v = &st->view_stats[i];
-            ProfilerState::ViewRow r;
-            r.id = v->view_id;
-            std::snprintf(r.name, sizeof(r.name), "%s", v->name);
-            r.cpu_ms = (float)((double)(v->cpu_time_end - v->cpu_time_begin) * 1000.0 / (double)s_prof.cpu_freq);
-            r.gpu_ms = (float)((double)(v->gpu_time_end - v->gpu_time_begin) * 1000.0 / (double)s_prof.gpu_freq);
-            r.draws  = 0; /* per-view draw count not in this stats struct */
-            s_prof.view_rows.push_back(r);
-        }
+        refill_view_rows(st);
     }
 
     s_prof.frame_ms[s_prof.head] = dt_ms;
@@ -280,7 +291,9 @@ void draw_view_table()
         for (const auto &r : s_prof.view_rows) {
             ImGui::TableNextRow();
             ImGui::TableNextColumn(); ImGui::Text("%d", r.id);
-            ImGui::TableNextColumn(); ImGui::TextUnformatted(r.name[0] ? r.name : "(unnamed)");
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(r.name[0] ? r.name
+                : jce_editor_i18n("profiler.unnamedView"));
             ImGui::TableNextColumn();
             ImU32 c_gpu = (r.gpu_ms > 5.0f) ? IM_COL32(255, 120, 80, 255)
                                              : IM_COL32(160, 200, 240, 255);
@@ -1006,9 +1019,8 @@ void draw_workbench(void)
     char fd_label [96];
     std::snprintf(cpu_label, sizeof(cpu_label), "%s###pf_tab_cpu",
                   jce_editor_i18n("profiler.title"));
-    /* No memoryProfiler.title key exists; layout historically uses a
-     * literal "Memory Profiler" label too. */
-    std::snprintf(mem_label, sizeof(mem_label), "Memory###pf_tab_memory");
+    std::snprintf(mem_label, sizeof(mem_label), "%s###pf_tab_memory",
+                  jce_editor_i18n("memoryProfiler.title"));
     std::snprintf(ana_label, sizeof(ana_label), "%s###pf_tab_analyzer",
                   jce_editor_i18n("profileAnalyzer.title"));
     std::snprintf(fd_label,  sizeof(fd_label),  "%s###pf_tab_framedbg",
@@ -1040,6 +1052,22 @@ void draw_workbench(void)
 }
 
 } /* anonymous namespace */
+
+/* Shared per-view GPU/CPU table — the single implementation, consumed by
+ * both the CPU tab and the Frame Debugger tab (which used to carry its
+ * own duplicate).  The CPU tab's sampler only runs while that tab is
+ * active, so refresh the snapshot here when this frame hasn't sampled. */
+extern "C" void jce_panel_profiler_draw_view_table(void)
+{
+    if (s_prof.view_rows_frame != ImGui::GetFrameCount()) {
+        if (const JceFrameStats *st = jce_gfx_stats_capture()) {
+            s_prof.cpu_freq = st->cpu_timer_freq > 0 ? st->cpu_timer_freq : 1;
+            s_prof.gpu_freq = st->gpu_timer_freq > 0 ? st->gpu_timer_freq : 1;
+            refill_view_rows(st);
+        }
+    }
+    draw_view_table();
+}
 
 extern "C" void jce_panel_profiler_request_tab(int idx)
 {

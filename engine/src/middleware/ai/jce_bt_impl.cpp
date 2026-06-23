@@ -9,6 +9,7 @@
 
 #include <behaviortree_cpp/action_node.h>
 #include <behaviortree_cpp/bt_factory.h>
+#include <behaviortree_cpp/condition_node.h>
 #include <behaviortree_cpp/control_node.h>
 #include <behaviortree_cpp/decorator_node.h>
 #include <behaviortree_cpp/loggers/bt_observer.h>
@@ -27,6 +28,13 @@ extern "C" {
 extern "C" {
 #include <jce/os/core/jce_log.h>
 }
+
+extern "C" {
+#include <jce/middleware/ai/jce_perception.h>   /* JceBlackboard */
+#include <jce/os/core/jce_hash.h>               /* jce_fnv1a32_str */
+}
+
+#include <cstdlib>   /* strtol / strtod */
 
 #define LOG_TAG "bt_impl"
 
@@ -90,6 +98,11 @@ struct JceBtBackend {
      * tree's nodes and must die before the nodes do. */
     std::vector<std::unique_ptr<BT::TreeObserver>> observers;
     bool lenient = false;   /* lenient load mode (see jce_bt_set_lenient_load) */
+
+    /* Per-tick environment for the bundled deterministic library
+     * (jce_bt_backend_register_library).  Updated by set_env before each tick;
+     * library nodes hold a back-pointer to this backend and read it live. */
+    JceBtTickEnv env = { nullptr, 0.0f, nullptr, nullptr };
 };
 
 /* ── Create / Destroy ───────────────────────────────────────────── */
@@ -134,6 +147,381 @@ void jce_bt_backend_register_action(JceBtBackend *b, const char *name,
         builder);
 
     LOG_DEBUG(LOG_TAG, "registered action '%s'", name);
+}
+
+/* ── Bundled deterministic node library ──────────────────────────────
+ *
+ * These nodes operate on the JceBlackboard + dt carried by the backend's
+ * `env` (set by jce_bt_backend_set_env before each tick).  Every node holds a
+ * back-pointer to the backend so it always reads the live env.  Time is the
+ * caller-supplied deterministic `dt`, never wall-clock — so trees using Wait
+ * and Cooldown tick reproducibly.
+ *
+ * The four perception conditions (IsTargetVisible / …) stay registered by the
+ * runtime via jce_bt_backend_register_action; this library is additive. */
+
+/* Classify a port token as bool / int / float / string and (optionally) write
+ * it to the blackboard.  The blackboard has no string kind, so non-numeric
+ * non-bool tokens are stored as an FNV-1a int HASH of the token; this lets two
+ * equal strings (e.g. the SetValue value and a BlackboardCheck literal) round-
+ * trip to an exact integer compare without a string allocation.  Distinct
+ * strings collide only on a 32-bit hash clash — negligible for AI state tags
+ * ("patrol"/"attack"/"flee"). */
+static void bt_lib_set_value(JceBlackboard *bb, const std::string &key,
+                             const std::string &val)
+{
+    if (!bb || key.empty()) return;
+
+    if (val == "true" || val == "false") {
+        jce_blackboard_set_bool(bb, key.c_str(), val == "true");
+        return;
+    }
+    /* Try integer (whole string consumed, no fractional part). */
+    if (!val.empty()) {
+        char *end = nullptr;
+        long iv = std::strtol(val.c_str(), &end, 10);
+        if (end && *end == '\0') {
+            jce_blackboard_set_int(bb, key.c_str(), (int)iv);
+            return;
+        }
+    }
+    /* Try float (whole string consumed). */
+    if (!val.empty()) {
+        char *end = nullptr;
+        double dv = std::strtod(val.c_str(), &end);
+        if (end && *end == '\0') {
+            jce_blackboard_set_float(bb, key.c_str(), (float)dv);
+            return;
+        }
+    }
+    /* Non-numeric string -> stable hash stored as an int. */
+    jce_blackboard_set_int(bb, key.c_str(),
+                           (int)jce_fnv1a32_str(val.c_str()));
+}
+
+/* True when blackboard[key] equals the port literal `want`, comparing in the
+ * stored slot's own type: bool vs "true"/"false", int/float by numeric value,
+ * and a hashed string slot vs hash(want).  False when the key is absent. */
+static bool bt_lib_value_equals(const JceBlackboard *bb, const std::string &key,
+                                const std::string &want)
+{
+    switch (jce_blackboard_kind(bb, key.c_str())) {
+    case JCE_BB_BOOL: {
+        bool stored = jce_blackboard_get_bool(bb, key.c_str(), false);
+        return (want == (stored ? "true" : "false"));
+    }
+    case JCE_BB_INT: {
+        int stored = jce_blackboard_get_int(bb, key.c_str(), 0);
+        /* `want` may be an integer literal OR a string tag: compare against the
+         * literal value first, then against its hash (string-tag case). */
+        char *end = nullptr;
+        long iv = std::strtol(want.c_str(), &end, 10);
+        if (end && *end == '\0' && !want.empty())
+            return stored == (int)iv;
+        return stored == (int)jce_fnv1a32_str(want.c_str());
+    }
+    case JCE_BB_FLOAT: {
+        float stored = jce_blackboard_get_float(bb, key.c_str(), 0.0f);
+        char *end = nullptr;
+        double dv = std::strtod(want.c_str(), &end);
+        if (end && *end == '\0' && !want.empty())
+            return stored == (float)dv;
+        return false;
+    }
+    default:
+        return false;   /* absent / unsupported kind */
+    }
+}
+
+/* Wait(sec): RUNNING until `sec` seconds of accumulated dt elapse -> SUCCESS.
+ * Re-entry from IDLE restarts the timer (StatefulActionNode::onStart). */
+class JceBtWaitNode : public BT::StatefulActionNode {
+public:
+    JceBtWaitNode(const std::string &name, const BT::NodeConfig &cfg,
+                  JceBtBackend *b)
+        : BT::StatefulActionNode(name, cfg), backend_(b) {}
+
+    static BT::PortsList providedPorts()
+    {
+        return { BT::InputPort<double>("sec", 1.0,
+                 "Seconds to wait before returning SUCCESS") };
+    }
+
+    BT::NodeStatus onStart() override
+    {
+        duration_ = 1.0;
+        getInput("sec", duration_);
+        if (duration_ <= 0.0) return BT::NodeStatus::SUCCESS;
+        /* Seed the timer with the FIRST tick's dt: onStart runs on the tick
+         * that begins the wait, and that tick advanced the world by env.dt.
+         * Dropping it (elapsed_=0) made Wait take one extra frame to complete.
+         * If a single tick's dt already covers the full duration, finish now. */
+        elapsed_ = (double)(backend_ ? backend_->env.dt : 0.0f);
+        return (elapsed_ >= duration_) ? BT::NodeStatus::SUCCESS
+                                       : BT::NodeStatus::RUNNING;
+    }
+
+    BT::NodeStatus onRunning() override
+    {
+        elapsed_ += (double)(backend_ ? backend_->env.dt : 0.0f);
+        return (elapsed_ >= duration_) ? BT::NodeStatus::SUCCESS
+                                       : BT::NodeStatus::RUNNING;
+    }
+
+    void onHalted() override { elapsed_ = 0.0; }
+
+private:
+    JceBtBackend *backend_;
+    double elapsed_ = 0.0;
+    double duration_ = 1.0;
+};
+
+/* SetBlackboard(key,value): write a typed value, SUCCESS. */
+class JceBtSetBlackboardNode : public BT::SyncActionNode {
+public:
+    JceBtSetBlackboardNode(const std::string &name, const BT::NodeConfig &cfg,
+                           JceBtBackend *b)
+        : BT::SyncActionNode(name, cfg), backend_(b) {}
+
+    static BT::PortsList providedPorts()
+    {
+        return { BT::InputPort<std::string>("key",   "Blackboard key to set"),
+                 BT::InputPort<std::string>("value", "Value (true/false/int/float/string)") };
+    }
+
+    BT::NodeStatus tick() override
+    {
+        if (!backend_ || !backend_->env.bb) return BT::NodeStatus::FAILURE;
+        std::string key, val;
+        getInput("key", key);
+        getInput("value", val);
+        if (key.empty()) return BT::NodeStatus::FAILURE;
+        bt_lib_set_value(backend_->env.bb, key, val);
+        return BT::NodeStatus::SUCCESS;
+    }
+
+private:
+    JceBtBackend *backend_;
+};
+
+/* ClearBlackboard(key): remove a key, or clear ALL keys when key omitted. */
+class JceBtClearBlackboardNode : public BT::SyncActionNode {
+public:
+    JceBtClearBlackboardNode(const std::string &name, const BT::NodeConfig &cfg,
+                             JceBtBackend *b)
+        : BT::SyncActionNode(name, cfg), backend_(b) {}
+
+    static BT::PortsList providedPorts()
+    {
+        return { BT::InputPort<std::string>("key", "",
+                 "Key to remove; empty clears the whole blackboard") };
+    }
+
+    BT::NodeStatus tick() override
+    {
+        if (!backend_ || !backend_->env.bb) return BT::NodeStatus::FAILURE;
+        std::string key;
+        getInput("key", key);
+        if (key.empty()) {
+            jce_blackboard_clear(backend_->env.bb);
+        } else {
+            jce_blackboard_remove(backend_->env.bb, key.c_str());
+        }
+        return BT::NodeStatus::SUCCESS;
+    }
+
+private:
+    JceBtBackend *backend_;
+};
+
+/* BlackboardCheck(key,value): SUCCESS when bb[key] lexically equals value. */
+class JceBtBlackboardCheckNode : public BT::ConditionNode {
+public:
+    JceBtBlackboardCheckNode(const std::string &name, const BT::NodeConfig &cfg,
+                             JceBtBackend *b)
+        : BT::ConditionNode(name, cfg), backend_(b) {}
+
+    static BT::PortsList providedPorts()
+    {
+        return { BT::InputPort<std::string>("key",   "Blackboard key to test"),
+                 BT::InputPort<std::string>("value", "Expected value (lexical)") };
+    }
+
+    BT::NodeStatus tick() override
+    {
+        if (!backend_ || !backend_->env.bb) return BT::NodeStatus::FAILURE;
+        std::string key, want;
+        getInput("key", key);
+        getInput("value", want);
+        if (key.empty() || !jce_blackboard_has(backend_->env.bb, key.c_str()))
+            return BT::NodeStatus::FAILURE;
+        return bt_lib_value_equals(backend_->env.bb, key, want)
+                   ? BT::NodeStatus::SUCCESS : BT::NodeStatus::FAILURE;
+    }
+
+private:
+    JceBtBackend *backend_;
+};
+
+/* Cooldown(sec): tick the child only once every `sec` seconds of dt.  While
+ * gated, returns FAILURE without ticking the child.  A RUNNING child passes
+ * through (the cooldown timer starts when the child COMPLETES).  First entry
+ * is never gated. */
+class JceBtCooldownNode : public BT::DecoratorNode {
+public:
+    JceBtCooldownNode(const std::string &name, const BT::NodeConfig &cfg,
+                      JceBtBackend *b)
+        : BT::DecoratorNode(name, cfg), backend_(b) {}
+
+    static BT::PortsList providedPorts()
+    {
+        return { BT::InputPort<double>("sec", 1.0,
+                 "Minimum seconds between successive child completions") };
+    }
+
+    BT::NodeStatus tick() override
+    {
+        double sec = 1.0;
+        getInput("sec", sec);
+
+        if (gated_) {
+            since_ += (double)(backend_ ? backend_->env.dt : 0.0f);
+            if (since_ < sec) {
+                /* Still cooling down: block without ticking the child. */
+                return BT::NodeStatus::FAILURE;
+            }
+            gated_ = false;   /* cooldown expired; allow a fresh run */
+        }
+
+        setStatus(BT::NodeStatus::RUNNING);
+        BT::NodeStatus cs = child_node_->executeTick();
+        switch (cs) {
+        case BT::NodeStatus::RUNNING:
+            return BT::NodeStatus::RUNNING;
+        case BT::NodeStatus::SUCCESS:
+        case BT::NodeStatus::FAILURE:
+            resetChild();
+            gated_ = true;     /* start the cooldown window */
+            since_ = 0.0;
+            return cs;
+        default:
+            return cs;
+        }
+    }
+
+    void halt() override
+    {
+        /* Keep the cooldown window across halts (gating is per-node lifetime),
+         * but stop a RUNNING child. */
+        resetChild();
+    }
+
+private:
+    JceBtBackend *backend_;
+    bool   gated_ = false;
+    double since_ = 0.0;
+};
+
+/* MoveToTarget(speed): drive the agent toward the blackboard target via the
+ * env move hook.  RUNNING while travelling, SUCCESS on arrival, FAILURE with
+ * no goal / no hook. */
+class JceBtMoveToTargetNode : public BT::StatefulActionNode {
+public:
+    JceBtMoveToTargetNode(const std::string &name, const BT::NodeConfig &cfg,
+                          JceBtBackend *b)
+        : BT::StatefulActionNode(name, cfg), backend_(b) {}
+
+    static BT::PortsList providedPorts()
+    {
+        return { BT::InputPort<double>("speed", 0.0,
+                 "Desired move speed (advisory; the nav hook may clamp)") };
+    }
+
+    BT::NodeStatus onStart() override { return drive(); }
+    BT::NodeStatus onRunning() override { return drive(); }
+    void onHalted() override {}
+
+private:
+    BT::NodeStatus drive()
+    {
+        if (!backend_ || !backend_->env.bb || !backend_->env.move_to)
+            return BT::NodeStatus::FAILURE;
+
+        JceBlackboard *bb = backend_->env.bb;
+        jce_vec3 goal;
+        if (jce_blackboard_kind(bb, "target.position") == JCE_BB_VEC3) {
+            goal = jce_blackboard_get_vec3(bb, "target.position",
+                                           jce_v3(0, 0, 0));
+        } else if (jce_blackboard_kind(bb, "target.last_known_position")
+                   == JCE_BB_VEC3) {
+            goal = jce_blackboard_get_vec3(bb, "target.last_known_position",
+                                           jce_v3(0, 0, 0));
+        } else {
+            return BT::NodeStatus::FAILURE;   /* nothing to move toward */
+        }
+
+        JceBtStatus s = backend_->env.move_to(goal.x, goal.y, goal.z,
+                                              backend_->env.move_userdata);
+        switch (s) {
+        case JCE_BT_SUCCESS: return BT::NodeStatus::SUCCESS;
+        case JCE_BT_RUNNING: return BT::NodeStatus::RUNNING;
+        default:             return BT::NodeStatus::FAILURE;
+        }
+    }
+
+    JceBtBackend *backend_;
+};
+
+/* Register one bundled node, swallowing a BT.CPP "already registered"
+ * exception so the registration is idempotent AND can never escape the C
+ * boundary (a future BT.CPP built-in with the same ID would otherwise call
+ * std::terminate).  Templated on the concrete node so the back-pointer is
+ * captured in the builder. */
+template <class NodeT>
+static void bt_lib_register(JceBtBackend *b, BT::NodeType type,
+                            const char *id)
+{
+    JceBtBackend *bp = b;
+    try {
+        b->factory.registerBuilder(
+            BT::TreeNodeManifest{type, id, NodeT::providedPorts(), {}},
+            [bp](const std::string &n, const BT::NodeConfig &c) {
+                return std::make_unique<NodeT>(n, c, bp);
+            });
+    } catch (const std::exception &e) {
+        LOG_WARN(LOG_TAG, "bundled node '%s' not registered: %s", id, e.what());
+    }
+}
+
+/* Register all bundled library nodes on the factory (idempotent per backend).
+ *
+ * IDs are chosen NOT to collide with BehaviorTree.CPP's built-ins: the backend
+ * already ships a "SetBlackboard"/"UnsetBlackboard" pair that read/write its
+ * OWN internal blackboard, so the JCE perception-blackboard writers are named
+ * "SetValue"/"ClearValue" to stay unambiguous (and avoid the duplicate-ID
+ * throw).  Repeat / RetryUntilSuccessful / Inverter / ForceSuccess|Failure are
+ * built in and need no registration here. */
+void jce_bt_backend_register_library(JceBtBackend *b)
+{
+    if (!b) return;
+
+    bt_lib_register<JceBtWaitNode>           (b, BT::NodeType::ACTION,    "Wait");
+    bt_lib_register<JceBtSetBlackboardNode>  (b, BT::NodeType::ACTION,    "SetValue");
+    bt_lib_register<JceBtClearBlackboardNode>(b, BT::NodeType::ACTION,    "ClearValue");
+    bt_lib_register<JceBtBlackboardCheckNode>(b, BT::NodeType::CONDITION, "BlackboardCheck");
+    bt_lib_register<JceBtCooldownNode>       (b, BT::NodeType::DECORATOR, "Cooldown");
+    bt_lib_register<JceBtMoveToTargetNode>   (b, BT::NodeType::ACTION,    "MoveToTarget");
+
+    LOG_SUCCESS(LOG_TAG, "registered bundled BT library "
+                         "(Wait/SetValue/ClearValue/"
+                         "BlackboardCheck/Cooldown/MoveToTarget)");
+}
+
+void jce_bt_backend_set_env(JceBtBackend *b, const JceBtTickEnv *env)
+{
+    if (!b) return;
+    if (env) b->env = *env;
+    else     b->env = JceBtTickEnv{ nullptr, 0.0f, nullptr, nullptr };
 }
 
 /* ── Tree loading ───────────────────────────────────────────────── */

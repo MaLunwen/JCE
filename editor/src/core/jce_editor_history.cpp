@@ -85,7 +85,7 @@ static size_t history_snapshot_bytes(const EditorHistorySnapshot &snap)
     size_t n = snap.scene_json.capacity() + snap.scene_path.capacity()
                + sizeof(EditorHistorySnapshot);
     for (const auto &kv : snap.component_orders)
-        n += sizeof(uint32_t) + kv.second.capacity() * sizeof(uint64_t);
+        n += sizeof(uint32_t) + kv.second.capacity() * sizeof(int);
     return n;
 }
 

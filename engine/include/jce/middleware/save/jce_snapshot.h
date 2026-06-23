@@ -100,6 +100,13 @@ JCE_API void jce_snapshot_register(JceSnapshotRegistry *r,
 
 JCE_API void jce_snapshot_unregister(JceSnapshotRegistry *r, const char *id);
 
+/* Return the `user` pointer registered for section `id`, or NULL when no
+ * such section is registered.  Lets a provider find and reuse a context it
+ * heap-allocated on a prior registration (e.g. to re-point it at a reloaded
+ * scene without leaking the old one).  NULL `user` registrations are
+ * indistinguishable from absent ones. */
+JCE_API void *jce_snapshot_get_user(JceSnapshotRegistry *r, const char *id);
+
 /* ================================================================== */
 /* Save / load                                                         */
 /* ================================================================== */

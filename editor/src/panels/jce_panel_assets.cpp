@@ -94,6 +94,91 @@ static std::string format_modified_time(const char *path)
     return std::string(buf);
 }
 
+static void reset_asset_browser_view_to_root(const std::string &root)
+{
+    s_assets.current_path = root;
+    s_assets.entries.clear();
+    s_assets.selected_set.clear();
+    s_assets.last_clicked_idx = -1;
+    s_assets.renaming_idx = -1;
+    s_assets.rename_focus_needed = false;
+    s_assets.context_idx = -1;
+    s_assets.entry_flash.clear();
+    s_assets.search_buf[0] = '\0';
+    s_assets.search_active = false;
+    s_assets.search_results.clear();
+    s_assets.last_search_query.clear();
+    s_assets.last_search_root.clear();
+    s_assets.pending_navigation_path.clear();
+    s_assets.pending_navigation_clear_search = false;
+    s_assets.next_auto_refresh_time = 0.0;
+    s_assets.jump_scroll_idx = -1;
+    s_assets.jump_last_char = '\0';
+    s_assets.jump_next_start = 0;
+    s_assets.jump_reset_time = 0.0;
+    s_assets.needs_refresh = true;
+}
+
+bool asset_browser_can_use_root(const std::string &path)
+{
+    if (path.empty()) return false;
+
+    std::string normalized = normalized_path_string(path);
+    if (normalized.empty()) return false;
+    if (is_filesystem_root(normalized.c_str())) return false;
+    return jce_fs_host_exists_dir(normalized.c_str());
+}
+
+static bool set_asset_browser_root(const std::string &path,
+                                   bool simulated,
+                                   bool update_followed_root)
+{
+    if (path.empty()) return false;
+
+    std::string normalized = normalized_path_string(path);
+    if (normalized.empty() ||
+        is_filesystem_root(normalized.c_str()) ||
+        !jce_fs_host_exists_dir(normalized.c_str())) {
+        jce_editor_console_log_level(
+            JCE_CONSOLE_WARNING,
+            "Asset browser: refused project root '%s'",
+            path.c_str());
+        return false;
+    }
+
+    if (update_followed_root)
+        s_assets.followed_project_root = normalized;
+
+    s_assets.project_root = normalized;
+    s_assets.project_root_simulated = simulated;
+    reset_asset_browser_view_to_root(normalized);
+
+    if (!simulated) {
+        /* Rebuild the real project-wide asset path index so resolvers can
+         * do O(1) basename lookups instead of recursive filesystem walks.
+         * Browser-only simulated roots deliberately do not mutate this
+         * global resolver state; scene rendering, Play, Run and build
+         * still follow the actual project root. */
+        jce_asset_path_index_rebuild_async(normalized.c_str());
+        jce_assetdb_set_root(normalized.c_str());
+    }
+    return true;
+}
+
+bool set_asset_browser_simulated_root(const std::string &path)
+{
+    ensure_assets_init();
+    return set_asset_browser_root(path, true, false);
+}
+
+bool restore_asset_browser_project_root(void)
+{
+    ensure_assets_init();
+    if (s_assets.followed_project_root.empty())
+        return false;
+    return set_asset_browser_root(s_assets.followed_project_root, false, false);
+}
+
 void ensure_assets_init(void)
 {
     if (s_assets.initialized) return;
@@ -133,7 +218,9 @@ void ensure_assets_init(void)
                 resolved_root = base_buf;
         }
     }
+    s_assets.followed_project_root = resolved_root;
     s_assets.project_root = resolved_root;
+    s_assets.project_root_simulated = false;
     s_assets.current_path      = s_assets.project_root;
     s_assets.last_clicked_idx  = -1;
     s_assets.renaming_idx      = -1;
@@ -542,24 +629,18 @@ void jce_editor_assets_set_project(const char *path)
 {
     ensure_assets_init();
     if (!path || !path[0]) return;
-    std::string normalized = normalized_path_string(path);
-    if (s_assets.project_root == normalized) return;
-    s_assets.project_root  = normalized;
-    navigate_asset_directory(normalized, true);
 
-    /* Rebuild the project-wide asset path index so resolvers can do
-     * O(1) basename lookups instead of recursive filesystem walks.
-     * Mirrors Unity's import-time GUID/path table at a coarser
-     * granularity (basename only).  Runs on a background worker (REPLACE)
-     * so opening a project never freezes the UI; the old index stays
-     * queryable until the new one swaps in (jce_asset_path_index_poll). */
-    jce_asset_path_index_rebuild_async(normalized.c_str());
-    jce_assetdb_set_root(normalized.c_str());
+    /* Opening a real project clears any temporary Asset Browser root.
+     * The effective browser root and the editor-wide asset index both
+     * return to the actual project directory. */
+    set_asset_browser_root(path, false, true);
 }
 
 const char *jce_editor_assets_get_project(void)
 {
     ensure_assets_init();
+    if (!s_assets.followed_project_root.empty())
+        return s_assets.followed_project_root.c_str();
     return s_assets.project_root.c_str();
 }
 

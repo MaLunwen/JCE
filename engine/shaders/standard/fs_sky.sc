@@ -11,12 +11,33 @@ $input v_texcoord0
  * Default values are set on the CPU side before each submit. */
 uniform vec4 u_sky_colors[3];
 
-/* u_sky_params.x = mode  (0 = gradient, 1 = equirect HDR)
+/* u_sky_params.x = mode  (0 = gradient, 1 = equirect HDR, 2 = Preetham)
  * u_sky_params.y = exposure
- * u_sky_params.z = y-rotation (radians) */
+ * u_sky_params.z = y-rotation (radians, equirect mode only) */
 uniform vec4 u_sky_params;
 
+/* ── Preetham analytic sky (mode 2) — GPU twin of jce_sky.c ──────────
+ * Mirror of jce_sky_radiance(): keep this byte-aligned with the C math.
+ *
+ *   u_sky_perez[0] = Y channel A..D   (.x=A .y=B .z=C .w=D)
+ *   u_sky_perez[1] = x channel A..D
+ *   u_sky_perez[2] = y channel A..D
+ *   u_sky_perez[3] = E coeffs         (.x=EY .y=Ex .z=Ey  .w unused)
+ *   u_sky_zenith   = (.x=Yz .y=xz .z=yz  .w=normalize flag)
+ *   u_sky_sun_dir  = unit vector toward the sun (.xyz) */
+uniform vec4 u_sky_perez[4];
+uniform vec4 u_sky_zenith;
+uniform vec4 u_sky_sun_dir;
+
 SAMPLER2D(s_equirect, 0);
+
+/* Perez F(theta,gamma): abcde = (A,B,C,D,E). Identical to sky_perez(). */
+float sky_perez(vec4 abcd, float E, float cos_theta, float gamma)
+{
+    float cg = cos(gamma);
+    return (1.0 + abcd.x * exp(abcd.y / cos_theta))
+         * (1.0 + abcd.z * exp(abcd.w * gamma) + E * cg * cg);
+}
 
 void main()
 {
@@ -25,7 +46,50 @@ void main()
     vec4 farH  = mul(u_invViewProj, vec4(v_texcoord0,  1.0, 1.0));
     vec3 dir   = normalize(farH.xyz / farH.w - nearH.xyz / nearH.w);
 
-    if (u_sky_params.x > 0.5) {
+    if (u_sky_params.x > 1.5) {
+        /* ── Preetham analytic daylight (mode 2) ──────────────────── */
+        /* theta = view-zenith angle; clamp cos just above 0 (sky hemi). */
+        float cos_theta = clamp(dir.y, 0.01, 1.0);
+
+        float cos_gamma = clamp(dot(dir, u_sky_sun_dir.xyz), -1.0, 1.0);
+        float gamma     = acos(cos_gamma);
+
+        float cos_ts  = clamp(u_sky_sun_dir.y, 0.01, 1.0);
+        float theta_s = acos(cos_ts);
+
+        /* F(0, theta_s): cos(0)=1, gamma=theta_s. */
+        float fY0 = sky_perez(u_sky_perez[0], u_sky_perez[3].x, 1.0, theta_s);
+        float fx0 = sky_perez(u_sky_perez[1], u_sky_perez[3].y, 1.0, theta_s);
+        float fy0 = sky_perez(u_sky_perez[2], u_sky_perez[3].z, 1.0, theta_s);
+        fY0 = (abs(fY0) < 1e-6) ? 1e-6 : fY0;
+        fx0 = (abs(fx0) < 1e-6) ? 1e-6 : fx0;
+        fy0 = (abs(fy0) < 1e-6) ? 1e-6 : fy0;
+
+        float Y = u_sky_zenith.x * sky_perez(u_sky_perez[0], u_sky_perez[3].x, cos_theta, gamma) / fY0;
+        float x = u_sky_zenith.y * sky_perez(u_sky_perez[1], u_sky_perez[3].y, cos_theta, gamma) / fx0;
+        float y = u_sky_zenith.z * sky_perez(u_sky_perez[2], u_sky_perez[3].z, cos_theta, gamma) / fy0;
+
+        Y = max(Y, 0.0);
+        if (u_sky_zenith.w > 0.5) {
+            float Yz = max(u_sky_zenith.x, 1e-6);
+            Y /= Yz;
+        }
+
+        /* xyY -> XYZ (guard y). */
+        y = max(y, 1e-4);
+        float X = (x / y) * Y;
+        float Z = ((1.0 - x - y) / y) * Y;
+
+        /* XYZ -> linear sRGB (D65) — mirrors jce_sky_radiance(). */
+        vec3 col;
+        col.r =  3.2404542 * X - 1.5371385 * Y - 0.4985314 * Z;
+        col.g = -0.9692660 * X + 1.8760108 * Y + 0.0415560 * Z;
+        col.b =  0.0556434 * X - 0.2040259 * Y + 1.0572252 * Z;
+
+        col *= u_sky_params.y;          /* exposure */
+        col  = max(col, vec3_splat(0.0));
+        gl_FragColor = vec4(col, 1.0);
+    } else if (u_sky_params.x > 0.5) {
         /* Equirectangular HDR sky. */
         /* Apply Y-axis rotation. */
         float cosR = cos(u_sky_params.z);

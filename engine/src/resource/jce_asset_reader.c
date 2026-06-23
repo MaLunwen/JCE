@@ -6,6 +6,7 @@
  */
 
 #include "jce_asset_reader.h"
+#include "jce_read_bounds.h"
 
 #include <string.h>
 #include <zstd.h>
@@ -45,10 +46,12 @@ bool jce_asset_open(JceAssetView *view, const void *data, size_t size)
     /* Version check. */
     if (hdr->version != JCEASSET_VERSION) return false;
 
-    /* Bounds-check chunk table. */
+    /* Bounds-check chunk table (overflow-safe: n * ENTRY can wrap size_t on
+     * 32-bit targets — never multiply against a file-controlled count). */
     uint32_t n = hdr->chunk_count;
-    size_t toc_end = JCEASSET_HEADER_SIZE + (size_t)n * JCEASSET_CHUNK_ENTRY_SIZE;
-    if (toc_end > size) return false;
+    if (!jce_count_fits(n, JCEASSET_CHUNK_ENTRY_SIZE,
+                        (uint64_t)size - JCEASSET_HEADER_SIZE))
+        return false;
 
     view->header    = hdr;
     view->chunks    = (const JceAssetChunkEntry *)(blob + JCEASSET_HEADER_SIZE);
@@ -84,8 +87,10 @@ size_t jce_asset_chunk_data(const JceAssetView *view,
 {
     if (!view || !chunk || !out_buf || out_size == 0) return 0;
 
-    /* Bounds-check the chunk data region. */
-    if (chunk->data_offset + chunk->compressed_size > view->blob_size)
+    /* Bounds-check the chunk data region (overflow-safe: data_offset is
+     * file-controlled and data_offset + compressed_size can wrap uint64). */
+    if (!jce_region_in_bounds(chunk->data_offset, chunk->compressed_size,
+                              view->blob_size))
         return 0;
 
     const uint8_t *src = view->blob + chunk->data_offset;
@@ -99,9 +104,11 @@ size_t jce_asset_chunk_data(const JceAssetView *view,
         return result;
     }
 
-    /* Uncompressed — copy up to out_size bytes. */
+    /* Uncompressed — copy up to out_size bytes, but never read past the
+     * validated source region [data_offset, data_offset + compressed_size). */
     size_t to_copy = chunk->original_size;
     if (to_copy > out_size) to_copy = out_size;
+    if (to_copy > chunk->compressed_size) to_copy = chunk->compressed_size;
     memcpy(out_buf, src, to_copy);
     return to_copy;
 }

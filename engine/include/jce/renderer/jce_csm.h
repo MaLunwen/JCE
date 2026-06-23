@@ -24,6 +24,13 @@ typedef struct {
     float    splits[JCE_CSM_MAX_CASCADES + 1];
     /* Light-space VP matrix per cascade. */
     jce_mat4 vp[JCE_CSM_MAX_CASCADES];
+    /* World-space bounding sphere of each cascade's camera-frustum slice
+     * (centre + radius).  Exposed so the shadow pass can cull casters that lie
+     * outside a cascade's coverage (per-cascade caster culling), bounding the
+     * per-frame shadow draws/uniforms.  Cull conservatively (add a margin toward
+     * the light) so casters between the sphere and the sun are not dropped. */
+    jce_vec3 center[JCE_CSM_MAX_CASCADES];
+    float    radius[JCE_CSM_MAX_CASCADES];
     uint32_t cascade_count;
 } JceCsmData;
 
@@ -41,6 +48,16 @@ typedef struct {
  * @param homogeneous_depth  bgfx homogeneous depth flag.
  * @param shadow_map_size Shadow map resolution used by cascades.
  * @param split_lambda   Practical split blend (0=linear, 1=logarithmic).
+ * @param caster_aabb_min World-space min corner of the shadow-caster bounds, or
+ *                        NULL. When supplied, each cascade's light-space NEAR
+ *                        plane is extended toward the light to enclose casters
+ *                        that sit between the camera-frustum cascade sphere and
+ *                        the sun (e.g. tall buildings).  Without this the near
+ *                        plane is anchored to the camera sphere and tall casters
+ *                        are clipped out of the shadow map, so their shadows
+ *                        truncate and the truncation moves with the camera.
+ * @param caster_aabb_max World-space max corner of the shadow-caster bounds, or
+ *                        NULL (disables the near-plane extension; legacy fit).
  */
 void jce_csm_compute(JceCsmData *out,
                      uint32_t cascade_count,
@@ -52,7 +69,9 @@ void jce_csm_compute(JceCsmData *out,
                      const jce_vec3 *light_dir,
                      bool homogeneous_depth,
                      uint16_t shadow_map_size,
-                     float split_lambda);
+                     float split_lambda,
+                     const jce_vec3 *caster_aabb_min,
+                     const jce_vec3 *caster_aabb_max);
 
 JCE_EXTERN_C_END
 

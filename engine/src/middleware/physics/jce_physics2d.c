@@ -46,12 +46,29 @@ static inline b2BodyType to_b2_body_type(JceBodyType t)
 
 /* ── World struct ─────────────────────────────────────────────────── */
 
+/* One live joint slot.  Mirrors the body pool: a parallel id + alive array.
+ * ground_id is the implicit static body created for a world-anchored joint
+ * (b2_nullBodyId when the joint binds two real bodies), torn down with the
+ * joint so it does not leak. */
+typedef struct {
+    b2JointId joint_id;
+    b2BodyId  ground_id;   /* world-anchor ground body, or b2_nullBodyId */
+    bool      alive;
+} Joint2DSlot;
+
+#define JOINT2D_POOL_CAP 1024u   /* generous fixed cap (matches body-pool style) */
+
 struct JcePhysics2D {
     b2WorldId   world_id;
     b2BodyId   *body_ids;      /* pool: slot index -> b2BodyId          */
     bool       *slot_alive;    /* pool: is this slot occupied?          */
     uint32_t    capacity;
     uint32_t    count;
+
+    /* Joint pool (mirrors the body pool's slot scheme). */
+    Joint2DSlot *joints;       /* pool: slot index -> joint record       */
+    uint32_t     joint_capacity;
+    uint32_t     joint_count;
 };
 
 /* ── Shape area (for density = mass / area) ───────────────────────── */
@@ -158,15 +175,19 @@ JcePhysics2D *jce_physics2d_create(const JcePhysics2DDesc *desc)
 
     w->body_ids   = (b2BodyId *)JCE_CALLOC(max_bodies, sizeof(b2BodyId));
     w->slot_alive = (bool *)JCE_CALLOC(max_bodies, sizeof(bool));
-    if (!w->body_ids || !w->slot_alive) {
+    w->joints     = (Joint2DSlot *)JCE_CALLOC(JOINT2D_POOL_CAP, sizeof(Joint2DSlot));
+    if (!w->body_ids || !w->slot_alive || !w->joints) {
         JCE_FREE(w->body_ids);
         JCE_FREE(w->slot_alive);
+        JCE_FREE(w->joints);
         JCE_FREE(w);
         return NULL;
     }
 
-    w->capacity = max_bodies;
-    w->count    = 0;
+    w->capacity       = max_bodies;
+    w->count          = 0;
+    w->joint_capacity = JOINT2D_POOL_CAP;
+    w->joint_count    = 0;
 
     /* Create Box2D world. */
     b2WorldDef world_def = b2DefaultWorldDef();
@@ -186,10 +207,15 @@ void jce_physics2d_destroy(JcePhysics2D *world)
 {
     if (!world) return;
 
+    /* b2DestroyWorld auto-destroys every body AND joint living in the world,
+     * so we must NOT call b2DestroyJoint afterwards (double-free).  Just drop
+     * the world once; the joint pool's b2JointId/b2BodyId become stale but are
+     * never touched again because we free the pool right below. */
     b2DestroyWorld(world->world_id);
 
     JCE_FREE(world->body_ids);
     JCE_FREE(world->slot_alive);
+    JCE_FREE(world->joints);
     JCE_FREE(world);
 
     LOG_INFO(LOG_TAG, "2D physics world destroyed");
@@ -444,6 +470,149 @@ JceRaycast2DResult jce_physics2d_raycast(const JcePhysics2D *world,
     result.body = (JceBodyHandle){ (uint32_t)(uintptr_t)ud };
 
     return result;
+}
+
+/* ── Joints (Distance / Hinge / Spring) ───────────────────────────── */
+
+/* Resolve a JceBodyHandle to its live b2BodyId (mirrors the guards used by
+ * every body accessor above).  Returns false + b2_nullBodyId if the handle
+ * is invalid, out of range, or its slot is dead. */
+static bool resolve_b2_body(const JcePhysics2D *world, JceBodyHandle h,
+                            b2BodyId *out)
+{
+    *out = b2_nullBodyId;
+    if (!world) return false;
+    if (!jce_body_valid(h) || h.idx >= world->capacity) return false;
+    if (!world->slot_alive[h.idx]) return false;
+    *out = world->body_ids[h.idx];
+    return true;
+}
+
+JceConstraintHandle JCE_CALL jce_physics2d_joint_create(JcePhysics2D *world,
+                                                        const JcePhysics2DJointDesc *desc)
+{
+    if (!world || !desc) return JCE_CONSTRAINT_INVALID;
+
+    /* body_a MUST be a real, live body. */
+    b2BodyId body_a;
+    if (!resolve_b2_body(world, desc->body_a, &body_a)) {
+        LOG_WARN(LOG_TAG, "2D joint: body_a is not a live body");
+        return JCE_CONSTRAINT_INVALID;
+    }
+
+    /* body_b: a real body, or — when INVALID — an implicit static ground
+     * body the joint owns (Box2D 3.1 has no global fixed body; a joint needs
+     * two valid bodies, so the world anchor is a 0-mass static body placed at
+     * the desc's connected/world anchor). */
+    b2BodyId body_b      = b2_nullBodyId;
+    b2BodyId ground_id   = b2_nullBodyId;
+    bool     world_anchor = !jce_body_valid(desc->body_b);
+    if (world_anchor) {
+        b2BodyDef gd  = b2DefaultBodyDef();
+        gd.type       = b2_staticBody;
+        gd.position   = to_b2(desc->anchor_b);   /* world position of the anchor */
+        ground_id     = b2CreateBody(world->world_id, &gd);
+        body_b        = ground_id;
+    } else if (!resolve_b2_body(world, desc->body_b, &body_b)) {
+        LOG_WARN(LOG_TAG, "2D joint: body_b is not a live body");
+        return JCE_CONSTRAINT_INVALID;
+    }
+
+    /* Find a free joint slot (linear scan mirrors the body pool). */
+    uint32_t slot = UINT32_MAX;
+    for (uint32_t i = 0; i < world->joint_capacity; i++) {
+        if (!world->joints[i].alive) { slot = i; break; }
+    }
+    if (slot == UINT32_MAX) {
+        LOG_ERROR(LOG_TAG, "2D joint pool exhausted (%u)", world->joint_capacity);
+        if (world_anchor) b2DestroyBody(ground_id);
+        return JCE_CONSTRAINT_INVALID;
+    }
+
+    /* For a world-anchored joint the ground body's local anchor is the origin
+     * (we placed the ground body AT the anchor point); for a body↔body joint
+     * the local anchor is the authored anchor_b in body_b's local space. */
+    b2Vec2 local_anchor_b = world_anchor ? (b2Vec2){ 0.0f, 0.0f }
+                                         : to_b2(desc->anchor_b);
+
+    b2JointId jid = b2_nullJointId;
+
+    switch (desc->kind) {
+        case JCE_PHYSICS2D_JOINT_DISTANCE:
+        case JCE_PHYSICS2D_JOINT_SPRING: {
+            b2DistanceJointDef def = b2DefaultDistanceJointDef();
+            def.bodyIdA      = body_a;
+            def.bodyIdB      = body_b;
+            def.localAnchorA = to_b2(desc->anchor_a);
+            def.localAnchorB = local_anchor_b;
+            def.length       = desc->distance > 0.0f ? desc->distance : 0.0f;
+            if (desc->kind == JCE_PHYSICS2D_JOINT_SPRING) {
+                def.enableSpring = true;
+                def.hertz        = desc->frequency_hz;
+                def.dampingRatio = desc->damping_ratio;
+            } else {
+                def.enableSpring = false;   /* rigid distance */
+            }
+            jid = b2CreateDistanceJoint(world->world_id, &def);
+            break;
+        }
+
+        case JCE_PHYSICS2D_JOINT_HINGE: {
+            b2RevoluteJointDef def = b2DefaultRevoluteJointDef();
+            def.bodyIdA        = body_a;
+            def.bodyIdB        = body_b;
+            def.localAnchorA   = to_b2(desc->anchor_a);
+            def.localAnchorB   = local_anchor_b;
+            def.enableMotor    = desc->use_motor;
+            def.motorSpeed     = desc->motor_speed_rad_s;
+            def.maxMotorTorque = desc->motor_max_torque;
+            def.enableLimit    = desc->use_limits;
+            def.lowerAngle     = desc->lower_angle_rad;
+            def.upperAngle     = desc->upper_angle_rad;
+            jid = b2CreateRevoluteJoint(world->world_id, &def);
+            break;
+        }
+
+        default:
+            LOG_WARN(LOG_TAG, "2D joint: unknown kind %d", desc->kind);
+            if (world_anchor) b2DestroyBody(ground_id);
+            return JCE_CONSTRAINT_INVALID;
+    }
+
+    if (!b2Joint_IsValid(jid)) {
+        LOG_ERROR(LOG_TAG, "2D joint: Box2D create failed (kind %d)", desc->kind);
+        if (world_anchor) b2DestroyBody(ground_id);
+        return JCE_CONSTRAINT_INVALID;
+    }
+
+    world->joints[slot].joint_id  = jid;
+    world->joints[slot].ground_id = ground_id;   /* b2_nullBodyId if no ground */
+    world->joints[slot].alive     = true;
+    world->joint_count++;
+
+    return (JceConstraintHandle){ slot };
+}
+
+void JCE_CALL jce_physics2d_joint_destroy(JcePhysics2D *world,
+                                          JceConstraintHandle joint)
+{
+    if (!world || !jce_constraint_valid(joint))    return;
+    if (joint.idx >= world->joint_capacity)        return;
+    if (!world->joints[joint.idx].alive)           return;
+
+    Joint2DSlot *s = &world->joints[joint.idx];
+
+    /* Order: destroy the joint first, then the implicit ground body (a body
+     * still referenced by a live joint must not be destroyed under it). */
+    if (b2Joint_IsValid(s->joint_id))
+        b2DestroyJoint(s->joint_id);
+    if (b2Body_IsValid(s->ground_id))
+        b2DestroyBody(s->ground_id);
+
+    s->joint_id  = b2_nullJointId;
+    s->ground_id = b2_nullBodyId;
+    s->alive     = false;
+    world->joint_count--;
 }
 
 /* ── Debug ─────────────────────────────────────────────────────────── */

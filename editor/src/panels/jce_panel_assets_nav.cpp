@@ -3,10 +3,10 @@
  */
 
 #include <jce/os/core/jce_path.h>
-#include <jce/os/platform/jce_host_dialog.h>
 #include <jce/os/platform/jce_host_paths.h>
 
 #include "core/jce_editor_config.h"
+#include "dialogs/jce_editor_dialogs.h"
 #include "jce_panel_assets_internal.h"
 
 static void persist_asset_browser_view_mode(void)
@@ -94,6 +94,10 @@ static void draw_dir_tree(const std::string &dir, int depth)
                 ImGui::SetClipboardText(sd.c_str());
             }
             ImGui::Separator();
+            if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.setAsProjectRoot"))) {
+                set_asset_browser_simulated_root(sd);
+            }
+            ImGui::Separator();
             if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInExplorer"))) {
                 jce_host_reveal_path(sd.c_str());
             }
@@ -145,25 +149,19 @@ static bool path_starts_with(const std::string &parent,
     return sep == '/' || sep == '\\';
 }
 
-/* Deferred folder-pick result.  SDL3 dialog callbacks fire from the
- * platform event thread; navigate_asset_directory() ultimately mutates
- * vectors the panel is still iterating, so we stash the picked path
- * here and apply it on the next panel frame. */
-static std::string s_pending_browse_path;
-
-static void on_browse_folder_picked(void *ud, JceDialogResult result,
-                                    const char *path)
-{
-    (void)ud;
-    if (result == JCE_DIALOG_OK && path && path[0])
-        s_pending_browse_path = path;
-}
+/* Deferred folder-pick result.  The shared dialog wrapper writes these on
+ * the main thread; navigate_asset_directory() still waits until the next
+ * panel frame so we never mutate vectors while drawing breadcrumbs. */
+static char s_pending_browse_path[1024] = {0};
+static bool s_pending_browse_ready = false;
 
 static void apply_pending_browse(void)
 {
-    if (s_pending_browse_path.empty()) return;
-    std::string pick;
-    pick.swap(s_pending_browse_path);
+    if (!s_pending_browse_ready)
+        return;
+    s_pending_browse_ready = false;
+    std::string pick = s_pending_browse_path;
+    s_pending_browse_path[0] = '\0';
     navigate_asset_directory(pick, true);
 }
 
@@ -205,6 +203,10 @@ static void draw_location_row(const char *icon_label,
         if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.copyPath")))
             ImGui::SetClipboardText(path.c_str());
         ImGui::Separator();
+        if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.setAsProjectRoot"),
+                            NULL, false, asset_browser_can_use_root(path)))
+            set_asset_browser_simulated_root(path);
+        ImGui::Separator();
         if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInExplorer")))
             jce_host_reveal_path(path.c_str());
         if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInTerminal")))
@@ -235,10 +237,19 @@ static void draw_asset_locations_section(void)
     if (!ImGui::TreeNodeEx(jce_editor_i18n("assetBrowser.locations"), hdr_flags))
         return;
 
-    /* Project root — always available; uses the leaf root icon. */
-    draw_location_row("[P]",
-                      jce_editor_i18n("assetBrowser.goHome"),
+    /* Browser root — may be a temporary simulated root. */
+    draw_location_row(s_assets.project_root_simulated ? "[S]" : "[P]",
+                      s_assets.project_root_simulated
+                          ? jce_editor_i18n("assetBrowser.simulatedRoot")
+                          : jce_editor_i18n("assetBrowser.goHome"),
                       s_assets.project_root, "project", false);
+    if (s_assets.project_root_simulated &&
+        !s_assets.followed_project_root.empty() &&
+        s_assets.followed_project_root != s_assets.project_root) {
+        draw_location_row("[P]", jce_editor_i18n("assetBrowser.goHome"),
+                          s_assets.followed_project_root, "project_real",
+                          false);
+    }
 
     /* Well-known user folders. */
     static const struct {
@@ -354,6 +365,12 @@ void draw_asset_directory_tree(float tree_w, float panel_h)
                 if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.copyPath"))) {
                     ImGui::SetClipboardText(s_assets.project_root.c_str());
                 }
+                if (s_assets.project_root_simulated) {
+                    ImGui::Separator();
+                    if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.restoreProjectRoot"))) {
+                        restore_asset_browser_project_root();
+                    }
+                }
                 ImGui::Separator();
                 if (ImGui::MenuItem(jce_editor_i18n("assetBrowser.openInExplorer"))) {
                     jce_host_reveal_path(s_assets.project_root.c_str());
@@ -430,12 +447,40 @@ void draw_asset_breadcrumb_bar(void)
         /* Browse… — open the OS folder picker.  Result lands in
            s_pending_browse_path and is consumed next frame. */
         if (ImGui::SmallButton(jce_editor_i18n("assetBrowser.browse"))) {
-            jce_host_dialog_pick_folder(
+            s_pending_browse_path[0] = '\0';
+            s_pending_browse_ready = false;
+            pick_folder_dialog_async(
                 jce_editor_i18n("assetBrowser.pickFolderTitle"),
                 s_assets.current_path.c_str(),
-                on_browse_folder_picked, NULL);
+                s_pending_browse_path, sizeof(s_pending_browse_path),
+                NULL, 0,
+                &s_pending_browse_ready,
+                NULL);
         }
         ImGui::SameLine();
+
+        {
+            bool can_set_root = asset_browser_can_use_root(s_assets.current_path);
+            ImGui::BeginDisabled(!can_set_root);
+            if (ImGui::SmallButton(jce_editor_i18n("assetBrowser.setRoot"))) {
+                set_asset_browser_simulated_root(s_assets.current_path);
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s",
+                    jce_editor_i18n("assetBrowser.setAsProjectRootTip"));
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+        }
+
+        if (s_assets.project_root_simulated) {
+            if (ImGui::SmallButton(jce_editor_i18n("assetBrowser.restoreRoot"))) {
+                restore_asset_browser_project_root();
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s",
+                    jce_editor_i18n("assetBrowser.restoreProjectRootTip"));
+            ImGui::SameLine();
+        }
 
         {
             std::vector<std::pair<std::string, std::string>> crumbs;

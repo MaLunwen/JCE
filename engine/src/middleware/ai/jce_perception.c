@@ -57,6 +57,20 @@ void jce_blackboard_clear(JceBlackboard *bb)
     if (bb) bb->count = 0;
 }
 
+bool jce_blackboard_remove(JceBlackboard *bb, const char *key)
+{
+    if (!bb || !key) return false;
+    for (uint32_t i = 0; i < bb->count; ++i) {
+        if (strncmp(bb->slots[i].key, key, JCE_BB_KEY_MAX) == 0) {
+            /* Swap-remove: order is not significant for a key/value store. */
+            bb->slots[i] = bb->slots[bb->count - 1];
+            bb->count--;
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Locate a slot by key, or NULL. */
 static JceBbSlot *bb_find(const JceBlackboard *bb, const char *key)
 {

@@ -172,6 +172,18 @@
 #endif
 #endif
 
+/* Weak / select-any linkage for a default symbol definition that any TU may
+ * override at link time with zero per-target wiring (e.g. an embedded-key
+ * default).  Centralised here — the one sanctioned home for toolchain
+ * attribute detection — so no other TU branches on the raw compiler macro. */
+#ifndef JCE_WEAK
+#if JCE_COMPILER_MSVC
+#define JCE_WEAK __declspec(selectany)
+#else
+#define JCE_WEAK __attribute__((weak))
+#endif
+#endif
+
 /* -- ABI-stable scalar typedefs ------------------------------------ */
 /*
  * Foreign-language bindings (JNI, C#, Python ctypes, Wasm imports, ...)

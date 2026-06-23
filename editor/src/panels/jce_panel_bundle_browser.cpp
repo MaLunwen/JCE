@@ -1167,10 +1167,11 @@ void draw_open_tab()
         static bool browse_ready = false, browse_cancel = false;
         open_file_dialog_async(BL("title", "Open Bundle"),
                                g_ob.path_input,
-                               "Bundle / Catalog (*.jbundle *.json);;"
-                               "Single bundle (*.jbundle);;"
-                               "Bundle catalog (*.json);;"
-                               "All Files (*.*)",
+                               jce_editor_i18n_or("fileDialog.filter.bundle",
+                                    "Bundle / Catalog (*.jbundle *.json);;"
+                                    "Single bundle (*.jbundle);;"
+                                    "Bundle catalog (*.json);;"
+                                    "All Files (*.*)"),
                                g_ob.path_input, sizeof(g_ob.path_input),
                                &browse_ready, &browse_cancel);
     }
@@ -1403,6 +1404,7 @@ extern "C" void jce_editor_panel_bundle_browser_show_build(void)
 {
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_BUNDLE_BROWSER);
     if (vis) *vis = true;
+    jce_editor_panel_request_focus("###bundle_browser");
     g_request_outer_tab = 0;
     g_current_outer_tab = 0;
     jce_editor_ui_state_save_int(k_outer_tab_state_key, 0);
@@ -1415,6 +1417,7 @@ extern "C" void jce_editor_panel_bundle_browser_show_open(void)
 {
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_BUNDLE_BROWSER);
     if (vis) *vis = true;
+    jce_editor_panel_request_focus("###bundle_browser");
     g_request_outer_tab = 0;
     g_current_outer_tab = 0;
     jce_editor_ui_state_save_int(k_outer_tab_state_key, 0);

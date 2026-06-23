@@ -85,6 +85,18 @@ static void seed_builtin(void)
     }
 }
 
+/* Built-in package descriptions are seeded in English (and persisted as
+ * such); translate them opportunistically at display time. */
+static const char *pkg_desc_i18n(const PkgEntry &p)
+{
+    if (p.user_added) return p.description.c_str();
+    char key[96];
+    std::string suffix = p.name;
+    for (auto &ch : suffix) if (ch == '.') ch = '_';
+    snprintf(key, sizeof(key), "packageManager.desc.%s", suffix.c_str());
+    return jce_editor_i18n_or(key, p.description.c_str());
+}
+
 /* ── Persistence ────────────────────────────────────────────────────── */
 static void pkgs_save(void)
 {
@@ -270,7 +282,7 @@ extern "C" void jce_editor_panel_package_manager_content(void)
                 ? jce_editor_i18n("packageManager.sourceUser")
                 : jce_editor_i18n("packageManager.sourceBuiltin"));
         ImGui::Spacing();
-        ImGui::TextWrapped("%s", p.description.c_str());
+        ImGui::TextWrapped("%s", pkg_desc_i18n(p));
     } else {
         ImGui::TextDisabled("%s",
             jce_editor_i18n("packageManager.selectHint"));

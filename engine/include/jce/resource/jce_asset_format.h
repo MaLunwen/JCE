@@ -76,6 +76,12 @@ JCE_EXTERN_C_BEGIN
 #define JCEASSET_CHUNK_MESH_VERTICES  0x0200  /* vertex buffer */
 #define JCEASSET_CHUNK_MESH_INDICES   0x0201  /* index buffer */
 #define JCEASSET_CHUNK_MESH_INFO      0x0202  /* JceAssetMeshInfo struct */
+/* Auto-LOD index buffer (additive).  One chunk per generated LOD level; the
+ * chunk payload begins with a JceAssetMeshLodHeader followed by the level's
+ * index buffer (level_index_count × index_stride bytes).  Backward-compatible:
+ * the reader looks chunks up by type (jce_asset_find_chunk) and silently
+ * ignores unknown types, so an old reader sees the base LOD0 mesh unchanged. */
+#define JCEASSET_CHUNK_MESH_LOD_INDICES 0x0203
 
 /* Audio chunks */
 #define JCEASSET_CHUNK_AUDIO_PCM      0x0300  /* decoded PCM s16 */
@@ -166,6 +172,20 @@ typedef struct JceAssetMeshInfo {
     uint32_t vertex_format;    /* enum: 0=pos+normal+uv, 1=+tangent, 2=+joints */
     uint32_t _pad;
 } JceAssetMeshInfo;
+
+/*
+ * Auto-LOD header — prefixes every JCEASSET_CHUNK_MESH_LOD_INDICES chunk.
+ * The simplified index buffer for the level follows immediately after this
+ * struct in the same chunk (index_count × index_stride bytes).  LOD0 is the
+ * base mesh (stored in JCEASSET_CHUNK_MESH_INDICES); LOD chunks carry levels
+ * 1..N, each referencing the SAME base vertex buffer.
+ */
+typedef struct JceAssetMeshLodHeader {
+    uint32_t lod_level;        /* 1-based LOD index (1 = first reduced level) */
+    uint32_t index_count;      /* number of indices in this level's buffer   */
+    uint32_t index_stride;     /* 2 (uint16) or 4 (uint32) — matches base    */
+    uint32_t source_mesh;      /* index of the base mesh this LOD belongs to */
+} JceAssetMeshLodHeader;
 
 /*
  * Audio info — stored in JCEASSET_CHUNK_AUDIO_INFO.

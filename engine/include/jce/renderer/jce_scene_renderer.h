@@ -12,11 +12,13 @@
 
 
 #include <jce/os/core/jce_defs.h>
+#include <jce/os/core/jce_math.h>
 #include <jce/renderer/jce_csm.h>
 #include <jce/renderer/jce_occlusion_culler.h>
 #include <jce/renderer/jce_postfx.h>
 #include <jce/renderer/jce_texture_types.h>
 #include <jce/renderer/jce_decals.h>
+#include <jce/middleware/animation/jce_anim_ik.h>   /* JceAnimEvent (POD) */
 #include <jce/middleware/world/jce_time_of_day.h>
 #include <jce/renderer/jce_volumetric_fog.h>
 
@@ -94,6 +96,11 @@ typedef struct {
     JceSceneViewModeKind view_mode;        /* default 0 = shaded   */
     uint32_t             viewport_width;   /* 0 = fallback 16:9    */
     uint32_t             viewport_height;  /* 0 = fallback 16:9    */
+    /* Distinct viewport identity (default 0).  The editor passes a different id
+     * per viewport (Game vs Scene) so each keeps its own previous-frame camera
+     * for correct, order-independent TAA motion vectors through the one shared
+     * renderer.  Single-viewport callers leave it 0. */
+    int                  viewport_id;
 
     /* Broadphase frustum culling using the spatial grid. Approximate AABBs
      * are derived from each entity's transform position + scale (a precise
@@ -127,6 +134,53 @@ typedef struct {
     uint16_t                 fog_depth_tex_handle;  /* UINT16_MAX = none */
     int                      fog_rt_width;          /* 0 = skip fog */
     int                      fog_rt_height;         /* 0 = skip fog */
+
+    /* Screen-space reflections: the lit color RT the SSR pass reflects.  SSR's
+     * ray-march view renders after the color pass, so this is the current
+     * frame's color.  UINT16_MAX = no SSR this frame. */
+    uint16_t                 ssr_color_tex_handle;
+
+    /* ── Focus-bounded entity collection ("draw distance") ────────────
+     * When cull_focus_enabled is true AND cull_radius > 0, the per-frame
+     * entity collect skips any entity whose transform origin is farther
+     * than cull_radius (HORIZONTAL / XZ distance) from the focus point
+     * (cull_focus_x/y/z).  Because EVERY downstream pass (cull cache,
+     * shadow caster loops, depth/velocity prepass, color pass) iterates
+     * the collected list, bounding the collect makes them all O(near)
+     * instead of O(all entities) — the fix that makes a full-loaded big
+     * world playable.
+     *
+     * The collect adds a ~70m margin to the radius before squaring so a
+     * large building whose authored origin sits just outside the radius
+     * but whose footprint is inside is not dropped.  Entities with NO
+     * transform are always collected (never culled by distance).
+     *
+     * Default (false / 0) → collect ALL entities exactly as before, so
+     * memset'd configs and existing callers are byte-identical (NO
+     * regression).  Shipped games are unaffected unless they opt in. */
+    bool                     cull_focus_enabled;
+    float                    cull_focus_x;
+    float                    cull_focus_y;   /* unused for XZ cull; carried for completeness */
+    float                    cull_focus_z;
+    float                    cull_radius;    /* <= 0 treated as disabled */
+
+    /* ── GPU-driven rendering (roadmap #18, Phase 0+1) ────────────────
+     * When true AND the GPU exposes BGFX_CAPS_COMPUTE AND the cull compute
+     * program loaded, the color-pass instanced batch is routed through a
+     * persistent GPU "GPUScene" buffer + a compute frustum-cull dispatch
+     * (cs_cull_frustum) that compacts the surviving per-instance world
+     * matrices on the GPU, instead of the per-frame transient instance-data
+     * buffer + CPU spatial-grid cull.  Only the OPAQUE COLOR pass is GPU-
+     * driven; shadow / depth-prepass / velocity stay on the CPU instancing
+     * path.  Any of those preconditions failing falls back to the exact CPU
+     * path.
+     *
+     * Default (false) → byte-identical to the existing CPU instancing path
+     * (sr_inst_flush → transient IDB).  The renderer also OR's in the
+     * `r.gpu_driven` console cvar (default off), so a build/runtime can flip
+     * it live without touching this field; either source turning it on
+     * engages the GPU path. */
+    bool                     gpu_driven;
 } JceSceneRenderConfig;
 
 /* Returns true if a skybox component is currently active in the scene
@@ -225,6 +279,63 @@ JCE_API const JceCsmData *jce_scene_renderer_get_csm(const JceSceneRenderer *sr)
    single instance — no separate global. Returns NULL before create(). */
 JCE_API JcePostFXPipeline *jce_scene_renderer_get_postfx(JceSceneRenderer *sr);
 
+/* ── Temporal Anti-Aliasing (TAA) driver ──────────────────────────────
+ *
+ * TAA needs the caller's help at two precise sites because the renderer
+ * does NOT own the main colour-pass view transform (the caller sets it,
+ * e.g. via jce_offscreen_target_prepare) nor the jce_postfx_apply() call.
+ *
+ * begin_frame: call it RIGHT BEFORE setting the main scene colour pass's
+ *   view transform.  Pass the CLEAN (un-jittered) view + proj you were
+ *   about to use.  When r.taa is ON it advances the jitter sequence, writes
+ *   the JITTERED projection into *out_jittered_proj (use THAT for the colour
+ *   pass), pushes the un-jittered inverse-view-proj + previous view*proj to
+ *   the engine PostFX pipeline, and enables TAA on it.  Returns true iff TAA
+ *   is active this frame (caller uses *out_jittered_proj); returns false and
+ *   leaves *out_jittered_proj == clean_proj when r.taa is OFF, so the OFF
+ *   path is byte-identical.  Drive the SAME pipeline you then call
+ *   jce_postfx_apply() on (the engine-owned one from get_postfx()).
+ *
+ * end_frame: call it AFTER the scene colour pass (end of frame) with the
+ *   SAME clean view + proj.  Records them as next frame's reproject source
+ *   and DISABLES TAA on the engine PostFX pipeline so it never leaks into
+ *   the editor's pick / preview / thumbnail postfx invocations.  Safe to
+ *   call unconditionally; it self-no-ops when r.taa is OFF. */
+JCE_API bool jce_scene_renderer_taa_begin_frame(JceSceneRenderer *sr,
+                                                uint32_t target_w,
+                                                uint32_t target_h,
+                                                const jce_mat4 *clean_view,
+                                                const jce_mat4 *clean_proj,
+                                                jce_mat4 *out_jittered_proj);
+
+JCE_API void jce_scene_renderer_taa_end_frame(JceSceneRenderer *sr,
+                                              const jce_mat4 *clean_view,
+                                              const jce_mat4 *clean_proj);
+
+/* STANDARD per-object motion vectors for TAA: request that the next
+ * jce_scene_renderer_render() write a per-object (and per-bone, for skinned)
+ * velocity buffer in its depth/G-buffer pre-pass.  The caller then binds
+ * jce_scene_renderer_get_velocity_texture() into its PostFX pipeline via
+ * jce_postfx_set_taa_motion_tex() before applying TAA, so animated geometry
+ * stops ghosting.  Set false (default) for zero cost when TAA is off.  Must be
+ * set every frame TAA is on (reset to false implicitly is the caller's job). */
+JCE_API void jce_scene_renderer_set_taa_velocity_enabled(JceSceneRenderer *sr,
+                                                         bool enabled);
+
+/* Call EXACTLY ONCE per displayed frame, BEFORE any viewport renders.  The
+ * editor renders multiple viewports (Scene + Game) through one shared renderer
+ * each frame; this advances a per-frame generation so the skinned-animation
+ * sample + previous-frame TAA state are produced once (on the first viewport)
+ * and reused by the rest, instead of being double-advanced and clobbered to
+ * zero motion.  A no-op for single-viewport callers that still call it once. */
+JCE_API void jce_scene_renderer_begin_velocity_frame(JceSceneRenderer *sr);
+
+/* The per-object motion-vector (velocity) texture produced by the most recent
+ * render when velocity was enabled AND the pre-pass ran AND the velocity shaders
+ * loaded; UINT16_MAX otherwise.  Encoded identically to fs_motion_vec.sc, so it
+ * feeds jce_postfx_set_taa_motion_tex() directly. */
+JCE_API uint16_t jce_scene_renderer_get_velocity_texture(const JceSceneRenderer *sr);
+
 /* Most-recent volumetric fog result texture (RGBA8: rgb in-scatter,
  * a transmittance).  Returns UINT16_MAX when fog was disabled this
  * frame, params/depth were invalid, or fog has never been rendered.
@@ -239,6 +350,12 @@ JCE_API uint16_t jce_scene_renderer_get_fog_result_texture(const JceSceneRendere
  * No-op when fog was disabled this frame, the composite shader is
  * unavailable on this backend, or the renderer has never run. */
 JCE_API void jce_scene_renderer_composite_fog(JceSceneRenderer *sr, uint16_t view_id,
+                                              uint16_t dst_fb_idx);
+
+/* Composite the SSR reflection RT over the destination color framebuffer.
+ * No-op when SSR was not active this frame.  view_id must be > the scene's
+ * SSR ray-march view (base+2) and the color pass; pass e.g. base+3. */
+JCE_API void jce_scene_renderer_composite_ssr(JceSceneRenderer *sr, uint16_t view_id,
                                               uint16_t dst_fb_idx);
 
 /* Per-frame culling stats from the most recent render call. */
@@ -265,6 +382,90 @@ JCE_API void jce_scene_renderer_set_global_lod(JceSceneRenderer *sr,
 JCE_API void jce_scene_renderer_set_anim_sm_active(JceSceneRenderer *sr,
                                                    bool active);
 
+/* ── Animation frame-event sink (P1 anim-events → gameplay) ───────────
+ *
+ * The renderer samples skeletal animation AND advances each instance's
+ * per-clip frame-event track every render (events authored into the
+ * <skeleton>.anim.json sidecar, fired over the (prev,cur] clip-time window
+ * by jce_anim_events_advance).  By default a fired event is only logged.
+ *
+ * Set a hook here to ROUTE fired events to gameplay: the runtime points it
+ * at its entity→script dispatch so an authored footstep / hitbox-on / etc.
+ * event reaches the entity's `on_anim_event(id, name, f0, f1, i0)` script
+ * method.  `entity` is the firing entity id; `ev` is the fired event (valid
+ * only for the duration of the call — copy out anything you keep); `user` is
+ * the pointer passed here verbatim.  Pass fn=NULL to clear (back to log-only).
+ *
+ * Default NULL → byte-identical to the prior behaviour (the in-engine
+ * LOG_DEBUG still fires), so this is purely additive. */
+typedef void (*JceSceneRendererAnimEventFn)(uint64_t entity,
+                                            const JceAnimEvent *ev,
+                                            void *user);
+JCE_API void jce_scene_renderer_set_anim_event_fn(JceSceneRenderer *sr,
+                                                  JceSceneRendererAnimEventFn fn,
+                                                  void *user);
+
+/* ── Animation state-change sink (state-enter/exit → gameplay) ────────
+ *
+ * The renderer drives each skeletal animator's bound .anim_sm.json state
+ * machine in Play and tracks its active state per instance.  When a state
+ * machine's active state CHANGES (e.g. Walk → Attack), this hook (when set)
+ * is called once with the transition's endpoints so gameplay can react:
+ * the runtime points it at its entity→script dispatch so the change reaches
+ * the entity's `on_state_exit(from_state)` / `on_state_enter(to_state)`
+ * script methods.
+ *
+ * `entity` is the animator's entity id; `from_state` is the previous state
+ * name (NULL/"" when entering the initial state — there is no prior state),
+ * `to_state` is the newly-entered state name.  Both strings point into the
+ * live SM and are valid only for the duration of the call (copy out anything
+ * you keep).  `user` is the pointer passed here verbatim.  Pass fn=NULL to
+ * clear.
+ *
+ * Default NULL → byte-identical to the prior behaviour (the SM drives the
+ * pose, no events fire), so this is purely additive — the per-instance state
+ * is only polled when a hook is installed. */
+typedef void (*JceSceneRendererAnimStateFn)(uint64_t entity,
+                                            const char *from_state,
+                                            const char *to_state,
+                                            void *user);
+JCE_API void jce_scene_renderer_set_anim_state_fn(JceSceneRenderer *sr,
+                                                  JceSceneRendererAnimStateFn fn,
+                                                  void *user);
+
+/* ── Ground-query hook (Foot IK ground adaptation) ────────────────────
+ *
+ * Foot IK (the JceFootIkComponent pass, sr_apply_foot_ik) needs to know the
+ * ground height + normal under each foot, but the L4 scene renderer does NOT
+ * hold the physics world.  The runtime installs this hook to a physics
+ * raycast (mirrors the anim-event hook): the renderer calls it with a ray
+ * origin (above the foot), a direction (typically straight down), and a max
+ * distance; the hook writes the hit Y into *out_hit_y and the surface normal
+ * into out_normal[3] and returns true on a hit, false on a miss.
+ *
+ *   entity    : the rigged entity being solved (lets the hook ignore the
+ *               character's own collider if it wants)
+ *   origin    : ray start (world space)
+ *   dir       : ray direction (world space; need not be unit length)
+ *   max_dist  : ray length
+ *   out_hit_y : ground height at the hit (world Y); written only on a hit
+ *   out_normal: ground normal at the hit; written only on a hit (may be NULL)
+ *   user      : the pointer passed to set_ground_query_fn verbatim
+ *
+ * Default NULL → sr_apply_foot_ik is a complete NO-OP (no ground info → the
+ * pose is byte-identical), so authoring a FootIk component changes nothing in
+ * tools / before Play.  Pass fn=NULL to clear. */
+typedef bool (*JceSceneRendererGroundQueryFn)(uint64_t entity,
+                                             const float origin[3],
+                                             const float dir[3],
+                                             float max_dist,
+                                             float *out_hit_y,
+                                             float out_normal[3],
+                                             void *user);
+JCE_API void jce_scene_renderer_set_ground_query_fn(JceSceneRenderer *sr,
+                                                    JceSceneRendererGroundQueryFn fn,
+                                                    void *user);
+
 /* Access built-in primitive meshes the renderer creates internally:
  * 0=cube, 1=sphere, 2=plane, 3=capsule, 4=cylinder.
  * Returns NULL for invalid shape or if the renderer is not initialised.
@@ -283,6 +484,13 @@ JCE_API void jce_scene_renderer_invalidate_terrain(JceSceneRenderer *sr,
  * re-loads from disk. Tools (Tile Palette panel) call this after Save. */
 JCE_API void jce_scene_renderer_invalidate_tilemap(JceSceneRenderer *sr,
                                                     const char *path);
+
+/* Drop EVERY cached model (the model cache never evicts and caches load
+ * FAILURES) so the next frame reloads all models from disk. Editors call this
+ * on scene-switch so a stale failed/path flag from the previous scene cannot
+ * block a model that exists in the new scene. Joins any in-flight async decode
+ * and destroys each GPU model; safe to call between frames. */
+JCE_API void jce_scene_renderer_invalidate_model_cache(JceSceneRenderer *sr);
 
 /* Forward decls for accessors below — full headers may not be in this TU. */
 struct JceAnimPlayer;

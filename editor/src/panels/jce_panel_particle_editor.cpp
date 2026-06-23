@@ -26,6 +26,7 @@
 extern "C" {
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_json.h>
+#include <jce/os/core/jce_easing.h>
 #include <jce/renderer/jce_particles.h>
 }
 
@@ -80,6 +81,11 @@ struct ParticleEditorState {
     int                   alive_peak  = 0;
     float                 bg_color[4] = { 0.784f, 0.863f, 0.643f, 1.0f };  /* #C8DCA4 — light sage, theme-neutral */
     int                   preset_idx  = 0;
+    /* FEATURE 8.2 — sub-emitter authoring.  When `sub_enabled` the child
+     * desc is serialized under a nested "subEmitter" object and the parent
+     * desc points `sub_emitter` at &sub_desc for the live preview. */
+    bool                   sub_enabled = false;
+    JceParticleEmitterDesc sub_desc{};
 };
 
 /* Internal parallel CPU "shadow" simulation. Mirrors emitter desc to
@@ -115,6 +121,48 @@ void desc_defaults(JceParticleEmitterDesc *d)
     d->size_end      = 0.0f;
     d->color_start.x = 1.0f; d->color_start.y = 1.0f; d->color_start.z = 1.0f; d->color_start.w = 1.0f;
     d->color_end.x   = 1.0f; d->color_end.y   = 1.0f; d->color_end.z   = 1.0f; d->color_end.w   = 0.0f;
+    /* FEATURE 8.3 — curves default to LINEAR (== memset 0) and velocity
+     * scale to a flat 1.0, matching jce_particles_desc_default so a saved
+     * default round-trips byte-for-byte. Flipbook disabled (rows/cols 0). */
+    d->size_curve           = JCE_EASE_LINEAR;
+    d->color_curve          = JCE_EASE_LINEAR;
+    d->velocity_curve       = JCE_EASE_LINEAR;
+    d->velocity_scale_start = 1.0f;
+    d->velocity_scale_end   = 1.0f;
+    d->flipbook_rows = 0u;
+    d->flipbook_cols = 0u;
+    d->flipbook_fps  = 0.0f;
+    d->flipbook_loop = false;
+}
+
+/* ── Ease-type combo (mirrors the engine's stable jce_ease_name ids) ──── */
+
+const char *ease_label(int i)
+{
+    const char *n = jce_ease_name((JceEaseType)i);
+    return n ? n : "Linear";
+}
+
+/* Draw an ease-type Combo bound to `*val`. Returns true on change. The id
+ * suffix keeps each combo's ImGui id unique within the panel. */
+bool draw_ease_combo(const char *i18n_key, const char *id_suffix, JceEaseType *val)
+{
+    int cur = (int)*val;
+    if (cur < 0 || cur >= JCE_EASE_COUNT) cur = 0;
+    const char *label = jce_editor_i18n_id(i18n_key, id_suffix);
+    bool changed = false;
+    if (ImGui::BeginCombo(label, ease_label(cur))) {
+        for (int i = 0; i < JCE_EASE_COUNT; ++i) {
+            bool sel = (i == cur);
+            if (ImGui::Selectable(ease_label(i), sel)) {
+                *val = (JceEaseType)i;
+                changed = true;
+            }
+            if (sel) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+    return changed;
 }
 
 /* ── Phase D presets ───────────────────────────────────────────────── */
@@ -187,12 +235,26 @@ void ensure_init(void)
     if (!s_pe.registered) {
         jce_reflect_register(&g_jce_type_JceParticleEmitterDesc);
         desc_defaults(&s_pe.desc);
+        desc_defaults(&s_pe.sub_desc);   /* child starts at sane defaults */
         s_pe.registered = true;
+    }
+}
+
+/* Point the parent desc's borrowed sub_emitter pointer at &s_pe.sub_desc when
+ * authoring is enabled (else NULL). Must run before any preview/spawn so the
+ * engine sees the same graph the UI shows; the pointer is owned by s_pe. */
+void sync_sub_emitter(void)
+{
+    s_pe.desc.sub_emitter = s_pe.sub_enabled ? &s_pe.sub_desc : nullptr;
+    if (!s_pe.sub_enabled) {
+        s_pe.desc.sub_spawn_on_birth = 0u;
+        s_pe.desc.sub_spawn_on_death = 0u;
     }
 }
 
 void rebuild_preview(void)
 {
+    sync_sub_emitter();
     if (s_pe.sys && jce_emitter_valid(s_pe.emitter))
         jce_particles_emitter_remove(s_pe.sys, s_pe.emitter);
     if (!s_pe.sys)
@@ -205,25 +267,106 @@ void rebuild_preview(void)
         jce_particles_emitter_stop(s_pe.sys, s_pe.emitter);
 }
 
+/* Write every emitter field (legacy + FEATURE 8.3 curves/flipbook) into
+ * `obj`.  Texture, sub-emitter and burst are written by the caller because
+ * they differ between the parent emitter and a nested child. */
+void write_desc_fields(JceJson *obj, const JceParticleEmitterDesc *d)
+{
+    jce_json_set_number(obj, "maxParticles", (double)d->max_particles);
+    jce_json_set_number(obj, "emitRate",     d->emit_rate);
+    jce_json_set_number(obj, "lifetimeMin",  d->lifetime_min);
+    jce_json_set_number(obj, "lifetimeMax",  d->lifetime_max);
+    jce_json_set_float_array(obj, "velocityMin", &d->velocity_min.x, 3);
+    jce_json_set_float_array(obj, "velocityMax", &d->velocity_max.x, 3);
+    jce_json_set_float_array(obj, "gravity",     &d->gravity.x,      3);
+    jce_json_set_number(obj, "sizeStart",    d->size_start);
+    jce_json_set_number(obj, "sizeEnd",      d->size_end);
+    jce_json_set_float_array(obj, "colorStart",  &d->color_start.x,  4);
+    jce_json_set_float_array(obj, "colorEnd",    &d->color_end.x,    4);
+    jce_json_set_bool(obj, "worldSpace", d->world_space);
+    /* FEATURE 8.3 — per-property lifetime curves (stable ease names so the
+     * file is human-editable) + velocity-scale ramp. */
+    jce_json_set_string(obj, "sizeCurve",     jce_ease_name(d->size_curve));
+    jce_json_set_string(obj, "colorCurve",    jce_ease_name(d->color_curve));
+    jce_json_set_string(obj, "velocityCurve", jce_ease_name(d->velocity_curve));
+    jce_json_set_number(obj, "velocityScaleStart", d->velocity_scale_start);
+    jce_json_set_number(obj, "velocityScaleEnd",   d->velocity_scale_end);
+    /* FEATURE 8.3 — flipbook / texture-sheet animation. */
+    jce_json_set_int (obj, "flipbookRows", (int)d->flipbook_rows);
+    jce_json_set_int (obj, "flipbookCols", (int)d->flipbook_cols);
+    jce_json_set_number(obj, "flipbookFps",  d->flipbook_fps);
+    jce_json_set_bool(obj, "flipbookLoop", d->flipbook_loop);
+}
+
 bool save_to_json(const char *path, const JceParticleEmitterDesc *d)
 {
     JceJson *root = jce_json_object();
     if (!root) return false;
-    jce_json_set_number(root, "maxParticles", (double)d->max_particles);
-    jce_json_set_number(root, "emitRate",     d->emit_rate);
-    jce_json_set_number(root, "emitBurst",    d->emit_burst);
-    jce_json_set_number(root, "lifetimeMin",  d->lifetime_min);
-    jce_json_set_number(root, "lifetimeMax",  d->lifetime_max);
-    jce_json_set_float_array(root, "velocityMin", &d->velocity_min.x, 3);
-    jce_json_set_float_array(root, "velocityMax", &d->velocity_max.x, 3);
-    jce_json_set_float_array(root, "gravity",     &d->gravity.x,      3);
-    jce_json_set_number(root, "sizeStart",    d->size_start);
-    jce_json_set_number(root, "sizeEnd",      d->size_end);
-    jce_json_set_float_array(root, "colorStart",  &d->color_start.x,  4);
-    jce_json_set_float_array(root, "colorEnd",    &d->color_end.x,    4);
-    jce_json_set_bool(root, "worldSpace", d->world_space);
+    write_desc_fields(root, d);
+    jce_json_set_number(root, "emitBurst", d->emit_burst);
     jce_json_set_string(root, "texture", s_pe.texture_path);
+
+    /* FEATURE 8.2 — sub-emitter authoring.  A nested "subEmitter" object
+     * holds a full child emitter desc; the parent carries the per-event
+     * spawn counts.  Absent object => no sub-emitter (legacy behaviour). */
+    if (s_pe.sub_enabled) {
+        JceJson *child = jce_json_object();
+        if (child) {
+            write_desc_fields(child, &s_pe.sub_desc);
+            jce_json_set_child(root, "subEmitter", child);
+        }
+        jce_json_set_int(root, "subSpawnOnBirth", (int)d->sub_spawn_on_birth);
+        jce_json_set_int(root, "subSpawnOnDeath", (int)d->sub_spawn_on_death);
+    }
     return ed_write_json_to_file(path, root);
+}
+
+/* Resolve a JSON ease field by stable name (jce_ease_name) or raw ordinal,
+ * mirroring the engine's resolve_ease so editor + engine agree exactly. */
+JceEaseType read_ease(const JceJson *obj, const char *key, JceEaseType def)
+{
+    const char *s = jce_json_get_string(obj, key, nullptr);
+    if (s && s[0]) {
+        for (int t = 0; t < JCE_EASE_COUNT; ++t) {
+            const char *name = jce_ease_name((JceEaseType)t);
+            if (name && std::strcmp(name, s) == 0) return (JceEaseType)t;
+        }
+        return def;
+    }
+    int ord = jce_json_get_int(obj, key, -1);
+    if (ord >= 0 && ord < JCE_EASE_COUNT) return (JceEaseType)ord;
+    return def;
+}
+
+/* Overlay all common emitter fields from `obj` onto a defaulted `d`.
+ * Mirrors jce_particles_desc_load_json's overlay-on-defaults semantics so a
+ * partial document still yields a usable emitter. */
+void read_desc_fields(const JceJson *obj, JceParticleEmitterDesc *d)
+{
+    d->max_particles = (uint32_t)jce_json_get_int(obj,    "maxParticles", (int)d->max_particles);
+    d->emit_rate     = (float)   jce_json_get_number(obj, "emitRate",     d->emit_rate);
+    d->lifetime_min  = (float)   jce_json_get_number(obj, "lifetimeMin",  d->lifetime_min);
+    d->lifetime_max  = (float)   jce_json_get_number(obj, "lifetimeMax",  d->lifetime_max);
+    d->size_start    = (float)   jce_json_get_number(obj, "sizeStart",    d->size_start);
+    d->size_end      = (float)   jce_json_get_number(obj, "sizeEnd",      d->size_end);
+    d->world_space   = jce_json_get_bool(obj, "worldSpace", d->world_space);
+    jce_json_get_floats(obj, "velocityMin", &d->velocity_min.x, 3, &d->velocity_min.x);
+    jce_json_get_floats(obj, "velocityMax", &d->velocity_max.x, 3, &d->velocity_max.x);
+    jce_json_get_floats(obj, "gravity",     &d->gravity.x,      3, &d->gravity.x);
+    jce_json_get_floats(obj, "colorStart",  &d->color_start.x,  4, &d->color_start.x);
+    jce_json_get_floats(obj, "colorEnd",    &d->color_end.x,    4, &d->color_end.x);
+    /* FEATURE 8.3 — curves + velocity scale. */
+    d->size_curve     = read_ease(obj, "sizeCurve",     d->size_curve);
+    d->color_curve    = read_ease(obj, "colorCurve",    d->color_curve);
+    d->velocity_curve = read_ease(obj, "velocityCurve", d->velocity_curve);
+    d->velocity_scale_start = (float)jce_json_get_number(obj, "velocityScaleStart", d->velocity_scale_start);
+    d->velocity_scale_end   = (float)jce_json_get_number(obj, "velocityScaleEnd",   d->velocity_scale_end);
+    /* FEATURE 8.3 — flipbook. */
+    d->flipbook_rows = (uint32_t)jce_json_get_int(obj, "flipbookRows", (int)d->flipbook_rows);
+    d->flipbook_cols = (uint32_t)jce_json_get_int(obj, "flipbookCols", (int)d->flipbook_cols);
+    d->flipbook_fps  = (float)jce_json_get_number(obj, "flipbookFps",  d->flipbook_fps);
+    d->flipbook_loop = jce_json_get_bool(obj, "flipbookLoop", d->flipbook_loop);
+    if (d->lifetime_max < d->lifetime_min) d->lifetime_max = d->lifetime_min;
 }
 
 bool load_from_json(const char *path, JceParticleEmitterDesc *d)
@@ -235,21 +378,26 @@ bool load_from_json(const char *path, JceParticleEmitterDesc *d)
     ED_FREE(buf);
     if (!root) return false;
     desc_defaults(d);
-    d->max_particles = (uint32_t)jce_json_get_int(root,    "maxParticles", (int)d->max_particles);
-    d->emit_rate     = (float)   jce_json_get_number(root, "emitRate",     d->emit_rate);
-    d->emit_burst    = (float)   jce_json_get_number(root, "emitBurst",    d->emit_burst);
-    d->lifetime_min  = (float)   jce_json_get_number(root, "lifetimeMin",  d->lifetime_min);
-    d->lifetime_max  = (float)   jce_json_get_number(root, "lifetimeMax",  d->lifetime_max);
-    d->size_start    = (float)   jce_json_get_number(root, "sizeStart",    d->size_start);
-    d->size_end      = (float)   jce_json_get_number(root, "sizeEnd",      d->size_end);
-    d->world_space   = jce_json_get_bool(root, "worldSpace", d->world_space);
-    jce_json_get_floats(root, "velocityMin", &d->velocity_min.x, 3, &d->velocity_min.x);
-    jce_json_get_floats(root, "velocityMax", &d->velocity_max.x, 3, &d->velocity_max.x);
-    jce_json_get_floats(root, "gravity",     &d->gravity.x,      3, &d->gravity.x);
-    jce_json_get_floats(root, "colorStart",  &d->color_start.x,  4, &d->color_start.x);
-    jce_json_get_floats(root, "colorEnd",    &d->color_end.x,    4, &d->color_end.x);
+    read_desc_fields(root, d);
+    d->emit_burst = (float)jce_json_get_number(root, "emitBurst", d->emit_burst);
     const char *tex = jce_json_get_string(root, "texture", "");
     std::snprintf(s_pe.texture_path, sizeof(s_pe.texture_path), "%s", tex ? tex : "");
+
+    /* FEATURE 8.2 — sub-emitter authoring. */
+    desc_defaults(&s_pe.sub_desc);
+    s_pe.sub_enabled = false;
+    d->sub_emitter = nullptr;
+    JceJson *child = jce_json_get(root, "subEmitter");
+    if (child && jce_json_is_object(child)) {
+        read_desc_fields(child, &s_pe.sub_desc);
+        s_pe.sub_enabled = true;
+        d->sub_spawn_on_birth = (uint32_t)jce_json_get_int(root, "subSpawnOnBirth", (int)d->sub_spawn_on_birth);
+        d->sub_spawn_on_death = (uint32_t)jce_json_get_int(root, "subSpawnOnDeath", (int)d->sub_spawn_on_death);
+        d->sub_emitter = &s_pe.sub_desc;
+    } else {
+        d->sub_spawn_on_birth = 0u;
+        d->sub_spawn_on_death = 0u;
+    }
     jce_json_free(root);
     return true;
 }
@@ -376,6 +524,88 @@ void draw_content(void)
     /* Reflection-driven property grid. */
     const JceReflectType *t = jce_reflect_find("Particle Emitter");
     if (t) jce_reflect_draw(t, &s_pe.desc);
+
+    /* ── FEATURE 8.3 — per-property lifetime curves (ease shaping) ─────── */
+    ImGui::Separator();
+    if (ImGui::CollapsingHeader(jce_editor_i18n("particleEditor.section.curves"),
+                                ImGuiTreeNodeFlags_DefaultOpen)) {
+        draw_ease_combo("particleEditor.field.sizeCurve",     "pe_szc", &s_pe.desc.size_curve);
+        draw_ease_combo("particleEditor.field.colorCurve",    "pe_clc", &s_pe.desc.color_curve);
+        draw_ease_combo("particleEditor.field.velocityCurve", "pe_vlc", &s_pe.desc.velocity_curve);
+        ImGui::DragFloat(jce_editor_i18n_id("particleEditor.field.velScaleStart", "pe"),
+                         &s_pe.desc.velocity_scale_start, 0.01f, 0.0f, 10.0f, "%.3f");
+        ImGui::DragFloat(jce_editor_i18n_id("particleEditor.field.velScaleEnd", "pe"),
+                         &s_pe.desc.velocity_scale_end, 0.01f, 0.0f, 10.0f, "%.3f");
+    }
+
+    /* ── FEATURE 8.3 — flipbook / texture-sheet animation ─────────────── */
+    if (ImGui::CollapsingHeader(jce_editor_i18n("particleEditor.section.flipbook"))) {
+        int fb_rows = (int)s_pe.desc.flipbook_rows;
+        int fb_cols = (int)s_pe.desc.flipbook_cols;
+        if (ImGui::DragInt(jce_editor_i18n_id("particleEditor.field.flipbookRows", "pe"),
+                           &fb_rows, 0.1f, 0, 64))
+            s_pe.desc.flipbook_rows = (uint32_t)(fb_rows < 0 ? 0 : fb_rows);
+        if (ImGui::DragInt(jce_editor_i18n_id("particleEditor.field.flipbookCols", "pe"),
+                           &fb_cols, 0.1f, 0, 64))
+            s_pe.desc.flipbook_cols = (uint32_t)(fb_cols < 0 ? 0 : fb_cols);
+        ImGui::DragFloat(jce_editor_i18n_id("particleEditor.field.flipbookFps", "pe"),
+                         &s_pe.desc.flipbook_fps, 0.5f, 0.0f, 240.0f, "%.1f");
+        ImGui::Checkbox(jce_editor_i18n_id("particleEditor.field.flipbookLoop", "pe"),
+                        &s_pe.desc.flipbook_loop);
+        ImGui::TextDisabled("%s", jce_editor_i18n("particleEditor.hint.flipbook"));
+    }
+
+    /* ── FEATURE 8.2 — sub-emitter (spawn child particles on birth/death) ─ */
+    if (ImGui::CollapsingHeader(jce_editor_i18n("particleEditor.section.subEmitter"))) {
+        if (ImGui::Checkbox(jce_editor_i18n_id("particleEditor.field.subEnable", "pe"),
+                            &s_pe.sub_enabled)) {
+            /* On first enable seed a useful on-death burst so the sub-emitter
+             * visibly does something; the user can tune it below. */
+            if (s_pe.sub_enabled && s_pe.desc.sub_spawn_on_birth == 0 &&
+                s_pe.desc.sub_spawn_on_death == 0) {
+                s_pe.desc.sub_spawn_on_death = 4u;
+            }
+            sync_sub_emitter();
+        }
+        if (s_pe.sub_enabled) {
+            int birth = (int)s_pe.desc.sub_spawn_on_birth;
+            int death = (int)s_pe.desc.sub_spawn_on_death;
+            if (ImGui::DragInt(jce_editor_i18n_id("particleEditor.field.subOnBirth", "pe"),
+                               &birth, 0.1f, 0, 256))
+                s_pe.desc.sub_spawn_on_birth = (uint32_t)(birth < 0 ? 0 : birth);
+            if (ImGui::DragInt(jce_editor_i18n_id("particleEditor.field.subOnDeath", "pe"),
+                               &death, 0.1f, 0, 256))
+                s_pe.desc.sub_spawn_on_death = (uint32_t)(death < 0 ? 0 : death);
+            ImGui::TextDisabled("%s", jce_editor_i18n("particleEditor.hint.subEmitter"));
+
+            /* Child emitter desc (minimal authoring of the key fields). */
+            ImGui::Indent();
+            ImGui::TextUnformatted(jce_editor_i18n("particleEditor.section.subChild"));
+            int cmax = (int)s_pe.sub_desc.max_particles;
+            if (ImGui::DragInt(jce_editor_i18n_id("particleEditor.field.subMaxParticles", "pe"),
+                               &cmax, 1.0f, 1, 65536))
+                s_pe.sub_desc.max_particles = (uint32_t)(cmax < 1 ? 1 : cmax);
+            ImGui::DragFloat(jce_editor_i18n_id("particleEditor.field.subLifetimeMin", "pe"),
+                             &s_pe.sub_desc.lifetime_min, 0.05f, 0.01f, 60.0f, "%.2f");
+            ImGui::DragFloat(jce_editor_i18n_id("particleEditor.field.subLifetimeMax", "pe"),
+                             &s_pe.sub_desc.lifetime_max, 0.05f, 0.01f, 60.0f, "%.2f");
+            ImGui::DragFloat3(jce_editor_i18n_id("particleEditor.field.subVelocityMin", "pe"),
+                             &s_pe.sub_desc.velocity_min.x, 0.05f);
+            ImGui::DragFloat3(jce_editor_i18n_id("particleEditor.field.subVelocityMax", "pe"),
+                             &s_pe.sub_desc.velocity_max.x, 0.05f);
+            ImGui::DragFloat3(jce_editor_i18n_id("particleEditor.field.subGravity", "pe"),
+                             &s_pe.sub_desc.gravity.x, 0.05f);
+            ImGui::DragFloat(jce_editor_i18n_id("particleEditor.field.subSizeStart", "pe"),
+                             &s_pe.sub_desc.size_start, 0.01f, 0.0f, 100.0f, "%.3f");
+            ImGui::DragFloat(jce_editor_i18n_id("particleEditor.field.subSizeEnd", "pe"),
+                             &s_pe.sub_desc.size_end, 0.01f, 0.0f, 100.0f, "%.3f");
+            ImGui::ColorEdit4(jce_editor_i18n_id("particleEditor.field.subColorStart", "pe"),
+                              &s_pe.sub_desc.color_start.x);
+            ImGui::ColorEdit4(jce_editor_i18n_id("particleEditor.field.subColorEnd", "pe"),
+                              &s_pe.sub_desc.color_end.x);
+            ImGui::Unindent();
+        }
+    }
 
     /* Texture path (Phase B Authoring; binding to handle is TODO until
      * editor exposes a string->JceTextureHandle loader). */

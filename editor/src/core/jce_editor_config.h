@@ -45,6 +45,13 @@ typedef struct {
     float gizmo_snap_rotate;
     float gizmo_snap_scale;
 
+    /* Gizmo display preferences (persisted across sessions).  Read every
+       frame by the scene-view gizmo renderer; before this they lived only
+       in a Search-only panel's in-memory struct and were lost on every
+       restart. */
+    bool  show_gizmos;         /* default true */
+    float gizmo_scale;         /* default 1.0  */
+
     /* Asset Browser settings (persisted across sessions). */
     int  asset_browser_view_mode; /* AssetBrowserViewMode enum (0=Grid,1=Details) */
 
@@ -76,6 +83,15 @@ typedef struct {
        KaiTi by name, fall back to ImGui built-in proggy). */
     char font_en_path[512];
     char font_zh_path[512];
+
+    /* External tools (Unity "Preferences > External Tools"): per-user,
+       per-machine paths to the preferred script/image apps.  Empty ->
+       fall back to OS default (jce_host_open_in_text_editor / reveal in
+       file manager).  These are USER preferences, not project-shared —
+       previously misfiled under project-settings (machine paths must not
+       travel via version control). */
+    char external_script_editor[512];
+    char external_image_editor[512];
 
     /* Input preferences. */
     bool invert_scroll_zoom;   /* MouseWheel: false=natural (up=zoom in) */
@@ -120,27 +136,40 @@ typedef struct {
     int                 ui_int_state_count;
 } JceEditorConfig;
 
-/* Load config from .jce/editor-config.json. Returns false if not found. */
+/* Load the per-user editor config into `cfg`.  Reads the two category
+ * files (~/.jce/editor-preferences.json + editor-session.json); for any
+ * category whose file is absent it falls back to the legacy single
+ * ~/.jce/editor-config.json (one-time forward migration, no data loss).
+ * Always seeds defaults first, so unset keys keep their default.  Returns
+ * false only when NO source file exists (pure defaults). */
 bool jce_editor_config_load(JceEditorConfig *cfg);
 
-/* Save config to .jce/editor-config.json. */
+/* Save the per-user editor config, split by industry-standard category:
+ * PREFERENCES -> ~/.jce/editor-preferences.json, SESSION/last-state ->
+ * ~/.jce/editor-session.json.  The legacy editor-config.json is left
+ * untouched (orphaned after the first split save). */
 bool jce_editor_config_save(const JceEditorConfig *cfg);
 
 /* Ensure the .jce config directory exists (idempotent). */
 void jce_editor_config_ensure_dir(void);
 
-/* Build "<exe_dir>/.jce/<name>" (or "<exe_dir>/.jce" when name is NULL/empty)
- * into `out`.  Anchored to the EXECUTABLE directory (the "launch directory",
- * via jce_fs_host_get_base_path), NOT the process CWD: a Finder/`open`
- * double-click runs with CWD=$HOME, so CWD-relative ".jce" dropped editor
- * files into the home directory.  Returns false if the base path can't be
- * resolved (out then falls back to a CWD-relative ".jce/<name>"). */
+/* Build "<home>/.jce/<name>" (or "<home>/.jce" when name is NULL/empty)
+ * into `out`.  Anchored to the user's HOME directory (via SDL
+ * jce_host_get_user_folder(JCE_USER_FOLDER_HOME)) — the industry-standard
+ * per-user config location, stable across builds/installs and independent
+ * of both the process CWD and the executable's location.  Returns false if
+ * HOME can't be resolved (out then falls back to a CWD-relative
+ * ".jce/<name>"). */
 bool jce_editor_dotjce_path(const char *name, char *out, size_t cap);
 
 /* Set defaults. */
 void jce_editor_config_defaults(JceEditorConfig *cfg);
 
-/* Add a path to recent projects (front of list, deduped, max 10). */
+/* Set the cap on remembered recent entries (Preferences > General >
+ * recent_max).  Clamped to [1,10]; bounds both add_recent helpers below. */
+void jce_editor_config_set_recent_cap(int n);
+
+/* Add a path to recent projects (front of list, deduped, capped). */
 void jce_editor_config_add_recent(JceEditorConfig *cfg, const char *path);
 
 /* Add a path to recent scenes (front of list, deduped, max 10). */

@@ -14,6 +14,8 @@ extern "C" void jce_editor_dialog_build_settings(bool *p_open)
 
     bool *vis = jce_editor_panel_visible_ptr(JCE_PANEL_BUILD_PROFILES);
     if (vis) *vis = true;
+    jce_panel_build_profiles_request_tab(0);
+    jce_editor_panel_request_focus("###build_profiles");
 
     /* One-shot: the panel owns its own visibility from here on. */
     *p_open = false;

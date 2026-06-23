@@ -227,9 +227,21 @@ void draw_hierarchy_context_menu(void)
                 }
             }
 
-            bool can_revert = jce_state_is_prefab_instance(ctx_id)
+            bool is_inst = jce_state_is_prefab_instance(ctx_id)
                 && jce_state_get_prefab_path(ctx_id) != NULL;
-            if (ImGui::MenuItem(jce_editor_i18n("hierarchy.prefab.revert"), NULL, false, can_revert)) {
+
+            /* Apply: push this instance's edits back to the source prefab. */
+            if (ImGui::MenuItem(jce_editor_i18n("hierarchy.prefab.apply"), NULL, false, is_inst)) {
+                if (jce_state_apply_prefab(ctx_id)) {
+                    jce_editor_console_log("Applied overrides to prefab: %s",
+                                           jce_state_get_prefab_path(ctx_id));
+                } else {
+                    jce_editor_console_log_level(JCE_CONSOLE_WARNING,
+                        "Failed to apply prefab overrides");
+                }
+            }
+
+            if (ImGui::MenuItem(jce_editor_i18n("hierarchy.prefab.revert"), NULL, false, is_inst)) {
                 if (jce_state_revert_prefab(ctx_id)) {
                     jce_editor_inspector_request_sync();
                 } else {

@@ -649,8 +649,13 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
     /* --- CJK font (merged into the Latin font) ----------------------- */
     ImFontConfig merge_cfg;
     merge_cfg.FontDataOwnedByAtlas = true;
-    merge_cfg.OversampleH = 2;
-    merge_cfg.OversampleV = 2;
+    /* OversampleH/V=1 for the CJK/Korean merge passes: oversampling barely
+     * helps dense CJK glyphs at 24px but quadruples their rasterization work
+     * and atlas area (the dominant font-atlas-build cost).  Latin keeps 2x2
+     * (cfg above).  PixelSnapH keeps glyph edges crisp.  Standard ImGui
+     * guidance for CJK. */
+    merge_cfg.OversampleH = 1;
+    merge_cfg.OversampleV = 1;
     merge_cfg.PixelSnapH  = true;
     merge_cfg.MergeMode   = true;
 
@@ -700,60 +705,19 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
         cjk_builder.AddRanges(io.Fonts->GetGlyphRangesKorean());
     cjk_builder.AddRanges(cjk_extra_ranges);
 
-    /* Scan i18n PAK files: for every UTF-8 codepoint encountered, mark
-       it as required. This is fast (~1 ms per file) and exact.
-       Enumerates every `i18n/*.json` in the PAK so newly-added locales
-       (ja, etc.) automatically contribute their codepoints — no
-       hardcoded path list to keep in sync. */
-    if (use_pak) {
-        const uint32_t pak_n = jce_pak_count(use_pak);
-        for (uint32_t pi = 0; pi < pak_n; pi++) {
-            const JcePakAsset *a = jce_pak_get(use_pak, pi);
-            if (!a || !a->path) continue;
-            /* Match exactly i18n/<name>.json (no nested dirs). */
-            if (strncmp(a->path, "i18n/", 5) != 0) continue;
-            const char *rest = a->path + 5;
-            if (strchr(rest, '/')) continue;
-            size_t rlen = strlen(rest);
-            if (rlen < 6 || strcmp(rest + rlen - 5, ".json") != 0) continue;
-            char *buf = (char *)jce_malloc((size_t)a->original_size + 1);
-            if (!buf) continue;
-            size_t n = jce_pak_decompress(a, buf, (size_t)a->original_size);
-            if (n > 0) {
-                buf[n] = '\0';
-                const unsigned char *p = (const unsigned char *)buf;
-                const unsigned char *end = p + n;
-                while (p < end) {
-                    /* Inline UTF-8 decoder: returns codepoint and
-                       advances `p`. Handles 1/2/3/4-byte sequences. */
-                    unsigned int cp = 0;
-                    unsigned char c = *p;
-                    int adv = 1;
-                    if (c < 0x80) {
-                        cp = c;
-                    } else if ((c & 0xE0) == 0xC0 && p + 1 < end) {
-                        cp = ((c & 0x1F) << 6) | (p[1] & 0x3F);
-                        adv = 2;
-                    } else if ((c & 0xF0) == 0xE0 && p + 2 < end) {
-                        cp = ((c & 0x0F) << 12) |
-                             ((p[1] & 0x3F) << 6) |
-                             (p[2] & 0x3F);
-                        adv = 3;
-                    } else if ((c & 0xF8) == 0xF0 && p + 3 < end) {
-                        cp = ((c & 0x07) << 18) |
-                             ((p[1] & 0x3F) << 12) |
-                             ((p[2] & 0x3F) << 6) |
-                             (p[3] & 0x3F);
-                        adv = 4;
-                    }
-                    if (cp >= 0x80 && cp <= 0xFFFF)
-                        cjk_builder.AddChar((ImWchar)cp);
-                    p += adv;
-                }
-            }
-            jce_free(buf);
-        }
-    }
+    /* (Removed) The i18n PAK codepoint scan that pre-marked every glyph used
+       by editor strings is obsolete under ImGui 1.92 dynamic fonts: the bgfx
+       backend now sets ImGuiBackendFlags_RendererHasTextures
+       (jce_imgui_renderer.cpp), under which pre-specified glyph ranges are
+       IGNORED and glyphs are rasterized ON DEMAND the first time they are
+       drawn — so every translatable string (and user-typed Han/Hangul/kana in
+       scene/asset names, and the language picker's native names) renders
+       without pre-baking, and no language can show as '?'.  Dropping the scan
+       also reclaims its per-font-load decompress + UTF-8 walk of every
+       i18n/*.json.  The static ranges built above/below remain only as
+       harmless intent documentation and as a fallback for the legacy path if
+       RendererHasTextures were ever disabled. */
+    (void)use_pak;
 
     static ImVector<ImWchar> cjk_ranges_v;
     cjk_ranges_v.clear();
@@ -861,6 +825,50 @@ bool jce_editor_load_fonts(const JcePakArchive *pak, float size_pixels,
             size_pixels, &merge_cfg, korean_ranges,
             /*quiet_on_miss=*/true);
         if (kf) break;
+    }
+
+    /* --- Cyrillic font (merged) ------------------------------------- */
+    /* Ink Free (and several Latin defaults) ship NO Cyrillic glyphs, so
+       ru/uk editor text renders as tofu once the locale switches. Mirror
+       the Korean pass: force-merge a Cyrillic-capable system font, gated
+       on a Cyrillic UI locale (Segoe UI / Arial / Tahoma on Windows;
+       system sans on macOS; fontconfig :lang=ru on Linux). The merged CJK
+       font frequently carries Cyrillic too, but make it explicit rather
+       than rely on whichever CJK fallback won above. */
+    const bool loc_is_cyrillic = active_loc &&
+        (strcmp(active_loc, "ru") == 0 || strcmp(active_loc, "uk") == 0);
+    if (loc_is_cyrillic) {
+        static const ImWchar cyrillic_ranges[] = {
+            0x0400, 0x04FF,   /* Cyrillic */
+            0x0500, 0x052F,   /* Cyrillic Supplement */
+            0x2DE0, 0x2DFF,   /* Cyrillic Extended-A */
+            0xA640, 0xA69F,   /* Cyrillic Extended-B */
+            0,
+        };
+        const char *cyr_fallbacks[] = {
+            "segoeui",            /* Segoe UI — Windows, full Cyrillic */
+            "Arial", "tahoma", "Verdana",
+            "Helvetica",          /* macOS */
+            "DejaVuSans", "LiberationSans", "NotoSans",  /* Linux */
+            "msyh", "NotoSansCJK-Regular",  /* CJK fonts also carry Cyrillic */
+            NULL };
+        bool cyr_ok = false;
+        {   /* Linux: fontconfig Cyrillic system font first (native lookup). */
+            char fcpath[1024];
+            if (linux_fc_match(":lang=ru", fcpath, sizeof(fcpath))) {
+                ImFont *cf = load_font_with_fallback(
+                    "Cyrillic", fcpath, NULL,
+                    size_pixels, &merge_cfg, cyrillic_ranges, /*quiet_on_miss=*/true);
+                if (cf) cyr_ok = true;
+            }
+        }
+        for (int i = 0; !cyr_ok && cyr_fallbacks[i]; i++) {
+            ImFont *cf = load_font_with_fallback(
+                "Cyrillic", NULL, cyr_fallbacks[i],
+                size_pixels, &merge_cfg, cyrillic_ranges,
+                /*quiet_on_miss=*/true);
+            if (cf) break;
+        }
     }
 
     /* --- Icon font (merged) ----------------------------------------- */

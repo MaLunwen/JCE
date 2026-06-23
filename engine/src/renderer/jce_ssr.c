@@ -11,6 +11,7 @@
 #include <jce/os/core/jce_profiler.h>
 #include <jce/renderer/jce_ssr.h>
 #include <jce/renderer/jce_views.h>
+#include <jce/renderer/jce_shaders.h>   /* jce_shaders_embedded_engine_pak fallback */
 
 #include "os/core/jce_memory.h"
 
@@ -30,6 +31,7 @@ struct JceSsr {
 
     bgfx_vertex_layout_t   layout;
     bgfx_program_handle_t  prog;
+    bgfx_program_handle_t  prog_composite;   /* fs_ssr_composite blend pass */
 
     bgfx_uniform_handle_t  u_p0;
     bgfx_uniform_handle_t  u_p1;
@@ -62,7 +64,13 @@ static bgfx_shader_handle_t ssr_load_shader(const JcePakArchive *pak,
     bgfx_shader_handle_t invalid = { UINT16_MAX };
     char path[256];
     snprintf(path, sizeof(path), "shaders/%s_%s.bin", name, sfx);
-    const JcePakAsset *a = jce_pak_find(pak, path);
+    /* Engine shaders are in jce_renderer's embedded pak, not the scene/editor
+     * pak.  Try the caller pak, then fall back to the embedded engine pak. */
+    const JcePakAsset *a = pak ? jce_pak_find(pak, path) : NULL;
+    if (!a) {
+        const JcePakArchive *fb = jce_shaders_embedded_engine_pak();
+        if (fb && fb != pak) { a = jce_pak_find(fb, path); if (a) pak = fb; }
+    }
     if (!a) { LOG_ERROR(LOG_TAG, "shader not in pak: %s", path); return invalid; }
     void *buf = JCE_MALLOC((size_t)a->original_size);
     if (!buf) return invalid;
@@ -137,6 +145,20 @@ JceSsr *jce_ssr_create(const JceSsrDesc *desc)
     }
     s->prog = bgfx_create_program(vsh, fsh, true);
 
+    /* Composite program: vs_ssr + fs_ssr_composite (loaded fresh — the create
+     * above destroyed vsh/fsh).  Optional; absent => composite is a no-op. */
+    s->prog_composite.idx = UINT16_MAX;
+    {
+        bgfx_shader_handle_t cvsh = ssr_load_shader(desc->pak, "vs_ssr",           sfx);
+        bgfx_shader_handle_t cfsh = ssr_load_shader(desc->pak, "fs_ssr_composite", sfx);
+        if (cvsh.idx != UINT16_MAX && cfsh.idx != UINT16_MAX) {
+            s->prog_composite = bgfx_create_program(cvsh, cfsh, true);
+        } else {
+            if (cvsh.idx != UINT16_MAX) bgfx_destroy_shader(cvsh);
+            if (cfsh.idx != UINT16_MAX) bgfx_destroy_shader(cfsh);
+        }
+    }
+
     s->u_p0          = bgfx_create_uniform("u_ssr_params0", BGFX_UNIFORM_TYPE_VEC4, 1);
     s->u_p1          = bgfx_create_uniform("u_ssr_params1", BGFX_UNIFORM_TYPE_VEC4, 1);
     s->u_screen      = bgfx_create_uniform("u_screen",      BGFX_UNIFORM_TYPE_VEC4, 1);
@@ -152,6 +174,7 @@ void jce_ssr_destroy(JceSsr *s)
 {
     if (!s) return;
     if (s->prog.idx != UINT16_MAX) bgfx_destroy_program(s->prog);
+    if (s->prog_composite.idx != UINT16_MAX) bgfx_destroy_program(s->prog_composite);
     if (s->u_p0.idx          != UINT16_MAX) bgfx_destroy_uniform(s->u_p0);
     if (s->u_p1.idx          != UINT16_MAX) bgfx_destroy_uniform(s->u_p1);
     if (s->u_screen.idx      != UINT16_MAX) bgfx_destroy_uniform(s->u_screen);
@@ -235,4 +258,35 @@ uint16_t jce_ssr_get_result_texture(const JceSsr *s)
 {
     if (!s || s->fb.idx == UINT16_MAX) return UINT16_MAX;
     return s->tex.idx;
+}
+
+void jce_ssr_composite(JceSsr *s, uint16_t view_id, uint16_t dst_fb_idx)
+{
+    if (!s || s->prog_composite.idx == UINT16_MAX) return;
+    if (s->tex.idx == UINT16_MAX)                  return;
+    JCE_PROFILE_ZONE_N("Renderer::SSR::composite");
+
+    /* Blend the reflection RT over the destination color buffer.  Callers must
+     * pass a view-id strictly greater than the SSR ray-march view so the RT is
+     * filled first. */
+    bgfx_frame_buffer_handle_t dst = { dst_fb_idx };
+    bgfx_set_view_frame_buffer(view_id, dst);
+    bgfx_set_view_rect(view_id, 0, 0, (uint16_t)s->w, (uint16_t)s->h);
+    bgfx_set_view_mode(view_id, BGFX_VIEW_MODE_SEQUENTIAL);
+    bgfx_touch(view_id);
+
+    bgfx_set_texture(0, s->s_color, s->tex,
+                     BGFX_SAMPLER_U_CLAMP | BGFX_SAMPLER_V_CLAMP
+                     | BGFX_SAMPLER_MIN_POINT | BGFX_SAMPLER_MAG_POINT
+                     | BGFX_SAMPLER_MIP_POINT);
+    bgfx_set_vertex_buffer(0, s->vbh, 0, 4);
+    bgfx_set_index_buffer(s->ibh, 0, 6);
+
+    /* Premultiplied "over": dst = refl.rgb + dst*(1-refl.a). */
+    uint64_t state = BGFX_STATE_WRITE_RGB
+                   | BGFX_STATE_BLEND_FUNC(BGFX_STATE_BLEND_ONE,
+                                           BGFX_STATE_BLEND_INV_SRC_ALPHA);
+    bgfx_set_state(state, 0);
+    bgfx_submit(view_id, s->prog_composite, 0, BGFX_DISCARD_ALL);
+    JCE_PROFILE_ZONE_END;
 }

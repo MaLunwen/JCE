@@ -35,7 +35,7 @@
 #include <jce/os/core/jce_config.h>
 #include <jce/application/jce_subsystem.h>
 #include <jce/middleware/audio/jce_audio.h>
-#include <jce/middleware/streaming/jce_streaming.h>
+#include <jce/resource/jce_streaming.h>
 #include <jce/middleware/ui/jce_localization.h>
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_crash_handler.h>
@@ -300,11 +300,30 @@ static SDL_AtomicInt s_render_paused = {0};
  * caused a worse UX regression: content didn't follow the window size during
  * drag and visibly snapped to the new dimensions on mouse release. */
 
+/* PAK read provider: bridges os/core's VFS (and i18n) to the resource-layer
+ * jce_pak_* implementation so those L2 modules never depend UP on the resource
+ * tier.  Registered once at the top of jce_engine_create, before any PAK is
+ * opened/mounted/read.  (See jce_fs_set_pak_provider / dependency inversion.) */
+static const void *JCE_CALL eng_pak_find(const JcePakArchive *pak,
+                                         const char *path)
+{ return jce_pak_find(pak, path); }
+static uint64_t JCE_CALL eng_pak_asset_size(const void *asset)
+{ return ((const JcePakAsset *)asset)->original_size; }
+static size_t JCE_CALL eng_pak_decompress(const void *asset, void *buf, size_t n)
+{ return jce_pak_decompress((const JcePakAsset *)asset, buf, n); }
+static const JceFsPakProvider ENG_PAK_PROVIDER = {
+    eng_pak_find, eng_pak_asset_size, eng_pak_decompress
+};
+
 JceEngine *jce_engine_create(int argc, char *argv[])
 {
     /* Snapshot argv first so any subsystem init below can read launch
      * flags through jce_args_* without each one re-parsing argv. */
     jce_args_stash(argc, argv);
+
+    /* Install the PAK read provider before anything opens/mounts/reads a PAK
+     * (dependency inversion: the os/core VFS + i18n call through this). */
+    jce_fs_set_pak_provider(&ENG_PAK_PROVIDER);
 
     /* Logger + crash handler + config. */
     jce_log_init();

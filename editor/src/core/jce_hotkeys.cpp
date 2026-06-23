@@ -51,6 +51,7 @@ HotkeyEntry s_table[JCE_HK_COUNT] = {
     { "gizmo.toggle_space",        "Gizmo / Toggle Local/World",  { ImGuiKey_X, JCE_HKM_NONE }, {} },
     { "gizmo.toggle_snap",         "Gizmo / Toggle Snap",         { ImGuiKey_S, JCE_HKM_NONE }, {} },
     { "gizmo.toggle_pivot",        "Gizmo / Toggle Pivot/Center", { ImGuiKey_Z, JCE_HKM_NONE }, {} },
+    { "gizmo.pivot_edit",          "Gizmo / Edit Pivot",          { ImGuiKey_D, JCE_HKM_NONE }, {} },
 
     /* view */
     { "view.frame_selected",       "View / Frame Selected",       { ImGuiKey_F, JCE_HKM_NONE }, {} },

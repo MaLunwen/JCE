@@ -1,47 +1,37 @@
 /*
- * jce_panel_frame_debugger.cpp  Frame Debugger window (Sprint 3 / 0.8.22)
+ * jce_panel_frame_debugger.cpp  Frame Debugger tab (Profiling workbench)
  *
- * Mirrors Unity's Window > Analysis > Frame Debugger. Two complementary
- * data sources:
+ * Mirrors Unity's Window > Analysis > Frame Debugger, on three REAL
+ * per-frame data sources:
  *
- *   1. bgfx_get_stats()  live, per-frame snapshot:
- *        - Frame totals: numDraw, numCompute, numBlit, GPU/CPU times,
- *          gpu memory used, draw resource counts.
- *        - viewStats[]: per-bgfx-view name + GPU time interval. We
- *          render this as a table sorted by view ID, the same axis on
- *          which jce_render_graph assigns passes.
+ *   1. bgfx_get_stats() totals: draw/compute/blit counts, CPU/GPU times,
+ *      backbuffer + resource counts, GPU memory.
+ *   2. The per-view GPU/CPU table — the Profiling workbench's single
+ *      shared implementation (jce_panel_profiler_draw_view_table); this
+ *      file used to carry a duplicate copy.
+ *   3. Scene-renderer submission breakdown: render-queue flush stats
+ *      (commands → submits, instance merging) and LOD pick counts from
+ *      the engine's per-frame counters.
  *
- *   2. jce_rg_frame_debug_*()  declarative render-graph capture:
- *        - "Capture next frame" button calls
- *          jce_rg_frame_debug_request_capture(); the next call to
- *          jce_rg_execute() fills a static buffer with each pass's
- *          name, view ID, read/write resource names, and culled flag.
- *        - The capture survives until overwritten so the user can pan
- *          through it after pausing or after switching panels.
- *
- * No engine consumer wires the render graph in production play yet, so
- * the second section will read "no capture available" until a game does
- * so. The first section always works.
+ * The former "render-graph capture" section was removed: jce_rg_execute
+ * has no production caller (the scene renderer drives bgfx views
+ * directly), so its capture button could never produce data.  The
+ * engine-side jce_rg debug API remains for future graph adoption.
  */
 
 #include "ui/jce_editor_colors.h"
 #include "core/jce_editor_i18n.h"
 #include "ui/jce_editor_panels.h"
+#include "scene/jce_editor_scene_render.h"
 
 #include <jce/tools/jce_imgui.hpp>
 #include <cstdio>
 #include <cstring>
 
 extern "C" {
-#include <jce/renderer/jce_render_graph.h>
 #include <jce/renderer/jce_renderer.h>
+#include <jce/renderer/jce_scene_renderer.h>
 }
-
-#define MAX_CAPTURED_PASSES 64
-
-static JceRGFrameDebugPass s_passes[MAX_CAPTURED_PASSES];
-static uint32_t            s_pass_count = 0;
-static int                 s_selected   = -1;
 
 /* ── Helpers ────────────────────────────────────────────────────────── */
 
@@ -85,110 +75,64 @@ static void draw_frame_totals(const JceGpuStats *st)
     }
 }
 
-static void draw_view_stats(const JceGpuStats *st)
+/* Per-view GPU/CPU table — the shared Profiling-workbench widget; this
+ * file used to carry its own duplicate copy of the table. */
+static void draw_view_stats(void)
 {
     if (!ImGui::CollapsingHeader(jce_editor_i18n("frameDebugger.section.views"),
                                  ImGuiTreeNodeFlags_DefaultOpen))
         return;
-    if (!st || !st->valid || st->num_views == 0) {
-        ImGui::TextDisabled("%s", jce_editor_i18n("frameDebugger.noViews"));
-        return;
-    }
-
-    if (ImGui::BeginTable("##views", 4,
-            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY,
-            ImVec2(0, 220))) {
-        ImGui::TableSetupColumn(jce_editor_i18n("frameDebugger.col.viewId"),
-                                ImGuiTableColumnFlags_WidthFixed, 60.0f);
-        ImGui::TableSetupColumn(jce_editor_i18n("frameDebugger.col.viewName"),
-                                ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn(jce_editor_i18n("frameDebugger.col.gpuMs"),
-                                ImGuiTableColumnFlags_WidthFixed, 90.0f);
-        ImGui::TableSetupColumn(jce_editor_i18n("frameDebugger.col.cpuMs"),
-                                ImGuiTableColumnFlags_WidthFixed, 90.0f);
-        ImGui::TableHeadersRow();
-
-        for (uint16_t i = 0; i < st->num_views; i++) {
-            const JceGpuViewStat *vs = &st->views[i];
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0); ImGui::Text("%u", (uint32_t)vs->view_id);
-            ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(vs->name[0] ? vs->name : "(unnamed)");
-            ImGui::TableSetColumnIndex(2); ImGui::Text("%.3f", vs->gpu_ms);
-            ImGui::TableSetColumnIndex(3); ImGui::Text("%.3f", vs->cpu_ms);
-        }
-        ImGui::EndTable();
-    }
+    jce_panel_profiler_draw_view_table();
 }
 
-static void draw_rg_capture(void)
+/* Scene-renderer submission breakdown — real per-frame counters from the
+ * engine (render-queue flush + LOD picks).  Replaces the former
+ * render-graph capture section whose button could never produce data
+ * (jce_rg_execute has no production caller). */
+static void draw_renderer_breakdown(void)
 {
-    if (!ImGui::CollapsingHeader(jce_editor_i18n("frameDebugger.section.rg"),
+    if (!ImGui::CollapsingHeader(jce_editor_i18n("frameDebugger.section.renderer"),
                                  ImGuiTreeNodeFlags_DefaultOpen))
         return;
 
-    if (ImGui::Button(jce_editor_i18n("frameDebugger.capture"))) {
-        jce_rg_frame_debug_request_capture();
-    }
-    ImGui::SameLine();
-    if (jce_rg_frame_debug_pending()) {
-        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "%s",
-                           jce_editor_i18n("frameDebugger.pending"));
-    } else if (s_pass_count > 0) {
-        ImGui::TextDisabled("%s: %u", jce_editor_i18n("frameDebugger.passes"),
-                            (uint32_t)s_pass_count);
-    } else {
-        ImGui::TextDisabled("%s", jce_editor_i18n("frameDebugger.notCaptured"));
-    }
-
-    /* Pull the latest capture each frame; cheap (memcpy ≤ 64 entries). */
-    uint32_t fresh_n = 0;
-    if (jce_rg_frame_debug_get(s_passes, MAX_CAPTURED_PASSES, &fresh_n)) {
-        s_pass_count = fresh_n;
-        if (s_selected >= (int)s_pass_count) s_selected = -1;
-    }
-
-    if (s_pass_count == 0) {
-        ImGui::TextDisabled("%s", jce_editor_i18n("frameDebugger.noRgHint"));
+    JceSceneRenderer *sr = jce_editor_get_scene_renderer();
+    if (!sr) {
+        ImGui::TextDisabled("%s", jce_editor_i18n("frameDebugger.noStats"));
         return;
     }
 
-    ImGui::BeginChild("##fd_pass_list", ImVec2(260, 240), true);
-    for (uint32_t i = 0; i < s_pass_count; i++) {
-        const JceRGFrameDebugPass *p = &s_passes[i];
-        char lbl[160];
-        snprintf(lbl, sizeof(lbl), "[%u] %s%s",
-                 (uint32_t)p->view_id, p->name,
-                 p->culled ? " (culled)" : "");
-        bool sel = (int)i == s_selected;
-        if (ImGui::Selectable(lbl, sel)) s_selected = (int)i;
-    }
-    ImGui::EndChild();
-    ImGui::SameLine();
-
-    ImGui::BeginChild("##fd_pass_detail", ImVec2(0, 240), true);
-    if (s_selected < 0 || s_selected >= (int)s_pass_count) {
-        ImGui::TextDisabled("%s", jce_editor_i18n("frameDebugger.selectHint"));
+    JceSceneRqStats rq = {};
+    jce_scene_renderer_get_rq_stats(sr, &rq);
+    if (rq.enabled) {
+        ImGui::Text("%s: %u  \xE2\x86\x92  %s: %u",
+            jce_editor_i18n("frameDebugger.rq.commands"),  rq.commands_in,
+            jce_editor_i18n("frameDebugger.rq.submits"),   rq.submits_out);
+        ImGui::Text("%s: %u  |  %s: %u",
+            jce_editor_i18n("frameDebugger.rq.batches"),   rq.batches_merged,
+            jce_editor_i18n("frameDebugger.rq.instances"), rq.instances_total);
     } else {
-        const JceRGFrameDebugPass *p = &s_passes[s_selected];
-        ImGui::Text("%s: %s", jce_editor_i18n("frameDebugger.detail.name"), p->name);
-        ImGui::Text("%s: %u",  jce_editor_i18n("frameDebugger.detail.view"), (uint32_t)p->view_id);
-        ImGui::Text("%s: %s",  jce_editor_i18n("frameDebugger.detail.culled"),
-                    p->culled ? "yes" : "no");
-        ImGui::Separator();
-        ImGui::Text("%s (%u):", jce_editor_i18n("frameDebugger.detail.reads"),
-                    (uint32_t)p->read_count);
-        uint16_t rn = p->read_count > 8 ? 8 : p->read_count;
-        for (uint16_t k = 0; k < rn; k++) ImGui::BulletText("%s", p->read_names[k]);
-        if (p->read_count > rn) ImGui::TextDisabled(jce_editor_i18n("frameDebugger.moreFmt"), p->read_count - rn);
-        ImGui::Separator();
-        ImGui::Text("%s (%u):", jce_editor_i18n("frameDebugger.detail.writes"),
-                    (uint32_t)p->write_count);
-        uint16_t wn = p->write_count > 8 ? 8 : p->write_count;
-        for (uint16_t k = 0; k < wn; k++) ImGui::BulletText("%s", p->write_names[k]);
-        if (p->write_count > wn) ImGui::TextDisabled(jce_editor_i18n("frameDebugger.moreFmt"), p->write_count - wn);
+        ImGui::TextDisabled("%s", jce_editor_i18n("frameDebugger.rq.off"));
     }
-    ImGui::EndChild();
+
+    ImGui::Separator();
+
+    JceSceneLodStats lod = {};
+    jce_scene_renderer_get_lod_stats(sr, &lod);
+    if (lod.enabled && lod.level_count > 0) {
+        ImGui::TextUnformatted(jce_editor_i18n("frameDebugger.lod.header"));
+        ImGui::SameLine();
+        for (int i = 0; i < lod.level_count && i < JCE_SCENE_LOD_MAX_LEVELS; i++) {
+            ImGui::SameLine();
+            ImGui::Text("L%d: %u", i, lod.picks[i]);
+        }
+        if (lod.culled > 0) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s: %u",
+                jce_editor_i18n("frameDebugger.lod.culled"), lod.culled);
+        }
+    } else {
+        ImGui::TextDisabled("%s", jce_editor_i18n("frameDebugger.lod.off"));
+    }
 }
 
 /* ── Public entry points ────────────────────────────────────────────── */
@@ -198,8 +142,8 @@ extern "C" void jce_editor_panel_frame_debugger_content(void)
     JceGpuStats stats;
     bool ok = jce_renderer_get_gpu_stats(&stats);
     draw_frame_totals(ok ? &stats : nullptr);
-    draw_view_stats(ok ? &stats : nullptr);
-    draw_rg_capture();
+    draw_view_stats();
+    draw_renderer_breakdown();
 }
 
 /* Shim: Frame Debugger has been merged into the Profiler "Profiling"

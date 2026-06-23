@@ -746,10 +746,16 @@ void draw_preset_editor(Preset &p)
         ImGui::SeparatorText(jce_editor_i18n("importPresets.editor.collider"));
         ImGui::Checkbox(jce_editor_i18n("importPresets.editor.genCollider"), &p.mdl.gen_collider);
         if (p.mdl.gen_collider) {
-            const char *splits[] = { "By Part", "Whole" };
+            const char *splits[] = { jce_editor_i18n("inspector.compcol.split.byPart"), jce_editor_i18n("inspector.compcol.split.whole") };
             ImGui::Combo(jce_editor_i18n("importPresets.editor.colSplit"), &p.mdl.col_split, splits, 2);
-            const char *modes[] = { "Auto", "Box", "Sphere", "Capsule",
-                                    "Convex Hull", "Convex Decomp", "Triangle Mesh" };
+            const char *modes[] = {
+                jce_editor_i18n("inspector.compcol.mode.auto"),
+                jce_editor_i18n("inspector.compcol.mode.box"),
+                jce_editor_i18n("inspector.compcol.mode.sphere"),
+                jce_editor_i18n("inspector.compcol.mode.capsule"),
+                jce_editor_i18n("inspector.compcol.mode.convexHull"),
+                jce_editor_i18n("inspector.compcol.mode.convexDecomp"),
+                jce_editor_i18n("inspector.compcol.mode.triangleMesh") };
             ImGui::Combo(jce_editor_i18n("importPresets.editor.colMode"), &p.mdl.col_mode, modes, 7);
             ImGui::Checkbox(jce_editor_i18n("importPresets.editor.colStatic"), &p.mdl.col_static);
             ImGui::Checkbox(jce_editor_i18n("importPresets.editor.colDetect"), &p.mdl.col_detect);

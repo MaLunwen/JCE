@@ -57,7 +57,8 @@ bool jce_scene_serial_save_file(const JceScene *scene, const char *path)
     if (!json) return false;
     size_t len = strlen(json);
 
-    bool ok = jce_fs_host_write_all(path, json, len);
+    /* Atomic: a crash mid-write must never truncate or empty the user's scene. */
+    bool ok = jce_fs_host_write_all_atomic(path, json, len);
     jce_json_free_string(json);
 
     if (!ok) {

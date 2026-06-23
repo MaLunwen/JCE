@@ -13,10 +13,13 @@ extern "C" {
 
 #include <jce/middleware/net/jce_net.h>
 #include <jce/middleware/net/jce_net_quant.h>
+#include <jce/middleware/net/jce_net_prediction.h>
 #include <jce/middleware/net/jce_net_transform.h>
 #include <jce/middleware/net/jce_net_types.h>
 #include <jce/middleware/net/jce_replication.h>
+#include <jce/middleware/net/jce_network_variable.h>
 #include <jce/middleware/net/jce_rpc.h>
+#include <jce/middleware/net/jce_net_input_command.h>
 #include <jce/middleware/net/jce_session.h>
 #include <jce/middleware/net/jce_lan_discovery.h>
 

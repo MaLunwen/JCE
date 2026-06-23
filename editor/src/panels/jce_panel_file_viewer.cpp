@@ -325,11 +325,12 @@ void jce_file_viewer_open(const char *path)
             open_path, file_size, FV_MAX_ASSET_BYTES / (1024 * 1024));
 
         snprintf(info_msg, sizeof(info_msg),
-            "Preview unavailable for this file.\n\n"
-            "Path: %s\n"
-            "Size: %.2f MB\n"
-            "Limit: %d MB\n\n"
-            "The file exceeds the File Viewer preview size limit.",
+            jce_editor_i18n_or("fileViewer.info.tooLarge",
+                "Preview unavailable for this file.\n\n"
+                "Path: %s\n"
+                "Size: %.2f MB\n"
+                "Limit: %d MB\n\n"
+                "The file exceeds the File Viewer preview size limit."),
             open_path,
             (double)file_size / (1024.0 * 1024.0),
             FV_MAX_ASSET_BYTES / (1024 * 1024));
@@ -346,8 +347,9 @@ void jce_file_viewer_open(const char *path)
         read_size = (int)file_size;
     else if (ftype == JCE_FV_VIDEO) {
         /* Video is decoded in-engine (jce_video) from the full byte
-         * buffer.  Respect the shared FV_MAX_ASSET_BYTES (200 MB) cap
-         * that also governs audio/model loads. */
+         * buffer.  Respect the shared FV_MAX_ASSET_BYTES (128 MB) cap
+         * that also governs audio/model loads.  (TODO: stream large video
+         * from tab->path instead of a whole-file read — audit F96.) */
         const long video_cap = FV_MAX_ASSET_BYTES;
         read_size = (file_size > video_cap) ? (int)video_cap
                                             : (int)file_size;

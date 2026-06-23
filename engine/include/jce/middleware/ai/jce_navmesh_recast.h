@@ -109,6 +109,23 @@ JCE_API int  jce_recast_find_path(const JceRecastNavMesh *nm,
                                    float goal_x,  float goal_z,
                                    float *out_xz, int max_pairs);
 
+/* 3D variant of jce_recast_find_path: emits XYZ triples instead of XZ pairs,
+ * so multi-floor navigation gets a real per-waypoint Y.
+ *
+ * `out_xyz` receives waypoint triples (x,y,z); its length must be at least
+ * max_pts*3 floats.  Start/goal Y is honoured (the start/goal are snapped to
+ * the nearest walkable polygon in 3D, not forced to Y=0).  Each emitted
+ * waypoint's Y is resolved on the polygon it lies on via
+ * dtNavMeshQuery::getPolyHeight, falling back to the straight-path height
+ * (and a findNearestPoly+getPolyHeight probe) when the per-point polyRef is
+ * unavailable.  Returns the number of waypoints written, 0 if no path exists.
+ *
+ * The 2D jce_recast_find_path is unchanged and remains the JceNavAgent path. */
+JCE_API int  jce_recast_find_path_3d(const JceRecastNavMesh *nm,
+                                     float start_x, float start_y, float start_z,
+                                     float goal_x,  float goal_y,  float goal_z,
+                                     float *out_xyz, int max_pts);
+
 /* Adapter matching JceNavAgentPathFn — pass the navmesh as `user`:
  *
  *   jce_nav_agent_set_path_fn(set, jce_recast_path_fn, recast_nm);
@@ -133,6 +150,60 @@ JCE_API int jce_recast_debug_edges(const JceRecastNavMesh *nm, JceRecastEdgeFn f
 
 JCE_API void jce_recast_get_stats(const JceRecastNavMesh *nm,
                                     JceRecastStats *out_stats);
+
+/* ── Dynamic obstacles (DetourTileCache) ─────────────────────────── *
+ *
+ * The builders above produce a *static* single-tile navmesh: fast to bake
+ * and query, but the walkable set is frozen at bake time.  For runtime
+ * obstacles (a crate dropped on a corridor, a door that closes) we need a
+ * navmesh whose tiles can be re-cut on the fly.  jce_recast_build_tiled
+ * bakes the same triangle soup into a *tile-cache-backed* navmesh: the
+ * geometry is sliced into a grid of compressed tiles managed by a live
+ * dtTileCache, and obstacles can be stamped into / removed from it at
+ * runtime, which rebuilds only the affected tiles so subsequent path
+ * queries route around them.
+ *
+ * The returned handle is the *same* JceRecastNavMesh type used by the
+ * static path, so every query function above (jce_recast_find_path,
+ * _3d, _snap_to_navmesh, _debug_edges, _get_stats, _path_fn) works
+ * unchanged on a tiled navmesh.  jce_recast_destroy frees it either way.
+ *
+ * The obstacle functions below are no-ops (return 0 / false) on a navmesh
+ * that was NOT built with jce_recast_build_tiled — the static path is
+ * fully preserved and additive.
+ */
+JCE_API JceRecastNavMesh *jce_recast_build_tiled(const float    *vertices,
+                                                 uint32_t        vertex_count,
+                                                 const uint32_t *indices,
+                                                 uint32_t        triangle_count,
+                                                 const JceRecastConfig *cfg);
+
+/* Opaque obstacle handle.  0 is the invalid/null obstacle ref. */
+typedef uint32_t JceRecastObstacleRef;
+
+/* Stamp a vertical cylinder obstacle into the tile cache and rebuild the
+ * tiles it touches so queries route around it.  `pos` is the centre of the
+ * cylinder *base* (x,y,z); the cylinder extends upward by `height`.
+ * Returns a non-zero obstacle ref on success, 0 on failure (no tile cache,
+ * obstacle pool full, or out of bounds). */
+JCE_API JceRecastObstacleRef jce_recast_add_obstacle(JceRecastNavMesh *nm,
+                                                     float pos_x, float pos_y, float pos_z,
+                                                     float radius, float height);
+
+/* Stamp an axis-aligned box obstacle (world-space min/max corners) into the
+ * tile cache.  Returns a non-zero obstacle ref on success, 0 on failure. */
+JCE_API JceRecastObstacleRef jce_recast_add_box_obstacle(JceRecastNavMesh *nm,
+                                                         float min_x, float min_y, float min_z,
+                                                         float max_x, float max_y, float max_z);
+
+/* Remove a previously added obstacle and rebuild the tiles it touched, so
+ * queries route through the freed area again.  Returns true on success. */
+JCE_API bool jce_recast_remove_obstacle(JceRecastNavMesh *nm,
+                                        JceRecastObstacleRef ref);
+
+/* True if this navmesh carries a live dtTileCache (built via
+ * jce_recast_build_tiled) and therefore supports dynamic obstacles. */
+JCE_API bool jce_recast_has_tile_cache(const JceRecastNavMesh *nm);
 
 JCE_EXTERN_C_END
 

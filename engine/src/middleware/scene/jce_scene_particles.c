@@ -133,6 +133,9 @@ static void sp_build_emitter(SpCtx *ctx, JceParticleEmitterComponent *c)
     jce_scene_particle_emitter_desc(c, &desc);
 
     JceEmitterHandle h = jce_particles_emitter_add(ctx->sys, &desc);
+    /* emitter_add deep-copied any loader-owned sub-emitter child synchronously;
+     * release the heap child desc now so it does not leak (no-op when none). */
+    jce_particles_desc_free(&desc);
     if (!jce_emitter_valid(h)) {
         LOG_WARN(LOG_TAG, "emitter pool full; particle component skipped");
         return;
@@ -226,6 +229,46 @@ void jce_scene_particles_update(JceScene *s, float dt)
         if (jce_particles_emitter_is_alive(sys, h))
             jce_particles_emitter_remove(sys, h);
     }
+}
+
+/* ── Per-entity control (scripting last-mile) ─────────────────────────────
+ *
+ * Resolve entity -> JceParticleEmitterComponent -> the live emitter handle in
+ * the scene-owned JceParticleSystem.  Tolerant: a no-op when the scene has no
+ * particle system yet (built lazily on the first jce_scene_particles_update
+ * tick), the entity has no emitter component, or the component is GPU-routed /
+ * not yet loaded (emitter_handle_idx == UINT32_MAX). */
+static JceParticleSystem *sp_resolve(JceScene *s, JceEntity e,
+                                     JceEmitterHandle *out)
+{
+    if (!s) return NULL;
+    JceParticleSystem *sys =
+        (JceParticleSystem *)jce_scene_internal_particles_get(s);
+    if (!sys) return NULL;
+    JceParticleEmitterComponent *c = jce_scene_get_particle_emitter(s, e);
+    if (!c || !c->loaded || c->emitter_handle_idx == UINT32_MAX) return NULL;
+    JceEmitterHandle h = { c->emitter_handle_idx };
+    if (!jce_particles_emitter_is_alive(sys, h)) return NULL;
+    *out = h;
+    return sys;
+}
+
+void jce_scene_particle_burst(JceScene *s, JceEntity e, int count)
+{
+    if (count <= 0) return;
+    JceEmitterHandle h;
+    JceParticleSystem *sys = sp_resolve(s, e, &h);
+    if (!sys) return;
+    jce_particles_emitter_burst(sys, h, (uint32_t)count);
+}
+
+void jce_scene_particle_set_emitting(JceScene *s, JceEntity e, bool on)
+{
+    JceEmitterHandle h;
+    JceParticleSystem *sys = sp_resolve(s, e, &h);
+    if (!sys) return;
+    if (on) jce_particles_emitter_start(sys, h);
+    else    jce_particles_emitter_stop(sys, h);
 }
 
 void jce_scene_particles_shutdown(JceScene *s)

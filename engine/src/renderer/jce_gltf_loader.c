@@ -8,16 +8,19 @@
 
 #include "jce_gltf_loader.h"
 
+#include <jce/middleware/animation/jce_morph.h>
 #include <jce/middleware/animation/jce_skeleton.h>
 #include <jce/renderer/jce_skinned_mesh.h>
 #include <jce/os/core/jce_filesystem.h>
 #include <jce/os/core/jce_log.h>
 #include <jce/os/core/jce_math.h>
+#include <float.h>   /* FLT_MAX (model AABB seed) */
 #include <jce/resource/jce_pak_loader.h>
 #include <jce/renderer/jce_mesh.h>
 #include <jce/renderer/jce_texture.h>
 
 #include "middleware/animation/jce_animation.h"
+#include <jce/middleware/animation/jce_anim_compress.h>  /* opt-in keyframe reduction */
 #include "os/core/jce_memory.h"
 #include "renderer/jce_model_internal.h"
 
@@ -37,12 +40,13 @@
 
 /* One primitive's geometry as CPU arrays (no GPU buffers yet). */
 typedef struct {
-    int       kind;            /* 0 = static PBR (JcePbrVertex), 1 = skinned */
-    void     *verts;           /* owned: JcePbrVertex[] or JceSkinnedVertex[] */
-    uint32_t  num_verts;
-    uint32_t *indices;         /* owned, may be NULL */
-    uint32_t  num_indices;
-    uint32_t  material_index;
+    int           kind;        /* 0 = static PBR (JcePbrVertex), 1 = skinned */
+    void         *verts;       /* owned: JcePbrVertex[] or JceSkinnedVertex[] */
+    uint32_t      num_verts;
+    uint32_t     *indices;     /* owned, may be NULL */
+    uint32_t      num_indices;
+    uint32_t      material_index;
+    JceMorphData *morph;       /* morph-target deltas (FEATURE 3.1), or NULL */
 } JceModelPrimCpu;
 
 typedef struct {
@@ -65,11 +69,20 @@ typedef struct {
     JceTextureCpu *emissive;
 } JceModelMatCpu;
 
+/* One imported morph-weight track: keyframed all-target weights for the model
+ * node it drives, tagged with its source animation index (FEATURE 3.1). */
+typedef struct {
+    uint32_t             anim_index;
+    uint32_t             node_index;
+    JceMorphWeightTrack *track;       /* CPU-only, owned */
+} JceModelMorphAnimCpu;
+
 struct JceModelCpu {
-    JceModelNodeCpu *nodes;      uint32_t num_nodes;
-    JceModelMatCpu  *materials;  uint32_t num_materials;
-    JceSkeleton     *skeleton;   /* CPU-only, built on the worker */
-    JceAnimClip    **anim_clips; uint32_t num_anims;
+    JceModelNodeCpu      *nodes;      uint32_t num_nodes;
+    JceModelMatCpu       *materials;  uint32_t num_materials;
+    JceSkeleton          *skeleton;   /* CPU-only, built on the worker */
+    JceAnimClip         **anim_clips; uint32_t num_anims;
+    JceModelMorphAnimCpu *morph_anims; uint32_t num_morph_anims;
 };
 
 /* ================================================================== */
@@ -374,12 +387,104 @@ static const cgltf_accessor *find_attribute(const cgltf_primitive *prim,
     return NULL;
 }
 
+/* Find a morph-target attribute accessor by type (POSITION / NORMAL). */
+static const cgltf_accessor *find_morph_attribute(const cgltf_morph_target *tgt,
+                                                  cgltf_attribute_type type)
+{
+    cgltf_size i;
+    for (i = 0; i < tgt->attributes_count; ++i) {
+        if (tgt->attributes[i].type == type)
+            return tgt->attributes[i].data;
+    }
+    return NULL;
+}
+
+/* Build morph storage for a primitive's targets (POSITION + optional NORMAL
+ * deltas) and seed the base weights from the mesh-/node-level defaults.
+ * Returns NULL when the primitive has no targets or no usable POSITION delta.
+ * The base weights array (if present) lives on the cgltf_mesh that owns the
+ * primitive — passed in via `mesh_weights`. */
+static JceMorphData *build_primitive_morph(const cgltf_primitive *prim,
+                                           uint32_t num_verts,
+                                           const cgltf_float *mesh_weights,
+                                           cgltf_size mesh_weights_count)
+{
+    uint32_t num_targets = (uint32_t)prim->targets_count;
+    if (num_targets == 0 || num_verts == 0) return NULL;
+
+    /* Detect whether ANY target carries NORMAL deltas; allocate the parallel
+     * normal-delta array only when at least one does. */
+    bool has_normals = false;
+    for (uint32_t t = 0; t < num_targets; ++t) {
+        if (find_morph_attribute(&prim->targets[t], cgltf_attribute_type_normal))
+            { has_normals = true; break; }
+    }
+
+    JceMorphData *morph = jce_morph_data_create(num_targets, num_verts,
+                                                has_normals);
+    if (!morph) return NULL;
+
+    bool any_position = false;
+    for (uint32_t t = 0; t < num_targets; ++t) {
+        const cgltf_morph_target *tgt = &prim->targets[t];
+
+        const cgltf_accessor *a_dpos =
+            find_morph_attribute(tgt, cgltf_attribute_type_position);
+        if (a_dpos && a_dpos->count >= num_verts) {
+            jce_vec3 *deltas = (jce_vec3 *)JCE_MALLOC(
+                (size_t)num_verts * sizeof(jce_vec3));
+            if (deltas) {
+                for (uint32_t v = 0; v < num_verts; ++v) {
+                    float d[3] = { 0.0f, 0.0f, 0.0f };
+                    cgltf_accessor_read_float(a_dpos, v, d, 3);
+                    deltas[v].x = d[0]; deltas[v].y = d[1]; deltas[v].z = d[2];
+                }
+                jce_morph_set_position_deltas(morph, t, deltas, num_verts);
+                JCE_FREE(deltas);
+                any_position = true;
+            }
+        }
+
+        if (has_normals) {
+            const cgltf_accessor *a_dnorm =
+                find_morph_attribute(tgt, cgltf_attribute_type_normal);
+            if (a_dnorm && a_dnorm->count >= num_verts) {
+                jce_vec3 *deltas = (jce_vec3 *)JCE_MALLOC(
+                    (size_t)num_verts * sizeof(jce_vec3));
+                if (deltas) {
+                    for (uint32_t v = 0; v < num_verts; ++v) {
+                        float d[3] = { 0.0f, 0.0f, 0.0f };
+                        cgltf_accessor_read_float(a_dnorm, v, d, 3);
+                        deltas[v].x = d[0]; deltas[v].y = d[1]; deltas[v].z = d[2];
+                    }
+                    jce_morph_set_normal_deltas(morph, t, deltas, num_verts);
+                    JCE_FREE(deltas);
+                }
+            }
+        }
+
+        /* Base weight: glTF stores defaults per mesh (or node); index by target. */
+        if (mesh_weights && (cgltf_size)t < mesh_weights_count)
+            jce_morph_set_base_weight(morph, t, (float)mesh_weights[t]);
+    }
+
+    if (!any_position) {
+        /* No target produced a POSITION delta — nothing to morph. */
+        jce_morph_data_destroy(morph);
+        return NULL;
+    }
+
+    return morph;
+}
+
 /* Extract one glTF primitive's geometry into CPU staging arrays (no GPU
  * buffers; jce_gltf_upload_cpu creates them later).  Ownership of verts +
  * indices transfers to `out`. */
 static void build_primitive_cpu(const cgltf_primitive *prim,
                                 JceModelPrimCpu *out,
-                                const cgltf_data *data)
+                                const cgltf_data *data,
+                                const cgltf_float *base_weights,
+                                cgltf_size base_weights_count)
 {
     const cgltf_accessor *a_pos    = find_attribute(prim, cgltf_attribute_type_position, 0);
     const cgltf_accessor *a_norm   = find_attribute(prim, cgltf_attribute_type_normal, 0);
@@ -408,6 +513,12 @@ static void build_primitive_cpu(const cgltf_primitive *prim,
 
     /* Material index. */
     out->material_index = find_material_index(data, prim->material);
+
+    /* Morph targets / blendshapes (FEATURE 3.1): read POSITION (+NORMAL) deltas
+     * per target and seed the base weights.  No-op when the primitive has no
+     * targets. */
+    out->morph = build_primitive_morph(prim, num_verts,
+                                       base_weights, base_weights_count);
 
     /* ---- Skinned mesh ---- */
     if (a_joints && a_wts) {
@@ -637,16 +748,26 @@ static JceAnimClip **extract_animations(cgltf_data *data, uint32_t *out_count)
                 dst->target = JCE_ANIM_TARGET_SCALE;
                 break;
             default:
-                continue; /* skip weights etc. */
+                /* The skeletal JceAnimClip only carries joint TRS; the "weights"
+                 * morph channel is no longer dropped — extract_morph_anims()
+                 * collects it into a JceMorphWeightTrack (FEATURE 3.1). */
+                continue;
             }
 
-            /* Interpolation. */
+            /* Interpolation.  cgltf packs cubic-spline outputs as
+             * [in_tangent, value, out_tangent] per key (3x the input count);
+             * the value loops below extract only the value sub-element and the
+             * clip is treated as LINEAR (the sampler does not Hermite-eval).
+             * Reading the raw index stored the in-tangent as the value and
+             * silently corrupted the animation (audit F46). */
+            const int cubic =
+                (samp->interpolation == cgltf_interpolation_type_cubic_spline);
             switch (samp->interpolation) {
             case cgltf_interpolation_type_step:
                 dst->interpolation = JCE_INTERP_STEP;
                 break;
             case cgltf_interpolation_type_cubic_spline:
-                dst->interpolation = JCE_INTERP_CUBIC_SPLINE;
+                dst->interpolation = JCE_INTERP_LINEAR;
                 break;
             default:
                 dst->interpolation = JCE_INTERP_LINEAR;
@@ -675,7 +796,8 @@ static JceAnimClip **extract_animations(cgltf_data *data, uint32_t *out_count)
                 if (!vals) { JCE_FREE(dst->timestamps); dst->timestamps = NULL; continue; }
                 for (ki = 0; ki < kf_count; ++ki) {
                     float v[3];
-                    cgltf_accessor_read_float(samp->output, ki, v, 3);
+                    cgltf_accessor_read_float(samp->output,
+                                              cubic ? ki * 3u + 1u : ki, v, 3);
                     vals[ki].x = v[0];
                     vals[ki].y = v[1];
                     vals[ki].z = v[2];
@@ -690,7 +812,8 @@ static JceAnimClip **extract_animations(cgltf_data *data, uint32_t *out_count)
                 if (!vals) { JCE_FREE(dst->timestamps); dst->timestamps = NULL; continue; }
                 for (ki = 0; ki < kf_count; ++ki) {
                     float v[4];
-                    cgltf_accessor_read_float(samp->output, ki, v, 4);
+                    cgltf_accessor_read_float(samp->output,
+                                              cubic ? ki * 3u + 1u : ki, v, 4);
                     vals[ki].x = v[0];
                     vals[ki].y = v[1];
                     vals[ki].z = v[2];
@@ -700,6 +823,29 @@ static JceAnimClip **extract_animations(cgltf_data *data, uint32_t *out_count)
             }
 
             valid_channels++;
+        }
+
+        /* Optional lossy keyframe reduction (opt-in import setting; default OFF
+         * so the load path is byte-identical).  Only LINEAR tracks: the reducer
+         * reconstructs via lerp/nlerp, so STEP tracks must keep every key. */
+        if (jce_anim_compress_is_enabled()) {
+            JceAnimCompressParams cp;
+            jce_anim_compress_get_params(&cp);
+            for (ci = 0; ci < valid_channels; ++ci) {
+                JceAnimChannel *c = &channels[ci];
+                if (c->interpolation != JCE_INTERP_LINEAR || !c->timestamps) continue;
+                if (c->target == JCE_ANIM_TARGET_ROTATION) {
+                    if (c->rotations)
+                        c->count = jce_anim_compress_track(c->timestamps, c->rotations,
+                            c->count, JCE_ANIM_COMPRESS_QUAT, &cp);
+                } else {
+                    jce_vec3 *vals = (c->target == JCE_ANIM_TARGET_TRANSLATION)
+                                         ? c->translations : c->scales;
+                    if (vals)
+                        c->count = jce_anim_compress_track(c->timestamps, vals,
+                            c->count, JCE_ANIM_COMPRESS_VEC3, &cp);
+                }
+            }
         }
 
         /* Create clip name. */
@@ -719,6 +865,121 @@ static JceAnimClip **extract_animations(cgltf_data *data, uint32_t *out_count)
 
     *out_count = num_anims;
     return clips;
+}
+
+/* ================================================================== */
+/* Extract morph-weight animation channels (FEATURE 3.1)               */
+/* ================================================================== */
+
+/* Map a cgltf_node to its index in the model's filtered node array (only
+ * mesh-bearing nodes are kept, in document order).  Returns -1 if `node`
+ * has no mesh (so was not staged). */
+static int32_t model_node_index_of(const cgltf_data *data,
+                                    const cgltf_node *node)
+{
+    if (!node || !node->mesh) return -1;
+    int32_t idx = 0;
+    for (cgltf_size ni = 0; ni < data->nodes_count; ++ni) {
+        if (!data->nodes[ni].mesh) continue;
+        if (&data->nodes[ni] == node) return idx;
+        idx++;
+    }
+    return -1;
+}
+
+/* Un-drop the glTF "weights" animation channel (previously skipped in
+ * extract_animations): each weights channel drives ALL morph targets of its
+ * target node's mesh over time.  cgltf packs the sampler output as
+ * (num_keys * num_targets) scalars, key-major.  Collect one JceMorphWeightTrack
+ * per (animation, mesh node) pair.  Independent of skins so static blendshape
+ * meshes work too. */
+static JceModelMorphAnimCpu *extract_morph_anims(cgltf_data *data,
+                                                 uint32_t *out_count)
+{
+    *out_count = 0;
+    if (data->animations_count == 0) return NULL;
+
+    /* Upper bound: every channel could be a distinct weights channel. */
+    cgltf_size cap = 0;
+    for (cgltf_size ai = 0; ai < data->animations_count; ++ai)
+        cap += data->animations[ai].channels_count;
+    if (cap == 0) return NULL;
+
+    JceModelMorphAnimCpu *out = (JceModelMorphAnimCpu *)JCE_CALLOC(
+        (size_t)cap, sizeof(JceModelMorphAnimCpu));
+    if (!out) return NULL;
+
+    uint32_t n = 0;
+    for (cgltf_size ai = 0; ai < data->animations_count; ++ai) {
+        const cgltf_animation *anim = &data->animations[ai];
+        for (cgltf_size ci = 0; ci < anim->channels_count; ++ci) {
+            const cgltf_animation_channel *ch = &anim->channels[ci];
+            if (ch->target_path != cgltf_animation_path_type_weights) continue;
+            if (!ch->sampler || !ch->target_node || !ch->target_node->mesh)
+                continue;
+
+            const cgltf_animation_sampler *samp = ch->sampler;
+            if (!samp->input || !samp->output) continue;
+
+            uint32_t num_targets =
+                (uint32_t)ch->target_node->mesh->primitives_count > 0
+                    ? (uint32_t)ch->target_node->mesh->primitives[0].targets_count
+                    : 0;
+            if (num_targets == 0) continue;
+
+            uint32_t num_keys = (uint32_t)samp->input->count;
+            if (num_keys == 0) continue;
+
+            int32_t node_index = model_node_index_of(data, ch->target_node);
+            if (node_index < 0) continue;
+
+            /* cubic-spline output packs [in_tangent, value, out_tangent] per key
+             * (3x); extract the value sub-element only and treat as LINEAR
+             * (mirrors the joint-channel handling in extract_animations). */
+            const int cubic =
+                (samp->interpolation == cgltf_interpolation_type_cubic_spline);
+            JceMorphInterp interp =
+                (samp->interpolation == cgltf_interpolation_type_step)
+                    ? JCE_MORPH_INTERP_STEP : JCE_MORPH_INTERP_LINEAR;
+
+            float *ts = (float *)JCE_MALLOC((size_t)num_keys * sizeof(float));
+            float *vals = (float *)JCE_MALLOC(
+                (size_t)num_keys * num_targets * sizeof(float));
+            if (!ts || !vals) { JCE_FREE(ts); JCE_FREE(vals); continue; }
+
+            for (uint32_t k = 0; k < num_keys; ++k)
+                cgltf_accessor_read_float(samp->input, k, &ts[k], 1);
+
+            /* Output is (num_keys * num_targets) scalars, key-major.  For
+             * cubic-spline each key holds [in_tangent*N, value*N, out_tangent*N]
+             * (3N scalars); the value block starts at k*3N + N. */
+            for (uint32_t k = 0; k < num_keys; ++k) {
+                for (uint32_t t = 0; t < num_targets; ++t) {
+                    uint32_t elem = cubic ? (k * 3u * num_targets
+                                             + num_targets + t)
+                                          : (k * num_targets + t);
+                    float w = 0.0f;
+                    cgltf_accessor_read_float(samp->output, elem, &w, 1);
+                    vals[k * num_targets + t] = w;
+                }
+            }
+
+            JceMorphWeightTrack *track = jce_morph_weight_track_create(
+                num_targets, num_keys, ts, vals, interp);
+            JCE_FREE(ts);
+            JCE_FREE(vals);
+            if (!track) continue;
+
+            out[n].anim_index = (uint32_t)ai;
+            out[n].node_index = (uint32_t)node_index;
+            out[n].track      = track;
+            n++;
+        }
+    }
+
+    if (n == 0) { JCE_FREE(out); return NULL; }
+    *out_count = n;
+    return out;
 }
 
 /* ================================================================== */
@@ -788,6 +1049,18 @@ static JceModelNodeCpu *extract_nodes_cpu(cgltf_data *data,
         /* Parent index: -1 for now (flat list). */
         node->parent = -1;
 
+        /* Morph base weights: node-level weights override mesh-level defaults
+         * (glTF 2.0 §3.7.2.2).  Either may be absent. */
+        const cgltf_float *base_weights = NULL;
+        cgltf_size base_weights_count = 0;
+        if (gnode->weights && gnode->weights_count > 0) {
+            base_weights = gnode->weights;
+            base_weights_count = gnode->weights_count;
+        } else if (gnode->mesh->weights && gnode->mesh->weights_count > 0) {
+            base_weights = gnode->mesh->weights;
+            base_weights_count = gnode->mesh->weights_count;
+        }
+
         /* Primitives → CPU staging. */
         uint32_t num_prims = (uint32_t)gnode->mesh->primitives_count;
         node->num_prims = num_prims;
@@ -797,7 +1070,8 @@ static JceModelNodeCpu *extract_nodes_cpu(cgltf_data *data,
             uint32_t pi;
             for (pi = 0; pi < num_prims; ++pi) {
                 build_primitive_cpu(&gnode->mesh->primitives[pi],
-                                    &node->prims[pi], data);
+                                    &node->prims[pi], data,
+                                    base_weights, base_weights_count);
             }
         }
 
@@ -820,10 +1094,11 @@ static JceModelCpu *build_model_cpu(const JcePakArchive *pak,
     JceModelCpu *cpu = (JceModelCpu *)JCE_CALLOC(1, sizeof(JceModelCpu));
     if (!cpu) return NULL;
 
-    cpu->materials  = extract_materials_cpu(pak, path, data, &cpu->num_materials);
-    cpu->nodes      = extract_nodes_cpu(data, &cpu->num_nodes);
-    cpu->skeleton   = extract_skeleton(data);    /* CPU-only */
-    cpu->anim_clips = extract_animations(data, &cpu->num_anims); /* CPU-only */
+    cpu->materials   = extract_materials_cpu(pak, path, data, &cpu->num_materials);
+    cpu->nodes       = extract_nodes_cpu(data, &cpu->num_nodes);
+    cpu->skeleton    = extract_skeleton(data);    /* CPU-only */
+    cpu->anim_clips  = extract_animations(data, &cpu->num_anims); /* CPU-only */
+    cpu->morph_anims = extract_morph_anims(data, &cpu->num_morph_anims); /* 3.1 */
     return cpu;
 }
 
@@ -886,6 +1161,22 @@ JceModelCpu *jce_gltf_decode_cpu(const JcePakArchive *pak, const char *asset_pat
         data->buffers[0].size = data->bin_size;
     }
 
+    /* Validate accessor / buffer-view ranges before any accessor read.  cgltf
+     * only cross-checks accessor offset+stride*count against the buffer view
+     * inside cgltf_validate(); without it a crafted glTF (count >> buffer)
+     * drives out-of-bounds heap reads in build_model_cpu and overflows 32-bit
+     * allocation math (audit Round-3 P1; also subsumes the F46 cubic-spline
+     * index hazard).  The bin-link fixup above runs first so legit GLBs with
+     * cgltf's silent size quirk still validate. */
+    result = cgltf_validate(data);
+    if (result != cgltf_result_success) {
+        LOG_ERROR(LOG_TAG, "cgltf_validate failed (%d): %s — refusing malformed glTF",
+                  (int)result, asset_path);
+        cgltf_free(data);
+        JCE_FREE(buf);
+        return NULL;
+    }
+
     JceModelCpu *cpu = build_model_cpu(pak, asset_path, data);
     if (cpu) {
         LOG_DEBUG(LOG_TAG, "decoded %s: %u nodes, %u materials, %u anims%s",
@@ -930,6 +1221,18 @@ JceModelCpu *jce_gltf_decode_cpu_memory(const void *file_data, uint32_t size,
         data->buffers[0].size = data->bin_size;
     }
 
+    /* Validate accessor / buffer-view ranges before any accessor read — this
+     * entry accepts arbitrary (untrusted) memory, so a malformed glTF must be
+     * rejected rather than driving OOB reads / 32-bit alloc overflow in
+     * build_model_cpu (audit Round-3 P1; subsumes the F46 cubic hazard). */
+    result = cgltf_validate(data);
+    if (result != cgltf_result_success) {
+        LOG_ERROR(LOG_TAG, "cgltf_validate failed (%d): %s — refusing malformed glTF",
+                  (int)result, tag);
+        cgltf_free(data);
+        return NULL;
+    }
+
     /* No PAK so textures resolve via embedded data / host disk fallback. */
     JceModelCpu *cpu = build_model_cpu(NULL, tag, data);
     if (cpu) {
@@ -943,6 +1246,37 @@ JceModelCpu *jce_gltf_decode_cpu_memory(const void *file_data, uint32_t size,
 }
 
 /* ================================================================== */
+/* Lightweight rig probe (header-only, no geometry / buffers / GPU)   */
+/* ================================================================== */
+
+bool jce_gltf_probe_rig_memory(const void *file_data, uint32_t size,
+                               bool *out_has_skin, bool *out_has_anim)
+{
+    if (out_has_skin) *out_has_skin = false;
+    if (out_has_anim) *out_has_anim = false;
+    if (!file_data || size == 0) return false;
+
+    /* cgltf_parse reads only the JSON header (and, for GLB, the chunk
+     * table) — it does NOT load buffers, decode images, build meshes, or
+     * sample animation tracks.  That makes this orders of magnitude
+     * cheaper than a full load: just enough to answer "is this rigged?"
+     * for the editor's drop path without blocking the main thread. */
+    cgltf_options options;
+    memset(&options, 0, sizeof(options));
+    cgltf_data *data = NULL;
+    if (cgltf_parse(&options, file_data, (cgltf_size)size, &data)
+            != cgltf_result_success) {
+        return false;
+    }
+
+    if (out_has_skin) *out_has_skin = data->skins_count > 0;
+    if (out_has_anim) *out_has_anim = data->animations_count > 0;
+
+    cgltf_free(data);
+    return true;
+}
+
+/* ================================================================== */
 /* Render thread: upload (bgfx) + free the CPU intermediate           */
 /* ================================================================== */
 
@@ -952,6 +1286,15 @@ JceModel *jce_gltf_upload_cpu(JceModelCpu *cpu)
 
     JceModel *model = (JceModel *)JCE_CALLOC(1, sizeof(JceModel));
     if (!model) { jce_gltf_model_cpu_free(cpu); return NULL; }
+
+    /* Local-space AABB seed (model space); accumulated over every primitive's
+     * vertices × its node's baked world transform in the node loop below, so the
+     * scene renderer can frustum-cull this model by its true extent instead of a
+     * point at the origin (fixes large/un-scaled models vanishing when their
+     * centre leaves the view). */
+    model->aabb_min[0] = model->aabb_min[1] = model->aabb_min[2] =  FLT_MAX;
+    model->aabb_max[0] = model->aabb_max[1] = model->aabb_max[2] = -FLT_MAX;
+    model->has_aabb = false;
 
     /* Materials: copy factors, upload each decoded map (consumes texcpu). */
     if (cpu->num_materials > 0 && cpu->materials) {
@@ -995,15 +1338,46 @@ JceModel *jce_gltf_upload_cpu(JceModelCpu *cpu)
                             JceModelPrimitive *dp = &dn->primitives[p];
                             dp->material_index = sp->material_index;
                             dp->static_mesh    = NULL;
+                            /* Morph deltas: transfer ownership (CPU-only, no
+                             * GPU resource).  FEATURE 3.1 CPU pre-skin path. */
+                            dp->morph          = sp->morph; sp->morph = NULL;
                             if (!sp->verts || sp->num_verts == 0) continue;
+                            /* Accumulate this primitive's vertex positions
+                             * (node-local) transformed by the node's baked world
+                             * matrix into the model-space AABB.  pos[3] is the
+                             * first field of both JcePbrVertex and JceSkinnedVertex. */
+                            {
+                                size_t vstride = (sp->kind == 1)
+                                    ? sizeof(JceSkinnedVertex) : sizeof(JcePbrVertex);
+                                const char *vb = (const char *)sp->verts;
+                                for (uint32_t k = 0; k < sp->num_verts; ++k) {
+                                    const float *pp =
+                                        (const float *)(const void *)(vb + (size_t)k * vstride);
+                                    jce_vec4 lv = { pp[0], pp[1], pp[2], 1.0f };
+                                    jce_vec4 wv = jce_m4_mul_v4(&src->local_transform, lv);
+                                    if (wv.x < model->aabb_min[0]) model->aabb_min[0] = wv.x;
+                                    if (wv.y < model->aabb_min[1]) model->aabb_min[1] = wv.y;
+                                    if (wv.z < model->aabb_min[2]) model->aabb_min[2] = wv.z;
+                                    if (wv.x > model->aabb_max[0]) model->aabb_max[0] = wv.x;
+                                    if (wv.y > model->aabb_max[1]) model->aabb_max[1] = wv.y;
+                                    if (wv.z > model->aabb_max[2]) model->aabb_max[2] = wv.z;
+                                }
+                                model->has_aabb = true;
+                            }
+                            /* FEATURE 3.1: retain an undeformed CPU copy of the
+                             * base verts ONLY for morph-bearing prims, so the
+                             * per-instance GPU morph deform can re-upload into a
+                             * dynamic VB.  Non-morph prims keep retain=false =>
+                             * zero RAM regression for ordinary characters. */
+                            bool retain_morph = (dp->morph != NULL);
                             if (sp->kind == 1)
                                 dp->skinned_mesh = jce_skinned_mesh_create(
                                     (const JceSkinnedVertex *)sp->verts, sp->num_verts,
-                                    sp->indices, sp->num_indices);
+                                    sp->indices, sp->num_indices, retain_morph);
                             else
                                 dp->skinned_mesh = jce_pbr_mesh_create(
                                     (const JcePbrVertex *)sp->verts, sp->num_verts,
-                                    sp->indices, sp->num_indices);
+                                    sp->indices, sp->num_indices, retain_morph);
                         }
                     }
                 }
@@ -1015,6 +1389,23 @@ JceModel *jce_gltf_upload_cpu(JceModelCpu *cpu)
     model->skeleton   = cpu->skeleton;   cpu->skeleton = NULL;
     model->anim_clips = cpu->anim_clips; cpu->anim_clips = NULL;
     model->num_anims  = cpu->num_anims;  cpu->num_anims = 0;
+
+    /* Morph-weight tracks (FEATURE 3.1): transfer ownership.  Re-pack the CPU
+     * staging array into the model's JceModelMorphAnim array (tracks are
+     * CPU-only — no GPU resource). */
+    if (cpu->num_morph_anims > 0 && cpu->morph_anims) {
+        model->morph_anims = (JceModelMorphAnim *)JCE_CALLOC(
+            cpu->num_morph_anims, sizeof(JceModelMorphAnim));
+        if (model->morph_anims) {
+            model->num_morph_anims = cpu->num_morph_anims;
+            for (uint32_t i = 0; i < cpu->num_morph_anims; ++i) {
+                model->morph_anims[i].anim_index = cpu->morph_anims[i].anim_index;
+                model->morph_anims[i].node_index = cpu->morph_anims[i].node_index;
+                model->morph_anims[i].track      = cpu->morph_anims[i].track;
+                cpu->morph_anims[i].track = NULL;  /* ownership moved */
+            }
+        }
+    }
 
     /* Free the CPU intermediate (textures + skeleton/anims already moved out;
      * jce_gltf_model_cpu_free is null-safe per remaining field). */
@@ -1033,6 +1424,8 @@ void jce_gltf_model_cpu_free(JceModelCpu *cpu)
                 for (uint32_t p = 0; p < nd->num_prims; ++p) {
                     if (nd->prims[p].verts)   JCE_FREE(nd->prims[p].verts);
                     if (nd->prims[p].indices) JCE_FREE(nd->prims[p].indices);
+                    if (nd->prims[p].morph)
+                        jce_morph_data_destroy(nd->prims[p].morph);
                 }
                 JCE_FREE(nd->prims);
             }
@@ -1059,7 +1452,293 @@ void jce_gltf_model_cpu_free(JceModelCpu *cpu)
         JCE_FREE(cpu->anim_clips);
     }
 
+    if (cpu->morph_anims) {
+        for (uint32_t i = 0; i < cpu->num_morph_anims; ++i)
+            jce_morph_weight_track_destroy(cpu->morph_anims[i].track);
+        JCE_FREE(cpu->morph_anims);
+    }
+
     JCE_FREE(cpu);
+}
+
+/* ================================================================== */
+/* Morph-target inspection on the CPU intermediate (FEATURE 3.1)        */
+/* ================================================================== */
+
+uint32_t jce_gltf_cpu_node_count(const JceModelCpu *cpu)
+{
+    return cpu ? cpu->num_nodes : 0;
+}
+
+uint32_t jce_gltf_cpu_node_prim_count(const JceModelCpu *cpu, uint32_t node)
+{
+    if (!cpu || node >= cpu->num_nodes || !cpu->nodes) return 0;
+    return cpu->nodes[node].num_prims;
+}
+
+const struct JceMorphData *jce_gltf_cpu_prim_morph(const JceModelCpu *cpu,
+                                                   uint32_t node, uint32_t prim)
+{
+    if (!cpu || node >= cpu->num_nodes || !cpu->nodes) return NULL;
+    const JceModelNodeCpu *nd = &cpu->nodes[node];
+    if (prim >= nd->num_prims || !nd->prims) return NULL;
+    return nd->prims[prim].morph;
+}
+
+uint32_t jce_gltf_cpu_morph_anim_count(const JceModelCpu *cpu)
+{
+    return cpu ? cpu->num_morph_anims : 0;
+}
+
+const struct JceMorphWeightTrack *jce_gltf_cpu_morph_anim_track(
+    const JceModelCpu *cpu, uint32_t index,
+    uint32_t *out_anim_index, uint32_t *out_node_index)
+{
+    if (!cpu || index >= cpu->num_morph_anims || !cpu->morph_anims) return NULL;
+    const JceModelMorphAnimCpu *ma = &cpu->morph_anims[index];
+    if (out_anim_index) *out_anim_index = ma->anim_index;
+    if (out_node_index) *out_node_index = ma->node_index;
+    return ma->track;
+}
+
+/* ── Skeleton / skin / anim inspection on the CPU intermediate ─────────
+ * Lets a headless caller (e.g. the FBX skinned-import unit test) assert that a
+ * decoded-but-not-uploaded JceModelCpu carries a skeleton, skinned vertices, and
+ * animation clips WITHOUT a GPU context (the upload step is what needs bgfx). */
+
+const JceSkeleton *jce_gltf_cpu_skeleton(const JceModelCpu *cpu)
+{
+    return cpu ? cpu->skeleton : NULL;
+}
+
+uint32_t jce_gltf_cpu_anim_count(const JceModelCpu *cpu)
+{
+    return cpu ? cpu->num_anims : 0;
+}
+
+const JceAnimClip *jce_gltf_cpu_anim_clip(const JceModelCpu *cpu, uint32_t index)
+{
+    if (!cpu || index >= cpu->num_anims || !cpu->anim_clips) return NULL;
+    return cpu->anim_clips[index];
+}
+
+/* Is (node, prim) a skinned primitive?  (kind == 1) */
+bool jce_gltf_cpu_prim_is_skinned(const JceModelCpu *cpu,
+                                  uint32_t node, uint32_t prim)
+{
+    if (!cpu || node >= cpu->num_nodes || !cpu->nodes) return false;
+    const JceModelNodeCpu *nd = &cpu->nodes[node];
+    if (prim >= nd->num_prims || !nd->prims) return false;
+    return nd->prims[prim].kind == 1;
+}
+
+uint32_t jce_gltf_cpu_prim_vertex_count(const JceModelCpu *cpu,
+                                        uint32_t node, uint32_t prim)
+{
+    if (!cpu || node >= cpu->num_nodes || !cpu->nodes) return 0;
+    const JceModelNodeCpu *nd = &cpu->nodes[node];
+    if (prim >= nd->num_prims || !nd->prims) return 0;
+    return nd->prims[prim].num_verts;
+}
+
+/* Read the bone weights of skinned vertex `vtx` of (node, prim) into out_w[4].
+ * Returns false if the prim is not skinned or indices are out of range. */
+bool jce_gltf_cpu_prim_skinned_weights(const JceModelCpu *cpu,
+                                       uint32_t node, uint32_t prim,
+                                       uint32_t vtx, float out_w[4])
+{
+    if (!cpu || node >= cpu->num_nodes || !cpu->nodes) return false;
+    const JceModelNodeCpu *nd = &cpu->nodes[node];
+    if (prim >= nd->num_prims || !nd->prims) return false;
+    const JceModelPrimCpu *p = &nd->prims[prim];
+    if (p->kind != 1 || !p->verts || vtx >= p->num_verts) return false;
+    const JceSkinnedVertex *v = &((const JceSkinnedVertex *)p->verts)[vtx];
+    out_w[0] = v->weights[0]; out_w[1] = v->weights[1];
+    out_w[2] = v->weights[2]; out_w[3] = v->weights[3];
+    return true;
+}
+
+/* ================================================================== */
+/* Generic CPU-model builder (format-agnostic skinned import)          */
+/* ------------------------------------------------------------------ */
+/* The struct JceModelCpu intermediate + its GPU upload (jce_gltf_upload_cpu)
+ * live HERE in the renderer layer.  Importers in OTHER layers (e.g. the assimp
+ * FBX path in jce_resource) cannot allocate/populate the opaque JceModelCpu
+ * directly, so this small builder lets them hand over already-extracted CPU
+ * geometry / skeleton / clips.  Everything below is bgfx-free (it only allocates
+ * CPU arrays and calls the animation layer's CPU-only skeleton/clip creators),
+ * so a caller — or a headless unit test — can build a JceModelCpu without a GPU
+ * context and assert on it via the jce_gltf_cpu_* accessors, then upload later
+ * with jce_gltf_upload_cpu() on the render thread (which is where the bgfx mesh
+ * creation happens).  Ownership of skeleton/clips passed to the setters moves
+ * into the builder; vertex/index arrays are COPIED. */
+
+JceModelCpu *jce_model_cpu_builder_create(void)
+{
+    return (JceModelCpu *)JCE_CALLOC(1, sizeof(JceModelCpu));
+}
+
+/* Reserve `num_nodes` mesh-bearing nodes.  Each node holds one primitive.
+ * Returns false on OOM or if nodes were already reserved. */
+bool jce_model_cpu_builder_reserve_nodes(JceModelCpu *cpu, uint32_t num_nodes)
+{
+    if (!cpu || cpu->nodes) return false;
+    if (num_nodes == 0) return true;
+    cpu->nodes = (JceModelNodeCpu *)JCE_CALLOC(num_nodes, sizeof(JceModelNodeCpu));
+    if (!cpu->nodes) return false;
+    cpu->num_nodes = num_nodes;
+    return true;
+}
+
+/* Populate node `node_index` with ONE skinned primitive built from a COPY of
+ * the supplied JceSkinnedVertex array + index array.  `name` may be NULL.
+ * `local_transform` is the node's model-space transform (column-major).  The
+ * skinned bone palette is addressed through the model's skeleton, so the
+ * vertices' joints[] must already be skeleton joint indices. */
+bool jce_model_cpu_builder_set_skinned_node(JceModelCpu *cpu, uint32_t node_index,
+                                            const char *name,
+                                            const jce_mat4 *local_transform,
+                                            const JceSkinnedVertex *verts,
+                                            uint32_t num_verts,
+                                            const uint32_t *indices,
+                                            uint32_t num_indices,
+                                            uint32_t material_index)
+{
+    if (!cpu || node_index >= cpu->num_nodes || !cpu->nodes) return false;
+    if (!verts || num_verts == 0) return false;
+
+    JceModelNodeCpu *node = &cpu->nodes[node_index];
+
+    if (name && name[0]) {
+        size_t len = strlen(name);
+        if (len >= sizeof(node->name)) len = sizeof(node->name) - 1;
+        memcpy(node->name, name, len);
+        node->name[len] = '\0';
+    } else {
+        SDL_snprintf(node->name, sizeof(node->name), "node_%u", node_index);
+    }
+    node->local_transform    = local_transform ? *local_transform : jce_m4_identity();
+    node->parent             = -1;
+    node->joint_parent_index = -1;
+    node->joint_local_matrix = jce_m4_identity();
+
+    node->prims = (JceModelPrimCpu *)JCE_CALLOC(1, sizeof(JceModelPrimCpu));
+    if (!node->prims) return false;
+    node->num_prims = 1;
+
+    JceModelPrimCpu *p = &node->prims[0];
+    p->kind           = 1;   /* skinned */
+    p->material_index = material_index;
+
+    JceSkinnedVertex *vcopy =
+        (JceSkinnedVertex *)JCE_MALLOC((size_t)num_verts * sizeof(JceSkinnedVertex));
+    if (!vcopy) return false;
+    memcpy(vcopy, verts, (size_t)num_verts * sizeof(JceSkinnedVertex));
+    p->verts     = vcopy;
+    p->num_verts = num_verts;
+
+    if (indices && num_indices > 0) {
+        uint32_t *icopy =
+            (uint32_t *)JCE_MALLOC((size_t)num_indices * sizeof(uint32_t));
+        if (!icopy) { JCE_FREE(vcopy); p->verts = NULL; return false; }
+        memcpy(icopy, indices, (size_t)num_indices * sizeof(uint32_t));
+        p->indices     = icopy;
+        p->num_indices = num_indices;
+    }
+    return true;
+}
+
+/* Populate node `node_index` with ONE static-PBR primitive (tangents, no
+ * skinning) from a COPY of the supplied JcePbrVertex array. */
+bool jce_model_cpu_builder_set_static_node(JceModelCpu *cpu, uint32_t node_index,
+                                           const char *name,
+                                           const jce_mat4 *local_transform,
+                                           const JcePbrVertex *verts,
+                                           uint32_t num_verts,
+                                           const uint32_t *indices,
+                                           uint32_t num_indices,
+                                           uint32_t material_index)
+{
+    if (!cpu || node_index >= cpu->num_nodes || !cpu->nodes) return false;
+    if (!verts || num_verts == 0) return false;
+
+    JceModelNodeCpu *node = &cpu->nodes[node_index];
+
+    if (name && name[0]) {
+        size_t len = strlen(name);
+        if (len >= sizeof(node->name)) len = sizeof(node->name) - 1;
+        memcpy(node->name, name, len);
+        node->name[len] = '\0';
+    } else {
+        SDL_snprintf(node->name, sizeof(node->name), "node_%u", node_index);
+    }
+    node->local_transform    = local_transform ? *local_transform : jce_m4_identity();
+    node->parent             = -1;
+    node->joint_parent_index = -1;
+    node->joint_local_matrix = jce_m4_identity();
+
+    node->prims = (JceModelPrimCpu *)JCE_CALLOC(1, sizeof(JceModelPrimCpu));
+    if (!node->prims) return false;
+    node->num_prims = 1;
+
+    JceModelPrimCpu *p = &node->prims[0];
+    p->kind           = 0;   /* static PBR */
+    p->material_index = material_index;
+
+    JcePbrVertex *vcopy =
+        (JcePbrVertex *)JCE_MALLOC((size_t)num_verts * sizeof(JcePbrVertex));
+    if (!vcopy) return false;
+    memcpy(vcopy, verts, (size_t)num_verts * sizeof(JcePbrVertex));
+    p->verts     = vcopy;
+    p->num_verts = num_verts;
+
+    if (indices && num_indices > 0) {
+        uint32_t *icopy =
+            (uint32_t *)JCE_MALLOC((size_t)num_indices * sizeof(uint32_t));
+        if (!icopy) { JCE_FREE(vcopy); p->verts = NULL; return false; }
+        memcpy(icopy, indices, (size_t)num_indices * sizeof(uint32_t));
+        p->indices     = icopy;
+        p->num_indices = num_indices;
+    }
+    return true;
+}
+
+/* Move ownership of an already-built skeleton into the model (replaces any
+ * existing one, which is destroyed). */
+void jce_model_cpu_builder_set_skeleton(JceModelCpu *cpu, JceSkeleton *skel)
+{
+    if (!cpu) return;
+    if (cpu->skeleton && cpu->skeleton != skel)
+        jce_skeleton_destroy(cpu->skeleton);
+    cpu->skeleton = skel;
+}
+
+/* Move ownership of an animation-clip array (clips[] and each clip) into the
+ * model.  `clips` must be a JCE_MALLOC'd array of `count` owned JceAnimClip*. */
+void jce_model_cpu_builder_set_anims(JceModelCpu *cpu,
+                                     JceAnimClip **clips, uint32_t count)
+{
+    if (!cpu) return;
+    if (cpu->anim_clips) {
+        for (uint32_t i = 0; i < cpu->num_anims; ++i)
+            jce_anim_clip_destroy(cpu->anim_clips[i]);
+        JCE_FREE(cpu->anim_clips);
+    }
+    cpu->anim_clips = clips;
+    cpu->num_anims  = clips ? count : 0;
+}
+
+/* Install a single default material (factors only, no textures) so the upload
+ * path always has at least one material to index.  Importers that extract real
+ * materials can build cpu->materials themselves; this is the minimal default. */
+bool jce_model_cpu_builder_set_default_material(JceModelCpu *cpu)
+{
+    if (!cpu || cpu->materials) return false;
+    cpu->materials = (JceModelMatCpu *)JCE_CALLOC(1, sizeof(JceModelMatCpu));
+    if (!cpu->materials) return false;
+    cpu->materials[0].base = jce_pbr_material_default();
+    cpu->num_materials = 1;
+    return true;
 }
 
 /* ================================================================== */

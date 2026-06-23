@@ -7,6 +7,7 @@
 #include "ui/jce_editor_panels.h"
 
 #include <jce/os/core/jce_path.h>
+#include <jce/os/core/jce_filesystem.h>
 
 #include <cstdio>
 #include <cstring>
@@ -71,6 +72,44 @@ const char *jce_editor_path_relative_or(char *buf, size_t buf_size,
     if (!src) return "";
     jce_editor_path_to_relative(buf, buf_size, src);
     return buf[0] ? buf : src;
+}
+
+void jce_editor_path_store_asset_ref(char *out, size_t out_size,
+                                     const char *path)
+{
+    if (!out || out_size == 0) return;
+    out[0] = '\0';
+    if (!path || !path[0]) return;
+
+    /* CWD-relative inputs (e.g. the engine model importer reports its
+     * extracted embedded-texture files relative to the process CWD) are
+     * meaningless once stored in a scene — the editor may be launched
+     * from anywhere.  Anchor them to an absolute path first so the
+     * project-relative conversion below has a real base.  Inputs that
+     * are already project-relative do NOT resolve against the CWD and
+     * pass through untouched. */
+    char anchored_buf[1024];
+    const char *anchored = path;
+    if (!jce_path_is_absolute(path)) {
+        char cwd[512];
+        if (jce_fs_host_get_current_dir(cwd, sizeof(cwd))) {
+            char joined[1024];
+            snprintf(joined, sizeof(joined), "%s/%s", cwd, path);
+            char norm[1024];
+            const char *cand = joined;
+            if (jce_path_normalize(norm, sizeof(norm), joined))
+                cand = norm;
+            if (jce_fs_host_exists_file(cand)) {
+                snprintf(anchored_buf, sizeof(anchored_buf), "%s", cand);
+                anchored = anchored_buf;
+            }
+        }
+    }
+
+    jce_editor_path_to_relative(out, out_size, anchored);
+    if (!out[0])
+        snprintf(out, out_size, "%s", anchored);
+    for (char *p = out; *p; ++p) if (*p == '\\') *p = '/';
 }
 
 const char *jce_editor_path_basename_view(const char *path)

@@ -9,6 +9,7 @@
  */
 
 #include "core/jce_editor_state_internal.h"
+#include "io/jce_editor_prefab_override.h"
 
 #include <cstring>
 
@@ -79,6 +80,46 @@ uint32_t load_entity_tree_node(const JceJson *node, uint32_t parent_id)
         (int)(sizeof(name_keys) / sizeof(name_keys[0])));
     if (!name || name[0] == '\0')
         name = "Entity";
+
+    /* ── Prefab override path (Risk-1 backward-compat gate) ───────────
+     *
+     * Take the NEW instantiate-source-then-overlay path ONLY when the
+     * node is a prefab instance whose source loads AND it carries the
+     * additive "overrides" array.  Any node WITHOUT "overrides" — every
+     * legacy scene/prefab on disk today — falls through to the unchanged
+     * full-snapshot loader below, so old files load byte-identically. */
+    static const char *const prefab_path_keys[] = { "prefabPath" };
+    const char *prefab_path = json_get_string_any(node, prefab_path_keys, 1);
+    bool is_instance = jce_json_get_bool(node, "prefabInstance", false);
+    if (is_instance && prefab_path && prefab_path[0] &&
+        jce_prefab_override::node_has_overrides(node)) {
+        uint32_t id = jce_state_instantiate_prefab(prefab_path, parent_id);
+        if (id != 0) {
+            /* Overlay ONLY the overridden components onto the instantiated
+             * source (node["components"] holds exactly those — see
+             * write_override_node), then re-apply instance-level fields the
+             * node owns (name, enabled, tag, disabledComponents) on top of
+             * the source defaults.  apply_entity_fields re-parses the same
+             * (overridden) components array via the engine, which is the
+             * actual overlay; overlay_components keeps the intent explicit
+             * and is exercised directly by the unit test. */
+            JceEntity e = jce_state_to_ecs_entity(id);
+            jce_prefab_override::overlay_components(s.scene, e, node);
+            jce_state_rename_entity(id, name);
+            apply_entity_fields(id, node);
+
+            /* The full subtree (children) was already created by
+             * instantiate_prefab from the source.  The override MVP tracks
+             * ROOT-level component overrides only, so the node's own
+             * "children" array is NOT re-loaded here — doing so would
+             * DUPLICATE the source's children.  Per-child overrides are a
+             * documented follow-up (each child node would carry its own
+             * "overrides" once child diffing exists). */
+            return id;
+        }
+        /* Instantiation failed — fall through to the legacy full path so
+         * the entity still loads (degraded but not lost). */
+    }
 
     uint32_t id = jce_state_create_entity(name, parent_id);
     apply_entity_fields(id, node);

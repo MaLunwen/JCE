@@ -246,7 +246,7 @@ void fv_render_render_pipeline(FvTab *tab)
     ImGui::NextColumn();
     ImGui::SetNextItemWidth(-1);
     {
-        static const char *items[] = {"Low", "Mid", "High", "Ultra"};
+        const char *items[] = {jce_editor_i18n("viewer.rp.preset.low"), jce_editor_i18n("viewer.rp.preset.mid"), jce_editor_i18n("viewer.rp.preset.high"), jce_editor_i18n("viewer.rp.preset.ultra")};
         int idx = (int)d.post_quality;
         if (ImGui::Combo("##pq", &idx, items, 4)) {
             d.post_quality = (JceRpQuality)idx;

@@ -105,6 +105,7 @@ bool load_snapshot(const char *path)
     jce_save_register_scene_provider(reg, scene);
 
     bool ok = jce_snapshot_load_from_file(reg, path);
+    jce_save_unregister_scene_provider(reg);   /* free provider context */
     jce_snapshot_registry_destroy(reg);
 
     if (ok) {
@@ -163,12 +164,12 @@ extern "C" void jce_editor_panel_save_browser_content(void)
     if (ImGui::BeginTable("##save_tbl", 6,
             ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
             ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
-        ImGui::TableSetupColumn("File",     ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Size",     ImGuiTableColumnFlags_WidthFixed, 80);
-        ImGui::TableSetupColumn("Format",   ImGuiTableColumnFlags_WidthFixed, 70);
-        ImGui::TableSetupColumn("Sections", ImGuiTableColumnFlags_WidthFixed, 80);
-        ImGui::TableSetupColumn("Status",   ImGuiTableColumnFlags_WidthFixed, 80);
-        ImGui::TableSetupColumn("Action",   ImGuiTableColumnFlags_WidthFixed, 70);
+        ImGui::TableSetupColumn(jce_editor_i18n("saveBrowser.col.file"),     ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn(jce_editor_i18n("saveBrowser.col.size"),     ImGuiTableColumnFlags_WidthFixed, 80);
+        ImGui::TableSetupColumn(jce_editor_i18n("saveBrowser.col.format"),   ImGuiTableColumnFlags_WidthFixed, 70);
+        ImGui::TableSetupColumn(jce_editor_i18n("saveBrowser.col.sections"), ImGuiTableColumnFlags_WidthFixed, 80);
+        ImGui::TableSetupColumn(jce_editor_i18n("saveBrowser.col.status"),   ImGuiTableColumnFlags_WidthFixed, 80);
+        ImGui::TableSetupColumn(jce_editor_i18n("saveBrowser.col.action"),   ImGuiTableColumnFlags_WidthFixed, 70);
         ImGui::TableHeadersRow();
 
         char sb[32];

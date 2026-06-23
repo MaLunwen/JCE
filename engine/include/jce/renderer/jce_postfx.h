@@ -18,6 +18,7 @@
 
 #include <jce/os/core/jce_allocator.h>
 #include <jce/os/core/jce_defs.h>
+#include <jce/os/core/jce_math.h>
 #include <jce/renderer/jce_gfx_types.h>
 
 #include <stdbool.h>
@@ -145,6 +146,62 @@ JCE_API void jce_postfx_get_custom_shader(const JcePostFXPipeline *pipeline,
                                           bool *out_needs_depth);
 JCE_API int  jce_postfx_get_custom_params(const JcePostFXPipeline *pipeline,
                                           float *out_vec4s, int max_count);
+
+/* ================================================================== */
+/* Temporal Anti-Aliasing (TAA)                                        */
+/* ================================================================== */
+/*
+ * TAA runs as the FIRST link of the chain (before tonemap/bloom/etc.):
+ * it resolves the current jittered scene colour against a persistent
+ * history buffer using per-pixel camera-reprojection motion vectors, and
+ * the resolved colour becomes the input to the remaining chain.
+ *
+ * Opt-in: nothing runs unless jce_postfx_set_taa(..., enabled=true) was
+ * called AND both the fs_taa / fs_motion_vec programs loaded AND a valid
+ * scene depth is passed to jce_postfx_apply().  When disabled the history
+ * and motion framebuffers are never allocated, so the rest of the chain is
+ * byte-identical to a build without TAA.
+ *
+ * The renderer must, every frame TAA is on:
+ *   1) jitter the MAIN colour pass's projection (jce_taa_apply_jitter),
+ *   2) push the UN-jittered scene inverse-view-proj + previous-frame
+ *      view*proj via jce_postfx_set_taa_matrices(), and
+ *   3) jce_postfx_set_taa(enabled=true, ...) before jce_postfx_apply().
+ * Motion vectors are jitter-free (they use the un-jittered matrices), so
+ * the jitter only sub-pixel-shifts the sampled image, not the reproject.
+ */
+
+/* Enable/disable TAA and set its resolve parameters.
+ *   feedback     : history blend weight (0.85-0.97 typical; higher = more
+ *                  temporal accumulation / softer, lower = sharper/noisier).
+ *   luma_clamp   : variance-box softening scale (1.0 default; 0 = hard box).
+ *   motion_clamp : how aggressively to drop feedback in high-motion regions
+ *                  (1.0 default). */
+JCE_API void jce_postfx_set_taa(JcePostFXPipeline *pipeline, bool enabled,
+                                float feedback, float luma_clamp,
+                                float motion_clamp);
+
+/* Supply the camera matrices the motion-vector pass needs, for the frame
+ * about to be resolved:
+ *   scene_inv_view_proj : inverse of the UN-jittered scene view*proj used
+ *                         for the main colour pass this frame.
+ *   prev_view_proj      : the previous frame's UN-jittered view*proj
+ *                         (pass the SAME as scene_inv_view_proj's source on
+ *                         the first frame; the on-screen test in fs_taa then
+ *                         rejects the empty history and outputs ~current). */
+JCE_API void jce_postfx_set_taa_matrices(JcePostFXPipeline *pipeline,
+                                         const jce_mat4 *scene_inv_view_proj,
+                                         const jce_mat4 *prev_view_proj);
+
+/* Supply a STANDARD per-object motion-vector texture for the frame about to be
+ * resolved (the scene renderer's velocity G-buffer, encoded identically to
+ * fs_motion_vec.sc).  When set to a valid handle, the TAA pass SKIPS its
+ * internal camera-only motion-vec pass and reprojects history with THIS texture
+ * instead — so moving / animated / skinned geometry stops ghosting.  One-shot:
+ * cleared at the end of every jce_postfx_apply().  Pass JCE_TEXTURE_INVALID (or
+ * never call it) to fall back to the camera-only reprojection. */
+JCE_API void jce_postfx_set_taa_motion_tex(JcePostFXPipeline *pipeline,
+                                           JceTextureHandle tex);
 
 /* ================================================================== */
 /* Rendering                                                           */

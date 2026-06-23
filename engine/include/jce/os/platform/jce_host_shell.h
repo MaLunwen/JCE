@@ -33,6 +33,13 @@ JCE_API bool jce_host_reveal_path(const char *path);
    Returns true if either path succeeded. */
 JCE_API bool jce_host_open_in_text_editor(const char *path);
 
+/* Launch a user-configured external editor on `path`, detached
+   (`<editor> <path>`).  `editor` is an absolute path to the editor
+   executable (a per-user preference — see JceEditorConfig external_*).
+   Returns false if `editor` or `path` is empty, or the spawn failed, so
+   callers can fall back (e.g. jce_host_open_in_text_editor / reveal). */
+JCE_API bool jce_host_open_in_editor(const char *editor, const char *path);
+
 /* Open a host OS terminal/console with `cwd` as the working directory.
    On Windows this launches the user's default terminal (Windows Terminal
    if installed, otherwise cmd.exe).  On macOS it launches Terminal.app.

@@ -505,6 +505,13 @@ void jce_net_replication_set_world(void *ecs_world)
 
 void jce_net_replication_attach_host(JceNetHost *host) { g_repl.host = host; }
 
+/* L4-internal — expose the bound flecs world to the NetworkVariable layer
+ * (jce_network_variable.c) so it can create / read / write its backing
+ * components on the same world the substrate replicates over.  Declared in
+ * jce_replication_internal.h (NOT a public header). */
+void *jce__net_replication_world(void);
+void *jce__net_replication_world(void) { return g_repl.world; }
+
 /* ================================================================== */
 /* Public — NetworkObject                                              */
 /* ================================================================== */
@@ -825,6 +832,31 @@ static void encode_snapshot_for(WBuf *w, JceNetTick tick, bool full,
     }
 }
 
+/* Encode a snapshot into a caller-owned buffer using the SAME encoder the
+ * broadcast path runs (encode_snapshot_for) — no host required.  This is
+ * the transport-free seam: it lets headless tools and tests drive the REAL
+ * delta/baseline/full-burst encoder and hand the exact bytes to
+ * jce_net_replication_handle_packet().  Returns the byte count (0 on
+ * failure); on success *out_buf is a heap buffer the caller frees with
+ * jce_net_replication_free_buffer().  `full` forces a full-state burst
+ * (every object/component, baseline ignored); otherwise it is a delta vs
+ * the live baseline (and advances the baseline exactly like a broadcast). */
+uint32_t jce_net_replication_encode_snapshot(JceNetTick tick, bool full,
+                                             void **out_buf)
+{
+    WBuf w = { NULL, 0, 0, true };
+    if (!g_repl.inited || !out_buf) return 0u;
+    encode_snapshot_for(&w, tick, full, /*interest=*/NULL);
+    if (!w.ok || w.size == 0u) { JCE_FREE(w.buf); *out_buf = NULL; return 0u; }
+    *out_buf = w.buf;
+    return w.size;
+}
+
+void jce_net_replication_free_buffer(void *buf)
+{
+    JCE_FREE(buf);
+}
+
 /* Refresh the peer table from the session roster: add freshly-connected
  * peers (flagged needs_full_burst) and drop ones that left. */
 struct PeerSweep { bool seen[JCE_REPL_PEER_CAP]; };
@@ -851,6 +883,10 @@ static void refresh_peers_from_session(void)
             memset(&g_repl.peers[i], 0, sizeof(g_repl.peers[i]));
 }
 
+/* Low-rate full-resync cadence (ticks).  ~1 s at 60 Hz — bounds how long a
+ * client can stay stale after a dropped UNRELIABLE delta (audit F57). */
+#define JCE_NET_KEYFRAME_TICKS 64u
+
 static void encode_and_broadcast(JceNetTick tick)
 {
     if (!g_repl.host) return;
@@ -859,6 +895,16 @@ static void encode_and_broadcast(JceNetTick tick)
      * a one-shot reliable full burst before they join the delta stream;
      * this is the late-joiner spawn sync. */
     refresh_peers_from_session();
+
+    /* Periodic keyframe self-heal: the steady-state delta stream is UNRELIABLE
+     * and advances the baseline on send, so one dropped datagram leaves a
+     * client stale on that component until it next changes.  Every
+     * JCE_NET_KEYFRAME_TICKS, re-arm a full RELIABLE burst for every peer so a
+     * missed delta is recovered within a bounded window (audit F57). */
+    if (tick != 0u && (tick % JCE_NET_KEYFRAME_TICKS) == 0u) {
+        for (uint32_t i = 0; i < JCE_REPL_PEER_CAP; ++i)
+            if (g_repl.peers[i].used) g_repl.peers[i].needs_full_burst = true;
+    }
 
     for (uint32_t i = 0; i < JCE_REPL_PEER_CAP; ++i) {
         PeerState *p = &g_repl.peers[i];

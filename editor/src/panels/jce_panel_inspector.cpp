@@ -2,199 +2,87 @@
  * jce_panel_inspector.cpp  Inspector panel (entity properties) — dispatcher.
  *
  * All draw_comp_* functions have been moved to domain TUs:
- *   inspector_transform.cpp  inspector_lighting.cpp  inspector_render.cpp
- *   inspector_physics.cpp    inspector_physics2d.cpp inspector_animation.cpp
- *   inspector_audio.cpp      inspector_gameplay.cpp  inspector_ui.cpp
+ *   jce_panel_inspector_transform.cpp  jce_panel_inspector_lighting.cpp  jce_panel_inspector_render.cpp
+ *   jce_panel_inspector_physics.cpp    jce_panel_inspector_physics2d.cpp jce_panel_inspector_animation.cpp
+ *   jce_panel_inspector_audio.cpp      jce_panel_inspector_gameplay.cpp  jce_panel_inspector_ui.cpp
  * Shared state and small helpers live in jce_panel_inspector_common.cpp.
  */
 
 #include "jce_panel_inspector_common.h"
 #include "ui/jce_editor_modals.h"
 
+/* Raw component blob — one engine registry call: comp_id → the row's
+ * type-erased get accessor and struct_size. */
 static void *comp_get_ptr_and_size(JceScene *scene, JceEntity e,
-                                   uint64_t flag, size_t *out_size);
-
-void *jce_inspector_comp_blob(JceScene *scene, JceEntity e,
-                              uint64_t flag, size_t *out_size)
+                                   int comp_id, size_t *out_size)
 {
-    return comp_get_ptr_and_size(scene, e, flag, out_size);
+    *out_size = 0;
+    if (!scene || comp_id == JCE_COMP_ID_INVALID) return NULL;
+    uint32_t sz = 0;
+    void *p = jce_scene_get_comp(scene, e, comp_id, &sz);
+    *out_size = sz;
+    return p;
 }
 
-static void *comp_get_ptr_and_size(JceScene *scene, JceEntity e,
-                                   uint64_t flag, size_t *out_size)
+/* Dense id of the essential Transform row (resolved once; ids are stable
+ * for the process lifetime once the engine registry is populated). */
+static int insp_transform_comp_id(void)
 {
-    if (!scene) return NULL;
-    if (jce_editor_component_slot_is_compound_collider(flag)) {
-        *out_size = sizeof(JceCompoundColliderComponent);
-        return jce_scene_get_compound_collider(scene, e);
-    }
-    if (jce_editor_component_slot_is_video_player(flag)) {
-        *out_size = sizeof(JceVideoPlayerComponent);
-        return jce_scene_get_video_player(scene, e);
-    }
-    if (jce_editor_component_slot_is_nav_agent(flag)) {
-        *out_size = sizeof(JceNavAgentComponent);
-        return jce_scene_get_nav_agent(scene, e);
-    }
-    if (jce_editor_component_slot_is_ik_constraints(flag)) {
-        *out_size = sizeof(JceIkConstraintComponent);
-        return jce_scene_get_ik_constraints(scene, e);
-    }
-    if (jce_editor_component_slot_is_sequence_player(flag)) {
-        *out_size = sizeof(JceSequencePlayerComponent);
-        return jce_scene_get_sequence_player(scene, e);
-    }
-
-    switch (flag) {
-    case JCE_COMP_FLAG_TRANSFORM:
-        *out_size = sizeof(JceTransform);
-        return jce_scene_get_transform(scene, e);
-    case JCE_COMP_FLAG_MESH_RENDERER:
-        *out_size = sizeof(JceMeshRenderer);
-        return jce_scene_get_mesh_renderer(scene, e);
-    case JCE_COMP_FLAG_CAMERA:
-        *out_size = sizeof(JceCameraComponent);
-        return jce_scene_get_camera(scene, e);
-    case JCE_COMP_FLAG_RIGIDBODY:
-        *out_size = sizeof(JceRigidBodyComponent);
-        return jce_scene_get_rigidbody(scene, e);
-    case JCE_COMP_FLAG_BOX_COLLIDER:
-        *out_size = sizeof(JceBoxColliderComponent);
-        return jce_scene_get_box_collider(scene, e);
-    case JCE_COMP_FLAG_SPHERE_COLLIDER:
-        *out_size = sizeof(JceSphereColliderComponent);
-        return jce_scene_get_sphere_collider(scene, e);
-    case JCE_COMP_FLAG_AUDIO_SOURCE:
-        *out_size = sizeof(JceAudioSourceComponent);
-        return jce_scene_get_audio_source(scene, e);
-    case JCE_COMP_FLAG_RIGIDBODY_2D:
-        *out_size = sizeof(JceRigidBody2DComponent);
-        return jce_scene_get_rigidbody2d(scene, e);
-    case JCE_COMP_FLAG_PARTICLE_EMITTER:
-        *out_size = sizeof(JceParticleEmitterComponent);
-        return jce_scene_get_particle_emitter(scene, e);
-    case JCE_COMP_FLAG_BEHAVIOR_TREE:
-        *out_size = sizeof(JceBehaviorTree);
-        return jce_scene_get_behavior_tree(scene, e);
-    case JCE_COMP_FLAG_LOD_GROUP:
-        *out_size = sizeof(JceLodGroupComponent);
-        return jce_scene_get_lod_group(scene, e);
-    case JCE_COMP_FLAG_VIRTUAL_CAMERA:
-        *out_size = sizeof(JceVirtualCameraComponent);
-        return jce_scene_get_virtual_camera(scene, e);
-    case JCE_COMP_FLAG_TRIGGER_VOLUME:
-        *out_size = sizeof(JceTriggerVolumeComponent);
-        return jce_scene_get_trigger_volume(scene, e);
-    case JCE_COMP_FLAG_CAPSULE_COLLIDER:
-        *out_size = sizeof(JceCapsuleColliderComponent);
-        return jce_scene_get_capsule_collider(scene, e);
-    case JCE_COMP_FLAG_MESH_COLLIDER:
-        *out_size = sizeof(JceMeshColliderComponent);
-        return jce_scene_get_mesh_collider(scene, e);
-    case JCE_COMP_FLAG_COLLIDER_2D:
-        *out_size = sizeof(JceCollider2DComponent);
-        return jce_scene_get_collider2d(scene, e);
-    case JCE_COMP_FLAG_TRAIL_RENDERER:
-        *out_size = sizeof(JceTrailRendererComponent);
-        return jce_scene_get_trail_renderer(scene, e);
-    case JCE_COMP_FLAG_LINE_RENDERER:
-        *out_size = sizeof(JceLineRendererComponent);
-        return jce_scene_get_line_renderer(scene, e);
-    case JCE_COMP_FLAG_REFLECTION_PROBE:
-        *out_size = sizeof(JceReflectionProbeComponent);
-        return jce_scene_get_reflection_probe(scene, e);
-    case JCE_COMP_FLAG_DECAL:
-        *out_size = sizeof(JceDecalComponent);
-        return jce_scene_get_decal(scene, e);
-    case JCE_COMP_FLAG_LIGHT_PROBE_GROUP:
-        *out_size = sizeof(JceLightProbeGroupComponent);
-        return jce_scene_get_light_probe_group(scene, e);
-    case JCE_COMP_FLAG_AUDIO_LISTENER:
-        *out_size = sizeof(JceAudioListenerComponent);
-        return jce_scene_get_audio_listener(scene, e);
-    case JCE_COMP_FLAG_AUDIO_REVERB_ZONE:
-        *out_size = sizeof(JceAudioReverbZoneComponent);
-        return jce_scene_get_audio_reverb_zone(scene, e);
-    case JCE_COMP_FLAG_AUDIO_OCCLUSION:
-        *out_size = sizeof(JceAudioOcclusionComponent);
-        return jce_scene_get_audio_occlusion(scene, e);
-    case JCE_COMP_FLAG_SPAWN_MANAGER:
-        *out_size = sizeof(JceSpawnManagerComponent);
-        return jce_scene_get_spawn_manager(scene, e);
-    case JCE_COMP_FLAG_WEAPON:
-        *out_size = sizeof(JceWeaponComponent);
-        return jce_scene_get_weapon(scene, e);
-    case JCE_COMP_FLAG_SAVE_POINT:
-        *out_size = sizeof(JceSavePointComponent);
-        return jce_scene_get_save_point(scene, e);
-    case JCE_COMP_FLAG_WHEEL_COLLIDER:
-        *out_size = sizeof(JceWheelColliderComponent);
-        return jce_scene_get_wheel_collider(scene, e);
-    case JCE_COMP_FLAG_CONSTANT_FORCE:
-        *out_size = sizeof(JceConstantForceComponent);
-        return jce_scene_get_constant_force(scene, e);
-    case JCE_COMP_FLAG_CONFIGURABLE_JOINT:
-        *out_size = sizeof(JceConfigurableJointComponent);
-        return jce_scene_get_configurable_joint(scene, e);
-    case JCE_COMP_FLAG_JOINT_2D:
-        *out_size = sizeof(JceJoint2DComponent);
-        return jce_scene_get_joint2d(scene, e);
-    case JCE_COMP_FLAG_BILLBOARD_RENDERER:
-        *out_size = sizeof(JceBillboardRendererComponent);
-        return jce_scene_get_billboard_renderer(scene, e);
-    case JCE_COMP_FLAG_CANVAS:
-        *out_size = sizeof(JceCanvasComponent);
-        return jce_scene_get_canvas(scene, e);
-    case JCE_COMP_FLAG_CANVAS_GROUP:
-        *out_size = sizeof(JceCanvasGroupComponent);
-        return jce_scene_get_canvas_group(scene, e);
-    case JCE_COMP_FLAG_LAYOUT_GROUP:
-        *out_size = sizeof(JceLayoutGroupComponent);
-        return jce_scene_get_layout_group(scene, e);
-    case JCE_COMP_FLAG_UI_IMAGE:
-        *out_size = sizeof(JceUIImageComponent);
-        return jce_scene_get_ui_image(scene, e);
-    case JCE_COMP_FLAG_UI_TEXT:
-        *out_size = sizeof(JceUITextComponent);
-        return jce_scene_get_ui_text(scene, e);
-    case JCE_COMP_FLAG_UI_BUTTON:
-        *out_size = sizeof(JceUIButtonComponent);
-        return jce_scene_get_ui_button(scene, e);
-    case JCE_COMP_FLAG_CLOTH:
-        *out_size = sizeof(JceClothComponent);
-        return jce_scene_get_cloth(scene, e);
-    case JCE_COMP_FLAG_NETWORK_OBJECT:
-        *out_size = sizeof(JceNetworkObjectComponent);
-        return jce_scene_get_network_object(scene, e);
-    case JCE_COMP_FLAG_NET_TRANSFORM:
-        *out_size = sizeof(JceNetTransformComponent);
-        return jce_scene_get_net_transform(scene, e);
-    case JCE_COMP_FLAG_NET_ANIMATOR:
-        *out_size = sizeof(JceNetAnimatorComponent);
-        return jce_scene_get_net_animator(scene, e);
-    case JCE_COMP_FLAG_NET_RIGIDBODY:
-        *out_size = sizeof(JceNetRigidbodyComponent);
-        return jce_scene_get_net_rigidbody(scene, e);
-    case JCE_COMP_FLAG_TILEMAP:
-        *out_size = sizeof(JceTilemapComponent);
-        return jce_scene_get_tilemap(scene, e);
-    case JCE_COMP_FLAG_TILEMAP_COLLIDER_2D:
-        *out_size = sizeof(JceTilemapCollider2DComponent);
-        return jce_scene_get_tilemap_collider2d(scene, e);
-    case JCE_COMP_FLAG_AVATAR:
-        *out_size = sizeof(JceAvatarComponent);
-        return jce_scene_get_avatar(scene, e);
-    case JCE_COMP_FLAG_VOLUME:
-        *out_size = sizeof(JceVolumeComponent);
-        return jce_scene_get_volume(scene, e);
-    case JCE_COMP_FLAG_OCCLUSION_PORTAL:
-        *out_size = sizeof(JceOcclusionPortalComponent);
-        return jce_scene_get_occlusion_portal(scene, e);
-    default:
-        *out_size = 0;
-        return NULL;
-    }
+    static int cid = JCE_COMP_ID_INVALID;
+    if (cid == JCE_COMP_ID_INVALID)
+        cid = jce_component_find("Transform");
+    return cid;
 }
+
+/* ── Prefab override indicator cache (F12 visual) ──────────────────────
+ *
+ * is_overridden loads + parses the source .prefab.json, so we compute the
+ * whole override-name set ONCE per inspector frame for the focused entity
+ * (jce_state_get_prefab_overrides does a single source load) and answer
+ * per-component header queries from the cache.  Refreshed lazily when the
+ * focused entity changes or when invalidated after Apply/Revert. */
+namespace {
+struct PrefabOverrideCache {
+    uint32_t entity_id = 0;
+    bool     is_instance = false;
+    std::vector<std::string> names;   /* canonical overridden comp names */
+
+    void refresh(uint32_t eid) {
+        entity_id = eid;
+        names.clear();
+        is_instance = false;
+        if (!eid || !jce_state_is_prefab_instance(eid)) return;
+        is_instance = true;
+        char buf[JCE_COMP_MAX][64];
+        int n = jce_state_get_prefab_overrides(eid, buf, JCE_COMP_MAX);
+        for (int i = 0; i < n; i++)
+            names.emplace_back(buf[i]);
+    }
+    bool has(const char *comp_name) const {
+        if (!comp_name) return false;
+        for (const std::string &s : names)
+            if (s == comp_name) return true;
+        return false;
+    }
+    void invalidate() { entity_id = 0; }
+};
+PrefabOverrideCache s_override_cache;
+
+/* Map a section's dense comp_id to the canonical override name.  The light
+ * section is drawn with a CONCRETE light comp_id (DirectionalLight/...),
+ * but overrides are tracked under the unified "Light" — coalesce here so
+ * the badge + Apply/Revert use the name write_override_node emitted. */
+const char *override_query_name(int comp_id)
+{
+    const char *n = jce_component_name(comp_id);
+    if (jce_editor_component_id_is_light_group(comp_id)) return "Light";
+    if (n && (strcmp(n, "DirectionalLight") == 0 ||
+              strcmp(n, "PointLight") == 0 ||
+              strcmp(n, "SpotLight") == 0))
+        return "Light";
+    return n;
+}
+} /* namespace */
 
 /* ── Tag colors (display data) ────────────────────────────────────── */
 
@@ -282,41 +170,28 @@ bool jce_editor_inspector_delete_dialog_open(void)
 
 /* ── Component header / settings popup helper ─────────────────────── */
 
-static bool comp_slot_uses_expanded_bit(uint64_t slot)
-{
-    return slot != 0 && (slot & (slot - 1)) == 0;
-}
-
+/* Fold state: one bit per dense comp_id in sidecar.expanded[4] (256 bits,
+ * default all-expanded) — every registered component gets a bit, including
+ * the post-64 rows the old single-word flag mask could not represent. */
 static bool comp_section_is_open(const EditorEntitySidecar &sidecar,
-                                 uint64_t slot)
+                                 int comp_id)
 {
-    if (comp_slot_uses_expanded_bit(slot))
-        return (sidecar.expanded_flags & slot) != 0;
-    return std::find(sidecar.collapsed_component_slots.begin(),
-                     sidecar.collapsed_component_slots.end(),
-                     slot) == sidecar.collapsed_component_slots.end();
+    if (comp_id < 0 || comp_id >= JCE_COMP_MAX)
+        return true;
+    return (sidecar.expanded[comp_id >> 6] >> (comp_id & 63)) & 1u;
 }
 
 static void comp_section_set_open(EditorEntitySidecar &sidecar,
-                                  uint64_t slot,
+                                  int comp_id,
                                   bool open)
 {
-    if (comp_slot_uses_expanded_bit(slot)) {
-        if (open)
-            sidecar.expanded_flags |= slot;
-        else
-            sidecar.expanded_flags &= ~slot;
+    if (comp_id < 0 || comp_id >= JCE_COMP_MAX)
         return;
-    }
-
-    auto &collapsed = sidecar.collapsed_component_slots;
-    auto it = std::find(collapsed.begin(), collapsed.end(), slot);
-    if (open) {
-        if (it != collapsed.end())
-            collapsed.erase(it);
-    } else if (it == collapsed.end()) {
-        collapsed.push_back(slot);
-    }
+    uint64_t bit = UINT64_C(1) << (comp_id & 63);
+    if (open)
+        sidecar.expanded[comp_id >> 6] |= bit;
+    else
+        sidecar.expanded[comp_id >> 6] &= ~bit;
 }
 
 /* Returns true if the component's body should be drawn this frame.
@@ -328,13 +203,13 @@ static bool s_comp_section_dimmed = false;
 
 static bool comp_section_begin(uint32_t entity_id,
                                EditorEntitySidecar &sidecar,
-                               uint64_t flag,
+                               int comp_id,
                                const char *display_name,
                                bool removable)
 {
-    ImGui::PushID((int)(flag ^ (flag >> 32)));
+    ImGui::PushID(comp_id);
 
-    bool was_open = comp_section_is_open(sidecar, flag);
+    bool was_open = comp_section_is_open(sidecar, comp_id);
     int tn_flags = ImGuiTreeNodeFlags_AllowOverlap |
                    (was_open ? ImGuiTreeNodeFlags_DefaultOpen : 0);
 
@@ -347,14 +222,13 @@ static bool comp_section_begin(uint32_t entity_id,
      * disabled, dim the section so it clearly reads as inactive (grey). */
     JceScene *_es = jce_state_get_scene();
     JceEntity _ee = jce_state_to_ecs_entity(entity_id);
-    /* Only a single-bit JCE_COMP_FLAG_* can be toggled via the disabled bitmask.
-     * Skip Transform (essential) and editor-only synthetic slots (flag 0 or a
-     * multi-bit mask, e.g. video player / compound collider) so we never set the
-     * wrong bit. */
-    bool flag_toggleable = flag != 0 && flag != JCE_COMP_FLAG_TRANSFORM &&
-                           (flag & (flag - 1)) == 0;
-    bool comp_disabled = flag_toggleable &&
-                         !jce_scene_component_enabled(_es, _ee, flag);
+    /* id-keyed enable state works for EVERY registered component — the old
+     * 64-bit disabled mask could not toggle the post-64 (former synthetic)
+     * rows.  Transform stays essential / always on. */
+    bool comp_toggleable = comp_id != JCE_COMP_ID_INVALID &&
+                           comp_id != insp_transform_comp_id();
+    bool comp_disabled = comp_toggleable &&
+                         !jce_scene_comp_enabled(_es, _ee, comp_id);
 
     ImGui::PushStyleColor(ImGuiCol_Header, jce_theme::inspector_header_color());
     if (comp_disabled)
@@ -363,7 +237,47 @@ static bool comp_section_begin(uint32_t entity_id,
     bool open = ImGui::CollapsingHeader(display_name, tn_flags);
     if (comp_disabled)
         ImGui::PopStyleColor();
-    comp_section_set_open(sidecar, flag, open);
+    comp_section_set_open(sidecar, comp_id, open);
+
+    /* Prefab override indicator (F12 visual): a bold blue "*" badge after
+     * the header name when this component differs from its source prefab.
+     * The light-group header keys on the unified "Light" override name. */
+    bool comp_overridden = false;
+    if (s_override_cache.entity_id == entity_id && s_override_cache.is_instance)
+        comp_overridden = s_override_cache.has(override_query_name(comp_id));
+    if (comp_overridden) {
+        ImGui::SameLine(hdr_x + ImGui::GetTreeNodeToLabelSpacing()
+                        + ImGui::CalcTextSize(display_name).x + 4.0f);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.36f, 0.66f, 1.0f, 1.0f));
+        ImGui::TextUnformatted("*");
+        ImGui::PopStyleColor();
+        /* Tooltip: the base message PLUS the per-FIELD list of which
+         * serialized keys diverge (e.g. "posX, scaleY").  Queried lazily on
+         * hover only (it loads + diffs the source), so it costs nothing on
+         * the common non-hovered path.  An empty list (the unified "Light",
+         * whose rows can't be field-diffed) shows the base message alone —
+         * that override is whole-component by design.  Full per-field-widget
+         * revert is a documented follow-up; this surfaces the divergence. */
+        if (ImGui::IsItemHovered()) {
+            char fbuf[JCE_COMP_MAX][64];
+            int fn = jce_state_get_prefab_field_overrides(
+                entity_id, override_query_name(comp_id), fbuf, JCE_COMP_MAX);
+            if (fn > 0) {
+                std::string list;
+                for (int fi = 0; fi < fn; fi++) {
+                    if (fi) list += ", ";
+                    list += fbuf[fi];
+                }
+                ImGui::SetTooltip("%s\n%s: %s",
+                    jce_editor_i18n("inspector.prefabOverrideTip"),
+                    jce_editor_i18n("inspector.prefabOverrideFields"),
+                    list.c_str());
+            } else {
+                ImGui::SetTooltip("%s",
+                    jce_editor_i18n("inspector.prefabOverrideTip"));
+            }
+        }
+    }
 
     /* Drag-reorder: pressing & dragging a header begins a drag; while
      * active, hovering another header records it as the drop target. On
@@ -372,11 +286,11 @@ static bool comp_section_begin(uint32_t entity_id,
         if (!s_drag.active) {
             s_drag.active   = true;
             s_drag.entity_id = entity_id;
-            s_drag.src_flag  = flag;
+            s_drag.src_comp  = comp_id;
         }
     }
     if (s_drag.active && s_drag.entity_id == entity_id && ImGui::IsItemHovered()) {
-        s_drag.hover_flag = flag;
+        s_drag.hover_comp = comp_id;
         /* Visual cue: thin line above the hovered header. */
         ImVec2 mn = ImGui::GetItemRectMin();
         ImVec2 mx = ImGui::GetItemRectMax();
@@ -389,14 +303,14 @@ static bool comp_section_begin(uint32_t entity_id,
 
     /* Enable checkbox right after the component NAME (prominent), so it clearly
      * reads as that component's on/off switch. Transform is always enabled. */
-    if (flag_toggleable) {
+    if (comp_toggleable) {
         float cb_x = hdr_x + ImGui::GetTreeNodeToLabelSpacing()
                    + ImGui::CalcTextSize(display_name).x + 12.0f;
         if (cb_x > header_w - 46.0f) cb_x = header_w - 46.0f;
         bool _en = !comp_disabled;
         ImGui::SameLine(cb_x);
         if (ImGui::Checkbox("##comp_enabled", &_en))
-            jce_scene_set_component_enabled(_es, _ee, flag, _en);
+            jce_scene_set_comp_enabled(_es, _ee, comp_id, _en);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("%s", jce_editor_i18n("inspector.toggleComponentTip"));
     }
@@ -409,15 +323,17 @@ static bool comp_section_begin(uint32_t entity_id,
         JceScene *_cs = jce_state_get_scene();
         JceEntity _ce = jce_state_to_ecs_entity(entity_id);
         size_t _csz = 0;
-        void *_cptr = comp_get_ptr_and_size(_cs, _ce, flag, &_csz);
+        void *_cptr = comp_get_ptr_and_size(_cs, _ce, comp_id, &_csz);
 
         if (ImGui::MenuItem(jce_editor_i18n("inspector.copyComponent"),
                             NULL, false, _cptr != NULL && _csz > 0 && _csz <= sizeof(s_comp_clipboard.data))) {
-            s_comp_clipboard.flag = flag;
+            s_comp_clipboard.comp_id = comp_id;
             s_comp_clipboard.data_size = _csz;
             memcpy(s_comp_clipboard.data, _cptr, _csz);
         }
-        bool can_paste = (s_comp_clipboard.flag == flag && s_comp_clipboard.data_size > 0
+        bool can_paste = (s_comp_clipboard.comp_id == comp_id
+                          && comp_id != JCE_COMP_ID_INVALID
+                          && s_comp_clipboard.data_size > 0
                           && _cptr != NULL && _csz == s_comp_clipboard.data_size);
         if (!can_paste) ImGui::BeginDisabled();
         if (ImGui::MenuItem(jce_editor_i18n("inspector.pasteComponentValues"))) {
@@ -432,13 +348,13 @@ static bool comp_section_begin(uint32_t entity_id,
         /* Move Up / Move Down — defer to end-of-frame loop. */
         if (ImGui::MenuItem(jce_editor_i18n("inspector.moveUp"))) {
             s_pending_move.entity_id = entity_id;
-            s_pending_move.src_flag  = flag;
+            s_pending_move.src_comp  = comp_id;
             s_pending_move.dir       = -1;
             s_pending_move.pending   = true;
         }
         if (ImGui::MenuItem(jce_editor_i18n("inspector.moveDown"))) {
             s_pending_move.entity_id = entity_id;
-            s_pending_move.src_flag  = flag;
+            s_pending_move.src_comp  = comp_id;
             s_pending_move.dir       = +1;
             s_pending_move.pending   = true;
         }
@@ -455,7 +371,7 @@ static bool comp_section_begin(uint32_t entity_id,
                 open_preset_save = true;
             }
             ImGui::Separator();
-            std::vector<std::string> names = jce_preset_list(flag);
+            std::vector<std::string> names = jce_preset_list(comp_id);
             if (names.empty()) {
                 ImGui::TextDisabled("%s", jce_editor_i18n("inspector.preset.empty"));
             } else {
@@ -463,7 +379,7 @@ static bool comp_section_begin(uint32_t entity_id,
                 for (const auto &n : names) {
                     if (ImGui::BeginMenu(n.c_str())) {
                         if (ImGui::MenuItem(jce_editor_i18n("inspector.preset.apply"))) {
-                            jce_preset_apply(flag, n.c_str(), _cs, _ce);
+                            jce_preset_apply(comp_id, n.c_str(), _cs, _ce);
                         }
                         ImGui::Separator();
                         ImGui::PushStyleColor(ImGuiCol_Text, JCE_COLOR_TEXT_ERROR);
@@ -475,7 +391,7 @@ static bool comp_section_begin(uint32_t entity_id,
                     }
                 }
                 if (!pending_delete.empty()) {
-                    jce_preset_delete(flag, pending_delete.c_str());
+                    jce_preset_delete(comp_id, pending_delete.c_str());
                 }
             }
             ImGui::EndMenu();
@@ -490,15 +406,15 @@ static bool comp_section_begin(uint32_t entity_id,
         if (ImGui::MenuItem(jce_editor_i18n("transform.reset"))) {
             if (_cptr && _csz > 0) {
                 jce_state_begin_batch_edit();
-                if (flag == JCE_COMP_FLAG_TRANSFORM) {
+                if (comp_id == insp_transform_comp_id()) {
                     JceTransform *t = (JceTransform *)_cptr;
                     t->position = { 0.0f, 0.0f, 0.0f };
                     t->rotation = jce_q_identity();
                     t->scale    = { 1.0f, 1.0f, 1.0f };
-                } else if (jce_editor_component_slot_is_compound_collider(flag)) {
+                } else if (comp_id == jce_component_find("CompoundCollider")) {
                     jce_editor_component_compound_default(
                         (JceCompoundColliderComponent *)_cptr);
-                } else if (jce_editor_component_slot_is_video_player(flag)) {
+                } else if (comp_id == jce_component_find("VideoPlayer")) {
                     /* Reset only the authoring fields; do NOT zero the live
                      * decoder / texture handles here (that would orphan the GPU
                      * texture + decoder).  Emptying clip_path makes
@@ -517,6 +433,31 @@ static bool comp_section_begin(uint32_t entity_id,
             }
         }
 
+        /* ── Prefab override: Apply to / Revert from source ──────────
+         * Only meaningful for a prefab-instance entity.  The canonical
+         * engine name for Apply/Revert is the unified "Light" for the
+         * light group, else the component's registry name.  Disabled when
+         * the component is not currently overridden (nothing to push/drop).
+         * Calls are deferred-safe (they batch their own undo). */
+        if (jce_state_is_prefab_instance(entity_id)) {
+            ImGui::Separator();
+            const char *pf_name = override_query_name(comp_id);
+            bool is_ov = pf_name && s_override_cache.entity_id == entity_id
+                         && s_override_cache.has(pf_name);
+            if (!is_ov) ImGui::BeginDisabled();
+            if (ImGui::MenuItem(jce_editor_i18n("inspector.applyToPrefab"))) {
+                if (pf_name &&
+                    jce_state_apply_prefab_component(entity_id, pf_name))
+                    s_override_cache.invalidate();
+            }
+            if (ImGui::MenuItem(jce_editor_i18n("inspector.revertToPrefab"))) {
+                if (pf_name &&
+                    jce_state_revert_prefab_component(entity_id, pf_name))
+                    s_override_cache.invalidate();
+            }
+            if (!is_ov) ImGui::EndDisabled();
+        }
+
         ImGui::Separator();
 
         if (!removable) {
@@ -529,7 +470,7 @@ static bool comp_section_begin(uint32_t entity_id,
             ImGui::PushStyleColor(ImGuiCol_Text, JCE_COLOR_TEXT_ERROR);
             if (ImGui::MenuItem(jce_editor_i18n("inspector.removeComponent"))) {
                 s_pending_remove.entity_id = entity_id;
-                s_pending_remove.flag      = flag;
+                s_pending_remove.comp_id   = comp_id;
                 s_pending_remove.pending   = true;
             }
             ImGui::PopStyleColor();
@@ -540,8 +481,10 @@ static bool comp_section_begin(uint32_t entity_id,
 
     /* Preset save modal — shared per-section so opening one closes others. */
     if (ImGui::BeginPopup("##preset_save_popup")) {
+        const JceEditorComponentDescriptor *_pd =
+            jce_editor_component_find_by_id(comp_id);
         ImGui::Text(jce_editor_i18n("inspector.preset.savePromptFmt"),
-                    jce_comp_flag_display_name(flag));
+                    _pd ? _pd->display_name : display_name);
         ImGui::SetNextItemWidth(220);
         if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
         bool commit = ImGui::InputText("##preset_name", s_preset_save_buf,
@@ -551,7 +494,7 @@ static bool comp_section_begin(uint32_t entity_id,
             if (s_preset_save_buf[0]) {
                 JceScene *_ps = jce_state_get_scene();
                 JceEntity _pe = jce_state_to_ecs_entity(entity_id);
-                jce_preset_save(flag, s_preset_save_buf, _ps, _pe);
+                jce_preset_save(comp_id, s_preset_save_buf, _ps, _pe);
             }
             ImGui::CloseCurrentPopup();
         }
@@ -582,42 +525,44 @@ static void comp_section_end(void)
  *  COMPONENT DISPLAY ORDER + DISPATCH
  *
  *  Inspector iterates components in user-controlled order stored in
- *  EditorEntitySidecar.component_order.  The editor component registry owns
- *  both real flag slots and synthetic flagless slots.
+ *  EditorEntitySidecar.component_order (dense engine comp_ids; the light
+ *  group is the unified "Light" row id).
  * ══════════════════════════════════════════════════════════════════════ */
 
-/* Ensures sidecar.component_order contains exactly the slots we want to
- * draw, given the entity's currently-set component flags:
+/* Ensures sidecar.component_order contains exactly the comp_ids we want
+ * to draw, given the entity's current components:
  *   - Removes entries no longer present (component was removed).
  *   - Appends new entries in default-order positions (component added).
- *   - Light flags collapse into the synthetic light group slot. */
+ *   - The three light components collapse into the unified "Light" row. */
 static void sync_component_order(EditorEntitySidecar &sidecar,
                                  JceScene *scene,
                                  JceEntity entity,
                                  uint64_t flags)
 {
-    auto wanted = [&](uint64_t entry) -> bool {
-        if (jce_editor_component_slot_is_light_group(entry))
+    auto wanted = [&](int cid) -> bool {
+        if (cid == JCE_COMP_ID_INVALID)
+            return false;
+        if (jce_editor_component_id_is_light_group(cid))
             return (flags & INSP_LIGHT_MASK) != 0;
 
         const JceEditorComponentDescriptor *desc =
-            jce_editor_component_find(entry);
+            jce_editor_component_find_by_id(cid);
         if (desc && (desc->legacy_flag & INSP_LIGHT_MASK) != 0)
             return false;
 
-        return jce_editor_component_slot_present(scene, entity, flags, entry);
+        return jce_scene_has_comp(scene, entity, cid);
     };
 
     /* Drop stale entries while preserving order of survivors. */
     auto &v = sidecar.component_order;
     v.erase(std::remove_if(v.begin(), v.end(),
-                           [&](uint64_t f) { return !wanted(f); }),
+                           [&](int c) { return !wanted(c); }),
             v.end());
 
     /* Add any missing entries by walking the default order. */
     int n_order = jce_editor_component_default_order_count();
     for (int i = 0; i < n_order; i++) {
-        uint64_t def = jce_editor_component_default_order_at(i);
+        int def = jce_editor_component_default_order_comp_id(i);
         if (!wanted(def)) continue;
         if (std::find(v.begin(), v.end(), def) == v.end())
             v.push_back(def);
@@ -628,7 +573,7 @@ static void draw_one_component_section(uint32_t focused,
                                        EditorEntitySidecar &sidecar,
                                        JceScene *scene,
                                        JceEntity ecs_e,
-                                       uint64_t flag);
+                                       int comp_id);
 
 /* ══════════════════════════════════════════════════════════════════════
  *  MULTI-OBJECT EDITING
@@ -644,46 +589,25 @@ static void draw_one_component_section(uint32_t focused,
  *  other components must be edited per-entity.
  * ══════════════════════════════════════════════════════════════════════ */
 
-static bool multi_edit_supported(uint64_t flag)
+static bool multi_edit_supported(int comp_id)
 {
     const JceEditorComponentDescriptor *desc =
-        jce_editor_component_find(flag);
+        jce_editor_component_find_by_id(comp_id);
     return desc && desc->multi_edit_supported;
 }
 
+/* Raw blob for the broadcast paths — the engine registry's type-erased
+ * accessor replaces the old 13-case getter switch (+ compound-collider
+ * synthetic-slot branch).  The descriptor's `multi_edit_supported` flag
+ * remains the SOLE whitelist gate (same 13 pure value-type components as
+ * before); this helper is only reached for whitelisted rows. */
 static void *multi_get_comp_ptr(JceScene *scene, JceEntity e,
-                                uint64_t flag, size_t *out_size)
+                                int comp_id, size_t *out_size)
 {
-#define M(F, GETTER, T)                                                   \
-    case F: {                                                             \
-        T *p = GETTER(scene, e);                                          \
-        if (out_size) *out_size = sizeof(T);                              \
-        return (void *)p;                                                 \
-    }
-    switch (flag) {
-        M(JCE_COMP_FLAG_TRANSFORM,         jce_scene_get_transform,         JceTransform)
-        M(JCE_COMP_FLAG_CAMERA,            jce_scene_get_camera,            JceCameraComponent)
-        M(JCE_COMP_FLAG_MESH_RENDERER,     jce_scene_get_mesh_renderer,     JceMeshRenderer)
-        M(JCE_COMP_FLAG_SPRITE_RENDERER,   jce_scene_get_sprite_renderer,   JceSpriteRendererComponent)
-        M(JCE_COMP_FLAG_RIGIDBODY,         jce_scene_get_rigidbody,         JceRigidBodyComponent)
-        M(JCE_COMP_FLAG_BOX_COLLIDER,      jce_scene_get_box_collider,      JceBoxColliderComponent)
-        M(JCE_COMP_FLAG_SPHERE_COLLIDER,   jce_scene_get_sphere_collider,   JceSphereColliderComponent)
-        M(JCE_COMP_FLAG_CAPSULE_COLLIDER,  jce_scene_get_capsule_collider,  JceCapsuleColliderComponent)
-        M(JCE_COMP_FLAG_MESH_COLLIDER,     jce_scene_get_mesh_collider,     JceMeshColliderComponent)
-        M(JCE_COMP_FLAG_AUDIO_SOURCE,      jce_scene_get_audio_source,      JceAudioSourceComponent)
-        M(JCE_COMP_FLAG_CONSTRAINT,        jce_scene_get_constraint,        JceConstraintComponent)
-        M(JCE_COMP_FLAG_SKELETAL_ANIMATOR, jce_scene_get_skeletal_animator, JceSkeletalAnimatorComponent)
-        default:
-            if (jce_editor_component_slot_is_compound_collider(flag)) {
-                JceCompoundColliderComponent *p =
-                    jce_scene_get_compound_collider(scene, e);
-                if (out_size) *out_size = sizeof(JceCompoundColliderComponent);
-                return (void *)p;
-            }
-            if (out_size) *out_size = 0;
-            return nullptr;
-    }
-#undef M
+    size_t sz = 0;
+    void *p = comp_get_ptr_and_size(scene, e, comp_id, &sz);
+    if (out_size) *out_size = sz;
+    return p;
 }
 
 /* ── Multi-select per-field broadcast: field reflection ──────────────────
@@ -797,32 +721,55 @@ static const InspField kF_audio[] = {
 #undef IF_AX
 #undef IF_STR
 
-/* Map a component slot/flag to its field table (NULL ⇒ use the 4-byte
- * fallback for the whole changed region). */
-static const InspField *inspbcast_fields(uint64_t entry, int *count)
+/* Map a dense comp_id to its field table (NULL ⇒ use the 4-byte fallback
+ * for the whole changed region).  Rows are keyed by canonical engine name
+ * and resolve their comp_id lazily once the engine registry exists. */
+struct InspBcastRow {
+    const char      *engine_name;
+    const InspField *fields;
+    int              count;
+    int              comp_id; /* lazily resolved; JCE_COMP_ID_INVALID until */
+};
+
+#define IF_ROW(NAME, TBL) \
+    { NAME, TBL, (int)(sizeof(TBL) / sizeof((TBL)[0])), JCE_COMP_ID_INVALID }
+static InspBcastRow kBcastRows[] = {
+    IF_ROW("Transform",        kF_transform),
+    IF_ROW("MeshRenderer",     kF_mesh_renderer),
+    IF_ROW("Camera",           kF_camera),
+    IF_ROW("SpriteRenderer",   kF_sprite_renderer),
+    IF_ROW("SkeletalAnimator", kF_skeletal),
+    IF_ROW("Constraint",       kF_constraint),
+    IF_ROW("Rigidbody",        kF_rigidbody),
+    IF_ROW("BoxCollider",      kF_box),
+    IF_ROW("SphereCollider",   kF_sphere),
+    IF_ROW("CapsuleCollider",  kF_capsule),
+    IF_ROW("MeshCollider",     kF_mesh_collider),
+    IF_ROW("CompoundCollider", kF_compound),
+    IF_ROW("AudioSource",      kF_audio),
+};
+#undef IF_ROW
+
+static const InspField *inspbcast_fields(int comp_id, int *count)
 {
-#define IF_RET(tbl) do { *count = (int)(sizeof(tbl) / sizeof((tbl)[0])); return (tbl); } while (0)
-    if (entry == JCE_COMP_FLAG_TRANSFORM)              IF_RET(kF_transform);
-    if (entry == JCE_COMP_FLAG_MESH_RENDERER)          IF_RET(kF_mesh_renderer);
-    if (entry == JCE_COMP_FLAG_CAMERA)                 IF_RET(kF_camera);
-    if (entry == JCE_COMP_FLAG_SPRITE_RENDERER)        IF_RET(kF_sprite_renderer);
-    if (entry == JCE_COMP_FLAG_SKELETAL_ANIMATOR)      IF_RET(kF_skeletal);
-    if (entry == JCE_COMP_FLAG_CONSTRAINT)             IF_RET(kF_constraint);
-    if (entry == JCE_COMP_FLAG_RIGIDBODY)              IF_RET(kF_rigidbody);
-    if (entry == JCE_COMP_FLAG_BOX_COLLIDER)           IF_RET(kF_box);
-    if (entry == JCE_COMP_FLAG_SPHERE_COLLIDER)        IF_RET(kF_sphere);
-    if (entry == JCE_COMP_FLAG_CAPSULE_COLLIDER)       IF_RET(kF_capsule);
-    if (entry == JCE_COMP_FLAG_MESH_COLLIDER)          IF_RET(kF_mesh_collider);
-    if (entry == JCE_EDITOR_COMP_SLOT_COMPOUND_COLLIDER) IF_RET(kF_compound);
-    if (entry == JCE_COMP_FLAG_AUDIO_SOURCE)           IF_RET(kF_audio);
-#undef IF_RET
+    if (comp_id != JCE_COMP_ID_INVALID) {
+        for (InspBcastRow &r : kBcastRows) {
+            if (r.comp_id == JCE_COMP_ID_INVALID)
+                r.comp_id = jce_component_find(r.engine_name);
+            if (r.comp_id == comp_id) {
+                *count = r.count;
+                return r.fields;
+            }
+        }
+    }
     *count = 0;
     return nullptr;
 }
 } /* namespace */
 
 /* Wrap a single-component draw with a before/after byte diff and broadcast the
- * EDITED FIELD(S) to every other selected entity that holds the same flag.
+ * EDITED FIELD(S) to every other selected entity that holds the same
+ * component (comp_id).
  *
  * The drawers mutate the focused entity's component in place, touching only the
  * fields the user actually edited this frame.  We snapshot the component bytes
@@ -835,7 +782,7 @@ static void draw_section_with_multi_broadcast(uint32_t focused,
                                               EditorEntitySidecar &sidecar,
                                               JceScene *scene,
                                               JceEntity ecs_e,
-                                              uint64_t entry)
+                                              int entry)
 {
     int sel_count = 0;
     const uint32_t *sel = jce_state_get_selection(&sel_count);
@@ -900,8 +847,7 @@ static void draw_section_with_multi_broadcast(uint32_t focused,
         if (other == focused) continue;
         JceEntity oe = jce_state_to_ecs_entity(other);
         if (!oe) continue;
-        uint64_t oflags = jce_scene_get_component_flags(scene, oe);
-        if (!jce_editor_component_slot_present(scene, oe, oflags, entry))
+        if (!jce_scene_has_comp(scene, oe, entry))
             continue;
         size_t osize = 0;
         void *optr = multi_get_comp_ptr(scene, oe, entry, &osize);
@@ -920,22 +866,22 @@ static void apply_pending_reorder(uint32_t focused_entity,
     /* Drag drop: on mouse release, move src before/after hover. */
     if (s_drag.active && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
         if (s_drag.entity_id == focused_entity &&
-            s_drag.src_flag != s_drag.hover_flag &&
-            s_drag.hover_flag != 0) {
+            s_drag.src_comp != s_drag.hover_comp &&
+            s_drag.hover_comp != JCE_COMP_ID_INVALID) {
             auto &v = sidecar.component_order;
-            auto it_src = std::find(v.begin(), v.end(), s_drag.src_flag);
-            auto it_dst = std::find(v.begin(), v.end(), s_drag.hover_flag);
+            auto it_src = std::find(v.begin(), v.end(), s_drag.src_comp);
+            auto it_dst = std::find(v.begin(), v.end(), s_drag.hover_comp);
             if (it_src != v.end() && it_dst != v.end()) {
                 jce_state_begin_batch_edit();
-                uint64_t f = *it_src;
+                int c = *it_src;
                 size_t dst_idx = (size_t)(it_dst - v.begin());
                 v.erase(it_src);
                 if (dst_idx > (size_t)(it_src - v.begin())) dst_idx--;
-                v.insert(v.begin() + dst_idx, f);
+                v.insert(v.begin() + dst_idx, c);
                 jce_state_end_batch_edit();
             }
         }
-        s_drag = { 0, 0, 0, false };
+        s_drag = { 0, JCE_COMP_ID_INVALID, JCE_COMP_ID_INVALID, false };
     }
 
     if (!s_pending_move.pending) return;
@@ -945,7 +891,7 @@ static void apply_pending_reorder(uint32_t focused_entity,
     }
 
     auto &v = sidecar.component_order;
-    auto it = std::find(v.begin(), v.end(), s_pending_move.src_flag);
+    auto it = std::find(v.begin(), v.end(), s_pending_move.src_comp);
     if (it != v.end()) {
         size_t idx = (size_t)(it - v.begin());
         if (s_pending_move.dir < 0 && idx > 0) {
@@ -958,188 +904,230 @@ static void apply_pending_reorder(uint32_t focused_entity,
             jce_state_end_batch_edit();
         }
     }
-    s_pending_move = { 0, 0, 0, 0, false };
+    s_pending_move = { 0, JCE_COMP_ID_INVALID, 0, false };
 }
 
-/* Single dispatch from a component slot to the matching draw_comp_X call.
- * Mirrors the historic per-flag if-block sequence verbatim so behaviour
- * is byte-identical except for ordering. Light is handled inline by the
- * caller (light-group path). */
+/* == Per-row draw adapters ==============================================
+ * One thin adapter per component, registered into the editor registry
+ * rows at first inspector draw (the core registry TU cannot reference
+ * the panel drawers).  draw_one_component_section dispatches through
+ * the row -- this replaces the historic 50-case JCE_DRAW switch AND
+ * the synthetic-slot early-outs.  Adding a future component means one
+ * INSP_DRAWFN line + one entry in insp_register_draw_fns(). */
+
+#define INSP_DRAWFN(NAME, EXPR)                                               \
+    static void drawfn_##NAME(JceScene *scene, JceEntity e,              \
+                              uint32_t entity_id)                      \
+    {                                                                     \
+        (void)scene; (void)e; (void)entity_id;                            \
+        EXPR;                                                             \
+    }
+
+INSP_DRAWFN(transform, draw_comp_transform(entity_id, jce_scene_get_transform(scene, e)))
+INSP_DRAWFN(pivot, draw_comp_pivot(scene, e, jce_scene_get_pivot(scene, e)))
+INSP_DRAWFN(camera, draw_comp_camera(jce_scene_get_camera(scene, e)))
+INSP_DRAWFN(mesh_renderer, draw_comp_mesh_renderer(jce_scene_get_mesh_renderer(scene, e)))
+INSP_DRAWFN(sprite_renderer, draw_comp_sprite_renderer(jce_scene_get_sprite_renderer(scene, e)))
+INSP_DRAWFN(animator, draw_comp_animator(jce_scene_get_animator(scene, e)))
+INSP_DRAWFN(skeletal_animator,
+            draw_comp_skeletal_animator(jce_scene_get_skeletal_animator(scene, e)))
+INSP_DRAWFN(rigidbody, draw_comp_rigidbody(jce_scene_get_rigidbody(scene, e)))
+INSP_DRAWFN(box_collider, draw_comp_box_collider(jce_scene_get_box_collider(scene, e)))
+INSP_DRAWFN(sphere_collider, draw_comp_sphere_collider(jce_scene_get_sphere_collider(scene, e)))
+INSP_DRAWFN(character_controller,
+            draw_comp_character_controller(jce_scene_get_character_controller(scene, e)))
+INSP_DRAWFN(audio_source, draw_comp_audio_source(jce_scene_get_audio_source(scene, e)))
+INSP_DRAWFN(music_track, draw_comp_music_track(jce_scene_get_music_track(scene, e)))
+INSP_DRAWFN(script, draw_comp_script(jce_scene_get_script(scene, e)))
+INSP_DRAWFN(skybox, draw_comp_skybox(jce_scene_get_skybox(scene, e)))
+INSP_DRAWFN(sprite_animator, draw_comp_sprite_animator(jce_scene_get_sprite_animator(scene, e)))
+INSP_DRAWFN(constraint, draw_comp_constraint(jce_scene_get_constraint(scene, e)))
+INSP_DRAWFN(terrain, draw_comp_terrain(jce_scene_get_terrain(scene, e)))
+INSP_DRAWFN(vegetation_scatter, draw_comp_vegetation_scatter(jce_scene_get_vegetation_scatter(scene, e)))
+INSP_DRAWFN(water, draw_comp_water(jce_scene_get_water(scene, e)))
+INSP_DRAWFN(buoyancy, draw_comp_buoyancy(jce_scene_get_buoyancy(scene, e)))
+INSP_DRAWFN(rigidbody2d, draw_comp_rigidbody2d(jce_scene_get_rigidbody2d(scene, e)))
+INSP_DRAWFN(particle_emitter, draw_comp_particle_emitter(jce_scene_get_particle_emitter(scene, e)))
+INSP_DRAWFN(behavior_tree, draw_comp_behavior_tree(jce_scene_get_behavior_tree(scene, e)))
+INSP_DRAWFN(lod_group, draw_comp_lod_group(jce_scene_get_lod_group(scene, e)))
+INSP_DRAWFN(virtual_camera, draw_comp_virtual_camera(jce_scene_get_virtual_camera(scene, e)))
+INSP_DRAWFN(trigger_volume, draw_comp_trigger_volume(jce_scene_get_trigger_volume(scene, e)))
+INSP_DRAWFN(capsule_collider, draw_comp_capsule_collider(jce_scene_get_capsule_collider(scene, e)))
+INSP_DRAWFN(mesh_collider, draw_comp_mesh_collider(jce_scene_get_mesh_collider(scene, e)))
+INSP_DRAWFN(compound_collider,
+            draw_comp_compound_collider(jce_scene_get_compound_collider(scene, e)))
+INSP_DRAWFN(collider2d, draw_comp_collider2d(jce_scene_get_collider2d(scene, e)))
+INSP_DRAWFN(trail_renderer, draw_comp_trail_renderer(jce_scene_get_trail_renderer(scene, e)))
+INSP_DRAWFN(line_renderer, draw_comp_line_renderer(jce_scene_get_line_renderer(scene, e)))
+INSP_DRAWFN(reflection_probe, draw_comp_reflection_probe(jce_scene_get_reflection_probe(scene, e)))
+INSP_DRAWFN(decal, draw_comp_decal(jce_scene_get_decal(scene, e)))
+INSP_DRAWFN(light_probe_group,
+            draw_comp_light_probe_group(jce_scene_get_light_probe_group(scene, e)))
+INSP_DRAWFN(audio_listener, draw_comp_audio_listener(jce_scene_get_audio_listener(scene, e)))
+INSP_DRAWFN(audio_reverb_zone,
+            draw_comp_audio_reverb_zone(jce_scene_get_audio_reverb_zone(scene, e)))
+INSP_DRAWFN(audio_occlusion, draw_comp_audio_occlusion(jce_scene_get_audio_occlusion(scene, e)))
+INSP_DRAWFN(spawn_manager, draw_comp_spawn_manager(jce_scene_get_spawn_manager(scene, e)))
+INSP_DRAWFN(weapon, draw_comp_weapon(jce_scene_get_weapon(scene, e)))
+INSP_DRAWFN(save_point, draw_comp_save_point(jce_scene_get_save_point(scene, e)))
+INSP_DRAWFN(wheel_collider, draw_comp_wheel_collider(jce_scene_get_wheel_collider(scene, e)))
+INSP_DRAWFN(vehicle, draw_comp_vehicle(jce_scene_get_vehicle(scene, e)))
+INSP_DRAWFN(soft_body, draw_comp_soft_body(jce_scene_get_soft_body(scene, e)))
+INSP_DRAWFN(constant_force, draw_comp_constant_force(jce_scene_get_constant_force(scene, e)))
+INSP_DRAWFN(configurable_joint,
+            draw_comp_configurable_joint(jce_scene_get_configurable_joint(scene, e)))
+INSP_DRAWFN(joint2d, draw_comp_joint2d(jce_scene_get_joint2d(scene, e)))
+INSP_DRAWFN(billboard_renderer,
+            draw_comp_billboard_renderer(jce_scene_get_billboard_renderer(scene, e)))
+INSP_DRAWFN(canvas, draw_comp_canvas(jce_scene_get_canvas(scene, e)))
+INSP_DRAWFN(canvas_group, draw_comp_canvas_group(jce_scene_get_canvas_group(scene, e)))
+INSP_DRAWFN(layout_group, draw_comp_layout_group(jce_scene_get_layout_group(scene, e)))
+INSP_DRAWFN(ui_image, draw_comp_ui_image(jce_scene_get_ui_image(scene, e)))
+INSP_DRAWFN(ui_text, draw_comp_ui_text(jce_scene_get_ui_text(scene, e)))
+INSP_DRAWFN(ui_button, draw_comp_ui_button(jce_scene_get_ui_button(scene, e)))
+INSP_DRAWFN(ui_slider, draw_comp_ui_slider(jce_scene_get_ui_slider(scene, e)))
+INSP_DRAWFN(ui_toggle, draw_comp_ui_toggle(jce_scene_get_ui_toggle(scene, e)))
+INSP_DRAWFN(ui_input_field, draw_comp_ui_input_field(jce_scene_get_ui_input_field(scene, e)))
+INSP_DRAWFN(ui_scroll_view, draw_comp_ui_scroll_view(jce_scene_get_ui_scroll_view(scene, e)))
+INSP_DRAWFN(ui_progress_bar, draw_comp_ui_progress_bar(jce_scene_get_ui_progress_bar(scene, e)))
+INSP_DRAWFN(ui_dropdown, draw_comp_ui_dropdown(jce_scene_get_ui_dropdown(scene, e)))
+INSP_DRAWFN(cloth, draw_comp_cloth(jce_scene_get_cloth(scene, e)))
+INSP_DRAWFN(network_object, draw_comp_network_object(jce_scene_get_network_object(scene, e)))
+INSP_DRAWFN(net_transform, draw_comp_net_transform(jce_scene_get_net_transform(scene, e)))
+INSP_DRAWFN(net_animator, draw_comp_net_animator(jce_scene_get_net_animator(scene, e)))
+INSP_DRAWFN(net_rigidbody, draw_comp_net_rigidbody(jce_scene_get_net_rigidbody(scene, e)))
+INSP_DRAWFN(tilemap, draw_comp_tilemap(jce_scene_get_tilemap(scene, e)))
+INSP_DRAWFN(tilemap_collider2d,
+            draw_comp_tilemap_collider2d(jce_scene_get_tilemap_collider2d(scene, e)))
+INSP_DRAWFN(avatar, draw_comp_avatar(jce_scene_get_avatar(scene, e)))
+INSP_DRAWFN(volume, draw_comp_volume(jce_scene_get_volume(scene, e)))
+INSP_DRAWFN(occlusion_portal, draw_comp_occlusion_portal(jce_scene_get_occlusion_portal(scene, e)))
+INSP_DRAWFN(video_player, draw_comp_video_player(jce_scene_get_video_player(scene, e)))
+INSP_DRAWFN(nav_agent, draw_comp_nav_agent(jce_scene_get_nav_agent(scene, e)))
+INSP_DRAWFN(ik_constraints, draw_comp_ik_constraints(jce_scene_get_ik_constraints(scene, e)))
+INSP_DRAWFN(foot_ik, draw_comp_foot_ik(jce_scene_get_foot_ik(scene, e)))
+INSP_DRAWFN(full_body_ik, draw_comp_full_body_ik(jce_scene_get_full_body_ik(scene, e)))
+INSP_DRAWFN(sequence_player, draw_comp_sequence_player(jce_scene_get_sequence_player(scene, e)))
+INSP_DRAWFN(morph_weights, draw_comp_morph_weights(scene, e, jce_scene_get_morph_weights(scene, e)))
+INSP_DRAWFN(network_variable, draw_comp_network_variable(jce_scene_get_network_variable(scene, e)))
+INSP_DRAWFN(gas, draw_comp_gas(jce_scene_get_gas(scene, e)))
+INSP_DRAWFN(ragdoll, draw_comp_ragdoll(jce_scene_get_ragdoll(scene, e)))
+INSP_DRAWFN(fracture, draw_comp_fracture(jce_scene_get_fracture(scene, e)))
+#undef INSP_DRAWFN
+
+static void insp_register_draw_fns(void)
+{
+    static bool done = false;
+    if (done) return;
+    done = true;
+    struct DrawRow { const char *engine_name; JceEditorCompDrawFn fn; };
+    static const DrawRow kRows[] = {
+        { "Transform", drawfn_transform },
+        { "Pivot", drawfn_pivot },
+        { "Camera", drawfn_camera },
+        { "MeshRenderer", drawfn_mesh_renderer },
+        { "SpriteRenderer", drawfn_sprite_renderer },
+        { "Animator", drawfn_animator },
+        { "SkeletalAnimator", drawfn_skeletal_animator },
+        { "Rigidbody", drawfn_rigidbody },
+        { "BoxCollider", drawfn_box_collider },
+        { "SphereCollider", drawfn_sphere_collider },
+        { "CharacterController", drawfn_character_controller },
+        { "AudioSource", drawfn_audio_source },
+        { "MusicTrack", drawfn_music_track },
+        { "Script", drawfn_script },
+        { "Skybox", drawfn_skybox },
+        { "SpriteAnimator", drawfn_sprite_animator },
+        { "Constraint", drawfn_constraint },
+        { "Terrain", drawfn_terrain },
+        { "VegetationScatter", drawfn_vegetation_scatter },
+        { "Water", drawfn_water },
+        { "Buoyancy", drawfn_buoyancy },
+        { "Rigidbody2D", drawfn_rigidbody2d },
+        { "ParticleEmitter", drawfn_particle_emitter },
+        { "BehaviorTree", drawfn_behavior_tree },
+        { "LODGroup", drawfn_lod_group },
+        { "VirtualCamera", drawfn_virtual_camera },
+        { "TriggerVolume", drawfn_trigger_volume },
+        { "CapsuleCollider", drawfn_capsule_collider },
+        { "MeshCollider", drawfn_mesh_collider },
+        { "CompoundCollider", drawfn_compound_collider },
+        { "Collider2D", drawfn_collider2d },
+        { "TrailRenderer", drawfn_trail_renderer },
+        { "LineRenderer", drawfn_line_renderer },
+        { "ReflectionProbe", drawfn_reflection_probe },
+        { "Decal", drawfn_decal },
+        { "LightProbeGroup", drawfn_light_probe_group },
+        { "AudioListener", drawfn_audio_listener },
+        { "AudioReverbZone", drawfn_audio_reverb_zone },
+        { "AudioOcclusion", drawfn_audio_occlusion },
+        { "SpawnManager", drawfn_spawn_manager },
+        { "Weapon", drawfn_weapon },
+        { "SavePoint", drawfn_save_point },
+        { "WheelCollider", drawfn_wheel_collider },
+        { "Vehicle", drawfn_vehicle },
+        { "SoftBody", drawfn_soft_body },
+        { "ConstantForce", drawfn_constant_force },
+        { "ConfigurableJoint", drawfn_configurable_joint },
+        { "Joint2D", drawfn_joint2d },
+        { "BillboardRenderer", drawfn_billboard_renderer },
+        { "Canvas", drawfn_canvas },
+        { "CanvasGroup", drawfn_canvas_group },
+        { "LayoutGroup", drawfn_layout_group },
+        { "UIImage", drawfn_ui_image },
+        { "UIText", drawfn_ui_text },
+        { "UIButton", drawfn_ui_button },
+        { "UISlider", drawfn_ui_slider },
+        { "UIToggle", drawfn_ui_toggle },
+        { "UIInputField", drawfn_ui_input_field },
+        { "UIScrollView", drawfn_ui_scroll_view },
+        { "UIProgressBar", drawfn_ui_progress_bar },
+        { "UIDropdown", drawfn_ui_dropdown },
+        { "Cloth", drawfn_cloth },
+        { "NetworkObject", drawfn_network_object },
+        { "NetworkTransform", drawfn_net_transform },
+        { "NetworkAnimator", drawfn_net_animator },
+        { "NetworkRigidbody", drawfn_net_rigidbody },
+        { "Tilemap", drawfn_tilemap },
+        { "TilemapCollider2D", drawfn_tilemap_collider2d },
+        { "Avatar", drawfn_avatar },
+        { "Volume", drawfn_volume },
+        { "OcclusionPortal", drawfn_occlusion_portal },
+        { "VideoPlayer", drawfn_video_player },
+        { "NavAgent", drawfn_nav_agent },
+        { "IkConstraints", drawfn_ik_constraints },
+        { "FootIk", drawfn_foot_ik },
+        { "FullBodyIk", drawfn_full_body_ik },
+        { "SequencePlayer", drawfn_sequence_player },
+        { "MorphWeights", drawfn_morph_weights },
+        { "NetworkVariable", drawfn_network_variable },
+        { "GameplayAbilitySystem", drawfn_gas },
+        { "Ragdoll", drawfn_ragdoll },
+        { "Fracture", drawfn_fracture },
+    };
+    for (const DrawRow &r : kRows)
+        jce_editor_component_set_draw_fn(r.engine_name, r.fn);
+}
+
+/* Single dispatch from a dense comp_id to its registry row draw fn.
+ * Light is handled inline by the caller (light-group path); rows with
+ * no draw fn (per-type lights, EditorMeta) draw nothing, exactly like
+ * the old switch default case. */
 static void draw_one_component_section(uint32_t focused,
                                        EditorEntitySidecar &sidecar,
                                        JceScene *scene,
                                        JceEntity ecs_e,
-                                       uint64_t flag)
+                                       int comp_id)
 {
-    const char *nm = jce_editor_component_display_name(flag);
+    insp_register_draw_fns();
     const JceEditorComponentDescriptor *desc =
-        jce_editor_component_find(flag);
-    bool removable = desc ? desc->removable : (flag != JCE_COMP_FLAG_TRANSFORM);
-
-    if (jce_editor_component_slot_is_compound_collider(flag)) {
-        if (comp_section_begin(focused, sidecar, flag, nm, removable))
-            draw_comp_compound_collider(
-                jce_scene_get_compound_collider(scene, ecs_e));
-        comp_section_end();
+        jce_editor_component_find_by_id(comp_id);
+    if (!desc || !desc->draw)
         return;
-    }
-
-    if (jce_editor_component_slot_is_video_player(flag)) {
-        if (comp_section_begin(focused, sidecar, flag, nm, removable))
-            draw_comp_video_player(
-                jce_scene_get_video_player(scene, ecs_e));
-        comp_section_end();
-        return;
-    }
-
-    if (jce_editor_component_slot_is_nav_agent(flag)) {
-        if (comp_section_begin(focused, sidecar, flag, nm, removable))
-            draw_comp_nav_agent(
-                jce_scene_get_nav_agent(scene, ecs_e));
-        comp_section_end();
-        return;
-    }
-
-    if (jce_editor_component_slot_is_ik_constraints(flag)) {
-        if (comp_section_begin(focused, sidecar, flag, nm, removable))
-            draw_comp_ik_constraints(
-                jce_scene_get_ik_constraints(scene, ecs_e));
-        comp_section_end();
-        return;
-    }
-
-    if (jce_editor_component_slot_is_sequence_player(flag)) {
-        if (comp_section_begin(focused, sidecar, flag, nm, removable))
-            draw_comp_sequence_player(
-                jce_scene_get_sequence_player(scene, ecs_e));
-        comp_section_end();
-        return;
-    }
-
-#define JCE_DRAW(F, EXPR)                                                  \
-    case F:                                                                \
-        if (comp_section_begin(focused, sidecar, F, nm, removable)) EXPR;  \
-        comp_section_end();                                                \
-        break
-
-    switch (flag) {
-        JCE_DRAW(JCE_COMP_FLAG_TRANSFORM,
-                 draw_comp_transform(focused, jce_scene_get_transform(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_CAMERA,
-                 draw_comp_camera(jce_scene_get_camera(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_MESH_RENDERER,
-                 draw_comp_mesh_renderer(jce_scene_get_mesh_renderer(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_SPRITE_RENDERER,
-                 draw_comp_sprite_renderer(jce_scene_get_sprite_renderer(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_ANIMATOR,
-                 draw_comp_animator(jce_scene_get_animator(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_SKELETAL_ANIMATOR,
-                 draw_comp_skeletal_animator(jce_scene_get_skeletal_animator(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_RIGIDBODY,
-                 draw_comp_rigidbody(jce_scene_get_rigidbody(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_BOX_COLLIDER,
-                 draw_comp_box_collider(jce_scene_get_box_collider(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_SPHERE_COLLIDER,
-                 draw_comp_sphere_collider(jce_scene_get_sphere_collider(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_CHARACTER_CONTROLLER,
-                 draw_comp_character_controller(jce_scene_get_character_controller(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_AUDIO_SOURCE,
-                 draw_comp_audio_source(jce_scene_get_audio_source(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_SCRIPT,
-                 draw_comp_script(jce_scene_get_script(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_SKYBOX,
-                 draw_comp_skybox(jce_scene_get_skybox(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_SPRITE_ANIMATOR,
-                 draw_comp_sprite_animator(jce_scene_get_sprite_animator(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_CONSTRAINT,
-                 draw_comp_constraint(jce_scene_get_constraint(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_TERRAIN,
-                 draw_comp_terrain(jce_scene_get_terrain(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_RIGIDBODY_2D,
-                 draw_comp_rigidbody2d(jce_scene_get_rigidbody2d(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_PARTICLE_EMITTER,
-                 draw_comp_particle_emitter(jce_scene_get_particle_emitter(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_BEHAVIOR_TREE,
-                 draw_comp_behavior_tree(jce_scene_get_behavior_tree(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_LOD_GROUP,
-                 draw_comp_lod_group(jce_scene_get_lod_group(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_VIRTUAL_CAMERA,
-                 draw_comp_virtual_camera(jce_scene_get_virtual_camera(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_TRIGGER_VOLUME,
-                 draw_comp_trigger_volume(jce_scene_get_trigger_volume(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_CAPSULE_COLLIDER,
-                 draw_comp_capsule_collider(jce_scene_get_capsule_collider(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_MESH_COLLIDER,
-                 draw_comp_mesh_collider(jce_scene_get_mesh_collider(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_COLLIDER_2D,
-                 draw_comp_collider2d(jce_scene_get_collider2d(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_TRAIL_RENDERER,
-                 draw_comp_trail_renderer(jce_scene_get_trail_renderer(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_LINE_RENDERER,
-                 draw_comp_line_renderer(jce_scene_get_line_renderer(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_REFLECTION_PROBE,
-                 draw_comp_reflection_probe(jce_scene_get_reflection_probe(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_DECAL,
-                 draw_comp_decal(jce_scene_get_decal(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_LIGHT_PROBE_GROUP,
-                 draw_comp_light_probe_group(jce_scene_get_light_probe_group(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_AUDIO_LISTENER,
-                 draw_comp_audio_listener(jce_scene_get_audio_listener(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_AUDIO_REVERB_ZONE,
-                 draw_comp_audio_reverb_zone(jce_scene_get_audio_reverb_zone(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_AUDIO_OCCLUSION,
-                 draw_comp_audio_occlusion(jce_scene_get_audio_occlusion(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_SPAWN_MANAGER,
-                 draw_comp_spawn_manager(jce_scene_get_spawn_manager(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_WEAPON,
-                 draw_comp_weapon(jce_scene_get_weapon(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_SAVE_POINT,
-                 draw_comp_save_point(jce_scene_get_save_point(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_WHEEL_COLLIDER,
-                 draw_comp_wheel_collider(jce_scene_get_wheel_collider(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_CONSTANT_FORCE,
-                 draw_comp_constant_force(jce_scene_get_constant_force(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_CONFIGURABLE_JOINT,
-                 draw_comp_configurable_joint(jce_scene_get_configurable_joint(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_JOINT_2D,
-                 draw_comp_joint2d(jce_scene_get_joint2d(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_BILLBOARD_RENDERER,
-                 draw_comp_billboard_renderer(jce_scene_get_billboard_renderer(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_CANVAS,
-                 draw_comp_canvas(jce_scene_get_canvas(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_CANVAS_GROUP,
-                 draw_comp_canvas_group(jce_scene_get_canvas_group(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_LAYOUT_GROUP,
-                 draw_comp_layout_group(jce_scene_get_layout_group(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_UI_IMAGE,
-                 draw_comp_ui_image(jce_scene_get_ui_image(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_UI_TEXT,
-                 draw_comp_ui_text(jce_scene_get_ui_text(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_UI_BUTTON,
-                 draw_comp_ui_button(jce_scene_get_ui_button(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_CLOTH,
-                 draw_comp_cloth(jce_scene_get_cloth(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_NETWORK_OBJECT,
-                 draw_comp_network_object(jce_scene_get_network_object(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_NET_TRANSFORM,
-                 draw_comp_net_transform(jce_scene_get_net_transform(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_NET_ANIMATOR,
-                 draw_comp_net_animator(jce_scene_get_net_animator(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_NET_RIGIDBODY,
-                 draw_comp_net_rigidbody(jce_scene_get_net_rigidbody(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_TILEMAP,
-                 draw_comp_tilemap(jce_scene_get_tilemap(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_TILEMAP_COLLIDER_2D,
-                 draw_comp_tilemap_collider2d(jce_scene_get_tilemap_collider2d(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_AVATAR,
-                 draw_comp_avatar(jce_scene_get_avatar(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_VOLUME,
-                 draw_comp_volume(jce_scene_get_volume(scene, ecs_e)));
-        JCE_DRAW(JCE_COMP_FLAG_OCCLUSION_PORTAL,
-                 draw_comp_occlusion_portal(jce_scene_get_occlusion_portal(scene, ecs_e)));
-        default: break;
-    }
-#undef JCE_DRAW
+    if (comp_section_begin(focused, sidecar, comp_id, desc->display_name,
+                           desc->removable))
+        desc->draw(scene, ecs_e, focused);
+    comp_section_end();
 }
 
 /* ── Material file sync ───────────────────────────────────────────── */
@@ -1163,7 +1151,7 @@ void jce_editor_inspector_reload_material(const char *material_path)
     }
 }
 
-/* ── Add Component options + popup live in inspector_add_component.cpp ── */
+/* ── Add Component options + popup live in jce_panel_inspector_add_component.cpp ── */
 
 /* ── Content (embeddable in tabs) ─────────────────────────────────── */
 
@@ -1380,24 +1368,36 @@ void jce_editor_panel_inspector_content(void)
 
     sync_component_order(sidecar, scene, ecs_e, flags);
 
-    /* Iterate components in user-defined display order. The dispatcher
-     * delegates to the same comp_section_begin / draw_comp_X / end
-     * sequence the previous code used per-flag. */
+    /* Refresh the prefab-override indicator set ONCE for this entity this
+     * frame (one source .prefab.json load) before drawing component
+     * headers, which query the cache.  Recompute when the focused entity
+     * changed or the cache was invalidated by an Apply/Revert.  Non-
+     * instances clear the set (no badges).  Best-effort visual only. */
+    if (s_override_cache.entity_id != focused)
+        s_override_cache.refresh(focused);
+
+    /* Iterate components in user-defined display order (dense comp_ids).
+     * The dispatcher delegates to the same comp_section_begin /
+     * draw_comp_X / end sequence the previous code used per-flag. */
     bool light_drawn = false;
-    for (uint64_t entry : sidecar.component_order) {
-        if (jce_editor_component_slot_is_light_group(entry)) {
+    for (int entry : sidecar.component_order) {
+        if (jce_editor_component_id_is_light_group(entry)) {
             if (light_drawn) continue;
             if (!(flags & INSP_LIGHT_MASK)) continue;
+            /* Section state (fold/remove/presets) keys on the PRESENT
+             * light type's own comp_id, matching the old per-flag key. */
             uint64_t lf = (flags & JCE_COMP_FLAG_DIR_LIGHT)   ? JCE_COMP_FLAG_DIR_LIGHT
                        : (flags & JCE_COMP_FLAG_POINT_LIGHT) ? JCE_COMP_FLAG_POINT_LIGHT
                                                               : JCE_COMP_FLAG_SPOT_LIGHT;
-            if (comp_section_begin(focused, sidecar, lf, "Light", true))
+            int lcid = jce_editor_component_comp_id(lf);
+            if (comp_section_begin(focused, sidecar, lcid, "Light", true))
                 draw_comp_light(scene, ecs_e, flags);
             comp_section_end();
             light_drawn = true;
             continue;
         }
-        if (!jce_editor_component_slot_present(scene, ecs_e, flags, entry))
+        if (entry == JCE_COMP_ID_INVALID ||
+            !jce_scene_has_comp(scene, ecs_e, entry))
             continue;
         draw_section_with_multi_broadcast(focused, sidecar, scene, ecs_e, entry);
     }
@@ -1409,51 +1409,16 @@ void jce_editor_panel_inspector_content(void)
     ImGui::EndDisabled();
 
     /* Flush deferred component removal here, after all draw_comp_*
-     * functions have returned (so no stale flecs pointer is in use). */
+     * functions have returned (so no stale flecs pointer is in use).
+     * jce_state_remove_component_id resolves the registry row from the
+     * dense comp_id, so one call covers every row. */
     if (s_pending_remove.pending) {
         uint32_t eid = s_pending_remove.entity_id;
-        uint64_t fl  = s_pending_remove.flag;
+        int      cid = s_pending_remove.comp_id;
         s_pending_remove.pending   = false;
         s_pending_remove.entity_id = 0;
-        s_pending_remove.flag      = 0;
-        if (jce_editor_component_slot_is_compound_collider(fl)) {
-            JceEntity ce = jce_state_to_ecs_entity(eid);
-            if (scene && ce) {
-                jce_state_begin_batch_edit();
-                jce_scene_remove_compound_collider(scene, ce);
-                jce_state_end_batch_edit();
-            }
-        } else if (jce_editor_component_slot_is_video_player(fl)) {
-            JceEntity ce = jce_state_to_ecs_entity(eid);
-            if (scene && ce) {
-                jce_state_begin_batch_edit();
-                jce_scene_remove_video_player(scene, ce);
-                jce_state_end_batch_edit();
-            }
-        } else if (jce_editor_component_slot_is_nav_agent(fl)) {
-            JceEntity ce = jce_state_to_ecs_entity(eid);
-            if (scene && ce) {
-                jce_state_begin_batch_edit();
-                jce_scene_remove_nav_agent(scene, ce);
-                jce_state_end_batch_edit();
-            }
-        } else if (jce_editor_component_slot_is_ik_constraints(fl)) {
-            JceEntity ce = jce_state_to_ecs_entity(eid);
-            if (scene && ce) {
-                jce_state_begin_batch_edit();
-                jce_scene_remove_ik_constraints(scene, ce);
-                jce_state_end_batch_edit();
-            }
-        } else if (jce_editor_component_slot_is_sequence_player(fl)) {
-            JceEntity ce = jce_state_to_ecs_entity(eid);
-            if (scene && ce) {
-                jce_state_begin_batch_edit();
-                jce_scene_remove_sequence_player(scene, ce);
-                jce_state_end_batch_edit();
-            }
-        } else {
-            jce_state_remove_component(eid, fl);
-        }
+        s_pending_remove.comp_id   = JCE_COMP_ID_INVALID;
+        jce_state_remove_component_id(eid, cid);
     }
 }
 

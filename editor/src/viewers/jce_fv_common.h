@@ -36,7 +36,9 @@ extern "C" {
  * ══════════════════════════════════════════════════════════════════════ */
 
 #define FV_MAX_TABS       16
-#define FV_MAX_ASSET_BYTES (1024 * 1024 * 1024) /* 1 GB per asset */
+#define FV_MAX_ASSET_BYTES (128 * 1024 * 1024)  /* 128 MB per asset — bounded
+    for the 512 MB device baseline; larger files show an info tab instead of
+    being read whole into RAM (audit F96) */
 #define FV_MAX_CONTENT    (1024 * 256)   /* 256 KB per file */
 #define FV_EDIT_BUF_CAP   (1024 * 64)   /* 64 KB edit buffer */
 

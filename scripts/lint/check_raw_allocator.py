@@ -107,6 +107,12 @@ def scan_tree(root: Path, tree: str) -> list[tuple[str, int, str, str]]:
                 continue
             in_block_comment = False
             for lineno, line in enumerate(lines, start=1):
+                # Per-line opt-out for justified exceptions — e.g. a virtual
+                # method named free()/malloc() that overrides an allocator
+                # interface (Recast/Detour), not the global allocator.
+                # Annotate the line with `raw-alloc-ok: <reason>`.
+                if "raw-alloc-ok" in line:
+                    continue
                 code = line
                 # Handle multi-line /* ... */ block comments.
                 out_chars: list[str] = []

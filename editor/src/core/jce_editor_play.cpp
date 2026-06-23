@@ -11,6 +11,7 @@
 
 #include "jce_editor_state_internal.h"
 #include "scene/jce_editor_scene_render.h"
+#include "scene/jce_editor_scene_asset_cache.h" /* resolve_mesh_path (collider) */
 #include "ui/jce_editor_panels.h"
 
 extern "C" {
@@ -20,6 +21,7 @@ extern "C" {
 #include <jce/middleware/physics/jce_physics_debug.h>
 #include <jce/middleware/scene/jce_scene.h>
 #include <jce/middleware/scene/jce_scene_components_json.h>
+#include <jce/resource/jce_world_streamer.h>   /* editor-Play world streaming */
 #include <jce/renderer/jce_scene_renderer.h>   /* set_anim_sm_active */
 #include <jce/os/core/jce_json.h>
 #include <jce/os/core/jce_filesystem.h>
@@ -29,6 +31,7 @@ extern "C" {
 #include "core/jce_assetdb.h"
 #include "core/jce_project_settings.h"
 #include "core/jce_editor_config.h"   /* jce_editor_dotjce_path (~/.jce) */
+#include "scene/jce_editor_game_render.h"  /* hand Play runtime to UI dispatch */
 
 #include <string>
 
@@ -42,12 +45,41 @@ static bool                  s_play_snapshot_valid = false;
 static JceRuntime *s_play_runtime = NULL;
 static JceAudio   *s_play_audio   = NULL;   /* owned alongside the runtime */
 
+/* World streaming for editor Play.  The runtime itself never ticks a streamer
+ * (engine gap — jce_runtime_step has no streaming), so the Play harness owns
+ * one for the session, mirroring jce_default_init_world_streaming in the
+ * shipped game: built from the scene's authored streaming block, driven by the
+ * live player position, torn down on Stop.  Inert unless the scene has a
+ * streaming block with enabled + chunks, so non-streaming scenes are
+ * byte-identical to before. */
+static JceWorldStreamer *s_play_streamer        = NULL;
+static JceFileSystem    *s_play_stream_fs       = NULL;
+static jce_vec3          s_play_stream_pos       = { 0.0f, 0.0f, 0.0f };
+static bool              s_play_stream_pos_valid = false;
+
 /* Editor-only audio resolver: probe a few host-FS roots (VFS bundle path,
  * project root, scene-dir, and a few parents) before giving up.  Matches
  * the legacy editor Play behaviour so showcase scenes that put music
  * next to assets/ still load when opened outside a project context.    */
 extern "C" {
 #include <jce/os/core/jce_filesystem.h>
+}
+
+/* Resolve a scene-stored (project-relative) model/collider path to a readable
+ * host path — the SAME resolution the scene renderer uses for the visual mesh
+ * (ed_load_model_cb -> jce_editor_scene_asset_cache_resolve_mesh_path), so a
+ * model-based collider (Compound / Mesh) resolves to the exact file its mesh
+ * renders from.  Without this the runtime read the raw relative path against
+ * the process CWD (the editor never chdir's) and model colliders silently
+ * failed to spawn while the mesh still rendered.  Falls back to the generic
+ * asset-path resolver. */
+static bool editor_play_resolve_path(void * /*ud*/, const char *in,
+                                     char *out, int out_size)
+{
+    if (!in || !in[0] || !out || out_size <= 0) return false;
+    if (jce_editor_scene_asset_cache_resolve_mesh_path(in, out, out_size))
+        return true;
+    return jce_editor_resolve_asset_path(in, out, out_size);
 }
 
 static uint32_t editor_play_audio_load(void * /*ud*/, JceAudio *audio,
@@ -119,7 +151,122 @@ static void editor_contact_cb(const JceContactEvent *ev, void * /*ud*/)
 
 int jce_editor_play_get_active_contacts(void) { return s_active_contacts; }
 
+/* Renderer anim-event hook → runtime script dispatch (P1 anim-events), the
+ * editor Play twin of the shipped default_main wiring.  The editor's scene
+ * renderer (jce_editor_get_scene_renderer) advances the per-clip animation
+ * event tracks each frame; while Play is active we point its hook here so each
+ * fired event reaches the firing entity's on_anim_event script handler through
+ * the play runtime.  `user` is the JceRuntime*. */
+static void editor_anim_event_cb(uint64_t entity, const JceAnimEvent *ev,
+                                 void *user)
+{
+    jce_runtime_dispatch_anim_event((JceRuntime *)user, entity, ev);
+}
+
+/* Renderer anim-state hook → runtime script dispatch (state-enter/exit), the
+ * editor Play twin of the shipped default_main wiring.  While Play is active we
+ * point the renderer's anim-state hook here so each SM active-state change
+ * reaches the entity's on_state_exit / on_state_enter handlers through the play
+ * runtime.  `user` is the JceRuntime*. */
+static void editor_anim_state_cb(uint64_t entity, const char *from_state,
+                                 const char *to_state, void *user)
+{
+    jce_runtime_dispatch_anim_state((JceRuntime *)user, entity,
+                                    from_state, to_state);
+}
+
+/* Foot IK: renderer ground-query hook -> play runtime physics raycast, so
+ * FootIk components adapt feet to terrain in editor Play (cleared on Stop). */
+static bool editor_ground_query_cb(uint64_t entity, const float origin[3],
+                                   const float dir[3], float max_dist,
+                                   float *out_hit_y, float out_normal[3],
+                                   void *user)
+{
+    (void)entity;
+    return jce_runtime_ground_raycast((JceRuntime *)user, origin, dir, max_dist,
+                                      out_hit_y, out_normal);
+}
+
 /* ── Play mode API ───────────────────────────────────────────────── */
+
+/* ── World streaming (editor Play) ───────────────────────────────────
+ * Mirrors jce_default_init_world_streaming (jce_default_main.inc.h) so the
+ * editor Play button streams chunks exactly like the shipped game. */
+static void play_streaming_begin(void)
+{
+    s_play_streamer = NULL;
+    s_play_stream_fs = NULL;
+    s_play_stream_pos_valid = false;
+    if (!s.scene) return;
+
+    const JceSceneStreamingSettings *st = jce_scene_get_streaming_settings(s.scene);
+    if (!st || !st->enabled || st->chunk_count == 0) return;
+
+    /* Avoid a double streamer if the scene-view Preview toggle left one live. */
+    jce_editor_scene_render_streaming_teardown();
+
+    /* Mount the source ASSET ROOT so chunk fragment paths resolve project-
+     * relative — SHARED with the scene-view preview streamer via
+     * jce_editor_streaming_fs_base() so both viewports stream identical content
+     * (no scene-view vs game-view divergence). */
+    char base[1024] = { 0 };
+    if (!jce_editor_streaming_fs_base(base, sizeof base)) {
+        LOG_WARN(LOG_TAG, "world streaming: no asset root resolved — disabled");
+        return;
+    }
+
+    JceFileSystem *fs = jce_fs_create();
+    if (!fs) return;
+    jce_fs_mount_dir(fs, "", base);
+
+    JceWorldStreamConfig wsc = jce_world_stream_config_default();
+    wsc.mode            = (st->mode == 1) ? JCE_STREAM_RECTANGULAR : JCE_STREAM_RADIAL;
+    wsc.load_radius     = st->load_radius;
+    wsc.unload_radius   = st->unload_radius;
+    wsc.max_pending     = st->max_pending;
+    wsc.budget_mb       = st->budget_mb;
+    wsc.frame_budget_ms = st->frame_budget_ms;
+    wsc.single_thread   = true;   /* cooperative: chunk apply spawns on main thread */
+
+    s_play_streamer = jce_world_streamer_create(&wsc, s.scene, fs, NULL);
+    if (!s_play_streamer) {
+        jce_fs_destroy(fs);
+        LOG_WARN(LOG_TAG, "play world streamer creation failed — streaming disabled");
+        return;
+    }
+    s_play_stream_fs = fs;
+    jce_world_streamer_register_from_scene_settings(s_play_streamer, st);
+    /* Mirror Play-streamed entities into the editor hierarchy/selection too. */
+    jce_state_attach_streamer_hierarchy(s_play_streamer);
+    /* Toggle the always-resident HLOD far-skyline proxies as chunks (un)load. */
+    jce_state_attach_streamer_hlod(s_play_streamer);
+    LOG_INFO(LOG_TAG,
+             "editor Play world streaming active (%u chunks, r=%.0f/%.0f, root=%s)",
+             jce_world_streamer_chunk_count(s_play_streamer),
+             wsc.load_radius, wsc.unload_radius, base);
+}
+
+static void play_streaming_tick(void)
+{
+    if (!s_play_streamer || !s_play_runtime) return;
+    jce_vec3 pos;
+    if (jce_runtime_get_player_position(s_play_runtime, &pos)) {
+        s_play_stream_pos = pos;
+        s_play_stream_pos_valid = true;
+    }
+    /* Until a CharacterController exists, hold last-known (or origin) so the
+     * inner ring around spawn still streams in on frame 0. */
+    jce_world_streamer_update(s_play_streamer, s_play_stream_pos);
+}
+
+static void play_streaming_end(void)
+{
+    if (s_play_streamer)  { jce_world_streamer_destroy(s_play_streamer); s_play_streamer = NULL; }
+    if (s_play_stream_fs) { jce_fs_destroy(s_play_stream_fs);            s_play_stream_fs = NULL; }
+    s_play_stream_pos_valid = false;
+    /* Re-show all HLOD proxies so the master skyline is whole again after Play. */
+    jce_state_detach_streamer_hlod();
+}
 
 void jce_state_play(void)
 {
@@ -171,6 +318,7 @@ void jce_state_play(void)
     rd.audio          = s_play_audio;
     rd.enable_physics = true;
     rd.audio_load_fn  = editor_play_audio_load;
+    rd.resolve_path_fn = editor_play_resolve_path;
     rd.user_data      = NULL;
     /* Govern the sim with Project Settings (Time / Physics).  Leave 0 for
      * any field the project doesn't override — jce_runtime_create falls
@@ -229,10 +377,37 @@ void jce_state_play(void)
     s_active_contacts = 0;
     jce_runtime_set_contact_listener(s_play_runtime, editor_contact_cb, NULL);
 
+    /* Phase 0.2: seed the runtime's global time scale from the project's Time
+     * settings (Unity-style default timeScale — previously built-but-unwired).
+     * Scripts (jce.set_time_scale / jce.pause) override it live during play. */
+    if (ps && ps->time.time_scale > 0.0f)
+        jce_runtime_set_time_scale(s_play_runtime, ps->time.time_scale);
+
     jce_editor_scene_reset_anim_timer();
     /* Let bound animation state machines own active_clip while playing (in the
      * editor they stay idle so manual clip preview keeps working). */
     jce_scene_renderer_set_anim_sm_active(jce_editor_get_scene_renderer(), true);
+    /* Route animation frame events into the play runtime's script VM so
+     * authored on_anim_event handlers fire in editor Play just like a shipped
+     * game (cleared on Stop below). */
+    jce_scene_renderer_set_anim_event_fn(jce_editor_get_scene_renderer(),
+                                         editor_anim_event_cb, s_play_runtime);
+    /* Route SM state changes into the play runtime's script VM so authored
+     * on_state_enter / on_state_exit handlers fire in editor Play just like a
+     * shipped game (cleared on Stop below). */
+    jce_scene_renderer_set_anim_state_fn(jce_editor_get_scene_renderer(),
+                                         editor_anim_state_cb, s_play_runtime);
+    /* Foot IK ground-query hook (cleared on Stop below, before runtime destroy). */
+    jce_scene_renderer_set_ground_query_fn(jce_editor_get_scene_renderer(),
+                                           editor_ground_query_cb, s_play_runtime);
+    /* Hand the game renderer the live runtime so canvas UI events (button
+     * clicks, slider/toggle/dropdown value changes, input-field edits + submit)
+     * dispatch to the gameplay script VM in editor Play, exactly like a shipped
+     * game (detached on Stop below). */
+    jce_editor_game_render_set_play_runtime(s_play_runtime);
+    /* World streaming for this Play session (inert unless the scene authored a
+     * streaming block) — the runtime has no streamer of its own. */
+    play_streaming_begin();
     s.play_state = JCE_PLAY_PLAYING;
     LOG_INFO(LOG_TAG, "play mode started");
 }
@@ -254,6 +429,25 @@ void jce_state_stop(void)
 {
     if (s.play_state == JCE_PLAY_STOPPED) return;
 
+    /* Clear the renderer's anim-event hook BEFORE destroying the runtime it
+     * forwards to — otherwise a stray render frame could route an event into a
+     * freed runtime pointer. */
+    jce_scene_renderer_set_anim_event_fn(jce_editor_get_scene_renderer(),
+                                         NULL, NULL);
+    jce_scene_renderer_set_anim_state_fn(jce_editor_get_scene_renderer(),
+                                         NULL, NULL);
+    jce_scene_renderer_set_ground_query_fn(jce_editor_get_scene_renderer(),
+                                           NULL, NULL);
+    /* Detach the runtime from the game renderer's UI dispatch BEFORE destroying
+     * it, so a stray render frame can't route a drained click into a freed
+     * runtime pointer (mirrors the renderer-hook clears above). */
+    jce_editor_game_render_set_play_runtime(NULL);
+
+    /* Unload streamed chunks (destroys their entities from the live scene)
+     * BEFORE the runtime is destroyed and BEFORE the pre-play snapshot is
+     * restored below, so streamed content never lingers or bakes in. */
+    play_streaming_end();
+
     if (s_play_runtime) { jce_runtime_destroy(s_play_runtime); s_play_runtime = NULL; }
     if (s_play_audio)   { jce_audio_destroy(s_play_audio);     s_play_audio   = NULL; }
     s_active_contacts = 0;
@@ -268,6 +462,11 @@ void jce_state_stop(void)
     jce_editor_scene_reset_anim_timer();
     /* Back to editor preview: SM idle, manual clip selection previews again. */
     jce_scene_renderer_set_anim_sm_active(jce_editor_get_scene_renderer(), false);
+    /* Restore the scene-view streaming preview (no-op unless the World Streaming
+     * → Preview toggle is on) — play_streaming_begin tore it down so only ONE
+     * streamer spawns into the shared scene during Play.  Both use the same FS
+     * base (jce_editor_streaming_fs_base) so content matches across viewports. */
+    jce_editor_scene_render_streaming_rebuild();
     LOG_INFO(LOG_TAG, "play mode stopped");
 }
 
@@ -285,30 +484,49 @@ void stop_play_before_scene_swap(void)
 void jce_state_step(float dt)
 {
     if (s.play_state != JCE_PLAY_PAUSED) return;
-    if (s_play_runtime) jce_runtime_step(s_play_runtime, dt > 0 ? dt : 1.0f/60.0f);
+    if (s_play_runtime) {
+        jce_runtime_step(s_play_runtime, dt > 0 ? dt : 1.0f/60.0f);
+        jce_state_prune_dead();   /* sync mirror list with runtime jce.destroy */
+        play_streaming_tick();    /* load/unload chunks around the player */
+    }
 }
 
 void jce_state_play_mode_tick(float dt)
 {
     if (s.play_state != JCE_PLAY_PLAYING) return;
-    if (s_play_runtime) jce_runtime_step(s_play_runtime, dt);
+    if (s_play_runtime) {
+        jce_runtime_step(s_play_runtime, dt);
+        jce_state_prune_dead();   /* drop runtime-destroyed entities (jce.destroy)
+                                   * so the hierarchy never touches a dead handle */
+        play_streaming_tick();    /* load/unload chunks around the player */
+    }
 }
 
 /* ── External hooks (game view / scene render) ──────────────────── */
 
 void jce_editor_play_set_player_input(float walk_x, float walk_z,
                                       bool jump_pressed, bool jump_held,
-                                      bool sprint)
+                                      bool sprint, bool attack)
 {
     if (!s_play_runtime) return;
     JceRuntimeInput in = {};
-    in.walk_x       = walk_x;
-    in.walk_z       = walk_z;
-    in.jump_pressed = jump_pressed;
-    in.jump_held    = jump_held;
-    in.sprint       = sprint;
-    in.speed_mult   = 1.0f;   /* sprint scaling is authored on the component */
+    in.walk_x         = walk_x;
+    in.walk_z         = walk_z;
+    in.jump_pressed   = jump_pressed;
+    in.jump_held      = jump_held;
+    in.sprint         = sprint;
+    in.attack_pressed = attack;
+    in.speed_mult     = 1.0f;   /* sprint scaling is authored on the component */
     jce_runtime_set_input(s_play_runtime, &in);
+}
+
+/* Top 6: bind the live editor action map so editor-Play scripts can query
+ * authored actions by name (jce.is_action_down / get_axis), like a shipped
+ * game.  The runtime borrows the pointer for this frame. */
+void jce_editor_play_set_actions(const JceInputActions *actions)
+{
+    if (!s_play_runtime) return;
+    jce_runtime_set_actions(s_play_runtime, actions);
 }
 
 bool jce_editor_play_get_player_position(float *out_x, float *out_y, float *out_z)
@@ -319,6 +537,17 @@ bool jce_editor_play_get_player_position(float *out_x, float *out_y, float *out_
     if (out_x) *out_x = p.x;
     if (out_y) *out_y = p.y;
     if (out_z) *out_z = p.z;
+    return true;
+}
+
+bool jce_editor_play_get_player_forward(float *out_x, float *out_y, float *out_z)
+{
+    if (!s_play_runtime) return false;
+    jce_vec3 f;
+    if (!jce_runtime_get_player_forward(s_play_runtime, &f)) return false;
+    if (out_x) *out_x = f.x;
+    if (out_y) *out_y = f.y;
+    if (out_z) *out_z = f.z;
     return true;
 }
 

@@ -70,11 +70,11 @@ extern "C" void jce_editor_panel_vcam_manager_content(void)
     if (ImGui::BeginTable("##vcam_tbl", 6,
             ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
             ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
-        ImGui::TableSetupColumn("Owner",    ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("VCam",     ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Priority", ImGuiTableColumnFlags_WidthFixed, 90);
-        ImGui::TableSetupColumn("Active",   ImGuiTableColumnFlags_WidthFixed, 60);
-        ImGui::TableSetupColumn("FOV",      ImGuiTableColumnFlags_WidthFixed, 80);
+        ImGui::TableSetupColumn(jce_editor_i18n("vcamManager.col.owner"),    ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn(jce_editor_i18n("vcamManager.col.vcam"),     ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn(jce_editor_i18n("vcamManager.col.priority"), ImGuiTableColumnFlags_WidthFixed, 90);
+        ImGui::TableSetupColumn(jce_editor_i18n("vcamManager.col.active"),   ImGuiTableColumnFlags_WidthFixed, 60);
+        ImGui::TableSetupColumn(jce_editor_i18n("vcamManager.col.fov"),      ImGuiTableColumnFlags_WidthFixed, 80);
         ImGui::TableSetupColumn("",         ImGuiTableColumnFlags_WidthFixed, 70);
         ImGui::TableHeadersRow();
 
